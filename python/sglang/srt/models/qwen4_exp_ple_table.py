@@ -242,6 +242,171 @@ class PleCheckpointPrefetcher:
                 pass
 
 
+PLE_CKPT_GATHER_ENV = "SGLANG_QWEN4_PLE_CKPT_GATHER"
+PLE_CKPT_PREAD_WORKERS_ENV = "SGLANG_QWEN4_PLE_PREAD_WORKERS"
+PLE_CKPT_PREAD_WORKERS = 32
+
+
+class PleCheckpointPreadGather:
+    """Task #55 (fnFL2 v26, 21.09.): prefill-sized gathers of the ``checkpoint``
+    backend read on the CPU instead of through HMM.
+
+    Measured on this rig's ZFS (zfs_mmap_probe.py / zfs_lock_probe.py,
+    21.09.): the gather kernel's HMM faults serve ~1.6k cold pages/s, one at a
+    time (an 8192-token chunk = 393k rows = 393k random 4 KiB pages = 4 min);
+    ``pread`` does NOT fill the page cache for the mmap (mincore 0/20000 after
+    pread), so the pread+WILLNEED warmer only warms the ARC; and a CPU touch of
+    the mmap serialises at ~6.5k pages/s globally (one file = four files).
+    ``pread`` itself runs at 36-55k IOPS on 8-64 threads. So a gather of
+    ``>= min_rows`` rows is done here: every row is one ``preadv`` straight
+    into a (pinned) staging buffer on a thread pool, then ONE H2D copy. Same
+    bytes as the mmap, same in-range rule as the kernel (rows outside
+    ``[vocab_start, vocab_end)`` are zero), output bf16. Decode-sized gathers
+    keep the kernel (their rows are warm). Off unless
+    ``SGLANG_QWEN4_PLE_CKPT_GATHER=pread``.
+    """
+
+    def __init__(
+        self,
+        table: "CheckpointMappedPleTable",
+        *,
+        min_rows: int = PLE_FILE_PREFETCH_MIN_ROWS,
+        workers: int = PLE_CKPT_PREAD_WORKERS,
+    ) -> None:
+        if not table.shard_files or len(table.shard_files) != len(table.bases):
+            raise ValueError("checkpoint PLE table carries no per-shard file map")
+        if len(table.shard_offsets) != len(table.bases):
+            raise ValueError("checkpoint PLE table carries no per-shard offsets")
+        self._table = table
+        self._row_bytes = int(table.row_bytes)
+        self._min_rows = int(min_rows)
+        self._workers = max(1, int(workers))
+        self._fds: dict = {}
+        for path in dict.fromkeys(table.shard_files):
+            self._fds[path] = os.open(path, os.O_RDONLY)
+        self._shard_fd = [self._fds[p] for p in table.shard_files]
+        self._pool = ThreadPoolExecutor(max_workers=self._workers)
+        self._staging: Optional[torch.Tensor] = None
+        self.stats = {"gathers": 0, "rows": 0, "zero_rows": 0, "seconds": 0.0}
+
+    @property
+    def min_rows(self) -> int:
+        return self._min_rows
+
+    def wants(self, flat_ids: torch.Tensor) -> bool:
+        if flat_ids.numel() < self._min_rows:
+            return False
+        if flat_ids.is_cuda and torch.cuda.is_current_stream_capturing():
+            return False
+        return True
+
+    def _staging_for(self, n: int) -> torch.Tensor:
+        st = self._staging
+        if st is None or st.shape[0] < n:
+            cap = max(n, 1 << 15)
+            pin = torch.cuda.is_available()
+            st = torch.empty((cap, self._table.embedding_dim), dtype=self._table.dtype, pin_memory=pin)
+            self._staging = st
+        return st[:n]
+
+    @staticmethod
+    def _read_rows(buf: memoryview, rb: int, rows: list, fds: list, offs: list) -> None:
+        """``rows[j]`` (staging row) <- ``preadv(fds[j], offs[j])``."""
+        for j in range(len(rows)):
+            i = rows[j]
+            os.preadv(fds[j], [buf[i * rb : (i + 1) * rb]], offs[j])
+
+    def gather_into(
+        self,
+        flat_ids: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        vocab_start: int = 0,
+        vocab_end: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Fill ``out`` ([n, dim] bf16) with the rows of ``flat_ids``."""
+        import time as _time
+
+        t0 = _time.monotonic()
+        ids = flat_ids.detach().reshape(-1).cpu().to(torch.int64)
+        n = int(ids.numel())
+        if out.dim() != 2 or out.shape[0] != n or out.shape[1] != self._table.embedding_dim:
+            raise ValueError("PLE pread gather: output shape does not match the ids")
+        if n == 0:
+            return out
+        if vocab_end is None:
+            vocab_end = self._table.total_rows
+        in_range = (ids >= vocab_start) & (ids < vocab_end) & (ids < self._table.total_rows)
+        staging = self._staging_for(n)
+        valid_idx = torch.nonzero(in_range).flatten()
+        nv = int(valid_idx.numel())
+        if nv != n:
+            # same rule as the kernel: out-of-range rows are 0.0
+            staging.zero_()
+        if nv:
+            vid = ids[valid_idx]
+            shard = torch.div(vid, self._table.shard_rows, rounding_mode="floor")
+            local = vid - shard * self._table.shard_rows
+            offs = torch.tensor(self._table.shard_offsets, dtype=torch.int64)[shard] + local * self._row_bytes
+            fds = torch.tensor(self._shard_fd, dtype=torch.int64)[shard]
+            # read in (fd, offset) order -- the block layer likes locality --
+            # but land every row at its own staging index (no scatter pass)
+            order = torch.argsort(fds * (1 << 48) + offs)
+            rows = valid_idx[order].tolist()
+            fds_l = fds[order].tolist()
+            offs_l = offs[order].tolist()
+            buf = memoryview(staging.view(torch.uint8).numpy().reshape(-1))
+            chunk = max(256, (nv + self._workers - 1) // self._workers)
+            futs = [
+                self._pool.submit(
+                    self._read_rows, buf, self._row_bytes, rows[lo : lo + chunk], fds_l[lo : lo + chunk], offs_l[lo : lo + chunk]
+                )
+                for lo in range(0, nv, chunk)
+            ]
+            for f in futs:
+                f.result()
+        out.copy_(staging, non_blocking=out.is_cuda)
+        self.stats["gathers"] += 1
+        self.stats["rows"] += n
+        self.stats["zero_rows"] += n - nv
+        self.stats["seconds"] += _time.monotonic() - t0
+        return out
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=False)
+        for fd in self._fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def make_ple_checkpoint_pread_gather(
+    table: "CheckpointMappedPleTable",
+) -> Optional["PleCheckpointPreadGather"]:
+    """``SGLANG_QWEN4_PLE_CKPT_GATHER=pread`` routes prefill-sized gathers of
+    the checkpoint backend through :class:`PleCheckpointPreadGather`; the
+    default (``hmm``) keeps the kernel for every gather."""
+    mode = os.environ.get(PLE_CKPT_GATHER_ENV, "hmm").strip().lower()
+    if mode in ("", "hmm", "0", "off"):
+        return None
+    if mode != "pread":
+        raise ValueError(f"{PLE_CKPT_GATHER_ENV} must be 'hmm' or 'pread', got {mode!r}")
+    min_rows = int(
+        os.environ.get("SGLANG_QWEN4_PLE_PREFETCH_MIN_ROWS", str(PLE_FILE_PREFETCH_MIN_ROWS))
+    )
+    workers = int(os.environ.get(PLE_CKPT_PREAD_WORKERS_ENV, str(PLE_CKPT_PREAD_WORKERS)))
+    g = PleCheckpointPreadGather(table, min_rows=min_rows, workers=workers)
+    logger.info(
+        "PLE table: prefill gathers of >= %d rows read on the CPU (preadv per row, "
+        "%d threads, pinned staging, one H2D copy) -- the HMM kernel serves only "
+        "smaller gathers (#55: cold pages cost 4 min per 8k chunk through HMM on ZFS)",
+        min_rows,
+        workers,
+    )
+    return g
+
+
 def make_ple_checkpoint_prefetcher(
     table: "CheckpointMappedPleTable",
 ) -> Optional["PleCheckpointPrefetcher"]:

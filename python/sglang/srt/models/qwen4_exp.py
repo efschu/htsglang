@@ -194,6 +194,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     allocate_ple_host_table,
     make_ple_file_prefetcher,
     make_ple_checkpoint_prefetcher,
+    make_ple_checkpoint_pread_gather,
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -1015,6 +1016,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # tensor names (``attach_checkpoint_table``); a gather before that
         # refuses by name.
         self._ckpt_table = None
+        self._ckpt_pread = None
         self._ckpt_backend = backend == "checkpoint"
         if self._ckpt_backend:
             host_table = torch.empty(
@@ -1059,6 +1061,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             )
         self._ckpt_table = table
         self._ckpt_prefetcher = make_ple_checkpoint_prefetcher(table)
+        self._ckpt_pread = make_ple_checkpoint_pread_gather(table)
 
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
@@ -1097,6 +1100,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 raise RuntimeError(
                     "PLE checkpoint table was never attached (load_weights did "
                     "not see the ngram_embedding shards)"
+                )
+            pread = getattr(self, "_ckpt_pread", None)
+            if pread is not None and pread.wants(flat_ids):
+                return pread.gather_into(
+                    flat_ids,
+                    output,
+                    vocab_start=self.shard_indices.org_vocab_start_index,
+                    vocab_end=self.shard_indices.org_vocab_end_index,
                 )
             prefetcher = getattr(self, "_ckpt_prefetcher", None)
             if prefetcher is not None:
