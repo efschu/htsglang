@@ -1722,6 +1722,19 @@ def _nvml_free() -> List[CardFree]:
     ]
 
 
+def dormant_residue_over(dc, reserve, weights_resident: bool) -> dict:
+    """W19: the cards whose measured dormant residue D_c exceeds the reserve
+    P's budget assumed. EMPTY under --weights-resident (fnFL2 v21): the
+    residue is the weight set by design and P was budgeted beside it."""
+    if weights_resident:
+        return {}
+    return {
+        u: (m, reserve.get(u))
+        for u, m in dc.items()
+        if reserve.get(u) is not None and m > reserve[u]
+    }
+
+
 def _nvml_process_mib(pids: set) -> Dict[str, int]:
     try:
         out = subprocess.run(
@@ -4641,7 +4654,22 @@ class Front:
             logger.info("WEG2-DC group=%s uuid=%s measured=%d MiB reserve=%s", src, uuid, mib, self.dc_reserve.get(uuid))
         if src == "D" and not self.dc_measured_d and dc:
             self.dc_measured_d = dc
-            over = {u: (m, self.dc_reserve.get(u)) for u, m in dc.items() if self.dc_reserve.get(u) is not None and m > self.dc_reserve[u]}
+            over = dormant_residue_over(dc, self.dc_reserve, self.weights_resident)
+            if self.weights_resident and any(
+                self.dc_reserve.get(u) is not None and m > self.dc_reserve[u] for u, m in dc.items()
+            ):
+                # fnFL2 v21 (21.09.): under --weights-resident D's dormant
+                # image IS its weights (11.5 GiB on a 3080 worker); nothing
+                # was ever meant to leave the card, and P's KV pool was sized
+                # inside P's own --rank-gpu-memory-mib with D's image present.
+                # The measured D_c is recorded, not graded.
+                logger.info(
+                    "WEG2-DC group=D weights RESIDENT: measured D_c %s MiB exceeds the "
+                    "pausable-form reserve %s -- expected (the image is the weight "
+                    "set); W19 not applicable on this arm",
+                    {u: m for u, m in sorted(dc.items())},
+                    {u: self.dc_reserve.get(u) for u in sorted(dc)},
+                )
             if over:
                 self.do_stop("W19 DormantResidueRefused",
                              f"measured D_c(D) exceeds the reserve P's budget assumed: {over} (measured, reserved) MiB -- waking P would overcommit the card")

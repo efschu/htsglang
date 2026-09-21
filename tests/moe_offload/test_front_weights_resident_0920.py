@@ -68,3 +68,16 @@ def test_the_release_handler_refuses_a_weights_tag_under_resident():
     from sglang.srt.weg2 import launcher as lc
 
     assert '"flip_weights": getattr(ns, "flip_weights", "family")' in inspect.getsource(lc._env_knobs)
+
+
+def test_w19_dormant_residue_is_not_graded_on_the_resident_arm():
+    """fnFL2 v21 (21.09.): D's first sleep measured 11534 MiB on a 3080 worker
+    against a pausable-form reserve of 1986 -> W19 STOP, though the residue
+    is the resident weight set by design."""
+    from sglang.srt.weg2.front import dormant_residue_over
+
+    dc = {"gpu-a": 11534, "gpu-b": 1500}
+    reserve = {"gpu-a": 1986, "gpu-b": 1986}
+    assert dormant_residue_over(dc, reserve, weights_resident=True) == {}
+    assert dormant_residue_over(dc, reserve, weights_resident=False) == {"gpu-a": (11534, 1986)}
+    assert dormant_residue_over(dc, {}, weights_resident=False) == {}
