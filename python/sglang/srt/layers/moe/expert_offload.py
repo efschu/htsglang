@@ -5063,6 +5063,33 @@ def refuse_cold_shard_at_repack_door(layer) -> None:
     )
 
 
+_SLOT_POOL_OFF_WARNED = set()
+
+
+def _warn_slot_pool_off(rank: int, cold: int, span: int) -> None:
+    """Einmal je Rang sagen, dass der Slot-Pool nicht greift (#72).
+
+    EINMAL, nicht je Layer: die Ursache ist eine Rang-Eigenschaft (die
+    gemessene Residenz bleibt hinter `--rank-moe-resident-fraction`
+    zurueck), also gilt sie fuer alle 48 MoE-Layer gleich. Achtundvierzig
+    identische Zeilen im Bootlog haetten dieselbe Information und weniger
+    Chance, gelesen zu werden.
+    """
+    key = (int(rank), int(span))
+    if key in _SLOT_POOL_OFF_WARNED:
+        return
+    _SLOT_POOL_OFF_WARNED.add(key)
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "[#72] slot pool OFF on rank %d: %d cold experts exceed the %d slots "
+        "its resident fraction reserves -- one store row per expert, as "
+        "before. Raise SGLANG_MOE_RESIDENT_EXPERT_FRACTION for this rank or "
+        "leave SGLANG_MOE_EXPERT_STORE_SLOT_FRACTION unset.",
+        int(rank), int(cold), int(span),
+    )
+
+
 def _expert_store_rows_for(layer, plan):
     """``(dir, layer_key, lo, num_global, local->row)`` when the shared expert
     store is on and this layer is a generic expert-dim shard; else ``None``."""
@@ -5089,14 +5116,114 @@ def _expert_store_rows_for(layer, plan):
         return None  # an EP-style slice; no global row map defined here
     from sglang.srt.layers.moe.cold_tier_fetch import layer_key_for
 
+    # #72 (Nutzer-Order 21.09.): DER STORE HAELT PLAETZE FUER DAS, WAS NICHT
+    # AUF EINER KARTE LIEGT -- "waehrend decode oder prefill muss niemals
+    # alles im systemram liegen". Bisher war die globale Experten-Id der
+    # Zeilenindex, also brauchte die Datei einen Platz je Experte, auch fuer
+    # die nie geschriebenen: 59 GiB auf Platte, 61,10 GiB shmem (fnFL2w5/w7),
+    # der groesste nicht-reclaimable Posten gegen die ~93-GiB-Decke.
+    #
+    # Die Slot-Zuordnung bleibt eine RECHNUNG, keine Absprache -- der Store
+    # ist ueber Raenge UND Gruppen geteilt. `slot_base_for_rank` liest die
+    # zwei Vektoren, die ohnehin auf jeder Kommandozeile stehen
+    # (`--rank-moe-ratio`, `--rank-moe-resident-fraction`), und
+    # `slot_rows` packt die Kalten darin lueckenlos. Fehlt eines von beiden,
+    # faellt alles auf `global_rows` zurueck -- byte-identisch zu vorher.
+    _index = _es.global_rows(plan.spill_ids, int(lo), pad)
+    _slots = None
+    if _es.slot_fraction() < 1.0:
+        _ratios = _rank_moe_ratio_vector(layer)
+        _fracs = _rank_resident_fraction_vector(layer, len(_ratios))
+        if _ratios and _fracs:
+            _rank = int(getattr(layer, "moe_tp_rank", 0) or 0)
+            _base = _es.slot_base_for_rank(_ratios, _fracs, _rank)
+            # DREI GROESSEN, DREI GETRENNTE RECHNUNGEN -- und die mittlere ist
+            # die, an der meine erste Fassung falsch war:
+            #
+            # (a) `_base`  : wo MEINE Plaetze anfangen. Aus den zwei Vektoren,
+            #                also auf jedem Rang dieselbe Zahl.
+            # (b) `_packed`: welcher meiner Experten auf welchen Platz. Dafuer
+            #                braucht `slot_rows` die Residenten im GLOBALEN
+            #                Id-Raum -- und zwar ALLE, die nicht meine Kalten
+            #                sind. Die Bereiche der ANDEREN Raenge gehoeren
+            #                dazu: sie sind nicht resident, aber sie sind auch
+            #                nicht meine, und sie duerfen meine Positionen
+            #                nicht verschieben. (Erste Fassung mischte hier
+            #                lokale spill_ids mit `range(512)` und zaehlte
+            #                fremde Bereiche als Kalte mit.)
+            # (c) `_slots`: wie GROSS die Datei ist. Die Summe ueber ALLE
+            #               Raenge, nie `_base + meine` -- der Store ist EINE
+            #               Datei je Layer/Attribut, und wer sie zuerst
+            #               oeffnet, legt sie an. Rang 0 wuerde sonst 25
+            #               Plaetze anlegen, in die Rang 2 auf Platz 118
+            #               schreibt: ein Schreiber hinter dem Dateiende.
+            _cold_global = {int(g) for g in _index.values()}
+            _not_mine = [e for e in range(num_global) if e not in _cold_global]
+            _packed = _es.slot_rows(plan.spill_ids, int(lo), pad,
+                                    resident_ids=_not_mine,
+                                    num_experts=num_global)
+            _span = _es.slot_base_for_rank(_ratios, _fracs, _rank + 1) - _base
+            if _packed and len(_packed) <= _span:
+                _index = {k: _base + v for k, v in _packed.items()}
+                _slots = _es.slot_base_for_rank(_ratios, _fracs, len(_ratios))
+            elif _packed:
+                # Mehr Kalte als die Rechnung mir zugesteht -- die Residenz
+                # blieb hinter `--rank-moe-resident-fraction` zurueck. Dann
+                # LIEBER DER ALTE, VOLLE STORE: mein Ueberlauf landete sonst
+                # in den Plaetzen des naechsten Rangs, und eine Kollision im
+                # geteilten Store ist Datenverlust, kein Speicherverlust.
+                _warn_slot_pool_off(_rank, len(_packed), _span)
     return (
         _es.store_dir(),
         layer_key_for(layer),
         int(lo),
-        num_global,
-        _es.global_rows(plan.spill_ids, int(lo), pad),
+        num_global if _slots is None else int(_slots),
+        _index,
         pad,
     )
+
+
+def _rank_moe_ratio_vector(layer):
+    """Die Expertenzahl je Rang, oder ``None``. #72."""
+    from sglang.srt.distributed import parallel_state as _ps
+
+    for src in (getattr(layer, "moe_ratio", None),
+                getattr(getattr(_ps, "_TP", None), "moe_ratio", None)):
+        if src:
+            try:
+                return [int(x) for x in src]
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _rank_resident_fraction_vector(layer, tp_size=None):
+    """Der Residenzanteil je Rang, oder ``None``. #72.
+
+    UEBER `resident_fraction_vector`, NICHT ueber `envs`: der EnvFloatVector
+    VERWEIGERT `.get()`, sobald er je Rang gesetzt ist -- "is set per rank
+    (0.59,0.59,0.59), so there is no single value to return" (environ.py:206).
+    Das ist genau der Fall, den #72 braucht, also war der direkte Weg der
+    einzige, der nie funktionieren konnte: meine erste Fassung fing die
+    Verweigerung ab und lieferte still `None`, der Slot-Pool blieb aus und
+    der Store wieder 512 Plaetze gross. Der vorgesehene Leser kreuzt Flag und
+    Env gegeneinander und broadcastet einen Skalar auf alle Raenge.
+
+    Ein BROADCASTETER Skalar taugt hier trotzdem: er sagt fuer jeden Rang
+    dasselbe, und genau das braucht die Basisrechnung -- nur die Laenge muss
+    zu den Ratios passen, sonst faellt ein Rang aus der Rechnung.
+    """
+    from sglang.srt.layers.moe import resident_fraction as _rf
+
+    try:
+        vec = _rf.resident_fraction_vector(tp_size=tp_size)
+    except Exception:  # noqa: BLE001 -- ohne Vektor bleibt es beim Alten
+        return None
+    try:
+        out = [float(x) for x in vec]
+    except (TypeError, ValueError):
+        return None
+    return out or None
 
 
 def presplit_expert_offload_after_repack(
@@ -5197,8 +5324,15 @@ def presplit_expert_offload_after_repack(
             from sglang.srt.layers.moe import expert_store as _es
 
             s_dir, s_key, s_lo, s_num, _s_index, s_pad = store_rows
+            # #72: `s_num` ist BEREITS die Plaetzezahl, wenn der Slot-Pool
+            # greift (`_expert_store_rows_for` hat sie gerechnet). Sie als
+            # `num_experts` zu uebergeben hiesse, `slots_for` ein zweites Mal
+            # darauf loszulassen -- die Datei waere doppelt verkleinert und
+            # der letzte Rang schriebe hinter ihr Ende. Explizit als
+            # `num_slots` durchreichen, damit genau eine Stelle rechnet.
             spill, _created = _es.open_store(
-                s_dir, s_key, attr, s_num, tuple(t.shape[1:]), t.dtype
+                s_dir, s_key, attr, s_num, tuple(t.shape[1:]), t.dtype,
+                num_slots=s_num,
             )
             # Only the COLD rows go to the host (flip design 20.09.: a row a
             # card holds in some layout is taken from that card over BAR1, the
