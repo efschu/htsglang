@@ -10966,6 +10966,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     front_log = None if dry else f"{base}.front.log"
     log = Log(front_log)
     log(f"=== WEG2 BOOT tag={ns.tag} tree={tree} @ {tip} ({'DIRTY: ' + dirty[:200] if dirty else 'clean'}) stamp={stamp} dry={dry}")
+    # THE PIN RESOLVER'S CONTRACT LINE, and it must stay in exactly this shape:
+    # `line_gate.BOOT_TREE_RE` is `^tree\s*:\s*\S+\s+@\s+([0-9a-f]{7,40})\b`, so
+    # the header above -- which carries the same two facts -- does NOT match it.
+    #
+    # WHY THIS LINE EXISTS AT ALL (measured 2026-09-21).  `resolve_pin` step 3
+    # reads this stamp out of `/root/current_boot.log` to learn which tree the
+    # standing boot runs.  No boot log since early September carried it: the
+    # emitter lived in the retired `boot_855_*` scripts and was never ported
+    # here.  `boot_commit()` therefore returned None on EVERY call, resolution
+    # fell through to step 4 -- the newest merge/integ/train NAME -- and the
+    # codegraph answered every query against `merge/train-0901` (14.09.) while
+    # a three-weeks-newer tree was booting.  Nobody noticed for a fortnight
+    # because step 4 returns a PLAUSIBLE pin instead of refusing.
+    #
+    # The filename is deliberately NOT the source of this fact: line_gate's own
+    # header records a launcher whose LOG= template hard-coded a stale SHA into
+    # the name while the header read correctly.
+    log(f"tree: {tree} @ {tip}")
     if dirty and not dry:
         raise Weg2LaunchRefused("tree is not clean -- boot from a COMMITTED tip only")
     py = f"{ns.venv}/bin/python"
@@ -12465,6 +12483,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ffh = open(front_log, "ab")
     fp = subprocess.Popen(front_argv, env=fenv, stdout=ffh, stderr=subprocess.STDOUT, cwd=tree, start_new_session=True)
     state.pids["front"] = fp.pid
+    # PUBLISH THE LOG BEFORE WAITING, NOT AFTER.  This used to sit after the
+    # LAUNCHED line, i.e. behind `wait_ready` below -- so a boot that never
+    # reached a ready front never updated the symlink, and every reader
+    # (`resolve_pin`, the deadman, a seat looking for "the current boot") was
+    # pointed at the last boot that SUCCEEDED.  Measured 2026-09-21: seven
+    # fnFL2 attempts in 2.5 h all ended `WEG2-LAUNCH REFUSED`, and
+    # /root/current_boot.log still named the 07:26 boot.  The pointer is needed
+    # MOST while a boot is failing, which is exactly when it was not written.
+    os.system(f"ln -sfn {shlex.quote(front_log)} /root/current_boot.log")
     state.t_ready["front"] = wait_ready(PORT_FRONT, fp.pid, 120, log, "front", fp)
 
     # 7. deadmen + helpers
@@ -12472,7 +12499,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.helper_pids.append(arm_deadman(log, spec_p.log, PORT_P, f"launch_server.*--port {PORT_P}", huge, ns.tag, "P", dry))
     state.helper_pids.append(arm_deadman(log, spec_d.log, PORT_D, f"launch_server.*--port {PORT_D}", huge, ns.tag, "D", dry))
     state.helper_pids.append(arm_deadman(log, front_log, PORT_FRONT, "sglang.srt.weg2.front", 120, ns.tag, "front", dry))
-    os.system(f"ln -sfn {shlex.quote(front_log)} /root/current_boot.log")
     with open(f"{GPU_ARB}/weg2/boot_{ns.tag}.logpath", "w") as f:
         f.write(front_log + "\n")
     _write_state(state)
