@@ -76,3 +76,30 @@ class SoloDraftPartition(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ATagNobodyCarriesStillRefuses(unittest.TestCase):
+    """The distinction the solo rule must NOT blur: 'placed on one card' vs
+    'exists nowhere'.  The second is a typo in the schedule and stays a
+    refusal, named once rather than once per card."""
+
+    def test_a_wave_tag_no_card_carries_is_refused_once(self):
+        census = xchg_residency.XchgCensus(
+            cards={
+                BIG: xchg_residency.CardCensus(
+                    uuid=BIG,
+                    tags={"P": {"weights_0": 100}, "D": {"weights_0": 90}},
+                    dormant_proc_used_mib=10,
+                ),
+                SM: xchg_residency.CardCensus(
+                    uuid=SM,
+                    tags={"P": {"weights_0": 50}, "D": {"weights_0": 50}},
+                    dormant_proc_used_mib=10,
+                ),
+            },
+            waves=(("weights_0",), ("weights_typo",)),
+        )
+        res = xchg_residency.check_partition(census)
+        self.assertEqual(len(res), 1, res)
+        self.assertIn("weights_typo", res[0])
+        self.assertIn("NO card carries", res[0])

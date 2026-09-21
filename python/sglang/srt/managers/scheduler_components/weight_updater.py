@@ -6766,6 +6766,37 @@ class SchedulerWeightUpdaterManager:
                     raise _errs[0][1]
             weg2_leg_ms = (time.perf_counter() - t_w0) * 1000
             _weg2_ph("leg_collects")
+            # fnFL2 v43: THE WEIGHTS-SIDE MIRROR of the graph tag's
+            # `_weg2_zero_graph_scratch` above, and for the identical reason.
+            # `marlin_make_workspace` registers a semaphore array as a
+            # PARAMETER on every Marlin layer (272 int32, created with
+            # `torch.zeros`, in no checkpoint and therefore in no exchange
+            # plan).  The resume maps FRESH physical pages under the weights
+            # region -- on the two-group form, pages the other group just
+            # released -- and nothing writes this parameter, so it holds the
+            # peer's residue.  Marlin's kernels require it to start at zero:
+            # a non-zero semaphore makes them spin or read a partial tile.
+            # Runs on the waking side, after the tags are mapped and before
+            # any forward.
+            try:
+                from sglang.srt.weg2.weight_exchange import zero_local_scratch
+                _m = self._weg2_model_for_group(self._weg2_group_name())
+                _scratch = zero_local_scratch(_m) if _m is not None else []
+                if _scratch:
+                    logger.info(
+                        "WEG2-RESUME local-scratch zeroed=%d first=%s "
+                        "(runtime-built parameters the exchange has no source "
+                        "for; see weight_exchange.LOCAL_SCRATCH_REASON)",
+                        len(_scratch), _scratch[0],
+                    )
+            except Exception as _sexc:  # noqa: BLE001
+                # NAMED, never swallowed: a failure here means the first
+                # forward after this wake runs on the peer's semaphores.
+                logger.error(
+                    "WEG2-RESUME local-scratch zeroing FAILED (%s) -- the "
+                    "first forward after this wake reads the peer's residue "
+                    "in every Marlin workspace", _sexc,
+                )
             card_uuid = self._weg2_card_uuid() or "unknown"
             for tag, (nbytes, tms) in weg2_per_tag.items():
                 # S7 (#1273): THREE FIELDS APPENDED, and the ring planner's

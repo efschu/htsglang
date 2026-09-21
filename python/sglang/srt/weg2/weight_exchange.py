@@ -3022,6 +3022,23 @@ class TagCoverage:
     #: by design.  Named, counted and printed with their reason, so an
     #: ``uncovered=0`` is a real zero and not a relabel of the same tensors.
     exempt: Tuple[str, ...] = ()
+    #: Live tensors under this tag that the plan does not name and that hold
+    #: ZERO bytes (fnFL2 v43: 265 Marlin placeholders -- ``weight_g_idx``,
+    #: ``g_idx_sort_indices``, ``weight_zero_point``, all ``shape=[0]``).  A
+    #: parameter with no storage occupies no page, so the refusal's own
+    #: sentence -- "the destination would serve whatever its arena held" --
+    #: has no referent: there is nothing to serve.  Counted and NAMED here
+    #: rather than dropped, so the population stays auditable.
+    empty: Tuple[str, ...] = ()
+    #: Live tensors under this tag that the plan does not name but that DO
+    #: hold bytes, and that are created locally by the runtime rather than
+    #: read from any checkpoint (``marlin_make_workspace``'s semaphore
+    #: array: 272 int32 = 1088 B per MoE layer).  The exchange has no source
+    #: for them BY CONSTRUCTION, and that is not a defect as long as the
+    #: destination zeroes them itself -- which
+    #: :func:`zero_local_scratch` and the resume-side call in
+    #: ``weight_updater.resume_memory_occupation`` do.
+    local_scratch: Tuple[str, ...] = ()
 
     #: #1335 (B4r): the three verdicts of the two books' comparison.  Named
     #: because withholding a wrong number without putting a word in its place
@@ -3170,6 +3187,13 @@ class TagCoverage:
             + f"attrs={self.n_attributes} "
             + f"exempt={len(self.exempt)} "
             + (f"reason={EXEMPT_REASON} " if self.exempt else "")
+            # fnFL2 v43: APPENDED, never interleaved -- same rule as the
+            # fields above.  Both are populations the plan does not name and
+            # that are NOT refusals; printing their counts is what keeps
+            # "not refused" from reading as "not seen".
+            + f"empty={len(self.empty)} "
+            + f"local_scratch={len(self.local_scratch)} "
+            + (f"scratch_reason={LOCAL_SCRATCH_REASON} " if self.local_scratch else "")
             + (
             f"tms_answered={'yes' if self.tms_bytes else 'no'} "
             f"mode={self.mode}"
@@ -3417,6 +3441,8 @@ def build_coverage(
         uncovered: List[LiveTensor] = []
         short: List[ShortParameter] = []
         exempt: List[str] = []
+        empty: List[str] = []
+        local_scratch: List[str] = []
         n_par = n_buf = n_attr = 0
 
         # Parameters and buffers first: they define WHICH allocations are
@@ -3474,6 +3500,18 @@ def build_coverage(
                         # tiles only three of four device sub-blocks must move
                         # this number, not the storage size it failed to cover.
                         planned_bytes += claim
+                elif int(t.nbytes) == 0:
+                    # fnFL2 v43: a Marlin placeholder (shape [0]).  No
+                    # storage, no page, nothing for the exchange to source
+                    # and nothing for the destination to serve wrongly.
+                    empty.append(t.name)
+                    covered_storage.add(t.storage_key)
+                elif is_local_scratch(t.name):
+                    # Created by the runtime, in no checkpoint and therefore
+                    # in no plan.  Sourceless by construction; the resume
+                    # side memsets it (``zero_local_scratch``).
+                    local_scratch.append(t.name)
+                    covered_storage.add(t.storage_key)
                 else:
                     uncovered.append(t)
             elif t.kind == BUFFER:
@@ -3499,6 +3537,8 @@ def build_coverage(
             short=tuple(short),
             missing=tuple(sorted(set(planned_of_tag) - seen_names)),
             exempt=tuple(sorted(exempt)),
+            empty=tuple(sorted(empty)),
+            local_scratch=tuple(sorted(local_scratch)),
             n_parameters=n_par,
             n_buffers=n_buf,
             n_attributes=n_attr,
@@ -3736,6 +3776,59 @@ def plan_bytes_from_descs(descs: Any) -> PlanBytes:
         add = 0 if getattr(d, "kind", None) == ZEROFILL else int(getattr(d, "nbytes", 0))
         bucket[name] = bucket.get(name, 0) + add
     return out
+
+
+#: Attribute names a RUNTIME builds locally, that live under an exchanged
+#: weights tag, hold bytes, and appear in no checkpoint and therefore in no
+#: plan.  Today exactly one: ``marlin_make_workspace``'s semaphore array
+#: (``marlin_utils.py``: ``torch.zeros(max_workspace_size, dtype=torch.int)``,
+#: registered as a Parameter on the layer).  Marlin REQUIRES it to be zero
+#: when a kernel starts, and the exchange writes no bytes into it, so after a
+#: remap it holds whatever the peer's pages held at that address.  Zeroing it
+#: on resume is not tidying: a non-zero semaphore makes the kernel spin or
+#: read a partial tile.
+LOCAL_SCRATCH_LEAF_NAMES = ("workspace",)
+
+#: Printed beside ``local_scratch=`` for the same reason ``EXEMPT_REASON`` is
+#: printed beside ``exempt=``: a count with no stated ground reads as a number
+#: somebody chose.
+LOCAL_SCRATCH_REASON = ("runtime-local scratch (in no checkpoint and no plan; "
+                        "the exchange has no source for it by construction and "
+                        "the WAKING side memsets it -- zero_local_scratch)")
+
+
+def is_local_scratch(name: str) -> bool:
+    """``True`` for a parameter the runtime creates and the plan cannot name.
+
+    Matched on the LEAF (``...mlp.experts.workspace``), so a checkpoint that
+    ever ships a tensor whose full name merely contains the word does not
+    silently join this class.
+    """
+    return str(name).rsplit(".", 1)[-1] in LOCAL_SCRATCH_LEAF_NAMES
+
+
+def zero_local_scratch(model) -> List[str]:
+    """Memset every local-scratch parameter; returns the names it touched.
+
+    Called on the WAKING side after the weights are back, which is the only
+    moment the pages exist and no kernel is reading them.  Returning the
+    names (rather than a count) keeps the acceptance line auditable: a zero
+    here and a non-empty ``local_scratch=`` on the cover line would be the
+    contradiction that says the wiring is gone.
+    """
+    import torch
+
+    done: List[str] = []
+    for name, param in getattr(model, "named_parameters", lambda: [])():
+        if not is_local_scratch(name):
+            continue
+        data = getattr(param, "data", None)
+        if data is None or data.numel() == 0:
+            continue
+        with torch.no_grad():
+            data.zero_()
+        done.append(name)
+    return done
 
 
 def is_zerofill_by_design(planned_bytes: int, live_bytes: int) -> bool:

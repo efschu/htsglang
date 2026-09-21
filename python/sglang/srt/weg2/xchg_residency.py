@@ -435,6 +435,23 @@ def check_partition(census: XchgCensus) -> List[str]:
     """
     bad: List[str] = []
     flat = _wave_tags(census)
+    # A wave tag NO card carries in ANY group is not a solo placement, it is a
+    # schedule naming bytes that exist nowhere -- refused whole, once, rather
+    # than per card (which would print the same defect six times).
+    borne = {
+        t
+        for t in set(flat)
+        for card in census.cards.values()
+        for group in GROUPS
+        if t in card.tags[group]
+    }
+    nowhere = sorted(set(flat) - borne)
+    if nowhere:
+        bad.append(
+            f"the wave partition names {nowhere}, which NO card carries in "
+            "either group -- an absent tag is not a zero-byte tag, and a wave "
+            "over bytes that exist nowhere prices a schedule nobody runs"
+        )
     dupes = sorted({t for t in flat if flat.count(t) > 1})
     if dupes:
         bad.append(
@@ -456,7 +473,7 @@ def check_partition(census: XchgCensus) -> List[str]:
             other = [g for g in GROUPS if g != group]
             missing = sorted(
                 t
-                for t in set(flat) - set(card.tags[group])
+                for t in (set(flat) & borne) - set(card.tags[group])
                 if any(t in card.tags[g] for g in other)
             )
             if missing:
