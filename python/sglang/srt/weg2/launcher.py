@@ -5100,6 +5100,11 @@ def check_drafter_identity(log_p: str, log_d: str) -> Dict[str, object]:
 
 _RESIDENT_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*resident_mib=(-?\d+(?:\.\d+)?)")
 _HEAD_RELEASED_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*head_released_mib=(-?\d+(?:\.\d+)?)")
+#: #66 (fnFL2v72): the fourth term -- what the private TAG POOLS still cache.
+#: empty_cache cannot reach them (#65 of the same day), so NVML counts those
+#: bytes while residue and release cannot see them: 5334.0 against 2202.6 +
+#: 1212.5 left 1918.9 MiB unexplained and W11b refused a build that was fine.
+_TAG_POOL_INACTIVE_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*tag_pool_inactive_mib=(-?\d+(?:\.\d+)?)")
 _NVML_DELTA_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*nvml_delta_mib=(-?\d+(?:\.\d+)?)")
 #: W11b (#1233 fix 6): how far the BUILD may stay unexplained by the two terms
 #: that claim to explain it, IN EITHER DIRECTION.  MEASURED on boot weg2dk5's
@@ -5149,6 +5154,7 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
     out: Dict[str, object] = {
         "resident_mib": None, "budget_mib": budget, "tol_mib": tol, "over_mib": None,
         "head_released_mib": None, "nvml_delta_mib": None, "unaccounted_mib": None,
+        "tag_pool_inactive_mib": None,
         "accounting_tol_mib": P_DRAFT_BUILD_ACCOUNTING_TOL_MIB,
         "resident_ok": False, "accounted": False, "ok": False,
     }
@@ -5158,6 +5164,7 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
                 for key, rx in (
                     ("resident_mib", _RESIDENT_RE),
                     ("head_released_mib", _HEAD_RELEASED_RE),
+                    ("tag_pool_inactive_mib", _TAG_POOL_INACTIVE_RE),
                     ("nvml_delta_mib", _NVML_DELTA_RE),
                 ):
                     m = rx.search(line)
@@ -5182,7 +5189,13 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
         #     enough apart to disagree).  weg2dk5's -109.9 is this side.
         # Neither direction is a pass: an explanation that does not add up is
         # not an explanation, whichever way it fails to add up.
-        out["unaccounted_mib"] = delta - (r + released)
+        # #66: the tag pools' own cache is the THIRD explaining term, measured
+        # (tag_pool_occupancy) rather than absorbed into a wider tolerance --
+        # empty_cache cannot reach a private pool (#65 of the same day), so
+        # NVML counts those bytes while residue and release cannot see them.
+        pooled = out.get("tag_pool_inactive_mib")
+        pooled = 0.0 if pooled is None or float(pooled) < 0 else float(pooled)
+        out["unaccounted_mib"] = delta - (r + released + pooled)
         out["accounted"] = abs(out["unaccounted_mib"]) <= P_DRAFT_BUILD_ACCOUNTING_TOL_MIB
     out["ok"] = bool(out["resident_ok"] and out["accounted"])
     return out
@@ -5210,7 +5223,8 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
     log(f"W11 DRAFT-RESIDENT P last stage resident_mib={w11['resident_mib']} budget_mib={w11['budget_mib']:.1f} "
         f"tol_mib={w11['tol_mib']:.0f} over_mib={w11['over_mib']} resident_ok={w11['resident_ok']} "
         f"| W11b BUILD-ACCOUNTING nvml_delta_mib={w11['nvml_delta_mib']} = resident_mib + "
-        f"head_released_mib={w11['head_released_mib']} + unaccounted_mib={w11['unaccounted_mib']} "
+        f"head_released_mib={w11['head_released_mib']} + tag_pool_inactive_mib={w11['tag_pool_inactive_mib']} "
+        f"+ unaccounted_mib={w11['unaccounted_mib']} "
         f"(tol {w11['accounting_tol_mib']:.0f}) accounted={w11['accounted']} "
         f"ok={w11['ok']}")
     if not w11["resident_ok"]:
@@ -5224,6 +5238,7 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
         # for. The build must be explained by residue + released.
         raise Weg2LaunchRefused(f"W11b Weg2DraftBuildUnaccounted: nvml_delta_mib={w11['nvml_delta_mib']} is not explained by "
                                 f"resident_mib={w11['resident_mib']} + head_released_mib={w11['head_released_mib']} "
+                                f"+ tag_pool_inactive_mib={w11['tag_pool_inactive_mib']} "
                                 f"(unaccounted {w11['unaccounted_mib']} MiB, tolerance {w11['accounting_tol_mib']:.0f}) -- either the "
                                 f"never-loaded lm_head was unbound from the graph without being freed (fix 2's shape, invisible to "
                                 f"resident_mib by construction) or one of the three instruments did not measure")

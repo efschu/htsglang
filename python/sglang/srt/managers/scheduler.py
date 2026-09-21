@@ -1638,7 +1638,7 @@ class Scheduler(
             "WEG2 DRAFT-KV-PRODUCER armed stage=%d/%d drafter=%s layout=v%d heads=%d "
             "head_dim=%d page_bytes=%d embed=resident mtp_mib=%.1f embed_mib=%.1f "
             "resident_mib=%.1f head_released_mib=%.1f head_deferred=%s "
-            "nvml_delta_mib=%.1f embed_dtype=%s build_s=%.1f",
+            "nvml_delta_mib=%.1f tag_pool_inactive_mib=%.1f embed_dtype=%s build_s=%.1f",
             self.draft_kv_producer.stage,
             self.draft_kv_producer.stages,
             kv_cache_builder.drafter_identity_hash(self.server_args),
@@ -1678,6 +1678,9 @@ class Scheduler(
             self.draft_kv_producer.head_released_mib,
             self.draft_kv_producer.head_deferred,
             self.draft_kv_producer.nvml_delta_mib,
+            # #66: what the private tag pools still cache -- empty_cache cannot
+            # reach them, so NVML counts them and W11b must see them by name.
+            getattr(self.draft_kv_producer, "tag_pool_inactive_mib", -1.0),
             self.draft_kv_producer.embed_dtype,
             self.draft_kv_producer.build_s,
         )

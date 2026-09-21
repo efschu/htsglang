@@ -85,6 +85,7 @@ class DraftKvProducer:
         # the target already paid for it); the NVML delta stays beside it on
         # the L2 line as its own named term, never as the residue.
         self._free_before_mib = _cuda_free_mib()
+        self._pool_inactive_before_mib = _tag_pool_inactive_mib()
         self.resident_mib = -1.0
         self.nvml_delta_mib = -1.0
         self.head_released_mib = 0.0
@@ -301,6 +302,24 @@ class DraftKvProducer:
             self.head_released_mib = _drop_parameters(own_head)
             del own_head
         torch.cuda.empty_cache()
+        # #66 (fnFL2v72): empty_cache does NOT reach a private tag pool -- the
+        # #65 finding of this same day. The draft build runs inside one, so
+        # its load transients stay cached there and NVML counts them, while
+        # W11b's two explaining terms (residue + released) cannot see them:
+        # 5334.0 measured against 2202.6 + 1212.5 left 1918.9 MiB unexplained.
+        # Measure that cache instead of widening a tolerance around it -- an
+        # explanation that names its terms is the whole point of this gate.
+        # MEASURED 21.09. on fnFL2v72's PP2: the pools hold 7649 MiB inactive
+        # after the load, LONG before this build. The absolute number is
+        # therefore the wrong term -- subtracting it would push W11b's
+        # residual strongly negative, and the gate refuses BOTH directions
+        # ("an explanation that does not add up is not an explanation").
+        # What belongs here is the DELTA this build added to that cache.
+        after_pool = _tag_pool_inactive_mib()
+        if after_pool >= 0 and self._pool_inactive_before_mib >= 0:
+            self.tag_pool_inactive_mib = after_pool - self._pool_inactive_before_mib
+        else:
+            self.tag_pool_inactive_mib = -1.0
         mib = sum(p.numel() * p.element_size() for p in params.values()) / float(2**20)
         self.embed_dtype = str(params["weight"].dtype) if "weight" in params else "?"
         after = _cuda_free_mib()
@@ -432,6 +451,29 @@ def _live_weight_mib(model, shared=None) -> float:
         seen.add(ptr)
         total += t.numel() * t.element_size()
     return total / float(2**20)
+
+
+def _tag_pool_inactive_mib() -> float:
+    """MiB the private tag pools hold CACHED (inactive) right now, or -1.
+
+    empty_cache cannot reach a private MemPool (#65, 21.09.), so these bytes
+    are invisible to torch's own accounting and to W11b's residue/release
+    terms -- while NVML counts them. Read before and after the draft build,
+    the DIFFERENCE is what the build added.
+    """
+    try:
+        from sglang.srt.managers.weg2_memory_saver import (
+            _TAG_MEM_POOLS,
+            tag_pool_occupancy,
+        )
+
+        inactive = 0.0
+        for _t in sorted(_TAG_MEM_POOLS):
+            occ = tag_pool_occupancy(_t) or {}
+            inactive += float(occ.get("inactive_gib") or 0.0)
+        return inactive * 1024.0
+    except Exception:  # noqa: BLE001 -- an instrument never fails a boot
+        return -1.0
 
 
 def _cuda_free_mib() -> float:
