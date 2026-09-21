@@ -75,24 +75,30 @@ def test_a_non_compressed_tensors_model_is_never_touched():
 
 # -- die Eigenschaft: genau einmal -----------------------------------------
 
-def test_the_transpose_happens_exactly_once(monkeypatch):
-    """Worker AN -> Verbraucher AUS, und umgekehrt. Nie beide, nie keiner."""
+def test_the_switch_is_locked_because_it_loaded_wrong(monkeypatch):
+    """fnFL2v87 starb eingeschaltet an
+
+        RuntimeError: The size of tensor a (2560) must match the size of
+        tensor b (80) at non-singleton dimension 1
+
+    -- das Praedikat im Worker ist breiter als das des Verbrauchers, der je
+    LAYER-METHODE entscheidet und Zweige hat, die vor der Transposition
+    abbiegen. Und schneller war es auch nicht (PP2 36,7 -> 47,5 s). Also
+    WIRFT der Pfad, statt still falsch zu laden."""
     src = torch.arange(2560 * 80, dtype=torch.int32).reshape(2560, 80)
-    want = src.t().contiguous()
 
     monkeypatch.setenv("SGLANG_LOAD_TRANSPOSE_IN_WORKER", "1")
-    worker_out = qx.Qwen4ExpForConditionalGeneration.weight_post_load(
-        _model(), "model.layers.0.mlp.experts.3.gate_proj.weight_packed", src
-    )
-    assert torch.equal(worker_out, want)        # der Worker hat es getan
-    assert fml._transpose_done_in_worker()      # der Verbraucher laesst es
+    with pytest.raises(RuntimeError, match="DEFECT and locked"):
+        qx.Qwen4ExpForConditionalGeneration.weight_post_load(
+            _model(), "model.layers.0.mlp.experts.3.gate_proj.weight_packed", src
+        )
 
     monkeypatch.setenv("SGLANG_LOAD_TRANSPOSE_IN_WORKER", "0")
-    worker_out = qx.Qwen4ExpForConditionalGeneration.weight_post_load(
+    out = qx.Qwen4ExpForConditionalGeneration.weight_post_load(
         _model(), "model.layers.0.mlp.experts.3.gate_proj.weight_packed", src
     )
-    assert worker_out is src                    # der Worker laesst es
-    assert not fml._transpose_done_in_worker()  # der Verbraucher tut es
+    assert out is src                           # aus: unveraendert durch
+    assert not fml._transpose_done_in_worker()  # und der Verbraucher tut es
 
 
 def test_the_consumer_reads_the_switch_at_the_right_place():
@@ -103,13 +109,15 @@ def test_the_consumer_reads_the_switch_at_the_right_place():
     assert "loaded_weight.t().contiguous() if _needs_ct_transpose else loaded_weight" in src
 
 
-def test_a_one_dimensional_tensor_is_left_alone(monkeypatch):
+def test_the_lock_comes_before_any_shape_logic(monkeypatch):
+    """Die Verriegelung greift VOR jeder Namens- oder Formpruefung -- sonst
+    haengt die Sicherheit an demselben Praedikat, das den Defekt hatte."""
     monkeypatch.setenv("SGLANG_LOAD_TRANSPOSE_IN_WORKER", "1")
     t = torch.arange(8, dtype=torch.int32)
-    out = qx.Qwen4ExpForConditionalGeneration.weight_post_load(
-        _model(), "model.layers.0.mlp.experts.3.gate_proj.weight_shape", t
-    )
-    assert out is t
+    with pytest.raises(RuntimeError, match="DEFECT and locked"):
+        qx.Qwen4ExpForConditionalGeneration.weight_post_load(
+            _model(), "irgendein.name.ohne.experts", t
+        )
 
 
 # -- die Naht im Loader -----------------------------------------------------

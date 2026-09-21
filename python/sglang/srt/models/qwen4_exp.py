@@ -2351,15 +2351,48 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         have. A global switch can be read by both sides and checked by a
         test.
 
-        Off by default; SGLANG_LOAD_TRANSPOSE_IN_WORKER=1 turns it on.
+        DEFEKT UND VERRIEGELT (fnFL2v87, 21.09. 13:54:15Z). Eingeschaltet
+        starb der Boot mit
+
+            RuntimeError: The size of tensor a (2560) must match the size of
+            tensor b (80) at non-singleton dimension 1
+
+        also genau an dem Shape-Konflikt, den diese Naht nicht haben darf. Die
+        Ursache ist das Praedikat, nicht die Idee: der Verbraucher transponiert
+        NICHT jeden Tensor, den `_is_ct_wna16_expert_shard` trifft -- er hat
+        Zweige, die vorher abbiegen (`_load_single_value`, `_load_w13`,
+        `_load_w2`), und die Bedingung dort haengt an der METHODE DES LAYERS,
+        nicht an der quant_config des Modells. Mein Praedikat ist breiter als
+        seins, also transponiert der Worker Tensoren, die der Verbraucher nie
+        angefasst haette.
+
+        UND ES WAR AUCH NICHT SCHNELLER: gemessen wanderte die Zeile zwar aus
+        dem Profil (layer.py:1973 verschwindet, der Verbraucher steht zu
+        34,2 % in threading.wait), aber die Ladezeit STIEG -- PP2 36,7 -> 47,5
+        s, PP1 50,3 -> 57,0 s. Grund: `post_load` laeuft je Datei SERIELL in
+        einem Worker, die acht Worker parallelisieren nur ueber Dateien, und
+        die Sliding-Window-Pipeline hat dadurch weniger Vorlauf. Der Engpass
+        ist umgezogen, nicht kleiner geworden.
+
+        Deshalb WIRFT dieser Pfad, statt still zu laden: ein Schalter, der ein
+        Modell falsch laedt, muss laut sein. Wer ihn wieder einschaltet,
+        braucht zuerst (1) ein Praedikat, das exakt die Tensoren trifft, die
+        der Verbraucher transponiert, und (2) einen Pool, der die Keys EINER
+        Datei aufteilt -- dann greifen die gemessenen 1,55-1,96x, ohne den
+        Verbraucher zu blockieren (#68).
         """
         if not _transpose_in_worker():
             return tensor
-        if not _is_ct_wna16_expert_shard(name, self):
-            return tensor
-        if getattr(tensor, "dim", None) is None or tensor.dim() != 2:
-            return tensor
-        return tensor.t().contiguous()
+        raise RuntimeError(
+            "SGLANG_LOAD_TRANSPOSE_IN_WORKER is set, but the worker-side "
+            "transpose is DEFECT and locked: its predicate is broader than "
+            "the consumer's, which transposes per LAYER METHOD and has "
+            "branches that return before the transpose at all. Boot fnFL2v87 "
+            "died of it (RuntimeError: size of tensor a (2560) must match "
+            "tensor b (80)). It was also SLOWER, not faster (PP2 36,7 -> 47,5 "
+            "s), because post_load runs serially per file. See "
+            "Qwen4ExpForConditionalGeneration.weight_post_load and task #68."
+        )
 
     def weight_name_needed(self, name: str):
         """Loader veto BEFORE a checkpoint tensor is read (weight_utils
