@@ -2728,7 +2728,9 @@ def release_active_tag_pools(reason: str = "") -> int:
     if not _TAG_MEM_POOLS or not torch.cuda.is_available():
         return 0
     device_index = torch.cuda.current_device()
+    before_reserved = torch.cuda.memory_reserved()
     n = 0
+    in_use = 0
     for tag, pool in list(_TAG_MEM_POOLS.items()):
         # THE ACTIVE POOL MUST NOT BE RELEASED (fnFL2 v50, the first cut of
         # this function): ``_cuda_releasePool`` asserts ``use_count == 0``
@@ -2741,6 +2743,7 @@ def release_active_tag_pools(reason: str = "") -> int:
         # layer later, when its own scope has closed.
         try:
             if int(pool.use_count()) != 0:
+                in_use += 1
                 continue
             _cuda_releasePool(device_index, pool.id)
             n += 1
@@ -2749,9 +2752,19 @@ def release_active_tag_pools(reason: str = "") -> int:
                 "WEG2-TAG-POOL release FAILED tag=%s (%s) -- this tag's load "
                 "transients stay pinned for the rest of the boot", tag, exc,
             )
+    freed_gib = (before_reserved - torch.cuda.memory_reserved()) / (1024 ** 3)
     torch.cuda.empty_cache()
-    logger.debug(
-        "WEG2-TAG-POOL released=%d%s", n, f" reason={reason}" if reason else "",
+    # AT INFO, and that is the lesson of fnFL2v51: the first two cuts of this
+    # function logged at DEBUG, the boot's overhead came back IDENTICAL to the
+    # unfixed run (7.58 GiB on the 8-layer stage, 10.10 on the 11-layer one --
+    # to the decimal), and the log could not say whether the release had run,
+    # found nothing to free, or never been reached.  An instrument whose
+    # verdict is invisible cannot be read as a null result.
+    logger.info(
+        "WEG2-TAG-POOL release pools=%d released=%d skipped_in_use=%d "
+        "freed_gib=%.2f%s",
+        len(_TAG_MEM_POOLS), n, in_use, freed_gib,
+        f" reason={reason}" if reason else "",
     )
     return n
 
