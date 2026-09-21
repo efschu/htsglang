@@ -1433,8 +1433,32 @@ class FusedMoE(torch.nn.Module):
             torch.cuda.memory._record_memory_history(max_entries=200000)
         before = expert_offload_release_totals()
         t0 = time.perf_counter()
-        with device_loading_context(self, state["device"]):
-            self.quant_method.process_weights_after_loading(self)
+        # THE REPACK RUNS OUTSIDE THE TAG POOL (fnFL2 v53, 21.09.).  Its [E]
+        # transients are freed the moment it returns, but a private MemPool
+        # never hands cached blocks back while it lives and the pool is cached
+        # per tag, so inside it they stayed pinned for the whole boot: 0.84
+        # GiB per layer, measured identical across two very different expert
+        # bookings (v47/v48).  Releasing the pool instead cannot work -- v52
+        # proved MemPool.use_count() counts the tag cache's own reference
+        # ("pools=6 released=0 skipped_in_use=6 freed_gib=0.00").
+        #
+        # What comes out belongs back INSIDE the pool, because that pool
+        # exists for segment purity (#1378 xsn66: a segment carries the tag it
+        # was opened under) -- a weight left in the default pool would have
+        # the exchange pause a segment holding another tag's bytes.  So:
+        # repack outside, copy the parameters back in, and only then empty the
+        # cache, which now really reaches the transients.
+        from sglang.srt.managers.weg2_memory_saver import (
+            copy_into_tag_pool,
+            outside_tag_pool,
+        )
+
+        with outside_tag_pool(reason="ct-stream-presplit") as _stepped_out:
+            with device_loading_context(self, state["device"]):
+                self.quant_method.process_weights_after_loading(self)
+        _moved_n, _moved_gib = (
+            copy_into_tag_pool(self) if _stepped_out else (0, 0.0)
+        )
         # The repack's [E] transients are freed but stay reserved in the
         # caching allocator; hand them back so the next layer's copy-in and
         # the KV pool are sized against real free memory, not the cache.
@@ -1455,6 +1479,14 @@ class FusedMoE(torch.nn.Module):
 
         release_active_tag_pools(reason="ct-stream-presplit")
         torch.cuda.empty_cache()
+        if _stepped_out:
+            logger.info(
+                "[ct-stream-presplit] layer %s: repack ran OUTSIDE the tag "
+                "pool, %d parameter(s) / %.2f GiB copied back in; reserved "
+                "%.2f GiB after empty_cache",
+                getattr(self, "layer_id", "?"), _moved_n, _moved_gib,
+                torch.cuda.memory_reserved() / 2**30,
+            )
         after = expert_offload_release_totals()
         presplit = getattr(self, "_moe_offload_presplit", None) or {}
         buf_bytes = sum(b.numel() * b.element_size() for b, _ in presplit.values())
