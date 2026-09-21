@@ -3523,7 +3523,23 @@ def build_coverage(
             if t.kind != ATTRIBUTE:
                 continue
             n_attr += 1
-            if t.storage_key not in covered_storage:
+            if t.storage_key in covered_storage:
+                continue
+            # fnFL2 v44: THE SAME TWO POPULATIONS REACH THIS BRANCH, and the
+            # first fix missed it by classifying only Parameters.  Marlin's
+            # workspace arrives here as an ATTRIBUTE, not a Parameter --
+            # ``marlin_utils.py`` rebinds ``layer.workspace`` to a fresh
+            # ``torch.nn.Parameter`` over the same data after registration,
+            # and the walk sees the rebound object.  The kind it is walked
+            # under does not change what it IS, so the classification must
+            # not depend on it.
+            if int(t.nbytes) == 0:
+                empty.append(t.name)
+                covered_storage.add(t.storage_key)
+            elif is_local_scratch(t.name):
+                local_scratch.append(t.name)
+                covered_storage.add(t.storage_key)
+            else:
                 uncovered.append(t)
 
         rows[tag] = TagCoverage(
@@ -3819,15 +3835,34 @@ def zero_local_scratch(model) -> List[str]:
     import torch
 
     done: List[str] = []
-    for name, param in getattr(model, "named_parameters", lambda: [])():
-        if not is_local_scratch(name):
-            continue
-        data = getattr(param, "data", None)
-        if data is None or data.numel() == 0:
-            continue
+    seen: set = set()
+
+    def _zero(name, obj) -> None:
+        data = getattr(obj, "data", obj)
+        if data is None or not hasattr(data, "numel") or data.numel() == 0:
+            return
+        key = (data.data_ptr(), int(data.numel()))
+        if key in seen:
+            return
+        seen.add(key)
         with torch.no_grad():
             data.zero_()
         done.append(name)
+
+    # BOTH WALKS, because the tensor's kind is not stable (fnFL2 v44): Marlin
+    # rebinds its workspace to a new Parameter over the same storage, so it is
+    # a Parameter to ``named_parameters`` on one build and a plain module
+    # attribute on another.  Deduplicated by storage, so a tensor both walks
+    # reach is zeroed once and reported once.
+    for name, param in getattr(model, "named_parameters", lambda: [])():
+        if is_local_scratch(name):
+            _zero(name, param)
+    for mod_name, mod in getattr(model, "named_modules", lambda: [])():
+        for leaf in LOCAL_SCRATCH_LEAF_NAMES:
+            obj = getattr(mod, leaf, None)
+            if obj is None:
+                continue
+            _zero(f"{mod_name}.{leaf}" if mod_name else leaf, obj)
     return done
 
 

@@ -109,3 +109,38 @@ class CoverLineNamesBothPopulations(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheKindIsNotStable(unittest.TestCase):
+    """fnFL2 v44: Marlin rebinds ``layer.workspace`` to a fresh Parameter over
+    the same storage, so the coverage walk sees it as an ATTRIBUTE.  The first
+    fix classified only Parameters and the boot still died, on 8 of the
+    original 273.  Classification must not depend on the kind, and neither may
+    the memset."""
+
+    def test_a_plain_attribute_workspace_is_zeroed_too(self):
+        m = torch.nn.Module()
+        inner = torch.nn.Module()
+        # NOT registered as a parameter: a plain tensor attribute
+        object.__setattr__(inner, "workspace", torch.full((272,), 5, dtype=torch.int32))
+        m.experts = inner
+        done = WX.zero_local_scratch(m)
+        self.assertEqual(done, ["experts.workspace"])
+        self.assertEqual(int(inner.workspace.abs().sum()), 0)
+
+    def test_one_tensor_reached_by_both_walks_is_reported_once(self):
+        m = torch.nn.Module()
+        inner = torch.nn.Module()
+        inner.workspace = torch.nn.Parameter(
+            torch.full((272,), 5, dtype=torch.int32), requires_grad=False
+        )
+        m.experts = inner
+        self.assertEqual(WX.zero_local_scratch(m), ["experts.workspace"])
+
+    def test_the_attribute_branch_classifies_the_same_two_populations(self):
+        import inspect
+
+        src = inspect.getsource(WX.build_coverage)
+        after = src.split("if t.kind != ATTRIBUTE:")[1]
+        self.assertIn("empty.append(t.name)", after)
+        self.assertIn("is_local_scratch(t.name)", after)
