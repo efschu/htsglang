@@ -375,6 +375,50 @@ WEG2_LEG_LEDGER_MAX = 8
 
 
 
+def _diagonal_card_of(group, device: int, phase: str) -> int:
+    """Die Karte der DIAGONAL-Lane -- aus der Halterschaft, nicht aus mir.
+
+    #82 (fnFL2w8, 21.09.): hier stand
+    ``int(getattr(group[0], "dst_rank", device))``, und der Default war
+    nicht der Ausnahmefall, sondern der stille Normalfall. Ein Deskriptor
+    ohne ``dst_rank`` landet schon eine Stufe vorher in der Diagonal-Gruppe
+    (``group_descs_by_pair`` liest ihn mit demselben Default,
+    weight_exchange_bounce.py:2064 -> ``pair_of(-1, -1)``), und DANN nimmt
+    diese Zeile MEINE Karte. Zwei Defaults, dieselbe Luecke, und zusammen
+    ergeben sie eine Lane, auf der niemand deponiert.
+
+    GEMESSEN an fnFL2w8: P sammelte auf 9 Lanes, D bediente 6. Die drei
+    ueberzaehligen waren c1, c2 und p3 -- genau die Diagonal-Lanen der
+    Karten, auf denen die sammelnden PP-Stufen SELBST sitzen. Der Tensor
+    ``layers.29.attn_hyper_connection.block_inject_weight.weight`` liegt auf
+    BEIDEN Seiten auf rank 0 (der 5090), P wartete trotzdem auf c1. Drei
+    Boots (w3/w7/w8) sind daran gestorben.
+
+    Unter symmetrischen Layouts faellt der Fehler nicht auf: da IST die
+    eigene Karte die Zielkarte. Unter Form A haelt der Attention-Host alles,
+    und die Worker-Karten haben auf ihrer Diagonalen nichts abzulegen.
+
+    Deshalb VERWEIGERT diese Funktion, statt zu raten. Ein Flip, der auf der
+    falschen Lane lauscht, stirbt ohnehin -- nur 120 s spaeter und ohne zu
+    sagen, woran. Die Verweigerung nennt Phase, Tensor und die Karte, die
+    ich genommen haette.
+    """
+    first = group[0] if group else None
+    card = getattr(first, "dst_rank", None)
+    if card is None:
+        name = getattr(first, "name", None) or getattr(first, "tag", "?")
+        raise RuntimeError(
+            f"W82 Weg2DiagonalCardUnknown: phase={phase} the diagonal lane "
+            f"needs the card that HOLDS the tensor, and this descriptor "
+            f"carries no dst_rank (first of {len(group)}: {name!r}). Falling "
+            f"back to my own card ({device}) is what made P wait on c1/c2/p3 "
+            f"in fnFL2w8 while D deposited on c0 -- a lane nobody serves. "
+            f"Set dst_rank on the descriptor, or route this tensor as a "
+            f"cross pair."
+        )
+    return int(card)
+
+
 def _any_scheduler_process_alive() -> bool:
     """Lebt ueberhaupt noch ein Scheduler ausser mir? (#79)
 
@@ -5665,7 +5709,7 @@ class SchedulerWeightUpdaterManager:
                             slot_bytes=_lane_bytes or xr.SLOT_BYTES,
                             pair=None if pair is None else int(pair),
                             card=(None if pair is not None else
-                                  int(getattr(group[0], "dst_rank", device))),
+                                  _diagonal_card_of(group, device, phase)),
                             liveness=self._weg2_cocard_peer_alive,
                             # weg2xsn86: (tag, name) pairs consumed but not
                             # written -- MEASURED target shares of the draft.
