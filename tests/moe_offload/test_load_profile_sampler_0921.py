@@ -61,3 +61,39 @@ def test_it_is_off_unless_the_env_says_on_and_never_blocks_the_load():
     # keep a model from loading
     assert src.count("except Exception:") == 2
     assert "_prof, _prof_t0 = None, time.perf_counter()" in src
+
+
+def test_the_sampler_holds_no_frame_across_its_wait():
+    """DIE EIGENSCHAFT, die drei Boots gekostet hat.
+
+    sys._current_frames() liefert die Frames ALLER Threads, und eine Frame
+    haelt ihre Locals am Leben -- beim Laden die Gewichts-Tensoren. Die erste
+    Fassung band die Frame und wartete DANN 50 ms; bei 20 Hz hing damit
+    dauerhaft ein Satz fest. GEMESSEN: mit Profiler reservierte der Allokator
+    auf der 5090 29,01-29,04 GiB (0,01-0,05 GiB frei), ohne ihn 28,56 GiB
+    (0,49 frei), bei identischem `allocated` -- und zwei Boots starben im
+    Graph-Capture daran.
+    """
+    import inspect
+
+    src = inspect.getsource(_LoadSampler._run)
+    # die Referenzen sind VOR dem Warten geloescht
+    i_del = src.index("del _f, _frames")
+    i_wait = src.index("self._stop.wait(")
+    assert i_del < i_wait, "Frame-Referenz ueberlebt das wait"
+    # und es wird nichts anderes gebunden, was eine Frame haelt
+    assert "frame = sys._current_frames()" not in src
+    # der Ort ist zu diesem Zeitpunkt schon eine Zeichenkette
+    assert 'site = "%s:%d %s" %' in src
+
+
+def test_it_still_counts_after_the_fix():
+    s = _LoadSampler(hz=200.0)
+    s.start()
+    t_end = time.perf_counter() + 0.15
+    while time.perf_counter() < t_end:
+        pass
+    sink = _Sink()
+    s.report(sink, 0.15)
+    assert len(sink.lines) == 1 and "WEG2 LOAD-PROFILE" in sink.lines[0]
+    assert "test_load_profile_sampler_0921.py" in sink.lines[0]

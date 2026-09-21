@@ -1027,9 +1027,34 @@ class _LoadSampler:
 
     def _run(self):
         while not self._stop.is_set():
-            frame = sys._current_frames().get(self._target)
-            if frame is not None:
-                site = f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno} {frame.f_code.co_name}"
+            # DAS INSTRUMENT DARF DAS GEMESSENE NICHT FESTHALTEN.
+            #
+            # `sys._current_frames()` liefert die Frames ALLER Threads, und
+            # eine Frame haelt ihre lokalen Variablen am Leben -- beim Laden
+            # also die Gewichts-Tensoren des Ladethreads. Die erste Fassung
+            # band `frame` in einer lokalen Variable und wartete DANN 50 ms:
+            # bei 20 Hz hing damit praktisch dauerhaft ein Satz Frames fest.
+            #
+            # GEMESSEN, drei Boots lang unbemerkt: mit Profiler reservierte der
+            # Allokator auf der 5090 29,01-29,04 GiB und liess 0,01-0,05 GiB
+            # frei, ohne ihn 28,56 GiB und 0,49 GiB (fnFL2v72 gegen v84/v85/
+            # v88, `allocated` in allen vier identisch 18,34 GiB). Die 450 MiB
+            # Unterschied haben zwei Boots im Graph-Capture gekillt -- das
+            # Instrument hat verhindert, was es messen sollte.
+            #
+            # Deshalb: alles Noetige SOFORT in Zeichenketten und Zahlen
+            # ueberfuehren, jede Frame-Referenz vor dem Warten loeschen.
+            _frames = sys._current_frames()
+            _f = _frames.get(self._target)
+            site = None
+            if _f is not None:
+                site = "%s:%d %s" % (
+                    os.path.basename(_f.f_code.co_filename),
+                    _f.f_lineno,
+                    _f.f_code.co_name,
+                )
+            del _f, _frames          # VOR dem wait, nicht am Schleifenende
+            if site is not None:
                 self._counts[site] = self._counts.get(site, 0) + 1
                 self._n += 1
             self._stop.wait(self._interval)
