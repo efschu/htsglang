@@ -465,7 +465,16 @@ def poll_status_words() -> int:
             # stop asking. `poll_status_word`'s own pre-check catches the
             # mapped-but-released case BEFORE the copy; this is the belt for
             # every failure shape it cannot see in advance.
-            _disarm = getattr(t, "_abort_poll_disarm", None)
+            # #99 (fnFL2w30, TP0): hier stand `t` -- eine Variable, die es in
+            # dieser Funktion nicht gibt; die Schleife heisst `transport`.
+            # Der NameError flog IM Fehlerpfad, verhinderte genau das Disarm,
+            # das dieser Block leistet, und der naechste Poll toetete den
+            # Prozess im Segfault. Der #1330-Fix hat damit die Form
+            # reproduziert, die sein eigener Kommentar beschreibt ("the
+            # process died in the driver a moment later with a segfault, not
+            # at the raise"). Erreichbar erst, wenn ein Poll WIRKLICH
+            # scheitert -- deshalb hat ihn kein Test und kein Boot betreten.
+            _disarm = getattr(transport, "_abort_poll_disarm", None)
             if callable(_disarm):
                 _disarm("the status poll raised; see the traceback above")
     return tripped
