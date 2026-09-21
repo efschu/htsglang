@@ -12891,6 +12891,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
+    # #71 (fnFL2v96): DIE FRONT SCHREIBT IN EINE DATEI, ALSO PUFFERT PYTHON
+    # BLOCKWEISE -- und ein Tod vor dem ersten vollen Block hinterlaesst NICHTS.
+    #
+    # Gemessen: v96 erreichte beide Gruppen READY (P 159,0 s, D 222,1 s, W11b
+    # gruen), dann verweigerte der Launcher mit "group front not READY on
+    # :30030 after 120 s (Connection refused)" -- und der front.log enthielt
+    # keine einzige Zeile der Front selbst, nur die des Launchers. Nicht weil
+    # sie nichts tat, sondern weil stdout hier ein FILE ist (`stdout=ffh`
+    # unten) und nicht ein TTY: Python schaltet dann von zeilen- auf
+    # blockgepuffert (8 KiB), und was im Puffer steht, wenn der Prozess
+    # abgeraeumt wird, ist verloren.
+    #
+    # Ein Prozess, dessen letzte 120 s unsichtbar sind, ist nicht
+    # diagnostizierbar -- und das ist bei dem Prozess, der den Flip fuehrt,
+    # der teuerste Blindflug im ganzen Boot. Die Gruppen selbst sind nicht
+    # betroffen (ihre Logger flushen je Zeile); es geht allein um die Front.
+    fenv["PYTHONUNBUFFERED"] = "1"
     # C14 / FIX 2 round 2: the BOOT half of the VRAM credit epoch.  Launcher
     # OUTPUT in exactly the class of TMS_HOST_RING_MAP (R19), never an operator
     # knob: it is this boot's ring epoch, the same nonce every rank already got
