@@ -5339,9 +5339,17 @@ def presplit_expert_offload_after_repack(
             # darauf loszulassen -- die Datei waere doppelt verkleinert und
             # der letzte Rang schriebe hinter ihr Ende. Explizit als
             # `num_slots` durchreichen, damit genau eine Stelle rechnet.
+            # #84: DIE ZEILEN, DIE DIESER RANG WIRKLICH BELEGT -- und nur
+            # die werden gepinnt. `_s_index` bildet lokale Id -> Store-Zeile
+            # ab und enthaelt genau die kalten (`spill_ids` schliesst die
+            # Residenten aus, :1529). Die residenten Zeilen bleiben damit
+            # unberuehrt: nie geschrieben, nie gepinnt, also sparse und
+            # kostenlos. Vorher pinnte `cudaHostRegister` die GANZE Datei
+            # und faultete jede Seite ein -- gemessen fnFL2w11: 58,01 GiB
+            # nominal, 58,01 GiB belegt, 0 Nullseiten.
             spill, _created = _es.open_store(
                 s_dir, s_key, attr, s_num, tuple(t.shape[1:]), t.dtype,
-                num_slots=s_num,
+                num_slots=s_num, rows=list(_s_index.values()),
             )
             # Only the COLD rows go to the host (flip design 20.09.: a row a
             # card holds in some layout is taken from that card over BAR1, the

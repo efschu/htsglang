@@ -120,6 +120,7 @@ def open_store(
     dtype: torch.dtype,
     register=None,
     num_slots: Optional[int] = None,
+    rows: Optional[Iterable[int]] = None,
 ) -> Tuple[torch.Tensor, bool]:
     """The ``(slots, *row_shape)`` tensor backed by the store file.
     Returns (tensor, created): the first opener creates the file (zero pages),
@@ -135,9 +136,29 @@ def open_store(
     os.makedirs(directory, exist_ok=True)
     path = store_path(directory, layer_key, attr)
     slots = int(num_slots) if num_slots is not None else slots_for(int(num_experts))
-    return shared_pinned_empty(
-        path, (int(slots),) + tuple(int(d) for d in row_shape), dtype, register
-    )
+    shape = (int(slots),) + tuple(int(d) for d in row_shape)
+    # #84 (21.09., Nutzer-Order "DU GIBST DIE UEBERFLUESSIGEN MOE SEITEN IM
+    # SYSTEMRAM NICHT FREI"): nur die Zeilen pinnen, die wirklich benutzt
+    # werden. GEMESSEN an fnFL2w11: die Datei ist nominal 58,01 GiB und
+    # belegt 58,01 GiB -- KEINE Nullseite, obwohl `spill_ids` die Residenten
+    # ausschliesst und sie nie geschrieben werden. Der Grund ist die
+    # Registrierung ueber die GANZE Datei: Pinning faultet jede Seite ein.
+    # Die residenten Experten haben dadurch eine Host-Kopie, die niemand
+    # schreibt und niemand liest.
+    #
+    # `rows` sind die Zeilen, die dieser Rang wirklich belegt. Daraus werden
+    # Byte-Bereiche; `_page_align` verschmilzt sie, und weil die Residenten
+    # je Rangbereich die ERSTEN sind, bleiben es wenige zusammenhaengende
+    # Spannen statt hunderter Einzelregistrierungen.
+    _ranges = None
+    if rows:
+        _row_bytes = 1
+        for d in row_shape:
+            _row_bytes *= int(d)
+        _row_bytes *= torch.empty((), dtype=dtype).element_size()
+        _ranges = [(int(r) * _row_bytes, (int(r) + 1) * _row_bytes)
+                   for r in sorted({int(r) for r in rows}) if 0 <= int(r) < slots]
+    return shared_pinned_empty(path, shape, dtype, register, pin_ranges=_ranges)
 
 
 def global_rows(local_ids: Iterable[int], lo: int, pad: bool = True) -> Dict[int, int]:

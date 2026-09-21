@@ -68,12 +68,57 @@ def open_shared_file(path: str, nbytes: int) -> Tuple[int, bool]:
     return fd, created
 
 
+def _page_align(ranges, nbytes: int):
+    """Byte-Bereiche auf Seitengrenzen runden und verschmelzen.
+
+    `cudaHostRegister` verlangt seitenausgerichtete Adressen. NACH AUSSEN
+    runden ist die sichere Richtung: ein paar Byte zu viel zu pinnen kostet
+    eine Seite, ein paar zu wenig laesst die GPU auf ungepinnte Seiten
+    zeigen. Ueberlappende oder benachbarte Bereiche werden verschmolzen,
+    damit aus 450 kalten Zeilen nicht 450 Registrierungen werden.
+    """
+    page = 4096
+    out = []
+    for lo, hi in sorted((int(a), int(b)) for a, b in ranges if int(b) > int(a)):
+        lo = max(0, (lo // page) * page)
+        hi = min(int(nbytes), -(-hi // page) * page)
+        if hi <= lo:
+            continue
+        if out and lo <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], hi))
+        else:
+            out.append((lo, hi))
+    return out
+
+
 def shared_pinned_empty(
-    path: str, shape, dtype: torch.dtype, register: Optional[bool] = None
+    path: str, shape, dtype: torch.dtype, register: Optional[bool] = None,
+    pin_ranges=None,
 ):
     """A CPU tensor of ``shape``/``dtype`` backed by the MAP_SHARED tmpfs file
     ``path``, page-locked in this process when CUDA is available (or when
-    ``register`` is True). Returns (tensor, created)."""
+    ``register`` is True). Returns (tensor, created).
+
+    ``pin_ranges`` (Byte-Paare) registriert NUR DIESE BEREICHE statt der
+    ganzen Datei -- der Hebel gegen den Host-RAM, und zwar der einzige, der
+    ohne Umnummerierung auskommt.
+
+    WARUM DAS UEBERHAUPT ETWAS SPART (gemessen fnFL2w11, 21.09.): die Datei
+    ist nominal 58,01 GiB gross und belegt 58,01 GiB -- keine einzige
+    Nullseite, obwohl nur die KALTEN Zeilen je geschrieben werden
+    (`spill_ids` schliesst die Residenten aus, expert_offload.py:1529).
+    Der Grund ist genau diese Registrierung: `cudaHostRegister` ueber die
+    ganze Datei faultet JEDE Seite ein, auch die, in die nie jemand
+    schreibt. Die residenten Experten haben damit eine Host-Kopie, die
+    niemand schreibt und niemand liest -- sie existiert nur, weil das
+    Pinning sie anfasst. Bei P (0.12/0.3/0.3 auf 171/171/170) sind das 123
+    von 512 Zeilen = 24 % der Datei.
+
+    Die Datei behaelt ihre VOLLE Groesse, damit die globale Experten-Id der
+    Zeilenindex bleibt und beide Ranggruppen dieselbe Adresse rechnen. Nur
+    der Inhalt schrumpft. Das ist der Unterschied zur Umnummerierung
+    (#72-Slot-Pool), die eine gemeinsame Residenzmenge beider Gruppen
+    gebraucht haette und deshalb am Metall 0 GiB brachte."""
     shape = tuple(int(d) for d in shape)
     nbytes = _nbytes(shape, dtype)
     if nbytes == 0:
@@ -86,20 +131,30 @@ def shared_pinned_empty(
     flat = torch.frombuffer(mm, dtype=torch.uint8)
     ptr = flat.data_ptr()
     do_register = torch.cuda.is_available() if register is None else register
-    registered = False
+    spans = _page_align(pin_ranges, nbytes) if pin_ranges else [(0, nbytes)]
+    pinned_ptrs = []
     if do_register:
-        err = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, _CUDA_HOST_REGISTER_MAPPED)
-        if int(err) != 0:
-            mm.close()
-            raise RuntimeError(
-                f"cudaHostRegister({nbytes} bytes of {path}) failed with cudaError {int(err)}"
+        for lo, hi in spans:
+            err = torch.cuda.cudart().cudaHostRegister(
+                ptr + lo, hi - lo, _CUDA_HOST_REGISTER_MAPPED
             )
-        registered = True
+            if int(err) != 0:
+                for q in pinned_ptrs:
+                    try:
+                        torch.cuda.cudart().cudaHostUnregister(q)
+                    except Exception:  # noqa: BLE001
+                        pass
+                mm.close()
+                raise RuntimeError(
+                    f"cudaHostRegister({hi - lo} bytes at +{lo} of {path}) "
+                    f"failed with cudaError {int(err)}"
+                )
+            pinned_ptrs.append(ptr + lo)
 
-    def _release(m=mm, p=ptr, reg=registered):
-        if reg:
+    def _release(m=mm, ps=tuple(pinned_ptrs)):
+        for q in ps:
             try:
-                torch.cuda.cudart().cudaHostUnregister(p)
+                torch.cuda.cudart().cudaHostUnregister(q)
             except Exception:  # noqa: BLE001 -- teardown never raises
                 pass
         try:
