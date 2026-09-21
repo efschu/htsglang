@@ -327,6 +327,13 @@ class _Index:
         self.global_writers: dict[tuple[str, str], set[str]] = defaultdict(set)
         #: module-level names read -> {reader qual}
         self.global_readers: dict[tuple[str, str], set[str]] = defaultdict(set)
+        #: module-level names read INSIDE A ``return`` EXPRESSION -> {reader}
+        #: -- the accessor subset.  A function that returns the global it
+        #: also writes is a memo, not an orphan: the value leaves through
+        #: its return, and its callers are the real readers.  Kept apart
+        #: from ``global_readers`` because the verdict rule needs both
+        #: readings: "who touches it" and "who hands it on".
+        self.global_return_readers: dict[tuple[str, str], set[str]] = defaultdict(set)
         #: every module-level assignment target, per module
         self.module_globals: dict[str, set[str]] = defaultdict(set)
 
@@ -438,6 +445,14 @@ class _IndexVisitor(ast.NodeVisitor):
                 self.idx.global_readers[(self.rel, node.id)].add(owner)
         self.generic_visit(node)
 
+    def visit_Return(self, node: ast.Return) -> None:
+        owner = self._owner()
+        if owner is not None and node.value is not None:
+            for sub in ast.walk(node.value):
+                if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                    self.idx.global_return_readers[(self.rel, sub.id)].add(owner)
+        self.generic_visit(node)
+
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if isinstance(node.ctx, ast.Load):
             owner = self._owner()
@@ -546,7 +561,26 @@ def orphan_verdicts(idx: _Index, entries: tuple[tuple[str, str], ...],
         live_writers = sorted(w for w in writers if w in reach)
         if not live_writers:
             continue          # nothing records it on a live path -> no debt
-        readers = {r for r in idx.global_readers.get((rel, name), ()) if r not in writers}
+        # THE WRITER IS EXCLUDED, EXCEPT WHERE IT IS AN ACCESSOR.
+        #
+        # Excluding the writer is right for a VERDICT slot: a function that
+        # stores its own answer and reads it back has not handed it to
+        # anybody, which is exactly the W84 shape.  It is WRONG for the memo
+        # shape, where the writer IS the reader on purpose -- it computes
+        # once, caches, and RETURNS the cached value, so the value does leave
+        # and the callers are the readers.  The two are told apart by HOW the
+        # writer reads it: inside a ``return`` expression (accessor) or not
+        # (self-consuming verdict).
+        #
+        # Measured on this tree: without the distinction
+        # ``weight_exchange_bounce.py::_PTR_ATTRS_BINDING`` is reported as
+        # "read by NOBODY" while line 2507 returns it.  An allowlist was the
+        # alternative and is refused: this ratchet carries an EMPTY one by
+        # construction, so a false positive is fixed in the RULE or it is not
+        # fixed at all.
+        _all = idx.global_readers.get((rel, name), ())
+        _accessors = idx.global_return_readers.get((rel, name), set())
+        readers = {r for r in _all if r not in writers or r in _accessors}
         live_readers = sorted(r for r in readers if r in reach)
         if not live_readers:
             out.append((rel, name, live_writers, sorted(readers)))
