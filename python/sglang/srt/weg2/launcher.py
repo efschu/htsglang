@@ -11979,7 +11979,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # `resolve_*` function to refuse here -- `bounce_terms` itself is what
     # refuses the one real danger (band_credit armed without max_tag_bytes).
     _band_credit = bool(getattr(ns, "xchg_band_credit", False))
-    if xchg_bounce_arm_pins_host(ns.weg2_weight_source, ns.weg2_xchg_oncard):
+    # #77 (fnFL2w3, 21.09.): ZWEI FRAGEN, BISHER EINE ANTWORT.
+    # `xchg_bounce_arm_pins_host` beantwortet "pinnt dieser Arm HOST-Bytes?"
+    # und ist bei `oncard=ipc` korrekt FALSCH -- eine VRAM-Bounce wird mit
+    # ihrem eigenen Leg befreit, kein Host-Byte bleibt liegen. Daran hing aber
+    # auch die PUBLIKATION DER TERME, und die braucht jeder Austausch-Arm:
+    # der Rang sizet seinen DEPOSIT daraus. Ohne sie ueberspringt die
+    # schlafende Gruppe ihre Tags --
+    #
+    #   WEG2-XCHG-DEPOSIT-SKIPPED group=D rank=1: the arm published no bounce
+    #   terms (SGLANG_WEG2_XCHG_BOUNCE_TERMS), so this rank cannot size a
+    #   deposit
+    #
+    # -- gemessen an fnFL2w3: von 16 Chunk-Tags wurde GENAU EINER deponiert
+    # (weights_0, 643-693 ms je Rang), die anderen 15 uebersprungen. Die
+    # wachende Gruppe wartete daraufhin ihr volles Lane-Budget von 120 s auf
+    # `unit 0` von `weights_9`, was exakt dem Front-Bound entspricht, also
+    # STALL epoch=0 elapsed=129,2 s, dann W29 auf resume_memory_occupation und
+    # 0/6 Raenge.
+    #
+    # Die Ledger-Buchung bleibt am ENGEREN Praedikat (sie zahlt Host-Bytes,
+    # die es bei ipc nicht gibt); publiziert wird, sobald ueberhaupt getauscht
+    # wird. Ein Term, den niemand allokiert, kostet nichts -- ein fehlender
+    # Term kostet den Boot.
+    _xchg_armed = str(ns.weg2_weight_source) != WEIGHT_SOURCE_DEFAULT
+    if _xchg_armed:
         # #1368: THE SAME LANE COUNT THE LEDGER CHARGES. The terms published
         # here are the INPUTS the ranks recompute from, and `n_lanes` is one of
         # them (xchg_bounce._TERM_FIELDS) -- so leaving it at the default while
