@@ -696,7 +696,9 @@ def resident_slot_count(num_local_experts: int, fraction: float) -> int:
     return max(1, min(num_local_experts, n))
 
 
-def scratch_slot_count(resident_count: int) -> int:
+def scratch_slot_count(
+    resident_count: int, num_local_experts: Optional[int] = None
+) -> int:
     """Scratch slots C for the fixed-resident buffer (env-overridable).
 
     The GPU buffer is (resident_count + C) slots; C bounds the unique SPILL
@@ -704,14 +706,33 @@ def scratch_slot_count(resident_count: int) -> int:
     big enough to hold a decode step's spilled top-k, small enough to keep the
     GPU buffer modest (buffer/E fraction determines resident-VRAM). Override via
     SGLANG_MOE_SCRATCH_SLOTS.
+
+    ``num_local_experts`` CLAMPS C to the rows that exist: the buffer is built
+    as ``min(R + C, E)`` (the plan cannot hold more rows than the rank owns)
+    while the pool-mode capture asserts ``buffer_size == R + C``, so an
+    unclamped C above ``E - R`` makes the two disagree and the decode graph
+    refuses -- fnFL2v64 died on ``pool mode requires buffer_size == R+C
+    (61 != 2+60)`` with E=61, R=2 and the default C=60. Clamping here, at the
+    single source both sides read, is what keeps them equal by construction.
+    A rank that cannot spare two scratch rows is refused rather than clamped
+    to a pool that the staging width (``C - 1``) cannot use.
     """
     import os
 
     env = os.environ.get("SGLANG_MOE_SCRATCH_SLOTS", "")
     picked = scratch_slots_from_env(env, _scratch_env_rank_and_size())
-    if picked is not None:
-        return picked
-    return max(8, resident_count // 4)
+    want = picked if picked is not None else max(8, resident_count // 4)
+    if num_local_experts is None:
+        return want
+    room = int(num_local_experts) - int(resident_count)
+    if room < 2:
+        raise ValueError(
+            f"expert pool: {num_local_experts} owned experts with "
+            f"{resident_count} resident leave {room} scratch row(s); the pool "
+            "needs at least 2 (the staging width is C-1). Lower the residency "
+            "fraction for this rank."
+        )
+    return min(want, room)
 
 
 def _scratch_env_rank_and_size():
@@ -1506,7 +1527,7 @@ def plan_load_time_staging(
     resident_ids = pinned + rest[: R - len(pinned)]
     resident_set = set(resident_ids)
     spill_ids = [e for e in range(E) if e not in resident_set]
-    C = scratch_slot_count(R)
+    C = scratch_slot_count(R, E)
 
     # #394: residency above is already fixed; only the cold pool is re-owned.
     # A pinned expert (the #82 pad expert at id E-1) is resident, so it is not
@@ -3099,7 +3120,9 @@ class MoEExpertOffloadCache:
             or getattr(layer, "num_local_experts")
         )
         self.resident_count = resident_slot_count(self.num_local_experts, fraction)
-        self.scratch = scratch_slot_count(self.resident_count)
+        self.scratch = scratch_slot_count(
+            self.resident_count, self.num_local_experts
+        )
         self.planner = ExpertResidencyPlanner(
             num_local_experts=self.num_local_experts,
             resident_count=self.resident_count,
