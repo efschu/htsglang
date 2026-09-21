@@ -171,6 +171,56 @@ def global_rows(local_ids: Iterable[int], lo: int, pad: bool = True) -> Dict[int
     return out
 
 
+RESIDENT_IDS_ENV = "SGLANG_MOE_EXPERT_STORE_RESIDENT_IDS"
+
+
+def shared_resident_ids():
+    """Die GLOBALEN Experten-Ids, die BEIDE Gruppen resident halten, oder ``None``.
+
+    #95, gemessen fnFL2w24: P (tp1) schrieb 324 Plaetze, D (tp3) wollte 512
+    -- und jeder D-Rang rechnete eine eigene Zahl (421/467/463). Der Grund
+    ist eine Annahme in #91/3: dort galt das Hotset EINES Rangs als die
+    ganze residente Menge. Unter tp1 stimmt das, denn ein Rang haelt alle
+    512 Experten. Unter tp3 kennt jeder Rang nur seinen Bereich, also
+    rechnet er 512 minus SEINE 91 statt 512 minus ALLE 188.
+
+    Die Plaetzezahl des Stores ist aber eine GLOBALE Groesse: eine Datei je
+    Layer und Attribut, geteilt ueber Raenge UND Gruppen. Deshalb gibt der
+    Launcher sie vor -- er ist die einzige Stelle, die beide Gruppen kennt,
+    genau wie bei :func:`shared_geometry`.
+
+    Als Komma-Liste oder als Pfad zu einer JSON-Liste. KONSERVATIV: alles
+    Unlesbare, Negative oder Leere gibt ``None``, dann bleibt es beim
+    bisherigen Weg. Eine falsche globale Menge waere eine falsche
+    Slot-Zuordnung, und die ist Datenverlust, nicht Speicherverlust.
+    """
+    raw = os.environ.get(RESIDENT_IDS_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.startswith("[") or os.path.sep in raw:
+            if not raw.startswith("["):
+                with open(raw) as fh:
+                    roh = json.load(fh)
+            else:
+                roh = json.loads(raw)
+        else:
+            roh = [x for x in raw.split(",")]
+        if not isinstance(roh, (list, tuple)):
+            return None
+        ids = set()
+        for x in roh:
+            t = str(x).strip()
+            if not t or not t.lstrip("+").isdigit():
+                return None
+            ids.add(int(t))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not ids or any(i < 0 for i in ids):
+        return None
+    return frozenset(ids)
+
+
 def shared_geometry():
     """Die gemeinsame Store-Geometrie ``(ratios, fractions)`` oder ``None``.
 

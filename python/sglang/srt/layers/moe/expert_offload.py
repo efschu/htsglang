@@ -5251,6 +5251,16 @@ def _expert_store_rows_for(layer, plan):
                                     resident_ids=_not_mine,
                                     num_experts=num_global)
             _span = _es.slot_base_for_rank(_ratios, _fracs, _rank + 1) - _base
+            # #95 (fnFL2w24): DIE PLAETZEZAHL IST EINE GLOBALE GROESSE.
+            # `_hot_ids` ist das Hotset DIESES Rangs. Unter tp1 (Gruppe P)
+            # ist das zugleich die ganze Residenz, unter tp3 (Gruppe D) nur
+            # ein Drittel -- gemessen rechnete P 324 Plaetze und die drei
+            # D-Raenge 421/467/463 fuer DIESELBE Datei. Steht die globale
+            # Menge, gilt sie; sonst bleibt es bei der alten Annahme, die
+            # unter tp1 richtig ist.
+            _global_res = _es.shared_resident_ids()
+            if _global_res is not None:
+                _hot_ids = set(_global_res) | set(_hot_ids or ())
             if _hot_ids is not None:
                 # #91/3: STEHT EIN GEMEINSAMES HOTSET, IST DIE KALTE MENGE IN
                 # BEIDEN GRUPPEN DIESELBE -- dann folgt die Zuordnung direkt
