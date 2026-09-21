@@ -111,3 +111,45 @@ def test_the_store_is_big_because_of_reserved_slots_not_content():
 
     src = inspect.getsource(es.open_store)
     assert "slots_for(int(num_experts))" in src
+
+
+def test_slot_rows_packs_the_cold_experts_without_gaps():
+    """Die Indirektion: 8 Experten, 3 resident -> 5 Plaetze, und die kalten
+    Ids liegen lueckenlos auf 0..4."""
+    res, N = {1, 4, 6}, 8
+    got = es.slot_rows([0, 2, 3, 5, 7], lo=0, pad=False,
+                       resident_ids=res, num_experts=N)
+    assert got == {0: 0, 2: 1, 3: 2, 5: 3, 7: 4}
+    assert es.slots_for(N, len(got) / N) == 5
+
+
+def test_every_rank_computes_the_same_slot_without_talking():
+    """Der Kern: der Store ist GETEILT. Zwei Raenge mit disjunkten lokalen
+    Ids muessen fuer dieselbe globale Id denselben Platz errechnen -- sonst
+    braeuchte es einen Konsens ueber Prozessgrenzen."""
+    res, N = {1, 4, 6}, 8
+    a = es.slot_rows([0, 2], lo=0, pad=False, resident_ids=res, num_experts=N)
+    b = es.slot_rows([2, 3], lo=0, pad=False, resident_ids=res, num_experts=N)
+    assert a[2] == b[2] == 1
+
+
+def test_a_resident_gets_no_slot():
+    """Residente liegen auf der Karte und brauchen keinen Host-Platz. Kaeme
+    einer doch, ist Weglassen der sichere Ausgang -- eine fehlende Zeile
+    holt der Leser von der Karte, eine ueberschriebene ist Datenverlust."""
+    assert es.slot_rows([1], lo=0, pad=False,
+                        resident_ids={1, 4, 6}, num_experts=8) == {}
+
+
+def test_without_residency_knowledge_nothing_changes():
+    """Byte-identisch zu heute, wenn der Aufrufer keine Residenz kennt."""
+    plain = es.global_rows([1, 2, 3], lo=10, pad=True)
+    assert es.slot_rows([1, 2, 3], lo=10, pad=True) == plain
+
+
+def test_the_pad_convention_survives():
+    """Die Nullzeile des Experten-Shards (#74) bleibt ausgenommen, auch im
+    Slot-Pool -- sie hat in keiner der beiden Welten eine Zeile."""
+    got = es.slot_rows([0, 1, 2], lo=0, pad=True,
+                       resident_ids=set(), num_experts=4)
+    assert 0 not in got and got == {1: 0, 2: 1}

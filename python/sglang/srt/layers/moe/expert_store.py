@@ -53,6 +53,7 @@ __all__ = [
     "slot_fraction",
     "slots_for",
     "global_rows",
+    "slot_rows",
     "write_rows",
     "mark_rows_written",
     "rows_written",
@@ -151,6 +152,50 @@ def global_rows(local_ids: Iterable[int], lo: int, pad: bool = True) -> Dict[int
                 out[e] = int(lo) + e - 1
         else:
             out[e] = int(lo) + e
+    return out
+
+
+def slot_rows(local_ids: Iterable[int], lo: int, pad: bool = True,
+              *, resident_ids: Optional[Iterable[int]] = None,
+              num_experts: Optional[int] = None) -> Dict[int, int]:
+    """Local id -> SLOT im Slot-Pool (#72). Deterministisch, ohne Absprache.
+
+    `global_rows` nimmt die globale Experten-Id ALS Zeilenindex -- deshalb
+    braucht die Datei heute einen Platz je Experte, auch fuer die, die nie
+    geschrieben werden. Nutzer-Order 21.09.: "waehrend decode oder prefill
+    muss niemals alles im systemram liegen"; Plaetze braucht nur, wer NICHT
+    auf einer Karte liegt.
+
+    DIE ZUORDNUNG BLEIBT EINE RECHNUNG, KEINE ABSPRACHE, und das ist die
+    ganze Kunst hier: der Store ist GETEILT -- ein Rang schreibt, ein Rang
+    der anderen Gruppe liest. Eine Freiliste muesste ueber Prozessgrenzen
+    hinweg konsistent sein (ein Konsens, ein Schloss, eine neue
+    Fehlerquelle). Stattdessen ist der Slot die POSITION der globalen Id in
+    der aufsteigenden Liste der Nicht-Residenten: jeder Rang rechnet sie aus
+    denselben zwei Angaben aus (``num_experts``, ``resident_ids``), die der
+    Plan ohnehin repliziert, und kommt zwangslaeufig auf dieselbe Zahl.
+
+    Ohne ``resident_ids`` faellt die Funktion auf `global_rows` zurueck --
+    byte-identisch zu heute, damit ein Aufrufer ohne Residenzwissen nichts
+    kaputt macht.
+    """
+    rows = global_rows(local_ids, lo, pad)
+    if resident_ids is None or num_experts is None:
+        return rows
+    res = {int(e) for e in resident_ids}
+    cold = [e for e in range(int(num_experts)) if e not in res]
+    slot_of = {gid: i for i, gid in enumerate(cold)}
+    out: Dict[int, int] = {}
+    for local, gid in rows.items():
+        slot = slot_of.get(int(gid))
+        if slot is None:
+            # Ein Resident hat keinen Platz -- und soll keinen bekommen. Der
+            # Aufrufer schreibt ihn nicht (spill_ids schliesst Residenten
+            # aus, expert_offload.py:1529); kaeme er doch, waere das Weglassen
+            # der sichere Ausgang: lieber eine Zeile fehlt im Store (der
+            # Leser holt sie von der Karte) als eine fremde ueberschrieben.
+            continue
+        out[local] = int(slot)
     return out
 
 
