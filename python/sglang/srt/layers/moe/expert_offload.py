@@ -5090,6 +5090,33 @@ def _warn_slot_pool_off(rank: int, cold: int, span: int) -> None:
     )
 
 
+def _hotset_local_ids(layer, num_local):
+    """Die LOKALEN Experten-Ids aus dem Hotset -- oder () wenn keins gilt.
+
+    #92. Die Datei ist je Rang lokal geschrieben, `plan_load_time_staging`
+    rechnet ebenfalls lokal: hier ist also keine Umrechnung noetig (anders
+    als bei `_hotset_global_ids`, das der Store braucht).
+
+    Leer heisst "kein Hotset" und damit das bisherige Verhalten -- die
+    ersten R Ids bleiben resident. Kein Raten: ohne Datei, ohne Abdeckung
+    dieses Layers, bei unlesbarem Inhalt gilt die alte Regel weiter.
+    """
+    from sglang.srt.environ import envs
+
+    pfad = envs.SGLANG_MOE_HOTSET_FILE.get()
+    if not pfad or not hotset_covers_layer(layer):
+        return ()
+    try:
+        daten = _load_hotset_file(hotset_path_for_rank(
+            pfad, getattr(layer, "moe_tp_rank", 0)))
+        roh = daten.get(str(getattr(layer, "layer_id", "")))
+        if not roh:
+            return ()
+        return tuple(sorted({int(x) for x in roh if 0 <= int(x) < int(num_local)}))
+    except Exception:
+        return ()
+
+
 def _hotset_global_ids(layer, num_global, lo, pad):
     """Die GLOBALEN Experten-Ids, die das Hotset resident haelt -- oder None.
 
@@ -5364,7 +5391,20 @@ def presplit_expert_offload_after_repack(
     E = getattr(layer, "num_local_experts", None)
     if not E:
         return
-    plan = plan_load_time_staging(int(E), fraction=frac, cold_shard=cold_shard)
+    # #92: DAS HOTSET MUSS SCHON HIER GELTEN, nicht erst in `_freeze_hotset`.
+    # `build_plan` fuellt die Residenz sonst mit `rest[: R - len(pinned)]`,
+    # also mit den ERSTEN R Ids -- und der Presplit schreibt danach einen
+    # Store, dessen kalte Menge nicht die des Hotsets ist. fnFL2w20 und w21
+    # starben genau daran (#91-Verweigerung: "155 kalte Experten stehen im
+    # Hotset und haetten keinen Store-Platz"), w19 vorher am IndexError
+    # dahinter. Siebte Instanz der Klasse: der richtige Wert an einer Stelle,
+    # die der zaehlende Pfad nie erreicht.
+    plan = plan_load_time_staging(
+        int(E),
+        fraction=frac,
+        cold_shard=cold_shard,
+        pinned_experts=_hotset_local_ids(layer, int(E)),
+    )
     if plan is None:
         return
     R = plan.resident_count

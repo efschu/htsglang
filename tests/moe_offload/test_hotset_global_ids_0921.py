@@ -76,3 +76,22 @@ def test_die_kalte_menge_ist_der_rest(hotset):
     ids = eo._hotset_global_ids(Layer(), 512, 0, False)
     assert len(ids) == 156
     assert len([e for e in range(512) if e not in ids]) == 356
+
+
+def test_lokale_ids_fuer_den_plan(hotset):
+    """#92: `plan_load_time_staging` rechnet LOKAL -- hier keine Umrechnung.
+    Ohne diese Uebergabe fuellt `build_plan` die Residenz mit den ERSTEN R
+    Ids, und der Presplit schreibt einen Store, dessen kalte Menge nicht die
+    des Hotsets ist (fnFL2w20/w21)."""
+    hotset([[5, 3, 9]])
+    assert eo._hotset_local_ids(Layer(), 512) == (3, 5, 9)
+
+
+def test_lokale_ids_ohne_hotset_sind_leer(monkeypatch):
+    monkeypatch.delenv("SGLANG_MOE_HOTSET_FILE", raising=False)
+    assert eo._hotset_local_ids(Layer(), 512) == ()
+
+
+def test_lokale_ids_ausserhalb_werden_verworfen(hotset):
+    hotset([[1, 700]])
+    assert eo._hotset_local_ids(Layer(), 512) == (1,)
