@@ -2769,6 +2769,66 @@ def release_active_tag_pools(reason: str = "") -> int:
     return n
 
 
+def tag_pool_occupancy(tag: str) -> Optional[dict]:
+    """What is still LIVE in ``tag``'s private pool, from the allocator itself.
+
+    A MEASUREMENT, not a fix, and it is the step that was missing before
+    fnFL2v56 tried to drop a pool object and died in
+    ``c10::AcceleratorError -- CUDA error: invalid argument``: whether the
+    pool CAN be dropped is a question the allocator answers, and nobody
+    asked it.
+
+    Returns ``{"segments", "active_blocks", "active_gib", "inactive_gib"}``
+    or None when torch has no private pools.  ``active_blocks == 0`` is the
+    precondition for dropping the pool; anything else names how much is in
+    the way.
+    """
+    import torch
+
+    pool = _TAG_MEM_POOLS.get(tag)
+    if pool is None or not torch.cuda.is_available():
+        return None
+    try:
+        segs = pool.snapshot(include_traces=False)
+    except TypeError:  # older signature
+        segs = pool.snapshot()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("WEG2-TAG-POOL occupancy unreadable tag=%s (%s)", tag, exc)
+        return None
+    active = inactive = 0
+    n_active = 0
+    for seg in segs or ():
+        for blk in seg.get("blocks", ()):
+            size = int(blk.get("size", 0))
+            if blk.get("state") == "active_allocated":
+                active += size
+                n_active += 1
+            else:
+                inactive += size
+    return {
+        "segments": len(segs or ()),
+        "active_blocks": n_active,
+        "active_gib": active / (1024 ** 3),
+        "inactive_gib": inactive / (1024 ** 3),
+    }
+
+
+def log_tag_pool_occupancy(tag: str, when: str = "") -> Optional[dict]:
+    """:func:`tag_pool_occupancy` on ONE line, at INFO."""
+    occ = tag_pool_occupancy(tag)
+    if occ is None:
+        return None
+    logger.info(
+        "WEG2-TAG-POOL occupancy tag=%s%s segments=%d active_blocks=%d "
+        "active_gib=%.2f inactive_gib=%.2f -- active_blocks=0 is what a pool "
+        "drop requires; inactive_gib is what empty_cache cannot reach here",
+        tag, f" when={when}" if when else "",
+        occ["segments"], occ["active_blocks"], occ["active_gib"],
+        occ["inactive_gib"],
+    )
+    return occ
+
+
 @contextmanager
 def tag_pool_scope(tag: str) -> Iterator[Any]:
     """Route every allocation inside into ``tag``'s own pool.

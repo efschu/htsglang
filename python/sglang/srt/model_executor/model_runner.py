@@ -2675,6 +2675,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # raise at boot leaves the other five in a collective that no longer
         # has six members.  The fenced re-check is the wake RPC's preamble
         # (spec section 3.6), which reads weight_exchange.boot_vote().
+        # fnFL2 v57: MEASURE whether the base tag's pool CAN be handed back,
+        # before anyone builds a fix on the assumption that it can.  v56 tried
+        # to drop the pool object and died in c10::AcceleratorError ("invalid
+        # argument"), because tensors the copy had not covered still held
+        # blocks in it -- a question the allocator answers and nobody asked.
+        # active_blocks=0 is the precondition; inactive_gib is the prize
+        # (measured 9.29 GiB on PP1, 7.91 on PP2, which IS the per-rank load
+        # overhead that killed v45-v56 in cu_mem_create).
+        try:
+            from sglang.srt.managers.weg2_memory_saver import (
+                log_tag_pool_occupancy,
+            )
+
+            log_tag_pool_occupancy(weights_tag, when="after-load")
+        except Exception as _occ_exc:  # noqa: BLE001
+            logger.warning(
+                "WEG2-TAG-POOL occupancy probe failed (%s)", _occ_exc
+            )
+
         from sglang.srt.weg2.weight_exchange import arm_coverage_at_load
 
         # #1330 B4n: BOTH RANK AXES, and `rank=` stays `tp_rank` because every
