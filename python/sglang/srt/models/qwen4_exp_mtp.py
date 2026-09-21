@@ -100,6 +100,13 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         config.full_attention_interval = 1
         config.ple_layer_ids = []
 
+        # #66: keep the target's own config for the VOCAB. _mtp_quant_config
+        # nulls the config when the checkpoint's `mtp.` tensors are dense,
+        # which is right for the mtp layers and wrong for embed_tokens --
+        # those rows come from the target half of the checkpoint and are
+        # packed there (Minachist). _build_embed_tokens decides from THIS
+        # config whether the vocab is quantized.
+        embed_quant_config = quant_config
         quant_config = _mtp_quant_config(quant_config)
 
         self.config = config
@@ -115,6 +122,7 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             quant_config,
             prefix=add_prefix("mtp", prefix),
             is_nextn=True,
+            embed_quant_config=embed_quant_config,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,

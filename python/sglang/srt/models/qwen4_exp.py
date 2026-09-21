@@ -1960,9 +1960,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         _emb_ph = skip_on_worker("embed_tokens", name)
         if _emb_ph is not None:
             return _emb_ph
-        raw = getattr(quant_config, "config", None)
+        # #66: an MTP build hands its UNMODIFIED config in here (see
+        # __init__); every other caller passes none and keeps its own.
+        vocab_config = getattr(self, "_embed_quant_config", None) or quant_config
+        raw = getattr(vocab_config, "config", None)
         vocab_quant = (
-            quant_config
+            vocab_config
             if isinstance(raw, dict) and vocab_named_in_targets(raw, name)
             else None
         )
@@ -1990,7 +1993,21 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         is_nextn: bool = False,
+        embed_quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
+        # #66 (fnFL2v66): the MTP build nulls its quant_config whenever the
+        # checkpoint's `mtp.` tensors are dense (_mtp_quant_config) -- right
+        # for the mtp layers, WRONG for embed_tokens, whose rows come from
+        # the TARGET half of the same checkpoint. Minachist packs the vocab
+        # (AutoRound group_3 `re:.*embed_tokens`), so a nulled config builds
+        # a bf16 table that no `weight_packed` fits into: the draft-KV
+        # producer's resident load then refuses by name ("the built table and
+        # the checkpoint disagree on the vocab quantization"). Handing the
+        # UNMODIFIED config through for the vocab alone lets
+        # _build_embed_tokens apply its own rule (quantize iff the config
+        # NAMES the vocab), which is already correct for both exports.
+        # Set BEFORE super().__init__, which is what calls the builder.
+        self._embed_quant_config = embed_quant_config
         super().__init__(config, quant_config, prefix, is_nextn)
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
