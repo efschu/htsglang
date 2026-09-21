@@ -5105,6 +5105,9 @@ _HEAD_RELEASED_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*head_released_mi
 #: bytes while residue and release cannot see them: 5334.0 against 2202.6 +
 #: 1212.5 left 1918.9 MiB unexplained and W11b refused a build that was fine.
 _TAG_POOL_INACTIVE_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*tag_pool_inactive_mib=(-?\d+(?:\.\d+)?)")
+#: #66: die zwei Terme, die W11b fehlten, als 533,7 MiB unerklaert blieben.
+_OUTSIDE_TORCH_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*outside_torch_mib=(-?\d+(?:\.\d+)?)")
+_DEFAULT_POOL_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*default_pool_inactive_mib=(-?\d+(?:\.\d+)?)")
 _NVML_DELTA_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*nvml_delta_mib=(-?\d+(?:\.\d+)?)")
 #: W11b (#1233 fix 6): how far the BUILD may stay unexplained by the two terms
 #: that claim to explain it, IN EITHER DIRECTION.  MEASURED on boot weg2dk5's
@@ -5154,7 +5157,8 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
     out: Dict[str, object] = {
         "resident_mib": None, "budget_mib": budget, "tol_mib": tol, "over_mib": None,
         "head_released_mib": None, "nvml_delta_mib": None, "unaccounted_mib": None,
-        "tag_pool_inactive_mib": None,
+        "tag_pool_inactive_mib": None, "outside_torch_mib": None,
+        "default_pool_inactive_mib": None,
         "accounting_tol_mib": P_DRAFT_BUILD_ACCOUNTING_TOL_MIB,
         "resident_ok": False, "accounted": False, "ok": False,
     }
@@ -5165,6 +5169,8 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
                     ("resident_mib", _RESIDENT_RE),
                     ("head_released_mib", _HEAD_RELEASED_RE),
                     ("tag_pool_inactive_mib", _TAG_POOL_INACTIVE_RE),
+                    ("outside_torch_mib", _OUTSIDE_TORCH_RE),
+                    ("default_pool_inactive_mib", _DEFAULT_POOL_RE),
                     ("nvml_delta_mib", _NVML_DELTA_RE),
                 ):
                     m = rx.search(line)
@@ -5195,7 +5201,27 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
         # NVML counts those bytes while residue and release cannot see them.
         pooled = out.get("tag_pool_inactive_mib")
         pooled = 0.0 if pooled is None or float(pooled) < 0 else float(pooled)
-        out["unaccounted_mib"] = delta - (r + released + pooled)
+        # #66 (fnFL2v86): die drei Terme oben liessen 533,7 MiB unerklaert bei
+        # 256 MiB Toleranz -- eine Verweigerung, die nicht sagen konnte, WO die
+        # Bytes sind. Beide neuen Terme beantworten genau das und sie sind
+        # ECHTE Posten, keine Toleranzerweiterung:
+        #   outside_torch          was auf der Karte waechst, ohne dass torch
+        #                          es bucht: CUDA-Kontext, cuBLAS-Workspaces,
+        #                          JIT-Kernel. NVML sieht es, torch nie.
+        #   default_pool_inactive  was der DEFAULT-Allokator cached, nachdem
+        #                          empty_cache lief -- der Tag-Pool-Term sieht
+        #                          nur die getaggten Pools.
+        # Ein negativer Wert heisst "nicht messbar" und wird zu 0, nie geraten.
+        outside = out.get("outside_torch_mib")
+        outside = 0.0 if outside is None or float(outside) < 0 else float(outside)
+        default_cached = out.get("default_pool_inactive_mib")
+        default_cached = (
+            0.0 if default_cached is None or float(default_cached) < 0
+            else float(default_cached)
+        )
+        out["unaccounted_mib"] = delta - (
+            r + released + pooled + outside + default_cached
+        )
         out["accounted"] = abs(out["unaccounted_mib"]) <= P_DRAFT_BUILD_ACCOUNTING_TOL_MIB
     out["ok"] = bool(out["resident_ok"] and out["accounted"])
     return out
@@ -5224,6 +5250,8 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
         f"tol_mib={w11['tol_mib']:.0f} over_mib={w11['over_mib']} resident_ok={w11['resident_ok']} "
         f"| W11b BUILD-ACCOUNTING nvml_delta_mib={w11['nvml_delta_mib']} = resident_mib + "
         f"head_released_mib={w11['head_released_mib']} + tag_pool_inactive_mib={w11['tag_pool_inactive_mib']} "
+        f"+ outside_torch_mib={w11['outside_torch_mib']} "
+        f"+ default_pool_inactive_mib={w11['default_pool_inactive_mib']} "
         f"+ unaccounted_mib={w11['unaccounted_mib']} "
         f"(tol {w11['accounting_tol_mib']:.0f}) accounted={w11['accounted']} "
         f"ok={w11['ok']}")
@@ -5239,6 +5267,8 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
         raise Weg2LaunchRefused(f"W11b Weg2DraftBuildUnaccounted: nvml_delta_mib={w11['nvml_delta_mib']} is not explained by "
                                 f"resident_mib={w11['resident_mib']} + head_released_mib={w11['head_released_mib']} "
                                 f"+ tag_pool_inactive_mib={w11['tag_pool_inactive_mib']} "
+                                f"+ outside_torch_mib={w11['outside_torch_mib']} "
+                                f"+ default_pool_inactive_mib={w11['default_pool_inactive_mib']} "
                                 f"(unaccounted {w11['unaccounted_mib']} MiB, tolerance {w11['accounting_tol_mib']:.0f}) -- either the "
                                 f"never-loaded lm_head was unbound from the graph without being freed (fix 2's shape, invisible to "
                                 f"resident_mib by construction) or one of the three instruments did not measure")

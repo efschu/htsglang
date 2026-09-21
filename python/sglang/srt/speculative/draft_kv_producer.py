@@ -86,6 +86,10 @@ class DraftKvProducer:
         # the L2 line as its own named term, never as the residue.
         self._free_before_mib = _cuda_free_mib()
         self._pool_inactive_before_mib = _tag_pool_inactive_mib()
+        # #66: die zwei Terme, die W11b bisher fehlten -- was AUSSERHALB von
+        # torch auf der Karte waechst, und was der Default-Allokator cached.
+        self._outside_before_mib = _outside_torch_mib()
+        self._default_inactive_before_mib = _default_pool_inactive_mib()
         self.resident_mib = -1.0
         self.nvml_delta_mib = -1.0
         self.head_released_mib = 0.0
@@ -336,6 +340,20 @@ class DraftKvProducer:
         after = _cuda_free_mib()
         if after >= 0 and self._free_before_mib >= 0:
             self.nvml_delta_mib = self._free_before_mib - after
+        # Beide NACH empty_cache: ein Rest im Default-Pool ist dann ein
+        # Befund, kein Buchungsposten.
+        _out_after = _outside_torch_mib()
+        _def_after = _default_pool_inactive_mib()
+        self.outside_torch_mib = (
+            _out_after - self._outside_before_mib
+            if (_out_after >= 0 and self._outside_before_mib >= 0)
+            else -1.0
+        )
+        self.default_pool_inactive_mib = (
+            _def_after - self._default_inactive_before_mib
+            if (_def_after >= 0 and self._default_inactive_before_mib >= 0)
+            else -1.0
+        )
         # `shared` is the TARGET's head and only ever that: under
         # tie_word_embeddings `lm_head` is this producer's own resident
         # embedding, and excluding it would under-report the residue W11
@@ -484,6 +502,54 @@ def _tag_pool_inactive_mib() -> float:
             inactive += float(occ.get("inactive_gib") or 0.0)
         return inactive * 1024.0
     except Exception:  # noqa: BLE001 -- an instrument never fails a boot
+        return -1.0
+
+
+def _outside_torch_mib() -> float:
+    """MiB this process holds on the card that TORCH DOES NOT ACCOUNT FOR.
+
+    ``nvml_used - torch.reserved``: the CUDA context, cuBLAS/cuDNN
+    workspaces, JIT'd kernels, NCCL/BAR1 buffers -- everything that grows
+    during a build and appears in NVML while torch's own numbers stay flat.
+
+    W11b exists to EXPLAIN an NVML delta, and until now it could only offer
+    torch-side terms (live weights, released head, private-pool cache). Boot
+    fnFL2v86 left 533.7 MiB unexplained against a 256 MiB tolerance -- a
+    refusal with no way to say WHERE the bytes are. This term is the missing
+    half of the question: read before and after, its difference says whether
+    the gap is inside torch (a cache we can name) or outside it (a context we
+    can only observe).
+
+    -1 when it cannot be read; an instrument never fails a boot.
+    """
+    try:
+        import torch
+
+        from sglang.srt.utils import get_device_id  # noqa: F401 -- may be absent
+
+        free_b, total_b = torch.cuda.mem_get_info()
+        used_mib = float(total_b - free_b) / float(2**20)
+        reserved_mib = float(torch.cuda.memory_reserved()) / float(2**20)
+        return used_mib - reserved_mib
+    except Exception:  # noqa: BLE001
+        return -1.0
+
+
+def _default_pool_inactive_mib() -> float:
+    """MiB torch's DEFAULT allocator holds cached (reserved - allocated).
+
+    The private-tag-pool term above sees only the tagged pools. A build that
+    allocates outside them leaves its cache here, where ``empty_cache`` DOES
+    reach -- so a non-zero delta here after an empty_cache is itself a
+    finding, not just an accounting entry.
+    """
+    try:
+        import torch
+
+        r = float(torch.cuda.memory_reserved())
+        a = float(torch.cuda.memory_allocated())
+        return (r - a) / float(2**20)
+    except Exception:  # noqa: BLE001
         return -1.0
 
 
