@@ -464,9 +464,33 @@ class JoinedTensor:
             # count the replicated components) -- `validate()`'s ordinary
             # dst_widths check would refuse a perfectly good MIXED_FUSED geom
             # on that mismatch alone.
+            # #80 (fnFL2w7, 21.09.): EIN NICHT-HALTER IST KEIN ZIEL, auch
+            # wenn die Form REPLIZIERT heisst. Seit #76 darf eine Teilmenge
+            # der TP-Gruppe einen Tensor halten, solange alle Halter ihn GANZ
+            # tragen -- das ist unter Form A der Normalfall: der
+            # Attention-Host haelt jedes Dense-Gewicht, die Experten-Worker
+            # keins. Der Breitenvektor sagt das (w, 0, 0), aber er erreichte
+            # `_blocks_of` nie, weil `self.sharded` bei REPLICATED falsch ist
+            # -- also fiel der Plan auf den gleichmaessigen Split ueber ALLE
+            # Raenge zurueck und adressierte Karten, die den Tensor nicht
+            # haben.
+            #
+            # GEMESSEN an fnFL2w7: P wartete auf lane=c1 (descs=37,
+            # 81.466.808 B) und lane=c2 (descs=113, 237.381.840 B) auf
+            # `layers.29/42.attn_hyper_connection.block_inject_weight.weight`
+            # -- und die Manifeste desselben Boots sagen: D rank1 = 0 solche
+            # Tensoren, D rank2 = 0, D rank0 = 384. Der Collect lief in sein
+            # volles Budget, dann W29 auf resume_memory_occupation, 0/6.
+            #
+            # Eine Null-Breite ist also eine ECHTE Aussage ueber das Ziel und
+            # muss durch, gerade bei REPLICATED. MIXED_FUSED bleibt aussen vor
+            # (siehe unten) und ein Vektor ohne Null aendert nichts.
             dst_widths=(tuple(int(w) for w in self.tp_widths)
-                        if (self.sharded and tp_is_dst
-                            and self.shard_axis != wx.MIXED_FUSED) else None),
+                        if (tp_is_dst
+                            and self.shard_axis != wx.MIXED_FUSED
+                            and (self.sharded
+                                 or any(int(w) == 0 for w in self.tp_widths)))
+                        else None),
             # #1384: MIXED_FUSED needs its declared components on the geom
             # regardless of `tp_is_dst` -- `_blocks_of` is called once per
             # SIDE (source and destination) for the same geom, and the TP
