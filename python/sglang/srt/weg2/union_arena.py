@@ -326,6 +326,41 @@ def build_manifest(
     )
 
 
+def manifest_from_layout(
+    layout: ArenaLayout,
+    *,
+    tag: str,
+    card: str,
+    owner_phase: str,
+    checksums: Mapping[str, int],
+) -> UnionManifest:
+    """The owner's manifest for ITS OWN layout (not a two-phase union).
+
+    The owner publishes what it actually holds; the peer binds the subset it
+    recognises and loads the rest itself. Planning a union would require the
+    owner to know the peer's tensor set before the peer exists, and would put
+    the peer's extra bytes on the card for the whole boot -- the very waste
+    this arena removes (user, 2026-09-21: "warum willst du dort platz
+    freilassen?").
+    """
+    missing = [s.name for s in layout.slots if s.name not in checksums]
+    if missing:
+        raise UnionShareError(
+            f"{len(missing)} slot(s) carry no checksum (e.g. {missing[0]!r})"
+        )
+    return UnionManifest(
+        version=MANIFEST_VERSION,
+        tag=str(tag),
+        card=str(card),
+        owner_phase=str(owner_phase),
+        total_bytes=int(layout.total_bytes),
+        slots=tuple(layout.slots),
+        checksums=tuple((s.name, int(checksums[s.name])) for s in layout.slots),
+        active=((str(owner_phase), tuple(s.name for s in layout.slots)),),
+        aliases=tuple(layout.aliases),
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class PeerBinding:
     """What the peer may bind, and what stays its own.
@@ -358,10 +393,15 @@ def verify_peer(
     private rather than refused: a phase legitimately holds bytes the other
     does not.
     """
-    if phase not in [p for p, _ in manifest.active]:
+    covered = [p for p, _ in manifest.active]
+    if len(covered) > 1 and phase not in covered:
         raise UnionShareError(
-            f"this process is phase {phase!r}; the manifest covers "
-            f"{[p for p, _ in manifest.active]}"
+            f"this process is phase {phase!r}; the manifest covers {covered}"
+        )
+    if phase == manifest.owner_phase:
+        raise UnionShareError(
+            f"phase {phase!r} IS the owner of this manifest; the owner binds "
+            f"its own layout directly and never through verify_peer"
         )
     if checksums is None and require_checksums:
         checksums = checksums_for(

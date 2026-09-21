@@ -2839,6 +2839,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         except Exception as exc:  # noqa: BLE001 -- a census never kills a boot
             logger.info("WEG2-UNION census skipped: %s", exc)
 
+        # 21.09. (union arena slice 3b): ONE weight image per card. The owner
+        # packs its weights into an exportable VMM arena and publishes them;
+        # the peer rebinds everything it can PROVE identical and drops its own
+        # copy. NOT wrapped in a swallowing except: a boot that believes it is
+        # sharing and is not would silently hold both copies and OOM later,
+        # which is exactly the failure this removes.
+        from sglang.srt.weg2.union_arena_bind import maybe_union_image
+
+        maybe_union_image(
+            self.model,
+            device=self.gpu_id,
+            role="draft" if self.is_draft_worker else "main",
+        )
+
         # #644: end-of-load host-anon discriminator. Off unless
         # SGLANG_644_DISCRIMINATOR is set; the answer it produces (references
         # genuinely persist vs glibc arenas holding freed pages) cannot be read
