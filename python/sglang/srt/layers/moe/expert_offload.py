@@ -5177,8 +5177,23 @@ def presplit_expert_offload_after_repack(
         # the rows the plan names (whole experts on dim 0 either way).
         if store_rows is not None:
             # Task #47 step 1: the spill pool IS the shared store (rows =
-            # global ids); this rank writes every row it loaded, residents
-            # included, so a reader from another rank group finds them.
+            # global ids), damit ein Leser aus der anderen Ranggruppe die
+            # Zeilen findet.
+            #
+            # #72 (21.09.): DER SATZ "residents included" STAND HIER FALSCH.
+            # `build_plan` setzt `spill_ids = [e for e in range(E) if e not in
+            # resident_set]` (Zeile ~1529) -- es gehen also NUR die kalten
+            # Zeilen in den Host, genau wie der Kommentar zwei Absaetze
+            # weiter unten sagt. Zwei Regeln an einer Stelle, und die
+            # veraltete stand oben; wer sie las, suchte den Host-Platz bei
+            # den falschen Zeilen.
+            #
+            # Was der Store trotzdem GROSS macht, ist nicht der Inhalt,
+            # sondern der reservierte Platz: `open_store` legt die Datei
+            # ueber ALLE globalen Experten-Ids an, auch die nie
+            # geschriebenen. Gemessen fnFL2w5/w7: 59 GiB auf Platte, 61,10
+            # GiB shmem. Die Indirektion global_id -> slot (Aufgabe #72)
+            # setzt genau hier an.
             from sglang.srt.layers.moe import expert_store as _es
 
             s_dir, s_key, s_lo, s_num, _s_index, s_pad = store_rows

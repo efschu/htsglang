@@ -80,3 +80,34 @@ def test_the_missing_half_is_named():
     assert "global_rows" in src, (
         "write_rows indiziert noch ueber global_rows -- der Slot-Pool braucht "
         "hier die Indirektion, sonst ist die kleinere Datei ein Fehler")
+
+
+def test_only_cold_rows_reach_the_host():
+    """#72-Klaerung (21.09.): an der Schreibstelle standen ZWEI Regeln
+    uebereinander -- "writes every row it loaded, residents included" und
+    "Only the COLD rows go to the host". `build_plan` entscheidet es:
+
+        spill_ids = [e for e in range(E) if e not in resident_set]
+
+    Nur die Nicht-Residenten. Der veraltete Satz ist entfernt; dieser Test
+    haelt die Entscheidung fest, damit sie nicht zurueckdriftet."""
+    import inspect
+
+    from sglang.srt.layers.moe import expert_offload as eo
+
+    src = inspect.getsource(eo)
+    assert "spill_ids = [e for e in range(E) if e not in resident_set]" in src
+    assert "residents\n            # included" not in src, (
+        "der veraltete Satz ist wieder da")
+
+
+def test_the_store_is_big_because_of_reserved_slots_not_content():
+    """Und die Folgerung, die daraus faellt: der Store ist nicht gross, weil
+    Residente hineingeschrieben wuerden -- sondern weil `open_store` die
+    Datei ueber ALLE globalen Ids anlegt. Genau da setzt der Slot-Pool an."""
+    import inspect
+
+    from sglang.srt.layers.moe import expert_store as es
+
+    src = inspect.getsource(es.open_store)
+    assert "slots_for(int(num_experts))" in src
