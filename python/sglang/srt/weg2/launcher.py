@@ -7007,7 +7007,7 @@ def _axis_renormalisation(
     )
 
 
-def _infeasible_breakdown(pcm, mlp, attn_units, budgets, cap) -> str:
+def _infeasible_breakdown(pcm, mlp, attn_units, budgets, cap, cards=()) -> str:
     """The per-rank arithmetic behind a W64 feasible=False, as one clause.
 
     A refusal that names only its verdict makes the reader re-derive the
@@ -7021,6 +7021,7 @@ def _infeasible_breakdown(pcm, mlp, attn_units, budgets, cap) -> str:
     to the budget the gate used and the shortfall is readable without a
     second run.
     """
+    THIS_GROUP = "D"   # this breakdown only ever prices group D's vectors
     try:
         from sglang.srt.uneven_perf import (
             _PREDICT_MAMBA_ACT_RESERVE_MIB,
@@ -7044,12 +7045,26 @@ def _infeasible_breakdown(pcm, mlp, attn_units, budgets, cap) -> str:
             free = (
                 float(budgets[r]) - (wb[r] - off[r]) / MI - mb[r] / MI - overhead
             )
+            # THE KEYS, so a reader can JOIN this line to the measurement.
+            # Without them the number is unattachable: the census speaks
+            # `pp<PP>tp<TP>`, the budget lines speak `card=`/`nvml_idx=`, and
+            # this line spoke neither -- a peer tool built on it could not
+            # tell which rank, which card, or even which group it was reading
+            # (reported 2026-09-21). The group is constant here and said out
+            # loud rather than left to be inferred.
+            _card = cards[r] if r < len(cards) else None
+            _key = "group=%s r%d" % (THIS_GROUP, r)
+            if _card is not None:
+                _key += " nvml%s %s" % (
+                    getattr(_card, "nvml_index", "?"),
+                    getattr(_card, "name", "?"),
+                )
             rows.append(
-                "r%d budget=%d - weights=%.0f (of which %.0f in the host "
+                "%s budget=%d - weights=%.0f (of which %.0f in the host "
                 "expert store) - mamba=%.0f - reserves=%.0f "
                 "=> free=%.0f MiB / kv_cell=%.0f B = %d tokens%s"
                 % (
-                    r, int(budgets[r]), (wb[r] - off[r]) / MI, off[r] / MI,
+                    _key, int(budgets[r]), (wb[r] - off[r]) / MI, off[r] / MI,
                     mb[r] / MI, overhead, free,
                     cell, int(ptok[r]) if r < len(ptok) else -1,
                     "  <-- BELOW the minimum" if (
@@ -7508,7 +7523,7 @@ def d_operating_point_rows(
                 "model's own verdict, not a margin chosen here: no safety "
                 "factor is applied on top of it."
                 % (position, list(int(w) for w in weights), list(budgets))
-                + _infeasible_breakdown(pcm, mlp, attn_units, budgets, cap)
+                + _infeasible_breakdown(pcm, mlp, attn_units, budgets, cap, cards)
             )
         return (
             DOperatingPointRow(

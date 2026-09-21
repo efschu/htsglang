@@ -38,7 +38,7 @@ def test_the_refused_rank_is_named_and_the_terms_add_up():
     free0 = budgets[0] - weights[0] - mamba[0] - RESERVES
     p = [free0 * MI / 14143.0, 100000.0, 100000.0]
     out = _infeasible_breakdown(pcm, [58, 25, 25], [58, 25, 25], budgets, {"p": p})
-    assert "r0 budget=28240" in out
+    assert "group=D r0 budget=28240" in out
     assert "weights=24000" in out and "mamba=900" in out
     assert f"reserves={RESERVES}" in out
     assert f"free={free0}" in out
@@ -54,7 +54,7 @@ def test_a_rank_below_the_minimum_is_marked_and_only_that_one():
     p = [10.0, 100000.0, 100000.0]
     out = _infeasible_breakdown(pcm, [58, 25, 25], [58, 25, 25], budgets, {"p": p})
     assert out.count("<-- BELOW the minimum") == 1
-    assert "r0 budget=28240" in out and "= 10 tokens  <-- BELOW" in out
+    assert "group=D r0 budget=28240" in out and "= 10 tokens  <-- BELOW" in out
 
 
 def test_every_rank_appears_even_when_all_are_below():
@@ -65,7 +65,7 @@ def test_every_rank_appears_even_when_all_are_below():
     )
     assert out.count("<-- BELOW the minimum") == 3
     for r in range(3):
-        assert f"r{r} budget=100" in out
+        assert f"group=D r{r} budget=100" in out
 
 
 def test_a_broken_model_degrades_to_a_named_note_not_an_exception():
@@ -86,7 +86,7 @@ def test_the_refusal_text_carries_the_clause():
     from sglang.srt.weg2 import launcher
 
     src = inspect.getsource(launcher.d_operating_point_rows)
-    assert "_infeasible_breakdown(pcm, mlp, attn_units, budgets, cap)" in src
+    assert "_infeasible_breakdown(pcm, mlp, attn_units, budgets, cap, cards)" in src
 
 
 def test_the_host_store_share_is_named_as_its_own_term():
@@ -95,3 +95,28 @@ def test_the_host_store_share_is_named_as_its_own_term():
     pcm = _pcm([89398], [619], 13312.0, offloaded_mib=[80000])
     out = _infeasible_breakdown(pcm, [58], [58], [28240], {"p": [100.0]})
     assert "weights=9398 (of which 80000 in the host expert store)" in out
+
+
+def test_the_line_carries_the_keys_a_reader_needs_to_join_it():
+    """Ein Peer-Werkzeug konnte diese Zeile nicht zuordnen: der Zensus spricht
+    pp<PP>tp<TP>, die Budgetzeilen card=/nvml_idx=, und diese Zeile sprach
+    keines von beidem (gemeldet 21.09.). Gruppe, Rang, nvml-Index und
+    Kartenname stehen jetzt drin."""
+    import types as _t
+
+    cards = [
+        _t.SimpleNamespace(nvml_index=1, name="NVIDIA GeForce RTX 5090"),
+        _t.SimpleNamespace(nvml_index=0, name="NVIDIA GeForce RTX 3080"),
+    ]
+    pcm = _pcm([100, 100], [1, 1], 1024.0)
+    out = _infeasible_breakdown(
+        pcm, [1, 1], [1, 1], [200, 200], {"p": [0.0, 0.0]}, cards
+    )
+    assert "group=D r0 nvml1 NVIDIA GeForce RTX 5090 budget=200" in out
+    assert "group=D r1 nvml0 NVIDIA GeForce RTX 3080 budget=200" in out
+
+
+def test_without_cards_it_still_names_group_and_rank():
+    pcm = _pcm([100], [1], 1024.0)
+    out = _infeasible_breakdown(pcm, [1], [1], [200], {"p": [0.0]})
+    assert "group=D r0 budget=200" in out
