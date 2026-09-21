@@ -2723,7 +2723,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
     # Deskriptors, und genau die musste ich aus Manifesten rekonstruieren,
     # die der Teardown danach geraeumt hatte.
     _d0 = descs[0] if descs else None
-    _who = (f" first={getattr(_d0, 'name', '?')!r}"
+    _who = (f" first={getattr(_d0, 'param_name', None) or getattr(_d0, 'tag', '?')!r}"
             f" src_rank={getattr(_d0, 'src_rank', '?')}"
             f" dst_rank={getattr(_d0, 'dst_rank', '?')}") if _d0 is not None else ""
     log(f"WEG2-SEQ lane={lane_key} phase={phase} handshake={resolved_full} "
