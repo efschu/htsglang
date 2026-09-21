@@ -5140,9 +5140,20 @@ def _expert_store_rows_for(layer, plan):
         # ersten Mal eingeschaltet war: ohne die Env ist
         # `slot_fraction() < 1.0` falsch und der ganze Block unerreichbar.
         # Ein Feature, das nie lief, hat auch nie gezeigt, dass es bricht.
-        _ratios = _rank_moe_ratio_vector(layer)
-        _fracs = (_rank_resident_fraction_vector(layer, len(_ratios))
-                  if _ratios else None)
+        # #91: STEHT EINE GEMEINSAME GEOMETRIE, GILT SIE FUER BEIDE GRUPPEN.
+        # Sonst rechnet P aus [512]/[0.30] 358 Plaetze und D aus
+        # [183,137,168]/[0.006,0.564,0.467] 332 -- zwei Zuordnungen auf
+        # DERSELBEN Datei, und die zweite schreibt in die Zeilen der ersten.
+        # Das ist Datenverlust, nicht Speicherverlust; deshalb gibt der
+        # Launcher, der als einziger beide Konfigurationen kennt, eine
+        # gemeinsame Geometrie vor.
+        _shared = _es.shared_geometry()
+        if _shared is not None:
+            _ratios, _fracs = _shared
+        else:
+            _ratios = _rank_moe_ratio_vector(layer)
+            _fracs = (_rank_resident_fraction_vector(layer, len(_ratios))
+                      if _ratios else None)
         if _ratios and _fracs:
             _rank = int(getattr(layer, "moe_tp_rank", 0) or 0)
             _base = _es.slot_base_for_rank(_ratios, _fracs, _rank)

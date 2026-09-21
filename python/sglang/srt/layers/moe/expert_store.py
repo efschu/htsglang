@@ -44,6 +44,20 @@ STORE_DIR_ENV = "SGLANG_MOE_EXPERT_STORE_DIR"
 #: mit oom_kill starb.
 SLOT_FRACTION_ENV = "SGLANG_MOE_EXPERT_STORE_SLOT_FRACTION"
 
+#: #91: DIE EINE GEOMETRIE, die beide Ranggruppen teilen muessen.
+#:
+#: Der Store ist EINE Datei je Layer/Attribut, geteilt zwischen P und D. Jede
+#: Gruppe rechnet ihre Slot-Zuordnung heute aus IHREN eigenen Vektoren --
+#: P (tp1/pp3) kommt auf 358 Plaetze, D (183,137,168) auf 332. Verschiedene
+#: Zuordnungen auf denselben Bytes sind kein Speicherverlust, sondern
+#: DATENVERLUST: D schreibt dann in die Zeilen, aus denen P nach dem Wake
+#: liest.
+#:
+#: Deshalb gibt der Launcher -- der als einziger BEIDE Konfigurationen kennt
+#: -- eine gemeinsame Geometrie vor, und beide Gruppen rechnen daraus
+#: dieselbe Abbildung `globale Id -> Slot`. Format: "r0,r1,r2|f0,f1,f2".
+STORE_GEOMETRY_ENV = "SGLANG_MOE_EXPERT_STORE_GEOMETRY"
+
 __all__ = [
     "STORE_DIR_ENV",
     "store_dir",
@@ -55,6 +69,7 @@ __all__ = [
     "global_rows",
     "slot_rows",
     "slot_base_for_rank",
+    "shared_geometry",
     "write_rows",
     "mark_rows_written",
     "rows_written",
@@ -154,6 +169,35 @@ def global_rows(local_ids: Iterable[int], lo: int, pad: bool = True) -> Dict[int
         else:
             out[e] = int(lo) + e
     return out
+
+
+def shared_geometry():
+    """Die gemeinsame Store-Geometrie ``(ratios, fractions)`` oder ``None``.
+
+    #91. Gesetzt vom Launcher ueber ``STORE_GEOMETRY_ENV``, weil nur er beide
+    Ranggruppen kennt. Steht sie, rechnen P und D DIESELBE Abbildung
+    ``globale Id -> Slot`` -- unabhaengig davon, wie die eigene Gruppe ihre
+    Experten aufteilt. Steht sie nicht, bleibt alles wie bisher.
+
+    KONSERVATIV: unlesbare oder widerspruechliche Angaben geben ``None``
+    zurueck, nicht eine halbe Geometrie. Eine falsche gemeinsame Zuordnung
+    waere schlimmer als gar keine -- sie sieht aus wie Ersparnis und ist
+    Datenverlust.
+    """
+    raw = os.environ.get(STORE_GEOMETRY_ENV, "").strip()
+    if not raw or "|" not in raw:
+        return None
+    left, _, right = raw.partition("|")
+    try:
+        ratios = [int(x) for x in left.split(",") if x.strip()]
+        fracs = [float(x) for x in right.split(",") if x.strip()]
+    except (TypeError, ValueError):
+        return None
+    if not ratios or len(ratios) != len(fracs):
+        return None
+    if any(r <= 0 for r in ratios) or any(not (0.0 <= f <= 1.0) for f in fracs):
+        return None
+    return ratios, fracs
 
 
 def slot_base_for_rank(ratios: Sequence[int],
