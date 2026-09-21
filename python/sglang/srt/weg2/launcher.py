@@ -7031,18 +7031,26 @@ def _infeasible_breakdown(pcm, mlp, attn_units, budgets, cap) -> str:
         MI = float(2 ** 20)
         attn = list(attn_units) if attn_units else None
         wb = pcm.per_rank_weight_bytes(list(mlp), attn)
+        # #62: the same subtraction predict_capacity makes -- what the host
+        # expert store holds is not on the card. Printed as its own term so
+        # the line cannot read as "the card carries all of it" again.
+        off = pcm.per_rank_offloaded_weight_bytes(list(mlp))
         mb = pcm.mamba_pool_bytes_for(attn)
         cell = float(pcm.kv_cell_bytes)
         overhead = float(_PREDICT_OVERHEAD_MIB + _PREDICT_MAMBA_ACT_RESERVE_MIB)
         ptok = list(cap.get("p") or [])
         rows = []
         for r in range(len(budgets)):
-            free = float(budgets[r]) - wb[r] / MI - mb[r] / MI - overhead
+            free = (
+                float(budgets[r]) - (wb[r] - off[r]) / MI - mb[r] / MI - overhead
+            )
             rows.append(
-                "r%d budget=%d - weights=%.0f - mamba=%.0f - reserves=%.0f "
+                "r%d budget=%d - weights=%.0f (of which %.0f in the host "
+                "expert store) - mamba=%.0f - reserves=%.0f "
                 "=> free=%.0f MiB / kv_cell=%.0f B = %d tokens%s"
                 % (
-                    r, int(budgets[r]), wb[r] / MI, mb[r] / MI, overhead, free,
+                    r, int(budgets[r]), (wb[r] - off[r]) / MI, off[r] / MI,
+                    mb[r] / MI, overhead, free,
                     cell, int(ptok[r]) if r < len(ptok) else -1,
                     "  <-- BELOW the minimum" if (
                         r < len(ptok) and ptok[r] < _PREDICT_MIN_RANK_TOKENS
@@ -7058,12 +7066,47 @@ def _infeasible_breakdown(pcm, mlp, attn_units, budgets, cap) -> str:
         return "  (per-rank breakdown unavailable: %s)" % exc
 
 
+def d_moe_residency(env_d: str, tp_size: int):
+    """Group D's expert residency, as the capacity model needs it (#62).
+
+    ``(resident_fraction, scratch_slots)`` per rank, or ``(None, None)`` when
+    the arm pins neither -- then the model keeps pricing every expert as
+    card-resident, which is what a non-offloading boot really does.
+
+    READ FROM THE ARM'S OWN ``--env-d`` STRING, not from this process's
+    environment: the launcher never has D's env set (the keys are handed to
+    the group at spawn), and three fnFL2 boots were spent on exactly that
+    confusion -- a term "read from the env" that no env in the reading process
+    ever carried.  One entry is broadcast to every rank, ``tp_size`` entries
+    are taken per rank, and any other count is IGNORED rather than guessed at:
+    a mis-sized vector must not silently become a capacity claim.
+    """
+    def _vec(raw, cast):
+        if not raw:
+            return None
+        try:
+            parsed = [cast(x) for x in str(raw).split(",") if x.strip()]
+        except ValueError:
+            return None
+        if len(parsed) == 1:
+            return parsed * tp_size
+        return parsed if len(parsed) == tp_size else None
+
+    env = parse_group_env(env_d or "")
+    return (
+        _vec(env.get("SGLANG_MOE_RESIDENT_EXPERT_FRACTION"), float),
+        _vec(env.get("SGLANG_MOE_SCRATCH_SLOTS"), int),
+    )
+
+
 def d_operating_point_rows(
     cards: Sequence[Card],
     budgets: Sequence[int],
     model: str,
     d_bs: int,
     facts: Sequence[EarlyReadFact] = EARLY_READ_FACTS,
+    moe_resident_fraction: Optional[Sequence[float]] = None,
+    moe_scratch_slots: Optional[Sequence[int]] = None,
 ) -> Tuple[List[DOperatingPointRow], List[str]]:
     """Price the three D weight vectors side by side. Returns (rows, refusals).
 
@@ -7093,6 +7136,8 @@ def d_operating_point_rows(
             plan,
             list(maxkv_weights),
             list(budgets),
+            moe_resident_fraction=moe_resident_fraction,
+            moe_scratch_slots=moe_scratch_slots,
         )
     except Exception as exc:  # pragma: no cover - geometry is diagnostic
         refusals.append(
@@ -7669,6 +7714,7 @@ def d_tp_ratio_decision(
     budgets: Sequence[int],
     model: str,
     d_bs: int,
+    env_d: str = "",
 ) -> DTpRatioDecision:
     """Choose group D's weight objective and PRICE the choice on one line.
 
@@ -7730,7 +7776,11 @@ def d_tp_ratio_decision(
     # #1241 slice (2). Built on EVERY boot, including the maxkv ones, because
     # the point of the line is that the trade is visible per boot. Refusals
     # only KILL the launch when the refused position is the one being shipped.
-    op_rows, op_refusals = d_operating_point_rows(cards, budgets, model, d_bs)
+    _moe_frac, _moe_scratch = d_moe_residency(env_d, len(budgets))
+    op_rows, op_refusals = d_operating_point_rows(
+        cards, budgets, model, d_bs,
+        moe_resident_fraction=_moe_frac, moe_scratch_slots=_moe_scratch,
+    )
     op_line = d_operating_point_line(op_rows, op_refusals, objective)
     if objective in D_OPERATING_POINTS:
         mine = [
@@ -12163,7 +12213,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if dry:
         budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card)
         d_ratio = d_tp_ratio_decision(
-            ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
+            ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
+            d_bs, getattr(ns, "env_d", "") or "",
         )
         log(d_ratio.line)
         log(d_ratio.op_line)
@@ -12262,7 +12313,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     state.budgets["D"] = budgets_d
     d_ratio = d_tp_ratio_decision(
-        ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
+        ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
+        d_bs, getattr(ns, "env_d", "") or "",
     )
     log(d_ratio.line)
     log(d_ratio.op_line)

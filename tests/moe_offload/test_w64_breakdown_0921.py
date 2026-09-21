@@ -20,9 +20,11 @@ MI = 2 ** 20
 RESERVES = _PREDICT_OVERHEAD_MIB + _PREDICT_MAMBA_ACT_RESERVE_MIB
 
 
-def _pcm(weights_mib, mamba_mib, cell_bytes):
+def _pcm(weights_mib, mamba_mib, cell_bytes, offloaded_mib=None):
+    off = offloaded_mib or [0] * len(weights_mib)
     return types.SimpleNamespace(
         per_rank_weight_bytes=lambda mlp, attn: [w * MI for w in weights_mib],
+        per_rank_offloaded_weight_bytes=lambda mlp: [o * MI for o in off],
         mamba_pool_bytes_for=lambda attn: [m * MI for m in mamba_mib],
         kv_cell_bytes=cell_bytes,
     )
@@ -71,6 +73,9 @@ def test_a_broken_model_degrades_to_a_named_note_not_an_exception():
         def per_rank_weight_bytes(self, mlp, attn):
             raise RuntimeError("no gemm scores")
 
+        def per_rank_offloaded_weight_bytes(self, mlp):
+            return [0.0]
+
     out = _infeasible_breakdown(Boom(), [1], [1], [100], {"p": [0.0]})
     assert "per-rank breakdown unavailable" in out and "no gemm scores" in out
 
@@ -82,3 +87,11 @@ def test_the_refusal_text_carries_the_clause():
 
     src = inspect.getsource(launcher.d_operating_point_rows)
     assert "_infeasible_breakdown(pcm, mlp, attn_units, budgets, cap)" in src
+
+
+def test_the_host_store_share_is_named_as_its_own_term():
+    """Die Zeile darf nie wieder so lesen, als traege die Karte alles: der
+    Anteil im Host-Expertenspeicher steht daneben (#62, fnFL2v80)."""
+    pcm = _pcm([89398], [619], 13312.0, offloaded_mib=[80000])
+    out = _infeasible_breakdown(pcm, [58], [58], [28240], {"p": [100.0]})
+    assert "weights=9398 (of which 80000 in the host expert store)" in out

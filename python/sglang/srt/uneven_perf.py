@@ -3999,6 +3999,8 @@ class PerfCostModel:
         measured: Optional[List[dict]] = None,
         measured_mlp_vector: Optional[List[int]] = None,
         calibration: Optional[PerfCalibration] = None,
+        moe_resident_fraction: Optional[Sequence[float]] = None,
+        moe_scratch_slots: Optional[Sequence[int]] = None,
     ):
         # ``plan_inputs`` is a PlanInputs dataclass (see above). The boot
         # path builds it via PlanInputs.from_server_args so the server and
@@ -4029,6 +4031,25 @@ class PerfCostModel:
             [int(v) for v in measured_mlp_vector]
             if measured_mlp_vector is not None
             and len(measured_mlp_vector) == self.tp_size
+            else None
+        )
+        # EXPERT OFFLOAD, in the capacity model (#62).  Without these two the
+        # model prices EVERY routed expert as card-resident, which for a
+        # Next-Flash-class MoE is 167 GiB against 61 GiB of cards -- it then
+        # declares every vector infeasible and W64 refuses a boot that the
+        # runtime serves happily out of the host expert store.  ``None`` keeps
+        # the pre-#62 behaviour byte-identical, so a boot that does not offload
+        # reads exactly the numbers it read before.
+        self.moe_resident_fraction = (
+            [min(max(float(f), 0.0), 1.0) for f in moe_resident_fraction]
+            if moe_resident_fraction is not None
+            and len(moe_resident_fraction) == self.tp_size
+            else None
+        )
+        self.moe_scratch_slots = (
+            [max(int(v), 0) for v in moe_scratch_slots]
+            if moe_scratch_slots is not None
+            and len(moe_scratch_slots) == self.tp_size
             else None
         )
 
@@ -4636,6 +4657,43 @@ class PerfCostModel:
         fracs = self._shard_fractions(fam.shard, mlp_vector)
         return [fam.bytes * fracs[r] * routed_frac for r in range(self.tp_size)]
 
+    def per_rank_offloaded_weight_bytes(
+        self, mlp_vector: List[int]
+    ) -> List[float]:
+        """Per-rank routed-expert bytes that live in the HOST store, not on
+        the card -- the part of :meth:`per_rank_offloadable_weight_bytes` the
+        residency does NOT keep resident (#62).
+
+        Zero unless ``moe_resident_fraction`` was handed to the constructor:
+        a boot that does not offload must read the same capacity it read
+        before, and a model that cannot see the fraction must not guess one.
+
+        A rank keeps ``ceil(fraction * experts_on_rank)`` experts plus its
+        scratch/LRU rows (each row holds one expert while it is fetched), so
+        the resident share is counted in EXPERTS and never in bytes-by-ratio:
+        the rows are the same unit the runtime allocates in, and a fraction of
+        0.006 on 5090 with 60 scratch rows is dominated by the rows.
+        """
+        if self.moe_resident_fraction is None:
+            return [0.0] * self.tp_size
+        offloadable = self.per_rank_offloadable_weight_bytes(mlp_vector)
+        if self.num_experts <= 0 or sum(offloadable) <= 0:
+            return [0.0] * self.tp_size
+        fam = self.families.get("mlp")
+        shard = self._shard_fractions(fam.shard, mlp_vector)
+        out: List[float] = []
+        for r in range(self.tp_size):
+            experts_r = float(self.num_experts) * float(shard[r])
+            if experts_r <= 0:
+                out.append(0.0)
+                continue
+            resident = math.ceil(self.moe_resident_fraction[r] * experts_r)
+            if self.moe_scratch_slots is not None:
+                resident += self.moe_scratch_slots[r]
+            share = min(1.0, resident / experts_r)
+            out.append(offloadable[r] * (1.0 - share))
+        return out
+
     def _mamba_pool_bytes(
         self, attn_vector: Optional[List[int]] = None
     ) -> List[float]:
@@ -4774,6 +4832,9 @@ class PerfCostModel:
         from sglang.srt.distributed.utils import partition_units
 
         weights = self.per_rank_weight_bytes(mlp_vector, attn_vector)
+        # #62: what the host store holds is not on the card.
+        offloaded = self.per_rank_offloaded_weight_bytes(mlp_vector)
+        weights = [w - o for w, o in zip(weights, offloaded)]
         mamba = self.mamba_pool_bytes_for(attn_vector)
         if self.measured is not None:
             # MEASURED budget model (registry-backed, cross/solo planning):
