@@ -1438,6 +1438,22 @@ class FusedMoE(torch.nn.Module):
         # The repack's [E] transients are freed but stay reserved in the
         # caching allocator; hand them back so the next layer's copy-in and
         # the KV pool are sized against real free memory, not the cache.
+        #
+        # empty_cache() ALONE DOES NOT DO THAT UNDER WEG 2 (fnFL2 v45-v49,
+        # 21.09.): with --flip-weights family the load runs inside a private
+        # torch.cuda.MemPool (weg2_memory_saver.tag_pool_scope) whose cached
+        # blocks empty_cache never reaches, and the pool is cached per tag so
+        # it is not left until the whole load is over.  Measured: the
+        # per-rank overhead was IDENTICAL across two very different expert
+        # bookings (7.58 GiB on an 8-layer stage, 10.10 on an 11-layer one)
+        # and rose 0.84 GiB per layer -- so it was the transients, not the
+        # booking, and group P's 29-layer stage died in cu_mem_create at
+        # layer 28 of 29.  Release the pools first, then the cache.
+        from sglang.srt.managers.weg2_memory_saver import (
+            release_active_tag_pools,
+        )
+
+        release_active_tag_pools(reason="ct-stream-presplit")
         torch.cuda.empty_cache()
         after = expert_offload_release_totals()
         presplit = getattr(self, "_moe_offload_presplit", None) or {}

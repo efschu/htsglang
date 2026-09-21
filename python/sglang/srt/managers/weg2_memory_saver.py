@@ -2690,6 +2690,61 @@ def tag_mem_pool(tag: str) -> Any:
     return pool
 
 
+def release_active_tag_pools(reason: str = "") -> int:
+    """Hand every tag pool's FREE blocks back to the driver.  Returns the count.
+
+    fnFL2 v45-v49 (21.09.), and it is the load-time twin of what
+    ``use_mem_pool`` already does on exit.  Under ``--flip-weights family``
+    the weights load inside :func:`tag_pool_scope`, whose pool is CACHED in
+    ``_TAG_MEM_POOLS`` and therefore not left until the whole load is over.
+    ``torch.cuda.empty_cache()`` does not reach into a live private pool
+    (measured, pool_probe.py: 1.8 GiB freed inside a MemPool stays reserved
+    through empty_cache), so every layer's Marlin repack transient stayed
+    pinned for the rest of the boot.
+
+    MEASURED COST of not doing this (boots fnFL2v47 vs v48, same ranks, two
+    very different expert bookings):
+
+        rank   layers   model tensors      occupied        overhead
+        pp2       8      6.71 / 4.78 GiB   14.29 / 12.36    7.58 GiB (both)
+        pp1      11      7.72 / 5.04 GiB   17.81 / 15.12   10.10 GiB (both)
+
+    The overhead does not move with the booking at all and rises 0.84 GiB per
+    LAYER -- so group P's 29-layer stage 0 pays ~25 GiB of a 32.6 GiB card
+    before a single expert is resident, and v45-v49 died in ``cu_mem_create``
+    at layer 28 of 29 rather than at any gate.
+
+    ``_cuda_releasePool`` releases a pool's CACHED blocks; blocks still held
+    by live tensors stay exactly where they are, which is why this is safe to
+    call in the middle of a load.  Absent in a torch without MemPool: returns
+    0 and says so once, the same shape as tag_pool_scope's own degrade.
+    """
+    import torch
+
+    try:
+        from torch.cuda.memory import _cuda_releasePool
+    except Exception:  # noqa: BLE001 -- a torch without private pools
+        return 0
+    if not _TAG_MEM_POOLS or not torch.cuda.is_available():
+        return 0
+    device_index = torch.cuda.current_device()
+    n = 0
+    for tag, pool in list(_TAG_MEM_POOLS.items()):
+        try:
+            _cuda_releasePool(device_index, pool.id)
+            n += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "WEG2-TAG-POOL release FAILED tag=%s (%s) -- this tag's load "
+                "transients stay pinned for the rest of the boot", tag, exc,
+            )
+    torch.cuda.empty_cache()
+    logger.debug(
+        "WEG2-TAG-POOL released=%d%s", n, f" reason={reason}" if reason else "",
+    )
+    return n
+
+
 @contextmanager
 def tag_pool_scope(tag: str) -> Iterator[Any]:
     """Route every allocation inside into ``tag``'s own pool.
