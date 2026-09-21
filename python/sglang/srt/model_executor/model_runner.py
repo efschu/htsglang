@@ -2675,47 +2675,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # raise at boot leaves the other five in a collective that no longer
         # has six members.  The fenced re-check is the wake RPC's preamble
         # (spec section 3.6), which reads weight_exchange.boot_vote().
-        # #1378 / fnFL2 v55: GIVE THE BASE TAG'S DEAD SHARD-LOAD BLOCKS BACK
-        # before anything prices this card.  ``load_weights`` runs in the BASE
-        # weights tag (``weight_chunk_scope`` wraps only the post-load pass,
-        # model_loader/loader.py:971), the presplit frees the originals
-        # python-side, and their blocks stay in that tag's private MemPool --
-        # which ``empty_cache`` cannot reach and ``_cuda_releasePool`` will
-        # not release while the tag cache holds a reference.  MEASURED on v55
-        # (WEG2-XCHG-COVER): the base tag books 9528 MiB on PP1 against 12.5
-        # MiB of live named tensors, 8726 against 628.2 on PP2 -- and those
-        # deltas ARE the per-rank load overhead (10.09 / 7.57 GiB) that killed
-        # v45-v55 in cu_mem_create.  What still lives under the base tag is
-        # small and named, so it moves to a fresh pool and the old pool object
-        # goes, taking the dead blocks with it.
-        try:
-            from sglang.srt.managers.weg2_memory_saver import (
-                register_tag_live_tensors,
-                swap_tag_pool,
-            )
-            from sglang.srt.weg2.weight_exchange import tag_of_parameter_name
-
-            _base_holders = []
-            for _n, _p in self.model.named_parameters():
-                if tag_of_parameter_name(_n, region_tag=weights_tag) != weights_tag:
-                    continue  # lives in a per-layer chunk pool, leave it there
-
-                def _mk(mod_param=_p):
-                    return (lambda: mod_param.data,
-                            lambda t: setattr(mod_param, "data", t))
-
-                _base_holders.append(_mk())
-            register_tag_live_tensors(weights_tag, _base_holders)
-            swap_tag_pool(weights_tag)
-        except Exception as _swap_exc:  # noqa: BLE001
-            # NAMED, never swallowed: without it the card keeps ~0.84 GiB per
-            # layer of dead blocks and the KV sizing refuses later, far from
-            # here.
-            logger.error(
-                "WEG2-TAG-POOL swap FAILED for the base weights tag (%s) -- "
-                "this rank keeps its dead shard-load blocks", _swap_exc,
-            )
-
         from sglang.srt.weg2.weight_exchange import arm_coverage_at_load
 
         # #1330 B4n: BOTH RANK AXES, and `rank=` stays `tp_rank` because every
