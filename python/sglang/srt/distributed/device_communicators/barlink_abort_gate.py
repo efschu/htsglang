@@ -477,6 +477,26 @@ def poll_status_words() -> int:
             _disarm = getattr(transport, "_abort_poll_disarm", None)
             if callable(_disarm):
                 _disarm("the status poll raised; see the traceback above")
+            # #100 (fnFL2w32/w33, TP0): NACH DEM DISARM DIE RUNDE BEENDEN.
+            # An beiden Boots gemessen: der Poll scheiterte ZWEIMAL in
+            # derselben Runde -- einmal je registriertem Transport -- und der
+            # Prozess starb still zwischen dem zweiten Disarm und der naechsten
+            # Gloo-Runde ("Connection closed by peer", kein Traceback, kein
+            # Signal, oom_kill unveraendert 27). Die Ursache lag davor: ein
+            # cu_mem_create-OOM (torch_memory_saver.cpp:194) liess das Mapping
+            # des Kontrollworts unbrauchbar zurueck. `is_poison_error` kennt
+            # dessen Signaturen nicht -- "unknown parameter type" und
+            # "invalid combination of arguments" stehen in keiner Marker-Liste
+            # --, also brach die Schleife nicht ab und griff ein zweites Mal
+            # auf einen bereits beschaedigten Kontext zu.
+            #
+            # Ein Poll, der ueberhaupt scheitert, kann sein Geraet nicht mehr
+            # sicher lesen; der Text der Ausnahme aendert daran nichts. Die
+            # Marker-Liste zu verlaengern waere der schwaechere Fix: die
+            # naechste Signatur fehlte wieder. Das Disarm gilt dem Transport,
+            # dieses `break` der RUNDE -- ein poisoned Kontext ist prozessweit,
+            # nicht transport-lokal.
+            break
     return tripped
 
 
