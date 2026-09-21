@@ -2698,6 +2698,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             for _t in sorted(_TAG_MEM_POOLS):
                 log_tag_pool_occupancy(_t, when="after-load")
+            # fnFL2v61 named the SHAPE of the waste (each chunk pool: ~22
+            # segments of ~100 MiB holding ~155 live blocks of ~2 MiB, so no
+            # segment can be returned); this dump names the CALL SITES.
+            # Armed by the same env as the presplit tensor inventory, so one
+            # boot answers both.  Written per rank, never by default.
+            import os as _os
+
+            if _os.environ.get("SGLANG_CT_PRESPLIT_MEMSNAP", ""):
+                import torch as _t2
+
+                _dir = "/spinning/gpu-arb/devtools/debug_artifacts/memsnapshots"
+                _os.makedirs(_dir, exist_ok=True)
+                _p = f"{_dir}/afterload_{_os.getpid()}.pickle"
+                try:
+                    _t2.cuda.memory._dump_snapshot(_p)
+                    logger.info("WEG2-MEMSNAP after-load dumped to %s", _p)
+                except Exception as _de:  # noqa: BLE001
+                    logger.warning("WEG2-MEMSNAP dump failed (%s)", _de)
         except Exception as _occ_exc:  # noqa: BLE001
             logger.warning(
                 "WEG2-TAG-POOL occupancy probe failed (%s)", _occ_exc
