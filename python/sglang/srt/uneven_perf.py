@@ -4832,9 +4832,31 @@ class PerfCostModel:
         from sglang.srt.distributed.utils import partition_units
 
         weights = self.per_rank_weight_bytes(mlp_vector, attn_vector)
-        # #62: what the host store holds is not on the card.
+        # #62: what the host store holds is not on the card -- but the term
+        # OPENS THE GATE AND DOES NOT CHOOSE THE VECTOR, and that asymmetry is
+        # deliberate.
+        #
+        # The DIRECTION is proven: the runtime serves the routed experts out of
+        # the host store, so pricing all of them as card-resident declared
+        # every vector infeasible (fnFL2v80: 89398 MiB of "weights" against a
+        # 28240 MiB budget) and W64 refused a boot the runtime runs.
+        #
+        # The MAGNITUDE is not. What is left after the subtraction is still the
+        # family model's own estimate, and it reads ~2x the measured census of
+        # the same form (fnFL2v72 [vram-census]: 11,78 / 11,06 / 10,49 GiB of
+        # model tensors per rank against this model's 24583 / 22164 / 21852
+        # MiB). An unanchored number may lift a refusal -- the refusal was
+        # provably wrong -- but it must not pick the DCP token vector, which is
+        # what fnFL2v84 paid for: the freed budget moved the vector to
+        # attn [10,7,7], the 5090's KV cell grew from 0,13 to 1,12 GB, the pool
+        # FELL from 262144 to 196224 tokens, and the card went OOM at
+        # cu_mem_create with 0,01 GiB free during graph capture.
+        #
+        # So: `feasible` sees the offload, `p` / `ctx` / `token_vector` keep
+        # the pre-#62 arithmetic byte-identical. The asymmetry retires the day
+        # the mass is anchored to the measured census (#48) -- not by widening
+        # it here.
         offloaded = self.per_rank_offloaded_weight_bytes(mlp_vector)
-        weights = [w - o for w, o in zip(weights, offloaded)]
         mamba = self.mamba_pool_bytes_for(attn_vector)
         if self.measured is not None:
             # MEASURED budget model (registry-backed, cross/solo planning):
@@ -4923,7 +4945,17 @@ class PerfCostModel:
             p = self._solo_rank_token_capacity(free_bytes)
         else:
             p = [f / self.kv_cell_bytes for f in free_bytes]
-        feasible = all(x >= _PREDICT_MIN_RANK_TOKENS for x in p)
+        # THE GATE, and only the gate, sees the host store (see above).
+        if any(o > 0 for o in offloaded):
+            gate_free = [f + o for f, o in zip(free_bytes, offloaded)]
+            gate_p = (
+                self._solo_rank_token_capacity(gate_free)
+                if self.solo_active
+                else [f / self.kv_cell_bytes for f in gate_free]
+            )
+        else:
+            gate_p = p
+        feasible = all(x >= _PREDICT_MIN_RANK_TOKENS for x in gate_p)
         if feasible and token_vector is not None:
             # #492: the pinned vector's OWN budget under the weighted owner
             # rule -- rank r owns v[r] of every sum(v) slots, so the group can

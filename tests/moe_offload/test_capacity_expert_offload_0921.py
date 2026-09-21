@@ -72,14 +72,13 @@ def test_a_dense_checkpoint_offloads_nothing():
     assert m.per_rank_offloaded_weight_bytes([1, 1, 1]) == [0.0, 0.0, 0.0]
 
 
-def test_predict_capacity_subtracts_the_same_term():
+def test_predict_capacity_reads_the_same_term():
     import inspect
 
     from sglang.srt.uneven_perf import PerfCostModel
 
     src = inspect.getsource(PerfCostModel.predict_capacity)
     assert "offloaded = self.per_rank_offloaded_weight_bytes(mlp_vector)" in src
-    assert "weights = [w - o for w, o in zip(weights, offloaded)]" in src
 
 
 # -- die Quelle der Zahlen: die --env-d-Zeichenkette des Arms, nie os.environ --
@@ -119,3 +118,26 @@ def test_the_decision_hands_env_d_to_the_rows():
     # und beide Aufrufstellen im main reichen die Zeichenkette wirklich durch
     main_src = inspect.getsource(launcher)
     assert main_src.count('d_bs, getattr(ns, "env_d", "") or "",') == 2
+
+
+# -- die Asymmetrie: der Abzug oeffnet das Gate, waehlt aber keinen Vektor ---
+
+def test_the_offload_opens_the_gate_but_leaves_p_and_the_vector_alone():
+    """fnFL2v84 hat den Preis bezahlt: der freigewordene Platz verschob den
+    DCP-Token-Vektor auf attn [10,7,7], die KV-Zelle der 5090 wuchs von 0,13
+    auf 1,12 GB, der Pool FIEL von 262144 auf 196224 Token, und die Karte ging
+    beim Graph-Capture mit 0,01 GiB frei OOM. Die Richtung des Abzugs ist
+    bewiesen, seine GROESSE nicht (~2x gegen den Zensus) -- also darf er
+    verweigern lassen, aber nicht waehlen."""
+    import inspect
+
+    from sglang.srt.uneven_perf import PerfCostModel
+
+    src = inspect.getsource(PerfCostModel.predict_capacity)
+    # p wird NICHT gekuerzt
+    assert "weights = [w - o for w, o in zip(weights, offloaded)]" not in src
+    # das Gate schon
+    assert "gate_free = [f + o for f, o in zip(free_bytes, offloaded)]" in src
+    assert "feasible = all(x >= _PREDICT_MIN_RANK_TOKENS for x in gate_p)" in src
+    # und ohne Offload ist gate_p buchstaeblich p
+    assert "gate_p = p" in src
