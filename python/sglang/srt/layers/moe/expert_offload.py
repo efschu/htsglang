@@ -5132,8 +5132,17 @@ def _expert_store_rows_for(layer, plan):
     _index = _es.global_rows(plan.spill_ids, int(lo), pad)
     _slots = None
     if _es.slot_fraction() < 1.0:
+        # #72, KORRIGIERT NACH fnFL2w10: `len(_ratios)` stand VOR der
+        # Pruefung, ob es die Ratios ueberhaupt gibt -- und Gruppe P laeuft
+        # OHNE --rank-moe-ratio. P starb daran vor READY
+        # (TypeError: object of type 'NoneType' has no len(),
+        # expert_offload.py:5136), und zwar erst, als der Slot-Pool zum
+        # ersten Mal eingeschaltet war: ohne die Env ist
+        # `slot_fraction() < 1.0` falsch und der ganze Block unerreichbar.
+        # Ein Feature, das nie lief, hat auch nie gezeigt, dass es bricht.
         _ratios = _rank_moe_ratio_vector(layer)
-        _fracs = _rank_resident_fraction_vector(layer, len(_ratios))
+        _fracs = (_rank_resident_fraction_vector(layer, len(_ratios))
+                  if _ratios else None)
         if _ratios and _fracs:
             _rank = int(getattr(layer, "moe_tp_rank", 0) or 0)
             _base = _es.slot_base_for_rank(_ratios, _fracs, _rank)

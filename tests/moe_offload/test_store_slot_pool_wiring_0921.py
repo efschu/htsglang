@@ -138,3 +138,27 @@ def test_a_short_fraction_vector_does_not_silently_shift_a_rank(monkeypatch, tmp
     _, _, _, n_slots, _, _ = _rows_for(monkeypatch, tmp_path, 1, 10,
                                        resident_vec="0.59,0.59")
     assert n_slots == 512
+
+
+def test_a_group_without_moe_ratios_does_not_crash(monkeypatch, tmp_path):
+    """fnFL2w10: GENAU HIER starb Gruppe P, bevor sie READY wurde.
+
+    `_fracs = _rank_resident_fraction_vector(layer, len(_ratios))` stand VOR
+    der Pruefung `if _ratios and _fracs` -- und P laeuft ohne
+    `--rank-moe-ratio` (nur D setzt 60,226,226). Also len(None) ->
+    TypeError im Ladepfad, mitten in process_weights_after_loading.
+
+    Sichtbar wurde das erst, als der Slot-Pool zum ersten Mal EINGESCHALTET
+    war: ohne SGLANG_MOE_EXPERT_STORE_SLOT_FRACTION ist
+    `slot_fraction() < 1.0` falsch und der ganze Block unerreichbar. Ein
+    Feature, das nie lief, hat auch nie gezeigt, dass es bricht -- deshalb
+    steht dieser Test hier und nicht nur der gruene Pfad daneben.
+    """
+    monkeypatch.setenv(es.STORE_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(es.SLOT_FRACTION_ENV, "0.82")
+    monkeypatch.setenv("SGLANG_MOE_RESIDENT_EXPERT_FRACTION", "0.12,0.3,0.3")
+    layer = _Layer(0, 0, 171, num_experts=512, ratios=())
+    layer.moe_ratio = None          # genau P's Fall
+    _, _, _, n_slots, index, _ = eo._expert_store_rows_for(layer, _Plan([1, 2, 3]))
+    assert n_slots == 512, "ohne Ratios bleibt es beim vollen Store"
+    assert sorted(index.values()) == [0, 1, 2]
