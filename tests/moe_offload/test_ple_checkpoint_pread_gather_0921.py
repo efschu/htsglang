@@ -79,6 +79,14 @@ def test_pread_gather_matches_the_mmap_rows_and_the_in_range_rule(tmp_path, work
     out2 = torch.empty((64, DIM), dtype=torch.bfloat16)
     g.gather_into(ids2, out2)
     assert torch.equal(out2.view(torch.int16), _reference(table, ids2, 0, table.total_rows).view(torch.int16))
+    # the model hands the output as (*input_ids.shape, dim) -- [T, K, dim] here
+    ids3 = torch.randint(0, table.total_rows, (12, 5), dtype=torch.int64)
+    out3 = torch.empty((12, 5, DIM), dtype=torch.bfloat16)
+    g.gather_into(ids3, out3)
+    ref3 = _reference(table, ids3.reshape(-1), 0, table.total_rows).reshape(12, 5, DIM)
+    assert torch.equal(out3.view(torch.int16), ref3.view(torch.int16))
+    with pytest.raises(ValueError):
+        g.gather_into(ids3, torch.empty((12, 4, DIM), dtype=torch.bfloat16))
     g.close()
 
 

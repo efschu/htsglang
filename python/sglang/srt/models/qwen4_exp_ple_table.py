@@ -330,10 +330,15 @@ class PleCheckpointPreadGather:
         t0 = _time.monotonic()
         ids = flat_ids.detach().reshape(-1).cpu().to(torch.int64)
         n = int(ids.numel())
-        if out.dim() != 2 or out.shape[0] != n or out.shape[1] != self._table.embedding_dim:
-            raise ValueError("PLE pread gather: output shape does not match the ids")
+        dim = self._table.embedding_dim
+        if out.numel() != n * dim or (out.dim() >= 1 and out.shape[-1] != dim):
+            raise ValueError(
+                f"PLE pread gather: output {tuple(out.shape)} does not match {n} ids x {dim}"
+            )
         if n == 0:
             return out
+        # the model hands (*ids.shape, dim); fill it through a flat [n, dim] view
+        flat_out = out.reshape(n, dim)
         if vocab_end is None:
             vocab_end = self._table.total_rows
         in_range = (ids >= vocab_start) & (ids < vocab_end) & (ids < self._table.total_rows)
@@ -365,7 +370,9 @@ class PleCheckpointPreadGather:
             ]
             for f in futs:
                 f.result()
-        out.copy_(staging, non_blocking=out.is_cuda)
+        flat_out.copy_(staging, non_blocking=out.is_cuda)
+        if flat_out.data_ptr() != out.data_ptr():
+            out.copy_(flat_out.reshape(out.shape))
         self.stats["gathers"] += 1
         self.stats["rows"] += n
         self.stats["zero_rows"] += n - nv
