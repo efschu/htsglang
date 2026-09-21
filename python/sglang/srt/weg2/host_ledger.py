@@ -1152,6 +1152,15 @@ RATE_LATCH_FILL_RISING_GIB = 0.01
 #: while 86 GiB are free is not pre-empting a reap, it is the reap.
 RATE_LATCH_CUSHION_RELEVANCE_GIB = 32.0
 
+#: fnFL2 v14 (21.09.): the shared expert store (59 GiB tmpfs) makes ``file -
+#: shmem`` ~0 for the WHOLE boot while 29 GiB of the pool are plain free
+#: pages -- the latch tore D down at nonreclaim 88.98 with headroom 6.92 and
+#: cushion 0.14, exactly the weg2xsn65 shape but INSIDE the relevance bound.
+#: The page cache is not the only thing that absorbs a write: free pages do,
+#: first. With at least this many GiB free (MemFree, the container's own
+#: reading through lxcfs) the reading is printed once and not latched.
+RATE_LATCH_FREE_POOL_GIB = 3.0
+
 
 def launch_moment_peak_gib(
     anon_load_peak_gib: float,
@@ -1285,6 +1294,7 @@ class RateLatch:
         self.gaps: List[float] = []
         #: #1378: the far-from-the-mark cushion reading is said ONCE per latch.
         self._cushion_far_noted = False
+        self._free_pool_noted = False
 
     def rate_gib_per_s(self) -> Optional[float]:
         """The WORST consecutive slope inside the trailing window, or ``None``.
@@ -1331,8 +1341,13 @@ class RateLatch:
         nonreclaim_gib: float,
         cushion_gib: Optional[float] = None,
         shmem_gib: Optional[float] = None,
+        free_gib: Optional[float] = None,
     ) -> Optional[str]:
         """#1361b: the CUSHION test replaces the remaining-bytes one, measured.
+
+        ``free_gib`` (MemFree): free pages absorb a write before the page
+        cache does; at or above RATE_LATCH_FREE_POOL_GIB the cushion reading
+        is noted once and never latched (fnFL2 v14).
 
         ``remaining_leg_gib`` IS DELETED, not left beside this -- a parameter
         that no longer decides anything is the present-but-unwired state this
@@ -1392,7 +1407,21 @@ class RateLatch:
                 self._last_shmem = float(shmem_gib)
             headroom = self.reap_mark_gib - float(nonreclaim_gib)
             if rising and float(cushion_gib) < RATE_LATCH_CUSHION_FLOOR_GIB:
-                if headroom > RATE_LATCH_CUSHION_RELEVANCE_GIB:
+                if free_gib is not None and float(free_gib) >= RATE_LATCH_FREE_POOL_GIB:
+                    if not self._free_pool_noted:
+                        self._free_pool_noted = True
+                        return (
+                            f"WEG2-HOST CUSHION-BELOW-FLOOR FREE-POOL-ABSORBS: cushion="
+                            f"{float(cushion_gib):.2f} GiB < floor "
+                            f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f} while shmem rises "
+                            f"(shmem={float(shmem_gib):.2f}) but MemFree={float(free_gib):.2f} "
+                            f"GiB >= {RATE_LATCH_FREE_POOL_GIB:.2f} (now={nonreclaim_gib:.2f}, "
+                            f"mark={self.reap_mark_gib:.2f}, headroom={headroom:.2f}) -- the "
+                            f"next write lands in free pages, not in a page cache the shared "
+                            f"expert store (tmpfs) has already displaced (fnFL2 v14 was torn "
+                            f"down on this reading); printed once"
+                        )
+                elif headroom > RATE_LATCH_CUSHION_RELEVANCE_GIB:
                     # #1378 xsn65: cold cache, 86 GiB of free pool -- the
                     # write this cushion would absorb lands in free pages.
                     # Said once, never latched; the rate path below still
@@ -4223,9 +4252,18 @@ def read_cgroup_pressure(root: str = "/sys/fs/cgroup") -> Dict[str, Optional[flo
         "file_reclaimable_gib": None,
         "anon_gib": None,
         "shmem_gib": None,
+        "memfree_gib": None,
         "source": None,
     }
     st: Dict[str, int] = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemFree:"):
+                    out["memfree_gib"] = int(line.split()[1]) * 1024 / GIB
+                    break
+    except (OSError, ValueError, IndexError):
+        pass
     try:
         with open(f"{root}/memory.stat") as f:
             for line in f:

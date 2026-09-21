@@ -5377,6 +5377,7 @@ class LaunchGuard:
                             else float(f) - float(sh)
                         ),
                         shmem_gib=None if sh is None else float(sh),
+                        free_gib=pr.get("memfree_gib"),
                     )
                     self.ticks += 1
                     if line is not None:

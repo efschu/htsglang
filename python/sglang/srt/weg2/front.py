@@ -2502,6 +2502,7 @@ class Front:
                             else float(_file) - float(_shm)
                         ),
                         shmem_gib=None if _shm is None else float(_shm),
+                        free_gib=_pr_fast.get("memfree_gib"),
                     )
                     if _line is not None and "RATE-GAP" in _line:
                         # Blindness is a finding, never silence -- but it is not
