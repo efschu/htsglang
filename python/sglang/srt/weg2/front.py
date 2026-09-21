@@ -1744,6 +1744,14 @@ def _nvml_free() -> List[CardFree]:
     ]
 
 
+def latch_line_is_verdict(line: str, latch=None) -> bool:
+    """True only for the RateLatch's W98 verdict (or a latch that reports
+    itself latched); its printed-once notes are findings, not teardowns."""
+    if line and "W98" in line:
+        return True
+    return bool(getattr(latch, "latched", False))
+
+
 def dormant_residue_over(dc, reserve, weights_resident: bool) -> dict:
     """W19: the cards whose measured dormant residue D_c exceeds the reserve
     P's budget assumed. EMPTY under --weights-resident (fnFL2 v21): the
@@ -2549,6 +2557,14 @@ class Front:
                         # look. #1361.
                         self.counters["host_rate_gap"] += 1
                         logger.warning("%s", _line)
+                    elif _line is not None and not latch_line_is_verdict(_line, rate_latch):
+                        # fnFL2 v24 (21.09.): the latch also RETURNS its
+                        # printed-once notes (CUSHION-BELOW-FLOOR NOT-LATCHED /
+                        # FREE-POOL-ABSORBS); the launcher's guard grades the
+                        # line on "W98", this branch tore a serving boot down
+                        # on the note right after its first completed flip.
+                        self.counters["host_rate_note"] += 1
+                        logger.info("%s", _line)
                     elif _line is not None:
                         self.counters["host_rate_latch"] += 1
                         logger.error("%s", _line)

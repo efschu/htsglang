@@ -43,3 +43,20 @@ def test_both_call_sites_pass_memfree():
     assert 'free_gib=pr.get("memfree_gib")' in inspect.getsource(launcher)
     assert 'free_gib=_pr_fast.get("memfree_gib")' in inspect.getsource(front)
     assert '"memfree_gib": None' in inspect.getsource(hl.read_cgroup_pressure)
+
+
+def test_front_stops_only_on_the_latch_verdict():
+    """fnFL2 v24 (21.09.): the front tore a serving boot down on the
+    FREE-POOL-ABSORBS note right after its first completed flip."""
+    import types
+
+    from sglang.srt.weg2 import front as fr
+
+    calm = types.SimpleNamespace(latched=False)
+    assert fr.latch_line_is_verdict("WEG2-HOST CUSHION-BELOW-FLOOR FREE-POOL-ABSORBS: cushion=0.01", calm) is False
+    assert fr.latch_line_is_verdict("WEG2-HOST CUSHION-BELOW-FLOOR NOT-LATCHED: cushion=0.43", calm) is False
+    assert fr.latch_line_is_verdict("W98 Weg2HostRateLatched: cushion=0.14 GiB BELOW", calm) is True
+    assert fr.latch_line_is_verdict("anything", types.SimpleNamespace(latched=True)) is True
+    src = inspect.getsource(fr.Front)
+    assert 'elif _line is not None and not latch_line_is_verdict(_line, rate_latch):' in src
+    assert src.index('not latch_line_is_verdict(_line, rate_latch)') < src.index('self.do_stop("W98 Weg2HostRateLatched", _line)')
