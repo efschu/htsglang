@@ -525,7 +525,18 @@ def _outside_torch_mib() -> float:
     try:
         import torch
 
-        free_b, total_b = torch.cuda.mem_get_info()
+        # DERSELBE ZUSTAND WIE nvml_delta, sonst sind die Terme nicht
+        # vergleichbar (fnFL2v90). `_cuda_free_mib` ruft VOR jeder Messung
+        # `empty_cache()`, misst also mit geleertem Default-Pool; dieser Term
+        # tat es nicht und las deshalb einen anderen Kartenzustand. Eine
+        # Bilanz aus zwei Messzeitpunkten ist keine Bilanz.
+        #
+        # empty_cache erreicht die privaten Tag-Pools NICHT (#65) -- deren
+        # Cache bleibt also in BEIDEN Zahlen stehen und wird vom
+        # tag_pool-Term erklaert. Genau so soll es sein.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        free_b, total_b = torch.cuda.mem_get_info(torch.cuda.current_device())
         used_mib = float(total_b - free_b) / float(2**20)
         reserved_mib = float(torch.cuda.memory_reserved()) / float(2**20)
         return used_mib - reserved_mib
@@ -550,6 +561,15 @@ def _default_pool_inactive_mib() -> float:
     try:
         import torch
 
+        # Auch hier NACH empty_cache, aus demselben Grund. Was danach noch
+        # als "reserved minus allocated" dasteht, ist der Anteil, den
+        # empty_cache nicht herausgeben KONNTE -- praktisch die privaten
+        # Tag-Pools. Deshalb ist dieser Term nach dem Leeren deckungsgleich
+        # mit dem tag_pool-Term und nicht dessen Summe mit head_released:
+        # gemessen v89 OHNE Leeren 2597,7 = 1385,2 + 1212,5, was die
+        # Doppelzaehlung ausloeste.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
         r = float(torch.cuda.memory_reserved())
         a = float(torch.cuda.memory_allocated())
         return (r - a) / float(2**20)
