@@ -1645,7 +1645,13 @@ class Scheduler(
             1,
             int(cfg.get_total_num_kv_heads()),
             int(cfg.head_dim),
-            2 * int(cfg.get_total_num_kv_heads()) * int(cfg.head_dim),
+            # per PAGE, not per token: under page_size > 1 a canonical draft
+            # page carries page_size rows, and an instrument that says
+            # otherwise misreads the store by that factor (#66).
+            2
+            * int(cfg.get_total_num_kv_heads())
+            * int(cfg.head_dim)
+            * max(1, int(getattr(self.server_args, "page_size", 1) or 1)),
             mtp_mib,
             embed_mib,
             # THREE instruments, each named on the line, none averaged with

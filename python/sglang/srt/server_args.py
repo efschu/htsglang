@@ -8493,8 +8493,19 @@ class ServerArgs:
             refuse(f"does not support data parallelism (dp_size={self.dp_size})")
         if self.ep_size > 1:
             refuse(f"does not support expert parallelism (ep_size={self.ep_size})")
-        if self.page_size != 1:
-            refuse(f"needs page_size == 1 (got page_size={self.page_size}): a canonical draft page is ONE token's draft layer")
+        # page_size: NOT refused since 2026-09-21 (#66). The refusal read "a
+        # canonical draft page is ONE token's draft layer" -- but nothing in
+        # the producer path holds that assumption: `page_size` appears nowhere
+        # in draft_kv_producer.py, the draft write lands on the TARGET batch's
+        # own `out_cache_loc` slots (eagle_worker_v2.py:1709, which is why a
+        # born-spilled prefill with host sentinels has to be skipped there),
+        # the canonical store's draft window is sized per token
+        # (canonical_page_store.py:757), and the only "2 * kv_heads *
+        # head_dim" in the tree is the PRODUCER'S LOG LINE
+        # (scheduler.py:1648), not an allocation. Next Flash runs page_size
+        # 64, so refusing it kept the decode group's drafter identity
+        # unmatchable (W10 Weg2DrafterIdentityMismatch P=None, boot fnFL2v65)
+        # and the flip had no draft KV to carry at all.
         if not self.hicache_canonical_kv_page:
             refuse("needs --hicache-canonical-kv-page: the draft page rides the canonical page format's geometry-free key")
         for name in (
