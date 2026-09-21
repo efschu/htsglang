@@ -284,14 +284,43 @@ def slot_rows(local_ids: Iterable[int], lo: int, pad: bool = True,
 
 
 def write_rows(
-    store: torch.Tensor, src: torch.Tensor, local_ids: Sequence[int], lo: int, pad: bool = True
+    store: torch.Tensor,
+    src: torch.Tensor,
+    local_ids: Sequence[int],
+    lo: int,
+    pad: bool = True,
+    rows: Optional[Dict[int, int]] = None,
 ) -> Dict[int, int]:
-    """Copy ``src[local]`` into its store row (see :func:`global_rows`) for
-    every local id (``src`` is expert-major over the rank's LOCAL ids, on any
-    device). Returns the local -> row map that was written."""
-    rows = global_rows(local_ids, lo, pad)
+    """Copy ``src[local]`` into its store row for every local id (``src`` is
+    expert-major over the rank's LOCAL ids, on any device). Returns the
+    local -> row map that was written.
+
+    ``rows`` ist die FERTIGE Abbildung ``lokal -> Zeile``. Ohne sie faellt die
+    Funktion auf :func:`global_rows` zurueck, also Zeile == globale Id.
+
+    #94, gemessen fnFL2w22 und w23: genau dieser Rueckfall war der Defekt.
+    Seit dem Slot-Pool (#72) hat die Datei nur noch so viele Plaetze, wie
+    Experten gleichzeitig kalt sind (324 statt 512), und
+    ``_expert_store_rows_for`` rechnet dafuer die Abbildung
+    ``lokal -> Slot``. Sie erreichte den LESER (``layer._moe_offload_store_
+    index``) und nicht den SCHREIBER -- der rief ``global_rows`` ein zweites
+    Mal und schrieb in Zeile 370 einer 324-Zeilen-Datei. Wer rechnet, gibt
+    das Ergebnis weiter; zweimal rechnen heisst irgendwann verschieden
+    rechnen.
+    """
+    rows = dict(rows) if rows is not None else global_rows(local_ids, lo, pad)
     if not rows:
         return rows
+    kapazitaet = int(store.shape[0])
+    daneben = sorted(r for r in rows.values() if not (0 <= int(r) < kapazitaet))
+    if daneben:
+        raise RuntimeError(
+            f"#94: {len(daneben)} Zeilen liegen ausserhalb der Store-Datei "
+            f"(0..{kapazitaet-1}), erste: {daneben[:4]}. Entweder ist die "
+            f"Abbildung lokal->Slot nicht durchgereicht worden (dann sind es "
+            f"globale Ids), oder die Datei wurde mit einer anderen "
+            f"Platzzahl angelegt als die Abbildung annimmt."
+        )
     locals_ = list(rows.keys())
     dst = torch.as_tensor([rows[e] for e in locals_], dtype=torch.long)
     # NO device-side gather: fn8m (20.09.) showed the index_select copies of

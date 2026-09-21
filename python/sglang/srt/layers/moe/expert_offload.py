@@ -5462,7 +5462,7 @@ def presplit_expert_offload_after_repack(
             # setzt genau hier an.
             from sglang.srt.layers.moe import expert_store as _es
 
-            s_dir, s_key, s_lo, s_num, _s_index, s_pad = store_rows
+            s_dir, s_key, s_lo, s_num, s_index, s_pad = store_rows
             # #72: `s_num` ist BEREITS die Plaetzezahl, wenn der Slot-Pool
             # greift (`_expert_store_rows_for` hat sie gerechnet). Sie als
             # `num_experts` zu uebergeben hiesse, `slots_for` ein zweites Mal
@@ -5478,7 +5478,18 @@ def presplit_expert_offload_after_repack(
             # host store keeps what no card holds). fn8m measured the store
             # with residents at 58 GiB shmem / 77 GiB cgroup after load, 89 at
             # the load peak, against the 88 GiB mark; residents are the 12 GiB.
-            written = _es.write_rows(spill, t, list(plan.spill_ids), s_lo, s_pad)
+            # #94 (fnFL2w22/w23): MIT der vorgerechneten Abbildung, nicht
+            # ohne. `_expert_store_rows_for` hat `lokal -> Slot` schon
+            # gerechnet und oben als `layer._moe_offload_store_index` fuer den
+            # LESER abgelegt; hier stand sie als `_s_index` entpackt und
+            # ungenutzt daneben, waehrend `write_rows` sich `global_rows` ein
+            # zweites Mal selbst rechnete. Ergebnis: Schreiben in Zeile 370
+            # einer Datei mit 324 Plaetzen -- zwei Boots tot, und der
+            # Unterstrich im Namen sagte die ganze Zeit, dass niemand sie
+            # liest.
+            written = _es.write_rows(
+                spill, t, list(plan.spill_ids), s_lo, s_pad, rows=s_index
+            )
             _es.mark_rows_written(
                 s_dir, s_key, attr, int(getattr(layer, "moe_tp_rank", 0) or 0),
                 written.values(),
