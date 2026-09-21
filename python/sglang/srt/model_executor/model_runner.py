@@ -2441,8 +2441,38 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 _tc.ple_offload_dir = _ple_dir
 
         # This can reduce thread conflicts and speed up weight loading.
+        #
+        # #66 (21.09.): das gilt fuer einen Ladepfad, in dem VIELE Threads
+        # gleichzeitig Tensoren anfassen -- und nicht fuer unseren. Gemessen
+        # an fnFL2v84 (SGLANG_LOAD_PROFILE=1, alle drei Raenge einig): 43 %
+        # der Ladezeit stehen in EINER Zeile,
+        # fused_moe_triton/layer.py:1973 `loaded_weight.t().contiguous()`, je
+        # Experten-Shard, seriell im Hauptthread -- waehrend die acht
+        # Datei-Worker in `threading.wait` stehen (9,7-12,8 %), weil ihr
+        # Puffer voll ist, und der NVMe-Controller dabei nur 40-60 % Leselast
+        # meldet. Die Platte wartet auf uns.
+        #
+        # Mit einem Thread transponiert diese Kopie auf EINEM Kern. Der
+        # Schalter gibt der Ladephase mehr Intraop-Threads, ohne die
+        # Voreinstellung anzutasten: ohne die Env ist es byte-identisch zu
+        # vorher, und die Zahl ist die des Operators, nicht geraten. Nach dem
+        # Laden zaehlt sie nicht mehr -- das Serving setzt seine eigene.
         if self.device != "cpu":
-            torch.set_num_threads(1)
+            _load_threads = 1
+            try:
+                _load_threads = max(1, int(
+                    os.environ.get("SGLANG_LOAD_INTRAOP_THREADS", "1")
+                ))
+            except ValueError:
+                _load_threads = 1
+            torch.set_num_threads(_load_threads)
+            if _load_threads > 1:
+                logger.info(
+                    "WEG2 LOAD-INTRAOP torch.set_num_threads(%d) for the load "
+                    "phase (SGLANG_LOAD_INTRAOP_THREADS); the default 1 leaves "
+                    "the per-shard transpose of layer.py:1973 on one core",
+                    _load_threads,
+                )
         if self.device == "cuda":
             if _needs_float16_fallback(self.gpu_id):
                 logger.info(
