@@ -1303,6 +1303,10 @@ class DRankVerdict:
     available_mib: float
     #: was der Launcher ihm gibt (``--rank-gpu-memory-mib`` / BUD_D).
     asked_mib: float
+    #: #158: die Korridor-Untergrenze dieser Karte unter Last (NVML-frei).
+    #: 0 heisst NICHT GEPRUEFT -- dann sagt `corridor_ok` True, ohne dass
+    #: etwas geprueft worden waere, und `corridor_note` sagt das auch.
+    corridor_floor_mib: float = 0.0
 
     @property
     def over_mib(self) -> float:
@@ -1311,7 +1315,44 @@ class DRankVerdict:
 
     @property
     def fits(self) -> bool:
+        """PHYSIK: passen die Bytes ueberhaupt auf die Karte."""
         return self.over_mib <= 0.0
+
+    @property
+    def rest_mib(self) -> float:
+        """Was nach dem Budget frei bleibt -- der Korridor lebt hiervon."""
+        return self.available_mib - self.asked_mib
+
+    @property
+    def corridor_ok(self) -> bool:
+        """BETRIEBSREGEL, getrennt von der Physik gehalten.
+
+        #158, Nutzer-Gesetz: 819..1229 MiB NVML-frei je Karte unter der Last
+        der wachen Gruppe. Ein Budget kann physisch passen (`fits`) und den
+        Korridor trotzdem reissen -- genau das war fnFL2w130/w131: der
+        Verdikt sagte gruen, die Karte lief auf 124 MiB frei, P starb.
+
+        BEWUSST KEIN Teil von `fits`: die Physik entscheidet, OB es passt;
+        der Korridor entscheidet, ob wir es WOLLEN. Wer beides in einen
+        Bool giesst, kann hinterher nicht mehr sagen, welche der beiden
+        Grenzen gerissen ist.
+        """
+        if self.corridor_floor_mib <= 0.0:
+            return True
+        return self.rest_mib >= self.corridor_floor_mib
+
+    @property
+    def corridor_note(self) -> str:
+        """Ein Satz fuer die Logzeile -- oder die ehrliche Aussage, dass
+        nichts geprueft wurde."""
+        if self.corridor_floor_mib <= 0.0:
+            return "Korridor NICHT GEPRUEFT (kein Floor uebergeben)"
+        if self.corridor_ok:
+            return (f"Korridor ok ({self.rest_mib:.0f} >= "
+                    f"{self.corridor_floor_mib:.0f} MiB)")
+        return (f"KORRIDOR GERISSEN: Rest {self.rest_mib:.0f} MiB liegt "
+                f"{self.corridor_floor_mib - self.rest_mib:.0f} MiB unter dem "
+                f"Floor {self.corridor_floor_mib:.0f}")
 
 
 def d_rank_available_mib(
@@ -1358,6 +1399,7 @@ def d_rank_budget_verdict(
     foreign_context_mib,
     nontorch_mib,
     reserve_mib_by_rank=None,
+    corridor_floor_mib=0.0,
 ):
     """Passt das Budget, das der Launcher jedem D-Rang gibt, physisch?
 
@@ -1390,6 +1432,7 @@ def d_rank_budget_verdict(
             reserve_mib=float(r),
             available_mib=float(a),
             asked_mib=float(b),
+            corridor_floor_mib=float(corridor_floor_mib),
         )
         for i, (b, t, f, o, r, a) in enumerate(
             zip(budgets_mib, card_total_mib, foreign_context_mib,

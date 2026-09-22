@@ -9686,13 +9686,24 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     # Ein FEHLENDER Term ist 0 und heisst "nicht gebucht" -- er wird im Druck
     # namentlich genannt, damit niemand die Zeile fuer vollstaendig haelt.
     # Genau das ist der Unterschied zu einem geratenen Default.
+    # #158: den Korridor-Floor mitgeben, damit der Verdikt die BETRIEBSREGEL
+    # bewerten kann und nicht nur die Physik. fnFL2w130/w131 sagten beide
+    # "fits", liefen auf 124 MiB frei und verloren P.
+    try:
+        from sglang.srt.managers import corridor_guard as _cg
+
+        _floor = float(_cg.corridor_band_floor_mib())
+    except BaseException:  # noqa: BLE001 -- ohne Floor wird NICHT geprueft,
+        _floor = 0.0       # und der Verdikt sagt das auch ("NICHT GEPRUEFT")
     verdikte = _pp_cut.d_rank_budget_verdict(
         budgets_mib=[float(b) for b in budgets_d],
         card_total_mib=totals,
         foreign_context_mib=fremd if fremd is not None else [0.0] * n,
         nontorch_mib=nicht_torch if nicht_torch is not None else [0.0] * n,
         reserve_mib_by_rank=reserve,
+        corridor_floor_mib=_floor,
     )
+    _korridor_riss = [v.rank for v in verdikte if not v.corridor_ok]
     drueber = [v.rank for v in verdikte if not v.fits]
     log(
         "%s VERDIKT %s: %s%s"
@@ -9706,9 +9717,12 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                    v.card_total_mib, v.foreign_context_mib, v.nontorch_mib,
                    v.reserve_mib, v.available_mib, v.asked_mib,
                    "REST" if v.fits else "DARUEBER", abs(v.over_mib))
+                + " [" + v.corridor_note + "]"
                 for v in verdikte
             ),
             ((" -- DARUEBER auf Rang %s" % drueber) if drueber else "")
+            + ((" -- KORRIDOR GERISSEN auf Rang %s: die Bytes passen, die "
+                "Betriebsregel nicht" % _korridor_riss) if _korridor_riss else "")
             + ((" [NICHT GEBUCHT: %s -- diese Zeile ist damit eine OBERGRENZE, "
                 "keine Bilanz]" % ", ".join(fehlend)) if fehlend else ""),
         )
