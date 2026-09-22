@@ -16752,6 +16752,41 @@ class ServerArgs:
             return None
         return declared_layer_kinds_from_config(cfg, depth)
 
+    def _pp_cut_hybrid_pool_cap(self) -> Optional[int]:
+        """Der KV-Deckel, den der Server auf hybriden Modellen anwendet (#128).
+
+        SPIEGELT `ModelRunner._hybrid_kv_token_cap` (#79) Zeile fuer Zeile --
+        inklusive des ``max()`` mit der Mamba-Slot-Kapazitaet. WER DEN
+        WEGLAESST, baut einen Planer-Deckel, der KLEINER ist als der des
+        Servers: der Planer plant dann zu wenig Pool, der Server allokiert
+        mehr, und das endet im OOM statt in einer Refusal. Ein Planer-Deckel
+        darf nie unter dem des Servers liegen.
+
+        ``None`` = kein Deckel: kein hybrides Modell, oder Nebenlaeufigkeit
+        bzw. Kontextlaenge nicht bestimmbar. Dann bleibt der Term, was er war.
+        """
+        mc = getattr(self, "model_config", None)
+        if mc is None or getattr(mc, "mambaish_config", None) is None:
+            return None
+        concurrency = 0
+        if self.max_running_requests and self.max_running_requests > 0:
+            concurrency = int(self.max_running_requests)
+        if self.max_mamba_cache_size:
+            from sglang.srt.mem_cache.mamba_pool_floor import (
+                mamba_slots_per_running_req,
+            )
+
+            ratio = max(int(mamba_slots_per_running_req(self)), 1)
+            concurrency = max(concurrency, int(self.max_mamba_cache_size) // ratio)
+        if concurrency <= 0:
+            return None
+        ctx = int(self.context_length or 0)
+        if ctx <= 0:
+            return None
+        from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
+
+        return concurrency * (ctx + int(get_req_to_token_extra_context_len(self)))
+
     def _handle_pp_solve_cut(self):
         """--pp-solve-cut: solve the layer cut from a measured census (#485).
 
@@ -16833,6 +16868,35 @@ class ServerArgs:
         pool_tokens = int(self.max_total_tokens or 0)
         if pool_tokens <= 0 and self.context_length:
             pool_tokens = int(self.context_length)
+        # #128 DER PLANER MUSS DENSELBEN DECKEL KENNEN WIE DER SERVER.
+        #
+        # Auf einem hybriden mamba/GDN+Attention-Modell deckelt
+        # `ModelRunner._hybrid_kv_token_cap` (#79) den KV-Pool auf
+        # `concurrency x (context_len + extra)`: nur die wenigen
+        # Full-Attention-Layer tragen KV, die Zelle ist winzig, und die
+        # Nebenlaeufigkeit ist durch die Mamba-Slots gebunden -- mehr Tokens
+        # kann dieses Modell physisch nie halten.
+        #
+        # GEMESSEN fnFL2w60: der Server allokierte auf ALLEN DREI P-Raengen
+        # 269952 Tokens ("KV token sizing: rank 0 local capacity 270000 ...
+        # THIS RANK BINDS"), waehrend dieser Term mit 937950 bepreiste. Der
+        # Planer reservierte also Platz fuer das 3,5-Fache und refuste jede
+        # hoehere Experten-Residenz (W40, "NONE of 6 servable candidates
+        # clears the floor") -- bei 45,9 / 72,0 / 51,3 % Kartenfuellung und
+        # 8,5-10,5 GB freiem VRAM je Karte NACH der KV-Allokation.
+        # Der Term stammt aus der dichten 27B-Welt, wo ein grosser Pool
+        # legitim ist.
+        _hyb = self._pp_cut_hybrid_pool_cap()
+        if _hyb is not None and (pool_tokens <= 0 or _hyb < pool_tokens):
+            logger.info(
+                "PP-CUT POOL CAP (#128): hybrid mamba/GDN model -- pool "
+                "priced at %d tokens instead of %d, the same ceiling the "
+                "server applies (#79 _hybrid_kv_token_cap). Everything the "
+                "pool cannot reach belongs to the expert residency.",
+                _hyb,
+                pool_tokens,
+            )
+            pool_tokens = int(_hyb)
         kv_bytes = self._pp_cut_kv_bytes_per_token_per_attn_layer()
         token_shares = self._pp_cut_token_shares()
 
