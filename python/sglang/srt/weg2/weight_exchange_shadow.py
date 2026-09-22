@@ -3454,8 +3454,31 @@ def derive_leg_plan(
     # is exactly the bytes both ends hold identically.
     if agreed is not None:
         keys = agreed.keys
+        # #137: DIE EXPERTEN-PUFFER UEBERLEBEN DIE VERENGUNG, und zwar
+        # BEGRUENDET, nicht als Ausnahme von der Regel.
+        #
+        # Die Verengung vergleicht `manifest_entry(name, class, rows_full,
+        # cols_full, itemsize)` -- Name UND GEOMETRIE. Fuer einen replizierten
+        # Tensor ist das richtig und faengt echte Divergenz. Ein Experten-
+        # Puffer hat aber je Gruppe eine ANDERE Geometrie, per Konstruktion:
+        #   P-Stufe 0:  188 residente + 32 Scratch Slots   (FR_P 0.367)
+        #   D-Rang 0:   134 residente + Scratch            (FR_D 0.70)
+        # Die Identitaeten treffen sich also NIE, die Schnittmenge wirft sie
+        # raus -- gemessen fnFL2w69: jeder Rang meldet gleichzeitig
+        # uncovered=12 (die eigenen Puffer fehlen im verengten Plan) UND
+        # missing=12 (stattdessen stehen dort Namen, die er nicht haelt),
+        # W84 mit 232/88/64 findings.
+        #
+        # DASS SIE UNGLEICH SIND, IST DER GRUND, WARUM DER FLIP SIE BEWEGT.
+        # Ihre Aufteilung bestimmt nicht das Paar-Agreement, sondern der
+        # Cross-Group-JOIN, der die Shard-Achse aus den Manifesten abliest
+        # ("The shard AXIS is likewise not guessed: it is READ OFF the join").
+        # Beide Gruppen fuehren sie -- derselbe Presplit laeuft auf beiden --
+        # also hat jeder Deskriptor eine Quelle und ein Ziel; was fehlte, war
+        # nur die Erlaubnis, sie zu paaren.
         kept = [g for g in inventory
-                if manifest_entry(g.name, tensor_class(g.name), g.rows_full,
+                if ms.is_expert_buffer_attr(g.name)
+                or manifest_entry(g.name, tensor_class(g.name), g.rows_full,
                                   g.cols_full, g.itemsize) in keys]
         if not kept:
             return _plan_refusal(

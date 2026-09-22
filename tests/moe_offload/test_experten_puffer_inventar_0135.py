@@ -170,9 +170,47 @@ def test_der_helfer_ist_die_einzige_stelle(chunks):
     import inspect
 
     for fn in (sh.card_inventory, sh.derive_leg_plan):
-        src = inspect.getsource(fn)
+        # NUR CODE, keine Kommentare: die Kommentare NENNEN `vars(module)`
+        # genau dort, wo sie erklaeren, warum der Helfer noetig ist -- ein
+        # Test, der den Erklaertext trifft, misst die Prosa statt die Naht.
+        src = "\n".join(z.split("#")[0] for z in inspect.getsource(fn).split("\n"))
         assert "expert_buffer_tensors(model)" in src, fn.__name__
-        assert "is_expert_buffer_attr" not in src, (
-            f"{fn.__name__} buchstabiert das Praefix selbst statt den Helfer "
-            f"zu rufen -- das ist die zweite Buchhaltung, die w68 gekostet hat"
+        # Die eigentliche Aussage: KEIN eigener Walk ueber die Modul-Dicts.
+        # (`is_expert_buffer_attr` darf sonst vorkommen -- #137 fragt damit
+        # in der Paar-Verengung, ob ein Eintrag ein Experten-Puffer IST, und
+        # das ist kein zweites Inventar, sondern eine Eigenschaftsfrage an
+        # einen Eintrag, den der Helfer geliefert hat.)
+        assert "vars(module)" not in src, (
+            f"{fn.__name__} walkt die Modul-Dicts selbst statt den Helfer zu "
+            f"rufen -- das ist die zweite Buchhaltung, die w68 gekostet hat"
         )
+
+
+# --- #137: die Verengung auf das co-lokierte Paar -------------------------
+
+def test_experten_puffer_ueberleben_die_paar_verengung():
+    """fnFL2w69: `reconcile_card_manifest` verengt den Plan auf die
+    Schnittmenge der Manifest-IDENTITAETEN des co-lokierten Paares, und eine
+    Identitaet enthaelt `rows_full`. Ein Experten-Puffer hat je Gruppe eine
+    andere (P-Stufe 0: 188+32 Slots, D-Rang 0: 134+Scratch), also treffen
+    sich die Identitaeten nie und die Schnittmenge wirft ihn raus -- jeder
+    Rang meldete gleichzeitig uncovered=12 UND missing=12.
+
+    Dass sie ungleich sind, ist der GRUND, warum der Flip sie bewegt. Dieser
+    Test bindet die Ausnahme an den Namen, nicht an eine Gesinnung: ein
+    normaler Tensor MUSS weiter an der Geometrie scheitern.
+    """
+    import inspect
+
+    src = inspect.getsource(sh.derive_leg_plan)
+    i = src.index("kept = [g for g in inventory")
+    block = src[i:i + 320]
+    assert "is_expert_buffer_attr(g.name)" in block, (
+        "die Verengung nimmt die Experten-Puffer nicht aus -- sie fallen "
+        "wieder heraus, und der Flip transportiert erneut null Experten"
+    )
+    assert "manifest_entry(" in block, (
+        "die Geometrie-Pruefung ist ganz entfallen -- sie MUSS fuer jeden "
+        "anderen Tensor stehen bleiben, sonst faengt nichts mehr echte "
+        "Divergenz (W80)"
+    )
