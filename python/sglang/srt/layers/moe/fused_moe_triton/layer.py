@@ -374,6 +374,33 @@ def expert_shard_generic_eligible(quant_config, plan_active, moe_ep_size, opt_in
     return True
 
 
+#: #68a DIE EINE QUELLE FUER "WIRD DIESER TENSOR TRANSPONIERT".
+#:
+#: Sie existierte ZWEIMAL, und die zweite war breiter -- daran starb der
+#: Worker-Transpose am Metall (fnFL2v87, 21.09.: "The size of tensor a
+#: (2560) must match the size of tensor b (80)"). Der VERBRAUCHER hier
+#: entschied an der Methode des LAYERS (drei Klassennamen), der WORKER in
+#: `qwen4_exp._is_ct_wna16_expert_shard` an der quant_config des MODELLS
+#: (`"CompressedTensors" in ...`) -- und das trifft auch Schemata, die
+#: diese drei Klassen NICHT sind. Der Worker transponierte damit Tensoren,
+#: die der Verbraucher nie angefasst haette.
+#:
+#: Eine Funktion, von beiden Seiten gerufen. Ein per-Tensor-Marker war die
+#: Alternative und bleibt abgelehnt (er kann zwischen den Seiten verloren
+#: gehen und laedt dann still falsch); ein gemeinsames PRAEDIKAT kann das
+#: nicht, und ein Test kann beide Seiten gegen dieselbe Namensliste stellen.
+_CT_TRANSPOSING_METHODS = (
+    "CompressedTensorsWNA16MarlinMoE",
+    "CompressedTensorsWNA16MoE",
+    "CompressedTensorsWNA16TritonMoE",
+)
+
+
+def ct_method_transposes(method) -> bool:
+    """Transponiert DIESE Layer-Methode ihre Experten-Shards? (#68a)"""
+    return type(method).__name__ in _CT_TRANSPOSING_METHODS
+
+
 def _transpose_done_in_worker() -> bool:
     """Did the loader thread already transpose the expert shards? (#66)
 
@@ -1999,11 +2026,7 @@ class FusedMoE(torch.nn.Module):
         # same switch, which is exactly why it is a switch and not a
         # per-tensor marker: a marker can get lost between the two, a switch
         # cannot.
-        _needs_ct_transpose = method.__class__.__name__ in [
-            "CompressedTensorsWNA16MarlinMoE",
-            "CompressedTensorsWNA16MoE",
-            "CompressedTensorsWNA16TritonMoE",
-        ]
+        _needs_ct_transpose = ct_method_transposes(method)
         if _needs_ct_transpose and _transpose_done_in_worker():
             _needs_ct_transpose = False
         # #68: `.t()` OHNE `.contiguous()` -- EINE KOPIE STATT ZWEI.

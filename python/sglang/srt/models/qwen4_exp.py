@@ -2269,9 +2269,54 @@ def _is_ct_wna16_expert_shard(name: str, model) -> bool:
         return False
     if not name.endswith(_CT_EXPERT_SUFFIXES):
         return False
-    qc = getattr(model, "quant_config", None)
-    method = type(qc).__name__ if qc is not None else ""
-    return "CompressedTensors" in method
+    # #68a: DIE METHODE DES LAYERS, NICHT DER TYP DES MODELLS.
+    #
+    # Hier stand `"CompressedTensors" in type(model.quant_config).__name__`
+    # -- und genau daran starb fnFL2v87 ("The size of tensor a (2560) must
+    # match the size of tensor b (80)"): der VERBRAUCHER transponiert nur
+    # unter drei ganz bestimmten Layer-Methoden, dieses Praedikat traf
+    # jedes compressed-tensors-Schema. Breiter als der Verbraucher heisst:
+    # der Worker transponiert Tensoren, die der Verbraucher nie anfasst,
+    # und die Shapes passen danach nicht mehr zusammen.
+    #
+    # Jetzt fragt diese Funktion DIESELBE Quelle wie der Verbraucher --
+    # `ct_method_transposes` in fused_moe_triton/layer.py -- und zwar an
+    # der Methode DES LAYERS, zu dem der Tensor gehoert. Findet sie den
+    # Layer nicht, ist die Antwort False: ein Fehltreffer kostet dann
+    # Geschwindigkeit (der Verbraucher transponiert selbst), nie
+    # Korrektheit -- die Asymmetrie, die ein solcher Schalter haben muss.
+    from sglang.srt.layers.moe.fused_moe_triton.layer import (
+        ct_method_transposes,
+    )
+
+    layer = _expert_layer_for_name(name, model)
+    if layer is None:
+        return False
+    return ct_method_transposes(getattr(layer, "quant_method", None))
+
+
+def _expert_layer_for_name(name: str, model):
+    """Das FusedMoE-Modul, zu dem dieser Checkpoint-Tensor gehoert (#68a).
+
+    ``model.language_model.layers.7.mlp.experts.3.down_proj.weight_packed``
+    -> das ``experts``-Modul von Layer 7. Ueber ``get_submodule`` auf dem
+    Praefix VOR ``.experts.``, damit die Namensform an genau einer Stelle
+    steht und nicht als zweite Regel neben dem Loader lebt.
+    """
+    marke = ".experts."
+    if marke not in name:
+        return None
+    praefix = name.split(marke, 1)[0] + ".experts"
+    for kandidat in (
+        praefix.replace("model.language_model.", "model."),
+        praefix,
+        praefix.replace("model.", "model.language_model.", 1),
+    ):
+        try:
+            return model.get_submodule(kandidat)
+        except AttributeError:
+            continue
+    return None
 
 
 class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
