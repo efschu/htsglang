@@ -603,9 +603,9 @@ P_PP_INCUMBENT_FMT = "%s / attention %s" % (
 #: second bookkeeping of the boot's own argv, which is the shape
 #: UPSTREAM-MINIMAL forbids. One name each, read by everybody.
 SPEC_ALGORITHM = "NEXTN"
-SPEC_NUM_STEPS = 2
+SPEC_NUM_STEPS = 3
 SPEC_EAGLE_TOPK = 1
-SPEC_NUM_DRAFT_TOKENS = 3
+SPEC_NUM_DRAFT_TOKENS = 4
 KV_CACHE_DTYPE = "fp8_e4m3"
 
 P_DRAFT_KV_FLAGS: Tuple[str, ...] = (
