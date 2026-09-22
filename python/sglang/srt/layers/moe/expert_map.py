@@ -122,12 +122,55 @@ def bounds(spans: Sequence[int]) -> List[int]:
     return lo
 
 
+def resident_count_like_the_rank(n: int, fraction: float) -> int:
+    """Wieviele Experten ein Rang mit ``n`` Experten bei ``fraction`` haelt.
+
+    #160, und es ist [[zwei-seiten-einer-naht-fragen-dasselbe]]: diese Zahl
+    gehoert NICHT hierher. Sie gehoert dem Rang, der die Experten wirklich
+    auf die Karte legt -- ``expert_offload.resident_slot_count``, an dem das
+    VRAM-Sizing und der #439-Latch haengen. Die Karte SCHREIBT AUF, was
+    passiert; sie entscheidet es nicht.
+
+    Vorher rechnete sie ``round(n * f)`` und der Rang ``max(1, ceil(f*n))``.
+    An den acht Fraktionen, die am 22.09. wirklich gefahren wurden,
+    divergierten SIEBEN -- jedes Mal um genau eine Id, und jedes Mal so,
+    dass die Karte einen Experten fuer kalt erklaert, den der Rang resident
+    haelt:
+
+        P  512 x 0.459  ->  Rang 236, Karte 235   (fnFL2w133)
+        P  512 x 0.309  ->  Rang 159, Karte 158   (fnFL2w132)
+        D  144 x 0.545  ->  Rang  79, Karte  78
+        D  176 x 0.449  ->  Rang  80, Karte  79
+        D  183 x 0.006  ->  Rang   2, Karte   1   (die max(1,...)-Kante)
+
+    Ohne Spiegel verdeckt die Verschiebung sich selbst -- der Store hat eine
+    Zeile zuviel, niemand stirbt. Mit Spiegel wird daraus der Abbruch
+    ``#107: N eigene kalte Experten haben in der KARTE keinen Platz``.
+
+    KEIN RUECKFALL auf eine eigene Formel, wenn der Import scheitert: eine
+    falsche Residenzmenge ist eine falsche Slot-Zuordnung, und die ist
+    Datenverlust, nicht Speicherverlust (dieselbe Begruendung wie #91/3).
+    """
+    from sglang.srt.layers.moe.expert_offload import resident_slot_count
+
+    n = int(n)
+    if n <= 0:
+        return 0
+    try:
+        f = float(fraction)
+    except (TypeError, ValueError):
+        f = 0.0
+    return resident_slot_count(n, min(max(f, 0.0), 1.0))
+
+
 def resident_sharded(ratios: Sequence[int], fractions: Sequence[float],
                      total: int) -> List[List[int]]:
     """Je Rang die GLOBALEN Ids, die diese Gruppe auf ihren Karten haelt.
 
-    Die Auswahl ist "die ersten ``round(span * fraction)`` des eigenen
-    Bandes" -- das ist, was der Offload-Plan ohne Hotset tut, und fnFL2w48
+    Die Auswahl ist "die ersten ``resident_count_like_the_rank(span,
+    fraction)`` des eigenen Bandes" -- das ist, was der Offload-Plan ohne
+    Hotset tut, und die Zaehlung ist seit #160 DIE DES RANGS statt einer
+    eigenen (vorher ``round``, siebenmal um eine Id daneben). fnFL2w48
     hat am Metall gezeigt, dass ein Hotset daran nichts aendert (P folgte
     ihm nicht). Die Karte schreibt also auf, was WIRKLICH passiert, nicht
     was passieren sollte.
@@ -140,8 +183,8 @@ def resident_sharded(ratios: Sequence[int], fractions: Sequence[float],
             f = float(fractions[i])
         except (IndexError, TypeError, ValueError):
             f = 0.0
-        f = min(max(f, 0.0), 1.0)
-        out.append(list(range(lo[i], lo[i] + round(span * f))))
+        out.append(list(range(lo[i],
+                              lo[i] + resident_count_like_the_rank(span, f))))
     return out
 
 
@@ -149,7 +192,8 @@ def resident_unsharded(fraction, total: int) -> List[List[int]]:
     """Je PP-STUFE die globalen Ids, die sie auf ihrer Karte haelt (#132).
 
     PP teilt nach LAYERN: jede Stufe haelt alle ``total`` Experten IHRER
-    Layer und residiert davon die ersten ``round(total * f_i)``. Die
+    Layer und residiert davon die ersten
+    ``resident_count_like_the_rank(total, f_i)`` (#160). Die
     Stufen haben verschiedene Karten und verschiedene Fractions -- genau
     dafuer gibt es zwei Layouts, und eine Zahl fuer alle drei wirft die
     Optimierung weg.
@@ -168,7 +212,7 @@ def resident_unsharded(fraction, total: int) -> List[List[int]]:
         fs = [0.0]
     if not fs:
         fs = [0.0]
-    return [list(range(round(total * min(max(f, 0.0), 1.0)))) for f in fs]
+    return [list(range(resident_count_like_the_rank(total, f))) for f in fs]
 
 
 def mirror_tp_selection(res_d: Sequence[Sequence[int]],
@@ -177,7 +221,8 @@ def mirror_tp_selection(res_d: Sequence[Sequence[int]],
 
     Der Austausch ist ein Besitzerwechsel -- er kann nur Bytes umhaengen,
     die BEIDE Seiten als denselben Tensor beschreiben. `resident_unsharded`
-    nimmt fuer P die ersten ``round(total*f)`` Ids von 0..total-1,
+    nimmt fuer P die ersten ``resident_count_like_the_rank(total, f)``
+    Ids von 0..total-1,
     `resident_sharded` fuer D je Rang die ersten seines BANDES. Zwei
     verschiedene Praefixe ueber zwei verschiedenen Grundmengen, und deshalb
     ist die Schnittmenge winzig: gemessen fnFL2w132 zwei Ids von 193, und
@@ -204,7 +249,7 @@ def mirror_tp_selection(res_d: Sequence[Sequence[int]],
         fs = [1.0]
     out: List[List[int]] = []
     for f in fs:
-        cap = round(int(total) * min(max(float(f), 0.0), 1.0))
+        cap = resident_count_like_the_rank(total, f)
         out.append(list(gemeinsam[:cap]) if cap < len(gemeinsam)
                    else list(gemeinsam))
     return out

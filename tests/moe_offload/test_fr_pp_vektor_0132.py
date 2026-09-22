@@ -13,7 +13,10 @@ from sglang.srt.layers.moe import expert_map as em
 
 def test_vektor_wird_je_stufe_gerechnet():
     res = em.resident_unsharded([0.367, 0.75, 0.95], 512)
-    assert [len(x) for x in res] == [188, 384, 486]
+    # #160: 487 statt 486 -- die Karte zaehlt jetzt wie der Rang.
+    # ceil(512*0.95) = 487, round(512*0.95) = 486. Die 188 und 384 sind
+    # unberuehrt, weil 0.367 und 0.75 auf beiden Wegen dasselbe geben.
+    assert [len(x) for x in res] == [188, 384, 487]
 
 
 def test_skalar_bleibt_die_alte_form():

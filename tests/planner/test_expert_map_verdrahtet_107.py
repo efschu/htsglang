@@ -25,11 +25,16 @@ def test_pruefer_akzeptiert_die_gemessene_form():
 def test_die_anderen_raenge_zaehlen_mit():
     k = em.build(**W128)
     res_d = k["phases"]["D"]["resident"]
-    assert [len(x) for x in res_d] == [1, 78, 79], "die 3080er halten 78+79"
+    # #160: die Karte zaehlt jetzt wie der Rang (ceil statt round). Rang 0
+    # haelt bei FR_D 0.006 ueber 192 Experten ZWEI, nicht einen -- die alte
+    # Kartenformel schrieb 1 auf und erklaerte damit eine residente Id fuer
+    # kalt. Das ist die Zahl aus Aufgabe #79, hier an der Quelle.
+    assert [len(x) for x in res_d] == [2, 79, 80], "die 3080er halten 79+80"
     # Ohne Karte bleibt im Schnitt aller Stufen/Raenge genau EINE Id -> 511
-    # Store-Slots. Mit Karte sind es weniger, weil 78+79 mitzaehlen.
+    # Store-Slots. Mit Karte sind es weniger, weil 79+80 mitzaehlen.
     assert k["slots"] < 511, f"slots={k['slots']} -- die Karte spart nichts"
-    assert k["slots"] == 354
+    # 3 Plaetze weniger als vor #160: mehr resident heisst weniger kalt.
+    assert k["slots"] == 351
 
 
 def test_mutant_widerspruechliche_karte_wird_weiter_verworfen():
@@ -73,8 +78,8 @@ def test_publish_schreibt_die_datei_und_der_leser_findet_sie(tmp_path, monkeypat
     monkeypatch.setattr(_pc, "checkpoint_weight_terms",
                         lambda m: type("T", (), {"num_experts": 512})())
     pfad = L.publish_expert_map(NS(), "/modell", str(tmp_path), zeilen.append)
-    assert pfad and json.load(open(pfad))["slots"] == 354
-    assert any("#107 EXPERTEN-KARTE" in z and "354 Store-Plaetze" in z
+    assert pfad and json.load(open(pfad))["slots"] == 351
+    assert any("#107 EXPERTEN-KARTE" in z and "351 Store-Plaetze" in z
                for z in zeilen), zeilen
 
     es._EXPERT_MAP_CACHE.clear()
@@ -103,16 +108,19 @@ def test_join_verdikt_faengt_die_w132_form():
     k = em.build(**W128)
     zeilen = em.join_verdict(k)
     assert len(zeilen) == 3, "alle drei PP-Stufen passen nicht zu D"
-    assert "P haelt 193 Experten, D haelt 158, gemeinsam 2" in zeilen[0]
+    assert "P haelt 194 Experten, D haelt 161, gemeinsam 4" in zeilen[0]
 
 
 def test_gleiche_anzahl_genuegt_nicht():
     """Weg A (uniforme FR_P) loest es NICHT -- die Ids bleiben verschieden."""
+    # #160 verschiebt die D-Vereinigung auf 161, also muss FR_P mitwandern:
+    # 0.314 ist das uniforme f mit resident_slot_count(512, f) == 161. Ohne
+    # das prueft der Test nicht mehr "gleiche ANZAHL, andere Ids".
     k = em.build(total=512, ratios=[183, 137, 168],
-                 fr_pp=[0.309] * 3, fr_tp=[0.006, 0.545, 0.449])
+                 fr_pp=[0.314] * 3, fr_tp=[0.006, 0.545, 0.449])
     zeilen = em.join_verdict(k)
     assert len(zeilen) == 3
-    assert "P haelt 158 Experten, D haelt 158, gemeinsam 1" in zeilen[0]
+    assert "P haelt 161 Experten, D haelt 161, gemeinsam 2" in zeilen[0]
 
 
 def test_identische_mengen_sind_joinbar():
@@ -136,15 +144,19 @@ def test_mirror_deckelt_bei_zu_kleinem_fr_p():
                  fr_pp=[0.377, 0.700, 0.442],
                  fr_tp=[0.688, 0.545, 0.449], mirror=True)
     zeilen = em.join_verdict(k)
-    assert zeilen, "FR_P 0.377 -> 193 < D-Menge 289, das muss auffallen"
-    assert "P haelt 193" in zeilen[0] and "D haelt 289" in zeilen[0]
+    assert zeilen, "FR_P 0.377 -> 194 < D-Menge 292, das muss auffallen"
+    assert "P haelt 194" in zeilen[0] and "D haelt 292" in zeilen[0]
 
 
 def test_mirror_mit_passender_obergrenze():
-    k = em.build(total=512, ratios=[183, 137, 168], fr_pp=[0.564] * 3,
+    # 0.570 statt 0.564: nach #160 ist die D-Vereinigung 292, und der
+    # Deckel muss sie ERREICHEN, sonst kuerzt er P und der Join meldet es
+    # (genau das tut der Test darueber). 0.570 ist das kleinste uniforme f
+    # mit resident_slot_count(512, f) == 292.
+    k = em.build(total=512, ratios=[183, 137, 168], fr_pp=[0.570] * 3,
                  fr_tp=[0.688, 0.545, 0.449], mirror=True)
     assert em.join_verdict(k) == []
-    assert [len(x) for x in k["phases"]["P"]["resident"]] == [289, 289, 289]
+    assert [len(x) for x in k["phases"]["P"]["resident"]] == [292, 292, 292]
     assert k["moves"] == 0
 
 
@@ -153,4 +165,6 @@ def test_ohne_mirror_bleibt_alles_byte_identisch():
     a = em.build(**W128)
     b = em.build(**W128, mirror=False)
     assert a == b
-    assert [len(x) for x in a["phases"]["P"]["resident"]] == [193, 358, 226]
+    # +1 je Stufe gegen vor #160 -- das IST die Korrektur, nicht ein Bruch:
+    # ceil(512*0.377)=194 ist, was der Rang haelt.
+    assert [len(x) for x in a["phases"]["P"]["resident"]] == [194, 359, 227]

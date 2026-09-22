@@ -101,8 +101,14 @@ def test_phase_of_trennt_die_gruppen():
 
 
 def test_fraction_null_haelt_nichts_und_eins_haelt_alles():
+    # #160: TOTAL-1, nicht TOTAL. `resident_slot_count` hat ein
+    # `max(1, ...)`, und das ist keine Kosmetik -- `plan_load_time_staging`
+    # rechnet bei fraction 0.0 wirklich R=1 und legt EINEN Experten auf die
+    # Karte (nur `R >= E` schaltet den Offload ganz ab). Die alte
+    # Kartenformel schrieb 0 auf und liess die Store-Datei einen Platz zu
+    # gross werden. Die Karte schreibt auf, was passiert.
     k0 = em.build(TOTAL, RATIOS, 0.0, [0.0, 0.0, 0.0])
-    assert k0["slots"] == TOTAL, "ohne Residenz braucht der Store alles"
+    assert k0["slots"] == TOTAL - 1, "ein Experte bleibt immer auf der Karte"
     k1 = em.build(TOTAL, RATIOS, 1.0, [1.0, 1.0, 1.0])
     assert k1["slots"] == 0, "voll resident heisst: kein Store"
 
