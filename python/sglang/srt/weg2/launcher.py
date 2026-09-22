@@ -12862,6 +12862,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.op_line)
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns))
+        # #114 auch HIER: es gibt ZWEI spec_d-Stellen, und die erste Fassung
+        # traf nur die andere -- der Dry-Run blieb ohne die Zeile, und der
+        # Verdrahtungs-Check meldete "#114 fehlt im Baum", obwohl es im Baum
+        # war. Der Pruefer hat genau das gefangen, wofuer er gebaut ist.
+        for _g, _e in (("P", env_p), ("D", env_d)):
+            _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
+                           if str(k).startswith("SGLANG_"))
+            log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
         spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns)), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
