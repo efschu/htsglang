@@ -3928,6 +3928,31 @@ def _split_fraction_text(text) -> list:
     return out
 
 
+def _argv_scalar(extra: str, flag: str):
+    """Der LETZTE Wert hinter ``flag`` in einer ``--extra-*``-Zeichenkette.
+
+    Der letzte, nicht der erste: argparse nimmt bei doppelter Flagge den
+    letzten, und genau diese Doppelung hat am 22.09. zehn Flags still
+    umgedreht (Memory ``argv-doppelung-arm-schlaegt-planer``). Wer hier den
+    ersten naehme, laese einen Wert, mit dem der Boot nicht startet.
+
+    ``None`` wenn die Flagge fehlt oder ohne Wert dasteht.
+    """
+    if not extra or not flag:
+        return None
+    try:
+        parts = shlex.split(str(extra))
+    except ValueError:
+        return None
+    gefunden = None
+    for i, tok in enumerate(parts):
+        if tok == flag and i + 1 < len(parts):
+            gefunden = parts[i + 1]
+        elif tok.startswith(flag + "="):
+            gefunden = tok[len(flag) + 1:]
+    return gefunden
+
+
 def _argv_vector(extra: str, flag: str):
     """Der Komma-Vektor hinter ``flag`` in einer ``--extra-*``-Zeichenkette.
 
@@ -9889,6 +9914,75 @@ def solve_p_cut(
                 log("PP-CUT RESERVE (#141) IGNORIERT: --pp-cut-reserve-mib hat "
                     "%d Eintraege, die P-Gruppe hat %d Stufen"
                     % (len(_r), n_stages_p))
+
+        # #156 KV-PREIS: der Posten, den die Sizing-Kette nie gefuehrt hat.
+        #
+        # Nutzer-Order 22.09., woertlich: "kv muss bepreist werden fuer 262k
+        # und danach geht der rest an moe experten" -- und die Diagnose davor:
+        # "ein rang kann nicht 441728 kv bekommen und die anderen viel weniger
+        # als 262k, da rechnet was absolut grundfalsch".
+        #
+        # Er hat recht. In design_bytes-first-lawful.md 1.1 stehen alle Posten,
+        # die vom Budget abgezogen werden -- KV ist keiner davon, sondern der
+        # REST nach allen anderen. Unter PP haelt jede Stufe KV fuer IHRE Layer
+        # und ALLE Token, der effektive Kontext ist also das MINIMUM ueber die
+        # Stufen. fnFL2w123 rechnete 441728/172672/121920, servierte 121920 und
+        # liess 6,75/3,54/3,48 GB nach dem Sizing brach liegen.
+        #
+        # Ohne --pp-cut-reserve-mib wird der Preis hier GERECHNET statt mit 0
+        # angesetzt. Die Zelle kommt aus der Modell-Geometrie und ist am Metall
+        # gegengeprueft (fnFL2w123: 8704/4352/3264 B/Token, exakt).
+        _kv_p = None
+        if _reserve_p is None:
+            try:
+                _kv_tokens = int(_argv_scalar(
+                    getattr(ns, "extra_p", ""), "--max-total-tokens") or 0)
+                _attn_text = str(getattr(ns, "pp_attn_stage_ratio", "") or "")
+                _attn = [int(x) for x in _csv_floats(_attn_text)] if _attn_text else []
+                _kv_dtype = str(_argv_scalar(
+                    getattr(ns, "extra_p", ""), "--kv-cache-dtype") or "auto")
+                _kv_bytes = 1.0 if "fp8" in _kv_dtype else 2.0
+                # --draft-kv-on-p legt je Stufe EINEN Draft-Attention-Layer in
+                # denselben Pool; das ist der Unterschied zwischen den 7616,
+                # die DESIGN_FLIP_NEXTFLASH_0920.md nennt, und den 8704, die
+                # w123 mit Draft emittierte.
+                _dr = 1 if str(getattr(ns, "draft_kv_on_p", "off")) == "on" else 0
+                _tc = text_cfg
+                if _kv_tokens > 0 and len(_attn) == n_stages_p:
+                    _kv_p = _pp_cut.kv_reserve_mib_per_stage(
+                        tokens=_kv_tokens,
+                        attn_layers_by_stage=_attn,
+                        kv_heads=int(_tc["num_key_value_heads"]),
+                        head_dim=int(_tc["head_dim"]),
+                        v_head_dim=int(_tc.get("v_head_dim", _tc["head_dim"])),
+                        kv_dtype_bytes=_kv_bytes,
+                        draft_attn_layers_by_stage=[_dr] * n_stages_p,
+                    )
+                    _reserve_p = _kv_p
+                    log(
+                        "PP-CUT KV-PREIS (#156): %d Token x Zelle je Stufe "
+                        "(Attention-Layer %s + Draft %d, %s -> %.0f B je "
+                        "Attention-Layer und Token) = %s MiB je Stufe. DAS ist "
+                        "der Posten, der in der Kette fehlte; er geht jetzt als "
+                        "Reserve in die Fraction-Decke, damit der Rest den "
+                        "Experten gehoert und nicht umgekehrt."
+                        % (_kv_tokens, _attn, _dr, _kv_dtype,
+                           _pp_cut.kv_cell_bytes_per_attention_layer(
+                               kv_heads=int(_tc["num_key_value_heads"]),
+                               head_dim=int(_tc["head_dim"]),
+                               v_head_dim=int(_tc.get("v_head_dim", _tc["head_dim"])),
+                               kv_dtype_bytes=_kv_bytes),
+                           ["%.0f" % m for m in _kv_p])
+                    )
+                else:
+                    log("PP-CUT KV-PREIS (#156) ENTFAELLT: tokens=%d, "
+                        "--pp-attn-stage-ratio %r passt nicht zu %d Stufen. "
+                        "Ohne beides ist der Preis nicht rechenbar und die "
+                        "Decke bleibt die nackte Obergrenze."
+                        % (_kv_tokens, _attn_text, n_stages_p))
+            except BaseException as _exc:  # noqa: BLE001
+                log("PP-CUT KV-PREIS (#156) failed: %s: %s"
+                    % (type(_exc).__name__, _exc))
 
         try:
             _fmax = _pp_cut.solve_expert_fraction_per_stage(

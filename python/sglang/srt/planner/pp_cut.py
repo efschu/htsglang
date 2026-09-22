@@ -1083,6 +1083,106 @@ def _price_stage(
 _MAKESPAN_SLACK = 1.005
 
 
+def kv_cell_bytes_per_attention_layer(
+    *,
+    kv_heads: int,
+    head_dim: int,
+    v_head_dim: int,
+    kv_dtype_bytes: float,
+    scale_block_size: int = 16,
+) -> float:
+    """Bytes je Token und je ATTENTION-Layer im KV-Pool.
+
+    Dieselben Terme wie ``pool_configurator.DefaultPoolConfigurator`` sie
+    fuer ``cell_size`` fuehrt (``num_kv_heads * (head_dim + v_head_dim) *
+    layers * kv_size``, plus den fp8-Skalenblock), aber OHNE einen lebenden
+    ModelRunner -- der Launcher muss den Posten bepreisen, bevor ein Rang
+    existiert.
+
+    GEGENGEPRUEFT am Metall (fnFL2w123, Next Flash, fp8_e4m3, kv_heads 2,
+    head_dim 256, v_head_dim 256): 1024 + 64 = 1088 B je Attention-Layer.
+    Mal (Attention-Layer der Stufe + 1 Draft-Layer) ergibt exakt die drei
+    vom Boot emittierten Zellen 8704 / 4352 / 3264 -- keine Naeherung, die
+    drei Zahlen stimmen auf das Byte. Das Design-Dokument
+    DESIGN_FLIP_NEXTFLASH_0920.md nennt unabhaengig 7616 = 7 x 1088 fuer
+    PP0 OHNE Draft-Layer, was dieselbe Konstante von der anderen Seite
+    bestaetigt.
+    """
+    per_layer = float(kv_heads) * (float(head_dim) + float(v_head_dim)) * float(
+        kv_dtype_bytes
+    )
+    # fp8/float4 fuehren einen Skalenpuffer je Block mit; bei 1 B/Element
+    # sind das die 64 B, die 1024 auf die gemessenen 1088 heben.
+    scales = (
+        float(kv_heads) * float(head_dim) * 2.0 * float(kv_dtype_bytes)
+    ) / max(1, int(scale_block_size))
+    return per_layer + scales
+
+
+def kv_reserve_mib_per_stage(
+    *,
+    tokens: int,
+    attn_layers_by_stage,
+    kv_heads: int,
+    head_dim: int,
+    v_head_dim: int,
+    kv_dtype_bytes: float,
+    draft_attn_layers_by_stage=None,
+    scale_block_size: int = 16,
+):
+    """Was ``tokens`` Token KV je PP-Stufe KOSTEN -- der fehlende Posten.
+
+    Nutzer-Order 22.09., woertlich: *"kv muss bepreist werden fuer 262k und
+    danach geht der rest an moe experten"* und *"der rechner rechnet falsch,
+    freier vram wird nicht zu kv, freier vram wird zu moe anteilen und zwar
+    in dem masse, das man trotzdem 262k context behaelt. ein rang kann nicht
+    441728 kv bekommen und die anderen viel weniger als 262k"*.
+
+    Er hat recht, und die Sizing-Kette zeigt warum: in
+    ``design_bytes-first-lawful.md`` §1.1 stehen alle Posten, die vom Budget
+    abgezogen werden (Gewichte, Korridor, Mamba, Spec-Zwischenzustand,
+    Prefill-Aktivierung) -- KV ist KEIN Posten, sondern das, was uebrig
+    bleibt, und wird am Ende durch ``cell_size`` geteilt. Unter PP haelt jede
+    Stufe KV fuer IHRE Layer, aber fuer ALLE Token des Kontexts. Der
+    effektive Kontext ist deshalb das MINIMUM ueber die Stufen: fnFL2w123
+    rechnete 441728 / 172672 / 121920 und servierte 121920, waehrend nach dem
+    Sizing 6,75 / 3,54 / 3,48 GB brach lagen.
+
+    Diese Funktion dreht die Richtung um: der Kontext ist die EINGABE, sein
+    Preis ein Posten wie jeder andere, und was danach frei ist, gehoert den
+    Experten (Memory ``nextflash-experten-sind-der-hebel``).
+
+    ``draft_attn_layers_by_stage``: der Draft-KV-Produzent (``--draft-kv-on-p``)
+    legt je Stufe eigene Attention-Layer in denselben Pool. Ohne Angabe 0 --
+    dann ist das Ergebnis eine UNTERGRENZE des Preises, und das ist genau der
+    Fehler, der w123 121920 Token servieren liess. Benennen, nicht raten.
+    """
+    stages = [int(x) for x in attn_layers_by_stage]
+    n = len(stages)
+    draft = (
+        [int(x) for x in draft_attn_layers_by_stage]
+        if draft_attn_layers_by_stage is not None
+        else [0] * n
+    )
+    if len(draft) != n:
+        raise ValueError(
+            f"kv_reserve_mib_per_stage: {n} Stufen, aber {len(draft)} "
+            f"Draft-Layer-Angaben -- eine halbe Geometrie loest nichts"
+        )
+    cell_layer = kv_cell_bytes_per_attention_layer(
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        v_head_dim=v_head_dim,
+        kv_dtype_bytes=kv_dtype_bytes,
+        scale_block_size=scale_block_size,
+    )
+    out = []
+    for a, d in zip(stages, draft):
+        cell = float(max(0, a) + max(0, d)) * cell_layer
+        out.append(float(tokens) * cell / MIB)
+    return out
+
+
 def solve_expert_fraction_per_stage(
     *,
     budgets_mib,
