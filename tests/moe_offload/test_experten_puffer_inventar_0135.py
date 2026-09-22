@@ -135,3 +135,44 @@ def test_die_bytes_des_manifests_stimmen_mit_dem_tensor(chunks):
     assert len(meins) == 1
     assert meins[0].nbytes == buf.numel() * buf.element_size() == 220 * 16 * 64 * 4
     assert meins[0].tag == "weights_2"
+
+
+# --- #136: BEIDE Inventare lesen dieselbe Quelle ---------------------------
+
+def test_plan_und_manifest_sehen_DENSELBEN_puffer(chunks):
+    """fnFL2w68: das Manifest trug die Experten (43,34 GB statt 5,19 GB),
+    der PLAN nicht -- `derive_leg_plan` hatte eine EIGENE
+    `named_parameters()`-Schleife. Die Coverage haelt den Plan gegen die
+    lebenden Tensoren und meldete sie als UNCOVERED (W84: 116/32/44
+    findings). Zwei Buchhaltungen, die an der teuersten Stelle auseinander-
+    laufen -- genau die Klasse, vor der `card_inventory`s Docstring warnt.
+    """
+    buf = torch.zeros(220, 16, 64, dtype=torch.int32)
+    model = _modell(buf)
+    # Die EINE Quelle, die beide lesen:
+    aus_der_quelle = dict(sh.expert_buffer_tensors(model))
+    assert len(aus_der_quelle) == 1
+    name = next(iter(aus_der_quelle))
+    assert name.endswith("weg2_experts_w13_weight_packed")
+    assert aus_der_quelle[name].data_ptr() == buf.data_ptr()
+
+    inv, _s, _w, _r = sh.card_inventory(rank=0, model=model)
+    im_inventar = {g.name for g, _t in inv}
+    assert name in im_inventar, (
+        "das Manifest-Inventar sieht den Puffer nicht"
+    )
+
+
+def test_der_helfer_ist_die_einzige_stelle(chunks):
+    """Gegenprobe gegen die Rueckkehr der zweiten Buchhaltung: beide
+    Inventare muessen `expert_buffer_tensors` RUFEN, nicht eine eigene
+    Schleife ueber `vars(module)` fuehren."""
+    import inspect
+
+    for fn in (sh.card_inventory, sh.derive_leg_plan):
+        src = inspect.getsource(fn)
+        assert "expert_buffer_tensors(model)" in src, fn.__name__
+        assert "is_expert_buffer_attr" not in src, (
+            f"{fn.__name__} buchstabiert das Praefix selbst statt den Helfer "
+            f"zu rufen -- das ist die zweite Buchhaltung, die w68 gekostet hat"
+        )

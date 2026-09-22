@@ -3026,6 +3026,38 @@ def _qkv_component_rows(model, name: str) -> Tuple[int, ...]:
     return ()
 
 
+def expert_buffer_tensors(model):
+    """Jeder Experten-Puffer des Modells als ``(name, tensor)`` (#135).
+
+    EINE STELLE, ZWEI LESER -- und das ist der Punkt: ``card_inventory``
+    (Manifest, Coverage) und ``derive_leg_plan`` (der Plan, dessen
+    ``plan_digest`` Gate 0 vergleicht) bauen ihre Listen getrennt, jede mit
+    einer eigenen ``named_parameters()``-Schleife. Genau daran ist fnFL2w68
+    haengengeblieben: das Manifest trug die Experten (43,34 GB statt 5,19),
+    der Plan nicht, und die Coverage meldete sie als UNCOVERED
+    (W84, 116/32/44 findings). Zwei Buchhaltungen, die an der teuersten
+    Stelle auseinanderlaufen -- die Klasse, vor der ``card_inventory``s
+    eigener Docstring warnt ("a second inventory ... would be second
+    bookkeeping beside this one -- the W80/W84/W19 family").
+
+    Der Puffer ist ein Attribut, kein Parameter: der Presplit ersetzt den
+    Experten-Parameter durch einen 0-Zeilen-Platzhalter. ``vars(module)``
+    findet ihn, ``named_parameters()`` nie.
+    """
+    from sglang.srt.managers import weg2_memory_saver as ms
+
+    out = []
+    for module_path, module in model.named_modules():
+        for attr, value in list(vars(module).items()):
+            if not ms.is_expert_buffer_attr(str(attr)):
+                continue
+            if not isinstance(value, torch.Tensor) or value.numel() == 0:
+                continue
+            out.append((f"{module_path}.{attr}" if module_path else str(attr),
+                        value))
+    return out
+
+
 def card_inventory(
     *,
     rank: int,
@@ -3130,30 +3162,24 @@ def card_inventory(
     # ein Parameter -- dieselbe Tag-Aufloesung, dieselbe Skip-Regel, dieselben
     # Refusal-Worte -- damit die zwei Populationen nicht zwei Buchhaltungen
     # werden. `named_parameters()` findet ihn nicht, `vars(module)` schon.
-    for module_path, module in model.named_modules():
-        for attr, value in list(vars(module).items()):
-            if not ms.is_expert_buffer_attr(str(attr)):
-                continue
-            if not isinstance(value, torch.Tensor) or value.numel() == 0:
-                continue
-            name = f"{module_path}.{attr}" if module_path else str(attr)
-            walked += 1
-            tag = str(tag_of(name, region_tag=region_tag))
-            if not ms.is_weights_family_tag(tag):
-                skipped.append((name, f"not-weights-family:{tag}"))
-                continue
-            if tag not in family:
-                return None, [], walked, f"tag-not-in-family:{name} tag={tag}"
-            try:
-                geom = wx.ParamGeom.of(value, name=name, tag=tag,
-                                       shard_axis=wx.REPLICATED, shard_total=0,
-                                       stage=int(rank))
-            except BaseException as exc:  # noqa: BLE001
-                reason = ("undescribable-W68" if "W68" in str(exc)
-                          else "undescribable")
-                skipped.append((name, reason))
-                continue
-            inventory.append((geom, value))
+    for name, value in expert_buffer_tensors(model):
+        walked += 1
+        tag = str(tag_of(name, region_tag=region_tag))
+        if not ms.is_weights_family_tag(tag):
+            skipped.append((name, f"not-weights-family:{tag}"))
+            continue
+        if tag not in family:
+            return None, [], walked, f"tag-not-in-family:{name} tag={tag}"
+        try:
+            geom = wx.ParamGeom.of(value, name=name, tag=tag,
+                                   shard_axis=wx.REPLICATED, shard_total=0,
+                                   stage=int(rank))
+        except BaseException as exc:  # noqa: BLE001
+            reason = ("undescribable-W68" if "W68" in str(exc)
+                      else "undescribable")
+            skipped.append((name, reason))
+            continue
+        inventory.append((geom, value))
     if not inventory:
         return None, skipped, walked, f"no-carried-tags:family={family}"
     return inventory, skipped, walked, ""
@@ -3383,6 +3409,32 @@ def derive_leg_plan(
             continue
         inventory.append(geom)
         tensor_of[str(name)] = param
+        carried.add(tag)
+
+    # #135: DIE EXPERTEN-PUFFER, aus DERSELBEN Quelle wie das Manifest.
+    #
+    # fnFL2w68 hat gezeigt, was zwei Buchhaltungen kosten: das Manifest trug
+    # die Experten (43,34 GB statt 5,19 in w67), dieser Plan nicht -- und die
+    # Coverage, die den Plan gegen die lebenden Tensoren haelt, meldete sie
+    # als UNCOVERED (W84: 116/32/44 findings auf den drei P-Raengen). Beide
+    # Schleifen lesen jetzt `expert_buffer_tensors`, damit die Naht nicht ein
+    # drittes Mal an derselben Stelle aufgeht.
+    for name, value in expert_buffer_tensors(model):
+        tag = str(tag_of(name, region_tag=region_tag))
+        if not ms.is_weights_family_tag(tag):
+            continue
+        if tag not in family:
+            return _plan_refusal("tag-not-in-family",
+                                 f"{name} tag={tag} family={family}")
+        try:
+            geom = wx.ParamGeom.of(value, name=name, tag=tag,
+                                   shard_axis=wx.REPLICATED, shard_total=0,
+                                   stage=int(rank))
+        except BaseException:  # noqa: BLE001 -- dieselbe Skip-Regel wie oben
+            undescribed += 1
+            continue
+        inventory.append(geom)
+        tensor_of[name] = value
         carried.add(tag)
 
     if not inventory:
