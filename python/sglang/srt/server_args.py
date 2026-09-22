@@ -9387,33 +9387,11 @@ class ServerArgs:
                 f"with data parallelism (dp_size={self.dp_size}, "
                 f"enable_dp_attention={self.enable_dp_attention})."
             )
-        # #148 (Nutzer-Order 22.09.): PP is refused because solo normally
-        # ASSEMBLES the draft's full vocab tables from the target's TP vocab
-        # shards -- an init-time all-rank gather (_solo_init_lm_head), and a
-        # collective cannot be issued from pipeline stages that run different
-        # layers. That reason vanishes when the tables are not TP-sharded at
-        # all: at tp_size == 1 every stage holds them whole, there is "no
-        # shard to assemble and no rank to gather from", and the solo path
-        # takes its collective-free branch (the same one Form A uses,
-        # eagle_worker_v2._solo_init_lm_head: "neither side issues a
-        # collective"). init_lm_head() then SHARES the target's modules
-        # instead of loading a second copy -- which is the point here:
-        # measured on fnFL2w116/w117, P's PP2 stage loaded its own
-        # embed_tokens 1,18 + lm_head 1,18 GiB (draft census 3,92 GiB total
-        # against INT4 experts of only 1,32) and died in cu_mem_create.
-        #
-        # So the refusal stays for tp_size > 1 -- there the gather is real --
-        # and lifts for the un-sharded case only.
-        if self.pp_size > 1 and self.tp_size > 1:
+        if self.pp_size > 1:
             raise ValueError(
-                "--speculative-draft-placement solo cannot combine pipeline "
-                f"parallelism (pp_size={self.pp_size}) with a SHARDED vocab "
-                f"(tp_size={self.tp_size}): the solo draft assembles its full "
-                "embed/lm_head from the target's TP vocab shards, and that "
-                "init-time gather is a collective every rank must enter at "
-                "the same point -- pipeline stages cannot. Use tp_size=1 "
-                "(stages hold the tables whole, no gather needed) or "
-                "--speculative-draft-placement split."
+                "--speculative-draft-placement solo supports pure "
+                "single-node Tensor Parallelism only; it cannot be combined "
+                f"with pipeline parallelism (pp_size={self.pp_size})."
             )
         if self.ep_size > 1:
             raise ValueError(
