@@ -169,3 +169,49 @@ class TestDerMelderNenntDenThread162(unittest.TestCase):
 
         q = inspect.getsource(m.build_mtp_lm_head)
         self.assertLess(q.index("#162 MTP-LM-HEAD"), q.index("Qwen3_5MtpLmHeadDeferred()"))
+
+
+class TestDieAbleitungFolgtDerBasisEntscheidung163(unittest.TestCase):
+    """#163: Qwen4Exp-MTP umging den Bau-Pfad der Basis.
+
+    `nn.Module.__init__` statt `super().__init__`, lm_head direkt
+    alloziert -- damit lief `build_mtp_lm_head` nie und der
+    Deferred-Zweig war tot. fnFL2w137 hat es bewiesen: die #162-Zeile
+    kam NIE, der Zensus zeigte trotzdem lm_head 1.18 GiB.
+    """
+
+    def test_die_ableitung_fragt_die_entscheidung_der_basis(self):
+        import inspect
+
+        from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
+
+        q = inspect.getsource(Qwen4ExpForCausalLMMTP.__init__)
+        self.assertIn("mtp_builds_own_lm_head", q)
+        self.assertIn("Qwen3_5MtpLmHeadDeferred", q)
+
+    def test_der_eigene_praefix_bleibt(self):
+        """NUR die Entscheidung wird uebernommen, NICHT der Bau.
+
+        build_mtp_lm_head nutzt prefix="lm_head", diese Klasse
+        "model.shared_head.head". Ein Austausch der ganzen Funktion
+        wuerde die Gewichte unter falschem Namen suchen.
+        """
+        import inspect
+
+        from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
+
+        q = inspect.getsource(Qwen4ExpForCausalLMMTP.__init__)
+        self.assertIn("model.shared_head.head", q)
+        self.assertIn("use_attn_tp_group", q)
+
+    def test_die_namen_sind_importiert(self):
+        """Die Falle des Tages: ein Name, der im Modulraum fehlt.
+
+        Mein eigenes publish_expert_map hing heute genau daran, und ein
+        `except` haette es als 'failed' verschluckt.
+        """
+        from sglang.srt.models import qwen4_exp_mtp as m
+
+        for n in ("mtp_builds_own_lm_head", "Qwen3_5MtpLmHeadDeferred",
+                  "_LM_HEAD_FROM_TARGET"):
+            self.assertTrue(hasattr(m, n), f"{n} fehlt im Modulraum")

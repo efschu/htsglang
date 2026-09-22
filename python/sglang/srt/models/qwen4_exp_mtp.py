@@ -17,7 +17,13 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
+from sglang.srt.models.qwen3_5_mtp import (
+    _LM_HEAD_FROM_TARGET,
+    Qwen3_5ForCausalLMMTP,
+    Qwen3_5MtpLmHeadDeferred,
+    _mtp_quant_config,
+    mtp_builds_own_lm_head,
+)
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
 from sglang.srt.runtime_context import get_model, get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_npu
@@ -116,13 +122,42 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             prefix=add_prefix("mtp", prefix),
             is_nextn=True,
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
-        )
+        # #163: DIE ENTSCHEIDUNG DER BASIS GILT AUCH HIER.
+        #
+        # Diese Ableitung ruft `nn.Module.__init__` statt `super().__init__`
+        # und legte den Head bisher DIREKT an -- damit lief
+        # `build_mtp_lm_head` nie, und mit ihm nicht der Deferred-Zweig, den
+        # `lm_head_from_target()` steuert. Der Draft-KV-Producer betritt den
+        # Contextmanager (draft_kv_producer.py:127), der Leser sass in einem
+        # Pfad, den dieser Boot nicht nimmt: fnFL2w137 druckte die
+        # #162-Zeile NIE, waehrend der Zensus weiter `lm_head 1.18 GiB`
+        # zeigte (das Ziel haelt dieselbe Rolle quantisiert in 0.60).
+        #
+        # NUR DIE ENTSCHEIDUNG wird uebernommen, NICHT der Bau: die
+        # Argumente hier sind andere als in `build_mtp_lm_head` --
+        # `prefix="model.shared_head.head"` statt `"lm_head"` und
+        # `use_attn_tp_group`. Ein Austausch der ganzen Funktion wuerde die
+        # Gewichte unter einem anderen Namen suchen.
+        #
+        # WAS ES SPART: was gebaut wird, zahlt das KV-Budget auch nach dem
+        # Loeschen -- "the KV budget is profiled from mem_get_info, which
+        # therefore still charges every byte the build touched"
+        # (lm_head_from_target-Docstring; gemessen head_released 1212.5
+        # neben nvml_delta 5334.0 MiB in w134). Eine Tabelle, die nie
+        # gebaut wird, braucht keine Freigabe.
+        if not mtp_builds_own_lm_head(
+            _LM_HEAD_FROM_TARGET.get(),
+            getattr(config, "tie_word_embeddings", False),
+        ):
+            self.lm_head = Qwen3_5MtpLmHeadDeferred()
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("model.shared_head.head", prefix),
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            )
         self.logits_processor = LogitsProcessor(config)
 
     def _init_pre_fc_norms(self, config: PretrainedConfig) -> None:
