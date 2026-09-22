@@ -3118,6 +3118,19 @@ def outside_tag_pool(reason: str = "") -> Iterator[bool]:
 
     Nested use is a no-op step: a second ``_cuda_endAllocateToPool`` for a
     pool this thread already left would drop a capture entry that is not ours.
+
+    WHERE THE BLOCK REALLY ALLOCATES (fnFL2x5 allocator snapshot, 22.09.):
+    not the default pool. ``torch_memory_saver.region()`` itself runs inside
+    ``use_mem_pool(_primary_mem_pool)`` -- a live private pool -- and the tag
+    pool is nested in it, so stepping out of the tag pool landed every
+    transient in TMS's pool: PP2 held 11 segments / 2856 MiB there with ZERO
+    active bytes, all of them opened by the repack (device_loading_context
+    1240, marlin repack 1200, presplit gather 374 MiB).  ``empty_cache``
+    reaches neither.  So the block runs in a FRESH pool of its own that is
+    deleted on the way out -- the move torch_memory_saver's own ``disable()``
+    makes -- and deleting a pool hands its segments back while every other
+    pool stays live.  TMS region tagging stays on: the survivors born under
+    :func:`back_into_tag_pool` keep their tag.
     """
     import torch
 
@@ -3140,10 +3153,111 @@ def outside_tag_pool(reason: str = "") -> Iterator[bool]:
     _cuda_endAllocateToPool(device_index, pool.id)
     _STEPPED_OUT_POOLS.append(pool)
     try:
-        yield True
+        with _transient_pool(reason):
+            yield True
     finally:
         _STEPPED_OUT_POOLS.pop()
         _cuda_beginAllocateCurrentThreadToPool(device_index, pool.id)
+
+
+#: Transient pools that could not be deleted because something still lived in
+#: them -- kept referenced so their destructor never runs on live blocks (v56
+#: died on exactly that: ``c10::AcceleratorError invalid argument``).
+_KEPT_TRANSIENT_POOLS: List[Any] = []
+
+#: ONE pool for every transient block of a load, reused layer after layer (the
+#: repack of layer N+1 takes the freed blocks of layer N, so the load peak stays
+#: one layer's working set) and handed back by
+#: :func:`release_load_transient_pool` once the weights region is closed.
+#: Not per block: the metal probe (22.09., torch 2.11) aborted in the pool's
+#: destructor -- ``captures_underway.empty() INTERNAL ASSERT FAILED`` in
+#: ``synchronize_and_free_events`` -- a pool can only be deleted while NO
+#: routing is active, and inside torch_memory_saver's region one always is.
+_LOAD_TRANSIENT_POOL: Any = None
+
+
+@contextmanager
+def _transient_pool(reason: str) -> Iterator[Any]:
+    """Route the block into the load's transient pool (created on first use)."""
+    global _LOAD_TRANSIENT_POOL
+    import torch
+
+    if not torch.cuda.is_available():
+        yield None
+        return
+    if _LOAD_TRANSIENT_POOL is None:
+        try:
+            _LOAD_TRANSIENT_POOL = torch.cuda.MemPool()
+        except Exception:  # noqa: BLE001 -- a torch without MemPool: the enclosing pool takes it
+            yield None
+            return
+    with torch.cuda.use_mem_pool(_LOAD_TRANSIENT_POOL):
+        yield _LOAD_TRANSIENT_POOL
+
+
+def release_load_transient_pool(reason: str = "") -> float:
+    """Hand the load's transient pool back to the driver; returns GiB freed.
+
+    Only where NO pool routing is active -- the destructor aborts the process
+    otherwise (see ``_LOAD_TRANSIENT_POOL``).  Refuses, loudly and harmlessly,
+    while a tag pool or a torch_memory_saver region is open, and keeps the pool
+    (never deletes it) when a block in it is still live."""
+    global _LOAD_TRANSIENT_POOL
+    pool = _LOAD_TRANSIENT_POOL
+    if pool is None:
+        return 0.0
+    import torch
+
+    if (
+        _ACTIVE_TAG_POOL is not None
+        or _STEPPED_OUT_POOLS
+        or _tms_cdll_in_region() is not None
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        logger.warning(
+            "WEG2-TAG-POOL load transient pool NOT released reason=%s -- a pool "
+            "routing is still active here (tag pool or saver region); deleting "
+            "now would abort in the allocator", reason or "?",
+        )
+        return 0.0
+    _LOAD_TRANSIENT_POOL = None
+    if _pool_has_live_blocks(pool, reason):
+        _KEPT_TRANSIENT_POOLS.append(pool)
+        return 0.0
+    before = torch.cuda.memory_reserved()
+    del pool
+    torch.cuda.empty_cache()
+    freed_gib = (before - torch.cuda.memory_reserved()) / 2**30
+    logger.info(
+        "WEG2-TAG-POOL load transient pool RELEASED reason=%s freed_gib=%.2f -- the "
+        "repack's working set, reused across layers and handed back in one piece",
+        reason or "?", freed_gib,
+    )
+    return freed_gib
+
+
+def _pool_has_live_blocks(pool: Any, reason: str) -> bool:
+    import torch
+
+    device_index = torch.cuda.current_device()
+    try:
+        if torch._C._cuda_checkPoolLiveAllocations(device_index, pool.id, set()):
+            return False
+    except Exception:  # noqa: BLE001 -- cannot tell: keep it rather than risk v56
+        pass
+    live = sum(
+        b["size"]
+        for s in torch.cuda.memory_snapshot(pool.id)
+        for b in s["blocks"]
+        if str(b.get("state", "")).startswith("active")
+    )
+    logger.warning(
+        "WEG2-TAG-POOL transient pool KEPT reason=%s live=%.1f MiB -- a tensor "
+        "that outlives the block was born outside back_into_tag_pool; the pool "
+        "stays referenced so its destructor never frees live blocks",
+        reason or "?", live / 2**20,
+    )
+    return True
 
 
 #: Pools the loading thread has stepped OUT of via :func:`outside_tag_pool`,

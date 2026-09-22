@@ -2723,6 +2723,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.remote_instance_transfer_engine_weight_info = (
                         self.loader.remote_instance_transfer_engine_weight_info
                     )
+        # fnFL2x5: the repack transients of the whole load sat in ONE reused
+        # pool; the weights region is closed here, so no routing is active and
+        # the pool can be handed back (inside the region its destructor aborts).
+        from sglang.srt.managers.weg2_memory_saver import (
+            release_load_transient_pool,
+        )
+
+        release_load_transient_pool(reason="after-load")
         # #1273 S2 (spec section 6/S2): arm the exchange for this rank at the
         # END OF WEIGHT LOADING -- every weight page this runner will ever hold
         # exists now and nothing has been paused yet.  A no-op under the

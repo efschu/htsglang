@@ -1519,26 +1519,33 @@ class FusedMoE(torch.nn.Module):
         if _snap and not getattr(FusedMoE, "_ct_memsnap_armed", False):
             FusedMoE._ct_memsnap_armed = True
             torch.cuda.memory._record_memory_history(max_entries=200000)
-        from sglang.srt.managers.weg2_memory_saver import outside_tag_pool
+        from sglang.srt.managers.weg2_memory_saver import (
+            outside_tag_pool,
+            weight_chunk_scope,
+        )
 
         before = expert_offload_release_totals()
         t0 = time.perf_counter()
-        # fnFL2x2: THE WHOLE REPACK OUTSIDE THE TAG POOL. The full [E] device
-        # copy, the repacked stack and the permuted scales are transients of
-        # ~2.5 GiB per layer; inside the live weights pool they stayed as dead
-        # segments (4.2-5.5 GiB per P stage after load). The presplit's
-        # resident buffers and the Marlin workspace -- the only survivors --
-        # are born back inside it (``back_into_tag_pool``).
-        with outside_tag_pool(reason="ct-stream-presplit") as _draussen:
+        # fnFL2x5: IN THE LAYER'S CHUNK, like the loader's own post-load pass
+        # (loader.py: `weight_chunk_scope(layer_id_from_module_name(name))`).
+        # This repack runs DURING load_weights, i.e. in the BASE weights tag,
+        # while the exchange names every piece of layer N by its chunk
+        # (`tag_of_parameter_name`). x5 died on exactly that: P's wake resumed
+        # weights_9 and collected layer 29's expert prefix into a buffer whose
+        # pages belonged to the base tag -- resumed LAST -- so the copy target
+        # was unmapped and memcpy_async segfaulted on PP1.
+        #
+        # fnFL2x2: and THE REPACK ITSELF OUTSIDE THE TAG POOL. The full [E]
+        # device copy, the repacked stack and the permuted scales are
+        # transients of ~2.5 GiB per layer; inside the live pool they stayed
+        # as dead segments (4.2-5.5 GiB per P stage). They go to a transient
+        # pool that is deleted afterwards; the survivors (presplit buffers,
+        # Marlin workspace) are born back in the chunk pool.
+        with weight_chunk_scope(self.layer_id), outside_tag_pool(
+            reason="ct-stream-presplit"
+        ):
             with device_loading_context(self, state["device"]):
                 self.quant_method.process_weights_after_loading(self)
-            # fnFL2x3: HIER, nicht unten. empty_cache gibt den Default-Pool
-            # nur frei, solange KEINE Pool-Umleitung aktiv ist (Allocator:
-            # release_cached_blocks prueft captures_underway.empty()). Unten
-            # ist der Tag-Pool wieder betreten -- x3 behielt so 3 GiB
-            # Repack-Transienten im Default-Pool (reserved 13,93 statt 7,90).
-            if _draussen:
-                torch.cuda.empty_cache()
         # The repack's [E] transients are freed but stay reserved in the
         # caching allocator; hand them back so the next layer's copy-in and
         # the KV pool are sized against real free memory, not the cache.

@@ -38,7 +38,18 @@ def stepped(monkeypatch):
         "begin"
     )
     monkeypatch.setitem(__import__("sys").modules, "torch.cuda.memory", mod)
+    # Ohne Karte: kein temporaerer Pool (MemPool() scheitert) -- die
+    # begin/end-Reihenfolge des Tag-Pools ist davon unabhaengig.
+    monkeypatch.setattr(MS, "_transient_pool", _kein_pool)
     return calls
+
+
+from contextlib import contextmanager  # noqa: E402
+
+
+@contextmanager
+def _kein_pool(reason):
+    yield None
 
 
 def test_back_into_ohne_ausstieg_ist_ein_no_op(stepped):
@@ -80,6 +91,114 @@ def test_ausnahme_im_ueberlebenden_stellt_den_zustand_wieder_her(stepped):
     assert MS._STEPPED_OUT_POOLS == []
 
 
+class _TmpPool:
+    made = []
+
+    def __init__(self):
+        self.id = (0, 90 + len(_TmpPool.made))
+        _TmpPool.made.append(self)
+
+
+@pytest.fixture
+def tmp_pools(monkeypatch):
+    """Der temporaere Pool: angelegt, betreten, und je nach Lebendzustand
+    geloescht oder behalten."""
+    _TmpPool.made.clear()
+    betreten = []
+
+    @contextmanager
+    def use_mem_pool(pool):
+        betreten.append(pool.id)
+        yield
+
+    monkeypatch.setattr(torch.cuda, "MemPool", _TmpPool, raising=False)
+    monkeypatch.setattr(torch.cuda, "use_mem_pool", use_mem_pool, raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(MS, "_LOAD_TRANSIENT_POOL", None, raising=False)
+    monkeypatch.setattr(MS, "_KEPT_TRANSIENT_POOLS", [], raising=False)
+    return betreten
+
+
+def test_ein_lade_pool_fuer_alle_bloecke(tmp_pools, monkeypatch):
+    """Metall-Probe 22.09.: ein Pool je Block assertet beim Loeschen im
+    Saver-Bereich (captures_underway.empty()). Also EIN Pool fuers Laden."""
+    monkeypatch.setattr(MS, "_LOAD_TRANSIENT_POOL", None, raising=False)
+    for _ in range(3):
+        with MS._transient_pool("x") as tmp:
+            assert tmp is _TmpPool.made[0]
+    assert len(_TmpPool.made) == 1
+    assert tmp_pools == [(0, 90)] * 3
+
+
+def test_freigabe_verweigert_solange_eine_umleitung_offen_ist(tmp_pools, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(MS, "_LOAD_TRANSIENT_POOL", _TmpPool(), raising=False)
+    monkeypatch.setattr(MS, "_ACTIVE_TAG_POOL", _FakePool(), raising=False)
+    monkeypatch.setattr(MS, "_tms_cdll_in_region", lambda: None)
+    assert MS.release_load_transient_pool("x") == 0.0
+    assert MS._LOAD_TRANSIENT_POOL is not None          # nicht angefasst
+    monkeypatch.setattr(MS, "_ACTIVE_TAG_POOL", None, raising=False)
+    monkeypatch.setattr(MS, "_tms_cdll_in_region", lambda: object())
+    assert MS.release_load_transient_pool("x") == 0.0   # Saver-Bereich offen
+    assert MS._LOAD_TRANSIENT_POOL is not None
+
+
+def test_freigabe_behaelt_den_pool_bei_lebendem_block(tmp_pools, monkeypatch):
+    """Loeschen mit lebendem Block = v56 (invalid argument)."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    pool = _TmpPool()
+    monkeypatch.setattr(MS, "_LOAD_TRANSIENT_POOL", pool, raising=False)
+    monkeypatch.setattr(MS, "_ACTIVE_TAG_POOL", None, raising=False)
+    monkeypatch.setattr(MS, "_STEPPED_OUT_POOLS", [], raising=False)
+    monkeypatch.setattr(MS, "_tms_cdll_in_region", lambda: None)
+    monkeypatch.setattr(MS, "_pool_has_live_blocks", lambda p, reason: True)
+    assert MS.release_load_transient_pool("x") == 0.0
+    assert MS._KEPT_TRANSIENT_POOLS == [pool]
+    assert MS._LOAD_TRANSIENT_POOL is None
+
+
+def test_model_runner_gibt_den_lade_pool_nach_der_region_frei():
+    import inspect
+
+    from sglang.srt.model_executor import model_runner as mr
+
+    src = inspect.getsource(mr.ModelRunner.load_model)
+    i = src.index('release_load_transient_pool(reason="after-load")')
+    zeile = src[: i].split("\n")[-1]
+    # auf Methoden-Ebene (8 Leerzeichen), also NACH dem with weights_region-Block
+    assert zeile == " " * 8, repr(zeile)
+
+
+def test_outside_verlaesst_den_tag_pool_bevor_es_den_temporaeren_betritt(
+    tmp_pools, monkeypatch
+):
+    """Kein Doppeleintrag desselben Pools: end(tag) VOR use_mem_pool(tmp),
+    begin(tag) NACH dessen Austritt."""
+    calls = []
+    monkeypatch.setattr(MS, "_ACTIVE_TAG_POOL", _FakePool(), raising=False)
+    monkeypatch.setattr(MS, "_STEPPED_OUT_POOLS", [], raising=False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(MS, "_pool_has_live_blocks", lambda pool, reason: False)
+    mod = types.ModuleType("torch.cuda.memory")
+    mod._cuda_endAllocateToPool = lambda dev, pid: calls.append(("end", pid))
+    mod._cuda_beginAllocateCurrentThreadToPool = lambda dev, pid: calls.append(
+        ("begin", pid)
+    )
+    monkeypatch.setitem(__import__("sys").modules, "torch.cuda.memory", mod)
+    with MS.outside_tag_pool(reason="x"):
+        calls.append(("drin", tmp_pools[-1]))
+        with MS.back_into_tag_pool():
+            calls.append("ueberlebender")
+    assert calls == [
+        ("end", (0, 7)),
+        ("drin", (0, 90)),
+        ("begin", (0, 7)),
+        "ueberlebender",
+        ("end", (0, 7)),
+        ("begin", (0, 7)),
+    ]
+
+
 def test_schema_wrapper_steigt_aus_und_der_repack_steigt_fuer_ueberlebende_ein():
     import inspect
 
@@ -113,7 +232,7 @@ def test_ct_stream_presplit_laeuft_ausserhalb():
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     src = inspect.getsource(FusedMoE._ct_stream_presplit_now)
-    i = src.index('outside_tag_pool(reason="ct-stream-presplit")')
+    i = src.index('reason="ct-stream-presplit"')
     assert "process_weights_after_loading(self)" in src[i : i + 300]
 
 
@@ -130,23 +249,25 @@ def _block_nach(src, kopf):
     return "\n".join(block)
 
 
-@pytest.mark.parametrize("wo", ["ct-stream", "schema"])
-def test_empty_cache_laeuft_draussen_nicht_drinnen(wo):
-    """fnFL2x3: der Allocator gibt den Default-Pool nur frei, solange KEINE
-    Pool-Umleitung aktiv ist. Metall-Probe (echte tag_pool_scope/outside/
-    back_into auf der 3080): draussen 1000 -> 400 MiB, drinnen bleibt 900."""
+def test_ct_stream_presplit_laeuft_im_chunk_des_layers():
+    """fnFL2x5: der ct-stream-Presplit lief im BASIS-Tag, der Austausch benennt
+    jedes Stueck von Layer N nach seinem Chunk -> P's Wake sammelte das
+    Experten-Praefix von Layer 29 unter weights_9 in Seiten, die erst mit dem
+    Basis-Tag (zuletzt) gemappt wurden -> Segfault in memcpy_async. Der
+    Endpass des Laders (loader.py) tut es richtig; derselbe Rahmen hier."""
     import inspect
 
-    if wo == "ct-stream":
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-        src = inspect.getsource(FusedMoE._ct_stream_presplit_now)
-        kopf = 'outside_tag_pool(reason="ct-stream-presplit")'
-    else:
-        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-            compressed_tensors_wNa16_moe as moe,
-        )
-
-        src = inspect.getsource(moe.CompressedTensorsWNA16MoE.process_weights_after_loading)
-        kopf = 'outside_tag_pool(reason="ct-moe-repack")'
-    assert "torch.cuda.empty_cache()" in _block_nach(src, kopf)
+    src = inspect.getsource(FusedMoE._ct_stream_presplit_now)
+    code = "\n".join(z for z in src.split("\n") if not z.lstrip().startswith("#"))
+    w = code.index("with weight_chunk_scope(self.layer_id)")
+    o = code.index("outside_tag_pool(", w)
+    p = code.index("self.quant_method.process_weights_after_loading(self)", o)
+    # alle drei im selben with-Kopf bzw. darin geschachtelt: kein Doppelpunkt-
+    # Ende eines Blocks zwischen Scope-Kopf und Repack auf gleicher Tiefe
+    kopf_tiefe = len(code[: w].split("\n")[-1])
+    zwischen = code[w:p].split("\n")[1:]
+    assert all(
+        len(z) - len(z.lstrip()) >= kopf_tiefe for z in zwischen if z.strip()
+    ), "der Repack steht nicht im Chunk-Scope"
