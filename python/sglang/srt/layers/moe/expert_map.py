@@ -171,10 +171,50 @@ def resident_unsharded(fraction, total: int) -> List[List[int]]:
     return [list(range(round(total * min(max(f, 0.0), 1.0)))) for f in fs]
 
 
+def mirror_tp_selection(res_d: Sequence[Sequence[int]],
+                        fr_pp, total: int) -> List[List[int]]:
+    """#159: die PP-Stufen halten DIESELBEN Ids wie die TP-Gruppe.
+
+    Der Austausch ist ein Besitzerwechsel -- er kann nur Bytes umhaengen,
+    die BEIDE Seiten als denselben Tensor beschreiben. `resident_unsharded`
+    nimmt fuer P die ersten ``round(total*f)`` Ids von 0..total-1,
+    `resident_sharded` fuer D je Rang die ersten seines BANDES. Zwei
+    verschiedene Praefixe ueber zwei verschiedenen Grundmengen, und deshalb
+    ist die Schnittmenge winzig: gemessen fnFL2w132 zwei Ids von 193, und
+    selbst bei gleicher ANZAHL (158 gegen 158) genau eine.
+
+    Diese Funktion setzt Ps Auswahl auf die Vereinigung der D-Baender. Die
+    MENGE bestimmt damit D (ueber --rank-moe-ratio und
+    --rank-moe-resident-fraction der D-Gruppe); ``fr_pp`` bleibt als
+    OBERGRENZE je Stufe: haelt eine Stufe die Menge nicht, wird sie hier
+    gekuerzt und der Aufrufer sieht es am Laengenunterschied.
+
+    Der Preis ist ehrlich zu nennen: die Menge ist fuer ALLE Layer
+    dieselbe, weil die TP-Gruppe alle Layer traegt. Eine Stufe auf der
+    grossen Karte kann also nicht mehr halten als eine auf der kleinen --
+    nicht weil die Software es verbietet, sondern weil ein Byte, das die
+    andere Seite nicht hat, nicht den Besitzer wechseln kann.
+    """
+    gemeinsam = sorted({int(g) for ids in res_d for g in ids})
+    try:
+        fs = [float(x) for x in fr_pp]
+    except TypeError:
+        fs = [float(fr_pp)]
+    if not fs:
+        fs = [1.0]
+    out: List[List[int]] = []
+    for f in fs:
+        cap = round(int(total) * min(max(float(f), 0.0), 1.0))
+        out.append(list(gemeinsam[:cap]) if cap < len(gemeinsam)
+                   else list(gemeinsam))
+    return out
+
+
 def build(total: int,
           ratios: Sequence[int],
           fr_pp: float,
-          fr_tp: Sequence[float]) -> dict:
+          fr_tp: Sequence[float],
+          mirror: bool = False) -> dict:
     """Die Karte beider Phasen, mit EINER Platzzahl fuer beide.
 
     ``slots`` ist das Maximum der beiden kalten Mengen, nicht ihre
@@ -183,8 +223,12 @@ def build(total: int,
     die Schnittmenge bleibt liegen, und genau das ist die Ersparnis, die
     kein zusaetzliches Systemram kostet.
     """
-    res_p = resident_unsharded(fr_pp, total)
     res_d = resident_sharded(ratios, fr_tp, total)
+    # #159: mit `mirror` haelt P dieselben Ids wie D -- die einzige Form, die
+    # der Austausch verbinden kann. Ohne `mirror` bleibt die alte Auswahl
+    # byte-identisch, damit bestehende Rechnungen sich nicht still aendern.
+    res_p = (mirror_tp_selection(res_d, fr_pp, total) if mirror
+             else resident_unsharded(fr_pp, total))
     # #132 KALT IST, WAS MINDESTENS EINE STUFE NICHT HAELT.
     #
     # Nicht "was keine Stufe haelt" (die Vereinigung): der Store muss die

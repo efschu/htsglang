@@ -120,3 +120,37 @@ def test_identische_mengen_sind_joinbar():
     k = em.build(total=512, ratios=[183, 137, 168],
                  fr_pp=[1.0] * 3, fr_tp=[1.0, 1.0, 1.0])
     assert em.join_verdict(k) == [], em.join_verdict(k)
+
+
+def test_mirror_macht_die_form_joinbar():
+    """#159: P spiegelt Ds Auswahl -- die einzige Form, die der Tausch kann."""
+    k = em.build(**W128, mirror=True)
+    assert em.join_verdict(k) == []
+    assert em.refuse_if_inconsistent(k) is None
+    assert k["moves"] == 0, "identische Mengen -> der Flip bewegt NICHTS"
+
+
+def test_mirror_deckelt_bei_zu_kleinem_fr_p():
+    """FR_P wird zur OBERGRENZE: reicht sie nicht, bricht der Join sichtbar."""
+    k = em.build(total=512, ratios=[183, 137, 168],
+                 fr_pp=[0.377, 0.700, 0.442],
+                 fr_tp=[0.688, 0.545, 0.449], mirror=True)
+    zeilen = em.join_verdict(k)
+    assert zeilen, "FR_P 0.377 -> 193 < D-Menge 289, das muss auffallen"
+    assert "P haelt 193" in zeilen[0] and "D haelt 289" in zeilen[0]
+
+
+def test_mirror_mit_passender_obergrenze():
+    k = em.build(total=512, ratios=[183, 137, 168], fr_pp=[0.564] * 3,
+                 fr_tp=[0.688, 0.545, 0.449], mirror=True)
+    assert em.join_verdict(k) == []
+    assert [len(x) for x in k["phases"]["P"]["resident"]] == [289, 289, 289]
+    assert k["moves"] == 0
+
+
+def test_ohne_mirror_bleibt_alles_byte_identisch():
+    """Der alte Weg darf sich nicht still aendern."""
+    a = em.build(**W128)
+    b = em.build(**W128, mirror=False)
+    assert a == b
+    assert [len(x) for x in a["phases"]["P"]["resident"]] == [193, 358, 226]

@@ -9867,10 +9867,18 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log) -> str:
                 "anderen Raenge zaehlt nicht mit." % ", ".join(luecken))
             return ""
         total = int(_pp_cut.checkpoint_weight_terms(model).num_experts)
+        # #159: `mirror` laesst P dieselben Ids waehlen wie D. Der Austausch
+        # kann nur Bytes umhaengen, die BEIDE Seiten als denselben Tensor
+        # beschreiben; ohne den Spiegel ist die Schnittmenge gemessen ZWEI
+        # von 193 (fnFL2w132). Env-Schalter, damit die alte Form fuer einen
+        # A/B byte-identisch erreichbar bleibt.
+        _mirror = str(os.environ.get("WEG2_EXPERT_MAP_MIRROR", "1")).strip() \
+            not in ("0", "false", "False", "off")
         karte = _em.build(total=total,
                           ratios=[int(float(x)) for x in ratios],
                           fr_pp=[float(x) for x in fr_pp],
-                          fr_tp=[float(x) for x in fr_tp])
+                          fr_tp=[float(x) for x in fr_tp],
+                          mirror=_mirror)
         grund = _em.refuse_if_inconsistent(karte)
         if grund:
             log("#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s" % grund)
