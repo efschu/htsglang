@@ -5128,6 +5128,97 @@ def _warn_slot_pool_off(rank: int, cold: int, span: int) -> None:
     )
 
 
+def _layer_expert_window(layer):
+    """``(lo, pad)`` -- das Fenster dieses Layers im GLOBALEN Id-Raum.
+
+    #159. Die Regel stand bisher NUR inline in `_expert_store_rows_for`,
+    und der Ladepfad, der die Residenz waehlt, hatte sie nicht. Genau
+    deshalb konnte die Karte etwas anderes beschreiben als der Rang tut:
+    keine der beiden Seiten kannte die Umrechnung der anderen.
+
+    ``lo`` ist die erste globale Id dieses Rangs, ``pad`` sagt, ob lokal 0
+    der Null-Padding-Experte ist (#82, GGUF-Expertenshard) und die echten
+    Ids deshalb bei lokal 1 beginnen. ``None`` heisst "fuer diesen Layer
+    ist kein globales Fenster definiert" -- ein EP-Slice; dann bleibt
+    alles wie bisher.
+
+    Umrechnung, in beide Richtungen die einzige im Haus:
+        lokal -> global:  lo + e - 1 wenn pad (e >= 1), sonst lo + e
+        global -> lokal:  g - lo + 1 wenn pad,          sonst g - lo
+    """
+    num_global = int(getattr(layer, "num_experts", 0) or 0)
+    num_local = int(getattr(layer, "num_local_experts", 0) or 0)
+    if num_global <= 0:
+        return None
+    if getattr(layer, "_expert_shard_generic", False):
+        rng = getattr(layer, "_gguf_expert_range", None)
+        if rng is None:
+            return None
+        return int(rng[0]), True
+    if num_local == num_global:
+        return 0, False           # unsharded PP-Stufe: lokal == global
+    return None                   # EP-Slice
+
+
+def _karten_residenz_lokal(layer, num_local):
+    """Die LOKALEN Ids, die DIE KARTE fuer diesen Rang resident nennt.
+
+    #159, und es ist der Leser, der seit #107 fehlte: `resident_of` gibt es
+    seit die Karte gebaut wird, und sie hatte NULL AUFRUFER. Die Residenz
+    stellte weiter `resident_fraction_for_rank()` her, also beschrieb die
+    Karte etwas, das niemand herstellte. fnFL2w133 ist daran gestorben --
+    mit eingeschaltetem Spiegel sofort und laut (`#107: 113 eigene kalte
+    Experten haben in der KARTE keinen Platz`), ohne ihn still.
+
+    Das ist dieselbe Klasse wie #140, #156 und #107 selbst: gebaut, nie
+    verdrahtet. Vier Instanzen an einem Tag, diese hier von mir.
+
+    ``None`` heisst "keine Karte fuer diesen Layer" -- dann gilt das
+    Hotset, und ohne Hotset die alte Regel. Kein Raten: eine falsche
+    Residenzmenge ist eine falsche Slot-Zuordnung, und die ist
+    Datenverlust (wie #91/3).
+    """
+    from sglang.srt.layers.moe import expert_map as _em
+    from sglang.srt.layers.moe import expert_store as _es
+
+    karte = _es.expert_map()
+    if karte is None:
+        return None
+    fenster = _layer_expert_window(layer)
+    if fenster is None:
+        return None
+    lo, pad = fenster
+    try:
+        phase = _em.phase_of(_group_of_layer(layer))
+        glob = _em.resident_of(karte, phase, int(getattr(layer, "moe_tp_rank", 0)))
+    except Exception:
+        return None
+    if not glob:
+        return None
+
+    lokal = set()
+    fremd = []
+    for g in glob:
+        e = int(g) - int(lo) + (1 if pad else 0)
+        if 0 <= e < int(num_local):
+            lokal.add(e)
+        else:
+            fremd.append(int(g))
+    # Der Pad-Experte hat KEIN globales Gegenstueck (#82) und muss resident
+    # bleiben, sonst faellt jeder fremde Top-k-Treffer in den Spill-Pool.
+    if pad:
+        lokal.add(0)
+    if not lokal:
+        return None
+    # Ids AUSSERHALB des eigenen Fensters sind kein Fehler: die Karte fuehrt
+    # alle Raenge, und die PP-Stufen halten denselben globalen Raum. Sie
+    # gehoeren schlicht jemand anderem. Gezaehlt werden sie trotzdem, damit
+    # eine Karte, die gar nicht zu diesem Rang passt, sichtbar wird.
+    if fremd and not lokal:
+        return None
+    return tuple(sorted(lokal))
+
+
 def _hotset_local_ids(layer, num_local):
     """Die LOKALEN Experten-Ids aus dem Hotset -- oder () wenn keins gilt.
 
@@ -5706,11 +5797,44 @@ def presplit_expert_offload_after_repack(
     # Hotset und haetten keinen Store-Platz"), w19 vorher am IndexError
     # dahinter. Siebte Instanz der Klasse: der richtige Wert an einer Stelle,
     # die der zaehlende Pfad nie erreicht.
+    # #159: DIE KARTE ZUERST, dann das Hotset, dann die alte Regel -- echte
+    # Alternativen, kein Vorspann (#107/2 hat gezeigt, dass Vorschalten
+    # nicht genuegt, solange ein anderer Pfad dieselbe Frage nochmal
+    # beantwortet).
+    #
+    # `pinned_experts` IST der Mechanismus, mit dem die Residenz
+    # vorgeschrieben wird: nennt die Karte genau R Ids, dann ist
+    # `rest[: R - len(pinned)]` leer und `resident_ids == sorted(pinned)`.
+    # Der Rang haelt also, was die Karte sagt -- und erst damit beschreibt
+    # sie etwas, das jemand herstellt.
+    _karte_res = _karten_residenz_lokal(layer, int(E))
+    if _karte_res is not None:
+        _R_erwartet = resident_slot_count(int(E), frac)
+        if len(_karte_res) != _R_erwartet:
+            # KEIN Anpassen im Stillen. R bestimmt `buffer_slots` und damit
+            # jede VRAM-Zahl dieses Rangs (#439-Latch); waehlte ich hier
+            # einfach die Kartenzahl, waeren Plan und Budget wieder zwei
+            # Rechnungen -- genau die Klasse, die #160 gerade geschlossen
+            # hat. Die Karte und die Fraction muessen zusammenpassen, und
+            # wenn nicht, gehoert das VOR die erste Allokation.
+            raise RuntimeError(
+                f"#159: die KARTE nennt {len(_karte_res)} residente Experten "
+                f"fuer Layer {getattr(layer, 'layer_id', '?')} Rang "
+                f"{getattr(layer, 'moe_tp_rank', '?')}, die Fraction {frac} "
+                f"ueber {int(E)} Experten ergibt {_R_erwartet}. Beide "
+                f"beschreiben dieselbe Karte und muessen dieselbe Zahl "
+                f"meinen -- sonst stimmt das VRAM-Budget nicht zu dem, was "
+                f"wirklich resident wird. Pruefe --rank-moe-resident-fraction "
+                f"gegen die Fractions, mit denen die Karte gebaut wurde."
+            )
+        _pinned = _karte_res
+    else:
+        _pinned = _hotset_local_ids(layer, int(E))
     plan = plan_load_time_staging(
         int(E),
         fraction=frac,
         cold_shard=cold_shard,
-        pinned_experts=_hotset_local_ids(layer, int(E)),
+        pinned_experts=_pinned,
     )
     if plan is None:
         return
