@@ -1629,6 +1629,33 @@ class Scheduler(
         self.draft_kv_producer = DraftKvProducer(self, self.draft_kv_producer_algorithm)
         embed_mib = self.draft_kv_producer.load_resident_embedding(self.server_args.model_path)
         draft_model = self.draft_kv_producer.draft_runner.model
+        # #161: WELCHE Bytes liegen hier wirklich ZWEIMAL auf der Karte?
+        # Der Zensus im ModelRunner (model_runner.py:2938) kann das nicht
+        # sagen -- er laeuft ueber named_parameters() und sieht einen per
+        # `lm_head_from_target()` GETEILTEN Tensor genauso wie einen
+        # eigenen. Aus seiner Zeile "pp0tp0-draft ... embed_tokens 1.18,
+        # lm_head 1.18" habe ich am 22.09. zweimal eine Zuordnung
+        # abgeleitet und zweimal zurueckgenommen; beide Male war es eine
+        # Vermutung, keine Messung.
+        #
+        # HIER, und nur hier, stehen BEIDE Modelle: das Ziel ueber den
+        # Scheduler, der Draft ueber den Producer. Der ModelRunner hat
+        # KEINE Ziel-Referenz (is_draft_worker ist ein blosses Flag), ein
+        # peer-Argument dort waere immer None gewesen -- gebaut, nie
+        # erreicht, die Klasse dieses ganzen Tages.
+        try:
+            from sglang.srt.model_executor.vram_family_census import (
+                log_vram_family_census,
+            )
+
+            log_vram_family_census(
+                draft_model,
+                f"pp{self.pp_rank}-draft-vs-target",
+                "after draft load",
+                peer=self.tp_worker.model_runner.model,
+            )
+        except Exception as _exc:  # noqa: BLE001 -- ein Zensus toetet nie
+            logger.debug("[vram-census] #161 peer census skipped: %s", _exc)
         mtp_mib = sum(
             p.numel() * p.element_size() for n, p in draft_model.named_parameters()
             if "embed_tokens" not in n and "lm_head" not in n

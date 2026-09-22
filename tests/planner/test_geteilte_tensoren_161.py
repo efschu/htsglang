@@ -72,3 +72,55 @@ class TestGeteiltGegenEigen(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDerZensusWirdMitPeerGERUFEN(unittest.TestCase):
+    """Die Lehre des 22.09.: gebaut ist nicht verdrahtet.
+
+    Sieben Instanzen an einem Tag -- #140, #156, #107, #159,
+    --rank-auto-reserve-mib, der #150-Melder, und der Vokabular-Share
+    selbst. Jedes Mal sah der Code vollstaendig aus. Deshalb prueft
+    dieser Test nicht die Funktion, sondern ihren AUFRUFER.
+    """
+
+    def test_scheduler_ruft_den_zensus_mit_peer(self):
+        import inspect
+
+        from sglang.srt.managers.scheduler import Scheduler
+
+        quelle = inspect.getsource(Scheduler._maybe_init_draft_kv_producer)
+        self.assertIn("log_vram_family_census", quelle,
+                      "der Peer-Zensus wird nicht gerufen")
+        self.assertIn("peer=", quelle,
+                      "ohne peer= sagt die Zeile nichts ueber geteilte Bytes")
+        self.assertIn("tp_worker.model_runner.model", quelle,
+                      "der Peer muss das ZIEL-Modell sein")
+
+    def test_er_steht_NACH_beiden_modellen(self):
+        """Reihenfolge, nicht nur Vorhandensein -- daran ist #92 gestorben."""
+        import inspect
+
+        from sglang.srt.managers.scheduler import Scheduler
+
+        q = inspect.getsource(Scheduler._maybe_init_draft_kv_producer)
+        self.assertLess(
+            q.index("draft_runner.model"), q.index("log_vram_family_census"),
+            "der Zensus muss NACH dem Draft-Modell stehen, sonst misst er nichts",
+        )
+
+    def test_der_modelrunner_bekommt_KEINEN_peer(self):
+        """Gegenprobe: dort waere er immer None -- kein Peer vorhanden.
+
+        Der ModelRunner haelt nur `is_draft_worker` als Flag, keine
+        Referenz auf den Ziel-Runner. Ein peer-Argument dort waere die
+        achte Instanz der Klasse gewesen.
+        """
+        import inspect
+
+        from sglang.srt.model_executor import model_runner as mr
+
+        quelle = inspect.getsource(mr)
+        i = quelle.index("log_vram_family_census(")
+        self.assertNotIn("peer=", quelle[i:i + 400],
+                         "der ModelRunner kennt sein Ziel nicht, er darf "
+                         "keinen Peer vortaeuschen")
