@@ -12963,6 +12963,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.op_line)
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns))
+    # #114: DIE EFFEKTIVE GRUPPEN-ENV GEHOERT INS LOG.
+    #
+    # Der Verdrahtungs-Check (weg2/verdrahtung_check.sh) liest das
+    # Dry-Run-Log, also das, was der Boot WIRKLICH startet. Er konnte bisher
+    # keine einzige Env pruefen, weil der Launcher sie nirgends druckt:
+    # `grep SGLANG_MOE_EXPERT_STORE_DIR dry_*.log` gibt 0 Treffer, obwohl sie
+    # gesetzt IST. Ein Pruefer, der am falschen Ort misst, meldet Luecken,
+    # die es nicht gibt, und uebersieht die echten.
+    for _g, _e in (("P", env_p), ("D", env_d)):
+        _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
+                       if str(k).startswith("SGLANG_"))
+        log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
     spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns)), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
