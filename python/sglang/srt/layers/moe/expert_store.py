@@ -522,6 +522,56 @@ def _sentinel(directory: str, layer_key: str, attr: str, rank: int) -> str:
     return store_path(directory, layer_key, attr) + f".r{int(rank)}.written.json"
 
 
+def fill_rows(
+    store: torch.Tensor,
+    dst: torch.Tensor,
+    rows: Dict[int, int],
+    *,
+    valid: Optional[Iterable[int]] = None,
+) -> Dict[int, int]:
+    """DAS GEGENSTUECK ZU :func:`write_rows`: Store -> ``dst[local]``.
+
+    #109 ERSTBOOT-ADOPTION, und der Grund, warum es diese Funktion bis
+    heute nicht gab: der geteilte Store war ZIEL und nie QUELLE. Der
+    Codegraph sagt es in einer Zeile -- ``write_rows`` hat GENAU EINEN
+    Aufrufer (``presplit_expert_offload_after_repack``, gerufen aus
+    ``process_weights_after_loading``), und kein Gegenstueck las je
+    zurueck. Also las die zweite Ranggruppe dieselben Shards noch einmal
+    von Platte, repackte, presplittete und schrieb dieselben Bytes in
+    dieselbe Datei. Gemessen fnFL2w52: D schrieb 288
+    ``ct-stream-presplit``-Zeilen und ``Multi-thread loading shards:
+    100%``, waehrend P den Store langst gefuellt hatte. Der geteilte
+    Store sparte den PLATZ (b6eeeaae586d, "ohne zwei Kopien"), nie die
+    ARBEIT -- das hat der Nutzer am Disk-I/O gesehen, bevor es im Log
+    stand.
+
+    ``valid`` ist die Menge der Zeilen, die ein Schreiber als FERTIG
+    veroeffentlicht hat (:func:`rows_written`). Eine Zeile ohne diesen
+    Beleg wird NICHT gelesen: eine frisch angelegte Store-Datei ist
+    genullt, und genullte Gewichte sehen aus wie Gewichte. Lieber eine
+    Zeile fehlt -- der Aufrufer bekommt sie in ``fehlend`` zurueck und
+    holt sie ueber die Legs -- als dass stille Nullen ins Modell wandern.
+    """
+    if not rows:
+        return {}
+    erlaubt = None if valid is None else {int(r) for r in valid}
+    kapazitaet = int(store.shape[0])
+    gefuellt: Dict[int, int] = {}
+    for local, row in rows.items():
+        r = int(row)
+        if not (0 <= r < kapazitaet):
+            raise RuntimeError(
+                f"#109: Store-Zeile {r} liegt ausserhalb der Datei "
+                f"(0..{kapazitaet-1}) -- dieselbe Abbildungsfrage wie #94, "
+                f"nur auf der Leseseite."
+            )
+        if erlaubt is not None and r not in erlaubt:
+            continue
+        dst[int(local)].copy_(store[r])
+        gefuellt[int(local)] = r
+    return gefuellt
+
+
 def mark_rows_written(directory: str, layer_key: str, attr: str, rank: int, rows: Iterable[int]) -> str:
     """Publish which store rows ``rank`` finished writing (atomic rename)."""
     path = _sentinel(directory, layer_key, attr, rank)

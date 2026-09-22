@@ -5480,6 +5480,49 @@ def _rank_resident_fraction_vector(layer, tp_size=None):
     return out or None
 
 
+
+def _fill_experts_from_store(store, dst, s_dir, s_key, attr, s_lo, E, s_pad):
+    """#109: die Experten-Bytes, die der GETEILTE STORE schon traegt.
+
+    Gibt ``(gefuellt, fehlend)`` zurueck -- Zeilen aus dem Store und
+    Zeilen, die dort NICHT liegen, weil die andere Gruppe sie auf einer
+    Karte haelt. Die fehlenden bleiben Platzhalter; sie kommen ueber die
+    Legs (Nutzer-Order 20.09.: "on-card reuse sonst bar1 dma").
+
+    MESSUNG, die den Schnitt bemisst (Karte #107 mit den Arm-Parametern
+    183,137,168 / FR_P 0.367 / FR_D 0.479,0.319,0.284, Slotgroesse aus
+    fnFL2w51): von 512 Experten je Layer liegen 324 im Store (63 %) und
+    188 nur auf P's Karten (37 %) -- und D-Rang 0 braucht 92 residente,
+    von denen KEIN einziger im Store liegt: es sind genau die
+    ``shared_resident=92``, die beide Gruppen auf DERSELBEN 5090 heiss
+    halten.
+    """
+    from sglang.srt.layers.moe import expert_map as _em
+    from sglang.srt.layers.moe import expert_store as _es
+
+    karte = _es.expert_map()
+    if karte is None:
+        return 0, int(E)
+    p_slots = karte.get("phases", {}).get(_em.PHASE_PP, {}).get("slot_of", {})
+    if not p_slots:
+        return 0, int(E)
+    global_of = _es.global_rows(range(int(E)), int(s_lo), bool(s_pad))
+    zeilen = {}
+    fehlend = 0
+    for local, gid in global_of.items():
+        slot = p_slots.get(str(int(gid)))
+        if slot is None:
+            fehlend += 1          # die andere Gruppe haelt ihn auf der Karte
+            continue
+        zeilen[int(local)] = int(slot)
+    belegt = _es.rows_written(s_dir, s_key, attr, 8)
+    gefuellt = _es.fill_rows(store, dst, zeilen, valid=belegt.keys())
+    # Was der Store fuehren SOLLTE, aber noch nicht belegt hat, zaehlt als
+    # fehlend -- nicht als gefuellt. Eine genullte Zeile sieht aus wie ein
+    # Gewicht; nur der Sentinel unterscheidet sie.
+    return len(gefuellt), int(E) - len(gefuellt)
+
+
 def presplit_expert_offload_after_repack(
     layer, cold_shard: Optional[ColdShardContext] = None
 ) -> None:  # pragma: no cover - CUDA
@@ -5615,6 +5658,27 @@ def presplit_expert_offload_after_repack(
             # einer Datei mit 324 Plaetzen -- zwei Boots tot, und der
             # Unterstrich im Namen sagte die ganze Zeit, dass niemand sie
             # liest.
+            # #109 ERSTBOOT-ADOPTION: HIER IST DER STORE QUELLE, NICHT ZIEL.
+            # Unter `--load-format dummy` haelt dieser Rang Zufallszahlen;
+            # der geteilte Store traegt P's echte Experten-Bytes bereits.
+            # Vor dem `buf[:R].copy_(t[...])` unten gefuellt, damit die
+            # residenten Zeilen echt auf die Karte gehen statt Zufall.
+            try:
+                from sglang.srt.weg2 import adopt as _ad
+
+                if _ad.weights_are_placeholder():
+                    _g, _f = _fill_experts_from_store(
+                        spill, t, s_dir, s_key, attr, s_lo, int(E), s_pad
+                    )
+                    logger.info(
+                        "#109 STORE-ADOPT layer=%s attr=%s: %d von %d "
+                        "Experten aus dem geteilten Store geholt, %d fehlen "
+                        "(die haelt die andere Gruppe auf ihrer Karte -- sie "
+                        "kommen ueber die Legs)",
+                        s_key, attr, _g, int(E), _f,
+                    )
+            except ImportError:
+                pass
             written = _es.write_rows(
                 spill, t, list(plan.spill_ids), s_lo, s_pad, rows=s_index
             )

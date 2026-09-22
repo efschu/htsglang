@@ -2689,6 +2689,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         # B2a / draft-solo shadow: meta-model, NO weight load.
                         self.model = self._build_weightless_worker_meta_model()
                     else:
+                        # #109: DER RIEGEL MUSS VOR DEM LADEN STEHEN, NICHT
+                        # DANACH. `process_weights_after_loading` -- und damit
+                        # der Experten-Presplit -- laeuft INNERHALB von
+                        # `loader.load_model`. Wird der Platzhalter-Zustand
+                        # erst bei "Load weight end" gesetzt (wie in #108), ist
+                        # er waehrend des Presplits noch False: der
+                        # Store-Schreibriegel greift nicht und der
+                        # Store-LESEPFAD (#109) laeuft nie. Zweite Instanz
+                        # derselben Klasse an EINEM Tag -- die erste war der
+                        # `--load-format`-Flag, der nie im argv ankam.
+                        from sglang.srt.weg2 import adopt as _weg2_adopt
+
+                        if str(
+                            getattr(self.server_args, "load_format", "")
+                        ).strip().lower() == "dummy" and _weg2_adopt.adopt_armed():
+                            _weg2_adopt.arm_placeholder("dummy-load (vor dem Loader)")
                         self.model = self.loader.load_model(
                             model_config=self.model_config,
                             device_config=DeviceConfig(self.device, self.gpu_id),
