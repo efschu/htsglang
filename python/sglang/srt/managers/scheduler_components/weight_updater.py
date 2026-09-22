@@ -494,6 +494,13 @@ class SchedulerWeightUpdaterManager:
     #: attribute -- this is a ``slots=True`` dataclass, and the comment above
     #: already learnt that lesson once.
     weg2_fence_raised: bool = False
+    #: #108/2: (collected descs, expected descs) of the last inject, written
+    #: by :meth:`_weg2_xchg_inject_from_peer`, read by the cover check after
+    #: it.  The third time for the lesson above: 7a3d8f5ceb assigned it as an
+    #: ad-hoc attribute, and fnFL2x5/x7 -- the first boots whose wake got
+    #: this far -- died on ``AttributeError`` in the assignment itself on all
+    #: three P ranks.
+    _weg2_last_inject_cover: Any = None
     #: #1295: this rank's W8b verdict on the L3 store index it rebuilt at the
     #: wake, empty when there is none.  Written by
     #: :meth:`_weg2_rescan_store_index`, read and cleared by the resume fence,
