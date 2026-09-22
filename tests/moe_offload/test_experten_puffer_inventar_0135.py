@@ -256,3 +256,30 @@ def test_ein_gewoehnliches_attribut_bleibt_draussen(chunks):
     assert "verdict=absent" in z, (
         f"ein gewoehnliches Attribut zaehlt jetzt als Parameter: {z}"
     )
+
+
+# --- #139: die Stelle, die die REFUSAL steuert ----------------------------
+
+def test_der_puffer_zaehlt_als_gesehener_plan_parameter(chunks):
+    """w69/w70/w71 meldeten unveraendert uncovered=12 UND missing=12 -- und
+    #138 half nicht, weil es die DRUCKZEILE heilte. `seen_names` wird nur im
+    PARAMETER-Zweig gefuellt, und `missing = planned - seen_names`; ein
+    geplanter Tensor, der als ATTRIBUT lebt, kann dort nie ankommen.
+    """
+    from sglang.srt.weg2.weight_exchange import arm_coverage
+
+    buf = torch.zeros(8, 4, 16, dtype=torch.int32)
+    model = _modell(buf)
+    name = "model.layers.7.mlp.experts.weg2_experts_w13_weight_packed"
+    vote = arm_coverage(
+        model, rank=0,
+        planned_bytes_by_tag={"weights_2": {name: buf.numel() * 4}},
+        tag_bytes=lambda _t: None, log=lambda _l: None,
+    )
+    row = vote.rows.get("weights_2")
+    assert row is not None, sorted(vote.rows)
+    assert not row.missing, f"missing={row.missing}"
+    assert not [t for t in row.uncovered if "weg2_experts" in t.name], (
+        f"uncovered={[t.name for t in row.uncovered]}"
+    )
+    assert row.ok, row

@@ -3561,7 +3561,28 @@ def build_coverage(
         # accounted for, and only then can an attribute be judged as an alias
         # of one of them rather than as a page of its own.
         for t in of_tag:
-            if t.kind == PARAMETER:
+            # #139: PARAMETER **ODER** der Experten-Puffer, der keiner mehr
+            # ist -- und DIESE Stelle steuert die Refusal, nicht die
+            # Druckzeile, die #138 geheilt hat.
+            #
+            # `seen_names` wird NUR hier gefuellt, und `missing` ist
+            # `planned_of_tag - seen_names`. Ein Tensor, den der Plan fuehrt
+            # und der als ATTRIBUT lebt, kann also nie ankommen: er faellt
+            # unten in den Attribut-Zweig, der ueber `covered_storage` geht
+            # und `planned_of_tag` gar nicht liest. Daher meldet derselbe
+            # Rang in derselben Runde beides -- uncovered (das Attribut ist
+            # ungedeckt) UND missing (der Plan-Name wurde nie gesehen).
+            # Gemessen w69/w70/w71 unveraendert: uncovered=12 missing=12,
+            # uncovered=8 missing=8.
+            #
+            # `presplit_expert_offload_after_repack` ersetzt den
+            # Experten-Parameter durch einen 0-Zeilen-Platzhalter und haelt
+            # die Bytes im Slot-Puffer (#135 veroeffentlicht ihn als
+            # Attribut), damit `device_loading_context` die 800 MiB nicht auf
+            # den Host kopiert. Er IST ein geplanter Parameter und wird hier
+            # als einer behandelt; jedes andere Attribut bleibt im Zweig
+            # darunter, wo es hingehoert.
+            if t.kind == PARAMETER or ms_is_expert_buffer(t.name):
                 n_par += 1
                 if t.name in planned_of_tag:
                     seen_names.add(t.name)
