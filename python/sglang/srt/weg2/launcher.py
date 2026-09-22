@@ -12296,6 +12296,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         _adopt_on = _adopt.ADOPT_ON if _d_adopt_armed(ns) else "off"
         xchg_env[_adopt.ADOPT_ENV] = _adopt_on
+        if _d_adopt_armed(ns):
+            # #113: OHNE DIESE ENV KANN DIE UNION-ARENA DIE GEWICHTE NICHT
+            # ERREICHEN. tms_csrc/utils.h erzeugt jede Allokation ohne
+            # `requestedHandleTypes`; `cuMemExportToShareableHandle`
+            # scheitert dann per Definition, und die metallbewiesene
+            # Union-Arena (500c984795) bleibt bei ihren eigenen 1,50 GiB
+            # statt an die ~27 GB der Gewichte zu kommen. Die Env geht an
+            # BEIDE Gruppen -- der Besitzer muss exportierbar anlegen, der
+            # Peer muss importieren koennen, und eine Entscheidung, die nur
+            # eine Seite erreicht, ist keine.
+            xchg_env["SGLANG_WEG2_VMM_EXPORTABLE"] = "1"
+            log("WEG2-VMM-EXPORTABLE on -- jede TMS-Allokation bekommt "
+                "CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, damit die "
+                "Union-Arena die Gewichtsbytes zwischen den Phasen teilen "
+                "kann statt sie zweimal zu halten (#113).")
         if _adopt_on == _adopt.ADOPT_ON:
             log("WEG2-D-ADOPT on -- D startet mit --load-format dummy und "
                 "holt seine Gewichte vom ERSTFLIP aus P's Karten. Riegel: "

@@ -40,6 +40,37 @@ hinterlegt, was D lesen koennte.
 | D laedt die 188 selbst von Platte | 37 % Plattenlast | **vom Nutzer verworfen** |
 | **Handle ueberlebt, D mappt es** | **null Bytes bewegt** | **das hier** |
 
+## KORREKTUR NACH DEM PRIOR-ART-GATE (devindex, 22.09.)
+
+**Der Mechanismus existiert bereits und ist am Metall bewiesen.** Commit
+`500c984795` (21.09.), "union arena slice 3b: ONE weight image per card,
+both phase groups run off it":
+
+> Owner packs its checkpoint tensors into the exportable VMM arena and
+> publishes; peer rebinds every tensor it can PROVE identical (name+shape+
+> stride+dtype+content checksum) and drops its own copy, keeping what it
+> cannot prove. **METAL-PROVEN on the 5090: peer's parameters land at the
+> owner's arena base, values bit-identical, card freed +1.50 GiB of a 1.50
+> GiB shared set.**
+
+Drei Module (`union_arena.py`, `union_arena_bind.py`, `union_arena_vmm.py`),
+verdrahtet in `model_runner.py:2953` und `:2970`. Damit ist #113 NICHT ein
+neuer Mechanismus, sondern eine EINZIGE fehlende Eigenschaft:
+
+`tms_csrc/utils.h:182 cu_mem_create` legt jede TMS-Allokation ohne
+`prop.requestedHandleTypes` an. Ohne
+`CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR` kann
+`cuMemExportToShareableHandle` auf ihr per Definition nicht gelingen
+(`understand_prior-art.md` Sec. 5, gemessen: `grep
+FILE_DESCRIPTOR|ExportToShareable tms_csrc/` -> 0 Treffer). Deshalb erreicht
+die Union-Arena heute nur ihre EIGENE Arena (1,50 GiB) und nicht die ~27 GB,
+die TMS haelt.
+
+GEBAUT (diese Sitzung): der exportierbare Typ hinter
+`SGLANG_WEG2_VMM_EXPORTABLE=1`, mit Rueckfall auf die alte Form, wenn der
+Treiber ihn verweigert -- und der Schreiber im Launcher, der die Env an
+BEIDE Gruppen gibt. Tests binden beide Seiten der Naht.
+
 ## Der Weg
 
 1. **P laedt** wie heute und fuellt den geteilten Store mit seinen KALTEN

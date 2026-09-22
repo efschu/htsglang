@@ -1,4 +1,6 @@
 #pragma once
+
+#include <cstdlib>
 #include <iostream>
 #include <vector> 
 #include "macro.h"
@@ -191,6 +193,48 @@ namespace CUDAUtils {
             prop.allocFlags.gpuDirectRDMACapable = 1;
         }
 
+        // #113 ERSTBOOT OHNE PLATTE: DAS HANDLE MUSS EXPORTIERBAR SEIN.
+        //
+        // Die Union-Arena (500c984795, 21.09., METALL-BEWIESEN auf der 5090:
+        // "peer's parameters land at the owner's arena base, values
+        // bit-identical, card freed +1.50 GiB") kann ein Gewichtsbild
+        // zwischen den beiden Phasen-Prozessen TEILEN, statt es zweimal zu
+        // halten. Sie erreicht heute aber nur ihre EIGENE Arena -- 1,50 GiB
+        // -- und nicht die ~27 GB, die TMS haelt.
+        //
+        // DER GRUND STEHT IN DIESER FUNKTION: `prop` nennt keinen
+        // `requestedHandleTypes`, und ohne
+        // CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR KANN
+        // `cuMemExportToShareableHandle` auf dieser Allokation nicht
+        // gelingen (understand_prior-art.md Sec.5, gemessen: `grep
+        // FILE_DESCRIPTOR|ExportToShareable tms_csrc/` -> 0 Treffer). Der
+        // Nutzer hat es am Metall gesehen und benannt: "es ist ja egal ob da
+        // P noch lebt, die bytes liegen ja immernoch im vram ... die duerfen
+        // nur nicht zerstoert werden".
+        //
+        // DEFAULT AUS. Mit SGLANG_WEG2_VMM_EXPORTABLE=1 bekommt jede
+        // TMS-Allokation den exportierbaren Typ; ohne die Variable ist diese
+        // Funktion byte-identisch zu vorher. Scheitert `cuMemCreate` mit dem
+        // Typ (Treiber, Plattform, IOMMU), wird es OHNE ihn wiederholt statt
+        // den Boot zu toeten -- ein Feature, das sich nicht anschalten
+        // laesst, darf kein Feature sein, das nicht bootet.
+        const char *_exportable = std::getenv("SGLANG_WEG2_VMM_EXPORTABLE");
+        if (_exportable != nullptr && _exportable[0] == '1') {
+            CUmemAllocationProp prop_exp = prop;
+            prop_exp.requestedHandleTypes =
+                CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+            CUresult _rc = cuMemCreate(alloc_handle, size, &prop_exp, 0);
+            if (_rc == CUDA_SUCCESS) {
+                return;
+            }
+            const char *_name = nullptr;
+            cuGetErrorName(_rc, &_name);
+            std::cerr << "[torch_memory_saver] #113 exportable VMM refused ("
+                      << (_name ? _name : "?")
+                      << ") -- falling back to the non-exportable form; the "
+                         "union arena cannot reach these bytes."
+                      << std::endl;
+        }
         CURESULT_CHECK(cuMemCreate(alloc_handle, size, &prop, 0));
     }
 
