@@ -3073,6 +3073,25 @@ def w38_armed_line(argv_of_p: Sequence[str]) -> str:
             "and D's own store read are untouched, and the drop lifts itself the moment a carrier "
             "exists (#968 PP0-authoritative materialisation is the named remedy)." % pp)
 
+def _adopt_load_format_flag() -> List[str]:
+    """#108: unter Adoption laedt D mit ``dummy``, nicht von Platte.
+
+    ``DummyModelLoader`` ruft ``initialize_dummy_weights`` UND danach
+    ``process_weights_after_loading`` je Modul -- Repack, Presplit und
+    Pool-Geometrie entstehen also IDENTISCH zum Plattenweg. Nur die Zahlen
+    sind Zufall, und genau die bringt der Erstflip aus P's Karten.
+
+    Der Flag geht ans ENDE der Liste, VOR ``extra``: so kann ein Arm ihn mit
+    seinem eigenen ``--load-format`` noch ueberstimmen, ohne dass der
+    Launcher raten muss, welcher der beiden gemeint war.
+    """
+    from sglang.srt.weg2 import adopt as _adopt
+
+    if not _adopt.adopt_armed():
+        return []
+    return ["--load-format", "dummy"]
+
+
 def argv_d(
     py: str,
     model: str,
@@ -3236,7 +3255,7 @@ def argv_d(
         # half that guards the window this line sits next to.
         "--barlink-uncovered-class", "refuse",
         "--port", str(PORT_D),
-    ] + admin_key_flag(admin_api_key) + extra
+    ] + admin_key_flag(admin_api_key) + _adopt_load_format_flag() + extra
 
 
 def _import_duplex_gate() -> float:
@@ -10653,6 +10672,22 @@ def build_parser() -> argparse.ArgumentParser:
              "--weg2-weight-source ring",
     )
     ap.add_argument(
+        "--weg2-d-adopt", choices=("on", "off"), default="off",
+        help="#108 ERSTBOOT-ADOPTION (Nutzer-Order 22.09.): 'on' laesst die "
+             "D-Gruppe mit --load-format dummy starten und ihre Gewichte vom "
+             "ERSTFLIP aus P's Karten holen, statt denselben Checkpoint ein "
+             "zweites Mal von Platte zu lesen. Gemessen fnFL2w51: P 28,24 s, "
+             "D danach nochmal 71,69 s fuer dieselben Bytes. Der groessere "
+             "Gewinn ist aber die Rueckkopplung -- wer beim ERSTEN Laden den "
+             "Flip-Pfad benutzt, sieht dessen Fehler in der ersten Minute "
+             "statt nach der fuenften (acht Boots am 22.09. starben jeweils "
+             "am Ende einer ~5-min-Ladephase). Zwei Riegel haengen daran, "
+             "beide in weg2/adopt.py: D schreibt nicht in den GETEILTEN "
+             "Store (sonst ueberschreibt sein dummy-Presplit P's echte "
+             "Experten) und rechnet keinen Forward, bis der Erstflip "
+             "VOLLSTAENDIG gedeckt hat. 'off' ist byte-identisch zu vorher.",
+    )
+    ap.add_argument(
         "--weg2-xchg-legs", choices=list(weight_exchange.XCHG_LEGS_CHOICES),
         default=weight_exchange.LEGS_BOTH,
         help="#1330 B4n. WHICH DIRECTION's exchange legs run. 'both' (the "
@@ -12144,6 +12179,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f" wie vor #106. Das ist der KONSERVATIVE Fall, nicht der"
             f" gewuenschte: passen die Vektoren nicht zusammen, kollidiert"
             f" der geteilte Store weiterhin beim Oeffnen der Datei")
+
+    # #108 ERSTBOOT-ADOPTION: die Entscheidung an BEIDE Gruppen.
+    # An P, weil P wissen muss, dass seine Bytes gebraucht werden (und es
+    # nicht schlafen legen darf, bevor der Erstflip lief); an D, weil dort
+    # die zwei Riegel daran haengen. Ein Kanal, wie bei #106/#107 -- zwei
+    # Kanaele fuer eine Entscheidung sind der Weg, auf dem zwei Antworten
+    # entstehen.
+    try:
+        from sglang.srt.weg2 import adopt as _adopt
+
+        _adopt_on = str(getattr(ns, "weg2_d_adopt", "off")).strip().lower()
+        xchg_env[_adopt.ADOPT_ENV] = _adopt_on
+        if _adopt_on == _adopt.ADOPT_ON:
+            log("WEG2-D-ADOPT on -- D startet mit --load-format dummy und "
+                "holt seine Gewichte vom ERSTFLIP aus P's Karten. Riegel: "
+                "kein Store-Schreiben und kein Forward auf D, bis der Flip "
+                "vollstaendig gedeckt hat (#108).")
+    except BaseException as _exc:  # noqa: BLE001 -- kippt nie den Boot
+        log(f"WEG2-D-ADOPT failed: {type(_exc).__name__}: {_exc}")
 
     # #107: DIE EXPERTEN-KARTE. Nutzer-Gesetz 22.09.: "alles was geshardet
     # wird braucht ne karte". #106 publiziert die zwei VEKTOREN, aus denen

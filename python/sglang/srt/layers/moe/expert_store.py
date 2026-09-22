@@ -411,6 +411,30 @@ def write_rows(
     das Ergebnis weiter; zweimal rechnen heisst irgendwann verschieden
     rechnen.
     """
+    # #108 ERSTBOOT-ADOPTION: EIN RANG AUF PLATZHALTERN SCHREIBT HIER NICHT.
+    # Der Store ist EINE Datei je Layer/Attribut fuer BEIDE Gruppen (#107).
+    # Laedt D unter Adoption mit `--load-format dummy`, laeuft sein Presplit
+    # trotzdem (DummyModelLoader ruft `process_weights_after_loading`) -- und
+    # wuerde P's echte Experten-Bytes mit Zufallszahlen ueberschreiben.
+    # Groesse und Struktur blieben dabei korrekt; nur der Inhalt waere
+    # zerstoert, und niemand saehe es. Lesen bleibt erlaubt: davon lebt die
+    # Adoption. Der Riegel faellt, sobald der Erstflip die echten Bytes
+    # gebracht hat (`adopt.mark_adopted`).
+    try:
+        from sglang.srt.weg2 import adopt as _adopt
+
+        if _adopt.store_writes_denied():
+            import logging as _lg
+
+            _lg.getLogger(__name__).info(
+                "#108 STORE-WRITE UNTERDRUECKT: dieser Rang haelt "
+                "Platzhalter-Gewichte (%s) und der Store gehoert BEIDEN "
+                "Gruppen -- %d Zeilen NICHT geschrieben",
+                _adopt.placeholder_reason() or "dummy-load", len(local_ids))
+            return dict(rows or {})
+    except ImportError:
+        pass
+
     rows = dict(rows) if rows is not None else global_rows(local_ids, lo, pad)
     if not rows:
         return rows

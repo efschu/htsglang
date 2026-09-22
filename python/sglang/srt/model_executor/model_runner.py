@@ -2875,6 +2875,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # This handles both config.json (standard) and hf_quant_config.json (ModelOpt)
         quant_str = self.model_config.get_quantization_config_log_str()
 
+        # #108: UNTER ADOPTION STEHEN HIER PLATZHALTER, KEINE GEWICHTE.
+        # `--load-format dummy` hat die Struktur gebaut (Repack, Presplit,
+        # Pool-Geometrie -- `DummyModelLoader` ruft
+        # `process_weights_after_loading`), aber die Zahlen sind Zufall.
+        # Ab dieser Zeile gelten beide Riegel, bis der Erstflip P's Bytes
+        # gebracht hat: kein Forward (model_runner.forward) und kein
+        # Schreiben in den GETEILTEN Store (expert_store.write_rows).
+        try:
+            from sglang.srt.weg2 import adopt as _weg2_adopt
+
+            if _weg2_adopt.adopt_armed():
+                _weg2_adopt.arm_placeholder(
+                    f"load-format={getattr(self.server_args, 'load_format', '?')}")
+                logger.info(
+                    "#108 ADOPTION ARMED: dieser Rang haelt PLATZHALTER. Kein "
+                    "Forward und kein Store-Schreiben, bis der Erstflip P's "
+                    "Bytes gebracht hat (adopt.mark_adopted).")
+        except ImportError:
+            pass
+
         logger.info(
             f"Load weight end. "
             f"elapsed={time.perf_counter() - tic_total:.2f} s, "
@@ -4605,6 +4625,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # #108 ERSTBOOT-ADOPTION: KEIN FORWARD AUF PLATZHALTERN.
+        #
+        # Unter `--weg2-d-adopt on` laedt D mit `--load-format dummy`: die
+        # Struktur entsteht vollstaendig (Repack, Presplit, Pool-Geometrie),
+        # aber in den Tensoren stehen ZUFALLSWERTE, bis der Erstflip P's
+        # Bytes gebracht hat. Ein Forward in diesem Fenster liefert
+        # syntaktisch gueltigen Unsinn -- der Fehlerfall, der wie ein
+        # Ergebnis aussieht und deshalb am teuersten ist. Der Riegel steht
+        # am Eingang des Forwards, nicht am Scheduler: ein Pfad, der ihn
+        # umgeht, koennte sonst trotzdem rechnen.
+        from sglang.srt.weg2 import adopt as _weg2_adopt
+
+        if _weg2_adopt.weights_are_placeholder():
+            _weg2_adopt.refuse_if_placeholder()
+
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
