@@ -5295,8 +5295,17 @@ def _expert_store_rows_for(layer, plan):
         # KEIN frueher `return` hier: die `#96 STORE-SLOTS`-Zeile am Ende der
         # Funktion ist der Beleg, an dem w22/w24/w26 gemessen wurden, und sie
         # muss auch fuer den Kartenweg kommen.
+        #
+        # ABER EIN ECHTES `elif`, KEIN VORSPANN (fnFL2w50, 07:15Z): meine
+        # erste Fassung setzte die Werte und liess den Rest weiterlaufen --
+        # `_global_only` war None, also fiel es in `elif _ratios and _fracs`,
+        # rechnete die Zuordnung neu und starb an `#91: 92 kalte Experten
+        # stehen im Hotset`. Einen Zweig VORZUSCHALTEN genuegt nicht; die
+        # Alternativen muessen wirklich Alternativen sein.
         _global_only = None if _karte is not None else _es.shared_resident_ids()
-        if _global_only is not None:
+        if _karte is not None:
+            pass  # die Karte hat oben entschieden
+        elif _global_only is not None:
             _kalt = [e for e in range(num_global) if e not in _global_only]
             _pos = {g: i for i, g in enumerate(_kalt)}
             _fehlend = [g for g in _index.values() if g not in _pos]

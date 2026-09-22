@@ -190,3 +190,29 @@ def test_der_schreiber_zieht_die_vektoren_aus_extra_d():
                  [float(x) for x in
                   _argv_vector(extra_d, "--rank-moe-resident-fraction")])
     assert k["slots"] == 324 and k["bounds"] == [0, 192, 336]
+
+
+def test_die_karte_schaltet_die_anderen_wege_AB_nicht_nur_vor():
+    """fnFL2w50 (07:15Z): meine erste Fassung war ein VORSPANN, kein Zweig.
+
+    Sie setzte `_index`/`_slots` aus der Karte und liess den Rest der
+    Funktion weiterlaufen -- `_global_only` war None, also fiel es in
+    `elif _ratios and _fracs`, rechnete alles neu und starb an
+    `#91: 92 kalte Experten stehen im Hotset`. Der Test liest die
+    Verzweigung selbst, weil genau sie der Defekt war.
+    """
+    import inspect
+
+    from sglang.srt.layers.moe import expert_offload as eo
+
+    src = inspect.getsource(eo._expert_store_rows_for)
+    i_karte = src.index("if _karte is not None:")
+    i_global = src.index("elif _global_only is not None:")
+    i_ratios = src.index("elif _ratios and _fracs:")
+    assert i_karte < i_global < i_ratios, (
+        "die Karte muss der ERSTE Zweig sein, und die beiden alten Wege "
+        "muessen `elif` sein -- sonst rechnen sie hinter ihr weiter")
+
+    zwischen = src[i_karte:i_global]
+    assert "_global_only = None if _karte is not None" in zwischen, (
+        "ohne diese Zeile liest der alte Weg wieder shared_resident_ids()")
