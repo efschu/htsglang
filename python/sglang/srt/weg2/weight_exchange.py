@@ -719,6 +719,21 @@ class ParamGeom:
     stage: Optional[int] = None
     dst_widths: Optional[Sequence[int]] = None
     dst_extents: Optional[Sequence[int]] = None
+    #: #102 (fnFL2w36/w37): DIE HALTER-KARTE DER QUELLSEITE.
+    #: Spiegel von ``dst_widths``. Bis hierher las ``_blocks_of`` den
+    #: per-Tensor-Breitenvektor NUR als Ziel ("``if is_dst and
+    #: geom.dst_widths is not None``"), und der Kommentar bei #1378 xsn54
+    #: sagte warum: "the SOURCE side keeps its every-rank shape until its
+    #: own defect is measured". Gemessen ist er jetzt -- Form A
+    #: (``--rank-tp-ratio 1,0,0``) legt alles Dense auf D-Rang 0, und in
+    #: Richtung ``tp_to_pp`` ist D die QUELLE: der Plan verlangte Layer-29-
+    #: Dense von Rang 1, dessen Adressbuch nur ``mlp.experts.*`` fuehrt
+    #: (600 Namen gegen Rang 0s 2011), refusete mit "33 of 37 descs have no
+    #: address on the side this rank owns", deponierte die Lane nie, und P
+    #: lief 90 s in sein Zeitbudget und riss alle drei PP-Raenge mit.
+    #: ``None`` haelt den generischen Split, der fuer eine echte TP-Gruppe
+    #: richtig ist.
+    src_widths: Optional[Sequence[int]] = None
     #: #1384: DECLARED per-component row sizes of a fused parameter (e.g. a
     #: QKVParallelLinear weight's (q, k, v) split), read straight off the
     #: module that already computed them to size its own buffer
@@ -1778,30 +1793,38 @@ def _blocks_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> List[List[
         # Die Breiten hier NICHT als Praefixsumme lesen: bei REPLICATED
         # traegt jeder HALTER die volle Form (deshalb size=total, nicht
         # size=w). Die Breite sagt nur, OB er sie traegt.
-        if is_dst and geom.dst_widths is not None:
-            if len(geom.dst_widths) != layout.n_ranks:
+        # #102: dieselbe Karte, beide Richtungen (siehe `src_widths`).
+        _widths = (geom.dst_widths if is_dst
+                   else getattr(geom, "src_widths", None))
+        if _widths is not None:
+            if len(_widths) != layout.n_ranks:
                 raise Weg2XchgPlanDisagree(
                     f"W68 Weg2XchgPlanDisagree: {geom.name}: "
-                    f"{len(geom.dst_widths)} seeded widths for "
-                    f"{layout.n_ranks} ranks."
+                    f"{len(_widths)} seeded widths for "
+                    f"{layout.n_ranks} ranks "
+                    f"({'dst' if is_dst else 'src'} side)."
                 )
             return [
                 ([Block(block=0, global_start=0, dev_row=0, size=total)]
                  if int(w) > 0 else [])
-                for w in geom.dst_widths
+                for w in _widths
             ]
         return [
             [Block(block=0, global_start=0, dev_row=0, size=total)]
             for _ in range(layout.n_ranks)
         ]
-    if is_dst and geom.dst_widths is not None:
-        if len(geom.dst_widths) != layout.n_ranks:
+    # #102: dieselbe Karte, beide Richtungen (siehe `src_widths`).
+    _widths = (geom.dst_widths if is_dst
+               else getattr(geom, "src_widths", None))
+    if _widths is not None:
+        if len(_widths) != layout.n_ranks:
             raise Weg2XchgPlanDisagree(
-                f"W68 Weg2XchgPlanDisagree: {geom.name}: {len(geom.dst_widths)} "
-                f"seeded widths for {layout.n_ranks} ranks."
+                f"W68 Weg2XchgPlanDisagree: {geom.name}: {len(_widths)} "
+                f"seeded widths for {layout.n_ranks} ranks "
+                f"({'dst' if is_dst else 'src'} side)."
             )
         out, acc = [], 0
-        for w in geom.dst_widths:
+        for w in _widths:
             out.append([Block(block=0, global_start=acc, dev_row=0, size=int(w))])
             acc += int(w)
         return out

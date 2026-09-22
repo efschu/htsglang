@@ -491,6 +491,21 @@ class JoinedTensor:
                             and (self.sharded
                                  or any(int(w) == 0 for w in self.tp_widths)))
                         else None),
+            # #102 (fnFL2w36/w37): DIESELBE KARTE, WENN DIE TP-GRUPPE DIE
+            # QUELLE IST. Bedingung woertlich die des Ziels, nur die
+            # Richtung gespiegelt -- eine Null-Breite ist auch hier eine
+            # ECHTE Aussage, naemlich "dieser Rang haelt den Tensor nicht".
+            # Ohne sie shardet die Quellseite generisch ueber alle Raenge
+            # und verlangt Layer-29-Dense von D-Rang 1, dessen Adressbuch
+            # nur `mlp.experts.*` fuehrt: "33 of 37 descs have no address
+            # on the side this rank owns" (w37, 01:45:34Z), Lane nie
+            # deponiert, P 90 s im Zeitbudget, alle drei PP-Raenge tot.
+            src_widths=(tuple(int(w) for w in self.tp_widths)
+                        if ((not tp_is_dst)
+                            and self.shard_axis != wx.MIXED_FUSED
+                            and (self.sharded
+                                 or any(int(w) == 0 for w in self.tp_widths)))
+                        else None),
             # #1384: MIXED_FUSED needs its declared components on the geom
             # regardless of `tp_is_dst` -- `_blocks_of` is called once per
             # SIDE (source and destination) for the same geom, and the TP
