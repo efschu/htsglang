@@ -12402,6 +12402,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Gewichtet wird mit den PP-STUFEN (Layer je Rang), nicht mit
         # `_geom_ratios` -- das sind D's MoE-Ratios und hier die falsche
         # Groesse.
+        _ne = _argv_vector(getattr(ns, "extra_d", ""), "--num-experts")
+        _total = int(_ne[0]) if _ne else 512
+
+        # #134: DIE BANDBREITE, aus derselben Geometrie wie die Karte und
+        # UNABHAENGIG davon, ob die Karte publiziert wird -- sie braucht nur
+        # die Ratios, nicht die Fractions, und eine refuesende Karte darf
+        # nicht stillschweigend auch die Bandteilung abschalten.
+        # Die Breite ist der ggT der D-Spans (expert_map.band_geometry), also
+        # faellt jede Besitzgrenze von D auf eine Bandgrenze: ein Band hat
+        # genau EINEN Halter je Phase. Im Arm gepinnt waere sie die naechste
+        # Instanz von `arm-defaults-die-den-boot-toeten` -- andere Ratios,
+        # andere Breite, und niemand denkt daran.
+        if _geom_ratios:
+            _bs, _bc = _em.band_geometry([int(x) for x in _geom_ratios], _total)
+            if _bs > 0:
+                xchg_env["SGLANG_WEG2_EXPERT_BAND_SIZE"] = str(_bs)
+                xchg_env["SGLANG_WEG2_EXPERT_BANDS"] = str(_bc)
+                log(f"WEG2-EXPERT-BAND size={_bs} count={_bc} "
+                    f"spans={_em.scaled_spans([int(x) for x in _geom_ratios], _total)} "
+                    f"-- die Verschiebeeinheit des Flips ist jetzt das "
+                    f"EXPERTEN-BAND je Layer-Chunk (#134), nicht der ganze "
+                    f"Layer-Chunk")
+            else:
+                log(f"WEG2-EXPERT-BAND aus: ratios={_geom_ratios} total={_total} "
+                    f"ergeben keine Breite, die jede D-Grenze trifft und unter "
+                    f"{_em.MAX_BANDS} Baendern bleibt -- der Flip transportiert "
+                    f"je Layer-Chunk wie vorher (langsamer, nicht falsch)")
+
         # #132: DER VEKTOR GEHT DURCH, NICHT SEIN MITTEL.
         #
         # #131 hatte hier das layer-gewichtete Mittel gebildet -- das war
@@ -12414,10 +12442,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _pp_frac = list(_fr_p) if _fr_p else None
         if _geom_ratios and _geom_fracs and _pp_frac is not None:
             _karte = _em.build(
-                total=int(_argv_vector(getattr(ns, "extra_d", ""),
-                                       "--num-experts")[0])
-                if _argv_vector(getattr(ns, "extra_d", ""), "--num-experts")
-                else 512,
+                total=_total,
                 ratios=[int(x) for x in _geom_ratios],
                 fr_pp=_pp_frac,
                 fr_tp=[float(x) for x in _geom_fracs])

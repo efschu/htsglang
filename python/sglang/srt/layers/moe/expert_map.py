@@ -46,6 +46,57 @@ PHASE_PP = "P"
 PHASE_TP = "D"
 
 
+#: #134: mehr Baender als das je Layer-Chunk zu Tags macht, will der Plan
+#: nicht -- 16 Chunks x 32 Baender sind schon 512 Tags. Die Zahl ist eine
+#: PLAN-Groesse, keine Physik; sie steht hier, damit sie EINE Stelle hat.
+MAX_BANDS = 32
+
+
+def band_geometry(ratios: Sequence[int], total: int) -> tuple:
+    """Die Breite eines EXPERTEN-BANDES und ihre Anzahl (#134).
+
+    Die Breite ist der GROESSTE GEMEINSAME TEILER der D-Spans, und das ist
+    keine Geschmacksfrage: ein Band ist die Einheit, die der Flip taggt und
+    am Stueck bewegt. Schneidet es eine Besitzgrenze von D, gehoert eine
+    Haelfte Rang r und die andere Rang r+1 -- dann gibt es fuer das Band
+    keinen EINEN Halter, und genau daran ist heute frueh die Karte
+    gescheitert ("298 Ids sind resident UND im Store").
+
+    Mit ``ratios=[183,137,168]`` und ``total=512`` sind die Spans 192/144/176
+    (``scaled_spans``); ggT = 16, also 32 Baender, und jede D-Grenze
+    (0/192/336/512) faellt auf eine Bandgrenze. Die Breite wird damit AUS DER
+    GEOMETRIE gerechnet statt im Arm gepinnt -- andere Ratios, andere
+    Breite, ohne dass jemand daran denken muss
+    (Memory ``arm-defaults-die-den-boot-toeten``).
+
+    Gibt ``(0, 0)`` zurueck, wenn die Ratios keine brauchbare Teilung
+    ergeben -- dann ist die Bandteilung AUS, und das ist die LANGSAME
+    Ausweichrichtung, nie die falsche: der Flip transportiert dann wie
+    vorher je Layer-Chunk. Zwei Faelle fuehren dahin, und beide lieber als
+    ein Band mit zwei Besitzern:
+      * der ggT teilt ``total`` nicht (eine Id fiele aus jedem Band),
+      * der ggT ist so klein, dass mehr als ``MAX_BANDS`` Baender
+        entstuenden -- bei 512 Experten und ggT 1 waeren das 512 Tags JE
+        CHUNK, also 8192 im Plan, und ein Band von 1,5 MiB liegt unter der
+        Groesse, ab der der Transport ueberhaupt asynchron laeuft
+        (``piece_histogram``: >= 2 MiB).
+    """
+    from math import gcd
+
+    spans = [int(x) for x in scaled_spans(ratios, total) if int(x) > 0]
+    if not spans or int(total) <= 0:
+        return 0, 0
+    size = spans[0]
+    for x in spans[1:]:
+        size = gcd(size, x)
+    if size <= 0 or int(total) % size != 0:
+        return 0, 0
+    count = int(total) // size
+    if count > MAX_BANDS:
+        return 0, 0
+    return size, count
+
+
 def scaled_spans(ratios: Sequence[int], total: int) -> List[int]:
     """Die Experten JE RANG, auf ``total`` skaliert -- wie der Server rechnet.
 

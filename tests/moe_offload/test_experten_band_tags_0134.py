@@ -174,3 +174,32 @@ def test_die_wellen_sind_eine_permutation_der_familie(baender):
         "W68, ein Tag in keiner ist W74"
     )
     assert wellen[-1][-1] == m.GPU_MEMORY_TYPE_WEIGHTS
+
+
+# --- die Bandbreite kommt aus der GEOMETRIE, nicht aus dem Arm ------------
+
+def test_bandbreite_trifft_jede_D_grenze():
+    from sglang.srt.layers.moe.expert_map import band_geometry, bounds, scaled_spans
+
+    spans = scaled_spans([183, 137, 168], 512)
+    assert spans == [192, 144, 176]
+    size, count = band_geometry([183, 137, 168], 512)
+    assert (size, count) == (16, 32)
+    # JEDE Besitzgrenze von D faellt auf eine Bandgrenze -- sonst haette ein
+    # Band zwei Halter, und genau daran ist die Karte heute frueh gescheitert
+    # ("298 Ids sind resident UND im Store").
+    for grenze in bounds(spans) + [512]:
+        assert grenze % size == 0, (grenze, size)
+
+
+def test_unbrauchbare_ratios_schalten_die_teilung_AUS():
+    from sglang.srt.layers.moe.expert_map import band_geometry
+
+    # ggT 1 -> 512 Baender je Chunk. Die Ausweichrichtung ist LANGSAM
+    # (Transport je Layer-Chunk wie vorher), nie falsch.
+    assert band_geometry([1, 1, 1], 512) == (0, 0)
+    assert band_geometry([5, 3, 1], 512) == (0, 0)
+    assert band_geometry([], 512) == (0, 0)
+    assert band_geometry([183, 137, 168], 0) == (0, 0)
+    # und eine grobe Teilung bleibt erlaubt
+    assert band_geometry([2, 1, 1], 512) == (128, 4)
