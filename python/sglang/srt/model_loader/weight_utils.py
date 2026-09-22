@@ -1329,7 +1329,8 @@ def _pread_one_key(fd, base, name, info, should_load):
     return buf.view(dtype).reshape(shape)
 
 
-def _pread_keys_parallel(st_file, base, order, should_load, workers: int) -> dict:
+def _pread_keys_parallel(st_file, base, order, should_load, workers: int,
+                         post_load=None) -> dict:
     """#68: die Keys EINER Datei auf ``workers`` Threads.
 
     Jeder Thread oeffnet seinen EIGENEN fd -- nicht aus Vorsicht vor
@@ -1345,8 +1346,22 @@ def _pread_keys_parallel(st_file, base, order, should_load, workers: int) -> dic
         try:
             for name, info in teil:
                 t = _pread_one_key(fd, base, name, info, should_load)
-                if t is not None:
-                    eigen[name] = t
+                if t is None:
+                    continue
+                # #68b DIE CPU-ARBEIT GEHOERT IN DIESEN THREAD.
+                #
+                # Vorher lief `post_load` beim AUFRUFER, als
+                # `{k: post_load(k, v) for k, v in result.items()}` -- rund
+                # 16 000 Keys je Shard, seriell, nachdem dieser Pool sie
+                # parallel gelesen hatte. Genau deshalb hat die
+                # Key-Parallelitaet allein NICHTS gebracht (fnFL2w56 gegen
+                # w54: 106,52 gegen 110,16 s bei 30-50 % NVMe-Last): der
+                # Engpass ist nicht das Lesen, sondern die Transposition
+                # danach. Hier laeuft sie auf `workers` Threads, und
+                # torch-Ops geben die GIL waehrend der Kopie frei.
+                if post_load is not None:
+                    t = post_load(name, t)
+                eigen[name] = t
         finally:
             os.close(fd)
         return eigen
@@ -1361,7 +1376,7 @@ def _pread_keys_parallel(st_file, base, order, should_load, workers: int) -> dic
     return result
 
 
-def pread_safetensors_file(st_file: str, should_load=None) -> dict:
+def pread_safetensors_file(st_file: str, should_load=None, post_load=None) -> dict:
     """Read a safetensors file's tensors with pread() into fresh CPU tensors,
     in file order, one tensor at a time -- no mmap, no whole-file buffer.
 
@@ -1406,7 +1421,9 @@ def pread_safetensors_file(st_file: str, should_load=None) -> dict:
     except ValueError:
         _kw = 1
     if _kw > 1 and len(order) > _kw:
-        return _pread_keys_parallel(st_file, base, order, should_load, _kw)
+        return _pread_keys_parallel(
+            st_file, base, order, should_load, _kw, post_load=post_load
+        )
 
     fd = os.open(st_file, os.O_RDONLY)
     try:
@@ -1482,7 +1499,12 @@ def buffered_multi_thread_safetensors_weights_iterator(
 
     def _load_file(st_file: str):
         if pread:
-            return pread_safetensors_file(st_file, should_load)
+            # #68b: unter Key-Parallelitaet laeuft `post_load` DRIN, je
+            # Thread. Der Rueckgabewert ist dann fertig, und die serielle
+            # Schleife unten wird uebersprungen -- sonst liefe sie ein
+            # zweites Mal ueber dieselben Tensoren.
+            _erg = pread_safetensors_file(st_file, should_load, post_load=post_load)
+            return _erg
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
@@ -1505,9 +1527,10 @@ def buffered_multi_thread_safetensors_weights_iterator(
                         continue
                     result[k] = f.get_tensor(k)
         if post_load is not None:
-            # In the worker, on the thread that read the file. Not
-            # guarded: an exception here must surface, because a
-            # half-transformed weight set loads silently wrong.
+            # NUR fuer die NICHT-pread-Pfade (mmap, whole-file): der
+            # pread-Pfad oben hat `post_load` bereits angewandt, je Thread
+            # (#68b). Nicht guarded: eine Ausnahme hier MUSS hochkommen,
+            # ein halb transformierter Gewichtssatz laedt still falsch.
             result = {k: post_load(k, v) for k, v in result.items()}
         return result
 

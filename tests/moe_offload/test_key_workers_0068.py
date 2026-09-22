@@ -103,3 +103,42 @@ def test_eine_ausnahme_wird_nicht_verschluckt(monkeypatch):
     else:
         raise AssertionError("die Ausnahme wurde verschluckt -- ein halb "
                              "gelesener Gewichtssatz laedt still falsch")
+
+
+def test_68b_post_load_laeuft_IM_key_thread(monkeypatch):
+    """Die Key-Parallelitaet allein brachte NICHTS (w56 106,52 s gegen w54
+    110,16 bei 30-50 % NVMe-Last): gelesen wurde parallel, aber `post_load`
+    lief danach seriell beim Aufrufer ueber ~16 000 Keys. Hier laeuft es
+    im lesenden Thread."""
+    import threading
+
+    p, _ = _fixture(n=40)
+    monkeypatch.setenv("SGLANG_LOAD_KEY_WORKERS", "4")
+    threads = set()
+
+    def _pl(name, t):
+        threads.add(threading.get_ident())
+        return t * 2
+
+    d = wu.pread_safetensors_file(p, post_load=_pl)
+    assert len(threads) > 1, (
+        f"post_load lief in {len(threads)} Thread(s) -- die CPU-Arbeit ist "
+        f"weiter seriell, genau der Befund aus w56"
+    )
+    # und es wurde GENAU EINMAL je Tensor angewandt (nicht zweimal)
+    erwartet = wu.pread_safetensors_file(p)
+    for k in erwartet:
+        assert torch.equal(d[k], erwartet[k] * 2), k
+
+
+def test_68b_kein_doppeltes_post_load_im_pread_pfad():
+    import inspect
+
+    src = inspect.getsource(wu.buffered_multi_thread_safetensors_weights_iterator)
+    i_pread = src.index("pread_safetensors_file(st_file, should_load, post_load=post_load)")
+    i_seriell = src.index("{k: post_load(k, v) for k, v in result.items()}")
+    assert i_pread < i_seriell
+    assert "return _erg" in src[i_pread : i_pread + 200], (
+        "der pread-Pfad faellt in die serielle Schleife durch -- post_load "
+        "liefe zweimal und das Modell laedt still falsch"
+    )
