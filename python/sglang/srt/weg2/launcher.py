@@ -12307,6 +12307,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # Peer muss importieren koennen, und eine Entscheidung, die nur
             # eine Seite erreicht, ist keine.
             xchg_env["SGLANG_WEG2_VMM_EXPORTABLE"] = "1"
+        # #68: der Datei-Pool gibt EINEN Task je Shard; auf diesem
+        # Checkpoint sind das ~16 000 Tensoren in EINEM Thread. Diese Env
+        # teilt die Keys einer Datei auf mehrere Threads -- an BEIDE
+        # Gruppen, weil beide denselben Loader fahren. Ohne Schreiber waere
+        # sie wieder eine Env, die nur gelesen wird (heute elfmal).
+        xchg_env["SGLANG_LOAD_KEY_WORKERS"] = str(
+            max(1, int(os.environ.get("WEG2_LOAD_KEY_WORKERS", "4") or 4))
+        )
             log("WEG2-VMM-EXPORTABLE on -- jede TMS-Allokation bekommt "
                 "CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, damit die "
                 "Union-Arena die Gewichtsbytes zwischen den Phasen teilen "

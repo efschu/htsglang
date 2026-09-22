@@ -1302,6 +1302,65 @@ def read_safetensors_header(st_file: str):
     return header, 8 + n
 
 
+def _pread_one_key(fd, base, name, info, should_load):
+    """EIN Tensor aus einer offenen safetensors-Datei. Der Rumpf ist Zeile
+    fuer Zeile der der seriellen Schleife in :func:`pread_safetensors_file`
+    -- absichtlich, damit die beiden Formen nicht auseinanderlaufen koennen
+    (#68). Gibt ``None`` zurueck, wenn der Aufrufer den Tensor nicht will."""
+    verdict = True if should_load is None else should_load(name)
+    if not verdict:
+        return None
+    dtype = _SAFETENSORS_DTYPES[info["dtype"]]
+    shape = tuple(int(x) for x in info["shape"])
+    if verdict == "meta":
+        return torch.empty(shape, dtype=dtype, device="meta")
+    off0, off1 = info["data_offsets"]
+    nbytes = int(off1) - int(off0)
+    if not nbytes:
+        return torch.empty(shape, dtype=dtype)
+    buf = torch.empty(nbytes, dtype=torch.uint8)
+    view = memoryview(buf.numpy())
+    pos = 0
+    while pos < nbytes:
+        n = os.preadv(fd, [view[pos : pos + _PREAD_CHUNK]], base + off0 + pos)
+        if n <= 0:
+            raise IOError(f"short read in fd at {base + off0 + pos}")
+        pos += n
+    return buf.view(dtype).reshape(shape)
+
+
+def _pread_keys_parallel(st_file, base, order, should_load, workers: int) -> dict:
+    """#68: die Keys EINER Datei auf ``workers`` Threads.
+
+    Jeder Thread oeffnet seinen EIGENEN fd -- nicht aus Vorsicht vor
+    `preadv` (das ist positionsbasiert und teilbar), sondern damit ein
+    Fehler in einem Thread die anderen nicht mitnimmt und der Schluss jedes
+    fd genau einem `finally` gehoert.
+    """
+    bloecke = [order[i::workers] for i in range(workers)]
+
+    def _lauf(teil):
+        eigen = {}
+        fd = os.open(st_file, os.O_RDONLY)
+        try:
+            for name, info in teil:
+                t = _pread_one_key(fd, base, name, info, should_load)
+                if t is not None:
+                    eigen[name] = t
+        finally:
+            os.close(fd)
+        return eigen
+
+    result = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        # Kein `swallow`: eine Ausnahme hier MUSS hochkommen. Ein halb
+        # gelesener Gewichtssatz laedt still falsch, und das ist das eine
+        # Ergebnis, das schlimmer ist als ein langsamer Boot.
+        for teil_dict in ex.map(_lauf, bloecke):
+            result.update(teil_dict)
+    return result
+
+
 def pread_safetensors_file(st_file: str, should_load=None) -> dict:
     """Read a safetensors file's tensors with pread() into fresh CPU tensors,
     in file order, one tensor at a time -- no mmap, no whole-file buffer.
@@ -1319,6 +1378,36 @@ def pread_safetensors_file(st_file: str, should_load=None) -> dict:
     header, base = read_safetensors_header(st_file)
     order = sorted(header.items(), key=lambda kv: kv[1]["data_offsets"][0])
     result = {}
+
+    # #68 DER POOL TEILT DIE KEYS EINER DATEI, NICHT NUR DIE DATEIEN.
+    #
+    # Der Aufrufer (`buffered_multi_thread_safetensors_weights_iterator`)
+    # gibt EINEN Task je Datei in den Pool. Auf diesem Checkpoint sind das
+    # 14 Shards mit 225 300 Tensoren -- rund 16 000 je Datei, und die liest
+    # dieser Thread hier ALLE nacheinander, samt `post_load`. Genau das
+    # benennt der Docstring von `Qwen4ExpForConditionalGeneration.
+    # weight_post_load` als den Grund, warum der Worker-Transpose (#66)
+    # LANGSAMER war statt schneller: "post_load runs serially per file"
+    # (PP2 36,7 -> 47,5 s, fnFL2v87), und den Weg heraus: "einen Pool, der
+    # die Keys EINER Datei aufteilt -- dann greifen die gemessenen
+    # 1,55-1,96x, ohne den Verbraucher zu blockieren".
+    #
+    # WARUM DAS SICHER IST: `os.preadv` ist positionsbasiert und veraendert
+    # den Dateizeiger nicht, mehrere Threads duerfen denselben fd benutzen.
+    # Jeder Thread schreibt in sein EIGENES Teil-Dict; gemischt wird erst
+    # danach, im aufrufenden Thread. Die Bytes und ihre Zuordnung sind
+    # identisch zur seriellen Form -- nur die Reihenfolge der Lesevorgaenge
+    # aendert sich, und die stand nie in einem Vertrag.
+    #
+    # DEFAULT 1 = byte-identisch zu vorher. SGLANG_LOAD_KEY_WORKERS setzt
+    # die Zahl; der Launcher setzt sie fuer beide Gruppen.
+    try:
+        _kw = int(os.environ.get("SGLANG_LOAD_KEY_WORKERS", "1") or "1")
+    except ValueError:
+        _kw = 1
+    if _kw > 1 and len(order) > _kw:
+        return _pread_keys_parallel(st_file, base, order, should_load, _kw)
+
     fd = os.open(st_file, os.O_RDONLY)
     try:
         for name, info in order:
