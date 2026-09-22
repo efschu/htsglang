@@ -3905,6 +3905,29 @@ def prepare_xchg_region(log: Log, boot_nonce: str, hook_mode: int,
     return weight_exchange_region.prepare_region(boot_nonce, hook_mode=hook_mode, log=log)
 
 
+def _split_fraction_text(text) -> list:
+    """Ein Fraction-Flag des LAUNCHERS als Liste (#130).
+
+    `--pp-cut-expert-device-fraction 0.367,0.75,0.95` kommt als String am
+    Namespace an, nicht als argv-Fragment -- `_argv_vector` findet es
+    dort nie. Leerer/unlesbarer Wert -> leere Liste, der Aufrufer faellt
+    dann auf seine zweite Quelle zurueck.
+    """
+    t = str(text or "").strip()
+    if not t:
+        return []
+    out = []
+    for teil in t.replace(";", ",").split(","):
+        teil = teil.strip()
+        if not teil:
+            continue
+        try:
+            out.append(float(teil))
+        except ValueError:
+            return []
+    return out
+
+
 def _argv_vector(extra: str, flag: str):
     """Der Komma-Vektor hinter ``flag`` in einer ``--extra-*``-Zeichenkette.
 
@@ -12345,10 +12368,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         from sglang.srt.layers.moe import expert_map as _em
 
-        _fr_p = _argv_vector(getattr(ns, "extra_p", ""),
-                             "--pp-cut-expert-device-fraction") or \
-            _argv_vector(getattr(ns, "extra_p", ""),
-                         "--rank-moe-resident-fraction")
+        # #130 DIESELBE QUELLE WIE DER PP-CUT.
+        #
+        # Hier stand `_argv_vector(ns.extra_p, "--pp-cut-expert-device-
+        # fraction")` -- aber dieses Flag ist ein LAUNCHER-Flag und steht
+        # nie in `--extra-p`. Der Ausdruck war IMMER leer, `_pp_frac`
+        # IMMER None, und die Karte fiel auf ihre Default-Residenz 188
+        # zurueck: slots = 512-188 = 324, in JEDEM Boot, unabhaengig von
+        # jeder Fraction (gemessen fnFL2w60 FR 0.367 und fnFL2w62 FR
+        # 0.367,0.75,0.95 -- beide slots=324, shared_resident=92).
+        # Der PP-Cut selbst liest `ns.pp_cut_expert_device_fraction`
+        # (launcher.py:9629) und sah die Fractions korrekt -- zwei Leser,
+        # zwei Quellen, eine davon leer.
+        _fr_p = _split_fraction_text(
+            getattr(ns, "pp_cut_expert_device_fraction", "")
+        ) or _argv_vector(getattr(ns, "extra_p", ""),
+                          "--rank-moe-resident-fraction")
         _pp_frac = float(_fr_p[0]) if _fr_p else None
         if _geom_ratios and _geom_fracs and _pp_frac is not None:
             _karte = _em.build(
