@@ -12384,7 +12384,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             getattr(ns, "pp_cut_expert_device_fraction", "")
         ) or _argv_vector(getattr(ns, "extra_p", ""),
                           "--rank-moe-resident-fraction")
-        _pp_frac = float(_fr_p[0]) if _fr_p else None
+        # #131 DIE EINE FRAKTION MUSS DAS LAYER-GEWICHTETE MITTEL SEIN.
+        #
+        # `resident_unsharded` modelliert die PP-Gruppe als EINEN Rang
+        # ("sie haelt jeden Experten und residiert die ersten
+        # round(total*fraction)") -- konzeptionell richtig, denn PP teilt
+        # nach LAYERN, und jede Stufe haelt alle Experten IHRER Layer.
+        # Genau deshalb ist `_fr_p[0]` die falsche Zahl: sie ist die
+        # Residenz der ERSTEN Stufe, nicht die der Gruppe.
+        #
+        # GEMESSEN fnFL2w62: FR_P 0.367,0.75,0.95 auf Stufen 29,11,8
+        # Layer -> `_fr_p[0]`=0,367 -> resident 188 -> slots 324 ->
+        # 37 GB tmpfs-Store, waehrend die Karten 71/83/78 % tragen.
+        # Gewichtet: (29x0,367 + 11x0,75 + 8x0,95)/48 = 0,5519
+        # -> resident 283 -> slots 229 -> Store ~26 GB. 11 GB weniger,
+        # und der Host stand bei 2 GB frei.
+        # Gewichtet wird mit den PP-STUFEN (Layer je Rang), nicht mit
+        # `_geom_ratios` -- das sind D's MoE-Ratios und hier die falsche
+        # Groesse.
+        _pp_w = _split_fraction_text(getattr(ns, "pp_stage_ratio", ""))
+        if _fr_p and _pp_w and len(_fr_p) == len(_pp_w):
+            _pp_frac = (sum(a * b for a, b in zip(_pp_w, _fr_p))
+                        / float(sum(_pp_w)))
+        else:
+            _pp_frac = float(_fr_p[0]) if _fr_p else None
         if _geom_ratios and _geom_fracs and _pp_frac is not None:
             _karte = _em.build(
                 total=int(_argv_vector(getattr(ns, "extra_d", ""),
