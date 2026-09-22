@@ -124,3 +124,48 @@ class TestDerZensusWirdMitPeerGERUFEN(unittest.TestCase):
         self.assertNotIn("peer=", quelle[i:i + 400],
                          "der ModelRunner kennt sein Ziel nicht, er darf "
                          "keinen Peer vortaeuschen")
+
+
+class TestDerMelderNenntDenThread162(unittest.TestCase):
+    """#162: die Entscheidung messen statt sie aus dem Zensus zu schliessen.
+
+    Bei tie_word_embeddings=False ist `mtp_builds_own_lm_head` genau
+    `not head_from_target`. Der Zensus zeigte einen GEBAUTEN lm_head,
+    also war `.get()` False -- obwohl der Contextmanager laeuft. Eine
+    ContextVar ist THREAD-lokal; der Thread-Name ist deshalb der
+    Unterschied zwischen "Schalter kaputt" und "Schalter kommt nicht an".
+    """
+
+    def test_die_entscheidungsformel_haengt_nur_am_schalter(self):
+        from sglang.srt.models.qwen3_5_mtp import mtp_builds_own_lm_head
+
+        # unser Checkpoint: tie_word_embeddings = False
+        self.assertFalse(mtp_builds_own_lm_head(True, False),
+                         "mit Schalter darf NICHTS gebaut werden")
+        self.assertTrue(mtp_builds_own_lm_head(False, False),
+                        "ohne Schalter wird gebaut -- das ist w134/w136")
+
+    def test_tie_word_embeddings_ist_nicht_deferrable(self):
+        from sglang.srt.models.qwen3_5_mtp import mtp_builds_own_lm_head
+
+        self.assertTrue(mtp_builds_own_lm_head(True, True),
+                        "bei tie ist der Head die eigene Embedding")
+
+    def test_der_melder_nennt_thread_und_beide_eingaben(self):
+        import inspect
+
+        from sglang.srt.models import qwen3_5_mtp as m
+
+        q = inspect.getsource(m.build_mtp_lm_head)
+        self.assertIn("#162 MTP-LM-HEAD", q)
+        for feld in ("current_thread", "from_target=", "tie_word_embeddings="):
+            self.assertIn(feld, q, f"{feld} fehlt -- dann sagt die Zeile zu wenig")
+
+    def test_der_melder_steht_VOR_dem_return(self):
+        """Sonst meldet er den Deferred-Fall nie."""
+        import inspect
+
+        from sglang.srt.models import qwen3_5_mtp as m
+
+        q = inspect.getsource(m.build_mtp_lm_head)
+        self.assertLess(q.index("#162 MTP-LM-HEAD"), q.index("Qwen3_5MtpLmHeadDeferred()"))

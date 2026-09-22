@@ -292,9 +292,40 @@ def build_mtp_lm_head(config, quant_config, prefix: str):
     The branch itself is :func:`mtp_builds_own_lm_head` -- see there for why
     the decision is a named function and not an ``if`` written twice.
     """
-    if not mtp_builds_own_lm_head(
-        _LM_HEAD_FROM_TARGET.get(), getattr(config, "tie_word_embeddings", False)
-    ):
+    _from_target = _LM_HEAD_FROM_TARGET.get()
+    _tie = getattr(config, "tie_word_embeddings", False)
+    _baut = mtp_builds_own_lm_head(_from_target, _tie)
+    # #162: SAGE, WORAUS DIE ENTSCHEIDUNG FIEL -- statt sie aus dem
+    # VRAM-Zensus zurueckzurechnen.
+    #
+    # fnFL2w134/w136: der Zensus zeigt `lm_head 1.18` im Draft, das Ziel
+    # haelt dieselbe Rolle quantisiert in 0.60. Bei
+    # tie_word_embeddings=False (unser Checkpoint) ist die Entscheidung
+    # GENAU `not head_from_target`, also MUSS `.get()` dort False gewesen
+    # sein -- obwohl `lm_head_from_target()` laeuft
+    # (draft_kv_producer.py:127). Das ist erschlossen, nicht gemessen,
+    # und der Unterschied hat heute vier Ruecknahmen gekostet.
+    #
+    # Eine ContextVar ist THREAD-lokal: baut ein Loader-Worker das
+    # Modell, ist sie dort leer, ohne dass jemand es sieht. Der
+    # Thread-Name steht deshalb mit in der Zeile -- er ist der
+    # Unterschied zwischen "der Schalter ist kaputt" und "der Schalter
+    # kommt nicht an".
+    #
+    # Was gebaut wird, zahlt das KV-Budget AUCH NACH DEM LOESCHEN
+    # (`lm_head_from_target`-Docstring: "the KV budget is profiled from
+    # mem_get_info, which therefore still charges every byte the build
+    # touched"; gemessen head_released 2425 neben nvml_delta 3998 MiB).
+    import threading as _th
+
+    logging.getLogger(__name__).info(
+        "#162 MTP-LM-HEAD baut_eigenen=%s | from_target=%s tie_word_embeddings=%s"
+        " | thread=%s -- baut_eigenen=True heisst: eine eigene [vocab,hidden]"
+        " Tabelle wird ALLOZIERT und vom KV-Budget bezahlt, auch wenn sie"
+        " danach geloescht wird",
+        _baut, _from_target, _tie, _th.current_thread().name,
+    )
+    if not _baut:
         return Qwen3_5MtpLmHeadDeferred()
     return ParallelLMHead(
         config.vocab_size,
