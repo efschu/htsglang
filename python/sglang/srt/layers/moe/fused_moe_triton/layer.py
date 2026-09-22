@@ -396,21 +396,61 @@ _CT_TRANSPOSING_METHODS = (
 )
 
 
+def ct_effective_method(layer):
+    """Die Methode, die fuer DIESEN Layer wirklich laedt (#68d).
+
+    `_weight_loader_impl` faehrt diese Kette selbst, seit es sie gibt:
+    `quant_method`, davor `scheme` wenn es eins gibt, und bei einem
+    KTEP-Wrapper dessen `gpu_method`. Die Namen in
+    `_CT_TRANSPOSING_METHODS` sind SCHEMA-Namen
+    (`CompressedTensorsWNA16MarlinMoE` und Geschwister), nicht die der
+    `quant_method` -- wer nur `layer.quant_method` fragt, bekommt deshalb
+    IMMER False.
+
+    Genau daran starb fnFL2w59 (PP2 nach 7,3 s, "The size of tensor a
+    (2560) must match the size of tensor b (80)"): der Worker fragte
+    `layer.quant_method` und transponierte nicht, der Verbraucher fragte
+    `self.scheme` -- und sprang wegen
+    `SGLANG_LOAD_TRANSPOSE_IN_WORKER=1` trotzdem ueber seine eigene
+    Transposition. Niemand transponierte. Die Kette steht darum ab hier
+    an EINER Stelle, und beide Seiten rufen sie.
+    """
+    method = getattr(layer, "quant_method", None)
+    scheme = getattr(layer, "scheme", None)
+    if scheme is not None:
+        method = scheme
+    if type(method).__name__ == "KTEPWrapperMethod":
+        method = getattr(method, "gpu_method", method)
+    return method
+
+
 def ct_method_transposes(method) -> bool:
     """Transponiert DIESE Layer-Methode ihre Experten-Shards? (#68a)"""
     return type(method).__name__ in _CT_TRANSPOSING_METHODS
 
 
-def _transpose_done_in_worker() -> bool:
-    """Did the loader thread already transpose the expert shards? (#66)
+#: Die Quittung, die der Lade-Worker am FusedMoE-Modul hinterlaesst, wenn er
+#: dessen Experten-Shards schon transponiert hat (#68e).
+CT_WORKER_TRANSPOSED_ATTR = "_ct_worker_transposed"
 
-    The same env the model's ``weight_post_load`` reads -- one switch, two
-    readers, so the work happens exactly once. Off by default, which makes
-    this path byte-identical to before.
+
+def transpose_done_in_worker(layer) -> bool:
+    """Hat der Lade-Worker die Shards DIESES Layers schon transponiert? (#68e)
+
+    Hier stand `os.environ["SGLANG_LOAD_TRANSPOSE_IN_WORKER"] == "1"` -- eine
+    Env fuer den ganzen Prozess. Die Asymmetrie war damit falsch herum: sagte
+    der Worker fuer einen Tensor NEIN (Layer nicht aufloesbar, Methode nicht
+    in der Liste), sprang der Verbraucher trotzdem ueber seine eigene
+    Transposition, weil die Env ja an war. Niemand transponierte, und der
+    Boot starb an "The size of tensor a (2560) must match the size of tensor
+    b (80)" (fnFL2v87, fnFL2w59).
+
+    Die Quittung steht darum am LAYER und wird vom Worker gesetzt, wenn er
+    wirklich transponiert hat. Fehlt sie, transponiert der Verbraucher selbst
+    -- langsamer, nie falsch. Das ist die Asymmetrie, die ein solcher
+    Schalter haben muss.
     """
-    import os as _os
-
-    return _os.environ.get("SGLANG_LOAD_TRANSPOSE_IN_WORKER") == "1"
+    return bool(getattr(layer, CT_WORKER_TRANSPOSED_ATTR, False))
 
 
 class FusedMoE(torch.nn.Module):
@@ -1982,11 +2022,10 @@ class FusedMoE(torch.nn.Module):
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
-        method = self.quant_method
-        if hasattr(self, "scheme"):
-            method = self.scheme
-        if method.__class__.__name__ == "KTEPWrapperMethod":
-            method = method.gpu_method
+        # #68d: DIESELBE Kette, die der Worker fragt -- eine Funktion, zwei
+        # Leser. Vorher stand sie hier als drei Zeilen und beim Worker als
+        # `layer.quant_method`, und die beiden waren nie dasselbe Objekt.
+        method = ct_effective_method(self)
 
         # For flashinfer TRT-LLM BF16 path, process_weights_after_loading reshapes
         # expert weights into block layout. During weight update, we must restore
@@ -2027,7 +2066,7 @@ class FusedMoE(torch.nn.Module):
         # per-tensor marker: a marker can get lost between the two, a switch
         # cannot.
         _needs_ct_transpose = ct_method_transposes(method)
-        if _needs_ct_transpose and _transpose_done_in_worker():
+        if _needs_ct_transpose and transpose_done_in_worker(self):
             _needs_ct_transpose = False
         # #68: `.t()` OHNE `.contiguous()` -- EINE KOPIE STATT ZWEI.
         #
@@ -2279,9 +2318,7 @@ class FusedMoE(torch.nn.Module):
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO: check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
-        method = self.quant_method
-        if hasattr(self, "scheme"):
-            method = self.scheme
+        method = ct_effective_method(self)
         if isinstance(method, Fp8MoEMethod) and (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             or get_moe_runner_backend().is_flashinfer_trtllm()
@@ -2292,6 +2329,10 @@ class FusedMoE(torch.nn.Module):
             )
 
             clear_mxfp8_shuffle_index_cache()
+        # #68e: auch dieser Einstieg darf nicht doppelt transponieren. Die
+        # Namensliste bleibt die engere des fused-Pfades -- nur die Quittung
+        # des Lade-Workers kommt dazu, damit die Arbeit hier genau einmal
+        # passiert, egal welcher Einstieg den Tensor bringt.
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
@@ -2302,6 +2343,7 @@ class FusedMoE(torch.nn.Module):
                 ]
             )
             and "zero" not in weight_name
+            and not transpose_done_in_worker(self)
             else loaded_weight
         )
 

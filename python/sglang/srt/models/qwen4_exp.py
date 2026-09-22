@@ -2257,6 +2257,15 @@ _CT_EXPERT_SUFFIXES = (
 )
 
 
+def _ct_expert_layer_to_transpose(name: str, model):
+    """Das FusedMoE-Modul, dessen Shards dieser Worker transponieren darf --
+    oder None. Traegt die Entscheidung UND ihren Adressaten, damit die
+    Quittung (#68e) genau dort landet, wo der Verbraucher sie liest."""
+    if not _is_ct_wna16_expert_shard(name, model):
+        return None
+    return _expert_layer_for_name(name, model)
+
+
 def _is_ct_wna16_expert_shard(name: str, model) -> bool:
     """Is this checkpoint tensor one the WNA16 MoE path would transpose?
 
@@ -2286,13 +2295,19 @@ def _is_ct_wna16_expert_shard(name: str, model) -> bool:
     # Geschwindigkeit (der Verbraucher transponiert selbst), nie
     # Korrektheit -- die Asymmetrie, die ein solcher Schalter haben muss.
     from sglang.srt.layers.moe.fused_moe_triton.layer import (
+        ct_effective_method,
         ct_method_transposes,
     )
 
     layer = _expert_layer_for_name(name, model)
     if layer is None:
         return False
-    return ct_method_transposes(getattr(layer, "quant_method", None))
+    # #68d: `ct_effective_method` statt `layer.quant_method`. Die Namen in
+    # `_CT_TRANSPOSING_METHODS` sind Schema-Namen; `quant_method` allein
+    # traf nie einen davon, also transponierte der Worker NIE -- und der
+    # Verbraucher sprang wegen der Env trotzdem ueber seine eigene
+    # Transposition (fnFL2w59, "2560 vs 80").
+    return ct_method_transposes(ct_effective_method(layer))
 
 
 def _expert_layer_for_name(name: str, model):
@@ -2445,8 +2460,22 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # DEFAULT BLEIBT AUS (`SGLANG_LOAD_TRANSPOSE_IN_WORKER` ungesetzt),
         # und der Verbraucher ueberspringt seinen eigenen Transpose unter
         # DERSELBEN Env -- die Arbeit passiert genau einmal.
-        if not _is_ct_wna16_expert_shard(name, self):
+        layer = _ct_expert_layer_to_transpose(name, self)
+        if layer is None:
             return tensor
+        # #68e DIE QUITTUNG STEHT AM LAYER, NICHT AN EINER ENV.
+        #
+        # Der Verbraucher ueberspringt seine eigene Transposition nur noch
+        # fuer Layer, die HIER wirklich transponiert wurden. Sagt dieser
+        # Worker fuer einen Tensor nein -- Layer nicht aufloesbar, Methode
+        # nicht in der Liste -- dann transponiert der Verbraucher selbst.
+        # Vorher las er eine prozessweite Env und uebersprang auch dann:
+        # niemand transponierte, und der Boot starb an "2560 vs 80".
+        from sglang.srt.layers.moe.fused_moe_triton.layer import (
+            CT_WORKER_TRANSPOSED_ATTR,
+        )
+
+        setattr(layer, CT_WORKER_TRANSPOSED_ATTR, True)
         return tensor.t()
 
     def weight_name_needed(self, name: str):

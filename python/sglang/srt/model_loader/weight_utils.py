@@ -1425,29 +1425,27 @@ def pread_safetensors_file(st_file: str, should_load=None, post_load=None) -> di
             st_file, base, order, should_load, _kw, post_load=post_load
         )
 
+    # #68c DER SERIELLE ZWEIG MUSS `post_load` GENAUSO ANWENDEN.
+    #
+    # Der Aufrufer (`_load_file`) ueberspringt seit #68b seine eigene
+    # `post_load`-Schleife fuer JEDEN pread-Pfad -- er verlaesst sich
+    # darauf, dass diese Funktion fertige Tensoren zurueckgibt. Der
+    # parallele Zweig oben tat das, dieser hier nicht: ohne
+    # SGLANG_LOAD_KEY_WORKERS>1 kam jeder Experten-Shard UNTRANSPONIERT
+    # beim Gewichtslader an, und der starb an
+    # "The size of tensor a (2560) must match the size of tensor b (80)"
+    # (fnFL2w59, PP2 nach 7,3 s). Das Lesen selbst steht darum nur noch
+    # EINMAL im Modul, in `_pread_one_key`, und `post_load` steht in
+    # beiden Zweigen unmittelbar daneben.
     fd = os.open(st_file, os.O_RDONLY)
     try:
         for name, info in order:
-            verdict = True if should_load is None else should_load(name)
-            if not verdict:
+            t = _pread_one_key(fd, base, name, info, should_load)
+            if t is None:
                 continue
-            dtype = _SAFETENSORS_DTYPES[info["dtype"]]
-            shape = tuple(int(x) for x in info["shape"])
-            if verdict == "meta":
-                result[name] = torch.empty(shape, dtype=dtype, device="meta")
-                continue
-            off0, off1 = info["data_offsets"]
-            nbytes = int(off1) - int(off0)
-            buf = torch.empty(nbytes, dtype=torch.uint8)
-            if nbytes:
-                view = memoryview(buf.numpy())
-                pos = 0
-                while pos < nbytes:
-                    n = os.preadv(fd, [view[pos : pos + _PREAD_CHUNK]], base + off0 + pos)
-                    if n <= 0:
-                        raise IOError(f"short read in {st_file} at {base + off0 + pos}")
-                    pos += n
-            result[name] = buf.view(dtype).reshape(shape) if nbytes else torch.empty(shape, dtype=dtype)
+            if post_load is not None:
+                t = post_load(name, t)
+            result[name] = t
     finally:
         os.close(fd)
     return result

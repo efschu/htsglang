@@ -142,3 +142,48 @@ def test_68b_kein_doppeltes_post_load_im_pread_pfad():
         "der pread-Pfad faellt in die serielle Schleife durch -- post_load "
         "liefe zweimal und das Modell laedt still falsch"
     )
+
+
+def test_68c_serieller_zweig_wendet_post_load_an(monkeypatch):
+    """w59-Wurzel: `_load_file` ueberspringt seit #68b seine eigene
+    post_load-Schleife fuer JEDEN pread-Pfad. Der serielle Zweig wandte
+    post_load aber nicht an -- ohne SGLANG_LOAD_KEY_WORKERS>1 kam jeder
+    Experten-Shard untransponiert beim Lader an (PP2 starb nach 7,3 s an
+    'size of tensor a (2560) must match the size of tensor b (80)')."""
+    p, erwartet = _fixture(n=9)
+    monkeypatch.delenv("SGLANG_LOAD_KEY_WORKERS", raising=False)
+    d = wu.pread_safetensors_file(p, post_load=lambda n, t: t * 2)
+    assert set(d) == set(erwartet)
+    for k in erwartet:
+        assert torch.equal(d[k], erwartet[k] * 2), (
+            f"{k} kam UNVERAENDERT zurueck -- post_load lief im seriellen "
+            f"Zweig nicht"
+        )
+
+
+def test_68c_genau_einmal_je_tensor_in_BEIDEN_zweigen(monkeypatch):
+    """Die Zaehlprobe ueber den ECHTEN Verbraucherpfad (`_load_file` im
+    buffered iterator): jeder Tensor sieht post_load genau einmal -- egal
+    ob der serielle oder der parallele Zweig liest. Zweimal waere ein
+    stilles Falschladen, keinmal der w59-Tod."""
+    p, erwartet = _fixture(n=11)
+    for kw in (None, "4"):
+        if kw is None:
+            monkeypatch.delenv("SGLANG_LOAD_KEY_WORKERS", raising=False)
+        else:
+            monkeypatch.setenv("SGLANG_LOAD_KEY_WORKERS", kw)
+        zaehler = {}
+
+        def _pl(name, t):
+            zaehler[name] = zaehler.get(name, 0) + 1
+            return t * 2
+
+        gesehen = dict(
+            wu.buffered_multi_thread_safetensors_weights_iterator(
+                [p], max_workers=2, pread=True, post_load=_pl
+            )
+        )
+        assert set(gesehen) == set(erwartet), kw
+        for k in erwartet:
+            assert zaehler[k] == 1, f"kw={kw}: {k} sah post_load {zaehler[k]}x"
+            assert torch.equal(gesehen[k], erwartet[k] * 2), f"kw={kw}: {k}"
