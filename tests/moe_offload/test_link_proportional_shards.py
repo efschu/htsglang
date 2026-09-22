@@ -384,7 +384,16 @@ def test_the_pinned_pad_expert_is_resident_and_can_never_be_delegated():
                 r, 3, HostShardRatio(_norm(MEASURED), "test", "")
             ),
         )
-        assert plan.resident_ids[0] == E - 1
+        # #134: die Residenz ist SORTIERT (ein Experten-Band muss ein
+        # konsekutiver Slot-Bereich sein, sonst laesst es sich nicht als EIN
+        # Tensor benennen und der Flip kann es weder taggen noch am Stueck
+        # transportieren). Der Pad-Experte steht damit an seiner sortierten
+        # Stelle statt in Slot 0 -- was dieser Test wirklich sichert, steht
+        # im Docstring und haengt an der ID, nicht an der Position: kein
+        # Produktionspfad liest `resident_ids[0]`, die Pin-Information reist
+        # als Id-Menge (`_moe_offload_pinned_experts`).
+        assert E - 1 in plan.resident_ids
+        assert list(plan.resident_ids) == sorted(plan.resident_ids)
         assert E - 1 not in plan.spill_ids
         assert E - 1 not in plan.delegated_ids
 

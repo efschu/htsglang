@@ -1433,6 +1433,15 @@ class ExpertStagingPlan:
     ``spill_ids[j]`` is the expert at pinned-pool row ``j``. Tuples, so the
     plan is hashable, comparable and printable in a test.
 
+    ``resident_ids`` IS SORTED (#134), and that is a contract, not an
+    accident: an expert band (the global ids ``[b*S, (b+1)*S)``) must fall on
+    a CONSECUTIVE slot range, or it cannot be published as one named tensor
+    and the flip can neither tag it nor move it in one piece
+    (``expert_band_slot_ranges`` relies on it and refuses if it is broken).
+    The slot ORDER is free -- every consumer reads it from this very list --
+    but a pinned expert is therefore at its sorted position, not at slot 0;
+    the pin travels as an ID SET (``pinned_ids``), never as a position.
+
     ``pinned_experts`` (see ``plan_load_time_staging``) is why the layout is
     carried explicitly instead of being the implicit static ``[0, R)``.
 
@@ -1533,7 +1542,17 @@ def plan_load_time_staging(
         )
     pinned_set = set(pinned)
     rest = [e for e in range(E) if e not in pinned_set]
-    resident_ids = pinned + rest[: R - len(pinned)]
+    # #134: SORTIERT, und das ist keine Kosmetik.  ``resident_ids[i]`` ist der
+    # Experte in GPU-Slot i; solange die Liste ``pinned + rest`` ist, liegen
+    # die Ids eines EXPERTEN-BANDES ([b*S, (b+1)*S)) verstreut ueber den
+    # Buffer, und ein Band laesst sich dann nicht als EIN Tensor benennen --
+    # der Flip koennte es weder taggen noch am Stueck transportieren.
+    # Sortiert ist jedes Band per Konstruktion ein KONSEKUTIVER Slot-Bereich
+    # (``expert_band_slot_ranges`` unten verlaesst sich darauf und prueft es).
+    # Die Slot-Reihenfolge ist frei: jeder Konsument liest sie aus DIESER
+    # Liste (``_moe_offload_frozen_layout``, ``MoEExpertOffloadCache``), keiner
+    # rechnet sie nach.
+    resident_ids = sorted(pinned + rest[: R - len(pinned)])
     resident_set = set(resident_ids)
     spill_ids = [e for e in range(E) if e not in resident_set]
     C = scratch_slot_count(R, E)
@@ -5532,6 +5551,81 @@ def _fill_experts_from_store(store, dst, s_dir, s_key, attr, s_lo, E, s_pad):
     return len(gefuellt), int(E) - len(gefuellt)
 
 
+def expert_band_slot_ranges(resident_ids) -> "list":
+    """Je Experten-Band der GPU-Slot-Bereich ``[s0, s1)``, den es belegt (#134).
+
+    ``resident_ids`` ist SORTIERT (``plan_load_time_staging``), also faellt
+    jedes Band -- die globalen Ids ``[b*S, (b+1)*S)`` -- auf einen
+    KONSEKUTIVEN Slot-Bereich.  Genau das macht ein Band benennbar: ein
+    Tensor, ein Tag, ein Transport-Stueck.
+
+    Leere Baender kommen NICHT in die Liste: dieser Rang haelt von ihnen
+    nichts auf der Karte (alles kalt, oder es gehoert gar nicht zu seinem
+    Experten-Band).  Ein leerer Eintrag waere ein 0-Byte-Tensor, den
+    ``build_plan`` als Parameter ohne Deskriptor sieht -- W74.
+
+    Gibt ``[]`` zurueck, wenn die Bandteilung aus ist.  REFUSED (ValueError)
+    statt geraten, wenn die Ids nicht sortiert ankommen: dann waere der
+    Bereich falsch, die Bytes gingen unter dem falschen Tag auf die Reise,
+    und der Fehler zeigte sich erst als falsch rechnendes Modell.
+    """
+    from sglang.srt.managers.weg2_memory_saver import expert_band_geometry
+
+    size, count = expert_band_geometry()
+    if size <= 0:
+        return []
+    ids = list(resident_ids)
+    if any(ids[i] > ids[i + 1] for i in range(len(ids) - 1)):
+        raise ValueError(
+            "#134: resident_ids ist nicht sortiert, ein Experten-Band waere "
+            "damit kein konsekutiver Slot-Bereich. plan_load_time_staging "
+            "sortiert; wer hier unsortiert ankommt, hat die Liste nach dem "
+            "Plan umgestellt."
+        )
+    import bisect
+
+    out = []
+    for b in range(count):
+        lo, hi = b * size, (b + 1) * size
+        s0 = bisect.bisect_left(ids, lo)
+        s1 = bisect.bisect_left(ids, hi)
+        if s1 > s0:
+            out.append((b, s0, s1))
+    return out
+
+
+def publish_expert_bands(layer, attr: str, buf, resident_ids) -> int:
+    """Die karten-residenten Experten als BENANNTE Baender am Modul (#134).
+
+    WARUM DAS NOETIG IST, gemessen an fnFL2w62: ``WEG2-XCHG-COVER tag=weights_1
+    planned_mib=226.4`` fuer DREI Layer -- die Experten eines einzigen Layers
+    sind ein Vielfaches davon.  Der Austausch baut sein Inventar aus
+    ``named_parameters()``/``named_buffers()``/``vars(module)``
+    (``weight_exchange.walk_live_tensors``), und der Presplit ersetzt den
+    Experten-Parameter durch einen 0-Zeilen-Platzhalter und legt die echten
+    Bytes in ein DICT (``layer._moe_offload_presplit``).  Der Walk sagt seine
+    Grenze selbst: "a tensor reachable only through a container attribute (a
+    list, a dict ...) is not found".  Der Flip transportierte damit Dense und
+    Attention und NULL Experten-Bytes.
+
+    Ein Band wird als VIEW auf den Slot-Buffer veroeffentlicht, nicht als
+    Kopie: es sind dieselben Bytes, der Austausch braucht Zeiger und Laenge,
+    und eine Kopie waere ein zweites Mal Karte fuer nichts.  Der Name traegt
+    den Band-Index (``expert_band_attr_name``), aus dem
+    ``tag_of_parameter_name`` denselben Tag ableitet, den der Allokationspfad
+    gesetzt hat.
+
+    Gibt die Zahl der veroeffentlichten Baender zurueck (0 = Teilung aus).
+    """
+    from sglang.srt.managers.weg2_memory_saver import expert_band_attr_name
+
+    n = 0
+    for band, s0, s1 in expert_band_slot_ranges(resident_ids):
+        setattr(layer, expert_band_attr_name(band, attr), buf[s0:s1])
+        n += 1
+    return n
+
+
 def presplit_expert_offload_after_repack(
     layer, cold_shard: Optional[ColdShardContext] = None
 ) -> None:  # pragma: no cover - CUDA
@@ -5720,6 +5814,15 @@ def presplit_expert_offload_after_repack(
                     )
                 )
         presplit[attr] = (buf, spill)
+        # #134: die residenten Experten dem Flip ZEIGEN. Ohne das sieht der
+        # Austausch nur den 0-Zeilen-Platzhalter, den wir unten setzen.
+        _bands = publish_expert_bands(layer, attr, buf, plan.resident_ids)
+        if _bands:
+            logger.info(
+                "#134 EXPERTEN-BAENDER layer=%s attr=%s: %d Baender ueber "
+                "%d residente Slots veroeffentlicht (der Flip sieht sie jetzt)",
+                getattr(layer, "layer_id", "?"), attr, _bands, R,
+            )
         if store_rows is not None:
             torch.cuda.empty_cache()  # give the sizer the device bytes back (fn8m)
         # #119: tally the VRAM this tensor stops holding, so the KV-pool sizing

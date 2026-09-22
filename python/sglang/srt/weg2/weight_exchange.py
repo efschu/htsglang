@@ -84,8 +84,10 @@ from sglang.srt.distributed.utils import partition_sizes
 from sglang.srt.managers.weg2_memory_saver import (
     Weg2XchgCoverageRefused,
     chunk_of_band_tag,
+    expert_band_from_param_name,
     is_weights_family_tag,
     layer_id_from_module_name,
+    weight_band_tag,
     weight_chunk_tag,
 )
 
@@ -3307,6 +3309,18 @@ def tag_of_parameter_name(
     layer_id = layer_id_from_module_name(name)
     if layer_id is None:
         return GPU_MEMORY_TYPE_WEIGHTS
+    # #134: ein Experten-Band traegt seinen Index IM NAMEN
+    # (``weg2_eband<b>_<attr>``, geschrieben von genau einer Stelle:
+    # ``expert_band_attr_name``).  Der Name ist hier die einzige verfuegbare
+    # Quelle -- die Allokation kennt der Walk nicht -- und er muss denselben
+    # Tag ergeben wie der Allokationspfad, der ``weight_chunk_tag(layer,
+    # expert_id)`` gefragt hat.  Beide rechnen deshalb in
+    # ``weight_chunk_tag``, nur mit verschiedenen Eingaengen fuer dieselbe
+    # Bandzugehoerigkeit.  Ohne Bandteilung liefert ``weight_band_tag`` den
+    # Chunk-Tag, also aendert ein Name mit Marker dann ebenfalls nichts.
+    band = expert_band_from_param_name(name)
+    if band is not None:
+        return weight_band_tag(layer_id, band) or GPU_MEMORY_TYPE_WEIGHTS
     return weight_chunk_tag(layer_id) or GPU_MEMORY_TYPE_WEIGHTS
 
 

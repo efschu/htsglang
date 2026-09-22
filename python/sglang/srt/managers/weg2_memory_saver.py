@@ -2373,6 +2373,19 @@ def expert_band_count() -> int:
     return expert_band_geometry()[1]
 
 
+def weight_band_tag(layer_id: int, band: int) -> Optional[str]:
+    """Der Tag eines Bandes ueber seinen INDEX statt ueber eine Experten-Id.
+
+    Der Austausch kennt aus dem Namen den Index, der Allokationspfad kennt die
+    Id -- beide muessen denselben Tag bekommen, also rechnet nur EINE Stelle
+    (``weight_chunk_tag``) und diese hier setzt bloss eine Id ihres Bandes ein.
+    """
+    size = expert_band_size()
+    if size <= 0:
+        return weight_chunk_tag(layer_id)
+    return weight_chunk_tag(layer_id, int(band) * size)
+
+
 def weight_chunk_tag(layer_id: int, expert_id: Optional[int] = None
                      ) -> Optional[str]:
     """Der Tag eines Layers -- oder eines EXPERTEN-BANDES darin (#134).
@@ -2665,6 +2678,31 @@ def is_weights_family_tag(tag: Any) -> bool:
         or is_weights_chunk_tag(tag)
         or (tag == GPU_MEMORY_TYPE_WEIGHTS_DRAFT and draft_tag_in_family())
     )
+
+
+#: #134: DER NAME, unter dem ein Experten-Band am MoE-Modul haengt.
+#: Der Austausch leitet den Tag eines Tensors aus seinem NAMEN ab
+#: (``weight_exchange.tag_of_parameter_name``), waehrend die Allokation ihn
+#: aus ``weight_chunk_scope`` bekommt -- beide muessen dasselbe sagen.  Ein
+#: Band traegt deshalb seinen Index IM NAMEN, und der Bildner unten ist die
+#: einzige Stelle, die ihn schreibt, wie der Leser darunter die einzige ist,
+#: die ihn liest.  Zwei Seiten einer Naht, EINE Funktion je Richtung
+#: (Memory ``zwei-seiten-einer-naht-fragen-dasselbe``).
+EXPERT_BAND_ATTR_PREFIX = "weg2_eband"
+_EXPERT_BAND_IN_NAME = re.compile(
+    r"(?:^|\.)" + re.escape(EXPERT_BAND_ATTR_PREFIX) + r"(\d+)_"
+)
+
+
+def expert_band_attr_name(band: int, attr: str) -> str:
+    """Wie ein Experten-Band am Modul heisst (#134)."""
+    return f"{EXPERT_BAND_ATTR_PREFIX}{int(band)}_{attr}"
+
+
+def expert_band_from_param_name(name: str) -> Optional[int]:
+    """Der Band-Index aus einem Tensornamen, oder None (#134)."""
+    m = _EXPERT_BAND_IN_NAME.search(name or "")
+    return int(m.group(1)) if m else None
 
 
 def layer_id_from_module_name(name: str) -> Optional[int]:
