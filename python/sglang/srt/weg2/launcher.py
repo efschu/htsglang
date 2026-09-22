@@ -12395,7 +12395,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # `prepare_weight_exchange` (200 lines down) is the same named refusal
         # with the same text, only sooner; the richer W71 of an UNFUNDABLE peak
         # still comes from that gate, which is the only place that solves one.
-        xchg_form_dormant_reserve(cards, ns.weg2_xchg_census, log=log)
+        _xr, _ = xchg_form_dormant_reserve(cards, ns.weg2_xchg_census, log=log)
+        # Die Census-Messung ersetzt die Konstante auch im BUDGET von P
+        # (`budgets_from_dc` zieht dc_expect_d ab) und im W19-Riegel -- EINE
+        # Zahl je Karte, nicht Messung im Log und Konstante in der Rechnung.
+        for c in cards:
+            if c.uuid in _xr:
+                dc_expect_d[c.uuid] = int(_xr[c.uuid]) + slack_mib
+        state.dc_expect_d = dc_expect_d
+        log("dormant residue RESERVE for group D (census-korrigiert): "
+            + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}"
+                        for c in cards))
     # #1257c: the operator's external headroom, resolved ONCE per boot and
     # keyed by CARD UUID -- never by NVML index, which is not stable across
     # boots on this rig. Everything downstream (both budget solves, the
@@ -14076,16 +14086,26 @@ def xchg_form_dormant_reserve(
                 "it cannot be priced and the serving constants must not stand "
                 "in -- they contain none of the exchange lane's residency"
             )
-        # THE ONE SELECTOR, never a second copy of the triple: this is the
-        # number W19 grades against, read where every other consumer reads it.
-        out[c.uuid] = dc_measured_d_mib(c, WEIGHT_SOURCE_EXCHANGE)
+        # PLATZTAUSCH / Nutzer 22.09. ("diesen wert nicht doppelt oder gar
+        # nicht nehmen"): die Census DIESES Modells IST die Messung. Die
+        # Konstante weg2xsn14 (2588/3084/2588) ist ein 27B-Wert, dessen ganzer
+        # Ueberschuss der residente DFlash2-Draft war -- seit B4k schlaeft der
+        # Draft mit (w132: weights_draft in pause_order). Unter Next Flash kostete
+        # sie P 1203 MiB auf der 5090 und 1114-1512 MiB je 3080. Die Konstante
+        # bleibt nur, wo keine Census-Zeile existiert.
+        _measured = int(getattr(entry, "dormant_proc_used_mib", 0) or 0)
+        if _measured > 0:
+            out[c.uuid] = _measured
+            _src = f"census:{entry.dormant_source[:60]}"
+        else:
+            out[c.uuid] = dc_measured_d_mib(c, WEIGHT_SOURCE_EXCHANGE)
+            _src = "measured:weg2xsn14 (27B-Konstante, keine Census-Zeile)"
         lines.append(
             f"WEG2-XCHG-RESERVE nvml{c.nvml_index} {c.name} "
-            f"reserved_mib={out[c.uuid]} source=measured:weg2xsn14 "
-            f"measured_mib={int(entry.dormant_proc_used_mib)} "
+            f"reserved_mib={out[c.uuid]} source={_src} "
+            f"measured_mib={_measured} "
             f"instrument=WEG2-DC-at-sleep "
-            f"delta_mib={out[c.uuid] - int(entry.dormant_proc_used_mib)} "
-            f"delta_is=resident-weights_draft-tag-until-B4k "
+            f"constant_27b_mib={dc_measured_d_mib(c, WEIGHT_SOURCE_EXCHANGE)} "
             f"census_source={entry.dormant_source[:120]}"
         )
     if log is not None:
