@@ -54,6 +54,45 @@ logger = logging.getLogger(__name__)
 __all__ = ["register", "dump", "install_sigusr1_handler"]
 
 #: Weak refs, so a dead transport cannot keep itself alive for a diagnostic.
+#: #110: DER SAMPLER SCHWEIGT WAEHREND DES LADENS.
+#:
+#: fnFL2w53, D-TP0 und D-TP1 gleichzeitig:
+#:
+#:     Current thread 0x00007e2927fe6000 (most recent call first):
+#:       File ".../barlink_launch_dump.py", line 221 in _run
+#:     Fatal Python error: Segmentation fault
+#:
+#: waehrend der MainThread in ``gptq_marlin_moe_repack`` stand. Der Sampler
+#: liest in ``_describe`` Transport-Felder und den gepinnten
+#: ``_round_mirror``; der Repack baut in derselben Zeit den Allocator um
+#: (TMS-Mappings, private Pools), und ein ``except Exception`` faengt
+#: keinen Segfault -- der Prozess ist weg, bevor irgendein Riegel greift.
+#:
+#: GENAU DIE FAMILIE, die #1330 fuer den Abort-Poll geloest hat ("NEVER READ
+#: A CONTROL WORD WHOSE BACKING THE PHASE MAY HAVE TAKEN"). Dort ist der
+#: Riegel eine ``data_ptr()==0``-Probe; hier reicht sie nicht, weil ein
+#: freigegebener pinned Host-Puffer seinen Zeiger BEHAELT. Darum das
+#: groebere, sichere Mittel: waehrend ``load_model`` sampelt niemand. Der
+#: Sampler ist fuer die LAUFZEIT gebaut ("launch record"), und in der
+#: Ladephase gibt es keinen Launch zu beobachten.
+_LOADING = False
+
+
+def enter_load_phase() -> None:
+    """Der Sampler haelt still, bis :func:`leave_load_phase` gerufen wird."""
+    global _LOADING
+    _LOADING = True
+
+
+def leave_load_phase() -> None:
+    global _LOADING
+    _LOADING = False
+
+
+def sampling_suspended() -> bool:
+    return bool(_LOADING)
+
+
 _TRANSPORTS: "List[weakref.ref]" = []
 _LOCK = threading.Lock()
 _INSTALLED = False
@@ -213,6 +252,9 @@ def start_sampler(rank: int, interval: float = 1.0) -> bool:
 
             while True:
                 try:
+                    if sampling_suspended():
+                        time.sleep(interval)
+                        continue
                     with _LOCK:
                         refs = list(_TRANSPORTS)
                     live = [r() for r in refs]

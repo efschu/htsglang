@@ -43,11 +43,18 @@ def _unsupported_kernel(*args, **kwargs):
 gptq_gemm = _unsupported_kernel
 gptq_marlin_repack = _unsupported_kernel
 gptq_shuffle = _unsupported_kernel
+#: #111: derselbe Fallback wie fuer die Kernel daneben. Ohne ihn waere ein
+#: fehlgeschlagener Import ein NameError IN der Schleife statt der sauberen
+#: Plattform-Meldung -- ein Fehler im Fehlerpfad, die Klasse aus #99.
+_jit_gptq_marlin_repack_module = _unsupported_kernel
 
 try:
     from sgl_kernel import gptq_gemm, gptq_shuffle
 
-    from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+    from sglang.jit_kernel.gptq_marlin_repack import (
+        _jit_gptq_marlin_repack_module,
+        gptq_marlin_repack,
+    )
 except Exception:
     pass
 
@@ -77,8 +84,38 @@ def gptq_marlin_moe_repack(
         device=b_q_weight.device,
         dtype=b_q_weight.dtype,
     )
+    # #111 LADEZEIT: VIER OPERATIONEN JE EXPERTE WAREN EINE ZUVIEL -- DREI.
+    #
+    # Diese Schleife ist die Stelle, an der py-spy den MainThread jedes
+    # ladenden Rangs antrifft (fnFL2w53, `gptq_kernels.py:81`), und sie lief
+    # je Experte durch den WRAPPER `gptq_marlin_repack`:
+    #
+    #     out = torch.empty(...)                  # Allokation
+    #     module = _jit_gptq_marlin_repack_module()  # JIT-Modul-Lookup
+    #     module.gptq_marlin_repack(..., out, ...)   # der Kernel
+    #     return out            -> output[e] = out   # und eine KOPIE
+    #
+    # Bei 512 Experten, 48 Layern und zwei Expertentensoren sind das rund
+    # 49 000 Durchlaeufe JE RANG -- mit 49 000 Allokationen, 49 000
+    # Modul-Lookups und 49 000 vermeidbaren Kopien. Die Karte wartet
+    # zwischen diesen winzigen Kerneln; das Tempo setzt der Python-Pfad.
+    #
+    # Der Kernel nimmt sein Ziel als ARGUMENT (`out` ist der dritte
+    # Parameter). Also schreibt er direkt in `output[e]`: Modul einmal
+    # holen, kein Zwischenpuffer, keine Kopie. Die BYTES sind per
+    # Konstruktion dieselben -- derselbe Kernel, dieselben Argumente, nur
+    # ohne den Umweg -- und `test_repack_bitidentisch` prueft genau das
+    # gegen die alte Form.
+    #
+    # NICHT gebatcht ueber die Expertenachse: `perm` ist je Experte
+    # verschieden, der Kernel ist 2D, und eine Kernel-Aenderung an dem
+    # Pfad, der die Gewichtsbytes schreibt, ist keine Ladezeit-Optimierung
+    # wert, solange diese hier ohne jedes Korrektheitsrisiko zu haben ist.
+    module = _jit_gptq_marlin_repack_module()
     for e in range(num_experts):
-        output[e] = gptq_marlin_repack(b_q_weight[e], perm[e], size_k, size_n, num_bits)
+        module.gptq_marlin_repack(
+            b_q_weight[e], perm[e], output[e], size_k, size_n, num_bits
+        )
     return output
 
 

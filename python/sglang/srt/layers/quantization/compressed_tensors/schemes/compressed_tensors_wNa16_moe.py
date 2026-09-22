@@ -424,22 +424,88 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 requires_grad=False,
             )
 
-        marlin_w13_qweight = gptq_marlin_moe_repack(
-            layer.w13_weight_packed,
-            layer.w13_g_idx_sort_indices,
-            layer.w13_weight_packed.shape[1] * self.packed_factor,
-            layer.w13_weight_packed.shape[2],
-            self.num_bits,
-        )
-        replace_tensor("w13_weight_packed", marlin_w13_qweight)
-        marlin_w2_qweight = gptq_marlin_moe_repack(
-            layer.w2_weight_packed,
-            layer.w2_g_idx_sort_indices,
-            layer.w2_weight_packed.shape[1] * self.packed_factor,
-            layer.w2_weight_packed.shape[2],
-            self.num_bits,
-        )
-        replace_tensor("w2_weight_packed", marlin_w2_qweight)
+        # #112 ERSTBOOT-ADOPTION: KEIN REPACK AUF PLATZHALTERN.
+        #
+        # WAS fnFL2w53 UND w54 GETOETET HAT, beide Male in dieser Zeile:
+        #
+        #     Current thread (D-TP0 und D-TP1 gleichzeitig):
+        #       gptq_marlin_repack.py:37   in gptq_marlin_repack
+        #       gptq_kernels.py:81         in gptq_marlin_moe_repack
+        #     Fatal Python error: Segmentation fault
+        #
+        # `--load-format dummy` ruft `initialize_dummy_weights`, und das
+        # fuellt JEDEN Parameter mit Zufall -- auch `w13_g_idx_sort_indices`
+        # und `w2_g_idx_sort_indices`, die der Marlin-Repack als INDIZES in
+        # die Gewichtszeilen benutzt. Zufaellige Indizes sind Zugriffe
+        # ausserhalb des Tensors; ein CUDA-Kernel quittiert das nicht mit
+        # einer Exception, sondern mit einem zerstoerten Kontext, und der
+        # naechste Zugriff faellt -- in w53 traf es den Sampler-Thread, in
+        # w54 den MainThread. EINE Ursache, zwei verschiedene Opfer; deshalb
+        # sah w53 aus wie ein Instrumentenfehler und war keiner.
+        #
+        # UND ER IST UNTER ADOPTION AUCH SINNLOS: D uebernimmt von P Bytes,
+        # die BEREITS im Marlin-Layout liegen (P hat genau diesen Repack
+        # gerechnet, bevor es sie in den geteilten Store schrieb). Ein
+        # Repack der Zufallswerte wirft das Ergebnis ohnehin weg.
+        #
+        # Die STRUKTUR bleibt: `replace_tensor` setzt unten die
+        # marlin-geformten Puffer, damit Pool-Geometrie und Presplit
+        # identisch zum Plattenweg entstehen -- nur eben leer statt aus
+        # Zufall gerechnet.
+        try:
+            from sglang.srt.weg2 import adopt as _weg2_adopt
+
+            _platzhalter = _weg2_adopt.weights_are_placeholder()
+        except ImportError:
+            _platzhalter = False
+        if _platzhalter:
+            import logging as _lg
+
+            _lg.getLogger(__name__).info(
+                "#112 REPACK UEBERSPRUNGEN: dieser Rang haelt Platzhalter "
+                "(%s). Die g_idx-Sortierindizes sind Zufall und wuerden den "
+                "Marlin-Repack ausserhalb der Tensoren indizieren; die "
+                "echten Bytes kommen bereits marlin-geformt aus dem "
+                "geteilten Store (#109) bzw. ueber die Legs.",
+                _weg2_adopt.placeholder_reason() or "dummy-load",
+            )
+            _leer13 = torch.empty(
+                (
+                    layer.w13_weight_packed.shape[0],
+                    layer.w13_weight_packed.shape[1] * self.packed_factor // 16,
+                    layer.w13_weight_packed.shape[2] * (self.num_bits // 2),
+                ),
+                device=layer.w13_weight_packed.device,
+                dtype=layer.w13_weight_packed.dtype,
+            )
+            replace_tensor("w13_weight_packed", _leer13)
+            _leer2 = torch.empty(
+                (
+                    layer.w2_weight_packed.shape[0],
+                    layer.w2_weight_packed.shape[1] * self.packed_factor // 16,
+                    layer.w2_weight_packed.shape[2] * (self.num_bits // 2),
+                ),
+                device=layer.w2_weight_packed.device,
+                dtype=layer.w2_weight_packed.dtype,
+            )
+            replace_tensor("w2_weight_packed", _leer2)
+        else:
+            marlin_w13_qweight = gptq_marlin_moe_repack(
+                layer.w13_weight_packed,
+                layer.w13_g_idx_sort_indices,
+                layer.w13_weight_packed.shape[1] * self.packed_factor,
+                layer.w13_weight_packed.shape[2],
+                self.num_bits,
+            )
+            replace_tensor("w13_weight_packed", marlin_w13_qweight)
+            marlin_w2_qweight = gptq_marlin_moe_repack(
+                layer.w2_weight_packed,
+                layer.w2_g_idx_sort_indices,
+                layer.w2_weight_packed.shape[1] * self.packed_factor,
+                layer.w2_weight_packed.shape[2],
+                self.num_bits,
+            )
+            replace_tensor("w2_weight_packed", marlin_w2_qweight)
         # Repack scales
         marlin_w13_scales = marlin_moe_permute_scales(
             layer.w13_weight_scale,

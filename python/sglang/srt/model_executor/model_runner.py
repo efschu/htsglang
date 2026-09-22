@@ -2699,6 +2699,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         # Store-LESEPFAD (#109) laeuft nie. Zweite Instanz
                         # derselben Klasse an EINEM Tag -- die erste war der
                         # `--load-format`-Flag, der nie im argv ankam.
+                        # #110: der barlink-Launch-Sampler schweigt, solange
+                        # der Loader laeuft -- er las in w53 Transport-Felder,
+                        # waehrend der Marlin-Repack den Allocator umbaute, und
+                        # nahm zwei D-Raenge per Segfault mit.
+                        from sglang.srt.distributed.device_communicators import (
+                            barlink_launch_dump as _weg2_dump,
+                        )
+
+                        _weg2_dump.enter_load_phase()
                         from sglang.srt.weg2 import adopt as _weg2_adopt
 
                         if str(
@@ -2709,6 +2718,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             model_config=self.model_config,
                             device_config=DeviceConfig(self.device, self.gpu_id),
                         )
+                        _weg2_dump.leave_load_phase()
                 if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
                     self.remote_instance_transfer_engine_weight_info = (
                         self.loader.remote_instance_transfer_engine_weight_info
