@@ -5659,76 +5659,17 @@ class BarlinkBar1Transport:
                 "it; polling it would fault the context")
             return bool(self._abort_code_seen)
 
-        # #144: DER VORAB-TEST KANN DEN VERLUST NICHT SEHEN -- DER VERSUCH SCHON.
-        #
-        # #1330 nennt als die zu verhindernde Signatur woertlich:
-        #     self._abort_poll_dst.copy_(self._ctl_dev[0:1], non_blocking=True)
-        #     RuntimeError: unknown parameter type
-        #     Fatal Python error: Segmentation fault
-        # und prueft dagegen data_ptr()==0. Boot fnFL2w80 zeigt am Metall,
-        # dass dieser Test die Lage NICHT trifft: der Fehler kam GENAU so,
-        # waehrend der Guard passieren liess -- ein TMS-Release hinterlaesst
-        # hier keinen Nullzeiger, sondern eine Storage, deren Typ die Kopie
-        # nicht mehr aufloesen kann. Ein Vorab-Test auf eine Eigenschaft, die
-        # der Verlust nicht setzt, ist kein Riegel.
-        #
-        # Der Kommentar oben benennt den Verstaerker selbst: "'Log and
-        # continue' is the amplifier, not the safety net: a poll that failed
-        # once fails every round and each attempt re-poisons." Im w80-Log
-        # steht dieser Traceback ZWEIMAL hintereinander -- der Poll lief
-        # weiter. Also faengt der Versuch seine eigene Ausnahme und DISARMT
-        # beim ersten Fehlschlag, statt sie nach oben zu reichen und beim
-        # naechsten Durchlauf zu wiederholen.
-        try:
-            with torch.cuda.stream(self._abort_poll_stream):
-                self._abort_poll_dst.copy_(self._ctl_dev[0:1], non_blocking=True)
+        with torch.cuda.stream(self._abort_poll_stream):
+            self._abort_poll_dst.copy_(self._ctl_dev[0:1], non_blocking=True)
             # #622: stage the three round words (round, mesh watermark, a2a
             # watermark) alongside the abort word, on the same private
             # stream. This gives the SIGUSR1 launch dump a host-resident
             # mirror to print — the live monotonicity probe for the ack
             # barrier's capture-safety proof — without ever violating the
             # dump's no-device-sync constraint.
-            # #142: THE #1330 GUARD ABOVE SECURES `_ctl_dev` AND ONLY IT.
-            #
-            # `_round_dev` is a SEPARATE device buffer (allocated at the
-            # `torch.zeros(3, ...)` site, not a view into the control word),
-            # so a phase release or a failed TMS resume can unmap it while
-            # the control word is still perfectly mapped -- and then this
-            # copy_ faults inside the driver, in a POLL THREAD, with the main
-            # thread somewhere else entirely. Boots fnFL2w73 and w74 both
-            # died exactly that way: `Current thread` in the faulthandler was
-            # this poll, while the innocent main thread sat in the draft's
-            # marlin repack. The visible symptom was "rank died during draft
-            # load", which cost two boots' worth of capacity diagnosis on
-            # FR_P -- the wrong axis entirely.
-            #
-            # This is the #1330 defect class reproducing itself one buffer to
-            # the right: the guard was written for the reader that existed,
-            # and the #622 round mirror was added inside its `with` block
-            # afterwards without extending it. So the check moves to where
-            # the read is, per buffer, and it is the same non-CUDA check (a
-            # released TMS mapping leaves a null data pointer in the tensor's
-            # own metadata; a probe that can itself fault is no probe).
-            #
-            # NOT a disarm: the abort word is the safety-critical reader and
-            # it is still mapped. Losing the mirror costs the SIGUSR1 launch
-            # dump three diagnostic words until the next resume remaps them;
-            # disarming the abort poll over it would trade a diagnostic for
-            # the mechanism that stops a wedged collective.
-            if (
-                self._round_dev is not None
-                and self._round_mirror is not None
-                and self._round_dev.untyped_storage().data_ptr() != 0
-            ):
+            if self._round_dev is not None and self._round_mirror is not None:
                 n = min(3, self._round_dev.numel())
                 self._round_mirror[:n].copy_(self._round_dev[:n], non_blocking=True)
-        except Exception as exc:  # noqa: BLE001 -- ANY failure means the backing is gone
-            self._abort_poll_disarm(
-                f"the control-word copy raised ({type(exc).__name__}: {exc}) "
-                "-- the device backing is gone in a way data_ptr() cannot "
-                "show; disarming NOW rather than re-poisoning the context "
-                "each round (#1330's own amplifier, measured in fnFL2w80)")
-            return bool(self._abort_code_seen)
         # Waits for THIS copy on THIS stream only -- not for the model.
         self._abort_poll_stream.synchronize()
         code = int(self._abort_poll_dst[0])

@@ -707,23 +707,6 @@ class PeerWatchdog:
         """
         from sglang.srt.distributed.device_communicators import barlink_abort_gate
 
-        # #143: DER #1073-RIEGEL EXISTIERT -- DIESER WEG FRAGTE IHN NIE.
-        #
-        # `abort_poll_suspended()` wurde gebaut, damit der DEVICE-seitige
-        # Abort-Poll stillsteht, solange ein Rang im Loader haengt. Sein
-        # einziger Aufrufer stand in `probe_once`; dieser Pfad hier --
-        # poll_abort_words -> abort_gate.poll_status_words -> bar1.
-        # poll_status_word -> copy_ auf `_ctl_dev` -- lief daran vorbei.
-        #
-        # fnFL2w73/w74/w76 starben alle drei genau dort, waehrend der
-        # MainThread den Draft lud. Der #1330-Guard an diesem copy_ prueft
-        # data_ptr()!=0 und LIESS ES DURCH: w76 beweist am Metall, dass ein
-        # nicht-nulliger Datenzeiger kein lebendes Mapping beweist. Ein
-        # schaerferer Guard ist deshalb die falsche Richtung -- der Leser
-        # darf waehrend des Umbaus gar nicht laufen, und dafuer gibt es
-        # diesen Riegel bereits.
-        if self.abort_poll_suspended():
-            return False
         return barlink_abort_gate.poll_status_words()
 
     def abort_poll_suspended(self) -> bool:
