@@ -143,15 +143,18 @@ def test_ohne_adoption_schreibt_write_rows_wie_immer():
     assert store.sum().item() > 0
 
 
-def test_argv_d_bekommt_dummy_nur_unter_adoption(monkeypatch):
-    """Der Plattenboot darf von #108 nichts merken -- kein Flag, keine
-    Aenderung an D's Kommandozeile."""
-    from sglang.srt.weg2.launcher import _adopt_load_format_flag
+def test_argv_d_bekommt_dummy_nur_unter_adoption():
+    """ERSETZT die w52-Fassung, die GRUEN WAR und NICHTS BEWIES.
 
-    monkeypatch.delenv(adopt.ADOPT_ENV, raising=False)
-    assert _adopt_load_format_flag() == []
-    monkeypatch.setenv(adopt.ADOPT_ENV, "on")
-    assert _adopt_load_format_flag() == ["--load-format", "dummy"]
+    Sie setzte die Env und rief ``_adopt_load_format_flag()`` ohne
+    Argument -- genau der Aufruf, der im Launcher-Prozess immer ``[]``
+    liefert. Der Test gruen, das argv leer, D las von Platte. Jetzt geht
+    der Wert als PARAMETER hinein, und der Test prueft den Rueckgabewert.
+    """
+    from sglang.srt.weg2 import launcher as lx
+
+    assert lx._adopt_load_format_flag(True) == ["--load-format", "dummy"]
+    assert lx._adopt_load_format_flag(False) == []
 
 
 # --- Der TRIGGER: das Flip-Paar vor dem ersten Request ------------------
@@ -241,3 +244,56 @@ def test_unermittelbare_deckung_laesst_den_riegel_stehen():
     adopt.arm_placeholder()
     adopt.mark_adopted(0, 0)
     assert adopt.weights_are_placeholder() is True
+
+
+# --- DER TEST, DER IN w52 GEFEHLT HAT -------------------------------------
+#
+# 18 Tests waren gruen, und im argv des Boots stand `--load-format dummy`
+# NULL mal: sie banden den HELFER und die LOG-ZEILE, nie das argv. Der
+# Launcher schrieb "D startet mit --load-format dummy", waehrend D mit
+# `load_format='auto'` 288 Presplit-Layer von Platte las. Diese drei Tests
+# binden das ERGEBNIS: was argv_d zurueckgibt, und dass die Produktions-
+# Aufrufstelle die Entscheidung mitgibt statt sie raten zu lassen.
+
+
+def _argv_d_minimal(**kw):
+    from sglang.srt.weg2 import launcher as lx
+
+    return lx.argv_d(
+        "py", "/m", [1, 1, 1], 1, 1, lx.RING_FORM_SENTINEL_STORE_CFG, [], **kw
+    )
+
+
+def test_argv_d_traegt_dummy_wenn_adoption_armiert():
+    argv = _argv_d_minimal(d_adopt=True)
+    assert "--load-format" in argv
+    assert argv[argv.index("--load-format") + 1] == "dummy"
+
+
+def test_argv_d_traegt_KEIN_dummy_ohne_adoption():
+    assert "dummy" not in _argv_d_minimal(d_adopt=False)
+
+
+def test_argv_d_liest_keine_env(monkeypatch):
+    # w52s Wurzel in einem Satz: die Env des LAUNCHER-Prozesses ist nicht
+    # die der Kinder. Ein Helfer, der sie liest, gibt im Launcher immer [].
+    monkeypatch.setenv("SGLANG_WEG2_D_ADOPT", "on")
+    assert "dummy" not in _argv_d_minimal(d_adopt=False)
+    monkeypatch.delenv("SGLANG_WEG2_D_ADOPT", raising=False)
+    assert "dummy" in _argv_d_minimal(d_adopt=True)
+
+
+def test_die_produktions_aufrufstelle_gibt_die_entscheidung_mit():
+    import inspect
+
+    from sglang.srt.weg2 import launcher as lx
+
+    src = inspect.getsource(lx)
+    bauer = [z for z in src.split("\n") if "argv_d(py, ns.model" in z]
+    assert bauer, "keine Produktions-Aufrufstelle von argv_d gefunden"
+    for z in bauer:
+        assert "d_adopt=" in z, (
+            "eine argv_d-Aufrufstelle gibt d_adopt NICHT mit -- dann faellt "
+            "sie auf den Default False und der Flag verschwindet still: "
+            + z.strip()[:120]
+        )

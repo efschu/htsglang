@@ -389,9 +389,8 @@ SEAMS: Dict[str, Seam] = {
                 # dadurch zum Hintergrundrauschen, das echte Treffer
                 # verdeckt -- die Regel FILE:LINE-OHNE-SHA-KEINE-ADRESSE
                 # gilt auch fuer die eigene Registry.
-                ("weg2/launcher.py", 7901, "def _saturated"),
-                ("weg2/launcher.py", 7905,
-                 "Form A worker: not on this axis, not saturated"),
+                ("weg2/launcher.py", 8006, "def _saturated"),
+                ("weg2/launcher.py", 8010, "Form A worker: not on this axis, not saturated"),
             ),
         ),
         Seam(

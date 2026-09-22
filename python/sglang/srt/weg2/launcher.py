@@ -2900,6 +2900,7 @@ def argv_p(
     # constants, which is what every pre-Next-Flash arm shipped.
     spec_flags: Optional[Sequence[str]] = None,
 ) -> List[str]:
+    _refuse_if_extra_raises_budget(budgets, list(extra or ()), "P")
     # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
     # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
     # server_args hands to derive_pp_layer_split, which builds a CONTIGUOUS
@@ -3073,21 +3074,122 @@ def w38_armed_line(argv_of_p: Sequence[str]) -> str:
             "and D's own store read are untouched, and the drop lifts itself the moment a carrier "
             "exists (#968 PP0-authoritative materialisation is the named remedy)." % pp)
 
-def _adopt_load_format_flag() -> List[str]:
+def _refuse_if_extra_raises_budget(
+    budgets: List[int], extra: List[str], group: str
+) -> None:
+    """W100: ``--extra-*`` darf ein Kartenbudget SENKEN, nie HEBEN.
+
+    WARUM DAS EIN EIGENER RIEGEL IST (fnFL2w51, 22.09.). Der Launcher
+    rechnet je Karte ``total - corridor - dormant_residue`` und schreibt das
+    Ergebnis als ``--rank-gpu-memory-mib`` in die argv. Danach haengt er
+    ``extra`` an -- und wenn der Arm dort dieselbe Flag noch einmal setzt,
+    gewinnt sie, weil argparse den LETZTEN Wert nimmt. Still, ohne eine
+    Zeile.
+
+    In w51 stand im argv von D zweimal ``--rank-gpu-memory-mib``:
+
+        28240,16672,16672   der Launcher (Korridor, predicted_free -230)
+        29900,18500,18500   der Arm (Handzahl aus v70-v75)
+
+    Der Arm gewann, D-TP0 lud das Zielmodell bis auf 1,30 GB avail, und der
+    SOLO-Draft danach fand keinen Platz mehr:
+
+        WEG2-TAG-POOL tag=weights_draft pool=new
+        [torch_memory_saver.cpp] CUresult error: 2 (out of memory)
+                                 func=cu_mem_create line=194
+
+    Die Richtung ist das Entscheidende, nicht die Doppelung: ein Arm, der
+    ein Budget SENKT, nimmt sich Luft und das ist immer sicher. Ein Arm, der
+    es HEBT, ueberzieht eine Karte, die der Launcher bereits bis an ihre
+    Grenze gerechnet hat -- und der Posten, der dann faellt, ist der
+    letztgeladene (hier der Draft), nicht der, den jemand gewaehlt haette.
+
+    Kein Opt-out: ist der Launcher-Wert zu niedrig, gehoert SEINE Rechnung
+    korrigiert ([[planner-alleinzustaendigkeit-vram]]), nicht ueberstimmt.
+    """
+    if not extra:
+        return
+    _werte: Optional[List[int]] = None
+    for _i, _tok in enumerate(extra):
+        if _tok == "--rank-gpu-memory-mib" and _i + 1 < len(extra):
+            _roh = extra[_i + 1]
+        elif _tok.startswith("--rank-gpu-memory-mib="):
+            _roh = _tok.split("=", 1)[1]
+        else:
+            continue
+        try:
+            _werte = [int(x) for x in str(_roh).strip().strip('"\'').split(",") if x != ""]
+        except ValueError:
+            # Unlesbar ist NICHT harmlos: dieselbe Flag steht dann trotzdem
+            # hinter der des Launchers und gewinnt. Benennen statt schweigen.
+            raise RuntimeError(
+                f"W100 Weg2ExtraBudgetRaise: --extra-{group.lower()} setzt "
+                f"--rank-gpu-memory-mib auf {_roh!r}, das nicht als "
+                f"MiB-Liste lesbar ist -- es ueberschreibt trotzdem die "
+                f"Launcher-Budgets {budgets}."
+            )
+    if _werte is None:
+        return
+    if len(_werte) != len(budgets):
+        raise RuntimeError(
+            f"W100 Weg2ExtraBudgetRaise: --extra-{group.lower()} setzt "
+            f"--rank-gpu-memory-mib mit {len(_werte)} Eintraegen "
+            f"({_werte}), der Launcher rechnet mit {len(budgets)} "
+            f"({budgets}). Die Listen muessen dieselbe Flotte meinen."
+        )
+    _hoch = [
+        (i, int(b), int(e)) for i, (b, e) in enumerate(zip(budgets, _werte)) if e > b
+    ]
+    if _hoch:
+        _text = "; ".join(
+            f"Rang {i}: Launcher {b} MiB -> extra {e} MiB (+{e - b})"
+            for i, b, e in _hoch
+        )
+        raise RuntimeError(
+            f"W100 Weg2ExtraBudgetRaise: --extra-{group.lower()} HEBT "
+            f"Kartenbudgets ueber die Launcher-Rechnung -- {_text}. Der "
+            f"Launcher-Wert ist total minus Korridor minus dormantes "
+            f"Residuum; darueber ueberzieht die Karte und der zuletzt "
+            f"geladene Posten faellt (fnFL2w51: der Solo-Draft, "
+            f"cu_mem_create CUresult 2). Senken ist erlaubt, heben nicht: "
+            f"ist die Launcher-Rechnung zu knapp, gehoert SIE korrigiert."
+        )
+
+
+def _d_adopt_armed(ns) -> bool:
+    """#108: EINE Aufloesung des ``--weg2-d-adopt``-Flags im Launcher.
+
+    Beide ``argv_d``-Bauer und der Env-Schreiber lesen DIESE Funktion. Zwei
+    Ableitungen derselben Entscheidung sind der Weg, auf dem zwei Antworten
+    entstehen (#91/#106/#107 -- dreimal dieselbe Klasse an einem Tag).
+    """
+    return str(getattr(ns, "weg2_d_adopt", "off")).strip().lower() == "on"
+
+
+def _adopt_load_format_flag(armed: bool) -> List[str]:
     """#108: unter Adoption laedt D mit ``dummy``, nicht von Platte.
+
+    ``armed`` KOMMT VOM AUFRUFER, ES WIRD KEINE ENV GELESEN -- und das ist
+    der ganze Fix aus fnFL2w52. Die erste Fassung rief
+    ``adopt.adopt_armed()`` ohne ``explicit``; im LAUNCHER-Prozess ist
+    ``SGLANG_WEG2_D_ADOPT`` aber nicht gesetzt (sie geht nur an die
+    Kinder), also gab die Funktion IMMER ``[]`` zurueck -- waehrend der
+    Launcher danebenschrieb "D startet mit --load-format dummy". Im argv
+    des Boots stand der Flag null mal, D las 288 Presplit-Layer von
+    Platte, und die Zeile war eine BEHAUPTUNG. Der Docstring von
+    ``adopt_armed`` benennt genau diese Falle ("ein Launcher-Aufrufer ohne
+    explicit liest still seine eigene ungesetzte Umgebung"); ein
+    Parameter kann man nicht vergessen zu setzen, eine Env schon.
 
     ``DummyModelLoader`` ruft ``initialize_dummy_weights`` UND danach
     ``process_weights_after_loading`` je Modul -- Repack, Presplit und
-    Pool-Geometrie entstehen also IDENTISCH zum Plattenweg. Nur die Zahlen
-    sind Zufall, und genau die bringt der Erstflip aus P's Karten.
+    Pool-Geometrie entstehen also identisch zum Plattenweg. Nur die Zahlen
+    sind Zufall, und genau die bringt der Erstflip.
 
-    Der Flag geht ans ENDE der Liste, VOR ``extra``: so kann ein Arm ihn mit
-    seinem eigenen ``--load-format`` noch ueberstimmen, ohne dass der
-    Launcher raten muss, welcher der beiden gemeint war.
+    Der Flag geht ans ENDE der Launcher-Liste, VOR ``extra``: so kann ein
+    Arm ihn mit seinem eigenen ``--load-format`` ueberstimmen.
     """
-    from sglang.srt.weg2 import adopt as _adopt
-
-    if not _adopt.adopt_armed():
+    if not armed:
         return []
     return ["--load-format", "dummy"]
 
@@ -3123,7 +3225,10 @@ def argv_d(
     # lines up -- `argv_d` has no `*` marker.
     weights_cpu_backup: bool = True,
     profile: str = PROFILE_QWEN27B,
+    # #108: kommt als WERT vom Launcher, nie aus der Env dieses Prozesses.
+    d_adopt: bool = False,
 ) -> List[str]:
+    _refuse_if_extra_raises_budget(budgets, list(extra or ()), "D")
     return [py, "-m", "sglang.launch_server"] + common_flags(
         model, s_gb, m_mib, store_cfg, max_kv_per_request, d_write_policy, "D",
         random_seed, barlink_cap_cycles, census_interval,
@@ -3255,7 +3360,7 @@ def argv_d(
         # half that guards the window this line sits next to.
         "--barlink-uncovered-class", "refuse",
         "--port", str(PORT_D),
-    ] + admin_key_flag(admin_api_key) + _adopt_load_format_flag() + extra
+    ] + admin_key_flag(admin_api_key) + _adopt_load_format_flag(d_adopt) + extra
 
 
 def _import_duplex_gate() -> float:
@@ -12189,7 +12294,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         from sglang.srt.weg2 import adopt as _adopt
 
-        _adopt_on = str(getattr(ns, "weg2_d_adopt", "off")).strip().lower()
+        _adopt_on = _adopt.ADOPT_ON if _d_adopt_armed(ns) else "off"
         xchg_env[_adopt.ADOPT_ENV] = _adopt_on
         if _adopt_on == _adopt.ADOPT_ON:
             log("WEG2-D-ADOPT on -- D startet mit --load-format dummy und "
@@ -12742,7 +12847,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.op_line)
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns))
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns)), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -12843,7 +12948,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.op_line)
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns))
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns)), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
