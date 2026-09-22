@@ -9872,8 +9872,21 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log) -> str:
         # beschreiben; ohne den Spiegel ist die Schnittmenge gemessen ZWEI
         # von 193 (fnFL2w132). Env-Schalter, damit die alte Form fuer einen
         # A/B byte-identisch erreichbar bleibt.
-        _mirror = str(os.environ.get("WEG2_EXPERT_MAP_MIRROR", "1")).strip() \
-            not in ("0", "false", "False", "off")
+        # DEFAULT AUS (22.09. 21:0xZ, fnFL2w133): der Spiegel ist erst zur
+        # HAELFTE gebaut. Er aendert die KARTE, aber die Residenz stellt im
+        # Rang weiter `resident_fraction_for_rank()` her -- "die ersten N".
+        # Karte und Rang widersprechen sich dann, und der Rang refused beim
+        # Laden: "#107: 113 eigene kalte Experten haben in der KARTE keinen
+        # Platz (erste: [236,237,238,239])" -- Id 236 ist in der Karte
+        # resident, im Rang kalt. w133 starb daran, waehrend w132 mit
+        # derselben Kette bis zum Wake kam.
+        #
+        # Was fehlt, ist `expert_map.resident_of()` im Ladepfad: die Funktion
+        # existiert seit #107 und hat NULL Aufrufer -- dieselbe Klasse, die
+        # heute schon #140, #156 und #107 selbst getroffen hat. Erst wenn der
+        # Rang seine Residenz AUS DER KARTE nimmt, darf der Spiegel an.
+        _mirror = str(os.environ.get("WEG2_EXPERT_MAP_MIRROR", "0")).strip() \
+            in ("1", "true", "True", "on")
         karte = _em.build(total=total,
                           ratios=[int(float(x)) for x in ratios],
                           fr_pp=[float(x) for x in fr_pp],
