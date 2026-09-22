@@ -9701,6 +9701,31 @@ def solve_p_cut(
         # Draft-KV-Produzent stirbt still im C++ (cu_mem_create OOM).
         # Gedruckt wird sie mit ihrer Herleitung; wer sie uebernimmt,
         # entscheidet der Operator -- aber raten muss er nicht mehr.
+        # #141: DIE RESERVE ALS EXPLIZITER EINGANG, nicht als Schaetzung.
+        #
+        # Erster Versuch war, sie aus --pp-attn-stage-ratio x kv_mib x
+        # Kontext zu rechnen. Der Launcher PARST dieses Flag aber gar nicht
+        # (kein add_argument; es ist ein Flag, das argv_p an den SERVER
+        # weiterreicht) -- mein Leser haette ins Leere gegriffen und die
+        # Bedingung waere still nie wahr geworden. Genau die Klasse, die
+        # heute schon zweimal Boots gekostet hat
+        # (Memory riegel-hinter-dem-was-er-sichert).
+        #
+        # Also kommt die Reserve dorther, wo sie gemessen wird: der Operator
+        # gibt sie je Stufe, und der Solver rechnet damit. Ohne Angabe bleibt
+        # das Ergebnis die DECKE -- als solche benannt, nicht als Empfehlung
+        # getarnt.
+        _res_text = str(getattr(ns, "pp_cut_reserve_mib", "") or "").strip()
+        _reserve_p = None
+        if _res_text:
+            _r = _csv_floats(_res_text)
+            if len(_r) == n_stages_p:
+                _reserve_p = _r
+            else:
+                log("PP-CUT RESERVE (#141) IGNORIERT: --pp-cut-reserve-mib hat "
+                    "%d Eintraege, die P-Gruppe hat %d Stufen"
+                    % (len(_r), n_stages_p))
+
         try:
             _fmax = _pp_cut.solve_expert_fraction_per_stage(
                 budgets_mib=budgets_p,
@@ -9710,7 +9735,17 @@ def solve_p_cut(
                 num_experts=terms.num_experts,
                 lru_rows=rows,
             )
-            _ueber = [i for i, (f, m) in enumerate(zip(fracs, _fmax)) if f > m]
+            _frec = _pp_cut.solve_expert_fraction_per_stage(
+                budgets_mib=budgets_p,
+                stage_layers=_stage_layers_for_solve,
+                mean_layer_mib=mean_layer_mib,
+                expert_layer_mib=terms.expert_layer_weight_bytes / _pp_cut.MIB,
+                num_experts=terms.num_experts,
+                lru_rows=rows,
+                reserve_mib_by_stage=_reserve_p,
+            ) if _reserve_p is not None else None
+            _ueber = [i for i, (f, m) in enumerate(
+                zip(fracs, _frec if _frec is not None else _fmax)) if f > m]
             log(
                 "PP-CUT FRACTION-SOLVE (#140): budgets %s MiB, layers %s, "
                 "dense %.0f + experts %.0f MiB/layer, LRU %s -> OBERGRENZE je "
@@ -9721,7 +9756,9 @@ def solve_p_cut(
                     list(budgets_p), list(_stage_layers_for_solve), mean_layer_mib,
                     terms.expert_layer_weight_bytes / _pp_cut.MIB, list(rows),
                     ["%.3f" % f for f in _fmax], ["%.3f" % f for f in fracs],
-                    (" -- UEBER DER DECKE auf Stufe(n) %s" % _ueber) if _ueber else "",
+                    ((" | MIT KV-RESERVE: %s" % ["%.3f" % f for f in _frec])
+                     if _frec is not None else "")
+                    + ((" -- DARUEBER auf Stufe(n) %s" % _ueber) if _ueber else ""),
                 )
             )
         except BaseException as _exc:  # noqa: BLE001 -- eine Zahl kippt nie den Boot
@@ -10452,6 +10489,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="K6: queued tokens that make a D->P round trip worth its cost. Unset = X.")
     ap.add_argument("--min-dwell-ms", type=float, default=None,
                     help="K7: minimum phase dwell. Unset = derived from the last flip in that direction.")
+    ap.add_argument(
+        "--pp-cut-reserve-mib", default="",
+        help="#141: je P-Stufe die MiB, die auf der Karte NICHT den Gewichten "
+             "gehoeren (KV-Pool, Draft-KV-Produzent, Prefill-Transiente). "
+             "Macht aus der #140-Decke eine Empfehlung. Ohne Angabe druckt "
+             "der Solver nur die Decke -- fnFL2w73 starb in genau dieser "
+             "Luecke (PP2: 4,93 GB frei, dann cu_mem_create OOM).")
     ap.add_argument("--idle-layout", choices=["tp", "pp"], default="tp",
                     help="K8: which layout is awake at rest -- tp = group D (today's shape), "
                          "pp = group P. The front's idle guard always counts the requests P has "
