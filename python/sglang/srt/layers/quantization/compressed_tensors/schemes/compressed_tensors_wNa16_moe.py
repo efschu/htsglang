@@ -66,6 +66,22 @@ def _moe_offload_active() -> bool:
     return offload_active()
 
 
+def _rang_karte(layer) -> torch.device:
+    """Die CUDA-Karte, auf der DIESER Rang rechnet (#112/4).
+
+    Nicht `irgendein_gewicht.device`: unter Offload (Residenz-Fraction <
+    1.0) liegen die expert-major Tensoren auf dem HOST, und unter der
+    Erstboot-Adoption sind sie Platzhalter. Beides sind legitime Zustaende,
+    in denen `.device` `cpu` sagt und der Rang trotzdem auf einer Karte
+    rechnet.
+    """
+    _t = getattr(layer, "w13_weight_packed", None)
+    _d = getattr(_t, "device", None)
+    if _d is not None and _d.type == "cuda":
+        return _d
+    return torch.device("cuda", torch.cuda.current_device())
+
+
 class GPTQMarlinState(Enum):
     REPACK = enum.auto()
     READY = enum.auto()
@@ -582,7 +598,18 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             )
             replace_tensor("w2_weight_zero_point", marlin_w2_zp)
 
-        layer.workspace = marlin_make_workspace(layer.w13_weight_packed.device, 4)
+        # #112/4: DAS WORKSPACE GEHOERT DER KARTE, NICHT DEM TENSOR.
+        #
+        # `marlin_make_workspace` fragt `get_device_properties(device)` und
+        # wirft "Expected a cuda device, but got: cpu". Genau das passierte
+        # fnFL2w60 auf TP1: bei Residenz-Fraction < 1.0 baut `create_weights`
+        # JEDEN expert-major Tensor auf dem HOST -- `w13_weight_packed.device`
+        # ist dann `cpu`, und der Rang starb, nachdem P schon stand.
+        #
+        # Das Device eines Gewichtstensors sagt, wo dieses Gewicht LIEGT. Es
+        # sagt nichts darueber, auf welcher Karte dieser Rang rechnet. Fuer
+        # ein Marlin-Workspace ist nur Letzteres die richtige Frage.
+        layer.workspace = marlin_make_workspace(_rang_karte(layer), 4)
         layer.is_marlin_converted = True
 
         # WP2: after the marlin repack, split into the fixed-resident GPU
