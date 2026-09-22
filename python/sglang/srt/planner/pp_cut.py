@@ -1143,6 +1143,228 @@ def solve_expert_fraction_per_stage(
     return out
 
 
+# ---------------------------------------------------------------------------
+# #145 -- DIE D-SEITE: die zwei Terme, die auf der P-Seite (#140/#141) fehlten
+# ---------------------------------------------------------------------------
+#
+# #141 gab dem P-Solver die KV-Reserve je Stufe. Die D-Seite hatte GAR keinen
+# Solver -- und genau dort ist fnFL2w83 gestorben: D-TP0 auf der 5090 belegte
+# 31860 von 32607 MiB und starb still aus C++ heraus
+# (``[torch_memory_saver.cpp] CUresult error: 2 (out of memory)
+# func=cu_mem_create line=238``), waehrend sein Budget 29680 MiB lautete.
+#
+# ZWEI TERME machen den Unterschied zwischen "Karte hat 32607 MiB" und "dieser
+# D-Rang darf 29680 MiB nehmen", und beide sind MESSBAR, keiner ist geraten:
+#
+# (b) FREMD-KONTEXT der schlafenden Phase, je KARTE. Wenn P einschlaeft,
+#     bleibt sein CUDA-Kontext liegen -- die Layer-Bytes wechseln nur den
+#     Besitzer (Nutzer-Order 22.09.: Sharing, kein Backup), der Kontext nicht.
+#     GEMESSEN identisch in SIEBEN Boots (vramwatch_fnFL2w80..w89, Plateau
+#     zwischen P's Einschlafen und D's Anstieg):
+#         nvml0 (3080) 852 MiB | nvml1 (5090) 1342 MiB | nvml2 (3080) 844 MiB
+#     Der Launcher fuehrt dafuer schon ``dormant_other``, aber mit dem
+#     FALSCHEN KOERPER: er setzt D's eigene Residuen-Messung fuer P's ein und
+#     lag in w83 um 76/36/28 MiB zu NIEDRIG (1266/816/816 gegen 1342/852/844).
+#
+# (c) NICHT-TORCH-VRAM je RANG: was der Rang ausserhalb des Torch-Allokators
+#     haelt -- eigener CUDA-Kontext, TMS-Handles aus ``cu_mem_create``,
+#     private VMM-Pools. Messbar als
+#         nvml_used - fremd_kontext - torch_reserved
+#     und das ist der Term, an dem w83 starb. GEMESSEN am Ende des Ladens
+#     (Boots w83/w86/w89, ``[vram-census] ... reserved`` gegen vramwatch):
+#         D-TP1 auf nvml0: 18498 - 852 - 17091 =  555 MiB
+#         D-TP2 auf nvml2: 20034 - 844 - 18668 =  522 MiB
+#         D-TP0 auf nvml1: 31860 - 1342 - 26890 = 3628 MiB  -- UNTERGRENZE,
+#           denn dieser Rang hat das Laden nie beendet; w86 las 3818 MiB.
+#
+# WAS DIESER TERM NICHT IST, mit Gegenbeleg: er ist NICHT die
+# "Presplit-Transiente" (die Spitze, die der Experten-Presplit ueber den
+# Endstand hinaus braucht). Die ist GEMESSEN NULL: ueber sechs Boots
+# (w80/w81/w82/w83/w86/w89) ist das Maximum von ``torch ... reserved`` ueber
+# alle 48 ``[ct-stream-presplit] layer N``-Zeilen auf den Rang-Zentel
+# IDENTISCH mit dem ``[vram-census] ... after load``-Wert desselben Rangs
+# (TP1: 16.69 = 16.69 GiB, TP2: 18.23 = 18.23 GiB). Der Presplit ueberschiesst
+# nicht; er waechst linear (TP0 0.44, TP1 0.33, TP2 0.36 GiB je Layer). Und
+# D-TP0 hat den Presplit VOLLSTAENDIG durchlaufen (``layer 47`` steht im Log,
+# reserved 26.26 GiB) -- der OOM kommt DANACH, hinter
+# ``#68 WORKER-TRANSPOSE``, und er kommt nicht aus dem Torch-Allokator.
+
+
+@dataclasses.dataclass(frozen=True)
+class DRankVerdict:
+    """Ein D-Rang, seine Karte, und ob sein Budget physisch passt."""
+
+    rank: int
+    card_total_mib: float
+    foreign_context_mib: float
+    nontorch_mib: float
+    reserve_mib: float
+    #: total - fremd - nicht-torch - reserve: was dem Rang fuer GEWICHTE bleibt.
+    available_mib: float
+    #: was der Launcher ihm gibt (``--rank-gpu-memory-mib`` / BUD_D).
+    asked_mib: float
+
+    @property
+    def over_mib(self) -> float:
+        """Wieviel zuviel. <= 0 heisst: passt, mit diesem Rest."""
+        return self.asked_mib - self.available_mib
+
+    @property
+    def fits(self) -> bool:
+        return self.over_mib <= 0.0
+
+
+def d_rank_available_mib(
+    *,
+    card_total_mib,
+    foreign_context_mib,
+    nontorch_mib,
+    reserve_mib_by_rank=None,
+):
+    """Was einem D-Rang auf seiner Karte WIRKLICH zur Verfuegung steht.
+
+    ``card_total_mib`` ist die NVML-Gesamtgroesse. Davon geht ab:
+
+    * ``foreign_context_mib`` -- Term (b), der CUDA-Kontext der SCHLAFENDEN
+      Phase, der auf derselben Karte liegen bleibt;
+    * ``nontorch_mib`` -- Term (c), was dieser Rang selbst ausserhalb des
+      Torch-Allokators haelt;
+    * ``reserve_mib_by_rank`` -- KV-Pool, Draft, Aktivierungen; ohne Angabe 0,
+      und dann ist das Ergebnis eine OBERGRENZE, keine Empfehlung.
+
+    Jeder Term ist ein EXPLIZITER Eingang. Kein Default raet hier etwas: ein
+    fehlender Term ist 0 und heisst "nicht gebucht", nicht "gibt es nicht".
+    """
+    n = len(list(card_total_mib))
+    fk = list(foreign_context_mib)
+    nt = list(nontorch_mib)
+    rs = list(reserve_mib_by_rank) if reserve_mib_by_rank is not None else [0.0] * n
+    if len(fk) != n or len(nt) != n or len(rs) != n:
+        raise ValueError(
+            f"d_rank_available_mib: {n} Karten, aber {len(fk)} Fremd-Kontexte / "
+            f"{len(nt)} Nicht-Torch-Werte / {len(rs)} Reserven -- eine halbe "
+            f"Bilanz entscheidet nichts"
+        )
+    return [
+        float(t) - float(f) - float(o) - float(r)
+        for t, f, o, r in zip(card_total_mib, fk, nt, rs)
+    ]
+
+
+def d_rank_budget_verdict(
+    *,
+    budgets_mib,
+    card_total_mib,
+    foreign_context_mib,
+    nontorch_mib,
+    reserve_mib_by_rank=None,
+):
+    """Passt das Budget, das der Launcher jedem D-Rang gibt, physisch?
+
+    Das Gegenstueck zu #141 auf der D-Seite. Rueckgabe: ein
+    :class:`DRankVerdict` je Rang, IMMER fuer alle Raenge -- der Aufrufer
+    nennt die, deren ``fits`` False ist, beim Rang-Index. w83 haette hier
+    stehen muessen: Rang 0 fragt 29680 gegen 32607 - 1342 - 3628 = 27637
+    verfuegbar, also 2043 MiB zuviel, waehrend Rang 1 und 2 passen.
+    """
+    n = len(list(budgets_mib))
+    if len(list(card_total_mib)) != n:
+        raise ValueError(
+            f"d_rank_budget_verdict: {n} Budgets, aber "
+            f"{len(list(card_total_mib))} Karten -- eine halbe Bilanz "
+            f"entscheidet nichts"
+        )
+    avail = d_rank_available_mib(
+        card_total_mib=card_total_mib,
+        foreign_context_mib=foreign_context_mib,
+        nontorch_mib=nontorch_mib,
+        reserve_mib_by_rank=reserve_mib_by_rank,
+    )
+    rs = list(reserve_mib_by_rank) if reserve_mib_by_rank is not None else [0.0] * n
+    return [
+        DRankVerdict(
+            rank=i,
+            card_total_mib=float(t),
+            foreign_context_mib=float(f),
+            nontorch_mib=float(o),
+            reserve_mib=float(r),
+            available_mib=float(a),
+            asked_mib=float(b),
+        )
+        for i, (b, t, f, o, r, a) in enumerate(
+            zip(budgets_mib, card_total_mib, foreign_context_mib,
+                nontorch_mib, rs, avail)
+        )
+    ]
+
+
+def solve_expert_fraction_per_d_rank(
+    *,
+    card_total_mib,
+    foreign_context_mib,
+    nontorch_mib,
+    n_layers: int,
+    dense_layer_mib_by_rank,
+    expert_layer_mib: float,
+    num_experts: int,
+    expert_span_by_rank,
+    scratch_rows_by_rank=None,
+    reserve_mib_by_rank=None,
+):
+    """Je D-TP-Rang die GROESSTE Experten-Fraction, die auf die Karte passt.
+
+    Dieselbe Umkehrung wie :func:`solve_expert_fraction_per_stage`, aber fuer
+    die TP-Gruppe D: jeder Rang traegt ALLE ``n_layers`` und davon seinen
+    SHARD der Experten (``expert_span_by_rank`` -- wieviele der
+    ``num_experts`` Zeilen diesem Rang gehoeren, aus ``--rank-moe-ratio``).
+
+    Die Bedingung je Rang r, alles in MiB::
+
+        n_layers * (dense_r + zeile * (span_r * f_r + scratch_r))
+            + nichttorch_r + reserve_r
+            <= karte_r - fremd_r
+
+    mit ``zeile = expert_layer_mib / num_experts`` -- die Zeilengroesse ist
+    rangunabhaengig (gemessen fnFL2w83: TP0 haelt 180 Zeilen zu 435 MiB je
+    Layer = 2,418 MiB/Zeile; der Launcher nennt die volle Layerbreite mit
+    1238 MiB auf 512 Zeilen = 2,418 MiB/Zeile -- dieselbe Zahl).
+
+    ``scratch_rows_by_rank`` sind die Scratch-/LRU-Plaetze
+    (``SGLANG_MOE_SCRATCH_SLOTS``), die neben der Residenz stehen und
+    ebenfalls Zeilen kosten.
+
+    Rueckgabe: Fractions je Rang, auf [0, 1] geklemmt. 0.0 heisst "dieser Rang
+    traegt nicht einmal seine Dense-Gewichte" -- benennen, nicht beschoenigen.
+    """
+    n = len(list(card_total_mib))
+    dense = list(dense_layer_mib_by_rank)
+    span = list(expert_span_by_rank)
+    scratch = (
+        list(scratch_rows_by_rank) if scratch_rows_by_rank is not None else [0.0] * n
+    )
+    if len(dense) != n or len(span) != n or len(scratch) != n:
+        raise ValueError(
+            f"solve_expert_fraction_per_d_rank: {n} Karten, aber {len(dense)} "
+            f"Dense-Werte / {len(span)} Experten-Spannen / {len(scratch)} "
+            f"Scratch-Zeilen -- eine halbe Geometrie loest nichts"
+        )
+    avail = d_rank_available_mib(
+        card_total_mib=card_total_mib,
+        foreign_context_mib=foreign_context_mib,
+        nontorch_mib=nontorch_mib,
+        reserve_mib_by_rank=reserve_mib_by_rank,
+    )
+    row_mib = float(expert_layer_mib) / max(1, int(num_experts))
+    L = max(1, int(n_layers))
+    out = []
+    for a, d, sp, sc in zip(avail, dense, span, scratch):
+        frei = float(a) - L * (float(d) + row_mib * float(sc))
+        nenner = L * row_mib * float(sp)
+        f = frei / nenner if nenner > 0 else 0.0
+        out.append(min(1.0, max(0.0, f)))
+    return out
+
+
 def solve_pp_cut(
     inputs: PPCutInputs,
     *,

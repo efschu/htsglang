@@ -9597,6 +9597,170 @@ def shipped_line(
     )
 
 
+#: #145: das Praefix, an dem der Gate-Lauf und der Verdrahtungs-Check die
+#: D-Seiten-Zeile finden. EIN Marker, beide Zeilen, damit `grep -c` eine
+#: Zahl liefert und nicht zwei Muster braucht.
+D_RANK_SOLVE_MARKER = "D-RANK VRAM (#145)"
+
+
+def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
+                          label: str) -> None:
+    """#145: die D-Seite des Planners spuckt ihre Sizing-Zahlen aus.
+
+    ZWEI Zeilen, und die Reihenfolge ist Absicht:
+
+    1. DAS VERDIKT -- rein physisch, ohne jede Modellgeometrie: passt das
+       Budget, das dieser Launcher dem Rang GERADE gibt, in
+       ``karte - fremd_kontext - nicht_torch - reserve``? Das ist die Zeile,
+       die fnFL2w83 haette verhindern muessen (Rang 0: 29680 gefragt,
+       32607-1342-3628 = 27637 verfuegbar).
+    2. DIE FRACTION-DECKE -- das D-Gegenstueck zu #140/#141. Nur wenn die
+       Geometrie VOLLSTAENDIG vorliegt; fehlt ein Vektor, wird er BENANNT und
+       die Zeile bleibt aus, statt dass eine halbe Geometrie eine Zahl
+       erfindet.
+
+    Aufgerufen an BEIDEN Stellen, an denen ``budgets_d`` entsteht (Dry-Run und
+    echter Lauf) -- die #114-Falle: eine Fassung, die nur eine der beiden
+    trifft, fehlt im Dry-Run genau dann, wenn der Gate-Lauf sie sucht.
+    """
+    from sglang.srt.planner import pp_cut as _pp_cut
+
+    n = len(list(budgets_d))
+    fehlend: List[str] = []
+
+    def _vec(attr: str, name: str):
+        raw = str(getattr(ns, attr, "") or "").strip()
+        if not raw:
+            fehlend.append(name)
+            return None
+        v = _csv_floats(raw)
+        if len(v) != n:
+            log(f"{D_RANK_SOLVE_MARKER} IGNORIERT: {name} hat {len(v)} "
+                f"Eintraege, die D-Gruppe hat {n} Raenge")
+            fehlend.append(name)
+            return None
+        return v
+
+    fremd = _vec("d_foreign_context_mib", "--d-foreign-context-mib")
+    nicht_torch = _vec("d_nontorch_mib", "--d-nontorch-mib")
+    reserve = _vec("d_reserve_mib", "--d-reserve-mib")
+    totals = [float(c.total_mib) for c in cards]
+
+    # Ein FEHLENDER Term ist 0 und heisst "nicht gebucht" -- er wird im Druck
+    # namentlich genannt, damit niemand die Zeile fuer vollstaendig haelt.
+    # Genau das ist der Unterschied zu einem geratenen Default.
+    verdikte = _pp_cut.d_rank_budget_verdict(
+        budgets_mib=[float(b) for b in budgets_d],
+        card_total_mib=totals,
+        foreign_context_mib=fremd if fremd is not None else [0.0] * n,
+        nontorch_mib=nicht_torch if nicht_torch is not None else [0.0] * n,
+        reserve_mib_by_rank=reserve,
+    )
+    drueber = [v.rank for v in verdikte if not v.fits]
+    log(
+        "%s VERDIKT %s: %s%s"
+        % (
+            D_RANK_SOLVE_MARKER,
+            label,
+            " | ".join(
+                "rang%d nvml%d %s: total %.0f - fremd %.0f - nichttorch %.0f "
+                "- reserve %.0f = %.0f verfuegbar, gefragt %.0f -> %s %.0f MiB"
+                % (v.rank, cards[v.rank].nvml_index, cards[v.rank].name,
+                   v.card_total_mib, v.foreign_context_mib, v.nontorch_mib,
+                   v.reserve_mib, v.available_mib, v.asked_mib,
+                   "REST" if v.fits else "DARUEBER", abs(v.over_mib))
+                for v in verdikte
+            ),
+            ((" -- DARUEBER auf Rang %s" % drueber) if drueber else "")
+            + ((" [NICHT GEBUCHT: %s -- diese Zeile ist damit eine OBERGRENZE, "
+                "keine Bilanz]" % ", ".join(fehlend)) if fehlend else ""),
+        )
+    )
+
+    # ---- 2. die Fraction-Decke, nur bei VOLLSTAENDIGER Geometrie ----------
+    luecken: List[str] = []
+    ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
+    tp_ratio = _argv_vector(getattr(ns, "extra_d", ""), "--rank-tp-ratio")
+    fr_d = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-resident-fraction")
+    _env_d = parse_group_env(getattr(ns, "env_d", "") or "")
+    _scratch_raw = _env_d.get("SGLANG_MOE_SCRATCH_SLOTS", "")
+    scratch = _csv_floats(_scratch_raw) if _scratch_raw else []
+    if len(scratch) == 1:
+        scratch = scratch * n
+    if not ratios or len(ratios) != n:
+        luecken.append("--rank-moe-ratio (extra_d)")
+    if not tp_ratio or len(tp_ratio) != n:
+        luecken.append("--rank-tp-ratio (extra_d)")
+    if not fr_d or len(fr_d) != n:
+        luecken.append("--rank-moe-resident-fraction (extra_d)")
+    if len(scratch) != n:
+        luecken.append("SGLANG_MOE_SCRATCH_SLOTS (env_d)")
+    if luecken:
+        log(f"{D_RANK_SOLVE_MARKER} FRACTION-SOLVE {label} ENTFAELLT: "
+            f"{', '.join(luecken)} fehlt/passt nicht zu {n} Raengen. Eine "
+            f"halbe Geometrie loest nichts (#91), also rechnet hier nichts.")
+        return
+    try:
+        terms = _pp_cut.checkpoint_weight_terms(ns.model)
+        cfg_path = os.path.join(ns.model, "config.json")
+        with open(cfg_path) as fh:
+            cfg = json.load(fh)
+        text_cfg = cfg.get("text_config") or cfg
+        n_layers = int(text_cfg["num_hidden_layers"])
+        n_attn_ckpt = len(terms.attention_layer_indices)
+        dense_full_mib = (
+            terms.attn_layer_weight_bytes * n_attn_ckpt
+            + terms.linear_layer_weight_bytes * (terms.n_layers - n_attn_ckpt)
+        ) / max(1, terms.n_layers) / _pp_cut.MIB
+        expert_full_mib = terms.expert_layer_weight_bytes / _pp_cut.MIB
+        # DIE EXPERTEN-SPANNE je Rang kommt aus --rank-moe-ratio, skaliert auf
+        # num_experts -- dieselbe Skalierung, die #140 fuer --pp-stage-ratio
+        # fuehrt, und Memory rank-ratios-sind-verhaeltnis: die Summe der
+        # Ratios ist NICHT die Zahl der Experten, sie ist ein Verhaeltnis.
+        _rs = [float(x) for x in ratios]
+        _sum = sum(_rs) or 1.0
+        span = [round(x / _sum * int(terms.num_experts)) for x in _rs]
+        span[-1] = int(terms.num_experts) - sum(span[:-1])
+        # DIE DENSE-BYTES je Rang folgen --rank-tp-ratio, dem Flag, mit dem
+        # der Boot die uneven TP-Aufteilung wirklich faehrt. Die Quelle steht
+        # in der Zeile, damit ein Leser sie pruefen kann, statt sie zu raten.
+        _ts = [float(x) for x in tp_ratio]
+        _tsum = sum(_ts) or 1.0
+        dense_by_rank = [dense_full_mib * (x / _tsum) for x in _ts]
+        decke = _pp_cut.solve_expert_fraction_per_d_rank(
+            card_total_mib=totals,
+            foreign_context_mib=fremd if fremd is not None else [0.0] * n,
+            nontorch_mib=nicht_torch if nicht_torch is not None else [0.0] * n,
+            n_layers=n_layers,
+            dense_layer_mib_by_rank=dense_by_rank,
+            expert_layer_mib=expert_full_mib,
+            num_experts=int(terms.num_experts),
+            expert_span_by_rank=span,
+            scratch_rows_by_rank=scratch,
+            reserve_mib_by_rank=reserve,
+        )
+        _gegeben = [float(x) for x in fr_d]
+        _ueber = [i for i, (g, m) in enumerate(zip(_gegeben, decke)) if g > m]
+        log(
+            "%s FRACTION-SOLVE %s: %d Layer, dense je Rang %s + Experten %.0f "
+            "MiB/Layer auf %d Zeilen (%.2f MiB/Zeile), Spanne %s (aus "
+            "--rank-moe-ratio %s), Scratch %s -> OBERGRENZE je Rang %s "
+            "(gegeben: %s)%s"
+            % (
+                D_RANK_SOLVE_MARKER, label, n_layers,
+                ["%.1f" % d for d in dense_by_rank], expert_full_mib,
+                int(terms.num_experts),
+                expert_full_mib / max(1, int(terms.num_experts)),
+                span, ",".join(ratios), [int(s) for s in scratch],
+                ["%.3f" % f for f in decke], ["%.3f" % f for f in _gegeben],
+                (" -- DARUEBER auf Rang %s" % _ueber) if _ueber else "",
+            )
+        )
+    except BaseException as _exc:  # noqa: BLE001 -- eine Zahl kippt nie den Boot
+        log(f"{D_RANK_SOLVE_MARKER} FRACTION-SOLVE {label} failed: "
+            f"{type(_exc).__name__}: {_exc}")
+
+
 def solve_p_cut(
     ns,
     cards: List[Card],
@@ -10496,6 +10660,39 @@ def build_parser() -> argparse.ArgumentParser:
              "Macht aus der #140-Decke eine Empfehlung. Ohne Angabe druckt "
              "der Solver nur die Decke -- fnFL2w73 starb in genau dieser "
              "Luecke (PP2: 4,93 GB frei, dann cu_mem_create OOM).")
+    # -- #145: DIE D-SEITE. Drei Flags, ALLE ohne Default, alle in RANG-/
+    # ORDINAL-Reihenfolge (dieselbe wie --user-reserve-mib und die
+    # `budget D ... ordinal=i`-Zeilen: ordinal 0 = die 5090 = nvml1).
+    # Wer einen Term weglaesst, bekommt ihn im Druck als FEHLT benannt --
+    # kein geratener Default, weil ein geratener Default hier genau die
+    # Zahl waere, um die es geht.
+    ap.add_argument(
+        "--d-foreign-context-mib", default="",
+        help="#145 Term (b): je D-RANG (ordinal) der VRAM, den die SCHLAFENDE "
+             "Phase auf derselben Karte liegen laesst -- ihr CUDA-Kontext. "
+             "Die Layer-Bytes wechseln beim Flip nur den Besitzer (Sharing, "
+             "kein Backup), der Kontext nicht; dieser Betrag steht der "
+             "aktiven Phase NICHT zur Verfuegung. GEMESSEN in sieben Boots "
+             "(vramwatch_fnFL2w80..w89, Plateau nach P's Einschlafen): "
+             "nvml0=852, nvml1=1342, nvml2=844 MiB, also in "
+             "Ordinal-Reihenfolge (5090 zuerst) 1342,852,844.")
+    ap.add_argument(
+        "--d-nontorch-mib", default="",
+        help="#145 Term (c): je D-RANG (ordinal) der VRAM, den der Rang "
+             "AUSSERHALB des Torch-Allokators haelt -- eigener CUDA-Kontext, "
+             "TMS-Handles aus cu_mem_create, private VMM-Pools. Messbar als "
+             "nvml_used - Fremd-Kontext - torch_reserved. GEMESSEN am Ende "
+             "des Ladens: 555 MiB (TP1/nvml0), 522 MiB (TP2/nvml2); fuer "
+             "TP0/nvml1 mindestens 3628 MiB (w83) bzw. 3818 (w86) -- dieser "
+             "Rang hat das Laden nie beendet, die Zahl ist eine UNTERGRENZE. "
+             "Genau dieser Term fehlte in w83: Budget 29680, verfuegbar "
+             "32607-1342-3628 = 27637.")
+    ap.add_argument(
+        "--d-reserve-mib", default="",
+        help="#145: das Gegenstueck zu --pp-cut-reserve-mib auf der D-Seite. "
+             "Je D-Rang (ordinal) die MiB, die auf der Karte NICHT den "
+             "Gewichten gehoeren: KV-Pool, Draft, Aktivierungen. Ohne Angabe "
+             "druckt der Solver die DECKE, nicht die Empfehlung.")
     ap.add_argument("--idle-layout", choices=["tp", "pp"], default="tp",
                     help="K8: which layout is awake at rest -- tp = group D (today's shape), "
                          "pp = group P. The front's idle guard always counts the requests P has "
@@ -13060,6 +13257,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     launch_group(spec_p, tree, log, dry)
     if dry:
         budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card)
+        # #145 AN BEIDEN STELLEN -- siehe #114 direkt darunter: es gibt ZWEI
+        # Stellen, an denen budgets_d entsteht, und eine Fassung, die nur die
+        # untere trifft, fehlt genau im Dry-Run, wo das Gate sie sucht.
+        log_d_rank_vram_solve(ns, cards, budgets_d, log, "D(dry, expectation)")
         d_ratio = d_tp_ratio_decision(
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
             d_bs, getattr(ns, "env_d", "") or "",
@@ -13169,6 +13370,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         user_reserve_by_card=user_reserve_by_card,
     )
     state.budgets["D"] = budgets_d
+    log_d_rank_vram_solve(ns, cards, budgets_d, log, "D")
     d_ratio = d_tp_ratio_decision(
         ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
         d_bs, getattr(ns, "env_d", "") or "",
