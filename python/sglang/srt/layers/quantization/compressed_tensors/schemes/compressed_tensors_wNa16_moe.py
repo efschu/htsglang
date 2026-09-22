@@ -372,6 +372,21 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         if getattr(layer, "is_marlin_converted", False):
             return
 
+        # fnFL2x2 (22.09.): der Repack laeuft im DEFAULT-Pool. Seine Ausgaben
+        # (repackter Stapel, permutierte Scales) werden in den bestehenden
+        # Parameter-Speicher kopiert oder vom Presplit ersetzt -- sie sind
+        # Transienten, und im lebenden Tag-Pool blieben sie als tote Segmente
+        # liegen (Draft-Pool 1,35 GiB inaktiv, Basis-Pool 4,2-5,5 GiB je
+        # P-Stufe). Wer ueberlebt, wird mit `back_into_tag_pool` im Tag-Pool
+        # geboren: Workspace, g_idx-Sortierung, die Presplit-Puffer.
+        from sglang.srt.managers.weg2_memory_saver import outside_tag_pool
+
+        with outside_tag_pool(reason="ct-moe-repack"):
+            self._repack_to_marlin(layer)
+
+    def _repack_to_marlin(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.managers.weg2_memory_saver import back_into_tag_pool
+
         # WP3a generic expert shard: the pad expert contributes zero (scales 0)
         zero_pad = getattr(layer, "zero_expert_shard_pad", None)
         if callable(zero_pad):
@@ -389,8 +404,10 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 layer._original_shapes[name] = tuple(target_attr.shape)
 
             # It is important to use resize_() here since it ensures
-            # the same buffer is reused
-            target_attr.resize_(new_t.shape)
+            # the same buffer is reused. Grows it anyway, the new storage is
+            # a survivor and belongs in the tag pool (fnFL2x2).
+            with back_into_tag_pool():
+                target_attr.resize_(new_t.shape)
             target_attr.copy_(new_t)
             del new_t
 
@@ -400,10 +417,13 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         # when running models with grouped act order,
         # resort to g_idx values provided in checkpoint
         if self.actorder == "group":
-            w13_g_idx_sort_indices = torch.empty_like(layer.w13_weight_g_idx)
-            w2_g_idx_sort_indices = torch.empty_like(layer.w2_weight_g_idx)
-            w13_sorted_g_idx = torch.empty_like(layer.w13_weight_g_idx)
-            w2_sorted_g_idx = torch.empty_like(layer.w2_weight_g_idx)
+            # Ueberlebende Indizes -- im Tag-Pool, auch wenn der Repack
+            # ausserhalb laeuft (ct-stream-presplit, fnFL2x2).
+            with back_into_tag_pool():
+                w13_g_idx_sort_indices = torch.empty_like(layer.w13_weight_g_idx)
+                w2_g_idx_sort_indices = torch.empty_like(layer.w2_weight_g_idx)
+                w13_sorted_g_idx = torch.empty_like(layer.w13_weight_g_idx)
+                w2_sorted_g_idx = torch.empty_like(layer.w2_weight_g_idx)
 
             for e in range(num_experts):
                 w13_g_idx_sort_indices[e] = torch.argsort(layer.w13_weight_g_idx[e]).to(
@@ -609,7 +629,10 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         # Das Device eines Gewichtstensors sagt, wo dieses Gewicht LIEGT. Es
         # sagt nichts darueber, auf welcher Karte dieser Rang rechnet. Fuer
         # ein Marlin-Workspace ist nur Letzteres die richtige Frage.
-        layer.workspace = marlin_make_workspace(_rang_karte(layer), 4)
+        # Ein Ueberlebender: laeuft der Repack ausserhalb des Tag-Pools
+        # (ct-stream-presplit, fnFL2x2), gehoert das Workspace trotzdem hinein.
+        with back_into_tag_pool():
+            layer.workspace = marlin_make_workspace(_rang_karte(layer), 4)
         layer.is_marlin_converted = True
 
         # WP2: after the marlin repack, split into the fixed-resident GPU

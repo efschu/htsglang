@@ -37,7 +37,7 @@ import re
 import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
@@ -3113,12 +3113,20 @@ def outside_tag_pool(reason: str = "") -> Iterator[bool]:
     the DEFAULT pool, in segments that carry no tag, so a caller MUST copy
     anything that has to survive back in before leaving the block -- else the
     exchange would pause a segment holding another tag's bytes (#1378 xsn66).
+    A survivor that is BORN inside the block (not copied in afterwards) is
+    allocated under :func:`back_into_tag_pool` instead.
+
+    Nested use is a no-op step: a second ``_cuda_endAllocateToPool`` for a
+    pool this thread already left would drop a capture entry that is not ours.
     """
     import torch
 
     pool = _ACTIVE_TAG_POOL
     if pool is None:
         yield False
+        return
+    if _STEPPED_OUT_POOLS and _STEPPED_OUT_POOLS[-1] is pool:
+        yield True
         return
     try:
         from torch.cuda.memory import (
@@ -3130,10 +3138,57 @@ def outside_tag_pool(reason: str = "") -> Iterator[bool]:
         return
     device_index = torch.cuda.current_device()
     _cuda_endAllocateToPool(device_index, pool.id)
+    _STEPPED_OUT_POOLS.append(pool)
     try:
         yield True
     finally:
+        _STEPPED_OUT_POOLS.pop()
         _cuda_beginAllocateCurrentThreadToPool(device_index, pool.id)
+
+
+#: Pools the loading thread has stepped OUT of via :func:`outside_tag_pool`,
+#: innermost last -- what :func:`back_into_tag_pool` re-enters.  The load that
+#: uses it is single-threaded (``model.load_weights`` consumes the file
+#: workers' tensors on the thread that opened the tag pool).
+_STEPPED_OUT_POOLS: List[Any] = []
+
+
+@contextmanager
+def back_into_tag_pool() -> Iterator[bool]:
+    """Inside an :func:`outside_tag_pool` block: allocate in the tag pool again.
+
+    For the SURVIVORS of a transient block -- the tensors that stay on the card
+    after it and must pause and resume with their tag.  fnFL2x2 (22.09.) is why
+    this exists: the expert presplit runs the whole Marlin repack of a layer
+    (the full ``[E]`` device copy, the repacked stack, the permuted scales:
+    ~2.5 GiB per layer) inside the base weights pool, and after load the pool
+    held 5.46 / 4.76 / 4.21 GiB of empty or split segments on P's three stages
+    next to 15.15 / 8.85 / 7.04 GiB of live residents.  Stage 2 then had 181
+    MiB less than zero for its KV pool.  ``release_active_tag_pools`` never
+    freed any of it (48/48 calls ``released=0``: a live MemPool's use_count is
+    never 0).  With the repack outside the pool and only the resident buffers
+    born back inside it, the pool holds exactly what stays.
+
+    Outside any stepped-out block this is a no-op and yields False.
+    """
+    import torch
+
+    if not _STEPPED_OUT_POOLS:
+        yield False
+        return
+    from torch.cuda.memory import (
+        _cuda_beginAllocateCurrentThreadToPool,
+        _cuda_endAllocateToPool,
+    )
+
+    pool = _STEPPED_OUT_POOLS.pop()
+    device_index = torch.cuda.current_device()
+    _cuda_beginAllocateCurrentThreadToPool(device_index, pool.id)
+    try:
+        yield True
+    finally:
+        _cuda_endAllocateToPool(device_index, pool.id)
+        _STEPPED_OUT_POOLS.append(pool)
 
 
 @contextmanager

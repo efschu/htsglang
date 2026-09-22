@@ -48,9 +48,9 @@ def test_ein_kartentensor_bestimmt_die_karte():
 
 
 def test_der_aufrufer_fragt_die_funktion():
-    src = inspect.getsource(
-        m.CompressedTensorsWNA16MoE.process_weights_after_loading
-    )
+    # fnFL2x2: der Repack-Koerper steht in `_repack_to_marlin`, der aeussere
+    # `process_weights_after_loading` legt ihn nur ausserhalb des Tag-Pools.
+    src = inspect.getsource(m.CompressedTensorsWNA16MoE._repack_to_marlin)
     code = "\n".join(z for z in src.split("\n") if not z.lstrip().startswith("#"))
     assert "marlin_make_workspace(_rang_karte(layer), 4)" in code
     assert "marlin_make_workspace(layer.w13_weight_packed.device" not in code, (

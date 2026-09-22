@@ -1519,9 +1519,19 @@ class FusedMoE(torch.nn.Module):
         if _snap and not getattr(FusedMoE, "_ct_memsnap_armed", False):
             FusedMoE._ct_memsnap_armed = True
             torch.cuda.memory._record_memory_history(max_entries=200000)
+        from sglang.srt.managers.weg2_memory_saver import outside_tag_pool
+
         before = expert_offload_release_totals()
         t0 = time.perf_counter()
-        with device_loading_context(self, state["device"]):
+        # fnFL2x2: THE WHOLE REPACK OUTSIDE THE TAG POOL. The full [E] device
+        # copy, the repacked stack and the permuted scales are transients of
+        # ~2.5 GiB per layer; inside the live weights pool they stayed as dead
+        # segments (4.2-5.5 GiB per P stage after load). The presplit's
+        # resident buffers and the Marlin workspace -- the only survivors --
+        # are born back inside it (``back_into_tag_pool``).
+        with outside_tag_pool(reason="ct-stream-presplit"), device_loading_context(
+            self, state["device"]
+        ):
             self.quant_method.process_weights_after_loading(self)
         # The repack's [E] transients are freed but stay reserved in the
         # caching allocator; hand them back so the next layer's copy-in and

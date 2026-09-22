@@ -6072,9 +6072,14 @@ def presplit_expert_offload_after_repack(
         if t.dim() == 0 or t.shape[0] != int(E):
             continue  # not an expert-major tensor
         # [R+C] GPU buffer: [0:R] fixed resident; scratch [R:R+C] left uninit.
-        buf = torch.empty(
-            (buf_slots,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device
-        )
+        # THE survivor of the presplit: born in the tag pool even when the
+        # repack around it runs outside (ct-stream-presplit, fnFL2x2).
+        from sglang.srt.managers.weg2_memory_saver import back_into_tag_pool
+
+        with back_into_tag_pool():
+            buf = torch.empty(
+                (buf_slots,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device
+            )
         # Spill -> pinned host; the GPU [E] stack is then freed. The static
         # plan is two contiguous slices, exactly as before; a #394 plan gathers
         # the rows the plan names (whole experts on dim 0 either way).
