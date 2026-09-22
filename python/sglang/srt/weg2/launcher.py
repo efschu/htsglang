@@ -9879,6 +9879,20 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log) -> str:
         pfad = os.path.join(evidence_dir, f"expert_map_{ns.tag}.json")
         with open(pfad, "w") as fh:
             _json.dump(karte, fh)
+        _join = _em.join_verdict(karte)
+        if _join:
+            log("#159 FLIP-JOIN UNMOEGLICH -- dieser Boot kann nicht flippen:")
+            for _z in _join:
+                log("     " + _z)
+            log("     Der Austausch ist ein BESITZERWECHSEL: was die eine "
+                "Gruppe nicht resident haelt, kann die andere nicht "
+                "uebernehmen. Gleiche ANZAHL genuegt nicht -- P nimmt die "
+                "ersten N von 0..total, D je Rang die ersten N SEINES Bandes; "
+                "bei 158 gegen 158 ist die Schnittmenge EINS. Gemessen "
+                "fnFL2w130/w131/w132: jedes Mal W68 Weg2XchgPlanDisagree beim "
+                "Wake, 40 Minuten nach dem Start, alle drei PP-Raenge tot.")
+        else:
+            log("#159 FLIP-JOIN ok: beide Gruppen halten je Layer dieselben Ids")
         log(
             "#107 EXPERTEN-KARTE %s: %d Experten, %d Store-Plaetze, P haelt je "
             "Stufe %s, D je Rang %s; der Flip bewegt %d Zeilen, %d bleiben auf "

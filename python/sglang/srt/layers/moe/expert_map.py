@@ -245,6 +245,55 @@ def resident_of(karte: dict, phase: str, rank: int) -> List[int]:
         return []
 
 
+def join_verdict(karte: dict) -> List[str]:
+    """#159: kann der FLIP die beiden Layouts ueberhaupt verbinden?
+
+    `refuse_if_inconsistent` prueft die Karte gegen SICH SELBST. Diese
+    Funktion prueft die beiden Phasen GEGENEINANDER -- und das ist die
+    Frage, an der fnFL2w130/w131/w132 gestorben sind, jedes Mal erst beim
+    Wake, 40 Minuten nach dem Start:
+
+        W68 Weg2XchgPlanDisagree: ...experts.weg2_experts_w13_weight_packed:
+        die PP-Seite haelt (36160, 2560), die TP-Reihen [(9600,2560),
+        (20480,2560),(20480,2560)] -- weder Zeilenschnitt noch Spaltenschnitt
+        noch Replikat noch PADDED cut, also koennen die zwei Gruppen nicht
+        denselben Tensor beschreiben.
+
+    Der Austausch vergleicht JE LAYER. Ein Layer gehoert genau einer
+    PP-Stufe; D traegt alle Layer, haelt also fuer jeden dieselbe Menge.
+    Beide Seiten muessen fuer diesen Layer DIESELBEN globalen Ids resident
+    haben -- nicht dieselbe Anzahl, dieselben Ids.
+
+    Gemessen an der Form von w132: P-Stufe 0 haelt 193 Experten, D haelt
+    158, und die Schnittmenge ist ZWEI. Beide sagen "die ersten N", meinen
+    aber verschiedene Grundmengen: P die ersten N von 0..511, D je Rang die
+    ersten N SEINES Bandes.
+
+    Rueckgabe: eine Zeile je Stufe, die nicht passt; leere Liste = joinbar.
+    KEINE Ausnahme -- der Aufrufer entscheidet, ob er refused oder nur warnt.
+    """
+    try:
+        res_p = karte["phases"][PHASE_PP]["resident"]
+        res_d = karte["phases"][PHASE_TP]["resident"]
+    except (KeyError, TypeError):
+        return ["Karte ohne phases -- join nicht pruefbar"]
+    d_ids = set()
+    for ids in res_d:
+        d_ids |= set(int(x) for x in ids)
+    out: List[str] = []
+    for i, ids in enumerate(res_p):
+        p_ids = set(int(x) for x in ids)
+        if p_ids == d_ids:
+            continue
+        out.append(
+            f"Stufe {i}: P haelt {len(p_ids)} Experten, D haelt {len(d_ids)}, "
+            f"gemeinsam {len(p_ids & d_ids)} -- P-only {len(p_ids - d_ids)}, "
+            f"D-only {len(d_ids - p_ids)}. Der Austausch vergleicht je Layer "
+            f"und braucht DIESELBEN Ids auf beiden Seiten."
+        )
+    return out
+
+
 def refuse_if_inconsistent(karte: dict) -> Optional[str]:
     """Die EINE Stelle, an der die Karte gegen sich selbst geprueft wird.
 

@@ -96,3 +96,27 @@ def test_publish_schreibt_nichts_ohne_vektoren(tmp_path):
     zeilen = []
     assert L.publish_expert_map(NS(), "/m", str(tmp_path), zeilen.append) == ""
     assert any("ENTFAELLT" in z for z in zeilen)
+
+
+def test_join_verdikt_faengt_die_w132_form():
+    """#159: der Grund, aus dem w130/w131/w132 beim Wake starben."""
+    k = em.build(**W128)
+    zeilen = em.join_verdict(k)
+    assert len(zeilen) == 3, "alle drei PP-Stufen passen nicht zu D"
+    assert "P haelt 193 Experten, D haelt 158, gemeinsam 2" in zeilen[0]
+
+
+def test_gleiche_anzahl_genuegt_nicht():
+    """Weg A (uniforme FR_P) loest es NICHT -- die Ids bleiben verschieden."""
+    k = em.build(total=512, ratios=[183, 137, 168],
+                 fr_pp=[0.309] * 3, fr_tp=[0.006, 0.545, 0.449])
+    zeilen = em.join_verdict(k)
+    assert len(zeilen) == 3
+    assert "P haelt 158 Experten, D haelt 158, gemeinsam 1" in zeilen[0]
+
+
+def test_identische_mengen_sind_joinbar():
+    """Die einzige Form, die der Austausch akzeptiert."""
+    k = em.build(total=512, ratios=[183, 137, 168],
+                 fr_pp=[1.0] * 3, fr_tp=[1.0, 1.0, 1.0])
+    assert em.join_verdict(k) == [], em.join_verdict(k)
