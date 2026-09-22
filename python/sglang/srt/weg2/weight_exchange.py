@@ -83,6 +83,7 @@ from sglang.srt.constants import (
 from sglang.srt.distributed.utils import partition_sizes
 from sglang.srt.managers.weg2_memory_saver import (
     Weg2XchgCoverageRefused,
+    chunk_of_band_tag,
     is_weights_family_tag,
     layer_id_from_module_name,
     weight_chunk_tag,
@@ -1278,24 +1279,49 @@ def derive_waves(
     def cards_of(tag: str) -> set:
         return {int(c) for c in tag_cards.get(tag, tuple(wanted))}
 
+    # #134: EIN EXPERTEN-BAND BRINGT KEINE NEUE KARTE.  ``weights_<n>_e<b>``
+    # liegt auf der Karte von ``weights_<n>`` (chunk_tag_cards sagt genau das),
+    # also deckt es nichts ab, was sein Chunk nicht schon deckt -- die Schleife
+    # unten schoebe jedes Band in eine EIGENE Welle, weil ``cards_of(tag) -
+    # covered`` leer wird, sobald der Chunk durch ist.  Gemessen an der
+    # 4-Chunk/3-Karten-Form: 2 Wellen ohne Baender, 10 mit, und §1.2 hat den
+    # Preis zusaetzlicher Wellen am Metall bei +25,8/+36,8 % (P->D) bzw.
+    # +29,8/+30,0 % (D->P).  Die Welle ist eine KARTEN-Eigenschaft, also ist
+    # die Einheit der LAYER-Chunk und das Band faehrt mit ihm.
+    units: List[List[str]] = []
+    unit_of: Dict[str, int] = {}
+    for tag in chunk_tags:
+        key = chunk_of_band_tag(tag) or tag
+        if key not in unit_of:
+            unit_of[key] = len(units)
+            units.append([])
+        units[unit_of[key]].append(tag)
+
+    def _cards_of_unit(unit: List[str]) -> set:
+        out: set = set()
+        for t in unit:
+            out |= cards_of(t)
+        return out
+
     waves: List[List[str]] = []
-    remaining = list(chunk_tags)
+    remaining = list(units)
     while remaining:
         covered: set = set()
         wave: List[str] = []
-        rest: List[str] = []
-        for tag in remaining:
-            if cards_of(tag) - covered:
-                wave.append(tag)
-                covered |= cards_of(tag)
+        rest: List[List[str]] = []
+        for unit in remaining:
+            if _cards_of_unit(unit) - covered:
+                wave.extend(unit)
+                covered |= _cards_of_unit(unit)
             else:
-                rest.append(tag)
+                rest.append(unit)
         if covered != wanted:
             # This wave cannot free on every card on its own.  Only the LAST
             # wave may look like that, because the base tag spans every card
             # and closes it -- so everything left joins here rather than
             # shipping a wave that starves a card.
-            wave = wave + rest
+            for unit in rest:
+                wave.extend(unit)
             rest = []
         waves.append(wave)
         remaining = rest

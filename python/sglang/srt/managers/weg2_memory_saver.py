@@ -2332,12 +2332,71 @@ def weight_chunk_geometry() -> Tuple[int, int]:
     return layers, count
 
 
-def weight_chunk_tag(layer_id: int) -> Optional[str]:
-    """The chunk tag of a layer, or None when chunking is off."""
+#: #134: wieviele Experten ein BAND fasst. Analog zu
+#: WEIGHT_CHUNK_ENV_LAYERS, nur eine Ebene feiner: der 27B-Flip
+#: verschiebt ganze Layer ueber Chunk-Tags, und ein Experte ist ein
+#: Layer-Stueck -- dieselbe pause/resume-Mechanik traegt ihn, sobald er
+#: einen eigenen Tag hat. 0 = Bandteilung AUS (byte-identisch zu vorher).
+EXPERT_BAND_ENV_SIZE = "SGLANG_WEG2_EXPERT_BAND_SIZE"
+EXPERT_BAND_ENV_COUNT = "SGLANG_WEG2_EXPERT_BANDS"
+
+
+def expert_band_geometry() -> Tuple[int, int]:
+    """(experts_per_band, band_count) aus der Env; (0, 0) = Bandteilung AUS.
+
+    SYMMETRISCH zu :func:`weight_chunk_geometry`, und das ist kein Stil: die
+    Tag-Bildung braucht die BREITE (welches Band eine Id trifft), die
+    Familien-Aufzaehlung braucht die ANZAHL (welche Tags es gibt).  Eine Zahl
+    allein kann nur eine der beiden Fragen beantworten -- die Chunk-Seite hat
+    genau deshalb zwei, und ein Band, das nur die Breite kennt, waere ein
+    Schreiber ohne Leser (Memory ``riegel-hinter-dem-was-er-sichert``).
+
+    BEIDE muessen gesetzt sein: eine halbe Geometrie ist AUS, nicht geraten.
+    """
+    try:
+        size = int(os.environ.get(EXPERT_BAND_ENV_SIZE, "0") or 0)
+        count = int(os.environ.get(EXPERT_BAND_ENV_COUNT, "0") or 0)
+    except ValueError:
+        return 0, 0
+    if size <= 0 or count <= 0:
+        return 0, 0
+    return size, count
+
+
+def expert_band_size() -> int:
+    """Experten je Band, oder 0 wenn die Bandteilung aus ist."""
+    return expert_band_geometry()[0]
+
+
+def expert_band_count() -> int:
+    """Wieviele Baender ein Layer-Chunk hat, oder 0 wenn die Teilung aus ist."""
+    return expert_band_geometry()[1]
+
+
+def weight_chunk_tag(layer_id: int, expert_id: Optional[int] = None
+                     ) -> Optional[str]:
+    """Der Tag eines Layers -- oder eines EXPERTEN-BANDES darin (#134).
+
+    Ohne `expert_id` unveraendert der Chunk-Tag des Layers, wie ihn der
+    27B-Flip benutzt. Mit `expert_id` und eingeschalteter Bandteilung ein
+    feinerer Tag `weights_<chunk>_e<band>`: dieselbe pause/resume-Familie,
+    nur kleiner geschnitten, damit der Flip einzelne Experten verschieben
+    kann statt immer den ganzen Layer.
+    """
     layers, count = weight_chunk_geometry()
     if layers <= 0:
         return None
-    return f"{WEIGHT_CHUNK_PREFIX}{min(int(layer_id) // layers, count - 1)}"
+    _chunk = min(int(layer_id) // layers, count - 1)
+    _base = f"{WEIGHT_CHUNK_PREFIX}{_chunk}"
+    if expert_id is None:
+        return _base
+    _size, _count = expert_band_geometry()
+    if _size <= 0:
+        return _base
+    # Geklemmt wie der Chunk oben: eine Id jenseits des letzten Bandes
+    # gehoert ins letzte Band, statt einen Tag zu erfinden, den
+    # ``weights_family_tags`` nie aufzaehlt (das waere W74 beim ersten Flip).
+    return f"{_base}_e{min(int(expert_id) // _size, _count - 1)}"
 
 
 def weights_family_tags(chunk_count: Optional[int] = None) -> list:
@@ -2354,9 +2413,23 @@ def weights_family_tags(chunk_count: Optional[int] = None) -> list:
     integer predicate and says so), because a chunk tag is a LAYER BAND of the
     target model and the draft head is not a band of anything.
     """
+    # #134: mit eingeschalteter Bandteilung traegt JEDER Layer-Chunk seine
+    #   Experten-Baender VOR sich selbst.  Zwei Gruende, beide tragend:
+    # * Der Chunk-Tag behaelt den REST des Layers (Attention, Dense, Normen);
+    #   die Experten wandern unter ihren eigenen Tags.  Die Summe ist
+    #   unveraendert der ganze Layer -- kein Byte faellt zwischen zwei Tags.
+    # * Die Baender zuerst, weil sie die grossen Bytes sind: die
+    #   Pause-Reihenfolge ist zugleich die Freigabe-Reihenfolge, und der
+    #   Basis-Tag muss LETZTER bleiben (``derive_waves`` liest ``tags[-1]``).
+    # Ohne die Env ist die Liste byte-identisch zu vorher.
     if chunk_count is None:
         chunk_count = weight_chunk_geometry()[1]
-    tags = [f"{WEIGHT_CHUNK_PREFIX}{k}" for k in range(int(chunk_count))]
+    bands = expert_band_count()
+    tags: list = []
+    for k in range(int(chunk_count)):
+        base = f"{WEIGHT_CHUNK_PREFIX}{k}"
+        tags.extend(f"{base}_e{b}" for b in range(bands))
+        tags.append(base)
     if draft_tag_in_family():
         tags.append(GPU_MEMORY_TYPE_WEIGHTS_DRAFT)
     return tags + [GPU_MEMORY_TYPE_WEIGHTS]
@@ -2423,6 +2496,17 @@ def chunk_tag_cards(
             tag = f"{WEIGHT_CHUNK_PREFIX}{min(layer // int(layers_per_chunk), int(chunk_count) - 1)}"
             acc.setdefault(tag, set()).add(int(cards[stage]))
             layer += 1
+    # #134: ein Experten-Band liegt auf der Karte SEINES Chunks -- es ist ja
+    # ein Stueck derselben Layer.  Ohne diesen Eintrag faende
+    # ``interleave_pause_order`` fuer das Band keine Karte, naehme den
+    # ``missing``-Zweig und fiele fuer JEDEN Flip auf die Identitaets-Ordnung
+    # zurueck (genau der Verlust, den der Kommentar dort an weg2dk4 festhaelt),
+    # und ``derive_waves`` behandelte es als karten-uniform.
+    bands = expert_band_count()
+    if bands > 0:
+        for tag in list(acc):
+            for b in range(bands):
+                acc[f"{tag}_e{b}"] = set(acc[tag])
     return {tag: tuple(sorted(v)) for tag, v in sorted(acc.items())}
 
 
@@ -2439,12 +2523,55 @@ def chunk_tag_cards(
 #:
 #: The index is what ``weight_chunk_tag`` writes, so the index is what the
 #: predicate reads.  Built from the prefix rather than a second literal.
-_WEIGHT_CHUNK_TAG_RE = re.compile(r"^" + re.escape(WEIGHT_CHUNK_PREFIX) + r"(\d+)$")
+_WEIGHT_CHUNK_TAG_RE = re.compile(
+    r"^" + re.escape(WEIGHT_CHUNK_PREFIX) + r"(\d+)(?:_e(\d+))?$"
+)
 
 
 def is_weights_chunk_tag(tag: Any) -> bool:
-    """``weights_<integer>`` -- one layer band of the weights family."""
+    """``weights_<integer>`` -- one layer band of the weights family.
+
+    #134: ``weights_<integer>_e<integer>`` joins, and it MUST.  An expert band
+    is a layer band cut finer (Nutzer 22.09.: "wir verschieben nicht nur ganze
+    layer sondern auch ganze experten -- aber das sind ja auch nur layer"), so
+    it is the same kind of thing the exchange already transports.  Left out,
+    ``is_weights_family_tag`` says no, ``build_plan`` raises W74
+    Weg2XchgSourceMissing for every expert tensor, and
+    ``interleave_pause_order`` drops the bands into ``rest`` where they have no
+    card list -- the identical defect the integer predicate was written for
+    (``weights_draft`` inside the family under a prefix test), only mirrored.
+
+    The suffix stays INTEGER on both halves for the same reason it was integer
+    before: the predicate reads exactly what ``weight_chunk_tag`` writes, and
+    nothing else that merely shares the prefix.
+    """
     return isinstance(tag, str) and _WEIGHT_CHUNK_TAG_RE.match(tag) is not None
+
+
+def chunk_of_band_tag(tag: Any) -> Optional[str]:
+    """The LAYER band a tag belongs to: itself for ``weights_<n>``, the parent
+    ``weights_<n>`` for ``weights_<n>_e<b>``, None for anything else (#134).
+
+    One authority, so the card map, the wave derivation and the pause order
+    cannot each grow their own way of stripping the band suffix.
+    """
+    if not isinstance(tag, str):
+        return None
+    m = _WEIGHT_CHUNK_TAG_RE.match(tag)
+    if m is None:
+        return None
+    return f"{WEIGHT_CHUNK_PREFIX}{m.group(1)}"
+
+
+def expert_band_of_tag(tag: Any) -> Optional[int]:
+    """The band index of ``weights_<n>_e<b>``, or None if the tag names a whole
+    layer band (#134)."""
+    if not isinstance(tag, str):
+        return None
+    m = _WEIGHT_CHUNK_TAG_RE.match(tag)
+    if m is None or m.group(2) is None:
+        return None
+    return int(m.group(2))
 
 
 def exchange_owns_wake_refill() -> bool:
