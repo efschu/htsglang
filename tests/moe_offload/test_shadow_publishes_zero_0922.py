@@ -111,3 +111,62 @@ def test_der_leg_filter_wirft_den_schatten_nicht_weg():
         "alle drei Raenge muessen den Filter ueberleben -- sonst zaehlt der "
         "Join eine Karte und refuse_diagonal_layout wirft W68 (w40)")
     assert sum(1 for m in kept if m.pieces) == 1, "nur Rang 0 haelt Stuecke"
+
+
+# --------------------------------------------------------------------------
+# #105 (fnFL2w41): DER DRITTE RIEGEL AUF DERSELBEN KETTE
+#
+# w41 belegte, dass #104 greift -- der Join baut den Draft-Plan KORREKT:
+#
+#     TP0  WEG2-XCHG-PLAN dir=d2h waves=1 descs=34 coalesced=34
+#
+# und verweigerte trotzdem auf den beiden Schatten-Raengen:
+#
+#     TP1/TP2  join-no-descriptors-for-rank -- "the joined plan has 34
+#              descriptors and none with src_rank=2"
+#
+# 4x im D-Log, der Flip stand 127,8 s in `gathered-legs`, dann toetete der
+# Waechter P. Die Regel selbst ist richtig: ein Rang, der Bytes halten
+# SOLLTE und keine bewegt, ist ein stiller Verlust. Aber ein Schatten haelt
+# per Definition nichts -- fuer ihn ist "keine Descriptors" die richtige
+# Verteilung, nicht ihr Fehlen. Sein eigenes leeres Manifest sagt es.
+# --------------------------------------------------------------------------
+
+def _leg(rank, mans):
+    return xm.leg_plan_from_join(hook="source", group="D", rank=rank,
+                                 manifests=mans, region_tag="weights_draft")
+
+
+def _drei_raenge():
+    return [_man("D", 0, 0, [_piece(NAME)]),
+            _man("D", 1, 1, []),
+            _man("D", 2, 2, []),
+            _man("P", 2, 2, [_piece(NAME)])]
+
+
+def test_der_halter_bekommt_seine_descriptors():
+    leg, refusal = _leg(0, _drei_raenge())
+    assert refusal == "", refusal
+    assert len(leg.descs) == 1, "Rang 0 haelt den Draft und bewegt ihn"
+
+
+@pytest.mark.parametrize("rank", [1, 2])
+def test_ein_schatten_geht_leer_aus_statt_zu_verweigern(rank):
+    """DER FALL, DER w41 TOETETE."""
+    leg, refusal = _leg(rank, _drei_raenge())
+    assert refusal == "", (
+        f"Rang {rank} publiziert ein LEERES Manifest -- er haelt nichts, "
+        f"also sind null Descriptors die richtige Antwort: {refusal}")
+    assert leg is not None and len(leg.descs) == 0
+    assert leg.card == rank, "der LegPlan gehoert weiter diesem Rang"
+
+
+def test_ein_rang_ohne_manifest_verweigert_weiter():
+    """DIE GEGENPROBE: der Fix darf die Regel nicht abschaffen.
+
+    Wer gar kein Manifest publiziert hat, hat nichts BEHAUPTET -- fuer ihn
+    ist "keine Descriptors" weiter ein stiller Verlust, kein Schatten.
+    """
+    leg, refusal = _leg(7, _drei_raenge())
+    assert leg is None
+    assert "no-descriptors-for-rank" in refusal

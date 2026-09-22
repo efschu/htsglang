@@ -1711,12 +1711,39 @@ def leg_plan_from_join(
     mine = tuple(d for d in plan.descs
                  if int(getattr(d, side, -1)) == int(rank))
     if not mine:
-        return None, refusal(
-            "no-descriptors-for-rank",
-            f"hook={hook} group={group} rank={rank} direction={direction}: the "
-            f"joined plan has {len(plan.descs)} descriptors and none with "
-            f"{side}={rank}. A leg that moves nothing would report a flip that "
-            f"moved no weights")
+        # #105 (fnFL2w41): EIN SCHATTEN HAELT NICHTS -- "keine Descriptors"
+        # ist fuer ihn die RICHTIGE Antwort, kein Defekt.
+        # Die Regel selbst bleibt: ein Rang, der Bytes halten SOLLTE und
+        # keine bewegt, ist ein stiller Verlust, und genau davor schuetzt
+        # sie. Aber unter `--speculative-draft-placement solo` tragen die
+        # Experten-Worker einen META-Drafter ohne ein einziges Byte; sie
+        # haben ihr leeres Manifest bewusst publiziert (#103), es hat den
+        # Leg-Filter bewusst ueberlebt (#104) -- und hier wurde daraus
+        # wieder ein Abbruch. Gemessen an w41: der Join baut den Plan
+        # KORREKT mit allen 34 Draft-Descriptors auf Rang 0
+        # ("WEG2-XCHG-PLAN dir=d2h descs=34"), und die Meldung sagt es
+        # selbst: "the joined plan has 34 descriptors and none with
+        # src_rank=2". Das ist die richtige Verteilung, nicht ihr Fehlen.
+        #
+        # Die Unterscheidung ist dieselbe wie in #104: haelt dieser Rang in
+        # DIESER Region ueberhaupt etwas? Sein eigenes Manifest sagt es.
+        _mine_man = next((m for m in manifests
+                          if str(m.group) == str(group)
+                          and int(m.rank) == int(rank)), None)
+        _is_shadow = _mine_man is not None and not _mine_man.pieces
+        if not _is_shadow:
+            return None, refusal(
+                "no-descriptors-for-rank",
+                f"hook={hook} group={group} rank={rank} "
+                f"direction={direction}: the joined plan has "
+                f"{len(plan.descs)} descriptors and none with {side}={rank}. "
+                f"A leg that moves nothing would report a flip that moved no "
+                f"weights")
+        # Schatten: weiter mit leerem `mine` -- der LegPlan unten wird ganz
+        # normal gebaut, nur mit `descs=()`. Kein Sonderobjekt hier: der
+        # Erfolgspfad kennt facts, tags, classes und card_digest, dieser
+        # Zweig nicht, und ein halb gebauter LegPlan waere ein zweiter
+        # Wahrheitsstand neben dem einen, den :1812 baut.
 
     # The acceptance line and the pointer profile, at the frame that holds the
     # XchgPlan -- the #1342 lesson: `WEG2-XCHG-PLAN` describes an XchgPlan and
