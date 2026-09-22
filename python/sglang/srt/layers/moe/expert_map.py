@@ -256,7 +256,26 @@ def refuse_if_inconsistent(karte: dict) -> Optional[str]:
     if total <= 0:
         return "total <= 0"
     for phase, p in karte.get("phases", {}).items():
-        res = {g for ids in p.get("resident", []) for g in ids}
+        _listen = [set(ids) for ids in p.get("resident", [])] or [set()]
+        # #132, ZWEITE SEITE DERSELBEN NAHT: `build` bildet `kalt` fuer die
+        # PP-Phase als "was MINDESTENS EINE Stufe nicht haelt" -- der Store
+        # muss die schlechtest versorgte Stufe bedienen. Dieser Pruefer las
+        # dagegen die VEREINIGUNG und meldete darum jede Id als "resident UND
+        # im Store", die eine Stufe haelt und eine andere nicht (gemessen bei
+        # FR_P 0.377/0.700/0.442: 165 Ids, die Karte wurde VERWORFEN und der
+        # Lauf fiel auf die globale Menge zurueck).
+        #
+        # "Resident" im Sinne des Stores heisst deshalb: von JEDER Stufe
+        # gehalten -- die Schnittmenge. Fuer die TP-Phase sind die Listen
+        # disjunkte Baender, dort ist Schnitt = Vereinigung, sobald mehr als
+        # ein Rang existiert; der Sonderfall EIN Rang faellt mit beidem
+        # zusammen. Eine Mengenoperation fuer beide Phasen, und sie ist
+        # dieselbe, die `build` benutzt.
+        if len(_listen) > 1 and any(a & b for i, a in enumerate(_listen)
+                                    for b in _listen[i + 1:]):
+            res = set.intersection(*_listen)      # PP: ueberlappende Listen
+        else:
+            res = set().union(*_listen)           # TP: disjunkte Baender
         slot_of_ = p.get("slot_of", {})
         kalt = {int(k) for k in slot_of_}
         if res & kalt:

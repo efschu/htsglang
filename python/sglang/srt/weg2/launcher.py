@@ -4925,6 +4925,15 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               # `weg2_boot_token`'s own docstring for why this one is safe to
               # publish UNCONDITIONALLY where that one may not be.
               weg2_boot_token: str = "",
+              # #107 DIE EXPERTEN-KARTE, fuer BEIDE Gruppen dieselbe Datei.
+              # Ohne sie liest `expert_store.expert_map()` nichts, `_karte`
+              # bleibt None und `_expert_store_rows_for` faellt auf die
+              # GLOBALE Residenzmenge zurueck -- eine Zahl fuer alle Karten,
+              # die die Residenz der jeweils anderen Raenge wegwirft
+              # (Nutzer 22.09.: "da wird dort vergessen ALLE karten zu
+              # zaehlen"). Gemessen w128: Hotset 1 Id -> 511 Store-Slots;
+              # die Karte rechnet fuer dieselbe Form 354.
+              expert_map_path: str = "",
               # Task #58: which vision form this boot runs. Published as
               # SGLANG_WEG2_VISION for the P group ONLY (see below).
               vision: str = VISION_OFF,
@@ -4985,6 +4994,9 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # operator's own shell can never arm a coupling nobody asked for.
     if group:
         env["SGLANG_WEG2_GROUP"] = group
+    if expert_map_path:
+        # BEIDE Gruppen, derselbe Pfad -- das ist der ganze Punkt der Karte.
+        env["SGLANG_MOE_EXPERT_MAP"] = expert_map_path
     else:
         env.pop("SGLANG_WEG2_GROUP", None)
     # C18: the shared host granule ring (spec C1-C8).  These four variables are
@@ -9786,6 +9798,90 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             f"{type(_exc).__name__}: {_exc}")
 
 
+def publish_expert_map(ns, model: str, evidence_dir: str, log) -> str:
+    """Die EXPERTEN-KARTE bauen und ablegen; Pfad zurueck, sonst "".
+
+    #107, Nutzer-Gesetz 22.09.: *"alles was geshardet wird braucht ne
+    karte"*. `expert_map.build` gab es seit dem Tag, `expert_store.expert_map`
+    liest sie aus ``SGLANG_MOE_EXPERT_MAP`` -- und NIEMAND hat sie je
+    geschrieben (gemessen 22.09.: 2 Leser-Dateien, 0 Schreiber, in keinem
+    Boot-argv). Ein Leser ohne Schreiber ist kein Riegel, er ist ein
+    Kommentar (Memory ``riegel-hinter-dem-was-er-sichert``).
+
+    Was das kostete: ohne Karte faellt ``_expert_store_rows_for`` auf die
+    globale Residenz-Id-Datei zurueck. Die kennt EINE Zahl fuer alle Karten,
+    also muss sie im Schnitt aller Stufen und Raenge liegen -- bei FR_P
+    0.377/0.700/0.442 und FR_D 0.006/... bleibt genau EINE Id uebrig, die
+    78+79 residenten Experten der beiden 3080er fallen heraus. Der Store
+    wuchs dadurch von 420 auf 511 Slots (+22 %), liegt in tmpfs (= shmem =
+    Host-RAM), und der Kernel toetete D-Rang 0 (w128, oom_kill 30 -> 31).
+    Die Karte rechnet fuer dieselbe Form 354 Slots.
+
+    KONSERVATIV: fehlt ein Vektor oder widerspricht sich die Karte, wird
+    NICHTS geschrieben und der Lauf rechnet wie bisher -- eine halbe Karte
+    waere eine falsche Slot-Zuordnung, und die ist Datenverlust.
+    """
+    import json as _json
+
+    try:
+        # LOKAL importieren wie jede andere Funktion hier: `_pp_cut` ist im
+        # Modulraum NICHT gebunden (nur in solve_p_cut/solve_d_ranks). Ohne
+        # diese Zeile haette der `except BaseException` unten den NameError
+        # geschluckt und "failed" geloggt -- ein Fix, der seine eigene
+        # Fehlerklasse reproduziert. Der Test hat es gefangen.
+        from sglang.srt.planner import pp_cut as _pp_cut
+        from sglang.srt.layers.moe import expert_map as _em
+
+        ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
+        fr_tp = _argv_vector(getattr(ns, "extra_d", ""),
+                             "--rank-moe-resident-fraction")
+        _fp_text = str(getattr(ns, "pp_cut_expert_device_fraction", "") or "")
+        fr_pp = (_csv_floats(_fp_text) if _fp_text else
+                 [float(x) for x in (_argv_vector(
+                     getattr(ns, "extra_p", ""),
+                     "--rank-moe-resident-fraction") or [])])
+        luecken = []
+        if not ratios:
+            luecken.append("--rank-moe-ratio (extra_d)")
+        if not fr_tp:
+            luecken.append("--rank-moe-resident-fraction (extra_d)")
+        if not fr_pp:
+            luecken.append("--pp-cut-expert-device-fraction / extra_p")
+        if luecken:
+            log("#107 EXPERTEN-KARTE ENTFAELLT: %s fehlt. Ohne sie rechnet "
+                "jede Gruppe wieder selbst und die Residenz der jeweils "
+                "anderen Raenge zaehlt nicht mit." % ", ".join(luecken))
+            return ""
+        total = int(_pp_cut.checkpoint_weight_terms(model).num_experts)
+        karte = _em.build(total=total,
+                          ratios=[int(float(x)) for x in ratios],
+                          fr_pp=[float(x) for x in fr_pp],
+                          fr_tp=[float(x) for x in fr_tp])
+        grund = _em.refuse_if_inconsistent(karte)
+        if grund:
+            log("#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s" % grund)
+            return ""
+        os.makedirs(evidence_dir, exist_ok=True)
+        pfad = os.path.join(evidence_dir, f"expert_map_{ns.tag}.json")
+        with open(pfad, "w") as fh:
+            _json.dump(karte, fh)
+        log(
+            "#107 EXPERTEN-KARTE %s: %d Experten, %d Store-Plaetze, P haelt je "
+            "Stufe %s, D je Rang %s; der Flip bewegt %d Zeilen, %d bleiben auf "
+            "den Karten liegen. BEIDE Gruppen lesen diese Datei -- vorher "
+            "rechnete jede selbst und die Residenz der anderen Raenge fiel "
+            "unter den Tisch."
+            % (pfad, total, int(karte["slots"]),
+               [len(x) for x in karte["phases"]["P"]["resident"]],
+               [len(x) for x in karte["phases"]["D"]["resident"]],
+               int(karte["moves"]), int(karte["shared_resident"]))
+        )
+        return pfad
+    except BaseException as _exc:  # noqa: BLE001 -- eine Karte kippt nie den Boot
+        log("#107 EXPERTEN-KARTE failed: %s: %s" % (type(_exc).__name__, _exc))
+        return ""
+
+
 def solve_p_cut(
     ns,
     cards: List[Card],
@@ -13075,7 +13171,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # TRAIN FIX 5 moved the dc-reserve / budgets_p / cut solve ahead of the
     # ring (block 1b- above); only ``env_p`` stays here, because it is the
     # one thing in this step that genuinely needs the armed ring.
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns))
+    # #107: EINMAL bauen, BEIDE Gruppen bekommen denselben Pfad.
+    _emap = publish_expert_map(ns, ns.model, ns.evidence_dir, log)
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap)
     # #1269 PUBLICATION: build_env's own comment says the decision is
     # "published explicitly so the boot log names the decision" -- but it only
     # SET the variables and logged nothing, so no boot log ever carried them.
@@ -13363,7 +13461,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.line)
         log(d_ratio.op_line)
         log(d_tokvec.line)
-        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns))
+        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap)
         # #114 auch HIER: es gibt ZWEI spec_d-Stellen, und die erste Fassung
         # traf nur die andere -- der Dry-Run blieb ohne die Zeile, und der
         # Verdrahtungs-Check meldete "#114 fehlt im Baum", obwohl es im Baum
@@ -13473,7 +13571,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.line)
     log(d_ratio.op_line)
     log(d_tokvec.line)
-    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns))
+    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap)
     # #114: DIE EFFEKTIVE GRUPPEN-ENV GEHOERT INS LOG.
     #
     # Der Verdrahtungs-Check (weg2/verdrahtung_check.sh) liest das
