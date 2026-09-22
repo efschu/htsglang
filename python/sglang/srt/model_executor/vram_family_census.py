@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import torch
 
@@ -130,8 +130,51 @@ def dump_load_memsnap(tag: str) -> None:
         logger.info("[vram-census] %s allocator snapshot failed: %s", tag, exc)
 
 
+def shared_with(named, peer: Optional[torch.nn.Module]):
+    """Welche dieser Tensoren liegen PHYSISCH bei ``peer`` -- Bytes, die
+    NICHT zweimal auf der Karte sind.
+
+    #161, und es ist die Frage, an der am 22.09. vier Zuordnungen
+    gescheitert sind. Der Zensus laeuft ueber ``named_parameters()`` und
+    sieht dort einen GETEILTEN Tensor genauso wie einen eigenen: der per
+    ``lm_head_from_target()`` verlinkte lm_head des Drafts erscheint mit
+    seinen vollen 1,18 GiB, obwohl das Ziel ihn bereits bezahlt hat.
+
+    Aus der Zeile "pp0tp0-draft ... embed_tokens 1.18, lm_head 1.18"
+    folgt deshalb WEDER "zweite Kopie" NOCH "gehoert dem Ziel". Beides
+    waren Zuordnungen, keine Messungen, und beide habe ich an einem Tag
+    behauptet und zurueckgenommen.
+
+    ``data_ptr()`` entscheidet es: dieselbe Adresse = dasselbe Byte.
+    ``None`` (kein Peer bekannt) -> leer, dann sagt die Zeile wie bisher
+    nichts ueber Teilen aus, aber sie BEHAUPTET auch nichts.
+    """
+    if peer is None:
+        return {}, 0
+    try:
+        peer_ptrs = {
+            t.data_ptr()
+            for _n, t in (list(peer.named_parameters()) + list(peer.named_buffers()))
+            if t is not None and t.numel()
+        }
+    except Exception:  # noqa: BLE001 -- ein Zensus toetet nie einen Boot
+        return {}, 0
+    geteilt, bytes_ = {}, 0
+    for n, t in named:
+        try:
+            if t is None or not t.numel() or t.data_ptr() not in peer_ptrs:
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        b = t.numel() * t.element_size()
+        geteilt[family_of(n)] = geteilt.get(family_of(n), 0) + b
+        bytes_ += b
+    return geteilt, bytes_
+
+
 def log_vram_family_census(
-    model: torch.nn.Module, tag: str, where: str
+    model: torch.nn.Module, tag: str, where: str,
+    peer: Optional[torch.nn.Module] = None,
 ) -> Dict[str, int]:
     named = list(model.named_parameters()) + list(model.named_buffers())
     fam = census(named)
@@ -144,16 +187,31 @@ def log_vram_family_census(
         reserved = torch.cuda.memory_reserved() / 2**30
     except Exception:  # noqa: BLE001
         alloc = reserved = float("nan")
+    _geteilt, _geteilt_bytes = shared_with(named, peer)
+    _teil = (
+        " | GETEILT mit dem Peer (#161, data_ptr-identisch, also NICHT "
+        "zweimal auf der Karte): %.2f GiB = {%s} -- EIGEN bleiben %.2f GiB"
+        % (
+            _geteilt_bytes / 2**30,
+            ", ".join(f"{k} {v / 2**30:.2f}" for k, v in
+                      sorted(_geteilt.items(), key=lambda kv: -kv[1])),
+            (total - _geteilt_bytes) / 2**30,
+        )
+        if _geteilt_bytes
+        else (" | geteilt: KEIN Peer uebergeben, diese Zeile sagt nichts "
+              "darueber, welche Bytes zweimal liegen (#161)")
+    )
     logger.info(
         "[vram-census] %s %s: model tensors on device %.2f GiB = {%s}; "
         "torch allocated %.2f GiB, reserved %.2f GiB (the gap to allocated is "
-        "non-model: workspaces, pool tables, KV, activations)",
+        "non-model: workspaces, pool tables, KV, activations)%s",
         tag,
         where,
         total / 2**30,
         parts,
         alloc,
         reserved,
+        _teil,
     )
     if reserved - alloc >= 1.0 and where == "after load":
         # the reserve the KV sizing is about to charge: name what pins it
