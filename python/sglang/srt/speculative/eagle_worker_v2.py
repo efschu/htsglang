@@ -542,37 +542,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         elif self.draft_kv_only:
             self.init_token_map()
             self._embed_head_shared_early = True
-            # #150b: DIESER Zweig laeuft auf P (--draft-kv-on-p on) -- und er
-            # ruft init_lm_head() NICHT. Die Vokabular-Module des Ziels werden
-            # also nie geteilt, der Draft-Runner laedt seine eigenen. Gemessen
-            # auf Next Flash: embed_tokens 1,18 + lm_head 1,18 GiB von 3,92
-            # GiB Draft-Tensoren (Zensus w107), waehrend die INT4-Experten nur
-            # 1,32 ausmachen. Auf PP2 toetet das den Rang (w116/w117: nvml2
-            # +3984 MiB auf 18914/20480, cu_mem_create).
-            #
-            # Ob das Absicht ist, entscheidet nicht diese Zeile -- sie sagt
-            # nur, WAS hier gilt, statt es im Zensus erraten zu lassen: traegt
-            # das Ziel teilbare Module (kein .weight), waere der Share
-            # moeglich und die zweite Kopie unnoetig.
-            try:
-                _tm = self.target_worker.model_runner.model
-                _lh = getattr(_tm, "lm_head", None)
-                _em = getattr(getattr(_tm, "model", None), "embed_tokens", None)
-                logger.info(
-                    "#150b DRAFT-VOCAB-SHARE branch=draft_kv_only shared=False"
-                    " (init_lm_head wird hier nicht gerufen) | teilbar_waere=%s"
-                    " lm_head=%s(weight=%s) embed_tokens=%s(weight=%s) |"
-                    " pp_size=%s tp_size=%s",
-                    target_shares_vocab_modules(_lh, _em),
-                    type(_lh).__name__ if _lh is not None else None,
-                    hasattr(_lh, "weight") if _lh is not None else None,
-                    type(_em).__name__ if _em is not None else None,
-                    hasattr(_em, "weight") if _em is not None else None,
-                    getattr(server_args, "pp_size", 1),
-                    getattr(server_args, "tp_size", 1),
-                )
-            except Exception as _exc:  # noqa: BLE001 -- Diagnose toetet nie
-                logger.info("#150b DRAFT-VOCAB-SHARE unlesbar: %s", _exc)
         elif not self.speculative_algorithm.is_eagle3():
             self.init_token_map()
             self.init_lm_head()
