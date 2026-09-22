@@ -116,6 +116,15 @@ import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+#: #109b MODUL-WEIT, NICHT LOKAL IN EINER ANDEREN FUNKTION.
+#: `logger` war nur innerhalb einer Funktion weiter unten gebunden; der
+#: #109-Pfad daneben (`STORE-ADOPT`) rief ihn auf Modulebene-Sicht und
+#: fnFL2w61 starb mit `NameError: name 'logger' is not defined` --
+#: NACHDEM #112/4 den Rang ueberhaupt erst bis dorthin gebracht hatte.
+import logging
+
+logger = logging.getLogger(__name__)
+
 from sglang.srt.layers.moe import pinned_host_ledger
 from sglang.srt.utils.break_cost_clock import break_cost_phase
 
