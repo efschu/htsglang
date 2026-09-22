@@ -469,13 +469,26 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 "geteilten Store (#109) bzw. ueber die Legs.",
                 _weg2_adopt.placeholder_reason() or "dummy-load",
             )
+            # #112/2 (fnFL2w57): DAS DEVICE KOMMT VON DER KARTE, NICHT VOM
+            # PARAMETER. Unter `--load-format dummy` liegt
+            # `w13_weight_packed` auf CPU; meine leeren Puffer erbten das,
+            # und der nachfolgende `marlin_make_workspace(...)` bekam es
+            # weitergereicht:
+            #     marlin_utils.py:296 in marlin_make_workspace
+            #     ValueError: Expected a cuda device, but got: cpu
+            # Der Boot kam damit weiter als jeder davor (#112 hat gegriffen,
+            # `#112 REPACK UEBERSPRUNGEN` steht im Log) und starb an der
+            # naechsten Stelle -- die Kette einzeln abarbeiten.
+            _dev = layer.w13_weight_packed.device
+            if _dev.type != "cuda":
+                _dev = torch.device("cuda", torch.cuda.current_device())
             _leer13 = torch.empty(
                 (
                     layer.w13_weight_packed.shape[0],
                     layer.w13_weight_packed.shape[1] * self.packed_factor // 16,
                     layer.w13_weight_packed.shape[2] * (self.num_bits // 2),
                 ),
-                device=layer.w13_weight_packed.device,
+                device=_dev,
                 dtype=layer.w13_weight_packed.dtype,
             )
             replace_tensor("w13_weight_packed", _leer13)
@@ -485,7 +498,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                     layer.w2_weight_packed.shape[1] * self.packed_factor // 16,
                     layer.w2_weight_packed.shape[2] * (self.num_bits // 2),
                 ),
-                device=layer.w2_weight_packed.device,
+                device=_dev,
                 dtype=layer.w2_weight_packed.dtype,
             )
             replace_tensor("w2_weight_packed", _leer2)

@@ -75,3 +75,14 @@ def test_111_der_modul_getter_hat_denselben_fallback():
     # Sonst ist ein fehlgeschlagener Import ein NameError IN der Schleife
     # statt der Plattform-Meldung (Fehler im Fehlerpfad, #99).
     assert "_jit_gptq_marlin_repack_module = _unsupported_kernel" in _KERNELS
+
+
+def test_112_die_leeren_puffer_liegen_auf_der_KARTE():
+    """fnFL2w57: unter `dummy` liegt w13_weight_packed auf CPU, und die
+    leeren Puffer erbten das -- `marlin_make_workspace` bekam dann
+    `Expected a cuda device, but got: cpu`."""
+    zweig = _SCHEME[_SCHEME.index("weights_are_placeholder"):_SCHEME.index("else:", _SCHEME.index("weights_are_placeholder"))]
+    code = "\n".join(z for z in zweig.split("\n") if not z.lstrip().startswith("#"))
+    assert "device=_dev" in code
+    assert 'torch.device("cuda"' in code
+    assert "device=layer.w13_weight_packed.device" not in code

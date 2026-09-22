@@ -193,7 +193,7 @@ SEAMS: Dict[str, Seam] = {
             "which slice 6a widened from ('experts',) to "
             "('experts', 'moe_gate') with its reason attached.",
             anchors=(
-                ("models/qwen4_exp.py", 2280, "this_rank_is_form_a_worker()"),
+                ("models/qwen4_exp.py", 2470, "this_rank_is_form_a_worker()"),
                 ("models/qwen4_exp.py", 1539, 'skip_on_worker("ple"'),
                 ("models/qwen4_exp.py", 1565,
                  'skip_on_worker("hyper_connection"'),
@@ -361,7 +361,7 @@ SEAMS: Dict[str, Seam] = {
             "no log line, until the deadman fires. Measured by the probe: "
             "worker_skips_dense alone diverges at collective #0.",
             anchors=(
-                ("models/qwen4_exp.py", 1144, "form_a_dense_is_unsharded"),
+                ("models/qwen4_exp.py", 1156, "form_a_dense_is_unsharded"),
                 ("form_a_symmetry.py", 2, "do the ranks still AGREE"),
             ),
         ),
