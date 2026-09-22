@@ -2688,6 +2688,29 @@ def is_weights_family_tag(tag: Any) -> bool:
 #: einzige Stelle, die ihn schreibt, wie der Leser darunter die einzige ist,
 #: die ihn liest.  Zwei Seiten einer Naht, EINE Funktion je Richtung
 #: (Memory ``zwei-seiten-einer-naht-fragen-dasselbe``).
+#: #135: DER NAME, unter dem der ganze Experten-Puffer eines Layers am
+#: MoE-Modul haengt. EIN Tensor je (Layer, Attribut) -- der Schnitt ueber die
+#: Experten kommt aus der Shard-Achse, nicht aus dem Namen (w67: ein View je
+#: Band meldet den Storage des ganzen Puffers und die Coverage refuest).
+EXPERT_BUFFER_ATTR_PREFIX = "weg2_experts_"
+
+
+def expert_buffer_attr_name(attr: str) -> str:
+    """Wie der Experten-Puffer eines Attributs am Modul heisst (#135)."""
+    return f"{EXPERT_BUFFER_ATTR_PREFIX}{attr}"
+
+
+def is_expert_buffer_attr(name: str) -> bool:
+    """Traegt dieser Tensorname einen Experten-Puffer (#135)?
+
+    EINE Autoritaet fuer beide Seiten der Naht: der Presplit schreibt den
+    Namen mit :func:`expert_buffer_attr_name`, das Inventar erkennt ihn hier,
+    und niemand buchstabiert das Praefix ein zweites Mal.
+    """
+    return f".{EXPERT_BUFFER_ATTR_PREFIX}" in str(name or "") or str(
+        name or "").startswith(EXPERT_BUFFER_ATTR_PREFIX)
+
+
 EXPERT_BAND_ATTR_PREFIX = "weg2_eband"
 _EXPERT_BAND_IN_NAME = re.compile(
     r"(?:^|\.)" + re.escape(EXPERT_BAND_ATTR_PREFIX) + r"(\d+)_"

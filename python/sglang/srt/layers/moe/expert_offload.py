@@ -5679,6 +5679,7 @@ def presplit_expert_offload_after_repack(
     import torch
 
     from sglang.srt.layers.moe.resident_fraction import resident_fraction_for_rank
+    from sglang.srt.managers.weg2_memory_saver import expert_buffer_attr_name
 
     if cold_shard is not None:
         refuse_cold_shard_at_repack_door(layer)
@@ -5836,6 +5837,32 @@ def presplit_expert_offload_after_repack(
                     )
                 )
         presplit[attr] = (buf, spill)
+        # #135: DEN EXPERTEN-PUFFER DEM FLIP ZEIGEN -- EIN Tensor, kein View.
+        #
+        # Gemessen an fnFL2w67: der Plan trug 3,59 GiB ueber 18 Chunk-Tags
+        # (Dense + Attention) gegen 13/20/13 GB Kartenbelegung, und das
+        # Manifest dasselbe (rank=0 pieces=1103 bytes=3,0 GB). Die Experten
+        # standen in KEINEM Deskriptor, weil der Presplit den Parameter durch
+        # einen 0-Zeilen-Platzhalter ersetzt und die Bytes in ein DICT legt,
+        # das keine der drei Walks findet (named_parameters, named_buffers,
+        # vars(module) -- ein Dict ist keins davon).
+        #
+        # WARUM DER GANZE PUFFER UND NICHT JE BAND (w67 hat das widerlegt):
+        # `_nbytes` misst den STORAGE, weil `covered_storage` per Storage-Key
+        # deckt; ein View meldet damit den ganzen Puffer (mib=800.000 fuer ein
+        # 25-MiB-Band) und die Coverage refuest (W84, ok = not (uncovered or
+        # short or missing)). Ein Band KANN auch kein eigener Tensor sein: der
+        # MoE-Kernel braucht den Experten-Stapel zusammenhaengend.
+        # Die Feinheit gehoert deshalb nicht in den Tag, sondern in die
+        # SHARD-ACHSE -- `StorageGeom.of` flacht [R,160,2560] auf rows=R*160
+        # ab, ein Experte sind 160 Zeilen, und der Join liest die Achse aus
+        # den Manifesten ab, statt sie zu raten (xchg_manifest.py-Kopf).
+        #
+        # Der Scratch [R, R+C) reist mit. Ehrlich beziffert statt versteckt:
+        # bei R=188, C=32 sind das 14,5 % Overhead je Tensor -- der Preis
+        # dafuer, dass die Byte-Zahl des Eintrags die des Storages IST und
+        # die Coverage nicht auf `short` laeuft.
+        setattr(layer, expert_buffer_attr_name(attr), buf)
         if store_rows is not None:
             torch.cuda.empty_cache()  # give the sizer the device bytes back (fn8m)
         # #119: tally the VRAM this tensor stops holding, so the KV-pool sizing

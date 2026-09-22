@@ -166,7 +166,13 @@ def test_plan_pins_the_padding_expert(monkeypatch):
     monkeypatch.setenv(FRACTION_ENV, "0.25")
     monkeypatch.setenv(SCRATCH_ENV, "2")
     plan = plan_load_time_staging(E, pinned_experts=(E - 1,))
-    assert plan.resident_ids == (E - 1, 0, 1)
+    # #134: SORTIERT -- der Pin ist eine Id-Menge, keine Position. Ein Band
+    # ([b*S, (b+1)*S)) muss ein konsekutiver Slot-Bereich sein, sonst laesst
+    # es sich nicht als ein Stueck benennen und der Flip kann es weder taggen
+    # noch am Stueck bewegen. Was dieser Test sichert -- der Pad-Experte
+    # bleibt resident und faellt aus dem kalten Pool -- ist unberuehrt.
+    assert plan.resident_ids == (0, 1, E - 1)
+    assert E - 1 in plan.resident_ids and E - 1 not in plan.spill_ids
     assert plan.spill_ids == tuple(range(2, E - 1))
     assert not plan.is_static_layout
     # every expert accounted for, exactly once
@@ -423,9 +429,17 @@ def test_materialize_pins_the_padding_expert_under_expert_shard(monkeypatch):
 
     resident_ids, spill_ids = layer._moe_offload_frozen_layout
     assert layer._moe_offload_full_experts == E  # E-1 owned + 1 zero pad
-    assert resident_ids[0] == E - 1  # the pad expert took slot 0
+    # #134: die Residenz ist SORTIERT (ein Experten-Band muss ein
+    # konsekutiver Slot-Bereich sein). Der Pad-Experte E-1 ist damit
+    # resident an SEINER sortierten Stelle statt in Slot 0 -- was dieser
+    # Test sichert, ist die Residenz und der Null-Inhalt, nicht die
+    # Position: kein Produktionspfad liest `resident_ids[0]`, die
+    # Pin-Information reist als Id-Menge.
+    assert E - 1 in resident_ids  # der Pad-Experte bleibt resident
+    assert list(resident_ids) == sorted(resident_ids)
     buf, _ = layer._moe_offload_presplit["w13_qweight"]
-    assert torch.equal(buf[0], torch.zeros_like(buf[0]))
+    pad_slot = list(resident_ids).index(E - 1)
+    assert torch.equal(buf[pad_slot], torch.zeros_like(buf[pad_slot]))
     assert sorted(resident_ids + spill_ids) == list(range(E))
 
 

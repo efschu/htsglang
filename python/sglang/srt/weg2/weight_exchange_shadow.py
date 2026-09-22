@@ -55,6 +55,8 @@ import os
 import struct
 import threading
 import time
+
+import torch
 from dataclasses import dataclass, field
 from typing import (
     Callable,
@@ -3112,6 +3114,46 @@ def card_inventory(
             skipped.append((str(name), reason))
             continue
         inventory.append((geom, param))
+    # #135: DIE EXPERTEN-PUFFER, die KEIN Parameter mehr sind.
+    #
+    # `presplit_expert_offload_after_repack` ersetzt den Experten-Parameter
+    # durch einen 0-Zeilen-Platzhalter (damit device_loading_context nichts
+    # auf den Host zurueckkopiert) und haelt die Bytes im Slot-Puffer. Die
+    # Schleife oben laeuft ueber `named_parameters()` und sah deshalb NULL
+    # Experten-Bytes -- gemessen fnFL2w67: Manifest rank=0 pieces=1103
+    # bytes=3,0 GB, Plan 3,59 GiB ueber 18 Chunk-Tags, gegen 13/20/13 GB
+    # Kartenbelegung.
+    #
+    # Der Puffer haengt seit #135 als EIN benanntes Attribut am MoE-Modul
+    # (`expert_buffer_attr_name`, die einzige schreibende Stelle; `is_expert_
+    # buffer_attr` die einzige lesende). Er wird hier GENAUSO behandelt wie
+    # ein Parameter -- dieselbe Tag-Aufloesung, dieselbe Skip-Regel, dieselben
+    # Refusal-Worte -- damit die zwei Populationen nicht zwei Buchhaltungen
+    # werden. `named_parameters()` findet ihn nicht, `vars(module)` schon.
+    for module_path, module in model.named_modules():
+        for attr, value in list(vars(module).items()):
+            if not ms.is_expert_buffer_attr(str(attr)):
+                continue
+            if not isinstance(value, torch.Tensor) or value.numel() == 0:
+                continue
+            name = f"{module_path}.{attr}" if module_path else str(attr)
+            walked += 1
+            tag = str(tag_of(name, region_tag=region_tag))
+            if not ms.is_weights_family_tag(tag):
+                skipped.append((name, f"not-weights-family:{tag}"))
+                continue
+            if tag not in family:
+                return None, [], walked, f"tag-not-in-family:{name} tag={tag}"
+            try:
+                geom = wx.ParamGeom.of(value, name=name, tag=tag,
+                                       shard_axis=wx.REPLICATED, shard_total=0,
+                                       stage=int(rank))
+            except BaseException as exc:  # noqa: BLE001
+                reason = ("undescribable-W68" if "W68" in str(exc)
+                          else "undescribable")
+                skipped.append((name, reason))
+                continue
+            inventory.append((geom, value))
     if not inventory:
         return None, skipped, walked, f"no-carried-tags:family={family}"
     return inventory, skipped, walked, ""
