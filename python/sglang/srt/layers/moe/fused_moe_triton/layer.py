@@ -1529,10 +1529,16 @@ class FusedMoE(torch.nn.Module):
         # segments (4.2-5.5 GiB per P stage after load). The presplit's
         # resident buffers and the Marlin workspace -- the only survivors --
         # are born back inside it (``back_into_tag_pool``).
-        with outside_tag_pool(reason="ct-stream-presplit"), device_loading_context(
-            self, state["device"]
-        ):
-            self.quant_method.process_weights_after_loading(self)
+        with outside_tag_pool(reason="ct-stream-presplit") as _draussen:
+            with device_loading_context(self, state["device"]):
+                self.quant_method.process_weights_after_loading(self)
+            # fnFL2x3: HIER, nicht unten. empty_cache gibt den Default-Pool
+            # nur frei, solange KEINE Pool-Umleitung aktiv ist (Allocator:
+            # release_cached_blocks prueft captures_underway.empty()). Unten
+            # ist der Tag-Pool wieder betreten -- x3 behielt so 3 GiB
+            # Repack-Transienten im Default-Pool (reserved 13,93 statt 7,90).
+            if _draussen:
+                torch.cuda.empty_cache()
         # The repack's [E] transients are freed but stay reserved in the
         # caching allocator; hand them back so the next layer's copy-in and
         # the KV pool are sized against real free memory, not the cache.

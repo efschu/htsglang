@@ -381,8 +381,13 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         # geboren: Workspace, g_idx-Sortierung, die Presplit-Puffer.
         from sglang.srt.managers.weg2_memory_saver import outside_tag_pool
 
-        with outside_tag_pool(reason="ct-moe-repack"):
+        with outside_tag_pool(reason="ct-moe-repack") as _draussen:
             self._repack_to_marlin(layer)
+            # Nur hier draussen erreicht empty_cache den Default-Pool: der
+            # Allocator gibt ihn nicht frei, solange eine Pool-Umleitung
+            # aktiv ist (fnFL2x3, 3 GiB Transienten blieben liegen).
+            if _draussen:
+                torch.cuda.empty_cache()
 
     def _repack_to_marlin(self, layer: torch.nn.Module) -> None:
         from sglang.srt.managers.weg2_memory_saver import back_into_tag_pool

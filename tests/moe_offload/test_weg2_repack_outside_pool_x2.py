@@ -115,3 +115,38 @@ def test_ct_stream_presplit_laeuft_ausserhalb():
     src = inspect.getsource(FusedMoE._ct_stream_presplit_now)
     i = src.index('outside_tag_pool(reason="ct-stream-presplit")')
     assert "process_weights_after_loading(self)" in src[i : i + 300]
+
+
+def _block_nach(src, kopf):
+    """Die eingerueckten Zeilen des with-Blocks, der mit `kopf` beginnt."""
+    zeilen = src.split("\n")
+    k = next(n for n, z in enumerate(zeilen) if kopf in z)
+    tiefe = len(zeilen[k]) - len(zeilen[k].lstrip())
+    block = []
+    for z in zeilen[k + 1 :]:
+        if z.strip() and len(z) - len(z.lstrip()) <= tiefe:
+            break
+        block.append(z)
+    return "\n".join(block)
+
+
+@pytest.mark.parametrize("wo", ["ct-stream", "schema"])
+def test_empty_cache_laeuft_draussen_nicht_drinnen(wo):
+    """fnFL2x3: der Allocator gibt den Default-Pool nur frei, solange KEINE
+    Pool-Umleitung aktiv ist. Metall-Probe (echte tag_pool_scope/outside/
+    back_into auf der 3080): draussen 1000 -> 400 MiB, drinnen bleibt 900."""
+    import inspect
+
+    if wo == "ct-stream":
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        src = inspect.getsource(FusedMoE._ct_stream_presplit_now)
+        kopf = 'outside_tag_pool(reason="ct-stream-presplit")'
+    else:
+        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+            compressed_tensors_wNa16_moe as moe,
+        )
+
+        src = inspect.getsource(moe.CompressedTensorsWNA16MoE.process_weights_after_loading)
+        kopf = 'outside_tag_pool(reason="ct-moe-repack")'
+    assert "torch.cuda.empty_cache()" in _block_nach(src, kopf)
