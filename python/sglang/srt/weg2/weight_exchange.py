@@ -4154,13 +4154,45 @@ def _write_placement_manifest(model, *, rank: int, region_tag: str,
         inventory = _held
         if not inventory:
             reason = reason or ("all-meta-shadow" if _shadow_n else "")
+            # #103 (fnFL2w38): "HAELT NICHTS" IST NICHT "EXISTIERT NICHT".
+            # #76 (oben) laesst den Meta-Schatten zu Recht nicht als HALTER
+            # auftreten -- er traegt die unrepackte Form und widerspricht dem
+            # Host. Aber gar kein Manifest zu schreiben nimmt ihn auch aus der
+            # RANGLISTE, und daran starb der Flip: unter
+            # `--speculative-draft-placement solo` sind die beiden
+            # Experten-Worker Draft-Schatten, also sah der Join fuer
+            # `weights_draft` nur EINE Karte, `refuse_diagonal_layout` hielt
+            # das fuer die PP-Form und warf W68, der Tag bekam null
+            # Descriptors -- und der Sleep endete in
+            #   W106 Weg2XchgWakeSourceGapRefused: tag=weights_draft
+            #   expected_bytes=5593104384 ... No third net exists
+            # auf allen drei Raengen (w38, 05:15:36Z).
+            #
+            # Ein LEERES Manifest sagt beides zugleich: der Rang ist da, und
+            # er haelt nichts -- Breite 0, genau was #102s Halter-Karte
+            # liest. Gemessen am selben Boot, dass der Austausch dann moeglich
+            # IST: D rank=0 card=0 weights_draft pieces=34 bytes=4139515392,
+            # P rank=2 card=2 dieselben 34 Stuecke und dieselbe Byte-Zahl.
+            #
+            # NUR fuer den Schatten-Fall. Ein Rang ohne jedes Inventar
+            # (`_shadow_n == 0`) hat nichts zu sagen und schweigt wie bisher:
+            # sonst publizierte ein Prozess ohne Drafter eine Rangzeile, die
+            # der Join als Halter-Kandidaten zaehlt.
+            if not _shadow_n:
+                log(
+                    f"{xm.JOIN_LINE_PREFIX}-WRITE group={group} rank={rank} "
+                    f"pieces=0 reason={reason or 'empty-inventory'} -- no "
+                    f"manifest written, so the join will refuse by name "
+                    f"rather than plan over the ranks that happened to publish"
+                )
+                return
             log(
                 f"{xm.JOIN_LINE_PREFIX}-WRITE group={group} rank={rank} "
-                f"pieces=0 reason={reason or 'empty-inventory'} -- no manifest "
-                f"written, so the join will refuse by name rather than plan "
-                f"over the ranks that happened to publish"
+                f"pieces=0 reason={reason} shadow_pieces={_shadow_n} -- #103: "
+                f"an EMPTY manifest is written so the join counts this rank "
+                f"and gives it width 0, instead of dropping it from the card "
+                f"list and reading the group as the PP form (W68 -> W106)"
             )
-            return
         geoms = [g for g, _t in inventory]
         # THE GROUP-UNIQUE RANK, not `tp_rank`. Under `--tp-size 1 --pp-size 3`
         # every rank of group P has `tp_rank == 0`, so keying on it made three
