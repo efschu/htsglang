@@ -1561,8 +1561,26 @@ def leg_plan_from_join(
             region_tag=man.region_tag, boot_token=man.boot_token,
             tp_rank=man.tp_rank, pp_rank=man.pp_rank,
             pieces=tuple(keep_p)))
-    manifests = [m for m in narrowed if m.pieces]
-    if not manifests:
+    # #104 (fnFL2w40): ZWEI FAELLE, DIE DIESER FILTER VERMISCHTE.
+    # `if m.pieces` warf bisher beides weg:
+    #   (a) ein Manifest, dessen Stuecke der REGIONSFILTER oben entfernt hat
+    #       -- es gehoert einem anderen Runner und muss raus;
+    #   (b) ein Manifest, das SCHON LEER ANKAM -- der Meta-Schatten aus #103,
+    #       der genau sagen will "diesen Rang gibt es, er haelt nichts".
+    # (b) ist die Breite-0-Aussage, die #102s Halter-Karte liest. Ohne sie
+    # zaehlt `join_manifests` eine Karte statt drei, `refuse_diagonal_layout`
+    # liest die Gruppe als PP-Form und wirft W68 -- gemessen an w40: die drei
+    # Manifeste lagen vor (`pieces=0 bytes=0`, Datei geschrieben), und der
+    # Join meldete TROTZDEM `tp_size=1`. #103 allein war damit wirkungslos:
+    # ein Riegel hinter dem, was er sichern sollte.
+    # (group, rank) als Schluessel, nicht rank allein: `narrowed` traegt
+    # BEIDE Gruppen, und P-Rang 1 ist nicht D-Rang 1.
+    _empty_on_arrival = {(str(m.group), int(m.rank))
+                         for m in manifests if not m.pieces}
+    manifests = [m for m in narrowed
+                 if m.pieces
+                 or (str(m.group), int(m.rank)) in _empty_on_arrival]
+    if not any(m.pieces for m in manifests):
         return None, refusal(
             "no-tensors-in-region",
             f"region={my_region}: no manifest carries a piece of this leg's "

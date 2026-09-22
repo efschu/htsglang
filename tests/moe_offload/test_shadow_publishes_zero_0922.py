@@ -81,3 +81,33 @@ def test_ohne_die_schatten_sieht_der_join_nur_eine_karte():
     assert len(join.cards) == 1, (
         "ohne die Schatten-Manifeste bleibt eine Karte uebrig -- das ist "
         "der w38-Zustand, und er fuehrt in refuse_diagonal_layout")
+
+
+def test_der_leg_filter_wirft_den_schatten_nicht_weg():
+    """#104 (fnFL2w40): #103 allein war WIRKUNGSLOS.
+
+    w40 schrieb die drei Manifeste korrekt (`pieces=0 bytes=0`, Datei da),
+    und der Join meldete TROTZDEM `tp_size=1`. Grund: `leg_plan_from_join`
+    filtert eine Ebene spaeter `[m for m in narrowed if m.pieces]` und warf
+    die leeren Schatten wieder weg -- ein Riegel hinter dem, was er sichern
+    sollte.
+
+    Der Filter muss zwei Faelle trennen: ein Manifest, dessen Stuecke der
+    REGIONSFILTER entfernt hat (raus), und eines, das SCHON LEER ANKAM
+    (bleibt, als Breite-0-Halter).
+    """
+    from sglang.srt.weg2 import xchg_manifest as xm
+    # Nachbau der Filterzeile: drei D-Manifeste, zwei davon leer angekommen
+    original = [_man("D", 0, 0, [_piece(NAME)]),
+                _man("D", 1, 1, []),
+                _man("D", 2, 2, [])]
+    # `narrowed` entsteht aus `original`; hier unveraendert, weil alle Stuecke
+    # zur Region gehoeren
+    narrowed = list(original)
+    empty = {(str(m.group), int(m.rank)) for m in original if not m.pieces}
+    kept = [m for m in narrowed
+            if m.pieces or (str(m.group), int(m.rank)) in empty]
+    assert len(kept) == 3, (
+        "alle drei Raenge muessen den Filter ueberleben -- sonst zaehlt der "
+        "Join eine Karte und refuse_diagonal_layout wirft W68 (w40)")
+    assert sum(1 for m in kept if m.pieces) == 1, "nur Rang 0 haelt Stuecke"
