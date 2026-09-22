@@ -5667,7 +5667,38 @@ class BarlinkBar1Transport:
             # mirror to print — the live monotonicity probe for the ack
             # barrier's capture-safety proof — without ever violating the
             # dump's no-device-sync constraint.
-            if self._round_dev is not None and self._round_mirror is not None:
+            # #142: THE #1330 GUARD ABOVE SECURES `_ctl_dev` AND ONLY IT.
+            #
+            # `_round_dev` is a SEPARATE device buffer (allocated at the
+            # `torch.zeros(3, ...)` site, not a view into the control word),
+            # so a phase release or a failed TMS resume can unmap it while
+            # the control word is still perfectly mapped -- and then this
+            # copy_ faults inside the driver, in a POLL THREAD, with the main
+            # thread somewhere else entirely. Boots fnFL2w73 and w74 both
+            # died exactly that way: `Current thread` in the faulthandler was
+            # this poll, while the innocent main thread sat in the draft's
+            # marlin repack. The visible symptom was "rank died during draft
+            # load", which cost two boots' worth of capacity diagnosis on
+            # FR_P -- the wrong axis entirely.
+            #
+            # This is the #1330 defect class reproducing itself one buffer to
+            # the right: the guard was written for the reader that existed,
+            # and the #622 round mirror was added inside its `with` block
+            # afterwards without extending it. So the check moves to where
+            # the read is, per buffer, and it is the same non-CUDA check (a
+            # released TMS mapping leaves a null data pointer in the tensor's
+            # own metadata; a probe that can itself fault is no probe).
+            #
+            # NOT a disarm: the abort word is the safety-critical reader and
+            # it is still mapped. Losing the mirror costs the SIGUSR1 launch
+            # dump three diagnostic words until the next resume remaps them;
+            # disarming the abort poll over it would trade a diagnostic for
+            # the mechanism that stops a wedged collective.
+            if (
+                self._round_dev is not None
+                and self._round_mirror is not None
+                and self._round_dev.untyped_storage().data_ptr() != 0
+            ):
                 n = min(3, self._round_dev.numel())
                 self._round_mirror[:n].copy_(self._round_dev[:n], non_blocking=True)
         # Waits for THIS copy on THIS stream only -- not for the model.
