@@ -2428,16 +2428,26 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         """
         if not _transpose_in_worker():
             return tensor
-        raise RuntimeError(
-            "SGLANG_LOAD_TRANSPOSE_IN_WORKER is set, but the worker-side "
-            "transpose is DEFECT and locked: its predicate is broader than "
-            "the consumer's, which transposes per LAYER METHOD and has "
-            "branches that return before the transpose at all. Boot fnFL2v87 "
-            "died of it (RuntimeError: size of tensor a (2560) must match "
-            "tensor b (80)). It was also SLOWER, not faster (PP2 36,7 -> 47,5 "
-            "s), because post_load runs serially per file. See "
-            "Qwen4ExpForConditionalGeneration.weight_post_load and task #68."
-        )
+        # #68a DIE VERRIEGELUNG FAELLT, WEIL IHR GRUND GEFALLEN IST.
+        #
+        # Sie stand hier, weil das Praedikat dieses Workers BREITER war als
+        # das des Verbrauchers -- daran starb fnFL2v87 ("size of tensor a
+        # (2560) must match tensor b (80)"). Seit df11022316 fragen BEIDE
+        # dieselbe Funktion (`ct_method_transposes`, an der Methode DES
+        # LAYERS), und ein Test stellt sie gegen dieselbe Namensliste.
+        #
+        # DER ZWEITE GRUND BLEIBT UND IST HIER NICHT GELOEST: "post_load
+        # runs serially per file" -- diese Arbeit laeuft im Datei-Worker,
+        # aber je Datei in EINEM Thread. Gemessen wurde deshalb PP2 36,7 ->
+        # 47,5 s. Wer diesen Schalter einschaltet, MUSS die Ladezeit gegen
+        # den ausgeschalteten Lauf messen; er ist kein Selbstlaeufer.
+        #
+        # DEFAULT BLEIBT AUS (`SGLANG_LOAD_TRANSPOSE_IN_WORKER` ungesetzt),
+        # und der Verbraucher ueberspringt seinen eigenen Transpose unter
+        # DERSELBEN Env -- die Arbeit passiert genau einmal.
+        if not _is_ct_wna16_expert_shard(name, self):
+            return tensor
+        return tensor.t()
 
     def weight_name_needed(self, name: str):
         """Loader veto BEFORE a checkpoint tensor is read (weight_utils

@@ -66,3 +66,17 @@ def test_ohne_layer_ist_die_antwort_False():
     modell = types.SimpleNamespace(get_submodule=lambda n: (_ for _ in ()).throw(AttributeError()))
     assert q._expert_layer_for_name("model.layers.0.mlp.experts.1.w.weight_packed", modell) is None
     assert q._is_ct_wna16_expert_shard("model.layers.0.mlp.experts.1.w.weight_packed", modell) is False
+
+
+def test_die_verriegelung_ist_gefallen_und_der_grund_benannt():
+    src = (_ROOT / "srt/models/qwen4_exp.py").read_text()
+    i = src.index("def weight_post_load")
+    block = src[i : src.index("def weight_name_needed", i)]
+    assert "DEFECT and locked" not in block, "die alte Verriegelung steht noch"
+    assert "_is_ct_wna16_expert_shard(name, self)" in block, (
+        "der Worker transponiert ohne das gemeinsame Praedikat zu fragen"
+    )
+    assert "tensor.t()" in block
+    # Der ZWEITE Grund (post_load seriell je Datei) muss benannt bleiben --
+    # er ist NICHT geloest, und wer den Schalter anwirft, muss das wissen.
+    assert "serially per file" in block
