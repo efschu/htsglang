@@ -5789,12 +5789,34 @@ class SchedulerWeightUpdaterManager:
                                  for p, g in _lanes.items()]
                         _errs = [(p, f.exception()) for p, f in _futs
                                  if f.exception() is not None]
+                    # #101 (fnFL2w36): `errors=%d` NENNT DEN FEHLER NICHT.
+                    # Gemessen: TP1 loggte `phase=deposit tag=weights_9 ms=5
+                    # errors=1` und danach stand im ganzen D-Log kein
+                    # Traceback -- die Lane c1 deponierte nie, P wartete 90 s
+                    # auf genau sie ("c1/weights_9: budget expired at unit 0")
+                    # und riss beim Fence alle drei P-Raenge mit. Die Zahl
+                    # allein kostete einen Boot: sie sagt DASS, nie WAS.
+                    # `raise _errs[0][1]` wirft zwar die erste Ausnahme, aber
+                    # der Aufrufer oben faengt sie in den Gruppen-Fence, und
+                    # die Ausnahmen der UEBRIGEN Lanes fallen still weg.
+                    _err_txt = "; ".join(
+                        f"{p}: {type(e).__name__}: {e}" for p, e in _errs)
                     logger.info(
                         "WEG2-SEQ-LANES parallel=%d phase=%s tag=%s ms=%.0f "
-                        "errors=%d t0=%.3f t=%.3f", len(_lanes), phase, tag,
+                        "errors=%d%s t0=%.3f t=%.3f", len(_lanes), phase, tag,
                         (time.perf_counter() - _t0) * 1000, len(_errs),
+                        (f" | {_err_txt}" if _errs else ""),
                         time.time() - (time.perf_counter() - _t0), time.time())
                     if _errs:
+                        # Mit Stack, damit die Wurzel im Log steht und nicht
+                        # nur die Zaehlung -- der Fence weiter oben macht aus
+                        # jeder Lane-Ausnahme dieselbe Gruppen-Meldung.
+                        logger.error(
+                            "#101 WEG2-SEQ-LANES phase=%s tag=%s: %d von %d "
+                            "Lane(s) gescheitert: %s -- die erste wird "
+                            "geworfen, die uebrigen stehen nur hier.",
+                            phase, tag, len(_errs), len(_lanes), _err_txt,
+                            exc_info=_errs[0][1])
                         raise _errs[0][1]
                 else:
                     for pair, group in _lanes.items():
