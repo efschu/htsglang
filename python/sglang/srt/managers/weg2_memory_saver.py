@@ -3176,9 +3176,24 @@ _KEPT_TRANSIENT_POOLS: List[Any] = []
 _LOAD_TRANSIENT_POOL: Any = None
 
 
+#: The saver entry points while :func:`_transient_pool` has SUSPENDED its
+#: region tracking -- :func:`back_into_tag_pool` turns it back on for the
+#: survivors (the current tag, set by ``weight_chunk_scope``, is untouched by
+#: the suspension, so they are tagged with their chunk again).
+_TMS_SUSPENDED: List[Any] = []
+
+
 @contextmanager
 def _transient_pool(reason: str) -> Iterator[Any]:
-    """Route the block into the load's transient pool (created on first use)."""
+    """Route the block into the load's transient pool (created on first use).
+
+    WITH torch_memory_saver's region tracking OFF, the way its own
+    ``disable()`` does it: a segment cudaMalloc'd while the region is
+    "interesting" becomes the saver's pausable VMM allocation, and handing it
+    back through the caching allocator later fails -- fnFL2x6 aborted in
+    ``MemPool::~MemPool -> release_block: CUDA error: invalid argument``, the
+    same message v56 died on.  Untracked, the transients are plain device
+    memory that the pool's deletion returns."""
     global _LOAD_TRANSIENT_POOL
     import torch
 
@@ -3191,8 +3206,17 @@ def _transient_pool(reason: str) -> Iterator[Any]:
         except Exception:  # noqa: BLE001 -- a torch without MemPool: the enclosing pool takes it
             yield None
             return
-    with torch.cuda.use_mem_pool(_LOAD_TRANSIENT_POOL):
-        yield _LOAD_TRANSIENT_POOL
+    cdll = _tms_cdll_in_region()
+    if cdll is not None:
+        cdll.tms_set_interesting_region(False)
+        _TMS_SUSPENDED.append(cdll)
+    try:
+        with torch.cuda.use_mem_pool(_LOAD_TRANSIENT_POOL):
+            yield _LOAD_TRANSIENT_POOL
+    finally:
+        if cdll is not None:
+            _TMS_SUSPENDED.pop()
+            cdll.tms_set_interesting_region(True)
 
 
 def release_load_transient_pool(reason: str = "") -> float:
@@ -3296,12 +3320,20 @@ def back_into_tag_pool() -> Iterator[bool]:
     )
 
     pool = _STEPPED_OUT_POOLS.pop()
+    # The survivors are weights: tracked by the saver again (paused and
+    # resumed with their chunk tag), even though the enclosing transient block
+    # suspended the tracking.
+    cdll = _TMS_SUSPENDED[-1] if _TMS_SUSPENDED else None
+    if cdll is not None:
+        cdll.tms_set_interesting_region(True)
     device_index = torch.cuda.current_device()
     _cuda_beginAllocateCurrentThreadToPool(device_index, pool.id)
     try:
         yield True
     finally:
         _cuda_endAllocateToPool(device_index, pool.id)
+        if cdll is not None:
+            cdll.tms_set_interesting_region(False)
         _STEPPED_OUT_POOLS.append(pool)
 
 
