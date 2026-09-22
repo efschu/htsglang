@@ -2101,7 +2101,49 @@ class SchedulerWeightUpdaterManager:
         # `tag`; a caller with `tag=None` (the whole-plan shadow grader)
         # gets `bool(plan.descs)` instead, which is the same question one
         # level up.
+        #
+        # #108: DIE DECKUNG FESTHALTEN, an der Stelle die sie KENNT.
+        # `_weg2_adopt_cover` liest sie spaeter zurueck, statt sie ein
+        # zweites Mal abzuleiten -- dieselbe Regel, an der heute #106 und
+        # #107/2 gescheitert sind: wer eine Zahl zweimal herleitet, bekommt
+        # irgendwann zwei verschiedene. `plan.descs` ist, was die Karte
+        # diesem Rang zuschreibt; `_cdescs` ist, was der Leg davon
+        # tatsaechlich getragen hat.
+        try:
+            _erwartet = len(getattr(plan, "descs", ()) or ())
+            self._weg2_last_inject_cover = (len(_cdescs or ()), _erwartet)
+        except (AttributeError, TypeError):
+            self._weg2_last_inject_cover = (0, 0)
         return bool(_cdescs)
+
+    def _weg2_adopt_cover(self) -> tuple:
+        """(gefuellt, erwartet) fuer #108 -- aus der KARTE, nicht geschaetzt.
+
+        Erwartet ist, was die Halter-Karte diesem Rang zuschreibt: jeder
+        Parameter des lebenden Modells, der in der letzten Join-Runde
+        Descriptors mit diesem Rang als Ziel hatte. Gefuellt ist, was der
+        Inject davon tatsaechlich beschrieben hat.
+
+        WARUM NICHT "alle Parameter des Modells": ein Rang haelt unter
+        Form A nur SEINEN Ausschnitt, und der meta-Draft-Schatten haelt
+        bewusst NICHTS (#103-#105). Wuerde hier die Modellgroesse als
+        Erwartung stehen, koennte kein Rang je vollstaendig decken und der
+        Riegel bliebe immer stehen -- ein Guard, der nie oeffnet, ist so
+        unbrauchbar wie einer, der nie schliesst.
+
+        KONSERVATIV: laesst sich die Zahl nicht ermitteln, gibt diese
+        Methode ``(0, 0)`` zurueck. ``adopt.mark_adopted`` wertet das NICHT
+        als Erfolg, der Riegel bleibt also stehen. Ein Boot, der mit Grund
+        nicht antwortet, ist besser als einer, der auf Zufallszahlen
+        rechnet.
+        """
+        try:
+            letzter = getattr(self, "_weg2_last_inject_cover", None)
+            if isinstance(letzter, tuple) and len(letzter) == 2:
+                return int(letzter[0]), int(letzter[1])
+        except (TypeError, ValueError):
+            pass
+        return 0, 0
 
     def _weg2_wake_reload_weights(self) -> None:
         """Fill the weight pages the resume recommitted, by whatever carries them.
@@ -2160,6 +2202,30 @@ class SchedulerWeightUpdaterManager:
                     "once-per-wake entry stands down rather than re-injecting")
                 return
             self._weg2_xchg_inject_weights()
+            # #108 ERSTBOOT-ADOPTION: hier faellt der Riegel -- oder er bleibt.
+            #
+            # Haelt dieser Rang Platzhalter (D unter `--weg2-d-adopt on`), war
+            # GENAU DIESER Inject der Grund seines Bootens. Die Deckung kommt
+            # aus der Halter-Karte, nicht aus dem Gefuehl: `_weg2_adopt_cover`
+            # zaehlt, wieviele der Tensoren, die dieser Rang halten MUSS,
+            # tatsaechlich Bytes bekommen haben. Deckt der Inject sie nicht
+            # alle, bleibt der Riegel stehen und der Rang verweigert weiter --
+            # ein halb gefuelltes Modell rechnet, und das ist schlimmer als
+            # eines, das nicht antwortet.
+            try:
+                from sglang.srt.weg2 import adopt as _adopt
+
+                if _adopt.weights_are_placeholder():
+                    _filled, _expected = self._weg2_adopt_cover()
+                    _adopt.mark_adopted(_filled, _expected)
+                    logger.info(
+                        "#108 ADOPT-COVER filled=%d expected=%d -> %s",
+                        _filled, _expected,
+                        "PLATZHALTER GELOEST, dieser Rang rechnet"
+                        if not _adopt.weights_are_placeholder()
+                        else f"RIEGEL BLEIBT ({_adopt.placeholder_reason()})")
+            except ImportError:
+                pass
             return
         server_args = self._weg2_server_args()
 

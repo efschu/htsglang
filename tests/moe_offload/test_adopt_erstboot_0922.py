@@ -152,3 +152,92 @@ def test_argv_d_bekommt_dummy_nur_unter_adoption(monkeypatch):
     assert _adopt_load_format_flag() == []
     monkeypatch.setenv(adopt.ADOPT_ENV, "on")
     assert _adopt_load_format_flag() == ["--load-format", "dummy"]
+
+
+# --- Der TRIGGER: das Flip-Paar vor dem ersten Request ------------------
+
+def test_die_front_faehrt_ein_flip_PAAR_nicht_nur_einen():
+    """P->D holt die Bytes, D->P stellt die Rollen wieder her.
+
+    Ohne den zweiten Halbschritt startete das Serving mit vertauschten
+    Rollen: D waere wach und P schliefe, obwohl P prefillt.
+    """
+    import inspect
+
+    from sglang.srt.weg2 import front
+
+    src = inspect.getsource(front.Front._adopt_first_flip)
+    assert src.index('self.flip("P", "D")') < src.index('self.flip("D", "P")'), (
+        "erst P->D (Bytes holen), dann D->P (Rollen zurueck)")
+
+
+def test_der_trigger_laeuft_VOR_dem_serving_loop():
+    """Sonst kaeme der erste Request auf Platzhalter-Gewichten an."""
+    import inspect
+
+    from sglang.srt.weg2 import front
+
+    src = inspect.getsource(front.Front.controller)
+    assert "_adopt_first_flip" in src
+    assert src.index("_adopt_first_flip") < src.index("while True"), (
+        "der Erstflip gehoert vor die Serving-Schleife")
+
+
+def test_der_trigger_ist_ohne_flag_ein_no_op():
+    """Der normale Boot darf kein zusaetzliches Flip-Paar fahren."""
+    import inspect
+
+    from sglang.srt.weg2 import front
+
+    src = inspect.getsource(front.Front._adopt_first_flip)
+    i_guard = src.index("adopt_armed()")
+    i_flip = src.index('self.flip("P", "D")')
+    assert i_guard < i_flip, "erst pruefen, dann flippen"
+    assert "return" in src[i_guard:i_flip], "ohne Flag sofort zurueck"
+
+
+def test_kein_try_except_um_das_flip_paar():
+    """Schlaegt die Adoption fehl, MUSS der Boot stehenbleiben.
+
+    Ein verschlucktes Scheitern ergaebe einen Boot, der laeuft und auf
+    jede Anfrage den Forward-Riegel wirft -- er saehe gesund aus und
+    beantwortete nichts.
+    """
+    import inspect
+
+    from sglang.srt.weg2 import front
+
+    src = inspect.getsource(front.Front._adopt_first_flip)
+    koerper = src[src.index('self.flip("P", "D")'):]
+    assert "except" not in koerper
+
+
+# --- Die Kette Inject -> Deckung -> Riegel ------------------------------
+
+def test_die_deckung_wird_dort_festgehalten_wo_sie_bekannt_ist():
+    """#106 und #107/2 sind daran gescheitert, dass eine Zahl zweimal
+    abgeleitet wurde. Die Deckung wird deshalb im Inject GEMERKT und im
+    Router nur GELESEN."""
+    import inspect
+
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    # `_weg2_xchg_inject_from_peer` ist die Methode, die `plan.descs` und
+    # die getragenen `_cdescs` BEIDE in der Hand hat -- nicht
+    # `_weg2_xchg_inject_weights`, das nur der Einstieg ist. Der erste Lauf
+    # dieses Tests hat genau diese Verwechslung aufgedeckt.
+    inject = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_xchg_inject_from_peer)
+    assert "_weg2_last_inject_cover" in inject, (
+        "die Deckung muss dort festgehalten werden, wo plan.descs und die "
+        "getragenen Descriptors beide bekannt sind")
+    cover = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_adopt_cover)
+    assert "_weg2_last_inject_cover" in cover and "plan" not in cover, (
+        "der Leser darf sie NICHT neu ableiten")
+
+
+def test_unermittelbare_deckung_laesst_den_riegel_stehen():
+    """`(0, 0)` ist kein Erfolg -- sonst oeffnete ein Inject, der gar
+    nichts fand, das Modell fuer Zufallszahlen."""
+    adopt.arm_placeholder()
+    adopt.mark_adopted(0, 0)
+    assert adopt.weights_are_placeholder() is True

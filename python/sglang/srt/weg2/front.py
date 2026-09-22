@@ -5155,8 +5155,50 @@ class Front:
                        queue_name, len(self.queue))
         return True
 
+    async def _adopt_first_flip(self) -> None:
+        """#108: EIN Flip-Paar, bevor der erste Request kommt.
+
+        Unter ``--weg2-d-adopt on`` haelt D nach dem Laden PLATZHALTER: die
+        Struktur steht (``--load-format dummy`` laeuft durch
+        ``process_weights_after_loading``), die Zahlen sind Zufall. Dieses
+        Paar bringt die echten Bytes:
+
+            flip P->D   legt P schlafen, weckt D -- und die Wake-Legs
+                        injizieren P's Karten-Bytes in D's Tensoren. Das ist
+                        derselbe Pfad, den jeder spaetere Flip nimmt; genau
+                        deshalb faellt sein Defekt jetzt auf und nicht erst
+                        nach dem ersten Prefill (Nutzer 22.09.: "etwaige
+                        probleme sieht man auch direkt").
+            flip D->P   stellt die Ausgangslage her: P prefillt, D decodiert.
+                        Ohne diesen zweiten Halbschritt startete das Serving
+                        mit vertauschten Rollen.
+
+        KEIN try/except um das Paar: schlaegt die Adoption fehl, MUSS der
+        Boot stehenbleiben. D haelt dann noch Zufallswerte, und der
+        Forward-Riegel (#108) wuerde jede Anfrage verweigern -- ein Boot,
+        der scheinbar laeuft und nichts beantwortet, ist schlechter als
+        einer, der mit Grund stirbt.
+        """
+        from sglang.srt.weg2 import adopt as _adopt
+
+        if not _adopt.adopt_armed():
+            return
+        logger.info(
+            "WEG2-ADOPT-FIRSTFLIP begin -- D haelt Platzhalter, das erste "
+            "Flip-Paar holt P's Bytes ueber dieselben Legs, die jeder "
+            "spaetere Flip nimmt (#108)")
+        t0 = time.time()
+        await self.flip("P", "D")
+        await self.flip("D", "P")
+        logger.info(
+            "WEG2-ADOPT-FIRSTFLIP done in %.2f s -- D traegt jetzt P's "
+            "Bytes, P ist wieder wach. Ob die Deckung VOLLSTAENDIG war, "
+            "sagt D's eigener Riegel (adopt.mark_adopted); ein Rang, dem "
+            "Tensoren fehlen, verweigert weiter.", time.time() - t0)
+
     async def controller(self) -> None:
         sem = asyncio.Semaphore(self.p_concurrency)
+        await self._adopt_first_flip()
         while True:
             await asyncio.sleep(0.2)
             try:
