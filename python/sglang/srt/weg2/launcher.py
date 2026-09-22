@@ -12402,12 +12402,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Gewichtet wird mit den PP-STUFEN (Layer je Rang), nicht mit
         # `_geom_ratios` -- das sind D's MoE-Ratios und hier die falsche
         # Groesse.
-        _pp_w = _split_fraction_text(getattr(ns, "pp_stage_ratio", ""))
-        if _fr_p and _pp_w and len(_fr_p) == len(_pp_w):
-            _pp_frac = (sum(a * b for a, b in zip(_pp_w, _fr_p))
-                        / float(sum(_pp_w)))
-        else:
-            _pp_frac = float(_fr_p[0]) if _fr_p else None
+        # #132: DER VEKTOR GEHT DURCH, NICHT SEIN MITTEL.
+        #
+        # #131 hatte hier das layer-gewichtete Mittel gebildet -- das war
+        # die falsche Antwort auf die richtige Frage: es gaukelt der Karte
+        # eine Residenz vor, die KEINE Stufe hat, und fnFL2w64 starb an
+        # "95 eigene kalte Experten haben in der KARTE keinen Platz".
+        # `resident_unsharded` nimmt seit #132 einen Vektor; die Karte
+        # rechnet die drei Stufen einzeln, und `kalt_p` ist, was
+        # MINDESTENS EINE Stufe nicht haelt.
+        _pp_frac = list(_fr_p) if _fr_p else None
         if _geom_ratios and _geom_fracs and _pp_frac is not None:
             _karte = _em.build(
                 total=int(_argv_vector(getattr(ns, "extra_d", ""),

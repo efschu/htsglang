@@ -94,14 +94,30 @@ def resident_sharded(ratios: Sequence[int], fractions: Sequence[float],
     return out
 
 
-def resident_unsharded(fraction: float, total: int) -> List[List[int]]:
-    """Die PP-Gruppe als EIN Rang: sie haelt jeden Experten und residiert
-    die ersten ``round(total * fraction)``."""
+def resident_unsharded(fraction, total: int) -> List[List[int]]:
+    """Je PP-STUFE die globalen Ids, die sie auf ihrer Karte haelt (#132).
+
+    PP teilt nach LAYERN: jede Stufe haelt alle ``total`` Experten IHRER
+    Layer und residiert davon die ersten ``round(total * f_i)``. Die
+    Stufen haben verschiedene Karten und verschiedene Fractions -- genau
+    dafuer gibt es zwei Layouts, und eine Zahl fuer alle drei wirft die
+    Optimierung weg.
+
+    ``fraction`` darf darum ein VEKTOR sein (eine Fraktion je Stufe); ein
+    Skalar bleibt die alte Form, eine Liste mit einem Eintrag auch.
+    """
     try:
-        f = min(max(float(fraction), 0.0), 1.0)
-    except (TypeError, ValueError):
-        f = 0.0
-    return [list(range(round(total * f)))]
+        fs = [float(x) for x in fraction]          # Vektor
+    except TypeError:
+        try:
+            fs = [float(fraction)]                 # Skalar
+        except (TypeError, ValueError):
+            fs = [0.0]
+    except ValueError:
+        fs = [0.0]
+    if not fs:
+        fs = [0.0]
+    return [list(range(round(total * min(max(f, 0.0), 1.0)))) for f in fs]
 
 
 def build(total: int,
@@ -118,9 +134,22 @@ def build(total: int,
     """
     res_p = resident_unsharded(fr_pp, total)
     res_d = resident_sharded(ratios, fr_tp, total)
+    # #132 KALT IST, WAS MINDESTENS EINE STUFE NICHT HAELT.
+    #
+    # Nicht "was keine Stufe haelt" (die Vereinigung): der Store muss die
+    # SCHLECHTEST versorgte Stufe bedienen koennen. Bei 0.367/0.75/0.95
+    # haelt Stufe 0 nur 188 von 512 -- sie braucht 324 Zeilen, auch wenn
+    # Stufe 2 fast alles auf der Karte hat. Die Vereinigung haette 26
+    # gesagt und die Laufzeit waere mit "95 eigene kalte Experten haben in
+    # der KARTE keinen Platz" gestorben (fnFL2w64).
+    _sets_p = [set(ids) for ids in res_p] or [set()]
+    # `flat_p` bleibt die Vereinigung -- sie beantwortet "wer liegt
+    # IRGENDWO in P auf einer Karte" und traegt `moves`/`shared_resident`.
+    # `kalt_p` beantwortet die ANDERE Frage und darf nicht dasselbe sein.
     flat_p = {g for ids in res_p for g in ids}
     flat_d = {g for ids in res_d for g in ids}
-    kalt_p = [g for g in range(total) if g not in flat_p]
+    kalt_p = [g for g in range(total)
+              if any(g not in s_ for s_ in _sets_p)]
     kalt_d = [g for g in range(total) if g not in flat_d]
     slots = max(len(kalt_p), len(kalt_d))
     return {
