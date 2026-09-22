@@ -85,6 +85,7 @@ from sglang.srt.managers.weg2_memory_saver import (
     Weg2XchgCoverageRefused,
     chunk_of_band_tag,
     expert_band_from_param_name,
+    is_expert_buffer_attr as ms_is_expert_buffer,
     is_weights_family_tag,
     layer_id_from_module_name,
     weight_band_tag,
@@ -3461,7 +3462,25 @@ def plan_param_lines(
     planned = dict((planned_bytes_by_tag or {}).get(tag, {}) or {})
     live: Dict[str, LiveTensor] = {}
     for tensor in walk_live_tensors(model, region_tag=region_tag):
-        if tensor.kind == PARAMETER:
+        # #138: PARAMETER **ODER** der Experten-Puffer, der keiner mehr ist.
+        #
+        # Gemessen fnFL2w70 (737aec0196): DERSELBE Rang meldet in DERSELBEN
+        # Runde (gleicher Zeitstempel, PP2 12:07:29) denselben Namen als
+        # UNCOVERED -- der Walk sieht ihn -- und hier als
+        #   verdict=absent live_tag=- live_mib=0.000 dtype=- shape=[]
+        # Ein Widerspruch, der genau EINE Ursache hat: der Filter eine Zeile
+        # hoeher. `presplit_expert_offload_after_repack` ersetzt den
+        # Experten-Parameter durch einen 0-Zeilen-Platzhalter und haelt die
+        # Bytes im Slot-Puffer, den #135 als ATTRIBUT veroeffentlicht --
+        # `kind == PARAMETER` schliesst ihn damit aus, obwohl derselbe Walk
+        # ihn zwei Zeilen vorher geliefert hat.
+        #
+        # Die Einschraenkung auf Parameter bleibt sonst: sie haelt Buffer und
+        # gewoehnliche Attribute aus einer PLAN-Zeile heraus, die je PLAN-
+        # PARAMETER eine Zeile druckt. Der Experten-Puffer IST ein geplanter
+        # Parameter -- er hat nur seine Parameter-Eigenschaft verloren, damit
+        # `device_loading_context` seine 800 MiB nicht auf den Host kopiert.
+        if tensor.kind == PARAMETER or ms_is_expert_buffer(tensor.name):
             live.setdefault(tensor.name, tensor)
     lines: List[str] = []
     for name in sorted(planned):

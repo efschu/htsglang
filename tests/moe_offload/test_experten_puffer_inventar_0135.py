@@ -214,3 +214,45 @@ def test_experten_puffer_ueberleben_die_paar_verengung():
         "anderen Tensor stehen bleiben, sonst faengt nichts mehr echte "
         "Divergenz (W80)"
     )
+
+
+# --- #138: die PLAN-PARAM-Zeile sieht den Puffer ---------------------------
+
+def test_plan_param_zeile_findet_den_experten_puffer(chunks):
+    """fnFL2w70: DERSELBE Rang meldete in DERSELBEN Runde (gleicher
+    Zeitstempel) denselben Namen als UNCOVERED -- der Walk sieht ihn -- und
+    als `verdict=absent live_tag=- shape=[]`. Ursache war der Filter
+    `kind == PARAMETER`: der Presplit ersetzt den Experten-Parameter durch
+    einen 0-Zeilen-Platzhalter, der Puffer ist seither ein ATTRIBUT.
+    """
+    from sglang.srt.weg2.weight_exchange import plan_param_lines
+
+    buf = torch.zeros(8, 4, 16, dtype=torch.int32)
+    model = _modell(buf)
+    name = "model.layers.7.mlp.experts.weg2_experts_w13_weight_packed"
+    zeilen = plan_param_lines(
+        model, rank=0, tag="weights_2",
+        planned_bytes_by_tag={"weights_2": {name: buf.numel() * 4}},
+    )
+    assert zeilen, "keine Zeile gedruckt"
+    z = zeilen[0]
+    assert "verdict=absent" not in z, (
+        f"der Puffer gilt als abwesend, obwohl der Walk ihn liefert: {z}"
+    )
+    assert "verdict=here" in z and "live_tag=weights_2" in z, z
+
+
+def test_ein_gewoehnliches_attribut_bleibt_draussen(chunks):
+    """Die Einschraenkung auf Parameter bleibt sonst: eine PLAN-Zeile druckt
+    je geplantem PARAMETER, nicht je Tensor am Modul."""
+    from sglang.srt.weg2.weight_exchange import plan_param_lines
+
+    model = _modell()
+    experts = model.model.layers[7].mlp.experts
+    experts.irgendein_puffer = torch.zeros(4, 4)
+    name = "model.layers.7.mlp.experts.irgendein_puffer"
+    z = plan_param_lines(model, rank=0, tag="weights_2",
+                         planned_bytes_by_tag={"weights_2": {name: 64}})[0]
+    assert "verdict=absent" in z, (
+        f"ein gewoehnliches Attribut zaehlt jetzt als Parameter: {z}"
+    )
