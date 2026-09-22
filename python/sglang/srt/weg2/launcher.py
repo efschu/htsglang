@@ -12414,7 +12414,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # genau EINEN Halter je Phase. Im Arm gepinnt waere sie die naechste
         # Instanz von `arm-defaults-die-den-boot-toeten` -- andere Ratios,
         # andere Breite, und niemand denkt daran.
-        if _geom_ratios:
+        # #134, NACH fnFL2w67: DIE SCHEIBE GEHT GANZ AN ODER GANZ AUS, und
+        # das ist nicht Vorsicht, sondern das, was der Plan selbst verlangt:
+        # `build_plan` wirft W74 fuer JEDEN Wellen-Tag ohne Deskriptor
+        # ("a wave that moves nothing is an agreement between six ranks that
+        # no byte has to arrive"). Ein Band-Tag in der Familie, dessen Bytes
+        # der Plan nicht traegt, ist also kein halber Gewinn -- er ist ein
+        # toter Boot. Solange die Baender nicht im xchg_manifest stehen,
+        # bleibt die Teilung AUS und der Flip faehrt je Layer-Chunk wie
+        # vorher. Der Schalter ist EXPLIZIT: ein Default, der halb
+        # einschaltet, waere die Falle, vor der der Arm-Kopf warnt.
+        _bands_on = os.environ.get("SGLANG_WEG2_EXPERT_BANDS_ARM", "0") == "1"
+        if _geom_ratios and not _bands_on:
+            log("WEG2-EXPERT-BAND aus (SGLANG_WEG2_EXPERT_BANDS_ARM!=1): die "
+                "Tag-Ebene steht (#134), die Bytes stehen noch nicht im "
+                "xchg_manifest -- ein Band-Tag ohne Deskriptor waere W74")
+        if _geom_ratios and _bands_on:
             _bs, _bc = _em.band_geometry([int(x) for x in _geom_ratios], _total)
             if _bs > 0:
                 xchg_env["SGLANG_WEG2_EXPERT_BAND_SIZE"] = str(_bs)

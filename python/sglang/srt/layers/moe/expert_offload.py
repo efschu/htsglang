@@ -5616,6 +5616,28 @@ def publish_expert_bands(layer, attr: str, buf, resident_ids) -> int:
     gesetzt hat.
 
     Gibt die Zahl der veroeffentlichten Baender zurueck (0 = Teilung aus).
+
+    KEIN AUFRUFER, UND WARUM -- gemessen an fnFL2w67 (9a50ccbb34), nicht
+    vermutet. Am Metall tat diese Funktion genau, was sie sollte: der Walk fand
+    jedes Band unter seinem richtigen Tag
+    (``WEG2-XCHG-UNCOVERED rank=0 tag=weights_13_e0 kind=attribute
+    name=model.layers.40.mlp.experts.weg2_eband0_w13_weight_packed``).
+    Trotzdem ist ein VIEW in DIESER Buchhaltung kein eigenstaendiges Stueck,
+    und die Zeile sagt es selbst: ``mib=800.000`` fuer ein Band mit
+    ``shape=[16, 160, 2560]`` int32 = 25 MiB. ``_nbytes`` misst den STORAGE
+    (``untyped_storage().nbytes()``), absichtlich, weil ``covered_storage``
+    per Storage-Key deckt und ein View so nicht zweimal zaehlt -- dieselbe
+    Eigenschaft, die ihn als Transport-Stueck untauglich macht. Ergebnis:
+    ``W84 Weg2XchgCoverageRefused: 1056/1392/992 finding(s)``, Boot gestoppt.
+    Die Refusal hatte recht.
+
+    DER RICHTIGE ORT ist ``weg2/xchg_manifest.py`` -- das Cross-Group-Manifest,
+    in dem jeder Rang aufschreibt, was sein Loader entschieden hat, und dessen
+    Join die zwei Fragen beantwortet, die kein Rang allein kann: welche P-Stufe
+    die Quelle haelt, und wie der Tensor ueber D geschnitten ist. Genau das ist
+    ein Experten-Band. Diese Funktion bleibt mit ihren Tests stehen, weil die
+    Bereichsrechnung (``expert_band_slot_ranges``) dort unveraendert gebraucht
+    wird; was faellt, ist nur der Weg ueber Modul-Attribute.
     """
     from sglang.srt.managers.weg2_memory_saver import expert_band_attr_name
 
@@ -5814,15 +5836,6 @@ def presplit_expert_offload_after_repack(
                     )
                 )
         presplit[attr] = (buf, spill)
-        # #134: die residenten Experten dem Flip ZEIGEN. Ohne das sieht der
-        # Austausch nur den 0-Zeilen-Platzhalter, den wir unten setzen.
-        _bands = publish_expert_bands(layer, attr, buf, plan.resident_ids)
-        if _bands:
-            logger.info(
-                "#134 EXPERTEN-BAENDER layer=%s attr=%s: %d Baender ueber "
-                "%d residente Slots veroeffentlicht (der Flip sieht sie jetzt)",
-                getattr(layer, "layer_id", "?"), attr, _bands, R,
-            )
         if store_rows is not None:
             torch.cuda.empty_cache()  # give the sizer the device bytes back (fn8m)
         # #119: tally the VRAM this tensor stops holding, so the KV-pool sizing
