@@ -12145,6 +12145,66 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f" gewuenschte: passen die Vektoren nicht zusammen, kollidiert"
             f" der geteilte Store weiterhin beim Oeffnen der Datei")
 
+    # #107: DIE EXPERTEN-KARTE. Nutzer-Gesetz 22.09.: "alles was geshardet
+    # wird braucht ne karte". #106 publiziert die zwei VEKTOREN, aus denen
+    # jede Gruppe ihre Aufteilung ableitet -- das reicht nicht, denn eine
+    # Ableitung kann von der anderen abweichen (acht tote Boots am 22.09.,
+    # zuletzt an funf Ids, weil die rohen Ratios 183,137,168 statt der
+    # skalierten 192,144,176 als Bereichsgrenzen dienten).
+    #
+    # Die Karte schreibt die Aufteilung HIN, einmal, hier: wer haelt welche
+    # globale Id, und wo liegt der Rest. Beide Gruppen LESEN sie.
+    #
+    # Sie ist der TAUSCH, nicht die Vereinigung (Nutzer 07:08Z): "die vram
+    # layer zurueck in den moe cache und die benoetigten experten in den
+    # vram, kein zusaetzlicher systemram". Der Store haelt darum
+    # `total - resident` Zeilen -- 324 bei 188 residenten, exakt die in
+    # fnFL2w24/w30 gemessene Zahl -- und nicht die Vereinigung (420).
+    try:
+        from sglang.srt.layers.moe import expert_map as _em
+
+        _fr_p = _argv_vector(getattr(ns, "extra_p", ""),
+                             "--pp-cut-expert-device-fraction") or \
+            _argv_vector(getattr(ns, "extra_p", ""),
+                         "--rank-moe-resident-fraction")
+        _pp_frac = float(_fr_p[0]) if _fr_p else None
+        if _geom_ratios and _geom_fracs and _pp_frac is not None:
+            _karte = _em.build(
+                total=int(_argv_vector(getattr(ns, "extra_d", ""),
+                                       "--num-experts")[0])
+                if _argv_vector(getattr(ns, "extra_d", ""), "--num-experts")
+                else 512,
+                ratios=[int(x) for x in _geom_ratios],
+                fr_pp=_pp_frac,
+                fr_tp=[float(x) for x in _geom_fracs])
+            _grund = _em.refuse_if_inconsistent(_karte)
+            if _grund:
+                log(f"WEG2-EXPERT-MAP REFUSED: {_grund} -- keine Karte "
+                    f"publiziert, beide Gruppen rechnen wie vor #107")
+            else:
+                import json as _json
+
+                _mp = os.path.join(getattr(ns, "evidence_dir", EVIDENCE_DIR),
+                                   f"expert_map_{ns.tag}.json")
+                with open(_mp, "w") as _fh:
+                    _json.dump(_karte, _fh)
+                xchg_env[_em.MAP_ENV] = _mp
+                log(f"WEG2-EXPERT-MAP {_mp} total={_karte['total']} "
+                    f"slots={_karte['slots']} spans={_karte['spans']} "
+                    f"bounds={_karte['bounds']} moves={_karte['moves']} "
+                    f"shared_resident={_karte['shared_resident']} -- BEIDE "
+                    f"Gruppen lesen diese Karte statt zu rechnen (#107); "
+                    f"slots ist der TAUSCH (total-resident), nicht die "
+                    f"Vereinigung")
+        else:
+            log(f"WEG2-EXPERT-MAP none ratios={_geom_ratios} "
+                f"fracs={_geom_fracs} pp_frac={_pp_frac} -- ohne alle drei "
+                f"Angaben wird KEINE Karte publiziert (eine halbe waere "
+                f"schlimmer als keine)")
+    except BaseException as _exc:  # noqa: BLE001 -- eine Karte kippt nie den Boot
+        log(f"WEG2-EXPERT-MAP failed: {type(_exc).__name__}: {_exc}")
+
+
     # #1369: PUBLISHED UNCONDITIONALLY, unlike everything else in `xchg_env`
     # above -- `prepare_xchg_env` returns `{}` outright under an un-armed
     # exchange (`weight_source not in WEIGHT_SOURCE_ARMED`), which is correct

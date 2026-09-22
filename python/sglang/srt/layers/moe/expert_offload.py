@@ -5155,6 +5155,25 @@ def _hotset_global_ids(layer, num_global, lo, pad):
     return {g for g in ids if 0 <= g < int(num_global)} or None
 
 
+def _group_of_layer(layer) -> str:
+    """``P`` fuer die PP-Gruppe, ``D`` fuer die TP-Gruppe (#107).
+
+    Die Karte fuehrt zwei Phasen, und ein Rang muss wissen, welche seine
+    ist. ``SGLANG_WEG2_GROUP`` setzt der Launcher ohnehin je Gruppe; ohne
+    sie entscheidet die Form: wer JEDEN Experten haelt
+    (``num_local == num_global``) ist die unsharded PP-Stufe, wer einen
+    Ausschnitt haelt, ist TP.
+    """
+    import os
+
+    g = os.environ.get("SGLANG_WEG2_GROUP", "").strip()
+    if g:
+        return g
+    nl = int(getattr(layer, "num_local_experts", 0) or 0)
+    ng = int(getattr(layer, "num_experts", 0) or 0)
+    return "P" if (ng and nl == ng) else "D"
+
+
 def _expert_store_rows_for(layer, plan):
     """``(dir, layer_key, lo, num_global, local->row)`` when the shared expert
     store is on and this layer is a generic expert-dim shard; else ``None``."""
@@ -5236,7 +5255,47 @@ def _expert_store_rows_for(layer, plan):
         # der eigenen kalten Id in der aufsteigenden kalten Liste. Beides
         # braucht weder --rank-moe-ratio noch die Fraction-Vektoren, die
         # Gruppe D unter Form A gar nicht auf diesem Weg fuehrt.
-        _global_only = _es.shared_resident_ids()
+        # #107: DIE KARTE ZUERST. Nutzer-Gesetz 22.09.: "alles was geshardet
+        # wird braucht ne karte". Steht sie, ist sie die AUTORITAET -- die
+        # vier Ableitungen darunter (shared_resident_ids, slot_base_for_rank,
+        # global_rows, das Hotset) bleiben nur als Rueckfall fuer Laeufe ohne
+        # Karte. Sie haben sich am 22.09. in acht Boots gegenseitig
+        # widersprochen, weil jede dieselbe Aufteilung neu ausrechnete:
+        #   w42-44  P rechnete 451 Plaetze, D 512
+        #   w45     beide 512 -> 59 GB tmpfs -> oom_kill 27->28, P tot
+        #   w46-49  #97, viermal -- zuletzt an funf Ids (183..187), weil die
+        #           ROHEN Ratios 183,137,168 als Bereichsgrenzen genommen
+        #           wurden statt der vom Server SKALIERTEN 192,144,176
+        # Die Karte rechnet nichts nach: sie wird gelesen.
+        _karte = _es.expert_map()
+        if _karte is not None:
+            from sglang.srt.layers.moe import expert_map as _em
+
+            _phase = _em.phase_of(_group_of_layer(layer))
+            _fehlend = [g for g in _index.values()
+                        if _em.slot_of(_karte, _phase, g) is None]
+            if _fehlend:
+                # Nach dem Umbau kann das nur noch heissen, dass die KARTE
+                # selbst falsch ist -- nicht, dass zwei Rechnungen
+                # auseinanderlaufen. Deshalb nennt die Meldung die Karte.
+                raise RuntimeError(
+                    f"#107: {len(_fehlend)} eigene kalte Experten haben in der "
+                    f"KARTE keinen Platz (erste: {_fehlend[:4]}, Phase "
+                    f"{_phase}, mein Bereich ab lo={lo}). Die Karte sagt fuer "
+                    f"diese Phase {len(_karte['phases'][_phase]['slot_of'])} "
+                    f"kalte Ids bei {_karte['slots']} Plaetzen; sie und die "
+                    f"tatsaechliche Residenz muessen dieselbe Aufteilung "
+                    f"meinen."
+                )
+            _index = {k: _em.slot_of(_karte, _phase, g)
+                      for k, g in _index.items()}
+            _slots = int(_karte["slots"])
+            _em_phase, _karte_slots = _phase, _slots
+
+        # KEIN frueher `return` hier: die `#96 STORE-SLOTS`-Zeile am Ende der
+        # Funktion ist der Beleg, an dem w22/w24/w26 gemessen wurden, und sie
+        # muss auch fuer den Kartenweg kommen.
+        _global_only = None if _karte is not None else _es.shared_resident_ids()
         if _global_only is not None:
             _kalt = [e for e in range(num_global) if e not in _global_only]
             _pos = {g: i for i, g in enumerate(_kalt)}
@@ -5331,9 +5390,11 @@ def _expert_store_rows_for(layer, plan):
         import logging as _lg
         _lg.getLogger(__name__).info(
             "#96 STORE-SLOTS rank=%s lo=%s pad=%s num_global=%s | "
-            "slot_fraction=%.3f hot=%s global_res=%s ratios=%s fracs=%s | "
-            "SLOTS=%s (None bedeutet: der Block lief nicht, Datei = num_global)",
+            "karte=%s slot_fraction=%.3f hot=%s global_res=%s ratios=%s "
+            "fracs=%s | SLOTS=%s (karte=... heisst: #107, die Karte war die Autoritaet; None bedeutet: der Block lief nicht, Datei = num_global)",
             getattr(layer, "moe_tp_rank", "?"), lo, pad, num_global,
+            (f"{_em_phase}/{_karte_slots}" if locals().get("_karte") is not None
+             else None),
             _es.slot_fraction(),
             len(_hot_ids) if _hot_ids else None,
             len(_es.shared_resident_ids() or ()) or None,

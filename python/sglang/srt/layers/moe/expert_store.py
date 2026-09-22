@@ -56,6 +56,9 @@ SLOT_FRACTION_ENV = "SGLANG_MOE_EXPERT_STORE_SLOT_FRACTION"
 #: Deshalb gibt der Launcher -- der als einziger BEIDE Konfigurationen kennt
 #: -- eine gemeinsame Geometrie vor, und beide Gruppen rechnen daraus
 #: dieselbe Abbildung `globale Id -> Slot`. Format: "r0,r1,r2|f0,f1,f2".
+#: #107: die Karte, die der Launcher fuer BEIDE Gruppen publiziert.
+EXPERT_MAP_ENV = "SGLANG_MOE_EXPERT_MAP"
+
 STORE_GEOMETRY_ENV = "SGLANG_MOE_EXPERT_STORE_GEOMETRY"
 
 __all__ = [
@@ -219,6 +222,56 @@ def shared_resident_ids():
     if not ids or any(i < 0 for i in ids):
         return None
     return frozenset(ids)
+
+
+_EXPERT_MAP_CACHE = {}
+
+
+def expert_map():
+    """DIE EXPERTEN-KARTE dieses Boots, oder ``None``.
+
+    #107, Nutzer-Gesetz 22.09.: *"alles was geshardet wird braucht ne
+    karte"*. Der Launcher publiziert sie ueber ``SGLANG_MOE_EXPERT_MAP``,
+    weil nur er beide Ranggruppen kennt -- dieselbe Stelle, an der #106
+    schon die Store-Geometrie publiziert. Steht sie, rechnet KEINE Gruppe
+    mehr selbst; sie lesen dieselbe Datei.
+
+    KONSERVATIV wie ``shared_geometry``: unlesbar, widerspruechlich oder
+    leer gibt ``None`` zurueck, nicht eine halbe Karte. Eine falsche Karte
+    waere eine falsche Slot-Zuordnung, und die ist Datenverlust, nicht
+    Speicherverlust. Der Widerspruchstest sitzt in
+    ``expert_map.refuse_if_inconsistent`` -- EINE Stelle, statt vier
+    Ableitungen, die sich gegenseitig widersprechen koennen.
+    """
+    import json
+    import logging
+    import os
+
+    pfad = os.environ.get(EXPERT_MAP_ENV, "").strip()
+    if not pfad:
+        return None
+    if pfad in _EXPERT_MAP_CACHE:
+        return _EXPERT_MAP_CACHE[pfad]
+    karte = None
+    try:
+        with open(pfad) as fh:
+            roh = json.load(fh)
+        from sglang.srt.layers.moe import expert_map as _em
+
+        grund = _em.refuse_if_inconsistent(roh)
+        if grund:
+            logging.getLogger(__name__).error(
+                "#107 EXPERTEN-KARTE %s VERWORFEN: %s -- dieser Lauf rechnet "
+                "wie vor der Karte, also koennen zwei Gruppen wieder "
+                "auseinanderlaufen", pfad, grund)
+        else:
+            karte = roh
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        logging.getLogger(__name__).error(
+            "#107 EXPERTEN-KARTE %s unlesbar (%s: %s)", pfad,
+            type(exc).__name__, exc)
+    _EXPERT_MAP_CACHE[pfad] = karte
+    return karte
 
 
 def shared_geometry():
