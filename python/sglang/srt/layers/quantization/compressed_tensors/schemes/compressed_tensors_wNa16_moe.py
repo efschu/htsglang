@@ -520,6 +520,33 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             )
             replace_tensor("w2_weight_packed", marlin_w2_qweight)
         # Repack scales
+        # #112/3 DIESELBE HOST-ALLOKATION, DIESELBE BEHANDLUNG.
+        #
+        # `create_weights` baut JEDEN expert-major Tensor auf dem HOST,
+        # wenn die Residenz-Fraction < 1.0 ist ("the full [E, ...] stack
+        # never sits on the card at once") -- packed weights, group scales
+        # UND zero points. Auf dem Plattenweg zieht der
+        # `device_loading_context` des Loaders sie fuer den Repack auf die
+        # Karte; mein Adoptionszweig laeuft daran vorbei, also muessen die
+        # Scales hier selbst hinueber. Sonst erbt
+        # `marlin_moe_permute_scales` das Host-Device und der Fehler
+        # wandert nur eine Zeile weiter (fnFL2w57 war die erste).
+        #
+        # Nur unter Platzhaltern: auf dem Plattenweg liegen sie zu diesem
+        # Zeitpunkt bereits auf der Karte, und ein `.to()` waere dort eine
+        # zusaetzliche Kopie ueber 48 Layer.
+        if _platzhalter:
+            _dev2 = torch.device("cuda", torch.cuda.current_device())
+            for _attr in (
+                "w13_weight_scale",
+                "w2_weight_scale",
+                "w13_weight_zero_point",
+                "w2_weight_zero_point",
+            ):
+                _t = getattr(layer, _attr, None)
+                if _t is not None and _t.device.type != "cuda":
+                    replace_tensor(_attr, _t.data.to(_dev2))
+
         marlin_w13_scales = marlin_moe_permute_scales(
             layer.w13_weight_scale,
             layer.w13_weight_packed.shape[2],

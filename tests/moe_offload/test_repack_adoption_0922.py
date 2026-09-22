@@ -86,3 +86,17 @@ def test_112_die_leeren_puffer_liegen_auf_der_KARTE():
     assert "device=_dev" in code
     assert 'torch.device("cuda"' in code
     assert "device=layer.w13_weight_packed.device" not in code
+
+
+def test_112_3_die_scales_gehen_auch_auf_die_karte():
+    """create_weights baut JEDEN expert-major Tensor auf dem Host, wenn die
+    Residenz-Fraction < 1.0 ist -- Scales und Zero-Points ebenso wie die
+    packed weights. Der Adoptionszweig laeuft am device_loading_context des
+    Loaders vorbei, also muessen sie hier selbst hinueber."""
+    code = "\n".join(z for z in _SCHEME.split("\n") if not z.lstrip().startswith("#"))
+    i_scales = code.index("marlin_w13_scales = marlin_moe_permute_scales")
+    davor = code[max(0, i_scales - 900):i_scales]
+    assert "w13_weight_scale" in davor and "_dev2" in davor
+    assert "w13_weight_zero_point" in davor, "die Zero-Points fehlen"
+    # und NUR unter Platzhaltern -- sonst eine Extrakopie ueber 48 Layer
+    assert "if _platzhalter:" in davor
