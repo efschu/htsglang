@@ -81,3 +81,37 @@ def test_beide_bekannten_puffer_sind_erfasst():
     """Regression: _ctl_dev (#1330) und _round_dev (#142, w73/w74)."""
     quellen = _device_sources(_poll_body())
     assert {"_ctl_dev", "_round_dev"} <= quellen, sorted(quellen)
+
+
+def test_der_kopierversuch_disarmt_bei_jeder_ausnahme():
+    """#144: w80 hat den Vorab-Test widerlegt -- der VERSUCH muss fangen.
+
+    `RuntimeError: unknown parameter type` kam am Metall genau an dem copy_,
+    das der #1330-data_ptr-Guard passieren liess: ein TMS-Release hinterlaesst
+    keinen Nullzeiger. Und der Traceback stand ZWEIMAL im Log -- der Poll lief
+    nach dem ersten Fehlschlag weiter und vergiftete den Kontext erneut.
+    Also: jede Ausnahme aus dem Kopierblock fuehrt zum Disarm, nicht nach oben.
+    """
+    fn = _poll_body()
+    tries = [n for n in ast.walk(fn) if isinstance(n, ast.Try)]
+    assert tries, "kein try im Poll -- ein Vorab-Test allein reicht nicht (w80)"
+    deckend = []
+    for t in tries:
+        quellen = set()
+        for node in ast.walk(ast.Module(body=t.body, type_ignores=[])):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "copy_"):
+                quellen.add(True)
+        if not quellen:
+            continue
+        for h in t.handlers:
+            breit = h.type is None or (isinstance(h.type, ast.Name)
+                                       and h.type.id == "Exception")
+            disarm = any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                         and "disarm" in c.func.attr for c in ast.walk(h))
+            if breit and disarm:
+                deckend.append(t)
+    assert deckend, (
+        "der copy_-Block ist nicht von einem try/except Exception gedeckt, "
+        "das disarmt. Ohne das faellt der Poll jede Runde erneut und "
+        "vergiftet den CUDA-Kontext weiter (fnFL2w80: derselbe Traceback 2x).")

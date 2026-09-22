@@ -5659,8 +5659,29 @@ class BarlinkBar1Transport:
                 "it; polling it would fault the context")
             return bool(self._abort_code_seen)
 
-        with torch.cuda.stream(self._abort_poll_stream):
-            self._abort_poll_dst.copy_(self._ctl_dev[0:1], non_blocking=True)
+        # #144: DER VORAB-TEST KANN DEN VERLUST NICHT SEHEN -- DER VERSUCH SCHON.
+        #
+        # #1330 nennt als die zu verhindernde Signatur woertlich:
+        #     self._abort_poll_dst.copy_(self._ctl_dev[0:1], non_blocking=True)
+        #     RuntimeError: unknown parameter type
+        #     Fatal Python error: Segmentation fault
+        # und prueft dagegen data_ptr()==0. Boot fnFL2w80 zeigt am Metall,
+        # dass dieser Test die Lage NICHT trifft: der Fehler kam GENAU so,
+        # waehrend der Guard passieren liess -- ein TMS-Release hinterlaesst
+        # hier keinen Nullzeiger, sondern eine Storage, deren Typ die Kopie
+        # nicht mehr aufloesen kann. Ein Vorab-Test auf eine Eigenschaft, die
+        # der Verlust nicht setzt, ist kein Riegel.
+        #
+        # Der Kommentar oben benennt den Verstaerker selbst: "'Log and
+        # continue' is the amplifier, not the safety net: a poll that failed
+        # once fails every round and each attempt re-poisons." Im w80-Log
+        # steht dieser Traceback ZWEIMAL hintereinander -- der Poll lief
+        # weiter. Also faengt der Versuch seine eigene Ausnahme und DISARMT
+        # beim ersten Fehlschlag, statt sie nach oben zu reichen und beim
+        # naechsten Durchlauf zu wiederholen.
+        try:
+            with torch.cuda.stream(self._abort_poll_stream):
+                self._abort_poll_dst.copy_(self._ctl_dev[0:1], non_blocking=True)
             # #622: stage the three round words (round, mesh watermark, a2a
             # watermark) alongside the abort word, on the same private
             # stream. This gives the SIGUSR1 launch dump a host-resident
@@ -5701,6 +5722,13 @@ class BarlinkBar1Transport:
             ):
                 n = min(3, self._round_dev.numel())
                 self._round_mirror[:n].copy_(self._round_dev[:n], non_blocking=True)
+        except Exception as exc:  # noqa: BLE001 -- ANY failure means the backing is gone
+            self._abort_poll_disarm(
+                f"the control-word copy raised ({type(exc).__name__}: {exc}) "
+                "-- the device backing is gone in a way data_ptr() cannot "
+                "show; disarming NOW rather than re-poisoning the context "
+                "each round (#1330's own amplifier, measured in fnFL2w80)")
+            return bool(self._abort_code_seen)
         # Waits for THIS copy on THIS stream only -- not for the model.
         self._abort_poll_stream.synchronize()
         code = int(self._abort_poll_dst[0])
