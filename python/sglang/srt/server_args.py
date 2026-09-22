@@ -9387,23 +9387,33 @@ class ServerArgs:
                 f"with data parallelism (dp_size={self.dp_size}, "
                 f"enable_dp_attention={self.enable_dp_attention})."
             )
-        # #148 (Nutzer-Order 22.09.): PP is refused because solo normally
-        # ASSEMBLES the draft's full vocab tables from the target's TP vocab
-        # shards -- an init-time all-rank gather (_solo_init_lm_head), and a
-        # collective cannot be issued from pipeline stages that run different
-        # layers. That reason vanishes when the tables are not TP-sharded at
-        # all: at tp_size == 1 every stage holds them whole, there is "no
-        # shard to assemble and no rank to gather from", and the solo path
-        # takes its collective-free branch (the same one Form A uses,
-        # eagle_worker_v2._solo_init_lm_head: "neither side issues a
-        # collective"). init_lm_head() then SHARES the target's modules
-        # instead of loading a second copy -- which is the point here:
-        # measured on fnFL2w116/w117, P's PP2 stage loaded its own
-        # embed_tokens 1,18 + lm_head 1,18 GiB (draft census 3,92 GiB total
-        # against INT4 experts of only 1,32) and died in cu_mem_create.
+        # #148 (Nutzer-Order 22.09.): PP is refused because solo ASSEMBLES the
+        # draft's full vocab tables from the target's TP vocab shards -- an
+        # init-time all_gather in _solo_init_lm_head that every participant
+        # must enter at the same point. Pipeline stages run DIFFERENT layers
+        # and cannot, so with a real gather the refusal is correct.
         #
-        # So the refusal stays for tp_size > 1 -- there the gather is real --
-        # and lifts for the un-sharded case only.
+        # At tp_size == 1 there is no gather to enter: the TP group holds one
+        # rank, its all_gather is a no-op that blocks nobody, and no vocab
+        # sharding exists to undo -- not by tp_size and not by
+        # --rank-vocab-ratio either. Each stage holds the tables whole.
+        #
+        # NOT the argument: Form A's collective-free branch
+        # (form_a_dense_is_unsharded). That predicate reads an INSTALLED PLAN
+        # and is False for a plain `tp1 pp3` boot, so this case takes the
+        # gather path -- harmlessly, over a one-rank group.
+        #
+        # WHY it matters, measured on fnFL2w116/w117 (reproducible to the
+        # MiB): with solo unavailable, P's PP2 stage fell through to the
+        # third early-share branch and loaded its OWN embed_tokens 1,18 +
+        # lm_head 1,18 GiB. Draft census 3,92 GiB against INT4 experts of
+        # only 1,32; nvml2 jumped 3984 MiB to 18914/20480 and died in
+        # cu_mem_create.
+        #
+        # The sufficient condition -- that the solo host ends up sharing the
+        # target's modules rather than loading a second copy -- is checked
+        # where it is knowable, in the worker (W149 below is the startup half
+        # only).
         if self.pp_size > 1 and self.tp_size > 1:
             raise ValueError(
                 "--speculative-draft-placement solo cannot combine pipeline "

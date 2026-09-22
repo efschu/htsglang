@@ -509,6 +509,36 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.init_token_map()
             self._solo_init_lm_head()
             self._embed_head_shared_early = True
+            # #148 second half. server_args lets solo through under PP when
+            # tp_size == 1 (no gather to enter). That is NECESSARY, not
+            # sufficient: it says the init cannot deadlock, not that the
+            # draft ends up SHARING the target's vocab modules. If it does
+            # not, every stage loads its own embed_tokens + lm_head, which is
+            # exactly the failure #148 exists to remove (fnFL2w116/w117:
+            # 1,18 + 1,18 GiB on PP2, nvml2 18914/20480, cu_mem_create).
+            # Refuse HERE, before the draft weights are read, rather than
+            # letting the boot die in C++ with no Python traceback.
+            _pp = int(getattr(server_args, "pp_size", 1) or 1)
+            if _pp > 1:
+                _tm = self.target_worker.model_runner.model
+                _shares = target_shares_vocab_modules(
+                    getattr(_tm, "lm_head", None),
+                    getattr(getattr(_tm, "model", None), "embed_tokens", None),
+                )
+                if not _shares:
+                    raise ValueError(
+                        "W149 Weg2SoloDraftVocabUnshared: "
+                        "--speculative-draft-placement solo under pipeline "
+                        f"parallelism (pp_size={_pp}) requires the draft to "
+                        "SHARE the target's vocab modules, but the target's "
+                        "embed_tokens/lm_head still carry their own .weight "
+                        "tensors -- so this stage would load a SECOND full "
+                        "copy (measured 1,18 + 1,18 GiB on Next Flash, which "
+                        "is what kills the stage in cu_mem_create). Enable "
+                        "--ple-offload-embedding on the target (its host "
+                        "embedding has no .weight to duplicate), or use "
+                        "--speculative-draft-placement split."
+                    )
         elif self.draft_kv_only:
             self.init_token_map()
             self._embed_head_shared_early = True
