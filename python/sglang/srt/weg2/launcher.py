@@ -1371,7 +1371,7 @@ D_DECODE_STEPS_PROVENANCE = (
 #: the launcher adds is the CHOICE plus a line that prints all three vectors
 #: beside each other so the trade is readable per boot instead of per
 #: archaeology.
-D_TP_OBJECTIVE_CHOICES = ("maxkv", "speed", "decode-bs1", "decode-bs6", "pinned")
+D_TP_OBJECTIVE_CHOICES = ("maxkv", "speed", "decode-bs1", "decode-bs6")
 
 #: USER ORDER 2026-09-09, verbatim: "der decode bs6 soll mit bs6 (nicht mehr
 #: bs4) der standard werden". Group D's default objective moves from the
@@ -8285,35 +8285,6 @@ def d_tp_ratio_decision(
                                     "the same finding is printed and the launch "
                                     "continues)." % objective)
 
-    if objective == "pinned":
-        # #147 (Next Flash Form A, task #56). Die vier gerechneten Objectives
-        # sind an der 27B-GEOMETRIE kalibriert -- `decode-bs6`s [3991,1000,1000]
-        # ist der TP0-Vektor aus task #11 (xsn-Linie), nicht Next Flash. Next
-        # Flash faehrt Form A: die 5090 ist Attention-Host (Dense, KV, Draft),
-        # die 3080er sind REINE Experten-Worker, also `--rank-tp-ratio 1,0,0`,
-        # wie die fnFA-Bestform es seit fnFA22 fuhr.
-        #
-        # Dieser Pin stand die ganze Zeit im --extra-d des fnFL2-Arms und kam
-        # NIE an: argv_d() setzt `d_ratio.flags` HINTER `shlex.split(ns.extra_d)`,
-        # und argparse nimmt bei doppeltem Flag den LETZTEN Wert. Jeder
-        # Flip-Boot lief damit im 27B-Vektor [1765,1042,1042] -- gemessen an
-        # fnFL2w110..w113, wo beide 3080er 17-18 GB trugen statt fast nichts.
-        # `pinned` haengt NICHTS an und laesst den Pin des Arms damit gelten.
-        return DTpRatioDecision(
-            objective=objective,
-            tune=tune,
-            flags=(),
-            line=(
-                "WEG2 D-TP-RATIO pinned: kein Solver-Vektor angehaengt -- es "
-                "gilt der --rank-tp-ratio aus --extra-d. Die gerechneten "
-                "Objectives (%s) sind an der 27B-Geometrie kalibriert und "
-                "beschreiben Next Flash Form A nicht." % (
-                    "|".join(o for o in D_TP_OBJECTIVE_CHOICES if o != "pinned"),
-                )
-            ),
-            op_line=op_line,
-            rows=tuple(op_rows),
-        )
     if objective == "speed":
         flags = ("--rank-tp-ratio", "auto-performance", "--rank-perf-tune", str(tune))
     elif objective in D_OPERATING_POINTS:
