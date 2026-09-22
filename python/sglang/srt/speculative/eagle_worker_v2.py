@@ -546,6 +546,41 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.init_token_map()
             self.init_lm_head()
             self._embed_head_shared_early = True
+            # #150: SAGE WARUM, statt es aus dem Zensus zu erraten.
+            # init_lm_head() teilt die Vokabular-MODULE des Ziels genau dann,
+            # wenn target_shares_vocab_modules() True sagt -- sonst laedt der
+            # Draft eigene embed_tokens + lm_head. Auf Next Flash sind das
+            # 1,18 + 1,18 GiB (Zensus fnFL2w107) von 3,92 GiB Draft-Tensoren,
+            # waehrend die INT4-Experten nur 1,32 ausmachen; auf PP2 hat das
+            # den Rang in cu_mem_create getoetet (w116/w117: nvml2 sprang um
+            # 3984 MiB auf 18914/20480).
+            #
+            # Die Praedikatsteile EINZELN, weil der Verdacht genau dort sitzt:
+            # unter PP liegt embed_tokens auf Stufe 0, der Draft aber auf der
+            # letzten -- ein None dort macht das Praedikat False, ohne dass
+            # jemand es sieht. Eine Zeile, kein Refusal: dieser Zweig ist der
+            # Normalfall jedes nicht-EAGLE3-Boots.
+            try:
+                _tm = self.target_worker.model_runner.model
+                _lh = getattr(_tm, "lm_head", None)
+                _em = getattr(getattr(_tm, "model", None), "embed_tokens", None)
+                logger.info(
+                    "#150 DRAFT-VOCAB-SHARE shared=%s | lm_head=%s(weight=%s,"
+                    " qweight=%s) embed_tokens=%s(weight=%s) | pp_size=%s"
+                    " pp_rank=%s tp_size=%s -- shared=False heisst: dieser"
+                    " Rang laedt eine ZWEITE volle Vokabular-Kopie",
+                    target_shares_vocab_modules(_lh, _em),
+                    type(_lh).__name__ if _lh is not None else None,
+                    hasattr(_lh, "weight") if _lh is not None else None,
+                    hasattr(_lh, "qweight") if _lh is not None else None,
+                    type(_em).__name__ if _em is not None else None,
+                    hasattr(_em, "weight") if _em is not None else None,
+                    getattr(server_args, "pp_size", 1),
+                    getattr(self, "pp_rank", "?"),
+                    getattr(server_args, "tp_size", 1),
+                )
+            except Exception as _exc:  # noqa: BLE001 -- Diagnose toetet nie
+                logger.info("#150 DRAFT-VOCAB-SHARE unlesbar: %s", _exc)
 
         self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
