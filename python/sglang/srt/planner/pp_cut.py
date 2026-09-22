@@ -1410,6 +1410,7 @@ def solve_expert_fraction_per_d_rank(
     expert_span_by_rank,
     scratch_rows_by_rank=None,
     reserve_mib_by_rank=None,
+    kv_mib_by_rank=None,
 ):
     """Je D-TP-Rang die GROESSTE Experten-Fraction, die auf die Karte passt.
 
@@ -1457,8 +1458,20 @@ def solve_expert_fraction_per_d_rank(
     row_mib = float(expert_layer_mib) / max(1, int(num_experts))
     L = max(1, int(n_layers))
     out = []
-    for a, d, sp, sc in zip(avail, dense, span, scratch):
-        frei = float(a) - L * (float(d) + row_mib * float(sc))
+    kv = (list(kv_mib_by_rank) if kv_mib_by_rank is not None else [0.0] * n)
+    if len(kv) != n:
+        raise ValueError(
+            f"solve_expert_fraction_per_d_rank: {n} Karten, aber {len(kv)} "
+            f"KV-Posten -- eine halbe Geometrie loest nichts"
+        )
+    # #156 auf der D-Seite: derselbe fehlende Posten wie bei den PP-Stufen.
+    # Nutzer 22.09.: "kv muss bepreist werden fuer 262k und danach geht der
+    # rest an moe experten". Ohne den Term ist das Ergebnis die Decke OHNE
+    # Kontext -- und genau daran wurde FR_D acht Boots lang von Hand
+    # vorbeigeraten (w123..w131 fuhren 0.006 auf einer Karte mit 16,18 GiB
+    # freiem VRAM = Platz fuer 143 Slots).
+    for a, d, sp, sc, kvr in zip(avail, dense, span, scratch, kv):
+        frei = float(a) - L * (float(d) + row_mib * float(sc)) - float(kvr)
         nenner = L * row_mib * float(sp)
         f = frei / nenner if nenner > 0 else 0.0
         out.append(min(1.0, max(0.0, f)))
