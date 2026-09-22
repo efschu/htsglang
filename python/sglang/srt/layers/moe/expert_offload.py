@@ -1481,6 +1481,7 @@ def plan_load_time_staging(
     fraction: Optional[float] = None,
     pinned_experts: Sequence[int] = (),
     cold_shard: Optional[ColdShardContext] = None,
+    resident_order: Optional[Sequence[int]] = None,
 ) -> Optional[ExpertStagingPlan]:
     """Residency plan for a load-time split, or ``None`` when there is none.
 
@@ -1553,6 +1554,21 @@ def plan_load_time_staging(
     # Liste (``_moe_offload_frozen_layout``, ``MoEExpertOffloadCache``), keiner
     # rechnet sie nach.
     resident_ids = sorted(pinned + rest[: R - len(pinned)])
+    if resident_order is not None:
+        # Version-2-Karte (Platztausch): die PUFFER-REIHENFOLGE ist der
+        # Vertrag mit dem Austausch -- Zeilen [0, praefix) sind die, die beide
+        # Phasen halten, nach Id sortiert. Die Menge muss exakt die sein, die
+        # oben entstand (die Karte hat genau R Ids gepinnt); nur die Ordnung
+        # kommt von ihr. Die Baender (#134) sind unter dieser Form aus.
+        order = [int(e) for e in resident_order]
+        if sorted(order) != resident_ids or len(set(order)) != len(order):
+            raise ValueError(
+                f"resident_order nennt {len(order)} Ids, die Residenz dieses "
+                f"Plans hat {len(resident_ids)} -- nicht dieselbe Menge "
+                f"(erste Abweichung: "
+                f"{sorted(set(order) ^ set(resident_ids))[:4]})"
+            )
+        resident_ids = order
     resident_set = set(resident_ids)
     spill_ids = [e for e in range(E) if e not in resident_set]
     C = scratch_slot_count(R, E)
@@ -3428,11 +3444,20 @@ class MoEExpertOffloadCache:
                 resident_buf, spill = presplit[attr]  # buf[R+C] GPU, spill host
                 self._resident[attr] = resident_buf
                 self._pinned[attr] = spill
-                setattr(
-                    self.layer,
-                    attr,
-                    torch.nn.Parameter(resident_buf, requires_grad=False),
+                _stack = torch.nn.Parameter(resident_buf, requires_grad=False)
+                # PLATZTAUSCH: dieser Parameter ist ein ALIAS des Experten-
+                # Puffers, den der Presplit schon (als Praefix) dem Flip
+                # veroeffentlicht hat. Ohne Markierung saehe der Austausch nach
+                # dem ersten Forward einen zweiten, ungeplanten Tensor ueber
+                # demselben Storage -- W84 `uncovered`, oder bei einem Manifest
+                # nach dem Install ein ganzer [R+C]-Stapel im Plan, den die
+                # andere Gruppe nie gleich schneiden kann (W68).
+                from sglang.srt.managers.weg2_memory_saver import (
+                    mark_expert_stack_alias,
                 )
+
+                mark_expert_stack_alias(_stack)
+                setattr(self.layer, attr, _stack)
                 continue
             # Split-here path (full [E] tensor present).
             full = getattr(self.layer, attr, None)
@@ -4007,20 +4032,8 @@ class MoEExpertOffloadCache:
         staging = max(1, min(staging, C - 1, PLAN_WIDTH))
         attrs = [a for a in self._pinned if a in self._resident]
         device = self._resident[attrs[0]].device
-        pool_index = self._spill_pool_index
-        resident_ids = self.planner.resident_ids
-        host_row = []
-        for e in range(E):
-            resident = (e < R) if resident_ids is None else (e in resident_ids)
-            if resident:
-                host_row.append(-1)
-            else:
-                host_row.append(int(pool_index[e]) if pool_index is not None else e - R)
-        hot_slot_of = (
-            dict(self.planner.resident_slot)
-            if self.planner.resident_slot is not None
-            else {e: e for e in range(R)}
-        )
+        hot_slot_of, host_row = self._pool_layout()
+        self._pool_staging = staging
         self._pool_tables = allocate_pool_tables(
             device, E, rows, R, staging, hot_slot_of, host_row
         )
@@ -4175,6 +4188,66 @@ class MoEExpertOffloadCache:
                 predicted, fetched, pf_hits, max(fetched - pf_hits, 0), pf_skipped,
             )
         sync_tables(self._pool_tables, dict(self._scratch_holds))
+
+    def _pool_layout(self):
+        """``(hot_slot_of, host_row)`` -- EINE Rechnung fuer Install und
+        Wake: welcher Experte in welcher Puffer-Zeile resident ist, und in
+        welcher Store-Zeile jeder kalte liegt."""
+        R, E = self.resident_count, self.num_local_experts
+        pool_index = self._spill_pool_index
+        resident_ids = self.planner.resident_ids
+        host_row = []
+        for e in range(E):
+            resident = (e < R) if resident_ids is None else (e in resident_ids)
+            if resident:
+                host_row.append(-1)
+            else:
+                host_row.append(int(pool_index[e]) if pool_index is not None else e - R)
+        hot_slot_of = (
+            dict(self.planner.resident_slot)
+            if self.planner.resident_slot is not None
+            else {e: e for e in range(R)}
+        )
+        return hot_slot_of, host_row
+
+    def rearm_after_wake(self) -> int:
+        """Nach dem Wake, bevor irgendein Forward laeuft (Platztausch).
+
+        Der Resume mappt FRISCHE Seiten; der Austausch hat nur den Praefix
+        gefuellt. Hier kommt der Rest: Pad-Zeile nullen, Extra-Zeilen aus ihren
+        festen Store-Plaetzen laden, den LRU-Zustand verwerfen (der Scratch
+        haelt Reste der anderen Gruppe) und die Pool-Tabellen an ihren alten
+        Adressen neu schreiben -- lagen sie unter einem pausierten Tag, sind
+        sie jetzt Muell, und die Graphen lesen genau diese Adressen.
+
+        Gibt die Zahl der nachgeladenen Experten-Zeilen zurueck.
+        """
+        import torch
+
+        runs = getattr(self.layer, "_moe_offload_refill_runs", ()) or ()
+        zeilen = 0
+        for attr, buf in self._resident.items():
+            spill = self._pinned.get(attr)
+            for z0, p0, n in runs:
+                if p0 < 0:
+                    buf[z0 : z0 + n].zero_()
+                    continue
+                if spill is None:
+                    raise RuntimeError(
+                        f"rearm_after_wake: Layer "
+                        f"{getattr(self.layer, 'layer_id', '?')} {attr} hat "
+                        f"Extra-Zeilen, aber keinen Store")
+                buf[z0 : z0 + n].copy_(spill[p0 : p0 + n], non_blocking=True)
+                zeilen += n
+        self._scratch_holds.clear()
+        if self._pool_ready:
+            from sglang.srt.layers.moe.expert_pool_device import reinit_pool_tables
+
+            hot_slot_of, host_row = self._pool_layout()
+            reinit_pool_tables(self._pool_tables, hot_slot_of, host_row)
+            if self._pool_pf_buffers is not None:
+                self._pool_pf_armed = False
+        return zeilen
 
     def prepare_breakable(self, topk_ids, bridge, stage=None):
         """#462 breakable route: the EAGER pre-replay phase, in one call.
@@ -5219,6 +5292,123 @@ def _karten_residenz_lokal(layer, num_local):
     return tuple(sorted(lokal))
 
 
+def _karten_layout_lokal(layer, num_local):
+    """Version-2-Karte (Platztausch): ``(reihenfolge, praefix, refill)`` oder None.
+
+    ``reihenfolge`` sind die LOKALEN Ids in PUFFER-Ordnung:
+    ``[gemeinsam (sortiert) | Pad | Extra]``. Die ersten ``praefix`` Zeilen
+    halten BEIDE Phasen und wandern ueber den Austausch; alles dahinter holt der
+    aufwachende Rang selbst aus dem Store (``refill``: ``(zeile, platz)``,
+    ``platz=-1`` ist der Null-Pad-Experte). Weil Gewichte sich nie aendern, liegt
+    jeder Experte ausserhalb der Schnittmenge DAUERHAFT in seinem festen Platz --
+    beim Schlafen wird nichts zurueckgeschrieben.
+
+    ``None``: keine Version-2-Karte oder kein globales Fenster -- dann gilt der
+    bisherige Pfad (`_karten_residenz_lokal`, Hotset, erste R).
+    """
+    from sglang.srt.layers.moe import expert_map as _em
+    from sglang.srt.layers.moe import expert_store as _es
+
+    karte = _es.expert_map()
+    if not _em.is_nested(karte):
+        return None
+    fenster = _layer_expert_window(layer)
+    layer_id = getattr(layer, "layer_id", None)
+    if fenster is None or layer_id is None:
+        return None
+    lo, pad = fenster
+    phase = _em.phase_of(_group_of_layer(layer))
+    lay = _em.rank_layout(karte, phase, int(layer_id),
+                          int(getattr(layer, "moe_tp_rank", 0) or 0))
+    if lay is None:
+        return None
+    praefix, extra, _ = lay
+
+    def lokal(g):
+        return int(g) - int(lo) + (1 if pad else 0)
+
+    pre_l = [lokal(g) for g in praefix]
+    ext_l = [lokal(g) for g in extra]
+    ausserhalb = [e for e in pre_l + ext_l if not 0 <= e < int(num_local)]
+    if ausserhalb:
+        raise RuntimeError(
+            f"Platztausch-Karte: Layer {layer_id} Phase {phase} nennt Ids "
+            f"ausserhalb dieses Rangs (lokal {ausserhalb[:4]}, lo={lo}, "
+            f"pad={pad}, E={num_local}) -- Karte und Expertenfenster "
+            f"beschreiben nicht denselben Rang"
+        )
+    reihenfolge = pre_l + ([0] if pad else []) + ext_l
+    refill = []
+    zeile = len(pre_l)
+    if pad:
+        refill.append((zeile, -1))
+        zeile += 1
+    for g in extra:
+        platz = _em.slot_of(karte, phase, g)
+        if platz is None:
+            raise RuntimeError(
+                f"Platztausch-Karte: Extra-Experte {g} (Layer {layer_id}, "
+                f"Phase {phase}) hat keinen Store-Platz -- er koennte nach dem "
+                f"Wake nicht nachgeladen werden")
+        refill.append((zeile, int(platz)))
+        zeile += 1
+    return tuple(reihenfolge), len(pre_l), tuple(refill)
+
+
+def rearm_expert_offload_after_wake(model):
+    """``(layer, zeilen)``: jeden Offload-Layer des Modells nach dem Wake
+    wieder rechenfaehig machen (Platztausch). Laeuft auf der AUFWACHENDEN Seite,
+    nachdem die Tags gemappt und die Austausch-Stuecke gesammelt sind, und
+    bevor irgendein Forward laeuft (weight_updater, hinter
+    `zero_local_scratch`).
+
+    Ein Layer ohne installierten Cache (Install ist lazy, erster Forward) wird
+    ueber seinen Presplit-Puffer bedient -- es ist derselbe Tensor, den der
+    Install spaeter uebernimmt. Ohne Version-2-Karte gibt es keine
+    `_moe_offload_refill_runs`, und die Funktion tut nichts.
+    """
+    import torch
+
+    layers = zeilen = 0
+    for module in model.modules():
+        runs = getattr(module, "_moe_offload_refill_runs", None)
+        cache = getattr(module, "_expert_offload", None)
+        if cache is not None and isinstance(cache, MoEExpertOffloadCache):
+            if runs is not None or cache._pool_ready:
+                zeilen += cache.rearm_after_wake()
+                layers += 1
+            continue
+        presplit = getattr(module, "_moe_offload_presplit", None)
+        if not runs or not presplit:
+            continue
+        for attr, (buf, spill) in presplit.items():
+            for z0, p0, n in runs:
+                if p0 < 0:
+                    buf[z0 : z0 + n].zero_()
+                    continue
+                buf[z0 : z0 + n].copy_(spill[p0 : p0 + n], non_blocking=True)
+                zeilen += n
+        layers += 1
+    if layers and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return layers, zeilen
+
+
+def _refill_runs(refill):
+    """``(zeile, platz)``-Paare zu zusammenhaengenden Laeufen
+    ``(zeile0, platz0, n)``; der Pad (``platz=-1``) bleibt ein eigener Lauf."""
+    runs = []
+    for zeile, platz in refill:
+        if (runs and platz >= 0 and runs[-1][1] >= 0
+                and zeile == runs[-1][0] + runs[-1][2]
+                and platz == runs[-1][1] + runs[-1][2]):
+            z0, p0, n = runs[-1]
+            runs[-1] = (z0, p0, n + 1)
+        else:
+            runs.append((int(zeile), int(platz), 1))
+    return runs
+
+
 def _hotset_local_ids(layer, num_local):
     """Die LOKALEN Experten-Ids aus dem Hotset -- oder () wenn keins gilt.
 
@@ -5807,8 +5997,33 @@ def presplit_expert_offload_after_repack(
     # `rest[: R - len(pinned)]` leer und `resident_ids == sorted(pinned)`.
     # Der Rang haelt also, was die Karte sagt -- und erst damit beschreibt
     # sie etwas, das jemand herstellt.
-    _karte_res = _karten_residenz_lokal(layer, int(E))
-    if _karte_res is not None:
+    # PLATZTAUSCH (Version-2-Karte, Nutzer-Entscheid 22.09.): Menge UND
+    # Reihenfolge kommen aus der Karte. Der Praefix ist, was der Austausch
+    # bewegt; dahinter Pad und Extra, die der Wake aus dem Store holt.
+    _layout = _karten_layout_lokal(layer, int(E))
+    _order = None
+    _n_praefix = None
+    if _layout is not None:
+        _order, _n_praefix, _refill = _layout
+        _R_erwartet = resident_slot_count(int(E), frac)
+        if len(_order) != _R_erwartet:
+            raise RuntimeError(
+                f"Platztausch-Karte nennt {len(_order)} residente Zeilen fuer "
+                f"Layer {getattr(layer, 'layer_id', '?')} Rang "
+                f"{getattr(layer, 'moe_tp_rank', '?')} (Praefix {_n_praefix}, "
+                f"Pad+Extra {len(_refill)}), der Rang rechnet bei Fraction "
+                f"{frac} ueber {int(E)} Experten {_R_erwartet}. Die Karte "
+                f"zaehlt mit resident_slot_count(span+pad, f) -- weichen sie "
+                f"ab, wurde sie mit anderen Fractions gebaut als dieser Rang "
+                f"laeuft.")
+        layer._moe_offload_exchange_rows = int(_n_praefix)
+        layer._moe_offload_refill_runs = tuple(_refill_runs(_refill))
+        _karte_res = None
+    else:
+        _karte_res = _karten_residenz_lokal(layer, int(E))
+    if _order is not None:
+        _pinned = _order
+    elif _karte_res is not None:
         _R_erwartet = resident_slot_count(int(E), frac)
         if len(_karte_res) != _R_erwartet:
             # KEIN Anpassen im Stillen. R bestimmt `buffer_slots` und damit
@@ -5835,6 +6050,7 @@ def presplit_expert_offload_after_repack(
         fraction=frac,
         cold_shard=cold_shard,
         pinned_experts=_pinned,
+        resident_order=_order,
     )
     if plan is None:
         return
@@ -5986,7 +6202,16 @@ def presplit_expert_offload_after_repack(
         # bei R=188, C=32 sind das 14,5 % Overhead je Tensor -- der Preis
         # dafuer, dass die Byte-Zahl des Eintrags die des Storages IST und
         # die Coverage nicht auf `short` laeuft.
-        setattr(layer, expert_buffer_attr_name(attr), buf)
+        # PLATZTAUSCH: unter der Version-2-Karte sieht der Austausch NUR den
+        # Praefix -- die Zeilen, die beide Phasen halten. Pad, Extra und
+        # Scratch reisen nicht: das Extra liegt dauerhaft im Store, der Scratch
+        # ist ein LRU-Cache. Ein View ueber den Anfang eines zusammenhaengenden
+        # Puffers flacht zu rows = praefix * (Zeilen je Experte) ab, und der
+        # Join liest daraus einen gewoehnlichen Zeilenschnitt ueber D.
+        if _n_praefix is None:
+            setattr(layer, expert_buffer_attr_name(attr), buf)
+        elif _n_praefix > 0:
+            setattr(layer, expert_buffer_attr_name(attr), buf[:_n_praefix])
         if store_rows is not None:
             torch.cuda.empty_cache()  # give the sizer the device bytes back (fn8m)
         # #119: tally the VRAM this tensor stops holding, so the KV-pool sizing

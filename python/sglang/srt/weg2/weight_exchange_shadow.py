@@ -3115,6 +3115,11 @@ def card_inventory(
     walked = 0
     for name, param in model.named_parameters():
         walked += 1
+        if ms.is_expert_stack_alias(param):
+            # Platztausch: Alias des Experten-Puffers (Install nach dem ersten
+            # Forward); der Puffer selbst folgt unten als #135-Eintrag.
+            skipped.append((str(name), "expert-stack-alias"))
+            continue
         tag = str(tag_of(str(name), region_tag=region_tag))
         if not ms.is_weights_family_tag(tag):
             # Not a skip of a FAMILY piece: this parameter is outside the
@@ -3384,6 +3389,10 @@ def derive_leg_plan(
     carried: set = set()
     undescribed = 0
     for name, param in model.named_parameters():
+        if ms.is_expert_stack_alias(param):
+            # Platztausch: der installierte Experten-Stapel ist ein Alias des
+            # Puffers, der unten als Experten-Puffer (Praefix) geplant wird.
+            continue
         tag = str(tag_of(str(name), region_tag=region_tag))
         if not ms.is_weights_family_tag(tag):
             continue

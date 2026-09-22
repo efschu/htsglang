@@ -9812,7 +9812,8 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             f"{type(_exc).__name__}: {_exc}")
 
 
-def publish_expert_map(ns, model: str, evidence_dir: str, log) -> str:
+def publish_expert_map(ns, model: str, evidence_dir: str, log,
+                       p_stage_layers=None) -> str:
     """Die EXPERTEN-KARTE bauen und ablegen; Pfad zurueck, sonst "".
 
     #107, Nutzer-Gesetz 22.09.: *"alles was geshardet wird braucht ne
@@ -9887,11 +9888,32 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log) -> str:
         # Rang seine Residenz AUS DER KARTE nimmt, darf der Spiegel an.
         _mirror = str(os.environ.get("WEG2_EXPERT_MAP_MIRROR", "0")).strip() \
             in ("1", "true", "True", "on")
-        karte = _em.build(total=total,
-                          ratios=[int(float(x)) for x in ratios],
-                          fr_pp=[float(x) for x in fr_pp],
-                          fr_tp=[float(x) for x in fr_tp],
-                          mirror=_mirror)
+        # PLATZTAUSCH (Nutzer-Entscheid 22.09. 22:20Z): die Version-2-Karte.
+        # Jede Phase haelt ihre eigene Anzahl; koordiniert wird nur die WAHL
+        # der Ids (geschachtelt). Sie braucht den REALISIERTEN P-Layer-Split,
+        # weil P's Residenz je STUFE gilt und ein Rang seinen Layer ueber die
+        # Stufe adressiert (unter tp=1 ist moe_tp_rank fuer alle Stufen 0).
+        _stages = [int(x) for x in (p_stage_layers or []) if int(x) > 0]
+        if _stages and len(_stages) == len(fr_pp) and not _mirror:
+            _layer_stage = [s for s, n in enumerate(_stages) for _ in range(n)]
+            karte = _em.build_nested(
+                total=total,
+                ratios=[int(float(x)) for x in ratios],
+                fr_pp=[float(x) for x in fr_pp],
+                fr_tp=[float(x) for x in fr_tp],
+                p_layer_stage=_layer_stage,
+                pad_tp=1,
+            )
+        else:
+            if not _mirror:
+                log("#107 PLATZTAUSCH-KARTE ENTFAELLT: P-Layer-Split %s passt "
+                    "nicht zu %d P-Fractions -- Version-1-Karte wie bisher"
+                    % (_stages or "unbekannt", len(fr_pp)))
+            karte = _em.build(total=total,
+                              ratios=[int(float(x)) for x in ratios],
+                              fr_pp=[float(x) for x in fr_pp],
+                              fr_tp=[float(x) for x in fr_tp],
+                              mirror=_mirror)
         grund = _em.refuse_if_inconsistent(karte)
         if grund:
             log("#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s" % grund)
@@ -9900,6 +9922,29 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log) -> str:
         pfad = os.path.join(evidence_dir, f"expert_map_{ns.tag}.json")
         with open(pfad, "w") as fh:
             _json.dump(karte, fh)
+        if _em.is_nested(karte):
+            _pp = karte["phases"]["P"]
+            _dp = karte["phases"]["D"]
+            _row_mib = float(getattr(ns, "_expert_row_mib", 0.0) or 0.0)
+            log(
+                "PLATZTAUSCH-KARTE %s: %d Experten, Store %d Plaetze je Layer "
+                "(= Komplement der Schnittmenge %d, in BEIDEN Phasen dieselbe "
+                "Belegung, beim Flip wird nichts zurueckgeschrieben); P je Stufe "
+                "resident %s davon gemeinsam %s; D je Rang resident %s. Der "
+                "Austausch bewegt je Layer den gemeinsamen Praefix, das Extra "
+                "holt der aufwachende Rang aus dem Store."
+                % (pfad, total, int(karte["slots"]), int(karte["shared_resident"]),
+                   [len(x) for x in _pp["resident"]],
+                   [len(x) for x in _pp["common"]],
+                   [len(x) for x in _dp["resident"]])
+                + (" Store ~%.1f GiB." % (int(karte["slots"]) * _row_mib
+                                          * len(karte.get("p_layer_stage", []))
+                                          / 1024.0) if _row_mib else "")
+            )
+            _nj = _em.nested_join_verdict(karte)
+            if _nj:
+                log("PLATZTAUSCH FLIP-JOIN UNMOEGLICH: " + " | ".join(_nj))
+            return pfad
         _join = _em.join_verdict(karte)
         if _join:
             log("#159 FLIP-JOIN UNMOEGLICH -- dieser Boot kann nicht flippen:")
@@ -13221,7 +13266,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ring (block 1b- above); only ``env_p`` stays here, because it is the
     # one thing in this step that genuinely needs the armed ring.
     # #107: EINMAL bauen, BEIDE Gruppen bekommen denselben Pfad.
-    _emap = publish_expert_map(ns, ns.model, ns.evidence_dir, log)
+    _emap = publish_expert_map(ns, ns.model, ns.evidence_dir, log,
+                               p_stage_layers=getattr(state, "p_stage_layers", None))
     env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap)
     # #1269 PUBLICATION: build_env's own comment says the decision is
     # "published explicitly so the boot log names the decision" -- but it only

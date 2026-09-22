@@ -86,6 +86,7 @@ from sglang.srt.managers.weg2_memory_saver import (
     chunk_of_band_tag,
     expert_band_from_param_name,
     is_expert_buffer_attr as ms_is_expert_buffer,
+    is_expert_stack_alias as ms_is_expert_stack_alias,
     is_weights_family_tag,
     layer_id_from_module_name,
     weight_band_tag,
@@ -3377,13 +3378,20 @@ def walk_live_tensors(
     out: List[LiveTensor] = []
 
     def _add(name: str, tensor: torch.Tensor, kind: str, module_path: str) -> None:
+        # PLATZTAUSCH: ein Experten-Puffer wird unter der Version-2-Karte als
+        # PRAEFIX-View veroeffentlicht. Sein Storage ist der ganze [R+C]-Puffer
+        # (Extra + Scratch reisen nicht); gezaehlt wird, was der View zeigt,
+        # sonst meldet die Coverage den Rest als `short`. Der Storage-Key
+        # bleibt der des Puffers, also zaehlt nichts doppelt.
+        nbytes = (int(tensor.numel()) * int(tensor.element_size())
+                  if ms_is_expert_buffer(name) else _nbytes(tensor))
         out.append(
             LiveTensor(
                 name=name,
                 module_path=module_path,
                 kind=kind,
                 tag=tag_of_parameter_name(name, region_tag=region_tag),
-                nbytes=_nbytes(tensor),
+                nbytes=nbytes,
                 storage_key=_storage_key(tensor),
                 dtype=str(tensor.dtype),
                 shape=tuple(tensor.shape),
@@ -3391,6 +3399,10 @@ def walk_live_tensors(
         )
 
     for name, param in model.named_parameters():
+        if ms_is_expert_stack_alias(param):
+            # Alias des Experten-Puffers (Install nach dem ersten Forward);
+            # der Puffer selbst kommt unten ueber vars(module).
+            continue
         _add(name, param, PARAMETER, name.rsplit(".", 1)[0] if "." in name else "")
     for name, buf in model.named_buffers():
         if buf is None:

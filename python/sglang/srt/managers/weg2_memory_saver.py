@@ -2711,6 +2711,25 @@ def is_expert_buffer_attr(name: str) -> bool:
         name or "").startswith(EXPERT_BUFFER_ATTR_PREFIX)
 
 
+#: Platztausch: der Parameter, den ``MoEExpertOffloadCache.install`` ueber den
+#: GANZEN Experten-Puffer legt (der Kernel liest den Stapel unter dem alten
+#: Namen), ist ein Alias. Veroeffentlicht wird der Puffer unter
+#: :func:`expert_buffer_attr_name` -- und unter der Version-2-Karte nur sein
+#: Praefix. Ohne Markierung saehe jeder Walk nach dem ersten Forward denselben
+#: Storage ein zweites Mal, als ungeplanten Parameter.
+_EXPERT_STACK_ALIAS_FLAG = "_weg2_expert_stack_alias"
+
+
+def mark_expert_stack_alias(param) -> None:
+    """Die EINE schreibende Stelle (``MoEExpertOffloadCache.install``)."""
+    setattr(param, _EXPERT_STACK_ALIAS_FLAG, True)
+
+
+def is_expert_stack_alias(tensor) -> bool:
+    """Die EINE lesende Stelle -- jeder Inventar- und Coverage-Walk fragt hier."""
+    return bool(getattr(tensor, _EXPERT_STACK_ALIAS_FLAG, False))
+
+
 EXPERT_BAND_ATTR_PREFIX = "weg2_eband"
 _EXPERT_BAND_IN_NAME = re.compile(
     r"(?:^|\.)" + re.escape(EXPERT_BAND_ATTR_PREFIX) + r"(\d+)_"

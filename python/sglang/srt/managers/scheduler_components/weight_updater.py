@@ -3978,6 +3978,21 @@ class SchedulerWeightUpdaterManager:
                     table.setdefault((region, str(name)), param)
             except BaseException:  # noqa: BLE001
                 continue
+            # PLATZTAUSCH: die Experten-Puffer (#135) stehen seit #135-#139 in
+            # Manifest, Plan und Coverage -- aber nie in DIESEM Adressbuch, das
+            # nur `named_parameters()` las. Ihre Deskriptoren hatten damit auf
+            # keiner Seite einen Zeiger (gebaut, nie erreicht). Dieselbe
+            # Quelle wie das Manifest (`expert_buffer_tensors`), damit Name und
+            # Zeiger aus EINEM Walk kommen.
+            try:
+                from sglang.srt.weg2.weight_exchange_shadow import (
+                    expert_buffer_tensors as _ebt,
+                )
+
+                for name, tensor in _ebt(model):
+                    table.setdefault((region, str(name)), tensor)
+            except BaseException:  # noqa: BLE001
+                pass
         return table
 
     def _weg2_join_src_addr(self, hook: str, group: str, rank: int, model,
@@ -7025,6 +7040,27 @@ class SchedulerWeightUpdaterManager:
                     "first forward after this wake reads the peer's residue "
                     "in every Marlin workspace", _sexc,
                 )
+            # PLATZTAUSCH (Nutzer-Entscheid 22.09.): der Austausch hat nur den
+            # Experten-PRAEFIX gefuellt. Pad nullen, Extra-Zeilen aus ihren
+            # festen Store-Plaetzen laden, LRU und Pool-Tabellen verwerfen --
+            # auf der aufwachenden Seite, vor dem ersten Forward. Ein Fehler
+            # hier ist KEIN Warnfall: ein Layer mit Resten der anderen Gruppe
+            # rechnet falsch und sagt es nicht.
+            from sglang.srt.layers.moe.expert_offload import (
+                rearm_expert_offload_after_wake,
+            )
+
+            _m = self._weg2_model_for_group(self._weg2_group_name())
+            if _m is not None:
+                _t_rearm = time.perf_counter()
+                _rl, _rz = rearm_expert_offload_after_wake(_m)
+                if _rl:
+                    logger.info(
+                        "WEG2-RESUME expert-rearm layers=%d rows_from_store=%d "
+                        "ms=%.0f (Platztausch: Praefix kam ueber den Austausch, "
+                        "Pad+Extra aus dem Store, LRU verworfen)",
+                        _rl, _rz, (time.perf_counter() - _t_rearm) * 1000,
+                    )
             card_uuid = self._weg2_card_uuid() or "unknown"
             for tag, (nbytes, tms) in weg2_per_tag.items():
                 # S7 (#1273): THREE FIELDS APPENDED, and the ring planner's

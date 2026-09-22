@@ -168,6 +168,53 @@ def allocate_step_buffers(device, num_experts: int, width: int = PLAN_WIDTH) -> 
     )
 
 
+def reinit_pool_tables(tables: PoolTables, hot_slot_of: Dict[int, int],
+                       host_row: Sequence[int]) -> None:
+    """Die Tabellen IN PLACE auf den Zustand von ``allocate_pool_tables``
+    zuruecksetzen -- dieselben Adressen, denn die Decode-Graphen haben genau
+    diese Zeiger aufgenommen (Platztausch, Wake).
+
+    Nach einem Flip halten die LRU-Zeilen Reste der anderen Gruppe, und lagen
+    die Tabellen unter einem pausierten Tag, sind auch die Residenten-Eintraege
+    Muell. Neu schreiben ist billiger als herauszufinden, welcher Fall vorliegt.
+    """
+    import torch
+
+    E, rows = tables.num_experts, int(tables.row_key.shape[0])
+    pool_rows = tables.pool_rows
+    if len(host_row) != E:
+        raise ValueError("host_row must have one entry per expert")
+    hot = torch.full((E,), -1, dtype=torch.int32)
+    key = torch.full((rows,), -1, dtype=torch.int32)
+    use = torch.zeros(rows, dtype=torch.int64)
+    for e, r in hot_slot_of.items():
+        if not 0 <= r < pool_rows:
+            raise ValueError(f"expert {e} placed outside the pool at row {r}")
+        hot[e] = r
+        key[r] = e
+    use[: tables.lru_start] = ROW_USE_NEVER
+    use[pool_rows:] = ROW_USE_NEVER
+    dev = tables.hot_phys.device
+    tables.hot_phys.copy_(hot.to(dev))
+    tables.host_row.copy_(torch.tensor(list(host_row), dtype=torch.int32).to(dev))
+    tables.row_key.copy_(key.to(dev))
+    tables.row_use.copy_(use.to(dev))
+    tables.clock.fill_(0)
+    tables.gate.fill_(1)
+    tables.error.fill_(0)
+    tables.promote_limit.fill_(0)
+    tables.promote_interval.fill_(1)
+    tables.forwards.fill_(0)
+    tables.promote_min_misses.fill_(1)
+    tables.protect_recent.fill_(0)
+    tables.miss_count.zero_()
+    tables.staging_rows.copy_(
+        torch.arange(pool_rows, rows, dtype=torch.int32).to(dev))
+    tables.misses_total.fill_(0)
+    tables.pf_row.fill_(-1)
+    tables.pf_counts.zero_()
+
+
 def sync_tables(tables: PoolTables, lru_holds: Dict[int, int]) -> None:
     """After an EAGER forward rewrote the LRU rows (run_waves' fetches): the
     device tables take the host's truth. ``lru_holds`` = row -> expert for the

@@ -311,6 +311,238 @@ def build(total: int,
     }
 
 
+#: Karte, deren Residenz GESCHACHTELT ist (Nutzer-Entscheid 22.09. 22:20Z,
+#: "natuerlich am platztausch"): jede Phase haelt ihre EIGENE Anzahl, und nur
+#: die WAHL der Ids wird koordiniert. Version 1 (`build`) bleibt fuer die
+#: alten Leser stehen.
+NESTED_VERSION = 2
+
+
+def _proportional_subset(groups: Sequence[Sequence[int]], m: int) -> List[int]:
+    """``m`` Ids aus ``groups``, proportional zu deren Groesse, je Gruppe die
+    ersten. Damit keine D-Spanne leer ausgeht, wenn eine P-Stufe weniger haelt
+    als D insgesamt -- eine Breite 0 waere ein Halter ohne Stueck im Join."""
+    sizes = [len(g) for g in groups]
+    total = sum(sizes)
+    if m >= total:
+        return sorted(int(x) for g in groups for x in g)
+    take = [m * s // total if total else 0 for s in sizes]
+    rest = m - sum(take)
+    # der Rest geht an die Gruppen mit dem groessten Bruchteil, stabil nach Index
+    order = sorted(range(len(groups)),
+                   key=lambda i: (-(m * sizes[i] % total) if total else 0, i))
+    for i in order[:rest]:
+        take[i] += 1
+    out: List[int] = []
+    for g, t in zip(groups, take):
+        out.extend(int(x) for x in list(g)[: min(t, len(g))])
+    return sorted(out)
+
+
+def build_nested(total: int,
+                 ratios: Sequence[int],
+                 fr_pp: Sequence[float],
+                 fr_tp: Sequence[float],
+                 p_layer_stage: Sequence[int],
+                 pad_tp: int = 1) -> dict:
+    """Die Karte beider Phasen mit GESCHACHTELTER Residenz (Version 2).
+
+    Nutzer-Entscheid 22.09.: jede Phase haelt so viele Experten, wie ihr Layout
+    allein auf der Karte fasst; koordiniert wird nur, WELCHE. Der Spiegel (#159)
+    setzte P auf D's Vereinigung und zog beide Layouts auf dieselbe Zahl --
+    gemessen w139: P 0,323 ueberall, wo 0,58/1,0/1,0 passten.
+
+    Je P-Stufe ``s`` ist ``common[s]`` die Menge, die BEIDE Phasen fuer die Layer
+    dieser Stufe auf einer Karte halten:
+      * haelt die Stufe mindestens so viele wie D insgesamt, ist
+        ``common[s]`` = D's ganze Residenz, und P nimmt dazu ``extra``;
+      * haelt sie weniger, ist ``common[s]`` ein proportionaler Teil von D's
+        Residenz, und D traegt fuer DIESE Layer den Rest als eigenes Extra.
+
+    Der Flip bewegt nur ``common`` ueber den Austausch (Zeilenschnitt: P's
+    Praefix ist nach Id sortiert, also nach D-Spanne gruppiert). Alles andere
+    liegt dauerhaft im Store: ``slot_of`` gilt fuer die Ids ausserhalb der
+    Schnittmenge ALLER Stufen und ist in BEIDEN Phasen dieselbe Abbildung --
+    Gewichte aendern sich nie, also muss beim Flip nichts zurueckgeschrieben
+    werden. Die Store-Groesse ist ``total - |common_all|`` Zeilen je Layer, das
+    Minimum jeder Form, in der die kleinere Phase ihre kalten Experten findet.
+
+    ``pad_tp``: D's Raenge tragen lokal 0 als Null-Padding-Experten (#82). Der
+    Rang zaehlt ihn in ``resident_slot_count(span + pad, f)`` mit; die Karte
+    zaehlt deshalb genauso und nennt ``slots - pad`` echte Ids (w139 starb an
+    genau dieser einen Id Unterschied).
+    """
+    spans = scaled_spans(ratios, total)
+    lo = bounds(spans)
+    pad = max(0, int(pad_tp))
+    res_d: List[List[int]] = []
+    for i, span in enumerate(spans):
+        try:
+            f = float(fr_tp[i])
+        except (IndexError, TypeError, ValueError):
+            f = 0.0
+        n = max(0, resident_count_like_the_rank(int(span) + pad, f) - pad)
+        n = min(n, int(span))
+        res_d.append(list(range(lo[i], lo[i] + n)))
+    d_all = sorted(g for ids in res_d for g in ids)
+    d_set = set(d_all)
+    try:
+        fs = [float(x) for x in fr_pp]
+    except TypeError:
+        fs = [float(fr_pp)]
+    res_p: List[List[int]] = []
+    common: List[List[int]] = []
+    for f in fs:
+        m = resident_count_like_the_rank(total, f)
+        if m >= len(d_all):
+            c = list(d_all)
+            extra = [g for g in range(total) if g not in d_set][: m - len(d_all)]
+        else:
+            c = _proportional_subset(res_d, m)
+            extra = []
+        common.append(c)
+        # DIE REIHENFOLGE IST DER VERTRAG: der Praefix [0, |common|) ist, was
+        # der Austausch bewegt, und er ist nach Id sortiert -- damit liegen die
+        # Ids jeder D-Spanne als EIN Block hintereinander.
+        res_p.append(c + sorted(extra))
+    common_all = set(common[0]) if common else set()
+    for c in common[1:]:
+        common_all &= set(c)
+    kalt = [g for g in range(total) if g not in common_all]
+    slot_of = {str(g): i for i, g in enumerate(kalt)}
+    # D je Rang und je P-Stufe: der Praefix (gemeinsam, sortiert) und das Extra
+    # (nur D haelt es auf der Karte, P holt es beim Wake aus dem Store).
+    d_prefix = [[sorted(set(c) & set(ids)) for c in common] for ids in res_d]
+    d_extra = [[sorted(set(ids) - set(c)) for c in common] for ids in res_d]
+    stages = [int(s) for s in p_layer_stage]
+    if stages and (min(stages) < 0 or max(stages) >= max(1, len(fs))):
+        raise ValueError(
+            f"p_layer_stage nennt Stufe {max(stages)} bei {len(fs)} "
+            f"P-Fractions -- Karte und PP-Schnitt beschreiben nicht dieselbe "
+            f"Pipeline")
+    return {
+        "version": NESTED_VERSION,
+        "total": int(total),
+        "slots": len(kalt),
+        "spans": list(spans),
+        "bounds": list(lo),
+        "pad_tp": pad,
+        "p_layer_stage": stages,
+        "phases": {
+            PHASE_PP: {"resident": [list(x) for x in res_p],
+                       "common": [list(x) for x in common],
+                       "slot_of": dict(slot_of)},
+            PHASE_TP: {"resident": [list(x) for x in res_d],
+                       "prefix_by_stage": d_prefix,
+                       "extra_by_stage": d_extra,
+                       "slot_of": dict(slot_of)},
+        },
+        "moves": sum(len(c) for c in common),
+        "shared_resident": len(common_all),
+    }
+
+
+def is_nested(karte: Optional[dict]) -> bool:
+    return bool(karte) and int(karte.get("version", 0)) >= NESTED_VERSION
+
+
+def stage_of_layer(karte: dict, layer_id: int) -> Optional[int]:
+    """Die P-Stufe, die diesen Layer traegt -- aus der Karte, nicht geraten."""
+    try:
+        return int(karte["p_layer_stage"][int(layer_id)])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+def rank_layout(karte: dict, phase: str, layer_id: int,
+                tp_rank: int) -> Optional[Tuple[List[int], List[int], List[int]]]:
+    """``(praefix, extra, slot_ids)`` in GLOBALEN Ids fuer diesen Layer und Rang.
+
+    ``praefix`` ist, was der Austausch fuer diesen Layer bewegt (sortiert),
+    ``extra``, was diese Phase zusaetzlich resident haelt und beim Wake aus dem
+    Store holt. P wird ueber die STUFE des Layers adressiert, nicht ueber
+    ``moe_tp_rank`` -- unter tp=1 ist der fuer alle Stufen 0, und die Karte
+    haette jeder Stufe die Residenz von Stufe 0 gegeben.
+    """
+    if not is_nested(karte):
+        return None
+    s = stage_of_layer(karte, layer_id)
+    if s is None:
+        return None
+    try:
+        if phase == PHASE_PP:
+            c = list(karte["phases"][PHASE_PP]["common"][s])
+            res = list(karte["phases"][PHASE_PP]["resident"][s])
+            extra = res[len(c):]
+            return c, extra, res
+        r = int(tp_rank)
+        pre = list(karte["phases"][PHASE_TP]["prefix_by_stage"][r][s])
+        ext = list(karte["phases"][PHASE_TP]["extra_by_stage"][r][s])
+        return pre, ext, pre + ext
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+def nested_join_verdict(karte: dict) -> List[str]:
+    """Kann der Austausch die Praefixe verbinden? Je Stufe muss P's Praefix
+    exakt die Vereinigung der D-Praefixe sein, in derselben Id-Ordnung."""
+    out: List[str] = []
+    try:
+        commons = karte["phases"][PHASE_PP]["common"]
+        pre = karte["phases"][PHASE_TP]["prefix_by_stage"]
+    except (KeyError, TypeError):
+        return ["Karte ohne common/prefix_by_stage -- nicht pruefbar"]
+    for s, c in enumerate(commons):
+        vereint: List[int] = []
+        for r in range(len(pre)):
+            vereint.extend(int(x) for x in pre[r][s])
+        if vereint != [int(x) for x in c]:
+            out.append(f"Stufe {s}: P-Praefix {len(c)} Ids, D-Praefixe "
+                       f"zusammen {len(vereint)} -- nicht dieselbe Folge")
+    slot_of = karte["phases"][PHASE_PP].get("slot_of", {})
+    if slot_of != karte["phases"][PHASE_TP].get("slot_of", {}):
+        out.append("slot_of unterscheidet sich zwischen den Phasen -- der "
+                   "Store haette zwei Belegungen")
+    return out
+
+
+def _refuse_if_inconsistent_nested(karte: dict, total: int) -> Optional[str]:
+    """Version 2: der Store haelt dauerhaft alles AUSSER der Schnittmenge aller
+    Praefixe; jede Id, die eine Phase fuer einen Layer NICHT auf der Karte hat,
+    braucht einen Platz, und keine Id der Schnittmenge darf einen haben."""
+    try:
+        commons = karte["phases"][PHASE_PP]["common"]
+        res_p = karte["phases"][PHASE_PP]["resident"]
+        res_d = karte["phases"][PHASE_TP]["resident"]
+        slot_of_ = karte["phases"][PHASE_PP]["slot_of"]
+    except (KeyError, TypeError):
+        return "Version-2-Karte ohne common/resident/slot_of"
+    kalt = {int(k) for k in slot_of_}
+    common_all = set(int(x) for x in commons[0]) if commons else set()
+    for c in commons[1:]:
+        common_all &= set(int(x) for x in c)
+    if common_all & kalt:
+        return (f"{len(common_all & kalt)} Ids der Schnittmenge haben einen "
+                f"Store-Platz -- sie liegen in beiden Phasen auf einer Karte")
+    if len(common_all) + len(kalt) != total:
+        return (f"Schnittmenge {len(common_all)} + Store {len(kalt)} != {total}")
+    d_all = {int(g) for ids in res_d for g in ids}
+    for s, ids in enumerate(res_p):
+        fehlt = [g for g in range(total) if g not in set(ids) and g not in kalt]
+        if fehlt:
+            return (f"P-Stufe {s}: {len(fehlt)} kalte Ids ohne Store-Platz "
+                    f"(erste {fehlt[:4]})")
+        if [int(x) for x in ids[: len(commons[s])]] != [int(x) for x in commons[s]]:
+            return f"P-Stufe {s}: der Praefix ist nicht `common` in Reihenfolge"
+    fehlt_d = [g for g in range(total) if g not in d_all and g not in kalt]
+    if fehlt_d:
+        return f"D: {len(fehlt_d)} kalte Ids ohne Store-Platz (erste {fehlt_d[:4]})"
+    if kalt and max(int(v) for v in slot_of_.values()) >= int(karte["slots"]):
+        return f"ein Platz liegt hinter dem Ende der Datei ({karte['slots']})"
+    grund = nested_join_verdict(karte)
+    return grund[0] if grund else None
+
+
 def phase_of(group: str) -> str:
     """``P`` fuer die PP-Gruppe, ``D`` sonst -- die Karte kennt nur zwei."""
     return PHASE_PP if str(group).upper().startswith("P") else PHASE_TP
@@ -393,6 +625,8 @@ def refuse_if_inconsistent(karte: dict) -> Optional[str]:
     total = int(karte.get("total", 0))
     if total <= 0:
         return "total <= 0"
+    if is_nested(karte):
+        return _refuse_if_inconsistent_nested(karte, total)
     for phase, p in karte.get("phases", {}).items():
         _listen = [set(ids) for ids in p.get("resident", [])] or [set()]
         # #132, ZWEITE SEITE DERSELBEN NAHT: `build` bildet `kalt` fuer die
