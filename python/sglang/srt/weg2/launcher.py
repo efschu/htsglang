@@ -3781,6 +3781,38 @@ def prepare_xchg_region(log: Log, boot_nonce: str, hook_mode: int,
     return weight_exchange_region.prepare_region(boot_nonce, hook_mode=hook_mode, log=log)
 
 
+def _argv_vector(extra: str, flag: str):
+    """Der Komma-Vektor hinter ``flag`` in einer ``--extra-*``-Zeichenkette.
+
+    #106. Gibt eine Liste von STRINGS zurueck, nicht von Zahlen: sie wird
+    woertlich in `SGLANG_MOE_EXPERT_STORE_GEOMETRY` weitergereicht, und der
+    Leser (`expert_store.shared_geometry`) parst selbst und verwirft
+    Unlesbares. Hier zu casten hiesse, denselben Zweifel zweimal zu
+    beantworten -- und die zweite Antwort koennte von der ersten abweichen.
+
+    ``None`` wenn die Flagge fehlt oder ohne Wert dasteht; eine leere Liste
+    kann nie entstehen, weil sie vom Aufrufer nicht von "fehlt" zu
+    unterscheiden waere.
+    """
+    if not extra or not flag:
+        return None
+    try:
+        parts = shlex.split(str(extra))
+    except ValueError:
+        return None
+    for i, tok in enumerate(parts):
+        raw = None
+        if tok == flag and i + 1 < len(parts):
+            raw = parts[i + 1]
+        elif tok.startswith(flag + "="):
+            raw = tok[len(flag) + 1:]
+        if raw is None:
+            continue
+        vec = [x.strip() for x in raw.split(",") if x.strip()]
+        return vec or None
+    return None
+
+
 def prepare_xchg_env(log: Log, boot_nonce: str, weight_source: str,
                        hook_mode: int = 0, dry: bool = False,
                        hop_bound_ms: Optional[float] = None,
@@ -12074,6 +12106,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                   # table and carries the census's own list.
                                   waves=(xchg_res.partition if xchg_res is not None
                                          else None))
+    # #106 (fnFL2w42/w43): DIE GEMEINSAME STORE-GEOMETRIE, ENDLICH GESETZT.
+    #
+    # `expert_store.shared_geometry()` existiert seit #91 und sein Docstring
+    # sagt "Gesetzt vom Launcher ueber STORE_GEOMETRY_ENV" -- der Launcher
+    # setzte sie NIE. Im ganzen Baum stand ein Leser ohne Schreiber, also
+    # rechnete jede Gruppe ihre eigene Abbildung globale Id -> Slot auf
+    # DERSELBEN Datei. Was #91 als Gefahr beschreibt, war der Normalfall.
+    #
+    # Am Metall: w42 und w43 starben beim Laden von D mit
+    #   ValueError: shared store .../L0-w13_weight_scale.bin
+    #               has 23091200 bytes, this layout wants 26214400
+    # P rechnete aus seinen Vektoren 451 Plaetze, D aus seinen 512. w41 lief
+    # davor nur, weil FR_P zufaellig auf dieselbe Zahl fuehrte -- kein
+    # Beweis, ein Zufall, und er verdeckte den fehlenden Schreiber.
+    #
+    # D's Vektoren sind die Autoritaet: die PP-Gruppe haelt jeden Experten
+    # ungeshardet (`num_local == num_global`, lo=0, pad=False) und hat gar
+    # keine eigene Aufteilung, waehrend D genau die Aufteilung IST, um die
+    # es geht. Fehlt einer der beiden Vektoren, wird NICHTS publiziert --
+    # dann rechnen beide wie bisher, statt dass eine halbe Geometrie eine
+    # falsche Zuordnung festschreibt (#91: "eine falsche gemeinsame
+    # Zuordnung waere schlimmer als gar keine").
+    _geom_ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
+    _geom_fracs = _argv_vector(getattr(ns, "extra_d", ""),
+                               "--rank-moe-resident-fraction")
+    if _geom_ratios and _geom_fracs and len(_geom_ratios) == len(_geom_fracs):
+        xchg_env["SGLANG_MOE_EXPERT_STORE_GEOMETRY"] = (
+            f"{','.join(_geom_ratios)}|{','.join(_geom_fracs)}")
+        log(f"WEG2-STORE-GEOMETRY shared={xchg_env['SGLANG_MOE_EXPERT_STORE_GEOMETRY']}"
+            f" source=extra_d -- BEIDE Gruppen rechnen dieselbe Abbildung"
+            f" globale Id -> Slot (#106; ohne sie rechnete P 451 und D 512"
+            f" Plaetze auf derselben Datei und D starb beim Laden)")
+    else:
+        log(f"WEG2-STORE-GEOMETRY none ratios={_geom_ratios} fracs={_geom_fracs}"
+            f" -- keine gemeinsame Geometrie publiziert; jede Gruppe rechnet"
+            f" wie vor #106. Das ist der KONSERVATIVE Fall, nicht der"
+            f" gewuenschte: passen die Vektoren nicht zusammen, kollidiert"
+            f" der geteilte Store weiterhin beim Oeffnen der Datei")
+
     # #1369: PUBLISHED UNCONDITIONALLY, unlike everything else in `xchg_env`
     # above -- `prepare_xchg_env` returns `{}` outright under an un-armed
     # exchange (`weight_source not in WEIGHT_SOURCE_ARMED`), which is correct

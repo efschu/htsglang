@@ -382,8 +382,15 @@ SEAMS: Dict[str, Seam] = {
             "refusal would have rejected every Form A vector as 'axis "
             "switched off'.",
             anchors=(
-                ("weg2/launcher.py", 7379, "def _saturated"),
-                ("weg2/launcher.py", 7383,
+                # 22.09. nachgezogen: die Anker standen auf 7379/7383 und
+                # zeigten seit langem ins Leere (`def _saturated` lag da
+                # schon bei 7882, rund 500 Zeilen weiter). Ein Anker, der
+                # nicht mehr trifft, meldet bei JEDEM Lauf rot und wird
+                # dadurch zum Hintergrundrauschen, das echte Treffer
+                # verdeckt -- die Regel FILE:LINE-OHNE-SHA-KEINE-ADRESSE
+                # gilt auch fuer die eigene Registry.
+                ("weg2/launcher.py", 7882, "def _saturated"),
+                ("weg2/launcher.py", 7886,
                  "Form A worker: not on this axis, not saturated"),
             ),
         ),
