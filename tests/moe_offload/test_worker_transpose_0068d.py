@@ -105,3 +105,46 @@ def test_auch_der_fused_einstieg_kennt_die_quittung():
     assert "ct_effective_method(self)" in code
     assert "not transpose_done_in_worker(self)" in code
     assert "self.scheme" not in code
+
+
+def test_68f_zaehler_zaehlt_gedreht_und_angeboten(monkeypatch):
+    """Ohne diese Zahl sind am Ende eines Boots 'der Schalter brachte
+    nichts' und 'der Schalter griff nie' nicht unterscheidbar -- w58 (Env
+    kam nicht an) und w59 (Praedikat sagte immer nein) haben je einen Boot
+    gekostet."""
+    import torch
+    from sglang.srt.models import qwen4_exp as qx
+
+    monkeypatch.setenv("SGLANG_LOAD_TRANSPOSE_IN_WORKER", "1")
+    experts = types.SimpleNamespace(
+        quant_method=CompressedTensorsMoEMethod(),
+        scheme=CompressedTensorsWNA16MarlinMoE(),
+    )
+
+    class _M:
+        def get_submodule(self, pfad):
+            if pfad.endswith(".experts"):
+                return experts
+            raise AttributeError(pfad)
+
+    vor = qx.worker_transpose_counts()
+    t = torch.arange(6, dtype=torch.int32).reshape(2, 3)
+    qx.Qwen4ExpForConditionalGeneration.weight_post_load(
+        _M(), "model.layers.0.mlp.experts.3.gate_proj.weight_packed", t
+    )
+    qx.Qwen4ExpForConditionalGeneration.weight_post_load(
+        _M(), "model.layers.0.self_attn.q_proj.weight", t
+    )
+    nach = qx.worker_transpose_counts()
+    assert nach[0] - vor[0] == 1, "gedreht falsch gezaehlt"
+    assert nach[1] - vor[1] == 2, "angeboten falsch gezaehlt"
+
+
+def test_68f_der_zaehler_haelt_nichts_fest():
+    """Ein Instrument darf das Gemessene nicht festhalten (21.09.: der
+    Sampler hielt Frames ueber sein wait = +450 MiB reserved, zwei Boots
+    tot). Hier stehen zwei ints, keine Tensoren."""
+    from sglang.srt.models import qwen4_exp as qx
+
+    assert all(isinstance(x, int) for x in qx._WORKER_TRANSPOSED)
+    assert len(qx._WORKER_TRANSPOSED) == 2

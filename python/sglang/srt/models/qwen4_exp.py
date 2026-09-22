@@ -2257,6 +2257,21 @@ _CT_EXPERT_SUFFIXES = (
 )
 
 
+#: #68f: WIE OFT hat der Lade-Worker wirklich gedreht -- je Prozess, nicht
+#: je Rang-Log-Zeile. Ohne diese Zahl ist "der Schalter brachte nichts" und
+#: "der Schalter griff nie" am Ende eines Boots NICHT unterscheidbar; genau
+#: daran haben w58 (Env kam nicht an) und w59 (Praedikat sagte immer nein)
+#: je einen Boot gekostet. Nur zaehlen, nichts halten: kein Tensor, keine
+#: Referenz, kein Speicher -- ein Instrument darf das Gemessene nicht
+#: festhalten.
+_WORKER_TRANSPOSED = [0, 0]  # [gedreht, angeboten]
+
+
+def worker_transpose_counts():
+    """(gedreht, angeboten) seit Prozessstart."""
+    return tuple(_WORKER_TRANSPOSED)
+
+
 def _ct_expert_layer_to_transpose(name: str, model):
     """Das FusedMoE-Modul, dessen Shards dieser Worker transponieren darf --
     oder None. Traegt die Entscheidung UND ihren Adressaten, damit die
@@ -2460,9 +2475,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # DEFAULT BLEIBT AUS (`SGLANG_LOAD_TRANSPOSE_IN_WORKER` ungesetzt),
         # und der Verbraucher ueberspringt seinen eigenen Transpose unter
         # DERSELBEN Env -- die Arbeit passiert genau einmal.
+        _WORKER_TRANSPOSED[1] += 1
         layer = _ct_expert_layer_to_transpose(name, self)
         if layer is None:
             return tensor
+        _WORKER_TRANSPOSED[0] += 1
         # #68e DIE QUITTUNG STEHT AM LAYER, NICHT AN EINER ENV.
         #
         # Der Verbraucher ueberspringt seine eigene Transposition nur noch
@@ -2978,6 +2995,18 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         for module in self.modules():
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
+
+        # #68f: der Schalter sagt, was er sollte -- diese Zahl sagt, was er
+        # TAT. gedreht=0 bei eingeschaltetem Schalter heisst: das Praedikat
+        # hat fuer jeden Tensor nein gesagt (w59) oder die Env kam nicht an
+        # (w58); die Ladezeit misst dann die ALTE Form, nicht die neue.
+        _gedreht, _angeboten = worker_transpose_counts()
+        logger.info(
+            "#68 WORKER-TRANSPOSE: gedreht=%d von angeboten=%d (Schalter %s)",
+            _gedreht,
+            _angeboten,
+            "an" if _transpose_in_worker() else "aus",
+        )
 
         return loaded_params
 
