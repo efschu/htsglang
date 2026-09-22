@@ -9674,6 +9674,59 @@ def solve_p_cut(
             + (terms.expert_layer_weight_bytes * float(f) + row_bytes * float(r)) / _pp_cut.MIB
             for f, r in zip(fracs, rows)
         )
+        # DIE LAYER JE STUFE, und sie wird NICHT geraten: --pp-stage-ratio ist
+        # ein SCORE-Vektor (Memory rank-ratios-sind-verhaeltnis), der nur dann
+        # die Layerzahlen IST, wenn seine Summe die Layerzahl des Checkpoints
+        # trifft. Fuer Next Flash tut sie das (29+11+8 = 48). Sonst wird
+        # proportional skaliert -- derselbe `scaled_spans`-Gedanke wie bei den
+        # Experten-Baendern, mit dem Rest auf der letzten Stufe, damit keine
+        # Layer zwischen zwei Stufen verschwindet.
+        _ratio_p = _csv_floats(str(getattr(ns, "pp_stage_ratio", "") or "")) or []
+        if len(_ratio_p) == n_stages_p and sum(_ratio_p) > 0:
+            if int(round(sum(_ratio_p))) == int(terms.n_layers):
+                _stage_layers_for_solve = [int(round(x)) for x in _ratio_p]
+            else:
+                _acc = [int(round(x * terms.n_layers / sum(_ratio_p)))
+                        for x in _ratio_p[:-1]]
+                _stage_layers_for_solve = _acc + [int(terms.n_layers) - sum(_acc)]
+        else:
+            _stage_layers_for_solve = [
+                int(terms.n_layers) // max(1, n_stages_p)] * n_stages_p
+
+        # #140 (Nutzer-Order 22.09.: "der planner muss sie ausspucken"):
+        # DIE UMKEHRUNG, neben der gegebenen Zahl. Was hier steht, ist bis
+        # heute nur Eingabe gewesen -- welche Fraction die Karte TRAEGT,
+        # rechnete niemand, und fnFL2w73 hat den Preis gezeigt: PP2 haelt bei
+        # 0.95 487 von 512 Experten, danach bleiben 4,93 GB und der
+        # Draft-KV-Produzent stirbt still im C++ (cu_mem_create OOM).
+        # Gedruckt wird sie mit ihrer Herleitung; wer sie uebernimmt,
+        # entscheidet der Operator -- aber raten muss er nicht mehr.
+        try:
+            _fmax = _pp_cut.solve_expert_fraction_per_stage(
+                budgets_mib=budgets_p,
+                stage_layers=_stage_layers_for_solve,
+                mean_layer_mib=mean_layer_mib,
+                expert_layer_mib=terms.expert_layer_weight_bytes / _pp_cut.MIB,
+                num_experts=terms.num_experts,
+                lru_rows=rows,
+            )
+            _ueber = [i for i, (f, m) in enumerate(zip(fracs, _fmax)) if f > m]
+            log(
+                "PP-CUT FRACTION-SOLVE (#140): budgets %s MiB, layers %s, "
+                "dense %.0f + experts %.0f MiB/layer, LRU %s -> OBERGRENZE je "
+                "Stufe %s (gegeben: %s)%s. Die Obergrenze laesst NICHTS fuer "
+                "KV, Draft und Aktivierungen -- sie ist die Decke, nicht die "
+                "Empfehlung."
+                % (
+                    list(budgets_p), list(_stage_layers_for_solve), mean_layer_mib,
+                    terms.expert_layer_weight_bytes / _pp_cut.MIB, list(rows),
+                    ["%.3f" % f for f in _fmax], ["%.3f" % f for f in fracs],
+                    (" -- UEBER DER DECKE auf Stufe(n) %s" % _ueber) if _ueber else "",
+                )
+            )
+        except BaseException as _exc:  # noqa: BLE001 -- eine Zahl kippt nie den Boot
+            log("PP-CUT FRACTION-SOLVE (#140) failed: %s: %s"
+                % (type(_exc).__name__, _exc))
         log(
             "PP-CUT POOL TERM (Task #47/#48): dense %.0f MiB/layer + experts %.0f MiB/layer "
             "(%d experts, %.2f MiB/row) at fractions %s + LRU rows %s -> per-stage %s MiB/layer; "

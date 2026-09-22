@@ -1083,6 +1083,66 @@ def _price_stage(
 _MAKESPAN_SLACK = 1.005
 
 
+def solve_expert_fraction_per_stage(
+    *,
+    budgets_mib,
+    stage_layers,
+    mean_layer_mib: float,
+    expert_layer_mib: float,
+    num_experts: int,
+    lru_rows,
+    reserve_mib_by_stage=None,
+):
+    """Je PP-Stufe die GROESSTE Experten-Fraction, die noch ins Budget passt.
+
+    DIE UMKEHRUNG der Rechnung, die der Launcher schon fuehrt. Heute nimmt er
+    ``--pp-cut-expert-device-fraction`` als EINGABE und rechnet daraus die
+    MiB je Layer; niemand rechnet, welche Fraction die Karte ueberhaupt
+    traegt. Ergebnis, gemessen fnFL2w73: PP2 haelt bei FR_P 0.95 487 von 512
+    Experten, danach bleiben 4,93 GB, und der Draft-KV-Produzent stirbt still
+    im C++ (``cu_mem_create: out of memory``) -- kein Python-Traceback, kein
+    Exit-Code.
+
+    Nutzer-Order 22.09., woertlich: *"diese falschen sizing zahlen tauchen
+    jetzt immer und immer wieder auf, werden dann endlos analysiert und
+    verworfen und halluziniert und neu berechnet. der planner muss sie
+    ausspucken"*. Diese Funktion spuckt sie aus.
+
+    Die Bedingung je Stufe s, alles in MiB:
+
+        layers_s * (dense + experts * f_s + row * lru_s) + reserve_s
+            <= budget_s
+
+    nach ``f_s`` aufgeloest. ``reserve_s`` ist, was auf der Karte NICHT den
+    Gewichten gehoert -- KV-Pool, Draft, Aktivierungen; der Aufrufer reicht
+    es durch, weil nur er weiss, was dieser Boot vorhat. Ohne Angabe ist es
+    0, und dann ist das Ergebnis eine OBERGRENZE, die der Draft noch
+    unterschreitet: als solche benannt, nicht als Empfehlung getarnt.
+
+    Rueckgabe: Liste von Fractions, je Stufe auf [0, 1] geklemmt. Eine
+    NEGATIVE Loesung wird auf 0.0 geklemmt und ist die Aussage "diese Stufe
+    traegt nicht einmal ihre Dense-Gewichte" -- der Aufrufer soll das
+    benennen, nicht beschoenigen.
+    """
+    n = len(list(stage_layers))
+    rows = list(lru_rows) if lru_rows is not None else [0.0] * n
+    res = list(reserve_mib_by_stage) if reserve_mib_by_stage is not None else [0.0] * n
+    if len(list(budgets_mib)) != n or len(rows) != n or len(res) != n:
+        raise ValueError(
+            f"solve_expert_fraction_per_stage: {n} Stufen, aber "
+            f"{len(list(budgets_mib))} Budgets / {len(rows)} LRU-Zeilen / "
+            f"{len(res)} Reserven -- eine halbe Geometrie loest nichts"
+        )
+    row_mib = float(expert_layer_mib) / max(1, int(num_experts))
+    out = []
+    for b, L, r, rsv in zip(budgets_mib, stage_layers, rows, res):
+        L = max(1, int(L))
+        frei = float(b) - float(rsv) - L * (float(mean_layer_mib) + row_mib * float(r))
+        f = frei / (L * float(expert_layer_mib)) if expert_layer_mib > 0 else 0.0
+        out.append(min(1.0, max(0.0, f)))
+    return out
+
+
 def solve_pp_cut(
     inputs: PPCutInputs,
     *,
