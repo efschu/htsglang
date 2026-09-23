@@ -126,6 +126,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.moe import pinned_host_ledger
+from sglang.srt.layers.prefill_timing import StageHead
 from sglang.srt.utils.break_cost_clock import break_cost_phase
 
 # --- M-C routing trace ------------------------------------------------------
@@ -2841,6 +2842,10 @@ def _h2d_i64(arr, device):
 
 _WAVE_T = {"on": None, "ev": [], "fetch_ms": 0.0, "apply_ms": 0.0, "layers": 0, "spill": 0,
            "tokens": 0, "forwards0": 0}
+# The layer that opens a forward on THIS pipeline stage (see prefill_timing):
+# keying on layer 0 left every stage but the first without a single line.
+_WAVE_T_HEAD = StageHead()
+_WAVE_TP_HEAD = StageHead()
 
 
 def _wave_timing_on() -> bool:
@@ -2858,10 +2863,11 @@ def _wave_timing_note(layer_id, e0, e1, e2, n_spill, n_tokens):
     t = _WAVE_T
     t["ev"].append((e0, e1, e2))
     t["spill"] += int(n_spill)
-    if layer_id in (0, None):
+    head = _WAVE_T_HEAD.opens_forward(layer_id)
+    if head:
         t["forwards0"] += 1
         t["tokens"] += int(n_tokens)
-    if layer_id in (0, None) and t["forwards0"] % 16 == 0:
+    if head and t["forwards0"] % 16 == 0:
         torch.cuda.synchronize()
         f = sum(a.elapsed_time(b) for a, b, _c in t["ev"])
         g = sum(b.elapsed_time(c) for _a, b, c in t["ev"])
@@ -2928,7 +2934,8 @@ def _wave_timing_note_prefill(layer_id, wave_events, n_spill, n_tokens):
     import torch
 
     t = _WAVE_TP
-    if layer_id in (0, None) and t["ev"]:
+    head = _WAVE_TP_HEAD.opens_forward(layer_id)
+    if head and t["ev"]:
         torch.cuda.synchronize()
         f = sum(a.elapsed_time(b) for a, b, _c in t["ev"])
         g = sum(b.elapsed_time(c) for _a, b, c in t["ev"])
@@ -2944,7 +2951,7 @@ def _wave_timing_note_prefill(layer_id, wave_events, n_spill, n_tokens):
     t["layers"] += 1
     t["waves"] += len(wave_events)
     t["spill"] += int(n_spill)
-    if layer_id in (0, None):
+    if head:
         t["tokens"] = int(n_tokens)
 
 

@@ -41,6 +41,7 @@ from typing import Optional, Sequence, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.prefill_timing import log_ple_gather
 
 logger = logging.getLogger(__name__)
 
@@ -373,10 +374,12 @@ class PleCheckpointPreadGather:
         flat_out.copy_(staging, non_blocking=out.is_cuda)
         if flat_out.data_ptr() != out.data_ptr():
             out.copy_(flat_out.reshape(out.shape))
+        dt = _time.monotonic() - t0
         self.stats["gathers"] += 1
         self.stats["rows"] += n
         self.stats["zero_rows"] += n - nv
-        self.stats["seconds"] += _time.monotonic() - t0
+        self.stats["seconds"] += dt
+        log_ple_gather(n, n - nv, dt, self._workers)
         return out
 
     def close(self) -> None:

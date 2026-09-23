@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
     track_mamba_states_if_needed,
 )
+from sglang.srt.layers.prefill_timing import StageHead
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -40,6 +41,9 @@ logger = logging.getLogger(__name__)
 # the KV shard size nor the expert stream explains; this names the kernel
 # family.
 _ATTN_T = {"on": None, "ev": {"full": [], "linear": []}, "layers": 0, "tokens": 0, "forwards": 0}
+# The layer that opens a forward on THIS pipeline stage (see prefill_timing):
+# keying on layer 0 left PP stages 1..n without a single line.
+_ATTN_T_HEAD = StageHead()
 
 
 def _attn_timing_on() -> bool:
@@ -51,7 +55,8 @@ def _attn_timing_on() -> bool:
 def _attn_timing_begin(layer_id, num_tokens: int) -> None:
     """Called at every timed layer; on layer 0 the previous forward is flushed."""
     t = _ATTN_T
-    if layer_id in (0, None) and (t["ev"]["full"] or t["ev"]["linear"]):
+    head = _ATTN_T_HEAD.opens_forward(layer_id)
+    if head and (t["ev"]["full"] or t["ev"]["linear"]):
         torch.cuda.synchronize()
         f = sum(a.elapsed_time(b) for a, b in t["ev"]["full"])
         l = sum(a.elapsed_time(b) for a, b in t["ev"]["linear"])
@@ -62,7 +67,7 @@ def _attn_timing_begin(layer_id, num_tokens: int) -> None:
             t["forwards"], t["tokens"], t["layers"], f, len(t["ev"]["full"]), l, len(t["ev"]["linear"]),
         )
         t["ev"]["full"].clear(); t["ev"]["linear"].clear(); t["layers"] = 0
-    if layer_id in (0, None):
+    if head:
         t["tokens"] = int(num_tokens)
     t["layers"] += 1
 
