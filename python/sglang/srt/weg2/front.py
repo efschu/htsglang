@@ -1410,6 +1410,31 @@ def _split_tight_destination_cards(
     return roomy, tight
 
 
+#: The draft head's weights tag (constants.GPU_MEMORY_TYPE_WEIGHTS_DRAFT);
+#: spelled here so the front does not import the constants module for one name.
+WEIGHTS_DRAFT_TAG = "weights_draft"
+
+
+def orderable_band(tag: Any, tag_cards: Dict[str, Any]) -> bool:
+    """A tag the pause order may place by CARD: a layer band, or the draft
+    tag when the launcher's map names its card.
+
+    23.09. (fnFL2x30): the draft head is not a layer band, so it sat in
+    ``rest`` behind every chunk -- harmless while lane p4 was a SEQ host
+    buffer (x22: the 2.9 GB deposit completed in 1.9 s and its 2770 MiB
+    were credited on card 2 before D needed them). Over a BAR1 ring (4 x 32
+    MiB) the deposit completes only as the collector consumes it, and the
+    collector reaches the draft LAST -- D TP2 ran out of credit at weights_4
+    (need 994, balance 356), P PP2 sat in the ring's recv for the collector,
+    120 s W35, W17. The draft is a refund on the last stage's card and lands
+    on D's attention host, which has the room: ordered as a band of that
+    card it is paused right after the card's chunks, exactly x22's timing.
+    Without a card in the map it stays where it was."""
+    if is_weights_chunk_tag(tag):
+        return True
+    return tag == WEIGHTS_DRAFT_TAG and bool(tag_cards.get(tag))
+
+
 def interleave_pause_order(
     tags: List[str],
     tag_cards: Dict[str, Any],
@@ -1450,8 +1475,8 @@ def interleave_pause_order(
     # every flip would fall back to the IDENTITY order and lose the
     # tightest-card-first ordering boot weg2dk4 paid for.  Non-chunk family
     # members belong in ``rest``, with the base tag still closing the sleep.
-    chunks = [t for t in tags if is_weights_chunk_tag(t)]
-    rest = [t for t in tags if not is_weights_chunk_tag(t)]
+    chunks = [t for t in tags if orderable_band(t, tag_cards)]
+    rest = [t for t in tags if not orderable_band(t, tag_cards)]
     def _rr(order_chunks, why):
         # 2026-09-15 (weg2xsn99/xsn104, Nutzer-Order Punkt 1): ROUND-ROBIN
         # OVER THE DESTINATION CARDS, applied to EVERY order this function
@@ -1549,7 +1574,7 @@ def interleave_chain_card(order: List[str], why: str, tag_cards: Dict[str, Any],
     env = os.environ if env is None else env
     if str(env.get("SGLANG_WEG2_FLIP_ORDER_CHAIN", "1")).strip().lower() in ("0", "false", "no", "off"):
         return list(order), why
-    chunks = [t for t in order if is_weights_chunk_tag(t) and tag_cards.get(t)]
+    chunks = [t for t in order if orderable_band(t, tag_cards) and tag_cards.get(t)]
     if len(chunks) < 3:
         return list(order), why
     count: Dict[int, int] = {}

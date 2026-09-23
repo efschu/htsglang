@@ -14470,6 +14470,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p_split, chunk_layers, chunk_count, card_of_stage=[c.nvml_index for c in cards]
     ) if p_split else {}
     src_chunk_cards = {"P": {t: list(v) for t, v in p_chunk_cards.items()}}
+    # 23.09. (fnFL2x30): THE DRAFT TAG IS A BAND OF THE LAST STAGE'S CARD.
+    # With --draft-kv-on-p the MTP head lives on P's last stage only (W11
+    # DRAFT-RESIDENT prices exactly that pool), so its pause refunds that
+    # card -- 2770 MiB on the Next-Flash 3080. Absent from this map it sat
+    # in the front's `rest` behind every chunk, which was harmless while
+    # lane p4 was a SEQ host buffer (x22) and a deadlock over a BAR1 ring:
+    # the collector reaches the draft last, D TP2 ran dry at weights_4.
+    # `front.orderable_band` places it with its card; the base tag still
+    # closes the sleep.
+    if p_split and _draft_kv_on_p_requested and cards:
+        src_chunk_cards["P"]["weights_draft"] = [int(cards[-1].nvml_index)]
     log(f"WEG2-FLIP-ORDER MAP group=P (SOLVED cut {cut.stage_ratio or '(gapped)'}/"
         f"{cut.attn_stage_ratio or '(gapped)'} -> REALIZED layer split "
         f"{p_split if p_split else 'REFUSED (' + p_split_note + ') -> NO MAP, identity order'} "
