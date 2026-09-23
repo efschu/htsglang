@@ -147,8 +147,14 @@ class TestDisagreeIsAGroupStop(CustomTestCase):
             page_size=1,
             prefetch_revoke_queue=Queue(),
             append_host_mem_release=lambda *a, **k: None,
+            # fnFL2x22: the form is agreed over prefetch_sync_groups first;
+            # with none, the rank's own answer (draft tier armed -> packed)
+            # stands and the claim reduce below is the one this test drives.
+            prefetch_sync_groups=[],
+            storage_backend=None,
         )
         stub.prefetch_thread_func = HiCacheController.prefetch_thread_func.__get__(stub)
+        stub._agree_claim_form = HiCacheController._agree_claim_form.__get__(stub)
         stub._stop_group_from_thread = getattr(HiCacheController, "_stop_group_from_thread", None)
         if stub._stop_group_from_thread is not None:
             stub._stop_group_from_thread = stub._stop_group_from_thread.__get__(stub)

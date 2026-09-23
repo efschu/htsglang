@@ -3431,6 +3431,12 @@ class FormAWorkerNullStorage(HiCacheStorage):
     ranks that own bytes.
     """
 
+    #: fnFL2x22: in the PACKED claim vote ([claim, -claim] MIN, cache_controller
+    #: .encode_claim_vote) "claims every page" is not neutral -- it would set
+    #: the group's MAX and the host's anchor-capped claim beside it reads as a
+    #: rank disagreement (W-STOP). A tier with no bytes abstains instead.
+    abstains_from_claim_vote = True
+
     def __init__(self, storage_config=None):
         self.storage_config = storage_config
         self.mem_pool_host = None

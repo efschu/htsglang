@@ -37,6 +37,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     compute_model_identity_hash,
 )
+from sglang.srt.mem_cache.hicache_collective import (
+    HiCacheCollectiveTimeoutError,
+    bounded_wait,
+)
 from sglang.srt.mem_cache.weg2_store_gates import check_mamba_blob_present
 
 
@@ -431,6 +435,54 @@ def assert_draft_claims_agree(min_claim: int, max_claim: int, rid) -> None:
             "claims differ. Ranks never disagree; stopping the group instead "
             "of compensating."
         )
+
+
+#: fnFL2x22 (23.09.): the claim reduce of the prefetch thread is a GROUP
+#: collective, so its FORM (packed [claim, -claim] or a bare scalar) must be
+#: one and the same on every rank -- xsn392 measured what a 2-vector against
+#: two scalars does: every probe times out at its budget with 0 pages on every
+#: rank, and the thread that never returns leaks its whole host span. The
+#: rank-local marker (`solo_draft_shadow`) covered ONE shadow kind; the Form A
+#: expert workers (21.09., null storage tier) are another, and nothing printed
+#: which form a rank chose. The form is therefore AGREED (one scalar MAX over
+#: the same groups) before the claim is reduced, and a rank that holds no
+#: bytes ABSTAINS from the packed vote instead of claiming every page: the
+#: null tier's "claims every page" answer (4053) beside the host's
+#: anchor-capped claim (4052) would otherwise be a W-STOP by
+#: `assert_draft_claims_agree`, not a MIN the host decides.
+CLAIM_VOTE_ABSTAIN = 1 << 30
+
+#: How long one prefetch-thread claim collective may wait for its peers
+#: before the wait is a named STOP. The reaper prices a 259k prefetch at
+#: ~255 s (#1157), so a mismatch that hangs the thread must be named BEFORE
+#: the reap reads it as "the store held nothing" -- 120 s, the same bound
+#: family as the flip's credit wait, and far below the gloo group's 7200 s.
+PREFETCH_CLAIM_REDUCE_BOUND_S = 120.0
+
+
+def encode_claim_vote(count: int, abstain: bool) -> list:
+    """The packed vote of one rank: ``[claim, -claim]`` for a voter, the
+    abstain sentinel in BOTH slots for a rank that holds no bytes -- it can
+    win neither the min nor the max, so the extremes come from voters alone."""
+    if abstain:
+        return [CLAIM_VOTE_ABSTAIN, CLAIM_VOTE_ABSTAIN]
+    return [int(count), -int(count)]
+
+
+def decode_claim_vote(packed) -> tuple:
+    """``(min, max)`` over the VOTERS of one MIN-reduced packed vector; a
+    group in which every rank abstained holds nothing and decodes to 0."""
+    lo, neg_hi = int(packed[0]), int(packed[1])
+    if lo >= CLAIM_VOTE_ABSTAIN:
+        return 0, 0
+    return lo, -neg_hi
+
+
+def claim_vote_abstains(controller) -> bool:
+    """A storage tier that holds no bytes (Form A expert worker) says so with
+    ``abstains_from_claim_vote``; every other tier votes its own claim."""
+    backend = getattr(controller, "storage_backend", None)
+    return bool(getattr(backend, "abstains_from_claim_vote", False))
 
 
 def resolve_draft_claim(kv_pages: int, draft_pages: int, chunk_pages: int, reprobe):
@@ -1052,8 +1104,46 @@ class HiCacheController:
         self.prefetch_sync_groups = []
 
     def _all_reduce_prefetch_groups(self, tensor: torch.Tensor, op) -> None:
+        # fnFL2x22: BOUNDED. The prefetch thread's collectives ran unbounded
+        # and a form mismatch parked every rank's thread for the whole reap
+        # budget (255 s) with no line naming it. An expiry here raises
+        # HiCacheCollectiveTimeoutError, which prefetch_thread_func turns
+        # into the group STOP -- a named death instead of a silent reap.
         for group in self.prefetch_sync_groups:
-            torch.distributed.all_reduce(tensor, op=op, group=group)
+            bounded_wait(
+                torch.distributed.all_reduce(
+                    tensor, op=op, group=group, async_op=True
+                ),
+                "prefetch-thread/all_reduce",
+                PREFETCH_CLAIM_REDUCE_BOUND_S,
+            )
+
+    def _agree_claim_form(self, operation) -> bool:
+        """fnFL2x22: ONE form for the claim reduce, agreed over the groups
+        that reduce it. ``True`` = packed ``[claim, -claim]``. A rank whose
+        own answer is "scalar" adopts the packed form when any peer needs it
+        (the xsn392 shadow rule, now by agreement instead of by a marker)."""
+        local = draft_claim_packed(self)
+        if not self.prefetch_sync_groups:
+            return local
+        flag = torch.tensor([int(local)], dtype=torch.int)
+        self._all_reduce_prefetch_groups(flag, torch.distributed.ReduceOp.MAX)
+        agreed = bool(int(flag.item()))
+        n = getattr(self, "_claim_form_n", 0) + 1
+        self._claim_form_n = n
+        if n <= 8 or n % 256 == 0 or agreed != local:
+            logger.info(
+                "#xsn392b PREFETCH-CLAIM-FORM rid=%s local_packed=%s "
+                "agreed_packed=%s abstain=%s groups=%d (n=%d; the form is a "
+                "group agreement, never a rank-local marker)",
+                getattr(operation, "request_id", "?"),
+                local,
+                agreed,
+                claim_vote_abstains(self),
+                len(self.prefetch_sync_groups),
+                n,
+            )
+        return agreed
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -3670,15 +3760,21 @@ class HiCacheController:
                     operation.mark_terminate()
                     self._prefetch_drained_after_stop += 1
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
-                if draft_claim_packed(self):
+                # fnFL2x22: the FORM is agreed over the group first (one
+                # scalar MAX), never read off this rank alone -- see
+                # CLAIM_VOTE_ABSTAIN for the boot that measured the mismatch.
+                if self._agree_claim_form(operation):
                     # #1233 L8: ONE collective carries min and max -- MIN over
                     # [count, -count] -- so a rank whose claim differs from
                     # the group's is a named STOP, not a silent MIN (Q11).
+                    # A rank holding no bytes (Form A worker) abstains: it
+                    # adopts the voters' MIN below instead of setting the MAX.
                     packed = torch.tensor(
-                        [storage_hit_count, -storage_hit_count], dtype=torch.int
+                        encode_claim_vote(storage_hit_count, claim_vote_abstains(self)),
+                        dtype=torch.int,
                     )
                     self._all_reduce_prefetch_groups(packed, torch.distributed.ReduceOp.MIN)
-                    _mn, _mx = int(packed[0].item()), -int(packed[1].item())
+                    _mn, _mx = decode_claim_vote(packed)
                     if _mn != _mx and operation.request_id in getattr(self, "weg2_hold_rids", ()):
                         # #1461 (boot weg2xsn216): a probe issued for a request in
                         # the DORMANT HOLD reads a store that P is still writing --
@@ -3692,7 +3788,7 @@ class HiCacheController:
                                        "store in flux; every rank proceeds with %d)", operation.request_id, _mn, _mx, _mn)
                     else:
                         assert_draft_claims_agree(_mn, _mx, operation.request_id)
-                    storage_hit_count = int(packed[0].item())
+                    storage_hit_count = int(_mn)
                 else:
                     storage_hit_count_tensor = torch.tensor(
                         storage_hit_count, dtype=torch.int
@@ -3766,8 +3862,12 @@ class HiCacheController:
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
                     self.prefetch_buffer.put(operation)
-            except Weg2DraftDisagree as e:
+            except (Weg2DraftDisagree, HiCacheCollectiveTimeoutError) as e:
                 # S5: group STOP, never a dead thread under a live server.
+                # fnFL2x22: a claim collective that expires (a peer never
+                # arrived, or arrived in another form) is the same law -- the
+                # alternative was measured: all three threads parked for the
+                # reap budget, 0 pages, the host span leaked, W17.
                 self._stop_group_from_thread(e)
                 return
             finally:

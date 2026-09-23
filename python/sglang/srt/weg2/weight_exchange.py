@@ -4250,6 +4250,17 @@ def _write_placement_manifest(model, *, rank: int, region_tag: str,
             return
         inventory, _skipped, _walked, reason = sh.card_inventory(
             rank=int(rank), model=model, region_tag=str(region_tag))
+        # fnFL2x24 (23.09.): seit dem 27B-Merge (xsn389) ueberspringt
+        # card_inventory Meta-Parameter SELBST ("meta-no-bytes") und gibt bei
+        # leerem Inventar None zurueck. Die Schatten-Zaehlung unten sah dann
+        # keinen Meta-Tensor mehr und iterierte ueber None -> TypeError auf D
+        # TP1/TP2 -> kein leeres #103-Manifest -> W68 auf allen drei D-Raengen
+        # -> kein Draft-Plan -> P PP0 hing im 5090-Kredit (STALL, W17). Ein
+        # per Skip-Grund gemeldeter Meta-Tensor IST ein Schattenstueck.
+        if inventory is None:
+            inventory = []
+        _meta_skipped = sum(
+            1 for _n, _r in (_skipped or []) if str(_r) == "meta-no-bytes")
         # #76 (fnFL2w2, 21.09.): EIN META-SCHATTEN HAELT NICHTS, ALSO
         # PUBLIZIERT ER NICHTS. Unter Form A bauen die Experten-Worker einen
         # meta-Drafter ("rank 1 is a draft SHADOW ... no draft weights/KV/
@@ -4264,7 +4275,9 @@ def _write_placement_manifest(model, *, rank: int, region_tag: str,
         # stellt sich hier an den Tensor, nicht an die Rolle, damit derselbe
         # Schnitt fuer jeden Schatten gilt (DFlash2, 27B, spaetere Formen).
         _held = [(g, t) for (g, t) in inventory if not _tensor_is_meta(t)]
-        _shadow_n = len(inventory) - len(_held)
+        _shadow_n = (len(inventory) - len(_held)) + _meta_skipped
+        if _shadow_n and not _held:
+            reason = "all-meta-shadow"
         if _shadow_n:
             log(
                 f"{xm.JOIN_LINE_PREFIX}-WRITE group={group} rank={rank} "
