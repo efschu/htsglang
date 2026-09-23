@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -930,7 +931,7 @@ def merge_region_tags(manifests: Iterable[RankManifest]) -> List[RankManifest]:
     return out
 
 
-def join_manifests(
+def _join_manifests_uncached(
     manifests: Sequence[RankManifest],
     *,
     pp_group: str = "P",
@@ -1206,6 +1207,146 @@ def join_manifests(
         cards=tuple(m.card for m in tp), tensors=tuple(tensors),
         unsourced=(), pp_ranks=len(pp), tp_ranks=len(tp),
     )
+
+
+# ---------------------------------------------------------------------------
+# THE JOIN, ONCE PER PROCESS (fnFL2x40).
+# ---------------------------------------------------------------------------
+
+#: fnFL2x40 (23.09.): the first flip of the boot spent 6.3-7.7 s in the FIRST
+#: deposit of every rank and 0.1-0.4 s in every later tag; the bytes were not
+#: it (D's first collect moved its whole tag in 92 ms). The join is a pure
+#: function of the boot's manifest files, and the first leg recomputed it on
+#: its critical path once per region in the hook and once more in every lane
+#: thread of the first tag (``_weg2_seq_lane_descs``), all under one GIL.
+#: Measured on x40's own manifests, CPU only: one join 0.55-0.57 s, three
+#: concurrent joins 2.09 s wall.
+#:
+#: Keyed on the manifests' CONTENT (every type here is a frozen dataclass), so
+#: a rewritten manifest -- the drafter's post-load rewrite -- is another key,
+#: never a stale hit. Concurrent callers of one key wait for the first one.
+JOIN_MEMO_MAX = 8
+_JOIN_MEMO: Dict[tuple, ManifestJoin] = {}
+_JOIN_INFLIGHT: Dict[tuple, threading.Event] = {}
+_JOIN_LOCK = threading.Lock()
+_JOIN_STATS: Dict[str, int] = {"hit": 0, "miss": 0, "wait": 0}
+
+
+def join_memo_stats() -> Dict[str, int]:
+    """``{"hit", "miss", "wait"}`` since the process started (the line reads)."""
+    with _JOIN_LOCK:
+        return dict(_JOIN_STATS)
+
+
+def clear_join_memo() -> None:
+    """Forget every stored join. The join's audit lines (destination-only
+    names, solo-held names) are written when a join is COMPUTED, so a caller
+    that needs them again clears first."""
+    with _JOIN_LOCK:
+        _JOIN_MEMO.clear()
+
+
+def join_manifests(
+    manifests: Sequence[RankManifest],
+    *,
+    pp_group: str = "P",
+    tp_group: str = "D",
+) -> ManifestJoin:
+    """:func:`_join_manifests_uncached`, computed once per distinct input.
+
+    A caller that finds the same input already being joined by another
+    thread waits for that result instead of joining it a second time. A join
+    that raises is not stored; a waiter then joins it itself and gets the same
+    refusal from its own call.
+    """
+    mans = tuple(manifests)
+    key = (str(pp_group), str(tp_group), mans)
+    while True:
+        with _JOIN_LOCK:
+            hit = _JOIN_MEMO.get(key)
+            if hit is not None:
+                _JOIN_STATS["hit"] += 1
+                return hit
+            event = _JOIN_INFLIGHT.get(key)
+            owner = event is None
+            if owner:
+                event = threading.Event()
+                _JOIN_INFLIGHT[key] = event
+                _JOIN_STATS["miss"] += 1
+            else:
+                _JOIN_STATS["wait"] += 1
+        if not owner:
+            event.wait()
+            continue
+        try:
+            joined = _join_manifests_uncached(mans, pp_group=pp_group,
+                                              tp_group=tp_group)
+        except BaseException:
+            with _JOIN_LOCK:
+                _JOIN_INFLIGHT.pop(key, None)
+            event.set()
+            raise
+        with _JOIN_LOCK:
+            if len(_JOIN_MEMO) >= JOIN_MEMO_MAX:
+                _JOIN_MEMO.clear()
+            _JOIN_MEMO[key] = joined
+            _JOIN_INFLIGHT.pop(key, None)
+        event.set()
+        return joined
+
+
+def manifest_files_signature(dump_dir: str = "") -> Tuple[Tuple[str, int, int], ...]:
+    """``(name, mtime_ns, size)`` of every manifest file in the directory.
+
+    What the boot-time warm-up waits on: the drafter rewrites its manifest
+    after the load, so the files are only final once this has stopped moving.
+    """
+    directory = dump_dir or manifest_dir()
+    if not directory:
+        return ()
+    try:
+        names = sorted(f for f in os.listdir(directory)
+                       if f.startswith(MANIFEST_PREFIX + "_") and f.endswith(".json"))
+    except OSError:
+        return ()
+    out = []
+    for fname in names:
+        try:
+            st = os.stat(os.path.join(directory, fname))
+        except OSError:
+            continue
+        out.append((fname, int(st.st_mtime_ns), int(st.st_size)))
+    return tuple(out)
+
+
+def prewarm_joins(*, pp_group: str = "P", tp_group: str = "D",
+                  region_tags: Sequence[str] = ("",)) -> Dict[str, float]:
+    """Join this boot's manifests ahead of the first flip; ``{what: ms}``.
+
+    Computes the two inputs the first leg would otherwise join on its
+    critical path: the WHOLE manifest set (the lane derivation) and the
+    region-narrowed set of every tag in ``region_tags`` (the hook's
+    :func:`leg_plan_from_join`, ``""`` being the main weights region).
+    ``{}`` when this boot's manifests are not all present yet.
+    """
+    import time as _time
+
+    mans, _why = manifests_for_boot(pp_group=pp_group, tp_group=tp_group)
+    if mans is None:
+        return {}
+    out: Dict[str, float] = {}
+    t0 = _time.perf_counter()
+    join_manifests(mans, pp_group=pp_group, tp_group=tp_group)
+    out["full"] = (_time.perf_counter() - t0) * 1000.0
+    for region_tag in region_tags:
+        t0 = _time.perf_counter()
+        narrowed, _n, _b, _r = narrow_manifests_to_region(
+            mans, region_tag=str(region_tag))
+        if any(m.pieces for m in narrowed):
+            join_manifests(narrowed, pp_group=pp_group, tp_group=tp_group)
+        out[f"region:{region_tag or wx.GPU_MEMORY_TYPE_WEIGHTS}"] = (
+            _time.perf_counter() - t0) * 1000.0
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1524,6 +1665,71 @@ def manifests_for_boot(
     return found, ""
 
 
+def narrow_manifests_to_region(
+    manifests: Sequence[RankManifest],
+    *,
+    region_tag: str = "",
+    skip_names: Optional[frozenset] = None,
+    log=None,
+):
+    """``(manifests, excluded, excluded_bytes, excluded_regions)``: every
+    manifest cut to ONE region's pieces -- the input :func:`leg_plan_from_join`
+    joins, and the one :func:`prewarm_joins` must reproduce exactly so the
+    boot-time join is the same memo key as the first flip's."""
+    my_region = (region_of_tag(region_tag) if region_tag
+                 else wx.GPU_MEMORY_TYPE_WEIGHTS)
+    excluded = 0
+    excluded_bytes = 0
+    excluded_regions = set()
+    narrowed = []
+    skipped = frozenset(skip_names or ())
+    for man in manifests:
+        keep_p, drop_p = [], []
+        for piece in man.pieces:
+            if (str(piece.param_name) in skipped
+                    and region_of_tag(piece.tag) == my_region):
+                # The caller's PROVEN one-sided name (weight_updater's
+                # measured target-share for the draft's lm_head): dropped BY
+                # NAME, in THIS region, with the line a reader can audit.
+                # Every other absence still reaches the W74 refusal below.
+                if log is not None:
+                    log(f"WEG2-XCHG-JOIN-SKIP name={piece.param_name} "
+                        f"region={my_region} group={man.group} "
+                        f"rank={man.rank} -- proven one-sided (target "
+                        f"share), excluded from this join by the caller")
+                continue
+            (keep_p if region_of_tag(piece.tag) == my_region
+             else drop_p).append(piece)
+        excluded += len(drop_p)
+        excluded_bytes += sum(int(p.nbytes) for p in drop_p)
+        excluded_regions |= {region_of_tag(p.tag) for p in drop_p}
+        narrowed.append(RankManifest(
+            group=man.group, rank=man.rank, card=man.card,
+            region_tag=man.region_tag, boot_token=man.boot_token,
+            tp_rank=man.tp_rank, pp_rank=man.pp_rank,
+            pieces=tuple(keep_p)))
+    # #104 (fnFL2w40): ZWEI FAELLE, DIE DIESER FILTER VERMISCHTE.
+    # `if m.pieces` warf bisher beides weg:
+    #   (a) ein Manifest, dessen Stuecke der REGIONSFILTER oben entfernt hat
+    #       -- es gehoert einem anderen Runner und muss raus;
+    #   (b) ein Manifest, das SCHON LEER ANKAM -- der Meta-Schatten aus #103,
+    #       der genau sagen will "diesen Rang gibt es, er haelt nichts".
+    # (b) ist die Breite-0-Aussage, die #102s Halter-Karte liest. Ohne sie
+    # zaehlt `join_manifests` eine Karte statt drei, `refuse_diagonal_layout`
+    # liest die Gruppe als PP-Form und wirft W68 -- gemessen an w40: die drei
+    # Manifeste lagen vor (`pieces=0 bytes=0`, Datei geschrieben), und der
+    # Join meldete TROTZDEM `tp_size=1`. #103 allein war damit wirkungslos:
+    # ein Riegel hinter dem, was er sichern sollte.
+    # (group, rank) als Schluessel, nicht rank allein: `narrowed` traegt
+    # BEIDE Gruppen, und P-Rang 1 ist nicht D-Rang 1.
+    _empty_on_arrival = {(str(m.group), int(m.rank))
+                         for m in manifests if not m.pieces}
+    kept = [m for m in narrowed
+            if m.pieces
+            or (str(m.group), int(m.rank)) in _empty_on_arrival]
+    return kept, excluded, excluded_bytes, excluded_regions
+
+
 def leg_plan_from_join(
     *,
     hook: str,
@@ -1582,55 +1788,9 @@ def leg_plan_from_join(
     # not lost: they get their own leg from their own `arm_coverage_at_load`.
     my_region = (region_of_tag(region_tag) if region_tag
                  else wx.GPU_MEMORY_TYPE_WEIGHTS)
-    excluded = 0
-    excluded_bytes = 0
-    excluded_regions = set()
-    narrowed = []
-    skipped = frozenset(skip_names or ())
-    for man in manifests:
-        keep_p, drop_p = [], []
-        for piece in man.pieces:
-            if (str(piece.param_name) in skipped
-                    and region_of_tag(piece.tag) == my_region):
-                # The caller's PROVEN one-sided name (weight_updater's
-                # measured target-share for the draft's lm_head): dropped BY
-                # NAME, in THIS region, with the line a reader can audit.
-                # Every other absence still reaches the W74 refusal below.
-                if log is not None:
-                    log(f"WEG2-XCHG-JOIN-SKIP name={piece.param_name} "
-                        f"region={my_region} group={man.group} "
-                        f"rank={man.rank} -- proven one-sided (target "
-                        f"share), excluded from this join by the caller")
-                continue
-            (keep_p if region_of_tag(piece.tag) == my_region
-             else drop_p).append(piece)
-        excluded += len(drop_p)
-        excluded_bytes += sum(int(p.nbytes) for p in drop_p)
-        excluded_regions |= {region_of_tag(p.tag) for p in drop_p}
-        narrowed.append(RankManifest(
-            group=man.group, rank=man.rank, card=man.card,
-            region_tag=man.region_tag, boot_token=man.boot_token,
-            tp_rank=man.tp_rank, pp_rank=man.pp_rank,
-            pieces=tuple(keep_p)))
-    # #104 (fnFL2w40): ZWEI FAELLE, DIE DIESER FILTER VERMISCHTE.
-    # `if m.pieces` warf bisher beides weg:
-    #   (a) ein Manifest, dessen Stuecke der REGIONSFILTER oben entfernt hat
-    #       -- es gehoert einem anderen Runner und muss raus;
-    #   (b) ein Manifest, das SCHON LEER ANKAM -- der Meta-Schatten aus #103,
-    #       der genau sagen will "diesen Rang gibt es, er haelt nichts".
-    # (b) ist die Breite-0-Aussage, die #102s Halter-Karte liest. Ohne sie
-    # zaehlt `join_manifests` eine Karte statt drei, `refuse_diagonal_layout`
-    # liest die Gruppe als PP-Form und wirft W68 -- gemessen an w40: die drei
-    # Manifeste lagen vor (`pieces=0 bytes=0`, Datei geschrieben), und der
-    # Join meldete TROTZDEM `tp_size=1`. #103 allein war damit wirkungslos:
-    # ein Riegel hinter dem, was er sichern sollte.
-    # (group, rank) als Schluessel, nicht rank allein: `narrowed` traegt
-    # BEIDE Gruppen, und P-Rang 1 ist nicht D-Rang 1.
-    _empty_on_arrival = {(str(m.group), int(m.rank))
-                         for m in manifests if not m.pieces}
-    manifests = [m for m in narrowed
-                 if m.pieces
-                 or (str(m.group), int(m.rank)) in _empty_on_arrival]
+    manifests, excluded, excluded_bytes, excluded_regions = (
+        narrow_manifests_to_region(manifests, region_tag=region_tag,
+                                   skip_names=skip_names, log=log))
     if not any(m.pieces for m in manifests):
         return None, refusal(
             "no-tensors-in-region",

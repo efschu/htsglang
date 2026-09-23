@@ -650,6 +650,8 @@ class SchedulerWeightUpdaterManager:
     _weg2_seam_finisher: Any = None
     #: xsn261: the boot-time lane-buffer registration thread (or None).
     _weg2_prewarm_thread: Any = None
+    #: fnFL2x40: the boot-time manifest-join warm-up thread (or None).
+    _weg2_join_prewarm_thread: Any = None
     _weg2_bar1: Any = None            # BAR1 lanes registry (weg2/bar1_lanes.py), built at boot
     _weg2_bar1_thread: Any = None     # its setup thread (windows served, peers mapped)
     _weg2_flip_index_now: object = None  # the flip index of the leg in progress (BAR1 flag seq = '<flip>-<tag>')
@@ -731,6 +733,7 @@ class SchedulerWeightUpdaterManager:
             # mapped peer writes mode=host at once and no collector waits
             # for a mode file that never comes.
             self._weg2_bar1_start()
+            self._weg2_join_prewarm_start()
             if (os.environ.get("SGLANG_WEG2_LANE_PREWARM", "0") or "0") != "1":
                 return
             import threading
@@ -741,6 +744,69 @@ class SchedulerWeightUpdaterManager:
             t.start()
         except Exception as exc:  # noqa: BLE001 -- a warm-up never breaks a boot
             logger.info("WEG2-LANE-PREWARM not started: %r", exc)
+
+    def _weg2_join_prewarm_start(self) -> None:
+        """fnFL2x40: join this boot's manifests on a daemon thread, before the
+        first flip needs them.
+
+        The first leg of the boot joined them on its critical path, once per
+        region in the hook and again in every lane thread of the first tag
+        (0.55-0.57 s per join, three concurrent 2.09 s wall, measured on x40's
+        manifests): 6.3-7.7 s in the first deposit of every rank against
+        0.1-0.4 s for every later tag. ``xchg_manifest.join_manifests`` keeps
+        each distinct input once per process, so a join done here is the one
+        the flip finds. SGLANG_WEG2_JOIN_PREWARM=0 keeps the first-use form.
+        """
+        if (os.environ.get("SGLANG_WEG2_JOIN_PREWARM", "1") or "1") == "0":
+            return
+        import threading
+
+        t = threading.Thread(target=self._weg2_prewarm_joins,
+                             name="weg2-join-prewarm", daemon=True)
+        self._weg2_join_prewarm_thread = t
+        t.start()
+
+    def _weg2_prewarm_joins(self, *, poll_s: float = 1.0, stable_s: float = 5.0,
+                            budget_s: float = 900.0, rounds: int = 3) -> int:
+        """Wait until the manifest files stop changing, join them, repeat when
+        they change again (the drafter rewrites its manifest after the load).
+        Returns the number of warm-ups done; a warm-up never breaks a boot."""
+        from sglang.srt.weg2 import xchg_manifest as xm
+
+        done = 0
+        last_warm = None
+        deadline = time.monotonic() + float(budget_s)
+        try:
+            while done < int(rounds) and time.monotonic() < deadline:
+                if done:
+                    # after the first warm-up only a REWRITE is left to catch
+                    deadline = min(deadline, time.monotonic() + 120.0)
+                sig = xm.manifest_files_signature()
+                t_sig = time.monotonic()
+                while time.monotonic() < deadline:
+                    time.sleep(float(poll_s))
+                    now = xm.manifest_files_signature()
+                    if now != sig:
+                        sig, t_sig = now, time.monotonic()
+                    elif time.monotonic() - t_sig >= float(stable_s):
+                        break
+                if sig == last_warm:
+                    continue
+                ms = xm.prewarm_joins()
+                if not ms:
+                    continue  # not every rank's manifest is there yet
+                last_warm = sig
+                done += 1
+                logger.info(
+                    "WEG2-JOIN-PREWARM group=%s rank=%s round=%d files=%d %s "
+                    "memo=%s -- the first flip finds these joins done "
+                    "(fnFL2x40: they were its first deposit's critical path)",
+                    self._weg2_group_name(), self._weg2_rank(), done, len(sig),
+                    " ".join(f"{k}_ms={v:.0f}" for k, v in ms.items()),
+                    xm.join_memo_stats())
+        except Exception as exc:  # noqa: BLE001 -- a warm-up never breaks a boot
+            logger.info("WEG2-JOIN-PREWARM stopped: %r", exc)
+        return done
 
     def _weg2_bar1_start(self) -> None:
         """Build the BAR1 lane registry (weg2/bar1_lanes.py) and run its
@@ -5951,6 +6017,7 @@ class SchedulerWeightUpdaterManager:
         if _lc is not None and _jk in _lc:
             join, plan = _lc[_jk]
         else:
+            _t_derive = time.perf_counter()
             mans, why = xm.manifests_for_boot(pp_group="P", tp_group="D")
             if mans is None:
                 raise wx.Weg2XchgPlanDisagree(
@@ -5960,6 +6027,15 @@ class SchedulerWeightUpdaterManager:
             plan = xm.plan_from_join(join, direction=wx.leg_direction(hook, group))
             if _lc is not None:
                 _lc[_jk] = (join, plan)
+            # fnFL2x40: this derivation sat on the first deposit's critical
+            # path in every lane thread; the line says what it costs now.
+            import threading
+
+            logger.info(
+                "WEG2-LANE-DERIVE hook=%s group=%s rank=%s ms=%.0f memo=%s "
+                "thread=%s", hook, group, rank,
+                (time.perf_counter() - _t_derive) * 1000,
+                xm.join_memo_stats(), threading.current_thread().name)
 
         model = self._weg2_model_for_group(group)
         # THE SAME REGION KEY THE PLAN WAS BUILT WITH: `_weg2_shadow_plan`

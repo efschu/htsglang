@@ -446,6 +446,9 @@ def test_a_tensor_with_no_counterpart_refuses_by_name():
     old_level = logger.level
     logger.setLevel(_logging.INFO)
     logger.addHandler(handler)
+    # fnFL2x40: the join is kept once per process and audits when it is
+    # COMPUTED; the first call above stored it, so recompute to read the line.
+    xm.clear_join_memo()
     try:
         xm.join_manifests(mans, pp_group="P", tp_group="D")
     finally:
