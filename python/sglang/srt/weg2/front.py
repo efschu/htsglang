@@ -1520,7 +1520,8 @@ def interleave_pause_order(
 
 
 def interleave_chain_card(order: List[str], why: str, tag_cards: Dict[str, Any],
-                          env=None) -> Tuple[List[str], str]:
+                          env=None, free_mib: Optional[Dict[int, int]] = None,
+                          ) -> Tuple[List[str], str]:
     """18.09. (xsn367): the SOURCE card that carries the most chunk tags (PP0
     on the 5090: six of eight bands) is the flip's critical chain -- the
     destination collects two tags at once now, and PP0's chain must never
@@ -1528,7 +1529,23 @@ def interleave_chain_card(order: List[str], why: str, tag_cards: Dict[str, Any],
     order given) with the others (in the order given); the base tag keeps
     closing the sleep. ``SGLANG_WEG2_FLIP_ORDER_CHAIN=0`` keeps the order.
     Identity when there is no map, one card, or fewer than two chunk tags
-    on the chain card."""
+    on the chain card.
+
+    23.09. (fnFL2x26): THE CHAIN NEVER OVERTAKES A TIGHTER CARD. The
+    destination is TP, so every resume costs EVERY card, while a card is
+    refunded only by its own bands' pauses (``interleave_pause_order``).
+    Pulling the chain card's bands to the front therefore makes every other
+    card pay one resume per chain band before its first refund. Measured on
+    the Next-Flash geometry (chain = the 5090 with nine of sixteen bands,
+    3080s free 7211/5567 MiB, 982 MiB per resume): the interleave put seven
+    resumes on card 0 before PP1's first pause, D TP1 overdrew its credit
+    (balance 870 < 982 at weights_9), the depth-1 drain wait of PP1's next
+    deposit then waited for a collector that could not run -- the P<->D
+    cycle, 180 s, W68 misnamed 'stalled or dead peer', W17. With
+    ``free_mib`` given, the cards TIGHTER than the chain card keep their
+    place ahead of it and only the roomier cards' bands are interleaved; no
+    roomier card means the order is kept as given. Without a free sample
+    the xsn367 form is unchanged."""
     env = os.environ if env is None else env
     if str(env.get("SGLANG_WEG2_FLIP_ORDER_CHAIN", "1")).strip().lower() in ("0", "false", "no", "off"):
         return list(order), why
@@ -1543,16 +1560,29 @@ def interleave_chain_card(order: List[str], why: str, tag_cards: Dict[str, Any],
     chain = max(sorted(count), key=lambda c: count[c])
     if count[chain] < 2:
         return list(order), why
+    tighter_cards: List[int] = []
+    if free_mib and chain in free_mib:
+        tighter_cards = sorted(
+            c for c in count
+            if c != chain and c in free_mib and int(free_mib[c]) < int(free_mib[chain]))
     mine = [t for t in chunks if int(tag_cards[t][0]) == chain]
-    others = [t for t in chunks if int(tag_cards[t][0]) != chain]
-    merged: List[str] = []
+    ahead = [t for t in chunks if int(tag_cards[t][0]) in tighter_cards]
+    others = [t for t in chunks
+              if int(tag_cards[t][0]) != chain and int(tag_cards[t][0]) not in tighter_cards]
+    if not others:
+        return list(order), why + (
+            f", chain card {chain} NOT interleaved: every other card {tighter_cards} is tighter")
+    merged: List[str] = list(ahead)
     while mine or others:
         if mine:
             merged.append(mine.pop(0))
         if others:
             merged.append(others.pop(0))
     rest = [t for t in order if t not in set(chunks)]
-    return merged + rest, why + f", chain card {chain} interleaved"
+    note = f", chain card {chain} interleaved"
+    if tighter_cards:
+        note += f" behind tighter cards {tighter_cards}"
+    return merged + rest, why + note
 
 
 @dataclass
@@ -4823,7 +4853,8 @@ class Front:
                 dst_cards=self.src_chunk_cards.get(dst, {}),
             )
             pause_order, why = interleave_chain_card(
-                pause_order, why, self.src_chunk_cards.get(src, {}))
+                pause_order, why, self.src_chunk_cards.get(src, {}),
+                free_mib=free_mib)
         logger.info(
             "WEG2-FLIP-ORDER epoch=%d src=%s driver_free=%s pause_order=%s resume_order=%s (%s) "
             "-- applied to the GATHERED sleep leg's tag list (C9), not to a per-tag RPC loop",

@@ -6632,11 +6632,16 @@ class SchedulerWeightUpdaterManager:
                                 f"{'p%s' % pair if pair is not None else 'diag'} "
                                 f"waited for the collector to drain the "
                                 f"previous tag and it did not. The credit for "
-                                f"that tag was published before this wait, so "
-                                f"the collector was free to run: this is a "
-                                f"stalled or dead peer, not the weg2xsn30 "
-                                f"cycle. Refusing rather than overwriting "
-                                f"bands a consumer may still read.")
+                                f"that tag was published before this wait. "
+                                f"Either the peer is stalled or dead, or it "
+                                f"sits in its own credit wait with a balance "
+                                f"the earlier resumes overdrew (fnFL2x26: the "
+                                f"pause order let the destination run ahead "
+                                f"of this card's supply -- read its "
+                                f"WEG2-VRAM-CREDIT waiting line and "
+                                f"front.interleave_chain_card). Refusing "
+                                f"rather than overwriting bands a consumer "
+                                f"may still read.")
                     # #1385: ACQUIRE RIGHT BEFORE THE BUFFER, RELEASE RIGHT
                     # AFTER IT CLOSES -- never earlier, never later. Acquiring
                     # here (not before the drain wait above) keeps the permit
