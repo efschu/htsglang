@@ -225,7 +225,7 @@ class TheDraftTagTravelsTheExistingSchedule(unittest.TestCase):
             tag_cards = {"weights_0": (0,), "weights_1": (1,), "weights_2": (2,)}
             free = {0: 5000, 1: 1000, 2: 3000}
             order, why = fr.interleave_pause_order(tags, tag_cards, free)
-            self.assertEqual(why, "tightest-card-first", why)
+            self.assertTrue(why.startswith("tightest-card-first"), why)
             self.assertEqual(sorted(order), sorted(tags))
             # tightest card first among the CHUNKS, then the non-chunk tail
             self.assertEqual(order[:3], ["weights_1", "weights_2", "weights_0"])

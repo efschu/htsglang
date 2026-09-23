@@ -1536,7 +1536,66 @@ def interleave_pause_order(
         return _rr(chunks, f"identity REFUSED to reorder: cards {unknown} absent from the NVML free sample {sorted(free_mib)}")
     index = {t: i for i, t in enumerate(chunks)}
     order = sorted(chunks, key=lambda t: (min(free_mib[int(c)] for c in tag_cards[t]), index[t]))
+    if uniform_destination(dst_cards):
+        order, note = source_round_robin(order, tag_cards, free_mib)
+        return order + rest, "tightest-card-first" + note
     return _rr(order, "tightest-card-first")
+
+
+SOURCE_RR_NOTE = ", round-robin over SOURCE cards"
+
+
+def uniform_destination(dst_cards: Optional[Dict[str, Any]]) -> bool:
+    """No destination map, or one where every tag names the same first card
+    (a TP group: every tag lands on every card) -- the shape whose resumes
+    cost every card."""
+    if not dst_cards:
+        return True
+    firsts = {int(cs[0]) if cs else -1 for cs in dst_cards.values()}
+    return len(firsts) <= 1
+
+
+def source_round_robin(order: List[str], tag_cards: Dict[str, Any],
+                       free_mib: Dict[int, int]) -> Tuple[List[str], str]:
+    """23.09. (fnFL2x35): a UNIFORM destination (TP: every tag lands on every
+    card) pays for EVERY resume on EVERY card, while a card is refunded only
+    by the pauses of its OWN bands. Tightest-card-first alone hands the
+    roomiest card's bands out last -- on the Next-Flash geometry the 5090
+    (free 8170, the most) then paid eight foreign chunk shards (~800 MiB
+    each) plus the 3984 MiB draft before its first own band paused: D TP0
+    ran dry at weights_0 (need 822, balance 260), P PP0's next deposit sat
+    in the depth-1 diagonal drain behind that resume -- the P<->D credit
+    cycle, W35, W17.
+
+    The round-robin bounds every card's exposure BY CONSTRUCTION: one band
+    per source card per round, the tightest card leading each round, each
+    card's own bands in the order given (tightness, then index -- the draft
+    stays right behind its card's chunks). Between two of its own refunds a
+    card pays at most (cards - 1) foreign resumes, and before its first
+    refund at most its rank in the tightness order. Identity for one source
+    card or an incomplete map; the base tag is not touched here."""
+    queues: Dict[int, List[str]] = {}
+    first_at: Dict[int, int] = {}
+    for i, t in enumerate(order):
+        cs = [int(c) for c in (tag_cards.get(t) or ())]
+        if not cs:
+            return list(order), ""
+        # a band spanning two stages (dk4's weights_6 on [0, 2]) queues on
+        # the TIGHTEST of its cards -- the same key the sort above used
+        card = min(cs, key=lambda c: (int(free_mib.get(c, 1 << 60)), cs.index(c)))
+        queues.setdefault(card, []).append(t)
+        first_at.setdefault(card, i)
+    if len(queues) < 2:
+        return list(order), ""
+    # tightest first; a tie keeps the order the cards first appear in
+    cards = sorted(queues, key=lambda c: (int(free_mib.get(c, 1 << 60)), first_at[c]))
+    rr: List[str] = []
+    while any(queues[c] for c in cards):
+        for c in cards:
+            if queues[c]:
+                rr.append(queues[c].pop(0))
+    return rr, (SOURCE_RR_NOTE + f" {cards} (uniform destination: every resume "
+                f"costs every card, a card is refunded only by its own bands -- x35)")
 
 
 # --------------------------------------------------------------------------
@@ -1574,6 +1633,12 @@ def interleave_chain_card(order: List[str], why: str, tag_cards: Dict[str, Any],
     env = os.environ if env is None else env
     if str(env.get("SGLANG_WEG2_FLIP_ORDER_CHAIN", "1")).strip().lower() in ("0", "false", "no", "off"):
         return list(order), why
+    if SOURCE_RR_NOTE in why:
+        # 23.09. (fnFL2x35): the source round-robin already gives the chain
+        # card one band per round and bounds every other card's exposure;
+        # re-merging here would pull the tighter cards' bands back to the
+        # front in bulk (the x35 shape).
+        return list(order), why + ", chain card: subsumed by the source round-robin"
     chunks = [t for t in order if orderable_band(t, tag_cards) and tag_cards.get(t)]
     if len(chunks) < 3:
         return list(order), why

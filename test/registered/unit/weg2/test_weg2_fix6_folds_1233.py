@@ -155,7 +155,7 @@ class TestEmptyCardListIsARefusal(CustomTestCase):
     def test_a_complete_map_still_pauses_the_tightest_card_first(self):
         order, why = self._order({"weights_0": (1,), "weights_1": (0,)})
         self.assertEqual(order, ["weights_1", "weights_0", "weights"])
-        self.assertEqual(why, "tightest-card-first")
+        self.assertTrue(why.startswith("tightest-card-first"), why)
 
 
 class TestW11GetsItsSecondInstrument(CustomTestCase):

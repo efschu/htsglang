@@ -272,12 +272,18 @@ class TestInterleavePauseOrder(CustomTestCase):
         }
 
     def test_tightest_card_first_on_the_weg2dk4_geometry(self):
+        # 23.09. (fnFL2x35): on a uniform (TP) destination the tightest-card
+        # order is dealt out ONE BAND PER SOURCE CARD PER ROUND, the tightest
+        # card leading -- [6,7,4,5,0..3] became [6,4,0, 7,5,1, 2,3]. The
+        # tightest card's path minimum is unchanged (its refunds still lead
+        # every round), the roomier cards' first refund moves to round one.
         order, why = interleave_pause_order(self.tags, self.map, FREE_AT_INTERLEAVE_START)
-        self.assertEqual(why, "tightest-card-first")
+        self.assertTrue(why.startswith("tightest-card-first"), why)
+        self.assertIn("round-robin over SOURCE cards [2, 0, 1]", why)
         self.assertEqual(
             order,
-            ["weights_6", "weights_7", "weights_4", "weights_5",
-             "weights_0", "weights_1", "weights_2", "weights_3", "weights"],
+            ["weights_6", "weights_4", "weights_0", "weights_7", "weights_5",
+             "weights_1", "weights_2", "weights_3", "weights"],
         )
 
     def test_the_base_tag_still_closes_the_sleep(self):
@@ -314,8 +320,18 @@ class TestInterleavePauseOrder(CustomTestCase):
         self.assertIn("[2]", why)
 
     def test_ties_keep_the_natural_index(self):
+        """Equal free on every card: within a card the natural index holds,
+        and the cards take their turns in the order they first appear."""
         order, _ = interleave_pause_order(self.tags, self.map, {0: 7, 1: 7, 2: 7})
-        self.assertEqual(order, self.tags)
+        # cards by first appearance in the natural order: 1 (weights_0),
+        # 0 (weights_4), 2 (weights_7); weights_6 spans [0, 2] and queues on
+        # its first card under a tie
+        self.assertEqual(order, ["weights_0", "weights_4", "weights_7", "weights_1",
+                                 "weights_5", "weights_2", "weights_6", "weights_3",
+                                 "weights"])
+        for card in (0, 1, 2):
+            own = [t for t in order if t in self.map and self.map[t][0] == card]
+            self.assertEqual(own, [t for t in self.tags if t in self.map and self.map[t][0] == card])
 
 
 class TestTheMeasuredPeak(CustomTestCase):
@@ -347,7 +363,7 @@ class TestTheMeasuredPeak(CustomTestCase):
 
     def test_the_new_order_keeps_every_card_positive(self):
         order, why = interleave_pause_order(self.tags, self.map, FREE_AT_INTERLEAVE_START)
-        self.assertEqual(why, "tightest-card-first")
+        self.assertTrue(why.startswith("tightest-card-first"), why)
         low = simulate_interleave(order, self.tags)
         for nvml, mib in low.items():
             self.assertGreater(mib, 0.0, f"nvml{nvml} went negative: {low}")
@@ -420,8 +436,8 @@ class TestFlipUsesTheOrder(CustomTestCase):
         self.assertEqual(len(paused), 2, "C9: kv, then ONE gathered family leg")
         self.assertEqual(
             paused[1],
-            ["weights_6", "weights_7", "weights_4", "weights_5",
-             "weights_0", "weights_1", "weights_2", "weights_3", "weights"],
+            ["weights_6", "weights_4", "weights_0", "weights_7", "weights_5",
+             "weights_1", "weights_2", "weights_3", "weights"],
         )
         # weg2xsn84 (#1378): D resumes the family in the SAME order P pauses
         # it, then its kv. The two gathered legs are a per-tag LOCKSTEP over
@@ -497,7 +513,10 @@ class TestRoundRobinOverDestinationCards(unittest.TestCase):
         a, _ = front_mod.interleave_pause_order(tags, m, FREE_AT_INTERLEAVE_START)
         b, why = front_mod.interleave_pause_order(tags, m, FREE_AT_INTERLEAVE_START, dst_cards=uni)
         self.assertEqual(a, b)
-        self.assertNotIn("round-robin", why)
+        # x35: a uniform destination map is the same shape as no map -- the
+        # source round-robin, never the destination one
+        self.assertNotIn("round-robin over destination", why)
+        self.assertIn("round-robin over SOURCE cards", why)
 
     def test_tp_source_without_a_map_still_round_robins_over_the_destination(self):
         """xsn104: the D->P leg (TP source, no chunk->card map) answered the
