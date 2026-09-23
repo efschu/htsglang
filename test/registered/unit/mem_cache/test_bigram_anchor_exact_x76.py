@@ -23,13 +23,36 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 from sglang.srt.mem_cache.unified_cache_components.mamba_component import (  # noqa: E402
     MambaComponent,
 )
-from sglang.srt.mem_cache.unified_radix_cache import bigram_anchor_key  # noqa: E402
+from sglang.srt.mem_cache.unified_radix_cache import (  # noqa: E402
+    UnifiedRadixCache,
+    bigram_anchor_ids,
+    bigram_anchor_key,
+)
 
 PAGE = 64
 
 
 def _ids(n):
     return array.array("q", range(1000, 1000 + n))
+
+
+def test_x77_at_a_chunk_end_the_next_token_comes_from_the_untruncated_ids():
+    """Bug regression (x77, c8e26de17d): ``get_fill_ids()`` stops at the chunk
+    end, so the exact key had no next token and P filed the anchor at 4416
+    again (``units=4416/4480 ok=False``, D extended 105)."""
+    fill = _ids(4480)          # what get_fill_ids() returns at the chunk end
+    full = _ids(4521)          # full_untruncated_fill_ids: the whole prompt
+    src = bigram_anchor_ids(fill, full)
+    assert src is full
+    key = bigram_anchor_key(src, 4480, None, is_bigram=True, exact=True, page_size=PAGE)
+    assert len(key) == 4480
+    # at the request's end both views are equal: the fill ids stand
+    assert bigram_anchor_ids(full, full) is full
+    assert bigram_anchor_ids(fill, None) is fill
+    # the unfinished retention reads the untruncated ids, not the fill ids
+    import inspect
+    src_txt = inspect.getsource(UnifiedRadixCache.cache_unfinished_req)
+    assert "bigram_anchor_ids(token_ids, req.full_untruncated_fill_ids)" in src_txt
 
 
 def test_the_tracked_page_survives_under_exact_bigram_keying():

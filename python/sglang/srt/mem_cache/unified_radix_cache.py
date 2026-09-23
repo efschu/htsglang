@@ -109,6 +109,22 @@ def bigram_anchor_key(token_ids, cache_len: int, extra_key, *, is_bigram: bool,
     if is_bigram and exact and n < len(token_ids):
         n += 1
     return RadixKey(token_ids[:n], extra_key, is_bigram=is_bigram).page_aligned(page_size)
+
+
+def bigram_anchor_ids(fill_ids, full_ids):
+    """The ids the exact key reads its next token from.
+
+    fnFL2x77 (23.09.): ``Req.get_fill_ids()`` is cut at ``extend_range.end``,
+    so at a chunk end (4480 of 4521 tokens) the fill ids hold NO token past
+    the tracked position and the exact form fell back to the upstream key
+    (4416 units, x77: ``units=4416/4480 ok=False``, D extended 105).  The
+    prompt is known in full: ``full_untruncated_fill_ids`` (origin + output)
+    carries the next token.  Same prefix, longer view; the fill ids stand
+    when the full ids are no longer.
+    """
+    if full_ids is not None and len(full_ids) > len(fill_ids):
+        return full_ids
+    return fill_ids
 from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
     MambaLoadBackUnservable,
 )
@@ -1752,8 +1768,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # the next token too, so the node's units equal the tokens the tracked
         # state consumed (see `bigram_anchor_key`); the KV rows stay
         # `effective_cache_len` and the key never names more than them.
+        # fnFL2x77: `get_fill_ids()` stops at the chunk end, so the next token
+        # is read from the untruncated ids -- the prompt is known in full.
         radix_key = bigram_anchor_key(
-            token_ids, effective_cache_len, req.extra_key,
+            bigram_anchor_ids(token_ids, req.full_untruncated_fill_ids),
+            effective_cache_len, req.extra_key,
             is_bigram=self.is_eagle, exact=self.bigram_anchor_exact,
             page_size=self.page_size,
         )
