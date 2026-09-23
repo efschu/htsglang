@@ -797,6 +797,7 @@ class SchedulerWeightUpdaterManager:
                     continue  # not every rank's manifest is there yet
                 last_warm = sig
                 done += 1
+                ms.update(self._weg2_warm_leg_cache())
                 logger.info(
                     "WEG2-JOIN-PREWARM group=%s rank=%s round=%d files=%d %s "
                     "memo=%s -- the first flip finds these joins done "
@@ -807,6 +808,44 @@ class SchedulerWeightUpdaterManager:
         except Exception as exc:  # noqa: BLE001 -- a warm-up never breaks a boot
             logger.info("WEG2-JOIN-PREWARM stopped: %r", exc)
         return done
+
+    def _weg2_warm_leg_cache(self) -> Dict[str, float]:
+        """fnFL2x82: derive this rank's lane PLAN for both hooks at boot, into
+        the same cache ``_weg2_seq_lane_descs`` reads (``("join", hook, group,
+        rank)``), so the first flip's lane threads find it.
+
+        x80 (D TP0, first wake): the join was warm (memo hit 11) but the plan
+        from it was not -- three lane threads derived it at once (400 ms each,
+        WEG2-LANE-DERIVE), the first collect started 0,33 s after the first
+        resume and PP0's first tag waited 632 ms for it. Returns ``{what: ms}``;
+        an empty dict when the manifests are not all there or the rank has no
+        group name. Never breaks a boot."""
+        from sglang.srt.weg2 import weight_exchange as wx
+        from sglang.srt.weg2 import weight_exchange_shadow as sh
+        from sglang.srt.weg2 import xchg_manifest as xm
+
+        group = self._weg2_group_name()
+        rank = self._weg2_rank()
+        if not group or rank is None or int(rank) < 0:
+            return {}
+        mans, _why = xm.manifests_for_boot(pp_group="P", tp_group="D")
+        if mans is None:
+            return {}
+        _lc = getattr(self, "_weg2_xchg_leg_cache", None)
+        if _lc is None:
+            _lc = {}
+            try:
+                self._weg2_xchg_leg_cache = _lc
+            except AttributeError:
+                return {}
+        out: Dict[str, float] = {}
+        join = xm.join_manifests(mans, pp_group="P", tp_group="D")
+        for hook in (sh.HOOK_SOURCE, "authoritative"):
+            t0 = time.perf_counter()
+            plan = xm.plan_from_join(join, direction=wx.leg_direction(hook, group))
+            _lc[("join", str(hook), str(group), int(rank))] = (join, plan)
+            out[f"leg:{hook}"] = (time.perf_counter() - t0) * 1000.0
+        return out
 
     def _weg2_bar1_start(self) -> None:
         """Build the BAR1 lane registry (weg2/bar1_lanes.py) and run its
@@ -6014,28 +6053,43 @@ class SchedulerWeightUpdaterManager:
             except AttributeError:
                 pass
         _jk = ("join", str(hook), str(group), int(rank))
-        if _lc is not None and _jk in _lc:
-            join, plan = _lc[_jk]
-        else:
-            _t_derive = time.perf_counter()
-            mans, why = xm.manifests_for_boot(pp_group="P", tp_group="D")
-            if mans is None:
-                raise wx.Weg2XchgPlanDisagree(
-                    f"W68 Weg2XchgPlanDisagree: the sequential transport could "
-                    f"not read the manifests it must derive its lane from: {why}")
-            join = xm.join_manifests(mans, pp_group="P", tp_group="D")
-            plan = xm.plan_from_join(join, direction=wx.leg_direction(hook, group))
-            if _lc is not None:
-                _lc[_jk] = (join, plan)
-            # fnFL2x40: this derivation sat on the first deposit's critical
-            # path in every lane thread; the line says what it costs now.
-            import threading
+        # fnFL2x82: SINGLE-FLIGHT. x80 (D TP0, first wake): the three lane
+        # threads of the first tag all missed this key at once and each derived
+        # the 20-GiB plan (400/402/420 ms, thread=weg2-lane_0/1/1) -- the
+        # first collect started 0,33 s after the first resume. One derives,
+        # the others wait for its entry; and `_weg2_warm_leg_cache` fills the
+        # key at boot, so the first flip normally finds it.
+        _dl = getattr(self, "_weg2_xchg_leg_lock", None)
+        if _dl is None:
+            import threading as _th
+            _dl = _th.Lock()
+            try:
+                self._weg2_xchg_leg_lock = _dl
+            except AttributeError:
+                pass
+        with _dl:
+            if _lc is not None and _jk in _lc:
+                join, plan = _lc[_jk]
+            else:
+                _t_derive = time.perf_counter()
+                mans, why = xm.manifests_for_boot(pp_group="P", tp_group="D")
+                if mans is None:
+                    raise wx.Weg2XchgPlanDisagree(
+                        f"W68 Weg2XchgPlanDisagree: the sequential transport could "
+                        f"not read the manifests it must derive its lane from: {why}")
+                join = xm.join_manifests(mans, pp_group="P", tp_group="D")
+                plan = xm.plan_from_join(join, direction=wx.leg_direction(hook, group))
+                if _lc is not None:
+                    _lc[_jk] = (join, plan)
+                # fnFL2x40: this derivation sat on the first deposit's critical
+                # path in every lane thread; the line says what it costs now.
+                import threading
 
-            logger.info(
-                "WEG2-LANE-DERIVE hook=%s group=%s rank=%s ms=%.0f memo=%s "
-                "thread=%s", hook, group, rank,
-                (time.perf_counter() - _t_derive) * 1000,
-                xm.join_memo_stats(), threading.current_thread().name)
+                logger.info(
+                    "WEG2-LANE-DERIVE hook=%s group=%s rank=%s ms=%.0f memo=%s "
+                    "thread=%s", hook, group, rank,
+                    (time.perf_counter() - _t_derive) * 1000,
+                    xm.join_memo_stats(), threading.current_thread().name)
 
         model = self._weg2_model_for_group(group)
         # THE SAME REGION KEY THE PLAN WAS BUILT WITH: `_weg2_shadow_plan`
