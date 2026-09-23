@@ -931,6 +931,87 @@ def merge_region_tags(manifests: Iterable[RankManifest]) -> List[RankManifest]:
     return out
 
 
+def _other_expert_spelling(name: str) -> str:
+    """The same expert stack under the OTHER representation: the Platztausch
+    buffer (``...experts.weg2_experts_<attr>``) <-> the plain stack
+    (``...experts.<attr>``). Pure string work on the last component."""
+    from sglang.srt.managers.weg2_memory_saver import EXPERT_BUFFER_ATTR_PREFIX
+
+    head, _, last = str(name).rpartition(".")
+    if last.startswith(EXPERT_BUFFER_ATTR_PREFIX):
+        last = last[len(EXPERT_BUFFER_ATTR_PREFIX):]
+    else:
+        last = EXPERT_BUFFER_ATTR_PREFIX + last
+    return f"{head}.{last}" if head else last
+
+
+def _refuse_one_sided_expert_buffers(
+    *,
+    tp: Sequence[RankManifest],
+    pp: Sequence[RankManifest],
+    tp_only: Sequence[Tuple[str, str]],
+    pp_only: Sequence[Tuple[str, str]],
+    pp_group: str,
+    tp_group: str,
+) -> None:
+    """W74 for a Platztausch expert buffer only ONE group publishes.
+
+    fnFL2x100 (FR_P 0.45/0.95/1.0): P's last stage held all 512 experts, so
+    ``plan_load_time_staging`` built it NO Platztausch buffer and it
+    published the plain ``mlp.experts.w13_weight_packed`` [512, ...] stack for
+    layers 40-47, while every D rank published ``weg2_experts_*``. The join
+    dropped D's 32 buffers (3.69 GB) as "destination-only names ... come back
+    from the disk-reload fallback" -- a fallback this INT4 checkpoint does not
+    have (W4) -- and never looked at P's 32 plain stacks at all. D TP1's plan
+    lost ``weights_14``/``weights_15`` whole and died at W106 in the flip;
+    D TP2 kept those tags only through the replicated ``mlp.gate.weight``, so
+    its own 1.1 GB per tag would have been released with no depositor.
+
+    A Platztausch buffer's prefix has ONE mover, the exchange (no dense
+    fallback, user decision 22.09.), so a buffer without a counterpart is
+    never "the disk-reload fallback's business": it is refused here, on every
+    rank alike (the join is a pure function of the same files), before the
+    first deposit. Other one-sided names keep their existing treatment.
+    """
+    from sglang.srt.managers.weg2_memory_saver import is_expert_buffer_attr
+
+    sides = ((tp_group, tp, tp_only), (pp_group, pp, pp_only))
+    found = []
+    for group, mans, only in sides:
+        keys = {k for k in only if is_expert_buffer_attr(k[1])}
+        for man in mans:
+            for pc in man.pieces:
+                nkey = (region_of_tag(pc.tag), pc.param_name)
+                if nkey in keys:
+                    found.append((group, int(man.rank), pc))
+    if not found:
+        return
+    other_names = {
+        g: {pc.param_name for man in mans for pc in man.pieces}
+        for g, mans, _only in sides}
+    nbytes = sum(int(pc.nbytes) for _g, _r, pc in found)
+    tags = sorted({str(pc.tag) for _g, _r, pc in found},
+                  key=lambda t: (len(t), t))
+    holders = sorted({f"{g} rank {r}" for g, r, _pc in found})
+    first_group, first_rank, first = found[0]
+    peer = pp_group if first_group == tp_group else tp_group
+    spelled = _other_expert_spelling(first.param_name)
+    counterpart = (
+        f"; {peer} publishes the SAME stack as {spelled!r} instead -- one "
+        f"group holds a Platztausch buffer, the other the plain stack (a "
+        f"stage/rank whose resident fraction leaves < 2 scratch rows builds "
+        f"no buffer: W120)"
+        if spelled in other_names[peer] else "")
+    raise wx.Weg2XchgSourceMissing(
+        f"W74 Weg2XchgSourceMissing: {len(found)} Platztausch expert "
+        f"buffer piece(s) ({nbytes} bytes, tags {','.join(tags)}) held by "
+        f"{', '.join(holders)} have no counterpart in the other group "
+        f"(first: {first.param_name!r} on {first_group} rank {first_rank})"
+        f"{counterpart}. The exchange is the only mover of a buffer's "
+        f"prefix; planning around these would release them at sleep with "
+        f"nobody depositing them (x100: W106 on D TP1 weights_14).")
+
+
 def _join_manifests_uncached(
     manifests: Sequence[RankManifest],
     *,
@@ -1063,6 +1144,10 @@ def _join_manifests_uncached(
                for man in pp for pc in man.pieces}
     _my_region = wx.GPU_MEMORY_TYPE_WEIGHTS
     dst_only = sorted(n for n in names if n not in pp_keys)
+    _refuse_one_sided_expert_buffers(
+        tp=tp, pp=pp, tp_only=dst_only,
+        pp_only=sorted(pp_keys - set(names)),
+        pp_group=pp_group, tp_group=tp_group)
     if dst_only:
         _db = sum(int(pc.nbytes) for man in tp for pc in man.pieces
                   if (region_of_tag(pc.tag), pc.param_name) in set(dst_only))

@@ -1307,6 +1307,12 @@ class VramCredit:
         #: weg2xsn258: the bounded allocatable poll (xsn108, 30 s) -- now
         #: taken OUTSIDE the counter lock, see `_AllocatableTransient`.
         alloc_poll_s: float = 30.0,
+        #: fnFL2x100: ``() -> str`` -- the OTHER ranks' posted leg aborts of
+        #: this flip (weg2/leg_abort.py), ``""`` when none; same 1 s cadence.
+        #: x100's P PP1 waited the whole budget here for a credit its
+        #: co-located D TP1 could never post: TP1 had died at W106 two tags
+        #: before ``weights_10``. A non-empty answer raises W121 at once.
+        abort_reader=None,
     ) -> Dict[str, Any]:
         """W waits for the peer to fund ``need_bytes``, or refuses by name.
 
@@ -1479,7 +1485,23 @@ class VramCredit:
         # weg2xsn258: the allocatable poll's own clock, started at the first
         # short reading and cleared by the first reading that covers `need`.
         _alloc_wait: Dict[str, Any] = {"t0": None}
+        _next_abort_check = time.monotonic()
         while True:
+            if abort_reader is not None and time.monotonic() >= _next_abort_check:
+                _next_abort_check = time.monotonic() + 0.5
+                try:
+                    _aborted = abort_reader()
+                except Exception:  # noqa: BLE001 -- a probe may not raise
+                    _aborted = ""
+                if _aborted:
+                    from sglang.srt.weg2.leg_abort import Weg2FlipPeerLegAborted
+
+                    raise Weg2FlipPeerLegAborted(
+                        f"W121 Weg2FlipPeerLegAborted: card={self.uuid} "
+                        f"tag={tag}: this credit wait ({need // MIB} MiB, "
+                        f"{time.perf_counter() - t0:.1f}s in, budget "
+                        f"{budget_s:.0f}s) waits for a release that belongs "
+                        f"to a leg another rank already abandoned: {_aborted}")
             if cycle_reader is not None and time.monotonic() >= _next_lane_check:
                 try:
                     _chain = cycle_reader()

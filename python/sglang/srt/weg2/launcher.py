@@ -10258,7 +10258,8 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
 
 
 def publish_expert_map(ns, model: str, evidence_dir: str, log,
-                       p_stage_layers=None) -> str:
+                       p_stage_layers=None,
+                       chunk_layers: Optional[int] = None) -> str:
     """Die EXPERTEN-KARTE bauen und ablegen; Pfad zurueck, sonst "".
 
     #107, Nutzer-Gesetz 22.09.: *"alles was geshardet wird braucht ne
@@ -10363,6 +10364,7 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
         if grund:
             log("#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s" % grund)
             return ""
+        _refuse_unbuilt_platztausch_buffers(karte, chunk_layers=chunk_layers)
         os.makedirs(evidence_dir, exist_ok=True)
         pfad = os.path.join(evidence_dir, f"expert_map_{ns.tag}.json")
         with open(pfad, "w") as fh:
@@ -10416,9 +10418,53 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
                int(karte["moves"]), int(karte["shared_resident"]))
         )
         return pfad
+    except Weg2LaunchRefused:
+        # W120 kippt den Boot -- mit Absicht, und als EINZIGE Ausnahme der
+        # Regel darunter: eine Karte, die ein Rang nicht baut, flippt nicht
+        # (x100), und ohne Karte flippt der Lauf erst recht nicht.
+        raise
     except BaseException as _exc:  # noqa: BLE001 -- eine Karte kippt nie den Boot
         log("#107 EXPERTEN-KARTE failed: %s: %s" % (type(_exc).__name__, _exc))
         return ""
+
+
+def _refuse_unbuilt_platztausch_buffers(karte: dict, *,
+                                        chunk_layers: Optional[int]) -> None:
+    """W120 VOR dem ersten Byte: die Karte gibt einem Rang einen
+    Platztausch-Puffer, den er beim Laden nicht baut.
+
+    fnFL2x100 (FR_P 0.45/0.95/1.0): P-Stufe 2 hielt alle 512 Experten, baute
+    darum keinen Puffer und publizierte fuer Layer 40-47 den nackten Stapel;
+    der Join liess D's 32 Puffer (3,69 GB) als "destination-only" fallen, und
+    D TP1 starb im ersten Schlaf-Leg an W106 auf weights_14 -- nach 5 Minuten
+    Laden, READY und Kontroll-Decode. Das ist aus der Karte allein ablesbar,
+    also refused der Dry-Run es, mit Stufe/Rang, Layern und Tags.
+    """
+    from sglang.srt.layers.moe import expert_map as _em
+
+    unbuilt = _em.unbuilt_platztausch_buffers(karte)
+    if not unbuilt:
+        return
+    zeilen = []
+    for u in unbuilt:
+        wer = (f"P-Stufe {u.index}" if u.phase == _em.PHASE_PP
+               else f"D-Rang {u.index}")
+        tags = ("?" if not chunk_layers else ",".join(
+            f"weights_{t}" for t in sorted({l // int(chunk_layers)
+                                             for l in u.layers})))
+        zeilen.append(
+            f"{wer}: {u.resident} von {u.experts} Experten resident -> kein "
+            f"Puffer (Layer {u.layers[0] if u.layers else '?'}-"
+            f"{u.layers[-1] if u.layers else '?'}, Tags {tags}); groesste "
+            f"Fraction mit Puffer {u.max_fraction:.3f}")
+    raise Weg2LaunchRefused(
+        "W120 Weg2PlatztauschBufferUnbuilt: " + " | ".join(zeilen)
+        + ". Ein Rang mit weniger als 2 Scratch-Zeilen baut keinen "
+        "Platztausch-Puffer (plan_load_time_staging: R >= E; scratch_slot_count: "
+        "E-R < 2) und publiziert den nackten Expertenstapel unter einem anderen "
+        "Namen -- der Flip-Join findet fuer diese Layer kein Gegenstueck "
+        "(x100: W106 auf D TP1 weights_14, 120 s spaeter W29, Gruppe tot). "
+        "Bei der genannten Fraction umfasst der Puffer weiterhin jede Zeile.")
 
 
 def solve_p_cut(
@@ -13866,7 +13912,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # one thing in this step that genuinely needs the armed ring.
     # #107: EINMAL bauen, BEIDE Gruppen bekommen denselben Pfad.
     _emap = publish_expert_map(ns, ns.model, ns.evidence_dir, log,
-                               p_stage_layers=getattr(state, "p_stage_layers", None))
+                               p_stage_layers=getattr(state, "p_stage_layers", None),
+                               chunk_layers=chunk_layers)
     env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap)
     # #1269 PUBLICATION: build_env's own comment says the decision is
     # "published explicitly so the boot log names the decision" -- but it only

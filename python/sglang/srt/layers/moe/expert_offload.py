@@ -707,6 +707,13 @@ def resident_slot_count(num_local_experts: int, fraction: float) -> int:
     return max(1, min(num_local_experts, n))
 
 
+#: The fewest scratch rows a Platztausch/offload buffer can run with (the
+#: staging width is C-1). ONE owner: ``scratch_slot_count`` refuses below it,
+#: and ``expert_map.unbuilt_platztausch_buffers`` refuses a map that would
+#: make a rank go below it (fnFL2x100, W120).
+MIN_SCRATCH_ROWS = 2
+
+
 def scratch_slot_count(
     resident_count: int, num_local_experts: Optional[int] = None
 ) -> int:
@@ -736,12 +743,12 @@ def scratch_slot_count(
     if num_local_experts is None:
         return want
     room = int(num_local_experts) - int(resident_count)
-    if room < 2:
+    if room < MIN_SCRATCH_ROWS:
         raise ValueError(
             f"expert pool: {num_local_experts} owned experts with "
             f"{resident_count} resident leave {room} scratch row(s); the pool "
-            "needs at least 2 (the staging width is C-1). Lower the residency "
-            "fraction for this rank."
+            f"needs at least {MIN_SCRATCH_ROWS} (the staging width is C-1). "
+            "Lower the residency fraction for this rank."
         )
     return min(want, room)
 
@@ -5419,6 +5426,42 @@ def _karten_layout_lokal(layer, num_local):
     return tuple(reihenfolge), len(pre_l), tuple(refill)
 
 
+def _refuse_unbuilt_platztausch_buffer(layer, *, frac: float, why: str) -> None:
+    """W120 at LOAD: the Version-2 Karte gives this layer a Platztausch
+    layout, but this rank is about to keep the plain [E] stack instead.
+
+    fnFL2x100: P's last stage ran at fraction 1.0, this door returned before
+    building a buffer, and the stage published ``mlp.experts.w13_weight_packed``
+    [512, ...] where every D rank published ``weg2_experts_*`` -- the flip's
+    join had nothing to pair for layers 40-47 and D TP1 died at W106 in the
+    first sleep leg, 5 minutes after load. The Karte and the rank must build
+    the same thing; when they cannot, the load is the place to say so.
+    ``None`` from ``_karten_layout_lokal`` (no Version-2 Karte, EP slice)
+    keeps the pre-Karte behaviour: no buffer, no refusal. The NEXTN draft
+    (``SGLANG_MOE_OFFLOAD_EXCLUDE_DRAFT=1``) is fully resident BY DESIGN and
+    outside the Karte -- its one-layer block is ``model.layers.0`` again, so
+    the Karte would otherwise answer for P stage 0's layer 0.
+    """
+    from sglang.srt.layers.moe import expert_map as _em
+    from sglang.srt.layers.moe import expert_store as _es
+
+    if not _em.is_nested(_es.expert_map()) or layer._moe_offload_excluded:
+        return
+    num_local = int(layer.num_local_experts)
+    if num_local <= 0 or _karten_layout_lokal(layer, num_local) is None:
+        return
+    top = (num_local - MIN_SCRATCH_ROWS) / num_local
+    raise RuntimeError(
+        f"W120 Weg2PlatztauschBufferUnbuilt: layer {layer.layer_id} group "
+        f"{_group_of_layer(layer)} rank {layer.moe_tp_rank}: {why} (fraction "
+        f"{frac}) -- this rank would keep the plain [{num_local}] expert "
+        f"stack, while the Platztausch-Karte gives the layer a buffer whose "
+        f"prefix the flip moves by name; the other group has no counterpart "
+        f"for the plain stack. Keep this rank's resident fraction at or below "
+        f"{math.floor(top * 1000) / 1000:.3f} ((E-{MIN_SCRATCH_ROWS})/E, "
+        f"E={num_local}): the buffer still spans every expert row.")
+
+
 def rearm_expert_offload_after_wake(model):
     """``(layer, zeilen)``: jeden Offload-Layer des Modells nach dem Wake
     wieder rechenfaehig machen (Platztausch). Laeuft auf der AUFWACHENDEN Seite,
@@ -6039,6 +6082,8 @@ def presplit_expert_offload_after_repack(
     if frac is None:
         frac = resident_fraction_for_rank()
     if frac >= 1.0:
+        _refuse_unbuilt_platztausch_buffer(layer, frac=float(frac),
+                                           why="fraction >= 1.0")
         return
     E = getattr(layer, "num_local_experts", None)
     if not E:
@@ -6117,6 +6162,10 @@ def presplit_expert_offload_after_repack(
         resident_order=_order,
     )
     if plan is None:
+        if _order is not None:
+            _refuse_unbuilt_platztausch_buffer(
+                layer, frac=float(frac),
+                why=f"the Karte pins all {len(_order)} of {int(E)} experts")
         return
     R = plan.resident_count
     buf_slots = plan.buffer_slots

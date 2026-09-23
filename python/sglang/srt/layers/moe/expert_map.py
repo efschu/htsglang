@@ -37,7 +37,10 @@ Die Skalierung gehoert deshalb HIERHIN -- einmal, an der Quelle der Karte
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Sequence, Tuple
+
+import msgspec
 
 #: Die Karte, die der Launcher publiziert; beide Gruppen lesen dieselbe.
 MAP_ENV = "SGLANG_MOE_EXPERT_MAP"
@@ -444,6 +447,61 @@ def build_nested(total: int,
 
 def is_nested(karte: Optional[dict]) -> bool:
     return bool(karte) and int(karte.get("version", 0)) >= NESTED_VERSION
+
+
+class UnbuiltBuffer(msgspec.Struct, frozen=True):
+    """Ein Rang, dem die Karte einen Platztausch-Puffer gibt, den er nicht
+    baut (W120). ``layers`` sind die Layer, die er traegt."""
+
+    phase: str
+    index: int
+    experts: int
+    resident: int
+    layers: Tuple[int, ...]
+    max_fraction: float
+
+
+def unbuilt_platztausch_buffers(karte: dict) -> Tuple[UnbuiltBuffer, ...]:
+    """Welche P-Stufe / welcher D-Rang baut KEINEN Platztausch-Puffer?
+
+    fnFL2x100 (FR_P 0.45/0.95/1.0): die Karte gab P-Stufe 2 den Praefix 182
+    und 512 residente Ids, aber ``plan_load_time_staging`` baut bei
+    ``R >= E`` keinen Puffer (bei ``E - R < MIN_SCRATCH_ROWS`` refused
+    ``scratch_slot_count``): die Stufe hielt den nackten [512]-Stapel unter
+    dem ANDEREN Namen, der Join fand fuer Layer 40-47 kein Gegenstueck, und
+    D TP1 starb im ersten Schlaf-Leg an W106 -- fuenf Minuten nach READY.
+
+    Dieselbe Zaehlung wie der Rang: P-Stufen halten alle ``total`` Experten
+    ihrer Layer, D-Raenge ``span + pad`` (der Pad zaehlt mit, #82). Leer =
+    jeder Rang baut seinen Puffer. ``max_fraction`` ist die groesste
+    Fraction, bei der er es tut; der Puffer umfasst dann trotzdem jede Zeile.
+    """
+    from sglang.srt.layers.moe.expert_offload import MIN_SCRATCH_ROWS
+
+    if not is_nested(karte):
+        return ()
+    total = int(karte["total"])
+    pad = int(karte.get("pad_tp", 0))
+    stages = [int(s) for s in karte.get("p_layer_stage", [])]
+    out: List[UnbuiltBuffer] = []
+
+    def _top(e: int) -> float:
+        return math.floor((e - MIN_SCRATCH_ROWS) / e * 1000) / 1000
+
+    for s, ids in enumerate(karte["phases"][PHASE_PP]["resident"]):
+        if total - len(ids) < MIN_SCRATCH_ROWS:
+            out.append(UnbuiltBuffer(
+                phase=PHASE_PP, index=s, experts=total, resident=len(ids),
+                layers=tuple(l for l, st in enumerate(stages) if st == s),
+                max_fraction=_top(total)))
+    for r, ids in enumerate(karte["phases"][PHASE_TP]["resident"]):
+        e = int(karte["spans"][r]) + pad
+        held = len(ids) + pad
+        if e - held < MIN_SCRATCH_ROWS:
+            out.append(UnbuiltBuffer(
+                phase=PHASE_TP, index=r, experts=e, resident=held,
+                layers=tuple(range(len(stages))), max_fraction=_top(e)))
+    return tuple(out)
 
 
 def stage_of_layer(karte: dict, layer_id: int) -> Optional[int]:

@@ -813,7 +813,18 @@ class SchedulerWeightUpdaterManager:
                     " ".join(f"{k}_ms={v:.0f}" for k, v in ms.items()),
                     xm.join_memo_stats())
         except Exception as exc:  # noqa: BLE001 -- a warm-up never breaks a boot
-            logger.info("WEG2-JOIN-PREWARM stopped: %r", exc)
+            from sglang.srt.weg2 import weight_exchange as wx
+
+            if isinstance(exc, (wx.Weg2XchgSourceMissing,
+                                wx.Weg2XchgPlanDisagree)):
+                # fnFL2x100: the SAME join the first flip will ask, refused
+                # at boot -- said loudly here, where it is minutes before the
+                # flip, instead of as "stopped" among the info lines.
+                logger.error("WEG2-JOIN-PREWARM REFUSED group=%s rank=%s: %s "
+                             "-- the first flip leg will refuse on every rank",
+                             self._weg2_group_name(), self._weg2_rank(), exc)
+            else:
+                logger.info("WEG2-JOIN-PREWARM stopped: %r", exc)
         return done
 
     def _weg2_warm_leg_cache(self, *, agree_budget_s: float = 60.0,
@@ -2072,6 +2083,25 @@ class SchedulerWeightUpdaterManager:
             sh.HOOK_SOURCE, group, int(rank), agreed=None,
             require_agreement=False)
         if plan is None:
+            # fnFL2x100: NO PLAN IS NOT "NOTHING TO DEPOSIT". A refused join
+            # (W74: a tensor one group publishes and the other does not) ends
+            # here on EVERY rank of the sleeping group, and the pause right
+            # after this return releases the tag's bytes with nobody holding
+            # them. With the ring off and the exchange authoritative that is
+            # the W106 gap exactly -- the same predicate, asked with the plan
+            # refusal as its reason, before VRAM is mutated for this tag.
+            if tag is not None:
+                _gap = self._weg2_xchg_wake_source_gap(
+                    tag, cdescs_present=False,
+                    resident_bytes=self._weg2_tag_resident_bytes(tag))
+                if _gap is not None:
+                    _expected_bytes = self._weg2_tag_bytes(tag)
+                    raise Weg2XchgWakeSourceGapRefused(
+                        f"W106 Weg2XchgWakeSourceGapRefused: group={group} "
+                        f"rank={rank} tag={tag} expected_bytes="
+                        f"{_expected_bytes if _expected_bytes > 0 else 'unmeasurable'}"
+                        f": this rank has NO exchange plan at all ({reason}) "
+                        f"-- {_gap}")
             logger.info(
                 "WEG2-XCHG-DEPOSIT-SKIPPED group=%s rank=%s no plan: %s",
                 group, rank, reason)
@@ -3508,6 +3538,13 @@ class SchedulerWeightUpdaterManager:
         came from the fence propagates untouched -- the group has already
         stopped, which is the outcome this method exists to produce.
         """
+        # fnFL2x100: NAME THE DEAD LEG TO THE WAITERS FIRST. The fence below
+        # reaches only THIS group, and only once every member arrives -- x100's
+        # D TP1 sat in it 121 s while P PP1 (credit), D TP0 (BAR1 'free') and
+        # P PP0 (lane mode) waited out their own 120 s budgets for a leg that
+        # had died at W106. Posted before the fence, read by every liveness
+        # probe and credit wait of this flip (weg2/leg_abort.py).
+        self._weg2_post_leg_abort(f"{what}: {type(exc).__name__}: {exc}")
         if self.weg2_fence_raised:
             self.weg2_fence_raised = False
             return
@@ -3516,6 +3553,52 @@ class SchedulerWeightUpdaterManager:
         self._weg2_group_fence(
             what, ok=False, failure=f"{type(exc).__name__}: {exc}"
         )
+
+    def _weg2_leg_abort_key(self) -> Optional[Dict[str, Any]]:
+        """``{boot_nonce, flip, group, rank}`` of the leg in progress, or
+        ``None`` when this rank is in no flip (no boot nonce, no flip index,
+        no group identity) -- then there is nothing to post or to read."""
+        from sglang.srt.weg2 import weight_exchange_region as xr
+
+        boot_nonce = (os.environ.get(xr.ENV_REGION_BOOT, "") or "").strip()
+        flip = self._weg2_flip_index_now
+        group = self._weg2_group_name()
+        rank = self._weg2_rank()
+        if (not boot_nonce or not isinstance(flip, int) or flip < 0
+                or group == "?" or rank is None or int(rank) < 0):
+            return None
+        return {"boot_nonce": boot_nonce, "flip": int(flip),
+                "group": str(group), "rank": int(rank)}
+
+    def _weg2_post_leg_abort(self, reason: str) -> None:
+        """Publish this rank's failed leg (weg2/leg_abort.py). Never raises:
+        the failure being reported is the one that must propagate."""
+        from sglang.srt.weg2 import leg_abort as la
+
+        key = self._weg2_leg_abort_key()
+        if key is None:
+            return
+        try:
+            path = la.post(reason=reason, **key)
+        except OSError as exc:
+            logger.error("WEG2-LEG-ABORT post failed: %r", exc)
+            return
+        logger.error("WEG2-LEG-ABORT posted group=%s rank=%s flip=%s path=%s "
+                     "reason=%s", key["group"], key["rank"], key["flip"], path,
+                     reason[: la.REASON_MAX_CHARS])
+
+    def _weg2_foreign_leg_aborts(self) -> str:
+        """The OTHER ranks' aborts of this flip as one clause, ``""`` if none.
+        Read by every wait of the leg (liveness, credit, lane refusal)."""
+        from sglang.srt.weg2 import leg_abort as la
+
+        key = self._weg2_leg_abort_key()
+        if key is None:
+            return ""
+        try:
+            return la.describe(la.foreign(**key))
+        except OSError:
+            return ""
 
     # ------------------------------------------------------------------
     # C14 -- the device-side credit, from this rank's side of the corridor
@@ -4841,7 +4924,14 @@ class SchedulerWeightUpdaterManager:
         FAIL-OPEN: any instrument error answers True -- keep waiting within
         the budget; the 120 s rendezvous budget remains the hard bound and
         the detector (the coordinator's requirement (b)).
+
+        fnFL2x100: A PEER WHOSE LEG ALREADY DIED IS NOT COMING either. Its
+        process may well be alive (x100's D TP1 sat in its group fence for
+        121 s), so NVML says nothing; its posted abort does, and ends this
+        wait at the next poll instead of at the budget.
         """
+        if self._weg2_foreign_leg_aborts():
+            return False
         try:
             uuid_key = resolve_pcie_lock_key()
             import pynvml  # noqa: PLC0415
@@ -7130,9 +7220,14 @@ class SchedulerWeightUpdaterManager:
             # two lanes that returned "" -- the embed rows 0..82815 were never
             # written and four boots read the SEAM-DIGEST mismatch as a
             # content question. A lane's refusal refuses the leg, by name.
+            # fnFL2x100: a lane stopped by ANOTHER rank's dead leg says only
+            # "gone or stuck"; the posted abort names who died and why.
+            _aborted = self._weg2_foreign_leg_aborts()
             raise bx.Weg2XchgBouncePhaseUnordered(
                 f"W68 Weg2XchgPlanDisagree: {len(_lane_failures)} lane(s) of "
-                f"this leg refused: " + " | ".join(_lane_failures[:6]))
+                f"this leg refused: " + " | ".join(_lane_failures[:6])
+                + (f" -- W121 PEER LEG ABORTED this flip: {_aborted}"
+                   if _aborted else ""))
         if _zerofill and phase == bx.PHASE_COLLECT:
             self._weg2_xchg_apply_zerofill(
                 ops=ops, descs=_zerofill, rank=rank, device=device, tag=tag)
@@ -7368,6 +7463,7 @@ class SchedulerWeightUpdaterManager:
                 epoch=epoch,
                 stuck_lane_reader=_stuck_lane_reader,
                 cycle_reader=_cycle_reader,
+                abort_reader=self._weg2_foreign_leg_aborts,
             )
         except Weg2VramCreditRefused:
             raise
