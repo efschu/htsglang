@@ -444,15 +444,21 @@ def note(op: str, nbytes: int, variant: Optional[int] = None) -> None:
 
 # ---------------------------------------------------------------------------
 # The EAGER half (23.09., fnFL2x41). D's first decode round died on its host
-# rank with the ranks' collective sequences already apart right after the
-# extend: the host's next launch was a 48-byte broadcast, the workers had
-# finished a 72-byte one the host never issued. The census above names who
-# asked for every CAPTURED collective; for an eager one nothing in the tree
-# does -- the launch record keeps only the last op, and without the callsite.
-# ``SGLANG_BARLINK_EAGER_TRACE=N`` logs the first N eager launches of this
-# process, one line each: a per-rank sequence the ranks' logs can be diffed
-# by, and the frames that asked for each entry. Off by default (N=0); off, it
-# is one dict read per launch.
+# rank and the ranks' collective sequences LOOKED apart right after the
+# extend. The census above names who asked for every CAPTURED collective; for
+# an eager one nothing in the tree does -- the launch record keeps only the
+# last op, and without the callsite. ``SGLANG_BARLINK_EAGER_TRACE=N`` logs the
+# first N eager launches of this process, one line each: a per-rank sequence
+# the ranks' logs can be diffed by, and the frames that asked for each entry.
+# Off by default (N=0); off, it is one dict read per launch.
+#
+# THE SIZE FIELD IS ``moved_bytes``, NOT THE PAYLOAD (x43): it is what the
+# launch reports -- for a broadcast or all_gather over the a2a kernel that is
+# ``length * (R - 1)``, the bytes sent to ALL peers (barlink_bar1.barlink_broadcast
+# passes ``kernel_bytes=length * (R - 1)``). A bs=1 draft-token broadcast
+# (24 B) prints as 48 at R=3; read as a payload it looked like a bs=2 batch
+# and cost a diagnostic boot. The x42 trace itself showed identical sequences
+# on all ranks -- there was no divergence.
 # ---------------------------------------------------------------------------
 ENV_EAGER_TRACE = "SGLANG_BARLINK_EAGER_TRACE"
 
@@ -481,7 +487,7 @@ def eager_note(
         seq = int(_EAGER_TRACE["seq"] or 0)
         _EAGER_TRACE["seq"] = seq + 1
         logger.info(
-            "BARLINK-EAGER-TRACE seq=%d group=%s op=%s nbytes=%d variant=%s site=%s",
+            "BARLINK-EAGER-TRACE seq=%d group=%s op=%s moved_bytes=%d variant=%s site=%s",
             seq, group or "?", op, int(nbytes),
             "-" if variant is None else int(variant),
             _callsite(EAGER_TRACE_FRAMES),

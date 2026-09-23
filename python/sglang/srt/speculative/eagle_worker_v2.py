@@ -98,6 +98,7 @@ from sglang.srt.speculative.eagle_utils import (
     per_step_draft_out_cache_loc,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_stage_sync import checkpoint as _stage_sync
 from sglang.srt.speculative.spec_utils import (
     _broadcast_draft_picks,
     capture_safe_tp_broadcast,
@@ -1389,6 +1390,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
         )
+        _stage_sync("draft-prepare")
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -2591,6 +2593,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 target_capture_mode = CaptureHiddenMode.NULL
             batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(batch)
+            _stage_sync("extend-forward")
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
@@ -2622,6 +2625,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch_output.next_draft_input = self._solo_stub_draft_input(
                     batch, batch_output.next_token_ids
                 )
+                _stage_sync("extend-draft")
                 return batch_output
             with (
                 self.draft_worker.draft_tp_context(
@@ -2639,6 +2643,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )
+                _stage_sync("extend-draft")
                 return batch_output
         else:
             from sglang.srt.speculative.spec_batch_probe import probe as _sbp
@@ -2695,9 +2700,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft"),
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+            _stage_sync("draft")
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
+            _stage_sync("verify-end")
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -2742,6 +2749,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         # future narrowed caller. State the width, always.
                         verify_width=int(verify_input.draft_token_num),
                     )
+            _stage_sync("draft-extend")
 
             # The bootstrap is discharged only HERE -- after the
             # draft_extend that turned this round's hidden states into a
@@ -3308,6 +3316,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch,
                 self.target_worker,
             )
+        _stage_sync("verify-prepare", stream=self.plan_stream)
 
         # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
         record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
@@ -3360,6 +3369,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             forward_batch=verify_forward_batch,
             is_verify=True,
         )
+        _stage_sync("verify-forward")
         logits_output = forward_batch_output.logits_output
 
         # Generate vocab mask for constrained decoding
@@ -3416,6 +3426,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             vocab_mask,
             weightless_recv=_wl_worker,
         )
+        _stage_sync("verify-sample")
         # #616 instrument: first consumption point after eagle_sample. Guarding
         # HERE rather than only at the `predict[accept_index]` gather covers
         # every downstream consumer (the mamba commit indexes accept_index too),
@@ -3490,6 +3501,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # the state itself.
                 int(verify_input.draft_token_num),
             )
+        _stage_sync("verify-mamba-commit")
 
         if not batch.forward_mode.is_idle():
             # #616 instrument: CONSUMPTION point of accept_index. This gather is

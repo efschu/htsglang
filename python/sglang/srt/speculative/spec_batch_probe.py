@@ -1,7 +1,12 @@
 """23.09. (fnFL2x42): Next Flash's D group runs bs=1 -- max_running_requests=1,
-graphs captured for bs=1 only -- yet every rank's first decode round sent the
-bs=2 payloads (48-byte draft tokens, 72-byte accept payload) for a batch that
-held ONE request, and the host died in the bs=1 verify graph.
+graphs captured for bs=1 only. The eager trace showed 48/72-byte broadcasts
+in its first decode round, which were read as bs=2 payloads for a batch that
+held ONE request.
+
+REFUTED by this probe on x43: ``seq_lens`` has one row at every site below,
+and the trace's size field is the bytes moved to BOTH peers (payload x 2 at
+R=3), not the payload -- the surviving 1-token health decode shows the same
+48/72 bytes. The probe stays as the instrument for a batch's row count.
 
 ``SGLANG_SPEC_BATCH_PROBE=N`` logs, per site, the first N looks at the batch
 shape where a second row can enter: the extend's hand-off, the overlap

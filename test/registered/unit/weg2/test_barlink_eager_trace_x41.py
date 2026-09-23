@@ -1,12 +1,12 @@
-"""23.09. (fnFL2x41): D's first decode round died on its host rank with the
-ranks' collective sequences apart right after the extend -- the host's next
-eager launch was a 48-byte broadcast, the workers had finished a 72-byte one
-the host never issued -- and no instrument named who asked for an EAGER
-collective. ``barlink_capture_census.eager_note`` logs them, one line each.
+"""23.09. (fnFL2x41): D's first decode round died on its host rank and no
+instrument named who asked for an EAGER collective.
+``barlink_capture_census.eager_note`` logs them, one line each.
 
 What must hold for that to be usable on a boot and harmless on every other:
-off by default, a hard budget, and a callsite that names the caller's frames,
-not the transport's own plumbing.
+off by default, a hard budget, a callsite that names the caller's frames, not
+the transport's own plumbing -- and a size field that says what it is. It is
+``moved_bytes`` (x43): a broadcast at R=3 moves its payload to two peers, so
+a 24-byte payload prints 48; read as a payload that became a phantom bs=2.
 """
 import logging
 import unittest
@@ -44,7 +44,8 @@ class EagerTrace(unittest.TestCase):
             for _ in range(4):
                 _seam_that_asked("broadcast", 48)
         self.assertEqual(len(cm.output), 2)
-        self.assertIn("seq=0 group=tp:0 op=broadcast nbytes=48", cm.output[0])
+        self.assertIn("seq=0 group=tp:0 op=broadcast moved_bytes=48", cm.output[0])
+        self.assertNotIn(" nbytes=", cm.output[0])
         self.assertIn("seq=1 ", cm.output[1])
 
     def test_the_site_names_the_caller_not_the_instrument(self):

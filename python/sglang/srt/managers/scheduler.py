@@ -339,6 +339,7 @@ from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_stage_sync import checkpoint as _stage_sync
 from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logger,
@@ -3096,6 +3097,7 @@ class Scheduler(
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            _stage_sync(f"result-{tmp_batch.forward_mode.name}")
 
         while True:
             if self.gracefully_exit:
