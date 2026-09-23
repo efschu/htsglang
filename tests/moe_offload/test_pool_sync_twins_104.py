@@ -27,6 +27,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 from collections import namedtuple
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.layers.moe import expert_offload as eo
@@ -40,8 +41,9 @@ DispatchOutput = namedtuple("DispatchOutput", "hidden_states hidden_states_scale
 CombineOutput = namedtuple("CombineOutput", "hidden_states")
 
 
-def _pool_cache(monkeypatch):
+def _pool_cache(monkeypatch, keep):
     monkeypatch.setenv("SGLANG_MOE_SCRATCH_SLOTS", str(C))
+    monkeypatch.setenv("SGLANG_OPT_MOE_POOL_KEEP_LRU", "1" if keep else "0")
     monkeypatch.setenv("SGLANG_MOE_OFFLOAD_WAVE_ORDER", "token")
     cache = eo.MoEExpertOffloadCache(SimpleNamespace(num_local_experts=E, layer_id=23), R / E)
     assert (cache.resident_count, cache.scratch) == (R, C)
@@ -83,10 +85,11 @@ def _decode_step(cache, ids):
     return cache._pool_buffers.routes[: len(ids)].tolist()
 
 
+@pytest.mark.parametrize("keep", [False, True], ids=["free-lru", "keep-lru"])
 def test_a_multi_wave_extend_never_routes_the_first_decode_away_from_an_experts_bytes(
-    monkeypatch,
+    monkeypatch, keep
 ):
-    cache = _pool_cache(monkeypatch)
+    cache = _pool_cache(monkeypatch, keep)
     # wave 1: token 0 needs spill 2..6 -> rows 2..6; wave 2: token 1 needs 5, 7
     # -> rows 2, 3. Row 5 still holds expert 5 from wave 1: a twin of row 2.
     _eager_forward(cache, [[2, 3, 4, 5, 6], [5, 7, 0, 1, 0]])
@@ -100,11 +103,20 @@ def test_a_multi_wave_extend_never_routes_the_first_decode_away_from_an_experts_
     assert ep.bijection_breaks(cache._pool_tables) == 0
 
 
-def test_sync_tables_reports_the_twins_it_freed_and_none_for_one_wave():
+@pytest.mark.parametrize("keep", [False, True], ids=["free-lru", "keep-lru"])
+def test_sync_tables_reports_the_twins_it_freed_and_none_for_one_wave(keep):
     t = ep.allocate_pool_tables("cpu", E, R + C, R, S, {0: 0, 1: 1}, [-1, -1] + list(range(E - R)))
-    assert ep.sync_tables(t, {2: 5, 3: 7, 4: 4, 5: 5, 6: 6}) == 1
+    holds = {2: 5, 3: 7, 4: 4, 5: 5, 6: 6}  # expert 5 in rows 2 and 5
+    assert ep.sync_tables(t, holds, keep_unwritten=keep).twins_freed == 1
     assert t.row_key.tolist()[2:6].count(5) == 1
-    assert ep.sync_tables(t, {2: 5, 3: 7}) == 0
+    assert ep.bijection_breaks(t) == 0
+    # one wave writes every expert once: nothing to free on a fresh pool
+    fresh = ep.allocate_pool_tables("cpu", E, R + C, R, S, {0: 0, 1: 1}, [-1, -1] + list(range(E - R)))
+    assert ep.sync_tables(fresh, {2: 5, 3: 7}, keep_unwritten=keep).twins_freed == 0
+    # under keep, rewriting 5 into row 3 frees the kept row 5 -- still one owner
+    if keep:
+        assert ep.sync_tables(t, {3: 5}, keep_unwritten=True).twins_freed == 1
+        assert ep.bijection_breaks(t) == 0 and t.hot_phys.tolist()[5] == 3
 
 
 def test_evicting_a_stale_twin_never_unmaps_the_expert_the_step_hits():

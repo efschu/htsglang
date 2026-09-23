@@ -58,6 +58,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import msgspec
+
 ROW_USE_NEVER = 0x7FFFFFFFFFFFFFFF
 PLAN_WIDTH = 64
 COPY_PROGRAMS = 32
@@ -215,29 +217,46 @@ def reinit_pool_tables(tables: PoolTables, hot_slot_of: Dict[int, int],
     tables.pf_counts.zero_()
 
 
-def sync_tables(tables: PoolTables, lru_holds: Dict[int, int]) -> int:
+class SyncReport(msgspec.Struct, frozen=True):
+    """What ``sync_tables`` left behind: LRU rows that own an expert, and the
+    twin rows it freed so that every expert has exactly one owner."""
+
+    owned: int
+    twins_freed: int
+
+
+def sync_tables(
+    tables: PoolTables, lru_holds: Dict[int, int], keep_unwritten: bool = False
+) -> SyncReport:
     """After an EAGER forward rewrote the LRU rows (run_waves' fetches): the
     device tables take the host's truth. ``lru_holds`` = row -> expert for the
-    rows the eager pass wrote; every other LRU row becomes free (-1), staging
-    rows are never owned. Residents [0, lru_start) are untouched.
+    rows the eager pass wrote (``_fetch`` records EVERY row it writes, so a row
+    absent from it was not touched). Staging rows are never owned. Residents
+    [0, lru_start) are untouched.
 
-    ONE OWNER PER EXPERT (Blocker #104, fnFL2x44-x50). A token-major eager
-    forward fetches every wave's spill experts into the rows [R, R + n_wave)
-    in sorted order, so an expert routed in two waves lands in two DIFFERENT
-    rows, and a row a later, smaller wave does not reach keeps its earlier
-    expert: ``lru_holds`` then names the same expert in two rows (D TP0, x50:
-    8-9 waves per extend layer). Both rows hold that expert's bytes, but the
-    step lives on ``row_key[r] == e`` iff ``hot_phys[e] == r``: evicting the
-    row ``hot_phys`` does not point at clears ``hot_phys[e]`` in the very step
-    that hits ``e`` in the other row, and ``e`` is routed to -1. The marlin
-    MoE runs without an expert map here, so a -1 block reads the expert BEFORE
-    the bank -- the first graph verify after every multi-wave extend. An eager
-    verify (one wave, no twin) healed it, which is what
-    SGLANG_SPEC_EAGER_VERIFY=first bought. Every row the holds name carries
-    its expert's bytes, so any one of them may own it: the last one in the
-    holds map does, every other row naming the same expert is freed.
+    ``keep_unwritten=False`` (the old form): every LRU row the eager pass did
+    not write becomes free (-1) -- the decode working set is dropped at every
+    extend and every eager verify.
 
-    Returns the number of twin rows freed (0 for a single-wave pass)."""
+    ``keep_unwritten=True`` (SGLANG_OPT_MOE_POOL_KEEP_LRU): a row the eager
+    pass did not write keeps its expert and its ``row_use``; its bytes did not
+    change, so the mapping is still true.
+
+    ONE OWNER PER EXPERT, in both forms (Blocker #104, fnFL2x44-x50). The step
+    lives on ``row_key[r] == e`` iff ``hot_phys[e] == r`` over the LRU rows. A
+    token-major eager forward fetches every wave's spill experts into the rows
+    [R, R + n_wave) in sorted order, so an expert routed in two waves lands in
+    two DIFFERENT rows, and a row a later, smaller wave does not reach keeps
+    its earlier expert: ``lru_holds`` then names the same expert twice (D TP0,
+    x50: 8-9 waves per extend layer). Under keep, a kept row may also still
+    hold an expert the eager pass wrote into a new row. Every such row carries
+    the expert's bytes, but evicting the row ``hot_phys`` does not point at
+    clears ``hot_phys[e]`` in the very step that hits ``e`` in the other row,
+    and ``e`` is routed to -1 -- the marlin MoE runs without an expert map
+    here, so a -1 block reads the expert BEFORE the bank: the first graph
+    verify after every multi-wave extend. An eager verify (one wave, no twin)
+    healed it, which is what SGLANG_SPEC_EAGER_VERIFY=first bought. The last
+    row the holds name for an expert owns it; every other row is freed."""
     import torch
 
     E, lo, hi = tables.num_experts, tables.lru_start, tables.pool_rows
@@ -245,19 +264,35 @@ def sync_tables(tables: PoolTables, lru_holds: Dict[int, int]) -> int:
     key = tables.row_key.cpu()
     use = tables.row_use.cpu()
     host_row = tables.host_row.cpu()
+    pf_row = tables.pf_row.cpu()
     clock = int(tables.clock[0])
-    for r in range(lo, key.shape[0]):
+    rows = int(key.shape[0])
+    written = {r for r in lru_holds if lo <= r < rows}
+    for r in range(lo, rows):
+        # staging rows are never owned; a written LRU row loses its old expert;
+        # without keep every LRU row is cleared
+        if keep_unwritten and r < hi and r not in written:
+            continue
         old = int(key[r])
-        if old >= 0:
+        if old >= 0 and int(hot[old]) == r:
             hot[old] = -1
         key[r] = -1
-    owner: Dict[int, int] = {}
-    held = 0
+        pf_row[r] = -1
+    # no expert may point at a row that no longer names it
+    at = hot.long()
+    dangling = (at >= lo) & (at < rows)
+    dangling &= key[at.clamp(0, rows - 1)].long() != torch.arange(E)
+    hot[dangling] = -1
+    twins = 0
     for r, e in lru_holds.items():
-        if lo <= r < hi and 0 <= e < E and int(host_row[e]) >= 0:
-            owner[e] = r
-            held += 1
-    for e, r in owner.items():
+        if not (lo <= r < hi and 0 <= e < E and int(host_row[e]) >= 0):
+            continue
+        twin = int(hot[e])
+        if twin >= lo and twin != r:
+            # e is in a kept row or was written twice: one owner only
+            key[twin] = -1
+            pf_row[twin] = -1
+            twins += 1
         hot[e] = r
         key[r] = e
         use[r] = clock
@@ -268,8 +303,8 @@ def sync_tables(tables: PoolTables, lru_holds: Dict[int, int]) -> int:
     # The eager pass rewrote these rows behind the prefetch's back: every
     # prefetch mark on them is stale and would count a later hit as a
     # prefetch hit it never was.
-    tables.pf_row[lo:].fill_(-1)
-    return held - len(owner)
+    tables.pf_row.copy_(pf_row.to(dev))
+    return SyncReport(owned=int((key[lo:hi] >= 0).sum()), twins_freed=twins)
 
 
 def bijection_breaks(tables: PoolTables) -> int:
@@ -761,7 +796,7 @@ def _copy_kernel():
 
 
 __all__ = [
-    "PLAN_WIDTH", "ROW_USE_NEVER", "PoolTables", "StepBuffers",
+    "PLAN_WIDTH", "ROW_USE_NEVER", "PoolTables", "StepBuffers", "SyncReport",
     "allocate_pool_tables", "allocate_step_buffers", "copy_rows",
     "bijection_breaks", "copy_rows_reference", "step", "step_reference", "sync_tables",
     "take_report",

@@ -4187,15 +4187,25 @@ class MoEExpertOffloadCache:
                 getattr(self.layer, "top_k", -1),
                 predicted, fetched, pf_hits, max(fetched - pf_hits, 0), pf_skipped,
             )
-        twins = sync_tables(self._pool_tables, dict(self._scratch_holds))
+        from sglang.srt.environ import envs
+
+        keep = envs.SGLANG_OPT_MOE_POOL_KEEP_LRU.get()
+        report = sync_tables(
+            self._pool_tables, dict(self._scratch_holds), keep_unwritten=keep
+        )
         if lid in (0, 23, 47):
-            # #104 Beweiszeile: ein token-major Extend mit mehreren Wellen legt
-            # denselben Experten in zwei Zeilen; vor dem Fix blieben beide
-            # stehen und der erste Graph-Verify routete ihn auf -1.
+            # Beweiszeile #104 + SGLANG_OPT_MOE_POOL_KEEP_LRU: wie viel Decode-
+            # Arbeitsmenge ein eager Forward uebrig laesst, und wie viele
+            # Zwillinge (derselbe Experte in zwei Zeilen) er freigegeben hat --
+            # vor #104 blieben sie stehen, und der erste Graph-Verify routete
+            # den Experten auf -1.
+            t = self._pool_tables
             logging.getLogger(__name__).info(
-                "MoE expert pool layer %s sync: eager pass wrote %d rows, %d twin "
-                "rows freed (one owner per expert, #104)",
-                lid, len(self._scratch_holds), twins,
+                "MoE expert pool layer %s sync: eager pass wrote %d rows, LRU owns "
+                "%d of %d rows after the sync, %d twin rows freed (keep_lru=%s, "
+                "one owner per expert, #104)",
+                lid, len(self._scratch_holds), report.owned,
+                t.pool_rows - t.lru_start, report.twins_freed, keep,
             )
 
     def _pool_layout(self):

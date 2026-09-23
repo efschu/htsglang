@@ -1622,6 +1622,16 @@ class Envs:
     #     transient T*top_k*H buffer per layer (freed at the end of the forward).
     # Decode (single-wave) is unaffected by this flag.
     SGLANG_MOE_OFFLOAD_WAVE_ORDER = EnvStr("token")
+    # Device-planned expert pool (SGLANG_MOE_OFFLOAD_GRAPH_MODE=pool): what an
+    # EAGER forward (extend, eager first verify) leaves of the decode LRU.
+    # True (default): only the LRU rows the eager pass actually WROTE take its
+    # experts; every row it did not write keeps its expert and its recency --
+    # the bytes in it did not change, so the device mapping stays true. False:
+    # the old behaviour, every unwritten LRU row is freed, so each request's
+    # decode starts from an empty LRU (fnFL2x100 MID-2, a radix-hit repeat of
+    # the same prompt: TP0 pool.fetch 53-68 ms in the first graph rounds, 8-13
+    # ms once re-warmed). Rank-uniform: every rank reads the same launcher env.
+    SGLANG_OPT_MOE_POOL_KEEP_LRU = EnvBool(True)
     # #119: hand the weight VRAM freed by the expert offload to the KV pool.
     # Default ON, but STRICTLY scoped to the offload lane -- every effect is
     # additionally gated on SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0, so with
