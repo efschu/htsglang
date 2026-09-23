@@ -63,6 +63,13 @@ from sglang.srt.managers.weg2_memory_saver import (
     vram_credit,
     weg2_graph_tag_armed,
 )
+from sglang.srt.managers.weg2_sleep_drain import (
+    WEG2_SLEEP_DRAIN_BOUND_S,
+    Weg2SleepDrainRefused,
+    drain_until_group_verdict,
+    refusal_message,
+)
+from sglang.srt.mem_cache.hicache_collective import collective_rank_desc
 from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreIndexBlind
 from sglang.srt.weg2 import seam_digest
 
@@ -3425,32 +3432,52 @@ class SchedulerWeightUpdaterManager:
             (time.perf_counter() - t0) * 1000,
         )
 
-    def _weg2_drain_hicache_before_sleep(self, bound_s: float = 30.0) -> None:
+    def _weg2_drain_hicache_before_sleep(
+        self, bound_s: float = WEG2_SLEEP_DRAIN_BOUND_S
+    ) -> None:
         """Drain HiCache in-flight terms (write-through / storage backup /
-        load-back / prefetch) before a sleep is judged -- see the caller."""
+        load-back / prefetch) before a sleep is judged -- see the caller.
+
+        fnFL2x105: a GROUP loop (``weg2_sleep_drain``). Called on EVERY rank,
+        idle or not: the first pass is a reduction over the attention group
+        that ``check_hicache_events`` posts its collectives on, and every rank
+        polls exactly as often as the others. A group still blocked when the
+        reduced verdict stops the loop raises W120 on every rank at once.
+        """
         sch = self.scheduler
-        tc = getattr(sch, "tree_cache", None)
-        if not getattr(sch, "enable_hierarchical_cache", False) or tc is None:
+        if sch is None or not sch.enable_hierarchical_cache:
             return
-        if not hasattr(tc, "check_hicache_events") or not hasattr(sch, "idle_blockers"):
-            return
-        t0 = time.time()
-        polls = 0
+        tc = sch.tree_cache
+        t0 = time.monotonic()
         first = list(sch.idle_blockers())
-        while time.time() - t0 < bound_s:
-            blockers = list(sch.idle_blockers())
-            if not blockers or any(not b.startswith("hicache") for b in blockers):
-                break
-            tc.check_hicache_events()
-            polls += 1
-            if sch.is_fully_idle():
-                break
-            time.sleep(0.01)
-        logger.warning(
-            "WEG2 SLEEP-DRAIN: waited %.2f s (%d polls) for HiCache in-flight terms "
-            "before the sleep; blockers at entry %s, now %s",
-            time.time() - t0, polls, first, list(sch.idle_blockers()),
+        verdict, polls = drain_until_group_verdict(
+            idle_blockers=sch.idle_blockers,
+            check_hicache_events=tc.check_hicache_events,
+            group_max=functools.partial(
+                tc.hicache_group_max, label="weg2_sleep_drain"
+            ),
+            bound_s=bound_s,
         )
+        waited_s = time.monotonic() - t0
+        now = list(sch.idle_blockers())
+        if first or polls or not verdict.idle:
+            logger.warning(
+                "WEG2 SLEEP-DRAIN: waited %.2f s (%d group polls) for HiCache "
+                "in-flight terms before the sleep; this rank's blockers at entry "
+                "%s, now %s; group verdict %s",
+                waited_s, polls, first, now, verdict,
+            )
+        if not verdict.idle:
+            raise Weg2SleepDrainRefused(
+                refusal_message(
+                    verdict=verdict,
+                    own_blockers=now,
+                    waited_s=waited_s,
+                    polls=polls,
+                    bound_s=bound_s,
+                    rank_desc=collective_rank_desc(tc),
+                )
+            )
 
     # ------------------------------------------------------------------
     # C15 -- ranks never disagree: a rank that could not finish its half of a
@@ -7522,9 +7549,14 @@ class SchedulerWeightUpdaterManager:
         # Those terms drain by themselves through check_hicache_events, which
         # only the scheduler loop drives; drive it here, bounded, before
         # judging. Any non-HiCache blocker still fails the assert below.
-        if not self.is_fully_idle():
-            self._weg2_drain_hicache_before_sleep()
-            _weg2_ph("drain_hicache")
+        # fnFL2x105: UNCONDITIONAL. The drain's polls are collectives over the
+        # attention group, so the question "drain or not" is a group question
+        # -- boot fnFL2x104: TP0 (idle) skipped this, slept and waited in the
+        # fence while TP1/TP2 (hicache_backup(1)) waited for it in the drain's
+        # all_reduce, 120 s until the fence expired. The drain now reduces its
+        # verdict over that group first and raises W120 on every rank alike.
+        self._weg2_drain_hicache_before_sleep()
+        _weg2_ph("drain_hicache")
 
         assert (
             self.is_fully_idle()

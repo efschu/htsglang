@@ -16,6 +16,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Iterator,
+    List,
     NamedTuple,
     Optional,
     Sequence,
@@ -775,6 +776,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if world == 1:
             world = max(world, int(getattr(self, "tp_world_size", 1) or 1))
         return world
+
+    def hicache_group_max(self, values: List[int], *, label: str) -> List[int]:
+        """fnFL2x105: MAX over the group ``drain_storage_control_queues`` reduces
+        over, so a loop that polls ``check_hicache_events`` on this verdict
+        polls it the same number of times on every rank."""
+        tensor = torch.tensor(list(values), dtype=torch.int64)
+        self._all_reduce_attn_groups(
+            tensor, torch.distributed.ReduceOp.MAX, label=label
+        )
+        return [int(v) for v in tensor.tolist()]
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op, label: str = "hicache"):
         reduced = False
@@ -2171,6 +2182,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
         new_node.creation_time = child.creation_time
+        # fnFL2x105: the upper half of a span whose pages are in the store is
+        # in the store -- its pages are a prefix of the same hash chain. Left
+        # False, the split parent of a transit-released node (workers:
+        # `backuped` False after the load-back freed the host rows) read as
+        # un-backed to `publish_unbacked_sweep`, while on the arena rank the
+        # same parent kept its host rows and read as backed. Boot fnFL2x104:
+        # the sleep flush issued 3 store writes on TP1/TP2 and 2 on TP0 for
+        # the same tree, the MIN-reduced ack drain left TP1/TP2 at
+        # hicache_backup(1) forever, and the group split on the sleep.
+        new_node.l3_present = child.l3_present
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 

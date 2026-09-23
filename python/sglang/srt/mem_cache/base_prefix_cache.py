@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import (
     TYPE_CHECKING,
     Any,
+    List,
     NamedTuple,
     Optional,
     Protocol,
@@ -503,6 +504,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Check HiCache related activities to update radix tree and synchronize across TP workers if needed
         """
         raise NotImplementedError()
+
+    def hicache_group_max(self, values: List[int], *, label: str) -> List[int]:
+        """Element-wise MAX of ``values`` over the group ``check_hicache_events``
+        synchronizes on (fnFL2x105: a verdict that decides how often a rank
+        polls it must be read over that same group). A cache that posts no
+        HiCache collectives has no such group: the rank's own values."""
+        return list(values)
 
     def take_events(self):
         return []

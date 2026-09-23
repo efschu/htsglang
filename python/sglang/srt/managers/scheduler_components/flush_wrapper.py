@@ -12,7 +12,7 @@ class SchedulerFlushWrapper:
     def __init__(
         self,
         *,
-        flush_cache: Callable[[], bool],
+        flush_cache: Callable[..., bool],
         is_fully_idle: Callable[[], bool],
         ipc_channels: SchedulerIpcChannels,
     ) -> None:
@@ -30,7 +30,13 @@ class SchedulerFlushWrapper:
 
         timeout_s = float(recv_req.timeout_s or 0.0)
         if timeout_s <= 0.0:
-            return FlushCacheReqOutput(success=self._flush_cache())
+            # fnFL2x105: the immediate RPC reaches every TP rank in the same
+            # pass, so its idle verdict may be (and is) a TP-group reduction.
+            # The deferred path below flushes on a rank-local idle test and
+            # must stay rank-local.
+            return FlushCacheReqOutput(
+                success=self._flush_cache(tp_group_verdict=True)
+            )
 
         if self._is_fully_idle():
             return FlushCacheReqOutput(success=self._flush_cache())

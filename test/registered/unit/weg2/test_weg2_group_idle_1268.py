@@ -151,7 +151,8 @@ class TheWiring(CustomTestCase):
         import inspect
 
         src = inspect.getsource(Scheduler.flush_cache)
-        self.assertIn("group_idle_verdict()", src)
+        # fnFL2x105: the call now carries `tp_group_verdict=`; still THE verdict.
+        self.assertIn("self.group_idle_verdict(", src)
         self.assertNotIn("if self.is_fully_idle():", src)
 
     def test_the_front_names_it_a_group_verdict(self):

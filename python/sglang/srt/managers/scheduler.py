@@ -16933,8 +16933,17 @@ class Scheduler(
             )
         return ResizeHiCacheStorageReqOutput(success=ok, message=msg, stats=stats)
 
-    def flush_cache(self, empty_cache: bool = True, zero_kv: Optional[bool] = None):
+    def flush_cache(
+        self,
+        empty_cache: bool = True,
+        zero_kv: Optional[bool] = None,
+        tp_group_verdict: bool = False,
+    ):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache.
+        ``tp_group_verdict``: fnFL2x105 -- the caller guarantees every TP rank
+        runs this flush in the same pass (the immediate /flush_cache RPC), so
+        the idle verdict is reduced over the HiCache group instead of read
+        rank-locally; see :meth:`group_idle_verdict`.
         ``zero_kv``: #1457 -- the KV data buffers are zeroed under
         SGLANG_FLUSH_ZERO_KV by default; the Weg-2 SLEEP leg passes False,
         because the pool is unmapped right after the flush and the memset of
@@ -16995,7 +17004,9 @@ class Scheduler(
                     "(un-backed nodes published and their write-throughs joined BEFORE the reset)",
                     _issued, _stats.get("unbacked"), _stats.get("in_flight_after"),
                     (time.perf_counter() - _t0) * 1000.0)
-        group_idle, verdict_detail = self.group_idle_verdict()
+        group_idle, verdict_detail = self.group_idle_verdict(
+            tp_group_verdict=tp_group_verdict
+        )
         if group_idle:
             self.cur_batch_for_debug = None
             self.last_batch = None
@@ -17040,8 +17051,19 @@ class Scheduler(
             success = False
         return success
 
-    def group_idle_verdict(self) -> Tuple[bool, str]:
+    def group_idle_verdict(self, tp_group_verdict: bool = False) -> Tuple[bool, str]:
         """#1268: is THE GROUP idle -- not "is this rank idle".
+
+        fnFL2x105 -- THE TP AXIS. Everything below binds the PP axis; at
+        ``pp_size <= 1`` this used to answer rank-locally ("single-rank
+        verdict"), and group D is ``pp_size=1, tp_size=3``. Boot fnFL2x104,
+        23:19:12: TP0 answered "Cache flushed successfully!" -- and reset its
+        tree and host pool -- while TP1/TP2 answered "not-idle because:
+        hicache_backup(1)" to the same RPC; only TP0's 200 left the group. With
+        ``tp_group_verdict`` (the immediate /flush_cache path, where every TP
+        rank runs this flush in the same pass) the idle bit is reduced over
+        the HiCache group, so the group flushes together or refuses together.
+        A cache without HiCache collectives answers rank-locally as before.
 
         THE DEFECT THIS CLOSES, measured on boot weg2sb1 (2026-09-08). At
         14:29:29 the front asked group P to quiesce and three ranks answered
@@ -17101,7 +17123,17 @@ class Scheduler(
         pp_size = int(getattr(getattr(self, "ps", None), "pp_size", 1) or 1)
         pp_rank = int(getattr(getattr(self, "ps", None), "pp_rank", 0) or 0)
         if pp_size <= 1:
-            return my_idle, f"single-rank verdict (pp_size={pp_size}): blockers=[{own}]"
+            # Without HiCache every idle clause reads replicated state (#1158),
+            # so the rank-local answer already is the group's.
+            if not (tp_group_verdict and self.enable_hierarchical_cache):
+                return my_idle, f"single-rank verdict (pp_size={pp_size}): blockers=[{own}]"
+            (blocked,) = self.tree_cache.hicache_group_max(
+                [int(not my_idle)], label="flush_cache/idle_verdict"
+            )
+            return blocked == 0, (
+                f"tp-group verdict (pp_size={pp_size}): group_idle={blocked == 0}, "
+                f"this rank blockers=[{own}]"
+            )
         if pp_rank != 0:
             # A FOLLOWER'S ANSWER NEVER LEAVES THE GROUP, so there is nothing
             # here for the one-verdict law to bind. It flushes its own pools on
