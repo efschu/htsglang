@@ -3028,6 +3028,60 @@ def _qkv_component_rows(model, name: str) -> Tuple[int, ...]:
     return ()
 
 
+#: Layout-Metadaten: die ``*weight_shape``-Tensoren der komprimierten
+#: Gewichte tragen die LOKALE logische Form (P-Stufe: alle Experten, D-Rang:
+#: sein Ausschnitt), werden nur beim Laden gelesen und duerfen nie zwischen
+#: den Layouts kopiert werden (fnFL2x72: 29+29 Stuecke je P-Rang MISMATCH,
+#: nachher in jedem Layer derselbe Digest = die Form des anderen Layouts).
+_LAYOUT_METADATA_SUFFIX = "weight_shape"
+
+
+def not_a_source_here(model):
+    """``name -> reason`` fuer Tensoren, die DIESER Rang nicht als Quelle
+    veroeffentlichen darf, oder ``None`` fuer jeden anderen (fnFL2x72, 23.09.).
+
+    EINE Regel fuer beide Walks (``card_inventory`` = Manifest/Grader und
+    ``derive_leg_plan`` = Plan), so wie ``expert_buffer_tensors`` (#135) --
+    zwei Buchhaltungen an dieser Naht waren die W80/W84/W19-Familie.
+
+    ``form-a-worker-unloaded``: ein Form-A-Worker laedt nur die gerouteten
+    Experten und den Router (``rank_role.worker_keeps_parameter``, F3); seine
+    ``q_norm``/``k_norm``/``shared_expert_gate`` existieren im Modulbaum mit
+    UNINITIALISIERTEN Bytes.  Das Manifest publizierte sie trotzdem, und
+    ``_pick_source`` bevorzugt den co-located Rang: beim Wake von P zogen
+    PP1/PP2 ihre Attention-Normen und Shared-Expert-Gates von D TP1/TP2, den
+    Workern auf denselben Karten.  Seam-Digest x72 (P nach dem ersten Wake):
+    PP1 ``k_norm:3 q_norm:3 shared_expert_gate:11``, PP2 ``2/2/8``, PP0
+    (co-located mit dem Attention-Host) sauber; x73 (D nach seinem Wake): TP0
+    dieselben Klassen NUR in den Layern 29-47 = die Layer von PP1/PP2, die
+    den Muell beim Sleep zurueckgaben.  Jeder P-Prefill laeuft nach einem
+    Wake, also stand jede Flip-Nadel seit x52 auf falschen Normen.
+
+    ``layout-metadata``: siehe ``_LAYOUT_METADATA_SUFFIX``.
+
+    Ausserhalb von Form A (kein Rollenplan) und ohne Metadaten-Tensor ist
+    das die Identitaet: kein Rang verliert ein Stueck.
+    """
+    from sglang.srt import rank_role as rr
+
+    veto = None
+    if rr.this_rank_is_form_a_worker():
+        cfg = getattr(model, "config", None)
+        n = getattr(cfg, "num_experts", None)
+        n = int(n) if isinstance(n, int) and n > 0 else None
+        veto = lambda name: rr.worker_keeps_parameter(name, n)  # noqa: E731
+
+    def reason(name: str) -> Optional[str]:
+        name = str(name)
+        if name.endswith(_LAYOUT_METADATA_SUFFIX):
+            return "layout-metadata"
+        if veto is not None and not veto(name):
+            return "form-a-worker-unloaded"
+        return None
+
+    return reason
+
+
 def expert_buffer_tensors(model):
     """Jeder Experten-Puffer des Modells als ``(name, tensor)`` (#135).
 
@@ -3115,12 +3169,21 @@ def card_inventory(
     inventory = []
     skipped = []
     walked = 0
+    excluded = not_a_source_here(model)
     for name, param in model.named_parameters():
         walked += 1
         if ms.is_expert_stack_alias(param):
             # Platztausch: Alias des Experten-Puffers (Install nach dem ersten
             # Forward); der Puffer selbst folgt unten als #135-Eintrag.
             skipped.append((str(name), "expert-stack-alias"))
+            continue
+        why = excluded(str(name))
+        if why is not None:
+            # fnFL2x72: ein Tensor, den dieser Rang nie geladen hat (Form-A-
+            # Worker) oder der nur SEIN Layout beschreibt, ist keine Quelle --
+            # abwesend aus dem Manifest plant der Join ihn auf den Raengen,
+            # die ihn halten (die ``meta-no-bytes``-Form).
+            skipped.append((str(name), why))
             continue
         if getattr(getattr(param, "device", None), "type", "") == "meta":
             # 19.09. (xsn389): a META parameter holds no bytes on any card --
@@ -3399,10 +3462,15 @@ def derive_leg_plan(
     tensor_of: Dict[str, object] = {}
     carried: set = set()
     undescribed = 0
+    excluded = not_a_source_here(model)
     for name, param in model.named_parameters():
         if ms.is_expert_stack_alias(param):
             # Platztausch: der installierte Experten-Stapel ist ein Alias des
             # Puffers, der unten als Experten-Puffer (Praefix) geplant wird.
+            continue
+        if excluded(str(name)) is not None:
+            # fnFL2x72: DIESELBE Regel wie im Manifest (`card_inventory`) --
+            # ein nie geladener oder layout-eigener Tensor ist keine Quelle.
             continue
         tag = str(tag_of(str(name), region_tag=region_tag))
         if not ms.is_weights_family_tag(tag):

@@ -855,6 +855,12 @@ class _FakeModel:
     def named_parameters(self):
         return list(self._params)
 
+    def named_modules(self):
+        # #135: `card_inventory` also walks the expert buffers through
+        # `expert_buffer_tensors(model)`, which reads `named_modules()`; a
+        # fixture without modules holds none.
+        return ()
+
 
 class _FakeDraftRunner:
     def __init__(self, model):
