@@ -4963,6 +4963,7 @@ class Front:
         # a bare flip index made this boot inherit.
         flip_epoch = credit_epoch(self.boot_epoch, self.epoch)
         t_gather0 = time.perf_counter()
+        _kv_task = None   # fnFL2x83: the kv wake chained on the waker's leg (gathered form only)
         if self.weights_resident:
             # Scheibe 6a: no weights family to move -- both layouts stay mapped.
             s_code = w_code = 200
@@ -5019,12 +5020,32 @@ class Front:
             if _kv_early:
                 _legs.insert(0, self.timed_rpc(D, "/resume_memory_occupation",
                                                {"tags": [KV_TAG], "epoch": flip_epoch}, RPC_TIMEOUT_S))
-            _res = await asyncio.gather(*_legs)
+            # fnFL2x83 (23.09.): THE KV WAKE CHAINS ON THE WAKER'S LEG, NOT ON
+            # THE SLEEPER'S. x82: D's weights leg returned at 10,170, P's
+            # release leg at 10,457 (its tail after the last pause: lane
+            # drains, empty_cache, residue census, malloc_trim, DC breakdown,
+            # fence) and the kv wake was issued only after BOTH -- 0,29 s of
+            # P's bookkeeping on D's critical path, though the kv pool's VRAM
+            # was funded long before (P's kv_cache is the first thing paused,
+            # every P tag the ring swapped is paused when D's leg returns).
+            # The waker's leg is awaited alone, the kv wake starts the moment
+            # it returns, the sleeper's leg is awaited after; step 5 below
+            # takes the task's answer instead of issuing a second call.
+            _leg_tasks = [asyncio.ensure_future(c) for c in _legs]
+            _w_task = _leg_tasks[-1]
+            (w_code, w_body, w_ms) = await _w_task
+            _kv_task = None
+            if w_code == 200:
+                self._flip_marks["wake-kv-issued"] = time.time()
+                _kv_task = asyncio.ensure_future(self.leg_rpc(
+                    D, "/resume_memory_occupation",
+                    {"tags": [KV_TAG], "epoch": flip_epoch}, RPC_TIMEOUT_S))
+            _res = await asyncio.gather(*_leg_tasks[:-1])
             if _kv_early:
-                (k_code, k_body, k_ms), (s_code, s_body, s_ms), (w_code, w_body, w_ms) = _res
+                (k_code, k_body, k_ms), (s_code, s_body, s_ms) = _res
                 logger.info("WEG2-WAKE-KV-EARLY rpc http=%s ms=%.0f (%s)", k_code, k_ms, str(k_body)[:120])
             else:
-                (s_code, s_body, s_ms), (w_code, w_body, w_ms) = _res
+                ((s_code, s_body, s_ms),) = _res
         legs_wall_ms = (time.perf_counter() - t_gather0) * 1000
         s_done, s_per_tag, s_crit = completed_tags(s_body)
         w_done, w_per_tag, w_crit = completed_tags(w_body)
@@ -5082,9 +5103,13 @@ class Front:
         t0 = time.time()
         self._flip_stage = "wake-kv"
         self._flip_marks["wake-kv"] = time.time()
-        code, body = await self.leg_rpc(D, "/resume_memory_occupation",
-                                        {"tags": [KV_TAG], "epoch": credit_epoch(self.boot_epoch, self.epoch)},
-                                        RPC_TIMEOUT_S)  # #1428: retryable, see the sleep leg
+        if _kv_task is not None:
+            # fnFL2x83: issued the moment the waker's weights leg returned
+            code, body = await _kv_task
+        else:
+            code, body = await self.leg_rpc(D, "/resume_memory_occupation",
+                                            {"tags": [KV_TAG], "epoch": credit_epoch(self.boot_epoch, self.epoch)},
+                                            RPC_TIMEOUT_S)  # #1428: retryable, see the sleep leg
         t_w = time.time()
         wake_ms += (t_w - t0) * 1000
         if code != 200:
