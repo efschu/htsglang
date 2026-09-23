@@ -179,6 +179,20 @@ from collections import Counter, defaultdict
 # chunk-publish path (`UnifiedRadixCache._inc_hit_count`, #1028) writes the
 # N-1 anchor with no second bookkeeping. Set by the Weg-2 launcher on group P.
 _WEG2_END_ANCHOR = os.environ.get("SGLANG_WEG2_END_ANCHOR", "0") == "1"
+
+
+def _weg2_end_anchor_grain(allocator, page_size) -> int:
+    """Where the end-of-prefill anchor may land: every token (1), except on a
+    QSA pool, where it is the page size -- a multiple of the compress ratio by
+    the pool's own construction check, and QSA refuses an extend whose prefix
+    splits a compressed group (fnFL2x14)."""
+    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+    if allocator is None or int(page_size or 1) <= 1:
+        return 1
+    return int(page_size) if isinstance(allocator.get_kvcache(), QSATokenToKVPool) else 1
+
+
 from contextlib import contextmanager
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple, Union
@@ -1498,17 +1512,29 @@ class PrefillAdder:
         """
         if not _WEG2_END_ANCHOR or self.rem_chunk_tokens is None or length < 2:
             return length, False
-        if start + length != len(req.full_untruncated_fill_ids):
+        end = start + length
+        if end != len(req.full_untruncated_fill_ids):
+            return length, False
+        # fnFL2x14 (23.09.): under QSA the anchor lands on a PAGE boundary,
+        # not at N-1. QSA compresses groups of `qsa_compress_ratio` tokens and
+        # refuses an extend whose prefix splits one (qwen_sparse_attn_backend
+        # _qsa_build_write_plan: `prefix_lens % ratio == 0`, a device assert);
+        # the QSA pool pins page_size to a ratio multiple. x14 prefilled
+        # 259414 tokens and died on the one-token chunk at prefix 259414.
+        grain = _weg2_end_anchor_grain(self.token_to_kv_pool_allocator, self.page_size)
+        cut = (end - 1) // grain * grain
+        if cut <= start:
             return length, False
         n = getattr(PrefillAdder, "_weg2_end_anchor_splits", 0) + 1
         PrefillAdder._weg2_end_anchor_splits = n
         if n <= 8 or n % 64 == 0:
             logger.info(
                 "WEG2 END-ANCHOR SPLIT n=%d rid=%s: last chunk ends at %d of %d "
-                "tokens, the final token is its own chunk (anchor at N-1)",
-                n, getattr(req, "rid", "?"), start + length - 1, start + length,
+                "tokens, the final %d token(s) are their own chunk (anchor at "
+                "%d, grain %d)",
+                n, getattr(req, "rid", "?"), cut, end, end - cut, cut, grain,
             )
-        return length - 1, True
+        return cut - start, True
 
     def _mint_chunked(self, req: Req, site: str) -> None:
         """#996 RATCHET: announce `req` as THIS pass's new chunked request.

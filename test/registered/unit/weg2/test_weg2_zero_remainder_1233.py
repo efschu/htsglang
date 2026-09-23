@@ -128,12 +128,14 @@ def _private_schedule_policy():
     return mod
 
 
-def _adder_split(armed: bool, rem_chunk_tokens, start: int, length: int, total: int):
+def _adder_split(armed: bool, rem_chunk_tokens, start: int, length: int, total: int,
+                 *, page_size=1, allocator=None):
     old = os.environ.get("SGLANG_WEG2_END_ANCHOR")
     os.environ["SGLANG_WEG2_END_ANCHOR"] = "1" if armed else "0"
     try:
         sp = _private_schedule_policy()
-        adder = SimpleNamespace(rem_chunk_tokens=rem_chunk_tokens)
+        adder = SimpleNamespace(rem_chunk_tokens=rem_chunk_tokens, page_size=page_size,
+                                token_to_kv_pool_allocator=allocator)
         req = SimpleNamespace(full_untruncated_fill_ids=list(range(total)), rid="rid")
         return sp.PrefillAdder._weg2_end_anchor_split(adder, req, start, length)
     finally:
@@ -147,6 +149,26 @@ def test_split_holds_the_last_token_back_when_the_extend_reaches_the_end():
     # 13225-token prompt, three 4096 chunks already done: the last chunk of
     # 937 becomes 936 + a 1-token chunk, so a boundary (anchor) lands at N-1.
     assert _adder_split(True, 4096, 12288, 937, 13225) == (936, True)
+
+
+def test_x14_under_qsa_the_anchor_lands_on_a_page_boundary():
+    """fnFL2x14: 259415-token needle, last chunk 258048+1367. At N-1 the one-
+    token chunk had prefix 259414 -- not a multiple of the QSA compress ratio
+    -- and _qsa_build_write_plan's device assert killed PP0 after the whole
+    prefill. On a QSA pool the cut is the last page boundary before N."""
+    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+    qsa = SimpleNamespace(get_kvcache=lambda: object.__new__(QSATokenToKVPool))
+    plain = SimpleNamespace(get_kvcache=lambda: object())
+    assert _adder_split(True, 4096, 258048, 1367, 259415,
+                        page_size=64, allocator=qsa) == (259392 - 258048, True)
+    # Not QSA: N-1 as before, page size or not (27B keeps its anchor).
+    assert _adder_split(True, 4096, 258048, 1367, 259415,
+                        page_size=64, allocator=plain) == (1366, True)
+    # The extend lies inside the last page: no split, the previous chunk
+    # boundary (page-aligned) is the anchor.
+    assert _adder_split(True, 4096, 259392, 23, 259415,
+                        page_size=64, allocator=qsa) == (23, False)
 
 
 def test_split_is_identity_when_disarmed_off_chunking_or_mid_prompt():
