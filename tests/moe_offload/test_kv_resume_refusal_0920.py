@@ -150,6 +150,34 @@ def test_adapter_raises_by_name_when_the_resume_did_not_land(monkeypatch):
     assert saver.resumed == ["kv_cache"], "the saver is still called -- we verify, not predict"
 
 
+def _records(monkeypatch, tms, a, *records):
+    seq = iter(records)
+    monkeypatch.setattr(type(a), "_resume_record", lambda self: next(seq))
+
+
+def test_x15_a_completed_resume_on_a_shared_card_is_not_refused(monkeypatch):
+    """fnFL2x15: P PP2 resumed its base tag (1866 MiB) while D TP2 paused on
+    the same card; free ROSE by 2016 MiB and W119 refused a resume that had
+    landed. The hook's resume sequence advances only past pass 3 (a rolled
+    back resume returns from pass 1), so it decides first."""
+    tms, a, saver = _adapter(monkeypatch, 3545 * MiB, 5561 * MiB, 1866 * MiB)
+    _records(monkeypatch, tms, a, (41, "weights_draft", 0, 0.0, 0.0),
+             (42, "weights", 12, 3.0, 0.0))
+    assert a.resume("weights") == "saver-return"
+
+
+@pytest.mark.parametrize("after", [(41, "weights_draft", 0, 0.0, 0.0),
+                                   (42, "kv_cache", 3, 1.0, 0.0)])
+def test_a_sequence_that_did_not_record_this_tag_proves_nothing(monkeypatch, after):
+    """The danger direction: a rolled-back resume records nothing (same seq),
+    and another tag's record is not this one's -- both fall back to the
+    measurement, which here says the bytes never left free memory."""
+    tms, a, saver = _adapter(monkeypatch, 5974 * MiB, 5974 * MiB, 6904 * MiB)
+    _records(monkeypatch, tms, a, (41, "weights_draft", 0, 0.0, 0.0), after)
+    with pytest.raises(tms.Weg2TmsResumeRefused):
+        a.resume("weights")
+
+
 def test_adapter_returns_the_savers_value_on_a_landed_resume(monkeypatch):
     tms, a, saver = _adapter(monkeypatch, 13355 * MiB, 331 * MiB, 13024 * MiB)
     assert a.resume("kv_cache") == "saver-return"

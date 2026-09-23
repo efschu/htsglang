@@ -245,10 +245,22 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
             need = self.tag_bytes(tag)
         except Exception:  # noqa: BLE001 -- an absent probe is not a refusal
             need = None
+        record_before = self._resume_record()
         before = _device_free_bytes()
         with _abort_poll_excluded():
             out = _memory_saver.resume(tag=tag)
         after = _device_free_bytes()
+        record_after = self._resume_record()
+        # fnFL2x15 (23.09.): THE HOOK'S OWN RECORD FIRST. Its rollback returns
+        # from pass 1, before note_resume, so the resume sequence advances
+        # only on a COMPLETED map pass. The free-memory delta below is blind
+        # on a shared card: P PP2 resumed its base tag (1866 MiB) while D TP2
+        # paused on the same card and free ROSE by 2016 MiB -- W119 on a
+        # resume that had landed.
+        if (record_before is not None and record_after is not None
+                and record_after[0] > record_before[0]
+                and record_after[1] == tag):
+            return out
         landed = resume_landed(before, after, need)
         if landed is False:
             raise Weg2TmsResumeRefused(
@@ -343,6 +355,22 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         prints ``n/a``, never a zero -- but stated here so a ROCm reader does
         not conclude the remap was free.
         """
+        record = self._resume_record()
+        if record is None:
+            return None
+        seq, last_tag, allocations, map_ms, copy_ms = record
+        if seq == 0 or last_tag != tag:
+            return None
+        return {
+            "allocations": allocations,
+            "map_ms": map_ms,
+            "copy_ms": copy_ms,
+        }
+
+    def _resume_record(self):
+        """``(seq, tag, allocations, map_ms, copy_ms)`` of the hook's last
+        COMPLETED resume (``note_resume`` runs after pass 3; a rolled-back
+        resume returns before it), or None when the hook has no symbol."""
         import ctypes
 
         fn = _weg2_ring_symbol("tms_resume_stats")
@@ -369,13 +397,8 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
                 ctypes.byref(copy_ms),
             )
         )
-        if seq == 0 or buf.value.decode() != tag:
-            return None
-        return {
-            "allocations": int(allocations.value),
-            "map_ms": float(map_ms.value),
-            "copy_ms": float(copy_ms.value),
-        }
+        return (seq, buf.value.decode(), int(allocations.value),
+                float(map_ms.value), float(copy_ms.value))
 
     def ring_stats(self):
         """C8/C7: the live per-card host-ring counters, or None when this boot
