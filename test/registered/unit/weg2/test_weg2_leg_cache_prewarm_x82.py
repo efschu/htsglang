@@ -34,7 +34,12 @@ class _Bare(wu.SchedulerWeightUpdaterManager):
         return self._r
 
     def _weg2_shadow_manifest(self, group, peer, rank, *, leg, epoch):
-        return self._agreed, ("agreed" if self._agreed is not None else "peer-missing")
+        # x84: a list plays the handshake -- peer-unready first, agreed later
+        self.manifest_calls = getattr(self, "manifest_calls", 0) + 1
+        a = self._agreed
+        if isinstance(a, list):
+            a = a[min(self.manifest_calls - 1, len(a) - 1)]
+        return a, ("agreed" if a is not None else "peer-unready")
 
     def _weg2_shadow_plan(self, hook, group, rank, *, agreed, require_agreement):
         # fnFL2x84: the hook's plan, keyed by the agreement (a boot constant)
@@ -75,7 +80,7 @@ def test_x84_without_an_agreement_the_hook_plan_is_not_warmed_but_the_lane_plan_
     calls = []
     _stub_manifests(monkeypatch, calls)
     m = _Bare("P", 2, agreed=None)
-    ms = m._weg2_warm_leg_cache()
+    ms = m._weg2_warm_leg_cache(agree_budget_s=0.0, agree_poll_s=0.0)
     assert ms["hook:source"] == -1.0 and ms["hook:destination"] == -1.0
     assert m.hook_plans == []
     assert ("join", "authoritative", "P", 2) in m._weg2_xchg_leg_cache
@@ -101,3 +106,16 @@ def test_the_join_prewarm_round_warms_the_lane_cache_and_the_derive_is_single_fl
     blk = src[j:j + 2400]
     assert "with _dl:" in blk and blk.index("with _dl:") < blk.index("plan = xm.plan_from_join(")
     assert isinstance(threading.Lock(), type(threading.Lock()))
+
+
+def test_x84_the_agreement_is_polled_until_the_peer_has_seen_ours(monkeypatch):
+    """x84 (D TP0 at boot): state=peer-unready on the first call (the peer's
+    manifest is published but has not seen ours), hook:*_ms=-1 -- the first
+    call publishes our side, the peer's warm-up answers, the next call agrees."""
+    calls = []
+    _stub_manifests(monkeypatch, calls)
+    m = _Bare("D", 0, agreed=[None, None, "AGREED"])
+    ms = m._weg2_warm_leg_cache(agree_budget_s=5.0, agree_poll_s=0.0)
+    assert m.manifest_calls == 3
+    assert ms["hook:source"] >= 0.0 and ms["hook:destination"] >= 0.0
+    assert [h[3] for h in m.hook_plans] == ["AGREED", "AGREED"]

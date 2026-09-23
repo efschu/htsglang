@@ -809,7 +809,8 @@ class SchedulerWeightUpdaterManager:
             logger.info("WEG2-JOIN-PREWARM stopped: %r", exc)
         return done
 
-    def _weg2_warm_leg_cache(self) -> Dict[str, float]:
+    def _weg2_warm_leg_cache(self, *, agree_budget_s: float = 60.0,
+                             agree_poll_s: float = 1.0) -> Dict[str, float]:
         """fnFL2x82: derive this rank's lane PLAN for both hooks at boot, into
         the same cache ``_weg2_seq_lane_descs`` reads (``("join", hook, group,
         rank)``), so the first flip's lane threads find it.
@@ -852,13 +853,23 @@ class SchedulerWeightUpdaterManager:
         # keyed by the pair's manifest agreement -- a boot constant. The same
         # agreement is made here, so the flip's key hits.
         peer = "D" if str(group) == "P" else "P"
-        for hook in (sh.HOOK_SOURCE, sh.HOOK_DESTINATION):
-            t0 = time.perf_counter()
+        # x84: the agreement is a two-sided handshake ("peer-unready: the
+        # peer's manifest is published but has not yet seen ours") -- the
+        # first call publishes our side, the peer's own warm-up answers it,
+        # so the agreement is polled for a bounded while before giving up.
+        agreed = None
+        deadline = time.monotonic() + float(agree_budget_s)
+        while True:
             agreed, state = self._weg2_shadow_manifest(
                 str(group), peer, int(rank), leg=0, epoch="prewarm")
+            if agreed is not None or time.monotonic() >= deadline:
+                break
+            time.sleep(float(agree_poll_s))
+        for hook in (sh.HOOK_SOURCE, sh.HOOK_DESTINATION):
             if agreed is None:
                 out[f"hook:{hook}"] = -1.0
                 continue
+            t0 = time.perf_counter()
             self._weg2_shadow_plan(str(hook), str(group), int(rank),
                                    agreed=agreed, require_agreement=True)
             out[f"hook:{hook}"] = (time.perf_counter() - t0) * 1000.0
