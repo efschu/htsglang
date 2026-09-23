@@ -10096,10 +10096,14 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
        ``karte - fremd_kontext - nicht_torch - reserve``? Das ist die Zeile,
        die fnFL2w83 haette verhindern muessen (Rang 0: 29680 gefragt,
        32607-1342-3628 = 27637 verfuegbar).
-    2. DIE FRACTION-DECKE -- das D-Gegenstueck zu #140/#141. Nur wenn die
-       Geometrie VOLLSTAENDIG vorliegt; fehlt ein Vektor, wird er BENANNT und
-       die Zeile bleibt aus, statt dass eine halbe Geometrie eine Zahl
-       erfindet.
+    2. DIE FRACTION-DECKE -- das D-Gegenstueck zu #140/#141, seit H8 gegen
+       das BUDGET mit den Metallregeln (Pufferregel ``min(R+S,E)``, fester
+       Rang-Posten gemessen, Aktivierung, 262k-KV;
+       :func:`expert_residency.plan_d_residency`). Nur wenn die Geometrie
+       VOLLSTAENDIG vorliegt; fehlt ein Vektor, wird er BENANNT und die Zeile
+       bleibt aus, statt dass eine halbe Geometrie eine Zahl erfindet.
+       Passt die GEFAHRENE Fraction auf einem Rang nicht, VERWEIGERT diese
+       Funktion den Boot (W122) -- im Dry-Run, bevor irgendein Rang laedt.
 
     Aufgerufen an BEIDEN Stellen, an denen ``budgets_d`` entsteht (Dry-Run und
     echter Lauf) -- die #114-Falle: eine Fassung, die nur eine der beiden
@@ -10196,65 +10200,38 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             f"{', '.join(luecken)} fehlt/passt nicht zu {n} Raengen. Eine "
             f"halbe Geometrie loest nichts (#91), also rechnet hier nichts.")
         return
+    # H8: DIE METALLREGELN. Die alte Decke rechnete gegen die KARTE mit
+    # ``fraction x Spanne + Scratch`` Zeilen und ohne KV/Aktivierung -- sie
+    # nannte TP1 0.807 und TP2 0.661, beide toeten den Boot (x98/x99 KV-Pool-
+    # ValueError 288 MiB, x97 OOM beim Laden). Jetzt: Budget je Rang, Puffer
+    # min(R+S,E) mit E = Spanne + Pad, fester Rang-Posten gemessen, 262k-KV.
+    from sglang.srt.planner import expert_residency as _er
+
     try:
-        terms = _pp_cut.checkpoint_weight_terms(ns.model)
-        cfg_path = os.path.join(ns.model, "config.json")
-        with open(cfg_path) as fh:
-            cfg = json.load(fh)
-        text_cfg = cfg.get("text_config") or cfg
-        n_layers = int(text_cfg["num_hidden_layers"])
-        n_attn_ckpt = len(terms.attention_layer_indices)
-        dense_full_mib = (
-            terms.attn_layer_weight_bytes * n_attn_ckpt
-            + terms.linear_layer_weight_bytes * (terms.n_layers - n_attn_ckpt)
-        ) / max(1, terms.n_layers) / _pp_cut.MIB
-        expert_full_mib = terms.expert_layer_weight_bytes / _pp_cut.MIB
-        # DIE EXPERTEN-SPANNE je Rang kommt aus --rank-moe-ratio, skaliert auf
-        # num_experts -- dieselbe Skalierung, die #140 fuer --pp-stage-ratio
-        # fuehrt, und Memory rank-ratios-sind-verhaeltnis: die Summe der
-        # Ratios ist NICHT die Zahl der Experten, sie ist ein Verhaeltnis.
-        _rs = [float(x) for x in ratios]
-        _sum = sum(_rs) or 1.0
-        span = [round(x / _sum * int(terms.num_experts)) for x in _rs]
-        span[-1] = int(terms.num_experts) - sum(span[:-1])
-        # DIE DENSE-BYTES je Rang folgen --rank-tp-ratio, dem Flag, mit dem
-        # der Boot die uneven TP-Aufteilung wirklich faehrt. Die Quelle steht
-        # in der Zeile, damit ein Leser sie pruefen kann, statt sie zu raten.
-        _ts = [float(x) for x in tp_ratio]
-        _tsum = sum(_ts) or 1.0
-        dense_by_rank = [dense_full_mib * (x / _tsum) for x in _ts]
-        decke = _pp_cut.solve_expert_fraction_per_d_rank(
-            card_total_mib=totals,
-            foreign_context_mib=fremd if fremd is not None else [0.0] * n,
-            nontorch_mib=nicht_torch if nicht_torch is not None else [0.0] * n,
-            n_layers=n_layers,
-            dense_layer_mib_by_rank=dense_by_rank,
-            expert_layer_mib=expert_full_mib,
-            num_experts=int(terms.num_experts),
-            expert_span_by_rank=span,
-            scratch_rows_by_rank=scratch,
-            reserve_mib_by_rank=reserve,
+        plan = _er.plan_d_residency(
+            model_path=ns.model,
+            budgets_mib=[float(b) for b in budgets_d],
+            ratios=[float(x) for x in ratios],
+            fractions=[float(x) for x in fr_d],
+            scratch_rows=[int(x) for x in scratch],
+            rank_tp_ratio=",".join(tp_ratio),
+            env_d=_env_d,
+            reference_logs=ns.d_residency_reference_logs,
+            kv_tokens=CONTEXT_LENGTH_TOKENS,
+            label=label,
+            marker=D_RANK_SOLVE_MARKER,
         )
-        _gegeben = [float(x) for x in fr_d]
-        _ueber = [i for i, (g, m) in enumerate(zip(_gegeben, decke)) if g > m]
-        log(
-            "%s FRACTION-SOLVE %s: %d Layer, dense je Rang %s + Experten %.0f "
-            "MiB/Layer auf %d Zeilen (%.2f MiB/Zeile), Spanne %s (aus "
-            "--rank-moe-ratio %s), Scratch %s -> OBERGRENZE je Rang %s "
-            "(gegeben: %s)%s"
-            % (
-                D_RANK_SOLVE_MARKER, label, n_layers,
-                ["%.1f" % d for d in dense_by_rank], expert_full_mib,
-                int(terms.num_experts),
-                expert_full_mib / max(1, int(terms.num_experts)),
-                span, ",".join(ratios), [int(s) for s in scratch],
-                ["%.3f" % f for f in decke], ["%.3f" % f for f in _gegeben],
-                (" -- DARUEBER auf Rang %s" % _ueber) if _ueber else "",
-            )
-        )
-    except BaseException as _exc:  # noqa: BLE001 -- eine Zahl kippt nie den Boot
+    except (OSError, KeyError, ValueError, _pp_cut.DraftResidencyUnavailable) as _exc:
+        # Eine UNLESBARE Geometrie/Referenz verweigert nicht den Boot, sie wird
+        # benannt; die Verweigerung unten kommt nur aus einer GERECHNETEN Bilanz.
         log(f"{D_RANK_SOLVE_MARKER} FRACTION-SOLVE {label} failed: "
             f"{type(_exc).__name__}: {_exc}")
+        return
+    for line in plan.lines:
+        log(line)
+    if plan.refusal is not None:
+        log(f"{D_RANK_SOLVE_MARKER} {plan.refusal}")
+        raise Weg2LaunchRefused(plan.refusal)
 
 
 def publish_expert_map(ns, model: str, evidence_dir: str, log,
@@ -10687,7 +10664,9 @@ def solve_p_cut(
                 zip(fracs, _frec if _frec is not None else _fmax)) if f > m]
             log(
                 "PP-CUT FRACTION-SOLVE (#140): budgets %s MiB, layers %s, "
-                "dense %.0f + experts %.0f MiB/layer, LRU %s -> OBERGRENZE je "
+                "dense %.0f + experts %.0f MiB/layer, LRU %s, Puffer "
+                "min(ceil(f*E)+LRU, E) (H8, groesste Offload-Fraction "
+                "(E-2)/E) -> OBERGRENZE je "
                 "Stufe %s (gegeben: %s)%s. Die Obergrenze laesst NICHTS fuer "
                 "KV, Draft und Aktivierungen -- sie ist die Decke, nicht die "
                 "Empfehlung."
@@ -11543,6 +11522,16 @@ def build_parser() -> argparse.ArgumentParser:
              "Je D-Rang (ordinal) die MiB, die auf der Karte NICHT den "
              "Gewichten gehoeren: KV-Pool, Draft, Aktivierungen. Ohne Angabe "
              "druckt der Solver die DECKE, nicht die Empfehlung.")
+    ap.add_argument(
+        "--d-residency-reference-logs", default="",
+        help="H8: Komma-Liste von D-Boot-Logs (boot_weg2_<tag>_*.D.log), aus "
+             "denen der D-FRACTION-SOLVE den festen Rang-Posten MISST "
+             "('weights + runtime state' minus Experten-Puffer, Aktivierung, "
+             "mamba/spec, KV-Zelle, Draft-Vokabular; je Term das Maximum ueber "
+             "die Boots). Leer = die eingebaute Referenz "
+             "expert_residency.D_RESIDENCY_REFERENCE_FNFL2 (fnFL2x98/x99/x100, "
+             "Next Flash Form A, --rank-tp-ratio 1,0,0); fuer jede andere Form "
+             "entfaellt die Decke mit Namen, bis Logs DIESER Form gegeben sind.")
     ap.add_argument("--idle-layout", choices=["tp", "pp"], default="tp",
                     help="K8: which layout is awake at rest -- tp = group D (today's shape), "
                          "pp = group P. The front's idle guard always counts the requests P has "

@@ -1210,10 +1210,15 @@ def solve_expert_fraction_per_stage(
 
     Die Bedingung je Stufe s, alles in MiB:
 
-        layers_s * (dense + experts * f_s + row * lru_s) + reserve_s
+        layers_s * (dense + row * min(ceil(f_s * E) + lru_s, E)) + reserve_s
             <= budget_s
 
-    nach ``f_s`` aufgeloest. ``reserve_s`` ist, was auf der Karte NICHT den
+    nach ``f_s`` aufgeloest -- die PUFFERREGEL der Runtime
+    (``expert_offload.plan_load_time_staging``: ``buffer_slots = min(R + C,
+    E)``; fnFL2 H8, :mod:`sglang.srt.planner.expert_residency`). Die alte
+    lineare Form ``experts * f_s + row * lru_s`` zaehlte oberhalb von
+    ``(E - lru)/E`` Zeilen, die es nicht gibt, und nannte 1.0, wo die groesste
+    Fraction mit Platztausch-Puffer ``(E-2)/E`` ist (H5, W120). ``reserve_s`` ist, was auf der Karte NICHT den
     Gewichten gehoert -- KV-Pool, Draft, Aktivierungen; der Aufrufer reicht
     es durch, weil nur er weiss, was dieser Boot vorhat. Ohne Angabe ist es
     0, und dann ist das Ergebnis eine OBERGRENZE, die der Draft noch
@@ -1233,14 +1238,17 @@ def solve_expert_fraction_per_stage(
             f"{len(list(budgets_mib))} Budgets / {len(rows)} LRU-Zeilen / "
             f"{len(res)} Reserven -- eine halbe Geometrie loest nichts"
         )
-    row_mib = float(expert_layer_mib) / max(1, int(num_experts))
-    out = []
-    for b, L, r, rsv in zip(budgets_mib, stage_layers, rows, res):
-        L = max(1, int(L))
-        frei = float(b) - float(rsv) - L * (float(mean_layer_mib) + row_mib * float(r))
-        f = frei / (L * float(expert_layer_mib)) if expert_layer_mib > 0 else 0.0
-        out.append(min(1.0, max(0.0, f)))
-    return out
+    from sglang.srt.planner import expert_residency as _er
+
+    return _er.solve_stage_fraction_by_buffer_rule(
+        budgets_mib=list(budgets_mib),
+        stage_layers=list(stage_layers),
+        dense_layer_mib=float(mean_layer_mib),
+        slot_mib=float(expert_layer_mib) / max(1, int(num_experts)),
+        num_experts=int(num_experts),
+        scratch_rows=rows,
+        reserve_mib_by_stage=res,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1439,86 +1447,6 @@ def d_rank_budget_verdict(
                 nontorch_mib, rs, avail)
         )
     ]
-
-
-def solve_expert_fraction_per_d_rank(
-    *,
-    card_total_mib,
-    foreign_context_mib,
-    nontorch_mib,
-    n_layers: int,
-    dense_layer_mib_by_rank,
-    expert_layer_mib: float,
-    num_experts: int,
-    expert_span_by_rank,
-    scratch_rows_by_rank=None,
-    reserve_mib_by_rank=None,
-    kv_mib_by_rank=None,
-):
-    """Je D-TP-Rang die GROESSTE Experten-Fraction, die auf die Karte passt.
-
-    Dieselbe Umkehrung wie :func:`solve_expert_fraction_per_stage`, aber fuer
-    die TP-Gruppe D: jeder Rang traegt ALLE ``n_layers`` und davon seinen
-    SHARD der Experten (``expert_span_by_rank`` -- wieviele der
-    ``num_experts`` Zeilen diesem Rang gehoeren, aus ``--rank-moe-ratio``).
-
-    Die Bedingung je Rang r, alles in MiB::
-
-        n_layers * (dense_r + zeile * (span_r * f_r + scratch_r))
-            + nichttorch_r + reserve_r
-            <= karte_r - fremd_r
-
-    mit ``zeile = expert_layer_mib / num_experts`` -- die Zeilengroesse ist
-    rangunabhaengig (gemessen fnFL2w83: TP0 haelt 180 Zeilen zu 435 MiB je
-    Layer = 2,418 MiB/Zeile; der Launcher nennt die volle Layerbreite mit
-    1238 MiB auf 512 Zeilen = 2,418 MiB/Zeile -- dieselbe Zahl).
-
-    ``scratch_rows_by_rank`` sind die Scratch-/LRU-Plaetze
-    (``SGLANG_MOE_SCRATCH_SLOTS``), die neben der Residenz stehen und
-    ebenfalls Zeilen kosten.
-
-    Rueckgabe: Fractions je Rang, auf [0, 1] geklemmt. 0.0 heisst "dieser Rang
-    traegt nicht einmal seine Dense-Gewichte" -- benennen, nicht beschoenigen.
-    """
-    n = len(list(card_total_mib))
-    dense = list(dense_layer_mib_by_rank)
-    span = list(expert_span_by_rank)
-    scratch = (
-        list(scratch_rows_by_rank) if scratch_rows_by_rank is not None else [0.0] * n
-    )
-    if len(dense) != n or len(span) != n or len(scratch) != n:
-        raise ValueError(
-            f"solve_expert_fraction_per_d_rank: {n} Karten, aber {len(dense)} "
-            f"Dense-Werte / {len(span)} Experten-Spannen / {len(scratch)} "
-            f"Scratch-Zeilen -- eine halbe Geometrie loest nichts"
-        )
-    avail = d_rank_available_mib(
-        card_total_mib=card_total_mib,
-        foreign_context_mib=foreign_context_mib,
-        nontorch_mib=nontorch_mib,
-        reserve_mib_by_rank=reserve_mib_by_rank,
-    )
-    row_mib = float(expert_layer_mib) / max(1, int(num_experts))
-    L = max(1, int(n_layers))
-    out = []
-    kv = (list(kv_mib_by_rank) if kv_mib_by_rank is not None else [0.0] * n)
-    if len(kv) != n:
-        raise ValueError(
-            f"solve_expert_fraction_per_d_rank: {n} Karten, aber {len(kv)} "
-            f"KV-Posten -- eine halbe Geometrie loest nichts"
-        )
-    # #156 auf der D-Seite: derselbe fehlende Posten wie bei den PP-Stufen.
-    # Nutzer 22.09.: "kv muss bepreist werden fuer 262k und danach geht der
-    # rest an moe experten". Ohne den Term ist das Ergebnis die Decke OHNE
-    # Kontext -- und genau daran wurde FR_D acht Boots lang von Hand
-    # vorbeigeraten (w123..w131 fuhren 0.006 auf einer Karte mit 16,18 GiB
-    # freiem VRAM = Platz fuer 143 Slots).
-    for a, d, sp, sc, kvr in zip(avail, dense, span, scratch, kv):
-        frei = float(a) - L * (float(d) + row_mib * float(sc)) - float(kvr)
-        nenner = L * row_mib * float(sp)
-        f = frei / nenner if nenner > 0 else 0.0
-        out.append(min(1.0, max(0.0, f)))
-    return out
 
 
 def solve_pp_cut(
