@@ -71,3 +71,26 @@ def test_x12_the_vocab_is_rebuilt_inside_the_drafters_scope_after_the_bf16_relea
     assert old_params_left == 0, "the BF16 table must be released first"
     assert producer.embed_released_mib > 0
     assert inner.embed_tokens is not old
+
+
+def test_x13_the_scope_carries_the_drafters_dtype(monkeypatch):
+    """x13: device alone was not enough -- the packed vocab took the process
+    default (float32) as params_dtype, dequantized float32 rows and the MTP
+    layer's gemma_rmsnorm refused them ('failed to dispatch data type Float').
+    The scope opens the loader's dtype context like the draft build had."""
+    from sglang.srt.managers import weg2_memory_saver as ms
+
+    monkeypatch.setattr(ms, "weights_region",
+                        lambda *a, **k: contextlib.nullcontext(), raising=True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0, raising=True)
+    producer = dkp.DraftKvProducer.__new__(dkp.DraftKvProducer)
+    producer.draft_runner = types.SimpleNamespace(
+        _weg2_manifest_identity={"region_tag": "weights_draft"},
+        server_args=types.SimpleNamespace(enable_weights_cpu_backup=False,
+                                          enable_draft_weights_cpu_backup=False),
+        memory_saver_adapter=None,
+        model_config=types.SimpleNamespace(dtype=torch.bfloat16))
+    before = torch.get_default_dtype()
+    with producer._draft_weights_scope():
+        assert torch.get_default_dtype() == torch.bfloat16
+    assert torch.get_default_dtype() == before

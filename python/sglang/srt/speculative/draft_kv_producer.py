@@ -190,14 +190,17 @@ class DraftKvProducer:
 
     @contextlib.contextmanager
     def _draft_weights_scope(self):
-        """The drafter's own device and weights region, as
-        ``model_runner.load_model`` opened them for the draft build: the tag
-        is the one that load recorded, the cpu-backup term the same
-        expression."""
+        """The drafter's own device, dtype and weights region, as
+        ``model_runner.load_model`` and the loader opened them for the draft
+        build: the tag is the one that load recorded, the cpu-backup term
+        the same expression. x13: without the dtype the packed vocab took
+        float32 as params_dtype and dequantized into float32 rows that the
+        MTP layer's gemma_rmsnorm refused."""
         from sglang.srt.managers.weg2_memory_saver import (
             GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
             weights_region,
         )
+        from sglang.srt.model_loader.utils import set_default_torch_dtype
         from sglang.srt.weg2.weight_exchange import weights_cpu_backup_armed
 
         runner = self.draft_runner
@@ -209,7 +212,8 @@ class DraftKvProducer:
         )
         with weights_region(runner.memory_saver_adapter, tag,
                             enable_cpu_backup=enable_cpu_backup):
-            with torch.device("cuda", torch.cuda.current_device()):
+            with set_default_torch_dtype(runner.model_config.dtype), \
+                    torch.device("cuda", torch.cuda.current_device()):
                 yield
 
     def load_resident_embedding(self, model_path: str) -> float:
