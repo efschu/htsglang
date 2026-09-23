@@ -59,7 +59,8 @@ class _SyncCase(unittest.TestCase):
         sss._SEEN.clear()
         sss._STATE.update(budget=None, last_ok="none", checked_ct=0)
         sss.os.environ.pop(sss.EAGER_ENV, None)
-        sss._EAGER.update(budget=None, round_ct=0)
+        sss.os.environ.pop(sss.EAGER_MIN_LEN_ENV, None)
+        sss._EAGER.update(budget=None, min_len=None, round_ct=0)
         sss._MODULE.update(active=False, models=set(), last_ok="none", checked_ct=0)
 
 
@@ -144,10 +145,37 @@ class EagerVerifyWithModuleSync(_SyncCase):
     with a sync after every layer and layer child names the module."""
 
     def test_eager_rounds_are_off_by_default_and_counted_when_on(self):
-        self.assertFalse(sss.eager_verify_round())
+        self.assertFalse(sss.eager_verify_round(655))
         self._reset()
         sss.os.environ[sss.EAGER_ENV] = "1"
-        self.assertEqual([sss.eager_verify_round() for _ in range(3)], [True, False, False])
+        self.assertEqual(
+            [sss.eager_verify_round(655) for _ in range(3)], [True, False, False]
+        )
+
+    def test_a_short_health_check_neither_runs_eager_nor_spends_the_budget(self):
+        # x45: the 1-token health check took the only eager round, and the
+        # 655-token request that dies ran its graph again.
+        sss.os.environ[sss.EAGER_ENV] = "1"
+        self.assertFalse(sss.eager_verify_round(1))
+        self.assertTrue(sss.eager_verify_round(655))
+        self.assertFalse(sss.eager_verify_round(655))
+
+    def test_the_graph_runner_is_refused_exactly_inside_an_active_window(self):
+        # x45: skipping only load_batch let _forward_raw replay the graph on
+        # stale buffers; the runner reads this flag and must stay eager.
+        model = _Model()
+        seen = []
+        model.model.layers[0].mlp.register_forward_hook(
+            lambda *_: seen.append(sss.eager_forward_active())
+        )
+        self.assertFalse(sss.eager_forward_active())
+        with sss.module_sync_window(model, active=True):
+            model(sss.torch.zeros(1))
+        self.assertEqual(seen, [True])
+        self.assertFalse(sss.eager_forward_active())
+        with sss.module_sync_window(model, active=False):
+            model(sss.torch.zeros(1))
+        self.assertEqual(seen, [True, False])
 
     def test_an_inactive_window_installs_nothing_and_never_syncs(self):
         model = _Model()

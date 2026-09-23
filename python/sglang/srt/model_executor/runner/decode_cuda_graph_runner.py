@@ -99,6 +99,9 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
+from sglang.srt.speculative.spec_stage_sync import (
+    eager_forward_active as _spec_eager_forward_active,
+)
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -886,6 +889,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # those this batch claims to be cannot be settled from the boot-66 log.
         # So the guard reports it, and the next boot names it instead of me
         # guessing it.
+        # x45: a diagnostic eager verify round (spec_stage_sync) must stay
+        # eager in _forward_raw too, on every rank -- every rank opens the
+        # window in the same round, and this is the one predicate all read.
+        if _spec_eager_forward_active():
+            return False
         _ids = getattr(forward_batch, "input_ids", None)
         if _ids is not None and self.num_tokens_per_bs:
             _have = int(_ids.shape[0])

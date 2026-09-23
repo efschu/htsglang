@@ -39,7 +39,11 @@ _STATE = {"budget": None, "last_ok": "none", "checked_ct": 0}
 # makes the fault graph-specific. Rank-uniform: every rank's verify() asks
 # once per round, in the same order, so all ranks go eager together.
 EAGER_ENV = "SGLANG_SPEC_EAGER_VERIFY"
-_EAGER = {"budget": None, "round_ct": 0}
+#: x45: a 1-token health check took the only eager round; the rounds are
+#: spent on requests whose context reaches this length.
+EAGER_MIN_LEN_ENV = "SGLANG_SPEC_EAGER_VERIFY_MIN_LEN"
+EAGER_MIN_LEN_DEFAULT = 64
+_EAGER = {"budget": None, "min_len": None, "round_ct": 0}
 _MODULE = {"active": False, "models": set(), "last_ok": "none", "checked_ct": 0}
 #: A module whose sync waited at least this long gets its own line.
 SLOW_MODULE_MS = 50.0
@@ -86,17 +90,31 @@ def checkpoint(stage: str, stream: Optional["torch.cuda.Stream"] = None) -> None
     )
 
 
-def eager_verify_round() -> bool:
-    """True while this verify round is among the first N (``SGLANG_SPEC_EAGER_VERIFY=N``)."""
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, str(default)) or default))
+    except ValueError:
+        return default
+
+
+def eager_verify_round(context_len: int) -> bool:
+    """True while this verify round is among the first N
+    (``SGLANG_SPEC_EAGER_VERIFY=N``) whose context reaches the minimum length;
+    shorter rounds neither run eager nor spend the budget."""
     if _EAGER["budget"] is None:
-        try:
-            _EAGER["budget"] = max(0, int(os.environ.get(EAGER_ENV, "0") or 0))
-        except ValueError:
-            _EAGER["budget"] = 0
-    if _EAGER["budget"] <= 0:
+        _EAGER["budget"] = _env_int(EAGER_ENV, 0)
+        _EAGER["min_len"] = _env_int(EAGER_MIN_LEN_ENV, EAGER_MIN_LEN_DEFAULT)
+    if _EAGER["budget"] <= 0 or context_len < _EAGER["min_len"]:
         return False
     _EAGER["round_ct"] += 1
     return _EAGER["round_ct"] <= _EAGER["budget"]
+
+
+def eager_forward_active() -> bool:
+    """True inside an active module-sync window. The decode graph runner
+    refuses its graph then (x45: skipping only load_batch replayed the graph
+    on stale static buffers, and no module ever ran)."""
+    return _MODULE["active"]
 
 
 def _module_hook(name: str):
