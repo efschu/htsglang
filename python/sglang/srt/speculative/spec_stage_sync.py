@@ -97,13 +97,39 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def eager_verify_round(context_len: int) -> bool:
+#: fnFL2x85 (23.09.): ``SGLANG_SPEC_EAGER_VERIFY=first`` -- EVERY request's
+#: first verify round runs eager, the rounds after it replay the graph.
+#: x46/x50: the first graph verify of a NEW request after its extend dies
+#: (TP0, ~4,3 s, deterministic), an eager round 1 lives and the graph rounds
+#: after it live (CODE MATCH). The boot-wide budget N was the instrument;
+#: this is the form that keeps the graph decode for everything but that one
+#: round. Rank-uniform: the batch's rids are the same on every rank.
+EAGER_FIRST = "first"
+
+
+def _eager_mode() -> None:
+    if _EAGER["budget"] is not None:
+        return
+    raw = str(os.environ.get(EAGER_ENV, "") or "").strip().lower()
+    _EAGER["per_request"] = raw == EAGER_FIRST
+    _EAGER["seen"] = set()
+    _EAGER["budget"] = 0 if _EAGER["per_request"] else _env_int(EAGER_ENV, 0)
+    _EAGER["min_len"] = _env_int(EAGER_MIN_LEN_ENV, EAGER_MIN_LEN_DEFAULT)
+
+
+def eager_verify_round(context_len: int, rids=()) -> bool:
     """True while this verify round is among the first N
     (``SGLANG_SPEC_EAGER_VERIFY=N``) whose context reaches the minimum length;
-    shorter rounds neither run eager nor spend the budget."""
-    if _EAGER["budget"] is None:
-        _EAGER["budget"] = _env_int(EAGER_ENV, 0)
-        _EAGER["min_len"] = _env_int(EAGER_MIN_LEN_ENV, EAGER_MIN_LEN_DEFAULT)
+    shorter rounds neither run eager nor spend the budget. Under
+    ``SGLANG_SPEC_EAGER_VERIFY=first`` a round is eager when it is the FIRST
+    verify of any request in ``rids`` (each rid spends its round once)."""
+    _eager_mode()
+    if _EAGER["per_request"]:
+        fresh = [str(r) for r in rids if str(r) not in _EAGER["seen"]]
+        if not fresh:
+            return False
+        _EAGER["seen"].update(fresh)
+        return True
     if _EAGER["budget"] <= 0 or context_len < _EAGER["min_len"]:
         return False
     _EAGER["round_ct"] += 1

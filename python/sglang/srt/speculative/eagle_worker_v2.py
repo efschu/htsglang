@@ -3316,7 +3316,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         eager_round = not batch.forward_mode.is_idle() and _stage_sync_eager_verify(
-            max((req.seqlen for req in batch.reqs), default=0)
+            max((req.seqlen for req in batch.reqs), default=0),
+            rids=[req.rid for req in batch.reqs],  # fnFL2x85: first round per request
         )
         with self.plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
