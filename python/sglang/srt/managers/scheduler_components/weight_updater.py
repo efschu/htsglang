@@ -4237,11 +4237,23 @@ class SchedulerWeightUpdaterManager:
                 # so it stays IN the lane -- consumed, never written -- to
                 # keep the two sides' unit indices aligned.
                 _shared, _eproof = self._weg2_draft_embed_target_shares()
+                # fnFL2x33/x34 (23.09.): THE HEAD IS THE OTHER SHARE'S TWIN.
+                # `skip_names` narrows the DRAFT PLAN (leg_plan_from_join,
+                # 35 descs), but the LANE derives its unit list from the raw
+                # join (`_weg2_seq_lane_descs` -> plan_from_join, 38 units)
+                # so both sides agree without metadata -- and unit 2,
+                # lm_head.weight_packed (636 MB), was written into the
+                # TARGET's head at 0x7f0000000, region `weights`, still
+                # PAUSED: SIGSEGV in cudaMemcpyAsync on D TP0, over BAR1
+                # (x33) and over the SEQ host lane (x34) alike. The measured
+                # head share takes the embed's form: consumed, never written.
                 self._weg2_xchg_no_write = frozenset(
-                    (str(draft_region_tag), str(n)) for n in _shared)
+                    (str(draft_region_tag), str(n))
+                    for n in set(_shared) | set(_lm_head_excluded))
                 logger.info(
-                    "WEG2-XCHG-DRAFT-EMBED-TARGET-SHARED %s -> no_write=%s",
-                    _eproof, sorted(_shared))
+                    "WEG2-XCHG-DRAFT-EMBED-TARGET-SHARED %s -> no_write=%s "
+                    "(+ the measured head share %s, x34)",
+                    _eproof, sorted(_shared), sorted(_lm_head_excluded))
             if draft_region_tag != wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT:
                 # A drafter this arm classifies as something other than the
                 # draft region (e.g. #631/#274's shapes, which stay in the
@@ -6752,14 +6764,6 @@ class SchedulerWeightUpdaterManager:
                         _b1 = getattr(self, "_weg2_bar1", None)
                         _b1_role = (_b1.role(_lane_key)
                                     if (_b1 is not None and pair is not None) else None)
-                        if _b1_role is not None and not b1.bar1_tag_allowed(tag):
-                            # fnFL2x33: the draft tag takes the SEQ host lane
-                            # on both sides (see bar1_lanes.bar1_tag_allowed)
-                            logger.info("WEG2-BAR1 lane=%s phase=%s tag=%s via=host "
-                                        "reason=tag-not-bar1 (x33: the draft's BAR1 "
-                                        "collect faulted; x22's host form)",
-                                        _lane_key, phase, tag)
-                            _b1_role = None
                         _b1_mode = None
                         if (_b1_role is not None
                                 and (_b1_role == "src") == (phase == bx.PHASE_DEPOSIT)):

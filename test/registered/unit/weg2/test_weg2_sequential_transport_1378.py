@@ -460,6 +460,65 @@ class NoWriteConsumesButDoesNotWrite(_TransportHarness):
                          "tag weights_0 is not in the no-write set: written")
 
 
+class _ProbingMemOps(_MemOps):
+    """A driver-style probe on top of the host fake: every address is device
+    memory except the listed fake addresses (rc 0, type 0, device -1: a
+    reserved, unmapped VMM range -- a PAUSED region)."""
+
+    def __init__(self, unknown=()):
+        super().__init__()
+        self.unknown = set(int(a) for a in unknown)
+        self.copies = []
+
+    def ptr_attrs(self, addr):
+        for fake in self.unknown:
+            if fake <= int(addr) < fake + self.vram_size.get(fake, 0):
+                return (0, 0, -1)
+        return (0, 2, 0)
+
+    def memcpy_async(self, dst, src, nbytes, stream):
+        self.copies.append(int(dst))
+        super().memcpy_async(dst, src, nbytes, stream)
+
+
+class UnmappedDestinationIsRefusedByName(_TransportHarness):
+    """fnFL2x34 (23.09.): unit 2 of the draft band, lm_head.weight_packed,
+    was written into the PAUSED target head (region `weights`, type 0 to the
+    driver) -- SIGSEGV in cudaMemcpyAsync two lines after the i==0 probe
+    said type=2 for unit 0. MUTANT: the shipped collect, which probed unit 0
+    only and logged instead of refusing."""
+
+    def setUp(self):
+        super().setUp()
+        self.ops = _ProbingMemOps()
+
+    def test_the_unmapped_unit_is_named_and_nothing_after_it_is_written(self):
+        nbytes = [64, 128, 32]
+        descs = []
+        for i, n in enumerate(nbytes):
+            src, dst = self._vram_pair(n, i)
+            self.ops.write(src, bytes([0xA0 + i]) * n)
+            descs.append(_desc(f"unit{i}", n, src_ptr=src, dst_ptr=dst))
+        descs[2] = _desc("lm_head.weight_packed", nbytes[2],
+                         src_ptr=descs[2].src_ptr, dst_ptr=descs[2].dst_ptr)
+        self.ops.unknown = {int(descs[2].dst_ptr)}
+        self.assertEqual(self._deposit(descs), "")
+        before = self.ops.read(int(descs[2].dst_ptr), nbytes[2])
+        rc = bx.run_sequential_units(
+            descs, self.ops, self.nonce, slot_bytes=1 << 30,
+            shm_root=self.root, phase=bx.PHASE_COLLECT,
+            log=self.lines.append, card=1)
+        self.assertIn("lm_head.weight_packed", rc)
+        self.assertIn("not mapped device memory", rc)
+        self.assertIn("type=0", rc)
+        self.assertNotIn(int(descs[2].dst_ptr), self.ops.copies,
+                         "the unknown destination was never copied into")
+        self.assertEqual(self.ops.read(int(descs[2].dst_ptr), nbytes[2]), before)
+
+    def test_a_probe_less_ops_keeps_the_shipped_form(self):
+        self.assertIsNone(tp.dst_pointer_probe(_MemOps()))
+
+
 class DigestOffByDefaultStillMovesAndChecksIdentity(_TransportHarness):
     """The default form (flag unset): no sha256 on either side, the record
     carries digest="" and the collect prints digest=off; the identity guard

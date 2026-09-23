@@ -739,6 +739,45 @@ class _IpcHandle(ctypes.Structure):
     _fields_ = [("reserved", ctypes.c_ubyte * CUDA_IPC_HANDLE_SIZE)]
 
 
+def dst_pointer_probe(ops):
+    """``addr -> (rc, type, device)`` for a collect side's destinations, or
+    None when nothing can be asked (the desk's host fakes).
+
+    ``ops.ptr_attrs`` when the ops carry one; the real :class:`CudartDeviceOps`
+    gets ``weight_exchange_bounce.ptr_attrs`` (cudaPointerGetAttributes: a
+    read, never a dereference, ``(-1,-1,-1)`` on any failure). fnFL2x33/x34:
+    a destination the driver does not know (type 0: a reserved, unmapped VMM
+    range -- a PAUSED region) is copied by cudaMemcpyDefault as pageable host
+    memory, and that fault has no name. Asked once per destination before
+    the first copy into it, the refusal names the piece instead."""
+    fn = getattr(ops, "ptr_attrs", None)
+    if callable(fn):
+        return fn
+    if getattr(ops, "name", "") == "cudart":
+        try:
+            from sglang.srt.weg2.weight_exchange_bounce import ptr_attrs
+        except Exception:  # noqa: BLE001 -- the probe is optional, the copy is not
+            return None
+        return ptr_attrs
+    return None
+
+
+def refuse_unmapped_dst(probe, probed: set, *, dst: int, lane_key, i, name, tag):
+    """One probe per destination; a non-device answer is a named refusal
+    string, a device answer (type 2) or an already-probed address is ''."""
+    if probe is None or int(dst) in probed:
+        return ""
+    probed.add(int(dst))
+    _rc, _ty, _dev = probe(int(dst))
+    if int(_ty) == 2:
+        return ""
+    return (f"collect lane={lane_key} piece {i} {name!r} tag={tag!r} "
+            f"dst=0x{int(dst):x} is not mapped device memory (rc={_rc} "
+            f"type={_ty} device={_dev}); refusing the copy-out -- a "
+            f"cudaMemcpyAsync into it is a SIGSEGV, not a CUDA error "
+            f"(fnFL2x33/x34: the draft's lm_head into the PAUSED target head)")
+
+
 class CudartDeviceOps(DeviceOps):
     """``libcudart`` through ctypes.  No logic, so the fake can carry the proofs.
 

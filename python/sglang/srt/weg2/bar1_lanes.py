@@ -899,44 +899,6 @@ class Bar1Lanes:
 
 # -- the transport: ONE tag over the ring -------------------------------------
 
-def dst_pointer_probe(ops):
-    """``addr -> (rc, type, device)`` for the collect side's destinations,
-    or None when nothing can be asked (the desk's host fakes).
-
-    ``ops.ptr_attrs`` when the ops carry one; the real ``CudartDeviceOps``
-    gets ``weight_exchange_bounce.ptr_attrs`` (cudaPointerGetAttributes: a
-    read, never a dereference, ``(-1,-1,-1)`` on any failure)."""
-    fn = getattr(ops, "ptr_attrs", None)
-    if callable(fn):
-        return fn
-    if getattr(ops, "name", "") == "cudart":
-        try:
-            from sglang.srt.weg2.weight_exchange_bounce import ptr_attrs
-        except Exception:  # noqa: BLE001 -- the probe is optional, the copy is not
-            return None
-        return ptr_attrs
-    return None
-
-
-#: The draft head's weights tag (constants.GPU_MEMORY_TYPE_WEIGHTS_DRAFT).
-WEIGHTS_DRAFT_TAG = "weights_draft"
-
-
-def bar1_tag_allowed(tag) -> bool:
-    """May this tag ride a BAR1 lane? The draft tag may not (fnFL2x33).
-
-    x22 carried ``weights_draft`` over the SEQ host lane (whole-tag buffer:
-    the deposit completes in 1.9 s without the collector, and its credit is
-    published before D needs it). Since the BAR1 lanes (18.09.) the draft
-    went over a 4 x 32 MiB ring: the deposit is coupled to the collector
-    (x30: D TP2 ran dry at weights_4 while PP2 waited in the ring for a
-    collector that came last) and the first collect that did run died with
-    SIGSEGV in cudaMemcpyAsync on D TP0 (x33). Until that collect is
-    understood, the draft takes the host lane on BOTH sides -- both read
-    this one predicate, so the mode never disagrees across the pair."""
-    return str(tag) != WEIGHTS_DRAFT_TAG
-
-
 def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
                    seq, phase: str, no_write=None, liveness=None,
                    budget_s: float = 120.0, device: int = 0, log=None,
@@ -1077,7 +1039,9 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         f"units={npieces} batches={len(batches)} slot={slot_bytes >> 20}MiB ring={ring} credits={via}")
     nb = len(batches)
     lag = (1 if role == "src" else 0) if int(ring) >= 3 else 0
-    probe = dst_pointer_probe(ops) if role == "dst" else None
+    from sglang.srt.weg2 import weight_exchange_transport as tp
+
+    probe = tp.dst_pointer_probe(ops) if role == "dst" else None
     probed: set = set()
     plan = [[[str(getattr(descs[pc.desc_index], "param_name", "?")),
               str(getattr(descs[pc.desc_index], "tag", "") or ""), int(pc.nbytes), int(pc.slot_off)]
@@ -1148,20 +1112,15 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                     return f"bar1 collect lane={lane_key} batch {g}: desc {name!r} carries no dst_ptr"
                 dst = int(desc.dst_ptr) + int(piece.dst_off)
                 src = sbase + int(piece.slot_off)
-                if probe is not None and piece.desc_index not in probed:
-                    # fnFL2x33: D TP0 died with SIGSEGV inside cudaMemcpyAsync
-                    # on the first BAR1 collect of weights_draft. A pointer
-                    # the driver does not know is copied as pageable host
-                    # memory and the fault has no name. Asked ONCE per
-                    # descriptor, before the first copy into it.
-                    probed.add(piece.desc_index)
-                    _rc, _ty, _dev = probe(dst)
-                    if int(_ty) != 2:
-                        return (f"bar1 collect lane={lane_key} seq={seq} batch {g}: desc "
-                                f"{name!r} tag={tag!r} dst=0x{dst:x} is not mapped device "
-                                f"memory (rc={_rc} type={_ty} device={_dev}); refusing the "
-                                f"copy-out -- a cudaMemcpyAsync into it is a SIGSEGV, not "
-                                f"a CUDA error (x33: the draft's first BAR1 collect)")
+                # fnFL2x33: D TP0 died with SIGSEGV inside cudaMemcpyAsync on
+                # the first BAR1 collect of weights_draft (unit 2, the draft's
+                # lm_head into the PAUSED target head). Asked ONCE per
+                # destination, before the first copy into it.
+                _why = tp.refuse_unmapped_dst(probe, probed, dst=int(desc.dst_ptr),
+                                              lane_key=lane_key, i=piece.desc_index,
+                                              name=name, tag=tag)
+                if _why:
+                    return f"bar1 seq={seq} batch {g}: {_why}"
                 if piece.kind == tp.FLAT:
                     ops.memcpy_async(dst, src, int(piece.nbytes), stream)
                 else:

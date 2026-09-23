@@ -3130,6 +3130,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 continue
             # ---- COLLECT ----
             _issued = []
+            _dst_probe, _probed = tp.dst_pointer_probe(ops), set()
             for i in _grp:
                 piece = _batch.pieces[i]
                 desc = descs[piece.desc_index]
@@ -3249,6 +3250,13 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                     log(f"WEG2-SEQ ptrattr lane={lane_key} "
                         f"dst_rc={_drc} dst_type={_dty} dst_device={_ddev} "
                         f"src_rc={_src} src_type={_sty} src_device={_sdev}")
+                # fnFL2x34: unit 2 (the draft's lm_head, 636 MB) went into the
+                # PAUSED target head -- SIGSEGV two lines after the i==0 probe
+                # above said type=2 for unit 0. Every destination, once.
+                _why = tp.refuse_unmapped_dst(_dst_probe, _probed, dst=int(desc.dst_ptr),
+                                              lane_key=lane_key, i=i, name=name, tag=tag)
+                if _why:
+                    return _why
                 _tc0 = time.perf_counter()
                 if piece.kind == tp.FLAT:
                     ops.memcpy_async(int(dst_ptr), _buf_addr, nbytes, stream)
