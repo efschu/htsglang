@@ -648,6 +648,9 @@ class FutureMap:
             else:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
+        from sglang.srt.speculative.spec_batch_probe import probe as _sbp
+
+        _sbp("resolve-seq-lens", batch, fi=fi)
 
         # #616 instrument: the relay is the prime suspect for a cross-stream
         # read -- new_seq_lens_buf is written by the forward stream and gathered

@@ -2595,6 +2595,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
             batch_output.new_seq_lens = batch.seq_lens
+            from sglang.srt.speculative.spec_batch_probe import probe as _sbp
+
+            _sbp("extend-handoff", batch,
+                 next_token_ids=getattr(batch_output, "next_token_ids", None))
             # Publish before draft_extend so the fence is at target-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -2637,6 +2641,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
         else:
+            from sglang.srt.speculative.spec_batch_probe import probe as _sbp
+
+            _sbp("decode-entry", batch)
             self.activate_step_by_batch(batch.seq_lens.shape[0])
             if self.round_cost_probe is not None:
                 # Tag the measurement with the chain length just activated.
