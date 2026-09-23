@@ -7953,3 +7953,11 @@ class ModelRunnerKVCacheMixin:
             )
         except Exception as exc:  # noqa: BLE001 -- a census never kills a boot
             logger.debug("[vram-census] skipped: %s", exc)
+        # fnFL2x10: the drafter's post-load share/rebuild (D set_embed_and_head,
+        # P load_resident_embedding) has run by now -- the census above reads
+        # the shared tables -- so the draft manifest is re-read from the live
+        # model; the load-time one names a BF16 embed that no longer exists.
+        if getattr(self, "is_draft_worker", False) and self._weg2_manifest_identity:
+            from sglang.srt.weg2.weight_exchange import rewrite_draft_manifest_live
+
+            rewrite_draft_manifest_live(self.model, **self._weg2_manifest_identity)

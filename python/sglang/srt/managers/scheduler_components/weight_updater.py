@@ -1652,6 +1652,14 @@ class SchedulerWeightUpdaterManager:
                 return None
             if cdescs_present:
                 return None  # the real join covers this tag on this leg
+            if resident_bytes is not None and int(resident_bytes) == 0:
+                # fnFL2x10: a META SHADOW (Form A's expert workers under
+                # --speculative-draft-placement solo) -- the allocator holds
+                # no byte of this tag here, so nothing is released and
+                # nothing needs a source at wake. x10's D TP1/TP2 refused
+                # W106 on exactly this; the real holder (TP0) carries the
+                # descriptors and runs this check with them.
+                return None
             # NUTZER-ORDER 2026-09-14 (A2, xsn32, W4 Weg2WakeRefused at
             # weg2_memory_saver.py:368): the exemption below used to answer
             # "covered by _weg2_xchg_draft_reload_from_disk" UNCONDITIONALLY
@@ -1784,6 +1792,18 @@ class SchedulerWeightUpdaterManager:
         still covers it) -- never silently both-or-neither.
         """
         if self.draft_worker is None:
+            return False
+        from sglang.srt.managers.weg2_memory_saver import (
+            GPU_MEMORY_TYPE_WEIGHTS_DRAFT as _DRAFT_TAG,
+        )
+
+        if self._weg2_tag_resident_bytes(_DRAFT_TAG) == 0:
+            # fnFL2x10: the meta shadow holds no byte of the draft tag -- its
+            # empty collect is complete, and a disk reload into a meta
+            # drafter would be W4 on a quantized checkpoint for nothing.
+            logger.info("WEG2-XCHG-DRAFT-RELOAD-SKIPPED tag=%s: tms_tag_bytes=0 "
+                        "on this rank (meta shadow) -- nothing to reload",
+                        _DRAFT_TAG)
             return False
         try:
             from sglang.srt.weg2.weight_exchange import weights_cpu_backup_armed
@@ -3604,13 +3624,24 @@ class SchedulerWeightUpdaterManager:
             # draft head vs target head), fail-closed -- no proof, no
             # exclusion, and any OTHER missing counterpart still refuses
             # W74 (test_weg2_draft_lmhead_share_1378.py's mutant).
-            _lm_head_excluded = ""
+            _lm_head_excluded: frozenset = frozenset()
             if draft_region_tag == wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT:
+                # fnFL2x10: PER PARAMETER, like the embed below. A quantized
+                # head carries weight_packed/weight_scale/... and no `weight`,
+                # so the single-tensor proof answered "no-weight" and the
+                # shared head stayed in the join -- once the manifests name
+                # the live drafter, both sides would move the TARGET's head
+                # through the draft lane into a still-paused region.
                 _proof = self._weg2_draft_lm_head_is_target_share()
                 if _proof.startswith("MEASURED-SHARED"):
-                    _lm_head_excluded = "lm_head.weight"
+                    _lm_head_excluded = frozenset({"lm_head.weight"})
+                else:
+                    _lm_head_excluded, _proof = (
+                        self._weg2_draft_lm_head_target_shares())
+                if _lm_head_excluded:
                     logger.info(
-                        "WEG2-XCHG-DRAFT-LMHEAD-TARGET-SHARED %s", _proof)
+                        "WEG2-XCHG-DRAFT-LMHEAD-TARGET-SHARED %s -> skip=%s",
+                        _proof, sorted(_lm_head_excluded))
                 # weg2xsn86 (#1378): THE EMBEDDING IS THE OTHER SHARE.
                 # frozen_kv_mtp_worker_v2 hands the draft the target's
                 # embed_tokens AND lm_head (set_embed_and_head); on D the
@@ -3653,8 +3684,7 @@ class SchedulerWeightUpdaterManager:
                 # #1378 xsn34: the one-sided shared head drops out of the
                 # DRAFT side's own tensor list BEFORE the join, so the W74
                 # "no counterpart" refusal keeps guarding every OTHER name.
-                skip_names=({_lm_head_excluded}
-                            if _lm_head_excluded else None),
+                skip_names=(_lm_head_excluded or None),
                 # THE DRAFT RUNNER'S OWN REGION, never the main one -- MUTANT
                 # 1's own danger direction (a draft leg reading the main
                 # region's bands would write foreign bytes into the draft
@@ -3696,6 +3726,44 @@ class SchedulerWeightUpdaterManager:
                     f"never silently excluded)")
         except BaseException as exc:  # noqa: BLE001 -- fail-closed observer
             return f"proof-failed:{_weg2_exc_note(exc)}"
+
+    def _weg2_draft_lm_head_target_shares(self):
+        """The draft's ``lm_head`` parameter names to skip in the draft join,
+        plus a proof string -- MEASURED per parameter (data_ptr identity with
+        the target head's parameter of the same name), fnFL2x10.
+
+        ALL OR NOTHING: the set is non-empty only when EVERY parameter of the
+        draft head is the target's. A head that is partly its own needs a
+        source, and dropping any of it would leave its bytes undefined -- the
+        W74 refusal keeps guarding that shape (fail-closed, like
+        :meth:`_weg2_draft_lm_head_is_target_share` for the BF16 head).
+        """
+        try:
+            drafter = _weg2_drafter_of(self)
+            draft_model = getattr(drafter, "model", None)
+            target_runner = getattr(getattr(self, "tp_worker", None),
+                                    "model_runner", None)
+            target_model = getattr(target_runner, "model", None)
+            d_head = getattr(draft_model, "lm_head", None)
+            t_head = getattr(target_model, "lm_head", None)
+            if d_head is None or t_head is None:
+                return frozenset(), ("no-head (draft head=%s target head=%s)"
+                                     % (d_head is not None, t_head is not None))
+            t_ptrs = {str(n): int(p.data_ptr())
+                      for n, p in t_head.named_parameters(recurse=False)}
+            d_params = [(str(n), int(p.data_ptr()))
+                        for n, p in d_head.named_parameters(recurse=False)]
+            if not d_params:
+                return frozenset(), "no-params (draft head deferred)"
+            own = [n for n, ptr in d_params if t_ptrs.get(n) != ptr]
+            if own:
+                return frozenset(), (f"NOT-SHARED own={sorted(own)} of "
+                                     f"{len(d_params)} -- needs a source")
+            return (frozenset(f"lm_head.{n}" for n, _ in d_params),
+                    f"MEASURED-SHARED {len(d_params)} params "
+                    f"first={d_params[0][0]}:{d_params[0][1]:#x}")
+        except BaseException as exc:  # noqa: BLE001 -- fail-closed observer
+            return frozenset(), f"proof-failed:{_weg2_exc_note(exc)}"
 
     def _weg2_draft_embed_target_shares(self):
         """MEASURED, not assumed (weg2xsn86): the draft's ``embed_tokens``

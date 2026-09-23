@@ -4200,7 +4200,8 @@ def _tensor_is_meta(tensor) -> bool:
 def _write_placement_manifest(model, *, rank: int, region_tag: str,
                               log: Callable[[str], None],
                               tp_rank: Optional[int] = None,
-                              pp_rank: int = 0, tp_size: int = 1) -> None:
+                              pp_rank: int = 0, tp_size: int = 1,
+                              supersede: bool = False) -> None:
     """#1330 B4n. Write this rank's placement manifest; never raise.
 
     LAZY IMPORT, because ``xchg_manifest`` imports this module: the cross-group
@@ -4299,7 +4300,7 @@ def _write_placement_manifest(model, *, rank: int, region_tag: str,
             region_tag=str(region_tag), boot_token=xm.boot_token(),
             pieces=xm.pieces_from_inventory(geoms),
             tp_rank=t_rank, pp_rank=int(pp_rank))
-        path = xm.write_rank_manifest(manifest, directory)
+        path = xm.write_rank_manifest(manifest, directory, supersede=supersede)
         log(xm.written_line(path, manifest))
     except BaseException as exc:  # noqa: BLE001 -- no fence here; see caller
         try:
@@ -4310,6 +4311,35 @@ def _write_placement_manifest(model, *, rank: int, region_tag: str,
             )
         except BaseException:  # noqa: BLE001
             pass
+
+
+def rewrite_draft_manifest_live(model, *, rank: int, region_tag: str,
+                                tp_rank: int, pp_rank: int, tp_size: int,
+                                log: Optional[Callable[[str], None]] = None,
+                                ) -> None:
+    """fnFL2x10 (23.09.): the DRAFT region's manifest, re-read from the LIVE
+    drafter once its post-load step has run; never raises.
+
+    The load-time write (:func:`arm_coverage_at_load`) sees the drafter as
+    BUILT, and the drafter changes after it: on D ``set_embed_and_head``
+    hands it the target's packed embed and head, on P's last stage
+    ``load_resident_embedding`` rebuilds the vocab under the target's
+    quantization. x10 died on exactly that gap -- both manifests listed a
+    BF16 ``model.embed_tokens.weight`` (1212.5 MiB) that existed on neither
+    side at the flip, D TP0's address book answered None and the draft leg
+    refused W68. Only the draft region is rewritten; the main region's
+    parameters are final at load.
+    """
+    emit = log if log is not None else logger.info
+    if not exchange_armed() or str(region_tag) != GPU_MEMORY_TYPE_WEIGHTS_DRAFT:
+        return
+    emit(f"WEG2-XCHG-MANIFEST-REWRITE region_tag={region_tag} rank={rank} "
+         f"tp_rank={tp_rank} pp_rank={pp_rank} -- the drafter's post-load "
+         f"share/rebuild replaced parameters after the load-time manifest; "
+         f"the live model is published instead")
+    _write_placement_manifest(
+        model, rank=rank, region_tag=region_tag, log=emit, tp_rank=tp_rank,
+        pp_rank=pp_rank, tp_size=tp_size, supersede=True)
 
 
 def arm_coverage_at_load(

@@ -293,12 +293,20 @@ def pieces_from_inventory(inventory: Iterable[object]) -> Tuple[ManifestPiece, .
     return tuple(sorted(out, key=lambda p: p.param_name))
 
 
-def write_rank_manifest(manifest: RankManifest, dump_dir: str) -> str:
+def write_rank_manifest(manifest: RankManifest, dump_dir: str, *,
+                        supersede: bool = False) -> str:
     """Write one rank's manifest atomically; return the path.
 
     ATOMIC because the reader is another process on the same box and a
     half-written file is indistinguishable from a short one: the join would
     then refuse a tensor that IS placed, which is the false-red direction.
+
+    ``supersede``: the SAME writer replaces its own load-time manifest
+    (fnFL2x10: the drafter's post-load share/rebuild changed its parameters
+    after the load-time write). Allowed only when the prior file carries the
+    same identity (group, rank, tp_rank, pp_rank); weg2xsn22's collision --
+    two ranks resolving to one name -- differs exactly there and still
+    refuses.
     """
     os.makedirs(dump_dir, exist_ok=True)
     path = os.path.join(dump_dir, manifest_filename(
@@ -319,8 +327,14 @@ def write_rank_manifest(manifest: RankManifest, dump_dir: str) -> str:
                 prior = RankManifest.from_json(json.load(fh), path=path)
         except BaseException:  # noqa: BLE001 -- an unreadable file is replaced
             prior = None
+        _same_writer = (
+            prior is not None
+            and (str(prior.group), int(prior.rank), prior.tp_rank, prior.pp_rank)
+            == (str(manifest.group), int(manifest.rank), manifest.tp_rank,
+                manifest.pp_rank))
         if (prior is not None
                 and prior.boot_token == manifest.boot_token
+                and not (supersede and _same_writer)
                 and tuple(p.key for p in prior.pieces)
                 != tuple(p.key for p in manifest.pieces)):
             raise wx.Weg2XchgPlanDisagree(

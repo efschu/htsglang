@@ -657,6 +657,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # register out from under the items the first runner booked.
         configure_global_register_from_server_args(server_args)
         self.is_draft_worker = is_draft_worker
+        # fnFL2x10: the placement manifest's identity, set by load_model and
+        # read by the draft manifest's post-share rewrite (init_memory_pool).
+        self._weg2_manifest_identity: Optional[dict] = None
         self.is_generation = model_config.is_generation
         self.device_timer = None
         # Per-rank prefill timer (metrics_reporter installs it on the TARGET
@@ -2824,6 +2827,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             pp_rank=_pp_rank_of_process,
             tp_size=self.tp_size,
         )
+        # fnFL2x10: the same identity, kept for the draft manifest's rewrite
+        # after the drafter's post-load share/rebuild (init_memory_pool).
+        self._weg2_manifest_identity = dict(
+            rank=self.tp_rank, region_tag=weights_tag, tp_rank=self.tp_rank,
+            pp_rank=_pp_rank_of_process, tp_size=self.tp_size)
 
         # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
         # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
