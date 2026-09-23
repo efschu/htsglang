@@ -97,6 +97,26 @@ class GraphReplayCensus(unittest.TestCase):
             grc.maybe_census(_runner(), _batch())
         self.assertEqual(grc._STATE["n"], 1)
 
+    def test_slotted_and_struct_metadata_is_walked_not_skipped(self):
+        # x47: the QSA forward metadata has no __dict__; the census printed
+        # no attn.full line at all and "tensors=15" was the only trace of it.
+        import msgspec
+
+        class QsaMeta(msgspec.Struct):
+            sequence_lengths: object = None
+
+        runner = _runner()
+        runner.attn_backend.full_attn_backend.forward_metadata = QsaMeta(
+            sequence_lengths=torch.tensor([659], dtype=torch.int32)
+        )
+        grc.os.environ[grc.ENV] = "1"
+        with self.assertLogs(grc.logger, level=logging.INFO) as cm:
+            grc.maybe_census(runner, _batch())
+        self.assertIn(
+            "attn.full.forward_metadata.sequence_lengths shape=(1,) dtype=int32 range=659..659",
+            "\n".join(cm.output),
+        )
+
     def test_a_census_names_every_input_skips_pools_and_ends_with_its_denominator(self):
         grc.os.environ[grc.ENV] = "2"
         with self.assertLogs(grc.logger, level=logging.INFO) as cm:

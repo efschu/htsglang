@@ -56,20 +56,34 @@ def _range(t: torch.Tensor) -> str:
     return f"{t.min().item()}..{t.max().item()}"
 
 
+def _fields(obj: Any) -> List[Tuple[str, Any]]:
+    """Attribute pairs of a plain object, a msgspec Struct or a __slots__
+    class. x47: the QSA metadata has no __dict__ and was skipped silently."""
+    if hasattr(obj, "__dict__"):
+        return list(vars(obj).items())
+    names = getattr(type(obj), "__struct_fields__", None) or getattr(
+        type(obj), "__slots__", None
+    )
+    if isinstance(names, str):
+        names = (names,)
+    return [(n, getattr(obj, n, None)) for n in (names or ())]
+
+
 def _walk(prefix: str, obj: Any, depth: int, out: List[Tuple[str, torch.Tensor]],
           seen: Set[int]) -> None:
-    if obj is None or id(obj) in seen or not hasattr(obj, "__dict__"):
+    if obj is None or id(obj) in seen:
         return
     seen.add(id(obj))
-    for key, value in vars(obj).items():
+    for key, value in _fields(obj):
         name = f"{prefix}.{key}"
         if isinstance(value, torch.Tensor):
             out.append((name, value))
         elif (
             depth > 0
-            and hasattr(value, "__dict__")
-            and not isinstance(value, torch.nn.Module)
+            and value is not None
+            and not isinstance(value, (torch.nn.Module, str, bytes, int, float, bool))
             and not any(s in type(value).__name__ for s in _SKIP_TYPES)
+            and _fields(value)
         ):
             _walk(name, value, depth - 1, out, seen)
 

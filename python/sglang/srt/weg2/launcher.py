@@ -14428,7 +14428,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # pages -- and P writes none, so every one of those reads misses and D's
     # draft state is cold after each flip. That is the cost of this arm; it is
     # not a defect of the store and must not be triaged as one.
-    if not ring_table.p_carries_drafter(shipped_argv_p):
+    # fnFL2x48b: under --weg2-disable-hicache no carrier exists, so NEITHER
+    # group prints a `HiCache draft KV registered` or `#706 canonical DRAFT
+    # page` line -- the gate read P=None D=None and refused a boot whose D was
+    # already READY, although the route it guards (draft pages through the
+    # carrier) is absent by construction. Same fact as the W7/W9/W45 skips.
+    if hicache_disabled:
+        log("W10/W11 SKIPPED (--weg2-disable-hicache): no HiCache carrier exists, so neither group registers "
+            "a drafter identity or a canonical draft layout to match, and no draft pages cross a flip -- the "
+            "#1233 route these gates grade is absent by construction (same fact as the W7/W9/W45 skips).")
+    elif not ring_table.p_carries_drafter(shipped_argv_p):
         log("W10/W11 SKIPPED (--draft-kv-on-p off): group P's argv carries no --speculative-* flag, so there is "
             "no draft-KV producer to grade -- no drafter identity to match against D's and no last-stage draft "
             "residue to hold against a budget. ROUTE UNDER THIS ARM: group D keeps its own NEXTN head and still "
