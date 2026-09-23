@@ -77,6 +77,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
 )
+from sglang.srt.model_executor.runner import graph_replay_census
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.utils.collective_clock import collective_clock
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
@@ -2471,6 +2472,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             collective_clock().note_graph_replay(
                 self._clock_graph_key(self._replay_graph_key)
             )
+            # fnFL2x46: the first verify replay of a new request dies, one
+            # after an eager round lives -- census the inputs it reads.
+            graph_replay_census.maybe_census(self, forward_batch)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
             if read_done_post_replay:
                 read_done = self.device_module.Event()
