@@ -1443,6 +1443,51 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"Unsupported V4 paged host layout/backend: {self.layout}/{io_backend}"
             )
 
+    def backup_accepts_device_indices(self, host_indices, device_indices) -> str:
+        """H2: whole pages into a layer_first host buffer go through the
+        kernel branch above with the device rows on the card; the direct
+        branch needs them on the host (the D2H this form removes)."""
+        if self.layout != "layer_first" or self.data_ptrs is None:
+            return f"{self.pool_name}:layout"
+        if not self.pin_memory:
+            # the kernel stores into host memory through its device mapping
+            return f"{self.pool_name}:unpinned"
+        if transfer_kv_all_layer_mla is None:
+            return f"{self.pool_name}:no_kernel"
+        if (
+            host_indices is None
+            or device_indices is None
+            or host_indices.numel() != device_indices.numel()
+            or host_indices.numel() % self.slot_page_size
+        ):
+            return f"{self.pool_name}:partial_page"
+        return ""
+
+    def backup_from_device_indices(self, device_pool, host_indices, device_indices):
+        """H2: the same page rows as the ``direct``/``layer_first`` branch of
+        :meth:`backup_from_device_all_layer` (one ``item_bytes`` row per page
+        and layer), written by the ``kernel``/``layer_first`` branch's copy
+        with the device rows left on the card. The host rows cross pinned and
+        non-blocking; both index tensors are kept alive on the current (write)
+        stream."""
+        if not self._has_transfer_indices(host_indices, device_indices):
+            return
+        host_rows = self._to_page_indices(host_indices).to(torch.int64)
+        if not host_rows.is_cuda:
+            host_rows = host_rows.pin_memory().to(self.gpu_device, non_blocking=True)
+        device_rows = self._to_page_indices(device_indices).to(torch.int64)
+        transfer_kv_all_layer_mla(
+            src_layers=self.device_ptrs,
+            dst_layers=self.data_ptrs,
+            src_indices=device_rows,
+            dst_indices=host_rows,
+            item_size=self.item_bytes,
+            num_layers=self.layer_num,
+        )
+        stream = torch.cuda.current_stream(self.gpu_device)
+        host_rows.record_stream(stream)
+        device_rows.record_stream(stream)
+
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
@@ -2316,6 +2361,49 @@ class HostPoolGroup:
                 transfer.host_indices,
                 transfer.device_indices,
                 io_backend,
+            )
+
+    def backup_accepts_device_indices(
+        self, host_indices, device_indices, pool_transfers: Optional[list] = None
+    ) -> str:
+        """H2: "" when the anchor AND every extra pool of this op take their
+        device indices on the card; else the first refusal. Asked before the
+        op is issued, so a refusal only selects the old normalisation."""
+        why = self.anchor_entry.host_pool.backup_accepts_device_indices(
+            host_indices, device_indices
+        )
+        if why:
+            return why
+        for transfer in pool_transfers or []:
+            entry = self.entry_map.get(transfer.name)
+            if entry is None:
+                return f"unbound:{transfer.name}"
+            if transfer.host_indices is None or transfer.device_indices is None:
+                return f"unresolved:{transfer.name}"
+            why = entry.host_pool.backup_accepts_device_indices(
+                transfer.host_indices, transfer.device_indices
+            )
+            if why:
+                return why
+        return ""
+
+    def backup_from_device_indices(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        pool_transfers: Optional[list] = None,
+    ) -> None:
+        """H2: :meth:`backup_from_device_all_layer` for an op every pool of
+        which accepted its device indices on the card -- same order (anchor
+        first, then the extra pools), same pools, no index normalisation."""
+        self.anchor_entry.host_pool.backup_from_device_indices(
+            self.anchor_entry.device_pool, host_indices, device_indices
+        )
+        for transfer in pool_transfers or []:
+            entry = self._entry_for_transfer(transfer, "backup")
+            entry.host_pool.backup_from_device_indices(
+                entry.device_pool, transfer.host_indices, transfer.device_indices
             )
 
 

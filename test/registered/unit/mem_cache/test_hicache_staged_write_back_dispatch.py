@@ -146,6 +146,11 @@ class _FakeEvent:
         pass
 
 
+class _FakeStream:
+    def query(self):
+        return True
+
+
 class _FakeDeviceModule:
     Event = _FakeEvent
 
@@ -153,6 +158,11 @@ class _FakeDeviceModule:
     @contextmanager
     def stream(stream):
         yield
+
+    @staticmethod
+    def current_stream():
+        # H2: start_writing asks whether the compute stream is busy (a query)
+        return _FakeStream()
 
 
 class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):

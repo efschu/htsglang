@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.common import (
     uniform_host_avail_for_backup,
     uniform_host_floor_active,
 )
+from sglang.srt.mem_cache import hicache_write_path
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_collective import (
     COLLECTIVE_POLL_MAX_S,
@@ -3406,14 +3407,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             first = self._weg2_chain_from(getattr(req, "last_node", None))
             if not first:
                 return
-            stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue(),
-                                                clock=_rp.SweepClock(_rp.chunk_budget_s()),
-                                                first=first, chain_only=True) or {}
+            # H2: wall vs thread CPU of this publish, and its write ops' host
+            # side (hicache_write_path) -- the line the next boot is read by.
+            h2 = hicache_write_path.PublishClock()
+            with hicache_write_path.sync_trace():
+                stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue(),
+                                                    clock=_rp.SweepClock(_rp.chunk_budget_s()),
+                                                    first=first, chain_only=True) or {}
             n = getattr(self, "_weg2_chunk_publish_n", 0) + 1
             self._weg2_chunk_publish_n = n
+            h2_line = h2.finish(n)
             if n <= 16 or n % 256 == 0:
                 logger.info("WEG2 CHUNK-PUBLISH rid=%s chain=%d %s (n=%d)", str(getattr(req, "rid", "?"))[:12],
                             len(first), stats, n)
+                logger.info("%s", h2_line)
         except Exception as exc:  # noqa: BLE001 -- a publisher never takes the chunk down
             logger.warning("WEG2 CHUNK-PUBLISH raised %s: %s", type(exc).__name__, exc)
 

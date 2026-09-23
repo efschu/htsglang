@@ -107,6 +107,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.mem_cache import hicache_write_path
 from sglang.srt.mem_cache.hicache_phase_guard import device_tier_disarmed
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
@@ -633,19 +634,31 @@ class HybridCacheController(BaseHiCacheController):
         if not consume_gate(self, "write_queue", "write"):
             return
         op = CacheOperation.merge_ops(self.write_queue)
+        # H2: the op's host cost is timed; `busy` = the compute stream still
+        # had queued work, i.e. a sync here would wait for (part of) a forward.
+        clock = hicache_write_path.IssueClock(
+            busy=hicache_write_path.compute_stream_busy(device_module)
+        )
+        refusal = self._device_index_write_refusal(op)
+        on_card = not refusal
         # Page-first write-back JIT kernels can keep destination host indices on CPU.
-        if (
+        if on_card or (
             self.io_backend == "kernel"
             and self.mem_pool_host.layout == "page_first"
             and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
         ):
+            # H2 device-index form: every pool of the op takes its device
+            # indices on the card, so the direct backend's `.cpu()` -- a sync
+            # of the COMPUTE stream, the forward in flight -- is skipped.
             host_indices = op.host_indices
             device_indices = op.device_indices
             resolved_pool_transfers = op.pool_transfers
         else:
+            clock.move_begin()
             host_indices, device_indices, resolved_pool_transfers = (
                 self.move_hybrid_indices(op)
             )
+            clock.move_end()
         self.write_queue.clear()
         # Weighted uneven-DCP: back up only this rank's owned tokens, from
         # their COMPACT device slots (identity when the gate is off). Only the
@@ -660,14 +673,24 @@ class HybridCacheController(BaseHiCacheController):
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                kv_host_indices,
-                kv_device_indices,
-                self.io_backend,
-                pool_transfers=resolved_pool_transfers,
-            )
-            if self.draft_tier_armed("write") and host_indices.numel() > 0:
+            if on_card:
+                # the refusal above asked every pool of this op; the draft
+                # tier and the DCP owner rule are unarmed (identity pairs)
+                self.mem_pool_host.backup_from_device_indices(
+                    self.mem_pool_device,
+                    kv_host_indices,
+                    kv_device_indices,
+                    pool_transfers=resolved_pool_transfers,
+                )
+            else:
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    kv_host_indices,
+                    kv_device_indices,
+                    self.io_backend,
+                    pool_transfers=resolved_pool_transfers,
+                )
+            if not on_card and self.draft_tier_armed("write") and host_indices.numel() > 0:
                 self.mem_pool_host_draft.backup_from_device_all_layer(
                     self.mem_pool_device_draft,
                     host_indices,
@@ -685,6 +708,30 @@ class HybridCacheController(BaseHiCacheController):
                 self.write_stream, kv_host_indices, kv_device_indices
             )
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+        clock.finish(device=on_card, reason=refusal)
+
+    def _device_index_write_refusal(self, op: CacheOperation) -> str:
+        """H2: "" = this write op goes out with its device indices on the card
+        (``HostPoolGroup.backup_from_device_indices``); otherwise why the
+        old normalisation runs. Every term is this op's own or this rank's
+        configuration; the bytes written are the same either way, so a
+        rank-local answer changes when the host waits, never what lands."""
+        why = hicache_write_path.device_index_write_gate(
+            enabled=hicache_write_path.device_index_write_on(),
+            io_backend=self.io_backend,
+            device_on_card=op.device_indices.is_cuda,
+        )
+        if why:
+            return why
+        if self.draft_tier_armed("write"):
+            # the draft pool's backup keeps the direct backend's host rows
+            return "draft"
+        if self._dcp_owner_ctx() is not None:
+            # the owner rule masks host AND device indices together
+            return "dcp"
+        return self.mem_pool_host.backup_accepts_device_indices(
+            op.host_indices, op.device_indices, op.pool_transfers
+        )
 
     def load(
         self,

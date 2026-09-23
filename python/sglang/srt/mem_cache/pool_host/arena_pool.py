@@ -1237,6 +1237,24 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 device_pool, host_indices[rest.to(host_indices.device)],
                 device_indices[rest.to(device_indices.device)], io_backend)
 
+    def backup_accepts_device_indices(self, host_indices, device_indices) -> str:
+        """H2: an op whose host ids are ALL arena rows (host side, a direct
+        write's claim) is written by the arena path above, which selects on
+        the card (xsn349) and never reads the io backend. A staging row would
+        take the base pool's backend branch, which wants host indices."""
+        if self.arena is None:
+            return "kv:arena_unbound"
+        if host_indices.is_cuda:
+            return "kv:host_ids_on_card"
+        if not bool(_arena_mask(self, host_indices).all()):
+            return "kv:staging_rows"
+        return ""
+
+    def backup_from_device_indices(self, device_pool, host_indices, device_indices):
+        # every row is an arena row (accepted above): the backend argument is
+        # never read on this path, the rest-branch that would read it is empty
+        self.backup_from_device_all_layer(device_pool, host_indices, device_indices, "direct")
+
     def _slots_of(self, host_indices: torch.Tensor):
         hi = host_indices.cpu()
         rows = hi[_arena_mask(self,hi)] - self.staging_rows

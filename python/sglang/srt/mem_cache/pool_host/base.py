@@ -334,6 +334,24 @@ class HostKVCache(abc.ABC):
         """
         raise NotImplementedError()
 
+    def backup_accepts_device_indices(
+        self, host_indices: torch.Tensor, device_indices: torch.Tensor
+    ) -> str:
+        """H2: "" when :meth:`backup_from_device_indices` can take this pair
+        with ``device_indices`` still on the card (no host normalisation, no
+        D2H); otherwise the reason it cannot. Default: it cannot."""
+        return f"pool:{type(self).__name__}"
+
+    def backup_from_device_indices(
+        self, device_pool, host_indices: torch.Tensor, device_indices: torch.Tensor
+    ) -> None:
+        """H2: the backup of a pair :meth:`backup_accepts_device_indices`
+        accepted, issued on the current (write) stream."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no device-index backup "
+            "(backup_accepts_device_indices refuses it)"
+        )
+
     @abc.abstractmethod
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         """

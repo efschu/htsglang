@@ -1322,6 +1322,15 @@ class Envs:
     # DROPS beyond this cap rather than queueing without limit -- a dropped
     # demotion is a later miss, never corruption.
     SGLANG_HICACHE_DEMOTE_ON_EVICT = EnvInt(0)
+    # H2 (23.09.): issue a write op with its device indices left on the card
+    # when every pool of the op can take them (arena KV/mamba, QSA page rows)
+    # instead of the io_backend=direct normalisation, whose device_indices.cpu()
+    # blocks the scheduler thread until the card's queued forward finished.
+    # False restores the old normalisation for every op (the fallback form).
+    SGLANG_OPT_HICACHE_DEVICE_INDEX_WRITE = EnvBool(True)
+    # H2: run the first N chunk publishes under torch's sync-debug "warn" mode
+    # and log each implicit synchronising call site once (H2-SYNC-SITE). 0 = off.
+    SGLANG_DEBUG_HICACHE_SYNC_TRACE = EnvInt(0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

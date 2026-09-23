@@ -394,6 +394,24 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 device_pool, host_indices[rest.to(host_indices.device)],
                 device_indices[rest.to(device_indices.device)], io_backend)
 
+    def backup_accepts_device_indices(self, host_indices, device_indices) -> str:
+        """H2: all-arena host ids are written by the kernel (xsn351) or copy
+        path above, both of which select the device rows on the card; the
+        staging rows' base branch wants host indices."""
+        if self.arena is None:
+            return "mamba:arena_unbound"
+        if host_indices.is_cuda:
+            return "mamba:host_ids_on_card"
+        _, is_arena = self._split(host_indices)
+        if not bool(is_arena.all()):
+            return "mamba:staging_rows"
+        return ""
+
+    def backup_from_device_indices(self, device_pool, host_indices, device_indices):
+        # all arena rows (accepted above): _backup_rest is empty, the backend
+        # argument is never read
+        self.backup_from_device_all_layer(device_pool, host_indices, device_indices, "direct")
+
     def _load_states_all_layers(self, device_pool, slots, didx) -> None:
         """xsn332/337: this rank's extents of the requested slots (temporal +
         conv, all layers) gathered COMPACTLY into a pinned stage, one H2D per
