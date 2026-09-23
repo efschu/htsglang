@@ -22,14 +22,24 @@ from sglang.srt.weg2 import xchg_manifest as xm  # noqa: E402
 
 
 class _Bare(wu.SchedulerWeightUpdaterManager):
-    def __init__(self, group, rank):
+    def __init__(self, group, rank, agreed="AGREED"):
         self._g, self._r = group, rank
+        self._agreed = agreed
+        self.hook_plans = []
 
     def _weg2_group_name(self):
         return self._g
 
     def _weg2_rank(self):
         return self._r
+
+    def _weg2_shadow_manifest(self, group, peer, rank, *, leg, epoch):
+        return self._agreed, ("agreed" if self._agreed is not None else "peer-missing")
+
+    def _weg2_shadow_plan(self, hook, group, rank, *, agreed, require_agreement):
+        # fnFL2x84: the hook's plan, keyed by the agreement (a boot constant)
+        self.hook_plans.append((hook, group, rank, agreed, require_agreement))
+        return ("PLAN", "")
 
 
 def _stub_manifests(monkeypatch, calls):
@@ -48,12 +58,27 @@ def test_the_boot_warm_up_fills_both_hooks_of_this_ranks_lane_cache(monkeypatch)
     _stub_manifests(monkeypatch, calls)
     m = _Bare("D", 0)
     ms = m._weg2_warm_leg_cache()
-    assert sorted(ms) == ["leg:authoritative", "leg:source"]
+    assert sorted(ms) == ["hook:destination", "hook:source", "leg:authoritative", "leg:source"]
+    # fnFL2x84: the hook's plan for both hooks, narrowed to the pair's agreement
+    assert m.hook_plans == [("source", "D", 0, "AGREED", True),
+                            ("destination", "D", 0, "AGREED", True)]
     lc = m._weg2_xchg_leg_cache
     # D imports on the authoritative hook (pp_to_tp) and exports on source (tp_to_pp)
     assert lc[("join", "authoritative", "D", 0)] == ("JOIN", "PLAN:pp_to_tp")
     assert lc[("join", sh.HOOK_SOURCE, "D", 0)] == ("JOIN", "PLAN:tp_to_pp")
     assert sorted(calls) == ["pp_to_tp", "tp_to_pp"]
+
+
+def test_x84_without_an_agreement_the_hook_plan_is_not_warmed_but_the_lane_plan_is(monkeypatch):
+    """The agreement needs the co-located peer's manifest; when it is not
+    there yet only the hook half is skipped (-1), the lane plans still land."""
+    calls = []
+    _stub_manifests(monkeypatch, calls)
+    m = _Bare("P", 2, agreed=None)
+    ms = m._weg2_warm_leg_cache()
+    assert ms["hook:source"] == -1.0 and ms["hook:destination"] == -1.0
+    assert m.hook_plans == []
+    assert ("join", "authoritative", "P", 2) in m._weg2_xchg_leg_cache
 
 
 def test_without_a_group_or_manifests_nothing_is_warmed(monkeypatch):

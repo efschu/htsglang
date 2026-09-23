@@ -845,6 +845,23 @@ class SchedulerWeightUpdaterManager:
             plan = xm.plan_from_join(join, direction=wx.leg_direction(hook, group))
             _lc[("join", str(hook), str(group), int(rank))] = (join, plan)
             out[f"leg:{hook}"] = (time.perf_counter() - t0) * 1000.0
+        # fnFL2x84: THE HOOK'S OWN PLAN TOO. x83: the source hook re-derived
+        # its region plans before P's first deposit (HOOK-TIME plan=125 ms)
+        # and the destination hook after D's last collect (plan=168 ms,
+        # regions weights + weights_draft), both on the critical path, both
+        # keyed by the pair's manifest agreement -- a boot constant. The same
+        # agreement is made here, so the flip's key hits.
+        peer = "D" if str(group) == "P" else "P"
+        for hook in (sh.HOOK_SOURCE, sh.HOOK_DESTINATION):
+            t0 = time.perf_counter()
+            agreed, state = self._weg2_shadow_manifest(
+                str(group), peer, int(rank), leg=0, epoch="prewarm")
+            if agreed is None:
+                out[f"hook:{hook}"] = -1.0
+                continue
+            self._weg2_shadow_plan(str(hook), str(group), int(rank),
+                                   agreed=agreed, require_agreement=True)
+            out[f"hook:{hook}"] = (time.perf_counter() - t0) * 1000.0
         return out
 
     def _weg2_bar1_start(self) -> None:
