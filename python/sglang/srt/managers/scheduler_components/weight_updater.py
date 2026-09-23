@@ -6752,6 +6752,14 @@ class SchedulerWeightUpdaterManager:
                         _b1 = getattr(self, "_weg2_bar1", None)
                         _b1_role = (_b1.role(_lane_key)
                                     if (_b1 is not None and pair is not None) else None)
+                        if _b1_role is not None and not b1.bar1_tag_allowed(tag):
+                            # fnFL2x33: the draft tag takes the SEQ host lane
+                            # on both sides (see bar1_lanes.bar1_tag_allowed)
+                            logger.info("WEG2-BAR1 lane=%s phase=%s tag=%s via=host "
+                                        "reason=tag-not-bar1 (x33: the draft's BAR1 "
+                                        "collect faulted; x22's host form)",
+                                        _lane_key, phase, tag)
+                            _b1_role = None
                         _b1_mode = None
                         if (_b1_role is not None
                                 and (_b1_role == "src") == (phase == bx.PHASE_DEPOSIT)):
