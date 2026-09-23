@@ -463,16 +463,19 @@ def test_the_credit_wait_wires_a_stuck_lane_reader_not_a_one_shot_check(
 
 
 def test_vram_credit_wait_for_catches_a_race_mid_wait_not_after_the_budget(
-        tmp_path):
+        tmp_path, monkeypatch):
     """THE REAL LOOP, driven end to end: `stuck_lane_reader` reports CLEAN
     for the first ~1.5s (the lane check's own 1s cadence gives it one or two
     clean looks) and then STUCK -- mirroring boot weg2xsn31's own timeline
     (clean at entry, saturating post lands 4s later). `wait_for` must raise
     `Weg2XchgLaneNeverDrainedRefused` well before its OWN 30s budget expires,
     proving the check lives INSIDE the poll loop and not only at the door.
+    The persistence window (fnFL2x8) is shortened to 2 s here; the default
+    20 s is pinned by its own test below.
     """
     from sglang.srt.managers.weg2_memory_saver import VramCredit
 
+    monkeypatch.setenv("SGLANG_WEG2_W108_PERSIST_S", "2")
     credit = VramCredit("GPU-test-1391", credit_dir=str(tmp_path))
     t0 = time.monotonic()
     calls = {"n": 0}
@@ -509,6 +512,46 @@ def test_vram_credit_wait_for_with_no_reader_is_byte_identical(tmp_path):
     with pytest.raises(Weg2VramCreditRefused) as exc:
         credit.wait_for(1024, budget_s=0.2, tag="weights_0", free_bytes_now=0)
     assert "W35" in str(exc.value)
+
+
+def test_vram_credit_wait_for_rides_out_bands_of_its_own_tag(tmp_path,
+                                                            monkeypatch):
+    """fnFL2x8: PP2 waited for weights_14's credit (need 3048, free 2205);
+    D's deposit of weights_14 ITSELF landed in lane 0-2-0 3.0 s into the wait
+    (deposit -> pause -> credit: the bands always arrive before the credit)
+    and W108 refused on the first full look, stranding the lane and starving
+    PP0 90 s later. A reading that clears inside the persistence window is
+    the lockstep working: the wait must go on (here to its own W35, since no
+    peer funds this test), never W108."""
+    from sglang.srt.managers.weg2_memory_saver import VramCredit
+
+    monkeypatch.setenv("SGLANG_WEG2_W108_PERSIST_S", "3")
+    credit = VramCredit("GPU-test-x8", credit_dir=str(tmp_path))
+    calls = {"n": 0}
+
+    def _reader():
+        calls["n"] += 1
+        return [("0-2-0", 117, 0)] if calls["n"] == 2 else []
+
+    with pytest.raises(Weg2VramCreditRefused) as exc:
+        credit.wait_for(
+            3048 * 1024 * 1024, budget_s=4.0, tag="weights_14",
+            free_bytes_now=0, stuck_lane_reader=_reader)
+    assert "W35" in str(exc.value)
+    assert "Weg2XchgLaneNeverDrainedRefused" not in str(exc.value)
+    assert calls["n"] >= 3, "the full reading was never followed by a look"
+
+
+def test_w108_persistence_default_survives_garbage(monkeypatch):
+    """The default window is what keeps x8's false refusal gone on every arm
+    that does not set the knob; a garbage value must not collapse it to 0."""
+    from sglang.srt.managers.weg2_memory_saver import _w108_persist_s
+
+    monkeypatch.delenv("SGLANG_WEG2_W108_PERSIST_S", raising=False)
+    assert _w108_persist_s() == 20.0
+    for bad in ("abc", ""):
+        monkeypatch.setenv("SGLANG_WEG2_W108_PERSIST_S", bad)
+        assert _w108_persist_s() == 20.0, bad
 
 
 def test_the_credit_wait_polls_normally_on_a_clean_lane(monkeypatch, real_sems):

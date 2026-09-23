@@ -812,6 +812,17 @@ class Weg2VramCreditRefused(RuntimeError):
     """
 
 
+def _w108_persist_s() -> float:
+    """``SGLANG_WEG2_W108_PERSIST_S``: how long the undrained-lane reading must
+    hold, unbroken, inside a credit wait before W108 refuses (default 20 s,
+    against the wait's 120 s budget).  fnFL2x8: at lane depth 2 a 1 s probe
+    refused a wait the source was still funding."""
+    try:
+        return max(0.0, float(os.environ.get("SGLANG_WEG2_W108_PERSIST_S", "20") or 20))
+    except ValueError:
+        return 20.0
+
+
 class Weg2XchgLaneNeverDrainedRefused(RuntimeError):
     """W108 -- a bounce lane already carries undrained bands nobody will ever
     take, named THE MOMENT it is found instead of after a 120 s budget.
@@ -1272,6 +1283,17 @@ class VramCredit:
         # a small fraction of the 120 s budget it replaces. Cheap: a handful
         # of ctypes reads, not an allocation or a syscall storm at 100 Hz.
         _next_lane_check = time.monotonic()
+        # fnFL2x8 (23.09.): THE STALL MUST PERSIST. "`full` is 0 between tags"
+        # holds between COLLECTS, not inside a credit wait: the depositor runs
+        # deposit(t) -> pause(t) -> credit, so the bands of the very tag this
+        # wait is for land in the lane BEFORE the pause that funds it. x8's
+        # PP2 waited for weights_14 (need 3048, free 2205); D's weights_14
+        # bands reached lane 0-2-0 3.0 s in, W108 refused on that first full
+        # look although D's pause (~0.95 GB on that card) was next, and the
+        # refusal stranded the lane and starved PP0 into a 90 s timeout. A
+        # stuck lane stays full; the lockstep drains.
+        _stuck_since = None
+        _stuck_persist_s = _w108_persist_s()
         while True:
             if stuck_lane_reader is not None and time.monotonic() >= _next_lane_check:
                 _next_lane_check = time.monotonic() + 1.0
@@ -1279,22 +1301,28 @@ class VramCredit:
                     _stuck = stuck_lane_reader()
                 except Exception:  # noqa: BLE001 -- a probe may not raise
                     _stuck = []
-                if _stuck:
+                if not _stuck:
+                    _stuck_since = None
+                elif _stuck_since is None:
+                    _stuck_since = time.monotonic()
+                if _stuck and time.monotonic() - _stuck_since >= _stuck_persist_s:
                     raise Weg2XchgLaneNeverDrainedRefused(
                         f"W108 Weg2XchgLaneNeverDrainedRefused: card={self.uuid} "
                         f"tag={tag}: waiting for a VRAM credit this card may "
                         f"never receive -- {len(_stuck)} lane(s) targeting "
                         f"this rank's card now hold undrained bands (found "
-                        f"{time.perf_counter() - t0:.1f}s into the wait): "
+                        f"{time.perf_counter() - t0:.1f}s into the wait, "
+                        f"held unbroken for {_stuck_persist_s:.0f}s): "
                         + ", ".join(
                             f"lane={lane} full={full} empty={empty}"
                             for lane, full, empty in _stuck)
-                        + ". Under the #1374 contract `full` is 0 between "
-                        f"tags by construction, so a peer deposited real "
-                        f"bytes for a DIFFERENT tag that this rank's "
-                        f"collector never drained; the credit for THIS tag "
-                        f"depends on that same peer's pause loop, which is "
-                        f"itself stuck behind the undrained lane. Refusing "
+                        + ". Bands of the tag this wait is FOR sit in the "
+                        f"lane until the depositor's pause posts the credit "
+                        f"-- that drains within seconds; a lane still full "
+                        f"after the persistence window holds bytes the "
+                        f"depositor cannot fund past (a DIFFERENT tag this "
+                        f"rank's collector never drained, or a pause loop "
+                        f"stuck behind this very lane). Refusing "
                         f"now beats riding out the remaining "
                         f"{budget_s - (time.perf_counter() - t0):.0f}s of "
                         f"this wait into a W35 that would hide the real lane."
