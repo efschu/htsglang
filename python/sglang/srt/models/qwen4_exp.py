@@ -1988,6 +1988,24 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             enable_tp=not form_a_dense_is_unsharded(),
         )
 
+    def _build_hyper_connection_mixer(self, hc_config) -> nn.Module:
+        # fnFL2x21 (2026-09-23): like the vocab (first stage only), the
+        # model-level mixer belongs to the LAST pipeline stage -- forward()
+        # hands every other stage's stream on before `mix`. Built everywhere it
+        # was a dead replica on PP0/PP1, and the flip join, which takes the
+        # first stage that publishes a replicated name as its holder, moved the
+        # bytes to PP0: the one stage that mixes (PP2) got nothing at a D->P
+        # wake, and PP1's copy had no source at the P->D sleep (W106).
+        if not self.pp_group.is_last_rank:
+            return PPMissingLayer()
+        # FORM A (F3): the model-level mixer, like the two per-layer ones,
+        # is not sharded at all -- every rank held it in full. A worker
+        # enters the model at a MoE input and never touches it.
+        _mix_ph = skip_on_worker("hyper_connection", "hyper_connection_mixer")
+        if _mix_ph is not None:
+            return _mix_ph
+        return GatedResidual(hc_config, use_combine=False)
+
     def __init__(
         self,
         config: Qwen4ExpTextConfig,
@@ -2027,14 +2045,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
-        # FORM A (F3): the model-level mixer, like the two per-layer ones,
-        # is not sharded at all -- every rank held it in full. A worker
-        # enters the model at a MoE input and never touches it.
-        _mix_ph = skip_on_worker("hyper_connection", "hyper_connection_mixer")
-        self.hyper_connection_mixer = (
-            _mix_ph if _mix_ph is not None
-            else GatedResidual(hc_config, use_combine=False)
-        )
+        self.hyper_connection_mixer = self._build_hyper_connection_mixer(hc_config)
         # WP5 (PP=3 prefill): the PLE batch (n-gram hashing, prefetch, commit)
         # is only built on the stage that owns a PLE layer.
         self._stage_has_ple = self.has_ple and any(
@@ -2187,6 +2198,16 @@ def weight_layer_is_owned(name: str, start_layer: int, end_layer: int) -> bool:
         return True
     layer_id = int(m.group(1))
     return start_layer <= layer_id < end_layer
+
+
+def mixer_is_foreign(model, name: str) -> bool:
+    """fnFL2x21: the model-level mixer exists on the last pipeline stage only
+    (``Qwen4ExpModel._build_hyper_connection_mixer``). On every other stage its
+    checkpoint tensors have no module; they are skipped before
+    ``load_packed_hc_linear`` would refuse them as a module-less KeyError."""
+    return name.startswith("model.hyper_connection_mixer.") and isinstance(
+        model.hyper_connection_mixer, PPMissingLayer
+    )
 
 
 _HC_PACKED_SUFFIXES = (".weight_packed", ".weight_scale", ".weight_shape")
@@ -2816,6 +2837,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace("model.language_model.", "model.")
             if not weight_layer_is_owned(name, pp_start_layer, pp_end_layer):
                 skipped_foreign_layer_count += 1
+                continue
+            if mixer_is_foreign(self.model, name):
                 continue
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
