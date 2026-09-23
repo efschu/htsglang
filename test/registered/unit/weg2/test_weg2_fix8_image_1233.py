@@ -543,6 +543,22 @@ class TestTheShmOrphanSweep(CustomTestCase):
             self.assertIn("hicache-weg2-fix973", names)
         self.assertTrue(any("allocated bytes" in ln and "freed" in ln for ln in log.lines))
 
+    def test_a_dead_boots_hicache_arena_is_swept(self):
+        """fnFL2x16: the shared page arena (`weg2-arena-<tag>`, 4 GiB after a
+        259k needle) outlived its boot; the next boot's host ledger counted
+        it as occupied because the prefix was not in the sweep."""
+        with tempfile.TemporaryDirectory() as tmp:
+            shm, proc = _fake_shm(tmp), _fake_proc(tmp)
+            os.makedirs(os.path.join(shm, "weg2-arena-fnFL2x16", "pages"), exist_ok=True)
+            with open(os.path.join(shm, "weg2-arena-fnFL2x16", "pages", "p0.bin"), "wb") as f:
+                f.write(b"k" * 4096)
+            out = launcher.shm_residue_sweep(
+                _Log(), "fnFL2x17", "0923_021100", False, shm_dir=shm, proc_root=proc,
+                archive_root=os.path.join(tmp, "archive"),
+            )
+            self.assertIn("weg2-arena-fnFL2x16", out["swept"])
+            self.assertFalse(os.path.exists(os.path.join(shm, "weg2-arena-fnFL2x16")))
+
     def test_foreign_names_are_never_touched(self):
         with tempfile.TemporaryDirectory() as tmp:
             shm, proc = _fake_shm(tmp), _fake_proc(tmp)

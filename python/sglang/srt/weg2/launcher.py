@@ -184,6 +184,12 @@ SHM_OWN_PREFIXES = (
     # holder refuses the boot as for every other entry.
     "weg2-seq-",
     f"sem.{weight_exchange_region.REGION_PREFIX}",  # "sem.weg2-xchg-"
+    # fnFL2x16 (2026-09-23): the shared HiCache page arena of every boot
+    # (`/dev/shm/weg2-arena-<tag>`, SGLANG_HICACHE_ARENA_DIR below, one
+    # directory per boot tag). MEASURED after a 259k needle: 4 GiB of tmpfs,
+    # left behind by the dead boot and charged by the next boot's W22 as
+    # occupied. The tag is new every boot, so an arena is never reopened.
+    "weg2-arena-",
 )
 #: The corridor law is 819-1229 MiB NVML-free per card under the awake
 #: group's load.  MEASURED 2026-09-07 boot weg2onebackup2 with this constant
