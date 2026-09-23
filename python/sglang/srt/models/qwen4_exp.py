@@ -190,6 +190,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5GatedDeltaNet,
     Qwen3_5LinearDecoderLayer,
 )
+from sglang.srt.models.mtp_vocab_share import MtpEmbedDeferred
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen4_exp_ple_table import (
     allocate_ple_host_table,
@@ -1961,6 +1962,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         _emb_ph = skip_on_worker("embed_tokens", name)
         if _emb_ph is not None:
             return _emb_ph
+        # fnFL2 H1b: the D drafter shares the TARGET's (INT8-packed) table;
+        # its own BF16 one was never loaded and cost 1212.5 MiB of the
+        # weights_draft tag (mtp_vocab_share.py). Decided in the base __init__.
+        if self._defer_embed:
+            return MtpEmbedDeferred()
         # #66: an MTP build hands its UNMODIFIED config in here (see
         # __init__); every other caller passes none and keeps its own.
         vocab_config = getattr(self, "_embed_quant_config", None) or quant_config

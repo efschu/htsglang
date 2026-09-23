@@ -370,6 +370,59 @@ def target_shares_vocab_modules(target_lm_head, embed_module) -> bool:
     return embed_module is not None and not hasattr(embed_module, "weight")
 
 
+def draft_vocab_shared_at_build(
+    *,
+    enabled: bool,
+    is_eagle3: bool,
+    has_token_map: bool,
+    draft_kv_only: bool,
+    solo_active: bool,
+    solo_is_host: bool,
+    form_a_dense_unsharded: bool,
+) -> bool:
+    """fnFL2 H1b: does THIS rank build its draft WITHOUT vocabulary tables of
+    its own (``qwen3_5_mtp.vocab_from_target``) and share the target's
+    ``embed_tokens``/``lm_head`` MODULES in right after the load?  Pure.
+
+    Yes exactly where the module share is what happens anyway:
+
+    * ``enabled`` -- ``SGLANG_WEG2_DRAFT_SHARE_EMBED`` (default on; ``0``
+      restores the built-then-replaced tables).
+    * not EAGLE3 -- its draft may keep dedicated embeddings / hot-token heads.
+    * no ``--speculative-token-map`` -- a hot-token head is a SLICED copy of
+      the target's rows, never the target's module.
+    * not the draft-KV producer (``--speculative-draft-kv-only``) -- it defers
+      its head itself (``lm_head_from_target``) and loads a resident embedding
+      under placement A, which needs a built module to rebuild into.
+    * split placement, or the solo HOST under Form A (``_solo_init_lm_head``
+      takes the split path there). The classic solo host gathers FULL tables
+      and hands over TENSORS (``set_embed_and_head``), and a solo SHADOW never
+      shares at all -- both keep their build.
+
+    Rank uniformity: every input but ``solo_is_host`` is the same on every
+    rank; the one that differs is the bit that already makes the solo host the
+    only rank that shares (the shadows' drafts are ``meta`` builds, 0 bytes).
+    """
+    if not enabled or is_eagle3 or has_token_map or draft_kv_only:
+        return False
+    if solo_active:
+        return form_a_dense_unsharded and solo_is_host
+    return True
+
+
+def draft_vocab_is_deferred(draft_model) -> bool:
+    """True while any vocab table of ``draft_model`` is still a build-time
+    placeholder (fnFL2 H1b embed, #1259 b head) -- such a draft can only be
+    completed by a MODULE share."""
+    from sglang.srt.models.mtp_vocab_share import MtpEmbedDeferred
+    from sglang.srt.models.qwen3_5_mtp import Qwen3_5MtpLmHeadDeferred
+
+    return any(
+        isinstance(m, (MtpEmbedDeferred, Qwen3_5MtpLmHeadDeferred))
+        for m in draft_model.modules()
+    )
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -448,6 +501,43 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.survival_probe: Optional[SurvivalProbe] = None
         self._init_adaptive_chain_probe()
 
+        # fnFL2 H1b: build the draft WITHOUT its own embed_tokens/lm_head where
+        # init_lm_head shares the target's modules anyway. Built-then-replaced,
+        # the two BF16 tables (2 x 1212.5 MiB on Next Flash) stayed in the
+        # weights_draft tag pool as dead reserve (x87: tag 3984 MiB of which
+        # 2.36 GiB were never-loaded rows) -- see models/mtp_vocab_share.py.
+        from sglang.srt.rank_role import form_a_dense_is_unsharded
+
+        self._draft_vocab_from_target = draft_vocab_shared_at_build(
+            enabled=envs.SGLANG_WEG2_DRAFT_SHARE_EMBED.get(),
+            is_eagle3=self.speculative_algorithm.is_eagle3(),
+            has_token_map=server_args.speculative_token_map is not None,
+            draft_kv_only=self.draft_kv_only,
+            solo_active=self._spec_solo_active,
+            solo_is_host=self._spec_solo_is_host,
+            form_a_dense_unsharded=form_a_dense_is_unsharded(),
+        )
+        logger.info(
+            "H1b DRAFT-VOCAB-AT-BUILD from_target=%s | env=%s eagle3=%s "
+            "token_map=%s draft_kv_only=%s solo=%s solo_host=%s form_a=%s -- "
+            "from_target=True heisst: der Draft baut KEINE eigene "
+            "embed_tokens/lm_head-Tabelle, init_lm_head teilt die Module des Ziels",
+            self._draft_vocab_from_target,
+            envs.SGLANG_WEG2_DRAFT_SHARE_EMBED.get(),
+            self.speculative_algorithm.is_eagle3(),
+            server_args.speculative_token_map is not None,
+            self.draft_kv_only,
+            self._spec_solo_active,
+            self._spec_solo_is_host,
+            form_a_dense_is_unsharded(),
+        )
+        if self._draft_vocab_from_target:
+            from sglang.srt.models.qwen3_5_mtp import vocab_from_target
+
+            vocab_ctx = vocab_from_target()
+        else:
+            vocab_ctx = contextlib.nullcontext()
+
         # Load draft model weights only.
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_parallel().attn_tp_group)
@@ -455,7 +545,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ctx = empty_context()
         with (
             ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        ), vocab_ctx, speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -812,8 +902,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         _embed_module = getattr(
             getattr(target_model, "model", None), "embed_tokens", None
         )
-        if target_shares_vocab_modules(target_lm_head, _embed_module):
-            draft_model = self.draft_runner.model
+        draft_model = self.draft_runner.model
+        # fnFL2 H1b: a draft built under vocab_from_target() has placeholders
+        # where its tables would be -- only the MODULE share completes it.
+        _deferred = draft_vocab_is_deferred(draft_model)
+        if _deferred or target_shares_vocab_modules(target_lm_head, _embed_module):
             if (
                 self.speculative_algorithm.is_eagle3()
                 or self.hot_token_id is not None
@@ -822,15 +915,32 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 raise NotImplementedError(
                     "a target vocab module without a .weight tensor (GGUF "
                     "quantized-resident lm_head, or a host-resident embedding) "
-                    "requires a NEXTN/EAGLE draft supporting module-level sharing "
-                    "(set_embed_and_head_modules) and no hot-token vocab. "
-                    "Set SGLANG_GGUF_DENSE_VOCAB=1 to restore the dense "
-                    "lm_head path."
+                    "or a draft built without vocab tables (deferred=%s, "
+                    "SGLANG_WEG2_DRAFT_SHARE_EMBED) requires a NEXTN/EAGLE draft "
+                    "supporting module-level sharing (set_embed_and_head_modules) "
+                    "and no hot-token vocab. Set SGLANG_GGUF_DENSE_VOCAB=1 / "
+                    "SGLANG_WEG2_DRAFT_SHARE_EMBED=0 to restore the dense path."
+                    % _deferred
                 )
-            embed_module = getattr(
-                getattr(target_model, "model", None), "embed_tokens", None
-            )
-            draft_model.set_embed_and_head_modules(embed_module, target_lm_head)
+            draft_model.set_embed_and_head_modules(_embed_module, target_lm_head)
+            if draft_vocab_is_deferred(draft_model):
+                # Refused HERE, at boot, by name -- not at the first draft
+                # forward inside a graph capture.
+                raise RuntimeError(
+                    "fnFL2 H1b: the draft was built without its own vocab tables "
+                    "but the target has no module to share in (embed_tokens=%s "
+                    "lm_head=%s). Set SGLANG_WEG2_DRAFT_SHARE_EMBED=0 to build "
+                    "the draft's own tables."
+                    % (type(_embed_module).__name__, type(target_lm_head).__name__)
+                )
+            if _deferred:
+                logger.info(
+                    "H1b DRAFT-VOCAB-SHARED modules embed_tokens=%s lm_head=%s "
+                    "-- the draft built no table of its own; both are the "
+                    "target's modules (one byte, one owner)",
+                    type(_embed_module).__name__,
+                    type(target_lm_head).__name__,
+                )
             return
 
         embed, head = target_model.get_embed_and_head()

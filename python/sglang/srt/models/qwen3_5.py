@@ -100,6 +100,11 @@ from sglang.srt.models.qwen2_moe import (
 )
 
 # Models
+from sglang.srt.models.mtp_vocab_share import (
+    MtpEmbedDeferred,
+    embed_from_target_requested,
+    mtp_builds_own_embed,
+)
 from sglang.srt.models.qwen3_vl import (
     Qwen3VLForConditionalGeneration,
     skip_vision_weight,
@@ -1610,6 +1615,29 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
+        # fnFL2 H1b: an MTP draft built under embed_from_target() gets NO
+        # embedding table of its own -- the worker shares the target's module
+        # in (mtp_vocab_share.py). Decided here, once, for every
+        # `_build_embed_tokens` override (Qwen4-Exp's included); the target
+        # itself (is_nextn=False) is never deferred.
+        self._defer_embed = bool(is_nextn) and not mtp_builds_own_embed(
+            embed_from_target_requested(),
+            getattr(config, "tie_word_embeddings", False),
+        )
+        if is_nextn:
+            import threading as _th
+
+            logger.info(
+                "H1b MTP-EMBED baut_eigenen=%s | from_target=%s "
+                "tie_word_embeddings=%s | thread=%s -- baut_eigenen=True heisst: "
+                "eine eigene [vocab,hidden] Eingabetabelle wird im Draft-Tag "
+                "ALLOZIERT, auch wenn sie danach vom Ziel ersetzt wird",
+                not self._defer_embed,
+                embed_from_target_requested(),
+                getattr(config, "tie_word_embeddings", False),
+                _th.current_thread().name,
+            )
+
         # Embedding layer
         self.embed_tokens = self._build_embed_tokens(config, quant_config, prefix)
 
@@ -1688,6 +1716,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         checkpoint packs the vocab (Qwen4-Exp / Minachist) passes them on."""
         if not self.pp_group.is_first_rank:
             return PPMissingLayer()
+        if self._defer_embed:
+            return MtpEmbedDeferred()
         # GGUF only: build embed_tokens QUANTIZED-RESIDENT (packed
         # `qweight` via GGUFEmbeddingMethod) instead of the dense bf16
         # materialization -- saves ~1.1 GiB/rank on a 248k vocab. Every

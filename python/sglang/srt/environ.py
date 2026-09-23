@@ -1980,6 +1980,11 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    # fnFL2 H1b: a NEXTN/MTP draft that shares the target's embed_tokens /
+    # lm_head MODULES builds no vocab table of its own (placeholders, replaced
+    # by init_lm_head). 0 restores the old form: both tables built in the
+    # weights_draft tag, then replaced (Next Flash: 2 x 1212.5 MiB dead reserve).
+    SGLANG_WEG2_DRAFT_SHARE_EMBED = EnvBool(True)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)

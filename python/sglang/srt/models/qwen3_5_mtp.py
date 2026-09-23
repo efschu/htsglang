@@ -36,6 +36,11 @@ from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.mtp_vocab_share import (
+    MtpEmbedDeferred,
+    MtpEmbedNotShared,
+    embed_from_target,
+)
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_npu
@@ -227,6 +232,20 @@ def lm_head_from_target():
         _LM_HEAD_FROM_TARGET.reset(token)
 
 
+@contextmanager
+def vocab_from_target():
+    """fnFL2 H1b: build the MTP draft with NEITHER vocabulary table of its own.
+
+    Both halves at once -- :func:`lm_head_from_target` for the output table
+    and ``mtp_vocab_share.embed_from_target`` for the input table -- because
+    the only caller that may enter it (``EagleDraftWorker.__init__``, when
+    ``draft_vocab_shared_at_build`` says yes) shares BOTH modules in right
+    after the load (``init_lm_head`` -> ``set_embed_and_head_modules``).
+    """
+    with lm_head_from_target(), embed_from_target():
+        yield
+
+
 class Qwen3_5MtpLmHeadDeferred(nn.Module):
     """The placeholder ``build_mtp_lm_head`` installs under
     ``lm_head_from_target()``: no parameters, no buffers, no vocab table.
@@ -409,6 +428,19 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         waiting for the target's module."""
         return isinstance(getattr(self, "lm_head", None), Qwen3_5MtpLmHeadDeferred)
 
+    @property
+    def embed_is_deferred(self) -> bool:
+        """fnFL2 H1b: this draft built no input table of its own and is still
+        waiting for the target's module."""
+        inner = getattr(self, "model", None)
+        return isinstance(getattr(inner, "embed_tokens", None), MtpEmbedDeferred)
+
+    @property
+    def vocab_is_deferred(self) -> bool:
+        """Either vocabulary table is still a placeholder: only a MODULE share
+        (``set_embed_and_head_modules``) can complete this draft."""
+        return self.lm_head_is_deferred or self.embed_is_deferred
+
     def get_embed_and_head(self):
         # `.weight` on the deferred placeholder raises Qwen3_5MtpLmHeadNotShared
         # by itself; naming the caller here is what makes that message useful.
@@ -421,6 +453,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
+        if self.vocab_is_deferred:
+            raise MtpEmbedNotShared(
+                "set_embed_and_head() hands over .weight TENSORS, but this MTP "
+                "draft was built with deferred vocab placeholders (fnFL2 H1b, "
+                "vocab_from_target()): share the target's MODULES instead "
+                "(set_embed_and_head_modules)."
+            )
         del self.model.embed_tokens.weight
         if not self.config.tie_word_embeddings:
             del self.lm_head.weight

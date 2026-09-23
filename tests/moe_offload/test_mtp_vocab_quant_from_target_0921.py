@@ -76,6 +76,9 @@ def test_a_named_vocab_quantizes_and_an_unnamed_one_does_not(monkeypatch):
         stub = types.SimpleNamespace(
             pp_group=types.SimpleNamespace(is_first_rank=True),
             _embed_quant_config=embed_cfg,
+            # fnFL2 H1b: set by the base __init__ before the builder runs;
+            # False = a build that keeps its own table (this test's subject).
+            _defer_embed=False,
         )
         monkeypatch.setattr(qwen4_exp, "skip_on_worker", lambda *a: None)
         captured = {}
