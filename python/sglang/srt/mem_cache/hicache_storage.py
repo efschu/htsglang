@@ -3367,9 +3367,43 @@ class HiCacheFile(HiCacheStorage):
                     return not is_read
                 if callable(_is_ar) and _is_ar(idx):
                     return not is_read
-                return op_fn(transfer.name, key, host_pool, idx)
+                ok = op_fn(transfer.name, key, host_pool, idx)
+                if ok and is_read:
+                    self._qsa_sidecar_trace("read", transfer.name, key, host_pool, idx)
+                return ok
             results[transfer.name] = [_one(i, key) for i, key in enumerate(keys)]
         return results
+
+    def _qsa_sidecar_trace(self, side: str, pool_name, key: str, host_pool, idx: int) -> None:
+        """fnFL2x56 (Task #106): the byte content of the index page, per layer
+        block, on BOTH sides of the carrier -- `SGLANG_QSA_SIDECAR_TRACE=N`
+        prints the first N pages a process writes or reads. P prints the
+        blocks of its own layers (in canonical order), D all twelve; equal
+        sums for the same key on both sides prove the carrier, unequal ones
+        name the side. Off by default (0)."""
+        if str(pool_name) != str(PoolName.QSA_INDEXER):
+            return
+        try:
+            budget = int(os.environ.get("SGLANG_QSA_SIDECAR_TRACE", "0") or 0)
+        except ValueError:
+            budget = 0
+        if budget <= 0:
+            return
+        n = getattr(self, "_qsa_trace_n", 0)
+        if n >= budget:
+            return
+        self._qsa_trace_n = n + 1
+        try:
+            page = host_pool.get_data_page(idx, flat=True)
+            blocks = page.view(torch.uint8).reshape(int(host_pool.layer_num), -1).to(torch.int64)
+            sums = blocks.sum(dim=1).tolist()
+            head = page.view(torch.uint8)[:8].tolist()
+            logger.info(
+                "#106T qsa page %s key=%s idx=%d layers=%d block_sums=%s head=%s",
+                side, str(key)[:20], int(idx), int(host_pool.layer_num), sums, head,
+            )
+        except Exception as exc:  # noqa: BLE001 -- an instrument never fails the IO
+            logger.info("#106T qsa page %s key=%s idx=%d trace failed: %r", side, str(key)[:20], int(idx), exc)
 
     def batch_get_v2(
         self,
@@ -3411,6 +3445,9 @@ class HiCacheFile(HiCacheStorage):
                 pages = [host_pool.get_data_page(s, flat=True) for s in starts]
             storage_keys = [self._log_key(transfer.name, key) for key in keys]
             results[transfer.name] = self._batch_set_each(storage_keys, pages)
+            for key, start, ok in zip(keys, starts, results[transfer.name]):
+                if ok:
+                    self._qsa_sidecar_trace("write", transfer.name, key, host_pool, start)
         return results
 
     def capacity_stats(self) -> Optional[dict]:
