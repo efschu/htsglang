@@ -2786,9 +2786,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._note_mamba_pin_skipped()
             return 0
 
-        # Backup invariant (write-through): parent must be backuped first
+        # Backup invariant (write-through): parent must be backuped first.
+        # A parent whose store write acked counts as backed -- the rule
+        # publish_unbacked_sweep already applies (#1317 C2/R-5). fnFL2x19/x20:
+        # under the arena the ack frees the transit host copy again
+        # (_weg2_release_chain_piece_host), so asking only `backuped` made every
+        # child backup at the sleep flush re-copy and re-write the whole acked
+        # chain above it: P's PP1/PP2 issued 1088/1024 store writes for 64
+        # nodes, 54 stayed in flight, /flush_cache answered 400 for 90 s, W3.
         if not write_back and (
-            node.parent is not self.root_node and not node.parent.backuped
+            node.parent is not self.root_node
+            and not node.parent.backuped
+            and not node.parent.l3_present
         ):
             if self.write_backup(node.parent) <= 0:
                 return 0
