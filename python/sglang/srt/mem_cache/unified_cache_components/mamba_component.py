@@ -211,7 +211,14 @@ class MambaComponent(TreeComponent):
         """
         if key_units <= 0:
             return 0
-        return key_units + 1 if self.cache.is_eagle else key_units
+        # fnFL2x76: with the EXACT bigram keying (`unified_radix_cache.
+        # bigram_anchor_key`, one token beyond the retained KV) a node of k
+        # units carries the state after exactly k tokens -- identity.  The
+        # +1 remains for the upstream keying only (a dense bigram tree has no
+        # recurrent state to file, so in production it is never read).
+        if self.cache.is_eagle and not self.cache.bigram_anchor_exact:
+            return key_units + 1
+        return key_units
 
     def create_match_validator(
         self, match_device_only: bool = False

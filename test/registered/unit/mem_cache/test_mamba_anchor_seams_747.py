@@ -273,7 +273,7 @@ class TestUnifiedValidatorBehaviour(CustomTestCase):
         # identity path the method's own docstring names. Setting the real
         # default rather than bypassing the read keeps the EAGLE correction in
         # this file's blast radius, where it belongs.
-        comp.cache = SimpleNamespace(is_eagle=False)
+        comp.cache = SimpleNamespace(is_eagle=False, bigram_anchor_exact=False)
         return comp
 
     @staticmethod

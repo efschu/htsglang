@@ -93,7 +93,7 @@ class HostResume(unittest.TestCase):
         # (CacheInitParams.is_eagle), and it is the value these tests already
         # assume: they pass plain raw depths, which is the identity case the
         # docstring names ("Identity outside EAGLE").
-        holder.cache = types.SimpleNamespace(is_eagle=False)
+        holder.cache = types.SimpleNamespace(is_eagle=False, bigram_anchor_exact=False)
         holder._raw_token_pos = MambaComponent._raw_token_pos.__get__(holder)
         fn = MambaComponent.create_match_validator(holder, match_device_only=False)
         return fn, MambaComponent

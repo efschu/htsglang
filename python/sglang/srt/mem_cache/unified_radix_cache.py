@@ -83,6 +83,32 @@ from sglang.srt.mem_cache.producer_phase_census import (
     note_walk_node as _pp_note_walk_node,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+
+
+def bigram_anchor_key(token_ids, cache_len: int, extra_key, *, is_bigram: bool,
+                      exact: bool, page_size: int) -> RadixKey:
+    """The retention key for a state tracked after ``cache_len`` tokens.
+
+    fnFL2x76 (23.09.): under BIGRAM keys (NEXTN/EAGLE) a key of ``cache_len``
+    tokens has ``cache_len - 1`` units, and page alignment then drops the
+    whole last page: P tracked the GDN state after 4480 tokens, filed it at
+    the 4416-unit node, D restored 4416 KV tokens with a state that had
+    consumed 4480 (64 tokens fed twice) and re-extended 77-105 tokens after
+    every wake -- 1,5 s of the 4,7 s flip.
+
+    EXACT form: the key takes ONE MORE token (known: it is the next prompt
+    token), so the node has ``cache_len`` units = a KV prefix of exactly the
+    ``cache_len`` tokens the tracked state has consumed; the page of units
+    ``[cache_len-64, cache_len)`` survives alignment.  Only when that next
+    token exists (``cache_len < len(token_ids)``); at a request's very end
+    the upstream form (one unit short) stands.  ``exact`` is the cache's
+    ``bigram_anchor_exact`` (bigram keys AND a recurrent component): a dense
+    model keeps the upstream keying, its KV prefix carries no state.
+    """
+    n = int(cache_len)
+    if is_bigram and exact and n < len(token_ids):
+        n += 1
+    return RadixKey(token_ids[:n], extra_key, is_bigram=is_bigram).page_aligned(page_size)
 from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
     MambaLoadBackUnservable,
 )
@@ -1525,6 +1551,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        # fnFL2x76: the retention key may take one token beyond the retained
+        # KV (`bigram_anchor_key`); `token_ids` itself is truncated below.
+        token_ids_full = token_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
@@ -1585,10 +1614,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
 
-            radix_key = RadixKey(
-                token_ids, req.extra_key, is_bigram=self.is_eagle
-            ).page_aligned(self.page_size)
+            radix_key = bigram_anchor_key(
+                token_ids_full, len(token_ids), req.extra_key,
+                is_bigram=self.is_eagle, exact=self.bigram_anchor_exact,
+                page_size=self.page_size,
+            )
             page_aligned_len = len(radix_key)
+            assert page_aligned_len <= len(kv_indices), (page_aligned_len, len(kv_indices))
             values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
             insert_params.key = radix_key
@@ -1716,12 +1748,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
-        radix_key = RadixKey(
-            token_ids[:effective_cache_len],
-            req.extra_key,
-            is_bigram=self.is_eagle,
-        ).page_aligned(self.page_size)
+        # fnFL2x76: under bigram keys with a recurrent anchor the key takes
+        # the next token too, so the node's units equal the tokens the tracked
+        # state consumed (see `bigram_anchor_key`); the KV rows stay
+        # `effective_cache_len` and the key never names more than them.
+        radix_key = bigram_anchor_key(
+            token_ids, effective_cache_len, req.extra_key,
+            is_bigram=self.is_eagle, exact=self.bigram_anchor_exact,
+            page_size=self.page_size,
+        )
         page_aligned_len = len(radix_key)
+        assert page_aligned_len <= len(kv_indices), (page_aligned_len, len(kv_indices))
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
         insert_params.key = radix_key
@@ -3418,8 +3455,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            n, str(getattr(req, "rid", "?"))[:12], tokens, type(e).__name__, e)
             return
         # raw-token position of a key-unit depth: bigram units span one more
-        # token than their count (`MambaComponent._raw_token_pos`).
-        anchor = usable_units + 1 if (self.is_eagle and usable_units > 0) else usable_units
+        # token than their count (`MambaComponent._raw_token_pos`) -- unless
+        # the exact keying (fnFL2x76) files the state at the unit count.
+        anchor = (usable_units + 1
+                  if (self.is_eagle and not self.bigram_anchor_exact and usable_units > 0)
+                  else usable_units)
         ok = usable_units >= target_units
         # #1481 (weg2xsn243/245): the N-1 node this split exists for becomes an
         # INTERIOR node the moment the final 1-token chunk is inserted below
@@ -7261,6 +7301,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def supports_mamba(self) -> bool:
         return ComponentType.MAMBA in self.components
+
+    @property
+    def bigram_anchor_exact(self) -> bool:
+        """fnFL2x76: bigram keys carry a recurrent anchor -> the retention key
+        takes one more token so node units == tokens the state consumed
+        (``bigram_anchor_key``); ``MambaComponent._raw_token_pos`` is then
+        the identity.  Dense bigram trees (27B + DFlash2) keep the upstream
+        keying."""
+        return bool(self.is_eagle and ComponentType.MAMBA in self.components)
 
     # ---- Streaming session API (delegates to composed StreamingSession) ----
 

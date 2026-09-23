@@ -158,9 +158,12 @@ class _StubNode:
 
 
 class _StubCache:
-    def __init__(self, is_eagle=False, cache_controller=None):
+    def __init__(self, is_eagle=False, cache_controller=None, bigram_anchor_exact=False):
         self.is_eagle = is_eagle
         self.cache_controller = cache_controller
+        # fnFL2x76: the upstream keying (one unit short) is what #783's +1
+        # measures; the exact keying makes the grid read the unit count.
+        self.bigram_anchor_exact = bigram_anchor_exact
 
 
 class _StubMambaComponent:
