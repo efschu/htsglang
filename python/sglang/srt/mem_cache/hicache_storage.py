@@ -3389,10 +3389,14 @@ class HiCacheFile(HiCacheStorage):
             budget = 0
         if budget <= 0:
             return
-        n = getattr(self, "_qsa_trace_n", 0)
-        if n >= budget:
+        # x57: one budget for both directions let D's own control writes use
+        # up the read lines; the budget is PER SIDE.
+        counters = getattr(self, "_qsa_trace_n", None)
+        if counters is None:
+            counters = self._qsa_trace_n = {"write": 0, "read": 0}
+        if counters.get(side, 0) >= budget:
             return
-        self._qsa_trace_n = n + 1
+        counters[side] = counters.get(side, 0) + 1
         try:
             page = host_pool.get_data_page(idx, flat=True)
             blocks = page.view(torch.uint8).reshape(int(host_pool.layer_num), -1).to(torch.int64)
