@@ -3028,12 +3028,15 @@ def _qkv_component_rows(model, name: str) -> Tuple[int, ...]:
     return ()
 
 
-#: Layout-Metadaten: die ``*weight_shape``-Tensoren der komprimierten
-#: Gewichte tragen die LOKALE logische Form (P-Stufe: alle Experten, D-Rang:
-#: sein Ausschnitt), werden nur beim Laden gelesen und duerfen nie zwischen
-#: den Layouts kopiert werden (fnFL2x72: 29+29 Stuecke je P-Rang MISMATCH,
+#: Layout-Metadaten: die ``weight_shape``-Tensoren der EXPERTEN-Stapel tragen
+#: die LOKALE logische Form (P-Stufe: alle Experten, D-Rang: sein Ausschnitt),
+#: werden nur beim Laden gelesen und duerfen nie zwischen den Layouts kopiert
+#: werden (fnFL2x72: w13/w2_weight_shape 29+29 Stuecke je P-Rang MISMATCH,
 #: nachher in jedem Layer derselbe Digest = die Form des anderen Layouts).
+#: Die ``weight_shape`` der dichten Schichten sind in beiden Layouts gleich
+#: (x72: kein Stueck davon bewegt) und reisen weiter wie bisher.
 _LAYOUT_METADATA_SUFFIX = "weight_shape"
+_LAYOUT_METADATA_SCOPE = ".mlp.experts."
 
 
 def not_a_source_here(model):
@@ -3073,7 +3076,7 @@ def not_a_source_here(model):
 
     def reason(name: str) -> Optional[str]:
         name = str(name)
-        if name.endswith(_LAYOUT_METADATA_SUFFIX):
+        if name.endswith(_LAYOUT_METADATA_SUFFIX) and _LAYOUT_METADATA_SCOPE in name:
             return "layout-metadata"
         if veto is not None and not veto(name):
             return "form-a-worker-unloaded"

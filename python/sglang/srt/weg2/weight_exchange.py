@@ -3150,6 +3150,12 @@ class TagCoverage:
     #: :func:`zero_local_scratch` and the resume-side call in
     #: ``weight_updater.resume_memory_occupation`` do.
     local_scratch: Tuple[str, ...] = ()
+    #: fnFL2x72: live tensors under this tag that THIS rank is no source for
+    #: and that no plan may carry to it -- a Form A worker's never-loaded
+    #: attention/shared-expert tensors, and the layout-specific expert
+    #: ``weight_shape`` (``weight_exchange_shadow.not_a_source_here``).  Named
+    #: and counted like ``local_scratch``: not a refusal, not a relabel.
+    not_source: Tuple[str, ...] = ()
 
     #: #1335 (B4r): the three verdicts of the two books' comparison.  Named
     #: because withholding a wrong number without putting a word in its place
@@ -3305,6 +3311,7 @@ class TagCoverage:
             + f"empty={len(self.empty)} "
             + f"local_scratch={len(self.local_scratch)} "
             + (f"scratch_reason={LOCAL_SCRATCH_REASON} " if self.local_scratch else "")
+            + f"not_source={len(self.not_source)} "
             + (
             f"tms_answered={'yes' if self.tms_bytes else 'no'} "
             f"mode={self.mode}"
@@ -3577,6 +3584,11 @@ def build_coverage(
     """
     mode = mode if mode is not None else weight_source()
     live = walk_live_tensors(model, region_tag=region_tag)
+    # fnFL2x72: the rule the manifest and the plan already apply -- imported
+    # here (the shadow imports this module) rather than restated.
+    from sglang.srt.weg2.weight_exchange_shadow import not_a_source_here
+
+    excluded = not_a_source_here(model)
 
     tags = {t.tag for t in live if is_weights_family_tag(t.tag)}
     tags |= {t for t in planned_bytes_by_tag if is_weights_family_tag(t)}
@@ -3595,6 +3607,7 @@ def build_coverage(
         exempt: List[str] = []
         empty: List[str] = []
         local_scratch: List[str] = []
+        not_source: List[str] = []
         n_par = n_buf = n_attr = 0
 
         # Parameters and buffers first: they define WHICH allocations are
@@ -3685,6 +3698,14 @@ def build_coverage(
                     # side memsets it (``zero_local_scratch``).
                     local_scratch.append(t.name)
                     covered_storage.add(t.storage_key)
+                elif excluded(t.name) is not None:
+                    # fnFL2x72: the SAME rule the manifest and the plan apply
+                    # (`weight_exchange_shadow.not_a_source_here`).  A Form A
+                    # worker never computes with this tensor, a layout's own
+                    # `weight_shape` is read only at load: no destination page
+                    # to serve wrongly, so no refusal -- counted by name.
+                    not_source.append(t.name)
+                    covered_storage.add(t.storage_key)
                 else:
                     uncovered.append(t)
             elif t.kind == BUFFER:
@@ -3712,6 +3733,9 @@ def build_coverage(
             elif is_local_scratch(t.name):
                 local_scratch.append(t.name)
                 covered_storage.add(t.storage_key)
+            elif excluded(t.name) is not None:
+                not_source.append(t.name)
+                covered_storage.add(t.storage_key)
             else:
                 uncovered.append(t)
 
@@ -3728,6 +3752,7 @@ def build_coverage(
             exempt=tuple(sorted(exempt)),
             empty=tuple(sorted(empty)),
             local_scratch=tuple(sorted(local_scratch)),
+            not_source=tuple(sorted(not_source)),
             n_parameters=n_par,
             n_buffers=n_buf,
             n_attributes=n_attr,
