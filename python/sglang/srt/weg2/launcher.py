@@ -1706,6 +1706,12 @@ COLLECTIVE_CENSUS_INTERVAL = 50
 P_BARLINK_BAR1_WINDOW_MIB = "24,PP_0=96"
 #: Group P's device mamba pool (--max-mamba-cache-size); see argv_p.
 P_MAX_MAMBA_CACHE_SIZE = 24
+#: #1243/#1425 precision tail on D (--kv-tail-min-tokens). 0 = OFF. Design
+#: default is 16384 (basis 7.6), but slice 1 merges the tail on the DECODE
+#: wrapper path only; under MTP (law: ON) the target step is a verify-extend,
+#: so an armed tail would be a W56 no-op that stops the boot. Off until the
+#: verify path merges the tail (slice 2). Set per boot with --d-kv-tail-min-tokens.
+D_KV_TAIL_MIN_TOKENS = 0
 
 
 class Weg2LaunchRefused(RuntimeError):
@@ -3411,6 +3417,12 @@ def argv_d(
     ) + [
         # C1/K2: D's own bs, independent of P's by construction.
         "--max-running-requests", str(d_bs),
+    ] + (
+        ["--kv-tail-min-tokens", str(D_KV_TAIL_MIN_TOKENS)]
+        if D_KV_TAIL_MIN_TOKENS > 0
+        and not any(str(a).startswith("--kv-tail-min-tokens") for a in extra)
+        else []
+    ) + [
         # C11/K5: law 4 enforced where the uncached extent is REAL -- after
         # match_prefix, on extend_input_len, inside get_new_batch_prefill.
         # The front prices with len(text)/3.0 and never re-checks, so a
@@ -11353,6 +11365,11 @@ def build_parser() -> argparse.ArgumentParser:
     # against the disk (max_size >= P pool bytes, W57). The two knobs below are
     # the only ones the disk form has, and both have a stated default.
     ap.add_argument(
+        "--d-kv-tail-min-tokens", type=int, default=D_KV_TAIL_MIN_TOKENS,
+        help="#1243/#1425: group D's precision-tail minimum (bf16 rows for the newest "
+             "N tokens of every sequence, --kv-tail-min-tokens on D). 0 = off (default "
+             "until the MTP verify path merges the tail); the design default is 16384.")
+    ap.add_argument(
         "--pin-ledger-arm-s", type=int, default=1,
         help="#1422 (boot xsn172): the pinned arm's host KV pool S (GB) for group P. "
              "The ladder's S=1 gave PP0 a 54,254-token staging pool (cell 18,432 B), "
@@ -12591,6 +12608,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _ACTIVE_BOOT_STATE = None
     ns = build_parser().parse_args(argv)
     apply_spec_form(ns)
+    global D_KV_TAIL_MIN_TOKENS
+    D_KV_TAIL_MIN_TOKENS = int(getattr(ns, "d_kv_tail_min_tokens", D_KV_TAIL_MIN_TOKENS) or 0)
     # #1386: THE SWITCH IS RESOLVED HERE, ONCE, AS EARLY AS `ns` EXISTS --
     # earlier than `draft_kv_on_p` below, because the FIRST `common_flags`
     # call (the sentinel `chunk_tokens` solve, several hundred lines down)
