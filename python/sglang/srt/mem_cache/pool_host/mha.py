@@ -1397,7 +1397,16 @@ def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
     """
     if device_pool.head_dim != device_pool.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
-    if os.environ.get("SGLANG_HICACHE_ARENA_HOST", "0") == "1":
+    # fnFL2x23: the arena pool maps one slot per token and refuses a paged pool
+    # only at bind() -- by then it is built with just its staging ring
+    # (SGLANG_HICACHE_ARENA_STAGING_GB, 4096 tokens at 0.05 GB). Next Flash
+    # pages by 64: D's prefetch budget fell to 0.9 x 4096 = 3686 and the
+    # launcher refused the boot (W45 below_floor). A paged pool keeps the
+    # regular host pool.
+    if (
+        os.environ.get("SGLANG_HICACHE_ARENA_HOST", "0") == "1"
+        and int(device_pool.page_size) == 1
+    ):
         # #1424 Stufe 3: rows beyond the staging ring are arena slots
         from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
         return ArenaMHAHostPool
