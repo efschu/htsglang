@@ -196,3 +196,41 @@ def test_x10_the_shadow_never_reaches_the_disk_reload(monkeypatch):
     m = _shadow_manager(monkeypatch, tag_bytes=0)
     assert m._weg2_xchg_draft_reload_from_disk() is False
     assert m.draft_worker.calls == []
+
+
+# ---------------------------------------------------------------------------
+# fnFL2x11: the base tag's allocator slack on Form A's expert workers.
+# ---------------------------------------------------------------------------
+
+
+def _main_model_manager(monkeypatch, model):
+    monkeypatch.setenv(wx.WEIGHT_SOURCE_ENV, wx.WEIGHT_SOURCE_EXCHANGE)
+    monkeypatch.setenv(wx.INJECT_ENV, wx.INJECT_AUTHORITATIVE)
+    monkeypatch.setenv(wx.WEIGHTS_CPU_BACKUP_ENV, wx.WEIGHTS_CPU_BACKUP_AUTO)
+    return Manager(
+        tp_worker=types.SimpleNamespace(
+            model_runner=types.SimpleNamespace(model=model)),
+        draft_worker=None, tp_cpu_group=None, memory_saver_adapter=None,
+        flush_cache=lambda *a, **k: True, is_fully_idle=lambda *a, **k: True,
+    )
+
+
+def test_x11_segment_slack_without_a_tensor_is_not_a_gap(monkeypatch):
+    """D TP1/TP2: `tag=weights expected_bytes=2097152`, zero descriptors,
+    and no tensor of the base tag at all (the boot coverage printed no row)."""
+    m = _main_model_manager(monkeypatch, torch.nn.Module())
+    assert m._weg2_xchg_wake_source_gap(
+        "weights", cdescs_present=False, resident_bytes=2 << 20) is None
+
+
+def test_a_live_tensor_without_descriptors_still_refuses(monkeypatch):
+    """The danger direction: a tensor of the tag that nobody deposits."""
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.norm = torch.nn.Module()
+    model.model.norm.register_parameter(
+        "weight", torch.nn.Parameter(torch.ones(8), requires_grad=False))
+    m = _main_model_manager(monkeypatch, model)
+    assert m._weg2_tag_live_tensor_count("weights") == 1
+    assert m._weg2_xchg_wake_source_gap(
+        "weights", cdescs_present=False, resident_bytes=2 << 20) is not None

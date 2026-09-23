@@ -1698,6 +1698,14 @@ class SchedulerWeightUpdaterManager:
             # this same check with its own descriptors (weg2xsn83 PP2 for
             # weights_6/weights_7) and is the one that would refuse.
             return None
+        if not cdescs_present and self._weg2_tag_live_tensor_count(tag) == 0:
+            # fnFL2x11: Form A's expert workers hold 2 MiB (one allocator
+            # granule) under the BASE tag and not one tensor of it -- the
+            # boot coverage printed no row for it. Segment slack is carried
+            # by the exchange on no rank; the check exists for TENSORS whose
+            # bytes nobody deposits, and the walk that fed the coverage
+            # vote finds none here.
+            return None
         if not cdescs_present:
             return (
                 "weights_cpu_backup_armed()=False for this tag and the "
@@ -1707,6 +1715,22 @@ class SchedulerWeightUpdaterManager:
                 "at wake"
             )
         return None
+
+    def _weg2_tag_live_tensor_count(self, tag) -> Optional[int]:
+        """How many live tensors of ``tag`` the MAIN model holds on this rank,
+        by the boot coverage's own walk (parameters, buffers, attribute
+        tensors); ``None`` when unreadable -- the caller then keeps its
+        refusal."""
+        try:
+            from sglang.srt.weg2 import weight_exchange as wx
+
+            model = self.tp_worker.model_runner.model
+            if model is None:
+                return None
+            return sum(1 for t in wx.walk_live_tensors(model)
+                       if str(t.tag) == str(tag))
+        except BaseException:  # noqa: BLE001 -- unreadable is not "none"
+            return None
 
     def _weg2_draft_checkpoint_quantization(self) -> Optional[str]:
         """The quantization ACTUALLY IN FORCE for the draft checkpoint
