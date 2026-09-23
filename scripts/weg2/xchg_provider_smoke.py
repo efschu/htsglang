@@ -226,6 +226,9 @@ class _LegStub:
 
     _weg2_cocard_peer_alive = (
         wu.SchedulerWeightUpdaterManager._weg2_cocard_peer_alive)
+    # fnFL2x18: a collect leg zeroes its declared pad after the lanes.
+    _weg2_xchg_apply_zerofill = (
+        wu.SchedulerWeightUpdaterManager._weg2_xchg_apply_zerofill)
 
 
 class _Sems:

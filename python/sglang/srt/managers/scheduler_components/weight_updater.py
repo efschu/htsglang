@@ -5613,7 +5613,21 @@ class SchedulerWeightUpdaterManager:
             # they were the same number is exactly the error this whole ticket
             # is about; the weaker check is kept because it is sound, and the
             # complete one belongs where the boot-wide set exists.
-            _lanes = bx.group_descs_by_pair(descs)
+            # fnFL2x18: THE DECLARED PAD NEVER BECOMES A LANE. A ZEROFILL desc
+            # (the zero pad expert row every Form-A D rank carries per expert
+            # tensor, #74; the vocab pad) has no source, and
+            # `group_descs_by_pair` files it under its destination's DIAGONAL.
+            # On a tag whose layers the co-located P stage does not hold, that
+            # diagonal carried ONLY pad, and `_weg2_seq_lane_descs` -- which
+            # asks the join for (card, card) pieces, and a pad row has
+            # src_rank=-1 -- refused W68 "NO desc for lane src=2 dst=2
+            # tag='weights_9'" on D TP2 at the first P->D wake. Nor was the
+            # pad ever zeroed on this path: `apply_zerofill` ran only in the
+            # ring transport. It is an initialisation case, done below after
+            # the tag's lanes, on the collect side.
+            _zerofill = [d for d in descs if getattr(d, "kind", None) == wx.ZEROFILL]
+            _lanes = bx.group_descs_by_pair(
+                [d for d in descs if getattr(d, "kind", None) != wx.ZEROFILL])
             _priced = int(getattr(terms, "n_lanes", 1) or 1)
             if terms is not None and _priced < len(_lanes):
                 # #1358 [W102-wired] THE CODE MATCHES THE DEFECT. This raised
@@ -6037,7 +6051,41 @@ class SchedulerWeightUpdaterManager:
             raise bx.Weg2XchgBouncePhaseUnordered(
                 f"W68 Weg2XchgPlanDisagree: {len(_lane_failures)} lane(s) of "
                 f"this leg refused: " + " | ".join(_lane_failures[:6]))
+        if _zerofill and phase == bx.PHASE_COLLECT:
+            self._weg2_xchg_apply_zerofill(
+                ops=ops, descs=_zerofill, rank=rank, device=device, tag=tag)
         return last
+
+    def _weg2_xchg_apply_zerofill(self, *, ops, descs, rank, device, tag) -> int:
+        """Zero this rank's declared pad of one tag, after the tag's lanes.
+
+        The pad rows exist on no card and in no checkpoint, so nothing ever
+        delivers them; after a backup-off resume their pages hold whatever
+        the remap left. A pad row without an address is refused by name --
+        skipping it would leave exactly those bytes in place.
+        """
+        from sglang.srt.weg2 import weight_exchange as wx
+        from sglang.srt.weg2 import weight_exchange_transport as tp
+
+        my_rank = int(rank) if rank is not None and int(rank) >= 0 else int(self._weg2_rank())
+        mine = [d for d in descs if int(d.dst_rank) == my_rank]
+        unresolved = [str(d.param_name) for d in mine if d.dst_ptr is None]
+        if unresolved:
+            raise wx.Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: {len(unresolved)} of {len(mine)} "
+                f"ZEROFILL descs of tag={tag!r} have no destination address on "
+                f"rank {my_rank} (first {unresolved[0]!r}) -- the pad rows would "
+                f"keep whatever the resumed pages held")
+        stream = ops.create_stream(int(device))
+        try:
+            nbytes = tp.apply_zerofill(ops, stream, mine, my_rank)
+        finally:
+            ops.destroy_stream(stream)
+        logger.info(
+            "WEG2-XCHG ZEROFILL tag=%s rank=%d descs=%d bytes=%d -- the declared "
+            "pad (no source anywhere) zeroed after this tag's lanes",
+            tag, my_rank, len(mine), nbytes)
+        return nbytes
 
     # PATH (a) WAS DELETED HERE (#1342 S3), and the deletion is recorded
     # rather than silent so a re-introduction has to argue with it.

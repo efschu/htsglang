@@ -915,6 +915,9 @@ class _Stub:
                      # died with AttributeError before emitting a leg
                      # (measured, --evidence phase_manifest_* of xsn53).
                      "_weg2_owned_name_keys",
+                     # fnFL2x18: a collect leg zeroes its declared pad (the
+                     # D ranks' zero pad expert rows) after its lanes.
+                     "_weg2_xchg_apply_zerofill",
                      "_weg2_xchg_bounce_leg"):
             setattr(type(self), name, getattr(cls, name))
 
