@@ -90,6 +90,13 @@ def _main_argv(tag: str, *extra: str) -> list:
         "--weg2-xchg-census", _CENSUS,
         "--evidence-dir", _RING_EVIDENCE,
         "--ring-table-boot", _RING_TABLE_BOOT_STEM_SUBSTR,
+        # #1451: THE BOOT FORM since the arena entered the ledger (#1432): the
+        # host ring is off and the exchange injects authoritatively (every arm
+        # since weg2xsn2xx).  Without it the launcher's `auto` armed the
+        # fixture's ring-era evidence (host weights 42.96 GiB) beside the
+        # 33.6 GiB arena and no rung was fundable on the pinned quiet box.
+        "--weg2-weights-cpu-backup", "off",
+        "--weg2-xchg-inject", "authoritative",
         *extra,
     ]
 

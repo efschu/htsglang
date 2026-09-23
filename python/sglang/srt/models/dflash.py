@@ -13,20 +13,25 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.utils import tp_partition_size, tp_plan_active
+from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    should_apply_lm_head_quant_method,
+)
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
@@ -35,9 +40,12 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
     get_dflash_layer_types,
+    is_dense_head_weight,
     parse_dflash_draft_config,
 )
 from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
@@ -51,6 +59,79 @@ logger = logging.getLogger(__name__)
 # how the drafter ends up silently on the materialise+GEMM fallback (#274
 # round 7c).
 DEFAULT_DFLASH_BLOCK_SIZE = 16
+try:
+    from flashinfer import top_k as _flashinfer_top_k
+except ImportError:
+    _flashinfer_top_k = None
+
+
+def gather_candidate_topk(
+    lm_head, hidden: torch.Tensor, k: int, *, use_quant_head: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The TP half of :meth:`DFlashDraftModel.compute_candidates`: this rank's
+    lm_head-shard top-k, the two all-gathers (K logits/ids per rank, not the
+    vocab), the global top-k -> ``(global_ids [N, K] long, top_vals [N, K])``.
+    EVERY TP rank must call it -- under ``--speculative-draft-placement solo``
+    the shadows (no draft model, a meta selector) join with the host's
+    broadcast hidden rows via :func:`shadow_join_candidate_gather`."""
+    shard = lm_head.shard_indices
+    vals, ids = _radix_topk(
+        _project_candidate_logits(
+            hidden,
+            lm_head,
+            num_org=int(shard.num_org_elements),
+            use_quant_head=use_quant_head,
+        ),
+        k,
+    )
+    global_ids = ids.long() + int(shard.org_vocab_start_index)
+    gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
+    gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+    top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
+    return torch.gather(gathered_ids, -1, sel).long(), top_vals
+
+
+def shadow_join_candidate_gather(lm_head, hidden: torch.Tensor, k: int) -> torch.Tensor:
+    """A solo SHADOW's side of the host's ``compute_candidates``: the same
+    shard projection and all-gathers, the global candidate ids as result
+    (identical on every rank; the lattice and the sample stay on the host)."""
+    quant_method = getattr(lm_head, "quant_method", None)
+    use_quant_head = should_apply_lm_head_quant_method(lm_head, quant_method)
+    ids, _vals = gather_candidate_topk(lm_head, hidden, k, use_quant_head=use_quant_head)
+    return ids
+
+
+def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    # The selector's largest single cost: it reads the whole logits tensor.
+    if _flashinfer_top_k is not None:
+        return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
+    return torch.topk(scores, k, dim=-1)
+
+
+def _project_candidate_logits(
+    hidden: torch.Tensor, lm_head: nn.Module, *, num_org: int, use_quant_head: bool
+) -> torch.Tensor:
+    """Project draft hiddens through the target head, restricted to the org vocab."""
+    if not use_quant_head:
+        weight = lm_head.weight
+        return torch.matmul(hidden.to(weight.dtype), weight[:num_org].T)
+    # A packed weight can't be row-sliced to the org vocab like the dense path,
+    # and flashinfer's radix top-k rejects the crop view (non-contiguous), so
+    # mask the padded tail out of the top-k instead.
+    logits = lm_head.quant_method.apply(lm_head, hidden, None).contiguous()
+    if logits.shape[-1] > num_org:
+        logits[:, num_org:] = float("-inf")
+    return logits
+
+
+def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
+    """Honor explicit causality while preserving legacy layer defaults."""
+    _get = getattr(config, "get_text_config", None)
+    text_config = _get() if callable(_get) else config  # test stubs carry no wrapper
+    is_causal = getattr(text_config, "is_causal", None)
+    if is_causal is None:
+        return default
+    return AttentionType.DECODER if is_causal else AttentionType.ENCODER_ONLY
 
 
 def _get_dflash_layer_attention_params(
@@ -66,12 +147,22 @@ def _get_dflash_layer_attention_params(
         )
 
     layer_type = layer_types[layer_id]
+    # #1486 (upstream 0dab252ffc / #34524, on this line only the helper had
+    # survived the pick, unused): the checkpoint's ``is_causal`` decides.  The
+    # DFlash2 draft (lued W8, 5x sliding_attention) says is_causal=false --
+    # a block-diffusion draft attends BIDIRECTIONALLY over its mask block;
+    # run causal, the late slots of the 8-block are blind and the accept
+    # length stalls at ~2.3 (df2l4-l10) against upstream's 4.29 on the 5090.
     if layer_type == "full_attention":
-        return -1, AttentionType.ENCODER_ONLY
+        return -1, _get_dflash_attention_type(
+            config, default=AttentionType.ENCODER_ONLY
+        )
     if layer_type == "sliding_attention":
         sliding_window_size = get_dflash_attention_sliding_window_size(config)
         assert sliding_window_size is not None
-        return sliding_window_size, AttentionType.DECODER
+        return sliding_window_size, _get_dflash_attention_type(
+            config, default=AttentionType.DECODER
+        )
     raise ValueError(
         "Unsupported DFLASH draft layer type. "
         f"layer_types[{layer_id}]={layer_type!r}."
@@ -328,10 +419,131 @@ class DFlashMLP(nn.Module):
         return x
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size, taps):
+    blocks = hidden_states.unflatten(-1, (num_groups, group_size))
+    coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
+    out = coefficients[:, 0] * blocks
+    position = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+    if block_size & (block_size - 1) == 0:
+        position = position & (block_size - 1)
+    else:
+        position = position % block_size
+    for tap in range(1, taps):
+        shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+        out = out + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+    return out.flatten(-2)
+
+
+class DFlashGroupedConv(nn.Module):
+    """Grouped dynamic depthwise K-tap convolution across one DFlash block.
+
+    Each sublayer is wrapped: `prepare` convolves its input and returns the kernel
+    for `finish` to convolve its output, both from one projection of the input.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        block_size: int,
+        taps: int,
+        group_size: int,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        if hidden_size % group_size:
+            raise ValueError(
+                f"DFLASH conv_group_size={group_size} must divide "
+                f"hidden_size={hidden_size}."
+            )
+        hidden_size = int(hidden_size)
+        self.block_size = int(block_size)
+        self.taps = int(taps)
+        self.group_size = int(group_size)
+        self.num_groups = hidden_size // self.group_size
+        # [input/output, tap, channel], the layout training exports.
+        # Replicated on purpose: 2 * taps * hidden elements, ~41 kB per conv,
+        # against 13 MB for the projection below.
+        base_kernel = torch.zeros(2, self.taps, hidden_size)
+        base_kernel[:, 0] = 1.0
+        self.base_kernel = nn.Parameter(base_kernel)
+        # SHARDED (task #37 stage 2), and ROW-parallel rather than column-
+        # parallel. Both split the same [2*taps*num_groups, hidden] weight by
+        # the same ratio; the difference is the collective that puts the
+        # coefficients back together.
+        #
+        # Column-parallel would give each rank a slice of the GROUP axis and
+        # need an all-gather over it. Under an uneven plan those slices have
+        # DIFFERENT widths per rank, and the fork's dim=-1 all_gather is
+        # equal-size-only (parallel_state.GroupCoordinator.all_gather builds
+        # output_size = input_size[0] * world_size); the variable-size
+        # all_gatherv is dim-0 and pynccl-only. That leaves padding to the
+        # widest rank plus per-rank narrow+cat surgery, ten times per forward.
+        #
+        # Row-parallel needs none of it: the input is the replicated hidden
+        # state, each rank contracts its own slice of it, and ONE all-reduce of
+        # the full [.., 2*taps*num_groups] coefficient tensor -- the same shape
+        # on every rank, which is what keeps the collective sequence
+        # rank-uniform -- reconstructs the exact projection. The convolution
+        # itself stays replicated: it folds the FULL hidden channels, and
+        # sharding it would move [.., hidden] instead of [.., 2*taps*groups].
+        #
+        # Units are 16-element groups of the CONTRACTION (hidden) axis, the
+        # same alignment rationale as DFlashMLP; the conv's own group_size
+        # never enters here, because this axis is contracted away.
+        _proj_units = hidden_size // math.gcd(hidden_size, 16)
+        self.kernel_projection = RowParallelLinear(
+            hidden_size,
+            2 * self.taps * self.num_groups,
+            bias=False,
+            input_is_parallel=False,
+            prefix=add_prefix("kernel_projection", prefix),
+            tp_units=_proj_units,
+        )
+
+    def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
+        # Marked here, not inside: by the time the compiled function traces, the dim
+        # is symbolic and the group index costs an integer div and mod per element.
+        torch._dynamo.mark_static(hidden_states, 1)
+        torch._dynamo.mark_static(delta, 1)
+        torch._dynamo.mark_static(delta, 2)
+        return _grouped_conv(
+            hidden_states,
+            delta,
+            self.base_kernel[side],
+            self.block_size,
+            self.num_groups,
+            self.group_size,
+            self.taps,
+        )
+
+    def prepare(self, hidden_states: torch.Tensor):
+        # RowParallelLinear returns (output, bias); bias is None (bias=False),
+        # and the output is already all-reduced back to the full group axis.
+        projected, _ = self.kernel_projection(hidden_states)
+        coefficients = projected.reshape(
+            *hidden_states.shape[:-1], 2, self.taps, self.num_groups
+        )
+        return (
+            self._convolve(hidden_states, coefficients[..., 0, :, :], side=0),
+            coefficients[..., 1, :, :],
+        )
+
+    def finish(self, hidden_states: torch.Tensor, coefficients) -> torch.Tensor:
+        return self._convolve(hidden_states, coefficients, side=1)
+
+
 class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
 
-    def __init__(self, config, layer_id: int, quant_config=None) -> None:
+    def __init__(
+        self,
+        config,
+        layer_id: int,
+        attention_conv: Optional[DFlashGroupedConv] = None,
+        mlp_conv: Optional[DFlashGroupedConv] = None,
+        quant_config=None,
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
@@ -342,6 +554,9 @@ class DFlashDecoderLayer(nn.Module):
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = DFlashMLP(config=config, quant_config=quant_config)
+
+        self.attention_conv = attention_conv
+        self.mlp_conv = mlp_conv
 
     def forward(
         self,
@@ -363,13 +578,26 @@ class DFlashDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        attention_kernel = None
+        if self.attention_conv is not None:
+            hidden_states, attention_kernel = self.attention_conv.prepare(hidden_states)
+
         attn_out = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        if attention_kernel is not None:
+            attn_out = self.attention_conv.finish(attn_out, attention_kernel)
+
         hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+
+        mlp_kernel = None
+        if self.mlp_conv is not None:
+            hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if mlp_kernel is not None:
+            hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
         return hidden_states, residual
 
 
@@ -392,11 +620,31 @@ class DFlashDraftModel(nn.Module):
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
+        draft_config = self.draft_config = parse_dflash_draft_config(
+            draft_hf_config=config
+        )
+        self.block_size = draft_config.resolve_block_size(default=16)
+        self.candidate_selector: Optional[nn.Module] = None
+
+        def grouped_conv(conv_prefix: str):
+            if not draft_config.conv_kernel_size:
+                return None
+            return DFlashGroupedConv(
+                hidden_size,
+                self.block_size,
+                draft_config.conv_kernel_size,
+                draft_config.conv_group_size,
+                prefix=add_prefix(conv_prefix, prefix),
+            )
 
         self.layers = nn.ModuleList(
             [
                 self.decoder_layer_cls(
-                    config=config, layer_id=i, quant_config=quant_config
+                    config=config,
+                    layer_id=i,
+                    attention_conv=grouped_conv(f"layers.{i}.attention_conv"),
+                    mlp_conv=grouped_conv(f"layers.{i}.mlp_conv"),
+                    quant_config=quant_config,
                 )
                 for i in range(num_layers)
             ]
@@ -407,18 +655,19 @@ class DFlashDraftModel(nn.Module):
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
         # feature tensors concatenated per token (not necessarily equal to num_layers).
         draft_config = parse_dflash_draft_config(draft_hf_config=config)
-        target_num_layers = (
-            int(draft_config.num_target_layers)
-            if draft_config.num_target_layers is not None
-            else num_layers
-        )
+        if draft_config.num_target_layers is not None:
+            target_num_layers = int(draft_config.num_target_layers)
+        elif draft_config.target_layer_ids is not None:
+            target_num_layers = max(draft_config.target_layer_ids) + 1
+        else:
+            target_num_layers = num_layers
         target_layer_ids = draft_config.resolve_target_layer_ids(
             target_num_layers=target_num_layers, draft_num_layers=num_layers
         )
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        # ReplicatedLinear rather than nn.Linear, so ``fc`` can take a PACKED
+        # A parallel linear rather than nn.Linear, so ``fc`` can take a PACKED
         # weight. It is by far the largest single tensor in the draft (for
         # Qwen3.6-27B: [25600, 5120], 131 M of the checkpoint's 1.73 G
         # parameters), and every quantised DFLASH artefact in the wild ships it
@@ -426,23 +675,53 @@ class DFlashDraftModel(nn.Module):
         # dense one, which made the whole checkpoint unloadable rather than
         # just this tensor.
         #
-        # REPLICATED and not column/row-parallel on purpose: ``fc`` consumes the
-        # concatenated target-layer features and produces the draft's hidden
-        # state, which every rank needs in full. It is also the shape that makes
-        # solo placement (draft weight-TP=1 on one host rank) the same code
-        # path as the split one.
-        self.fc = ReplicatedLinear(
-            self.num_context_features * hidden_size,
+        # ROW-parallel (task #37 stage 2), replacing the replicated form. The
+        # input is the concatenation of the K target-layer hidden states, and
+        # every rank holds it IN FULL -- the target's hidden states are
+        # replicated after its own TP all-reduce -- so ``input_is_parallel`` is
+        # False and the layer cuts the contraction axis itself, by the shard
+        # plan (RowParallelLinear.forward). The output all-reduce restores the
+        # full draft hidden state that every rank needs.
+        #
+        # Units are 16-element groups of the contraction axis, so any weight
+        # vector works and not only the ones whose sum divides K*hidden; no
+        # family, because this axis is the target's hidden dim K times over and
+        # has nothing to do with the "mlp" family's intermediate size.
+        #
+        # Under solo placement the draft is built with tp_size=1 (ModelRunner
+        # overrides the parallel context for the host AND the shadows), so this
+        # is a plain local matmul with no collective -- the same code path as
+        # the split one, which is what made the replicated form attractive
+        # before the bytes mattered.
+        _fc_in = self.num_context_features * hidden_size
+        _fc_units = _fc_in // math.gcd(_fc_in, 16)
+        self.fc = RowParallelLinear(
+            _fc_in,
             hidden_size,
             bias=False,
+            input_is_parallel=False,
             quant_config=quant_config,
             prefix=add_prefix("fc", prefix),
+            tp_units=_fc_units,
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         self.block_size = draft_config.resolve_block_size(
             default=DEFAULT_DFLASH_BLOCK_SIZE
         )
+
+    def set_block_size(self, block_size: int) -> None:
+        """Adopt the block size the worker resolved.
+
+        The convolutions are built from the checkpoint's block_size, which
+        --speculative-num-draft-tokens may override; the layout they index
+        depends on it, so the resolved value has to reach them.
+        """
+        self.block_size = int(block_size)
+        for layer in self.layers:
+            for conv in (layer.attention_conv, layer.mlp_conv):
+                if conv is not None:
+                    conv.block_size = self.block_size
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
@@ -454,9 +733,12 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        # ``input_size`` rather than ``in_features``: ReplicatedLinear carries
-        # the logical shape under its own name, and it is the only one that
-        # survives quantisation (a packed weight has no ``in_features``).
+        # ``input_size`` rather than ``in_features``: the parallel linears
+        # carry the LOGICAL (unsharded) shape under that name, and it is the
+        # only one that survives quantisation (a packed weight has no
+        # ``in_features``) AND sharding (``weight.shape[1]`` is this rank's
+        # slice of the contraction axis, not the feature count the caller has
+        # to hand in).
         expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
@@ -467,7 +749,8 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        # ReplicatedLinear returns (output, bias); bias is None here (bias=False).
+        # RowParallelLinear returns (output, bias); bias is None (bias=False),
+        # and the output is already all-reduced across the TP group.
         projected, _ = self.fc(target_hidden)
         return self.hidden_norm(projected)
 
@@ -517,17 +800,29 @@ class DFlashDraftModel(nn.Module):
         params_dict = dict(self.named_parameters())
 
         def resolve_param_name(name: str) -> Optional[str]:
-            if name in params_dict:
-                return name
-            if name.startswith("model."):
-                stripped_name = name[len("model.") :]
-                if stripped_name in params_dict:
-                    return stripped_name
-            else:
-                prefixed_name = f"model.{name}"
-                if prefixed_name in params_dict:
-                    return prefixed_name
+            for candidate in _name_candidates(name):
+                if candidate in params_dict:
+                    return candidate
             return None
+
+        def _name_candidates(name: str) -> Iterable[str]:
+            forms = [name]
+            if name.startswith("model."):
+                forms.append(name[len("model.") :])
+            else:
+                forms.append(f"model.{name}")
+            for form in forms:
+                yield form
+                # The selector codebooks are MODULES now
+                # (VocabParallelEmbedding, task #37 stage 2), not bare
+                # nn.Parameters: the checkpoint's
+                # `candidate_selector.successor_codebook` is this model's
+                # `candidate_selector.successor_codebook.weight`. Scoped to the
+                # codebook names rather than "try `.weight` on anything", so a
+                # checkpoint tensor that merely shares a module's name cannot
+                # be silently absorbed by it.
+                if form.endswith("_codebook"):
+                    yield f"{form}.weight"
 
         loaded_params: set[str] = set()
 
@@ -555,16 +850,21 @@ class DFlashDraftModel(nn.Module):
                 # there is nothing to compare here; that case is caught on the
                 # first forward by project_target_hidden, which checks the same
                 # quantity against the same config field.
-                if resolved_name.endswith("fc.weight") and tuple(
-                    loaded_weight.shape
-                ) != tuple(param.shape):
-                    raise ValueError(
-                        "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
-                        "number of context features (K) does not match this config. "
-                        f"Expected fc.weight.shape={tuple(param.shape)} "
-                        f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
-                        f"but got {tuple(loaded_weight.shape)} for weight '{name}'."
-                    )
+                #
+                # Compared against the LOGICAL shape, not ``param.shape``: fc
+                # is row-parallel since task #37 stage 2, so under TP>1 this
+                # rank's parameter holds only its slice of the contraction
+                # axis while the checkpoint tensor is always the full one.
+                if resolved_name.endswith("fc.weight"):
+                    logical = (int(self.fc.output_size), int(self.fc.input_size))
+                    if tuple(loaded_weight.shape) != logical:
+                        raise ValueError(
+                            "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
+                            "number of context features (K) does not match this config. "
+                            f"Expected fc.weight.shape={logical} "
+                            f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
+                            f"but got {tuple(loaded_weight.shape)} for weight '{name}'."
+                        )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(resolved_name)
@@ -690,4 +990,274 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return self.hidden_norm(self.fc(fused))
 
 
-EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM]
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _score_edges(
+    *,
+    keys: torch.Tensor,
+    predecessors: torch.Tensor,
+    unary_logits: torch.Tensor,
+    hidden: torch.Tensor,
+) -> torch.Tensor:
+    """The pure arithmetic of the lattice, with the two codebook ROWS already
+    looked up by the caller.
+
+    The lookups used to happen in here. They moved out when the codebooks
+    became vocab-parallel (task #37 stage 2): a sharded lookup ends in an
+    all-reduce, and a collective inside a torch.compile region is a graph break
+    at best and a captured-but-wrong collective at worst. Everything that is
+    left is elementwise plus one einsum, which is what this region was
+    compiled for anyway."""
+    return unary_logits[:, :, None] + torch.einsum(
+        "blpr,blcr->blpc", predecessors * hidden[:, :, None], keys
+    )
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def _follow_maps(maps, initial_indices, edges: int):
+    index = initial_indices
+    path = [index]
+    for edge in range(edges):
+        index = maps[:, edge].gather(-1, index[:, None])[:, 0]
+        path.append(index)
+    return torch.stack(path, dim=1)
+
+
+class CandidateSelector(nn.Module):
+    """Scores the K x K transitions between adjacent proposal slots, then walks them.
+
+    The two [vocab, r] tables are VOCAB-PARALLEL (task #37 stage 2), exactly
+    like the LM head: each rank holds a contiguous band of rows, masks the ids
+    outside it to zero, and one all-reduce per table puts the gathered rows
+    back together. Candidate ids are global -- ``compute_candidates``
+    all-gathers the per-shard top-k and re-ranks, so every rank asks for the
+    same ids -- which is why a masked lookup plus a sum is exact here and not
+    merely close: the ranks that do not own a row contribute a zero row.
+
+    They used to be replicated ("any rank can need any row", which is true and
+    is what the mask is for). At 248320 x 256 bf16 that was 254 MB on EVERY
+    rank of the TP3 layout, the single largest replicated block in the draft.
+
+    Under ``--speculative-draft-placement solo`` the draft is built with
+    tp_size=1, so VocabParallelEmbedding holds the whole table, skips the mask
+    and runs no collective -- the shadows never call this module at all.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        vocab_size: int,
+        state_rank: int,
+        top_k: int,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        if _flashinfer_top_k is None:
+            logger.warning(
+                "flashinfer is unavailable; the DFlash2 selector falls back to "
+                "torch.topk, which roughly halves end-to-end throughput on a large "
+                "vocabulary."
+            )
+        state_rank = int(state_rank)
+        self.top_k = int(top_k)
+        self.vocab_size = int(vocab_size)
+        self.state_rank = state_rank
+        # No quant_config: these two tables ship dense in every DFLASH2
+        # artefact so far, and they were bare nn.Parameters before -- a
+        # quantised codebook would have been unloadable then too. The
+        # embedding-dim is the selector rank, not a hidden size, so the
+        # vocab-parallel layer is used purely for its ROW sharding.
+        self.predecessor_codebook = VocabParallelEmbedding(
+            self.vocab_size,
+            state_rank,
+            prefix=add_prefix("predecessor_codebook", prefix),
+        )
+        self.successor_codebook = VocabParallelEmbedding(
+            self.vocab_size,
+            state_rank,
+            prefix=add_prefix("successor_codebook", prefix),
+        )
+        self.hidden_projection = nn.Linear(hidden_size, state_rank, bias=False)
+
+    def build_lattice(
+        self,
+        *,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """score[b,e,p,c] = unary[b,e,c] + <A[pred[b,e,p]] * project(h[b,e]), B[c]>
+
+        pred is cand[b,e-1], and the verified anchor for slot 0.
+        """
+        hidden = self.hidden_projection(hidden_states)
+        # Concatenate the ids and look them up once. Concatenating the looked-up
+        # rows instead moves a [b, slots, k, rank] float tensor where this moves
+        # one id per candidate, and it costs a second gather for the anchor.
+        predecessor_ids = torch.cat(
+            [
+                anchor_token_ids[:, None, None].expand(-1, 1, self.top_k),
+                candidate_ids[:, :-1],
+            ],
+            dim=1,
+        )
+        # OUTSIDE the compiled region below, on purpose: each of these is a
+        # masked lookup plus an all-reduce under TP>1 (no-ops at tp_size=1),
+        # and a collective does not belong in a compile graph. Both are issued
+        # by every rank, in this order, with the same shapes -- the collective
+        # sequence stays rank-uniform even though the shard widths differ.
+        keys = self.successor_codebook(candidate_ids)
+        predecessors = self.predecessor_codebook(predecessor_ids)
+        # Everything but the batch is a model constant. Left symbolic, inductor
+        # recovers indices with an integer division per element instead of folding.
+        for tensor in (unary_logits, hidden):
+            torch._dynamo.mark_static(tensor, 1)
+            torch._dynamo.mark_static(tensor, 2)
+        for tensor in (keys, predecessors):
+            torch._dynamo.mark_static(tensor, 1)
+            torch._dynamo.mark_static(tensor, 2)
+            torch._dynamo.mark_static(tensor, 3)
+        return _score_edges(
+            keys=keys,
+            predecessors=predecessors,
+            unary_logits=unary_logits,
+            hidden=hidden,
+        )
+
+    def sample_path(
+        self,
+        *,
+        candidate_ids: torch.Tensor,
+        scores: torch.Tensor,
+        uniforms: torch.Tensor,
+        temperatures: torch.Tensor,
+        greedy_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Walk one path, with q over the K candidates for the verify. greedy_mask
+        rows take the argmax, selected rather than branched, so one captured graph
+        serves greedy and sampling batches alike."""
+        if scores.is_cuda:
+            return selector_walk_triton(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                uniforms=uniforms,
+                temperatures=temperatures,
+                greedy_mask=greedy_mask,
+            )
+        top_k = self.top_k
+        temps = temperatures.view(-1, 1)
+        initial_probs = torch.softmax(scores[:, 0, 0].float() / temps, dim=-1)
+        initial_indices = (
+            uniforms[:, :1]
+            .ge(initial_probs.cumsum(dim=-1))
+            .sum(dim=-1)
+            .clamp_max(top_k - 1)
+        )
+        transition_probs = torch.softmax(
+            scores[:, 1:].float() / temps[:, :, None, None], dim=-1
+        )
+        local_maps = (
+            uniforms[:, 1:, None, None]
+            .ge(transition_probs.cumsum(dim=-1))
+            .sum(dim=-1)
+            .clamp_max(top_k - 1)
+        )
+        initial_indices = torch.where(
+            greedy_mask, scores[:, 0, 0].argmax(dim=-1), initial_indices
+        )
+        local_maps = torch.where(
+            greedy_mask[:, None, None], scores[:, 1:].argmax(dim=-1), local_maps
+        )
+        torch._dynamo.mark_static(local_maps, 1)
+        torch._dynamo.mark_static(local_maps, 2)
+        path_indices = _follow_maps(
+            local_maps, initial_indices, int(scores.shape[1]) - 1
+        )
+        tokens = candidate_ids.gather(-1, path_indices.unsqueeze(-1))[:, :, 0]
+        realized_rows = transition_probs.gather(
+            2, path_indices[:, :-1, None, None].expand(-1, -1, 1, top_k)
+        )[:, :, 0]
+        q_rows = torch.cat((initial_probs.unsqueeze(1), realized_rows), dim=1)
+        # Greedy rows walk the argmax, so their q is the point mass there, not
+        # the temperature-1 softmax above. The triton walk stores the same.
+        q_rows = torch.where(
+            greedy_mask[:, None, None], F.one_hot(path_indices, top_k).float(), q_rows
+        )
+        return tokens, q_rows
+
+
+class DFlash2DraftModel(DFlashDraftModel):
+    """DFlash backbone + candidate selector. Reuses the DFLASH speculative worker."""
+
+    def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        draft_config = self.draft_config
+        if not draft_config.selector_rank:
+            raise ValueError(
+                "DFlash selector draft requires dflash_config.selector_rank."
+            )
+        self.candidate_selector = CandidateSelector(
+            hidden_size=int(config.hidden_size),
+            vocab_size=int(config.vocab_size),
+            state_rank=draft_config.selector_rank,
+            top_k=draft_config.selector_top_k,
+            prefix=add_prefix("candidate_selector", prefix),
+        )
+        # The draft has no head of its own; the worker points this at the target's
+        # before capture.
+        self.lm_head: Optional[nn.Module] = None
+
+    def _transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        logits = logits.float()
+        if self.draft_config.output_multiplier != 1.0:
+            logits.mul_(self.draft_config.output_multiplier)
+        softcap = self.draft_config.final_logit_softcapping
+        if softcap is not None:
+            logits.div_(softcap).tanh_().mul_(softcap)
+        return logits
+
+    def compute_candidates(
+        self, hidden: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Top-k base candidates via the target lm_head: hidden [N, H] -> global
+        candidate_ids / unary_logits [N, K]. Under TP (vocab-sharded lm_head): local top-k
+        per shard, all-gather K logits/ids (not the full vocab), then a global top-k --
+        identical candidates at O(tp*K) instead of O(vocab) gather bandwidth."""
+        assert self.lm_head is not None, "draft_model.lm_head unset before capture"
+        k = self.candidate_selector.top_k
+        # The worker screens the head before capture, but its eager fallback
+        # (_propose_selector_block) attaches whatever the target has.
+        weight = getattr(self.lm_head, "weight", None)
+        quant_method = getattr(self.lm_head, "quant_method", None)
+        use_quant_head = should_apply_lm_head_quant_method(self.lm_head, quant_method)
+        if not use_quant_head and not is_dense_head_weight(weight):
+            raise RuntimeError(
+                "DFlash2 selector requires a dense FP16/BF16/FP32 target lm_head "
+                "or a supported lm_head.quant_method."
+            )
+        if get_parallel().tp_size == 1:
+            org = int(self.lm_head.org_vocab_size)
+            vals, ids = _radix_topk(
+                _project_candidate_logits(
+                    hidden, self.lm_head, num_org=org, use_quant_head=use_quant_head
+                ),
+                k,
+            )
+            return ids.long(), self._transform_unary_logits(vals)
+        ids, top_vals = gather_candidate_topk(
+            self.lm_head, hidden, k, use_quant_head=use_quant_head
+        )
+        return ids, self._transform_unary_logits(top_vals)
+
+
+class MuseGlimmerAssistantModel(DFlashDraftModel):
+    """Alias for checkpoints declaring architectures=["MuseGlimmerAssistantModel"]."""
+
+
+EntryClass = [
+    DFlashDraftModel,
+    DFlashLagunaForCausalLM,
+    MuseGlimmerAssistantModel,
+    DFlash2DraftModel,
+]

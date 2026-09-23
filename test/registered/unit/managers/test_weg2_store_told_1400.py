@@ -6,6 +6,7 @@ danger direction is a rank ADMITTING without a told verdict (the W27 width
 split): every admission assertion here fails if `admission` is bypassed.
 """
 
+import types
 import os
 from types import SimpleNamespace
 
@@ -321,3 +322,108 @@ def test_follower_that_already_holds_the_told_span_is_satisfied_without_a_read()
     s.tree_cache.register("eeee0002", loaded=0, flips=0)
     with pytest.raises(m.Weg2StoreToldMismatch):
         m.admission(s, r2, note)
+
+
+# ---- #1416: told is anchor-clamped like the followers' presence probe ------
+
+
+def test_1416_told_is_clamped_to_the_anchored_presence():
+    from sglang.srt.managers import weg2_store_told as wst
+
+    class _Backend:
+        hit = 4095
+
+        def batch_exists_v2(self, keys, transfers, extra):
+            assert len(keys) == 53247, "the WHOLE span, not a 128-page batch (#1416c)"
+            return types.SimpleNamespace(kv_hit_pages=self.hit)
+
+    class _CC:
+        page_size = 1
+        storage_backend = _Backend()
+
+        def get_hash_str(self, ids, last_hash, page_size=1):
+            return ["h%d" % i for i in range(len(ids))]
+
+        def _presence_pool_transfers(self):
+            return ["mamba"]
+
+    class _Req:
+        origin_input_ids = list(range(60000))
+        rid = "abcdef0123456789"
+
+    sched = types.SimpleNamespace(cache_controller=_CC())
+    assert wst._anchor_clamp(sched, _Req(), 53247) == 4095
+    _Backend.hit = 99999
+    assert wst._anchor_clamp(sched, _Req(), 53247) == 53247, "never above completed"
+    sched.cache_controller.get_hash_str = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x"))
+    assert wst._anchor_clamp(sched, _Req(), 53247) == 53247, "unaskable: no clamp"
+    assert wst._anchor_clamp(types.SimpleNamespace(), _Req(), 7) == 7, "no probe: no clamp"
+    assert wst._anchor_clamp(sched, _Req(), 0) == 0
+
+
+def test_1416b_pp0_record_follows_the_clamp(monkeypatch):
+    """xsn169: a clamped told must also clamp PP0's own completed record, or
+    PP0's admission raises the mismatch against itself."""
+    from sglang.srt.managers import weg2_store_told as wst
+
+    class _Tree:
+        _prefetch_completed_tokens = {"r1": 4095}
+
+        def check_prefetch_progress(self, rid):
+            return True
+
+        def completed_prefetch_tokens(self, rid):
+            return self._prefetch_completed_tokens.get(rid)
+
+    class _Req:
+        rid = "r1"
+        origin_input_ids = list(range(8000))
+        prefetch_deferred = None
+
+    class _CC:
+        page_size = 1
+        storage_backend = types.SimpleNamespace(
+            batch_exists_v2=lambda keys, t, e: types.SimpleNamespace(kv_hit_pages=0))
+
+        def get_hash_str(self, ids, last_hash, page_size=1):
+            return ["h"] * len(ids)
+
+        def _presence_pool_transfers(self):
+            return ["mamba"]
+
+    req = _Req()
+    sched = types.SimpleNamespace(
+        tree_cache=_Tree(), cache_controller=_CC(), waiting_queue=[req],
+        _weg2_store_held={"r1": req}, _weg2_store_told={},
+    )
+    out = wst.pp0_publish(sched, [])
+    assert [o.told for o in out] == [0]
+    assert sched.tree_cache._prefetch_completed_tokens["r1"] == 0
+    assert sched._weg2_store_told["r1"] == 0
+
+
+def test_1419_told_caps_the_radix_match_on_every_rank():
+    from sglang.srt.managers import weg2_store_told as wst
+    from sglang.srt.managers.schedule_batch import _weg2_cap_key_limit
+
+    class _Tree:
+        def check_prefetch_progress(self, rid):
+            return True
+
+        def completed_prefetch_tokens(self, rid):
+            return 4095
+
+        def pop_prefetch_loaded_tokens(self, rid):
+            return 0
+
+    req = types.SimpleNamespace(rid="r9")
+    sched = types.SimpleNamespace(
+        tree_cache=_Tree(), _weg2_store_told={"r9": 4095},
+        _weg2_store_told_satisfied={}, ps=types.SimpleNamespace(pp_rank=1),
+    )
+    assert wst.admission(sched, req, lambda *a: None) == 0
+    assert req._weg2_prefix_cap == 4095
+    assert _weg2_cap_key_limit(req, None) == 4095
+    assert _weg2_cap_key_limit(req, 100000) == 4095
+    assert _weg2_cap_key_limit(req, 10) == 10
+    assert _weg2_cap_key_limit(types.SimpleNamespace(), 77) == 77

@@ -274,6 +274,72 @@ def _local_prefix(req) -> int:
         return 0
 
 
+def _anchored_pages_full_span(cc, ids, page_size: int):
+    """#1416c (boot xsn174): ``store_presence_pages`` asks the store about
+    the FIRST ``STORAGE_BATCH_SIZE`` (128) pages only -- a 98,550-token span
+    whose anchor sits on its last page answered 0, so told was clamped to 0
+    and P recomputed 98k tokens it had just read back from the arena. Ask
+    the whole span, the way ``_storage_hit_query`` does: one
+    ``batch_exists_v2`` over every page key with the tree's component
+    transfers (the mamba anchor is the trailing-pages pool). None = the
+    question could not be asked.
+    """
+    try:
+        hashes = cc.get_hash_str(list(ids), None, page_size=page_size)
+        if not hashes:
+            return 0
+        transfers = cc._presence_pool_transfers()
+        backend = cc.storage_backend
+        from sglang.srt.mem_cache.hicache_storage import HiCacheStorageExtraInfo
+        extra = HiCacheStorageExtraInfo(prefix_keys=None)
+        if transfers:
+            return int(backend.batch_exists_v2(list(hashes), transfers, extra).kv_hit_pages or 0)
+        return int(backend.batch_exists(list(hashes), extra) or 0)
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        logger.warning("#1416c full-span anchor probe unavailable: %r", exc)
+        return None
+
+
+def _anchor_clamp(scheduler, req, told: int) -> int:
+    """#1416 (boots xsn159/162/167): the completed prefix counts KV pages; the
+    admission match accepts a prefix only up to the deepest page that also
+    carries a mamba anchor. PP0 published told=53247 from a host-budget-
+    truncated read (no anchor inside the span), its own match then refused
+    the whole span ("MambaComponent:absent"), and the followers -- whose
+    presence probe IS anchor-clamped since #869b -- answered store_absent:
+    told mismatch, rank exit. Ask the same anchor-clamped question here, so
+    told never names a prefix no rank can admit. Unavailable probe = no
+    clamp (the pre-#1416 number), never a silent zero.
+    """
+    if told <= 0:
+        return int(told)
+    try:
+        cc = getattr(scheduler, "cache_controller", None) or getattr(
+            getattr(scheduler, "tree_cache", None), "cache_controller", None
+        )
+        ids = getattr(req, "origin_input_ids", None)
+        if cc is None or not callable(getattr(cc, "get_hash_str", None)) or not ids:
+            return int(told)
+        page_size = int(getattr(cc, "page_size", 1) or 1)
+        pages = _anchored_pages_full_span(cc, list(ids[: int(told)]), page_size)
+        if pages is None:
+            # the full-span question could not be asked: no clamp (the
+            # pre-#1416 number; #1419 caps every rank's match to told, so a
+            # too-large told recomputes on all ranks alike, it never diverges)
+            return int(told)
+        anchored = min(int(told), pages * page_size)
+        if anchored < int(told):
+            logger.warning(
+                "#1416 STORE-TOLD ANCHOR-CLAMP rid=%s completed=%d anchored=%d: the "
+                "span beyond the deepest mamba anchor is not admissible on any rank",
+                rid8(req), int(told), anchored,
+            )
+        return anchored
+    except Exception as exc:  # noqa: BLE001 - a probe never breaks publication
+        logger.warning("#1416 anchor clamp skipped for rid=%s: %r", rid8(req), exc)
+        return int(told)
+
+
 def pp0_publish(scheduler, recv_reqs: List) -> List:
     """Top of a PP0 pass, before the forward: turn terminated prefetches of
     held rids into ``Weg2StoreTold`` objects appended to the outgoing list.
@@ -298,6 +364,17 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
         if not tree.check_prefetch_progress(rid):
             continue
         told = _completed_prefix(tree, rid)
+        clamped = _anchor_clamp(scheduler, req, told)
+        if clamped != told:
+            # #1416b (boot xsn169): PP0's OWN admission compares its recorded
+            # completed prefix with told; a clamped told against the stale
+            # record (told=0 vs own=4095) stopped PP0 itself. The record is
+            # "what this rank can admit" -- clamp it with the same number.
+            try:
+                tree._prefetch_completed_tokens[rid] = int(clamped)
+            except Exception:  # noqa: BLE001 - a tree without the dict keeps its number
+                pass
+        told = clamped
         told_map[rid] = told
         held.pop(rid, None)
         out.append(Weg2StoreTold(rid=rid, told=told))
@@ -318,7 +395,7 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     return list(recv_reqs) + out
 
 
-def follower_absorb(scheduler, recv_reqs: List) -> List:
+def _follower_absorb_impl(scheduler, recv_reqs: List) -> List:
     """After the forward, before dispatch: take the told objects off the list,
     store them, and register the held requests' prefetch with the told span."""
     if not any(isinstance(r, Weg2StoreTold) for r in recv_reqs):
@@ -363,6 +440,12 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
         note_skip(SKIP_TOLD_PENDING, rid)
         return None
     tree = scheduler.tree_cache
+    # #1419: told bounds this rank's radix match (schedule_batch
+    # _weg2_cap_key_limit) so no rank -- PP0 included -- admits more than told.
+    try:
+        req._weg2_prefix_cap = int(told)
+    except Exception:  # noqa: BLE001
+        pass
     satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None) or {}
     if rid in satisfied:
         # registered nothing because it already held the span (see
@@ -410,3 +493,8 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
     # `storage_hit_length` / cached_tokens_storage, informational); the
     # uniform fact -- the prefix -- was just checked against told.
     return credit
+
+
+from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed  # noqa: E402
+
+follower_absorb = _pass_timed("_1475_absorb_ms")(_follower_absorb_impl)  # #1475

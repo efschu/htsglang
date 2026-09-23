@@ -215,7 +215,14 @@ def test_the_loader_is_declared_buffered_so_a_planner_quotes_the_right_rate():
 def test_checkpoint_names_are_mapped_onto_module_names(shard):
     sd = vsl.tower_state_dict(str(shard), meta=True)
     mapped = vsl.strip_checkpoint_prefix(sd)
-    assert "blocks.0.attn.qkv.weight" in mapped
+    # CORRECTED after metal boot xsn406: this line used to assert
+    # `blocks.0.attn.qkv.weight`, i.e. it pinned the prefix strip alone as
+    # sufficient -- and that is precisely the defect. The module's parameter is
+    # `attn.qkv_proj` (VisionAttention, use_qkv_parallel=True), so the old
+    # expectation was the 54-unfilled-parameter refusal written down as a
+    # passing test. See test_vision_tower_name_mapping_0920.py.
+    assert "blocks.0.attn.qkv_proj.weight" in mapped
+    assert "blocks.0.attn.qkv.weight" not in mapped
     assert "merger.linear_fc2.weight" in mapped
     assert not any(k.startswith("model.") for k in mapped)
     assert len(mapped) == len(sd)

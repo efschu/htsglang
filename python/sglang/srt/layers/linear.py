@@ -34,6 +34,7 @@ from sglang.srt.distributed.utils import (
     attn_q_partition_groups,
     attn_q_partition_units,
     tp_loaded_shard_start,
+    tp_partition_offset,
     tp_partition_size,
     tp_partition_sizes,
     tp_plan_active,
@@ -2282,6 +2283,26 @@ class RowParallelLinear(LinearBase):
     def forward(self, input_, skip_all_reduce=False, forward_batch=None):
         if self.input_is_parallel:
             input_parallel = input_
+        elif self.tp_size > 1 and tp_plan_active(self.tp_size, self.tp_family):
+            # Uneven TP (--rank-tp-ratio) with a REPLICATED input: the weight
+            # rows were split by the shard plan, so the input has to be cut at
+            # exactly the same boundaries. The even split below cannot do that
+            # -- it calls divide(), which under a plan like (39, 13, 12) either
+            # raises on the first non-divisible dimension or (when the size
+            # happens to divide) hands this rank the wrong slice of the
+            # contraction. Guarded on an installed plan, so the default path
+            # keeps running the identical even split it always did.
+            start = tp_partition_offset(
+                self.input_size,
+                self.tp_size,
+                self.tp_rank,
+                self.tp_units,
+                self.tp_family,
+                self.tp_q_groups,
+            )
+            input_parallel = input_.narrow(
+                -1, start, self.input_size_per_partition
+            ).contiguous()
         else:
             splitted_input = split_tensor_along_last_dim(
                 input_, num_partitions=self.tp_size

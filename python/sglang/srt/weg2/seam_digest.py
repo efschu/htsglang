@@ -513,6 +513,7 @@ def piece_digest(
     """
     acc = _fold.DeviceAccumulators(1)
     nbytes = _fold.fold_piece(tensor, acc, 0, chunk_bytes=chunk_bytes)
+    _fold.release_index_cache()  # #1454
     lanes = _drain_accumulators(acc)[0]
     return _digest_of(lanes, nbytes), nbytes
 
@@ -557,6 +558,7 @@ def read_pieces(
     for row, (geom, tensor) in enumerate(items):
         identities.append(identity_of(geom, card=card))
         sizes.append(_fold.fold_piece(tensor, acc, row, chunk_bytes=chunk_bytes))
+    _fold.release_index_cache()  # #1454: nothing of the grader stays on the card
     lanes = _drain_accumulators(acc)
     out = [
         PieceReading(identity=identities[i], digest=_digest_of(lanes[i], sizes[i]),

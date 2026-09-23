@@ -23,6 +23,8 @@ free-slot bookkeeping.
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import traceback
 from typing import Iterator, Optional
 
@@ -45,6 +47,20 @@ logger = logging.getLogger(__name__)
 # BOUNDED BY CONSTRUCTION -- per (rid, station), never per step, with a global
 # cap. The denominator is printed with the cap line so a missing rid can never
 # be read as "that station was not reached".
+#: #1467: THE SLOT TRAIL SYNCHRONISES THE GPU.  `note_924d` and
+#: `_note_slot_event` call `.tolist()` on a CUDA index tensor, and `free()`
+#: indexed with a boolean mask -- each is a device sync in the SCHEDULER
+#: thread, which then waits for every prefill kernel already queued.
+#: MEASURED (py-spy, boot weg2xsn223, PP0, 90 s over three 100k prefills):
+#: 284 of 3516 samples inside `_do_alloc` at the trail line, reached from
+#: stash_chunked_request -> cache_unfinished_req -> _alloc_mamba_slot; the
+#: #1466 PASS-STALL stamp read schedule_ms=350-430 three times per request
+#: change (the whole seconds without a forward on all P ranks).  The trail
+#: is opt-in (SGLANG_MAMBA_SLOT_TRAIL=1); the double-free refusal stays,
+#: evaluated through a CUDA event once the mask is complete, never by
+#: waiting for it.
+SLOT_TRAIL_ENV = "SGLANG_MAMBA_SLOT_TRAIL"
+_SLOT_TRAIL = os.environ.get(SLOT_TRAIL_ENV, "") == "1"
 _924D_SEEN: set = set()
 _924D_SEQ = 0
 _924D_CAP = 8192
@@ -62,6 +78,8 @@ def note_924d(station: str, *, rid=None, slot=None, node_id=None, extra: str = "
     slot -- the very join #1190 needs.
     """
     global _924D_SUPPRESSED
+    if not _SLOT_TRAIL:
+        return  # #1467: opt-in -- `.tolist()` on a CUDA slot is a device sync
     try:
         subject = str(rid)[:12] if rid is not None else f"node{node_id}"
         # #Q0-trail: LIFECYCLE STATIONS MUST NOT DEDUP. The (subject, station)
@@ -178,6 +196,7 @@ class MambaSlotAllocator:
         return self._do_alloc(need_size)
 
     def _do_alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        self._drain_double_free_checks()  # #1467: read completed answers, never wait
         if need_size > len(self.free_slots):
             return None
         select_index = self.free_slots[:need_size]
@@ -212,6 +231,8 @@ class MambaSlotAllocator:
     _PROV_FRAMES = 9
 
     def _note_slot_event(self, index, kind: str) -> None:
+        if not _SLOT_TRAIL:
+            return  # #1467: opt-in -- `index.tolist()` is a device sync
         try:
             book = getattr(self, "_slot_provenance", None)
             if book is None:
@@ -220,7 +241,17 @@ class MambaSlotAllocator:
             seq = getattr(self, "_slot_event_seq", 0) + 1
             self._slot_event_seq = seq
             if kind == "FREE":
-                where = "".join(traceback.format_stack(limit=self._PROV_FRAMES + 3)[:-3])
+                # #1429 (xsn190 py-spy): `traceback.format_stack` reads source
+                # lines through linecache on EVERY free, and the idle PP loop
+                # frees a probe slot ~1000x/s (alloc_group_end) -- the main
+                # thread spent its idle time here. A raw frame walk records the
+                # same provenance (file:line function) at microsecond cost.
+                frames = []
+                f = sys._getframe(1)
+                while f is not None and len(frames) < self._PROV_FRAMES:
+                    frames.append(f"  {f.f_code.co_filename}:{f.f_lineno} {f.f_code.co_name}")
+                    f = f.f_back
+                where = "\n".join(reversed(frames))
             else:
                 where = ""
             for slot in index.tolist() if hasattr(index, "tolist") else [index]:
@@ -277,15 +308,58 @@ class MambaSlotAllocator:
         # question about the wrong slot. They are excluded from the ledger
         # rather than answered wrongly; the free list itself is unchanged.
         in_ledger = (free_index >= 0) & (free_index < self.slot_used.numel())
-        self._refuse_double_free(free_index[in_ledger])
-        self.slot_used[free_index[in_ledger]] = False
+        # #1467: no boolean-mask indexing here (a device sync); out-of-ledger
+        # ids are routed to slot 0, the unused dummy row (free_slots starts
+        # at 1), and masked out of the double-free question.
+        safe = torch.where(in_ledger, free_index, torch.zeros_like(free_index))
+        self._defer_double_free_check(safe, in_ledger)
+        self.slot_used[safe] = False
         # #1033b: recorded AFTER the ledger update, so the book holds only
         # releases that genuinely flipped a slot True->False. A refused release
         # never becomes somebody's "first releaser".
-        self._note_slot_event(free_index[in_ledger], "FREE")
+        self._note_slot_event(safe, "FREE")
         self.free_slots = torch.cat((self.free_slots, free_index))
 
-    def _refuse_double_free(self, free_index: torch.Tensor) -> None:
+    def _defer_double_free_check(self, safe: torch.Tensor, in_ledger: torch.Tensor) -> None:
+        """#1467: the #924 double-free question, asked WITHOUT waiting.
+
+        The mask is computed on the device now; its answer is read only once a
+        CUDA event recorded behind it reports complete (`query()`), i.e. never
+        by stalling the scheduler thread behind queued prefill kernels.  Every
+        `free()`/`alloc()` first drains the completed entries, so a refusal is
+        delayed by at most the passes the mask spent in flight -- still ONE
+        boot's attribution with the releaser's stack, recorded at release time.
+        On a CPU allocator (tests) the answer is read immediately.
+        """
+        already_free = self.slot_used[safe].logical_not() & in_ledger
+        stack = "".join(traceback.format_stack(limit=12)[:-2])
+        pend = getattr(self, "_1467_pending", None)
+        if pend is None:
+            pend = self._1467_pending = []
+        if already_free.is_cuda:
+            ev = torch.cuda.Event()
+            ev.record()
+            pend.append((ev, already_free, safe, stack))
+        else:
+            pend.append((None, already_free, safe, stack))
+        self._drain_double_free_checks()
+
+    def _drain_double_free_checks(self, wait: bool = False) -> None:
+        pend = getattr(self, "_1467_pending", None)
+        if not pend:
+            return
+        keep = []
+        for ev, already_free, safe, stack in pend:
+            if ev is not None and not wait and not ev.query():
+                keep.append((ev, already_free, safe, stack))
+                continue
+            if ev is not None and wait:
+                ev.synchronize()
+            if bool(already_free.any()):
+                self._refuse_double_free(safe[already_free], stack=stack)
+        self._1467_pending = keep
+
+    def _refuse_double_free(self, free_index: torch.Tensor, stack: Optional[str] = None) -> None:
         """#924: say WHO returned a slot that is already free, then raise.
 
         WHY NOT A SILENT DEDUP. Dropping the duplicate here would keep the
@@ -338,13 +412,15 @@ class MambaSlotAllocator:
         # that is the prerequisite for deciding whether the token is needed.
         if free_index.numel() == 0:
             return
-        already_free = self.slot_used[free_index].logical_not()
-        if not bool(already_free.any()):
-            return
-        offenders = free_index[already_free].tolist()
+        if stack is None:  # direct call (tests, old callers): the ids passed are the offenders
+            already_free = self.slot_used[free_index].logical_not()
+            if not bool(already_free.any()):
+                return
+            free_index = free_index[already_free]
+        offenders = free_index.tolist()
         n = getattr(self, "_double_free_count", 0) + 1
         self._double_free_count = n
-        trace = "".join(traceback.format_stack(limit=12)[:-2])
+        trace = stack if stack is not None else "".join(traceback.format_stack(limit=12)[:-2])
         if getattr(self, "_first_double_free_trace", None) is None:
             self._first_double_free_trace = trace
         logger.error(
@@ -361,7 +437,7 @@ class MambaSlotAllocator:
             "the old 'Releasing caller:' line showed, and it is NOT normally "
             "the offender):\n%s",
             offenders,
-            len(self.free_slots) + int(already_free.sum()),
+            len(self.free_slots) + len(offenders),
             self.size,
             n,
             "\n".join(self._describe_slot_history(s) for s in offenders),

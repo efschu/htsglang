@@ -11,6 +11,92 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import CacheOperation as BaseCacheOperation
+
+
+def _draft_device_rows(draft_pool, device_indices, direction: str):
+    """weg2xsn277/278 (18.09.): row-addressed draft transfers name TARGET
+    slots; a draft pool smaller than the target pool (the DFlash window pool
+    on group D: 4113 slots) carries ``weg2_slot_mapper`` and the base
+    controller translates through it (`_draft_device_indices`). This
+    controller passed the RAW target rows: the 4k smoke wrote rows up to
+    4314 into a 4114-row draft pool (silent), the first 98k load ran off
+    the allocation ('illegal memory access', xsn277); xsn278's
+    WEG2-ARENA-LOAD guard named it: dst=[1025,4314] of 4114. Same rule as
+    the base controller: a backup reads the draft slot behind each target
+    slot, a load allocates one; a mirror pool needs no translation."""
+    mapper = getattr(draft_pool, "weg2_slot_mapper", None)
+    if mapper is None:
+        return device_indices
+    # xsn279: the hybrid path carries the rows on the CPU (the 'direct' io
+    # backend's pair lists); the mapper's table lives on the device and
+    # `translate_write` masks against it ("Expected all tensors to be on the
+    # same device, cuda:0 and cpu"). Translate on the mapper's device.
+    dev = getattr(mapper, "device", None)
+    rows = device_indices if dev is None else device_indices.to(device=dev)
+    if direction == "write":
+        return mapper.translate_read(rows)
+    return mapper.translate_write(rows)
+
+
+_DRAFT_SKIP_LOGGED = {"n": 0}
+
+
+_DRAFT_WINDOW_LOGGED = {"n": 0}
+
+
+def _draft_rows_or_skip(draft_pool, device_indices, direction: str, *, nrows: int,
+                        host_indices=None):
+    """weg2xsn281/xsn288: ``(draft_rows, host_rows, skipped)``.
+
+    THE WINDOW IS THE LOAD (xsn288). DFlash2's draft attends over the last
+    ``draft_window_size`` positions only (2048; the window pool on group D
+    is sized for exactly that: 4113 slots = (2048 + 8) x running x 2). A
+    98k prefix therefore needs its LAST 2048 draft rows on D, not all 98k
+    -- xsn281 skipped the whole draft half whenever the prefix exceeded
+    the pool ("DFLASH small solo pool exhausted"), so the draft read zero
+    holes for the window's tail and accepted 2.9-3.3 (measured xsn288, five
+    98k prompts) against 5.5-5.9 on the same checkpoint with the window
+    present. Rows are the prefix in token order (the load_back node chain),
+    so the tail slice IS the window; ``host_indices`` is sliced alike so the
+    pair lists stay aligned.
+
+    The skip stays for the case the tail still does not fit (the pool holds
+    fewer than ``ctx_cap`` reclaimable slots): skipped BY NAME, target load
+    unchanged, accept-rate only."""
+    mapper = getattr(draft_pool, "weg2_slot_mapper", None)
+    cap = int(getattr(mapper, "ctx_cap", 0) or 0)
+    dev_rows, host_rows = device_indices, host_indices
+    if mapper is not None and cap > 0 and int(device_indices.numel()) > cap:
+        dev_rows = device_indices.reshape(-1)[-cap:]
+        if host_indices is not None:
+            host_rows = host_indices.reshape(-1)[-cap:]
+        _DRAFT_WINDOW_LOGGED["n"] += 1
+        n = _DRAFT_WINDOW_LOGGED["n"]
+        if n <= 3 or (n & (n - 1)) == 0:
+            logger.info(
+                "WEG2-DRAFT-LOAD WINDOW rows=%d of %d: the DFlash draft attends the "
+                "last ctx_cap=%d positions only, so the prefix's tail is the load "
+                "(window pool slots=%s) (n=%d)",
+                int(dev_rows.numel()), nrows, cap,
+                getattr(mapper, "num_draft_slots", "?"), n,
+            )
+    try:
+        return _draft_device_rows(draft_pool, dev_rows, direction), host_rows, False
+    except RuntimeError as exc:
+        if "solo pool exhausted" not in str(exc):
+            raise
+        _DRAFT_SKIP_LOGGED["n"] += 1
+        n = _DRAFT_SKIP_LOGGED["n"]
+        if n <= 3 or (n & (n - 1)) == 0:
+            mapper = getattr(draft_pool, "weg2_slot_mapper", None)
+            logger.info(
+                "WEG2-DRAFT-LOAD SKIPPED rows=%d: the DFlash window pool cannot hold "
+                "this load (slots=%s ctx_cap=%s) -- over-threshold context, target KV "
+                "loads unchanged, draft KV absent (accept-rate only) (n=%d): %s",
+                nrows, getattr(mapper, "num_draft_slots", "?"),
+                getattr(mapper, "ctx_cap", "?"), n, str(exc)[:160],
+            )
+        return None, None, True
 from sglang.srt.managers.cache_controller import consume_gate
 from sglang.srt.managers.cache_controller import (
     HiCacheAck,
@@ -485,6 +571,7 @@ class HybridCacheController(BaseHiCacheController):
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        host_indices: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         # #760: THE OVERRIDE IS THE HOLE THE CRASH WENT THROUGH. The base
         # class asks device_tier_disarmed at enqueue; this override did not,
@@ -508,7 +595,8 @@ class HybridCacheController(BaseHiCacheController):
         # copy dies with a bare tensor-size RuntimeError.
         if self._refuse_unaddressable_kv_rows(device_indices, "write"):
             return None
-        host_indices = self.mem_pool_host.alloc(len(device_indices))
+        if host_indices is None:  # #1427: a direct write brings its arena slots along
+            host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
         pool_transfers = self._resolve_pool_transfers_allocation(
@@ -583,7 +671,7 @@ class HybridCacheController(BaseHiCacheController):
                 self.mem_pool_host_draft.backup_from_device_all_layer(
                     self.mem_pool_device_draft,
                     host_indices,
-                    device_indices,
+                    _draft_device_rows(self.mem_pool_device_draft, device_indices, "write"),
                     self.io_backend,
                 )
             finish_event.record()
@@ -664,23 +752,34 @@ class HybridCacheController(BaseHiCacheController):
         # a producer is allocated.
         if not consume_gate(self, "load_queue", "load"):
             return -1
+        _sl_t0 = time.perf_counter()  # 19.09. Task #3: the wake's start_loading, sectioned
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices, resolved_pool_transfers = (
             self.move_hybrid_indices(op)
         )
         self.load_queue.clear()
+        _sl_t1 = time.perf_counter()
         # Weighted uneven-DCP: load only this rank's owned tokens into their
         # COMPACT device slots (identity when the gate is off). pool_transfers
         # and the draft pool keep the raw pair list (see start_writing).
         kv_host_indices, kv_device_indices = self._dcp_kv_transfer_pairs(
             host_indices, device_indices
         )
+        _sl_t2 = time.perf_counter()
+        _sl_kv_ms = 0.0
+        _sl_draft_ms = 0.0
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
+        # xsn281: the draft rows are translated ONCE per load (the mapper
+        # allocates draft slots; a per-layer call would allocate per layer)
+        # and the draft half is skipped by name when the window pool cannot
+        # hold this load (an over-threshold context DFLASH will not serve).
+        draft_rows, draft_host_rows, draft_rows_skipped = None, None, False
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             for i in range(self.mem_pool_host.transfer_layer_domain):
+                _sl_a = time.perf_counter()
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
                     kv_host_indices,
@@ -689,18 +788,26 @@ class HybridCacheController(BaseHiCacheController):
                     self.io_backend,
                     pool_transfers=resolved_pool_transfers,
                 )
+                _sl_kv_ms += (time.perf_counter() - _sl_a) * 1000.0
                 if (
                     self.draft_tier_armed("load")
                     and host_indices.numel() > 0
                     and _host_pool_covers_layer(self.mem_pool_host_draft, i)
                 ):
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
-                        host_indices,
-                        device_indices,
-                        i,
-                        self.io_backend,
-                    )
+                    if draft_rows is None and not draft_rows_skipped:
+                        draft_rows, draft_host_rows, draft_rows_skipped = _draft_rows_or_skip(
+                            self.mem_pool_device_draft, device_indices, "load",
+                            nrows=int(host_indices.numel()), host_indices=host_indices)
+                    if draft_rows is not None:
+                        _sl_c = time.perf_counter()
+                        self.mem_pool_host_draft.load_to_device_per_layer(
+                            self.mem_pool_device_draft,
+                            draft_host_rows if draft_host_rows is not None else host_indices,
+                            draft_rows,
+                            i,
+                            self.io_backend,
+                        )
+                        _sl_draft_ms += (time.perf_counter() - _sl_c) * 1000.0
                 producer_event.complete(i)
             self._record_transfer_indices_on_stream(
                 self.load_stream,
@@ -718,6 +825,23 @@ class HybridCacheController(BaseHiCacheController):
                 op.node_ids,
             )
         )
+        _sl_t3 = time.perf_counter()
+        _n_tok = int(host_indices.numel()) if hasattr(host_indices, "numel") else -1
+        _comp = getattr(self.mem_pool_host, "_weg2_load_ms", None)
+        _comp_txt = ",".join(f"{k}={v:.0f}" for k, v in sorted((_comp or {}).items()))
+        if isinstance(_comp, dict):
+            _comp.clear()
+        if _n_tok >= 8192 or (_sl_t3 - _sl_t0) > 0.05:
+            logger.info(
+                "WEG2-START-LOADING tokens=%d nodes=%d total_ms=%.0f merge_move_ms=%.0f dcp_pairs_ms=%.0f "
+                "kv_issue_ms=%.0f draft_issue_ms=%.0f tail_ms=%.0f components_ms=[%s] (CPU time of the "
+                "scheduler thread; the copies run on the load stream; kv_issue includes the page loadback's "
+                "own sync under SGLANG_WEG2_ARENA_PAGE_LOAD_TIMING=1)",
+                _n_tok, len(getattr(op, "node_ids", ()) or ()),
+                (_sl_t3 - _sl_t0) * 1000.0, (_sl_t1 - _sl_t0) * 1000.0, (_sl_t2 - _sl_t1) * 1000.0,
+                _sl_kv_ms, _sl_draft_ms,
+                (_sl_t3 - _sl_t2) * 1000.0 - _sl_kv_ms - _sl_draft_ms, _comp_txt,
+            )
         return producer_id
 
     def _record_transfer_indices_on_stream(
@@ -793,9 +917,35 @@ class HybridCacheController(BaseHiCacheController):
             # base class gives; the rank-uniform MIN all_reduce in
             # prefetch_thread_func then agrees on it.
             return [], 0
-        hash_value = self.get_hash_str(
+        # #1442 / xsn328-333: P's handed-over page keys for the covered prefix
+        # (the scheduler's registry is sliced at the MATCHED length; the
+        # tree's operation.weg2_page_keys assumed a tail read -- offset 2 for
+        # a from-root read), own hashes for the tail (P's list is one page
+        # short of the ids). D's own hashes agreed with P's for the first 64
+        # tokens only, so the dormant hold's re-reads answered zero.
+        own_hashes = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
+        from sglang.srt.managers import cache_controller as _cc_mod
+        from sglang.srt.weg2.handoff_keys import first_mismatch as _first_mismatch
+        _hk = _cc_mod.WEG2_HANDOFF_PAGE_KEYS.get(operation.request_id) or getattr(operation, "weg2_page_keys", None)
+        _k = min(len(_hk), len(own_hashes)) if _hk else 0
+        if _k > 0:
+            _hn = getattr(self, "_1442_keys_n", 0) + 1
+            self._1442_keys_n = _hn
+            if _hn <= 12 or _hn % 256 == 0:
+                logger.info("#1442 HANDOFF-KEYS USE rid=%s pages=%d covered=%d first_mismatch=%s last_hash=%s (own vs P's keys; P's are used)",
+                            operation.request_id, len(own_hashes), _k, _first_mismatch(own_hashes[:_k], list(_hk[:_k])),
+                            (operation.last_hash or "")[:12])
+            hash_value = list(_hk[:_k]) + list(own_hashes[_k:])
+        else:
+            hash_value = own_hashes
+            if str(operation.request_id).startswith("weg2-"):
+                _hn0 = getattr(self, "_1442_nokeys_n", 0) + 1
+                self._1442_nokeys_n = _hn0
+                if _hn0 <= 12 or _hn0 % 256 == 0:
+                    logger.info("#1442 HANDOFF-KEYS NONE rid=%r pages=%d registry=%s (n=%d)", operation.request_id,
+                                len(own_hashes), sorted(_cc_mod.WEG2_HANDOFF_PAGE_KEYS.keys())[:6], _hn0)
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None

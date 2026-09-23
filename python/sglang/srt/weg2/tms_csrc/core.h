@@ -56,7 +56,10 @@ public:
     cudaError_t free(void* ptr);
 
     void pause(const std::string& tag);
-    void resume(const std::string& tag);
+    //: weg2xsn269: 0 on success, else the CUresult of the failing pass-1 call;
+    //: on failure every allocation this call had already mapped is unmapped
+    //: again and left PAUSED, so a retry after a refund is legal.
+    int resume(const std::string& tag);
 
     //: C7: the planner's sizing input.  Sum of ``metadata.size`` over the
     //: allocations carrying ``tag``.  This REPLACES the RssShmem delta as the

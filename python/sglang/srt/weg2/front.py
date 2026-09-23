@@ -68,6 +68,11 @@ from aiohttp import (
     web,
 )
 
+from sglang.srt.weg2.intake_stall import is_intake_stall, is_too_large  # weg2xsn272
+
+#: weg2xsn291: the least a woken group keeps the cards even when fairness or
+#: work-exhaustion override the derived min-dwell (see Front._dwell_ok).
+FAIRNESS_DWELL_FLOOR_MS = 2000.0
 from sglang.srt.managers import corridor_guard
 from sglang.srt.managers.corridor_guard import (
     corridor_band_ceiling_mib,
@@ -1514,6 +1519,42 @@ def interleave_pause_order(
 # --------------------------------------------------------------------------
 
 
+def interleave_chain_card(order: List[str], why: str, tag_cards: Dict[str, Any],
+                          env=None) -> Tuple[List[str], str]:
+    """18.09. (xsn367): the SOURCE card that carries the most chunk tags (PP0
+    on the 5090: six of eight bands) is the flip's critical chain -- the
+    destination collects two tags at once now, and PP0's chain must never
+    wait behind the other cards' bands. Alternate that card's tags (in the
+    order given) with the others (in the order given); the base tag keeps
+    closing the sleep. ``SGLANG_WEG2_FLIP_ORDER_CHAIN=0`` keeps the order.
+    Identity when there is no map, one card, or fewer than two chunk tags
+    on the chain card."""
+    env = os.environ if env is None else env
+    if str(env.get("SGLANG_WEG2_FLIP_ORDER_CHAIN", "1")).strip().lower() in ("0", "false", "no", "off"):
+        return list(order), why
+    chunks = [t for t in order if is_weights_chunk_tag(t) and tag_cards.get(t)]
+    if len(chunks) < 3:
+        return list(order), why
+    count: Dict[int, int] = {}
+    for t in chunks:
+        count[int(tag_cards[t][0])] = count.get(int(tag_cards[t][0]), 0) + 1
+    if len(count) < 2:
+        return list(order), why
+    chain = max(sorted(count), key=lambda c: count[c])
+    if count[chain] < 2:
+        return list(order), why
+    mine = [t for t in chunks if int(tag_cards[t][0]) == chain]
+    others = [t for t in chunks if int(tag_cards[t][0]) != chain]
+    merged: List[str] = []
+    while mine or others:
+        if mine:
+            merged.append(mine.pop(0))
+        if others:
+            merged.append(others.pop(0))
+    rest = [t for t in order if t not in set(chunks)]
+    return merged + rest, why + f", chain card {chain} interleaved"
+
+
 @dataclass
 class Group:
     name: str
@@ -1526,6 +1567,34 @@ class Group:
     @property
     def phase(self) -> str:
         return "prefill" if self.name == "P" else "decode"
+
+
+async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch) -> int:
+    """#1459c: keep up to ``limit`` leg-1 calls in flight, refilling from
+    ``queue`` (a deque; new arrivals appended while draining are taken too)
+    the moment ONE finishes.  ``on_done(p)`` runs in COMPLETION order.
+    ``may_dispatch()`` False stops NEW dispatches (the phase is leaving
+    "serving"); what is already in flight is always awaited, never
+    abandoned -- the old gather had the same property for its batch.
+    Returns the number of dispatch rounds (the ``passes`` term of the
+    drain summary line).
+    """
+    inflight: set = set()
+    rounds = 0
+    while True:
+        dispatched = False
+        while queue and len(inflight) < limit and may_dispatch():
+            inflight.add(asyncio.ensure_future(one(queue.popleft())))
+            dispatched = True
+        if dispatched:
+            rounds += 1
+        if not inflight:
+            return rounds
+        done, _pending = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            inflight.discard(t)
+            on_done(t.result())
+
 
 
 @dataclass
@@ -1547,6 +1616,10 @@ class Pending:
     leg1_prompt_tokens: int = 0
     skip_leg1: bool = False  # #1233 route CARRIER-EXCEEDS: one prefill on D, no leg 1
     leg1_done: bool = False
+    #: weg2xsn272: P refused this leg 1 as WEG2-INTAKE-STALL (its pool cannot
+    #: admit the request while it keeps the backlog for D); requeued at the
+    #: head, prefilled in the next P phase. Never a hand-off to D.
+    intake_stalled: bool = False
     #: C4: the D seat this request holds while its leg 2 is in flight, and the
     #: event the admitter waits on before it resolves the next future (R-15).
     seat: Optional[Seat] = None
@@ -1814,6 +1887,59 @@ def dormant_residue_over(dc, reserve, weights_resident: bool) -> dict:
         if reserve.get(u) is not None and m > reserve[u]
     }
 
+#: #1493: how far the sleeping group's CURRENT device residency may exceed the
+#: dormant image it recorded at its own sleep before a manual flip is refused.
+#: Not a reserve and not a safety factor -- it is measurement slack: NVML
+#: per-process readings on a shared card move by tens of MiB between samples.
+MANUAL_FLIP_RESIDENCY_SLACK_MIB = 256
+
+
+def manual_flip_residency_refusal(*, awake: Optional[str], sleeper: Optional[str],
+                                  sleeper_used_mib=None, sleeper_dormant_mib=None,
+                                  slack_mib: int = MANUAL_FLIP_RESIDENCY_SLACK_MIB):
+    """Name why a manual flip must not be attempted right now, or None.
+
+    BOOT weg2xsn406 (2026-09-20 16:49:25Z) is the case. A `POST /weg2/flip`
+    arrived while D was awake. The handler flips D->P and then straight back
+    P->D -- and that RETURN wake is the one that has to fund D's whole
+    kv_cache tag again. P had just prefilled on the same cards, its transient
+    residency was still on them, and the return wake hit
+
+        [core.cpp] WEG2-TMS-RESUME REFUSED tag=kv_cache rc=2 (out of memory)
+
+    i.e. the flip destroyed a serving group to find out something that was
+    measurable BEFORE it started. The automatic flip never reaches this state
+    because it does not turn around inside one request.
+
+    THE TEST IS ONE-SIDED AND USES ONLY WHAT THE FRONT ALREADY READS: the
+    sleeping group's CURRENT NVML per-process bytes against the dormant image
+    THAT SAME GROUP recorded at its own sleep. A sleeper that is holding more
+    than its dormant image has not finished releasing -- those bytes are the
+    transient residency, and they are exactly what the return wake will not
+    find. Either figure absent => None: an absence is never a refusal
+    (NULL-NUR-BEI-ERREICHTEM-EMITTER).
+
+    Returns the refusal text (a W115 line) or None.
+    """
+    if str(awake or "") != "D":
+        return None
+    if sleeper_used_mib is None or sleeper_dormant_mib is None:
+        return None
+    over = int(sleeper_used_mib) - int(sleeper_dormant_mib)
+    if over <= int(slack_mib):
+        return None
+    return (
+        f"W115 Weg2ManualFlipRefused: group {sleeper or '?'} still holds "
+        f"{int(sleeper_used_mib)} MiB against a dormant image of "
+        f"{int(sleeper_dormant_mib)} MiB -- {over} MiB of transient residency "
+        f"above a {int(slack_mib)} MiB measurement slack. A manual flip turns "
+        f"around inside one request (D->P->D), so those bytes are missing from "
+        f"the RETURN wake, not from the flip out; on boot weg2xsn406 that wake "
+        f"refused its kv_cache resume on a device OOM and the group died. "
+        f"D stays awake and serving: refusing a flip costs a flip, attempting "
+        f"it cost a group."
+    )
+
 
 def _nvml_process_mib(pids: set) -> Dict[str, int]:
     try:
@@ -1842,7 +1968,7 @@ class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
                  weight_chunks: int = 0, carrier_max_tokens: int = 0,
-                 weights_resident: bool = False,
+                 weights_resident: bool = False, weight_form: str = "",
                  p_concurrency: int = DEFAULT_P_BS, d_bs: int = DEFAULT_D_BS,
                  tp_prefill_max_tokens: int = X_FALLBACK_TOKENS,
                  flip_min_work_tokens: Optional[int] = None,
@@ -1890,6 +2016,7 @@ class Front:
         self.tag = tag
         self.store_dir = store_dir
         self.dc_reserve = dc_reserve
+        self.weight_form = str(weight_form or "")  # #1444: stamps the dormant record
         self.w_s = w_s
         self.epoch = 0
         #: #1350: the non-reclaimable reading (anon+shmem+slab_unreclaimable)
@@ -1962,6 +2089,7 @@ class Front:
         self._flip_stall_reported_epoch: int = -1
         self.drain_refusals_in_a_row = 0
         self.identity_checked = False
+        self._flip_marks: Dict[str, float] = {}  # #1455 timeline stamps
         self.dc_measured_d: Dict[str, int] = {}
         #: fnFL2 v22 (21.09.): /health_generate proxies in flight per group.
         #: A probe forwarded a moment before `WEG2-FLIP begin` is a running
@@ -1978,6 +2106,12 @@ class Front:
         # writes both, R-6/R-12).  It is the front's D concurrency AND D's
         # own --max-running-requests, one number.
         self.d_bs = max(1, int(d_bs))
+        # #1443: leg-2 requests may be handed to D while D is DORMANT -- D
+        # accepts and holds them (tokenised ids and store lookup now, device
+        # load and decode after the wake), so the first token after the flip
+        # is the load away, not the whole re-admission. SGLANG_WEG2_DORMANT_ADMIT=0
+        # keeps the dispatch behind the wake.
+        self.dormant_admit = os.environ.get("SGLANG_WEG2_DORMANT_ADMIT", "1") == "1"
         # law 4: X.  ONE value for all four front sites (C9); the front's use
         # is an ESTIMATE (no tokenizer here) -- D enforces it for real at
         # get_new_batch_prefill after match_prefix (C11, W31).
@@ -2795,6 +2929,34 @@ class Front:
             status=501,
         )
 
+    async def _requeue_intake_stalled(self, p: "Pending", err: object) -> None:
+        """weg2xsn272: P answered leg 1 with WEG2-INTAKE-STALL -- its pool
+        cannot admit ``p`` while it keeps the prefilled backlog for D. The
+        request goes back to the HEAD of the queue (it is the oldest), this
+        drain stops dispatching, the flip to D follows (queue not empty), and
+        the next P phase prefills it into an emptied pool. P's own rank
+        dropped it; ``/abort_request`` drops it on every rank (PP followers
+        hold their own copy) -- idempotent where it is already gone."""
+        p.intake_stalled = True
+        p.leg1_done = False
+        p.x_requeues += 1
+        self._p_intake_stalled = True
+        self.counters["p_intake_stalls"] += 1
+        self.queue.appendleft(p)
+        logger.warning(
+            "WEG2 P-INTAKE-STALL rid=%s est_prompt=%d requeued at the head "
+            "(requeues=%d, queue=%d) -- drain ends, flip to D follows: %s",
+            p.rid, int(p.est_prompt), p.x_requeues, len(self.queue),
+            str(err)[:300],
+        )
+        try:
+            code, _body = await self.rpc(
+                self.groups["P"], "/abort_request", {"rid": p.rid}, 30)
+            logger.info("WEG2 P-INTAKE-STALL rid=%s /abort_request on P -> %s", p.rid, code)
+        except Exception as exc:  # noqa: BLE001 -- P's own rank already dropped it
+            logger.warning("WEG2 P-INTAKE-STALL rid=%s /abort_request on P raised: %s",
+                           p.rid, exc)
+
     async def handle_abort(self, request: web.Request) -> web.Response:
         payload = await request.json()
         rid = payload.get("rid")
@@ -2877,6 +3039,8 @@ class Front:
             return web.json_response({"error": f"{_code}: {_why}"}, status=501)
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
+        if isinstance(payload, dict):
+            payload["rid"] = rid  # #1442: P and D see the same rid (the hand-off key)
         text = request_text(payload)
         remainder, est_prompt, known = price_remainder(text, self.spans)
         # MF-3: the routing probe's OTHER half, taken here and nowhere else.
@@ -3114,6 +3278,13 @@ class Front:
             return None
         return Seat(self, rid, "short", tokens=est_tokens)
 
+    def _d_accepts_leg2(self) -> bool:
+        """#1443: D takes leg-2 requests when awake, and -- dormant-admit armed --
+        while it is dormant behind an awake P (it holds them until the wake).
+        Never mid-flip: the phase must be settled."""
+        from sglang.srt.weg2.retain_publish import d_accepts_leg2 as _acc
+        return _acc(self.awake, self.state, self.dormant_admit)   # xsn347: also during the P->D flip
+
     def _log_admit(self, rid: str, source: str, t_arrive: float, rank: Optional[int] = None) -> None:
         """L2.  ``rank`` is this admission's ORDINAL in the current epoch.
 
@@ -3172,7 +3343,7 @@ class Front:
         while True:
             await asyncio.sleep(0.05)
             try:
-                if self.state != "serving" or self.awake != "D":
+                if not self._d_accepts_leg2():   # xsn348: the state rule lives in d_accepts_leg2 (P->D flip admits)
                     continue
                 if not self._ready_for_d:
                     continue
@@ -3198,7 +3369,7 @@ class Front:
                     # request that would fit cannot be admitted past it.
                     continue
                 await self._d_seat.acquire()
-                if not (self.awake == "D" and self.admit_d and self.state == "serving"):
+                if not (self._d_accepts_leg2() and self.admit_d):
                     # The phase moved while this admitter was queued behind a
                     # running decode.  Give the seat back and leave the
                     # request where it is: the deque head is still the oldest
@@ -4214,7 +4385,7 @@ class Front:
                 after = await self._weg2_decode_progress(g)
                 self._drain_progress = weg2_drain_progress_delta(before, after)
                 return False
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.02)  # #1455: 250 ms poll was a quarter of the drain
         return True
 
     async def quiesce(self, g: Group) -> Tuple[bool, str]:
@@ -4248,7 +4419,7 @@ class Front:
             if code == 200:
                 return True, body
             last = body
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.05)  # #1455: the P flush RPC answers in ~5 ms; 500 ms poll cost ~1 s per flip
         return False, last
 
     # #1236: `_store_used_bytes` IS DELETED, not repaired. It read
@@ -4302,7 +4473,8 @@ class Front:
         host_ledger.refuse_sleep_leg_deficit(
             cushion, need, margin_gib=0.0, source=src, group=str(group))
 
-    def sample_dormant_image(self, group: str, shmem_before: Optional[int]) -> Optional[dict]:
+    def sample_dormant_image(self, group: str, shmem_before: Optional[int],
+                             vram_residue_mib: Optional[Dict[str, int]] = None) -> Optional[dict]:
         """Measure ``group``'s dormant host image, once, at its first sleep.
 
         The term boot weg2dk7 refuted: the ledger charged the weight-tag byte
@@ -4348,6 +4520,8 @@ class Front:
             # `predicted_run_peak_gib` refuse (W95) rather than add the same
             # bytes to the origin and to the charges.
             sampled_at_flip_epoch=self.epoch,
+            vram_residue_mib=vram_residue_mib,
+            vram_residue_form=self.weight_form,
             load_witness={
                 "queued": len(self.queue),
                 "outstanding": sum(
@@ -4462,6 +4636,7 @@ class Front:
         # "flipping", so there is no path on which a stale t0 can be read.
         self._flip_t0 = t_flip0
         self._flip_stage = "drain"
+        self._flip_marks["drain"] = time.time()
         logger.info("WEG2-FLIP begin epoch=%d sleep=%s wake=%s outstanding=%d queue=%d", self.epoch, src, dst, len(S.outstanding), len(self.queue))
         # #1350 READING 1 OF 2, at a moment this front already owns. Only at
         # epoch 0: the term is the step the FIRST waking of each group adds, it
@@ -4526,6 +4701,7 @@ class Front:
         self.drain_refusals_in_a_row = 0
         # 2. quiesce + double witness (W3)
         self._flip_stage = "quiesce"
+        self._flip_marks["quiesce"] = time.time()
         idle, msg = await self.quiesce(S)
         wv = witness_verdict(len(S.outstanding), idle)
         if wv is not None:
@@ -4586,7 +4762,15 @@ class Front:
         shmem_before = host_ledger.read_cgroup_shmem_bytes()
         t0 = time.time()
         self._flip_stage = "sleep-kv"
-        code, body = await self.rpc(S, "/release_memory_occupation", {"tags": [KV_TAG]}, RPC_TIMEOUT_S)
+        self._flip_marks["sleep-kv"] = time.time()
+        # #1428 (xsn188): the KV legs went out on the shared pooled session
+        # with no epoch, so a stale keep-alive connection ("Server disconnected",
+        # got_response=False) had no retry and killed the boot at the first
+        # wake although P answered 200. Same retry-on-fresh-connection as the
+        # weights legs (#1285); the epoch is the far side's dedup key.
+        code, body = await self.leg_rpc(S, "/release_memory_occupation",
+                                        {"tags": [KV_TAG], "epoch": credit_epoch(self.boot_epoch, self.epoch)},
+                                        RPC_TIMEOUT_S)
         sleep_ms += (time.time() - t0) * 1000
         if code != 200:
             self.do_stop("W4 Weg2WakeRefused", f"sleep({src}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- VRAM state undefined, no retry")
@@ -4638,6 +4822,8 @@ class Front:
                 self.weights_tags, self.src_chunk_cards.get(src, {}), free_mib,
                 dst_cards=self.src_chunk_cards.get(dst, {}),
             )
+            pause_order, why = interleave_chain_card(
+                pause_order, why, self.src_chunk_cards.get(src, {}))
         logger.info(
             "WEG2-FLIP-ORDER epoch=%d src=%s driver_free=%s pause_order=%s resume_order=%s (%s) "
             "-- applied to the GATHERED sleep leg's tag list (C9), not to a per-tag RPC loop",
@@ -4682,7 +4868,14 @@ class Front:
             # exactly as before fix6.
             self._sleep_leg_gate(S)
             self._flip_stage = "gathered-legs"
-            (s_code, s_body, s_ms), (w_code, w_body, w_ms) = await asyncio.gather(
+            self._flip_marks["gathered-legs"] = time.time()
+            # Wake-Parallel (user 18.09.): the kv resume is sent WITH the legs
+            # (listed first, so it lands before the weights call); the waker resumes
+            # it early when its card can fund it, else defers it into the weights
+            # call after the legs -- either way the held requests' loads overlap
+            # the legs. The post-legs kv call below stays (idempotent per epoch).
+            from sglang.srt.weg2.wake_kv import early_send_on as _kv_early_on
+            _legs = [
                 self.timed_rpc(S, "/release_memory_occupation",
                                {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
                 # weg2xsn84 (#1378): THE WAKE WALKS THE SAME ORDER AS THE SLEEP.
@@ -4700,7 +4893,17 @@ class Front:
                 # the permutation check's reference above.
                 self.timed_rpc(D, "/resume_memory_occupation",
                                {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
-            )
+            ]
+            _kv_early = bool(_kv_early_on())
+            if _kv_early:
+                _legs.insert(0, self.timed_rpc(D, "/resume_memory_occupation",
+                                               {"tags": [KV_TAG], "epoch": flip_epoch}, RPC_TIMEOUT_S))
+            _res = await asyncio.gather(*_legs)
+            if _kv_early:
+                (k_code, k_body, k_ms), (s_code, s_body, s_ms), (w_code, w_body, w_ms) = _res
+                logger.info("WEG2-WAKE-KV-EARLY rpc http=%s ms=%.0f (%s)", k_code, k_ms, str(k_body)[:120])
+            else:
+                (s_code, s_body, s_ms), (w_code, w_body, w_ms) = _res
         legs_wall_ms = (time.perf_counter() - t_gather0) * 1000
         s_done, s_per_tag, s_crit = completed_tags(s_body)
         w_done, w_per_tag, w_crit = completed_tags(w_body)
@@ -4754,9 +4957,26 @@ class Front:
         # 4. measure D_c(src) on the DEVICE axis; W19 for D at its first sleep.
         # fix 8: and the HOST axis, once per group -- the dormant image the next
         # boot's ledger prices instead of the weight-tag census sum.
-        self.sample_dormant_image(src, shmem_before)
+        # 5. wake dst kv (W4)
+        t0 = time.time()
+        self._flip_stage = "wake-kv"
+        self._flip_marks["wake-kv"] = time.time()
+        code, body = await self.leg_rpc(D, "/resume_memory_occupation",
+                                        {"tags": [KV_TAG], "epoch": credit_epoch(self.boot_epoch, self.epoch)},
+                                        RPC_TIMEOUT_S)  # #1428: retryable, see the sleep leg
+        t_w = time.time()
+        wake_ms += (t_w - t0) * 1000
+        if code != 200:
+            self.do_stop("W4 Weg2WakeRefused", f"wake({dst}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- group-fatal, recovery = teardown + relaunch")
+            return
+        # #1455: the residue measurement (NVML + host image) runs AFTER the wake answered -- it is
+        # instrumentation, not a precondition; ~250 ms off the critical path.
         pids = _session_pids(S.sid) if S.sid else set()
         dc = _nvml_process_mib(pids) if pids else {}
+        # #1444: the device residue rides in the dormant-image record, so the
+        # NEXT boot prices this form's MEASURED residue instead of the xsn14
+        # constant (launcher.dc_residue_from_record).
+        self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc)
         for uuid, mib in sorted(dc.items()):
             logger.info("WEG2-DC group=%s uuid=%s measured=%d MiB reserve=%s", src, uuid, mib, self.dc_reserve.get(uuid))
         if src == "D" and not self.dc_measured_d and dc:
@@ -4781,15 +5001,7 @@ class Front:
                 self.do_stop("W19 DormantResidueRefused",
                              f"measured D_c(D) exceeds the reserve P's budget assumed: {over} (measured, reserved) MiB -- waking P would overcommit the card")
                 return
-        # 5. wake dst kv (W4)
-        t0 = time.time()
-        self._flip_stage = "wake-kv"
-        code, body = await self.rpc(D, "/resume_memory_occupation", {"tags": [KV_TAG]}, RPC_TIMEOUT_S)
-        t_w = time.time()
-        wake_ms += (t_w - t0) * 1000
-        if code != 200:
-            self.do_stop("W4 Weg2WakeRefused", f"wake({dst}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- group-fatal, recovery = teardown + relaunch")
-            return
+        self._flip_marks["dc"] = time.time()
         self.awake = dst
         self.epoch += 1
         self.admit_d = True
@@ -4799,6 +5011,17 @@ class Front:
         self._flip_stage = "none"
         # C8: phase dwell restarts here, and the L2 admission ordinal with it.
         self.t_awake = time.time()
+        try:  # #1455 WEG2-FLIP-TIMELINE: every stage as a delta to the flip begin, one line
+            _m = self._flip_marks
+            _b = _m.get("drain", self.t_awake)
+            _order = ["drain", "quiesce", "sleep-kv", "gathered-legs", "wake-kv", "dc"]
+            _parts = " ".join(f"{k}@{(_m[k] - _b) * 1000:.0f}" for k in _order if k in _m)
+            logger.info("WEG2-FLIP-TIMELINE epoch=%d slept=%s woke=%s ms-from-begin: %s done@%.0f "
+                        "(stage@t = the moment that stage BEGAN; the D readmission continues on D after done)",
+                        self.epoch, src, dst, _parts, (self.t_awake - _b) * 1000)
+        except Exception:  # noqa: BLE001 -- a timeline never breaks a flip
+            pass
+        self._flip_marks = {}
         self._admitted_this_epoch = 0
         # C11 / L5.  interleave_ms IS NOT sleep+wake any more, and saying so is
         # the point of the line: with the legs gathered the two are different
@@ -4892,7 +5115,14 @@ class Front:
             overridden = "fairness"
         elif work_exhausted and self.w_s > 0 and oldest_wait_s >= self.w_s:
             overridden = "work"
-        ok = awake_ms >= need or overridden != "none"
+        # weg2xsn291: an override must not flip a group that woke 200 ms ago
+        # -- xsn291 epoch 10: D woke at :50.19, fairness fired at :50.44 for a
+        # request P can never hold, the D->P legs ran into W35/W68 and both
+        # groups died. A floor under every override: the woken group keeps
+        # the cards for at least FAIRNESS_DWELL_FLOOR_MS.
+        ok = awake_ms >= need or (
+            overridden != "none" and awake_ms >= FAIRNESS_DWELL_FLOOR_MS
+        )
         logger.info("WEG2 MIN-DWELL src=%s dst=%s awake_ms=%d derived_from_flip_ms=%d overridden_by=%s "
                     "provenance=%s verdict=%s",
                     src, dst, int(awake_ms), int(need), overridden, prov, "flip" if ok else "hold")
@@ -5247,7 +5477,13 @@ class Front:
             "Tensoren fehlen, verweigert weiter.", time.time() - t0)
 
     async def controller(self) -> None:
-        sem = asyncio.Semaphore(self.p_concurrency)
+        # #1459: P takes p_concurrency + P_QUEUE_AHEAD requests at once; the
+        # extra one waits in P's queue (max-running-requests bounds compute)
+        # while its intake store probe runs in the shadow of the current
+        # prefill -- boot weg2xsn214 measured a 3 s GPU-idle gap per 100k
+        # request between one prefill and the next.
+        _ahead = max(0, int(os.environ.get("SGLANG_WEG2_P_QUEUE_AHEAD", "1") or 0))
+        sem = asyncio.Semaphore(self.p_concurrency + _ahead)
         await self._adopt_first_flip()
         while True:
             await asyncio.sleep(0.2)
@@ -5319,6 +5555,10 @@ class Front:
                 queue_at_entry = len(self.queue)
                 prefilled = 0
                 passes = 0
+                # weg2xsn272: a P intake stall ends THIS drain (no new
+                # dispatches, the stalled request stays at the head) and the
+                # flip below follows because the queue is not empty.
+                self._p_intake_stalled = False
                 short_behind_p0 = self.counters.get("short_behind_p", 0)
                 # MF-3: the same delta idiom as `short_behind_p0` -- the
                 # epoch's terms are read off the running counters rather than
@@ -5327,32 +5567,61 @@ class Front:
                           self.counters.get("p_prefix_tokens_in_store", 0),
                           self.counters.get("p_prefix_tokens_reused", 0))
                 _drain_uncached = 0
-                while self.queue and self.state == "serving":
-                    passes += 1
-                    batch = [self.queue.popleft()
-                             for _ in range(min(self.p_concurrency, len(self.queue)))]
+                async def one(p: Pending) -> Pending:
+                    if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once
+                        p.leg1_done = True
+                        return p
+                    async with sem:
+                        try:
+                            await self.leg1(p)
+                        except Exception as e:  # noqa: BLE001
+                            if is_intake_stall(e) and not is_too_large(e):
+                                await self._requeue_intake_stalled(p, e)
+                                return p
+                            if is_too_large(e):
+                                # weg2xsn291: larger than P's whole pool -- no
+                                # flip can make room; refused by name, never
+                                # requeued (the requeue loop killed the boot).
+                                self.counters["p_intake_too_large"] += 1
+                                logger.error(
+                                    "WEG2 P-INTAKE-TOO-LARGE rid=%s est_prompt=%d: refused, "
+                                    "not requeued -- the request exceeds P's pool: %s",
+                                    p.rid, int(p.est_prompt), str(e)[:300])
+                            self.counters["leg1_failures"] += 1
+                            logger.error("WEG2 leg1 rid=%s failed: %s", p.rid, e)
+                            if not p.fut.done():
+                                p.fut.set_exception(e)
+                            return p
+                        p.leg1_done = True
+                        # xsn286: a request requeued by an intake stall is an
+                        # ordinary request again once its leg 1 succeeded --
+                        # the flag stayed set, _on_leg1_done skipped it, it
+                        # never reached D (weg2-6-4: prefilled 44 s on P in the
+                        # next phase, then nothing; D idle, IDLE-WEDGE).
+                        p.intake_stalled = False
+                    return p
 
-                    async def one(p: Pending):
-                        if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once
-                            p.leg1_done = True
-                            return
-                        async with sem:
-                            try:
-                                await self.leg1(p)
-                            except Exception as e:  # noqa: BLE001
-                                self.counters["leg1_failures"] += 1
-                                logger.error("WEG2 leg1 rid=%s failed: %s", p.rid, e)
-                                if not p.fut.done():
-                                    p.fut.set_exception(e)
-                                return
-                            p.leg1_done = True
-                    await asyncio.gather(*(one(p) for p in batch))
-                    _drain_uncached += sum(int(q.est_uncached) for q in batch)
-                    for p in batch:
-                        if not p.fut.done():
-                            self._ready_for_d.append(p)
-                            self._sync_batch_gate()
-                            prefilled += 1
+                def _on_leg1_done(p: Pending) -> None:
+                    nonlocal _drain_uncached, prefilled
+                    if p.intake_stalled:
+                        return  # weg2xsn272: back in the queue, not ready for D
+                    _drain_uncached += int(p.est_uncached)
+                    if not p.fut.done():
+                        self._ready_for_d.append(p)
+                        self._sync_batch_gate()
+                        prefilled += 1
+
+                # #1459c: a CONTINUOUS pool, not paired batches.  The #1459
+                # form dispatched `p_concurrency + ahead` requests as ONE
+                # batch and gathered the whole batch before taking the next,
+                # so only every second request had a successor queued on P
+                # while it ran (xsn217: -7 finished 26.2 s after -6, -8 took
+                # 29.5 s again -- the 3 s store probe was back on every
+                # second request).  The pool refills the moment ONE leg
+                # finishes, so P always has the next request queued.
+                passes = await _p_drain_pool(
+                    self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
+                    lambda: self.state == "serving" and not self._p_intake_stalled)
                 if passes:
                     oldest_short = 0.0
                     if self._ready_for_d:
@@ -5383,7 +5652,8 @@ class Front:
                 # prefilled sitting on `await fut` behind a one-hour client
                 # timeout -- a LOST-REQUEST class introduced by the fix for
                 # law 5.  The admitter (C4) releases them once D is awake.
-                if self.queue or self._ready_for_d:
+                if self.queue or self._ready_for_d or (self.dormant_admit and self.groups["D"].outstanding):
+                    # #1443: requests already handed to the dormant D are a reason to flip too
                     await self.flip("P", "D")
                 elif self._idle_disposition("P", at_rest=True) == "flip":
                     await self.flip("P", "D")
@@ -5645,12 +5915,47 @@ class Front:
     async def handle_manual_flip(self, request: web.Request) -> web.Response:
         if self.state != "serving":
             return web.json_response({"error": self.state}, status=503)
+        # #1493: a manual flip from D turns around inside one request, so the
+        # return wake pays for whatever the sleeper has not released yet.
+        # Measured BEFORE the flip out, because after it there is no group
+        # left to refuse on behalf of.
+        why = self._manual_flip_refusal()
+        if why is not None:
+            logger.error("%s", why)
+            return web.json_response({"error": "manual-flip-refused", "why": why,
+                                      "code": "W115"}, status=409)
         src, dst = self.awake, ("P" if self.awake == "D" else "D")
         self.admit_d = False
         await self.flip(src, dst)
         if self.awake == "P" and self.state == "serving":
             await self.flip("P", "D")
         return web.json_response(self.state_dict())
+
+    def _manual_flip_refusal(self) -> Optional[str]:
+        """#1493: the two readings behind :func:`manual_flip_residency_refusal`.
+
+        Fail-soft by construction: any reading that cannot be taken makes this
+        None, so the endpoint behaves exactly as before rather than refusing
+        on a blind guess.
+        """
+        try:
+            sleeper = "P" if self.awake == "D" else "D"
+            rec = (self.dormant_image or {}).get(sleeper) or {}
+            dormant = rec.get("vram_residue_mib")
+            used = None
+            pids = getattr(self, "group_pids", None)
+            if callable(pids):
+                pids = pids(sleeper)
+            if pids:
+                by_uuid = _nvml_process_mib(set(pids))
+                if by_uuid:
+                    used = max(int(v) for v in by_uuid.values())
+            return manual_flip_residency_refusal(
+                awake=self.awake, sleeper=sleeper,
+                sleeper_used_mib=used, sleeper_dormant_mib=dormant,
+            )
+        except Exception:  # noqa: BLE001 -- a guard may not break the endpoint
+            return None
 
 
 def main():
@@ -5665,6 +5970,7 @@ def main():
     ap.add_argument("--prefill-sid", type=int, default=0)
     ap.add_argument("--decode-sid", type=int, default=0)
     ap.add_argument("--dc-reserve", default="", help="uuid=mib,uuid=mib")
+    ap.add_argument("--weight-form", default="", help="#1444: weight source form stamped into the dormant record")
     ap.add_argument("--fairness-w-s", type=float, default=45.0,
                     help="A1-1: the ONLY sanctioned pre-emption of a P drain or a D exhaustion. "
                          "Seconds the oldest waiter may wait before the front stops admitting new "
@@ -5774,6 +6080,7 @@ def main():
     front = Front(args.prefill, args.decode, args.awake, args.tag, args.store_dir, args.prefill_sid, args.decode_sid, dc, args.fairness_w_s,
                   weight_chunks=args.weight_chunks, carrier_max_tokens=args.carrier_max_tokens,
                   weights_resident=args.weights_resident,
+                  weight_form=args.weight_form,
                   p_concurrency=args.p_concurrency, d_bs=args.d_bs,
                   tp_prefill_max_tokens=args.tp_prefill_max_tokens,
                   flip_min_work_tokens=args.flip_min_work_tokens,

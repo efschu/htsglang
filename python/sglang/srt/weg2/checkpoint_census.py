@@ -402,7 +402,8 @@ def widest_layer_terms(model_dir: str, *, pairs: int, depth: int,
                        slot_bytes: int = 0, n_lanes: int = 1,
                        max_tag_bytes: int = 0, lanes_concurrent: int = 0,
                        band_credit: bool = False,
-                       n_cross_lanes: Optional[int] = None):
+                       n_cross_lanes: Optional[int] = None,
+                       price_lane_cap: int = 0):
     """``(BounceTerms, widest_line, widest_layer_name)`` for the launcher.
 
     ONE CALL SITE'S WORTH of glue, kept here so the launcher holds no
@@ -463,6 +464,7 @@ def widest_layer_terms(model_dir: str, *, pairs: int, depth: int,
         lanes_concurrent=int(lanes_concurrent),
         band_credit=bool(band_credit),
         n_cross_lanes=n_cross_lanes,
+        price_lane_cap=int(price_lane_cap or 0),
         **kw,
     )
     return terms, widest_line(census), f"layer {idx}"

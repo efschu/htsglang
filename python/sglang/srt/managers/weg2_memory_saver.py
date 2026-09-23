@@ -822,6 +822,14 @@ def _w108_persist_s() -> float:
     except ValueError:
         return 20.0
 
+class Weg2XchgCreditCycleRefused(RuntimeError):
+    """W109 (#22, xsn323) -- this rank's credit wait is one edge of a CYCLE:
+    the sleeper co-located with it (whose pauses fund the credit) is itself
+    blocked on a BAR1 deposit that a waker of this group collects only after
+    ITS credit, and the chain of such edges closes here. Named after a few
+    seconds of grace (bar1_lanes.ENV_CYCLE_GRACE_S) instead of after the
+    120 s credit budget (W35) -- the cycle cannot resolve itself."""
+
 
 class Weg2XchgLaneNeverDrainedRefused(RuntimeError):
     """W108 -- a bounce lane already carries undrained bands nobody will ever
@@ -955,6 +963,13 @@ class Weg2VramCreditAllocatableShort(Weg2VramCreditRefused):
     -pattern trap. `test_weg2_wcode_uniqueness_1263` is the authority.
     """
 
+class _AllocatableTransient(Exception):
+    """weg2xsn258: raised by `wait_for`'s grant gate INSIDE `claim`'s lock when
+    the card's allocatable estimate is short of the request but the bounded
+    poll has not expired. `claim` writes nothing on it; `wait_for` catches
+    it, sleeps outside the lock and re-tries. Never leaves `wait_for`."""
+
+
 class VramCredit:
     """The device-side mirror of the host ring's bitmap, per physical GPU.
 
@@ -1074,6 +1089,77 @@ class VramCredit:
             self._store(handle, state)
             return total
 
+    def debit(self, tag: str, nbytes: int, free_bytes: Optional[int] = None,
+              floor_bytes: Optional[int] = None) -> bool:
+        """S takes device bytes BACK from its own published credit for a
+        transient it parks on this card: the on-card IPC staging of a
+        deposit lane (weg2xsn269, 18.09.). The staging is a cudaMalloc on
+        the SAME card the waking rank resumes into; unbooked, the waker's
+        check (credit and free VRAM, both true at that instant) and the
+        depositor's next staging raced 240 ms apart and the waker's
+        cuMemCreate ran out of memory -- the memory saver's CURESULT_CHECK
+        is an exit(1), so TP0 vanished without a traceback and group D died
+        (xsn269 flip 4). Booked here as consumed bytes under the same lock
+        the waker claims under, a staging can only take what the waker was
+        never promised. Returns False (nothing written) when the balance
+        does not cover it; the caller then takes the host path."""
+        want = max(0, int(nbytes))
+        with self._locked(True) as handle:
+            state = self._load(handle)
+            if not state:
+                return False
+            credit = int(state.get("credit_bytes", 0))
+            consumed = int(state.get("consumed_bytes", 0))
+            staged = int(state.get("staged_bytes", 0))
+            if credit - consumed < want:
+                # Task #20 (18.09., xsn302-309): at the START of a leg nothing is
+                # published yet, so every on-card staging fell to the host path
+                # (PP0: 5 x 1309 MiB per flip, ~1 s). The card's FREE VRAM at
+                # that moment is large (the sleeper's KV pool went first,
+                # sleep-kv precedes the legs): bytes that are free AND not
+                # promised to the waker (credit - consumed) AND not already
+                # staged may be staged. Booked as OVERDRAWN staging: it counts
+                # in staged_bytes (the waker's early exit subtracts it) but not
+                # in consumed_bytes (the waker's counter balance is untouched).
+                if free_bytes is None:
+                    return False
+                promised = max(0, credit - consumed)
+                floor = max(0, int(floor_bytes or 0))
+                if int(free_bytes) - floor - promised - staged < want:
+                    return False
+                state["overdraw_bytes"] = int(state.get("overdraw_bytes", 0)) + want
+                state["staged_bytes"] = staged + want
+                stagings = list(state.get("stagings", []))
+                stagings.append(str(tag) + ":overdraw")
+                state["stagings"] = stagings
+                self._store(handle, state)
+                return True
+            state["consumed_bytes"] = consumed + want
+            state["staged_bytes"] = staged + want
+            stagings = list(state.get("stagings", []))
+            stagings.append(str(tag))
+            state["stagings"] = stagings
+            self._store(handle, state)
+            return True
+
+    def refund(self, tag: str, nbytes: int) -> None:
+        """The staging booked by :meth:`debit` is freed: the bytes return
+        to the balance (never below zero, never past what was staged)."""
+        want = max(0, int(nbytes))
+        with self._locked(True) as handle:
+            state = self._load(handle)
+            if not state or want == 0:
+                return
+            staged = int(state.get("staged_bytes", 0))
+            give = min(want, staged)
+            state["staged_bytes"] = staged - give
+            # an overdrawn staging never touched consumed_bytes: refund it first
+            over = int(state.get("overdraw_bytes", 0))
+            from_over = min(give, over)
+            state["overdraw_bytes"] = over - from_over
+            state["consumed_bytes"] = max(0, int(state.get("consumed_bytes", 0)) - (give - from_over))
+            self._store(handle, state)
+
     def leg_complete(self) -> None:
         """S closes its leg.  This is W's terminating predicate."""
         with self._locked(True) as handle:
@@ -1095,8 +1181,15 @@ class VramCredit:
         epoch: Optional[Any] = None,
         require_full: bool = False,
         gate=None,
+        overdraw: bool = False,
     ) -> Dict[str, Any]:
         """W takes bytes OFF this leg's credit -- the debit half of `publish`.
+
+        ``overdraw`` (weg2xsn290): take the WHOLE ``want`` even when the
+        counter does not cover it, so ``consumed`` runs past ``credit`` and
+        the balance the peer's :meth:`debit` reads is 0 until the peer
+        publishes past the deficit -- the physical bytes were taken off the
+        card's free space, and the counter must say so.
 
         #1349, MEASURED ON BOOT weg2xsn21b (D rank 0, the 5090
         GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d, 2026-09-12 16:06:26Z):
@@ -1139,9 +1232,12 @@ class VramCredit:
             consumed = int(state.get("consumed_bytes", 0))
             available = max(0, credit - consumed)
             covered = available >= want
-            claimed = 0 if (require_full and not covered) else min(available, want)
+            if overdraw:
+                claimed = want
+            else:
+                claimed = 0 if (require_full and not covered) else min(available, want)
             gate_value = None
-            if gate is not None and (covered or not require_full):
+            if gate is not None and (covered or not require_full or overdraw):
                 gate_value = gate(available)  # may raise; nothing is written
             if claimed > 0:
                 state["credit_bytes"] = credit
@@ -1158,6 +1254,7 @@ class VramCredit:
                 "available_bytes": available - claimed,
                 "claimed_bytes": claimed,
                 "covered": covered,
+                "staged_bytes": int(state.get("staged_bytes", 0)),
                 "leg_complete": bool(state.get("leg_complete")),
                 "stale_epoch": stale_epoch,
                 "gate": gate_value,
@@ -1204,6 +1301,12 @@ class VramCredit:
         #: 120 s poll ran to its end without ever looking again. ``None``
         #: (default) keeps every existing caller's behaviour byte-identical.
         stuck_lane_reader=None,
+        #: #22: ``() -> chain | None`` -- the BAR1 credit-cycle reader, same
+        #: cadence; a chain raises W109 at once.
+        cycle_reader=None,
+        #: weg2xsn258: the bounded allocatable poll (xsn108, 30 s) -- now
+        #: taken OUTSIDE the counter lock, see `_AllocatableTransient`.
+        alloc_poll_s: float = 30.0,
     ) -> Dict[str, Any]:
         """W waits for the peer to fund ``need_bytes``, or refuses by name.
 
@@ -1242,7 +1345,17 @@ class VramCredit:
         if need == 0:
             return {"waited_s": 0.0, "reason": "this tag needs no device bytes"}
         floor = max(0, int(floor_bytes or 0))
-        if free_bytes_now is not None and int(free_bytes_now) >= need:
+        # weg2xsn274 (18.09.): THE EARLY EXIT GRADED FREE WITHOUT THE FLOOR.
+        # TP0 (5090) took it with free=3156 MiB for a 2502 MiB tag while the
+        # measured floor was 767 MiB: 3156 - 767 = 2389 < 2502, the gate below
+        # would have waited, this exit did not, cu_mem_create ran out of
+        # memory and the memory saver exit(1)'d the rank (xsn272 took the same
+        # exit 58 times and survived by margin). The exit now grades the
+        # ALLOCATABLE estimate, the same term the gate grades.
+        if (
+            free_bytes_now is not None
+            and int(free_bytes_now) - floor >= need
+        ):
             # #1349: THE EARLY EXIT SPENDS CREDIT TOO, and not debiting it was
             # the second route to the same wall.  "The card already holds the
             # bytes" does not say WHOSE bytes they are: on a co-located pair the
@@ -1254,19 +1367,87 @@ class VramCredit:
             # not that the peer funded them, so it takes only what the counter
             # actually has.  `epoch` keeps a stale or absent counter at zero, so
             # a single-group boot writes nothing and still costs nothing.
-            spent = self.claim(tag, need, epoch=epoch)
-            return {
-                "waited_s": 0.0,
-                "free_bytes": int(free_bytes_now),
-                "credit_bytes": spent["credit_bytes"],
-                "consumed_bytes": spent["consumed_bytes"],
-                "available_bytes": spent["available_bytes"],
-                "claimed_bytes": spent["claimed_bytes"],
-                "reason": (
-                    "the card already holds the bytes, so no peer release funds "
-                    "this tag and none is waited for"
-                ),
-            }
+            # weg2xsn284 (18.09.): FREE ALONE IS NO LICENCE ON A SHARED CARD.
+            # TP0 took this exit with free=4338, floor=767 (allocatable 3571
+            # for 2502) and a balance of 741 MiB; the co-located sleeper, whose
+            # refunded staging had just re-funded the balance, staged its next
+            # tag (1673 MiB) between this reading and TP0's cu_mem_create --
+            # OOM, exit(1). The bytes this exit reads as free are exactly what
+            # the peer's counter still licenses the peer to take. So the exit
+            # holds only when the counter COVERS the tag (a full claim), or
+            # when there is no counter at all (single-group boot: credit 0,
+            # nothing published, nothing to spend); a live counter that is
+            # short sends the tag into the loop, whose gate re-reads free
+            # against the balance the peer cannot exceed.
+            spent = self.claim(tag, need, epoch=epoch, require_full=True)
+            if int(spent["claimed_bytes"]) >= need or int(spent["credit_bytes"]) == 0:
+                return {
+                    "waited_s": 0.0,
+                    "free_bytes": int(free_bytes_now),
+                    "allocatable_est_bytes": max(0, int(free_bytes_now) - floor),
+                    "corridor_floor_bytes": floor,
+                    "credit_bytes": spent["credit_bytes"],
+                    "consumed_bytes": spent["consumed_bytes"],
+                    "available_bytes": spent["available_bytes"],
+                    "claimed_bytes": spent["claimed_bytes"],
+                    "reason": (
+                        "the card already holds the bytes above its corridor floor "
+                        + ("and the peer's counter covers the tag"
+                           if int(spent["claimed_bytes"]) >= need
+                           else "and no peer counter licenses them away")
+                    ),
+                }
+            # weg2xsn290 (18.09.): A SHORT COUNTER MUST NOT WAIT FOR BYTES THE
+            # CARD ALREADY HOLDS -- that wait is a cycle. TP1 waited here for
+            # weights_4's credit, which PP1 publishes only after pausing
+            # weights_5, whose deposit waits for TP1 to collect weights_4 off
+            # lane c1, which TP1 does only after this wait: 180 s, W68 on every
+            # P rank, boot dead. xsn284's hazard (the peer's refund + re-stage
+            # landing between this reading and cu_mem_create) is closed
+            # differently: the peer's staging is debit-gated on this same
+            # counter (xsn269), so the claim is OVERDRAWN by the whole tag --
+            # the balance the peer reads is 0 until it publishes past the
+            # deficit and its next staging takes the host path -- and the free
+            # reading is taken AGAIN after the claim, minus the staging the
+            # peer has live (debited) right now, so a malloc in flight cannot
+            # be double-counted as free.
+            _free_again = int(free_reader() if free_reader is not None else free_bytes_now)
+            _staged = int(spent.get("staged_bytes", 0))
+            if _free_again - floor - _staged >= need:
+                spent = self.claim(tag, need, epoch=epoch, overdraw=True)
+                logger.info(
+                    "WEG2-CREDIT-EARLY tag=%s free=%d MiB floor=%d MiB peer_staged=%d MiB "
+                    ">= need=%d MiB with the counter SHORT (balance was %d MiB): claim "
+                    "OVERDRAWN by %d MiB -- the peer's next staging takes the host path "
+                    "until it publishes past the deficit (xsn290: waiting here was the "
+                    "deposit/collect cycle)",
+                    tag, _free_again // MIB, floor // MIB, _staged // MIB, need // MIB,
+                    int(spent["available_before_bytes"]) // MIB,
+                    max(0, need - int(spent["available_before_bytes"])) // MIB,
+                )
+                return {
+                    "waited_s": 0.0,
+                    "free_bytes": _free_again,
+                    "allocatable_est_bytes": max(0, _free_again - floor),
+                    "corridor_floor_bytes": floor,
+                    "credit_bytes": spent["credit_bytes"],
+                    "consumed_bytes": spent["consumed_bytes"],
+                    "available_bytes": spent["available_bytes"],
+                    "claimed_bytes": spent["claimed_bytes"],
+                    "reason": (
+                        "the card physically holds the bytes above its corridor floor and "
+                        "the peer's live staging; the counter is short and the claim is "
+                        "OVERDRAWN, so the peer's staging takes the host path (xsn290)"
+                    ),
+                }
+            logger.info(
+                "WEG2-CREDIT-WAIT tag=%s free=%d MiB allocatable=%d MiB >= need=%d MiB, "
+                "but the peer's counter is SHORT (balance %d MiB) and free minus the "
+                "peer's live staging (%d MiB) does not hold the tag; waiting on the "
+                "counter (xsn284/xsn290)",
+                tag, _free_again // MIB, max(0, _free_again - floor) // MIB,
+                need // MIB, int(spent["available_before_bytes"]) // MIB, _staged // MIB,
+            )
         deadline = time.monotonic() + float(budget_s)
         t0 = time.perf_counter()
         stale_epoch = None
@@ -1294,7 +1475,26 @@ class VramCredit:
         # stuck lane stays full; the lockstep drains.
         _stuck_since = None
         _stuck_persist_s = _w108_persist_s()
+
+        # weg2xsn258: the allocatable poll's own clock, started at the first
+        # short reading and cleared by the first reading that covers `need`.
+        _alloc_wait: Dict[str, Any] = {"t0": None}
         while True:
+            if cycle_reader is not None and time.monotonic() >= _next_lane_check:
+                try:
+                    _chain = cycle_reader()
+                except Exception:  # noqa: BLE001 -- a probe may not raise
+                    _chain = None
+                if _chain:
+                    raise Weg2XchgCreditCycleRefused(
+                        f"W109 Weg2XchgCreditCycleRefused: card={self.uuid} tag={tag}: "
+                        f"this credit wait is one edge of a cycle (found "
+                        f"{time.perf_counter() - t0:.1f}s into the wait): "
+                        + " -> ".join(f"sleeper{s} blocked depositing {t} to waker{d}"
+                                      for s, d, t in _chain)
+                        + "; every waker in the chain waits for a credit its "
+                        "co-located sleeper cannot fund before its deposit "
+                        "drains, and no collect of these tags is submitted")
             if stuck_lane_reader is not None and time.monotonic() >= _next_lane_check:
                 _next_lane_check = time.monotonic() + 1.0
                 try:
@@ -1367,18 +1567,25 @@ class VramCredit:
                     # next tag's credit while that collect is still in
                     # flight. Poll the allocatable estimate (bounded) before
                     # refusing; a genuine shortfall still refuses by name.
-                    import time as _time85
-                    _t85 = _time85.perf_counter()
-                    while (allocatable_est is not None and allocatable_est < need
-                           and _time85.perf_counter() - _t85 < 30.0):
-                        _time85.sleep(0.05)
-                        free_now = self._free_now(free_reader)
-                        allocatable_est = (
-                            None if free_now is None else max(0, free_now - floor))
+                    #
+                    # weg2xsn258 (17.09.): THAT POLL RAN INSIDE `claim`'s
+                    # EXCLUSIVE flock -- up to 30 s with the counter file
+                    # locked -- and the co-located sleeper's `publish` of the
+                    # very tag this rank waited for blocked behind it
+                    # (D-TP0 weights_1: credit_ms=30008; PP0 then never saw
+                    # a balance >= need and died of the 120 s budget). The
+                    # poll now lives OUTSIDE the lock: this gate raises, the
+                    # claim writes nothing, and `wait_for`'s own loop (below)
+                    # re-tries on the same bounded clock, holding the lock
+                    # only for the ms of one read.
+                    if _alloc_wait["t0"] is None:
+                        _alloc_wait["t0"] = time.perf_counter()
                     _dev["free_bytes"] = free_now
                     _dev["allocatable_est_bytes"] = allocatable_est
                     _dev["allocatable_waited_ms"] = int(
-                        (_time85.perf_counter() - _t85) * 1000)
+                        (time.perf_counter() - _alloc_wait["t0"]) * 1000)
+                    if time.perf_counter() - _alloc_wait["t0"] < float(alloc_poll_s):
+                        raise _AllocatableTransient()
                 if allocatable_est is not None and allocatable_est < need:
                     raise Weg2VramCreditAllocatableShort(
                         f"W85 Weg2VramCreditAllocatableShort card={self.uuid} "
@@ -1399,9 +1606,14 @@ class VramCredit:
                         f"bytes an earlier tag of the same leg already took."
                     )
 
-            rec = self.claim(
-                tag, need, epoch=epoch, require_full=True, gate=_grant_gate
-            )
+            try:
+                rec = self.claim(
+                    tag, need, epoch=epoch, require_full=True, gate=_grant_gate
+                )
+            except _AllocatableTransient:
+                # The lock is released; the peer's publish can land now.
+                time.sleep(0.05)
+                continue
             if rec["stale_epoch"] is not None:
                 # Not this flip's counter -- and "this flip" means THIS BOOT's
                 # flip: the comparison is on the composed token of
@@ -2860,6 +3072,66 @@ def weights_region_tag(tag: str) -> Iterator[str]:
 #: Python frames alone could not name the corrupter.
 _SEGVBT_HANDLE = None
 
+#: weg2xsn269 (18.09.): THE RESUME THAT RAISES INSTEAD OF DYING.  The pip
+#: binding's ``resume(tag)`` calls the void ``tms_resume``, whose only failure
+#: mode is exit(1) from inside a driver call -- measured, the D rank of
+#: weg2xsn269 printed ``CUresult error: out of memory`` and was gone, no
+#: traceback, no W-code.  The weg2 hook exports ``tms_resume_rc`` (same
+#: resume, returns the CUresult, rolls the tag back to PAUSED on failure);
+#: this helper prefers it whenever the hook's path is in the rank's env and
+#: the symbol exists, and falls back to the adapter otherwise -- an old hook
+#: keeps the old behaviour, never a silent no-op.
+_TMS_RC_HANDLE = None
+_TMS_RC_MISSING = False
+
+
+def _tms_resume_rc_symbol():
+    global _TMS_RC_HANDLE, _TMS_RC_MISSING
+    if _TMS_RC_MISSING:
+        return None
+    if _TMS_RC_HANDLE is None:
+        so = os.environ.get("SGLANG_WEG2_TMS_PRELOAD_SO", "")
+        if not so:
+            _TMS_RC_MISSING = True
+            return None
+        try:
+            import ctypes
+
+            lib = ctypes.CDLL(so)
+            fn = lib.tms_resume_rc
+            fn.argtypes = [ctypes.c_char_p]
+            fn.restype = ctypes.c_int
+            _TMS_RC_HANDLE = fn
+        except (OSError, AttributeError) as exc:
+            _TMS_RC_MISSING = True
+            logger.warning(
+                "WEG2-TMS-RESUME rc symbol unavailable (%s): %s -- falling back to "
+                "the void resume (a refused resume then exits the rank)", so, exc)
+            return None
+    return _TMS_RC_HANDLE
+
+
+def weg2_tms_resume(adapter, tag: str, *, rc_fn=None) -> int:
+    """Resume ``tag`` and RAISE on a refused resume. Returns the rc (always 0).
+
+    ``rc_fn`` is the injectable ``tms_resume_rc`` (tests); by default the
+    hook's symbol from ``SGLANG_WEG2_TMS_PRELOAD_SO``. Without it the
+    adapter's own resume runs, unchanged.
+    """
+    fn = rc_fn if rc_fn is not None else _tms_resume_rc_symbol()
+    if fn is None:
+        adapter.resume(tag)
+        return 0
+    rc = int(fn(str(tag).encode()))
+    if rc != 0:
+        raise RuntimeError(
+            f"WEG2-TMS-RESUME REFUSED tag={tag} rc={rc} -- the card refused the "
+            f"VMM remap (rc 2 = CUDA_ERROR_OUT_OF_MEMORY); every allocation of the "
+            f"tag is PAUSED again, the rank keeps its frames (weg2xsn269 died here "
+            f"with exit(1) and no traceback)"
+        )
+    return 0
+
 
 def _load_native_segv_backtrace() -> None:
     global _SEGVBT_HANDLE
@@ -2876,6 +3148,60 @@ def _load_native_segv_backtrace() -> None:
 
 
 _load_native_segv_backtrace()
+
+
+#: weg2xsn296 (18.09., Nutzer-Order "ALLES was runter kann in den System-RAM"):
+#: THE RESIDUE INSTRUMENT. After a sleep the process still holds ~1.0 GB (P)
+#: / ~1.5 GB (D) per card (xsn295 [weg2 sleep-acceptance] proc_used) that no
+#: tag covers. Torch's own view says which allocations those are, but only
+#: with stacks recorded from the START of the process: SGLANG_WEG2_MEMHIST=1
+#: arms torch.cuda.memory._record_memory_history at rank start; the sleep
+#: path then dumps a snapshot next to the boot's evidence (see
+#: weight_updater._weg2_log_sleep_residue) for debugtools memsnapshot_analyze.
+MEMHIST_ENV = "SGLANG_WEG2_MEMHIST"
+_MEMHIST_ARMED = False
+
+
+def _arm_memory_history() -> None:
+    global _MEMHIST_ARMED
+    if _MEMHIST_ARMED or os.environ.get(MEMHIST_ENV, "") != "1":
+        return
+    try:
+        import torch
+
+        torch.cuda.memory._record_memory_history(max_entries=200000)
+        _MEMHIST_ARMED = True
+        logger.info("WEG2-MEMHIST armed: torch allocation history with stacks (SGLANG_WEG2_MEMHIST=1)")
+    except Exception as exc:  # noqa: BLE001 -- an instrument never kills a rank
+        logger.warning("WEG2-MEMHIST NOT armed: %s", exc)
+
+
+_arm_memory_history()
+
+
+def sleep_residue_terms(
+    *, active_bytes: int, reserved_bytes: int, tagged_bytes: int, nvml_used_bytes: Optional[int]
+) -> Dict[str, int]:
+    """The post-sleep residue split three ways (all MiB-free integers, bytes):
+
+    * ``untagged_live`` -- torch allocations alive that NO tag covers: what
+      the memory saver cannot pause and the order says must go to host RAM;
+    * ``torch_reserved`` -- torch's cudaMalloc'ed segments (still counting the
+      tagged ones the saver unmapped underneath, so it is NOT device
+      residency);
+    * ``outside_torch`` -- NVML per-process bytes minus what torch holds
+      alive and untagged: CUDA context, comm windows, non-torch allocations.
+      ``None``-safe: an unreadable NVML reading yields -1 here, never 0.
+    """
+    untagged = max(0, int(active_bytes) - int(tagged_bytes))
+    outside = -1 if nvml_used_bytes is None else max(0, int(nvml_used_bytes) - untagged)
+    return {
+        "active_bytes": int(active_bytes),
+        "tagged_bytes": int(tagged_bytes),
+        "untagged_live": untagged,
+        "torch_reserved": int(reserved_bytes),
+        "outside_torch": outside,
+    }
 
 
 #: #1378 xsn66 -- ONE CACHING-ALLOCATOR POOL PER WEIGHTS TAG, process-local.
@@ -3473,4 +3799,198 @@ def dormant_refusal_message(*, rid: str, context: str) -> str:
         "on released VMM pages and kill the group (S1 boot killer K2). Route "
         "to the awake group via the Weg-2 front on :30030, or wake this group "
         "first (resume_memory_occupation)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1446: THE DORMANT RESIDUE, ATTRIBUTED ON THE RANK AT EVERY SLEEP
+# ---------------------------------------------------------------------------
+#
+# The front measures the sleeping group's residue as ONE number per card
+# (``WEG2-DC group=D measured=1616..1686 MiB`` on the 5090, boot weg2xsn205)
+# and the launcher prices it (#1444).  Section [1y] above attributed 1462 of
+# rg6's 1820 MiB by reading dumps; 358 MiB stayed unattributed, and with the
+# graph pool and the float workspace now tagged (458 MiB released) the
+# measured residue still sits ~650 MiB above the [1y] rows.  This is the live
+# attribution, printed by the rank itself at every release RPC, from the three
+# instruments the rank owns:
+#
+#   nvml      NVML per-process bytes for THIS pid on THIS card -- the front's
+#             own quantity, so the two lines are comparable;
+#   torch     the caching allocator's reserved/allocated -- everything that
+#             went through torch and is not in a saver region;
+#   tms       the saver's per-tag byte sums, split by ``offload_tags`` into
+#             RESIDENT (mapped) and PAUSED (unmapped -- physically gone, but
+#             still in the saver's ledger).
+#
+# The remainder ``other = nvml - torch_reserved - tms_resident`` is what no
+# allocator owns: the CUDA context and its kernel images, the driver's own
+# state, the communicator/BAR1 windows, and anything cudaMalloc'd outside
+# torch.  That is the part a remap cannot move, and it is the floor the
+# corridor pays; the two allocator parts are the part a tag or an
+# ``empty_cache`` CAN move.  A reading that could not be taken is ``None`` on
+# the line, never 0 (NULL-NUR-BEI-ERREICHTEM-EMITTER).
+
+
+def dc_breakdown(
+    *,
+    nvml_proc_bytes: Optional[int],
+    torch_reserved: Optional[int],
+    torch_allocated: Optional[int],
+    tag_bytes: Dict[str, int],
+    offload_tags: Any,
+    card_total_bytes: Optional[int] = None,
+    card_free_bytes: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Pure: the attribution record from the three readings.  MiB, rounded."""
+    paused = {str(t) for t in (offload_tags or ())}
+    res_tags = {t: int(b) for t, b in tag_bytes.items() if b and t not in paused}
+    pau_tags = {t: int(b) for t, b in tag_bytes.items() if b and t in paused}
+    res = sum(res_tags.values())
+    pau = sum(pau_tags.values())
+    mib = lambda b: None if b is None else int(round(b / (1024 * 1024)))  # noqa: E731
+    # MEASURED (boot weg2xsn206, TP0 after every leg): torch_reserved 28940 with
+    # tms_paused 28146 and nvml_proc 1640 -- torch's counters KEEP the saver's
+    # regions (resident AND paused) as reserved, so the allocator's own
+    # untagged share is reserved minus BOTH tag sums, and the remainder the
+    # driver reports beyond that is what no allocator owns.
+    untagged = None
+    other = None
+    if torch_reserved is not None:
+        untagged = max(0, int(torch_reserved) - res - pau)
+        if nvml_proc_bytes is not None:
+            other = int(nvml_proc_bytes) - res - untagged
+    return {
+        "nvml_proc_mib": mib(nvml_proc_bytes),
+        "torch_reserved_mib": mib(torch_reserved),
+        "torch_allocated_mib": mib(torch_allocated),
+        "torch_untagged_mib": mib(untagged),
+        "tms_resident_mib": mib(res),
+        "tms_paused_mib": mib(pau),
+        "resident_tags_mib": {t: mib(b) for t, b in sorted(res_tags.items())},
+        "paused_tags_mib": {t: mib(b) for t, b in sorted(pau_tags.items())},
+        "other_mib": mib(other),
+        # --- #1491: the CARD, not just this process -----------------------
+        # The three readings above answer "what does MY pid hold". Boots
+        # weg2xsn406 and weg2xsn408 asked a question they cannot answer: D's
+        # TP1 found 8387 MiB free at its first wake and 5974 MiB at its
+        # second, and this rank's own dormant residue grew by only 232 MiB in
+        # between (untagged_live 224 -> 437, nvml_proc 1598 -> 1830). The
+        # missing ~2.2 GiB is on the card and belongs to SOMEONE ELSE -- the
+        # co-resident P group, which prefills on the same card between D's
+        # wakes. No instrument read that, so it was never attributed, and the
+        # wake walked into an OOM it could have named.
+        #
+        # `card_other_procs` is that term: total - free - mine. It is a
+        # RESIDUAL, so it also absorbs any driver accounting this process
+        # cannot see -- named as a residual rather than claimed as the
+        # sibling's, because the honest bound is "not mine".
+        "card_total_mib": mib(card_total_bytes),
+        "card_free_mib": mib(card_free_bytes),
+        "card_other_procs_mib": (
+            None
+            if (card_total_bytes is None or card_free_bytes is None
+                or nvml_proc_bytes is None)
+            else mib(max(0, int(card_total_bytes) - int(card_free_bytes)
+                         - int(nvml_proc_bytes)))
+        ),
+    }
+
+
+#: The posts a wake-to-wake comparison walks, biggest mover first. `card_free`
+#: leads because it is the quantity the wake actually fails on; the rest say
+#: WHO took it.
+DC_CREEP_POSTS = (
+    "card_free_mib",
+    "card_other_procs_mib",
+    "nvml_proc_mib",
+    "torch_untagged_mib",
+    "other_mib",
+    "tms_resident_mib",
+    "tms_paused_mib",
+    "torch_reserved_mib",
+)
+
+#: Per-process store of the previous record per key (rank+stage). Process-local
+#: by construction: a creep is a statement about ONE rank's own history.
+_dc_previous: Dict[str, Dict[str, Any]] = {}
+
+
+def remember_dc(key: str, rec: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Store ``rec`` under ``key`` and return what was there before."""
+    prev = _dc_previous.get(str(key))
+    if rec is not None:
+        _dc_previous[str(key)] = dict(rec)
+    return prev
+
+
+def forget_dc(key: Optional[str] = None) -> None:
+    """Test-only. Drop one key's history, or all of it."""
+    if key is None:
+        _dc_previous.clear()
+    else:
+        _dc_previous.pop(str(key), None)
+
+
+def dc_creep(prev: Optional[Dict[str, Any]],
+             cur: Optional[Dict[str, Any]]) -> Optional[Dict[str, int]]:
+    """Per-post MiB delta ``cur - prev``, or None when there is nothing to say.
+
+    A post missing from EITHER record is left out entirely rather than read as
+    a zero: a reading that could not be taken is an absence
+    (NULL-NUR-BEI-ERREICHTEM-EMITTER), and a zero delta built from two
+    absences is the exact shape that made this creep invisible for two boots.
+    """
+    if not prev or not cur:
+        return None
+    out: Dict[str, int] = {}
+    for post in DC_CREEP_POSTS:
+        a, b = prev.get(post), cur.get(post)
+        if a is None or b is None:
+            continue
+        out[post] = int(b) - int(a)
+    return out or None
+
+
+def format_dc_creep(delta: Optional[Dict[str, int]], *, stage: str,
+                    since: str = "the previous wake") -> str:
+    """The one creep line (``WEG2-VRAM-CREEP``). Names the biggest TAKER.
+
+    "Biggest taker" is the post that GREW most, except for ``card_free_mib``,
+    where growth is good news -- it is reported as the headline number and
+    never nominated as a culprit.
+    """
+    if not delta:
+        return (f"WEG2-VRAM-CREEP stage={stage} n/a -- no comparable record from "
+                f"{since} on this rank (first wake, or a reading that could not "
+                f"be taken; an absence, not a zero)")
+    takers = {k: v for k, v in delta.items() if k != "card_free_mib"}
+    worst = max(takers.items(), key=lambda kv: kv[1]) if takers else None
+    free = delta.get("card_free_mib")
+    head = "n/a" if free is None else f"{free:+d} MiB"
+    body = " ".join(f"{k[:-4] if k.endswith('_mib') else k}={v:+d}"
+                    for k, v in delta.items())
+    tail = ("no post grew" if worst is None or worst[1] <= 0
+            else f"BIGGEST TAKER {worst[0][:-4]} {worst[1]:+d} MiB")
+    return (f"WEG2-VRAM-CREEP stage={stage} card_free {head} since {since}; "
+            f"{body}; {tail} (every figure is MiB, delta of THIS rank's own "
+            f"readings; card_other_procs is a RESIDUAL total-free-mine, so it "
+            f"names bytes that are NOT this process's, never whose they are)")
+
+
+def format_dc_breakdown(rec: Dict[str, Any], *, stage: str) -> str:
+    """The one log line (``WEG2-DC-BREAKDOWN``), every figure with its unit."""
+    n = lambda k: "n/a" if rec.get(k) is None else str(rec.get(k))  # noqa: E731
+    return (
+        f"WEG2-DC-BREAKDOWN stage={stage} nvml_proc={n('nvml_proc_mib')} MiB = "
+        f"tms_resident {n('tms_resident_mib')} {rec.get('resident_tags_mib') or {}} "
+        f"+ torch_untagged {n('torch_untagged_mib')} (workspaces, static buffers, allocator cache) "
+        f"+ other {n('other_mib')} (context+driver+communicator+non-torch); "
+        f"tms_paused {n('tms_paused_mib')} {rec.get('paused_tags_mib') or {}} is unmapped and NOT in nvml_proc; "
+        f"raw torch_reserved {n('torch_reserved_mib')} allocated {n('torch_allocated_mib')}; "
+        f"card free {n('card_free_mib')} of {n('card_total_mib')} MiB total, "
+        f"other processes hold {n('card_other_procs_mib')} MiB (residual total-free-mine) "
+        f"(instrument: NVML per-process bytes for this pid = the front's WEG2-DC quantity; "
+        f"torch_untagged = reserved - resident - paused, because torch keeps the saver's regions "
+        f"reserved even when unmapped; tms = saver tag sums split by offload_tags)"
     )

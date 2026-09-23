@@ -182,6 +182,18 @@ def _is_equal_or_regex_match(
         if re.match(pattern, value):
             return True
     elif check_contains:
+        # #1483 (df2l, lued/Qwen3.8-27B-INT8-W8A16-MTP): the checkpoint's
+        # ignore list names the PARENT module of every GDN layer literally
+        # (``model.language_model.layers.N.linear_attn``) while its children
+        # in_proj_qkv / in_proj_z / out_proj carry packed int8 tensors.  A
+        # literal that is a strict ANCESTOR of the layer (target + ".") is a
+        # module-level entry in compressed-tensors' own semantics and does not
+        # propagate to the children; matching it by substring made all 144 GDN
+        # projections dense, the packed weights went unloaded, and the target
+        # answered token 0 on every prompt.  The substring reading stays for
+        # every other shape (fused shard names, partial literals).
+        if value.lower().startswith(target.lower() + "."):
+            return False
         if target.lower() in value.lower():
             return True
     elif target == value:

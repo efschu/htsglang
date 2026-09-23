@@ -389,7 +389,8 @@ def clear_poison_record() -> None:
 
 
 def pause_polling() -> _PausePolling:
-    """Exclude the watchdog's device reads for the duration of a capture.
+    """Exclude the watchdog's device reads for the duration of a capture
+    OR of a torch-memory-saver pause/resume.
 
     Entered by ``parallel_state.graph_capture`` -- the ONE context manager
     that surrounds every CUDA-graph capture in this process, so there is one
@@ -397,6 +398,13 @@ def pause_polling() -> _PausePolling:
     ``barlink.graph_capture_running()`` cannot serve here: it asks whether the
     CALLING THREAD's current stream is capturing, and the watchdog is a
     different thread, where the honest answer is always False.
+
+    #1489 adds the SECOND entrant, and it is the same fact in a different
+    coat: ``torch_memory_saver_adapter``'s ``pause``/``resume``. A TMS pause
+    unmaps the physical handles behind a tag while KEEPING the virtual
+    reservation, so for the length of the call the watchdog can hold a device
+    pointer that still LOOKS live and is not backed. The exclusion is the
+    structural answer -- the transport-side pre-check below is only the belt.
     """
     return _PausePolling()
 
@@ -404,6 +412,54 @@ def pause_polling() -> _PausePolling:
 def polling_paused() -> bool:
     with _capture_lock:
         return _capture_depth > 0
+
+
+# --- #1489: the gate itself can be disarmed, not just one transport ---------
+# Boot weg2xsn406 (2026-09-20 16:49:25Z) is the specimen that #1330's
+# per-transport disarm does not cover. A manual `/weg2/flip` arrived while D
+# was awake; the wake's `resume_memory_occupation` hit
+#   [core.cpp] WEG2-TMS-RESUME REFUSED tag=kv_cache rc=2 (out of memory)
+#              ... every allocation of the tag is PAUSED again
+# and left the control word's backing unmapped. The watchdog pass then raised
+# `RuntimeError: unknown parameter type` on transport A, disarmed A -- and the
+# `for` loop CONTINUED to transport B in the same poisoned context, raised
+# again, and the process died with `Fatal Python error: Segmentation fault`
+# whose current thread was `poll_status_word` itself.
+#
+# The per-transport disarm is therefore necessary and NOT sufficient: one
+# unmapped mapping is a statement about the PROCESS's device memory, not about
+# one transport. The first poll failure of any shape stops the whole gate, by
+# name, once.
+_gate_lock = threading.Lock()
+_gate_disarmed: Optional[str] = None
+
+
+def disarm_gate(why: str) -> bool:
+    """Stop the watchdog's device polling for this process. Returns True once.
+
+    Losing the instrument is strictly better than losing the process, and the
+    abort word is sticky, so what a disarmed gate costs is the LAST KNOWN
+    verdict and nothing else -- no consumer's view can go backwards.
+    """
+    global _gate_disarmed
+    with _gate_lock:
+        if _gate_disarmed is not None:
+            return False
+        _gate_disarmed = str(why)
+    return True
+
+
+def gate_disarmed() -> Optional[str]:
+    """The reason the gate stopped polling, or None while it still polls."""
+    with _gate_lock:
+        return _gate_disarmed
+
+
+def rearm_gate() -> None:
+    """Test-only. A real process does not un-lose a mapping."""
+    global _gate_disarmed
+    with _gate_lock:
+        _gate_disarmed = None
 
 
 def poll_status_words() -> int:
@@ -423,6 +479,11 @@ def poll_status_words() -> int:
     if not abort_check_enabled():
         return 0
     if polling_paused():
+        return 0
+    if gate_disarmed() is not None:
+        # #1489: a previous pass already said, by name, that this process's
+        # device memory is not safe to read. Asking again every round is the
+        # amplifier, not the safety net.
         return 0
     tripped = 0
     for transport in registered():
@@ -465,37 +526,30 @@ def poll_status_words() -> int:
             # stop asking. `poll_status_word`'s own pre-check catches the
             # mapped-but-released case BEFORE the copy; this is the belt for
             # every failure shape it cannot see in advance.
-            # #99 (fnFL2w30, TP0): hier stand `t` -- eine Variable, die es in
-            # dieser Funktion nicht gibt; die Schleife heisst `transport`.
-            # Der NameError flog IM Fehlerpfad, verhinderte genau das Disarm,
-            # das dieser Block leistet, und der naechste Poll toetete den
-            # Prozess im Segfault. Der #1330-Fix hat damit die Form
-            # reproduziert, die sein eigener Kommentar beschreibt ("the
-            # process died in the driver a moment later with a segfault, not
-            # at the raise"). Erreichbar erst, wenn ein Poll WIRKLICH
-            # scheitert -- deshalb hat ihn kein Test und kein Boot betreten.
+            _poll_fault_dump(transport, exc)
             _disarm = getattr(transport, "_abort_poll_disarm", None)
             if callable(_disarm):
                 _disarm("the status poll raised; see the traceback above")
-            # #100 (fnFL2w32/w33, TP0): NACH DEM DISARM DIE RUNDE BEENDEN.
-            # An beiden Boots gemessen: der Poll scheiterte ZWEIMAL in
-            # derselben Runde -- einmal je registriertem Transport -- und der
-            # Prozess starb still zwischen dem zweiten Disarm und der naechsten
-            # Gloo-Runde ("Connection closed by peer", kein Traceback, kein
-            # Signal, oom_kill unveraendert 27). Die Ursache lag davor: ein
-            # cu_mem_create-OOM (torch_memory_saver.cpp:194) liess das Mapping
-            # des Kontrollworts unbrauchbar zurueck. `is_poison_error` kennt
-            # dessen Signaturen nicht -- "unknown parameter type" und
-            # "invalid combination of arguments" stehen in keiner Marker-Liste
-            # --, also brach die Schleife nicht ab und griff ein zweites Mal
-            # auf einen bereits beschaedigten Kontext zu.
-            #
-            # Ein Poll, der ueberhaupt scheitert, kann sein Geraet nicht mehr
-            # sicher lesen; der Text der Ausnahme aendert daran nichts. Die
-            # Marker-Liste zu verlaengern waere der schwaechere Fix: die
-            # naechste Signatur fehlte wieder. Das Disarm gilt dem Transport,
-            # dieses `break` der RUNDE -- ein poisoned Kontext ist prozessweit,
-            # nicht transport-lokal.
+            # #1489: AND STOP THE WHOLE PASS. Disarming only the transport
+            # that raised left the loop free to walk into the NEXT one with
+            # the same unmapped backing -- boot weg2xsn406 logged exactly two
+            # tracebacks from two transports in one pass and then segfaulted
+            # inside `poll_status_word`. One unmapped mapping is a fact about
+            # this PROCESS's device memory, not about one transport.
+            if disarm_gate(f"{source} raised {type(exc).__name__}: {exc}"):
+                logger.error(
+                    "#1489 W113 BarlinkPollGateDisarmed source=%s exc=%s -- the "
+                    "watchdog's DEVICE polling is now OFF for this whole "
+                    "process, not just for the transport that raised. A poll "
+                    "that failed once fails every round, and on boot "
+                    "weg2xsn406 the second attempt of the same pass took the "
+                    "process down with a segfault instead of a raise. The "
+                    "abort word is sticky, so what is lost is the last "
+                    "verdict and nothing else; host-side peer probing is "
+                    "untouched. This is a NAMED refusal, not a silent skip.",
+                    source,
+                    exc,
+                )
             break
     return tripped
 
@@ -582,6 +636,56 @@ def rearm_inline_reads() -> int:
         except Exception:  # noqa: BLE001 - teardown must not raise
             logger.exception("barlink abort gate: could not re-arm an in-line read")
     return changed
+
+
+def _poll_fault_dump(transport: Any, exc: BaseException) -> None:
+    """xsn317/321: the poll's exception was the last line before an exit(1)
+    without a Python traceback. Name the objects the copy touched and take a
+    py-spy dump of THIS process (all threads, native frames) so the moment is
+    recorded even when the process is gone a second later. Never raises."""
+    try:
+        parts = []
+        for name in ("_ctl_dev", "_abort_poll_dst", "_round_dev", "_round_mirror", "_abort_poll_stream"):
+            obj = getattr(transport, name, None)
+            if obj is None:
+                parts.append(f"{name}=None")
+                continue
+            try:
+                parts.append(f"{name}=({type(obj).__name__} dev={getattr(obj, 'device', '?')} "
+                             f"dtype={getattr(obj, 'dtype', '?')} ptr={obj.data_ptr() if hasattr(obj, 'data_ptr') else '?'} "
+                             f"numel={obj.numel() if hasattr(obj, 'numel') else '?'})")
+            except Exception as e:  # noqa: BLE001
+                parts.append(f"{name}=<{type(e).__name__}: {e}>")
+                if is_poison_error(e):
+                    parts.append("(context poisoned: no further device reads)")
+                    break
+        logger.error("WEG2-BARLINK-POLL-DIAG exc=%s: %s | %s", type(exc).__name__, exc, " ".join(parts))
+    except Exception as e:  # noqa: BLE001
+        logger.error("WEG2-BARLINK-POLL-DIAG failed: %s: %s", type(e).__name__, e)
+        if is_poison_error(e):
+            return
+    if os.environ.get("SGLANG_WEG2_POLL_PYSPY", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    try:
+        import shutil
+        import subprocess
+        import sys
+        exe = os.path.join(os.path.dirname(sys.executable), "py-spy")
+        if not os.path.exists(exe):
+            exe = shutil.which("py-spy")
+        if not exe:
+            logger.error("WEG2-BARLINK-POLL-PYSPY unavailable: no py-spy next to %s", sys.executable)
+            return
+        out_dir = os.environ.get("SGLANG_WEG2_PYSPY_DIR", "/spinning/evidence-665-f1")
+        path = os.path.join(out_dir, f"pyspy_pollfault_{os.getpid()}_{int(time.time())}.txt")
+        with open(path, "w") as fh:
+            r = subprocess.run([exe, "dump", "--pid", str(os.getpid()), "--native", "--nonblocking"],
+                               stdout=fh, stderr=subprocess.STDOUT, timeout=45)
+        logger.error("WEG2-BARLINK-POLL-PYSPY rc=%s file=%s", r.returncode, path)
+    except Exception as e:  # noqa: BLE001
+        logger.error("WEG2-BARLINK-POLL-PYSPY failed: %s: %s", type(e).__name__, e)
+        if is_poison_error(e):
+            return
 
 
 def registered() -> List[Any]:
@@ -853,6 +957,8 @@ __all__ = [
     "abort_check_enabled",
     "check_aborts",
     "check_after_graph_replay",
+    "disarm_gate",
+    "gate_disarmed",
     "check_every",
     "current_replay",
     "format_current_replay",
@@ -870,6 +976,7 @@ __all__ = [
     "poll_interval_s",
     "poll_status_words",
     "polling_paused",
+    "rearm_gate",
     "register",
     "registered",
     "replay_check_enabled",

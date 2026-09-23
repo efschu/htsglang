@@ -16,6 +16,7 @@ from sglang.srt.managers.pp_admission_congruence import (
     LOAD_BACK_EXTENT_ATTR,
 )
 
+WEG2_ADMIT_T = {"lb_ms": 0.0, "lb_n": 0}  # xsn325: init_load_back wall per pass, read+reset by the POST-WAKE-PASS line
 _988_LOADBACK_SEEN = {"n": 0, "mamba": 0, "kv_only": 0}
 #: #1048: this rank's own stamp went stale between the match and the apply.
 _1048_STALE = {"n": 0}
@@ -802,6 +803,33 @@ def truncation_align_admission_error(
         f"line. Raise --chunked-prefill-size to at least "
         f"{truncation_align_size}, or lower the alignment."
     ), None
+
+
+_WEG2_CHUNK_ADMIT: Optional[bool] = None
+_WEG2_PARK_ON: Optional[bool] = None
+
+
+def _weg2_chunk_admit() -> bool:
+    """Punkt 2: per-chunk admission (group P, rides with the park). Read once."""
+    global _WEG2_CHUNK_ADMIT
+    if _WEG2_CHUNK_ADMIT is None:
+        try:
+            from sglang.srt.weg2.park import chunk_admit_active
+            _WEG2_CHUNK_ADMIT = bool(chunk_admit_active())
+        except Exception:  # noqa: BLE001 -- a desk double without the module
+            _WEG2_CHUNK_ADMIT = False
+    return _WEG2_CHUNK_ADMIT
+
+
+def _weg2_park_on() -> bool:
+    global _WEG2_PARK_ON
+    if _WEG2_PARK_ON is None:
+        try:
+            from sglang.srt.weg2.park import park_active
+            _WEG2_PARK_ON = bool(park_active())
+        except Exception:  # noqa: BLE001
+            _WEG2_PARK_ON = False
+    return _WEG2_PARK_ON
 
 
 class PrefillAdder:
@@ -1942,6 +1970,10 @@ class PrefillAdder:
                     req.set_extend_range(
                         len(req.prefix_indices), len(req.prefix_indices)
                     )
+                    if _weg2_park_on():
+                        # Punkt 2: the scheduler turns this in-place park into
+                        # a rows-back park at the head of the next step.
+                        req.weg2_pool_parked = True
                     logger.warning(
                         "chunked prefill PARKED: the pool can fund %d tokens, "
                         "below one page (%d). The request keeps its place and "
@@ -2235,6 +2267,19 @@ class PrefillAdder:
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
+        # Punkt 2 (18.09., Weg 2 group P): ADMISSION PER CHUNK. The gate
+        # charges the NEXT chunk (+ reservation, page, mamba gap), not the
+        # whole extend; the rest is funded chunk by chunk, and when the pool
+        # cannot fund a chunk the #679 park below hands the request's rows
+        # back (`weg2_pool_parked` -> Scheduler.process_pending_weg2_park).
+        # A request that was already parked once is admitted WHOLE again
+        # (today's gate) so a tight pool cannot ping-pong it.
+        if _weg2_chunk_admit() and not getattr(req, "weg2_parked_span", 0):
+            from sglang.srt.weg2.park import chunk_admit_tokens as _cat
+            total_tokens = (
+                _cat(cand_extend_input_len, self.rem_chunk_tokens)
+                + max_new + self.page_size + self._mamba_gap_budget_for_req(req)
+            )
         # Prefill-Spill (PS1-V1a): the born-spilled current-step demand is the
         # lifetime demand MINUS the future decode (max_new) that will spill to
         # host -- i.e. just the prefill input (+ page + mamba gap). Used only if
@@ -2337,6 +2382,7 @@ class PrefillAdder:
                 # pass, chunk, cutover or flip can land between them, which is
                 # the only lifecycle shape this fact is safe under.
                 req.mamba_loadback_anchor_adopted = False
+                _lb_t0 = time.perf_counter()
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
@@ -2349,6 +2395,8 @@ class PrefillAdder:
                         req=req,
                     )
                 )
+                WEG2_ADMIT_T["lb_ms"] += (time.perf_counter() - _lb_t0) * 1000.0
+                WEG2_ADMIT_T["lb_n"] += 1
                 # #968 S1: THE TOLD EXTENT DECIDES *HOW MUCH*, NOT MERELY
                 # *WHETHER* -- enforced HERE because the callee cannot.
                 #
@@ -2385,6 +2433,44 @@ class PrefillAdder:
                 # an extent was chosen at all.
                 if _lb_extent is not None:
                     _applied = int(new_indices.numel())
+                    if _applied == 0 and _lb_extent > 0 and getattr(
+                        req, "mamba_loadback_anchor_adopted", False
+                    ):
+                        # weg2xsn282 (18.09.): NOTHING loaded is NOT a skewed
+                        # host tier, it is NO DEVICE ROOM YET. Group D held
+                        # three 98k prompts (retained after finishing until
+                        # their write-through), the fourth's load-back
+                        # yielded 0 rows, the mamba restore had adopted its
+                        # anchor -- and the #968 refusal below became a #791
+                        # STOP that killed the group. The room comes back when
+                        # the finished prompts' rows are evictable; give the
+                        # anchor back and WAIT (NO_TOKEN), as any request does
+                        # while the pool is full.
+                        from sglang.srt.mem_cache.common import (
+                            release_admission_acquired_mamba_slot,
+                        )
+                        release_admission_acquired_mamba_slot(
+                            req, self.tree_cache, site="loadback_no_room"
+                        )
+                        req.mamba_loadback_anchor_adopted = False
+                        # xsn285: the counter lives on the TREE (the adder is
+                        # rebuilt every pass -- on the adder it read n=1 every
+                        # time and printed 102k lines in 150 s).
+                        _tc = self.tree_cache
+                        _n = getattr(_tc, "_weg2_loadback_no_room", 0) + 1
+                        try:
+                            _tc._weg2_loadback_no_room = _n
+                        except Exception:  # noqa: BLE001 -- a slotted double
+                            pass
+                        if _n <= 3 or (_n & (_n - 1)) == 0:
+                            logger.info(
+                                "WEG2-LOADBACK-WAIT rid=%s extent=%d applied=0: no device "
+                                "room for the host hit yet (rem_total_tokens=%s); the anchor "
+                                "is given back and the request waits (n=%d)",
+                                getattr(req, "rid", "?"), int(_lb_extent),
+                                getattr(self, "rem_total_tokens", "?"), _n,
+                            )
+                        return AddReqResult.NO_TOKEN
                     if _applied != _lb_extent and getattr(
                         req, "mamba_loadback_anchor_adopted", False
                     ):

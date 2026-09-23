@@ -16,6 +16,7 @@ DMA) pins it with cudaHostRegister.
 from __future__ import annotations
 
 import ctypes
+import functools
 import hashlib
 import logging
 import mmap
@@ -91,6 +92,23 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_reap_stale.argtypes = [p_u8]
             lib.arena_stats.restype = None
             lib.arena_stats.argtypes = [p_u8, p_i64]
+            lib.arena_find_slots.restype = i64
+            lib.arena_find_slots.argtypes = [p_u8, i64, p_u64, p_u64, p_i64, p_i8]
+            lib.arena_find_stems.restype = i64
+            lib.arena_find_stems.argtypes = [p_u8, i64, ctypes.POINTER(ctypes.c_char_p), p_i64, p_i8]
+            lib.arena_claim.restype = i64
+            lib.arena_claim.argtypes = [p_u8, i64, p_u64, p_u64, p_i64,
+                                        ctypes.POINTER(ctypes.c_char_p), p_i64, p_i64, p_i8]
+            lib.arena_lookup_stems.restype = i64
+            lib.arena_lookup_stems.argtypes = [p_u8, i64, ctypes.POINTER(ctypes.c_char_p), p_i8]
+            lib.arena_claim_stems.restype = i64
+            lib.arena_claim_stems.argtypes = [p_u8, i64, ctypes.POINTER(ctypes.c_char_p), p_i64, p_i64, p_i64, p_i8]
+            lib.arena_complete.restype = i64
+            lib.arena_complete.argtypes = [p_u8, i64, p_i64, p_i64, p_i64, p_i64, p_i64, p_i8]
+            lib.arena_ref_slots.restype = i64
+            lib.arena_ref_slots.argtypes = [p_u8, i64, p_i64, ctypes.c_int32]
+            lib.arena_data_offset.restype = i64
+            lib.arena_data_offset.argtypes = [p_u8]
             _lib = lib
             return lib
         except Exception as e:  # noqa: BLE001 - the arena is optional
@@ -100,6 +118,7 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             return None
 
 
+@functools.lru_cache(maxsize=1 << 20)  # #1438: the same stems are hashed for find/ref/draft; cached
 def key128(stem: str) -> tuple[int, int]:
     """The 128-bit key of a store stem; low word never 0 or ~0 (index sentinels)."""
     d = hashlib.blake2b(stem.encode("utf-8"), digest_size=16).digest()
@@ -172,9 +191,13 @@ class ShmArena:
         n = len(stems)
         if n == 0:
             return []
-        lo, hi = self._keys(stems)
         st = (ctypes.c_int8 * n)()
-        self._lib.arena_lookup(self._base, n, lo, hi, st)
+        try:  # xsn357: hashed in C (arena_lookup_stems); Python key128 was the prefetch thread's cost
+            c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
+            self._lib.arena_lookup_stems(self._base, n, c_stems, st)
+        except Exception:  # noqa: BLE001 -- the key path stays as the fallback
+            lo, hi = self._keys(stems)
+            self._lib.arena_lookup(self._base, n, lo, hi, st)
         return [bool(x) for x in st]
 
     def write(self, stems, totals, extents, payload_ptrs) -> list[int]:
@@ -216,16 +239,161 @@ class ShmArena:
         got = self._lib.arena_evict_candidates(self._base, want, slots, lo, hi, tot, c_keep, len(keep))
         return [(int(slots[i]), int(lo[i]), int(hi[i]), int(tot[i])) for i in range(got)]
 
+    # -- Stufe 3 (#1424): address pages in place --------------------------
+    def find_slots(self, stems: Sequence[str]) -> list[tuple[int, int]]:
+        """(slot, state) per stem; slot -1 when absent. state 2 = COMPLETE.
+        #1439: hashed in C (arena_find_stems) -- one call for a 100k prefix."""
+        n = len(stems)
+        if n == 0:
+            return []
+        c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
+        slots = (ctypes.c_int64 * n)()
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_find_stems(self._base, n, c_stems, slots, st)
+        return list(zip(slots, st))
+
+    def find_slots_np(self, stems: Sequence[str]):
+        """Posten 2 (18.09.): (slots int64[n], states int8[n]) as numpy views --
+        no 520k-tuple Python list (xsn306: zip 95 ms + lead-list 26 ms + the
+        per-element loops downstream)."""
+        import numpy as np
+        n = len(stems)
+        if n == 0:
+            return np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.int8)
+        c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
+        slots = np.empty((n,), dtype=np.int64)
+        st = np.empty((n,), dtype=np.int8)
+        self._lib.arena_find_stems(self._base, n,
+                                   c_stems,
+                                   slots.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                   st.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
+        return slots, st
+
+    def ref_slots_np(self, slots, delta: int) -> int:
+        """ref_slots over a numpy int64 array (zero-copy pointer)."""
+        import numpy as np
+        a = np.ascontiguousarray(np.asarray(slots, dtype=np.int64))
+        n = int(a.shape[0])
+        if n == 0:
+            return 0
+        return int(self._lib.arena_ref_slots(self._base, n,
+                                             a.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                             int(delta)))
+
+    def find_states(self, stems: Sequence[str]) -> list[int]:
+        """#1439: the states only (0 absent/free, 1 claimed, 2 complete), by stem, hashed in C."""
+        n = len(stems)
+        if n == 0:
+            return []
+        c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
+        slots = (ctypes.c_int64 * n)()
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_find_stems(self._base, n, c_stems, slots, st)
+        return list(st)
+
+    def claim_slots(self, stems: Sequence[str], totals: Sequence[int]) -> list[tuple[int, int, int]]:
+        """#1427 direct writes: (slot, status, generation) per stem. status
+        0 = fresh claim, 1 = join an earlier writer's claim, 2 = already
+        COMPLETE, 3 = too large, 4 = no free slot (slot -1)."""
+        n = len(stems)
+        if n == 0:
+            return []
+        c_tot = (ctypes.c_int64 * n)(*[int(t) for t in totals])
+        c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
+        slots = (ctypes.c_int64 * n)()
+        gens = (ctypes.c_int64 * n)()
+        st = (ctypes.c_int8 * n)()
+        # xsn350: keys hashed in C (arena_claim_stems); the Python key128 per
+        # stem was ~30 ms per 4096-page node in the scheduler thread.
+        rc = self._lib.arena_claim_stems(self._base, n, c_stems, c_tot, slots, gens, st)
+        if rc < 0:
+            lo, hi = self._keys(stems)
+            self._lib.arena_claim(self._base, n, lo, hi, c_tot, c_stems, slots, gens, st)
+        return [(int(slots[i]), int(st[i]), int(gens[i])) for i in range(n)]
+
+    def claim_slots_np(self, stems: Sequence[str], totals: Sequence[int]):
+        """xsn359: claim_slots as numpy arrays (slots int64, status int8,
+        generation int64) -- no 3 x n ctypes reads into Python tuples."""
+        import numpy as np
+        n = len(stems)
+        if n == 0:
+            return (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int8), np.zeros(0, dtype=np.int64))
+        c_tot = (ctypes.c_int64 * n)(*[int(t) for t in totals])
+        c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
+        slots = np.zeros(n, dtype=np.int64); gens = np.zeros(n, dtype=np.int64); st = np.zeros(n, dtype=np.int8)
+        p_slots = slots.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
+        p_gens = gens.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
+        p_st = st.ctypes.data_as(ctypes.POINTER(ctypes.c_int8))
+        rc = self._lib.arena_claim_stems(self._base, n, c_stems, c_tot, p_slots, p_gens, p_st)
+        if rc < 0:
+            lo, hi = self._keys(stems)
+            self._lib.arena_claim(self._base, n, lo, hi, c_tot, c_stems, p_slots, p_gens, p_st)
+        return slots, st, gens
+
+    def complete_slots_np(self, slots, gens, extents):
+        """xsn359: complete_slots on numpy int64 arrays; returns status int8."""
+        import numpy as np
+        n = int(len(slots))
+        if n == 0:
+            return np.zeros(0, dtype=np.int8)
+        ext = [tuple(extents)] * n
+        n_ext, c_off, c_len = self._extents(ext)
+        s_np = np.ascontiguousarray(slots, dtype=np.int64); g_np = np.ascontiguousarray(gens, dtype=np.int64)
+        st = np.zeros(n, dtype=np.int8)
+        self._lib.arena_complete(self._base, n, s_np.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                 g_np.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)), n_ext, c_off, c_len,
+                                 st.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
+        return st
+
+    def complete_slots(self, slots: Sequence[int], gens: Sequence[int], extents) -> list[int]:
+        """#1427: merge this writer's extents (same shape for every slot) into
+        the coverage and flip COMPLETE when the page is full. status per slot:
+        1 completed now, 0 merged but not full, 2 already complete, 3 lost."""
+        n = len(slots)
+        if n == 0:
+            return []
+        ext = [tuple(extents)] * n
+        n_ext, c_off, c_len = self._extents(ext)
+        c_slots = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        c_gens = (ctypes.c_int64 * n)(*[int(g) for g in gens])
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_complete(self._base, n, c_slots, c_gens, n_ext, c_off, c_len, st)
+        return list(st)
+
+    def ref_slots(self, slots: Sequence[int], delta: int) -> int:
+        """Reader references: +1 pins COMPLETE slots against eviction, -1 releases.
+        Returns how many slots took the delta."""
+        n = len(slots)
+        if n == 0:
+            return 0
+        c = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        return int(self._lib.arena_ref_slots(self._base, n, c, int(delta)))
+
+    def data_offset(self) -> int:
+        """Byte offset of slot 0's data inside the mapping."""
+        return int(self._lib.arena_data_offset(self._base))
+
     def slot_stem(self, slot: int) -> str:
         """The store stem recorded in the slot header (any rank may evict it)."""
         raw = self._lib.arena_slot_stem(self._base, int(slot))
         return (raw or b"").decode("utf-8", "replace")
+
+    def slot_ptr(self, slot: int) -> int:
+        """Address of slot data inside the mapping (for a C read straight into the slot)."""
+        return int(self._lib.arena_slot_ptr(self._base, int(slot)))
 
     def slot_view(self, slot: int, nbytes: int) -> memoryview:
         off = int(self._lib.arena_slot_ptr(self._base, int(slot))) - int(self._base.value)
         return memoryview(self._mm)[off:off + int(nbytes)]
 
     def free_slots(self, slots: Sequence[int]) -> None:
+        # xsn328: who frees which slots (D's dormant re-reads found P's pages FREE/CLAIMED again)
+        _fn = getattr(type(self), "_free_log_n", 0) + 1
+        type(self)._free_log_n = _fn
+        if _fn <= 16 or _fn % 256 == 0:
+            import traceback as _tb
+            _caller = "".join(_tb.format_stack(limit=4)[:-1]).strip().replace("\n", " | ")[-300:]
+            logger.info("ARENA-FREE n=%d slots=%d first=%s caller=%s", _fn, len(slots), (list(slots)[:3] if slots else []), _caller)
         n = len(slots)
         if n == 0:
             return

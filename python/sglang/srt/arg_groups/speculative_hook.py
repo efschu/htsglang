@@ -199,9 +199,17 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "Currently DFLASH speculative decoding does not support dp attention."
         )
 
-    if server_args.pp_size != 1:
+    if server_args.pp_size != 1 and not getattr(
+        server_args, "speculative_draft_kv_only", False
+    ):
+        # Weg 2 group P (PLAN_DFLASH2_P_0917): under --speculative-draft-kv-only
+        # the DFlash worker is a draft-KV PRODUCER on the last PP stage; the
+        # capture layers of every stage reach it through
+        # distributed/pp_aux_capture. A PROPOSING DFlash drafter under PP is
+        # still refused (no PP-shaped draft round exists).
         raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
+            "Currently DFLASH speculative decoding only supports pp_size == 1 "
+            "(a draft-KV producer under PP needs --speculative-draft-kv-only)."
         )
 
     if server_args.speculative_draft_model_path is None:

@@ -300,9 +300,10 @@ void TorchMemorySaver::pause(const std::string& tag) {
 #endif
 }
 
-void TorchMemorySaver::resume(const std::string& tag) {
+int TorchMemorySaver::resume(const std::string& tag) {
 #if defined(USE_ROCM)
     ROCmHIPImplementation::rocm_resume(tag, allocation_metadata_, allocator_metadata_mutex_);
+    return 0;
 
 #elif defined(USE_CUDA)
     const std::lock_guard <std::mutex> lock(allocator_metadata_mutex_);
@@ -348,8 +349,38 @@ void TorchMemorySaver::resume(const std::string& tag) {
         AllocationMetadata& metadata = allocation_metadata_[ptr];
 
         CUmemGenericAllocationHandle newAllocHandle;
-        CUDAUtils::cu_mem_create(&newAllocHandle, metadata.size, metadata.device);
-        CURESULT_CHECK(cuMemMap((CUdeviceptr) ptr, metadata.size, 0, newAllocHandle, 0));
+        // weg2xsn269: a refused cuMemCreate (OOM on the card) is a RETURN
+        // CODE, not an exit(1).  Roll the allocations this call already
+        // mapped back to PAUSED (unmap + release, the exact inverse of the
+        // three calls below) and hand the CUresult up; nothing of this tag
+        // is left half-mapped and the rank keeps its Python frames.
+        CUresult weg2_rc = CUDAUtils::cu_mem_create_rc(&newAllocHandle, metadata.size, metadata.device);
+        if (weg2_rc == CUDA_SUCCESS) {
+            weg2_rc = cuMemMap((CUdeviceptr) ptr, metadata.size, 0, newAllocHandle, 0);
+            if (weg2_rc != CUDA_SUCCESS) {
+                cuMemRelease(newAllocHandle);
+            }
+        }
+        if (weg2_rc != CUDA_SUCCESS) {
+            uint64_t weg2_rolled = 0;
+            for (size_t r = 0; r < m; ++r) {
+                AllocationMetadata& md = allocation_metadata_[matched_ptrs[r]];
+                cuMemUnmap((CUdeviceptr) matched_ptrs[r], md.size);
+                cuMemRelease(md.allocHandle);
+                md.state = AllocationState::PAUSED;
+                weg2_rolled += (uint64_t) md.size;
+            }
+            const char* err_str = nullptr;
+            cuGetErrorString(weg2_rc, &err_str);
+            std::cerr << "[core.cpp] WEG2-TMS-RESUME REFUSED tag=" << tag
+                      << " rc=" << (int) weg2_rc << " (" << (err_str ? err_str : "?") << ")"
+                      << " failed_alloc=" << m << "/" << matched_ptrs.size()
+                      << " failed_bytes=" << metadata.size
+                      << " rolled_back_bytes=" << weg2_rolled
+                      << " tag_bytes=" << weg2_leg_bytes
+                      << " -- every allocation of the tag is PAUSED again" << std::endl;
+            return (int) weg2_rc;
+        }
         CUDAUtils::cu_mem_set_access(ptr, metadata.size, metadata.device);
         metadata.state = AllocationState::ACTIVE;
         metadata.allocHandle = newAllocHandle;
@@ -491,6 +522,7 @@ void TorchMemorySaver::resume(const std::string& tag) {
         }
         metadata.cpu_backup_granules.clear();
     }
+    return 0;
 #else
     #error "USE_PLATFORM is not set"
 #endif

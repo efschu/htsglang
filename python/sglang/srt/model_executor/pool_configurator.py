@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -220,6 +220,83 @@ def apply_solo_draft_kv_cell_factor(
     return max(int(target_cell_size), scaled)
 
 
+#: weg2xsn289 (18.09.): env that turns the DFlash draft pool into the WINDOW
+#: pool on a target rank (dflash_worker_v2._maybe_init_solo_small_pool).
+DFLASH_WINDOW_POOL_ENV = "SGLANG_DFLASH_WINDOW_POOL"
+
+
+def window_pool_draft_slots(server_args, window: int) -> int:
+    """The window pool's slot count, the SAME formula the worker allocates
+    with (``1 + (cap + block) x max_running x factor``); the factor from
+    ``SGLANG_DFLASH_SOLO_POOL_FACTOR`` (default 2.0)."""
+    import os
+
+    from sglang.srt.speculative.dflash_solo_pool import (
+        DEFAULT_SOLO_POOL_FACTOR,
+        SOLO_POOL_FACTOR_ENV,
+    )
+
+    try:
+        factor = float(os.environ.get(SOLO_POOL_FACTOR_ENV, DEFAULT_SOLO_POOL_FACTOR))
+    except ValueError:
+        factor = float(DEFAULT_SOLO_POOL_FACTOR)
+    block = int(getattr(server_args, "speculative_num_draft_tokens", None) or 1)
+    mrr = int(getattr(server_args, "max_running_requests", None) or 1)
+    return 1 + int((int(window) + block) * max(1, mrr) * max(1.0, factor))
+
+
+def window_pool_active(mr: ModelRunner) -> bool:
+    """Mirror of the worker's predicate: a DFlash-family TARGET rank with the
+    compact draft cache (``--speculative-draft-window-size``) and
+    ``SGLANG_DFLASH_WINDOW_POOL=1``."""
+    import os
+
+    if getattr(mr, "is_draft_worker", False):
+        return False
+    spec = getattr(mr, "spec_algorithm", None)
+    if spec is None or not spec.is_dflash_family():
+        return False
+    sa = mr.server_args
+    if getattr(sa, "speculative_draft_window_size", None) is None:
+        return False
+    return os.environ.get(DFLASH_WINDOW_POOL_ENV, "0") == "1"
+
+
+def apply_window_pool_draft_charge(
+    mr: ModelRunner, target_cell_size: int, cell_size_with_draft: int
+) -> Tuple[int, int]:
+    """weg2xsn289 (18.09.): THE WINDOW POOL IS NOT A MIRROR, so the draft is
+    not a per-token charge. ``(cell_size, reserve_bytes)``.
+
+    ``scale_kv_cell_size_per_token_for_dflash`` inflates every token's cell by
+    the draft layers' KV (D: 28672 -> 43008 B/token), which is right when the
+    draft pool mirrors the target pool slot for slot. Under the window pool
+    the draft holds ``window_pool_draft_slots`` rows (4113 for W=2048 -- 59 MB
+    at 14336 B/row), NOT one per target token -- measured xsn289 on group D:
+    TP1 sized 171,681 tokens off 6.877 GiB at 43008 B/token, allocated
+    171,681 x 28672 B of target KV and a 4113-row draft pool, and left the
+    other 2.4 GiB idle; the 5090 the same at 22,561 tokens. So under the
+    window pool the cell is the TARGET cell and the draft's bytes are a
+    CONSTANT reserve taken off the pool's budget instead.
+
+    Byte-identical on every path that is not the window pool (factor 1.0
+    paths, mirror pools, draft workers, non-DFlash forms)."""
+    draft_part = int(cell_size_with_draft) - int(target_cell_size)
+    if draft_part <= 0 or not window_pool_active(mr):
+        return int(cell_size_with_draft), 0
+    window = int(mr.server_args.speculative_draft_window_size)
+    slots = window_pool_draft_slots(mr.server_args, window)
+    reserve = int(slots) * int(draft_part)
+    logger.info(
+        "WEG2-WINDOW-POOL KV charge: rank %d draft-KV part %d B/token is NOT per "
+        "token under the window pool (W=%d, %d draft slots): cell %d -> %d B/token, "
+        "draft reserve %d MiB taken off the pool budget instead",
+        int(getattr(mr, "tp_rank", 0) or 0), draft_part, window, slots,
+        int(cell_size_with_draft), int(target_cell_size), reserve >> 20,
+    )
+    return int(target_cell_size), reserve
+
+
 class MemoryPoolConfigurator:
     """Base class for memory pool configurators.
 
@@ -395,6 +472,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self._cell_size = apply_solo_draft_kv_cell_factor(
             mr, target_cell_size, self._cell_size
         )
+        # weg2xsn289: under the window pool the draft is a constant reserve,
+        # not a per-token charge (see apply_window_pool_draft_charge).
+        self._cell_size, self._window_pool_reserve_bytes = apply_window_pool_draft_charge(
+            mr, target_cell_size, self._cell_size
+        )
 
     def _compute_cell_size(self, mr: ModelRunner, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
@@ -557,7 +639,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        available_bytes = max(available_bytes, 0)
+        # weg2xsn289: the window pool's draft rows are a constant reserve.
+        available_bytes = max(
+            0, int(available_bytes) - int(getattr(self, "_window_pool_reserve_bytes", 0) or 0)
+        )
         max_total_num_tokens = (
             self._KVLESS_STAGE_TOKENS
             if self._cell_size == 0

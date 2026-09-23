@@ -114,6 +114,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -738,7 +739,33 @@ def build_census(
             marked = any(ring_table.XCHG_FORM_MARKER in line for line in fh)
     except OSError as exc:
         raise _refuse(f"front log of the selected boot {stem} is unreadable: {exc}")
+    # User order 2026-09-17 ("freigeben"): #1305 item 4 keeps excluding
+    # SHADOW exchange boots (the exchange as a comparison arm beside the host
+    # ring: their dormant residual carried the ring AND the lane), but an
+    # AUTHORITATIVE exchange boot with the host ring absent by design IS the
+    # form being armed, and its WEG2-DC readings are exactly what the next
+    # boot's cards will hold. Refusing it left the launcher on the 09.09.
+    # census (dormant 1668/1334/1334 MiB, NEXTN head resident then) against
+    # 1172/722/912 MiB measured in the current form: 1.4-1.9 GB per card
+    # over-reserved.
+    authoritative = False
     if marked:
+        try:
+            with open(front, errors="replace") as fh:
+                body = fh.read()
+        except OSError:
+            body = ""
+        authoritative = "inject=authoritative" in body and (
+            "ABSENT-BY-DESIGN" in body or "ring_absent_by_design=True" in body
+        )
+    if marked and authoritative:
+        sys.stderr.write(
+            f"WEG2-XCHG-CENSUS note: {stem} is an AUTHORITATIVE exchange boot "
+            "with the host ring absent by design -- accepted as the census "
+            "source (user order 2026-09-17); #1305 item 4 still excludes "
+            "SHADOW exchange boots.\n"
+        )
+    if marked and not authoritative:
         raise _refuse(
             f"the selected boot {stem} is an xchg shadow boot "
             f"({ring_table.XCHG_FORM_MARKER} in its front log).  #1305 item 4 "
@@ -763,6 +790,20 @@ def build_census(
                         break
         except OSError as exc:
             raise _refuse(f"selection oracle {selection_oracle!r} unreadable: {exc}")
+        if not chose and boot_stem and os.path.basename(selection_oracle).startswith(stem):
+            # A host-ring-ABSENT boot prints no "SOURCE solved from" line (there
+            # is no ring to solve a source for). When the producer is PINNED to
+            # that very boot and the oracle IS that boot's own front log, the
+            # selection question is answered by identity: the reference boot
+            # selected itself. Anything else still refuses below.
+            try:
+                with open(selection_oracle, errors="replace") as fh:
+                    ring_absent = any("ABSENT-BY-DESIGN" in line for line in fh)
+            except OSError:
+                ring_absent = False
+            if ring_absent:
+                chose = stem
+                selection += "; oracle = the pinned boot's own front log (host ring absent by design, no SOURCE line to read)"
         if not chose:
             raise _refuse(
                 f"selection oracle {selection_oracle!r} carries no "
@@ -825,6 +866,18 @@ def family_from_front(front_log: str) -> List[str]:
             for line in fh:
                 found = _CHUNKS_RE.search(line)
                 if found:
+                    # The line prints the family the boot PAUSED verbatim
+                    # ("family ['weights_0', ..., 'weights_draft', 'weights']").
+                    # Read it: rebuilding it through weights_family_tags in
+                    # THIS process asks draft_tag_in_family(), which reads the
+                    # exchange environment the tool does not run under, and
+                    # drops weights_draft (refused xsn246 as a source, 17.09.).
+                    listed = re.search(r"family \[([^\]]*)\]", line)
+                    if listed:
+                        tags = [t.strip().strip("'\"") for t in listed.group(1).split(",")]
+                        tags = [t for t in tags if t]
+                        if tags:
+                            return tags
                     return [str(t) for t in weights_family_tags(int(found.group(1)))]
     except OSError as exc:
         raise _refuse(f"front log {front_log!r} unreadable: {exc}")

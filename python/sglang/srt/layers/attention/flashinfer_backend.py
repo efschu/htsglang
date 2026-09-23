@@ -2352,6 +2352,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
+            # #1490 instrument: what the DFLASH draft's attention actually sees
+            # (ENCODER_ONLY layers exist only in the draft).  Three calls per boot.
+            if layer.attn_type == AttentionType.ENCODER_ONLY and getattr(self, "_1490_n", 0) < 3:
+                self._1490_n = getattr(self, "_1490_n", 0) + 1
+                try:
+                    _w = prefill_wrapper_paged
+                    _qo = getattr(_w, "_qo_indptr_buf", None); _kv = getattr(_w, "_paged_kv_indptr_buf", None)
+                    _cm = getattr(_w, "_custom_mask_buf", None)
+                    logger.warning("#1490 DRAFT-ATTN layer=%s causal=%s window_left=%s q_rows=%s kv_len_per_req=%s custom_mask_buf=%s mode=%s ragged_override=%s",
+                                   layer.layer_id, causal, layer.sliding_window_size, int(q.shape[0]),
+                                   (_kv[:4].tolist() if _kv is not None else None), (None if _cm is None else tuple(_cm.shape)),
+                                   str(forward_batch.forward_mode), self._ragged_wrapper_override is not None)
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning("#1490 DRAFT-ATTN n/a (%s: %s)", type(_e).__name__, _e)
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 self.token_to_kv_pool.get_kv_buffer(layer.layer_id),

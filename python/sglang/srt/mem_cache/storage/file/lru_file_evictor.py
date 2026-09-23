@@ -894,7 +894,18 @@ class LRUFileEvictor:
         )
         return False
 
+    #: #1459: the shared L3 stem index (l3_index.L3Index) or None; set by the
+    #: store after construction.  The evictor is the one bookkeeper of the
+    #: disk store, so commit/evict/clear keep the table exact.
+    l3_index = None
+
     def commit(self, suffixed_key: str) -> None:
+        _idx = getattr(self, "l3_index", None)
+        if _idx is not None:
+            try:
+                _idx.add([suffixed_key])
+            except Exception:  # noqa: BLE001 -- the index is an accelerator, never a gate
+                pass
         """Mark a reserved write as durably on disk (clears its in-flight flag).
 
         RECONCILE HERE, because ``reserve`` could only estimate. A reservation
@@ -1440,6 +1451,12 @@ class LRUFileEvictor:
         try:
             os.remove(tensor_path)
             freed = evict_size
+            _idx = getattr(self, "l3_index", None)
+            if _idx is not None:
+                try:
+                    _idx.remove([evict_stem])  # #1459
+                except Exception:  # noqa: BLE001
+                    pass
             if self._on_evict is not None:
                 self._on_evict(evict_stem)
         except FileNotFoundError:

@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
@@ -133,6 +134,95 @@ DEFAULT_STAGE_DEADLINE_S = 6.0
 #: The legs, in the order ``run_vision_stage`` runs them.  The deadline is
 #: checked BEFORE each one.
 LEGS = ("plan", "displace", "load", "encode", "attach", "teardown")
+
+
+#: The request id of the request currently being tokenized, for the log lines.
+#: A ``ContextVar`` rather than a parameter because the seam that runs the
+#: stage (``base_processor.process_and_combine_mm_data``) is four upstream
+#: frames below the only place that knows the rid, and widening four upstream
+#: signatures to carry a log field is a worse trade than one task-local.
+#: Measured cost of NOT having it: ``W105 Weg2VisionNoRoom rid= --`` on
+#: xsn405, a refusal that could not be tied to the request that caused it.
+_REQUEST_RID: ContextVar[str] = ContextVar("weg2_vision_rid", default="")
+
+
+def set_request_rid(rid: str) -> None:
+    """Record the rid for this request's task.  Never raises.
+
+    Per-task by construction: each HTTP request is its own asyncio task with
+    its own context, so a value set here cannot leak into another request.
+    """
+    try:
+        _REQUEST_RID.set(str(rid or ""))
+    except Exception:  # noqa: BLE001 -- a log field never breaks a request
+        pass
+
+
+def current_rid() -> str:
+    try:
+        return _REQUEST_RID.get()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+class VisionStageRequestRefused(ValueError):
+    """A refused stage ENDS the request, here, in the processor process.
+
+    THE DEFECT THIS EXISTS TO END (metal boot xsn405, 20.09. 16:18Z): the seam
+    logged the refusal and then *let the request continue*.  The comment that
+    justified it said the items "still carry ``feature``, and the normal
+    refusal downstream is what the caller sees -- one failure, named once, not
+    two."  That premise is FALSE, and the boot proved it: the downstream
+    refusal is ``_require_visual`` (``qwen3_vl.py:1421``), which raises inside
+    the SCHEDULER THREAD during prefill.  A RuntimeError there is not a request
+    refusal, it is a dead rank -- all of PP0/PP1/PP2 went down and the front
+    logged ``W17 Weg2GroupDead``.  One refused image killed the group.
+
+    So a refusal is terminal AT THE SEAM.  Raising out of the processor ends
+    the request before the tokenizer builds a ``TokenizedGenerateReqInput``,
+    which means nothing carrying mm_items is ever sent to a scheduler.
+
+    It derives from :class:`ValueError` deliberately: that is the one exception
+    class every entrypoint route already catches
+    (``http_server.py:1235/1248/1260``) and turns into a clean error envelope
+    instead of an unhandled 500.  ``weg2_http_status`` lifts the status to 501
+    -- the same code the front already answers an image with under
+    ``--weg2-vision off`` (``W101``), so a client sees ONE status for "this
+    server will not encode that image", however it was decided.
+    """
+
+    #: Read by ``http_server._create_error_response``; the precedent is
+    #: ``ServerShuttingDown`` -> 503 (#840).
+    weg2_http_status = 501
+
+    def __init__(self, outcome: "VisionStageOutcome"):
+        self.outcome = outcome
+        self.code = outcome.code
+        self.fatal = bool(outcome.fatal)
+        super().__init__(
+            f"{outcome.code}: the transient vision stage did not produce "
+            f"embeddings for this request (rid={outcome.rid or '<unset>'}), so "
+            "it is refused here, in the tokenizer process. Nothing carrying "
+            "image items is handed to a scheduler: a rank built without a "
+            "vision tower would raise _require_visual inside its scheduler "
+            "thread, which kills the group rather than the request. "
+            f"{outcome.detail}"
+        )
+
+
+class VisionStageUnstaged(VisionStageRequestRefused):
+    """Image items reached the transport with no embeddings and no verdict.
+
+    The second line of defence, and it exists because the first one can only
+    catch failures it was TOLD about.  ``maybe_run`` returns ``None`` for
+    "nothing to do", and one of the ways to reach that is an installed service
+    that this boot expected and does not have.  This check asks the only
+    question that actually matters at this seam -- *are any image items about
+    to leave for a scheduler without rows?* -- and refuses by name if so.
+    """
+
+    def __init__(self, outcome: "VisionStageOutcome"):
+        super().__init__(outcome)
 
 
 class VisionStageNotArmed(RuntimeError):
@@ -240,11 +330,41 @@ def code_for(exc: BaseException) -> Tuple[str, bool]:
     return W_LOAD, False
 
 
+def _device_total_mib(dev: Any, mem: Any) -> float:
+    """Total MiB of a card, from the object that actually carries it.
+
+    THE DEFECT THIS FUNCTION EXISTS TO END (metal boot xsn405, 20.09. 16:18Z).
+    The predecessor read ``getattr(mem, "total_mib", 0.0)`` -- and
+    ``registry.nvml.MemoryInfo`` has ``free_mib``, ``reserved_mib``,
+    ``allocatable_mib`` and ``tenant_used_mib``, but NO ``total_mib``: that
+    property lives on ``DeviceInfo`` (``registry/nvml.py:88``).  The
+    ``getattr`` default turned a wrong-object read into ``0.0``, the
+    ``total_mib <= 0`` guard then dropped EVERY card silently, and the
+    placement was handed an empty list.  What the operator saw was
+    ``W105 Weg2VisionNoRoom ... (evictions FORBIDDEN by the caller): . Best
+    card is short by nan GiB`` -- a capacity verdict over zero cards.
+
+    So: the number is read from ``dev`` first (where it is defined), then from
+    ``mem`` only as an explicit second source, and a card whose total cannot be
+    read at ALL is reported to the caller instead of vanishing.  No default:
+    ``getattr`` with a numeric default on a budget path is the #606 class.
+    """
+    for src in (dev, mem):
+        total = getattr(src, "total_mib", None)
+        if total is not None:
+            return float(total)
+        total_bytes = getattr(src, "total_bytes", None)
+        if total_bytes is not None:
+            return float(total_bytes) / MIB
+    return -1.0
+
+
 def census_from_nvml(
     snapshot: Sequence[Tuple[Any, Any]],
     *,
     h2d_gbps: Dict[int, float],
     ranks_of_card: Optional[Dict[int, Tuple[int, ...]]] = None,
+    on_drop: Optional[Callable[[int, str], None]] = None,
 ) -> Tuple[CardAir, ...]:
     """Turn ``registry.nvml.memory_snapshot()`` into the planner's input.
 
@@ -263,32 +383,60 @@ def census_from_nvml(
 
     A card with no measured H2D rate is DROPPED, not defaulted: placing
     against an assumed link rate is how a modelled time becomes fiction.
+
+    EVERY DROP IS REPORTED.  ``on_drop(card, reason)`` is called for each one
+    and the reason is logged at WARNING.  A census that silently returns fewer
+    cards than the rig has is indistinguishable from a full rig, and that
+    confusion is exactly what cost boot xsn405: see :func:`_device_total_mib`.
     """
     out = []
     for dev, mem in snapshot:
-        idx = int(getattr(dev, "index", getattr(dev, "nvml_index", -1)))
+        idx_raw = getattr(dev, "index", None)
+        if idx_raw is None:
+            idx_raw = getattr(dev, "nvml_index", -1)
+        idx = int(idx_raw)
+
+        def _drop(reason: str, _idx: int = idx) -> None:
+            logger.warning("vision stage census: card%d DROPPED -- %s", _idx, reason)
+            if on_drop is not None:
+                on_drop(_idx, reason)
+
         if idx not in h2d_gbps:
-            logger.warning(
-                "vision stage census: card%d has no MEASURED h2d rate; dropping "
-                "it from the placement rather than assuming one",
-                idx,
+            _drop(
+                "no MEASURED h2d rate for this card (have rates for "
+                f"{sorted(h2d_gbps)}); placing against an assumed link rate "
+                "would make the modelled time fiction"
             )
             continue
-        free_mib = float(getattr(mem, "free_mib", 0.0))
-        total_mib = float(getattr(mem, "total_mib", 0.0))
+        free_mib = getattr(mem, "free_mib", None)
+        if free_mib is None:
+            _drop(
+                f"the memory record {type(mem).__name__} carries no 'free_mib'; "
+                "the placement input cannot be read from it"
+            )
+            continue
+        total_mib = _device_total_mib(dev, mem)
         if total_mib <= 0:
-            continue
-        out.append(
-            CardAir(
-                card=idx,
-                ranks=tuple((ranks_of_card or {}).get(idx, ())),
-                total_bytes=int(total_mib * MIB),
-                free_bytes=int(free_mib * MIB),
-                h2d_gbps=float(h2d_gbps[idx]),
-                evictable=(),  # see the module docstring: not from this process
-                provenance="nvml memory_snapshot (idle)",
+            _drop(
+                f"total capacity unreadable from {type(dev).__name__}/"
+                f"{type(mem).__name__} (got {total_mib}); 'total_mib' lives on "
+                "DeviceInfo, not on MemoryInfo"
             )
-        )
+            continue
+        try:
+            out.append(
+                CardAir(
+                    card=idx,
+                    ranks=tuple((ranks_of_card or {}).get(idx, ())),
+                    total_bytes=int(total_mib * MIB),
+                    free_bytes=int(float(free_mib) * MIB),
+                    h2d_gbps=float(h2d_gbps[idx]),
+                    evictable=(),  # see the module docstring: not from this process
+                    provenance="nvml memory_snapshot (idle)",
+                )
+            )
+        except ValueError as exc:  # CardAir's own self-consistency guards
+            _drop(f"census is self-inconsistent: {exc}")
     return tuple(out)
 
 
@@ -329,11 +477,58 @@ class VisionStageService:
         return self.pause_tag is not None and self.resume_tag is not None
 
     def _census(self) -> Tuple[CardAir, ...]:
-        return census_from_nvml(
+        """The placement input, and a RECORD of what it contained.
+
+        ``_last_census`` is kept so a refusal can print the candidates it was
+        actually offered instead of leaving the reader to guess.  A capacity
+        refusal over an empty candidate list is not a capacity finding, and
+        the only way to tell the two apart afterwards is for the census to say
+        what it saw.
+        """
+        drops: list = []
+        cards = census_from_nvml(
             self.nvml_snapshot(),
             h2d_gbps=self.h2d_gbps,
             ranks_of_card=self.ranks_of_card,
+            on_drop=lambda card, why: drops.append((card, why)),
         )
+        self._last_census = cards
+        self._last_census_drops = tuple(drops)
+        return cards
+
+    def census_note(self, need_bytes: int) -> str:
+        """One sentence naming every candidate with numbers, and every drop.
+
+        This is what makes the ``W105`` line actionable: card, free_idle,
+        need and slack for each candidate the placement was offered -- or, if
+        it was offered none, why.
+        """
+        cards = getattr(self, "_last_census", ())
+        drops = getattr(self, "_last_census_drops", ())
+        if cards:
+            candidates = "; ".join(
+                f"card{c.card}: free_idle {c.free_bytes / GIB:.3f} GiB, need "
+                f"{need_bytes / GIB:.3f} GiB, slack "
+                f"{(c.free_bytes - need_bytes) / GIB:.3f} GiB"
+                for c in cards
+            )
+            note = f"CENSUS offered {len(cards)} card(s): {candidates}."
+        else:
+            note = (
+                "CENSUS offered ZERO cards, so no card was measured against the "
+                "need -- this refusal is an INPUT failure, not a capacity "
+                "finding."
+            )
+        if drops:
+            note += " DROPPED: " + "; ".join(
+                f"card{c} ({why})" for c, why in drops
+            )
+        elif not cards:
+            note += (
+                " No card was dropped either, so nvml_snapshot() itself "
+                "returned an empty sequence in this process."
+            )
+        return note
 
     def _deadline(self, started: float):
         """A ``check_deadline`` for :func:`run_vision_stage`.
@@ -364,6 +559,9 @@ class VisionStageService:
         GROUP is compromised, not this request.
         """
         started = self.clock()
+        rid = rid or current_rid()
+        self._last_census = ()
+        self._last_census_drops = ()
         hooks = StageHooks(
             census=self._census,
             load_tower=self.load_tower,
@@ -397,20 +595,26 @@ class VisionStageService:
                 achieved_tflops=self.achieved_tflops,
                 clock=self.clock,
                 check_deadline=self._deadline(started),
+                rid=rid,
             )
         except BaseException as exc:  # noqa: BLE001 -- every seam becomes an outcome
             code, fatal = code_for(exc)
             detail = f"{type(exc).__name__}: {exc}"
-            if isinstance(exc, VisionStageNoRoom) and not self.eviction_available:
-                detail += (
-                    " NOTE: band displacement was not attempted -- "
-                    "pause_tag/resume_tag live in the RANK processes and this "
-                    "stage runs in the group's processor process, which cannot "
-                    "reach them. A placement needing a band requires the "
-                    "rank-side path."
-                )
+            if isinstance(exc, VisionStageNoRoom):
+                # The candidates WITH NUMBERS, always -- a placement refusal
+                # that does not say what it was offered cannot be acted on,
+                # and on xsn405 it was the missing half of the line.
+                detail += " " + self.census_note(int(exc.need_bytes))
+                if not self.eviction_available:
+                    detail += (
+                        " NOTE: band displacement was not attempted -- "
+                        "pause_tag/resume_tag live in the RANK processes and this "
+                        "stage runs in the group's processor process, which cannot "
+                        "reach them. A placement needing a band requires the "
+                        "rank-side path."
+                    )
             (logger.error if fatal else logger.warning)(
-                "%s rid=%s -- %s", code, rid, detail
+                "%s rid=%s -- %s", code, rid or "<unset>", detail
             )
             return VisionStageOutcome(
                 ok=False,
@@ -420,6 +624,10 @@ class VisionStageService:
                 seconds=self.clock() - started,
                 fatal=fatal,
             )
+        # The acceptance line (design §6 row e) is emitted by the runtime, ONCE
+        # -- not here.  A second copy would double every grep count the metal
+        # test takes off it, and a doubled acceptance line is worse than a
+        # missing one: it reads as two stages having run.
         return VisionStageOutcome(
             ok=True,
             code=W_STAGE_OK,
@@ -530,12 +738,7 @@ def maybe_run(items: Sequence[Any], *, rid: str = "") -> Optional[VisionStageOut
     """
     if not items:
         return None
-    pending = [
-        it
-        for it in items
-        if getattr(it, "precomputed_embeddings", None) is None
-        and getattr(it, "feature", None) is not None
-    ]
+    pending = _unstaged(items)
     if not pending:
         return None
     service = _SERVICE
@@ -543,4 +746,62 @@ def maybe_run(items: Sequence[Any], *, rid: str = "") -> Optional[VisionStageOut
         if _ARM_REFUSAL:
             raise VisionStageNotArmed(_ARM_REFUSAL, len(pending))
         return None
-    return service.encode_items(pending, rid=rid)
+    return service.encode_items(pending, rid=rid or current_rid())
+
+
+def _unstaged(items: Sequence[Any]) -> list:
+    """Items that carry pixels and no rows -- the ones a tower has to run for."""
+    return [
+        it
+        for it in items
+        if getattr(it, "precomputed_embeddings", None) is None
+        and getattr(it, "feature", None) is not None
+    ]
+
+
+def this_boot_is_transient() -> bool:
+    """Does the launcher say this process serves ``--weg2-vision transient``?
+
+    The launcher publishes the key and pops it otherwise (design R19), so the
+    variable is an OUTPUT of the boot, never an operator's input.
+    """
+    import os
+
+    return os.environ.get(VISION_ENV, "").strip() == VISION_TRANSIENT
+
+
+def assert_nothing_unstaged(items: Sequence[Any], *, rid: str = "") -> None:
+    """Refuse if any image item would reach a scheduler with no embeddings.
+
+    Called by the processor AFTER :func:`maybe_run`, and only in a transient
+    boot.  It is the check that does not depend on a verdict having been
+    reached: ``maybe_run`` returns ``None`` both for "text request, nothing to
+    do" and for "no service installed and no refusal recorded", and the second
+    of those, in a boot whose ranks have no tower, is the shape that killed
+    group P on xsn405.
+
+    The text path cannot reach it: with no image item, :func:`_unstaged` is
+    empty and this returns before looking at anything else.
+    """
+    if not this_boot_is_transient():
+        return
+    pending = _unstaged(items)
+    if not pending:
+        return
+    rid = rid or current_rid()
+    outcome = VisionStageOutcome(
+        ok=False,
+        code=W_NOT_ARMED,
+        detail=(
+            f"{len(pending)} image item(s) still carry pixels and NO "
+            "precomputed embeddings after the transient vision stage seam. "
+            "This boot runs --weg2-vision transient, so every rank was built "
+            "with language_model_only and has no vision tower: handing these "
+            "items on would reach _require_visual inside a scheduler thread "
+            "and kill the group. Recorded arming refusal: "
+            f"{arm_refusal() or '<none>'}."
+        ),
+        rid=rid,
+    )
+    logger.error("%s rid=%s -- %s", outcome.code, rid or "<unset>", outcome.detail)
+    raise VisionStageUnstaged(outcome)

@@ -1578,14 +1578,18 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             return hidden_states
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
+        # Under PP every stage marks its own capture layers: the captures
+        # travel to the last stage inside the text model's forward
+        # (distributed/pp_aux_capture). Only the last stage unpacks the
+        # (hidden, aux) tuple and owns the LogitsProcessor.
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
+        if not self.pp_group.is_last_rank:
+            return
+        self.capture_aux_hidden_states = True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

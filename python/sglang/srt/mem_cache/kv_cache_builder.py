@@ -82,6 +82,27 @@ def get_draft_kv_pool(
 #: (``phase_flip_boot.build_flip_draft_worker``); the PP prefill phase has none
 #: by design, so a draft backup taken there would persist rows no drafter ever
 #: wrote, under a content-addressed key, for the TP phase to load as valid.
+def draft_total_kv_heads_of(draft_worker, server_args) -> Optional[int]:
+    """The DRAFTER's total kv-head count, read off its own model config
+    (the canonical draft page holds every head of the draft: 8 on DFlash2,
+    4 on the NEXTN head). None when no draft runner is reachable."""
+    if draft_worker is None:
+        return None
+    inner = getattr(draft_worker, "draft_worker", None)
+    if getattr(server_args, "enable_multi_layer_eagle", False):
+        runners = getattr(inner, "draft_runner_list", None) or []
+        runner = runners[0] if runners else None
+    else:
+        runner = getattr(inner, "draft_runner", None)
+    cfg = getattr(runner, "model_config", None)
+    if cfg is None:
+        return None
+    try:
+        return int(cfg.get_total_num_kv_heads())
+    except Exception:  # noqa: BLE001 -- a config without heads: fall back
+        return None
+
+
 DRAFT_OWNER_PHASE_FLIP = "tp"
 
 
@@ -369,6 +390,9 @@ def rebind_hicache_draft_for_phase(scheduler, phase: str) -> bool:
         owner_phase=reg.owner_phase,
         binding_generation=reg.generation,
         drafter_identity=reg.identity,
+        draft_total_kv_heads=draft_total_kv_heads_of(
+            getattr(scheduler, "draft_worker", None), scheduler.server_args
+        ),
     )
     return True
 
@@ -429,6 +453,16 @@ def maybe_register_hicache_draft(
         server_args=server_args,
     )
     if draft_kv_pool is None:
+        # 19.09. (xsn392): a solo-draft SHADOW has no draft pool by design,
+        # but the prefetch claim reduce must keep the host's packed form on
+        # every rank -- mark the controller (cache_controller.draft_claim_packed).
+        try:
+            inner = getattr(draft_worker, "draft_worker", None)
+            runner = getattr(inner, "draft_runner", None)
+            if getattr(runner, "is_draft_solo_shadow", False):
+                tree_cache.cache_controller.solo_draft_shadow = True
+        except Exception:  # noqa: BLE001 -- a marker, never a boot blocker
+            pass
         return
 
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -456,6 +490,7 @@ def maybe_register_hicache_draft(
         owner_phase=None,
         binding_generation=None,
         drafter_identity=drafter_identity_hash(server_args),
+        draft_total_kv_heads=draft_total_kv_heads_of(draft_worker, server_args),
     )
 
 

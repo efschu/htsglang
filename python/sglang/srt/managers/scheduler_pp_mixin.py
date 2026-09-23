@@ -93,6 +93,41 @@ from sglang.srt.utils.common import Range, get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
+
+from sglang.srt.managers.weg2_pass_timer import read_ms as _pt_read
+
+
+def _1463_timed(attr: str):
+    """#1463: per-pass phase timer for the PP follower's request TAIL.
+
+    xsn217 measured the flip's sleep-kv stage at ~860 ms: PP0 forwarded the
+    Flush at t=202.027, PP1 took it at 202.776, PP2 ended its own pass at
+    202.775 -- both followers were still inside a pass with an occupied slot
+    and NO forward (the 1-token END-ANCHOR chunk: 531 ms on PP2 for ~50 ms
+    of compute).  The #1460 gate stamp is throttled to 250 ms and cannot say
+    where such a pass spends its time.  This records the wall time of one
+    method on the holder (``setattr(self, attr, ms)``); ``_pp_process_batch_result``
+    reads the three terms and emits ONE ``#1463 PASS-TAIL`` line when the
+    pass carried a finished request or the terms sum past 100 ms.  A plain
+    function decorator: the #631 test family binds these methods onto a bare
+    SimpleNamespace one at a time, which a decorated function survives.
+    """
+    def deco(fn):
+        def wrapped(self, *a, **kw):
+            t0 = time.perf_counter()
+            try:
+                return fn(self, *a, **kw)
+            finally:
+                try:
+                    setattr(self, attr, (time.perf_counter() - t0) * 1000.0)
+                except Exception:  # noqa: BLE001
+                    pass
+        wrapped.__name__ = fn.__name__
+        wrapped.__doc__ = fn.__doc__
+        wrapped.__wrapped__ = fn
+        return wrapped
+    return deco
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -4031,6 +4066,51 @@ class SchedulerPPMixin:
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 self._pp_flip_pass_tick(mb_id)
+                # #1466 PASS-STALL: boot weg2xsn221 (P running-req 2) still shows
+                # whole seconds without a forward on ALL P ranks, twice per
+                # request change, both inside the new request's store probe
+                # window (STORE-TOLD INTAKE -> PUBLISHED, 3-4 s).  One line per
+                # pass whose wall time minus its forward exceeds 300 ms, with
+                # the phase terms the decorated methods recorded.
+                try:
+                    _1466_now = time.perf_counter()
+                    _1466_prev = getattr(self, "_1466_pass_t", None)
+                    self._1466_pass_t = _1466_now
+                    _1466_run = _pt_read(self, "_1466_run_ms")
+                    _1466_recv = _pt_read(self, "_1466_recv_ms")
+                    _1466_input = _pt_read(self, "_1466_input_ms")
+                    _1466_sched = _pt_read(self, "_1466_schedule_ms")
+                    # #1466b: the #1463 terms too (proxy recv from the upstream
+                    # stage, send-join + output from the last stage) -- xsn224's
+                    # request tails read other_ms=400-700 with every named term
+                    # near 0, i.e. the pass sat in exactly these two.
+                    _1466_prx = float(getattr(self, "_1463_recv_ms", 0.0) or 0.0)
+                    _1466_cmt = float(getattr(self, "_1463_commit_ms", 0.0) or 0.0)
+                    _1466_proc = float(getattr(self, "_1463_process_ms", 0.0) or 0.0)  # #1466c: process_batch_result
+                    # #1475: the intake's own parts (weg2xsn232-235: input_ms 1.4-1.9 s
+                    # on every rank in the same pass, handle_generate_request < 200 ms)
+                    _1475 = " ".join("%s=%.0f" % (k, _pt_read(self, a)) for k, a in (
+                        ("vote_ms", "_1475_vote_ms"), ("post_send_ms", "_1475_post_send_ms"),
+                        ("send_ms", "_1475_send_ms"), ("proc_input_ms", "_1475_process_input_ms"),
+                        ("absorb_ms", "_1475_absorb_ms")))
+                    if _1466_prev is not None:
+                        _1466_pass = (_1466_now - _1466_prev) * 1000.0
+                        if _1466_pass - _1466_run >= 300.0:
+                            logger.info(
+                                "#1466 PASS-STALL pp_rank=%s slot=%d pass_ms=%.0f fwd_ms=%.0f "
+                                "recv_ms=%.0f input_ms=%.0f schedule_ms=%.0f proxy_recv_ms=%.0f commit_ms=%.0f process_ms=%.0f other_ms=%.0f input[%s] t=%.3f",
+                                getattr(getattr(self, "ps", None), "pp_rank", "?"), mb_id,
+                                _1466_pass, _1466_run, _1466_recv, _1466_input, _1466_sched, _1466_prx, _1466_cmt, _1466_proc,
+                                _1466_pass - _1466_run - _1466_recv - _1466_input - _1466_sched - _1466_prx - _1466_cmt - _1466_proc,
+                                _1475, time.time())
+                    try:
+                        self._1463_recv_ms = 0.0
+                        self._1463_commit_ms = 0.0
+                        self._1463_process_ms = 0.0
+                    except Exception:  # noqa: BLE001
+                        pass
+                except Exception:  # noqa: BLE001
+                    pass
                 # #824 W4(b): honour a slot restore requested by the falling
                 # edge above. Restart the body on that slot rather than
                 # advancing, so this rank re-enters the pipeline where it
@@ -4117,6 +4197,17 @@ class SchedulerPPMixin:
                         and self.ps.pp_rank != 0
                     ):
                         _chain_gate = self._pp_row_chain_pending()
+                    if self.ps.pp_rank != 0:  # #1460: the follower's gate verdict, at most every 250 ms
+                        _now = time.time()
+                        if _now - float(getattr(self, "_1460_last", 0.0) or 0.0) >= 0.25:
+                            self._1460_last = _now
+                            try:
+                                logger.info("#1460 FOLLOWER-GATE gate=%s proxy=%s mbs=%d chunked=%s t=%.3f",
+                                            _chain_gate, self._pp_row_any_proxy_signal(),
+                                            sum(1 for b in self.mbs if b is not None),
+                                            getattr(self, "chunked_req", None) is not None, _now)
+                            except Exception:  # noqa: BLE001
+                                pass
                     if _chain_gate is None or _chain_gate:
                         recv_reqs = self.request_receiver.recv_requests()
                         # #1071: the ring moved for this rank -- every slot's
@@ -5814,6 +5905,7 @@ class SchedulerPPMixin:
             if server_is_idle and queue_size == 0:
                 self.on_idle()
 
+    @_1463_timed("_1466_input_ms")  # #1466: the pass's intake phase (handle_generate_request etc.)
     def _pp_forward_and_process_input_requests(
         self: Scheduler, recv_reqs: List
     ) -> None:
@@ -5890,7 +5982,7 @@ class SchedulerPPMixin:
         if recv_reqs:
             _rn = getattr(self, "_pp_req_trace_n", 0) + 1
             self._pp_req_trace_n = _rn
-            if _rn <= 30:
+            if _rn <= 30 or any(type(r).__name__ == "AbortReq" for r in recv_reqs):  # xsn324: aborts always traced
                 try:
                     logger.info(
                         "#631 REQ-TRACE r%d rank=%s n=%d kinds=%s rids=%s",
@@ -5961,6 +6053,14 @@ class SchedulerPPMixin:
             _wire_reqs = recv_reqs
             if weg2_store_told.armed(self) and weg2_store_told.is_pp0(self):
                 _wire_reqs = weg2_store_told.pp0_publish(self, recv_reqs)
+            try:  # #1460: when did PP0 put a Weg-2 control request on the chain?
+                _ctrl = [type(r).__name__ for r in (_wire_reqs or ())
+                         if type(r).__name__ in ("FlushCacheReqInput", "ReleaseMemoryOccupationReqInput",
+                                                 "ResumeMemoryOccupationReqInput", "AbortReq")]
+                if _ctrl:
+                    logger.info("#1460 CTRL-FWD kinds=%s n_wire=%d t=%.3f", _ctrl, len(_wire_reqs or ()), time.time())
+            except Exception:  # noqa: BLE001
+                pass
             with torch.profiler.record_function("send_reqs_to_next_stage"):
                 self.send_req_work = self._pp_send_pyobj_to_next_stage(
                     _wire_reqs,
@@ -6005,6 +6105,7 @@ class SchedulerPPMixin:
         """
         return self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0
 
+    @_1463_timed("_1475_vote_ms")  # #1475
     def _weg2_vote_pass_hook(self: Scheduler, recv_reqs: List) -> None:
         """Harvest a landed lap, stamp a new one, attach THIS rank's slot.
 
@@ -7679,6 +7780,7 @@ class SchedulerPPMixin:
         """
         return max(1, int(getattr(self.ps, "pp_size", 1) or 1))
 
+    @_1463_timed("_1475_post_send_ms")  # #1475
     def _pp_post_send(self: Scheduler, work: List[P2PWork]) -> None:
         """Post-and-forget: take the send off the pass path entirely.
 
@@ -7859,6 +7961,7 @@ class SchedulerPPMixin:
                 raise RingCommitTimeout(message) from exc
         work.clear()
 
+    @_1463_timed("_1463_commit_ms")
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
         self: Scheduler,
         next_first_rank_mb_id: int,
@@ -7909,6 +8012,7 @@ class SchedulerPPMixin:
             self._pp_commit_comm_work(work=pending_output_work)
         return next_pp_outputs, next_batch_result, d2h_event
 
+    @_1463_timed("_1475_send_ms")  # #1475
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
@@ -10186,6 +10290,7 @@ class SchedulerPPMixin:
     #: `self._pp_wait_for_proxy_readiness(mb_id)` is unchanged in meaning.
     _pp_wait_for_proxy_readiness = _pp_wait_for_dict_readiness
 
+    @_1463_timed("_1463_recv_ms")
     def _pp_recv_proxy_tensors(
         self: Scheduler, mb_id: int = -1
     ) -> Optional[PPProxyTensors]:
@@ -10623,7 +10728,31 @@ class SchedulerPPMixin:
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
-        self.process_batch_result(batch, output_result)
+        _t0 = time.perf_counter()
+        try:
+            self.process_batch_result(batch, output_result)
+        finally:
+            # #1463 PASS-TAIL: see `_1463_timed`.  One line per pass that
+            # delivered a finished request or spent >= 100 ms outside the
+            # forward; the three terms are the pass's recv (wait on the
+            # upstream frame), commit (send join + wait on the last rank's
+            # output) and process (finish/backup/handoff host work).
+            try:
+                _proc = (time.perf_counter() - _t0) * 1000.0
+                self._1463_process_ms = float(getattr(self, "_1463_process_ms", 0.0) or 0.0) + _proc  # #1466c
+                _recv = float(getattr(self, "_1463_recv_ms", 0.0) or 0.0)
+                _commit = float(getattr(self, "_1463_commit_ms", 0.0) or 0.0)
+                _reqs = getattr(batch, "reqs", None) or ()
+                _fin = sum(1 for r in _reqs if getattr(r, "finished", lambda: False)())
+                if _fin or (_proc + _recv + _commit) >= 100.0:
+                    logger.info(
+                        "#1463 PASS-TAIL pp_rank=%s bs=%d finished=%d recv_ms=%.0f commit_ms=%.0f process_ms=%.0f t=%.3f",
+                        getattr(getattr(self, "ps", None), "pp_rank", "?"), len(_reqs), _fin,
+                        _recv, _commit, _proc, time.time())
+                self._1463_recv_ms = 0.0
+                self._1463_commit_ms = 0.0
+            except Exception:  # noqa: BLE001
+                pass
 
     def _pp_send_output_to_next_stage(
         self: Scheduler,

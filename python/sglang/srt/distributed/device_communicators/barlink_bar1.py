@@ -184,6 +184,33 @@ from sglang.srt.distributed.device_communicators.barlink_liveness import (
 _resolve_timeout_cycles = None
 
 
+
+def _untagged_alloc():
+    """A context in which torch allocations bypass the memory saver's tag
+    region (torch_memory_saver.disable()); a no-op context when the saver is
+    absent or not preloaded (desk, tests) -- the saver asserts at __enter__,
+    so the fallback is taken there, not at construction."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _cm():
+        cm = None
+        try:
+            import torch_memory_saver as _tms
+            cm = _tms.torch_memory_saver.disable()
+            cm.__enter__()
+        except Exception:  # noqa: BLE001 -- no saver / no preload: plain allocations
+            cm = None
+        try:
+            yield
+        finally:
+            if cm is not None:
+                try:
+                    cm.__exit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
+    return _cm()
+
 def resolve_timeout_cycles(base_cycles: int) -> int:
     """Deadline for a device collective right now -- see utils/jit_cold_build.
 
@@ -2846,8 +2873,14 @@ class BarlinkBar1Transport:
         # the round in word 1 (word 2), which is the round whose payload lines
         # it is about to overwrite. Local VRAM, never touched by a peer -- what
         # crosses the aperture are the ack lines in the flag region.
-        self._round_dev = torch.zeros(3, dtype=torch.int64, device=self.device)
-        self._ctl_dev = torch.zeros(2, dtype=torch.int32, device=self.device)
+        # Wake-Parallel (18.09., xsn317/318): these words are read by the BAR1
+        # status/abort polls at any time, including while a memory-saver tag
+        # region is paused or being resumed under them. Allocated UNTAGGED
+        # (memory saver disabled for the two allocations) so no phase
+        # release, pause or early resume ever remaps their backing.
+        with _untagged_alloc():
+            self._round_dev = torch.zeros(3, dtype=torch.int64, device=self.device)
+            self._ctl_dev = torch.zeros(2, dtype=torch.int32, device=self.device)
         # #517: arm the deferred status read now that the word exists.
         self._arm_status_stage()
         # #616f: and the watchdog's private-stream read of the same word.
@@ -5659,24 +5692,124 @@ class BarlinkBar1Transport:
                 "it; polling it would fault the context")
             return bool(self._abort_code_seen)
 
-        with torch.cuda.stream(self._abort_poll_stream):
-            self._abort_poll_dst.copy_(self._ctl_dev[0:1], non_blocking=True)
-            # #622: stage the three round words (round, mesh watermark, a2a
-            # watermark) alongside the abort word, on the same private
-            # stream. This gives the SIGUSR1 launch dump a host-resident
-            # mirror to print — the live monotonicity probe for the ack
-            # barrier's capture-safety proof — without ever violating the
-            # dump's no-device-sync constraint.
-            if self._round_dev is not None and self._round_mirror is not None:
-                n = min(3, self._round_dev.numel())
-                self._round_mirror[:n].copy_(self._round_dev[:n], non_blocking=True)
-        # Waits for THIS copy on THIS stream only -- not for the model.
-        self._abort_poll_stream.synchronize()
-        code = int(self._abort_poll_dst[0])
+        # #1489: AND THE PROCESS-WIDE LATCH. The `data_ptr == 0` test above is
+        # the belt #1330 built for a RELEASED mapping, and boot weg2xsn406
+        # measured its reach: a torch-memory-saver pause keeps the VIRTUAL
+        # reservation and unmaps only the physical handles, so after
+        #   [core.cpp] WEG2-TMS-RESUME REFUSED tag=kv_cache rc=2 (out of memory)
+        # the very tensor that faulted still printed a non-zero pointer in the
+        # rank's own diagnostic --
+        #   _ctl_dev=(Tensor dev=cuda:0 dtype=torch.int32 ptr=140017225696256 numel=2)
+        # -- and the pre-check waved it through. The latch carries the fact the
+        # pointer cannot: some OTHER site in this process has already found
+        # device memory unsafe to read.
+        if barlink_abort_gate.gate_disarmed() is not None:
+            self._abort_poll_disarm(
+                "the process-wide abort-poll gate is already disarmed "
+                f"({barlink_abort_gate.gate_disarmed()})")
+            return bool(self._abort_code_seen)
+
+        # #1489 W113: CHECK THE ARGUMENTS BEFORE THE EXTENSION, NOT AFTER.
+        # `Tensor.copy_` dispatches into the loaded extension stack, and a
+        # wrong argument there does not come back as a Python TypeError: boot
+        # weg2xsn406 got `RuntimeError: unknown parameter type` -- the
+        # extension/FFI phrasing for an argument of a type it cannot bind --
+        # and the process then died in the driver rather than at the raise. An
+        # argument that this function OWNS must never be handed to an
+        # extension unexamined.
+        bad = self._abort_poll_arg_refusal()
+        if bad is not None:
+            self._abort_poll_disarm(f"W113 the poll's own arguments are unsound: {bad}")
+            return bool(self._abort_code_seen)
+
+        try:
+            with torch.cuda.stream(self._abort_poll_stream):
+                self._abort_poll_dst.copy_(self._ctl_dev[0:1], non_blocking=True)
+                # #622: stage the three round words (round, mesh watermark, a2a
+                # watermark) alongside the abort word, on the same private
+                # stream. This gives the SIGUSR1 launch dump a host-resident
+                # mirror to print — the live monotonicity probe for the ack
+                # barrier's capture-safety proof — without ever violating the
+                # dump's no-device-sync constraint.
+                if self._round_dev is not None and self._round_mirror is not None:
+                    n = min(3, self._round_dev.numel())
+                    self._round_mirror[:n].copy_(self._round_dev[:n], non_blocking=True)
+            # Waits for THIS copy on THIS stream only -- not for the model.
+            self._abort_poll_stream.synchronize()
+            code = int(self._abort_poll_dst[0])
+        except Exception as exc:  # noqa: BLE001 -- see #1489 above
+            # The gate above this catches every exception too, but it catches
+            # it a frame too late to say WHICH read failed, and -- measured on
+            # weg2xsn406 -- it then walked into the next transport. Refusing
+            # here keeps the pass alive for transports whose memory is fine
+            # while this one goes quiet by name, and it latches the process
+            # gate so no round asks again.
+            barlink_abort_gate.disarm_gate(
+                f"barlink-BAR1 group {self.group} status copy raised "
+                f"{type(exc).__name__}: {exc}")
+            self._abort_poll_disarm(
+                f"W113 the status copy raised {type(exc).__name__}: {exc} -- "
+                "a failed TMS resume or a phase release owns the control "
+                "word's backing")
+            return bool(self._abort_code_seen)
         if code:
             self._abort_code_seen = code
             return True
         return False
+
+    def _abort_poll_arg_refusal(self) -> Optional[str]:
+        """Name the unsound poll argument, or None when all of them hold.
+
+        #1489. Every value named here is built by :meth:`_arm_abort_poll` and
+        owned by this object, so a violation is a STATE bug in this class (a
+        half-armed poll, a mirror that never got built, a control word that
+        was re-pointed at the host) -- never user input. Naming it is
+        therefore strictly better than letting the extension phrase it as
+        `unknown parameter type` three frames down and a segfault after that.
+
+        Cheap on purpose: metadata only, no CUDA call. A probe that can itself
+        fault is no probe.
+        """
+        import torch
+
+        dst = self._abort_poll_dst
+        ctl = self._ctl_dev
+        stream = self._abort_poll_stream
+        if not isinstance(ctl, torch.Tensor):
+            return f"_ctl_dev is {type(ctl).__name__}, not a Tensor"
+        if not isinstance(dst, torch.Tensor):
+            return f"_abort_poll_dst is {type(dst).__name__}, not a Tensor"
+        if not bool(getattr(ctl, "is_cuda", False)):
+            return f"_ctl_dev is on {ctl.device}, not on a device"
+        if ctl.numel() < 1:
+            return "_ctl_dev is empty (numel=0)"
+        if dst.numel() < 1:
+            return "_abort_poll_dst is empty (numel=0)"
+        if dst.dtype != ctl.dtype:
+            return f"dtype mismatch: _abort_poll_dst {dst.dtype} vs _ctl_dev {ctl.dtype}"
+        if dst.untyped_storage().data_ptr() == 0:
+            return "_abort_poll_dst's host backing is not mapped (data_ptr=0)"
+        if self._round_mirror is not None and self._round_dev is not None:
+            if not isinstance(self._round_dev, torch.Tensor):
+                return f"_round_dev is {type(self._round_dev).__name__}, not a Tensor"
+            if not isinstance(self._round_mirror, torch.Tensor):
+                return (
+                    f"_round_mirror is {type(self._round_mirror).__name__}, "
+                    "not a Tensor"
+                )
+            if self._round_mirror.dtype != self._round_dev.dtype:
+                return (
+                    f"round dtype mismatch: mirror {self._round_mirror.dtype} "
+                    f"vs device {self._round_dev.dtype}"
+                )
+            if self._round_dev.untyped_storage().data_ptr() == 0:
+                return "_round_dev's device backing is not mapped (data_ptr=0)"
+        # Last, because it orders the copy rather than being bound by it: an
+        # unsound stream is a real refusal but a less specific one, and the
+        # tensor shapes above are what the extension actually binds.
+        if not isinstance(stream, torch.cuda.Stream):
+            return f"_abort_poll_stream is {type(stream).__name__}, not a cuda Stream"
+        return None
 
     def _wait_ctl_event(self) -> bool:
         """Wait for the staged copy, but never past the deadline.

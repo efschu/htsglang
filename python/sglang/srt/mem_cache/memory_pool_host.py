@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -248,7 +249,7 @@ def _refuse_stray_host_index(pool, index, op: str) -> None:
     Subclasses IndexError so existing handlers still catch it, but carries the
     tier story instead of `index 76997 is out of bounds for dimension 0`.
     """
-    size = int(getattr(pool, "size", -1))
+    size = int(getattr(pool, "id_space", None) or getattr(pool, "size", -1))  # #1424
     if size < 0 or index is None:
         return
     if torch.is_tensor(index):
@@ -2064,6 +2065,54 @@ class HostPoolGroup:
         for entry in self.entries:
             entry.host_pool.clear()
 
+    # -- #1424 Stufe 3: the arena host pool API, delegated to the anchor pool
+    # (the controller holds THIS group, never the MHA pool itself; boot
+    # xsn175 bound only the draft pool because the KV path asked the group).
+    @property
+    def arena_read(self) -> bool:
+        return bool(getattr(self.anchor_entry.host_pool, "arena_read", False))
+
+    @property
+    def arena(self):
+        return getattr(self.anchor_entry.host_pool, "arena", None)
+
+    @property
+    def staging_rows(self) -> int:
+        return int(getattr(self.anchor_entry.host_pool, "staging_rows", self.anchor_entry.host_pool.size))
+
+    @property
+    def arena_slots(self) -> int:
+        return int(getattr(self.anchor_entry.host_pool, "arena_slots", 0))
+
+    @property
+    def prefetch_capacity_tokens(self):
+        return getattr(self.anchor_entry.host_pool, "prefetch_capacity_tokens", None)
+
+    @property
+    def id_space(self) -> int:
+        return int(getattr(self.anchor_entry.host_pool, "id_space", self.anchor_entry.host_pool.size))
+
+    def ensure_bound(self, storage_backend, role: str = "kv") -> bool:
+        fn = getattr(self.anchor_entry.host_pool, "ensure_bound", None)
+        return bool(fn(storage_backend, role=role)) if callable(fn) else False
+
+    def resolve_rows(self, host_indices, slots) -> None:
+        return self.anchor_entry.host_pool.resolve_rows(host_indices, slots)
+
+    def is_arena_id(self, i) -> bool:
+        return bool(self.anchor_entry.host_pool.is_arena_id(i))
+
+    def is_placeholder(self, i) -> bool:
+        return bool(self.anchor_entry.host_pool.is_placeholder(i))
+
+    def __getattr__(self, name):
+        # only reached for attributes the group does not define itself
+        if name in ("alloc_read", "alloc_write", "complete_write", "abort_write", "pin_slots"):
+            fn = getattr(self.anchor_entry.host_pool, name, None)
+            if callable(fn):
+                return fn
+        raise AttributeError(name)
+
     def available_size(self):
         return self.anchor_entry.host_pool.available_size()
 
@@ -2175,9 +2224,15 @@ class HostPoolGroup:
         pool_transfers: Optional[list] = None,
     ) -> None:
         # 1. Anchor (KV) transfer
+        # 19.09. (Task #3): CPU ms per component, summed over the layers of one
+        # start_loading; the controller prints and resets `_weg2_load_ms`.
+        _acc = getattr(self, "_weg2_load_ms", None)
+        if _acc is None:
+            _acc = self._weg2_load_ms = {}
         anchor = self.anchor_entry
         local_layer_id = anchor.local_layer(layer_id)
         if local_layer_id is not None and host_indices.numel() > 0:
+            _t = time.perf_counter()
             anchor.host_pool.load_to_device_per_layer(
                 anchor.device_pool,
                 host_indices,
@@ -2185,6 +2240,7 @@ class HostPoolGroup:
                 local_layer_id,
                 io_backend,
             )
+            _acc["kv"] = _acc.get("kv", 0.0) + (time.perf_counter() - _t) * 1000.0
 
         # 2. Extra pool transfers
         for transfer in pool_transfers or []:
@@ -2194,6 +2250,7 @@ class HostPoolGroup:
                 # A layer this pool does not cover. The ONLY legitimate skip
                 # here, and it is per-layer, not per-pool.
                 continue
+            _t = time.perf_counter()
             entry.host_pool.load_to_device_per_layer(
                 entry.device_pool,
                 transfer.host_indices,
@@ -2201,6 +2258,8 @@ class HostPoolGroup:
                 local_layer_id,
                 io_backend,
             )
+            _k = str(getattr(transfer, "name", None) or type(entry.host_pool).__name__)
+            _acc[_k] = _acc.get(_k, 0.0) + (time.perf_counter() - _t) * 1000.0
 
     def backup_from_device_all_layer(
         self,

@@ -347,6 +347,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Important: for FP8, this must cover not only `.weight` but also
         # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
         self._bind_packed_weight_loaders(self.in_proj_qkvz)
+        if layer_id == 0:  # #1483 instrument
+            logger.info("#1483 GDN-PROJ layer0 qkvz=%s ba=%s out=%s prefix=%s quant=%s",
+                        type(self.in_proj_qkvz.quant_method).__name__, type(self.in_proj_ba.quant_method).__name__,
+                        type(self.out_proj.quant_method).__name__ if hasattr(self, "out_proj") else "n/a",
+                        prefix, None if quant_config is None else quant_config.get_name())
         self._bind_packed_weight_loaders(self.in_proj_ba)
         self._fused_in_proj_weight: Optional[torch.Tensor] = None
         self._fused_in_proj_qkvz_width = 0
@@ -1683,11 +1688,61 @@ class Qwen3_5ForCausalLM(nn.Module):
         checkpoint packs the vocab (Qwen4-Exp / Minachist) passes them on."""
         if not self.pp_group.is_first_rank:
             return PPMissingLayer()
+        # GGUF only: build embed_tokens QUANTIZED-RESIDENT (packed
+        # `qweight` via GGUFEmbeddingMethod) instead of the dense bf16
+        # materialization -- saves ~1.1 GiB/rank on a 248k vocab. Every
+        # non-GGUF quantization keeps quant_config=None here, i.e. the
+        # default path is byte-identical. SGLANG_GGUF_DENSE_VOCAB=1
+        # restores the legacy dense embed for GGUF too.
+        from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
+            is_compressed_tensors_config,
+        )
+
+        embedding_quant_config = None
+        if quant_config is not None and quant_config.get_name() == "gguf":
+            from sglang.srt.model_loader.gguf_qwen35 import gguf_dense_vocab
+
+            if not gguf_dense_vocab():
+                embedding_quant_config = quant_config
+        elif is_compressed_tensors_config(quant_config):
+            # #727: only when the checkpoint ACTUALLY quantized the vocab.
+            # Every checkpoint we serve today lists embed_tokens in
+            # quantization_config.ignore, so this stays None and the dense
+            # BF16 path runs byte-identically. A requantized checkpoint
+            # (tools/requant_vocab_int8.py) drops that entry, and then the
+            # int8 rows are dequantized on gather instead of materialized.
+            #
+            # #763: the family test used to be a bare == "compressed-tensors"
+            # here, but the config names itself "compressed_tensors", so it
+            # never matched and a requantized checkpoint silently took the
+            # dense path -- int8 rows into a BF16 embedding, scales orphaned
+            # ("weight_scale not found in params_dict"), output = token soup.
+            from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
+                vocab_is_quantized,
+            )
+
+            _model_path = None
+            try:
+                from sglang.srt.runtime_context import get_server_args
+
+                _model_path = getattr(get_server_args(), "model_path", None)
+            except Exception:  # noqa: BLE001 -- no runtime context: ignore-list reading
+                _model_path = None
+            # #1482: the tensor file decides (weight_scale beside the vocab);
+            # the ignore list is only the fallback -- see vocab_is_quantized.
+            if vocab_is_quantized(
+                getattr(quant_config, "config", None) or {},
+                add_prefix("embed_tokens", prefix),
+                _model_path,
+            ):
+                embedding_quant_config = quant_config
         return VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
             enable_tp=not is_dp_attention_enabled(),
+            quant_config=embedding_quant_config,
+            prefix=add_prefix("embed_tokens", prefix),
         )
 
     def get_input_embeddings(self):
@@ -1749,6 +1804,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             )
 
         aux_hidden_states = []
+        # DFlash-family capture across PP stages (pp_aux_capture): remember
+        # WHICH layer each captured tensor belongs to, so the last stage can
+        # assemble every stage's captures in layer-id order.
+        captured_layer_ids = []
         # Pass through decoder layers
         for layer_idx in owned_layer_ids(self.layers, self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
@@ -1757,6 +1816,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states, residual = self.pp_crossing_wire.before_layer(
                 layer_idx, hidden_states, residual
             )
+            is_capture_layer = bool(getattr(layer, "_is_layer_to_capture", False))
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
             ):
@@ -1766,11 +1826,11 @@ class Qwen3_5ForCausalLM(nn.Module):
                     residual=residual,
                     forward_batch=forward_batch,
                     captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
+                        aux_hidden_states if is_capture_layer else None
                     ),
                 )
+            if is_capture_layer and len(aux_hidden_states) > len(captured_layer_ids):
+                captured_layer_ids.append(layer_idx)
 
             # Process deepstack embeddings if provided
             if (
@@ -1792,12 +1852,44 @@ class Qwen3_5ForCausalLM(nn.Module):
             if _LAYER_NORM_TRACE:
                 _trace_layer_norms(layer_idx, hidden_states, residual)
 
+        # DFlash-family capture under PP: every stage captured at its OWN
+        # layers above. The captures RIDE THE PIPELINE PROXY to the next
+        # stage (aux_layer_<id> entries beside hidden_states/residual); the
+        # last stage assembles received + own in layer-id order. weg2xsn261:
+        # a separate cross-stage send from inside this forward deadlocked
+        # the pipeline (see pp_aux_capture). One stage: identity.
+        aux_carry = {}
+        if self.layers_to_capture and int(self.pp_group.world_size) > 1:
+            from sglang.srt.distributed.pp_aux_capture import (
+                assemble_aux_on_last_stage,
+                carry_aux_forward,
+            )
+
+            if len(captured_layer_ids) != len(aux_hidden_states):
+                raise RuntimeError(
+                    "aux capture bookkeeping disagrees with the layer loop: "
+                    f"{len(captured_layer_ids)} capture layer(s) but "
+                    f"{len(aux_hidden_states)} tensor(s) on pp_rank "
+                    f"{self.pp_group.rank_in_group}"
+                )
+            _received = (pp_proxy_tensors.tensors
+                         if pp_proxy_tensors is not None else None)
+            _own = dict(zip(captured_layer_ids, aux_hidden_states))
+            _stage = int(self.pp_group.rank_in_group)
+            if not self.pp_group.is_last_rank:
+                aux_carry = carry_aux_forward(
+                    received=_received, captured=_own, stage=_stage)
+            else:
+                aux_hidden_states = assemble_aux_on_last_stage(
+                    received=_received, captured=_own, stage=_stage)
+
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
                     "residual": residual,
+                    **aux_carry,
                 }
             )
 

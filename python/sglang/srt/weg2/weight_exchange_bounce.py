@@ -2249,10 +2249,16 @@ def seq_buffer_depth() -> int:
     four of card 0's tags first; at depth 2 it could not get ahead of them).
     Cost: depth x lane bytes on tmpfs per lane (~25 GB at 4), and on-card
     staging that falls back to the host path when VRAM is short."""
+    # weg2xsn284 (18.09.): DEPTH 1 IS THE DEFAULT. With registered, persistent
+    # lanes (below) the flips ran 1.8-3.3 s per direction at depth 1 (vs
+    # 5-12 s pageable at depth 2-4), the 5090's lanes at 12-13 GB/s; depth 4
+    # parked ~23 GB of tmpfs beside the full 41 GiB arena and latched W98
+    # (xsn283: shmem 58.5 GiB). The run-ahead depth 2 bought is worth less
+    # than a lane at link rate.
     try:
-        d = int(os.environ.get(SEQ_BUFFER_DEPTH_ENV, "2") or 2)
+        d = int(os.environ.get(SEQ_BUFFER_DEPTH_ENV, "1") or 1)
     except ValueError:
-        d = 2
+        d = 1
     return 1 if d < 1 else (8 if d > 8 else d)
 
 
@@ -2382,12 +2388,37 @@ def _persistent_host_buffer(path: str, biggest: int, ops, lane_key: str, log):
         fh = open(path, "r+b")
         mm = _mmap.mmap(fh.fileno(), biggest)
         addr = _mmap_addr(mm)
+        # xsn262 (17.09.): cudaHostRegister over freshly truncated tmpfs
+        # pages faults every page in under the driver's lock -- 553 MB
+        # took 21 s with four processes registering at once (they
+        # serialise in the driver). Populate the mapping first, outside
+        # any lock, so the register only pins. MADV_POPULATE_WRITE (Linux
+        # 5.14+, value 23); a kernel without it leaves the old form.
+        _t_pop = time.perf_counter()
+        try:
+            mm.madvise(getattr(_mmap, "MADV_POPULATE_WRITE", 23))
+            _pop_ms = (time.perf_counter() - _t_pop) * 1000
+        except (OSError, ValueError, AttributeError):
+            _pop_ms = -1.0
         registered = "no"
         refusal = ""
         t0 = time.perf_counter()
         try:
-            ops.host_register(int(addr), int(biggest), tp.CUDA_HOST_REGISTER_PORTABLE)
-            registered = "yes"
+            # xsn268 (17.09., py-spy --native at the DRAIN-STALL): PP0 and TP0
+            # of one card sat in cudaHostUnregister (ioctl) for the whole
+            # ~12.5 s stall -- the lane release / the grow path unregisters a
+            # 2 GB mapping while the co-located process copies, and the
+            # driver serialises both. Registering became cheap with the
+            # populate above; UNregistering did not. Default: no
+            # registration at all -- the lane copies run pageable (the driver
+            # stages them through its own pinned buffers) and the release is
+            # an unmap + truncate with no driver call. SGLANG_WEG2_SEQ_HOST_
+            # REGISTER=1 keeps the pinned form for an A/B.
+            if not seq_host_register():
+                registered = "no(off)"
+            else:
+                ops.host_register(int(addr), int(biggest), tp.CUDA_HOST_REGISTER_PORTABLE)
+                registered = "yes"
         except AttributeError:
             registered = "unavailable"
         except Exception as _reg_exc:  # noqa: BLE001
@@ -2396,20 +2427,124 @@ def _persistent_host_buffer(path: str, biggest: int, ops, lane_key: str, log):
                        f"bytes={int(biggest)}: {type(_reg_exc).__name__}: {_reg_exc}")
         log(f"WEG2-SEQ persist lane={lane_key} {how} size={int(biggest)} "
             f"addr={int(addr)} registered={registered} "
-            f"register_ms={(time.perf_counter() - t0) * 1000:.0f}")
+            f"register_ms={(time.perf_counter() - t0) * 1000:.0f} "
+            f"populate_ms={_pop_ms:.0f}")
         if refusal:
             mm.close()
             fh.close()
             return None, 0, registered, refusal
         _SEQ_HOST_BUF[path] = {"fh": fh, "mm": mm, "addr": int(addr),
-                               "size": int(biggest), "registered": registered}
+                               "size": int(biggest), "registered": registered,
+                               "ops": ops, "lane": lane_key}
         return mm, int(addr), registered, ""
 
 
-def _stage_alloc(ops, device: int, key, nbytes: int, log, lane_key: str) -> int:
+#: xsn265 (17.09.): the PERSISTENT lane buffers grew, over both flip
+#: directions, to ~25 GB of tmpfs against 15.75 GiB priced -- and under the
+#: DFLASH form (draft arena beside the KV arena) the host ledger latched W98
+#: (cushion 1.42 < 1.50 GiB, shmem 61 GiB) 18 s after the first flip. What
+#: made the buffers persistent was the register cost (weg2xsn89: 2 GB per
+#: lane per tag); with the tmpfs populate before cudaHostRegister that cost
+#: is 22-146 ms per lane, so the buffers are now released at every LEG END:
+#: the depositor (after `_weg2_xchg_drain_outstanding`'s drain waits, i.e.
+#: after the collector confirmed every band) unregisters, unmaps and
+#: TRUNCATES the file to 0 -- tmpfs residency returns to the host -- and the
+#: collector unregisters and unmaps its own mapping. The next leg creates,
+#: populates and registers again. =0 keeps the boot-long form.
+SEQ_RELEASE_LANES_ENV = "SGLANG_WEG2_SEQ_RELEASE_LANES"
+#: xsn268: cudaHostRegister/Unregister of the host lane buffers -- OFF by
+#: default (see `_persistent_host_buffer`): the unregister was the 12.5-s
+#: stall measured on every flip.
+SEQ_HOST_REGISTER_ENV = "SGLANG_WEG2_SEQ_HOST_REGISTER"
+
+
+def seq_host_register() -> bool:
+    """weg2xsn284 (18.09.): REGISTERED BY DEFAULT again -- once per lane,
+    never unregistered (see seq_release_lanes): the 12.5-s stall of xsn265/
+    267 was the per-leg cudaHostUnregister, not the register. Measured with
+    register=1/release=0/depth=1: 5090 lanes 12-13 GB/s (pageable 1.6-3.9),
+    card 2 7-12 GB/s, the x4 slot 2.7-6 GB/s; flips 1.8-3.3 s per direction."""
+    return _env_flag(SEQ_HOST_REGISTER_ENV, "1")
+
+
+def seq_release_lanes() -> bool:
+    """weg2xsn284: lanes stay mapped, populated and registered across legs
+    (default OFF = no release). The residency this keeps is depth x lane
+    bytes (~6 GB at depth 1) and is what the host ledger prices."""
+    return _env_flag(SEQ_RELEASE_LANES_ENV, "0")
+
+
+def release_host_lane_buffers(*, truncate: bool, log=None) -> Tuple[int, int]:
+    """Unregister and unmap every cached lane host buffer of this process;
+    with ``truncate`` the files are cut to 0 bytes (the depositor's side,
+    after every band was drained). Returns ``(buffers, bytes)``."""
+    emit = log or logger.info
+    n = 0
+    total = 0
+    t0 = time.perf_counter()
+    with _SEQ_CACHE_LOCK:
+        for path, ent in list(_SEQ_HOST_BUF.items()):
+            try:
+                if ent.get("registered") == "yes" and ent.get("ops") is not None:
+                    try:
+                        ent["ops"].host_unregister(int(ent["addr"]))
+                    except Exception as exc:  # noqa: BLE001 -- unmapped below regardless
+                        emit(f"WEG2-SEQ lane-release lane={ent.get('lane')} "
+                             f"host_unregister failed: {type(exc).__name__}: {exc}")
+                try:
+                    ent["mm"].close()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    ent["fh"].close()
+                except Exception:  # noqa: BLE001
+                    pass
+                if truncate:
+                    try:
+                        os.truncate(path, 0)
+                    except OSError as exc:
+                        emit(f"WEG2-SEQ lane-release lane={ent.get('lane')} "
+                             f"truncate failed: {exc}")
+                n += 1
+                total += int(ent.get("size", 0) or 0)
+            finally:
+                _SEQ_HOST_BUF.pop(path, None)
+    emit(f"WEG2-SEQ lane-release buffers={n} bytes={total} truncated={int(bool(truncate))} "
+         f"ms={(time.perf_counter() - t0) * 1000:.0f} -- host lane buffers of this leg "
+         f"returned (tmpfs residency falls with the truncate; the next leg registers "
+         f"again, populate+register measured 22-146 ms per lane)")
+    return n, total
+
+
+def _stage_free_entry(ent, log, lane_key: str) -> None:
+    """Free one staging entry and give its bytes back to whoever charged
+    them (``ent['refund']``, set by :func:`_stage_alloc` from ``charge``)."""
+    try:
+        ent["ops"].raw_free(int(ent["ptr"]))
+    except Exception as exc:  # noqa: BLE001
+        log(f"WEG2-SEQ stage lane={lane_key} free-failed: {exc}")
+    refund = ent.get("refund")
+    if refund is not None:
+        try:
+            refund()
+        except Exception as exc:  # noqa: BLE001
+            log(f"WEG2-SEQ stage lane={lane_key} refund-failed: {exc}")
+
+
+def _stage_alloc(ops, device: int, key, nbytes: int, log, lane_key: str,
+                 charge=None) -> int:
     """A transient DEVICE staging buffer for one lane slot; an existing
     entry of the same slot is freed first (the caller runs only after that
-    slot's drain). Freed for good by :func:`release_stage_buffers`."""
+    slot's drain). Freed for good by :func:`release_stage_buffers`.
+
+    ``charge`` (weg2xsn269, 18.09.): ``(nbytes) -> refund-callable | None``.
+    The staging sits on the card the WAKING rank resumes into, so its bytes
+    must be booked against that card's VRAM credit BEFORE the cudaMalloc --
+    unbooked, the waker's credit check and this allocation raced (xsn269:
+    TP0 checked 3124 MiB free for a 2502 MiB tag, PP0 staged 1.99 GB 240 ms
+    later, TP0's cuMemCreate ran out of memory and the memory saver's
+    exit(1) killed the rank). A ``None`` from ``charge`` refuses the staging
+    (host path for the tag); the refund runs when the entry is freed."""
     with _SEQ_CACHE_LOCK:
         # weg2xsn100 (depth 4): at most TWO live stagings per lane -- the
         # depositor's run-ahead otherwise parks 4 x 2 GB on the waker's
@@ -2423,13 +2558,23 @@ def _stage_alloc(ops, device: int, key, nbytes: int, log, lane_key: str) -> int:
                                f"{lane_key} (max 2)")
         ent = _SEQ_STAGE.pop(key, None)
         if ent is not None:
-            try:
-                ent["ops"].raw_free(int(ent["ptr"]))
-            except Exception as exc:  # noqa: BLE001
-                log(f"WEG2-SEQ stage lane={lane_key} free-failed: {exc}")
-        ptr = int(ops.raw_malloc(int(device), int(nbytes)))
+            _stage_free_entry(ent, log, lane_key)
+        refund = None
+        if charge is not None:
+            refund = charge(int(nbytes))
+            if refund is None:
+                raise RuntimeError(
+                    f"staging refused by the card's VRAM credit: {int(nbytes)} "
+                    f"B on lane {lane_key} exceed the balance the waking rank "
+                    f"was not promised")
+        try:
+            ptr = int(ops.raw_malloc(int(device), int(nbytes)))
+        except Exception:
+            if refund is not None:
+                refund()
+            raise
         _SEQ_STAGE[key] = {"ptr": ptr, "size": int(nbytes), "device": int(device),
-                           "ops": ops}
+                           "ops": ops, "refund": refund}
         return ptr
 
 
@@ -2437,6 +2582,7 @@ def release_stage_buffers(boot_nonce=None, log=None) -> int:
     """Free every staging buffer this process holds (``boot_nonce`` None =
     all) -- the depositor's leg end, after every drain is confirmed."""
     n = 0
+    _log = log if log is not None else (lambda *_a: None)
     with _SEQ_CACHE_LOCK:
         for key in [k for k in _SEQ_STAGE
                     if boot_nonce is None or k[0] == str(boot_nonce)]:
@@ -2445,8 +2591,13 @@ def release_stage_buffers(boot_nonce=None, log=None) -> int:
                 ent["ops"].raw_free(int(ent["ptr"]))
                 n += 1
             except Exception as exc:  # noqa: BLE001
-                if log is not None:
-                    log(f"WEG2-SEQ stage {key[1]} free-failed: {exc}")
+                _log(f"WEG2-SEQ stage {key[1]} free-failed: {exc}")
+            refund = ent.get("refund")
+            if refund is not None:
+                try:
+                    refund()
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"WEG2-SEQ stage {key[1]} refund-failed: {exc}")
     if log is not None and n:
         log(f"WEG2-SEQ stage released={n}")
     return n
@@ -2583,6 +2734,11 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                          shm_root: str = xr.SHM_ROOT,
                          device: int = 0,
                          phase: str = PHASE_DEPOSIT,
+                         #: weg2xsn269: the depositor's on-card IPC staging is
+                         #: booked against the card's VRAM credit through this
+                         #: ``(nbytes) -> refund | None`` before it is
+                         #: allocated; None = unbooked (desk fakes, ring arm).
+                         stage_charge=None,
                          #: #1378 xsn44 (the PLACEMENT witness): the digest of
                          #: the DESTINATION after the copy-out, compared
  #: against the deposit's record BY NAME. The sha256 buffer digest
@@ -2877,7 +3033,8 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
             try:
                 _ipc_base = _stage_alloc(ops, int(device),
                                          (str(boot_nonce), _lane_file),
-                                         int(total_bytes), log, lane_key)
+                                         int(total_bytes), log, lane_key,
+                                         charge=stage_charge)
                 _ipc_hex = bytes(ops.ipc_get_handle(int(_ipc_base))).hex()
                 log(f"WEG2-SEQ ipc lane={lane_key} phase=deposit stage={int(_ipc_base)} "
                     f"bytes={int(total_bytes)} handle={_ipc_hex[:16]}.. -- on-card "

@@ -825,6 +825,31 @@ def _tie_word_embeddings(model_path: str) -> bool:
     return bool(text.get("tie_word_embeddings", cfg.get("tie_word_embeddings", False)))
 
 
+def external_drafter_mib_from_argv(argv: Sequence[str]) -> float:
+    """The bytes of an EXTERNAL drafter checkpoint the argv names (DFlash:
+    ``--speculative-algorithm DFLASH --speculative-draft-model-path X``),
+    read off X's safetensors headers; 0.0 for the checkpoint's own NEXTN
+    head (priced from the target's terms) and for no drafter at all. Group P
+    carries the whole draft on its last stage (TP1), so no rank share applies."""
+    toks = [str(t) for t in argv]
+    algo = None
+    path = None
+    for i, t in enumerate(toks):
+        if t == "--speculative-algorithm" and i + 1 < len(toks):
+            algo = toks[i + 1].upper()
+        elif t.startswith("--speculative-algorithm="):
+            algo = t.split("=", 1)[1].upper()
+        elif t == "--speculative-draft-model-path" and i + 1 < len(toks):
+            path = toks[i + 1]
+        elif t.startswith("--speculative-draft-model-path="):
+            path = t.split("=", 1)[1]
+    if algo != "DFLASH" or not path:
+        return 0.0
+    from sglang.srt.speculative.dflash_pricing import dflash_draft_family_bytes
+
+    return float(sum(dflash_draft_family_bytes(path).values())) / MIB
+
+
 def p_carries_drafter(argv: Sequence[str]) -> bool:
     """THE ONE PREDICATE: does THIS group-P argv run the draft-KV producer?
 
@@ -863,6 +888,7 @@ def checkpoint_stage_weights(
     attn_split: Sequence[int],
     carries_drafter: bool,
     drafter_head_from_target: bool = False,
+    external_drafter_mib: float = 0.0,
 ) -> List[StageWeights]:
     """Per-PP-stage weight MiB from the safetensors HEADERS and the shipped cut.
 
@@ -940,10 +966,19 @@ def checkpoint_stage_weights(
                 replicated_mib=per_stage_replicated,
                 embedding_mib=embed if s == 0 else 0.0,
                 lm_head_mib=head if s == last else 0.0,
-                drafter_mib=(mtp + embed + drafter_head) if (carries_drafter and s == last) else 0.0,
+                drafter_mib=(
+                    (external_drafter_mib if external_drafter_mib > 0 else (mtp + embed + drafter_head))
+                    if (carries_drafter and s == last)
+                    else 0.0
+                ),
                 drafter_terms=(
-                    f"mtp {mtp:.1f} + its own embedding {embed:.1f} + its own "
-                    f"lm_head {drafter_head:.1f}"
+                    (
+                        f"external drafter checkpoint {external_drafter_mib:.1f} "
+                        "(DFlash: whole draft on the last stage, no embedding/head of its own)"
+                        if external_drafter_mib > 0
+                        else f"mtp {mtp:.1f} + its own embedding {embed:.1f} + its own "
+                        f"lm_head {drafter_head:.1f}"
+                    )
                     + (
                         ""
                         if drafter_head
@@ -1016,6 +1051,7 @@ def stage_weights_from_argv(argv: Sequence[str]) -> Tuple[Optional[List[StageWei
         return checkpoint_stage_weights(
             model, layer_split, attn_split, carries,
             drafter_head_from_target=head_from_target,
+            external_drafter_mib=external_drafter_mib_from_argv(argv),
         ), ""
     except (Weg2RingFormMismatch, OSError, Exception) as exc:  # noqa: BLE001
         return None, f"the checkpoint terms of {model!r} could not be read: {exc}"

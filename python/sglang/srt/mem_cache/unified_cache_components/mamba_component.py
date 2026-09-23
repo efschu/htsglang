@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import logging
+import sys
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -58,6 +59,22 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+_1469_N = 0
+_1469_CAP = 600
+
+
+def _1469_note(kind: str, **kw) -> None:
+    """#1469: one line per retention/free/evict event, first 600 per process."""
+    global _1469_N
+    _1469_N += 1
+    if _1469_N > _1469_CAP:
+        return
+    try:
+        logger.info("#1469 %s %s", kind, " ".join(f"{k}={v}" for k, v in kw.items()))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class MambaLoadBackUnservable(Exception):
@@ -698,6 +715,12 @@ class MambaComponent(TreeComponent):
         x = lru.get_lru_no_lock()
         while tracker[ct] < request and x is not None and lru.in_list(x):
             assert x.component_data[ct].value is not None
+            # #1470b: the un-backed-skip tried here on weg2xsn228 crashed PP0
+            # (alloc_req_slots: mamba_available=0 -- nothing evictable while the
+            # backlog holds every slot).  Losing a mid-request anchor is survivable
+            # (D re-enters up to the deepest anchor; the final node always keeps
+            # its state); an unservable admission is not.  The flush-side join
+            # (#1470, scheduler.flush_cache) is what protects the hand-back.
             if x in self.cache.evictable_device_leaves:
                 # D-leaf: atomic eviction of all components
                 x_next = lru.get_prev_no_lock(x)
@@ -706,8 +729,22 @@ class MambaComponent(TreeComponent):
                     x_next = lru.get_lru_no_lock()
                 x = x_next
             else:
-                # Internal: tombstone Mamba + cascade
+                # Internal: tombstone Mamba + cascade.  #1481: the END-ANCHOR
+                # node (N-1 of a finished prompt, see
+                # UnifiedRadixCache._weg2_end_anchor_witness) keeps its state
+                # while un-backed -- it is the one anchor the hand-back reader
+                # can reach; the flip flush (#1470) publishes it and lifts the
+                # hold.  Bounded by the number of finished prompts awaiting the
+                # flip, never the whole backlog (the #1470b hazard).
                 x_next = lru.get_prev_no_lock(x)
+                if (
+                    getattr(x, "_weg2_end_anchor", False)
+                    and not getattr(x, "backuped", False)
+                    and x.component_data[ct].host_value is None
+                ):
+                    _1469_note("HOLD-END-ANCHOR", node=x.id)
+                    x = x_next
+                    continue
                 self.cache._evict_component_and_detach_lru(
                     x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
@@ -897,12 +934,40 @@ class MambaComponent(TreeComponent):
         return ckpt_slot
 
     def _free_mamba_value(self, mamba_value: torch.Tensor) -> None:
+        try:  # #1469: who gives a node's value back, and from where
+            _f = sys._getframe(1)
+            _1469_note("FREE", caller=f"{_f.f_code.co_name}:{_f.f_lineno}",
+                       slot=(mamba_value.tolist() if hasattr(mamba_value, "tolist") and not mamba_value.is_cuda else "cuda"))
+        except Exception:  # noqa: BLE001
+            pass
         if self.int8_ckpt_pool is not None:
             self.int8_ckpt_pool.free(mamba_value)
         else:
             self.cache.req_to_token_pool.mamba_allocator.free(mamba_value)
 
     def prepare_for_caching_req(
+        self,
+        req: Req,
+        insert_params: InsertParams,
+        token_ids_len: int,
+        is_finished: bool,
+    ) -> Optional[int]:
+        # #1469 NODE-VALUE TRAIL: with group P at --max-running-requests 2 the
+        # backup finds the node's mamba value EMPTY (86-102 of ~120 backups,
+        # weg2xsn219/221/222/225/226; 24 with one running request) and group D
+        # re-enters only the first 4095 tokens.  Three fixes aimed at the
+        # write-back backlog (#1465 stream priority, #1467 trail sync, #1468
+        # bubble wait) did not move it.  This trail answers the two questions
+        # the logs could not: was the value SET at insert (and with which
+        # cache_len), and who took it away afterwards (`_free_mamba_value`
+        # with its caller, or the component eviction).  Rate-capped.
+        cl = self._prepare_for_caching_req_impl(req, insert_params, token_ids_len, is_finished)
+        _1469_note("RETAIN", rid=getattr(req, "rid", None), is_finished=is_finished,
+                   token_ids_len=token_ids_len, cache_len=cl,
+                   value=(insert_params.mamba_value is not None))
+        return cl
+
+    def _prepare_for_caching_req_impl(
         self,
         req: Req,
         insert_params: InsertParams,
@@ -1526,10 +1591,27 @@ class MambaComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            host_indices = self._mamba_pool_host.alloc(1)
-            if host_indices is None:
-                self.cache.evict_host(1, ComponentType.MAMBA)
-                host_indices = self._mamba_pool_host.alloc(1)
+            _mp = self._mamba_pool_host
+            if hasattr(_mp, "alloc_read"):
+                # #1427/#1430: the arena pool resolves blobs in place; it binds
+                # itself here if init/rebind did not, and an unbound pool
+                # yields NO transfer (the prefix is capped, recomputed) --
+                # never an anchor-slot copy.
+                if getattr(_mp, "arena", None) is None:
+                    _be = getattr(self.cache.cache_controller, "storage_backend", None)
+                    try:
+                        if _be is not None:
+                            _mp.ensure_bound(_be)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if getattr(_mp, "arena", None) is None:
+                    return []
+                host_indices = _mp.alloc_read(1)
+            else:
+                host_indices = _mp.alloc(1)
+                if host_indices is None:
+                    self.cache.evict_host(1, ComponentType.MAMBA)
+                    host_indices = _mp.alloc(1)
             if host_indices is None:
                 return []
             return [

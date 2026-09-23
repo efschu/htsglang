@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import time
+
+from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -195,6 +197,7 @@ class SchedulerRequestReceiver:
         return False
 
     @scheduler_nvtx_method("scheduler.recv_requests")
+    @_pass_timed("_1466_recv_ms")  # #1466: the pass's recv phase
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -208,6 +211,18 @@ class SchedulerRequestReceiver:
                 return []
 
         recv_reqs = self._pull_raw_reqs()
+        # #1458: ms-stamped arrival of the Weg-2 control requests on EVERY rank
+        # (boot weg2xsn214: PP0 waited 789 ms in the KV-release fence for the
+        # followers; second-granular logs could not say where they were).
+        try:
+            for _r in (recv_reqs or ()):
+                _k = type(_r).__name__
+                if _k in ("FlushCacheReqInput", "ReleaseMemoryOccupationReqInput",
+                          "ResumeMemoryOccupationReqInput"):
+                    logger.info("#1458 CTRL-RECV kind=%s pp_rank=%s tp_rank=%s t=%.3f",
+                                _k, self.ps.pp_rank, self.ps.attn_tp_rank, time.time())
+        except Exception:  # noqa: BLE001 -- an instrument never breaks the intake
+            pass
 
         # #631 automatic phase policy. The arm rides the SAME chain a
         # manual POST /phase_flip uses, because forwarding it is what

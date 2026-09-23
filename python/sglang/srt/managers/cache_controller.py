@@ -19,6 +19,8 @@ import signal
 import sys
 import threading
 import time
+
+from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -176,6 +178,21 @@ class LayerDoneCounter:
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1
+
+
+HICACHE_WRITE_STREAM_PRIORITY_ENV = "SGLANG_HICACHE_WRITE_STREAM_PRIORITY"
+
+
+def hicache_write_stream_priority() -> int:
+    """#1465: CUDA stream priority for the write-through stream.  0 (default,
+    lowest) when unset or unparsable; torch clamps to the device's range,
+    where a NEGATIVE number is a HIGHER priority (-1 is the highest on
+    every current NVIDIA part)."""
+    raw = os.environ.get(HICACHE_WRITE_STREAM_PRIORITY_ENV, "")
+    try:
+        return int(str(raw).strip() or 0)
+    except ValueError:
+        return 0
 
 
 class CacheOperation:
@@ -394,6 +411,14 @@ class Weg2DraftDisagree(RuntimeError):
     so the claims are equal by construction; an inequality is a store
     mutated between two ranks' probes, and the law is STOP, never a
     compensation (spec section 3.4: do NOT invent a vote)."""
+
+
+def draft_claim_packed(controller) -> bool:
+    """See ``HiCacheController.draft_claim_packed``; a module function so the
+    prefetch loop's stubs (tests) need only ``draft_tier_armed``."""
+    armed = getattr(controller, "draft_tier_armed", None)
+    return bool(armed("admission") if armed is not None else False) or bool(
+        getattr(controller, "solo_draft_shadow", False))
 
 
 def assert_draft_claims_agree(min_claim: int, max_claim: int, rid) -> None:
@@ -768,6 +793,44 @@ def _record_quiesce_poison(reason: str, name: str, exc: BaseException) -> None:
         pass
 
 
+_WEG2_DRAFT_POOL = None
+
+
+def _weg2_draft_pool_executor():
+    """#1442: one worker for the draft page lookups that run beside the KV lookups."""
+    global _WEG2_DRAFT_POOL
+    if _WEG2_DRAFT_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _WEG2_DRAFT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="weg2-draft-get")
+    return _WEG2_DRAFT_POOL
+
+
+
+from sglang.srt.weg2.handoff_keys import first_mismatch
+
+
+def weg2_suffixed_stems(backend, keys):
+    """Posten 2 (18.09.): the store suffix of a key depends only on its CLASS
+    (the tail after the last '.', or '' for a bare KV page hash -- see
+    `_suffix_for_key`: draft identity form, shared-kv = no '.', shared-mamba =
+    endswith('.mamba')). ARENA-GET asked it 520k times per re-admission
+    (find_ms 2,0 s of which the C lookup is 0,4 s offline); one answer per
+    class instead."""
+    memo = {}
+    out = []
+    for k in keys:
+        dot = k.rfind(".")
+        cls = k[dot:] if dot >= 0 else ""
+        suf = memo.get(cls)
+        if suf is None:
+            suf = memo[cls] = backend._suffix_for_key(k)[0]
+        out.append(k + suf)
+    return out
+
+
+WEG2_HANDOFF_PAGE_KEYS: dict = {}  # rid -> P's page keys for the span the dormant prefetch asks (weg2.handoff_keys)
+
+
 class HiCacheController:
     def __init__(
         self,
@@ -837,6 +900,10 @@ class HiCacheController:
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
+        # 19.09. (xsn392, --speculative-draft-placement solo): a SHADOW rank has no
+        # draft pool but must reduce the prefetch claim in the HOST's packed form
+        # (see draft_claim_packed); set by kv_cache_builder.maybe_register_hicache_draft.
+        self.solo_draft_shadow = False
         self.mem_pool_device_draft = None
         self.mem_pool_host_draft = None
         self.draft_page_get_func = None
@@ -848,6 +915,7 @@ class HiCacheController:
         self.draft_owner_phase = None
         self.draft_binding_generation = None
         self.draft_identity = None
+        self.draft_total_kv_heads = None
         self._draft_disarm_warned = set()
         # #993 EXECUTION PROOF for the draft READ path. The write half was
         # observable from the store (pages on disk); the read half had no
@@ -913,7 +981,19 @@ class HiCacheController:
         self.ack_load_queue: List[HiCacheAck] = []
         self.ack_write_queue: List[HiCacheAck] = []
 
-        self.write_stream = device_module.Stream()
+        # #1465: the write-through copies run as KERNELS (io_backend="kernel",
+        # memory_pool_host.backup_from_device_all_layer) on this stream.  At
+        # default priority they queue behind a group-P prefill that never
+        # idles: boot weg2xsn219 (P --max-running-requests 2, no gap between
+        # prefills) grew the un-backed backlog to 72 -> 103 nodes with 16 in
+        # flight and the pin budget exhausted (pins 4/18 -> 0/18), and the
+        # flip's quiesce flush then drained 56 write-throughs in 2.0-2.8 s
+        # (sleep-kv stage 2.8 s vs 0.3 s in weg2xsn218, where the 3 s gap
+        # between prefills let the copies finish).  A high-priority stream
+        # lets the copy kernels interleave with the prefill kernels; the
+        # launcher sets it for group P only (decode graphs on D keep the
+        # default).  Unset = 0 = byte-identical to before.
+        self.write_stream = device_module.Stream(priority=hicache_write_stream_priority())
         self.load_stream = device_module.Stream()
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
@@ -1273,6 +1353,9 @@ class HiCacheController:
                     storage_backend, self.storage_config, self.mem_pool_host
                 )
             self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+            _hand0 = getattr(self, "_weg2_hand_mamba_parts", None)  # #1430: bind at init
+            if callable(_hand0):
+                _hand0()
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -1681,6 +1764,19 @@ class HiCacheController:
             )
         self._canonical_mamba_layer_ids = [int(i) for i in mamba_layer_ids]
         self._canonical_mamba_spec = spec
+        # #1427 Stufe 4b: the mamba arena host pool needs the same cut the
+        # window was built from (per-layer, per-segment extents, unmerged).
+        try:
+            self._weg2_mamba_window_parts = (spec, list(ratios), int(rank), int(layer_lo), int(layer_hi))
+            if get_pool is not None and PoolName.MAMBA in entry_names:
+                _mp = get_pool(PoolName.MAMBA)
+                if hasattr(_mp, "_weg2_parts"):
+                    _mp._weg2_parts = self._weg2_mamba_window_parts
+                    _be = getattr(self, "storage_backend", None)
+                    if _be is not None and getattr(_mp, "arena", None) is None:
+                        _mp.ensure_bound(_be)  # #1430: bind as soon as the cut is known
+        except Exception:  # noqa: BLE001 - the window itself is unaffected
+            logger.warning("#1427 could not hand the mamba window parts to the host pool", exc_info=True)
         logger.info(
             "#706 canonical GDN blob active: layers [%d, %d) of %d, %d of %d "
             "blob bytes on this rank, %d extent(s).",
@@ -1692,6 +1788,42 @@ class HiCacheController:
             len(window.extents),
         )
         return window
+
+    def _weg2_hand_mamba_parts(self) -> None:
+        """#1427c/#1430: bind EVERY arena host pool of the CURRENT group --
+        KV, draft, mamba -- as soon as the backend and the windows exist
+        (init, every rebind, the draft install). Before this the pools bound
+        lazily on their first read, and a rank that never reads (PP1/PP2,
+        the draft on P, D's rebuilt mamba pool) stayed on the staging path;
+        with #1430 that path is a refusal, so binding must not wait."""
+        backend = getattr(self, "storage_backend", None)
+        group = getattr(self, "mem_pool_host", None)
+        if backend is None or group is None:
+            return
+        try:
+            if getattr(group, "arena_read", False) and hasattr(group, "ensure_bound"):
+                group.ensure_bound(backend, role="kv")
+        except Exception:  # noqa: BLE001
+            logger.warning("#1430 KV arena bind at registration failed", exc_info=True)
+        dpool = getattr(self, "mem_pool_host_draft", None)
+        try:
+            if dpool is not None and getattr(dpool, "arena_read", False) and getattr(dpool, "arena", None) is None:
+                dpool.ensure_bound(backend, role="draft")
+        except Exception:  # noqa: BLE001
+            logger.warning("#1430 draft arena bind at registration failed", exc_info=True)
+        parts = getattr(self, "_weg2_mamba_window_parts", None)
+        get_pool = getattr(group, "get_pool", None)
+        names = getattr(group, "entry_map", None) or {}
+        if parts is None or get_pool is None or PoolName.MAMBA not in names:
+            return
+        try:
+            mp = get_pool(PoolName.MAMBA)
+            if hasattr(mp, "_weg2_parts"):
+                mp._weg2_parts = parts
+                if mp.arena is None:
+                    mp.ensure_bound(backend)
+        except Exception:  # noqa: BLE001 - the pool binds lazily at first use otherwise
+            logger.warning("#1427c mamba parts hand-over failed", exc_info=True)
 
     def rebind_canonical_windows(self, incoming_phase: str) -> bool:
         """#706 x #719 (0828 specimen): re-derive the canonical windows from
@@ -1757,6 +1889,12 @@ class HiCacheController:
         entries = getattr(self.mem_pool_host, "entries", None) or []
         for entry in entries:
             backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+        # #1427c: the rebound group's mamba pool needs the cut, and binds
+        # lazily. Looked up, not called directly: the roundtrip probes borrow
+        # this method onto a bare object (test 0828) and have no helper.
+        _hand = getattr(self, "_weg2_hand_mamba_parts", None)
+        if callable(_hand):
+            _hand()
         import dataclasses
 
         self.storage_config = dataclasses.replace(
@@ -1837,14 +1975,18 @@ class HiCacheController:
         # content-addressed key. Refuse: a prefix that is not staged is a miss
         # later, which is the cheap failure.
         if device_tier_disarmed("write"):
+            self._weg2_last_write_refusal = "tier_disarmed"
             return None
         # #923: and the row this copy would READ must be a row this rank's
         # device pool has. Asked before the host allocation, so a refusal
         # strands nothing.
         if self._refuse_unaddressable_kv_rows(device_indices, "write"):
+            self._weg2_last_write_refusal = "unaddressable_rows"
             return None
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
+            self._weg2_last_write_refusal = "host_alloc:%d>%s" % (
+                len(device_indices), getattr(self.mem_pool_host, "available_size", lambda: "?")())
             return None
         self.write_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
@@ -1910,7 +2052,7 @@ class HiCacheController:
                 self.mem_pool_host_draft.backup_from_device_all_layer(
                     self.mem_pool_device_draft,
                     host_indices,
-                    device_indices,
+                    self._draft_device_indices(device_indices, "write"),
                     self.io_backend,
                 )
             finish_event.record()
@@ -2163,6 +2305,23 @@ class HiCacheController:
         kv_host_indices, kv_device_indices = self._dcp_kv_transfer_pairs(
             host_indices, device_indices
         )
+        # Task #3 (17.09., flip tail): WHAT THIS LOAD MOVES, keyed by the
+        # finish event the ack carries, read back by the tree's
+        # `loading_check` once the event has landed -- one line per merged
+        # load with tokens, bytes and the device-side ms between the two
+        # events (WEG2-LOAD-DEVICE). Before this line the host->device
+        # half of a re-admission had no number anywhere.
+        try:
+            _k0 = self.mem_pool_device.k_buffer[0]
+            _cell = int(_k0[0].numel()) * int(_k0.element_size())
+            _meta = getattr(self, "_weg2_load_meta", None)
+            if _meta is None:
+                _meta = self._weg2_load_meta = {}
+            _meta[id(producer_event.finish_event)] = (
+                int(kv_host_indices.numel()), 2 * int(self.layer_num) * _cell,
+                time.perf_counter())
+        except Exception:  # noqa: BLE001 -- an instrument never raises
+            pass
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
@@ -2181,7 +2340,7 @@ class HiCacheController:
                     self.mem_pool_host_draft.load_to_device_per_layer(
                         self.mem_pool_device_draft,
                         host_indices,
-                        device_indices,
+                        self._draft_device_indices(device_indices, "load"),
                         i,
                         self.io_backend,
                     )
@@ -2311,6 +2470,16 @@ class HiCacheController:
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
 
+    def draft_claim_packed(self) -> bool:
+        """RANK-UNIFORM form of the prefetch claim reduce: the packed
+        ``[hit, -hit]`` MIN (draft tier armed) or the bare scalar MIN.
+        xsn392 (19.09.): under --speculative-draft-placement solo the host
+        arms the draft tier and the shadows do not -- one rank reduced a
+        2-vector against two scalars, every prefetch probe timed out at its
+        budget with 0 pages on every rank. A solo shadow answers the packed
+        form (its own claim is the KV claim; the MIN adopts the host's)."""
+        return draft_claim_packed(self)
+
     def draft_tier_armed(self, direction: str) -> bool:
         """THE ONE GATE for draft-half I/O. Six consume points, one answer.
 
@@ -2346,6 +2515,15 @@ class HiCacheController:
         and correctly outside it.
         """
         if not self.has_draft:
+            return False
+        if direction in ("write", "load") and getattr(
+            self.mem_pool_device_draft, "weg2_direct_publish", False
+        ):
+            # A producer's chunk ring (DFlash on group P): its rows are
+            # published hash-keyed by publish_draft_rows_direct inside the
+            # producer's own call. Row-addressed backup/load would read the
+            # ring at target slot indices -- meaningless -- so they are off,
+            # silently and by construction, for this pool.
             return False
         if self.draft_owner_phase is not None:
             from sglang.srt.mem_cache.hicache_phase_guard import active_phase
@@ -2396,6 +2574,7 @@ class HiCacheController:
         owner_phase=None,
         binding_generation=None,
         drafter_identity=None,
+        draft_total_kv_heads=None,
     ) -> None:
         """Register draft KV pools so L2/L3 ops piggyback draft transfers.
 
@@ -2409,6 +2588,12 @@ class HiCacheController:
         self.draft_owner_phase = owner_phase
         self.draft_binding_generation = binding_generation
         self.draft_identity = drafter_identity
+        # The DRAFTER's total kv-head count (the canonical draft page holds
+        # every head of the draft, not of the target): 8 on DFlash2 against
+        # the target's 4. None keeps the NEXTN head's reading (target = draft).
+        self.draft_total_kv_heads = (
+            int(draft_total_kv_heads) if draft_total_kv_heads else None
+        )
         logger.info(
             "HiCache draft KV registered: %s (host %d slots), owner_phase=%s, "
             "binding_generation=%s, drafter=%s",
@@ -2438,6 +2623,66 @@ class HiCacheController:
         # If storage is already attached, wire up the draft I/O path now.
         # Otherwise this will be deferred until attach_storage_backend().
         self._maybe_register_draft_with_storage()
+
+    def _draft_device_indices(self, device_indices, direction: str):
+        """Row-addressed draft transfers name TARGET slots. A draft pool that
+        is smaller than the target pool (DFlash window pool, the small solo
+        pool) carries a slot mapper: a backup reads the draft slot behind
+        each target slot (an unmapped row is the zero-KV hole slot), a load
+        allocates one. A mirror pool needs no translation."""
+        mapper = getattr(self.mem_pool_device_draft, "weg2_slot_mapper", None)
+        if mapper is None:
+            return device_indices
+        if direction == "write":
+            return mapper.translate_read(device_indices)
+        return mapper.translate_write(device_indices)
+
+    def publish_draft_rows_direct(self, hash_values, device_pool, device_indices) -> int:
+        """Producer path (Weg 2 group P, DFlash): publish draft rows that sit
+        in ``device_pool`` at ``device_indices`` under the page hashes
+        ``hash_values``, straight into the draft arena, keyed like every
+        other draft page of this drafter (``_draft_component_name``). No
+        target host row is involved. Returns the number of pages complete
+        in the arena afterwards; a refusal is COUNTED, never silent."""
+        if not self.has_draft or self.mem_pool_host_draft is None:
+            raise RuntimeError(
+                "publish_draft_rows_direct: no draft pool is registered on "
+                "this cache controller"
+            )
+        publish = getattr(self.mem_pool_host_draft, "publish_direct", None)
+        if publish is None:
+            raise RuntimeError(
+                "publish_draft_rows_direct: the draft host pool "
+                f"{type(self.mem_pool_host_draft).__name__} cannot publish "
+                "directly (the arena host pool is required: "
+                "SGLANG_HICACHE_ARENA_HOST=1)"
+            )
+        if self.storage_backend is None:
+            raise RuntimeError(
+                "publish_draft_rows_direct: no storage backend (L3) to publish into"
+            )
+        n = int(
+            publish(
+                list(hash_values),
+                self._draft_component_name(),
+                device_pool,
+                device_indices,
+                self.storage_backend,
+            )
+        )
+        total = len(hash_values)
+        self._draft_l3_write_issued += n
+        self._draft_l3_write_refused += total - n
+        if n != total:
+            logger.warning(
+                "#706 draft page direct publish: %d of %d page(s) refused by "
+                "the arena (cumulative issued=%d refused=%d)",
+                total - n,
+                total,
+                self._draft_l3_write_issued,
+                self._draft_l3_write_refused,
+            )
+        return n
 
     def disarm_draft_kv_pool(self, reason: str) -> None:
         """#861: leave the draft half unarmed for the phase being entered.
@@ -2558,12 +2803,22 @@ class HiCacheController:
                 "canonical draft window: the storage attach recorded no model "
                 "config, so the checkpoint's total kv-head count is unknown (S2)."
             )
-        total = int(model_config.get_total_num_kv_heads())
+        total = int(
+            getattr(self, "draft_total_kv_heads", None)
+            or model_config.get_total_num_kv_heads()
+        )
         pool = self.mem_pool_host_draft
         pool.get_size_per_token()  # binds head_num/head_dim/layer_num
         off, n = self._draft_head_window(total)
+        tp_size, tp_rank = self.tp_size, self.tp_rank
+        if int(pool.head_num) == total and int(n) != total:
+            # 19.09. (xsn387, --speculative-draft-placement solo): the solo
+            # host holds the draft UNSHARDED (every kv head, like group P's
+            # tp-1 pool), so its window is the WHOLE canonical page -- the
+            # TP dealing above names the share a sharded rank would hold.
+            off, n, tp_size, tp_rank = 0, total, 1, 0
         window = build_draft_window(
-            pool, total, off, n, tp_size=self.tp_size, tp_rank=self.tp_rank
+            pool, total, off, n, tp_size=tp_size, tp_rank=tp_rank
         )
         layout = DraftKvCanonicalLayout(
             version=CANONICAL_LAYOUT_VERSION,
@@ -2578,7 +2833,11 @@ class HiCacheController:
         )
         hidden = int(getattr(model_config, "hidden_size", 0) or 0)
         if hidden > 0:
-            check_full_head_shipment_is_justified(layout, hidden, 2)
+            # a DFlash draft's context is one hidden per capture layer
+            # (= its draft layer count); a NEXTN head's is one hidden
+            check_full_head_shipment_is_justified(
+                layout, hidden, 2, num_context_layers=int(pool.layer_num)
+            )
         backend.install_canonical_windows(
             backend.canonical_kv_page, backend.canonical_mamba_blob, draft_page=window
         )
@@ -2598,6 +2857,9 @@ class HiCacheController:
             layout.version,
             self.draft_identity,
         )
+        _hand_d = getattr(self, "_weg2_hand_mamba_parts", None)  # #1430: bind the draft pool now
+        if callable(_hand_d):
+            _hand_d()
 
     def prefetch(
         self,
@@ -2740,7 +3002,94 @@ class HiCacheController:
         operation.increment(inc)
 
     # todo: deprecate
+    def _arena_page_get(self, operation, hash_values, host_indices) -> Optional[int]:
+        """#1424 Stufe 3: address COMPLETE pages in the arena in place -- key ->
+        slot, reader reference, ids written over the placeholders; no copy.
+        Returns the hit count, or None when this pool is not arena-bound."""
+        pool = self.mem_pool_host
+        if not getattr(pool, "arena_read", False) or self.storage_backend is None:
+            return None
+        if not pool.ensure_bound(self.storage_backend, role="kv"):
+            # xsn176: an unbound arena pool must NOT fall through to the copy
+            # path -- the registration handed out placeholders, and a copy
+            # into them is a StrayHostIndexError that hung the read 8 min.
+            # An honest miss instead.
+            return 0
+        _t0 = time.perf_counter()
+        stems = weg2_suffixed_stems(self.storage_backend, hash_values)  # Posten 2: suffix memoised per key class
+        import numpy as _np
+        _fs, _st = pool.arena.find_slots_np(stems)  # Posten 2 (18.09.): numpy, no 520k-tuple list
+        _t1 = time.perf_counter()
+        slots = []
+        # #1439b: the leading run of COMPLETE slots is referenced in ONE C
+        # call (xsn200: one ref per page in a Python loop was 7 %); only the
+        # first non-complete page, if any, takes the per-page path (L3 fill).
+        _bad = _np.flatnonzero((_fs < 0) | (_st != 2))
+        lead = int(_bad[0]) if _bad.size else int(_fs.shape[0])
+        if lead:
+            got = pool.arena.ref_slots_np(_fs[:lead], +1)
+            if got == lead:
+                slots = _fs[:lead].tolist()
+            else:
+                pool.arena.ref_slots_np(_fs[:lead], -1)  # undo the partial refs, take the slow path
+                lead = 0
+        for i in range(lead, int(_fs.shape[0])):
+            slot, state = int(_fs[i]), int(_st[i])
+            if slot < 0 or state != 2:
+                # #1433: not in the L2 -- ask the L3. A page on disk is read
+                # straight into a fresh slot and completed; only then is the
+                # prefix really over.
+                _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
+                fill = _fill_fn(pool.arena, [stems[i]], int(pool._page_bytes))[0] if callable(_fill_fn) else None
+                if fill is None:
+                    break
+                slot = fill
+            if pool.arena.ref_slots([slot], +1) != 1:
+                break  # evicted between find and ref: the prefix ends here
+            slots.append(slot)
+        if not slots:
+            # xsn314/322/326: the dormant hold's re-reads answered ZERO for
+            # pages P had completed (PP2's ack flips COMPLETE within ~4 s),
+            # while the wake found 520k of them at once. Name the first miss.
+            _mn = getattr(self, "_1436_miss_n", 0) + 1
+            self._1436_miss_n = _mn
+            if _mn <= 12 or _mn % 256 == 0:
+                try:
+                    _ex = self.storage_backend.batch_exists(list(hash_values[:2]), None)
+                except Exception as exc:  # noqa: BLE001
+                    _ex = f"exists-raised:{type(exc).__name__}"
+                logger.info("#1436 ARENA-GET MISS n=%d keys=%d first_stem=%s find=(slot=%d,state=%d) second=(slot=%d,state=%d) "
+                            "lead=%d bad_at=%s batch_exists(first2)=%s arena=%s",
+                            _mn, len(hash_values), stems[0][:48] if stems else "-",
+                            int(_fs[0]) if _fs.shape[0] else -9, int(_st[0]) if _st.shape[0] else -9,
+                            int(_fs[1]) if _fs.shape[0] > 1 else -9, int(_st[1]) if _st.shape[0] > 1 else -9,
+                            lead, int(_bad[0]) if _bad.size else -1, _ex,
+                            getattr(getattr(pool, "arena", None), "path", type(getattr(pool, "arena", None)).__name__))
+            return 0
+        _t2 = time.perf_counter()
+        pool.resolve_rows(host_indices, slots)
+        _t3 = time.perf_counter()
+        # Task #3: ONE increment per batch. `increment` is a lock + an add;
+        # 262k of them per re-admission (xsn246 ARENA-GET) is a Python
+        # loop on the read path's critical section. A terminated
+        # operation refuses the whole batch, which the caller already
+        # treats as a short batch (completed != prev + len).
+        operation.increment(len(slots) * self.page_size)
+        # #1436 instrument: where the re-admission of a long prompt spends
+        # its time on the read side (xsn196: ~9 s per 100k prompt on D).
+        _acc = getattr(self, "_1436_acc", None)
+        if _acc is None:
+            _acc = self._1436_acc = [0, 0.0, 0.0, 0.0, 0]
+        _acc[0] += 1; _acc[1] += _t1 - _t0; _acc[2] += _t2 - _t1; _acc[3] += _t3 - _t2; _acc[4] += len(slots)
+        if _acc[0] <= 4 or _acc[0] % 512 == 0:
+            logger.info("#1436 ARENA-GET calls=%d pages=%d find_ms=%.0f ref_ms=%.0f resolve+pin_ms=%.0f",
+                        _acc[0], _acc[4], _acc[1] * 1000, _acc[2] * 1000, _acc[3] * 1000)
+        return len(slots)
+
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
+        _apg = getattr(self, "_arena_page_get", None)
+        if callable(_apg) and _apg(operation, hash_values, host_indices) is not None:
+            return
         dummy_page_dst, _release = _borrow_read_pages(
             self.storage_backend, PoolName.KV, self.mem_pool_host, len(hash_values)
         )
@@ -2792,18 +3141,24 @@ class HiCacheController:
             # Best-effort draft L3 read before publishing target completion.
             # Otherwise wait_complete can race and load back target KV before
             # draft KV reaches host memory.
+            _draft_fut = None
             if self.draft_tier_armed("l3-load"):
-                flags = self._draft_page_get_flags(batch_hashes, batch_host_indices)
-                if flags is not None and self._draft_read_broke_the_claim(
-                    operation, i, flags
-                ):
-                    operation.mark_terminate()
-                    break
+                # #1442: the draft lookup does not depend on the KV lookup --
+                # it runs beside it (the C lookups release the GIL).
+                _draft_fut = _weg2_draft_pool_executor().submit(
+                    self._draft_page_get_flags, batch_hashes, batch_host_indices)
 
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
+            if _draft_fut is not None:
+                flags = _draft_fut.result()
+                if flags is not None and self._draft_read_broke_the_claim(
+                    operation, i, flags
+                ):
+                    operation.mark_terminate()
+                    break
             # Check termination
             if (
                 operation.completed_tokens
@@ -2934,6 +3289,13 @@ class HiCacheController:
                     exc_info=True,
                 )
                 if operation is not None:
+                    # #1033e: the scheduler must be able to reap this operation
+                    # -- terminated, and its component reads counted as done.
+                    try:
+                        operation.mark_terminate()
+                        operation.pool_transfers_done = True
+                    except Exception:  # noqa: BLE001
+                        pass
                     try:
                         self.append_host_mem_release(
                             operation.host_indices[operation.completed_tokens :],
@@ -2988,7 +3350,8 @@ class HiCacheController:
                 "pool and has no value without one; a 0 here would refuse every "
                 "prefetch silently"
             )
-        return int(self.prefetch_capacity_fraction * int(pool.size))
+        cap = getattr(pool, "prefetch_capacity_tokens", None) or int(pool.size)  # #1424
+        return int(self.prefetch_capacity_fraction * int(cap))
 
     def prefetch_rate_limited(self) -> bool:
         """Refuse a new prefetch registration once the registered prefetches
@@ -3095,6 +3458,7 @@ class HiCacheController:
             )
         ]
 
+    @_pass_timed("_1474_probe_ms")  # #1474
     def store_presence_pages(self, token_ids, last_hash, prefix_keys=None) -> int:
         """#950: how many pages the STORE holds for this span, by CONTENT KEY.
 
@@ -3202,6 +3566,31 @@ class HiCacheController:
         page_hashes = self.get_hash_str(
             tokens_to_fetch, last_hash, page_size=self.page_size
         )
+        # xsn328/329: a held request reads with P's handed-over page keys
+        # (weg2.handoff_keys); its own hashes agreed with P's for the first
+        # 64 tokens only. The first mismatch is named once.
+        # the scheduler's registry first: it is sliced at the MATCHED length;
+        # the tree's operation.weg2_page_keys assumed a tail read (xsn331:
+        # offset=2 for a from-root read of 4314 of 4316 ids)
+        _hk = WEG2_HANDOFF_PAGE_KEYS.get(operation.request_id) or getattr(operation, "weg2_page_keys", None)
+        _k = min(len(_hk), len(page_hashes)) if _hk else 0
+        if _k == 0 and str(operation.request_id).startswith("weg2-"):
+            _hn0 = getattr(self, "_1442_nokeys_n", 0) + 1
+            self._1442_nokeys_n = _hn0
+            if _hn0 <= 12 or _hn0 % 256 == 0:
+                logger.info("#1442 HANDOFF-KEYS NONE rid=%r pages=%d registry=%s op_keys=%s (n=%d)",
+                            operation.request_id, len(page_hashes), sorted(WEG2_HANDOFF_PAGE_KEYS.keys())[:6],
+                            len(getattr(operation, "weg2_page_keys", None) or []), _hn0)
+        if _k > 0:
+            # P's list is one page short of the ids (the last token has no
+            # cached page): P's keys for the covered prefix, own hashes after.
+            _mm = first_mismatch(page_hashes[:_k], list(_hk[:_k]))
+            _hn = getattr(self, "_1442_keys_n", 0) + 1
+            self._1442_keys_n = _hn
+            if _hn <= 12 or _hn % 256 == 0:
+                logger.info("#1442 HANDOFF-KEYS rid=%s pages=%d covered=%d first_mismatch=%s last_hash=%s (own vs P's keys; P's are used)",
+                            operation.request_id, len(page_hashes), _k, _mm, (last_hash or "")[:12])
+            page_hashes = list(_hk[:_k]) + list(page_hashes[_k:])
 
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             if operation.is_terminated():
@@ -3281,7 +3670,7 @@ class HiCacheController:
                     operation.mark_terminate()
                     self._prefetch_drained_after_stop += 1
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
-                if self.draft_tier_armed("admission"):
+                if draft_claim_packed(self):
                     # #1233 L8: ONE collective carries min and max -- MIN over
                     # [count, -count] -- so a rank whose claim differs from
                     # the group's is a named STOP, not a silent MIN (Q11).
@@ -3289,9 +3678,20 @@ class HiCacheController:
                         [storage_hit_count, -storage_hit_count], dtype=torch.int
                     )
                     self._all_reduce_prefetch_groups(packed, torch.distributed.ReduceOp.MIN)
-                    assert_draft_claims_agree(
-                        int(packed[0].item()), -int(packed[1].item()), operation.request_id
-                    )
+                    _mn, _mx = int(packed[0].item()), -int(packed[1].item())
+                    if _mn != _mx and operation.request_id in getattr(self, "weg2_hold_rids", ()):
+                        # #1461 (boot weg2xsn216): a probe issued for a request in
+                        # the DORMANT HOLD reads a store that P is still writing --
+                        # the ranks' probes land ms apart and differ (TP2 94207 vs
+                        # 97870).  That is the one case where the inequality is the
+                        # write-through's clock, not a divergent store: every rank
+                        # adopts the group MIN (the same prefix on every rank) and
+                        # the hold's top-up (#1456) fetches the rest.  Outside the
+                        # hold the law stays STOP.
+                        logger.warning("#1461 DRAFT-CLAIM MIN-ADOPTED rid=%s per_rank_claim=[%d, %d] (hold-time probe, "
+                                       "store in flux; every rank proceeds with %d)", operation.request_id, _mn, _mx, _mn)
+                    else:
+                        assert_draft_claims_agree(_mn, _mx, operation.request_id)
                     storage_hit_count = int(packed[0].item())
                 else:
                     storage_hit_count_tensor = torch.tensor(
@@ -3482,7 +3882,7 @@ class HiCacheController:
 
         -1 when no reader is installed, 0 when the read failed. The count
         used to be discarded here (#1047's "per-page validity bit" question):
-        `read_extents` is all-or-nothing, so a hit IS a complete canonical
+        the canonical extent read is all-or-nothing, so a hit IS a complete canonical
         page and the count is the validity signal admission needs.
         """
         flags = self._draft_page_get_flags(hash_values, host_indices)
@@ -3625,6 +4025,33 @@ class HiCacheController:
         """
         component = self._draft_component_name()
         draft_keys = [f"{h}.{component}" for h in hash_values]
+        dpool = self.mem_pool_host_draft
+        _hi_pages = host_indices[:: self.page_size][: len(draft_keys)]
+        _rows_ok = bool(getattr(dpool, "arena_read", False)) and bool(
+            (_hi_pages.cpu() >= int(dpool.staging_rows)).all()
+        )  # #1438: tensor op, not a Python genexpr per page
+        if (_rows_ok and self.storage_backend is not None
+                and dpool.ensure_bound(self.storage_backend, role="draft")):
+            # #1424: the draft rows share the KV rows' ids; behind an arena id
+            # the draft page is addressed in the DRAFT arena (miss = zero row).
+            stems = weg2_suffixed_stems(self.storage_backend, draft_keys)  # Posten 2
+            found = dpool.arena.find_slots(stems)
+            rows = (_hi_pages.cpu() - int(dpool.staging_rows)).tolist()
+            flags, slots, hits = [], [], 0
+            for i, (slot, state) in enumerate(found):
+                if slot < 0 or state != 2:  # #1433: L3 -> L2 for the draft page too
+                    _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
+                    fill = _fill_fn(dpool.arena, [stems[i]], int(dpool._page_bytes))[0] if callable(_fill_fn) else None
+                    if fill is not None:
+                        slot, state = fill, 2
+                ok = slot >= 0 and state == 2 and dpool.arena.ref_slots([slot], +1) == 1
+                slots.append(slot if ok else -1)
+                flags.append(bool(ok))
+                hits += int(ok)
+            dpool.resolve_draft_rows(rows, slots)
+            self._draft_l3_hits += hits
+            self._draft_l3_misses += len(draft_keys) - hits
+            return flags
         draft_dummy, _release = _borrow_read_pages(
             self.storage_backend, component, self.mem_pool_host_draft, len(draft_keys)
         )

@@ -2650,13 +2650,15 @@ _WEIGHT_TO_GEMM_FAMILY: Dict[str, Optional[str]] = {
     "vision": None,
     "draft_repl": None,  # replicated: skipped by the sharded term anyway
     "draft_solo_ckpt": None,  # external checkpoint bytes, format unknown
+    "dflash_attn": GEMM_FAMILY_ATTN_GDN,  # external DFlash draft, split placement
+    "dflash_repl": None,
 }
 
 
 def gemm_family_for_weight_family(name: str, num_experts: int) -> Optional[str]:
     """The #324 score family a cost-model weight family runs on, or ``None``
     for 'no own family, use the scalar rate'."""
-    if name in ("mlp", "draft_mlp"):
+    if name in ("mlp", "draft_mlp", "dflash_mlp"):
         return GEMM_FAMILY_MOE if num_experts > 0 else GEMM_FAMILY_MLP
     return _WEIGHT_TO_GEMM_FAMILY.get(name)
 
@@ -4196,6 +4198,23 @@ class PerfCostModel:
         #: Draft-KV bytes per token on the solo host. ``None`` = fall back to
         #: the target's mtp_layers-derived term.
         self.solo_draft_kv_cell_bytes = None
+        # An EXTERNAL DFlash draft in split placement: its bytes come off its
+        # own checkpoint headers and shard on ITS head grid
+        # (speculative/dflash_pricing). The NEXTN head families below stay
+        # what the target config says; whether that head is loaded is the
+        # loader's business, its bytes are priced either way.
+        self.dflash_split_ckpt = None
+        self.dflash_kv_heads = 0
+        if (
+            self.spec_active
+            and str(plan_inputs.speculative_algorithm or "").upper() == "DFLASH"
+            and plan_inputs.speculative_draft_model_path
+            and not self._placement_solo
+        ):
+            from sglang.srt.speculative.dflash_pricing import dflash_draft_kv_heads
+
+            self.dflash_split_ckpt = str(plan_inputs.speculative_draft_model_path)
+            self.dflash_kv_heads = int(dflash_draft_kv_heads(self.dflash_split_ckpt))
         if self.solo_active and plan_inputs.speculative_draft_model_path:
             from sglang.srt.distributed.utils import _checkpoint_size_mib
 
@@ -4386,6 +4405,16 @@ class PerfCostModel:
             "draft_mlp": _Family(draft_mlp, 2.0, "mlp"),
             "draft_repl": _Family(draft_repl, 2.0, "replicated"),
         }
+        if self.dflash_split_ckpt:
+            from sglang.srt.speculative.dflash_pricing import (
+                dflash_draft_family_bytes,
+            )
+
+            db = dflash_draft_family_bytes(self.dflash_split_ckpt)
+            # bytes are exact (read off the headers): bytes_per_param 1.0
+            families["dflash_attn"] = _Family(float(db["attn"]), 1.0, "dflash_attn")
+            families["dflash_mlp"] = _Family(float(db["mlp"]), 1.0, "mlp")
+            families["dflash_repl"] = _Family(float(db["repl"]), 1.0, "replicated")
 
         # Solo placement: the draft is not sharded, it is RESIDENT ON ONE RANK.
         # Re-point every draft family at that rank (shadows drop to zero) and
@@ -4451,7 +4480,9 @@ class PerfCostModel:
         bf16_bytes = sum(
             fam.bytes
             for name, fam in families.items()
-            if name not in quant_names and name != "draft_solo_ckpt"
+            if name not in quant_names
+            and name != "draft_solo_ckpt"
+            and not name.startswith("dflash_")  # separate checkpoint, exact bytes
         )
         quant_params = sum(families[name].params for name in quant_names)
         if ckpt_bytes > 0 and quant_params > 0:
@@ -4558,6 +4589,14 @@ class PerfCostModel:
         if shard == "mlp":
             units = partition_units(self.mlp_units, mlp_vector)
             return [u / self.mlp_units for u in units]
+        if shard == "dflash_attn":
+            # the external draft's own kv-head grid (8 on DFlash2), dealt by
+            # the base attention plan like the target's heads
+            grid = int(self.dflash_kv_heads or 0)
+            if grid < n:
+                return [1.0] * n  # replicated-KV regime: every rank all heads
+            units = partition_units(grid, attn_plan)
+            return [u / grid for u in units]
         raise ValueError(shard)
 
     def token_shard_fractions(self, token_vector: Sequence[int]) -> List[float]:

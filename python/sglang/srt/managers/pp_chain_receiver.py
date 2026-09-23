@@ -548,7 +548,11 @@ class PpChainReceiver:
                     f"further advances here is the 1068cap park (PP1, "
                     f"07:34:09), so this stops instead."
                 )
+            _t0 = time.time()
             self._advance(block=True)
+            _dt = (time.time() - _t0) * 1000
+            if _dt >= 50.0:  # #1460: a blocking chain receive that waited
+                logger.info("%s #1460 CHAIN-RECV blocked %.0f ms absorbed=%d t=%.3f", LOG_PREFIX, _dt, absorbed, time.time())
             absorbed += 1
         return self.inbox.popleft()
 

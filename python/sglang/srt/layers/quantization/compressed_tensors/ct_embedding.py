@@ -70,8 +70,64 @@ def is_compressed_tensors_config(quant_config: Any) -> bool:
     return name.strip().lower().replace("-", "_") == "compressed_tensors"
 
 
-def vocab_is_quantized(quant_config: Dict[str, Any], layer_name: str) -> bool:
+_SCALE_INDEX_CACHE: Dict[str, Optional[set]] = {}
+
+
+def _checkpoint_scale_leaves(model_path: Optional[str]) -> Optional[set]:
+    """The leaf names (``embed_tokens``, ``lm_head`` ...) for which the
+    checkpoint at ``model_path`` carries a ``<name>.weight_scale`` tensor --
+    read from ``model.safetensors.index.json`` or a single-file header.
+    ``None`` when nothing readable is there (the caller then falls back to
+    the ignore-list reading)."""
+    if not model_path:
+        return None
+    if model_path in _SCALE_INDEX_CACHE:
+        return _SCALE_INDEX_CACHE[model_path]
+    leaves: Optional[set] = None
+    try:
+        import json
+        import os
+
+        keys = None
+        idx = os.path.join(model_path, "model.safetensors.index.json")
+        if os.path.isfile(idx):
+            with open(idx) as f:
+                keys = list((json.load(f).get("weight_map") or {}).keys())
+        else:
+            single = os.path.join(model_path, "model.safetensors")
+            if os.path.isfile(single):
+                from safetensors import safe_open
+
+                with safe_open(single, "pt") as f:
+                    keys = list(f.keys())
+        if keys is not None:
+            leaves = set()
+            for k in keys:
+                if k.endswith(".weight_scale"):
+                    parts = k.split(".")
+                    if len(parts) >= 2:
+                        leaves.add(parts[-2])
+    except Exception:  # noqa: BLE001 -- an unreadable index is not a boot killer
+        leaves = None
+    _SCALE_INDEX_CACHE[model_path] = leaves
+    return leaves
+
+
+def vocab_is_quantized(
+    quant_config: Dict[str, Any], layer_name: str, model_path: Optional[str] = None
+) -> bool:
     """Does this checkpoint actually carry ``layer_name`` quantized?
+
+    17.09. (boot df2l, lued/Qwen3.8-27B-INT8-W8A16-MTP): the ignore list
+    CANNOT tell.  Both that ORIGINAL checkpoint (BF16 vocab, targets
+    ['Linear'], embed_tokens not in ignore) and our #727 requant (int8 vocab
+    with weight_scale, same targets, same ignore) answer "quantized" here,
+    so the original loaded BF16 rows through the int8 method: the target
+    answered '!!!' (token 0) on every prompt and NEXTN's MTP head died in
+    gemma_rmsnorm on a Char tensor.  The tensor file is the authority: when
+    ``model_path`` is known, the vocab is quantized iff the checkpoint has a
+    ``<leaf>.weight_scale`` beside it; the ignore-list reading below stays
+    the fallback for a checkpoint whose index cannot be read.
 
     The authority is ``quantization_config.ignore``: a producer that excluded a
     tensor did not write scales for it, so a method that assumed otherwise
@@ -85,6 +141,10 @@ def vocab_is_quantized(quant_config: Dict[str, Any], layer_name: str) -> bool:
     almost never matches, so the layer is treated as quantized only when the
     list genuinely does not mention it.
     """
+    leaves = _checkpoint_scale_leaves(model_path)
+    if leaves is not None:
+        leaf = layer_name.split(".")[-1] if layer_name else ""
+        return leaf in leaves
     for entry in quant_config.get("ignore", []) or []:
         if not isinstance(entry, str):
             continue

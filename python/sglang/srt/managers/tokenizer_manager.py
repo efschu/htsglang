@@ -150,6 +150,20 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
+def _weg2_set_vision_rid(rid) -> None:
+    """Publish this request's rid for the transient vision stage's log lines.
+
+    Guarded and silent: a log field must never be the reason a request fails,
+    and an upstream boot without the weg2 tree must not notice this exists.
+    """
+    try:
+        from sglang.srt.weg2.vision_stage_service import set_request_rid
+
+        set_request_rid(rid)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @lru_cache(maxsize=1)
 def _ragged_verify_cap_accept() -> bool:
     # The mode env is fixed at server launch; cache to keep it off the
@@ -259,6 +273,28 @@ class InputFormat(Enum):
     SINGLE_STRING = 1  # Regular single text like "Hello world"
     BATCH_STRINGS = 2  # Regular batch like ["Hello", "World"]
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
+
+
+def _weg2_handoff_ids(obj):
+    """#1442: the token ids P produced for this rid, from the shared hand-off
+    (None = no hand-off, tokenise as before). Cached on the object so the
+    two calls in the branch above read the file once."""
+    rid = getattr(obj, "rid", None)
+    if not isinstance(rid, str) or not rid.startswith("weg2-"):
+        return None
+    cached = getattr(obj, "_weg2_handoff_ids_cache", "unset")
+    if cached != "unset":
+        return cached
+    try:
+        from sglang.srt.weg2 import handoff as _ho
+        ids = _ho.read_ids(rid)
+    except Exception:  # noqa: BLE001
+        ids = None
+    try:
+        obj._weg2_handoff_ids_cache = ids
+    except Exception:  # noqa: BLE001
+        pass
+    return ids
 
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
@@ -907,6 +943,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             input_ids = obj.input_ids
         elif obj.input_ids is not None:
             input_ids = obj.input_ids
+        elif _weg2_handoff_ids(obj) is not None:
+            input_ids = _weg2_handoff_ids(obj)  # #1442: P tokenised this prompt already
         else:
             if self.tokenizer is None:
                 raise ValueError(
@@ -935,6 +973,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
         if should_run_mm_processor:
+            # Task #58: hand the rid to the transient vision stage, which runs
+            # four frames below this one inside the multimodal processor and
+            # has no other way to learn it. Without this the metal log read
+            # `W105 Weg2VisionNoRoom rid= --` and no refusal could be tied to
+            # the request that caused it. Task-local, never raises, and a
+            # no-op in any boot that does not run the stage.
+            _weg2_set_vision_rid(obj.rid)
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
             if obj.video_data is not None and not isinstance(obj.video_data, list):
@@ -1826,7 +1871,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and self.server_args.tokenizer_worker_num == 1
             and rid not in self.rid_to_state
         ):
-            return
+            # weg2xsn276 (18.09.): on a Weg 2 group the abort must reach EVERY
+            # scheduler rank even when this manager no longer knows the rid --
+            # the scheduler's WEG2-INTAKE-STALL refusal finalised the stream
+            # on this side and dropped the request on ITS rank only; the PP
+            # followers still queued it, the front's /abort_request was
+            # swallowed here, and the flip's release asserted 'server idle'
+            # (W29 on PP2). An AbortReq for a rid no rank holds is a no-op.
+            from sglang.srt.weg2.intake_stall import abort_must_reach_every_rank
+
+            if not abort_must_reach_every_rank(rid_known=False, abort_all=abort_all):
+                return
+            logger.info(
+                "WEG2 abort_request rid=%s not in rid_to_state -- dispatched to every "
+                "scheduler rank anyway (Weg 2 group %s)",
+                rid, os.environ.get("SGLANG_WEG2_GROUP", "?"),
+            )
         req = AbortReq(rid=rid, abort_all=abort_all)
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:

@@ -99,7 +99,10 @@ def get_batch_sizes_to_capture(
     # fnFA16 hung the host in this all_reduce for 120 s until the workers'
     # sampler-warmup barrier timed out. The solo draft's ladder is bounded by
     # its own pool alone, which is exactly what the local value already is.
-    _solo_draft = bool(getattr(model_runner, "is_draft_solo_host", False))
+    # The 27B line reached the same hang as xsn386 (19.09.) and names it
+    # `spec_solo_rank_local_graphs`; either flag means rank-local capture.
+    _solo_draft = bool(getattr(model_runner, "is_draft_solo_host", False)) or bool(
+        getattr(model_runner, "spec_solo_rank_local_graphs", False))
     if get_parallel().tp_size > 1 and not _solo_draft:
         import torch
         import torch.distributed as dist

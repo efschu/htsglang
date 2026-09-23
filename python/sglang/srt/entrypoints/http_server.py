@@ -2895,11 +2895,19 @@ def _create_error_response(e):
     # and the request is retryable -- against another replica now, against this
     # one after it restarts. Answering 400 would tell a load balancer to drop
     # the request instead of re-routing it.
-    status = (
-        HTTPStatus.SERVICE_UNAVAILABLE.value
-        if isinstance(e, ServerShuttingDown)
-        else HTTPStatus.BAD_REQUEST.value
-    )
+    # Task #58: a Weg-2 refusal names its own status on the exception
+    # (`VisionStageRequestRefused.weg2_http_status` = 501, the same code the
+    # front answers an image with under `--weg2-vision off`). The attribute is
+    # read rather than imported so an upstream boot never pays for a weg2
+    # import here; its ABSENCE means 400, which is the behaviour that was
+    # already there, so no path changes status by accident.
+    weg2_status = getattr(e, "weg2_http_status", None)
+    if weg2_status is not None:
+        status = int(weg2_status)
+    elif isinstance(e, ServerShuttingDown):
+        status = HTTPStatus.SERVICE_UNAVAILABLE.value
+    else:
+        status = HTTPStatus.BAD_REQUEST.value
     return openai_error_response(
         str(e),
         status_code=status,

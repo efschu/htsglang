@@ -204,7 +204,8 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         return _memory_saver.disable()
 
     def pause(self, tag: str):
-        return _memory_saver.pause(tag=tag)
+        with _abort_poll_excluded():
+            return _memory_saver.pause(tag=tag)
 
     def resume(self, tag: str):
         """Resume ``tag`` AND VERIFY IT HAPPENED (#1490).

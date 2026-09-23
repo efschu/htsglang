@@ -295,6 +295,21 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return Fp8LinearMethod(self.linear_fp8_config)
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
+                # #1483 instrument (df2l: lued W8A16 GDN projections came up
+                # dense at boot while the same config quantizes them hermetically)
+                try:
+                    if ".layers." in str(prefix) and ".layers.0." not in str(prefix):
+                        raise StopIteration  # one layer's worth of evidence is enough
+                    from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer as _sil
+
+                    _ign = _sil(prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping)
+                    logger.info("#1483 CT-SCHEME-NONE prefix=%s cls=%s ignored=%s fused_keys=%s ignore_n=%d targets=%s",
+                                prefix, type(layer).__name__, _ign, sorted(self.packed_modules_mapping.keys())[:6],
+                                len(self.ignore or []), list(self.target_scheme_map.keys())[:4])
+                except StopIteration:
+                    pass
+                except Exception as _e:  # noqa: BLE001
+                    logger.info("#1483 CT-SCHEME-NONE prefix=%s cls=%s (probe failed: %s)", prefix, type(layer).__name__, _e)
                 return UnquantizedLinearMethod()
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
@@ -314,7 +329,14 @@ class CompressedTensorsConfig(QuantizationConfig):
                 vocab_is_quantized,
             )
 
-            if not vocab_is_quantized(getattr(self, "config", None) or {}, prefix):
+            _model_path = None
+            try:
+                from sglang.srt.runtime_context import get_server_args
+
+                _model_path = getattr(get_server_args(), "model_path", None)
+            except Exception:  # noqa: BLE001 -- no runtime context (tests): ignore-list reading
+                _model_path = None
+            if not vocab_is_quantized(getattr(self, "config", None) or {}, prefix, _model_path):
                 return UnquantizedEmbeddingMethod()
             # pack-quantized group vocab (AutoRound / llm-compressor writes
             # weight_packed + group weight_scale, e.g. Minachist's INT8 g128

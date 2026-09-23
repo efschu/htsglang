@@ -152,6 +152,7 @@ def check_full_head_shipment_is_justified(
     layout: DraftKvCanonicalLayout,
     hidden_size: int,
     hidden_element_size: int,
+    num_context_layers: int = 1,
 ) -> None:
     """Refuse when shipping every head costs more than the option it replaced.
 
@@ -169,7 +170,12 @@ def check_full_head_shipment_is_justified(
     checkpoint and explains itself to the next reader.
     """
     canonical = layout.bytes_per_token()
-    recompute = hidden_size * hidden_element_size
+    # The alternative ships every hidden vector the draft's context needs:
+    # one for a NEXTN/EAGLE head, one PER CAPTURE LAYER for a DFlash draft
+    # (its fc concatenates them). Comparing 20 KiB of DFlash2 draft KV
+    # against one 10 KiB hidden would refuse a shipment that is in fact 2.5x
+    # cheaper than the five hiddens it replaces.
+    recompute = hidden_size * hidden_element_size * max(1, int(num_context_layers))
     if canonical > recompute:
         raise DraftKvLayoutMismatch(
             "canonical full-head draft-KV shipment is not justified on this "
@@ -233,6 +239,33 @@ def local_head_window(
 
     if num_kv_heads < tp_size:
         return 0, num_kv_heads
+
+    # An installed uneven-TP plan (--rank-tp-ratio) deals the kv heads the
+    # way the draft's attention layers and its pool are cut on THIS rank
+    # (distributed/utils.tp_partition_size, units = every head): 8 heads on
+    # 3991/1000/1000 are 5/2/1, not the largest-remainder 3/3/2. The window
+    # must be the pool's own cut or the rank reads another rank's heads
+    # under the same key. Without a plan the dealing below is unchanged.
+    from sglang.srt.distributed.utils import (
+        get_tp_partition_ratios,
+        partition_sizes,
+        tp_plan_active,
+    )
+
+    if tp_plan_active(tp_size):
+        sizes = [
+            int(x)
+            for x in partition_sizes(
+                num_kv_heads, weights=get_tp_partition_ratios(), units=num_kv_heads
+            )
+        ]
+        if sum(sizes) != num_kv_heads or len(sizes) != tp_size:
+            raise DraftKvLayoutMismatch(
+                f"uneven-TP draft head partition {sizes} does not deal the "
+                f"{num_kv_heads} kv heads over {tp_size} ranks"
+            )
+        start = sum(sizes[:tp_rank])
+        return start, start + sizes[tp_rank]
 
     base, remainder = divmod(num_kv_heads, tp_size)
     # Ranks below `remainder` take one extra head; the offset is therefore

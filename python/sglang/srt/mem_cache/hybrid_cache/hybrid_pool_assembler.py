@@ -559,7 +559,12 @@ def build_hybrid_mamba_stack(
         server_args=server_args,
         use_mla=use_mla,
     )
-    mamba_host_pool = MambaPoolHost(
+    from sglang.srt.mem_cache.pool_host.arena_pool import arena_host_enabled as _arena_on
+    if _arena_on():  # #1427 Stufe 4b
+        from sglang.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost as _MambaCls
+    else:
+        _MambaCls = MambaPoolHost
+    mamba_host_pool = _MambaCls(
         mamba_pool,
         server_args.hicache_ratio,
         server_args.hicache_size,

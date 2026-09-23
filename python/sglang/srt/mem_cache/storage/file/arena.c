@@ -20,6 +20,7 @@
 #define _GNU_SOURCE
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define A_MAGIC 0x41524e4132363931ULL /* "ARNA2691" */
@@ -174,14 +175,26 @@ static int64_t find_slot(uint8_t *base, uint64_t klo, uint64_t khi) {
 }
 
 /* claim a FREE slot for key (index entry published); -1 = arena full */
-static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t total) {
+static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t total, int *fresh) {
     ArenaHeader *h = hdr(base);
+    if (fresh) *fresh = 0;
+    /* #1431 (xsn193): a FULL arena refused every page only after walking all
+     * 524288 slot headers -- per page, per sweep -- and P's main thread spent
+     * its bubbles in here. The counters know the answer in O(1). They are
+     * kept exact by claim/complete/evict/free below. */
+    if (atomic_load(&h->n_complete) + atomic_load(&h->n_claimed) >= h->slots) return -1;
     uint64_t start = atomic_fetch_add(&h->clock_hand, 1) % h->slots;
     for (uint64_t n = 0; n < h->slots; n++) {
         uint64_t s = (start + n) % h->slots;
         SlotHeader *sh = slot_hdr(base, s);
         uint32_t expect = S_FREE;
         if (atomic_compare_exchange_strong(&sh->state, &expect, S_CLAIMED)) {
+            /* xsn342 (18.09.): the hand moved +1 per claim while the scan
+             * ran ahead of it; once it wrapped, EVERY claim re-walked the
+             * whole occupied prefix (measured: 2 us -> 2.8 ms per claim,
+             * 4096-page node = 11.6 s, PP1 wedged 150 s in the retain
+             * sweep). CLOCK semantics: the hand follows the last claim. */
+            atomic_store(&h->clock_hand, s + 1);
             sh->key_lo = klo;
             sh->key_hi = khi;
             sh->total_bytes = total;
@@ -199,16 +212,29 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
             for (uint64_t m = 0; m < h->index_cap; m++, i = (i + 1) & mask) {
                 uint64_t k = atomic_load(&keys[i]);
                 if (k == klo) {
-                    /* another writer published this key concurrently: yield our slot */
-                    atomic_store(&sh->state, S_FREE);
                     uint32_t other = atomic_load(&slots[i]);
-                    return (int64_t)other;
+                    SlotHeader *oh = slot_hdr(base, other);
+                    uint32_t ost = atomic_load(&oh->state);
+                    if (oh->key_lo == klo && oh->key_hi == khi && (ost == S_CLAIMED || ost == S_COMPLETE)) {
+                        /* another writer published this key concurrently: yield our slot */
+                        atomic_store(&sh->state, S_FREE);
+                        return (int64_t)other;
+                    }
+                    /* xsn342: a STALE cell (its slot was freed by abort_write and
+                     * may already carry another writer's key): take the cell over
+                     * for our fresh slot instead of handing the caller a slot it
+                     * does not own (ARENA-COMPLETE LOST 'recycled under the writer'). */
+                    atomic_store(&slots[i], (uint32_t)s);
+                    atomic_fetch_add(&h->n_claimed, 1);
+                    if (fresh) *fresh = 1;
+                    return (int64_t)s;
                 }
                 if (k == 0 || k == TOMB) {
                     uint64_t expect_k = k;
                     if (atomic_compare_exchange_strong(&keys[i], &expect_k, klo)) {
                         atomic_store(&slots[i], (uint32_t)s);
                         atomic_fetch_add(&h->n_claimed, 1);
+                        if (fresh) *fresh = 1;
                         return (int64_t)s;
                     }
                     /* lost the race for this cell: re-read it */
@@ -224,6 +250,42 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
 
 /* status per page: 0 partial, 1 completed now, 2 already complete,
  * 3 refused (extent not granule-aligned or out of range), 4 arena full */
+/* Merge k extents into the slot's sorted, disjoint interval list under the
+ * slot lock. Returns 1 when the slot is fully covered, 0 when not, -1 on
+ * interval-list overflow. Shared by arena_write (payload copy) and
+ * arena_complete (#1427 direct DMA writes, no payload). */
+static int merge_ivals(SlotHeader *sh, int64_t k, const int64_t *off_arr, const int64_t *len_arr,
+                       uint64_t total) {
+    int overflow = 0;
+    while (atomic_exchange(&sh->lock, 1)) { /* spin */ }
+    for (int64_t j = 0; j < k && !overflow; j++) {
+        uint64_t lo = (uint64_t)off_arr[j], hi = lo + (uint64_t)len_arr[j];
+        uint32_t n = sh->n_ivals;
+        uint32_t a = 0;
+        while (a < n && sh->ivals[a].hi < lo) a++;
+        uint32_t b = a;
+        while (b < n && sh->ivals[b].lo <= hi) {
+            if (sh->ivals[b].lo < lo) lo = sh->ivals[b].lo;
+            if (sh->ivals[b].hi > hi) hi = sh->ivals[b].hi;
+            b++;
+        }
+        uint32_t removed = b - a;
+        if (removed == 0) {
+            if (n + 1 > sh->cap_ivals) { overflow = 1; break; }
+            memmove(&sh->ivals[a + 1], &sh->ivals[a], (n - a) * sizeof(Ival));
+            sh->ivals[a].lo = lo; sh->ivals[a].hi = hi;
+            sh->n_ivals = n + 1;
+        } else {
+            sh->ivals[a].lo = lo; sh->ivals[a].hi = hi;
+            if (removed > 1) memmove(&sh->ivals[a + 1], &sh->ivals[b], (n - b) * sizeof(Ival));
+            sh->n_ivals = n - removed + 1;
+        }
+    }
+    int full = (sh->n_ivals == 1 && sh->ivals[0].lo == 0 && sh->ivals[0].hi == total);
+    atomic_store(&sh->lock, 0);
+    return overflow ? -1 : full;
+}
+
 int64_t arena_write(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_t *khi,
                     const int64_t *totals, const int64_t *n_ext, const int64_t *ext_off,
                     const int64_t *ext_len, const uint8_t **payload, const char **stems,
@@ -241,7 +303,7 @@ int64_t arena_write(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
         }
         if (s) { status[i] = s; e += k; continue; }
         int64_t slot = find_slot(base, klo[i], khi[i]);
-        if (slot < 0) slot = claim_slot(base, klo[i], khi[i], total);
+        if (slot < 0) slot = claim_slot(base, klo[i], khi[i], total, NULL);
         if (slot < 0) { status[i] = 4; e += k; continue; }
         SlotHeader *sh = slot_hdr(base, (uint64_t)slot);
         if (atomic_load(&sh->state) == S_COMPLETE) { status[i] = 2; e += k; ok++; continue; }
@@ -260,35 +322,8 @@ int64_t arena_write(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
         }
         atomic_thread_fence(memory_order_release);
         /* record coverage: merge the extents into the sorted interval list */
-        int full = 0, overflow = 0;
-        while (atomic_exchange(&sh->lock, 1)) { /* spin */ }
-        for (int64_t j = 0; j < k && !overflow; j++) {
-            uint64_t lo = (uint64_t)ext_off[e + j], hi = lo + (uint64_t)ext_len[e + j];
-            uint32_t n = sh->n_ivals;
-            /* find insertion point and the run of intervals overlapping/touching [lo,hi) */
-            uint32_t a = 0;
-            while (a < n && sh->ivals[a].hi < lo) a++;
-            uint32_t b = a;
-            while (b < n && sh->ivals[b].lo <= hi) {
-                if (sh->ivals[b].lo < lo) lo = sh->ivals[b].lo;
-                if (sh->ivals[b].hi > hi) hi = sh->ivals[b].hi;
-                b++;
-            }
-            /* replace ivals[a..b) with one interval */
-            uint32_t removed = b - a;
-            if (removed == 0) {
-                if (n + 1 > sh->cap_ivals) { overflow = 1; break; }
-                memmove(&sh->ivals[a + 1], &sh->ivals[a], (n - a) * sizeof(Ival));
-                sh->ivals[a].lo = lo; sh->ivals[a].hi = hi;
-                sh->n_ivals = n + 1;
-            } else {
-                sh->ivals[a].lo = lo; sh->ivals[a].hi = hi;
-                if (removed > 1) memmove(&sh->ivals[a + 1], &sh->ivals[b], (n - b) * sizeof(Ival));
-                sh->n_ivals = n - removed + 1;
-            }
-        }
-        full = (sh->n_ivals == 1 && sh->ivals[0].lo == 0 && sh->ivals[0].hi == total);
-        atomic_store(&sh->lock, 0);
+        int mr = merge_ivals(sh, k, ext_off + e, ext_len + e, total);
+        int overflow = mr < 0, full = mr > 0;
         if (overflow) { status[i] = 3; e += k; continue; }
         if (full) {
             uint32_t expect = S_CLAIMED;
@@ -410,11 +445,262 @@ int64_t arena_evict_candidates(uint8_t *base, int64_t want, int64_t *slots, uint
 
 uint8_t *arena_slot_ptr(uint8_t *base, int64_t slot) { return slot_data(base, (uint64_t)slot); }
 
+/* #1424 Stufe 3: the slot of each key (-1 absent) and its state, so a reader
+ * can address the page IN PLACE instead of copying it out. */
+int64_t arena_find_slots(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_t *khi,
+                         int64_t *slots, int8_t *states) {
+    int64_t found = 0;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t s = find_slot(base, klo[i], khi[i]);
+        slots[i] = s;
+        states[i] = s < 0 ? 0 : (int8_t)atomic_load(&slot_hdr(base, (uint64_t)s)->state);
+        if (s >= 0) found++;
+    }
+    return found;
+}
+/* #1424 Stufe 3: reader references. +1 pins a COMPLETE slot against eviction
+ * (arena_evict_candidates skips refcount != 0), -1 releases. Returns how many
+ * slots took the delta; a +1 on a slot that is not COMPLETE is refused (0). */
+/* #1427 DIRECT WRITES (Stufe 4): the writer DMAs its extents straight into
+ * slot_data instead of handing a host payload to arena_write. claim gives it
+ * the slot; complete merges its extents into the coverage list and flips the
+ * slot COMPLETE when every extent of the page is in. Several ranks (PP layer
+ * shards) claim the SAME key and each completes its own extents.
+ * claim status per key: 0 = claimed by this call (fresh), 1 = CLAIMED by an
+ * earlier writer (join: write your extents, then complete), 2 = already
+ * COMPLETE (nothing to write), 3 = too large, 4 = no free slot. gen_out is
+ * the slot generation to hand back to arena_complete. */
+static void stem_key128(const char *stem, uint64_t *lo, uint64_t *hi);
+int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_t *khi,
+                    const int64_t *totals, const char **stems, int64_t *slots_out,
+                    int64_t *gen_out, int8_t *status);
+
+/* xsn350: the stems' 128-bit keys hashed HERE (py-spy PP0: key128 in Python
+ * was ~30 ms per 4096-page node of the chunk publish, in the scheduler thread). */
+/* xsn357 (py-spy PP0, prefetch thread): the store hit query of a waiting
+ * prompt hashed thousands of stems in Python for arena_lookup; hash here. */
+int64_t arena_lookup_stems(uint8_t *base, int64_t n, const char **stems, int8_t *out) {
+    int64_t found = 0;
+    for (int64_t i = 0; i < n; i++) {
+        uint64_t lo, hi;
+        stem_key128(stems[i], &lo, &hi);
+        int64_t s = find_slot(base, lo, hi);
+        int8_t hit = 0;
+        if (s >= 0) hit = (atomic_load(&slot_hdr(base, (uint64_t)s)->state) == S_COMPLETE) ? 1 : 0;
+        out[i] = hit;
+        found += hit;
+    }
+    return found;
+}
+
+int64_t arena_claim_stems(uint8_t *base, int64_t n, const char **stems, const int64_t *totals,
+                          int64_t *slots_out, int64_t *gen_out, int8_t *status) {
+    uint64_t *klo = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)(n > 0 ? n : 1));
+    uint64_t *khi = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)(n > 0 ? n : 1));
+    if (!klo || !khi) { free(klo); free(khi); return -1; }
+    for (int64_t i = 0; i < n; i++) stem_key128(stems[i], &klo[i], &khi[i]);
+    int64_t ok = arena_claim(base, n, klo, khi, totals, stems, slots_out, gen_out, status);
+    free(klo); free(khi);
+    return ok;
+}
+
+int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_t *khi,
+                    const int64_t *totals, const char **stems, int64_t *slots_out,
+                    int64_t *gen_out, int8_t *status) {
+    ArenaHeader *h = hdr(base);
+    int64_t ok = 0;
+    for (int64_t i = 0; i < n; i++) {
+        uint64_t total = (uint64_t)totals[i];
+        slots_out[i] = -1; gen_out[i] = 0;
+        if (total > h->slot_bytes) { status[i] = 3; continue; }
+        int64_t slot = find_slot(base, klo[i], khi[i]);
+        int fresh = 0;
+        if (slot < 0) {
+            /* xsn342: 'fresh' is what claim_slot says -- a yield to another
+             * writer's slot is a JOIN (status 1), never a fresh claim the
+             * caller may free again on abort. */
+            slot = claim_slot(base, klo[i], khi[i], total, &fresh);
+            if (slot < 0) { status[i] = 4; continue; }
+        }
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slot);
+        slots_out[i] = slot;
+        gen_out[i] = (int64_t)sh->generation;
+        if (atomic_load(&sh->state) == S_COMPLETE) { status[i] = 2; ok++; continue; }
+        if (stems && stems[i] && sh->stem[0] == 0) {
+            size_t sl = strlen(stems[i]);
+            if (sl >= STEM_CAP) sl = STEM_CAP - 1;
+            memcpy(sh->stem, stems[i], sl);
+            sh->stem[sl] = 0;
+        }
+        status[i] = fresh ? 0 : 1;
+        ok++;
+    }
+    return ok;
+}
+
+/* status per slot: 1 = completed by this call, 0 = extents merged, page not
+ * yet full (other writers pending), 2 = already COMPLETE, 3 = slot recycled
+ * (generation moved on) or interval overflow -- the writer's bytes are lost. */
+int64_t arena_complete(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens,
+                       const int64_t *n_ext, const int64_t *ext_off, const int64_t *ext_len,
+                       int8_t *status) {
+    ArenaHeader *h = hdr(base);
+    int64_t ok = 0, e = 0;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t k = n_ext[i];
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if ((int64_t)sh->generation != gens[i]) { status[i] = 3; e += k; continue; }
+        uint32_t st0 = atomic_load(&sh->state);
+        if (st0 == S_COMPLETE) { status[i] = 2; e += k; ok++; continue; }
+        if (st0 != S_CLAIMED) { status[i] = 3; e += k; continue; }  /* freed or evicting */
+        atomic_thread_fence(memory_order_release);
+        int mr = merge_ivals(sh, k, ext_off + e, ext_len + e, sh->total_bytes);
+        e += k;
+        if (mr < 0) { status[i] = 3; continue; }
+        if (mr == 0) { status[i] = 0; ok++; continue; }
+        uint32_t expect = S_CLAIMED;
+        if (atomic_compare_exchange_strong(&sh->state, &expect, S_COMPLETE)) {
+            atomic_fetch_add(&h->n_complete, 1);
+            atomic_fetch_sub(&h->n_claimed, 1);
+            status[i] = 1;
+        } else {
+            status[i] = 2;
+        }
+        ok++;
+    }
+    return ok;
+}
+
+
+/* ---- #1439: BLAKE2b (RFC 7693), unkeyed, 16-byte digest -- the same key128
+ * the Python side computes with hashlib.blake2b(stem, digest_size=16), so the
+ * arena can be asked by STEM from C without a Python hash + ctypes array per
+ * key (xsn199 D profile: 6 % of the re-admission of a 100k prompt). */
+static const uint64_t b2b_iv[8] = {
+    0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL, 0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+    0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL, 0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL};
+static const uint8_t b2b_sigma[12][16] = {
+    {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}, {14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3},
+    {11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4}, {7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8},
+    {9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13}, {2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9},
+    {12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11}, {13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10},
+    {6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5}, {10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0},
+    {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}, {14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3}};
+static inline uint64_t b2b_rotr(uint64_t x, int n) { return (x >> n) | (x << (64 - n)); }
+static inline uint64_t b2b_ld64(const uint8_t *p) {
+    uint64_t v = 0; for (int i = 7; i >= 0; i--) v = (v << 8) | p[i]; return v;
+}
+#define B2B_G(a, b, c, d, x, y) do { \
+    v[a] += v[b] + (x); v[d] = b2b_rotr(v[d] ^ v[a], 32); \
+    v[c] += v[d];       v[b] = b2b_rotr(v[b] ^ v[c], 24); \
+    v[a] += v[b] + (y); v[d] = b2b_rotr(v[d] ^ v[a], 16); \
+    v[c] += v[d];       v[b] = b2b_rotr(v[b] ^ v[c], 63); } while (0)
+static void b2b_compress(uint64_t h[8], const uint8_t blk[128], uint64_t t, int last) {
+    uint64_t v[16], m[16];
+    for (int i = 0; i < 8; i++) { v[i] = h[i]; v[i + 8] = b2b_iv[i]; }
+    v[12] ^= t; /* t0 (messages here are < 2^64 bytes, t1 = 0) */
+    if (last) v[14] = ~v[14];
+    for (int i = 0; i < 16; i++) m[i] = b2b_ld64(blk + 8 * i);
+    for (int r = 0; r < 12; r++) {
+        const uint8_t *s = b2b_sigma[r];
+        B2B_G(0, 4,  8, 12, m[s[0]],  m[s[1]]);  B2B_G(1, 5,  9, 13, m[s[2]],  m[s[3]]);
+        B2B_G(2, 6, 10, 14, m[s[4]],  m[s[5]]);  B2B_G(3, 7, 11, 15, m[s[6]],  m[s[7]]);
+        B2B_G(0, 5, 10, 15, m[s[8]],  m[s[9]]);  B2B_G(1, 6, 11, 12, m[s[10]], m[s[11]]);
+        B2B_G(2, 7,  8, 13, m[s[12]], m[s[13]]); B2B_G(3, 4,  9, 14, m[s[14]], m[s[15]]);
+    }
+    for (int i = 0; i < 8; i++) h[i] ^= v[i] ^ v[i + 8];
+}
+static void blake2b_16(const uint8_t *in, size_t n, uint8_t out[16]) {
+    uint64_t h[8];
+    for (int i = 0; i < 8; i++) h[i] = b2b_iv[i];
+    h[0] ^= 0x01010000ULL ^ (uint64_t)16; /* param block: digest 16, key 0, fanout 1, depth 1 */
+    uint8_t blk[128];
+    size_t off = 0;
+    while (n - off > 128) { b2b_compress(h, in + off, (uint64_t)(off + 128), 0); off += 128; }
+    size_t rem = n - off;
+    memset(blk, 0, 128); memcpy(blk, in + off, rem);
+    b2b_compress(h, blk, (uint64_t)n, 1);
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 8; j++) out[8 * i + j] = (uint8_t)(h[i] >> (8 * j));
+}
+/* key128(stem) exactly as hicache_arena.key128: lo/hi little-endian halves,
+ * lo in {0, ~0} mapped to 1 (those are the index's empty/tomb markers). */
+static void stem_key128(const char *stem, uint64_t *lo, uint64_t *hi) {
+    uint8_t d[16];
+    blake2b_16((const uint8_t *)stem, strlen(stem), d);
+    uint64_t l = b2b_ld64(d), h = b2b_ld64(d + 8);
+    if (l == 0 || l == ~0ULL) l = 1;
+    *lo = l; *hi = h;
+}
+void arena_key128(const char *stem, uint64_t *lo, uint64_t *hi) { stem_key128(stem, lo, hi); }
+/* find by STEM: hashing in C, one call for a whole prefix. */
+int64_t arena_find_stems(uint8_t *base, int64_t n, const char **stems, int64_t *slots, int8_t *states) {
+    int64_t found = 0;
+    for (int64_t i = 0; i < n; i++) {
+        uint64_t lo, hi;
+        stem_key128(stems[i], &lo, &hi);
+        int64_t s = find_slot(base, lo, hi);
+        slots[i] = s;
+        states[i] = s < 0 ? 0 : (int8_t)atomic_load(&slot_hdr(base, (uint64_t)s)->state);
+        if (s >= 0) found++;
+    }
+    return found;
+}
+
+int64_t arena_ref_slots(uint8_t *base, int64_t n, const int64_t *slots, int32_t delta) {
+    int64_t done = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (slots[i] < 0) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if (delta > 0) {
+            atomic_fetch_add(&sh->refcount, 1);
+            /* #1427: a writer's node references the slot from the claim on,
+             * before the page is COMPLETE -- CLAIMED slots take refs too. */
+            uint32_t st = atomic_load(&sh->state);
+            if (st != S_COMPLETE && st != S_CLAIMED) { atomic_fetch_sub(&sh->refcount, 1); continue; }
+            atomic_store(&sh->clock_bit, 1);
+        } else if (delta < 0) {
+            if (atomic_load(&sh->refcount) > 0) atomic_fetch_sub(&sh->refcount, 1); else continue;
+        }
+        done++;
+    }
+    return done;
+}
+/* #1424 Stufe 3: byte offset of slot 0's data from the mapping base, so a
+ * torch view can address every slot as base + data_off + slot * slot_bytes. */
+int64_t arena_data_offset(uint8_t *base) {
+    ArenaHeader *h = hdr(base);
+    int64_t o[6];
+    arena_layout((int64_t)h->slots, (int64_t)h->slot_bytes, o);
+    return o[4];
+}
 void arena_free_slots(uint8_t *base, int64_t n, const int64_t *slots) {
+    ArenaHeader *h = hdr(base);
     for (int64_t i = 0; i < n; i++) {
         SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        uint32_t prev = atomic_exchange(&sh->state, S_FREE);
+        /* xsn342: unlink the index cell (the evictor does; free did not),
+         * else the next claim of this key finds a stale cell and is handed
+         * a slot it does not own. */
+        if (prev != S_EVICTING && sh->key_lo != 0) {
+            _Atomic uint64_t *keys = index_keys(base);
+            _Atomic uint32_t *islots = index_slots(base);
+            uint64_t mask = h->index_cap - 1;
+            uint64_t j = mix64(sh->key_lo) & mask;
+            for (uint64_t m = 0; m < h->index_cap; m++, j = (j + 1) & mask) {
+                uint64_t k = atomic_load(&keys[j]);
+                if (k == 0) break;
+                if (k == sh->key_lo && atomic_load(&islots[j]) == (uint32_t)slots[i]) {
+                    atomic_store(&keys[j], TOMB);
+                    break;
+                }
+            }
+        }
         sh->key_lo = 0; sh->key_hi = 0;
-        atomic_store(&sh->state, S_FREE);
+        sh->generation++;  /* #1427: a late arena_complete on this slot is refused */
+        /* #1431: keep the occupancy counters exact (EVICTING was already
+         * taken out of n_complete by arena_evict_candidates). */
+        if (prev == S_COMPLETE) atomic_fetch_sub(&h->n_complete, 1);
+        else if (prev == S_CLAIMED) atomic_fetch_sub(&h->n_claimed, 1);
     }
 }
 
@@ -443,4 +729,153 @@ void arena_stats(uint8_t *base, int64_t *out) {
     out[1] = (int64_t)atomic_load(&h->n_complete);
     out[2] = (int64_t)atomic_load(&h->n_claimed);
     out[3] = (int64_t)h->slot_bytes;
+}
+
+/* ------------------------------------------------------------------------
+ * #1459: the shared L3 STEM INDEX -- "is this stem on the disk store?"
+ * answered from shared memory instead of a stat() per page.
+ *
+ * Boot weg2xsn214: group P's intake probe for a fresh 100k prompt stat'ed
+ * ~94k page files to learn that none exists (3 s per request, GPU idle).
+ * Every writer that commits a page file and every evictor that unlinks one
+ * updates this table, so a stem that is not here is NOT on disk.
+ *
+ * Layout: L3Hdr (64 B) | keys[2*cap] u64 (lo, hi) per entry; (0,0) = empty,
+ * (~0,~0) = tombstone.  Open addressing, linear probe, keyed by the same
+ * BLAKE2b-128 stem key as the arena.  Writers take a spinlock; readers are
+ * lock-free (a half-written entry reads as a transient miss, never a hit).
+ * ------------------------------------------------------------------------ */
+#define L3_MAGIC 0x4c334944585f5731ULL
+#define L3_HDR_BYTES 64
+typedef struct {
+    uint64_t magic;
+    uint64_t cap;              /* power of two */
+    _Atomic uint64_t count;    /* live entries */
+    _Atomic uint32_t lock;
+    uint32_t pad0;
+    uint64_t pad1[4];
+} L3Hdr;
+
+static inline _Atomic uint64_t *l3_keys(uint8_t *base) {
+    return (_Atomic uint64_t *)(base + L3_HDR_BYTES);
+}
+static inline void l3_lock(L3Hdr *h) { while (atomic_exchange(&h->lock, 1u)) { } }
+static inline void l3_unlock(L3Hdr *h) { atomic_store(&h->lock, 0u); }
+
+int64_t l3idx_layout(int64_t cap) {
+    if (cap < 1024 || (cap & (cap - 1))) return -1;
+    return (int64_t)L3_HDR_BYTES + 16 * cap;
+}
+
+int l3idx_init(uint8_t *base, int64_t cap) {
+    int64_t bytes = l3idx_layout(cap);
+    if (bytes < 0) return -1;
+    memset(base, 0, (size_t)bytes);
+    L3Hdr *h = (L3Hdr *)base;
+    h->cap = (uint64_t)cap;
+    atomic_store(&h->count, 0);
+    atomic_store(&h->lock, 0u);
+    atomic_thread_fence(memory_order_seq_cst);
+    h->magic = L3_MAGIC;
+    return 0;
+}
+
+int64_t l3idx_cap(uint8_t *base) {
+    L3Hdr *h = (L3Hdr *)base;
+    return h->magic == L3_MAGIC ? (int64_t)h->cap : -1;
+}
+
+int64_t l3idx_count(uint8_t *base) {
+    L3Hdr *h = (L3Hdr *)base;
+    return h->magic == L3_MAGIC ? (int64_t)atomic_load(&h->count) : -1;
+}
+
+/* returns: 1 inserted, 0 already present, -2 table full */
+static int l3_add_one(uint8_t *base, uint64_t lo, uint64_t hi) {
+    L3Hdr *h = (L3Hdr *)base;
+    _Atomic uint64_t *k = l3_keys(base);
+    uint64_t mask = h->cap - 1, i = lo & mask;
+    int64_t tomb = -1;
+    for (uint64_t n = 0; n < h->cap; n++, i = (i + 1) & mask) {
+        uint64_t elo = atomic_load(&k[2 * i]), ehi = atomic_load(&k[2 * i + 1]);
+        if (elo == 0 && ehi == 0) break;
+        if (elo == ~0ULL && ehi == ~0ULL) { if (tomb < 0) tomb = (int64_t)i; continue; }
+        if (elo == lo && ehi == hi) return 0;
+    }
+    if (atomic_load(&h->count) * 2 >= h->cap && tomb < 0) return -2;
+    uint64_t at = tomb >= 0 ? (uint64_t)tomb : i;
+    atomic_store(&k[2 * at + 1], hi);
+    atomic_store(&k[2 * at], lo);
+    atomic_fetch_add(&h->count, 1);
+    return 1;
+}
+
+int64_t l3idx_add_stems(uint8_t *base, int64_t n, const char **stems) {
+    L3Hdr *h = (L3Hdr *)base;
+    if (h->magic != L3_MAGIC) return -1;
+    int64_t added = 0, full = 0;
+    l3_lock(h);
+    for (int64_t j = 0; j < n; j++) {
+        uint64_t lo, hi; stem_key128(stems[j], &lo, &hi);
+        int r = l3_add_one(base, lo, hi);
+        if (r == 1) added++; else if (r == -2) full++;
+    }
+    l3_unlock(h);
+    return full ? -2 : added;
+}
+
+int64_t l3idx_del_stems(uint8_t *base, int64_t n, const char **stems) {
+    L3Hdr *h = (L3Hdr *)base;
+    if (h->magic != L3_MAGIC) return -1;
+    _Atomic uint64_t *k = l3_keys(base);
+    uint64_t mask = h->cap - 1;
+    int64_t removed = 0;
+    l3_lock(h);
+    for (int64_t j = 0; j < n; j++) {
+        uint64_t lo, hi; stem_key128(stems[j], &lo, &hi);
+        uint64_t i = lo & mask;
+        for (uint64_t m = 0; m < h->cap; m++, i = (i + 1) & mask) {
+            uint64_t elo = atomic_load(&k[2 * i]), ehi = atomic_load(&k[2 * i + 1]);
+            if (elo == 0 && ehi == 0) break;
+            if (elo == lo && ehi == hi) {
+                atomic_store(&k[2 * i], ~0ULL);
+                atomic_store(&k[2 * i + 1], ~0ULL);
+                atomic_fetch_sub(&h->count, 1);
+                removed++;
+                break;
+            }
+        }
+    }
+    l3_unlock(h);
+    return removed;
+}
+
+int64_t l3idx_has_stems(uint8_t *base, int64_t n, const char **stems, int8_t *out) {
+    L3Hdr *h = (L3Hdr *)base;
+    if (h->magic != L3_MAGIC) return -1;
+    _Atomic uint64_t *k = l3_keys(base);
+    uint64_t mask = h->cap - 1;
+    int64_t hits = 0;
+    for (int64_t j = 0; j < n; j++) {
+        uint64_t lo, hi; stem_key128(stems[j], &lo, &hi);
+        uint64_t i = lo & mask;
+        int8_t found = 0;
+        for (uint64_t m = 0; m < h->cap; m++, i = (i + 1) & mask) {
+            uint64_t elo = atomic_load(&k[2 * i]), ehi = atomic_load(&k[2 * i + 1]);
+            if (elo == 0 && ehi == 0) break;
+            if (elo == lo && ehi == hi) { found = 1; break; }
+        }
+        out[j] = found;
+        hits += found;
+    }
+    return hits;
+}
+
+void l3idx_clear(uint8_t *base) {
+    L3Hdr *h = (L3Hdr *)base;
+    if (h->magic != L3_MAGIC) return;
+    l3_lock(h);
+    memset(base + L3_HDR_BYTES, 0, (size_t)(16 * h->cap));
+    atomic_store(&h->count, 0);
+    l3_unlock(h);
 }

@@ -203,6 +203,22 @@ class _Intake:
     _clear_prefetch_deferral_for_reissue = _method("_clear_prefetch_deferral_for_reissue")
     _host_pool_available_size = _method("_host_pool_available_size")
     _host_pool_identity = _method("_host_pool_identity")
+    # #1436/#1440 added a progress witness to the retry path; this double does
+    # not model delivery, so the witness is a no-op here (sockel-red since).
+    # #1436/#1440 progress witness: the double models no delivery, so the
+    # witness is a no-op ("n/a") except where a test installs the #1317k
+    # stall stand-in (`_stall_witness`) on its own instance.
+    _weg2_note_prefetch_progress = lambda self, req: "n/a"  # noqa: E731
+    # the undeferrable exit asks whether a windowed store read is in flight;
+    # the double has none
+    _weg2_windowed_store_read_active = lambda self, *a, **k: False  # noqa: E731
+
+    def _stall_witness(self, req):
+        """#1317k stand-in (installed per test): every retry is a no-progress
+        pass; 'terminal' once the stall bound is reached."""
+        n = int(getattr(req, "_weg2_no_progress_passes", 0) or 0) + 1
+        req._weg2_no_progress_passes = n
+        return "terminal" if n >= self._weg2_prefetch_stall_passes() else "stalled"
 
     def __init__(
         self,
@@ -388,30 +404,35 @@ class TestTheNamedExits(_Clean):
         self.assertEqual(len(s.waiting_queue), 1, "it is queued, admissible, recompute-bound")
 
     def test_expiry_exits_by_name_and_admits_with_rate_expired(self):
-        # T24: the same bound #1065 uses: base + pages x per_page.
-        clock = [1000.0]
+        # #1317k: NO WALL CLOCK -- a rate mark expires after
+        # SGLANG_WEG2_PREFETCH_STALL_PASSES consecutive retries without
+        # progress (the double models no delivery, so every retry is one).
+        # Rewritten 2026-09-17 from the pre-#1317k bound_s form.
+        import types
         s = _Intake(lambda req: "declined:rate_limited")
+        # the pass-based law is installed on THIS instance only: binding the
+        # stall bound on the class switches the shortfall arm's tests, which
+        # still exercise the priced wall-clock bound, to the pass law too
+        s._weg2_prefetch_stall_passes = types.MethodType(Scheduler._weg2_prefetch_stall_passes, s)
+        s._weg2_note_prefetch_progress = s._stall_witness
         r = _Req("slow", seq=1)
-        bound = s._deferred_prefetch_bound_s(SPAN)
-        self.assertAlmostEqual(bound, 2.0 + SPAN * (1.0 / 1024), places=6)
-        with mock.patch.object(sched_mod.time, "monotonic", lambda: clock[0]):
+        with mock.patch.dict(os.environ, {"SGLANG_WEG2_PREFETCH_STALL_PASSES": "3"}):
+            self.assertEqual(s._weg2_prefetch_stall_passes(), 3)
             s._add_request_to_queue(r)
             self.assertEqual(r.prefetch_deferred, "rate_limited")
-            clock[0] += bound / 2
-            s._retry_deferred_prefetches()
-            self.assertEqual(r.prefetch_deferred, "rate_limited", "inside the bound: still held")
-            clock[0] += bound / 2 + 1.0
+            for _ in range(2):
+                s._retry_deferred_prefetches()
+                self.assertEqual(r.prefetch_deferred, "rate_limited", "inside the bound: still held")
             with self.assertLogs(LOG, level="WARNING") as caught:
                 s._retry_deferred_prefetches()
         self.assertIsNone(r.prefetch_deferred)
         self.assertFalse(s._admission_held_for_deferred_prefetch(r))
         self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_expired", 0), 1)
-        lines = [ln for ln in caught.output if "#1068 PREFETCH DEFER EXPIRED" in ln]
+        lines = [ln for ln in caught.output if "#1317k PREFETCH DEFER STALLED" in ln]
         self.assertEqual(len(lines), 1, caught.output)
         self.assertIn("rid=slow", lines[0])
-        self.assertIn("waited_s=", lines[0])
-        self.assertIn(f"bound_s={bound:.1f}", lines[0])
-        self.assertIn("attempts=3", lines[0])
+        self.assertIn("no_progress_passes=3 bound_passes=3", lines[0])
+        self.assertIn("reason=rate_stalled", lines[0])
 
     def test_the_counters_partition(self):
         # Every MARK has exactly one exit:
@@ -712,7 +733,12 @@ class TestFollowersMarkAndRetryButNeverHold(_Clean):
         occ = _Occupancy(limit=0)  # rate_limited until the budget is raised
         f = _Intake(occ, pp_size=3, pp_rank=1)
         r = _Req("w", seq=1)
-        with self.assertLogs(LOG, level="INFO") as caught:
+        # #1400: in the carrierless PP form with HiCache storage a follower is
+        # weg2_held on PP0's told verdict and never defers itself; this test
+        # exercises the follower DEFERRAL mechanism, which still serves every
+        # form without store-told, so that arm is disabled here (2026-09-17).
+        with mock.patch.object(sched_mod.weg2_store_told, "armed", lambda scheduler: False), \
+                self.assertLogs(LOG, level="INFO") as caught:
             f._add_request_to_queue(r)
         # the mark is set on the follower exactly as on PP0
         self.assertEqual(r.prefetch_deferred, "rate_limited")
@@ -751,6 +777,7 @@ class TestFollowersMarkAndRetryButNeverHold(_Clean):
         self.assertFalse(getattr(r, "_prefetch_landed_hold_once", False))
         self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_dropped", 0), 0, "nothing dropped by name")
 
+    @mock.patch.object(sched_mod.weg2_store_told, "armed", lambda scheduler: False)  # #1400 off: deferral mechanism under test
     def test_pp0_and_a_follower_land_the_same_sequence(self):
         # The rank-uniformity argument, as a test: the same wave through a
         # PP0 and a follower stand-in with the same (MIN-synced) capacity
@@ -1144,17 +1171,22 @@ class TestTheGroupShortfallDeferral(_Clean):
         self.assertEqual(getattr(r, "prefetch_deferred", None),
                          _DEFER_REASON_SHORTFALL)
         self.assertEqual(r.prefetch_defer_attempts, 2)
-        # age it past its own bound
-        r.prefetch_defer_since = time.monotonic() - (
-            s._deferred_prefetch_bound_s(SPAN) + 1.0
-        )
-        with self.assertLogs(LOG, level="WARNING") as caught:
+        # #1317k (rewritten 2026-09-17): NO WALL CLOCK -- the mark expires after
+        # SGLANG_WEG2_PREFETCH_STALL_PASSES retries without progress
+        import types
+        s._weg2_prefetch_stall_passes = types.MethodType(Scheduler._weg2_prefetch_stall_passes, s)
+        s._weg2_note_prefetch_progress = s._stall_witness
+        with mock.patch.dict(os.environ, {"SGLANG_WEG2_PREFETCH_STALL_PASSES": "2"}):
             s._retry_deferred_prefetches()
+            self.assertEqual(getattr(r, "prefetch_deferred", None), _DEFER_REASON_SHORTFALL)
+            with self.assertLogs(LOG, level="WARNING") as caught:
+                s._retry_deferred_prefetches()
         self.assertIsNone(getattr(r, "prefetch_deferred", None))
         self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_expired", 0), 1)
-        self.assertTrue(
-            [x for x in caught.output if "DEFER EXPIRED" in x], caught.output
-        )
+        lines = [x for x in caught.output if "#1317k PREFETCH DEFER STALLED" in x]
+        self.assertEqual(len(lines), 1, caught.output)
+        self.assertIn("arm=host_pool_shortfall", lines[0])
+        self.assertIn("no_progress_passes=2 bound_passes=2", lines[0])
 
     def test_a_retry_that_lands_whole_clears_the_mark(self):
         # The intended path end to end: deferred while the pool was busy,
@@ -1294,9 +1326,14 @@ class TheShortfallMarkSurvivesTheInFlightCutRead(CustomTestCase):
     def test_the_bound_still_ends_it(self):
         """A read that never lands cannot hold the queue: the SAME bound."""
         s, r = self._marked()
-        r.prefetch_defer_since = time.monotonic() - 10 * 3600.0
+        # #1317k (rewritten 2026-09-17): the SAME pass bound as the rate arm
+        import types
+        s._weg2_prefetch_stall_passes = types.MethodType(Scheduler._weg2_prefetch_stall_passes, s)
+        s._weg2_note_prefetch_progress = s._stall_witness
         s._verdict = lambda req: "declined:already_in_flight"
-        s._retry_deferred_prefetches()
+        with mock.patch.dict(os.environ, {"SGLANG_WEG2_PREFETCH_STALL_PASSES": "2"}):
+            s._retry_deferred_prefetches()
+            s._retry_deferred_prefetches()
         self.assertIsNone(getattr(r, "prefetch_deferred", None))
 
     def test_the_rank_local_hold_stands_down_where_the_group_speaks(self):

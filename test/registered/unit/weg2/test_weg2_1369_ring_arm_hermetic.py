@@ -516,7 +516,7 @@ class TestDangerDirectionIIResumeNeverReadsAGhostRing(unittest.TestCase):
         cls.core = _code(cls.core_raw)
         cls.malloc = _body(cls.core, "cudaError_t TorchMemorySaver::malloc(")
         cls.pause = _body(cls.core, "void TorchMemorySaver::pause(")
-        cls.resume = _body(cls.core, "void TorchMemorySaver::resume(")
+        cls.resume = _body(cls.core, "int TorchMemorySaver::resume(")  # xsn289: resume returns the CUresult
 
     def test_pause_and_resume_take_no_enable_cpu_backup_parameter(self):
         header = _read("core.h")

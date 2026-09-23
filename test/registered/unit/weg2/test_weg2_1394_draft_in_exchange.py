@@ -488,3 +488,16 @@ if __name__ == "__main__":
     import unittest
 
     unittest.main()
+
+
+def test_a_solo_draft_shadow_never_reloads_the_draft_from_disk(monkeypatch, armed):
+    """xsn391 (19.09.): the shadow's empty draft collect went on to the
+    disk-reload fallback, whose quantization gate refused (W4) -- for bytes
+    the shadow never held. A solo-draft shadow answers False before any gate."""
+    m = _manager(monkeypatch, group="D", rank=1,
+                main_model=_FakeModel([("model.layers.0.self_attn.q.weight", (16, 32))]),
+                draft_model=_FakeModel([("model.layers.0.mtp.fc.weight", (15, 8))]))
+    drafter = wu._weg2_drafter_of(m)
+    assert drafter is not None
+    drafter.is_draft_solo_shadow = True
+    assert m._weg2_xchg_draft_reload_from_disk() is False

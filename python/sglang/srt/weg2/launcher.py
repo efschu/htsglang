@@ -324,6 +324,55 @@ DC_MEASURED_D_XCHG_3080_MIB = DC_MEASURED_D_XCHG_MIB[0]
 DC_MEASURED_D_XCHG_5090_MIB = DC_MEASURED_D_XCHG_MIB[1]
 
 
+#: #1444: margin on top of a RECORDED residue.  The front measured group D's
+#: residue on this form at 1616-1686 MiB (5090) and 1256-1356 MiB (3080) across
+#: the flips of one boot (weg2xsn203), a 100 MiB spread; 256 covers it twice.
+#: The constant it replaces over-reserved 1300-1400 MiB per card, because it
+#: was read at boot weg2xsn14 when the weights_draft tag was still RESIDENT --
+#: the tag has travelled with the exchange since, and P's budget paid for
+#: bytes that are no longer there.
+DC_RECORD_MARGIN_MIB = 256
+#: ``=0`` prices the xsn14 constant again (the pre-#1444 form).
+DC_RECORD_ENV = "SGLANG_WEG2_DC_D_RECORD"
+
+
+def dc_residue_from_record(
+    rec: Optional[Dict[str, object]], cards: Sequence[Card], weight_source: str
+) -> Tuple[Optional[Dict[str, int]], str]:
+    """Group D's dormant residue per card from the PREVIOUS boot's record.
+
+    ``(per-uuid MiB incl. :data:`DC_RECORD_MARGIN_MIB`, provenance)`` when the
+    newest group-D dormant-image record carries a ``vram_residue_mib`` for
+    EVERY card of this boot and was measured under the SAME weight form;
+    ``(None, why)`` otherwise, and the caller prices the constant.  A record
+    from another form is not this form's residue (the whole reason the xsn14
+    constant went stale), so the form gate is exact, not fuzzy.
+    """
+    if os.environ.get(DC_RECORD_ENV, "1").strip() == "0":
+        return None, f"{DC_RECORD_ENV}=0 -> constant"
+    if not isinstance(rec, dict):
+        return None, "no group-D dormant-image record in the sidecar -> constant"
+    tag = str(rec.get("boot_tag", "?"))
+    form = str(rec.get("vram_residue_form", "") or "")
+    if form != str(weight_source):
+        return None, (f"record of boot {tag} measured form {form!r}, this boot is "
+                      f"{str(weight_source)!r} -> constant")
+    vals = rec.get("vram_residue_mib") or {}
+    if not isinstance(vals, dict):
+        return None, f"record of boot {tag} carries no vram_residue_mib -> constant"
+    out: Dict[str, int] = {}
+    parts = []
+    for c in cards:
+        v = vals.get(c.uuid)
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0:
+            return None, (f"record of boot {tag} carries no residue for card "
+                          f"{c.uuid} ({c.name}) -> constant")
+        out[c.uuid] = int(v) + DC_RECORD_MARGIN_MIB
+        parts.append(f"nvml{c.nvml_index} {c.name} {int(v)}+{DC_RECORD_MARGIN_MIB}={out[c.uuid]}")
+    return out, (f"boot {tag} at {rec.get('at', '?')} form {form!r}: "
+                 + ", ".join(parts) + " MiB")
+
+
 def dc_measured_d_mib(card: Card, weight_source: str) -> int:
     """Group D's MEASURED dormant residue for this card, on THIS form.
 
@@ -661,6 +710,112 @@ def p_draft_kv_flags(extra_d: Sequence[str]) -> Tuple[str, ...]:
 #: producer is the default.  ``off`` is the serving-base / A-B form and is
 #: never silent -- see :func:`draft_kv_off_line`.
 DRAFT_KV_ON_P_DEFAULT = "on"
+
+#: --spec-form (PLAN_DFLASH2_P_0917). THE SPECULATIVE FORM OF THE BOOT, ONE
+#: WRITER (the same MF-6 argument as SPEC_ALGORITHM above): argv_p, argv_d,
+#: d_plan_inputs and the D environment all read it here. ``NEXTN`` is the
+#: shipping form (the constants above, byte-identical); ``DFLASH`` puts the
+#: external DFlash2 draft on both groups -- P as the draft-KV producer
+#: (dflash_draft_kv_producer), D as the proposer with the compact draft
+#: cache and the window pool.
+SPEC_FORM_DEFAULT = "NEXTN"
+DFLASH_DRAFT_PATH_DEFAULT = (
+    "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued"
+)
+DFLASH_BLOCK_DEFAULT = 8
+DFLASH_WINDOW_DEFAULT = 2048
+_SPEC_FORM: Dict[str, object] = {
+    "form": SPEC_FORM_DEFAULT,
+    "draft_path": DFLASH_DRAFT_PATH_DEFAULT,
+    "block": DFLASH_BLOCK_DEFAULT,
+    "window": DFLASH_WINDOW_DEFAULT,
+}
+
+
+def apply_spec_form(ns) -> None:
+    """Install the CLI's speculative form once, before any argv is built."""
+    _SPEC_FORM["form"] = str(getattr(ns, "spec_form", SPEC_FORM_DEFAULT) or SPEC_FORM_DEFAULT).upper()
+    _SPEC_FORM["draft_path"] = str(getattr(ns, "dflash_draft_path", DFLASH_DRAFT_PATH_DEFAULT) or DFLASH_DRAFT_PATH_DEFAULT)
+    _SPEC_FORM["block"] = int(getattr(ns, "dflash_block", DFLASH_BLOCK_DEFAULT) or DFLASH_BLOCK_DEFAULT)
+    _SPEC_FORM["window"] = int(getattr(ns, "dflash_window", DFLASH_WINDOW_DEFAULT) or DFLASH_WINDOW_DEFAULT)
+    if _SPEC_FORM["form"] == "DFLASH" and not os.path.isdir(_SPEC_FORM["draft_path"]):
+        raise SystemExit(
+            f"--spec-form DFLASH: draft checkpoint {_SPEC_FORM['draft_path']} is not a directory"
+        )
+
+
+def spec_form_is_dflash() -> bool:
+    return str(_SPEC_FORM["form"]) == "DFLASH"
+
+
+def spec_flags(*, producer: bool) -> List[str]:
+    """The speculative flag family of one group. Under NEXTN this is the
+    constant family (P adds the producer silencer); under DFLASH the external
+    draft, byte-identical on P and D (they hash into the drafter identity),
+    D additionally with the compact draft cache window."""
+    if spec_form_is_dflash():
+        flags = [
+            "--speculative-algorithm", "DFLASH",
+            "--speculative-draft-model-path", str(_SPEC_FORM["draft_path"]),
+            "--speculative-num-draft-tokens", str(int(_SPEC_FORM["block"])),
+        ]
+        if producer:
+            flags.append("--speculative-draft-kv-only")
+        else:
+            flags += ["--speculative-draft-window-size", str(int(_SPEC_FORM["window"]))]
+            if dflash_placement() == "solo":
+                flags += ["--speculative-draft-placement", "solo"]
+        return flags
+    flags = [
+        "--speculative-algorithm", SPEC_ALGORITHM,
+        "--speculative-num-steps", str(SPEC_NUM_STEPS),
+        "--speculative-eagle-topk", str(SPEC_EAGLE_TOPK),
+        "--speculative-num-draft-tokens", str(SPEC_NUM_DRAFT_TOKENS),
+    ]
+    if producer:
+        flags.append("--speculative-draft-kv-only")
+    return flags
+
+
+#: 19.09. (xsn393, Punkt 5 D-Kapazitaet): the DFLASH draft on D runs SOLO by
+#: default -- the host rank holds it whole, the other ranks a meta shadow
+#: (measured: decode bs6 58 ms vs 61 ms replicated, KV 259k/193k/208k vs
+#: 290k/132k/141k tokens per rank, needle MATCH). `split` restores the
+#: replicated per-rank draft (A/B only).
+ENV_DFLASH_PLACEMENT = "SGLANG_WEG2_DFLASH_PLACEMENT"
+
+
+def dflash_placement() -> str:
+    # 19.09. (user order): D shards the draft across the TP ranks ("split",
+    # the server default); "solo" (draft whole on one rank, xsn393) is the A/B
+    # opt-in, never the standard -- a replicated or solo draft is refused on D.
+    v = (os.environ.get(ENV_DFLASH_PLACEMENT, "split") or "split").strip().lower()
+    return "solo" if v == "solo" else "split"
+
+
+def spec_form_env(group: str) -> Dict[str, str]:
+    """Environment the form needs on one group: D's window pool under DFLASH,
+    and (solo placement) the solo host's compact draft cache."""
+    if spec_form_is_dflash() and group == "D":
+        env = {"SGLANG_DFLASH_WINDOW_POOL": "1"}
+        if dflash_placement() == "solo":
+            env["SGLANG_DFLASH_SOLO_COMPACT"] = "1"
+        return env
+    return {}
+
+
+def spec_plan_fields() -> Dict[str, object]:
+    """The PlanInputs fields of the form (d_plan_inputs)."""
+    if spec_form_is_dflash():
+        return {
+            "speculative_algorithm": "DFLASH",
+            "speculative_num_draft_tokens": int(_SPEC_FORM["block"]),
+            "speculative_draft_model_path": str(_SPEC_FORM["draft_path"]),
+        }
+    return {
+        "speculative_algorithm": SPEC_ALGORITHM,
+        "speculative_num_draft_tokens": SPEC_NUM_DRAFT_TOKENS,
+    }
 
 
 def draft_kv_off_line() -> str:
@@ -2801,7 +2956,10 @@ def common_flags(
         "--enable-hierarchical-cache",
         "--hicache-host-role", "staging",
         "--hicache-size", str(s_gb),
-        "--hicache-mamba-host-mib", str(m_mib),
+        # #1430: the mamba anchor pool is a fallback id range too (Stufe 4b
+        # writes the states into the mamba arena); two slots, not 13. The
+        # ledger still prices M (conservative). Override: SGLANG_WEG2_MAMBA_ANCHOR_MIB.
+        "--hicache-mamba-host-mib", str(int(os.environ.get("SGLANG_WEG2_MAMBA_ANCHOR_MIB", "100") or m_mib)),
         "--hicache-write-policy", write_policy,
         "--hicache-storage-backend", "file",
         "--hicache-mem-layout", "layer_first",
@@ -3308,11 +3466,7 @@ def argv_d(
         # from d_tp_ratio_decision as --d-tp-objective, priced on the launch
         # line; the default is still 'auto' because the maxkv law makes
         # capacity the default objective, not because nothing was decided.
-        "--speculative-algorithm", SPEC_ALGORITHM,
-        "--speculative-num-steps", str(SPEC_NUM_STEPS),
-        "--speculative-eagle-topk", str(SPEC_EAGLE_TOPK),
-        "--speculative-num-draft-tokens", str(SPEC_NUM_DRAFT_TOKENS),
-    ] + list(token_vector_flags) + [
+    ] + spec_flags(producer=False) + list(token_vector_flags) + [
         # NO TOKEN VECTOR BY DEFAULT (#1032). What stood here was
         # `--uneven-token-vector 29,19,16 --uneven-token-vector-role seed`, the
         # emitted value of RETRACTED investigation #602. See
@@ -5118,6 +5272,14 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # The ring is allocated once and reused; 256 page buffers are a few MiB.
     # An operator value in the environment wins.
     env.setdefault("SGLANG_HICACHE_READ_BUFFERS", "256")
+    # Task #3 (17.09.): the arena re-admission probes 128 pages per call;
+    # 1024 cuts the call count 8x on the read path's critical section
+    # (xsn246: 2048 calls, find_ms=1037). An operator value wins.
+    env.setdefault("SGLANG_HICACHE_STORAGE_BATCH", "1024")
+    # Task #3: the arena -> device gather after a wake runs on an idle card;
+    # 16 blocks instead of the interference-tuned 2 (measured next boot,
+    # WEG2-LOAD-DEVICE). An operator value wins.
+    env.setdefault("SGLANG_HICACHE_ARENA_LOAD_BLOCK_QUOTA", "16")
     # #1402: the store read path is bounded by the GIL hand-off after every
     # syscall (see run_scheduler_process); 0.2 ms measured 1.07 ms/page vs
     # 20.6 ms/page at Python's 5 ms default beside a busy main thread.
@@ -5131,8 +5293,21 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # 16 GiB = 524k KV pages: three ~100k prefixes fit without eviction
     # (boot xsn153: three 80k prefixes overflowed 8 GiB, evictions dropped
     # pages other ranks had written, followers found "store_absent").
-    env.setdefault("SGLANG_HICACHE_ARENA_GIB", "16")
-    env.setdefault("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "128")  # #1410: 48 thrashed on 3x100k (xsn159)
+    # #1431 (xsn193): the park test's working set is 6 x 100k tokens x 32 KiB
+    # = 19.5 GiB and every page a live tree node references stays in the
+    # arena (the host copy IS the slot); 16 GiB ran full. 28 GiB = 917k
+    # slots at 28; 24 GiB = 786k slots is enough for the 600k and leaves the
+    # mamba arena its share: the ledger's last dry-run had 18.7 GiB of
+    # headroom (75.74 of 94.43 GiB) for both.
+    env.setdefault("SGLANG_HICACHE_ARENA_GIB", "22")  # #1432: 720k slots, fits the priced headroom with the mamba arena
+    # #1424 Stufe 3: the host tier IS the arena (rows = slots, reads in place);
+    # the per-rank pool shrinks to a 1 GB staging ring for the write side.
+    env.setdefault("SGLANG_HICACHE_ARENA_HOST", "1")
+    env.setdefault("SGLANG_HICACHE_ARENA_STAGING_GB", "0.05")  # #1430: fallback range only
+    # #1410: 48 thrashed on 3x100k (xsn159). #1431: one anchor state per 4096
+    # tokens x 6 x 100k = ~150 live blobs in the park test, 128 ran full;
+    # 192 x 46.76 MiB = 8.8 GiB (with 24 GiB KV: 32.8 GiB shm, fundable).
+    env.setdefault("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "140")  # #1432: 140 x 74.8 MiB = 10.2 GiB, priced; L3 return path covers the rest
     # write_back + bubble publisher (weg2_bubble_publish, 2026-09-16): the
     # publish sweep runs bounded in the PP loop's bubbles, nothing is left
     # for the flip's flush. "0" in the operator's environment disables it.
@@ -5283,6 +5458,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # the next boot confirms or corrects the value.
     env.setdefault("SGLANG_IDLE_BLOCKING_POLL", "1")
     env.setdefault("MALLOC_ARENA_MAX", "4")
+    env.update(spec_form_env(group))  # --spec-form: D's window pool under DFLASH
     return env
 
 
@@ -5512,7 +5688,18 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
     green, because the only caller sits behind two launched servers.  A gate
     nothing can reach is a gate nothing can pin.
     """
-    w11 = check_draft_resident(log_p)
+    # --spec-form DFLASH: the last stage's drafter is the EXTERNAL DFlash
+    # checkpoint, whole (TP1), priced off its headers -- the same term
+    # ring_table.checkpoint_stage_weights charges the stage with
+    # (external_drafter_mib_from_argv); the NEXTN constant is its own head.
+    _w11_budget = None
+    if spec_form_is_dflash():
+        from sglang.srt.speculative.dflash_pricing import dflash_draft_family_bytes
+
+        _w11_budget = float(
+            sum(dflash_draft_family_bytes(str(_SPEC_FORM["draft_path"])).values())
+        ) / float(1 << 20)
+    w11 = check_draft_resident(log_p, budget_mib=_w11_budget)
     log(f"W11 DRAFT-RESIDENT P last stage resident_mib={w11['resident_mib']} budget_mib={w11['budget_mib']:.1f} "
         f"tol_mib={w11['tol_mib']:.0f} over_mib={w11['over_mib']} resident_ok={w11['resident_ok']} "
         f"| W11b BUILD-ACCOUNTING nvml_delta_mib={w11['nvml_delta_mib']} = resident_mib + "
@@ -5978,7 +6165,8 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
                               # ALWAYS auto-derives through
                               # `xchg_bounce.resolve_cross_lanes` rather than
                               # becoming a second knob nobody asked for.
-                              band_credit: bool = False):
+                              band_credit: bool = False,
+                              price_lane_cap: int = 0):
     """``(charged_bytes, lines)`` for the host bounce. #1332 B1b.
 
     THE SECOND PRODUCER OF THE SAME PREDICATE AS
@@ -6030,7 +6218,8 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
         depth=int(bounce_depth), slot_bytes=slot_bytes, n_lanes=int(n_lanes),
         max_tag_bytes=xchg_max_tag_bytes(str(model_dir)),
         lanes_concurrent=int(lanes_concurrent),
-        band_credit=bool(band_credit))
+        band_credit=bool(band_credit),
+        price_lane_cap=int(price_lane_cap or 0))
     lines = [widest, xchg_bounce.arm_line(terms)]
     # PROVENANCE, ADDITIVE: the depth-slot is derived HERE, from this
     # checkpoint's census, and never from a knob -- but no line said so, and a
@@ -6167,6 +6356,7 @@ def choose_host_ledger(
     cgroup_root: str = "/sys/fs/cgroup",
     record_path: Optional[str] = None,
     pin_m_mib: int = 0,
+    pin_s_gb: int = 0,
     deviation_reason: str = "",
     riegel_gib: Optional[float] = None,
     model_digest_want: str = "",
@@ -6341,8 +6531,27 @@ def choose_host_ledger(
     # lane record from it refused the DEFAULT arm, which is the very boot that
     # would have produced the record the exchange arm needs. A producer that
     # locks out its own bootstrap is worse than the under-charge it fixes.
+    _price_cap = 0
     if xchg_bounce_arm_pins_host(weight_source, oncard_mode):
         _lane_n, _lane_prov = xchg_lane_count(stage_ratio, legs, d_vector)
+        # #1464b: REGION FORM -- the lane term is a coverage constant, not
+        # this cut's buffers.  xsn220 (32a8193805) shipped the solver's
+        # 43,11,10 and the ledger charged its WORST-CASE 9 lanes = 27.75 GiB
+        # -> run peak 103.00 GiB -> W97 at launch, for buffers the region
+        # form never allocates (see host_price_for_cut, #1464).  Charge every
+        # cut what the measured incumbent was charged (5 lanes -> 15.75 GiB,
+        # the term that has covered an unattributed ~10 GiB since xsn31), so
+        # the ledger's prediction does not move with the cut.  The count
+        # published to the ranks stays `_lane_n` (W102 compares counts).
+        if os.environ.get("SGLANG_WEG2_PCUT_LANE_PRICE", "") != "1":
+            _price_cap = region_form_lane_price_cap(d_vector, legs)
+            if _price_cap:
+                _lane_prov += (
+                    f" | #1464b REGION-FORM: lanes charged min(n_lanes={_lane_n}, "
+                    f"{_price_cap}) -- the incumbent {_csv(DEFAULT_PP_ORDERED_CUT)}'s "
+                    f"measured count as a coverage constant; no per-lane buffer "
+                    f"exists in this form (xsn218: 0 HOST-SLOT lines, shmem "
+                    f"+0.09 GiB per flip)")
     else:
         _lane_n = 1
         _lane_prov = (
@@ -6353,7 +6562,7 @@ def choose_host_ledger(
             f"says so; W102 is for an arm that WOULD allocate buffers.")
     _bounce_charge_bytes, _bounce_lines = xchg_bounce_terms_for_arm(
         weight_source, oncard_mode, model_dir, oncard_slot_mib, bounce_depth,
-        _lane_n, lanes_concurrent, band_credit)
+        _lane_n, lanes_concurrent, band_credit, price_lane_cap=_price_cap)
     _bounce_lines = list(_bounce_lines) + [_lane_prov]
     # #1361 [23a] THE PRICED STATE, NOT ONLY THE PRICE. B4n measured THREE
     # distinct states that all cost 2.16 GiB -- (depth=1, comparing=True),
@@ -6435,6 +6644,9 @@ def choose_host_ledger(
         weights_cpu_backup_armed,
     )
     ledger_kw = dict(
+        # #1451: no arena on a --weg2-disable-hicache boot -- the term charged
+        # 33.6 GiB there too (test_weg2_hicache_disabled_1386 M=2400 unfundable)
+        **(_weg2_arena_ledger_terms(model_dir) if (model_dir and not hicache_disabled) else {}),  # #1432
         # #1317n D's L2 IS PRICED SEPARATELY FROM P'S. It rides the ONE kwargs
         # block for exactly the reason the block exists (boot weg2sn6a died of
         # a price() call that had drifted from choose()'s keywords): a term
@@ -6565,19 +6777,19 @@ def choose_host_ledger(
         try:
             arm, reap_headroom_gib, lines = host_ledger.choose(
                 mi["MemTotal"], mi["MemAvailable"],
-                arms=[(1, int(pin_m_mib))], **ledger_kw,
+                arms=[(int(pin_s_gb) if pin_s_gb else 1, int(pin_m_mib))], **ledger_kw,
             )
         except host_ledger.Weg2HostLedgerRefused as e:
             raise host_ledger.Weg2HostLedgerRefused(
                 f"W87 Weg2PinnedArmRefused: --pin-ledger-arm-m {int(pin_m_mib)} "
-                f"was priced by the ladder itself (S=1 M={int(pin_m_mib)}) and "
+                f"was priced by the ladder itself (S={int(pin_s_gb) if pin_s_gb else 1} M={int(pin_m_mib)}) and "
                 f"is not fundable: {e}. A pin selects among arms the ledger "
                 "would fund; it is not a way past the ledger's verdict, and the "
                 "host-threshold law admits no accept-the-risk branch. Pin a "
                 "smaller M, or drop the pin and let choose() ladder."
             ) from e
         lines = list(lines) + [
-            f"WEG2-LEDGER ARM PINNED by --pin-ledger-arm-m: S=1 M={int(pin_m_mib)} "
+            f"WEG2-LEDGER ARM PINNED by --pin-ledger-arm-m/-s: S={int(pin_s_gb) if pin_s_gb else 1} M={int(pin_m_mib)} "
             f"launch={arm.launch_leftover_gib:.2f} GiB "
             f"run={arm.run_leftover_gib:.2f} GiB "
             f"run_peak={arm.predicted_run_peak_gib():.2f} GiB "
@@ -6683,6 +6895,69 @@ def sleep_group(port: int, log: Log, name: str, weights_tags: List[str]) -> floa
         raise Weg2LaunchRefused(f"sleep({name}) failed: HTTP {code} {body[:300]!r}")
     log(f"sleep({name}) OK in {dt:.0f} ms (tags {','.join(tags)}; flush BEFORE pause per record 1d MUST_FIX)")
     return dt
+
+
+def _weg2_arena_ledger_terms(model: str) -> dict:
+    """#1432: the L2 arena's host bytes and the REAL fallback pool sizes, for
+    the ledger. Sizes come from the same environment the child processes get
+    (SGLANG_HICACHE_ARENA_GIB / _MAMBA_SLOTS / _STAGING_GB, SGLANG_WEG2_MAMBA_
+    ANCHOR_MIB) and the same geometry the store derives: one KV slot per token
+    (all attention layers), one draft slot per KV slot (one layer cell), one
+    mamba slot per canonical GDN blob (hicache_migrate.qwen3_5_mamba_spec,
+    bf16 states -- 78,446,592 B on Qwen3.8-27B, checked against the arena
+    file). Empty dict when the arena host tier is off."""
+    import logging as _logging
+    if os.environ.get("SGLANG_HICACHE_ARENA_HOST", "1") != "1":
+        return {}
+    try:
+        cfg = _model_config(model)
+        text_cfg = cfg.get("text_config") or cfg
+        n_layers = int(text_cfg["num_hidden_layers"])
+        kinds = text_cfg.get("layer_types") or []
+        n_attn = sum(1 for k in kinds if str(k) == "full_attention")
+        n_lin = len(kinds) - n_attn
+        from sglang.srt.planner import pp_cut as _pp_cut
+        cell = int(_pp_cut.kv_mib_per_token_per_attn_layer_from_config(cfg, "fp8_e4m3", n_layers) * (1 << 20))
+        kv_page = cell * n_attn
+        kv_gib = float(os.environ.get("SGLANG_HICACHE_ARENA_GIB", "22") or 22)
+        kv_slots = max(1024, int(kv_gib * (1 << 30)) // max(1, kv_page))
+        from sglang.srt.mem_cache.hicache_migrate import qwen3_5_mamba_spec
+        blob = qwen3_5_mamba_spec(text_cfg, num_linear_layers=n_lin, units=1,
+                                  temporal_itemsize=2, conv_itemsize=2).total_bytes if n_lin else 0
+        mamba_slots = int(os.environ.get("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "140") or 140)
+        # xsn267 (17.09.): under --spec-form DFLASH the draft slot is the
+        # DFlash draft's own page -- draft_layers x (K+V) x draft kv heads x
+        # head_dim x kv itemsize (5 x 2 x 8 x 128 x 1 = 10240 B, the
+        # arena-10240.bin the boot actually created: 7.76 GiB) -- not one
+        # target attention cell (the NEXTN form's draft). Priced with the
+        # target cell the ledger was 7 GiB short and W98 latched at cushion
+        # 1.07 GiB (xsn267) with the lanes already released per leg.
+        draft_cell = cell
+        try:
+            if str(_SPEC_FORM.get("form") or "").upper() == "DFLASH":
+                _dp = str(_SPEC_FORM.get("draft_path") or "")
+                if _dp:
+                    _dc = json.load(open(os.path.join(_dp, "config.json")))
+                    _dc = _dc.get("text_config") or _dc
+                    _kv_item = 1 if "fp8" in "fp8_e4m3" else 2
+                    draft_cell = (int(_dc["num_hidden_layers"]) * 2
+                                  * int(_dc["num_key_value_heads"]) * int(_dc["head_dim"]) * _kv_item)
+        except Exception as _dexc:  # noqa: BLE001 -- unreadable draft config keeps the target cell
+            _logging.getLogger("weg2.launcher").info("WEG2-ARENA-LEDGER draft page not derived: %r", _dexc)
+        arena_bytes = kv_slots * kv_page + kv_slots * draft_cell + mamba_slots * blob
+        out = dict(
+            arena_gib=arena_bytes / (1 << 30),
+            staging_gb=float(os.environ.get("SGLANG_HICACHE_ARENA_STAGING_GB", "0.05") or 0.05),
+            anchor_mib=int(os.environ.get("SGLANG_WEG2_MAMBA_ANCHOR_MIB", "100") or 100),
+        )
+        _logging.getLogger("weg2.launcher").info(
+            "WEG2-ARENA-LEDGER kv=%d slots x %d B + draft %d x %d B + mamba %d x %d B = %.2f GiB "
+            "(term arena_gib); fallback pools staging=%s GB anchor=%s MiB",
+            kv_slots, kv_page, kv_slots, draft_cell, mamba_slots, blob, out["arena_gib"],
+            out["staging_gb"], out["anchor_mib"])
+        return out
+    except Exception as exc:  # noqa: BLE001 - a mispriced arena is refused, never guessed
+        raise Weg2LaunchRefused(f"W108 Weg2ArenaLedgerRefused: the arena term could not be derived: {exc!r}")
 
 
 def _model_config(model: str) -> dict:
@@ -7253,9 +7528,8 @@ def d_plan_inputs(model: str, tp_size: int, d_bs: int):
         tp_size=int(tp_size),
         model_path=model,
         kv_cache_dtype=KV_CACHE_DTYPE,
-        speculative_algorithm=SPEC_ALGORITHM,
-        speculative_num_draft_tokens=SPEC_NUM_DRAFT_TOKENS,
         max_running_requests=int(d_bs),
+        **spec_plan_fields(),
     )
 
 
@@ -9469,6 +9743,164 @@ P_SOLVER_OBJECTIVE_OF = {
 }
 
 
+#: #1447: how much more pinned host bounce a faster cut may cost than the
+#: incumbent (39,13,12), in GiB.  Default 0: the solver ships the fastest cut
+#: at or above the floor whose exchange bounce is no larger than the
+#: incumbent's -- boot weg2xsn204 shipped 40,12,12 under the cap-floor rule and
+#: the ledger refused it (W97, run peak 105 GiB) because that cut's bounce is
+#: priced at the WORST-CASE lane count (no boot has measured it).  An operator
+#: who has the host room grants it here, by number, and the ledger still has
+#: the last word.
+PCUT_BOUNCE_SLACK_ENV = "SGLANG_WEG2_PCUT_BOUNCE_SLACK_GIB"
+
+
+def region_form_lane_price_cap(d_vector: str = XCHG_D_VECTOR_DEFAULT,
+                               legs: str = "both") -> int:
+    """#1464b: the lane count the ledger charges in the REGION form for EVERY
+    cut -- the measured record of the ordered default cut (39,13,12 -> 5),
+    0 when that record does not exist (then nothing is capped and the old
+    per-cut count prices, as before)."""
+    rec = host_ledger.XCHG_LANES_BY_CUT.get(
+        host_ledger.xchg_cut_key(_csv(DEFAULT_PP_ORDERED_CUT), str(d_vector), str(legs)))
+    try:
+        return max(0, int((rec or {}).get("lanes", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def host_price_is_region_form(ns) -> bool:
+    """#1464: does this arm's exchange run its legs through the boot's
+    ``xchg.bin`` region (hook + semaphores) rather than the per-lane file
+    bounce?  True for every exchange+host arm: ``--weg2-xchg-inject`` has no
+    "off" choice, and both leg call sites pass ``hook=``/``sems=``.  Kept as
+    its own predicate so a future arm that really runs ``run_bounce_leg``
+    (no hook) can say so in ONE place; ``SGLANG_WEG2_PCUT_LANE_PRICE=1``
+    restores the lane price for the cut pick (measurement/diagnosis only).
+    """
+    if os.environ.get("SGLANG_WEG2_PCUT_LANE_PRICE", "") == "1":
+        return False
+    return xchg_bounce_arm_pins_host(
+        str(getattr(ns, "weg2_weight_source", WEIGHT_SOURCE_DEFAULT)),
+        str(getattr(ns, "weg2_xchg_oncard", ONCARD_MODE_DEFAULT)))
+
+
+def host_price_for_cut(ns, stage_ratio: str) -> Tuple[float, int, str]:
+    """``(xchg_bounce GiB, lanes, lane source)`` the ledger WOULD charge for
+    this cut -- the same chain ``choose_host_ledger`` prices (``xchg_lane_count``
+    -> ``xchg_bounce_terms_for_arm``), with the same argv-derived inputs, so
+    the solver and the ledger cannot disagree on a candidate's host cost.
+    ``(0.0, 1, "no exchange")`` on an arm that pins no host bounce."""
+    weight_source = str(getattr(ns, "weg2_weight_source", WEIGHT_SOURCE_DEFAULT))
+    oncard_mode = str(getattr(ns, "weg2_xchg_oncard", ONCARD_MODE_DEFAULT))
+    if not xchg_bounce_arm_pins_host(weight_source, oncard_mode):
+        return 0.0, 1, "no exchange"
+    legs = str(getattr(ns, "weg2_xchg_legs", "both") or "both")
+    lanes, prov = xchg_lane_count(stage_ratio, legs)
+    source = ("measured" if "source=measured" in prov
+              else "WORST-CASE" if "WORST-CASE" in prov else "n/a")
+    if host_price_is_region_form(ns):
+        # #1464: THE PER-LANE ASSEMBLE BUFFERS ARE NOT ALLOCATED IN THE
+        # REGION FORM, so they must not decide the cut.  Every production
+        # exchange boot arms `--weg2-xchg-inject` (choices: shadow |
+        # authoritative -- there is no "off"), and both leg call sites in
+        # weight_updater pass `hook=` + `sems=`, so `_weg2_xchg_bounce_leg`
+        # takes the BounceSlots/region branch and never reaches
+        # `run_bounce_leg` (the `LayerBounce` that creates
+        # bounce.bin.{c0,c1,p1,p2,p4} and emits WEG2-XCHG-HOST-SLOT).
+        # MEASURED, boot weg2xsn218 (0113846b61, 2026-09-17): 0 HOST-SLOT
+        # lines on P and D; /dev/shm/weg2-xchg-<epoch>/ holds xchg.bin
+        # (385 MiB apparent, 1 MiB resident) and a 3.3 KB bnc index; the
+        # host sampler read shmem +0.094 GiB across the D->P flip and
+        # +0.007 GiB across the P->D flip, anon +0.28 GiB.  The 15.75 GiB
+        # lane price (5 lanes x 3.00 GiB + 0.75 staging) was measured on
+        # weg2xsn28/31 (2026-09-13) in the FILE bounce form and kept the
+        # solver on 39,13,12 for every boot since: every unmeasured cut was
+        # charged the WORST-CASE 9 lanes = 27.75 GiB and refused.  Priced
+        # by the form that runs, every cut costs the same 385 MiB region,
+        # so the fastest frontier cut at/above the pool floor ships.
+        # NOT CHANGED HERE: the ledger's ARM term (choose_host_ledger ->
+        # xchg_bounce_terms_for_arm) still charges the lane price.  That
+        # is deliberate and named: xsn218's ledger predicted the run peak
+        # at 91.91 GiB and the sampler measured 85.86 GiB non-reclaimable;
+        # without the 15.75 the prediction would read 76.2 GiB, ~10 GiB
+        # UNDER the measurement.  The lane term currently covers an
+        # unattributed ~10 GiB, and dropping it before that is attributed
+        # would let arena_from_ledger grow the arena into the reap mark.
+        _region_gib = float(weight_exchange_region.REGION_BYTES) / host_ledger.GIB
+        return _region_gib, int(lanes), "region-form %s" % source
+    nbytes, _lines = xchg_bounce_terms_for_arm(
+        weight_source, oncard_mode, str(getattr(ns, "model", "")),
+        getattr(ns, "weg2_xchg_oncard_slot_mib", None),
+        int(getattr(ns, "xchg_bounce_depth", xchg_bounce.ASSEMBLE_DEPTH_DEFAULT)),
+        int(lanes),
+        int(xchg_bounce.resolve_lanes_concurrent(getattr(ns, "xchg_lanes_concurrent", None))),
+        bool(getattr(ns, "xchg_band_credit", False)))
+    return float(nbytes) / host_ledger.GIB, int(lanes), source
+
+
+def host_priced_pick(rows, price, incumbent_gib: float, slack_gib: float):
+    """#1447, pure: ``rows`` are frontier candidates FASTEST FIRST, already at
+    or above the pool floor; ``price(row) -> (gib, lanes, source)``.  Returns
+    ``(first fundable row or None, log lines)`` -- fundable = its bounce is
+    within ``incumbent_gib + slack_gib``.  Every row is priced and printed,
+    the ones the boot did not take included."""
+    picked = None
+    lines = []
+    for row in rows:
+        gib, lanes, source = price(row)
+        ok = float(gib) <= float(incumbent_gib) + float(slack_gib) + 1e-9
+        lines.append(
+            "PP-CUT HOST-PRICE cut=%s attn=%s makespan_ms=%.1f pool=%d xchg_bounce=%.2f GiB "
+            "lanes=%d (%s) vs incumbent %.2f + slack %.2f -> %s"
+            % (_csv(row.layers), _csv(row.attn), float(row.makespan_ms), int(row.pool_tokens),
+               float(gib), int(lanes), source, float(incumbent_gib), float(slack_gib),
+               "FUNDABLE" if ok else "over the host budget"))
+        if ok and picked is None:
+            picked = row
+    return picked, lines
+
+
+def _arm_run_peak_gib(arm) -> Optional[float]:
+    """The arm's priced run peak, or None when the arm cannot say."""
+    try:
+        v = arm.predicted_run_peak_gib()
+        return None if v is None else float(v)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fmt_gib(v: Optional[float]) -> str:
+    return "n/a" if v is None else f"{v:.2f}"
+
+
+#: #1453: the KV arena never shrinks below this (8 GiB = 262144 slots of 32 KiB,
+#: one 262k-token request), and the excess is rounded UP to the next 0.25 GiB.
+ARENA_FROM_LEDGER_FLOOR_GIB = 8.0
+
+
+def arena_from_ledger(cur_gib: float, run_peak_gib: Optional[float], riegel_gib,
+                      *, enabled: bool = True) -> Tuple[Optional[float], str]:
+    """``(new arena GiB or None, why)`` -- pure.  None means: leave it."""
+    if not enabled:
+        return None, "off (SGLANG_WEG2_ARENA_FROM_LEDGER=0 or hicache disabled); arena %.2f GiB stays" % cur_gib
+    if riegel_gib is None:
+        return None, "no --host-riegel-gib on this boot; arena %.2f GiB stays" % cur_gib
+    if run_peak_gib is None:
+        return None, "the arm carries no run peak; arena %.2f GiB stays" % cur_gib
+    over = float(run_peak_gib) - float(riegel_gib)
+    if over <= 0:
+        return None, ("run_peak %.2f <= riegel %.2f GiB (headroom %.2f); arena %.2f GiB stays"
+                      % (run_peak_gib, riegel_gib, -over, cur_gib))
+    give = math.ceil(over * 4) / 4
+    new = max(ARENA_FROM_LEDGER_FLOOR_GIB, float(cur_gib) - give)
+    if new >= float(cur_gib):
+        return None, ("run_peak %.2f is %.2f over the riegel %.2f but the arena is at its floor %.2f GiB"
+                      % (run_peak_gib, over, riegel_gib, cur_gib))
+    return new, ("run_peak %.2f GiB is %.2f over the riegel %.2f -> arena %.2f -> %.2f GiB "
+                 "(%d KV slots of 32 KiB), re-pricing"
+                 % (run_peak_gib, over, riegel_gib, cur_gib, new, int(new * (1 << 30) // 32768)))
+
+
 def pick_shipped_cut(decision, incumbent_layers, incumbent_attn, objective: str):
     """WHICH priced candidate group P ships, and why.  Pure.
 
@@ -10459,7 +10891,33 @@ def solve_p_cut(
     # say which floor it was measured against, and whether that floor was the
     # shipped default or something the operator typed, sends the reader to the
     # wrong flag.
-    pool_floor, pool_floor_from_cut, pool_floor_rule = resolve_pool_floor(ns.pp_solve_pool_floor)
+    _floor_flag = ns.pp_solve_pool_floor
+    # #1441b (xsn204): the cap-floor rule shipped 40,12,12 and the launch was
+    # refused at the ledger -- the exchange bounce term for that form is 27.75
+    # GiB against 15.75 for 39,13,12 (+12 GiB of pinned host lanes: the 8-layer
+    # tag windows fall differently across the stage boundaries), run peak
+    # 105 GiB over the 95.9 GiB watermark. The rule stays, opt-in
+    # (SGLANG_WEG2_PCUT_CAP_FLOOR=1), until the solver prices the exchange
+    # bounce of a candidate cut beside its makespan.
+    # #1447: the cap-floor rule is the DEFAULT again on the exchange arm, now
+    # that the solver prices each candidate's host bounce beside its makespan
+    # (host_priced_pick); SGLANG_WEG2_PCUT_CAP_FLOOR=0 turns it off.
+    _cap_floor_default = "1" if xchg_bounce_arm_pins_host(
+        str(getattr(ns, "weg2_weight_source", WEIGHT_SOURCE_DEFAULT)),
+        str(getattr(ns, "weg2_xchg_oncard", ONCARD_MODE_DEFAULT))) else "0"
+    if (_floor_flag is None and int(getattr(ns, "p_bs", DEFAULT_P_BS)) == 1
+            and os.environ.get("SGLANG_WEG2_PCUT_CAP_FLOOR", _cap_floor_default) == "1"):
+        # #1441 (user 16.09.): with ONE chunked prefill at a time on P (sglang's
+        # single chunked_req; --p-bs 1) the pool only has to hold the largest
+        # request plus one chunk, so the floor is the cap, not the ordered
+        # cut's pool -- 'immer das schnellste Layout, in das der Prefill
+        # reinpasst'. The ordered cut of 2026-09-09 stays the rule for p_bs > 1.
+        _cap = int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS)
+        _floor_flag = _cap + int(chunk_tokens)
+        log("PP-CUT POOL FLOOR RULE: source=cap+chunk (p_bs=1, user order 2026-09-16) floor=%d = "
+            "max_kv_per_request %d + chunk %d -- the solver ships the fastest cut at or above it"
+            % (_floor_flag, _cap, int(chunk_tokens)))
+    pool_floor, pool_floor_from_cut, pool_floor_rule = resolve_pool_floor(_floor_flag)
     log("PP-CUT POOL FLOOR RULE: " + pool_floor_rule)
     decision = _cut.solve_launch_cut(
         layer_families=families,
@@ -10590,6 +11048,41 @@ def solve_p_cut(
             P_PP_ATTN_STAGE_RATIO_SCORES,
             str(ns.pp_solve_objective),
         )
+        # #1447: on the exchange arm the makespan pick is re-read against the
+        # HOST cost of every frontier row at/above the floor, fastest first:
+        # the boot ships the first one whose pinned bounce fits the incumbent's
+        # plus the operator's slack.  The ledger keeps the last word.
+        if str(ns.pp_solve_objective) == "makespan" and xchg_bounce_arm_pins_host(
+                str(getattr(ns, "weg2_weight_source", WEIGHT_SOURCE_DEFAULT)),
+                str(getattr(ns, "weg2_xchg_oncard", ONCARD_MODE_DEFAULT))):
+            _floor = decision.pool_floor
+            _rows = [c for c in decision.frontier
+                     if _floor is None or float(c.pool_tokens) >= float(_floor)]
+            # the incumbent of the HOST price is the ordered default cut
+            # (39,13,12 -- the one measured lane set), not the scores' 32,18,14
+            _inc_cut = _csv(DEFAULT_PP_ORDERED_CUT)
+            _inc_gib, _inc_lanes, _inc_src = host_price_for_cut(ns, _inc_cut)
+            try:
+                _slack = float(os.environ.get(PCUT_BOUNCE_SLACK_ENV, "0") or 0.0)
+            except ValueError:
+                _slack = 0.0
+            log("PP-CUT HOST-PRICE incumbent %s: xchg_bounce=%.2f GiB lanes=%d (%s); slack %s=%.2f GiB; "
+                "%d frontier rows at/above the floor priced fastest first"
+                % (_inc_cut, _inc_gib, _inc_lanes, _inc_src,
+                   PCUT_BOUNCE_SLACK_ENV, _slack, len(_rows)))
+            _picked, _hp_lines = host_priced_pick(
+                _rows, lambda r: host_price_for_cut(ns, _csv(r.layers)), _inc_gib, _slack)
+            for _ln in _hp_lines:
+                log(_ln)
+            if _picked is None:
+                log("PP-CUT HOST-PRICE: NO frontier row at/above the floor is fundable within "
+                    "the incumbent's bounce + slack -- the makespan pick stays and the ledger decides")
+            elif _picked is not chosen:
+                chosen, ship_why = _picked, (
+                    "the fastest frontier cut at/above the floor whose exchange bounce fits the "
+                    "incumbent's + slack (#1447 host-priced; the makespan pick %s/%s costs more host)"
+                    % (_csv((decision.makespan or decision.chosen).layers),
+                       _csv((decision.makespan or decision.chosen).attn)))
     # ALL THREE ARMS PRICED ON EVERY BOOT, the shipped one named.  The two the
     # boot did NOT take are the whole reason this line exists: the makespan
     # default was paid for weeks because its alternative was never printed
@@ -10860,11 +11353,25 @@ def build_parser() -> argparse.ArgumentParser:
     # against the disk (max_size >= P pool bytes, W57). The two knobs below are
     # the only ones the disk form has, and both have a stated default.
     ap.add_argument(
+        "--pin-ledger-arm-s", type=int, default=1,
+        help="#1422 (boot xsn172): the pinned arm's host KV pool S (GB) for group P. "
+             "The ladder's S=1 gave PP0 a 54,254-token staging pool (cell 18,432 B), "
+             "so a re-queued 100k prompt could never be read back from the arena and "
+             "was recomputed on P (98k tokens, 29-57 s) with every page in L2. S=5 "
+             "holds 271k tokens on PP0 = the 262,144 cap plus one window. Back to 1 with "
+             "#1424 (Stufe 3): reads are arena slots, the pool is a 1 GB staging ring. 0 = S=1.")
+    ap.add_argument(
+        # #1451: default 600 (was 2400) -- the number every arm has pinned
+        # since the arena entered the ledger (#1432): with arena 33.6 GiB the
+        # 2400 rung is unfundable on this box (test_weg2_hicache_disabled_1386
+        # read it against the pinned quiet-box meminfo), 600 is what boots run.
         "--pin-ledger-arm-m", type=int, default=600,
         help="#1317/#1318: PIN the host-ledger arm's mamba-host-pool size M (MiB) "
-             "instead of letting `host_ledger.choose` pick it. 0 = choose. Default 600 "
-             "since 2026-09-15 (12-13 host anchor slots per rank; M=150 gave 4 and "
-             "dropped the next prefetch on xsn127). "
+             "instead of letting `host_ledger.choose` pick it. 0 = choose. Default 2400 "
+             "since 2026-09-16 (#1414, boot xsn163: at M=600 = 13 host anchor slots PP2 "
+             "answered PP0's told=4095 with 'anchor_pool_exhausted' during 3 x 100k and "
+             "the told mismatch stopped P; 600 gave 12-13 slots since 2026-09-15, M=150 "
+             "gave 4 and dropped the next prefetch on xsn127). "
              "WHY IT EXISTS: #1318 derived the host ring multipliers from rows x cell "
              "bytes (D 6.0 -> 3.00 GB/S, P 2.0 -> 1.78), which frees 3.12 GiB at every "
              "arm and moves `choose` from M=600 to M=1200 -- the arm boot weg2dk5 was "
@@ -11054,6 +11561,24 @@ def build_parser() -> argparse.ArgumentParser:
              "'off'), and the W10 drafter-identity / W11 draft-resident gates "
              "(which grade a producer that does not exist under 'off' and are "
              "SKIPPED with a named line rather than refusing the boot).")
+    ap.add_argument(
+        "--spec-form", choices=["NEXTN", "DFLASH"], default=SPEC_FORM_DEFAULT,
+        help="PLAN_DFLASH2_P_0917. The speculative form of BOTH groups. NEXTN "
+             "(default) is the shipping form: the checkpoint's mtp.* head, the "
+             "constants SPEC_* above. DFLASH puts the external DFlash2 draft on "
+             "both groups: P as the draft-KV producer (chunk ring, hash-keyed "
+             "direct publish into the draft arena), D as the proposer with the "
+             "compact draft cache (--dflash-window) and the window pool "
+             "(SGLANG_DFLASH_WINDOW_POOL=1 in D's environment). The draft's bytes "
+             "are priced off its own checkpoint headers (uneven_perf dflash_* "
+             "families) so the D budget carries them.")
+    ap.add_argument("--dflash-draft-path", default=DFLASH_DRAFT_PATH_DEFAULT,
+                    help="DFLASH draft checkpoint directory (both groups, byte-identical flag).")
+    ap.add_argument("--dflash-block", type=int, default=DFLASH_BLOCK_DEFAULT,
+                    help="DFLASH block size = --speculative-num-draft-tokens (8 for DFlash2).")
+    ap.add_argument("--dflash-window", type=int, default=DFLASH_WINDOW_DEFAULT,
+                    help="D's compact draft cache window = --speculative-draft-window-size "
+                         "(the draft's sliding_window, 2048 for DFlash2).")
     ap.add_argument(
         "--transport", choices=["bar1", "nccl"], default="bar1",
         help="Collective transport for BOTH groups. 'bar1' is the shipping "
@@ -12065,6 +12590,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # shape anyway) must never make a fast pre-spawn refusal look post-spawn.
     _ACTIVE_BOOT_STATE = None
     ns = build_parser().parse_args(argv)
+    apply_spec_form(ns)
     # #1386: THE SWITCH IS RESOLVED HERE, ONCE, AS EARLY AS `ns` EXISTS --
     # earlier than `draft_kv_on_p` below, because the FIRST `common_flags`
     # call (the sentinel `chunk_tokens` solve, several hundred lines down)
@@ -12351,10 +12877,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # B4h: THE ONE CONSUMER, form-switched through the one selector, so P's
     # per-card budget follows the arm automatically and no parallel reserve
     # object exists.
+    # #1444: the MEASURED residue of the previous boot on this form wins over
+    # the xsn14 constant; the constant is the fallback with a printed reason.
+    _dc_rec_d = host_ledger.read_measured_record(measured_record_path()).get("D")
+    _dc_from_record, _dc_record_prov = dc_residue_from_record(
+        _dc_rec_d, cards, ns.weg2_weight_source)
     dc_expect_d = {
-        c.uuid: dc_measured_d_mib(c, ns.weg2_weight_source) + slack_mib
+        c.uuid: (
+            _dc_from_record[c.uuid] if _dc_from_record is not None
+            else dc_measured_d_mib(c, ns.weg2_weight_source)
+        ) + slack_mib
         for c in cards
     }
+    log(f"#1444 DC-RESIDUE group=D source="
+        f"{'RECORD' if _dc_from_record is not None else 'CONSTANT'}: {_dc_record_prov}; "
+        f"reserve incl. {slack_mib} MiB slack = "
+        + ", ".join(f"nvml{c.nvml_index} {dc_expect_d[c.uuid]}" for c in cards) + " MiB")
     if ns.transport == "nccl":
         log(
             f"TRANSPORT=nccl (development mode, user order 2026-09-07): barlink flags dropped from both groups; "
@@ -12365,17 +12903,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     state.dc_expect_d = dc_expect_d
     _xchg_form = ns.weg2_weight_source == WEIGHT_SOURCE_EXCHANGE
-    log(("dormant residue RESERVE for group D = MEASURED D_c(D) of boot "
-         + (f"weg2xsn14 ({'/'.join(str(v) for v in DC_MEASURED_D_XCHG_MIB)} MiB, "
-            "the EXCHANGE form's own residue at epoch 0; its whole excess over "
-            "the serving form is the RESIDENT weights_draft tag -- see "
-            "DC_MEASURED_D_XCHG_MIB)"
-            if _xchg_form else
-            "weg2ls1b2 (2228 / 1922 / 1922 MiB, NVML per-process, windows included)"))
-        + f" + {slack_mib} MiB slack; spec 1.6 expectation was "
-        f"{DC_EXPECT_5090_MIB}/{DC_EXPECT_3080_MIB} (exceeded); "
-        f"form={ns.weg2_weight_source}; graded by W19 at D's first sleep: "
-        + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}" for c in cards))
+    if _dc_from_record is None:  # #1444: the constant's provenance only when it was priced
+        log(("dormant residue RESERVE for group D = MEASURED D_c(D) of boot "
+             + (f"weg2xsn14 ({'/'.join(str(v) for v in DC_MEASURED_D_XCHG_MIB)} MiB, "
+                "the EXCHANGE form's own residue at epoch 0; its whole excess over "
+                "the serving form is the RESIDENT weights_draft tag -- see "
+                "DC_MEASURED_D_XCHG_MIB)"
+                if _xchg_form else
+                "weg2ls1b2 (2228 / 1922 / 1922 MiB, NVML per-process, windows included)"))
+            + f" + {slack_mib} MiB slack; spec 1.6 expectation was "
+            f"{DC_EXPECT_5090_MIB}/{DC_EXPECT_3080_MIB} (exceeded); "
+            f"form={ns.weg2_weight_source}; graded by W19 at D's first sleep: "
+            + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}" for c in cards))
     if _xchg_form:
         # B4i: THE LINE, ON EVERY LAUNCH OF THIS FORM, DRY-RUN INCLUDED.
         #
@@ -13110,80 +13649,100 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # a passed one: it stays False, i.e. a legacy record stays refused.
     _rt = getattr(ring_plan, "table", None)
     _form_key_matches = bool(getattr(_rt, "form_same", None)) if _rt is not None else False
-    arm, reap_headroom_gib, lines, cg = choose_host_ledger(
-        ring_plan.host_weights_bytes,
-        ring_plan.host_weights_span1_bytes, ring_plan.provenance,
-        # #1390: NAMED, not left to choose_host_ledger's own literal
-        # defaults -- see MEMINFO_PATH/CGROUP_ROOT above for why a bare call
-        # would keep reading the real box even under a test's mock.
-        meminfo_path=MEMINFO_PATH, cgroup_root=CGROUP_ROOT,
-        pin_m_mib=int(getattr(ns, "pin_ledger_arm_m", 0) or 0),
-        # #1360: the operator's declaration, from argv and nowhere else.
-        deviation_reason=str(getattr(ns, "host_ledger_deviation", "") or ""),
-        riegel_gib=getattr(ns, "host_riegel_gib", None),
-        # #1378 Stage 2 (W105): the operator's citation of the PRIOR boot's
-        # own numbers, from argv and nowhere else -- same placement, same
-        # "None means unmeasured, not zero" rule as the deviation pair above.
-        prior_cushion_min_gib=getattr(ns, "prior_cushion_min_gib", None),
-        prior_bounce_gib=getattr(ns, "prior_bounce_gib", None),
-        # #1378 Stage 2: THIS boot's own form, in the EXACT shape
-        # `front.py._write_flip_ratchet` writes it in -- a different spelling
-        # here would auto-resolve nothing (silently, since form_key is a
-        # plain equality filter) rather than raise, so the two producers are
-        # kept to the one literal construction, not re-derived twice.
-        flip_ratchet_form_key=f"wtags={len(weights_tags)}",
-        # #1362 [22-fix]: content digest, snapshot-independent. `None` (an
-        # unreadable checkpoint) stays empty and the arm keeps the pre-#1362
-        # behaviour rather than refusing on a digest it could not compute.
-        model_digest_want=(host_ledger.checkpoint_digest(ns.model)[0] or ""),
-        # #1362 [22-fix2]: the ring solve already decided whether THIS boot's
-        # group-P form key matches the source boot's. A legacy record (no
-        # digest, written before #1362) is admitted only when it did -- the
-        # form key contains --model-path and excludes labels, so a match is
-        # evidence of the same checkpoint path. Read from the solve rather than
-        # recomputed: a second computation of the same predicate is the second
-        # bookkeeping this fork keeps paying for.
-        form_key_matches=_form_key_matches,
-        # #1358 [fix] THE CUT REACHES THE LEDGER. `choose_host_ledger` grew
-        # `stage_ratio` with a DEFAULT of "", and this -- its only caller --
-        # never passed it, so the lane record was looked up under
-        # 'pp=;d=tp3;legs=both' while the seed is 'pp=39,13,12;...'. W102 on
-        # every rung, rc=2, ARM=0: the producer locked out every boot.
-        #
-        # A DEFAULT PARAMETER IS THE SAME TRAP AS A POSITIONAL ONE, one step
-        # quieter: the positional shift crashed, this one silently looked up
-        # the wrong key. Desk tests passed `stage_ratio=` explicitly and were
-        # blind to it exactly as they were to the argv_p shift.
-        stage_ratio=str(stage_ratio or ""),
-        legs=str(getattr(ns, "weg2_xchg_legs", "both") or "both"),
-        # #1317n NO BOOT WITH S_D=S_P IN THE LEDGER. D carries 4 GB where P
-        # carries 1, which is +8.38 GiB of rings; an arm priced without it is
-        # optimistic by that much against a reap mark nobody may touch.
-        s_gb_d=s_gb_d, d_cap_terms=_l2_terms,
-        weight_source=ns.weg2_weight_source,
-        bounce_depth=int(getattr(ns, "xchg_bounce_depth",
-                                 xchg_bounce.ASSEMBLE_DEPTH_DEFAULT)),
-        # #1385 (Wand 11b): THE SAME RESOLVED VALUE the ranks' publication
-        # call above priced with -- resolved once, before either call, so the
-        # ledger and the ranks cannot disagree about the cap.
-        lanes_concurrent=int(_lanes_concurrent),
-        # #1397 (Option 3): the SAME resolved value the ranks' publication
-        # call above priced with -- resolved once, before either call, for
-        # the identical reason `lanes_concurrent` is.
-        band_credit=_band_credit,
-        # B4f: ring absence needs BOTH arms, and the inject mode is already in
-        # hand here -- `prepare_xchg_env` published it three statements above.
-        inject_mode=ns.weg2_xchg_inject,
-        oncard_mode=ns.weg2_xchg_oncard,
-        oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib,
-        # #1332 B1b: the checkpoint whose WIDEST layer sizes the host bounce.
-        model_dir=ns.model,
-        # #1386: the SAME local `main` resolved once, above, beside
-        # `draft_kv_on_p` -- never re-read from `ns` here.
-        hicache_disabled=hicache_disabled,
-        # #1369: the SAME local `main` resolved once, above, from the SAME
-        # predicate the shipped argvs read -- never re-read from `ns` here.
-        weights_cpu_backup_armed=weights_cpu_backup_armed)
+    def _price_host_ledger():
+        """#1453: the ONE ledger pricing, callable twice (see below)."""
+        return choose_host_ledger(
+            ring_plan.host_weights_bytes,
+            ring_plan.host_weights_span1_bytes, ring_plan.provenance,
+            # #1390: NAMED, not left to choose_host_ledger's own literal
+            # defaults -- see MEMINFO_PATH/CGROUP_ROOT above for why a bare call
+            # would keep reading the real box even under a test's mock.
+            meminfo_path=MEMINFO_PATH, cgroup_root=CGROUP_ROOT,
+            pin_m_mib=int(getattr(ns, "pin_ledger_arm_m", 0) or 0),
+            pin_s_gb=int(getattr(ns, "pin_ledger_arm_s", 0) or 0),
+            # #1360: the operator's declaration, from argv and nowhere else.
+            deviation_reason=str(getattr(ns, "host_ledger_deviation", "") or ""),
+            riegel_gib=getattr(ns, "host_riegel_gib", None),
+            # #1378 Stage 2 (W105): the operator's citation of the PRIOR boot's
+            # own numbers, from argv and nowhere else -- same placement, same
+            # "None means unmeasured, not zero" rule as the deviation pair above.
+            prior_cushion_min_gib=getattr(ns, "prior_cushion_min_gib", None),
+            prior_bounce_gib=getattr(ns, "prior_bounce_gib", None),
+            # #1378 Stage 2: THIS boot's own form, in the EXACT shape
+            # `front.py._write_flip_ratchet` writes it in -- a different spelling
+            # here would auto-resolve nothing (silently, since form_key is a
+            # plain equality filter) rather than raise, so the two producers are
+            # kept to the one literal construction, not re-derived twice.
+            flip_ratchet_form_key=f"wtags={len(weights_tags)}",
+            # #1362 [22-fix]: content digest, snapshot-independent. `None` (an
+            # unreadable checkpoint) stays empty and the arm keeps the pre-#1362
+            # behaviour rather than refusing on a digest it could not compute.
+            model_digest_want=(host_ledger.checkpoint_digest(ns.model)[0] or ""),
+            # #1362 [22-fix2]: the ring solve already decided whether THIS boot's
+            # group-P form key matches the source boot's. A legacy record (no
+            # digest, written before #1362) is admitted only when it did -- the
+            # form key contains --model-path and excludes labels, so a match is
+            # evidence of the same checkpoint path. Read from the solve rather than
+            # recomputed: a second computation of the same predicate is the second
+            # bookkeeping this fork keeps paying for.
+            form_key_matches=_form_key_matches,
+            # #1358 [fix] THE CUT REACHES THE LEDGER. `choose_host_ledger` grew
+            # `stage_ratio` with a DEFAULT of "", and this -- its only caller --
+            # never passed it, so the lane record was looked up under
+            # 'pp=;d=tp3;legs=both' while the seed is 'pp=39,13,12;...'. W102 on
+            # every rung, rc=2, ARM=0: the producer locked out every boot.
+            #
+            # A DEFAULT PARAMETER IS THE SAME TRAP AS A POSITIONAL ONE, one step
+            # quieter: the positional shift crashed, this one silently looked up
+            # the wrong key. Desk tests passed `stage_ratio=` explicitly and were
+            # blind to it exactly as they were to the argv_p shift.
+            stage_ratio=str(stage_ratio or ""),
+            legs=str(getattr(ns, "weg2_xchg_legs", "both") or "both"),
+            # #1317n NO BOOT WITH S_D=S_P IN THE LEDGER. D carries 4 GB where P
+            # carries 1, which is +8.38 GiB of rings; an arm priced without it is
+            # optimistic by that much against a reap mark nobody may touch.
+            s_gb_d=s_gb_d, d_cap_terms=_l2_terms,
+            weight_source=ns.weg2_weight_source,
+            bounce_depth=int(getattr(ns, "xchg_bounce_depth",
+                                     xchg_bounce.ASSEMBLE_DEPTH_DEFAULT)),
+            # #1385 (Wand 11b): THE SAME RESOLVED VALUE the ranks' publication
+            # call above priced with -- resolved once, before either call, so the
+            # ledger and the ranks cannot disagree about the cap.
+            lanes_concurrent=int(_lanes_concurrent),
+            # #1397 (Option 3): the SAME resolved value the ranks' publication
+            # call above priced with -- resolved once, before either call, for
+            # the identical reason `lanes_concurrent` is.
+            band_credit=_band_credit,
+            # B4f: ring absence needs BOTH arms, and the inject mode is already in
+            # hand here -- `prepare_xchg_env` published it three statements above.
+            inject_mode=ns.weg2_xchg_inject,
+            oncard_mode=ns.weg2_xchg_oncard,
+            oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib,
+            # #1332 B1b: the checkpoint whose WIDEST layer sizes the host bounce.
+            model_dir=ns.model,
+            # #1386: the SAME local `main` resolved once, above, beside
+            # `draft_kv_on_p` -- never re-read from `ns` here.
+            hicache_disabled=hicache_disabled,
+            # #1369: the SAME local `main` resolved once, above, from the SAME
+            # predicate the shipped argvs read -- never re-read from `ns` here.
+            weights_cpu_backup_armed=weights_cpu_backup_armed)
+
+    arm, reap_headroom_gib, lines, cg = _price_host_ledger()
+    # #1453 (user 16.09.: 'L2-Groesse aus Ledger-Spielraum'): the arena is the
+    # largest host term (33.6 GiB with draft+mamba); when the priced run peak
+    # sits ABOVE the riegel, the KV arena gives that excess back and the
+    # ledger prices once more -- the boot then funds itself without the
+    # --host-ledger-deviation it needed before (weg2xsn207: 93.15 vs 93.00).
+    _arena_new, _arena_why = arena_from_ledger(
+        float(os.environ.get("SGLANG_HICACHE_ARENA_GIB", "22") or 22),
+        _arm_run_peak_gib(arm), getattr(ns, "host_riegel_gib", None),
+        enabled=(os.environ.get("SGLANG_WEG2_ARENA_FROM_LEDGER", "1") == "1" and not hicache_disabled))
+    log("#1453 L2-ARENA FROM LEDGER: " + _arena_why)
+    if _arena_new is not None:
+        os.environ["SGLANG_HICACHE_ARENA_GIB"] = f"{_arena_new:g}"
+        arm, reap_headroom_gib, lines, cg = _price_host_ledger()
+        log("#1453 L2-ARENA FROM LEDGER: re-priced with arena %.2f GiB -> run_peak %s GiB"
+            % (_arena_new, _fmt_gib(_arm_run_peak_gib(arm))))
     state.cgroup = dict(cg)
     for ln in lines:
         log(ln)
@@ -13308,6 +13867,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
+    # #1465: group P's write-through copy kernels at high stream priority, so
+    # the backlog measured on weg2xsn219 (P running-req 2: 72 -> 103 un-backed
+    # nodes, 2.0-2.8 s flush drain at the flip) does not build behind a
+    # prefill that never idles.  P only; D keeps the default (decode graphs).
+    env_p.setdefault("SGLANG_HICACHE_WRITE_STREAM_PRIORITY", "-1")
     # TRAIN FIX 5: the chunk size the cut solver was given BEFORE the ring is
     # re-read here against the arm this boot actually chose.  The hoist above
     # rests on --chunked-prefill-size being a CONSTANT of common_flags rather
@@ -14149,6 +14713,7 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         # Told once, here, so --dry-run prints it too.
         "--vision", str(getattr(ns, "weg2_vision", VISION_OFF)),
         "--dc-reserve", ",".join(f"{c.uuid}={dc_expect_d.get(c.uuid, 0)}" for c in cards),
+        "--weight-form", str(ns.weg2_weight_source),  # #1444: stamps the record
         "--fairness-w-s", str(ns.fairness_w_s),
         "--weight-chunks", str(chunk_count),
     ] + (["--weights-resident"] if getattr(ns, "flip_weights", "family") == "resident" else []) + [

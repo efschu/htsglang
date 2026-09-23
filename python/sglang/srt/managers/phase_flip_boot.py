@@ -2307,7 +2307,12 @@ def _hybrid_pin_entries(*, tp_runner, sa, kv_host, inner_pool, tp_device_pool, l
             "collide with. Keeping the KV-only pin."
         )
         return None
-    mamba_host = MambaPoolHost(
+    from sglang.srt.mem_cache.pool_host.arena_pool import arena_host_enabled as _arena_on
+    if _arena_on():  # #1427 Stufe 4b
+        from sglang.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost as _MambaCls
+    else:
+        _MambaCls = MambaPoolHost
+    mamba_host = _MambaCls(
         mamba_pool,
         1.0,  # host_to_device_ratio: the fallback below the MiB knob
         0,  # host_size GB: 0 selects the ratio path below the MiB knob

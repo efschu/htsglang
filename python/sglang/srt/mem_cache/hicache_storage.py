@@ -30,7 +30,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Max pages per batched storage IO call.
-STORAGE_BATCH_SIZE = 128
+# Task #3 (17.09.): the per-call overhead of `_page_transfer`'s batches
+# (ctypes marshalling of the stems, one find_slots + ref_slots + resolve
+# per call) was 2048 calls for a 262k-page re-admission on xsn246. The
+# upstream default stays 128; the arena form raises it through the env
+# (SGLANG_HICACHE_STORAGE_BATCH). Termination still lands at a batch
+# boundary -- a larger batch is a coarser stop, never a wrong one.
+STORAGE_BATCH_SIZE = int(os.environ.get("SGLANG_HICACHE_STORAGE_BATCH", "128") or 128)
 
 
 def compute_model_identity_hash(
@@ -2504,9 +2510,71 @@ class HiCacheFile(HiCacheStorage):
             return False
         return False
 
+    def arena_fill_from_disk(self, arena, stems, total_bytes: int):
+        """#1433: the L3 -> L2 return path. For every stem that is NOT in the
+        arena but IS on disk: claim a slot, read the whole canonical page from
+        the disk store straight into the slot, complete it. Returns one entry
+        per stem: the slot (COMPLETE, no reference taken yet), or None when
+        the page is not on disk / could not be read / is being filled by
+        another writer right now (join later, it is a miss for this read).
+        Before #1433 the arena was a write-only sink towards the disk: a
+        page evicted to L3 was never read back, the prefix was recomputed."""
+        n = len(stems)
+        out = [None] * n
+        if n == 0:
+            return out
+        try:
+            on_disk = self._stat_stems(list(stems))
+        except Exception:  # noqa: BLE001 - no stat, no fill
+            return out
+        todo = []
+        for i, st in enumerate(stems):
+            if st not in on_disk:
+                continue
+            (slot, status, gen), = arena.claim_slots([st], [int(total_bytes)])
+            if status == 2:
+                out[i] = slot          # raced in by someone else: complete, usable
+            elif status == 0:
+                todo.append((i, slot, gen, st))
+            elif status == 4:
+                try:
+                    self._arena_evict_to_disk(arena, 256)
+                except Exception:  # noqa: BLE001
+                    pass
+                (slot, status, gen), = arena.claim_slots([st], [int(total_bytes)])
+                if status == 0:
+                    todo.append((i, slot, gen, st))
+                elif status == 2:
+                    out[i] = slot
+        if not todo:
+            return out
+        from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
+        pio = _load_pageio()
+        paths = [self._existing_path(st) for _, _, _, st in todo]
+        rc = pio.read_pages(paths, [int(total_bytes)] * len(todo), [((0, int(total_bytes)),)] * len(todo),
+                            [arena.slot_ptr(slot) for _, slot, _, _ in todo], True)
+        filled = 0
+        for (i, slot, gen, st), r in zip(todo, rc):
+            if r == 0:
+                cs = arena.complete_slots([slot], [gen], [(0, int(total_bytes))])
+                if cs and cs[0] in (1, 2):
+                    out[i] = slot
+                    filled += 1
+                    continue
+            arena.free_slots([slot])
+        k = getattr(self, "_1433_n", 0) + 1
+        self._1433_n = k
+        if k <= 8 or k % 256 == 0:
+            logger.info("#1433 L3->L2 fill: %d of %d pages read from disk into the arena (n=%d)", filled, len(todo), k)
+        return out
+
     def _arena_evict_to_disk(self, arena, want: int) -> int:
         """Move up to `want` complete, unreferenced, unpinned pages from the
         arena to the disk store (the cold tier), then free their slots."""
+        _en = getattr(type(self), "_evict_log_n", 0) + 1
+        type(self)._evict_log_n = _en
+        if _en <= 16 or _en % 64 == 0:
+            logger.info("ARENA-EVICT n=%d want=%d (arena clock: COMPLETE unreferenced slots go to disk and FREE -- xsn328)", _en, int(want))
         from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
         from sglang.srt.mem_cache.canonical_page_store import canonical_fsync_default
 
@@ -2576,11 +2644,48 @@ class HiCacheFile(HiCacheStorage):
             stems.pop((c[1], c[2]), None)
         return moved
 
+    def _l3_index(self):
+        """#1459: the shared L3 stem index beside the arena, opened once
+        (None without an arena dir, with the env off, or when the build
+        failed).  Handed to the evictor, which keeps it exact."""
+        idx = getattr(self, "_l3idx", None)
+        if idx is not None or getattr(self, "_l3idx_tried", False):
+            return idx
+        self._l3idx_tried = True
+        try:
+            adir = self._arena_dir()
+            if not adir:
+                return None
+            from sglang.srt.mem_cache.storage.file.l3_index import open_index
+            # #1459b (boot weg2xsn216): NOT inside the arena dir -- every file
+            # there is read as an arena of some slot size, and the index file
+            # made the host tiers rebind against a phantom pool (HICACHE-INDEX
+            # REFUSED on the first prefill).  A sibling dir instead.
+            _idir = adir.rstrip("/") + "-l3idx"
+            os.makedirs(_idir, exist_ok=True)
+            idx = open_index(os.path.join(_idir, "l3idx.bin"))
+            self._l3idx = idx
+            if idx is not None:
+                self._evictor.l3_index = idx
+                logger.info("#1459 L3-INDEX %s at %s (cap %d, entries %d)",
+                            "created" if idx.created else "joined", idx.path, idx.cap, idx.count())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("#1459 L3-INDEX n/a (%s: %s)", type(exc).__name__, exc)
+        return idx
+
     def _stat_stems(self, stems: List[str]) -> dict:
         """``{stem: size}`` for the stems that are on disk; one C call when
-        the #1402 helper is available, else ``_stat_stem`` each."""
+        the #1402 helper is available, else ``_stat_stem`` each.
+        #1459: the shared L3 index answers first -- only the stems it names
+        are stat'ed; a stem it does not know is not on disk."""
         if not stems:
             return {}
+        _idx = self._l3_index()
+        if _idx is not None:
+            _present = _idx.has(stems)
+            stems = [st for st, p in zip(stems, _present) if p]
+            if not stems:
+                return {}
         from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
 
         pio = _load_pageio()
@@ -2598,6 +2703,57 @@ class HiCacheFile(HiCacheStorage):
             sizes = pio.stat_sizes([self._flat_path(s) for s in rest])
             out.update({s: int(sz) for s, sz in zip(rest, sizes) if sz >= 0})
         return out
+
+    def _arena_kv_present_prefix(self, keys: List[str]) -> Optional[int]:
+        """#1439: how many LEADING KV pages are COMPLETE in the L2 arena, from
+        one C call; None when no arena / no canonical KV window (the caller
+        keeps the per-key path). The pages beyond the answer may still be on
+        the disk -- the caller checks that remainder the old way."""
+        _pn = getattr(type(self), "_1439_present_n", 0) + 1
+        type(self)._1439_present_n = _pn
+        if not keys or not self._arena_dir() or self._canonical_kv_extents is None:
+            if _pn <= 12 or _pn % 512 == 0:
+                logger.info("#1439 ARENA-PRESENT n=%d keys=%d -> None (arena_dir=%s kv_extents=%s)", _pn, len(keys),
+                            bool(self._arena_dir()), self._canonical_kv_extents is not None)
+            return None
+        arena = self._arena_for(int(self._canonical_kv_extents.total_bytes))
+        if arena is None:
+            if _pn <= 12 or _pn % 512 == 0:
+                logger.info("#1439 ARENA-PRESENT n=%d keys=%d -> None (no arena for total=%d)", _pn, len(keys),
+                            int(self._canonical_kv_extents.total_bytes))
+            return None
+        sfx = self._suffix_for_key(keys[0])[0]
+        stems = [k + sfx for k in keys]
+        n = 0
+        _states = arena.find_states(stems)
+        for st in _states:
+            if st != 2:
+                break
+            n += 1
+        if _pn <= 24 or _pn % 512 == 0:
+            # xsn327/328: the dormant hit query answers 0 while P completed the
+            # pages; xsn328 showed leading_complete=64 of 4314 -- name the state
+            # at the break and the state census over the asked range.
+            _hist = {}
+            for st in _states:
+                _hist[int(st)] = _hist.get(int(st), 0) + 1
+            _brk = int(_states[n]) if n < len(_states) else -1
+            _brk_stem = stems[n] if n < len(stems) else "-"
+            # xsn334: the keys equal P's (first_mismatch=None) and pages 64.. are
+            # still 'state 0' while dormant -- is the INDEX entry gone (slot -1)
+            # or the slot FREE (slot >= 0)? Plus the arena's own counters.
+            try:
+                _fs2, _st2 = arena.find_slots_np(stems[n:n + 2]) if n < len(stems) else ([], [])
+                _brk_slots = [(int(a), int(b)) for a, b in zip(list(_fs2), list(_st2))]
+            except Exception as exc:  # noqa: BLE001
+                _brk_slots = f"n/a:{type(exc).__name__}"
+            try:
+                _ast = arena.stats()
+            except Exception as exc:  # noqa: BLE001
+                _ast = f"n/a:{type(exc).__name__}"
+            logger.info("#1439 ARENA-PRESENT n=%d keys=%d leading_complete=%d break_state=%d break_stem=%s break_slots=%s stats=%s census=%s first_stem=%s arena=%s",
+                        _pn, len(keys), n, _brk, _brk_stem[:64], _brk_slots, _ast, sorted(_hist.items()), stems[0][:64], getattr(arena, "path", "?"))
+        return n
 
     def _readable_stems(self, stems: List[str]) -> List[str]:
         """The subset of ``stems`` a reader can serve (``_stem_readable``'s
@@ -2620,13 +2776,29 @@ class HiCacheFile(HiCacheStorage):
         rest = [s for s in stems if s not in in_arena]
         sizes = self._stat_stems(rest) if rest else {}
         out = [s for s in stems if s in in_arena]
+        _first_missing = None
         for stem in rest:
             size = sizes.get(stem)
             if size is None:
+                if _first_missing is None:
+                    _first_missing = (stem, "no-file")
                 continue
             total = self._canonical_total_for_stem(stem)
             if total is None or int(size) == int(total):
                 out.append(stem)
+            elif _first_missing is None:
+                _first_missing = (stem, f"partial size={size} total={total}")
+        if _first_missing is not None:
+            # #1472 READ-TRACE: what the reader could NOT serve, and why.  The
+            # short store reads on group D during the flip (weg2xsn229-231:
+            # delivered 4095 of 98210, 20+ s after P served the prompt) had no
+            # line naming the first unreadable page or the path that refused it.
+            _n = getattr(type(self), "_1472_n", 0) + 1
+            type(self)._1472_n = _n
+            if _n <= 40 or _n % 200 == 0:
+                logger.info("#1472 READ-TRACE n=%d asked=%d readable=%d arena_hits=%d first_missing=%s why=%s arena_dir=%s",
+                            _n, len(stems), len(out), len(in_arena), _first_missing[0][:48], _first_missing[1],
+                            bool(self._arena_dir()))
         return out
 
     def _canonical_total_for_stem(self, stem: str) -> Optional[int]:
@@ -2737,22 +2909,141 @@ class HiCacheFile(HiCacheStorage):
                     mismatch,
                 )
             return PoolTransferResult(0, {}, keys_asked=len(keys))
-        existing_files = self._collect_existing_component_keys(keys, pool_transfers)
+        # #1439 (xsn199 D profile): the presence probe of a 100k prompt was
+        # 27 % of D's re-admission -- 300k stems formatted, hashed and
+        # looked up one by one in Python. Now: the leading KV prefix that is
+        # COMPLETE in the arena comes from ONE C call (arena_find_stems, the
+        # hash in C too); only what the arena does not hold goes through the
+        # old per-key path, and the component pools are asked lazily for
+        # exactly the pages the trailing rule inspects.
+        kv_fast = self._arena_kv_present_prefix(keys)
+        if kv_fast is not None:
+            rest = keys[kv_fast:]
+            # #1473: LONGEST-PREFIX means STOP AT THE FIRST MISS.  The probe
+            # walked every remaining key through `_readable_stems` (Python per
+            # stem: canonical width, arena lookup, stat) before it took the
+            # prefix -- 94k stems for a fresh 100k prompt, ~1 s in the
+            # scheduler thread of PP0 at every request change (py-spy
+            # weg2xsn223: 150 of 3516 samples in _readable_stems/_stat_stems;
+            # #1466 PASS-STALL input_ms 400-1400).  Chunked in key order, the
+            # walk ends at the chunk holding the first miss: a new prompt costs
+            # one chunk.
+            kv_pages = kv_fast
+            _CH = 512
+            for _off in range(0, len(rest), _CH):
+                _chunk = rest[_off:_off + _CH]
+                existing_rest = self._collect_existing_component_keys(_chunk, None)
+                _hit = next(
+                    (i for i in range(len(_chunk))
+                     if f"{self._get_component_key(_chunk[i])}.bin" not in existing_rest),
+                    len(_chunk),
+                )
+                kv_pages += _hit
+                if _hit < len(_chunk):
+                    break
+            # #1439b (xsn200 D profile): the trailing rule walked prefix_len
+            # downwards asking has_component() per page -- for the mamba
+            # blob that is up to one chunk (4096) of single lookups per pool,
+            # 18 % of D's re-admission. One C call per pool over all kv_pages
+            # stems answers every page at once; the disk is asked only for a
+            # page the arena does not hold.
+            _bulk: dict = {}
+            _memo: dict = {}
 
-        def has_component(page_idx: int, name: str) -> bool:
-            return (
-                f"{self._get_component_key(keys[page_idx], name)}.bin" in existing_files
+            def _bulk_states(name: str):
+                if name in _bulk:
+                    return _bulk[name]
+                states = None
+                try:
+                    if kv_pages and self._arena_dir():
+                        k0 = keys[0] if name in (None, "__default__", PoolName.KV) else f"{keys[0]}.{name}"
+                        win = self._canonical_window(k0)
+                        arena = self._arena_for(int(win.total_bytes)) if win is not None else None
+                        if arena is not None:
+                            sfx = self._suffix_for_key(k0)[0]
+                            tail = "" if name in (None, "__default__", PoolName.KV) else f".{name}"
+                            stems = [f"{k}{tail}{sfx}" for k in keys[:kv_pages]]
+                            states = arena.find_states(stems)
+                except Exception:  # noqa: BLE001 - fall back to the per-page path
+                    states = None
+                _bulk[name] = states
+                return states
+
+            _l3bulk: dict = {}
+
+            def _bulk_l3(name: str):
+                """xsn362 (py-spy PP0, prefetch thread 517/1316 samples): the
+                trailing rule asked has_component per page, and every page the
+                arena does not hold went through _readable_stems([k]) -- a
+                lookup, a canonical-width derivation and an L3 stat, one page at
+                a time, ~4k times per pool for a fresh prompt. The shared L3
+                index answers all pages of a pool in ONE call; a stem it does
+                not list is on no disk, so the per-page path runs only for the
+                stems it names."""
+                if name in _l3bulk:
+                    return _l3bulk[name]
+                present = None
+                try:
+                    _idx = self._l3_index()
+                    if _idx is not None and kv_pages:
+                        stems = [self._get_component_key(k, name) for k in keys[:kv_pages]]
+                        present = _idx.has(stems)
+                except Exception:  # noqa: BLE001 - fall back to the per-page path
+                    present = None
+                _l3bulk[name] = present
+                return present
+
+            _rbulk: dict = {}
+            def _bulk_readable(name: str, states, l3):
+                """xsn381 (py-spy PP0, prefetch thread 320/1066 samples): every
+                page the arena did not hold COMPLETE but the L3 index listed
+                still went through _readable_stems([k]) one page at a time
+                (an arena lookup, a width derivation, a stat -- per page).
+                ONE batched call per pool for all such pages; the answer is a
+                set the per-page rule reads."""
+                if name in _rbulk:
+                    return _rbulk[name]
+                try:
+                    idx = [i for i in range(kv_pages)
+                           if not (states is not None and i < len(states) and states[i] == 2)
+                           and not (l3 is not None and i < len(l3) and not l3[i])]
+                    stems = [self._get_component_key(keys[i], name) for i in idx]
+                    present = set(self._readable_stems(stems)) if stems else set()
+                except Exception:  # noqa: BLE001 - fall back to the per-page path
+                    present = None
+                _rbulk[name] = present
+                return present
+            def has_component(page_idx: int, name: str) -> bool:
+                states = _bulk_states(name)
+                if states is not None and page_idx < len(states) and states[page_idx] == 2:
+                    return True
+                l3 = None
+                if states is not None and page_idx < len(states):
+                    l3 = _bulk_l3(name)
+                    if l3 is not None and page_idx < len(l3) and not l3[page_idx]:
+                        return False   # neither COMPLETE in the arena nor on any disk
+                k = self._get_component_key(keys[page_idx], name)
+                v = _memo.get(k)
+                if v is None:
+                    rb = _bulk_readable(name, states, l3)
+                    v = (k in rb) if rb is not None else bool(self._readable_stems([k]))
+                    _memo[k] = v
+                return v
+        else:
+            existing_files = self._collect_existing_component_keys(keys, pool_transfers)
+
+            def has_component(page_idx: int, name: str) -> bool:
+                return (
+                    f"{self._get_component_key(keys[page_idx], name)}.bin" in existing_files
+                )
+            kv_pages = next(
+                (
+                    i
+                    for i in range(len(keys))
+                    if f"{self._get_component_key(keys[i])}.bin" not in existing_files
+                ),
+                len(keys),
             )
-
-        # Longest contiguous KV prefix present in storage.
-        kv_pages = next(
-            (
-                i
-                for i in range(len(keys))
-                if f"{self._get_component_key(keys[i])}.bin" not in existing_files
-            ),
-            len(keys),
-        )
 
         hit_count: dict[str, int] = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
@@ -3000,10 +3291,38 @@ class HiCacheFile(HiCacheStorage):
                 results[transfer.name] = [False] * len(keys)
                 continue
 
-            results[transfer.name] = [
-                op_fn(transfer.name, key, host_pool, host_indices[i * page_size].item())
-                for i, key in enumerate(keys)
-            ]
+            # #1427 Stufe 4b: a pool that lives in the arena resolves COMPLETE
+            # blobs in place (slot id over the placeholder, no copy); only the
+            # keys it does not hold go through the per-key read.
+            pre = None
+            resolver = getattr(host_pool, "arena_resolve_reads", None)
+            # #1427e: `op_fn is self._read_page` was always False -- a bound
+            # method is a fresh object per attribute access -- so the resolver
+            # never ran on the metal (xsn190/191) and every read fell into the
+            # per-key copy. Compare by name.
+            is_read = getattr(op_fn, "__name__", "") == "_read_page"
+            if is_read and callable(resolver):
+                try:
+                    pre = resolver(self, host_indices, [self._log_key(transfer.name, k) for k in keys])
+                except Exception:  # noqa: BLE001 - fall back to the copy path
+                    logger.warning("#1427 arena resolve failed for %s", transfer.name, exc_info=True)
+                    pre = None
+            # #1427e: a placeholder or arena id is never a row the per-key copy
+            # can land in -- on the READ side that is a miss (False), on the
+            # write side the page is in the store already (True); the raise
+            # inside the storage thread took a rank down (xsn191).
+            _is_ph = getattr(host_pool, "is_placeholder", None)
+            _is_ar = getattr(host_pool, "is_arena_id", None)
+            def _one(i, key):
+                if pre is not None and pre[i] is not None:
+                    return pre[i]
+                idx = host_indices[i * page_size].item()
+                if callable(_is_ph) and _is_ph(idx):
+                    return not is_read
+                if callable(_is_ar) and _is_ar(idx):
+                    return not is_read
+                return op_fn(transfer.name, key, host_pool, idx)
+            results[transfer.name] = [_one(i, key) for i, key in enumerate(keys)]
         return results
 
     def batch_get_v2(
@@ -3075,6 +3394,9 @@ class HiCacheFile(HiCacheStorage):
         return self._evictor.check_free_space(force=force)
 
     def clear(self) -> bool:
+        _idx = self._l3_index()
+        if _idx is not None:
+            _idx.clear()  # #1459
         try:
             for dirpath, _dirnames, filenames in os.walk(self.file_path):
                 for filename in filenames:

@@ -72,7 +72,11 @@ LANE1_ODD = 0x9E3779B97F4A7C15 - (1 << 64)  # signed image of the golden ratio
 #: block in device memory for the index vector plus the product, so this is the
 #: knob that bounds the grader's own VRAM footprint during a flip -- when the
 #: card is at its tightest, which is exactly when the exchange runs.
-DEFAULT_CHUNK_BYTES = 4 << 20
+#: #1450: 16 MiB by default (was 4): the fold's cost on the host is the
+#: Python loop -- ~10 launches per block -- and 9.6 GiB/rank at 4 MiB is 2400
+#: blocks per reading; at 16 MiB it is 600.  The cached index pair grows to
+#: 2 x 16 MiB per device.  SGLANG_WEG2_SEAM_CHUNK_BYTES overrides.
+DEFAULT_CHUNK_BYTES = int(__import__("os").environ.get("SGLANG_WEG2_SEAM_CHUNK_BYTES", str(16 << 20)) or (16 << 20))
 
 
 def _torch():
@@ -170,6 +174,22 @@ def _s64(value: int) -> int:
 
 
 _IDX_CACHE: Dict[Tuple[str, int], Tuple[Any, Any]] = {}
+
+
+def release_index_cache() -> int:
+    """#1454: drop the cached index pairs -- called at the END of a reading.
+    Census of boot weg2xsn209 (D rank 0, allocator snapshot): the cache held
+    162 MiB of the 794 MiB untagged residue on the sleeping card (one pair
+    per distinct block length, 2 x 16 MiB each).  A reading rebuilds them in
+    a few launches; the card keeps nothing between readings.  Returns bytes."""
+    freed = 0
+    for i, ii in _IDX_CACHE.values():
+        try:
+            freed += int(i.numel() * i.element_size()) + int(ii.numel() * ii.element_size())
+        except Exception:  # noqa: BLE001
+            pass
+    _IDX_CACHE.clear()
+    return freed
 
 
 def _index_vectors(device, k: int):

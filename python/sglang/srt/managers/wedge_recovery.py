@@ -362,10 +362,42 @@ class WedgeRecoveryChannel:
             reason = "drain-raised"
         self.acked_reason = reason
         self.acked_at = time.monotonic()
+        # weg2xsn275 (18.09.): ON GROUP P THE WEDGE IS THE INTAKE STALL. The
+        # watchdog confirmed "N queued, 0 running, no first token for >= 20 s"
+        # and the relief ladder had nothing to actuate (xsn273/275: CLASS=
+        # UNCLEAR, NOT_APPLICABLE, 150 s later the boot was killed). Neither
+        # the adder's NO_TOKEN nor the seat gate was reached in that state, so
+        # the refusal hangs HERE, on the scheduler thread, off the one
+        # detector that demonstrably fires: the head of the waiting queue is
+        # answered 503 WEG2-INTAKE-STALL and the front requeues it and flips.
+        _weg2_intake_stall_from_wedge(scheduler, reason)
         # LAST, and deliberately so: the watchdog reads ``acked_seq`` as the
         # gate on the other two fields, so it must become visible after them.
         self.acked_seq = seq
         return RecoveryOutcome(_classify(reason), reason, seq, 0.0)
+
+
+def _weg2_intake_stall_from_wedge(scheduler: Any, reason: str) -> None:
+    """weg2xsn275: a confirmed admission wedge with requests waiting and
+    nothing running is, on Weg 2 group P, the intake stall (the parked,
+    prefilled backlog holds the pool until the flip). Hand the head of the
+    waiting queue to the scheduler's refusal (group-gated there); never
+    raises -- this runs on the scheduler thread."""
+    try:
+        observe = getattr(scheduler, "_weg2_intake_stall_observe", None)
+        queue = getattr(scheduler, "waiting_queue", None)
+        running = getattr(scheduler, "running_batch", None)
+        if observe is None or not queue:
+            return
+        if running is not None and not running.is_empty():
+            return
+        if getattr(scheduler, "chunked_req", None) is not None:
+            return
+        observe(queue[0], None,
+                note=f"gate=admission-wedge waiting={len(queue)} reason={str(reason)[:120]}",
+                immediate=True)
+    except Exception as e:  # noqa: BLE001 - must never take the loop down
+        logger.warning("[#800 WEDGE-RECOVERY] intake-stall hand-off raised: %s", e)
 
 
 def get_recovery_channel(scheduler: Any) -> Optional[WedgeRecoveryChannel]:

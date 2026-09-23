@@ -413,9 +413,14 @@ class TheDiscriminatorMustBeBoundedAndNameTheSlot(CustomTestCase):
     """
 
     def test_one_line_per_rid_and_station(self):
+        from unittest import mock
+
         from sglang.srt.mem_cache.allocator import mamba as mamba_alloc
 
-        with self.assertLogs(mamba_alloc.__name__, level="INFO") as captured:
+        # #1467: the trail is opt-in (its `.tolist()` synchronised the GPU in
+        # the scheduler thread); this test ARMS it.
+        with mock.patch.object(mamba_alloc, "_SLOT_TRAIL", True), \
+                self.assertLogs(mamba_alloc.__name__, level="INFO") as captured:
             for _ in range(5):
                 mamba_alloc.note_924d("alloc", rid="probe-A", slot=torch.tensor([7]))
             mamba_alloc.note_924d("free", rid="probe-A", slot=torch.tensor([7]))

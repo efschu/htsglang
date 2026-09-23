@@ -6,6 +6,8 @@ import os
 import sys
 import threading
 import time
+
+from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from array import array
 from collections import Counter, defaultdict
 from functools import partial
@@ -410,6 +412,18 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+def _weg2_release_drain_cap() -> int:
+    """Entries of the host-release queues drained per scheduling pass; 0 = all
+    (SGLANG_WEG2_RELEASE_DRAIN_CAP, default 0 = all -- xsn332/335)."""
+    try:
+        # xsn335: capped at 64, the host rows of the dormant phase stayed
+        # referenced, P claimed fresh arena slots and shmem rose into the W98
+        # host-rate latch -- default OFF until the drain is measured alone.
+        return max(0, int(os.environ.get("SGLANG_WEG2_RELEASE_DRAIN_CAP", "0")))
+    except ValueError:
+        return 0
 
 # #1233 zero-remainder: END-OF-PREFILL ANCHOR instrument, armed by the Weg-2
 # launcher on group P together with the schedule_policy split (same env).
@@ -1585,6 +1599,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
             if _WEG2_END_ANCHOR:
                 self._weg2_note_end_anchor(req, token_ids)
+            self._weg2_handoff_write(req, radix_key)
+            self._weg2_publish_at_retain(req, radix_key)
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
@@ -1763,6 +1779,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 insert_result=result,
                 insert_params=insert_params,
             )
+        self._weg2_publish_at_chunk(req, radix_key)   # xsn346: the chunk's node goes out now
 
     # ---- Internal Helpers ----
 
@@ -1981,6 +1998,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             key = key[prefix_len:]
             if len(key):
                 child_key = key.child_key(self.page_size)
+        if len(key) > 0 and node is not self.root_node and node.children:
+            # #1420 instrument (boot xsn172): D's walk for a 98k prompt stopped at
+            # the 4314-token split node with the prefetched chain hanging below
+            # -- name the child keys the node HAS and the one the walk WANTS.
+            n = getattr(UnifiedRadixCache, "_1420_n", 0) + 1
+            UnifiedRadixCache._1420_n = n
+            if n <= 24 or n % 256 == 0:
+                try:
+                    have = [str(k)[:60] for k in list(node.children.keys())[:4]]
+                    logger.warning(
+                        "#1420 WALK-STOP n=%d depth=%d remaining=%d want=%s have=%s "
+                        "bigram=%s node_evicted=%s node_backuped=%s",
+                        n, cum_tokens, len(key), str(child_key)[:60], have,
+                        getattr(key, "is_bigram", None), node.evicted, node.backuped,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
         census_emit(census, logger)
         if p_census is not None:
@@ -2514,6 +2548,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # it joins them rather than relying on six callers staying correct.
         if EvictLayer.DEVICE in target:
             cd = node.component_data[comp.component_type]
+            if comp.component_type == ComponentType.MAMBA and cd.value is not None:
+                try:  # #1469: a mamba value leaving the device before/after its backup
+                    from sglang.srt.mem_cache.unified_cache_components.mamba_component import _1469_note
+                    _1469_note("EVICT", node=node.id, backuped=getattr(node, "backuped", None),
+                               host=(cd.host_value is not None), lock_ref=cd.lock_ref)
+                except Exception:  # noqa: BLE001
+                    pass
             if cd.value is not None and cd.lock_ref > 0:
                 raise ValueError(
                     f"#904: refusing to free {comp.component_type.name} device "
@@ -2700,6 +2741,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 and self.cache_controller.write_policy == "write_back"
             ):
                 written = self.write_backup(node, write_back=True)
+                if written == 0 and self.ongoing_write_through:
+                    # #1426 (xsn184/185/186): upstream's write-back eviction is
+                    # SYNCHRONOUS -- the host has room because the acks that
+                    # free it are waited for. Here the 1 GB staging ring fills
+                    # with 13 in-flight pages and the peel gave up on the first
+                    # refusal, so the adder's evictable count was undeliverable
+                    # and the extend OOMed. Drain the in-flight writes (their
+                    # acks rebind the rows to arena slots and free the ring),
+                    # then try once more. A second zero is a real wall and is
+                    # reported by the caller's under-delivery check.
+                    self.writing_check(write_back=True)
+                    written = self.write_backup(node, write_back=True)
                 if written == 0:
                     return
                 self.writing_check(write_back=True)
@@ -2766,6 +2819,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     # ---- HiCache: Backup / LoadBack ----
 
+    def _1421_refused(self, why: str, node) -> None:
+        """#1421 instrument (boot xsn172): the publish sweep printed refused=34
+        with in_flight=2 for 90 s and the drain hit W3 -- write_backup said 0
+        silently. Name the branch, rate-limited."""
+        n = getattr(UnifiedRadixCache, "_1421_n", 0) + 1
+        UnifiedRadixCache._1421_n = n
+        # #1426: sampled PER REASON. xsn186 sampled 1/256 over the whole
+        # stream, the parent_unbacked chain lines took every sample and the
+        # innermost reason -- the one that actually refused -- never printed.
+        per = getattr(UnifiedRadixCache, "_1421_per_why", None)
+        if per is None:
+            per = UnifiedRadixCache._1421_per_why = {}
+        key = why.split(":", 1)[0]
+        k = per[key] = per.get(key, 0) + 1
+        if k <= 24 or k % 256 == 0:
+            try:
+                p = node.parent
+                logger.warning(
+                    "#1421 BACKUP-REFUSED n=%d why=%s node=%s tokens=%d evicted=%s backuped=%s "
+                    "parent=%s parent_evicted=%s parent_backuped=%s parent_is_root=%s pins=%s/%s",
+                    n, why, getattr(node, "id", "?"), len(getattr(node, "key", []) or []),
+                    node.evicted, node.backuped, getattr(p, "id", "?"),
+                    getattr(p, "evicted", None), getattr(p, "backuped", None),
+                    p is self.root_node, self._mamba_pins_held(), self._mamba_pin_budget,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
     def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
         """Backup a node's data from device to host (D->H)."""
         if self.cache_controller is None:
@@ -2784,6 +2865,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # not use nor strands a host allocation.
         if not self._mamba_write_through_pin_admissible(node, write_back=write_back):
             self._note_mamba_pin_skipped()
+            self._1421_refused("mamba_pin", node)
             return 0
 
         # Backup invariant (write-through): parent must be backuped first.
@@ -2800,6 +2882,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             and not node.parent.l3_present
         ):
             if self.write_backup(node.parent) <= 0:
+                self._1421_refused("parent_unbacked", node)
                 return 0
 
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
@@ -2873,15 +2956,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # With no floor (pools agree, single rank, no host tier) the eviction
         # retry runs exactly as before.
         kv_tokens = len(device_value)
-        host_avail = uniform_host_avail_for_backup(
+        # #1427 Stufe 4: with the arena bound, the host copy IS the arena
+        # slot -- claim one per page and DMA straight into it. No staging
+        # row, no ring, no store thread, no rebind. The mamba/draft aux
+        # pools still follow their own paths (extra_pools below).
+        _pre = self._weg2_direct_claim(node, comp_xfers)
+        if _pre is False:
+            return 0
+        host_avail = 0 if _pre is not None else uniform_host_avail_for_backup(
             self, self.cache_controller.mem_pool_host
         )
-        if host_avail < kv_tokens:
+        if _pre is None and host_avail < kv_tokens:
             if uniform_host_floor_active(self):
+                self._1421_refused("host_floor", node)
                 return 0
             needed = kv_tokens - host_avail
             evicted = self.evict_host(needed)
             if evicted < needed:
+                self._1421_refused(f"host_evict_short:{host_avail}+{evicted}<{kv_tokens}", node)
                 return 0
 
         # #810: the STAGING bound, taken BEFORE the allocation rather than
@@ -2891,26 +2983,38 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # exhausted tier costs today -- but it is COUNTED and it is reached
         # without the rank-local `evict_host` above. `None` under the default
         # role skips the gate entirely.
-        ring = self.staging_write_ring
+        ring = self.staging_write_ring if _pre is None else None
         if ring is not None and not ring.admit(node.id, kv_tokens):
+            self._1421_refused("staging_ring", node)
             return 0
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         host_indices = self.cache_controller.write(
-            device_value, node_id=node.id, extra_pools=aux_xfers or None
+            device_value, node_id=node.id, extra_pools=aux_xfers or None,
+            **({"host_indices": _pre} if _pre is not None else {}),
         )
         if host_indices is None:
+            if _pre is not None:
+                self._weg2_direct_abort(_pre, node)
             # #810: the write failed after the ring admitted it, so the page
             # never reaches the drain and its admission must not stay charged.
             if ring is not None:
                 ring.abort(node.id)
+            # #1426: this was the one SILENT zero in write_backup (xsn186:
+            # sweeps refused 8/8 for two minutes with the ring empty and no
+            # reason in the log). The controller names why it returned None.
+            self._1421_refused(
+                "write_none:%s" % getattr(self.cache_controller, "_weg2_last_write_refusal", "?"),
+                node,
+            )
             return 0
 
         # #645: charge the admission against the published floor, so the next
         # backup in THIS iteration decides against what is left rather than
         # against the iteration-start snapshot. No-op when no floor is active.
-        note_uniform_host_admitted(self, kv_tokens)
+        if _pre is None:
+            note_uniform_host_admitted(self, kv_tokens)
 
         # Commit
         kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
@@ -2938,6 +3042,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         lock_params: Optional[DecLockRefParams],
     ) -> None:
         node.write_through_pending_id = node.id
+        if "_1472_issued_at" not in self.__dict__:
+            self._1472_issued_at = {}
+        self._1472_issued_at[node.id] = time.perf_counter()  # #1472 WT-ACK latency
         self.ongoing_write_through[node.id] = _OngoingWriteThrough(
             node, lock_params, [node]
         )
@@ -2968,18 +3075,195 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         for node in new_nodes:
             node.write_through_pending_id = ack_id
+        if "_1472_issued_at" not in self.__dict__:
+            self._1472_issued_at = {}
+        self._1472_issued_at[ack_id] = time.perf_counter()  # #1472 WT-ACK latency
         self.ongoing_write_through[ack_id] = _OngoingWriteThrough(
             lock_node,
             lock_params,
             updated_nodes,
         )
 
+    # -- #1427 Stufe 4: direct writes ------------------------------------------
+    def _weg2_direct_pool(self):
+        cc = self.cache_controller
+        pool = getattr(cc, "mem_pool_host", None)
+        # #1427e (xsn191): bind FIRST, then look. The old order returned None
+        # on every rank that had not prefetched yet (PP1/PP2 never do: only
+        # PP0 reads the store), so those ranks kept writing through the
+        # staging ring and its 13 in-flight pages -- the very wall Stufe 4
+        # removes -- and PP2 OOMed on a full ring while PP0 wrote directly.
+        if not getattr(pool, "arena_read", False) or not hasattr(pool, "ensure_bound"):
+            return None
+        try:
+            if not pool.ensure_bound(cc.storage_backend, role="kv"):
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        if getattr(pool, "arena", None) is None:
+            return None
+        return pool
+
+    def _weg2_mamba_pool(self):
+        cc = self.cache_controller
+        group = getattr(cc, "mem_pool_host", None)
+        get_pool = getattr(group, "get_pool", None)
+        names = getattr(group, "entry_map", None) or {}
+        if get_pool is None or PoolName.MAMBA not in names:
+            return None
+        mp = get_pool(PoolName.MAMBA)
+        if not hasattr(mp, "arena_resolve_reads"):
+            return None
+        try:
+            if getattr(mp, "_weg2_parts", None) is None:  # #1427c: hand over at the point of use
+                mp._weg2_parts = getattr(cc, "_weg2_mamba_window_parts", None)
+            if not mp.ensure_bound(cc.storage_backend):
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        return mp
+
+    def _weg2_direct_claim(self, node, comp_xfers=None):
+        """None = not a direct-write pool (take the staging path); False =
+        refused (counted); a tensor = the arena rows to write into. The
+        mamba transfer of `comp_xfers` (if any) gets its arena slot here too."""
+        pool = self._weg2_direct_pool()
+        if pool is None:
+            # #1430: on an arena boot the staging path no longer exists for
+            # hashed pages -- an unbound pool refuses, named, and the next
+            # sweep retries once the pool is bound (it binds at init/rebind).
+            if getattr(getattr(self.cache_controller, "mem_pool_host", None), "arena_read", False):
+                self._1421_refused("arena_unbound", node)
+                return False
+            return None
+        hashes = getattr(node, "hash_value", None)
+        dv = node.component_data[BASE_COMPONENT_TYPE].value
+        if not hashes or dv is None or len(hashes) * int(self.page_size) != int(dv.numel()):
+            self._1421_refused("direct_no_hashes", node)
+            return False
+        pre = pool.alloc_write(hashes)
+        if pre is None:
+            self._1421_refused("arena_claim", node)
+            return False
+        mxfer = None
+        for xfers in (comp_xfers or {}).values():
+            for x in xfers:
+                if x.name == PoolName.MAMBA and x.host_indices is None and x.device_indices is not None:
+                    mxfer = x
+        if mxfer is not None:
+            mp = self._weg2_mamba_pool()
+            mrows = mp.alloc_write([hashes[-1]]) if mp is not None else None
+            if mrows is None:
+                pool.abort_write(pre)
+                _why = "mamba_claim" if mp is not None else "mamba_pool_unbound"
+                self._weg2_sweep_last_refusal = _why   # xsn342: the sweep stops on a full mamba arena
+                self._1421_refused(_why, node)
+                return False
+            mxfer.host_indices = mrows
+            pend = getattr(self, "_weg2_direct_mamba_rows", None)
+            if pend is None:
+                pend = self._weg2_direct_mamba_rows = {}
+            pend[node.id] = mrows
+        cc = self.cache_controller
+        dpool = getattr(cc, "mem_pool_host_draft", None)
+        if (dpool is not None and getattr(dpool, "arena_read", False)
+                and cc.draft_tier_armed("write")):
+            # #1427g (xsn192, PP2): the draft pool binds on its first READ
+            # (draft page get) -- P never reads draft pages, so the pool was
+            # unbound, the KV write carried arena ids, and the draft copy
+            # behind it indexed a 54k-row staging buffer with id 54k+slot.
+            # Bind it here, on the write side, and refuse if that fails.
+            try:
+                bound = dpool.ensure_bound(cc.storage_backend, role="draft")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("#1427g draft bind raised: %r", exc)
+                bound = False
+            if not bound or getattr(dpool, "row_slot", None) is None:
+                pool.abort_write(pre)
+                self._1421_refused("draft_unbound", node)
+                return False
+            try:
+                ok = dpool.alloc_write_draft(pre, hashes, cc._draft_component_name())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("#1427 draft claim raised: %r", exc)
+                ok = False
+            if not ok:
+                pool.abort_write(pre)
+                self._1421_refused("draft_claim", node)
+                return False
+        return pre
+
+    def _weg2_direct_abort(self, rows, node=None) -> None:
+        cc = self.cache_controller
+        pool = getattr(cc, "mem_pool_host", None)
+        dpool = getattr(cc, "mem_pool_host_draft", None)
+        if getattr(dpool, "row_slot", None) is not None:
+            dpool.abort_write(rows)
+        if pool is not None:
+            pool.abort_write(rows)
+        if node is not None:
+            mrows = (getattr(self, "_weg2_direct_mamba_rows", None) or {}).pop(node.id, None)
+            mp = self._weg2_mamba_pool() if mrows is not None else None
+            if mp is not None:
+                mp.abort_write(mrows)
+
+    def _weg2_direct_complete(self, node) -> bool:
+        """Ack of a direct write: this rank's extents are in the slot. Merge
+        the coverage (COMPLETE when every rank is in), take the reader
+        reference, and mark the node store-present -- the sweep has nothing
+        left to publish for it."""
+        cc = self.cache_controller
+        pool = getattr(cc, "mem_pool_host", None)
+        if getattr(pool, "arena", None) is None:
+            return False
+        hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+        if hv is None or hv.numel() == 0 or int(hv.min()) < pool.staging_rows:
+            return False
+        done = pool.complete_write(hv)
+        dpool = getattr(cc, "mem_pool_host_draft", None)
+        if getattr(dpool, "row_slot", None) is not None:
+            try:
+                dpool.complete_write(hv)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("#1427 draft complete raised: %r", exc)
+        (getattr(self, "_weg2_direct_mamba_rows", None) or {}).pop(node.id, None)
+        mp = self._weg2_mamba_pool()
+        if mp is not None and len(node.component_data) > int(ComponentType.MAMBA):
+            mhv = node.component_data[ComponentType.MAMBA].host_value
+            if mhv is not None and mhv.numel() and mp.is_arena_id(int(mhv.min())):
+                try:
+                    mp.complete_write(mhv)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("#1427 mamba complete raised: %r", exc)
+        node.l3_present = True
+        n = getattr(self, "_1427_direct_n", 0) + 1
+        self._1427_direct_n = n
+        if n <= 8 or n % 256 == 0:
+            logger.info("#1427 DIRECT-WRITE ACK node=%s pages=%d completed_for_all=%d (n=%d)",
+                        getattr(node, "id", "?"), int(hv.numel()), done, n)
+        return True
+
+    _1472_issued_at: dict = {}
+
     def _finish_write_through_ack(self, ack_id: int) -> None:
         lock_node, lock_params, publish_nodes = self.ongoing_write_through.pop(ack_id)
+        try:  # #1472 WT-ACK: how long a write-through took from issue to ack (P side)
+            _t_iss = self._1472_issued_at.pop(ack_id, None)
+            _k = getattr(type(self), "_1472_ack_n", 0) + 1
+            type(self)._1472_ack_n = _k
+            if _t_iss is not None and (_k <= 40 or _k % 200 == 0):
+                logger.info("#1472 WT-ACK n=%d ack_id=%s nodes=%d latency_ms=%.0f still_in_flight=%d",
+                            _k, ack_id, len(publish_nodes), (time.perf_counter() - _t_iss) * 1000.0,
+                            len(self.ongoing_write_through))
+        except Exception:  # noqa: BLE001
+            pass
+        direct = set()
         for node in publish_nodes:
             if node.write_through_pending_id == ack_id:
                 node.write_through_pending_id = None
             self._record_store_event(node, medium=StorageMedium.CPU)
+            if self._weg2_direct_complete(node):
+                direct.add(id(node))
         if lock_params is not None:
             self.dec_lock_ref(lock_node, lock_params)
         # #810: end of the ADMITTED phase. The device->host copy has landed, so
@@ -2994,7 +3278,116 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # Back up each fragment: after a split, lock_node only holds the
             # suffix; the prefix fragment must be persisted as well.
             for node in publish_nodes:
-                self.write_backup_storage(node)
+                if id(node) not in direct:  # #1427: a direct write is in the store already
+                    self.write_backup_storage(node)
+
+    def _weg2_publish_at_retain(self, req, radix_key=None) -> None:
+        """xsn338: publish the finished request's (and every other unbacked)
+        node NOW -- parents first, bounded, the sweep's own pin budget -- instead
+        of waiting for a PP bubble or the sleep flush (weg2.retain_publish)."""
+        try:
+            from sglang.srt.weg2 import retain_publish as _rp
+            if not _rp.publish_at_retain_on() or not self.enable_storage:
+                return
+            _t0 = time.perf_counter()
+            # xsn344: the finished request's OWN chain first (parents first),
+            # then the rest -- with a budget the BFS from the root spent it on
+            # older nodes and D's dormant read of this request found half.
+            first = self._weg2_chain_nodes(radix_key) if radix_key is not None else []
+            stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue(),
+                                                clock=_rp.SweepClock(_rp.budget_s()),
+                                                first=first) or {}
+            stats["chain"] = len(first)
+            n = getattr(self, "_weg2_retain_publish_n", 0) + 1
+            self._weg2_retain_publish_n = n
+            if n <= 16 or n % 64 == 0:
+                logger.info("WEG2 RETAIN-PUBLISH rid=%s %s ms=%.0f (n=%d)", str(getattr(req, "rid", "?"))[:12],
+                            stats, (time.perf_counter() - _t0) * 1000.0, n)
+        except Exception as exc:  # noqa: BLE001 -- a publisher never takes the retain down
+            logger.warning("WEG2 RETAIN-PUBLISH raised %s: %s", type(exc).__name__, exc)
+
+    def _weg2_chain_from(self, node) -> list:
+        """The nodes from `node` up to (excluding) the root, ROOT FIRST."""
+        chain = []
+        try:
+            while node is not None and node is not self.root_node:
+                chain.append(node)
+                node = node.parent
+        except Exception:  # noqa: BLE001
+            return []
+        chain.reverse()
+        return chain
+
+    def _weg2_chain_nodes(self, radix_key) -> list:
+        """The tree nodes of `radix_key`'s matched path, ROOT FIRST (a parent
+        publishes before its child: write_backup refuses 'parent_unbacked')."""
+        try:
+            mr = self.match_prefix(MatchPrefixParams(key=radix_key))
+            node = getattr(mr, "last_device_node", None) or getattr(mr, "last_host_node", None)
+            chain = []
+            while node is not None and node is not self.root_node:
+                chain.append(node)
+                node = node.parent
+            chain.reverse()
+            return chain
+        except Exception:  # noqa: BLE001 - an accelerator, never a wall
+            return []
+
+    def _weg2_publish_at_chunk(self, req, radix_key) -> None:
+        """xsn346: publish the request's chain (this chunk's node last, its
+        parents first) while the request still prefills -- a small budget per
+        chunk, so the retain finds one node left and D's dormant read of the
+        LAST request of a phase is complete before the flip begins."""
+        try:
+            from sglang.srt.weg2 import retain_publish as _rp
+            if not _rp.publish_at_chunk_on() or not self.enable_storage:
+                return
+            # xsn348: the chain from the request's own last node (a parent walk),
+            # not a match_prefix over the 98k key per chunk (CHUNK-PUBLISH 114 ms
+            # with one node issued; the retain's single-node issue is ~45 ms).
+            first = self._weg2_chain_from(getattr(req, "last_node", None))
+            if not first:
+                return
+            stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue(),
+                                                clock=_rp.SweepClock(_rp.chunk_budget_s()),
+                                                first=first, chain_only=True) or {}
+            n = getattr(self, "_weg2_chunk_publish_n", 0) + 1
+            self._weg2_chunk_publish_n = n
+            if n <= 16 or n % 256 == 0:
+                logger.info("WEG2 CHUNK-PUBLISH rid=%s chain=%d %s (n=%d)", str(getattr(req, "rid", "?"))[:12],
+                            len(first), stats, n)
+        except Exception as exc:  # noqa: BLE001 -- a publisher never takes the chunk down
+            logger.warning("WEG2 CHUNK-PUBLISH raised %s: %s", type(exc).__name__, exc)
+
+    def _weg2_handoff_write(self, req, radix_key) -> None:
+        """#1442: hand P's finished prefill to D by rid -- the token ids and
+        the page-key chain of the inserted path -- so D neither re-tokenises
+        nor re-hashes a 100k prompt before its first store lookup."""
+        try:
+            from sglang.srt.weg2 import handoff as _ho
+            rid = str(getattr(req, "rid", "") or "")
+            if not rid.startswith("weg2-") or not _ho.path(rid) or not self.enable_storage:
+                return
+            mr = self.match_prefix(MatchPrefixParams(key=radix_key))
+            node = getattr(mr, "last_device_node", None) or getattr(mr, "last_host_node", None)
+            chain = []
+            while node is not None and node is not self.root_node:
+                hv = getattr(node, "hash_value", None)
+                if not hv:
+                    return  # a node without keys: nothing honest to hand over
+                chain.append(list(hv))
+                node = node.parent
+            keys = [k for part in reversed(chain) for k in part]
+            ids = list(getattr(req, "origin_input_ids", None) or [])
+            if not keys or not ids:
+                return
+            if _ho.write(rid, ids, keys):
+                n = getattr(self, "_1442_n", 0) + 1
+                self._1442_n = n
+                if n <= 8 or n % 256 == 0:
+                    logger.info("#1442 HANDOFF rid=%s ids=%d page_keys=%d (n=%d)", rid[:12], len(ids), len(keys), n)
+        except Exception:  # noqa: BLE001 - the hand-off is an accelerator, never a wall
+            logger.warning("#1442 hand-off write raised", exc_info=True)
 
     def _weg2_note_end_anchor(self, req, token_ids) -> None:
         """#1233 END-OF-PREFILL ANCHOR instrument, one line per finished request.
@@ -3026,6 +3419,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # token than their count (`MambaComponent._raw_token_pos`).
         anchor = usable_units + 1 if (self.is_eagle and usable_units > 0) else usable_units
         ok = usable_units >= target_units
+        # #1481 (weg2xsn243/245): the N-1 node this split exists for becomes an
+        # INTERIOR node the moment the final 1-token chunk is inserted below
+        # it, and the mamba pool's interior branch evicts it un-backed under a
+        # second concurrent prompt (--max-running-requests 2).  The final
+        # node's anchor sits one unit PAST the tail a reader asks for
+        # (token_ids[:-1]), so with the N-1 anchor gone the read has no anchor
+        # in range (#1035c CAPPED by=mamba) -> W31 -> second prefill.  Mark the
+        # node; the mamba eviction skips it while its state is un-backed.
+        try:
+            _n = getattr(mr, "last_device_node", None)
+            if ok and _n is not None and _n is not self.root_node:
+                _n._weg2_end_anchor = True
+        except Exception:  # noqa: BLE001 -- an instrument never kills a rank
+            pass
         if not ok:
             UnifiedRadixCache._weg2_end_anchor_short = getattr(UnifiedRadixCache, "_weg2_end_anchor_short", 0) + 1
         logger.warning(
@@ -3050,6 +3457,61 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             self._weg2_host_transit = cached
         return bool(cached)
+
+    def _weg2_rebind_host_to_arena(self, node) -> bool:
+        """#1424 Stufe 3 step 5: the store write of this node acked, so every
+        page is COMPLETE in the arena. Point the node's host rows at the
+        arena slots (reader references taken) and free the staging rows --
+        the host copy stays, at no cost, and the next reader on ANY rank of
+        either phase finds it without a copy. False = not an arena pool, or
+        a page not found (the caller keeps the old behaviour)."""
+        cc = self.cache_controller
+        pool = getattr(cc, "mem_pool_host", None)
+        if not getattr(pool, "arena_read", False) or getattr(pool, "arena", None) is None:
+            return False
+        try:
+            cd = node.component_data[BASE_COMPONENT_TYPE]
+            old = cd.host_value
+            hashes = getattr(node, "hash_value", None)
+            if old is None or not hashes or int(old.numel()) != len(hashes) * int(self.page_size):
+                return False
+            if int(old.min()) >= pool.staging_rows:
+                return True  # already arena rows
+            backend = cc.storage_backend
+            stems = [backend._get_suffixed_key(h) for h in hashes]
+            found = pool.arena.find_slots(stems)
+            slots = []
+            for slot, state in found:
+                if slot < 0 or state != 2 or pool.arena.ref_slots([slot], +1) != 1:
+                    break
+                slots.append(slot)
+            if len(slots) != len(found):
+                if slots:
+                    pool.arena.ref_slots(slots, -1)
+                return False
+            _pin = getattr(pool, "pin_slots", None) or getattr(getattr(pool, "anchor_entry", None), "host_pool", None) and getattr(pool.anchor_entry.host_pool, "pin_slots", None)
+            if callable(_pin):
+                _pin(slots)
+            new = torch.tensor([pool.staging_rows + s for s in slots], dtype=old.dtype, device=old.device)
+            dpool = getattr(cc, "mem_pool_host_draft", None)
+            if getattr(dpool, "row_slot", None) is not None and dpool.arena is not None:
+                comp = cc._draft_component_name()
+                dstems = [backend._get_suffixed_key(f"{h}.{comp}") for h in hashes]
+                dfound = dpool.arena.find_slots(dstems)
+                dslots = [s if (s >= 0 and st == 2 and dpool.arena.ref_slots([s], +1) == 1) else -1
+                          for s, st in dfound]
+                dpool.resolve_draft_rows(slots, dslots)
+            cd.host_value = new
+            cc.append_host_mem_release(host_indices=old)
+            n = getattr(self, "_weg2_rebind_n", 0) + 1
+            self._weg2_rebind_n = n
+            if n <= 8 or n % 256 == 0:
+                logger.info("#1424 HOST-REBIND node=%s tokens=%d rows->arena slots (n=%d)",
+                            getattr(node, "id", "?"), len(slots), n)
+            return True
+        except Exception as e:  # noqa: BLE001 - a failed rebind keeps the copy
+            logger.warning("#1424 host rebind failed on node %s: %s: %s", getattr(node, "id", "?"), type(e).__name__, e)
+            return False
 
     def _weg2_release_chain_piece_host(self, node) -> None:
         """#1407: a publish-chain head piece is in the store now (ack); its
@@ -3130,7 +3592,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            getattr(node, "id", "?"), type(e).__name__, e)
             return None
 
-    def publish_unbacked_sweep(self, max_issue: int = 64) -> dict:
+    def publish_unbacked_sweep(self, max_issue: int = 64, clock=None, first=None, chain_only: bool = False) -> dict:
         """#1233 zero-remainder: back every un-backed device node up before a flush.
 
         The hand-back seam. The Weg-2 front quiesces a group through
@@ -3153,9 +3615,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         stats = {"unbacked": 0, "issued": 0, "refused": 0, "pending": 0, "skipped_pending": 0}
         if self.cache_controller is None or self.disable:
             return stats
-        queue = [self.root_node]
+        from sglang.srt.weg2 import retain_publish as _rp
+        self._weg2_sweep_last_refusal = None
+        queue = list(first or []) + ([] if chain_only else [self.root_node])   # xsn344: the retain's own chain first
         while queue:
             node = queue.pop(0)
+            if chain_only and node is not self.root_node and node not in first:
+                continue   # xsn347: the chunk sweep walks the chain only (the BFS cost 109 ms per chunk)
+            # xsn342: a bounded sweep -- wall budget (retain) and a full mamba
+            # arena end it; the remaining nodes stay unbacked for the next one.
+            if clock is not None and clock.expired():
+                stats["stopped"] = "budget"
+                break
+            if _rp.mamba_full_stops_sweep(self._weg2_sweep_last_refusal):
+                stats["stopped"] = "mamba_full"
+                break
             for child in list(node.children.values()):
                 queue.append(child)
             # #1317 C2/R-5: `l3_present` joins `backuped` as a skip reason.
@@ -3215,12 +3689,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 stats["issued"] += 1
             else:
                 stats["refused"] += 1
+        if clock is not None:
+            stats["ms"] = round(clock.elapsed_ms())
         stats["pending"] = len(self.ongoing_write_through) + len(getattr(self, "ongoing_backup", {}) or {})
         n = getattr(UnifiedRadixCache, "_weg2_sweep_n", 0) + 1
         UnifiedRadixCache._weg2_sweep_n = n
         cc = self.cache_controller
         stats["draft_issued"] = int(getattr(cc, "_draft_l3_write_issued", 0) or 0)
         stats["draft_refused"] = int(getattr(cc, "_draft_l3_write_refused", 0) or 0)
+        if n % 256 == 0 and self.component_protected_size_.get(BASE_COMPONENT_TYPE, 0) > 0:
+            # Punkt 1 (18.09.): WHO holds device rows, sampled every 256th sweep
+            # (~40 s) -- names the holder without waiting for an intake stall.
+            try:
+                logger.warning("WEG2-LOCK-CENSUS sweep=%d %s", n, self.weg2_lock_census_str(limit=4))
+            except Exception:  # noqa: BLE001 -- the census never breaks the sweep
+                logger.warning("WEG2-LOCK-CENSUS raised", exc_info=True)
         if stats["unbacked"] or n <= 4 or n % 64 == 0:
             logger.warning(
                 "WEG2 PUBLISH-SWEEP n=%d unbacked=%d issued=%d refused=%d skipped_pending=%d "
@@ -3351,6 +3834,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 f"local_available={self.token_to_kv_pool_allocator.available_size()}"
             )
         if floor < kv_tokens:
+            # weg2xsn285 (18.09.): THE FLOOR REFUSED AND NOBODY EVICTED. Group
+            # D held three finished 98k prompts (retained, backed up,
+            # evictable) and the fourth's load-back asked for 99570 tokens
+            # against a uniform floor of 68841 -- refused here every pass,
+            # 102k WEG2-LOADBACK-WAIT lines in 150 s, the flip's drain
+            # stalled, the boot was killed. The floor counts FREE rows only;
+            # the room is in the evictable leaves, and the prefill path's
+            # `evict_from_tree_cache` never runs for a load-back. Evict
+            # RANK-UNIFORMLY -- every rank drains its whole evictable leaf
+            # set in LRU order (the sets are replicas: same tree, same
+            # locks; the flip runtime evicts the same way), so no rank
+            # decides from its own shard -- and refuse THIS pass as before:
+            # the next iteration's floor is published from the freed pools.
+            _ev = int(self.evictable_size())
+            if _ev > 0:
+                _n = getattr(self, "_weg2_loadback_evicts", 0) + 1
+                self._weg2_loadback_evicts = _n
+                _res = self.evict(EvictParams(num_tokens=_ev))
+                if _n <= 3 or (_n & (_n - 1)) == 0:
+                    logger.info(
+                        "WEG2-LOADBACK-EVICT rid=%s kv_tokens=%d floor=%d: the uniform "
+                        "floor is short by %d, the evictable leaves are drained "
+                        "rank-uniformly (requested=%d evicted=%d); this pass refuses, "
+                        "the next floor decides (n=%d)",
+                        getattr(req, "rid", None), int(kv_tokens), int(floor),
+                        int(kv_tokens) - int(floor), _ev,
+                        int(getattr(_res, "num_tokens_evicted", 0) or 0), _n,
+                    )
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
@@ -3660,6 +4171,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 len(node.component_data[BASE_COMPONENT_TYPE].host_value),
             )
 
+    @_pass_timed("_1474_pfs_ms")  # #1474
     def prefetch_from_storage(
         self,
         req_id: str,
@@ -3759,7 +4271,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         need = prefetch_length
         if eligible:
             anchor_lock_params = self.inc_host_lock_ref(last_host_node).to_dec_params()
-            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+            _alloc_read = getattr(self.cache_controller.mem_pool_host, "alloc_read", None)
+            _bind = getattr(self.cache_controller.mem_pool_host, "ensure_bound", None)
+            if callable(_alloc_read) and callable(_bind) and _bind(
+                self.cache_controller.storage_backend, role="kv"
+            ):
+                # #1424 Stufe 3: read rows are arena slots, resolved at the
+                # read; the registration hands out placeholders, no budget.
+                host_indices = _alloc_read(prefetch_length)
+            else:
+                host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
             if host_indices is None:
                 self.evict_host(prefetch_length)
                 host_indices = self.cache_controller.mem_pool_host.alloc(
@@ -4154,6 +4675,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_keys,
             extra_pools=aux_xfers or None,
         )
+        # #1442: D takes P's page-key chain for this request instead of
+        # re-hashing the tokens; the chain is indexed from the request start,
+        # the prefetch starts after the locally matched prefix.
+        try:
+            from sglang.srt.weg2 import handoff as _ho
+            # xsn330: keep the file -- the dormant hold re-reads every 2 s
+            # (#1456); the wake's hold release removes it (scheduler).
+            _keys = _ho.read_keys(str(req_id), remove=False) if str(req_id).startswith("weg2-") else None
+            if _keys:
+                _pages = int(prefetch_length) // int(self.page_size)
+                _total = _keys  # chain length in pages == P's inserted page count
+                _ids = _ho.read_ids(str(req_id))
+                _ntok = len(_ids) if _ids else None
+                _off = (int(_ntok) - int(prefetch_length)) // int(self.page_size) if _ntok is not None else None
+                if _off is not None and 0 <= _off < len(_total):
+                    # partial coverage is fine (P's list is one page short of the ids)
+                    operation.weg2_page_keys = list(_total[_off:_off + _pages])
+                    n = getattr(self, "_1442_use_n", 0) + 1
+                    self._1442_use_n = n
+                    if n <= 8 or n % 256 == 0:
+                        logger.info("#1442 HANDOFF-KEYS rid=%s pages=%d offset=%d (n=%d)",
+                                    str(req_id)[:12], _pages, _off, n)
+        except Exception:  # noqa: BLE001
+            logger.warning("#1442 hand-off keys raised", exc_info=True)
         # DIAGNOSTIC ONLY (#905 window): stamp the host pool identity and its
         # clear-epoch AT REGISTRATION, i.e. at the instant these host slots were
         # allocated. The completion path below compares them against the pool it
@@ -4622,6 +5167,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 host_indices[:min_completed_tokens],
                 hash_value[: min_completed_tokens // self.page_size],
             )
+            # #1423 instrument (boot xsn173, #1420 pair): WHERE did the chain
+            # land? The walk later wanted child (22, 20) under the depth-4314
+            # node and found only (22, 21). Name the registration node (depth,
+            # its children after the insert) and the inserted head unit.
+            try:
+                _n = getattr(UnifiedRadixCache, "_1423_n", 0) + 1
+                UnifiedRadixCache._1423_n = _n
+                if _n <= 24 or _n % 256 == 0:
+                    _d, _x = 0, last_host_node
+                    while _x is not None and _x is not self.root_node:
+                        _d += len(_x.key); _x = _x.parent
+                    _pl = int(insert_result.prefix_len)
+                    _rest = fetched_key[_pl:] if _pl < len(fetched_key) else None
+                    _head = str(_rest.child_key(self.page_size))[:40] if _rest is not None and len(_rest) else "-"
+                    logger.warning(
+                        "#1423 INSERT-PLACED req=%s reg_node=%s reg_depth=%d reg_keylen=%d "
+                        "reg_children_after=%s matched=%d inserted=%d head_unit=%s "
+                        "deepest=%s unclaimed=%s",
+                        str(req_id)[:8], getattr(last_host_node, "id", "?"), _d,
+                        len(last_host_node.key), [str(k)[:30] for k in list(last_host_node.children.keys())[:4]],
+                        _pl, int(min_completed_tokens) - _pl, _head,
+                        getattr(insert_result.inserted_host_node, "id", None),
+                        bool(insert_result.host_span_unclaimed),
+                    )
+            except Exception:  # noqa: BLE001
+                pass
             # #1317 C2 WRITER 2 of 2: these pages CAME OUT OF L3 -- the
             # prefetch is what read them -- so their presence there is a fact
             # of this code path, not a prediction. Marked on the chain the
@@ -4634,6 +5205,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if not insert_result.host_span_unclaimed:
                 self._mark_l3_present_span(
                     insert_result.inserted_host_node, last_host_node
+                )
+                # #1417 (boot xsn167): the span this prefetch just inserted
+                # is host-only until the admission loads it back, and the
+                # anchor lock taken at registration covers `last_host_node`
+                # alone. Under host-pool pressure (three 100k prefixes on a
+                # 122k pool) the fresh chain was evicted between completion
+                # and admission: the walk reached 4314 of 98550, accepted 0,
+                # uncached 4252 > X -> W50 -> requeue -> P recompute. Pin
+                # every node of the inserted chain until the admission pops
+                # the outcome (or the request is aborted).
+                self._pin_prefetched_span(
+                    req_id, insert_result.inserted_host_node, last_host_node
                 )
             # #1061: the adopted tail arrived via the PREFETCH arm. Only the
             # keys the tree NEWLY adopted count as arrivals -- the matched
@@ -4881,6 +5464,40 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _deliverable,
             max(0, _deliverable - (int(insert_result.prefix_len) + int(loaded_from_storage))),
         )
+        # weg2xsn272 (18.09.): THE LOADBACK INSTRUMENT (task #3). The
+        # prefetch's host->device transfer ends HERE, not in loading_check
+        # (where an earlier WEG2-LOAD-DEVICE never fired). tokens x
+        # bytes/token over the operation's own clock, so the bs6
+        # readmission of 6 x 98k tokens on D is the measurement against
+        # the lane's ceiling; never averaged with the arena-find time.
+        try:
+            _t0 = float(getattr(operation, "start_time", 0.0) or 0.0)
+            _ms = (time.monotonic() - _t0) * 1000.0 if _t0 else -1.0
+            # xsn291: the arena host pool answers get_ksize_per_token, not
+            # get_size_per_token (its __getattr__ raised on every D rank).
+            _hp = self.cache_controller.mem_pool_host
+            _bpt = int(getattr(_hp, "size_per_token", 0) or 0)
+            if _bpt <= 0 and hasattr(_hp, "get_size_per_token"):
+                _bpt = int(_hp.get_size_per_token() or 0)
+            if _bpt <= 0 and hasattr(_hp, "get_ksize_per_token"):
+                _bpt = 2 * int(_hp.get_ksize_per_token() or 0)   # K + V
+            _bytes = int(completed_tokens) * _bpt
+            logger.info(
+                "WEG2-LOAD-DEVICE req=%s tokens=%d bytes_per_token=%d bytes=%d ms=%.0f "
+                "GB/s=%.2f (host arena -> device, the operation's own clock from "
+                "start_loading to terminate_prefetch; matched=%d loaded=%d)",
+                req_id, int(completed_tokens), _bpt, _bytes, _ms,
+                (_bytes / (_ms / 1000.0) / 1e9) if _ms > 0 else -1.0,
+                int(insert_result.prefix_len), int(loaded_from_storage),
+            )
+        except Exception as _ie:  # noqa: BLE001 -- an instrument never kills the prefetch
+            # xsn289: 27 prefetch successes on D, 0 WEG2-LOAD-DEVICE lines and
+            # this branch silent at DEBUG -- an instrument that fails must SAY
+            # so at the level its line would have had (once per shape).
+            if not getattr(self, "_weg2_load_device_raised", False):
+                self._weg2_load_device_raised = True
+                logger.info("WEG2-LOAD-DEVICE instrument raised (%s: %s) -- suppressed after the first",
+                            type(_ie).__name__, str(_ie)[:200], exc_info=True)
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
         return True
@@ -5139,7 +5756,43 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         operation.mark_terminate()
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
+        self._unpin_prefetched_span(req_id)
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
+
+    #: #1417 upper bound on pinned spans (rids that never reach admission)
+    _PREFETCH_SPAN_PINS_MAX = 64
+
+    def _pin_prefetched_span(self, req_id: str, deepest, stop_at) -> int:
+        """#1417: host-lock every node from *deepest* up to (excluding)
+        *stop_at*; released by ``pop_prefetch_loaded_tokens`` /
+        ``release_aborted_request``. Returns the number of nodes pinned."""
+        pins = getattr(self, "_prefetch_span_pins", None)
+        if pins is None:
+            pins = self._prefetch_span_pins = {}
+        self._unpin_prefetched_span(req_id)
+        held = []
+        node = deepest
+        while node is not None and node is not stop_at and node is not self.root_node:
+            try:
+                held.append((node, self.inc_host_lock_ref(node).to_dec_params()))
+            except Exception:  # noqa: BLE001 - a pin never breaks a completion
+                break
+            node = node.parent
+        if held:
+            pins[str(req_id)] = held
+        while len(pins) > self._PREFETCH_SPAN_PINS_MAX:
+            self._unpin_prefetched_span(next(iter(pins)))
+        return len(held)
+
+    def _unpin_prefetched_span(self, req_id: str) -> int:
+        pins = getattr(self, "_prefetch_span_pins", None)
+        held = pins.pop(str(req_id), None) if pins else None
+        for node, params in held or []:
+            try:
+                self.dec_host_lock_ref(node, params)
+            except Exception:  # noqa: BLE001
+                pass
+        return len(held or [])
 
     def completed_prefetch_tokens(self, req_id: str) -> Optional[int]:
         """#1175: how many prefix tokens THIS rank's storage prefetch has
@@ -5187,6 +5840,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
 
     def release_aborted_request(self, rid: str) -> None:
+        self._unpin_prefetched_span(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self._prefetch_completed_tokens.pop(rid, None)
         if rid not in self.ongoing_prefetch:
@@ -5331,7 +5985,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # would license a free that loses the KV.
                     node.l3_present = True
                     self.dec_host_lock_ref(node, lock_params)
-                    if getattr(node, "_weg2_chain_piece", False) or self._weg2_host_is_transit():
+                    if self._weg2_rebind_host_to_arena(node):
+                        pass  # #1424: the rows now ARE the arena slots
+                    elif getattr(node, "_weg2_chain_piece", False) or self._weg2_host_is_transit():
                         self._weg2_release_chain_piece_host(node)
                 # #810: the storage write acked -- this is the drain the
                 # staging ring measures its residency against. Outside the
@@ -5495,8 +6151,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         qsize_list = list(map(int, qsizes.tolist()))
         n_revoke, n_backup, n_release = qsize_list[:3]
+        # xsn332: the release drain after a wake carried the whole dormant
+        # phase's frees (~190 ms of the 535 ms wake pass, torch.cat/unique
+        # over every freed row). Cap the entries per pass -- a constant, so
+        # the rank-uniform MIN above stays uniform; the rest drains next pass.
+        _cap = _weg2_release_drain_cap()
+        if _cap > 0 and n_release > _cap:
+            n_release = _cap
         extra_release_counts = {
-            pool_name: qsize_list[_pool_slot(pool_name, 3)]
+            pool_name: (min(qsize_list[_pool_slot(pool_name, 3)], _cap) if _cap > 0 else qsize_list[_pool_slot(pool_name, 3)])
             for pool_name in extra_release_queues
         }
         self._drain_storage_control_queues_impl(
@@ -5971,6 +6634,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if write_back:
             # Blocking: wait for all pending write-backs
+            _1465_t0 = time.perf_counter()
+            _1465_n = len(self.ongoing_write_through)
             while self.ongoing_write_through:
                 for _, finish_event, ack_list in cc.ack_write_queue:
                     finish_event.synchronize()
@@ -5979,14 +6644,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                             self._finish_write_through_ack(ack_id)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
+            if _1465_n:
+                logger.info("#1465 WRITE-BACK DRAIN n=%d ms=%.0f (the flush waited for this many in-flight write-throughs)",
+                            _1465_n, (time.perf_counter() - _1465_t0) * 1000.0)
             return
-
         finish_count = self._count_ready_acks(cc.ack_write_queue, "writing_check")
 
         # Process completed acks
         while finish_count > 0:
-            _, finish_event, ack_list = cc.ack_write_queue.pop(0)
+            start_event, finish_event, ack_list = cc.ack_write_queue.pop(0)
             finish_event.synchronize()
+            try:  # xsn345: how long the card -> arena write of this op took (events, no extra sync)
+                _wn = getattr(UnifiedRadixCache, "_weg2_write_ack_n", 0) + 1
+                UnifiedRadixCache._weg2_write_ack_n = _wn
+                if _wn <= 16 or _wn % 256 == 0:
+                    logger.info("WEG2-WRITE-ACK n=%d nodes=%d ms=%.0f (start->finish event of the write op)",
+                                _wn, len(ack_list), float(start_event.elapsed_time(finish_event)))
+            except Exception:  # noqa: BLE001 -- an instrument, never the ack
+                pass
             for ack_id in ack_list:
                 self._finish_write_through_ack(ack_id)
             finish_count -= 1
@@ -6022,8 +6697,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         finish_count = self._count_ready_acks(cc.ack_load_queue, "loading_check")
 
         while finish_count > 0:
-            _, finish_event, ack_list = cc.ack_load_queue.pop(0)
+            start_event, finish_event, ack_list = cc.ack_load_queue.pop(0)
             finish_event.synchronize()
+            # Task #3 (17.09.): the host->device half of a re-admission,
+            # measured between the load's own two events (device clock) and
+            # against the wall since start_loading (D runs THIS tree).
+            _meta = getattr(cc, "_weg2_load_meta", None)
+            _m = _meta.pop(id(finish_event), None) if _meta else None
+            if _m is not None:
+                try:
+                    _tok, _bpt, _t0 = _m
+                    _ms = float(start_event.elapsed_time(finish_event))
+                    logger.info(
+                        "WEG2-LOAD-DEVICE tokens=%d mib=%.0f gpu_ms=%.0f wall_ms=%.0f "
+                        "GB/s=%.2f (bytes = tokens x 2 x layers x cell on THIS rank; "
+                        "gpu_ms = load_stream start->finish event)",
+                        _tok, _tok * _bpt / (1 << 20), _ms,
+                        (time.perf_counter() - _t0) * 1000,
+                        (_tok * _bpt / 1e9) / max(_ms / 1000.0, 1e-6))
+                except Exception:  # noqa: BLE001 -- an instrument never raises
+                    pass
             for ack_id in ack_list:
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
@@ -6032,7 +6725,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # store (l3_present) is on the card now; its host rows were
                 # transit. D's pool held a loaded 79k prefix (occupied 38695)
                 # and the next two 79k reads found available=0 -> W88 -> 503.
-                if getattr(node, "l3_present", False) and self._weg2_host_is_transit():
+                if (getattr(node, "l3_present", False) and self._weg2_host_is_transit()
+                        and not getattr(self.cache_controller.mem_pool_host, "arena_read", False)):
+                    # #1424: arena rows cost nothing to keep; only a copied
+                    # transit row is released after the load-back
                     self._weg2_release_chain_piece_host(node)
             finish_count -= 1
 
@@ -6584,6 +7280,65 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 f"(available_size={available_size} + component_evictable_size_={self.component_evictable_size_[ct]})"
             )
         return "\n".join(lines) + "\n"
+
+    def weg2_lock_census_str(self, limit: int = 6) -> str:
+        """WHO holds device rows, for the intake stall (Punkt 1, 18.09.).
+        xsn293: PP0's pool read 81 % used with NOTHING running and a 99.5k
+        request refused for 66 s -- the adder's budget counts avail +
+        evictable, so those rows were LOCKED, and no log named the holder.
+        This walks the tree once (only when a stall is named) and reports:
+        the tracked terms, every component's locked node count and rows, the
+        in-flight write-through / load-back memberships, and the largest
+        locked nodes with their per-component lock refs. Cheap enough for a
+        stall path, never for a per-tick path.
+        """
+        try:
+            nodes = self._collect_all_nodes()
+        except Exception as exc:  # noqa: BLE001 - diagnostics never raise
+            return f"lock_census=unavailable({exc!r})"
+        wt = set(getattr(self, "ongoing_write_through", {}) or ())
+        lb = set(getattr(self, "ongoing_load_back", {}) or ())
+        base = BASE_COMPONENT_TYPE
+        parts = [
+            f"nodes={len(nodes)}",
+            f"tracked_evictable={self.component_evictable_size_.get(base, 0)}",
+            f"tracked_protected={self.component_protected_size_.get(base, 0)}",
+            f"ongoing_wt={len(wt)} ongoing_lb={len(lb)}",
+        ]
+        locked_rows = {ct: 0 for ct in self.tree_components}
+        locked_nodes = {ct: 0 for ct in self.tree_components}
+        dev_rows = 0
+        held = []
+        for n in nodes:
+            if n is self.root_node:
+                continue
+            cd_full = n.component_data[base]
+            full_dev = 0 if cd_full.value is None else len(cd_full.value)
+            dev_rows += full_dev
+            any_lock = False
+            for ct in self.tree_components:
+                cd = n.component_data[ct]
+                if cd.lock_ref > 0:
+                    any_lock = True
+                    locked_nodes[ct] += 1
+                    locked_rows[ct] += full_dev
+            if any_lock and full_dev > 0:
+                locks = ",".join(
+                    f"{ct.name[:1]}{n.component_data[ct].lock_ref}"
+                    for ct in self.tree_components
+                    if n.component_data[ct].lock_ref > 0
+                )
+                held.append((full_dev, f"id={n.id} dev={full_dev} locks={locks} "
+                                       f"backuped={int(bool(n.backuped))} "
+                                       f"wt={int(n.id in wt)} lb={int(n.id in lb)}"))
+        parts.append(f"device_rows_in_tree={dev_rows}")
+        for ct in self.tree_components:
+            parts.append(f"{ct.name}_locked_nodes={locked_nodes[ct]} "
+                         f"{ct.name}_locked_rows={locked_rows[ct]}")
+        held.sort(key=lambda t: -t[0])
+        if held:
+            parts.append("top_locked=[" + "; ".join(h for _, h in held[:limit]) + "]")
+        return "lock_census " + " ".join(parts)
 
     def leak_census_str(self) -> str:
         """What the TREE holds, recomputed from the nodes, for a pool leak.

@@ -423,6 +423,23 @@ def build_bootstrap_draft_input(scheduler, batch, topk: int):
     )
 
 
+def build_bootstrap_dflash_input(scheduler, batch):
+    """The DFlash counterpart of ``build_bootstrap_draft_input``: the first
+    round after the cutover anchors its block at each request's last
+    committed token (``bonus_tokens``) over the committed length
+    (``new_seq_lens``); the draft KV of the prefix window is what the
+    admission loaded from the draft arena (group P's producer wrote it),
+    every other row is the zero-KV hole."""
+    from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+
+    device = scheduler.device
+    bonus = torch.tensor(pending_tokens(batch), dtype=torch.int64, device=device)
+    seq_lens = batch.seq_lens
+    if not torch.is_tensor(seq_lens):
+        seq_lens = torch.tensor(list(seq_lens), dtype=torch.int64, device=device)
+    return make_draft_input_v2(bonus_tokens=bonus, new_seq_lens=seq_lens)
+
+
 def _draft_hidden_spec(scheduler):
     from sglang.srt.speculative.eagle_utils import (
         get_draft_recurrent_hidden_state_spec,
@@ -476,11 +493,23 @@ def arm_draft_bootstrap(scheduler, batch, draft_worker) -> dict:
             "target verifies every proposed token.",
             LOG_PREFIX,
         )
+    elif getattr(pool, "weg2_slot_mapper", None) is not None:
+        # A mapped (window / small solo) draft pool addresses draft slots,
+        # not target slots: a fresh pool has nothing mapped for the carried
+        # requests, so there are no stale rows to scrub -- an unmapped row
+        # reads as the zero-KV hole by construction.
+        rows, layer_ids = 0, draft_kv_layer_ids(pool)
     else:
         rows, layer_ids = scrub_draft_kv(pool, slot_rows)
 
-    topk = int(getattr(draft_worker, "topk", 1) or 1)
-    batch.spec_info = build_bootstrap_draft_input(scheduler, batch, topk)
+    algo = getattr(scheduler, "flip_spec_algorithm", None) or getattr(
+        scheduler, "spec_algorithm", None
+    )
+    if algo is not None and getattr(algo, "is_dflash", lambda: False)():
+        batch.spec_info = build_bootstrap_dflash_input(scheduler, batch)
+    else:
+        topk = int(getattr(draft_worker, "topk", 1) or 1)
+        batch.spec_info = build_bootstrap_draft_input(scheduler, batch, topk)
     for req in reqs:
         setattr(req, BOOTSTRAP_ATTR, True)
 

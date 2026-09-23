@@ -236,6 +236,14 @@ class Envs:
     # Raise on bare server_args field assignments after resolution; mutation
     # must go through ServerArgs.override() (enabled by the test harness).
     SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
+    # Which speculative decisions rank 0 broadcasts to its TP group (upstream
+    # #33614, spec_tp_sync.py); narrowing it under live traffic isolates where
+    # ranks diverge. Comma separated presets ("all", "rng", "init", "off"), or
+    # SpecTpSyncSite slugs and numbers, each negatable with a leading "-".
+    SGLANG_SPEC_TP_SYNC = EnvStr("all")
+    # A/B: keep the DFLASH draft sampler (greedy head or DFlash2 selector) eager,
+    # not folded into the draft cuda graph.
+    SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
 
     # Downgrade the draft-model unloaded-parameter check (#290/#318) from a
     # hard error to a log line. An unloaded drafter proposes noise, so this is

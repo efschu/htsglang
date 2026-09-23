@@ -73,6 +73,7 @@ reserve, and reserves are forbidden.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -583,6 +584,178 @@ class TowerHooks:
         torch.cuda.empty_cache()
 
 
+class VisionStageBackendRefused(VisionStageLoadRefused):
+    """No multimodal attention backend fits this card, by its own numbers.
+
+    A subclass of :class:`VisionStageLoadRefused` on purpose: it happens on the
+    LOAD leg, before a single pixel is encoded, and ``code_for`` already maps
+    that class to ``W106``.  A new W-code for "the kernel would not have fit"
+    would split one seam across two codes for no gain.
+    """
+
+
+#: Shared memory ONE BLOCK of the Triton vision-attention kernel demands, bytes.
+#:
+#: MEASURED, not modelled -- this is the number the driver itself reported on
+#: metal boot xsn407 (20.09. 17:16Z), card0, refusing the launch::
+#:
+#:   W107 Weg2VisionEncodeFailed rid=weg2-8-27 -- VisionStageEncodeFailed:
+#:   card0: the encoder forward over 1 item(s) raised: out of resource: shared
+#:   memory, Required: 131072, Hardware limit: 101376.
+#:
+#: It is a FLOOR for the decision, not a formula: the block sizes live inside
+#: the shared prefill kernel ``context_attention_fwd``
+#: (``VisionTritonAttention.forward`` just calls it), so they are not a knob
+#: this stage can turn -- halving them would change the kernel the whole engine
+#: prefills with, which is not a transient tower's business.
+TRITON_VISION_ATTN_SMEM_BYTES = 131072
+
+#: The backend chosen when the Triton kernel does not fit.  ``sdpa`` has no
+#: opt-in shared-memory demand at all: it builds a boolean mask ``[1, s, s]``
+#: (``VisionSdpaAttention._generate_mask_cache``, ``layers/attention/vision.py:209``)
+#: and hands the rest to torch.  At the design's named geometry -- 1024x1024,
+#: 4096 patch rows -- that mask is 4096^2 bytes = 16 MiB, which is small beside
+#: the 79 MiB of encoder activation the arming line already books.
+VISION_BACKEND_FALLBACK = "sdpa"
+
+#: Backends that carry the Triton kernel's demand.  Named as a set rather than
+#: an ``== "triton_attn"`` so a second Triton-backed entry cannot slip past.
+TRITON_BACKED_BACKENDS = frozenset({"triton_attn"})
+
+
+def choose_vision_attention_backend(
+    *,
+    smem_optin_bytes: Optional[int],
+    card: int = -1,
+    operator_override: Optional[str] = None,
+) -> Tuple[str, str]:
+    """(backend, reason) for the transient tower, from the card's OWN numbers.
+
+    THE DEFECT THIS ENDS (metal boot xsn407): upstream's default table
+    (``vision.py:_determine_attention_backend``) special-cases exactly two
+    capabilities -- major 9 -> ``fa3``, major 10 -> ``fa4`` -- and everything
+    else on CUDA falls through to ``triton_attn``.  BOTH card families of this
+    rig fall through: the 3080 is sm_86 and the 5090 is sm_120.  And both report
+    the same opt-in shared memory, 101376 bytes, against the kernel's 131072 --
+    so the Triton vision kernel fits on NO CARD OF THIS RIG, and the way that
+    surfaced was a kernel launch failure in the middle of the encode leg.
+
+    The decision is made HERE, before the module is built, out of
+    ``shared_memory_per_block_optin`` -- the torch spelling of
+    ``cudaDeviceGetAttribute(cudaDevAttrMaxSharedMemoryPerBlockOptin)``.
+
+    Four outcomes, and none of them is a guess:
+
+    * an operator override that is not Triton-backed -- honoured as given;
+    * an operator override that IS, on a card too small -- REFUSED by name,
+      because running it reproduces xsn407 on purpose;
+    * a capability that cannot be read -- REFUSED by name.  Choosing a kernel
+      against an unknown limit is how a modelled fit becomes a launch failure;
+    * otherwise: Triton when it fits, ``sdpa`` when it does not, with BOTH
+      numbers in the reason either way.
+    """
+    if operator_override:
+        if operator_override not in TRITON_BACKED_BACKENDS:
+            return operator_override, (
+                f"operator override --mm-attention-backend={operator_override} "
+                "honoured as given (not a Triton-backed backend, so the "
+                "shared-memory ceiling does not apply)"
+            )
+        if smem_optin_bytes is None or int(smem_optin_bytes) <= 0:
+            raise VisionStageBackendRefused(
+                f"card{card}: --mm-attention-backend={operator_override} was "
+                "requested and this card's opt-in shared memory could not be "
+                "read, so whether the kernel fits is unknown. Refusing rather "
+                "than launching into the xsn407 failure."
+            )
+        if int(smem_optin_bytes) < TRITON_VISION_ATTN_SMEM_BYTES:
+            raise VisionStageBackendRefused(
+                f"card{card}: --mm-attention-backend={operator_override} was "
+                f"requested, and that kernel needs "
+                f"{TRITON_VISION_ATTN_SMEM_BYTES} B of shared memory per block "
+                f"while this card admits {int(smem_optin_bytes)} B opt-in. The "
+                "launch would fail inside the encode leg (metal boot xsn407). "
+                f"Drop the override to get {VISION_BACKEND_FALLBACK}, which has "
+                "no opt-in shared-memory demand."
+            )
+        return operator_override, (
+            f"operator override --mm-attention-backend={operator_override} "
+            f"honoured: card admits {int(smem_optin_bytes)} B opt-in >= the "
+            f"kernel's {TRITON_VISION_ATTN_SMEM_BYTES} B"
+        )
+
+    if smem_optin_bytes is None or int(smem_optin_bytes) <= 0:
+        raise VisionStageBackendRefused(
+            f"card{card}: the opt-in shared memory per block could not be read "
+            f"(got {smem_optin_bytes!r}), so no backend can be chosen against a "
+            "known limit. Refusing rather than defaulting -- a kernel picked "
+            "against an unknown ceiling is how xsn407 failed mid-encode."
+        )
+
+    smem = int(smem_optin_bytes)
+    if smem >= TRITON_VISION_ATTN_SMEM_BYTES:
+        return "triton_attn", (
+            f"card{card} admits {smem} B opt-in shared memory >= the Triton "
+            f"vision kernel's {TRITON_VISION_ATTN_SMEM_BYTES} B"
+        )
+    return VISION_BACKEND_FALLBACK, (
+        f"card{card} admits only {smem} B opt-in shared memory and the Triton "
+        f"vision kernel needs {TRITON_VISION_ATTN_SMEM_BYTES} B (short by "
+        f"{TRITON_VISION_ATTN_SMEM_BYTES - smem} B), so the transient tower "
+        f"uses {VISION_BACKEND_FALLBACK} instead. Upstream's default table "
+        "would have picked triton_attn here: it special-cases only sm_90 and "
+        "sm_100 and lets every other CUDA capability fall through"
+    )
+
+
+def smem_optin_for_torch_index(torch_index: int) -> Optional[int]:
+    """This card's ``cudaDevAttrMaxSharedMemoryPerBlockOptin``, or ``None``.
+
+    ``None`` on any failure rather than a number: the caller REFUSES on
+    ``None``, and a fabricated ceiling is the one answer that turns a readable
+    refusal back into a kernel launch failure.
+    """
+    try:
+        import torch
+
+        return int(
+            torch.cuda.get_device_properties(
+                torch_index
+            ).shared_memory_per_block_optin
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "vision stage: could not read shared_memory_per_block_optin for "
+            "torch index %s: %s",
+            torch_index,
+            exc,
+        )
+        return None
+
+
+@contextlib.contextmanager
+def _mm_attention_backend(backend: str):
+    """Hold ``mm_attention_backend`` at ``backend`` while the tower is built.
+
+    Construction-scoped on purpose, and that is enough: ``VisionAttention``
+    resolves the backend ONCE in ``__init__`` and stores the instance as
+    ``self.qkv_backend`` (``layers/attention/vision.py:993``), so the choice is
+    baked into the module and the global goes back to what it was. The process
+    this runs in is the tokenizer's -- it serves no attention of its own -- but
+    the restore is not optional for that reason: a global left changed is a
+    defect waiting for the next reader, not a saved line.
+    """
+    from sglang.srt.runtime_context import get_server_args
+
+    server_args = get_server_args()
+    previous = server_args.mm_attention_backend
+    server_args.mm_attention_backend = backend
+    try:
+        yield
+    finally:
+        server_args.mm_attention_backend = previous
+
+
 def _build_qwen3vl_tower(hf_config: Any, torch_index: int) -> Any:
     """The real tower module, alone, in a process that is not a rank.
 
@@ -613,14 +786,30 @@ def _build_qwen3vl_tower(hf_config: Any, torch_index: int) -> Any:
             local_rank=0,
         )
         initialize_model_parallel(tensor_model_parallel_size=1)
-    vision_config = getattr(hf_config, "vision_config", None)
-    module = Qwen3VLMoeVisionModel(
-        vision_config,
-        norm_eps=getattr(hf_config, "rms_norm_eps", 1e-6),
-        quant_config=None,
-        prefix="model.visual",
-        use_data_parallel=False,
+    # THE BACKEND IS DECIDED BEFORE THE MODULE EXISTS, from this card's own
+    # shared-memory ceiling -- see `choose_vision_attention_backend`. Deciding
+    # it afterwards is what xsn407 did by omission, and the answer arrived as a
+    # kernel launch failure in the middle of the encode leg.
+    from sglang.srt.runtime_context import get_server_args
+
+    backend, why = choose_vision_attention_backend(
+        smem_optin_bytes=smem_optin_for_torch_index(torch_index),
+        card=torch_index,
+        operator_override=get_server_args().mm_attention_backend,
     )
+    logger.info(
+        "[vision-attn] torch_index=%d backend=%s -- %s", torch_index, backend, why
+    )
+
+    vision_config = getattr(hf_config, "vision_config", None)
+    with _mm_attention_backend(backend):
+        module = Qwen3VLMoeVisionModel(
+            vision_config,
+            norm_eps=getattr(hf_config, "rms_norm_eps", 1e-6),
+            quant_config=None,
+            prefix="model.visual",
+            use_data_parallel=False,
+        )
     return module.to(device=torch.device("cuda", torch_index))
 
 
