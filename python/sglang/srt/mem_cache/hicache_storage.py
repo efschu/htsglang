@@ -1991,8 +1991,10 @@ class HiCacheFile(HiCacheStorage):
             (kv_page is None) != (self.canonical_kv_page is None)
             or ((mamba_blob is None) != (self.canonical_mamba_blob is None))
             or (draft_page is None and self.canonical_draft_page is not None)
-            or (qsa_page is None and self.canonical_qsa_page is not None)
         ):
+            # qsa_page=None means UNCHANGED, not "switch off": the draft
+            # install (`_install_canonical_draft_window`) passes only its own
+            # slot, and fnFL2x55 died on every P stage at exactly that call.
             raise CanonicalPageError(
                 "refusing to switch the canonical format on or off at a "
                 "cutover: window presence decides the key shape, and "

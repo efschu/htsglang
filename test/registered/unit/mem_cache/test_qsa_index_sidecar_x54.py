@@ -90,6 +90,33 @@ class QsaIndexSidecar(unittest.TestCase):
         self.assertFalse(backend._is_qsa_key("abc.qsa_indexer"))
         self.assertIsNone(backend._canonical_window("abc.qsa_indexer"))
 
+    def test_draft_install_without_qsa_page_keeps_the_window(self):
+        # fnFL2x55: every P stage died at the draft window install, which
+        # passes only its own slot -- qsa_page=None must mean "unchanged".
+        from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageError
+        from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+
+        backend = HiCacheFile.__new__(HiCacheFile)
+        kv = SimpleNamespace(spec=SimpleNamespace(page_bytes=786432),
+                             as_extents=lambda: "kv-extents")
+        qsa = SimpleNamespace(total_bytes=12 * 4096, extents=((0, 4096),))
+        draft = SimpleNamespace(total_bytes=2048, extents=((0, 2048),))
+        backend.canonical_kv_page = kv
+        backend._canonical_kv_extents = "kv-extents"
+        backend.canonical_mamba_blob = None
+        backend.canonical_draft_page = None
+        backend.canonical_qsa_page = qsa
+        backend._rederive_suffixes = lambda: None
+        try:
+            backend.install_canonical_windows(kv, None, draft_page=draft)
+        except AttributeError:
+            pass  # the suffix re-derivation needs a real backend; the slot check ran
+        self.assertIs(backend.canonical_qsa_page, qsa)
+        self.assertIs(backend.canonical_draft_page, draft)
+        other = SimpleNamespace(total_bytes=13 * 4096, extents=((0, 4096),))
+        with self.assertRaises(CanonicalPageError):
+            backend.install_canonical_windows(kv, None, draft_page=draft, qsa_page=other)
+
 
 if __name__ == "__main__":
     unittest.main()
