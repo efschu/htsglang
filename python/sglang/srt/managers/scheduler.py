@@ -5052,6 +5052,26 @@ class Scheduler(
             else:
                 req._1471_short = False
                 return "complete"
+        # fnFL2x38 (23.09.): A TAIL SHORTER THAN ONE STORE READ IS RECOMPUTED,
+        # NOT RE-READ. weg2-0-1 (8815 tokens): the store held 8704, P never
+        # published the last full page (deliverable 8768), every 2-s re-read
+        # answered ZERO, and the request sat the whole 20-s settle bound out
+        # before the lapse queued it "as it is" -- whereupon the extend
+        # computed the 111 tokens in one pass. After ONE re-read has answered
+        # short, a tail within the store's own prefetch threshold goes to the
+        # extend now; the flip time is the reader's, not the store's.
+        _rec2 = getattr(getattr(self, "tree_cache", None), "prefetch_loaded_tokens_by_reqid", None) or {}
+        _span2 = int(getattr(req, "_prefetch_span_tokens", 0) or 0)
+        _have2 = _rec2.get(str(req.rid))
+        _have2 = int(getattr(_have2, "materialized", _have2) or 0) if _have2 is not None else 0
+        _tail = _span2 - _have2
+        if 0 < _tail <= self.WEG2_TAIL_RECOMPUTE_TOKENS and int(getattr(req, "_1456_n", 0) or 0) >= 1:
+            req._1471_short = False
+            logger.info("#x38 SETTLE-TAIL rid=%s tail=%d tokens <= %d after %d re-read(s) (%s): "
+                        "released -- the extend computes the tail",
+                        str(req.rid)[:12], _tail, self.WEG2_TAIL_RECOMPUTE_TOKENS,
+                        int(getattr(req, "_1456_n", 0) or 0), reason)
+            return "complete"
         req._1471_short = True
         if now - float(getattr(req, "_1456_last", 0.0) or 0.0) < 2.0:
             return "wait"
@@ -5169,6 +5189,11 @@ class Scheduler(
     #: store completes within a few seconds of the wake; the bound is a
     #: backstop, never the expected path.
     WEG2_POST_WAKE_SETTLE_S = 20.0
+
+    #: fnFL2x38: a short read's tail up to this many tokens (the store's own
+    #: prefetch threshold, unified_radix_cache.prefetch_threshold) is
+    #: recomputed by the extend after one zero re-read, never waited for.
+    WEG2_TAIL_RECOMPUTE_TOKENS = 256
 
     def _weg2_post_wake_settle_tick(self) -> int:
         """#1471: release the requests parked at the wake with a SHORT read

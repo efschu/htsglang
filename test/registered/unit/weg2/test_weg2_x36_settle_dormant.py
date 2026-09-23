@@ -134,6 +134,67 @@ class TheTopUpOfAHeldExtentIgnoresTheThreshold(unittest.TestCase):
         self.assertRegex(src, r'if not locally_eligible:\s*reason = "anchor"')
 
 
+class AShortTailIsRecomputedNotReRead(unittest.TestCase):
+    """fnFL2x38: the store never received the last page; every 2-s re-read
+    answered zero and the request sat out the 20-s settle bound before the
+    extend computed the 111-token tail in one pass."""
+
+    def _holder(self, have, reason="zero-answer"):
+        h = _holder()
+        h.tree_cache = types.SimpleNamespace(
+            cache_controller=types.SimpleNamespace(weg2_hold_rids=set()),
+            check_prefetch_progress=lambda rid: True,
+            prefetch_loaded_tokens_by_reqid={"a": have},
+            ongoing_prefetch={})
+        h.WEG2_TAIL_RECOMPUTE_TOKENS = S.WEG2_TAIL_RECOMPUTE_TOKENS
+        h._weg2_note_store_shortfall = lambda req: reason
+        h._prefetch_kvcache = lambda req: "issued"
+        h._weg2_refetch_one = types.MethodType(S._weg2_refetch_one, h)
+        return h
+
+    def test_after_one_zero_re_read_a_page_tail_is_released(self):
+        h = self._holder(have=8704)
+        r = types.SimpleNamespace(rid="a", _prefetch_span_tokens=8768, _1456_n=1, _1471_short=True, _1456_last=0.0)
+        self.assertEqual(h._weg2_refetch_one(r, now=100.0), "complete")
+        self.assertFalse(r._1471_short)
+
+    def test_before_the_first_re_read_and_for_a_long_tail_it_is_re_read(self):
+        h = self._holder(have=8704)
+        r = types.SimpleNamespace(rid="a", _prefetch_span_tokens=8768, _1456_n=0, _1471_short=True, _1456_last=0.0)
+        self.assertEqual(h._weg2_refetch_one(r, now=100.0), "reissued")   # n was 0: read once first
+        h2 = self._holder(have=4096)
+        r2 = types.SimpleNamespace(rid="a", _prefetch_span_tokens=8768, _1456_n=3, _1471_short=True, _1456_last=0.0)
+        self.assertEqual(h2._weg2_refetch_one(r2, now=100.0), "reissued")  # 4672 tokens: a real read
+
+
+class TheWakeRearmsEveryModelOfTheRank(unittest.TestCase):
+    """fnFL2x38: the rearm ran on `_weg2_model_for_group(group)`, which for D
+    is the DRAFT; the MoE layers live in the TARGET. D woke with 0 rearmed
+    layers (P: 3) and TP2 died of an illegal memory access in its first
+    forward on P's expert rows."""
+
+    def test_wake_models_are_target_then_draft_deduplicated(self):
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+        tgt, drf = object(), object()
+        h = types.SimpleNamespace(tp_worker=types.SimpleNamespace(model_runner=types.SimpleNamespace(model=tgt)))
+        h._weg2_model_for_group = lambda g: drf
+        h._weg2_wake_models = types.MethodType(wu.SchedulerWeightUpdaterManager._weg2_wake_models, h)
+        self.assertEqual(h._weg2_wake_models(), [tgt, drf])
+        h._weg2_model_for_group = lambda g: tgt          # shared runner: once
+        self.assertEqual(h._weg2_wake_models(), [tgt])
+        h.tp_worker = None
+        self.assertEqual(h._weg2_wake_models(), [tgt])
+
+    def test_rearm_and_scratch_zero_iterate_the_wake_models(self):
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+        src = inspect.getsource(wu)
+        i = src.index("_wake_models = self._weg2_wake_models()")
+        blk = src[i:i + 3000]
+        self.assertIn("for _m in _wake_models:\n                    _scratch.extend(zero_local_scratch(_m))", blk)
+        self.assertIn("for _m in _wake_models:\n                _l, _z = rearm_expert_offload_after_wake(_m)", blk)
+        self.assertNotIn("_m = self._weg2_model_for_group(self._weg2_group_name())", blk)
+
+
 class ADormantGroupBuildsNoPrefillBatch(unittest.TestCase):
     def test_the_gate_is_the_first_thing_get_new_batch_prefill_does(self):
         src = inspect.getsource(S.get_new_batch_prefill)

@@ -6201,6 +6201,21 @@ class SchedulerWeightUpdaterManager:
         self._weg2_owned_name_keys_cache = keys
         return keys
 
+    def _weg2_wake_models(self) -> list:
+        """fnFL2x38: every model this rank computes with after a wake -- the
+        TARGET (tp_worker's runner: MoE layers, Marlin workspaces, expert
+        pool) and, when present and distinct, the DRAFT.  The exchange asks
+        :meth:`_weg2_model_for_group` for the REGION's runner (D: the draft);
+        the rearm and the scratch zeroing must reach the layers that run."""
+        out: list = []
+        for m in (
+            getattr(getattr(getattr(self, "tp_worker", None), "model_runner", None), "model", None),
+            self._weg2_model_for_group("D"),
+        ):
+            if m is not None and all(m is not o for o in out):
+                out.append(m)
+        return out
+
     def _weg2_model_for_group(self, group: str):
         """The model runner for the given group."""
         if group == "D":
@@ -8557,10 +8572,19 @@ class SchedulerWeightUpdaterManager:
             # a non-zero semaphore makes them spin or read a partial tile.
             # Runs on the waking side, after the tags are mapped and before
             # any forward.
+            # fnFL2x38 (23.09.): BOTH RUNNERS OF THIS RANK, never the group's
+            # exchange runner alone. `_weg2_model_for_group("D")` answers the
+            # DRAFT (the runner whose region the draft leg addresses); the
+            # MoE layers, the Marlin workspaces and the expert pool live in
+            # the TARGET. D woke with 0 rearmed layers (P: 3), ran its first
+            # forward on P's expert rows and stale pool tables, TP2 died of an
+            # illegal memory access two seconds after layer 47.
+            _wake_models = self._weg2_wake_models()
             try:
                 from sglang.srt.weg2.weight_exchange import zero_local_scratch
-                _m = self._weg2_model_for_group(self._weg2_group_name())
-                _scratch = zero_local_scratch(_m) if _m is not None else []
+                _scratch = []
+                for _m in _wake_models:
+                    _scratch.extend(zero_local_scratch(_m))
                 if _scratch:
                     logger.info(
                         "WEG2-RESUME local-scratch zeroed=%d first=%s "
@@ -8586,17 +8610,24 @@ class SchedulerWeightUpdaterManager:
                 rearm_expert_offload_after_wake,
             )
 
-            _m = self._weg2_model_for_group(self._weg2_group_name())
-            if _m is not None:
-                _t_rearm = time.perf_counter()
-                _rl, _rz = rearm_expert_offload_after_wake(_m)
-                if _rl:
-                    logger.info(
-                        "WEG2-RESUME expert-rearm layers=%d rows_from_store=%d "
-                        "ms=%.0f (Platztausch: Praefix kam ueber den Austausch, "
-                        "Pad+Extra aus dem Store, LRU verworfen)",
-                        _rl, _rz, (time.perf_counter() - _t_rearm) * 1000,
-                    )
+            _t_rearm = time.perf_counter()
+            _rl = _rz = 0
+            for _m in _wake_models:
+                _l, _z = rearm_expert_offload_after_wake(_m)
+                _rl += int(_l)
+                _rz += int(_z)
+            if _rl:
+                logger.info(
+                    "WEG2-RESUME expert-rearm layers=%d rows_from_store=%d "
+                    "ms=%.0f models=%d (Platztausch: Praefix kam ueber den Austausch, "
+                    "Pad+Extra aus dem Store, LRU verworfen)",
+                    _rl, _rz, (time.perf_counter() - _t_rearm) * 1000, len(_wake_models),
+                )
+            else:
+                logger.warning(
+                    "WEG2-RESUME expert-rearm NONE: no offload layer on %d wake model(s) "
+                    "of group %s -- a MoE group waking without a rearm computes on the "
+                    "other group's expert rows (x38)", len(_wake_models), self._weg2_group_name())
             card_uuid = self._weg2_card_uuid() or "unknown"
             for tag, (nbytes, tms) in weg2_per_tag.items():
                 # S7 (#1273): THREE FIELDS APPENDED, and the ring planner's
