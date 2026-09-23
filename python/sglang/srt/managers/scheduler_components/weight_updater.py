@@ -3530,27 +3530,6 @@ class SchedulerWeightUpdaterManager:
             return weights_only
         return {str(t): int(v) for t, v in census.items()}, WEG2_TAG_POPULATION_ALL
 
-    def _weg2_group_votes(self, vote: bool) -> List[bool]:
-        """fnFL2x81: every rank's ``vote`` over the group's cpu group, in rank
-        order -- the mid-legs kv verdict is the GROUP's (see
-        ``wake_kv.kv_mid_uniform``). Same collective pattern as the group
-        fence: the bounded ``monitored_barrier`` first (it names a rank that
-        did not join), the unbounded ``all_gather_object`` only behind it.
-        Without a group (world 1, no cpu group) the vote stands alone."""
-        scheduler = self.scheduler
-        world_group = getattr(scheduler, "world_group", None) if scheduler is not None else None
-        cpu_group = getattr(world_group, "cpu_group", None)
-        if cpu_group is None:
-            return [bool(vote)]
-        world = torch.distributed.get_world_size(group=cpu_group)
-        if world <= 1:
-            return [bool(vote)]
-        torch.distributed.monitored_barrier(
-            group=cpu_group, timeout=timedelta(seconds=WEG2_GROUP_FENCE_BUDGET_S))
-        gathered: List[Optional[bool]] = [None] * world
-        torch.distributed.all_gather_object(gathered, bool(vote), group=cpu_group)
-        return [bool(v) for v in gathered]
-
     def _weg2_wake_kv_first_ok(self, tags) -> bool:
         """Wake-Parallel (user 18.09.): may the kv_cache pool be resumed BEFORE
         the weight legs? Only when the card can fund it right now: free -
@@ -8312,7 +8291,6 @@ class SchedulerWeightUpdaterManager:
                     # 0.8 s behind weights_6/7 at every flip
                     _n_wake_workers = _weg2_wake_collect_workers()
                     _wake_worker = _TPE(max_workers=_n_wake_workers, thread_name_prefix="weg2-wake-collect")
-                _weg2_kv_mid_settled = False   # fnFL2x81: the group's mid-legs verdict landed
                 for _ti, tag in enumerate(weights_tags):
                     # C14: the device bytes this tag needs may only exist once
                     # the co-located SLEEPING rank has released them, and with
@@ -8494,48 +8472,32 @@ class SchedulerWeightUpdaterManager:
                     # kv_cache + cuda_graph after the legs -- so the pool is
                     # still PAUSED here whatever this call's tag list says; the
                     # kv RPC then finds it resumed and runs only the clear half)
-                    # fnFL2x81 (23.09.): GROUP-UNIFORM. xsn377 turned this off
-                    # because the per-rank verdicts differed and one rank's
-                    # preload moved its prefixes alone (PrefixLensRankDivergence).
-                    # Now every rank votes after every tag (a rank whose pool is
-                    # not outstanding votes True) and ONE all_gather over the
-                    # group's cpu group makes the verdict the tightest rank's --
-                    # the same collective, the same tag, on every rank, until the
-                    # group has resumed (`_weg2_kv_mid_settled`) or the tags end.
-                    # The gather runs for every tag on every rank (the tag list
-                    # is the front's, identical per rank; no `continue` reaches
-                    # past this point), so the collectives always pair up.
-                    from sglang.srt.weg2 import wake_kv as _wk
-                    _kv_outstanding = (
-                        GPU_MEMORY_TYPE_KV_CACHE in self.offload_tags
-                        and not _weg2_kv_resumed_early
-                        and not (_kv_epoch is not None and self._weg2_kv_resumed_epoch == _kv_epoch))
-                    if _wk.kv_mid_on() and not _weg2_kv_mid_settled:
+                    if (GPU_MEMORY_TYPE_KV_CACHE in self.offload_tags
+                            and not _weg2_kv_resumed_early
+                            and not (_kv_epoch is not None and self._weg2_kv_resumed_epoch == _kv_epoch)
+                            # DEFAULT OFF (xsn377): the decision is per rank, and it
+                            # differed (TP1 6.5 GB funded, TP0 12.3 GB never) -- the
+                            # preload then moved one rank's prefixes and the extend
+                            # died on PrefixLensRankDivergence. A group-uniform verdict
+                            # would be the tightest rank's (TP0: never before the last
+                            # tag), so this stays a lever for a STAGED pool, not for
+                            # the whole one.
+                            and str(os.environ.get("SGLANG_WEG2_WAKE_KV_MID", "0")).strip().lower()
+                            not in ("0", "false", "no", "off")):
                         try:
+                            from sglang.srt.weg2.wake_kv import kv_mid_ok as _kv_mid_ok
                             _ti_mid = list(weights_tags).index(tag)
                             _rest = list(weights_tags)[_ti_mid + 1:]
                             _rest_need = sum(int(tag_bytes.get(t, 0) or 0) for t in _rest)
                             _kv_need = int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_KV_CACHE) or 0)
                             _free_mid = self._weg2_free_bytes()
                             _floor_mid = int(self._weg2_corridor_floor_bytes() or 0)
-                            _vote = _wk.kv_mid_vote(outstanding=_kv_outstanding, free_bytes=_free_mid,
-                                                    floor_bytes=_floor_mid, kv_bytes=_kv_need,
-                                                    remaining_bytes=_rest_need)
-                            _votes = self._weg2_group_votes(bool(_vote))
-                            _mid_ok = _wk.kv_mid_uniform(_votes)
-                            _weg2_kv_mid_settled = bool(_mid_ok)
+                            _mid_ok = _kv_mid_ok(_free_mid, _floor_mid, _kv_need, _rest_need)
                             logger.info("WEG2-WAKE-KV-MID %s after tag=%s free=%s MiB floor=%d MiB kv=%d MiB "
-                                        "remaining=%d tags(%d MiB) votes=%s",
-                                        "RESUME" if _mid_ok else "wait", tag,
+                                        "remaining=%d tags(%d MiB)", "RESUME" if _mid_ok else "wait", tag,
                                         (int(_free_mid) >> 20) if _free_mid is not None else None,
-                                        _floor_mid >> 20, _kv_need >> 20, len(_rest), _rest_need >> 20,
-                                        "".join("1" if v else "0" for v in _votes))
-                            if _mid_ok and not _kv_outstanding:
-                                # this rank's pool is already back: only the
-                                # preload happens here, together with the group
-                                _n_pre = self._weg2_preload_hold()
-                                logger.info("WEG2-WAKE-KV-MID preload only after tag=%s preload=%d", tag, _n_pre)
-                            elif _mid_ok:
+                                        _floor_mid >> 20, _kv_need >> 20, len(_rest), _rest_need >> 20)
+                            if _mid_ok:
                                 _t_mid = time.perf_counter()
                                 # #1490: same rule mid-legs. A refusal here is
                                 # not an error -- the remaining legs still free
