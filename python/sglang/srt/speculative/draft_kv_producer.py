@@ -23,6 +23,7 @@ shared from the target, which does exist on the last stage.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import glob
 import json
@@ -97,6 +98,9 @@ class DraftKvProducer:
         self.card_free_mib = -1.0
         self.other_live_mib = -1.0
         self.head_released_mib = 0.0
+        # fnFL2x12: the BF16 vocab the MTP build materialised, released when
+        # the target-quantized rebuild replaces it.
+        self.embed_released_mib = 0.0
         # #1259 (b): True when the head's own [vocab, hidden] output table was
         # never BUILT (the deferral below) rather than built-and-deleted. The
         # two are not interchangeable on the ledger: a deleted table is still
@@ -184,6 +188,30 @@ class DraftKvProducer:
 
     # -- placement A --------------------------------------------------------
 
+    @contextlib.contextmanager
+    def _draft_weights_scope(self):
+        """The drafter's own device and weights region, as
+        ``model_runner.load_model`` opened them for the draft build: the tag
+        is the one that load recorded, the cpu-backup term the same
+        expression."""
+        from sglang.srt.managers.weg2_memory_saver import (
+            GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+            weights_region,
+        )
+        from sglang.srt.weg2.weight_exchange import weights_cpu_backup_armed
+
+        runner = self.draft_runner
+        identity = runner._weg2_manifest_identity or {}
+        tag = identity.get("region_tag") or GPU_MEMORY_TYPE_WEIGHTS_DRAFT
+        args = runner.server_args
+        enable_cpu_backup = weights_cpu_backup_armed() and (
+            args.enable_weights_cpu_backup or args.enable_draft_weights_cpu_backup
+        )
+        with weights_region(runner.memory_saver_adapter, tag,
+                            enable_cpu_backup=enable_cpu_backup):
+            with torch.device("cuda", torch.cuda.current_device()):
+                yield
+
     def load_resident_embedding(self, model_path: str) -> float:
         """Load the checkpoint's ``embed_tokens`` tensors into the draft's own
         embedding (INT8 via the same quant_config the target uses, #727) and
@@ -220,7 +248,19 @@ class DraftKvProducer:
         inner_config = getattr(inner, "config", None)
         if target_quant is not None and rebuild is not None and inner_config is not None:
             inner._embed_quant_config = target_quant
-            embed = rebuild(inner_config, target_quant, prefix="mtp")
+            # fnFL2x12: the rebuild runs OUTSIDE the loader's device and
+            # memory-saver scopes, so VocabParallelEmbedding materialised
+            # its tables on the CPU -- the first prefill after a flip died in
+            # `layer.weight_packed[x]` (CUDA indices into a CPU table). Build
+            # on the drafter's own device, under its own region tag, so the
+            # table pauses with the draft and the exchange refills it.
+            # The BF16 table the MTP build materialised goes FIRST: released
+            # into the same tag pool, its block can carry the packed rebuild
+            # instead of the pool growing by it (x12: it stayed live, 1212.5
+            # MiB beside the table that replaced it).
+            self.embed_released_mib = _drop_parameters(embed)
+            with self._draft_weights_scope():
+                embed = rebuild(inner_config, target_quant, prefix="mtp")
             inner.embed_tokens = embed
             logger.info(
                 "WEG2 DRAFT-KV-PRODUCER vocab rebuilt under the TARGET's "
