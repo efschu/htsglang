@@ -104,8 +104,11 @@ def _backend_inputs(attn_backend) -> List[Tuple[str, torch.Tensor]]:
 def _pool_lines(model) -> List[str]:
     """The expert pool tables over all MoE layers: per field the range across
     layers, plus the layers whose sticky error word is set."""
+    from sglang.srt.layers.moe.expert_pool_device import bijection_breaks
+
     ranges = {f: [] for f in _POOL_FIELDS}
     error_layers = []
+    breaks = []
     layers = 0
     for module in model.modules():
         cache = getattr(module, "_expert_offload", None)
@@ -113,13 +116,22 @@ def _pool_lines(model) -> List[str]:
         if tables is None:
             continue
         layers += 1
+        # #104: a row naming an expert whose hot_phys points elsewhere is the
+        # state in which evicting it routes that expert to -1.
+        n_breaks = bijection_breaks(tables)
+        if n_breaks:
+            breaks.append((getattr(getattr(cache, "layer", None), "layer_id", "?"), n_breaks))
         for field in _POOL_FIELDS:
             t = getattr(tables, field, None)
             if isinstance(t, torch.Tensor) and t.numel():
                 ranges[field].append((int(t.min().item()), int(t.max().item())))
         if int(tables.error[0]) != 0:
             error_layers.append(getattr(getattr(cache, "layer", None), "layer_id", "?"))
-    lines = [f"pool layers={layers} error_layers={error_layers[:8]}"]
+    lines = [
+        f"pool layers={layers} error_layers={error_layers[:8]}",
+        f"pool.bijection_breaks total={sum(n for _l, n in breaks)} "
+        f"layers={len(breaks)} first={breaks[:6]}",
+    ]
     for field, rs in ranges.items():
         if rs:
             lines.append(

@@ -104,6 +104,11 @@ def _env_int(name: str, default: int) -> int:
 #: after it live (CODE MATCH). The boot-wide budget N was the instrument;
 #: this is the form that keeps the graph decode for everything but that one
 #: round. Rank-uniform: the batch's rids are the same on every rank.
+#: #104 root (desk, 23.09.): the token-major multi-wave extend left the same
+#: expert in two LRU rows of the device pool; the first graph step evicted one
+#: and routed the expert to -1 (expert_pool_device.sync_tables). A one-wave
+#: eager verify never writes such a twin -- that is all "first" bought. With
+#: one owner per expert at the sync this switch is an instrument again.
 EAGER_FIRST = "first"
 
 

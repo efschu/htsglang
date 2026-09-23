@@ -4187,7 +4187,16 @@ class MoEExpertOffloadCache:
                 getattr(self.layer, "top_k", -1),
                 predicted, fetched, pf_hits, max(fetched - pf_hits, 0), pf_skipped,
             )
-        sync_tables(self._pool_tables, dict(self._scratch_holds))
+        twins = sync_tables(self._pool_tables, dict(self._scratch_holds))
+        if lid in (0, 23, 47):
+            # #104 Beweiszeile: ein token-major Extend mit mehreren Wellen legt
+            # denselben Experten in zwei Zeilen; vor dem Fix blieben beide
+            # stehen und der erste Graph-Verify routete ihn auf -1.
+            logging.getLogger(__name__).info(
+                "MoE expert pool layer %s sync: eager pass wrote %d rows, %d twin "
+                "rows freed (one owner per expert, #104)",
+                lid, len(self._scratch_holds), twins,
+            )
 
     def _pool_layout(self):
         """``(hot_slot_of, host_row)`` -- EINE Rechnung fuer Install und

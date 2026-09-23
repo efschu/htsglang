@@ -38,6 +38,10 @@ class _Tables:
         self.row_use = torch.zeros(4, dtype=torch.int64)
         self.error = torch.tensor([error], dtype=torch.int32)
         self.staging_rows = torch.tensor([3], dtype=torch.int32)
+        # resident row 0, LRU rows 1..2, staging row 3; row 2 names expert 2,
+        # whose hot_phys points at the staging row: one #104 bijection break
+        self.lru_start = 1
+        self.pool_rows = 3
 
 
 class _MoE(torch.nn.Module):
@@ -128,6 +132,7 @@ class GraphReplayCensus(unittest.TestCase):
         self.assertNotIn("k_buffer", text)
         self.assertIn("pool layers=2 error_layers=[1]", text)
         self.assertIn("pool.hot_phys min=-1 max=3", text)
+        self.assertIn("pool.bijection_breaks total=2 layers=2", text)
         self.assertIn("done tensors=3", cm.output[-1])
 
 

@@ -215,28 +215,52 @@ def reinit_pool_tables(tables: PoolTables, hot_slot_of: Dict[int, int],
     tables.pf_counts.zero_()
 
 
-def sync_tables(tables: PoolTables, lru_holds: Dict[int, int]) -> None:
+def sync_tables(tables: PoolTables, lru_holds: Dict[int, int]) -> int:
     """After an EAGER forward rewrote the LRU rows (run_waves' fetches): the
     device tables take the host's truth. ``lru_holds`` = row -> expert for the
     rows the eager pass wrote; every other LRU row becomes free (-1), staging
-    rows are never owned. Residents [0, lru_start) are untouched."""
+    rows are never owned. Residents [0, lru_start) are untouched.
+
+    ONE OWNER PER EXPERT (Blocker #104, fnFL2x44-x50). A token-major eager
+    forward fetches every wave's spill experts into the rows [R, R + n_wave)
+    in sorted order, so an expert routed in two waves lands in two DIFFERENT
+    rows, and a row a later, smaller wave does not reach keeps its earlier
+    expert: ``lru_holds`` then names the same expert in two rows (D TP0, x50:
+    8-9 waves per extend layer). Both rows hold that expert's bytes, but the
+    step lives on ``row_key[r] == e`` iff ``hot_phys[e] == r``: evicting the
+    row ``hot_phys`` does not point at clears ``hot_phys[e]`` in the very step
+    that hits ``e`` in the other row, and ``e`` is routed to -1. The marlin
+    MoE runs without an expert map here, so a -1 block reads the expert BEFORE
+    the bank -- the first graph verify after every multi-wave extend. An eager
+    verify (one wave, no twin) healed it, which is what
+    SGLANG_SPEC_EAGER_VERIFY=first bought. Every row the holds name carries
+    its expert's bytes, so any one of them may own it: the last one in the
+    holds map does, every other row naming the same expert is freed.
+
+    Returns the number of twin rows freed (0 for a single-wave pass)."""
     import torch
 
     E, lo, hi = tables.num_experts, tables.lru_start, tables.pool_rows
     hot = tables.hot_phys.cpu()
     key = tables.row_key.cpu()
     use = tables.row_use.cpu()
+    host_row = tables.host_row.cpu()
     clock = int(tables.clock[0])
     for r in range(lo, key.shape[0]):
         old = int(key[r])
         if old >= 0:
             hot[old] = -1
         key[r] = -1
+    owner: Dict[int, int] = {}
+    held = 0
     for r, e in lru_holds.items():
-        if lo <= r < hi and 0 <= e < E and int(tables.host_row[e]) >= 0:
-            hot[e] = r
-            key[r] = e
-            use[r] = clock
+        if lo <= r < hi and 0 <= e < E and int(host_row[e]) >= 0:
+            owner[e] = r
+            held += 1
+    for e, r in owner.items():
+        hot[e] = r
+        key[r] = e
+        use[r] = clock
     dev = tables.hot_phys.device
     tables.hot_phys.copy_(hot.to(dev))
     tables.row_key.copy_(key.to(dev))
@@ -245,6 +269,20 @@ def sync_tables(tables: PoolTables, lru_holds: Dict[int, int]) -> None:
     # prefetch mark on them is stale and would count a later hit as a
     # prefetch hit it never was.
     tables.pf_row[lo:].fill_(-1)
+    return held - len(owner)
+
+
+def bijection_breaks(tables: PoolTables) -> int:
+    """LRU rows that break ``row_key[r] == e`` iff ``hot_phys[e] == r``: a row
+    naming an expert whose ``hot_phys`` points elsewhere, or an expert pointing
+    at an LRU row that names someone else. 0 is the only state the step is
+    written for (#104 census field ``pool.bijection_breaks``). One host read."""
+    lo, hi = tables.lru_start, tables.pool_rows
+    hot = tables.hot_phys.tolist()
+    key = tables.row_key.tolist()
+    breaks = sum(1 for r in range(lo, hi) if key[r] >= 0 and hot[key[r]] != r)
+    breaks += sum(1 for e, r in enumerate(hot) if lo <= r < hi and key[r] != e)
+    return breaks
 
 
 def check_pool_error(tables: PoolTables, where: str = "") -> None:
@@ -390,7 +428,10 @@ def step_reference(
             staged.append((e, staging_rows[len(staged)]))
             continue
         old = row_key[victim]
-        if old >= 0:
+        # #104: only the row that OWNS ``old`` unmaps it. A stale twin (a row
+        # still naming ``old`` while ``hot_phys[old]`` points at another row)
+        # must not route ``old`` to -1 when it is evicted.
+        if old >= 0 and hot[old] == victim:
             hot[old] = -1
         hot[e] = victim
         row_key[victim] = e
@@ -597,7 +638,10 @@ def _step_kernel():
                 if victim_row >= 0:
                     old = tl.load(row_key_ptr + victim_row).to(tl.int64)
                     if old >= 0:
-                        tl.store(hot_phys_ptr + old, -1)
+                        # #104: a stale twin never unmaps the owner's row
+                        owner = tl.load(hot_phys_ptr + old).to(tl.int64)
+                        if owner == victim_row:
+                            tl.store(hot_phys_ptr + old, -1)
                     tl.store(hot_phys_ptr + expert, victim_row.to(tl.int32))
                     tl.store(row_key_ptr + victim_row, expert.to(tl.int32))
                     tl.store(row_use_ptr + victim_row, clock)
@@ -719,7 +763,8 @@ def _copy_kernel():
 __all__ = [
     "PLAN_WIDTH", "ROW_USE_NEVER", "PoolTables", "StepBuffers",
     "allocate_pool_tables", "allocate_step_buffers", "copy_rows",
-    "copy_rows_reference", "step", "step_reference", "sync_tables", "take_report",
+    "bijection_breaks", "copy_rows_reference", "step", "step_reference", "sync_tables",
+    "take_report",
     "take_prefetch_report",
     "check_pool_error",
 ]
