@@ -1364,6 +1364,47 @@ def fairness_reached(oldest_arrival: Optional[float], now: float, w_s: float) ->
     return oldest_arrival is not None and (now - oldest_arrival) >= w_s
 
 
+def _wake_defer_below_mib() -> int:
+    """``SGLANG_WEG2_WAKE_DEFER_BELOW_MIB``: a destination card with less
+    driver-free memory than this at the flip's start joins the wake order only
+    after the roomy cards' tags.  0 (default) keeps the plain round-robin."""
+    try:
+        return max(0, int(os.environ.get("SGLANG_WEG2_WAKE_DEFER_BELOW_MIB", "0") or 0))
+    except ValueError:
+        return 0
+
+
+def _split_tight_destination_cards(
+    seq: List[Any], free_mib: Dict[int, int]
+) -> Tuple[List[Any], List[Any]]:
+    """``(roomy, tight)`` over the destination cards' queue keys.
+
+    fnFL2x8 (Next Flash, Platztausch, 23.09.): the round-robin handed the
+    destination's LAST P stage a tag in round one.  Its chunk needs ~2.7 GB
+    on a 3080 with 1383 MiB driver-free, while the TP source releases only
+    ~0.6 GB of that card per tag -- the resume waited for a credit the source
+    could not give before its lane to that very rank drained, and the leg
+    stalled (W108 on PP2, 90 s ``budget expired`` on PP0).  Summed over the
+    flip, every card had room; only the PATH was infeasible.  A tight card
+    therefore waits behind the roomy ones, tightest last, and gets its tags
+    once the source has released most of that card.
+
+    Keys that are not NVML indices (``-1`` for a tag with no card) and cards
+    absent from the sample count as roomy -- no deferral without a reading.
+    At least one card stays roomy, so the order always starts somewhere."""
+    floor = _wake_defer_below_mib()
+    if floor <= 0 or not free_mib:
+        return list(seq), []
+    roomy = [k for k in seq if k not in free_mib or free_mib[k] >= floor]
+    tight = sorted(
+        (k for k in seq if k in free_mib and free_mib[k] < floor),
+        key=lambda k: -free_mib[k],
+    )
+    if not roomy:
+        roomy, tight = [tight[0]], tight[1:]
+    return roomy, tight
+
+
 def interleave_pause_order(
     tags: List[str],
     tag_cards: Dict[str, Any],
@@ -1426,12 +1467,21 @@ def interleave_pause_order(
                     seq.append(key)
                 queues[key].append(t)
             if len(seq) > 1:
+                roomy, tight = _split_tight_destination_cards(seq, free_mib)
                 rr: list = []
-                while any(queues[k] for k in seq):
-                    for k in seq:
+                while any(queues[k] for k in roomy):
+                    for k in roomy:
                         if queues[k]:
                             rr.append(queues[k].pop(0))
-                return rr + rest, why + ", round-robin over destination cards"
+                for k in tight:
+                    rr.extend(queues[k])
+                why += ", round-robin over destination cards"
+                if tight:
+                    why += (
+                        f" {roomy}; TIGHT destination cards {tight} deferred behind "
+                        f"them (driver_free below {_wake_defer_below_mib()} MiB)"
+                    )
+                return rr + rest, why
         return order_chunks + rest, why
 
     if not tag_cards:
