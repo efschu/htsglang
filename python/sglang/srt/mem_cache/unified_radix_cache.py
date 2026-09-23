@@ -4437,18 +4437,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                                 _size = int(getattr(_hp, "size", -1))
                             except Exception:  # noqa: BLE001 - diagnostic only
                                 _size = -1
+                            # fnFL2x25: the arena pool's [] is NOT exhaustion --
+                            # an UNBOUND arena (no blob/arena on this rank's
+                            # storage tier) yields [] with every slot free.
+                            # Name which one, or "6 free, still dropped" reads
+                            # as a lie (it did, for one boot).
+                            _cause = "exhausted"
+                            if getattr(_hp, "arena_read", False) and getattr(
+                                _hp, "arena", None
+                            ) is None:
+                                _cause = "arena_unbound"
                             logger.warning(
                                 "#1035 PREFETCH DROPPED (host anchor pool "
-                                "exhausted) n=%d comp=%s req=%s prefetch_tokens=%d "
-                                "host_anchor_avail=%s host_anchor_size=%s -- this "
-                                "rank votes the prefetch DOWN; the prompt is "
-                                "recomputed in full. Not a storage miss.",
+                                "%s) n=%d comp=%s req=%s prefetch_tokens=%d "
+                                "host_anchor_avail=%s host_anchor_size=%s pool=%s "
+                                "-- this rank votes the prefetch DOWN; the prompt "
+                                "is recomputed in full. Not a storage miss.",
+                                _cause,
                                 self._1035_n,
                                 comp.component_type,
                                 req_id,
                                 len(prefetch_key),
                                 _avail,
                                 _size,
+                                type(_hp).__name__,
                             )
                         break
                     if transfers:

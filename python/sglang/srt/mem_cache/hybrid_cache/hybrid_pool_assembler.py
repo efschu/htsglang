@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MAMBA_ANCHOR_HOST_AUTO_MULT,
     MambaPoolHost,
     PoolEntry,
+    mamba_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
@@ -559,11 +560,8 @@ def build_hybrid_mamba_stack(
         server_args=server_args,
         use_mla=use_mla,
     )
-    from sglang.srt.mem_cache.pool_host.arena_pool import arena_host_enabled as _arena_on
-    if _arena_on():  # #1427 Stufe 4b
-        from sglang.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost as _MambaCls
-    else:
-        _MambaCls = MambaPoolHost
+    # #1427 Stufe 4b; fnFL2x25: the class this RANK can bind, not the knob alone
+    _MambaCls = mamba_host_pool_cls(MambaPoolHost)
     mamba_host_pool = _MambaCls(
         mamba_pool,
         server_args.hicache_ratio,

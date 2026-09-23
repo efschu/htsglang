@@ -323,6 +323,38 @@ class MambaBlobGeometryError(RuntimeError):
     """
 
 
+def mamba_host_pool_cls(plain_cls=None):
+    """The anchor host pool class THIS rank can bind (fnFL2x25, 23.09.).
+
+    ``plain_cls`` is the caller's OWN ``MambaPoolHost`` name (its module
+    binding, which the hermetic unit fixtures patch); the default is this
+    module's. Returned unchanged unless the arena is on and this rank can
+    bind it.
+
+    The arena pool (#1427b) resolves blobs in the storage tier's arena; a
+    Form A expert worker rides FormAWorkerNullStorage, which has no arena and
+    no canonical mamba blob, so ``ensure_bound`` answers False,
+    ``build_hicache_transfers`` returns [] at every PREFETCH, and the rank
+    leaves the prefetch alone while the host registers it -- measured x25:
+    gloo ``8 vs 4`` on the next prefetch collective, W17. On such a rank the
+    plain pool (x22-proven: one slot per prefetch, the null tier claims every
+    page) is the only class that can take part. ONE chooser for both
+    construction sites (assembler, phase-flip rebind), so they cannot
+    disagree. The arena module is imported only when it is chosen: importing
+    it unconditionally changed the hermetic (no-CUDA) unit path.
+    """
+    from sglang.srt.mem_cache.pool_host.arena_pool import arena_host_enabled
+    from sglang.srt.rank_role import this_rank_is_form_a_worker
+
+    if arena_host_enabled() and not this_rank_is_form_a_worker():
+        from sglang.srt.mem_cache.pool_host.arena_mamba_pool import (
+            ArenaMambaPoolHost,
+        )
+
+        return ArenaMambaPoolHost
+    return MambaPoolHost if plain_cls is None else plain_cls
+
+
 class MambaPoolHost(HostKVCache):
     @revert_pinned_posts_on_failure  # #729
     def __init__(
