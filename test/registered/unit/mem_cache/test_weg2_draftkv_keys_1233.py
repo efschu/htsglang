@@ -37,6 +37,7 @@ SHARES = ((0, 2), (2, 1), (3, 1))
 class FakeDraftHostPool:
     def __init__(self, head_num, head_dim=HEAD_DIM, layer_num=1):
         self.head_num, self.head_dim, self.layer_num = head_num, head_dim, layer_num
+        self.page_size, self.layout = 1, "layer_first"
         self.dtype = torch.uint8
 
     def get_size_per_token(self):

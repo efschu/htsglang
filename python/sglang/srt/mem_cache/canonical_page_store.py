@@ -756,7 +756,10 @@ def build_draft_window(
 ) -> CanonicalExtentWindow:
     """This rank's window in the canonical ``{hash}.draft-{drafter}`` page (#1233).
 
-    The canonical DRAFT page is the WHOLE token page of the draft layer(s):
+    One key is one HOST page of ``host_draft_pool.page_size`` tokens, in the
+    pool's flat order ``(2, layer, page, head, head_dim)``; at page_size 1
+    that is exactly the token page below. The canonical DRAFT page is the
+    WHOLE token page of the draft layer(s):
     ``CanonicalPageSpec(num_draft_layers, 2 * total_kv_heads * head_dim *
     itemsize)`` -- K half-cells of every slot, then V half-cells, every kv
     head (2048 B on the NEXTN head of Qwen3.8-27B: 1 layer, 4 heads, 256
@@ -806,24 +809,42 @@ def build_draft_window(
                 "Refusing at registration: a page read under the same key "
                 "with another head order is a silently wrong draft KV."
             )
-    spec = CanonicalPageSpec(
-        num_attn_layers=layers,
-        kv_bytes_per_token_per_attn_layer=2 * total * head_dim * itemsize,
-    )
+    # fnFL2x19: ONE STORE KEY IS ONE HOST PAGE, and since #66 the draft host
+    # pool pages by 64 tokens. The window used to cut a single token (1024 B
+    # on the Next Flash MTP head) out of the 65536 B each page write handed
+    # it, so every draft page write refused -- 4053 per 259k needle, and on
+    # boot fnFL2x19 the re-issued writes never settled and P's flush_cache
+    # held the P->D flip in quiesce until W3. The page is the host pool's own
+    # flat order ``(2, layer, page, head, head_dim)``; at page_size 1 this is
+    # byte-identical to the token form. ``page_first`` flattens
+    # ``(2, page, layer, ...)`` -- another order under the same key -- and is
+    # refused rather than cut.
+    page = int(host_draft_pool.page_size)
+    if page > 1 and str(host_draft_pool.layout) not in ("layer_first", "page_first_direct"):
+        raise CanonicalPageError(
+            f"draft host pool layout {host_draft_pool.layout!r} at page_size "
+            f"{page} flattens tokens before layers; the canonical draft page "
+            "is (2, layer, page, head, head_dim) and a page cut in another "
+            "order would store another page under the same key."
+        )
+    cell = total * head_dim * itemsize
     k = off * head_dim * itemsize
     length = n * head_dim * itemsize
-    half = spec.half_cell_bytes
-    extents = [(slot * half + k, length) for slot in range(layers)]
-    extents += [(spec.half_page_bytes + slot * half + k, length) for slot in range(layers)]
+    extents = [
+        (((kv * layers + layer) * page + token) * cell + k, length)
+        for kv in range(2)
+        for layer in range(layers)
+        for token in range(page)
+    ]
     window = CanonicalExtentWindow(
-        total_bytes=spec.page_bytes,
+        total_bytes=2 * layers * page * cell,
         extents=_merge_sequential(extents),
         label="draft page",
     )
-    have = int(host_draft_pool.get_size_per_token())
+    have = int(host_draft_pool.get_size_per_token()) * page
     if window.payload_bytes != have:
         raise CanonicalPageError(
-            f"draft window cuts {window.payload_bytes} bytes per token but the "
+            f"draft window cuts {window.payload_bytes} bytes per page but the "
             f"draft host pool holds {have}: the window and the pool disagree "
             "about this rank's draft bytes, so neither can be trusted."
         )

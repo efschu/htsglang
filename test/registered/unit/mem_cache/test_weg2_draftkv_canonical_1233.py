@@ -33,10 +33,13 @@ class FakeDraftHostPool:
     """The three attributes ``build_draft_window`` reads plus the byte count
     the host pool itself reports (``pool_host/mha.py get_size_per_token``)."""
 
-    def __init__(self, head_num, head_dim=HEAD_DIM, layer_num=1):
+    def __init__(self, head_num, head_dim=HEAD_DIM, layer_num=1, page_size=1,
+                 layout="layer_first"):
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
+        self.page_size = page_size
+        self.layout = layout
         self.dtype = torch.uint8
 
     def get_size_per_token(self):
@@ -93,6 +96,28 @@ class TestDraftPageSpec(CustomTestCase):
         )
         self.assertTrue(whole.is_whole)
         self.assertEqual(whole.extents, ((0, PAGE_BYTES),))
+
+    def test_x19_a_64_token_host_page_is_one_canonical_page(self):
+        """fnFL2x19: the Next Flash MTP head (1 layer, 2 kv heads, 256, fp8)
+        pages its draft host pool by 64 tokens; the window cut 1024 B of the
+        65536 B each page write handed it and refused every draft page (P's
+        flush_cache then held the P->D flip in quiesce). Whole heads: one
+        extent over the whole page. Head cut: the (kv, layer, token) cells of
+        the pool's flat order (2, layer, page, head, head_dim)."""
+        whole = build_draft_window(
+            FakeDraftHostPool(2, page_size=64), 2, 0, 2, tp_size=1, tp_rank=0)
+        self.assertEqual(whole.total_bytes, 65536)
+        self.assertEqual(whole.extents, ((0, 65536),))
+        cut = build_draft_window(
+            FakeDraftHostPool(1, page_size=64), 2, 1, 1, tp_size=2, tp_rank=1)
+        self.assertEqual(cut.payload_bytes, 32768)
+        self.assertEqual(cut.extents[:2], ((256, 256), (768, 256)))
+        self.assertEqual(len(cut.extents), 2 * 64)
+
+    def test_x19_page_first_at_page_size_above_one_is_refused(self):
+        with self.assertRaisesRegex(CanonicalPageError, "page_first"):
+            build_draft_window(FakeDraftHostPool(2, page_size=64, layout="page_first"),
+                               2, 0, 2, tp_size=1, tp_rank=0)
 
     def test_t3_refusals_payload_and_head_window(self):
         with self.assertRaises(CanonicalPageError):
