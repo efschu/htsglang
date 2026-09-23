@@ -128,11 +128,29 @@ def _arena_page_load_timing() -> bool:
     return str(os.environ.get("SGLANG_WEG2_ARENA_PAGE_LOAD_TIMING", "0")).strip() not in ("", "0")
 
 
-def _arena_page_load_block() -> int:
-    try:
-        return max(64, int(os.environ.get(ARENA_PAGE_LOAD_BLOCK_ENV, "8192")))  # xsn325: 10.4-12.5 GB/s vs 5.9-11 at 2048
-    except ValueError:
-        return 8192
+#: The pinned stage the default block was tuned for: 8192 pages of the 27B's
+#: 32-KiB page (xsn325: 10.4-12.5 GB/s vs 5.9-11 at 2048) = 256 MiB per stage.
+_PAGE_LOAD_STAGE_BYTES = 8192 * 32768
+
+
+def _arena_page_load_block(page_bytes: int = 0) -> int:
+    """Pages per pinned stage of the all-layer page load.
+
+    fnFL2x65 (23.09.): the default was a PAGE COUNT tuned for the 27B's 32-KiB
+    page. A Next Flash page is 786432 B (12 layers x 64 tokens x 1 KiB), so the
+    same count pinned 2 x 6 GiB (+ the device stage) on D TP0 at the wake --
+    shmem +15 GiB in 4 s, the kernel OOM-killed the rank (x63/x64/x65, py-spy in
+    ``_load_pages_all_layers``). Unset, the block is 256 MiB worth of pages of
+    THIS pool's page; an explicit env value stays a page count."""
+    v = os.environ.get(ARENA_PAGE_LOAD_BLOCK_ENV, "").strip()
+    if v:
+        try:
+            return max(64, int(v))
+        except ValueError:
+            pass
+    if int(page_bytes or 0) > 32768:
+        return max(64, _PAGE_LOAD_STAGE_BYTES // int(page_bytes))
+    return 8192
 
 
 def _arena_load_block_quota():
@@ -624,12 +642,12 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         a pinned host stage and one H2D copy per block, then scatter each
         layer on the device. Two pinned stages alternate so the CPU gather of
         block i+1 overlaps the DMA of block i."""
-        B = _arena_page_load_block()
         n = int(slots.numel())
         if n == 0:
             return
         dev = device_pool.k_buffer[0].device
         pb = self._page_bytes
+        B = _arena_page_load_block(pb)  # x65: a 256-MiB stage, not 8192 pages of any size
         H, D = int(self.head_num), int(self.head_dim)
         e = self.dtype.itemsize
         cell = H * D * e

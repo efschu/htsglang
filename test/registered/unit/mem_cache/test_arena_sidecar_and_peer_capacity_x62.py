@@ -142,3 +142,23 @@ def test_an_arena_pool_without_bytes_bids_the_sentinel():
     p.page_size = 64
     p.size_per_token = 0
     assert p._carrier_capacity_bid(4096) == NO_KV_RANK_TOKENS
+
+
+# ---- 3. the page-load stage is sized in bytes, not pages (x65) ----------------
+
+def test_the_page_load_block_keeps_the_27b_form_and_caps_the_paged_stage():
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop(ap.ARENA_PAGE_LOAD_BLOCK_ENV, None)
+        assert ap._arena_page_load_block(32768) == 8192   # 27B: 256 MiB per stage, unchanged
+        assert ap._arena_page_load_block(0) == 8192       # unbound / desk fixtures
+        # Next Flash: 12 layers x 64 tokens x 1 KiB = 786432 B per page; 8192 of
+        # them pinned 2 x 6 GiB on D TP0 at the wake (x63-x65, kernel OOM)
+        b = ap._arena_page_load_block(786432)
+        assert b == 8192 * 32768 // 786432 == 341
+        assert 2 * b * 786432 <= 2 * (256 << 20)
+        assert ap._arena_page_load_block(64 << 20) == 64  # never below the floor
+
+
+def test_an_explicit_page_load_block_stays_a_page_count():
+    with mock.patch.dict(os.environ, {ap.ARENA_PAGE_LOAD_BLOCK_ENV: "2048"}, clear=False):
+        assert ap._arena_page_load_block(786432) == 2048
