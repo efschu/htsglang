@@ -7991,6 +7991,9 @@ class SchedulerWeightUpdaterManager:
             if scheduler is not None:
                 # W25: the pools are mapped again; the admission seams admit.
                 scheduler.weg2_dormant = False
+                # fnFL2x36: the standstill pass bound gets a grace of one
+                # stall window from here (scheduler._weg2_note_prefetch_progress)
+                scheduler._weg2_last_wake_t = time.perf_counter()
                 logger.info(
                     "WEG2-DORMANT cleared: kv_cache resumed, admission seams admit"
                 )

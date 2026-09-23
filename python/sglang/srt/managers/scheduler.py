@@ -5177,6 +5177,18 @@ class Scheduler(
         settle = getattr(self, "weg2_post_wake_settle", None)
         if not settle:
             return 0
+        if getattr(self, "weg2_dormant", False):
+            # fnFL2x36: the group went back to sleep with requests still
+            # parked (the next flip came 12 s after the wake).  A release
+            # into a dormant scheduler is an extend on paused pools; the
+            # parked requests wait for the next wake, their clocks restart
+            # there (`_1471_since` is re-stamped by the hold release).
+            if not getattr(self, "_x36_settle_dormant_said", False):
+                self._x36_settle_dormant_said = True
+                logger.info("#x36 SETTLE dormant: %d parked request(s) kept until the next wake %s",
+                            len(settle), [str(getattr(r, "rid", "?"))[:12] for r in settle])
+            return 0
+        self._x36_settle_dormant_said = False
         # #1471d (weg2xsn239): a parked request stayed "reading" for the whole
         # 20 s bound and was released short.  The load-back acks that finish
         # its re-read are drained by check_hicache_events, which only the
@@ -6945,6 +6957,11 @@ class Scheduler(
         if _rp.dormant_standstill_holds(getattr(self, "weg2_dormant", False)):
             # xsn344: while this group sleeps the read can only fill as fast as
             # P publishes; the clock (and the pass bound below) start at the wake.
+            # fnFL2x36: THE PASS COUNT TOO.  Only the wall clock restarted
+            # here; `n` kept climbing through the sleep and the first
+            # observation after the wake found 64 >= 64 -> W88, 503, zero
+            # tokens (weg2-0-1, 08:27:37, one page short of its handoff).
+            req._weg2_no_progress_passes = 0
             req._weg2_no_progress_t0 = time.perf_counter()
             if not getattr(req, "_weg2_dormant_wait_said", False):
                 req._weg2_dormant_wait_said = True
@@ -6968,6 +6985,13 @@ class Scheduler(
         # list onto a SimpleNamespace (the #1298 lesson, again).
         if time.perf_counter() - _t0 >= _weg2_prefetch_stall_s():
             return "terminal"
+        # fnFL2x36: the wake's own seconds are a GRACE for the pass bound --
+        # the scheduler passes fast while the legs run (64 in 11 s) and the
+        # store's last page lands after the fence; inside the grace only the
+        # wall bound above (from the wake) may declare a read dead.
+        _wake_t = getattr(self, "_weg2_last_wake_t", None)
+        if _wake_t is not None and time.perf_counter() - float(_wake_t) < _weg2_prefetch_stall_s():
+            return "stalled"
         return "terminal" if n >= self._weg2_prefetch_stall_passes() else "stalled"
 
     def _weg2_store_load_terminal(
@@ -7032,6 +7056,14 @@ class Scheduler(
         )
         refused_id = id(req)
         self.waiting_queue = [q for q in self.waiting_queue if id(q) != refused_id]
+        # fnFL2x36 (23.09.): THE ANSWER IS THE END OF THE REQUEST EVERYWHERE.
+        # weg2-0-1 was answered 503 here at 08:27:37 (site=drain) while it
+        # sat in the post-wake settle list; the list kept it, the 20-s bound
+        # lapsed at 08:27:57 and queued it "as it is" into a group that had
+        # gone dormant again at 08:27:52 -> extend on paused pools, Triton
+        # 'cpu tensor?' on TP1/TP2, illegal memory access on TP0, D dead.
+        _forget = getattr(self, "_weg2_forget_held", None) or functools.partial(Scheduler._weg2_forget_held, self)
+        _forget(req, site="weg2_store_load_terminal")
         _tc = getattr(self, "tree_cache", None)
         if _tc is not None and release_admission_acquired_mamba_slot(
             req, _tc, site="weg2_store_load_terminal"
@@ -7069,6 +7101,30 @@ class Scheduler(
             logger.debug("W88 rid=%s: trace abort raised", rid[:16], exc_info=True)
         self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
         return "failed"
+
+    def _weg2_forget_held(self, req, *, site: str) -> None:
+        """fnFL2x36: drop ``req`` from the dormant hold, the post-wake settle
+        list and the relaxed-claim rid set, and mark it terminal so no tick
+        re-queues it.  Idempotent; a request that is nowhere costs nothing."""
+        rid = getattr(req, "rid", None)
+        req._weg2_terminal = True
+        gone = []
+        for attr in ("weg2_dormant_hold", "weg2_post_wake_settle"):
+            lst = getattr(self, attr, None)
+            if lst and any(r is req for r in lst):
+                lst[:] = [r for r in lst if r is not req]
+                gone.append(attr)
+        try:
+            _cc = self.tree_cache.cache_controller
+            held = getattr(_cc, "weg2_hold_rids", None)
+            if held and rid in held:
+                held.discard(rid)
+                gone.append("weg2_hold_rids")
+        except Exception:  # noqa: BLE001 -- bookkeeping never eats the answer
+            pass
+        if gone:
+            logger.info("#x36 FORGET-HELD rid=%s site=%s removed_from=%s",
+                        str(rid)[:12], site, ",".join(gone))
 
     def _apply_prefetch_deferral(self, req, verdict: str, site: str) -> Optional[str]:
         """Route one prefetch verdict through the A12.2 deferral state machine.
@@ -11692,6 +11748,19 @@ class Scheduler(
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
+        if getattr(self, "weg2_dormant", False) and self.waiting_queue:
+            # fnFL2x36: a DORMANT group builds no prefill batch, whatever
+            # reached its waiting queue (the settle bound queued weg2-0-1 at
+            # 08:27:57 into a group asleep since 08:27:52: extend on paused
+            # pools, D dead on all three ranks).  The pools are mapped again
+            # at the wake; the queue is served then.
+            if not getattr(self, "_x36_dormant_batch_said", False):
+                self._x36_dormant_batch_said = True
+                logger.info("#x36 DORMANT: no prefill batch for %d queued request(s) while the pools are paused %s",
+                            len(self.waiting_queue),
+                            [str(getattr(r, "rid", "?"))[:12] for r in self.waiting_queue[:4]])
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
+        self._x36_dormant_batch_said = False
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision

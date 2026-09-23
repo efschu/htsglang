@@ -4242,9 +4242,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # the FIRST failing one is named -- a request can trip several, and
         # summing them would double-count the way `refused_tokens_by_component`
         # is documented to.
+        _topup = self._weg2_extent_topup(req_id)
         if not locally_eligible:
             reason = "anchor"
-        elif prefetch_length < self.prefetch_threshold:
+        elif prefetch_length < self.prefetch_threshold and not _topup:
             reason = "too_short"
         elif self.cache_controller.prefetch_rate_limited():
             reason = "rate_limited"
@@ -4799,6 +4800,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception:  # noqa: BLE001 - diagnostic only
             pass
         return terms
+
+    def _weg2_extent_topup(self, req_id) -> bool:
+        """fnFL2x36 (23.09.): is this read the TOP-UP of a held request's
+        registered extent?  Then the prefetch threshold does not apply.
+
+        The threshold (256) prices a FRESH read: below it the store round
+        trip costs more than prefilling the tokens.  A request handed over
+        from P is different -- its whole prefix is on the host except the
+        tail P publishes last.  x36: D loaded 8704 of 8768 deliverable
+        tokens at the wake, the top-up of the last page was ``need=64 <
+        threshold=256``, refused as ``too_short`` on every 2-s re-issue, the
+        chain stood still, W88 answered 503 with zero tokens.  The held rids
+        are the ones under #1461's relaxed claim law (``weg2_hold_rids``,
+        kept while a request is held or parked after the wake)."""
+        held = getattr(self.cache_controller, "weg2_hold_rids", None)
+        if not held:
+            return False
+        return req_id in held or str(req_id) in held
 
     def _log_prefetch_refused(self, reason: str, req_id: str, need: int) -> None:
         """L1 (#1068 slice 4): ONE line per refused prefetch behind the #915

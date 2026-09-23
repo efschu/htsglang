@@ -26,7 +26,10 @@ def _holder(states):
     h.ps = types.SimpleNamespace(tp_size=1)
     for n in ("_weg2_release_dormant_hold", "_weg2_post_wake_settle_tick", "_weg2_group_min_flags"):
         setattr(h, n, types.MethodType(getattr(S, n), h))
-    h._weg2_refetch_one = lambda req, now: states[req.rid]
+    # weg2xsn296 added allow_reissue=; a two-argument fake raised TypeError
+    # inside the release, which the fail-soft path read as "queued as it is"
+    # (both requests released, the park never exercised) -- fixed 23.09.
+    h._weg2_refetch_one = lambda req, now, allow_reissue=True: states[req.rid]
     return h
 
 
