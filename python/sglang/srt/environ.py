@@ -461,6 +461,17 @@ class Envs:
     # they are read (weight_name_needed: PLE shards the checkpoint backend
     # only maps, experts and layers other ranks own).
     SGLANG_WEIGHT_LOADER_PREAD = EnvBool(False)
+    # Weight loader: how many threads consume the EXPERT shards a model's
+    # load_weights hands to FusedMoE.weight_loader (Ladezeit 2, 23.09.).
+    # Measured fnFL2x26 with SGLANG_LOAD_PROFILE: 50 % of a 107 s rank load
+    # was the per-shard `expert_data.copy_` (222720 strided host copies,
+    # serial on the loader thread while the eight file workers waited).
+    # The copy releases the GIL, the destinations are disjoint rows of a
+    # stacked [E, ...] parameter, and the per-layer presplit trigger counts
+    # under its own lock -- so the shards can land in parallel. 0 = the
+    # serial form (A/B); the pool is bounded (2 x threads in flight) so the
+    # sliding-window file buffer stays the only thing that holds mmaps.
+    SGLANG_LOAD_CONSUMER_THREADS = EnvInt(4)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
     # HTTP server

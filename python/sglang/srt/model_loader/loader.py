@@ -1023,7 +1023,22 @@ class _LoadSampler:
         self._target = threading.get_ident()
         self._counts: Dict[str, int] = {}
         self._n = 0
+        # Ladezeit 2 (23.09.): the expert shards land in the "load-consumer"
+        # threads now (model_loader/load_consumer.py); sampled separately so
+        # the loader thread's own line keeps its meaning (it reads `wait`
+        # when the consumers are the bottleneck) and the consumers' sites
+        # say WHAT they spend their time on.
+        self._consumer_counts: Dict[str, int] = {}
+        self._consumer_n = 0
         self._t = None
+
+    @staticmethod
+    def _site(frame) -> str:
+        return "%s:%d %s" % (
+            os.path.basename(frame.f_code.co_filename),
+            frame.f_lineno,
+            frame.f_code.co_name,
+        )
 
     def _run(self):
         while not self._stop.is_set():
@@ -1048,15 +1063,22 @@ class _LoadSampler:
             _f = _frames.get(self._target)
             site = None
             if _f is not None:
-                site = "%s:%d %s" % (
-                    os.path.basename(_f.f_code.co_filename),
-                    _f.f_lineno,
-                    _f.f_code.co_name,
-                )
+                site = self._site(_f)
+            consumer_sites = []
+            for _th in threading.enumerate():
+                if not _th.name.startswith("load-consumer"):
+                    continue
+                _g = _frames.get(_th.ident)
+                if _g is not None:
+                    consumer_sites.append(self._site(_g))
+                _g = None
             del _f, _frames          # VOR dem wait, nicht am Schleifenende
             if site is not None:
                 self._counts[site] = self._counts.get(site, 0) + 1
                 self._n += 1
+            for s in consumer_sites:
+                self._consumer_counts[s] = self._consumer_counts.get(s, 0) + 1
+                self._consumer_n += 1
             self._stop.wait(self._interval)
 
     def start(self):
@@ -1076,6 +1098,14 @@ class _LoadSampler:
             elapsed_s,
             "; ".join(f"{s} {100.0*c/self._n:.1f}%" for s, c in rows),
         )
+        if self._consumer_n:
+            crows = sorted(self._consumer_counts.items(), key=lambda kv: -kv[1])[:top]
+            logger_.info(
+                "WEG2 LOAD-PROFILE consumers %d thread-samples over %.1f s -- %s",
+                self._consumer_n,
+                elapsed_s,
+                "; ".join(f"{s} {100.0*c/self._consumer_n:.1f}%" for s, c in crows),
+            )
 
 
 class LayeredModelLoader(DefaultModelLoader):

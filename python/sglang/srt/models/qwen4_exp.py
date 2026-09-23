@@ -2657,6 +2657,42 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
+        from sglang.srt.model_loader.load_consumer import (
+            ExpertLoadPool,
+            consumer_threads,
+            current_device_index,
+        )
+
+        expert_pool = ExpertLoadPool(
+            consumer_threads(), device_index=current_device_index()
+        )
+        with expert_pool:
+            loaded_params = self._load_weights_with_pool(
+                weights,
+                stacked_params_mapping=stacked_params_mapping,
+                expert_params_mapping=expert_params_mapping,
+                fused_expert_params_mapping=fused_expert_params_mapping,
+                num_experts=num_experts,
+                expert_pool=expert_pool,
+            )
+        logger.info(
+            "Ladezeit-2 EXPERT-CONSUMER threads=%d submitted=%d completed=%d",
+            expert_pool.threads,
+            expert_pool.submitted,
+            expert_pool.completed,
+        )
+        return loaded_params
+
+    def _load_weights_with_pool(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        *,
+        stacked_params_mapping,
+        expert_params_mapping,
+        fused_expert_params_mapping,
+        num_experts,
+        expert_pool,
+    ):
         ignore_suffixes = (
             ".bias",
             "_bias",
@@ -2951,8 +2987,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         ):
                             continue
                         param = params_dict[mapped_name]
-                        weight_loader = param.weight_loader
-                        weight_loader(
+                        # Ladezeit 2: the expert shards land through the
+                        # consumer pool (load_consumer.py); serial when
+                        # SGLANG_LOAD_CONSUMER_THREADS=0
+                        expert_pool.submit(
+                            param.weight_loader,
                             param,
                             loaded_weight,
                             mapped_name,
