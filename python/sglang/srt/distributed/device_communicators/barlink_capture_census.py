@@ -101,6 +101,7 @@ __all__ = [
     "capture_census_enabled",
     "segment",
     "note",
+    "eager_note",
     "format_local_capture_census",
 ]
 
@@ -129,7 +130,7 @@ def capture_census_enabled() -> bool:
     return os.environ.get(ENV_ENABLE, "1") not in ("0", "false", "False")
 
 
-def _callsite() -> str:
+def _callsite(frames: int = CALLSITE_FRAMES) -> str:
     """``file:line`` of the first frames outside the transport.
 
     Walks frames directly instead of ``traceback.extract_stack``: the latter
@@ -139,7 +140,7 @@ def _callsite() -> str:
     try:
         out: List[str] = []
         frame = sys._getframe(1)
-        while frame is not None and len(out) < CALLSITE_FRAMES:
+        while frame is not None and len(out) < frames:
             name = frame.f_code.co_filename
             if not any(marker in name for marker in _INTERNAL_MARKERS):
                 out.append(f"{os.path.basename(name)}:{frame.f_lineno}")
@@ -439,6 +440,54 @@ def note(op: str, nbytes: int, variant: Optional[int] = None) -> None:
     if not capture_census_enabled():
         return
     _CAPTURE_CENSUS.note(op, nbytes, variant)
+
+
+# ---------------------------------------------------------------------------
+# The EAGER half (23.09., fnFL2x41). D's first decode round died on its host
+# rank with the ranks' collective sequences already apart right after the
+# extend: the host's next launch was a 48-byte broadcast, the workers had
+# finished a 72-byte one the host never issued. The census above names who
+# asked for every CAPTURED collective; for an eager one nothing in the tree
+# does -- the launch record keeps only the last op, and without the callsite.
+# ``SGLANG_BARLINK_EAGER_TRACE=N`` logs the first N eager launches of this
+# process, one line each: a per-rank sequence the ranks' logs can be diffed
+# by, and the frames that asked for each entry. Off by default (N=0); off, it
+# is one dict read per launch.
+# ---------------------------------------------------------------------------
+ENV_EAGER_TRACE = "SGLANG_BARLINK_EAGER_TRACE"
+
+#: Deeper than the capture census: an eager broadcast's first outside frames
+#: are the process-group plumbing, the seam that asked for it sits below.
+EAGER_TRACE_FRAMES = 6
+
+_EAGER_TRACE: Dict[str, Optional[int]] = {"left": None, "seq": 0}
+
+
+def eager_note(
+    op: str, nbytes: int, variant: Optional[int] = None, group: str = ""
+) -> None:
+    """Log one EAGER collective launch, while the trace budget lasts."""
+    try:
+        left = _EAGER_TRACE["left"]
+        if left is None:
+            try:
+                left = max(0, int(os.environ.get(ENV_EAGER_TRACE, "0") or 0))
+            except ValueError:
+                left = 0
+        if left <= 0:
+            _EAGER_TRACE["left"] = 0
+            return
+        _EAGER_TRACE["left"] = left - 1
+        seq = int(_EAGER_TRACE["seq"] or 0)
+        _EAGER_TRACE["seq"] = seq + 1
+        logger.info(
+            "BARLINK-EAGER-TRACE seq=%d group=%s op=%s nbytes=%d variant=%s site=%s",
+            seq, group or "?", op, int(nbytes),
+            "-" if variant is None else int(variant),
+            _callsite(EAGER_TRACE_FRAMES),
+        )
+    except Exception:  # noqa: BLE001 - instrument must not raise
+        pass
 
 
 def format_local_capture_census(rank: int) -> str:

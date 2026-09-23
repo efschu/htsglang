@@ -5497,6 +5497,13 @@ class BarlinkBar1Transport:
         else:
             self._unchecked_launches += 1
             self._last_op_captured = False
+            from sglang.srt.distributed.device_communicators import (
+                barlink_capture_census,
+            )
+
+            barlink_capture_census.eager_note(
+                op, int(nbytes), variant, str(self.group or "")
+            )
 
     def _rounds_for(self, op: str, nbytes: int) -> int:
         """Round count of the named collective, computed at RAISE time only.
