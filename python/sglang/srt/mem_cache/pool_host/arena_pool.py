@@ -36,6 +36,7 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
 )
 
+from sglang.srt.mem_cache.pool_host.base import NO_KV_RANK_TOKENS
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
 logger = logging.getLogger(__name__)
@@ -213,6 +214,18 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         pool bound by an older fixture."""
         t = getattr(self, "arena_tokens", None)
         return int(t) if t else int(self.arena_slots) * _psz(self)
+
+    def _carrier_capacity_bid(self, size: int) -> int:
+        """fnFL2x62: this pool hands out ids up to staging + A*P, not up to its
+        ``size`` (the staging ring), so a no-KV peer must accept the whole id
+        space. Planned from the environment exactly as ``bind()`` will size
+        the arena (``planned_arena_slots``), because this runs in ``__init__``
+        before the arena is bound."""
+        P = int(getattr(self, "page_size", 1) or 1)
+        spt = int(getattr(self, "size_per_token", 0) or 0)
+        if spt <= 0:
+            return NO_KV_RANK_TOKENS
+        return int(size) + int(planned_arena_slots(spt * P)) * P
 
     def _arena_init_fields(self) -> None:
         self.staging_rows = int(self.size)

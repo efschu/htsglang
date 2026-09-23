@@ -171,6 +171,7 @@ class HostKVCache(abc.ABC):
             self.size = sync_fixed_hicache_size(
                 fixed_host_pool_tokens(host_size, self.size_per_token), host_size
             )
+            self.size = self._sync_no_kv_peers(self.size, host_size)
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align up the host memory pool size to the page size
@@ -225,6 +226,28 @@ class HostKVCache(abc.ABC):
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
         self.clear()
+
+    def _carrier_capacity_bid(self, size: int) -> int:
+        """fnFL2x62: the slot count a peer WITHOUT KV bytes (a Form A expert
+        worker) must accept for this rank's host ids. A plain pool hands out
+        ids below ``size``; the arena pool overrides this with its id space
+        (staging ring + arena tokens), because the first MIN-reduce above saw
+        only its ring (4096 rows) and the workers then refused every 70-page
+        re-read as ``host_pool_exhausted`` while the attention host issued it
+        -- a rank-local exit before a group collective (gloo '8 vs 4' abort)."""
+        return int(size)
+
+    def _sync_no_kv_peers(self, size: int, host_size: float) -> int:
+        """Second MIN-reduce over the SAME group as ``sync_fixed_hicache_size``:
+        ranks holding KV bid :meth:`_carrier_capacity_bid` and keep their own
+        ``size``; a rank with 0 B/token takes the result (the smallest carrier
+        capacity of the group). Every rank of the group constructs this pool
+        in lockstep, so the collective count matches; without a process group
+        the sync returns its input, and the no-KV rank keeps the sentinel."""
+        no_kv = int(self.size_per_token) <= 0
+        bid = NO_KV_RANK_TOKENS if no_kv else self._carrier_capacity_bid(size)
+        synced = sync_fixed_hicache_size(int(bid), host_size)
+        return int(synced) if no_kv else int(size)
 
     def destroy(self):
         """Unregister pinned host buffers in userspace before process exit.

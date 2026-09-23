@@ -3280,6 +3280,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for node in publish_nodes:
                 if id(node) not in direct:  # #1427: a direct write is in the store already
                     self.write_backup_storage(node)
+                else:  # fnFL2x62: ... except its sidecars without an arena home
+                    self._weg2_write_plain_sidecars(node)
 
     def _weg2_publish_at_retain(self, req, radix_key=None) -> None:
         """xsn338: publish the finished request's (and every other unbacked)
@@ -4042,6 +4044,78 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         ):
             self.write_backup(node)
+
+    @staticmethod
+    def _plain_sidecar_transfers(transfers, registered_pools) -> list:
+        """fnFL2x62: the transfers a DIRECT write leaves unwritten -- pools that
+        are registered with the store and have no arena home. KV lives in its
+        slot, an arena mamba blob / arena draft page in theirs (completed by
+        ``_weg2_direct_complete``); a plain V4 sidecar (the QSA index of Next
+        Flash, the paged draft on PP2) reaches the store only through
+        ``batch_set_v2``. Unregistered pools are dropped: the backend indexes
+        ``registered_pools[transfer.name]`` and would KeyError on them."""
+        out = []
+        pools = registered_pools or {}
+        for t in transfers or []:
+            if t.name == PoolName.KV:
+                continue
+            pool = pools.get(t.name)
+            if pool is None or getattr(pool, "arena_read", False):
+                continue
+            out.append(t)
+        return out
+
+    def _weg2_write_plain_sidecars(self, node: UnifiedTreeNode) -> None:
+        """fnFL2x62: a direct write completes the KV page in the arena and the
+        mamba blob / draft page in THEIR arenas, and the write-through ack then
+        skips ``write_backup_storage`` -- so a sidecar pool WITHOUT an arena
+        home was never written: P issued 0 store writes (x58: 12), D found 0
+        QSA anchors and capped every claim to 0 ('#1035c ... by=qsa_indexer'),
+        held the request in a zero-answer loop and the group died on the
+        refetch vote. Issue the store write for exactly those pools, KV
+        skipped (``sidecar_only``): the same transfers ``write_backup_storage``
+        builds, filtered by :meth:`_plain_sidecar_transfers`."""
+        cc = self.cache_controller
+        if not self.enable_storage or cc is None or not node.backuped:
+            return
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        for comp in self._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            transfers = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_STORAGE)
+            if transfers:
+                comp_xfers[comp.component_type] = transfers
+        hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=hv, keys=node.hash_value)
+        xfers = [x for xs in comp_xfers.values() for x in xs]
+        xfers.extend(self._build_sidecar_transfers(CacheTransferPhase.BACKUP_STORAGE, kv_xfer, comp_xfers))
+        xfers = self._plain_sidecar_transfers(
+            xfers, getattr(cc.storage_backend, "registered_pools", None)
+        )
+        if not xfers:
+            return
+        prefix_keys = None
+        if self.hicache_storage_pass_prefix_keys:
+            prefix_keys = node.get_prefix_hash_values(node.parent)
+        operation_id = cc.write_storage(
+            hv, node.key.token_ids, node.hash_value, prefix_keys,
+            extra_pools=xfers, sidecar_only=True,
+        )
+        n = getattr(self, "_106s_n", 0) + 1
+        self._106s_n = n
+        if n <= 16 or n % 64 == 0:
+            logger.info(
+                "#106S SIDECAR-WRITE-ISSUED n=%d op=%s node=%s pages=%d pools=%s "
+                "(KV direct-written to the arena; the plain sidecars go to the store)",
+                n, operation_id, getattr(node, "id", "?"), len(node.hash_value or []),
+                [str(getattr(t.name, "value", t.name)) for t in xfers],
+            )
+        self.ongoing_backup[operation_id] = (
+            node,
+            self.inc_host_lock_ref(node).to_dec_params(),
+        )
+        if self.staging_write_ring is not None:
+            self.staging_write_ring.occupy(operation_id, len(hv))
 
     def write_backup_storage(self, node: UnifiedTreeNode) -> None:
         # #1233 STORE-WRITE census (boots weg2ls3b1/b2): group P's FIRST

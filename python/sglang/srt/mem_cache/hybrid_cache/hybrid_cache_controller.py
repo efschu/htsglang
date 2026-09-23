@@ -889,7 +889,11 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
         kv_page_owner_mask: Optional[torch.Tensor] = None,
+        sidecar_only: bool = False,
     ) -> int:
+        """``sidecar_only`` (fnFL2x62): the KV pages are already in the store
+        (direct-written arena slots); only ``extra_pools`` are persisted and
+        the operation acks as complete for every token."""
         operation = StorageOperation(
             host_indices,
             token_ids,
@@ -898,6 +902,7 @@ class HybridCacheController(BaseHiCacheController):
             pool_transfers=extra_pools,
         )
         operation.kv_page_owner_mask = kv_page_owner_mask
+        operation.sidecar_only = bool(sidecar_only)
         self.backup_queue.put(operation)
         return operation.id
 
@@ -1230,6 +1235,13 @@ class HybridCacheController(BaseHiCacheController):
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_set_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+
+        if getattr(operation, "sidecar_only", False):
+            # fnFL2x62: the KV pages of this operation are direct-written
+            # arena slots, already complete in the store; only the plain
+            # sidecars above had to be persisted. Ack every token.
+            operation.completed_tokens = len(operation.hash_value) * self.page_size
+            return
 
         # Backup kv pools
         super()._page_backup(operation)
