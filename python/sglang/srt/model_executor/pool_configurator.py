@@ -435,6 +435,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # kv_tail_cell_bytes on the very line declared authoritative for the
         # ring's cost.
         self._kv_tail_target_cell_size = int(target_cell_size)
+        # #1243 slice 2q: the QSA index keys (Next Flash) are IN that cell --
+        # bf16 already and never shadowed by the ring, which holds the
+        # full-attention K/V only. Kept apart so the ring cell is not charged
+        # (and printed) with them.
+        self._kv_tail_qsa_cell = int(
+            self._compute_qsa_cell_size(
+                hf_config=mr.model_config.hf_config, num_layers=num_layers
+            )
+        )
         self._kv_tail_mr = mr
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
@@ -695,7 +704,90 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             pass
         return 4 * (int(rows) + int(page_size) + 1)
 
-    def _kv_tail_ring_post(self, page_size: int):
+    def _kv_tail_charge_ring(self, available_bytes, page_size: int):
+        """#1243: take the ring post off ``available_bytes`` or refuse.
+
+        Refused, never clamped: the ring is not shortened, because a silently
+        shorter tail is precision the operator asked for and did not get.
+        Returns ``(available_bytes, tail_post, tail_terms)``."""
+        tail_post, tail_terms = self._kv_tail_ring_post(page_size, available_bytes)
+        if not tail_post:
+            return available_bytes, tail_post, tail_terms
+        left = int(available_bytes) - int(tail_post)
+        if left <= 0:
+            from sglang.srt.mem_cache.kv_tail import Weg2KvTailUnfundable
+
+            raise Weg2KvTailUnfundable(
+                "W140 Weg2KvTailUnfundable: the precision-tail ring post of "
+                f"{tail_post} bytes ({tail_terms['rows']} rows x "
+                f"{tail_terms['cell']} B/row) leaves "
+                f"{left} bytes for the KV pool on this rank. "
+                "Lower --kv-tail-min-tokens or --kv-tail-ring-rows; the "
+                "ring is not clamped, because a silently shorter tail is "
+                "precision the operator asked for and did not get."
+            )
+        return left, tail_post, tail_terms
+
+    @staticmethod
+    def _kv_tail_refuse_headroom_form(mr, dcp_size: int) -> None:
+        """#1243 slice 2e-II: the headroom ring is refused by name where it
+        would be VRAM taken and never used, or sized with arithmetic that does
+        not exist yet."""
+        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+        from sglang.srt.mem_cache.kv_tail import (
+            Weg2KvTailFormRefused,
+            Weg2KvTailUnfundable,
+        )
+
+        if not is_qwen_qsa(getattr(mr.model_config, "hf_config", None)):
+            raise Weg2KvTailFormRefused(
+                "W142 Weg2KvTailFormRefused: --kv-tail-headroom needs the elastic "
+                "rows reader (QSA / Next Flash). This model's attention reads "
+                "the ring through FlashInfer's paged plan, whose window is fixed "
+                "at --kv-tail-min-tokens -- a headroom ring would be VRAM taken "
+                "from the pool and never read."
+            )
+        if dcp_size > 1:
+            raise Weg2KvTailUnfundable(
+                "W140 Weg2KvTailUnfundable: --kv-tail-headroom is sized for "
+                f"dcp_size 1; this rank runs dcp_size {dcp_size}. Under weighted "
+                "DCP the admission bound is a token SHARE per rank (the uneven "
+                "sizing path), and that arithmetic is not built for the ring."
+            )
+
+    def _kv_tail_headroom_terms(
+        self, mr, sa, mrr: int, page_size: int, available_bytes, ring_cell: int
+    ) -> dict:
+        """#1243 slice 2e-II: the KV the admission bound can never use.
+
+        At most ``max_running_requests`` requests run, each capped at
+        ``--max-kv-per-request`` (else the context length). The pool keeps
+        that bound plus one page per request (speculative over-allocation and
+        page rounding) plus one page of slack; the rest of the per-rank bytes
+        -- minus the mapping the ring needs -- becomes bf16 ring rows. The
+        post then leaves the pool at or above the bound by construction.
+        """
+        if available_bytes is None:
+            raise RuntimeError(
+                "#1243 slice 2e-II: the headroom ring is sized from "
+                "available_bytes and the caller did not pass them."
+            )
+        ctx = int(getattr(mr.model_config, "context_len", 0) or 0)
+        cap = int(getattr(sa, "max_kv_per_request", None) or ctx)
+        if ctx:
+            cap = min(cap, ctx)
+        need = int(mrr) * cap
+        total = int(available_bytes) // int(self._cell_size)
+        spare = max(0, total - need - (int(mrr) + 1) * int(page_size))
+        map_bytes = self._kv_tail_map_bytes(total, page_size)
+        head_bytes = spare * int(self._cell_size) - int(map_bytes)
+        return {
+            "headroom_rows": max(0, head_bytes // int(ring_cell)),
+            "need_tokens": need,
+            "spare_tokens": spare,
+        }
+
+    def _kv_tail_ring_post(self, page_size: int, available_bytes: Optional[int] = None):
         """#1243: this rank's bf16 ring as a BUDGET POST, plus its terms.
 
         Basis 2.8 asks for an age-dependent bytes-per-token at the sizing
@@ -722,6 +814,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             max_tokens=int(getattr(sa, "kv_tail_max_tokens", -1)),
             ring_rows=getattr(sa, "kv_tail_ring_rows", None),
             host_max_tokens=getattr(sa, "kv_tail_host_max_tokens", None),
+            headroom=bool(getattr(sa, "kv_tail_headroom", False)),
         )
         if not knobs.enabled:
             return 0, {}
@@ -737,6 +830,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         dcp_size = int(get_parallel().attn_dcp_size or 1)
         dcp_rank = int(get_parallel().attn_dcp_rank or 0)
+        if knobs.headroom:
+            self._kv_tail_refuse_headroom_form(mr, dcp_size)
         if dcp_size > 1:
             cp_S, _lo, _hi, cp_ratio = dcp_weighted_owner_bounds(dcp_size, dcp_rank)
         else:
@@ -750,9 +845,22 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             rows = auto_ring_rows(mrr, knobs.min_tokens, cp_ratio, cp_S)
         base_cell = int(
             getattr(self, "_kv_tail_target_cell_size", 0) or self._cell_size
-        )
+        ) - int(getattr(self, "_kv_tail_qsa_cell", 0) or 0)
         ring_cell = base_cell // max(self._kv_tail_body_itemsize, 1) * 2
+        head = {}
+        if knobs.headroom:
+            if ring_cell <= 0:
+                # No full-attention KV on this rank (Form A expert worker):
+                # nothing to shadow, nothing to post.
+                return 0, {}
+            head = self._kv_tail_headroom_terms(mr, sa, mrr, page_size, available_bytes, ring_cell)
+            rows = max(int(rows or 0), int(head["headroom_rows"]))
+            # The installer builds the ring with THESE rows -- never a second
+            # derivation that could disagree with the post charged here.
+            mr._kv_tail_ring_rows_sized = int(rows)
         return int(rows) * int(ring_cell), {
+            **head,
+            "headroom": bool(knobs.headroom),
             "rows": int(rows),
             "cell": int(ring_cell),
             "min_tokens": knobs.min_tokens,
@@ -780,24 +888,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         available_bytes = max(
             0, int(available_bytes) - int(getattr(self, "_window_pool_reserve_bytes", 0) or 0)
         )
-        # #1243: the ring post comes off available_bytes BEFORE the division,
-        # or the ring is unfunded and the boot OOMs at pool init instead of
-        # refusing here. 0 and byte-identical when the tail is off.
-        tail_post, tail_terms = self._kv_tail_ring_post(page_size)
-        if tail_post:
-            available_bytes = int(available_bytes) - int(tail_post)
-            if available_bytes <= 0:
-                from sglang.srt.mem_cache.kv_tail import Weg2KvTailUnfundable
-
-                raise Weg2KvTailUnfundable(
-                    "W54 Weg2KvTailUnfundable: the precision-tail ring post of "
-                    f"{tail_post} bytes ({tail_terms['rows']} rows x "
-                    f"{tail_terms['cell']} B/row) leaves "
-                    f"{available_bytes} bytes for the KV pool on this rank. "
-                    "Lower --kv-tail-min-tokens or --kv-tail-ring-rows; the "
-                    "ring is not clamped, because a silently shorter tail is "
-                    "precision the operator asked for and did not get."
-                )
+        # #1243: the ring post comes off available_bytes BEFORE the division
+        # (and AFTER every other reserve: the headroom ring is sized from what
+        # is left). 0 and byte-identical when the tail is off.
+        available_bytes, tail_post, tail_terms = self._kv_tail_charge_ring(
+            available_bytes, page_size
+        )
         _tail_map_bytes = 0
         max_total_num_tokens = (
             self._KVLESS_STAGE_TOKENS
@@ -819,7 +915,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 from sglang.srt.mem_cache.kv_tail import Weg2KvTailUnfundable
 
                 raise Weg2KvTailUnfundable(
-                    "W54 Weg2KvTailUnfundable: the precision-tail ring post "
+                    "W140 Weg2KvTailUnfundable: the precision-tail ring post "
                     f"({tail_post} B) plus its slot mapping "
                     f"({_tail_map_bytes} B) leaves {available_bytes} bytes "
                     "for the KV pool on this rank."
@@ -868,7 +964,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     "kv_tail_ring_bytes=%d kv_tail_map_bytes=%d min_tokens=%s "
                     "max_tokens=%s host_max_tokens=%s "
                     "dcp_share=%s mrr=%s post_bytes=%d "
-                    "tail_dtype=%s body_dtype=%s"
+                    "tail_dtype=%s body_dtype=%s "
+                    "headroom=%s need_tokens=%s spare_tokens=%s"
                     % (
                         tail_terms["rows"],
                         tail_terms["cell"],
@@ -882,6 +979,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         tail_terms.get("post_bytes", tail_post),
                         tail_terms["tail_dtype"],
                         tail_terms["body_dtype"],
+                        # #1243 slice 2e-II: what the headroom ring took and
+                        # what the admission bound kept ("-" = not asked for).
+                        tail_terms.get("headroom", False),
+                        tail_terms.get("need_tokens", "-"),
+                        tail_terms.get("spare_tokens", "-"),
                     )
                 )
             ),

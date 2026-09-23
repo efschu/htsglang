@@ -1396,6 +1396,18 @@ class ServerArgs:
             "given up. Slice 5; refused until then.",
         ),
     ] = False
+    kv_tail_headroom: A[
+        bool,
+        Arg(
+            help="Precision tail (#1243 slice 2e-II): size the bf16 ring from "
+            "the KV pool the admission bound can never use -- the pool minus "
+            "--max-running-requests x the per-request cap (--max-kv-per-request, "
+            "else the context length). 16-bit KV as long as KV VRAM is free; "
+            "the elastic window lets the running requests grow into it. Rows "
+            "reader (QSA / Next Flash) and dcp 1 only; refused by name "
+            "elsewhere. Turns the tail on by itself.",
+        ),
+    ] = False
     max_queued_requests: A[
         Optional[int],
         "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
@@ -7322,6 +7334,9 @@ class ServerArgs:
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
+        # #1243 slice 2q: the tail's page-size gate by reader (needs the model
+        # config the line above loaded).
+        self._handle_kv_tail_page_form()
 
         # Set kernel backends.
         self._handle_sampling_backend()
@@ -8942,12 +8957,13 @@ class ServerArgs:
             virtual_fp8=self.kv_tail_virtual_fp8,
             sidecar=self.kv_tail_sidecar,
             draft=self.kv_tail_draft,
+            headroom=bool(getattr(self, "kv_tail_headroom", False)),
         )
         knobs.validate(page_size=self.page_size)
         if self.kv_tail_shrink_hysteresis_rounds is not None:
             if self.kv_tail_shrink_hysteresis_rounds < 1:
                 raise ValueError(
-                    "W54 Weg2KvTailUnfundable: "
+                    "W140 Weg2KvTailUnfundable: "
                     "--kv-tail-shrink-hysteresis-rounds must be >= 1, got "
                     f"{self.kv_tail_shrink_hysteresis_rounds}. Shrinking is "
                     "immediate; regrowth needs proof, and zero rounds of proof "
@@ -8960,7 +8976,7 @@ class ServerArgs:
         ):
             if value:
                 raise ValueError(
-                    f"W54 Weg2KvTailUnfundable: {flag} is not implemented on "
+                    f"W140 Weg2KvTailUnfundable: {flag} is not implemented on "
                     f"this tree (precision tail slice {slice_no}; slice 1 "
                     "ships the bf16 ring, the second decode attention call and "
                     "the trimmed body plan only). Refused rather than accepted "
@@ -8969,13 +8985,11 @@ class ServerArgs:
                 )
         if not knobs.enabled:
             return
-        if self.page_size != 1:
-            raise ValueError(
-                "W58 Weg2KvTailFormRefused: the precision tail needs "
-                f"--page-size 1, got {self.page_size}. The body-slot -> "
-                "ring-row mapping is indexed per TOKEN by the compacted "
-                "physical slot the weighted DCP owner rule produces."
-            )
+        # #1243 slice 2q: the page-size gate depends on WHO READS the ring,
+        # and that needs the model config -- decided in
+        # _handle_kv_tail_page_form, right after the model-specific
+        # adjustments have loaded it (still before any weight is touched).
+        self._kv_tail_page_form_pending = True
         # #1426 slice 2: CUDA graphs are supported -- the tail wrappers of a
         # captured decode/verify are graph-mode wrappers (use_cuda_graph,
         # frozen buffers sized to the ring) re-planned out of graph per step;
@@ -8984,6 +8998,43 @@ class ServerArgs:
         # -- the target's verify EXTEND plans the tail over the ring
         # (_kv_tail_plan_verify) and merges it after the paged body call
         # (_kv_tail_merge_verify). No refusal here.
+
+    def _handle_kv_tail_page_form(self, hf_config=None):
+        """#1243 slice 2q: ``--page-size > 1`` under the precision tail, by
+        READER.
+
+        The PAGED reader (FlashInfer: 27B and every non-QSA model) plans its
+        body read over page ids, so a tail boundary inside a page has no
+        reading -- refused as before. The ROWS reader (QSA: Qwen4-Exp / Next
+        Flash, which REQUIRES a page that is a multiple of the compress
+        ratio) addresses one token row per selected token, so the per-token
+        mapping holds at any page size -- accepted. ``hf_config`` is for
+        tests; the parse path reads the model config the model-specific
+        adjustments just loaded."""
+        # The page size is read HERE, not when _handle_kv_tail ran: the
+        # model-specific overrides may resolve it in between (the Qwen hybrid
+        # family's page default lives in arg_groups/overrides.py).
+        if not getattr(self, "_kv_tail_page_form_pending", False):
+            return
+        if int(self.page_size or 1) == 1:
+            return
+        reader = "paged"
+        if hf_config is None and str(self.model_path).lower() not in ("none", "dummy"):
+            hf_config = self.get_model_config().hf_config
+        if hf_config is not None:
+            from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+            if is_qwen_qsa(hf_config):
+                reader = "rows"
+        if reader == "paged":
+            raise ValueError(
+                "W142 Weg2KvTailFormRefused: the precision tail needs "
+                f"--page-size 1 on this model, got {self.page_size}. Its "
+                "attention reads the KV through a paged plan whose indices "
+                "are pages, and the body-slot -> ring-row mapping is indexed "
+                "per TOKEN (only the QSA rows reader, one row per selected "
+                "token, is page-size-free)."
+            )
 
     def _handle_hicache_host_role(self):
         """#810: fail fast when the host tier is declared staging but sized

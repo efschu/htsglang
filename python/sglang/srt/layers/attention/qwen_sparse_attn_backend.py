@@ -456,12 +456,126 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.dcp_model_config, self.dcp_size, local_heads
         )
 
+    def _kv_tail_ring(self):
+        """#1243 slice 2q: the precision-tail ring on this backend's pool, or
+        None (tail off, draft pool, Form A expert worker)."""
+        return getattr(self.token_to_kv_pool, "kv_tail", None)
+
+    def _kv_tail_write(self, layer, loc, mask, k, v) -> None:
+        """The ring half of the double write, at the SAME (loc, mask) the body
+        write takes. The rows were handed out at plan time (precommit), so the
+        claim here is a pure gather and capture-safe. Runs BEFORE the body
+        write: the fp8 body write divides ``k``/``v`` by the KV scale in place
+        (memory_pool.MHATokenToKVPool.set_kv_buffer), and the ring must see
+        the unscaled 16-bit values."""
+        ring = self._kv_tail_ring()
+        if ring is None:
+            return
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
+        loc_t, _, full_loc = unwrap_write_loc(loc)
+        ring_loc, ring_mask = ring.claim(full_loc if full_loc is not None else loc_t, mask)
+        if ring_loc is not None:
+            ring.write(layer, ring_loc, ring_mask, k, v)
+
+    def _kv_tail_plan(self, forward_batch, in_capture: bool = False) -> None:
+        """#1243 slice 2q: one step of the tail's sliding window, OUT OF GRAPH.
+
+        Target sites only -- the draft runs its own backend on its own pool,
+        which carries no ring. Decode writes one token per request, verify the
+        chain of draft tokens at ``seq_lens + [0, d)`` (``_graph_speculative
+        _layout``), extend the chunk at ``prefix + [0, extend_len)``. The
+        token's REQUEST INDEX is derived from those lengths, never from
+        ``positions``: Qwen4-Exp rotates with M-RoPE, where an image moves the
+        rope position but not the ``req_to_token`` column."""
+        ring = self._kv_tail_ring()
+        if ring is None:
+            return
+        mode = forward_batch.forward_mode
+        if mode.is_target_verify():
+            site = "verify"
+        elif mode.is_decode():
+            site = "decode"
+        elif mode == ForwardMode.EXTEND or mode.is_split_prefill():
+            site = "extend"
+        else:
+            ring.disarm()
+            return
+        if in_capture:
+            # The capture writes the runner's dummy slots: no rows handed out,
+            # the in-graph claim gathers the (null) mapping.
+            ring.begin_step(site)
+            ring.precommit_skip()
+            return
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
+        loc_t, _, full_loc = unwrap_write_loc(forward_batch.out_cache_loc)
+        loc = (full_loc if full_loc is not None else loc_t).reshape(-1)
+        # A graph replay hands a view whose batch is PADDED (``num_padding``
+        # trailing requests) while ``out_cache_loc`` carries the real tokens
+        # only (decode_cuda_graph_runner.build_replay_fb_view): every request
+        # array is cut to the real requests first.
+        bs = int(forward_batch.req_pool_indices.numel())
+        bs -= max(0, int(getattr(forward_batch, "num_padding", 0) or 0))
+        dev = loc.device
+        seq_lens = forward_batch.seq_lens[:bs].to(device=dev, dtype=torch.int64)
+        arange_bs = torch.arange(bs, device=dev, dtype=torch.int64)
+        expect_read = True
+        if site == "decode":
+            loc = loc[:bs]
+            tok_req = arange_bs
+            tok_index = seq_lens - 1
+        elif site == "verify":
+            d = int(getattr(forward_batch.spec_info, "draft_token_num", 0) or 0)
+            if d <= 0:
+                d = int(loc.numel()) // max(bs, 1)
+            loc = loc[: bs * d]
+            tok_req = arange_bs.repeat_interleave(d)
+            within = torch.arange(bs * d, device=dev, dtype=torch.int64) - tok_req * d
+            tok_index = seq_lens[tok_req] + within
+        else:
+            ext = forward_batch.extend_seq_lens[:bs].to(device=dev, dtype=torch.int64)
+            ext_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+            n_real = (
+                sum(int(x) for x in ext_cpu[:bs]) if ext_cpu is not None else int(ext.sum())
+            )
+            loc = loc[:n_real]
+            tok_req = torch.repeat_interleave(arange_bs, ext, output_size=n_real)
+            starts = torch.cumsum(ext, 0) - ext
+            within = torch.arange(n_real, device=dev, dtype=torch.int64) - starts[tok_req]
+            tok_index = (seq_lens - ext)[tok_req] + within
+            prefix_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+            # Only an extend over a prefix reads the pool (the first chunk
+            # attends its own fresh 16-bit k/v, no rows kernel).
+            expect_read = bool(
+                prefix_cpu is None or any(int(x) > 0 for x in list(prefix_cpu)[:bs])
+            )
+        ring.plan_rows_step(
+            site,
+            loc,
+            tok_req,
+            tok_index,
+            forward_batch.req_pool_indices[:bs],
+            self.req_to_token,
+            expect_read,
+        )
+
+    def _kv_tail_operands(self, layer):
+        """The rows kernel's ``tail=`` argument for this layer, and the launch
+        noted -- or None with the tail off."""
+        ring = self._kv_tail_ring()
+        if ring is None:
+            return None
+        ring.note_rows_launch()
+        return ring.rows_operands(layer.layer_id)
+
     def _set_kv_buffer(self, forward_batch, layer, k: torch.Tensor, v: torch.Tensor) -> None:
         """Store this forward's k/v: every row on a non-DCP pool, only the
         owned rows (at their compact slot) under DCP -- the dense backends'
         write rule, stated through the same shared helpers."""
         loc = forward_batch.out_cache_loc
         if self.dcp_size <= 1:
+            self._kv_tail_write(layer, loc, None, k, v)
             self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
             return
         if self.uneven_dcp_weighted:
@@ -481,6 +595,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 getattr(forward_batch, "dcp_kv_mask", None),
             )
             loc = loc // self.dcp_size
+        self._kv_tail_write(layer, loc, mask, k, v)
         self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v, dcp_kv_mask=mask)
 
     def _local_rows(self, slots: torch.Tensor) -> torch.Tensor:
@@ -594,9 +709,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool = self.token_to_kv_pool
         k_pool = pool.get_key_buffer(layer.layer_id)
         v_pool = pool.get_value_buffer(layer.layer_id)
+        # #1243 slice 2q: with the precision tail on, every lane whose row has
+        # a bf16 ring row reads it in 16 bit (one kernel, no merge).
+        tail = self._kv_tail_operands(layer)
+        # Passed only when on: the tail-off call stays the pre-#1243 call.
+        tail_kw = {} if tail is None else {"tail": tail}
         if self.dcp_size <= 1:
             out, _ = sparse_attn_rows_triton(
-                q.contiguous(), k_pool, v_pool, rows, layer.scaling, row_counts=row_counts
+                q.contiguous(), k_pool, v_pool, rows, layer.scaling, row_counts=row_counts, **tail_kw
             )
             return out
         from sglang.srt.layers.dcp.comm import (
@@ -618,10 +738,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             rows, row_counts = compact_owned_rows(rows)
         if row_counts is not None:
             out, lse = sparse_attn_rows_triton(
-                q_all, k_pool, v_pool, rows, layer.scaling, row_counts=row_counts
+                q_all, k_pool, v_pool, rows, layer.scaling, row_counts=row_counts, **tail_kw
             )
         else:
-            out, lse = sparse_attn_rows_triton(q_all, k_pool, v_pool, rows, layer.scaling)
+            out, lse = sparse_attn_rows_triton(q_all, k_pool, v_pool, rows, layer.scaling, **tail_kw)
         # The merge scales in fp32 and hands back fp32 (fn1x 2026-09-16: every
         # rank died in o_proj with 'float != BFloat16'); the layer's output
         # projection expects the query dtype.
@@ -1129,8 +1249,11 @@ class QwenSparseAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch):
         if forward_batch.forward_mode.is_idle():
             self.forward_metadata = None
+            self._kv_tail_plan(forward_batch)
             return
         self.forward_metadata = self._metadata_from_forward_batch(forward_batch)
+        # #1243 slice 2q: the tail's step plan, out of graph (eager entry).
+        self._kv_tail_plan(forward_batch)
 
     def init_forward_metadata_out_graph(
         self,
@@ -1162,6 +1285,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 num_padding=num_padding if num_padding is not None else 0,
             )
+        # #1243 slice 2q: the tail's step plan, out of graph (capture: rows
+        # are NOT handed out -- the capture writes dummy slots; replay: the
+        # real step's age-out and precommit).
+        self._kv_tail_plan(forward_batch, in_capture=in_capture)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         if self.device is None:
@@ -1850,6 +1977,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 q, layer, forward_batch, topk_indices
             )
             return self._pad_extend_output(output, num_output_rows)
+        tail_on = self._kv_tail_ring() is not None
         if not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
@@ -1860,6 +1988,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 pool.get_value_buffer(layer.layer_id),
                 slots,
                 layer.scaling,
+                **({"tail": self._kv_tail_operands(layer)} if tail_on else {}),
             )
             return self._pad_extend_output(output, num_output_rows)
 
@@ -1888,10 +2017,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return self._pad_extend_output(output, num_output_rows)
 
-        if self.dcp_size > 1 or (_qsa_rows_path_armed() and q.is_cuda):
+        if self.dcp_size > 1 or (_qsa_rows_path_armed() and q.is_cuda) or (tail_on and q.is_cuda):
             # WP3b: the prefix rows live on their owner ranks; attend the owned
             # subset on the gathered heads and LSE-merge (see _attend_rows).
             # fn5e: also the non-DCP branch -- see _qsa_rows_path_armed.
+            # #1243 slice 2q: and always with the precision tail on (the only
+            # reader of the ring).
             metadata = self._resolve_metadata(forward_batch)
             rows, counts = self._rows_and_counts(topk_indices, metadata)
             output = self._attend_rows(q, layer, rows, counts)
@@ -2083,7 +2214,12 @@ class QwenSparseAttnBackend(AttentionBackend):
         if save_kv_cache:
             self._set_kv_buffer(forward_batch, layer, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-        if self.dcp_size <= 1 and _qsa_rows_path_armed() and q.is_cuda:
+        # #1243 slice 2q: the precision tail is read by the rows kernel only,
+        # so a tail-on rank takes it even where the rows path is switched off.
+        tail_on = self._kv_tail_ring() is not None
+        if self.dcp_size <= 1 and (
+            (_qsa_rows_path_armed() and q.is_cuda) or (tail_on and q.is_cuda)
+        ):
             # fn5e: rows kernel on every rank (see _qsa_rows_path_armed)
             metadata = self._resolve_metadata(forward_batch)
             rows, counts = self._rows_and_counts(topk_indices, metadata)
@@ -2100,18 +2236,28 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool = self.token_to_kv_pool
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
+        tail_on = self._kv_tail_ring() is not None
         if not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
-            output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
+            output = qsa_sparse_attention(
+                q, k_buffer, v_buffer, slots, layer.scaling,
+                **({"tail": self._kv_tail_operands(layer)} if tail_on else {}),
+            )
             return output.reshape(q.shape[0], -1)
 
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
-        trtllm_decode = _resolve_trtllm_sparse_decode() if self.dcp_size <= 1 else None
+        # #1243 slice 2q: trtllm reads the pool through page tables and cannot
+        # see the ring, so a tail-on rank verifies on the rows kernel.
+        trtllm_decode = (
+            _resolve_trtllm_sparse_decode()
+            if self.dcp_size <= 1 and not tail_on
+            else None
+        )
         if trtllm_decode is None and _speculative_rows_route(
             self.dcp_size,
-            _qsa_rows_path_armed(),
+            _qsa_rows_path_armed() or tail_on,
             q.is_cuda,
             _resolve_flash_attn_varlen_func_or_none() is not None,
         ):

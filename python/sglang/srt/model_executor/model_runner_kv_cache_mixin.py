@@ -3578,14 +3578,21 @@ class ModelRunnerKVCacheMixin:
             virtual_fp8=bool(getattr(sa, "kv_tail_virtual_fp8", False)),
             sidecar=bool(getattr(sa, "kv_tail_sidecar", False)),
             draft=bool(getattr(sa, "kv_tail_draft", False)),
+            headroom=bool(getattr(sa, "kv_tail_headroom", False)),
         )
         if not knobs.enabled:
             return None
+        # #1243 slice 2e-II: the headroom ring's rows were sized -- and their
+        # bytes charged -- by pool_configurator._kv_tail_ring_post; the ring is
+        # built with exactly those, never a second derivation.
+        _sized = getattr(self, "_kv_tail_ring_rows_sized", None)
+        if knobs.headroom and _sized:
+            knobs.ring_rows = int(_sized)
         # BASIS 7.3 IS DEFERRED TO SLICE 5, SO THE DRAFT IS EXEMPT BY NAME.
         # This branch is taken by the draft pool worker too, and a draft with a
         # ring is worse than a draft without one: every draft decode step
         # carries `spec_info.kv_indptr`, so the weighted-DCP plan branch is
-        # skipped, no tail plan is armed, and the per-layer merge raises W58 on
+        # skipped, no tail plan is armed, and the per-layer merge raises W142 on
         # the first step. The tail is a TARGET-side feature until slice 5 gives
         # the draft its own tail rule (and its own pressure precedence).
         if getattr(self, "is_draft_worker", False) or getattr(
@@ -3615,7 +3622,7 @@ class ModelRunnerKVCacheMixin:
                 from sglang.srt.mem_cache.kv_tail import Weg2KvTailFormRefused
 
                 raise Weg2KvTailFormRefused(
-                    "W58 Weg2KvTailFormRefused: the precision tail refuses "
+                    "W142 Weg2KvTailFormRefused: the precision tail refuses "
                     f"EVEN modulo DCP (dcp_size={dcp_size}). That lane "
                     "inflates the allocator index space and the page "
                     "granularity by the split factor, and its write loc is "
@@ -3629,6 +3636,14 @@ class ModelRunnerKVCacheMixin:
             index_space = "global"
         else:
             cp_S, cp_ratio = 1, 1
+        # #1243 slice 2q: WHO READS the ring. A QSA model (Qwen4-Exp / Next
+        # Flash) reads its full-attention KV one row per selected token
+        # (qwen_sparse_attn_backend._attend_rows); every other model here reads
+        # it through FlashInfer's paged plan. The same predicate the backend
+        # registry uses to pick QwenSparseAttnBackend decides it.
+        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+        reader = "rows" if is_qwen_qsa(self.model_config.hf_config) else "paged"
         return install_kv_tail_ring(
             self.token_to_kv_pool,
             knobs,
@@ -3638,6 +3653,7 @@ class ModelRunnerKVCacheMixin:
             enable_memory_saver=bool(getattr(sa, "enable_memory_saver", False)),
             owner_bounds=owner_bounds,
             allocator_index_space=index_space,
+            reader=reader,
         )
 
     def _decoupled_kv_pool_override(

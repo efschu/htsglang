@@ -549,6 +549,10 @@ def _sparse_attn_rows_fwd(
     scale,
     topk,
     counts,
+    tail_k,
+    tail_v,
+    tail_map,
+    tail_read,
     sq_m: tl.constexpr,
     sq_h: tl.constexpr,
     sq_d: tl.constexpr,
@@ -565,6 +569,12 @@ def _sparse_attn_rows_fwd(
     sl_h: tl.constexpr,
     sr_m: tl.constexpr,
     sr_n: tl.constexpr,
+    stk_n: tl.constexpr,
+    stk_h: tl.constexpr,
+    stk_d: tl.constexpr,
+    stv_n: tl.constexpr,
+    stv_h: tl.constexpr,
+    stv_d: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -572,6 +582,7 @@ def _sparse_attn_rows_fwd(
     HEAD_DIM: tl.constexpr,
     KV_FP8: tl.constexpr,
     USE_COUNTS: tl.constexpr,
+    HAS_TAIL: tl.constexpr,
 ):
     """WP3b: sparse GQA over ABSOLUTE K/V rows, with the LSE.
 
@@ -583,6 +594,15 @@ def _sparse_attn_rows_fwd(
     ``lse`` this kernel emits is what the group's LSE merge combines. A query
     whose rows are all ``-1`` (this rank owns none of its keys) gets out=0 and
     lse=-inf, which the merge weighs as exp(-inf)=0.
+
+    PRECISION TAIL (#1243 slice 2q, ``HAS_TAIL``): ``tail_map[row]`` is the
+    bf16 ring row that shadows pool row ``row`` (-1 = none). A lane whose row
+    has one reads K/V from ``tail_k``/``tail_v`` in 16 bit; every other lane
+    reads the pool exactly as without the tail. So each selected token is read
+    ONCE, from ONE source -- no second pass, no merge. Group 0 of each query
+    adds its tail lanes to ``tail_read`` (the READ fact, counted on the
+    device so a graph replay counts too). ``HAS_TAIL=False`` keeps the masks
+    of the tail-less kernel exactly.
     """
     query = tl.program_id(0).to(tl.int64)
     group = tl.program_id(1)
@@ -597,11 +617,14 @@ def _sparse_attn_rows_fwd(
     q_values = (q_values * scale * 1.4426950408).to(q_values.dtype)
     k_base = k + group * sk_h
     v_base = v + group * sv_h
+    tk_base = tail_k + group * stk_h
+    tv_base = tail_v + group * stv_h
     row_ptr = rows + query * sr_m
     max_value = tl.full([BLOCK_M], -float("inf"), tl.float32)
     normalizer = tl.zeros([BLOCK_M], tl.float32)
     accumulator = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
     offs_n = tl.arange(0, BLOCK_N)
+    tail_lanes = tl.zeros([BLOCK_N], tl.int32)
     # Owned-row compaction (Task #42, 19.09.): under DCP every rank holds only
     # its OWN subset of a query's top-k rows (the rest are -1). Looping to
     # ``topk`` and masking the foreign lanes still runs the tile math for every
@@ -618,14 +641,22 @@ def _sparse_attn_rows_fwd(
         row = tl.load(row_ptr + current * sr_n, mask=current < topk, other=-1).to(tl.int64)
         valid = row >= 0
         safe_row = tl.where(valid, row, 0)
+        if HAS_TAIL:
+            ring_row = tl.load(tail_map + safe_row, mask=valid, other=-1).to(tl.int64)
+            in_tail = valid & (ring_row >= 0)
+            in_body = valid & (ring_row < 0)
+            safe_ring = tl.where(in_tail, ring_row, 0)
+            tail_lanes += in_tail.to(tl.int32)
+        else:
+            in_body = valid
         keys_raw = tl.load(
             k_base + safe_row[None, :] * sk_n + offs_d[:, None] * sk_d,
-            mask=valid[None, :],
+            mask=in_body[None, :],
             other=0,
         )
         values_raw = tl.load(
             v_base + safe_row[:, None] * sv_n + offs_d[None, :] * sv_d,
-            mask=valid[:, None],
+            mask=in_body[:, None],
             other=0,
         )
         if KV_FP8:
@@ -634,6 +665,19 @@ def _sparse_attn_rows_fwd(
         else:
             keys = keys_raw.to(q_values.dtype)
             values = values_raw.to(q_values.dtype)
+        if HAS_TAIL:
+            tail_keys = tl.load(
+                tk_base + safe_ring[None, :] * stk_n + offs_d[:, None] * stk_d,
+                mask=in_tail[None, :],
+                other=0,
+            ).to(q_values.dtype)
+            tail_values = tl.load(
+                tv_base + safe_ring[:, None] * stv_n + offs_d[None, :] * stv_d,
+                mask=in_tail[:, None],
+                other=0,
+            ).to(q_values.dtype)
+            keys = tl.where(in_tail[None, :], tail_keys, keys)
+            values = tl.where(in_tail[:, None], tail_values, values)
         scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
         next_max = tl.maximum(max_value, tl.max(scores, 1))
         # A block with no valid key leaves next_max at -inf; exp2(-inf - -inf)
@@ -668,6 +712,9 @@ def _sparse_attn_rows_fwd(
         lse_value,
         mask=offs_h < GROUP_SIZE,
     )
+    if HAS_TAIL:
+        # One count per (query, row): every head group reads the same rows.
+        tl.atomic_add(tail_read, tl.sum(tail_lanes, axis=0).to(tl.int64), mask=group == 0)
 
 
 def compact_owned_rows(rows):
@@ -683,13 +730,18 @@ def compact_owned_rows(rows):
     return rows_sorted.contiguous(), counts.contiguous()
 
 
-def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale, row_counts=None):
+def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale, row_counts=None, tail=None):
     """(out [Tq, Hq, D] in q.dtype, lse [Tq, Hq] fp32 natural log) for the
     selected absolute rows; see ``_sparse_attn_rows_fwd``.
 
     ``row_counts`` ([Tq] int32, from ``compact_owned_rows``) bounds every
     query's loop to its leading valid rows; without it the loop runs to
-    ``topk`` and masks."""
+    ``topk`` and masks.
+
+    ``tail`` (#1243 slice 2q) is ``(tail_k, tail_v, tail_map, tail_read)``:
+    the precision tail's bf16 ring buffers for this layer, the int32 pool-row
+    -> ring-row mapping (-1 = none) and the int64 device scalar the kernel
+    adds its tail lanes to. ``None`` is the tail-less kernel."""
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k_pool.shape[1]
     group_size = num_q_heads // num_kv_heads
@@ -701,6 +753,22 @@ def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale, row_counts=None):
             raise ValueError("row_counts must have one entry per query row")
     else:
         row_counts = rows  # unused pointer; USE_COUNTS=False never reads it
+    has_tail = tail is not None
+    if has_tail:
+        tail_k, tail_v, tail_map, tail_read = tail
+        if tail_k.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            raise TypeError(f"sparse rows kernel: the tail ring must be 16/32 bit, got {tail_k.dtype}")
+        if tuple(tail_k.shape[1:]) != tuple(k_pool.shape[1:]) or tuple(
+            tail_v.shape[1:]
+        ) != tuple(v_pool.shape[1:]):
+            raise ValueError(
+                "sparse rows kernel: the tail ring's (heads, head_dim) "
+                f"{tuple(tail_k.shape[1:])} differ from the pool's {tuple(k_pool.shape[1:])}"
+            )
+        if tail_map.dtype != torch.int32 or not tail_map.is_contiguous():
+            raise TypeError("sparse rows kernel: the tail mapping must be contiguous int32")
+        if tail_read.dtype != torch.int64 or tail_read.numel() != 1:
+            raise TypeError("sparse rows kernel: the tail read counter must be one int64")
     out = torch.empty_like(q)
     lse = torch.empty((total_q, num_q_heads), dtype=torch.float32, device=q.device)
     if total_q == 0:
@@ -711,6 +779,15 @@ def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale, row_counts=None):
         k_pool, v_pool = k_pool.view(torch.uint8), v_pool.view(torch.uint8)
     elif k_pool.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError(f"sparse rows kernel: unsupported KV dtype {k_pool.dtype}")
+    if not has_tail:
+        # Unused pointers; HAS_TAIL=False never dereferences them.
+        tail_k, tail_v, tail_map, tail_read = k_pool, v_pool, rows, rows
+        tail_strides = (0, 0, 0, 0, 0, 0)
+    else:
+        tail_strides = (
+            tail_k.stride(0), tail_k.stride(1), tail_k.stride(2),
+            tail_v.stride(0), tail_v.stride(1), tail_v.stride(2),
+        )
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
     _sparse_attn_rows_fwd[(total_q, num_kv_heads)](
@@ -723,6 +800,10 @@ def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale, row_counts=None):
         scale,
         rows.shape[-1],
         row_counts,
+        tail_k,
+        tail_v,
+        tail_map,
+        tail_read,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -739,6 +820,7 @@ def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale, row_counts=None):
         lse.stride(1),
         rows.stride(0),
         rows.stride(1),
+        *tail_strides,
         NUM_KV_HEADS=num_kv_heads,
         GROUP_SIZE=group_size,
         BLOCK_M=block_m,
@@ -746,6 +828,7 @@ def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale, row_counts=None):
         HEAD_DIM=head_dim,
         KV_FP8=kv_fp8,
         USE_COUNTS=use_counts,
+        HAS_TAIL=has_tail,
         num_warps=warps,
         num_stages=stages,
     )

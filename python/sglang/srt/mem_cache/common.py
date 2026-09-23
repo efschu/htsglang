@@ -1864,6 +1864,13 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         get_kv_session_offload_manager().release_finished_spilled_req(req)
         return
 
+    # #1243 slice 2q: the precision tail is private per request and the tree
+    # holds fp8 only (basis 7.1). Release the request's 16-bit rows BEFORE the
+    # tree takes its slots; no ring installed -> returns at the first lookup.
+    from sglang.srt.mem_cache.kv_tail import release_request_ring_rows
+
+    release_request_ring_rows(req, tree_cache)
+
     tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),

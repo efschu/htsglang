@@ -274,8 +274,14 @@ def qsa_sparse_attention(
     v_cache: torch.Tensor,
     token_slots: torch.Tensor,
     softmax_scale: Optional[float] = None,
+    tail=None,
 ) -> torch.Tensor:
-    """Torch reference for sparse GQA over physical token slots."""
+    """Torch reference for sparse GQA over physical token slots.
+
+    ``tail`` (#1243 slice 2q) is the rows kernel's ``(tail_k, tail_v,
+    tail_map, tail_read)``: a slot whose ``tail_map`` entry is >= 0 is read
+    from the bf16 ring instead of the cache, and the lanes so read are added
+    to ``tail_read`` -- the same rule as ``_sparse_attn_rows_fwd``."""
 
     if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
         raise ValueError("q, k_cache and v_cache must be rank-3 tensors")
@@ -288,6 +294,21 @@ def qsa_sparse_attention(
         raise ValueError("Q/K/V head dimensions must match")
     if q.shape[1] % k_cache.shape[1] != 0:
         raise ValueError("query heads must be divisible by KV heads")
+    if tail is not None:
+        tail_k, tail_v, tail_map, tail_read = tail
+        slots = token_slots.long()
+        valid = slots >= 0
+        ring_rows = tail_map[slots.clamp(min=0)].long()
+        in_tail = valid & (ring_rows >= 0)
+        tail_read.add_(in_tail.sum().to(tail_read.dtype))
+        # One cache with the ring rows appended; tail lanes point past the
+        # cache's end. Reference-only (CPU desk path): the rows kernel does
+        # the same selection per lane without the concatenation.
+        base = k_cache.shape[0]
+        k_all = torch.cat((k_cache.float(), tail_k.float()), dim=0)
+        v_all = torch.cat((v_cache.float(), tail_v.float()), dim=0)
+        slots = torch.where(in_tail, base + ring_rows.clamp(min=0), slots)
+        return qsa_sparse_attention_reference(q, k_all, v_all, slots, softmax_scale)
     return qsa_sparse_attention_reference(
         q, k_cache, v_cache, token_slots, softmax_scale
     )

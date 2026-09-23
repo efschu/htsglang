@@ -1707,11 +1707,18 @@ P_BARLINK_BAR1_WINDOW_MIB = "24,PP_0=96"
 #: Group P's device mamba pool (--max-mamba-cache-size); see argv_p.
 P_MAX_MAMBA_CACHE_SIZE = 24
 #: #1243/#1425 precision tail on D (--kv-tail-min-tokens). 0 = OFF. Design
-#: default is 16384 (basis 7.6), but slice 1 merges the tail on the DECODE
-#: wrapper path only; under MTP (law: ON) the target step is a verify-extend,
-#: so an armed tail would be a W56 no-op that stops the boot. Off until the
-#: verify path merges the tail (slice 2). Set per boot with --d-kv-tail-min-tokens.
+#: default is 16384 (basis 7.6). Slice 2 (#1426-#1429) merges the tail on the
+#: MTP verify path of the FlashInfer reader (27B); slice 2q reads it inside
+#: Next Flash's QSA rows kernel. Stays 0 until a boot proves it on the serving
+#: form (functional acceptance: bf16 provenance, in_tail plateau, merges
+#: counted). Set per boot with --d-kv-tail-min-tokens.
 D_KV_TAIL_MIN_TOKENS = 0
+#: #1243 slice 2q: the same tail on group P (basis slice 6's P ring, in the
+#: form the rows reader gives for free: P's chunked prefill reads its newest N
+#: prompt tokens in 16 bit). 0 = OFF; set per boot with --p-kv-tail-min-tokens.
+#: The FlashInfer reader keeps its ring disarmed on extend, so on 27B this
+#: buys nothing until slice 2d reaches that reader.
+P_KV_TAIL_MIN_TOKENS = 0
 
 
 class Weg2LaunchRefused(RuntimeError):
@@ -3147,6 +3154,12 @@ def argv_p(
         # the size of P's req_to_token_pool (R-13), which is why it is
         # resolved before the budget solve and printed with it.
         "--max-running-requests", str(p_bs),
+    ] + (
+        ["--kv-tail-min-tokens", str(P_KV_TAIL_MIN_TOKENS)]
+        if P_KV_TAIL_MIN_TOKENS > 0
+        and not any(str(a).startswith("--kv-tail-min-tokens") for a in extra)
+        else []
+    ) + [
         "--tp-size", "1", "--pp-size", "3",
         # #692 MICROBATCH DEPTH, group P only -- group D runs pp_size=1 and a
         # pipeline depth is meaningless there. STATED even at 0 so the argv is
@@ -11368,7 +11381,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--d-kv-tail-min-tokens", type=int, default=D_KV_TAIL_MIN_TOKENS,
         help="#1243/#1425: group D's precision-tail minimum (bf16 rows for the newest "
              "N tokens of every sequence, --kv-tail-min-tokens on D). 0 = off (default "
-             "until the MTP verify path merges the tail); the design default is 16384.")
+             "until a boot proves it on the serving form); the design default is 16384.")
+    ap.add_argument(
+        "--p-kv-tail-min-tokens", type=int, default=P_KV_TAIL_MIN_TOKENS,
+        help="#1243 slice 2q: group P's precision-tail minimum (--kv-tail-min-tokens on "
+             "P). With Next Flash's QSA rows reader P's chunked prefill reads its newest "
+             "N prompt tokens in 16 bit. 0 = off (default).")
     ap.add_argument(
         "--pin-ledger-arm-s", type=int, default=1,
         help="#1422 (boot xsn172): the pinned arm's host KV pool S (GB) for group P. "
@@ -12608,8 +12626,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _ACTIVE_BOOT_STATE = None
     ns = build_parser().parse_args(argv)
     apply_spec_form(ns)
-    global D_KV_TAIL_MIN_TOKENS
+    global D_KV_TAIL_MIN_TOKENS, P_KV_TAIL_MIN_TOKENS
     D_KV_TAIL_MIN_TOKENS = int(getattr(ns, "d_kv_tail_min_tokens", D_KV_TAIL_MIN_TOKENS) or 0)
+    P_KV_TAIL_MIN_TOKENS = int(getattr(ns, "p_kv_tail_min_tokens", P_KV_TAIL_MIN_TOKENS) or 0)
     # #1386: THE SWITCH IS RESOLVED HERE, ONCE, AS EARLY AS `ns` EXISTS --
     # earlier than `draft_kv_on_p` below, because the FIRST `common_flags`
     # call (the sentinel `chunk_tokens` solve, several hundred lines down)

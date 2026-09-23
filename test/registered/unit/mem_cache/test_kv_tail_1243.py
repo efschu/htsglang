@@ -59,6 +59,18 @@ HEADS = 2
 HEAD_DIM = 8
 
 
+def _qsa_hf_config():
+    """The QSA indexer fields of Next Flash (Qwen3.8-Flash-Next config.json:
+    4 index heads, 1 index kv head, dim 128, budget 2048, ratio 4)."""
+    return types.SimpleNamespace(
+        indexer_n_heads=4,
+        indexer_kv_heads=1,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+    )
+
+
 def _body_pool(rows=64, dtype=torch.float8_e4m3fn):
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
@@ -434,7 +446,7 @@ class TestCountersAndDueGate(CustomTestCase):
             self.assertIn(field, line, line)
 
     def test_held_rows_attended_by_nobody_is_a_named_refusal(self):
-        """W56, arm (a): the shape boot weg2kvtail1 shipped."""
+        """W141, arm (a): the shape boot weg2kvtail1 shipped."""
         ring = _ring(rows=16)
         ring.claim(
             torch.tensor([20, 21], dtype=torch.int64), torch.ones(2, dtype=torch.bool)
@@ -443,10 +455,10 @@ class TestCountersAndDueGate(CustomTestCase):
         kv_indices = torch.tensor([30, 31], dtype=torch.int32)
         with self.assertRaises(Weg2KvTailNoOp) as cm:
             ring.plan(kv_indptr, kv_indices, torch.tensor([2]))
-        self.assertIn("W56 Weg2KvTailNoOp", str(cm.exception))
+        self.assertIn("W141 Weg2KvTailNoOp", str(cm.exception))
 
     def test_rows_that_vanished_without_a_release_is_a_named_refusal(self):
-        """W56, arm (b): a deleter between the writer and its only reader --
+        """W141, arm (b): a deleter between the writer and its only reader --
         exactly the per-LAYER reset that rooted the probe."""
         ring = _ring(rows=16)
         ring.claim(
@@ -460,7 +472,7 @@ class TestCountersAndDueGate(CustomTestCase):
         kv_indices = torch.tensor([20, 21], dtype=torch.int32)
         with self.assertRaises(Weg2KvTailNoOp) as cm:
             ring.plan(kv_indptr, kv_indices, torch.tensor([2]))
-        self.assertIn("W56 Weg2KvTailNoOp", str(cm.exception))
+        self.assertIn("W141 Weg2KvTailNoOp", str(cm.exception))
 
     def test_reset_is_counted_so_a_wipe_is_never_silent(self):
         ring = _ring(rows=16)
@@ -488,7 +500,7 @@ class TestKnobValidation(CustomTestCase):
         with self.assertRaises(Weg2KvTailUnfundable) as cm:
             KvTailKnobs(min_tokens=16384, max_tokens=4096).validate()
         m = str(cm.exception)
-        self.assertIn("W54 Weg2KvTailUnfundable", m)
+        self.assertIn("W140 Weg2KvTailUnfundable", m)
         self.assertIn("16384", m)
         self.assertIn("--kv-tail-max-tokens", m)
 
@@ -563,7 +575,7 @@ class TestSizingAndForm(CustomTestCase):
         body.page_size = 2
         with self.assertRaises(Weg2KvTailFormRefused) as cm:
             KvTailRing(body, KvTailKnobs(min_tokens=8), ring_rows=16)
-        self.assertIn("W58 Weg2KvTailFormRefused", str(cm.exception))
+        self.assertIn("W142 Weg2KvTailFormRefused", str(cm.exception))
 
     def test_an_hnd_body_pool_is_refused_by_name(self):
         body = _body_pool(64)
@@ -710,7 +722,7 @@ class TestAllocatorIndexSpace(CustomTestCase):
                 owned_share_den=1,
                 allocator_index_space="even",
             )
-        self.assertIn("W58 Weg2KvTailFormRefused", str(cm.exception))
+        self.assertIn("W142 Weg2KvTailFormRefused", str(cm.exception))
 
     def test_a_global_index_space_without_bounds_is_refused(self):
         from sglang.srt.mem_cache.kv_tail import (
@@ -1091,6 +1103,9 @@ class TestTheMixinRingBuilderRuns(_OnPathBase):
             token_to_kv_pool=_body_pool(rows),
             is_draft_worker=False,
             is_draft_pool_worker=False,
+            # Slice 2q: the reader is read off the model config; a config
+            # without QSA indexer fields is the paged (FlashInfer) reader.
+            model_config=types.SimpleNamespace(hf_config=types.SimpleNamespace()),
         )
 
     def test_the_ring_is_installed_on_the_pool_with_the_tail_on(self):
@@ -1159,10 +1174,31 @@ class TestTheLauncherOnPathRefusals(_OnPathBase):
         return sa
 
     def test_a_paged_body_is_refused_because_the_mapping_is_per_token(self):
+        """Slice 2q: the gate is decided by READER once the model config is
+        loaded; a model without a QSA profile is the paged reader and keeps
+        the page-size-1 refusal."""
         sa = self._sa(kv_tail_min_tokens=16384, page_size=16)
+        sa._handle_kv_tail()  # records the pending gate, decides nothing yet
         with self.assertRaises(ValueError) as cm:
-            sa._handle_kv_tail()
+            sa._handle_kv_tail_page_form(hf_config=types.SimpleNamespace())
         self.assertIn("--page-size 1", str(cm.exception))
+
+    def test_the_qsa_rows_reader_accepts_a_paged_body(self):
+        """Slice 2q: Next Flash's QSA reads one row per selected token and
+        REQUIRES a page that is a multiple of the compress ratio -- page 64
+        must parse with the tail on."""
+        sa = self._sa(kv_tail_min_tokens=16384, page_size=64)
+        sa._handle_kv_tail()
+        sa._handle_kv_tail_page_form(hf_config=_qsa_hf_config())
+
+    def test_the_page_gate_reads_the_page_size_after_the_overrides(self):
+        """The overrides may resolve the page size between the two halves;
+        the second half reads the CURRENT value, not a flag frozen earlier."""
+        sa = self._sa(kv_tail_min_tokens=16384, page_size=1)
+        sa._handle_kv_tail()
+        sa.page_size = 16  # resolved later by an override
+        with self.assertRaises(ValueError):
+            sa._handle_kv_tail_page_form(hf_config=types.SimpleNamespace())
 
     def test_captured_graphs_are_accepted_at_parse_time_since_slice_2(self):
         """#1426 slice 2: a captured decode/verify gets a graph-mode tail
@@ -2279,8 +2315,8 @@ _MUTANTS = {
     # M10 -- index the mapping with the RAW allocator index (the F1 defect):
     # under weighted DCP that frees a DIFFERENT live token's ring row.
     "M10_raw_free_index": (
-        "        slots = self.to_compact_slots(free_index)",
-        "        slots = free_index.to(torch.int64)",
+        "        slots = self.to_compact_slots(self._whole_pages(free_index))",
+        "        slots = self._whole_pages(free_index).to(torch.int64)",
     ),
     # M11 -- claim regardless of the arm: the ring fills on EXTEND again, with
     # the oldest prompt tokens, which is the inverse of the design.
@@ -2922,7 +2958,7 @@ class Test1427CaptureSafeClaim(unittest.TestCase):
 
 class Test1428VerifyMergeIsWiredOnTheDcpExtendPath(unittest.TestCase):
     """#1428: the read half of the verify tail must follow EVERY paged body read
-    of the DCP extend path (boot kvt6d: planned 3 rows, merged 0 -> W56)."""
+    of the DCP extend path (boot kvt6d: planned 3 rows, merged 0 -> W56, now W141)."""
 
     def test_every_dcp_paged_read_is_followed_by_the_tail_merge(self):
         import inspect

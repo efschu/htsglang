@@ -5918,7 +5918,7 @@ class FlashInferAttnBackend(AttentionBackend):
         ring = self.token_to_kv_pool.kv_tail
         if not getattr(self, "uneven_dcp_weighted", False):
             raise Weg2KvTailFormRefused(
-                "W58 Weg2KvTailFormRefused: the verify-step tail needs the weighted "
+                "W142 Weg2KvTailFormRefused: the verify-step tail needs the weighted "
                 "uneven-DCP owner rule; this form is not weighted DCP.")
         tail_lens = _kv_tail_position_lengths(paged_kernel_lens, ring.knobs.min_tokens)
         scratch_indptr = torch.zeros_like(kv_indptr)
@@ -5930,7 +5930,7 @@ class FlashInferAttnBackend(AttentionBackend):
         n = int(own_indptr[bs].item())
         if kv_indices.numel() < n or not torch.equal(own_indices[:n].to(kv_indices.dtype), kv_indices[:n]):
             raise Weg2KvTailFormRefused(
-                "W58 Weg2KvTailFormRefused: spec_info's verify kv_indices differ from "
+                "W142 Weg2KvTailFormRefused: spec_info's verify kv_indices differ from "
                 "the weighted owner rule's; the tail split would attend the wrong rows.")
         body_indptr, body_indices, tail_indptr, tail_ring = ring.plan(
             own_indptr, own_indices, owned_tail_len, site="verify")
@@ -5991,7 +5991,7 @@ class FlashInferAttnBackend(AttentionBackend):
         out_loc = getattr(fb, "out_cache_loc", None)
         if out_loc is None:
             raise Weg2KvTailFormRefused(
-                "W58 Weg2KvTailFormRefused: the precision tail plans a step "
+                "W142 Weg2KvTailFormRefused: the precision tail plans a step "
                 "without the step's out_cache_loc (no forward_batch reached "
                 "init_forward_metadata[_out_graph]); the ring cannot precommit "
                 "rows for a write it cannot see."
@@ -6032,7 +6032,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self, "_wl_chunk_block_size", 0
         ):
             raise Weg2KvTailFormRefused(
-                "W58 Weg2KvTailFormRefused: the precision tail refuses the "
+                "W142 Weg2KvTailFormRefused: the precision tail refuses the "
                 "kv-session-offload spill lane and the weightless block-decode "
                 "lane. Both replace the monolithic paged read with their own "
                 "index plumbing, which slice 1 does not trim -- running the "
@@ -6041,7 +6041,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         if int(getattr(self, "num_wrappers", 1)) != 1:
             raise Weg2KvTailFormRefused(
-                "W58 Weg2KvTailFormRefused: the precision tail refuses a "
+                "W142 Weg2KvTailFormRefused: the precision tail refuses a "
                 f"multi-wrapper backend (num_wrappers={self.num_wrappers}, "
                 f"dispatch_reason={getattr(self, 'dispatch_reason', None)}). "
                 "The sliding-window and cross-attention lanes enter this "
@@ -6121,7 +6121,7 @@ class FlashInferAttnBackend(AttentionBackend):
             from sglang.srt.mem_cache.kv_tail import Weg2KvTailFormRefused
 
             raise Weg2KvTailFormRefused(
-                "W58 Weg2KvTailFormRefused: a decode step reached the tail "
+                "W142 Weg2KvTailFormRefused: a decode step reached the tail "
                 "merge without a tail plan. The body indices for this step "
                 "were built by a branch slice 1 does not trim (a spec_info "
                 "kv_indptr, the even-DCP rule, or the non-DCP path), so the "
@@ -6440,7 +6440,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 # this rank's owned body (fp8, trimmed plan) + this rank's ring
                 # rows (bf16) are merged HERE, before the cross-rank LSE
                 # all-gather -- the tail is a partition of the owned set. Boot
-                # kvt6d (16.09.): planned 3 tail rows, merge ran 0 times (W56),
+                # kvt6d (16.09.): planned 3 tail rows, merge ran 0 times (W56, now W141),
                 # because the hook sat only on the non-DCP forward_extend.
                 if getattr(self, "_kv_tail_verify_plan", None) is not None:
                     o_pre_raw, lse_pre_raw = self._kv_tail_merge_verify(
@@ -6553,7 +6553,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # this rank's owned body (fp8, trimmed plan) + this rank's ring
             # rows (bf16) are merged HERE, before the cross-rank LSE
             # all-gather -- the tail is a partition of the owned set. Boot
-            # kvt6d (16.09.): planned 3 tail rows, merge ran 0 times (W56),
+            # kvt6d (16.09.): planned 3 tail rows, merge ran 0 times (W56, now W141),
             # because the hook sat only on the non-DCP forward_extend.
             if getattr(self, "_kv_tail_verify_plan", None) is not None:
                 o_pre_raw, lse_pre_raw = self._kv_tail_merge_verify(
