@@ -1623,6 +1623,7 @@ class HiCacheController:
         # the host pool's own start_layer is 0 on every PP stage.
         canonical_kv_page = None
         canonical_mamba_blob = None
+        canonical_qsa_page = None
         from sglang.srt.rank_role import this_rank_is_form_a_worker
 
         if this_rank_is_form_a_worker():
@@ -1688,6 +1689,7 @@ class HiCacheController:
                 is not None,
                 mamba_blob=canonical_mamba_blob,
             )
+            canonical_qsa_page = self._canonical_qsa_window(attn_layer_ids)
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
@@ -1713,7 +1715,52 @@ class HiCacheController:
             # #706: full-width pages, stage-offset writes, suffix-free KV keys.
             canonical_kv_page=canonical_kv_page,
             canonical_mamba_blob=canonical_mamba_blob,
+            canonical_qsa_page=canonical_qsa_page,
         )
+
+    def _canonical_qsa_window(self, attn_layer_ids):
+        """This rank's layer window in the canonical QSA index page (23.09.,
+        Task #106), or None when the bound stack carries no QSA sidecar.
+
+        Derived from the pools bound NOW, like the KV and mamba windows: the
+        host pool group's ``qsa_indexer`` entry names the host mirror, the
+        hybrid device pool names this rank's full-attention layers. A QSA
+        pool WITHOUT the sidecar entry is refused rather than served
+        index-less: that is exactly the x54 shape (KV and GDN restored, index
+        empty, mid-prompt needle answered with a filler number).
+        """
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+        from sglang.srt.mem_cache.qsa_pool_host import build_qsa_index_window
+
+        device_pool = self.mem_pool_device_hybrid
+        if not isinstance(device_pool, QSATokenToKVPool):
+            return None
+        if not device_pool.qsa_compressed_k_buffer_pool:
+            # a Form-A expert worker: no full-attention layer, no index, no
+            # sidecar (the assembler registered none either)
+            return None
+        entries = getattr(self.mem_pool_host, "entries", None) or []
+        host_pool = next(
+            (e.host_pool for e in entries if str(e.name) == str(PoolName.QSA_INDEXER)),
+            None,
+        )
+        if host_pool is None:
+            raise RuntimeError(
+                "QSA HiCache: the bound device pool carries a compressed QSA "
+                "index but the host pool group has no 'qsa_indexer' sidecar -- "
+                "a prefix restored from the carrier would select blocks over "
+                "an empty index (fnFL2x54)."
+            )
+        window = build_qsa_index_window(attn_layer_ids, device_pool, host_pool)
+        logger.info(
+            "#106 canonical QSA index page active: %d B per layer block, "
+            "extents %s of %d B; keys '{hash}.qsa_indexer' carry content only.",
+            int(host_pool.item_bytes),
+            list(window.extents),
+            int(window.total_bytes),
+        )
+        return window
 
     def _canonical_mamba_window(self, server_args, model_config, phase=None):
         """This rank's window in the canonical GDN blob (#706 slice 2).
@@ -1970,7 +2017,10 @@ class HiCacheController:
                 self._canonical_model_config,
                 phase=incoming_phase,
             )
-        install(kv_window, mamba_window)
+        qsa_window = None
+        if getattr(backend, "canonical_qsa_page", None) is not None:
+            qsa_window = self._canonical_qsa_window(attn_layer_ids)
+        install(kv_window, mamba_window, qsa_page=qsa_window)
         # The v2 component reads/writes must land in the pools bound NOW, not
         # the pools bound at attach -- the same frozen-binding class one layer
         # down (`_batch_io_v2` resolves `registered_pools[name]`, registered
@@ -1991,6 +2041,7 @@ class HiCacheController:
             self.storage_config,
             canonical_kv_page=kv_window,
             canonical_mamba_blob=mamba_window,
+            canonical_qsa_page=qsa_window,
         )
         logger.info(
             "#706 canonical windows rebound for the '%s' phase: KV slots "

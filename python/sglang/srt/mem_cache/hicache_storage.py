@@ -163,6 +163,12 @@ class HiCacheStorageConfig:
     #: storage``, because the draft pool binds after the storage config is
     #: built; None keeps every draft key byte-identical to today.
     canonical_draft_page: Optional[CanonicalExtentWindow] = None
+    #: 23.09. (fnFL2x54, Task #106): this rank's layer window in the whole
+    #: canonical QSA index page (``qsa_pool_host.build_qsa_index_window``).
+    #: None keeps ``{hash}.qsa_indexer`` a per-rank key -- which under PP=3
+    #: means three stages overwriting one another, so the window is REQUIRED
+    #: wherever the sidecar pool is registered.
+    canonical_qsa_page: Optional[CanonicalExtentWindow] = None
 
 
 @dataclass
@@ -339,6 +345,9 @@ class PoolName(str, Enum):
     MAMBA = "mamba"
     SWA = "swa"
     INDEXER = "indexer"
+    # 23.09. (fnFL2x54, Task #106): the compressed QSA index keys of
+    # Qwen3.8-Flash-Next, a KV-indexed sidecar (qsa_pool_host.py).
+    QSA_INDEXER = "qsa_indexer"
     # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
     # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
     DEEPSEEK_V4_C4 = "deepseek_v4_c4"
@@ -931,6 +940,12 @@ class HiCacheFile(HiCacheStorage):
             storage_config, "canonical_mamba_blob", None
         )
         self.canonical_draft_page = getattr(storage_config, "canonical_draft_page", None)
+        self.canonical_qsa_page = getattr(storage_config, "canonical_qsa_page", None)
+        if self.canonical_qsa_page is not None and self.canonical_kv_page is None:
+            raise CanonicalPageError(
+                "a canonical QSA index page window needs the canonical KV page: "
+                "the sidecar is addressed by the KV page's own key and indices."
+            )
         if self.canonical_draft_page is not None and self.canonical_kv_page is None:
             raise NotImplementedError(
                 "The #1233 canonical draft page was configured without the "
@@ -1112,6 +1127,8 @@ class HiCacheFile(HiCacheStorage):
                 resumable_totals.append(int(self.canonical_kv_page.spec.page_bytes))
             if self.canonical_mamba_blob is not None:
                 resumable_totals.append(int(self.canonical_mamba_blob.total_bytes))
+            if self.canonical_qsa_page is not None:
+                resumable_totals.append(int(self.canonical_qsa_page.total_bytes))
             try:
                 sweep_partials(
                     self.file_path,
@@ -1370,6 +1387,14 @@ class HiCacheFile(HiCacheStorage):
         """
         return "." not in key
 
+    def _is_qsa_key(self, key: str) -> bool:
+        """True when the compressed QSA index page for this key is canonical
+        (23.09., Task #106). Gated on the window, like the mamba blob: without
+        it the key keeps every geometry term and stays per-rank."""
+        return self.canonical_qsa_page is not None and key.endswith(
+            f".{PoolName.QSA_INDEXER}"
+        )
+
     def _is_shared_mamba_key(self, key: str) -> bool:
         """True when the GDN/mamba blob for this key is the canonical one.
 
@@ -1542,7 +1567,7 @@ class HiCacheFile(HiCacheStorage):
             self.dcp_owner_mode or self.canonical_kv_page is not None
         ) and self._is_shared_kv_key(key):
             return self.kv_config_suffix, self._kv_config_suffix_is_group_wide
-        if self._is_shared_mamba_key(key):
+        if self._is_shared_mamba_key(key) or self._is_qsa_key(key):
             return self.kv_config_suffix, self._kv_config_suffix_is_group_wide
         return self.config_suffix, self._config_suffix_is_group_wide
 
@@ -1791,6 +1816,8 @@ class HiCacheFile(HiCacheStorage):
             return self._canonical_kv_extents
         if self._is_shared_mamba_key(key):
             return self.canonical_mamba_blob
+        if self._is_qsa_key(key):
+            return self.canonical_qsa_page
         return None
 
     def _get_canonical_slice(
@@ -1932,7 +1959,9 @@ class HiCacheFile(HiCacheStorage):
         """
         return self._evictor.rescan()
 
-    def install_canonical_windows(self, kv_page, mamba_blob, draft_page=None) -> None:
+    def install_canonical_windows(
+        self, kv_page, mamba_blob, draft_page=None, qsa_page=None
+    ) -> None:
         """#706 x #719 (0828): swap this backend's read/write-time cut.
 
         Called by ``HiCacheController.rebind_canonical_windows`` at the flip
@@ -1962,12 +1991,23 @@ class HiCacheFile(HiCacheStorage):
             (kv_page is None) != (self.canonical_kv_page is None)
             or ((mamba_blob is None) != (self.canonical_mamba_blob is None))
             or (draft_page is None and self.canonical_draft_page is not None)
+            or (qsa_page is None and self.canonical_qsa_page is not None)
         ):
             raise CanonicalPageError(
                 "refusing to switch the canonical format on or off at a "
                 "cutover: window presence decides the key shape, and "
                 "re-keying a live store strands every page written under "
                 "the other rule."
+            )
+        if (
+            qsa_page is not None
+            and self.canonical_qsa_page is not None
+            and int(qsa_page.total_bytes) != int(self.canonical_qsa_page.total_bytes)
+        ):
+            raise CanonicalPageError(
+                f"refusing to install a QSA index window of a "
+                f"{qsa_page.total_bytes}-byte page over a store keyed for "
+                f"{self.canonical_qsa_page.total_bytes}-byte index pages."
             )
         if kv_page is None:
             return
@@ -2002,6 +2042,8 @@ class HiCacheFile(HiCacheStorage):
         self._canonical_kv_extents = kv_page.as_extents()
         self.canonical_mamba_blob = mamba_blob
         self.canonical_draft_page = draft_page
+        if qsa_page is not None:
+            self.canonical_qsa_page = qsa_page
         # #969F: THE FACT THE KEY SUFFIX DEPENDS ON JUST CHANGED. Re-derive it
         # here, at the one place that changes it, so there is a single
         # derivation function and no second moment. Without this the store
@@ -2458,6 +2500,8 @@ class HiCacheFile(HiCacheStorage):
             if blob is not None and int(total_bytes) == int(blob.total_bytes):
                 slots = int(os.environ.get("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "48"))
             else:
+                # the draft page AND the QSA index page (23.09., Task #106)
+                # follow the KV page 1:1, so they get the KV slot COUNT
                 slots = kv_slots
             os.makedirs(d, exist_ok=True)
             arena = ShmArena(os.path.join(d, f"arena-{int(total_bytes)}.bin"), int(total_bytes), slots)

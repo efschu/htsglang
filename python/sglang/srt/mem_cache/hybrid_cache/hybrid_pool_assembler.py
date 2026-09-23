@@ -552,6 +552,7 @@ def build_hybrid_mamba_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    qsa_device_pools: tuple[Any, ...] = (),
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     kv_host_pool = build_kv_host_pool(
@@ -600,6 +601,28 @@ def build_hybrid_mamba_stack(
             device_free_fn=mamba_allocator.free,
         ),
     ]
+    if qsa_device_pools:
+        # 23.09. (fnFL2x54, Task #106): the compressed QSA index keys ride
+        # the KV page's indices as a sidecar (qsa_pool_host.py). Adapted from
+        # kanadaj/sglang PR #9 patch 0022; the host budget is not re-split
+        # here -- the index is 768 B/token against 12288 B/token of KV.
+        from sglang.srt.mem_cache.qsa_pool_host import QSAPagedHostPool
+
+        index_host_pool = QSAPagedHostPool(
+            qsa_device_pools,
+            num_host_tokens=kv_host_pool.size,
+            page_size=page_size,
+            layout=server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        entries.append(
+            build_pool_entry(
+                name=PoolName.QSA_INDEXER,
+                host_pool=index_host_pool,
+                device_pool=qsa_device_pools[0],
+                layer_mapping=full_layer_mapping,
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -843,9 +866,28 @@ class _MambaStrategy(StackStrategy):
         enable_storage_metrics=False,
     ):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
         full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
         mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+        # 23.09. (Task #106): a QSA pool carries a compressed index the KV
+        # page does not; it rides along as a KV-indexed sidecar. The NEXTN
+        # draft shares the target's index here, so only the target pool.
+        qsa_pools: tuple = ()
+        # A Form-A expert worker holds no full-attention layer and therefore
+        # no compressed buffer: no sidecar on that rank (its KV load is empty).
+        if isinstance(kvcache, QSATokenToKVPool) and kvcache.qsa_compressed_k_buffer_pool:
+            if len(kvcache.qsa_compressed_k_buffer_pool) != kvcache.full_kv_pool.layer_num:
+                raise ValueError(
+                    "QSA HiCache: the compressed index has "
+                    f"{len(kvcache.qsa_compressed_k_buffer_pool)} layer(s) but the "
+                    f"full KV pool {kvcache.full_kv_pool.layer_num}"
+                )
+            if int(kvcache.page_size) != int(cache.page_size):
+                raise ValueError(
+                    f"QSA HiCache: pool page {kvcache.page_size} != cache page {cache.page_size}"
+                )
+            qsa_pools = (kvcache,)
         host_pool_group, cache_controller = build_hybrid_mamba_stack(
             params=params,
             server_args=server_args,
@@ -867,6 +909,7 @@ class _MambaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            qsa_device_pools=qsa_pools,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -875,8 +918,13 @@ class _MambaStrategy(StackStrategy):
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
+            sidecars=(
+                [SidecarPoolSpec(PoolName.QSA_INDEXER, indices_from_pool=PoolName.KV)]
+                if qsa_pools
+                else []
+            ),
             register_req_to_token_counter=True,
-            pools_desc="KV + MAMBA",
+            pools_desc="KV + MAMBA + QSA_INDEXER" if qsa_pools else "KV + MAMBA",
         )
 
 

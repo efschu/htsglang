@@ -207,6 +207,10 @@ class QSATokenToKVPool(HybridLinearKVPool):
         return self.qsa_rope_position_buffer[loc.long()]
 
     def get_qsa_compressed_k_buffer(self, layer_id: int) -> torch.Tensor:
+        # 23.09. (Task #106): a prefix restored from the HiCache carrier
+        # brings this layer's compressed keys on the load stream; read them
+        # only once that layer's H2D step is complete, as the K/V read does.
+        self._wait_for_layer(layer_id)
         return self.qsa_compressed_k_buffer_pool[
             self._transfer_full_attention_id(layer_id)
         ]
