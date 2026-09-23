@@ -1631,6 +1631,11 @@ class Envs:
     #     transient T*top_k*H buffer per layer (freed at the end of the forward).
     # Decode (single-wave) is unaffected by this flag.
     SGLANG_MOE_OFFLOAD_WAVE_ORDER = EnvStr("token")
+    # Per-forward CUDA-event split of a prefill chunk: MOE-OFFLOAD-TIMING-PREFILL
+    # (expert stream vs grouped GEMM), ATTN-TIMING-PREFILL (full vs linear
+    # attention) and PLE-GATHER-PREFILL (the stage-0 CPU gather). One host sync
+    # per forward per rank. The older call sites still read the raw key.
+    SGLANG_MOE_OFFLOAD_TIMING = EnvBool(False)
     # Device-planned expert pool (SGLANG_MOE_OFFLOAD_GRAPH_MODE=pool): what an
     # EAGER forward (extend, eager first verify) leaves of the decode LRU.
     # True (default): only the LRU rows the eager pass actually WROTE take its
