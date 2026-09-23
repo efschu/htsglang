@@ -608,9 +608,19 @@ def build_hybrid_mamba_stack(
         # here -- the index is 768 B/token against 12288 B/token of KV.
         from sglang.srt.mem_cache.qsa_pool_host import QSAPagedHostPool
 
+        index_tokens = int(kv_host_pool.size)
+        if getattr(kv_host_pool, "arena_read", False) and int(page_size) > 1:
+            # x59 (Task #107): the paged KV anchor is the arena; its ids run
+            # to S + slots * P and the sidecar rows are addressed by them.
+            from sglang.srt.mem_cache.pool_host.arena_pool import planned_id_space_tokens
+
+            index_tokens = planned_id_space_tokens(
+                int(kv_host_pool.size), int(page_size),
+                int(kv_host_pool.size_per_token) * int(page_size),
+            )
         index_host_pool = QSAPagedHostPool(
             qsa_device_pools,
-            num_host_tokens=kv_host_pool.size,
+            num_host_tokens=index_tokens,
             page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,

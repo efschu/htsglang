@@ -3492,7 +3492,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _pin = getattr(pool, "pin_slots", None) or getattr(getattr(pool, "anchor_entry", None), "host_pool", None) and getattr(pool.anchor_entry.host_pool, "pin_slots", None)
             if callable(_pin):
                 _pin(slots)
-            new = torch.tensor([pool.staging_rows + s for s in slots], dtype=old.dtype, device=old.device)
+            _ids = getattr(pool, "arena_ids", None) or getattr(
+                getattr(getattr(pool, "anchor_entry", None), "host_pool", None), "arena_ids", None)
+            if callable(_ids):
+                # x59 (Task #107): P ids per slot on a paged arena pool (P == 1: unchanged)
+                new = _ids(slots).to(dtype=old.dtype, device=old.device)
+            else:
+                new = torch.tensor([pool.staging_rows + s for s in slots], dtype=old.dtype, device=old.device)
             dpool = getattr(cc, "mem_pool_host_draft", None)
             if getattr(dpool, "row_slot", None) is not None and dpool.arena is not None:
                 comp = cc._draft_component_name()

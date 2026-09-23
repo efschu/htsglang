@@ -1389,23 +1389,29 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         )
 
 
-def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
+def get_mha_host_pool_cls(device_pool: MHATokenToKVPool, role: str = "kv") -> type:
     """Pick the right MHA host-pool class based on the device pool's K/V dims.
 
     Returns ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
     (e.g. MiMo-V2), else the default ``MHATokenToKVPoolHost``.
+
+    ``role``: the KV anchor ("kv") takes the arena form whenever the arena
+    host is on -- x59 (Task #107): ALSO for a paged pool (Next Flash, page
+    64), one arena slot per page, so the six ranks share ONE L2 like the
+    27B instead of one 4-GB pinned pool each (fnFL2x23 had refused the
+    paged form: ``bind()`` knew only one slot per token, and every rank fell
+    back to the private pool -- 11.7 GB of pinned host RAM that held nothing
+    but pages in transit). A paged DRAFT pool ("draft") stays the plain
+    class: it is a per-key sidecar addressed by the KV pool's ids.
     """
     if device_pool.head_dim != device_pool.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
-    # fnFL2x23: the arena pool maps one slot per token and refuses a paged pool
-    # only at bind() -- by then it is built with just its staging ring
-    # (SGLANG_HICACHE_ARENA_STAGING_GB, 4096 tokens at 0.05 GB). Next Flash
-    # pages by 64: D's prefetch budget fell to 0.9 x 4096 = 3686 and the
-    # launcher refused the boot (W45 below_floor). A paged pool keeps the
-    # regular host pool.
+    from sglang.srt.rank_role import this_rank_is_form_a_worker
+
     if (
         os.environ.get("SGLANG_HICACHE_ARENA_HOST", "0") == "1"
-        and int(device_pool.page_size) == 1
+        and not this_rank_is_form_a_worker()  # no attention, no arena (as the mamba chooser)
+        and (role == "kv" or int(device_pool.page_size) == 1)
     ):
         # #1424 Stufe 3: rows beyond the staging ring are arena slots
         from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool

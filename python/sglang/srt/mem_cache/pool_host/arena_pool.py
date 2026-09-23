@@ -43,6 +43,55 @@ logger = logging.getLogger(__name__)
 ENV_ARENA_HOST = "SGLANG_HICACHE_ARENA_HOST"
 ENV_STAGING_GB = "SGLANG_HICACHE_ARENA_STAGING_GB"
 PLACEHOLDERS = 1 << 22
+
+
+def _psz(pool) -> int:
+    """x59: tokens per arena slot. Set by ``ArenaMHAHostPool.bind`` from the
+    pool's page size; 1 is the 27B form, the mamba arena pool (which borrows
+    the slot bookkeeping below and carries a page size of its own meaning)
+    and every hermetic fixture that never binds a paged pool. A module
+    function, not a method: the fixtures call the pool's methods on bare
+    namespaces, and the mamba pool borrows them as plain functions."""
+    return int(getattr(pool, "_arena_page_tokens", 1) or 1)
+
+
+def _arena_mask(pool, hi: torch.Tensor) -> torch.Tensor:
+    S = int(pool.staging_rows)
+    return (hi >= S) & (hi < S + _atok(pool))
+
+
+def _slots_of_rows(pool, rows: torch.Tensor) -> torch.Tensor:
+    """Arena ROWS (host id - S) -> the slots they belong to, one per page, in
+    order, duplicates of one page folded (a page's ids are consecutive)."""
+    P = _psz(pool)
+    if P == 1:
+        return rows.to(torch.int64)
+    return torch.unique_consecutive(rows.to(torch.int64) // P)
+
+
+def _atok(pool) -> int:
+    """x59: the arena's id range in TOKENS (A * P); a pool bound by an older
+    fixture carries only the slot count."""
+    t = getattr(pool, "arena_tokens", None)
+    return int(t) if t else int(getattr(pool, "arena_slots", 0)) * _psz(pool)
+
+
+def _page_slots(pool, rows: torch.Tensor) -> torch.Tensor:
+    """x59: token rows of whole pages -> one slot per page (the P consecutive
+    ids of each page, in order; anything else is a caller handing tokens of
+    a page out of order and is refused). P == 1: the rows are the slots."""
+    P = _psz(pool)
+    if P == 1:
+        return rows
+    n = int(rows.numel())
+    if n % P:
+        raise RuntimeError(f"#1424 paged arena load: {n} token rows are not whole pages of {P}")
+    pages = rows.view(-1, P)
+    first = pages[:, 0]
+    lane = torch.arange(P, device=rows.device, dtype=rows.dtype)[None, :]
+    if bool((first % P).any()) or bool((pages != first[:, None] + lane).any()):
+        raise RuntimeError("#1424 paged arena load: a page's token rows are not consecutive from its first id")
+    return first // P
 _CUDA_HOST_REGISTER_FLAGS = 3  # Portable | Mapped
 _CUDA_ERROR_ALREADY_REGISTERED = 712
 
@@ -102,6 +151,37 @@ def arena_host_enabled() -> bool:
     return os.environ.get(ENV_ARENA_HOST, "0") == "1"
 
 
+ENV_ARENA_KV_PAGE_BYTES = "SGLANG_HICACHE_ARENA_KV_PAGE_BYTES"
+
+
+def planned_arena_slots(kv_page_bytes: int) -> int:
+    """The slot count the storage backend will give the KV arena
+    (``HiCacheFile._arena_for``: ``max(1024, GIB * 2^30 // page_bytes)``),
+    computed BEFORE the bind from the same environment -- so a sidecar pool
+    that is addressed by the KV pool's ids (QSA index, paged draft) can be
+    sized to the whole id space at construction. ``kv_page_bytes`` is the
+    CANONICAL page (every attention layer of the model); a PP stage passes
+    ``SGLANG_HICACHE_ARENA_KV_PAGE_BYTES`` from the launcher when its local
+    layers are fewer than the model's, or over-estimates with its own."""
+    try:
+        gib = float(os.environ.get("SGLANG_HICACHE_ARENA_GIB", "8"))
+    except ValueError:
+        gib = 8.0
+    env_pb = os.environ.get(ENV_ARENA_KV_PAGE_BYTES)
+    if env_pb:
+        try:
+            kv_page_bytes = int(env_pb)
+        except ValueError:
+            pass
+    return max(1024, int(gib * (1 << 30)) // max(1, int(kv_page_bytes)))
+
+
+def planned_id_space_tokens(staging_tokens: int, page_size: int, kv_page_bytes: int) -> int:
+    """Tokens a sidecar pool must be able to address: the staging ring plus
+    P tokens per planned arena slot (placeholders never carry bytes)."""
+    return int(staging_tokens) + planned_arena_slots(kv_page_bytes) * int(page_size)
+
+
 class ArenaMHAHostPool(MHATokenToKVPoolHost):
     """MHA host pool whose rows beyond the staging ring are arena slots."""
 
@@ -122,10 +202,23 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             super().__init__(device_pool, 0.0, staging_gb, page_size, layout, *args, **kwargs)
         self._arena_init_fields()
 
+    def _P(self) -> int:
+        """Tokens per arena slot (the pool's page size); 1 = the 27B form.
+        Read defensively: the hermetic fixtures build the pool without
+        ``__init__`` and never set a page size."""
+        return int(getattr(self, "page_size", 1) or 1)
+
+    def _arena_tok(self) -> int:
+        """Arena ids in TOKENS (A * P); falls back to the slot count for a
+        pool bound by an older fixture."""
+        t = getattr(self, "arena_tokens", None)
+        return int(t) if t else int(self.arena_slots) * _psz(self)
+
     def _arena_init_fields(self) -> None:
         self.staging_rows = int(self.size)
         self.arena = None
         self.arena_slots = 0
+        self.arena_tokens = 0  # x59: A * page_size once bound
         self.arena_k_refs: Optional[list] = None
         self.arena_v_refs: Optional[list] = None
         self.row_slot: Optional[dict] = None  # draft role: kv-row -> draft slot (-1 miss)
@@ -172,8 +265,21 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             return False
 
     def bind(self, arena, window, role: str = "kv", pin: bool = True) -> None:
-        if int(self.page_size) != 1:
-            raise ValueError("#1424 the arena host pool needs page_size 1 (one slot per token)")
+        # x59 (23.09., Task #107): ONE arena slot per PAGE of ``page_size``
+        # tokens. Next Flash pages by 64 (QSA groups, GDN anchors); the
+        # token-paged 27B form is the special case P == 1 and stays
+        # byte-identical. A page's flat layout is the one
+        # ``MHATokenToKVPoolHost.get_data_page`` produces for ``layer_first``:
+        # K/V-major, layer-major inside each half, TOKEN-MINOR -- so one
+        # layer's K block of a page is ``P * cell`` contiguous bytes.
+        P = int(getattr(self, "page_size", 1) or 1)  # the pool's own page size (bind sets _arena_page_tokens)
+        if P < 1:
+            raise ValueError(f"#1424 the arena host pool needs a positive page size, got {P}")
+        if role == "draft" and P != 1:
+            raise ValueError(
+                "#1424 the draft role of the arena host pool is token-paged only; a paged "
+                "draft page rides the KV page as a per-key sidecar (kv_cache_builder)"
+            )
         ext = [(int(o), int(l)) for o, l in window.extents]
         if len(ext) == 1 and ext[0][0] == 0 and ext[0][1] == int(window.total_bytes):
             # the whole page (D's DCP ranks hold every layer and head): the
@@ -183,13 +289,16 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         L = int(self.layer_num)
         e = int(self.dtype.itemsize)
         cell = int(self.head_num) * int(self.head_dim) * e
+        block = P * cell  # one layer's K (or V) bytes of one page
         if len(ext) == 2:
             (k_off, k_len), (v_off, v_len) = ext
-            if k_len != v_len or k_len != L * cell:
-                raise ValueError(f"#1424 window extents {ext} do not match {L} layers x {cell} B")
-            k_offs = [k_off + l * cell for l in range(L)]
-            v_offs = [v_off + l * cell for l in range(L)]
-        elif len(ext) == 2 * L:
+            if k_len != v_len or k_len != L * block:
+                raise ValueError(
+                    f"#1424 window extents {ext} do not match {L} layers x {P} tokens x {cell} B"
+                )
+            k_offs = [k_off + l * block for l in range(L)]
+            v_offs = [v_off + l * block for l in range(L)]
+        elif len(ext) == 2 * L and P == 1:
             # xsn267 (17.09., DFlash draft on D): a HEAD-SHARDED window names
             # its K and V extent PER LAYER -- the canonical draft page is
             # [K L0 | V L0 | K L1 | ...] and this rank owns a head slice of
@@ -216,14 +325,26 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         tok = page_bytes // e
         H, D = int(self.head_num), int(self.head_dim)
         base_off = int(typed.storage_offset())  # the data region's own offset in the mapping
-        self.arena_k_refs = [
-            typed.as_strided((A, H, D), (tok, D, 1), storage_offset=base_off + k_offs[l] // e)
-            for l in range(L)
-        ]
-        self.arena_v_refs = [
-            typed.as_strided((A, H, D), (tok, D, 1), storage_offset=base_off + v_offs[l] // e)
-            for l in range(L)
-        ]
+        if P == 1:
+            self.arena_k_refs = [
+                typed.as_strided((A, H, D), (tok, D, 1), storage_offset=base_off + k_offs[l] // e)
+                for l in range(L)
+            ]
+            self.arena_v_refs = [
+                typed.as_strided((A, H, D), (tok, D, 1), storage_offset=base_off + v_offs[l] // e)
+                for l in range(L)
+            ]
+        else:
+            # (slot, token-in-page, H, D): a page's tokens are contiguous cells
+            # inside one layer block, the slots are page_bytes apart.
+            self.arena_k_refs = [
+                typed.as_strided((A, P, H, D), (tok, H * D, D, 1), storage_offset=base_off + k_offs[l] // e)
+                for l in range(L)
+            ]
+            self.arena_v_refs = [
+                typed.as_strided((A, P, H, D), (tok, H * D, D, 1), storage_offset=base_off + v_offs[l] // e)
+                for l in range(L)
+            ]
         # Posten 2 (18.09.): WHOLE-PAGE loadback. One arena slot is one page
         # holding K and V of EVERY layer; the per-layer gather kernel read it
         # as 2*L separate 1-KiB rows over PCIe (0,6-1,5 GB/s, xsn303). The
@@ -288,8 +409,11 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._pending_mask = torch.zeros(int(A), dtype=torch.bool)
         self._pending_gen = torch.zeros(int(A), dtype=torch.int64)     # xsn359: generation per pending slot
         self._pending_fresh = torch.zeros(int(A), dtype=torch.bool)   # xsn359: fresh claim (free on abort)
-        self.id_space = self.staging_rows + A + PLACEHOLDERS
-        self.prefetch_capacity_tokens = A
+        # the id space counts TOKENS: P ids per slot, [S, S + A*P)
+        self._arena_page_tokens = P
+        self.arena_tokens = A * P
+        self.id_space = self.staging_rows + A * P + PLACEHOLDERS
+        self.prefetch_capacity_tokens = A * P
         if role == "draft":
             self.row_slot = {}
             self._zero_k = torch.zeros((1, H, D), dtype=self.dtype, pin_memory=self.pin_memory)
@@ -298,25 +422,42 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     role, self.staging_rows, A, L, k_off, v_off)
 
     # -- id space ------------------------------------------------------------
+    # x59 (Task #107): host ids are TOKENS. [0, S) staging rows, [S, S + A*P)
+    # arena ids -- id S + slot*P + t is token t of arena slot `slot` -- and
+    # placeholders above. P == 1 is the token-paged 27B form unchanged.
     def is_arena_id(self, i: int) -> bool:
-        return self.staging_rows <= int(i) < self.staging_rows + self.arena_slots
+        return self.staging_rows <= int(i) < self.staging_rows + _atok(self)
 
     def is_placeholder(self, i: int) -> bool:
-        return int(i) >= self.staging_rows + self.arena_slots
+        return int(i) >= self.staging_rows + _atok(self)
+
+    def arena_ids(self, slots) -> torch.Tensor:
+        """The host ids of whole slots: P consecutive ids per slot, in slot order."""
+        s = torch.as_tensor(list(slots) if not torch.is_tensor(slots) else slots, dtype=torch.int64)
+        P = _psz(self)
+        if P == 1:
+            return s + self.staging_rows
+        return (s[:, None] * P + torch.arange(P, dtype=torch.int64)[None, :]).reshape(-1) + self.staging_rows
 
     @_pass_timed("_1474_alloc_ms")  # #1474
     def alloc_read(self, n: int) -> torch.Tensor:
         """Placeholders for a prefetch registration; resolved in place later."""
-        base = self.staging_rows + self.arena_slots
+        base = self.staging_rows + _atok(self)
         start = self._read_ph_next
         self._read_ph_next = (start + n) % PLACEHOLDERS
         return (torch.arange(start, start + n, dtype=torch.int64) % PLACEHOLDERS) + base
 
     def resolve_rows(self, host_indices: torch.Tensor, slots: Sequence[int]) -> None:
-        """KV role: write arena ids over the placeholders, in place."""
-        n = len(slots)
+        """KV role: write arena ids over the placeholders, in place -- P ids
+        per slot, so a resolved run covers len(slots) * P tokens."""
         self.pin_slots(slots)
-        vals = torch.as_tensor(list(slots) if not torch.is_tensor(slots) else slots, dtype=host_indices.dtype) + self.staging_rows
+        vals = self.arena_ids(slots).to(dtype=host_indices.dtype)
+        n = int(vals.numel())
+        if n > int(host_indices.numel()):
+            raise ValueError(
+                f"#1424 resolve_rows: {len(slots)} slots x {_psz(self)} tokens "
+                f"= {n} ids do not fit the {int(host_indices.numel())}-token registration"
+            )
         host_indices[:n] = vals.to(host_indices.device)
 
     def resolve_draft_rows(self, rows: Sequence[int], slots: Sequence[int]) -> None:
@@ -330,8 +471,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
     def load_to_device_per_layer(self, device_pool, host_indices, device_indices, layer_id, io_backend):
         if self.arena is None or host_indices.numel() == 0:
             return super().load_to_device_per_layer(device_pool, host_indices, device_indices, layer_id, io_backend)
-        S, A = self.staging_rows, self.arena_slots
-        is_arena = (host_indices >= S) & (host_indices < S + A)
+        S = self.staging_rows
+        is_arena = _arena_mask(self,host_indices)
         if not bool(is_arena.any()):
             return super().load_to_device_per_layer(device_pool, host_indices, device_indices, layer_id, io_backend)
         # 19.09. (xsn398, Task #3): the page load's "already loaded at layer 0"
@@ -396,14 +537,32 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 f"{layer_id} are not all registered (pinned bitmap PARTIAL) -- a device "
                 f"read of an unregistered host page is an illegal address")
 
+    def _page_slots_of_rows(self, rows: torch.Tensor) -> torch.Tensor:
+        """x59: token rows of whole pages -> one slot per page (rows must be
+        the P consecutive ids of each page, in order; anything else is a
+        caller handing tokens of a page out of order and is refused)."""
+        P = _psz(self)
+        if P == 1:
+            return rows
+        n = int(rows.numel())
+        if n % P:
+            raise RuntimeError(
+                f"#1424 paged arena load: {n} token rows are not whole pages of {P}")
+        pages = rows.view(-1, P)
+        first = pages[:, 0]
+        if bool((first % P).any()) or bool((pages != first[:, None] + torch.arange(P, device=rows.device, dtype=rows.dtype)[None, :]).any()):
+            raise RuntimeError("#1424 paged arena load: a page's token rows are not consecutive from its first id")
+        return first // P
+
     def _load_arena(self, device_pool, rows, device_indices, layer_id) -> None:
+        P = _psz(self)
         if _arena_page_load_on() and getattr(self, "_page_view", None) is not None:
             key = getattr(self, "_page_key_hint", None) or (
                 id(rows), id(device_indices), int(rows.numel()), int(device_indices.numel()))
             if layer_id != 0 and self._page_loaded_key == key:
                 return  # every layer came with the page load at layer 0
             if layer_id == 0:
-                slots = rows
+                slots = _page_slots(self,rows)
                 _tm0 = time.perf_counter()
                 if self.row_slot is not None:
                     rl = rows.tolist()
@@ -420,6 +579,14 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     return
                 # misses (row_slot without a slot) keep the per-layer path below
             self._page_loaded_key = None
+        if P != 1:
+            # per-layer path of a paged pool: the per-token kernel cannot
+            # address (slot, token) through one stride; a torch gather can.
+            slots = rows // P
+            self.pin_slots(torch.unique(slots))
+            self._arena_load_guard(device_pool, slots, device_indices, layer_id, nrows=int(rows.numel()), nmiss=0)
+            self._transfer_paged(device_pool, rows, device_indices, layer_id)
+            return
         if self.row_slot is not None:
             rl = rows.tolist()
             slots = torch.tensor([self.row_slot.get(int(r), -1) for r in rl], dtype=rows.dtype, device=rows.device)
@@ -517,13 +684,20 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 self._page_events[k].record()
             if _ev is not None:
                 _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
-            dst = _dst_all[start:start + b] if _async_idx else device_indices[start:start + b].to(device=dev, dtype=torch.int64)
+            # x59: P device tokens per page, in page order; one layer's K block
+            # of a page is P contiguous cells, so the stage slice scatters as
+            # (b * P) rows.
+            P = _psz(self)
+            if _async_idx:
+                dst = _dst_all[start * P:(start + b) * P]
+            else:
+                dst = device_indices[start * P:(start + b) * P].to(device=dev, dtype=torch.int64)
             for l in range(L):
                 ko, vo = self._k_offs_b[l], self._v_offs_b[l]
                 device_pool.k_buffer[l].index_copy_(
-                    0, dst, dev_stage[:b, ko:ko + cell].reshape(-1).view(self.dtype).view(b, H, D))
+                    0, dst, dev_stage[:b, ko:ko + P * cell].reshape(-1).view(self.dtype).view(b * P, H, D))
                 device_pool.v_buffer[l].index_copy_(
-                    0, dst, dev_stage[:b, vo:vo + cell].reshape(-1).view(self.dtype).view(b, H, D))
+                    0, dst, dev_stage[:b, vo:vo + P * cell].reshape(-1).view(self.dtype).view(b * P, H, D))
             if _ev is not None:
                 _e2 = torch.cuda.Event(enable_timing=True); _e2.record()
                 _ev.append((_e0, _e1, _e2))
@@ -605,6 +779,49 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             element_dim=self.element_dim,
             block_quota=_arena_load_block_quota(),
         )
+
+    # -- x59 (Task #107): the paged pool's torch paths ---------------------------
+    def _transfer_paged(self, device_pool, rows, device_indices, layer_id) -> None:
+        """Per-layer load of a PAGED pool (fallback beside the whole-page
+        load): token rows -> (slot, token) into the strided arena views, one
+        gather per K and V, then an indexed copy onto the card."""
+        P = _psz(self)
+        rows = rows.to("cpu", dtype=torch.int64)
+        slot, tok = rows // P, rows % P
+        k_src = self.arena_k_refs[layer_id][slot, tok]
+        v_src = self.arena_v_refs[layer_id][slot, tok]
+        dst_k = device_pool.k_buffer[layer_id]
+        dev = dst_k.device
+        didx = device_indices.to(device=dev, dtype=torch.int64)
+        dst_k.index_copy_(0, didx, k_src.to(device=dev, non_blocking=False))
+        device_pool.v_buffer[layer_id].index_copy_(0, didx, v_src.to(device=dev, non_blocking=False))
+
+    def _backup_paged_copy(self, device_pool, slots: torch.Tensor, device_indices: torch.Tensor) -> None:
+        """Direct write of a PAGED pool without the pointer/stride kernel:
+        this rank's K and V blocks of every page go card -> host stage ->
+        the slots' layer blocks (one contiguous run per layer per page)."""
+        P = _psz(self)
+        b = int(slots.numel())
+        if b == 0:
+            return
+        self.pin_slots(slots)
+        L = len(self._k_offs_b)
+        cell = int(self.element_dim) * int(self.dtype.itemsize)
+        block = P * cell
+        slots_cpu = slots.to("cpu", dtype=torch.int64)
+        didx = device_indices.to(device=device_pool.k_buffer[0].device, dtype=torch.int64)
+        for l in range(L):
+            kv = device_pool.k_buffer[l]
+            vv = device_pool.v_buffer[l]
+            k_rows = kv.view(torch.uint8).reshape(kv.shape[0], -1)[didx].reshape(b, block).to("cpu")
+            v_rows = vv.view(torch.uint8).reshape(vv.shape[0], -1)[didx].reshape(b, block).to("cpu")
+            ko, vo = self._k_offs_b[l], self._v_offs_b[l]
+            self._page_view[slots_cpu, ko:ko + block] = k_rows
+            self._page_view[slots_cpu, vo:vo + block] = v_rows
+        global _ARENA_WRITE_N
+        if _ARENA_WRITE_N <= 8 or _ARENA_WRITE_N % 256 == 0:
+            logger.info("WEG2-ARENA-WRITE n=%d pages=%d bytes=%d mode=paged-copy block=%dB layers=%d",
+                        _ARENA_WRITE_N, b, b * 2 * L * block, block, L)
 
     # -- #1427 Stufe 4: direct writes, card -> arena slot -------------------------
     def _claim_np(self, stems, totals):
@@ -742,7 +959,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         slots = self._claim(self._stems(hashes))
         if slots is None:
             return None
-        return torch.tensor([self.staging_rows + s for s in slots], dtype=torch.int64)
+        return self.arena_ids(slots)  # x59: P ids per page hash
 
     def alloc_write_draft(self, kv_host_indices: torch.Tensor, hashes, comp: str) -> bool:
         """Draft role: claim the draft slot behind each KV arena row."""
@@ -834,9 +1051,19 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         _n_log = _ARENA_WRITE_N
         b = int(slots.numel())
         cell = int(self.element_dim) * int(self.dtype.itemsize)
+        P = _psz(self)
+        block = P * cell  # x59: one layer's K (or V) block of a page
+        if int(device_indices.numel()) != b * P:
+            raise RuntimeError(
+                f"#1424 arena write: {b} slots need {b * P} device tokens, got {int(device_indices.numel())}")
         _quota = _aw.write_block_quota()
         mode = getattr(self, "_write_mode", None) or _aw.write_mode()
-        runs = _aw.contiguous_runs(self._k_offs, self._v_offs, cell) if mode == "run" else None
+        runs = _aw.contiguous_runs(self._k_offs, self._v_offs, block) if mode == "run" else None
+        if runs is None and P != 1:
+            # the per-token cell kernel cannot address (slot, token); the
+            # paged pool writes through a host stage instead (torch copies)
+            self._backup_paged_copy(device_pool, slots, device_indices)
+            return
         if runs is not None and dev.type == "cuda":
             # xsn345 RUN MODE: gather this rank's layers into a run-shaped stage
             # on the card, then two contiguous runs per page (K, V) go to the
@@ -850,10 +1077,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 for l in range(L):
                     kv = device_pool.k_buffer[l]
                     vv = device_pool.v_buffer[l]
-                    stage[:, l * cell:(l + 1) * cell].copy_(
-                        kv.view(torch.uint8).reshape(kv.shape[0], -1)[didx])
-                    stage[:, run + l * cell:run + (l + 1) * cell].copy_(
-                        vv.view(torch.uint8).reshape(vv.shape[0], -1)[didx])
+                    stage[:, l * block:(l + 1) * block].copy_(
+                        kv.view(torch.uint8).reshape(kv.shape[0], -1)[didx].reshape(b, block))
+                    stage[:, run + l * block:run + (l + 1) * block].copy_(
+                        vv.view(torch.uint8).reshape(vv.shape[0], -1)[didx].reshape(b, block))
                 dst_ptrs, src_ptrs, src_stride = _aw.run_pointers(
                     self._data_base, k_off, v_off, run, stage.data_ptr())
                 _nb = lambda t: t.pin_memory().to(dev, non_blocking=True)   # noqa: E731 -- no stream sync
@@ -876,6 +1103,12 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 logger.warning("WEG2-ARENA-WRITE run mode failed (%s: %s); cell mode from now on",
                                type(exc).__name__, exc)
                 self._write_mode = mode = "cell"
+                if P != 1:
+                    self._backup_paged_copy(device_pool, slots, device_indices)
+                    return
+        if P != 1:
+            self._backup_paged_copy(device_pool, slots, device_indices)
+            return
         k_ptrs, v_ptrs = self._arena_ptrs(dev)
         _slots_dev = (slots.to(dtype=torch.int64).pin_memory().to(dev, non_blocking=True)
                       if dev.type == "cuda" else slots.to(device=dev, dtype=torch.int64))
@@ -914,18 +1147,26 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if self.arena is None or host_indices.numel() == 0:
             return super().backup_from_device_all_layer(device_pool, host_indices, device_indices, io_backend)
         hi = host_indices.cpu()
-        S, A = self.staging_rows, self.arena_slots
-        is_arena = (hi >= S) & (hi < S + A)
+        S = self.staging_rows
+        is_arena = _arena_mask(self,hi)
         if not bool(is_arena.any()):
             return super().backup_from_device_all_layer(device_pool, host_indices, device_indices, io_backend)
         sel = is_arena.nonzero(as_tuple=True)[0]
         if self.row_slot is None and self._pending_mask is not None:
             # xsn355 (py-spy PP0): the per-row Python pairs/todo lists were ~30 ms
             # per 4096-page node; KV role membership comes from the mask.
+            P = _psz(self)
             rows_t = (hi[sel] - S).to(torch.int64)
-            keep = self._pending_mask[rows_t]
-            slots = rows_t[keep]
-            sel = sel[keep]
+            if P == 1:
+                keep = self._pending_mask[rows_t]
+                slots = rows_t[keep]
+                sel = sel[keep]
+            else:
+                # x59: one slot per page; the P token ids of a page travel together
+                page_slots = _page_slots(self,rows_t)
+                keep_p = self._pending_mask[page_slots]
+                slots = page_slots[keep_p]
+                sel = sel.view(-1, P)[keep_p].reshape(-1)
             todo = bool(slots.numel())
         else:
             rows = (hi[sel] - S).tolist()
@@ -954,11 +1195,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
 
     def _slots_of(self, host_indices: torch.Tensor):
         hi = host_indices.cpu()
-        S, A = self.staging_rows, self.arena_slots
-        rows = hi[(hi >= S) & (hi < S + A)] - S
+        rows = hi[_arena_mask(self,hi)] - self.staging_rows
         if self.row_slot is not None:
             return [self.row_slot.get(int(r), -1) for r in rows.tolist()]
-        return rows.tolist()
+        return _slots_of_rows(self,rows).tolist()
 
     def complete_write(self, host_indices: torch.Tensor) -> int:
         """The copy landed (ack): merge this rank's extents into the pages'
@@ -1062,7 +1302,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # slots not held by a writer in flight.
         try:
             st = self.arena.stats()
-            return max(0, int(st["slots"]) - int(st["claimed"]))
+            # x59: the answer is TOKENS (P per slot), like the staging count
+            return max(0, int(st["slots"]) - int(st["claimed"])) * _psz(self)
         except Exception:  # noqa: BLE001
             return len(self.free_slots)
 
@@ -1080,9 +1321,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if self.arena is None:
             return super().free(indices)
         idx = indices.cpu() if torch.is_tensor(indices) else torch.as_tensor(indices)
-        S, A = self.staging_rows, self.arena_slots
+        S = self.staging_rows
         staging = idx[idx < S]
-        arena_rows = idx[(idx >= S) & (idx < S + A)]
+        arena_rows = idx[_arena_mask(self,idx)]
         freed = 0
         if staging.numel():
             freed += int(super().free(staging))
@@ -1092,7 +1333,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 slots = [self.row_slot.pop(int(r), -1) for r in rows]
                 slots = [s for s in slots if s >= 0]
             else:
-                slots = rows
+                # x59: P token ids per slot -> one release per slot
+                slots = _slots_of_rows(self,arena_rows - S).tolist()
             if self._pending_mask is not None:
                 st_ = torch.as_tensor(slots, dtype=torch.int64)
                 m, sel, _g, fr = self._pend_take(st_)

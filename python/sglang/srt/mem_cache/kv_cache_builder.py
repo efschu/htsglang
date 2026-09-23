@@ -408,15 +408,26 @@ def _build_draft_host_pool(*, pool, primary, server_args, page_size):
 
     # Same slot count as the target host pool, so host indices stay 1-to-1
     # between the target and draft KV caches.
+    primary_tokens = int(primary.size)
+    if getattr(primary, "arena_read", False) and int(page_size) > 1:
+        # x59 (Task #107): the paged KV anchor keeps only its staging ring in
+        # RAM and hands out ARENA ids up to S + slots * P -- the draft page
+        # is a per-key sidecar indexed by those ids, so its rows must cover
+        # the whole id space, not the ring.
+        from sglang.srt.mem_cache.pool_host.arena_pool import planned_id_space_tokens
+
+        primary_tokens = planned_id_space_tokens(
+            int(primary.size), int(page_size), int(primary.size_per_token) * int(page_size)
+        )
     kw = dict(
-        host_to_device_ratio=primary.size / pool.size,
+        host_to_device_ratio=primary_tokens / pool.size,
         host_size=0,
         page_size=page_size,
         layout=server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
     )
     if isinstance(pool, MHATokenToKVPool):
-        return get_mha_host_pool_cls(pool)(pool, **kw)
+        return get_mha_host_pool_cls(pool, role="draft")(pool, **kw)
     if isinstance(pool, MLATokenToKVPool):
         return MLATokenToKVPoolHost(pool, **kw)
     logger.warning(
