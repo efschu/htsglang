@@ -33,6 +33,15 @@ from typing import Any, Callable, List, Optional
 
 from sglang.srt.environ import envs
 
+#: The pool of the load in progress (one load at a time per process); read
+#: by FusedMoE._ct_stream_note to hand the per-layer presplit back to the
+#: loader thread. None outside a load.
+_CURRENT: Optional["ExpertLoadPool"] = None
+
+
+def current_pool() -> Optional["ExpertLoadPool"]:
+    return _CURRENT
+
 
 def consumer_threads() -> int:
     """The configured consumer count, never negative."""
@@ -53,6 +62,17 @@ class ExpertLoadPool:
         self._pending: List[Future] = []
         self.submitted = 0
         self.completed = 0
+        # fnFL2x31: WORK THE LOADER THREAD MUST DO ITSELF. The TMS tag that
+        # makes a device allocation pausable is thread_local in the C++ hook
+        # (tms_csrc/entrypoint.cpp:40), so the per-layer presplit -- which
+        # fires from whichever thread lands a layer's last shard -- allocated
+        # UNTAGGED from the consumers: PP1 slept with untagged_live=8408 MiB
+        # (x30: 0), card 0 stayed at 10 GB, D TP1 died loading (CUDA OOM).
+        # The consumers queue such work here; the loader thread runs it in
+        # `submit()` and `drain()`, under its own tag, one at a time.
+        self._deferred: List[Callable[[], Any]] = []
+        self._loader_ident = threading.get_ident()
+        self.deferred_run = 0
         self._ex: Optional[ThreadPoolExecutor] = None
         if self.threads > 0:
             self._ex = ThreadPoolExecutor(
@@ -75,9 +95,33 @@ class ExpertLoadPool:
     def parallel(self) -> bool:
         return self._ex is not None
 
+    def on_loader_thread(self) -> bool:
+        return threading.get_ident() == self._loader_ident
+
+    def defer_to_loader(self, fn: Callable[[], Any]) -> None:
+        """Run ``fn`` on the loader thread at its next submit() or drain().
+        Called from a consumer thread; on the loader thread it runs at once."""
+        if self.on_loader_thread():
+            fn()
+            self.deferred_run += 1
+            return
+        with self._lock:
+            self._deferred.append(fn)
+
+    def run_deferred(self) -> None:
+        """Loader thread only: run every queued deferred call, in order."""
+        while True:
+            with self._lock:
+                if not self._deferred:
+                    return
+                fn = self._deferred.pop(0)
+            fn()
+            self.deferred_run += 1
+
     def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
         """Queue one consumer call, or run it inline in the serial form."""
         self._raise_if_failed()
+        self.run_deferred()
         if self._ex is None:
             fn(*args, **kwargs)
             self.submitted += 1
@@ -125,24 +169,37 @@ class ExpertLoadPool:
     def drain(self) -> None:
         """Wait for every queued call; re-raise the first failure."""
         if self._ex is None:
+            self.run_deferred()
             self._raise_if_failed()
             return
-        with self._lock:
-            pending = list(self._pending)
-            self._pending = []
-        for f in pending:
-            try:
-                f.result()
-            except BaseException:  # noqa: BLE001 -- the first one is re-raised below
-                pass
-        self._raise_if_failed()
+        while True:
+            with self._lock:
+                pending = list(self._pending)
+                self._pending = []
+            for f in pending:
+                try:
+                    f.result()
+                except BaseException:  # noqa: BLE001 -- the first one is re-raised below
+                    pass
+            self._raise_if_failed()
+            # a deferred call may have been queued by the last completions;
+            # and nothing else can queue one once every future is done
+            self.run_deferred()
+            with self._lock:
+                if not self._pending and not self._deferred:
+                    return
 
     def close(self) -> None:
+        global _CURRENT
+        if _CURRENT is self:
+            _CURRENT = None
         if self._ex is not None:
             self._ex.shutdown(wait=True)
             self._ex = None
 
     def __enter__(self) -> "ExpertLoadPool":
+        global _CURRENT
+        _CURRENT = self
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

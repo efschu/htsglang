@@ -1503,7 +1503,20 @@ class FusedMoE(torch.nn.Module):
                 state["done"] = True
                 fire = True
         if fire:
-            self._ct_stream_presplit_now(state)
+            # fnFL2x31: the presplit allocates on the device under the TMS
+            # tag, and that tag is thread_local (tms_csrc/entrypoint.cpp:40).
+            # Landed by a load-consumer thread (Ladezeit 2), the layer's
+            # buffers came out UNTAGGED and no pause could free them (PP1
+            # untagged_live=8408 MiB, card 0 never emptied, D TP1 OOM).
+            # So the consumer hands the presplit to the loader thread, which
+            # holds the tag; on the loader thread it runs right here.
+            from sglang.srt.model_loader import load_consumer
+
+            _pool = load_consumer.current_pool()
+            if _pool is not None and not _pool.on_loader_thread():
+                _pool.defer_to_loader(lambda: self._ct_stream_presplit_now(state))
+            else:
+                self._ct_stream_presplit_now(state)
 
     def _ct_stream_presplit_now(self, state) -> None:
         import time

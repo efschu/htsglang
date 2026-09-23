@@ -135,3 +135,68 @@ def test_the_env_default_is_four_consumers():
     assert lc.consumer_threads() == 4
     with envs.SGLANG_LOAD_CONSUMER_THREADS.override(-3):
         assert lc.consumer_threads() == 0
+
+
+# ---------------------------------------------------------------------------
+# fnFL2x31: work under a TMS tag belongs to the thread that holds the tag.
+# ---------------------------------------------------------------------------
+
+def test_deferred_work_runs_on_the_loader_thread_at_submit_and_drain():
+    """The TMS tag is thread_local: a presplit fired from a consumer thread
+    allocated untagged (PP1 slept with untagged_live=8408 MiB, D TP1 OOM).
+    A consumer defers; the loader thread runs it in submit() and drain()."""
+    pool = lc.ExpertLoadPool(2)
+    ran_on = []
+
+    def work():
+        ran_on.append(threading.get_ident())
+
+    def consumer_side():
+        pool.defer_to_loader(work)
+
+    pool.submit(consumer_side)
+    for _ in range(200):
+        if pool.completed >= 1:
+            break
+        time.sleep(0.005)
+    pool.submit(lambda: None)   # the loader thread drains the queue here
+    assert ran_on == [threading.get_ident()]
+    pool.submit(consumer_side)
+    pool.drain()                # ...and here, for what landed last
+    pool.close()
+    assert ran_on == [threading.get_ident()] * 2
+    assert pool.deferred_run == 2
+
+
+def test_the_presplit_trigger_hands_off_to_the_loader_thread():
+    """Bound to FusedMoE._ct_stream_note itself: the last shard of a layer
+    landing in a consumer thread must NOT run the presplit there."""
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+    fired_on = []
+
+    class Stub:
+        _ct_stream_note = FusedMoE._ct_stream_note
+
+        def __init__(self, param):
+            self._ct_stream_presplit = {
+                "done": False, "lock": threading.Lock(),
+                "names": {id(param): "w13"}, "expected": {"w13": 2}, "seen": {},
+            }
+
+        def _ct_stream_presplit_now(self, state):
+            fired_on.append(threading.get_ident())
+
+    param = torch.zeros(1)
+    layer = Stub(param)
+    with lc.ExpertLoadPool(2) as pool:
+        pool.submit(layer._ct_stream_note, param)
+        pool.submit(layer._ct_stream_note, param)
+    assert fired_on == [threading.get_ident()]
+    assert layer._ct_stream_presplit["done"] is True
+    # outside a load (no current pool) the trigger fires inline, as before
+    fired_on.clear()
+    layer2 = Stub(param)
+    layer2._ct_stream_note(param)
+    layer2._ct_stream_note(param)
+    assert fired_on == [threading.get_ident()]
