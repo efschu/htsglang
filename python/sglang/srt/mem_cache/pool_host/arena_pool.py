@@ -119,9 +119,22 @@ def _arena_page_load_on() -> bool:
     return str(os.environ.get(ARENA_PAGE_LOAD_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
 
 
-def _arena_page_load_mode() -> str:
-    m = str(os.environ.get("SGLANG_WEG2_ARENA_PAGE_LOAD_MODE", "kernel")).strip().lower()
-    return "cpu" if m == "cpu" else "kernel"
+def _arena_page_load_mode(page_bytes: int = 0) -> str:
+    """"kernel" = the MLA one-buffer JIT gather with element_dim = page bytes;
+    "cpu" = the pinned-stage index_select.
+
+    fnFL2x66 (23.09.): the JIT module is instantiated PER ELEMENT SIZE. The
+    27B's 32-KiB page is a warm build; a Next Flash page (786432 B) is a new
+    instantiation, and the first load after the wake built it with ninja in
+    the scheduler thread (py-spy: transfer_hicache_one_layer_mla -> load_jit
+    -> build_ninja) for > 150 s while the expert workers waited in the
+    all_reduce and died at the BAR1 cycle deadline. Unset, a page above 32 KiB
+    takes the cpu stage (70 pages x 786432 B = 55 MB, a memcpy); an explicit
+    env value wins for both sizes."""
+    m = str(os.environ.get("SGLANG_WEG2_ARENA_PAGE_LOAD_MODE", "")).strip().lower()
+    if m in ("cpu", "kernel"):
+        return m
+    return "cpu" if int(page_bytes or 0) > 32768 else "kernel"
 
 
 def _arena_page_load_timing() -> bool:
@@ -676,7 +689,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # the GPU gather WHOLE PAGES straight from the mapped arena (the MLA
         # one-buffer kernel with element_dim = page bytes); "cpu" is the
         # pinned-stage form; the first kernel failure falls back to cpu.
-        mode = getattr(self, "_page_mode", None) or _arena_page_load_mode()
+        mode = getattr(self, "_page_mode", None) or _arena_page_load_mode(pb)  # x66: no JIT build at the wake
         if mode == "kernel" and dev.type != "cuda":
             mode = "cpu"
         _timing = _arena_page_load_timing()

@@ -162,3 +162,23 @@ def test_the_page_load_block_keeps_the_27b_form_and_caps_the_paged_stage():
 def test_an_explicit_page_load_block_stays_a_page_count():
     with mock.patch.dict(os.environ, {ap.ARENA_PAGE_LOAD_BLOCK_ENV: "2048"}, clear=False):
         assert ap._arena_page_load_block(786432) == 2048
+
+
+# ---- 4. no JIT build at the wake: paged pools load through the cpu stage (x66) --
+
+def test_a_paged_pool_loads_through_the_cpu_stage_by_default():
+    """x66: 'kernel' instantiates the MLA one-buffer JIT per element size; the
+    786432-B page built it with ninja in the scheduler thread at the wake for
+    > 150 s while the workers died at the BAR1 cycle deadline."""
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("SGLANG_WEG2_ARENA_PAGE_LOAD_MODE", None)
+        assert ap._arena_page_load_mode(32768) == "kernel"   # 27B: a warm build
+        assert ap._arena_page_load_mode(0) == "kernel"
+        assert ap._arena_page_load_mode(786432) == "cpu"
+
+
+def test_an_explicit_page_load_mode_wins_for_both_page_sizes():
+    with mock.patch.dict(os.environ, {"SGLANG_WEG2_ARENA_PAGE_LOAD_MODE": "kernel"}, clear=False):
+        assert ap._arena_page_load_mode(786432) == "kernel"
+    with mock.patch.dict(os.environ, {"SGLANG_WEG2_ARENA_PAGE_LOAD_MODE": "cpu"}, clear=False):
+        assert ap._arena_page_load_mode(32768) == "cpu"
