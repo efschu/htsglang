@@ -63,6 +63,43 @@ def kv_mid_ok(free_bytes, floor_bytes: int, kv_bytes: int, remaining_bytes: int,
     return int(free_bytes) - int(floor_bytes) - int(margin_bytes) >= int(kv_bytes) + int(remaining_bytes)
 
 
+#: fnFL2x81 (23.09.): the mid-legs resume is ON by default -- the verdict is
+#: group-uniform now (see :func:`kv_mid_uniform`), which is what xsn377 lacked.
+KV_MID_ENV = "SGLANG_WEG2_WAKE_KV_MID"
+
+
+def kv_mid_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(KV_MID_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def kv_mid_vote(*, outstanding: bool, free_bytes, floor_bytes: int, kv_bytes: int,
+                remaining_bytes: int) -> bool:
+    """One rank's vote for the group's mid-legs kv resume after this tag.
+
+    A rank whose kv pool is not outstanding (never paused, or already back)
+    has nothing to fund and votes True; every other rank votes its own fit
+    (:func:`kv_mid_ok`)."""
+    if not outstanding:
+        return True
+    return kv_mid_ok(free_bytes, floor_bytes, kv_bytes, remaining_bytes)
+
+
+def kv_mid_uniform(votes) -> bool:
+    """fnFL2x81: the GROUP resumes its kv pools after the same tag, or not at
+    all this tag -- every rank's vote must be True.
+
+    xsn377 (18.09.): the per-rank decision differed (TP1 6.5 GB funded at the
+    first tag, TP0 12.3 GB never), the preload then moved ONE rank's
+    prefixes and the first extend died on PrefixLensRankDivergence. The
+    tightest rank rules: with the 1:1 swap every P tag that leaves the 5090
+    (~1.7 GB) is bigger than the D tag that arrives (~0.9 GB), so TP0 funds
+    its 4.3 GB pool a few tags before the end (x80: 7.8 GB free after P's
+    kv pause, +0.8 GB per tag pair) and the loadback overlaps those tags."""
+    votes = list(votes)
+    return bool(votes) and all(bool(v) for v in votes)
+
+
 # --- #1490: the fit test the wake computed and then ignored ------------------
 # Boots weg2xsn406 (16:49:25Z) and weg2xsn408 (17:57:21Z), same shape twice.
 # `_weg2_wake_kv_first_ok` computes EXACTLY the physical-fit arithmetic --
