@@ -191,6 +191,35 @@ class TestTheInstallerUsesTheSizedRows(CustomTestCase):
         self.assertEqual(ring.reader, "rows")
 
 
+class TestTheHeadroomParseGate(CustomTestCase):
+    def _sa(self, **kw):
+        from sglang.srt.server_args import ServerArgs
+
+        sa = ServerArgs.__new__(ServerArgs)
+        for k, v in dict(
+            kv_tail_min_tokens=16384, kv_tail_max_tokens=-1, kv_tail_ring_rows=None,
+            kv_tail_host_max_tokens=None, kv_tail_shrink_hysteresis_rounds=None,
+            kv_tail_virtual_fp8=False, kv_tail_sidecar=False, kv_tail_draft=False,
+            kv_tail_headroom=True, page_size=1, disable_cuda_graph=False,
+        ).items():
+            setattr(sa, k, v)
+        sa.__dict__.update(kw)
+        return sa
+
+    def test_headroom_on_a_paged_reader_is_refused_at_parse_time(self):
+        sa = self._sa(page_size=1)  # the 27B form: page 1, FlashInfer
+        sa._handle_kv_tail()
+        with self.assertRaises(ValueError) as cm:
+            sa._handle_kv_tail_page_form(hf_config=types.SimpleNamespace())
+        self.assertIn("W142", str(cm.exception))
+        self.assertIn("--kv-tail-headroom", str(cm.exception))
+
+    def test_headroom_on_the_qsa_reader_parses(self):
+        sa = self._sa(page_size=64)
+        sa._handle_kv_tail()
+        sa._handle_kv_tail_page_form(hf_config=_qsa_hf_config())
+
+
 class TestTheKnob(CustomTestCase):
     def test_headroom_alone_turns_the_tail_on(self):
         self.assertTrue(KvTailKnobs(min_tokens=0, headroom=True).enabled)

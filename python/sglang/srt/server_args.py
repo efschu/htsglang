@@ -9016,7 +9016,8 @@ class ServerArgs:
         # family's page default lives in arg_groups/overrides.py).
         if not getattr(self, "_kv_tail_page_form_pending", False):
             return
-        if int(self.page_size or 1) == 1:
+        headroom = bool(getattr(self, "kv_tail_headroom", False))
+        if int(self.page_size or 1) == 1 and not headroom:
             return
         reader = "paged"
         if hf_config is None and str(self.model_path).lower() not in ("none", "dummy"):
@@ -9026,6 +9027,18 @@ class ServerArgs:
 
             if is_qwen_qsa(hf_config):
                 reader = "rows"
+        if headroom and reader == "paged":
+            # Slice 2e-II, refused at PARSE time as well as at pool sizing:
+            # the paged reader's window is fixed at the minimum, so a
+            # headroom ring would be VRAM taken and never read.
+            raise ValueError(
+                "W142 Weg2KvTailFormRefused: --kv-tail-headroom needs the "
+                "elastic rows reader (QSA / Next Flash); this model reads the "
+                "ring through FlashInfer's paged plan, whose window is fixed at "
+                "--kv-tail-min-tokens."
+            )
+        if int(self.page_size or 1) == 1:
+            return
         if reader == "paged":
             raise ValueError(
                 "W142 Weg2KvTailFormRefused: the precision tail needs "
