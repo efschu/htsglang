@@ -722,6 +722,7 @@ def eagle_prepare_for_verify(
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
+    force_eager: bool = False,
 ):
     from sglang.kernels.ops.speculative.cache_locs import (
         assign_extend_cache_locs_func,
@@ -778,9 +779,12 @@ def eagle_prepare_for_verify(
     batch.capture_hidden_mode = capture_mode
     verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
-    # Run attention backend plan and cuda graph preparation
+    # Run attention backend plan and cuda graph preparation. ``force_eager``
+    # (spec_stage_sync.eager_verify_round, rank-uniform) keeps the graph out
+    # of a diagnostic round before load_batch could mark the batch ready.
     can_run_cuda_graph = bool(
-        target_worker.model_runner.decode_cuda_graph_runner
+        not force_eager
+        and target_worker.model_runner.decode_cuda_graph_runner
         and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
             verify_forward_batch
         )

@@ -32,7 +32,9 @@ class _Stream:
             raise self.fault
 
 
-class StageSync(unittest.TestCase):
+class _SyncCase(unittest.TestCase):
+    """Env, module state and a mock stream reset around every test."""
+
     def setUp(self):
         self._env = sss.os.environ.pop(sss.ENV, None)
         self._reset()
@@ -56,7 +58,12 @@ class StageSync(unittest.TestCase):
     def _reset():
         sss._SEEN.clear()
         sss._STATE.update(budget=None, last_ok="none", checked_ct=0)
+        sss.os.environ.pop(sss.EAGER_ENV, None)
+        sss._EAGER.update(budget=None, round_ct=0)
+        sss._MODULE.update(active=False, models=set(), last_ok="none", checked_ct=0)
 
+
+class StageSync(_SyncCase):
     def test_off_by_default_never_syncs(self):
         with self.assertNoLogs(sss.logger, level=logging.INFO):
             for _ in range(3):
@@ -100,6 +107,87 @@ class StageSync(unittest.TestCase):
         self.assertIn("last_ok=draft#1", line)
         self.assertIn("illegal memory access was encountered", line)
         self.assertNotIn("more", line)
+
+
+class _Layer(sss.torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear_attn = sss.torch.nn.Identity()
+        self.mlp = sss.torch.nn.Identity()
+
+    def forward(self, x):
+        return self.mlp(self.linear_attn(x))
+
+
+class _Inner(sss.torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = sss.torch.nn.ModuleList([_Layer(), _Layer()])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class _Model(sss.torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = _Inner()
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class EagerVerifyWithModuleSync(_SyncCase):
+    """x44 -> x45: the verify forward is the faulting stage; round 1 eager
+    with a sync after every layer and layer child names the module."""
+
+    def test_eager_rounds_are_off_by_default_and_counted_when_on(self):
+        self.assertFalse(sss.eager_verify_round())
+        self._reset()
+        sss.os.environ[sss.EAGER_ENV] = "1"
+        self.assertEqual([sss.eager_verify_round() for _ in range(3)], [True, False, False])
+
+    def test_an_inactive_window_installs_nothing_and_never_syncs(self):
+        model = _Model()
+        with sss.module_sync_window(model, active=False):
+            model(sss.torch.zeros(1))
+        self.assertEqual(self.stream.sync_ct, 0)
+        self.assertFalse(any(m._forward_hooks for m in model.modules()))
+
+    def test_a_clean_window_syncs_every_layer_and_child_and_prints_its_denominator(self):
+        model = _Model()
+        with self.assertLogs(sss.logger, level=logging.INFO) as cm:
+            with sss.module_sync_window(model, active=True):
+                model(sss.torch.zeros(1))
+        # model.layers.{0,1} and their two children each, plus model.model
+        self.assertEqual(self.stream.sync_ct, 7)
+        self.assertIn("installed hooks=7", cm.output[0])
+        self.assertIn("window ok checked=7 last_ok=model", cm.output[-1])
+        model(sss.torch.zeros(1))  # outside the window the hooks stay inert
+        self.assertEqual(self.stream.sync_ct, 7)
+
+    def test_a_fault_names_the_module_and_its_predecessor_and_reraises(self):
+        model = _Model()
+        calls = {"n": 0}
+
+        def sync():
+            calls["n"] += 1
+            if calls["n"] == 4:  # layers.1.linear_attn
+                raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+        self.stream.synchronize = sync
+        with self.assertLogs(sss.logger, level=logging.ERROR) as cm:
+            with self.assertRaises(RuntimeError):
+                with sss.module_sync_window(model, active=True):
+                    model(sss.torch.zeros(1))
+        self.assertIn(
+            "SPEC-MODULE-SYNC FAULT module=model.layers.1.linear_attn checked=4 "
+            "last_ok=model.layers.0",
+            cm.output[0],
+        )
+        self.assertFalse(sss._MODULE["active"])
 
 
 if __name__ == "__main__":

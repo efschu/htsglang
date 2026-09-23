@@ -99,6 +99,12 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_stage_sync import checkpoint as _stage_sync
+from sglang.srt.speculative.spec_stage_sync import (
+    eager_verify_round as _stage_sync_eager_verify,
+)
+from sglang.srt.speculative.spec_stage_sync import (
+    module_sync_window as _module_sync_window,
+)
 from sglang.srt.speculative.spec_utils import (
     _broadcast_draft_picks,
     capture_safe_tp_broadcast,
@@ -3309,12 +3315,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
+        eager_round = (
+            not batch.forward_mode.is_idle() and _stage_sync_eager_verify()
+        )
         with self.plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
                 verify_input,
                 self.req_to_token_pool,
                 batch,
                 self.target_worker,
+                force_eager=eager_round,
             )
         _stage_sync("verify-prepare", stream=self.plan_stream)
 
@@ -3364,11 +3374,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # eagle_prepare_for_verify marked the batch in exactly that case; the
         # non-cuda-graph path stays unmarked and gets forward_extend's init
         # (post-pad).
-        forward_batch_output = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-        )
+        with _module_sync_window(
+            self.target_worker.model_runner.model, active=eager_round
+        ):
+            forward_batch_output = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+            )
         _stage_sync("verify-forward")
         logits_output = forward_batch_output.logits_output
 
