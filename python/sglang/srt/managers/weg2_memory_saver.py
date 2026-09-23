@@ -1641,6 +1641,49 @@ class VramCredit:
                     "corridor_floor_bytes": floor,
                     "reason": "the peer's releases funded this tag",
                 }
+            # fnFL2x37 (23.09.): THE CARD IS ASKED AGAIN ON EVERY PASS. The
+            # xsn290 exit above (free minus floor minus the peer's live
+            # staging holds the tag -> claim OVERDRAWN, the peer's next
+            # staging takes the host path) was taken ONCE, at the door, with
+            # the entry reading. D TP2 entered with free=1669 MiB for an
+            # 868 MiB tag (allocatable 968, peer staging 471: short by 371),
+            # and from then on this loop read only the counter. Card 2 then
+            # freed 3.2 GB (nvidia-smi: 4864 MiB free at 08:47) and nobody
+            # looked: TP2 waited 120 s for a pause PP2 could not reach, because
+            # PP2's last deposit waited for TP0, TP0's collect for PP0's next
+            # tag, and PP0's ring for TP2's very collect -- the P<->D cycle,
+            # W35, boot dead, with room on every card.
+            if free_reader is not None:
+                _free_loop = self._free_now(free_reader)
+                _staged_loop = int(rec.get("staged_bytes", 0) or 0)
+                if _free_loop is not None and _free_loop - floor - _staged_loop >= need:
+                    spent = self.claim(tag, need, epoch=epoch, overdraw=True)
+                    logger.info(
+                        "WEG2-CREDIT-EARLY tag=%s free=%d MiB floor=%d MiB peer_staged=%d MiB "
+                        ">= need=%d MiB %.1f s INTO THE WAIT with the counter SHORT (balance "
+                        "%d MiB): claim OVERDRAWN by %d MiB -- the card freed up after the entry "
+                        "reading (x37: P's kv pause landed while this rank read only the counter)",
+                        tag, _free_loop // MIB, floor // MIB, _staged_loop // MIB, need // MIB,
+                        time.perf_counter() - t0, available // MIB,
+                        max(0, need - available) // MIB,
+                    )
+                    return {
+                        "waited_s": time.perf_counter() - t0,
+                        "free_bytes": _free_loop,
+                        "allocatable_est_bytes": max(0, _free_loop - floor),
+                        "corridor_floor_bytes": floor,
+                        "credit_bytes": spent["credit_bytes"],
+                        "credit_published_bytes": credit,
+                        "consumed_bytes": spent["consumed_bytes"],
+                        "available_bytes": spent["available_bytes"],
+                        "claimed_bytes": spent["claimed_bytes"],
+                        "reason": (
+                            "the card came to hold the bytes above its corridor floor and the "
+                            "peer's live staging while this rank waited; the counter is short "
+                            "and the claim is OVERDRAWN, so the peer's staging takes the host "
+                            "path (xsn290 rule, re-read in the loop -- x37)"
+                        ),
+                    }
             if rec["leg_complete"]:
                 # #1349: ASK THE CARD ONCE MORE BEFORE REFUSING.  The debit makes
                 # the balance shrink within a leg, so "the peer will release no
