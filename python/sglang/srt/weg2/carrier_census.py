@@ -160,6 +160,15 @@ class CarrierCensus:
     lines: Tuple[str, ...]
     verdict: str
     detail: str
+    #: Ranks that hold no carrier and therefore abstain (boot fnFL2x61): the
+    #: Form A expert workers of group D have no attention layer and a null
+    #: storage tier; their plain host pool is SYNCED to the attention host's
+    #: pool ``size`` (the 4096-row staging ring under the arena form) and their
+    #: ``#915`` line prints 0.9 x that ring, while the attention host prints
+    #: the arena's capacity.  A worker's number is not a bound on anything the
+    #: front routes, so it is neither counted nor compared -- the same rule the
+    #: prefetch-claim vote applies (Task #89: workers abstain, ABSTAIN pair).
+    abstained: Tuple[int, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -425,16 +434,62 @@ def parse_limit_lines(
     return out
 
 
+#: The line a Form A expert worker prints instead of the ``#706 canonical KV
+#: page active`` marker (fnFL2 v18; the launcher's W7/W10 counts it by the same
+#: text).  Such a rank holds no attention layer and no carrier, so the census
+#: lets it abstain -- see :attr:`CarrierCensus.abstained`.
+FORM_A_WORKER_MARKER = "this rank is a Form A expert worker (no attention layer) -- no page window"
+
+_WORKER_RE = re.compile(r"\bTP(?P<rank>\d+)\]")
+
+
+def form_a_worker_ranks(log_path: str) -> Tuple[int, ...]:
+    """The TP ranks of ``log_path`` that declared themselves Form A expert
+    workers (no attention layer, null storage tier), sorted.  A missing file
+    yields ``()`` -- the census then expects every rank, as before."""
+    found = set()
+    try:
+        with open(log_path, errors="replace") as f:
+            for line in f:
+                if FORM_A_WORKER_MARKER not in line:
+                    continue
+                m = _WORKER_RE.search(line)
+                if m:
+                    found.add(int(m.group("rank")))
+    except OSError:
+        return ()
+    return tuple(sorted(found))
+
+
 def census(
     log_path: str,
     *,
     expected_ranks: int,
     floor: int,
     sites: Sequence[str] = CENSUS_SITES,
+    abstain_ranks: Sequence[int] = (),
 ) -> CarrierCensus:
-    """Take the carrier census over one group log.  Pure; never raises."""
-    rows = parse_limit_lines(log_path, sites=sites)
+    """Take the carrier census over one group log.  Pure; never raises.
+
+    ``abstain_ranks`` (boot fnFL2x61): ranks that hold no carrier.  Their lines
+    are neither counted toward the population nor compared -- a Form A expert
+    worker's ``#915`` line is 0.9 x the staging ring its plain pool was synced
+    to, not a bound on anything the front routes (see
+    :attr:`CarrierCensus.abstained`).  The population is every expected rank
+    that does not abstain; an all-abstaining group has no carrier and is
+    ``missing``.
+    """
+    abstained: Tuple[int, ...] = tuple(sorted({int(r) for r in abstain_ranks}))
+    rows = [
+        (rank, d, raw)
+        for rank, d, raw in parse_limit_lines(log_path, sites=sites)
+        if rank not in abstained
+    ]
     site_names = ",".join(sites) or "<any>"
+    abstain_note = (
+        f" (TP {list(abstained)} abstain: Form A expert workers, no attention layer, null storage tier)"
+        if abstained else ""
+    )
 
     per_rank: Dict[int, int] = {}
     rank_rows: Dict[int, List[Dict[str, str]]] = {}
@@ -456,7 +511,8 @@ def census(
             expected_ranks=int(expected_ranks),
             lines=tuple(lines),
             verdict=verdict,
-            detail=detail,
+            detail=detail + abstain_note,
+            abstained=abstained,
         )
 
     # The first parsed row is taken BEFORE any refusal, so a refusal that did
@@ -485,7 +541,16 @@ def census(
             f"(that is not the same fact as a route that was switched off)",
         )
 
-    missing_ranks = [r for r in range(expected_ranks) if r not in per_rank]
+    population = [r for r in range(expected_ranks) if r not in abstained]
+    if not population:
+        return _mk(
+            "missing",
+            f"every one of the {expected_ranks} TP ranks abstains, so the group holds no carrier "
+            f"at all; a group without an attention host has no bound to route by",
+            first=first,
+        )
+
+    missing_ranks = [r for r in population if r not in per_rank]
     if missing_ranks:
         return _mk(
             "missing",

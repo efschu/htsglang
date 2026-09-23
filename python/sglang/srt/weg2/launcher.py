@@ -14376,9 +14376,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # against a literal: the front routes SHORT on `remainder <= X`.
         _floor, _floor_why = _cc.route_floor(x_tokens)
         _expect_ranks = _cc.tp_size_of(spec_d.argv)
-        _cen = _cc.census(spec_d.log, expected_ranks=_expect_ranks, floor=_floor)
+        # fnFL2x61: Form A expert workers (no attention layer, null storage
+        # tier) hold no carrier; their plain pool is synced to the attention
+        # host's staging ring and prints 0.9 x that, while the host prints the
+        # arena's capacity -- they abstain, as they do in the prefetch vote.
+        _abstain = _cc.form_a_worker_ranks(spec_d.log)
+        _cen = _cc.census(spec_d.log, expected_ranks=_expect_ranks, floor=_floor,
+                          abstain_ranks=_abstain)
         log(f"CARRIER BOUND: source='{_cc.SOURCE_MARKER}' in {spec_d.log}; component={_cc.COMPONENT}; "
-            f"per-rank(TP)={_cen.per_rank} expected_ranks={_cen.expected_ranks} (from group D argv --tp-size); "
+            f"per-rank(TP)={_cen.per_rank} expected_ranks={_cen.expected_ranks} (from group D argv --tp-size) "
+            f"abstained(Form A workers)={list(_cen.abstained)}; "
             f"{_cen.terms()} sites={_cen.site}; "
             f"floor={_cen.floor} [{_floor_why}]; verdict={_cen.verdict}: {_cen.detail}")
         for _sl in _cen.lines:
