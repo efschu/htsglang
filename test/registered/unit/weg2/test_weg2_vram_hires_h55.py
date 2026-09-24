@@ -454,6 +454,33 @@ class TestReport(unittest.TestCase):
             self.assertEqual(r["ausser_torch"], 31200 - 30700)
             self.assertEqual(r["card_free_min"], 3500)
 
+    def test_h59_planner_definition_persist_and_torch_headroom(self):
+        # fnFL2x164 PP0 chunk 0, verbatim numbers: H55 transient 4074 is the
+        # planner's 3663 (peak - allocated AFTER) plus the 411 MiB the chunk
+        # leaves behind; torch headroom = 105 + 28780 - 27307 - 216 = 1362
+        # (= WEG2-GRAPH-POOL headroom_mib of the same chunk).
+        line = ("[2026-09-24 19:15:41 PP0] WEG2-VRAM-PEAK rank=0 phase=chunk rows=16384 n=1 "
+                "t0_unix_ms=1790277332153 t_unix_ms=1790277341963 window_ms=9811 "
+                "peak_allocated_mib=27307 peak_reserved_mib=28868 start_allocated_mib=23233 "
+                "transient_mib=4074 allocated_mib=23644 reserved_mib=28780 card_free_start_mib=5327 "
+                "card_free_mib=105 card_total_mib=32088\n")
+        pool = ("[2026-09-24 19:15:41 PP0] WEG2-GRAPH-POOL rank=0 phase=extend captured_mib=23156 "
+                "private_free_mib=216 reserved_after_mib=28780 allocated_mib=23644 peak_mib=27307 "
+                "card_free_mib=105 card_total_mib=32088 cap_mib=28885 headroom_mib=1362 pools=x\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "boot_weg2_fnFL2x164_x_0924_191021.P.log")
+            with open(p, "w") as f:
+                f.write(pool + line)
+            self.assertEqual(vr.private_free_by_rank(p), {"0": 216})
+            rows = vr.inproc_rows(None, {"P": vr.peak_lines(p)}, {}, (1, 0, 2),
+                                  private_free={"P": vr.private_free_by_rank(p)})
+            r = [x for x in rows if x["phase"] == "chunk"][0]
+            self.assertEqual((r["transient"], r["tr_plan"], r["persist"]), (4074, 3663, 411))
+            self.assertEqual(r["kopf_torch_min"], 1362)
+            # without the private-free term the headroom is not claimed
+            bare = vr.inproc_rows(None, {"P": vr.peak_lines(p)}, {}, (1, 0, 2))
+            self.assertIsNone([x for x in bare if x["phase"] == "chunk"][0]["kopf_torch_min"])
+
     def test_without_peak_lines_windows_fall_back_to_seconds(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, crow, _ = self._rows(tmp, with_peak_lines=False)

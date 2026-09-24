@@ -347,20 +347,69 @@ def card_rows(tr: Trace, wins: List[Window], plan, dmon, rank_cards) -> List[Dic
     return rows
 
 
+_RX_POOL_PF = re.compile(r"WEG2-GRAPH-POOL rank=(\d+) phase=\S+ .*?private_free_mib=(-?\d+)")
+
+
+def private_free_by_rank(path: Optional[str]) -> Dict[str, int]:
+    """H59: ``private_free_mib`` je Rang aus den WEG2-GRAPH-POOL-Zeilen eines
+    Logs (der letzte Wert; im Boot konstant) -- der dritte Term des Planer-
+    Kopfraums ``cap - peak - privat_frei``."""
+    out: Dict[str, int] = {}
+    if not path or not os.path.exists(path):
+        return out
+    with open(path, errors="replace") as f:
+        for ln in f:
+            if "WEG2-GRAPH-POOL " not in ln:
+                continue
+            m = _RX_POOL_PF.search(ln)
+            if m and int(m.group(2)) >= 0:
+                out[m.group(1)] = int(m.group(2))
+    return out
+
+
+def _num(d: Dict[str, str], fld: str) -> Optional[int]:
+    v = d.get(fld, "na")
+    if v in ("na", ""):
+        return None
+    try:
+        return int(float(v))
+    except ValueError:
+        return None
+
+
 def inproc_rows(tr: Optional[Trace], peaks_by_group: Dict[str, List[Dict[str, str]]], plan,
-                rank_cards) -> List[Dict]:
+                rank_cards, private_free: Optional[Dict[str, Dict[str, int]]] = None) -> List[Dict]:
+    """Je (Gruppe, Rang, Phase) die In-Prozess-Maxima. H59: ``transient`` ist
+    H55s ``peak - start``; ``tr_plan`` = ``peak - allocated NACH dem Fenster``
+    ist die PLANER-Definition (``[vram-peak]``, ``PP-CUT ACTIVATION``), und
+    ``persist`` = ``allocated nach - start`` ist, was das Fenster liegen laesst
+    (im Planer das Chunk-WACHSTUM). ``kopf_torch`` = ``card_free + reserved -
+    peak_allocated - privat_frei`` am Fensterende, das Minimum -- der Kopfraum
+    in der Waehrung der P-/D-KARTE, gegen den near-OOM gilt."""
     agg: Dict[Tuple[str, str, str], Dict] = {}
+    pf_all = private_free or {}
     for grp, peaks in peaks_by_group.items():
+        pf = pf_all.get(grp, {})
         for d in peaks:
             ph = d.get("phase", "?") + (f":{d['leg']}" if "leg" in d else "")
             key = (grp, d.get("rank", "?"), ph)
             a = agg.setdefault(key, {"n": 0, "peak_reserved": 0, "transient": 0, "card_free_min": None,
-                                     "nvml_proc_max": None})
+                                     "nvml_proc_max": None, "tr_plan": None, "persist": None,
+                                     "kopf_torch_min": None})
             a["n"] += 1
             for fld, dst in (("peak_reserved_mib", "peak_reserved"), ("transient_mib", "transient")):
                 v = d.get(fld, "na")
                 if v != "na":
                     a[dst] = max(a[dst], int(float(v)))
+            pk, st, en = _num(d, "peak_allocated_mib"), _num(d, "start_allocated_mib"), _num(d, "allocated_mib")
+            if pk is not None and en is not None:
+                a["tr_plan"] = max(a["tr_plan"] or 0, pk - en)
+                if st is not None:
+                    a["persist"] = en - st if a["persist"] is None else max(a["persist"], en - st)
+            cf, rs = _num(d, "card_free_mib"), _num(d, "reserved_mib")
+            if pk is not None and cf is not None and rs is not None and d.get("rank", "?") in pf:
+                kopf = cf + rs - pk - pf[d["rank"]]
+                a["kopf_torch_min"] = kopf if a["kopf_torch_min"] is None else min(a["kopf_torch_min"], kopf)
             for fld in ("card_free_mib", "card_free_start_mib"):
                 v = d.get(fld, "na")
                 if v != "na":
@@ -416,12 +465,19 @@ def render(tr: Trace, crow: List[Dict], irow: List[Dict]) -> str:
         out.append("")
         out.append("IN-PROZESS (WEG2-VRAM-PEAK, torch-Allokator je Fenster)")
         out.append(f"{'grp':3} {'rank':>4} {'phase':16} {'card':>5} {'n':>4} {'peak_res':>8} {'transient':>9} "
-                   f"{'plan_tr':>7} {'free_min':>8} {'nvml_proc':>9} {'ausser_torch':>12}")
+                   f"{'plan_tr':>7} {'tr_plan':>7} {'persist':>7} {'kopf_torch':>10} "
+                   f"{'free_min':>8} {'nvml_proc':>9} {'ausser_torch':>12}")
         for r in irow:
             out.append(f"{r['group']:3} {r['rank']:>4} {r['phase'][:16]:16} "
                        f"{('nvml' + str(r['card'])) if r['card'] is not None else '-':>5} {r['n']:>4} "
                        f"{_f(r['peak_reserved'], 8)} {_f(r['transient'], 9)} {_f(r['plan_transient'])} "
+                       f"{_f(r.get('tr_plan'))} {_f(r.get('persist'))} {_f(r.get('kopf_torch_min'), 10)} "
                        f"{_f(r['card_free_min'], 8)} {_f(r['nvml_proc_max'], 9)} {_f(r['ausser_torch'], 12)}")
+        out.append("  transient = peak - START (H55); tr_plan = peak - allocated NACH dem Fenster (die "
+                   "Planer-Definition, gegen plan_tr zu lesen); persist = was das Fenster liegen laesst "
+                   "(im Planer das Chunk-Wachstum); kopf_torch = card_free + reserved - peak - privat_frei "
+                   "(Minimum, die Waehrung der P-/D-KARTE). rest_min oben ist die Karte NACH dem "
+                   "Allokator-Cache: fnFL2x165 lief alle sechs 16k-Chunks mit rest_min 7 MiB auf PP0.")
     return "\n".join(out)
 
 
@@ -474,7 +530,8 @@ def report(csv_path: str, p_log: str, d_log: str, front: Optional[str] = None, d
     wins.sort(key=lambda w: (w.kind == "boot", w.a_ms))
     plan = planner_card(dry, rank_cards)
     crow = card_rows(tr, wins, plan, dmon_series(dmon, day), rank_cards)
-    irow = inproc_rows(tr, {"P": p_peaks, "D": d_peaks}, plan, rank_cards)
+    irow = inproc_rows(tr, {"P": p_peaks, "D": d_peaks}, plan, rank_cards,
+                       private_free={"P": private_free_by_rank(p_log), "D": private_free_by_rank(d_log)})
     return render(tr, crow, irow)
 
 

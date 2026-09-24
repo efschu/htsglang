@@ -154,6 +154,17 @@ class TestOverride(unittest.TestCase):
             solve(cap_tokens=1, pinned_layers=(16, 8, 8), pinned_attn=(2, 3, 3))
         self.assertIn("not realizable", str(caught.exception))
 
+    def test_an_unpriceable_pinned_cut_names_the_rank_and_the_overrun(self):
+        # H59: the pool model's own sentence rides on the W40 -- the dry run of
+        # FR_P[2] 0.55 (fnFL2 x164 form) printed only the generic class before.
+        # rank2: 1500 - 8 x 100 (weights) - 1000 (arming floor) = -300 MiB
+        with self.assertRaises(PPCutRefused) as caught:
+            solve(cap_tokens=1, free_mib=(20000.0, 12000.0, 1500.0), pinned_layers=INCUMBENT)
+        message = str(caught.exception)
+        self.assertIn("W40 Weg2PPCutRefused: the pinned layer cut 16,8,8 cannot be priced", message)
+        self.assertIn("Pool model: cut (16, 8, 8) is infeasible on rank2", message)
+        self.assertIn("by 300.0 MiB", message)
+
 
 class TestTheAttentionAxisIsNotAFreeAllocation(unittest.TestCase):
     """The premise a naive solver would encode, refuted on the real shape.

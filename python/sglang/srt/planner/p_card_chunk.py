@@ -35,6 +35,18 @@ ausserhalb der Stuetzpunkte wird verweigert (W131), nie extrapoliert. Keine
 Reserve, kein Hand-Pin: jeder Term ist eine Messung oder die Geometrie des
 Checkpoints.
 
+H59 (fnFL2x164, 4 Sitze, FR_P 0.410/0.712 = die H41d-Kante, PP0 tot im
+vierten Chunk): nicht die Transiente (in der Planer-Definition 3663/3264/3263
+MiB, unter den Stuetzstellen -- H55s ``transient_mib`` ist ``peak - start``
+und enthaelt, was der Chunk liegen laesst, siehe :class:`ChunkWindow`) und
+nicht die Sitze (1 -> 4 Sitze: +3 MiB allocated, -3 privat_frei), sondern der
+MITBEWOHNER: ``cap`` enthaelt den schlafenden D-Rang derselben Karte, und der
+hielt in x164s erstem Flip 84 MiB mehr als in der Referenz x160 und waechst
+ueber die Flips bis 2004 MiB (x165). Die Karte bucht darum den gemessenen
+Mitbewohner-Hochstand gegen den Stand am Referenzpunkt, die Referenz traegt
+ihre Sitze als Form-Schluessel, und die eingebaute Referenz ist die 4-Sitze-
+Form (x163 + x164 + x165).
+
 Rein (kein torch): der Launcher rechnet es ohne CUDA.
 """
 
@@ -77,6 +89,11 @@ class PChunkUnmeasured(ValueError):
     """W131: ein Chunk ausserhalb der gemessenen Stuetzpunkte."""
 
 
+class PCardFormUnmeasured(ValueError):
+    """H59: der Boot faehrt mehr Sitze, als die Referenz gemessen hat -- die
+    Bilanz entfaellt mit Namen (keine Zahl aus einer anderen Form)."""
+
+
 # ---------------------------------------------------------------------------
 # 1. die Transiente als Funktion des Chunks
 # ---------------------------------------------------------------------------
@@ -113,7 +130,11 @@ _RX_PEAK = re.compile(
 )
 _RX_CHUNK = re.compile(
     _STAGE + r" max_total_num_tokens=(\d+), chunked_prefill_size=(-?\d+)"
+    r"(?:, max_prefill_tokens=-?\d+, max_running_requests=(\d+))?"
 )
+#: Der Zeitstempel einer Rang-Zeile (P wie D), fuer die Zuordnung Chunk-0-Punkt
+#: <-> Schlafstand des Mitbewohners (H59).
+_RX_TS = re.compile(r"^\[([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}) ")
 _RX_BUFFER = re.compile(
     _STAGE + r" MoE expert-offload active on layer \d+: (\d+)/(\d+) experts "
     r"resident \+ (\d+) scratch \(buffer=(\d+), fraction=([0-9.]+)\)"
@@ -126,6 +147,7 @@ def observe_p_log(text: str) -> Dict[str, Dict[int, object]]:
     """Was ein P-Log je Stufe ueber Chunk, Puffer, KV und Transiente sagt."""
     chunk: Dict[int, int] = {}
     tokens: Dict[int, int] = {}
+    seats: Dict[int, int] = {}
     buffer: Dict[int, int] = {}
     experts: Dict[int, int] = {}
     fraction: Dict[int, float] = {}
@@ -137,6 +159,8 @@ def observe_p_log(text: str) -> Dict[str, Dict[int, object]]:
             s = int(m.group(1))
             tokens[s] = int(m.group(2))
             chunk[s] = int(m.group(3))
+            if m.group(4) is not None:
+                seats[s] = int(m.group(4))
             continue
         m = _RX_BUFFER.search(line)
         if m:
@@ -163,6 +187,7 @@ def observe_p_log(text: str) -> Dict[str, Dict[int, object]]:
     return {
         "chunk": chunk,
         "tokens": tokens,
+        "seats": seats,
         "buffer": buffer,
         "experts": experts,
         "fraction": fraction,
@@ -246,6 +271,79 @@ P_TRANSIENT_SUPPORT_FNFL2 = TransientSupport(
                        source="fnFL2x118+fnFL2x141+fnFL2x145+fnFL2x146"),
     ),
 )
+
+
+#: H59: die H55-Fensterzeile eines Chunks (``WEG2-VRAM-PEAK ... phase=chunk``).
+_RX_H55_CHUNK = re.compile(
+    _STAGE + r" WEG2-VRAM-PEAK rank=\d+ phase=chunk rows=(\d+) n=\d+ .*?"
+    r"peak_allocated_mib=(\d+) peak_reserved_mib=(\d+) start_allocated_mib=(\d+) "
+    r"transient_mib=(-?\d+) allocated_mib=(\d+) reserved_mib=(\d+) "
+    r"card_free_start_mib=(\d+) card_free_mib=(\d+)"
+)
+
+
+class ChunkWindow(msgspec.Struct, frozen=True, kw_only=True):
+    """Ein H55-Chunk-Fenster einer P-Stufe, MiB (torch-Sicht).
+
+    ZWEI TRANSIENTEN, EIN FENSTER (H59). H55 druckt ``transient_mib = peak -
+    start_allocated``; die Planer-Transiente ``T_s(chunk)`` ist ``peak -
+    allocated NACH dem Chunk`` ([vram-peak], :func:`observe_p_log`). Der
+    Unterschied ist ``persist = allocated_nach - start``: was der Chunk
+    liegen laesst (die Chunk-Ausgabe im PP-Flug, bis 3 Chunks, danach
+    konstant) -- im Planer steht er als Chunk-WACHSTUM, nicht in T. fnFL2x164
+    Chunk 0: 4074 = 3663 + 411 (PP0), 3914 = 3265 + 649 (PP1), 3914 = 3263 +
+    651 (PP2); die "377/627/647 MiB groessere Transiente" ist genau dieses
+    ``persist`` minus die 34/22/4 MiB, die x164 UNTER der Stuetzstelle lag.
+    """
+
+    stage: int
+    rows: int
+    peak_mib: float
+    peak_reserved_mib: float
+    start_mib: float
+    end_mib: float
+    reserved_mib: float
+    card_free_mib: float
+
+    @property
+    def transient_h55_mib(self) -> float:
+        return self.peak_mib - self.start_mib
+
+    @property
+    def transient_planner_mib(self) -> float:
+        return self.peak_mib - self.end_mib
+
+    @property
+    def persist_mib(self) -> float:
+        return self.end_mib - self.start_mib
+
+    @property
+    def cap_mib(self) -> float:
+        """card free + reserved am Fensterende (die ``cap`` von WEG2-GRAPH-POOL)."""
+        return self.card_free_mib + self.reserved_mib
+
+
+def chunk_windows(text: str) -> Dict[int, List[ChunkWindow]]:
+    """Die H55-Chunk-Fenster je P-Stufe, in Log-Reihenfolge."""
+    out: Dict[int, List[ChunkWindow]] = {}
+    for line in text.splitlines():
+        m = _RX_H55_CHUNK.search(line)
+        if not m:
+            continue
+        s = int(m.group(1))
+        out.setdefault(s, []).append(
+            ChunkWindow(
+                stage=s,
+                rows=int(m.group(2)),
+                peak_mib=float(m.group(3)),
+                peak_reserved_mib=float(m.group(4)),
+                start_mib=float(m.group(5)),
+                end_mib=float(m.group(7)),
+                reserved_mib=float(m.group(8)),
+                card_free_mib=float(m.group(10)),
+            )
+        )
+    return out
 
 
 def unmeasured_text(support: TransientSupport, chunk: int) -> str:
@@ -370,6 +468,20 @@ class PCardReference(msgspec.Struct, frozen=True, kw_only=True):
     #: Preis einer Zeile ueber der Referenz, MiB (leer = das Zeilenbild).
     row_card_mib: Tuple[float, ...] = ()
     row_card_source: str = ""
+    #: H59 FORM-SCHLUESSEL neben ``chunk``: die Sitze der Referenz (group P
+    #: ``--max-running-requests``, gelesen aus der Zeile ``max_total_num_tokens=
+    #: ..., max_running_requests=N``). Ein Boot mit MEHR Sitzen ist ungemessen
+    #: (die Bilanz entfaellt mit Namen); weniger Sitze deckt die Referenz
+    #: (gemessen x162 -> x163, 1 -> 4 Sitze: allocated +3, privat_frei -3 MiB,
+    #: Kopfraum gleich).
+    seats: int = 1
+    #: H59 MITBEWOHNER: was der SCHLAFENDE D-Rang derselben Karte am Chunk-0-
+    #: Punkt dieser Referenz hielt (``WEG2-DC-BREAKDOWN stage=release
+    #: tags=['weights_...`` nvml_proc des letzten D-Release davor), MiB je
+    #: Stufe; leer = ungemessen. ``cap`` enthaelt ihn: haelt er in einem
+    #: spaeteren Flip mehr, faellt der Kopfraum um genau die Differenz.
+    co_tenant_mib: Tuple[float, ...] = ()
+    co_tenant_source: str = ""
 
 
 _RX_EXTENT = re.compile(_STAGE + r" #969 EXTENT n=\d+ fwd=\d+ reqs=\[\('[^']*', (\d+), (\d+)")
@@ -406,6 +518,8 @@ class PoolSample(msgspec.Struct, frozen=True, kw_only=True):
     private_free_mib: float
     peak_mib: float
     cap_mib: float
+    #: Zeitstempel der Zeile ("YYYY-MM-DD HH:MM:SS", leer ohne Stempel).
+    t: str = ""
 
     @property
     def headroom_mib(self) -> float:
@@ -432,6 +546,7 @@ def pool_samples(text: str) -> Dict[int, List[PoolSample]]:
             s = int(m.group(1))
             if s not in chunk or s not in start or int(m.group(3)) < 0:
                 continue
+            ts = _RX_TS.search(line)
             out.setdefault(s, []).append(
                 PoolSample(
                     stage=s,
@@ -440,9 +555,123 @@ def pool_samples(text: str) -> Dict[int, List[PoolSample]]:
                     private_free_mib=float(m.group(3)),
                     peak_mib=float(m.group(4)),
                     cap_mib=float(m.group(5)),
+                    t=ts.group(1) if ts else "",
                 )
             )
     return out
+
+
+# ---------------------------------------------------------------------------
+# H59: der Mitbewohner der P-Karte -- der schlafende D-Rang derselben Karte
+# ---------------------------------------------------------------------------
+#
+# ``cap`` einer P-Stufe (card free + reserved) enthaelt, was ANDERE Prozesse
+# auf der Karte halten -- in der P-Phase ist das der schlafende D-Rang
+# derselben Karte (PP0/TP0 nvml1, PP1/TP1 nvml0, PP2/TP2 nvml2). Er ist NICHT
+# konstant: nach seinem weights-Release haelt er tms_resident (Draft 1556 MiB
+# auf TP0) + seinen Allokator-Cache, und der waechst von Flip zu Flip
+# (gemessen in 17 Boots x145..x164, TP0: erster Flip 1696-1782, spaeter bis
+# 1990 MiB; TP1/TP2 766-774, nach dem 259k-Prompt 836-838). fnFL2x164 starb
+# genau daran vorbei: sein erster Flip hielt TP0 1782 statt 1698 (x160, die
+# Referenz) -> cap PP0 28885 statt 28967, -82 MiB, die Karte sagte 458 und
+# war 372. Der Term ist die GEMESSENE Spanne, keine Reserve: Maximum ueber
+# die gemessenen Flips minus das, was am Referenzpunkt schon in cap steckt.
+
+_RX_DORMANT = re.compile(
+    r"\[(?:[0-9-]+ [0-9:]+ )?TP(\d+)\] WEG2-DC-BREAKDOWN stage=release "
+    r"tags=\['weights_[^\]]*\] nvml_proc=(\d+) MiB"
+)
+
+
+def co_tenant_by_flip(d_text: str) -> Dict[int, List[Tuple[str, float]]]:
+    """``{D-Rang: [(Zeitstempel, nvml_proc MiB) je weights-Release]}`` -- der
+    Schlafstand des D-Rangs, den die P-Stufe derselben Karte als Mitbewohner
+    hat (je D->P-Flip ein Wert, in Log-Reihenfolge)."""
+    out: Dict[int, List[Tuple[str, float]]] = {}
+    for line in d_text.splitlines():
+        m = _RX_DORMANT.search(line)
+        if not m:
+            continue
+        ts = _RX_TS.search(line)
+        out.setdefault(int(m.group(1)), []).append(
+            (ts.group(1) if ts else "", float(m.group(2)))
+        )
+    return out
+
+
+def co_tenant_at(d_text: str, rank: int, t: str) -> Optional[float]:
+    """Der Schlafstand des D-Rangs ``rank`` zum Zeitpunkt ``t`` (der letzte
+    weights-Release an oder vor ``t``), oder ``None``."""
+    best: Optional[float] = None
+    for ts, mib in co_tenant_by_flip(d_text).get(int(rank), []):
+        if ts and t and ts <= t:
+            best = mib
+    return best
+
+
+class CoTenantSpan(msgspec.Struct, frozen=True, kw_only=True):
+    """Das gemessene Maximum des Mitbewohners je P-Stufe (= der D-Rang
+    derselben Karte), MiB, ueber alle gemessenen D->P-Flips."""
+
+    max_mib: Tuple[float, ...]
+    source: str
+
+
+def co_tenant_span_from_logs(
+    d_boots: Sequence[Tuple[str, str]], *, n_stages: int
+) -> CoTenantSpan:
+    """Das Maximum je D-Rang ueber alle weights-Releases der D-Logs
+    (``d_boots`` = (Name, Text)); ein Rang ohne Zeile ist ungemessen (0)."""
+    best = [0.0] * n_stages
+    where: List[str] = [""] * n_stages
+    for name, text in d_boots:
+        for r, vals in co_tenant_by_flip(text).items():
+            if r >= n_stages:
+                continue
+            for i, (_t, mib) in enumerate(vals):
+                if mib > best[r]:
+                    best[r] = mib
+                    where[r] = "%s Flip %d" % (name, i + 1)
+    return CoTenantSpan(
+        max_mib=tuple(best),
+        source="; ".join("stage%d %.0f (%s)" % (s, best[s], where[s] or "-") for s in range(n_stages)),
+    )
+
+
+def merge_co_tenant(a: CoTenantSpan, b: CoTenantSpan) -> CoTenantSpan:
+    """Das Maximum zweier Spannen je Stufe (eingebaut + frische D-Logs)."""
+    n = max(len(a.max_mib), len(b.max_mib))
+    va = tuple(a.max_mib) + (0.0,) * (n - len(a.max_mib))
+    vb = tuple(b.max_mib) + (0.0,) * (n - len(b.max_mib))
+    return CoTenantSpan(
+        max_mib=tuple(max(x, y) for x, y in zip(va, vb)),
+        source="%s | %s" % (a.source, b.source),
+    )
+
+
+#: Der gemessene Mitbewohner-Hochstand der NF-Form (D: Form A, host,worker,
+#: worker, FR_D 0.06,0.51,0.48; P-Stufe s teilt die Karte mit D-TPs), aus den
+#: D-Logs unter /spinning/evidence-665-f1 (Fixture-Zeilen unter
+#: test/registered/unit/weg2/fixtures/p_card_h41/*.D.lines; der Test
+#: ``test_the_shipped_co_tenant_span_is_the_logs_own_measurement`` bindet sie):
+#:
+#:   D-Rang (Karte)   erster Flip   Hochstand   wo
+#:   TP0 (nvml1)      1698 / 1782   2004        fnFL2x165 Flip 5
+#:   TP1 (nvml0)       768           838        fnFL2x160 Flip 3 (nach 259k)
+#:   TP2 (nvml2)       766           836        fnFL2x160 Flip 3 (nach 259k)
+#:
+#: TP0 springt im zweiten Flip um ~+250 (x165 1698 -> 1956) und kriecht dann
+#: um +10..25 MiB je Flip (1982, 1994, 2004); x163 fiel im fuenften Flip auf
+#: 1816 zurueck. Der Hochstand ist gemessen, nicht begrenzt: ein laengerer
+#: Lauf kann ihn ueberschreiten (dann mit --p-card-reference-logs und den
+#: D-Logs daneben auffrischen).
+P_CARD_CO_TENANT_FNFL2 = CoTenantSpan(
+    max_mib=(2004.0, 838.0, 836.0),
+    source=(
+        "stage0 2004 (fnFL2x165 Flip 5); stage1 838 (fnFL2x160 Flip 3); "
+        "stage2 836 (fnFL2x160 Flip 3)"
+    ),
+)
 
 
 def headroom_by_chunk_index(text: str) -> Dict[int, Dict[int, float]]:
@@ -627,6 +856,7 @@ def p_card_reference_from_logs(
     support: TransientSupport,
     model: str,
     over_boots: Sequence[Tuple[str, str]] = (),
+    d_logs: Optional[Dict[str, str]] = None,
 ) -> PCardReference:
     """Die P-Karten-Referenz aus P-Logs MESSEN (``boots`` = (Name, Text)).
 
@@ -635,19 +865,31 @@ def p_card_reference_from_logs(
     Peak-Werten der gemessenen Chunk-Indizes (je Token); der LMEM-Posten als
     cap-Abfall zwischen Chunk 0 und dem letzten Punkt; der laengste Prompt.
     ``over_boots`` (mehr Zeilen, lebend oder tot) messen den Zeilenpreis.
+
+    H59: ``d_logs`` (Name des P-Boots -> Text seines D-Logs) liefert den
+    Mitbewohner am Chunk-0-Punkt jedes Boots (der Schlafstand des D-Rangs
+    derselben Karte, letzter weights-Release davor). Mit ihm fuer ALLE Boots
+    wird das Minimum ueber ``K0 + Mitbewohner`` gezogen -- zwei Boots mit
+    verschieden vollem Mitbewohner sind sonst nicht vergleichbar -- und die
+    Referenz nennt den Mitbewohner ihres Punkts. Die Sitze (``max_running_
+    requests``) sind Form wie der Chunk: eine Referenz mischt sie nicht.
     """
     n = len(stage_layers)
-    best: Dict[int, Tuple[float, PoolSample, int, float]] = {}
+    best: Dict[int, Tuple[float, PoolSample, int, float, Optional[float], str]] = {}
     growth: Dict[int, float] = {}
     gidx: Dict[int, int] = {}
     lmem: Dict[int, float] = {}
     chunks = set()
     draft = set()
+    seats = set()
     longest = 0
-    for _name, text in boots:
+    dl = dict(d_logs or {})
+    with_co = bool(dl) and all(name in dl for name, _t in boots)
+    for name, text in boots:
         obs = observe_p_log(text)
         samples = pool_samples(text)
         draft.add(bool(obs["draft_on_p"][0]))
+        seats.update(obs["seats"].values() or [1])
         longest = max(longest, longest_prompt_tokens(text))
         for s in range(n):
             ss = samples.get(s, [])
@@ -661,8 +903,16 @@ def p_card_reference_from_logs(
             kv = float(obs["tokens"][s]) * float(obs["cell"][s]) / MIB
             t, _src = transient_mib(support, s, c)
             h0 = p0.headroom_mib + rows * int(stage_layers[s]) * float(row_mib) + kv + t
-            if s not in best or h0 < best[s][0]:
-                best[s] = (h0, p0, rows, kv)
+            co = co_tenant_at(dl[name], s, p0.t) if with_co else None
+            if with_co and co is None:
+                raise ValueError(
+                    "P-Karten-Referenz: %s Stufe %d -- kein weights-Release des D-Rangs %d "
+                    "vor dem Chunk-0-Punkt (%s) im D-Log; der Mitbewohner ist ungemessen"
+                    % (name, s, s, p0.t or "ohne Zeitstempel")
+                )
+            key = h0 + (co or 0.0)
+            if s not in best or key < best[s][0] + (best[s][4] or 0.0):
+                best[s] = (h0, p0, rows, kv, co, name)
             last = max(ss, key=lambda p: (p.chunk_index, p.peak_mib))
             if last.chunk_index > 0:
                 g = (last.peak_mib - p0.peak_mib) / (last.chunk_index * c)
@@ -676,10 +926,18 @@ def p_card_reference_from_logs(
             "spaeteren Punkt (Wachstum), Pufferzeile, KV-Zelle oder Chunk"
             % ([b[0] for b in boots], missing)
         )
-    if len(chunks) != 1 or len(draft) != 1:
+    if len(chunks) != 1 or len(draft) != 1 or len(seats) != 1:
         raise ValueError(
-            "P-Karten-Referenz %s mischt Chunks %s bzw. Draft-auf-P %s; eine Referenz "
-            "ist EINE Form" % ([b[0] for b in boots], sorted(chunks), sorted(draft))
+            "P-Karten-Referenz %s mischt Chunks %s, Draft-auf-P %s bzw. Sitze %s; eine "
+            "Referenz ist EINE Form"
+            % ([b[0] for b in boots], sorted(chunks), sorted(draft), sorted(seats))
+        )
+    co_src = ""
+    if with_co:
+        co_src = "; ".join(
+            "stage%d %.0f (%s, D-TP%d am Chunk-0-Punkt %s)"
+            % (s, best[s][4], best[s][5], s, best[s][1].t)
+            for s in range(n)
         )
     ref = PCardReference(
         source=" + ".join(b[0] for b in boots),
@@ -698,6 +956,9 @@ def p_card_reference_from_logs(
         growth_measured_chunks=tuple(gidx[s] for s in range(n)),
         longest_prompt_tokens=int(longest),
         lmem_mib=tuple(round(lmem[s], 1) for s in range(n)),
+        seats=int(next(iter(seats))),
+        co_tenant_mib=tuple(float(best[s][4]) for s in range(n)) if with_co else (),
+        co_tenant_source=co_src,
     )
     if not over_boots:
         return ref
@@ -741,19 +1002,18 @@ P_CARD_REFERENCE_FNFL2_X150 = PCardReference(
 )
 
 
-#: Die gemessene P-Karten-Referenz des HEUTIGEN Baums (76ce5580d4 = H39 Repack
-#: ausserhalb der Tag-Pools, H44/H46 Lanes, H47 Run-Write-Fix + LMEM-Bedarf),
-#: hergeleitet aus fnFL2x160 (FR_P 0.332,0.605,0.39 -> H25 0.733887, Puffer
-#: 202/342/408 Zeilen, Chunk 16384, KV 262144 x 7616/3264/2176 B), der den
-#: 97k- UND den 259441-Token-Prompt (16 Chunks) ohne OOM lief. Gegen die
-#: historische Referenz: privat_frei 2394 -> 225 MiB auf PP0 (173 PP1, 142
-#: PP2), daher liegt der Kopfraum bei MEHR Zeilen hoeher -- eine Referenz ist
-#: ein Baumstand und wird mit ihm aufgefrischt. Chunk 0 PP0: cap 28967 -
-#: peak 24490 - privat_frei 225 = 4252 MiB; Wachstum 990 / 974 / 329 MiB,
-#: saettigt nach Chunk 3 / 3 / 1 (gemessen bis Chunk 15); kein LMEM-Abfall
-#: (0 / 2 / 2 MiB). Zeilenpreis: das Bild (kein Boot mit mehr Zeilen auf
-#: diesem Baum). Auffrischen: ``--p-card-reference-logs``.
-P_CARD_REFERENCE_FNFL2 = PCardReference(
+#: HISTORISCH seit H59 (1-Sitz-Form, Baum 76ce5580d4 = H39 Repack ausserhalb
+#: der Tag-Pools, H44/H46 Lanes, H47 Run-Write-Fix + LMEM-Bedarf): die
+#: P-Karten-Referenz aus fnFL2x160 (FR_P 0.332,0.605,0.39 -> H25 0.733887,
+#: Puffer 202/342/408 Zeilen, Chunk 16384, KV 262144 x 7616/3264/2176 B,
+#: ``--max-running-requests 1``), der den 97k- UND den 259441-Token-Prompt
+#: (16 Chunks) ohne OOM lief. Chunk 0 PP0: cap 28967 - peak 24490 -
+#: privat_frei 225 = 4252 MiB; Wachstum 990 / 974 / 329 MiB, saettigt nach
+#: Chunk 3 / 3 / 1 (gemessen bis Chunk 15); kein LMEM-Abfall (0 / 2 / 2 MiB).
+#: Mitbewohner am Chunk-0-Punkt (erster Flip): D-TP0 1698, TP1 768, TP2 766.
+#: Sie trug die Kante 0.410/0.712 (H41d), an der fnFL2x164 starb: ohne
+#: Mitbewohner-Term war ihr cap der eines Flips mit 1698 MiB D-TP0.
+P_CARD_REFERENCE_FNFL2_X160 = PCardReference(
     source="fnFL2x160",
     model="Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",
     stage_layers=(29, 11, 8),
@@ -770,6 +1030,61 @@ P_CARD_REFERENCE_FNFL2 = PCardReference(
     growth_measured_chunks=(3, 3, 1),
     longest_prompt_tokens=259441,
     lmem_mib=(0.0, 2.0, 2.0),
+    seats=1,
+    co_tenant_mib=(1698.0, 768.0, 766.0),
+    co_tenant_source=(
+        "stage0 1698 (fnFL2x160, D-TP0 am Chunk-0-Punkt 2026-09-24 15:07:21); stage1 768 "
+        "(fnFL2x160, D-TP1 am Chunk-0-Punkt 2026-09-24 15:07:24); stage2 766 (fnFL2x160, "
+        "D-TP2 am Chunk-0-Punkt 2026-09-24 15:07:27)"
+    ),
+)
+
+
+#: Die gemessene P-Karten-Referenz der 4-SITZE-FORM des heutigen Baums (H59):
+#: fnFL2x163 (ce1dac1984, FR_P 0.36,0.64,0.39 -> 217/360/408 Zeilen, 97k in
+#: 6 Chunks, Wachstum bis Chunk 3 und dann keine Hochwassermarke mehr),
+#: fnFL2x164 (2e2aac1e4e = x163 + H55-Instrumente, FR_P 0.410,0.712 -> 242/
+#: 397/408, PP0 starb im vierten Chunk an der Karte) und fnFL2x165 (x163-Form
+#: auf 2e2aac1e4e: jede GRAPH-POOL-Zeile gleich x163, die H55-Fenster zeigen
+#: die Saettigung je Chunk: PP0 persist +411/+349/+321/+320/+1). Alle
+#: ``--max-running-requests 4``, Chunk 16384, KV 262144 x 7616/3264/2176 B,
+#: kein Draft auf P.
+#:
+#: Je Stufe das Minimum von ``K0 + Mitbewohner`` (x163 auf allen drei:
+#: PP0 23997.0 + 1698 gegen x164 23925.1 + 1782; der x164-Punkt lag 84 MiB
+#: tiefer, weil sein D-TP0 im ersten Flip 1782 statt 1698 hielt -- dieselbe
+#: Karte, derselbe Zeilenpreis, ein vollerer Mitbewohner). Wachstum je Token
+#: das Maximum (x164 PP0 (27977 - 27307) / 2 Chunks = 335 MiB je 16k), die
+#: Saettigung von x163 (Chunk 3 / 3 / 1). Transiente in der Planer-Definition
+#: ([vram-peak] peak - allocated NACH dem Chunk) auf beiden 3.58 / 3.19 /
+#: 3.19 GiB wie x160 -- die Stuetzpunkte bleiben. Der Modell-Pfad gegen
+#: x164s eigene Zeilen (Mitbewohner 1782): Chunk 0..2 1350 / 1015 / 680 MiB
+#: gerechnet gegen 1362 / 1013 / 692 gemessen, Chunk 3 345 < 400 -- dort
+#: starb PP0 (320 MiB angefordert, 287 frei, 627 im Split-Verschnitt).
+P_CARD_REFERENCE_FNFL2 = PCardReference(
+    source="fnFL2x163 + fnFL2x164 + fnFL2x165",
+    model="Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",
+    stage_layers=(29, 11, 8),
+    chunk=16384,
+    headroom0_mib=(23997.0, 16071.5, 15756.8),
+    headroom_mib=(3186.0, 2397.0, 4057.0),
+    buffer_rows=(217, 360, 408),
+    kv_mib=(1904.0, 816.0, 544.0),
+    cap_mib=(28969.0, 18626.0, 18634.0),
+    peak_mib=(25565.0, 16082.0, 14438.0),
+    private_free_mib=(218.0, 147.0, 139.0),
+    draft_on_p=False,
+    growth_mib_per_token=(0.0204468, 0.019928, 0.0200806),
+    growth_measured_chunks=(3, 3, 1),
+    longest_prompt_tokens=97841,
+    lmem_mib=(0.0, 2.0, 2.0),
+    seats=4,
+    co_tenant_mib=(1698.0, 768.0, 766.0),
+    co_tenant_source=(
+        "stage0 1698 (fnFL2x163, D-TP0 am Chunk-0-Punkt 2026-09-24 18:22:41); stage1 768 "
+        "(fnFL2x163, D-TP1 am Chunk-0-Punkt 2026-09-24 18:22:44); stage2 766 (fnFL2x163, "
+        "D-TP2 am Chunk-0-Punkt 2026-09-24 18:22:47)"
+    ),
 )
 
 
@@ -799,6 +1114,13 @@ class PCardFit(msgspec.Struct, frozen=True, kw_only=True):
     near_oom_mib: float
     ceiling_fraction: Optional[float]
     ceiling_max_rows: int
+    #: H59: der Mitbewohner-Term (gemessener Hochstand minus Stand am
+    #: Referenzpunkt, >= 0) und seine beiden Enden; ``co_tenant_ref_mib``
+    #: None = die Referenz kennt ihren Mitbewohner nicht (Term 0, benannt).
+    co_tenant_mib: float = 0.0
+    co_tenant_ref_mib: Optional[float] = None
+    co_tenant_max_mib: Optional[float] = None
+    seats: int = 0
 
     @property
     def refused(self) -> bool:
@@ -827,16 +1149,25 @@ def solve_p_card(
     prompt_tokens: int = 0,
     lmem_fixed: bool = True,
     use_growth: bool = True,
+    seats: int = 0,
+    co_tenant: Optional[CoTenantSpan] = None,
 ) -> Tuple[PCardFit, ...]:
     """Je P-Stufe der Kopfraum am LETZTEN Chunk eines Prompts von
     ``prompt_tokens`` Token (0 = der laengste Prompt der Referenz)::
 
         K0 - Zeilen x Bild - Ueber x (Preis - Bild) - KV - T(chunk) - Draft
-           - g x (Token vor dem letzten Chunk) - LMEM   >= near-OOM
+           - g x (Token vor dem letzten Chunk) - LMEM
+           - (Mitbewohner-Hochstand - Mitbewohner am Referenzpunkt)  >= near-OOM
 
     ``lmem_fixed``: der Baum traegt den H47-Fix (Run-Write in 1-KiB-Elementen)
     -> LMEM 0; sonst der gemessene Hochstand je Stufe (PP0 aus x149).
     ``use_growth=False`` ist nur fuer den Mutanten-Test.
+
+    H59: ``seats`` = die Sitze DIESES Boots (P ``--max-running-requests``; 0 =
+    nicht geprueft). Mehr Sitze als die Referenz: :class:`PCardFormUnmeasured`.
+    ``co_tenant`` = der gemessene Mitbewohner-Hochstand je Stufe; mit einer
+    Referenz, die ihren Mitbewohner kennt, kostet jede Stufe die Differenz
+    (ein spaeterer Flip mit vollerem D-Cache nimmt der Karte genau so viel).
     """
     from sglang.srt.planner import expert_residency as _er
 
@@ -847,6 +1178,14 @@ def solve_p_card(
             "einer Stufe haengt an ihrer Layerzahl. Boots DIESES Schnitts per "
             "--p-card-reference-logs geben"
             % (list(stage_layers), reference.source, list(reference.stage_layers))
+        )
+    if int(seats) > int(reference.seats):
+        raise PCardFormUnmeasured(
+            "P-Karte: %d Sitze (P --max-running-requests), die Referenz (%s) ist bei "
+            "%d Sitzen gemessen; mehr Sitze sind eine ungemessene Form (mehr "
+            "gleichzeitige Chunks im Flug, eigene Zustaende je Sitz). Boots DIESER "
+            "Form per --p-card-reference-logs geben"
+            % (int(seats), reference.source, int(reference.seats))
         )
     if len(fractions) != n or len(lru_rows) != n or len(kv_mib) != n:
         raise ValueError(
@@ -891,7 +1230,17 @@ def solve_p_card(
             if reference.row_card_mib
             else layer_mib
         )
-        rest = float(reference.headroom0_mib[s]) - float(kv_mib[s]) - t - draft - growth - lmem
+        co_ref: Optional[float] = None
+        co_max: Optional[float] = None
+        co = 0.0
+        if reference.co_tenant_mib and s < len(reference.co_tenant_mib):
+            co_ref = float(reference.co_tenant_mib[s])
+            if co_tenant is not None and s < len(co_tenant.max_mib):
+                co_max = float(co_tenant.max_mib[s])
+                co = max(0.0, co_max - co_ref)
+        rest = (
+            float(reference.headroom0_mib[s]) - float(kv_mib[s]) - t - draft - growth - lmem - co
+        )
         over = max(0, int(rows) - ref_rows)
         head = rest - rows * layer_mib - over * (row_card - layer_mib)
         at_ref = rest - ref_rows * layer_mib - float(near_oom_mib)
@@ -927,21 +1276,38 @@ def solve_p_card(
                     max_rows=max_rows,
                 ),
                 ceiling_max_rows=max_rows,
+                co_tenant_mib=co,
+                co_tenant_ref_mib=co_ref,
+                co_tenant_max_mib=co_max,
+                seats=int(seats),
             )
         )
     return tuple(out)
+
+
+def _co_tenant_text(fit: PCardFit) -> str:
+    if fit.co_tenant_ref_mib is None:
+        return "Mitbewohner ungemessen (Referenz ohne D-Log, Term 0)"
+    if fit.co_tenant_max_mib is None:
+        return "Mitbewohner am Referenzpunkt %.0f, Hochstand ungemessen (Term 0)" % (
+            fit.co_tenant_ref_mib
+        )
+    return "Mitbewohner D-TP%d schlafend %.0f am Referenzpunkt, gemessen bis %.0f -> %.0f MiB" % (
+        fit.stage, fit.co_tenant_ref_mib, fit.co_tenant_max_mib, fit.co_tenant_mib
+    )
 
 
 def describe_p_card(fit: PCardFit, reference: PCardReference) -> str:
     s = fit.stage
     ceiling = "KEINE" if fit.ceiling_fraction is None else "%.3f" % fit.ceiling_fraction
     return (
-        "%s stage%d (%s) prompt=%d: Referenz %s Kopfraum Chunk 0 %.0f = cap %.0f - peak "
+        "%s stage%d (%s) prompt=%d: Referenz %s (%d Sitze%s) Kopfraum Chunk 0 %.0f = cap "
+        "%.0f - peak "
         "%.0f - privat_frei %.0f MiB bei %d Zeilen, KV %.0f, Chunk %d; hier f %.4f -> %d "
         "Zeilen (%+.0f MiB; je Zeile ueber der Referenz %.1f, Bild %.1f), KV %.0f (%+.0f), "
         "Transiente %.0f (%+.0f, %s)%s, Chunk-Wachstum am Chunk %d %.0f MiB (%.1f je "
-        "16k, saettigt nach Chunk %d, gemessen ueber %d Token%s), LMEM %s -> Kopfraum %.0f "
-        "MiB (near-OOM %.0f) -> "
+        "16k, saettigt nach Chunk %d, gemessen ueber %d Token%s), LMEM %s, %s -> Kopfraum "
+        "%.0f MiB (near-OOM %.0f) -> "
         "%s | KARTEN-DECKE f %s (<= %d Zeilen)"
         % (
             CARD_MARKER,
@@ -949,6 +1315,8 @@ def describe_p_card(fit: PCardFit, reference: PCardReference) -> str:
             fit.card,
             fit.prompt_tokens,
             reference.source,
+            reference.seats,
+            (", hier %d" % fit.seats) if fit.seats else "",
             reference.headroom_mib[s],
             reference.cap_mib[s],
             reference.peak_mib[s],
@@ -974,6 +1342,7 @@ def describe_p_card(fit: PCardFit, reference: PCardReference) -> str:
             reference.longest_prompt_tokens,
             ", Prompt laenger als gemessen: HOCHRECHNUNG" if fit.growth_extrapolated else "",
             fit.lmem_source,
+            _co_tenant_text(fit),
             fit.headroom_mib,
             fit.near_oom_mib,
             fit.verdict,
@@ -993,9 +1362,11 @@ def p_card_refusal_text(
         "%s (P, chunk %d, prompt %d): die Experten-Residenz passt ins Budget, aber nicht "
         "auf die KARTE am letzten Chunk -- %s. Gemessen: Kopfraum am Chunk 0 von %s, "
         "verschoben um Puffer (je Zeile ueber der Referenz zum gemessenen Preis), KV, "
-        "Chunk-Transiente, Draft, Chunk-Wachstum der Spitze und den Run-Write-LMEM; "
+        "Chunk-Transiente, Draft, Chunk-Wachstum der Spitze, den Run-Write-LMEM und den "
+        "Mitbewohner-Hochstand (schlafender D-Rang derselben Karte); "
         "fnFL2x121 (FR_P[0] 0.45) und x122 (0.40) starben im ersten 16k-Chunk, "
-        "fnFL2x149 (0.351) im zweiten am Run-Write-LMEM (H47). "
+        "fnFL2x149 (0.351) im zweiten am Run-Write-LMEM (H47), fnFL2x164 (0.410, "
+        "4 Sitze) im vierten am Chunk-Wachstum (H59). "
         "Groesste tragbare Fraction je Stufe: %s."
         % (
             CARD_REFUSAL_CODE,

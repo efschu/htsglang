@@ -11557,12 +11557,20 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
         raise Weg2LaunchRefused(str(exc)) from None
     ref_logs = [x.strip() for x in str(getattr(ns, "p_card_reference_logs", "") or "").split(",")
                 if x.strip()]
+    # H59: der Mitbewohner (schlafender D-Rang derselben Karte) -- eingebauter
+    # gemessener Hochstand, aufgefrischt um die D-Logs neben den Referenz-Logs.
+    co_tenant = _p_card.P_CARD_CO_TENANT_FNFL2
     try:
         if ref_logs:
             boots = []
+            d_logs = {}
             for path in ref_logs:
                 with open(path, errors="replace") as fh:
                     boots.append((os.path.basename(path), fh.read()))
+                d_path = path[: -len(".P.log")] + ".D.log" if path.endswith(".P.log") else ""
+                if d_path and os.path.isfile(d_path):
+                    with open(d_path, errors="replace") as fh:
+                        d_logs[os.path.basename(path)] = fh.read()
             over = []
             for path in [x.strip() for x in str(
                     getattr(ns, "p_card_over_logs", "") or "").split(",") if x.strip()]:
@@ -11570,13 +11578,27 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
                     over.append((os.path.basename(path), fh.read()))
             reference = _p_card.p_card_reference_from_logs(
                 boots, stage_layers=stage_layers, row_mib=row_mib,
-                support=support, model=name, over_boots=over)
+                support=support, model=name, over_boots=over, d_logs=d_logs)
+            if d_logs:
+                co_tenant = _p_card.merge_co_tenant(
+                    co_tenant,
+                    _p_card.co_tenant_span_from_logs(
+                        sorted(d_logs.items()), n_stages=len(stage_layers)),
+                )
         else:
             reference = _p_card.P_CARD_REFERENCE_FNFL2
     except (OSError, ValueError) as exc:
         log(f"{_p_card.CARD_MARKER} ENTFAELLT: Referenz unlesbar: "
             f"{type(exc).__name__}: {exc}")
         return
+    # H59 FORM-SCHLUESSEL: die Sitze DIESES Boots = group P's wirksames
+    # --max-running-requests (das argparse behaelt: ein --extra-p-Wert schlaegt
+    # --p-bs, dieselbe Regel wie p_micro_batch_flags).
+    _mrr = _argv_scalar(getattr(ns, "extra_p", ""), "--max-running-requests")
+    try:
+        seats = int(_mrr) if _mrr is not None else int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
+    except (TypeError, ValueError):
+        seats = int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
     if kv_mib is None:
         log(f"{_p_card.CARD_MARKER} ENTFAELLT: kein KV-Preis je Stufe (#156 entfiel "
             f"oder --pp-cut-reserve-mib ersetzt ihn); ohne KV ist der Kopfraum "
@@ -11613,6 +11635,7 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
             cards=[_dp.stage_card_label(cards, s) for s in range(len(stage_layers))],
             near_oom_mib=float(corridor_guard.NEAR_OOM_MIB),
             prompt_tokens=tokens, lmem_fixed=lmem_fixed,
+            seats=seats, co_tenant=co_tenant,
         )
 
     try:
@@ -12825,11 +12848,14 @@ def build_parser() -> argparse.ArgumentParser:
              "am bindenden Punkt, normiert auf Puffer, KV-Zelle x Token und die "
              "Chunk-Transiente des Logs; je Stufe das Minimum ueber die Boots. "
              "Unter corridor_guard.NEAR_OOM_MIB verweigert W132. Leer = die "
-             "eingebaute Referenz p_card_chunk.P_CARD_REFERENCE_FNFL2 (fnFL2x160, "
-             "Baum 76ce5580d4, Schnitt 29,11,8, Chunk 16384, 97k- und 259k-Prompt); "
-             "ein anderer Schnitt laesst die Bilanz mit Namen entfallen. Die "
-             "Referenz ist ein BAUMSTAND (privat_frei, LMEM) und wird mit ihm "
-             "aufgefrischt.")
+             "eingebaute Referenz p_card_chunk.P_CARD_REFERENCE_FNFL2 (H59: "
+             "fnFL2x163 + fnFL2x164 + fnFL2x165, 4 Sitze, Schnitt 29,11,8, Chunk 16384, "
+             "97k-Prompt); ein anderer Schnitt oder MEHR Sitze als die Referenz "
+             "lassen die Bilanz mit Namen entfallen. Liegt neben <x>.P.log ein "
+             "<x>.D.log, liest die Karte daraus den Mitbewohner (schlafender "
+             "D-Rang derselben Karte) am Referenzpunkt und frischt dessen "
+             "gemessenen Hochstand auf. Die Referenz ist ein BAUMSTAND "
+             "(privat_frei, LMEM) und wird mit ihm aufgefrischt.")
     ap.add_argument(
         "--p-card-over-logs", default="",
         help="H41c: Komma-Liste von P-Boot-Logs DERSELBEN Form mit mehr "

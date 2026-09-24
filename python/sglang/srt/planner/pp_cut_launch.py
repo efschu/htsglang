@@ -1032,6 +1032,10 @@ def solve_launch_cut(
     # candidates here, so the decoupling the attention flag buys is priced;
     # what is NOT enumerated is a free allocation, which is not realizable.
     attn_cache: Dict[Tuple[int, ...], Tuple[Tuple[int, ...], Optional[float]]] = {}
+    # H59: WHY a cut is unpriceable, kept for the pinned-cut W40 below -- the
+    # pool model's own sentence names the rank and the overrun in MiB; the
+    # refusal used to drop it and print only the generic class.
+    pool_why: Dict[Tuple[int, ...], str] = {}
 
     def resolve(counts: Sequence[int]) -> Tuple[Tuple[int, ...], Optional[float]]:
         key = tuple(int(c) for c in counts)
@@ -1039,8 +1043,9 @@ def solve_launch_cut(
             attn = attention_counts(layer_families, key)
             try:
                 pool = pp_phase_pool(key, attn, pool_model)
-            except ValueError:
+            except ValueError as exc:
                 pool = None
+                pool_why[key] = str(exc)
             attn_cache[key] = (attn, pool)
         return attn_cache[key]
 
@@ -1345,11 +1350,13 @@ def solve_launch_cut(
                 )
             )
         if derived_pool is None:
+            why = pool_why.get(layers, "")
             raise PPCutRefused(
                 "W40 Weg2PPCutRefused: the pinned layer cut %s cannot be "
                 "priced by the pool model (a stage does not fit its weights, "
                 "mamba state and arming floor, or holds no attention layer)."
-                % (",".join(str(n) for n in layers),)
+                "%s"
+                % (",".join(str(n) for n in layers), (" Pool model: " + why) if why else "")
             )
         priced = price(
             contiguous_layer_sets(layers),
