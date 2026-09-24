@@ -4491,7 +4491,7 @@ class ServerArgs:
         "intermediate state' of the mamba budget. GDN hybrid models, linear "
         "draft chains (--speculative-eagle-topk None or 1: NEXTN/MTP/DFLASH) "
         "only. The ring length is --linear-replayssm-cache-len (a power of two, "
-        ">= the widest verify window). Mutually exclusive with "
+        ">= 16 and >= the widest verify window). Mutually exclusive with "
         "--enable-linear-replayssm.",
     ] = False
 
@@ -16218,10 +16218,11 @@ class ServerArgs:
                     f"--disaggregation-mode={self.disaggregation_mode!r}."
                 )
             ring = self.linear_replayssm_cache_len
-            if ring < 1 or ring & (ring - 1):
+            if ring < 16 or ring & (ring - 1):
                 raise ValueError(
                     f"{flag}: --linear-replayssm-cache-len must be a power of "
-                    f"two (the ring indexes modulo L), got {ring}."
+                    "two (the ring indexes modulo L) and >= 16 (the commit "
+                    f"kernel's tl.dot minimum), got {ring}."
                 )
             if self.mamba_ssm_dtype not in (None, "float32"):
                 logger.warning(
