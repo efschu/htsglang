@@ -16021,6 +16021,13 @@ class ServerArgs:
                     f"{flag} is not wired for PD disaggregation, got "
                     f"--disaggregation-mode={self.disaggregation_mode!r}."
                 )
+            if getattr(self, "enable_unified_memory", False):
+                # S5: the unified pool builds its own intermediate state and
+                # knows no ring, while the budget would price the ring.
+                raise ValueError(
+                    f"{flag} is not wired for --enable-unified-memory (the "
+                    "unified pool allocates the per-draft intermediate state)."
+                )
             ring = self.linear_replayssm_cache_len
             if ring < 16 or ring & (ring - 1):
                 raise ValueError(
