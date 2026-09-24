@@ -1933,6 +1933,17 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    # DFLASH-PRODUCE-ON-P (user decision 2026-09-24: "P ohne draft rechnen"):
+    # 0 = group P still BUILDS its DFlash draft-KV producer on the last PP
+    # stage (the draft bytes stay cold-resident: same VRAM, same planner cut,
+    # same exchange census and flip) but COMPUTES nothing with it -- no aux
+    # hidden capture on any PP stage (no set_dflash_layers_to_capture marks,
+    # no pp_aux_capture carry), no DFlashDraftKvProducer.produce(), no
+    # publish_draft_rows_direct. Group D is unchanged and finds no draft pages
+    # (its existing cold path). The weg2 launcher always sets it on group P
+    # under --spec-form DFLASH (--dflash-produce-on-p, default off -> 0).
+    # Unset = 1 = the producer form as before (non-launcher boots).
+    SGLANG_WEG2_DFLASH_PRODUCE = EnvBool(True)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)

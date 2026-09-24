@@ -47,6 +47,38 @@ _HASH_POS_ATTR = "_weg2_dflash_hash_pos"
 _HASH_LAST_ATTR = "_weg2_dflash_hash_last"
 
 
+#: The rank-side switch of ``--dflash-produce-on-p`` (weg2 launcher, set on
+#: group P through ``spec_form_env("P")``). See environ.py.
+DFLASH_PRODUCE_ENV = "SGLANG_WEG2_DFLASH_PRODUCE"
+
+
+def dflash_produce_on_p() -> bool:
+    """Does group P's DFlash draft-KV producer COMPUTE (user decision
+    2026-09-24: default off in the launcher)?
+
+    False: the producer is still built -- its weights stay cold-resident on
+    the last stage, so VRAM, the planner cut, the exchange census and the
+    flip are unchanged -- but nothing runs on it: the scheduler's
+    ``_draft_kv_producer_wants`` answers False (no FULL capture, no
+    ``produce()``, no ``publish_draft_rows_direct``) and the target model
+    runner arms no aux-hidden capture on any PP stage. Unset -> True, the
+    producer form as before."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_DFLASH_PRODUCE.get())
+
+
+def dflash_produce_off_line(*, where: str) -> str:
+    """The one rank-side line naming the form (never silent)."""
+    return (
+        f"WEG2 DFLASH-PRODUCE-ON-P off ({DFLASH_PRODUCE_ENV}=0) at {where}: the "
+        "DFlash draft stays cold-resident on group P's last stage (weights, "
+        "chunk ring, graphs built as before) and computes nothing -- no aux "
+        "capture, no produce(), no publish_draft_rows_direct; group D finds "
+        "no draft pages and takes its cold path (user decision 2026-09-24)"
+    )
+
+
 class DFlashDraftKvProduceError(RuntimeError):
     """A chunk's draft rows could not be produced or published."""
 

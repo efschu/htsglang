@@ -1797,6 +1797,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         )
 
+    def _dflash_aux_capture_armed(self) -> bool:
+        """DFLASH-PRODUCE-ON-P: False only on a draft-KV-ONLY target (group P)
+        whose DFlash producer is switched off (SGLANG_WEG2_DFLASH_PRODUCE=0).
+        A proposing DFlash target (group D) always captures."""
+        if not getattr(self.server_args, "speculative_draft_kv_only", False):
+            return True
+        if not self.spec_algorithm.is_dflash_family():
+            return True
+        from sglang.srt.speculative.dflash_draft_kv_producer import (
+            dflash_produce_on_p,
+        )
+
+        return dflash_produce_on_p()
+
     def init_aux_hidden_state_capture(self):
         """Configure auxiliary hidden state capture for speculative decoding.
 
@@ -1807,7 +1821,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.model.set_eagle3_layers_to_capture(
                 self.eagle_aux_hidden_state_layer_ids
             )
-        if self.dflash_family_use_aux_hidden_state:
+        if self.dflash_family_use_aux_hidden_state and not self._dflash_aux_capture_armed():
+            # DFLASH-PRODUCE-ON-P off (user decision 2026-09-24): group P's
+            # target marks NO capture layer on ANY PP stage, so nothing is
+            # captured and no aux_layer_* carry rides the PP proxy. The draft
+            # pricing fields above (dflash_family_draft_num_layers, the KV cell
+            # scaling in pool_configurator) are untouched -> same planner cut.
+            from sglang.srt.speculative.dflash_draft_kv_producer import (
+                dflash_produce_off_line,
+            )
+
+            logger.info(
+                dflash_produce_off_line(
+                    where=f"model_runner tp_rank={self.tp_rank} pp_rank={self.pp_rank} "
+                    "(aux capture not armed)"
+                )
+            )
+        elif self.dflash_family_use_aux_hidden_state:
             if self.spec_algorithm.is_dspark() and hasattr(
                 self.model, "set_dspark_layers_to_capture"
             ):
