@@ -704,6 +704,46 @@ void arena_free_slots(uint8_t *base, int64_t n, const int64_t *slots) {
     }
 }
 
+/* fnFL2 H19: DROP a displaced page -- COMPLETE and referenced by nobody --
+ * without the disk write the evictor would do. A displaced mamba anchor is
+ * one the P->D hand-over no longer needs (a deeper anchor of the same request
+ * replaces it); writing its 58.8 MB blob to the cold tier per chunk is what
+ * the clock evictor would cost. Every writer rank releases its reference
+ * first; the release that brings the count to 0 drops the slot. A slot that
+ * is CLAIMED, EVICTING, FREE or still referenced is left alone (out[i]=0).
+ * Same CAS/unlink sequence as arena_evict_candidates, then arena_free_slots
+ * (prev == EVICTING: no second unlink, no second n_complete decrement). */
+int64_t arena_drop_unreferenced(uint8_t *base, int64_t n, const int64_t *slots, int8_t *out) {
+    ArenaHeader *h = hdr(base);
+    int64_t dropped = 0;
+    for (int64_t i = 0; i < n; i++) {
+        out[i] = 0;
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if (atomic_load(&sh->refcount) != 0) continue;
+        uint32_t expect = S_COMPLETE;
+        if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) continue;
+        if (atomic_load(&sh->refcount) != 0) { atomic_store(&sh->state, S_COMPLETE); continue; }
+        _Atomic uint64_t *keys = index_keys(base);
+        _Atomic uint32_t *islots = index_slots(base);
+        uint64_t mask = h->index_cap - 1;
+        uint64_t j = mix64(sh->key_lo) & mask;
+        for (uint64_t m = 0; m < h->index_cap; m++, j = (j + 1) & mask) {
+            uint64_t k = atomic_load(&keys[j]);
+            if (k == 0) break;
+            if (k == sh->key_lo && atomic_load(&islots[j]) == (uint32_t)slots[i]) {
+                atomic_store(&keys[j], TOMB);
+                break;
+            }
+        }
+        atomic_fetch_sub(&h->n_complete, 1);
+        arena_free_slots(base, 1, &slots[i]);
+        out[i] = 1;
+        dropped++;
+    }
+    return dropped;
+}
+
 /* Reap CLAIMED slots older than `max_generation_age` writes of the clock:
  * a rank that died mid-write leaves a CLAIMED slot behind. Cheap form: a
  * CLAIMED slot whose index entry is tombstoned or missing is freed. Returns

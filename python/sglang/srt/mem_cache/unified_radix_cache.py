@@ -156,6 +156,7 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
 )
 from sglang.srt.session.streaming_session import StreamingSession
+from sglang.srt.weg2 import mamba_arena_displace as _mad
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -285,6 +286,15 @@ class UnifiedTreeNode:
         # Never set from a prediction, never cleared to hide a failure: a
         # False here costs one re-read, a wrong True loses KV.
         self.l3_present: bool = False
+        # fnFL2 H19 (weg2/mamba_arena_displace.py): the request whose prefill
+        # created this node's mamba anchor (set at its chunk/retain publish,
+        # never overwritten), and whether this rank already released one
+        # anchor of that request because the arena refused this node.
+        self.weg2_anchor_rid: Optional[str] = None
+        self.weg2_arena_displaced: bool = False
+        # #1481: the END-ANCHOR witness marks the N-1 node (set in
+        # UnifiedRadixCache._weg2_note_end_anchor).
+        self._weg2_end_anchor: bool = False
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -624,6 +634,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Dispatch methods below pre-check conditions so the session's
         # internal fall-through to self.inner.xxx never fires -- no recursion.
         self.session = StreamingSession(inner=self)
+        # fnFL2 H19: per-request mamba arena anchors (weg2/mamba_arena_displace.py)
+        self._weg2_anchor_ledger = _mad.RidAnchorLedger()
+        self._weg2_direct_mamba_rows: dict = {}   # #1427: node id -> mamba arena rows in flight
+        self._weg2_rid_anchor_cfg = envs.SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS.get()
 
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
@@ -3207,6 +3221,93 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return None
         return mp
 
+    # -- fnFL2 H19: the arena keeps a request's DEEPEST anchors ----------------
+    def _weg2_mamba_claim(self, node, mp, last_hash):
+        """The mamba arena slot of `node`'s anchor (host ids) or None.
+        SHARE: a request at its per-rank share releases its shallowest anchor
+        first; FULL: a refused node releases one more (once per node and
+        rank) and claims again (weg2/mamba_arena_displace.py)."""
+        rid = node.weg2_anchor_rid
+        cap = _mad.rid_anchor_cap(configured=self._weg2_rid_anchor_cfg, arena_slots=mp.arena_slots)
+        if rid is None or cap == 0:
+            return mp.alloc_write([last_hash])
+        st = self._weg2_anchor_ledger.of(rid)
+        path, depth = _mad.ancestor_path(target=node, root=self.root_node)
+        owned = _mad.owned_anchors(path=path, rid=rid, anchor_of=lambda n: self._weg2_anchor_of(n, mp))
+        if len(owned) >= cap:
+            victim = _mad.pick_own_victim(owned)
+            if victim is not None:
+                self._weg2_release_anchor(victim, mp, st, why="share", for_rid=rid)
+                owned = [a for a in owned if a is not victim]
+        mrows = mp.alloc_write([last_hash])
+        if mrows is None and not node.weg2_arena_displaced:
+            victim = self._weg2_full_victim(node, rid, owned, mp)
+            if victim is not None:
+                node.weg2_arena_displaced = True
+                self._weg2_release_anchor(victim, mp, st, why="full", for_rid=rid)
+                owned = [a for a in owned if a is not victim]
+                mrows = mp.alloc_write([last_hash])
+        self._weg2_note_anchor_claim(node, rid, st, ok=mrows is not None, held=len(owned), depth=depth, cap=cap, mp=mp)
+        return mrows
+
+    def _weg2_anchor_of(self, n, mp):
+        """(held, slots): an arena anchor sits on `n`; its slots when this rank
+        may release it (settled write, no host lock, not the end anchor)."""
+        cd = n.component_data[ComponentType.MAMBA]
+        hv = cd.host_value
+        if hv is None or hv.numel() == 0 or not mp.is_arena_id(int(hv.min())):
+            return False, None
+        if (n._weg2_end_anchor or n.write_through_pending_id is not None
+                or cd.host_lock_ref > 0 or n.id in self._weg2_direct_mamba_rows):
+            return True, None
+        return True, mp.settled_anchor_slots(hv)
+
+    def _weg2_full_victim(self, node, rid, owned, mp):
+        """FULL: the request's own shallowest anchor; a request with none to
+        give (its first anchor, or its end anchor) takes another request's
+        shallowest INTERMEDIATE anchor."""
+        victim = _mad.pick_own_victim(owned)
+        if victim is not None or (owned and not node._weg2_end_anchor):
+            return victim
+        tree = _mad.tree_anchors(root=self.root_node, anchor_of=lambda n: self._weg2_anchor_of(n, mp))
+        return _mad.pick_foreign_victim(tree, rid=rid)
+
+    def _weg2_release_anchor(self, victim, mp, st, why: str, for_rid: str) -> None:
+        """Release this rank's reference on the victim's anchor (the node keeps
+        its KV; its mamba host value goes, as the host LRU would do) and drop
+        the slot once no rank references it."""
+        comp = self.components[ComponentType.MAMBA]
+        self._evict_component_and_detach_lru(victim.node, comp, target=EvictLayer.HOST, tracker=None)
+        self._update_evictable_leaf_sets(victim.node)
+        dropped = mp.drop_unreferenced(list(victim.slots))
+        if why == "share":
+            st.displaced_share += 1
+        else:
+            st.displaced_full += 1
+        st.dropped += dropped
+        n = UnifiedRadixCache._weg2_displace_n + 1
+        UnifiedRadixCache._weg2_displace_n = n
+        if n <= 16 or n % 64 == 0 or victim.rid != for_rid:
+            logger.info("WEG2 MAMBA-ARENA DISPLACE n=%d why=%s for_rid=%s victim_rid=%s node=%s depth=%d dropped=%d",
+                        n, why, for_rid[:12], victim.rid[:12], victim.node.id, victim.depth, dropped)
+
+    def _weg2_note_anchor_claim(self, node, rid, st, ok: bool, held: int, depth: int, cap: int, mp) -> None:
+        if ok:
+            st.written += 1
+            st.held = held + 1
+            st.deepest = max(st.deepest, depth)
+        else:
+            st.refused += 1
+            st.held = held
+        if node._weg2_end_anchor:
+            st.end_anchor = "slot" if ok else "refused"
+            logger.info("%s", st.line(rid=rid, cap=cap, slots=mp.arena_slots))
+
+    def _weg2_tag_anchor(self, node, rid: str) -> None:
+        """The request that created `node` owns its anchor (first tag wins)."""
+        if node is not None and node is not self.root_node and node.weg2_anchor_rid is None:
+            node.weg2_anchor_rid = rid
+
     def _weg2_direct_claim(self, node, comp_xfers=None):
         """None = not a direct-write pool (take the staging path); False =
         refused (counted); a tensor = the arena rows to write into. The
@@ -3236,7 +3337,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     mxfer = x
         if mxfer is not None:
             mp = self._weg2_mamba_pool()
-            mrows = mp.alloc_write([hashes[-1]]) if mp is not None else None
+            mrows = self._weg2_mamba_claim(node, mp, hashes[-1]) if mp is not None else None
             if mrows is None:
                 pool.abort_write(pre)
                 _why = "mamba_claim" if mp is not None else "mamba_pool_unbound"
@@ -3328,6 +3429,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return True
 
     _1472_issued_at: dict = {}
+    _weg2_displace_n: int = 0   # fnFL2 H19: displacement lines, rate-limited
 
     def _finish_write_through_ack(self, ack_id: int) -> None:
         lock_node, lock_params, publish_nodes = self.ongoing_write_through.pop(ack_id)
@@ -3380,6 +3482,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # then the rest -- with a budget the BFS from the root spent it on
             # older nodes and D's dormant read of this request found half.
             first = self._weg2_chain_nodes(radix_key) if radix_key is not None else []
+            self._weg2_tag_retain_chain(first, str(req.rid))
             stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue(),
                                                 clock=_rp.SweepClock(_rp.budget_s()),
                                                 first=first) or {}
@@ -3389,8 +3492,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if n <= 16 or n % 64 == 0:
                 logger.info("WEG2 RETAIN-PUBLISH rid=%s %s ms=%.0f (n=%d)", str(getattr(req, "rid", "?"))[:12],
                             stats, (time.perf_counter() - _t0) * 1000.0, n)
+            self._weg2_log_rid_anchors(str(req.rid), first)
         except Exception as exc:  # noqa: BLE001 -- a publisher never takes the retain down
             logger.warning("WEG2 RETAIN-PUBLISH raised %s: %s", type(exc).__name__, exc)
+
+    def _weg2_tag_retain_chain(self, chain, rid: str) -> None:
+        """H19: the finished request owns its final node and its END-ANCHOR
+        node (#1481); shared-prefix nodes keep the tag of their creator."""
+        if not chain:
+            return
+        self._weg2_tag_anchor(chain[-1], rid)
+        for n in chain:
+            if n._weg2_end_anchor:
+                self._weg2_tag_anchor(n, rid)
+
+    def _weg2_log_rid_anchors(self, rid: str, chain) -> None:
+        """H19 (c): one line per finished request -- anchors written, displaced,
+        refused, the deepest, and whether the END-ANCHOR node (#1481) holds its
+        arena slot now (its anchor is usually claimed at its chunk, before
+        the finish marks it)."""
+        st = self._weg2_anchor_ledger.peek(rid)
+        mp = self._weg2_mamba_pool() if st is not None else None
+        if mp is None:
+            return
+        ends = [n for n in chain if n._weg2_end_anchor and n.weg2_anchor_rid == rid]
+        if ends:
+            held, _ = self._weg2_anchor_of(ends[-1], mp)
+            st.end_anchor = "slot" if held else "missing"
+        cap = _mad.rid_anchor_cap(configured=self._weg2_rid_anchor_cfg, arena_slots=mp.arena_slots)
+        logger.info("%s at=retain", st.line(rid=rid, cap=cap, slots=mp.arena_slots))
 
     def _weg2_chain_from(self, node) -> list:
         """The nodes from `node` up to (excluding) the root, ROOT FIRST."""
@@ -3434,6 +3564,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             first = self._weg2_chain_from(getattr(req, "last_node", None))
             if not first:
                 return
+            self._weg2_tag_anchor(first[-1], str(req.rid))   # H19: this chunk's node is the request's anchor
             # H2: wall vs thread CPU of this publish, and its write ops' host
             # side (hicache_write_path) -- the line the next boot is read by.
             h2 = hicache_write_path.PublishClock()

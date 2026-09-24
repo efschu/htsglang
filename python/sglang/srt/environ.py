@@ -493,6 +493,14 @@ class Envs:
     # the extend shrinks, an INLINE walk of 500 ms is back on the critical
     # path. The census is a leak instrument: switch it on by name when hunting.
     SGLANG_WEG2_SLEEP_HEAP_CENSUS = EnvInt(Weg2HeapCensus.OFF)
+    # MAMBA_ARENA_RID_ANCHORS (H19, fnFL2x130): arena mamba anchors one
+    # request may hold per rank; its next, deeper anchor displaces its
+    # shallowest one, and a node the full arena refuses releases one more
+    # (weg2/mamba_arena_displace.py) -- the hand-over reads the DEEPEST anchor
+    # only, x130 kept the first 30 of 191 and lost the end anchor. -1 = auto
+    # max(2, arena_slots // 4) (32 -> 8; chunk 16384 stays untouched),
+    # N >= 2 = N, 0 = off (first-come as before).
+    SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS = EnvInt(-1)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)

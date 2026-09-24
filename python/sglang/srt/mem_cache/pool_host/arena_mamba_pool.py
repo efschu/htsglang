@@ -258,6 +258,27 @@ class ArenaMambaPoolHost(MambaPoolHost):
             return None
         return torch.tensor([self.staging_rows + s for s in slots], dtype=torch.int64)
 
+    # -- fnFL2 H19: anchor displacement -----------------------------------------------
+    def settled_anchor_slots(self, host_value: Optional[torch.Tensor]) -> Optional[list]:
+        """The arena slots of a node's mamba host value when this rank's write
+        into them has landed (acked, no pending claim) -- the only anchors a
+        displacement may release. None = no arena anchor, or still in flight."""
+        if self.arena is None or host_value is None or host_value.numel() == 0:
+            return None
+        S, A = self.staging_rows, self.arena_slots
+        rows = [int(i) - S for i in host_value.cpu().tolist()]
+        if any(r < 0 or r >= A for r in rows):
+            return None
+        if any(r in self._pending for r in rows):
+            return None
+        return rows
+
+    def drop_unreferenced(self, slots: Sequence[int]) -> int:
+        """Free the displaced anchors' slots once no rank references them."""
+        if self.arena is None or not slots:
+            return 0
+        return self.arena.drop_unreferenced(list(slots))
+
     def is_arena_id(self, i: int) -> bool:
         return self.staging_rows <= int(i) < self.staging_rows + self.arena_slots
 

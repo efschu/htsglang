@@ -88,6 +88,8 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_slot_ptr.argtypes = [p_u8, i64]
             lib.arena_free_slots.restype = None
             lib.arena_free_slots.argtypes = [p_u8, i64, p_i64]
+            lib.arena_drop_unreferenced.restype = i64
+            lib.arena_drop_unreferenced.argtypes = [p_u8, i64, p_i64, p_i8]
             lib.arena_reap_stale.restype = i64
             lib.arena_reap_stale.argtypes = [p_u8]
             lib.arena_stats.restype = None
@@ -399,6 +401,17 @@ class ShmArena:
             return
         c = (ctypes.c_int64 * n)(*[int(s) for s in slots])
         self._lib.arena_free_slots(self._base, n, c)
+
+    def drop_unreferenced(self, slots: Sequence[int]) -> int:
+        """fnFL2 H19: free the COMPLETE slots nobody references any more --
+        a displaced anchor, no disk write (arena.c arena_drop_unreferenced).
+        Returns how many were dropped; a referenced/claimed slot stays."""
+        n = len(slots)
+        if n == 0:
+            return 0
+        c = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        out = (ctypes.c_int8 * n)()
+        return int(self._lib.arena_drop_unreferenced(self._base, n, c, out))
 
     def reap_stale(self) -> int:
         return int(self._lib.arena_reap_stale(self._base))
