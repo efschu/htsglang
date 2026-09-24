@@ -797,6 +797,20 @@ def usage_of_stream_tail(tail: bytes) -> Tuple[int, int, int, bool]:
     return 0, 0, 0, False
 
 
+#: H61 (boot fnFL2x165, 2026-09-24): the markers that say the client has
+#: ALREADY been sent the end of the answer. OpenAI wire: a chunk whose
+#: ``finish_reason`` is a string (it is ``null`` while decoding). Anthropic
+#: wire: ``message_delta`` with a ``stop_reason`` string, or ``message_stop``.
+_STREAM_FINISH_RE = re.compile(
+    rb'"(?:finish_reason|stop_reason)"\s*:\s*"|event:\s*message_stop|"type"\s*:\s*"message_stop"'
+)
+
+
+def stream_finish_seen(buf: bytes) -> bool:
+    """True when ``buf`` carries the end-of-answer marker of either wire (H61)."""
+    return _STREAM_FINISH_RE.search(buf) is not None
+
+
 class AnthropicStreamUsage:
     """Roll up an Anthropic SSE stream's usage ACROSS THE WHOLE STREAM.
 
@@ -3931,12 +3945,43 @@ class Front:
                     # head of the stream, and the bounded tail below trims the
                     # head away on any long answer. Accumulate as we forward.
                     anth = AnthropicStreamUsage() if request.path == "/v1/messages" else None
+                    # H61 (boot fnFL2x165, 2026-09-24): A CLIENT THAT HANGS UP
+                    # AFTER THE FINISH CHUNK HAS BEEN SERVED, NOT FAILED.
+                    # MEASURED: rid weg2-2-6 had all 1024 tokens at the client
+                    # (DECODE-PROBE code 19:38:31Z); the client closed on the
+                    # finish chunk, the NEXT write (D's usage chunk) raised
+                    # 'ClientConnectionResetError: Cannot write to closing
+                    # transport', and the except below counted a leg-2
+                    # failure. No WEG2-SERVED, no record_presence -- so the
+                    # warm repeat of that 12.7k prompt priced presence_span=1,
+                    # routed LONG and paid a P prefill plus a flip pair: TTFT
+                    # 12.9 s where x163 served the same probe from D's cache
+                    # in 1.6 s. Once the end of the answer has been written,
+                    # a write error to the client is a hang-up, not a fault:
+                    # stop writing, keep reading D to its end (the usage
+                    # chunk and [DONE], nothing is generated any more), and
+                    # book presence as for any served stream. BEFORE the
+                    # finish marker the old abort stands: the error
+                    # propagates and closing D's connection aborts decoding
+                    # for a client that is gone.
+                    client_io = {"gone": False, "finished": False}
 
                     async def _push(chunk: bytes) -> None:
-                        await resp.write(chunk)
+                        if not client_io["gone"]:
+                            try:
+                                await resp.write(chunk)
+                            except ConnectionResetError:
+                                # aiohttp's ClientConnectionResetError is a
+                                # ConnectionResetError.
+                                if not client_io["finished"]:
+                                    raise
+                                client_io["gone"] = True
                         if anth is not None:
                             anth.feed(chunk)
+                        _scan_from = max(0, len(tail) - 64)
                         tail.extend(chunk)
+                        if not client_io["finished"] and stream_finish_seen(bytes(tail[_scan_from:])):
+                            client_io["finished"] = True
                         if len(tail) > 262144:
                             del tail[:-131072]
 
@@ -3949,7 +3994,18 @@ class Front:
                             await _push(first_chunk)
                         async for chunk in r.content.iter_any():
                             await _push(chunk)
-                    await resp.write_eof()
+                    if not client_io["gone"]:
+                        try:
+                            await resp.write_eof()
+                        except ConnectionResetError:
+                            if not client_io["finished"]:
+                                raise
+                            client_io["gone"] = True
+                    if client_io["gone"]:
+                        self.counters["leg2_client_closed_after_finish"] += 1
+                        logger.info("WEG2 leg2 rid=%s CLIENT-CLOSED-AFTER-FINISH: the client hung up after the "
+                                    "end of the answer was written; D's stream was read to its end and is "
+                                    "booked as served (H61)", rid)
                     g.served += 1
                     if anth is not None:
                         pt, ct, comp, priced = anth.result()
