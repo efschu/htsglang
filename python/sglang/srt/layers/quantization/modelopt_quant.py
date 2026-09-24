@@ -2035,6 +2035,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 " quantization with the selected MoE backend. Please use "
                 "Blackwell and above, or use moe_runner_backend=marlin on SM80+."
             )
+        # H68 (upstream PR #38092): persisted so create_weights can skip the
+        # swizzled blockscale copies the Marlin path never reads.
+        self.use_marlin_fallback = use_marlin_fallback
         self.enable_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -2162,8 +2165,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
         # during process_weights_after_loading, so skip the expensive
-        # swizzle+allocate here to avoid GPU memory fragmentation
-        if self.enable_flashinfer_trtllm_moe:
+        # swizzle+allocate here to avoid GPU memory fragmentation.
+        # H68 (upstream PR #38092): the Marlin path never reads them either --
+        # process_weights_after_loading returns right after
+        # prepare_moe_nvfp4_layer_for_marlin -- and a full swizzled copy of the
+        # block scales (~10 % of every NVFP4 expert) would sit dead beside the
+        # experts for the whole run.
+        skip_swizzled = self.enable_flashinfer_trtllm_moe or getattr(
+            self, "use_marlin_fallback", False
+        )
+        if skip_swizzled:
             layer.w13_blockscale_swizzled = None
         else:
             layer.w13_blockscale_swizzled = Parameter(
@@ -2183,7 +2194,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if self.enable_flashinfer_trtllm_moe:
+        if skip_swizzled:
             layer.w2_blockscale_swizzled = None
         else:
             layer.w2_blockscale_swizzled = Parameter(
