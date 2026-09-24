@@ -2088,6 +2088,15 @@ class Front:
         from sglang.srt.weg2 import line_identity as _line_identity
 
         self.record_line = _line_identity.parse_spec(record_line)
+        if self.record_line is not None and self.measured_record:
+            # WARMED HERE, before READY: the first judgement of the sidecar
+            # (one git rev-list + every boot tag's front-log head) must not
+            # land in the first flip's sleep-leg gate (_sleep_leg_need_gib
+            # runs synchronously inside the flip, before 'gathered-legs').
+            _t0 = time.time()
+            _n, _ok = self.record_line.warm(self.measured_record)
+            logger.info("WEG2-27B-LINE record identity warmed: %d of %d sample(s) of %s in %.2f s",
+                        _ok, _n, self.record_line.describe(), time.time() - _t0)
         self.commit = commit
         self.ledger_arm = dict(ledger_arm or {})
         self.dormant_image: Dict[str, dict] = {}

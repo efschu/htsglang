@@ -107,6 +107,21 @@ class TestLineIdentity(_Line):
         self.assertTrue(self.line.accepts_log(p_good))
         self.assertFalse(self.line.accepts_log(p_bad))
 
+    def test_one_git_call_per_head_and_warm(self):
+        LI._ancestor_index.cache_clear()
+        LI._is_ancestor.cache_clear()
+        rec = os.path.join(self.ev, "rec_warm.json")
+        with open(rec, "w") as f:
+            json.dump({"samples": [{"group": "D", "boot_tag": t} for t in
+                                   ("xsn411", "xsn418", "fnFL2x144", "nosuch", "xsn411")]}, f)
+        n, ok = self.line.warm(rec)
+        self.assertEqual((n, ok), (5, 2))
+        self.assertEqual(LI._ancestor_index.cache_info().misses, 1)  # ONE rev-list
+        self.assertEqual(self.line.warm(os.path.join(self.ev, "missing.json")), (0, 0))
+        # a short or unknown tip is unproven, never a prefix wildcard
+        self.assertFalse(LI._is_ancestor(self.repo, self.base_tip[:6], self.line_tip))
+        self.assertTrue(LI._is_ancestor(self.repo, self.base_tip[:7], self.line_tip))
+
     def test_spec_round_trip(self):
         back = LI.parse_spec(self.line.spec())
         self.assertEqual(back, self.line)
