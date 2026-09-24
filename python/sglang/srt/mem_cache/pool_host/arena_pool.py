@@ -763,6 +763,21 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             return 0
         return int(self.arena.ref_slots_np(slots.numpy(), -1))
 
+    def release_queued_rows(self, host_indices: torch.Tensor) -> int:
+        """SGLANG_HICACHE_ARENA_QUEUE_REFS: arena rows out of the host release
+        queue (HostPoolGroup._free_arena_rows) -- a store prefetch's rows the
+        tree did not adopt, each holding the ONE reader reference
+        `_arena_page_get` took. Handed back by the tree reset's rules
+        (release_tree_rows: staging rows are not arena rows, rows of a pending
+        write belong to their writer and are skipped), and a row named twice in
+        one call is released ONCE: a double-queued span must not take a second
+        reference (another holder's) off the slot. Returns the references
+        dropped."""
+        idx = torch.as_tensor(host_indices).reshape(-1).cpu().to(torch.int64)
+        if idx.numel() == 0:
+            return 0
+        return self.release_tree_rows(torch.unique(idx))
+
     def _evict_for_claim(self, arena, need: int) -> int:
         """Make room for a claim that found no free slot: free the `need`
         oldest unreferenced COMPLETE slots (the arena clock, second chance)

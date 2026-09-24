@@ -21,6 +21,7 @@ from sglang.jit_kernel.hicache import (
 )
 from sglang.jit_kernel.hisparse import transfer_cache_dsv4_mla
 from sglang.srt.mem_cache.pinned_host_budget import check_and_register_pinned_post
+from sglang.srt.mem_cache.storage.file.hicache_arena import arena_queue_refs_on
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MambaPool,
@@ -2122,10 +2123,80 @@ class HostPoolGroup:
         # dropped by name (see _split_host_indices_by_binding). Freeing what
         # remains is the whole point -- an empty result is still a valid free.
         pool = self.anchor_entry.host_pool
+        handed_back = 0
+        if arena_queue_refs_on():
+            indices, handed_back = self._free_arena_rows(pool, indices)
+            if len(indices) == 0:
+                return handed_back
         live, n_stray = _split_host_indices_by_binding(pool, indices, "free")
         if n_stray and len(live) == 0:
-            return 0
-        return pool.free(live)
+            return handed_back
+        return handed_back + pool.free(live)
+
+    def _free_arena_rows(self, pool, indices):
+        """SGLANG_HICACHE_ARENA_QUEUE_REFS (27B, 24.09., default off).
+
+        THE DEFECT. This group is the host pool the release queue frees
+        against (`_drain_release`, and the rebind settle). The #718 split above
+        bounds ids by `pool.size`, which on an arena host pool is the STAGING
+        range only (#1424: arena ids are staging_rows + slot, placeholders sit
+        beyond staging_rows + arena_slots). So every arena id the queue carried
+        was dropped as a stray (boot xsn429 P: "4314 index(es) outside [0,
+        2442)"), and the arena branch of ArenaMHAHostPool.free -- written for
+        exactly these rows -- was unreachable from the queue. What the queue
+        carries there: the rows of a store prefetch the tree did NOT adopt --
+        the unclaimed head (already on device), an unsynced tail, an aborted
+        or retired span -- each with the one reader reference
+        `_arena_page_get` took when it resolved the row. Dropped, that
+        reference is never returned: the slot can never be evicted again, and
+        a long boot pins the arena until claims are refused (desk, real
+        objects: 20 pinned per cycle, the writer's claim refused at cycle 46
+        of a 1000-slot arena). xsn429 D: 51942 such references in 12 minutes.
+
+        HERE: arena ids go back to the arena, one reference per row
+        (`release_queued_rows`: duplicates collapse, rows of a pending write
+        belong to their writer and are skipped), through this process's
+        RefLedger -- a release beyond what this process holds is refused, so
+        another rank's reader reference is never taken. Placeholders never
+        took a reference and are dropped. Everything else takes the unchanged
+        path below (staging rows freed, true strays refused by #718).
+
+        Only when the anchor pool is arena-bound AND its arena keeps a ledger
+        (the same switch); otherwise nothing changes. Returns (the ids left for
+        the unchanged path, the arena rows handed back)."""
+        arena = getattr(pool, "arena", None)
+        release = getattr(pool, "release_queued_rows", None)
+        if arena is None or getattr(arena, "_ledger", None) is None or not callable(release):
+            return indices, 0
+        idx = torch.as_tensor(indices).reshape(-1).to(torch.int64).cpu()
+        S = int(pool.staging_rows)
+        A = int(pool.arena_slots)
+        is_arena = (idx >= S) & (idx < S + A)
+        is_ph = (idx >= S + A) & (idx < int(getattr(pool, "id_space", S + A)))
+        n_arena = int(is_arena.sum())
+        n_ph = int(is_ph.sum())
+        if n_arena == 0 and n_ph == 0:
+            return indices, 0
+        led = arena._ledger
+        refused0 = led.refused
+        returned = int(release(idx[is_arena])) if n_arena else 0
+        refused = led.refused - refused0
+        st = self.__dict__.setdefault("_queue_refs", {"calls": 0, "rows": 0, "returned": 0,
+                                                       "refused": 0, "placeholders": 0})
+        st["calls"] += 1
+        st["rows"] += n_arena
+        st["returned"] += returned
+        st["refused"] += refused
+        st["placeholders"] += n_ph
+        if st["calls"] <= 8 or st["calls"] % 256 == 0 or refused:
+            logger.info(
+                "ARENA-QUEUE-REFS n=%d rows=%d returned=%d refused=%d placeholders=%d "
+                "(cumulative rows=%d returned=%d refused=%d placeholders=%d; refused = "
+                "a release beyond this process's own references, never applied)",
+                st["calls"], n_arena, returned, refused, n_ph,
+                st["rows"], st["returned"], st["refused"], st["placeholders"],
+            )
+        return idx[~(is_arena | is_ph)], n_arena
 
     def get_data_page(self, index, flat: bool = True):
         # #718 class, index axis. Returns data -- loud, for get_page_buffer_meta's reason.
