@@ -192,6 +192,32 @@ def solo_draft_kv_cell_factor(mr: ModelRunner) -> float:
     return factor
 
 
+def draft_kv_pool_on_this_rank(mr: ModelRunner) -> bool:
+    """fnFL2 H42c-2: does THIS target rank allocate a draft KV pool at all?
+
+    False only for a draft-KV-ONLY producer (``speculative_draft_kv_only``,
+    Weg-2 group P with ``--draft-kv-on-p on``) on a PP stage that is not the
+    last: ``Scheduler._maybe_init_draft_kv_producer`` builds the producer, and
+    with it the draft pool, on ``get_pp_group().is_last_rank`` alone. The
+    draft scaling below charged a draft layer into the cell of EVERY stage
+    regardless -- x161: cell 8704/4352/3264 B/token against 7616/3264/2176
+    without the draft, while ``KV Cache is allocated`` printed the same
+    K 0.88/0.38 GB on PP0/PP1 in both forms and the one draft pool (K 0.13 GB)
+    only on PP2 ("DRAFT-KV-PRODUCER armed stage=2/3", PP1 "no-drafter"). With
+    --max-total-tokens the pool is tokens x real layers, so the phantom only
+    raised the free memory a stage needs to reach its token cap: 272 MiB per
+    non-last stage at 262144 tokens, which the planner mirrored
+    (``PP-CUT KV-PREIS ... + Draft 1``) and took from the expert fraction.
+    Every other form (no draft-KV-only producer, pp_size 1, the last stage)
+    returns True: byte-identical."""
+    if not getattr(mr.server_args, "speculative_draft_kv_only", False):
+        return True
+    pp_size = int(getattr(mr, "pp_size", 1) or 1)
+    if pp_size <= 1:
+        return True
+    return int(getattr(mr, "pp_rank", 0) or 0) == pp_size - 1
+
+
 def apply_solo_draft_kv_cell_factor(
     mr: ModelRunner, target_cell_size: int, cell_size_with_draft: int
 ) -> int:
@@ -420,6 +446,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         target_cell_size = self._compute_cell_size(mr, num_layers)
         self._cell_size = target_cell_size
+        # fnFL2 H42c-2: no draft KV pool on this rank -> no draft term in its
+        # cell (a draft-KV-only producer lives on the last PP stage only).
+        _draft_pool_here = draft_kv_pool_on_this_rank(mr)
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
@@ -427,7 +456,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # reuse the target architecture's attention config.
         if (
             mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
-        ) and not mr.is_draft_worker:
+        ) and not mr.is_draft_worker and _draft_pool_here:
             eagle_draft_num_layers = getattr(mr, "eagle_draft_num_layers", None)
             if (
                 eagle_draft_num_layers is not None
@@ -450,7 +479,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         )
         if (
             mr.spec_algorithm.is_dflash_family() or _cross_algo
-        ) and not mr.is_draft_worker:
+        ) and not mr.is_draft_worker and _draft_pool_here:
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )

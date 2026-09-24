@@ -1153,7 +1153,8 @@ def kv_reserve_mib_per_stage(
     Experten (Memory ``nextflash-experten-sind-der-hebel``).
 
     ``draft_attn_layers_by_stage``: der Draft-KV-Produzent (``--draft-kv-on-p``)
-    legt je Stufe eigene Attention-Layer in denselben Pool. Ohne Angabe 0 --
+    legt seine Attention-Layer auf der Stufe an, die ihn traegt -- der letzten
+    (H42c-2: der Aufrufer uebergibt ``[0, ..., 0, n]``). Ohne Angabe 0 --
     dann ist das Ergebnis eine UNTERGRENZE des Preises, und das ist genau der
     Fehler, der w123 121920 Token servieren liess. Benennen, nicht raten.
     """

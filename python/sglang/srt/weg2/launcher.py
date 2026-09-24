@@ -11653,10 +11653,16 @@ def solve_p_cut(
                 _kv_dtype = str(_argv_scalar(
                     getattr(ns, "extra_p", ""), "--kv-cache-dtype") or "auto")
                 _kv_bytes = 1.0 if "fp8" in _kv_dtype else 2.0
-                # --draft-kv-on-p legt je Stufe EINEN Draft-Attention-Layer in
-                # denselben Pool; das ist der Unterschied zwischen den 7616,
-                # die DESIGN_FLIP_NEXTFLASH_0920.md nennt, und den 8704, die
-                # w123 mit Draft emittierte.
+                # --draft-kv-on-p legt EINEN Draft-Attention-Layer an -- auf der
+                # LETZTEN Stufe, wo der Produzent lebt
+                # (Scheduler._maybe_init_draft_kv_producer: is_last_rank).
+                # w123s 8704 auf Stufe 0 war die Zelle der Rang-Planung, die
+                # den Draft bis H42c-2 auf JEDER Stufe einrechnete
+                # (pool_configurator.draft_kv_pool_on_this_rank); allokiert
+                # wurde er nie dort: x161 'KV Cache is allocated' K 0.88/0.38
+                # GB auf PP0/PP1 wie x160 ohne Draft, der Draft-Pool (K 0.13 GB)
+                # nur auf PP2. Der Phantom-Posten kostete 272 MiB je
+                # Nicht-Letzt-Stufe (P-Kante 0.332 -> 0.324).
                 _dr = 1 if str(getattr(ns, "draft_kv_on_p", "off")) == "on" else 0
                 _tc = text_cfg
                 if _kv_tokens > 0 and len(_attn) == n_stages_p:
@@ -11667,12 +11673,12 @@ def solve_p_cut(
                         head_dim=int(_tc["head_dim"]),
                         v_head_dim=int(_tc.get("v_head_dim", _tc["head_dim"])),
                         kv_dtype_bytes=_kv_bytes,
-                        draft_attn_layers_by_stage=[_dr] * n_stages_p,
+                        draft_attn_layers_by_stage=[0] * (n_stages_p - 1) + [_dr],
                     )
                     _reserve_p = _kv_p
                     log(
                         "PP-CUT KV-PREIS (#156): %d Token x Zelle je Stufe "
-                        "(Attention-Layer %s + Draft %d, %s -> %.0f B je "
+                        "(Attention-Layer %s + Draft %d auf der letzten Stufe, %s -> %.0f B je "
                         "Attention-Layer und Token) = %s MiB je Stufe. DAS ist "
                         "der Posten, der in der Kette fehlte; er geht jetzt als "
                         "Reserve in die Fraction-Decke, damit der Rest den "
