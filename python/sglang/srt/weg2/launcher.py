@@ -1278,6 +1278,56 @@ P_PP_STAGE_FIXED_MIB = "2342.0,1105.5,3518.0"
 #: rank of both boots. It had NO FIELD in the pool model before #1286.
 P_PREFILL_ACTIVATION_RESERVE_MIB = 1024.0
 
+#: Task #114 (24.09.): group P's prefill TRANSIENT per chunk token, MiB, one
+#: entry per P stage (PP0 = the 5090 stage, PP1/PP2 = the 3080 stages).
+#: MEASURED by the boot's own ``[vram-peak] high-water`` instrument
+#: (allocator peak minus allocated at the chunk's high-water mark), and
+#: LINEAR in the chunk width on every stage:
+#:   PP0  chunk  8192 -> 1.79 GiB (fnFL2x113, x116)   16384 -> 3.58 GiB (x118)
+#:   PP1  chunk  8192 -> 1.59 GiB                     16384 -> 3.19 GiB
+#:   PP2  chunk  8192 -> 1.21 GiB                     16384 -> 2.43 GiB
+#: fnFL2x121/x122 (5090 stage at residency 0.45/0.40, chunk 16384) passed
+#: every launch gate and died in the FIRST chunk's forward (CUDA OOM, 320 and
+#: 384 MiB short) because the post above priced the reference boots' 1024 MiB
+#: (chunk 4096) on every chunk width. NOT a demand decision of its own: the
+#: instrument's two measured points per stage, transcribed.
+P_PREFILL_TRANSIENT_MIB_PER_CHUNK_TOKEN = (0.224, 0.199, 0.152)
+
+#: The runtime's residual post for exactly this transient
+#: (``model_runner_kv_cache_mixin.PREFILL_TRANSIENT_ENV``): a comma vector,
+#: MiB per rank, that the sizer subtracts from ``rest`` before the KV pool.
+#: Named here rather than imported so the launcher stays torch-free; the
+#: unit test pins the two names to each other.
+P_PREFILL_TRANSIENT_ENV = "SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB"
+
+
+def p_prefill_transient_vector_mib(chunk_tokens: int) -> Tuple[float, ...]:
+    """Group P's MEASURED prefill transient for ``chunk_tokens``, MiB per
+    stage (#114) -- the instrument's per-token slope times the chunk width."""
+    return tuple(
+        round(float(per_token) * float(chunk_tokens), 1)
+        for per_token in P_PREFILL_TRANSIENT_MIB_PER_CHUNK_TOKEN
+    )
+
+
+def p_prefill_activation_reserve_mib(pinned: Optional[float], chunk_tokens: int) -> float:
+    """The pool model's `prefill activation reserve` post for ``chunk_tokens``.
+
+    ``pinned`` (``--pp-cut-activation-reserve-mib``) wins when the operator set
+    it. Otherwise the LARGER of the reference boots' 1024 MiB and the measured
+    transient of the binding stage (max over stages): a chunk at or below the
+    reference width prices byte-identically to #1286, a wider chunk prices what
+    ``[vram-peak]`` measured. The pool model carries ONE post for every rank,
+    and the max over stages is the safe way to be wrong -- an over-charge
+    under-prices a pool, an under-charge OOMs a forward (fnFL2x121).
+    """
+    if pinned is not None:
+        return float(pinned)
+    return max(
+        float(P_PREFILL_ACTIVATION_RESERVE_MIB),
+        max(p_prefill_transient_vector_mib(chunk_tokens)),
+    )
+
 #: The `gapped corridor holdback` post, MiB per rank. 1.000 GiB on every rank
 #: of both boots. This is the term ARMING_FLOOR_MIB was standing in for, and
 #: they are NOT the same thing: the runtime charges this holdback and no
@@ -5465,6 +5515,21 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # the next boot confirms or corrects the value.
     env.setdefault("SGLANG_IDLE_BLOCKING_POLL", "1")
     env.setdefault("MALLOC_ARENA_MAX", "4")
+    # #114: group P books its MEASURED prefill transient in the sizer's own
+    # ledger (one entry per P rank, priced from the chunk P boots with), so
+    # the KV pool is sized around it instead of over it -- fnFL2x121/x122
+    # sized 262144 tokens into the transient's room and died in the first
+    # chunk's forward. The operator's own value wins (setdefault); every other
+    # group gets the family POPPED, so D never inherits P's post.
+    if group == "P":
+        env.setdefault(
+            P_PREFILL_TRANSIENT_ENV,
+            ",".join(
+                "%.0f" % v for v in p_prefill_transient_vector_mib(P_CHUNKED_PREFILL_TOKENS)
+            ),
+        )
+    else:
+        env.pop(P_PREFILL_TRANSIENT_ENV, None)
     env.update(spec_form_env(group))  # --spec-form: D's window pool under DFLASH
     return env
 
@@ -10813,7 +10878,11 @@ def solve_p_cut(
         # arming floor and nothing else, and boot weg2sb5f published 499,967
         # tokens for the cut group P then sized at 304,655 (+64.1 %).
         stage_fixed_mib=tuple(_csv_floats(ns.pp_cut_stage_fixed_mib)),
-        activation_reserve_mib=float(ns.pp_cut_activation_reserve_mib),
+        # #114: priced from the chunk P boots with (see the log line below),
+        # never the reference boots' 1024 on a wider chunk.
+        activation_reserve_mib=p_prefill_activation_reserve_mib(
+            ns.pp_cut_activation_reserve_mib, int(chunk_tokens)
+        ),
         # #1257c: None = follow the reserve (the runtime charges exactly it);
         # a number = the operator pinned it.
         corridor_holdback_mib=(
@@ -11101,6 +11170,21 @@ def solve_p_cut(
     # line can be read side by side without a translation step.
     _act_heuristic_mib, _act_provenance = p_activation_reserve_provenance(
         model, int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
+    )
+    # #114: the post's OWN provenance, next to the posts line it feeds.
+    log(
+        "PP-CUT activation post (#114): chunk %d -> measured prefill transient "
+        "per stage %s MiB (%s MiB per chunk token, [vram-peak] high-water on "
+        "fnFL2x113/x116 at 8192 and x118 at 16384); post = %.1f MiB/rank (%s)"
+        % (
+            int(chunk_tokens),
+            list(p_prefill_transient_vector_mib(int(chunk_tokens))),
+            list(P_PREFILL_TRANSIENT_MIB_PER_CHUNK_TOKEN),
+            float(model_pool.activation_reserve_mib),
+            "pinned by --pp-cut-activation-reserve-mib"
+            if ns.pp_cut_activation_reserve_mib is not None
+            else "max(reference 1024, binding stage)",
+        )
     )
     log(
         "PP-CUT budget posts (the boot's own list, MiB/rank): "
@@ -12400,12 +12484,13 @@ def build_parser() -> argparse.ArgumentParser:
              f"runtime state. Empty = UNFUNDED and REFUSED at the launch seam.",
     )
     ap.add_argument(
-        "--pp-cut-activation-reserve-mib", type=float,
-        default=P_PREFILL_ACTIVATION_RESERVE_MIB,
+        "--pp-cut-activation-reserve-mib", type=float, default=None,
         help=f"The boot's 'prefill activation reserve' post, MiB per rank "
-             f"(#1286). Default {P_PREFILL_ACTIVATION_RESERVE_MIB} = the "
-             f"1.000 GiB it measured on every rank of both reference boots. "
-             f"It had no field at all before #1286.",
+             f"(#1286). Unset = max({P_PREFILL_ACTIVATION_RESERVE_MIB:.0f} MiB, "
+             f"the 1.000 GiB both reference boots measured at chunk 4096, and "
+             f"the MEASURED prefill transient of the binding P stage for the "
+             f"chunk P boots with: {P_PREFILL_TRANSIENT_MIB_PER_CHUNK_TOKEN} "
+             f"MiB per chunk token per stage, #114). A number pins the post.",
     )
     ap.add_argument(
         "--pp-cut-corridor-holdback-mib", type=float, default=None,
