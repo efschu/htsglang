@@ -3843,6 +3843,69 @@ class SchedulerWeightUpdaterManager:
             return weights_only
         return {str(t): int(v) for t, v in census.items()}, WEG2_TAG_POPULATION_ALL
 
+    def _weg2_kv_group_all(self, mine: bool, what: str) -> bool:
+        """xsn410: a per-rank yes/no made group-uniform (AND over the gloo cpu
+        group). Used for every decision that gates a path carrying a collective
+        (the kv resume half): the early/late plan and the mid-legs resume. Logs
+        only when the ranks disagree. World 1 / no group: the own answer."""
+        group = getattr(self, "tp_cpu_group", None)
+        try:
+            world = int(torch.distributed.get_world_size(group=group)) if group is not None else 1
+        except Exception:  # noqa: BLE001 -- no process group: single rank
+            world = 1
+        if world <= 1:
+            return bool(mine)
+        gathered: List[Optional[bool]] = [None] * world
+        torch.distributed.all_gather_object(gathered, bool(mine), group=group)
+        verdict = all(v is True for v in gathered)
+        if verdict != bool(mine) or len(set(gathered)) > 1:
+            logger.info("WEG2-WAKE-KV GROUP %s: votes=%s -> %s (this rank said %s)",
+                        what, gathered, verdict, bool(mine))
+        return verdict
+
+    def _weg2_kv_group_verdict(self, mine: bool, kv_epoch) -> bool:
+        """xsn409 (20.09.): the kv_cache resume verdict of a wake is the WHOLE TP
+        group's. Every rank contributes ok/refused over the gloo cpu group; if any
+        rank refused (W114 Weg2KvResumeRefused), a rank that already resumed and
+        cleared its pool pauses it again, sets the dormant flag back and forgets
+        the resumed epoch, so all ranks answer the front's post-legs kv call from
+        the same dormant image. A split group (awake ranks beside a dormant one)
+        hangs in the scheduler loop's next collective -- xsn409: three silent
+        ranks, the front's second kv RPC never dispatched. World 1: own verdict."""
+        group = getattr(self, "tp_cpu_group", None)
+        try:
+            world = int(torch.distributed.get_world_size(group=group)) if group is not None else 1
+        except Exception:  # noqa: BLE001 -- no process group: single rank
+            world = 1
+        if world <= 1:
+            return bool(mine)
+        gathered: List[Optional[bool]] = [None] * world
+        torch.distributed.all_gather_object(gathered, bool(mine), group=group)
+        refused = [i for i, v in enumerate(gathered) if v is not True]
+        if not refused:
+            return True
+        logger.error(
+            "W114 Weg2KvResumeRefused GROUP epoch=%s: rank(s) %s refused the kv_cache "
+            "resume, this rank had %s -- every rank steps back to the dormant image "
+            "(kv_cache paused, dormant set, epoch not done) so the post-legs kv call "
+            "resumes the group together instead of splitting it",
+            kv_epoch, refused, "resumed" if mine else "refused too",
+        )
+        if mine:
+            try:
+                self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            except Exception as exc:  # noqa: BLE001 -- named, never a silent split
+                logger.error("W114 group step-back: pause(kv_cache) raised %s: %s", type(exc).__name__, exc)
+            scheduler = getattr(self, "scheduler", None)
+            if scheduler is not None:
+                try:
+                    scheduler.weg2_dormant = True
+                except Exception:  # noqa: BLE001
+                    pass
+            self._weg2_kv_resumed_epoch = None
+        self._weg2_kv_deferred = True
+        return False
+
     def _weg2_wake_kv_first_ok(self, tags) -> bool:
         """Wake-Parallel (user 18.09.): may the kv_cache pool be resumed BEFORE
         the weight legs? Only when the card can fund it right now: free -
@@ -8423,6 +8486,14 @@ class SchedulerWeightUpdaterManager:
                 logger.info("WEG2-WAKE-KV-FIT skipped (%s: %s)", type(_exc).__name__, _exc)
                 _kv_floor = 0
             _unfit = kv_resume_fit_refusal(_kv_free, _kv_need, _kv_floor)
+            # xsn410 (20.09.): THE GROUP VERDICT SITS HERE, BETWEEN THE RESUME AND
+            # THE CLEAR HALF. Placed after the clear half (xsn409's fix), it
+            # deadlocked: the two resumed ranks ran the clear half's collective
+            # (_weg2_release_dormant_hold -> _weg2_group_min_flags) while the
+            # refused rank waited in the verdict's all_gather -- three silent
+            # ranks, the front's kv RPC never returned. Every path out of this
+            # resume half votes, the refused ones with False, so the clear half
+            # runs on no rank unless the whole group resumed.
             if _unfit is not None:
                 logger.error(
                     "W114 Weg2KvResumeRefused epoch=%s: %s. The kv_cache tag "
@@ -8436,7 +8507,7 @@ class SchedulerWeightUpdaterManager:
                     "of marking a grave.",
                     _kv_epoch, _unfit,
                 )
-                return False
+                return self._weg2_kv_group_verdict(False, _kv_epoch)
             try:
                 self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
             except Weg2TmsResumeRefused as _exc:
@@ -8445,7 +8516,9 @@ class SchedulerWeightUpdaterManager:
                     "cleared and NOT marked resumed; this rank stays DORMANT.",
                     _kv_epoch, _exc,
                 )
-                return False
+                return self._weg2_kv_group_verdict(False, _kv_epoch)
+            if not self._weg2_kv_group_verdict(True, _kv_epoch):
+                return False  # a sibling refused: the verdict paused this rank's pool again
             self._weg2_kv_resumed_epoch = _kv_epoch
             _weg2_ph("kv_resume")
             scheduler = self.scheduler
@@ -8564,10 +8637,16 @@ class SchedulerWeightUpdaterManager:
         from sglang.srt.weg2.wake_kv import wake_kv_plan as _wk_plan
         _kv_epoch = getattr(recv_req, "epoch", None)
         _kv_in = GPU_MEMORY_TYPE_KV_CACHE in tags
+        # xsn410: the fit is PER RANK (xsn377: TP1 funded, TP0 never) but the plan
+        # must be the GROUP's, because the resume half now carries a collective --
+        # one rank on "early" beside a sibling on "late" would deadlock there.
+        _fundable = (self._weg2_wake_kv_first_ok(tags) if _kv_in else False)
+        if _kv_in:
+            _fundable = self._weg2_kv_group_all(_fundable, "WAKE-KV-FIRST fundable")
         _plan = _wk_plan(
             kv_in_tags=_kv_in,
             weights_in_tags=any(is_weights_family_tag(t) for t in tags),
-            fundable=(self._weg2_wake_kv_first_ok(tags) if _kv_in else False),
+            fundable=_fundable,
             deferred=bool(self._weg2_kv_deferred),
             epoch=_kv_epoch, epoch_done=self._weg2_kv_epoch_done,
             weights_done=(self._weg2_weights_epoch_done is not None
@@ -8926,6 +9005,8 @@ class SchedulerWeightUpdaterManager:
                             _free_mid = self._weg2_free_bytes()
                             _floor_mid = int(self._weg2_corridor_floor_bytes() or 0)
                             _mid_ok = _kv_mid_ok(_free_mid, _floor_mid, _kv_need, _rest_need)
+                            # xsn410: group-uniform, the resume half carries a collective
+                            _mid_ok = self._weg2_kv_group_all(bool(_mid_ok), "WAKE-KV-MID tag=%s" % (tag,))
                             logger.info("WEG2-WAKE-KV-MID %s after tag=%s free=%s MiB floor=%d MiB kv=%d MiB "
                                         "remaining=%d tags(%d MiB)", "RESUME" if _mid_ok else "wait", tag,
                                         (int(_free_mid) >> 20) if _free_mid is not None else None,
@@ -9292,6 +9373,12 @@ class SchedulerWeightUpdaterManager:
             # refused resume that marked the epoch done would make the next
             # call answer "done: nothing to do" and leave the group dormant
             # forever with no second chance and no further line in the log.
+            # xsn409 (20.09.): a per-rank kv verdict split the TP group -- two ranks
+            # resumed and cleared, one refused (W114) and stayed DORMANT; the next
+            # collective of the scheduler loop then hung all three. The verdict is the
+            # GROUP's: any refused rank makes every rank step back to the dormant image.
+            # xsn410: the verdict moved INTO `_weg2_kv_resume_part` (between the
+            # resume and the clear half); `_weg2_kv_ok` is group-uniform here.
             if _weg2_kv_ok:
                 self._weg2_kv_epoch_done = _kv_epoch
                 self._weg2_kv_deferred = False

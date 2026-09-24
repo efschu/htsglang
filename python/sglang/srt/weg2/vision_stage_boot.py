@@ -578,9 +578,22 @@ class TowerHooks:
 
     # -- release ------------------------------------------------------------
     def release_tower(self, handle: Any) -> None:
+        """Drop the LAST reference, then return the cache to the card.
+
+        xsn410: the runtime hands the tower in a one-slot box (its own name
+        already cleared), because a plain argument leaves the caller's
+        reference alive and ``empty_cache`` then returns nothing -- the
+        2.1 GiB that stayed on card0 refused D's kv resume one flip later.
+        ``gc.collect`` catches a module held only through a cycle.
+        """
+        import gc
+
         import torch
 
+        if isinstance(handle, list):
+            handle.clear()
         del handle
+        gc.collect()
         torch.cuda.empty_cache()
 
 
