@@ -10,6 +10,10 @@ class LinearAttnKernelBase(ABC):
     and provides decode/extend/target_verify methods with a unified interface.
     """
 
+    # Upstream #33778: opt in only when target-verify kernels honor non-unit
+    # token strides on q/k/v (then the verify split stays a set of views).
+    supports_strided_target_verify_qkv: bool = False
+
     @abstractmethod
     def decode(
         self,
