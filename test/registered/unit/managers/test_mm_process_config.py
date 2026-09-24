@@ -71,6 +71,8 @@ class TestBaseProcessorConfigExtraction(unittest.TestCase):
 
         server_args = MagicMock()
         server_args.mm_process_config = mm_process_config
+        server_args.allowed_media_domains = []
+        server_args.media_url_max_file_size_mb = 64
 
         hf_config = MagicMock()
         mock_hf_processor = MagicMock()
@@ -319,6 +321,8 @@ class TestDoubleBosGuard(unittest.TestCase):
         server_args.mm_process_config = {}
         server_args.disable_fast_image_processor = True
         server_args.keep_mm_feature_on_device = True
+        server_args.allowed_media_domains = []
+        server_args.media_url_max_file_size_mb = 64
 
         mock_hf_processor = MagicMock()
         mock_hf_processor.__class__.__name__ = "TestProcessor"
