@@ -478,6 +478,14 @@ class Envs:
     # already missing from the free reading (x105 TP2: 943 MiB counted twice,
     # 311 + 293 ms credit waits).
     SGLANG_WEG2_CREDIT_LIVE_STAGING = EnvBool(True)
+    # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
+    # not carry (pad + D-extra rows, loaded from the host store) are issued on
+    # a side stream right behind the resume of their layer's chunk tag, i.e.
+    # DURING the legs; the expert-rearm after the legs only joins the stream
+    # (WEG2-RESUME expert-rearm ... prefetched=N rows wait_ms=... overlap=...).
+    # Same bytes from the same pinned store into the same buffers: no new host
+    # RAM, no VRAM reserve. 0 = the serial rearm of the 2026-09-24 form.
+    SGLANG_WEG2_REARM_PREFETCH = EnvBool(True)
     # TAIL_HANDOFF (H18, E1 of H17, fnFL2x132): P ends the prompt's last-but-one
     # chunk at c = floor_r(N-1) (r = QSA compress ratio) instead of the page,
     # and hands the GDN state after c plus the KV/QSA rows of the partial page

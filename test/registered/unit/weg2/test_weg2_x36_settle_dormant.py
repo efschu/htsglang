@@ -191,7 +191,8 @@ class TheWakeRearmsEveryModelOfTheRank(unittest.TestCase):
         i = src.index("_wake_models = self._weg2_wake_models()")
         blk = src[i:i + 3000]
         self.assertIn("for _m in _wake_models:\n                    _scratch.extend(zero_local_scratch(_m))", blk)
-        self.assertIn("for _m in _wake_models:\n                _l, _z = rearm_expert_offload_after_wake(_m)", blk)
+        # H31: the rearm takes the joined prefetch; still one call per wake model
+        self.assertIn("for _m in _wake_models:\n                _l, _z = rearm_expert_offload_after_wake(_m, prefetch=_rearm_pf)", blk)
         self.assertNotIn("_m = self._weg2_model_for_group(self._weg2_group_name())", blk)
 
 

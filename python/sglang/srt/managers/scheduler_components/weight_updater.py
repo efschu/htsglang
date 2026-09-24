@@ -1805,6 +1805,50 @@ class SchedulerWeightUpdaterManager:
         if line:
             logger.info("%s", line)
 
+    def _weg2_rearm_prefetch_begin(self, phases):
+        """H31: plan the Platztausch pad+extra rows of every wake model by the
+        tag their buffer lives under, so each tag's rows can be issued right
+        behind its resume. None = the serial rearm (switch off, no offload
+        layer with a map, or the plan failed -- named, never raised)."""
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_WEG2_REARM_PREFETCH.get():
+            return None
+        try:
+            from sglang.srt.layers.moe.expert_offload import ExpertRearmPrefetch
+            from sglang.srt.managers.weg2_memory_saver import (
+                GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+            )
+
+            target = getattr(getattr(getattr(self, "tp_worker", None), "model_runner", None),
+                             "model", None)
+            regions = [(m, GPU_MEMORY_TYPE_WEIGHTS if m is target else GPU_MEMORY_TYPE_WEIGHTS_DRAFT)
+                       for m in self._weg2_wake_models()]
+            pf = ExpertRearmPrefetch(regions, phases=phases)
+        except Exception as exc:  # noqa: BLE001 -- the serial rearm stays
+            logger.info("WEG2-REARM-PREFETCH off (%s: %s) -- the rearm loads serially",
+                        type(exc).__name__, str(exc)[:160])
+            return None
+        if not pf.planned_layers:
+            return None
+        logger.info("WEG2-REARM-PREFETCH plan layers=%d rows=%d tags=%d plan_ms=%.1f",
+                    pf.planned_layers, pf.planned_rows, len(pf.planned_tags), pf.plan_ms)
+        return pf
+
+    def _weg2_rearm_prefetch_issue(self, pf, tag):
+        """H31: right behind ``resume(tag)``. A failed issue drops the prefetch
+        for the rest of this wake (its layers load serially at the rearm);
+        what it already queued is still joined there."""
+        if pf is None:
+            return None
+        try:
+            pf.issue(tag)
+        except Exception as exc:  # noqa: BLE001 -- the rearm's own path raises it again
+            logger.warning("WEG2-REARM-PREFETCH issue tag=%s FAILED (%s: %s) -- the "
+                           "remaining layers load serially at the rearm",
+                           tag, type(exc).__name__, str(exc)[:160])
+        return pf
+
     def _weg2_restore_lmem_at_wake(self) -> None:
         """H15: put the limit saved at the park back. Never raises."""
         park = self._weg2_lmem_park
@@ -8811,6 +8855,9 @@ class SchedulerWeightUpdaterManager:
             _weg2_ph("pre_leg")
             shm0 = self._weg2_rss_shmem_mib()
             tag_bytes = {tag: self._weg2_tag_bytes(tag) for tag in weights_tags}
+            # H31: the Platztausch pad+extra rows, issued per tag behind its
+            # resume below and joined at the expert-rearm after the legs.
+            _rearm_pf = self._weg2_rearm_prefetch_begin(_weg2_ph_l)
             # S7 (#1273): tag -> the saver's own pass-1/pass-2 decomposition of
             # that tag's resume, or None where the instrument is absent.
             weg2_map_stats: Dict[str, Optional[Dict[str, float]]] = {}
@@ -8892,6 +8939,9 @@ class SchedulerWeightUpdaterManager:
                     # weg2xsn269: a refused remap raises here (rc from the
                     # hook's tms_resume_rc) instead of exit(1) inside cuMemCreate.
                     weg2_tms_resume(self.memory_saver_adapter, tag)
+                    # H31: this tag's buffers exist now -- their pad+extra rows
+                    # go on the side stream while the legs run on.
+                    _rearm_pf = self._weg2_rearm_prefetch_issue(_rearm_pf, tag)
                     # #1378 xsn62: DID THE RESUME ACTUALLY MAP ANYTHING?
                     #
                     # weg2xsn61 read the destination of the first copy-out and
@@ -9259,21 +9309,29 @@ class SchedulerWeightUpdaterManager:
             # hier ist KEIN Warnfall: ein Layer mit Resten der anderen Gruppe
             # rechnet falsch und sagt es nicht.
             from sglang.srt.layers.moe.expert_offload import (
+                REARM_PREFETCH_OFF_FIELDS,
                 rearm_expert_offload_after_wake,
             )
 
             _t_rearm = time.perf_counter()
+            # H31: join the side stream first -- only the rest is paid here.
+            _pf_join = _rearm_pf.join(_weg2_ph_l) if _rearm_pf is not None else None
             _rl = _rz = 0
             for _m in _wake_models:
-                _l, _z = rearm_expert_offload_after_wake(_m)
+                _l, _z = rearm_expert_offload_after_wake(_m, prefetch=_rearm_pf)
                 _rl += int(_l)
                 _rz += int(_z)
             if _rl:
+                _pf_rows = _pf_join.rows if _pf_join is not None else 0
                 logger.info(
                     "WEG2-RESUME expert-rearm layers=%d rows_from_store=%d "
-                    "ms=%.0f models=%d (Platztausch: Praefix kam ueber den Austausch, "
-                    "Pad+Extra aus dem Store, LRU verworfen)",
-                    _rl, _rz, (time.perf_counter() - _t_rearm) * 1000, len(_wake_models),
+                    "serial=%d %s ms=%.0f models=%d (Platztausch: Praefix kam ueber den "
+                    "Austausch, Pad+Extra aus dem Store, LRU verworfen; H31: prefetched "
+                    "= waehrend der Legs auf dem Seitenstrom, wait_ms = was der Wake "
+                    "davon noch selbst zahlt)",
+                    _rl, _rz + _pf_rows, _rz,
+                    _pf_join.fields() if _pf_join is not None else REARM_PREFETCH_OFF_FIELDS,
+                    (time.perf_counter() - _t_rearm) * 1000, len(_wake_models),
                 )
             else:
                 logger.warning(

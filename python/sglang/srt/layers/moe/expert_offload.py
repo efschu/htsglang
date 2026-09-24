@@ -4393,7 +4393,7 @@ class MoEExpertOffloadCache:
         copy_rows(self._pool_srcs, self._pool_dsts, src, dst, count)
         return len(pairs)
 
-    def rearm_after_wake(self) -> int:
+    def rearm_after_wake(self, rows_loaded: bool = False) -> int:
         """Nach dem Wake, bevor irgendein Forward laeuft (Platztausch).
 
         Der Resume mappt FRISCHE Seiten; der Austausch hat nur den Praefix
@@ -4403,25 +4403,21 @@ class MoEExpertOffloadCache:
         Adressen neu schreiben -- lagen sie unter einem pausierten Tag, sind
         sie jetzt Muell, und die Graphen lesen genau diese Adressen.
 
-        Gibt die Zahl der nachgeladenen Experten-Zeilen zurueck.
+        ``rows_loaded`` (H31): Pad+Extra hat :class:`ExpertRearmPrefetch`
+        schon waehrend der Legs geladen (und der Aufrufer hat dessen Strom
+        gejoint) -- dann bleibt nur der Rest (LRU, Tabellen).
+
+        Gibt die Zahl der HIER nachgeladenen Experten-Zeilen zurueck.
         """
         import torch
 
-        runs = getattr(self.layer, "_moe_offload_refill_runs", ()) or ()
         zeilen = 0
-        for attr, buf in self._resident.items():
-            spill = self._pinned.get(attr)
-            for z0, p0, n in runs:
-                if p0 < 0:
-                    buf[z0 : z0 + n].zero_()
-                    continue
-                if spill is None:
-                    raise RuntimeError(
-                        f"rearm_after_wake: Layer "
-                        f"{getattr(self.layer, 'layer_id', '?')} {attr} hat "
-                        f"Extra-Zeilen, aber keinen Store")
-                buf[z0 : z0 + n].copy_(spill[p0 : p0 + n], non_blocking=True)
-                zeilen += n
+        if not rows_loaded:
+            runs = getattr(self.layer, "_moe_offload_refill_runs", ()) or ()
+            zeilen = load_refill_rows(
+                [(attr, buf, self._pinned.get(attr))
+                 for attr, buf in self._resident.items()],
+                runs, layer_id=getattr(self.layer, "layer_id", "?"))
         self._scratch_holds.clear()
         if self._pool_ready:
             from sglang.srt.layers.moe.expert_pool_device import reinit_pool_tables
@@ -5693,7 +5689,53 @@ def _refuse_unbuilt_platztausch_buffer(layer, *, frac: float, why: str) -> None:
         f"E={num_local}): the buffer still spans every expert row.")
 
 
-def rearm_expert_offload_after_wake(model):
+def load_refill_rows(entries, runs, *, layer_id="?") -> int:
+    """Pad+Extra EINES Layers auf den laufenden Strom legen (Platztausch).
+
+    ``entries`` sind ``(attr, buf, spill)`` je Experten-Attribut, ``runs`` die
+    ``(zeile0, platz0, n)``-Laeufe der Karte (:func:`_refill_runs`). Ein Pad-Lauf
+    (``platz0 < 0``) wird genullt, jeder andere aus seinem festen Store-Platz
+    kopiert (gepinnter Host -> Karte, ``non_blocking``). Gibt die Zahl der
+    kopierten Zeilen zurueck. EINE Stelle fuer den seriellen Rearm, den
+    Presplit-Fall und den H31-Prefetch, damit die drei nie verschiedene Bytes
+    laden.
+    """
+    zeilen = 0
+    for attr, buf, spill in entries:
+        for z0, p0, n in runs:
+            if p0 < 0:
+                buf[z0 : z0 + n].zero_()
+                continue
+            if spill is None:
+                raise RuntimeError(
+                    f"rearm_after_wake: Layer {layer_id} {attr} hat "
+                    f"Extra-Zeilen, aber keinen Store")
+            buf[z0 : z0 + n].copy_(spill[p0 : p0 + n], non_blocking=True)
+            zeilen += n
+    return zeilen
+
+
+def _rearm_targets(module):
+    """``(cache, runs, entries)`` eines Moduls oder None -- genau die
+    Verzweigung von :func:`rearm_expert_offload_after_wake`: ein installierter
+    Cache nimmt seine eigenen Puffer (Runs am ``cache.layer``), sonst der
+    Presplit-Stash (derselbe Tensor, den der Install spaeter uebernimmt)."""
+    runs = getattr(module, "_moe_offload_refill_runs", None)
+    cache = getattr(module, "_expert_offload", None)
+    if cache is not None and isinstance(cache, MoEExpertOffloadCache):
+        if runs is None and not cache._pool_ready:
+            return None
+        c_runs = tuple(getattr(cache.layer, "_moe_offload_refill_runs", ()) or ())
+        return cache, c_runs, [(attr, buf, cache._pinned.get(attr))
+                               for attr, buf in cache._resident.items()]
+    presplit = getattr(module, "_moe_offload_presplit", None)
+    if not runs or not presplit:
+        return None
+    return None, tuple(runs), [(attr, buf, spill)
+                               for attr, (buf, spill) in presplit.items()]
+
+
+def rearm_expert_offload_after_wake(model, prefetch=None):
     """``(layer, zeilen)``: jeden Offload-Layer des Modells nach dem Wake
     wieder rechenfaehig machen (Platztausch). Laeuft auf der AUFWACHENDEN Seite,
     nachdem die Tags gemappt und die Austausch-Stuecke gesammelt sind, und
@@ -5704,33 +5746,295 @@ def rearm_expert_offload_after_wake(model):
     ueber seinen Presplit-Puffer bedient -- es ist derselbe Tensor, den der
     Install spaeter uebernimmt. Ohne Version-2-Karte gibt es keine
     `_moe_offload_refill_runs`, und die Funktion tut nichts.
+
+    ``prefetch`` (H31): ein GEJOINTER :class:`ExpertRearmPrefetch`. Layer, deren
+    Pad+Extra er schon geladen hat, laden hier nichts mehr (LRU und Tabellen
+    macht der Rearm weiter selbst); alle anderen laden wie bisher seriell.
+    ``zeilen`` zaehlt nur die HIER geladenen Zeilen.
     """
     import torch
 
+    if prefetch is not None and not prefetch.joined:
+        raise RuntimeError(
+            "rearm_expert_offload_after_wake: der H31-Prefetch ist nicht gejoint "
+            "-- sein Seitenstrom kann noch in die Puffer schreiben, die der "
+            "Rearm gleich an den ersten Forward gibt")
+    loaded = prefetch.loaded if prefetch is not None else frozenset()
     layers = zeilen = 0
     for module in model.modules():
-        runs = getattr(module, "_moe_offload_refill_runs", None)
-        cache = getattr(module, "_expert_offload", None)
-        if cache is not None and isinstance(cache, MoEExpertOffloadCache):
-            if runs is not None or cache._pool_ready:
-                zeilen += cache.rearm_after_wake()
-                layers += 1
+        target = _rearm_targets(module)
+        if target is None:
             continue
-        presplit = getattr(module, "_moe_offload_presplit", None)
-        if not runs or not presplit:
-            continue
-        for attr, (buf, spill) in presplit.items():
-            for z0, p0, n in runs:
-                if p0 < 0:
-                    buf[z0 : z0 + n].zero_()
-                    continue
-                buf[z0 : z0 + n].copy_(spill[p0 : p0 + n], non_blocking=True)
-                zeilen += n
+        cache, runs, entries = target
+        pre = id(module) in loaded
+        if cache is not None:
+            zeilen += cache.rearm_after_wake(rows_loaded=pre)
+        elif not pre:
+            zeilen += load_refill_rows(entries, runs,
+                                       layer_id=getattr(module, "layer_id", "?"))
         layers += 1
     if layers and torch.cuda.is_available():
         torch.cuda.synchronize()
     _warm_after_wake(model)
     return layers, zeilen
+
+
+def _buffer_mapped(buf) -> bool:
+    """Kennt der Treiber die Seiten dieses Puffers (erstes UND letztes Byte)?
+
+    Der H31-Prefetch schreibt nur in einen Puffer, dessen Tag schon wieder
+    gemappt ist. Die Tag-Zuordnung sagt WANN er es versucht; diese Lesung ist
+    der Riegel davor (``ptr_attrs`` kann nicht faulten, ein Fehler liest sich
+    als nicht gemappt -> der Layer bleibt beim seriellen Rearm). Ein
+    CPU-Tensor (Tests) gilt als gemappt."""
+    if not getattr(buf, "is_cuda", False):
+        return True
+    nbytes = int(buf.numel()) * int(buf.element_size())
+    if nbytes <= 0:
+        return True
+    from sglang.srt.weg2.weight_exchange_bounce import ptr_attrs
+
+    addr = int(buf.data_ptr())
+    return ptr_attrs(addr)[1] == 2 and ptr_attrs(addr + nbytes - 1)[1] == 2
+
+
+def _default_rearm_tag_of(name: str, region_tag: str) -> str:
+    """Der Tag, unter dem ein Experten-Puffer dieses Namens liegt -- die
+    Autoritaet des Austauschs (``tag_of_parameter_name``: die Region gewinnt
+    ueber den Namen, der Draft-Layer liegt unter ``weights_draft``)."""
+    from sglang.srt.weg2.weight_exchange import tag_of_parameter_name
+
+    return tag_of_parameter_name(name, region_tag=region_tag)
+
+
+@dataclass
+class _PrefetchLayer:
+    key: int
+    layer_id: object
+    runs: tuple
+    entries: list
+
+
+@dataclass(frozen=True)
+class RearmPrefetchJoin:
+    """Was der Join des H31-Prefetchs gemessen hat (Felder der Rearm-Zeile)."""
+
+    rows: int
+    layers: int
+    tags: int
+    wait_ms: float
+    pending_at_join: bool
+    issue_ms: float
+    span_ms: float
+    plan_ms: float
+    skipped_unmapped: int
+    left_serial: int
+    overlap: str
+
+    def fields(self) -> str:
+        return (
+            f"prefetched={self.rows} rows prefetch_layers={self.layers} "
+            f"prefetch_tags={self.tags} wait_ms={self.wait_ms:.1f} "
+            f"pending_at_join={'yes' if self.pending_at_join else 'no'} "
+            f"issue_ms={self.issue_ms:.1f} span_ms={self.span_ms:.0f} "
+            f"plan_ms={self.plan_ms:.1f} skipped_unmapped={self.skipped_unmapped} "
+            f"left_serial={self.left_serial} overlap={self.overlap or 'none'}"
+        )
+
+
+#: Die Felder der Rearm-Zeile, wenn kein Prefetch lief (Schalter aus, kein
+#: Offload-Layer mit Karte, oder der Plan ist gescheitert).
+REARM_PREFETCH_OFF_FIELDS = "prefetched=0 rows wait_ms=0.0 overlap=off"
+
+
+class _CudaStreamOps:
+    """Die vier Strom-Handgriffe des H31-Prefetchs gegen CUDA (Tests setzen
+    eine Attrappe ein, die Fertigzeiten simuliert)."""
+
+    def new_stream(self):
+        import torch
+
+        return torch.cuda.Stream()
+
+    def stream_ctx(self, stream):
+        import torch
+
+        return torch.cuda.stream(stream)
+
+    def after_current(self, stream) -> None:
+        import torch
+
+        stream.wait_stream(torch.cuda.current_stream())
+
+    def record(self, stream):
+        import torch
+
+        ev = torch.cuda.Event()
+        ev.record(stream)
+        return ev
+
+    def current_waits(self, event) -> None:
+        import torch
+
+        torch.cuda.current_stream().wait_event(event)
+
+
+def _default_stream_ops():
+    import torch
+
+    return _CudaStreamOps() if torch.cuda.is_available() else None
+
+
+class ExpertRearmPrefetch:
+    """fnFL2 H31: Pad+Extra des Platztauschs WAEHREND der Flip-Legs laden.
+
+    x141 (b07a9087cb): jede D-Zeile ueber die P-Stufe-0-Residenz hinaus ist
+    eine Extra-Zeile, die ``rearm_expert_offload_after_wake`` SERIELL nach den
+    Legs aus dem Store laedt (TP1: 232 Zeilen in 46 ms direkt vor der
+    Gruppen-Fence, der Rang wartete davor auf die letzte 5090-Lane). Die
+    Zeilenliste steht seit dem Load fest (Karte -> ``_moe_offload_refill_runs``),
+    der Zielpuffer existiert, sobald der Chunk-Tag seines Layers wieder gemappt
+    ist (``resume(tag)`` im Leg-Loop, hinter dessen Kredit), und der Store ist
+    gepinnter Host (``cudaHostRegister`` auf tmpfs): die Kopie braucht also
+    weder einen fruehen Kredit noch einen Host-Zwischenpuffer, nur einen
+    anderen Zeitpunkt.
+
+    Ablauf: :meth:`issue` direkt hinter ``resume(tag)`` legt die Laeufe aller
+    Layer dieses Tags auf einen Seitenstrom (die Austausch-Sammlung schreibt
+    nur den Praefix, die Bereiche sind disjunkt); :meth:`join` an der Stelle
+    des alten seriellen Ladens wartet nur den Rest, und der Rearm laedt fuer
+    diese Layer nichts mehr. Ein Layer, dessen Tag dieser Wake nicht mappt
+    oder dessen Puffer der Treiber nicht kennt, bleibt beim seriellen Pfad.
+
+    Kein neuer Dauer-Host-RAM, keine VRAM-Reserve: dieselben Bytes vom selben
+    Store in denselben Puffer, nur frueher.
+    """
+
+    def __init__(self, models_regions, *, phases=None, stream_ops="cuda",
+                 tag_of=None, mapped=None, clock=None):
+        import time
+
+        self._clock = clock or time.perf_counter
+        t0 = self._clock()
+        self._tag_of = tag_of or _default_rearm_tag_of
+        self._mapped = mapped or _buffer_mapped
+        # ``stream_ops`` None: synchron auf dem laufenden Strom (CPU-Tests)
+        self._ops = _default_stream_ops() if stream_ops == "cuda" else stream_ops
+        self.stream = None
+        self.event = None
+        self._by_tag: Dict[str, List[_PrefetchLayer]] = {}
+        self.planned_rows = 0
+        self.planned_layers = 0
+        for model, region in models_regions:
+            for name, module in model.named_modules():
+                target = _rearm_targets(module)
+                if target is None:
+                    continue
+                _cache, runs, entries = target
+                if not runs or not entries:
+                    continue  # nichts zu laden (Pool ohne Karte): der Rearm macht die Tabellen
+                tag = str(self._tag_of(f"{name}.{entries[0][0]}", region))
+                self._by_tag.setdefault(tag, []).append(_PrefetchLayer(
+                    key=id(module), layer_id=getattr(module, "layer_id", "?"),
+                    runs=runs, entries=entries))
+                self.planned_layers += 1
+                self.planned_rows += sum(n for _z, p, n in runs if p >= 0) * len(entries)
+        self.loaded: set = set()
+        self.rows = 0
+        self.tags_issued: List[str] = []
+        self.skipped_unmapped = 0
+        self.issue_ms = 0.0
+        self.plan_ms = (self._clock() - t0) * 1000
+        self.t_first = None
+        self.joined = False
+        self.failed = False
+        self._phases = phases
+        self._phase_idx = None
+
+    @property
+    def planned_tags(self) -> Tuple[str, ...]:
+        return tuple(self._by_tag)
+
+    def _ensure_stream(self):
+        if self.stream is None and self._ops is not None:
+            self.stream = self._ops.new_stream()
+        return self.stream
+
+    def issue(self, tag) -> int:
+        """Hinter ``resume(tag)``: die Laeufe der Layer dieses Tags auf den
+        Seitenstrom legen. Gibt die Zahl der Zeilen zurueck (0: kein Layer)."""
+        import contextlib
+
+        if self.joined:
+            raise RuntimeError("ExpertRearmPrefetch.issue nach dem Join")
+        if self.failed:
+            return 0  # nach einem Fehler laedt der Rest seriell
+        layers = self._by_tag.pop(str(tag), None)
+        if not layers:
+            return 0
+        t0 = self._clock()
+        if self.t_first is None:
+            self.t_first = t0
+            self._phase_idx = len(self._phases) if self._phases is not None else None
+        stream = self._ensure_stream()
+        ctx = self._ops.stream_ctx(stream) if stream is not None else contextlib.nullcontext()
+        n = 0
+        with ctx:
+            if stream is not None:
+                # der Seitenstrom ueberholt nichts, was der laufende Strom auf
+                # diesen Adressen schon eingereiht hat (nach dem Resume nichts,
+                # aber die Ordnung ist der Vertrag, nicht die Hoffnung)
+                self._ops.after_current(stream)
+            try:
+                for lay in layers:
+                    if not all(self._mapped(buf) for _a, buf, _s in lay.entries):
+                        self.skipped_unmapped += 1
+                        continue
+                    n += load_refill_rows(lay.entries, lay.runs, layer_id=lay.layer_id)
+                    self.loaded.add(lay.key)
+            except BaseException:
+                # was schon eingereiht ist, deckt das Event unten; der Layer,
+                # der scheiterte, und alle dahinter bleiben beim seriellen Pfad
+                self.failed = True
+                raise
+            finally:
+                if stream is not None:
+                    self.event = self._ops.record(stream)
+                self.rows += n
+                self.tags_issued.append(str(tag))
+                self.issue_ms += (self._clock() - t0) * 1000
+        return n
+
+    def join(self, phases=None) -> RearmPrefetchJoin:
+        """Den laufenden Strom auf den Seitenstrom warten lassen und blockieren,
+        bis die Kopien fertig sind. Misst, was der Wake davon noch selbst
+        bezahlt (``wait_ms``, 0 = ganz versteckt), und nennt die Phasen, die
+        zwischen dem ersten :meth:`issue` und hier liefen."""
+        t0 = self._clock()
+        pending = False
+        if self.event is not None:
+            try:
+                pending = not bool(self.event.query())
+            except Exception:  # noqa: BLE001 -- nur die Lesung, das Warten folgt
+                pending = True
+            # GPU-Ordnung fuer alles, was der Wake danach einreiht, UND
+            # Host-Warten: der Rearm gibt die Puffer gleich an den Forward
+            self._ops.current_waits(self.event)
+            self.event.synchronize()
+        t1 = self._clock()
+        self.joined = True
+        names = []
+        ph = phases if phases is not None else self._phases
+        if ph is not None and self._phase_idx is not None:
+            names = [str(nm) for nm, _ms in list(ph)[int(self._phase_idx):]]
+        left = self.planned_layers - len(self.loaded)
+        return RearmPrefetchJoin(
+            rows=self.rows, layers=len(self.loaded), tags=len(self.tags_issued),
+            wait_ms=(t1 - t0) * 1000, pending_at_join=pending,
+            issue_ms=self.issue_ms,
+            span_ms=0.0 if self.t_first is None else (t1 - self.t_first) * 1000,
+            plan_ms=self.plan_ms, skipped_unmapped=self.skipped_unmapped,
+            left_serial=left, overlap="+".join(names))
 
 
 def _warm_after_wake(model):
