@@ -147,9 +147,17 @@ def test_a_single_budget_arm_is_unchanged():
     sample's OWN arithmetic (`pids=[]` measures a zero image, so the image term
     is 0 here) rather than a hand-rolled formula.
     """
+    # H44b: the sample's image is the RssShmem of `pids=[os.getpid()]` (#1390),
+    # i.e. THIS pytest process -- zero only when no earlier test in the same
+    # process left a shared mapping behind (POSIX semaphores of the lane
+    # tests, 15-103 KiB measured), and the tolerance below is 1 KiB. So the
+    # expectation subtracts the image the sample itself recorded
+    # (`rss_shmem_gib`, residual = nonreclaim - charges - image) instead of
+    # assuming 0; the arithmetic under test is unchanged.
     expect = hl._boot_charges_gib(hl.charge_terms(1, 600, RANKS, _images(0.0)))
     r = _sample(arm={"s_gb": 1, "m_mib": 600})
-    assert abs(float(r["run_residual_gib"]) - (50.0 - expect)) < 1e-6
+    img = float(r["rss_shmem_gib"])
+    assert abs(float(r["run_residual_gib"]) - (50.0 - expect - img)) < 1e-6
     # Explicit S_D == S must agree with omitting it entirely.
     r2 = _sample(arm={"s_gb": 1, "m_mib": 600, "s_gb_d": 1})
     assert abs(float(r2["run_residual_gib"]) - float(r["run_residual_gib"])) < 1e-6
