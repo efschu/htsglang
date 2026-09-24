@@ -414,6 +414,27 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 logger = logging.getLogger(__name__)
 
+#: 27B line, 2026-09-24 (operator order after weg2xsn420): group P gives an
+#: INNER mamba anchor's arena reference back once its chain moved past it
+#: (UnifiedRadixCache._weg2_release_inner_anchor) and holds the END anchors one
+#: phase across the flip's reset (_weg2_carrier_hold). Default off; "1" arms both.
+INNER_ANCHOR_RELEASE_ENV = "SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE"
+
+
+def _weg2_inner_anchor_release_on() -> bool:
+    """Group P of a weg2 boot (SGLANG_WEG2_GROUP=P), unless switched off --
+    and only while the #1481 end-anchor mark is armed (SGLANG_WEG2_END_ANCHOR,
+    which the launcher always sets on P): the mark is what keeps the hand-back
+    anchor out of the release."""
+    if os.environ.get("SGLANG_WEG2_GROUP", "").strip().upper() != "P":
+        return False
+    if not _WEG2_END_ANCHOR:
+        return False
+    # Default OFF until the metal proves it (operator/user 2026-09-24); the
+    # arm switches it on with =1.
+    return os.environ.get(INNER_ANCHOR_RELEASE_ENV, "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
 
 def _weg2_release_drain_cap() -> int:
     """Entries of the host-release queues drained per scheduling pass; 0 = all
@@ -934,11 +955,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not getattr(getattr(cc, "mem_pool_host", None), "arena_read", False):
             return 0
         per_pool: dict = {}
+        end_rows: dict = {}
+        hold_end = _weg2_inner_anchor_release_on()
         skipped = 0
+        visited = 0
         stack = list(root.children.values())
         while stack:
             node = stack.pop()
             stack.extend(node.children.values())
+            visited += 1
             if getattr(node, "write_through_pending_id", None) is not None:
                 skipped += 1
                 continue
@@ -954,9 +979,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         or getattr(comp, "_swa_kv_pool_host", None))
                 if pool is None or not hasattr(pool, "release_tree_rows"):
                     continue
+                if (hold_end and comp.component_type == ComponentType.MAMBA
+                        and getattr(node, "_weg2_end_anchor", False)):
+                    # the hand-back anchor: held one more P phase, see
+                    # _weg2_carrier_hold
+                    end_rows.setdefault(id(pool), (pool, []))[1].append(cd.host_value)
+                    continue
                 per_pool.setdefault(id(pool), (pool, []))[1].append(cd.host_value)
         released = failed = 0
         first_error = None
+        if hold_end and visited:
+            # Rotated once per P phase: the sleep flushes TWICE (the front's
+            # quiesce and release_memory_occupation) and an idle flip resets
+            # an empty tree -- an empty reset keeps the standing hold.
+            released += self._weg2_carrier_hold(end_rows)
         for pool, values in per_pool.values():
             # Best effort per pool: the reset that follows must happen
             # whatever one pool says (before this release it leaked them all).
@@ -3341,6 +3377,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     mp.complete_write(mhv)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("#1427 mamba complete raised: %r", exc)
+                else:
+                    self._weg2_release_inner_anchor(node, mp)
         node.l3_present = True
         n = getattr(self, "_1427_direct_n", 0) + 1
         self._1427_direct_n = n
@@ -3348,6 +3386,94 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             logger.info("#1427 DIRECT-WRITE ACK node=%s pages=%d completed_for_all=%d (n=%d)",
                         getattr(node, "id", "?"), int(hv.numel()), done, n)
         return True
+
+    def _weg2_release_inner_anchor(self, node, mp) -> bool:
+        """Group P: `node`'s anchor just completed, so the nearest anchor ABOVE
+        it on the chain is INNER now -- give its arena reference back.
+
+        MEASURED NEED (weg2xsn420): P writes one mamba anchor per written node
+        -- per 4096-token chunk (chunked_prefill_size 4096,
+        mamba_checkpoint_interval None = per node, the user's law since
+        27./28.08, no grid) plus the #1481 N-1 split -- and its tree held a
+        reader reference on every one until the flip's reset: one 4x98k
+        phase took ~102 of the 112 slots of the mamba arena, 6x262k would
+        take 384. The hand-back needs ONE anchor per prompt (the #1481 end
+        anchor N-1, `_weg2_end_anchor`); every other is prefix cache. Released
+        here, an inner anchor stays COMPLETE in the arena (findable by stem
+        for a later prefix hit) and is what a claim may drop when it needs
+        room (`_evict_for_claim`, no disk I/O). The tree's host value is
+        tombstoned BEFORE the reference drops -- a slot id the tree keeps
+        without a reference could be reused under it.
+
+        Kept: an `_weg2_end_anchor` node (the hand-back; held across the reset
+        by `_weg2_carrier_hold`), a host-locked or write-pending one. Host
+        bookkeeping only (one `free`, no sync, no copy). SGLANG_WEG2_GROUP=P
+        only, armed by SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE=1 (default off)."""
+        if not _weg2_inner_anchor_release_on():
+            return False
+        mc = self.components.get(ComponentType.MAMBA)
+        if mc is None:
+            return False
+        a = getattr(node, "parent", None)
+        while a is not None and a is not self.root_node:
+            if a.component_data[ComponentType.MAMBA].host_value is not None:
+                break
+            a = getattr(a, "parent", None)
+        if a is None or a is self.root_node:
+            return False
+        cd = a.component_data[ComponentType.MAMBA]
+        why = None
+        if getattr(a, "_weg2_end_anchor", False):
+            why = "end_anchor"
+        elif cd.host_lock_ref > 0:
+            why = "host_locked"
+        elif getattr(a, "write_through_pending_id", None) is not None:
+            why = "write_pending"
+        elif not (cd.host_value.numel() and mp.is_arena_id(int(cd.host_value.min()))):
+            why = "not_arena"
+        if why is None:
+            try:
+                mc.evict_component(a, target=EvictLayer.HOST)
+            except Exception as exc:  # noqa: BLE001 -- a release never breaks an ack
+                why = f"raised:{type(exc).__name__}"
+        k = getattr(UnifiedRadixCache, "_weg2_inner_release_n", 0) + 1
+        UnifiedRadixCache._weg2_inner_release_n = k
+        if why is None:
+            done = getattr(UnifiedRadixCache, "_weg2_inner_released", 0) + 1
+            UnifiedRadixCache._weg2_inner_released = done
+        if k <= 8 or k % 256 == 0 or (why and why.startswith("raised")):
+            logger.info(
+                "WEG2 INNER-ANCHOR %s node=%s below=%s released=%d of %d asked (P: the chain "
+                "moved past; the anchor stays COMPLETE in the arena as prefix cache)",
+                "released" if why is None else f"kept({why})", getattr(a, "id", "?"),
+                getattr(node, "id", "?"), getattr(UnifiedRadixCache, "_weg2_inner_released", 0), k)
+        return why is None
+
+    def _weg2_carrier_hold(self, end_rows: dict) -> int:
+        """The flip's reset on group P: hold the END anchors' references one
+        more P phase (released at the NEXT reset), give back the ones held at
+        the previous reset. Returns the references released now.
+
+        Why one phase is enough: the front flips D->P only once D is drained
+        (#1011), and D admits every prompt of a P phase -- the queued ones
+        through D-REFILL -- before that; each admission's prefetch takes D's
+        own reference. Without the hold, D's own claims in that D phase (its
+        tails, its short prefills) could drop a queued prompt's end anchor
+        from a full arena before D reads it (#1035c capped -> W31 -> a second
+        prefill). `end_rows` is {id(pool): (pool, [host values])}."""
+        prev = getattr(self, "_weg2_carrier_rows", None) or {}
+        released = 0
+        for pool, values in prev.values():
+            try:
+                released += int(pool.release_tree_rows(torch.cat([v.reshape(-1).cpu() for v in values])))
+            except Exception as exc:  # noqa: BLE001 -- best effort, named
+                logger.warning("WEG2 CARRIER-HOLD release raised: %r", exc)
+        self._weg2_carrier_rows = end_rows
+        held = sum(sum(int(v.numel()) for v in vals) for _, vals in end_rows.values())
+        if held or released:
+            logger.info("WEG2 CARRIER-HOLD held=%d end-anchor row(s) of this phase, released=%d "
+                        "of the previous one (group P, one phase)", held, released)
+        return released
 
     _1472_issued_at: dict = {}
 
