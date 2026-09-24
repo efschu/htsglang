@@ -691,7 +691,22 @@ def p_draft_kv_flags(extra_d: Sequence[str]) -> Tuple[str, ...]:
     free to run a shorter chain, and the producer never proposes anyway.
 
     ``--speculative-draft-kv-only`` is P's alone and is never taken from D.
+
+    --spec-form DFLASH (weg2xsn415, 24.09.): P carries the EXTERNAL DFlash2
+    draft, i.e. :func:`spec_flags` ``(producer=True)`` -- algorithm DFLASH,
+    the draft checkpoint path and the block, exactly the P argv of weg2xsn411
+    (desk/dflash2-pick eb5d04453f, whose argv_p called ``spec_flags(producer=
+    True)`` inline). The merge f295e098eb of that line into this one kept
+    THIS helper at both argv_p call sites, and it only knows the NEXTN
+    constants: P shipped ``--speculative-algorithm NEXTN`` and loaded the
+    TARGET checkpoint's MTP head as its draft (fc = eh_proj, int8
+    [10240, 5120] + per-channel f32 scale [5120, 1]) while D loaded DFlash2
+    (fc packed int32 + bf16 group scales) -- W10 refused xsn414 on the
+    identity, W68 refused xsn415's first flip on ``fc.weight_scale`` itemsize
+    4 (P) vs 2 (D).
     """
+    if spec_form_is_dflash():
+        return tuple(spec_flags(producer=True))
     want = {
         "--speculative-algorithm": SPEC_ALGORITHM,
         "--speculative-num-steps": str(SPEC_NUM_STEPS),
@@ -5600,6 +5615,55 @@ def p_produces_draft_pages() -> bool:
 W10_SKIPPED_NO_DRAFT_PAGES = (
     "W10 SKIPPED: P produces no draft pages (--dflash-produce-on-p off)"
 )
+
+#: The argv tokens that decide WHICH drafter checkpoint a group loads.
+_DRAFTER_ARGV_FLAGS = (
+    "--speculative-algorithm",
+    "--speculative-draft-model-path",
+    "--speculative-draft-model-revision",
+)
+
+
+def _last_flag_values(argv: Sequence[str], flags: Sequence[str]) -> Dict[str, Optional[str]]:
+    """argparse semantics: the LAST occurrence of a flag wins."""
+    out: Dict[str, Optional[str]] = {f: None for f in flags}
+    toks = list(argv)
+    for i, tok in enumerate(toks):
+        if tok in out and i + 1 < len(toks):
+            out[tok] = toks[i + 1]
+        else:
+            for f in flags:
+                if tok.startswith(f + "="):
+                    out[f] = tok[len(f) + 1:]
+    return out
+
+
+def check_drafter_argv_agreement(argv_p: Sequence[str], d_spec_argv: Sequence[str]) -> Dict[str, object]:
+    """W10a (weg2xsn415, 24.09.): P and D must load the SAME drafter checkpoint.
+
+    The flip's weight exchange pairs group P's ``weights_draft`` tensors with
+    group D's by name, so a P that carries a different drafter than D cannot
+    flip at all (xsn415: P NEXTN/MTP head vs D DFlash2 -> W68 ``fc.weight_scale``
+    itemsize 4 vs 2 at the first flip, after both groups had loaded). W10
+    graded this only after both groups were up, from their log lines -- and
+    W10 is skipped under --dflash-produce-on-p off. This is the PRE-SPAWN
+    form, read off the argv the ranks will run: ``d_spec_argv`` is group D's
+    speculative family plus its ``--extra-d`` (argv_d appends extra last, so
+    last-wins is argv_d's own precedence). A P without the producer flag
+    carries no drafter and is not graded."""
+    p_carries = "--speculative-draft-kv-only" in list(argv_p)
+    p = _last_flag_values(argv_p, _DRAFTER_ARGV_FLAGS)
+    d = _last_flag_values(d_spec_argv, _DRAFTER_ARGV_FLAGS)
+    verdict = {"p_carries": p_carries, "P": p, "D": d, "match": (not p_carries) or p == d}
+    if not verdict["match"]:
+        raise Weg2LaunchRefused(
+            "W10a Weg2DrafterArgvMismatch: group P would load drafter "
+            f"{p} but group D {d} -- the flip exchange pairs weights_draft by "
+            "tensor name and cannot name two checkpoints (weg2xsn415: W68 "
+            "fc.weight_scale itemsize 4 on P vs 2 on D at the first flip). "
+            "Refused before any rank spawns."
+        )
+    return verdict
 
 
 def gate_w10(log_p: str, log_d: str, log, *, p_produces_draft_pages: bool) -> Dict[str, object]:
@@ -14415,6 +14479,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p_max_total_tokens=int(cut.pool_tokens),
         hicache_disabled=hicache_disabled,
         weights_cpu_backup=weights_cpu_backup_armed)
+    # W10a (weg2xsn415): the drafter P ships must be D's, checked on the argv
+    # before any rank spawns (W10 grades the logs only after both are up and
+    # is skipped under --dflash-produce-on-p off).
+    _w10a = check_drafter_argv_agreement(
+        shipped_argv_p, list(spec_flags(producer=False)) + shlex.split(ns.extra_d)
+    )
+    log(f"W10a DRAFTER-ARGV P={_w10a['P']} D={_w10a['D']} p_carries={_w10a['p_carries']} "
+        f"match={_w10a['match']}")
     # TRAIN FIX 5: THE SENTINEL PREMISE, PROVEN ON EVERY BOOT.  The form key that
     # gated the ring table was hashed over an argv built with sentinel ledger
     # terms, which is sound only while every flag those sentinels reach is
