@@ -14,7 +14,11 @@ This module closes ONE window at a time and prints it:
     WEG2-VRAM-PEAK rank=0 phase=chunk rows=16384 n=1 t0_unix_ms=.. t_unix_ms=..
       window_ms=.. peak_allocated_mib=.. peak_reserved_mib=.. start_allocated_mib=..
       transient_mib=.. allocated_mib=.. reserved_mib=.. card_free_start_mib=..
-      card_free_mib=.. card_total_mib=..
+      card_free_mib=.. card_total_mib=.. alloc_retries=.. ooms=.. alloc_retries_total=..
+
+``alloc_retries`` / ``ooms`` (H59): the window's delta of the caching
+allocator's cumulative ``num_alloc_retries`` / ``num_ooms`` -- ``na`` for the
+first window (no start reading) or a backend without the counters.
 
 * ``phase=chunk`` -- every extend forward of the target runner (P: one line
   per chunk; D: its extend after a flip).
@@ -71,7 +75,21 @@ _STATE: Dict[str, Any] = {
     "free_start": None,      # card free bytes at window start
     "rounds": 0,
     "rank": None,
+    # H59: the allocator's cumulative retry/OOM counters at window start
+    # (``memory_stats()`` ``num_alloc_retries`` / ``num_ooms``; neither
+    # ``reset_peak_memory_stats`` nor this module resets them)
+    "retries0": None,
+    "ooms0": None,
 }
+
+#: H59: the two cumulative allocator counters the line reports as a delta per
+#: window. ``num_alloc_retries`` counts ``release_cached_blocks`` + retry in
+#: the caching allocator's malloc path (cudaMalloc failed at the card limit:
+#: device sync, every unsplit cached block freed, allocation retried) --
+#: fnFL2x166 PP0 lost ~0.6 s per 16k chunk to it in chunks 4-6, and fnFL2x164
+#: died on the same path (the retry freed too little). ``num_ooms`` counts the
+#: allocations that failed even after that.
+RETRY_KEYS = ("num_alloc_retries", "num_ooms")
 
 
 def _enabled() -> bool:
@@ -95,13 +113,23 @@ def _round_every() -> int:
 def _peaks(cuda):
     """(peak_alloc, peak_reserved, alloc_now, reserved_now) in bytes, one
     ``memory_stats()`` read."""
+    return _stats(cuda)[:4]
+
+
+def _stats(cuda):
+    """``_peaks`` plus the cumulative ``num_alloc_retries`` / ``num_ooms``
+    (``None`` when the backend does not report them) -- the same single
+    ``memory_stats()`` read."""
     st = cuda.memory_stats()
+    counters = tuple(
+        (int(st[k]) if k in st and st[k] is not None else None) for k in RETRY_KEYS
+    )
     return (
         int(st.get("allocated_bytes.all.peak", 0)),
         int(st.get("reserved_bytes.all.peak", 0)),
         int(st.get("allocated_bytes.all.current", 0)),
         int(st.get("reserved_bytes.all.current", 0)),
-    )
+    ) + counters
 
 
 def cum_peak_allocated(cuda) -> int:
@@ -119,12 +147,19 @@ def reset_since_pools() -> None:
     _STATE["start_alloc"] = None
     _STATE["free_start"] = None
     _STATE["rounds"] = 0
+    _STATE["retries0"] = None
+    _STATE["ooms0"] = None
+
+
+def _delta(now: Optional[int], start: Optional[int]) -> str:
+    """Counter delta over the window, ``na`` without a start or a reading."""
+    return "na" if now is None or start is None else str(max(0, int(now) - int(start)))
 
 
 def _close(cuda, rank: int, phase: str, extra: str = "", clock=time.time) -> Optional[str]:
     """Close the open window: read, fold, re-base, print. Returns the line."""
     try:
-        pa, pr, a, r = _peaks(cuda)
+        pa, pr, a, r, retries, ooms = _stats(cuda)
     except Exception as exc:  # noqa: BLE001
         logger.debug("%s skipped: %s", MARKER, exc)
         return None
@@ -143,15 +178,20 @@ def _close(cuda, rank: int, phase: str, extra: str = "", clock=time.time) -> Opt
     t0 = _STATE["t0"]
     start_alloc = _STATE["start_alloc"]
     free_start = _STATE["free_start"]
+    retries0, ooms0 = _STATE["retries0"], _STATE["ooms0"]
     n = int(_STATE["rounds"])
     _STATE["t0"] = now
     _STATE["start_alloc"] = a
     _STATE["free_start"] = free
     _STATE["rounds"] = 0
+    _STATE["retries0"] = retries
+    _STATE["ooms0"] = ooms
 
     def mib(x):
         return "na" if x is None or x < 0 else f"{x / MIB:.0f}"
 
+    # H59: appended AFTER card_total_mib, so every existing reader of the line
+    # (vram_hires_report, p_card_chunk.chunk_windows) parses it unchanged
     line = (
         f"{MARKER} rank={rank} phase={phase}{extra} n={n if phase == 'round' else 1 if phase == 'chunk' else 0} "
         f"t0_unix_ms={'na' if t0 is None else int(t0 * 1000)} t_unix_ms={int(now * 1000)} "
@@ -160,7 +200,9 @@ def _close(cuda, rank: int, phase: str, extra: str = "", clock=time.time) -> Opt
         f"start_allocated_mib={mib(start_alloc)} "
         f"transient_mib={'na' if start_alloc is None else mib(pa - start_alloc)} "
         f"allocated_mib={mib(a)} reserved_mib={mib(r)} "
-        f"card_free_start_mib={mib(free_start)} card_free_mib={mib(free)} card_total_mib={mib(total)}"
+        f"card_free_start_mib={mib(free_start)} card_free_mib={mib(free)} card_total_mib={mib(total)} "
+        f"alloc_retries={_delta(retries, retries0)} ooms={_delta(ooms, ooms0)} "
+        f"alloc_retries_total={'na' if retries is None else retries}"
     )
     logger.info(line)
     return line

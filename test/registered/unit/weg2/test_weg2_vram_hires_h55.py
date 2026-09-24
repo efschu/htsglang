@@ -480,6 +480,17 @@ class TestReport(unittest.TestCase):
             # without the private-free term the headroom is not claimed
             bare = vr.inproc_rows(None, {"P": vr.peak_lines(p)}, {}, (1, 0, 2))
             self.assertIsNone([x for x in bare if x["phase"] == "chunk"][0]["kopf_torch_min"])
+            # a line without the H59 counters has no retry figure (not zero)
+            self.assertIsNone(r["retries"])
+            with open(p, "a") as f:
+                f.write(line.rstrip("\n") + " alloc_retries=3 ooms=0 alloc_retries_total=5\n")
+                f.write(line.rstrip("\n") + " alloc_retries=na ooms=na alloc_retries_total=5\n")
+                f.write(line.rstrip("\n") + " alloc_retries=2 ooms=1 alloc_retries_total=7\n")
+            rows2 = vr.inproc_rows(None, {"P": vr.peak_lines(p)}, {}, (1, 0, 2),
+                                   private_free={"P": vr.private_free_by_rank(p)})
+            r2 = [x for x in rows2 if x["phase"] == "chunk"][0]
+            # summed over the phase's windows: 3 + 2 retries, 0 + 1 OOM
+            self.assertEqual((r2["n"], r2["retries"], r2["ooms"]), (4, 5, 1))
 
     def test_without_peak_lines_windows_fall_back_to_seconds(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -604,6 +615,45 @@ class TestPeakWindows(unittest.TestCase):
         self.assertEqual(b["start_allocated_mib"], "20480")
         self.assertRegex(b["t_unix_ms"], r"^\d{13}$")
         self.assertNotEqual(b["window_ms"], "na")
+
+    def test_h59_allocator_retries_and_ooms_are_a_delta_per_window(self):
+        """fnFL2x166 PP0 lost ~0.6 s per chunk to release_cached_blocks +
+        retry; x164 died on that path. The line carries the window's delta of
+        the cumulative counters (never reset by reset_peak_memory_stats)."""
+        stats = {"num_alloc_retries": 7, "num_ooms": 0}
+        real = self.cuda.memory_stats
+        self.cuda.memory_stats = lambda: {**real(), **stats}
+        a = self._chunk(3700)
+        self.assertEqual((a["alloc_retries"], a["ooms"], a["alloc_retries_total"]), ("na", "na", "7"))
+        stats["num_alloc_retries"] = 11
+        b = self._chunk(3700)
+        self.assertEqual((b["alloc_retries"], b["ooms"], b["alloc_retries_total"]), ("4", "0", "11"))
+        stats["num_ooms"] = 1
+        c = self._chunk(100)
+        self.assertEqual((c["alloc_retries"], c["ooms"]), ("0", "1"))
+        # the existing fields still end with card_total_mib, the new ones follow it
+        line = "WEG2-VRAM-PEAK " + " ".join("%s=%s" % kv for kv in c.items())
+        self.assertLess(line.index("card_total_mib="), line.index("alloc_retries="))
+
+    def test_h59_without_the_counters_the_fields_say_na(self):
+        a = self._chunk(3700)
+        b = self._chunk(1200)
+        self.assertEqual((a["alloc_retries"], b["alloc_retries"], b["ooms"]), ("na", "na", "na"))
+        self.assertEqual(b["alloc_retries_total"], "na")
+
+    def test_h59_the_p_card_reader_parses_the_extended_line(self):
+        from sglang.srt.planner import p_card_chunk as pc
+
+        stats = {"num_alloc_retries": 2, "num_ooms": 0}
+        real = self.cuda.memory_stats
+        self.cuda.memory_stats = lambda: {**real(), **stats}
+        self._chunk(3700)
+        with self.assertLogs(vpw.logger, "INFO") as cm:
+            self.cuda.alloc(3700 << 20)
+            self.cuda.free(3700 << 20)
+            line = vpw.on_forward_end(_Runner(), _FB("extend", 16384), self.cuda)
+        w = pc.chunk_windows("[2026-09-24 20:19:41 PP0] " + line)[0][0]
+        self.assertEqual((w.rows, w.transient_h55_mib), (16384, 3700.0))
 
     def test_since_pools_peak_survives_the_rebase(self):
         """[vram-peak]/WEG2-GRAPH-POOL read peak_mib 'since the pools'; the

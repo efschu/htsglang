@@ -395,8 +395,13 @@ def inproc_rows(tr: Optional[Trace], peaks_by_group: Dict[str, List[Dict[str, st
             key = (grp, d.get("rank", "?"), ph)
             a = agg.setdefault(key, {"n": 0, "peak_reserved": 0, "transient": 0, "card_free_min": None,
                                      "nvml_proc_max": None, "tr_plan": None, "persist": None,
-                                     "kopf_torch_min": None})
+                                     "kopf_torch_min": None, "retries": None, "ooms": None})
             a["n"] += 1
+            # H59: allocator retries/OOMs of the window (delta; 'na' = no start)
+            for fld, dst in (("alloc_retries", "retries"), ("ooms", "ooms")):
+                v = _num(d, fld)
+                if v is not None:
+                    a[dst] = (a[dst] or 0) + v
             for fld, dst in (("peak_reserved_mib", "peak_reserved"), ("transient_mib", "transient")):
                 v = d.get(fld, "na")
                 if v != "na":
@@ -466,13 +471,14 @@ def render(tr: Trace, crow: List[Dict], irow: List[Dict]) -> str:
         out.append("IN-PROZESS (WEG2-VRAM-PEAK, torch-Allokator je Fenster)")
         out.append(f"{'grp':3} {'rank':>4} {'phase':16} {'card':>5} {'n':>4} {'peak_res':>8} {'transient':>9} "
                    f"{'plan_tr':>7} {'tr_plan':>7} {'persist':>7} {'kopf_torch':>10} "
-                   f"{'free_min':>8} {'nvml_proc':>9} {'ausser_torch':>12}")
+                   f"{'free_min':>8} {'nvml_proc':>9} {'ausser_torch':>12} {'retries':>7} {'ooms':>4}")
         for r in irow:
             out.append(f"{r['group']:3} {r['rank']:>4} {r['phase'][:16]:16} "
                        f"{('nvml' + str(r['card'])) if r['card'] is not None else '-':>5} {r['n']:>4} "
                        f"{_f(r['peak_reserved'], 8)} {_f(r['transient'], 9)} {_f(r['plan_transient'])} "
                        f"{_f(r.get('tr_plan'))} {_f(r.get('persist'))} {_f(r.get('kopf_torch_min'), 10)} "
-                       f"{_f(r['card_free_min'], 8)} {_f(r['nvml_proc_max'], 9)} {_f(r['ausser_torch'], 12)}")
+                       f"{_f(r['card_free_min'], 8)} {_f(r['nvml_proc_max'], 9)} {_f(r['ausser_torch'], 12)} "
+                       f"{_f(r.get('retries'))} {_f(r.get('ooms'), 4)}")
         out.append("  transient = peak - START (H55); tr_plan = peak - allocated NACH dem Fenster (die "
                    "Planer-Definition, gegen plan_tr zu lesen); persist = was das Fenster liegen laesst "
                    "(im Planer das Chunk-Wachstum); kopf_torch = card_free + reserved - peak - privat_frei "

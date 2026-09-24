@@ -522,6 +522,8 @@ _RX_D_RELEASE = re.compile(
 _RX_FLOOR = re.compile(_RANK + r"PP(\d+)\] WEG2-CREDIT-FLOOR card=\S+ group=P floor_mib=(\d+)")
 _RX_ROWS = re.compile(
     _RANK + r"(PP|TP)(\d+)\] MoE expert-offload active on layer \d+: .*?\(buffer=(\d+),")
+#: H59: derselbe Zeilentyp, der Layer je PP-Rang (fuer den Schnitt der Referenz)
+_RX_P_LAYER = re.compile(_RANK + r"PP(\d+)\] MoE expert-offload active on layer (\d+):")
 _RX_ONCARD = re.compile(
     _RANK + r"TP(\d+)\] WEG2-SEQ lane=c\d+ phase=deposit handshake=\S+ descs=\d+ slot=\d+ "
     r"slot_bytes=(\d+)")
@@ -555,6 +557,27 @@ class WakeReference:
     d_tags: Tuple[Mapping[str, float], ...]
     d_rows: Tuple[int, ...]
     d_oncard: Tuple[Mapping[str, float], ...]
+    #: H59: der erste Layer jeder P-Stufe DIESES Boots (kleinster ``MoE
+    #: expert-offload active on layer N`` je PP-Rang) -- daraus der P-Schnitt
+    #: der Referenz. Leer = nicht gemessen (die eingebaute Referenz traegt
+    #: ihren Schnitt im REFERENCE_KEY).
+    p_first_layers: Tuple[int, ...] = ()
+
+
+def reference_p_split(ref: "WakeReference", n_layers: int) -> Optional[Tuple[int, ...]]:
+    """H59: der P-Schnitt, bei dem die Referenz GEMESSEN ist (aus den ersten
+    Layern je Stufe und ``n_layers``), oder ``None``, wenn die Referenz ihn
+    nicht kennt. Die P-Tags der Referenz liegen auf den Karten DIESES
+    Schnitts; ein anderer Schnitt verschiebt ganze Tags zwischen den Karten,
+    und das ist kein Delta der Pufferregel."""
+    firsts = tuple(int(x) for x in ref.p_first_layers)
+    if not firsts or len(firsts) != len(ref.p_card) or list(firsts) != sorted(firsts):
+        return None
+    bounds = list(firsts) + [int(n_layers)]
+    split = tuple(bounds[i + 1] - bounds[i] for i in range(len(firsts)))
+    if firsts[0] != 0 or any(n <= 0 for n in split):
+        return None
+    return split
 
 
 def reference_from_logs(p_text: str, d_text: str, front_text: str, *, source: str,
@@ -581,6 +604,10 @@ def reference_from_logs(p_text: str, d_text: str, front_text: str, *, source: st
     for text in (p_text, d_text):
         for mm in _RX_ROWS.finditer(text):
             rows.setdefault((mm.group(1), int(mm.group(2))), int(mm.group(3)))
+    first_layer: Dict[int, int] = {}
+    for mm in _RX_P_LAYER.finditer(p_text):
+        s, layer = int(mm.group(1)), int(mm.group(2))
+        first_layer[s] = min(first_layer.get(s, layer), layer)
     # the first flip's on-card staging per D rank and tag: the slot_bytes of
     # the c-lane handshakes since that rank's previous SLEEP-TAG-TIME line
     oncard: Dict[int, Dict[str, float]] = {}
@@ -611,6 +638,8 @@ def reference_from_logs(p_text: str, d_text: str, front_text: str, *, source: st
         d_tags=tuple(d_tags[r] for r in range(n)),
         d_rows=tuple(rows[("TP", r)] for r in range(n)),
         d_oncard=tuple(dict(oncard.get(r, {})) for r in range(n)),
+        p_first_layers=(tuple(first_layer[s] for s in range(n))
+                        if all(s in first_layer for s in range(n)) else ()),
     )
 
 
@@ -755,6 +784,7 @@ REFERENCE_FNFL2X114D = WakeReference(
          'weights_12': 580.327, 'weights_13': 193.442},
         {'weights_14': 580.327, 'weights_15': 580.327},
     ),
+    p_first_layers=(0, 29, 40),
 )
 
 #: Fuer welche Form die Referenz gilt: Modell, P-Schnitt, Chunk-Laenge, Karten

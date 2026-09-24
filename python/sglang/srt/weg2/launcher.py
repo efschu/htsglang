@@ -11167,8 +11167,17 @@ def log_wake_credit_solve(ns, cards: List[Card], fits, log, label: str, *,
             # H54: dieselbe Suche, die die Front faehrt (die Tabelle traegt sie mit)
             search=bool(envs.SGLANG_WEG2_ENABLE_FLIP_ORDER_CREDIT_SEARCH.get()),
             reference=ref,
+            # H59: der Schnitt, bei dem die REFERENZ gemessen ist -- nicht der
+            # geplante. Bis hier stand p_split des geplanten Boots im Schluessel,
+            # die Pruefung "fremde Geometrie" war damit immer erfuellt, und ein
+            # anderer Schnitt (26,10,12 gegen die x162-Referenz 29,11,8) rechnete
+            # still mit den P-Tags der alten Karten (weights_12 auf PP1 statt
+            # PP2). Unbekannt (Log ohne Layerzeilen) -> ENTFAELLT mit Namen.
             reference_key=None if ref is None else {
-                "p_card": tuple(ref.p_card), "p_split": tuple(int(x) for x in p_split),
+                "p_card": tuple(ref.p_card),
+                "p_split": _wc.reference_p_split(ref, int(fits[0].n_layers))
+                or ("ungemessen: %s ohne 'MoE expert-offload active on layer'-Zeilen"
+                    % ref.source),
                 "chunk_layers": int(chunk_layers)},
         )
     except (OSError, KeyError, ValueError) as _exc:
