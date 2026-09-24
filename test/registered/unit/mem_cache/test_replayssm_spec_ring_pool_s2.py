@@ -70,7 +70,7 @@ def _params(hv, hk, conv_dtype=torch.bfloat16, kda=False):
     )
 
 
-def _pool(spec, hv=6, hk=2, conv_dtype=torch.bfloat16, draft=4, ring=8, **kw):
+def _pool(spec, hv=6, hk=2, conv_dtype=torch.bfloat16, draft=4, ring=16, **kw):
     return MambaPool(
         size=4,
         spec_state_size=2,
@@ -108,9 +108,9 @@ class TestAllocation(_Base):
                 c = pool.mamba_cache
                 self.assertIsNone(c.intermediate_ssm)
                 rows = 3  # spec_state_size + 1
-                self.assertEqual(tuple(c.replayssm_d.shape), (3, rows, hv, 8, V))
-                self.assertEqual(tuple(c.replayssm_k.shape), (3, rows, hk, 8, K))
-                self.assertEqual(tuple(c.replayssm_g.shape), (3, rows, hv, 8))
+                self.assertEqual(tuple(c.replayssm_d.shape), (3, rows, hv, 16, V))
+                self.assertEqual(tuple(c.replayssm_k.shape), (3, rows, hk, 16, K))
+                self.assertEqual(tuple(c.replayssm_g.shape), (3, rows, hv, 16))
                 self.assertEqual(c.replayssm_d.dtype, torch.bfloat16)
                 self.assertEqual(c.replayssm_g.dtype, torch.float32)
                 self.assertEqual(c.replayssm_rawv.shape, c.replayssm_d.shape)
@@ -124,7 +124,7 @@ class TestAllocation(_Base):
                     t.numel() * t.element_size()
                     for t in (c.replayssm_d, c.replayssm_k, c.replayssm_g, c.replayssm_rawv, c.replayssm_rawk)
                 )
-                per_req = _params(hv, hk).replayssm_ring_bytes_per_req(record_len=8)
+                per_req = _params(hv, hk).replayssm_ring_bytes_per_req(record_len=16)
                 self.assertEqual(ring_bytes, per_req * rows)
 
     def test_fp32_activations_have_no_low_parts(self):
@@ -135,7 +135,9 @@ class TestAllocation(_Base):
 
     def test_runtime_refusals(self):
         with self.assertRaisesRegex(ValueError, "shorter than the widest verify window"):
-            _pool(True, draft=16, ring=8)
+            _pool(True, draft=32, ring=16)
+        with self.assertRaisesRegex(ValueError, "must be >= 16"):
+            _pool(True, draft=4, ring=8)
         with self.assertRaisesRegex(ValueError, "KDA"):
             _pool(True, params=_params(6, 2, kda=True))
         with self.assertRaisesRegex(ValueError, "exclusive"):
@@ -179,7 +181,7 @@ class TestLifecycle(_Base):
             enable_mamba_extra_buffer=False,
             speculative_num_draft_tokens=4,
             speculative_eagle_topk=1,
-            linear_replayssm_cache_len=8,
+            linear_replayssm_cache_len=16,
             enable_linear_replayssm_spec=True,
         )
         pool = rtp.mamba_pool
@@ -230,6 +232,7 @@ class TestServerArgsStaticChecks(_Base):
             "needs a speculative algorithm": dict(speculative_algorithm=None),
             "linear draft chain": dict(speculative_eagle_topk=2),
             "power of": dict(linear_replayssm_cache_len=12),
+            ">= 16": dict(linear_replayssm_cache_len=8),
             "PD disaggregation": dict(disaggregation_mode="decode"),
         }
         for msg, kw in cases.items():

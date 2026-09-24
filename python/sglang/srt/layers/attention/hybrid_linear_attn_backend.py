@@ -159,6 +159,7 @@ class MambaAttnBackendBase(AttentionBackend):
 
         replayssm_write_pos = None
         replayssm_force_flush = None
+        replayssm_spec_rows = None
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
@@ -227,6 +228,9 @@ class MambaAttnBackendBase(AttentionBackend):
                     dtype=torch.int32,
                     device=forward_batch.input_ids.device,
                 )
+                replayssm_spec_rows = self._replayssm_spec_rows(
+                    forward_batch.req_pool_indices, heal=True
+                )
 
                 if self.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrieve_next_token
@@ -284,6 +288,7 @@ class MambaAttnBackendBase(AttentionBackend):
             has_mamba_track_mask=has_mamba_track_mask,
             replayssm_write_pos=replayssm_write_pos,
             replayssm_force_flush=replayssm_force_flush,
+            replayssm_spec_rows=replayssm_spec_rows,
         )
 
     def init_forward_metadata_out_graph(
@@ -402,6 +407,34 @@ class MambaAttnBackendBase(AttentionBackend):
         if mamba_pool is None:
             return False
         return getattr(mamba_pool, "replayssm_write_pos", None) is not None
+
+    def _replayssm_spec_rows(
+        self, req_pool_indices: torch.Tensor, *, heal: bool
+    ) -> Optional[torch.Tensor]:
+        """27B ReplaySSM package (S3): the request rows of a TARGET_VERIFY whose
+        pool runs the GDN spec ring (--enable-linear-replayssm-spec), or None.
+
+        The pool is read live (a rebinding cannot leave a stale answer). The
+        commit folds EVERY accepted window into ``temporal``
+        (fold-every-commit, see update_mamba_state_after_mtp_verify), so at
+        the start of any verify each live row's cursors are write_pos == 0 and
+        is_flush == 0 by construction. ``heal`` re-states exactly that for this
+        step's rows (padding rows are request row 0, the ReqToTokenPool's
+        padding row): a verify therefore never depends on cursor bytes from
+        before this step -- a TMS restore, a phase flip or a reused row cannot
+        hand it a stale cursor. The ring CONTENT needs no such care: with
+        write_pos == 0 the verify reads no history, only the checkpoint.
+        ``heal`` is off during graph capture (dummy rows).
+        """
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        write_pos = getattr(mamba_pool, "replayssm_spec_write_pos", None)
+        if write_pos is None:
+            return None
+        if heal:
+            rows = req_pool_indices.to(device=write_pos.device, dtype=torch.long)
+            write_pos.index_fill_(0, rows, 0)
+            mamba_pool.replayssm_is_flush.index_fill_(0, rows, 0)
+        return req_pool_indices
 
     def _replayssm_track_flush_mask(
         self, seq_lens_cpu: torch.Tensor, bs: int
@@ -567,6 +600,11 @@ class MambaAttnBackendBase(AttentionBackend):
             if self.replayssm_force_flush_list is not None
             else None
         )
+        replayssm_spec_rows = (
+            self._replayssm_spec_rows(req_pool_indices, heal=False)
+            if forward_mode.is_target_verify()
+            else None
+        )
 
         if forward_mode.is_target_verify() and self.topk > 1:
             # retrieve_* are None during capture, so skip the copy.
@@ -578,6 +616,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                replayssm_spec_rows=replayssm_spec_rows,
             )
         else:
             return ForwardMetadata(
@@ -585,6 +624,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                replayssm_spec_rows=replayssm_spec_rows,
             )
 
     def _replay_metadata(
@@ -714,6 +754,15 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
+        # 27B ReplaySSM package (S3): the static req_pool_indices buffer (its
+        # padded rows were zeroed above) -- the captured verify reads it by
+        # pointer, the eager commit slices it.
+        replayssm_spec_rows = (
+            self._replayssm_spec_rows(req_pool_indices, heal=not in_capture)
+            if forward_mode.is_target_verify()
+            else None
+        )
+
         if forward_mode.is_target_verify() and self.topk > 1:
             if (
                 spec_info is not None
@@ -735,6 +784,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                replayssm_spec_rows=replayssm_spec_rows,
             )
         else:
             return ForwardMetadata(
@@ -743,6 +793,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 mamba_track_indices=track_buf,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                replayssm_spec_rows=replayssm_spec_rows,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -1200,13 +1251,22 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
         if intermediate_state_cache is None:
-            # 27B ReplaySSM package: the spec ring replaced the intermediate
-            # state; this route is not wired to it (S3). Refuse, never scatter
-            # a None.
-            raise RuntimeError(
-                "ReplaySSM spec ring allocated (--enable-linear-replayssm-spec) "
-                "but this commit path still reads intermediate_ssm"
+            # 27B ReplaySSM package (S3): the spec ring replaced the
+            # intermediate state -- fold the accepted window from the ring.
+            self._commit_replayssm_spec_after_verify(
+                mamba_caches=mamba_caches,
+                state_indices_tensor=state_indices_tensor,
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
             )
+            self._update_ple_state_after_mtp_verify(
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+            return
 
         if os.getenv("SGLANG_767_TRACE", "") not in ("", "0"):
             import logging as _logging
@@ -1260,6 +1320,115 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_track_indices,
             mamba_steps_to_track,
         )
+
+    def _commit_replayssm_spec_after_verify(
+        self,
+        *,
+        mamba_caches: "MambaPool.SpeculativeState",
+        state_indices_tensor: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+    ) -> None:
+        """27B ReplaySSM package (S3): commit a GDN verify from the spec ring.
+
+        The verify (GDNAttnBackend._replayssm_target_verify) left the window's
+        compact records (d, k, g + 16-bit low parts) at the request rows the
+        metadata planned; here, for every GDN layer in one launch each:
+
+        1. advance the request-row cursors by the accepted count;
+        2. fold the accepted prefix into ``temporal`` (the checkpoint) and, on
+           a track-interval crossing, write the crossing state into the track
+           slot -- the ring's replacement for the two intermediate scatters;
+        3. roll the conv state back from the conv verify windows, which stay
+           allocated (unchanged from the recurrent route).
+
+        FOLD EVERY COMMIT, for any SSM dtype: upstream defers the fold for an
+        fp32 checkpoint (circular history across steps), which would leave
+        ``temporal`` behind the request between folds. Everything on this line
+        that reads ``temporal`` -- radix insert, HiCache backup (the weg2 L2
+        arena write), the NF line's H21 tail adopt (weg2/tail_adopt.py reads
+        and installs ``cache.temporal``), the P/D flip -- assumes it is the
+        committed state after every verify, as the recurrent route makes it.
+        Folding every commit keeps that
+        invariant; the ring is then per-step scratch (write_pos is 0 at every
+        verify), which is also what lets the verify metadata re-state the
+        cursors instead of trusting bytes from an earlier step.
+
+        Linear chain only (the flag refuses topk > 1 and the verify route
+        refuses a tree): the accepted count is last step + 1, the bonus token
+        included, exactly as the recurrent route commits step
+        ``last_correct_step_indices``; a -1 step (nothing accepted) folds
+        nothing, like the masked scatter.
+        """
+        from sglang.srt.layers.attention.fla.gdn_replayssm_spec_decode import (
+            commit_gdn_replayssm_circular,
+            commit_gdn_replayssm_spec,
+        )
+
+        backend = self.linear_attn_backend
+        spec_rows = getattr(backend.forward_metadata, "replayssm_spec_rows", None)
+        if spec_rows is None:
+            raise RuntimeError(
+                "ReplaySSM spec commit: the verify metadata planned no ring rows "
+                "(replayssm_spec_rows is None) although the pool runs the spec "
+                "ring -- the verify cannot have written the records this commit "
+                "folds"
+            )
+        mamba_pool = backend.req_to_token_pool.mamba_pool
+        request_number = last_correct_step_indices.shape[0]
+        rows = spec_rows[:request_number]
+        accept_lens = (last_correct_step_indices + 1).to(torch.int32)
+        max_cache_len = mamba_caches.replayssm_d.shape[-2]
+        commit_gdn_replayssm_spec(
+            write_pos=mamba_pool.replayssm_spec_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            num_accepted=accept_lens,
+            replay_indices=rows,
+            max_cache_len=max_cache_len,
+            # Only the deferred-fold margin reads it; a constant keeps one
+            # compiled variant across the adaptive draft ladder.
+            max_spec_len=mamba_pool.replayssm_spec_max_window,
+            fold_every_commit=True,
+            # Request row 0 is the ReqToTokenPool's padding row, never a live
+            # request: a padded row advances nothing.
+            null_block_id=0,
+        )
+        commit_gdn_replayssm_circular(
+            checkpoint_state=mamba_caches.temporal,
+            d_cache=mamba_caches.replayssm_d,
+            k_cache=mamba_caches.replayssm_k,
+            g_cache=mamba_caches.replayssm_g,
+            d_residual_cache=mamba_caches.replayssm_rawv,
+            k_residual_cache=mamba_caches.replayssm_rawk,
+            state_batch_indices=state_indices_tensor,
+            replay_indices=rows,
+            write_pos=mamba_pool.replayssm_spec_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            accept_lens=accept_lens,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            # Mamba slots: valid >= 0, padding == -1.
+            null_block_id=-1,
+        )
+        conv_states = mamba_caches.conv[0]
+        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
+        fused_conv_window_scatter_with_mask(
+            conv_states,
+            intermediate_conv_window_cache,
+            state_indices_tensor,
+            last_correct_step_indices,
+        )
+        if mamba_track_indices is not None:
+            assert mamba_steps_to_track is not None
+            fused_conv_window_scatter_with_mask(
+                conv_states,
+                intermediate_conv_window_cache,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
 
     @staticmethod
     def _scatter_speculative_state_with_mask(
