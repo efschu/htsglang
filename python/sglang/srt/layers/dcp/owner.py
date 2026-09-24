@@ -38,6 +38,7 @@ from sglang.kernels.ops.kvcache.kv_indices import create_flashinfer_kv_indices_t
 
 __all__ = [
     "build_dcp_weighted_kv_indices",
+    "build_dcp_weighted_kv_indices_sync_free",
     "dcp_accounting_total_slots",
     "dcp_compact_pool_rows",
     "dcp_even_write_mask",
@@ -47,6 +48,7 @@ __all__ = [
     "dcp_verify_paged_lens",
     "dcp_verify_window_is_disjoint",
     "dcp_weighted_owned_lengths",
+    "dcp_weighted_pack_owned",
     "dcp_weighted_owner_bounds",
     "dcp_weighted_read_slots",
     "dcp_weighted_write_slots",
@@ -568,6 +570,128 @@ def build_dcp_weighted_kv_indices(
         kv_indices = torch.cat([kv_indices, kv_indices.new_zeros(pad)])
     owned_per_req = dcp_weighted_owned_lengths(owned, lens64)
     kv_indptr[1 : bs + 1] = torch.cumsum(owned_per_req, dim=0)
+    return kv_indptr[: bs + 1], kv_indices
+
+
+def dcp_weighted_pack_owned(
+    full_kv: torch.Tensor,
+    full_indptr: torch.Tensor,
+    cp_S: int,
+    cp_lo: int,
+    cp_hi: int,
+    cp_ratio: int,
+    pad: int = 0,
+):
+    """Fixed-shape twin of ``compact[owned]`` + the owned per-request counts.
+
+    ``full_kv`` holds the per-request slot lists back to back; only its first
+    ``full_indptr[-1]`` entries are meaningful, the rest (a host-side upper
+    bound sized it) is don't-care. ``full_indptr`` is the exact device prefix
+    sum of the per-request lengths.
+
+    Returns ``(kv_indices, owned_prefix)``:
+
+    * ``kv_indices`` has ``full_kv.numel() + pad`` entries: this rank's owned
+      compact slots in request order at ``[0, n_owned)``, zeros after -- the
+      same leading entries ``build_dcp_weighted_kv_indices`` produces, only
+      the zero tail is longer;
+    * ``owned_prefix[b]`` is the number of owned slots among the first
+      ``full_indptr[b]`` entries, i.e. exactly the ``kv_indptr`` that
+      ``cumsum(dcp_weighted_owned_lengths(...))`` builds (``owned_prefix[0]``
+      is 0).
+
+    Why this exists: ``compact[owned]`` is a boolean index -- its output size
+    is data-dependent, so torch reads it back from the device (a stream
+    sync, owner.py:566 in the xsn421/xsn422 py-spy, 83-105 samples on D TP0),
+    and ``repeat_interleave`` without ``output_size`` is a second one. Every
+    shape here depends only on ``full_kv.numel()`` and ``bs``, so nothing
+    blocks. Pure tensor math, CPU-testable.
+    """
+    T = int(full_kv.numel())
+    device = full_kv.device
+    compact, owned = dcp_weighted_read_slots(full_kv, cp_S, cp_lo, cp_hi, cp_ratio)
+    fi64 = full_indptr.to(torch.int64)
+    if T > 0:
+        valid = torch.arange(T, device=device, dtype=torch.int64) < fi64[-1:]
+        owned = owned & valid
+    csum = torch.cumsum(owned.to(torch.int64), dim=0)
+    # Owned entry i goes to row (#owned before it); every other entry goes to
+    # one dummy row past the end, all writing the same 0, so the scatter is
+    # deterministic.
+    dummy = T + int(pad)
+    dst = torch.where(owned, csum - 1, torch.full_like(csum, dummy))
+    vals = torch.where(owned, compact, torch.zeros_like(compact))
+    out = torch.zeros(T + int(pad) + 1, dtype=torch.int32, device=device)
+    out.scatter_(0, dst, vals.to(torch.int32))
+    kv_indices = out[: T + int(pad)]
+    csum0 = torch.cat([torch.zeros(1, dtype=torch.int64, device=device), csum])
+    owned_prefix = csum0[fi64]
+    return kv_indices, owned_prefix
+
+
+def build_dcp_weighted_kv_indices_sync_free(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    paged_kernel_lens: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_start_idx: Optional[torch.Tensor],
+    cp_S: int,
+    cp_lo: int,
+    cp_hi: int,
+    cp_ratio: int,
+    *,
+    total_tokens_bound: int,
+    pad: int = 0,
+    req_to_token_stride: Optional[int] = None,
+):
+    """``build_dcp_weighted_kv_indices`` without a single host read.
+
+    Same inputs, same ``kv_indptr`` values written in place, same leading
+    ``kv_indices`` entries (see ``dcp_weighted_pack_owned``); the only
+    difference is that ``kv_indices`` has ``total_tokens_bound + pad``
+    entries instead of ``n_owned + pad`` -- the consumer reads the first
+    ``kv_indptr[bs]`` and, when it wants the old length, slices to
+    ``n_owned + pad`` once it knows ``n_owned``.
+
+    ``total_tokens_bound`` is a HOST upper bound of ``sum(paged_kernel_lens)``
+    (the scheduler's length mirror, exact or over-estimated). It sizes the slot
+    buffer the Triton kernel writes, so it must never be smaller than the
+    device sum: a device-side assert (``torch._assert_async``, no host wait)
+    stops the stream before the kernel if it is, which is loud instead of an
+    out-of-bounds write.
+    """
+    bs = int(req_pool_indices.shape[0])
+    device = req_pool_indices.device
+    lens64 = paged_kernel_lens.to(torch.int64)
+    full_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+    if bs > 0:
+        full_indptr[1:] = torch.cumsum(lens64, dim=0).to(torch.int32)
+    T = max(int(total_tokens_bound), 0)
+    if full_indptr.is_cuda:
+        torch._assert_async(full_indptr[bs] <= T)
+    elif int(full_indptr[bs]) > T:
+        raise ValueError(
+            f"total_tokens_bound {T} is below the length sum {int(full_indptr[bs])}"
+        )
+    full_kv = torch.empty(T, dtype=torch.int32, device=device)
+    if T > 0 and bs > 0:
+        create_flashinfer_kv_indices_triton[(bs,)](
+            req_to_token,
+            req_pool_indices,
+            paged_kernel_lens,
+            full_indptr,
+            kv_start_idx,
+            full_kv,
+            (
+                req_to_token.shape[1]
+                if req_to_token_stride is None
+                else req_to_token_stride
+            ),
+        )
+    kv_indices, owned_prefix = dcp_weighted_pack_owned(
+        full_kv, full_indptr, cp_S, cp_lo, cp_hi, cp_ratio, pad
+    )
+    kv_indptr[1 : bs + 1] = owned_prefix[1:].to(kv_indptr.dtype)
     return kv_indptr[: bs + 1], kv_indices
 
 

@@ -51,6 +51,14 @@ from sglang.srt.layers.dcp.lockstep import (
     draft_extend_prefix_lens,
     weightless_has_prefix,
 )
+from sglang.srt.layers.dcp.owner import build_dcp_weighted_kv_indices_sync_free
+from sglang.srt.layers.dcp.verify_preplan import (
+    DcpVerifyPrebuilt,
+    HostPlanMeta,
+    host_arange_indptr,
+    host_indptr_from_lens,
+    host_ones,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -1417,6 +1425,61 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cp_hi,
             self.cp_ratio,
         ) = dcp_weighted_owner_bounds(self.dcp_size, self.dcp_rank)
+
+    def dcp_verify_prebuild(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_host,
+    ) -> Optional[DcpVerifyPrebuilt]:
+        """SGLANG_DFLASH_PLAN_SYNC_FREE: the verify's owned-slot index, now.
+
+        Called by the DFLASH worker right after the block prep, i.e. BEFORE
+        the draft forward on the same stream. Builds exactly what the
+        target-verify branch of ``call_begin_forward`` would build for the
+        committed prefix ``[0, seq_lens)`` -- into the same ``kv_indptr[0]``
+        buffer the verify graph's paged wrapper reads -- without a host read,
+        and stages the counts to the host behind an event. None when this
+        backend does not take the weighted-DCP verify split, or when no host
+        length mirror is available to size the slot buffer (the verify then
+        plans the old way).
+
+        ``seq_lens_host`` sizes the buffer only; it may over-estimate (a
+        device-side assert refuses an under-estimate). The counts the verify
+        plans with are the device's, read back.
+        """
+        if not (self.uneven_dcp and self.uneven_dcp_weighted):
+            return None
+        host = dcp_host_lens(seq_lens_host)
+        bs = int(req_pool_indices.shape[0])
+        if host is None or bs == 0 or int(host.numel()) != bs:
+            return None
+        upd = self.indices_updater_prefill
+        kv_indptr_buf = upd.kv_indptr[0]
+        if kv_indptr_buf.numel() < bs + 1:
+            return None
+        kv_indptr, kv_indices = build_dcp_weighted_kv_indices_sync_free(
+            upd.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            kv_indptr_buf,
+            None,
+            self.cp_S,
+            self.cp_lo,
+            self.cp_hi,
+            self.cp_ratio,
+            total_tokens_bound=int(host.sum()),
+            pad=256,
+        )
+        buf = getattr(self, "_dcp_preplan_host_buf", None)
+        if buf is None or buf.numel() < bs + 1:
+            buf = torch.empty(max(bs + 1, 64), dtype=kv_indptr.dtype)
+            if kv_indptr.is_cuda:
+                buf = buf.pin_memory()
+            self._dcp_preplan_host_buf = buf
+        return DcpVerifyPrebuilt.launch(
+            bs=bs, kv_indptr=kv_indptr, kv_indices=kv_indices, host_buf=buf
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         """IN-graph hook, recorded at the START of every captured decode body
@@ -6440,6 +6503,88 @@ def _host_sum_or_device(
     return int(lens_cpu.sum())
 
 
+# ---------------------------------------------------------------------------
+# SGLANG_DFLASH_PLAN_SYNC_FREE (layers/dcp/verify_preplan.py has the why).
+# ---------------------------------------------------------------------------
+
+
+def _plan_sync_free_on() -> bool:
+    return bool(envs.SGLANG_DFLASH_PLAN_SYNC_FREE.get())
+
+
+def _usable_verify_prebuilt(
+    spec_info,
+    bs: int,
+    kv_indptr_buf: torch.Tensor,
+    weighted: bool,
+) -> Optional[DcpVerifyPrebuilt]:
+    """The worker's prebuilt verify index, if it describes THIS plan.
+
+    It must be the weighted rule, the same row count (a padded graph bucket
+    differs and falls back), no draft->draft tree mask, and it must have been
+    written into the very ``kv_indptr`` buffer this plan was handed -- the
+    graph wrapper's ``paged_kv_indptr_buf`` aliases it.
+    """
+    pre = getattr(spec_info, "dcp_verify_prebuilt", None)
+    if pre is None or not weighted:
+        return None
+    if getattr(spec_info, "custom_mask", None) is not None:
+        return None
+    if int(pre.bs) != int(bs):
+        return None
+    if pre.kv_indptr.data_ptr() != kv_indptr_buf.data_ptr():
+        return None
+    return pre
+
+
+def _draft_host_plan(
+    spec_info,
+    bs: int,
+    paged_kernel_lens_cpu,
+    custom_mask,
+    use_sliding_window_kv_pool: bool,
+) -> Optional[HostPlanMeta]:
+    """Exact host plan metadata for a DFLASH draft block forward, or None.
+
+    ``host_lens_exact`` is set by the DFLASH worker only for the draft forward
+    of a round whose host lengths equal the device lengths. The kv layout is
+    then ``[0, cumsum(len + draft_token_num)]`` -- the same arithmetic
+    ``DFlashVerifyInput.generate_attn_arg_prefill`` runs on the device.
+    """
+    if not getattr(spec_info, "host_lens_exact", False):
+        return None
+    if custom_mask is not None or use_sliding_window_kv_pool:
+        return None
+    if getattr(spec_info, "ragged_verify_layout", None) is not None:
+        return None
+    lens = dcp_host_lens(paged_kernel_lens_cpu)
+    if lens is None or int(lens.numel()) != int(bs):
+        return None
+    draft_num = int(spec_info.draft_token_num)
+    return HostPlanMeta(
+        host_arange_indptr(bs, draft_num),
+        host_indptr_from_lens(lens, add=draft_num),
+        host_ones(bs),
+        check_device=True,
+    )
+
+
+def _assert_plan_indptr_matches(wrapper, kv_indptr_dev: torch.Tensor, bs: int):
+    """Device-side check that the planned kv_indptr is the device's own.
+
+    The draft plan scheduled from HOST lengths that are exact only by an
+    assumption about the scheduler's mirror. FlashInfer's FA2 kernel derives
+    its split layout from the DEVICE lengths, so a mismatch would mis-address
+    the partial outputs silently. ``torch._assert_async`` (no host wait) stops
+    the stream before the forward's graph can run on it instead.
+    """
+    buf = getattr(wrapper, "_paged_kv_indptr_buf", None)
+    if buf is None or not torch.is_tensor(buf) or buf.numel() < bs + 1:
+        return
+    same = torch.eq(buf[: bs + 1], kv_indptr_dev[: bs + 1].to(buf.dtype)).all()
+    torch._assert_async(same)
+
+
 class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
@@ -7004,6 +7149,13 @@ class FlashInferIndicesUpdaterPrefill:
                     device=seq_lens.device, dtype=seq_lens.dtype
                 )
             )
+            if num_accept_tokens is None and _plan_sync_free_on():
+                # SGLANG_DFLASH_PLAN_SYNC_FREE: prefix_lens IS seq_lens here,
+                # so its host mirror is seq_lens' own (freshness-guarded) one.
+                # Without it the window branch below had no mirror and summed
+                # on the device (_host_sum_or_device, the 6439 host read in
+                # front of every DFLASH draft forward).
+                prefix_lens_cpu = fresh_seq_lens_cpu
         sliding_window_size = self.sliding_window_size
         assert sliding_window_size is not None
         for wrapper_id in range(2):
@@ -7235,6 +7387,11 @@ class FlashInferIndicesUpdaterPrefill:
         # (--speculative-eagle-topk > 1); stays None on every other path so the
         # ragged plan keeps its default (causal chain / non-causal extend).
         ragged_custom_mask = None
+        # SGLANG_DFLASH_PLAN_SYNC_FREE: exact host metadata for the plans at
+        # the bottom (paged: qo/kv indptr + last_page_len; ragged: qo). Stays
+        # None on every path the switch does not reach -> the plans read the
+        # device tensors as before.
+        host_plan: Optional[HostPlanMeta] = None
         if spec_info is None and self.attn_backend.uneven_dcp:
             # Uneven-DCP extend: the paged (prefix) wrapper reads only this
             # rank's OWNED prefix token slots (even-modulo owner rule), with the
@@ -7463,8 +7620,29 @@ class FlashInferIndicesUpdaterPrefill:
                     "request. Disable SGLANG_RAGGED_VERIFY_MODE."
                 )
             draft_num = spec_info.draft_token_num
+            # SGLANG_DFLASH_PLAN_SYNC_FREE: the DFLASH worker built this very
+            # index before the draft forward (dcp_verify_prebuild) and staged
+            # the owned counts to the host behind an event that sits IN FRONT
+            # of the draft on the stream. Taking it here replaces the two
+            # host reads of the build below (compact[owned], repeat_interleave)
+            # and gives the plans below exact host metadata, so nothing in
+            # this verify prep waits for the draft.
+            prebuilt = _usable_verify_prebuilt(
+                spec_info, bs, kv_indptr, self.attn_backend.uneven_dcp_weighted
+            )
+            if prebuilt is not None:
+                prebuilt_host_indptr = prebuilt.host_kv_indptr()
+                kv_indptr = prebuilt.kv_indptr
+                kv_indices = prebuilt.kv_indices[
+                    : int(prebuilt_host_indptr[-1]) + 256
+                ]
+                host_plan = HostPlanMeta(
+                    host_arange_indptr(bs, draft_num),
+                    prebuilt_host_indptr,
+                    host_ones(bs),
+                )
             # Paged prefix (committed context) over this rank's OWNED slots.
-            if self.attn_backend.uneven_dcp_weighted:
+            elif self.attn_backend.uneven_dcp_weighted:
                 kv_indptr, kv_indices = _build_dcp_weighted_kv_indices(
                     self.req_to_token,
                     req_pool_indices,
@@ -7574,6 +7752,19 @@ class FlashInferIndicesUpdaterPrefill:
                         kv_start_idx=kv_start_idx,
                     )
                 )
+                # SGLANG_DFLASH_PLAN_SYNC_FREE, the DFLASH DRAFT forward: the
+                # worker flags a round whose host lengths are the EXACT device
+                # lengths (published seq_lens_cpu, page_size 1). Then the plan
+                # can schedule from host vectors instead of reading
+                # qo/kv_indptr back; the equality is re-checked on the device
+                # after the plan (see _assert_plan_indptr_matches).
+                host_plan = _draft_host_plan(
+                    spec_info,
+                    bs,
+                    paged_kernel_lens_cpu,
+                    custom_mask,
+                    use_sliding_window_kv_pool,
+                )
             else:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
@@ -7599,9 +7790,19 @@ class FlashInferIndicesUpdaterPrefill:
                 if self.attn_backend.uneven_dcp
                 else self.num_kv_heads
             )
+            # SGLANG_DFLASH_PLAN_SYNC_FREE: the ragged qo/kv layout of a verify
+            # is the constant draft-block stride, known on the host; handing
+            # the host copy to plan() skips its two .to("cpu") reads
+            # (prefill.py 3054/3055) and fills the graph buffers with the same
+            # values by a non-blocking H2D.
+            ragged_qo = (
+                host_plan.qo_indptr
+                if host_plan is not None and ragged_custom_mask is None
+                else qo_indptr
+            )
             wrapper_ragged.begin_forward(
-                qo_indptr,
-                qo_indptr,
+                ragged_qo,
+                ragged_qo,
                 ragged_qo_heads,
                 ragged_kv_heads,
                 self.head_dim,
@@ -7672,11 +7873,27 @@ class FlashInferIndicesUpdaterPrefill:
                 max_kv_len=int(seq_lens_cpu_i32.max()),
             )
 
+        # SGLANG_DFLASH_PLAN_SYNC_FREE: plan() schedules from the exact host
+        # copies (its .to("cpu") becomes a no-op) and copies them into the
+        # graph buffers H2D; kv_indices stays the device tensor (D2D).
+        if host_plan is not None and not uses_fast_prefill and use_custom_mask is None:
+            plan_qo, plan_kv_indptr, plan_last = (
+                host_plan.qo_indptr,
+                host_plan.kv_indptr,
+                host_plan.last_page_len,
+            )
+        else:
+            host_plan = None
+            plan_qo, plan_kv_indptr, plan_last = (
+                qo_indptr,
+                kv_indptr,
+                self.kv_last_page_len[:bs],
+            )
         wrapper_paged.begin_forward(
-            qo_indptr,
-            kv_indptr,
+            plan_qo,
+            plan_kv_indptr,
             kv_indices,
-            self.kv_last_page_len[:bs],
+            plan_last,
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
@@ -7692,6 +7909,8 @@ class FlashInferIndicesUpdaterPrefill:
             max_item_len_ptr=max_item_len_ptr,
             **paged_plan_kwargs,
         )
+        if host_plan is not None and host_plan.check_device:
+            _assert_plan_indptr_matches(wrapper_paged, kv_indptr, bs)
 
 
 class FlashInferMultiStepDraftBackend:
