@@ -2573,6 +2573,9 @@ def _stage_alloc(ops, device: int, key, nbytes: int, log, lane_key: str,
             if refund is not None:
                 refund()
             raise
+        from sglang.srt.managers.weg2_memory_saver import StageBooking
+        if isinstance(refund, StageBooking):
+            refund.live()   # H11: allocated -- no longer hidden in a free reading
         _SEQ_STAGE[key] = {"ptr": ptr, "size": int(nbytes), "device": int(device),
                            "ops": ops, "refund": refund}
         return ptr

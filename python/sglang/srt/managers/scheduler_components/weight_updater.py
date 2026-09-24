@@ -4,6 +4,7 @@ import functools
 import hashlib
 import logging
 import os
+import threading
 import time
 import traceback
 from collections import OrderedDict
@@ -91,6 +92,24 @@ from sglang.srt.weg2 import seam_digest
 WEG2_GROUP_FENCE_BUDGET_S = 120.0
 
 MIB_ = 1024 * 1024
+
+#: H11: ONE derivation per plan key at a time. x105 (D TP0, first wake): the
+#: two collect workers of the first two tags both missed the per-tag key and
+#: derived the same 20-GiB plan side by side (WEG2-XCHG-PLAN h2d twice,
+#: first collect 0,2-0,33 s after the first resume). Re-entrant: the
+#: derivation may ask for a plan itself.
+_WEG2_PLAN_LOCK = threading.RLock()
+
+#: H11: every lane key a wake collect can ride (``c<card>`` diagonal,
+#: ``p<k>`` directed cross pair) -- the turn registry's universe.
+_WEG2_TURN_LANES = ("c0", "c1", "c2", "p0", "p1", "p2", "p3", "p4", "p5")
+
+
+def _weg2_plan_key(hook, group, rank, require_agreement, agreed_key) -> tuple:
+    """The leg-cache key of a shadow plan -- the ONE producer, read by the
+    cached lookup and by the boot warm-up alike (H11)."""
+    return ("plan", str(hook), str(group), int(rank), bool(require_agreement),
+            agreed_key)
 
 
 def _weg2_group_stop_on_leg_failure(fn):
@@ -664,6 +683,9 @@ class SchedulerWeightUpdaterManager:
     _weg2_flip_index_now: object = None  # the flip index of the leg in progress (BAR1 flag seq = '<flip>-<tag>')
     _weg2_leg_tag_order: Any = None   # the wake leg's tag list (index = tag order for the tag-order gate)
     _weg2_tag_done: Any = None        # {tag index: threading.Event}, set when that tag's collect is through
+    #: H11: the wake leg's per-lane turns for host/IPC lanes (weg2/lane_turns.py),
+    #: None = the every-earlier-tag gate (SGLANG_WEG2_WAKE_LANE_TURNS=0).
+    _weg2_lane_turns: Any = None
     #: weg2xsn269/270: the VramCredit of the leg this rank is SLEEPING
     #: through (set in release_memory_occupation, read by
     #: _weg2_stage_charge). A slots dataclass: an undeclared attribute
@@ -891,7 +913,36 @@ class SchedulerWeightUpdaterManager:
             self._weg2_shadow_plan(str(hook), str(group), int(rank),
                                    agreed=agreed, require_agreement=True)
             out[f"hook:{hook}"] = (time.perf_counter() - t0) * 1000.0
+        # H11: THE PER-TAG KEY TOO. x83-x105: the deposit of every tag
+        # (hook=source) and the collect (hook=authoritative) read the plan
+        # WITHOUT an agreement -- a key neither warm-up above fills. The first
+        # tag of the first P->D flip derived it: PP0's no-op weights_13 took
+        # 106/121/517/134 ms (x83/x87/x104/x105) before its first byte, D's
+        # first collect began 0,2-0,33 s after its first resume.
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_WEG2_TAG_PLAN_PREWARM.get():
+            for hook in (sh.HOOK_SOURCE, "authoritative"):
+                out[f"tag:{hook}"] = self._weg2_warm_tag_plan(
+                    _lc, str(hook), str(group), int(rank))
         return out
+
+    def _weg2_warm_tag_plan(self, cache: dict, hook: str, group: str,
+                            rank: int) -> float:
+        """H11: derive the per-tag plan (``agreed=None``,
+        ``require_agreement=False``) into ``cache`` and return its ms, -1.0
+        when no plan came out. OVERWRITES the key: a later warm-up round runs
+        because a manifest changed (the drafter rewrites its own after the
+        load), and the plan of the newer manifests is the one the flip must
+        find."""
+        t0 = time.perf_counter()
+        with _WEG2_PLAN_LOCK:
+            out = SchedulerWeightUpdaterManager._weg2_shadow_plan_uncached(
+                self, hook, group, rank, agreed=None, require_agreement=False)
+            if out is None or out[0] is None:
+                return -1.0
+            cache[_weg2_plan_key(hook, group, rank, False, None)] = out
+        return (time.perf_counter() - t0) * 1000.0
 
     def _weg2_bar1_start(self) -> None:
         """Build the BAR1 lane registry (weg2/bar1_lanes.py) and run its
@@ -3781,11 +3832,11 @@ class SchedulerWeightUpdaterManager:
                     n >> 20,
                 )
                 return None
+            # H11: a booking, not a bare refund -- _stage_alloc marks it live
+            # once the cudaMalloc returned (the waker stops counting it twice)
+            from sglang.srt.managers.weg2_memory_saver import StageBooking
 
-            def _refund():
-                credit.refund("ipc-stage", n)
-
-            return _refund
+            return StageBooking(credit, "ipc-stage", n)
 
         return _charge
 
@@ -4145,14 +4196,17 @@ class SchedulerWeightUpdaterManager:
         if _lc is None:
             return _impl(self, hook, group, rank, agreed=agreed,
                          require_agreement=require_agreement)
-        key = ("plan", str(hook), str(group), int(rank), bool(require_agreement),
-               _agreed_key)
+        key = _weg2_plan_key(hook, group, rank, require_agreement, _agreed_key)
         if key in _lc:
             return _lc[key]
-        out = _impl(self, hook, group, rank, agreed=agreed,
-                    require_agreement=require_agreement)
-        if out is not None and out[0] is not None:
-            _lc[key] = out
+        with _WEG2_PLAN_LOCK:
+            # H11: single flight -- a thread that waited here finds the key
+            if key in _lc:
+                return _lc[key]
+            out = _impl(self, hook, group, rank, agreed=agreed,
+                        require_agreement=require_agreement)
+            if out is not None and out[0] is not None:
+                _lc[key] = out
         return out
 
     def _weg2_shadow_plan_uncached(self, hook: str, group: str, rank: int, *,
@@ -4724,6 +4778,34 @@ class SchedulerWeightUpdaterManager:
         except Exception:  # noqa: BLE001
             pass
 
+    def _weg2_turn_index(self, tag) -> int:
+        """The tag's index in this wake leg's order, -1 when it has none."""
+        order = self._weg2_leg_tag_order or []
+        return order.index(str(tag)) if str(tag) in order else -1
+
+    def _weg2_turns_register(self, tag) -> None:
+        """H11, main thread, in tag order: the tag is pending on every
+        host/IPC lane until its collect says which lanes it uses."""
+        turns = self._weg2_lane_turns
+        idx = self._weg2_turn_index(tag)
+        if turns is not None and idx >= 0:
+            turns.register(idx)
+
+    def _weg2_turns_leave(self, tag, lane: str) -> None:
+        """H11: the tag's run on ``lane`` is over."""
+        turns = self._weg2_lane_turns
+        idx = self._weg2_turn_index(tag)
+        if turns is not None and idx >= 0:
+            turns.leave(lane, idx)
+
+    def _weg2_turns_release(self, tag, used=None) -> None:
+        """H11: drop the tag from the lanes it does not use (``used``) or
+        from every lane (its collect is over)."""
+        turns = self._weg2_lane_turns
+        idx = self._weg2_turn_index(tag)
+        if turns is not None and idx >= 0:
+            turns.release(idx, used)
+
     def _weg2_preload_hold(self) -> int:
         """18.09. (Flip-Schwanz): the held requests' host pages start loading
         into the (just resumed) kv pool NOW -- the same match + init_load_back
@@ -4795,6 +4877,7 @@ class SchedulerWeightUpdaterManager:
             except AttributeError:
                 pass
             self._weg2_bar1_release(tag)       # every lane: this tag's collect is over
+            self._weg2_turns_release(tag)
             self._weg2_tag_done_set(tag)
         self._weg2_xchg_collected_per_tag = True
         self._weg2_seam_after_part(tag)
@@ -6894,7 +6977,29 @@ class SchedulerWeightUpdaterManager:
                         _is_bar1_lane = bool(
                             _b1g_role is not None
                             and _b1g.window_for(_lane_key, _b1g_role) is not None)
-                        if not _is_bar1_lane:
+                        _turns = self._weg2_lane_turns
+                        if not _is_bar1_lane and _turns is not None:
+                            # H11: THE LANE'S TURN, not every earlier tag.
+                            # Only the earlier tags that ride THIS lane can
+                            # collide on its slot counter; the others (other
+                            # source cards under the round-robin order) left
+                            # it when their collect started. x83-x105: D TP0
+                            # waited 790-889 ms per P->D flip in this gate.
+                            _ord = self._weg2_leg_tag_order or []
+                            _ti = _ord.index(str(tag)) if str(tag) in _ord else -1
+                            _tg0 = time.perf_counter()
+                            _ok, _waited = _turns.take(_lane_key, _ti, 600.0)
+                            if not _ok:
+                                _lane_failures.append(
+                                    f"{_lane_key}/{tag}: lane turn: the earlier tag(s) "
+                                    f"{','.join(_ord[j] for j in _waited)} did not leave "
+                                    f"the lane within 600 s")
+                                return
+                            if _waited:
+                                logger.info("WEG2-TAG-GATE lane=%s tag=%s waited_ms=%.0f for=%s mode=lane",
+                                            _lane_key, tag, (time.perf_counter() - _tg0) * 1000,
+                                            ",".join(_ord[j] for j in _waited))
+                        elif not _is_bar1_lane:
                             _ord = getattr(self, "_weg2_leg_tag_order", None) or []
                             _evs = getattr(self, "_weg2_tag_done", None) or {}
                             _ti = _ord.index(str(tag)) if str(tag) in _ord else -1
@@ -7160,19 +7265,31 @@ class SchedulerWeightUpdaterManager:
                 # Each lane owns its buffer, record file, handshake and
                 # rendezvous; the ctypes copies release the GIL. Off with
                 # SGLANG_WEG2_SEQ_LANES_PARALLEL=0 (the xsn87 serial form).
+                def _run_lane_turned(pair, group):
+                    # H11: the lane's turn ends with its run, whichever way
+                    # _run_lane returns -- the next tag on it may start.
+                    try:
+                        _run_lane(pair, group)
+                    finally:
+                        if phase == bx.PHASE_COLLECT:
+                            self._weg2_turns_leave(
+                                tag, f"p{pair}" if pair is not None
+                                else f"c{int(getattr(group[0], 'dst_rank', device))}")
+
                 if phase == bx.PHASE_COLLECT:
                     # the BAR1 lanes this tag does NOT use give up their turn now
                     _used_keys = [(f"p{p}" if p is not None
                                    else f"c{int(getattr(g[0], 'dst_rank', device))}")
                                   for p, g in _lanes.items()]
                     self._weg2_bar1_release(tag, used=_used_keys)
+                    self._weg2_turns_release(tag, used=_used_keys)
                 if bx.seq_lanes_parallel() and len(_lanes) > 1:
                     from concurrent.futures import ThreadPoolExecutor
                     _t0 = time.perf_counter()
                     with ThreadPoolExecutor(
                             max_workers=len(_lanes),
                             thread_name_prefix="weg2-lane") as _ex:
-                        _futs = [(p, _ex.submit(_run_lane, p, g))
+                        _futs = [(p, _ex.submit(_run_lane_turned, p, g))
                                  for p, g in _lanes.items()]
                         _errs = [(p, f.exception()) for p, f in _futs
                                  if f.exception() is not None]
@@ -7207,7 +7324,7 @@ class SchedulerWeightUpdaterManager:
                         raise _errs[0][1]
                 else:
                     for pair, group in _lanes.items():
-                        _run_lane(pair, group)
+                        _run_lane_turned(pair, group)
             finally:
                 if _lane_permit is not None:
                     _lane_permit.close()
@@ -8482,6 +8599,11 @@ class SchedulerWeightUpdaterManager:
             import threading as _thr
             self._weg2_leg_tag_order = [str(t) for t in weights_tags]
             self._weg2_tag_done = {i: _thr.Event() for i in range(len(weights_tags))}
+            from sglang.srt.environ import envs as _envs_h11
+            from sglang.srt.weg2.lane_turns import LaneTurns
+
+            self._weg2_lane_turns = (LaneTurns(_WEG2_TURN_LANES)
+                                     if _envs_h11.SGLANG_WEG2_WAKE_LANE_TURNS.get() else None)
             try:
                 if self._weg2_wake_weight_carrier() != self.CARRIER_EXCHANGE:
                     for _ev in self._weg2_tag_done.values():
@@ -8500,7 +8622,16 @@ class SchedulerWeightUpdaterManager:
                     # (they arrive over other links); with one worker PP0 idled
                     # 0.8 s behind weights_6/7 at every flip
                     _n_wake_workers = _weg2_wake_collect_workers()
-                    _wake_worker = _TPE(max_workers=_n_wake_workers, thread_name_prefix="weg2-wake-collect")
+                    # H11: the run-ahead bound below keeps up to
+                    # _n_wake_workers + 1 collects submitted (t-2 finishing,
+                    # t-1, t); a pool of exactly _n_wake_workers queued the
+                    # just-resumed tag t behind them -- x105 PP0 weights_1/2
+                    # waited 115/139 ms on its lane p0 while D TP1's two
+                    # workers held PP2's and PP1's tags. The spare worker(s)
+                    # change no resume and no VRAM, only who may collect.
+                    _wake_worker = _TPE(
+                        max_workers=_n_wake_workers + max(0, _envs_h11.SGLANG_WEG2_WAKE_COLLECT_SPARE.get()),
+                        thread_name_prefix="weg2-wake-collect")
                 for _ti, tag in enumerate(weights_tags):
                     # C14: the device bytes this tag needs may only exist once
                     # the co-located SLEEPING rank has released them, and with
@@ -8760,6 +8891,7 @@ class SchedulerWeightUpdaterManager:
                             # semaphores keep their order) while this thread
                             # waits for tag t+1's credit and resumes it.
                             self._weg2_bar1_register(tag)
+                            self._weg2_turns_register(tag)
                             _wake_futs.append((str(tag), _wake_worker.submit(
                                 self._weg2_wake_collect_one, tag)))
                             # weg2xsn110: BOUNDED run-ahead. Unbounded, the
@@ -8773,6 +8905,7 @@ class SchedulerWeightUpdaterManager:
                                 _wake_futs[-(_n_wake_workers + 1)][1].result()
                         else:
                             self._weg2_bar1_register(tag)
+                            self._weg2_turns_register(tag)
                             self._weg2_wake_collect_one(tag)
                     elif (str(tag) == _WEIGHTS_DRAFT_TAG
                             and self._weg2_xchg_draft_reload_from_disk()):

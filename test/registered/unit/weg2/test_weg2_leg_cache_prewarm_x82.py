@@ -63,7 +63,10 @@ def test_the_boot_warm_up_fills_both_hooks_of_this_ranks_lane_cache(monkeypatch)
     _stub_manifests(monkeypatch, calls)
     m = _Bare("D", 0)
     ms = m._weg2_warm_leg_cache()
-    assert sorted(ms) == ["hook:destination", "hook:source", "leg:authoritative", "leg:source"]
+    # H11: plus the per-tag key of the deposit/collect (tag:*, -1 here: the
+    # stub carries no model to derive from; test_weg2_flip_legs_h11.py pins it)
+    assert sorted(ms) == ["hook:destination", "hook:source", "leg:authoritative", "leg:source",
+                          "tag:authoritative", "tag:source"]
     # fnFL2x84: the hook's plan for both hooks, narrowed to the pair's agreement
     assert m.hook_plans == [("source", "D", 0, "AGREED", True),
                             ("destination", "D", 0, "AGREED", True)]

@@ -425,6 +425,28 @@ class Envs:
     SGLANG_PHASE_FLIP_REFILL_DEPTH = EnvInt(2)
     SGLANG_PHASE_FLIP_REFILL_SAVE_SLICES = EnvInt(4)
 
+    # Weg-2 flip legs (H11, fnFL2x83-x105): the non-physics time of the legs.
+    # TAG_PLAN_PREWARM: the per-tag plan key the deposit (hook=source) and the
+    # collect (hook=authoritative) read is derived at boot with the hook plans,
+    # not by the first tag of the first flip (PP0 106-517 ms, D 200-330 ms).
+    SGLANG_WEG2_TAG_PLAN_PREWARM = EnvBool(True)
+    # WAKE_LANE_TURNS: the tag-order gate of a host/IPC lane waits only for the
+    # earlier tags that USE that lane (a turn per lane, as the BAR1 lanes do),
+    # not for every earlier tag of every source card.
+    SGLANG_WEG2_WAKE_LANE_TURNS = EnvBool(True)
+    # WAKE_COLLECT_SPARE: collect workers beyond the run-ahead bound
+    # (SGLANG_WEG2_WAKE_COLLECT_WORKERS, default 2). The bound keeps bound+1
+    # collects submitted; a pool of exactly `bound` queued the just-resumed
+    # tag behind two tags of other source cards (x105 PP0 weights_1/2: lane
+    # p0 waited 115/139 ms). 0 = the pool of the 2026-09-18 form. Resumes and
+    # VRAM are unchanged by it.
+    SGLANG_WEG2_WAKE_COLLECT_SPARE = EnvInt(1)
+    # CREDIT_LIVE_STAGING: the waker's credit check subtracts only the peer's
+    # stagings that are booked but not yet allocated; an allocated staging is
+    # already missing from the free reading (x105 TP2: 943 MiB counted twice,
+    # 311 + 293 ms credit waits).
+    SGLANG_WEG2_CREDIT_LIVE_STAGING = EnvBool(True)
+
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     # Controls weight-file ordering for load-time I/O optimization.

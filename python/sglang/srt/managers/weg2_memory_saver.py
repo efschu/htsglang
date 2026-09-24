@@ -970,6 +970,48 @@ class _AllocatableTransient(Exception):
     it, sleeps outside the lock and re-tries. Never leaves `wait_for`."""
 
 
+def staging_to_subtract(before: Dict[str, Any], after: Dict[str, Any]) -> int:
+    """H11: how much of the peer's booked staging a free reading taken
+    between the ledger records ``before`` and ``after`` may still count as
+    free.
+
+    A staging is booked (:meth:`VramCredit.debit`) BEFORE its cudaMalloc and
+    marked live (:meth:`VramCredit.mark_live`) after it returned. Only the
+    booked-not-yet-live part can hide in a free reading; the live part is
+    already missing from it. Every debit, refund and mark_live bumps
+    ``stage_gen``: when it moved between the two records the reading may
+    straddle a malloc or a free, and the whole booking is subtracted (the
+    larger of the two records -- the pre-H11 rule, never less)."""
+    staged_b = int(before.get("staged_bytes", 0) or 0)
+    staged_a = int(after.get("staged_bytes", 0) or 0)
+    if int(before.get("stage_gen", -1)) != int(after.get("stage_gen", -2)):
+        return max(staged_b, staged_a)
+    return max(0, staged_a - int(after.get("live_bytes", 0) or 0))
+
+
+class StageBooking:
+    """H11: one IPC staging booked against a leg's :class:`VramCredit`.
+    Called, it refunds (the refund-callable contract of
+    ``weight_exchange_bounce._stage_alloc``); :meth:`live` marks the booking
+    allocated once the cudaMalloc returned."""
+
+    def __init__(self, credit: "VramCredit", tag: str, nbytes: int):
+        self._credit = credit
+        self._tag = str(tag)
+        self._nbytes = int(nbytes)
+        self._live = False
+
+    def live(self) -> None:
+        if not self._live:
+            self._credit.mark_live(self._nbytes)
+            self._live = True
+
+    def __call__(self) -> None:
+        self._credit.refund(self._tag, self._nbytes,
+                            live_bytes=self._nbytes if self._live else 0)
+        self._live = False
+
+
 class VramCredit:
     """The device-side mirror of the host ring's bitmap, per physical GPU.
 
@@ -1129,6 +1171,7 @@ class VramCredit:
                     return False
                 state["overdraw_bytes"] = int(state.get("overdraw_bytes", 0)) + want
                 state["staged_bytes"] = staged + want
+                state["stage_gen"] = int(state.get("stage_gen", 0)) + 1
                 stagings = list(state.get("stagings", []))
                 stagings.append(str(tag) + ":overdraw")
                 state["stagings"] = stagings
@@ -1136,15 +1179,18 @@ class VramCredit:
                 return True
             state["consumed_bytes"] = consumed + want
             state["staged_bytes"] = staged + want
+            state["stage_gen"] = int(state.get("stage_gen", 0)) + 1
             stagings = list(state.get("stagings", []))
             stagings.append(str(tag))
             state["stagings"] = stagings
             self._store(handle, state)
             return True
 
-    def refund(self, tag: str, nbytes: int) -> None:
+    def refund(self, tag: str, nbytes: int, live_bytes: int = 0) -> None:
         """The staging booked by :meth:`debit` is freed: the bytes return
-        to the balance (never below zero, never past what was staged)."""
+        to the balance (never below zero, never past what was staged).
+        ``live_bytes``: the part of it :meth:`mark_live` had marked allocated
+        (H11) -- it leaves the live count with it."""
         want = max(0, int(nbytes))
         with self._locked(True) as handle:
             state = self._load(handle)
@@ -1153,12 +1199,41 @@ class VramCredit:
             staged = int(state.get("staged_bytes", 0))
             give = min(want, staged)
             state["staged_bytes"] = staged - give
+            live = int(state.get("live_bytes", 0))
+            state["live_bytes"] = min(staged - give, max(0, live - max(0, int(live_bytes))))
+            state["stage_gen"] = int(state.get("stage_gen", 0)) + 1
             # an overdrawn staging never touched consumed_bytes: refund it first
             over = int(state.get("overdraw_bytes", 0))
             from_over = min(give, over)
             state["overdraw_bytes"] = over - from_over
             state["consumed_bytes"] = max(0, int(state.get("consumed_bytes", 0)) - (give - from_over))
             self._store(handle, state)
+
+    def mark_live(self, nbytes: int) -> None:
+        """H11: a booked staging's cudaMalloc returned -- its bytes are now
+        missing from the card's free reading, so a waker that subtracts them
+        from that reading again counts them twice (x105 D TP2: 943 MiB of
+        PP2's two c2 stagings, credit waits of 311 and 293 ms for bytes the
+        card held). Never more than is staged."""
+        want = max(0, int(nbytes))
+        with self._locked(True) as handle:
+            state = self._load(handle)
+            if not state or want == 0:
+                return
+            staged = int(state.get("staged_bytes", 0))
+            state["live_bytes"] = min(staged, int(state.get("live_bytes", 0)) + want)
+            state["stage_gen"] = int(state.get("stage_gen", 0)) + 1
+            self._store(handle, state)
+
+    def _staging_to_subtract(self, before: Dict[str, Any]) -> int:
+        """The peer's staging a free reading taken AFTER ``before`` (a
+        :meth:`claim` record) may still overstate -- see
+        :func:`staging_to_subtract`."""
+        if not envs.SGLANG_WEG2_CREDIT_LIVE_STAGING.get():
+            return int(before.get("staged_bytes", 0) or 0)
+        with self._locked(False) as handle:
+            after = self._load(handle)
+        return staging_to_subtract(before, after)
 
     def leg_complete(self) -> None:
         """S closes its leg.  This is W's terminating predicate."""
@@ -1255,6 +1330,8 @@ class VramCredit:
                 "claimed_bytes": claimed,
                 "covered": covered,
                 "staged_bytes": int(state.get("staged_bytes", 0)),
+                "live_bytes": int(state.get("live_bytes", 0)),
+                "stage_gen": int(state.get("stage_gen", 0)),
                 "leg_complete": bool(state.get("leg_complete")),
                 "stale_epoch": stale_epoch,
                 "gate": gate_value,
@@ -1418,7 +1495,7 @@ class VramCredit:
             # peer has live (debited) right now, so a malloc in flight cannot
             # be double-counted as free.
             _free_again = int(free_reader() if free_reader is not None else free_bytes_now)
-            _staged = int(spent.get("staged_bytes", 0))
+            _staged = self._staging_to_subtract(spent)
             if _free_again - floor - _staged >= need:
                 spent = self.claim(tag, need, epoch=epoch, overdraw=True)
                 logger.info(
@@ -1677,7 +1754,7 @@ class VramCredit:
             # W35, boot dead, with room on every card.
             if free_reader is not None:
                 _free_loop = self._free_now(free_reader)
-                _staged_loop = int(rec.get("staged_bytes", 0) or 0)
+                _staged_loop = self._staging_to_subtract(rec)
                 if _free_loop is not None and _free_loop - floor - _staged_loop >= need:
                     spent = self.claim(tag, need, epoch=epoch, overdraw=True)
                     logger.info(
