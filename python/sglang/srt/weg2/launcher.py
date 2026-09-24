@@ -105,15 +105,23 @@ PORT_FRONT = 30030
 DEFAULT_FRONT_HOST = "0.0.0.0"
 PORT_P = 30031
 PORT_D = 30032
-EVIDENCE_DIR = "/spinning/evidence-665-f1"
-GPU_ARB = "/spinning/gpu-arb"
+#: RIG PATHS, overridable for a container image (docker plan, stage B,
+#: 2026-09-24). Every default is this rig's literal; with no SGLANG_WEG2_* path
+#: variable set, every value below is byte-identical to before. An EMPTY
+#: variable counts as unset. Most of these have no CLI flag (--evidence-dir only
+#: reaches the ring tables), so the environment is the one seam an image has.
+EVIDENCE_DIR = os.environ.get("SGLANG_WEG2_EVIDENCE_DIR") or "/spinning/evidence-665-f1"
+GPU_ARB = os.environ.get("SGLANG_WEG2_GPU_ARB") or "/spinning/gpu-arb"
 #: The step-0 metal probe's RECORD (C0, WEG2_BUILD_DECISIONS_0906 section 1p).
 #: A FILE, not a number: the per-card duplex ratios C12/C13 gate on are parsed
 #: out of its own measured rows and printed with this path beside them.
 DUPLEX_PROBE_DEFAULT = f"{GPU_ARB}/weg2/PROBE_RING_0907.md"
-DEADMAN = f"{GPU_ARB}/devtools/boot_deadman.sh"
-MEMTS = f"{GPU_ARB}/devtools/mem_timeseries.sh"
-HOST_PREFLIGHT = f"{GPU_ARB}/devtools/host_ledger_preflight.sh"
+#: The three rig helpers main() runs itself. Their own override, so an image can
+#: ship them read-only while GPU_ARB is a writable state volume.
+DEVTOOLS_DIR = os.environ.get("SGLANG_WEG2_DEVTOOLS_DIR") or f"{GPU_ARB}/devtools"
+DEADMAN = f"{DEVTOOLS_DIR}/boot_deadman.sh"
+MEMTS = f"{DEVTOOLS_DIR}/mem_timeseries.sh"
+HOST_PREFLIGHT = f"{DEVTOOLS_DIR}/host_ledger_preflight.sh"
 SHM_DIR = "/dev/shm"
 PRESENCE_DIR = f"{SHM_DIR}/sglang-phase-flip-presence"
 #: #1390: named exactly like `SHM_DIR` above, and for the same reason --
@@ -140,7 +148,8 @@ CGROUP_ROOT = "/sys/fs/cgroup"
 #: tokens x 32,768 B = 9.30 GiB, i.e. the "#1236 Store >= P pool" law violated
 #: by 1.86x before the first flip.  RAM was the wrong currency for a carrier
 #: that has to be at least as large as a pool that already lives in RAM.
-STORE_ROOT = "/spinning/hicache-weg2"
+#: SGLANG_WEG2_STORE_ROOT: see the rig-path block above.
+STORE_ROOT = os.environ.get("SGLANG_WEG2_STORE_ROOT") or "/spinning/hicache-weg2"
 #: C18: where the per-card host-ring files live under the MAP_SHARED form.  A
 #: tmpfs, because the granules must be shared PAGES (both co-located rank
 #: processes map the same file), not a disk-backed file.  THIS COMMENT IS THE
@@ -1250,7 +1259,8 @@ def hicache_disabled_line() -> str:
         "ledger prices anchors_gib/rings_gib/overhead_gib at 0.00 for the "
         "identical reason (see WEG2-HICACHE-DISABLED in this boot's ARM lines)"
     )
-VENV_DEFAULT = "/spinning/htsglang-gpu/.venv"
+#: SGLANG_WEG2_VENV: see the rig-path block at the top (--venv still wins).
+VENV_DEFAULT = os.environ.get("SGLANG_WEG2_VENV") or "/spinning/htsglang-gpu/.venv"
 #: The model context both groups are launched with.  Named once because K9's
 #: --max-kv-per-request default IS this number (the as-built cap, decoupled
 #: from the model context so it can be lowered without touching the context).

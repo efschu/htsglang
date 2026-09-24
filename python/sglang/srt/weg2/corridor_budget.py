@@ -136,7 +136,12 @@ BYTES_PER_MIB = 1 << 20
 #: Where the paired corridor/budget sample lives by default.  Evidence tree,
 #: not the repo: it is a measurement of THIS rig, produced by the front's
 #: corridor sampler plus that boot's own launcher and D-group log lines.
-DEFAULT_SAMPLE_PATH = "/spinning/gpu-arb/weg2/corridor_budget_sample.json"
+#: Follows SGLANG_WEG2_GPU_ARB like the launcher's GPU_ARB (docker plan, stage
+#: B); unset or empty -> byte-identical to the rig literal.
+DEFAULT_SAMPLE_PATH = (
+    f"{os.environ.get('SGLANG_WEG2_GPU_ARB') or '/spinning/gpu-arb'}"
+    "/weg2/corridor_budget_sample.json"
+)
 
 
 @dataclass(frozen=True)
