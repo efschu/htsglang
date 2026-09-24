@@ -16057,6 +16057,15 @@ class Scheduler(
             from sglang.srt.models.qwen4_exp_ple_admit import note_ple_batch
 
             note_ple_batch(batch.reqs)
+            # fnFL2 H63: under the tail fold a last chunk carries its tail;
+            # its END-only hand-off is armed here, with the stream the END
+            # gather must be ordered on (no-op unless the fold is armed).
+            tail_handoff.arm_fold(
+                batch.reqs,
+                self.token_to_kv_pool_allocator,
+                self.page_size,
+                self.forward_stream,
+            )
         # Pairing objective (#274 slice D): publish this batch's grain shape
         # for the lane's pairing policy. Read-only for the policy, one tuple
         # store here; None on every default path. Publishing must not alter

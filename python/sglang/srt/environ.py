@@ -535,6 +535,20 @@ class Envs:
     # slot of the existing MAX, never a new collective. 0 = no hold (vote at
     # the termination on whatever is staged then).
     SGLANG_WEG2_TAIL_WAIT_MS = EnvInt(1500)
+    # TAIL FOLD (fnFL2 H63, group P, only with TAIL_HANDOFF + TAIL_ADOPT +
+    # TAIL_SKIP_EXTEND): the END-ANCHOR no longer splits the last chunk at
+    # c = floor_r(N-1) when N is not a page multiple -- the tail [c, N) runs
+    # inside the last chunk's forward instead of a forward of its own (x163:
+    # 1-4 tokens, 125-903 ms on PP0, plus one more pipeline round per
+    # request). The page anchor the tree keeps is the same (the extra_buffer
+    # track lands on floor_page(N) == floor_page(N-1)); what is dropped is the
+    # E1 state AT c, which only D's E1 fallback reads (TP0 logs x153b-x166:
+    # 52 skips, 0 skip refusals, i.e. never read). P publishes END-only parts (header e1=False:
+    # rows [floor_page(c), N), ring, GDN state after N, P's token); D votes 2
+    # or 0 for them, a refused skip is the page resume. N % page == 0 keeps
+    # the cut (the fold would track the anchor at N, one token too deep).
+    # False = the H24 form, byte for byte.
+    SGLANG_WEG2_ENABLE_P_TAIL_FOLD = EnvBool(False)
     # DECODE WARM FROM P (fnFL2 H29). P publishes what it saw at the END of
     # the prompt into the hand-off dir (<SGLANG_HICACHE_ARENA_DIR>/handoff):
     # the routed experts of the last LRU_WARM_TOKENS tokens per MoE layer and

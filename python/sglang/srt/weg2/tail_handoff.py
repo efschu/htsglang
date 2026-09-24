@@ -102,6 +102,22 @@ def skip_extend_enabled() -> bool:
     )
 
 
+def fold_enabled() -> bool:
+    """H63: SGLANG_WEG2_ENABLE_P_TAIL_FOLD, only on top of E2 (the END
+    section is then the whole hand-off)."""
+    return bool(envs.SGLANG_WEG2_ENABLE_P_TAIL_FOLD.get()) and skip_extend_enabled()
+
+
+def fold_applies(n_tokens: int, page_size: int) -> bool:
+    """H63: may the tail of an N-token prompt run inside its last chunk?
+    Only where the last chunk's extra_buffer track lands on the same page
+    anchor the cut would give, floor_page(N) == floor_page(N-1), i.e. N not a
+    page multiple; at N % page == 0 the fold would anchor at N (one token
+    deeper than any reader may claim) and the cut stays."""
+    page = int(page_size or 1)
+    return fold_enabled() and page > 1 and int(n_tokens) % page != 0
+
+
 # -- geometry (pure) -------------------------------------------------------------
 def anchor_grain(page_size: int, qsa_ratio: Optional[int]) -> int:
     """Where the end-of-prefill cut may land. 1 without QSA (unchanged);
@@ -242,6 +258,11 @@ class TailHeader(msgspec.Struct, frozen=True):
     #: names the whole manifest, so D can tell "2 of 3 written so far" from
     #: "complete". 0 = a pre-H45 header (the count is unknown).
     n_parts: int = 0
+    #: H63 (tail fold): False = an END-only part. The E1 payload is empty (its
+    #: digests are those of nothing), the layer lists and row shapes above
+    #: describe the END section, and D can serve it as E2 (skip) or not at
+    #: all -- there is no state at c. True = every pre-H63 header.
+    e1: bool = True
 
 
 def _dir() -> str:
@@ -320,22 +341,28 @@ def _end_header(end: EndPayload) -> EndHeader:
 
 def write_part(spec: TailSpec, part: str, fa: Dict[int, Tuple[torch.Tensor, ...]],
                gdn: Dict[int, Tuple[torch.Tensor, ...]], end: Optional[EndPayload] = None,
-               n_parts: int = 0) -> Optional[TailHeader]:
+               n_parts: int = 0, e1: bool = True) -> Optional[TailHeader]:
     """Atomically write one rank's part (payload first, header last: a
     present header means a complete payload). ``end`` (E2) rides along as
     payload key "end" and header field ``end``; ``n_parts`` (H45) is the
-    number of parts P publishes for the rid (its PP size)."""
+    number of parts P publishes for the rid (its PP size). ``e1=False``
+    (H63 tail fold): an END-only part -- ``fa``/``gdn`` must be empty, the
+    layer lists and row shapes are taken from the END section."""
     if not _dir():
         return None
+    if not e1 and (end is None or fa or gdn):
+        raise ValueError("an END-only part (e1=False) carries the END section and no E1 payload")
     fa_t, gdn_t = _fa_order(fa), _gdn_order(gdn)
+    lay_fa, lay_gdn = (fa, gdn) if e1 else (end.fa, end.gdn)
     header = TailHeader(
-        spec=spec, part=part, fa_layers=sorted(fa), gdn_layers=sorted(gdn),
-        fa_row_shapes={str(g): list(fa[g][0].shape[1:]) for g in sorted(fa)},
-        gdn_row_shapes={str(g): list(gdn[g][0].shape[1:]) for g in sorted(gdn)},
+        spec=spec, part=part, fa_layers=sorted(lay_fa), gdn_layers=sorted(lay_gdn),
+        fa_row_shapes={str(g): list(lay_fa[g][0].shape[1:]) for g in sorted(lay_fa)},
+        gdn_row_shapes={str(g): list(lay_gdn[g][0].shape[1:]) for g in sorted(lay_gdn)},
         fa_digest=digest(fa_t), gdn_digest=digest(gdn_t),
         nbytes=_nbytes(fa_t + gdn_t),
         end=_end_header(end) if end is not None else None,
         n_parts=int(n_parts),
+        e1=bool(e1),
     )
     jpath, ppath = part_paths(spec.rid, part)
     os.makedirs(os.path.dirname(jpath), exist_ok=True)
@@ -428,6 +455,9 @@ class _Capture(msgspec.Struct):
     event: object
     #: the scheduler's forward stream (E2 gathers the end state on it)
     stream: object = None
+    #: H63: False = a fold capture (no state at c was taken; the part is
+    #: END-only)
+    e1: bool = True
 
 
 _CAPTURES: Dict[str, _Capture] = {}
@@ -480,6 +510,52 @@ def _capture_state(req, req_to_token_pool, allocator, page_size: int, stream) ->
     _CAPTURES[str(req.rid)] = _Capture(spec=spec, gdn=gdn, event=event, stream=stream)
     while len(_CAPTURES) > capture_keep():  # an aborted prompt never publishes: drop the oldest
         _CAPTURES.pop(next(iter(_CAPTURES)))
+    return True
+
+
+_FOLD_N = [0]
+
+
+def arm_fold(reqs, allocator, page_size: int, stream) -> int:
+    """Scheduler entry (every extend batch, before its forward; H63): under
+    the tail fold register an END-only capture for each request whose extend
+    reaches the end of its prompt -- its last chunk carries the tail, so no
+    stash at c ever happens and ``publish_rows`` needs the capture (and the
+    forward stream the END gather is ordered on) from here. Never raises into
+    the scheduler; returns how many were registered."""
+    if not fold_enabled():
+        return 0
+    n = 0
+    for req in reqs:
+        try:
+            if _arm_fold_one(req, allocator, page_size, stream):
+                n += 1
+        except Exception as exc:  # noqa: BLE001 -- no capture = no part = D's page resume, named
+            logger.warning("WEG2-TAIL-FOLD arm failed rid=%s (%s: %s)", getattr(req, "rid", "?"),
+                           type(exc).__name__, exc)
+    return n
+
+
+def _arm_fold_one(req, allocator, page_size: int, stream) -> bool:
+    if not _is_p_request(req) or getattr(req, "extend_range", None) is None:
+        return False
+    fill = req.full_untruncated_fill_ids
+    if int(req.extend_range.end) != len(fill) or not fold_applies(len(fill), page_size):
+        return False
+    spec = spec_for(req.rid, req.origin_input_ids, req.extra_key, page_size, _grain_of(allocator, page_size))
+    if spec is None or spec.n_tokens != len(fill):
+        return False
+    _CAPTURES[str(req.rid)] = _Capture(spec=spec, gdn={}, event=None, stream=stream, e1=False)
+    while len(_CAPTURES) > capture_keep():  # an aborted prompt never publishes: drop the oldest
+        _CAPTURES.pop(next(iter(_CAPTURES)))
+    _FOLD_N[0] += 1
+    if _FOLD_N[0] <= 8 or _FOLD_N[0] % 64 == 0:
+        logger.info(
+            "WEG2-TAIL-FOLD rid=%s n_tokens=%d page_prefix=%d cut=%d: the tail runs in the last chunk "
+            "[%d, %d), END-only part at its finish (n=%d)",
+            spec.rid, spec.n_tokens, spec.page_prefix, spec.cut, int(getattr(req.extend_range, "start", -1)),
+            int(req.extend_range.end), _FOLD_N[0],
+        )
     return True
 
 
@@ -578,6 +654,17 @@ def _publish_rows(req, kv_indices: torch.Tensor, allocator, part: str, req_to_to
     except Exception as exc:  # noqa: BLE001 -- a failed END capture is E1, named
         logger.warning("WEG2-TAIL-PUBLISH end=none rid=%s reason=raised:%s: %s", spec.rid, type(exc).__name__, exc)
         end = None
+    if not cap.e1:
+        # H63 tail fold: no state at c exists, so a part without its END
+        # section would hand D nothing; D waits NO_PARTS_WAIT_S, then resumes
+        # at the page anchor (today's extend)
+        if end is None:
+            logger.info("WEG2-TAIL-PUBLISH fold rid=%s: END refused, no part (D resumes at page_prefix=%d)",
+                        spec.rid, spec.page_prefix)
+            return
+        threading.Thread(target=_write_and_log, args=(spec, part, {}, {}, end, n_parts, False), daemon=True,
+                         name="weg2-tail-publish").start()
+        return
     if cap.event is not None:
         # recorded on the forward stream after the chunk [X, c): once it has
         # fired, that chunk's KV rows are written too (stream order)
@@ -657,11 +744,12 @@ def _ring_rows(kvpool, req_pool_idx: int, ring_rows: int):
     return ring, _to_host(kvpool.qsa_rope_position_buffer.index_select(0, idx))
 
 
-def _write_and_log(spec: TailSpec, part: str, fa, gdn, end: Optional[EndPayload] = None, n_parts: int = 0) -> None:
+def _write_and_log(spec: TailSpec, part: str, fa, gdn, end: Optional[EndPayload] = None, n_parts: int = 0,
+                   e1: bool = True) -> None:
     try:
         if end is not None and end.event is not None:
             end.event.synchronize()  # the forward-stream gather has landed
-        header = write_part(spec, part, fa, gdn, end=end, n_parts=n_parts)
+        header = write_part(spec, part, fa, gdn, end=end, n_parts=n_parts, e1=e1)
         _prune(spec.rid)
     except Exception:  # noqa: BLE001 -- a hand-off that fails is the page-prefix resume
         logger.warning("WEG2-TAIL-PUBLISH write failed rid=%s", spec.rid, exc_info=True)
@@ -678,6 +766,16 @@ def _write_and_log(spec: TailSpec, part: str, fa, gdn, end: Optional[EndPayload]
         )
         return
     e = header.end
+    if not header.e1:
+        logger.info(
+            "WEG2-TAIL-PUBLISH rid=%s page_prefix=%d tail_rows=%d state_at=%d first_token=%d n_tokens=%d part=%s "
+            "of=%d fa_layers=%d gdn_layers=%d groups=%d ring_rows=%d bytes=%d end_key=%s end_digests=%s/%s/%s "
+            "| E1 absent (fold): cut=%d key=%s (n=%d)",
+            spec.rid, spec.page_prefix, e.rows, spec.n_tokens, e.first_token, spec.n_tokens, part, header.n_parts,
+            len(header.fa_layers), len(header.gdn_layers), e.groups, e.ring_rows, e.nbytes, e.key, e.fa_digest,
+            e.gdn_digest, e.ring_digest, spec.cut, spec.key, _PUBLISH_N[0],
+        )
+        return
     logger.info(
         "WEG2-TAIL-PUBLISH rid=%s page_prefix=%d tail_rows=%d state_at=%d first_token=%d n_tokens=%d part=%s "
         "of=%d fa_layers=%d gdn_layers=%d groups=%d ring_rows=%d bytes=%d end_key=%s end_digests=%s/%s/%s "

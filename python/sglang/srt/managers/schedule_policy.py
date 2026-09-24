@@ -237,6 +237,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.weg2 import tail_adopt
+from sglang.srt.weg2 import tail_handoff
 from sglang.srt.managers import anchor_tails as _anchor_tails
 
 if TYPE_CHECKING:
@@ -1565,12 +1566,29 @@ class PrefillAdder:
         chunk boundary -- and therefore a published recurrent anchor -- lands
         at N-1, the deepest position a later reader can claim. Identity when
         disarmed, when chunked prefill is off (no continuation machinery to
-        schedule the held token), or when the extend does not reach the end.
+        schedule the held token), when the extend does not reach the end, or
+        under the H63 tail fold (``tail_handoff.fold_applies``).
         """
         if not _WEG2_END_ANCHOR or self.rem_chunk_tokens is None or length < 2:
             return length, False
         end = start + length
         if end != len(req.full_untruncated_fill_ids):
+            return length, False
+        # fnFL2 H63 (SGLANG_WEG2_ENABLE_P_TAIL_FOLD, on top of E2): the tail
+        # runs inside this last chunk. The page anchor the tree keeps is the
+        # same -- the chunk's extra_buffer track lands on floor_page(end),
+        # which is floor_page(end - 1) unless end is a page multiple (then the
+        # cut below stays) -- and D takes the END state P publishes at the
+        # finish (weg2/tail_handoff.arm_fold); no state at c is ever needed.
+        if tail_handoff.fold_applies(end, self.page_size):
+            n = getattr(PrefillAdder, "_weg2_end_anchor_folds", 0) + 1
+            PrefillAdder._weg2_end_anchor_folds = n
+            if n <= 8 or n % 64 == 0:
+                logger.info(
+                    "WEG2 END-ANCHOR FOLD n=%d rid=%s: the last chunk [%d, %d) carries the tail, "
+                    "no own forward (page %d)",
+                    n, getattr(req, "rid", "?"), start, end, int(self.page_size),
+                )
             return length, False
         # fnFL2x14 (23.09.): under QSA the anchor lands on a PAGE boundary,
         # not at N-1. QSA compresses groups of `qsa_compress_ratio` tokens and

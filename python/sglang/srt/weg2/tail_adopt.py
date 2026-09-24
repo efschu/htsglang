@@ -246,6 +246,10 @@ class Staged(msgspec.Struct):
     #: else "none:<why>")
     n_parts: int = 0
     token_src: str = "none"
+    #: H63 (tail fold): False = the parts are END-only (``TailHeader.e1``):
+    #: no state at c exists, so this rid is served as E2 (vote 2) or not at
+    #: all (vote 0) -- never E1
+    e1: bool = True
 
     @property
     def ok(self) -> bool:
@@ -288,7 +292,8 @@ def _stage_e1(headers: List[th.TailHeader], held: HeldShapes, check_digest: bool
     """E1 (H21): rows [floor_page(c), c) + state at c; ``bundles`` receives
     the part payloads read (holding rank only)."""
     spec = headers[0].spec
-    st = Staged(spec=spec, headers=list(headers), verdict="ready", qsa_ratio=held.qsa_ratio)
+    st = Staged(spec=spec, headers=list(headers), verdict="ready", qsa_ratio=held.qsa_ratio,
+                e1=all(h.e1 for h in headers))
     for h in headers:
         if h.spec != spec:
             st.verdict = f"spec_differs:{h.part}"
@@ -316,6 +321,11 @@ def _stage_e1(headers: List[th.TailHeader], held: HeldShapes, check_digest: bool
         bundles.append(bundle)
         fa.update({int(g): tuple(t) for g, t in bundle["fa"].items() if int(g) in held.fa})
         gdn.update({int(g): tuple(t) for g, t in bundle["gdn"].items() if int(g) in held.gdn})
+    if not st.e1:
+        # H63 END-only parts: the headers' layer lists and row shapes (checked
+        # above) describe the END section, which _stage_end checks row by
+        # row; there is no E1 payload to check, pin or install
+        return st
     rows = spec.rows
     for g, want in held.fa.items():
         lead = [rows, rows] + ([rows // held.qsa_ratio] if held.qsa_ratio else [])
@@ -607,7 +617,10 @@ def local_vote(rid: str) -> int:
         job.thread.join(STAGE_JOIN_S)
     if not job.box or not job.box[0].ok:
         return 0
-    return 2 if job.box[0].end_ok and _SKIP_SERVER[0] else 1
+    if job.box[0].end_ok and _SKIP_SERVER[0]:
+        return 2
+    # H63: END-only parts carry no state at c -- no E1 level to offer
+    return 1 if job.box[0].e1 else 0
 
 
 def agree(rid: str, group_vote: int) -> None:
@@ -631,7 +644,9 @@ def agree(rid: str, group_vote: int) -> None:
         first, src = end_token(job.headers)
         st = Staged(spec=job.headers[0].spec, headers=list(job.headers), verdict=why, n_parts=job.want,
                     first_token=first, token_src=src)
-    agreed = group_vote >= 1 and st.ok
+    # H63: END-only parts are agreed only as the skip (every rank reads the
+    # same headers, so st.e1 is uniform and so is this answer)
+    agreed = group_vote >= 1 and st.ok and (st.e1 or group_vote >= 2)
     skip = group_vote >= 2 and st.end_ok
     if not skip:
         st.drop_end()
@@ -671,10 +686,11 @@ def _log_ready(st: Staged, adopt: str, skip: bool = False, skip_note: str = "", 
         rows, state_at, extend = spec.rows, spec.cut, spec.extend
     logger.info(
         "WEG2-TAIL-READY rid=%s page_prefix=%d tail_rows=%d state_at=%d extend=%d parts=%d/%s key=%s "
-        "verdict=%s adopt=%s end=%s first_token=%d token_src=%s waited_ms=%.0f%s",
+        "verdict=%s adopt=%s end=%s first_token=%d token_src=%s waited_ms=%.0f%s%s",
         spec.rid, spec.page_prefix, rows, state_at, extend, len(st.headers), st.n_parts or "?", spec.key,
         st.verdict, adopt, st.end_verdict, st.first_token, st.token_src, waited_ms,
         f" skip_refused={skip_note}" if skip_note else "",
+        "" if st.e1 else " e1=absent(fold)",
     )
 
 
@@ -718,6 +734,13 @@ def plan_adopt(req, prefix_len: int, batch_empty: bool = True) -> Optional[Agree
     if entry.skip:
         why = skip_refusal(entry, req, batch_empty)
         if why:
+            if not entry.staged.e1:
+                # H63: END-only parts have no E1 to fall back on -- today's
+                # extend from the page anchor, uniformly (every input of
+                # skip_refusal is rank-uniform)
+                entry.staged.drop_end()
+                _log_ready(entry.staged, f"skipped:end_only:{why}", waited_ms=entry.waited_ms)
+                return None
             entry.skip, entry.skip_note = False, f"admission:{why}"
             entry.staged.drop_end()
     return entry
