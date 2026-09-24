@@ -571,6 +571,17 @@ class Envs:
     # card still lacks free - floor - staging for the next D tag: W35 after
     # the 120 s credit budget). 0 = the lines are printed, the boot goes on.
     SGLANG_WEG2_ENABLE_PD_CREDIT_REFUSAL = EnvBool(True)
+    # WARM_MIN_DWELL (H34b, fnFL2x148): the front's min-dwell (K7) prices a
+    # round trip with a measured flip. The boot's FIRST flip is not one: it
+    # registers the on-card lanes' host staging buffers for the first time
+    # (x148: cudaHostRegister 7.3/7.8/7.9/5.9 s, flip 24.6 s against 1.6-2.2 s
+    # afterwards) and held the next D->P flip 24.6 s (TTFT 34 s instead of
+    # 17). On: the dwell is the median of the last MIN_DWELL_WINDOW flips in
+    # the same direction WITHOUT the boot's first flip, else the median of the
+    # later flips of either direction, else 0. 0 = the last same-direction
+    # flip, first flip included (the pre-H34b rule).
+    SGLANG_WEG2_ENABLE_WARM_MIN_DWELL = EnvBool(True)
+    SGLANG_WEG2_MIN_DWELL_WINDOW = EnvInt(5)
     # SLEEP_RELEASE_LMEM (H15, fnFL2x120): a complete sleep lowers the context's
     # per-thread stack limit (cuCtxSetLimit), which frees the driver's
     # local-memory reservation (derived 255 MiB per process on the 5090,

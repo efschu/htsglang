@@ -1,0 +1,11 @@
+[2026-09-24 11:56:53,563] INFO weg2.front: WEG2 MIN-DWELL src=D dst=P awake_ms=18145 derived_from_flip_ms=0 overridden_by=none provenance=none-first-flip verdict=flip
+[2026-09-24 11:57:23,773] INFO weg2.front: WEG2-FLIP done epoch=1 slept=D woke=P flip_total=24598 ms
+[2026-09-24 11:57:56,782] INFO weg2.front: WEG2-FLIP done epoch=2 slept=P woke=D flip_total=2296 ms
+[2026-09-24 11:58:03,815] INFO weg2.front: WEG2 MIN-DWELL src=D dst=P awake_ms=7108 derived_from_flip_ms=24598 overridden_by=none provenance=last-flip-D->P verdict=hold
+[2026-09-24 11:58:21,321] INFO weg2.front: WEG2 MIN-DWELL src=D dst=P awake_ms=24614 derived_from_flip_ms=24598 overridden_by=none provenance=last-flip-D->P verdict=flip
+[2026-09-24 11:58:23,234] INFO weg2.front: WEG2-FLIP done epoch=3 slept=D woke=P flip_total=1865 ms
+[2026-09-24 11:58:36,372] INFO weg2.front: WEG2-FLIP done epoch=4 slept=P woke=D flip_total=1835 ms
+[2026-09-24 11:58:50,833] INFO weg2.front: WEG2-FLIP done epoch=5 slept=D woke=P flip_total=1964 ms
+[2026-09-24 11:58:58,132] INFO weg2.front: WEG2-FLIP done epoch=6 slept=P woke=D flip_total=1804 ms
+[2026-09-24 11:59:16,005] INFO weg2.front: WEG2-FLIP done epoch=7 slept=D woke=P flip_total=1950 ms
+[2026-09-24 11:59:23,422] INFO weg2.front: WEG2-FLIP done epoch=8 slept=P woke=D flip_total=1819 ms

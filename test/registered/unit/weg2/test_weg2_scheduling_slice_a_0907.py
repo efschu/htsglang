@@ -631,10 +631,18 @@ def test_t10_a_trickle_below_the_threshold_does_not_buy_a_round_trip():
 def test_t10b_min_dwell_is_derived_from_the_last_flip_and_names_its_overrides():
     """C8/K7: dwell derived from the last completed flip in THAT direction,
     0 before the first, and two named overrides."""
+    from sglang.srt.environ import envs
+
     f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0)
     assert f._derived_min_dwell_ms("D", "P") == (0.0, "none-first-flip")
     f.flip_log.append({"sleep": "D", "wake": "P", "flip_ms": 14000})
-    assert f._derived_min_dwell_ms("D", "P") == (14000.0, "last-flip-D->P")
+    # H34b: by default the boot's first flip is no price (cold lanes); the
+    # pre-H34b rule -- the last same-direction flip -- stays behind the switch
+    assert f._derived_min_dwell_ms("D", "P")[0] == 0.0
+    with envs.SGLANG_WEG2_ENABLE_WARM_MIN_DWELL.override(False):
+        assert f._derived_min_dwell_ms("D", "P") == (14000.0, "last-flip-D->P")
+    f.flip_log.append({"sleep": "D", "wake": "P", "flip_ms": 14000})
+    assert f._derived_min_dwell_ms("D", "P")[0] == 14000.0
     f.t_awake = time.time()  # just woke: dwell not served
     assert f._dwell_ok("D", "P", fairness_fired=False, work_exhausted=False,
                        oldest_wait_s=0.0) is False

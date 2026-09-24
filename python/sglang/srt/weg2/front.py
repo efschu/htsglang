@@ -53,6 +53,7 @@ import json
 import logging
 import os
 import re
+import statistics
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -1719,6 +1720,42 @@ def credit_pause_order(order: List[str], why: str, plan: Optional[Dict[str, Any]
         order, table, free_mib=free, floor_mib=floors,
         double_staging=not envs.SGLANG_WEG2_CREDIT_LIVE_STAGING.get())
     return new, why + ", " + note
+
+
+def warm_min_dwell_ms(flip_log: List[dict], src: str, dst: str, *,
+                      window: int = 5) -> Tuple[float, str]:
+    """H34b (fnFL2x148): K7's min-dwell from the boot's WARM flips.
+
+    The boot's first flip is not the price of a round trip: it is the only
+    flip that registers the on-card lanes' host staging buffers (``WEG2-SEQ
+    persist ... new/grow ... register_ms``). fnFL2x148 epoch 1 (D->P) spent
+    7.3 + 7.8 + 7.9 + 5.9 s in cudaHostRegister and took 24.6 s; every later
+    flip took 1.6-2.2 s. Priced with the 24.6 s, the next D->P flip was held
+    24.6 s (87 ``verdict=hold`` lines, TTFT 34 s instead of 17).
+
+    So: the median of the last ``window`` flips ``src -> dst`` after the
+    boot's first flip; before there is one, the median of the last ``window``
+    later flips of EITHER direction (what a warm flip costs on this rig);
+    before any later flip, 0 -- the same as before the first flip. The
+    provenance is one token (the log line is split on spaces) and names what
+    was excluded."""
+    if not flip_log:
+        return 0.0, "none-first-flip"
+    first = flip_log[0]
+    tail = ":first-flip-%s->%s-%dms-excluded" % (
+        first.get("sleep"), first.get("wake"), int(float(first.get("flip_ms") or 0.0)))
+    later = [r for r in flip_log[1:] if float(r.get("flip_ms") or 0.0) > 0.0]
+    n = max(1, int(window))
+    same = [r for r in later if r.get("sleep") == src and r.get("wake") == dst][-n:]
+    if same:
+        ms = statistics.median(float(r["flip_ms"]) for r in same)
+        return float(ms), "median-warm-%s->%s:n=%d%s" % (src, dst, len(same), tail)
+    anyd = later[-n:]
+    if anyd:
+        ms = statistics.median(float(r["flip_ms"]) for r in anyd)
+        return float(ms), "median-warm-any-direction:n=%d:no-warm-%s->%s-yet%s" % (
+            len(anyd), src, dst, tail)
+    return 0.0, "none-after-first-flip" + tail
 
 
 def timed_pause_order(order: List[str], why: str, plan: Optional[Dict[str, Any]],
@@ -5356,6 +5393,9 @@ class Front:
         """
         if self.min_dwell_ms is not None:
             return self.min_dwell_ms, "flag"
+        if envs.SGLANG_WEG2_ENABLE_WARM_MIN_DWELL.get():
+            return warm_min_dwell_ms(self.flip_log, src, dst,
+                                     window=envs.SGLANG_WEG2_MIN_DWELL_WINDOW.get())
         for rec in reversed(self.flip_log):
             if rec.get("sleep") == src and rec.get("wake") == dst:
                 return float(rec.get("flip_ms") or 0.0), f"last-flip-{src}->{dst}"
