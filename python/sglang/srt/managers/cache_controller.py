@@ -21,6 +21,7 @@ import threading
 import time
 
 from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
+from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -2184,8 +2185,11 @@ class HiCacheController:
         _, rows = self._dcp_owned_device_rows(device_indices)
         if rows.numel() == 0:
             return False
-        row_max = int(rows.max())
-        row_min = int(rows.min())
+        # #PGAP: these two reads wait for the stream the rows were written on --
+        # the host sync a chunk publish inside the plan waited on (xsn420).
+        with _weg2_p_overlap.span("rowcheck"):
+            row_max = int(rows.max())
+            row_min = int(rows.min())
         if row_min >= 0 and row_max < cap:
             return False
         n = getattr(self, "_unaddressable_kv_rows_refused", 0) + 1

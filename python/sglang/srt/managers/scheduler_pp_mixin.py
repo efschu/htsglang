@@ -95,6 +95,7 @@ logger = logging.getLogger(__name__)
 
 
 from sglang.srt.managers.weg2_pass_timer import read_ms as _pt_read
+from sglang.srt.managers import weg2_p_overlap as _pov
 
 
 def _1463_timed(attr: str):
@@ -5088,6 +5089,14 @@ class SchedulerPPMixin:
                         self, "_pp_launched_batches", {}
                     )
                     self._pp_launched_batches[mb_id] = cur_batch
+                    if _pov.p_host_overlap_on():
+                        # P-HOST-OVERLAP LEAD BOUND: with the output ring
+                        # skipped for middle chunks nothing else stops this
+                        # rank from running ahead of its downstream, one
+                        # 80 MB frame alive per chunk ahead. Device-side
+                        # only: the forward below waits until the frame sent
+                        # `lead` passes ago has been received.
+                        _pov.bound_proxy_lead(self)
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         cur_batch,
@@ -5104,17 +5113,31 @@ class SchedulerPPMixin:
                     # records no duration; the gap is still measured at
                     # the next `begin`, this only classifies it.
                     self._pp_bubble_note_no_batch()
-                if self.server_args.pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
+                # P-HOST-OVERLAP (weg2_p_overlap.py, item 3): the chunked-
+                # prefill HiCache publish that `cache_unfinished_req` deferred
+                # out of THIS pass's plan runs here, AFTER the launch -- its
+                # host sync then waits for the chunk that finished while the
+                # next one is already queued on the card. Unset = no call.
+                if _pov.p_host_overlap_on():
+                    with _pov.span("deferred_publish"):
+                        _flush = getattr(
+                            self.tree_cache, "weg2_flush_deferred_chunk_publish", None
                         )
-                    )
+                        if _flush is not None:
+                            _flush()
+                if self.server_args.pp_async_batch_depth == 0:
+                    with _pov.span("output_commit"):
+                        next_pp_outputs, next_batch_result, d2h_event = (
+                            self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                                next_first_rank_mb_id,
+                                next_mb_id,
+                            )
+                        )
                 if self.mbs[next_mb_id] is not None:
                     # #1002d: a declined output leaves this unset by design.
                     if d2h_event is not None:
-                        d2h_event.synchronize()
+                        with _pov.span("d2h_wait"):
+                            d2h_event.synchronize()
                     # #1009: THE OTHER HALF OF THE PRECONDITION. `self.mbs[
                     # next_mb_id] is not None` asks whether the slot HOLDS a
                     # batch; it does not ask whether that batch has RUN. On a
@@ -5247,7 +5270,7 @@ class SchedulerPPMixin:
                     else:
                         with torch.profiler.record_function(
                             "process_batch_result"
-                        ):
+                        ), _pov.span("process"):
                             self._pp_process_batch_result(
                                 self.mbs[next_mb_id],
                                 next_batch_result,
@@ -5410,6 +5433,23 @@ class SchedulerPPMixin:
                                 # learned nothing this pass.
                                 load_back=getattr(self, "_pp_load_back_wire", None),
                             )
+                        if _pov.p_host_overlap_on():
+                            _pov.note_proxy_send(self, self.send_proxy_work)
+                elif cur_batch and _pov.p_host_overlap_on():
+                    # P-HOST-OVERLAP (weg2_p_overlap.py, item 2): THE LAST RANK
+                    # FENCES ITS SCHEDULE STREAM ON THIS FORWARD, device-side,
+                    # exactly as the ranks above do before their proxy send.
+                    # With SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM a middle
+                    # chunk sends no output, so the `wait_event(q_event)` in
+                    # `_pp_send_output_to_next_stage` -- which ordered the next
+                    # plan's anchor copy and HiCache write start event behind
+                    # this forward as a side effect -- no longer runs. This
+                    # line is that ordering, without the host wait the output
+                    # receive used to hang on it. Idempotent when the output
+                    # was sent (same event, already waited on).
+                    self.device_module.current_stream().wait_event(
+                        self.launch_event
+                    )
 
                 self.pp_outputs = next_pp_outputs
 
@@ -10990,6 +11030,10 @@ class SchedulerPPMixin:
         _bubble = self._pp_bubble_meter()
         if _bubble is not None:
             _bubble.begin(mb_id)
+        # #PGAP (weg2_p_overlap.py): card idle before THIS forward, measured on
+        # the card (timing events on the forward stream), plus the host phases
+        # since the previous launch. None when SGLANG_WEG2_P_HOSTGAP is unset.
+        _gap = self._pp_gap_meter() if _pov.hostgap_on() else None
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
@@ -11001,6 +11045,13 @@ class SchedulerPPMixin:
                 from sglang.srt.managers.weg2_bubble_publish import bubble_end
 
                 bubble_end(self)
+                if _gap is not None:
+                    _gap_host = _pov.take_spans()
+                    # this pass's plan and proxy receive: the per-call timers the
+                    # #1466/#1463 lines already keep, read WITHOUT resetting them
+                    _gap_host["plan"] = float(getattr(self, "_1466_schedule_ms", 0.0) or 0.0)
+                    _gap_host["proxy_recv"] = float(getattr(self, "_1463_recv_ms", 0.0) or 0.0)
+                    _gap.begin()
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
                 set_time_batch(
                     cur_batch.reqs,
@@ -11013,6 +11064,13 @@ class SchedulerPPMixin:
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
+                if _gap is not None:
+                    _gap_host["launch"] = float(getattr(self, "_1466_run_ms", 0.0) or 0.0)
+                    _gap.end(
+                        int(getattr(self, "forward_ct", -1)),
+                        getattr(cur_batch, "extend_num_tokens", None),
+                        _gap_host,
+                    )
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(
@@ -11023,11 +11081,24 @@ class SchedulerPPMixin:
                             ),
                         )
                     )
+        if _gap is not None:
+            for _line in _gap.harvest():
+                logger.info("%s", _line)
         if _bubble is not None:
             _window = _bubble.end()
             if _window:
                 logger.info("%s", _window)
         return result, event
+
+    def _pp_gap_meter(self: Scheduler):
+        """The rank's #PGAP meter (weg2_p_overlap.GapMeter), made on first use;
+        reached only while SGLANG_WEG2_P_HOSTGAP=1."""
+        meter = getattr(self, "_weg2_pgap_meter", None)
+        if meter is None:
+            meter = self._weg2_pgap_meter = _pov.GapMeter(
+                getattr(getattr(self, "ps", None), "pp_rank", "?")
+            )
+        return meter
 
     def _pp_bubble_meter(self: Scheduler):
         """The rank's bubble meter, or None when there is no reporter.

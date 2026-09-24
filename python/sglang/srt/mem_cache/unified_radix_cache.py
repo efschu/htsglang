@@ -8,6 +8,7 @@ import threading
 import time
 
 from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
+from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
 from array import array
 from collections import Counter, defaultdict
 from functools import partial
@@ -980,6 +981,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # The old tree's host rows go back through their pools FIRST -- see
         # `_release_host_values_before_reset` (weg2xsn420, arena references).
         self._release_host_values_before_reset()
+        # P-HOST-OVERLAP: a deferred chunk publish names nodes of the tree being
+        # destroyed; it must not outlive it (empty unless the mode is on).
+        self._weg2_deferred_chunk_publish = []
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.priority = -sys.maxsize
         self.root_node.key = RadixKey(array("q"), None)
@@ -1560,6 +1564,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
+        # P-HOST-OVERLAP: a chunk publish still deferred goes out before the
+        # finish path publishes its own node, so the chain keeps parents first.
+        # Nothing is deferred unless SGLANG_WEG2_P_HOST_OVERLAP=1.
+        self.weg2_flush_deferred_chunk_publish()
 
         kv_committed_len = req.pop_committed_kv_cache()
         # #969L: THE VALUE AT THE PARK INSERT. §S proved this insert IS reached
@@ -1749,15 +1757,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         effective_cache_len = len(token_ids)
-        for comp in self._components_tuple:
-            cl = comp.prepare_for_caching_req(
-                req=req,
-                insert_params=insert_params,
-                token_ids_len=len(token_ids),
-                is_finished=False,
-            )
-            if cl is not None:
-                effective_cache_len = min(effective_cache_len, cl)
+        with _weg2_p_overlap.span("anchor"):  # #PGAP: the mamba anchor (slot + copy)
+            for comp in self._components_tuple:
+                cl = comp.prepare_for_caching_req(
+                    req=req,
+                    insert_params=insert_params,
+                    token_ids_len=len(token_ids),
+                    is_finished=False,
+                )
+                if cl is not None:
+                    effective_cache_len = min(effective_cache_len, cl)
 
         if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
             for comp in self._components_tuple:
@@ -1858,7 +1867,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 insert_result=result,
                 insert_params=insert_params,
             )
-        self._weg2_publish_at_chunk(req, radix_key)   # xsn346: the chunk's node goes out now
+        if _weg2_p_overlap.p_host_overlap_on():
+            # P-HOST-OVERLAP (managers/weg2_p_overlap.py, item 3): the publish
+            # leaves the plan and runs right after the NEXT forward's launch
+            # (`weg2_flush_deferred_chunk_publish`, called by the PP loop).
+            # Later than here, never earlier: xsn358 moved it EARLIER (before
+            # the pass's card wait) and raced the rows it copies (476fa26ca5).
+            self._weg2_defer_chunk_publish(req, radix_key)
+        else:
+            self._weg2_publish_at_chunk(req, radix_key)   # xsn346: the chunk's node goes out now
+
+    def _weg2_defer_chunk_publish(self, req, radix_key) -> None:
+        pend = getattr(self, "_weg2_deferred_chunk_publish", None)
+        if pend is None:
+            pend = self._weg2_deferred_chunk_publish = []
+        pend.append((req, radix_key))
+
+    def weg2_flush_deferred_chunk_publish(self) -> int:
+        """Run the chunk publishes ``cache_unfinished_req`` deferred, oldest
+        first (parents before children, the order the inline call had). Returns
+        how many ran. A no-op with nothing deferred -- which is always, unless
+        SGLANG_WEG2_P_HOST_OVERLAP=1."""
+        pend = getattr(self, "_weg2_deferred_chunk_publish", None)
+        if not pend:
+            return 0
+        self._weg2_deferred_chunk_publish = []
+        for req, radix_key in pend:
+            self._weg2_publish_at_chunk(req, radix_key)
+        return len(pend)
 
     # ---- Internal Helpers ----
 
@@ -3418,9 +3454,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             first = self._weg2_chain_from(getattr(req, "last_node", None))
             if not first:
                 return
-            stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue(),
-                                                clock=_rp.SweepClock(_rp.chunk_budget_s()),
-                                                first=first, chain_only=True) or {}
+            with _weg2_p_overlap.span("publish"):  # #PGAP
+                stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue(),
+                                                    clock=_rp.SweepClock(_rp.chunk_budget_s()),
+                                                    first=first, chain_only=True) or {}
             n = getattr(self, "_weg2_chunk_publish_n", 0) + 1
             self._weg2_chunk_publish_n = n
             if n <= 16 or n % 256 == 0:
@@ -6706,14 +6743,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # Blocking: wait for all pending write-backs
             _1465_t0 = time.perf_counter()
             _1465_n = len(self.ongoing_write_through)
-            while self.ongoing_write_through:
-                for _, finish_event, ack_list in cc.ack_write_queue:
-                    finish_event.synchronize()
-                    for ack_id in ack_list:
-                        if ack_id in self.ongoing_write_through:
-                            self._finish_write_through_ack(ack_id)
-                cc.ack_write_queue.clear()
-                assert len(self.ongoing_write_through) == 0
+            with _weg2_p_overlap.span("evict_drain"):  # #PGAP
+                while self.ongoing_write_through:
+                    for _, finish_event, ack_list in cc.ack_write_queue:
+                        finish_event.synchronize()
+                        for ack_id in ack_list:
+                            if ack_id in self.ongoing_write_through:
+                                self._finish_write_through_ack(ack_id)
+                    cc.ack_write_queue.clear()
+                    assert len(self.ongoing_write_through) == 0
             if _1465_n:
                 logger.info("#1465 WRITE-BACK DRAIN n=%d ms=%.0f (the flush waited for this many in-flight write-throughs)",
                             _1465_n, (time.perf_counter() - _1465_t0) * 1000.0)
