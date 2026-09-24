@@ -10,6 +10,78 @@ import triton
 
 from sglang.srt.layers.attention.fla.utils import tensor_cache
 
+# ---------------------------------------------------------------------------
+# HOST-KNOWN LENGTHS (P-NOSYNC, eager forwards; managers/weg2_p_overlap.py)
+#
+# The eager chunk tables below cost the host two waits per table and forward:
+# ``.tolist()`` of the per-sequence chunk counts (device->host) and ``.to(
+# cu_seqlens)`` / ``new_tensor([0])`` (pageable host->device, non_blocking=
+# False). Each drains the forward stream at the first GDN layer, i.e. waits
+# for the forward still running before this one. The linear-attention
+# backend knows the lengths on the host (``extend_seq_lens_cpu``) and hands
+# them in per cu_seqlens OBJECT (``note_host_seq_lens``); the eager
+# computation then builds the SAME table on the host and sends it pinned,
+# non-blocking. Unregistered tensors -- and every graph-static one, which the
+# pin wrapper below serves first -- keep the stock computation.
+# ---------------------------------------------------------------------------
+_HOST_SEQ_LENS: dict = {}
+_HOST_SEQ_LENS_CAP = 8
+
+
+def note_host_seq_lens(cu_seqlens: torch.Tensor, seq_lens) -> bool:
+    """Register the host lengths of ``cu_seqlens`` (one per sequence, so
+    ``len == numel - 1``). Refused (False) when they cannot be the lengths of
+    that tensor; bounded, oldest first."""
+    try:
+        lens = tuple(int(n) for n in seq_lens)
+    except Exception:  # noqa: BLE001 - a non-iterable mirror: stock path
+        return False
+    if len(lens) != cu_seqlens.numel() - 1 or (lens and min(lens) < 0):
+        return False
+    _HOST_SEQ_LENS.pop(id(cu_seqlens), None)
+    while len(_HOST_SEQ_LENS) >= _HOST_SEQ_LENS_CAP:
+        _HOST_SEQ_LENS.pop(next(iter(_HOST_SEQ_LENS)))
+    _HOST_SEQ_LENS[id(cu_seqlens)] = (cu_seqlens, lens)
+    return True
+
+
+def _host_seq_lens(cu_seqlens: torch.Tensor):
+    entry = _HOST_SEQ_LENS.get(id(cu_seqlens))
+    if entry is None or entry[0] is not cu_seqlens:
+        return None
+    return entry[1]
+
+
+def _to_like(values, dtype, like: torch.Tensor) -> torch.Tensor:
+    """``values`` onto ``like``'s device without a host wait (pinned,
+    non-blocking) -- a plain tensor where there is no CUDA device."""
+    t = torch.tensor(values, dtype=dtype, pin_memory=like.is_cuda)
+    return t.to(like.device, non_blocking=True)
+
+
+def _host_chunk_indices(lens, chunk_size: int, like: torch.Tensor) -> torch.Tensor:
+    """The eager ``_prepare_chunk_indices`` table from host lengths: rows
+    ``[seq, chunk]``, where ``seq`` counts the sequences that HAVE a chunk
+    (``indices.eq(0).cumsum(0) - 1``), in ``like``'s dtype."""
+    flat = []
+    seq = -1
+    for n in lens:
+        for j in range((n + chunk_size - 1) // chunk_size):
+            if j == 0:
+                seq += 1
+            flat.append(seq)
+            flat.append(j)
+    return _to_like(flat, like.dtype, like).view(-1, 2)
+
+
+def _host_chunk_offsets(lens, chunk_size: int, like: torch.Tensor) -> torch.Tensor:
+    """The eager ``_prepare_chunk_offsets`` vector from host lengths: 0 then
+    the running chunk count, int64 (``cumsum`` promotes the integer input)."""
+    acc = [0]
+    for n in lens:
+        acc.append(acc[-1] + (n + chunk_size - 1) // chunk_size)
+    return _to_like(acc, torch.int64, like)
+
 
 @tensor_cache
 def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
@@ -78,6 +150,9 @@ def _graph_static(name: str, fn: Callable) -> Callable:
 def _prepare_chunk_indices(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
+    host = _host_seq_lens(cu_seqlens)  # P-NOSYNC: registered host lengths
+    if host is not None:
+        return _host_chunk_indices(host, int(chunk_size), cu_seqlens)
     indices = torch.cat(
         [
             torch.arange(n)
@@ -91,6 +166,9 @@ def _prepare_chunk_indices(
 def _prepare_chunk_offsets(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
+    host = _host_seq_lens(cu_seqlens)  # P-NOSYNC: registered host lengths
+    if host is not None:
+        return _host_chunk_offsets(host, int(chunk_size), cu_seqlens)
     return torch.cat(
         [cu_seqlens.new_tensor([0]), triton.cdiv(prepare_lens(cu_seqlens), chunk_size)]
     ).cumsum(-1)

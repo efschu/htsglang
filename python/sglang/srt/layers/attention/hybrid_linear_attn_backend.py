@@ -5,6 +5,7 @@ from typing import Optional, Union
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.fla.index import note_host_seq_lens
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
@@ -20,6 +21,7 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     track_mamba_states_if_needed,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -273,6 +275,13 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
+                if _weg2_p_overlap.p_nosync_on():
+                    # P-NOSYNC: FLA's chunk tables for THIS cu_seqlens are
+                    # built from the host lengths (fla/index.py), not by a
+                    # device->host read at the first GDN layer.
+                    note_host_seq_lens(
+                        query_start_loc, forward_batch.extend_seq_lens_cpu
+                    )
                 if (
                     forward_batch.mamba_track_mask is not None
                     and forward_batch.mamba_track_mask.any()

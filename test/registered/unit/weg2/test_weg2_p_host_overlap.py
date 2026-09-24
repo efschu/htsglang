@@ -268,6 +268,33 @@ class TestInstrument(unittest.TestCase):
             self.assertIn("publish", d)
             self.assertEqual(pov.take_spans(), {})
 
+    def test_fi_plan_is_a_launch_term_on_the_line(self):
+        # fi_plan is PART OF launch (flashinfer's blocking plan read), printed
+        # right after it so `launch - fi_plan` reads off one line
+        self.assertEqual(pov._ORDER[pov._ORDER.index("launch") + 1], "fi_plan")
+        line = pov.format_line(1, 7, 4096, 2.0, 500.0, {"launch": 480.0, "fi_plan": 430.0})
+        self.assertIn("launch=480 fi_plan=430", line)
+
+    def test_spans_opened_inside_the_launch_go_on_this_forwards_line(self):
+        src = inspect.getsource(ppm.SchedulerPPMixin._pp_launch_batch)
+        run = src.index("result = self.run_batch(")
+        merge = src.index("for _k, _v in _pov.take_spans().items():", run)
+        self.assertLess(merge, src.index("_gap.end(", run))
+
+    def test_both_flashinfer_prefill_plans_sit_in_the_span(self):
+        # text, not import: the backend module pulls flashinfer in
+        path = os.path.join(os.path.dirname(inspect.getsourcefile(ppm)), "..", "layers",
+                            "attention", "flashinfer_backend.py")
+        text = open(os.path.abspath(path)).read()
+        # the plan call is `_plan_r(` / `_plan_p(`: the stock begin_forward, or
+        # the P-NOSYNC one-plan-ahead partial (test_weg2_p_nosync_launch.py)
+        for call in ("_plan_r(", "_plan_p("):
+            self.assertEqual(text.count(call), 1)
+            i = text.index(call)
+            head = text[text.rindex("\n", 0, text.rindex("\n", 0, i)):i]
+            self.assertIn('with _weg2_p_overlap.span("fi_plan"):', head)
+        self.assertIn("from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap", text)
+
     def test_gap_meter_measures_on_the_card_and_never_syncs(self):
         m = pov.GapMeter(2, event_factory=_Ev)
         m.begin()

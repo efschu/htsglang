@@ -61,6 +61,16 @@ logger = logging.getLogger(__name__)
 #: waiting for it.
 SLOT_TRAIL_ENV = "SGLANG_MAMBA_SLOT_TRAIL"
 _SLOT_TRAIL = os.environ.get(SLOT_TRAIL_ENV, "") == "1"
+
+
+def slot_trail_on() -> bool:
+    """Whether ``note_924d`` records anything. A caller whose ``extra=`` text
+    reads a CUDA tensor (``.tolist()``) asks this first under P-NOSYNC: the
+    argument is evaluated before ``note_924d`` can decline, so an off trail
+    still paid the device sync."""
+    return _SLOT_TRAIL
+
+
 _924D_SEEN: set = set()
 _924D_SEQ = 0
 _924D_CAP = 8192

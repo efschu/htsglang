@@ -124,6 +124,17 @@ def p_nosync_on() -> bool:
     * ``HiCacheController.move_indices`` (direct + layer_first): the device
       indices stay on the device (permuted there) instead of ``.cpu()``.
 
+    SECOND SITE (weg2xsn423, anchor 0 with the above): the PLAN still sat
+    417-495 ms per 4096 chunk, and py-spy PP0 put 1538 of 2263 samples on
+    ``HybridReqToTokenPool.alloc``'s ``mapping[select_index] = t`` -- a Python
+    row list as the index, moved to the device BLOCKING by ``index_put_``. So:
+
+    * ``HybridReqToTokenPool.alloc``: the mapping rows go over pinned memory,
+      non-blocking (``_nosync_mapping_rows``);
+    * ``ScheduleBatch._collect_deferred_mamba_cow_and_clear``: the #924D
+      ``first_state`` note, whose ``extra=`` text ``.tolist()``s a CUDA tensor
+      before ``note_924d`` can decline, is only built with the trail on.
+
     Set for group P by the launcher's ``--p-host-overlap``; unset = the stock
     code paths, byte-identical."""
     return os.environ.get(P_NOSYNC_ENV, "") == "1"
@@ -265,8 +276,13 @@ class GapMeter:
 
 
 _PLAN_PARTS = ("anchor", "publish", "rowcheck", "evict_drain")
-_ORDER = ("plan", "proxy_recv", "launch", "deferred_publish", "output_commit",
-          "d2h_wait", "process")
+#: ``fi_plan`` is PART OF ``launch``: the wall time inside flashinfer's prefill
+#: ``plan()``, whose ``qo_indptr.to("cpu")`` waits for everything queued on the
+#: forward stream. Once the plan no longer waits for the running forward
+#: (P-NOSYNC, memory_pool ``_nosync_mapping_rows``), that wait lands HERE, so
+#: ``launch - fi_plan`` is the launch's own host work.
+_ORDER = ("plan", "proxy_recv", "launch", "fi_plan", "deferred_publish",
+          "output_commit", "d2h_wait", "process")
 
 
 def format_line(rank, fwd_ct, tokens, gap_ms, fwd_ms, host: Dict[str, float]) -> str:

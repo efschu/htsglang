@@ -11066,6 +11066,11 @@ class SchedulerPPMixin:
                 event.record(self.device_module.current_stream())
                 if _gap is not None:
                     _gap_host["launch"] = float(getattr(self, "_1466_run_ms", 0.0) or 0.0)
+                    # spans opened INSIDE this launch (fi_plan: flashinfer's
+                    # blocking plan read) belong to this forward's line, not
+                    # to the next one's take_spans() above
+                    for _k, _v in _pov.take_spans().items():
+                        _gap_host[_k] = _gap_host.get(_k, 0.0) + _v
                     _gap.end(
                         int(getattr(self, "forward_ct", -1)),
                         getattr(cur_batch, "extend_num_tokens", None),

@@ -52,6 +52,7 @@ from sglang.srt.layers.dcp.lockstep import (
     weightless_has_prefix,
 )
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -377,6 +378,110 @@ def _local_attn_head_counts(model_runner: "ModelRunner") -> tuple:
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
 global_override_indptr_cpu = None
+
+
+# ---------------------------------------------------------------------------
+# P-NOSYNC prefill plan (managers/weg2_p_overlap.py, SGLANG_WEG2_P_NOSYNC).
+#
+# flashinfer's prefill plan() (paged AND ragged) opens with
+# ``qo_indptr.to("cpu")`` / ``paged_kv_indptr.to("cpu")``: a BLOCKING
+# device->host read that waits for everything queued on the forward stream.
+# Once the plan no longer waits for the running forward (memory_pool
+# ``_nosync_mapping_rows``), launch(k+1) waits HERE for forward k (py-spy
+# weg2xsn423 PP0: 97 samples on prefill.py:1963 already). The values are known
+# on the host -- seq_lens_cpu, extend_prefix_lens_cpu, the paged-lens mirror --
+# so under P-NOSYNC the normal extend hands plan() HOST indptrs, and its
+# ``.to("cpu")`` is a no-op.
+#
+# That removes the one thing that drained the stream before plan() refilled
+# its PINNED staging buffer (``_pin_memory_int_workspace_buffer``: host plan ->
+# pinned -> cudaMemcpyAsync on the stream). With the host free to run ahead,
+# plan(k+2) could overwrite the staging bytes plan(k+1)'s copy has not read
+# yet. So each wrapper waits (host) for the copy of ITS previous plan before
+# planning again -- one plan ahead of the card, never two.
+# ---------------------------------------------------------------------------
+_P_NOSYNC_PLAN_EVENT_ATTR = "_weg2_p_nosync_plan_copy_event"
+_P_NOSYNC_PLAN_BACKENDS = ("auto", "fa2", "fa3")
+
+
+def _p_nosync_host_indptrs(
+    bs: int,
+    seq_lens_cpu,
+    extend_prefix_lens_cpu,
+    paged_kernel_lens_cpu,
+    paged_kernel_lens_sum,
+):
+    """Host (qo_indptr, paged_kv_indptr, last_page_len) for a normal extend,
+    int32, pinned when CUDA is up -- or None when the host mirrors are absent
+    or disagree (the caller then keeps the stock device plan).
+
+    The qo lengths are ``seq_lens_cpu - extend_prefix_lens_cpu`` (the device
+    qo_indptr is the cumsum of ``seq_lens - prefix_lens``); the paged lengths
+    are the mirror of ``paged_kernel_lens`` and must add up to the host sum the
+    caller already holds; page size is 1, so every last page holds one slot."""
+    try:
+        if seq_lens_cpu is None or extend_prefix_lens_cpu is None:
+            return None
+        if paged_kernel_lens_cpu is None:
+            return None
+
+        def _ints(v):
+            return [int(x) for x in (v.tolist() if torch.is_tensor(v) else v)]
+
+        seq = _ints(seq_lens_cpu)
+        pre = _ints(extend_prefix_lens_cpu)
+        paged = _ints(paged_kernel_lens_cpu)
+        if not (len(seq) == len(pre) == len(paged) == bs) or bs <= 0:
+            return None
+        if sum(paged) != int(paged_kernel_lens_sum) or min(paged) < 0:
+            return None
+        qo, kv = [0], [0]
+        for s, p in zip(seq, pre):
+            if s - p <= 0:
+                return None
+            qo.append(qo[-1] + s - p)
+        for n in paged:
+            kv.append(kv[-1] + n)
+        pin = torch.cuda.is_available()
+
+        def _t(v):
+            return torch.tensor(v, dtype=torch.int32, pin_memory=pin)
+
+        return _t(qo), _t(kv), _t([1] * bs)
+    except Exception:  # noqa: BLE001 - an accelerator: the stock plan stays
+        return None
+
+
+def _p_nosync_plan(wrapper, *args, **kwargs) -> None:
+    """``wrapper.begin_forward`` one plan ahead of the card (see above): wait
+    for the copy of this wrapper's previous plan, plan, fence this one."""
+    prev = getattr(wrapper, _P_NOSYNC_PLAN_EVENT_ATTR, None)
+    if prev is not None:
+        prev.synchronize()
+    wrapper.begin_forward(*args, **kwargs)
+    ev = torch.cuda.Event()
+    ev.record()
+    setattr(wrapper, _P_NOSYNC_PLAN_EVENT_ATTR, ev)
+
+
+def _p_nosync_plan_ok(*wrappers) -> bool:
+    """The host-indptr plan applies: P-NOSYNC on, not capturing, every wrapper
+    on a backend whose plan() takes host indptrs, none on fast_prefill_plan."""
+    if not _weg2_p_overlap.p_nosync_on():
+        return False
+    try:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    for w in wrappers:
+        if w is None:
+            continue
+        if getattr(w, "_backend", "auto") not in _P_NOSYNC_PLAN_BACKENDS:
+            return False
+        if hasattr(getattr(w, "begin_forward", None), "func"):
+            return False  # a partial (fast_prefill_plan): its own host contract
+    return True
 
 
 def fast_prefill_plan(
@@ -7292,6 +7397,9 @@ class FlashInferIndicesUpdaterPrefill:
         # (--speculative-eagle-topk > 1); stays None on every other path so the
         # ragged plan keeps its default (causal chain / non-causal extend).
         ragged_custom_mask = None
+        # P-NOSYNC host indptrs (_p_nosync_host_indptrs); set only by the
+        # normal-extend branch below, None = the stock device plan.
+        nosync_host = None
         if spec_info is None and self.attn_backend.uneven_dcp:
             # Uneven-DCP extend: the paged (prefix) wrapper reads only this
             # rank's OWNED prefix token slots (even-modulo owner rule), with the
@@ -7619,6 +7727,21 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr = qo_indptr[: bs + 1]
 
             custom_mask = cross_attention_custom_mask
+            # P-NOSYNC: the same two vectors from the host mirrors, for plan().
+            # The device ones above stay: the kv-indices kernel reads them.
+            if (
+                custom_mask is None
+                and not use_sliding_window_kv_pool
+                and not (multi_item_params is not None and multi_item_params.is_enabled())
+                and _p_nosync_plan_ok(wrapper_ragged if use_ragged else None, wrapper_paged)
+            ):
+                nosync_host = _p_nosync_host_indptrs(
+                    bs,
+                    seq_lens_cpu,
+                    extend_prefix_lens_cpu,
+                    paged_kernel_lens_cpu,
+                    paged_kernel_lens_sum,
+                )
         else:
             assert isinstance(spec_info, SpecInput)
             if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
@@ -7656,18 +7779,31 @@ class FlashInferIndicesUpdaterPrefill:
                 if self.attn_backend.uneven_dcp
                 else self.num_kv_heads
             )
-            wrapper_ragged.begin_forward(
-                qo_indptr,
-                qo_indptr,
-                ragged_qo_heads,
-                ragged_kv_heads,
-                self.head_dim,
-                q_data_type=self.q_data_type,
-                # Tree-spec only (topk > 1): flashinfer packs this bool mask into
-                # the per-bucket ragged wrapper's custom_mask_buf on every replay
-                # -> CUSTOM mask mode over the draft->draft block. None elsewhere.
-                custom_mask=ragged_custom_mask,
+            # #PGAP fi_plan (weg2_p_overlap.py): flashinfer's plan() reads
+            # qo_indptr device->host BLOCKING (prefill.py `qo_indptr.to("cpu")`),
+            # i.e. it waits for everything queued on the forward stream. The
+            # span names that wait inside the launch; off = a bare yield.
+            # Under P-NOSYNC (nosync_host set) plan() gets the host indptr and
+            # runs one plan ahead of the card (_p_nosync_plan).
+            _qo_r = qo_indptr if nosync_host is None else nosync_host[0]
+            _plan_r = (
+                wrapper_ragged.begin_forward
+                if nosync_host is None
+                else partial(_p_nosync_plan, wrapper_ragged)
             )
+            with _weg2_p_overlap.span("fi_plan"):
+                _plan_r(
+                    _qo_r,
+                    _qo_r,
+                    ragged_qo_heads,
+                    ragged_kv_heads,
+                    self.head_dim,
+                    q_data_type=self.q_data_type,
+                    # Tree-spec only (topk > 1): flashinfer packs this bool mask into
+                    # the per-bucket ragged wrapper's custom_mask_buf on every replay
+                    # -> CUSTOM mask mode over the draft->draft block. None elsewhere.
+                    custom_mask=ragged_custom_mask,
+                )
 
         if use_sliding_window_kv_pool:
             assert self._swa_kv_pool is not None
@@ -7729,26 +7865,33 @@ class FlashInferIndicesUpdaterPrefill:
                 max_kv_len=int(seq_lens_cpu_i32.max()),
             )
 
-        wrapper_paged.begin_forward(
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            self.kv_last_page_len[:bs],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            1,
-            q_data_type=self.q_data_type,
-            kv_data_type=self.data_type,
-            custom_mask=use_custom_mask,
-            non_blocking=True,
-            fixed_split_size=fixed_split_size,
-            prefix_len_ptr=prefix_len_ptr,
-            token_pos_in_items_ptr=token_pos_in_items_ptr,
-            token_pos_in_items_len=token_pos_in_items_len,
-            max_item_len_ptr=max_item_len_ptr,
-            **paged_plan_kwargs,
-        )
+        if nosync_host is None:
+            _qo_p, _kv_p, _last_p = qo_indptr, kv_indptr, self.kv_last_page_len[:bs]
+            _plan_p = wrapper_paged.begin_forward
+        else:  # P-NOSYNC: host indptrs, one plan ahead (see the ragged plan)
+            _qo_p, _kv_p, _last_p = nosync_host
+            _plan_p = partial(_p_nosync_plan, wrapper_paged)
+        with _weg2_p_overlap.span("fi_plan"):  # #PGAP, see the ragged plan above
+            _plan_p(
+                _qo_p,
+                _kv_p,
+                kv_indices,
+                _last_p,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+                custom_mask=use_custom_mask,
+                non_blocking=True,
+                fixed_split_size=fixed_split_size,
+                prefix_len_ptr=prefix_len_ptr,
+                token_pos_in_items_ptr=token_pos_in_items_ptr,
+                token_pos_in_items_len=token_pos_in_items_len,
+                max_item_len_ptr=max_item_len_ptr,
+                **paged_plan_kwargs,
+            )
 
 
 class FlashInferMultiStepDraftBackend:
