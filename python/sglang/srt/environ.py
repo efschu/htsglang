@@ -1643,6 +1643,12 @@ class Envs:
     # surviving rank raises HiCacheCollectiveTimeoutError instead. <= 0 restores
     # the unbounded blocking wait.
     SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S = EnvFloat(600.0)
+    # H62 (NF D rounds): cadence of the #939 retired-prefetch agreement
+    # (UnifiedRadixCache.drain_retired_prefetch, one gloo MIN all_reduce per
+    # scheduler iteration on a multi-rank attention group, outside
+    # check_hicache_events). 1 = every round (unchanged); N > 1 = every round
+    # while any rank names a retired record, every N-th round while none does.
+    SGLANG_HICACHE_RETIRED_AGREE_EVERY = EnvInt(1)
     # #410: the pin budget, 0 = unbounded. Read once when the store builds
     # its PinLedger; a checkpoint that would cross it is refused by name.
     SGLANG_HICACHE_PIN_BUDGET_BYTES = EnvInt(0)

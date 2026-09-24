@@ -514,6 +514,26 @@ def _hicache_round_timing_every() -> int:
     except ValueError:
         return 0
 
+
+def _hicache_retired_agree_every() -> int:
+    """SGLANG_HICACHE_RETIRED_AGREE_EVERY (NF D rounds, H62, 24.09.; default 1 =
+    off): the cadence of the SECOND HiCache CPU collective of a decode round --
+    the #939 retired-prefetch agreement in
+    `UnifiedRadixCache.drain_retired_prefetch`, one gloo MIN all_reduce of
+    ``[digest, -digest, refusals, -refusals]`` over the attention group. It is
+    called once per scheduler iteration from ``Scheduler._drain_prefetch_progress``
+    (TP loop: inside ``_update_uniform_pool_budget``), i.e. OUTSIDE
+    ``check_hicache_events`` and outside SGLANG_HICACHE_DRAIN_AGREE_EVERY's gate.
+
+    Unset / <= 1 = EVERY round, the unchanged path. N > 1: every round while the
+    last agreement saw a retired record on any rank, every N-th round while it
+    saw none on every rank. See `UnifiedRadixCache._retired_agreement_due`.
+    """
+    try:
+        return max(1, int(envs.SGLANG_HICACHE_RETIRED_AGREE_EVERY.get() or 1))
+    except (TypeError, ValueError):
+        return 1
+
 # #1233 zero-remainder: END-OF-PREFILL ANCHOR instrument, armed by the Weg-2
 # launcher on group P together with the schedule_policy split (same env).
 _WEG2_END_ANCHOR = os.environ.get("SGLANG_WEG2_END_ANCHOR", "0") == "1"
@@ -5964,9 +5984,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         optimising: correctness first, and piggy-backing this onto an existing
         round collective is a micro-optimisation, not a fix.
 
+        H62 (NF D rounds, measured): x165 D (TP 3) ran this agreement on every
+        decode round -- DECODE-HOST-PERIOD allreduce_n = 2 x hicache_calls in
+        all 72 windows, the second of the two outside ``check_hicache_events``
+        -- for a retired list that was empty on every rank for the whole boot.
+        SGLANG_HICACHE_RETIRED_AGREE_EVERY=N thins it on a rank-UNIFORM
+        cadence, which is not the rank-local predicate forbidden above: the
+        inputs are this method's own call count (as uniform as the unconditional
+        collective it thins -- which would wedge otherwise) and the agreed
+        maximum digest, identical on every rank after the reduce
+        (`_retired_agreement_due` / `_retired_agreement_agreed`). Unset = every
+        round, byte-identical.
+
         Returns the number of records reaped (0 or 1).
         """
         if self.cache_controller is None:
+            return 0
+        # H62: SGLANG_HICACHE_RETIRED_AGREE_EVERY -- a round the rank-uniform
+        # cadence skips takes no collective and reaps nothing, on every rank.
+        _gate_every = _hicache_retired_agree_every()
+        _gated = _gate_every > 1 and self._drain_agreement_is_collective()
+        if _gated and not self._retired_agreement_due():
             return 0
 
         # Sort by the req_id we can recover from the operation, not by position.
@@ -6014,6 +6052,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         agreed_max = -int(vote[1].item())
         refusals_min = int(vote[2].item())
         refusals_max = -int(vote[3].item())
+        if _gated:
+            # hot = some rank named a candidate (digests are never 0): the
+            # agreement stays every-round until every rank's list is empty.
+            self._retired_agreement_agreed(_gate_every, hot=agreed_max != 0)
         if refusals_min != refusals_max:
             self._stale_refusal_divergences = (
                 getattr(self, "_stale_refusal_divergences", 0) + 1
@@ -6093,6 +6135,45 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             len(self._retired_prefetch),
         )
         return 1
+
+    def _retired_agreement_due(self) -> bool:
+        """H62: advance the retired-agreement cadence by one round; True when
+        this round agrees (SGLANG_HICACHE_RETIRED_AGREE_EVERY > 1 on a
+        collective group only -- `drain_retired_prefetch` asks nothing else).
+
+        WHY THE SKIP IS RANK-UNIFORM. The round counter advances once per
+        `drain_retired_prefetch` call, and those calls are rank-uniform: on the
+        TP loop they come from `_update_uniform_pool_budget`, which every rank
+        reaches exactly once per iteration (its own MIN reduce on tp_cpu_group
+        right behind this one would wedge otherwise, as would the unconditional
+        agreement this thins). `_retired_gate_next` is set only from the agreed
+        (replicated) maximum digest. So every rank skips and agrees on the
+        same rounds; a skipped round reaps nothing anywhere.
+
+        WHAT IT COSTS. A record retired while the group is idle waits up to N
+        rounds for the next agreement, holding its host span and anchor lock
+        that much longer (then it is reaped exactly as before). The #943
+        refusal instrument rides the agreement and is read on its rounds only.
+        """
+        r = self._retired_gate_round = int(getattr(self, "_retired_gate_round", 0)) + 1
+        if r < int(getattr(self, "_retired_gate_next", 0)):
+            self._retired_gate_skipped = int(getattr(self, "_retired_gate_skipped", 0)) + 1
+            return False
+        return True
+
+    def _retired_agreement_agreed(self, every: int, *, hot: bool) -> None:
+        """H62: after an agreement, the next one is the next round while any
+        rank still names a retired record (``hot``), else ``every`` rounds on."""
+        r = int(getattr(self, "_retired_gate_round", 0))
+        self._retired_gate_next = r + 1 if hot else r + every
+        n = self._retired_gate_agreed = int(getattr(self, "_retired_gate_agreed", 0)) + 1
+        if n == 1 or n % 1024 == 0:
+            logger.info(
+                "HICACHE-RETIRED-GATE every=%d round=%d agreements=%d skipped=%d hot=%s "
+                "(#939 retired-prefetch agreement on a rank-uniform cadence; unset "
+                "SGLANG_HICACHE_RETIRED_AGREE_EVERY = every round)",
+                every, r, n, int(getattr(self, "_retired_gate_skipped", 0)), bool(hot),
+            )
 
     def _release_retired_prefetch_local(self) -> int:
         """Release every retired prefetch record on THIS rank. Detach only.
