@@ -385,6 +385,24 @@ def prefill_transient_mib_for_rank(text: str, rank: int) -> float:
     return 0.0
 
 
+
+def _replayssm_spec_for(runner) -> bool:
+    """27B ReplaySSM package (S2): the spec ring is ported for GDN only.
+
+    The ring's record layout is the GDN temporal (HV, V, K) with scalar decay;
+    a Mamba2 / Lightning / KDA model under the flag would allocate a ring its
+    verify path never writes while losing the intermediate state it does read,
+    so the flag is refused here, where the model config is known.
+    """
+    if not getattr(runner.server_args, "enable_linear_replayssm_spec", False):
+        return False
+    if runner.hybrid_gdn_config is None:
+        raise ValueError(
+            "--enable-linear-replayssm-spec: only the GDN verify route is ported "
+            "on this line; this model has no GDN (hybrid_gdn_config is None)."
+        )
+    return True
+
 class ModelRunnerKVCacheMixin:
     # === #119: expert-offload VRAM -> KV pool ==============================
     # The expert offload (#77/#123) parks cold experts in a pinned host pool and
@@ -3923,6 +3941,7 @@ class ModelRunnerKVCacheMixin:
                     enable_linear_replayssm=self.server_args.enable_linear_replayssm,
                     linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
                     mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
+                    enable_linear_replayssm_spec=_replayssm_spec_for(self),
                 )
             else:
                 # DSV4 on NPU needs an extended ReqToTokenPool holding per-req

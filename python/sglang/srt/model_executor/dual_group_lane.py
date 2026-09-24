@@ -4034,6 +4034,12 @@ class DualGroupLane:
                 "server_args.max_speculative_num_draft_tokens; run with "
                 f"SGLANG_LANE_SPEC_VERIFY=seqdecode instead (got {type(cache)})."
             )
+        if cache.intermediate_ssm is None:
+            raise ValueError(
+                "dual-group lane verify: the lane pool runs the ReplaySSM spec "
+                "ring (--enable-linear-replayssm-spec), which the lane's verify "
+                "is not wired for; run the lane without the flag."
+            )
         width = int(cache.intermediate_ssm.shape[2])
         if width < draft_token_num:
             raise ValueError(
