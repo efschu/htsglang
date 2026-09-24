@@ -42,6 +42,13 @@ class TritonGDNKernel(LinearAttnKernelBase):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
+    # Upstream #33778: fused_sigmoid_gating_delta_rule_update reads q/k/v with
+    # their token strides (q.stride()[1]) and a dense head axis, so the verify
+    # split may hand it torch.split views. Only the CUDA/HIP Triton kernel was
+    # checked; NPU/CPU/XPU substitute other implementations above.
+    supports_strided_target_verify_qkv: bool = (
+        not is_cpu() and not is_npu() and not is_xpu()
+    )
 
     def packed_decode(
         self,
