@@ -1585,7 +1585,9 @@ class Pending:
     #: <= X, no vision stage) and it sits in the P queue only because of the
     #: phase (it arrived while P was awake or a flip ran). The one kind of queued
     #: request `--d-short-drain-tokens` may hand to D -- never a LONG, vision,
-    #: carrier or re-queued one (law 4: D never prefills above X).
+    #: carrier or re-queued one (law 4: D never prefills above X), and never a
+    #: SHORT that D's own #915 budget refused at arrival (RC2 review: FIX 4a
+    #: sent it to BATCH because D cannot take it now).
     d_eligible: bool = False
     #: set when that drain handed it to D: its leg 2 then runs exactly as the
     #: SHORT route's (pending=None -- no leg 1 ever ran for it).
@@ -3222,8 +3224,11 @@ class Front:
         # match_prefix and refuses by name there (L9/W31).
         logger.info("WEG2 X-ROUTE rid=%s est_uncached=%d X=%d (ESTIMATE, front pricing, no tokenizer)",
                     rid, remainder, self.tp_prefill_max_tokens)
+        # RC2 review (idle policy b): why a SHORT falls through to BATCH. Only
+        # D's own #915 refusal is recorded -- see `d_eligible` below.
+        short_refused: List[str] = []
         if self.awake == "D" and self.admit_d and self.state == "serving" and short_ok:
-            seat = await self._acquire_short_seat(rid, est_prompt)
+            seat = await self._acquire_short_seat(rid, est_prompt, short_refused)
             if seat is not None:
                 self.counters["route_short"] += 1
                 # #1324: `span_known=True` used to stand alone here and read as
@@ -3268,8 +3273,16 @@ class Front:
                     # length -- only P can serve it (Pending.p_only).
                     p_only=_verdict == VERDICT_STAGE,
                     # 27B idle policy (b): only a request whose OWN route is SHORT
-                    # may later be handed to D by --d-short-drain-tokens.
-                    d_eligible=short_ok)
+                    # may later be handed to D by --d-short-drain-tokens -- and
+                    # only when it is queued because of the PHASE (the field's
+                    # contract). RC2 review: a SHORT that an awake, admitting D
+                    # just refused on its #915 budget (FIX 4a) is queued because
+                    # of D. Drained back, the same gate would hold it at the head
+                    # of _ready_for_d (law 2 never skips the head) while the
+                    # closed batch gate stops every SHORT arrival behind it --
+                    # also the ones that fit -- until D's running decodes end,
+                    # up to --drain-deadline-s each. Today's path keeps it here.
+                    d_eligible=short_ok and not short_refused)
         self.queue.append(p)
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         logger.info("WEG2-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d)",
@@ -3296,7 +3309,8 @@ class Front:
         if p is not None and p.posted_evt is not None and not p.posted_evt.is_set():
             p.posted_evt.set()
 
-    async def _acquire_short_seat(self, rid: str, est_tokens: int = 0) -> Optional[Seat]:
+    async def _acquire_short_seat(self, rid: str, est_tokens: int = 0,
+                                  refused: Optional[List[str]] = None) -> Optional[Seat]:
         """A SHORT arrival's seat -- behind the BATCH gate (C5/R-16).
 
         Returns ``None`` when the request must fall through to route BATCH:
@@ -3304,6 +3318,10 @@ class Front:
         changed while waiting.  Never an unbounded wait (MUST NOT 8): the
         bound is ``--drain-deadline-s``, the same number that already says
         "D is not making progress" everywhere else in this front.
+
+        ``refused`` (RC2 review): when D's own #915 budget is the reason, the
+        caller's list gets ``"d_budget"`` -- the one fall-through that says
+        D cannot take this request NOW, as opposed to the phase or the gate.
         """
         try:
             await asyncio.wait_for(self._batch_gate.wait(), self.drain_deadline_s)
@@ -3319,6 +3337,8 @@ class Front:
             # SHORT arrival that does not fit falls through to route BATCH
             # rather than overcommitting the staging pool -- the return
             # contract this method already has for a held gate.
+            if refused is not None:
+                refused.append("d_budget")
             return None
         await self._d_seat.acquire()
         if not (self.awake == "D" and self.admit_d and self.state == "serving"):

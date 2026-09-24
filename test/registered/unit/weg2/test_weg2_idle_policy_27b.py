@@ -361,7 +361,9 @@ class ControllerHoldRestartsOnWork(CustomTestCase):
 class Wiring(CustomTestCase):
     def test_the_batch_pending_carries_its_own_route_verdict(self):
         src = inspect.getsource(front_mod.Front.handle_generate)
-        self.assertIn("d_eligible=short_ok)", src)
+        # RC2 review: minus the SHORT that D's own #915 budget just refused
+        # (test_weg2_idle_drain_budget_rc2_0924.py).
+        self.assertIn("d_eligible=short_ok and not short_refused)", src)
         tail = src[src.rfind("await fut  # leg 1 done and D awake"):]
         self.assertIn("if p.d_direct:", tail)
         i = tail.index("if p.d_direct:")
