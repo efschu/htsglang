@@ -8887,6 +8887,27 @@ def p_host_overlap_lines(overlap: bool, hostgap: bool) -> List[str]:
     return lines
 
 
+#: --p-deep-split-from (27B line, 2026-09-24): 0 = off, the default.
+P_DEEP_SPLIT_FROM_DEFAULT = 0
+#: The crossover prefix read off the xsn426/xsn428 #PGAP fits: the graph's
+#: PP0 chunk costs 41.9 + 1.432 * (prefix + 256) / 1000 ms, the eager chunk is
+#: bounded below by the ~57 ms host launch of 42 layers, and the split lowers
+#: the eager device time under that line -- so eager + split wins from
+#: (57 - 41.9) / 1.432 * 1000 - 256 ~ 10,300 tokens on. Rounded to 20 chunks
+#: of 512. A RECOMMENDATION printed in the help, never applied by default.
+P_DEEP_SPLIT_FROM_FIT = 10240
+
+
+def p_deep_split_env(ns) -> Dict[str, str]:
+    """Group P's environment for --p-deep-split-from; {} when off."""
+    from sglang.srt.layers.attention import fi_prefill_wave_split as _fiws
+
+    n = int(getattr(ns, "p_deep_split_from", P_DEEP_SPLIT_FROM_DEFAULT) or 0)
+    if n < 0:
+        raise SystemExit(f"--p-deep-split-from must be >= 0, got {n}")
+    return _fiws.launcher_env_p_deep_split(n)
+
+
 def newest_bubble_log(
     evidence_dir: str, accept: Optional[Callable[[str], bool]] = None
 ) -> Optional[str]:
@@ -9060,6 +9081,153 @@ def pcie_lanes(cards: Sequence[Card]) -> List[Optional[int]]:
         except Exception:
             pass
     return out
+
+
+def card_power_limits_w(cards: Sequence[Card]) -> List[Optional[float]]:
+    """ENFORCED power limit per CUDA ordinal, W, from NVML; ``None`` if unknown.
+
+    27B line (user 24.09. ~18:55Z: the cards run power-limited -- 5090 400 W of
+    600, 3080 230 W of 320 -- and the limits may be raised). A per-layer cost
+    measured at one limit is not the cost at another, so every boot prints
+    its limits (:func:`card_power_line`) and a stage fit is checked against
+    them (:func:`stage_fit_family_cost`)."""
+    out: List[Optional[float]] = []
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        return [None for _ in cards]
+    try:
+        for c in cards:
+            try:
+                h = pynvml.nvmlDeviceGetHandleByIndex(int(c.nvml_index))
+                out.append(float(pynvml.nvmlDeviceGetEnforcedPowerLimit(h)) / 1000.0)
+            except Exception:
+                out.append(None)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+    return out
+
+
+#: The one line a stage-fit RECORD is read back from (group P's cards in stage
+#: order). Parsed by :func:`read_card_power_record`; change both together.
+CARD_POWER_MARKER = "PP-CUT CARD-POWER (the record for --pp-cut-stage-fit):"
+_CARD_POWER_RE = re.compile(r"stage (\d+) card='([^']*)' uuid=(\S+) limit_w=(\S+)")
+#: Two limits within this many watts are the same limit.
+CARD_POWER_TOLERANCE_W = 5.0
+
+
+def card_power_line(cards: Sequence[Card], limits_w: Sequence[Optional[float]]) -> str:
+    return CARD_POWER_MARKER + " " + " ; ".join(
+        "stage %d card='%s' uuid=%s limit_w=%s"
+        % (r, c.name, c.uuid, "unknown" if w is None else "%.0f" % w)
+        for r, (c, w) in enumerate(zip(cards, limits_w))
+    )
+
+
+def read_card_power_record(front_log: str) -> Optional[List[Tuple[str, Optional[float]]]]:
+    """``[(card name, limit W or None), ...]`` in stage order from a boot's
+    front log, or ``None`` when the boot printed no record (every boot before
+    this line existed)."""
+    try:
+        with open(front_log, "r", errors="replace") as fh:
+            for line in fh:
+                if CARD_POWER_MARKER not in line:
+                    continue
+                rows = sorted(
+                    (int(s), name, None if lim == "unknown" else float(lim))
+                    for s, name, _uuid, lim in _CARD_POWER_RE.findall(line)
+                )
+                if rows:
+                    return [(name, lim) for _s, name, lim in rows]
+    except OSError:
+        return None
+    return None
+
+
+def stage_fit_family_cost(ns, cards: Sequence[Card], chunk_tokens: int,
+                          limits_now: Sequence[Optional[float]], log):
+    """--pp-cut-stage-fit: the P cut's stage cost FITTED from a boot's #PGAP
+    lines (planner/pgap_stage_fit.py), or a W40 refusal.
+
+    Returns ``(cost, provenance, fitted_log)``. THE POWER RECORD (user order
+    24.09.): the fitted boot's per-stage card and power limit come from its
+    own front log (:data:`CARD_POWER_MARKER`), else from the operator's
+    ``--pp-cut-stage-fit-power`` assertion; a record whose card or limit
+    differs from this boot's metal is STALE and refused, unless
+    ``--pp-cut-stage-fit-stale-ok`` -- then it is used and the provenance says
+    STALE in capitals. No record at all is refused: never reused silently."""
+    from sglang.srt.planner import pgap_stage_fit as _fit
+
+    arg = str(getattr(ns, "pp_cut_stage_fit", "") or "").strip()
+    if arg == "auto":
+        _line = getattr(ns, "weg2_line_id", None)
+        path, seen = _fit.newest_pgap_log(
+            EVIDENCE_DIR, int(chunk_tokens), len(cards),
+            accept=_line.accepts_log if _line is not None else None)
+        for s in seen:
+            log("PP-CUT STAGE FIT auto: " + s)
+        if path is None:
+            raise Weg2LaunchRefused(
+                "W40 Weg2PPCutRefused: --pp-cut-stage-fit auto found no P log in "
+                f"{EVIDENCE_DIR} with #PGAP lines at chunk {int(chunk_tokens)} and "
+                f"{len(cards)} stages (run a boot with --p-hostgap first, or pass a path)")
+    else:
+        path = arg
+    try:
+        fitted = _fit.read_pgap_log(path)
+        if fitted.chunk_tokens != int(chunk_tokens):
+            raise _fit.StageFitRefused(
+                f"it ran {fitted.chunk_tokens}-token P chunks, this boot runs "
+                f"{int(chunk_tokens)}; the attention cost per chunk is chunk-specific "
+                "(192 CTAs at 512 on the 5090), so a fit does not transfer")
+        cost, prov = _fit.fit_stage_cost(fitted, [c.name for c in cards])
+    except (_fit.StageFitRefused, OSError, ValueError, ZeroDivisionError) as exc:
+        raise Weg2LaunchRefused(f"W40 Weg2PPCutRefused: --pp-cut-stage-fit {path}: {exc}")
+    front = path[: -len(".P.log")] + ".front.log" if path.endswith(".P.log") else ""
+    record = read_card_power_record(front) if front else None
+    source = "record in %s" % os.path.basename(front)
+    asserted = str(getattr(ns, "pp_cut_stage_fit_power", "") or "").strip()
+    if record is None and asserted:
+        vals = _csv_floats(asserted)
+        if len(vals) != len(cards):
+            raise SystemExit(
+                f"--pp-cut-stage-fit-power {asserted!r}: {len(cards)} per-stage watts expected")
+        record = [(c.name, float(v)) for c, v in zip(cards, vals)]
+        source = "ASSERTED by --pp-cut-stage-fit-power (the fitted boot printed no record)"
+    if record is None:
+        raise Weg2LaunchRefused(
+            "W40 Weg2PPCutRefused: --pp-cut-stage-fit %s carries no power record "
+            "(its boot printed no '%s' line) and none was asserted. The per-layer "
+            "cost moves with the power limit, so an unrecorded fit is not reused "
+            "silently: pass --pp-cut-stage-fit-power W,W,W with the limits that "
+            "boot ran at (24.09. user measurement: 400,230,230)"
+            % (path, CARD_POWER_MARKER))
+    diffs = []
+    for r, ((name, lim), c, now) in enumerate(zip(record, cards, limits_now)):
+        if name != c.name:
+            diffs.append(f"stage {r} card {name!r} -> {c.name!r}")
+        elif lim is None or now is None:
+            diffs.append(f"stage {r} limit {lim} W -> {now} W (unknown)")
+        elif abs(float(lim) - float(now)) > CARD_POWER_TOLERANCE_W:
+            diffs.append(f"stage {r} {c.name} {lim:.0f} W -> {now:.0f} W")
+    verdict = (
+        "power MATCH (%s): %s" % (
+            source, ",".join("%.0f" % float(l) for _n, l in record if l is not None))
+        if not diffs else "power STALE (%s): %s" % (source, "; ".join(diffs))
+    )
+    log("PP-CUT STAGE FIT POWER: " + verdict)
+    if diffs and not getattr(ns, "pp_cut_stage_fit_stale_ok", False):
+        raise Weg2LaunchRefused(
+            "W40 Weg2PPCutRefused: --pp-cut-stage-fit %s is STALE against this "
+            "boot's metal -- %s. Re-measure (a boot with --p-hostgap at the new "
+            "limits), or pass --pp-cut-stage-fit-stale-ok to price with it anyway "
+            "(the provenance then says STALE)." % (path, "; ".join(diffs)))
+    return cost, prov + " | " + verdict, fitted
 
 
 def per_pair_crossing_ms(
@@ -10228,6 +10396,31 @@ def solve_p_cut(
         anchor_attn_ms_per_layer=float(ns.pp_cut_attn_anchor_ms),
         anchor_prefix_tokens=float(ns.pp_cut_attn_anchor_prefix_tokens),
     )
+    # 27B line (user 24.09.): every boot prints its P cards' power limits --
+    # the record a later --pp-cut-stage-fit is checked against.
+    _power_now = card_power_limits_w(cards)
+    log(card_power_line(cards, _power_now))
+    # --pp-cut-stage-fit (default off): the stage cost FITTED from a boot's own
+    # #PGAP lines replaces the bsscale family split above.
+    _fitted_log = None
+    if str(getattr(ns, "pp_cut_stage_fit", "") or "").strip():
+        family_cost, family_prov, _fitted_log = stage_fit_family_cost(
+            ns, cards, int(chunk_tokens), _power_now, log)
+    # --pp-cut-depth-profile (default off): price each candidate over a depth
+    # profile instead of the single design prefix.
+    _depth_profile = None
+    _prof_arg = str(getattr(ns, "pp_cut_depth_profile", "") or "").strip()
+    if _prof_arg:
+        from sglang.srt.planner import pgap_stage_fit as _fit
+
+        try:
+            _depth_profile, _prof_prov = _fit.depth_profile(
+                _prof_arg, int(chunk_tokens), _fitted_log)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        log("PP-CUT DEPTH PROFILE (--pp-cut-depth-profile): %s -- every "
+            "candidate's makespan below is the weighted mean over it, and its "
+            "depth_tokens the profile's mean" % _prof_prov)
     # THE CROSSING FRAME is the same object the depth price already charges:
     # one PPProxyTensors hidden-states frame, [chunk, hidden] in the model
     # dtype. Derived here from the same three numbers rather than restated.
@@ -10304,7 +10497,10 @@ def solve_p_cut(
         per_pair_crossing_ms=pair_ms,
         pinned_layer_set=ns.pp_layer_set or None,
         measured_provenance=(
-            "MEASURED per-layer ms %s (boot bsscale, BSSCALE_0907.md tip "
+            ("makespan priced by the STAGE FIT (--pp-cut-stage-fit, line 'PP-CUT "
+             "depth axis'); the terms that follow only order the enumeration: "
+             if _fitted_log is not None else "")
+            + "MEASURED per-layer ms %s (boot bsscale, BSSCALE_0907.md tip "
             "37c884b0b0: PP0 259.1 ms/32 layers, PP1 632.9/18, PP2 470.2/14, "
             "per full 4096-token chunk at bs6)" % ns.pp_cut_measured_ms_per_layer
         ),
@@ -10326,6 +10522,7 @@ def solve_p_cut(
         # the floor off its own frontier; both None = the operator passed 0.
         pool_floor=pool_floor,
         pool_floor_from_cut=pool_floor_from_cut,
+        depth_profile=_depth_profile,
     )
     # #1305: THE NUMBER, now that the frontier exists.  A W67/W40 raised by
     # the solve above carries the cut and the floor in its own text.
@@ -11517,6 +11714,23 @@ def build_parser() -> argparse.ArgumentParser:
              "off.",
     )
     ap.add_argument(
+        "--p-deep-split-from", type=int, default=P_DEEP_SPLIT_FROM_DEFAULT,
+        metavar="PREFIX_TOKENS",
+        help="Group P deep-chunk attention form (27B line). 0 (the default) = "
+             "off: group P's environment is byte-identical. N > 0 = an EAGER P "
+             "chunk whose prefix is >= N tokens plans its flashinfer prefill "
+             "with a wave-aware KV split (the extend plan's fixed_split_size; "
+             "rank line 'FI-WAVE-SPLIT'). With the prefill graph on, pair it "
+             "with Agent H's --p-prefill-graph-max-prefix N (same N): the graph "
+             "then declines those chunks (census reason 'deep_split') and they "
+             "take this split -- the graph-mode plan cannot split. Reason, "
+             "measured on xsn426/xsn428: at 512 tokens head_dim 256 gives 192 "
+             "attention CTAs, two rounds on the 5090's 170 SMs. The 3080 stages "
+             "find no gain and keep the stock plan. Crossover from the same "
+             f"fits: ~{P_DEEP_SPLIT_FROM_FIT} (eager PP0 host launch ~57 ms "
+             "against the graph's 41.9 + 1.432 ms per 1k prefix). Env names in "
+             "layers/attention/fi_prefill_wave_split.py.")
+    ap.add_argument(
         "--p-bubble-measured-from", default="",
         help="Path of the group-P log whose PP-BUBBLE lines feed "
              f"--p-microbatch-depth. Unset = the newest log in {EVIDENCE_DIR} "
@@ -11548,6 +11762,39 @@ def build_parser() -> argparse.ArgumentParser:
              "optimal placement of the 16 attention layers is a FUNCTION of "
              "this number, not a constant.",
     )
+    ap.add_argument(
+        "--pp-cut-stage-fit", default="", metavar="P_LOG|auto",
+        help="27B line, default off (unset = the bsscale 4096 family split "
+             "prices the P cut, as before). A group-P log with #PGAP lines "
+             "(--p-hostgap), or 'auto' = the newest such log at THIS boot's P "
+             "chunk size: every forward's gpu_fwd_ms is joined to its chunk's "
+             "prefix and fitted per stage as a + b*(prefix+C/2)/1000 (device-"
+             "bound chunks only), and the solver prices every candidate cut with "
+             "the per-layer, per-attention-layer and per-forward costs that fit "
+             "implies (planner/pgap_stage_fit.py). The pool floor is untouched. "
+             "The fitted boot's power record (its front log's CARD-POWER line, "
+             "else --pp-cut-stage-fit-power) must match this boot's metal, else "
+             "W40 (--pp-cut-stage-fit-stale-ok prices with it anyway, marked "
+             "STALE). The cut itself stays free: --pp-stage-ratio / "
+             "--pp-attn-stage-ratio pin any P cut.")
+    ap.add_argument(
+        "--pp-cut-stage-fit-power", default="", metavar="W,W,W",
+        help="Only with --pp-cut-stage-fit, for a fitted boot that printed no "
+             "CARD-POWER record: the per-stage power limits it ran at, W "
+             "(user measurement 24.09. ~18:55Z: 400,230,230). Compared with "
+             "this boot's NVML limits like a printed record.")
+    ap.add_argument(
+        "--pp-cut-stage-fit-stale-ok", action="store_true",
+        help="Only with --pp-cut-stage-fit: price with a fit whose card or "
+             "power limit differs from this boot's metal (default: W40).")
+    ap.add_argument(
+        "--pp-cut-depth-profile", default="", metavar="ladder:N,N,...|fit",
+        help="27B line, default off (unset = price every cut at the single "
+             "design prefix, as before). 'ladder:2048,8192,32768' = each "
+             "candidate's makespan is the mean over every chunk start of those "
+             "prompt lengths, rungs weighted equally -- a max of lines is not "
+             "the line of the mean, so a prompt ladder is priced on its own "
+             "chunks; 'fit' = over the --pp-cut-stage-fit log's own chunks.")
     ap.add_argument(
         "--pp-cut-design-prefix-from", default="",
         help="Path of the P log whose prefill census feeds "
@@ -13027,6 +13274,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for _pline in p_host_overlap_lines(
             getattr(ns, "p_host_overlap", False), getattr(ns, "p_hostgap", False)):
         log(_pline)
+    # --p-deep-split-from: {} when off (env byte-identical).
+    _ds_env = p_deep_split_env(ns)
+    env_p.update(_ds_env)
+    if _ds_env:
+        log(
+            "WEG2 P-DEEP-SPLIT: on from prefix %s tokens -- group P gets %s: an "
+            "eager chunk that deep plans a wave-aware flashinfer KV split (rank "
+            "line 'FI-WAVE-SPLIT')%s"
+            % (
+                int(getattr(ns, "p_deep_split_from", 0)),
+                " ".join("%s=%s" % kv for kv in sorted(_ds_env.items())),
+                "; the prefill graph is ON, so only the chunks its own depth "
+                "threshold hands to eager (--p-prefill-graph-max-prefix, census "
+                "reason 'deep_split') reach the split -- set it to the same N"
+                if p_prefill_graph_bucket() else "",
+            )
+        )
     # --p-prefill-graph: {} when off (env byte-identical). The pool vector is
     # the SAME call the cut's pool model was built from (solve_p_cut).
     _pg_pool = p_prefill_graph_pool_mib(ns)

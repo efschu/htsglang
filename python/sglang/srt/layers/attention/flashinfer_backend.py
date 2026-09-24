@@ -23,6 +23,7 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.distributed.utils import tp_partition_size
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention import fi_prefill_wave_split as _fi_wave_split
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_workspace import (
     HIGH_WORKSPACE_ARCHITECTURES,
@@ -1947,6 +1948,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 # Use new backend-specific implementation
                 multi_item_params = self._process_multi_item_scoring(forward_batch)
 
+            # 27B line (fi_prefill_wave_split): the wave-aware KV split of the
+            # EAGER prefill plan, only under SGLANG_FI_PREFILL_WAVE_SPLIT=1 and
+            # never over the deterministic tile size. Off = the stock value.
+            _prefill_fixed_split = self.prefill_split_tile_size
+            if _prefill_fixed_split is None and _fi_wave_split.wave_split_on():
+                _prefill_fixed_split = self._p_wave_split_size(forward_batch, use_ragged)
+
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -1957,7 +1965,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=None,
-                fixed_split_size=self.prefill_split_tile_size,
+                fixed_split_size=_prefill_fixed_split,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
                 extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
@@ -1969,6 +1977,65 @@ class FlashInferAttnBackend(AttentionBackend):
                 multi_item_params,
                 swa_out_cache_loc=swa_out_cache_loc,
             )
+
+    def _p_wave_split_size(self, forward_batch: ForwardBatch, use_ragged: bool) -> Optional[int]:
+        """``fixed_split_size`` for THIS eager prefill plan, or None = stock.
+
+        Reached only under ``SGLANG_FI_PREFILL_WAVE_SPLIT=1``
+        (fi_prefill_wave_split). Host-known lengths only -- a missing host
+        mirror returns None (the stock plan), never a device read. The paged
+        kernel reads prefix + new tokens when it runs causal over both
+        (``use_ragged`` False) and the prefix alone under the ragged/paged
+        pair. Every decision is named, rate-limited to occurrences 1, 2, 4, ...
+        per reason."""
+        try:
+            seq = forward_batch.seq_lens_cpu
+            pre = forward_batch.extend_prefix_lens_cpu
+            ext = forward_batch.extend_seq_lens_cpu
+            if seq is None or pre is None or ext is None:
+                return None
+            seq_l = [int(x) for x in (seq.tolist() if hasattr(seq, "tolist") else seq)]
+            pre_l = [int(x) for x in pre]
+            ext_l = [int(x) for x in ext]
+            if not (len(seq_l) == len(pre_l) == len(ext_l)) or not seq_l:
+                return None
+            kv_l = pre_l if use_ragged else seq_l
+            num_sm = self.__dict__.get("_fi_wave_num_sm")
+            if num_sm is None:
+                num_sm = int(
+                    torch.cuda.get_device_properties(
+                        torch.cuda.current_device()
+                    ).multi_processor_count
+                )
+                self._fi_wave_num_sm = num_sm
+            upd = self.indices_updater_prefill
+            choice = _fi_wave_split.choose_prefill_kv_split(
+                ext_l,
+                kv_l,
+                num_qo_heads=int(upd.num_qo_heads),
+                num_kv_heads=int(upd.num_kv_heads),
+                head_dim=int(upd.head_dim),
+                num_sm=num_sm,
+                float_workspace_bytes=int(self.workspace_buffer.numel()),
+                min_prefix_tokens=_fi_wave_split.wave_split_from_prefix(),
+            )
+        except Exception as exc:  # noqa: BLE001 - an accelerator: stock plan stays
+            choice = None
+            reason = "error:%s" % type(exc).__name__
+        else:
+            reason = choice.reason.split(":")[0]
+        counts = self.__dict__.setdefault("_fi_wave_split_counts", {})
+        n = counts.get(reason, 0) + 1
+        counts[reason] = n
+        if not (n & (n - 1)):
+            logger.info(
+                "%s occurrence=%d num_sm=%s from_prefix=%d",
+                choice.line() if choice is not None else "FI-WAVE-SPLIT " + reason,
+                n,
+                self.__dict__.get("_fi_wave_num_sm"),
+                _fi_wave_split.wave_split_from_prefix(),
+            )
+        return None if choice is None else choice.fixed_split_size
 
     def init_cuda_graph_state(
         self,
