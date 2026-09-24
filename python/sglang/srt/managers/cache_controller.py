@@ -1031,6 +1031,13 @@ class HiCacheController:
         self.load_queue: List[CacheOperation] = []
         self.write_queue: List[CacheOperation] = []
         self.ack_load_queue: List[HiCacheAck] = []
+        # upstream #36738: set by the scheduler (Scheduler._bind_hicache_load_fence)
+        # to the stream(s) it launches forwards on; gates the load-back H2D
+        # behind in-flight forwards (see start_loading). A single stream or a
+        # tuple of streams (the fork's concurrent spill lane adds its own).
+        # None -> no fence (pre-port behaviour, e.g. controllers built outside
+        # a scheduler).
+        self.load_fence_stream = None
         self.ack_write_queue: List[HiCacheAck] = []
 
         # #1465: the write-through copies run as KERNELS (io_backend="kernel",
@@ -2416,6 +2423,15 @@ class HiCacheController:
         else:
             raise ValueError(f"Unsupported io backend")
 
+    def _load_fence_streams(self) -> tuple:
+        """upstream #36738: the stream(s) the load-back H2D must wait for."""
+        fence = getattr(self, "load_fence_stream", None)
+        if fence is None:
+            return ()
+        if isinstance(fence, (tuple, list)):
+            return tuple(s for s in fence if s is not None)
+        return (fence,)
+
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
             return -1
@@ -2466,6 +2482,19 @@ class HiCacheController:
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            # upstream #36738: under overlap scheduling a device page reclaimed
+            # for this load-back (freed from a finished request / evicted node)
+            # can still be WRITTEN by the forward in flight on the forward
+            # stream (e.g. the overshoot step of a request that finished one
+            # iteration earlier). The producer start event above only orders
+            # the load after the schedule stream, not after that forward: a
+            # silent KV-corruption race. Fence the H2D behind every forward
+            # stream the scheduler bound. Cost is nil when the forward stream
+            # is idle (flip wake, non-overlap), otherwise the load no longer
+            # overlaps the running forward (upstream: "a finer-grained fence
+            # is possible").
+            for fence_stream in self._load_fence_streams():
+                self.load_stream.wait_stream(fence_stream)
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,

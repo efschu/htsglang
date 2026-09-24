@@ -991,6 +991,8 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        # upstream #36738: load-back H2D waits for the in-flight forward.
+        self._bind_hicache_load_fence()
         self._pool_phase_probe("tree_cache")
 
         # #847 (W33): the WRITER for the phase-matched host pools. HERE, AND
@@ -2641,6 +2643,8 @@ class Scheduler(
                 "kv-session-offload DECOUPLE: second forward stream "
                 "'spill_stream' leased for the concurrent spill lane (S4b)."
             )
+        # upstream #36738: re-bind now that the spill lane's stream exists.
+        self._bind_hicache_load_fence()
 
         if not self.enable_overlap:
             return
@@ -2658,6 +2662,41 @@ class Scheduler(
         # (the ring is an overlap-only asset); harmless when decoupling is off.
         self._spill_record_buf = [None] * 2
         self._spill_record_ct = 0
+
+    def _bind_hicache_load_fence(self) -> None:
+        """upstream #36738: fence HiCache load-back H2D behind the forward stream(s).
+
+        The fence names every stream this scheduler launches a forward on: the
+        device lane's ``forward_stream`` (overlap loop, and the PP loops via
+        ``forward_stream_ctx``) plus the concurrent spill lane's
+        ``spill_stream`` when SGLANG_KVSO_DECOUPLE leased one. Phase flip:
+        weg2 keeps ONE scheduler, ONE tp_worker/model_runner and ONE
+        tree_cache/cache_controller per process for its whole life
+        (``forward_stream`` is written only by the get_worker_info unpack at
+        init and the spill lane's try/finally swap), so the stream bound here
+        stays the valid one across every cutover; the cutover therefore needs
+        no re-bind. Idempotent -- called after tree_cache init and again from
+        init_overlap once the spill stream exists."""
+        if not getattr(self, "enable_hierarchical_cache", False):
+            return
+        cache_controller = getattr(
+            getattr(self, "tree_cache", None), "cache_controller", None
+        )
+        if cache_controller is None:
+            return
+        streams = tuple(
+            s
+            for s in (
+                getattr(self, "forward_stream", None),
+                getattr(self, "spill_stream", None),
+            )
+            if s is not None
+        )
+        if not streams:
+            return
+        cache_controller.load_fence_stream = (
+            streams[0] if len(streams) == 1 else streams
+        )
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
@@ -3024,11 +3063,13 @@ class Scheduler(
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
-        # Wait for the prev forward to finish reading the shared buffers this
-        # iter's schedule will overwrite. Fast path: wait on the read-done event
+        # upstream #31687: called right after each run_batch launch (device
+        # lane, spill lane, disagg overlap loops): order later schedule_stream
+        # work (result processing, next iteration's writes) behind the
+        # forward's shared-buffer reads. Fast path: wait on the read-done event
         # the forward published after its snapshot (non-spec: decode graph;
-        # spec: draft_extend), then clear it. Else fall back to whole-forward
-        # wait_stream.
+        # spec: draft_extend / DFlash verify), then clear it. Else fall back to
+        # whole-forward wait_stream.
         if not self._war_barrier_enabled:
             return
         # #616 bisection arm: SGLANG_WAR_BARRIER_FASTPATH=0 forces the
@@ -3133,7 +3174,11 @@ class Scheduler(
             # (staged D2H + event query), no-op unless the guard is armed.
             index_race_guard.poll()
 
-            self._apply_war_barrier()
+            # upstream #31687: the WAR barrier moved from here to right after
+            # each run_batch launch (below), so the result processing of the
+            # PREVIOUS batch -- which runs after this iteration's launch -- is
+            # ordered behind the forward's shared-buffer reads too, not only
+            # the next iteration's schedule writes.
 
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
@@ -3166,6 +3211,11 @@ class Scheduler(
                 if self.idle_sleeper is not None:
                     self.idle_sleeper.reset()
                 batch_result = self.run_batch(batch)
+                # upstream #31687: fence result processing (and the next
+                # iteration's writes) behind THIS forward's shared reads. Also
+                # consumes this forward's read-done event before a concurrent
+                # spill forward (below) can publish its own on the same runner.
+                self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
                 self._weg2_post_wake_pass_log(batch)  # Wake-Parallel item 2
             else:
@@ -16217,6 +16267,14 @@ class Scheduler(
             self.batch_record_ct = self._spill_record_ct
         try:
             spill_result = self.run_batch(spill_batch)
+            # upstream #31687, spill lane: the same barrier right after the
+            # launch, still inside the swap -- the fast path waits on the
+            # read-done event the SPILL forward published, the fallback on
+            # `self.forward_stream`, which is spill_stream here. The device
+            # forward's event was already consumed by the barrier behind the
+            # device run_batch, so the two lanes' events never overwrite one
+            # another unconsumed.
+            self._apply_war_barrier()
             # Delay-sample (spec V2) must run on the spill stream too; a no-op
             # for non-spec (delay_sample_func is None). Kept inside the swap so
             # forward_stream_ctx is still spill_stream.
