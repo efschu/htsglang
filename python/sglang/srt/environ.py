@@ -1626,6 +1626,17 @@ class Envs:
     # Max decode batch size eligible for the captured offload path. Buckets with
     # bs*top_k > scratch (would need >1 wave) fall back to eager. 0 = no cap.
     SGLANG_MOE_OFFLOAD_MAX_GRAPH_BS = EnvInt(0)
+    # H12: the wave order of an EAGER forward under the device-planned pool
+    # (SGLANG_MOE_OFFLOAD_GRAPH_MODE=pool: D's extend after the flip, an eager
+    # verify). True (default): expert-major -- each spill expert crosses PCIe
+    # ONCE per forward and lands in exactly one pool row. fnFL2x104 (90k
+    # needle): D ran the 49-token extend token-major because the arm sets
+    # SGLANG_MOE_OFFLOAD_WAVE_ORDER=expert only for P; TP0 (12 residents, 181
+    # spill rows) re-fetched the hot experts in every wave, 3 waves / 0.27 GiB
+    # H2D per layer, and the extend's gpu-ms (1069) was that stream. False:
+    # the pool's eager forwards follow SGLANG_MOE_OFFLOAD_WAVE_ORDER again.
+    # Rank-uniform: every rank reads the same launcher env.
+    SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR = EnvBool(True)
     # #254: how a prefill forward that overflows the scratch region is split.
     #   "token"  (default) -- waves are disjoint TOKEN subsets; every wave
     #     re-fetches the spill experts its tokens need, so a spill expert is

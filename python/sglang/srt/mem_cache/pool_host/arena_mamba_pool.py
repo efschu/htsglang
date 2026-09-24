@@ -27,7 +27,11 @@ from typing import Optional, Sequence
 import torch
 
 from sglang.srt.mem_cache.memory_pool_host import MambaPoolHost
-from sglang.srt.mem_cache.pool_host.arena_pool import PLACEHOLDERS, ArenaMHAHostPool
+from sglang.srt.mem_cache.pool_host.arena_pool import (
+    PLACEHOLDERS,
+    ArenaMHAHostPool,
+    _arena_page_load_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +44,34 @@ def _arena_state_load_block_bytes() -> int:
         return max(1 << 20, int(os.environ.get("SGLANG_WEG2_ARENA_STATE_LOAD_BLOCK_BYTES", str(256 << 20))))
     except ValueError:
         return 256 << 20
+
+
+def merge_state_extents(comp):
+    """H12: the compact extents ``(cursor, arena_off, len)`` merged wherever
+    the next one continues the previous one in the arena slot too. The
+    compact side is contiguous by construction, so a merged run is ONE copy
+    from the slot into the stage row."""
+    runs = []
+    for cur, off, ln in comp:
+        if runs and runs[-1][1] + runs[-1][2] == off and runs[-1][0] + runs[-1][2] == cur:
+            runs[-1] = (runs[-1][0], runs[-1][1], runs[-1][2] + ln)
+        else:
+            runs.append((cur, off, ln))
+    return runs
+
+
+def _state_block_dma(slot_view, dev_stage, slots, runs) -> int:
+    """H12: this rank's extents of each slot copied straight from the
+    registered mamba arena into the device stage row (no pinned CPU gather).
+    Both the pre-pin (pieces of whole slots from slot 0) and the lazy pin
+    (runs of whole slots) register whole slots, so an extent -- which never
+    leaves its slot -- lies inside one registration. Returns the copies
+    issued."""
+    for i, slot in enumerate(slots):
+        src = slot_view[slot]
+        for cur, off, ln in runs:
+            dev_stage[i, cur:cur + ln].copy_(src[off:off + ln], non_blocking=True)
+    return len(slots) * len(runs)
 
 
 def _arena_state_load_on() -> bool:
@@ -417,7 +449,12 @@ class ArenaMambaPoolHost(MambaPoolHost):
         conv, all layers) gathered COMPACTLY into a pinned stage, one H2D per
         block, split on the device. xsn337: copying the whole 78-MiB canonical
         blob per state (every rank's extents) made the pass slower (706 ms);
-        the compact stage carries only this rank's bytes."""
+        the compact stage carries only this rank's bytes.
+
+        H12: in "dma" mode (``_arena_page_load_mode`` of the slot size, the
+        default for the 78-MiB blob) the extents go straight from the
+        registered arena into the device stage -- fnFL2x104 TP0 spent
+        components_ms mamba=91 on two pinned CPU gathers of 58.8 MB."""
         n = int(slots.numel())
         if n == 0:
             return
@@ -436,7 +473,10 @@ class ArenaMambaPoolHost(MambaPoolHost):
         comp, row_bytes = self._compact
         B = max(1, _arena_state_load_block_bytes() // max(1, row_bytes))
         bb = min(B, n)
-        if self._state_stage is None or self._state_stage.shape[0] < bb or self._state_stage.shape[1] != row_bytes:
+        dma = _arena_page_load_mode(self._page_bytes) == "dma"
+        if dma:
+            runs = merge_state_extents(comp)
+        elif self._state_stage is None or self._state_stage.shape[0] < bb or self._state_stage.shape[1] != row_bytes:
             self._state_stage = torch.empty((bb, row_bytes), dtype=torch.uint8, pin_memory=_pin)
         if getattr(self, "_state_dev_stage", None) is None or self._state_dev_stage.shape[0] < bb \
                 or self._state_dev_stage.shape[1] != row_bytes or self._state_dev_stage.device != dev:
@@ -448,12 +488,15 @@ class ArenaMambaPoolHost(MambaPoolHost):
         L = int(lay["L"])
         for start in range(0, n, B):
             b = min(B, n - start)
-            stage = self._state_stage[:b]
             sl = slots_cpu[start:start + b]
-            for (cur, off, ln) in comp:
-                torch.index_select(self._slot_view[:, off:off + ln], 0, sl, out=stage[:, cur:cur + ln])
             dev_stage = self._state_dev_stage[:b]
-            dev_stage.copy_(stage, non_blocking=_pin)
+            if dma:
+                _state_block_dma(self._slot_view, dev_stage, sl.tolist(), runs)
+            else:
+                stage = self._state_stage[:b]
+                for (cur, off, ln) in comp:
+                    torch.index_select(self._slot_view[:, off:off + ln], 0, sl, out=stage[:, cur:cur + ln])
+                dev_stage.copy_(stage, non_blocking=_pin)
             d_b = didx[start:start + b]
             k = 0
             for l in range(L):
@@ -469,13 +512,14 @@ class ArenaMambaPoolHost(MambaPoolHost):
                     row[:, ch0:ch0 + n_j] = dev_stage[:, cur_j:cur_j + ln_j].contiguous().view(self.conv_dtype).view(b, n_j, width)
                     ch0 += n_j
                 dst_c.index_copy_(0, d_b, row)
-            if _pin and start + b < n:
+            if _pin and not dma and start + b < n:
                 torch.cuda.current_stream(dev).synchronize()  # the stage is reused by the next block
         global _STATE_LOAD_N
         _STATE_LOAD_N += 1
         if _STATE_LOAD_N <= 8 or _STATE_LOAD_N % 64 == 0:
-            logger.info("WEG2-ARENA-STATE-LOAD n=%d slots=%d own_bytes=%d block=%d (this rank's extents, pinned gather + one H2D per block, split on device)",
-                        _STATE_LOAD_N, n, n * row_bytes, B)
+            logger.info("WEG2-ARENA-STATE-LOAD n=%d slots=%d own_bytes=%d block=%d mode=%s (this rank's extents, %s, split on device)",
+                        _STATE_LOAD_N, n, n * row_bytes, B, "dma" if dma else "cpu",
+                        f"{len(runs)} copies per slot from the arena" if dma else "pinned gather + one H2D per block")
 
     def load_to_device_per_layer(self, device_pool, host_indices, device_indices, layer_id, io_backend="direct"):
         if self.arena is None or host_indices.numel() == 0:

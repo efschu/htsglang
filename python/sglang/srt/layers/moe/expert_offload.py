@@ -3332,6 +3332,13 @@ class MoEExpertOffloadCache:
         # spill expert fetched once per forward; byte-identical via the fixed
         # k-order combine in _run_waves_expert_major.
         self._wave_order = resolve_wave_order(envs.SGLANG_MOE_OFFLOAD_WAVE_ORDER.get())
+        # H12: the device-planned pool's eager forwards (run_eager_pool) split
+        # expert-major unless SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR=0.
+        self._pool_eager_wave_order = (
+            "expert"
+            if envs.SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR.get()
+            else self._wave_order
+        )
 
         # --- Stage-3 CUDA-graph-capturable path ----------------------------
         # Built by install_capturable_buffers() (after install(), and after any
@@ -4163,6 +4170,19 @@ class MoEExpertOffloadCache:
         self._pool_pf_armed = True
         return True
 
+    def run_eager_pool(self, dispatch_output, apply_fn):
+        """An eager forward (extend, uncaptured shape) under the pool mode, the
+        FusedMoE branch in one place: record the rows run_waves writes, split
+        in the pool's eager order (SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR,
+        H12: expert-major -- each spill expert fetched once and held by one
+        row), then republish those rows to the device tables."""
+        self.begin_eager_pool()
+        out = self.run_waves(
+            dispatch_output, apply_fn, lookahead=None, order=self._pool_eager_wave_order
+        )
+        self.sync_pool_from_host()
+        return out
+
     def begin_eager_pool(self):
         """Before an eager (prefill / uncaptured) forward under the pool mode:
         run_waves will rewrite scratch rows; record exactly those."""
@@ -4415,9 +4435,13 @@ class MoEExpertOffloadCache:
             if self._heat.due():
                 self._migrate_heat()
 
-    def run_waves(self, dispatch_output, apply_fn, lookahead=None):
+    def run_waves(self, dispatch_output, apply_fn, lookahead=None, order=None):
         """Run the grouped-GEMM for one forward, wave-splitting when the forward
         needs more unique experts than there are resident slots.
+
+        ``order`` (H12): the overflow split, "token" or "expert"; None is the
+        configured SGLANG_MOE_OFFLOAD_WAVE_ORDER. ``run_eager_pool`` passes the
+        pool's own eager order.
 
         ``lookahead`` (WP8): ``(next_cache, predicted_ids)`` -- the offload
         cache of a LATER layer and the expert ids its router predicted on this
@@ -4482,7 +4506,7 @@ class MoEExpertOffloadCache:
         except Exception as exc:  # noqa: BLE001 -- a dump never kills a forward
             logger.debug("[expert-oracle] target record skipped: %s", exc)
 
-        if self._wave_order == "expert":
+        if (self._wave_order if order is None else order) == "expert":
             # #254: split over SPILL EXPERTS instead of tokens. The single-wave
             # case is bit-for-bit the token-major fast path below.
             resident_used, spill_waves = plan_expert_waves(

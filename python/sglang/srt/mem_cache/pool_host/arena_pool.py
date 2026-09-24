@@ -119,22 +119,90 @@ def _arena_page_load_on() -> bool:
     return str(os.environ.get(ARENA_PAGE_LOAD_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
 
 
+ARENA_PAGE_LOAD_MODES = ("cpu", "kernel", "dma")
+
+
 def _arena_page_load_mode(page_bytes: int = 0) -> str:
     """"kernel" = the MLA one-buffer JIT gather with element_dim = page bytes;
-    "cpu" = the pinned-stage index_select.
+    "cpu" = the pinned-stage index_select; "dma" = one H2D copy per run of
+    consecutive slots straight out of the registered arena (no CPU gather, no
+    JIT, no pinned stage).
 
     fnFL2x66 (23.09.): the JIT module is instantiated PER ELEMENT SIZE. The
     27B's 32-KiB page is a warm build; a Next Flash page (786432 B) is a new
     instantiation, and the first load after the wake built it with ninja in
     the scheduler thread (py-spy: transfer_hicache_one_layer_mla -> load_jit
     -> build_ninja) for > 150 s while the expert workers waited in the
-    all_reduce and died at the BAR1 cycle deadline. Unset, a page above 32 KiB
-    takes the cpu stage (70 pages x 786432 B = 55 MB, a memcpy); an explicit
-    env value wins for both sizes."""
+    all_reduce and died at the BAR1 cycle deadline.
+
+    H12 (fnFL2x104, 90k needle): the cpu stage that replaced it is a memcpy in
+    the scheduler thread -- 1528 pages = 1.2 GB in 347 ms on D TP0 (3.5 GB/s,
+    ``components_ms=[kv=347``), 78 % of the first pass's init_new 448 ms, while
+    the expert workers wait in the extend's first all_reduce. A Next Flash page
+    is 768 KiB and the pages of one request lie in consecutive slots
+    (x104: slot=[72,1599] for 1528 pages), so the DMA engine reads them from
+    the registered arena at link rate without any gather. Unset, a page above
+    32 KiB takes "dma"; the 27B's 32-KiB page keeps "kernel"; an explicit env
+    value wins for both sizes."""
     m = str(os.environ.get("SGLANG_WEG2_ARENA_PAGE_LOAD_MODE", "")).strip().lower()
-    if m in ("cpu", "kernel"):
+    if m in ARENA_PAGE_LOAD_MODES:
         return m
-    return "cpu" if int(page_bytes or 0) > 32768 else "kernel"
+    return "dma" if int(page_bytes or 0) > 32768 else "kernel"
+
+
+def page_dma_runs(slots: Sequence[int], piece_pages: int) -> list:
+    """Runs of consecutive arena slots, as ``(stage_row, first_slot, count)``.
+
+    One run is one H2D copy of ``count`` whole pages from the arena into the
+    device stage rows ``[stage_row, stage_row + count)``. A run never crosses a
+    multiple of ``piece_pages``: the arena is registered with cudaHostRegister
+    in pieces of that many pages (``bind``'s pre-pin; 1 for the lazy per-slot
+    pin), and a single copy must stay inside ONE registration to be a DMA from
+    page-locked memory. The stage keeps the caller's page order, so the
+    per-layer scatter that follows is the same one the cpu stage feeds."""
+    piece = max(1, int(piece_pages))
+    runs = []
+    row = 0
+    n = len(slots)
+    while row < n:
+        first = int(slots[row])
+        count = 1
+        while (
+            row + count < n
+            and int(slots[row + count]) == first + count
+            and (first + count) % piece != 0
+        ):
+            count += 1
+        runs.append((row, first, count))
+        row += count
+    return runs
+
+
+def _ensure_page_stages(pool, B: int, pb: int, dev) -> None:
+    """The cpu mode's two alternating pinned host stages (2 x 256 MiB);
+    "dma" and "kernel" never allocate them. A module function like ``_psz``:
+    the fixtures drive the page load on bare namespaces."""
+    if pool._page_stages is None or pool._page_stages[0].shape[0] < B:
+        _pin = bool(dev.type == "cuda")
+        pool._page_stages = (
+            torch.empty((B, pb), dtype=torch.uint8, pin_memory=_pin),
+            torch.empty((B, pb), dtype=torch.uint8, pin_memory=_pin),
+        )
+        pool._page_events = ((torch.cuda.Event(), torch.cuda.Event()) if _pin
+                             else (_NoEvent(), _NoEvent()))
+
+
+def _page_block_dma(pool, dev_stage, block_slots) -> int:
+    """H12: one H2D copy per run of consecutive slots, straight from the
+    registered arena into the device stage rows (page order kept, see
+    ``page_dma_runs``). Returns the number of copies issued. The arena bytes
+    stay valid until the copy lands for the same reason they do in "kernel"
+    mode: the slots are referenced by the load that reads them."""
+    runs = page_dma_runs(block_slots.tolist(), pool._dma_piece_pages)
+    view = pool._page_view
+    for row, first, count in runs:
+        dev_stage[row:row + count].copy_(view[first:first + count], non_blocking=True)
+    return len(runs)
 
 
 def _arena_page_load_timing() -> bool:
@@ -417,6 +485,12 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if self._pinned is None:
             self._pinned = arena._pinned_slots = torch.zeros(A, dtype=torch.bool)
         self._all_pinned = bool(self._pinned.all())
+        # H12: pages per cudaHostRegister piece -- the "dma" page load keeps
+        # each copy inside one registration. 1 (a page) is always inside one:
+        # the lazy pin registers whole slots, and a piece of the pre-pin below
+        # is a whole number of pages. Raised to the pre-pin's piece only when
+        # THIS bind registered the region, so the piece size is known.
+        self._dma_piece_pages = 1
         # #1436 (xsn196): pinning slot runs on first use cost 3.4 % of P's
         # prefill loop and sat on D's re-admission of every 100k prompt.
         # Register the whole data region once at bind, in 1 GiB pieces; the
@@ -436,6 +510,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 off += n
             self._pinned[:] = True
             self._all_pinned = True
+            self._dma_piece_pages = step // page_bytes
             logger.info("#1436 arena pre-pinned: %.2f GiB in %.1f s (role=%s)", total / (1 << 30),
                         time.perf_counter() - t0, role)
         # Task #3: build the load's JIT variant NOW (boot), not inside the
@@ -651,10 +726,13 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                        rows, device_indices, layer_id)
 
     def _load_pages_all_layers(self, device_pool, slots, device_indices) -> None:
-        """Fetch whole 32-KiB pages (all layers of a token) in blocks through
-        a pinned host stage and one H2D copy per block, then scatter each
-        layer on the device. Two pinned stages alternate so the CPU gather of
-        block i+1 overlaps the DMA of block i."""
+        """Fetch whole pages (all layers of a token) in blocks into a device
+        stage, then scatter each layer on the device. How a block reaches the
+        stage is the mode (``_arena_page_load_mode``): "dma" copies runs of
+        consecutive slots straight out of the registered arena, "kernel" lets
+        the GPU gather the pages through the mapped arena, "cpu" gathers into
+        two alternating pinned stages so the CPU gather of block i+1 overlaps
+        the DMA of block i."""
         n = int(slots.numel())
         if n == 0:
             return
@@ -664,14 +742,6 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         H, D = int(self.head_num), int(self.head_dim)
         e = self.dtype.itemsize
         cell = H * D * e
-        if self._page_stages is None or self._page_stages[0].shape[0] < B:
-            _pin = bool(dev.type == "cuda")
-            self._page_stages = (
-                torch.empty((B, pb), dtype=torch.uint8, pin_memory=_pin),
-                torch.empty((B, pb), dtype=torch.uint8, pin_memory=_pin),
-            )
-            self._page_events = ((torch.cuda.Event(), torch.cuda.Event()) if _pin
-                                 else (_NoEvent(), _NoEvent()))
         cpu_slots = slots.to("cpu", dtype=torch.int64)
         dev_stage = torch.empty((min(B, n), pb), dtype=torch.uint8, device=dev)
         # xsn338: the index tensors cross to the device ONCE from pinned
@@ -692,9 +762,12 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         mode = getattr(self, "_page_mode", None) or _arena_page_load_mode(pb)  # x66: no JIT build at the wake
         if mode == "kernel" and dev.type != "cuda":
             mode = "cpu"
+        if mode == "cpu":
+            _ensure_page_stages(self, B, pb, dev)
         _timing = _arena_page_load_timing()
         _t0 = time.perf_counter() if _timing else 0.0
         _gather_ms = 0.0
+        _runs = 0
         # 19.09. (Task #3, xsn394): under the timing env every block records
         # three events (before gather, after gather, after the per-layer
         # scatter) so the device time splits into GATHER (host->stage over
@@ -705,6 +778,14 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             k = bi % 2
             if _ev is not None:
                 _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
+            if mode == "dma":
+                try:
+                    _runs += _page_block_dma(self, dev_stage, cpu_slots[start:start + b])
+                except Exception as exc:  # noqa: BLE001 -- one named fallback, then cpu
+                    logger.warning("WEG2-ARENA-PAGE-LOAD dma mode failed (%s: %s); cpu mode from now on",
+                                   type(exc).__name__, exc)
+                    self._page_mode = mode = "cpu"
+                    _ensure_page_stages(self, B, pb, dev)
             if mode == "kernel":
                 try:
                     from sglang.jit_kernel.hicache import transfer_hicache_one_layer_mla
@@ -718,6 +799,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     logger.warning("WEG2-ARENA-PAGE-LOAD kernel mode failed (%s: %s); cpu mode from now on",
                                    type(exc).__name__, exc)
                     self._page_mode = mode = "cpu"
+                    _ensure_page_stages(self, B, pb, dev)
             if mode == "cpu":
                 self._page_events[k].synchronize()  # the DMA that last read this stage is done
                 host_stage = self._page_stages[k]
@@ -760,6 +842,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                      f" gather_GB/s={(n * pb) / max(_gd, 1e-3) / 1e6:.2f} cpu_gather_ms={_gather_ms:.0f}"
                      f" map_ms={getattr(self, '_last_load_map_ms', 0.0):.0f} pin_ms={getattr(self, '_last_load_pin_ms', 0.0):.0f}"
                      f" pinned_new={getattr(self, '_last_load_pinned_n', 0)}")
+        if mode == "dma":
+            _wall = f" runs={_runs} piece={self._dma_piece_pages}" + _wall
         if n_log <= 8 or n_log % 64 == 0 or _timing:
             logger.info("WEG2-ARENA-PAGE-LOAD n=%d rows=%d pages=%d block=%d bytes=%d mode=%s%s (whole pages, layers split on device)",
                         n_log, n, n, B, n * pb, mode, _wall)

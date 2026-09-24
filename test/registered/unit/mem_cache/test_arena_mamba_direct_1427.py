@@ -103,6 +103,39 @@ def test_backup_lands_in_the_blob_at_the_store_cut_and_loads_back(tmp_path):
     assert p.free(rows) == 1 and arena.ref_slots([slot], -1) == 0
 
 
+def test_the_dma_state_load_lands_the_cpu_stages_rows_without_a_pinned_stage(tmp_path, monkeypatch):
+    """H12: fnFL2x104 TP0 spent 91 ms of the first pass on two pinned CPU
+    gathers of one 58.8-MB state. The "dma" load copies this rank's extents
+    straight from the arena; it must land the same device rows as the cpu
+    stage, for several slots out of order, and never allocate the pinned
+    stage."""
+    arena = ShmArena(str(tmp_path / "mamba.bin"), TOTAL, 8)
+    p = _pool(arena)
+    dev = _device_pool()
+    rows = p.alloc_write(["a", "b", "c"])
+    p.backup_from_device_all_layer(dev, rows, torch.tensor([3, 0, 2]), "direct")
+    p.complete_write(rows)
+    back_rows = rows.flip(0)                                 # slots out of order
+    got = {}
+    for mode in ("cpu", "dma"):
+        monkeypatch.setenv("SGLANG_WEG2_ARENA_PAGE_LOAD_MODE", mode)
+        p._state_stage = None
+        p._state_loaded_key = None
+        back = _device_pool(fill=False)
+        didx = torch.tensor([1, 3, 0])
+        # layer 0 loads every layer; the later calls are the no-ops of one load
+        for l in range(SPEC.num_layers):
+            p.load_to_device_per_layer(back, back_rows, didx, l, "direct")
+        got[mode] = back
+        if mode == "dma":
+            assert p._state_stage is None, "dma allocated the pinned CPU stage"
+    for l in range(SPEC.num_layers):
+        assert torch.equal(got["dma"].mamba_cache.temporal[l], got["cpu"].mamba_cache.temporal[l])
+        assert torch.equal(got["dma"].mamba_cache.conv[0][l], got["cpu"].mamba_cache.conv[0][l])
+        # device row 1 took slot "c", which came from device row 2
+        assert torch.equal(got["dma"].mamba_cache.temporal[l][1], dev.mamba_cache.temporal[l][2])
+
+
 def test_prefetch_resolves_a_complete_blob_in_place_and_skips_the_copy(tmp_path):
     arena = ShmArena(str(tmp_path / "mamba.bin"), TOTAL, 8)
     p = _pool(arena)

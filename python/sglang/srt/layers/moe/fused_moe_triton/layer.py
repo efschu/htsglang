@@ -2649,10 +2649,7 @@ class FusedMoE(torch.nn.Module):
                     topk_output=topk_output._replace(topk_ids=remapped)
                 )
                 return _apply(sub)
-            cache.begin_eager_pool()
-            out = cache.run_waves(dispatch_output, _apply, lookahead=None)
-            cache.sync_pool_from_host()
-            return out
+            return cache.run_eager_pool(dispatch_output, _apply)
 
         # run_waves handles both the single-wave decode fast path (one apply over
         # the full batch) and the multi-wave prefill-overflow path (disjoint
