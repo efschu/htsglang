@@ -2687,6 +2687,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.remote_instance_transfer_engine_weight_info = (
                         self.loader.remote_instance_transfer_engine_weight_info
                     )
+        # H39 port (NF line 4da5c56cc2/d6b7d4a1d3): the dense Marlin repack's
+        # load pools (checkpoint-format tensors + repack working set) are
+        # handed back here -- the weights region is closed, so no pool routing
+        # is active (inside it the pool destructor aborts).  A no-op returning
+        # 0.0 without a log line unless SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL
+        # created a load pool during this load (default off on this line).
+        from sglang.srt.managers.weg2_memory_saver import (
+            release_load_transient_pool,
+        )
+
+        release_load_transient_pool(reason="after-load")
         # #1273 S2 (spec section 6/S2): arm the exchange for this rank at the
         # END OF WEIGHT LOADING -- every weight page this runner will ever hold
         # exists now and nothing has been paused yet.  A no-op under the

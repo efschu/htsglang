@@ -37,7 +37,7 @@ import re
 import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
@@ -3036,8 +3036,310 @@ def tag_pool_scope(tag: str) -> Iterator[Any]:
             )
         yield None
         return
-    with stack:
-        yield pool
+    # H39 port (NF line b48c7f07e5): remember which pool routes right now, so
+    # a nested step can leave it for a transient (outside_tag_pool). Pure
+    # bookkeeping -- no allocation, no log -- so it is not behind the switch.
+    global _ACTIVE_TAG_POOL
+    _prev_active = _ACTIVE_TAG_POOL
+    _ACTIVE_TAG_POOL = pool
+    try:
+        with stack:
+            yield pool
+    finally:
+        _ACTIVE_TAG_POOL = _prev_active
+
+
+# ---------------------------------------------------------------------------
+# H39 PORT TO THE 27B LINE -- load transients outside the private tag pools.
+#
+# Code taken from the NF line (b48c7f07e5, 11cadf67a3, 4da5c56cc2, 196d43b514,
+# d6b7d4a1d3); the measurements quoted in the docstrings below marked "NF
+# line" are that line's and are NOT 27B figures.  The 27B measurement
+# (weg2xsn423/xsn424, identical in both boots): the target is W8A8-INT8 and
+# repacks nothing -- reserved minus allocated after its load is 0.04/0.20/0.20
+# GiB on D and 0.02/0.00/0.08 on P -- but the DFlash2-W8 drafter is
+# compressed_tensors_wNa16 (8 bit, group 128) and its Marlin repack left the
+# ``weights_draft`` pool holding 431/209/199 MiB (D TP0/TP1/TP2) and 771 MiB
+# (P PP2) more segment than the drafter's tensors.  Nothing here runs unless a
+# caller steps out: on this line only compressed_tensors_wNa16 does, and only
+# with SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL=1 (default off).  Off, no load
+# pool is ever created and release_load_transient_pool returns 0.0 at once.
+# ---------------------------------------------------------------------------
+
+#: The pool ``tag_pool_scope`` currently routes to, so a nested step can step
+#: OUT of it for the duration of a transient (:func:`outside_tag_pool`).  A
+#: module global rather than a parameter because the step that needs it -- the
+#: repack inside ``process_weights_after_loading`` -- is several frames below
+#: the scope, in a quantization scheme.
+_ACTIVE_TAG_POOL: Any = None
+
+
+@contextmanager
+def outside_tag_pool(reason: str = "", *, into: str = "load") -> Iterator[bool]:
+    """Route allocations inside OUT of the current tag pool, then come back.
+
+    ``into`` names the load pool the block lands in: ``"load"`` (the repack
+    working set, reused layer after layer) or ``"ckpt"`` (the
+    checkpoint-format tensors a post-load repack REPLACES, born at model
+    construction and dead after the repack).  Two pools so that one tensor
+    something still references pins only its own kind, never the other pool's
+    empty segments (see :func:`release_load_transient_pool`).
+
+    A private ``MemPool`` NEVER hands a cached block back to the driver while
+    it lives: ``emptyCache`` releases ``graph_pools_freeable`` only, and a tag
+    pool is cached per tag for the whole boot.  So every transient born inside
+    one leaves a segment there forever.
+
+    Yields True when it really stepped out.  Everything allocated inside lands
+    in segments that carry no tag, so a caller MUST copy anything that has to
+    survive back in before leaving the block -- else the exchange would pause
+    a segment holding another tag's bytes (#1378 xsn66).  A survivor that is
+    BORN inside the block (not copied in afterwards) is allocated under
+    :func:`back_into_tag_pool` instead.
+
+    Nested use is a no-op step: a second ``_cuda_endAllocateToPool`` for a
+    pool this thread already left would drop a capture entry that is not ours.
+
+    WHERE THE BLOCK REALLY ALLOCATES (NF line, fnFL2x5 allocator snapshot):
+    not the default pool. ``torch_memory_saver.region()`` itself runs inside
+    ``use_mem_pool(_primary_mem_pool)`` -- a live private pool -- and the tag
+    pool is nested in it, so merely stepping out of the tag pool would land
+    every transient in TMS's pool, which ``empty_cache`` does not reach
+    either.  So the block runs in a load pool of its own that is deleted after
+    the weights region (:func:`release_load_transient_pool`).
+    """
+    import torch
+
+    pool = _ACTIVE_TAG_POOL
+    if pool is None:
+        yield False
+        return
+    if _STEPPED_OUT_POOLS and _STEPPED_OUT_POOLS[-1] is pool:
+        yield True
+        return
+    try:
+        from torch.cuda.memory import (
+            _cuda_beginAllocateCurrentThreadToPool,
+            _cuda_endAllocateToPool,
+        )
+    except Exception:  # noqa: BLE001 -- a torch without private pools
+        yield False
+        return
+    device_index = torch.cuda.current_device()
+    _cuda_endAllocateToPool(device_index, pool.id)
+    _STEPPED_OUT_POOLS.append(pool)
+    try:
+        with _transient_pool(reason, into=into):
+            yield True
+    finally:
+        _STEPPED_OUT_POOLS.pop()
+        _cuda_beginAllocateCurrentThreadToPool(device_index, pool.id)
+
+
+#: Load pools that could not be deleted because something still lived in
+#: them -- kept referenced so their destructor never runs on live blocks (NF
+#: line v56 died on exactly that: ``c10::AcceleratorError invalid argument``).
+_KEPT_TRANSIENT_POOLS: List[Any] = []
+
+#: ONE pool for every transient block of a load, reused layer after layer (the
+#: repack of layer N+1 takes the freed blocks of layer N, so the load peak stays
+#: one layer's working set) and handed back by
+#: :func:`release_load_transient_pool` once the weights region is closed.
+#: Not per block: a pool can only be deleted while NO routing is active
+#: (NF-line metal probe, torch 2.11: ``captures_underway.empty() INTERNAL
+#: ASSERT FAILED`` in the destructor), and inside torch_memory_saver's region
+#: one always is.
+_LOAD_TRANSIENT_POOL: Any = None
+
+#: The checkpoint-format tensors of the dense Marlin linears
+#: (compressed_tensors_wNa16), born at construction, replaced by the post-load
+#: repack.  Released beside the transient pool, independently of it.
+_LOAD_CKPT_POOL: Any = None
+
+
+#: The saver entry points while :func:`_transient_pool` has SUSPENDED its
+#: region tracking -- :func:`back_into_tag_pool` turns it back on for the
+#: survivors (the current tag, set by ``weight_chunk_scope``, is untouched by
+#: the suspension, so they are tagged with their chunk again).
+_TMS_SUSPENDED: List[Any] = []
+
+
+@contextmanager
+def _transient_pool(reason: str, *, into: str = "load") -> Iterator[Any]:
+    """Route the block into a load pool (created on first use).
+
+    WITH torch_memory_saver's region tracking OFF, the way its own
+    ``disable()`` does it: a segment cudaMalloc'd while the region is
+    "interesting" becomes the saver's pausable VMM allocation, and handing it
+    back through the caching allocator later fails (NF line fnFL2x6:
+    ``MemPool::~MemPool -> release_block: CUDA error: invalid argument``).
+    Untracked, the transients are plain device memory that the pool's
+    deletion returns."""
+    global _LOAD_TRANSIENT_POOL, _LOAD_CKPT_POOL
+    import torch
+
+    if not torch.cuda.is_available():
+        yield None
+        return
+    target = _LOAD_CKPT_POOL if into == "ckpt" else _LOAD_TRANSIENT_POOL
+    if target is None:
+        try:
+            target = torch.cuda.MemPool()
+        except Exception:  # noqa: BLE001 -- a torch without MemPool: the enclosing pool takes it
+            yield None
+            return
+        if into == "ckpt":
+            _LOAD_CKPT_POOL = target
+        else:
+            _LOAD_TRANSIENT_POOL = target
+    cdll = _tms_cdll_in_region()
+    if cdll is not None:
+        cdll.tms_set_interesting_region(False)
+        _TMS_SUSPENDED.append(cdll)
+    try:
+        with torch.cuda.use_mem_pool(target):
+            yield target
+    finally:
+        if cdll is not None:
+            _TMS_SUSPENDED.pop()
+            cdll.tms_set_interesting_region(True)
+
+
+def release_load_transient_pool(reason: str = "") -> float:
+    """Hand the load pools back to the driver; returns GiB freed.
+
+    Only where NO pool routing is active -- the destructor aborts the process
+    otherwise (see ``_LOAD_TRANSIENT_POOL``).  Refuses, loudly and harmlessly,
+    while a tag pool or a torch_memory_saver region is open, and keeps a pool
+    (never deletes it) when a block in it is still live.  The checkpoint-format
+    pool goes first and on its own: a live block there keeps only it.  With no
+    load pool created (the switch off) this is 0.0 without a log line."""
+    freed = _release_one_load_pool("ckpt", reason)
+    return freed + _release_one_load_pool("load", reason)
+
+
+def _release_one_load_pool(kind: str, reason: str) -> float:
+    global _LOAD_TRANSIENT_POOL, _LOAD_CKPT_POOL
+    pool = _LOAD_CKPT_POOL if kind == "ckpt" else _LOAD_TRANSIENT_POOL
+    if pool is None:
+        return 0.0
+    import torch
+
+    if (
+        _ACTIVE_TAG_POOL is not None
+        or _STEPPED_OUT_POOLS
+        or _tms_cdll_in_region() is not None
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        logger.warning(
+            "WEG2-TAG-POOL %s NOT released reason=%s -- a pool "
+            "routing is still active here (tag pool or saver region); deleting "
+            "now would abort in the allocator", _LOAD_POOL_NAME[kind], reason or "?",
+        )
+        return 0.0
+    if kind == "ckpt":
+        _LOAD_CKPT_POOL = None
+    else:
+        _LOAD_TRANSIENT_POOL = None
+    if _pool_has_live_blocks(pool, f"{reason or '?'} pool={kind}"):
+        _KEPT_TRANSIENT_POOLS.append(pool)
+        return 0.0
+    before = torch.cuda.memory_reserved()
+    del pool
+    torch.cuda.empty_cache()
+    freed_gib = (before - torch.cuda.memory_reserved()) / 2**30
+    logger.info(
+        "WEG2-TAG-POOL %s RELEASED reason=%s freed_gib=%.2f -- %s",
+        _LOAD_POOL_NAME[kind], reason or "?", freed_gib, _LOAD_POOL_WHAT[kind],
+    )
+    return freed_gib
+
+
+#: The log names of the two load pools -- the NF line's wording byte for byte,
+#: so one boot reader parses both lines' logs.
+_LOAD_POOL_NAME = {
+    "load": "load transient pool",
+    "ckpt": "checkpoint-format pool",
+}
+_LOAD_POOL_WHAT = {
+    "load": "the repack's working set, reused across layers and handed back in one piece",
+    "ckpt": (
+        "the dense Marlin linears' checkpoint-format tensors, replaced by the "
+        "post-load repack (H39: they were dead blocks of the tag pools)"
+    ),
+}
+
+
+def _pool_has_live_blocks(pool: Any, reason: str) -> bool:
+    import torch
+
+    device_index = torch.cuda.current_device()
+    try:
+        if torch._C._cuda_checkPoolLiveAllocations(device_index, pool.id, set()):
+            return False
+    except Exception:  # noqa: BLE001 -- cannot tell: keep it rather than risk v56
+        pass
+    live = sum(
+        b["size"]
+        for s in torch.cuda.memory_snapshot(pool.id)
+        for b in s["blocks"]
+        if str(b.get("state", "")).startswith("active")
+    )
+    logger.warning(
+        "WEG2-TAG-POOL transient pool KEPT reason=%s live=%.1f MiB -- a tensor "
+        "that outlives the block was born outside back_into_tag_pool; the pool "
+        "stays referenced so its destructor never frees live blocks",
+        reason or "?", live / 2**20,
+    )
+    return True
+
+
+#: Pools the loading thread has stepped OUT of via :func:`outside_tag_pool`,
+#: innermost last -- what :func:`back_into_tag_pool` re-enters.  The load that
+#: uses it is single-threaded (the post-load pass and model construction run
+#: on the thread that opened the tag pool).
+_STEPPED_OUT_POOLS: List[Any] = []
+
+
+@contextmanager
+def back_into_tag_pool() -> Iterator[bool]:
+    """Inside an :func:`outside_tag_pool` block: allocate in the tag pool again.
+
+    For the SURVIVORS of a transient block -- the tensors that stay on the card
+    after it and must pause and resume with their tag (repacked weight,
+    permuted scales, g_idx, Marlin workspace).  With the repack outside the
+    pool and only the resident buffers born back inside it, the pool holds
+    exactly what stays.  The saver's tracking, suspended by the enclosing
+    transient block, is back on for them.
+
+    Outside any stepped-out block this is a no-op and yields False.
+    """
+    import torch
+
+    if not _STEPPED_OUT_POOLS:
+        yield False
+        return
+    from torch.cuda.memory import (
+        _cuda_beginAllocateCurrentThreadToPool,
+        _cuda_endAllocateToPool,
+    )
+
+    pool = _STEPPED_OUT_POOLS.pop()
+    # The survivors are weights: tracked by the saver again (paused and
+    # resumed with their chunk tag), even though the enclosing transient block
+    # suspended the tracking.
+    cdll = _TMS_SUSPENDED[-1] if _TMS_SUSPENDED else None
+    if cdll is not None:
+        cdll.tms_set_interesting_region(True)
+    device_index = torch.cuda.current_device()
+    _cuda_beginAllocateCurrentThreadToPool(device_index, pool.id)
+    try:
+        yield True
+    finally:
+        _cuda_endAllocateToPool(device_index, pool.id)
+        if cdll is not None:
+            cdll.tms_set_interesting_region(False)
+        _STEPPED_OUT_POOLS.append(pool)
 
 
 @contextmanager
