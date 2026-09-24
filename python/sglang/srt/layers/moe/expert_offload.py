@@ -5667,7 +5667,23 @@ def rearm_expert_offload_after_wake(model):
         layers += 1
     if layers and torch.cuda.is_available():
         torch.cuda.synchronize()
+    _warm_after_wake(model)
     return layers, zeilen
+
+
+def _warm_after_wake(model):
+    """fnFL2 H29: the D-side half of the decode warm, AFTER the rearm (its
+    reinit freed the LRU rows) and before any forward. Both halves are off by
+    default and neither can refuse the wake."""
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_WEG2_PLE_DECODE_PREFETCH.get():
+        try:
+            from sglang.srt.models.qwen4_exp_ple_table import start_ple_decode_warm
+
+            start_ple_decode_warm(model)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PLE-DECODE-PREFETCH skipped: %s", exc)
 
 
 def _refill_runs(refill):
@@ -6643,3 +6659,4 @@ def _router_probe(router_logits, topk_weights, flat_weights, T, K) -> None:
         )
     except Exception as exc:  # noqa: BLE001 -- an instrument never kills a layer
         logger.debug("[nan-probe-rw] router probe skipped: %s", exc)
+

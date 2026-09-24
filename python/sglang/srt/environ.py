@@ -498,6 +498,19 @@ class Envs:
     # TAIL_ADOPT; any refusal falls back to E1 (extend [c, N)), then to the
     # page resume. 0 = the H21 form.
     SGLANG_WEG2_TAIL_SKIP_EXTEND = EnvBool(True)
+    # DECODE WARM FROM P (fnFL2 H29). P publishes what it saw at the END of
+    # the prompt into the hand-off dir (<SGLANG_HICACHE_ARENA_DIR>/handoff):
+    # the PLE rows of its last prefill gather. D reads them after the wake.
+    # Both groups need the switch (the launcher env is not the rank env).
+    # PLE_DECODE_PREFETCH (H29a): D faults the published PLE rows' pages into
+    # ITS OWN mapping of the checkpoint shards on a background thread (the
+    # decode gather is an in-graph HMM kernel; P's pread gather does not fill
+    # the mmap page cache on ZFS, so D's first reads of prompt n-grams are
+    # cold). At most PLE_DECODE_PREFETCH_PAGES pages per wake.
+    SGLANG_WEG2_PLE_DECODE_PREFETCH = EnvBool(False)
+    SGLANG_WEG2_PLE_DECODE_PREFETCH_PAGES = EnvInt(16384)
+    # a published file older than this is another prompt's and is ignored
+    SGLANG_WEG2_DECODE_WARM_MAX_AGE_S = EnvFloat(600.0)
     # FLIP_ORDER_CREDIT (H14, fnFL2x114c/x114d): the front simulates the
     # D->P wake per card (weg2/wake_credit.py) before it hands out the pause
     # order; an order that ends in the W109 credit cycle is replaced by one in

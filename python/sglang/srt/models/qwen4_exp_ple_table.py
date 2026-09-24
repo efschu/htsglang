@@ -222,6 +222,7 @@ class PleCheckpointPrefetcher:
         row_ids = row_ids[(row_ids >= 0) & (row_ids < self._table.total_rows)]
         if row_ids.numel() == 0:
             return False
+        note_ple_prefill_rows(row_ids)  # fnFL2 H29a (hmm gather on P)
         by_fd = self.pages_by_fd(row_ids)
         n_pages = 0
         for fd, pages in by_fd.items():
@@ -346,6 +347,8 @@ class PleCheckpointPreadGather:
         staging = self._staging_for(n)
         valid_idx = torch.nonzero(in_range).flatten()
         nv = int(valid_idx.numel())
+        # fnFL2 H29a: P hands the rows it just read to D's decode warm
+        note_ple_prefill_rows(ids[in_range])
         if nv != n:
             # same rule as the kernel: out-of-range rows are 0.0
             staging.zero_()
@@ -963,3 +966,186 @@ def map_ple_table_from_checkpoint(
         shard_files=shard_files,
         shard_offsets=shard_offsets,
     )
+
+
+# ---- fnFL2 H29a: D's decode PLE rows warm from P's last prefill gather -------
+#
+# WHERE THE DECODE GATHER RUNS. ``Qwen4ExpPinnedHostEmbedding.gather`` launches
+# ``_gather_ple_embedding_from_shards_kernel`` -- inside the captured verify
+# graph, on the PLE layer (``ple_layer_ids``, one layer on Qwen3.8-Flash-Next),
+# on the rank that owns the dense side (Form A: TP0 only, the expert workers
+# never build the PLE). It dereferences the checkpoint mmap through HMM; a row
+# whose page is not in THIS process's page cache mapping faults inside the
+# kernel. No Python runs per replay, so a per-round host prefetch of the draft
+# candidates cannot run before it (and the draft tokens exist only on the
+# device until the verify has been launched).
+#
+# WHAT IS DIFFERENT ON D AFTER A FLIP. On a one-group boot the decoding process
+# prefilled the prompt itself: the prefill gathers faulted every prompt n-gram
+# row into its own mapping, and a decode that repeats prompt n-grams (code)
+# reads them warm. Under Weg 2, P prefilled -- with the pread gather (#55),
+# which on ZFS fills the ARC but NOT the mmap page cache -- and D never saw
+# the prompt. Here D faults P's published rows (repeated rows first, then the
+# last tokens' rows) into its own mapping on one background thread, bounded by
+# SGLANG_WEG2_PLE_DECODE_PREFETCH_PAGES, and counts page-cache residency
+# (mincore) before it touches: ``warm`` pages were in the page cache already,
+# ``cold`` ones were faulted in by the touch.
+
+_PLE_PUBLISH_POOL: Optional[ThreadPoolExecutor] = None
+_PLE_WARM_LAST_MTIME: Optional[float] = None
+_PLE_WARM_DEADLINE_S = 30.0
+
+
+def _ple_publish_armed() -> bool:
+    """P side: the switch is on and this process is not group D."""
+    if not envs.SGLANG_WEG2_PLE_DECODE_PREFETCH.get():
+        return False
+    return os.environ.get("SGLANG_WEG2_GROUP", "").strip() != "D"
+
+
+def note_ple_prefill_rows(row_ids: torch.Tensor) -> bool:
+    """P side, from a prefill gather that already holds its row ids on the
+    host: publish the rows worth warming (weg2/decode_warm_handoff) on one
+    background thread. Returns whether anything was queued."""
+    global _PLE_PUBLISH_POOL
+    if not _ple_publish_armed() or row_ids.numel() == 0 or row_ids.is_cuda:
+        return False
+    ids = row_ids.detach().to(torch.int64).numpy().copy()
+    if _PLE_PUBLISH_POOL is None:
+        _PLE_PUBLISH_POOL = ThreadPoolExecutor(max_workers=1)
+
+    def _publish() -> None:
+        from sglang.srt.weg2.decode_warm_handoff import publish_ple_rows
+
+        try:
+            publish_ple_rows(ids)
+        except Exception as exc:  # noqa: BLE001 -- a warm hint never fails P
+            logger.debug("[H29a] PLE row publish skipped: %s", exc)
+
+    _PLE_PUBLISH_POOL.submit(_publish)
+    return True
+
+
+def _mincore_page(addr: int, vec) -> int:
+    """1 = in the page cache, 0 = not, -1 = not mapped (or no libc)."""
+    libc = _libc()
+    if libc is None:
+        return -1
+    rc = libc.mincore(
+        ctypes.c_void_p(addr), ctypes.c_size_t(1 << _PAGE_SHIFT), vec
+    )
+    if rc != 0:
+        return -1
+    return int(vec[0]) & 1
+
+
+def ple_row_pages(table: "CheckpointMappedPleTable", rows) -> list:
+    """Global PLE rows -> distinct page addresses of THIS mapping, in the
+    rows' order (a row that straddles a page boundary names both pages)."""
+    rows = torch.as_tensor(rows, dtype=torch.int64).reshape(-1)
+    rows = rows[(rows >= 0) & (rows < table.total_rows)]
+    if rows.numel() == 0 or not table.bases:
+        return []
+    shard = torch.div(rows, table.shard_rows, rounding_mode="floor")
+    keep = shard < len(table.bases)
+    rows, shard = rows[keep], shard[keep]
+    bases = torch.tensor(table.bases, dtype=torch.int64)
+    start = bases[shard] + (rows - shard * table.shard_rows) * table.row_bytes
+    end = start + (table.row_bytes - 1)
+    pages = torch.stack([start >> _PAGE_SHIFT, end >> _PAGE_SHIFT], dim=1).reshape(-1)
+    uniq, inverse = torch.unique(pages, return_inverse=True)
+    first = torch.full((uniq.numel(),), pages.numel(), dtype=torch.int64)
+    first.scatter_reduce_(0, inverse, torch.arange(pages.numel()), reduce="amin")
+    ordered = uniq[torch.argsort(first)]
+    return [int(p) << _PAGE_SHIFT for p in ordered.tolist()]
+
+
+def warm_ple_rows(table: "CheckpointMappedPleTable", rows, max_pages: int,
+                  deadline_s: float = _PLE_WARM_DEADLINE_S) -> dict:
+    """Fault the pages of ``rows`` into this process's mapping. Every page is
+    checked with mincore first: an unmapped address is never touched (no
+    segfault can come out of a stale row id), a resident one is only
+    counted. Returns the census."""
+    import time as _time
+
+    t0 = _time.monotonic()
+    pages = ple_row_pages(table, rows)
+    if max_pages > 0:
+        pages = pages[: int(max_pages)]
+    vec = (ctypes.c_ubyte * 1)()
+    warm = cold = unmapped = touched = 0
+    for addr in pages:
+        state = _mincore_page(addr, vec)
+        if state < 0:
+            unmapped += 1
+            continue
+        if state == 1:
+            warm += 1
+            continue
+        cold += 1
+        if _time.monotonic() - t0 > deadline_s:
+            continue
+        ctypes.string_at(addr, 1)  # the fault: page cache + this mapping's PTE
+        touched += 1
+    return {
+        "rows": int(torch.as_tensor(rows).numel()),
+        "pages": len(pages),
+        "warm": warm,
+        "cold": cold,
+        "unmapped": unmapped,
+        "touched": touched,
+        "ms": (_time.monotonic() - t0) * 1000.0,
+    }
+
+
+def _ple_tables_of(model) -> list:
+    out = []
+    for module in model.modules():
+        table = getattr(module, "_ckpt_table", None)
+        if isinstance(table, CheckpointMappedPleTable) and table not in out:
+            out.append(table)
+    return out
+
+
+def start_ple_decode_warm(model, directory: Optional[str] = None,
+                          background: bool = True) -> Optional[threading.Thread]:
+    """D side, after the wake: warm P's published rows in every mapped PLE
+    table of ``model`` on one daemon thread (``background=False`` runs it
+    inline, for tests). A file already warmed (same mtime) is not warmed
+    again. Logs ``PLE-DECODE-PREFETCH``."""
+    global _PLE_WARM_LAST_MTIME
+    from sglang.srt.weg2.decode_warm_handoff import load_ple_rows
+
+    tables = _ple_tables_of(model)
+    if not tables:
+        return None
+    rows, mtime = load_ple_rows(directory)
+    if rows is None:
+        logger.info("PLE-DECODE-PREFETCH rows=0 (no fresh ple_rows file from P)")
+        return None
+    if mtime == _PLE_WARM_LAST_MTIME:
+        return None
+    _PLE_WARM_LAST_MTIME = mtime
+    max_pages = int(envs.SGLANG_WEG2_PLE_DECODE_PREFETCH_PAGES.get())
+
+    def _run() -> None:
+        for table in tables:
+            try:
+                c = warm_ple_rows(table, rows, max_pages)
+            except Exception as exc:  # noqa: BLE001 -- a warm hint never kills D
+                logger.warning("PLE-DECODE-PREFETCH failed: %s", exc)
+                return
+            logger.info(
+                "PLE-DECODE-PREFETCH rows=%d pages=%d warm=%d cold=%d unmapped=%d "
+                "touched=%d ms=%.1f (fnFL2 H29a: P's last prefill rows faulted into "
+                "D's mapping; warm/cold = mincore page-cache census before the touch)",
+                c["rows"], c["pages"], c["warm"], c["cold"], c["unmapped"],
+                c["touched"], c["ms"],
+            )
+
+    if not background:
+        _run()
+        return None
+    th = threading.Thread(target=_run, name="ple-decode-warm", daemon=True)
+    th.start()
+    return th
