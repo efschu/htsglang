@@ -1872,6 +1872,18 @@ def _session_pids(sid: int) -> set:
     return {int(a) for a, b in (l.split() for l in out.splitlines()[1:] if len(l.split()) == 2) if b == str(sid)}
 
 
+def _measured_record_stat_key(path: str) -> Optional[Tuple[int, int, int, int]]:
+    """The sidecar's identity for the sleep-leg memo: (dev, ino, size, mtime_ns).
+
+    ``None`` when it cannot be stat'ed -- the caller then reads as before and
+    memoises nothing, so a missing or unreadable file keeps its old answer."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
 class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
@@ -4337,12 +4349,40 @@ class Front:
         # handed this process, and `sample_dormant_image` appends to exactly it.
         if not self.measured_record:
             return None, "no-sidecar"
+        # xsn420 (24.09.): this read runs synchronously in the flip path,
+        # between 'WEG2-FLIP-ORDER' and 'gathered-legs' -- the whole
+        # append-only sidecar (1854 samples, 2.9 MB) parsed and, on the 27B
+        # line, every sample judged by the record identity. Measured gap
+        # ORDER -> gathered-legs: 35-62 ms on every flip of xsn420 against
+        # 11-20 ms on xsn407/xsn411 (1347 samples then). The answer is a pure
+        # function of the file's bytes and of this front's fixed identity, so
+        # it is memoised on the file's stat: every change of the file -- this
+        # front's own samples at the first sleeps and at epoch 2, another
+        # boot's append -- is a new key and is read again. Taken only when the
+        # stat is the same before AND after the read (no torn key).
+        key0 = _measured_record_stat_key(self.measured_record)
+        memo = getattr(self, "_sleep_leg_need_memo", None)
+        if memo is None:
+            memo = self._sleep_leg_need_memo = {}
+        hit = memo.get(str(group))
+        if key0 is not None and hit is not None and hit[0] == key0:
+            return hit[1]
+        # getattr: a Front built without __init__ (the #1361 execution smoke)
+        # has no identity; the live front always sets it in __init__.
+        record_line = getattr(self, "record_line", None)
         try:
             rec = host_ledger.read_measured_record(
                 self.measured_record,
-                accept=self.record_line.accepts_sample if self.record_line is not None else None)
+                accept=record_line.accepts_sample if record_line is not None else None)
         except Exception:  # noqa: BLE001 - a gate must never break the flip
             return None, "unreadable"
+        out = self._sleep_leg_need_from_record(rec, group)
+        if key0 is not None and _measured_record_stat_key(self.measured_record) == key0:
+            memo[str(group)] = (key0, out)
+        return out
+
+    @staticmethod
+    def _sleep_leg_need_from_record(rec: Optional[dict], group: str) -> Tuple[Optional[float], str]:
         e = (rec or {}).get(str(group))
         if not isinstance(e, dict):
             return None, "absent"
