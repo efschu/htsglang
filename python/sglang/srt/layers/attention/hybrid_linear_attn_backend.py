@@ -11,6 +11,9 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
 )
+from sglang.srt.layers.attention.mamba.mamba_state_indices_triton import (
+    fused_replay_state_indices,
+)
 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
@@ -109,6 +112,25 @@ class MambaAttnBackendBase(AttentionBackend):
         self._verify_query_start_loc_by_rows: dict = {}
         self._cuda_graph_max_bs: int = 0
         self.conv_states_shape: tuple[int, int] = None
+
+    def _fused_state_indices_ok(self) -> bool:
+        """Upstream #32219 fast path eligibility, asked per replay (the pool
+        object is read live, so a rebinding cannot leave a stale answer).
+
+        The fused kernel gathers ``req_index_to_mamba_index_mapping`` directly,
+        so it is valid only where ``get_mamba_indices`` is that flat gather and
+        the v2p translate is the identity (the static hybrid pool; not the
+        unified pool), and not under ReplaySSM, whose cursor refresh reads the
+        gathered ids."""
+        pool = self.req_to_token_pool
+        return (
+            self.replayssm_write_pos_list is None
+            and str(self.device).startswith("cuda")
+            and isinstance(pool, HybridReqToTokenPool)
+            and type(pool).translate_mamba_indices
+            is HybridReqToTokenPool.translate_mamba_indices
+            and type(pool).get_mamba_indices is HybridReqToTokenPool.get_mamba_indices
+        )
 
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba slot-id translate (identity for the non-unified
@@ -591,14 +613,26 @@ class MambaAttnBackendBase(AttentionBackend):
                 num_padding = torch.count_nonzero(
                     seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
                 )
-        # Make sure forward metadata is correctly handled for padding reqs
-        req_pool_indices[bs - num_padding :] = 0
-        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        # Translate using the LIVE v2p table BEFORE the padding sentinel below;
-        # captured Mamba kernels read state_indices_list as PHYSICAL ids.
-        mamba_indices = self._translate_mamba_indices(mamba_indices)
-        mamba_indices[bs - num_padding :] = -1
-        self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        if self._fused_state_indices_ok():
+            # Upstream #32219 single-launch fast path: mapping gather + padding
+            # sentinel + store into the static buffer, plus zeroing the padded
+            # req_pool_indices rows -- bit-identical to the reference chain.
+            mamba_indices = fused_replay_state_indices(
+                req_pool_indices=req_pool_indices,
+                mamba_index_mapping=self.req_to_token_pool.req_index_to_mamba_index_mapping,
+                out_state_indices=self.state_indices_list[bs - 1],
+                valid_bs=bs - int(num_padding),
+                total_bs=bs,
+            )
+        else:
+            # Make sure forward metadata is correctly handled for padding reqs
+            req_pool_indices[bs - num_padding :] = 0
+            mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+            # Translate using the LIVE v2p table BEFORE the padding sentinel below;
+            # captured Mamba kernels read state_indices_list as PHYSICAL ids.
+            mamba_indices = self._translate_mamba_indices(mamba_indices)
+            mamba_indices[bs - num_padding :] = -1
+            self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
         track_buf = None
