@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import struct
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -257,12 +258,16 @@ def params_on_meta():
     Buffers stay where the module puts them (a rope's cos/sin cache is
     computed at construction and must be real). A parameter is created by
     its layer first and moved to meta at registration, so the transient per
-    parameter is one tensor at a time -- the largest tower tensor, ~10 MiB.
+    parameter is one tensor at a time -- the largest tower tensor (the 27B
+    merger's fc2, 45 MiB).
     """
     orig = torch.nn.Module.register_parameter
+    owner = threading.get_ident()
 
     def register_parameter(module, name, param):
-        if param is not None and param.device.type != "meta":
+        # Scoped to the building thread: the class attribute is process-wide,
+        # and a module another thread builds meanwhile must stay untouched.
+        if threading.get_ident() == owner and param is not None and param.device.type != "meta":
             param = torch.nn.Parameter(param.to("meta"), requires_grad=False)
         return orig(module, name, param)
 
