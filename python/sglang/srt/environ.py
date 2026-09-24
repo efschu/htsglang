@@ -1932,6 +1932,15 @@ class Envs:
     # bounded by req_to_token_pool = --max-running-requests). Admission cap
     # only, no allocation: kept out of the ring form key.
     SGLANG_WEG2_ENABLE_P_UNDIVIDED_MICRO_BATCH = EnvBool(False)
+    # fnFL2 H42 (Task #118): several END-ANCHOR tails per P forward. Unset/
+    # False = stock: a whole-fit prompt's body [0, N-1') mints THE chunked
+    # continuation (`scheduler.chunked_req`, one per pass, #959/#996), so at
+    # most ONE request reaches its end per forward and the second whole-fit
+    # prompt of a pass is refused (#967). True (and SGLANG_WEG2_END_ANCHOR
+    # armed, i.e. group P only): each anchor body becomes an ANCHOR TAIL of
+    # its own (`Scheduler.anchor_tails`); the tails [N-1', N) are re-added
+    # together in the next pass. Inert without the END-ANCHOR (group D).
+    SGLANG_WEG2_ENABLE_P_MULTI_ANCHOR_TAILS = EnvBool(False)
     # Device-planned expert pool (SGLANG_MOE_OFFLOAD_GRAPH_MODE=pool): what an
     # EAGER forward (extend, eager first verify) leaves of the decode LRU.
     # True (default): only the LRU rows the eager pass actually WROTE take its

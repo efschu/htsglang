@@ -1330,6 +1330,12 @@ def _live_reqs(scheduler) -> List:
     if chunked is not None and id(chunked) not in seen:
         seen.add(id(chunked))
         out.append(chunked)
+    # fnFL2 H42: END-ANCHOR tails are continuations in NO batch too, each with
+    # committed KV and a mamba slot -- the same route, one per request.
+    for tail in getattr(scheduler, "anchor_tails", None) or ():
+        if id(tail) not in seen:
+            seen.add(id(tail))
+            out.append(tail)
     return out
 
 
@@ -2153,6 +2159,11 @@ def consume_retracted_from_live_universe(scheduler, reqs) -> int:
     if chunked is not None and id(chunked) in targets:
         scheduler.chunked_req = None
         retired += 1
+    tails = getattr(scheduler, "anchor_tails", None)
+    if tails:  # fnFL2 H42: the same retirement, per tail
+        keep = [t for t in tails if id(t) not in targets]
+        retired += len(tails) - len(keep)
+        scheduler.anchor_tails = keep
     return retired
 
 

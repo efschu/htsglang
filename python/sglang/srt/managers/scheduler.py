@@ -220,6 +220,7 @@ from sglang.srt.managers import prefetch_ballot
 from sglang.srt.managers import tp_head_congruence
 from sglang.srt.managers import weg2_store_told
 from sglang.srt.managers import uniform_floor_scope
+from sglang.srt.managers import anchor_tails as _anchor_tails
 from sglang.srt.managers.pp_admission_congruence import (
     PP_ADMISSION_VACUOUS_ROLLUP_EVERY,
     PPAdmissionCongruenceGuard,
@@ -2242,6 +2243,10 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
+        # fnFL2 H42: END-ANCHOR tails carried to the next pass, one per request
+        # (managers/anchor_tails.py). Stays empty unless
+        # SGLANG_WEG2_ENABLE_P_MULTI_ANCHOR_TAILS is armed on group P.
+        self.anchor_tails: List[Req] = []
         self._pending_chunked_abort_req = None
         self._pending_chunked_abort_delay = 0  # xsn324: passes to keep launching chunks (weg2.pp_abort)
         self.is_mixed_chunk = (
@@ -9955,6 +9960,14 @@ class Scheduler(
             if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
                 self.stash_chunked_request(self.chunked_req)
 
+        if getattr(self, "anchor_tails", None):
+            # fnFL2 H42: every anchor tail is a continuation exactly like the
+            # chunked request -- out of the merge, its body chunk stashed (the
+            # per-request anchor node, MAMBA-ARENA claim and tail capture).
+            chunked_req_to_exclude.update(self.anchor_tails)
+            for _tail in _anchor_tails.stash_due(self.anchor_tails):
+                self.stash_chunked_request(_tail)
+
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
@@ -9977,6 +9990,11 @@ class Scheduler(
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
                 chunked_req_to_exclude.add(last_batch.chunked_req)
+            # fnFL2 H42: the same for this slot's anchor bodies, whose tails ran
+            # (or run) in a later pass.
+            chunked_req_to_exclude.update(
+                getattr(last_batch, "weg2_anchor_tail_bodies", ()) or ()
+            )
 
             if self.dllm_config is not None and last_batch.reqs:
                 chunked_req_to_exclude.update(last_batch.reqs)
@@ -12090,7 +12108,12 @@ class Scheduler(
             n_reqs = 0 if ret is None else len(ret.reqs)
             queue = len(self.waiting_queue)
             running = len(self.running_batch.reqs) if self.running_batch else 0
-            chunked = 1 if self.chunked_req is not None else 0
+            chunked = (
+                1
+                if self.chunked_req is not None
+                or getattr(self, "anchor_tails", None)
+                else 0
+            )
             # The #1225 point: this request was ADMITTED and nothing is left
             # chunked, i.e. its LAST prefill chunk just went in.
             _1223_last_chunk = ret is not None and chunked == 0
@@ -13069,7 +13092,7 @@ class Scheduler(
         if (
             (running_batch.batch_is_full and _count_veto)
             or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        ) and self.chunked_req is None and not getattr(self, "anchor_tails", None):
             # weg2xsn273: the seat gate declined with NOTHING running and a
             # request waiting -- on group P the parked, prefilled backlog holds
             # the request slots until the flip, so this never resolves by
@@ -13094,7 +13117,7 @@ class Scheduler(
         if (
             self.min_free_slots_delayer is not None
             and _count_veto
-            and self.chunked_req is None
+            and self.chunked_req is None and not getattr(self, "anchor_tails", None)
             and self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
                 num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
@@ -13114,7 +13137,7 @@ class Scheduler(
         if (
             _count_veto
             and self.get_num_allocatable_reqs(running_bs) <= 0
-            and self.chunked_req is None
+            and self.chunked_req is None and not getattr(self, "anchor_tails", None)
             and not self.enable_priority_preemption
         ):
             # #1153 follow-up: THE FOURTH SITE OF THE SAME COUNT ARITHMETIC,
@@ -13145,7 +13168,7 @@ class Scheduler(
         if (
             _count_veto
             and self.get_num_allocatable_reqs(running_bs) <= 0
-            and self.chunked_req is None
+            and self.chunked_req is None and not getattr(self, "anchor_tails", None)
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
@@ -13415,6 +13438,34 @@ class Scheduler(
         except Exception:  # noqa: BLE001 - a probe may never break admission
             self._996_budget = "err"
             self._996_bind = "err"
+
+        if adder.multi_anchor_tails and not self.spec_algorithm.is_none():
+            # fnFL2 H42: the EAGLE prefill rotation knows ONE non-final chunk
+            # (`batch.chunked_req`, eagle_utils._eagle_prefill_tail_tokens), so
+            # with a draft on this group the stock single continuation stays.
+            adder.multi_anchor_tails = False
+            if not getattr(self, "_h42_spec_disarm_logged", False):
+                self._h42_spec_disarm_logged = True
+                logger.warning(
+                    "WEG2 ANCHOR-TAILS DISARMED spec=%s: a draft runs on this group, "
+                    "so END-ANCHOR bodies stay the single chunked continuation "
+                    "(SGLANG_WEG2_ENABLE_P_MULTI_ANCHOR_TAILS needs the H25 form, "
+                    "no draft on P)",
+                    self.spec_algorithm,
+                )
+        # fnFL2 H42: the carried END-ANCHOR tails first -- each final, 1-grain,
+        # re-added through `add_chunked_req` (same budget charge, same
+        # forwarded-schedule execution as the chunked request below); ahead of
+        # the chunked request so a long continuation cannot starve a tail into
+        # the #679 park. Empty (unarmed): nothing runs here.
+        _tail_readd = None
+        if getattr(self, "anchor_tails", None):
+            _tail_readd = _anchor_tails.readd_anchor_tails(
+                self.anchor_tails,
+                adder,
+                incoming=getattr(self, "_pp_admission_incoming_effective", None),
+            )
+            self.anchor_tails = _tail_readd.kept
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
@@ -14051,7 +14102,7 @@ class Scheduler(
                                 pool_free_tokens=int(self.token_to_kv_pool_allocator.available_size()),
                                 running_empty=running_batch.is_empty(),
                                 waiting=len(self.waiting_queue),
-                            ) and self.chunked_req is None:
+                            ) and self.chunked_req is None and not getattr(self, "anchor_tails", None):
                                 self._weg2_intake_stall_observe(
                                     req, None,
                                     note=f"gate=prefetch_pending pool_free="
@@ -14587,7 +14638,7 @@ class Scheduler(
                     if (
                         running_batch.is_empty()
                         and not adder.can_run_list
-                        and self.chunked_req is None
+                        and self.chunked_req is None and not getattr(self, "anchor_tails", None)
                     ):
                         self._weg2_intake_stall_observe(req, adder)
                 # revert matched mamba idx to avoid memory leak, if req is not added.
@@ -14987,6 +15038,24 @@ class Scheduler(
         if self.chunked_req is not None:
             self.chunked_req.inflight_middle_chunks += 1
 
+        # fnFL2 H42: this pass's anchor bodies join the carried tails; every
+        # tail IN this batch takes its middle-chunk increment (no output until
+        # its final tail runs). Unarmed: no tail was minted or carried.
+        _tails_in_batch = ()
+        if adder.new_anchor_tails or _tail_readd is not None:
+            self.anchor_tails = _anchor_tails.adopt_anchor_tails(
+                self.anchor_tails, adder.new_anchor_tails, can_run_list
+            )
+            _tails_in_batch = _anchor_tails.bodies_in_batch(
+                self.anchor_tails, can_run_list
+            )
+            _anchor_tails.log_pass(
+                minted=adder.new_anchor_tails,
+                readd=_tail_readd,
+                tails=self.anchor_tails,
+                pp_rank=getattr(self.ps, "pp_rank", 0),
+            )
+
         _wk_t2 = time.perf_counter()  # admission done
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -15003,8 +15072,11 @@ class Scheduler(
         )
 
         new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+            _anchor_tails.contains_last_prefill_chunk(
+                can_run_list, self.chunked_req, _tails_in_batch
+            )
         )
+        new_batch.weg2_anchor_tail_bodies = _tails_in_batch
         # #861k: CARRY THE TRANSPORT CLAIM TO THE BATCH, so the conformance
         # detector can judge the MEASURED bytes against it at emit time. The
         # seam stamp itself is one-shot and was spent above; this flag is the
@@ -16739,7 +16811,7 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
-            and self.chunked_req is None
+            and self.chunked_req is None and not getattr(self, "anchor_tails", None)
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
@@ -17035,7 +17107,7 @@ class Scheduler(
             self.enable_hierarchical_cache
             and os.environ.get("SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP", "1") != "0"
             and self.running_batch.is_empty()
-            and self.chunked_req is None
+            and self.chunked_req is None and not getattr(self, "anchor_tails", None)
         ):
             _sweep = getattr(self.tree_cache, "publish_unbacked_sweep", None)
             _wc = getattr(self.tree_cache, "writing_check", None)
@@ -17255,6 +17327,7 @@ class Scheduler(
 
         _check("running_batch", self.running_batch.is_empty())
         _check("chunked_req", self.chunked_req is None)
+        _check("anchor_tails", not getattr(self, "anchor_tails", None))
         _check("dllm_staging", not self.dllm_manager.any_staging_reqs())
         _check(
             "last_batch",
@@ -18525,6 +18598,20 @@ class Scheduler(
                 if self._pending_chunked_abort_delay:
                     logger.info("WEG2-PP-CHUNKED-ABORT recorded rid=%s pp_rank=%s: applied in %d pass(es) so the stages stop at the same chunk (xsn324)",
                                 chunked_req.rid, getattr(self.ps, "pp_rank", 0), self._pending_chunked_abort_delay)
+        # fnFL2 H42: an END-ANCHOR tail is finished with abort after its final
+        # 1-grain forward (the running-request route), on every rank alike.
+        for _tail in _anchor_tails.abort_targets(
+            getattr(self, "anchor_tails", None) or (),
+            rid=recv_req.rid,
+            abort_all=recv_req.abort_all,
+        ):
+            if not _tail.finished():
+                _tail.to_finish = FINISH_ABORT()
+                logger.info(
+                    "WEG2 ANCHOR-TAIL ABORT rid=%s: finished with abort after its "
+                    "final tail forward (the tail is on every stage's schedule)",
+                    _tail.rid,
+                )
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue
@@ -18714,6 +18801,7 @@ class Scheduler(
 
             self.running_batch.batch_is_full = False
             self.chunked_req = None
+            self.anchor_tails = []  # fnFL2 H42: the same retract, per tail
 
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,

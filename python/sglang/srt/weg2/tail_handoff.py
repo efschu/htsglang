@@ -65,6 +65,28 @@ logger = logging.getLogger(__name__)
 #: rids whose part files P keeps (older ones are removed at the next publish);
 #: one 97k prompt is ~78 MiB of GDN state across the P ranks (host RAM law).
 KEEP_RIDS = 2
+#: fnFL2 H42: with several END-ANCHOR tails per pass
+#: (SGLANG_WEG2_ENABLE_P_MULTI_ANCHOR_TAILS) one P phase leaves one capture and
+#: one part-file set PER OPEN REQUEST -- bounded by P's --max-running-requests
+#: (the request slots P holds until the flip). Fallback when the server args are
+#: unreadable (a desk test): the p_bs-4 form. ~26 MiB of GDN state per rid and
+#: rank either way (host RAM law: grows with p_bs, not with the prompt).
+KEEP_CAPTURES_MULTI_TAIL = 4
+
+
+def capture_keep() -> int:
+    """How many rids' captures and part files P keeps (fnFL2 H42)."""
+    if not envs.SGLANG_WEG2_ENABLE_P_MULTI_ANCHOR_TAILS.get():
+        return KEEP_RIDS
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        mrr = int(get_server_args().max_running_requests or 0)
+    except Exception:  # noqa: BLE001 -- no server args (desk): the p_bs-4 form
+        mrr = KEEP_CAPTURES_MULTI_TAIL
+    if mrr <= 0:  # unset: the p_bs-4 form
+        mrr = KEEP_CAPTURES_MULTI_TAIL
+    return max(KEEP_RIDS, mrr)
 
 
 def enabled() -> bool:
@@ -348,7 +370,7 @@ def remove(rid: str) -> None:
 
 
 def _prune(keep_rid: str) -> None:
-    """Keep the part files of the KEEP_RIDS newest rids (by mtime)."""
+    """Keep the part files of the ``capture_keep()`` newest rids (by mtime)."""
     d = _dir()
     if not d:
         return
@@ -360,7 +382,7 @@ def _prune(keep_rid: str) -> None:
         except OSError:
             pass
     newest.pop(keep_rid, None)
-    for rid in sorted(newest, key=newest.get, reverse=True)[KEEP_RIDS - 1:]:
+    for rid in sorted(newest, key=newest.get, reverse=True)[capture_keep() - 1:]:
         remove(rid)
 
 
@@ -421,7 +443,7 @@ def _capture_state(req, req_to_token_pool, allocator, page_size: int, stream) ->
         gdn = _gdn_slot_to_host(req_to_token_pool, req.mamba_pool_idx)
         event = _record(stream)
     _CAPTURES[str(req.rid)] = _Capture(spec=spec, gdn=gdn, event=event, stream=stream)
-    while len(_CAPTURES) > KEEP_RIDS:  # an aborted prompt never publishes: drop the oldest
+    while len(_CAPTURES) > capture_keep():  # an aborted prompt never publishes: drop the oldest
         _CAPTURES.pop(next(iter(_CAPTURES)))
     return True
 

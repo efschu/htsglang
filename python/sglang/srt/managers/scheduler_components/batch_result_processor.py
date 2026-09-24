@@ -220,6 +220,10 @@ class SchedulerBatchResultProcessor:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
+        # fnFL2 H42: with END-ANCHOR tails armed several middle chunks share
+        # one batch; every one of them is kept off the stream, not only the
+        # last (stock: "at most one request being currently chunked").
+        skip_stream_reqs = []
 
         # #1003: A VOIDED SLOT HAS NO RESULT, AND MUST NOT BE PROCESSED AS IF
         # IT HAD ONE. Boot 54 died here -- `result.copy_done` on `result=None`
@@ -426,6 +430,7 @@ class SchedulerBatchResultProcessor:
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
                     skip_stream_req = req
+                    skip_stream_reqs.append(req)
 
                     # Incrementally update input logprobs.
                     if batch.return_logprob and not wl_worker:
@@ -481,9 +486,17 @@ class SchedulerBatchResultProcessor:
                     self.record_prefill_progress()
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self.output_streamer.stream_output(
-            batch.reqs, batch.return_logprob, skip_stream_req
-        )
+        if len(skip_stream_reqs) > 1:
+            _skip_ids = {id(r) for r in skip_stream_reqs}
+            self.output_streamer.stream_output(
+                [r for r in batch.reqs if id(r) not in _skip_ids],
+                batch.return_logprob,
+                None,
+            )
+        else:
+            self.output_streamer.stream_output(
+                batch.reqs, batch.return_logprob, skip_stream_req
+            )
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(

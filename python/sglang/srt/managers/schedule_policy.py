@@ -237,6 +237,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.weg2 import tail_adopt
+from sglang.srt.managers import anchor_tails as _anchor_tails
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -974,6 +975,14 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+        #: fnFL2 H42: this pass's END-ANCHOR bodies, each the ANCHOR TAIL of
+        #: its own request (managers/anchor_tails.py). Only ever filled while
+        #: `multi_anchor_tails` is armed; empty, the stock single-continuation
+        #: path below is untouched.
+        self.new_anchor_tails: List[Req] = []
+        self.multi_anchor_tails = _anchor_tails.multi_anchor_tails_armed(
+            _WEG2_END_ANCHOR
+        )
         #: #959 IS A CONTINUATION ALREADY RESIDENT THIS PASS?
         #:
         #: `scheduler.chunked_req` is the authority and it is not this object's
@@ -1621,6 +1630,35 @@ class PrefillAdder:
         )
         self.new_chunked_req = req
 
+    def _is_anchor_body(self, req: Req, start: int, end: int) -> bool:
+        """fnFL2 H42: does the extent [start, end) end at `req`'s END-ANCHOR
+        cut, leaving only the final tail? False whenever multi-tail mode is
+        off, or chunked prefill is off (no continuation machinery at all)."""
+        if not self.multi_anchor_tails or self.rem_chunk_tokens is None:
+            return False
+        return _anchor_tails.is_anchor_body(
+            fill_len=len(req.full_untruncated_fill_ids),
+            start=start,
+            end=end,
+            grain=_weg2_end_anchor_grain(self.token_to_kv_pool_allocator, self.page_size),
+        )
+
+    def _mint_anchor_tail(self, req: Req, site: str) -> None:
+        """fnFL2 H42: announce `req`'s END-ANCHOR body as an ANCHOR TAIL.
+
+        The twin of `_mint_chunked` for the one continuation whose remainder
+        is final by construction ([cut, N), at most one grain). It never
+        touches `new_chunked_req`, so the #996 single-field assert keeps its
+        meaning; its own invariant is one tail per request per pass.
+        """
+        assert req is not self.new_chunked_req and not any(
+            t is req for t in self.new_anchor_tails
+        ), (
+            f"H42 ANCHOR TAIL MINTED TWICE at {site}: rid={getattr(req, 'rid', '?')} "
+            f"is already this pass's chunked request or anchor tail."
+        )
+        self.new_anchor_tails.append(req)
+
     def _told_last_chunk(self, req: Req) -> Optional[bool]:
         """#996: the deciding rank's last-chunk verdict for `req`, or None.
 
@@ -1861,7 +1899,14 @@ class PrefillAdder:
             # therefore runs, as decided, and nothing is re-prefilled: no
             # double prefill, no dropped named request, and the assert stays
             # intact because the single field keeps its one occupant.
-            if self.chunked_req_outstanding:
+            #
+            # fnFL2 H42: an END-ANCHOR body is minted as an ANCHOR TAIL, by
+            # the same geometry rule PP0 applied (the carried verdict said
+            # "not last" and the extent ends at the anchor cut of the carried
+            # fill), so this rank carries the rid exactly as PP0 does.
+            if self._is_anchor_body(req, prefix_len, prefix_len + extend_len):
+                self._mint_anchor_tail(req, "_add_scheduled_req")
+            elif self.chunked_req_outstanding:
                 note_second_continuation_refused(req, "_add_scheduled_req")
             else:
                 self._mint_chunked(req, "_add_scheduled_req")
@@ -2708,7 +2753,16 @@ class PrefillAdder:
                 # (`chunked_req_outstanding`) AND a mint earlier in this pass
                 # (`new_chunked_req`, the #996 assert) both refuse the split; the
                 # request waits a pass rather than tripping the ratchet.
-                if _ea_forced and (self.chunked_req_outstanding or self.new_chunked_req is not None):
+                # fnFL2 H42: in multi-tail mode the body becomes an ANCHOR
+                # TAIL of its own and never occupies the single field, so the
+                # refusal does not apply -- several prompts reach their end in
+                # one forward, bounded by the chunk budget.
+                _ea_tail = _ea_forced and self.multi_anchor_tails
+                if (
+                    _ea_forced
+                    and not _ea_tail
+                    and (self.chunked_req_outstanding or self.new_chunked_req is not None)
+                ):
                     note_second_continuation_refused(req, "add_one_req/end-anchor")
                     return AddReqResult.OTHER
                 if _tail is not None:
@@ -2723,7 +2777,9 @@ class PrefillAdder:
                     (_ea_start + _ea_len) if _ea_forced else len(req.full_untruncated_fill_ids),
                 )
                 self.can_run_list.append(req)
-                if _ea_forced:
+                if _ea_tail:
+                    self._mint_anchor_tail(req, "add_one_req/end-anchor")
+                elif _ea_forced:
                     self._mint_chunked(req, "add_one_req/end-anchor")
 
                 self._req_inc_lock_ref(req)
@@ -2769,7 +2825,16 @@ class PrefillAdder:
                 # Both fresh-request mint sites need it; the forwarded-schedule
                 # site already has its own (`carried_chunk`). Missing it here
                 # would leave the same assert reachable by the longer path.
-                if self.chunked_req_outstanding:
+                # fnFL2 H42: a truncation that happens to stop exactly at the
+                # END-ANCHOR cut leaves only the final tail -- the same body a
+                # follower classifies by geometry, so it is minted the same way
+                # here and never needs the single field.
+                _trunc_tail = self._is_anchor_body(
+                    req,
+                    len(req.prefix_indices),
+                    len(req.prefix_indices) + trunc_len,
+                )
+                if self.chunked_req_outstanding and not _trunc_tail:
                     # #967: same guard, second mint site, same instrument.
                     note_second_continuation_refused(req, "add_one_req")
                     return AddReqResult.OTHER
@@ -2780,7 +2845,10 @@ class PrefillAdder:
                 )
 
                 self.can_run_list.append(req)
-                self._mint_chunked(req, "add_one_req")
+                if _trunc_tail:
+                    self._mint_anchor_tail(req, "add_one_req/trunc-at-anchor")
+                else:
+                    self._mint_chunked(req, "add_one_req")
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(

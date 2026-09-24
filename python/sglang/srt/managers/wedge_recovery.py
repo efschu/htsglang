@@ -393,6 +393,8 @@ def _weg2_intake_stall_from_wedge(scheduler: Any, reason: str) -> None:
             return
         if getattr(scheduler, "chunked_req", None) is not None:
             return
+        if getattr(scheduler, "anchor_tails", None):  # fnFL2 H42: prefill in flight
+            return
         observe(queue[0], None,
                 note=f"gate=admission-wedge waiting={len(queue)} reason={str(reason)[:120]}",
                 immediate=True)

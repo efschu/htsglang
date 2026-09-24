@@ -3138,6 +3138,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     chunked_req: Optional[Req] = None
     chunked_req_next_prompt_token: Optional[int] = None
     contains_last_prefill_chunk: bool = True
+    # fnFL2 H42: the members of this batch that continue as END-ANCHOR tails
+    # (Scheduler.anchor_tails); excluded from the running-batch merge when the
+    # batch returns as last_batch, like `chunked_req`. Empty unless armed.
+    weg2_anchor_tail_bodies: Tuple = ()
 
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None

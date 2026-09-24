@@ -882,7 +882,9 @@ def _release_voided_request(scheduler, req, remaining_req_count: int = 0) -> Non
             logger.warning("#969 voided-request retract failed: %s", exc)
 
 
-def _park_chunked_prefill_chunk(scheduler, req, *, pass_allocated: bool = True) -> bool:
+def _park_chunked_prefill_chunk(
+    scheduler, req, *, pass_allocated: bool = True, inflight_taken: Optional[bool] = None
+) -> bool:
     """#797b: un-do ONE prepared-but-never-run chunk. True iff it parked one.
 
     #971 `pass_allocated`: DID THIS PASS GET FAR ENOUGH TO OWE THE GIVE-BACKS?
@@ -1017,8 +1019,12 @@ def _park_chunked_prefill_chunk(scheduler, req, *, pass_allocated: bool = True) 
         req.extend_range = Range(int(start), int(start))
     except Exception as exc:  # noqa: BLE001 - cleanup must not raise
         logger.warning("#797b parked-chunk extend_range reset failed: %s", exc)
+    # fnFL2 H42: `inflight_taken=False` -- a FINAL re-add (an END-ANCHOR tail)
+    # took no increment this pass; the counter it would decrement belongs to
+    # the body chunk whose result is still owed. None = the stock rule.
+    give_back = prepared if inflight_taken is None else (prepared and bool(inflight_taken))
     try:
-        if prepared and int(getattr(req, "inflight_middle_chunks", 0) or 0) > 0:
+        if give_back and int(getattr(req, "inflight_middle_chunks", 0) or 0) > 0:
             req.inflight_middle_chunks -= 1
     except Exception as exc:  # noqa: BLE001 - cleanup must not raise
         logger.warning("#797b parked-chunk inflight accounting failed: %s", exc)
@@ -2802,6 +2808,10 @@ def pp_request_locations(holder) -> Dict[str, object]:
     rid = getattr(chunked, "rid", None)
     if rid is not None:
         out.setdefault(rid, chunked)
+    for tail in getattr(holder, "anchor_tails", None) or ():  # fnFL2 H42
+        rid = getattr(tail, "rid", None)
+        if rid is not None:
+            out.setdefault(rid, tail)
     by_slot = getattr(holder, "_pp_chunked_req_before_by_slot", None) or ()
     # #971: THE SLOT PLACE WAS SILENTLY EMPTY FOR EVERY CONSUMER. Production
     # builds this ring as a LIST -- `[None] * pp_loop_size` in
@@ -3224,6 +3234,54 @@ def pp_chunked_req_for_slot(holder, mb_id) -> Optional[object]:
     if slot < 0 or slot >= len(ring):
         return None
     return ring[slot]
+
+
+def pp_anchor_tails_for_slot(holder, mb_id) -> Tuple[object, ...]:
+    """fnFL2 H42: the slot's END-ANCHOR tails before its admission, or ()."""
+    ring = getattr(holder, "_pp_anchor_tails_before_by_slot", None)
+    if not ring:
+        return ()
+    try:
+        slot = int(mb_id)
+    except (TypeError, ValueError):
+        return ()
+    if slot < 0 or slot >= len(ring):
+        return ()
+    return tuple(ring[slot] or ())
+
+
+def pp_restore_anchor_tails_after_void(scheduler, mb_id) -> Tuple[object, ...]:
+    """fnFL2 H42, #797d for tails: the voided pass's tail admission undone.
+
+    The scheduler's tail list goes back to what it was before this slot's
+    admission. Every pre-admission tail the pass re-added gets its chunk
+    PARKED (rows of the never-run chunk freed, extent back to the parked
+    shape; the inflight increment given back only if this pass took one -- a
+    final re-add took none, and the counter belongs to the body's result that
+    is still owed). A tail MINTED by the voided pass is an ordinary member of
+    the voided batch; the member loop parks it into the waiting queue with its
+    give-backs (#984). Returns the pre-admission tails (the members the loop
+    keeps). No-op (returns ()) when neither list holds a tail.
+    """
+    from sglang.srt.managers.anchor_tails import restore_after_void
+
+    before = pp_anchor_tails_for_slot(scheduler, mb_id)
+    current = tuple(getattr(scheduler, "anchor_tails", None) or ())
+    if not before and not current:
+        return ()
+    restore = restore_after_void(before=before, current=current)
+    for tail, taken in restore.parks:
+        _park_chunked_prefill_chunk(scheduler, tail, inflight_taken=taken)
+    scheduler.anchor_tails = list(restore.tails)
+    if restore.dropped or restore.parks:
+        logger.info(
+            "WEG2 ANCHOR-TAILS VOID slot=%s restored=%d dropped_mints=%d rids=%s",
+            mb_id,
+            len(restore.tails),
+            len(restore.dropped),
+            pp_rid_digest([getattr(t, "rid", None) for t in restore.dropped]),
+        )
+    return tuple(before)
 
 
 def pp_rehome_refused_chunked_req(scheduler, mb_id) -> bool:
@@ -3935,7 +3993,7 @@ def pp_log_void_park_census(
     )
 
 
-def pp_void_keeps_request(req, resident_rids, chunked_before) -> bool:
+def pp_void_keeps_request(req, resident_rids, chunked_before, tails_before=()) -> bool:
     """#797/#797b: is this batch member SCHEDULER-owned rather than round-owned?
 
     A voided pass hands its batch's requests back -- KV, mamba slot, req-pool
@@ -3968,6 +4026,10 @@ def pp_void_keeps_request(req, resident_rids, chunked_before) -> bool:
     if req is None:
         return False
     if chunked_before is not None and req is chunked_before:
+        return True
+    # fnFL2 H42: a carried END-ANCHOR tail re-added by the voided pass stays a
+    # tail (parked, like the chunked request), never re-queued.
+    if any(req is t for t in (tails_before or ())):
         return True
     return getattr(req, "rid", None) in (resident_rids or ())
 
@@ -8511,6 +8573,13 @@ class SchedulerPPMixin:
             carried = list(carried or []) + [None] * (size - len(carried or []))
             self._pp_chunked_req_before_by_slot = carried
         carried[int(mb_id)] = getattr(self, "chunked_req", None)
+        # fnFL2 H42: the slot's END-ANCHOR tails as they stand NOW, for the
+        # same void: a voided pass restores this list (pp_anchor_tails_for_slot).
+        tails = getattr(self, "_pp_anchor_tails_before_by_slot", None)
+        if tails is None or len(tails) < size:
+            tails = list(tails or []) + [()] * (size - len(tails or []))
+            self._pp_anchor_tails_before_by_slot = tails
+        tails[int(mb_id)] = tuple(getattr(self, "anchor_tails", None) or ())
 
     def _pp_note_launched_chain(self: Scheduler, mb_id: int, chain) -> None:
         """#978: record this generation's launched chain for slot ``mb_id``.
@@ -9460,6 +9529,8 @@ class SchedulerPPMixin:
             )
             self.chunked_req = None
 
+        tails_before = pp_restore_anchor_tails_after_void(self, mb_id)
+
         running_mbs = getattr(self, "running_mbs", None) or ()
         running = running_mbs[mb_id] if 0 <= mb_id < len(running_mbs) else None
         resident = {r.rid for r in (getattr(running, "reqs", None) or ())}
@@ -9467,7 +9538,7 @@ class SchedulerPPMixin:
         released = 0
         released_rids, kept_rids, parked_rids, reachable_rids = [], [], [], []
         for req in reqs:
-            if pp_void_keeps_request(req, resident, chunked_before):
+            if pp_void_keeps_request(req, resident, chunked_before, tails_before):
                 kept_rids.append(getattr(req, "rid", None))
                 continue
             # #984: A VOID IS A PARK FOR RANK 0's MEMBERS TOO. This loop used

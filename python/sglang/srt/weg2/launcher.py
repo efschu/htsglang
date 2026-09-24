@@ -3676,10 +3676,19 @@ def p_micro_batch_line(argv_of_p: Sequence[str]) -> str:
         return (f"P-MICRO-BATCH mode=stock width={stock} (= --max-running-requests "
                 f"{mrr} // pp {pp}): one P forward admits at most {stock} request(s); "
                 f"SGLANG_WEG2_ENABLE_P_UNDIVIDED_MICRO_BATCH=1 lifts it to {max(mrr, 1)}{doubled}")
+    if envs.SGLANG_WEG2_ENABLE_P_MULTI_ANCHOR_TAILS.get():
+        # fnFL2 H42: every whole-fit prompt's END-ANCHOR body becomes a tail
+        # of its own (managers/anchor_tails.py); the tails end together.
+        tails = ("SGLANG_WEG2_ENABLE_P_MULTI_ANCHOR_TAILS=1: every END-ANCHOR body is an "
+                 "anchor tail of its own request, so up to that many requests REACH THEIR END "
+                 "per forward (their tails [N-1', N) ride together in the next pass)")
+    else:
+        tails = ("END-ANCHOR still mints ONE continuation per pass (#959/#996), so at "
+                 "most one request REACHES ITS END per forward "
+                 "(SGLANG_WEG2_ENABLE_P_MULTI_ANCHOR_TAILS=1 lifts it)")
     return (f"P-MICRO-BATCH mode=undivided width={mb} (--max-running-requests {mrr}, "
             f"stock would be {stock}): one P forward admits up to {mb} request(s) within the "
-            f"chunk budget; END-ANCHOR still mints ONE continuation per pass (#959/#996), so at "
-            f"most one request REACHES ITS END per forward{doubled}")
+            f"chunk budget; {tails}{doubled}")
 
 
 def w38_armed_line(argv_of_p: Sequence[str]) -> str:
