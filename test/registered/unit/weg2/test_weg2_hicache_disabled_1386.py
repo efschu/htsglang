@@ -494,7 +494,10 @@ class TheDraftKvProducerFallsWithIt(_HermeticMainBase):
 
     def test_explicit_draft_kv_on_p_off_is_fine_no_refusal(self):
         # Explicit `off` agrees with the auto-fallback -- no conflict, no
-        # refusal, same as the default case.
+        # refusal, same as the default case.  H25: the env names the same
+        # fact (W127 refuses an explicit env that contradicts an explicit
+        # flag), so this case states it the same way on both inputs.
+        os.environ["SGLANG_WEG2_DRAFT_ON_P"] = "0"
         rc, out, exc = self.run_main(_main_argv(
             "t1386c", "--weg2-disable-hicache", "--draft-kv-on-p", "off",
         ))

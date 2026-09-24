@@ -263,6 +263,16 @@ class Envs:
     # a debugging escape hatch, not a supported configuration.
     SGLANG_ALLOW_UNLOADED_DRAFT_PARAMS = EnvBool(False)
 
+    # H25 (Nutzer-Order 24.09. 08:25Z, "Draft auf P streichen"): does the
+    # Weg-2 prefill group P carry the MTP draft head? False = P boots with no
+    # draft (no weights_draft tag, no draft-KV producer; P's draft KV has had
+    # no reader since fnFL2x63), the freed VRAM on P's draft card goes to that
+    # stage's expert residency (launcher PP-CUT draft post), and D's own draft
+    # is parked in pinned system RAM while P runs (weg2/draft_park.py). The
+    # weg2 launcher resolves it once, together with --draft-kv-on-p, and
+    # publishes the resolved value to the front and both groups' ranks.
+    SGLANG_WEG2_DRAFT_ON_P = EnvBool(False)
+
     # #695: allocate the permanent phase-flip host weight images at their exact
     # size (MAP_ANONYMOUS + cudaHostRegister) instead of through torch's pinned
     # caching allocator, which rounds every request up to a power of two and

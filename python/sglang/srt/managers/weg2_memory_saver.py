@@ -3034,12 +3034,22 @@ def draft_tag_in_family() -> bool:
     travels the host ring.  Admitting the tag to the family there would add a
     family member with no bytes to the wave list and the pause order, on a path
     nobody asked to change.
+
+    H25 (Nutzer-Order 24.09.): AND GROUP P MUST CARRY A DRAFT.  The membership
+    is a Platztausch: D's draft bytes leave D's card because P's last stage
+    holds the partner bytes.  Under ``SGLANG_WEG2_DRAFT_ON_P=0`` (the default
+    since H25) P boots with no draft, the leg has no partner -- so the tag
+    leaves the family on EVERY process (the launcher publishes the one
+    resolved value before the front or any rank reads it), and D parks its
+    draft bytes in pinned system RAM instead (``weg2/draft_park.py``).
     """
     try:
         from sglang.srt.weg2.weight_exchange import exchange_armed
     except Exception:  # noqa: BLE001 -- the saver must import without the lane
         return False
-    return bool(exchange_armed())
+    from sglang.srt.environ import envs
+
+    return bool(exchange_armed()) and bool(envs.SGLANG_WEG2_DRAFT_ON_P.get())
 
 
 def is_weights_family_tag(tag: Any) -> bool:

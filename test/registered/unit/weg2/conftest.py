@@ -89,3 +89,30 @@ def _weg2_shm_ratchet():
         + " -- clean it in the fixture that creates the region, not in a boot "
           "seat's pre-flight"
     )
+
+
+#: H25 (Nutzer-Order 24.09. 08:25Z): ``SGLANG_WEG2_DRAFT_ON_P`` defaults to
+#: False since the order -- group P carries no draft and ``weights_draft``
+#: leaves the weights family.  The tests of this suite written BEFORE H25 pin
+#: the form they were written against (draft on P, the tag in the family),
+#: which stays a supported arm under ``SGLANG_WEG2_DRAFT_ON_P=1``.  A module
+#: that tests the H25 form itself sets ``H25_OWN_DRAFT_FORM = True`` and pins
+#: its own value per case.  Saved and restored around every case, because
+#: ``launcher.main`` PUBLISHES the resolved value into ``os.environ``.
+_DRAFT_ON_P_ENV = "SGLANG_WEG2_DRAFT_ON_P"
+
+
+@pytest.fixture(autouse=True)
+def _weg2_draft_on_p_form(request):
+    backup = os.environ.get(_DRAFT_ON_P_ENV)
+    if request.module.__dict__.get("H25_OWN_DRAFT_FORM", False):
+        os.environ.pop(_DRAFT_ON_P_ENV, None)
+    else:
+        os.environ[_DRAFT_ON_P_ENV] = "1"
+    try:
+        yield
+    finally:
+        if backup is None:
+            os.environ.pop(_DRAFT_ON_P_ENV, None)
+        else:
+            os.environ[_DRAFT_ON_P_ENV] = backup

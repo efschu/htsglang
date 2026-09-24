@@ -819,6 +819,89 @@ def spec_plan_fields() -> Dict[str, object]:
     }
 
 
+#: H25 (Nutzer-Order 24.09. 08:25Z, "Draft auf P streichen"): the operator's
+#: input for "does group P carry the MTP head". The launcher flag
+#: ``--draft-kv-on-p`` and this variable are TWO SPELLINGS OF ONE FACT (the
+#: draft-KV producer IS the draft on P); :func:`resolve_draft_on_p` reconciles
+#: them once, the launcher writes the resolved value back into
+#: ``ns.draft_kv_on_p`` and into its own environment (front and both groups
+#: inherit it through ``build_env``), and
+#: ``weg2_memory_saver.draft_tag_in_family`` reads it on every rank.
+DRAFT_ON_P_ENV = "SGLANG_WEG2_DRAFT_ON_P"
+DRAFT_ON_P_CONFLICT = "W127 Weg2DraftOnPConflict"
+
+
+def resolve_draft_on_p(flag_value: str, flag_explicit: bool,
+                       env_set: bool, env_value: bool) -> Tuple[bool, str]:
+    """``(draft_on_p, provenance)`` for group P, from flag and env.
+
+    The ENV is the authority since H25 (its default is False, the user
+    order); an explicit flag that contradicts an EXPLICIT env is refused by
+    name (W127) -- an A/B arm whose two inputs say opposite things is the boot
+    that gets attributed to the wrong form.  An explicit ``--draft-kv-on-p
+    on`` against the UNSET env (every arm since #1264 passes the flag) does
+    not refuse: it is overruled by the order and the line says so, because the
+    producer it asks for has had no reader since fnFL2x63 (H1: PUBLISH-SWEEP
+    draft_issued=0, D runs DRAFT-COLD every flip).
+    """
+    flag_on = str(flag_value) == "on"
+    if env_set:
+        if flag_explicit and flag_on != bool(env_value):
+            raise Weg2LaunchRefused(
+                f"{DRAFT_ON_P_CONFLICT}: --draft-kv-on-p {flag_value} contradicts "
+                f"{DRAFT_ON_P_ENV}={'1' if env_value else '0'}. Both name whether "
+                "group P carries the MTP draft head; drop one of them."
+            )
+        return bool(env_value), f"env {DRAFT_ON_P_ENV}={'1' if env_value else '0'}"
+    if flag_explicit and flag_on:
+        return False, (f"default {DRAFT_ON_P_ENV}=0 (Nutzer-Order 24.09.) OVERRULES "
+                       f"--draft-kv-on-p {flag_value}: the producer has no reader "
+                       "since fnFL2x63; set the env to 1 to keep the draft on P")
+    return False, f"default {DRAFT_ON_P_ENV}=0 (Nutzer-Order 24.09.)"
+
+
+def strip_speculative_flags(tokens: Sequence[str]) -> Tuple[List[str], List[str]]:
+    """``(kept, stripped)``: every ``--speculative-*`` token of an extra argv,
+    with its value when it takes one.
+
+    H25: no draft on P means ZERO ``--speculative-*`` tokens on group P
+    (#1264 property 1), and ``ring_table.p_carries_drafter`` reads ANY such
+    token as "P carries a drafter".  The Next-Flash arm passes
+    ``--speculative-draft-model-path`` through ``--extra-p``; without this P
+    would still load the MTP head (and a draft path with no algorithm).  A
+    value is a following token that is not itself a flag; ``--flag=value`` is
+    one token.
+    """
+    kept: List[str] = []
+    stripped: List[str] = []
+    toks = [str(t) for t in tokens]
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t.startswith("--speculative-"):
+            stripped.append(t)
+            if "=" not in t and i + 1 < len(toks) and not toks[i + 1].startswith("--"):
+                stripped.append(toks[i + 1])
+                i += 1
+        else:
+            kept.append(t)
+        i += 1
+    return kept, stripped
+
+
+def draft_on_p_line(draft_on_p: bool, provenance: str, stripped: Sequence[str]) -> str:
+    """The one line naming which H25 form ran and where D's draft lives."""
+    if draft_on_p:
+        return (f"WEG2 DRAFT-ON-P: on ({provenance}) -- group P carries the MTP head as "
+                "draft-KV producer and as the exchange partner of D's draft")
+    return (
+        f"WEG2 DRAFT-ON-P: off ({provenance}) -- group P boots with NO draft "
+        f"(stripped from --extra-p: {list(stripped) or 'nothing'}); weights_draft leaves "
+        "the family, D parks its draft in pinned system RAM while P runs "
+        "(WEG2-DRAFT-PARK/UNPARK) and starts every flipped request DRAFT-COLD"
+    )
+
+
 def draft_kv_off_line() -> str:
     """The one line the launcher prints when the producer is switched OFF.
 
@@ -3416,7 +3499,10 @@ def argv_p(
         []
         if any(str(a).startswith("--max-mamba-cache-size") for a in extra)
         else ["--max-mamba-cache-size", str(P_MAX_MAMBA_CACHE_SIZE)]
-    ) + extra
+        # H25: no draft on P means ZERO --speculative-* tokens on P, including
+        # the ones an arm passes through --extra-p for both forms (the
+        # Next-Flash arm's --speculative-draft-model-path).
+    ) + (list(extra) if draft_kv_on_p else strip_speculative_flags(extra)[0])
 
 
 def w38_armed_line(argv_of_p: Sequence[str]) -> str:
@@ -13084,6 +13170,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # enforces, the mode the front schedules and the mode the launcher prices
     # cannot be three readings.
     os.environ[weight_exchange.WEIGHT_SOURCE_ENV] = str(ns.weg2_weight_source)
+    # H25 (Nutzer-Order 24.09.): "does group P carry the draft" -- resolved
+    # ONCE from --draft-kv-on-p and SGLANG_WEG2_DRAFT_ON_P, written back into
+    # `ns` (every later `ns.draft_kv_on_p` reader agrees: the KV price, the
+    # PP-CUT draft post, argv_p) and published into this process's
+    # environment for the same reason as the arm above: the weights family
+    # (`draft_tag_in_family`) is read here, by the front and by every rank.
+    draft_on_p, draft_on_p_prov = resolve_draft_on_p(
+        ns.draft_kv_on_p,
+        bs_source("--draft-kv-on-p", argv) == "flag",
+        envs.SGLANG_WEG2_DRAFT_ON_P.is_set(),
+        envs.SGLANG_WEG2_DRAFT_ON_P.get(),
+    )
+    ns.draft_kv_on_p = "on" if draft_on_p else "off"
+    envs.SGLANG_WEG2_DRAFT_ON_P.set(draft_on_p)
     # #1032 RESOLVED HERE, BEFORE THE SWEEPS, THE STORE AND ANY LAUNCH: a
     # retracted token vector is a desk fact, and the whole point of W46 is that
     # it must not cost a boot window -- nor a mount, nor an shm sweep -- to
@@ -13578,6 +13678,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     draft_kv_on_p = _draft_kv_on_p_requested and not hicache_disabled
     if not draft_kv_on_p:
         log(draft_kv_off_line())
+    log(draft_on_p_line(
+        draft_kv_on_p, draft_on_p_prov,
+        [] if draft_kv_on_p else strip_speculative_flags(shlex.split(ns.extra_p))[1]))
     # #1386: `hicache_disabled` was already resolved once, at the top of
     # `main`, before `log` even existed (the first `common_flags` sentinel
     # call needs it long before this point) -- this is only the LOG SIDE of
