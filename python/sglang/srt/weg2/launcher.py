@@ -2203,6 +2203,162 @@ def _tree_bytes(path: str) -> Tuple[int, int, int]:
     return alloc, apparent, n
 
 
+#: The module the stock server is started as.  A process is a server only when
+#: its argv carries ``-m`` followed by EXACTLY this token -- see
+#: :func:`live_launch_servers` for why a substring of the command line is not.
+LAUNCH_SERVER_MODULE = "sglang.launch_server"
+
+
+def _proc_argv(pid: str, proc_root: str) -> List[str]:
+    try:
+        with open(f"{proc_root}/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+    except OSError:
+        return []
+    return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+
+
+def _proc_ppid(pid: int, proc_root: str) -> int:
+    try:
+        with open(f"{proc_root}/{pid}/stat") as f:
+            # comm may hold spaces and ')': the fields after the LAST ')' are
+            # "state ppid ...".
+            return int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def _proc_ancestors(pid: int, proc_root: str) -> List[int]:
+    chain: List[int] = []
+    seen = {pid}
+    p = _proc_ppid(pid, proc_root)
+    while p > 1 and p not in seen:
+        chain.append(p)
+        seen.add(p)
+        p = _proc_ppid(p, proc_root)
+    return chain
+
+
+def is_launch_server_argv(argv: Sequence[str]) -> bool:
+    """True only for ``<python...> [opts] -m sglang.launch_server ...``.
+
+    argv[0]'s basename must start with ``python`` and the module must be a
+    WHOLE argument after ``-m`` -- never a piece of a longer string.  A shell
+    whose ``-c`` script merely MENTIONS the module (``bash -c 'pgrep -fc
+    "sglang.launch_server"; bash start_when_free.sh ...'``) is not a server,
+    and neither is ``python -m sglang.srt.weg2.launcher``.
+    """
+    if not argv or not os.path.basename(argv[0]).startswith("python"):
+        return False
+    for i, a in enumerate(argv[1:], start=1):
+        if a == "-m" and i + 1 < len(argv) and argv[i + 1] == LAUNCH_SERVER_MODULE:
+            return True
+        if a == "-m" + LAUNCH_SERVER_MODULE:
+            return True
+    return False
+
+
+def _proc_has_cuda_context(pid: str, proc_root: str) -> bool:
+    """A CUDA context holds ``/dev/nvidia*`` open (fd) and mapped (maps)."""
+    fd_dir = f"{proc_root}/{pid}/fd"
+    try:
+        for fd in os.listdir(fd_dir):
+            try:
+                if os.readlink(f"{fd_dir}/{fd}").startswith("/dev/nvidia"):
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    try:
+        with open(f"{proc_root}/{pid}/maps") as f:
+            for line in f:
+                if "/dev/nvidia" in line:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def _proc_boot_tag(pid: str, proc_root: str) -> Optional[str]:
+    """The Weg-2 boot tag a server was started under, from its own
+    ``SGLANG_WEG2_BOOT_TOKEN`` (``<tag>:<epoch>:<launcher pid>``, published by
+    :func:`build_env` for both groups).  ``None`` = no token (a stock server of
+    another operator) or unreadable -- both count as a FOREIGN tag."""
+    try:
+        with open(f"{proc_root}/{pid}/environ", "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    for kv in raw.split(b"\0"):
+        if kv.startswith(b"SGLANG_WEG2_BOOT_TOKEN="):
+            return kv.split(b"=", 1)[1].decode("utf-8", "replace").split(":", 1)[0]
+    return None
+
+
+def live_launch_servers(
+    tag: str, proc_root: str = "/proc", self_pid: Optional[int] = None
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    """#1217, fnFL2 H26: the LIVE ``sglang.launch_server`` processes that must
+    refuse a residue sweep -- and, separately, the ones that only look like one.
+
+    WHY NOT ``pgrep -f "sglang[.]launch_server"`` (what this replaces): it
+    matches a SUBSTRING of every command line on the box.  Metal 24.09.
+    08:56-08:57Z, boot fnFL2x140: three starts, three refusals naming pids
+    3122930 / 3157795 / 3189930, each gone seconds later.  Each was the
+    operator's own Bash-tool shell, ``bash -c '... pgrep -fc
+    "sglang.launch_server"; ... bash start_when_free.sh fnFL2x139
+    boot_nf_x140.sh fnFL2x140 ...'`` -- the ANCESTOR of this very launcher
+    (tool shell -> start_when_free.sh -> boot_nf_x140.sh -> boot_nf_cd_long.sh
+    -> arm_fnFL2_long.sh -> timeout -> ``python -m sglang.srt.weg2.launcher
+    ... --dry-run``), alive exactly as long as the start it was waiting on.
+    The trap only armed because two dead 16 KB ``sglang_loads_*`` flags of
+    another boot sat in /dev/shm; without own entries pgrep never ran.
+
+    The rules:
+
+    * this process and its whole parent chain are never counted;
+    * only a real server argv counts (:func:`is_launch_server_argv`); any
+      other process whose command line merely contains the module name goes
+      to the second list, which the caller logs;
+    * a real server counts when it holds a CUDA context, or when its boot tag
+      (``SGLANG_WEG2_BOOT_TOKEN``) is not ``tag`` -- a stock server without a
+      token is foreign and counts even before its CUDA init.  Only a server of
+      THIS tag with no CUDA context (nothing it could be holding) is skipped.
+    """
+    me = os.getpid() if self_pid is None else self_pid
+    mine = {me, *_proc_ancestors(me, proc_root)}
+    live: List[Dict[str, object]] = []
+    ignored: List[Dict[str, object]] = []
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return live, ignored
+    for entry in sorted((e for e in entries if e.isdigit()), key=int):
+        argv = _proc_argv(entry, proc_root)
+        if not argv:
+            continue
+        server = is_launch_server_argv(argv)
+        if not server and not any(LAUNCH_SERVER_MODULE in a for a in argv):
+            continue
+        pid = int(entry)
+        head = " ".join(argv)[:160]
+        if pid in mine:
+            ignored.append({"pid": pid, "why": "self/ancestor", "argv": head})
+            continue
+        if not server:
+            ignored.append({"pid": pid, "why": "not a server argv", "argv": head})
+            continue
+        cuda = _proc_has_cuda_context(entry, proc_root)
+        boot_tag = _proc_boot_tag(entry, proc_root)
+        rec: Dict[str, object] = {"pid": pid, "cuda": cuda, "tag": boot_tag, "argv": head}
+        if cuda or boot_tag != tag:
+            live.append(rec)
+        else:
+            ignored.append({**rec, "why": "own tag, no CUDA context"})
+    return live, ignored
+
+
 def shm_residue_sweep(
     log: Log,
     tag: str,
@@ -2226,7 +2382,10 @@ def shm_residue_sweep(
       never stat'ed for size, never moved -- /dev/shm here is full of other
       people's `sem.mp-*`;
     * any live ``sglang.launch_server`` REFUSES the boot before anything is
-      touched (another boot is up; this is not the moment to tidy /dev/shm);
+      touched (another boot is up; this is not the moment to tidy /dev/shm).
+      "Live server" is decided by :func:`live_launch_servers`, never by a
+      substring of some command line (fnFL2 H26: the substring caught the
+      operator's own start shell, an ancestor of this launcher, three times);
     * an entry with a live holder (:func:`shm_holder_pids`) REFUSES the boot,
       naming the entry and the pids.  Nothing is killed and nothing is swept;
     * an orphan REGULAR FILE is moved into the archive WITH ITS CONTENT: the
@@ -2251,13 +2410,17 @@ def shm_residue_sweep(
     if not own:
         log(f"#1217/#1233 shm residue: none of ours in {shm_dir} ({foreign} foreign entries untouched)")
         return {"swept": [], "bytes_freed": 0, "refused": {}, "archive": ""}
-    live = subprocess.run(
-        ["pgrep", "-f", "sglang[.]launch_server"], capture_output=True, text=True
-    ).stdout.split()
+    live, ignored = live_launch_servers(tag, proc_root)
+    if ignored:
+        log(
+            f"#1217 shm residue (fnFL2 H26): {len(ignored)} process(es) mention "
+            f"{LAUNCH_SERVER_MODULE} but are NOT a live foreign server, not counted: {ignored}"
+        )
     if live:
         raise Weg2LaunchRefused(
-            f"#1217 shm residue: LIVE launch_server pid(s)=[{' '.join(live)}] -- refusing this "
-            f"boot, not sweeping, not killing anything (our /dev/shm entries: {own})"
+            f"#1217 shm residue: LIVE launch_server pid(s)=[{' '.join(str(s['pid']) for s in live)}] "
+            f"{live} -- refusing this boot, not sweeping, not killing anything "
+            f"(our /dev/shm entries: {own})"
         )
     held = {n: shm_holder_pids(os.path.join(shm_dir, n), proc_root) for n in own}
     refused = {n: pids for n, pids in held.items() if pids}
