@@ -2238,9 +2238,19 @@ class PrefillAdder:
             req.prefix_indices
         )
         total_tokens = cand_extend_input_len + max_new + self.page_size
+        # Upstream #36415: read the request's mamba debits BEFORE
+        # `init_load_back` below -- a host load-back binds `req.mamba_pool_idx`
+        # (MambaComponent.build_hicache_transfers), after which both helpers
+        # return 0 and the admission would be charged nothing for the state it
+        # just took. Upstream fixed the shared-gap reserve; the fork's
+        # non-unified slot gate (#581/#1044, `rem_mamba_slots` on
+        # HybridReqToTokenPool -- the 27B's pool) has the same trap, so its
+        # charge is hoisted with it. The debit sites below reuse both values.
+        mamba_gap_reserve = self._mamba_gap_budget_for_req(req)
+        mamba_slot_charge = self._mamba_slots_for_req(req)
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
-        total_tokens += self._mamba_gap_budget_for_req(req)
+        total_tokens += mamba_gap_reserve
         # Punkt 2 (18.09., Weg 2 group P): ADMISSION PER CHUNK. The gate
         # charges the NEXT chunk (+ reservation, page, mamba gap), not the
         # whole extend; the rest is funded chunk by chunk, and when the pool
@@ -2252,7 +2262,7 @@ class PrefillAdder:
             from sglang.srt.weg2.park import chunk_admit_tokens as _cat
             total_tokens = (
                 _cat(cand_extend_input_len, self.rem_chunk_tokens)
-                + max_new + self.page_size + self._mamba_gap_budget_for_req(req)
+                + max_new + self.page_size + mamba_gap_reserve
             )
         # Prefill-Spill (PS1-V1a): the born-spilled current-step demand is the
         # lifetime demand MINUS the future decode (max_new) that will spill to
@@ -2669,8 +2679,8 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                     req.retracted_stain,
-                    mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-                    mamba_slot_charge=self._mamba_slots_for_req(req),
+                    mamba_gap_reserve=mamba_gap_reserve,
+                    mamba_slot_charge=mamba_slot_charge,
                 )
             else:
                 # Make sure at least one page is available
@@ -2721,8 +2731,8 @@ class PrefillAdder:
                     trunc_len,
                     0,
                     req.retracted_stain,
-                    mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-                    mamba_slot_charge=self._mamba_slots_for_req(req),
+                    mamba_gap_reserve=mamba_gap_reserve,
+                    mamba_slot_charge=mamba_slot_charge,
                 )
 
         return self.budget_state()

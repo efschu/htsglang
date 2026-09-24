@@ -64,7 +64,8 @@ def test_park_req_is_a_frozen_ring_object():
 def test_adder_gate_charges_the_next_chunk_on_group_p_only():
     from sglang.srt.managers import schedule_policy as sp
     src = open(sp.__file__).read()
-    i = src.index("total_tokens += self._mamba_gap_budget_for_req(req)")
+    # #36415: the mamba gap reserve is read once, before the host load-back
+    i = src.index("total_tokens += mamba_gap_reserve")
     blk = src[i:i + 1200]
     assert "_weg2_chunk_admit()" in blk and "weg2_parked_span" in blk
     assert "chunk_admit_tokens as _cat" in blk
