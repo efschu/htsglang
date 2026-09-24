@@ -78,6 +78,20 @@ starts a new group at c (the QSA ``prefix_lens % ratio == 0`` assert holds).
    request holds nothing else (PrefillAdder refuses the next request, like
    the born-spilled-deep batch).
 
+5. WAIT (H45, ``SGLANG_WEG2_TAIL_WAIT_MS``). P's PP ranks write their parts
+   from background publish threads, and D's first prefetch check can come
+   before the last of them landed (metal fnFL2x150/x151: TP0 staged parts=1-2
+   of 3, 'fa_layer_missing' -> vote 0 -> a real extend, flip 3.6-3.9 s; the
+   one flip whose manifest was complete adopted in 1.95 s). The header names
+   P's part count (``TailHeader.n_parts``), so ``stage`` starts reading only a
+   COMPLETE manifest and re-reads the part list at every check until then;
+   ``vote_hold`` is this rank's "not staged yet" (bounded by the env, 300 ms
+   while no part exists at all), MAX-reduced with the prefetch termination
+   verdict, so the group holds the termination -- and with it the vote --
+   uniformly. The READY line carries ``waited_ms`` (how long the hold kept a
+   finished read from terminating) and ``token_src`` (P's sampled token, read
+   from the END headers of the parts -- the one source on every rank).
+
 QSA at an OPEN group (N % r != 0): decode compresses the group its length
 completes, from the per-request pending ring (qwen_sparse_attn_backend
 ``_qsa_build_write_plan``: members come from the ring). P's final chunk wrote
@@ -117,6 +131,15 @@ KEEP_AGREED = 8
 #: how long the vote waits for a staging thread that is still reading.
 STAGE_JOIN_S = 1.0
 READY_VERDICTS = ("ready", "not_mine")
+#: H45: the hold while NO part of the rid exists (P may publish none: no
+#: partial page below the cut, END refused before the write) -- short, the
+#: partial-manifest bound is the env's.
+NO_PARTS_WAIT_S = 0.3
+
+
+def tail_wait_s() -> float:
+    """SGLANG_WEG2_TAIL_WAIT_MS as seconds (H45); 0 = no hold."""
+    return max(0.0, float(envs.SGLANG_WEG2_TAIL_WAIT_MS.get() or 0) / 1000.0)
 
 
 def adopt_enabled() -> bool:
@@ -218,6 +241,11 @@ class Staged(msgspec.Struct):
     end_rope: Optional[torch.Tensor] = None
     #: keyed "fa<gid>" / "gdn<gid>" / "ring<gid>" / "rope"
     end_readback: Dict[str, Tuple[torch.Tensor, ...]] = {}
+    #: H45: the part count P's manifest names (0 = unknown / pre-H45) and
+    #: where ``first_token`` came from ("publish" = the parts' END headers,
+    #: else "none:<why>")
+    n_parts: int = 0
+    token_src: str = "none"
 
     @property
     def ok(self) -> bool:
@@ -247,6 +275,8 @@ def stage_parts(headers: List[th.TailHeader], held: HeldShapes, check_digest: bo
     and -- when the parts carry it and SKIP is on -- the END section (E2)."""
     bundles: List[dict] = []
     st = _stage_e1(headers, held, check_digest, bundles)
+    st.n_parts = max((int(h.n_parts) for h in headers), default=0)
+    st.first_token, st.token_src = end_token(headers)
     if st.ok and th.skip_extend_enabled():
         st.end_verdict = _stage_end(st, bundles, held, check_digest)
         if st.end_verdict not in READY_VERDICTS:
@@ -306,6 +336,18 @@ def _stage_e1(headers: List[th.TailHeader], held: HeldShapes, check_digest: bool
     if check_digest:
         st.readback = _readback_buffers(fa, gdn, {}, None, pin)
     return st
+
+
+def end_token(headers: List[th.TailHeader]) -> Tuple[int, str]:
+    """(P's sampled token, source) from the parts' END headers -- the same
+    source on every rank, whatever this rank's own E1 verdict (H45: TP0 used
+    to print first_token=-1 whenever its E1 staging refused, because only
+    ``_stage_end`` read it). (-1, 'none:<why>') when the headers do not name
+    one token."""
+    why = _end_header_refusal(headers) if headers else "no_parts"
+    if why:
+        return -1, f"none:{why}"
+    return int(headers[0].end.first_token), "publish"
 
 
 def _end_header_refusal(headers: List[th.TailHeader]) -> str:
@@ -412,8 +454,26 @@ def _readback_buffers(fa, gdn, ring, rope, pin: bool) -> Dict[str, Tuple[torch.T
 
 
 class _Job(msgspec.Struct):
-    thread: threading.Thread
+    """One rid's staging on this rank. H45: made at the FIRST progress check
+    (``thread`` None while the manifest is incomplete; the part list is
+    re-read at every check), started once the manifest is complete."""
+
     box: List[Staged]
+    thread: Optional[threading.Thread] = None
+    #: perf_counter of the first progress check of the rid
+    t_first: float = 0.0
+    #: the manifest as last read: state / parts seen / parts named
+    state: str = "none"
+    have: int = 0
+    want: int = 0
+    headers: List[th.TailHeader] = []
+    #: perf_counter at which the hold first kept a finished read from
+    #: terminating (-1 = never held)
+    held_since: float = -1.0
+
+    @property
+    def staged(self) -> bool:
+        return bool(self.box)
 
 
 class Agreed(msgspec.Struct):
@@ -426,6 +486,8 @@ class Agreed(msgspec.Struct):
     #: by a uniform admission refusal (then E1)
     skip: bool = False
     skip_note: str = ""
+    #: H45: how long the hold kept this rid's finished read from terminating
+    waited_ms: float = 0.0
 
     @property
     def resume_at(self) -> int:
@@ -458,26 +520,69 @@ def _stage_into(box: List[Staged], headers, held: HeldShapes, check_digest: bool
         box.append(Staged(spec=headers[0].spec, headers=list(headers), verdict=f"stage_raised:{type(exc).__name__}"))
 
 
+#: manifest states ``stage`` starts reading at (a 'legacy' manifest has no
+#: count: taken as it is, the H21 form)
+_STAGE_STATES = ("complete", "legacy")
+
+
 def stage(rid: str, tree_cache) -> None:
     """Prefetch-progress entry (every round): start reading the parts of a
-    D request once, in the background. Never raises into the tree."""
+    D request once its manifest is complete (H45), in the background. Never
+    raises into the tree."""
     try:
-        if rid in _JOBS or not _candidate(rid):
+        job = _JOBS.get(rid)
+        if job is not None and (job.thread is not None or job.staged):
             return
+        if job is None:
+            if not _candidate(rid):
+                return
+            job = _Job(box=[], t_first=time.perf_counter())
+            _JOBS[rid] = job
+            while len(_JOBS) > KEEP_AGREED:  # a prefetch that never completed
+                _JOBS.pop(next(iter(_JOBS)))
         headers = th.headers_for(rid)
-        if not headers:
+        job.state, job.have, job.want = th.manifest_state(headers)
+        job.headers = list(headers)
+        if job.state in ("none", "partial"):
+            return  # P's publish threads are still writing: re-read next check
+        if job.state not in _STAGE_STATES:
+            # a count that can never complete (stale / disagreeing parts): a
+            # named 0 vote now, no hold
+            job.box.append(Staged(spec=headers[0].spec, headers=list(headers), n_parts=job.want,
+                                  verdict=f"parts_{job.state}:{job.have}/{job.want}"))
             return
         held = held_shapes(tree_cache.token_to_kv_pool_allocator.get_kvcache(), tree_cache.req_to_token_pool)
-        box: List[Staged] = []
         device = torch.cuda.current_device() if torch.cuda.is_available() else None
-        t = threading.Thread(target=_stage_into, args=(box, headers, held, verify_enabled(), device),
-                             daemon=True, name="weg2-tail-stage")
-        _JOBS[rid] = _Job(thread=t, box=box)
-        while len(_JOBS) > KEEP_AGREED:  # a prefetch that never completed
-            _JOBS.pop(next(iter(_JOBS)))
-        t.start()
+        job.thread = threading.Thread(target=_stage_into, args=(job.box, headers, held, verify_enabled(), device),
+                                      daemon=True, name="weg2-tail-stage")
+        job.thread.start()
     except Exception as exc:  # noqa: BLE001 -- no staging = a 0 vote
         logger.warning("WEG2-TAIL stage refused rid=%s (%s: %s)", rid, type(exc).__name__, exc)
+
+
+def vote_hold(rid: str) -> int:
+    """H45: this rank's slot in the prefetch termination MAX -- 1 while its
+    staging of the rid is not finished (manifest incomplete or the read still
+    running) and inside the bound (``SGLANG_WEG2_TAIL_WAIT_MS`` from the first
+    check; ``NO_PARTS_WAIT_S`` while no part exists at all), else 0. The
+    group's MAX makes the hold uniform; every input here is rank-local."""
+    job = _JOBS.get(rid)
+    if job is None or job.staged:
+        return 0
+    wait = tail_wait_s()
+    if wait <= 0.0:
+        return 0
+    if job.thread is None and job.have == 0:
+        wait = min(wait, NO_PARTS_WAIT_S)
+    return 1 if time.perf_counter() - job.t_first < wait else 0
+
+
+def note_held(rid: str) -> None:
+    """H45: the group's read of ``rid`` could terminate, the tail hold kept
+    it (``can_terminate_prefetch``) -- stamp the start of the wait."""
+    job = _JOBS.get(rid)
+    if job is not None and job.held_since < 0:
+        job.held_since = time.perf_counter()
 
 
 #: E2 needs a worker that honours a skip batch (EAGLEWorkerV2's extend
@@ -498,7 +603,8 @@ def local_vote(rid: str) -> int:
     job = _JOBS.get(rid)
     if job is None:
         return 0
-    job.thread.join(STAGE_JOIN_S)
+    if job.thread is not None and not job.box:
+        job.thread.join(STAGE_JOIN_S)
     if not job.box or not job.box[0].ok:
         return 0
     return 2 if job.box[0].end_ok and _SKIP_SERVER[0] else 1
@@ -509,9 +615,22 @@ def agree(rid: str, group_vote: int) -> None:
     job = _JOBS.pop(rid, None)
     if job is None:
         return
+    waited_ms = (time.perf_counter() - job.held_since) * 1000.0 if job.held_since >= 0 else 0.0
     st = job.box[0] if job.box else None
     if st is None:
-        return  # still reading after STAGE_JOIN_S: voted 0, nothing to remember
+        # voted 0: the manifest never completed inside the bound, or the read
+        # was still running after STAGE_JOIN_S -- named at the admission
+        why = "stage_unfinished" if job.thread is not None else f"parts_{job.state}:{job.have}/{job.want}"
+        if not job.headers:
+            logger.info(
+                "WEG2-TAIL-READY rid=%s parts=0/? verdict=no_parts adopt=skipped:no_parts end=absent "
+                "first_token=-1 token_src=none:no_parts waited_ms=%.0f",
+                rid, waited_ms,
+            )
+            return
+        first, src = end_token(job.headers)
+        st = Staged(spec=job.headers[0].spec, headers=list(job.headers), verdict=why, n_parts=job.want,
+                    first_token=first, token_src=src)
     agreed = group_vote >= 1 and st.ok
     skip = group_vote >= 2 and st.end_ok
     if not skip:
@@ -519,7 +638,8 @@ def agree(rid: str, group_vote: int) -> None:
     if not agreed:
         st.fa, st.gdn, st.readback = {}, {}, {}  # never applied: drop the payload now
     _AGREED[rid] = Agreed(staged=st, agreed=agreed, skip=skip,
-                          skip_note="" if skip else f"level{int(group_vote)}:{st.end_verdict}")
+                          skip_note="" if skip else f"level{int(group_vote)}:{st.end_verdict}",
+                          waited_ms=waited_ms)
     while len(_AGREED) > KEEP_AGREED:
         _AGREED.pop(next(iter(_AGREED)))
 
@@ -540,17 +660,21 @@ def uniform_refusal(spec: th.TailSpec, ids, fill_len: int, extra_key, prefix_len
     return ""
 
 
-def _log_ready(st: Staged, adopt: str, skip: bool = False, skip_note: str = "") -> None:
+def _log_ready(st: Staged, adopt: str, skip: bool = False, skip_note: str = "", waited_ms: float = 0.0) -> None:
+    """tail_rows/state_at/extend name the geometry the group RUNS: E1's
+    [page_prefix, c) + extend [c, N) unless the END state is taken (skip).
+    ``parts`` is seen/named (``?`` = a pre-H45 manifest without a count)."""
     spec = st.spec
     if skip:
         rows, state_at, extend = spec.n_tokens - spec.page_prefix, spec.n_tokens, 0
     else:
         rows, state_at, extend = spec.rows, spec.cut, spec.extend
     logger.info(
-        "WEG2-TAIL-READY rid=%s page_prefix=%d tail_rows=%d state_at=%d extend=%d parts=%d key=%s "
-        "verdict=%s adopt=%s end=%s first_token=%d%s",
-        spec.rid, spec.page_prefix, rows, state_at, extend, len(st.headers), spec.key,
-        st.verdict, adopt, st.end_verdict, st.first_token, f" skip_refused={skip_note}" if skip_note else "",
+        "WEG2-TAIL-READY rid=%s page_prefix=%d tail_rows=%d state_at=%d extend=%d parts=%d/%s key=%s "
+        "verdict=%s adopt=%s end=%s first_token=%d token_src=%s waited_ms=%.0f%s",
+        spec.rid, spec.page_prefix, rows, state_at, extend, len(st.headers), st.n_parts or "?", spec.key,
+        st.verdict, adopt, st.end_verdict, st.first_token, st.token_src, waited_ms,
+        f" skip_refused={skip_note}" if skip_note else "",
     )
 
 
@@ -584,12 +708,12 @@ def plan_adopt(req, prefix_len: int, batch_empty: bool = True) -> Optional[Agree
     if entry is None:
         return None
     if not entry.agreed:
-        _log_ready(entry.staged, "skipped:group_vote")
+        _log_ready(entry.staged, "skipped:group_vote", waited_ms=entry.waited_ms)
         return None
     why = uniform_refusal(entry.staged.spec, req.origin_input_ids, len(req.full_untruncated_fill_ids),
                           req.extra_key, prefix_len)
     if why:
-        _log_ready(entry.staged, f"skipped:{why}")
+        _log_ready(entry.staged, f"skipped:{why}", waited_ms=entry.waited_ms)
         return None
     if entry.skip:
         why = skip_refusal(entry, req, batch_empty)
@@ -612,7 +736,7 @@ def commit_adopt(req, entry: Agreed, tree_cache, page_size: int) -> int:
     page = alloc_token_slots(tree_cache, int(page_size))
     rows = page[: spec.rows].to(dtype=req.prefix_indices.dtype, device=req.prefix_indices.device)
     req.prefix_indices = torch.cat([req.prefix_indices, rows])
-    _log_ready(st, "done", skip_note=entry.skip_note)
+    _log_ready(st, "done", skip_note=entry.skip_note, waited_ms=entry.waited_ms)
     if st.verdict == "not_mine":
         _log_adopt(spec, fa_rows=0, fa_layers=0, gdn_layers=0, digest="not_mine", ms=0.0, issue_ms=0.0)
         return spec.cut
@@ -720,7 +844,7 @@ def _commit_skip(req, entry: Agreed, tree_cache, page_size: int) -> int:
     page = alloc_token_slots(tree_cache, int(page_size))
     rows = page[: spec.rows].to(dtype=req.prefix_indices.dtype, device=req.prefix_indices.device)
     req.prefix_indices = torch.cat([req.prefix_indices, rows])
-    _log_ready(st, "done", skip=True)
+    _log_ready(st, "done", skip=True, waited_ms=entry.waited_ms)
     inst = None
     if st.end_verdict == "ready":
         inst = _skip_install(st, tree_cache)

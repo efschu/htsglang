@@ -1680,7 +1680,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # QSA group's ring rows, GDN slot, P's sampled token).
             tail_handoff.publish_rows(
                 req, kv_indices, self.token_to_kv_pool_allocator, f"pp{self.pp_rank}-{os.getpid()}",
-                req_to_token_pool=self.req_to_token_pool,
+                req_to_token_pool=self.req_to_token_pool, n_parts=self.pp_size,
             )
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
@@ -5296,7 +5296,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             > self._prefetch_timeout_budget_s(operation)
         )
 
-    def can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
+    def can_terminate_prefetch(
+        self, operation: PrefetchOperation, tail_hold: int = 0
+    ) -> bool:
+        """``tail_hold`` (H45, weg2/tail_adopt.vote_hold): 1 = this rank's
+        read of P's tail parts is not finished yet (manifest incomplete or
+        still staging, inside its bound). It rides the SAME MAX as the
+        termination verdict, so the group holds the termination -- and with
+        it the tail vote in ``check_prefetch_progress`` -- uniformly. Under
+        ``best_effort`` (no collective here) it is ignored."""
         if self.prefetch_stop_policy == "best_effort":
             return True
 
@@ -5324,7 +5332,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         operation_terminated = operation.is_terminated()
         states = torch.tensor(
-            [1 - int(can_terminate), int(operation_terminated)],
+            [1 - int(can_terminate), int(operation_terminated), int(bool(tail_hold))],
             dtype=torch.int,
         )
         self._all_reduce_attn_groups(
@@ -5334,7 +5342,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         can_terminate = states[0].item() == 0
         operation_terminated = states[1].item() == 1
-        return can_terminate or operation_terminated
+        done = can_terminate or operation_terminated
+        if done and states[2].item() > 0:
+            # H45: the read is done, some rank's tail parts are not -- the
+            # vote waits (bounded) instead of falling on a partial manifest
+            tail_adopt.note_held(getattr(operation, "request_id", "") or "")
+            return False
+        return done
 
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
@@ -5351,9 +5365,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if operation.host_indices is None:
             return True
         # H21: start reading P's tail parts for this rid in the background
-        # (once), so the vote below joins a finished read.
+        # (once the manifest is complete -- H45), so the vote below joins a
+        # finished read; until then the group holds the termination (bounded,
+        # SGLANG_WEG2_TAIL_WAIT_MS) instead of voting on a partial manifest.
         tail_adopt.stage(req_id, tree_cache=self)
-        if not self.can_terminate_prefetch(operation):
+        if not self.can_terminate_prefetch(
+            operation, tail_hold=tail_adopt.vote_hold(req_id)
+        ):
             return False
 
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(

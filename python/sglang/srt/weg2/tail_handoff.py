@@ -238,6 +238,10 @@ class TailHeader(msgspec.Struct, frozen=True):
     gdn_digest: str
     nbytes: int
     end: Optional[EndHeader] = None
+    #: H45: how many parts P publishes for this rid (its PP size); every part
+    #: names the whole manifest, so D can tell "2 of 3 written so far" from
+    #: "complete". 0 = a pre-H45 header (the count is unknown).
+    n_parts: int = 0
 
 
 def _dir() -> str:
@@ -249,6 +253,34 @@ def part_paths(rid: str, part: str) -> Tuple[str, str]:
     d = _dir()
     stem = os.path.join(d, f"{rid}.tail.{part}")
     return f"{stem}.json", f"{stem}.pt"
+
+
+def _part_index(part: str) -> str:
+    """'pp2-266044' -> 'pp2': the publishing PP rank (the pid is per boot)."""
+    return part.split("-", 1)[0]
+
+
+def manifest_state(headers: Sequence[TailHeader]) -> Tuple[str, int, int]:
+    """H45: (state, have, want) of the parts D sees for one rid -- 'none'
+    (no header yet), 'partial' (fewer PP ranks than the manifest names:
+    P's publish threads are still writing), 'complete', 'excess' (more
+    headers than P publishes: a stale part), 'differs' (the parts disagree
+    on the count) or 'legacy' (pre-H45 headers without a count: taken as
+    they are, the H21 form)."""
+    have = len(headers)
+    if not have:
+        return "none", 0, 0
+    wants = {int(h.n_parts) for h in headers}
+    if len(wants) > 1:
+        return "differs", have, max(wants)
+    want = wants.pop()
+    if want <= 0:
+        return "legacy", have, 0
+    if have > want:
+        return "excess", have, want
+    if len({_part_index(h.part) for h in headers}) < want:
+        return "partial", have, want
+    return "complete", have, want
 
 
 def headers_for(rid: str) -> List[TailHeader]:
@@ -287,10 +319,12 @@ def _end_header(end: EndPayload) -> EndHeader:
 
 
 def write_part(spec: TailSpec, part: str, fa: Dict[int, Tuple[torch.Tensor, ...]],
-               gdn: Dict[int, Tuple[torch.Tensor, ...]], end: Optional[EndPayload] = None) -> Optional[TailHeader]:
+               gdn: Dict[int, Tuple[torch.Tensor, ...]], end: Optional[EndPayload] = None,
+               n_parts: int = 0) -> Optional[TailHeader]:
     """Atomically write one rank's part (payload first, header last: a
     present header means a complete payload). ``end`` (E2) rides along as
-    payload key "end" and header field ``end``."""
+    payload key "end" and header field ``end``; ``n_parts`` (H45) is the
+    number of parts P publishes for the rid (its PP size)."""
     if not _dir():
         return None
     fa_t, gdn_t = _fa_order(fa), _gdn_order(gdn)
@@ -301,6 +335,7 @@ def write_part(spec: TailSpec, part: str, fa: Dict[int, Tuple[torch.Tensor, ...]
         fa_digest=digest(fa_t), gdn_digest=digest(gdn_t),
         nbytes=_nbytes(fa_t + gdn_t),
         end=_end_header(end) if end is not None else None,
+        n_parts=int(n_parts),
     )
     jpath, ppath = part_paths(spec.rid, part)
     os.makedirs(os.path.dirname(jpath), exist_ok=True)
@@ -513,18 +548,20 @@ def _fa_rows(kvpool, rows: torch.Tensor, groups: Optional[int] = None,
     return out
 
 
-def publish_rows(req, kv_indices: torch.Tensor, allocator, part: str, req_to_token_pool=None) -> None:
-    """cache_finished_req entry: never raises into the tree."""
+def publish_rows(req, kv_indices: torch.Tensor, allocator, part: str, req_to_token_pool=None,
+                 n_parts: int = 0) -> None:
+    """cache_finished_req entry: never raises into the tree. ``n_parts``:
+    how many ranks publish a part of this rid (P's PP size, H45)."""
     if not _CAPTURES:
         return
     try:
-        _publish_rows(req, kv_indices, allocator, part, req_to_token_pool)
+        _publish_rows(req, kv_indices, allocator, part, req_to_token_pool, n_parts)
     except Exception as exc:  # noqa: BLE001 -- a failed publish is the page-prefix resume, named
         logger.warning("WEG2-TAIL-PUBLISH failed rid=%s (%s: %s)", req.rid, type(exc).__name__, exc)
         _CAPTURES.pop(str(req.rid), None)
 
 
-def _publish_rows(req, kv_indices: torch.Tensor, allocator, part: str, req_to_token_pool) -> None:
+def _publish_rows(req, kv_indices: torch.Tensor, allocator, part: str, req_to_token_pool, n_parts: int = 0) -> None:
     """At cache_finished_req, before the unaligned tail is freed: read the
     partial page's rows, join the state capture, write this rank's part."""
     cap = _CAPTURES.pop(str(req.rid), None)
@@ -546,7 +583,7 @@ def _publish_rows(req, kv_indices: torch.Tensor, allocator, part: str, req_to_to
         # fired, that chunk's KV rows are written too (stream order)
         cap.event.synchronize()
     fa = _fa_rows(allocator.get_kvcache(), kv_indices[spec.page_prefix:spec.cut].to(torch.int64))
-    threading.Thread(target=_write_and_log, args=(spec, part, fa, cap.gdn, end), daemon=True,
+    threading.Thread(target=_write_and_log, args=(spec, part, fa, cap.gdn, end, n_parts), daemon=True,
                      name="weg2-tail-publish").start()
 
 
@@ -620,11 +657,11 @@ def _ring_rows(kvpool, req_pool_idx: int, ring_rows: int):
     return ring, _to_host(kvpool.qsa_rope_position_buffer.index_select(0, idx))
 
 
-def _write_and_log(spec: TailSpec, part: str, fa, gdn, end: Optional[EndPayload] = None) -> None:
+def _write_and_log(spec: TailSpec, part: str, fa, gdn, end: Optional[EndPayload] = None, n_parts: int = 0) -> None:
     try:
         if end is not None and end.event is not None:
             end.event.synchronize()  # the forward-stream gather has landed
-        header = write_part(spec, part, fa, gdn, end=end)
+        header = write_part(spec, part, fa, gdn, end=end, n_parts=n_parts)
         _prune(spec.rid)
     except Exception:  # noqa: BLE001 -- a hand-off that fails is the page-prefix resume
         logger.warning("WEG2-TAIL-PUBLISH write failed rid=%s", spec.rid, exc_info=True)
@@ -634,18 +671,18 @@ def _write_and_log(spec: TailSpec, part: str, fa, gdn, end: Optional[EndPayload]
     _PUBLISH_N[0] += 1
     if header.end is None:
         logger.info(
-            "WEG2-TAIL-PUBLISH rid=%s page_prefix=%d tail_rows=%d state_at=%d n_tokens=%d part=%s "
+            "WEG2-TAIL-PUBLISH rid=%s page_prefix=%d tail_rows=%d state_at=%d n_tokens=%d part=%s of=%d "
             "fa_layers=%d gdn_layers=%d bytes=%d key=%s fa_digest=%s gdn_digest=%s (n=%d)",
-            spec.rid, spec.page_prefix, spec.rows, spec.cut, spec.n_tokens, part, len(header.fa_layers),
+            spec.rid, spec.page_prefix, spec.rows, spec.cut, spec.n_tokens, part, header.n_parts, len(header.fa_layers),
             len(header.gdn_layers), header.nbytes, spec.key, header.fa_digest, header.gdn_digest, _PUBLISH_N[0],
         )
         return
     e = header.end
     logger.info(
         "WEG2-TAIL-PUBLISH rid=%s page_prefix=%d tail_rows=%d state_at=%d first_token=%d n_tokens=%d part=%s "
-        "fa_layers=%d gdn_layers=%d groups=%d ring_rows=%d bytes=%d end_key=%s end_digests=%s/%s/%s "
+        "of=%d fa_layers=%d gdn_layers=%d groups=%d ring_rows=%d bytes=%d end_key=%s end_digests=%s/%s/%s "
         "| E1 tail_rows=%d state_at=%d bytes=%d key=%s fa_digest=%s gdn_digest=%s (n=%d)",
-        spec.rid, spec.page_prefix, e.rows, spec.n_tokens, e.first_token, spec.n_tokens, part,
+        spec.rid, spec.page_prefix, e.rows, spec.n_tokens, e.first_token, spec.n_tokens, part, header.n_parts,
         len(header.fa_layers), len(header.gdn_layers), e.groups, e.ring_rows, e.nbytes, e.key, e.fa_digest,
         e.gdn_digest, e.ring_digest, spec.rows, spec.cut, header.nbytes, spec.key, header.fa_digest,
         header.gdn_digest, _PUBLISH_N[0],

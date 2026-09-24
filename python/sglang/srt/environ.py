@@ -515,6 +515,17 @@ class Envs:
     # TAIL_ADOPT; any refusal falls back to E1 (extend [c, N)), then to the
     # page resume. 0 = the H21 form.
     SGLANG_WEG2_TAIL_SKIP_EXTEND = EnvBool(True)
+    # TAIL_WAIT_MS (H45, metal fnFL2x150/x151): P's PP ranks write their tail
+    # parts from background threads; D's vote used to read the part list ONCE
+    # at the first prefetch check and fell on a partial manifest (parts=1-2 of
+    # 3 -> 'fa_layer_missing' on TP0 -> extend instead of adoption, flip 3.6-3.9
+    # s instead of ~2 s). D now stages only a COMPLETE manifest (the header
+    # names P's part count) and the group holds the prefetch termination -- the
+    # vote's collective -- until every rank has staged, at most this many ms
+    # after its first check (300 ms while no part exists at all). The hold is a
+    # slot of the existing MAX, never a new collective. 0 = no hold (vote at
+    # the termination on whatever is staged then).
+    SGLANG_WEG2_TAIL_WAIT_MS = EnvInt(1500)
     # DECODE WARM FROM P (fnFL2 H29). P publishes what it saw at the END of
     # the prompt into the hand-off dir (<SGLANG_HICACHE_ARENA_DIR>/handoff):
     # the routed experts of the last LRU_WARM_TOKENS tokens per MoE layer and
