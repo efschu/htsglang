@@ -67,6 +67,7 @@ from typing import (
     Tuple,
 )
 
+from sglang.srt.environ import envs
 from sglang.srt.managers import corridor_guard
 from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import (
@@ -857,6 +858,11 @@ CONTEXT_LENGTH_TOKENS = 262144
 #: D's prefill chunk width.  Named once because it is X's FLOOR (K5): a bound
 #: below one chunk would refuse work D must be able to do to make progress.
 CHUNKED_PREFILL_TOKENS = 4096
+#: P's prefill chunk width (L2 lever, 24.09.): read ONCE at import from the
+#: registered env so the cut solver, the depth funding and argv_p agree; the
+#: TRAIN FIX 5 re-check below still proves that on every boot.  D keeps
+#: CHUNKED_PREFILL_TOKENS (X's floor).
+P_CHUNKED_PREFILL_TOKENS = int(envs.SGLANG_WEG2_P_CHUNKED_PREFILL_TOKENS.get())
 #: WEG2_SCHEDULING_SPEC_0907 C10/K5 -- the RECORDED break-even inputs, used
 #: only when this rig's own logs carry none.  Measured pair from record
 #: 1l/1o (boot weg2zr2, tip 7e3a9150b4): D's realised single-prefill rate at
@@ -2968,7 +2974,8 @@ def common_flags(
         "--hicache-canonical-kv-page",
     ]) + [
         "--host", "127.0.0.1",
-        "--chunked-prefill-size", str(CHUNKED_PREFILL_TOKENS),
+        "--chunked-prefill-size",
+        str(P_CHUNKED_PREFILL_TOKENS if group == "P" else CHUNKED_PREFILL_TOKENS),
         "--scheduler-distributed-teardown",
         "--page-size", "1",
         # #1235: arbitrary and FIXED, which is the whole provenance -- see

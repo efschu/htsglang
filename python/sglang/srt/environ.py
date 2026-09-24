@@ -1636,6 +1636,13 @@ class Envs:
     # attention) and PLE-GATHER-PREFILL (the stage-0 CPU gather). One host sync
     # per forward per rank. The older call sites still read the raw key.
     SGLANG_MOE_OFFLOAD_TIMING = EnvBool(False)
+    # Weg2 launcher: group P's --chunked-prefill-size (tokens). The launcher
+    # names the chunk ONCE (CHUNKED_PREFILL_TOKENS) because the PP-cut solver,
+    # the depth funding and P's argv must all price the same chunk; an argv
+    # override alone (EXTRA_P_ADD) would ship a cut solved for another chunk.
+    # 4096 is the flip form; 8192 is the fn7t best form (L2 lever, 24.09.).
+    # D keeps 4096 (X's floor, K5).
+    SGLANG_WEG2_P_CHUNKED_PREFILL_TOKENS = EnvInt(4096)
     # Device-planned expert pool (SGLANG_MOE_OFFLOAD_GRAPH_MODE=pool): what an
     # EAGER forward (extend, eager first verify) leaves of the decode LRU.
     # True (default): only the LRU rows the eager pass actually WROTE take its
