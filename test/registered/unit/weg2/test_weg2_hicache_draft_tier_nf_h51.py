@@ -512,3 +512,26 @@ def test_nf_launcher_ledger_drops_the_1_83_gib_draft_term(monkeypatch, tmp_path,
     assert on - off == 1922389 * 1024
     assert round((on - off) / (1 << 30), 2) == 1.83
     assert "draft 0 x 1024 B" in caplog.text and "draft 1922389 x 1024 B" in caplog.text
+
+
+def test_nf_w10_skip_line_follows_the_tier(monkeypatch):
+    """The W10/W11 skip line of the x158 form (P carries no drafter) told the
+    reader 'D still asks the carrier for draft pages ... its draft reads
+    miss' -- false under tier off, where D asks for none. Under on (A/B) the
+    old sentence stays byte-identical."""
+    from sglang.srt.weg2 import launcher as L
+
+    form(monkeypatch, group=None, draft_on_p=False)
+    monkeypatch.setitem(L._SPEC_FORM, "draft_kv_on_p", False)
+    off = L.w10_skip_no_producer_line()
+    assert "HICACHE-DRAFT-TIER off" in off and "NO draft pages" in off
+    assert "still asks the carrier" not in off and "draft reads miss" not in off
+    monkeypatch.setenv(TIER_ENV, "on")
+    on = L.w10_skip_no_producer_line()
+    assert on == (
+        "W10/W11 SKIPPED (--draft-kv-on-p off): group P's argv carries no --speculative-* flag, so there is "
+        "no draft-KV producer to grade -- no drafter identity to match against D's and no last-stage draft "
+        "residue to hold against a budget. ROUTE UNDER THIS ARM: group D keeps its own NEXTN head and still "
+        "asks the carrier for draft pages, but group P writes none, so D's draft reads miss and its draft "
+        "state is COLD after every flip. Expect draft_pages=0 on the front's served lines; that is this "
+        "arm, not a carrier fault. KV and Mamba across the flip are untouched.")

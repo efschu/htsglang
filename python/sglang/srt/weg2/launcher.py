@@ -884,6 +884,35 @@ def hicache_draft_tier_line() -> str:
     )
 
 
+def w10_skip_no_producer_line() -> str:
+    """The W10/W11 skip line when group P carries no drafter. Its ROUTE
+    sentence follows the RESOLVED tier (H53): the old text ("D still asks the
+    carrier for draft pages ... its draft reads miss") is false once the draft
+    gets no HiCache space -- D asks for none, so the line must not tell the
+    reader to expect misses that no longer happen."""
+    head = (
+        "W10/W11 SKIPPED (--draft-kv-on-p off): group P's argv carries no --speculative-* flag, so there is "
+        "no draft-KV producer to grade -- no drafter identity to match against D's and no last-stage draft "
+        "residue to hold against a budget. "
+    )
+    if resolve_hicache_draft_tier()[0] == "off":
+        route = (
+            "ROUTE UNDER THIS ARM: HICACHE-DRAFT-TIER off -- group D keeps its own NEXTN head but the draft "
+            "gets no HiCache space, so D asks the carrier for NO draft pages (no draft lookup, no DRAFT-PRESENCE "
+            "probe, no '#993 draft L3 READ') and builds its draft context cold after every flip (#993 zeros + "
+            "1 bootstrap round). Expect draft_pages=0 on the front's served lines; that is this arm, not a "
+            "carrier fault. "
+        )
+    else:
+        route = (
+            "ROUTE UNDER THIS ARM: group D keeps its own NEXTN head and still "
+            "asks the carrier for draft pages, but group P writes none, so D's draft reads miss and its draft "
+            "state is COLD after every flip. Expect draft_pages=0 on the front's served lines; that is this "
+            "arm, not a carrier fault. "
+        )
+    return head + route + "KV and Mamba across the flip are untouched."
+
+
 def spec_form_env(group: str) -> Dict[str, str]:
     """Environment the form needs on one group: D's window pool under DFLASH,
     and (solo placement) the solo host's compact draft cache."""
@@ -15828,12 +15857,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "a drafter identity or a canonical draft layout to match, and no draft pages cross a flip -- the "
             "#1233 route these gates grade is absent by construction (same fact as the W7/W9/W45 skips).")
     elif not ring_table.p_carries_drafter(shipped_argv_p):
-        log("W10/W11 SKIPPED (--draft-kv-on-p off): group P's argv carries no --speculative-* flag, so there is "
-            "no draft-KV producer to grade -- no drafter identity to match against D's and no last-stage draft "
-            "residue to hold against a budget. ROUTE UNDER THIS ARM: group D keeps its own NEXTN head and still "
-            "asks the carrier for draft pages, but group P writes none, so D's draft reads miss and its draft "
-            "state is COLD after every flip. Expect draft_pages=0 on the front's served lines; that is this "
-            "arm, not a carrier fault. KV and Mamba across the flip are untouched.")
+        log(w10_skip_no_producer_line())
     else:
         w10 = check_drafter_identity(spec_p.log, spec_d.log)
         log(f"W10 DRAFTER-IDENTITY P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} layout_D={w10['layout_D']} "
