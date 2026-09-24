@@ -294,6 +294,9 @@ class DRankReference(msgspec.Struct, frozen=True, kw_only=True):
     #: H50: lief die Referenz im H39-Zustand (Dense-Repack ausserhalb der
     #: Tag-Pools, :func:`boot_dense_repack_outside_pool`)?
     dense_repack_outside_pool: bool = False
+    #: H64: die Verify-Form der Referenz-Boots (``None`` = rekurrent, sonst
+    #: die Ringlaenge L des ReplaySSM-Spec-Rings), aus der Wirkung im Log.
+    replayssm_spec_ring_len: Optional[int] = None
 
 
 _TP = r"\[(?:[0-9-]+ [0-9:]+ )?TP(\d+)\]"
@@ -387,6 +390,7 @@ def d_rank_reference_from_logs(
     """
     layer_mib = float(n_layers) * float(slot_bytes) / MIB
     h39 = _boots_dense_repack_state(boots)
+    ring = _boots_replayssm_spec_state(boots)
     fixed: Dict[int, float] = {}
     best: Dict[str, Dict[int, float]] = {
         k: {} for k in ("mamba", "spec", "act", "cell")
@@ -434,6 +438,7 @@ def d_rank_reference_from_logs(
         draft_host_rank=host,
         draft_vocab_held=vocab_held,
         dense_repack_outside_pool=h39,
+        replayssm_spec_ring_len=ring,
     )
 
 
@@ -812,6 +817,9 @@ class DCardReference(msgspec.Struct, frozen=True, kw_only=True):
     draft_vocab_held: bool
     #: H50: lief die Referenz im H39-Zustand (siehe DRankReference)?
     dense_repack_outside_pool: bool = False
+    #: H64: die Verify-Form der Referenz-Boots (``None`` = rekurrent, sonst
+    #: die Ringlaenge L des ReplaySSM-Spec-Rings), aus der Wirkung im Log.
+    replayssm_spec_ring_len: Optional[int] = None
 
 
 def d_card_reference_from_logs(
@@ -835,6 +843,7 @@ def d_card_reference_from_logs(
 
     layer_mib = float(n_layers) * float(slot_bytes) / MIB
     h39 = _boots_dense_repack_state(boots)
+    ring = _boots_replayssm_spec_state(boots)
     best: Dict[int, Tuple[float, object, int]] = {}
     dec: Dict[int, float] = {}
     host = -1
@@ -888,6 +897,7 @@ def d_card_reference_from_logs(
         draft_host_rank=host,
         draft_vocab_held=vocab_held,
         dense_repack_outside_pool=h39,
+        replayssm_spec_ring_len=ring,
     )
 
 
@@ -1172,6 +1182,299 @@ class DResidencyPlan(msgspec.Struct, frozen=True, kw_only=True):
     card_fits: Tuple["DCardFit", ...] = ()
 
 
+# ---------------------------------------------------------------------------
+# 6. (H64) die Verify-Form der D-Gruppe: rekurrent oder ReplaySSM-Spec-Ring
+# ---------------------------------------------------------------------------
+
+#: H64: die Zeile, die ein D-Rang mit dem ReplaySSM-Spec-Ring beim Bau des
+#: Mamba-Pools einmal druckt (``MambaPool``, 27B ReplaySSM S2). Wie bei H39 ist
+#: die Form eines Referenz-Logs die WIRKUNG, nie ein Flag der Argumentzeile.
+REPLAYSSM_SPEC_RING_MARK = "GDN ReplaySSM SPEC ring allocated"
+_RX_SPEC_RING = re.compile(re.escape(REPLAYSSM_SPEC_RING_MARK) + r" \(L=(\d+),")
+
+#: dtype-Namen der Konfiguration/Argumentzeile -> Bytes je Element.
+_DTYPE_BYTES = {"float32": 4, "float16": 2, "bfloat16": 2}
+
+
+def boot_replayssm_spec_ring_len(text: str) -> Optional[int]:
+    """Die Ringlaenge L eines D-Logs mit Spec-Ring, ``None`` = rekurrenter
+    Verify (per-Draft-Zwischenzustaende)."""
+    m = _RX_SPEC_RING.search(text)
+    return int(m.group(1)) if m else None
+
+
+def _boots_replayssm_spec_state(boots: Sequence[Tuple[str, str]]) -> Optional[int]:
+    """Die Verify-Form EINER Referenz. Boots beider Formen (oder zweier
+    Ringlaengen) zu mischen hiesse, das Maximum zweier Allokationen zu nehmen,
+    die sich auf D-TP0 der Next-Flash-Form um ~0,4 GiB unterscheiden -- das
+    wird verweigert, nicht gemittelt (wie H39)."""
+    states = {name: boot_replayssm_spec_ring_len(text) for name, text in boots}
+    if len(set(states.values())) > 1:
+        raise ValueError(
+            "Referenz mischt D-Boots verschiedener Verify-Form ('%s', L): %s"
+            % (REPLAYSSM_SPEC_RING_MARK, states)
+        )
+    return next(iter(states.values()), None)
+
+
+def spec_form_text(ring_len: Optional[int]) -> str:
+    return (
+        "rekurrentem Verify (Zwischenzustand je Draft-Schritt)"
+        if ring_len is None
+        else "ReplaySSM-Spec-Ring L=%d" % int(ring_len)
+    )
+
+
+class ReplaySSMSpecForm(msgspec.Struct, frozen=True, kw_only=True):
+    """H64: was an der Verify-Form der D-Gruppe den Posten 'speculative
+    intermediate state' und die Verify-Allokation bestimmt; gebaut vom
+    Launcher (``d_replayssm_spec_plan_form``), nur unter --d-replayssm-spec on.
+    """
+
+    #: --linear-replayssm-cache-len unter --enable-linear-replayssm-spec;
+    #: ``None`` = rekurrenter Verify.
+    ring_len: Optional[int]
+    #: Das breiteste Verify-Fenster D (NEXTN: --speculative-num-draft-tokens,
+    #: wie D es faehrt; DFLASH: der Block).
+    draft_tokens: int
+    #: D's --max-running-requests. Der Posten zaehlt so viele Zeilen
+    #: (``capped_reqs``), die Allokation eine Padding-Zeile mehr
+    #: (``spec_state_size + 1``).
+    max_running: int
+    #: D's --mamba-ssm-dtype; ``None`` = das des Checkpoints.
+    ssm_dtype: Optional[str] = None
+
+
+class GdnSpecUnitBytes(msgspec.Struct, frozen=True, kw_only=True):
+    """Bytes je GDN-Einheit (1 k-Kopf + r v-Koepfe), Schicht und Request-Zeile:
+    die Laufzeitformeln aus ``configs/mamba_utils.py`` (``mamba_cache_per_req``,
+    ``spec_ring_workspace_bytes_per_req``, ``replayssm_ring_bytes_per_req``) je
+    Einheit, per Test an sie gebunden. Alles skaliert linear mit den Einheiten
+    eines Rangs (uneven GDN-TP teilt in ganzen Einheiten), deshalb sind die
+    Verhaeltnisse unten rang- und schichtfrei."""
+
+    per_req: float
+    #: EIN SSM-Zustand (= ein per-Draft-Zwischenzustand des rekurrenten Verify).
+    ssm: float
+    #: Die Conv-Verify-Fenster; sie bleiben in BEIDEN Formen allokiert.
+    conv_window: float
+    #: Der Ring der Laenge L (d, k, ihre Low-Parts bei 16 Bit, g in fp32);
+    #: 0 fuer den rekurrenten Verify.
+    ring: float
+
+
+def gdn_spec_unit_bytes(
+    text_cfg: Mapping[str, object],
+    *,
+    draft_tokens: int,
+    ring_len: Optional[int],
+    ssm_dtype: Optional[str] = None,
+    act_dtype: Optional[str] = None,
+) -> GdnSpecUnitBytes:
+    """Die Einheits-Bytes aus der Checkpoint-Geometrie (``text_config``).
+
+    Aktivierungs-dtype (Conv-Zustand, Ring-Records) = das Modell-dtype wie in
+    ``mamba2_state_dtype`` (ohne SGLANG_MAMBA_CONV_DTYPE); SSM-dtype = D's
+    --mamba-ssm-dtype, sonst das des Checkpoints, sonst float32.
+    """
+    k = int(text_cfg["linear_key_head_dim"])
+    v = int(text_cfg["linear_value_head_dim"])
+    hv = int(text_cfg["linear_num_value_heads"])
+    h = int(text_cfg["linear_num_key_heads"])
+    if h <= 0 or hv % h:
+        raise ValueError(
+            "GDN-Geometrie: %d v-Koepfe sind kein Vielfaches von %d k-Koepfen" % (hv, h)
+        )
+    r = hv // h
+    kc = int(text_cfg["linear_conv_kernel_dim"])
+    act_name = str(
+        act_dtype or text_cfg.get("dtype") or text_cfg.get("torch_dtype") or "bfloat16"
+    )
+    ssm_name = str(ssm_dtype or text_cfg.get("mamba_ssm_dtype") or "float32")
+    act = _DTYPE_BYTES[act_name]
+    ssm_b = _DTYPE_BYTES[ssm_name]
+    conv_dim = 2 * k + r * v
+    ssm = float(r * v * k * ssm_b)
+    ring = 0.0
+    if ring_len is not None:
+        L = int(ring_len)
+        ring = float(r * L * v * act + L * k * act + r * L * 4)
+        if act != 4:
+            ring += float(r * L * v * act + L * k * act)
+    return GdnSpecUnitBytes(
+        per_req=float(conv_dim * (kc - 1) * act) + ssm,
+        ssm=ssm,
+        conv_window=float(conv_dim * (int(draft_tokens) + kc - 2) * act),
+        ring=ring,
+    )
+
+
+def _spec_post_and_alloc(
+    per_req_mib: float,
+    *,
+    ring_len: Optional[int],
+    form: ReplaySSMSpecForm,
+    unit_of,
+) -> Tuple[float, float]:
+    """(Posten, Verify-Allokation ohne Conv-Fenster) eines Rangs in MiB, fuer
+    die Form ``ring_len``: der Posten wie ``handle_max_mamba_cache`` ihn bucht
+    (``per_req x capped x D`` bzw. ``capped x Ring-Werkraum``), die Allokation
+    wie ``MambaPool`` sie baut (``spec_state_size + 1`` Zeilen)."""
+    u = unit_of(ring_len)
+    cap = int(form.max_running)
+    rows = cap + 1
+    d = int(form.draft_tokens)
+    if ring_len is None:
+        return (
+            per_req_mib * cap * d,
+            per_req_mib * rows * d * u.ssm / u.per_req,
+        )
+    return (
+        per_req_mib * cap * (u.conv_window + u.ring) / u.per_req,
+        per_req_mib * rows * u.ring / u.per_req,
+    )
+
+
+class ReplaySSMSpecRebook(msgspec.Struct, frozen=True, kw_only=True):
+    """H64: je Rang der gemessene Posten der Referenz und was die gefahrene
+    Form bucht (Budget) bzw. allokiert (Karte), MiB -- GERECHNET aus dem
+    gemessenen Referenz-Posten, nicht gemessen."""
+
+    ref_ring_len: Optional[int]
+    ring_len: Optional[int]
+    per_req_mib: Tuple[float, ...]
+    spec_ref_mib: Tuple[float, ...]
+    spec_mib: Tuple[float, ...]
+    alloc_ref_mib: Tuple[float, ...]
+    alloc_mib: Tuple[float, ...]
+
+    @property
+    def freed_mib(self) -> Tuple[float, ...]:
+        """Was die Karte je Rang gegenueber der Referenz-Form gewinnt (MiB)."""
+        return tuple(
+            round(a - b, 1) for a, b in zip(self.alloc_ref_mib, self.alloc_mib)
+        )
+
+
+def replayssm_spec_rebook(
+    *,
+    spec_mib_ref: Sequence[float],
+    ref_ring_len: Optional[int],
+    form: ReplaySSMSpecForm,
+    text_cfg: Mapping[str, object],
+    act_dtype: Optional[str] = None,
+) -> ReplaySSMSpecRebook:
+    """Den Spec-Posten einer Referenz auf die gefahrene Verify-Form umbuchen.
+
+    Der gemessene Posten traegt je Rang ``per_req x capped x D`` (rekurrent)
+    bzw. ``capped x Ring-Werkraum`` (Ring) -- daraus folgt der Zustand je
+    Request ``per_req`` des Rangs (0 auf einem Rang ohne GDN-Koepfe, Form-A-
+    Worker), und aus ihm beide Formen. Vorausgesetzt wie fuer jeden anderen
+    Referenz-Posten: dieselbe D-Form (Fenster, --max-running-requests,
+    SSM-dtype) wie der Boot, den die Referenz vertritt.
+    """
+
+    def unit_of(ring_len):
+        return gdn_spec_unit_bytes(
+            text_cfg,
+            draft_tokens=form.draft_tokens,
+            ring_len=ring_len,
+            ssm_dtype=form.ssm_dtype,
+            act_dtype=act_dtype,
+        )
+
+    cap = int(form.max_running)
+    d = int(form.draft_tokens)
+    if cap <= 0 or d <= 0:
+        raise ValueError(
+            "ReplaySSMSpecForm: --max-running-requests %d, Fenster %d" % (cap, d)
+        )
+    per_req: List[float] = []
+    for s in spec_mib_ref:
+        if ref_ring_len is None:
+            per_req.append(float(s) / (cap * d))
+        else:
+            u = unit_of(ref_ring_len)
+            per_req.append(float(s) / cap * u.per_req / (u.conv_window + u.ring))
+    ref = [
+        _spec_post_and_alloc(p, ring_len=ref_ring_len, form=form, unit_of=unit_of)
+        for p in per_req
+    ]
+    run = [
+        _spec_post_and_alloc(p, ring_len=form.ring_len, form=form, unit_of=unit_of)
+        for p in per_req
+    ]
+    return ReplaySSMSpecRebook(
+        ref_ring_len=ref_ring_len,
+        ring_len=form.ring_len,
+        per_req_mib=tuple(per_req),
+        spec_ref_mib=tuple(float(s) for s in spec_mib_ref),
+        spec_mib=tuple(round(r[0], 1) for r in run),
+        alloc_ref_mib=tuple(round(r[1], 1) for r in ref),
+        alloc_mib=tuple(round(r[1], 1) for r in run),
+    )
+
+
+def replayssm_spec_alloc_mib(
+    *,
+    per_req_mib: Sequence[float],
+    ring_len: Optional[int],
+    form: ReplaySSMSpecForm,
+    text_cfg: Mapping[str, object],
+    act_dtype: Optional[str] = None,
+) -> Tuple[float, ...]:
+    """H64: die Verify-Allokation ohne Conv-Fenster je Rang (MiB) in der Form
+    ``ring_len`` -- fuer die Karte, deren Referenz eine andere Form haben kann
+    als die Budget-Referenz."""
+
+    def unit_of(rl):
+        return gdn_spec_unit_bytes(
+            text_cfg,
+            draft_tokens=form.draft_tokens,
+            ring_len=rl,
+            ssm_dtype=form.ssm_dtype,
+            act_dtype=act_dtype,
+        )
+
+    return tuple(
+        round(
+            _spec_post_and_alloc(
+                float(p), ring_len=ring_len, form=form, unit_of=unit_of
+            )[1],
+            1,
+        )
+        for p in per_req_mib
+    )
+
+
+def describe_spec_rebook(
+    rb: ReplaySSMSpecRebook, *, source: str, form: ReplaySSMSpecForm
+) -> str:
+    return (
+        "REPLAYSSM-SPEC (H64): D faehrt mit %s (Fenster %d, --max-running-requests "
+        "%d, SSM %s), die Referenz %s ist mit %s gemessen -> 'speculative "
+        "intermediate state' je Rang [%s] MiB (Budget), Verify-Allokation ohne "
+        "Conv-Fenster [%s] MiB (Karte, Kopfraum %s MiB) -- GERECHNET aus dem "
+        "gemessenen Referenz-Posten (per_req je Rang %s MiB), nicht gemessen"
+        % (
+            spec_form_text(rb.ring_len),
+            int(form.draft_tokens),
+            int(form.max_running),
+            form.ssm_dtype or "des Checkpoints",
+            source,
+            spec_form_text(rb.ref_ring_len),
+            ", ".join(
+                "%.1f -> %.1f" % (a, b) for a, b in zip(rb.spec_ref_mib, rb.spec_mib)
+            ),
+            ", ".join(
+                "%.1f -> %.1f" % (a, b) for a, b in zip(rb.alloc_ref_mib, rb.alloc_mib)
+            ),
+            ["%+.1f" % x for x in rb.freed_mib],
+            ["%.2f" % p for p in rb.per_req_mib],
+        )
+    )
+
+
 def _env_true(env: Mapping[str, str], name: str) -> bool:
     return str(env.get(name, "")).strip().lower() in _TRUE
 
@@ -1267,6 +1570,7 @@ def plan_d_residency(
     label: str,
     marker: str,
     card_reference_logs: str = "",
+    replayssm_spec: Optional[ReplaySSMSpecForm] = None,
 ) -> DResidencyPlan:
     """Der D-FRACTION-SOLVE mit den Metallregeln, fuer ``launcher``.
 
@@ -1312,6 +1616,46 @@ def plan_d_residency(
             lines=("%s FRACTION-SOLVE %s ENTFAELLT: %s." % (marker, label, why),),
             refusal=None,
         )
+    # H64: der Spec-Posten der Referenz gilt fuer IHRE Verify-Form. Nur wenn
+    # der Launcher eine Form uebergibt (--d-replayssm-spec on), wird er auf die
+    # gefahrene umgebucht; ohne sie (Schalter aus) bleibt die Rechnung
+    # byte-gleich.
+    spec_rebook: Optional[ReplaySSMSpecRebook] = None
+    spec_lines: Tuple[str, ...] = ()
+    act_dtype = str(
+        text_cfg.get("dtype")
+        or text_cfg.get("torch_dtype")
+        or cfg.get("torch_dtype")
+        or cfg.get("dtype")
+        or "bfloat16"
+    )
+    if replayssm_spec is not None:
+        spec_rebook = replayssm_spec_rebook(
+            spec_mib_ref=ref.spec_mib,
+            ref_ring_len=ref.replayssm_spec_ring_len,
+            form=replayssm_spec,
+            text_cfg=text_cfg,
+            act_dtype=act_dtype,
+        )
+        if replayssm_spec.ring_len != ref.replayssm_spec_ring_len:
+            ref = msgspec.structs.replace(ref, spec_mib=spec_rebook.spec_mib)
+            spec_lines = (
+                "%s FRACTION-SOLVE %s %s"
+                % (
+                    marker,
+                    label,
+                    describe_spec_rebook(
+                        spec_rebook, source=ref.source, form=replayssm_spec
+                    ),
+                ),
+            )
+        else:
+            spec_lines = (
+                "%s FRACTION-SOLVE %s REPLAYSSM-SPEC (H64): D faehrt mit %s, die "
+                "Referenz %s ist in derselben Form gemessen -- ihr Posten gilt "
+                "unveraendert"
+                % (marker, label, spec_form_text(replayssm_spec.ring_len), ref.source),
+            )
     share = draft_share_embed(env_d)
     staging = int(str(env_d.get(POOL_STAGING_ENV, "")).strip() or POOL_STAGING_DEFAULT)
     vocab = draft_vocab_mib(
@@ -1372,7 +1716,7 @@ def plan_d_residency(
             dcp_note,
         )
     )
-    lines = (head,) + tuple(
+    lines = (head,) + spec_lines + tuple(
         "%s FRACTION-SOLVE %s %s" % (marker, label, describe_rank(f)) for f in fits
     )
     card_lines, cards, card_refusal = _plan_d_card(
@@ -1387,6 +1731,12 @@ def plan_d_residency(
         label=label,
         marker=marker,
         dense_repack=dense_repack,
+        replayssm_spec=replayssm_spec,
+        spec_per_req_mib=(
+            spec_rebook.per_req_mib if spec_rebook is not None else None
+        ),
+        text_cfg=text_cfg,
+        act_dtype=act_dtype,
     )
     refusals = [t for t in (refusal_text(fits, label=label), card_refusal) if t]
     return DResidencyPlan(
@@ -1476,6 +1826,10 @@ def _plan_d_card(
     label: str,
     marker: str,
     dense_repack: bool = DENSE_REPACK_OUTSIDE_POOL_DEFAULT,
+    replayssm_spec: Optional[ReplaySSMSpecForm] = None,
+    spec_per_req_mib: Optional[Sequence[float]] = None,
+    text_cfg: Optional[Mapping[str, object]] = None,
+    act_dtype: Optional[str] = None,
 ) -> Tuple[Tuple[str, ...], Tuple[DCardFit, ...], Optional[str]]:
     """H33: die Karten-Bilanz neben der Budget-Bilanz. Eine unlesbare Referenz
     verweigert nicht, sie wird benannt (wie H8); verweigert wird nur aus einer
@@ -1502,6 +1856,62 @@ def _plan_d_card(
             ("%s KARTE %s ENTFAELLT: %s." % (marker, label, why),),
             (),
             None,
+        )
+    # H64: die Karten-Referenz misst die Verify-Allokation IHRER Form im Peak
+    # mit. Faehrt D eine andere (--d-replayssm-spec), wird der Kopfraum um den
+    # Unterschied verschoben -- GERECHNET, aus dem Zustand je Request des Rangs
+    # (spec_per_req_mib, hergeleitet aus dem gemessenen Referenz-Posten).
+    shift_line: Tuple[str, ...] = ()
+    if (
+        replayssm_spec is not None
+        and spec_per_req_mib is not None
+        and text_cfg is not None
+        and ref.replayssm_spec_ring_len != replayssm_spec.ring_len
+    ):
+        a_ref = replayssm_spec_alloc_mib(
+            per_req_mib=spec_per_req_mib,
+            ring_len=ref.replayssm_spec_ring_len,
+            form=replayssm_spec,
+            text_cfg=text_cfg,
+            act_dtype=act_dtype,
+        )
+        a_run = replayssm_spec_alloc_mib(
+            per_req_mib=spec_per_req_mib,
+            ring_len=replayssm_spec.ring_len,
+            form=replayssm_spec,
+            text_cfg=text_cfg,
+            act_dtype=act_dtype,
+        )
+        shift = tuple(round(a - b, 1) for a, b in zip(a_ref, a_run))
+        ref = msgspec.structs.replace(
+            ref,
+            headroom0_mib=tuple(
+                round(h + s, 1) for h, s in zip(ref.headroom0_mib, shift)
+            ),
+            # der Peak der Referenz traegt die Verify-Allokation ihrer Form;
+            # gesenkt um den Unterschied, damit 'Kopfraum = cap - peak -
+            # privat_frei' im Druck (describe_card) wahr bleibt.
+            peak_mib=tuple(
+                round(pk - s, 1) for pk, s in zip(ref.peak_mib, shift)
+            ),
+            free_decode0_mib=tuple(
+                None if f is None else round(f + s, 1)
+                for f, s in zip(ref.free_decode0_mib, shift)
+            ),
+        )
+        shift_line = (
+            "%s KARTE %s REPLAYSSM-SPEC (H64): Referenz %s mit %s gemessen, D "
+            "faehrt mit %s -> Verify-Allokation je Rang %s MiB, Kopfraum und "
+            "Decode-frei um %s MiB verschoben -- GERECHNET, nicht gemessen"
+            % (
+                marker,
+                label,
+                ref.source,
+                spec_form_text(ref.replayssm_spec_ring_len),
+                spec_form_text(replayssm_spec.ring_len),
+                ["%.1f -> %.1f" % (a, b) for a, b in zip(a_ref, a_run)],
+                ["%+.1f" % s for s in shift],
+            ),
         )
     floor = float(corridor_band_floor_mib())
     cards = solve_d_card(
@@ -1553,5 +1963,5 @@ def _plan_d_card(
     )
     lines = (head,) + tuple(
         "%s KARTE %s %s" % (marker, label, describe_card(c, ref)) for c in cards
-    )
+    ) + shift_line
     return lines, cards, card_refusal_text(cards, ref, label=label)

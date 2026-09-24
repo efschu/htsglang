@@ -1034,6 +1034,47 @@ def d_replayssm_spec_line() -> str:
     )
 
 
+def d_replayssm_spec_plan_form(ns):
+    """H64 (NF line): group D's verify form for the D planner
+    (``expert_residency.plan_d_residency``: the #145 FRACTION-SOLVE budget and
+    KARTE D) -- ``None`` unless --d-replayssm-spec on, so the default form is
+    priced exactly as before.
+
+    The planner's references (fnFL2x151 + x158, x141 + x144) were measured on
+    the recurrent verify: their 'speculative intermediate state' post and the
+    peak of their card carry the per-draft intermediate states. Without this
+    form the planner would keep booking them under the ring and the freed
+    bytes would never reach the expert-row edge (D's KV is capped at the
+    context on the Next-Flash form, so the edge is where they go).
+
+    Read off the argv D runs: the window (:func:`d_verify_window`),
+    --max-running-requests and --mamba-ssm-dtype as --extra-d ships them (the
+    last value wins, as in argparse), else D's own ``--d-bs`` and the SSM dtype
+    the launcher's early-read flags give the 27B profile; None = the
+    checkpoint's.
+    """
+    if not d_replayssm_spec():
+        return None
+    from sglang.srt.planner.expert_residency import ReplaySSMSpecForm
+
+    extra = str(getattr(ns, "extra_d", "") or "")
+    d_bs = int(getattr(ns, "d_bs", DEFAULT_D_BS) or DEFAULT_D_BS)
+    raw_mrr = _argv_scalar(extra, "--max-running-requests")
+    try:
+        mrr = int(str(raw_mrr)) if raw_mrr is not None else d_bs
+    except ValueError:
+        mrr = d_bs
+    ssm = _argv_scalar(extra, "--mamba-ssm-dtype")
+    if ssm is None and getattr(ns, "profile", None) == PROFILE_QWEN27B:
+        ssm = _argv_scalar(" ".join(early_read_flags("D")), "--mamba-ssm-dtype")
+    return ReplaySSMSpecForm(
+        ring_len=d_replayssm_spec_ring_len(),
+        draft_tokens=d_verify_window(),
+        max_running=max(1, mrr),
+        ssm_dtype=ssm,
+    )
+
+
 def spec_plan_fields() -> Dict[str, object]:
     """The PlanInputs fields of the form (d_plan_inputs)."""
     ring = (
@@ -11183,6 +11224,9 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             marker=D_RANK_SOLVE_MARKER,
             # H33: die KARTEN-Bilanz (Posten ausserhalb des Budgets, W130).
             card_reference_logs=getattr(ns, "d_card_reference_logs", "") or "",
+            # H64 (NF): die Verify-Form der D-Gruppe; None unter
+            # --d-replayssm-spec off -- die Rechnung bleibt dann byte-gleich.
+            replayssm_spec=d_replayssm_spec_plan_form(ns),
         )
     except (OSError, KeyError, ValueError, _pp_cut.DraftResidencyUnavailable) as _exc:
         # Eine UNLESBARE Geometrie/Referenz verweigert nicht den Boot, sie wird
@@ -13104,7 +13148,10 @@ def build_parser() -> argparse.ArgumentParser:
              "D-REPLAYSSM-SPEC line has passed) leaves argv_d byte-identical. Group "
              "P never gets it (P runs no target verify). NF line (H64): the draft "
              "window is group D's --speculative-num-draft-tokens as --extra-d ships "
-             "it (the Next-Flash MTP runs 4 over the constants' 3).")
+             "it (the Next-Flash MTP runs 4 over the constants' 3); the D planner "
+             "(#145 FRACTION-SOLVE and KARTE D) books the ring's post and verify "
+             "allocation instead of the recurrent references' -- D's KV is capped at "
+             "the context there, so the freed bytes reach the expert-row edge.")
     ap.add_argument(
         "--transport", choices=["bar1", "nccl"], default="bar1",
         help="Collective transport for BOTH groups. 'bar1' is the shipping "
