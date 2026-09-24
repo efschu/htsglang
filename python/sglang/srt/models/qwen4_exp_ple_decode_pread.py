@@ -54,6 +54,41 @@ Device: two int32 counters. Proof line every ``..._LOG_EVERY`` rounds::
 from the stage (device counter, counts every staged-kernel gather since the
 last line) -- the second one proves the host hash mirrors the model's.
 ``SGLANG_QWEN4_PLE_DECODE_PREAD=0`` keeps the plain kernel in the graph.
+
+fnFL2 H69 -- THE STAGE BEHIND THE REPLAY (``SGLANG_WEG2_PLE_STAGE_BEHIND_REPLAY``).
+x168 (DECODE-HOST-SPLIT, TP0, 64-round medians): the device round tiles as
+draft 1.9 + gap_ple 1.7 + verify 21.2 + accept 0.1 + dext 0.9 ms with
+gap_round 0.0 -- the ONLY idle stretch of the round is the one this module
+opens: the host waits for the draft's tokens, hashes, preads and only then
+launches the verify, and the workers wait for it in the verify's first
+all-reduce. Every other host wait of the round (ctl_wait 8-10 ms, the
+workers' seq_wait/recv) is slack: the device is busy while it lasts.
+
+The rows are read by layer 1 (``ple_layer_ids == [2]``) through the prefetch
+stream that forks at layer 0, so they are not needed when the verify STARTS,
+only one decoder layer later. With the switch on, a graphed verify round
+runs in this order instead:
+
+* ``arm_ple_verify_gate`` (before the forward): the round gets a number
+  ``seq`` and a stream-ordered ``expect <- seq`` lands on the device;
+* the verify graph is launched while the draft may still be running; its
+  prefetch stream runs :func:`_ple_stage_gate_kernel` (one warp) that spins
+  on the host's ``done`` word -- page-locked, in the stage's own memfd --
+  until ``done >= expect``, bounded; decoder layer 0 runs meanwhile on the
+  forward stream;
+* the host stages the round exactly as before (``finish_ple_verify_stage``,
+  called from the model runner's post-replay hook right after the graph
+  launch) and then publishes ``done <- seq``;
+* :func:`_gather_ple_embedding_gated_kernel` takes stage rows only when the
+  gate passed; a gate that timed out sends every row through HMM (bytes
+  unchanged, it only costs time), and the kernel never touches a stage the
+  host may still be writing;
+* ``disarm_ple_verify_gate`` (after the forward): ``expect <- -1``, so any
+  later gather that is not an armed verify reads through HMM as well.
+
+Eager verify rounds keep the H40 order (stage, publish, then launch) -- the
+gate is passed before the kernel starts. ``gate_pass``/``gate_timeout`` on
+the proof line count the gate's outcomes.
 """
 
 from __future__ import annotations
@@ -87,14 +122,25 @@ _CUDA_HOST_REGISTER_PORTABLE_MAPPED = 3
 _MASK64 = (1 << 64) - 1
 _SIGN64 = 1 << 63
 _WRAP32 = 1 << 32
+#: fnFL2 H69: the gate block behind the stage ids (the ``done`` word, padded
+#: to a cache line); only a gated stage has it.
+_GATE_BYTES = 64
+#: fnFL2 H69: the gate's poll bound per microsecond of host budget, and its
+#: floor (see ``ple_gate_spins``).
+_GATE_SPINS_PER_US = 4
+_GATE_SPINS_MIN = 4096
 
 __all__ = [
     "PLE_DECODE_STAGE_ROWS",
     "PleDecodeStager",
     "PleHashParamsPy",
+    "arm_ple_verify_gate",
     "begin_ple_verify_stage",
+    "disarm_ple_verify_gate",
     "finish_ple_verify_stage",
     "make_ple_decode_stager",
+    "ple_gate_spins",
+    "ple_stage_is_gated",
     "ple_verify_row_ids",
 ]
 
@@ -230,6 +276,100 @@ def _gather_ple_embedding_staged_kernel(
     tl.atomic_add(counters_ptr + 1, hit.to(tl.int32))
 
 
+@triton.jit
+def _ple_stage_gate_kernel(
+    expect_ptr,
+    done_addr_ptr,
+    go_ptr,
+    gate_counters_ptr,
+    MAX_SPINS: tl.constexpr,
+):
+    """fnFL2 H69: one program (launch it with ``num_warps=1``) in front of
+    :func:`_gather_ple_embedding_gated_kernel` on the same stream.
+
+    ``expect_ptr`` = the round the verify was armed for (device int64, -1 =
+    not armed), ``done_addr_ptr`` = [host address of the stage's ``done``
+    word] (int64, page-locked, written by the host after the round's rows and
+    ids). Spins on ``done`` until it reaches ``expect`` or ``MAX_SPINS`` polls
+    passed, then writes ``go_ptr`` (int32: 1 = the stage holds this round) and
+    counts [passed, timed out] in ``gate_counters_ptr``. Not armed: no poll,
+    ``go`` 0, nothing counted."""
+    expect = tl.load(expect_ptr)
+    armed = expect >= 0
+    done_ptr = tl.load(done_addr_ptr).to(tl.pointer_type(tl.int64))
+    done = tl.load(done_ptr, volatile=True)
+    spins = (expect * 0).to(tl.int32)  # a scalar tensor: the loop carries it
+    while armed & (done < expect) & (spins < MAX_SPINS):
+        done = tl.load(done_ptr, volatile=True)
+        spins += 1
+    go = armed & (done >= expect)
+    tl.store(go_ptr, go.to(tl.int32))
+    tl.atomic_add(gate_counters_ptr, go.to(tl.int32))
+    tl.atomic_add(gate_counters_ptr + 1, (armed & (done < expect)).to(tl.int32))
+
+
+@triton.jit
+def _gather_ple_embedding_gated_kernel(
+    bases_ptr,
+    shard_rows,
+    ids_ptr,
+    stage_addrs_ptr,
+    go_ptr,
+    counters_ptr,
+    output_ptr,
+    embedding_dim,
+    tp_vocab_start,
+    tp_vocab_end,
+    is_fp8: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """fnFL2 H69: :func:`_gather_ple_embedding_staged_kernel` behind the gate.
+    The stage is read only when ``go_ptr`` (written by
+    :func:`_ple_stage_gate_kernel` just before, same stream) says the host
+    finished this round; otherwise every row comes from the table (HMM) and
+    the stage -- which the host may still be writing -- is not touched."""
+    row_id = tl.program_id(0)
+    global_idx = tl.load(ids_ptr + row_id).to(tl.int64)
+    in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
+    go = tl.load(go_ptr) != 0
+    stage_ids_addr = tl.load(stage_addrs_ptr)
+    stage_rows_addr = tl.load(stage_addrs_ptr + 1)
+    staged_idx = tl.load(
+        stage_ids_addr.to(tl.pointer_type(tl.int64)) + row_id, mask=go, other=-1
+    )
+    hit = in_range & go & (staged_idx == global_idx)
+    safe_idx = tl.where(in_range, global_idx, 0)
+    shard = safe_idx // shard_rows
+    local = safe_idx - shard * shard_rows
+    base = tl.load(bases_ptr + shard)
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < embedding_dim
+    if is_fp8:
+        weight_ptr = base.to(tl.pointer_type(tl.float8e4nv))
+        stage_ptr = stage_rows_addr.to(tl.pointer_type(tl.float8e4nv))
+    else:
+        weight_ptr = base.to(tl.pointer_type(tl.bfloat16))
+        stage_ptr = stage_rows_addr.to(tl.pointer_type(tl.bfloat16))
+    from_table = tl.load(
+        weight_ptr + local * embedding_dim + offsets,
+        mask=mask & in_range & (~hit),
+        other=0.0,
+    ).to(tl.bfloat16)
+    from_stage = tl.load(
+        stage_ptr + row_id * embedding_dim + offsets,
+        mask=mask & hit,
+        other=0.0,
+    ).to(tl.bfloat16)
+    values = tl.where(hit, from_stage, from_table)
+    tl.store(
+        output_ptr + row_id * embedding_dim + offsets,
+        tl.where(in_range, values, 0.0),
+        mask=mask,
+    )
+    tl.atomic_add(counters_ptr, in_range.to(tl.int32))
+    tl.atomic_add(counters_ptr + 1, hit.to(tl.int32))
+
+
 # --------------------------------------------------------------------------
 # The stage and its workers.
 # --------------------------------------------------------------------------
@@ -254,10 +394,16 @@ class PleDecodeStager:
         delay_s: float = 0.0,
         capacity: int = PLE_DECODE_STAGE_ROWS,
         device: Optional[torch.device] = None,
+        gated: bool = False,
+        gate_spins: int = _GATE_SPINS_MIN,
     ) -> None:
         global _LIVE_STAGERS
         if not table.shard_files or len(table.shard_offsets) != len(table.bases):
             raise ValueError("checkpoint PLE table carries no per-shard file map")
+        # fnFL2 H69: a gated stage carries the ``done`` word and launches the
+        # gate + gated kernel pair (module docstring); set once, never flipped
+        self._gated = bool(gated)
+        self._gate_spins = max(1, int(gate_spins))
         self._table = table
         self._params_fn = params_fn
         self._params: Optional[PleHashParamsPy] = None
@@ -272,10 +418,14 @@ class PleDecodeStager:
         self._delay_s = float(delay_s)
         self.capacity = int(capacity)
         self._rb = int(table.row_bytes)
-        self._nbytes = self.capacity * (self._rb + 8)
+        self._nbytes = self.capacity * (self._rb + 8) + (_GATE_BYTES if self._gated else 0)
         self._fd: Optional[int] = None
         self._region: Optional[torch.Tensor] = None
         self._stage_ids: Optional[torch.Tensor] = None
+        #: fnFL2 H69: the page-locked ``done`` word (int64 view), gated only
+        self._done: Optional[torch.Tensor] = None
+        #: fnFL2 H69: per device (expect, go, gate counters, [done address])
+        self._gate_dev: dict = {}
         self._pinned = False
         self._host_failed = False
         self._workers: Optional[PlePreadProcs] = None
@@ -299,6 +449,10 @@ class PleDecodeStager:
         pin = torch.cuda.is_available()
         self._ctr_host = torch.zeros(2, dtype=torch.int32, pin_memory=pin)
         self._ctr_seen: Optional[tuple] = None
+        self._gate_ctr_host: Optional[torch.Tensor] = (
+            torch.zeros(2, dtype=torch.int32, pin_memory=pin) if self._gated else None
+        )
+        self._gate_ctr_seen: Optional[tuple] = None
         self._win = self._new_window()
         self.stats = {"rounds": 0, "rows": 0, "hit": 0, "late": 0, "wait_s": 0.0}
         _LIVE_STAGERS += 1
@@ -307,6 +461,16 @@ class PleDecodeStager:
     @property
     def active(self) -> bool:
         return not self._disabled and not self._host_failed
+
+    @property
+    def gated(self) -> bool:
+        """fnFL2 H69: this stage is filled behind the verify replay."""
+        return self._gated
+
+    @property
+    def done_word(self) -> Optional[torch.Tensor]:
+        """fnFL2 H69: the page-locked ``done`` word the gate polls (gated)."""
+        return self._done
 
     @property
     def stage_ids(self) -> Optional[torch.Tensor]:
@@ -342,6 +506,25 @@ class PleDecodeStager:
                 self._ctr_device = key
         return st
 
+    def _gate_state(self, device: torch.device, *, capturing: bool) -> Optional[tuple]:
+        """fnFL2 H69: (expect int64[1], go int32[1], gate counters int32[2],
+        [done address] int64[1]) on ``device``, made like ``_device_state``
+        by the first NON-capturing launch; ``expect`` starts at -1 (a gather
+        before the first armed verify reads through HMM)."""
+        key = str(device)
+        st = self._gate_dev.get(key)
+        if st is None:
+            if capturing or self._done is None:
+                return None
+            st = (
+                torch.full((1,), -1, dtype=torch.int64, device=device),
+                torch.zeros(1, dtype=torch.int32, device=device),
+                torch.zeros(2, dtype=torch.int32, device=device),
+                torch.tensor([self._done.data_ptr()], dtype=torch.int64, device=device),
+            )
+            self._gate_dev[key] = st
+        return st
+
     def params(self) -> PleHashParamsPy:
         if self._params is None:
             self._params = PleHashParamsPy.of(self._params_fn())
@@ -365,8 +548,13 @@ class PleDecodeStager:
             region = torch.from_file(
                 f"/proc/self/fd/{fd}", shared=True, size=self._nbytes, dtype=torch.uint8
             )
-            ids = region[self.capacity * self._rb :].view(torch.int64)
+            ids_end = self.capacity * (self._rb + 8)
+            ids = region[self.capacity * self._rb : ids_end].view(torch.int64)
             ids.fill_(-1)
+            if self._gated:
+                # fnFL2 H69: no round published yet (seqs start at 1)
+                self._done = region[ids_end : ids_end + 8].view(torch.int64)
+                self._done.fill_(0)
             if torch.cuda.is_available():
                 rc = int(
                     torch.cuda.cudart().cudaHostRegister(
@@ -444,6 +632,7 @@ class PleDecodeStager:
                 torch.cuda.cudart().cudaHostUnregister(self._region.data_ptr())
             self._region = None
             self._stage_ids = None
+            self._done = None
         if self._fd is not None:
             os.close(self._fd)
             self._fd = None
@@ -470,11 +659,22 @@ class PleDecodeStager:
         if st is None:
             return False
         addrs, counters = st
+        gate = None
+        if self._gated:
+            gate = self._gate_state(flat_ids.device, capturing=capturing)
+            if gate is None:
+                return False
         if capturing:
             # the graph is built before the first round: start the workers
             # now, not inside the first decode round after a flip
             self._ensure_workers()
         table = self._table
+        if gate is not None:
+            self._launch_gated(
+                flat_ids, output, addrs, counters, gate,
+                vocab_start=vocab_start, vocab_end=vocab_end, block_d=block_d,
+            )
+            return True
         _gather_ple_embedding_staged_kernel[(n,)](
             table.bases_on(flat_ids.device),
             table.shard_rows,
@@ -490,12 +690,58 @@ class PleDecodeStager:
         )
         return True
 
+    def _launch_gated(
+        self, flat_ids, output, addrs, counters, gate, *, vocab_start, vocab_end, block_d
+    ) -> None:
+        """fnFL2 H69: the gate (one warp) then the gated gather, one stream."""
+        expect, go, gate_counters, done_addr = gate
+        table = self._table
+        _ple_stage_gate_kernel[(1,)](
+            expect, done_addr, go, gate_counters, MAX_SPINS=self._gate_spins, num_warps=1,
+        )
+        _gather_ple_embedding_gated_kernel[(int(flat_ids.numel()),)](
+            table.bases_on(flat_ids.device),
+            table.shard_rows,
+            flat_ids,
+            addrs,
+            go,
+            counters,
+            output,
+            embedding_dim=table.embedding_dim,
+            tp_vocab_start=vocab_start,
+            tp_vocab_end=vocab_end,
+            is_fp8=table.dtype == torch.float8_e4m3fn,
+            BLOCK_D=block_d,
+        )
+
+    # -- the gate (fnFL2 H69) ----------------------------------------------------
+    def arm_gate(self, seq: int) -> None:
+        """Stream-ordered ``expect <- seq`` before the verify is launched: its
+        gate waits for ``done >= seq``."""
+        for expect, _, _, _ in self._gate_dev.values():
+            expect.fill_(int(seq))
+
+    def publish(self, seq: int) -> None:
+        """Host side, after the round's rows and ids are written: ``done <- seq``
+        (the gate's release). A plain int64 store into page-locked memory."""
+        if self._done is not None:
+            self._done[0] = int(seq)
+
+    def disarm_gate(self) -> None:
+        """Stream-ordered ``expect <- -1`` after the verify: a later gather that
+        is not an armed verify reads through HMM."""
+        for expect, _, _, _ in self._gate_dev.values():
+            expect.fill_(-1)
+
     # -- the round ---------------------------------------------------------------
     def snapshot_counters(self) -> None:
         """Stream-ordered copy of the kernel counters (read after the event)."""
         c = self.counters
         if c is not None:
             self._ctr_host.copy_(c, non_blocking=c.is_cuda)
+        g = self._gate_dev.get(self._ctr_device)
+        if g is not None and self._gate_ctr_host is not None:
+            self._gate_ctr_host.copy_(g[2], non_blocking=g[2].is_cuda)
 
     def stage(self, ctx_rows: Sequence[Sequence[int]], *, sync_s: float, t_ready: float) -> None:
         """Fill the stage with this round's rows. Must run while no kernel
@@ -574,16 +820,29 @@ class PleDecodeStager:
             return now
         return tuple((a - b) % _WRAP32 for a, b in zip(now, prev))
 
+    def _gate_delta(self) -> tuple:
+        now = tuple(int(x) for x in self._gate_ctr_host.tolist())
+        prev, self._gate_ctr_seen = self._gate_ctr_seen, now
+        if prev is None:
+            return now
+        return tuple((a - b) % _WRAP32 for a, b in zip(now, prev))
+
     def _log_window(self, procs: int) -> None:
         win = self._win
         k_rows, k_hit = self._kernel_delta()
         r = max(1, win["rounds"])
+        gate = ""
+        if self._gated:
+            # fnFL2 H69: the gates since the last line that found the round
+            # staged / gave up (their gather read every row through HMM)
+            g_pass, g_timeout = self._gate_delta()
+            gate = " gate_pass=%d gate_timeout=%d" % (g_pass, g_timeout)
         logger.info(
             "PLE-DECODE-PREAD rounds=%d rows=%d hit=%d late=%d kernel_rows=%d "
-            "kernel_hit=%d wait_ms=%.2f wait_max_ms=%.2f read_ms=%.2f sync_ms=%.2f procs=%d",
+            "kernel_hit=%d wait_ms=%.2f wait_max_ms=%.2f read_ms=%.2f sync_ms=%.2f procs=%d%s",
             win["rounds"], win["rows"], win["hit"], win["late"], k_rows, k_hit,
             win["wait_s"] * 1000.0 / r, win["wait_max_s"] * 1000.0,
-            win["read_s"] * 1000.0 / r, win["sync_s"] * 1000.0 / r, procs,
+            win["read_s"] * 1000.0 / r, win["sync_s"] * 1000.0 / r, procs, gate,
         )
         self._win = self._new_window()
 
@@ -600,6 +859,7 @@ def make_ple_decode_stager(
     default on); None when the switch is off or the layer has no host hash."""
     if table is None or params_fn is None or not envs.SGLANG_QWEN4_PLE_DECODE_PREAD.get():
         return None
+    budget_ms = envs.SGLANG_QWEN4_PLE_DECODE_PREAD_BUDGET_MS.get()
     return PleDecodeStager(
         table,
         params_fn,
@@ -607,10 +867,20 @@ def make_ple_decode_stager(
         vocab_end=vocab_end,
         procs=envs.SGLANG_QWEN4_PLE_DECODE_PREAD_PROCS.get(),
         threads=envs.SGLANG_QWEN4_PLE_DECODE_PREAD_THREADS.get(),
-        budget_s=envs.SGLANG_QWEN4_PLE_DECODE_PREAD_BUDGET_MS.get() / 1000.0,
+        budget_s=budget_ms / 1000.0,
         log_every=envs.SGLANG_QWEN4_PLE_DECODE_PREAD_LOG_EVERY.get(),
         device=device,
+        gated=envs.SGLANG_WEG2_PLE_STAGE_BEHIND_REPLAY.get(),
+        gate_spins=ple_gate_spins(budget_ms),
     )
+
+
+def ple_gate_spins(budget_ms: float) -> int:
+    """fnFL2 H69: the gate's poll bound for a host budget of ``budget_ms``.
+    A poll of page-locked host memory over PCIe takes about a microsecond, so
+    the gate waits up to ~``_GATE_SPINS_PER_US`` x the budget -- the host's own
+    bound on the stage -- before its gather falls back to HMM."""
+    return max(_GATE_SPINS_MIN, int(float(budget_ms) * 1000.0 * _GATE_SPINS_PER_US))
 
 
 # --------------------------------------------------------------------------
@@ -622,10 +892,14 @@ class PleVerifyStage(NamedTuple):
     stagers: tuple
     ctx_host: torch.Tensor
     event: Optional[object]
+    #: fnFL2 H69: the round number the gates were armed for (-1 = not armed)
+    seq: int = -1
 
 
 _MODEL_EMBEDDINGS: dict = {}
 _CTX_HOST: dict = {}
+#: fnFL2 H69: the last armed round (process-wide, monotone; ``done`` starts at 0)
+_GATE_SEQ = 0
 
 
 def _stagers_of(model) -> List[PleDecodeStager]:
@@ -690,20 +964,62 @@ def begin_ple_verify_stage(model, pool, batch, verify_input) -> Optional[PleVeri
     return PleVerifyStage(tuple(stagers), host, event)
 
 
-def finish_ple_verify_stage(stage: Optional[PleVerifyStage]) -> None:
-    """Right before the verify forward: wait for the draft's tokens, stage
-    their PLE rows (bounded by the budget)."""
+def finish_ple_verify_stage(stage: Optional[PleVerifyStage]) -> float:
+    """Right before the verify forward (fnFL2 H69, gated and graphed: right
+    after its launch): wait for the draft's tokens, stage their PLE rows
+    (bounded by the budget); an armed round then publishes ``done``. Returns
+    the host seconds it took (0.0 without a stage)."""
     if stage is None:
-        return
+        return 0.0
     t0 = time.monotonic()
     # fnFL2 H58: ple_sync (the wait for the draft) and ple_stage (hash + pread
     # while the stream idles) of DECODE-HOST-SPLIT; timing only.
     h58_t = time.perf_counter()
-    if stage.event is not None:
-        stage.event.synchronize()
-    t_ready = time.monotonic()
-    h58_t = _h58_span("ple_sync_ms", h58_t)
-    rows = stage.ctx_host.tolist()
+    try:
+        if stage.event is not None:
+            stage.event.synchronize()
+        t_ready = time.monotonic()
+        h58_t = _h58_span("ple_sync_ms", h58_t)
+        rows = stage.ctx_host.tolist()
+        for st in stage.stagers:
+            st.stage(rows, sync_s=t_ready - t0, t_ready=t_ready)
+        _h58_span("ple_stage_ms", h58_t)
+    finally:
+        if stage.seq >= 0:
+            # fnFL2 H69: released even when staging failed -- the ids say
+            # -1 for what is not there, so the gather is right either way,
+            # and a gate never waits out its bound for a round that is over
+            for st in stage.stagers:
+                st.publish(stage.seq)
+    return time.monotonic() - t0
+
+
+def ple_stage_is_gated(stage: Optional[PleVerifyStage]) -> bool:
+    """fnFL2 H69: whether this round's stage sits behind a device gate."""
+    return stage is not None and any(st.gated for st in stage.stagers)
+
+
+def arm_ple_verify_gate(stage: Optional[PleVerifyStage]) -> Optional[PleVerifyStage]:
+    """fnFL2 H69, before the verify forward is launched: number the round and
+    put ``expect <- seq`` on the stream, so the verify's gate waits for this
+    round's ``done``. Returns the stage carrying its ``seq`` (unchanged when
+    it is not gated: no stage, switch off)."""
+    global _GATE_SEQ
+    if not ple_stage_is_gated(stage):
+        return stage
+    _GATE_SEQ += 1
+    seq = _GATE_SEQ
     for st in stage.stagers:
-        st.stage(rows, sync_s=t_ready - t0, t_ready=t_ready)
-    _h58_span("ple_stage_ms", h58_t)
+        if st.gated:
+            st.arm_gate(seq)
+    return stage._replace(seq=seq)
+
+
+def disarm_ple_verify_gate(stage: Optional[PleVerifyStage]) -> None:
+    """fnFL2 H69, after the verify forward was launched: ``expect <- -1`` on
+    the stream, behind the verify."""
+    if stage is None or stage.seq < 0:
+        return
+    for st in stage.stagers:
+        if st.gated:
+            st.disarm_gate()

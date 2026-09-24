@@ -784,6 +784,16 @@ class Envs:
     SGLANG_QWEN4_PLE_DECODE_PREAD_THREADS = EnvInt(4)
     SGLANG_QWEN4_PLE_DECODE_PREAD_BUDGET_MS = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_DECODE_PREAD_LOG_EVERY = EnvInt(32)
+    # fnFL2 H69 (D, graphed verify rounds): the H40 stage is filled AFTER the
+    # verify graph was launched instead of before it. The graph starts right
+    # behind the draft; a one-warp gate kernel on the PLE prefetch stream
+    # waits (bounded) for the host's "round staged" word while decoder layer
+    # 0 runs on the forward stream, and the staged gather then reads the
+    # stage (gate timed out: every row through HMM, bytes unchanged). Takes
+    # the host's event wait + hash + pread (x168: gpu_gap_ple 1.7 ms per
+    # round, all three cards idle) off the device's critical path. Off = the
+    # H40 order and the H40 kernel, byte-identical.
+    SGLANG_WEG2_PLE_STAGE_BEHIND_REPLAY = EnvBool(False)
     # fnFL2 H43: the FIRST chunk's gather starts at the request's admission
     # (scheduler intake, or the front's hint while P still sleeps) into a third
     # shared slot, whenever the H32 ring is idle. Off = H32 alone. Never on

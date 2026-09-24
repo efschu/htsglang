@@ -78,6 +78,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
 )
 from sglang.srt.model_executor.runner import graph_replay_census
+from sglang.srt.model_executor.runner import post_replay_hook
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.utils.collective_clock import collective_clock
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
@@ -2476,6 +2477,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # after an eager round lives -- census the inputs it reads.
             graph_replay_census.maybe_census(self, forward_batch)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            # fnFL2 H69: host work the caller parked for "right after the
+            # launch" (the verify round's PLE stage, gated on the device);
+            # one truth test when nothing is armed.
+            post_replay_hook.fire(self.model_runner)
             if read_done_post_replay:
                 read_done = self.device_module.Event()
                 read_done.record()

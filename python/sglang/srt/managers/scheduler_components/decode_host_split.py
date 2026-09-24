@@ -129,6 +129,7 @@ __all__ = [
     "SPLIT",
     "SplitCounters",
     "active_split",
+    "exclude_span",
     "mark",
     "note_span",
     "register_active",
@@ -184,6 +185,16 @@ def note_span(name: str, t0: float, count: Optional[str] = None) -> float:
     if count is not None:
         setattr(SPLIT, count, getattr(SPLIT, count) + 1.0)
     return t1
+
+
+def exclude_span(name: str, ms: float) -> None:
+    """Take ``ms`` back out of ``SPLIT.<name>``: time that ran NESTED inside
+    that span and is already counted under its own names. fnFL2 H69: with
+    ``SGLANG_WEG2_PLE_STAGE_BEHIND_REPLAY`` the PLE stage (``ple_sync`` +
+    ``ple_stage``) runs inside the verify ``launch``, and ``verify = vprep +
+    ple_sync + ple_stage + launch + accept`` stays a partition only if it is
+    counted once."""
+    setattr(SPLIT, name, getattr(SPLIT, name) - float(ms))
 
 
 def timed(name: str, count: Optional[str] = None):

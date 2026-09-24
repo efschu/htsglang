@@ -84,9 +84,13 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
+from sglang.srt.model_executor.runner import post_replay_hook
 from sglang.srt.models.qwen4_exp_ple_decode_pread import (
+    arm_ple_verify_gate,
     begin_ple_verify_stage,
+    disarm_ple_verify_gate,
     finish_ple_verify_stage,
+    ple_stage_is_gated,
 )
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
@@ -304,6 +308,27 @@ def _get_plan_stream(
         return plan_stream, plan_stream_ctx
     else:
         return None, contextlib.nullcontext()
+
+
+_PLE_UNFIRED_WARNED = False
+
+
+def _stage_ple_unfired(late) -> None:
+    """fnFL2 H69: the verify's PLE stage was parked for the post-replay hook,
+    but no graph replay ran it (the forward went eager after all, or raised).
+    Stage now -- this also publishes the round, so a gate still waiting on
+    the device is released; if it already gave up, its gather read every row
+    through HMM (same bytes, only slower)."""
+    global _PLE_UNFIRED_WARNED
+    if late is None:
+        return
+    if not _PLE_UNFIRED_WARNED:
+        _PLE_UNFIRED_WARNED = True
+        logger.warning(
+            "PLE-STAGE-BEHIND-REPLAY: a graphed verify round reached no graph "
+            "replay; its PLE stage ran after the forward (logged once)"
+        )
+    late()
 
 
 def _spec_trace_rounds() -> int:
@@ -3641,20 +3666,46 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # fnFL2 H40: stage the round's PLE rows (pread workers) so the verify
         # gather reads them from host memory instead of faulting them in
         _h58.note_span("vprep_ms", _h58_t)
-        finish_ple_verify_stage(ple_stage)
-        _h58_t = time.perf_counter()
-        with _module_sync_window(
-            self.target_worker.model_runner.model, active=eager_round
-        ):
-            _h58.mark(_h58.MARK_VERIFY_LAUNCH)
-            forward_batch_output = self.target_worker.forward_batch_generation(
-                batch=None,
-                forward_batch=verify_forward_batch,
-                is_verify=True,
+        # fnFL2 H69 (SGLANG_WEG2_PLE_STAGE_BEHIND_REPLAY): a gated stage is
+        # armed first. A graphed round then stages it from the post-replay
+        # hook -- the verify graph already running behind the draft, its gate
+        # holding only layer 1's PLE gather -- and an eager round stages it
+        # here, before the launch, as H40 does.
+        ple_stage = arm_ple_verify_gate(ple_stage)
+        ple_runner = self.target_worker.model_runner
+        ple_behind = (
+            ple_stage_is_gated(ple_stage) and can_run_cuda_graph and not eager_round
+        )
+        ple_hook_s: List[float] = []
+        if ple_behind:
+            post_replay_hook.arm(
+                ple_runner,
+                lambda: ple_hook_s.append(finish_ple_verify_stage(ple_stage)),
             )
-            _h58.mark(_h58.MARK_VERIFY_END)
+        else:
+            finish_ple_verify_stage(ple_stage)
+        _h58_t = time.perf_counter()
+        try:
+            with _module_sync_window(
+                self.target_worker.model_runner.model, active=eager_round
+            ):
+                _h58.mark(_h58.MARK_VERIFY_LAUNCH)
+                forward_batch_output = self.target_worker.forward_batch_generation(
+                    batch=None,
+                    forward_batch=verify_forward_batch,
+                    is_verify=True,
+                )
+                _h58.mark(_h58.MARK_VERIFY_END)
+        finally:
+            if ple_behind:
+                _stage_ple_unfired(post_replay_hook.disarm(ple_runner))
+            disarm_ple_verify_gate(ple_stage)
         _stage_sync("verify-forward")
         _h58_t = _h58.note_span("launch_ms", _h58_t)
+        if ple_hook_s:
+            # H69: the stage ran nested in the launch and is already counted
+            # as ple_sync + ple_stage
+            _h58.exclude_span("launch_ms", 1000.0 * sum(ple_hook_s))
         logits_output = forward_batch_output.logits_output
 
         # Generate vocab mask for constrained decoding
