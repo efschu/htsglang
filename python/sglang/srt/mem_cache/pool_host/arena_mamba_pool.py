@@ -27,7 +27,13 @@ from typing import Optional, Sequence
 import torch
 
 from sglang.srt.mem_cache.memory_pool_host import MambaPoolHost
-from sglang.srt.mem_cache.pool_host.arena_pool import PLACEHOLDERS, ArenaMHAHostPool
+from sglang.srt.mem_cache.pool_host.arena_pool import (
+    PLACEHOLDERS,
+    ArenaMHAHostPool,
+    _select_rows_async,
+    index_to_device_async,
+    load_index_async,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -426,7 +432,9 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 or self._state_dev_stage.shape[1] != row_bytes or self._state_dev_stage.device != dev:
             self._state_dev_stage = torch.empty((bb, row_bytes), dtype=torch.uint8, device=dev)
         slots_cpu = slots.to("cpu", dtype=torch.int64)
-        didx = didx.to(dev)
+        # SGLANG_HICACHE_LOAD_ASYNC_INDEX: pinned + non_blocking instead of a
+        # pageable `.to(dev)` (a host wait on the forward-fenced load stream).
+        didx = index_to_device_async(didx, dev) if load_index_async() else didx.to(dev)
         e_c = int(self.conv_dtype.itemsize)
         t_shape = tuple(lay["t_shape"]); conv_shape = tuple(lay["conv_shape"]); width = int(lay["width"])
         L = int(lay["L"])
@@ -480,7 +488,16 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 return  # every layer came with the state load at layer 0
             if layer_id == 0:
                 try:
-                    self._load_states_all_layers(device_pool, slots, device_indices.cpu()[sel])
+                    if load_index_async():
+                        # SGLANG_HICACHE_LOAD_ASYNC_INDEX: the device rows stay on
+                        # the card (selected there when not every row is an arena
+                        # row) -- `.cpu()` of the mamba slot tensor is a host wait
+                        # on the forward-fenced load stream. Same rows, same order.
+                        _didx = (device_indices if bool(is_arena.all())
+                                 else _select_rows_async(device_indices, is_arena))
+                    else:
+                        _didx = device_indices.cpu()[sel]
+                    self._load_states_all_layers(device_pool, slots, _didx)
                     self._state_loaded_key = key
                     rest = (~is_arena).nonzero(as_tuple=True)[0]
                     if rest.numel():

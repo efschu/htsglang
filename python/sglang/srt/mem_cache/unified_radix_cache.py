@@ -447,6 +447,33 @@ def _weg2_release_drain_cap() -> int:
     except ValueError:
         return 0
 
+
+def _hicache_drain_agree_every() -> int:
+    """SGLANG_HICACHE_DRAIN_AGREE_EVERY (27B D rounds, 24.09.): how often the
+    per-round storage-queue agreement (`drain_storage_control_queues`, one
+    gloo MIN all_reduce over the attention group) runs while it finds nothing.
+
+    Unset / <= 1 = EVERY round, the unchanged path. N > 1: the agreement runs
+    on a rank-uniform cadence -- every round while the last agreement drained
+    something, every N-th round while it found every queue empty on the MIN --
+    so a D decode round does not carry a cross-rank CPU collective for queues
+    that are empty. See `UnifiedRadixCache._gated_drain_storage_control_queues`.
+    """
+    try:
+        return max(1, int(os.environ.get("SGLANG_HICACHE_DRAIN_AGREE_EVERY", "1")))
+    except ValueError:
+        return 1
+
+
+def _hicache_round_timing_every() -> int:
+    """SGLANG_HICACHE_ROUND_TIMING=N (instrument, default 0 = off): time
+    `check_hicache_events` and its storage-queue agreement on every round and
+    print a summary line every N rounds. Measures, changes nothing else."""
+    try:
+        return max(0, int(os.environ.get("SGLANG_HICACHE_ROUND_TIMING", "0")))
+    except ValueError:
+        return 0
+
 # #1233 zero-remainder: END-OF-PREFILL ANCHOR instrument, armed by the Weg-2
 # launcher on group P together with the schedule_policy split (same env).
 _WEG2_END_ANCHOR = os.environ.get("SGLANG_WEG2_END_ANCHOR", "0") == "1"
@@ -6358,7 +6385,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _drain_release()
         _drain_extra_release()
 
-    def drain_storage_control_queues(self) -> None:
+    def drain_storage_control_queues(self) -> bool:
+        """Drain the storage control queues by the group's MIN of their sizes.
+
+        Returns True when the agreement found something to drain on every
+        rank (any MIN > 0) -- a rank-uniform answer, read only by the gated
+        cadence (`_gated_drain_storage_control_queues`); every other caller
+        ignores it, as it ignored the former None.
+        """
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         # The sidecar slots are laid out over the fixed PoolName universe, NOT
@@ -6402,6 +6436,57 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             extra_release_counts=extra_release_counts,
             log_metrics=True,
         )
+        return any(v > 0 for v in qsize_list)
+
+    def _drain_agreement_is_collective(self) -> bool:
+        """True when `drain_storage_control_queues` issues a collective here.
+
+        The same condition as `_all_reduce_attn_groups`: an attention group
+        with more than one rank, else a TP group with more than one. Group P
+        (TP 1, PP 3) takes no collective in the drain at all, so the cadence
+        gate never engages there and P keeps its every-round local drain.
+        """
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                return True
+        return int(getattr(self, "tp_world_size", 1) or 1) > 1
+
+    def _gated_drain_storage_control_queues(self, every: int) -> None:
+        """The storage-queue agreement on a rank-uniform cadence (27B D rounds).
+
+        WHAT IT REMOVES. `drain_storage_control_queues` MIN-reduces the queue
+        sizes over the attention group on every scheduler round: on group D
+        (TP 3) one gloo all_reduce per decode round, parked on its own waiter
+        thread (`bounded_wait` -> `ParkedWait`), which also lock-steps the three
+        schedulers once per round -- for queues (prefetch revokes, storage
+        backup acks, host releases) that are empty through a decode phase.
+
+        WHY THE SKIP IS RANK-UNIFORM. Every input of the decision is replicated:
+        the round counter advances once per `check_hicache_events`, whose calls
+        are rank-uniform (the #1028 census reads the same n on all three D ranks
+        at every state change -- and the every-round collective this replaces
+        would itself deadlock if they were not), and `hot` is the MIN the
+        agreement just returned. So every rank enters the collective on exactly
+        the same rounds; between them nobody drains, and nobody's tree changes.
+
+        WHAT IT COSTS. A queue entry that appears while the group is idle waits
+        up to `every` rounds for the next agreement (then it drains as today,
+        with the same MIN counts and the same per-pass release cap); while the
+        agreement keeps finding work it runs every round, as today.
+        """
+        r = self._drain_gate_round = int(getattr(self, "_drain_gate_round", 0)) + 1
+        if r < int(getattr(self, "_drain_gate_next", 0)):
+            self._drain_gate_skipped = int(getattr(self, "_drain_gate_skipped", 0)) + 1
+            return
+        hot = self.drain_storage_control_queues()
+        self._drain_gate_next = r + 1 if hot else r + every
+        n = self._drain_gate_agreed = int(getattr(self, "_drain_gate_agreed", 0)) + 1
+        if n == 1 or n % 1024 == 0:
+            logger.info(
+                "HICACHE-DRAIN-GATE every=%d round=%d agreements=%d skipped=%d hot=%s "
+                "(rank-uniform cadence; unset SGLANG_HICACHE_DRAIN_AGREE_EVERY = every round)",
+                every, r, n, int(getattr(self, "_drain_gate_skipped", 0)), bool(hot),
+            )
 
     def _apply_storage_runtime_config(
         self,
@@ -7330,18 +7415,60 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
         except Exception:  # noqa: BLE001 - a probe may never break the round
             pass
+        _timing_every = _hicache_round_timing_every()
+        _t0 = time.perf_counter() if _timing_every else 0.0
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         self.writing_check()
         self.loading_check()
         if self._pin_trace_every:
             self._emit_pin_trace()
+        _t1 = time.perf_counter() if _timing_every else 0.0
         if self.enable_storage:
-            self.drain_storage_control_queues()
+            _every = _hicache_drain_agree_every()
+            if _every > 1 and self._drain_agreement_is_collective():
+                self._gated_drain_storage_control_queues(_every)
+            else:
+                self.drain_storage_control_queues()
+        _t2 = time.perf_counter() if _timing_every else 0.0
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+        if _timing_every:
+            self._note_hicache_round_timing(_timing_every, _t1 - _t0, _t2 - _t1,
+                                            time.perf_counter() - _t0)
+
+    def _note_hicache_round_timing(self, every: int, checks_s: float, drain_s: float,
+                                   total_s: float) -> None:
+        """SGLANG_HICACHE_ROUND_TIMING=N: what `check_hicache_events` costs the
+        round. `checks` = PP-sync reap + write/load ack polls (+ pin trace);
+        `drain` = the storage-queue agreement and its drain (the gloo
+        all_reduce on a multi-rank group); `total` = the whole call. Wall
+        time of the scheduler thread, summarised every N rounds; an instrument,
+        never a decision."""
+        acc = getattr(self, "_hc_round_acc", None)
+        if acc is None:
+            acc = self._hc_round_acc = {"n": 0, "checks": 0.0, "drain": 0.0, "total": 0.0,
+                                        "drain_max": 0.0, "total_max": 0.0}
+        acc["n"] += 1
+        acc["checks"] += checks_s
+        acc["drain"] += drain_s
+        acc["total"] += total_s
+        acc["drain_max"] = max(acc["drain_max"], drain_s)
+        acc["total_max"] = max(acc["total_max"], total_s)
+        if acc["n"] >= every:
+            n = acc["n"]
+            logger.info(
+                "HICACHE-ROUND-TIMING rounds=%d checks_ms=%.3f drain_ms=%.3f (max %.2f) "
+                "total_ms=%.3f (max %.2f) per round, drain_collective=%s agree_every=%d "
+                "gate_skipped=%d (scheduler-thread wall of check_hicache_events)",
+                n, acc["checks"] * 1e3 / n, acc["drain"] * 1e3 / n, acc["drain_max"] * 1e3,
+                acc["total"] * 1e3 / n, acc["total_max"] * 1e3,
+                bool(self.enable_storage and self._drain_agreement_is_collective()),
+                _hicache_drain_agree_every(), int(getattr(self, "_drain_gate_skipped", 0)),
+            )
+            self._hc_round_acc = None
 
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""
