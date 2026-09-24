@@ -389,6 +389,49 @@ def plan_expert_waves(
     return sorted(resident_used), spill_waves
 
 
+def plan_expert_waves_np(
+    ids_np,
+    resident_count: int,
+    scratch: int,
+    resident_ids: Optional[frozenset] = None,
+    num_experts: Optional[int] = None,
+) -> Tuple[List[int], List[List[int]]]:
+    """``plan_expert_waves`` over a [T, K] integer array instead of a nested
+    Python list (fnFL2 H20b). Same result, element for element: the used set
+    is ``np.unique`` of the non-negative ids (sorted, like ``sorted(set)``),
+    split by the same spill predicate, chunked by the same ``scratch``.
+
+    Why: at a 16384-token prefill chunk the list path costs ~26 ms of host
+    Python PER MoE LAYER after the ``tolist`` rendezvous (desk bench, T=16384
+    K=10: tolist 4.2 + plan_expert_waves 16.0 + np.asarray 5.4 ms), and the
+    GPU idles through all of it -- ~0.75 s of PP0's 5.5-s forward (29 layers).
+    """
+    import numpy as np
+
+    if scratch < 1:
+        raise ValueError("scratch must be >= 1")
+    flat = np.asarray(ids_np).reshape(-1)
+    used = np.unique(flat[flat >= 0])
+    if resident_ids is not None:
+        width = max(int(used[-1]) + 1 if used.size else 0, int(num_experts or 0))
+        is_res = np.zeros(width, dtype=bool)
+        members = [int(e) for e in resident_ids if 0 <= int(e) < width]
+        is_res[members] = True
+        res_of_used = is_res[used]
+    else:
+        res_of_used = used < resident_count
+    spill_sorted = used[~res_of_used].tolist()
+    spill_waves = [
+        spill_sorted[i : i + scratch] for i in range(0, len(spill_sorted), scratch)
+    ]
+    return used[res_of_used].tolist(), spill_waves
+
+
+# fnFL2 H20b: below this many routed (token, k) pairs the list path stays --
+# decode and small extends are not what the vector planner is for.
+PLAN_VECTOR_MIN_PAIRS = 4096
+
+
 def resolve_wave_order(value: Optional[str]) -> str:
     """Normalize SGLANG_MOE_OFFLOAD_WAVE_ORDER; reject anything else loudly."""
     order = (value or "token").strip().lower()
@@ -3340,6 +3383,8 @@ class MoEExpertOffloadCache:
         # spill expert fetched once per forward; byte-identical via the fixed
         # k-order combine in _run_waves_expert_major.
         self._wave_order = resolve_wave_order(envs.SGLANG_MOE_OFFLOAD_WAVE_ORDER.get())
+        # fnFL2 H20b: numpy wave planning for expert-major prefill.
+        self._plan_vector = bool(envs.SGLANG_MOE_OFFLOAD_PLAN_VECTOR.get())
         # H12: the device-planned pool's eager forwards (run_eager_pool) split
         # expert-major unless SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR=0.
         self._pool_eager_wave_order = (
@@ -4443,6 +4488,72 @@ class MoEExpertOffloadCache:
             if self._heat.due():
                 self._migrate_heat()
 
+    def _vector_plan_eligible(self, topk_ids, order) -> bool:
+        """fnFL2 H20b: may this forward plan on a numpy array instead of the
+        nested ``tolist``? Only for expert-major prefill-sized forwards, and
+        only while no consumer of the Python id list is active (router
+        stats, the Stage-1 hot calibration, the #302a heat window, the NaN
+        trace) -- those read ``ids_list`` and keep the list path."""
+        from sglang.srt.layers.nan_guard import nan_guard_on
+
+        return (
+            self._plan_vector
+            and (self._wave_order if order is None else order) == "expert"
+            and int(topk_ids.numel()) >= PLAN_VECTOR_MIN_PAIRS
+            and self._router_stats is None
+            and not (self._hot_enabled and not self._hot_frozen)
+            and self._heat is None
+            and not nan_guard_on()
+        )
+
+    def _run_waves_vector(self, dispatch_output, apply_fn, lookahead):
+        """The expert-major route of ``run_waves`` planned in numpy: one D2H
+        copy of the ids (the same rendezvous ``tolist`` was), ``np.unique``
+        for the used set, no per-element Python. The waves and the flat pair
+        array are the list path's exactly, so the forward is byte-identical;
+        a forward that turns out single-wave re-enters the list path."""
+        import numpy as np
+        import torch
+
+        topk_ids = dispatch_output.topk_output.topk_ids
+        n_own = int(topk_ids.numel())
+        if lookahead is None:
+            both_np = topk_ids.reshape(-1).cpu().numpy()
+        else:
+            _next_cache, pred = lookahead
+            both_np = torch.cat(
+                [topk_ids.reshape(-1), pred.reshape(-1).to(topk_ids.dtype)]
+            ).cpu().numpy()
+        flat_np = both_np[:n_own].astype(np.int64)
+        self._nan_trace = None  # the guard is off (eligibility); no trace
+        _hap.checkpoint("moe.routed", layer=getattr(self.layer, "layer_id", None),
+                        T=int(topk_ids.shape[0]))
+        resident_used, spill_waves = plan_expert_waves_np(
+            flat_np,
+            self.resident_count,
+            self.scratch,
+            self.planner.resident_ids,
+            num_experts=self.num_local_experts,
+        )
+        if len(spill_waves) <= 1:
+            k = int(topk_ids.shape[-1])
+            own = flat_np.tolist()
+            ids_list = [own[i : i + k] for i in range(0, n_own, k)]
+            prefetch = (
+                None
+                if lookahead is None
+                else self._issue_lookahead(lookahead, both_np[n_own:].tolist())
+            )
+            return self._run_single_wave(dispatch_output, apply_fn, ids_list, prefetch)
+        self.planner.stats.overflow_forwards += 1
+        if lookahead is not None:
+            # the list path drops it too: either _issue_lookahead finds no
+            # installed cache or the multi-wave branch drops the thunk
+            self.planner.stats.lookahead_dropped += 1
+        return self._run_waves_expert_major(
+            dispatch_output, apply_fn, flat_np, resident_used, spill_waves
+        )
+
     def run_waves(self, dispatch_output, apply_fn, lookahead=None, order=None):
         """Run the grouped-GEMM for one forward, wave-splitting when the forward
         needs more unique experts than there are resident slots.
@@ -4465,6 +4576,7 @@ class MoEExpertOffloadCache:
         Returns a CombineInput whose hidden_states is the full [T, H] output,
         byte-identical to the no-offload path (see module docstring).
         """
+        import numpy as np
         import torch
 
         topk_output = dispatch_output.topk_output
@@ -4479,6 +4591,9 @@ class MoEExpertOffloadCache:
             out = apply_fn(dispatch_output)
             fwd_mark("moe_apply")
             return out
+
+        if self._vector_plan_eligible(topk_ids, order):
+            return self._run_waves_vector(dispatch_output, apply_fn, lookahead)
 
         prefetch = None
         if lookahead is None:
@@ -4530,7 +4645,11 @@ class MoEExpertOffloadCache:
                 if prefetch is not None:
                     self.planner.stats.lookahead_dropped += 1
                 return self._run_waves_expert_major(
-                    dispatch_output, apply_fn, ids_list, resident_used, spill_waves
+                    dispatch_output,
+                    apply_fn,
+                    np.asarray(ids_list, dtype=np.int64).reshape(-1),
+                    resident_used,
+                    spill_waves,
                 )
             return self._run_single_wave(dispatch_output, apply_fn, ids_list, prefetch)
 
@@ -4734,7 +4853,7 @@ class MoEExpertOffloadCache:
         return out
 
     def _run_waves_expert_major(
-        self, dispatch_output, apply_fn, ids_list, resident_used, spill_waves
+        self, dispatch_output, apply_fn, flat_np, resident_used, spill_waves
     ):  # pragma: no cover - requires CUDA
         """#254 expert-major prefill: waves are disjoint SPILL-EXPERT groups, so
         every spill expert crosses PCIe exactly ONCE per forward instead of once
@@ -4779,7 +4898,8 @@ class MoEExpertOffloadCache:
 
         # pair index (t*K + k) -> wave: 0 = the fetch-free resident wave,
         # 1..n = spill groups, -1 = padded slot (contributes an exact zero).
-        flat_np = np.asarray(ids_list, dtype=np.int64).reshape(-1)
+        # flat_np: the [T*K] routed ids as int64 (list path: np.asarray of
+        # the tolist; H20b vector path: the D2H array itself).
         wave_lut = np.full(self.num_local_experts, -1, dtype=np.int64)
         for e in resident_used:
             wave_lut[e] = 0

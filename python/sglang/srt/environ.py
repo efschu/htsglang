@@ -1728,6 +1728,14 @@ class Envs:
     #     transient T*top_k*H buffer per layer (freed at the end of the forward).
     # Decode (single-wave) is unaffected by this flag.
     SGLANG_MOE_OFFLOAD_WAVE_ORDER = EnvStr("token")
+    # fnFL2 H20b: plan an expert-major prefill forward on a numpy array (one
+    # D2H copy + np.unique) instead of topk_ids.tolist() + per-element Python.
+    # Desk bench at T=16384 K=10: ~26 ms host Python per MoE layer after the
+    # rendezvous, the GPU idle through it (~0.75 s of PP0's 5.5-s chunk).
+    # Same waves, same pair array -> byte-identical forward. Falls back to the
+    # list path whenever a list consumer is on (router stats, hot calibration,
+    # heat window, NaN guard) and below 4096 routed pairs (decode).
+    SGLANG_MOE_OFFLOAD_PLAN_VECTOR = EnvBool(False)
     # Per-forward CUDA-event split of a prefill chunk: MOE-OFFLOAD-TIMING-PREFILL
     # (expert stream vs grouped GEMM), ATTN-TIMING-PREFILL (full vs linear
     # attention) and PLE-GATHER-PREFILL (the stage-0 CPU gather). One host sync
