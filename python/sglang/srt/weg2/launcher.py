@@ -1505,6 +1505,35 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> 
     ), False)
 
 
+#: RC2 review (L1): the name a --d-short-drain-tokens above X is refused with.
+SHORT_DRAIN_ABOVE_X_NAME = "W153 Weg2ShortDrainAboveX"
+
+
+def refuse_short_drain_above_x(n_tokens: int, x_tokens: int, x_provenance: str) -> None:
+    """LAW 4 SUMMED OVER A DRAIN, at launch (RC2 review, L1).
+
+    ``--d-short-drain-tokens N`` (27B idle policy b) hands a queued SHORT-only
+    backlog of at most N uncached tokens to group D in ONE drain. Each request
+    is <= X by its own route verdict, but the SUM is what D prefills at once,
+    and law 4 (user veto 2026-09-10: D never prefills above X) holds for that
+    sum too. X here is the value this launch hands the front and group D:
+    :func:`resolve_x` has already applied the front floor to the flag
+    (``max(floor, --tp-prefill-max-tokens)``) or derived it. N > X can never
+    be served as asked, so it is refused by name instead of being quietly cut.
+    The front keeps its own riegel beside this one -- every drain is capped at
+    ``min(N, X in force)`` -- because the live X re-solve moves X during a
+    boot, which no launch-time check can see. 0 = off, never refused.
+    """
+    n, x = int(n_tokens or 0), int(x_tokens)
+    if n > 0 and n > x:
+        raise SystemExit(
+            f"{SHORT_DRAIN_ABOVE_X_NAME}: --d-short-drain-tokens {n} exceeds X={x} "
+            f"({x_provenance}). One drain would hand group D {n} uncached tokens to "
+            f"prefill at once; law 4 caps what D prefills at X, summed over the drain "
+            f"too. Pass --d-short-drain-tokens <= {x}, or 0 for off."
+        )
+
+
 def resolve_pool_floor(
     override: Optional[int],
 ) -> Tuple[Optional[int], Optional[Tuple[int, ...]], str]:
@@ -11161,7 +11190,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="27B idle policy (b), passed to the front: while D is awake, a queued "
                          "backlog made ONLY of SHORT requests (each <= X, law 4 -- D never prefills "
                          "above X) whose uncached tokens sum to at most N is served on D instead of "
-                         "waiting for a flip. 0 (default) = off = today: such a backlog waits for "
+                         "waiting for a flip. N > X is refused (W153: law 4 holds for the sum of a "
+                         "drain too), and the front caps every drain at min(N, the X in force). "
+                         "0 (default) = off = today: such a backlog waits for "
                          "FLIP-ECONOMICS (--flip-min-work-tokens) or the fairness bound.")
     ap.add_argument("--d-hold-s", type=float, default=None,
                     help="27B idle policy (c), passed to the front: D stays awake this many seconds "
@@ -12628,6 +12659,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if int(ns.d_short_drain_tokens or 0) < 0 or (ns.d_hold_s is not None and float(ns.d_hold_s) < 0):
         raise SystemExit(f"--d-short-drain-tokens {ns.d_short_drain_tokens} / --d-hold-s {ns.d_hold_s}: "
                          f"both must be >= 0 (0 / unset = off)")
+    # RC2 review (L1): law 4 summed over a drain -- N above the X this launch
+    # hands out is refused by name (W153), never quietly cut.
+    refuse_short_drain_above_x(int(ns.d_short_drain_tokens or 0), x_tokens, x_provenance)
     # THE OPERATING POINT, WITH ITS PROVENANCE, ON EVERY BOOT RECORD. The pair
     # is provisional by the order that set it (2026-09-09, "vorerst"), so a
     # later re-measurement has to be able to sort past boots into "told" and

@@ -5734,7 +5734,8 @@ class Front:
         Applies while D is awake, serving and admitting, when EVERY queued
         request is ``d_eligible`` (its own route verdict was SHORT: uncached
         <= X, no vision stage, not carrier, never re-queued) and the queued
-        uncached tokens sum to <= N. Then the whole queue moves, oldest first,
+        uncached tokens sum to <= min(N, X) -- X in force, law 4 summed over
+        the drain (RC2 review). Then the whole queue moves, oldest first,
         into ``_ready_for_d`` marked ``d_direct``: the admitter seats them with
         D's own bs and budget, and each leg 2 runs as the SHORT route's. One
         LONG / vision / re-queued request in the queue and nothing is split
@@ -5752,7 +5753,13 @@ class Front:
                     and not p.reroutes and not p.x_requeues and 0 <= int(p.est_uncached) <= x):
                 return 0
         total = sum(int(p.est_uncached) for p in self.queue)
-        if total > n_max:
+        # LAW 4 SUMMED OVER THE DRAIN (RC2 review, L1): D prefills this whole
+        # sum at once, so it is capped at X as well as at N -- the X IN FORCE,
+        # which the live re-solve moves during a boot. The launcher refuses
+        # N > X at launch (W153); this riegel holds whatever the flags say.
+        if total > min(n_max, x):
+            if total <= n_max:
+                self.counters["d_short_drain_x_capped"] += 1
             return 0
         moved = list(self.queue)
         self.queue.clear()
@@ -5764,7 +5771,7 @@ class Front:
         self.counters["d_short_drain_tokens"] += total
         logger.info("WEG2 D-SHORT-DRAIN n=%d tokens=%d max=%d X=%d rids=%s oldest_wait_s=%.1f "
                     "(27B idle policy b: a queued SHORT-only backlog is served on D like the SHORT "
-                    "route, no flip; every request <= X, law 4)",
+                    "route, no flip; every request and their sum <= X, law 4)",
                     len(moved), total, n_max, x, [p.rid for p in moved][:8],
                     max(0.0, now - min(p.t_arrive for p in moved)))
         return len(moved)
@@ -6364,8 +6371,9 @@ def main():
                          "by name (W1 -> W2). Today's shipped value, promoted from a literal.")
     ap.add_argument("--d-short-drain-tokens", type=int, default=0,
                     help="27B idle policy (b): while D is awake, a queued backlog made ONLY of SHORT "
-                         "requests (each <= X, law 4) whose uncached tokens sum to at most N is served "
-                         "on D instead of waiting for a flip. 0 (default) = off = today.")
+                         "requests (each <= X, law 4) whose uncached tokens sum to at most min(N, X) "
+                         "is served on D instead of waiting for a flip (X = the X in force, live "
+                         "re-solve included). 0 (default) = off = today.")
     ap.add_argument("--d-hold-s", type=float, default=None,
                     help="27B idle policy (c): D stays awake this many seconds after its own work "
                          "ended -- at rest under --idle-layout P, and in front of a backlog "
