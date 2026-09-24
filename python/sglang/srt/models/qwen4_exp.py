@@ -215,6 +215,7 @@ from sglang.srt.models.qwen4_exp_ple_prefetch import (
 )
 from sglang.srt.models.qwen4_exp_ple_decode_pread import make_ple_decode_stager
 from sglang.srt.models.qwen4_exp_ple_fp8 import ple_fp8_bytes_to_bf16, ple_fp8_decode_arg
+from sglang.srt.weg2 import ple_state as _ple_handoff
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, logger
 
@@ -425,6 +426,16 @@ def _prepare_ple_batch(
                     tokens,
                     tokens.new_full((), ngram_eos_token_id),
                 )
+        if (
+            _ple_handoff.enabled()
+            and mode.is_extend()
+            and not mode.is_target_verify()
+            and not get_is_capture_mode()
+        ):
+            # fnFL2 H63c: a resumed slot's PLE side states come from the hand-off
+            # (arena side rows on the load stream, E1 rows queued per rid) --
+            # join the load and write the queued rows BEFORE the history is read
+            _ple_handoff.before_ple_read(get_req_to_token_pool(), forward_batch)
         history = get_req_to_token_pool().get_ngram_context(state_indices)
         if history.shape[1] != ngram_size - 1:
             raise RuntimeError(

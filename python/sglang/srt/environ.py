@@ -586,6 +586,20 @@ class Envs:
     # being written; one 97k rid (PP0+PP1+PP2) is 56.9 MiB folded (H63),
     # 113.8 MiB not (x166).
     SGLANG_WEG2_TAIL_KEEP_MIB = EnvInt(0)
+    # PLE STATE HAND-OFF (fnFL2 H63c, set on BOTH groups): the Qwen4-Exp PLE
+    # side states of a request slot -- the n-gram history (NGramPool, the
+    # last ngram_size-1 tokens) and the short-conv window (ShortConvPool, the
+    # last (kernel-1)*ngram_size conv inputs, 9 on Qwen3.8-Flash-Next) --
+    # travel with the GDN state on every P->D path: the E1 part (state at c),
+    # the END part (state after N) and the arena anchors (a side table beside
+    # the mamba arena, one row per arena slot, tagged with the slot's stem).
+    # D installs them into the request's slot instead of the EOS history and
+    # zero window a cleared slot starts from (the mamba host pool and the tail
+    # parts carried the GDN state only: every P->D resume re-started the PLE
+    # n-gram hash and short conv at the resume point). Rows are only written
+    # and installed on the rank that runs the PLE layer. False = the H24/H63b
+    # form, byte for byte.
+    SGLANG_WEG2_PLE_STATE_HANDOFF = EnvBool(False)
     # DECODE WARM FROM P (fnFL2 H29). P publishes what it saw at the END of
     # the prompt into the hand-off dir (<SGLANG_HICACHE_ARENA_DIR>/handoff):
     # the routed experts of the last LRU_WARM_TOKENS tokens per MoE layer and

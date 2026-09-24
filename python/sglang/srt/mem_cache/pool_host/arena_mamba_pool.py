@@ -27,6 +27,7 @@ from typing import Optional, Sequence
 import torch
 
 from sglang.srt.mem_cache.memory_pool_host import MambaPoolHost
+from sglang.srt.weg2 import ple_state
 from sglang.srt.mem_cache.pool_host.arena_pool import (
     PLACEHOLDERS,
     ArenaMHAHostPool,
@@ -355,6 +356,10 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 didx_d = device_indices.index_select(0, sel.pin_memory().to(dev, non_blocking=True))
             else:
                 didx_d = device_indices[sel].to(dev)
+            if ple_state.enabled():
+                # H63c: the PLE side states beside the GDN blob, on the same
+                # (write) stream, so the write's ack covers them too
+                ple_state.side_write(self.arena, device_pool, slots.tolist(), didx_d)
             if self._mamba_write_kernel(device_pool, slots, didx_d, dev):
                 return self._backup_rest(device_pool, host_indices, device_indices, io_backend, is_arena)
             didx = didx_d.cpu()
@@ -577,6 +582,11 @@ class ArenaMambaPoolHost(MambaPoolHost):
                         _didx = device_indices.cpu()[sel]
                     self._load_states_all_layers(device_pool, slots, _didx)
                     self._state_loaded_key = key
+                    if ple_state.enabled():
+                        # H63c: the anchors' PLE side states into the same
+                        # targets, on the load stream (before the PLE read's join);
+                        # the rows are selected on the card, never `.cpu()`
+                        ple_state.side_read(self.arena, device_pool, slots.tolist(), device_indices, sel)
                     rest = (~is_arena).nonzero(as_tuple=True)[0]
                     if rest.numel():
                         super().load_to_device_per_layer(
@@ -595,6 +605,9 @@ class ArenaMambaPoolHost(MambaPoolHost):
         for ch0, n, view in self._c_views[0][layer_id]:
             row[:, ch0:ch0 + n] = view.index_select(0, slots)
         dst_c.index_copy_(0, didx, row.to(dev))
+        if layer_id == 0 and ple_state.enabled():
+            # H63c: the per-layer path's layer 0 carries the PLE side states
+            ple_state.side_read(self.arena, device_pool, slots.tolist(), didx)
         rest = (~is_arena).nonzero(as_tuple=True)[0]
         if rest.numel():
             super().load_to_device_per_layer(

@@ -59,6 +59,7 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.weg2 import ple_state
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +221,8 @@ class EndHeader(msgspec.Struct, frozen=True):
     gdn_digest: str
     ring_digest: str
     nbytes: int
+    #: H63c: digest of the PLE rows after N ('' = none carried)
+    ple_digest: str = ""
 
 
 class EndPayload(msgspec.Struct):
@@ -237,6 +240,8 @@ class EndPayload(msgspec.Struct):
     ring: Dict[int, Tuple[torch.Tensor, ...]]
     rope: Optional[torch.Tensor]
     event: object = None
+    #: H63c: the PLE side-state rows after N (weg2/ple_state.py), or None
+    ple: Optional[Dict[str, torch.Tensor]] = None
 
 
 def ring_order(ring: Dict[int, Tuple[torch.Tensor, ...]], rope: Optional[torch.Tensor]) -> List[torch.Tensor]:
@@ -263,6 +268,8 @@ class TailHeader(msgspec.Struct, frozen=True):
     #: describe the END section, and D can serve it as E2 (skip) or not at
     #: all -- there is no state at c. True = every pre-H63 header.
     e1: bool = True
+    #: H63c: digest of the E1 PLE rows (state at c; '' = none carried)
+    ple_digest: str = ""
 
 
 def _dir() -> str:
@@ -336,12 +343,14 @@ def _end_header(end: EndPayload) -> EndHeader:
         first_token=int(end.first_token), key=end.key, rows=int(end.rows), groups=int(end.groups),
         ring_rows=int(end.ring_rows), fa_digest=digest(fa_t), gdn_digest=digest(gdn_t),
         ring_digest=digest(ring_t), nbytes=_nbytes(fa_t + gdn_t + ring_t),
+        ple_digest=ple_state.digest(end.ple),
     )
 
 
 def write_part(spec: TailSpec, part: str, fa: Dict[int, Tuple[torch.Tensor, ...]],
                gdn: Dict[int, Tuple[torch.Tensor, ...]], end: Optional[EndPayload] = None,
-               n_parts: int = 0, e1: bool = True) -> Optional[TailHeader]:
+               n_parts: int = 0, e1: bool = True,
+               ple: Optional[Dict[str, torch.Tensor]] = None) -> Optional[TailHeader]:
     """Atomically write one rank's part (payload first, header last: a
     present header means a complete payload). ``end`` (E2) rides along as
     payload key "end" and header field ``end``; ``n_parts`` (H45) is the
@@ -363,13 +372,18 @@ def write_part(spec: TailSpec, part: str, fa: Dict[int, Tuple[torch.Tensor, ...]
         end=_end_header(end) if end is not None else None,
         n_parts=int(n_parts),
         e1=bool(e1),
+        ple_digest=ple_state.digest(ple) if e1 else "",
     )
     jpath, ppath = part_paths(spec.rid, part)
     os.makedirs(os.path.dirname(jpath), exist_ok=True)
     tmp = f"{ppath}.{os.getpid()}.tmp"
     bundle = {"fa": fa, "gdn": gdn}
+    if ple is not None and e1:
+        bundle["ple"] = ple  # H63c: E1's PLE rows (state at c)
     if end is not None:
         bundle["end"] = {"fa": end.fa, "gdn": end.gdn, "ring": end.ring, "rope": end.rope}
+        if end.ple is not None:
+            bundle["end"]["ple"] = end.ple  # H63c: the PLE rows after N
     torch.save(bundle, tmp)
     os.replace(tmp, ppath)
     tmp = f"{jpath}.{os.getpid()}.tmp"
@@ -548,6 +562,8 @@ class _Capture(msgspec.Struct):
     #: H63: False = a fold capture (no state at c was taken; the part is
     #: END-only)
     e1: bool = True
+    #: H63c: the PLE side-state rows at c (weg2/ple_state.py), or None
+    ple: Optional[Dict[str, torch.Tensor]] = None
 
 
 _CAPTURES: Dict[str, _Capture] = {}
@@ -596,8 +612,9 @@ def _capture_state(req, req_to_token_pool, allocator, page_size: int, stream) ->
     ctx = torch.cuda.stream(stream) if stream is not None else _null_ctx()
     with ctx:
         gdn = _gdn_slot_to_host(req_to_token_pool, req.mamba_pool_idx)
+        ple = _ple_rows(req_to_token_pool, req.mamba_pool_idx)
         event = _record(stream)
-    _CAPTURES[str(req.rid)] = _Capture(spec=spec, gdn=gdn, event=event, stream=stream)
+    _CAPTURES[str(req.rid)] = _Capture(spec=spec, gdn=gdn, event=event, stream=stream, ple=ple)
     while len(_CAPTURES) > capture_keep():  # an aborted prompt never publishes: drop the oldest
         _CAPTURES.pop(next(iter(_CAPTURES)))
     return True
@@ -676,6 +693,15 @@ def _gdn_slot_to_host(pool, mamba_pool_idx: torch.Tensor) -> Dict[int, Tuple[tor
         parts = [cache.temporal[local].index_select(0, phys)] + [c[local].index_select(0, phys) for c in cache.conv]
         gdn[int(gid)] = tuple(_to_host(t) for t in parts)
     return gdn
+
+
+def _ple_rows(pool, mamba_pool_idx) -> Optional[Dict[str, torch.Tensor]]:
+    """H63c: the PLE side-state rows of one request slot on the CURRENT
+    stream (armed, and only on the rank that runs a PLE layer), else None."""
+    if not ple_state.enabled() or mamba_pool_idx is None:
+        return None
+    phys = pool.translate_mamba_indices(mamba_pool_idx.reshape(1).to(torch.int64))
+    return ple_state.snapshot(pool, phys)
 
 
 class _null_ctx:
@@ -760,8 +786,8 @@ def _publish_rows(req, kv_indices: torch.Tensor, allocator, part: str, req_to_to
         # fired, that chunk's KV rows are written too (stream order)
         cap.event.synchronize()
     fa = _fa_rows(allocator.get_kvcache(), kv_indices[spec.page_prefix:spec.cut].to(torch.int64))
-    threading.Thread(target=_write_and_log, args=(spec, part, fa, cap.gdn, end, n_parts), daemon=True,
-                     name="weg2-tail-publish").start()
+    threading.Thread(target=_write_and_log, args=(spec, part, fa, cap.gdn, end, n_parts, True, cap.ple),
+                     daemon=True, name="weg2-tail-publish").start()
 
 
 def end_refusal(req, kv_rows: int, spec: TailSpec) -> str:
@@ -802,10 +828,12 @@ def _capture_end(req, kv_indices: torch.Tensor, allocator, req_to_token_pool, ca
         fa = _fa_rows(kvpool, kv_indices[spec.page_prefix:spec.n_tokens].to(torch.int64), groups=groups, host=_to_host)
         ring, rope = _ring_rows(kvpool, req.req_pool_idx, ring_rows)
         gdn = _gdn_slot_to_host(req_to_token_pool, req.mamba_pool_idx)
+        ple = _ple_rows(req_to_token_pool, req.mamba_pool_idx)
         event = _record(cap.stream)
     return EndPayload(
         first_token=int(req.output_ids[-1]), key=tail_key(req.origin_input_ids, spec.n_tokens, req.extra_key),
         rows=rows, groups=groups, ring_rows=ring_rows, fa=fa, gdn=gdn, ring=ring, rope=rope, event=event,
+        ple=ple,
     )
 
 
@@ -835,12 +863,17 @@ def _ring_rows(kvpool, req_pool_idx: int, ring_rows: int):
 
 
 def _write_and_log(spec: TailSpec, part: str, fa, gdn, end: Optional[EndPayload] = None, n_parts: int = 0,
-                   e1: bool = True) -> None:
+                   e1: bool = True, ple: Optional[Dict[str, torch.Tensor]] = None) -> None:
     try:
         if end is not None and end.event is not None:
             end.event.synchronize()  # the forward-stream gather has landed
-        header = write_part(spec, part, fa, gdn, end=end, n_parts=n_parts, e1=e1)
+        header = write_part(spec, part, fa, gdn, end=end, n_parts=n_parts, e1=e1, ple=ple)
         _prune(spec.rid, part)
+        # H63c: the PLE rows as P handed them over (D prints the same digest)
+        if ple is not None and e1:
+            ple_state.log_state("P", "e1", spec.rid, spec.cut, ple)
+        if end is not None and end.ple is not None:
+            ple_state.log_state("P", "end", spec.rid, spec.n_tokens, end.ple)
     except Exception:  # noqa: BLE001 -- a hand-off that fails is the page-prefix resume
         logger.warning("WEG2-TAIL-PUBLISH write failed rid=%s", spec.rid, exc_info=True)
         return

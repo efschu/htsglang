@@ -118,6 +118,7 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.weg2 import ple_state
 from sglang.srt.weg2 import tail_handoff as th
 
 logger = logging.getLogger(__name__)
@@ -250,6 +251,12 @@ class Staged(msgspec.Struct):
     #: no state at c exists, so this rid is served as E2 (vote 2) or not at
     #: all (vote 0) -- never E1
     e1: bool = True
+    #: H63c: the PLE side-state rows P carried (E1: at c, END: after N) and
+    #: why they are absent ('' = present and digest-checked)
+    ple: Optional[Dict[str, torch.Tensor]] = None
+    ple_why: str = "absent"
+    end_ple: Optional[Dict[str, torch.Tensor]] = None
+    end_ple_why: str = "absent"
 
     @property
     def ok(self) -> bool:
@@ -261,6 +268,7 @@ class Staged(msgspec.Struct):
 
     def drop_end(self) -> None:
         self.end_fa, self.end_gdn, self.end_ring, self.end_rope, self.end_readback = {}, {}, {}, None, {}
+        self.end_ple = None
 
 
 def _check_rows(kind: str, gid: int, tensors, want: List[RowSpec], lead: List[int]) -> str:
@@ -321,6 +329,8 @@ def _stage_e1(headers: List[th.TailHeader], held: HeldShapes, check_digest: bool
         bundles.append(bundle)
         fa.update({int(g): tuple(t) for g, t in bundle["fa"].items() if int(g) in held.fa})
         gdn.update({int(g): tuple(t) for g, t in bundle["gdn"].items() if int(g) in held.gdn})
+    if ple_state.enabled():
+        st.ple, st.ple_why = _ple_of(headers, bundles, end=False)
     if not st.e1:
         # H63 END-only parts: the headers' layer lists and row shapes (checked
         # above) describe the END section, which _stage_end checks row by
@@ -346,6 +356,33 @@ def _stage_e1(headers: List[th.TailHeader], held: HeldShapes, check_digest: bool
     if check_digest:
         st.readback = _readback_buffers(fa, gdn, {}, None, pin)
     return st
+
+
+def _ple_of(headers: List[th.TailHeader], bundles: List[dict], end: bool):
+    """H63c: (rows, '') of the ONE part that carries PLE rows (P's rank with
+    the PLE layer), digest-checked; (None, why) otherwise. A missing or bad
+    PLE section never refuses the adoption: the slot then keeps the history
+    it resumed with (today's behaviour), named in the lines."""
+    found = []
+    for h, b in zip(headers, bundles):
+        if end:
+            want = h.end.ple_digest if h.end is not None else ""
+            rows = (b.get("end") or {}).get("ple")
+        else:
+            want = h.ple_digest
+            rows = b.get("ple")
+        if want or rows is not None:
+            found.append((h, want, rows))
+    if not found:
+        return None, "absent"
+    if len(found) > 1:
+        return None, f"parts:{len(found)}"
+    h, want, rows = found[0]
+    if rows is None:
+        return None, f"payload_missing:{h.part}"
+    if ple_state.digest(rows) != want:
+        return None, f"digest_MISMATCH:{h.part}"
+    return rows, ""
 
 
 def end_token(headers: List[th.TailHeader]) -> Tuple[int, str]:
@@ -405,6 +442,8 @@ def _stage_end(st: Staged, bundles: List[dict], held: HeldShapes, check_digest: 
     why = _end_shape_refusal(end, held, fa, gdn, ring, ropes)
     if why:
         return why
+    if ple_state.enabled():
+        st.end_ple, st.end_ple_why = _ple_of(headers, bundles, end=True)
     pin = torch.cuda.is_available()
     st.end_fa = {g: tuple(_pin(t, pin) for t in ts) for g, ts in fa.items()}
     st.end_gdn = {g: tuple(_pin(t, pin) for t in ts) for g, ts in gdn.items()}
@@ -769,7 +808,38 @@ def commit_adopt(req, entry: Agreed, tree_cache, page_size: int) -> int:
         _log_adopt(spec, fa_rows=0, fa_layers=0, gdn_layers=0, digest="not_mine", ms=0.0, issue_ms=0.0)
         return spec.cut
     _queue_install(req, st, rows, tree_cache)
+    _queue_ple(req, st.ple, st.ple_why, tree_cache, "e1", spec.cut)
     return spec.cut
+
+
+def _ple_line(req, rows, why: str, path: str, at: int, result: str) -> None:
+    """H63c: D's WEG2-PLE-STATE line -- the digest P printed for the same
+    rid/path/position, and whether the history is the prompt's own tokens."""
+    ids = list(getattr(req, "origin_input_ids", None) or [])
+    ctx = ple_state.ctx_tokens(rows)
+    expect = ids[max(0, int(at) - len(ctx)):int(at)] if ctx else []
+    ple_state.log_state(
+        "D", path, str(req.rid), at, rows,
+        extra=(f" expect={','.join(str(x) for x in expect) or '-'}"
+               f" ctx_ok={'yes' if ctx and ctx == expect else 'NO'} installed={result or why}"),
+    )
+
+
+def _queue_ple(req, rows, why: str, tree_cache, path: str, at: int) -> None:
+    """H63c (E1): the rows at c go to the forward that carries this rid
+    (``ple_state.apply_pending`` from ``_prepare_ple_batch``), on the rank
+    that runs the PLE layer only."""
+    if not ple_state.enabled():
+        return
+    rtp = tree_cache.req_to_token_pool
+    if not ple_state.is_owner(rtp):
+        return
+    if rows is None or req.mamba_pool_idx is None:
+        _ple_line(req, rows, why or "no_slot", path, at, "")
+        return
+    slot = rtp.translate_mamba_indices(req.mamba_pool_idx.reshape(1).to(torch.int64))
+    ple_state.queue(str(req.rid), slot, rows)
+    _ple_line(req, rows, why, path, at, "queued")
 
 
 # -- 3. INSTALL ------------------------------------------------------------------------
@@ -800,6 +870,10 @@ class Install(msgspec.Struct):
     req_to_token: Optional[torch.Tensor] = None
     translate: Optional[object] = None
     ratio: int = 0
+    #: H63c: the PLE rows after N (skip) and the pool they are written into
+    ple: Optional[Dict[str, torch.Tensor]] = None
+    ple_why: str = "absent"
+    pool: Optional[object] = None
 
 
 #: installs waiting for the extend forward's GDN layer reads (memory_pool
@@ -894,6 +968,7 @@ def _skip_install(st: Staged, tree_cache) -> Install:
         t0=time.perf_counter(), readback=st.end_readback, end=True, ring=st.end_ring, ring_dst=ring_dst,
         rope=st.end_rope, rope_dst=kvpool.qsa_rope_position_buffer if st.end_rope is not None else None,
         req_to_token=rtp.req_to_token, translate=rtp.translate_mamba_indices, ratio=st.qsa_ratio,
+        ple=st.end_ple, ple_why=st.end_ple_why, pool=rtp,
     )
 
 
@@ -972,6 +1047,18 @@ def _install_end(inst: Install, req) -> None:
             back = inst.readback.get(f"gdn{gid}")
             for j, (dst, s) in enumerate(zip(inst.gdn_dst[gid], inst.gdn[gid])):
                 _put(dst, inst.slot, s, None if back is None else back[j])
+    if ple_state.enabled() and inst.pool is not None and ple_state.is_owner(inst.pool):
+        # H63c: the PLE side states after N, into the same slot; no forward
+        # runs before the first decode reads them, and a queued row of this
+        # rid must never land after them
+        ple_state.discard(str(req.rid))
+        result = ""
+        if inst.ple is not None and req.mamba_pool_idx is not None:
+            slot = inst.slot if inst.slot is not None else inst.translate(
+                req.mamba_pool_idx.reshape(1).to(torch.int64))
+            why = ple_state.install(inst.pool, slot, inst.ple)
+            result = "yes" if not why else f"refused:{why}"
+        _ple_line(req, inst.ple, inst.ple_why, "end", spec.n_tokens, result)
     inst.issue_ms = (time.perf_counter() - t) * 1000.0
     _finish(inst, bool(inst.readback))
 
