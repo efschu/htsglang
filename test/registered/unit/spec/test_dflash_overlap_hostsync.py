@@ -86,5 +86,57 @@ class TestFilterBatchHostIndices(CustomTestCase):
                 )
 
 
+class _FakeGroup:
+    def __init__(self, rank, world_size=3):
+        self.rank_in_group = rank
+        self.world_size = world_size
+        self.broadcasts = 0
+
+    def broadcast(self, values, src=0):
+        self.broadcasts += 1
+
+
+class TestSpecTpSyncDivergeBudget(CustomTestCase):
+    """#1485 compare = a blocking device read per broadcast; bounded now."""
+
+    def _sync(self, rank, budget, rounds):
+        from sglang.srt.environ import envs
+        from sglang.srt.speculative import spec_tp_sync as mod
+
+        calls = {"clone": 0}
+        orig_clone = torch.Tensor.clone
+
+        with envs.SGLANG_SPEC_TP_DIVERGE_CHECKS.override(budget):
+            group = _FakeGroup(rank)
+            sync = mod.SpecTpSync(group)
+
+        def counting_clone(t, *a, **k):
+            calls["clone"] += 1
+            return orig_clone(t, *a, **k)
+
+        values = torch.arange(4)
+        torch.Tensor.clone = counting_clone
+        try:
+            for _ in range(rounds):
+                sync.sync(mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, values)
+        finally:
+            torch.Tensor.clone = orig_clone
+        self.assertEqual(group.broadcasts, rounds)
+        return calls["clone"]
+
+    def test_broadcast_source_never_compares(self):
+        self.assertEqual(self._sync(rank=0, budget=64, rounds=100), 0)
+        self.assertEqual(self._sync(rank=0, budget=-1, rounds=100), 0)
+
+    def test_receiving_rank_compares_only_its_budget(self):
+        self.assertEqual(self._sync(rank=1, budget=5, rounds=100), 5)
+
+    def test_minus_one_keeps_the_old_unbounded_compare(self):
+        self.assertEqual(self._sync(rank=2, budget=-1, rounds=100), 100)
+
+    def test_zero_turns_it_off(self):
+        self.assertEqual(self._sync(rank=1, budget=0, rounds=10), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
