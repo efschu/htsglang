@@ -23,6 +23,7 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.distributed.utils import tp_partition_size
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention import fi_graph_split as _fi_graph_split
 from sglang.srt.layers.attention import fi_prefill_wave_split as _fi_wave_split
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_workspace import (
@@ -1781,6 +1782,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 # does not exist on this arm.
                 extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             )
+            # 27B line (fi_graph_split): the KV split INSIDE the full prefill
+            # graph, only under SGLANG_FI_PREFILL_GRAPH_SPLIT=N; unset = the
+            # stock graph plan above, untouched.
+            if _fi_graph_split.graph_split_max_chunks() > 1:
+                self._p_graph_split(forward_batch, bs, in_capture)
         else:
             raise ValueError("Invalid forward mode")
 
@@ -1976,6 +1982,101 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix,
                 multi_item_params,
                 swa_out_cache_loc=swa_out_cache_loc,
+            )
+
+    def _p_graph_split(self, forward_batch: ForwardBatch, bs: int, in_capture: bool) -> None:
+        """Arm (at capture) / refresh (at replay) the KV split inside the full
+        prefill graph -- layers/attention/fi_graph_split.py.
+
+        The capture decides once per wrapper: every check in
+        ``flashinfer_contract_ok`` / ``layout_from_stock`` passes -> the
+        captured kernel gets a grid of q_tiles_max x N work items and this
+        method rewrites the work-item arrays before every replay; any check
+        fails -> the stock plan stays for the life of the capture, named once.
+        A replay of an armed capture MUST get its arrays (the graph reads our
+        offsets), so errors there raise instead of falling back."""
+        wrappers = list(self.full_cg_prefill_wrappers or [])
+        states = self.__dict__.setdefault("_fi_graph_split_states", {})
+        if len(wrappers) != 1:
+            if in_capture:
+                logger.info(
+                    "FI-GRAPH-SPLIT off for this capture: %d full-CG prefill "
+                    "wrappers (one full-attention wrapper is the checked form)",
+                    len(wrappers),
+                )
+            return
+        w = wrappers[0]
+        key = id(w)
+        upd = self.indices_updater_prefill
+        if in_capture:
+            ok, why = _fi_graph_split.flashinfer_contract_ok(w)
+            lay = None
+            if ok:
+                out_bytes = torch.empty((), dtype=upd.q_data_type).element_size()
+                lay, why = _fi_graph_split.layout_from_stock(
+                    list(w._plan_info),
+                    slots=int(getattr(self, "full_cg_prefill_req_slots", bs) or bs),
+                    max_chunks=_fi_graph_split.graph_split_max_chunks(),
+                    num_qo_heads=int(upd.num_qo_heads),
+                    num_kv_heads=int(upd.num_kv_heads),
+                    head_dim_vo=int(upd.head_dim),
+                    out_bytes=int(out_bytes),
+                    int_workspace_bytes=int(w._int_workspace_buffer.numel()),
+                    float_workspace_bytes=int(
+                        w._float_workspace_buffer.numel()
+                        * w._float_workspace_buffer.element_size()
+                    ),
+                )
+            if lay is None:
+                states[key] = None
+                logger.info("FI-GRAPH-SPLIT off for this capture: %s", why)
+                return
+            states[key] = _fi_graph_split.GraphSplitState(lay, list(w._plan_info))
+            o = lay.offsets
+            logger.info(
+                "FI-GRAPH-SPLIT armed: grid %d work items per KV head (%d q tiles x "
+                "%d chunks), partials %.1f MB at float offset %d, int region %d B at "
+                "%d, min chunk %d tokens",
+                lay.padded,
+                lay.padded // lay.max_chunks,
+                lay.max_chunks,
+                (o["float_end"] - o["v"]) / 1e6,
+                o["v"],
+                lay.int_bytes,
+                lay.int_base,
+                _fi_graph_split.graph_split_min_chunk(),
+            )
+        st = states.get(key)
+        if st is None:
+            return
+        seq = forward_batch.seq_lens_cpu
+        seq_l = [int(x) for x in (seq.tolist() if hasattr(seq, "tolist") else list(seq))][:bs]
+        pre = [int(x) for x in (forward_batch.extend_prefix_lens_cpu or [])][:bs]
+        pre += seq_l[len(pre):]  # sentinel slots: no new rows
+        qo = [max(0, s - p) for s, p in zip(seq_l, pre)]
+        num_sm = self.__dict__.get("_fi_wave_num_sm")
+        if num_sm is None:
+            num_sm = int(
+                torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+            )
+            self._fi_wave_num_sm = num_sm
+        chunk, choice = _fi_graph_split.apply(
+            w, st, qo, seq_l, num_kv_heads=int(upd.num_kv_heads), num_sm=num_sm
+        )
+        reason = "capture" if in_capture else choice.reason.split(":")[0]
+        counts = self.__dict__.setdefault("_fi_graph_split_counts", {})
+        n = counts.get(reason, 0) + 1
+        counts[reason] = n
+        if not (n & (n - 1)):
+            logger.info(
+                "FI-GRAPH-SPLIT %s occurrence=%d chunks=%d kv_chunk=%d prefix=%s "
+                "predicted_attn_ratio=%.3f",
+                reason,
+                n,
+                st.last_chunks,
+                chunk,
+                pre[:1],
+                choice.predicted_ratio,
             )
 
     def _p_wave_split_size(self, forward_batch: ForwardBatch, use_ragged: bool) -> Optional[int]:

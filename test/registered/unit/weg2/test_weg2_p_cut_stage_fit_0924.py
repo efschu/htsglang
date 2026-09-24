@@ -162,3 +162,30 @@ class TestPowerRecord(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGraphSplitFlag(CustomTestCase):
+    """--p-prefill-graph-split: default off; inert without the prefill graph."""
+
+    def setUp(self):
+        self._saved = dict(L._P_PREFILL_GRAPH)
+
+    def tearDown(self):
+        L._P_PREFILL_GRAPH.clear()
+        L._P_PREFILL_GRAPH.update(self._saved)
+
+    def test_default_off_and_inert_without_the_graph(self):
+        ns = _ns()
+        self.assertEqual(ns.p_prefill_graph_split, 0)
+        L.apply_p_prefill_graph(ns)
+        self.assertEqual(L.p_graph_split_env(ns), {})
+        ns = _ns(p_prefill_graph_split=7)
+        L.apply_p_prefill_graph(ns)
+        self.assertEqual(L.p_graph_split_env(ns), {})
+
+    def test_on_with_the_graph(self):
+        ns = _ns(p_prefill_graph=512, p_prefill_graph_split=7)
+        L.apply_p_prefill_graph(ns)
+        self.assertEqual(L.p_graph_split_env(ns), {"SGLANG_FI_PREFILL_GRAPH_SPLIT": "7"})
+        with self.assertRaises(SystemExit):
+            L.p_graph_split_env(_ns(p_prefill_graph=512, p_prefill_graph_split=1))

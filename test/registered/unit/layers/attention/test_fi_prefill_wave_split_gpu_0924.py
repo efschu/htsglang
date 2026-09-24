@@ -12,9 +12,13 @@ prefixes where the chooser splits on the 5090. Skipped without CUDA; on a
 3080 the chooser declines, so the split is FORCED at the 5090's choice there
 (the kernel is the same).
 
-Run in a GPU window (seconds, < 1 GiB):
-  CUDA_VISIBLE_DEVICES=<5090> PYTHONPATH=<tree>/python python -m pytest -q -s \
-    test/registered/unit/layers/attention/test_fi_prefill_wave_split_gpu_0924.py
+Run in a GPU window (seconds; compiles nothing -- the pre-check skips instead):
+  TEST27B_GPU=1 CUDA_VISIBLE_DEVICES=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d \
+  PATH=/usr/local/cuda/bin:/usr/bin:/bin /root/.claude/jobs/1ab4cd30/tmp/test27b.sh \
+  env PYTHONPATH=<tree>/python /spinning/htsglang-gpu/.venv/bin/python -m pytest -q -s \
+  -p no:cacheprovider test/registered/unit/layers/attention/test_fi_prefill_wave_split_gpu_0924.py
+Do NOT export FLASHINFER_CUDA_ARCH_LIST before python starts: flashinfer fixes
+its cache directory at import, and 12.0a there selects a new, empty 120a tree.
 """
 
 import math
@@ -25,6 +29,16 @@ import torch
 
 if not torch.cuda.is_available():  # pragma: no cover - desk
     pytest.skip("needs CUDA", allow_module_level=True)
+
+# Window hygiene (operator 24.09.): exactly one visible GPU, the server's arch
+# flags mirrored (flashinfer imported first, then set_cuda_arch -> 12.0a), and
+# ninja -n on a copy of the module's ninja state clean -- else SKIP instead of
+# a JIT build that dies at the 3 GiB test cap. fi_jit_cache_check.py.
+from sglang.srt.layers.attention import fi_jit_cache_check as _jit  # noqa: E402
+
+_JIT_OK, _JIT_LINES = _jit.check_prefill_modules(("bf16", "e4m3"))
+if not _JIT_OK:  # pragma: no cover
+    pytest.skip("flashinfer module would compile here: " + " | ".join(_JIT_LINES), allow_module_level=True)
 
 flashinfer = pytest.importorskip("flashinfer")
 

@@ -8898,6 +8898,23 @@ P_DEEP_SPLIT_FROM_DEFAULT = 0
 P_DEEP_SPLIT_FROM_FIT = 10240
 
 
+#: --p-prefill-graph-split (27B line, 2026-09-24): 0 = off, the default.
+P_PREFILL_GRAPH_SPLIT_DEFAULT = 0
+
+
+def p_graph_split_env(ns) -> Dict[str, str]:
+    """Group P's environment for --p-prefill-graph-split; {} when off or when
+    the prefill graph itself is off (nothing to split inside)."""
+    from sglang.srt.layers.attention import fi_graph_split as _fgs
+
+    n = int(getattr(ns, "p_prefill_graph_split", P_PREFILL_GRAPH_SPLIT_DEFAULT) or 0)
+    if n < 0 or n == 1:
+        raise SystemExit(f"--p-prefill-graph-split must be 0 (off) or >= 2, got {n}")
+    if not p_prefill_graph_bucket():
+        return {}
+    return _fgs.launcher_env_p_graph_split(n)
+
+
 def p_deep_split_env(ns) -> Dict[str, str]:
     """Group P's environment for --p-deep-split-from; {} when off."""
     from sglang.srt.layers.attention import fi_prefill_wave_split as _fiws
@@ -11714,6 +11731,21 @@ def build_parser() -> argparse.ArgumentParser:
              "off.",
     )
     ap.add_argument(
+        "--p-prefill-graph-split", type=int, default=P_PREFILL_GRAPH_SPLIT_DEFAULT,
+        metavar="MAX_CHUNKS",
+        help="Group P, only with --p-prefill-graph (27B line). 0 (the default) = "
+             "off: the full prefill graph keeps flashinfer's own plan, env "
+             "byte-identical. N >= 2 = the captured attention grid is sized for "
+             "up to N KV chunks per q tile and every replay plans its own chunk "
+             "count by the wave rule (rank lines 'FI-GRAPH-SPLIT armed' / "
+             "'FI-GRAPH-SPLIT split ...'), in EVERY depth, no eager fallback "
+             "needed. Why: flashinfer's graph plan assumes 2 CTAs/SM "
+             "(scheduler.cuh:717, real occupancy 1 for fp8 KV hd256) and caps "
+             "the grid at 85 work items per KV head on the 5090, so 48 q tiles "
+             "are never split: 192 CTAs on 170 SMs, two rounds. 7 = 99 %% wave "
+             "fill (192 x 7 on 170 SMs), 44 MB of the float workspace. "
+             "layers/attention/fi_graph_split.py.")
+    ap.add_argument(
         "--p-deep-split-from", type=int, default=P_DEEP_SPLIT_FROM_DEFAULT,
         metavar="PREFIX_TOKENS",
         help="Group P deep-chunk attention form (27B line). 0 (the default) = "
@@ -13274,6 +13306,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for _pline in p_host_overlap_lines(
             getattr(ns, "p_host_overlap", False), getattr(ns, "p_hostgap", False)):
         log(_pline)
+    # --p-prefill-graph-split: {} when off (env byte-identical).
+    _gs_env = p_graph_split_env(ns)
+    env_p.update(_gs_env)
+    if _gs_env:
+        log(
+            "WEG2 P-GRAPH-SPLIT: on, up to %s KV chunks inside the prefill graph "
+            "-- group P gets %s; the captured grid is q_tiles x N, every replay "
+            "writes its own work-item arrays (rank lines 'FI-GRAPH-SPLIT')"
+            % (int(getattr(ns, "p_prefill_graph_split", 0)),
+               " ".join("%s=%s" % kv for kv in sorted(_gs_env.items())))
+        )
+    elif int(getattr(ns, "p_prefill_graph_split", 0) or 0):
+        log("WEG2 P-GRAPH-SPLIT: requested but INERT -- --p-prefill-graph is off, "
+            "there is no captured prefill graph to split inside")
     # --p-deep-split-from: {} when off (env byte-identical).
     _ds_env = p_deep_split_env(ns)
     env_p.update(_ds_env)
