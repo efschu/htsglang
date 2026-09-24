@@ -1076,12 +1076,25 @@ class DFlashWorkerV2(BaseSpecWorker):
                 num_global,
             )
             return None
+        # SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE (default off): the window pool's
+        # mapper and per-round rebuild without host reads (dflash_solo_pool).
+        sync_free = bool(
+            self._window_pool and envs.SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE.get()
+        )
         mapper = DraftKVSlotMapper(
             num_global_slots=num_global,
             num_draft_slots=num_draft_slots,
             ctx_cap=int(cap),
             device=self.device,
+            sync_free=sync_free,
         )
+        if sync_free:
+            logger.info(
+                "DFLASH window pool: SYNC-FREE mapper armed "
+                "(SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE=1) -- no host read on "
+                "the per-round rebuild / draft-KV append; exact reads only "
+                "for writes beyond the free-count bound."
+            )
         token_to_kv_pool_allocator.register_free_listener(
             mapper.on_global_free, mapper.on_global_clear
         )
@@ -2759,6 +2772,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         # that stood here is gone. The target prefill computes its own.
         self._validate_phase1_sampling_support(batch)
 
+        _mapper = self._solo_pool_mapper
+        if _mapper is not None and _mapper.sync_free:
+            # Sync-free window pool: this forward's stream is the one whose
+            # mapper calls may skip the host reads (dflash_solo_pool).
+            _mapper.bind_owner_stream()
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -2995,6 +3014,41 @@ class DFlashWorkerV2(BaseSpecWorker):
                         verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                         batch_size=bs,
                         block_size=block_size,
+                    )
+                elif (
+                    self._solo_pool_mapper is not None
+                    and self._solo_pool_mapper.sync_free
+                ):
+                    # Window pool, SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE=1: the
+                    # same draft rows as the branch below, without its host
+                    # reads (lengths.max().item(), the boolean compaction and
+                    # the mapper's counts). Width = the host bound seq_lens_cpu
+                    # the backends plan with (>= every device length).
+                    from sglang.srt.speculative.dflash_solo_pool import (
+                        rebuild_window_rows_sync_free,
+                    )
+
+                    mapper = self._solo_pool_mapper
+                    mapper.begin_round()
+                    rebuild_window_rows_sync_free(
+                        mapper=mapper,
+                        target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                        draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
+                        req_pool_indices=batch.req_pool_indices,
+                        start=suffix_start,
+                        lengths=draft_prefix_lens,
+                        max_len=int(seq_lens_cpu.max()) if bs > 0 else 0,
+                    )
+                    block_loc = mapper.translate_write(verify_out_cache_loc)
+                    block_end = self._draft_block_end_buf[:bs]
+                    torch.add(draft_prefix_lens, block_size, out=block_end)
+                    assign_req_to_token_pool_func(
+                        batch.req_pool_indices,
+                        self.draft_model_runner.req_to_token_pool.req_to_token,
+                        draft_prefix_lens,
+                        block_end,
+                        block_loc,
+                        bs,
                     )
                 else:
                     suffix_cache_loc = self._gather_req_to_token_segments(
