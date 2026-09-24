@@ -409,6 +409,53 @@ def _replayssm_spec_for(runner) -> bool:
         )
     return True
 
+def _spec_workspace_draft_units(runner, config, D):
+    """The speculative verify workspace per request, in units of per_req.
+
+    Every branch of ``handle_max_mamba_cache`` (and the demand path's
+    ``_mamba_pool_budget_cost_gb`` / ``_fit_mamba_pool_to_budget``) prices the
+    "speculative intermediate state" post as ``per_req * D`` per admitted
+    request. On the recurrent route that is the convention, and this returns
+    ``D`` itself -- the same object, so every expression consuming it is
+    byte-identical.
+
+    27B ReplaySSM package (S5): under --enable-linear-replayssm-spec the pool
+    builds no per-draft intermediate state; per request row it holds the conv
+    verify windows plus the ring (``spec_ring_workspace_bytes_per_req``).
+    Expressed in the same unit -- a fractional D -- the branches' joint
+    solves, fits and posts price the real allocation without a second
+    formula, and the freed bytes stay in ``total_rest_memory`` for the KV
+    pool. The ratio is layer-count free, so a PP stage's stage-local per_req
+    scales it alike. Module-level and duck-typed for the same reason as
+    :func:`_note_mamba_component` (#624 stub drift).
+    """
+    if not D or not _replayssm_spec_for(runner):
+        return D
+    params = config.mamba2_cache_params
+    per_req_global = params.mamba_cache_per_req
+    if per_req_global <= 0:
+        return D
+    ring_len = int(runner.server_args.linear_replayssm_cache_len)
+    workspace = params.spec_ring_workspace_bytes_per_req(int(D), ring_len)
+    units = workspace / per_req_global
+    if not getattr(runner, "_replayssm_spec_post_logged", False):
+        try:
+            runner._replayssm_spec_post_logged = True
+        except AttributeError:
+            pass
+        logger.info(
+            "ReplaySSM spec ring: 'speculative intermediate state' priced at "
+            "%.2f MiB per request row (conv verify windows + ring, L=%d) "
+            "instead of %.2f MiB (%d per-draft states) -- %.4f per_req units",
+            workspace / (1 << 20),
+            ring_len,
+            per_req_global * int(D) / (1 << 20),
+            int(D),
+            units,
+        )
+    return units
+
+
 class ModelRunnerKVCacheMixin:
     # === #119: expert-offload VRAM -> KV pool ==============================
     # The expert offload (#77/#123) parks cold experts in a pinned host pool and
@@ -2380,7 +2427,10 @@ class ModelRunnerKVCacheMixin:
                     * capped_reqs
                     # Max width: adaptive k-ladder rungs / the cross-algorithm
                     # secondary rung can exceed the boot shape's draft tokens.
-                    * server_args.max_speculative_num_draft_tokens
+                    # (S5: the ring's workspace in the same unit.)
+                    * _spec_workspace_draft_units(
+                        self, config, server_args.max_speculative_num_draft_tokens
+                    )
                 )
                 _spec_gb = intermediate_size / (1 << 30)
                 _note_mamba_component(self, "speculative intermediate state", _spec_gb)
@@ -2395,6 +2445,7 @@ class ModelRunnerKVCacheMixin:
             # rationale.
             ratio = self._calculate_mamba_ratio()
             D = server_args.max_speculative_num_draft_tokens if has_spec_dec else 0
+            D = _spec_workspace_draft_units(self, config, D)
             demand_size = self._auto_mamba_demand_size(ratio)
             # Never exceed what the post-weights budget can physically hold
             # (main state + spec-decode intermediate state per admitted req).
@@ -2490,6 +2541,7 @@ class ModelRunnerKVCacheMixin:
             # joint solve of the radix-enabled branch.
             ratio = self._calculate_mamba_ratio()
             D = server_args.max_speculative_num_draft_tokens if has_spec_dec else 0
+            D = _spec_workspace_draft_units(self, config, D)
             if per_req > 0:
                 budget_size = int(mamba_budget_bytes // (per_req * (1 + D / ratio)))
             else:
@@ -2520,7 +2572,8 @@ class ModelRunnerKVCacheMixin:
                 intermediate_size = (
                     per_req
                     * server_args.max_mamba_cache_size
-                    * server_args.max_speculative_num_draft_tokens
+                    # D: max draft tokens, or the ring's workspace units (S5)
+                    * D
                 )
                 _spec_gb = intermediate_size / (1 << 30)
                 _note_mamba_component(self, "speculative intermediate state", _spec_gb)
@@ -2541,7 +2594,9 @@ class ModelRunnerKVCacheMixin:
 
             if has_spec_dec:
                 ratio = self._calculate_mamba_ratio()
-                D = server_args.max_speculative_num_draft_tokens
+                D = _spec_workspace_draft_units(
+                    self, config, server_args.max_speculative_num_draft_tokens
+                )
                 # Joint solve: main_state + intermediate = mamba_budget
                 server_args.override(
                     "mamba_pool.memory_budget_spec",

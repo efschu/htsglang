@@ -3074,6 +3074,17 @@ class PlanInputs:
     dcp_size: Optional[int] = None
     kv_token_vector: Optional[List[int]] = None
 
+    #: 27B ReplaySSM package (S5): ``--linear-replayssm-cache-len`` when
+    #: ``--enable-linear-replayssm-spec`` is on, else None. The spec ring
+    #: replaces the target verify's per-draft intermediate state, so the
+    #: spec-decode pad of the mamba pool prices the conv verify windows + the
+    #: ring instead of D full states (mirror of the mixin's
+    #: ``_spec_workspace_draft_units``). Appended last: no positional caller
+    #: can shift. (NF line, H64: appended after kv_token_vector -- the 27B
+    #: line's group-fact fields of 159333c14d that precede it there are not
+    #: part of this package and do not exist on this line.)
+    linear_replayssm_spec_ring_len: Optional[int] = None
+
     @property
     def rank_gpu_memory_mib(self):
         """Alias so functions that duck-type a ``ServerArgs`` (e.g.
@@ -3124,6 +3135,11 @@ class PlanInputs:
             effective_vram_mib=list(budgets) if budgets else None,
             rank_tp_ratio=list(ratio) if isinstance(ratio, list) else None,
             dcp_size=getattr(server_args, "dcp_size", None),
+            linear_replayssm_spec_ring_len=(
+                int(server_args.linear_replayssm_cache_len)
+                if getattr(server_args, "enable_linear_replayssm_spec", False)
+                else None
+            ),
         )
 
 
@@ -4151,6 +4167,11 @@ class PerfCostModel:
 
         self.spec_active = plan_inputs.speculative_algorithm is not None
         self.spec_draft_tokens = int(plan_inputs.speculative_num_draft_tokens or 0)
+        # 27B ReplaySSM package (S5): the spec ring's length, None = recurrent
+        # verify (see PlanInputs.linear_replayssm_spec_ring_len).
+        self.replayssm_spec_ring_len = getattr(
+            plan_inputs, "linear_replayssm_spec_ring_len", None
+        )
         # -- draft PLACEMENT (--speculative-draft-placement) -----------------
         # Split (default): every rank carries ~1/tp of the draft, which is what
         # the draft_* families below encode. Solo: ONE rank carries the whole
@@ -4762,10 +4783,42 @@ class PerfCostModel:
         ratio = 5  # MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO(3) + overlap(2)
         slots = math.ceil(target * ratio * 1.25)
         d = self.spec_draft_tokens if self.spec_active else 0
+        d = self._spec_pad_draft_units(d, heads_per_unit, per_req_per_unit)
         eff_slots = slots + min(target, slots // ratio) * d
 
         gdn_units = self.gdn_unit_partition(attn_vector)
         return [per_req_per_unit * u * eff_slots for u in gdn_units]
+
+    def _spec_pad_draft_units(
+        self, d: int, heads_per_unit: int, per_req_per_unit: int
+    ):
+        """The spec-decode pad per admitted request, in units of the per-request
+        state -- ``d`` itself on the recurrent route (byte-identical).
+
+        27B ReplaySSM package (S5), mirror of the mixin's
+        ``_spec_workspace_draft_units`` and of
+        ``BaseLinearStateParams.spec_ring_workspace_bytes_per_req`` in this
+        model's per-UNIT terms (one GDN unit = 1 k head + heads_per_unit v
+        heads; 16-bit activations as ``conv_per_unit_layer`` assumes):
+        deduplicated conv verify windows ``conv_dim * (d + K - 2)`` plus the
+        ring -- d and k records with their low parts, fp32 g -- of length L.
+        """
+        ring = self.replayssm_spec_ring_len
+        if not d or ring is None or per_req_per_unit <= 0:
+            return d
+        L = int(ring)
+        act_b = 2
+        conv_windows = (
+            (2 * self.gdn_k_dim + heads_per_unit * self.gdn_v_dim)
+            * (d + self.conv_kernel - 2)
+            * act_b
+        )
+        ring_bytes = (
+            heads_per_unit * L * self.gdn_v_dim * act_b * 2  # d + low part
+            + L * self.gdn_k_dim * act_b * 2  # k + low part
+            + heads_per_unit * L * 4  # g, fp32
+        )
+        return self.gdn_layers * (conv_windows + ring_bytes) / per_req_per_unit
 
     def mamba_pool_bytes_for(
         self, attn_vector: Optional[List[int]] = None
