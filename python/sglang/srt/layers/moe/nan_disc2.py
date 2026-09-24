@@ -449,7 +449,11 @@ def snapshot(experts, cache, bad_rows: Sequence[int], good_rows: Sequence[int]) 
     trace = getattr(cache, "_nan_trace", None) if cache is not None else None
     if not isinstance(trace, dict):
         return None
-    ids_list = trace.get("ids_list") or []
+    # a [T][K] list (list route) or a [T, K] int64 array (H20c vector route);
+    # `or []` would ask an array for its truth value and raise
+    ids_list = trace.get("ids_list")
+    if ids_list is None:
+        ids_list = []
     waves = trace.get("waves") or []
     bad_sets = row_expert_sets(ids_list, bad_rows)
     good_sets = row_expert_sets(ids_list, good_rows)

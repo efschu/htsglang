@@ -431,6 +431,31 @@ def plan_expert_waves_np(
 # decode and small extends are not what the vector planner is for.
 PLAN_VECTOR_MIN_PAIRS = 4096
 
+# fnFL2 H20c: the last (mode, why) this process logged; decode-sized forwards
+# are the documented exclusion and never move it.
+_PLAN_ROUTE_LAST: Dict[str, Optional[str]] = {"state": None}
+
+
+def note_plan_route(closed_by: Optional[str], *, layer_id, pairs: int) -> bool:
+    """Edge-triggered 'MOE-PLAN-ROUTE mode=vector|list why=<reader>': one line
+    per process whenever the route of a prefill-sized forward changes, so a
+    boot names why the vector planner did (not) run. Returns whether it logged."""
+    if closed_by == "decode_size":
+        return False
+    state = "vector" if closed_by is None else f"list:{closed_by}"
+    if state == _PLAN_ROUTE_LAST["state"]:
+        return False
+    _PLAN_ROUTE_LAST["state"] = state
+    logger.info(
+        "MOE-PLAN-ROUTE mode=%s why=%s layer=%s pairs=%d (fnFL2 H20c; "
+        "SGLANG_MOE_OFFLOAD_PLAN_VECTOR; logged on change only)",
+        "vector" if closed_by is None else "list",
+        closed_by or "open",
+        layer_id,
+        pairs,
+    )
+    return True
+
 
 def resolve_wave_order(value: Optional[str]) -> str:
     """Normalize SGLANG_MOE_OFFLOAD_WAVE_ORDER; reject anything else loudly."""
@@ -4488,23 +4513,27 @@ class MoEExpertOffloadCache:
             if self._heat.due():
                 self._migrate_heat()
 
-    def _vector_plan_eligible(self, topk_ids, order) -> bool:
-        """fnFL2 H20b: may this forward plan on a numpy array instead of the
-        nested ``tolist``? Only for expert-major prefill-sized forwards, and
-        only while no consumer of the Python id list is active (router
-        stats, the Stage-1 hot calibration, the #302a heat window, the NaN
-        trace) -- those read ``ids_list`` and keep the list path."""
-        from sglang.srt.layers.nan_guard import nan_guard_on
-
-        return (
-            self._plan_vector
-            and (self._wave_order if order is None else order) == "expert"
-            and int(topk_ids.numel()) >= PLAN_VECTOR_MIN_PAIRS
-            and self._router_stats is None
-            and not (self._hot_enabled and not self._hot_frozen)
-            and self._heat is None
-            and not nan_guard_on()
-        )
+    def _vector_plan_closed_by(self, topk_ids, order) -> Optional[str]:
+        """fnFL2 H20b/H20c: why this forward must take the nested-list route,
+        or None when it may plan on a numpy array. The list stays only where
+        something still reads it element by element: the router stats, the
+        Stage-1 hot calibration and the #302a heat window. The NaN trace
+        (SGLANG_NAN_GUARD=1, the Bestform P env) reads rows by index and takes
+        the [T, K] array as it is (H20c: x136 had the switch on and the route
+        shut by exactly that guard, moe_plan_ms 1078-1696 on PP0)."""
+        if not self._plan_vector:
+            return "switch_off"
+        if (self._wave_order if order is None else order) != "expert":
+            return "token_order"
+        if int(topk_ids.numel()) < PLAN_VECTOR_MIN_PAIRS:
+            return "decode_size"
+        if self._router_stats is not None:
+            return "router_stats"
+        if self._hot_enabled and not self._hot_frozen:
+            return "hot_calibration"
+        if self._heat is not None:
+            return "heat_window"
+        return None
 
     def _run_waves_vector(self, dispatch_output, apply_fn, lookahead):
         """The expert-major route of ``run_waves`` planned in numpy: one D2H
@@ -4525,7 +4554,10 @@ class MoEExpertOffloadCache:
                 [topk_ids.reshape(-1), pred.reshape(-1).to(topk_ids.dtype)]
             ).cpu().numpy()
         flat_np = both_np[:n_own].astype(np.int64)
-        self._nan_trace = None  # the guard is off (eligibility); no trace
+        k = int(topk_ids.shape[-1])
+        # [T, K] int64 rows: nan_disc2 reads ids_list[r] per row, which an
+        # array answers exactly like the list (H20c).
+        self._nan_trace_begin(flat_np.reshape(-1, k))
         _hap.checkpoint("moe.routed", layer=getattr(self.layer, "layer_id", None),
                         T=int(topk_ids.shape[0]))
         resident_used, spill_waves = plan_expert_waves_np(
@@ -4536,7 +4568,6 @@ class MoEExpertOffloadCache:
             num_experts=self.num_local_experts,
         )
         if len(spill_waves) <= 1:
-            k = int(topk_ids.shape[-1])
             own = flat_np.tolist()
             ids_list = [own[i : i + k] for i in range(0, n_own, k)]
             prefetch = (
@@ -4592,7 +4623,10 @@ class MoEExpertOffloadCache:
             fwd_mark("moe_apply")
             return out
 
-        if self._vector_plan_eligible(topk_ids, order):
+        closed_by = self._vector_plan_closed_by(topk_ids, order)
+        note_plan_route(closed_by, layer_id=getattr(self.layer, "layer_id", None),
+                        pairs=int(topk_ids.numel()))
+        if closed_by is None:
             return self._run_waves_vector(dispatch_output, apply_fn, lookahead)
 
         prefetch = None

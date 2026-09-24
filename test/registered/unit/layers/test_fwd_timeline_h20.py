@@ -75,6 +75,9 @@ def _fields(line: str) -> dict:
 class TestFwdTimeline(CustomTestCase):
     def setUp(self):
         ft.reset_for_tests()
+        # a case that leaves a forward open must not arm the marks of the
+        # MoE tests that run after it in the same process (they have no GPU)
+        self.addCleanup(ft.reset_for_tests)
         self.clock = _Clock()
         self.lines = []
         p = mock.patch.object(ft, "_new_event", self.clock.event)
