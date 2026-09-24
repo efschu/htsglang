@@ -9352,6 +9352,69 @@ def p_log_model_path(path: str, max_lines: int = 20000) -> str:
     return ""
 
 
+#: The source boot of a census produced by weg2/xchg_census.py, as its
+#: provenance names it ("ring-table boot boot_weg2_<tag>_<tree>_<date>_<time>").
+_CENSUS_SOURCE_BOOT_RE = re.compile(r"ring-table boot (boot_weg2_[A-Za-z0-9_]+)")
+
+
+def census_checkpoint(census_path: str,
+                      evidence_dirs: Sequence[str]) -> Tuple[str, str]:
+    """``(checkpoint path, how it was read)`` of the checkpoint a census was
+    MEASURED on; ``("", why)`` when it cannot be named. The census's own
+    ``checkpoint`` field first (xchg_census.py writes it since weg2xsn441), else
+    the ``server_args`` model_path of its source boot's P log."""
+    try:
+        with open(census_path) as fh:
+            blob = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return "", "the census is unreadable (%s)" % exc
+    ck = blob.get("checkpoint") if isinstance(blob, dict) else None
+    if isinstance(ck, str) and ck:
+        return ck, "the census's own checkpoint field"
+    m = _CENSUS_SOURCE_BOOT_RE.search(str(blob.get("provenance", "")))
+    if not m:
+        return "", "the census names no source boot in its provenance"
+    stem = m.group(1)
+    for d in evidence_dirs:
+        if not d:
+            continue
+        path = os.path.join(d, stem + ".P.log")
+        if os.path.isfile(path):
+            model = p_log_model_path(path)
+            if model:
+                return model, "%s.P.log server_args" % stem
+    return "", ("its source boot %s has no readable P log with a server_args line "
+                "under %s" % (stem, ", ".join(d for d in evidence_dirs if d) or "-"))
+
+
+def census_checkpoint_decision(census_path: str, model_path: str,
+                               evidence_dirs: Sequence[str],
+                               allow_foreign: bool) -> Optional[str]:
+    """The census must price THIS checkpoint (weg2xsn441: the FP8 boot ran on the
+    INT8 census of weg2xsn246, the flip's VRAM was priced for the other
+    checkpoint's bytes, and nothing said so before the metal). None when it
+    does; a NAMED line when it cannot be verified or is allowed foreign;
+    W161 otherwise -- in the dry run, before any card is touched."""
+    src, how = census_checkpoint(census_path, evidence_dirs)
+    if not src:
+        return ("WEG2 XCHG-CENSUS checkpoint UNVERIFIED: %s -- the flip's VRAM peaks "
+                "are priced from %s for a checkpoint this launcher cannot name"
+                % (how, census_path))
+    if os.path.realpath(src) == os.path.realpath(str(model_path)):
+        return None
+    what = ("the census %s was measured on %s (%s); this boot runs %s -- its "
+            "per-tag bytes, dormant residue and flip peaks are the other "
+            "checkpoint's (format, scale geometry, embedding dtype, load residue)"
+            % (census_path, src, how, model_path))
+    if allow_foreign:
+        return ("WEG2 XCHG-CENSUS FOREIGN (allowed by --weg2-xchg-census-foreign): "
+                + what + " -- this boot MEASURES its own census, it is not priced by one")
+    raise Weg2LaunchRefused(
+        "W161 Weg2XchgCensusForeign: " + what + ". Produce this checkpoint's census "
+        "(weg2/xchg_census.py --ring-table-boot <a boot of it>), or pass "
+        "--weg2-xchg-census-foreign for the boot that measures it.")
+
+
 def stage_fit_family_cost(ns, cards: Sequence[Card], chunk_tokens: int,
                           limits_now: Sequence[Optional[float]], log):
     """--pp-cut-stage-fit: the P cut's stage cost FITTED from a boot's #PGAP
@@ -11783,6 +11846,15 @@ def build_parser() -> argparse.ArgumentParser:
              "--weg2-weight-source exchange; absent, the launcher REFUSES by "
              "name (W71) rather than invent a table",
     )
+    ap.add_argument(
+        "--weg2-xchg-census-foreign", action="store_true",
+        help="27B line (weg2xsn441): accept a --weg2-xchg-census that was MEASURED "
+             "on another checkpoint than --model (named line WEG2 XCHG-CENSUS "
+             "FOREIGN). Without it such a census is refused in the dry run (W161): "
+             "its tag bytes, dormant residue and flip peaks are the other "
+             "checkpoint's. For the boot that measures this checkpoint's census. "
+             "Default off; a census of the booted checkpoint prints nothing new.",
+    )
     ap.add_argument("--ring-table-boot", default="",
                     help="pin the ring table to ONE boot instead of the newest usable "
                          "one. Matched as a SUBSTRING of the log stem, so the boot TAG "
@@ -12857,6 +12929,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # `prepare_weight_exchange` (200 lines down) is the same named refusal
         # with the same text, only sooner; the richer W71 of an UNFUNDABLE peak
         # still comes from that gate, which is the only place that solves one.
+        # weg2xsn441: the census must be THIS checkpoint's (W161 in the dry run).
+        _census_line = census_checkpoint_decision(
+            ns.weg2_xchg_census, str(ns.model),
+            (ns.evidence_dir, EVIDENCE_DIR),
+            bool(getattr(ns, "weg2_xchg_census_foreign", False)))
+        if _census_line:
+            log(_census_line)
         xchg_form_dormant_reserve(cards, ns.weg2_xchg_census, log=log)
     # #1257c: the operator's external headroom, resolved ONCE per boot and
     # keyed by CARD UUID -- never by NVML index, which is not stable across

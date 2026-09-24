@@ -688,8 +688,17 @@ def census_from_logs(
         + ("; " + form_note if form_note else "")
         + ("; " + " | ".join(bounds) if bounds else "")
     )
+    blob = {"cards": entries, "waves": waves, "provenance": provenance}
+    # weg2xsn441: the checkpoint the census was MEASURED on, read from its source
+    # boot's own P log, so the launcher can refuse a census of another checkpoint
+    # (launcher.census_checkpoint_decision, W161) without that boot's logs.
+    from sglang.srt.weg2.launcher import p_log_model_path
+
+    checkpoint = p_log_model_path(os.path.join(evidence_dir, f"{stem}.P.log"))
+    if checkpoint:
+        blob["checkpoint"] = checkpoint
     return CensusBuild(
-        blob={"cards": entries, "waves": waves, "provenance": provenance},
+        blob=blob,
         stem=stem,
         provenance=provenance,
         lines=lines,

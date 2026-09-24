@@ -2,7 +2,8 @@
 
 import logging
 import weakref
-from typing import Optional
+from contextlib import nullcontext
+from typing import Callable, ContextManager, Optional
 
 import torch
 
@@ -145,9 +146,42 @@ def zero_fp8_marlin_workspaces() -> int:
     return n
 
 
+def _survivor_scope(born_in):
+    """The allocation context of a tensor that STAYS on the layer (see
+    ``prepare_fp8_layer_for_marlin(born_in=...)``); a no-op without a hook."""
+    return born_in() if born_in is not None else nullcontext()
+
+
+def _as_survivor(t: torch.Tensor, born_in) -> torch.Tensor:
+    """``t`` computed in the caller's (transient) pool: copied into a fresh
+    block born under ``born_in``. Without a hook ``t`` itself is the survivor."""
+    if born_in is None:
+        return t
+    with born_in():
+        fresh = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+    fresh.copy_(t)
+    return fresh
+
+
 def prepare_fp8_layer_for_marlin(
-    layer: torch.nn.Module, size_k_first: bool = True
+    layer: torch.nn.Module,
+    size_k_first: bool = True,
+    *,
+    born_in: Optional[Callable[[], ContextManager]] = None,
 ) -> None:
+    """Repack an fp8 linear into Marlin's layout.
+
+    ``born_in`` (27B line, weg2 H39 for FP8; default None = unchanged): a
+    context-manager factory under which the SURVIVORS are allocated -- the lock
+    workspace, the repacked weight, the permuted scales, the bias. The caller
+    runs this function OUTSIDE the weg2 tag pool
+    (``weg2_memory_saver.outside_tag_pool``) and passes
+    ``weg2_memory_saver.back_into_tag_pool``: the repack's working set then
+    dies in the load's transient pool (handed back after load), and the
+    checkpoint-format weight is released right before its Marlin survivor is
+    born, which takes its block of the tag pool -- instead of both staying as
+    dead blocks of the tag pool, which the flip pauses and resumes with the tag
+    (weg2xsn441: tms - walk 1.5-4.1 GiB per rank)."""
     logger.warning_once(
         "Your GPU does not have native support for FP8 computation but "
         "FP8 quantization is being used. Weight-only FP8 compression will "
@@ -166,8 +200,9 @@ def prepare_fp8_layer_for_marlin(
 
     device = layer.weight.device
 
-    # WORKSPACE
-    layer.workspace = marlin_make_workspace(device)
+    # WORKSPACE (a survivor)
+    with _survivor_scope(born_in):
+        layer.workspace = marlin_make_workspace(device)
 
     # WEIGHT
     # Repack weights to marlin format
@@ -175,14 +210,21 @@ def prepare_fp8_layer_for_marlin(
     qweight = pack_fp8_to_int32(layer.weight, size_k_first)
     if not size_k_first:
         qweight = qweight.T.contiguous()
+    if born_in is not None:
+        # H39: the checkpoint-format weight dies HERE, before its survivor is
+        # born -- ``qweight`` is a copy by now (``.T.contiguous()``) -- so the
+        # repacked weight takes the freed block of the tag pool (same byte
+        # count, N*K) instead of leaving it behind as a dead block.
+        layer.weight = None
 
-    marlin_qweight = gptq_marlin_repack(
-        b_q_weight=qweight,
-        perm=perm,
-        size_k=part_size_k,
-        size_n=part_size_n,
-        num_bits=8,
-    )
+    with _survivor_scope(born_in):
+        marlin_qweight = gptq_marlin_repack(
+            b_q_weight=qweight,
+            perm=perm,
+            size_k=part_size_k,
+            size_n=part_size_n,
+            num_bits=8,
+        )
     layer.weight = torch.nn.Parameter(marlin_qweight, requires_grad=False)
 
     # WEIGHT SCALES
@@ -229,11 +271,12 @@ def prepare_fp8_layer_for_marlin(
         s=scales, size_k=part_size_k, size_n=part_size_n, group_size=group_size
     )
     marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
+    marlin_scales = _as_survivor(marlin_scales, born_in)
     layer.weight_scale = torch.nn.Parameter(marlin_scales, requires_grad=False)
 
     if hasattr(layer, "bias") and layer.bias is not None:
         assert layer.bias.shape == (part_size_n,)
-        bias = marlin_permute_bias(layer.bias)
+        bias = _as_survivor(marlin_permute_bias(layer.bias), born_in)
         layer.bias = torch.nn.Parameter(bias, requires_grad=False)
 
 
