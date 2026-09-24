@@ -11,6 +11,10 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import (
+    get_schema_properties,
+    infer_type_from_json_schema,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,14 +113,22 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 except AttributeError:
                     return {}
 
-                if isinstance(params, dict) and "properties" in params:
-                    return params["properties"]
-                elif isinstance(params, dict):
+                if isinstance(params, dict):
+                    properties = get_schema_properties(params)
+                    if properties or "properties" in params:
+                        return properties
                     return params
                 else:
                     return {}
         logger.warning(f"Tool '{func_name}' is not defined in the tools list.")
         return {}
+
+    def _get_param_type(self, param_schema: Any) -> str:
+        """Infer the parser conversion type from a JSON schema parameter."""
+        inferred_type = infer_type_from_json_schema(param_schema)
+        if inferred_type is None:
+            return "string"
+        return str(inferred_type).strip().lower()
 
     def _convert_param_value(
         self, param_value: str, param_name: str, param_config: dict, func_name: str
@@ -134,13 +146,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
             return param_value
 
-        if (
-            isinstance(param_config[param_name], dict)
-            and "type" in param_config[param_name]
-        ):
-            param_type = str(param_config[param_name]["type"]).strip().lower()
-        else:
-            param_type = "string"
+        param_type = self._get_param_type(param_config[param_name])
         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
             return param_value
         elif (
