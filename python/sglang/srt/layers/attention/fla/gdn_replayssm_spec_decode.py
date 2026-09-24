@@ -36,7 +36,10 @@ Fork port (27B ReplaySSM slice S1): taken verbatim from upstream main
 #32692 -> #36970 -> #35544) to this line's fla path; only the fla.utils import
 moved. Upstream wires the GDN route to the EAGLE/MTP commit only and refuses
 DFLASH/DSPARK for non-KDA models -- this line's DFLASH commit wiring is its own
-(later slices), pinned by the recurrent-equivalence tests of S1/S3.
+(later slices), pinned by the recurrent-equivalence tests of S1/S3. S4 adds one
+fork change inside the compact commit: lanes past the accepted history are
+zeroed after their load, so garbage ring memory (TMS restore) cannot reach the
+checkpoint.
 
 Linear-chain only: the intra-window interaction uses a strictly-lower causal
 mask, so this kernel is valid only for linear draft chains
@@ -864,6 +867,21 @@ def gdn_replayssm_compact_commit_kernel(
     gates = tl.load(
         g_cache + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys
     ).to(tl.float32)
+    # Fork (27B ReplaySSM S4): only lanes below n_history hold records this
+    # commit may read (track_len <= n_history). The other lanes hold whatever
+    # the memory held -- after a TMS restore of the pool region any bit
+    # pattern, NaN/Inf included -- and the masked multiply below (x * 0) would
+    # keep a NaN. A select after the (in-bounds, unmasked) load zeroes them
+    # without masking the dot operands' loads (see the verify kernel's note on
+    # masked dot staging); for finite data the result is bit-identical.
+    lane_ok = o_t < n_history
+    keys = tl.where(lane_ok[:, None], keys, tl.zeros_like(keys))
+    if HAS_RESIDUAL:
+        key_residual = tl.where(
+            lane_ok[:, None], key_residual, tl.zeros_like(key_residual)
+        )
+    updates = tl.where(lane_ok[:, None], updates, 0.0)
+    gates = tl.where(lane_ok, gates, 0.0)
 
     if fold_active:
         active_mask = o_t < n_history
