@@ -1016,6 +1016,42 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(tool_calls[1].id, "functions.get_weather:2")
             self.assertEqual(tool_calls[1].function.name, "get_weather")
 
+    def test_non_streaming_tool_call_index_is_the_call_ordinal(self):
+        """Two calls to one tool are numbered 0 and 1, as in the streaming deltas,
+        not by the detector's tool_index (0 for both)."""
+        self.chat.tool_call_parser = "deepseekv4"
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as ParserMock:
+            parser_instance = ParserMock.return_value
+            calls = []
+            for city in ("San Francisco", "London"):
+                call_info = Mock()
+                call_info.name = "get_weather"
+                call_info.parameters = json.dumps({"location": city})
+                call_info.tool_index = 0
+                calls.append(call_info)
+            parser_instance.has_tool_call.return_value = True
+            parser_instance.parse_non_stream.return_value = ("", calls)
+
+            tool_calls, _, finish_reason = self.chat._process_tool_calls(
+                text="<｜DSML｜tool_calls>...",
+                tools=tools,
+                finish_reason={"type": "stop", "matched": None},
+                history_tool_calls_cnt=0,
+            )
+
+        self.assertEqual([tc.index for tc in tool_calls], [0, 1])
+        self.assertEqual(
+            [tc.function.arguments for tc in tool_calls],
+            [
+                json.dumps({"location": "San Francisco"}),
+                json.dumps({"location": "London"}),
+            ],
+        )
+        self.assertEqual(finish_reason["type"], "tool_calls")
+
     def test_kimi_k2_streaming_tool_call_id_with_history(self):
         """Ensure streaming first chunk tool_call.id increase with tool calls history for kimi_k2 parser."""
 
