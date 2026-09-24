@@ -3074,6 +3074,26 @@ class PlanInputs:
     dcp_size: Optional[int] = None
     kv_token_vector: Optional[List[int]] = None
 
+    # -- group facts a planner run OUTSIDE the rank cannot read from its own
+    #    environment (27B line, 24.09.). Unset = the pre-existing behaviour.
+    #: The group's --mamba-ssm-dtype. The rank publishes it as
+    #: SGLANG_MAMBA_SSM_DTYPE (server_args), but a planner in the LAUNCHER's
+    #: process never sees that env and priced the SSM state as fp32 -- 2x the
+    #: real mamba pool (xsn420 D: 12.3 GiB priced vs 6.3 GiB allocated).
+    mamba_ssm_dtype: Optional[str] = None
+    #: DFLASH with the compact draft cache and SGLANG_DFLASH_WINDOW_POOL=1 on
+    #: the group (pool_configurator.apply_window_pool_draft_charge): the
+    #: per-token cell is the TARGET cell -- no draft part, and no target MTP
+    #: layer, the external draft replaces it -- and the draft's KV is a
+    #: CONSTANT reserve of window_pool_slots x draft cell per rank.
+    dflash_window_pool: bool = False
+    speculative_draft_window_size: Optional[int] = None
+    #: Per-rank MiB of everything the pool pays that is neither weights, nor
+    #: the mamba pool, nor KV (runtime state, activation reserve, workspaces),
+    #: MEASURED on the last boot of this form by the caller. Replaces the flat
+    #: _PREDICT_OVERHEAD_MIB + _PREDICT_MAMBA_ACT_RESERVE_MIB (2304 MiB/rank).
+    overhead_mib_by_rank: Optional[List[float]] = None
+
     @property
     def rank_gpu_memory_mib(self):
         """Alias so functions that duck-type a ``ServerArgs`` (e.g.
@@ -3314,6 +3334,24 @@ _GGUF_SCALAR_FMT = {
 #: fixed-size recurrent STATE instead (sized by the mamba pool, not per token),
 #: so they must not be counted here.
 _KV_BEARING_LAYER_TYPES = ("full_attention", "sliding_attention", "attention")
+
+
+#: dflash_solo_pool.SOLO_POOL_FACTOR_ENV / DEFAULT_SOLO_POOL_FACTOR, spelled
+#: here because that module imports torch; a unit test pins the two equal.
+_WINDOW_POOL_FACTOR_ENV = "SGLANG_DFLASH_SOLO_POOL_FACTOR"
+_WINDOW_POOL_FACTOR_DEFAULT = 2.0
+
+
+def dflash_window_pool_slots(window: int, block: int, max_running: int) -> int:
+    """The DFlash window pool's slot count -- the formula of
+    ``pool_configurator.window_pool_draft_slots`` (``1 + (W + block) x
+    max_running x factor``), torch-free so a planner can price the reserve
+    the rank will take (xsn420: W=2048, block 8, mrr 6 -> 24673 slots)."""
+    try:
+        factor = float(os.environ.get(_WINDOW_POOL_FACTOR_ENV, _WINDOW_POOL_FACTOR_DEFAULT))
+    except ValueError:
+        factor = float(_WINDOW_POOL_FACTOR_DEFAULT)
+    return 1 + int((int(window) + max(1, int(block))) * max(1, int(max_running)) * max(1.0, factor))
 
 
 def _kv_cell_bytes_from_config(cfg: dict, kv_cache_dtype: Optional[str]) -> Optional[float]:
@@ -4219,6 +4257,31 @@ class PerfCostModel:
             2 * self.kv_heads * self.head_dim * (1 if "fp8" in kv_dtype else 2)
         )
         cell_layers = self.full_layers + (self.mtp_layers if self.spec_active else 0)
+        #: DFLASH window pool (PlanInputs.dflash_window_pool): per-rank constant
+        #: draft-KV reserve in bytes, 0.0 on every other form.
+        self.window_pool_reserve_bytes = 0.0
+        if (
+            getattr(plan_inputs, "dflash_window_pool", False)
+            and str(plan_inputs.speculative_algorithm or "").upper() == "DFLASH"
+            and plan_inputs.speculative_draft_model_path
+            and getattr(plan_inputs, "speculative_draft_window_size", None)
+            and not self.solo_active
+        ):
+            # The runtime's rule (pool_configurator.apply_window_pool_draft_charge):
+            # cell = the TARGET cell, the draft part a constant reserve.
+            cell_layers = self.full_layers
+            draft_cell = _kv_cell_bytes_from_config(
+                self._load_config(plan_inputs.speculative_draft_model_path),
+                plan_inputs.kv_cache_dtype,
+            )
+            if draft_cell:
+                self.window_pool_reserve_bytes = float(
+                    dflash_window_pool_slots(
+                        int(plan_inputs.speculative_draft_window_size),
+                        int(plan_inputs.speculative_num_draft_tokens or 1),
+                        int(plan_inputs.max_running_requests or 1),
+                    )
+                ) * float(draft_cell)
         #: Full-kv-head KV bytes per token (weighted DCP replicates heads).
         self.kv_cell_bytes = self.kv_cell_bytes_per_layer * cell_layers
 
@@ -4684,7 +4747,12 @@ class PerfCostModel:
         per-request state scales with the rank's GDN-unit share."""
         if not self.gdn_layers or not self.gdn_units:
             return [0.0] * self.tp_size
-        ssm_env = os.environ.get("SGLANG_MAMBA_SSM_DTYPE", "")
+        # The group's own --mamba-ssm-dtype when the caller states it (a
+        # planner outside the rank cannot read the rank's env), else the env.
+        ssm_env = str(
+            getattr(self.plan_inputs, "mamba_ssm_dtype", None)
+            or os.environ.get("SGLANG_MAMBA_SSM_DTYPE", "")
+        )
         ssm_bytes = 2 if "bfloat16" in ssm_env or "float16" in ssm_env else 4
         heads_per_unit = max(self.gdn_v_heads // max(self.gdn_k_heads, 1), 1)
         state_per_unit_layer = (
@@ -4869,6 +4937,11 @@ class PerfCostModel:
             overhead = (
                 _PREDICT_OVERHEAD_MIB + _PREDICT_MAMBA_ACT_RESERVE_MIB
             ) * 2**20
+            # 27B line: the caller's MEASURED per-rank overhead, when given,
+            # replaces the flat constant (PlanInputs.overhead_mib_by_rank).
+            _measured_ovh = getattr(self.plan_inputs, "overhead_mib_by_rank", None)
+            if _measured_ovh is not None and len(_measured_ovh) != self.tp_size:
+                _measured_ovh = None
             # Solo host only: the draft's CUDA graphs and its own attention
             # workspace live on top of the draft weights and draft KV pool,
             # and neither the generic per-rank overhead above nor the weight
@@ -4895,7 +4968,9 @@ class PerfCostModel:
                     else 0.0
                 )
                 free_bytes.append(
-                    budget - weights[r] - mamba[r] - overhead - extra
+                    budget - weights[r] - mamba[r]
+                    - (overhead if _measured_ovh is None else float(_measured_ovh[r]) * 2**20)
+                    - extra - self.window_pool_reserve_bytes
                 )
         if self.solo_active:
             p = self._solo_rank_token_capacity(free_bytes)

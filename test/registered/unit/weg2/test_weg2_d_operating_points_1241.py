@@ -750,43 +750,51 @@ class AttentionTokenAxis1293Test(unittest.TestCase):
         # is which axis the family's COMPUTE is judged and priced on.
         self.assertEqual(bs1.attn_heads, (12, 6, 6))
 
-    def test_1293_token_shares_are_proportional_to_the_measurement(self):
-        """Largest-remainder over the 64 token units, exactly the runtime's
-        own integerisation -- and the shares must SUM TO THE WORLD (the
-        owner rule hands out every one of the 64 units exactly once)."""
+    def test_1293_no_position_pins_the_token_vector_27b_line(self):
+        """27B line (24.09., approved reversal of the pinned half of #1293):
+        the launcher ships ONLY --rank-tp-ratio for every position, never
+        --rank-kv-ratio, so the runtime installs the CAPACITY-matched token
+        vector after profiling on every position (xsn420 D.log: 'installed
+        measured KV-token ownership vector [32, 15, 17]'). A row that showed
+        the rate-proportional vector (34,15,15 / 42,11,11 here) described a
+        split no boot of that position has. Every row now carries the vector
+        predict_capacity derives -- this fake derives none, so () -- and never
+        the rate-proportional one."""
         rows, _ = self.rows()
         bs1 = next(r for r in rows if r.position == "decode-bs1")
         bs6 = next(r for r in rows if r.position == "decode-bs6")
-        self.assertEqual(bs1.attn_token_units, DEC1_BS1_TOKEN_UNITS)
-        self.assertEqual(bs6.attn_token_units, DEC1_BS6_TOKEN_UNITS)
-        for row in (bs1, bs6):
-            units = row.attn_token_units
-            self.assertEqual(sum(units), 64, row.position)
-            total_w = sum(row.weights)
-            for r, (u, w) in enumerate(zip(units, row.weights)):
-                self.assertLess(
-                    abs(u - 64.0 * w / total_w),
-                    1.0,
-                    "rank %d of %s drifted a full unit off the measured "
-                    "ratio" % (r, row.position),
-                )
+        self.assertNotEqual(bs1.attn_token_units, DEC1_BS1_TOKEN_UNITS)
+        self.assertNotEqual(bs6.attn_token_units, DEC1_BS6_TOKEN_UNITS)
+        self.assertEqual(bs1.attn_token_units, ())
+        self.assertEqual(bs6.attn_token_units, ())
+        # the rate-proportional vector stays REPRESENTABLE on the token grid
+        # (the axis verdict is unchanged) -- it is just not what gets installed
+        from sglang.srt.distributed.utils import partition_units
 
-    def test_1293_the_pinned_token_vector_REACHES_the_capacity_gate(self):
-        """#492's discipline: the pinned vector's funded context is
-        cp_token_context_budget(pin, P) -- strictly the weaker of the two --
-        and it must reach the gate, not be rounded away. mlp for
-        [58, 25, 25] on 32 units is [17, 8, 7] -> P = [170000, 80000, 70000];
-        matched ctx would be 320000, the pin funds
-        min(170000//34, 80000//15, 70000//15) * 64 = 4666 * 64 = 298624."""
-        rows, _ = self.rows()
+        self.assertEqual(tuple(partition_units(64, list(bs1.weights))), DEC1_BS1_TOKEN_UNITS)
+
+    def test_1293_funded_ctx_is_the_capacity_install_not_a_rate_pin_27b_line(self):
+        """27B line (24.09.): the funded context of every position is priced
+        at the vector the runtime installs (capacity-matched), not at a
+        rate-pinned vector the launcher never ships. mlp for [58, 25, 25] on
+        32 units is [17, 8, 7] -> P = [170000, 80000, 70000] -> matched ctx
+        min(320000, 64 * 70000) = 320000 (the rate pin priced 298624).
+        predict_capacity is never handed a token_vector."""
+        seen = []
+
+        class Spy(Dec1PCM):
+            def predict_capacity(self, mlp, attn=None, token_vector=None):
+                seen.append(token_vector)
+                return super().predict_capacity(mlp, attn, token_vector=token_vector)
+
+        rows, _ = self.rows(pcm=Spy)
         bs1 = next(r for r in rows if r.position == "decode-bs1")
-        self.assertEqual(bs1.funded_ctx_tokens, 298624)
-        self.assertNotEqual(bs1.funded_ctx_tokens, 320000)
-        # maxkv keeps the derived-matched call (byte-identical default):
-        # mlp = partition_units(32, [3669, 2267, 2265]) = [14, 9, 9] ->
-        # P = [140000, 90000, 90000] -> min(320000, 64 * 90000) = 320000.
+        self.assertEqual(bs1.funded_ctx_tokens, 320000)
+        self.assertNotEqual(bs1.funded_ctx_tokens, 298624)
         maxkv = next(r for r in rows if r.position == "maxkv")
         self.assertEqual(maxkv.funded_ctx_tokens, 320000)
+        self.assertTrue(seen)
+        self.assertTrue(all(v is None for v in seen), seen)
 
     # -- MUTANT A: attention back on the head grid -------------------------
 
@@ -889,8 +897,10 @@ class AttentionTokenAxis1293Test(unittest.TestCase):
         rows, refusals = self.rows()
         line = d_operating_point_line(rows, refusals, "maxkv")
         self.assertIn("attn_axis=token", line)
-        self.assertIn("token_units [34, 15, 15]", line)
-        self.assertIn("token_units [42, 11, 11]", line)
+        # 27B line (24.09.): no row prints a rate-pinned token vector any more
+        # -- the runtime installs the capacity-matched one on every position
+        self.assertNotIn("token_units [34, 15, 15]", line)
+        self.assertNotIn("token_units [42, 11, 11]", line)
         # The head grid still BINDS for the projections on this rig (4 units,
         # ranks 1/2 floored) -- stated on the row instead of either silent or
         # fatal.

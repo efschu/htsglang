@@ -7145,7 +7145,28 @@ def _weights_from_scores(scores: Sequence[float]) -> Tuple[int, ...]:
     return _gcd_reduce([int(round(float(s) / max(lo, 1e-9) * 1000.0)) for s in scores])
 
 
-def d_plan_inputs(model: str, tp_size: int, d_bs: int):
+def _group_fact_value(group: str, flag: str) -> Optional[str]:
+    """The value EARLY_READ_FACTS states for ``flag`` on ``group`` -- the same
+    row build_env exports and the argv builders emit."""
+    for fact in EARLY_READ_FACTS:
+        if fact.groups in ("both", group) and len(fact.flag) >= 2 and fact.flag[0] == flag:
+            return str(fact.flag[1])
+    return None
+
+
+def d_window_pool_fields() -> Dict[str, object]:
+    """PlanInputs fields of group D's DFLASH window pool: set exactly when
+    spec_form_env("D") publishes SGLANG_DFLASH_WINDOW_POOL=1 and the draft is
+    split (the solo host prices its own pool)."""
+    if spec_form_is_dflash() and spec_form_env("D").get("SGLANG_DFLASH_WINDOW_POOL") == "1" \
+            and dflash_placement() != "solo":
+        return {"dflash_window_pool": True,
+                "speculative_draft_window_size": int(_SPEC_FORM["window"])}
+    return {}
+
+
+def d_plan_inputs(model: str, tp_size: int, d_bs: int,
+                  overhead_mib_by_rank: Optional[Sequence[float]] = None):
     """The runtime ``PlanInputs`` describing THIS boot's group D.
 
     ONE FACTORY (refuter MF-6). Every field is read from the module constant
@@ -7161,7 +7182,149 @@ def d_plan_inputs(model: str, tp_size: int, d_bs: int):
         kv_cache_dtype=KV_CACHE_DTYPE,
         max_running_requests=int(d_bs),
         **spec_plan_fields(),
+        # 27B line (24.09.): the GROUP's facts, which this launcher process
+        # does not carry in its own environment -- the SSM dtype (priced fp32
+        # before: the planner read SGLANG_MAMBA_SSM_DTYPE off the launcher's
+        # env, where it is never set) and the DFLASH window pool (cell 32768 +
+        # constant draft reserve instead of 34816 per token).
+        mamba_ssm_dtype=_group_fact_value("D", "--mamba-ssm-dtype"),
+        **d_window_pool_fields(),
+        overhead_mib_by_rank=(list(overhead_mib_by_rank)
+                              if overhead_mib_by_rank is not None else None),
     )
+
+
+def d_row_attn_units(pcm, weights: Sequence[int]) -> List[int]:
+    """The attention UNIT vector a D operating-point row prices ``weights``
+    with -- the runtime widens the grid to the q-heads when the o-group count
+    is below the world size (uneven_perf.py:4520-4528). ONE implementation for
+    the row and for the calibration that must reproduce the row exactly."""
+    from sglang.srt.distributed.utils import partition_units
+
+    n_ranks = len(weights)
+    a_units = int(pcm.attn_units)
+    grid = a_units if a_units >= n_ranks else max(int(pcm.q_heads), n_ranks)
+    return list(partition_units(grid, list(weights)))
+
+
+_KV_POOL_SIZING_RE = re.compile(
+    r"TP(\d+)\] KV pool sizing: available_bytes=(\d+) .*?cell_size=(\d+)")
+
+
+def _d_argv_of_front_log(front_log: str) -> List[str]:
+    try:
+        with open(front_log, errors="replace") as f:
+            for line in f:
+                if "group D argv:" in line:
+                    return shlex.split(line.split("group D argv:", 1)[1])
+    except OSError:
+        pass
+    return []
+
+
+def d_overhead_calibration(
+    model: str, line_id, evidence_dir: str = EVIDENCE_DIR,
+) -> Tuple[Optional[List[float]], str]:
+    """Per-rank MiB of group D's non-KV, non-weight, non-mamba posts, MEASURED
+    on the newest D log of THIS line (``line_id``: same checkpoint, a commit
+    of this line's own history) -- ``(None, why)`` when no such boot exists.
+
+    Against the planner's own weight and mamba model at THAT boot's vector
+    and budgets: ``O_r = budget_r - KV bytes_r - weights_r - mamba_r -
+    window reserve``, KV bytes the rank's own final 'KV pool sizing:
+    available_bytes' line. The planner then reproduces that boot's per-rank
+    capacity exactly at its own vector and moves weights / mamba with any
+    other vector. The flat 2304 MiB it replaces priced xsn420's D at 330939
+    tokens against 634087 realised. The measured cell must equal the
+    planner's cell, or the calibration does not transfer and is refused.
+    """
+    from sglang.srt.distributed.utils import partition_units
+    from sglang.srt.uneven_perf import PerfCostModel
+
+    if line_id is None:
+        return None, "no line identity (desk caller)"
+    try:
+        names = [n for n in os.listdir(evidence_dir) if n.endswith(".D.log")]
+    except OSError as exc:
+        return None, f"evidence dir unreadable: {exc}"
+    paths = sorted((os.path.join(evidence_dir, n) for n in names),
+                   key=os.path.getmtime, reverse=True)
+    skipped = 0
+    for d_log in paths:
+        if not line_id.accepts_log(d_log):
+            continue
+        front = d_log[: -len(".D.log")] + ".front.log"
+        argv = _d_argv_of_front_log(front)
+        if not argv:
+            skipped += 1
+            continue
+        kv: Dict[int, Tuple[int, int]] = {}
+        try:
+            with open(d_log, errors="replace") as f:
+                for line in f:
+                    if "KV pool sizing:" in line:
+                        m = _KV_POOL_SIZING_RE.search(line)
+                        if m:
+                            kv[int(m.group(1))] = (int(m.group(2)), int(m.group(3)))
+        except OSError:
+            skipped += 1
+            continue
+        fm: Dict[str, str] = {}
+        for i, tok in enumerate(argv[:-1]):
+            if tok.startswith("--"):
+                fm[tok] = argv[i + 1]
+        try:
+            budgets = [int(x) for x in fm["--rank-gpu-memory-mib"].split(",")]
+            mrr = int(fm.get("--max-running-requests", "1"))
+        except (KeyError, ValueError):
+            skipped += 1
+            continue
+        n = len(budgets)
+        if sorted(kv) != list(range(n)):
+            skipped += 1
+            continue
+        ratio = fm.get("--rank-tp-ratio", "auto")
+        if ratio == "auto":
+            weights = list(_gcd_reduce(budgets))
+        else:
+            try:
+                weights = [int(x) for x in ratio.split(",")]
+            except ValueError:
+                skipped += 1
+                continue
+            if len(weights) != n:
+                skipped += 1
+                continue
+        cells = {c for _, c in kv.values()}
+        try:
+            pcm = PerfCostModel(d_plan_inputs(model, n, mrr), weights, budgets)
+            mlp = list(partition_units(int(pcm.mlp_units), weights))
+            # the SAME joint candidate the row prices (predict_capacity(mlp,
+            # attn_units): attention/GDN/mamba follow the attn units), so the
+            # row reproduces this boot per rank, not only in the sum
+            attn_units = d_row_attn_units(pcm, weights)
+            w = pcm.per_rank_weight_bytes(mlp, attn_units)
+            mamba = pcm.mamba_pool_bytes_for(attn_units)
+        except Exception as exc:  # noqa: BLE001 -- a calibration never kills a boot
+            return None, f"planner not buildable for {os.path.basename(d_log)}: {exc}"
+        if cells != {int(pcm.kv_cell_bytes)}:
+            return None, (f"{os.path.basename(d_log)}: measured cell {sorted(cells)} != planner cell "
+                          f"{int(pcm.kv_cell_bytes)} -- the calibration would not transfer")
+        mib = float(1 << 20)
+        ovh = [
+            (budgets[r] * mib - kv[r][0] - w[r] - mamba[r] - pcm.window_pool_reserve_bytes) / mib
+            for r in range(n)
+        ]
+        if any(o < 0 or o > 8192 for o in ovh):
+            return None, (f"{os.path.basename(d_log)}: implausible measured overhead "
+                          f"{[round(o) for o in ovh]} MiB -- refused, flat default stays")
+        return ovh, (
+            f"MEASURED on {os.path.basename(d_log)} (this line, {line_id.model_name}): budgets {budgets}, "
+            f"--rank-tp-ratio {ratio}, mrr {mrr}, KV {[kv[r][0] for r in range(n)]} B at cell "
+            f"{sorted(cells)[0]} -> overhead {[round(o, 1) for o in ovh]} MiB/rank "
+            f"(flat default was {1280 + 1024}); skipped {skipped} newer log(s) without the instruments"
+        )
+    return None, f"no D log of this line carries 'KV pool sizing' and a group D argv (skipped {skipped})"
 
 
 def _attn_axis_for(weights: Sequence[int], plan_flags) -> str:
@@ -7257,6 +7420,7 @@ def d_operating_point_rows(
     model: str,
     d_bs: int,
     facts: Sequence[EarlyReadFact] = EARLY_READ_FACTS,
+    overhead_mib_by_rank: Optional[Sequence[float]] = None,
 ) -> Tuple[List[DOperatingPointRow], List[str]]:
     """Price the three D weight vectors side by side. Returns (rows, refusals).
 
@@ -7281,7 +7445,7 @@ def d_operating_point_rows(
     try:
         from sglang.srt.uneven_perf import PerfCostModel
 
-        plan = d_plan_inputs(model, len(budgets), d_bs)
+        plan = d_plan_inputs(model, len(budgets), d_bs, overhead_mib_by_rank)
         pcm = PerfCostModel(
             plan,
             list(maxkv_weights),
@@ -7413,7 +7577,7 @@ def d_operating_point_rows(
             # row quotes the geometry the model would actually shard on.
             a_units = int(pcm.attn_units)
             grid = a_units if a_units >= n_ranks else max(int(pcm.q_heads), n_ranks)
-            attn_units = list(partition_units(grid, list(weights)))
+            attn_units = d_row_attn_units(pcm, weights)
             scale = int(pcm.q_heads) // max(1, grid)
             attn = tuple(u * scale for u in attn_units)
             # #1293 THE AXIS THE ATTENTION COMPUTE RIDES. Under replicated-KV
@@ -7432,17 +7596,16 @@ def d_operating_point_rows(
             # gridding attention on kv-heads (placement.py:813 models it
             # right); the same class sat here.
             axis = _attn_axis_for(weights, dcp_flags)
+            # 27B line (24.09.): NO position pins the token vector. The
+            # launcher ships only --rank-tp-ratio for every position (never
+            # --rank-kv-ratio), so the runtime installs the CAPACITY-matched
+            # vector after profiling on every one of them (xsn420 D.log:
+            # 'installed measured KV-token ownership vector [32, 15, 17]').
+            # The rate-proportional vector this used to pin priced a funded
+            # context no boot of these positions can have (decode-bs6:
+            # 116416 vs ~625k). The derived vector is read off
+            # predict_capacity below, for every position as for maxkv.
             token_units: Tuple[int, ...] = ()
-            if axis == "token" and position != "maxkv":
-                # The position's own intent made concrete: token ownership
-                # proportional to the measured rates, integerised exactly the
-                # way the runtime integerises its token vector. For maxkv
-                # (auto) the runtime DERIVES its capacity-matched vector
-                # instead; that derived vector is read off predict_capacity
-                # below rather than re-spelled here.
-                token_units = tuple(
-                    partition_units(_CP_TOKEN_UNITS, list(weights))
-                )
             # GDN through the cost model's OWN partitioner, so its predicate
             # (and its `[0] * tp_size` answer for a model it will not shard)
             # is inherited rather than re-implemented.
@@ -7601,20 +7764,23 @@ def d_operating_point_rows(
             # the gate rather than being rounded away. maxkv (auto) keeps the
             # byte-identical derived-matched call, and its token vector is
             # read BACK off the model's own answer below.
-            cap = (
-                pcm.predict_capacity(
-                    mlp, list(attn_units), token_vector=list(token_units)
-                )
-                if token_units
-                else pcm.predict_capacity(mlp, list(attn_units))
-            )
+            cap = pcm.predict_capacity(mlp, list(attn_units))
             pool = int(sum(cap["p"]))
             if "feasible" in cap:
                 feasible = bool(cap["feasible"])
             if cap.get("ctx") is not None:
                 funded_ctx = int(cap["ctx"])
-            if position == "maxkv" and axis == "token" and cap.get("token_vector"):
+            if axis == "token" and cap.get("token_vector"):
                 token_units = tuple(int(v) for v in cap["token_vector"])
+                # THE RUNTIME'S OWN INSTALLED POOL: the owner rule over the
+                # vector it installs (distributed/utils.cp_token_context_budget,
+                # the same arithmetic as 'max_total_num_tokens X -> ~Y'), i.e.
+                # the funded context after the 64-unit quantisation.
+                from sglang.srt.distributed.utils import cp_token_context_budget
+
+                funded_ctx = int(cp_token_context_budget(
+                    [max(int(v), 1) for v in token_units],
+                    [max(int(x), 1) for x in cap["p"]]))
         except Exception:
             pool = None
         refusal = None
@@ -7850,6 +8016,7 @@ def d_tp_ratio_decision(
     budgets: Sequence[int],
     model: str,
     d_bs: int,
+    overhead_mib_by_rank: Optional[Sequence[float]] = None,
 ) -> DTpRatioDecision:
     """Choose group D's weight objective and PRICE the choice on one line.
 
@@ -7911,7 +8078,8 @@ def d_tp_ratio_decision(
     # #1241 slice (2). Built on EVERY boot, including the maxkv ones, because
     # the point of the line is that the trade is visible per boot. Refusals
     # only KILL the launch when the refused position is the one being shipped.
-    op_rows, op_refusals = d_operating_point_rows(cards, budgets, model, d_bs)
+    op_rows, op_refusals = d_operating_point_rows(
+        cards, budgets, model, d_bs, overhead_mib_by_rank=overhead_mib_by_rank)
     op_line = d_operating_point_line(op_rows, op_refusals, objective)
     if objective in D_OPERATING_POINTS:
         mine = [
@@ -7953,7 +8121,7 @@ def d_tp_ratio_decision(
         from sglang.srt.uneven_perf import PerfCostModel
 
         pcm = PerfCostModel(
-            d_plan_inputs(model, len(budgets), d_bs), weights, list(budgets)
+            d_plan_inputs(model, len(budgets), d_bs, overhead_mib_by_rank), weights, list(budgets)
         )
         n_q = int(pcm.q_heads)
         scale = n_q // max(1, int(pcm.attn_units))
@@ -11487,6 +11655,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ns.weg2_line_id = line_id
     log("WEG2-27B-LINE calibration identity: a measured source counts only when its boot ran "
         + line_id.describe())
+    # 27B line (24.09.): group D's planner overhead, MEASURED on the newest D
+    # log of this line (d_overhead_calibration). None = the flat default,
+    # named on the line.
+    d_overhead_mib, _d_overhead_prov = d_overhead_calibration(str(ns.model), line_id)
+    log("WEG2 D-PLANNER-CALIBRATION " + ("overhead " if d_overhead_mib is not None
+                                          else "UNCALIBRATED (flat 2304 MiB/rank): ")
+        + _d_overhead_prov)
     if dirty and not dry:
         raise Weg2LaunchRefused("tree is not clean -- boot from a COMMITTED tip only")
     py = f"{ns.venv}/bin/python"
@@ -12646,7 +12821,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if dry:
         budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card)
         d_ratio = d_tp_ratio_decision(
-            ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
+            ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs,
+            overhead_mib_by_rank=d_overhead_mib,
         )
         log(d_ratio.line)
         log(d_ratio.op_line)
@@ -12745,7 +12921,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     state.budgets["D"] = budgets_d
     d_ratio = d_tp_ratio_decision(
-        ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
+        ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs,
+        overhead_mib_by_rank=d_overhead_mib,
     )
     log(d_ratio.line)
     log(d_ratio.op_line)
