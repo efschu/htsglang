@@ -89,7 +89,12 @@ class _Fake:
 
 def _drive(monkeypatch, plan):
     fake = _Fake(plan)
-    monkeypatch.setattr(sched_mod, "_stage_sync", lambda *a, **k: None)
+    # raising=False: the NF line's scheduler carries a `_stage_sync` probe
+    # inside event_loop_overlap's pop_and_process; the 27B line (829ebd09f8)
+    # has no such attribute, and the patch must not require it -- the ORDER
+    # this test pins is the same on both lines (event_loop_overlap differs
+    # only by that one call).
+    monkeypatch.setattr(sched_mod, "_stage_sync", lambda *a, **k: None, raising=False)
     Scheduler.event_loop_overlap(fake)
     return fake.log
 
