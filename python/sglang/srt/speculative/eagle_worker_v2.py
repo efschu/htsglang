@@ -2720,39 +2720,150 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(batch)
             _stage_sync("extend-forward")
+            return self._extend_draft_phase(batch, batch_output, on_publish)
+        return self._forward_decode_round(batch, on_publish)
 
-            # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
-            # Extend processed L prompt tokens; next verify iter expects same L.
-            batch_output.new_seq_lens = batch.seq_lens
-            from sglang.srt.speculative.spec_batch_probe import probe as _sbp
+    def _extend_draft_phase(
+        self, batch: ScheduleBatch, batch_output: GenerationBatchResult, on_publish=None
+    ) -> GenerationBatchResult:
+        """The extend's tail after its target forward: publish, then the
+        draft prefill (solo host: ``_draft_extend_for_prefill``; shadow: the
+        stub). ONE body for a real target forward and for H24's skipped one
+        (``_forward_skip_extend``), so a skip reaches its first decode round
+        from the same draft state as E1 (H24b)."""
+        # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
+        # Extend processed L prompt tokens; next verify iter expects same L.
+        batch_output.new_seq_lens = batch.seq_lens
+        from sglang.srt.speculative.spec_batch_probe import probe as _sbp
 
-            _sbp("extend-handoff", batch,
-                 next_token_ids=getattr(batch_output, "next_token_ids", None))
-            # Publish before draft_extend so the fence is at target-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
+        _sbp("extend-handoff", batch,
+             next_token_ids=getattr(batch_output, "next_token_ids", None))
+        # Publish before draft_extend so the fence is at target-end.
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
 
-            # Draft prefill.
-            #
-            # Draft-input replication note (why solo needs no extra input
-            # comm): the NEXTN/EAGLE draft consumes the TARGET's hidden
-            # states (logits_output.hidden_states), and the target's
-            # residual stream is REPLICATED on every TP rank — each decoder
-            # layer ends in a RowParallel all_reduce, so the captured
-            # hidden states (FULL here, LAST in decode) are already
-            # identical bytes on all ranks when this point is reached. The
-            # solo rank therefore drafts from purely local inputs; the
-            # shadows only need the k token ids it broadcasts per round.
-            if self._spec_solo_active and not self._spec_solo_is_host:
-                # Shadow rank: skip the draft prefill forward entirely. The
-                # draft KV for the prefill positions is written ONLY on the
-                # solo rank (hidden states for all prefill positions are
-                # locally available there post-target-forward).
-                batch_output.next_draft_input = self._solo_stub_draft_input(
-                    batch, batch_output.next_token_ids
+        # Draft prefill.
+        #
+        # Draft-input replication note (why solo needs no extra input
+        # comm): the NEXTN/EAGLE draft consumes the TARGET's hidden
+        # states (logits_output.hidden_states), and the target's
+        # residual stream is REPLICATED on every TP rank — each decoder
+        # layer ends in a RowParallel all_reduce, so the captured
+        # hidden states (FULL here, LAST in decode) are already
+        # identical bytes on all ranks when this point is reached. The
+        # solo rank therefore drafts from purely local inputs; the
+        # shadows only need the k token ids it broadcasts per round.
+        if self._spec_solo_active and not self._spec_solo_is_host:
+            # Shadow rank: skip the draft prefill forward entirely. The
+            # draft KV for the prefill positions is written ONLY on the
+            # solo rank (hidden states for all prefill positions are
+            # locally available there post-target-forward).
+            batch_output.next_draft_input = self._solo_stub_draft_input(
+                batch, batch_output.next_token_ids
+            )
+            _stage_sync("extend-draft")
+            return batch_output
+        with (
+            self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft_extend"),
+        ):
+            batch_output.next_draft_input = (
+                self.draft_worker._draft_extend_for_prefill(
+                    batch,
+                    batch_output.logits_output.hidden_states,
+                    batch_output.next_token_ids,
+                    batch_output.logits_output.mm_input_embeds,
                 )
-                _stage_sync("extend-draft")
-                return batch_output
+            )
+            _stage_sync("extend-draft")
+            return batch_output
+
+    def _forward_decode_round(self, batch: ScheduleBatch, on_publish=None):
+        """One decode round: draft -> verify -> draft extend."""
+        from sglang.srt.speculative.spec_batch_probe import probe as _sbp
+
+        _sbp("decode-entry", batch)
+        self.activate_step_by_batch(batch.seq_lens.shape[0])
+        if self.round_cost_probe is not None:
+            # Tag the measurement with the chain length just activated.
+            self.round_cost_probe.begin(self.speculative_num_steps)
+
+        if batch.spec_info is None:
+            capture_mode = (
+                CaptureHiddenMode.NULL
+                if self.speculative_algorithm.is_standalone()
+                else CaptureHiddenMode.LAST
+            )
+            hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                self.draft_worker.draft_runner
+            )
+            batch.spec_info = EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=hidden_size,
+                dtype=hidden_dtype,
+                topk=self.topk,
+                capture_hidden_mode=capture_mode,
+                vocab_size=self.target_worker.model_config.vocab_size,
+            )
+        # #631 PHASE-FLIP BOOTSTRAP ROUND. A request carried across a
+        # PP->TP cutover prefilled in a phase that has no draft worker,
+        # so it has no draft chain to start from -- only the bootstrap
+        # seed the cutover installed, which carries bonus_tokens and
+        # nothing else that is real. Run the SAME trivial 1-node verify
+        # the zero-step path uses (always accepts the root, samples one
+        # bonus token from target logits: functionally a plain decode)
+        # and let the _draft_extend_for_decode at the end of this round
+        # seed the real chain from its FULL-captured hidden states.
+        # From the next round the carried request is ordinary.
+        # #1233 (WEG 2, S0): the cold-bootstrap mark is gone. It was
+        # planted only when a request crossed an in-process layout change
+        # into a draft worker that had never seen it; Weg 2's decode group
+        # builds its draft worker at boot and keeps it for the group's
+        # whole life, so no request in this process ever arrives cold.
+        if self.speculative_num_steps == 0:
+            # Drafting disabled (high batch size). _draft_extend below still
+            # runs, keeping draft KV warm for when the batch shrinks.
+            verify_input = self._build_trivial_verify_input(batch)
+        else:
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft"),
+            ):
+                verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+        _stage_sync("draft")
+        assert verify_input.is_verify_input()
+        batch.spec_info = verify_input
+        batch_output = self.verify(batch)
+        _stage_sync("verify-end")
+        # Publish before draft_extend so the fence is at verify-end.
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+        if self._spec_solo_active and not self._spec_solo_is_host:
+            # Shadow rank: no draft-extend forward. verify already set
+            # bonus_tokens (the only next-round field a shadow reads —
+            # its next draft round is the broadcast recv); topk/hidden
+            # get shape-valid stubs for the overlap FutureMap.
+            self._stub_skipped_draft_extend(batch, batch_output)
+        elif (
+            self.speculative_num_steps == 0
+            and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
+            # #1233 (WEG 2, S0): the ``and not flip_bootstrap`` term is
+            # gone with the mark. It kept the stub away from a bootstrap
+            # round, whose whole purpose was to produce the hidden states
+            # this draft_extend turns into a real seed for a request that
+            # had just crossed into a cold draft worker. No request in
+            # this process crosses into a cold draft worker any more.
+        ):
+            self._stub_skipped_draft_extend(batch, batch_output)
+        else:
             with (
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group
@@ -2761,131 +2872,33 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 speculative_moe_a2a_backend_context(),
                 spec_stage_span("draft_extend"),
             ):
-                batch_output.next_draft_input = (
-                    self.draft_worker._draft_extend_for_prefill(
-                        batch,
-                        batch_output.logits_output.hidden_states,
-                        batch_output.next_token_ids,
-                        batch_output.logits_output.mm_input_embeds,
-                    )
+                self.draft_worker._draft_extend_for_decode(
+                    batch,
+                    batch_output,
+                    # The bootstrap round's verify was 1 node wide, so
+                    # this draft extend has one token row per request
+                    # and must stride over that, not over the
+                    # instance's configured 4.
+                    #
+                    # Passed UNCONDITIONALLY (#631): the two are equal
+                    # on every ordinary round, so this is byte-identical
+                    # there, and making it conditional on flip_bootstrap
+                    # left the correct width one `or` away from any
+                    # future narrowed caller. State the width, always.
+                    verify_width=int(verify_input.draft_token_num),
                 )
-                _stage_sync("extend-draft")
-                return batch_output
-        else:
-            from sglang.srt.speculative.spec_batch_probe import probe as _sbp
+        _stage_sync("draft-extend")
 
-            _sbp("decode-entry", batch)
-            self.activate_step_by_batch(batch.seq_lens.shape[0])
-            if self.round_cost_probe is not None:
-                # Tag the measurement with the chain length just activated.
-                self.round_cost_probe.begin(self.speculative_num_steps)
+        # The bootstrap is discharged only HERE -- after the
+        # draft_extend that turned this round's hidden states into a
+        # real chain actually ran. Clearing the mark any earlier (at
+        # the cutover, or before the verify) would let an exception
+        # between the two leave a request marked as bootstrapped while
+        # its draft input is still the seed's zeros.
+        if self.round_cost_probe is not None:
+            self.round_cost_probe.end()
+        return batch_output
 
-            if batch.spec_info is None:
-                capture_mode = (
-                    CaptureHiddenMode.NULL
-                    if self.speculative_algorithm.is_standalone()
-                    else CaptureHiddenMode.LAST
-                )
-                hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
-                    self.draft_worker.draft_runner
-                )
-                batch.spec_info = EagleDraftInput.create_idle_input(
-                    device=self.device,
-                    hidden_size=hidden_size,
-                    dtype=hidden_dtype,
-                    topk=self.topk,
-                    capture_hidden_mode=capture_mode,
-                    vocab_size=self.target_worker.model_config.vocab_size,
-                )
-            # #631 PHASE-FLIP BOOTSTRAP ROUND. A request carried across a
-            # PP->TP cutover prefilled in a phase that has no draft worker,
-            # so it has no draft chain to start from -- only the bootstrap
-            # seed the cutover installed, which carries bonus_tokens and
-            # nothing else that is real. Run the SAME trivial 1-node verify
-            # the zero-step path uses (always accepts the root, samples one
-            # bonus token from target logits: functionally a plain decode)
-            # and let the _draft_extend_for_decode at the end of this round
-            # seed the real chain from its FULL-captured hidden states.
-            # From the next round the carried request is ordinary.
-            # #1233 (WEG 2, S0): the cold-bootstrap mark is gone. It was
-            # planted only when a request crossed an in-process layout change
-            # into a draft worker that had never seen it; Weg 2's decode group
-            # builds its draft worker at boot and keeps it for the group's
-            # whole life, so no request in this process ever arrives cold.
-            if self.speculative_num_steps == 0:
-                # Drafting disabled (high batch size). _draft_extend below still
-                # runs, keeping draft KV warm for when the batch shrinks.
-                verify_input = self._build_trivial_verify_input(batch)
-            else:
-                with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft"),
-                ):
-                    verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
-            _stage_sync("draft")
-            assert verify_input.is_verify_input()
-            batch.spec_info = verify_input
-            batch_output = self.verify(batch)
-            _stage_sync("verify-end")
-            # Publish before draft_extend so the fence is at verify-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
-            if self._spec_solo_active and not self._spec_solo_is_host:
-                # Shadow rank: no draft-extend forward. verify already set
-                # bonus_tokens (the only next-round field a shadow reads —
-                # its next draft round is the broadcast recv); topk/hidden
-                # get shape-valid stubs for the overlap FutureMap.
-                self._stub_skipped_draft_extend(batch, batch_output)
-            elif (
-                self.speculative_num_steps == 0
-                and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
-                # #1233 (WEG 2, S0): the ``and not flip_bootstrap`` term is
-                # gone with the mark. It kept the stub away from a bootstrap
-                # round, whose whole purpose was to produce the hidden states
-                # this draft_extend turns into a real seed for a request that
-                # had just crossed into a cold draft worker. No request in
-                # this process crosses into a cold draft worker any more.
-            ):
-                self._stub_skipped_draft_extend(batch, batch_output)
-            else:
-                with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft_extend"),
-                ):
-                    self.draft_worker._draft_extend_for_decode(
-                        batch,
-                        batch_output,
-                        # The bootstrap round's verify was 1 node wide, so
-                        # this draft extend has one token row per request
-                        # and must stride over that, not over the
-                        # instance's configured 4.
-                        #
-                        # Passed UNCONDITIONALLY (#631): the two are equal
-                        # on every ordinary round, so this is byte-identical
-                        # there, and making it conditional on flip_bootstrap
-                        # left the correct width one `or` away from any
-                        # future narrowed caller. State the width, always.
-                        verify_width=int(verify_input.draft_token_num),
-                    )
-            _stage_sync("draft-extend")
-
-            # The bootstrap is discharged only HERE -- after the
-            # draft_extend that turned this round's hidden states into a
-            # real chain actually ran. Clearing the mark any earlier (at
-            # the cutover, or before the verify) would let an exception
-            # between the two leave a request marked as bootstrapped while
-            # its draft input is still the seed's zeros.
-            if self.round_cost_probe is not None:
-                self.round_cost_probe.end()
-            return batch_output
 
     def _forward_spill_tick_spec(self, batch: ScheduleBatch, on_publish=None):
         """C3/d2 (spec-in-spill-tick): run the model-configured NEXTN/EAGLE
@@ -3078,32 +3091,54 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _forward_skip_extend(
         self, batch: ScheduleBatch, first_tokens: List[int], on_publish=None
     ) -> GenerationBatchResult:
-        """H24 (weg2 E2): the extend [N-1, N) of a request whose END state P
-        handed over -- no forward. On the forward stream: join the batch's
-        HiCache load, write P's rows/ring/GDN state (tail_adopt.run_skip),
-        inside the prefill rank timer so the per-rank prefill line keeps its
-        1:1 pairing. The result is P's sampled token; the draft seed is the
-        shape-valid stub whose first verify re-seeds the chain from its own
-        hidden states (``_draft_extend_for_decode``). Every rank of the group
-        takes this branch for the same batch (the vote was a MIN)."""
+        """H24 (weg2 E2): the extend [c, N) of a request whose END state P
+        handed over -- no TARGET forward. On the forward stream: join the
+        batch's HiCache load, write P's rows/ring/GDN state
+        (tail_adopt.run_skip), inside the prefill rank timer so the per-rank
+        prefill line keeps its 1:1 pairing. The result is P's sampled token
+        with ZERO target hidden states for [c, N); the extend's draft phase
+        then runs unchanged (``_extend_draft_phase``).
+
+        H24b (metal fnFL2x140): the first cut returned the shadow's stub seed
+        on the SOLO HOST as well, so TP0 entered its first decode draft with
+        no draft extend behind it -- the only sequence that had never run --
+        and died at the draft-token broadcast ('barlink-bar1 a2a: kernel
+        launch failed', eagle_worker_v2 draft -> _solo_send_draft_tokens).
+        The skip now leaves the host in exactly E1's draft state. Every rank
+        of the group takes this branch for the same batch (the vote was a
+        MIN)."""
         runner = self.target_worker.model_runner
         timer = runner.prefill_rank_timer
+        shadow = self._spec_solo_active and not self._spec_solo_is_host
         ctx = timer.wrap(metadata={"category": "extend"}) if timer else contextlib.nullcontext()
         with ctx:
-            tail_adopt.run_skip(batch, counter=self.target_worker.hicache_layer_transfer_counter)
+            tail_adopt.run_skip(
+                batch,
+                counter=self.target_worker.hicache_layer_transfer_counter,
+                draft="stub" if shadow else "extend",
+            )
         _stage_sync("extend-forward")
-        next_token_ids = torch.tensor(first_tokens, dtype=torch.int64, device=self.device)
-        batch_output = GenerationBatchResult(
-            logits_output=LogitsProcessorOutput(next_token_logits=None),
-            next_token_ids=next_token_ids,
+        return self._extend_draft_phase(
+            batch, self._skip_extend_output(batch, first_tokens), on_publish
+        )
+
+    def _skip_extend_output(
+        self, batch: ScheduleBatch, first_tokens: List[int]
+    ) -> GenerationBatchResult:
+        """What the skipped target forward hands its draft phase: P's tokens
+        and FULL-shaped target hidden states of the extend rows, zeros (the
+        draft's own prefix rows are cold zeros too, #993)."""
+        config = self.target_worker.model_config
+        hidden = torch.zeros(
+            (int(batch.extend_num_tokens), int(config.spec_hidden_size)),
+            dtype=config.dtype,
+            device=self.device,
+        )
+        return GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(next_token_logits=None, hidden_states=hidden),
+            next_token_ids=torch.tensor(first_tokens, dtype=torch.int32, device=self.device),
             can_run_cuda_graph=False,
         )
-        batch_output.new_seq_lens = batch.seq_lens
-        if on_publish is not None:
-            on_publish(batch_output.new_seq_lens)
-        batch_output.next_draft_input = self._solo_stub_draft_input(batch, next_token_ids)
-        _stage_sync("extend-draft")
-        return batch_output
 
     def _solo_stub_draft_input(
         self, batch: ScheduleBatch, next_token_ids: torch.Tensor

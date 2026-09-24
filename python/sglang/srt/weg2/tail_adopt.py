@@ -61,20 +61,22 @@ starts a new group at c (the QSA ``prefix_lens % ratio == 0`` assert holds).
    token), the vote slot carries a LEVEL: 2 = this rank can serve the END
    state too, 1 = only E1, 0 = neither; the group's MIN is the one answer.
    On 2 (and rank-uniform admission checks: the batch is still empty, no
-   logprob/hidden/grammar/penalty request, key over ids[0:N]) the prefix
-   grows to N-1 inside ONE page and the batch's extend is the single token
-   [N-1, N) -- a shape, not a forward: EAGLEWorkerV2 runs NO target forward
-   for it (``skip_tokens`` / ``run_skip``). On the forward stream it joins
-   the batch's HiCache load (last layer event of its consumer), writes the
-   END rows at the request's slots [floor_page(c), N) (read from
-   req_to_token, so the extend's own slot N-1 included), the complete
-   groups' compressed rows, the ring rows at ``req_pool_idx * r + j``, and
-   the GDN slot; the result is P's token as ``next_token_ids`` and a stub
-   draft seed (hidden zeros) whose first verify round re-seeds the chain
-   from its own hidden states. The request then merges into the running
-   batch like any finished prefill: its next forward is a DECODE round. A
-   batch holding a skip request holds nothing else (PrefillAdder refuses the
-   next request, like the born-spilled-deep batch).
+   logprob/hidden/grammar/penalty request, key over ids[0:N]) the batch has
+   EXACTLY E1's shape -- prefix c inside ONE page, extend [c, N) -- but
+   EAGLEWorkerV2 runs NO target forward for it (``skip_tokens`` /
+   ``run_skip``). On the forward stream it joins the batch's HiCache load
+   (last layer event of its consumer), writes the END rows at the request's
+   slots [floor_page(c), N) (read from req_to_token, so the extend's own
+   slots [c, N) included), the complete groups' compressed rows, the ring
+   rows at ``req_pool_idx * r + j``, and the GDN slot. The result is P's
+   token as ``next_token_ids`` with ZERO target hidden states for [c, N),
+   and the extend's DRAFT phase then runs exactly as after a real target
+   forward (H24b): the solo host runs ``_draft_extend_for_prefill`` over
+   [c, N) (draft KV + draft-pool QSA rows of those positions, a real
+   draft seed), the shadows take their stub. The request then merges into
+   the running batch like any finished prefill. A batch holding a skip
+   request holds nothing else (PrefillAdder refuses the next request, like
+   the born-spilled-deep batch).
 
 QSA at an OPEN group (N % r != 0): decode compresses the group its length
 completes, from the per-request pending ring (qwen_sparse_attn_backend
@@ -427,10 +429,11 @@ class Agreed(msgspec.Struct):
 
     @property
     def resume_at(self) -> int:
-        """Where the admission's extend starts: N-1 under SKIP (a shape
-        only, no forward), else c (E1)."""
-        spec = self.staged.spec
-        return spec.n_tokens - 1 if self.skip else spec.cut
+        """Where the admission's extend starts: c, for E1 and SKIP alike.
+        H24b: SKIP keeps E1's batch shape [c, N) -- the draft extend that
+        follows needs a group-aligned prefix (QSA ``prefix_lens % r == 0``)
+        and is the proven order before the first decode draft."""
+        return self.staged.spec.cut
 
 
 _JOBS: Dict[str, _Job] = {}
@@ -635,7 +638,7 @@ class Install(msgspec.Struct):
     readback: Dict[str, Tuple[torch.Tensor, ...]] = {}
     #: E2 (SKIP): the END state -- written in one go by ``run_skip``; rows,
     #: groups, ring slots and the mamba slot are resolved there (the
-    #: request's req_pool_idx and its extend slot N-1 exist only after
+    #: request's req_pool_idx and its extend slots [c, N) exist only after
     #: prepare_for_extend)
     end: bool = False
     ring: Dict[int, Tuple[torch.Tensor, ...]] = {}
@@ -707,16 +710,15 @@ def _queue_install(req, st: Staged, rows: torch.Tensor, tree_cache) -> None:
 
 # -- 4. SKIP (E2) ----------------------------------------------------------------------
 def _commit_skip(req, entry: Agreed, tree_cache, page_size: int) -> int:
-    """E2 admission commit: ONE page, the prefix grows to N-1 inside it (its
-    first N-1-page_prefix slots), the extend [N-1, N) is a shape only; the
-    holding rank prepares the END install. Returns N-1."""
+    """E2 admission commit: ONE page, the prefix grows to c inside it (its
+    first c-page_prefix slots, E1's shape), the extend [c, N) runs no target
+    forward; the holding rank prepares the END install. Returns c."""
     from sglang.srt.mem_cache.common import alloc_token_slots
 
     st = entry.staged
     spec = st.spec
     page = alloc_token_slots(tree_cache, int(page_size))
-    n_prefix = spec.n_tokens - 1 - spec.page_prefix
-    rows = page[:n_prefix].to(dtype=req.prefix_indices.dtype, device=req.prefix_indices.device)
+    rows = page[: spec.rows].to(dtype=req.prefix_indices.dtype, device=req.prefix_indices.device)
     req.prefix_indices = torch.cat([req.prefix_indices, rows])
     _log_ready(st, "done", skip=True)
     inst = None
@@ -726,7 +728,7 @@ def _commit_skip(req, entry: Agreed, tree_cache, page_size: int) -> int:
                                         t0=time.perf_counter())
     while len(SKIP_PLANS) > KEEP_AGREED:  # an admitted batch that never ran
         SKIP_PLANS.pop(next(iter(SKIP_PLANS)))
-    return spec.n_tokens - 1
+    return spec.cut
 
 
 def _skip_install(st: Staged, tree_cache) -> Install:
@@ -763,9 +765,11 @@ def skip_tokens(batch) -> Optional[List[int]]:
     return [SKIP_PLANS[rid].first_token for rid in rids]
 
 
-def run_skip(batch, counter) -> None:
+def run_skip(batch, counter, draft: str = "extend") -> None:
     """Worker entry, on the forward stream, instead of the target forward:
-    join the batch's HiCache load, write every END install, log."""
+    join the batch's HiCache load, write every END install, log. ``draft``
+    names what seeds the chain on this rank (the host's draft extend, or a
+    shadow's stub)."""
     t = time.perf_counter()
     if counter is not None and batch.hicache_consumer_index >= 0:
         # the load-back of [0, floor_page(c)) (+ its GDN anchor into the
@@ -778,9 +782,11 @@ def run_skip(batch, counter) -> None:
         if plan.install is not None:
             _install_end(plan.install, req)
         logger.info(
-            "WEG2-TAIL-SKIP-EXTEND rid=%s prefix=%d first_token=%d draft=no held=%s ms=%.1f since_commit_ms=%.1f "
-            "(no extend forward: P's END state + token; the first decode round verifies off a stub seed)",
-            plan.spec.rid, plan.spec.n_tokens, plan.first_token, "yes" if plan.install is not None else "not_mine",
+            "WEG2-TAIL-SKIP-EXTEND rid=%s prefix=%d first_token=%d draft=%s draft_rows=%d held=%s ms=%.1f "
+            "since_commit_ms=%.1f (no target forward: P's END state + token; the draft phase of [c, N) runs "
+            "as after a real extend, off zero target hidden states)",
+            plan.spec.rid, plan.spec.n_tokens, plan.first_token, draft, plan.spec.extend,
+            "yes" if plan.install is not None else "not_mine",
             (time.perf_counter() - t) * 1000.0, (time.perf_counter() - plan.t0) * 1000.0,
         )
 

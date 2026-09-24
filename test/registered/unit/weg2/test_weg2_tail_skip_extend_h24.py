@@ -14,13 +14,17 @@ pin (derived properties / bookkeeping a later diff can silently break):
   the same MIN slot, so ONE rank short of the END state puts EVERY rank on E1
   -- never a split where one rank skips the forward its peers run (the Form-A
   all-reduces would wedge);
-* the admission under SKIP grows the prefix to N-1 inside one page, closes the
-  batch, and the (skipped) extend slot N-1 receives P's last row;
+* the admission under SKIP builds EXACTLY E1's batch (prefix c inside one
+  page, extend [c, N)), closes the batch, and the extend's own slots [c, N)
+  receive P's last rows -- no target forward runs over them;
 * the install lands byte-exact at D's own slots (rows via req_to_token, groups
   at slot // r, ring rows at D's ``req_pool_idx * r + j``, the GDN slot) and
   after the batch's HiCache load join;
-* the worker returns P's token and a shape-valid draft seed with that token as
-  the bonus -- the request enters the decode queue like a finished prefill.
+* the worker returns P's token and hands the extend's DRAFT phase zero target
+  hidden states: the solo host runs its draft extend over [c, N) exactly as
+  after a real forward, a shadow takes its stub (H24b, metal fnFL2x140: the
+  host drafting its first decode round off the shadow's stub, with no draft
+  extend behind it, died at the draft-token broadcast).
 """
 
 import contextlib
@@ -340,10 +344,10 @@ def test_level_two_vote_skips_the_extend_on_every_rank(d_group, caplog):
     with caplog.at_level(logging.INFO, logger="sglang.srt.weg2.tail_adopt"):
         votes, plans = _run_group(d_group)
         assert votes == [2, 2, 2] and all(p.skip for p in plans)
-        # every rank: prefix N-1 inside ONE page, the extend is the 1-token shape [N-1, N)
+        # every rank: E1's shape -- prefix c inside ONE page, extend [c, N)
         for r in d_group:
-            assert len(r.req.prefix_indices) == N - 1
-            assert torch.equal(r.req.prefix_indices[PREFIX:], torch.arange(D_PAGE * PAGE, D_PAGE * PAGE + N - 1 - PREFIX))
+            assert len(r.req.prefix_indices) == C
+            assert torch.equal(r.req.prefix_indices[PREFIX:], torch.arange(D_PAGE * PAGE, D_PAGE * PAGE + C - PREFIX))
             assert not r.pending  # nothing rides the (absent) forward's GDN reads
             _prepare_for_extend(r)
         counter = _Counter()
@@ -371,7 +375,7 @@ def test_level_two_vote_skips_the_extend_on_every_rank(d_group, caplog):
     assert text.count(f"state_at={N} extend=0 parts=3") == 3
     assert f"WEG2-TAIL-ADOPT rid={RID} page_prefix=192 tail_rows=49 state_at={N} extend=0 fa_rows_written=49 " \
            "fa_layers=3 gdn_layers=9 digest=match" in text
-    assert text.count(f"WEG2-TAIL-SKIP-EXTEND rid={RID} prefix={N} first_token={FIRST} draft=no") == 3
+    assert text.count(f"WEG2-TAIL-SKIP-EXTEND rid={RID} prefix={N} first_token={FIRST} draft=extend draft_rows=1") == 3
 
 
 def _assert_e1(d_group, plans):
@@ -430,7 +434,7 @@ def test_uniform_admission_refusal_is_e1_on_every_rank(d_group, caplog, what, re
 
 def test_a_process_without_the_skip_branch_votes_e1(d_group, monkeypatch):
     """A D whose model worker would run the extend forward anyway (no
-    EAGLEWorkerV2) must never vote 2: the forward over [N-1, N) on a GDN
+    EAGLEWorkerV2) must never vote 2: the forward over [c, N) on a GDN
     state already at N would advance it twice."""
     _publish()
     monkeypatch.setattr(ta, "_SKIP_SERVER", [False])
@@ -487,32 +491,75 @@ def test_readback_mismatch_names_the_ring(d_group, caplog):
 
 
 # ------------------------------------------------------------------ the worker's branch
-def test_worker_returns_p_token_and_a_draft_seed_without_a_forward(d_group):
+class _DraftWorker:
+    def __init__(self):
+        self.calls = []
+        self.draft_runner = SimpleNamespace(tp_group=None)
+
+    def draft_tp_context(self, group):
+        return contextlib.nullcontext()
+
+    def _draft_extend_for_prefill(self, batch, hidden, next_token_ids, mm_input_embeds):
+        self.calls.append((hidden, next_token_ids, mm_input_embeds))
+        return SimpleNamespace(bonus_tokens=next_token_ids, seeded_by="draft_extend")
+
+
+def _worker(solo_active, solo_host):
+    import torch as _t
+
     from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
+    w = object.__new__(EAGLEWorkerV2)
+    w._target_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(prefill_rank_timer=None),
+        hicache_layer_transfer_counter=_Counter(),
+        model_config=SimpleNamespace(spec_hidden_size=16, dtype=_t.bfloat16),
+    )
+    w._draft_worker = _DraftWorker()
+    w.device = "cpu"
+    w._spec_solo_active, w._spec_solo_is_host = solo_active, solo_host
+    w.topk = 1
+    return w
+
+
+@pytest.fixture
+def no_moe_ctx(monkeypatch):
+    import sglang.srt.speculative.eagle_worker_v2 as ew
+
+    monkeypatch.setattr(ew, "speculative_moe_backend_context", contextlib.nullcontext)
+    monkeypatch.setattr(ew, "speculative_moe_a2a_backend_context", contextlib.nullcontext)
+
+
+@pytest.mark.parametrize("solo_active, solo_host, seeded", [
+    (True, True, "draft_extend"),  # metal x140's rank: the solo host drafts from a draft extend
+    (False, False, "draft_extend"),  # sharded draft: every rank runs it
+    (True, False, "stub"),  # shadow: the stub, as after a real extend
+])
+def test_worker_skip_hands_the_draft_phase_zero_target_hidden(d_group, no_moe_ctx, caplog, solo_active,
+                                                              solo_host, seeded):
     _publish()
     tp0 = d_group[0]
     _run_group(d_group)
     _prepare_for_extend(tp0)
     published = []
-    seed = {}
-
-    def stub(batch, next_token_ids):
-        seed["bonus"] = next_token_ids
-        return SimpleNamespace(bonus_tokens=next_token_ids)
-
-    worker = SimpleNamespace(
-        target_worker=SimpleNamespace(model_runner=SimpleNamespace(prefill_rank_timer=None),
-                                      hicache_layer_transfer_counter=_Counter()),
-        device="cpu", _solo_stub_draft_input=stub,
-    )
-    batch = SimpleNamespace(reqs=[tp0.req], hicache_consumer_index=-1, seq_lens=torch.tensor([N]))
-    with tp0.active():
-        out = EAGLEWorkerV2._forward_skip_extend(worker, batch, [FIRST], on_publish=published.append)
+    w = _worker(solo_active, solo_host)
+    w._solo_stub_draft_input = lambda batch, ids: SimpleNamespace(bonus_tokens=ids, seeded_by="stub")
+    batch = SimpleNamespace(reqs=[tp0.req], hicache_consumer_index=-1, seq_lens=torch.tensor([N]),
+                            extend_num_tokens=N - C)
+    with tp0.active(), caplog.at_level(logging.INFO, logger="sglang.srt.weg2.tail_adopt"):
+        out = w._forward_skip_extend(batch, [FIRST], on_publish=published.append)
     _join("weg2-tail-verify")
     assert out.next_token_ids.tolist() == [FIRST]
     assert torch.equal(out.new_seq_lens, batch.seq_lens) and published == [batch.seq_lens]
+    assert out.next_draft_input.seeded_by == seeded
     assert torch.equal(out.next_draft_input.bonus_tokens, out.next_token_ids)
-    assert out.logits_output.hidden_states is None and not out.can_run_cuda_graph
-    assert worker.target_worker.hicache_layer_transfer_counter.calls == []  # consumer -1: no load to join
+    hidden = out.logits_output.hidden_states
+    assert list(hidden.shape) == [N - C, 16] and hidden.dtype == torch.bfloat16 and not hidden.any()
+    if seeded == "draft_extend":
+        ((h, ids, mm),) = w._draft_worker.calls  # exactly one draft extend, over the extend rows
+        assert h is hidden and ids is out.next_token_ids and mm is None
+    else:
+        assert not w._draft_worker.calls
+    assert f"draft={'stub' if seeded == 'stub' else 'extend'} draft_rows={N - C}" in caplog.text
+    assert w.target_worker.hicache_layer_transfer_counter.calls == []  # consumer -1: no load to join
     assert not tp0.skips
