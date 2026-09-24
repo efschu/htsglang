@@ -10585,6 +10585,8 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             kv_tokens=CONTEXT_LENGTH_TOKENS,
             label=label,
             marker=D_RANK_SOLVE_MARKER,
+            # H33: die KARTEN-Bilanz (Posten ausserhalb des Budgets, W130).
+            card_reference_logs=getattr(ns, "d_card_reference_logs", "") or "",
         )
     except (OSError, KeyError, ValueError, _pp_cut.DraftResidencyUnavailable) as _exc:
         # Eine UNLESBARE Geometrie/Referenz verweigert nicht den Boot, sie wird
@@ -12103,6 +12105,16 @@ def build_parser() -> argparse.ArgumentParser:
              "expert_residency.D_RESIDENCY_REFERENCE_FNFL2 (fnFL2x98/x99/x100, "
              "Next Flash Form A, --rank-tp-ratio 1,0,0); fuer jede andere Form "
              "entfaellt die Decke mit Namen, bis Logs DIESER Form gegeben sind.")
+    ap.add_argument(
+        "--d-card-reference-logs", default="",
+        help="H33: Komma-Liste von D-Boot-Logs, aus denen die KARTEN-Bilanz des "
+             "D-FRACTION-SOLVE den Posten AUSSERHALB des Budgets misst: je Rang "
+             "Kopfraum = cap - peak - privat_frei am bindenden Messpunkt "
+             "(WEG2-GRAPH-POOL-Zeilen; aeltere Logs: [vram-peak] + #1027 "
+             "trapped=), normiert auf den Pufferbytes des Logs; je Rang das "
+             "Minimum ueber die Boots. Unter corridor_guard.NEAR_OOM_MIB "
+             "verweigert W130. Leer = die eingebaute Referenz "
+             "expert_residency.D_CARD_REFERENCE_FNFL2 (fnFL2x141 + fnFL2x144).")
     ap.add_argument(
         "--wake-credit-reference-logs", default="",
         help="H14: P.log,D.log,front.log EINES Boots, dessen erster Wake (D->P) "

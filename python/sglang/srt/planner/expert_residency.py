@@ -35,6 +35,13 @@ ihm, und alle drei sind am Metall gemessen, nicht geraten:
    geteiltem Vokabular faellt die eigene BF16-embed_tokens/lm_head-Tabelle des
    Drafts weg (2 x vocab x hidden x 2 B = 2425 MiB auf dem Draft-Host).
 
+4. (H33) DIE KARTE: das Budget passt, die Karte nicht. Mit gedeckeltem KV
+   (262144 Token) bleibt Budget liegen, und was die 5090 fuellt -- freie
+   Bloecke privater Graph-/Tag-Pools (4993 MiB auf D-TP0, fuer empty_cache
+   unerreichbar) plus die Transiente des schwersten Forwards -- steht in
+   keinem Budget-Posten. Abschnitt 4b rechnet den Kopfraum gegen die near-
+   OOM-Grenze aus gemessenen Punkten (``graph_pool_ledger``, W130).
+
 Alles hier ist rein (kein torch), damit der Launcher es ohne CUDA-Import
 rechnen kann; die zwei gespiegelten Runtime-Formeln (``resident_rows``,
 ``expert_span_by_rank``) sind per Test an ihre Runtime-Quellen gebunden.
@@ -656,17 +663,350 @@ def solve_stage_fraction_by_buffer_rule(
 
 
 # ---------------------------------------------------------------------------
+# 4b. die KARTE: der Posten ausserhalb des Budgets (fnFL2 H33)
+# ---------------------------------------------------------------------------
+#
+# Die Bilanz oben prueft das BUDGET. Mit ``--max-total-tokens 262144`` nimmt
+# der KV-Pool nur 262144 x Zelle, der Rest des Budgets bleibt liegen -- und die
+# KARTE fuellt, was in keinem Budget-Posten steht: die freien Bloecke der
+# privaten Pools (Graph-/Tag-Pools, fuer ``empty_cache`` unerreichbar) und die
+# Transiente des schwersten Forwards. Auf der 5090 (D-TP0) hat der Dry-Run
+# deshalb FR_D[0] 0.10/0.15 und SCRATCH_D[0] 86 durchgelassen, und x128 starb
+# mit SCRATCH 86 an OOM (H30 R1). Hier steht dieser Posten GEMESSEN im Ledger
+# (``graph_pool_ledger``): je Rang der Kopfraum am bindenden Messpunkt eines
+# Referenz-Boots, ``cap - peak - privat_frei``. Ein Boot mit einem anderen
+# Puffer verschiebt ihn um genau die Pufferbytes (x128 gegen x141: peak
+# +460 MiB bei +4 Zeilen x 48 Layer = 464 MiB); darunter liegt die near-OOM-
+# Grenze des Korridorgesetzes. Keine Reserve: jeder Term ist eine Messung.
+
+#: Der W-Code. W123..W125 liegen auf dem Layout-Switch-Zweig, W126..W128 sind
+#: auf dieser Linie vergeben (H14, Draft-auf-P, Draft-Park); W129 bleibt frei
+#: fuer die parallel laufenden Riegel.
+CARD_REFUSAL_CODE = "W130 Weg2DCardNearOom"
+
+
+class DCardReference(msgspec.Struct, frozen=True, kw_only=True):
+    """Was die Karte eines D-Rangs am bindenden Messpunkt eines Referenz-Boots
+    uebrig liess, auf einen LEEREN Experten-Puffer normiert. Je Rang das
+    Minimum ueber die Boots (konservativ, wie H8 das Maximum der Posten)."""
+
+    source: str
+    model: str
+    rank_tp_ratio: str
+    #: ``headroom + Puffer x Layer x Zeile`` des bindenden Messpunkts, MiB.
+    headroom0_mib: Tuple[float, ...]
+    #: ``card_free + Pufferbytes`` im Decode, MiB (``None`` = kein Decode-Punkt).
+    free_decode0_mib: Tuple[Optional[float], ...]
+    #: Die Terme des bindenden Punkts, nur fuer den Druck.
+    buffer_rows: Tuple[int, ...]
+    cap_mib: Tuple[float, ...]
+    peak_mib: Tuple[float, ...]
+    private_free_mib: Tuple[float, ...]
+    phase: Tuple[str, ...]
+    precision_mib: Tuple[float, ...]
+    draft_host_rank: int
+    draft_vocab_held: bool
+
+
+def d_card_reference_from_logs(
+    boots: Sequence[Tuple[str, str]],
+    *,
+    n_ranks: int,
+    n_layers: int,
+    slot_bytes: float,
+    model: str,
+    rank_tp_ratio: str,
+) -> DCardReference:
+    """Die Karten-Referenz aus D-Logs MESSEN (``boots`` = (Name, Text)).
+
+    Je Boot und Rang: der Messpunkt mit dem kleinsten Kopfraum
+    (``graph_pool_ledger.binding_sample``) und der Puffer desselben Logs
+    (``MoE expert-offload active on layer 47``). Fehlt einem Rang einer der
+    beiden in ALLEN Boots, wird verweigert, statt eine Null einzusetzen -- ein
+    fehlender privater Term ist der ganze Posten.
+    """
+    from sglang.srt.planner import graph_pool_ledger as gpl
+
+    layer_mib = float(n_layers) * float(slot_bytes) / MIB
+    best: Dict[int, Tuple[float, object, int]] = {}
+    dec: Dict[int, float] = {}
+    host = -1
+    vocab_held = False
+    for _name, text in boots:
+        obs = _observe_boot(text, n_layers=n_layers)
+        samples = gpl.samples_from_log(text)
+        for r, ss in samples.items():
+            if r not in obs["buffer"]:
+                continue
+            rows = int(obs["buffer"][r])
+            s = gpl.binding_sample(ss)
+            if s is None:
+                continue
+            h0 = s.headroom_mib + rows * layer_mib
+            if r not in best or h0 < best[r][0]:
+                best[r] = (h0, s, rows)
+            d = gpl.decode_sample(ss)
+            if d is not None:
+                f0 = d.card_free_mib + rows * layer_mib
+                dec[r] = min(dec.get(r, f0), f0)
+        for r, has in obs["draft_experts"].items():
+            if has:
+                host = r
+                vocab_held = vocab_held or bool(obs["draft_vocab"].get(r, 0.0))
+    missing = [r for r in range(n_ranks) if r not in best]
+    if missing:
+        raise ValueError(
+            "D-Karten-Referenz unvollstaendig in %s: Rang %s ohne gemessenen "
+            "privaten Term (WEG2-GRAPH-POOL bzw. [vram-peak] + #1027) oder ohne "
+            "Pufferzeile" % ([b[0] for b in boots], missing)
+        )
+    return DCardReference(
+        source=" + ".join(b[0] for b in boots),
+        model=model,
+        rank_tp_ratio=rank_tp_ratio,
+        headroom0_mib=tuple(round(best[r][0], 1) for r in range(n_ranks)),
+        free_decode0_mib=tuple(
+            (round(dec[r], 1) if r in dec else None) for r in range(n_ranks)
+        ),
+        buffer_rows=tuple(best[r][2] for r in range(n_ranks)),
+        cap_mib=tuple(round(best[r][1].cap_mib, 1) for r in range(n_ranks)),
+        peak_mib=tuple(round(best[r][1].peak_mib, 1) for r in range(n_ranks)),
+        private_free_mib=tuple(
+            round(best[r][1].private_free_mib, 1) for r in range(n_ranks)
+        ),
+        phase=tuple(best[r][1].phase for r in range(n_ranks)),
+        precision_mib=tuple(
+            round(best[r][1].precision_mib, 1) for r in range(n_ranks)
+        ),
+        draft_host_rank=host,
+        draft_vocab_held=vocab_held,
+    )
+
+
+#: Die gemessene Karten-Referenz der Next-Flash-Form-A-D-Gruppe, hergeleitet
+#: von :func:`d_card_reference_from_logs` aus fnFL2x141 (c9ea5d5d24) und
+#: fnFL2x144 (cc660d8786), beide FR_D 0.06,0.44,0.365 / SCRATCH_D 82,48,48,
+#: FR_P 0.26,0.45,0.39 (/spinning/evidence-665-f1/boot_weg2_fnFL2x14{1,4}_*.D.log;
+#: dieselben Zeilen liegen als Fixture unter
+#: test/registered/unit/weg2/fixtures/d_card_h33/). Bindend ist auf jedem Rang
+#: der ``[vram-peak] decode``-Punkt; TP0 aus x144 (608 MiB Kopfraum, x141 618).
+#: Der Test ``test_the_shipped_card_reference_is_the_logs_own_measurement``
+#: bindet sie an die Logs. Auffrischen: ``--d-card-reference-logs``.
+D_CARD_REFERENCE_FNFL2 = DCardReference(
+    source="fnFL2x141 + fnFL2x144",
+    model="Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",
+    rank_tp_ratio="1,0,0",
+    headroom0_mib=(11513.8, 16705.9, 16661.4),
+    free_decode0_mib=(11970.6, 17417.7, 17339.1),
+    buffer_rows=(94, 112, 113),
+    cap_mib=(29388.8, 18780.2, 18780.2),
+    peak_mib=(23787.5, 14428.2, 14438.4),
+    private_free_mib=(4993.1, 640.1, 790.3),
+    phase=("decode", "decode", "decode"),
+    precision_mib=(15.4, 15.4, 15.4),
+    draft_host_rank=0,
+    draft_vocab_held=False,
+)
+
+
+class DCardFit(msgspec.Struct, frozen=True, kw_only=True):
+    """Ein D-Rang auf seiner KARTE: Kopfraum nach dem schwersten Forward und
+    Decode-frei, beide aus der Referenz um die Pufferbytes verschoben."""
+
+    rank: int
+    fraction: float
+    scratch_rows: int
+    local_experts: int
+    buffer_rows: int
+    ref_buffer_rows: int
+    layer_row_mib: float
+    expert_delta_mib: float
+    vocab_delta_mib: float
+    headroom_mib: float
+    free_decode_mib: Optional[float]
+    near_oom_mib: float
+    band_floor_mib: float
+    ceiling_fraction: Optional[float]
+    ceiling_max_rows: int
+
+    @property
+    def verdict(self) -> str:
+        if self.buffer_rows < 0:
+            return "KEIN PUFFER (W122)"
+        if self.headroom_mib < self.near_oom_mib:
+            return "STIRBT AN DER KARTE"
+        if self.free_decode_mib is not None and self.free_decode_mib < self.band_floor_mib:
+            return "PASST, KORRIDOR GERISSEN (Befund, kein Stopper)"
+        return "PASST"
+
+    @property
+    def refused(self) -> bool:
+        return self.verdict == "STIRBT AN DER KARTE"
+
+
+def solve_d_card(
+    *,
+    fits: Sequence[DRankResidency],
+    reference: DCardReference,
+    vocab_mib: float,
+    share_embed: bool,
+    near_oom_mib: float,
+    band_floor_mib: float,
+) -> Tuple[DCardFit, ...]:
+    """Je D-Rang die Karten-Bilanz::
+
+        headroom_r = headroom0_r - L x slot x buffer_rows_r - vocab_delta_r
+                     >= near_oom        (corridor_guard.NEAR_OOM_MIB)
+
+    ``vocab_delta_r`` gilt auf dem Draft-Host: ``+vocab`` wenn dieser Boot
+    die eigene Draft-Tabelle haelt und die Referenz nicht, ``-vocab`` im
+    umgekehrten Fall. ``free_decode`` ist die Karte im Decode (Befund gegen
+    den Band-Floor, kein Stopper).
+    """
+    n = len(fits)
+    if len(reference.headroom0_mib) != n:
+        raise ValueError(
+            f"solve_d_card: {n} Raenge, aber die Karten-Referenz "
+            f"({reference.source}) hat {len(reference.headroom0_mib)}"
+        )
+    out: List[DCardFit] = []
+    for fit in fits:
+        r = fit.rank
+        layer_mib = float(fit.n_layers) * float(fit.slot_mib)
+        delta = 0.0
+        if r == reference.draft_host_rank:
+            holds = not share_embed
+            if holds and not reference.draft_vocab_held:
+                delta = float(vocab_mib)
+            elif not holds and reference.draft_vocab_held:
+                delta = -float(vocab_mib)
+        rows = int(fit.buffer_rows)
+        expert = max(rows, 0) * layer_mib
+        head = float(reference.headroom0_mib[r]) - expert - delta
+        f0 = reference.free_decode0_mib[r]
+        free_dec = None if f0 is None else float(f0) - expert - delta
+        max_rows = int(
+            math.floor(
+                (float(reference.headroom0_mib[r]) - delta - float(near_oom_mib))
+                / layer_mib
+            )
+        )
+        out.append(
+            DCardFit(
+                rank=r,
+                fraction=float(fit.fraction),
+                scratch_rows=int(fit.scratch_rows),
+                local_experts=int(fit.local_experts),
+                buffer_rows=rows,
+                ref_buffer_rows=int(reference.buffer_rows[r]),
+                layer_row_mib=layer_mib,
+                expert_delta_mib=(rows - int(reference.buffer_rows[r])) * layer_mib,
+                vocab_delta_mib=delta,
+                headroom_mib=head,
+                free_decode_mib=free_dec,
+                near_oom_mib=float(near_oom_mib),
+                band_floor_mib=float(band_floor_mib),
+                ceiling_fraction=largest_fraction_for_rows(
+                    local_experts=int(fit.local_experts),
+                    scratch_rows=int(fit.scratch_rows),
+                    max_rows=max_rows,
+                ),
+                ceiling_max_rows=max_rows,
+            )
+        )
+    return tuple(out)
+
+
+def describe_card(card: DCardFit, reference: DCardReference) -> str:
+    r = card.rank
+    ceiling = "KEINE" if card.ceiling_fraction is None else "%.3f" % card.ceiling_fraction
+    free_dec = "n/a" if card.free_decode_mib is None else "%.0f" % card.free_decode_mib
+    return (
+        "rang%d: Referenz %d Zeilen, Kopfraum %.0f = cap %.0f - peak %.0f - "
+        "privat_frei %.0f MiB am Punkt '%s' (+-%.0f); hier f %.3f S %d -> %s "
+        "Zeilen, Puffer %+.0f MiB%s -> Kopfraum %.0f MiB (near-OOM %.0f), Decode "
+        "frei %s MiB (Band-Floor %.0f) -> %s | KARTEN-DECKE f %s (<= %d Zeilen)"
+        % (
+            r,
+            reference.buffer_rows[r],
+            reference.headroom0_mib[r] - reference.buffer_rows[r] * card.layer_row_mib,
+            reference.cap_mib[r],
+            reference.peak_mib[r],
+            reference.private_free_mib[r],
+            reference.phase[r],
+            reference.precision_mib[r],
+            card.fraction,
+            card.scratch_rows,
+            card.buffer_rows if card.buffer_rows >= 0 else "KEIN",
+            card.expert_delta_mib,
+            (" %+.0f Draft-Vokabular" % card.vocab_delta_mib)
+            if card.vocab_delta_mib
+            else "",
+            card.headroom_mib,
+            card.near_oom_mib,
+            free_dec,
+            card.band_floor_mib,
+            card.verdict,
+            ceiling,
+            card.ceiling_max_rows,
+        )
+    )
+
+
+def card_refusal_text(
+    cards: Sequence[DCardFit], reference: DCardReference, *, label: str
+) -> Optional[str]:
+    """Der W130-Satz, wenn mindestens ein Rang auf seiner Karte stirbt."""
+    bad = [c for c in cards if c.refused]
+    if not bad:
+        return None
+    return (
+        "%s (%s): der Experten-Puffer passt ins Budget, aber nicht auf die Karte "
+        "von %s -- %s. Der Posten ausserhalb des Budgets (freie Bloecke privater "
+        "Graph-/Tag-Pools, fuer empty_cache unerreichbar, plus die Transiente des "
+        "schwersten Forwards) ist gemessen in %s; fnFL2x128 (SCRATCH_D 82->86 auf "
+        "der 5090) starb genau daran (OOM im Extend, 74.81 MiB frei, 4.75 GiB in "
+        "privaten Pools). Groesste tragbare Fraction je Rang auf der Karte: %s."
+        % (
+            CARD_REFUSAL_CODE,
+            label,
+            ["rang%d" % c.rank for c in bad],
+            "; ".join(
+                "rang%d f %.3f S %d -> %d Zeilen, Kopfraum %.0f MiB < near-OOM %.0f"
+                % (
+                    c.rank,
+                    c.fraction,
+                    c.scratch_rows,
+                    c.buffer_rows,
+                    c.headroom_mib,
+                    c.near_oom_mib,
+                )
+                for c in bad
+            ),
+            reference.source,
+            ",".join(
+                "KEINE" if c.ceiling_fraction is None else "%.3f" % c.ceiling_fraction
+                for c in cards
+            ),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # 5. die Launcher-Naht: alles, was der D-FRACTION-SOLVE liest, an EINER Stelle
 # ---------------------------------------------------------------------------
 
 
 class DResidencyPlan(msgspec.Struct, frozen=True, kw_only=True):
     """Was der Launcher druckt (``lines``) und ob er verweigert (``refusal``,
-    der W122-Satz; ``None`` = der Boot passt oder die Rechnung entfaellt)."""
+    der W122-Satz und/oder der W130-Satz; ``None`` = der Boot passt oder die
+    Rechnung entfaellt)."""
 
     lines: Tuple[str, ...]
     refusal: Optional[str]
     fits: Tuple[DRankResidency, ...] = ()
+    #: H33: die Karten-Bilanz je Rang (leer = sie entfiel, Grund in ``lines``).
+    card_fits: Tuple["DCardFit", ...] = ()
 
 
 def _env_true(env: Mapping[str, str], name: str) -> bool:
@@ -739,12 +1079,15 @@ def plan_d_residency(
     kv_tokens: int,
     label: str,
     marker: str,
+    card_reference_logs: str = "",
 ) -> DResidencyPlan:
     """Der D-FRACTION-SOLVE mit den Metallregeln, fuer ``launcher``.
 
     Liest die Checkpoint-Geometrie (Header, keine Tensoren), die Gruppen-Env
     von D und die gemessene Referenz; rechnet je Rang die Bilanz und gibt die
-    Zeilen und, wenn ein Rang nicht passt, den W122-Satz zurueck.
+    Zeilen und, wenn ein Rang nicht passt, den W122-Satz zurueck. Seit H33
+    daneben die KARTEN-Bilanz (Posten ausserhalb des Budgets, gemessen;
+    ``card_reference_logs`` leer = :data:`D_CARD_REFERENCE_FNFL2`) mit W130.
     """
     import json
     import os
@@ -839,6 +1182,155 @@ def plan_d_residency(
     lines = (head,) + tuple(
         "%s FRACTION-SOLVE %s %s" % (marker, label, describe_rank(f)) for f in fits
     )
-    return DResidencyPlan(
-        lines=lines, refusal=refusal_text(fits, label=label), fits=fits
+    card_lines, cards, card_refusal = _plan_d_card(
+        fits=fits,
+        model_path=model_path,
+        rank_tp_ratio=rank_tp_ratio,
+        card_reference_logs=card_reference_logs,
+        n_layers=int(terms.n_layers),
+        slot_bytes=slot_bytes,
+        vocab_mib=vocab,
+        share_embed=share,
+        label=label,
+        marker=marker,
     )
+    refusals = [t for t in (refusal_text(fits, label=label), card_refusal) if t]
+    return DResidencyPlan(
+        lines=lines + card_lines,
+        refusal="; ".join(refusals) if refusals else None,
+        fits=fits,
+        card_fits=cards,
+    )
+
+
+def _card_reference_for(
+    *,
+    model_path: str,
+    rank_tp_ratio: str,
+    card_reference_logs: str,
+    n_ranks: int,
+    n_layers: int,
+    slot_bytes: float,
+) -> Tuple[Optional[DCardReference], str]:
+    """Die Karten-Referenz fuer DIESE Form, oder ``(None, warum nicht)``."""
+    import os
+
+    model = os.path.basename(os.path.normpath(model_path))
+    paths = [p.strip() for p in str(card_reference_logs or "").split(",") if p.strip()]
+    if paths:
+        boots = []
+        for p in paths:
+            with open(p, errors="replace") as fh:
+                boots.append((os.path.basename(p), fh.read()))
+        return (
+            d_card_reference_from_logs(
+                boots,
+                n_ranks=n_ranks,
+                n_layers=n_layers,
+                slot_bytes=slot_bytes,
+                model=model,
+                rank_tp_ratio=rank_tp_ratio,
+            ),
+            "",
+        )
+    ref = D_CARD_REFERENCE_FNFL2
+    if (
+        ref.model != model
+        or ref.rank_tp_ratio != rank_tp_ratio
+        or len(ref.headroom0_mib) != n_ranks
+    ):
+        return None, (
+            "die eingebaute Karten-Referenz (%s) gilt fuer %s mit --rank-tp-ratio %s "
+            "auf %d Raengen, dieser Boot faehrt %s mit %s auf %d; den Posten "
+            "ausserhalb des Budgets per --d-card-reference-logs <D.log,...> aus "
+            "Boots DIESER Form messen (WEG2-GRAPH-POOL bzw. [vram-peak] + #1027)"
+            % (
+                ref.source,
+                ref.model,
+                ref.rank_tp_ratio,
+                len(ref.headroom0_mib),
+                model,
+                rank_tp_ratio,
+                n_ranks,
+            )
+        )
+    return ref, ""
+
+
+def _plan_d_card(
+    *,
+    fits: Sequence[DRankResidency],
+    model_path: str,
+    rank_tp_ratio: str,
+    card_reference_logs: str,
+    n_layers: int,
+    slot_bytes: float,
+    vocab_mib: float,
+    share_embed: bool,
+    label: str,
+    marker: str,
+) -> Tuple[Tuple[str, ...], Tuple[DCardFit, ...], Optional[str]]:
+    """H33: die Karten-Bilanz neben der Budget-Bilanz. Eine unlesbare Referenz
+    verweigert nicht, sie wird benannt (wie H8); verweigert wird nur aus einer
+    GERECHNETEN Bilanz."""
+    from sglang.srt.managers.corridor_guard import (
+        NEAR_OOM_MIB,
+        corridor_band_floor_mib,
+    )
+
+    try:
+        ref, why = _card_reference_for(
+            model_path=model_path,
+            rank_tp_ratio=rank_tp_ratio,
+            card_reference_logs=card_reference_logs,
+            n_ranks=len(fits),
+            n_layers=n_layers,
+            slot_bytes=slot_bytes,
+        )
+    except (OSError, ValueError) as exc:
+        ref, why = None, "%s: %s" % (type(exc).__name__, exc)
+    if ref is None:
+        return (
+            ("%s KARTE %s ENTFAELLT: %s." % (marker, label, why),),
+            (),
+            None,
+        )
+    floor = float(corridor_band_floor_mib())
+    cards = solve_d_card(
+        fits=fits,
+        reference=ref,
+        vocab_mib=vocab_mib,
+        share_embed=share_embed,
+        near_oom_mib=float(NEAR_OOM_MIB),
+        band_floor_mib=floor,
+    )
+    head = (
+        "%s KARTE %s (H33, Posten ausserhalb des Budgets GEMESSEN): Kopfraum je Rang "
+        "= cap - peak - privat_frei am bindenden Messpunkt von %s (cap = card free + "
+        "reserved, peak = allocator peak since pools, privat_frei = freie Bloecke "
+        "privater Graph-/Tag-Pools, fuer empty_cache unerreichbar), verschoben um "
+        "die Pufferbytes dieses Boots; Grenze near-OOM %d MiB "
+        "(corridor_guard.NEAR_OOM_MIB, Stopper in jeder Phase), Decode gegen den "
+        "Band-Floor %d MiB (Befund) -> KARTEN-DECKE je Rang %s, BUDGET-DECKE %s "
+        "(gegeben: %s)"
+        % (
+            marker,
+            label,
+            ref.source,
+            NEAR_OOM_MIB,
+            floor,
+            [
+                "KEINE" if c.ceiling_fraction is None else "%.3f" % c.ceiling_fraction
+                for c in cards
+            ],
+            [
+                "KEINE" if f.ceiling_fraction is None else "%.3f" % f.ceiling_fraction
+                for f in fits
+            ],
+            ["%.3f" % f.fraction for f in fits],
+        )
+    )
+    lines = (head,) + tuple(
+        "%s KARTE %s %s" % (marker, label, describe_card(c, ref)) for c in cards
+    )
+    return lines, cards, card_refusal_text(cards, ref, label=label)

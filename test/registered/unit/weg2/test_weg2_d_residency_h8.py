@@ -275,11 +275,17 @@ def test_the_launcher_refuses_x98_before_a_rank_loads(tmp_path, monkeypatch):
         )
     assert any("STIRBT AM KV-POOL" in ln for ln in lines)
     lines.clear()
-    launcher.log_d_rank_vram_solve(
-        _launcher_ns(tmp_path / "b", "0.098,0.634,0.519"),
-        cards,
-        LIVE_BUDGETS,
-        lines.append,
-        "D",
-    )
+    # H33: die BUDGET-Decke laesst W122 durch; seit der Karten-Bilanz sagt der
+    # Launcher daneben, dass 0.098 bei eigenem Draft-Vokabular (+2425 MiB auf
+    # dem Draft-Host) nicht auf die 5090 passt (W130 rang0) -- die Budget-
+    # Decke war nie eine Karten-Decke (H30 R1).
+    with pytest.raises(launcher.Weg2LaunchRefused, match=r"^W130 .*rang0"):
+        launcher.log_d_rank_vram_solve(
+            _launcher_ns(tmp_path / "b", "0.098,0.634,0.519"),
+            cards,
+            LIVE_BUDGETS,
+            lines.append,
+            "D",
+        )
     assert any("DECKE je Rang ['0.098', '0.634', '0.519']" in ln for ln in lines), lines
+    assert not any(ln.startswith("W122") for ln in lines)

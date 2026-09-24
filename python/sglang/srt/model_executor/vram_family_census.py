@@ -288,6 +288,107 @@ def log_vram_idle(runner, where: str, cuda=torch.cuda) -> Optional[float]:
     return free_gib
 
 
+# --- WEG2-GRAPH-POOL: the post outside the budget (fnFL2 H33) ----------------
+#
+# `[vram-peak]` prints reserved/allocated/free, but not what the D-side ledger
+# was missing on the 5090 (H30 R1): the FREE blocks inside PRIVATE pools
+# (CUDA-graph pools, memory-saver tag pools). `empty_cache` never reaches
+# them, `reserved`/`allocated` count them without separating them, and only
+# the segment snapshot carries the pool id (#1027). On fnFL2x141 TP0 that is
+# 4993 MiB -- the term that let the dry-run pass SCRATCH_D 86, which died on
+# metal (fnFL2x128). This record measures it at the point it matters and
+# prints the balance the planner consumes (`planner.graph_pool_ledger`,
+# `expert_residency` KARTE / W130): headroom = card free + reserved - peak -
+# private free.
+#
+# Cost: one `memory_snapshot()` walk (measured 1.5-4.4 ms on this rig, #1027)
+# per record -- once after the captures and once per `[vram-peak]` line, which
+# is itself rate-limited. Never inside a capture.
+
+_GRAPH_POOL_STATE = {"post_capture": False}
+
+
+def _capturing(cuda) -> bool:
+    try:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        if get_is_capture_mode():
+            return True
+    except Exception:  # noqa: BLE001 -- an instrument never kills a forward
+        pass
+    try:
+        return bool(cuda.is_current_stream_capturing())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _rank_of(runner) -> int:
+    fn = getattr(runner, "_rank_vector_index", None)
+    if callable(fn):
+        try:
+            return int(fn())
+        except Exception:  # noqa: BLE001
+            pass
+    return int(getattr(runner, "tp_rank", 0) or 0)
+
+
+def log_graph_pool(runner, phase: str, cuda=torch.cuda) -> Optional[str]:
+    """Print one ``WEG2-GRAPH-POOL`` record for this rank now. Returns the
+    line, or ``None`` when the allocator could not be read (never a zero)."""
+    from sglang.srt.planner import graph_pool_ledger as gpl
+
+    try:
+        free, total = cuda.mem_get_info()
+        reserved = int(cuda.memory_reserved())
+        allocated = int(cuda.memory_allocated())
+        peak = int(cuda.max_memory_allocated())
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("%s skipped: %s", gpl.MARKER, exc)
+        return None
+    try:
+        segments = cuda.memory_snapshot()
+    except Exception as exc:  # noqa: BLE001 -- the record says it is blind
+        logger.debug("%s snapshot unavailable: %s", gpl.MARKER, exc)
+        segments = None
+    sample = gpl.sample_from_stats(
+        rank=_rank_of(runner),
+        phase=phase,
+        free_bytes=int(free),
+        total_bytes=int(total),
+        reserved_bytes=reserved,
+        allocated_bytes=allocated,
+        peak_bytes=peak,
+        segments=segments,
+    )
+    line = gpl.format_line(sample)
+    logger.info(line)
+    return line
+
+
+def maybe_log_graph_pool(runner, kind: Optional[str], cuda=torch.cuda) -> Optional[str]:
+    """At forward end: the first record once the captures are done
+    (``phase=post-capture``, process-wide -- target and draft share one
+    allocator), then one beside every ``[vram-peak]`` line (``phase=<kind>``).
+    Returns the phase logged last, or ``None``."""
+    if kind is None and _GRAPH_POOL_STATE["post_capture"]:
+        return None  # the common forward: nothing to record, no driver call
+    if _capturing(cuda):
+        return None
+    logged = None
+    try:
+        if not _GRAPH_POOL_STATE["post_capture"]:
+            _GRAPH_POOL_STATE["post_capture"] = True
+            if log_graph_pool(runner, "post-capture", cuda=cuda) is not None:
+                logged = "post-capture"
+        if kind is not None and log_graph_pool(runner, kind, cuda=cuda) is not None:
+            logged = kind
+    except Exception as exc:  # noqa: BLE001 -- an instrument never kills a forward
+        logger.debug("WEG2-GRAPH-POOL skipped: %s", exc)
+    return logged
+
+
 # --- [vram-peak]: the transient the planner has to leave room for -----------
 PEAK_EXTEND_MIN_TOKENS = 2048
 PEAK_DECODE_AT = 64
@@ -362,6 +463,9 @@ def maybe_log_vram_peak(runner, forward_batch, cuda=torch.cuda) -> Optional[str]
         return None
     if kind is None and peak >= st["logged"] + PEAK_HIGHWATER_STEP_GIB:
         kind = "high-water"
+    # H33: the WEG2-GRAPH-POOL record rides on the same forward-end hook --
+    # once after the captures, then beside every [vram-peak] line.
+    maybe_log_graph_pool(runner, kind, cuda=cuda)
     if kind is None:
         return None
     st["logged"] = max(st["logged"], peak)
