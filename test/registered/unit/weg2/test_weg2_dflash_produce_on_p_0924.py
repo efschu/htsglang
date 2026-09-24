@@ -108,7 +108,9 @@ def _argv_p():
         model="/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
         budgets=[27960, 17064, 16552], s_gb=48, m_mib=2400, store_cfg=STORE_CFG,
         extra=[], p_max_total_tokens=463763, draft_kv_on_p=True,
-        spec_flags=L.spec_flags(producer=True),
+        # 27B line: argv_p derives P's producer flags itself
+        # (spec_flags(producer=True) inside argv_p); the NF line's argv_p takes
+        # them as a keyword instead. Same flags, same identity question.
     )
 
 
