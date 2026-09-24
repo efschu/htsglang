@@ -628,6 +628,11 @@ def agree(rid: str, group_vote: int) -> None:
     job = _JOBS.pop(rid, None)
     if job is None:
         return
+    # H63b: the MIN above means every rank of the group has voted, i.e.
+    # staged this rid's parts into memory or given up on them -- nothing
+    # reads the files again; under SGLANG_WEG2_TAIL_KEEP_MIB they leave the
+    # store now (the consumption receipt P's budget relies on)
+    th.consumed(rid)
     waited_ms = (time.perf_counter() - job.held_since) * 1000.0 if job.held_since >= 0 else 0.0
     st = job.box[0] if job.box else None
     if st is None:

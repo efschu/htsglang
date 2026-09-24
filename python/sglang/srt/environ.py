@@ -549,6 +549,21 @@ class Envs:
     # the cut (the fold would track the anchor at N, one token too deep).
     # False = the H24 form, byte for byte.
     SGLANG_WEG2_ENABLE_P_TAIL_FOLD = EnvBool(False)
+    # TAIL KEEP (fnFL2 H63b, set on BOTH groups): the tail-part store
+    # (<arena dir>/handoff, tmpfs = host RAM) as a bounded buffer between P
+    # and D instead of an age window. 0 = the H42 count rule: P keeps the
+    # parts of its capture_keep() (= its --max-running-requests) newest rids,
+    # so a burst deeper than that loses its older parts before D reads them
+    # (x163/x166: 4 of 8 burst requests no_parts/parts_partial on D, each
+    # 0.6-0.9 s more serial D time, the first after the flip also up to the
+    # 1.5 s H45 hold). >0 = P keeps, besides those, every older rid while all
+    # parts together fit this many MiB (oldest out first), and D removes a
+    # rid's parts once its group agreed on it (every rank has staged: the
+    # consumption receipt), so the store holds only what D has not read yet.
+    # Bound: max(KEEP_MIB, capture_keep() x one rid's parts) plus the parts
+    # being written; one 97k rid (PP0+PP1+PP2) is 56.9 MiB folded (H63),
+    # 113.8 MiB not (x166).
+    SGLANG_WEG2_TAIL_KEEP_MIB = EnvInt(0)
     # DECODE WARM FROM P (fnFL2 H29). P publishes what it saw at the END of
     # the prompt into the hand-off dir (<SGLANG_HICACHE_ARENA_DIR>/handoff):
     # the routed experts of the last LRU_WARM_TOKENS tokens per MoE layer and

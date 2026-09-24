@@ -431,10 +431,71 @@ def remove(rid: str) -> None:
             pass
 
 
-def _prune(keep_rid: str) -> None:
-    """Keep the part files of the ``capture_keep()`` newest rids (by mtime)."""
+def keep_budget_bytes() -> int:
+    """H63b: SGLANG_WEG2_TAIL_KEEP_MIB in bytes; 0 = the count rule."""
+    return max(0, int(envs.SGLANG_WEG2_TAIL_KEEP_MIB.get())) << 20
+
+
+def census(d: str) -> Tuple[Dict[str, float], Dict[str, int]]:
+    """H63b: rid -> newest mtime and rid -> bytes of its finished part files
+    in ``d`` (a ``*.tmp`` is a part another rank is writing right now)."""
+    newest: Dict[str, float] = {}
+    size: Dict[str, int] = {}
+    for p in glob.glob(os.path.join(d, "*.tail.*")):
+        if p.endswith(".tmp"):
+            continue
+        rid = os.path.basename(p).split(".tail.", 1)[0]
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        newest[rid] = max(newest.get(rid, 0.0), float(st.st_mtime))
+        size[rid] = size.get(rid, 0) + int(st.st_size)
+    return newest, size
+
+
+def prune_victims(newest: Dict[str, float], size: Dict[str, int], keep_rid: str, keep_min: int,
+                  budget: int) -> List[str]:
+    """Pure (H63b): the rids to remove, oldest first. Newest first, the rid
+    just written and the ``keep_min`` newest others always stay (the count
+    rule's set -- never fewer than today); every further rid stays while the
+    kept parts together fit ``budget`` bytes."""
+    order = sorted((r for r in newest if r != keep_rid), key=lambda r: newest[r], reverse=True)
+    total = size.get(keep_rid, 0)
+    victims: List[str] = []
+    for i, rid in enumerate(order):
+        n = size.get(rid, 0)
+        if i < keep_min or total + n <= budget:
+            total += n
+        else:
+            victims.append(rid)
+    return victims[::-1]
+
+
+_KEEP_N = [0]
+
+
+def _prune(keep_rid: str, part: str = "") -> None:
+    """Keep the part files of the ``capture_keep()`` newest rids (by mtime);
+    under SGLANG_WEG2_TAIL_KEEP_MIB also every older rid that still fits the
+    budget (H63b; D removes what it consumed, ``consumed``)."""
     d = _dir()
     if not d:
+        return
+    budget = keep_budget_bytes()
+    if budget > 0:
+        newest, size = census(d)
+        victims = prune_victims(newest, size, keep_rid, capture_keep() - 1, budget)
+        for rid in victims:
+            remove(rid)
+        if part.startswith("pp0"):
+            _KEEP_N[0] += 1
+            kept = [r for r in newest if r not in victims]
+            logger.info(
+                "WEG2-TAIL-KEEP rid=%s kept=%d kept_mib=%.1f budget_mib=%d removed=%d%s (n=%d)",
+                keep_rid, len(kept), sum(size.get(r, 0) for r in kept) / 1048576.0, budget >> 20,
+                len(victims), f" removed_rids={','.join(victims)}" if victims else "", _KEEP_N[0],
+            )
         return
     newest: Dict[str, float] = {}
     for p in glob.glob(os.path.join(d, "*.tail.*.json")):
@@ -446,6 +507,35 @@ def _prune(keep_rid: str) -> None:
     newest.pop(keep_rid, None)
     for rid in sorted(newest, key=newest.get, reverse=True)[capture_keep() - 1:]:
         remove(rid)
+
+
+_CONSUMED_N = [0]
+
+
+def consumed(rid: str) -> bool:
+    """D's consumption receipt (H63b): the group has agreed on ``rid`` --
+    every rank staged its parts or gave up, and nothing reads them after
+    that -- so they leave the store now instead of at P's next prune. Only
+    under SGLANG_WEG2_TAIL_KEEP_MIB; the removal runs off the scheduler
+    thread (tmpfs unlink of ~60-120 MB). True = a removal was started."""
+    if keep_budget_bytes() <= 0 or not _dir():
+        return False
+    threading.Thread(target=_remove_consumed, args=(str(rid),), daemon=True, name="weg2-tail-consumed").start()
+    return True
+
+
+def _remove_consumed(rid: str) -> None:
+    d = _dir()
+    n = 0
+    for p in glob.glob(os.path.join(d, f"{glob.escape(rid)}.tail.*")):
+        try:
+            os.remove(p)
+            n += 1
+        except OSError:
+            pass  # another rank of the group removed it first
+    if n:
+        _CONSUMED_N[0] += 1
+        logger.info("WEG2-TAIL-CONSUMED rid=%s removed_files=%d (n=%d)", rid, n, _CONSUMED_N[0])
 
 
 # -- P side: capture + publish -----------------------------------------------------
@@ -750,7 +840,7 @@ def _write_and_log(spec: TailSpec, part: str, fa, gdn, end: Optional[EndPayload]
         if end is not None and end.event is not None:
             end.event.synchronize()  # the forward-stream gather has landed
         header = write_part(spec, part, fa, gdn, end=end, n_parts=n_parts, e1=e1)
-        _prune(spec.rid)
+        _prune(spec.rid, part)
     except Exception:  # noqa: BLE001 -- a hand-off that fails is the page-prefix resume
         logger.warning("WEG2-TAIL-PUBLISH write failed rid=%s", spec.rid, exc_info=True)
         return
