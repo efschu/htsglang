@@ -612,6 +612,15 @@ class Envs:
     # one lane takes of the card's SMs; the metal probe
     # (probe_lanes_parallel.py) sweeps it.
     SGLANG_WEG2_LANE_SM_COPY_BLOCKS = EnvInt(64)
+    # Weg-2 load (H39, fnFL2x141-x145): the dense Marlin linears
+    # (compressed_tensors_wNa16: GDN/attention/shared-expert 6->8 bit, HC
+    # mixer, PLE, lm_head) keep their checkpoint-format tensors and the whole
+    # repack working set OUTSIDE the private tag pools; only the survivors
+    # (repacked weight, permuted scales, g_idx, workspace) are born in the tag
+    # pool. On D-TP0 those dead blocks were 4.6 of the 4.9 GiB private-free
+    # (weights pool 1.22 GiB = lm_head, bands 3.45 GiB). False = the
+    # 2026-09-24 form, byte for byte (everything born in the tag pool).
+    SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL = EnvBool(True)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)

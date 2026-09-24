@@ -3,7 +3,8 @@
 
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
-from typing import Callable, Optional
+from contextlib import contextmanager, nullcontext
+from typing import Callable, Iterator, Optional
 
 import math
 from fractions import Fraction
@@ -168,6 +169,63 @@ def _widen_dense_packed_to_8bit(
     return out.to(torch.int32)
 
 
+def dense_repack_outside_pool_armed() -> bool:
+    """SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL (H39): keep the checkpoint-format
+    tensors and the repack working set of this scheme out of the weg2 tag pool.
+    A no-op wherever no tag pool is open (outside_tag_pool yields False)."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL.get())
+
+
+@contextmanager
+def _checkpoint_format_scope() -> Iterator[bool]:
+    """Where ``create_weights`` allocates the tensors that
+    ``process_weights_after_loading`` REPLACES (weight_packed, weight_scale,
+    weight_zero_point, weight_g_idx).
+
+    H39 (fnFL2x141/x144/x145, D-TP0 on the 5090): a private tag pool never
+    hands a freed block back while it lives, so every checkpoint-format tensor
+    born in it stayed there as a dead block after the Marlin repack replaced
+    it -- the 8-bit lm_head alone left 606 MiB (original) + 606 MiB (the
+    ``contiguous()`` of its transposed view) in the base ``weights`` pool
+    (measured 1.22 GiB inactive on D-TP0 and on P's last stage, 0.01 GiB on
+    PP0 that holds only the un-repacked embedding), and the 6-bit dense
+    linears ~2.75x their repacked size per band (measured 0.18-0.25 GiB per
+    band on D-TP0, 0.03-0.04 on the expert-only TP1/TP2).  Born in the load's
+    transient pool instead, they go back to the driver with it after load.
+    """
+    if not dense_repack_outside_pool_armed():
+        yield False
+        return
+    from sglang.srt.managers.weg2_memory_saver import outside_tag_pool
+
+    with outside_tag_pool(reason="ct-dense-ckpt", into="ckpt") as stepped_out:
+        yield stepped_out
+
+
+def _born_in_tag_pool(stepped_out: bool):
+    """Inside a stepped-out repack: allocate the survivor in the tag pool."""
+    if not stepped_out:
+        return nullcontext(False)
+    from sglang.srt.managers.weg2_memory_saver import back_into_tag_pool
+
+    return back_into_tag_pool()
+
+
+def _survivor(t: torch.Tensor, stepped_out: bool) -> torch.Tensor:
+    """A tensor computed outside the tag pool that STAYS: copied into a fresh
+    block of the tag pool (one device copy; the original is a transient)."""
+    if not stepped_out:
+        return t
+    with _born_in_tag_pool(True) as back:
+        if not back:
+            return t
+        fresh = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+    fresh.copy_(t)
+    return fresh
+
+
 class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
     _kernel_backends_being_used: set[str] = set()
 
@@ -256,58 +314,62 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         # dense packing: ceil(in * bits / 32) int32 words per row (== in //
         # pack_factor for 4/8 bit, where 32 % bits == 0)
         packed_input_dim = math.ceil(input_size_per_partition * self.src_num_bits / 32)
-        weight = PackedvLLMParameter(input_dim=1,
-                                     output_dim=0,
-                                     weight_loader=weight_loader,
-                                     packed_factor=self.pack_factor,
-                                     packed_dim=1,
-                                     data=torch.empty(
-                                         output_size_per_partition,
-                                         packed_input_dim,
-                                         dtype=torch.int32,
-                                     ))
+        # H39: everything process_weights_after_loading REPLACES is born
+        # outside the weg2 tag pool (_checkpoint_format_scope); weight_shape,
+        # which stays, below it. Registration order is unchanged.
+        with _checkpoint_format_scope():
+            weight = PackedvLLMParameter(input_dim=1,
+                                         output_dim=0,
+                                         weight_loader=weight_loader,
+                                         packed_factor=self.pack_factor,
+                                         packed_dim=1,
+                                         data=torch.empty(
+                                             output_size_per_partition,
+                                             packed_input_dim,
+                                             dtype=torch.int32,
+                                         ))
 
-        weight_scale_args = {
-            "weight_loader":
-            weight_loader,
-            "data":
-            torch.empty(
-                output_size_per_partition,
-                scales_and_zp_size,
-                dtype=params_dtype,
-            )
-        }
+            weight_scale_args = {
+                "weight_loader":
+                weight_loader,
+                "data":
+                torch.empty(
+                    output_size_per_partition,
+                    scales_and_zp_size,
+                    dtype=params_dtype,
+                )
+            }
 
-        zeros_args = {
-            "weight_loader":
-            weight_loader,
-            "data":
-            torch.zeros(
-                output_size_per_partition // self.pack_factor,
-                scales_and_zp_size,
-                dtype=torch.int32,
-            )
-        }
+            zeros_args = {
+                "weight_loader":
+                weight_loader,
+                "data":
+                torch.zeros(
+                    output_size_per_partition // self.pack_factor,
+                    scales_and_zp_size,
+                    dtype=torch.int32,
+                )
+            }
 
-        if not partition_scales:
-            weight_scale = ChannelQuantScaleParameter(output_dim=0,
-                                                      **weight_scale_args)
+            if not partition_scales:
+                weight_scale = ChannelQuantScaleParameter(output_dim=0,
+                                                          **weight_scale_args)
 
-            if not self.symmetric:
-                qzeros = PackedColumnParameter(output_dim=0,
-                                               packed_dim=0,
-                                               packed_factor=self.pack_factor,
-                                               **zeros_args)
-        else:
-            weight_scale = GroupQuantScaleParameter(output_dim=0,
-                                                    input_dim=1,
-                                                    **weight_scale_args)
-            if not self.symmetric:
-                qzeros = PackedvLLMParameter(input_dim=1,
-                                             output_dim=0,
-                                             packed_dim=0,
-                                             packed_factor=self.pack_factor,
-                                             **zeros_args)
+                if not self.symmetric:
+                    qzeros = PackedColumnParameter(output_dim=0,
+                                                   packed_dim=0,
+                                                   packed_factor=self.pack_factor,
+                                                   **zeros_args)
+            else:
+                weight_scale = GroupQuantScaleParameter(output_dim=0,
+                                                        input_dim=1,
+                                                        **weight_scale_args)
+                if not self.symmetric:
+                    qzeros = PackedvLLMParameter(input_dim=1,
+                                                 output_dim=0,
+                                                 packed_dim=0,
+                                                 packed_factor=self.pack_factor,
+                                                 **zeros_args)
 
         # A 2D array defining the original shape of the weights
         # before packing
@@ -324,10 +386,12 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
 
         # group index (for activation reordering)
         if self.has_g_idx:
-            weight_g_idx = RowvLLMParameter(data=torch.empty(
-                input_size_per_partition,
-                dtype=torch.int32,
-            ),
+            with _checkpoint_format_scope():
+                g_idx_data = torch.empty(
+                    input_size_per_partition,
+                    dtype=torch.int32,
+                )
+            weight_g_idx = RowvLLMParameter(data=g_idx_data,
                                             input_dim=0,
                                             weight_loader=weight_loader)
             layer.register_parameter("weight_g_idx", weight_g_idx)
@@ -335,6 +399,23 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
     # Checkpoints are serialized in compressed-tensors format, which is
     # different from the format the kernel may want. Handle repacking here.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # H39: the repack runs OUTSIDE the weg2 tag pool (the load's transient
+        # pool, handed back after load); only the survivors are born in the
+        # tag pool -- the dense twin of ct-moe-repack (fnFL2x2, 11cadf67a3).
+        # Measured before (x144/x145 D-TP0): every transient of this method
+        # stayed a dead block of a live private pool, 4.6 GiB of the 4.9 GiB
+        # private-free that capped the 5090 at 94 expert rows.
+        if dense_repack_outside_pool_armed():
+            from sglang.srt.managers.weg2_memory_saver import outside_tag_pool
+
+            with outside_tag_pool(reason="ct-dense-marlin") as stepped_out:
+                self._repack_to_marlin(layer, stepped_out=bool(stepped_out))
+            return
+        self._repack_to_marlin(layer, stepped_out=False)
+
+    def _repack_to_marlin(self, layer: torch.nn.Module, *, stepped_out: bool) -> None:
+        """``stepped_out``: allocations land outside the tag pool, survivors
+        go back in through :func:`_survivor` / :func:`_born_in_tag_pool`."""
         # Default names since marlin requires empty parameters for these,
         # TODO: remove this requirement from marlin (allow optional tensors)
         self.w_q_name = "weight_packed"
@@ -355,8 +436,9 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
         self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
 
-        # Allocate marlin workspace.
-        self.workspace = marlin_make_workspace(device)
+        # Allocate marlin workspace (a survivor: born in the tag pool).
+        with _born_in_tag_pool(stepped_out):
+            self.workspace = marlin_make_workspace(device)
 
         def _transform_param(
             layer: torch.nn.Module, name: Optional[str], fn: Callable
@@ -374,7 +456,14 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         if self.src_num_bits != c.weight_type.size_bits:
             # widen the dense sub-byte packing to the kernel's 8-bit packing
             wp = getattr(layer, self.w_q_name)
-            wp.data = widen_dense_packed_to_8bit(
+            # Stepped out, the widened packing is a transient like the rest
+            # (the repack below consumes it): no copy back into the pool.
+            widen = (
+                _widen_dense_packed_to_8bit
+                if stepped_out
+                else widen_dense_packed_to_8bit
+            )
+            wp.data = widen(
                 wp.data,
                 src_bits=self.src_num_bits,
                 in_features=c.partition_weight_shape[0],
@@ -385,23 +474,31 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         def transform_w_q(x):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
-            x.data = gptq_marlin_repack(
-                x.data.contiguous(),
-                perm=layer.g_idx_sort_indices,
-                size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
-                num_bits=c.weight_type.size_bits,
-            )
+            # The contiguous() of the transposed view is a transient; the
+            # repack allocates exactly its output, the survivor.
+            src = x.data.contiguous()
+            with _born_in_tag_pool(stepped_out):
+                x.data = gptq_marlin_repack(
+                    src,
+                    perm=layer.g_idx_sort_indices,
+                    size_k=c.partition_weight_shape[0],
+                    size_n=c.partition_weight_shape[1],
+                    num_bits=c.weight_type.size_bits,
+                )
+            del src
             return x
 
         def transform_w_s(x):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1)
-            x.data = marlin_permute_scales(
-                x.data.contiguous(),
-                size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
-                group_size=c.group_size,
+            x.data = _survivor(
+                marlin_permute_scales(
+                    x.data.contiguous(),
+                    size_k=c.partition_weight_shape[0],
+                    size_n=c.partition_weight_shape[1],
+                    group_size=c.group_size,
+                ),
+                stepped_out,
             )
             return x
 
@@ -409,11 +506,13 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             g_idx, g_idx_sort_indices = marlin_sort_g_idx(
                 getattr(layer, self.w_gidx_name)
             )
+            g_idx = _survivor(g_idx, stepped_out)
             _transform_param(layer, self.w_gidx_name, lambda _: g_idx)
-            layer.g_idx_sort_indices = g_idx_sort_indices
+            layer.g_idx_sort_indices = _survivor(g_idx_sort_indices, stepped_out)
         else:
-            setattr(layer, self.w_gidx_name, marlin_make_empty_g_idx(device))
-            layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
+            with _born_in_tag_pool(stepped_out):
+                setattr(layer, self.w_gidx_name, marlin_make_empty_g_idx(device))
+                layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
 
         if c.zero_points:
             grouped_k = (
@@ -422,20 +521,24 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             _transform_param(
                 layer,
                 self.w_zp_name,
-                lambda x: marlin_zero_points(
-                    unpack_cols(
-                        x.t(),
-                        c.weight_type.size_bits,
-                        grouped_k,
-                        c.partition_weight_shape[1],
+                lambda x: _survivor(
+                    marlin_zero_points(
+                        unpack_cols(
+                            x.t(),
+                            c.weight_type.size_bits,
+                            grouped_k,
+                            c.partition_weight_shape[1],
+                        ),
+                        size_k=grouped_k,
+                        size_n=c.partition_weight_shape[1],
+                        num_bits=c.weight_type.size_bits,
                     ),
-                    size_k=grouped_k,
-                    size_n=c.partition_weight_shape[1],
-                    num_bits=c.weight_type.size_bits,
+                    stepped_out,
                 ),
             )
         else:
-            setattr(layer, self.w_zp_name, marlin_make_empty_g_idx(device))
+            with _born_in_tag_pool(stepped_out):
+                setattr(layer, self.w_zp_name, marlin_make_empty_g_idx(device))
         _transform_param(layer, self.w_q_name, transform_w_q)
         _transform_param(layer, self.w_s_name, transform_w_s)
 

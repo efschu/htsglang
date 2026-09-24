@@ -3600,8 +3600,15 @@ _ACTIVE_TAG_POOL: Any = None
 
 
 @contextmanager
-def outside_tag_pool(reason: str = "") -> Iterator[bool]:
+def outside_tag_pool(reason: str = "", *, into: str = "load") -> Iterator[bool]:
     """Route allocations inside to the DEFAULT pool, then come back.
+
+    ``into`` names the load pool the block lands in: ``"load"`` (the repack
+    working set, reused layer after layer) or ``"ckpt"`` (H39: the
+    checkpoint-format tensors a post-load repack REPLACES, born at model
+    construction and dead after the repack).  Two pools so that one tensor
+    something still references pins only its own kind, never the other pool's
+    empty segments (see :func:`release_load_transient_pool`).
 
     A private ``MemPool`` NEVER hands a cached block back to the driver while
     it lives: ``emptyCache`` releases ``graph_pools_freeable`` only, and a tag
@@ -3659,7 +3666,7 @@ def outside_tag_pool(reason: str = "") -> Iterator[bool]:
     _cuda_endAllocateToPool(device_index, pool.id)
     _STEPPED_OUT_POOLS.append(pool)
     try:
-        with _transient_pool(reason):
+        with _transient_pool(reason, into=into):
             yield True
     finally:
         _STEPPED_OUT_POOLS.pop()
@@ -3681,6 +3688,11 @@ _KEPT_TRANSIENT_POOLS: List[Any] = []
 #: routing is active, and inside torch_memory_saver's region one always is.
 _LOAD_TRANSIENT_POOL: Any = None
 
+#: H39: the checkpoint-format tensors of the dense Marlin linears
+#: (compressed_tensors_wNa16), born at construction, replaced by the post-load
+#: repack.  Released beside the transient pool, independently of it.
+_LOAD_CKPT_POOL: Any = None
+
 
 #: The saver entry points while :func:`_transient_pool` has SUSPENDED its
 #: region tracking -- :func:`back_into_tag_pool` turns it back on for the
@@ -3690,7 +3702,7 @@ _TMS_SUSPENDED: List[Any] = []
 
 
 @contextmanager
-def _transient_pool(reason: str) -> Iterator[Any]:
+def _transient_pool(reason: str, *, into: str = "load") -> Iterator[Any]:
     """Route the block into the load's transient pool (created on first use).
 
     WITH torch_memory_saver's region tracking OFF, the way its own
@@ -3700,25 +3712,30 @@ def _transient_pool(reason: str) -> Iterator[Any]:
     ``MemPool::~MemPool -> release_block: CUDA error: invalid argument``, the
     same message v56 died on.  Untracked, the transients are plain device
     memory that the pool's deletion returns."""
-    global _LOAD_TRANSIENT_POOL
+    global _LOAD_TRANSIENT_POOL, _LOAD_CKPT_POOL
     import torch
 
     if not torch.cuda.is_available():
         yield None
         return
-    if _LOAD_TRANSIENT_POOL is None:
+    target = _LOAD_CKPT_POOL if into == "ckpt" else _LOAD_TRANSIENT_POOL
+    if target is None:
         try:
-            _LOAD_TRANSIENT_POOL = torch.cuda.MemPool()
+            target = torch.cuda.MemPool()
         except Exception:  # noqa: BLE001 -- a torch without MemPool: the enclosing pool takes it
             yield None
             return
+        if into == "ckpt":
+            _LOAD_CKPT_POOL = target
+        else:
+            _LOAD_TRANSIENT_POOL = target
     cdll = _tms_cdll_in_region()
     if cdll is not None:
         cdll.tms_set_interesting_region(False)
         _TMS_SUSPENDED.append(cdll)
     try:
-        with torch.cuda.use_mem_pool(_LOAD_TRANSIENT_POOL):
-            yield _LOAD_TRANSIENT_POOL
+        with torch.cuda.use_mem_pool(target):
+            yield target
     finally:
         if cdll is not None:
             _TMS_SUSPENDED.pop()
@@ -3726,14 +3743,20 @@ def _transient_pool(reason: str) -> Iterator[Any]:
 
 
 def release_load_transient_pool(reason: str = "") -> float:
-    """Hand the load's transient pool back to the driver; returns GiB freed.
+    """Hand the load's transient pools back to the driver; returns GiB freed.
 
     Only where NO pool routing is active -- the destructor aborts the process
     otherwise (see ``_LOAD_TRANSIENT_POOL``).  Refuses, loudly and harmlessly,
-    while a tag pool or a torch_memory_saver region is open, and keeps the pool
-    (never deletes it) when a block in it is still live."""
-    global _LOAD_TRANSIENT_POOL
-    pool = _LOAD_TRANSIENT_POOL
+    while a tag pool or a torch_memory_saver region is open, and keeps a pool
+    (never deletes it) when a block in it is still live.  The checkpoint-format
+    pool (H39) goes first and on its own: a live block there keeps only it."""
+    freed = _release_one_load_pool("ckpt", reason)
+    return freed + _release_one_load_pool("load", reason)
+
+
+def _release_one_load_pool(kind: str, reason: str) -> float:
+    global _LOAD_TRANSIENT_POOL, _LOAD_CKPT_POOL
+    pool = _LOAD_CKPT_POOL if kind == "ckpt" else _LOAD_TRANSIENT_POOL
     if pool is None:
         return 0.0
     import torch
@@ -3745,13 +3768,16 @@ def release_load_transient_pool(reason: str = "") -> float:
         or torch.cuda.is_current_stream_capturing()
     ):
         logger.warning(
-            "WEG2-TAG-POOL load transient pool NOT released reason=%s -- a pool "
+            "WEG2-TAG-POOL %s NOT released reason=%s -- a pool "
             "routing is still active here (tag pool or saver region); deleting "
-            "now would abort in the allocator", reason or "?",
+            "now would abort in the allocator", _LOAD_POOL_NAME[kind], reason or "?",
         )
         return 0.0
-    _LOAD_TRANSIENT_POOL = None
-    if _pool_has_live_blocks(pool, reason):
+    if kind == "ckpt":
+        _LOAD_CKPT_POOL = None
+    else:
+        _LOAD_TRANSIENT_POOL = None
+    if _pool_has_live_blocks(pool, f"{reason or '?'} pool={kind}"):
         _KEPT_TRANSIENT_POOLS.append(pool)
         return 0.0
     before = torch.cuda.memory_reserved()
@@ -3759,11 +3785,25 @@ def release_load_transient_pool(reason: str = "") -> float:
     torch.cuda.empty_cache()
     freed_gib = (before - torch.cuda.memory_reserved()) / 2**30
     logger.info(
-        "WEG2-TAG-POOL load transient pool RELEASED reason=%s freed_gib=%.2f -- the "
-        "repack's working set, reused across layers and handed back in one piece",
-        reason or "?", freed_gib,
+        "WEG2-TAG-POOL %s RELEASED reason=%s freed_gib=%.2f -- %s",
+        _LOAD_POOL_NAME[kind], reason or "?", freed_gib, _LOAD_POOL_WHAT[kind],
     )
     return freed_gib
+
+
+#: The log names of the two load pools; "load transient pool" is the form the
+#: boot readers already parse (fnFL2x5 on), kept byte for byte.
+_LOAD_POOL_NAME = {
+    "load": "load transient pool",
+    "ckpt": "checkpoint-format pool",
+}
+_LOAD_POOL_WHAT = {
+    "load": "the repack's working set, reused across layers and handed back in one piece",
+    "ckpt": (
+        "the dense Marlin linears' checkpoint-format tensors, replaced by the "
+        "post-load repack (H39: they were dead blocks of the tag pools)"
+    ),
+}
 
 
 def _pool_has_live_blocks(pool: Any, reason: str) -> bool:
