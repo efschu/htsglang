@@ -254,6 +254,11 @@ class Envs:
     # ranks diverge. Comma separated presets ("all", "rng", "init", "off"), or
     # SpecTpSyncSite slugs and numbers, each negatable with a leading "-".
     SGLANG_SPEC_TP_SYNC = EnvStr("all")
+    # #1485 divergence instrument in SpecTpSync.sync: how many broadcasts per
+    # rank compare the rank-local value against rank 0's (each compare is a
+    # blocking device read). -1 = never retire (the pre-#31468 behaviour on the
+    # receiving ranks), 0 = off. The broadcast source never compares.
+    SGLANG_SPEC_TP_DIVERGE_CHECKS = EnvInt(64)
     # A/B: keep the DFLASH draft sampler (greedy head or DFlash2 selector) eager,
     # not folded into the draft cuda graph.
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
