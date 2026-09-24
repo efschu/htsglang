@@ -889,6 +889,47 @@ def strip_speculative_flags(tokens: Sequence[str]) -> Tuple[List[str], List[str]
     return kept, stripped
 
 
+DRAFT_PARK_UNPRICED = "W128 Weg2DraftParkUnpriced"
+
+
+def d_draft_park_term(ns, draft_on_p: bool) -> Tuple[float, str]:
+    """``(MiB, provenance)`` of D's parked draft (ledger post ``d_draft_host``).
+
+    Non-zero only in the one form where D parks: the exchange arm (under
+    ``ring`` the draft rides the base tag's ring backup), weights flipping
+    (under ``resident`` nothing sleeps) and group P without a draft.  Priced
+    from the draft checkpoint's own headers (``draft_post.d_draft_host_mib``).
+    D with a draft that cannot be priced is refused by name (W128): an
+    unpriced pinned image is host RAM the ledger promised to somebody else.
+    """
+    if draft_on_p:
+        return 0.0, "none (group P carries the draft; the draft tag flips)"
+    if str(ns.weg2_weight_source) != WEIGHT_SOURCE_EXCHANGE:
+        return 0.0, f"none (weight source {ns.weg2_weight_source!r}: the draft rides the base tag)"
+    if str(getattr(ns, "flip_weights", "family")) == "resident":
+        return 0.0, "none (--flip-weights resident: nothing sleeps)"
+    extra_d = str(getattr(ns, "extra_d", "") or "")
+    if _argv_scalar(extra_d, "--speculative-algorithm") is None:
+        return 0.0, "none (group D runs no speculative decoding)"
+    from sglang.srt.weg2 import draft_post as _dp
+
+    placement = _argv_scalar(extra_d, "--speculative-draft-placement")
+    path = _argv_scalar(extra_d, "--speculative-draft-model-path")
+    mib = _dp.d_draft_host_mib(str(path), share_embed=d_draft_share_embed(ns)) if path else None
+    if placement != "solo" or mib is None:
+        raise Weg2LaunchRefused(
+            f"{DRAFT_PARK_UNPRICED}: group P carries no draft, so D parks its draft "
+            "in pinned host RAM while P runs, and that image must be in the host "
+            f"ledger -- but D's argv names placement={placement!r} draft "
+            f"path={path!r} ({'no *.safetensors there' if path else 'no path'}). "
+            "Only '--speculative-draft-placement solo' with an explicit "
+            "--speculative-draft-model-path is priced (rank 0 holds the draft)."
+        )
+    return float(mib), (f"D rank 0 parks its solo draft: checkpoint {path} minus the "
+                        f"target-shared tables (share_embed={d_draft_share_embed(ns)}) "
+                        f"+ buffers {_dp.DRAFT_RUNNER_BUFFER_MIB} = {mib:.0f} MiB pinned")
+
+
 def draft_on_p_line(draft_on_p: bool, provenance: str, stripped: Sequence[str]) -> str:
     """The one line naming which H25 form ran and where D's draft lives."""
     if draft_on_p:
@@ -6678,6 +6719,7 @@ def choose_host_ledger(
     ring_bytes: int,
     ring_span1_bytes: int,
     ring_provenance: str = "",
+    d_draft_host_gib: float = 0.0,
     meminfo_path: str = "/proc/meminfo",
     cgroup_root: str = "/sys/fs/cgroup",
     record_path: Optional[str] = None,
@@ -6970,6 +7012,10 @@ def choose_host_ledger(
         weights_cpu_backup_armed,
     )
     ledger_kw = dict(
+        # H25: the parked D draft's pinned host image (ledger post
+        # 'd_draft_host'), priced by `d_draft_park_term` -- one kwargs block,
+        # so the pinned arm and the ladder price the same post.
+        d_draft_host_gib=float(d_draft_host_gib),
         # #1451: no arena on a --weg2-disable-hicache boot -- the term charged
         # 33.6 GiB there too (test_weg2_hicache_disabled_1386 M=2400 unfundable)
         **(_weg2_arena_ledger_terms(model_dir) if (model_dir and not hicache_disabled) else {}),  # #1432
@@ -13271,6 +13317,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     ns.draft_kv_on_p = "on" if draft_on_p else "off"
     envs.SGLANG_WEG2_DRAFT_ON_P.set(draft_on_p)
+    # H25 (C): what D's parked draft holds in pinned host RAM -- a desk fact,
+    # refused (W128) before any sweep or launch when it cannot be priced.
+    d_draft_host_mib, d_draft_host_prov = d_draft_park_term(ns, draft_on_p)
     # #1032 RESOLVED HERE, BEFORE THE SWEEPS, THE STORE AND ANY LAUNCH: a
     # retracted token vector is a desk fact, and the whole point of W46 is that
     # it must not cost a boot window -- nor a mount, nor an shm sweep -- to
@@ -13768,6 +13817,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(draft_on_p_line(
         draft_kv_on_p, draft_on_p_prov,
         [] if draft_kv_on_p else strip_speculative_flags(shlex.split(ns.extra_p))[1]))
+    log(f"WEG2-HOST d_draft_host={d_draft_host_mib:.0f} MiB -- {d_draft_host_prov}")
     # #1386: `hicache_disabled` was already resolved once, at the top of
     # `main`, before `log` even existed (the first `common_flags` sentinel
     # call needs it long before this point) -- this is only the LOG SIDE of
@@ -14265,6 +14315,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return choose_host_ledger(
             ring_plan.host_weights_bytes,
             ring_plan.host_weights_span1_bytes, ring_plan.provenance,
+            d_draft_host_gib=d_draft_host_mib / 1024.0,
             # #1390: NAMED, not left to choose_host_ledger's own literal
             # defaults -- see MEMINFO_PATH/CGROUP_ROOT above for why a bare call
             # would keep reading the real box even under a test's mock.

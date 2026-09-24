@@ -698,6 +698,11 @@ class SchedulerWeightUpdaterManager:
     #: H15: the local-memory park of the last complete sleep (weg2/sleep_lmem.py
     #: LmemPark), None once the wake restored it. slots=True: declared here.
     _weg2_lmem_park: Any = None
+    #: H25: the draft's pinned host image (weg2/draft_park.DraftHostPark),
+    #: created at the first park and reused for the life of the process.
+    _weg2_draft_park: Any = None
+    #: H25: (phase list, index) of the wake RPC where the draft H2D started.
+    _weg2_draft_unpark_ph0: Any = None
     _weg2_kv_deferred: bool = False       # Wake-Parallel: kv resume deferred to the weights call
     _weg2_kv_epoch_done: object = None    # Wake-Parallel: flip epoch whose kv resume is done
     _weg2_kv_resumed_epoch: object = None  # Wake-Parallel: flip epoch whose kv_cache tms resume (the RESUME half) already ran
@@ -1695,6 +1700,94 @@ class SchedulerWeightUpdaterManager:
             return
         self._weg2_lmem_park = park
         logger.info("WEG2-SLEEP-LMEM %s", park.format_post())
+
+    def _weg2_draft_park_armed(self) -> bool:
+        """H25: does THIS rank park its draft at the sleep?  Exactly when a
+        draft runner lives here, the exchange arm is on and ``weights_draft``
+        is NOT a family member (group P carries no draft, so nobody moves
+        these bytes and the region has no cpu backup on this arm)."""
+        from sglang.srt.managers.weg2_memory_saver import draft_tag_in_family
+        from sglang.srt.weg2.weight_exchange import exchange_armed
+
+        return (_weg2_drafter_of(self) is not None and bool(exchange_armed())
+                and not draft_tag_in_family())
+
+    def _weg2_park_draft_at_sleep(self, credit) -> None:
+        """H25 (C): D2H the draft into the pinned host image, pause its tag,
+        and credit the released VRAM to the waking group on this card. Runs
+        at the FIRST weights RPC of a sleep, before any family tag pauses."""
+        if not self._weg2_draft_park_armed():
+            return
+        # an H2D of the previous wake that no admission joined: join it now,
+        # before the D2H reads the same storages
+        self._weg2_unpark_draft_join([], where="sleep")
+        from sglang.srt.managers.weg2_memory_saver import GPU_MEMORY_TYPE_WEIGHTS_DRAFT
+        from sglang.srt.weg2.draft_park import DraftHostPark, park_population
+
+        drafter = _weg2_drafter_of(self)
+        target = self.tp_worker.model_runner.model
+        population = park_population(drafter.model, target)
+        tag_bytes = int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_WEIGHTS_DRAFT) or 0)
+        if not population or tag_bytes <= 0:
+            logger.info("WEG2-DRAFT-PARK tag=%s nothing to park on this rank "
+                        "(storages=%d tms_bytes=%d)", GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+                        len(population), tag_bytes)
+            return
+        if self._weg2_draft_park is None:
+            self._weg2_draft_park = DraftHostPark(new_stream=torch.cuda.Stream)
+        rec = self._weg2_draft_park.park(
+            population, tag=GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+            pause=self.memory_saver_adapter.pause,
+            sync=torch.cuda.synchronize)
+        if credit is not None:
+            credit.publish(GPU_MEMORY_TYPE_WEIGHTS_DRAFT, tag_bytes)
+        logger.info("%s tms_bytes=%d credited=%s", rec.line(), tag_bytes,
+                    "yes" if credit is not None else "no-credit")
+
+    def _weg2_unpark_draft_start(self, credit, epoch, submitted, phases) -> None:
+        """H25 (C): after the family legs -- the peer's release on this card
+        is complete, so the draft's bytes are covered -- claim them, resume
+        the tag (same VA: the verifier's CUDA graphs stay valid) and issue the
+        H2D on a side stream. :meth:`_weg2_unpark_draft_join` closes it at
+        the ADMISSION (DORMANT clear), the last instant before a forward can
+        read the draft -- so the copy overlaps the legs' tail, the fence, the
+        front's round trip and the KV wake."""
+        park = self._weg2_draft_park
+        if park is None or not park.parked:
+            return
+        from sglang.srt.managers.weg2_memory_saver import (
+            GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+            weg2_tms_resume,
+        )
+
+        need = int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_WEIGHTS_DRAFT) or park.nbytes)
+        self._weg2_await_vram_credit(credit, GPU_MEMORY_TYPE_WEIGHTS_DRAFT, need,
+                                     epoch, submitted=list(submitted))
+        resume_ms = park.unpark_start(
+            tag=GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+            resume=lambda t: weg2_tms_resume(self.memory_saver_adapter, t))
+        self._weg2_draft_unpark_ph0 = (phases, len(phases))
+        logger.info("WEG2-DRAFT-UNPARK start tag=%s resume_ms=%.0f issue_ms=%.0f bytes=%d",
+                    GPU_MEMORY_TYPE_WEIGHTS_DRAFT, resume_ms, park.unpark_issue_ms,
+                    park.nbytes)
+
+    def _weg2_unpark_draft_join(self, phases, *, where: str) -> None:
+        """H25 (C): block until the draft's H2D is done and name what it
+        overlapped: the phases of the starting RPC after the start, and --
+        when the join runs in a LATER RPC -- that RPC's phases so far."""
+        park = self._weg2_draft_park
+        if park is None or self._weg2_draft_unpark_ph0 is None:
+            return
+        started_in, idx = self._weg2_draft_unpark_ph0
+        self._weg2_draft_unpark_ph0 = None
+        names = [str(n) for n, _ms in list(started_in)[int(idx):]]
+        if phases is not started_in:
+            names.append("rpc")
+            names.extend(str(n) for n, _ms in list(phases))
+        names.append(where)
+        line = park.join(overlap="+".join(names))
+        if line:
+            logger.info("%s", line)
 
     def _weg2_restore_lmem_at_wake(self) -> None:
         """H15: put the limit saved at the park back. Never raises."""
@@ -8024,6 +8117,11 @@ class SchedulerWeightUpdaterManager:
             # IPC stagings against this credit (see _weg2_stage_charge).
             self._weg2_leg_credit = credit
             _weg2_ph("census_credit")
+            # H25 (C): the draft goes to host RAM FIRST, while every page is
+            # still mapped, and its VRAM is credited before the family's.
+            if not family_paused_before:
+                self._weg2_park_draft_at_sleep(credit)
+                _weg2_ph("draft_park")
             # #1273 S5b: the SOURCE half of the shadow, at the last instant the
             # weight pages are mapped.  See _weg2_shadow_source_leg for why it
             # is here and not after the pause.  Never raises; on the `ring`
@@ -8498,6 +8596,9 @@ class SchedulerWeightUpdaterManager:
             # Wake-Parallel: DORMANT cleared, hold release, store rescan, disagg
             # queues -- only once the weights are resumed (the late site).
             scheduler = self.scheduler
+            # H25 (C): the parked draft's H2D is joined HERE, the last instant
+            # before a request can reach the verifier.
+            self._weg2_unpark_draft_join(_weg2_ph_l, where="admit")
             if scheduler is not None:
                 # W25: the pools are mapped again; the admission seams admit.
                 scheduler.weg2_dormant = False
@@ -9071,6 +9172,9 @@ class SchedulerWeightUpdaterManager:
                 logger.info("WEG2-SEQ lane-release skipped: %r", _rel_exc)
             weg2_leg_ms = (time.perf_counter() - t_w0) * 1000
             _weg2_ph("leg_collects")
+            # H25 (C): the parked draft comes back BEHIND the legs, on a side
+            # stream, and overlaps everything below up to the fence.
+            self._weg2_unpark_draft_start(credit, credit_epoch, weights_tags, _weg2_ph_l)
             # fnFL2 v43: THE WEIGHTS-SIDE MIRROR of the graph tag's
             # `_weg2_zero_graph_scratch` above, and for the identical reason.
             # `marlin_make_workspace` registers a semaphore array as a
