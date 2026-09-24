@@ -73,6 +73,7 @@ from sglang.srt.weg2.intake_stall import is_intake_stall, is_too_large  # weg2xs
 #: weg2xsn291: the least a woken group keeps the cards even when fairness or
 #: work-exhaustion override the derived min-dwell (see Front._dwell_ok).
 FAIRNESS_DWELL_FLOOR_MS = 2000.0
+from sglang.srt.environ import envs
 from sglang.srt.managers import corridor_guard
 from sglang.srt.managers.corridor_guard import (
     corridor_band_ceiling_mib,
@@ -1675,6 +1676,51 @@ def interleave_chain_card(order: List[str], why: str, tag_cards: Dict[str, Any],
     return merged + rest, why + note
 
 
+def credit_pause_order(order: List[str], why: str, plan: Optional[Dict[str, Any]],
+                       src: str, dst: str, cards_now: List["CardFree"], *,
+                       floor_of=None) -> Tuple[List[str], str]:
+    """H14 (fnFL2x114c/x114d): the pause order, checked against the wake's
+    per-card credit before the legs go out.
+
+    The sleeper runs deposit(t) -> pause(t) -> credit(t) per tag; a deposit
+    to a waker on ANOTHER card ends only when that waker collects, i.e. after
+    ITS credit, which only ITS co-located sleeper's pauses fund. Whether a
+    given order ends in that W109 cycle is a property of order x tag sizes x
+    free per card -- ``wake_credit.simulate`` computes it from the planner's
+    tag table (``--wake-credit-plan``), this free sample and the waker's
+    corridor floors. A cycle-free order comes back UNCHANGED; a cycling one
+    is replaced by ``wake_credit.credit_order``'s funded order, or kept with
+    a W126 note when no order is funded (the planner refused such a form).
+
+    No table for this direction, the lever off, or an unreadable floor: the
+    order as given, and ``why`` says so."""
+    table = (plan or {}).get("%s->%s" % (src, dst))
+    if not table:
+        return list(order), why
+    if not envs.SGLANG_WEG2_FLIP_ORDER_CREDIT.get():
+        return list(order), why + ", credit order OFF (SGLANG_WEG2_FLIP_ORDER_CREDIT=0)"
+    from sglang.srt.weg2 import wake_credit as _wc
+
+    if floor_of is None:
+        def floor_of(uuid: str) -> Optional[int]:
+            f = corridor_floor_for_card(uuid, dst)
+            return None if f is None else int(f.mib)
+    free: Dict[int, float] = {}
+    floors: Dict[int, float] = {}
+    for c in cards_now:
+        free[int(c.nvml_index)] = float(c.free_mib)
+        try:
+            f = floor_of(c.uuid)
+        except Exception as exc:  # noqa: BLE001 -- no floor, no simulation
+            return list(order), why + ", credit order SKIPPED (floor unreadable: %s)" % type(exc).__name__
+        if f is not None:
+            floors[int(c.nvml_index)] = float(f)
+    new, note = _wc.front_order(
+        order, table, free_mib=free, floor_mib=floors,
+        double_staging=not envs.SGLANG_WEG2_CREDIT_LIVE_STAGING.get())
+    return new, why + ", " + note
+
+
 @dataclass
 class Group:
     name: str
@@ -2100,6 +2146,7 @@ class Front:
                  measured_record: str = "", commit: str = "",
                  ledger_arm: Optional[Dict[str, float]] = None,
                  admin_key_file: str = "",
+                 wake_credit_plan: Optional[Dict[str, Any]] = None,
                  vision: str = VISION_MODE_OFF):
         # #1275: the key arrives as a PATH, never as an argv value. The groups
         # have no choice (`server_args` offers only `--admin-api-key`, so their
@@ -2133,6 +2180,9 @@ class Front:
         # parallelism, EMPTY for a group whose tags are uniform across cards
         # (TP).  Read by interleave_pause_order when that group is the source.
         self.src_chunk_cards: Dict[str, Dict[str, List[int]]] = dict(src_chunk_cards or {})
+        # H14: the planner's per-card tag table of the first wake, keyed by
+        # direction ("D->P"); read by credit_pause_order at every such flip.
+        self.wake_credit_plan: Dict[str, Any] = dict(wake_credit_plan or {})
         self.tag = tag
         self.store_dir = store_dir
         self.dc_reserve = dc_reserve
@@ -4934,7 +4984,8 @@ class Front:
         # uses attribute access).  Neither branch was wrong alone.  Attribute
         # access is now the ONE shape both readers use, so a further field on
         # `CardFree` cannot break either.
-        free_mib = {c.nvml_index: c.free_mib for c in _nvml_free()}
+        _cards_now = _nvml_free()
+        free_mib = {c.nvml_index: c.free_mib for c in _cards_now}
         if self.weights_resident:
             pause_order, why = [], "weights resident on both groups (--weights-resident): no family to order"
         else:
@@ -4945,6 +4996,11 @@ class Front:
             pause_order, why = interleave_chain_card(
                 pause_order, why, self.src_chunk_cards.get(src, {}),
                 free_mib=free_mib)
+            # H14: the per-card credit simulation of THIS wake, on the same
+            # free sample; an order that ends in the W109 cycle is replaced,
+            # a cycle-free one stays byte-identical.
+            pause_order, why = credit_pause_order(
+                pause_order, why, self.wake_credit_plan, src, dst, _cards_now)
         logger.info(
             "WEG2-FLIP-ORDER epoch=%d src=%s driver_free=%s pause_order=%s resume_order=%s (%s) "
             "-- applied to the GATHERED sleep leg's tag list (C9), not to a per-tag RPC loop",
@@ -6184,6 +6240,12 @@ def main():
                     help="#1233 weg2dk4: JSON {group: {weights_k: [nvml_index, ...]}} -- which cards hold each chunk tag's "
                          "bytes, per group, derived by the launcher from that group's parallelism. A group that is absent "
                          "(or an empty map) pauses in the natural tag order, exactly as before.")
+    ap.add_argument("--wake-credit-plan", default="",
+                    help="H14: JSON {'D->P': [{card, release, demand, oncard}, ...]} -- the planner's per-card tag "
+                         "table of the first wake (weg2/wake_credit.py, W126 riegel). With "
+                         "SGLANG_WEG2_FLIP_ORDER_CREDIT on, a D->P pause order that the per-card credit simulation "
+                         "ends in the W109 cycle is replaced by a funded one; a cycle-free order is kept unchanged. "
+                         "Empty = the order as before.")
     ap.add_argument("--measured-record", default="",
                     help="#1233 fix 8: the JSON sidecar this line writes its DORMANT-IMAGE measurements "
                          "into (empty = measure and log, do not persist)")
@@ -6234,6 +6296,7 @@ def main():
                   drain_deadline_s=args.drain_deadline_s,
                   d_admit_max_tokens=args.d_admit_max_tokens,
                   src_chunk_cards=json.loads(args.src_chunk_cards) if args.src_chunk_cards else {},
+                  wake_credit_plan=json.loads(args.wake_credit_plan) if args.wake_credit_plan else {},
                   measured_record=args.measured_record, commit=args.commit,
                   ledger_arm=json.loads(args.ledger_arm) if args.ledger_arm else {},
                   admin_key_file=args.admin_key_file,

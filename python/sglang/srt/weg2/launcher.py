@@ -10086,7 +10086,7 @@ D_RANK_SOLVE_MARKER = "D-RANK VRAM (#145)"
 
 
 def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
-                          label: str) -> None:
+                          label: str, *, p_split=None, chunk_layers=None) -> None:
     """#145: die D-Seite des Planners spuckt ihre Sizing-Zahlen aus.
 
     ZWEI Zeilen, und die Reihenfolge ist Absicht:
@@ -10232,6 +10232,106 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     if plan.refusal is not None:
         log(f"{D_RANK_SOLVE_MARKER} {plan.refusal}")
         raise Weg2LaunchRefused(plan.refusal)
+    log_wake_credit_solve(ns, cards, plan.fits, log, label,
+                          p_split=p_split, chunk_layers=chunk_layers)
+
+
+#: H14: die Tag-Tabelle des ersten Wakes fuer ``front --wake-credit-plan``,
+#: gesetzt von :func:`log_wake_credit_solve` (echter Lauf und Dry-Run), gelesen
+#: von ``main`` beim Bau des Front-argv. ``None`` = der Riegel entfiel.
+_WAKE_CREDIT_FRONT_PLAN: Optional[Dict[str, object]] = None
+
+
+def log_wake_credit_solve(ns, cards: List[Card], fits, log, label: str, *,
+                          p_split=None, chunk_layers=None) -> None:
+    """H14: der Kreditbedarf des ersten Wakes (D schlaeft, P wacht), je Karte.
+
+    fnFL2x114c/x114d starben am ersten Wake an W109: der co-lokierte
+    Schlaefer gibt den Tag seines Wakers erst frei, nachdem er einen Tag an
+    einen Waker auf einer ANDEREN Karte deponiert hat, dessen Kredit am
+    Schlaefer DORT haengt. Der D-FRACTION-SOLVE (H8) und P's Puffer (H5)
+    passten -- nur der Weg nicht. Dieser Riegel rechnet den Weg: die gemessene
+    Referenz (``wake_credit.REFERENCE_FNFL2X114D`` oder
+    ``--wake-credit-reference-logs``) plus die Pufferregel als Delta, gegen die
+    Gates von ``VramCredit.wait_for``; endet der Wake -- auch nach der
+    Kredit-Ordnung der Front (SGLANG_WEG2_FLIP_ORDER_CREDIT) -- im Zyklus,
+    VERWEIGERT er (W126) mit der Arithmetik je Karte, bevor ein Rang laedt.
+    Eine unvollstaendige Geometrie entfaellt mit Namen, nie eine halbe Zahl.
+    """
+    global _WAKE_CREDIT_FRONT_PLAN
+    from sglang.srt.planner import expert_residency as _er
+    from sglang.srt.weg2 import wake_credit as _wc
+
+    luecken: List[str] = []
+    if not p_split:
+        luecken.append("P-Schnitt (flip_order_split)")
+    if not chunk_layers:
+        luecken.append("chunk_layers")
+    if not fits:
+        luecken.append("D-FRACTION-SOLVE (H8)")
+    _fp_text = str(getattr(ns, "pp_cut_expert_device_fraction", "") or "")
+    fr_pp = (_csv_floats(_fp_text) if _fp_text else
+             [float(x) for x in (_argv_vector(getattr(ns, "extra_p", ""),
+                                              "--rank-moe-resident-fraction") or [])])
+    env_p = parse_group_env(getattr(ns, "env_p", "") or "")
+    # P's scratch rows: the group env the ranks read, else the PP-CUT's own
+    # --pp-cut-expert-lru-rows (the same number the #140 FRACTION-SOLVE uses)
+    _s = (str(env_p.get("SGLANG_MOE_SCRATCH_SLOTS", "")).strip()
+          or str(getattr(ns, "pp_cut_expert_lru_rows", "") or "").strip())
+    scratch_p = _csv_floats(_s) if _s else []
+    if p_split and len(scratch_p) == 1:
+        scratch_p = scratch_p * len(p_split)
+    if not p_split or len(fr_pp) != len(p_split):
+        luecken.append("P-Fractions (--pp-cut-expert-device-fraction / extra_p)")
+    if not p_split or len(scratch_p) != len(p_split):
+        luecken.append("SGLANG_MOE_SCRATCH_SLOTS (env_p)")
+    if luecken:
+        log(f"{_wc.MARKER} {label} ENTFAELLT: {', '.join(luecken)} fehlt -- "
+            f"ohne vollstaendige Geometrie rechnet der Riegel nichts.")
+        _WAKE_CREDIT_FRONT_PLAN = None
+        return
+    ref = None
+    _logs = [p.strip() for p in str(getattr(ns, "wake_credit_reference_logs", "") or "").split(",")
+             if p.strip()]
+    try:
+        if _logs:
+            if len(_logs) != 3:
+                raise ValueError("--wake-credit-reference-logs braucht P.log,D.log,front.log")
+            texts = []
+            for p in _logs:
+                with open(p, errors="replace") as fh:
+                    texts.append(fh.read())
+            ref = _wc.reference_from_logs(*texts, source=",".join(os.path.basename(p) for p in _logs),
+                                          p_card=[c.nvml_index for c in cards])
+        num_experts = int(sum(int(f.span) for f in fits))
+        p_rows = [_er.buffer_rows(local_experts=num_experts, fraction=float(f),
+                                  scratch_rows=int(s)) for f, s in zip(fr_pp, scratch_p)]
+        d_rows = [int(f.buffer_rows) for f in fits]
+        ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio") or []
+        live = str(env_p.get("SGLANG_WEG2_CREDIT_LIVE_STAGING", "")).strip().lower()
+        double = (live in ("0", "false", "no", "off")) if live else (
+            not envs.SGLANG_WEG2_CREDIT_LIVE_STAGING.get())
+        wplan = _wc.plan_wake_credit(
+            model=ns.model, p_split=p_split, chunk_layers=int(chunk_layers),
+            n_layers=int(fits[0].n_layers), p_card=[c.nvml_index for c in cards],
+            d_ratio=",".join(str(x) for x in ratios), p_rows=p_rows, d_rows=d_rows,
+            slot_mib=float(fits[0].slot_mib), label=label,
+            reorder=bool(envs.SGLANG_WEG2_FLIP_ORDER_CREDIT.get()), double_staging=double,
+            reference=ref,
+            reference_key=None if ref is None else {
+                "p_card": tuple(ref.p_card), "p_split": tuple(int(x) for x in p_split),
+                "chunk_layers": int(chunk_layers)},
+        )
+    except (OSError, KeyError, ValueError) as _exc:
+        log(f"{_wc.MARKER} {label} failed: {type(_exc).__name__}: {_exc}")
+        _WAKE_CREDIT_FRONT_PLAN = None
+        return
+    for line in wplan.lines:
+        log(line)
+    _WAKE_CREDIT_FRONT_PLAN = wplan.front_plan
+    if wplan.refusal is not None:
+        log(f"{_wc.MARKER} {wplan.refusal}")
+        raise Weg2LaunchRefused(wplan.refusal)
 
 
 def publish_expert_map(ns, model: str, evidence_dir: str, log,
@@ -11532,6 +11632,15 @@ def build_parser() -> argparse.ArgumentParser:
              "expert_residency.D_RESIDENCY_REFERENCE_FNFL2 (fnFL2x98/x99/x100, "
              "Next Flash Form A, --rank-tp-ratio 1,0,0); fuer jede andere Form "
              "entfaellt die Decke mit Namen, bis Logs DIESER Form gegeben sind.")
+    ap.add_argument(
+        "--wake-credit-reference-logs", default="",
+        help="H14: P.log,D.log,front.log EINES Boots, dessen erster Wake (D->P) "
+             "die Referenz des WAKE-CREDIT-Riegels (W126) ist: free beim "
+             "Flip-Start, Ordnung, Tags beider Gruppen, P-Floors, Pufferzeilen, "
+             "On-card-Staging. Leer = die eingebaute Referenz "
+             "wake_credit.REFERENCE_FNFL2X114D (Next Flash Form A, P-Schnitt "
+             "29/11/8, Karten 1,0,2); fuer eine andere Geometrie entfaellt der "
+             "Riegel mit Namen.")
     ap.add_argument("--idle-layout", choices=["tp", "pp"], default="tp",
                     help="K8: which layout is awake at rest -- tp = group D (today's shape), "
                          "pp = group P. The front's idle guard always counts the requests P has "
@@ -14187,7 +14296,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # #145 AN BEIDEN STELLEN -- siehe #114 direkt darunter: es gibt ZWEI
         # Stellen, an denen budgets_d entsteht, und eine Fassung, die nur die
         # untere trifft, fehlt genau im Dry-Run, wo das Gate sie sucht.
-        log_d_rank_vram_solve(ns, cards, budgets_d, log, "D(dry, expectation)")
+        log_d_rank_vram_solve(ns, cards, budgets_d, log, "D(dry, expectation)",
+                              p_split=p_split, chunk_layers=chunk_layers)
         d_ratio = d_tp_ratio_decision(
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
             d_bs, getattr(ns, "env_d", "") or "",
@@ -14210,6 +14320,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
             flip_min_work_tokens, idle_layout_front, admin_key_file=admin_key_file,
+            wake_credit_plan=_WAKE_CREDIT_FRONT_PLAN,
             anon_preboot_bytes=anon_preboot_bytes, front_host=ns.front_host)))
         log("DRY-RUN complete: nothing started, mounted, armed or written")
         return 0
@@ -14297,7 +14408,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         user_reserve_by_card=user_reserve_by_card,
     )
     state.budgets["D"] = budgets_d
-    log_d_rank_vram_solve(ns, cards, budgets_d, log, "D")
+    log_d_rank_vram_solve(ns, cards, budgets_d, log, "D",
+                          p_split=p_split, chunk_layers=chunk_layers)
     d_ratio = d_tp_ratio_decision(
         ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
         d_bs, getattr(ns, "env_d", "") or "",
@@ -14588,7 +14700,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     front_argv = front_argv_for(
         py, store_dir, spec_p.pid, spec_d.pid, dc_expect_d, cards, ns, chunk_count,
         carrier_max_tokens, p_bs, d_bs, x_tokens, flip_min_work_tokens, idle_layout_front,
-        src_chunk_cards=src_chunk_cards, measured_record=measured_record_path(),
+        src_chunk_cards=src_chunk_cards, wake_credit_plan=_WAKE_CREDIT_FRONT_PLAN,
+        measured_record=measured_record_path(),
         commit=tip, ledger_arm={"s_gb": arm.s_gb, "s_gb_d": s_gb_d, "m_mib": arm.m_mib,
                     # #1326: the xchg deposit is an ARM CHARGE, so the front's
                     # dormant-image sampler must be able to subtract it from
@@ -14776,6 +14889,7 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
                    p_bs: int, d_bs: int, x_tokens: int, flip_min_work_tokens: int,
                    idle_layout_front: str,
                    src_chunk_cards: Optional[Dict[str, Dict[str, List[int]]]] = None,
+                   wake_credit_plan: Optional[Dict[str, object]] = None,
                    measured_record: str = "", commit: str = "",
                    ledger_arm: Optional[Dict[str, float]] = None,
                    admin_key_file: str = "",
@@ -14851,6 +14965,10 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
     # names the arm; the front is not told twice.
     if src_chunk_cards:
         argv += ["--src-chunk-cards", json.dumps(src_chunk_cards, sort_keys=True)]
+    if wake_credit_plan:
+        # H14: the first wake's per-card tag table (W126 riegel); the front
+        # reads free/floors live and reorders only an order that cycles.
+        argv += ["--wake-credit-plan", json.dumps(wake_credit_plan, sort_keys=True)]
     if measured_record:
         argv += ["--measured-record", measured_record]
     if commit:

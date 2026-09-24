@@ -446,6 +446,15 @@ class Envs:
     # already missing from the free reading (x105 TP2: 943 MiB counted twice,
     # 311 + 293 ms credit waits).
     SGLANG_WEG2_CREDIT_LIVE_STAGING = EnvBool(True)
+    # FLIP_ORDER_CREDIT (H14, fnFL2x114c/x114d): the front simulates the
+    # D->P wake per card (weg2/wake_credit.py) before it hands out the pause
+    # order; an order that ends in the W109 credit cycle is replaced by one in
+    # which a co-located sleeper always frees its waker's tag before its first
+    # deposit without a collector. A cycle-free order is kept UNCHANGED (proven
+    # on x104/x113/x115/x116), so the proven form flips byte-identically. The
+    # planner refuses (W126) a form no order can fund. 0 = the round-robin as
+    # before, and the planner then refuses every form whose given order cycles.
+    SGLANG_WEG2_FLIP_ORDER_CREDIT = EnvBool(True)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
