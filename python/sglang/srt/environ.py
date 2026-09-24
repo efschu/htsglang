@@ -2207,6 +2207,12 @@ class Envs:
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
+    # QSA rows kernel launch (fnFL2 H58, layers/attention/qsa/sparse_attn.py):
+    # overrides the device-name-keyed (H20 / else L20) BLOCK_N / num_warps /
+    # num_stages table of sparse_attn_rows_triton, optionally per arch, e.g.
+    # "sm86:512=32/4/2,inf=64/4/2" (only sm86 changes) or "inf=32/8/2" (all).
+    # Empty = the table (default). Launch parameters only, same math.
+    SGLANG_FORCE_QSA_ROWS_CONFIG = EnvStr("")
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)

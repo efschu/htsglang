@@ -26,6 +26,77 @@ def _get_best_config(total_q: int):
     return next(cfg for limit, cfg in table if total_q <= limit)
 
 
+# fnFL2 H58: the table above is keyed on the device NAME -- H20, else L20 --
+# so the rig's RTX 3080 (sm86) and RTX 5090 (sm120) both take the L20 row,
+# and above 512 query rows (every P prefix chunk) that is (BLOCK_N 16,
+# 1 warp, 2 stages). Compiled for head_dim 256 (Triton cache, cuobjdump) that
+# build holds REG 255 with STACK 1104-1120 B per thread on sm86 and 992-1000 B
+# on sm120 -- a spilling kernel -- in 16.4 KB of shared memory per 32-thread
+# CTA: 5 CTAs = 5 of 48 warp slots per SM on both cards. The same kernel at
+# (32, 8, 2), the table's own <=32-row entry, does not spill: REG 211-226 /
+# STACK 0 on sm86 (1 CTA = 8 warps per SM), REG 111 / STACK 0 on sm120
+# (2 CTAs). On the P stages the rows path of a 16k prefix chunk costs 428-435
+# ms per full-attention layer on the 3080s against 57 ms on the 5090 (x162
+# ATTN-TIMING-PREFILL, x136 FWD-TIMING-PREFILL alike), 7.5x, while the
+# prefix-free prefill kernel of the same backend is 3.3x apart. This override
+# makes the launch an A/B at the metal, per arch, without touching the
+# default: SGLANG_FORCE_QSA_ROWS_CONFIG, grammar
+#   [smXX:]LIMIT=BLOCK_N/WARPS/STAGES[,LIMIT=...][;[smYY:]...]
+# LIMIT is the largest total_q the entry serves ("inf" closes a group);
+# e.g. "sm86:inf=32/8/2" moves only the 3080 stages to the spill-free build.
+def parse_rows_config(raw: str, arch: int):
+    """The (limit, (block_n, warps, stages)) table the override names for
+    ``arch`` (e.g. 86, 120), or None when it names none for this arch."""
+    chosen = None
+    for group in (g.strip() for g in str(raw or "").split(";")):
+        if not group:
+            continue
+        target = None
+        if group.startswith("sm") and ":" in group:
+            head, group = group.split(":", 1)
+            target = int(head[2:])
+        if target is not None and target != int(arch):
+            continue
+        table = []
+        for entry in (e.strip() for e in group.split(",")):
+            if not entry:
+                continue
+            limit_s, cfg_s = entry.split("=", 1)
+            block_n, warps, stages = (int(x) for x in cfg_s.split("/"))
+            if block_n < 16 or block_n & (block_n - 1):
+                raise ValueError(f"QSA rows config {entry!r}: BLOCK_N must be a power of two >= 16")
+            if warps not in (1, 2, 4, 8, 16) or stages < 1:
+                raise ValueError(f"QSA rows config {entry!r}: warps in 1/2/4/8/16, stages >= 1")
+            limit = float("inf") if limit_s.strip() == "inf" else int(limit_s)
+            table.append((limit, (block_n, warps, stages)))
+        if not table or table[-1][0] != float("inf"):
+            raise ValueError(f"QSA rows config group {group!r} must end with an 'inf=' entry")
+        # an arch-specific group wins over a generic one, whatever the order
+        if chosen is None or target is not None:
+            chosen = table
+    return chosen
+
+
+_ROWS_CONFIG_CACHE: dict = {}
+
+
+def _get_rows_config(total_q: int):
+    """``_get_best_config`` for the rows kernel, unless
+    SGLANG_FORCE_QSA_ROWS_CONFIG names a table for this device's arch."""
+    from sglang.srt.environ import envs
+
+    raw = envs.SGLANG_FORCE_QSA_ROWS_CONFIG.get()
+    if raw:
+        major, minor = torch.cuda.get_device_capability()
+        key = (raw, major * 10 + minor)
+        if key not in _ROWS_CONFIG_CACHE:
+            _ROWS_CONFIG_CACHE[key] = parse_rows_config(raw, key[1])
+        table = _ROWS_CONFIG_CACHE[key]
+        if table is not None:
+            return next(cfg for limit, cfg in table if total_q <= limit)
+    return _get_best_config(total_q)
+
+
 @triton.jit
 def _sparse_gqa_prefill(
     q,
@@ -712,7 +783,7 @@ def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale, row_counts=None):
     elif k_pool.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError(f"sparse rows kernel: unsupported KV dtype {k_pool.dtype}")
     block_m = max(16, triton.next_power_of_2(group_size))
-    block_n, warps, stages = _get_best_config(total_q)
+    block_n, warps, stages = _get_rows_config(total_q)
     _sparse_attn_rows_fwd[(total_q, num_kv_heads)](
         q,
         k_pool,
