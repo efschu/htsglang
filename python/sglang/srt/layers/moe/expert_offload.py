@@ -128,7 +128,7 @@ logger = logging.getLogger(__name__)
 from sglang.srt.debug_utils import host_anon_probe as _hap
 from sglang.srt.layers.moe import pinned_host_ledger
 from sglang.srt.layers.fwd_timeline import fwd_mark
-from sglang.srt.layers.prefill_timing import StageHead
+from sglang.srt.layers.prefill_timing import StageHead, flush_wait
 from sglang.srt.managers.scheduler_components.decode_host_split import (
     timed as _h58_timed,
 )
@@ -2953,7 +2953,13 @@ def _wave_timing_note(layer_id, e0, e1, e2, n_spill, n_tokens):
         t["forwards0"] += 1
         t["tokens"] += int(n_tokens)
     if head and t["forwards0"] % 16 == 0:
-        torch.cuda.synchronize()
+        # fnFL2 H67: event-scoped with SGLANG_WEG2_ENABLE_TIMING_EVENT_FLUSH
+        # (a device-wide wait here joins the pending PP send, see flush_wait)
+        flush_wait(
+            [e for tri in t["ev"] for e in tri],
+            instrument="moe",
+            forward=t["forwards0"],
+        )
         f = sum(a.elapsed_time(b) for a, b, _c in t["ev"])
         g = sum(b.elapsed_time(c) for _a, b, c in t["ev"])
         n = len(t["ev"])
@@ -3021,7 +3027,15 @@ def _wave_timing_note_prefill(layer_id, wave_events, n_spill, n_tokens):
     t = _WAVE_TP
     head = _WAVE_TP_HEAD.opens_forward(layer_id)
     if head and t["ev"]:
-        torch.cuda.synchronize()
+        # fnFL2 H67: this flush runs at the head layer INSIDE the next forward;
+        # a device-wide synchronize here also joined the pending PP proxy send
+        # (flush_wait's docstring). Event-scoped with
+        # SGLANG_WEG2_ENABLE_TIMING_EVENT_FLUSH.
+        flush_wait(
+            [e for tri in t["ev"] for e in tri],
+            instrument="moe_prefill",
+            forward=t["forwards"] + 1,
+        )
         f = sum(a.elapsed_time(b) for a, b, _c in t["ev"])
         g = sum(b.elapsed_time(c) for _a, b, c in t["ev"])
         t["forwards"] += 1

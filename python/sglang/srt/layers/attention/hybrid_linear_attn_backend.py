@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
     track_mamba_states_if_needed,
 )
-from sglang.srt.layers.prefill_timing import StageHead
+from sglang.srt.layers.prefill_timing import StageHead, flush_wait
 from sglang.srt.layers.fwd_timeline import fwd_mark
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
@@ -58,7 +58,15 @@ def _attn_timing_begin(layer_id, num_tokens: int) -> None:
     t = _ATTN_T
     head = _ATTN_T_HEAD.opens_forward(layer_id)
     if head and (t["ev"]["full"] or t["ev"]["linear"]):
-        torch.cuda.synchronize()
+        # fnFL2 H67: this flush runs at the head layer INSIDE the next
+        # forward; a device-wide synchronize here also joined the pending PP
+        # proxy send (flush_wait's docstring). Event-scoped with
+        # SGLANG_WEG2_ENABLE_TIMING_EVENT_FLUSH.
+        flush_wait(
+            [e for a, b in t["ev"]["full"] + t["ev"]["linear"] for e in (a, b)],
+            instrument="attn",
+            forward=t["forwards"] + 1,
+        )
         f = sum(a.elapsed_time(b) for a, b in t["ev"]["full"])
         l = sum(a.elapsed_time(b) for a, b in t["ev"]["linear"])
         t["forwards"] += 1

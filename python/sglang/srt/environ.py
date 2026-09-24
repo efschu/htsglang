@@ -2046,6 +2046,16 @@ class Envs:
     # so their sum is the forward's span and the line is comparable with the
     # rank's gpu-ms. No host sync in the forward; read at the next forward.
     SGLANG_WEG2_PREFILL_TIMING = EnvBool(False)
+    # fnFL2 H67: the flush of ATTN-TIMING-PREFILL / MOE-OFFLOAD-TIMING(-PREFILL)
+    # (layers/prefill_timing.flush_wait) waits on the recorded events of the
+    # forward it reads instead of torch.cuda.synchronize(). The device-wide
+    # wait at the stage's head layer also joins the async PP proxy send of the
+    # previous chunk, which completes only when the next stage posts its
+    # receive: on a stage faster than its successor the instrument parked the
+    # forward for the successor's remaining compute (x167 PP0 chunk 4/5:
+    # 548/639 ms inside 'linear', burst forward 16: 1196 ms) and gpu-ms counted
+    # it as compute. Same events, same sums. Off: the device-wide wait.
+    SGLANG_WEG2_ENABLE_TIMING_EVENT_FLUSH = EnvBool(False)
     # fnFL2 H28 (Task #53): the decode round's all-reduce census by class.
     # On: the Form A MoE-input carrier records under its own collective-clock
     # family 'tp.moe_carrier' (the combine keeps 'tp.all_reduce'), and every

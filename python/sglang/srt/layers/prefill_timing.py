@@ -19,7 +19,8 @@ single-stage and PP0 lines are unchanged.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+import time
+from typing import Any, Optional, Sequence
 
 import msgspec
 
@@ -52,6 +53,66 @@ class StageHead(msgspec.Struct):
 
 def timing_on() -> bool:
     return bool(envs.SGLANG_MOE_OFFLOAD_TIMING.get())
+
+
+def timing_event_flush_on() -> bool:
+    return bool(envs.SGLANG_WEG2_ENABLE_TIMING_EVENT_FLUSH.get())
+
+
+def flush_wait(events: Sequence[Any], *, instrument: str, forward: int) -> float:
+    """fnFL2 H67: make the recorded CUDA events of the forward being flushed
+    readable (``elapsed_time``). Returns the host wait in ms and logs it as
+    ``TIMING-FLUSH-WAIT``.
+
+    Legacy (``SGLANG_WEG2_ENABLE_TIMING_EVENT_FLUSH`` off): ``torch.cuda.
+    synchronize()`` -- a wait for EVERY stream of this process, not for these
+    events. On a non-last pipeline stage one of those streams carries the
+    async proxy send of the previous chunk (``GroupCoordinator.
+    send_tensor_dict`` -> NCCL isend, posted and never joined on the pass path,
+    #1015e), and that send completes only when the next stage posts its
+    receive -- after it has finished its own previous chunk. The flush runs at
+    the stage's head layer INSIDE the running forward, so a stage that is
+    faster than its successor sits there for the successor's remaining compute
+    and the rank's gpu-ms books it as compute. Measured as FWD-TIMING linear
+    minus ATTN-TIMING linear (the flush is the only thing between them at the
+    head layer): x167 PP0 chunk 4/5 548/639 ms, burst forward 16 1196 ms; x166
+    569/663/1361 ms; 0-3 ms on PP1/PP2 and on PP0 chunk 1-3.
+
+    Switch on: wait on the events themselves -- the last one first (the
+    instruments record on the compute stream, so it covers the rest), then any
+    event that still reports incomplete. No other stream is joined; the events
+    and their sums are the same.
+    """
+    evs = list(events)
+    t0 = time.monotonic()
+    if timing_event_flush_on():
+        mode = "event"
+        if evs:
+            evs[-1].synchronize()
+            for ev in evs[:-1]:
+                if not ev.query():
+                    ev.synchronize()
+    else:
+        mode = "device"
+        import torch
+
+        torch.cuda.synchronize()
+    wait_ms = (time.monotonic() - t0) * 1000.0
+    logger.info(
+        "TIMING-FLUSH-WAIT instrument=%s forward=%d mode=%s wait_ms=%.1f events=%d "
+        "t_unix_ms=%d (host wall of the instrument flush at the stage's head "
+        "layer, inside the running forward, and when it returned; mode=device "
+        "also joins every other stream of this process, the async PP send to "
+        "the next stage included -- then it returns when the next stage has "
+        "taken the previous chunk)",
+        instrument,
+        int(forward),
+        mode,
+        wait_ms,
+        len(evs),
+        int(time.time() * 1000.0),
+    )
+    return wait_ms
 
 
 def log_ple_gather(rows: int, zero_rows: int, seconds: float, workers: int) -> None:
