@@ -1406,6 +1406,77 @@ class ServingChatTestCase(unittest.TestCase):
             chunks.append(chunk)
         return chunks
 
+    def test_stream_end_flushes_truncated_reasoning_without_stream_reasoning(self):
+        """#32225: with stream_reasoning=False the qwen3 detector buffers the
+        whole trace until </think>. A stream cut before it (finish_reason
+        length) must deliver the trace as reasoning_content on the final chunk
+        instead of dropping it; an abort must not flush."""
+        self.chat.reasoning_parser = "qwen3"
+        self.tm.server_args.incremental_streaming_output = True
+
+        def run(finish_on_last):
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                stream=True,
+                separate_reasoning=True,
+                stream_reasoning=False,
+            )
+            reasoning_parser_dict = {}
+
+            async def step(text, finish_reason_type):
+                content = {
+                    "text": text,
+                    "meta_info": {
+                        "id": "chatcmpl-trunc",
+                        "prompt_tokens": 5,
+                        "completion_tokens": 2,
+                        "cached_tokens": 0,
+                        "finish_reason": (
+                            {"type": finish_reason_type}
+                            if finish_reason_type
+                            else None
+                        ),
+                    },
+                    "index": 0,
+                }
+                out = []
+                async for chunk in self.chat._generate_stream_content(
+                    content=content,
+                    index=0,
+                    request=req,
+                    stream_offsets={},
+                    reasoning_parser_dict=reasoning_parser_dict,
+                    parser_dict={},
+                    has_tool_calls={},
+                    choice_logprobs=None,
+                    finish_reason_type=finish_reason_type,
+                    continuous_usage_stats=False,
+                    prompt_tokens={0: 5},
+                    reasoning_tokens={0: 0},
+                    completion_tokens={0: 2},
+                ):
+                    out.append(chunk)
+                return out
+
+            loop = get_or_create_event_loop()
+            first = loop.run_until_complete(step("<think>half a", None))
+            last = loop.run_until_complete(step(" thought", finish_on_last))
+            return self._parse_chunks(first), self._parse_chunks(last)
+
+        def reasoning_of(parsed):
+            return "".join(
+                c["choices"][0]["delta"].get("reasoning_content") or ""
+                for c in parsed
+            )
+
+        first, last = run("length")
+        self.assertEqual(reasoning_of(first), "")
+        self.assertEqual(reasoning_of(last), "half a thought")
+
+        first, last = run("abort")
+        self.assertEqual(reasoning_of(first) + reasoning_of(last), "")
+
     def test_streaming_logprobs_attached_with_reasoning_parser(self):
         """Logprobs must ride on the reasoning chunk when a reasoning parser is active."""
         self.chat.reasoning_parser = "qwen3"

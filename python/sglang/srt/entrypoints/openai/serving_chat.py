@@ -410,7 +410,12 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
             reasoning_text, delta = self._process_reasoning_stream(
-                index, delta, reasoning_parser_dict, content, request
+                index,
+                delta,
+                reasoning_parser_dict,
+                content,
+                request,
+                finish_reason_type,
             )
             if reasoning_text:
                 usage = None
@@ -1672,6 +1677,7 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_parser_dict: Dict[int, ReasoningParser],
         content: Dict[str, Any],
         request: ChatCompletionRequest,
+        finish_reason_type: Optional[str] = None,
     ) -> tuple[Optional[str], str]:
         """Process reasoning content in streaming response"""
         if index not in reasoning_parser_dict:
@@ -1687,7 +1693,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 tokenizer=self.tokenizer_manager.tokenizer,
             )
         reasoning_parser = reasoning_parser_dict[index]
-        return reasoning_parser.parse_stream_chunk(delta)
+        reasoning_text, normal_text = reasoning_parser.parse_stream_chunk(delta)
+        # Stream end (#30533/#32225): flush what the detector still buffers --
+        # under stream_reasoning=False that is the whole reasoning trace when
+        # the stream was cut before the end token (e.g. max_tokens).
+        if finish_reason_type is not None and finish_reason_type != "abort":
+            end_reasoning_text, end_normal_text = reasoning_parser.parse_stream_end()
+            if end_reasoning_text:
+                reasoning_text = (reasoning_text or "") + end_reasoning_text
+            if end_normal_text:
+                normal_text = (normal_text or "") + end_normal_text
+        return reasoning_text, normal_text
 
     def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
         """Counts the number of tool calls in the request's message history.
