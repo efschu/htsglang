@@ -2840,6 +2840,14 @@ class PhasePoolModel:
         # P boots a safetensors checkpoint. Funded at zero and acknowledged by
         # the seam like the other two, rather than omitted from the census.
         ("GGUF dequant scratch", "gguf_scratch_mib (not modelled -- acknowledge)"),
+        # f3f9062592 (Task #48 C) books a MEASURED prefill transient as its own
+        # runtime post, but ONLY when SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB is
+        # set for the group (default 0 = byte-identical sizing). The 27B
+        # line's launcher never publishes it, so the post is zero on every
+        # boot of this line and is priced at zero here -- named in the census
+        # so the zero is SAID, not an unmirrored post priced as free by silence.
+        ("prefill transient (measured)",
+         "not modelled -- 0 unless the group env books SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB"),
     )
 
     @property

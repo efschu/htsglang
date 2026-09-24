@@ -664,7 +664,10 @@ DRAFT_KV_ON_P_DEFAULT = "on"
 #: external DFlash2 draft on both groups -- P as the draft-KV producer
 #: (dflash_draft_kv_producer), D as the proposer with the compact draft
 #: cache and the window pool.
-SPEC_FORM_DEFAULT = "NEXTN"
+#: The NEXTN form IS the NEXTN algorithm, so its name is SPEC_ALGORITHM --
+#: not a second typing of the literal (#1241 MF-6: one writer per spec
+#: literal; d3e9625651 had typed it twice more).
+SPEC_FORM_DEFAULT = SPEC_ALGORITHM
 DFLASH_DRAFT_PATH_DEFAULT = (
     "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued"
 )
@@ -10515,7 +10518,7 @@ def build_parser() -> argparse.ArgumentParser:
              "(which grade a producer that does not exist under 'off' and are "
              "SKIPPED with a named line rather than refusing the boot).")
     ap.add_argument(
-        "--spec-form", choices=["NEXTN", "DFLASH"], default=SPEC_FORM_DEFAULT,
+        "--spec-form", choices=[SPEC_ALGORITHM, "DFLASH"], default=SPEC_FORM_DEFAULT,
         help="PLAN_DFLASH2_P_0917. The speculative form of BOTH groups. NEXTN "
              "(default) is the shipping form: the checkpoint's mtp.* head, the "
              "constants SPEC_* above. DFLASH puts the external DFlash2 draft on "

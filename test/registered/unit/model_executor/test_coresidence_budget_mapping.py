@@ -76,6 +76,14 @@ class _FakeServerArgs:
         # assertions below were written against (no ceiling clause).
         self.max_running_requests_ceiling = None
 
+    def capture_reserve_mb(self, card_uuid=None):
+        """Fixture drift, 2026-08-30 (found 24.09.): #1025 (153fc05423) reads
+        ``server_args.capture_reserve_mb`` on the per-rank-budget branch as the
+        successor's entry point -- the attribute is touched, never called, and
+        nothing is subtracted ("gebaut, GEMESSEN, NICHT scharfgeschaltet"). The
+        fixture only has to own the name; 0.0 is what a disarmed post is."""
+        return 0.0
+
     def uneven_memory_budgets_active(self):
         return self.rank_gpu_memory_mib is not None
 
@@ -126,6 +134,31 @@ class _FakeRunner:
 
     def _measured_kv_budget_correction_bytes(self):
         return 0
+
+    # Fixture drift, 2026-08-06 (found 24.09.): #602 (7b775eb746) reads the
+    # corridor card's NVML free bytes inside _profile_available_bytes. Wired
+    # to the REAL method, like the helpers below: it answers None outside
+    # --rank-kv-ratio corridor (corridor_mode_active tolerates a server_args
+    # view that predates the mode), which is this fixture's configuration --
+    # so no NVML read happens and the arithmetic under test is untouched.
+    def _read_corridor_card_free_bytes(self):
+        return M.ModelRunnerKVCacheMixin._read_corridor_card_free_bytes(self)
+
+    # Fixture drift, same class: the gapped-corridor user-reserve holdback is
+    # a post of _profile_available_bytes too. The REAL method answers
+    # (rest, None) -- no holdback -- for pp_size 1 without
+    # --rank-user-reserve-mib, which is this fixture; wired, not stubbed.
+    def _gapped_corridor_holdback(self, rest_memory):
+        return M.ModelRunnerKVCacheMixin._gapped_corridor_holdback(self, rest_memory)
+
+    # Fixture drift, 2026-08-09 (found 24.09.): #631 (518f9f3060) asks NVML
+    # for this PROCESS's reach inside _assert_budget_physically_available. Its
+    # documented answer when NVML has nothing to say about the pid is None --
+    # "the caller keeps the old arithmetic" -- and this fixture's one device
+    # primitive is the stubbed mem_get_info, so None is the configuration
+    # modelled here (no NVML read from a unit test).
+    def _nvml_process_reach_gb(self):
+        return None
 
     def handle_max_mamba_cache(self, rest_memory):
         return rest_memory - self._mamba_posts_gb
