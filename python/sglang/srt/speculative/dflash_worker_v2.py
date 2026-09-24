@@ -54,6 +54,7 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     capture_safe_tp_broadcast,
+    mamba_track_grid,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
@@ -2215,6 +2216,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         *,
         batch: ScheduleBatch,
         seq_lens_pre_verify: torch.Tensor,
+        seq_lens_post_verify: torch.Tensor,
         commit_lens: torch.Tensor,
     ) -> None:
         """Commit Mamba intermediate states for accepted verify steps.
@@ -2222,6 +2224,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         During TARGET_VERIFY, Mamba kernels run with `disable_state_update=True` and
         cache per-step intermediate states. After acceptance, we need to commit the
         state corresponding to each request's last accepted step.
+
+        upstream #37818: the track-boundary crossing is measured against the
+        POST-verify lengths (prefix_lens + commit_lens). ``batch.seq_lens`` is
+        still the pre-verify value here (it is advanced by the scheduler from
+        ``new_seq_lens`` afterwards), so comparing against it made
+        ``to_track_mask`` always False: DFLASH decode never wrote a tracked
+        Mamba state, while the scheduler (batch_result_processor
+        ``_mamba_check_track_boundary``) still flipped the ping-pong slot and
+        recorded ``mamba_last_track_seqlen`` for the cache insert.
         """
         if not self._need_mamba_verify_commit:
             return
@@ -2231,13 +2242,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
-            mamba_track_interval = self.server_args.mamba_track_interval
+            # upstream #35412 (DFlash hunk): the checkpoint must land on a
+            # radix node -> the fork's own grid (spec_utils.mamba_track_grid,
+            # lcm of tree page, mamba chunk and track interval). Under the
+            # weighted uneven DCP the tree page stays natural (page_size), so
+            # this equals the raw interval on the 27B D group.
+            mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
-                != batch.seq_lens // mamba_track_interval
+                != seq_lens_post_verify // mamba_track_interval
             )
             tracking_point = (
-                batch.seq_lens // mamba_track_interval * mamba_track_interval
+                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
             )
             to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
             can_track_mask = to_track_mask & (
@@ -3130,9 +3146,16 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
+            # upstream #37818: hand the POST-verify lengths to the Mamba
+            # commit (the Triton accept path already produced them; the
+            # eager/sampling paths derive them here, once, and the value is
+            # reused for the publish below).
+            if new_seq_lens is None:
+                new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
             self._update_target_mamba_state_after_verify(
                 batch=batch,
                 seq_lens_pre_verify=seq_lens_pre_verify,
+                seq_lens_post_verify=new_seq_lens,
                 commit_lens=commit_lens,
             )
 
