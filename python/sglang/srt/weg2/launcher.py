@@ -739,7 +739,7 @@ def apply_spec_form(ns) -> None:
 #: 63/42/74 ms per stage, ~24 ms fixed + ~0.9 ms per layer, independent of the
 #: token count, against ~48-71 ms of compute for a 512-token chunk.
 P_PREFILL_GRAPH_DEFAULT = 0
-_P_PREFILL_GRAPH: Dict[str, int] = {"bucket": P_PREFILL_GRAPH_DEFAULT}
+_P_PREFILL_GRAPH: Dict[str, object] = {"bucket": P_PREFILL_GRAPH_DEFAULT, "tiny": ()}
 
 
 def apply_p_prefill_graph(ns) -> None:
@@ -751,6 +751,43 @@ def apply_p_prefill_graph(ns) -> None:
     if bucket < 0:
         raise SystemExit(f"--p-prefill-graph must be >= 0, got {bucket}")
     _P_PREFILL_GRAPH["bucket"] = bucket
+    _P_PREFILL_GRAPH["tiny"] = p_prefill_graph_tiny_of(ns, bucket)
+
+
+def p_prefill_graph_tiny_of(ns, bucket: int) -> Tuple[int, ...]:
+    """--p-prefill-graph-tiny as extra, SMALLER capture buckets (27B line,
+    24.09., default off = ()). Why: group P ends every prompt with the 1-token
+    END-OF-PREFILL ANCHOR chunk (schedule_policy._weg2_end_anchor_split,
+    SGLANG_WEG2_END_ANCHOR=1), and the runner pads every batch up to the
+    smallest captured bucket that holds it (base_cuda_graph_runner.
+    _pad_to_bucket) -- with bs [512] alone that one token replays a full
+    512-row graph: measured xsn430/xsn433 #PGAP tokens=1 gpu_fwd 37.1 / 35.0 /
+    38.0 ms (PP0/PP1/PP2) against ~41 / 34 / 38 ms for a real 512 chunk. A
+    16-token bucket is weight-bandwidth bound instead (~12 / 7 / 7 ms
+    estimated). Buckets must be positive and below the main bucket."""
+    raw = str(getattr(ns, "p_prefill_graph_tiny", "") or "").strip()
+    if not raw:
+        return ()
+    if not bucket:
+        raise SystemExit("--p-prefill-graph-tiny needs --p-prefill-graph N (the main bucket)")
+    try:
+        vals = sorted({int(x) for x in raw.split(",") if x.strip()})
+    except ValueError:
+        raise SystemExit(f"--p-prefill-graph-tiny {raw!r}: comma list of token counts expected")
+    bad = [v for v in vals if v <= 0 or v >= int(bucket)]
+    if bad:
+        raise SystemExit(
+            f"--p-prefill-graph-tiny {raw!r}: every bucket must be in (0, {int(bucket)}), got {bad}"
+        )
+    return tuple(vals)
+
+
+def p_prefill_graph_buckets() -> List[int]:
+    """Every captured prefill bucket, ascending; [] when the graph is off."""
+    bucket = p_prefill_graph_bucket()
+    if not bucket:
+        return []
+    return sorted(set(int(t) for t in _P_PREFILL_GRAPH.get("tiny", ()) or ()) | {bucket})
 
 
 def p_prefill_graph_bucket() -> int:
@@ -788,7 +825,7 @@ def p_prefill_graph_flags() -> List[str]:
             {
                 "prefill": {
                     "backend": "full",
-                    "bs": [bucket],
+                    "bs": p_prefill_graph_buckets(),
                     "full_prefill_max_req": 1,
                 }
             },
@@ -836,7 +873,12 @@ def p_prefill_graph_pool_mib(ns) -> Tuple[float, ...]:
                 f"{P_PREFILL_GRAPH_STAGES} non-negative per-stage values expected"
             )
         return vals
-    est = P_PREFILL_GRAPH_POOL_MIB_PER_512 * float(bucket) / 512.0
+    # Tiny buckets (--p-prefill-graph-tiny) are priced proportionally on top:
+    # an UPPER estimate, the runner captures every bucket into ONE pool (the
+    # full backend's global graph pool, largest first) and the smaller ones
+    # reuse its blocks; the rank line 'PREFILL-GRAPH captured ... capture_mib='
+    # measures all buckets together and replaces this via the flag above.
+    est = P_PREFILL_GRAPH_POOL_MIB_PER_512 * float(sum(p_prefill_graph_buckets())) / 512.0
     return (est,) * P_PREFILL_GRAPH_STAGES
 
 
@@ -875,10 +917,14 @@ def p_prefill_graph_line() -> str:
             "WEG2 P-PREFILL-GRAPH: off -- group P prefills eager at "
             f"--chunked-prefill-size {CHUNKED_PREFILL_TOKENS} (default form)"
         )
+    tiny = [b for b in p_prefill_graph_buckets() if b != bucket]
     return (
         f"WEG2 P-PREFILL-GRAPH: on bucket={bucket} -- group P runs "
         f"--chunked-prefill-size {bucket} and captures ONE full prefill graph "
-        f"of {bucket} tokens per PP stage ({' '.join(p_prefill_graph_flags())}); "
+        f"of {bucket} tokens per PP stage"
+        + (f" plus tiny bucket(s) {tiny} (the 1-token END-ANCHOR and short rests "
+           f"replay those instead of padding to {bucket})" if tiny else "")
+        + f" ({' '.join(p_prefill_graph_flags())}); "
         "capture pool in the memory saver's cuda_graph tag (released by P's "
         "sleep, remapped by its wake); rank lines 'PREFILL-GRAPH captured ... "
         "capture_mib=' (cost) and 'PREFILL-GRAPH eager reason=' (every batch "
@@ -11151,6 +11197,19 @@ def build_parser() -> argparse.ArgumentParser:
              "capture cost per stage is the rank line 'PREFILL-GRAPH captured "
              "... capture_mib='. Changes P's form key (chunk + graph config "
              "are device allocations). User goal: 512.")
+    ap.add_argument(
+        "--p-prefill-graph-tiny", default="", metavar="TOKENS[,TOKENS]",
+        help="Only with --p-prefill-graph (27B line). Empty (the default) = off: "
+             "one captured bucket, argv byte-identical. TOKENS = extra, smaller "
+             "prefill graph buckets, e.g. 16: the 1-token END-OF-PREFILL ANCHOR "
+             "chunk every P prompt ends with (and rests up to TOKENS) replays "
+             "that bucket instead of padding to the main one -- measured "
+             "xsn430/xsn433: a padded 1-token replay costs 37/35/38 ms per "
+             "stage, a real 512 chunk ~41/34/38. Captured into the same pool "
+             "(largest first; smaller buckets reuse its blocks); the budget "
+             "post adds the proportional estimate unless "
+             "--p-prefill-graph-pool-mib gives the measured capture_mib. "
+             "Changes P's form key (graph config).")
     ap.add_argument(
         "--p-prefill-graph-pool-mib", default="", metavar="MIB[,MIB,MIB]",
         help="Only with --p-prefill-graph: the 'prefill graph pool' budget post "
