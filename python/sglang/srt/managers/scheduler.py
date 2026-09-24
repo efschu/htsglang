@@ -1716,7 +1716,7 @@ class Scheduler(
             if not dflash_produce_on_p():
                 logger.info(
                     dflash_produce_off_line(
-                        where=f"scheduler pp_rank={self.pp_rank} (producer built, never asked)"
+                        where=f"scheduler pp_rank={self.ps.pp_rank} (producer built, never asked)"
                     )
                 )
 
