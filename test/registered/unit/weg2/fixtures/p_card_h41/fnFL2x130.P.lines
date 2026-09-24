@@ -10,7 +10,40 @@
 [2026-09-24 05:11:58 PP1] max_total_num_tokens=262144, chunked_prefill_size=512, max_prefill_tokens=16384, max_running_requests=1, context_len=262144, available_gpu_mem=8.82 GB
 [2026-09-24 05:11:58 PP2] max_total_num_tokens=262144, chunked_prefill_size=512, max_prefill_tokens=16384, max_running_requests=1, context_len=262144, available_gpu_mem=7.28 GB
 [2026-09-24 05:11:58 PP0] max_total_num_tokens=262144, chunked_prefill_size=512, max_prefill_tokens=16384, max_running_requests=1, context_len=262144, available_gpu_mem=10.63 GB
+[2026-09-24 05:12:03 PP0] WEG2-SLEEP-LMEM lmem 311->0 MiB released (stack 1248->0 B x 261120 threads, derived; NVML -314 MiB measured; 1.9 ms)
+[2026-09-24 05:12:04 PP2] WEG2-SLEEP-LMEM lmem 150->0 MiB released (stack 1504->0 B x 104448 threads, derived; NVML -152 MiB measured; 4.7 ms)
+[2026-09-24 05:12:04 PP1] WEG2-SLEEP-LMEM lmem 150->0 MiB released (stack 1504->0 B x 104448 threads, derived; NVML -152 MiB measured; 2.0 ms)
 [2026-09-24 05:15:08 PP0] [vram-peak] high-water (512 rows): allocator peak since pools 17.65 GiB, allocated now 17.52, reserved 22.06, card free 6.22 of 31.34 GiB -> transient headroom used = peak - allocated 0.12 GiB | cache = reserved - allocated 4.53 GiB, of which fragmentation (inactive split) 0.70 GiB, alloc retries 0
+[2026-09-24 05:15:08 PP0] WEG2-ARENA-WRITE n=1 pages=8 bytes=3670016 mode=run runs=2x229376B quota=16
 [2026-09-24 05:15:09 PP1] [vram-peak] high-water (512 rows): allocator peak since pools 9.51 GiB, allocated now 9.38, reserved 11.34, card free 6.84 of 19.58 GiB -> transient headroom used = peak - allocated 0.13 GiB | cache = reserved - allocated 1.96 GiB, of which fragmentation (inactive split) 0.39 GiB, alloc retries 0
+[2026-09-24 05:15:09 PP1] WEG2-ARENA-WRITE n=1 pages=8 bytes=1572864 mode=run runs=2x98304B quota=16
+[2026-09-24 05:15:09 PP0] WEG2-ARENA-WRITE n=2 pages=8 bytes=3670016 mode=run runs=2x229376B quota=16
 [2026-09-24 05:15:11 PP2] [vram-peak] high-water (512 rows): allocator peak since pools 9.43 GiB, allocated now 9.30, reserved 12.63, card free 5.56 of 19.58 GiB -> transient headroom used = peak - allocated 0.13 GiB | cache = reserved - allocated 3.33 GiB, of which fragmentation (inactive split) 1.54 GiB, alloc retries 0
 [2026-09-24 05:15:12 PP2] [vram-peak] high-water (512 rows): allocator peak since pools 9.38 GiB, allocated now 9.30, reserved 12.63, card free 5.56 of 19.58 GiB -> transient headroom used = peak - allocated 0.08 GiB | cache = reserved - allocated 3.33 GiB, of which fragmentation (inactive split) 1.54 GiB, alloc retries 0
+[2026-09-24 05:15:13 PP0] WEG2-ARENA-WRITE n=3 pages=8 bytes=3670016 mode=run runs=2x229376B quota=16
+[2026-09-24 05:15:13 PP2] WEG2-ARENA-WRITE n=1 pages=8 bytes=1048576 mode=run runs=2x65536B quota=16
+[2026-09-24 05:15:13 PP1] WEG2-ARENA-WRITE n=2 pages=8 bytes=1572864 mode=run runs=2x98304B quota=16
+[2026-09-24 05:15:14 PP2] WEG2-ARENA-WRITE n=2 pages=8 bytes=1048576 mode=run runs=2x65536B quota=16
+[2026-09-24 05:15:14 PP1] WEG2-ARENA-WRITE n=3 pages=8 bytes=1572864 mode=run runs=2x98304B quota=16
+[2026-09-24 05:15:14 PP0] WEG2-ARENA-WRITE n=4 pages=8 bytes=3670016 mode=run runs=2x229376B quota=16
+[2026-09-24 05:15:15 PP2] WEG2-ARENA-WRITE n=3 pages=8 bytes=1048576 mode=run runs=2x65536B quota=16
+[2026-09-24 05:15:15 PP1] WEG2-ARENA-WRITE n=4 pages=8 bytes=1572864 mode=run runs=2x98304B quota=16
+[2026-09-24 05:15:15 PP0] WEG2-ARENA-WRITE n=5 pages=8 bytes=3670016 mode=run runs=2x229376B quota=16
+[2026-09-24 05:15:16 PP2] WEG2-ARENA-WRITE n=4 pages=8 bytes=1048576 mode=run runs=2x65536B quota=16
+[2026-09-24 05:15:16 PP1] WEG2-ARENA-WRITE n=5 pages=8 bytes=1572864 mode=run runs=2x98304B quota=16
+[2026-09-24 05:15:16 PP0] WEG2-ARENA-WRITE n=6 pages=8 bytes=3670016 mode=run runs=2x229376B quota=16
+[2026-09-24 05:15:17 PP2] WEG2-ARENA-WRITE n=5 pages=8 bytes=1048576 mode=run runs=2x65536B quota=16
+[2026-09-24 05:15:18 PP1] WEG2-ARENA-WRITE n=6 pages=8 bytes=1572864 mode=run runs=2x98304B quota=16
+[2026-09-24 05:15:18 PP0] WEG2-ARENA-WRITE n=7 pages=8 bytes=3670016 mode=run runs=2x229376B quota=16
+[2026-09-24 05:15:19 PP2] WEG2-ARENA-WRITE n=6 pages=8 bytes=1048576 mode=run runs=2x65536B quota=16
+[2026-09-24 05:15:19 PP1] WEG2-ARENA-WRITE n=7 pages=8 bytes=1572864 mode=run runs=2x98304B quota=16
+[2026-09-24 05:15:19 PP0] WEG2-ARENA-WRITE n=8 pages=8 bytes=3670016 mode=run runs=2x229376B quota=16
+[2026-09-24 05:15:20 PP2] WEG2-ARENA-WRITE n=7 pages=8 bytes=1048576 mode=run runs=2x65536B quota=16
+[2026-09-24 05:15:20 PP1] WEG2-ARENA-WRITE n=8 pages=8 bytes=1572864 mode=run runs=2x98304B quota=16
+[2026-09-24 05:15:21 PP2] WEG2-ARENA-WRITE n=8 pages=8 bytes=1048576 mode=run runs=2x65536B quota=16
+[2026-09-24 05:19:49 PP1] WEG2-SLEEP-LMEM lmem 300->0 MiB released (stack 3008->0 B x 104448 threads, derived; NVML -300 MiB measured; 2.5 ms)
+[2026-09-24 05:19:50 PP0] WEG2-SLEEP-LMEM lmem 1769->0 MiB released (stack 7104->0 B x 261120 threads, derived; NVML -1770 MiB measured; 4.4 ms)
+[2026-09-24 05:19:50 PP2] WEG2-SLEEP-LMEM lmem 198->0 MiB released (stack 1984->0 B x 104448 threads, derived; NVML -198 MiB measured; 4.7 ms)
+[2026-09-24 05:24:58 PP1] WEG2-SLEEP-LMEM lmem 300->0 MiB released (stack 3008->0 B x 104448 threads, derived; NVML -300 MiB measured; 4.5 ms)
+[2026-09-24 05:24:58 PP0] WEG2-SLEEP-LMEM lmem 1769->0 MiB released (stack 7104->0 B x 261120 threads, derived; NVML -1770 MiB measured; 3.9 ms)
+[2026-09-24 05:24:58 PP2] WEG2-SLEEP-LMEM lmem 198->0 MiB released (stack 1984->0 B x 104448 threads, derived; NVML -198 MiB measured; 5.0 ms)

@@ -11281,14 +11281,14 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
             for path in ref_logs:
                 with open(path, errors="replace") as fh:
                     boots.append((os.path.basename(path), fh.read()))
-            deaths = []
+            over = []
             for path in [x.strip() for x in str(
-                    getattr(ns, "p_card_death_logs", "") or "").split(",") if x.strip()]:
+                    getattr(ns, "p_card_over_logs", "") or "").split(",") if x.strip()]:
                 with open(path, errors="replace") as fh:
-                    deaths.append((os.path.basename(path), fh.read()))
+                    over.append((os.path.basename(path), fh.read()))
             reference = _p_card.p_card_reference_from_logs(
                 boots, stage_layers=stage_layers, row_mib=row_mib,
-                support=support, model=name, death_boots=deaths)
+                support=support, model=name, over_boots=over)
         else:
             reference = _p_card.P_CARD_REFERENCE_FNFL2
     except (OSError, ValueError) as exc:
@@ -11314,8 +11314,15 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
                 f"ist nicht lesbar ({path!r}).")
             return
         draft_mib = float(weights) + float(transient)
-    try:
-        fits = _p_card.solve_p_card(
+    # H41c: der Riegel rechnet am LETZTEN Chunk des Prompts (Default: der
+    # laengste Prompt der Referenz, 97841); 262144 wird daneben als Befund
+    # gedruckt (Hochrechnung ueber die gemessenen Chunks hinaus), nicht als
+    # Riegel. LMEM des Run-Writes: 0 mit dem H47-Fix in DIESEM Baum.
+    prompt = int(getattr(ns, "p_card_prompt_tokens", 0) or 0)
+    lmem_fixed = _p_card.arena_write_lmem_fixed()
+
+    def _solve(tokens):
+        return _p_card.solve_p_card(
             reference=reference, support=support, fractions=fracs,
             lru_rows=lru_rows, stage_layers=stage_layers, chunk=int(chunk_tokens),
             kv_mib=[float(x) for x in kv_mib], num_experts=int(num_experts),
@@ -11323,7 +11330,12 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
             draft_mib_last_stage=draft_mib,
             cards=[_dp.stage_card_label(cards, s) for s in range(len(stage_layers))],
             near_oom_mib=float(corridor_guard.NEAR_OOM_MIB),
+            prompt_tokens=tokens, lmem_fixed=lmem_fixed,
         )
+
+    try:
+        fits = _solve(prompt)
+        deep = _solve(CONTEXT_LENGTH_TOKENS) if fits[0].prompt_tokens != CONTEXT_LENGTH_TOKENS else ()
     except _p_card.PChunkUnmeasured as exc:
         raise Weg2LaunchRefused(str(exc)) from None
     except ValueError as exc:
@@ -11331,6 +11343,9 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
         return
     for fit in fits:
         log(_p_card.describe_p_card(fit, reference))
+    for fit in deep:
+        log(f"{_p_card.CARD_MARKER} BEFUND (kein Riegel, Hochrechnung): "
+            + _p_card.describe_p_card(fit, reference))
     refusal = _p_card.p_card_refusal_text(fits, reference, chunk=int(chunk_tokens))
     if refusal is not None:
         log(f"{_p_card.CARD_MARKER} {refusal}")
@@ -12507,16 +12522,21 @@ def build_parser() -> argparse.ArgumentParser:
              "Chunk-Transiente des Logs; je Stufe das Minimum ueber die Boots. "
              "Unter corridor_guard.NEAR_OOM_MIB verweigert W132. Leer = die "
              "eingebaute Referenz p_card_chunk.P_CARD_REFERENCE_FNFL2 (fnFL2x145 + "
-             "fnFL2x146, Schnitt 29,11,8, Chunk 16384, Zeilenpreis aus dem Tod "
-             "fnFL2x149); ein anderer Schnitt laesst die Bilanz mit Namen entfallen.")
+             "fnFL2x150, Schnitt 29,11,8, Chunk 16384, Zeilenpreis aus fnFL2x149 "
+             "Chunk 0); ein anderer Schnitt laesst die Bilanz mit Namen entfallen.")
     ap.add_argument(
-        "--p-card-death-logs", default="",
-        help="H41b: Komma-Liste von P-Boot-Logs DERSELBEN Form mit mehr "
-             "Pufferzeilen, die im Chunk-Forward an der Karte starben (OOM-Text + "
-             "WEG2-GRAPH-POOL + #969 EXTENT). Sie messen, was eine Zeile ueber der "
-             "Referenz die Karte kostet (untere Schranke, je Stufe; Stufen ohne "
-             "eigenen Tod erben das Verhaeltnis). Nur zusammen mit "
+        "--p-card-over-logs", default="",
+        help="H41c: Komma-Liste von P-Boot-Logs DERSELBEN Form mit mehr "
+             "Pufferzeilen (lebend oder tot). Ihr CHUNK-0-Punkt (WEG2-GRAPH-POOL + "
+             "#969 EXTENT) misst, was eine Zeile ueber der Referenz die Karte "
+             "kostet (obere Schranke, nie unter dem Zeilenbild). Nur zusammen mit "
              "--p-card-reference-logs; leer = eingebaut (fnFL2x149).")
+    ap.add_argument(
+        "--p-card-prompt-tokens", type=int, default=0,
+        help="H41c: die Prompt-Laenge, an deren LETZTEM Chunk die P-KARTE "
+             "verweigert (Chunk-Wachstum der Spitze je Token, gemessen an der "
+             "Referenz, bis dorthin fortgeschrieben). 0 = der laengste Prompt der "
+             "Referenz (97841). 262144 wird immer als Befund daneben gedruckt.")
     ap.add_argument(
         "--wake-credit-reference-logs", default="",
         help="H14: P.log,D.log,front.log EINES Boots, dessen erster Wake (D->P) "

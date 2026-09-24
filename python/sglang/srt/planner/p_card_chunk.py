@@ -304,33 +304,69 @@ def activation_lines(support: TransientSupport, chunk: int) -> Tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
-# 2. die P-Karte: gemessener Kopfraum, um Puffer, KV, Chunk und Draft verschoben
+# 2. die P-Karte: gemessener Kopfraum, um Puffer, KV, Chunk, Draft und LMEM
+#    verschoben (H41, H41c)
 # ---------------------------------------------------------------------------
+#
+# H41c (x149 aufgeklaert von H47, da80a26a59). Die Bilanz je Stufe am Chunk-
+# Index i eines Prompts::
+#
+#   Kopfraum_s(i) = K0_s - Zeilen x L x Zeile - Ueber x (Preis - Bild)
+#                   - KV_s - T_s(chunk) - Draft_s - g_s x (Token vor Chunk i)
+#                   - LMEM_s
+#
+# * K0_s: der Kopfraum am Chunk 0 der Referenz (cap - peak - privat_frei),
+#   normiert auf leeren Puffer, kein KV, keine Transiente, keinen Draft;
+# * Ueber x (Preis - Bild): eine Zeile ueber der Referenz kostet den am Chunk 0
+#   eines Boots mit MEHR Zeilen gemessenen Preis (x149 PP0: (4594 - 1300) / 46
+#   = 71.6 MiB, Bild 70.1 -- eine OBERE Schranke, die +73 MiB privat_frei von
+#   x149 stecken darin), nie weniger als das Bild;
+# * g_s: das Wachstum der Spitze je Chunk, aus den PEAK-Werten der Referenz
+#   (x146/x150 PP0 21965 -> 22286 -> 22607 -> 22927 = 320.7 MiB je 16k-Chunk),
+#   je Token gerechnet und bis zum LETZTEN Chunk des Prompts fortgeschrieben.
+#   Gemessen ist es bis Chunk 3 (PP2: 1); danach druckt die Referenz keine
+#   neue Hochwassermarke mehr (Schritt 256 MiB) -- die Fortschreibung darueber
+#   ist eine HOCHRECHNUNG und steht so in jeder Zeile;
+# * LMEM_s: der lokale Treiberspeicher des Arena-Write-Kernels im Run-Modus
+#   (H47): stack = run/32 - 64 B je residentem Thread, einmal je Karte,
+#   sichtbar als cap-Abfall zwischen Chunk 0 und Chunk 1 (x149 PP0 -1457,
+#   x146 PP1 -150, PP2 -48). Mit dem H47-Fix (``arena_write.
+#   RUN_ELEMENT_BYTES``) ist er 0; ohne Fix gilt der gemessene Hochstand.
+#
+# Der TOD x149 ist KEIN Zeilenpreis: im Chunk 0 lag x149 auf dem Zeilenbild
+# (1300 gemessen), gestorben ist er am LMEM (cap 28951 -> 27494 nach
+# 'WEG2-ARENA-WRITE n=1 ... mode=run'). :func:`death_from_log` erkennt diesen
+# Fall und bucht ihn nicht.
 
 
 class PCardReference(msgspec.Struct, frozen=True, kw_only=True):
-    """Der Kopfraum am bindenden Punkt eines Referenz-Boots, je P-Stufe."""
+    """Der Kopfraum am Chunk 0 eines Referenz-Boots je P-Stufe, das Wachstum
+    je Chunk und der LMEM-Posten dieser Referenz."""
 
     source: str
     model: str
     stage_layers: Tuple[int, ...]
     chunk: int
-    #: ``Kopfraum + Puffer x L x Zeile + KV + T(chunk)`` -- die Karte ohne
-    #: Experten-Puffer, KV und Chunk-Transiente, MiB; Minimum ueber die Boots.
+    #: ``Kopfraum(Chunk 0) + Puffer x L x Zeile + KV + T(chunk)``, MiB;
+    #: Minimum ueber die Boots.
     headroom0_mib: Tuple[float, ...]
-    #: Die Terme des bindenden Punkts, fuer den Druck.
+    #: Die Terme des Chunk-0-Punkts, fuer den Druck.
     headroom_mib: Tuple[float, ...]
     buffer_rows: Tuple[int, ...]
     kv_mib: Tuple[float, ...]
     cap_mib: Tuple[float, ...]
     peak_mib: Tuple[float, ...]
     private_free_mib: Tuple[float, ...]
-    phase: Tuple[str, ...]
     draft_on_p: bool
-    #: H41b (x149): was eine Pufferzeile UEBER der Referenz die Karte je Stufe
-    #: kostet, MiB (Layer x Zeile ist die Untergrenze). Gemessen an einem
-    #: gestorbenen Boot derselben Form (:func:`row_card_cost_from_deaths`);
-    #: leer = das Zeilenbild ``L x Zeile``.
+    #: Wachstum der Spitze je Token (MiB), aus den Peak-Werten ueber die
+    #: gemessenen Chunk-Indizes; ``growth_measured_chunks`` = bis wohin.
+    growth_mib_per_token: Tuple[float, ...]
+    growth_measured_chunks: Tuple[int, ...]
+    #: Der laengste Prompt der Referenz (Token), Tiefe des Riegels per Default.
+    longest_prompt_tokens: int
+    #: cap-Abfall nach dem ersten Run-Write der Referenz, MiB je Stufe (H47).
+    lmem_mib: Tuple[float, ...]
+    #: Preis einer Zeile ueber der Referenz, MiB (leer = das Zeilenbild).
     row_card_mib: Tuple[float, ...] = ()
     row_card_source: str = ""
 
@@ -341,6 +377,8 @@ _RX_POOL = re.compile(
     r".*?peak_mib=(\d+) .*?cap_mib=(\d+) "
 )
 _RX_EXC = re.compile(_STAGE + r" Scheduler hit an exception")
+_RX_RUNWRITE = re.compile(_STAGE + r" WEG2-ARENA-WRITE n=\d+ .*mode=run ")
+_RX_SLEEP_LMEM = re.compile(_STAGE + r" WEG2-SLEEP-LMEM lmem \d+->\d+ MiB released \(stack (\d+)->")
 _RX_OOM = re.compile(
     r"OutOfMemoryError: CUDA out of memory\. Tried to allocate ([0-9.]+) (MiB|GiB)\. "
     r"GPU \d+ has a total capacity of [0-9.]+ GiB of which ([0-9.]+) (MiB|GiB) is free\."
@@ -348,19 +386,37 @@ _RX_OOM = re.compile(
     r"([0-9.]+) (MiB|GiB) is reserved by PyTorch but unallocated"
 )
 
+#: Ab diesem cap-Abfall zwischen zwei Punkten derselben Stufe ist es der
+#: Run-Write-LMEM (x149 1457 MiB), keine Zeile und kein Chunk.
+LMEM_CAP_DROP_MIB = 1024.0
+#: Ab diesem Stack je Thread ist ein WEG2-SLEEP-LMEM der Run-Write-Hochstand
+#: (Basis 1248-1504 B, Run-Write PP0 7104 B, x151).
+LMEM_STACK_BYTES = 2000
+
 
 def _mib(v: str, unit: str) -> float:
     return float(v) * (GIB_IN_MIB if unit == "GiB" else 1.0)
 
 
-def headroom_by_chunk_index(text: str) -> Dict[int, Dict[int, float]]:
-    """``{stage: {chunk_index: min headroom}}`` aus den WEG2-GRAPH-POOL-Zeilen
-    eines P-Logs; der Chunk-Index ist ``start // chunk`` der letzten
-    ``#969 EXTENT``-Zeile der Stufe davor (der Punkt steht am Forward-Ende).
-    ``post-capture`` ist kein Forward-Punkt und zaehlt nicht."""
+class PoolSample(msgspec.Struct, frozen=True, kw_only=True):
+    stage: int
+    chunk_index: int
+    phase: str
+    private_free_mib: float
+    peak_mib: float
+    cap_mib: float
+
+    @property
+    def headroom_mib(self) -> float:
+        return self.cap_mib - self.peak_mib - self.private_free_mib
+
+
+def pool_samples(text: str) -> Dict[int, List[PoolSample]]:
+    """Die Forward-Punkte (WEG2-GRAPH-POOL, ohne ``post-capture``) je Stufe mit
+    ihrem Chunk-Index ``start // chunk`` der letzten ``#969 EXTENT``-Zeile."""
     chunk: Dict[int, int] = {}
     start: Dict[int, int] = {}
-    out: Dict[int, Dict[int, float]] = {}
+    out: Dict[int, List[PoolSample]] = {}
     for line in text.splitlines():
         m = _RX_CHUNK.search(line)
         if m:
@@ -375,33 +431,68 @@ def headroom_by_chunk_index(text: str) -> Dict[int, Dict[int, float]]:
             s = int(m.group(1))
             if s not in chunk or s not in start or int(m.group(3)) < 0:
                 continue
-            idx = start[s] // max(1, chunk[s])
-            h = float(m.group(5)) - float(m.group(4)) - float(m.group(3))
-            cur = out.setdefault(s, {})
-            cur[idx] = min(cur.get(idx, h), h)
+            out.setdefault(s, []).append(
+                PoolSample(
+                    stage=s,
+                    chunk_index=start[s] // max(1, chunk[s]),
+                    phase=m.group(2),
+                    private_free_mib=float(m.group(3)),
+                    peak_mib=float(m.group(4)),
+                    cap_mib=float(m.group(5)),
+                )
+            )
     return out
 
 
+def headroom_by_chunk_index(text: str) -> Dict[int, Dict[int, float]]:
+    """``{stage: {chunk_index: min headroom}}`` (siehe :func:`pool_samples`)."""
+    out: Dict[int, Dict[int, float]] = {}
+    for s, ss in pool_samples(text).items():
+        cur = out.setdefault(s, {})
+        for p in ss:
+            cur[p.chunk_index] = min(cur.get(p.chunk_index, p.headroom_mib), p.headroom_mib)
+    return out
+
+
+def longest_prompt_tokens(text: str) -> int:
+    """Das groesste Extent-Ende eines Logs (der laengste Prompt, Token)."""
+    best = 0
+    for line in text.splitlines():
+        m = _RX_EXTENT.search(line)
+        if m:
+            best = max(best, int(m.group(3)))
+    return best
+
+
 class PCardDeath(msgspec.Struct, frozen=True, kw_only=True):
-    """Ein P-Rang, der im Chunk-Forward an der Karte starb: die OBERE Schranke
-    seines Kopfraums am Todespunkt, torch-Sicht, MiB::
+    """Ein P-Rang, der an der Karte starb, torch-Sicht, MiB.
 
-        Kopfraum <= (frei + reserviert) - (belegt + Anforderung) - privat_frei
+    ``allocated by PyTorch`` im OOM-Text enthaelt die freien Bloecke der
+    privaten Pools (H47): echt belegt = belegt - privat_frei. Damit::
 
-    mit ``reserviert = belegt + reserviert-aber-frei`` aus dem OOM-Text und
-    ``privat_frei`` aus dem letzten WEG2-GRAPH-POOL-Punkt der Stufe."""
+        Kopfraum_Tod = cap_Tod - (belegt - privat_frei + Anforderung) - privat_frei
+                     = cap_Tod - belegt - Anforderung
+
+    ``cause`` = ``"lmem"``, wenn zwischen dem letzten Punkt der Stufe und dem
+    Tod ein ``WEG2-ARENA-WRITE ... mode=run`` lag und cap um mehr als
+    :data:`LMEM_CAP_DROP_MIB` fiel (oder ein WEG2-SLEEP-LMEM-Stack ueber
+    :data:`LMEM_STACK_BYTES` steht) -- dann ist der Tod der LMEM-Posten und
+    kein Zeilenpreis; sonst ``"card"``."""
 
     source: str
     stage: int
     chunk: int
     chunk_index: int
     buffer_rows: int
-    kv_mib: float
-    draft_on_p: bool
-    headroom_bound_mib: float
+    cause: str
+    headroom_mib: float
     cap_mib: float
-    need_mib: float
+    cap_before_mib: float
+    used_mib: float
+    request_mib: float
     private_free_mib: float
+    #: Kopfraum am Tod, wenn cap nicht gefallen waere (LMEM-Fall).
+    headroom_without_lmem_mib: float
 
 
 def death_from_log(name: str, text: str) -> Optional[PCardDeath]:
@@ -410,6 +501,9 @@ def death_from_log(name: str, text: str) -> Optional[PCardDeath]:
     chunk: Dict[int, int] = {}
     start: Dict[int, int] = {}
     pfree: Dict[int, float] = {}
+    cap_last: Dict[int, float] = {}
+    runwrite_after: Dict[int, bool] = {}
+    big_stack: Dict[int, bool] = {}
     exc_stage: Optional[int] = None
     for line in text.splitlines():
         m = _RX_CHUNK.search(line)
@@ -422,7 +516,18 @@ def death_from_log(name: str, text: str) -> Optional[PCardDeath]:
             continue
         m = _RX_POOL.search(line)
         if m:
-            pfree[int(m.group(1))] = float(m.group(3))
+            s = int(m.group(1))
+            pfree[s] = float(m.group(3))
+            cap_last[s] = float(m.group(5))
+            runwrite_after[s] = False
+            continue
+        m = _RX_RUNWRITE.search(line)
+        if m:
+            runwrite_after[int(m.group(1))] = True
+            continue
+        m = _RX_SLEEP_LMEM.search(line)
+        if m and int(m.group(2)) > LMEM_STACK_BYTES:
+            big_stack[int(m.group(1))] = True
             continue
         m = _RX_EXC.search(line)
         if m:
@@ -434,100 +539,83 @@ def death_from_log(name: str, text: str) -> Optional[PCardDeath]:
             if s not in chunk or s not in start or s not in pfree:
                 return None
             obs = observe_p_log(text)
-            if s not in obs["buffer"] or s not in obs["cell"] or s not in obs["tokens"]:
+            if s not in obs["buffer"]:
                 return None
             req = _mib(m.group(1), m.group(2))
             free = _mib(m.group(3), m.group(4))
             alloc = float(m.group(5)) * GIB_IN_MIB
             unalloc = _mib(m.group(6), m.group(7))
             cap = free + alloc + unalloc
-            need = alloc + req
+            used = alloc - pfree[s]
+            head = cap - used - req - pfree[s]
+            drop = cap_last[s] - cap
+            lmem = (runwrite_after.get(s, False) and drop > LMEM_CAP_DROP_MIB) or big_stack.get(s, False)
             return PCardDeath(
                 source=name,
                 stage=s,
                 chunk=int(chunk[s]),
                 chunk_index=int(start[s]) // max(1, int(chunk[s])),
                 buffer_rows=int(obs["buffer"][s]),
-                kv_mib=float(obs["tokens"][s]) * float(obs["cell"][s]) / MIB,
-                draft_on_p=bool(obs["draft_on_p"][0]),
-                headroom_bound_mib=round(cap - need - pfree[s], 1),
+                cause="lmem" if lmem else "card",
+                headroom_mib=round(head, 1),
                 cap_mib=round(cap, 1),
-                need_mib=round(need, 1),
+                cap_before_mib=cap_last[s],
+                used_mib=round(used, 1),
+                request_mib=req,
                 private_free_mib=pfree[s],
+                headroom_without_lmem_mib=round(head + max(0.0, drop), 1),
             )
     return None
 
 
-def row_card_cost_from_deaths(
+def row_card_cost_from_boots(
     reference_boots: Sequence[Tuple[str, str]],
-    deaths: Sequence[PCardDeath],
+    over_boots: Sequence[Tuple[str, str]],
     *,
     reference: "PCardReference",
     row_mib: float,
 ) -> Tuple[Tuple[float, ...], str]:
-    """Was eine Pufferzeile ueber der Referenz die KARTE kostet, je Stufe.
+    """Preis einer Zeile ueber der Referenz, je Stufe, aus dem CHUNK-0-Punkt.
 
-    Je Tod: ``k = (Kopfraum_ref(Chunk-Index des Todes) - Schranke_Tod - dKV) /
-    dZeilen`` -- der Referenz-Kopfraum am SELBEN Chunk-Index (Minimum ueber die
-    Referenz-Boots); die Todes-Schranke ist eine obere, also ist ``k`` eine
-    UNTERE Schranke der wahren Kosten. Je Stufe das Maximum aus ``L x Zeile``
-    und den Toden dieser Stufe. Stufen ohne eigenen Tod erben das groesste
-    gemessene Verhaeltnis ``k / (L x Zeile)`` (als Uebertragung benannt).
+    ``k = (Kopfraum_ref(Chunk 0) - Kopfraum_over(Chunk 0) - dKV) / dZeilen``;
+    am Chunk 0 liegt noch kein Run-Write und kein Chunk-Wachstum dazwischen.
+    Eine Differenz im privat_frei steckt darin, also ist ``k`` eine OBERE
+    Schranke. Nie unter dem Zeilenbild ``L x Zeile``.
     """
     n = len(reference.stage_layers)
-    per_idx: Dict[int, Dict[int, float]] = {}
+    img = [int(reference.stage_layers[s]) * float(row_mib) for s in range(n)]
+    ref0: Dict[int, float] = {}
     for _name, text in reference_boots:
         for s, d in headroom_by_chunk_index(text).items():
-            cur = per_idx.setdefault(s, {})
-            for i, h in d.items():
-                cur[i] = min(cur.get(i, h), h)
-    img = [int(reference.stage_layers[s]) * float(row_mib) for s in range(n)]
-    k: Dict[int, float] = {}
+            if 0 in d:
+                ref0[s] = min(ref0.get(s, d[0]), d[0])
+    k = list(img)
     notes: List[str] = []
-    for d in deaths:
-        s = d.stage
-        if d.chunk != reference.chunk or d.draft_on_p != reference.draft_on_p:
+    for name, text in over_boots:
+        obs = observe_p_log(text)
+        h = headroom_by_chunk_index(text)
+        if obs["chunk"].get(0) != reference.chunk or bool(obs["draft_on_p"][0]) != reference.draft_on_p:
             raise ValueError(
-                "Tod %s: Chunk %d / Draft %s, die Referenz %s hat %d / %s -- ein Tod "
-                "einer anderen Form misst keine Zeilenkosten"
-                % (d.source, d.chunk, d.draft_on_p, reference.source, reference.chunk,
-                   reference.draft_on_p)
+                "Ueber-Boot %s: Chunk %s / Draft %s, die Referenz %s hat %d / %s"
+                % (name, obs["chunk"].get(0), obs["draft_on_p"][0], reference.source,
+                   reference.chunk, reference.draft_on_p)
             )
-        drows = int(d.buffer_rows) - int(reference.buffer_rows[s])
-        if drows <= 0:
-            raise ValueError(
-                "Tod %s stage%d: %d Zeilen <= Referenz %d -- kein Zeilenterm messbar"
-                % (d.source, s, d.buffer_rows, reference.buffer_rows[s])
+        for s in range(n):
+            if s not in obs["buffer"] or 0 not in h.get(s, {}) or s not in ref0:
+                continue
+            drows = int(obs["buffer"][s]) - int(reference.buffer_rows[s])
+            if drows <= 0:
+                continue
+            kv = float(obs["tokens"].get(s, 0)) * float(obs["cell"].get(s, 0)) / MIB
+            val = (ref0[s] - h[s][0] - (kv - float(reference.kv_mib[s]))) / drows
+            notes.append(
+                "stage%d %.1f MiB/Zeile = (Referenz %.0f - %s %.0f am Chunk 0) / %d Zeilen "
+                "(Bild %.1f%s)"
+                % (s, val, ref0[s], name, h[s][0], drows, img[s],
+                   "" if val >= img[s] else "; darunter gilt das Bild")
             )
-        href = per_idx.get(s, {}).get(d.chunk_index)
-        if href is None:
-            raise ValueError(
-                "Tod %s stage%d im Chunk %d: die Referenz %s hat an diesem Chunk-Index "
-                "keinen WEG2-GRAPH-POOL-Punkt" % (d.source, s, d.chunk_index, reference.source)
-            )
-        dkv = float(d.kv_mib) - float(reference.kv_mib[s])
-        val = (href - d.headroom_bound_mib - dkv) / drows
-        k[s] = max(k.get(s, img[s]), val)
-        notes.append(
-            "stage%d %.1f MiB/Zeile >= (Referenz-Kopfraum %.0f @Chunk %d - Tod %s %.0f "
-            "[cap %.0f - Bedarf %.0f - privat_frei %.0f] - dKV %.0f) / %d Zeilen "
-            "(Zeilenbild %.1f)"
-            % (s, val, href, d.chunk_index, d.source, d.headroom_bound_mib, d.cap_mib,
-               d.need_mib, d.private_free_mib, dkv, drows, img[s])
-        )
-    ratio = max([k[s] / img[s] for s in k] or [1.0])
-    out = []
-    for s in range(n):
-        if s in k:
-            out.append(round(k[s], 1))
-        else:
-            out.append(round(img[s] * ratio, 1))
-            if ratio > 1.0:
-                notes.append(
-                    "stage%d ohne eigenen Tod: Verhaeltnis %.3f der gemessenen Stufe "
-                    "uebertragen (Hochrechnung) -> %.1f MiB/Zeile" % (s, ratio, img[s] * ratio)
-                )
-    return tuple(out), "; ".join(notes)
+            k[s] = max(k[s], val)
+    return tuple(round(x, 1) for x in k), "; ".join(notes)
 
 
 def p_card_reference_from_logs(
@@ -537,51 +625,55 @@ def p_card_reference_from_logs(
     row_mib: float,
     support: TransientSupport,
     model: str,
-    death_boots: Sequence[Tuple[str, str]] = (),
+    over_boots: Sequence[Tuple[str, str]] = (),
 ) -> PCardReference:
     """Die P-Karten-Referenz aus P-Logs MESSEN (``boots`` = (Name, Text)).
 
-    ``death_boots``: P-Logs derselben Form mit MEHR Pufferzeilen, die im
-    Chunk-Forward an der Karte starben (x149); sie messen die Kartenkosten je
-    Zeile ueber der Referenz (:func:`row_card_cost_from_deaths`).
-
-    Je Boot und Stufe der ``WEG2-GRAPH-POOL``-Punkt mit dem kleinsten
-    Kopfraum (``graph_pool_ledger.binding_sample``), normiert mit dem Puffer,
-    der KV-Zelle x Token und der Stuetzpunkt-Transiente DESSELBEN Logs. Fehlt
-    einer Stufe einer der Terme in ALLEN Boots, wird verweigert, statt eine
-    Null einzusetzen.
+    Je Stufe: der Chunk-0-Punkt (Minimum ueber die Boots), normiert mit
+    Puffer, KV-Zelle x Token und Stuetzpunkt-Transiente; das Wachstum aus den
+    Peak-Werten der gemessenen Chunk-Indizes (je Token); der LMEM-Posten als
+    cap-Abfall zwischen Chunk 0 und dem letzten Punkt; der laengste Prompt.
+    ``over_boots`` (mehr Zeilen, lebend oder tot) messen den Zeilenpreis.
     """
-    from sglang.srt.planner import graph_pool_ledger as gpl
-
     n = len(stage_layers)
-    best: Dict[int, Tuple[float, object, int, float]] = {}
+    best: Dict[int, Tuple[float, PoolSample, int, float]] = {}
+    growth: Dict[int, float] = {}
+    gidx: Dict[int, int] = {}
+    lmem: Dict[int, float] = {}
     chunks = set()
     draft = set()
+    longest = 0
     for _name, text in boots:
         obs = observe_p_log(text)
-        samples = gpl.samples_from_log(text)
+        samples = pool_samples(text)
         draft.add(bool(obs["draft_on_p"][0]))
+        longest = max(longest, longest_prompt_tokens(text))
         for s in range(n):
-            if s not in samples or s not in obs["buffer"] or s not in obs["cell"]:
-                continue
-            if s not in obs["chunk"] or s not in obs["tokens"]:
-                continue
-            smp = gpl.binding_sample(samples[s])
-            if smp is None:
+            ss = samples.get(s, [])
+            first = [p for p in ss if p.chunk_index == 0]
+            if not first or s not in obs["buffer"] or s not in obs["cell"] or s not in obs["tokens"]:
                 continue
             c = int(obs["chunk"][s])
             chunks.add(c)
+            p0 = min(first, key=lambda p: p.headroom_mib)
             rows = int(obs["buffer"][s])
             kv = float(obs["tokens"][s]) * float(obs["cell"][s]) / MIB
             t, _src = transient_mib(support, s, c)
-            h0 = smp.headroom_mib + rows * int(stage_layers[s]) * float(row_mib) + kv + t
+            h0 = p0.headroom_mib + rows * int(stage_layers[s]) * float(row_mib) + kv + t
             if s not in best or h0 < best[s][0]:
-                best[s] = (h0, smp, rows, kv)
-    missing = [s for s in range(n) if s not in best]
+                best[s] = (h0, p0, rows, kv)
+            last = max(ss, key=lambda p: (p.chunk_index, p.peak_mib))
+            if last.chunk_index > 0:
+                g = (last.peak_mib - p0.peak_mib) / (last.chunk_index * c)
+                growth[s] = max(growth.get(s, 0.0), g)
+                gidx[s] = max(gidx.get(s, 0), last.chunk_index)
+            lmem[s] = max(lmem.get(s, 0.0), max(0.0, p0.cap_mib - min(p.cap_mib for p in ss)))
+    missing = [s for s in range(n) if s not in best or s not in growth]
     if missing:
         raise ValueError(
-            "P-Karten-Referenz unvollstaendig in %s: Stufe %s ohne WEG2-GRAPH-POOL-"
-            "Punkt, Pufferzeile, KV-Zelle oder Chunk" % ([b[0] for b in boots], missing)
+            "P-Karten-Referenz unvollstaendig in %s: Stufe %s ohne Chunk-0-Punkt, ohne "
+            "spaeteren Punkt (Wachstum), Pufferzeile, KV-Zelle oder Chunk"
+            % ([b[0] for b in boots], missing)
         )
     if len(chunks) != 1 or len(draft) != 1:
         raise ValueError(
@@ -597,91 +689,84 @@ def p_card_reference_from_logs(
         headroom_mib=tuple(round(best[s][1].headroom_mib, 1) for s in range(n)),
         buffer_rows=tuple(best[s][2] for s in range(n)),
         kv_mib=tuple(round(best[s][3], 1) for s in range(n)),
-        cap_mib=tuple(round(best[s][1].cap_mib, 1) for s in range(n)),
-        peak_mib=tuple(round(best[s][1].peak_mib, 1) for s in range(n)),
-        private_free_mib=tuple(round(best[s][1].private_free_mib, 1) for s in range(n)),
-        phase=tuple(best[s][1].phase for s in range(n)),
+        cap_mib=tuple(best[s][1].cap_mib for s in range(n)),
+        peak_mib=tuple(best[s][1].peak_mib for s in range(n)),
+        private_free_mib=tuple(best[s][1].private_free_mib for s in range(n)),
         draft_on_p=bool(next(iter(draft))),
+        growth_mib_per_token=tuple(round(growth[s], 7) for s in range(n)),
+        growth_measured_chunks=tuple(gidx[s] for s in range(n)),
+        longest_prompt_tokens=int(longest),
+        lmem_mib=tuple(round(lmem[s], 1) for s in range(n)),
     )
-    deaths = [d for d in (death_from_log(nm, tx) for nm, tx in death_boots) if d is not None]
-    if len(deaths) != len(death_boots):
-        raise ValueError(
-            "Todes-Boots %s: nicht jeder traegt einen lesbaren OOM-Tod einer P-Stufe"
-            % [b[0] for b in death_boots]
-        )
-    if not deaths:
+    if not over_boots:
         return ref
-    cost, src = row_card_cost_from_deaths(boots, deaths, reference=ref, row_mib=row_mib)
+    cost, src = row_card_cost_from_boots(boots, over_boots, reference=ref, row_mib=row_mib)
     return msgspec.structs.replace(ref, row_card_mib=cost, row_card_source=src)
 
 
 #: Die gemessene P-Karten-Referenz der Next-Flash-Bestform (H25-Form, kein
 #: Draft auf P), hergeleitet von :func:`p_card_reference_from_logs` aus
-#: fnFL2x145 (9310d2893a) und fnFL2x146 (012db511b8), beide Schnitt 29,11,8,
-#: Chunk 16384, FR_P 0.26,0.45,0.39 -> H25 0.26,0.45,0.733887 (Puffer
-#: 166/263/408 Zeilen), KV 262144 x 7616/3264/2176 B. Bindend ist auf jeder
-#: Stufe der letzte ``high-water``-Punkt des 97k-Prompts (PP0 x146: cap 28953
-#: - peak 22927 - privat_frei 2394 = 3632 MiB). Zeile 2.4170 MiB (512 Experten,
-#: 1237.5 MiB je Layer, aus den Safetensors-Headern). Auffrischen:
-#: ``--p-card-reference-logs`` / ``--p-card-death-logs``.
-#:
-#: H41b -- DIE ZEILE UEBER DER REFERENZ KOSTET DIE KARTE MEHR ALS IHR BILD.
-#: fnFL2x149 (74c06defd0, FR_P 0.351 -> 212 Zeilen auf PP0) passierte die
-#: erste Fassung dieses Riegels (Kopfraum 408 gerechnet) und starb im ZWEITEN
-#: 16k-Chunk (``#969 EXTENT ... 16384, 32768``) an ``h = k.new_empty(...)`` im
-#: GDN-Extend: "Tried to allocate 384.00 MiB ... 292.81 MiB is free ... 26.28
-#: GiB is allocated by PyTorch ... 290.04 MiB is reserved by PyTorch but
-#: unallocated". Im ERSTEN Chunk lag x149 genau auf dem Zeilenbild (Kopfraum
-#: 1300 gemessen gegen 4594 - 46 x 70.1 - 73 = 1297); im zweiten fehlten
-#: gegen x146 (4273 bei Chunk 1) 6541 MiB statt 3224: +1790 MiB torch-Bedarf
-#: ueber die Chunk-1-Spitze hinaus und -1457 MiB cap (frei + reserviert
-#: 28951 -> 27494, Speicher ausserhalb des Allokators). Beides zusammen ist
-#: ~ein zweites Zeilenbild; der Mechanismus ist NICHT identifiziert. Der
-#: Riegel fuehrt deshalb den GEMESSENEN Preis je Zeile ueber der Referenz
-#: (untere Schranke aus dem Tod, :func:`row_card_cost_from_deaths`), nicht
-#: das Bild; auf PP1/PP2 (kein eigener Tod) als uebertragenes Verhaeltnis.
+#: fnFL2x146 (012db511b8) und fnFL2x150 (78878cdd58), beide Schnitt 29,11,8,
+#: Chunk 16384, FR_P 0.26,0.45,0.39 -> H25 0.733887 (Puffer 166/263/408
+#: Zeilen), KV 262144 x 7616/3264/2176 B, 97k-Prompt (97841 Token). Chunk 0
+#: PP0: cap 28953 - peak 21965 - privat_frei 2394 = 4594 MiB; Wachstum der
+#: Spitze 320.7 MiB je 16k-Chunk (gemessen bis Chunk 3); LMEM-Posten der
+#: Referenz 0 / 150 / 48 MiB (PP0: Run-Write scheiterte, Fallback paged-copy).
+#: Zeilenpreis ueber der Referenz aus fnFL2x149 Chunk 0: PP0 71.6 MiB (Bild
+#: 70.1); PP1 26.4 < Bild -> Bild. Zeile 2.4170 MiB (512 Experten, 1237.5 MiB
+#: je Layer). Auffrischen: ``--p-card-reference-logs`` / ``--p-card-over-logs``.
 P_CARD_REFERENCE_FNFL2 = PCardReference(
-    source="fnFL2x145 + fnFL2x146",
+    source="fnFL2x146 + fnFL2x150",
     model="Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",
     stage_layers=(29, 11, 8),
     chunk=16384,
-    headroom0_mib=(20868.2, 14101.5, 13613.8),
-    headroom_mib=(3632.0, 3006.0, 1914.0),
+    headroom0_mib=(21820.2, 15225.5, 13990.8),
+    headroom_mib=(4584.0, 4130.0, 2291.0),
     buffer_rows=(166, 263, 408),
     kv_mib=(1904.0, 816.0, 544.0),
-    cap_mib=(28953.0, 18464.0, 18574.0),
-    peak_mib=(22927.0, 14464.0, 14759.0),
+    cap_mib=(28943.0, 18614.0, 18622.0),
+    peak_mib=(21965.0, 13490.0, 14430.0),
     private_free_mib=(2394.0, 994.0, 1901.0),
-    phase=("high-water", "high-water", "high-water"),
     draft_on_p=False,
-    row_card_mib=(142.2, 53.9, 39.2),
+    growth_mib_per_token=(0.0195719, 0.0198161, 0.0200806),
+    growth_measured_chunks=(3, 3, 1),
+    longest_prompt_tokens=97841,
+    lmem_mib=(0.0, 150.0, 48.0),
+    row_card_mib=(71.4, 26.6, 19.3),
     row_card_source=(
-        "stage0 142.2 MiB/Zeile >= (Referenz-Kopfraum 4273 @Chunk 1 - Tod fnFL2x149 -2268 "
-        "[cap 27494 - Bedarf 27295 - privat_frei 2467] - dKV 0) / 46 Zeilen (Zeilenbild 70.1); "
-        "stage1 ohne eigenen Tod: Verhaeltnis 2.029 der gemessenen Stufe uebertragen "
-        "(Hochrechnung) -> 53.9 MiB/Zeile; stage2 ohne eigenen Tod: Verhaeltnis 2.029 der "
-        "gemessenen Stufe uebertragen (Hochrechnung) -> 39.2 MiB/Zeile"
+        "stage0 71.4 MiB/Zeile = (Referenz 4584 - fnFL2x149 1300 am Chunk 0) / 46 Zeilen "
+        "(Bild 70.1); stage1 26.4 MiB/Zeile = (Referenz 4130 - fnFL2x149 1545 am Chunk 0) "
+        "/ 98 Zeilen (Bild 26.6; darunter gilt das Bild)"
     ),
 )
 
 
 class PCardFit(msgspec.Struct, frozen=True, kw_only=True):
-    """Eine P-Stufe auf ihrer Karte fuer (Fraction, Chunk)."""
+    """Eine P-Stufe auf ihrer Karte fuer (Fraction, Chunk, Prompt)."""
 
     stage: int
     card: str
     fraction: float
     buffer_rows: int
     layer_row_mib: float
-    #: Kartenkosten einer Zeile ueber der Referenz (>= layer_row_mib, H41b).
+    #: Preis einer Zeile ueber der Referenz (>= layer_row_mib).
     row_card_mib: float
     expert_mib: float
     kv_mib: float
     transient_mib: float
-    #: T_s bei der Chunkbreite der Referenz (die Verschiebung ist die Differenz).
     transient_ref_mib: float
     transient_source: str
     draft_mib: float
+    prompt_tokens: int
+    last_chunk_index: int
+    growth_mib: float
+    growth_extrapolated: bool
+    #: Der Kopfraum, wenn das Wachstum nach dem letzten GEMESSENEN Chunk
+    #: stehen bleibt (so zeigen es x146/x150: keine neue Hochwassermarke
+    #: danach, also < 256 MiB) -- gedruckt, nicht der Riegel.
+    headroom_saturated_mib: float
+    lmem_mib: float
+    lmem_source: str
     headroom_mib: float
     near_oom_mib: float
     ceiling_fraction: Optional[float]
@@ -711,18 +796,19 @@ def solve_p_card(
     draft_mib_last_stage: float = 0.0,
     cards: Sequence[str] = (),
     near_oom_mib: float = NEAR_OOM_MIB,
+    prompt_tokens: int = 0,
+    lmem_fixed: bool = True,
+    use_growth: bool = True,
 ) -> Tuple[PCardFit, ...]:
-    """Je P-Stufe::
+    """Je P-Stufe der Kopfraum am LETZTEN Chunk eines Prompts von
+    ``prompt_tokens`` Token (0 = der laengste Prompt der Referenz)::
 
-        Kopfraum_s = K0_s - Puffer_s x L_s x Zeile - KV_s - T_s(chunk) - Draft_s
-                     >= near-OOM
+        K0 - Zeilen x Bild - Ueber x (Preis - Bild) - KV - T(chunk) - Draft
+           - g x (Token vor dem letzten Chunk) - LMEM   >= near-OOM
 
-    ``Draft_s`` gilt auf der LETZTEN Stufe und ist die Differenz der Draft-
-    Form gegen die Referenz: ``(draft_on_p - reference.draft_on_p) x
-    draft_mib_last_stage`` (``draft_post.p_draft_post_mib``: Gewichte + Puffer
-    + Produzenten-Transiente, derselbe Posten, den H25 in Zeilen umrechnet). ``PChunkUnmeasured`` fuer einen Chunk
-    ausserhalb der Stuetzpunkte; ``ValueError`` fuer einen anderen Schnitt als
-    den der Referenz (der Kopfraum ist je Layerzahl gemessen).
+    ``lmem_fixed``: der Baum traegt den H47-Fix (Run-Write in 1-KiB-Elementen)
+    -> LMEM 0; sonst der gemessene Hochstand je Stufe (PP0 aus x149).
+    ``use_growth=False`` ist nur fuer den Mutanten-Test.
     """
     from sglang.srt.planner import expert_residency as _er
 
@@ -739,6 +825,11 @@ def solve_p_card(
             "P-Karte: %d Stufen, aber %d Fractions / %d LRU / %d KV"
             % (n, len(fractions), len(lru_rows), len(kv_mib))
         )
+    prompt = int(prompt_tokens) if int(prompt_tokens) > 0 else int(reference.longest_prompt_tokens)
+    c = int(chunk)
+    n_chunks = max(1, -(-prompt // c))
+    last_idx = n_chunks - 1
+    before_last = last_idx * c
     out: List[PCardFit] = []
     for s in range(n):
         layer_mib = int(stage_layers[s]) * float(row_mib)
@@ -747,23 +838,34 @@ def solve_p_card(
             fraction=float(fractions[s]),
             scratch_rows=int(lru_rows[s]),
         )
-        t, src = transient_mib(support, s, chunk)
+        t, src = transient_mib(support, s, c)
         draft = 0.0
         if s == n - 1:
             draft = (int(bool(draft_on_p)) - int(bool(reference.draft_on_p))) * float(
                 draft_mib_last_stage
             )
-        rest = float(reference.headroom0_mib[s]) - float(kv_mib[s]) - t - draft
-        # H41b (x149): eine Zeile UEBER der Referenz kostet die Karte
-        # ``row_card`` (gemessen am Tod), darunter das Zeilenbild L x Zeile.
+        growth = float(reference.growth_mib_per_token[s]) * before_last if use_growth else 0.0
+        extrapolated = last_idx > int(reference.growth_measured_chunks[s])
+        if lmem_fixed:
+            lmem, lsrc = 0.0, "0 (H47-Fix: Run-Write in 1-KiB-Elementen)"
+        else:
+            lmem = max(float(reference.lmem_mib[s]), float(P_LMEM_RUN_WRITE_MIB[s]))
+            lsrc = "%.0f (ohne H47-Fix: gemessener Run-Write-Hochstand)" % lmem
         ref_rows = int(reference.buffer_rows[s])
         row_card = (
             max(layer_mib, float(reference.row_card_mib[s]))
             if reference.row_card_mib
             else layer_mib
         )
+        rest = float(reference.headroom0_mib[s]) - float(kv_mib[s]) - t - draft - growth - lmem
         over = max(0, int(rows) - ref_rows)
         head = rest - rows * layer_mib - over * (row_card - layer_mib)
+        sat = (
+            float(reference.growth_mib_per_token[s])
+            * min(last_idx, int(reference.growth_measured_chunks[s])) * c
+            if use_growth else 0.0
+        )
+        head_sat = head + growth - sat
         at_ref = rest - ref_rows * layer_mib - float(near_oom_mib)
         if at_ref >= 0.0:
             max_rows = ref_rows + int(math.floor(at_ref / row_card))
@@ -783,6 +885,13 @@ def solve_p_card(
                 transient_ref_mib=transient_mib(support, s, reference.chunk)[0],
                 transient_source=src,
                 draft_mib=draft,
+                prompt_tokens=prompt,
+                last_chunk_index=last_idx,
+                growth_mib=growth,
+                growth_extrapolated=bool(extrapolated and use_growth),
+                headroom_saturated_mib=head_sat,
+                lmem_mib=lmem,
+                lmem_source=lsrc,
                 headroom_mib=head,
                 near_oom_mib=float(near_oom_mib),
                 ceiling_fraction=_er.largest_fraction_for_rows(
@@ -800,23 +909,23 @@ def describe_p_card(fit: PCardFit, reference: PCardReference) -> str:
     s = fit.stage
     ceiling = "KEINE" if fit.ceiling_fraction is None else "%.3f" % fit.ceiling_fraction
     return (
-        "%s stage%d (%s): Referenz %s Kopfraum %.0f = cap %.0f - peak %.0f - "
-        "privat_frei %.0f MiB am Punkt '%s' bei %d Zeilen, KV %.0f, Chunk %d; hier "
-        "f %.4f -> %d Zeilen (%+.0f MiB; je Zeile ueber der Referenz %.1f MiB, Bild %.1f), "
-        "KV %.0f (%+.0f), Transiente %.0f (%+.0f, %s)%s "
-        "-> Kopfraum %.0f MiB (near-OOM %.0f) -> %s | KARTEN-DECKE f %s (<= %d Zeilen) "
-        "-- Messaufloesung: der bindende Punkt kann bis %.0f MiB unter dem wahren "
-        "liegen (Hochwasser-Schritt), gedruckt, nicht abgezogen"
+        "%s stage%d (%s) prompt=%d: Referenz %s Kopfraum Chunk 0 %.0f = cap %.0f - peak "
+        "%.0f - privat_frei %.0f MiB bei %d Zeilen, KV %.0f, Chunk %d; hier f %.4f -> %d "
+        "Zeilen (%+.0f MiB; je Zeile ueber der Referenz %.1f, Bild %.1f), KV %.0f (%+.0f), "
+        "Transiente %.0f (%+.0f, %s)%s, Chunk-Wachstum bis Chunk %d %.0f MiB (%.1f je "
+        "16k, gemessen bis Chunk %d%s), LMEM %s -> Kopfraum %.0f MiB (near-OOM %.0f) -> "
+        "%s | KARTEN-DECKE f %s (<= %d Zeilen) | gesaettigt (Wachstum nur bis zum gemessenen "
+        "Chunk) %.0f MiB, gedruckt, nicht der Riegel"
         % (
             CARD_MARKER,
             s,
             fit.card,
+            fit.prompt_tokens,
             reference.source,
             reference.headroom_mib[s],
             reference.cap_mib[s],
             reference.peak_mib[s],
             reference.private_free_mib[s],
-            reference.phase[s],
             reference.buffer_rows[s],
             reference.kv_mib[s],
             reference.chunk,
@@ -831,12 +940,18 @@ def describe_p_card(fit: PCardFit, reference: PCardReference) -> str:
             fit.transient_mib - fit.transient_ref_mib,
             fit.transient_source,
             (" Draft %+.0f" % fit.draft_mib) if fit.draft_mib else "",
+            fit.last_chunk_index,
+            fit.growth_mib,
+            reference.growth_mib_per_token[s] * 16384,
+            reference.growth_measured_chunks[s],
+            ", darueber HOCHRECHNUNG" if fit.growth_extrapolated else "",
+            fit.lmem_source,
             fit.headroom_mib,
             fit.near_oom_mib,
             fit.verdict,
             ceiling,
             fit.ceiling_max_rows,
-            HIGHWATER_STEP_MIB,
+            fit.headroom_saturated_mib,
         )
     )
 
@@ -848,26 +963,41 @@ def p_card_refusal_text(
     if not bad:
         return None
     return (
-        "%s (P, chunk %d): die Experten-Residenz passt ins Budget, aber nicht auf die "
-        "KARTE im Chunk-Forward -- %s. Gemessen: Kopfraum = cap - peak - privat_frei "
-        "am bindenden Punkt von %s, verschoben um Puffer, KV, die Chunk-Transiente "
-        "(Stuetzpunkte %s) und den Draft, je Zeile ueber der Referenz zum gemessenen "
-        "Kartenpreis; fnFL2x121 (FR_P[0] 0.45) und x122 (0.40) starben genau hier "
-        "(CUDA-OOM im ersten 16k-Chunk, 320/384 MiB), fnFL2x149 (0.351) im zweiten. Groesste "
-        "tragbare Fraction je Stufe bei diesem Chunk: %s."
+        "%s (P, chunk %d, prompt %d): die Experten-Residenz passt ins Budget, aber nicht "
+        "auf die KARTE am letzten Chunk -- %s. Gemessen: Kopfraum am Chunk 0 von %s, "
+        "verschoben um Puffer (je Zeile ueber der Referenz zum gemessenen Preis), KV, "
+        "Chunk-Transiente, Draft, Chunk-Wachstum der Spitze und den Run-Write-LMEM; "
+        "fnFL2x121 (FR_P[0] 0.45) und x122 (0.40) starben im ersten 16k-Chunk, "
+        "fnFL2x149 (0.351) im zweiten am LMEM und laege ohne ihn im Chunk 5 unter null. "
+        "Groesste tragbare Fraction je Stufe: %s."
         % (
             CARD_REFUSAL_CODE,
             int(chunk),
+            fits[0].prompt_tokens if fits else 0,
             "; ".join(
                 "stage%d (%s) f %.4f -> %d Zeilen, Kopfraum %.0f MiB < near-OOM %.0f"
                 % (f.stage, f.card, f.fraction, f.buffer_rows, f.headroom_mib, f.near_oom_mib)
                 for f in bad
             ),
             reference.source,
-            "chunk %d" % reference.chunk,
             ",".join(
                 "KEINE" if f.ceiling_fraction is None else "%.3f" % f.ceiling_fraction
                 for f in fits
             ),
         )
     )
+
+
+#: H47: der Run-Write-LMEM je P-Stufe OHNE Fix, MiB -- der gemessene
+#: Hochstand (x149/x151 PP0 cap -1457/-1456; x146 PP1 -150, PP2 -48). Gesetz
+#: stack = run/32 - 64 B je residentem Thread (SM x 1536), einmal je Karte.
+P_LMEM_RUN_WRITE_MIB = (1457.0, 150.0, 48.0)
+
+
+def arena_write_lmem_fixed() -> bool:
+    """Traegt DIESER Baum den H47-Fix (``arena_write.RUN_ELEMENT_BYTES``)?"""
+    try:
+        from sglang.srt.weg2 import arena_write as _aw
+    except Exception:  # noqa: BLE001 -- ohne Modul kein Run-Write, also kein LMEM
+        return True
+    return hasattr(_aw, "RUN_ELEMENT_BYTES")

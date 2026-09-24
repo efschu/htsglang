@@ -11,8 +11,32 @@
 [2026-09-24 01:35:40 PP2] max_total_num_tokens=262144, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=1, context_len=262144, available_gpu_mem=7.28 GB
 [2026-09-24 01:35:40 PP0] max_total_num_tokens=262144, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=1, context_len=262144, available_gpu_mem=10.63 GB
 [2026-09-24 01:39:31 PP0] [vram-peak] extend (8192 rows): allocator peak since pools 19.50 GiB, allocated now 17.68, reserved 24.49, card free 3.52 of 31.34 GiB -> transient headroom used = peak - allocated 1.82 GiB | cache = reserved - allocated 6.82 GiB, of which fragmentation (inactive split) 0.73 GiB, alloc retries 0
+[2026-09-24 01:39:31 PP0] WEG2-ARENA-WRITE n=1 pages=64 bytes=29360128 mode=run runs=2x229376B quota=16
+[2026-09-24 01:39:31 PP0] WEG2-ARENA-WRITE n=2 pages=64 bytes=29360128 mode=run runs=2x229376B quota=16
 [2026-09-24 01:39:33 PP1] [vram-peak] extend (8192 rows): allocator peak since pools 11.27 GiB, allocated now 9.64, reserved 13.72, card free 4.36 of 19.58 GiB -> transient headroom used = peak - allocated 1.62 GiB | cache = reserved - allocated 4.08 GiB, of which fragmentation (inactive split) 0.37 GiB, alloc retries 0
+[2026-09-24 01:39:34 PP1] WEG2-ARENA-WRITE n=1 pages=64 bytes=12582912 mode=run runs=2x98304B quota=16
+[2026-09-24 01:39:34 PP1] WEG2-ARENA-WRITE n=2 pages=64 bytes=12582912 mode=run runs=2x98304B quota=16
+[2026-09-24 01:39:34 PP0] WEG2-ARENA-WRITE n=3 pages=64 bytes=29360128 mode=run runs=2x229376B quota=16
+[2026-09-24 01:39:34 PP0] WEG2-ARENA-WRITE n=4 pages=64 bytes=29360128 mode=run runs=2x229376B quota=16
 [2026-09-24 01:39:36 PP2] [vram-peak] extend (8192 rows): allocator peak since pools 11.19 GiB, allocated now 9.59, reserved 15.19, card free 2.90 of 19.58 GiB -> transient headroom used = peak - allocated 1.59 GiB | cache = reserved - allocated 5.59 GiB, of which fragmentation (inactive split) 1.49 GiB, alloc retries 0
 [2026-09-24 01:39:37 PP2] [vram-peak] extend (8192 rows): allocator peak since pools 10.81 GiB, allocated now 9.60, reserved 15.19, card free 2.90 of 19.58 GiB -> transient headroom used = peak - allocated 1.21 GiB | cache = reserved - allocated 5.59 GiB, of which fragmentation (inactive split) 1.49 GiB, alloc retries 0
+[2026-09-24 01:39:37 PP2] WEG2-ARENA-WRITE n=1 pages=64 bytes=8388608 mode=run runs=2x65536B quota=16
+[2026-09-24 01:39:37 PP2] WEG2-ARENA-WRITE n=2 pages=64 bytes=8388608 mode=run runs=2x65536B quota=16
+[2026-09-24 01:39:37 PP1] WEG2-ARENA-WRITE n=3 pages=64 bytes=12582912 mode=run runs=2x98304B quota=16
 [2026-09-24 01:39:38 PP0] [vram-peak] high-water (8192 rows): allocator peak since pools 19.81 GiB, allocated now 18.02, reserved 24.73, card free 1.86 of 31.34 GiB -> transient headroom used = peak - allocated 1.79 GiB | cache = reserved - allocated 6.71 GiB, of which fragmentation (inactive split) 0.73 GiB, alloc retries 0
+[2026-09-24 01:39:38 PP0] WEG2-ARENA-WRITE n=5 pages=64 bytes=29360128 mode=run runs=2x229376B quota=16
+[2026-09-24 01:39:38 PP0] WEG2-ARENA-WRITE n=6 pages=64 bytes=29360128 mode=run runs=2x229376B quota=16
+[2026-09-24 01:39:39 PP2] WEG2-ARENA-WRITE n=3 pages=64 bytes=8388608 mode=run runs=2x65536B quota=16
+[2026-09-24 01:39:39 PP2] WEG2-ARENA-WRITE n=4 pages=64 bytes=8388608 mode=run runs=2x65536B quota=16
 [2026-09-24 01:39:41 PP1] [vram-peak] high-water (8192 rows): allocator peak since pools 11.56 GiB, allocated now 9.97, reserved 14.15, card free 3.79 of 19.58 GiB -> transient headroom used = peak - allocated 1.59 GiB | cache = reserved - allocated 4.18 GiB, of which fragmentation (inactive split) 0.37 GiB, alloc retries 0
+[2026-09-24 01:39:41 PP1] WEG2-ARENA-WRITE n=4 pages=64 bytes=12582912 mode=run runs=2x98304B quota=16
+[2026-09-24 01:39:41 PP0] WEG2-ARENA-WRITE n=7 pages=64 bytes=29360128 mode=run runs=2x229376B quota=16
+[2026-09-24 01:39:41 PP0] WEG2-ARENA-WRITE n=8 pages=64 bytes=29360128 mode=run runs=2x229376B quota=16
+[2026-09-24 01:39:41 PP1] WEG2-ARENA-WRITE n=5 pages=64 bytes=12582912 mode=run runs=2x98304B quota=16
+[2026-09-24 01:39:41 PP1] WEG2-ARENA-WRITE n=6 pages=64 bytes=12582912 mode=run runs=2x98304B quota=16
+[2026-09-24 01:39:44 PP2] WEG2-ARENA-WRITE n=5 pages=64 bytes=8388608 mode=run runs=2x65536B quota=16
+[2026-09-24 01:39:44 PP2] WEG2-ARENA-WRITE n=6 pages=64 bytes=8388608 mode=run runs=2x65536B quota=16
+[2026-09-24 01:39:45 PP1] WEG2-ARENA-WRITE n=7 pages=64 bytes=12582912 mode=run runs=2x98304B quota=16
+[2026-09-24 01:39:45 PP1] WEG2-ARENA-WRITE n=8 pages=64 bytes=12582912 mode=run runs=2x98304B quota=16
+[2026-09-24 01:39:48 PP2] WEG2-ARENA-WRITE n=7 pages=64 bytes=8388608 mode=run runs=2x65536B quota=16
+[2026-09-24 01:39:48 PP2] WEG2-ARENA-WRITE n=8 pages=64 bytes=8388608 mode=run runs=2x65536B quota=16

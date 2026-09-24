@@ -11,12 +11,18 @@ between, W131 outside) and the draft.
 
 The fixtures under fixtures/p_card_h41/ are the P logs' own lines (verbatim,
 filtered: chunk, [vram-peak], WEG2-GRAPH-POOL, KV pool sizing, the first MoE
-buffer line per stage, the draft-group line, the OOM text; for x145/x146/x149
-also the ``#969 EXTENT`` lines and ``Scheduler hit an exception``).
+buffer line per stage, the draft-group line, the OOM text; for x145/x146/
+x149/x150 also ``#969 EXTENT``, ``Scheduler hit an exception``,
+``WEG2-ARENA-WRITE`` and ``WEG2-SLEEP-LMEM``).
 
-H41b: fnFL2x149 (FR_P[0] 0.351, the v1 edge) passed v1 and died in PP0's
-SECOND chunk. A buffer row above the reference costs the card ~2 row images
-(142.2 MiB on PP0, lower bound from the death); the edge at 16384 is 0.304.
+H41c: fnFL2x149 (FR_P[0] 0.351) died in PP0's SECOND chunk of the
+arena run-write's local memory (H47: cap -1457 MiB after 'WEG2-ARENA-WRITE
+... mode=run'), not of a row price: at chunk 0 it sat on the row image (1300
+measured). The card is now priced at the LAST chunk of the prompt: the
+reference's measured peak growth (320.7 MiB per 16k chunk on PP0) carried to
+chunk 5 of the 97k prompt (and, as a separate extrapolated finding, chunk 15
+of 262144), plus the run-write LMEM when the tree lacks the H47 fix. x149 is
+refused by the chunk term; the edge at 97k is 0.332/0.605/0.757.
 
 Hermetic: no GPU, no torch device.
 """
@@ -110,57 +116,90 @@ class TestMeasuredSupport:
 class TestCardReference:
     def test_the_shipped_card_reference_is_the_logs_own_measurement(self):
         got = pc.p_card_reference_from_logs(
-            [_boot("fnFL2x145"), _boot("fnFL2x146")], stage_layers=CUT,
+            [_boot("fnFL2x146"), _boot("fnFL2x150")], stage_layers=CUT,
             row_mib=ROW_MIB, support=pc.P_TRANSIENT_SUPPORT_FNFL2, model=MODEL,
-            death_boots=[_boot("fnFL2x149")],
+            over_boots=[_boot("fnFL2x149")],
         )
         assert got == pc.P_CARD_REFERENCE_FNFL2
 
-    def test_x149_death_is_read_off_its_own_oom_line(self):
+    def test_chunk0_headroom_and_growth_of_the_reference(self):
+        ref = pc.P_CARD_REFERENCE_FNFL2
+        # x150 PP0 chunk 0: cap 28943 - peak 21965 - privat_frei 2394
+        assert ref.headroom_mib[0] == 4584.0
+        # peak 21965 -> 22286 -> 22607 -> 22927: 320.7 MiB per 16k chunk
+        assert ref.growth_mib_per_token[0] * 16384 == pytest.approx(320.7, abs=0.1)
+        assert ref.growth_measured_chunks == (3, 3, 1)
+        assert ref.longest_prompt_tokens == 97841
+        # the reference's own run-write LMEM: PP0 fell back (0), PP1 -150, PP2 -48
+        assert ref.lmem_mib == (0.0, 150.0, 48.0)
+
+    def test_row_price_from_x149_chunk0_is_about_the_image(self):
+        ref = pc.P_CARD_REFERENCE_FNFL2
+        # (4584 - 1300) / 46 = 71.4; image 29 x 2.417 = 70.1
+        assert ref.row_card_mib[0] == pytest.approx(71.4, abs=0.05)
+        assert ref.row_card_mib[0] / (29 * ROW_MIB) < 1.03
+        # PP1 measured 26.4 < image -> the image stands
+        assert ref.row_card_mib[1] == pytest.approx(11 * ROW_MIB, abs=0.05)
+
+    def test_x149_death_is_the_lmem_case_not_a_row_price(self):
         d = pc.death_from_log(*_boot("fnFL2x149"))
-        # 12:18:30 PP0, second chunk (#969 EXTENT 16384..32768), 212 rows;
-        # cap = 292.81 free + 26.28 GiB allocated + 290.04 unallocated,
-        # need = allocated + 384, private_free 2467 (WEG2-GRAPH-POOL extend)
-        assert (d.stage, d.chunk_index, d.buffer_rows) == (0, 1, 212)
-        assert d.headroom_bound_mib == pytest.approx(-2268.1, abs=0.2)
-        assert d.private_free_mib == 2467.0
+        # PP0, second chunk, after 'WEG2-ARENA-WRITE n=1 ... mode=run'
+        assert (d.stage, d.chunk_index, d.buffer_rows, d.cause) == (0, 1, 212, "lmem")
+        # cap 28951 -> 27494 (-1457), used = 26.28 GiB - privat_frei 2467
+        assert d.cap_before_mib - d.cap_mib == pytest.approx(1457.4, abs=0.5)
+        assert d.used_mib == pytest.approx(24443.7, abs=0.5)
+        # without the LMEM the rank had 1656 MiB at the death point
+        assert d.headroom_without_lmem_mib == pytest.approx(1656.3, abs=0.5)
 
     def test_x149_first_chunk_sat_on_the_row_image(self):
-        # chunk 0: 4594 (x146) - 46 rows x 29 x 2.417 - 73 private_free = 1297,
-        # measured 1300 -- the extra cost appears from chunk 1 on.
         h149 = pc.headroom_by_chunk_index(_boot("fnFL2x149")[1])[0][0]
         h146 = pc.headroom_by_chunk_index(_boot("fnFL2x146")[1])[0][0]
         assert abs(h146 - 46 * 29 * ROW_MIB - 73 - h149) < 5.0
-
-    def test_row_card_cost_is_about_two_row_images(self):
-        ref = pc.P_CARD_REFERENCE_FNFL2
-        assert ref.row_card_mib[0] == pytest.approx(142.2, abs=0.1)
-        assert 2.0 < ref.row_card_mib[0] / (29 * ROW_MIB) < 2.1
-        # stages without their own death inherit the ratio (named)
-        assert "uebertragen (Hochrechnung)" in ref.row_card_source
-
-    def test_pp0_binds_at_the_last_high_water_of_x146(self):
-        ref = pc.P_CARD_REFERENCE_FNFL2
-        # 28953 - 22927 - 2394 (WEG2-GRAPH-POOL rank=0 phase=high-water 11:31:00)
-        assert ref.headroom_mib[0] == 3632.0
-        assert ref.buffer_rows == (166, 263, 408)
-        assert ref.kv_mib == (1904.0, 816.0, 544.0)
-        assert ref.draft_on_p is False
 
     def test_near_oom_mirror_is_the_corridor_law(self):
         from sglang.srt.managers import corridor_guard
 
         assert pc.NEAR_OOM_MIB == float(corridor_guard.NEAR_OOM_MIB)
 
+    def test_lmem_law_constants(self):
+        # H47: x149/x151 PP0 -1457/-1456; x146 PP1 -150, PP2 -48
+        assert pc.P_LMEM_RUN_WRITE_MIB == (1457.0, 150.0, 48.0)
+
+
+H146 = (0.26, 0.45, 0.733887)
+H149 = (0.351, 0.642, 0.733887)
+KV_H25 = (1904.0, 816.0, 544.0)
+
 
 class TestVerdicts:
-    def test_x145_form_passes(self):
-        # x145: FR_P 0.26,0.45,0.39 -> H25 0.26,0.45,0.733887, no draft on P.
-        fr, kv, draft, chunk = _form_of("fnFL2x145")
-        assert fr == (0.26, 0.45, 0.734) and draft is False and chunk == 16384
-        fits = _solve((0.26, 0.45, 0.733887), kv, draft, chunk)
+    @pytest.mark.parametrize("fixed", [True, False])
+    def test_x146_form_passes_at_97k(self, fixed):
+        fits = _solve(H146, KV_H25, False, 16384, lmem_fixed=fixed)
         assert [f.verdict for f in fits] == ["PASST"] * 3
-        assert pc.p_card_refusal_text(fits, pc.P_CARD_REFERENCE_FNFL2, chunk=chunk) is None
+        assert fits[0].last_chunk_index == 5 and fits[0].prompt_tokens == 97841
+
+    @pytest.mark.parametrize("fixed", [True, False])
+    def test_x149_form_is_refused_by_the_chunk_term(self, fixed):
+        fr, kv, draft, chunk = _form_of("fnFL2x149")
+        assert fr[:2] == (0.351, 0.642) and draft is False and chunk == 16384
+        fits = _solve(H149, kv, draft, chunk, lmem_fixed=fixed)
+        assert fits[0].refused
+        # with the H47 fix: 1300 - 5 x 320.7 = -304 (chunk 5), as H47 warned
+        if fixed:
+            assert fits[0].headroom_mib == pytest.approx(-304, abs=2)
+        text = pc.p_card_refusal_text(fits, pc.P_CARD_REFERENCE_FNFL2, chunk=chunk)
+        assert text.startswith("W132 Weg2PCardChunkOom (P, chunk 16384, prompt 97841)")
+
+    def test_mutant_without_the_chunk_term_lets_0351_through(self):
+        fits = _solve(H149, KV_H25, False, 16384, use_growth=False)
+        assert not any(f.refused for f in fits)
+        assert fits[0].headroom_mib == pytest.approx(1300, abs=2)  # x149 chunk 0
+
+    def test_even_the_saturated_reading_refuses_0351(self):
+        # growth stopping after the last measured chunk (3): 1300 - 3 x 320.7
+        fits = _solve(H149, KV_H25, False, 16384)
+        assert fits[0].headroom_saturated_mib == pytest.approx(338, abs=2)
+        assert fits[0].headroom_saturated_mib < pc.NEAR_OOM_MIB
 
     @pytest.mark.parametrize("boot,f0", [("fnFL2x121", 0.45), ("fnFL2x122", 0.40)])
     def test_the_oom_boots_are_refused_on_the_5090_stage(self, boot, f0):
@@ -168,72 +207,53 @@ class TestVerdicts:
         assert fr[0] == f0 and draft is True and chunk == 16384
         assert "OutOfMemoryError" in _boot(boot)[1]
         fits = _solve(fr, kv, draft, chunk)
-        assert fits[0].refused and not fits[1].refused and not fits[2].refused
+        assert fits[0].refused
         text = pc.p_card_refusal_text(fits, pc.P_CARD_REFERENCE_FNFL2, chunk=chunk)
-        assert text.startswith("W132 Weg2PCardChunkOom (P, chunk 16384)")
         assert "stage0 (nvml1) f %.4f" % f0 in text
 
-    def test_x149_form_is_refused(self):
-        # x149: FR_P 0.351,0.642,0.39 -> H25 0.733887, died in PP0's 2nd chunk.
-        fr, kv, draft, chunk = _form_of("fnFL2x149")
-        assert fr[:2] == (0.351, 0.642) and draft is False and chunk == 16384
-        assert "OutOfMemoryError" in _boot("fnFL2x149")[1]
-        fits = _solve((0.351, 0.642, 0.733887), kv, draft, chunk)
-        assert fits[0].refused and fits[0].buffer_rows == 212
-        assert fits[1].refused  # 361 rows at the transferred price
-        text = pc.p_card_refusal_text(fits, pc.P_CARD_REFERENCE_FNFL2, chunk=chunk)
-        assert text.startswith("W132 Weg2PCardChunkOom (P, chunk 16384)")
+    def test_edges_at_97k_with_and_without_the_lmem_fix(self):
+        fixed = _solve(H146, KV_H25, False, 16384, lmem_fixed=True)
+        assert [f.ceiling_fraction for f in fixed] == [0.332, 0.605, 0.757]
+        assert [f.ceiling_max_rows for f in fixed] == [202, 342, 420]
+        nofix = _solve(H146, KV_H25, False, 16384, lmem_fixed=False)
+        assert [f.ceiling_fraction for f in nofix] == [0.291, 0.593, 0.753]
+        edge = _solve((0.332, 0.605, 0.757), KV_H25, False, 16384)
+        assert not any(f.refused for f in edge)
+        over = _solve((0.333, 0.605, 0.757), KV_H25, False, 16384)
+        assert over[0].buffer_rows == 203 and over[0].refused
 
-    def test_mutant_with_the_row_image_lets_x149_through(self):
-        # H41 v1: a row above the reference priced at its image L x row.
-        mutant = msgspec.structs.replace(pc.P_CARD_REFERENCE_FNFL2, row_card_mib=())
-        fr, kv, draft, chunk = _form_of("fnFL2x149")
-        fits = _solve((0.351, 0.642, 0.733887), kv, draft, chunk, reference=mutant)
-        assert not any(f.refused for f in fits)
-
-    def test_the_card_ceiling_at_16384_is_the_edge(self):
-        fr, kv, draft, chunk = _form_of("fnFL2x145")
-        fits = _solve((0.26, 0.45, 0.733887), kv, draft, chunk)
-        assert [f.ceiling_max_rows for f in fits] == [188, 311, 446]
-        assert [f.ceiling_fraction for f in fits] == [0.304, 0.544, 0.808]
-        # the edge itself passes, one row above it dies
-        edge = _solve((0.304, 0.544, 0.733887), kv, draft, chunk)
-        assert edge[0].buffer_rows == 188 and not edge[0].refused
-        assert edge[1].buffer_rows == 311 and not edge[1].refused
-        over = _solve((0.306, 0.45, 0.733887), kv, draft, chunk)
-        assert over[0].buffer_rows == 189 and over[0].refused
+    def test_262k_is_a_separate_extrapolated_edge(self):
+        deep = _solve(H146, KV_H25, False, 16384, prompt_tokens=262144)
+        assert deep[0].last_chunk_index == 15 and deep[0].growth_extrapolated
+        assert [f.ceiling_fraction for f in deep] == [0.244, 0.367, 0.425]
+        assert all(f.refused for f in deep)  # today's form, extrapolated
 
     def test_a_narrower_chunk_buys_rows_by_the_measured_difference(self):
-        fr, kv, draft, _ = _form_of("fnFL2x145")
-        at16 = _solve((0.26, 0.45, 0.733887), kv, draft, 16384)[0]
-        at8 = _solve((0.26, 0.45, 0.733887), kv, draft, 8192)[0]
+        at16 = _solve(H146, KV_H25, False, 16384, use_growth=False)[0]
+        at8 = _solve(H146, KV_H25, False, 8192, use_growth=False)[0]
         assert at8.headroom_mib - at16.headroom_mib == pytest.approx(3696.6 - 1863.7)
 
-    def test_mutant_without_the_chunk_term_lets_x122_through(self, monkeypatch):
-        # The #1286 world: the activation priced as the reference boots'
-        # 1024 MiB on every chunk width. x122 (died) then passes the card.
+    def test_mutant_without_the_chunk_transient_lets_x122_through(self, monkeypatch):
         fr, kv, draft, chunk = _form_of("fnFL2x122")
-        # Isolated from the H41b row price (row image only), so the chunk term
-        # alone decides: with it x122 is refused, without it x122 passes.
         image = msgspec.structs.replace(pc.P_CARD_REFERENCE_FNFL2, row_card_mib=())
-        assert _solve(fr, kv, draft, chunk, reference=image)[0].refused
+        kw = dict(reference=image, use_growth=False)
+        assert _solve(fr, kv, draft, chunk, **kw)[0].refused
         monkeypatch.setattr(pc, "transient_mib", lambda sup, s, c: (1024.0, "mutant"))
-        fits = _solve(fr, kv, draft, chunk, reference=image)
-        assert not any(f.refused for f in fits)
+        assert not _solve(fr, kv, draft, chunk, **kw)[0].refused
 
     def test_another_cut_is_named_not_priced(self):
         with pytest.raises(ValueError, match="Schnitt"):
             pc.solve_p_card(
                 reference=pc.P_CARD_REFERENCE_FNFL2, support=pc.P_TRANSIENT_SUPPORT_FNFL2,
                 fractions=(0.26, 0.45, 0.73), lru_rows=LRU, stage_layers=(33, 7, 8),
-                chunk=16384, kv_mib=(1904, 816, 544), num_experts=512, row_mib=ROW_MIB,
+                chunk=16384, kv_mib=KV_H25, num_experts=512, row_mib=ROW_MIB,
             )
 
 
 class TestLauncherSeam:
-    def _ns(self, draft="off"):
+    def _ns(self, draft="off", prompt=0):
         return types.SimpleNamespace(
-            p_card_reference_logs="", draft_kv_on_p=draft,
+            p_card_reference_logs="", draft_kv_on_p=draft, p_card_prompt_tokens=prompt,
             extra_p="--speculative-draft-model-path /nonexistent/draft", extra_d="",
         )
 
@@ -251,11 +271,19 @@ class TestLauncherSeam:
         )
         return lines
 
-    def test_x145_form_prints_activation_and_card_and_passes(self):
-        lines = self._run(self._ns(), (0.26, 0.45, 0.733887), (1904.0, 816.0, 544.0))
+    def test_x146_form_passes_and_prints_262k_as_befund(self):
+        lines = self._run(self._ns(), H146, KV_H25)
         assert sum(l.startswith("PP-CUT ACTIVATION chunk=16384 stage") for l in lines) == 3
         card = [l for l in lines if l.startswith("PP-CUT P-KARTE stage")]
-        assert len(card) == 3 and all("-> PASST |" in l for l in card)
+        assert len(card) == 3 and all("prompt=97841" in l and "-> PASST |" in l for l in card)
+        deep = [l for l in lines if l.startswith("PP-CUT P-KARTE BEFUND")]
+        assert len(deep) == 3 and all("prompt=262144" in l and "HOCHRECHNUNG" in l for l in deep)
+
+    def test_x149_form_is_refused_w132(self):
+        from sglang.srt.weg2 import launcher
+
+        with pytest.raises(launcher.Weg2LaunchRefused, match="W132 Weg2PCardChunkOom"):
+            self._run(self._ns(), H149, KV_H25)
 
     def test_x121_form_is_refused_w132(self, monkeypatch):
         from sglang.srt.weg2 import draft_post, launcher
@@ -264,17 +292,11 @@ class TestLauncherSeam:
         with pytest.raises(launcher.Weg2LaunchRefused, match="W132 Weg2PCardChunkOom"):
             self._run(self._ns("on"), (0.45, 0.45, 0.39), (2176.0, 1088.0, 816.0))
 
-    def test_x149_form_is_refused_w132(self):
-        from sglang.srt.weg2 import launcher
-
-        with pytest.raises(launcher.Weg2LaunchRefused, match="W132 Weg2PCardChunkOom"):
-            self._run(self._ns(), (0.351, 0.642, 0.733887), (1904.0, 816.0, 544.0))
-
     def test_unmeasured_chunk_is_refused_w131(self):
         from sglang.srt.weg2 import launcher
 
         with pytest.raises(launcher.Weg2LaunchRefused, match="W131"):
-            self._run(self._ns(), (0.26, 0.45, 0.733887), (1904.0, 816.0, 544.0), chunk=32768)
+            self._run(self._ns(), H146, KV_H25, chunk=32768)
 
     def test_other_model_is_named_not_priced(self):
         from sglang.srt.weg2 import launcher
