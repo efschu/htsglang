@@ -249,6 +249,11 @@ class Envs:
     # A/B: keep the DFLASH draft sampler (greedy head or DFlash2 selector) eager,
     # not folded into the draft cuda graph.
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # DFLASH window pool (SGLANG_DFLASH_WINDOW_POOL=1): run the draft-slot
+    # mapper and the per-round window rebuild without host reads, so the host
+    # is not held behind the verify (dflash_solo_pool sync-free mode). Off =
+    # the legacy mapper, byte-identical.
+    SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE = EnvBool(False)
 
     # Downgrade the draft-model unloaded-parameter check (#290/#318) from a
     # hard error to a log line. An unloaded drafter proposes noise, so this is
