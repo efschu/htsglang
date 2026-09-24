@@ -11439,11 +11439,11 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
                 f"ist nicht lesbar ({path!r}).")
             return
         draft_mib = float(weights) + float(transient)
-    # H41c: der Riegel rechnet am LETZTEN Chunk des Prompts (Default: der
-    # laengste Prompt der Referenz, 97841); 262144 wird daneben als Befund
-    # gedruckt (Hochrechnung ueber die gemessenen Chunks hinaus), nicht als
-    # Riegel. LMEM des Run-Writes: 0 mit dem H47-Fix in DIESEM Baum.
-    prompt = int(getattr(ns, "p_card_prompt_tokens", 0) or 0)
+    # H41c/H41d: der Riegel rechnet am LETZTEN Chunk des Prompts, Default der
+    # volle Kontext (262144, NF-Pflicht). Das Chunk-Wachstum SAETTIGT
+    # (fnFL2x160: nach Chunk 3, gemessen ueber 16 Chunks), also ist die
+    # 262k-Kante die 97k-Kante. LMEM des Run-Writes: 0 mit dem H47-Fix.
+    prompt = int(getattr(ns, "p_card_prompt_tokens", 0) or 0) or CONTEXT_LENGTH_TOKENS
     lmem_fixed = _p_card.arena_write_lmem_fixed()
 
     def _solve(tokens):
@@ -11460,7 +11460,6 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
 
     try:
         fits = _solve(prompt)
-        deep = _solve(CONTEXT_LENGTH_TOKENS) if fits[0].prompt_tokens != CONTEXT_LENGTH_TOKENS else ()
     except _p_card.PChunkUnmeasured as exc:
         raise Weg2LaunchRefused(str(exc)) from None
     except ValueError as exc:
@@ -11468,9 +11467,6 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
         return
     for fit in fits:
         log(_p_card.describe_p_card(fit, reference))
-    for fit in deep:
-        log(f"{_p_card.CARD_MARKER} BEFUND (kein Riegel, Hochrechnung): "
-            + _p_card.describe_p_card(fit, reference))
     refusal = _p_card.p_card_refusal_text(fits, reference, chunk=int(chunk_tokens))
     if refusal is not None:
         log(f"{_p_card.CARD_MARKER} {refusal}")
@@ -12658,9 +12654,11 @@ def build_parser() -> argparse.ArgumentParser:
              "am bindenden Punkt, normiert auf Puffer, KV-Zelle x Token und die "
              "Chunk-Transiente des Logs; je Stufe das Minimum ueber die Boots. "
              "Unter corridor_guard.NEAR_OOM_MIB verweigert W132. Leer = die "
-             "eingebaute Referenz p_card_chunk.P_CARD_REFERENCE_FNFL2 (fnFL2x145 + "
-             "fnFL2x150, Schnitt 29,11,8, Chunk 16384, Zeilenpreis aus fnFL2x149 "
-             "Chunk 0); ein anderer Schnitt laesst die Bilanz mit Namen entfallen.")
+             "eingebaute Referenz p_card_chunk.P_CARD_REFERENCE_FNFL2 (fnFL2x160, "
+             "Baum 76ce5580d4, Schnitt 29,11,8, Chunk 16384, 97k- und 259k-Prompt); "
+             "ein anderer Schnitt laesst die Bilanz mit Namen entfallen. Die "
+             "Referenz ist ein BAUMSTAND (privat_frei, LMEM) und wird mit ihm "
+             "aufgefrischt.")
     ap.add_argument(
         "--p-card-over-logs", default="",
         help="H41c: Komma-Liste von P-Boot-Logs DERSELBEN Form mit mehr "
@@ -12670,10 +12668,11 @@ def build_parser() -> argparse.ArgumentParser:
              "--p-card-reference-logs; leer = eingebaut (fnFL2x149).")
     ap.add_argument(
         "--p-card-prompt-tokens", type=int, default=0,
-        help="H41c: die Prompt-Laenge, an deren LETZTEM Chunk die P-KARTE "
-             "verweigert (Chunk-Wachstum der Spitze je Token, gemessen an der "
-             "Referenz, bis dorthin fortgeschrieben). 0 = der laengste Prompt der "
-             "Referenz (97841). 262144 wird immer als Befund daneben gedruckt.")
+        help="H41c/H41d: die Prompt-Laenge, an deren LETZTEM Chunk die P-KARTE "
+             "verweigert. Das Chunk-Wachstum der Spitze saettigt am letzten "
+             "wachsenden Chunk der Referenz (fnFL2x160: Chunk 3, gemessen ueber "
+             "16 Chunks); ein Prompt laenger als der laengste der Referenz heisst "
+             "HOCHRECHNUNG. 0 = der volle Kontext (262144).")
     ap.add_argument(
         "--wake-credit-reference-logs", default="",
         help="H14: P.log,D.log,front.log EINES Boots, dessen erster Wake (D->P) "

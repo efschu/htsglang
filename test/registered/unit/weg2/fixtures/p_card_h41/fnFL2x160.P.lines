@@ -1,0 +1,166 @@
+# boot_weg2_fnFL2x160_76ce5580d4_0924_150138.P.log
+[2026-09-24 15:01:52] server_args=ServerArgs(model_path='/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist', tokenizer_path='/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist', tokenizer_mode='auto', tokenizer_backend='huggingface', tokenizer_worker_num=1, detokenizer_worker_num=1, skip_tokenizer_init=False, load_format='auto', model_loader_extra_config='{}', trust_remote_code=True, context_length=262144, is_embedding=False, enable_multimodal=False, revision=None, model_impl='auto', model_config_parser='auto', json_model_override_args='{"language_model_only":true}', dtype='auto', quantization=None, gguf_mmq_decode_threshold=False, quantization_param_path=None, kv_cache_dtype='fp8_e4m3', enable_fp32_lm_head=False, modelopt_quant=None, modelopt_checkpoint_restore_path=None, modelopt_checkpoint_save_path=None, modelopt_export_path=None, quantize_and_serve=False, rl_quant_profile=None, enable_tf32_matmul=False, mem_fraction_static=-0.244, max_running_requests=1, max_running_requests_ceiling=None, admission_floor=1, admission_throttle_high=0.9, admission_release_low=0.7, admission_release_hysteresis=8, max_queued_requests=None, tp_prefill_max_tokens=0, max_kv_per_request=262144, max_total_tokens=262144, chunked_prefill_size=16384, enable_dynamic_chunking=False, max_prefill_tokens=16384, prefill_max_requests=None, schedule_policy='fcfs', enable_priority_scheduling=False, disable_priority_preemption=False, default_priority_value=None, abort_on_priority_when_disabled=False, schedule_low_priority_values_first=False, priority_scheduling_preemption_threshold=10, enable_fast_lane=False, fast_lane_priority=1000000, fast_lane_reserved_heavy_slots=1, fast_lane_heavy_aging_ms=10000.0, retraction_policy='length', schedule_conservativeness=1.0, page_size=64, swa_full_tokens_ratio=0.8, disable_hybrid_swa_memory=False, swa_pool_sizing='ratio', radix_eviction_policy='lru', prefill_only_disable_kv_cache
+[2026-09-24 15:02:41 PP2] MoE expert-offload active on layer 40: 376/512 experts resident + 32 scratch (buffer=408, fraction=0.734)
+[2026-09-24 15:02:51 PP1] MoE expert-offload active on layer 29: 310/512 experts resident + 32 scratch (buffer=342, fraction=0.605)
+[2026-09-24 15:03:47 PP0] MoE expert-offload active on layer 0: 170/512 experts resident + 32 scratch (buffer=202, fraction=0.332)
+[2026-09-24 15:03:50 PP2] KV pool sizing: available_bytes=4442357760 (4.137 GiB), cell_size=2176, page_size=64 -> max_total_num_tokens=2041472
+[2026-09-24 15:03:50 PP1] KV pool sizing: available_bytes=4160487424 (3.875 GiB), cell_size=3264, page_size=64 -> max_total_num_tokens=1274624
+[2026-09-24 15:03:50 PP0] KV pool sizing: available_bytes=6517948416 (6.070 GiB), cell_size=7616, page_size=64 -> max_total_num_tokens=855808
+[2026-09-24 15:03:50 PP2] max_total_num_tokens=262144, chunked_prefill_size=16384, max_prefill_tokens=16384, max_running_requests=1, context_len=262144, available_gpu_mem=8.73 GB
+[2026-09-24 15:03:50 PP1] max_total_num_tokens=262144, chunked_prefill_size=16384, max_prefill_tokens=16384, max_running_requests=1, context_len=262144, available_gpu_mem=7.57 GB
+[2026-09-24 15:03:50 PP0] max_total_num_tokens=262144, chunked_prefill_size=16384, max_prefill_tokens=16384, max_running_requests=1, context_len=262144, available_gpu_mem=10.29 GB
+[2026-09-24 15:03:56 PP0] WEG2-SLEEP-LMEM lmem 311->0 MiB released (stack 1248->0 B x 261120 threads, derived; NVML -314 MiB measured; 2.0 ms)
+[2026-09-24 15:03:56 PP2] WEG2-SLEEP-LMEM lmem 150->0 MiB released (stack 1504->0 B x 104448 threads, derived; NVML -152 MiB measured; 4.0 ms)
+[2026-09-24 15:03:56 PP1] WEG2-SLEEP-LMEM lmem 150->0 MiB released (stack 1504->0 B x 104448 threads, derived; NVML -152 MiB measured; 1.8 ms)
+[2026-09-24 15:07:16 PP0] #969 EXTENT n=1 fwd=1 reqs=[('weg2-0-4', 0, 16384, 0, 16384)]
+[2026-09-24 15:07:16 PP1] #969 EXTENT n=1 fwd=1 reqs=[('weg2-0-4', 0, 16384, 0, 16384)]
+[2026-09-24 15:07:16 PP2] #969 EXTENT n=1 fwd=1 reqs=[('weg2-0-4', 0, 16384, 0, 16384)]
+[2026-09-24 15:07:21 PP0] WEG2-GRAPH-POOL rank=0 phase=post-capture captured_mib=20348 private_free_mib=225 reserved_after_mib=28098 allocated_mib=20827 peak_mib=24490 allocator_cache_mib=7271 general_cache_mib=7046 card_free_mib=869 card_total_mib=32088 cap_mib=28967 headroom_mib=4252 pools=0.1:2702/2657,0.5:1770/1699,0.3:1742/1738,0.8:1716/1705 -- captured = Segmente privater Pools (Graph/Tag), private_free = davon frei und fuer empty_cache unerreichbar; headroom = cap - peak - private_free ist, was der schwerste Forward auf dieser Karte uebrig laesst (Ledger-Eingang des D-KARTE-Riegels, H33)
+[2026-09-24 15:07:21 PP0] WEG2-GRAPH-POOL rank=0 phase=extend captured_mib=20348 private_free_mib=225 reserved_after_mib=28098 allocated_mib=20827 peak_mib=24490 allocator_cache_mib=7271 general_cache_mib=7046 card_free_mib=869 card_total_mib=32088 cap_mib=28967 headroom_mib=4252 pools=0.1:2702/2657,0.5:1770/1699,0.3:1742/1738,0.8:1716/1705 -- captured = Segmente privater Pools (Graph/Tag), private_free = davon frei und fuer empty_cache unerreichbar; headroom = cap - peak - private_free ist, was der schwerste Forward auf dieser Karte uebrig laesst (Ledger-Eingang des D-KARTE-Riegels, H33)
+[2026-09-24 15:07:21 PP0] [vram-peak] extend (16384 rows): allocator peak since pools 23.92 GiB, allocated now 20.34, reserved 27.44, card free 0.85 of 31.34 GiB -> transient headroom used = peak - allocated 3.58 GiB | cache = reserved - allocated 7.10 GiB, of which fragmentation (inactive split) 0.24 GiB, alloc retries 0
+[2026-09-24 15:07:21 PP0] WEG2-ARENA-WRITE n=1 pages=64 bytes=29360128 mode=run runs=2x229376B elem=1024B items=14336 quota=16
+[2026-09-24 15:07:21 PP0] WEG2-ARENA-WRITE n=2 pages=64 bytes=29360128 mode=run runs=2x229376B elem=1024B items=14336 quota=16
+[2026-09-24 15:07:21 PP0] WEG2-ARENA-WRITE n=3 pages=64 bytes=29360128 mode=run runs=2x229376B elem=1024B items=14336 quota=16
+[2026-09-24 15:07:21 PP0] WEG2-ARENA-WRITE n=4 pages=64 bytes=29360128 mode=run runs=2x229376B elem=1024B items=14336 quota=16
+[2026-09-24 15:07:21 PP0] #969 EXTENT n=2 fwd=1 reqs=[('weg2-0-4', 16384, 32768, 16384, 16384)]
+[2026-09-24 15:07:24 PP1] WEG2-GRAPH-POOL rank=1 phase=post-capture captured_mib=11592 private_free_mib=173 reserved_after_mib=17130 allocated_mib=12330 peak_mib=15594 allocator_cache_mib=4800 general_cache_mib=4627 card_free_mib=1496 card_total_mib=20055 cap_mib=18626 headroom_mib=2859 pools=0.5:2798/2715,0.7:2740/2719,0.6:2734/2713,0.1:1102/1082 -- captured = Segmente privater Pools (Graph/Tag), private_free = davon frei und fuer empty_cache unerreichbar; headroom = cap - peak - private_free ist, was der schwerste Forward auf dieser Karte uebrig laesst (Ledger-Eingang des D-KARTE-Riegels, H33)
+[2026-09-24 15:07:24 PP1] WEG2-GRAPH-POOL rank=1 phase=extend captured_mib=11592 private_free_mib=173 reserved_after_mib=17130 allocated_mib=12330 peak_mib=15594 allocator_cache_mib=4800 general_cache_mib=4627 card_free_mib=1496 card_total_mib=20055 cap_mib=18626 headroom_mib=2859 pools=0.5:2798/2715,0.7:2740/2719,0.6:2734/2713,0.1:1102/1082 -- captured = Segmente privater Pools (Graph/Tag), private_free = davon frei und fuer empty_cache unerreichbar; headroom = cap - peak - private_free ist, was der schwerste Forward auf dieser Karte uebrig laesst (Ledger-Eingang des D-KARTE-Riegels, H33)
+[2026-09-24 15:07:24 PP1] [vram-peak] extend (16384 rows): allocator peak since pools 15.23 GiB, allocated now 12.04, reserved 16.73, card free 1.46 of 19.58 GiB -> transient headroom used = peak - allocated 3.19 GiB | cache = reserved - allocated 4.69 GiB, of which fragmentation (inactive split) 0.13 GiB, alloc retries 0
+[2026-09-24 15:07:24 PP1] WEG2-ARENA-WRITE n=1 pages=64 bytes=12582912 mode=run runs=2x98304B elem=1024B items=6144 quota=16
+[2026-09-24 15:07:24 PP1] WEG2-ARENA-WRITE n=2 pages=64 bytes=12582912 mode=run runs=2x98304B elem=1024B items=6144 quota=16
+[2026-09-24 15:07:24 PP1] WEG2-ARENA-WRITE n=3 pages=64 bytes=12582912 mode=run runs=2x98304B elem=1024B items=6144 quota=16
+[2026-09-24 15:07:24 PP1] WEG2-ARENA-WRITE n=4 pages=64 bytes=12582912 mode=run runs=2x98304B elem=1024B items=6144 quota=16
+[2026-09-24 15:07:24 PP1] #969 EXTENT n=2 fwd=1 reqs=[('weg2-0-4', 16384, 32768, 16384, 16384)]
+[2026-09-24 15:07:24 PP0] WEG2-GRAPH-POOL rank=0 phase=high-water captured_mib=20348 private_free_mib=225 reserved_after_mib=28178 allocated_mib=21176 peak_mib=24839 allocator_cache_mib=7002 general_cache_mib=6777 card_free_mib=789 card_total_mib=32088 cap_mib=28967 headroom_mib=3903 pools=0.1:2702/2657,0.5:1770/1699,0.3:1742/1738,0.8:1716/1705 -- captured = Segmente privater Pools (Graph/Tag), private_free = davon frei und fuer empty_cache unerreichbar; headroom = cap - peak - private_free ist, was der schwerste Forward auf dieser Karte uebrig laesst (Ledger-Eingang des D-KARTE-Riegels, H33)
+[2026-09-24 15:07:24 PP0] [vram-peak] high-water (16384 rows): allocator peak since pools 24.26 GiB, allocated now 20.68, reserved 27.52, card free 0.77 of 31.34 GiB -> transient headroom used = peak - allocated 3.58 GiB | cache = reserved - allocated 6.84 GiB, of which fragmentation (inactive split) 0.24 GiB, alloc retries 0
+[2026-09-24 15:07:24 PP0] WEG2-ARENA-WRITE n=5 pages=64 bytes=29360128 mode=run runs=2x229376B elem=1024B items=14336 quota=16
+[2026-09-24 15:07:24 PP0] WEG2-ARENA-WRITE n=6 pages=64 bytes=29360128 mode=run runs=2x229376B elem=1024B items=14336 quota=16
+[2026-09-24 15:07:24 PP0] WEG2-ARENA-WRITE n=7 pages=64 bytes=29360128 mode=run runs=2x229376B elem=1024B items=14336 quota=16
+[2026-09-24 15:07:24 PP0] WEG2-ARENA-WRITE n=8 pages=64 bytes=29360128 mode=run runs=2x229376B elem=1024B items=14336 quota=16
+[2026-09-24 15:07:24 PP0] #969 EXTENT n=3 fwd=1 reqs=[('weg2-0-4', 32768, 49152, 32768, 16384)]
+[2026-09-24 15:07:27 PP2] WEG2-GRAPH-POOL rank=2 phase=post-capture captured_mib=10418 private_free_mib=142 reserved_after_mib=15724 allocated_mib=11172 peak_mib=14435 allocator_cache_mib=4552 general_cache_mib=4411 card_free_mib=2910 card_total_mib=20055 cap_mib=18634 headroom_mib=4057 pools=0.5:3262/3192,0.6:3202/3191,0.3:2152/2132,0.1:768/749 -- captured = Segmente privater Pools (Graph/Tag), private_free = davon frei und fuer empty_cache unerreichbar; headroom = cap - peak - private_free ist, was der schwerste Forward auf dieser Karte uebrig laesst (Ledger-Eingang des D-KARTE-Riegels, H33)
+[2026-09-24 15:07:27 PP2] WEG2-GRAPH-POOL rank=2 phase=extend captured_mib=10418 private_free_mib=142 reserved_after_mib=15724 allocated_mib=11172 peak_mib=14435 allocator_cache_mib=4552 general_cache_mib=4411 card_free_mib=2910 card_total_mib=20055 cap_mib=18634 headroom_mib=4057 pools=0.5:3262/3192,0.6:3202/3191,0.3:2152/2132,0.1:768/749 -- captured = Segmente privater Pools (Graph/Tag), private_free = davon frei und fuer empty_cache unerreichbar; headroom = cap - peak - private_free ist, was der schwerste Forward auf dieser Karte uebrig laesst (Ledger-Eingang des D-KARTE-Riegels, H33)
+[2026-09-24 15:07:27 PP2] [vram-peak] extend (16384 rows): allocator peak since pools 14.10 GiB, allocated now 10.91, reserved 15.36, card free 2.84 of 19.58 GiB -> transient headroom used = peak - allocated 3.19 GiB | cache = reserved - allocated 4.45 GiB, of which fragmentation (inactive split) 0.10 GiB, alloc retries 0
+[2026-09-24 15:07:27 PP2] WEG2-ARENA-WRITE n=1 pages=64 bytes=8388608 mode=run runs=2x65536B elem=1024B items=4096 quota=16
+[2026-09-24 15:07:27 PP2] WEG2-ARENA-WRITE n=2 pages=64 bytes=8388608 mode=run runs=2x65536B elem=1024B items=4096 quota=16
+[2026-09-24 15:07:27 PP2] WEG2-ARENA-WRITE n=3 pages=64 bytes=8388608 mode=run runs=2x65536B elem=1024B items=4096 quota=16
+[2026-09-24 15:07:27 PP2] WEG2-ARENA-WRITE n=4 pages=64 bytes=8388608 mode=run runs=2x65536B elem=1024B items=4096 quota=16
+[2026-09-24 15:07:27 PP2] #969 EXTENT n=2 fwd=1 reqs=[('weg2-0-4', 16384, 32768, 16384, 16384)]
+[2026-09-24 15:07:27 PP0] WEG2-GRAPH-POOL rank=0 phase=high-water captured_mib=20348 private_free_mib=225 reserved_after_mib=28500 allocated_mib=21497 peak_mib=25160 allocator_cache_mib=7003 general_cache_mib=6779 card_free_mib=467 card_total_mib=32088 cap_mib=28967 headroom_mib=3582 pools=0.1:2702/2657,0.5:1770/1699,0.3:1742/1738,0.8:1716/1705 -- captured = Segmente privater Pools (Graph/Tag), private_free = davon frei und fuer empty_cache unerreichbar; headroom = cap - peak - private_free ist, was der schwerste Forward auf dieser Karte uebrig laesst (Ledger-Eingang des D-KARTE-Riegels, H33)
+[2026-09-24 15:07:27 PP0] [vram-peak] high-water (16384 rows): allocator peak since pools 24.57 GiB, allocated now 20.99, reserved 27.83, card free 0.46 of 31.34 GiB -> transient headroom used = peak - allocated 3.58 GiB | cache = reserved - allocated 6.84 GiB, of which fragmentation (inactive split) 0.24 GiB, alloc retries 0
+[2026-09-24 15:07:27 PP0] #969 EXTENT n=4 fwd=1 reqs=[('weg2-0-4', 49152, 65536, 49152, 16384)]
+[2026-09-24 15:07:28 PP1] WEG2-GRAPH-POOL rank=1 phase=high-water captured_mib=11592 private_free_mib=173 reserved_after_mib=17364 allocated_mib=12663 peak_mib=15927 allocator_cache_mib=4701 general_cache_mib=4529 card_free_mib=1260 card_total_mib=20055 cap_mib=18624 headroom_mib=2524 pools=0.5:2798/2715,0.7:2740/2719,0.6:2734/2713,0.1:1102/1082 -- captured = Segmente privater Pools (Graph/Tag), private_free = davon frei und fuer empty_cache unerreichbar; headroom = cap - peak - private_free ist, was der schwerste Forward auf dieser Karte uebrig laesst (Ledger-Eingang des D-KARTE-Riegels, H33)
+[2026-09-24 15:07:28 PP1] [vram-peak] high-water (16384 rows): allocator peak since pools 15.55 GiB, allocated now 12.37, reserved 16.96, card free 1.23 of 19.58 GiB -> transient headroom used = peak - allocated 3.19 GiB | cache = reserved - allocated 4.59 GiB, of which fragmentation (inactive split) 0.14 GiB, alloc retries 0
+[2026-09-24 15:07:28 PP1] WEG2-ARENA-WRITE n=5 pages=64 bytes=12582912 mode=run runs=2x98304B elem=1024B items=6144 quota=16
+[2026-09-24 15:07:28 PP1] WEG2-ARENA-WRITE n=6 pages=64 bytes=12582912 mode=run runs=2x98304B elem=1024B items=6144 quota=16
+[2026-09-24 15:07:28 PP1] WEG2-ARENA-WRITE n=7 pages=64 bytes=12582912 mode=run runs=2x98304B elem=1024B items=6144 quota=16
+[2026-09-24 15:07:28 PP1] WEG2-ARENA-WRITE n=8 pages=64 bytes=12582912 mode=run runs=2x98304B elem=1024B items=6144 quota=16
+[2026-09-24 15:07:28 PP1] #969 EXTENT n=3 fwd=1 reqs=[('weg2-0-4', 32768, 49152, 32768, 16384)]
+[2026-09-24 15:07:30 PP2] WEG2-GRAPH-POOL rank=2 phase=high-water captured_mib=10418 private_free_mib=142 reserved_after_mib=15948 allocated_mib=11501 peak_mib=14764 allocator_cache_mib=4447 general_cache_mib=4305 card_free_mib=2684 card_total_mib=20055 cap_mib=18632 headroom_mib=3726 pools=0.5:3262/3192,0.6:3202/3191,0.3:2152/2132,0.1:768/749 -- captured = Segmente privater Pools (Graph/Tag), private_free = davon frei und fuer empty_cache unerreichbar; headroom = cap - peak - private_free ist, was der schwerste Forward auf dieser Karte uebrig laesst (Ledger-Eingang des D-KARTE-Riegels, H33)
+[2026-09-24 15:07:30 PP2] [vram-peak] high-water (16384 rows): allocator peak since pools 14.42 GiB, allocated now 11.23, reserved 15.57, card free 2.62 of 19.58 GiB -> transient headroom used = peak - allocated 3.19 GiB | cache = reserved - allocated 4.34 GiB, of which fragmentation (inactive split) 0.12 GiB, alloc retries 0
+[2026-09-24 15:07:30 PP2] WEG2-ARENA-WRITE n=5 pages=64 bytes=8388608 mode=run runs=2x65536B elem=1024B items=4096 quota=16
+[2026-09-24 15:07:30 PP2] WEG2-ARENA-WRITE n=6 pages=64 bytes=8388608 mode=run runs=2x65536B elem=1024B items=4096 quota=16
+[2026-09-24 15:07:30 PP2] WEG2-ARENA-WRITE n=7 pages=64 bytes=8388608 mode=run runs=2x65536B elem=1024B items=4096 quota=16
+[2026-09-24 15:07:30 PP2] WEG2-ARENA-WRITE n=8 pages=64 bytes=8388608 mode=run runs=2x65536B elem=1024B items=4096 quota=16
+[2026-09-24 15:07:30 PP2] #969 EXTENT n=3 fwd=1 reqs=[('weg2-0-4', 32768, 49152, 32768, 16384)]
+[2026-09-24 15:07:31 PP0] WEG2-GRAPH-POOL rank=0 phase=high-water captured_mib=20348 private_free_mib=225 reserved_after_mib=28820 allocated_mib=21817 peak_mib=25480 allocator_cache_mib=7003 general_cache_mib=6778 card_free_mib=147 card_total_mib=32088 cap_mib=28967 headroom_mib=3262 pools=0.1:2702/2657,0.5:1770/1699,0.3:1742/1738,0.8:1716/1705 -- captured = Segmente privater Pools (Graph/Tag), private_free = davon frei und fuer empty_cache unerreichbar; headroom = cap - peak - private_free ist, was der schwerste Forward auf dieser Karte uebrig laesst (Ledger-Eingang des D-KARTE-Riegels, H33)
+[2026-09-24 15:07:31 PP0] [vram-peak] high-water (16384 rows): allocator peak since pools 24.88 GiB, allocated now 21.31, reserved 28.14, card free 0.14 of 31.34 GiB -> transient headroom used = peak - allocated 3.58 GiB | cache = reserved - allocated 6.84 GiB, of which fragmentation (inactive split) 0.24 GiB, alloc retries 0
+[2026-09-24 15:07:31 PP0] #969 EXTENT n=5 fwd=1 reqs=[('weg2-0-4', 65536, 81920, 65536, 16384)]
+[2026-09-24 15:07:32 PP1] WEG2-GRAPH-POOL rank=1 phase=high-water captured_mib=11592 private_free_mib=173 reserved_after_mib=18078 allocated_mib=12983 peak_mib=16247 allocator_cache_mib=5095 general_cache_mib=4922 card_free_mib=546 card_total_mib=20055 cap_mib=18624 headroom_mib=2204 pools=0.5:2798/2715,0.7:2740/2719,0.6:2734/2713,0.1:1102/1082 -- captured = Segmente privater Pools (Graph/Tag), private_free = davon frei und fuer empty_cache unerreichbar; headroom = cap - peak - private_free ist, was der schwerste Forward auf dieser Karte uebrig laesst (Ledger-Eingang des D-KARTE-Riegels, H33)
+[2026-09-24 15:07:32 PP1] [vram-peak] high-water (16384 rows): allocator peak since pools 15.87 GiB, allocated now 12.68, reserved 17.65, card free 0.53 of 19.58 GiB -> transient headroom used = peak - allocated 3.19 GiB | cache = reserved - allocated 4.98 GiB, of which fragmentation (inactive split) 0.14 GiB, alloc retries 0
+[2026-09-24 15:07:32 PP1] #969 EXTENT n=4 fwd=1 reqs=[('weg2-0-4', 49152, 65536, 49152, 16384)]
+[2026-09-24 15:07:35 PP0] #969 EXTENT n=6 fwd=1 reqs=[('weg2-0-4', 81920, 97840, 81920, 15920)]
+[2026-09-24 15:07:36 PP1] WEG2-GRAPH-POOL rank=1 phase=high-water captured_mib=11592 private_free_mib=173 reserved_after_mib=18402 allocated_mib=13304 peak_mib=16568 allocator_cache_mib=5098 general_cache_mib=4926 card_free_mib=222 card_total_mib=20055 cap_mib=18624 headroom_mib=1883 pools=0.5:2798/2715,0.7:2740/2719,0.6:2734/2713,0.1:1102/1082 -- captured = Segmente privater Pools (Graph/Tag), private_free = davon frei und fuer empty_cache unerreichbar; headroom = cap - peak - private_free ist, was der schwerste Forward auf dieser Karte uebrig laesst (Ledger-Eingang des D-KARTE-Riegels, H33)
+[2026-09-24 15:07:36 PP1] [vram-peak] high-water (16384 rows): allocator peak since pools 16.18 GiB, allocated now 12.99, reserved 17.97, card free 0.22 of 19.58 GiB -> transient headroom used = peak - allocated 3.19 GiB | cache = reserved - allocated 4.98 GiB, of which fragmentation (inactive split) 0.14 GiB, alloc retries 0
+[2026-09-24 15:07:36 PP2] #969 EXTENT n=4 fwd=1 reqs=[('weg2-0-4', 49152, 65536, 49152, 16384)]
+[2026-09-24 15:07:36 PP1] #969 EXTENT n=5 fwd=1 reqs=[('weg2-0-4', 65536, 81920, 65536, 16384)]
+[2026-09-24 15:07:39 PP0] #969 EXTENT n=7 fwd=1 reqs=[('weg2-0-4', 97840, 97841, 97840, 1)]
+[2026-09-24 15:07:40 PP2] #969 EXTENT n=5 fwd=1 reqs=[('weg2-0-4', 65536, 81920, 65536, 16384)]
+[2026-09-24 15:07:40 PP1] #969 EXTENT n=6 fwd=1 reqs=[('weg2-0-4', 81920, 97840, 81920, 15920)]
+[2026-09-24 15:07:44 PP2] #969 EXTENT n=6 fwd=1 reqs=[('weg2-0-4', 81920, 97840, 81920, 15920)]
+[2026-09-24 15:07:44 PP1] #969 EXTENT n=7 fwd=1 reqs=[('weg2-0-4', 97840, 97841, 97840, 1)]
+[2026-09-24 15:07:46 PP2] #969 EXTENT n=7 fwd=1 reqs=[('weg2-0-4', 97840, 97841, 97840, 1)]
+[2026-09-24 15:07:48 PP1] WEG2-SLEEP-LMEM lmem 150->0 MiB released (stack 1504->0 B x 104448 threads, derived; NVML -152 MiB measured; 8.6 ms)
+[2026-09-24 15:07:48 PP2] WEG2-SLEEP-LMEM lmem 150->0 MiB released (stack 1504->0 B x 104448 threads, derived; NVML -152 MiB measured; 7.5 ms)
+[2026-09-24 15:07:48 PP0] WEG2-SLEEP-LMEM lmem 311->0 MiB released (stack 1248->0 B x 261120 threads, derived; NVML -314 MiB measured; 2.6 ms)
+[2026-09-24 15:07:55 PP0] #969 EXTENT n=8 fwd=1 reqs=[('weg2-2-5', 0, 16384, 0, 16384)]
+[2026-09-24 15:07:55 PP2] #969 EXTENT n=8 fwd=1 reqs=[('weg2-2-5', 0, 16384, 0, 16384)]
+[2026-09-24 15:07:55 PP1] #969 EXTENT n=8 fwd=1 reqs=[('weg2-2-5', 0, 16384, 0, 16384)]
+[2026-09-24 15:07:57 PP0] #969 EXTENT n=9 fwd=1 reqs=[('weg2-2-5', 16384, 32768, 16384, 16384)]
+[2026-09-24 15:08:00 PP1] #969 EXTENT n=9 fwd=1 reqs=[('weg2-2-5', 16384, 32768, 16384, 16384)]
+[2026-09-24 15:08:01 PP0] #969 EXTENT n=10 fwd=1 reqs=[('weg2-2-5', 32768, 49152, 32768, 16384)]
+[2026-09-24 15:08:02 PP2] #969 EXTENT n=9 fwd=1 reqs=[('weg2-2-5', 16384, 32768, 16384, 16384)]
+[2026-09-24 15:08:04 PP0] #969 EXTENT n=11 fwd=1 reqs=[('weg2-2-5', 49152, 65536, 49152, 16384)]
+[2026-09-24 15:08:04 PP1] #969 EXTENT n=10 fwd=1 reqs=[('weg2-2-5', 32768, 49152, 32768, 16384)]
+[2026-09-24 15:08:07 PP2] #969 EXTENT n=10 fwd=1 reqs=[('weg2-2-5', 32768, 49152, 32768, 16384)]
+[2026-09-24 15:08:08 PP0] #969 EXTENT n=12 fwd=1 reqs=[('weg2-2-5', 65536, 81920, 65536, 16384)]
+[2026-09-24 15:08:08 PP1] #969 EXTENT n=11 fwd=1 reqs=[('weg2-2-5', 49152, 65536, 49152, 16384)]
+[2026-09-24 15:08:12 PP0] #969 EXTENT n=13 fwd=1 reqs=[('weg2-2-5', 81920, 98304, 81920, 16384)]
+[2026-09-24 15:08:12 PP2] #969 EXTENT n=11 fwd=1 reqs=[('weg2-2-5', 49152, 65536, 49152, 16384)]
+[2026-09-24 15:08:12 PP1] #969 EXTENT n=12 fwd=1 reqs=[('weg2-2-5', 65536, 81920, 65536, 16384)]
+[2026-09-24 15:08:16 PP0] #969 EXTENT n=14 fwd=1 reqs=[('weg2-2-5', 98304, 114688, 98304, 16384)]
+[2026-09-24 15:08:16 PP2] #969 EXTENT n=12 fwd=1 reqs=[('weg2-2-5', 65536, 81920, 65536, 16384)]
+[2026-09-24 15:08:16 PP1] #969 EXTENT n=13 fwd=1 reqs=[('weg2-2-5', 81920, 98304, 81920, 16384)]
+[2026-09-24 15:08:20 PP0] #969 EXTENT n=15 fwd=1 reqs=[('weg2-2-5', 114688, 131072, 114688, 16384)]
+[2026-09-24 15:08:20 PP2] #969 EXTENT n=13 fwd=1 reqs=[('weg2-2-5', 81920, 98304, 81920, 16384)]
+[2026-09-24 15:08:20 PP1] #969 EXTENT n=14 fwd=1 reqs=[('weg2-2-5', 98304, 114688, 98304, 16384)]
+[2026-09-24 15:08:24 PP0] #969 EXTENT n=16 fwd=1 reqs=[('weg2-2-5', 131072, 147456, 131072, 16384)]
+[2026-09-24 15:08:24 PP2] #969 EXTENT n=14 fwd=1 reqs=[('weg2-2-5', 98304, 114688, 98304, 16384)]
+[2026-09-24 15:08:24 PP1] #969 EXTENT n=15 fwd=1 reqs=[('weg2-2-5', 114688, 131072, 114688, 16384)]
+[2026-09-24 15:08:28 PP0] #969 EXTENT n=17 fwd=1 reqs=[('weg2-2-5', 147456, 163840, 147456, 16384)]
+[2026-09-24 15:08:29 PP2] #969 EXTENT n=15 fwd=1 reqs=[('weg2-2-5', 114688, 131072, 114688, 16384)]
+[2026-09-24 15:08:29 PP1] #969 EXTENT n=16 fwd=1 reqs=[('weg2-2-5', 131072, 147456, 131072, 16384)]
+[2026-09-24 15:08:32 PP0] #969 EXTENT n=18 fwd=1 reqs=[('weg2-2-5', 163840, 180224, 163840, 16384)]
+[2026-09-24 15:08:33 PP2] #969 EXTENT n=16 fwd=1 reqs=[('weg2-2-5', 131072, 147456, 131072, 16384)]
+[2026-09-24 15:08:33 PP1] #969 EXTENT n=17 fwd=1 reqs=[('weg2-2-5', 147456, 163840, 147456, 16384)]
+[2026-09-24 15:08:36 PP0] #969 EXTENT n=19 fwd=1 reqs=[('weg2-2-5', 180224, 196608, 180224, 16384)]
+[2026-09-24 15:08:37 PP2] #969 EXTENT n=17 fwd=1 reqs=[('weg2-2-5', 147456, 163840, 147456, 16384)]
+[2026-09-24 15:08:37 PP1] #969 EXTENT n=18 fwd=1 reqs=[('weg2-2-5', 163840, 180224, 163840, 16384)]
+[2026-09-24 15:08:41 PP0] #969 EXTENT n=20 fwd=1 reqs=[('weg2-2-5', 196608, 212992, 196608, 16384)]
+[2026-09-24 15:08:41 PP2] #969 EXTENT n=18 fwd=1 reqs=[('weg2-2-5', 163840, 180224, 163840, 16384)]
+[2026-09-24 15:08:41 PP1] #969 EXTENT n=19 fwd=1 reqs=[('weg2-2-5', 180224, 196608, 180224, 16384)]
+[2026-09-24 15:08:45 PP0] #969 EXTENT n=21 fwd=1 reqs=[('weg2-2-5', 212992, 229376, 212992, 16384)]
+[2026-09-24 15:08:46 PP2] #969 EXTENT n=19 fwd=1 reqs=[('weg2-2-5', 180224, 196608, 180224, 16384)]
+[2026-09-24 15:08:46 PP1] #969 EXTENT n=20 fwd=1 reqs=[('weg2-2-5', 196608, 212992, 196608, 16384)]
+[2026-09-24 15:08:49 PP0] #969 EXTENT n=22 fwd=1 reqs=[('weg2-2-5', 229376, 245760, 229376, 16384)]
+[2026-09-24 15:08:50 PP2] #969 EXTENT n=20 fwd=1 reqs=[('weg2-2-5', 196608, 212992, 196608, 16384)]
+[2026-09-24 15:08:50 PP1] #969 EXTENT n=21 fwd=1 reqs=[('weg2-2-5', 212992, 229376, 212992, 16384)]
+[2026-09-24 15:08:54 PP0] #969 EXTENT n=23 fwd=1 reqs=[('weg2-2-5', 245760, 259440, 245760, 13680)]
+[2026-09-24 15:08:54 PP2] #969 EXTENT n=21 fwd=1 reqs=[('weg2-2-5', 212992, 229376, 212992, 16384)]
+[2026-09-24 15:08:54 PP1] #969 EXTENT n=22 fwd=1 reqs=[('weg2-2-5', 229376, 245760, 229376, 16384)]
+[2026-09-24 15:08:58 PP0] #969 EXTENT n=24 fwd=1 reqs=[('weg2-2-5', 259440, 259441, 259440, 1)]
+[2026-09-24 15:08:59 PP2] #969 EXTENT n=22 fwd=1 reqs=[('weg2-2-5', 229376, 245760, 229376, 16384)]
+[2026-09-24 15:08:59 PP1] #969 EXTENT n=23 fwd=1 reqs=[('weg2-2-5', 245760, 259440, 245760, 13680)]
+[2026-09-24 15:09:03 PP2] #969 EXTENT n=23 fwd=1 reqs=[('weg2-2-5', 245760, 259440, 245760, 13680)]
+[2026-09-24 15:09:03 PP1] #969 EXTENT n=24 fwd=1 reqs=[('weg2-2-5', 259440, 259441, 259440, 1)]
+[2026-09-24 15:09:05 PP2] #969 EXTENT n=24 fwd=1 reqs=[('weg2-2-5', 259440, 259441, 259440, 1)]
+[2026-09-24 15:09:06 PP1] WEG2-SLEEP-LMEM lmem 150->0 MiB released (stack 1504->0 B x 104448 threads, derived; NVML -152 MiB measured; 6.8 ms)
+[2026-09-24 15:09:07 PP2] WEG2-SLEEP-LMEM lmem 150->0 MiB released (stack 1504->0 B x 104448 threads, derived; NVML -152 MiB measured; 8.9 ms)
+[2026-09-24 15:09:08 PP0] WEG2-SLEEP-LMEM lmem 311->0 MiB released (stack 1248->0 B x 261120 threads, derived; NVML -314 MiB measured; 2.4 ms)
+[2026-09-24 15:09:13 PP0] #969 EXTENT n=25 fwd=1 reqs=[('weg2-4-6', 0, 12668, 0, 12668)]
+[2026-09-24 15:09:13 PP1] #969 EXTENT n=25 fwd=1 reqs=[('weg2-4-6', 0, 12668, 0, 12668)]
+[2026-09-24 15:09:13 PP2] #969 EXTENT n=25 fwd=1 reqs=[('weg2-4-6', 0, 12668, 0, 12668)]
+[2026-09-24 15:09:17 PP0] #969 EXTENT n=26 fwd=1 reqs=[('weg2-4-6', 12668, 12672, 12668, 4)]
+[2026-09-24 15:09:19 PP1] #969 EXTENT n=26 fwd=1 reqs=[('weg2-4-6', 12668, 12672, 12668, 4)]
+[2026-09-24 15:09:21 PP2] #969 EXTENT n=26 fwd=1 reqs=[('weg2-4-6', 12668, 12672, 12668, 4)]
+[2026-09-24 15:09:22 PP1] WEG2-SLEEP-LMEM lmem 150->0 MiB released (stack 1504->0 B x 104448 threads, derived; NVML -152 MiB measured; 13.7 ms)
+[2026-09-24 15:09:22 PP2] WEG2-SLEEP-LMEM lmem 150->0 MiB released (stack 1504->0 B x 104448 threads, derived; NVML -152 MiB measured; 10.9 ms)
+[2026-09-24 15:09:23 PP0] WEG2-SLEEP-LMEM lmem 311->0 MiB released (stack 1248->0 B x 261120 threads, derived; NVML -314 MiB measured; 3.6 ms)
+[2026-09-24 15:09:35 PP0] #969 EXTENT n=27 fwd=1 reqs=[('weg2-6-7', 0, 8360, 0, 8360)]
+[2026-09-24 15:09:35 PP1] #969 EXTENT n=27 fwd=1 reqs=[('weg2-6-7', 0, 8360, 0, 8360)]
+[2026-09-24 15:09:35 PP2] #969 EXTENT n=27 fwd=1 reqs=[('weg2-6-7', 0, 8360, 0, 8360)]
+[2026-09-24 15:09:37 PP0] #969 EXTENT n=28 fwd=1 reqs=[('weg2-6-7', 8360, 8361, 8360, 1)]
+[2026-09-24 15:09:39 PP1] #969 EXTENT n=28 fwd=1 reqs=[('weg2-6-7', 8360, 8361, 8360, 1)]
+[2026-09-24 15:09:40 PP2] #969 EXTENT n=28 fwd=1 reqs=[('weg2-6-7', 8360, 8361, 8360, 1)]
+[2026-09-24 15:09:41 PP1] WEG2-SLEEP-LMEM lmem 150->0 MiB released (stack 1504->0 B x 104448 threads, derived; NVML -152 MiB measured; 2.7 ms)
+[2026-09-24 15:09:42 PP2] WEG2-SLEEP-LMEM lmem 150->0 MiB released (stack 1504->0 B x 104448 threads, derived; NVML -152 MiB measured; 5.8 ms)
+[2026-09-24 15:09:42 PP0] WEG2-SLEEP-LMEM lmem 311->0 MiB released (stack 1248->0 B x 261120 threads, derived; NVML -314 MiB measured; 2.7 ms)
+[2026-09-24 15:09:58 PP0] #969 EXTENT n=29 fwd=1 reqs=[('weg2-8-8', 0, 8464, 0, 8464)]
+[2026-09-24 15:09:58 PP2] #969 EXTENT n=29 fwd=1 reqs=[('weg2-8-8', 0, 8464, 0, 8464)]
+[2026-09-24 15:09:58 PP1] #969 EXTENT n=29 fwd=1 reqs=[('weg2-8-8', 0, 8464, 0, 8464)]
+[2026-09-24 15:10:00 PP0] #969 EXTENT n=30 fwd=1 reqs=[('weg2-8-8', 8464, 8466, 8464, 2)]
+[2026-09-24 15:10:02 PP1] #969 EXTENT n=30 fwd=1 reqs=[('weg2-8-8', 8464, 8466, 8464, 2)]
+[2026-09-24 15:10:03 PP2] #969 EXTENT n=30 fwd=1 reqs=[('weg2-8-8', 8464, 8466, 8464, 2)]
+[2026-09-24 15:10:04 PP1] WEG2-SLEEP-LMEM lmem 150->0 MiB released (stack 1504->0 B x 104448 threads, derived; NVML -152 MiB measured; 2.7 ms)
+[2026-09-24 15:10:05 PP2] WEG2-SLEEP-LMEM lmem 150->0 MiB released (stack 1504->0 B x 104448 threads, derived; NVML -152 MiB measured; 3.8 ms)
+[2026-09-24 15:10:05 PP0] WEG2-SLEEP-LMEM lmem 311->0 MiB released (stack 1248->0 B x 261120 threads, derived; NVML -314 MiB measured; 5.7 ms)

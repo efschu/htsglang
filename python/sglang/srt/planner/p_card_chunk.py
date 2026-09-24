@@ -321,12 +321,13 @@ def activation_lines(support: TransientSupport, chunk: int) -> Tuple[str, ...]:
 #   eines Boots mit MEHR Zeilen gemessenen Preis (x149 PP0: (4594 - 1300) / 46
 #   = 71.6 MiB, Bild 70.1 -- eine OBERE Schranke, die +73 MiB privat_frei von
 #   x149 stecken darin), nie weniger als das Bild;
-# * g_s: das Wachstum der Spitze je Chunk, aus den PEAK-Werten der Referenz
-#   (x146/x150 PP0 21965 -> 22286 -> 22607 -> 22927 = 320.7 MiB je 16k-Chunk),
-#   je Token gerechnet und bis zum LETZTEN Chunk des Prompts fortgeschrieben.
-#   Gemessen ist es bis Chunk 3 (PP2: 1); danach druckt die Referenz keine
-#   neue Hochwassermarke mehr (Schritt 256 MiB) -- die Fortschreibung darueber
-#   ist eine HOCHRECHNUNG und steht so in jeder Zeile;
+# * g_s: das Wachstum der Spitze, aus den PEAK-Werten der Referenz, und es
+#   SAETTIGT (H41d, gemessen fnFL2x160: 259441-Token-Prompt, 16 Chunks; PP0
+#   24490 -> 24839 -> 25160 -> 25480 und danach bis Chunk 15 keine neue
+#   Hochwassermarke, PP1 ebenso, PP2 nach Chunk 1): der Term ist
+#   g_s x min(Chunk-Index, letzter wachsender Chunk) -- PP0 990, PP1 974,
+#   PP2 329 MiB, unabhaengig von der Promptlaenge. Nur ein Prompt, der LAENGER
+#   ist als der laengste der Referenz, ist eine HOCHRECHNUNG (so benannt);
 # * LMEM_s: der lokale Treiberspeicher des Arena-Write-Kernels im Run-Modus
 #   (H47): stack = run/32 - 64 B je residentem Thread, einmal je Karte,
 #   sichtbar als cap-Abfall zwischen Chunk 0 und Chunk 1 (x149 PP0 -1457,
@@ -704,9 +705,8 @@ def p_card_reference_from_logs(
     return msgspec.structs.replace(ref, row_card_mib=cost, row_card_source=src)
 
 
-#: Die gemessene P-Karten-Referenz der Next-Flash-Bestform (H25-Form, kein
-#: Draft auf P), hergeleitet von :func:`p_card_reference_from_logs` aus
-#: fnFL2x146 (012db511b8) und fnFL2x150 (78878cdd58), beide Schnitt 29,11,8,
+#: HISTORISCH (Baum bis 78878cdd58, vor H39/H44/H46/H47): die P-Karten-Referenz
+#: aus fnFL2x146 (012db511b8) und fnFL2x150 (78878cdd58), beide Schnitt 29,11,8,
 #: Chunk 16384, FR_P 0.26,0.45,0.39 -> H25 0.733887 (Puffer 166/263/408
 #: Zeilen), KV 262144 x 7616/3264/2176 B, 97k-Prompt (97841 Token). Chunk 0
 #: PP0: cap 28953 - peak 21965 - privat_frei 2394 = 4594 MiB; Wachstum der
@@ -715,7 +715,7 @@ def p_card_reference_from_logs(
 #: Zeilenpreis ueber der Referenz aus fnFL2x149 Chunk 0: PP0 71.6 MiB (Bild
 #: 70.1); PP1 26.4 < Bild -> Bild. Zeile 2.4170 MiB (512 Experten, 1237.5 MiB
 #: je Layer). Auffrischen: ``--p-card-reference-logs`` / ``--p-card-over-logs``.
-P_CARD_REFERENCE_FNFL2 = PCardReference(
+P_CARD_REFERENCE_FNFL2_X150 = PCardReference(
     source="fnFL2x146 + fnFL2x150",
     model="Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",
     stage_layers=(29, 11, 8),
@@ -741,6 +741,38 @@ P_CARD_REFERENCE_FNFL2 = PCardReference(
 )
 
 
+#: Die gemessene P-Karten-Referenz des HEUTIGEN Baums (76ce5580d4 = H39 Repack
+#: ausserhalb der Tag-Pools, H44/H46 Lanes, H47 Run-Write-Fix + LMEM-Bedarf),
+#: hergeleitet aus fnFL2x160 (FR_P 0.332,0.605,0.39 -> H25 0.733887, Puffer
+#: 202/342/408 Zeilen, Chunk 16384, KV 262144 x 7616/3264/2176 B), der den
+#: 97k- UND den 259441-Token-Prompt (16 Chunks) ohne OOM lief. Gegen die
+#: historische Referenz: privat_frei 2394 -> 225 MiB auf PP0 (173 PP1, 142
+#: PP2), daher liegt der Kopfraum bei MEHR Zeilen hoeher -- eine Referenz ist
+#: ein Baumstand und wird mit ihm aufgefrischt. Chunk 0 PP0: cap 28967 -
+#: peak 24490 - privat_frei 225 = 4252 MiB; Wachstum 990 / 974 / 329 MiB,
+#: saettigt nach Chunk 3 / 3 / 1 (gemessen bis Chunk 15); kein LMEM-Abfall
+#: (0 / 2 / 2 MiB). Zeilenpreis: das Bild (kein Boot mit mehr Zeilen auf
+#: diesem Baum). Auffrischen: ``--p-card-reference-logs``.
+P_CARD_REFERENCE_FNFL2 = PCardReference(
+    source="fnFL2x160",
+    model="Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",
+    stage_layers=(29, 11, 8),
+    chunk=16384,
+    headroom0_mib=(24011.6, 16054.9, 15756.8),
+    headroom_mib=(4252.0, 2859.0, 4057.0),
+    buffer_rows=(202, 342, 408),
+    kv_mib=(1904.0, 816.0, 544.0),
+    cap_mib=(28967.0, 18626.0, 18634.0),
+    peak_mib=(24490.0, 15594.0, 14435.0),
+    private_free_mib=(225.0, 173.0, 142.0),
+    draft_on_p=False,
+    growth_mib_per_token=(0.0201416, 0.0198161, 0.0200806),
+    growth_measured_chunks=(3, 3, 1),
+    longest_prompt_tokens=259441,
+    lmem_mib=(0.0, 2.0, 2.0),
+)
+
+
 class PCardFit(msgspec.Struct, frozen=True, kw_only=True):
     """Eine P-Stufe auf ihrer Karte fuer (Fraction, Chunk, Prompt)."""
 
@@ -761,10 +793,6 @@ class PCardFit(msgspec.Struct, frozen=True, kw_only=True):
     last_chunk_index: int
     growth_mib: float
     growth_extrapolated: bool
-    #: Der Kopfraum, wenn das Wachstum nach dem letzten GEMESSENEN Chunk
-    #: stehen bleibt (so zeigen es x146/x150: keine neue Hochwassermarke
-    #: danach, also < 256 MiB) -- gedruckt, nicht der Riegel.
-    headroom_saturated_mib: float
     lmem_mib: float
     lmem_source: str
     headroom_mib: float
@@ -829,7 +857,6 @@ def solve_p_card(
     c = int(chunk)
     n_chunks = max(1, -(-prompt // c))
     last_idx = n_chunks - 1
-    before_last = last_idx * c
     out: List[PCardFit] = []
     for s in range(n):
         layer_mib = int(stage_layers[s]) * float(row_mib)
@@ -844,8 +871,15 @@ def solve_p_card(
             draft = (int(bool(draft_on_p)) - int(bool(reference.draft_on_p))) * float(
                 draft_mib_last_stage
             )
-        growth = float(reference.growth_mib_per_token[s]) * before_last if use_growth else 0.0
-        extrapolated = last_idx > int(reference.growth_measured_chunks[s])
+        # H41d: das Wachstum saettigt am letzten wachsenden Chunk der Referenz
+        # (x160: gemessen ueber 16 Chunks); darueber hinaus kein Term.
+        sat_idx = min(last_idx, int(reference.growth_measured_chunks[s]))
+        growth = (
+            float(reference.growth_mib_per_token[s]) * sat_idx * int(reference.chunk)
+            if use_growth else 0.0
+        )
+        ref_last = max(0, -(-int(reference.longest_prompt_tokens) // c) - 1)
+        extrapolated = last_idx > ref_last
         if lmem_fixed:
             lmem, lsrc = 0.0, "0 (H47-Fix: Run-Write in 1-KiB-Elementen)"
         else:
@@ -860,12 +894,6 @@ def solve_p_card(
         rest = float(reference.headroom0_mib[s]) - float(kv_mib[s]) - t - draft - growth - lmem
         over = max(0, int(rows) - ref_rows)
         head = rest - rows * layer_mib - over * (row_card - layer_mib)
-        sat = (
-            float(reference.growth_mib_per_token[s])
-            * min(last_idx, int(reference.growth_measured_chunks[s])) * c
-            if use_growth else 0.0
-        )
-        head_sat = head + growth - sat
         at_ref = rest - ref_rows * layer_mib - float(near_oom_mib)
         if at_ref >= 0.0:
             max_rows = ref_rows + int(math.floor(at_ref / row_card))
@@ -889,7 +917,6 @@ def solve_p_card(
                 last_chunk_index=last_idx,
                 growth_mib=growth,
                 growth_extrapolated=bool(extrapolated and use_growth),
-                headroom_saturated_mib=head_sat,
                 lmem_mib=lmem,
                 lmem_source=lsrc,
                 headroom_mib=head,
@@ -912,10 +939,10 @@ def describe_p_card(fit: PCardFit, reference: PCardReference) -> str:
         "%s stage%d (%s) prompt=%d: Referenz %s Kopfraum Chunk 0 %.0f = cap %.0f - peak "
         "%.0f - privat_frei %.0f MiB bei %d Zeilen, KV %.0f, Chunk %d; hier f %.4f -> %d "
         "Zeilen (%+.0f MiB; je Zeile ueber der Referenz %.1f, Bild %.1f), KV %.0f (%+.0f), "
-        "Transiente %.0f (%+.0f, %s)%s, Chunk-Wachstum bis Chunk %d %.0f MiB (%.1f je "
-        "16k, gemessen bis Chunk %d%s), LMEM %s -> Kopfraum %.0f MiB (near-OOM %.0f) -> "
-        "%s | KARTEN-DECKE f %s (<= %d Zeilen) | gesaettigt (Wachstum nur bis zum gemessenen "
-        "Chunk) %.0f MiB, gedruckt, nicht der Riegel"
+        "Transiente %.0f (%+.0f, %s)%s, Chunk-Wachstum am Chunk %d %.0f MiB (%.1f je "
+        "16k, saettigt nach Chunk %d, gemessen ueber %d Token%s), LMEM %s -> Kopfraum %.0f "
+        "MiB (near-OOM %.0f) -> "
+        "%s | KARTEN-DECKE f %s (<= %d Zeilen)"
         % (
             CARD_MARKER,
             s,
@@ -944,14 +971,14 @@ def describe_p_card(fit: PCardFit, reference: PCardReference) -> str:
             fit.growth_mib,
             reference.growth_mib_per_token[s] * 16384,
             reference.growth_measured_chunks[s],
-            ", darueber HOCHRECHNUNG" if fit.growth_extrapolated else "",
+            reference.longest_prompt_tokens,
+            ", Prompt laenger als gemessen: HOCHRECHNUNG" if fit.growth_extrapolated else "",
             fit.lmem_source,
             fit.headroom_mib,
             fit.near_oom_mib,
             fit.verdict,
             ceiling,
             fit.ceiling_max_rows,
-            fit.headroom_saturated_mib,
         )
     )
 
@@ -968,7 +995,7 @@ def p_card_refusal_text(
         "verschoben um Puffer (je Zeile ueber der Referenz zum gemessenen Preis), KV, "
         "Chunk-Transiente, Draft, Chunk-Wachstum der Spitze und den Run-Write-LMEM; "
         "fnFL2x121 (FR_P[0] 0.45) und x122 (0.40) starben im ersten 16k-Chunk, "
-        "fnFL2x149 (0.351) im zweiten am LMEM und laege ohne ihn im Chunk 5 unter null. "
+        "fnFL2x149 (0.351) im zweiten am Run-Write-LMEM (H47). "
         "Groesste tragbare Fraction je Stufe: %s."
         % (
             CARD_REFUSAL_CODE,
