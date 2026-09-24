@@ -2211,6 +2211,74 @@ class DFlashWorkerV2(BaseSpecWorker):
             write_layer_kv=_write_layer_kv,
         )
 
+    @staticmethod
+    def _dflash_grammar_vocab_mask(
+        *,
+        batch: ScheduleBatch,
+        verify_input: DFlashVerifyInput,
+        draft_tokens_cpu: torch.Tensor,
+        device,
+    ) -> Optional[torch.Tensor]:
+        """upstream #30096, on the fork's synchronous bitmask path.
+
+        A DFLASH verify block is a LINEAR chain: node i's only child is i + 1
+        (column 0 is the already-committed anchor, so mask row i constrains
+        the target's prediction AFTER chain token i -- the same row the target
+        logits carry). The fork's ``generate_token_bitmask`` walks that chain
+        per grammar request (accept / fill / rollback, stopping below the
+        first draft token the grammar refuses) and stamps
+        ``verify_input.grammar``. Rows it never reaches stay all-allowed; they
+        lie past the first refused draft, which the masked target can never
+        accept. Deterministic on the rank-synced draft tokens and identical
+        grammar states, so every rank builds the same mask."""
+        from sglang.srt.speculative.spec_utils import generate_token_bitmask
+
+        bs, chain_len = draft_tokens_cpu.shape
+        next_token = torch.full((bs, chain_len), -1, dtype=torch.int64)
+        if chain_len > 1:
+            next_token[:, :-1] = torch.arange(1, chain_len, dtype=torch.int64)
+        next_sibling = torch.full((bs, chain_len), -1, dtype=torch.int64)
+        vocab_mask = generate_token_bitmask(
+            batch.reqs,
+            verify_input,
+            next_token,
+            next_sibling,
+            draft_tokens_cpu,
+            batch.sampling_info.vocab_size,
+        )
+        # As on the EAGLE v2 path: a mask left from the extend stage must not
+        # be applied to the verify block by the logit adjustments.
+        batch.sampling_info.vocab_mask = None
+        if vocab_mask is None:
+            return None
+        assert verify_input.grammar is not None
+        return vocab_mask.to(device)
+
+    @staticmethod
+    def _dflash_verify_logprobs(
+        *,
+        batch: ScheduleBatch,
+        logits_output,
+        out_tokens: torch.Tensor,
+        bs: int,
+        block_size: int,
+    ) -> None:
+        """upstream #33459: out_tokens[:, j] is the token the verify logits row
+        j predicts (accepted drafts, then the bonus), so every row is its own
+        accept index; the processor slices the first commit_len per request."""
+        from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
+
+        output_indices = torch.arange(
+            bs * block_size, dtype=torch.int64, device=out_tokens.device
+        ).view(bs, block_size)
+        compute_spec_v2_logprobs(
+            batch,
+            logits_output,
+            out_tokens.reshape(-1),
+            output_indices,
+            block_size - 1,
+        )
+
     def _update_target_mamba_state_after_verify(
         self,
         *,
@@ -2581,10 +2649,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
     ) -> GenerationBatchResult:
-        if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DFLASH speculative decoding does not support return_logprob yet."
-            )
+        # upstream #33459: return_logprob is served (verify-time
+        # compute_spec_v2_logprobs, see _dflash_verify_logprobs); the refusal
+        # that stood here is gone. The target prefill computes its own.
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -3006,6 +3073,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_sum = seq_lens_sum_backup
         self._audit_mark("verify_prep")  # DFLASH AUDIT (env-gated)
 
+        # upstream #30096 (adapted to the fork's synchronous bitmask path, the
+        # one EAGLE v2 uses here; #31488's overlapped GrammarTree/barrier is
+        # not ported): the block's rank-synced draft tokens on the host, taken
+        # before the verify launch. Only a grammar batch pays this D2H.
+        grammar_draft_tokens_cpu = (
+            draft_tokens.cpu() if getattr(batch, "has_grammar", False) else None
+        )
+
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -3016,11 +3091,28 @@ class DFlashWorkerV2(BaseSpecWorker):
         can_run_cuda_graph = target_out.can_run_cuda_graph
         self._audit_mark("verify")  # DFLASH AUDIT (env-gated)
 
+        grammar_vocab_mask = None
+        if grammar_draft_tokens_cpu is not None:
+            grammar_vocab_mask = self._dflash_grammar_vocab_mask(
+                batch=batch,
+                verify_input=verify_input,
+                draft_tokens_cpu=grammar_draft_tokens_cpu,
+                device=logits_output.next_token_logits.device,
+            )
+
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
+            )
+
+        # upstream #30096: constrain every chain position before accept picks
+        # from it (greedy argmax, the sampling kernels and the selector all
+        # read these logits).
+        if grammar_vocab_mask is not None:
+            verify_input.grammar.apply_vocab_mask(
+                logits=logits_output.next_token_logits, vocab_mask=grammar_vocab_mask
             )
 
         candidates = draft_tokens
@@ -3143,6 +3235,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
             )
         # === END DFLASH AUDIT ===
+
+        # upstream #33459: logprobs of the committed run (drafts + bonus) off
+        # the verify logits, in the spec-v2 layout the result processor reads.
+        if getattr(batch, "return_logprob", False):
+            self._dflash_verify_logprobs(
+                batch=batch,
+                logits_output=logits_output,
+                out_tokens=out_tokens,
+                bs=bs,
+                block_size=int(self.block_size),
+            )
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
