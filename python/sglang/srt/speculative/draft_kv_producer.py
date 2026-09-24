@@ -30,7 +30,7 @@ import json
 import logging
 import os
 import time
-
+from typing import Callable
 
 import torch
 
@@ -85,18 +85,11 @@ class DraftKvProducer:
         # bytes (parameters + buffers, the shared target lm_head excluded --
         # the target already paid for it); the NVML delta stays beside it on
         # the L2 line as its own named term, never as the residue.
-        self._free_before_mib = _cuda_free_mib()
-        self._pool_inactive_before_mib = _tag_pool_inactive_mib()
-        # #66: die zwei Terme, die W11b bisher fehlten -- was AUSSERHALB von
-        # torch auf der Karte waechst, und was der Default-Allokator cached.
-        self._outside_before_mib = _outside_torch_mib()
-        self._default_inactive_before_mib = _default_pool_inactive_mib()
-        # #66: der dritte Zustand neben "frei" und "gecached" -- lebend.
-        self._alloc_before_mib = _live_allocated_mib()
-        self.resident_mib = -1.0
-        self.nvml_delta_mib = -1.0
-        self.card_free_mib = -1.0
-        self.other_live_mib = -1.0
+        # #66: the W11b build instruments (NVML free, tag-pool cache, outside
+        # torch, whole-allocator cache, live allocator bytes), read BEFORE the
+        # build by the ONE meter both producers use (DraftBuildMeter below).
+        self._build_meter = DraftBuildMeter()
+        DraftBuildMeter.init_fields(self)
         self.head_released_mib = 0.0
         # fnFL2x12: the BF16 vocab the MTP build materialised, released when
         # the target-quantized rebuild replaces it.
@@ -334,6 +327,9 @@ class DraftKvProducer:
         target_model = self.draft_worker.target_worker.model_runner.model
         head = getattr(target_model, "lm_head", None)
         own_head = getattr(draft_model, "lm_head", None)
+        # A handle built without __init__ (tests) carries no meter: its
+        # instruments read -1 ("not measured"), never a guess.
+        meter = getattr(self, "_build_meter", None) or DraftBuildMeter.unmeasured()
         # #1259 (b): with the build deferred there is NO fallback table. If the
         # target has no `lm_head` on this stage the share cannot happen, and
         # the honest place to say so is here, at boot, and not per chunk inside
@@ -357,78 +353,23 @@ class DraftKvProducer:
             # those 1212.5 MiB twice -- W11b's residual went from +1918.9
             # (term missing) to -678.8 (term double-counting). Both are a
             # refusal, and rightly so.
-            self._pool_inactive_after_mib = _tag_pool_inactive_mib()
+            meter.mark_pool_before_release()
             self.head_released_mib = _drop_parameters(own_head)
             del own_head
-        torch.cuda.empty_cache()
-        # #66 (fnFL2v72): empty_cache does NOT reach a private tag pool -- the
-        # #65 finding of this same day. The draft build runs inside one, so
-        # its load transients stay cached there and NVML counts them, while
-        # W11b's two explaining terms (residue + released) cannot see them:
-        # 5334.0 measured against 2202.6 + 1212.5 left 1918.9 MiB unexplained.
-        # Measure that cache instead of widening a tolerance around it -- an
-        # explanation that names its terms is the whole point of this gate.
-        # MEASURED 21.09. on fnFL2v72's PP2: the pools hold 7649 MiB inactive
-        # after the load, LONG before this build. The absolute number is
-        # therefore the wrong term -- subtracting it would push W11b's
-        # residual strongly negative, and the gate refuses BOTH directions
-        # ("an explanation that does not add up is not an explanation").
-        # What belongs here is the DELTA this build added to that cache.
-        # taken before the head release above; "now" only when nothing was
-        # released (tie_word_embeddings drops no second table).
-        after_pool = getattr(self, "_pool_inactive_after_mib", -1.0)
-        if after_pool < 0:
-            after_pool = _tag_pool_inactive_mib()
-        if after_pool >= 0 and self._pool_inactive_before_mib >= 0:
-            self.tag_pool_inactive_mib = after_pool - self._pool_inactive_before_mib
-        else:
-            self.tag_pool_inactive_mib = -1.0
         mib = sum(p.numel() * p.element_size() for p in params.values()) / float(2**20)
         self.embed_dtype = str(params["weight"].dtype) if "weight" in params else "?"
-        after = _cuda_free_mib()
-        if after >= 0 and self._free_before_mib >= 0:
-            self.nvml_delta_mib = self._free_before_mib - after
-        # #66: WAS DIE KARTE NACH DEM BUILD NOCH FREI HAT -- kein
-        # Buchungsposten, sondern der MASSSTAB fuer den unerklaerten Rest.
-        # W11b existiert, um ein OOM zu verhindern; ob eine unerklaerte
-        # Differenz gefaehrlich ist, entscheidet allein diese Zahl, und keiner
-        # der vier Terme trug sie bisher.
-        self.card_free_mib = after
-        # Beide NACH empty_cache: ein Rest im Default-Pool ist dann ein
-        # Befund, kein Buchungsposten.
-        _out_after = _outside_torch_mib()
-        _def_after = _default_pool_inactive_mib()
-        self.outside_torch_mib = (
-            _out_after - self._outside_before_mib
-            if (_out_after >= 0 and self._outside_before_mib >= 0)
-            else -1.0
-        )
-        self.default_pool_inactive_mib = (
-            _def_after - self._default_inactive_before_mib
-            if (_def_after >= 0 and self._default_inactive_before_mib >= 0)
-            else -1.0
-        )
         # `shared` is the TARGET's head and only ever that: under
         # tie_word_embeddings `lm_head` is this producer's own resident
         # embedding, and excluding it would under-report the residue W11
         # grades by the whole vocab table.
         now_head = getattr(draft_model, "lm_head", None)
-        self.resident_mib = _live_weight_mib(
-            draft_model, shared=(now_head if (head is not None and now_head is head) else None)
+        meter.finish(
+            self,
+            resident_mib=lambda: _live_weight_mib(
+                draft_model,
+                shared=(now_head if (head is not None and now_head is head) else None),
+            ),
         )
-        # #66: LEBENDE NICHT-MODELL-BYTES. Was der Build an Allokator-Bytes
-        # zugelegt hat, minus dem, was davon Modell ist -- also der
-        # Attention-Workspace des Draft-Runners und was sonst ausser den
-        # Gewichten lebt. Nur positiv gemeldet: ein negativer Wert hiesse, der
-        # Modell-Term uebersteigt den Allokator-Zuwachs, und das waere ein
-        # Befund ueber die Messung, kein Buchungsposten.
-        _alloc_after = _live_allocated_mib()
-        if _alloc_after >= 0 and self._alloc_before_mib >= 0 and self.resident_mib >= 0:
-            self.other_live_mib = max(
-                0.0, (_alloc_after - self._alloc_before_mib) - self.resident_mib
-            )
-        else:
-            self.other_live_mib = -1.0
         return mib
 
     # -- the per-chunk primitive ---------------------------------------------
@@ -684,6 +625,142 @@ def _cuda_free_mib() -> float:
     torch.cuda.empty_cache()
     free, _total = torch.cuda.mem_get_info(torch.cuda.current_device())
     return free / float(2**20)
+
+
+#: The instrument fields the scheduler's `WEG2 DRAFT-KV-PRODUCER armed` line
+#: prints and the launcher's W11/W11b gate reads back (launcher._*_RE).
+DRAFT_BUILD_FIELDS = (
+    "resident_mib",
+    "nvml_delta_mib",
+    "tag_pool_inactive_mib",
+    "outside_torch_mib",
+    "default_pool_inactive_mib",
+    "card_free_mib",
+    "other_live_mib",
+)
+
+
+class DraftBuildMeter:
+    """#66: THE W11b BUILD INSTRUMENTS, ONE IMPLEMENTATION FOR EVERY PRODUCER.
+
+    Constructed right BEFORE a draft build (``DraftKvProducer`` and
+    ``DFlashDraftKvProducer`` both do so first thing in ``__init__``),
+    :meth:`finish` right AFTER it (in ``load_resident_embedding``, before any
+    KV pool, chunk ring, attention workspace or graph of the producer is
+    allocated). Every term is a DELTA across the build, read in the same card
+    state (``empty_cache`` first) so that
+
+        nvml_delta = resident + other_live + default_pool_inactive + outside
+
+    holds by construction (NVML used = torch reserved + outside torch;
+    reserved = allocated + cached; allocated growth = model + other live).
+    ``tag_pool_inactive_mib`` is the cached part that sits in the memory
+    saver's private tag pools (empty_cache cannot reach them, #65); it is a
+    PART of ``default_pool_inactive_mib`` and W11b uses one of the two, never
+    both (fnFL2v89). ``card_free_mib`` is the scale W11b weighs a remainder
+    against, not a term.
+
+    weg2xsn417 (24.09.): the DFlash producer printed these as -1 placeholders
+    (it carried its own two-term copy of the old formula), so W11b read
+    3072.0 = 2174.5 + 897.5 unaccounted and refused a build xsn411 had
+    explained to 5.7 MiB with that copy. One meter, no second copy.
+    """
+
+    def __init__(self, *, measured: bool = True):
+        if measured:
+            self.free_before_mib = _cuda_free_mib()
+            self.pool_inactive_before_mib = _tag_pool_inactive_mib()
+            # #66: what grows on the card OUTSIDE torch, and what the whole
+            # allocator caches (tag pools included).
+            self.outside_before_mib = _outside_torch_mib()
+            self.default_inactive_before_mib = _default_pool_inactive_mib()
+            # #66: the third state beside "free" and "cached" -- live.
+            self.alloc_before_mib = _live_allocated_mib()
+        else:
+            self.free_before_mib = -1.0
+            self.pool_inactive_before_mib = -1.0
+            self.outside_before_mib = -1.0
+            self.default_inactive_before_mib = -1.0
+            self.alloc_before_mib = -1.0
+        self.pool_inactive_after_mib = -1.0
+
+    @classmethod
+    def unmeasured(cls) -> "DraftBuildMeter":
+        """A meter whose every term reads -1 ("not measured") -- W11b refuses
+        such a line; it never guesses a term."""
+        return cls(measured=False)
+
+    @staticmethod
+    def init_fields(target) -> None:
+        """Every armed-line field at -1 until :meth:`finish` measured it."""
+        for name in DRAFT_BUILD_FIELDS:
+            setattr(target, name, -1.0)
+
+    def mark_pool_before_release(self) -> None:
+        """MEASURED fnFL2v74: a head release frees into the SAME private pool,
+        so the tag-pool term is read BEFORE it -- afterwards those bytes would
+        be counted twice (W11b +1918.9 -> -678.8, both refusals)."""
+        self.pool_inactive_after_mib = _tag_pool_inactive_mib()
+
+    def finish(self, target, *, resident_mib: Callable[[], float]) -> None:
+        """Read the AFTER side and set every field of
+        :data:`DRAFT_BUILD_FIELDS` on ``target``. ``resident_mib`` is the
+        caller's own live-weight reading (what the draft model holds,
+        parameters + buffers, shared target modules excluded)."""
+        torch.cuda.empty_cache()
+        # #66 (fnFL2v72): empty_cache does NOT reach a private tag pool (#65),
+        # so a build's load transients stay cached there and NVML counts them.
+        # MEASURED 21.09. (fnFL2v72 PP2): the pools held 7649 MiB inactive
+        # LONG before the build, so the absolute number is the wrong term --
+        # what belongs here is the DELTA this build added ("now" only when no
+        # release was marked).
+        after_pool = self.pool_inactive_after_mib
+        if after_pool < 0:
+            after_pool = _tag_pool_inactive_mib()
+        target.tag_pool_inactive_mib = (
+            after_pool - self.pool_inactive_before_mib
+            if (after_pool >= 0 and self.pool_inactive_before_mib >= 0)
+            else -1.0
+        )
+        after = _cuda_free_mib()
+        target.nvml_delta_mib = (
+            self.free_before_mib - after
+            if (after >= 0 and self.free_before_mib >= 0)
+            else -1.0
+        )
+        # #66: what the card still has free after the build -- not a term, the
+        # SCALE W11b weighs an unexplained remainder against.
+        target.card_free_mib = after
+        # Both AFTER empty_cache: a remainder in the allocator is then a
+        # finding, not a booking term.
+        out_after = _outside_torch_mib()
+        def_after = _default_pool_inactive_mib()
+        target.outside_torch_mib = (
+            out_after - self.outside_before_mib
+            if (out_after >= 0 and self.outside_before_mib >= 0)
+            else -1.0
+        )
+        target.default_pool_inactive_mib = (
+            def_after - self.default_inactive_before_mib
+            if (def_after >= 0 and self.default_inactive_before_mib >= 0)
+            else -1.0
+        )
+        target.resident_mib = float(resident_mib())
+        # #66: LIVE NON-MODEL BYTES -- the allocator growth of the build minus
+        # what of it is model (a runner's attention workspace, sampler and
+        # rotary buffers not registered as module buffers, ...). Positive only:
+        # a negative value would mean the model term exceeds the allocator
+        # growth, a finding about the measurement, not a booking term.
+        alloc_after = _live_allocated_mib()
+        target.other_live_mib = (
+            max(0.0, (alloc_after - self.alloc_before_mib) - target.resident_mib)
+            if (
+                alloc_after >= 0
+                and self.alloc_before_mib >= 0
+                and target.resident_mib >= 0
+            )
+            else -1.0
+        )
 
 
 def _iter_checkpoint_tensors(model_path: str, needle: str):

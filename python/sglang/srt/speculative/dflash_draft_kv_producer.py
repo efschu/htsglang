@@ -35,8 +35,8 @@ from typing import Dict, List, Optional, Sequence
 import torch
 
 from sglang.srt.speculative.draft_kv_producer import (
+    DraftBuildMeter,
     Weg2DraftRegistrationOffStage,
-    _cuda_free_mib,
     _draft_server_args,
     _live_weight_mib,
 )
@@ -254,26 +254,17 @@ class DFlashDraftKvProducer:
         self._rows = 0
         self._published = 0
         self._peak_mib = 0.0
-        self._free_before_mib = _cuda_free_mib()
-        # allocator view before the build: the NVML delta minus the allocator's
-        # reserved delta is context growth (kernel modules, cuBLAS/JIT
-        # workspaces) -- the fourth W11b instrument, measured not guessed.
-        try:
-            self._reserved_before_mib = torch.cuda.memory_reserved() / float(2**20)
-            self._allocated_before_mib = torch.cuda.memory_allocated() / float(2**20)
-        except Exception:  # noqa: BLE001 -- no CUDA context: not measured
-            self._reserved_before_mib = -1.0
-            self._allocated_before_mib = -1.0
-        self.context_growth_mib = 0.0
-        # allocator_cache_mib: reserved-but-free blocks the draft's load left
-        # in its (memory-saver) pool -- the W8 dequant scratch. Measured
-        # 2026-09-17 (xsn255, P last stage): live 2174 MiB, NVML delta 3072,
-        # context growth 0 -> ~900 MiB cache. Explained, named, never an
-        # 'unaccounted' remainder.
-        self.allocator_cache_mib = 0.0
-        # The fields Scheduler.maybe_init_draft_worker prints for every producer.
-        self.resident_mib = -1.0
-        self.nvml_delta_mib = -1.0
+        # #66 / weg2xsn417: the W11b build instruments, read by the SAME meter
+        # the NEXTN producer uses (draft_kv_producer.DraftBuildMeter) -- the
+        # scheduler's armed line prints them and the launcher's W11b adds them
+        # up. This handle used to carry its own two-term copy (context growth
+        # + allocator cache) of the pre-#66 formula; the armed line of the NF
+        # line printed -1 for every #66 term, and W11b refused xsn417 with
+        # 897.5 MiB 'unaccounted' -- the allocator cache the W8 draft load
+        # leaves behind (xsn411, same build: allocator_cache_mib=891.8,
+        # context growth 0.0, remainder 5.7 MiB live non-model bytes).
+        self._build_meter = DraftBuildMeter()
+        DraftBuildMeter.init_fields(self)
         self.head_released_mib = 0.0
         self.head_deferred = False
         self.embed_dtype = "n/a"
@@ -306,31 +297,20 @@ class DFlashDraftKvProducer:
     def load_resident_embedding(self, model_path: str) -> float:
         """A DFlash draft borrows the target's embedding only to embed the
         decode block; the producer embeds nothing. Nothing to load -- but the
-        launcher's W11/W11b accounting reads three instruments off the armed
-        line, the same three DraftKvProducer reports: the live bytes of the
-        draft (resident_mib), the NVML free delta across the build
-        (nvml_delta_mib) and the released head (0 here). A -1 delta is
-        'not measured' and refuses the boot (xsn253, W11b)."""
-        torch.cuda.empty_cache()
-        after = _cuda_free_mib()
-        if after >= 0 and self._free_before_mib >= 0:
-            self.nvml_delta_mib = self._free_before_mib - after
-        self.resident_mib = _live_weight_mib(self.draft_runner.model)
-        try:
-            reserved_after = torch.cuda.memory_reserved() / float(2**20)
-            allocated_after = torch.cuda.memory_allocated() / float(2**20)
-        except Exception:  # noqa: BLE001
-            reserved_after = allocated_after = -1.0
-        if (
-            self.nvml_delta_mib >= 0
-            and reserved_after >= 0
-            and self._reserved_before_mib >= 0
-        ):
-            reserved_delta = reserved_after - self._reserved_before_mib
-            self.context_growth_mib = max(0.0, self.nvml_delta_mib - reserved_delta)
-            if allocated_after >= 0 and self._allocated_before_mib >= 0:
-                allocated_delta = allocated_after - self._allocated_before_mib
-                self.allocator_cache_mib = max(0.0, reserved_delta - allocated_delta)
+        launcher's W11/W11b accounting reads the build instruments off the
+        armed line, measured by the one DraftBuildMeter both producers use:
+        the live bytes of the draft (resident_mib, parameters + buffers --
+        the draft's rotary cos/sin cache is a buffer, 128.2 MiB on
+        Qwen3.8-27B-DFlash2), the NVML free delta across the build, the
+        allocator cache it left (default_pool_inactive_mib, its tag-pool part
+        tag_pool_inactive_mib), what grew outside torch, the live non-model
+        bytes, and the card's free margin. The released head is 0 here. A -1
+        term is 'not measured' and W11b refuses it (xsn253, xsn417).
+        Measured BEFORE the chunk ring, the attention backend and the graphs
+        of this handle exist (alloc_memory_pool / init_attention_backends /
+        init_cuda_graphs run later), so none of those is in the build."""
+        meter = getattr(self, "_build_meter", None) or DraftBuildMeter.unmeasured()
+        meter.finish(self, resident_mib=lambda: _live_weight_mib(self.draft_runner.model))
         return 0.0
 
     def alloc_memory_pool(self, **kw):
