@@ -193,6 +193,35 @@ def test_the_hand_back_anchor_and_in_use_anchors_are_kept(tmp_path):
     assert pool.arena.evict_candidates(SLOTS) == [], "every anchor still referenced"
 
 
+def test_a_fork_keeps_its_anchor(tmp_path):
+    """User decision 24.09. point 2, "Forks bleiben" (added with the per-path
+    cap, Agent G): an anchor whose node has two children serves both branches
+    -- the chain moving past it on ONE branch does not make it inner."""
+    pool = _pool(tmp_path / "g.bin")
+    t, root = _tree(pool)
+    h = [_publish(pool, f"f-{i}") for i in range(3)]
+    fork = _node(root, h[0])
+    _node(fork, h[1])                                   # branch 1
+    fork._weg2_fork = True                              # set by the insert of branch 2
+    assert _release(t, _node(fork, h[2]), pool) is False  # branch 2's anchor acked
+    assert fork.component_data[ComponentType.MAMBA].host_value is not None
+    assert pool.arena.evict_candidates(SLOTS) == [], "the fork's anchor stays referenced"
+
+
+def test_a_child_only_one_rank_has_does_not_make_a_fork(tmp_path):
+    """On group P only PP0 reads the store: a host-prefetched second child may
+    hang below a node on PP0 alone. The fork is what the DEVICE insert marked
+    (same step on every rank), not `len(children)` -- else PP0 would keep an
+    anchor its peers release."""
+    pool = _pool(tmp_path / "h.bin")
+    t, root = _tree(pool)
+    h = [_publish(pool, f"g-{i}") for i in range(2)]
+    n1 = _node(root, h[0])
+    _node(n1, None)                                     # PP0's prefetched host chain
+    assert _release(t, _node(n1, h[1]), pool) is True
+    assert n1.component_data[ComponentType.MAMBA].host_value is None
+
+
 def test_a_full_arena_drops_released_inner_anchors_never_the_end_anchor(tmp_path):
     pool = _pool(tmp_path / "c.bin")
     t, root = _tree(pool)

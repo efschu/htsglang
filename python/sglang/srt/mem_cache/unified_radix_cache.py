@@ -83,6 +83,7 @@ from sglang.srt.mem_cache.producer_phase_census import (
     note_prefetch_adopted as _pp_note_prefetch_adopted,
     note_walk_node as _pp_note_walk_node,
 )
+from sglang.srt.mem_cache.mamba_ckpt_utils import weg2_max_states_per_path
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
     MambaLoadBackUnservable,
@@ -1047,6 +1048,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # P-HOST-OVERLAP: a deferred chunk publish names nodes of the tree being
         # destroyed; it must not outlive it (empty unless the mode is on).
         self._weg2_deferred_chunk_publish = []
+        # 27B line (24.09.): the per-path cap's waiting releases name nodes of
+        # the tree being destroyed, whose copies the release above and the pool
+        # resets below take back -- releasing them later would free twice.
+        self._weg2_cap_deferred = {}
+        self._weg2_cap_tail = None
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.priority = -sys.maxsize
         self.root_node.key = RadixKey(array("q"), None)
@@ -1743,12 +1749,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             insert_params.key = radix_key
             insert_params.value = values
+            self._weg2_cap_tail = None
             result = self.insert(insert_params)
 
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
             if _WEG2_END_ANCHOR:
                 self._weg2_note_end_anchor(req, token_ids)
+            # 27B line (24.09.): the per-path cap runs AFTER the #1481 mark, so
+            # the hand-back anchor N-1 is already exempt when the final node's
+            # insert pushes the path over the bound.
+            self._weg2_cap_after_insert()
             self._weg2_handoff_write(req, radix_key)
             self._weg2_publish_at_retain(req, radix_key)
         else:
@@ -1877,6 +1888,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         insert_params.key = radix_key
         insert_params.value = values
+        self._weg2_cap_tail = None
         result = self.insert(insert_params)
 
         # Match prefix
@@ -1930,6 +1942,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 insert_result=result,
                 insert_params=insert_params,
             )
+        # 27B line (24.09.): the per-path cap, after the request moved its lock
+        # to the new anchor (the old one is free to go) and before the publish
+        # (a capped anchor not yet in the arena keeps its device copy until the
+        # publish took it -- `_weg2_cap_release`).
+        self._weg2_cap_after_insert()
         if _weg2_p_overlap.p_host_overlap_on():
             # P-HOST-OVERLAP (managers/weg2_p_overlap.py, item 3): the publish
             # leaves the plan and runs right after the NEXT forward's launch
@@ -2437,6 +2454,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # only a tombstone for this span (e.g. the whole leaf is outside the SWA
         # window). Materialize it anyway so the Full KV stays cacheable.
         if len(key):
+            if node.children and node is not self.root_node:
+                # 27B line (24.09.): THIS insert makes `node` a fork. Marked
+                # here, at the device insert every rank runs at the same step,
+                # rather than read later off `len(children)`: on group P only
+                # PP0 reads the store, so a host-prefetched child can exist on
+                # one PP rank and not on its peers. The per-path cap and Agent
+                # B's inner release keep a fork's anchor ("Forks bleiben").
+                node._weg2_fork = True
             target_node = self._add_new_node(node, key, value, priority=priority)
             is_new_leaf = True
         else:
@@ -3433,9 +3458,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         without a reference could be reused under it.
 
         Kept: an `_weg2_end_anchor` node (the hand-back; held across the reset
-        by `_weg2_carrier_hold`), a host-locked or write-pending one. Host
-        bookkeeping only (one `free`, no sync, no copy). SGLANG_WEG2_GROUP=P
-        only, armed by SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE=1 (default off)."""
+        by `_weg2_carrier_hold`), a FORK (`_weg2_fork`, set by the device
+        insert that gave the node its second child -- user decision 24.09.
+        point 2, "Forks bleiben": its state serves every branch below it;
+        added with the per-path cap, Agent G), a host-locked or write-pending
+        one. Host bookkeeping only (one `free`, no sync, no copy).
+        SGLANG_WEG2_GROUP=P only, armed by
+        SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE=1 (default off)."""
         if not _weg2_inner_anchor_release_on():
             return False
         mc = self.components.get(ComponentType.MAMBA)
@@ -3452,6 +3481,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         why = None
         if getattr(a, "_weg2_end_anchor", False):
             why = "end_anchor"
+        elif getattr(a, "_weg2_fork", False):
+            why = "fork"
         elif cd.host_lock_ref > 0:
             why = "host_locked"
         elif getattr(a, "write_through_pending_id", None) is not None:
@@ -3502,6 +3533,180 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         "of the previous one (group P, one phase)", held, released)
         return released
 
+    # -- 27B line, 24.09.: the per-path cap (user decision point 2) ------------
+
+    def _weg2_cap_after_insert(self) -> int:
+        """Run the per-path cap on the node the insert just anchored (noted by
+        `MambaComponent._weg2_note_anchored`; None when the insert anchored
+        nothing or the cap is off). Returns the anchors capped."""
+        tail = getattr(self, "_weg2_cap_tail", None)
+        self._weg2_cap_tail = None
+        if tail is None:
+            return 0
+        return self._weg2_cap_path_states(tail)
+
+    def _weg2_cap_path_states(self, tail) -> int:
+        """UPSTREAM --mamba-max-states-per-path (1417345f5f,
+        `MambaComponent._evict_excess_path_states`) on this fork's tree:
+        after an insert anchored `tail`, the shallowest eligible anchors of the
+        root-to-tail path beyond the cap are taken; their KV stays.
+        SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH (group P, default off).
+
+        Kept, as upstream: the tail, FORKS ("Forks bleiben"; `_weg2_fork`, set
+        by the device insert that gave the node its second child -- upstream
+        reads `len(children) != 1`, which on group P is rank-local: only PP0
+        reads the store, so a host-prefetched child can hang on PP0 alone), and
+        -- this fork's hand-back -- the #1481 END anchor (`_weg2_end_anchor`:
+        it stays until D took it over, user decision point 1;
+        `_weg2_carrier_hold` holds it across the reset).
+
+        THE DECISION USES RANK-UNIFORM FACTS ONLY, AND THAT IS THE DEVIATION
+        FROM UPSTREAM. Upstream also skips locked nodes, and its locks
+        include the write-through's, which this fork releases at a RANK-LOCAL
+        ack (#737: acks are drained rank-locally). Skipping on them would let
+        one PP rank cap an anchor its peer keeps -- a tree divergence the
+        forwarded admission turns into a `local < told` shortfall
+        (raenge-nie-uneins: no mechanism may be ABLE to produce that). So the
+        selection reads only the path, the fork mark, the #1481 mark and the
+        holder flag `_weg2_anchored` (all three set by inserts, the same step
+        on every rank), and a taken node is REFUSED AS A RESUME ANCHOR at once
+        by the mamba validator (`_weg2_capped`) on every rank. The locks
+        protect the COPIES instead (`_weg2_cap_release`): a locked, host-
+        locked, write-pending or not-yet-published anchor keeps its device
+        slot and arena row until it is free, then gives them back
+        (`_weg2_cap_drain` at every ack and every cap run). "Gesperrte Knoten
+        und write-pending bleiben" therefore holds for the bytes; what the
+        cap takes at once is the anchor's eligibility for NEW matches.
+
+        Where "removed" leads here: the device slot goes back to the pool and
+        the arena reference is dropped -- the arena keeps the COMPLETE state
+        (findable by stem for D's read and a later phase's prefetch) until a
+        claim needs the slot (A's `_evict_for_claim`, no disk I/O). That is
+        this fork's "host backup retained".
+
+        Host bookkeeping only: no sync, no copy (the device free is the
+        allocator's index_fill_ under P-NOSYNC). Returns the anchors taken."""
+        cap = weg2_max_states_per_path()
+        if cap <= 0 or tail is None or tail is self.root_node:
+            return 0
+        mc = self.components.get(ComponentType.MAMBA)
+        if mc is None:
+            return 0
+        self._weg2_cap_drain()
+        holders = []
+        node = tail
+        while node is not None and node is not self.root_node:
+            if getattr(node, "_weg2_anchored", False):
+                holders.append(node)
+            node = node.parent
+        excess = len(holders) - cap
+        if excess <= 0:
+            return 0
+        taken = []
+        kept_fork = kept_end = 0
+        for node in reversed(holders):  # shallowest first
+            if excess <= 0 or node is tail:
+                break
+            if getattr(node, "_weg2_fork", False):
+                kept_fork += 1
+                continue
+            if getattr(node, "_weg2_end_anchor", False):
+                kept_end += 1
+                continue
+            node._weg2_anchored = False
+            node._weg2_capped = True
+            taken.append(node)
+            excess -= 1
+        deferred = getattr(self, "_weg2_cap_deferred", None)
+        if deferred is None:
+            deferred = self._weg2_cap_deferred = {}
+        released = 0
+        for node in taken:
+            if self._weg2_cap_release(node, mc):
+                released += 1
+            else:
+                deferred[node.id] = node
+        cls = UnifiedRadixCache
+        n = getattr(cls, "_weg2_cap_n", 0) + 1
+        cls._weg2_cap_n = n
+        cls._weg2_capped_total = getattr(cls, "_weg2_capped_total", 0) + len(taken)
+        if n <= 16 or n % 256 == 0:
+            logger.info(
+                "WEG2 PATH-CAP n=%d tail=%s holders=%d cap=%d taken=%d released_now=%d "
+                "waiting=%d kept_fork=%d kept_end=%d taken_total=%d (group P: the "
+                "shallowest anchors beyond the cap are no resume points any more; their "
+                "copies go back when free, the KV stays)",
+                n, getattr(tail, "id", "?"), len(holders), cap, len(taken), released,
+                len(deferred), kept_fork, kept_end, cls._weg2_capped_total,
+            )
+        return len(taken)
+
+    @staticmethod
+    def _weg2_node_attached(node) -> bool:
+        parent = getattr(node, "parent", None)
+        if parent is None:
+            return False
+        return any(child is node for child in parent.children.values())
+
+    def _weg2_cap_release(self, node, mc) -> bool:
+        """Give back the copies of an anchor the cap took: its device slot and
+        its arena reference. False = not yet (the caller keeps it waiting):
+        locked (a request or the write-through still reads the slot),
+        host-locked (a load-back reads the row), write-pending (the D->H copy
+        is in flight, the arena row un-acked), or a device-only state whose
+        node was never published (the arena copy comes first -- the chunk
+        publish is on its way). True = done, or nothing left to give back (the
+        LRU, Agent B's release or a leaf eviction took the copies already)."""
+        cd = node.component_data[ComponentType.MAMBA]
+        if cd.value is None and cd.host_value is None:
+            return True
+        if not self._weg2_node_attached(node):
+            # Detached from the tree: whoever detached it owns what is left. A
+            # named leak, never a second free of a slot that may be reused.
+            k = getattr(UnifiedRadixCache, "_weg2_cap_detached_n", 0) + 1
+            UnifiedRadixCache._weg2_cap_detached_n = k
+            if k <= 8 or k % 256 == 0:
+                logger.warning("WEG2 PATH-CAP node=%s left the tree with copies still set "
+                               "(value=%s host=%s): not released here (n=%d)",
+                               getattr(node, "id", "?"), cd.value is not None,
+                               cd.host_value is not None, k)
+            return True
+        if cd.lock_ref > 0 or cd.host_lock_ref > 0:
+            return False
+        if getattr(node, "write_through_pending_id", None) is not None:
+            return False
+        if (cd.value is not None and cd.host_value is None
+                and self.cache_controller is not None
+                and not node.backuped and not getattr(node, "l3_present", False)):
+            return False
+        try:
+            self._evict_component_and_detach_lru(node, mc, target=EvictLayer.ALL, tracker=None)
+        except Exception as exc:  # noqa: BLE001 -- the copies stay, the anchor stays taken
+            logger.warning("WEG2 PATH-CAP release raised on node %s: %r (kept waiting)",
+                           getattr(node, "id", "?"), exc)
+            return False
+        self._update_evictable_leaf_sets(node)
+        return True
+
+    def _weg2_cap_drain(self) -> int:
+        """Release the copies of capped anchors that were waiting and are free
+        now. Called at every cap run and after every write-through ack; empty
+        (and free) unless the cap is armed. Returns the releases done."""
+        deferred = getattr(self, "_weg2_cap_deferred", None)
+        if not deferred:
+            return 0
+        mc = self.components.get(ComponentType.MAMBA)
+        if mc is None:
+            deferred.clear()
+            return 0
+        done = [
+            nid for nid, node in list(deferred.items())
+            if not getattr(node, "_weg2_capped", False) or self._weg2_cap_release(node, mc)
+        ]
+        for nid in done:
+            deferred.pop(nid, None)
+        return len(done)
+
     _1472_issued_at: dict = {}
 
     def _finish_write_through_ack(self, ack_id: int) -> None:
@@ -3525,6 +3730,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 direct.add(id(node))
         if lock_params is not None:
             self.dec_lock_ref(lock_node, lock_params)
+        # 27B line (24.09.): a capped anchor waiting for exactly this write
+        # (its lock, its pending id, its publish) is free now.
+        self._weg2_cap_drain()
         # #810: end of the ADMITTED phase. The device->host copy has landed, so
         # the admission taken in `write_backup` is retired here -- before the
         # storage hand-off below, which takes its own charge per operation.
