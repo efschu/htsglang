@@ -286,7 +286,9 @@ class TestInstrument(unittest.TestCase):
         path = os.path.join(os.path.dirname(inspect.getsourcefile(ppm)), "..", "layers",
                             "attention", "flashinfer_backend.py")
         text = open(os.path.abspath(path)).read()
-        for call in ("wrapper_ragged.begin_forward(", "wrapper_paged.begin_forward("):
+        # the plan call is `_plan_r(` / `_plan_p(`: the stock begin_forward, or
+        # the P-NOSYNC one-plan-ahead partial (test_weg2_p_nosync_launch.py)
+        for call in ("_plan_r(", "_plan_p("):
             self.assertEqual(text.count(call), 1)
             i = text.index(call)
             head = text[text.rindex("\n", 0, text.rindex("\n", 0, i)):i]
