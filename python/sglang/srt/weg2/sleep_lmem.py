@@ -31,9 +31,20 @@ of the dormant hold, a lane copy) grows it back to exactly what that kernel
 needs -- that is the driver's normal path, not an error.
 
 THE RESTORE. At the wake, before the kv_cache fit check reads the card, the
-limit goes back to the value saved at the park, so the woken rank runs its
-first graph replay with the reservation it had before the sleep. The cost is
-one ``cuCtxSetLimit`` (a device-idle wait plus one allocation), printed in ms.
+limit goes back up, so the woken rank runs its first graph replay with the
+reservation it needs. The cost is one ``cuCtxSetLimit`` (a device-idle wait
+plus one allocation), printed in ms.
+
+H47 (fnFL2x151): the value saved at the park is a HIGH-WATER, not a need -- one
+launch of the arena run-write kernel (229376-B element, 7 KiB LocalStorage per
+thread) had grown PP0 to 7104 B, and the restore put 1769 MiB back at every
+wake. The target is therefore :func:`wake_target_stack`: max(boot base, the
+largest stack of a kernel this phase runs) when that is known; otherwise the
+saved value only up to :data:`RESTORE_CAP_STACK_BYTES`, else the boot base and
+a ``WEG2-WAKE-LMEM restore SKIPPED saved=<B> reason=oversized`` line -- the
+driver grows the reservation itself if a kernel of the phase needs more. The
+boot base is the stack the FIRST park of the process found (1248 B on the
+5090 PP0 of fnFL2), capped the same way (above it: the driver default).
 
 Everything here is fail-soft: a refused park leaves the context as it was, a
 refused restore leaves the driver's on-demand growth, and both say so on the
@@ -52,6 +63,11 @@ import msgspec
 CU_LIMIT_STACK_SIZE = 0x00
 #: Rungs tried at the park, lowest first; the first one the driver accepts wins.
 PARK_STACK_LADDER: Tuple[int, ...] = (0, 16, 256)
+#: The driver's default per-thread stack (the base when no park saw a sane one).
+DRIVER_DEFAULT_STACK_BYTES = 1024
+#: H47: a saved stack above this is a high-water of one oversized kernel, not
+#: restored blindly (the stack's own kernels: <= 1248 B measured on sm_120).
+RESTORE_CAP_STACK_BYTES = 2048
 _MIB = 1 << 20
 
 NvmlReader = Callable[[], Optional[int]]
@@ -110,6 +126,8 @@ class LmemPark(msgspec.Struct, frozen=True, kw_only=True):
     saved_stack_bytes: int
     parked_stack_bytes: int
     threads: int
+    #: H47: the boot's base stack (first park of the process), the wake's floor.
+    base_stack_bytes: int = DRIVER_DEFAULT_STACK_BYTES
     nvml_before: Optional[int] = None
     nvml_after: Optional[int] = None
     ms: float = 0.0
@@ -141,6 +159,20 @@ class LmemRestore(msgspec.Struct, frozen=True, kw_only=True):
     nvml_after: Optional[int] = None
     ms: float = 0.0
     refused: str = ""
+    #: H47: the saved high-water NOT restored, and why ("" = restored as saved).
+    skipped_saved_bytes: int = 0
+    skip_reason: str = ""
+
+    def skip_line(self) -> str:
+        """The H47 line for a saved high-water the wake did not put back ("" if none)."""
+        if not self.skip_reason:
+            return ""
+        return (
+            f"WEG2-WAKE-LMEM restore SKIPPED saved={self.skipped_saved_bytes} "
+            f"reason={self.skip_reason} target={self.restored_stack_bytes} B "
+            f"(lmem {lmem_mib(stack_bytes=self.skipped_saved_bytes, threads=self.threads):.0f} MiB "
+            f"not reserved; the driver grows it on demand if a kernel of this phase needs it)"
+        )
 
     def format_line(self, *, park: LmemPark) -> str:
         grown = self.found_stack_bytes - park.parked_stack_bytes
@@ -158,20 +190,50 @@ class LmemRestore(msgspec.Struct, frozen=True, kw_only=True):
         return head
 
 
+def boot_base_stack(saved: int, cap: int = RESTORE_CAP_STACK_BYTES) -> int:
+    """H47: the base a first park derives from the stack it found -- that stack
+    when it is sane (<= cap), else the driver default."""
+    saved = int(saved)
+    return saved if 0 < saved <= int(cap) else DRIVER_DEFAULT_STACK_BYTES
+
+
+def wake_target_stack(
+    *,
+    saved: int,
+    base: int,
+    phase_kernel_stack: Optional[int] = None,
+    cap: int = RESTORE_CAP_STACK_BYTES,
+) -> Tuple[int, str]:
+    """H47: the stack the wake restores, and a skip reason ("" = none).
+
+    Known largest kernel stack of the phase -> max(base, that). Unknown -> the
+    saved value when it is <= cap, else the base ("oversized")."""
+    base = int(base)
+    if phase_kernel_stack is not None:
+        return max(base, int(phase_kernel_stack)), ""
+    if int(saved) <= int(cap):
+        return int(saved), ""
+    return base, "oversized"
+
+
 def park_lmem(
     *,
     driver: StackLimitDriver,
     threads: int,
     nvml_bytes: NvmlReader,
     ladder: Sequence[int] = PARK_STACK_LADDER,
+    base_stack_bytes: Optional[int] = None,
 ) -> LmemPark:
-    """Lower the stack limit to the first rung the driver accepts. Never raises."""
+    """Lower the stack limit to the first rung the driver accepts. Never raises.
+    ``base_stack_bytes``: the boot base from an earlier park; None = this is the
+    first park, the base is derived from the stack found (:func:`boot_base_stack`)."""
     t0 = time.perf_counter()
     try:
         saved = driver.get_stack_bytes()
     except Exception as exc:  # noqa: BLE001 -- a refused park leaves the context as it was
         return LmemPark(saved_stack_bytes=0, parked_stack_bytes=0, threads=threads,
                         refused=f"get: {type(exc).__name__}: {exc}")
+    base = int(base_stack_bytes) if base_stack_bytes else boot_base_stack(saved)
     before = nvml_bytes()
     parked, errors = _first_accepted_rung(driver=driver, saved=saved, ladder=ladder)
     after = nvml_bytes()
@@ -179,9 +241,10 @@ def park_lmem(
     if parked is None:
         why = "; ".join(errors) if errors else f"no rung below the saved {saved} B"
         return LmemPark(saved_stack_bytes=saved, parked_stack_bytes=saved, threads=threads,
-                        nvml_before=before, nvml_after=after, ms=ms, refused=why)
+                        base_stack_bytes=base, nvml_before=before, nvml_after=after, ms=ms,
+                        refused=why)
     return LmemPark(saved_stack_bytes=saved, parked_stack_bytes=parked, threads=threads,
-                    nvml_before=before, nvml_after=after, ms=ms)
+                    base_stack_bytes=base, nvml_before=before, nvml_after=after, ms=ms)
 
 
 def _first_accepted_rung(
@@ -200,29 +263,40 @@ def _first_accepted_rung(
 
 
 def restore_lmem(
-    *, driver: StackLimitDriver, park: LmemPark, nvml_bytes: NvmlReader
+    *,
+    driver: StackLimitDriver,
+    park: LmemPark,
+    nvml_bytes: NvmlReader,
+    phase_kernel_stack_bytes: Optional[int] = None,
 ) -> LmemRestore:
-    """Put the saved limit back unless the context already holds at least that."""
+    """Raise the limit to :func:`wake_target_stack` unless the context already
+    holds at least that (a wake never lowers it)."""
     t0 = time.perf_counter()
+    target, skip = wake_target_stack(saved=park.saved_stack_bytes, base=park.base_stack_bytes,
+                                     phase_kernel_stack=phase_kernel_stack_bytes)
+    skipped = park.saved_stack_bytes if skip else 0
     try:
         found = driver.get_stack_bytes()
     except Exception as exc:  # noqa: BLE001
         return LmemRestore(found_stack_bytes=park.parked_stack_bytes,
                            restored_stack_bytes=park.parked_stack_bytes, threads=park.threads,
-                           refused=f"get: {type(exc).__name__}: {exc}")
-    if found >= park.saved_stack_bytes:
+                           refused=f"get: {type(exc).__name__}: {exc}",
+                           skipped_saved_bytes=skipped, skip_reason=skip)
+    if found >= target:
         return LmemRestore(found_stack_bytes=found, restored_stack_bytes=found,
-                           threads=park.threads, ms=(time.perf_counter() - t0) * 1000.0)
+                           threads=park.threads, ms=(time.perf_counter() - t0) * 1000.0,
+                           skipped_saved_bytes=skipped, skip_reason=skip)
     before = nvml_bytes()
     try:
-        driver.set_stack_bytes(park.saved_stack_bytes)
+        driver.set_stack_bytes(target)
         restored = driver.get_stack_bytes()
         refused = ""
     except Exception as exc:  # noqa: BLE001
         restored, refused = found, f"set: {type(exc).__name__}: {exc}"
     return LmemRestore(found_stack_bytes=found, restored_stack_bytes=restored,
                        threads=park.threads, nvml_before=before, nvml_after=nvml_bytes(),
-                       ms=(time.perf_counter() - t0) * 1000.0, refused=refused)
+                       ms=(time.perf_counter() - t0) * 1000.0, refused=refused,
+                       skipped_saved_bytes=skipped, skip_reason=skip)
 
 
 def format_residue_posts(

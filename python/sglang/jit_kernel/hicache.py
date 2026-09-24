@@ -12,9 +12,50 @@ if TYPE_CHECKING:
 
 DEFAULT_BLOCK_QUOTA = 2
 
+#: fnFL2 H47: above this many bytes of per-thread element storage the kernel's
+#: LocalStorage spills to local memory, and the driver grows the context's LMEM
+#: reservation to it for EVERY resident thread and keeps it. Measured: a
+#: 229376-B element (unroll 1, 7168 B/thread) -> stack 7104 B, 1769 MiB on a 5090.
+LOCAL_BYTES_WARN_THRESHOLD = 256
+
+
+def local_bytes_per_thread(element_size: int, unroll: int) -> int:
+    """hicache.cuh: kNumThreads = 32 / unroll threads share one element, each
+    holds element / kNumThreads bytes in its LocalStorage."""
+    return int(element_size) * int(unroll) // 32
+
+
+def lmem_warning_line(element_size: int, unroll: int, threads: int | None) -> str | None:
+    """The HICACHE-JIT warning for a module whose per-thread storage exceeds
+    :data:`LOCAL_BYTES_WARN_THRESHOLD` (None below it). ``threads`` = SMs x
+    max resident threads per SM of the card (None = unknown, printed n/a)."""
+    local = local_bytes_per_thread(element_size, unroll)
+    if local <= LOCAL_BYTES_WARN_THRESHOLD:
+        return None
+    mib = "n/a" if not threads else f"{local * int(threads) / (1 << 20):.0f}"
+    return (
+        f"HICACHE-JIT element={int(element_size)} unroll={int(unroll)} "
+        f"local_bytes_per_thread={local} > {LOCAL_BYTES_WARN_THRESHOLD}: "
+        f"LMEM-Reservierung {mib} MiB je Karte (the driver keeps it; split the "
+        f"element, e.g. arena_write.RUN_ELEMENT_BYTES)"
+    )
+
+
+def _resident_threads() -> int | None:
+    try:
+        import torch
+
+        p = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return int(p.multi_processor_count) * int(p.max_threads_per_multi_processor)
+    except Exception:  # noqa: BLE001 -- a warning never fails a build
+        return None
+
 
 @cache_once_per_arch
 def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> Module:
+    line = lmem_warning_line(element_size, unroll, _resident_threads())
+    if line is not None:
+        logging.getLogger(__name__).warning("%s", line)
     args = make_cpp_args(
         element_size,
         unroll,

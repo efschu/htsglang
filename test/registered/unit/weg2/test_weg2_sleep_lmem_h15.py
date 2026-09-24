@@ -162,6 +162,7 @@ def test_the_residue_posts_carry_before_and_after_per_post():
 def _manager_fake(drv):
     return types.SimpleNamespace(
         _weg2_lmem_park=None,
+        _weg2_lmem_base_stack=0,
         _weg2_sm_threads=lambda: THREADS_5090,
         _weg2_nvml_self_bytes=drv.nvml,
     )
@@ -219,3 +220,76 @@ def test_park_runs_before_the_census_and_restore_before_the_kv_fit():
     i_fit = src.index("kv_resume_fit_refusal(_kv_free", i_restore)
     assert i_restore < i_pre < i_fit
     assert "_weg2_lmem_park: Any = None" in src  # slots dataclass field
+    assert "_weg2_lmem_base_stack: int = 0" in src  # H47, same rule
+
+
+# -- H47: the wake restores a need, not a high-water ---------------------------
+#: fnFL2x151 PP0: boot base 1248 B (first park), 7104 B after one launch of the
+#: arena run-write kernel (229376-B element), restored at every wake (1769 MiB).
+PP0_BASE = 1248
+PP0_HIGH_WATER = 7104
+
+
+def test_wake_target_rule():
+    # known largest kernel stack of the phase: max(base, that)
+    assert sl.wake_target_stack(saved=PP0_HIGH_WATER, base=PP0_BASE, phase_kernel_stack=1000) == (PP0_BASE, "")
+    assert sl.wake_target_stack(saved=PP0_HIGH_WATER, base=PP0_BASE, phase_kernel_stack=3008) == (3008, "")
+    # unknown: the saved value up to the cap, else the base and "oversized"
+    assert sl.wake_target_stack(saved=1504, base=1504) == (1504, "")
+    assert sl.wake_target_stack(saved=2048, base=PP0_BASE) == (2048, "")
+    assert sl.wake_target_stack(saved=PP0_HIGH_WATER, base=PP0_BASE) == (PP0_BASE, "oversized")
+    # the boot base: the first park's stack when sane, else the driver default
+    assert sl.boot_base_stack(PP0_BASE) == PP0_BASE
+    assert sl.boot_base_stack(PP0_HIGH_WATER) == sl.DRIVER_DEFAULT_STACK_BYTES == 1024
+    assert sl.boot_base_stack(0) == 1024
+
+
+def test_an_oversized_high_water_is_not_restored_and_says_so():
+    drv = _Driver(stack=PP0_BASE, threads=THREADS_5090, base=0)
+    first = sl.park_lmem(driver=drv, threads=THREADS_5090, nvml_bytes=drv.nvml)
+    assert first.base_stack_bytes == PP0_BASE
+    sl.restore_lmem(driver=drv, park=first, nvml_bytes=drv.nvml)
+    assert drv.stack == PP0_BASE
+    drv.stack = PP0_HIGH_WATER  # the run-write kernel grew it during the phase
+    park = sl.park_lmem(driver=drv, threads=THREADS_5090, nvml_bytes=drv.nvml,
+                        base_stack_bytes=first.base_stack_bytes)
+    assert (park.saved_stack_bytes, park.base_stack_bytes) == (PP0_HIGH_WATER, PP0_BASE)
+    rec = sl.restore_lmem(driver=drv, park=park, nvml_bytes=drv.nvml)
+    assert rec.refused == "" and drv.stack == PP0_BASE and rec.restored_stack_bytes == PP0_BASE
+    assert round(sl.lmem_mib(stack_bytes=drv.stack, threads=THREADS_5090)) == 311
+    line = rec.skip_line()
+    assert line.startswith(f"WEG2-WAKE-LMEM restore SKIPPED saved={PP0_HIGH_WATER} reason=oversized")
+    assert "1769 MiB not reserved" in line
+
+
+def test_a_known_phase_kernel_stack_sets_the_target():
+    drv = _Driver(stack=PP0_HIGH_WATER, threads=THREADS_5090, base=0)
+    park = sl.park_lmem(driver=drv, threads=THREADS_5090, nvml_bytes=drv.nvml, base_stack_bytes=PP0_BASE)
+    rec = sl.restore_lmem(driver=drv, park=park, nvml_bytes=drv.nvml, phase_kernel_stack_bytes=3008)
+    assert drv.stack == 3008 and rec.skip_line() == ""
+
+
+def test_a_sane_saved_stack_is_restored_as_before():
+    drv = _Driver(stack=1504, threads=THREADS_3080, base=0)
+    park = sl.park_lmem(driver=drv, threads=THREADS_3080, nvml_bytes=drv.nvml)
+    rec = sl.restore_lmem(driver=drv, park=park, nvml_bytes=drv.nvml)
+    assert drv.stack == 1504 and rec.skip_line() == ""
+
+
+def test_the_manager_keeps_the_first_parks_base_and_logs_the_skip(mgr_cls, monkeypatch):
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    warned: list = []
+    monkeypatch.setattr(wu.logger, "warning", lambda fmt, *a: warned.append(fmt % a))
+    drv = _Driver(stack=PP0_BASE, threads=THREADS_5090, base=0)
+    monkeypatch.setattr(sl, "CudaDriverStackLimit", lambda: drv)
+    fake = _manager_fake(drv)
+    mgr_cls._weg2_park_lmem_at_sleep(fake)
+    assert fake._weg2_lmem_base_stack == PP0_BASE
+    mgr_cls._weg2_restore_lmem_at_wake(fake)
+    drv.stack = PP0_HIGH_WATER
+    mgr_cls._weg2_park_lmem_at_sleep(fake)
+    assert fake._weg2_lmem_base_stack == PP0_BASE  # a grown stack never becomes the base
+    mgr_cls._weg2_restore_lmem_at_wake(fake)
+    assert drv.stack == PP0_BASE
+    assert any("restore SKIPPED saved=7104 reason=oversized" in w for w in warned)

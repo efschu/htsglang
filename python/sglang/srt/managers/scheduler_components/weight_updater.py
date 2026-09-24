@@ -700,6 +700,8 @@ class SchedulerWeightUpdaterManager:
     #: H15: the local-memory park of the last complete sleep (weg2/sleep_lmem.py
     #: LmemPark), None once the wake restored it. slots=True: declared here.
     _weg2_lmem_park: Any = None
+    #: H47: the boot's base stack (bytes) from the first park; 0 = no park yet.
+    _weg2_lmem_base_stack: int = 0
     #: H25: the draft's pinned host image (weg2/draft_park.DraftHostPark),
     #: created at the first park and reused for the life of the process.
     _weg2_draft_park: Any = None
@@ -1787,11 +1789,14 @@ class SchedulerWeightUpdaterManager:
                 driver=CudaDriverStackLimit(),
                 threads=self._weg2_sm_threads(),
                 nvml_bytes=self._weg2_nvml_self_bytes,
+                base_stack_bytes=self._weg2_lmem_base_stack or None,
             )
         except Exception as exc:  # noqa: BLE001 -- an unparked context is the old state
             logger.info("WEG2-SLEEP-LMEM n/a (%s: %s)", type(exc).__name__, str(exc)[:160])
             return
         self._weg2_lmem_park = park
+        if not park.refused:
+            self._weg2_lmem_base_stack = park.base_stack_bytes
         logger.info("WEG2-SLEEP-LMEM %s", park.format_post())
 
     def _weg2_draft_park_armed(self) -> bool:
@@ -1994,6 +1999,8 @@ class SchedulerWeightUpdaterManager:
             logger.warning("WEG2-WAKE-LMEM n/a (%s: %s)", type(exc).__name__, str(exc)[:160])
             return
         (logger.warning if rec.refused else logger.info)("%s", rec.format_line(park=park))
+        if rec.skip_line():
+            logger.warning("%s", rec.skip_line())
 
     def _weg2_residue_posts(self) -> str:
         """H15: the per-post split of the sleep residue that is readable in-process.
