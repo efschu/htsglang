@@ -3049,11 +3049,13 @@ class Scheduler(
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
-        # Wait for the prev forward to finish reading the shared buffers this
-        # iter's schedule will overwrite. Fast path: wait on the read-done event
+        # upstream #31687: called right after each run_batch launch (device
+        # lane, spill lane, disagg overlap loops): order later schedule_stream
+        # work (result processing, next iteration's writes) behind the
+        # forward's shared-buffer reads. Fast path: wait on the read-done event
         # the forward published after its snapshot (non-spec: decode graph;
-        # spec: draft_extend), then clear it. Else fall back to whole-forward
-        # wait_stream.
+        # spec: draft_extend / DFlash verify), then clear it. Else fall back to
+        # whole-forward wait_stream.
         if not self._war_barrier_enabled:
             return
         # #616 bisection arm: SGLANG_WAR_BARRIER_FASTPATH=0 forces the
@@ -3158,7 +3160,11 @@ class Scheduler(
             # (staged D2H + event query), no-op unless the guard is armed.
             index_race_guard.poll()
 
-            self._apply_war_barrier()
+            # upstream #31687: the WAR barrier moved from here to right after
+            # each run_batch launch (below), so the result processing of the
+            # PREVIOUS batch -- which runs after this iteration's launch -- is
+            # ordered behind the forward's shared-buffer reads too, not only
+            # the next iteration's schedule writes.
 
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
@@ -3191,6 +3197,11 @@ class Scheduler(
                 if self.idle_sleeper is not None:
                     self.idle_sleeper.reset()
                 batch_result = self.run_batch(batch)
+                # upstream #31687: fence result processing (and the next
+                # iteration's writes) behind THIS forward's shared reads. Also
+                # consumes this forward's read-done event before a concurrent
+                # spill forward (below) can publish its own on the same runner.
+                self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
                 self._weg2_post_wake_pass_log(batch)  # Wake-Parallel item 2
             else:
@@ -16231,6 +16242,14 @@ class Scheduler(
             self.batch_record_ct = self._spill_record_ct
         try:
             spill_result = self.run_batch(spill_batch)
+            # upstream #31687, spill lane: the same barrier right after the
+            # launch, still inside the swap -- the fast path waits on the
+            # read-done event the SPILL forward published, the fallback on
+            # `self.forward_stream`, which is spill_stream here. The device
+            # forward's event was already consumed by the barrier behind the
+            # device run_batch, so the two lanes' events never overwrite one
+            # another unconsumed.
+            self._apply_war_barrier()
             # Delay-sample (spec V2) must run on the spill stream too; a no-op
             # for non-spec (delay_sample_func is None). Kept inside the swap so
             # forward_stream_ctx is still spill_stream.
