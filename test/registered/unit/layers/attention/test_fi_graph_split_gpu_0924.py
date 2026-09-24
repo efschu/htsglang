@@ -6,12 +6,21 @@ instead, see fi_jit_cache_check.py):
   PATH=/usr/local/cuda/bin:/usr/bin:/bin /root/.claude/jobs/1ab4cd30/tmp/test27b.sh \
   env PYTHONPATH=<tree>/python /spinning/htsglang-gpu/.venv/bin/python -m pytest -q -s \
   -p no:cacheprovider test/registered/unit/layers/attention/test_fi_graph_split_gpu_0924.py
+(the parity alone, first failure stops: append ``::TestPlannerParity -x``)
 
 What it proves (27B P geometry: 512 new tokens causal over prefix + chunk,
 24 q / 4 KV heads, head_dim 256, page_size 1):
-(A) our work-item arrays are flashinfer's: the C++ planner's own fixed-split
+(A) our work-item arrays are flashinfer's: the JIT module's own fixed-split
     arrays (read back from the wrapper's pinned int buffer) equal
-    fi_graph_split.split_arrays for the same chunk;
+    fi_graph_split.split_arrays for the same chunk. The reference is an EAGER
+    plan, and 0.6.14 reserves its split partials per work item x CTA_TILE_Q x
+    sizeof(float) (#5177): 506 MiB at 98k / 7 chunks, so the workspace is sized
+    by stock_eager_split_float_bytes -- with 384 MiB the planner refused, which
+    was the first window run's failure (2026-09-24 20:23Z; found at the desk by
+    test_fi_graph_split_cpp_parity_0924.py, which compiles the same planner
+    host-only and compares the same arrays over ~700 shapes without a GPU).
+    A refusal or a difference fails with the case, the plan vector and each
+    array's first differing index;
 (B) a CUDA graph captured ONCE with the split grid, replayed at prefixes 4k /
     36k / 98k with per-replay arrays, matches eager flashinfer WITHOUT split
     within one bf16 ulp of the output magnitude (not bit-identical by
@@ -37,8 +46,8 @@ if not _OK:  # pragma: no cover - window hygiene
 import flashinfer  # noqa: E402
 
 from sglang.srt.layers.attention import fi_graph_split as G  # noqa: E402
+from sglang.srt.layers.attention.fi_prefill_wave_split import fa2_cta_tile_q  # noqa: E402
 from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cuda_ci(est_time=60, suite="nightly-1-gpu")
 
@@ -71,31 +80,77 @@ def _eager_stock(q, k, v, kv_len):
     return w.run(q, (k[:kv_len], v[:kv_len])).float()
 
 
-class TestPlannerParity(CustomTestCase):
+def _first_diff(got, want):
+    """Index of the first difference (or where the shorter one ends), None if equal."""
+    for i, (a, b) in enumerate(zip(got, want)):
+        if a != b:
+            return i
+    return None if len(got) == len(want) else min(len(got), len(want))
+
+
+def _around(xs, i):
+    return xs[max(0, i - 2): i + 3]
+
+
+# Plain unittest.TestCase ON PURPOSE (both classes): sglang's CustomTestCase
+# runs every test inside retry(), and the first window run showed nothing but
+# "retry() exceed maximum number of retries" -- the cause stayed in the chained
+# exception the excerpt did not reach.
+class TestPlannerParity(unittest.TestCase):
     def test_python_arrays_equal_the_cpp_planner(self):
+        major = torch.cuda.get_device_capability()[0]
+        gqa = HQ // HKV
         for kv_len, n in ((36000 + QO, 5), (98304 + QO, 7), (2048 + QO, 4)):
             chunk = math.ceil(kv_len / n)
-            w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(torch.zeros(WS, dtype=torch.uint8, device=DEV), "NHD")
-            _plan(w, kv_len, fixed_split_size=chunk)
+            tile = fa2_cta_tile_q(QO * gqa, HD, major)  # the eager plan's own tile rule
+            items = math.ceil(QO * gqa / tile) * math.ceil(kv_len / chunk)
+            fws = G.stock_eager_split_float_bytes(HQ, items, tile, HD)
+            case = "kv=%d n=%d chunk=%d float_ws=%d B" % (kv_len, n, chunk, fws)
+            ws = torch.empty(fws, dtype=torch.uint8, device=DEV)
+            w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD")
+            try:
+                _plan(w, kv_len, fixed_split_size=chunk)
+            except Exception as e:  # noqa: BLE001 - name the refusal itself
+                self.fail("PARITY %s: the C++ planner refused: %s: %s" % (case, type(e).__name__, e))
             torch.cuda.synchronize()
             info = [int(x) for x in w._plan_info]
             pin = w._pin_memory_int_workspace_buffer
-            want = G.split_arrays([QO], [kv_len], gqa=HQ // HKV, cta_tile_q=info[3], kv_chunk=chunk)
-            items = info[0]
-            self.assertEqual(items, len(want["request_indices"]))
 
-            def read(off, count):
-                return pin[off: off + 4 * count].view(torch.int32).tolist()
+            def read(off, count, width=4):
+                raw = pin[off: off + width * count]
+                return (raw.view(torch.int32) if width == 4 else raw).tolist()
 
-            self.assertEqual(read(info[4], items), want["request_indices"])
-            self.assertEqual(read(info[5], items), want["qo_tile_indices"])
-            self.assertEqual(read(info[6], items), want["kv_tile_indices"])
-            self.assertEqual(read(info[8], 2), want["o_indptr"])
-            self.assertEqual(read(info[9], 1), want["kv_chunk_size"])
-            self.assertEqual(read(info[7], QO + 1), want["merge_indptr"])
+            want = G.split_arrays([QO], [kv_len], gqa=gqa, cta_tile_q=info[3], kv_chunk=chunk)
+            got = {
+                "request_indices": read(info[4], info[0]),
+                "qo_tile_indices": read(info[5], info[0]),
+                "kv_tile_indices": read(info[6], info[0]),
+                "o_indptr": read(info[8], 2),
+                "kv_chunk_size": read(info[9], 1),
+                "merge_indptr": read(info[7], QO + 1) if info[14] else [],
+            }
+            diffs = []
+            if info[0] != len(want["request_indices"]):
+                diffs.append("work items cpp %d vs ours %d" % (info[0], len(want["request_indices"])))
+            if not info[14]:
+                diffs.append("the C++ plan did not split (split_kv=0)")
+            else:
+                mask = read(info[12], info[0], width=1)
+                if any(m != 1 for m in mask):
+                    diffs.append("block_valid_mask: %d of %d items invalid" % (mask.count(0), info[0]))
+            for name, g in got.items():
+                i = _first_diff(g, want[name])
+                if i is not None:
+                    diffs.append(
+                        "%s[%d] (len cpp %d, ours %d): cpp %s vs ours %s"
+                        % (name, i, len(g), len(want[name]), _around(g, i), _around(want[name], i)))
+            if diffs:
+                self.fail("PARITY %s plan_info=%s -- first differences: %s" % (case, info, " | ".join(diffs)))
+            print("PARITY %s: %d work items, tile %d, arrays identical" % (case, info[0], info[3]), flush=True)
+            del w, ws
 
 
-class TestGraphSplit(CustomTestCase):
+class TestGraphSplit(unittest.TestCase):
     def _graph(self, split: bool):
         ws = torch.zeros(WS, dtype=torch.uint8, device=DEV)
         bufs = dict(
