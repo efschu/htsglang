@@ -823,11 +823,23 @@ def copy_rows_reference(sources, destinations, pairs) -> None:
 
 
 def _word_rows(tensor):
+    """The bank as ``[rows, words]`` for the copy kernel: int32 words whenever
+    a row is a multiple of 4 bytes (every expert tensor before H68b -- the
+    launch is byte-identical to before), else the widest word that divides it.
+    H68b: the NVFP4 Marlin global scales are ``[E, 1]`` bf16, 2 bytes a row;
+    ``view(torch.int32)`` refuses that, and the pool step would die at the
+    first captured decode on exactly the tensors the kernel indexes by slot."""
     import torch
 
     if not tensor.is_contiguous():
         raise ValueError("pool copies require contiguous rows")
-    return tensor.view(torch.uint8).reshape(tensor.shape[0], -1).view(torch.int32)
+    rows = tensor.view(torch.uint8).reshape(tensor.shape[0], -1)
+    row_bytes = rows.shape[1]
+    if row_bytes % 4 == 0:
+        return rows.view(torch.int32)
+    if row_bytes % 2 == 0:
+        return rows.view(torch.int16)
+    return rows
 
 
 def copy_rows(sources, destinations, src_rows, dst_rows, count) -> None:

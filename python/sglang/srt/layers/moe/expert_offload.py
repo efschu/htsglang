@@ -2446,9 +2446,9 @@ class StreamingExpertStager:
 _OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES = (
     "GGUFMoEAscendMethod",
     "MoeWNA16Method",
-    # NVFP4 MoE (#323b) -- ModelOpt serialized, ModelOpt online-converted, and
-    # the compressed-tensors scheme.
-    "ModelOptNvFp4FusedMoEMethod",
+    # NVFP4 MoE (#323b) -- ModelOpt online-converted and the
+    # compressed-tensors scheme. The serialized ModelOpt method moved to the
+    # conditional set below (H68b): it has a half now, on the Marlin path.
     "ModelOptNvFp4OnlineFusedMoEMethod",
     "CompressedTensorsW4A4Nvfp4MoE",
 )
@@ -2458,6 +2458,27 @@ _OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES = (
 #: once it has actually staged this layer; absent/False => refuse.
 _OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES = {
     "GGUFMoEMethod": "_moe_offload_gguf_staged",
+    # H68b: ModelOpt NVFP4 has the half on the MARLIN path only (host staging
+    # in create_weights, per-expert repack + presplit in
+    # _marlin_repack_and_presplit). A native W4A4 backend (flashinfer
+    # cutlass / trtllm / cutedsl: swizzled block scales, alphas) never sets
+    # the marker and is refused exactly as before.
+    "ModelOptNvFp4FusedMoEMethod": "_moe_offload_nvfp4_marlin_staged",
+}
+
+#: Why a conditional method's half did not stage a layer, per method -- the
+#: reason names the layer's OWN state, so it cannot go stale (#479).
+_OFFLOAD_CONDITIONAL_REASONS = {
+    "ModelOptNvFp4FusedMoEMethod": (
+        "'ModelOptNvFp4FusedMoEMethod' has a load-time offload half on the "
+        "Marlin path only (H68b), and it did not stage this layer: the marker "
+        "{marker!r} is absent. That happens when the MoE runner backend is not "
+        "Marlin (a native W4A4 backend keeps swizzled block scales and alphas "
+        "the offload cache does not know), when the checkpoint is not "
+        "serialized ModelOpt NVFP4, or when no rank of the group runs a "
+        "resident fraction < 1.0 (then create_weights built nothing on the "
+        "host). Run --moe-runner-backend marlin on every rank."
+    ),
 }
 
 
@@ -2497,7 +2518,11 @@ def assert_expert_offload_quant_supported(
             continue
         name = type(candidate).__name__
         marker = _OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES.get(name)
-        if marker is not None:
+        if marker is not None and name in _OFFLOAD_CONDITIONAL_REASONS:
+            if getattr(layer, marker, False):
+                continue  # the half staged this layer -> covered
+            reason = _OFFLOAD_CONDITIONAL_REASONS[name].format(marker=marker)
+        elif marker is not None:
             if getattr(layer, marker, False):
                 continue  # the half staged this layer -> covered
             # #479: this used to name MXFP4 as THE uncovered example, which
@@ -3262,6 +3287,18 @@ class MoEExpertOffloadCache:
         "w2_weight_packed",
         "w13_weight_zero_point",
         "w2_weight_zero_point",
+        # H68b: ModelOpt NVFP4 on the Marlin path (the one NVFP4 layout with a
+        # load-time half, see _OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES). Its
+        # packed E2M1 stacks and E4M3 block scales reuse "w13_weight" /
+        # "w13_weight_scale" above; the per-expert GLOBAL scales are the only
+        # new expert-major tensors. The kernel reads them at the SLOT index the
+        # remap produces, so a full [E] vector next to [R+C] weights would pair
+        # every expert with another expert's global scale -- the #323b defect.
+        # [E, 1] after the repack (one row per expert, see
+        # prepare_moe_nvfp4_layer_for_marlin_inplace). input_scale stays out:
+        # global (all experts on every rank) and unread by Marlin.
+        "w13_weight_scale_2",
+        "w2_weight_scale_2",
     )
 
     def __init__(self, layer, fraction: float):

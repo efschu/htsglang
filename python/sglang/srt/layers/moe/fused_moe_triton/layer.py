@@ -1557,7 +1557,15 @@ class FusedMoE(torch.nn.Module):
         with weight_chunk_scope(self.layer_id), outside_tag_pool(
             reason="ct-stream-presplit"
         ):
-            with device_loading_context(self, state["device"]):
+            if state.get("device_ctx", True):
+                with device_loading_context(self, state["device"]):
+                    self.quant_method.process_weights_after_loading(self)
+            else:
+                # H68b (NVFP4 Marlin door): the scheme reads its host-staged
+                # experts one at a time itself, so the loader must NOT first
+                # copy the whole [E] stack to the card -- that copy is the
+                # transient this door exists to avoid. The compressed-tensors
+                # state carries no key and keeps the path above.
                 self.quant_method.process_weights_after_loading(self)
         # The repack's [E] transients are freed but stay reserved in the
         # caching allocator; hand them back so the next layer's copy-in and

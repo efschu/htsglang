@@ -47,7 +47,8 @@ from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils import GPTQ_MARLIN_MIN_THREAD_K
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
-    prepare_moe_nvfp4_layer_for_marlin,
+    nvfp4_marlin_global_scale_1d,
+    prepare_moe_nvfp4_layer_for_marlin_inplace,
     prepare_nvfp4_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -2121,6 +2122,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
+        # H68b: the load-time half of the expert offload (see
+        # _nvfp4_host_staging_device). "cpu" -> every expert-major tensor is
+        # built on the HOST, the stream presplit repacks + splits each layer
+        # the moment its last shard landed; None -> byte-identical stock path.
+        _moe_dev = self._nvfp4_host_staging_device(layer)
+        layer._moe_nvfp4_host_staged = _moe_dev == "cpu"
+
         w13_weight = ModelWeightParameter(
             data=torch.empty(
                 layer.num_local_experts,
@@ -2128,6 +2136,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
                 dtype=weight_dtype,
+                device=_moe_dev,
             ),
             input_dim=1,
             output_dim=2,
@@ -2143,6 +2152,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // 2,
                 dtype=weight_dtype,
+                device=_moe_dev,
             ),
             input_dim=1,
             output_dim=2,
@@ -2156,6 +2166,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 num_shards * intermediate_size_per_partition,
                 hidden_size // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
+                device=_moe_dev,
             ),
             input_dim=1,
             output_dim=2,
@@ -2187,6 +2198,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
+                device=_moe_dev,
             ),
             input_dim=1,
             output_dim=2,
@@ -2213,13 +2225,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             else (layer.num_local_experts,)
         )
         w13_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(w13_weight_scale_shape, dtype=torch.float32),
+            data=torch.empty(
+                w13_weight_scale_shape, dtype=torch.float32, device=_moe_dev
+            ),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
 
         w2_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(layer.num_local_experts, dtype=torch.float32),
+            data=torch.empty(
+                layer.num_local_experts, dtype=torch.float32, device=_moe_dev
+            ),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
@@ -2260,11 +2276,114 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
+        if _moe_dev == "cpu":
+            self._arm_stream_presplit(layer, num_shards)
+
+    # ----- H68b: the NVFP4 half of the expert offload (Marlin only) -----
+    #
+    # The compressed-tensors WNA16 door has had it since WP1/WP2
+    # (compressed_tensors_wNa16_moe.py create_weights + FusedMoE._ct_stream_note):
+    # host allocation of every expert-major tensor, a per-layer shard counter,
+    # and the repack + presplit on the loader thread the moment the layer's
+    # last shard landed, so the checkpoint's experts never sit on the card (and
+    # never all in host RAM) at once. NVFP4 MoE was refused by the offload
+    # installer instead (#323b), which on this rig means refused outright: 63
+    # GiB of routed experts fit on no card set without the offload.
+    #
+    # Only the Marlin path gets the half. It is the one layout both
+    # architectures of the rig serve (sm86 has no native FP4; the 5090 runs it
+    # under --moe-runner-backend marlin), so the host store, the Platztausch and
+    # the flip exchange move ONE byte layout. A native W4A4 backend keeps the
+    # stock allocation and stays refused by the installer (no marker below).
+
+    def _nvfp4_host_staging_device(self, layer) -> Optional[str]:
+        """``"cpu"`` when this layer's experts are staged on the host for the
+        offload presplit, else ``None`` (stock allocation, byte-identical)."""
+        if not getattr(self, "use_marlin_fallback", False):
+            return None
+        if getattr(self.quant_config, "is_nvfp4_online", False):
+            return None
+        if not self.quant_config.is_checkpoint_nvfp4_serialized:
+            return None
+        if getattr(layer, "_moe_offload_excluded", False):
+            return None  # the draft keeps its experts on the card
+        from sglang.srt.layers.moe.resident_fraction import offload_active
+
+        return "cpu" if offload_active() else None
+
+    def _arm_stream_presplit(self, layer, num_shards: int, ambient=None) -> None:
+        """Arm FusedMoE's per-layer early presplit (``_ct_stream_note``) with
+        this method's expert-major tensor names. Needs a CUDA ambient device:
+        the repack runs on the card. Under the generic expert shard only the
+        OWNED experts arrive (the pad expert never does). ``input_scale`` is
+        global (``_sglang_require_global_experts``) and not counted.
+        ``device_ctx=False``: the repack reads the host-staged experts itself,
+        one at a time, instead of the loader moving the whole [E] stack to the
+        card first."""
+        import threading
+
+        if ambient is None:
+            ambient = torch.empty(0).device
+        if ambient.type != "cuda":
+            return
+        owned = int(getattr(layer, "_expert_shard_owned", layer.num_local_experts))
+        expected = {
+            "w13_weight": num_shards * owned,
+            "w2_weight": owned,
+            "w13_weight_scale": num_shards * owned,
+            "w2_weight_scale": owned,
+            "w13_weight_scale_2": num_shards * owned,
+            "w2_weight_scale_2": owned,
+        }
+        layer._ct_stream_presplit = {
+            "expected": expected,
+            "names": {id(getattr(layer, n)): n for n in expected},
+            "seen": {},
+            "lock": threading.Lock(),
+            "done": False,
+            "device": ambient,
+            "device_ctx": False,
+        }
+
+    def _marlin_repack_and_presplit(self, layer: torch.nn.Module) -> None:
+        """The Marlin repack of an NVFP4 MoE layer, then the offload presplit.
+
+        (c) The pad expert of the generic expert shard is zeroed BEFORE the
+        repack (``zero_expert_shard_pad``: scales 0 make the dequantized weight
+        0 whatever the payload); without it every foreign expert, which the
+        shard remaps onto the pad, contributed ``torch.empty`` garbage.
+        (d) Per expert, Parameter identity kept
+        (``prepare_moe_nvfp4_layer_for_marlin_inplace``).
+        The presplit is a no-op unless the rank's resident fraction is < 1;
+        the marker tells the offload installer this layer HAS its load-time
+        half (``_OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES``)."""
+        from sglang.srt.managers.weg2_memory_saver import outside_tag_pool
+
+        staged = bool(getattr(layer, "_moe_nvfp4_host_staged", False))
+        zero_pad = getattr(layer, "zero_expert_shard_pad", None)
+        if callable(zero_pad):
+            zero_pad()
+        with outside_tag_pool(reason="nvfp4-moe-repack"):
+            prepare_moe_nvfp4_layer_for_marlin_inplace(layer, outputs_survive=not staged)
+        layer.is_marlin_converted = True
+        from sglang.srt.layers.moe.expert_offload import (
+            presplit_expert_offload_after_repack,
+        )
+
+        presplit_expert_offload_after_repack(layer)
+        if staged:
+            layer._moe_offload_nvfp4_marlin_staged = True
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process FP4 MoE weights after loading from serialized checkpoint.
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
+        # H68b: the stream presplit may already have processed this layer on
+        # the loader thread; the loader's own post-load pass is then a no-op
+        # (same contract as the compressed-tensors door).
+        if getattr(layer, "is_marlin_converted", False):
+            return
         # GEMM1 scale processing is deferred until the input scale is known;
         # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
         moe_runner_backend = getattr(
@@ -2296,7 +2415,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "w13_weight_scale_2",
                 w13_weight_scale_2.contiguous(),
             )
-            prepare_moe_nvfp4_layer_for_marlin(layer)
+            self._marlin_repack_and_presplit(layer)
             return
 
         # Calculate input scales based on strategy
@@ -2646,8 +2765,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w13_g_idx_sort_indices=None,
                 w2_g_idx_sort_indices=None,
                 weight_bits=4,
-                w13_global_scale=layer.w13_weight_scale_2,
-                w2_global_scale=layer.w2_weight_scale_2,
+                # H68b: [E, 1] on the layer (one row per expert for the
+                # presplit / store / Platztausch cut), [E] for the kernel.
+                w13_global_scale=nvfp4_marlin_global_scale_1d(layer.w13_weight_scale_2),
+                w2_global_scale=nvfp4_marlin_global_scale_1d(layer.w2_weight_scale_2),
                 expert_map=expert_map,
                 global_num_experts=global_num_experts,
             )

@@ -386,6 +386,14 @@ def slot_rows(local_ids: Iterable[int], lo: int, pad: bool = True,
     return out
 
 
+#: dtypes whose CPU ``index_copy_`` has no kernel; written through a byte view.
+_NO_CPU_INDEX_COPY = tuple(
+    getattr(torch, name)
+    for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz")
+    if hasattr(torch, name)
+)
+
+
 def write_rows(
     store: torch.Tensor,
     src: torch.Tensor,
@@ -455,7 +463,15 @@ def write_rows(
     # (+1.9 GiB on the x4 3080), which the KV sizer then read as used and
     # the first 8k chunk OOMed on. Move the rows through the host instead.
     if src.device.type == "cpu":
-        store.index_copy_(0, dst, src[torch.as_tensor(locals_, dtype=torch.long)].to(store.dtype))
+        picked = src[torch.as_tensor(locals_, dtype=torch.long)].to(store.dtype)
+        if picked.dtype in _NO_CPU_INDEX_COPY:
+            # H68b: the NVFP4 block scales are float8_e4m3fn, and CPU
+            # index_copy_ has no kernel for float8 ("index_copy_cpu not
+            # implemented for 'Float8_e4m3fn'"). Same bytes through a uint8
+            # view; every dtype the store held before takes the line below.
+            store.view(torch.uint8).index_copy_(0, dst, picked.view(torch.uint8))
+        else:
+            store.index_copy_(0, dst, picked)
         return rows
     # fn8m4 (20.09.): a host intermediate (src.to("cpu")) per tensor left the
     # load's anon footprint at 60 GiB while the store filled (shmem 26 GiB)

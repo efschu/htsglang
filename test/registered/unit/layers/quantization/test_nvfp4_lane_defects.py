@@ -639,8 +639,20 @@ class TestExpertOffloadNvfp4Guard(CustomTestCase):
         assert_expert_offload_quant_supported(_named("Fp8MoEMethod"), scheme=None)
 
     def test_the_deny_list_names_all_three_nvfp4_classes(self):
+        # H68b: the serialized ModelOpt method has a load-time half now (Marlin
+        # path) and moved to the CONDITIONAL set -- admitted only on a layer
+        # that half staged, refused everywhere else (see the test above).
+        from sglang.srt.layers.moe.expert_offload import (
+            _OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES,
+        )
+
+        self.assertEqual(
+            _OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES["ModelOptNvFp4FusedMoEMethod"],
+            "_moe_offload_nvfp4_marlin_staged",
+        )
+        self.assertNotIn("ModelOptNvFp4FusedMoEMethod", _OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES)
         for name in (
-            *self.NVFP4_MOE_METHODS,
+            "ModelOptNvFp4OnlineFusedMoEMethod",
             "CompressedTensorsW4A4Nvfp4MoE",
         ):
             self.assertIn(name, _OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES)
