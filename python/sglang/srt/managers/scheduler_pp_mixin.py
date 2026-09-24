@@ -5235,7 +5235,9 @@ class SchedulerPPMixin:
                         _h49_php = pp_host_period()
                         if _h49_php.on:
                             _h49_php.note_sync(
-                                stage=self.pp_rank,
+                                # H49b: der Scheduler traegt den PP-Rang unter
+                                # self.ps.pp_rank (x162 starb an self.pp_rank).
+                                stage=int(getattr(getattr(self, "ps", None), "pp_rank", 0) or 0),
                                 entry=_h49_t0,
                                 exit=time.perf_counter(),
                             )
