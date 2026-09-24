@@ -236,6 +236,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.weg2 import tail_adopt
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -2643,11 +2644,8 @@ class PrefillAdder:
                 # Per-branch bail patches are how #965 was paid for twice.
                 req.set_extend_range(prefix_len, prefix_len)
                 _note_988_loadback(req, prefix_len)
-                # H18 (E1): can this rank serve P's tail (rows + state at c)?
-                # A probe only -- the adoption is not wired (see tail_handoff).
-                from sglang.srt.weg2 import tail_handoff
-
-                tail_handoff.probe(req, prefix_len, self.tree_cache, self.page_size)
+                # H18's probe stood here; H21 decides the tail at the commit
+                # below (tail_adopt.plan_adopt), on the group's vote.
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
@@ -2680,6 +2678,14 @@ class PrefillAdder:
                 # held token is scheduled by the chunked-request machinery,
                 # which admits ONE continuation per pass (#996 ratchet).
                 _ea_start = len(req.prefix_indices)
+                # H21 (fnFL2, E1 second half): D takes P's partial page and
+                # its state at c over -- the group voted it at the prefetch
+                # completion, the inputs here are rank-uniform, so every rank
+                # runs the same extend [c, N) (1-4 tokens instead of
+                # N - floor_page(c)). None = today's extend.
+                _tail = tail_adopt.plan_adopt(req, _ea_start)
+                if _tail is not None:
+                    _ea_start = _tail.staged.spec.cut
                 _ea_len, _ea_forced = self._weg2_end_anchor_split(
                     req, _ea_start, len(req.full_untruncated_fill_ids) - _ea_start
                 )
@@ -2690,6 +2696,12 @@ class PrefillAdder:
                 if _ea_forced and (self.chunked_req_outstanding or self.new_chunked_req is not None):
                     note_second_continuation_refused(req, "add_one_req/end-anchor")
                     return AddReqResult.OTHER
+                if _tail is not None:
+                    # the commit: nothing below leaves this branch without the
+                    # request in can_run_list, so the page cannot leak
+                    prefix_len = tail_adopt.commit_adopt(
+                        req, _tail, tree_cache=self.tree_cache, page_size=self.page_size
+                    )
                 req.set_extend_range(
                     _ea_start,
                     (_ea_start + _ea_len) if _ea_forced else len(req.full_untruncated_fill_ids),

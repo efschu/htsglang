@@ -8,8 +8,8 @@ silently break):
 * the key is token-exact over [0, c) -- the needle safety of the hand-off;
 * the group verdict is a MIN: one rank that cannot serve keeps the page resume;
 * P's capture selects the GDN working slot and the partial page's rows (KV +
-  QSA compressed groups) exactly, and D refuses a part whose digest, key,
-  prefix, layer coverage or row shape does not match.
+  QSA compressed groups) exactly, and D refuses a part whose digest, layer
+  coverage or row shape does not match (D's adoption: test_weg2_tail_adopt_h21).
 """
 
 import os
@@ -198,24 +198,6 @@ def test_readiness_needs_every_local_layer_with_its_shape():
     assert th.local_readiness(other, [a, b], need_fa, need_gdn) == "spec_differs:pp0"
     # a rank without GDN/KV layers (Form-A worker) is ready on any complete spec
     assert th.local_readiness(spec, [a, b], {}, {}) == ""
-
-
-def test_probe_verdicts_on_d(arena):
-    kv, rp, alloc = _pools()
-    ids = list(range(N))
-    req = _req(ids, 240)
-    assert th.capture_state(req, rp, alloc, PAGE, None)
-    th.publish_rows(req, torch.arange(N) + PAGE, alloc, "pp0-1")
-    _join_publishers()
-    tree = SimpleNamespace(token_to_kv_pool_allocator=alloc, req_to_token_pool=rp)
-    assert th.probe(_req(ids, 192), 192, tree, PAGE) == ""
-    assert th.probe(_req(ids, 192), 128, tree, PAGE) == "prefix:128!=192"
-    wrong = list(ids)
-    wrong[230] += 1
-    assert th.probe(_req(wrong, 192), 192, tree, PAGE) == "key_mismatch"
-    assert th.probe(SimpleNamespace(rid="weg2-9-9", origin_input_ids=ids, extra_key=None), 192, tree, PAGE) == "no_parts"
-    with envs.SGLANG_WEG2_TAIL_HANDOFF.override(False):
-        assert th.probe(_req(ids, 192), 192, tree, PAGE) == "off"
 
 
 def test_prune_keeps_the_newest_rids(arena):

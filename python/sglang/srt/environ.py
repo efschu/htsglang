@@ -466,6 +466,19 @@ class Envs:
     # D probes them at its load-back (WEG2-TAIL-READY). 0 = the 64-token cut
     # and no tail files, byte for byte the 2026-09-24 form.
     SGLANG_WEG2_TAIL_HANDOFF = EnvBool(True)
+    # TAIL_ADOPT (H21, second half of E1): D takes the hand-off over -- the
+    # TP group MIN-votes it in the prefetch-progress collective, every rank
+    # grows the prefix by the partial page's rows [floor_page(c), c), the
+    # rank(s) holding attention/GDN layers write the rows and the state at c
+    # at the first GDN layer of the extend forward, and the extend is [c, N)
+    # (1-4 tokens). Effective only under TAIL_HANDOFF; 0 = the H18 form
+    # (extend from floor_page(c)).
+    SGLANG_WEG2_TAIL_ADOPT = EnvBool(True)
+    # TAIL_VERIFY (H21): D checks the part payloads against the publish
+    # digests before its vote (a mismatch votes the group back to the page
+    # resume) and reads the written rows/state back once per request for the
+    # WEG2-TAIL-ADOPT line (digest=match|MISMATCH).
+    SGLANG_WEG2_TAIL_VERIFY = EnvBool(True)
     # FLIP_ORDER_CREDIT (H14, fnFL2x114c/x114d): the front simulates the
     # D->P wake per card (weg2/wake_credit.py) before it hands out the pause
     # order; an order that ends in the W109 credit cycle is replaced by one in

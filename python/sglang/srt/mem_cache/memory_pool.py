@@ -62,6 +62,7 @@ from sglang.srt.mem_cache.layout.page_major import (
     mamba_entry_bytes,
     mha_entry_bytes,
 )
+from sglang.srt.weg2 import tail_adopt
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
@@ -2281,6 +2282,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # Same shape as 09c4e49bb7 (moe-offload scratch region): a side stream
         # joined to compute in one direction only.
         self._wait_for_mamba_layer(layer_id)
+        # H21 (fnFL2, tail adoption): a request admitted with P's partial page
+        # and its state at c gets them written HERE -- on the forward stream,
+        # after this layer's load-stream join and after the deferred COW/clear,
+        # so neither the floor_page(c) anchor load nor a COW overwrites them.
+        if tail_adopt.PENDING_INSTALLS:
+            tail_adopt.install_layer(layer_id)
         return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
 
     def short_conv_layer_cache(self, layer_id: int) -> torch.Tensor:

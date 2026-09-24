@@ -28,11 +28,10 @@ the covered global layer ids, the row shapes and a digest per section. The
 key is a hash of the token ids [0, c) and the extra key: token-exact, so a
 part can never be applied to another prompt (needle safety).
 
-D probes the parts at its load-back (``probe``): key, prefix, layer coverage,
-shapes against its own pools. The adoption itself (page, rows, state into the
-request slot after the deferred COW, extend [c, N), group MIN verdict) is
-NOT wired in this commit -- see the H18 report; the pure pieces it needs
-(``agree_cut``, ``extend_range``, ``verify_part``) are here and tested.
+D takes the parts over in weg2/tail_adopt.py (H21): a group MIN vote in the
+prefetch-progress collective, the partial page as a request-owned page at the
+admission commit, rows + state written at the extend's first GDN layer,
+extend [c, N).
 """
 
 from __future__ import annotations
@@ -211,19 +210,29 @@ def write_part(spec: TailSpec, part: str, fa: Dict[int, Tuple[torch.Tensor, ...]
     return header
 
 
-def verify_part(header: TailHeader) -> Optional[dict]:
-    """Load a part and check both digests; None on any mismatch (the reader
-    then keeps the page-prefix resume -- a wrong row is never applied)."""
+def read_part(header: TailHeader, check_digest: bool = True) -> Tuple[Optional[dict], str]:
+    """Load a part; with ``check_digest`` compare both sections against the
+    publish digests. (bundle, '') or (None, reason) -- 'unreadable' or
+    'digest_MISMATCH' (the reader then keeps the page-prefix resume: a wrong
+    row is never applied)."""
     _j, ppath = part_paths(header.spec.rid, header.part)
     try:
         bundle = torch.load(ppath, map_location="cpu")
     except (OSError, RuntimeError, EOFError):
         logger.warning("WEG2-TAIL part unreadable: %s", ppath, exc_info=True)
-        return None
-    if digest(_fa_order(bundle["fa"])) != header.fa_digest or digest(_gdn_order(bundle["gdn"])) != header.gdn_digest:
+        return None, "unreadable"
+    if check_digest and (
+        digest(_fa_order(bundle["fa"])) != header.fa_digest
+        or digest(_gdn_order(bundle["gdn"])) != header.gdn_digest
+    ):
         logger.warning("WEG2-TAIL DIGEST MISMATCH rid=%s part=%s", header.spec.rid, header.part)
-        return None
-    return bundle
+        return None, "digest_MISMATCH"
+    return bundle, ""
+
+
+def verify_part(header: TailHeader) -> Optional[dict]:
+    """``read_part`` with both digests checked; None on any refusal."""
+    return read_part(header, check_digest=True)[0]
 
 
 def remove(rid: str) -> None:
@@ -407,11 +416,14 @@ def _write_and_log(spec: TailSpec, part: str, fa, gdn) -> None:
     )
 
 
-# -- D side: probe -------------------------------------------------------------------
+# -- D side: readiness (the adoption itself lives in weg2/tail_adopt.py) -------------
 def local_readiness(spec: TailSpec, headers: Sequence[TailHeader], need_fa: Dict[int, List[int]],
                     need_gdn: Dict[int, List[int]]) -> str:
-    """'' when the parts cover every layer this rank holds with matching row
-    shapes and one agreed spec; otherwise the first reason it cannot serve."""
+    """'' when the parts cover every layer this rank HOLDS with matching row
+    shapes and one agreed spec; otherwise the first reason it cannot serve.
+    ``need_*`` carry only held layers (weg2/tail_adopt.held_shapes drops a
+    layer whose rows are empty, e.g. a Form-A worker's 0-head attention pool:
+    fnFL2x133 TP1/TP2 'fa_shape:3:[2, 256]!=[0, 256]')."""
     if not headers:
         return "no_parts"
     for h in headers:
@@ -430,63 +442,3 @@ def local_readiness(spec: TailSpec, headers: Sequence[TailHeader], need_fa: Dict
         if list(have_gdn[g]) != list(shape):
             return f"gdn_shape:{g}:{have_gdn[g]}!={list(shape)}"
     return ""
-
-
-def _need_shapes(kvpool, req_to_token_pool) -> Tuple[Dict[int, List[int]], Dict[int, List[int]]]:
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
-
-    need_fa: Dict[int, List[int]] = {}
-    if isinstance(kvpool, HybridLinearKVPool):
-        full = kvpool.full_kv_pool
-        for gid, local in kvpool.full_attention_layer_id_mapping.items():
-            need_fa[int(gid)] = list(full.k_buffer[local].shape[1:])
-    need_gdn: Dict[int, List[int]] = {}
-    if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        temporal = req_to_token_pool.mamba_pool.mamba_cache.temporal
-        for gid, local in req_to_token_pool.mamba_map.items():
-            need_gdn[int(gid)] = list(temporal[local].shape[1:])
-    return need_fa, need_gdn
-
-
-_PROBE_N = [0]
-
-
-def probe(req, prefix_len: int, tree_cache, page_size: int) -> str:
-    """Admission entry (#988 site): never raises into add_one_req."""
-    try:
-        return _probe(req, prefix_len, tree_cache, page_size)
-    except Exception as exc:  # noqa: BLE001 -- a probe is an instrument, named
-        logger.warning("WEG2-TAIL-READY probe failed rid=%s (%s: %s)", req.rid, type(exc).__name__, exc)
-        return "probe_raised"
-
-
-def _probe(req, prefix_len: int, tree_cache, page_size: int) -> str:
-    """D, at the #988 load-back: can this rank serve the tail of ``req``?
-    Logs one WEG2-TAIL-READY line per probed request; returns the verdict
-    ('' = ready). Reads only the small headers (no payload on the admission
-    path)."""
-    if not enabled() or not str(req.rid).startswith("weg2-") or not _dir():
-        return "off"
-    headers = headers_for(str(req.rid))
-    if not headers:
-        return "no_parts"
-    spec = headers[0].spec
-    ids = req.origin_input_ids
-    verdict = ""
-    if len(ids) != spec.n_tokens:
-        verdict = f"n_tokens:{len(ids)}!={spec.n_tokens}"
-    elif int(prefix_len) != spec.page_prefix:
-        verdict = f"prefix:{int(prefix_len)}!={spec.page_prefix}"
-    elif tail_key(ids, spec.cut, req.extra_key) != spec.key:
-        verdict = "key_mismatch"
-    else:
-        need_fa, need_gdn = _need_shapes(tree_cache.token_to_kv_pool_allocator.get_kvcache(), tree_cache.req_to_token_pool)
-        verdict = local_readiness(spec, headers, need_fa, need_gdn)
-    _PROBE_N[0] += 1
-    logger.info(
-        "WEG2-TAIL-READY rid=%s page_prefix=%d tail_rows=%d state_at=%d extend=%d parts=%d key=%s "
-        "verdict=%s adopt=not_wired (n=%d)",
-        spec.rid, spec.page_prefix, spec.rows, spec.cut, spec.extend, len(headers), spec.key,
-        verdict or "ready", _PROBE_N[0],
-    )
-    return verdict

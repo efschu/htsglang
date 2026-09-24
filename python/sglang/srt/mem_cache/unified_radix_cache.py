@@ -29,7 +29,7 @@ from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.utils import uneven_dcp_active
 from sglang.srt.environ import envs
-from sglang.srt.weg2 import tail_handoff
+from sglang.srt.weg2 import tail_adopt, tail_handoff
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -240,7 +240,11 @@ def _pool_slot(pool_name, offset: int) -> int:
 #: after the pool slots keep the vector rank-invariant in length.
 _REAP_SLOT_PROBED = 1 + _POOL_SLOT_COUNT
 _REAP_SLOT_HIT_TOKENS = 2 + _POOL_SLOT_COUNT
-_REAP_PACKED_LEN = 3 + _POOL_SLOT_COUNT
+#: H21 (fnFL2): the tail-adoption vote (weg2/tail_adopt.py) rides the same
+#: MIN -- 1 = this rank can serve P's partial page + state at c (or holds no
+#: layer of it); the reduced slot is the group's one answer for the admission.
+_REAP_SLOT_TAIL_VOTE = 3 + _POOL_SLOT_COUNT
+_REAP_PACKED_LEN = 4 + _POOL_SLOT_COUNT
 
 
 class UnifiedTreeNode:
@@ -5343,6 +5347,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ) = self.ongoing_prefetch[req_id]
         if operation.host_indices is None:
             return True
+        # H21: start reading P's tail parts for this rid in the background
+        # (once), so the vote below joins a finished read.
+        tail_adopt.stage(req_id, tree_cache=self)
         if not self.can_terminate_prefetch(operation):
             return False
 
@@ -5358,7 +5365,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             operation, hash_value
         )
         packed_list = [completed_tokens] + [0] * _POOL_SLOT_COUNT
-        packed_list += [_probed_local, _hit_tokens_local]
+        packed_list += [_probed_local, _hit_tokens_local, tail_adopt.local_vote(req_id)]
         assert len(packed_list) == _REAP_PACKED_LEN
         if self.tp_world_size > 1:
             # Reduce full completed tokens together with the sidecar pools that
@@ -5383,6 +5390,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             packed = torch.tensor(packed_list, dtype=torch.int)
         _probed, _hit_tokens = self._reap_annotation_from_packed(packed)
+        tail_adopt.agree(req_id, int(packed[_REAP_SLOT_TAIL_VOTE].item()))
 
         # #1157: THE REAP IS A LINE. `probed` / `hit_pages` are the GROUP's
         # reading (MIN-reduced above, N1): whether the prefetch thread's store
