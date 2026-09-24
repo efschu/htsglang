@@ -970,6 +970,36 @@ def build_prefill_registry(
                     "prefill registry; cannot adopt."
                 )
         reg.register_slot(slot, bind=bind)
+
+    # Pipeline-parallel stage input of a non-first stage (upstream #35451,
+    # full prefill graph): one tokens-axis slot per proxy key, sourced from
+    # the out-of-band pp input on FillContext. ZERO padding: the padded rows
+    # are processed by the captured graph, so they must be benign (finite)
+    # rather than the previous replay's rows. Adopt-only -- registered when
+    # the source carries the dict, i.e. never on a first stage / without PP.
+    if source is not None:
+        pp = getattr(source, "pp_proxy_tensors", None)
+        if pp is not None:
+
+            def _pp_source(key):
+                def _fn(_fb, ctx):
+                    ppx = ctx.pp_proxy_tensors
+                    return None if ppx is None else ppx.tensors[key]
+
+                return _fn
+
+            for _key, _backing in pp.items():
+                reg.register_slot(
+                    GraphSlot(
+                        name=f"pp_proxy_tensors.{_key}",
+                        shape_fn=lambda _bs, _mt, _s=tuple(_backing.shape): _s,
+                        dtype=_backing.dtype,
+                        axis="tokens",
+                        padding_policy=PaddingPolicy.ZERO,
+                        source_fn=_pp_source(_key),
+                    ),
+                    bind=_backing,
+                )
     return reg
 
 

@@ -38,6 +38,12 @@ elif is_xpu():
     )
 
 
+class _SkipTraceUnderCapture(Exception):
+    """Leaves the #631b trace block without touching the device (see
+    TritonGDNKernel.extend): raised before any read, swallowed by the block's
+    own ``except``."""
+
+
 class TritonGDNKernel(LinearAttnKernelBase):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
 
@@ -201,6 +207,14 @@ class TritonGDNKernel(LinearAttnKernelBase):
         try:
             import logging as _lg
 
+            # P prefill graph: the trace's host reads (item / tolist) are
+            # device syncs, which INVALIDATE a stream capture even when the
+            # exception they raise is swallowed below -- the capture then dies
+            # at capture_end.
+            # Under capture the trace is skipped whole (the replay runs no
+            # Python anyway, so there is nothing it could ever print there).
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise _SkipTraceUnderCapture()
             _q = query_start_loc
             _n = getattr(TritonGDNKernel, "_631b_n", 0) + 1
             TritonGDNKernel._631b_n = _n
