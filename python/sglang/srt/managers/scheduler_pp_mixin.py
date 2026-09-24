@@ -25,6 +25,7 @@ from sglang.srt.distributed.pp_typed_channel import (
 )
 from sglang.srt.distributed.pp_object_recv import get_or_create_frame
 from sglang.srt.distributed.utils import pp_gapped_ownership_active
+from sglang.srt.managers import anchor_tails as _anchor_tails
 from sglang.srt.managers import weg2_store_told
 from sglang.srt.managers.weg2_idle_vote import (
     VOTE_HOME_STEP_BUDGET_S,
@@ -1567,6 +1568,52 @@ def pp_flip_forget_ring_scoped_slots(holder) -> None:
     # an entry that outlived a ring rebuild would name a slot of the
     # previous topology.
     holder._pp_launched_batches = {}
+
+
+def _pp_slot_batch(holder, mb_id: int):
+    """This rank's batch in slot ``mb_id`` (the planned ring entry, else the
+    batch being launched), or None. Diagnostics only; never raises."""
+    try:
+        mbs = getattr(holder, "mbs", None)
+        if mbs is not None and 0 <= int(mb_id) < len(mbs) and mbs[mb_id] is not None:
+            return mbs[mb_id]
+    except Exception:  # noqa: BLE001
+        pass
+    return getattr(holder, "cur_batch", None)
+
+
+def pp_slot_disagreement_message(*, pp_rank, mb_id, stamp, recv_fwd_ct, batch) -> str:
+    """fnFL2 H42c: the #1004 stop, naming both sides of the slot.
+
+    ``stamp`` is the sender's ``_pp_proxy_stamp`` tuple as it arrived
+    (``(mb_id, seq, rows, epoch, fwd_ct, (rid, start, end))`` on this line --
+    the tail elements are optional). ``batch`` is this rank's batch in its own
+    slot, or None.
+    """
+
+    def _at(i):
+        try:
+            return stamp[i]
+        except Exception:  # noqa: BLE001
+            return "?"
+
+    try:
+        reqs = list(getattr(batch, "reqs", None) or ())
+        rids = ",".join(str(getattr(r, "rid", "?"))[:16] for r in reqs) or "-"
+        extend = getattr(batch, "extend_num_tokens", None)
+    except Exception:  # noqa: BLE001
+        rids, extend = "?", None
+    return (
+        f"#1004 SLOT DISAGREEMENT (one layout per process): PP{pp_rank} is "
+        f"launching slot {mb_id} (fwd_ct={recv_fwd_ct}, rids=[{rids}], "
+        f"extend={extend}) but the upstream's proxy names slot {_at(0)} "
+        f"(seq={_at(1)} rows={_at(2)} sender_fwd_ct={_at(4)} extent={_at(5)}). "
+        f"The stages admitted this batch in DIFFERENT passes: some admission "
+        f"verdict was rank-local (a wall clock, a local count) on a form where "
+        f"every stage plans for itself. Computing on it would pair one pass's "
+        f"hidden states with another's metadata; returning None only moved "
+        f"the death into the model without a name (x161). Refusing."
+    )
 
 
 def pp_proxy_stamp_names_pass(stamp, mb_id: int, epoch: Optional[int]) -> bool:
@@ -6040,19 +6087,22 @@ class SchedulerPPMixin:
         # where a relayed request dies between the consumed chain hop and
         # the downstream waiting queue (boot 631row16: s0=150=c1 balanced,
         # request never locatable). Name every non-empty batch of received
-        # requests per rank, first 30.
-        if recv_reqs:
+        # requests per rank, first 30. (H42c: PP0's pass clock rides every
+        # list while the burst window is armed; a clock is not a request and
+        # would spend the 30 on idle passes.)
+        _traced = _anchor_tails.without_burst_clock(recv_reqs)
+        if _traced:
             _rn = getattr(self, "_pp_req_trace_n", 0) + 1
             self._pp_req_trace_n = _rn
-            if _rn <= 30 or any(type(r).__name__ == "AbortReq" for r in recv_reqs):  # xsn324: aborts always traced
+            if _rn <= 30 or any(type(r).__name__ == "AbortReq" for r in _traced):  # xsn324: aborts always traced
                 try:
                     logger.info(
                         "#631 REQ-TRACE r%d rank=%s n=%d kinds=%s rids=%s",
                         _rn,
                         getattr(getattr(self, "ps", None), "pp_rank", "?"),
-                        len(recv_reqs),
-                        [type(r).__name__ for r in recv_reqs][:4],
-                        [str(getattr(r, "rid", "?"))[:8] for r in recv_reqs][:4],
+                        len(_traced),
+                        [type(r).__name__ for r in _traced][:4],
+                        [str(getattr(r, "rid", "?"))[:8] for r in _traced][:4],
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -6115,6 +6165,16 @@ class SchedulerPPMixin:
             _wire_reqs = recv_reqs
             if weg2_store_told.armed(self) and weg2_store_told.is_pp0(self):
                 _wire_reqs = weg2_store_told.pp0_publish(self, recv_reqs)
+            # fnFL2 H42c: PP0's pass clock rides list m, and PP0 decides pass
+            # m's burst hold on the SAME value its followers will read
+            # (anchor_tails H42c note; x161's rank-local clocks split slots).
+            if self.pp_group.is_first_rank and _anchor_tails.burst_clock_armed(
+                self.ps.pp_size
+            ):
+                self._weg2_burst_clock = time.monotonic()
+                _wire_reqs = _anchor_tails.stamp_burst_clock(
+                    _wire_reqs, self._weg2_burst_clock
+                )
             try:  # #1460: when did PP0 put a Weg-2 control request on the chain?
                 _ctrl = [type(r).__name__ for r in (_wire_reqs or ())
                          if type(r).__name__ in ("FlushCacheReqInput", "ReleaseMemoryOccupationReqInput",
@@ -6141,6 +6201,15 @@ class SchedulerPPMixin:
         # leaves `recv_reqs` before dispatch on EVERY rank -- it is a lap, not
         # a request, and `process_input_requests` has no handler for it.
         recv_reqs = self._weg2_vote_after_forward(recv_reqs)
+        # fnFL2 H42c: a follower takes PP0's pass clock off the list after
+        # relaying it; pass-scoped (None when absent, and the burst verdict
+        # then stops by name rather than read this rank's own clock).
+        if not self.pp_group.is_first_rank and _anchor_tails.burst_clock_armed(
+            self.ps.pp_size
+        ):
+            recv_reqs, self._weg2_burst_clock = _anchor_tails.absorb_burst_clock(
+                recv_reqs
+            )
         # #1400: a follower takes PP0's store verdicts off the list after
         # forwarding them onward (PP2 gets them one pass later on the same
         # wire) and registers its held requests with the told span.
@@ -10685,20 +10754,24 @@ class SchedulerPPMixin:
         self._pp_proxy_drops = getattr(self, "_pp_proxy_drops", 0) + 1
         # #997/#1004, and #1233 (WEG 2, S0): `mb_id` is a slot in a ring
         # this guard policed ACROSS an in-process layout change. With one
-        # layout per process the ring is never rebuilt and the cross-epoch
-        # case the refusal names cannot arise, so the bypass branch -- the
-        # one every boot without the flip already took -- is now the only
-        # branch. Counted, never silent: boots 46-48 died once each on this
-        # family with the refusal reachable and nothing logged.
-        logger.warning(
-            "#1004 IDENTITY REFUSAL BYPASSED (one layout per process): stamp "
-            "mb_id=%s seq=%s rows=%s while on mb_id=%s.",
-            stamp[0],
-            stamp[1],
-            stamp[2],
-            mb_id,
+        # layout per process the ring is never rebuilt, so the cross-epoch
+        # case cannot arise -- and a mismatch that DOES arrive is therefore
+        # not a stale leftover but the stages DISAGREEING about which slot
+        # holds this batch (fnFL2 H42c, x161: PP0 ran weg2-2-6 in slot 0,
+        # PP1 admitted it in slot 2). The bypass returned None, and the
+        # model then died three frames later on a nameless "no
+        # pp_proxy_tensors". A None here is never survivable on a stage that
+        # needs hidden states, so the bypass is a named stop instead
+        # (RAENGE-NIE-UNEINS), with both sides of the slot in the message.
+        raise RuntimeError(
+            pp_slot_disagreement_message(
+                pp_rank=getattr(getattr(self, "ps", None), "pp_rank", "?"),
+                mb_id=mb_id,
+                stamp=stamp,
+                recv_fwd_ct=int(getattr(self, "forward_ct", -1)),
+                batch=_pp_slot_batch(self, mb_id),
+            )
         )
-        return None
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,

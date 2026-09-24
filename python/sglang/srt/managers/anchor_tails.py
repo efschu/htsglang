@@ -320,3 +320,82 @@ def burst_hold_verdict(
     if pending == 0 and quiet:
         return _v(False, "quiet")
     return _v(True, "assembling")
+
+
+# ---------------------------------------------------------------- H42c
+# THE HOLD NEEDS ONE CLOCK. x161 (7370b10062, 24.09. 15:41:43, rid weg2-2-6,
+# 12672 tokens after the D->P flip): on the carrierless P form
+# (``pp_flip_counters`` None -> ``#631 ROW AUTHORITY DISABLED``) no follower
+# executes a forwarded schedule, so ``rank_local_count_veto_applies`` is True
+# on EVERY stage and every stage takes the burst verdict itself. Each read its
+# own ``time.monotonic()`` at its own wall time for the same logical pass:
+# PP1 found the queue quiet at its pass in slot 2 (``release reason=quiet
+# held_ms=53``); PP0 had still held that pass (it runs ahead of PP1 on the
+# async chain send) and released one pass later, in slot 0 (``held_ms=55``).
+# PP1 admitted weg2-2-6 in slot 2, PP0 in slot 0; PP0's proxy stamped slot 0
+# reached PP1's slot 2 (``#1004 ... stamp mb_id=0 ... while on mb_id=2``) and
+# the model died without hidden states.
+#
+# The logical pass IS aligned across the stages: a follower's pass m consumes
+# PP0's request list m (blocking chain receive), and every other input of the
+# verdict (queue, #1400 told/held, budget, seats) is a function of the lists
+# received so far. Only the clock was rank-local. So PP0 puts ITS pass clock
+# on list m, every stage (PP0 included) decides pass m on that one value, and
+# the verdict is the same function of the same inputs everywhere.
+class Weg2BurstClock(NamedTuple):
+    """PP0's ``time.monotonic()`` for one pass, riding the request wire."""
+
+    now: float
+
+
+class BurstClockAbsent(RuntimeError):
+    """A PP stage had to take the burst verdict without PP0's pass clock."""
+
+
+def burst_clock_armed(pp_size: int) -> bool:
+    """Does PP0 stamp its pass clock onto the wire? Only in a PP group with
+    the burst window set; env-read, so identical on every stage."""
+    return int(pp_size or 1) > 1 and int(envs.SGLANG_WEG2_P_BURST_ASSEMBLY_MS.get() or 0) > 0
+
+
+def stamp_burst_clock(wire_reqs: Sequence[Any], now: float) -> List[Any]:
+    """PP0, before the chain send: the list to SEND (the dispatched list stays
+    the caller's -- the ``weg2_store_told.pp0_publish`` convention)."""
+    return list(wire_reqs or ()) + [Weg2BurstClock(float(now))]
+
+
+def absorb_burst_clock(recv_reqs: List[Any]) -> Tuple[List[Any], Optional[float]]:
+    """A follower, after relaying the list onward: take PP0's clock off it.
+    Returns ``(rest, now)``; ``now`` is None when the list carried none. Two
+    clocks on one list are two passes merged into one -- refused by name."""
+    clocks = [r for r in (recv_reqs or ()) if isinstance(r, Weg2BurstClock)]
+    if not clocks:
+        return recv_reqs, None
+    if len(clocks) != 1:
+        raise BurstClockAbsent(
+            "H42c BURST-CLOCK: %d PP0 pass clocks on one request list (%s); one "
+            "list is one pass" % (len(clocks), [c.now for c in clocks])
+        )
+    return [r for r in recv_reqs if not isinstance(r, Weg2BurstClock)], float(clocks[0].now)
+
+
+def without_burst_clock(recv_reqs: Sequence[Any]) -> List[Any]:
+    """The list as the request trace should see it (a clock is not a request)."""
+    return [r for r in (recv_reqs or ()) if not isinstance(r, Weg2BurstClock)]
+
+
+def burst_pass_now(pp_size: int, pass_clock: Optional[float], monotonic) -> float:
+    """The ``now`` of THIS pass's burst verdict. Non-PP: the local clock (one
+    rank, nothing to disagree with). PP: PP0's clock of this pass on every
+    stage; without it the stage would decide on its own wall time -- the x161
+    split -- so it stops by name instead (RAENGE-NIE-UNEINS)."""
+    if int(pp_size or 1) <= 1:
+        return float(monotonic())
+    if pass_clock is None:
+        raise BurstClockAbsent(
+            "H42c BURST-CLOCK ABSENT: this PP stage must take the burst-assembly "
+            "verdict (SGLANG_WEG2_P_BURST_ASSEMBLY_MS>0) but PP0's pass clock did "
+            "not arrive on this pass's request list. Deciding on this rank's own "
+            "wall time is what split x161 (PP1 slot 2, PP0 slot 0); refusing."
+        )
+    return float(pass_clock)

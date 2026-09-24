@@ -12932,13 +12932,22 @@ class Scheduler(
         Coordination only: gathers the queue's arrival stamps, the #1400
         store-told state and the budgets, and asks
         `anchor_tails.burst_hold_verdict`. Returns the hold reason, or None to
-        admit. Stamps are first-seen times on this rank (monotonic), kept for
-        rids still queued.
+        admit. Stamps are first-seen times, kept for rids still queued.
+
+        fnFL2 H42c: on a PP group EVERY stage without a forwarded schedule
+        takes this verdict (the carrierless P form has none), so the clock is
+        PP0's pass clock from the request wire, never this rank's own
+        (`anchor_tails.burst_pass_now`; x161 split PP1 slot 2 / PP0 slot 0 on
+        two wall clocks).
         """
         window_ms = int(envs.SGLANG_WEG2_P_BURST_ASSEMBLY_MS.get() or 0)
         if window_ms <= 0:
             return None
-        now = time.monotonic()
+        now = _anchor_tails.burst_pass_now(
+            getattr(getattr(self, "ps", None), "pp_size", 1),
+            getattr(self, "_weg2_burst_clock", None),
+            time.monotonic,
+        )
         seen = self.__dict__.setdefault("_weg2_burst_seen", {})
         queued = {str(r.rid): r for r in self.waiting_queue}
         for rid in list(seen):

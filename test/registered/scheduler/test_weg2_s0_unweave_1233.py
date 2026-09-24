@@ -1661,16 +1661,20 @@ class TestTheProxyReceiveDecidesAcceptOrDrop(unittest.TestCase):
         self.assertEqual(0, holder._pp_proxy_drops)
 
     def test_a_stamp_naming_another_slot_is_dropped_and_counted(self):
+        """fnFL2 H42c: never ACCEPTED -- and no longer a silent None either.
+
+        The None of S0's drop reached the model on every stage that needs
+        hidden states and died there nameless (x161: "entered the forward
+        without pp_proxy_tensors"). One layout per process means a foreign
+        slot is the stages DISAGREEING, so the receive stops by name."""
         ppm, holder = self._holder(
             {"hidden_states": "HS", "__stamp__": (2, 17, 3, -1)}
         )
-        out = ppm.SchedulerPPMixin._pp_recv_proxy_tensors(holder, mb_id=1)
-        self.assertIsNone(
-            out,
-            "a proxy frame stamped for another slot was ACCEPTED: this pairs "
-            "one request set's hidden states with another's metadata, which is "
-            "silent wrong output whenever the two widths agree",
-        )
+        with self.assertRaises(RuntimeError) as cm:
+            ppm.SchedulerPPMixin._pp_recv_proxy_tensors(holder, mb_id=1)
+        self.assertIn("#1004 SLOT DISAGREEMENT", str(cm.exception))
+        self.assertIn("launching slot 1 (fwd_ct=7", str(cm.exception))
+        self.assertIn("proxy names slot 2 (seq=17 rows=3", str(cm.exception))
         self.assertEqual(
             1,
             holder._pp_proxy_drops,
