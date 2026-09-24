@@ -164,55 +164,56 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     a,
     mixed_qkvz,
     mixed_ba,
+    qkvz_row_stride,
+    ba_row_stride,
     NUM_HEADS_QK: tl.constexpr,
     NUM_HEADS_V: tl.constexpr,
     HEAD_QK: tl.constexpr,
     HEAD_V: tl.constexpr,
+    V_POW2: tl.constexpr,
 ):
     i_bs, i_qk = tl.program_id(0), tl.program_id(1)
 
     V_PER_GROUP: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK
 
     # ── Input dimensions (contiguous layout) ──
+    # Row strides are runtime arguments (upstream #37500): the inputs may be
+    # column views of one fused in_proj GEMM output (finalize_fused_in_proj),
+    # whose row pitch is qkvz width + ba width, not the dense widths.
     TOTAL_Q: tl.constexpr = NUM_HEADS_QK * HEAD_QK
     TOTAL_K: tl.constexpr = NUM_HEADS_QK * HEAD_QK
     TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
-    TOTAL_QKVZ: tl.constexpr = TOTAL_Q + TOTAL_K + TOTAL_V + TOTAL_V
-    TOTAL_BA: tl.constexpr = NUM_HEADS_V * 2
 
     # ── Output dimensions ──
     QKV_DIM_T: tl.constexpr = TOTAL_Q + TOTAL_K + TOTAL_V
 
     # ── Read from contiguous input ──
     # q for head group i_qk: in the all_q region, offset i_qk * HEAD_QK
-    blk_q_ptr = mixed_qkvz + i_bs * TOTAL_QKVZ + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
+    blk_q_ptr = (
+        mixed_qkvz + i_bs * qkvz_row_stride + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
+    )
     # k for head group i_qk: in the all_k region
     blk_k_ptr = (
         mixed_qkvz
-        + i_bs * TOTAL_QKVZ
+        + i_bs * qkvz_row_stride
         + TOTAL_Q
         + i_qk * HEAD_QK
         + tl.arange(0, HEAD_QK)
     )
-    # v for head group i_qk: in the all_v region
-    blk_v_ptr = (
+    # Base offsets of the v/z regions for head group i_qk (upstream #34859).
+    # tl.arange only accepts power-of-two extents, so non-power-of-two group
+    # sizes (the v/k head ratio 3 of the dense 27B hybrids) walk the group one
+    # HEAD_V-sized head at a time; power-of-two groups keep the single wide
+    # vector access. V_POW2 arrives as a wrapper-computed constexpr so the dead
+    # branch is pruned before tl.arange validation.
+    v_ld_base = (
         mixed_qkvz
-        + i_bs * TOTAL_QKVZ
+        + i_bs * qkvz_row_stride
         + TOTAL_Q
         + TOTAL_K
         + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
     )
-    # z for head group i_qk: in the all_z region
-    blk_z_ptr = (
-        mixed_qkvz
-        + i_bs * TOTAL_QKVZ
-        + TOTAL_Q
-        + TOTAL_K
-        + TOTAL_V
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
+    z_ld_base = v_ld_base + TOTAL_V
 
     # ── Write to output (identical layout to the interleaved kernel) ──
     blk_q_st_ptr = mixed_qkv + i_bs * QKV_DIM_T + i_qk * HEAD_QK + tl.arange(0, HEAD_QK)
@@ -223,33 +224,42 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         + i_qk * HEAD_QK
         + tl.arange(0, HEAD_QK)
     )
-    blk_v_st_ptr = (
+    v_st_base = (
         mixed_qkv
         + i_bs * QKV_DIM_T
         + NUM_HEADS_QK * HEAD_QK * 2
         + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
     )
-    blk_z_st_ptr = (
-        z
-        + i_bs * NUM_HEADS_V * HEAD_V
-        + i_qk * V_PER_GROUP * HEAD_V
-        + tl.arange(0, V_PER_GROUP * HEAD_V)
-    )
+    z_st_base = z + i_bs * NUM_HEADS_V * HEAD_V + i_qk * V_PER_GROUP * HEAD_V
 
     tl.store(blk_q_st_ptr, tl.load(blk_q_ptr))
     tl.store(blk_k_st_ptr, tl.load(blk_k_ptr))
-    tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
-    tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
+    if V_POW2:
+        offs_group = tl.arange(0, V_PER_GROUP * HEAD_V)
+        tl.store(v_st_base + offs_group, tl.load(v_ld_base + offs_group))
+        tl.store(z_st_base + offs_group, tl.load(z_ld_base + offs_group))
+    else:
+        offs_head = tl.arange(0, HEAD_V)
+        for i in tl.static_range(V_PER_GROUP):
+            tl.store(
+                v_st_base + i * HEAD_V + offs_head,
+                tl.load(v_ld_base + i * HEAD_V + offs_head),
+            )
+            tl.store(
+                z_st_base + i * HEAD_V + offs_head,
+                tl.load(z_ld_base + i * HEAD_V + offs_head),
+            )
 
     # ── b and a from contiguous [all_b | all_a] ──
     for i in tl.static_range(V_PER_GROUP):
-        blk_b_ptr = mixed_ba + i_bs * TOTAL_BA + i_qk * V_PER_GROUP + i
+        blk_b_ptr = mixed_ba + i_bs * ba_row_stride + i_qk * V_PER_GROUP + i
         blk_b_st_ptr = b + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
         tl.store(blk_b_st_ptr, tl.load(blk_b_ptr))
 
     for i in tl.static_range(V_PER_GROUP):
-        blk_a_ptr = mixed_ba + i_bs * TOTAL_BA + NUM_HEADS_V + i_qk * V_PER_GROUP + i
+        blk_a_ptr = (
+            mixed_ba + i_bs * ba_row_stride + NUM_HEADS_V + i_qk * V_PER_GROUP + i
+        )
         blk_a_st_ptr = a + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
         tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
 
@@ -292,6 +302,9 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         device=mixed_ba.device,
     )
     a = torch.empty_like(b)
+    v_per_group = num_heads_v // num_heads_qk
+    # the rows may be strided (fused in_proj views), the columns may not
+    assert mixed_qkvz.stride(-1) == 1 and mixed_ba.stride(-1) == 1
     grid = (batch * seq_len, num_heads_qk)
     fused_qkvzba_split_reshape_cat_contiguous_kernel[grid](
         mixed_qkv,
@@ -300,10 +313,13 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         a,
         mixed_qkvz,
         mixed_ba,
+        mixed_qkvz.stride(0),
+        mixed_ba.stride(0),
         num_heads_qk,
         num_heads_v,
         head_qk,
         head_v,
+        V_POW2=(v_per_group & (v_per_group - 1)) == 0,
         num_warps=1,
         num_stages=3,
     )
