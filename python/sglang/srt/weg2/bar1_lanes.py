@@ -336,6 +336,99 @@ class SocketCredits:
 
 # -- #22: the credit-wait cycle, as numbers ------------------------------------
 
+# -- fnFL2 H22: how the depositor copies, and how long lanes overlapped ---------
+
+#: The copy engine (cudaMemcpyAsync into the mapped window): a card's deposit
+#: lanes share its ONE D2H engine and run time-multiplexed.
+COPY_SERIAL = "serial"
+#: The SM copy kernel (weg2/lane_sm_copy.py): each lane's stores go out on its
+#: own streams in parallel.
+COPY_SM = "sm"
+
+
+def parallel_copy_on() -> bool:
+    from sglang.srt.environ import envs
+    return bool(envs.SGLANG_WEG2_LANE_PARALLEL_COPY.get())
+
+
+def sm_blocks() -> int:
+    from sglang.srt.environ import envs
+    try:
+        return max(1, int(envs.SGLANG_WEG2_LANE_SM_COPY_BLOCKS.get()))
+    except (TypeError, ValueError):
+        return 64
+
+
+def deposit_copy_mode(ops, device: int):
+    """(mode, copier, why) for one deposit tag. Switch off: the copy engine,
+    no copier asked for (the 2026-09-24 path, call for call). Switch on: the
+    ops' SM copier, or the copy engine with the NAMED reason it was refused."""
+    if not parallel_copy_on():
+        return COPY_SERIAL, None, ""
+    fn = getattr(ops, "sm_copier", None)
+    if not callable(fn):
+        return COPY_SERIAL, None, f"ops {getattr(ops, 'name', type(ops).__name__)} has no sm copier"
+    try:
+        copier, why = fn(int(device))
+    except Exception as exc:  # noqa: BLE001 -- a refusal with its name, never a crash
+        return COPY_SERIAL, None, f"{type(exc).__name__}: {exc}"
+    if copier is None:
+        return COPY_SERIAL, None, str(why or "sm copier unavailable")
+    return COPY_SM, copier, ""
+
+
+def _compact(why: str, n: int = 120) -> str:
+    return "_".join(str(why).split())[:n]
+
+
+_SPAN_LOCK = threading.Lock()
+_SPANS: dict = {}          # lane key -> [[t0, t1 or None], ...] (the last few tags)
+_SPAN_KEEP = 8
+
+
+def span_open(lane_key: str, now: Optional[float] = None) -> list:
+    """Register this lane's tag as running in this process (for overlap_ms)."""
+    span = [time.perf_counter() if now is None else float(now), None]
+    with _SPAN_LOCK:
+        lst = _SPANS.setdefault(str(lane_key), [])
+        lst.append(span)
+        del lst[:-_SPAN_KEEP]
+    return span
+
+
+def span_close(lane_key: str, span: list, now: Optional[float] = None) -> float:
+    """Close the span; return the seconds during which at least one OTHER
+    lane of this process was inside a tag as well (union, not sum). A lane
+    still running counts up to now -- so the lane that ends last carries the
+    complete figure."""
+    t1 = time.perf_counter() if now is None else float(now)
+    if span[1] is None:
+        span[1] = t1
+    t1 = span[1]
+    t0 = span[0]
+    ivs = []
+    with _SPAN_LOCK:
+        for lk, lst in _SPANS.items():
+            if lk == str(lane_key):
+                continue
+            for a, b in lst:
+                lo, hi = max(t0, a), min(t1, t1 if b is None else b)
+                if hi > lo:
+                    ivs.append((lo, hi))
+    ivs.sort()
+    total, cur_lo, cur_hi = 0.0, None, None
+    for lo, hi in ivs:
+        if cur_hi is None or lo > cur_hi:
+            if cur_hi is not None:
+                total += cur_hi - cur_lo
+            cur_lo, cur_hi = lo, hi
+        else:
+            cur_hi = max(cur_hi, hi)
+    if cur_hi is not None:
+        total += cur_hi - cur_lo
+    return total
+
+
 def tag_of_seq(seq) -> str:
     """"<flip>-<tag>" -> "<tag>" (a desk counter has no tag: itself)."""
     s = str(seq)
@@ -890,6 +983,20 @@ class Bar1Lanes:
         for lk, r in roles.items():
             if r == "src":
                 self.connect_peer(lk)
+        if parallel_copy_on() and self.peers:
+            # H22: the SM copy kernel is built HERE (boot, helper thread), never
+            # by the first deposit of a flip.
+            from sglang.srt.weg2 import lane_sm_copy
+            t0 = time.perf_counter()
+            copier, why = lane_sm_copy.copier_for(self._ordinal())
+            if copier is not None:
+                self.log(f"WEG2-BAR1 sm-copy ready device={self._ordinal()} "
+                         f"arch=sm_{copier.arch[0]}{copier.arch[1]} image={copier.image_kind} "
+                         f"build_ms={copier.build_ms:.0f} blocks={sm_blocks()} "
+                         f"ms={(time.perf_counter() - t0) * 1000:.0f} lanes={sorted(self.peers)}")
+            else:
+                self.log(f"WEG2-BAR1 sm-copy REFUSED device={self._ordinal()} {why} "
+                         f"-> mode=serial (copy engine)")
         self.ready = True
         self.log(f"WEG2-BAR1 setup group={self.group} rank={self.rank} "
                  f"windows={sorted(self.recv)} peers={sorted(self.peers)} "
@@ -1078,7 +1185,16 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
     total = sum(int(b.total_bytes) for b in batches)
     npieces = sum(len(b.pieces) for b in batches)
     _nw = no_write or ()
+    # H22: the depositor's copy path. The collector copies out of its OWN
+    # window (local D2D) and stays on memcpy.
+    if role == "src":
+        cmode, copier, cwhy = deposit_copy_mode(ops, device)
+    else:
+        cmode, copier, cwhy = COPY_SERIAL, None, ""
+    cblocks = sm_blocks() if copier is not None else 0
+    slow = 0          # this tag's bytes that could not take the 16-B SM path
     t0 = time.perf_counter()
+    span = span_open(lane_key, t0)
     clk = LaneClock()
     log(f"WEG2-BAR1 mapped lane={lane_key} phase={phase} seq={seq} bytes={total} "
         f"units={npieces} batches={len(batches)} slot={slot_bytes >> 20}MiB ring={ring} credits={via}")
@@ -1132,7 +1248,18 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                                 f"{getattr(desc, 'param_name', '?')!r} carries no src_ptr")
                     src = int(desc.src_ptr) + int(piece.src_off)
                     dst = sbase + int(piece.slot_off)
-                    if piece.kind == tp.FLAT:
+                    if copier is not None:
+                        # H22: same stream, same slot, same order -- only the
+                        # engine differs (SM stores instead of the D2H engine)
+                        if piece.kind == tp.FLAT:
+                            slow += int(copier.copy_async(dst, src, int(piece.nbytes), stream,
+                                                          blocks=cblocks) or 0)
+                        else:
+                            slow += int(copier.copy2d_async(
+                                dst, int(piece.run_bytes), src, int(piece.spitch),
+                                int(piece.run_bytes), int(piece.rows), stream,
+                                blocks=cblocks) or 0)
+                    elif piece.kind == tp.FLAT:
                         ops.memcpy_async(dst, src, int(piece.nbytes), stream)
                     else:
                         ops.memcpy2d_async(dst, int(piece.run_bytes), src, int(piece.spitch),
@@ -1204,10 +1331,19 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
             clk.credit += time.perf_counter() - tw
     except RuntimeError as exc:
         return f"bar1 lane={lane_key} seq={seq}: {exc}"
-    total_s = time.perf_counter() - t0
+    finally:
+        if span[1] is None:        # every early return closes the span too
+            span[1] = time.perf_counter()
+    t_end = span[1]
+    total_s = t_end - t0
+    overlap_s = span_close(lane_key, span, t_end)
+    if copier is not None:
+        mode_f = f"mode={cmode} sm_blocks={cblocks} sm_slow_bytes={slow}"
+    else:
+        mode_f = f"mode={cmode}" + (f" mode_why={_compact(cwhy)}" if cwhy else "")
     log(f"WEG2-BAR1 lane-time lane={lane_key} phase={phase} seq={seq} units={npieces} "
         f"batches={nb} bytes={total} total_ms={total_s * 1000:.0f} "
         f"wait_ms={clk.credit * 1000:.0f} copy_sync_ms={clk.sync * 1000:.0f} "
         f"rate_GBs={(total / max(total_s, 1e-9)) / 1e9:.1f} via=bar1 credits={via} "
-        f"{clk.fields()}")
+        f"{clk.fields()} {mode_f} overlap_ms={overlap_s * 1000:.0f}")
     return ""

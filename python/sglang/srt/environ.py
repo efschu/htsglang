@@ -514,6 +514,21 @@ class Envs:
     # max(2, arena_slots // 4) (32 -> 8; chunk 16384 stays untouched),
     # N >= 2 = N, 0 = off (first-come as before).
     SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS = EnvInt(-1)
+    # LANE_PARALLEL_COPY (H22, fnFL2x127/x132): a BAR1 deposit lane writes into
+    # the peer's window as REGISTERED HOST memory, so cudaMemcpyAsync makes
+    # every deposit copy a D2H on the card's ONE D2H copy engine
+    # (asyncEngineCount 2 = one per direction): the 5090's two lanes run
+    # time-multiplexed (x132: p0 alone 7.0, p1 alone 13.7 GB/s, together
+    # 104-110 ms = 4.3-4.4 GB/s each). 1 = the depositor copies with an SM
+    # kernel (weg2/lane_sm_copy.py, NVRTC at the lane setup) on the lane's own
+    # streams; slots, sync-before-full and credits unchanged. A refused build
+    # stays on the copy engine with `mode=serial mode_why=` in the lane line.
+    # 0 = the copy engine, byte for byte the 2026-09-24 form.
+    SGLANG_WEG2_LANE_PARALLEL_COPY = EnvBool(False)
+    # LANE_SM_COPY_BLOCKS: blocks per SM-copy launch (x 256 threads), the cap
+    # one lane takes of the card's SMs; the metal probe
+    # (probe_lanes_parallel.py) sweeps it.
+    SGLANG_WEG2_LANE_SM_COPY_BLOCKS = EnvInt(64)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)

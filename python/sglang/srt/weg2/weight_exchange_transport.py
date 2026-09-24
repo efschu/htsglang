@@ -911,6 +911,15 @@ class CudartDeviceOps(DeviceOps):
             "cudaMemsetAsync",
         )
 
+    def sm_copier(self, device: int):
+        """fnFL2 H22: ``(copier, "")`` or ``(None, reason)`` -- the SM copy
+        kernel of ``weg2/lane_sm_copy.py`` for this device (built once per
+        process). The BAR1 deposit lane asks only under
+        SGLANG_WEG2_LANE_PARALLEL_COPY."""
+        from sglang.srt.weg2 import lane_sm_copy
+
+        return lane_sm_copy.copier_for(int(device))
+
     # -- host pinning -----------------------------------------------------
     def host_register(self, ptr: int, nbytes: int, flags: int) -> None:
         self._check(self.lib.cudaHostRegister(ctypes.c_void_p(ptr), nbytes, flags),
