@@ -840,27 +840,6 @@ def p_prefill_graph_pool_mib(ns) -> Tuple[float, ...]:
     return (est,) * P_PREFILL_GRAPH_STAGES
 
 
-#: --p-deep-split-from (27B line, 2026-09-24): 0 = off, the default.
-P_DEEP_SPLIT_FROM_DEFAULT = 0
-#: The crossover prefix read off the xsn426/xsn428 #PGAP fits: the graph's
-#: PP0 chunk costs 41.9 + 1.432 * (prefix + 256) / 1000 ms, the eager chunk is
-#: bounded below by the ~57 ms host launch of 42 layers, and the split lowers
-#: the eager device time under that line -- so eager + split wins from
-#: (57 - 41.9) / 1.432 * 1000 - 256 ~ 10,300 tokens on. Rounded to 20 chunks
-#: of 512. A RECOMMENDATION printed in the help, never applied by default.
-P_DEEP_SPLIT_FROM_FIT = 10240
-
-
-def p_deep_split_env(ns) -> Dict[str, str]:
-    """Group P's environment for --p-deep-split-from; {} when off."""
-    from sglang.srt.layers.attention import fi_prefill_wave_split as _fiws
-
-    n = int(getattr(ns, "p_deep_split_from", P_DEEP_SPLIT_FROM_DEFAULT) or 0)
-    if n < 0:
-        raise SystemExit(f"--p-deep-split-from must be >= 0, got {n}")
-    return _fiws.launcher_env_p_deep_split(n)
-
-
 def p_prefill_graph_env(pool_mib: Sequence[float]) -> Dict[str, str]:
     """Group P's environment under --p-prefill-graph ({} when off, so the
     default env stays byte-identical)."""
@@ -8897,6 +8876,27 @@ def p_host_overlap_lines(overlap: bool, hostgap: bool) -> List[str]:
     return lines
 
 
+#: --p-deep-split-from (27B line, 2026-09-24): 0 = off, the default.
+P_DEEP_SPLIT_FROM_DEFAULT = 0
+#: The crossover prefix read off the xsn426/xsn428 #PGAP fits: the graph's
+#: PP0 chunk costs 41.9 + 1.432 * (prefix + 256) / 1000 ms, the eager chunk is
+#: bounded below by the ~57 ms host launch of 42 layers, and the split lowers
+#: the eager device time under that line -- so eager + split wins from
+#: (57 - 41.9) / 1.432 * 1000 - 256 ~ 10,300 tokens on. Rounded to 20 chunks
+#: of 512. A RECOMMENDATION printed in the help, never applied by default.
+P_DEEP_SPLIT_FROM_FIT = 10240
+
+
+def p_deep_split_env(ns) -> Dict[str, str]:
+    """Group P's environment for --p-deep-split-from; {} when off."""
+    from sglang.srt.layers.attention import fi_prefill_wave_split as _fiws
+
+    n = int(getattr(ns, "p_deep_split_from", P_DEEP_SPLIT_FROM_DEFAULT) or 0)
+    if n < 0:
+        raise SystemExit(f"--p-deep-split-from must be >= 0, got {n}")
+    return _fiws.launcher_env_p_deep_split(n)
+
+
 def newest_bubble_log(
     evidence_dir: str, accept: Optional[Callable[[str], bool]] = None
 ) -> Optional[str]:
@@ -11134,23 +11134,6 @@ def build_parser() -> argparse.ArgumentParser:
              "per stage; pass the measured 'PREFILL-GRAPH captured ... "
              "capture_mib=' values of a previous boot instead.")
     ap.add_argument(
-        "--p-deep-split-from", type=int, default=P_DEEP_SPLIT_FROM_DEFAULT,
-        metavar="PREFIX_TOKENS",
-        help="Group P deep-chunk attention form (27B line). 0 (the default) = "
-             "off: group P's environment is byte-identical. N > 0 = an EAGER P "
-             "chunk whose prefix is >= N tokens plans its flashinfer prefill "
-             "with a wave-aware KV split (the extend plan's fixed_split_size; "
-             "rank line 'FI-WAVE-SPLIT'). With the prefill graph on, pair it "
-             "with Agent H's --p-prefill-graph-max-prefix N (same N): the graph "
-             "then declines those chunks (census reason 'deep_split') and they "
-             "take this split -- the graph-mode plan cannot split. Reason, "
-             "measured on xsn426/xsn428: at 512 tokens head_dim 256 gives 192 "
-             "attention CTAs, two rounds on the 5090's 170 SMs. The 3080 stages "
-             "find no gain and keep the stock plan. Crossover from the same "
-             f"fits: ~{P_DEEP_SPLIT_FROM_FIT} (eager PP0 host launch ~57 ms "
-             "against the graph's 41.9 + 1.432 ms per 1k prefix). Env names in "
-             "layers/attention/fi_prefill_wave_split.py.")
-    ap.add_argument(
         "--d-replayssm-spec", choices=["off", "on"], default=D_REPLAYSSM_SPEC_DEFAULT,
         help="27B ReplaySSM package. 'on' gives group D --enable-linear-replayssm-spec "
              "(+ --linear-replayssm-cache-len, a power of two >= 16 and >= the draft "
@@ -11712,6 +11695,23 @@ def build_parser() -> argparse.ArgumentParser:
              "since the previous launch. For the --p-host-overlap A/B; default "
              "off.",
     )
+    ap.add_argument(
+        "--p-deep-split-from", type=int, default=P_DEEP_SPLIT_FROM_DEFAULT,
+        metavar="PREFIX_TOKENS",
+        help="Group P deep-chunk attention form (27B line). 0 (the default) = "
+             "off: group P's environment is byte-identical. N > 0 = an EAGER P "
+             "chunk whose prefix is >= N tokens plans its flashinfer prefill "
+             "with a wave-aware KV split (the extend plan's fixed_split_size; "
+             "rank line 'FI-WAVE-SPLIT'). With the prefill graph on, pair it "
+             "with Agent H's --p-prefill-graph-max-prefix N (same N): the graph "
+             "then declines those chunks (census reason 'deep_split') and they "
+             "take this split -- the graph-mode plan cannot split. Reason, "
+             "measured on xsn426/xsn428: at 512 tokens head_dim 256 gives 192 "
+             "attention CTAs, two rounds on the 5090's 170 SMs. The 3080 stages "
+             "find no gain and keep the stock plan. Crossover from the same "
+             f"fits: ~{P_DEEP_SPLIT_FROM_FIT} (eager PP0 host launch ~57 ms "
+             "against the graph's 41.9 + 1.432 ms per 1k prefix). Env names in "
+             "layers/attention/fi_prefill_wave_split.py.")
     ap.add_argument(
         "--p-bubble-measured-from", default="",
         help="Path of the group-P log whose PP-BUBBLE lines feed "
@@ -13256,10 +13256,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for _pline in p_host_overlap_lines(
             getattr(ns, "p_host_overlap", False), getattr(ns, "p_hostgap", False)):
         log(_pline)
-    # --p-prefill-graph: {} when off (env byte-identical). The pool vector is
-    # the SAME call the cut's pool model was built from (solve_p_cut).
-    _pg_pool = p_prefill_graph_pool_mib(ns)
-    env_p.update(p_prefill_graph_env(_pg_pool))
     # --p-deep-split-from: {} when off (env byte-identical).
     _ds_env = p_deep_split_env(ns)
     env_p.update(_ds_env)
@@ -13277,6 +13273,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if p_prefill_graph_bucket() else "",
             )
         )
+    # --p-prefill-graph: {} when off (env byte-identical). The pool vector is
+    # the SAME call the cut's pool model was built from (solve_p_cut).
+    _pg_pool = p_prefill_graph_pool_mib(ns)
+    env_p.update(p_prefill_graph_env(_pg_pool))
     if _pg_pool:
         log(
             "WEG2 P-PREFILL-GRAPH post 'prefill graph pool' MiB per stage = %s "
