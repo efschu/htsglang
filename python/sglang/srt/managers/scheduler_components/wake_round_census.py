@@ -22,6 +22,9 @@ arms on the first pass after the wake, i.e. after the extend was launched):
 * ``since_wake_ms`` -- this round's open minus the wake (DORMANT cleared).
   For n=1 that is the post-wake host path up to the first decode launch --
   the part of the flip time that follows the weight legs;
+* ``ple_ms`` -- fnFL2 H35: the PLE layer's wait on its HMM n-gram gather
+  (``ple.wait``, only under SGLANG_DEBUG_DECODE_PLE_WAIT, else ``-``); it is
+  part of ``gpu_ms`` and, when present, no longer part of ``compute_ms``;
 * ``graph`` -- every forward of the round replayed a captured graph;
 * ``cold`` -- the largest single term of the round (``compute`` when the
   round is compute-bound, i.e. stationary on this form; ``pool.fetch`` when
@@ -47,6 +50,9 @@ __all__ = ["RoundCost", "WakeRoundCensus", "cold_term"]
 #: The families the line names on its own, after the phase prefix is folded.
 FETCH_FAMILY = "pool.fetch"
 ALL_REDUCE_FAMILY = "tp.all_reduce"
+#: fnFL2 H35 (layers/ple_wait_span.py): the PLE layer's join on its HMM
+#: gather -- present only under SGLANG_DEBUG_DECODE_PLE_WAIT.
+PLE_WAIT_FAMILY = "ple.wait"
 
 
 class RoundCost(msgspec.Struct, frozen=True, kw_only=True):
@@ -65,12 +71,15 @@ class RoundCost(msgspec.Struct, frozen=True, kw_only=True):
     since_wake_ms: Optional[float]
     graphed: bool
     cold: str
+    #: fnFL2 H35: ``ple.wait`` of the round; None when the family was not
+    #: recorded (switch off) -- printed ``-``, never a fabricated 0.0.
+    ple_ms: Optional[float] = None
 
     def line(self) -> str:
         return (
             "DECODE-ROUND-COST n=%d round=%d rank=%d gpu_ms=%.1f compute_ms=%s "
             "fetch_ms=%.1f allreduce_ms=%.1f wall_ms=%.1f since_wake_ms=%s "
-            "graph=%s cold=%s"
+            "graph=%s cold=%s ple_ms=%s"
             % (
                 self.n,
                 self.round_id,
@@ -83,6 +92,7 @@ class RoundCost(msgspec.Struct, frozen=True, kw_only=True):
                 "-" if self.since_wake_ms is None else "%.0f" % self.since_wake_ms,
                 "yes" if self.graphed else "no",
                 self.cold,
+                "-" if self.ple_ms is None else "%.1f" % self.ple_ms,
             )
         )
 
@@ -215,4 +225,5 @@ class WakeRoundCensus:
             ),
             graphed=bool(graphed),
             cold=cold_term(graphed=graphed, compute_ms=compute_ms, folded=folded),
+            ple_ms=folded.get(PLE_WAIT_FAMILY),
         )

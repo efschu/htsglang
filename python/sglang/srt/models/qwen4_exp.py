@@ -55,6 +55,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.nan_guard import check as _nan_check
 from sglang.srt.layers.nan_guard import nan_guard_on as _nan_guard_on
+from sglang.srt.layers.ple_wait_span import ple_wait_scope, wait_for_ple_prefetch
 
 
 def _nan_discriminate(layer, mlp_in, mlp_out, forward_batch) -> None:
@@ -1464,7 +1465,8 @@ class Qwen4ExpPLELayer(nn.Module):
         if self._prefetch_state is None:
             raise RuntimeError("PLE prefetch state is missing")
         embeddings, semantic_tokens, physical_tokens = self._prefetch_state
-        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        # fnFL2 H35: the join is timed as ``ple.wait`` (SGLANG_DEBUG_DECODE_PLE_WAIT).
+        wait_for_ple_prefetch(self._prefetch_stream)
         embeddings = self.ple_embedding.ngram_embedding.reduce(embeddings)
         embeddings = embeddings * self.ple_embedding.ngram_embedding.weight_scale
         embeddings = self.ple_embedding._finish_embedding_lookup(
@@ -1486,7 +1488,8 @@ class Qwen4ExpPLELayer(nn.Module):
         if self._prefetch_state is not None:
             embeddings = self._consume_prefetched_embeddings(forward_batch)
         else:
-            embeddings = self.ple_embedding(batch, forward_batch)
+            with ple_wait_scope():
+                embeddings = self.ple_embedding(batch, forward_batch)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]

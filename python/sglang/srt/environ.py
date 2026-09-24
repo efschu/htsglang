@@ -519,6 +519,13 @@ class Envs:
     # cold). At most PLE_DECODE_PREFETCH_PAGES pages per wake.
     SGLANG_WEG2_PLE_DECODE_PREFETCH = EnvBool(False)
     SGLANG_WEG2_PLE_DECODE_PREFETCH_PAGES = EnvInt(16384)
+    # DECODE PLE WAIT (fnFL2 H35, layers/ple_wait_span.py): time the PLE
+    # layer's join on its n-gram gather as the clock family ``ple.wait``
+    # (``spec_verify:ple.wait`` on ``Decode rank batch``, ``ple_ms`` on
+    # DECODE-ROUND-COST). The gather reads the on-disk table through HMM
+    # inside the verify graph; its cold-page faults otherwise sit in TP0's
+    # ``compute``. Debug instrumentation, per rank env (set it in group D).
+    SGLANG_DEBUG_DECODE_PLE_WAIT = EnvBool(False)
     # LRU_WARM_FROM_HANDOFF (H29b): after rearm_after_wake the free LRU rows
     # of every pool layer are filled with P's most-routed experts of the last
     # LRU_WARM_TOKENS prompt tokens (no new VRAM: only rows the reinit left
