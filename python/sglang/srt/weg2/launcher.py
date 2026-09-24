@@ -739,6 +739,15 @@ DFLASH_DRAFT_PATH_DEFAULT = (
 )
 DFLASH_BLOCK_DEFAULT = 8
 DFLASH_WINDOW_DEFAULT = 2048
+#: --d-replayssm-spec (27B ReplaySSM package, S6). ``on`` gives group D
+#: ``--enable-linear-replayssm-spec``: its GDN target verify runs the compact
+#: spec ring instead of per-draft intermediate states, and the freed
+#: "speculative intermediate state" post goes to D's KV pool (27B desk, not an
+#: NF value: -0.41 GiB post / +0.41 GiB KV per rank at 18/6 heads, mrr 2). OFF
+#: BY DEFAULT until the metal gate (see d_replayssm_spec_line) has passed -- off
+#: leaves argv_d and the D pricing byte-identical. P never gets it: P runs no
+#: target verify.
+D_REPLAYSSM_SPEC_DEFAULT = "off"
 _SPEC_FORM: Dict[str, object] = {
     "form": SPEC_FORM_DEFAULT,
     "draft_path": DFLASH_DRAFT_PATH_DEFAULT,
@@ -750,6 +759,9 @@ _SPEC_FORM: Dict[str, object] = {
     # SGLANG_WEG2_DRAFT_ON_P (the H25 authority, default 0), never the CLI
     # default of --draft-kv-on-p (on, overruled by the order since H25).
     "draft_kv_on_p": None,
+    "d_replayssm_spec": D_REPLAYSSM_SPEC_DEFAULT == "on",
+    # NF line (H64): --extra-d's --speculative-num-draft-tokens (d_verify_window).
+    "d_extra_draft_tokens": None,
 }
 
 
@@ -762,6 +774,16 @@ def apply_spec_form(ns) -> None:
     # NF: the CLI value of --draft-kv-on-p is not the answer (H25 overrules
     # it); main installs the resolved value beside resolve_draft_on_p.
     _SPEC_FORM["draft_kv_on_p"] = None
+    _SPEC_FORM["d_replayssm_spec"] = (
+        str(getattr(ns, "d_replayssm_spec", D_REPLAYSSM_SPEC_DEFAULT) or D_REPLAYSSM_SPEC_DEFAULT).lower()
+        == "on"
+    )
+    # NF line (H64): group D's MTP depth as --extra-d ships it (read by
+    # d_verify_window; the last value wins, as in argparse). None when --extra-d
+    # names none -- the constants' depth then stands.
+    _SPEC_FORM["d_extra_draft_tokens"] = _argv_scalar(
+        str(getattr(ns, "extra_d", "") or ""), "--speculative-num-draft-tokens"
+    )
     if _SPEC_FORM["form"] == "DFLASH" and not os.path.isdir(_SPEC_FORM["draft_path"]):
         raise SystemExit(
             f"--spec-form DFLASH: draft checkpoint {_SPEC_FORM['draft_path']} is not a directory"
@@ -935,17 +957,101 @@ def spec_form_env(group: str) -> Dict[str, str]:
     return {}
 
 
+def d_replayssm_spec() -> bool:
+    """--d-replayssm-spec as installed by :func:`apply_spec_form`."""
+    return bool(_SPEC_FORM.get("d_replayssm_spec", D_REPLAYSSM_SPEC_DEFAULT == "on"))
+
+
+def d_verify_window() -> int:
+    """Group D's widest verify window: the draft block under DFLASH; under
+    NEXTN the ``--speculative-num-draft-tokens`` D actually runs.
+
+    NF line (H64): the Next-Flash arm ships D's MTP depth through --extra-d
+    (``--speculative-num-steps 3 ... --speculative-num-draft-tokens 4``), which
+    argv_d appends AFTER the constants' spec family (SPEC_NUM_DRAFT_TOKENS 3),
+    and argparse takes the last value -- so the window is --extra-d's value
+    when it names one (installed by :func:`apply_spec_form`), else the
+    constant."""
+    if spec_form_is_dflash():
+        return int(_SPEC_FORM["block"])
+    raw = _SPEC_FORM.get("d_extra_draft_tokens")
+    try:
+        extra = int(str(raw)) if raw is not None else 0
+    except ValueError:
+        extra = 0
+    return extra if extra > 0 else int(SPEC_NUM_DRAFT_TOKENS)
+
+
+def d_replayssm_spec_ring_len() -> int:
+    """The ring length group D gets: a power of two, >= 16 (the commit
+    kernel's tl.dot floor) and >= the widest verify window (the draft block
+    under DFLASH, the draft tokens under NEXTN -- :func:`d_verify_window`).
+    With fold every commit the ring holds one window, so the floor is also the
+    whole cost."""
+    window = d_verify_window()
+    ring = 16
+    while ring < window:
+        ring *= 2
+    return ring
+
+
+def d_replayssm_spec_flags() -> List[str]:
+    """Group D's ReplaySSM spec-ring flags -- empty unless --d-replayssm-spec on.
+
+    ONE FACTORY with :func:`spec_plan_fields`: the argv this ships and the
+    PlanInputs the launcher prices D with read the same switch, so the D pool
+    the boot sizes and the one the launcher publishes cannot disagree about
+    the "speculative intermediate state" post."""
+    if not d_replayssm_spec():
+        return []
+    return [
+        "--enable-linear-replayssm-spec",
+        "--linear-replayssm-cache-len", str(d_replayssm_spec_ring_len()),
+    ]
+
+
+def d_replayssm_spec_line() -> str:
+    """The one launcher line naming group D's verify form, with the metal gate
+    the ON arm must pass before it may become the default."""
+    if not d_replayssm_spec():
+        return (
+            "WEG2 D-REPLAYSSM-SPEC: off -- STANDARD FORM: group D's GDN target "
+            "verify writes per-draft intermediate states (the 'speculative "
+            "intermediate state' post); --d-replayssm-spec on is the A/B arm"
+        )
+    accept = "DFLASH" if spec_form_is_dflash() else "MTP (NEXTN)"
+    return (
+        "WEG2 D-REPLAYSSM-SPEC: on -- A/B ARM, METAL GATE PENDING: group D runs "
+        f"--enable-linear-replayssm-spec (ring L={d_replayssm_spec_ring_len()}, "
+        f"verify window {d_verify_window()}, fold every commit, bf16 checkpoint "
+        "with hi/lo compensation). Expect in D's log: 'GDN ReplaySSM SPEC ring "
+        "allocated' and 'ReplaySSM spec ring: 'speculative intermediate state' "
+        "priced at ...' per rank, the KV budget posts line with the smaller post, "
+        "and a smaller 'Mamba Cache is allocated' line. Gate before any default: "
+        f"{accept} acceptance length vs the off arm, needle MATCH at 262k, greedy "
+        "A/B on fixed prompts (first tokens identical, logprob drift), a 4-8k "
+        "token generation without degeneration."
+    )
+
+
 def spec_plan_fields() -> Dict[str, object]:
     """The PlanInputs fields of the form (d_plan_inputs)."""
+    ring = (
+        {"linear_replayssm_spec_ring_len": d_replayssm_spec_ring_len()}
+        if d_replayssm_spec()
+        else {}
+    )
     if spec_form_is_dflash():
         return {
             "speculative_algorithm": "DFLASH",
             "speculative_num_draft_tokens": int(_SPEC_FORM["block"]),
             "speculative_draft_model_path": str(_SPEC_FORM["draft_path"]),
+            **ring,
         }
     return {
         "speculative_algorithm": SPEC_ALGORITHM,
         "speculative_num_draft_tokens": SPEC_NUM_DRAFT_TOKENS,
+        **ring,
     }
 
 
@@ -4118,7 +4224,7 @@ def argv_d(
         # from d_tp_ratio_decision as --d-tp-objective, priced on the launch
         # line; the default is still 'auto' because the maxkv law makes
         # capacity the default objective, not because nothing was decided.
-    ] + spec_flags(producer=False) + list(token_vector_flags) + [
+    ] + spec_flags(producer=False) + d_replayssm_spec_flags() + list(token_vector_flags) + [
         # NO TOKEN VECTOR BY DEFAULT (#1032). What stood here was
         # `--uneven-token-vector 29,19,16 --uneven-token-vector-role seed`, the
         # emitted value of RETRACTED investigation #602. See
@@ -12988,6 +13094,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="D's compact draft cache window = --speculative-draft-window-size "
                          "(the draft's sliding_window, 2048 for DFlash2).")
     ap.add_argument(
+        "--d-replayssm-spec", choices=["off", "on"], default=D_REPLAYSSM_SPEC_DEFAULT,
+        help="27B ReplaySSM package. 'on' gives group D --enable-linear-replayssm-spec "
+             "(+ --linear-replayssm-cache-len, a power of two >= 16 and >= the draft "
+             "window): D's GDN target verify runs the compact spec ring instead of "
+             "per-draft intermediate states and the freed 'speculative intermediate "
+             "state' post goes to D's KV pool; the launcher's D pricing follows the "
+             "same switch. 'off' (default until the metal gate named on the WEG2 "
+             "D-REPLAYSSM-SPEC line has passed) leaves argv_d byte-identical. Group "
+             "P never gets it (P runs no target verify). NF line (H64): the draft "
+             "window is group D's --speculative-num-draft-tokens as --extra-d ships "
+             "it (the Next-Flash MTP runs 4 over the constants' 3).")
+    ap.add_argument(
         "--transport", choices=["bar1", "nccl"], default="bar1",
         help="Collective transport for BOTH groups. 'bar1' is the shipping "
              "default. 'nccl' is the DEVELOPMENT mode of the user's order of "
@@ -14654,6 +14772,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(f"WEG2-HOST d_draft_host={d_draft_host_mib:.0f} MiB -- {d_draft_host_prov}")
     if not hicache_disabled:
         log(hicache_draft_tier_line())
+    # --d-replayssm-spec (27B ReplaySSM S6): D's verify form, both states named.
+    log(d_replayssm_spec_line())
     # #1386: `hicache_disabled` was already resolved once, at the top of
     # `main`, before `log` even existed (the first `common_flags` sentinel
     # call needs it long before this point) -- this is only the LOG SIDE of
