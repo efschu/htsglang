@@ -2193,10 +2193,19 @@ def _per_family_formats(
     single answer at family granularity -- see the resolution note below.
     """
     per_family: Dict[str, List[Tuple[str, str]]] = {}
+    # H68: the format keys of ROUTED-expert modules, from ModelOpt
+    # `quantized_layers` only (see `_routed_experts_carry_moe`).
+    routed_moe_keys: List[str] = []
 
     layers = qc.get("quantized_layers")
     if isinstance(layers, dict) and layers:
         for module, info in layers.items():
+            if _is_draft_module(str(module)):
+                # H68: the drafter (MTP / NextN head) is a separate model. Its
+                # scheme describes none of the target's families, and folding
+                # it in made the MoE family of nvidia/Qwen3.8-Flash-Next-NVFP4
+                # "mixed" (FP8-block MTP experts beside NVFP4 routed experts).
+                continue
             family = gemm_family_of_module(str(module))
             if family is None:
                 continue
@@ -2204,6 +2213,8 @@ def _per_family_formats(
             key = _modelopt_algo_format(algo)
             if key is not None:
                 per_family.setdefault(family, []).append((key, str(module)))
+                if family == GEMM_FAMILY_MOE and _is_routed_expert_module(str(module)):
+                    routed_moe_keys.append(key)
 
     # The ignored families first: a class selector's complement is defined
     # against them, so they have to be known before the groups are read.
@@ -2257,6 +2268,8 @@ def _per_family_formats(
             # answer is a measurement rather than a vote. Any other family
             # stays unresolved and is left OUT.
             weighted = _weigh_attn_gdn_by_layers(family, evidence, layer_split)
+            if weighted is None:
+                weighted = _routed_experts_carry_moe(family, evidence, routed_moe_keys)
             if weighted is not None:
                 resolved[family] = weighted
             continue
@@ -2292,6 +2305,60 @@ def _weigh_attn_gdn_by_layers(
         return None
     best = max(weights.items(), key=lambda kv: kv[1])
     return best[0] if best[1] > 0 else None
+
+
+#: H68: drafter namespaces inside a target checkpoint's quantization map.
+_DRAFT_MODULE_RE = re.compile(r"(^|\.)(mtp|nextn)(\.|$)")
+
+
+def _is_draft_module(name: str) -> bool:
+    """True for a module of the draft head shipped inside the target
+    checkpoint (``mtp.*``, ``model.mtp.*``, ``nextn.*``)."""
+    return bool(_DRAFT_MODULE_RE.search((name or "").lower()))
+
+
+def _is_routed_expert_module(name: str) -> bool:
+    """A ROUTED expert stack (``...mlp.experts``), not the shared expert."""
+    low = (name or "").lower()
+    return "experts" in low and "shared_expert" not in low
+
+
+def _routed_experts_carry_moe(
+    family: str,
+    evidence: Sequence[Tuple[str, str]],
+    routed_keys: Sequence[str],
+) -> Optional[str]:
+    """H68: resolve a MIXED MoE family by its routed experts.
+
+    nvidia/Qwen3.8-Flash-Next-NVFP4 lists its 48 routed ``mlp.experts`` stacks
+    as NVFP4 in ``quantized_layers`` and excludes ``mlp.shared_expert*`` (BF16).
+    Both land in the MoE family, so the generic rule ("bf16 AND a quantized
+    key -> leave the family out") dropped exactly the family that holds 63 of
+    the checkpoint's 69 GiB of GPU-resident weights, and the checkpoint-wide
+    key fell through to the router/hyper-connection "mlp" evidence: ``bf16``.
+
+    The resolution is deliberately narrow:
+
+    * only ModelOpt ``quantized_layers`` evidence can supply ``routed_keys``
+      (compressed-tensors configs keep their old result byte for byte);
+    * the routed experts must agree on ONE key;
+    * every bf16 piece of evidence must name a SHARED expert (or its gate) --
+      a bf16 routed-expert entry, or any third scheme, keeps the family
+      unresolved exactly as before.
+    """
+    if family != GEMM_FAMILY_MOE or not routed_keys:
+        return None
+    keys = set(routed_keys)
+    if len(keys) != 1:
+        return None
+    routed = next(iter(keys))
+    for key, source in evidence:
+        if key == routed:
+            continue
+        if key == "bf16" and "shared_expert" in str(source).lower():
+            continue
+        return None
+    return routed
 
 
 def _is_nvfp4_like(method: str, fmt: str, qc: dict) -> Optional[str]:
