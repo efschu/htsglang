@@ -12951,13 +12951,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Die Census-Messung ersetzt die Konstante auch im BUDGET von P
         # (`budgets_from_dc` zieht dc_expect_d ab) und im W19-Riegel -- EINE
         # Zahl je Karte, nicht Messung im Log und Konstante in der Rechnung.
+        # fnFL2x111 (24.09.): die Census-Zeile stammt aus Boot fnFL2x86 (1896 MiB
+        # auf der 5090), der #1444-Record des VORIGEN Boots (x110) mass 1950 und
+        # preiste 1950+256+64 = 2270. Diese Schleife ueberschrieb den Record mit
+        # der aelteren Census (1896+64 = 1960); mit P-Chunk 8192 hielt D-TP0 beim
+        # ersten Sleep 2000 MiB (torch_reserved +50 MiB) -> W19 vor dem ersten
+        # Flip. Eine aeltere Census unterbietet keine neuere Messung derselben
+        # Form: je Karte gewinnt die GROESSERE der beiden gepreisten Reserven,
+        # und die Zeile darunter nennt, welche.
+        _won: List[str] = []
         for c in cards:
             if c.uuid in _xr:
-                dc_expect_d[c.uuid] = int(_xr[c.uuid]) + slack_mib
+                _census_reserve = int(_xr[c.uuid]) + slack_mib
+                _record_reserve = int(dc_expect_d[c.uuid]) if _dc_from_record is not None else 0
+                if _record_reserve > _census_reserve:
+                    dc_expect_d[c.uuid] = _record_reserve
+                    _won.append(f"nvml{c.nvml_index}=record({_record_reserve})>census({_census_reserve})")
+                else:
+                    dc_expect_d[c.uuid] = _census_reserve
+                    _won.append(f"nvml{c.nvml_index}=census({_census_reserve})>=record({_record_reserve})")
         state.dc_expect_d = dc_expect_d
-        log("dormant residue RESERVE for group D (census-korrigiert): "
+        log("dormant residue RESERVE for group D (census-korrigiert, neuere Messung "
+            "unterbietet die aeltere nicht): "
             + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}"
-                        for c in cards))
+                        for c in cards) + " -- " + ", ".join(_won))
     # #1257c: the operator's external headroom, resolved ONCE per boot and
     # keyed by CARD UUID -- never by NVML index, which is not stable across
     # boots on this rig. Everything downstream (both budget solves, the
