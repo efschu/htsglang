@@ -3468,6 +3468,20 @@ class Scheduler(
         # admission (weg2/vision_rank_runner.py). False on every other boot
         # and rank, and then nothing below changes.
         self._weg2_vision_rank_stage = False
+        # WEG2 VISION (D side): a tower-less D with multimodal tokenization
+        # refuses an image inside its extent by name (W123) at the admission.
+        self._weg2_vision_d_guard = False
+        if os.environ.get("SGLANG_WEG2_GROUP", "").strip().upper() == "D":
+            from sglang.srt.weg2.vision_d_guard import d_guard_armed
+
+            self._weg2_vision_d_guard = d_guard_armed(self.model_config)
+            if self._weg2_vision_d_guard:
+                logger.info(
+                    "W102 Weg2VisionStage D-GUARD armed: this group tokenizes "
+                    "images (pad ids, mrope delta) and has no tower; an image "
+                    "position inside a request's extent is refused by name "
+                    "(W123) at the admission"
+                )
         _vision_origin_aborts = None
         if os.environ.get("SGLANG_WEG2_VISION", "").strip() == "transient":
             from sglang.srt.weg2.vision_rank_runner import (
@@ -11866,6 +11880,72 @@ class Scheduler(
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
 
+    def _weg2_vision_d_covered(self, req: Req, head_inputs=None) -> Optional[int]:
+        """WEG2 VISION (D side): the request's covered prefix in tokens.
+
+        The GROUP's MIN-reduced match (device + host) where the group has one
+        -- the term W31's extent is priced on (``weg2_uncached_extent``), read
+        here without that method's instrument counters -- so the verdict is
+        rank-uniform with no new collective. None under ``tp_size > 1`` when
+        the group has no match for this rid: never a rank-local number.
+        """
+        gm = tp_head_congruence.group_match_for(
+            head_inputs, str(getattr(req, "rid", "") or "")
+        )
+        if gm is not None:
+            return min(int(gm), len(req.full_untruncated_fill_ids))
+        if int(getattr(getattr(self, "ps", None), "tp_size", 1) or 1) > 1:
+            return None
+        return len(req.prefix_indices) + int(getattr(req, "host_hit_length", 0) or 0)
+
+    def _weg2_vision_d_verdict(self, req: Req, head_inputs=None) -> str:
+        """WEG2 VISION (D side): admit / defer / refuse one request. A rid
+        the group has no covered length for is DEFERRED -- never admitted on
+        this rank's own number (an admitted image position is a dead group)
+        and never refused on it."""
+        from sglang.srt.weg2 import vision_d_guard as _vdg
+
+        if not _vdg.image_spans(req):
+            return _vdg.ADMIT
+        defers = getattr(self, "_weg2_vision_d_defers", None)
+        if defers is None:
+            defers = self._weg2_vision_d_defers = {}
+        return _vdg.bounded(
+            _vdg.verdict(req, self._weg2_vision_d_covered(req, head_inputs)),
+            str(req.rid),
+            defers,
+        )
+
+    def _weg2_answer_vision_d_refusals(self, refused: List[Req], head_inputs=None) -> None:
+        """Remove the W123-refused requests and answer them BY NAME -- the
+        W31 answer path (same queue mutation on every rank, the send a no-op
+        off rank 0), terminal: re-routing would bring the same prompt back."""
+        from sglang.srt.weg2 import vision_d_guard as _vdg
+
+        refused_ids = {id(r) for r in refused}
+        self.waiting_queue = [q for q in self.waiting_queue if id(q) not in refused_ids]
+        for req in refused:
+            covered = self._weg2_vision_d_covered(req, head_inputs)
+            message = _vdg.refusal_message(req, covered)
+            logger.error("%s rid=%s covered=%s", _vdg.W_NOT_IN_PREFIX, req.rid, covered)
+            _tc = getattr(self, "tree_cache", None)
+            if _tc is not None:
+                release_admission_acquired_mamba_slot(req, _tc, site="weg2_vision_d_refusal")
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+            elif self.enable_hierarchical_cache:
+                self.tree_cache.terminate_prefetch(req.rid)
+            abort_req = AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": message,
+                },
+                rid=req.rid,
+            )
+            req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         if getattr(self, "weg2_dormant", False) and self.waiting_queue:
             # fnFL2x36: a DORMANT group builds no prefill batch, whatever
@@ -13820,6 +13900,8 @@ class Scheduler(
         # itself; they are removed and answered after the loop, where
         # mutating the list is safe. Empty on every boot with the flag off.
         _x_refused: List[Req] = []
+        # WEG2 VISION (D side): W123, collected and answered like W31.
+        _v_refused: List[Req] = []
 
         # #968 NAME WHAT THE FOLLOWER IS ALREADY HOLDING. A rank that parked a
         # chunked continuation after a #797 void has it in `self.chunked_req`
@@ -14293,6 +14375,17 @@ class Scheduler(
                 _note_skip("weg2_x_refused", req.rid)
                 _x_refused.append(req)
                 continue
+            # WEG2 VISION (D side): priced like W31 -- the GROUP's match, no
+            # new collective -- so the verdict is the same on every rank.
+            if getattr(self, "_weg2_vision_d_guard", False):
+                _vd = self._weg2_vision_d_verdict(req, _head_inputs)
+                if _vd == "defer":
+                    _note_skip("weg2_vision_defer", req.rid)
+                    continue
+                if _vd == "refuse":
+                    _note_skip("weg2_vision_refused", req.rid)
+                    _v_refused.append(req)
+                    continue
 
             # #791 PP ADMISSION UNIFORMITY. Every PP stage independently
             # re-derives its own admission verdict from its own local radix
@@ -14759,6 +14852,8 @@ class Scheduler(
         # request from that rank's queue with no client-visible signal.
         if _x_refused:
             self._weg2_answer_x_refusals(_x_refused, _head_inputs)
+        if _v_refused:
+            self._weg2_answer_vision_d_refusals(_v_refused, _head_inputs)
 
         # #1153: what this loop REACHED, recorded before any of the three
         # refusal raises below so the group-STOP line can name it (and once
