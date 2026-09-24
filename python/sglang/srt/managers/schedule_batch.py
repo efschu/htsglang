@@ -4783,6 +4783,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
                 has_been_filtered=False,
+                # #31468: the host keep-list, so a CPU mirror is filtered
+                # without a device read of new_indices.
+                new_indices_cpu=keep_indices,
             )
 
     def merge_batch(self, other: ScheduleBatch):
