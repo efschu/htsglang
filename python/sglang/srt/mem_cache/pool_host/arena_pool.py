@@ -1108,6 +1108,46 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             return [self._backend._get_suffixed_key(f"{h}.{suffix}") for h in hashes]
         return [self._backend._get_suffixed_key(h) for h in hashes]
 
+    def release_queued_rows(self, host_indices: torch.Tensor) -> int:
+        """SGLANG_HICACHE_ARENA_QUEUE_REFS: arena rows out of the host release
+        queue (HostPoolGroup._free_arena_rows) -- a store prefetch's rows the
+        tree did not adopt, each holding the ONE reader reference
+        `_arena_page_get` took. Handed back by the tree reset's rules
+        (release_tree_rows: staging rows are not arena rows, rows of a pending
+        write belong to their writer and are skipped), and a row named twice in
+        one call is released ONCE: a double-queued span must not take a second
+        reference (another holder's) off the slot. Returns the references
+        dropped."""
+        # H62 (NF line): the 27B body hands the rows to `release_tree_rows`
+        # (27B 479f6eccb0, not on this line, and unpaged: slot = row - S).
+        # Here the same rules on the PAGED id space (x59): arena token rows ->
+        # ONE reference per page (`_slots_of_rows` on the unique rows, P = 64
+        # on Next Flash -- `_arena_page_get` took one per page), rows of a
+        # pending write skipped, `row_slot` rows mapped as `free` maps them.
+        if self.arena is None or host_indices is None:
+            return 0
+        idx = torch.as_tensor(host_indices).reshape(-1).cpu().to(torch.int64)
+        if idx.numel() == 0:
+            return 0
+        rows = torch.unique(idx[_arena_mask(self, idx)]) - int(self.staging_rows)
+        if rows.numel() == 0:
+            return 0
+        row_slot = getattr(self, "row_slot", None)
+        if row_slot is not None:
+            mapped = {row_slot.pop(int(r), -1) for r in rows.tolist()}
+            slots = torch.tensor(sorted(m for m in mapped if m >= 0), dtype=torch.int64)
+        else:
+            slots = _slots_of_rows(self, rows)
+        mask = getattr(self, "_pending_mask", None)
+        if mask is not None and slots.numel():
+            slots = slots[~mask[slots]]
+        elif getattr(self, "_pending", None) and slots.numel():
+            pend = self._pending
+            slots = torch.tensor([s for s in slots.tolist() if s not in pend], dtype=torch.int64)
+        if slots.numel() == 0:
+            return 0
+        return int(self.arena.ref_slots_np(slots.numpy(), -1))
+
     def _claim(self, stems):
         """Claim (or join, or find complete) one slot per stem. Returns the
         slot list, or None when a slot could not be had even after one

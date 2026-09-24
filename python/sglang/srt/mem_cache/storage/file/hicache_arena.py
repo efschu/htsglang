@@ -36,6 +36,118 @@ _failed = False
 #: every extent boundary must sit on this granule (arena.c GRANULE)
 GRANULE = 1  # coverage is an interval list; any byte range counts
 
+#: 27B 24.09. (arena reader refs out of the release queue). Default OFF.
+#: "1": (a) every ShmArena of this process keeps a LEDGER of the reader
+#: references this process holds per slot, and a release (-1) never takes more
+#: than that -- a rank can never drop another rank's reference, nor drop one
+#: it does not hold; (b) HostPoolGroup.free hands arena ids from the host
+#: release queue back to the arena (one reference per row) instead of dropping
+#: them as #718 strays. See HostPoolGroup._free_arena_rows.
+ENV_QUEUE_REFS = "SGLANG_HICACHE_ARENA_QUEUE_REFS"
+
+
+def arena_queue_refs_on() -> bool:
+    return os.environ.get(ENV_QUEUE_REFS, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+class RefLedger:
+    """The reader references THIS process holds, per slot of one arena file.
+
+    The C refcount is shared by every rank process mapping the file; it cannot
+    say whose a reference is. This count can: it is raised by every +1 this
+    process takes through ShmArena and consumed by every -1, and a -1 beyond
+    it is refused (counted in `refused`). One ledger per file and process --
+    two ShmArena objects on the same path share it."""
+
+    def __init__(self, slots: int):
+        import torch
+
+        self.held = torch.zeros(int(slots), dtype=torch.int32)
+        self.lock = threading.Lock()
+        self.refused = 0
+
+    def took(self, slots) -> None:
+        import torch
+
+        t = torch.as_tensor(slots, dtype=torch.int64).reshape(-1)
+        t = t[t >= 0]
+        if t.numel():
+            with self.lock:
+                self.held.index_add_(0, t, torch.ones(t.numel(), dtype=torch.int32))
+
+    def allow_release(self, slots):
+        """The multiset of `slots` this process may release (each at most as
+        often as it holds a reference there); the ledger is debited for it."""
+        import torch
+
+        t = torch.as_tensor(slots, dtype=torch.int64).reshape(-1)
+        t = t[t >= 0]
+        if t.numel() == 0:
+            return t
+        with self.lock:
+            uq, cnt = torch.unique(t, return_counts=True)
+            have = self.held[uq]
+            allow = torch.minimum(cnt.to(torch.int32), have)
+            self.held[uq] = have - allow
+            self.refused += int((cnt - allow).sum())
+        return torch.repeat_interleave(uq, allow.to(torch.int64))
+
+
+_LEDGERS: dict = {}
+
+#: Instrument (default 0 = off): every N seconds a daemon thread logs the
+#: arena's reference census (ShmArena.ref_census) -- how many COMPLETE slots a
+#: reader reference pins, over the whole boot. Off the round path: the strided
+#: header read of a 720k-slot arena is ~15 ms (desk), numpy releases the GIL.
+ENV_REF_CENSUS_S = "SGLANG_HICACHE_ARENA_REF_CENSUS_S"
+_CENSUS_THREADS: dict = {}
+
+
+def _start_ref_census(arena: "ShmArena") -> None:
+    try:
+        every = float(os.environ.get(ENV_REF_CENSUS_S, "0") or 0)
+    except ValueError:
+        every = 0.0
+    if every <= 0:
+        return
+    key = os.path.realpath(arena.path)
+    with _lock:
+        if key in _CENSUS_THREADS:
+            return
+        stop = threading.Event()
+
+        def _run():
+            n = 0
+            while not stop.wait(every):
+                n += 1
+                try:
+                    pinned, refs, complete = arena.ref_census()
+                    led = arena._ledger
+                    logger.info(
+                        "ARENA-REF-CENSUS n=%d path=%s slots=%d complete=%d pinned=%d refs=%d "
+                        "own_held=%s own_refused=%s (pinned = COMPLETE slots a reader "
+                        "reference keeps from eviction, all ranks; own_* = this process's "
+                        "ledger, SGLANG_HICACHE_ARENA_QUEUE_REFS)",
+                        n, arena.path, arena.slots, complete, pinned, refs,
+                        int(led.held.sum()) if led is not None else "-",
+                        led.refused if led is not None else "-",
+                    )
+                except Exception as exc:  # noqa: BLE001 - an instrument never raises
+                    logger.info("ARENA-REF-CENSUS n=%d failed: %r", n, exc)
+
+        th = threading.Thread(target=_run, name="arena-ref-census", daemon=True)
+        _CENSUS_THREADS[key] = stop
+        th.start()
+
+
+def _ledger_for(path: str, slots: int) -> RefLedger:
+    key = (os.path.realpath(path), int(slots))
+    with _lock:
+        led = _LEDGERS.get(key)
+        if led is None:
+            led = _LEDGERS[key] = RefLedger(slots)
+        return led
+
 
 def _load_lib() -> Optional[ctypes.CDLL]:
     global _lib, _failed
@@ -140,6 +252,9 @@ class ShmArena:
     read 0 ok / 1 absent / 2 width / 3 refused.
     """
 
+    #: SGLANG_HICACHE_ARENA_QUEUE_REFS: this process's RefLedger (None = off)
+    _ledger = None
+
     def __init__(self, path: str, slot_bytes: int, slots: int):
         lib = _load_lib()
         if lib is None:
@@ -166,6 +281,10 @@ class ShmArena:
                 f"{path} holds an arena of another geometry (not {slots} x {slot_bytes})"
             )
         self.fresh = rc == 0
+        # SGLANG_HICACHE_ARENA_QUEUE_REFS: this process's reader references
+        # (None = off, the unchanged path).
+        self._ledger = _ledger_for(path, self.slots) if arena_queue_refs_on() else None
+        _start_ref_census(self)
 
     # -- helpers -----------------------------------------------------------
     @staticmethod
@@ -278,9 +397,45 @@ class ShmArena:
         n = int(a.shape[0])
         if n == 0:
             return 0
+        if self._ledger is not None:
+            return self._ref_ledgered(a, int(delta))
         return int(self._lib.arena_ref_slots(self._base, n,
                                              a.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
                                              int(delta)))
+
+    def _ref_ledgered(self, a, delta: int) -> int:
+        """SGLANG_HICACHE_ARENA_QUEUE_REFS: a reference change through this
+        process's ledger. -1: only what this process holds is released (the
+        rest is refused and counted, never applied). +1: recorded when every
+        valid slot took it; a partial batch (a slot left COMPLETE/CLAIMED
+        between find and ref) is NOT recorded -- a reference this process
+        cannot name is leaked rather than ever released twice."""
+        import numpy as np
+        if delta < 0:
+            a = self._ledger.allow_release(a).numpy()
+            if a.shape[0] == 0:
+                return 0
+        n = int(a.shape[0])
+        done = int(self._lib.arena_ref_slots(self._base, n,
+                                             a.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                             int(delta)))
+        if delta > 0 and done == int(np.count_nonzero(a >= 0)):
+            self._ledger.took(a)
+        return done
+
+    def ref_census(self):
+        """Read-only census of the slot headers: (COMPLETE slots with a reader
+        reference, sum of references, COMPLETE slots). Strided read of every
+        header -- a diagnostic, never on a round path."""
+        import numpy as np
+        out = (ctypes.c_int64 * 6)()
+        self._lib.arena_layout(self.slots, self.slot_bytes, out)
+        hb, hoff = int(out[0]), int(out[3])
+        u32 = np.frombuffer(self._mm, dtype=np.uint32, count=self.slots * hb // 4, offset=hoff)
+        hdr = u32.reshape(self.slots, hb // 4)
+        state, ref = hdr[:, 0], hdr[:, 1]
+        return (int(((state == 2) & (ref > 0)).sum()), int(ref.sum(dtype=np.int64)),
+                int((state == 2).sum()))
 
     def find_states(self, stems: Sequence[str]) -> list[int]:
         """#1439: the states only (0 absent/free, 1 claimed, 2 complete), by stem, hashed in C."""
@@ -368,6 +523,9 @@ class ShmArena:
         n = len(slots)
         if n == 0:
             return 0
+        if self._ledger is not None:
+            import numpy as np
+            return self._ref_ledgered(np.asarray([int(s) for s in slots], dtype=np.int64), int(delta))
         c = (ctypes.c_int64 * n)(*[int(s) for s in slots])
         return int(self._lib.arena_ref_slots(self._base, n, c, int(delta)))
 
