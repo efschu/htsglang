@@ -11,6 +11,9 @@ realistischem Praefix:
   Zeilen = Pool-Slots hinter einer zufaelligen 64er-Seitenpermutation);
   Varianten: Launch-Konfiguration (SGLANG_FORCE_QSA_ROWS_CONFIG, H58) x
   fp8-Decode (SGLANG_WEG2_QSA_FP8_DECODE, H65: exp2 | bits | ptx);
+* ``resolve`` -- Top-k -> Pool-Zeilen: eager torch-Kette gegen den
+  fusionierten Resolve (SGLANG_WEG2_QSA_ROWS_FUSED_EAGER), Zeit und
+  Spitzen-Allokation ueber den Eingaben, Zeilen gleich;
 * ``prefill`` -- praefixfreier erster Chunk (SGLANG_WEG2_QSA_PREFILL_CONFIG).
 
 Je Variante: Median/Minimum ms je Launch (= je Full-Attention-Layer) ueber
@@ -165,7 +168,7 @@ def main(argv=None) -> int:
     ap.add_argument("--card", type=int, required=True, help="NVML index (0/2 = 3080, 1 = 5090)")
     ap.add_argument("--booking", default="", help="gpuq booking id (must be running and hold --card)")
     ap.add_argument("--no-booking-check", action="store_true")
-    ap.add_argument("--kernels", default="rows,prefill")
+    ap.add_argument("--kernels", default="rows,resolve,prefill")
     ap.add_argument("--prefix", default="32768,81920", help="prefix lengths for the rows kernel")
     ap.add_argument("--chunk", type=int, default=16384)
     ap.add_argument("--cfgs", default="table,32/8/2,32/4/2,64/8/2")
@@ -274,6 +277,52 @@ def main(argv=None) -> int:
                 torch.cuda.empty_cache()
             del kp, vp, q, rows, base
             torch.cuda.empty_cache()
+
+    if "resolve" in kernels:
+        # H65 SGLANG_WEG2_QSA_ROWS_FUSED_EAGER: the eager torch chain against the
+        # fused resolve, time and PEAK allocation above the inputs, rows equal.
+        import types
+
+        from sglang.srt.layers.attention import qwen_sparse_attn_backend as qbk
+        from sglang.srt.layers.attention.qsa.rows_resolve import MODE_NONE, qsa_rows_resolve
+
+        prefix = max(prefixes or [0])
+        total_tok = prefix + a.chunk
+        pages = (total_tok + PAGE - 1) // PAGE
+        perm = torch.randperm(pages + 8, device=dev, generator=gen)[:pages] + 1
+        r2t = torch.zeros(2, pages * PAGE + PAGE, dtype=torch.int32, device=dev)
+        lpos = torch.arange(total_tok, device=dev)
+        r2t[1, :total_tok] = (perm[lpos // PAGE] * PAGE + lpos % PAGE).to(torch.int32)
+        logical = _selection(torch, prefix + torch.arange(a.chunk, device=dev), a.pattern, gen, dev)
+        seq_ids = torch.zeros(a.chunk, dtype=torch.int32, device=dev)
+        seq_lens = torch.tensor([total_tok], dtype=torch.int32, device=dev)
+        req_pool = torch.tensor([1], device=dev)
+        meta = types.SimpleNamespace(is_cuda_graph=False, token_to_batch_idx=seq_ids, sequence_lengths=seq_lens,
+                                     row_req_pool_indices=req_pool, token_slot_table=r2t[req_pool.long(), :total_tok])
+        res = {}
+        variants = (
+            ("torch_chain", lambda: qbk.QwenSparseAttnBackend._logical_to_physical(logical, meta)),
+            ("fused", lambda: qsa_rows_resolve(logical, seq_ids, seq_lens, req_pool, r2t, mode=MODE_NONE)[0]),
+        )
+        for name_v, fn in variants:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats(dev)
+            base_alloc = torch.cuda.memory_allocated(dev)
+
+            def run(fn=fn, name_v=name_v):
+                res[name_v] = fn()
+
+            med, mn = _time(torch, run, a.reps)
+            peak = (torch.cuda.max_memory_allocated(dev) - base_alloc) / (1 << 20)
+            eq = "-" if name_v == "torch_chain" else ("yes" if torch.equal(res[name_v], res["torch_chain"]) else "NO")
+            print(f"QSA-ROWS-BENCH kernel=resolve arch=sm{arch} prefix={prefix} chunk={a.chunk} "
+                  f"variant={name_v} ms_med={med:.2f} ms_min={mn:.2f} peak_above_inputs_mib={peak:.0f} "
+                  f"rows_equal_chain={eq}", flush=True)
+            if out_f:
+                out_f.write(json.dumps(dict(kernel="resolve", variant=name_v, prefix=prefix, ms_med=med, ms_min=mn,
+                                            peak_mib=peak, rows_equal_chain=eq, card=a.card, arch=arch)) + "\n")
+        del res, logical, r2t, meta
+        torch.cuda.empty_cache()
 
     if "prefill" in kernels:
         n = a.chunk
