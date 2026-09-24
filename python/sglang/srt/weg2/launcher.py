@@ -840,12 +840,16 @@ def p_prefill_graph_pool_mib(ns) -> Tuple[float, ...]:
     return (est,) * P_PREFILL_GRAPH_STAGES
 
 
-def p_prefill_graph_env(pool_mib: Sequence[float]) -> Dict[str, str]:
+def p_prefill_graph_env(
+    pool_mib: Sequence[float], max_prefix: Optional[int] = None
+) -> Dict[str, str]:
     """Group P's environment under --p-prefill-graph ({} when off, so the
-    default env stays byte-identical)."""
+    default env stays byte-identical). ``max_prefix`` is
+    --p-prefill-graph-max-prefix: None (the default) sets nothing, i.e. no
+    depth threshold."""
     if not p_prefill_graph_bucket():
         return {}
-    return {
+    env = {
         # model_runner_kv_cache_mixin.PREFILL_GRAPH_POOL_ENV: the runtime
         # books the same post the pool model priced.
         "SGLANG_KV_BUDGET_PREFILL_GRAPH_MIB": ",".join("%.1f" % v for v in pool_mib),
@@ -854,6 +858,13 @@ def p_prefill_graph_env(pool_mib: Sequence[float]) -> Dict[str, str]:
         # share the float workspace instead of a second split-kv buffer.
         "SGLANG_FULL_CG_PREFILL_SHARED_WORKSPACE": "1",
     }
+    if max_prefix is not None:
+        if int(max_prefix) < 0:
+            raise SystemExit(f"--p-prefill-graph-max-prefix must be >= 0, got {max_prefix}")
+        # prefill_cuda_graph_runner.PREFILL_GRAPH_MAX_PREFIX_ENV: a chunk whose
+        # prefix exceeds it runs eager (census reason 'deep_split').
+        env["SGLANG_PREFILL_GRAPH_MAX_PREFIX"] = str(int(max_prefix))
+    return env
 
 
 def p_prefill_graph_line() -> str:
@@ -10937,6 +10948,13 @@ def build_parser() -> argparse.ArgumentParser:
              "per stage; pass the measured 'PREFILL-GRAPH captured ... "
              "capture_mib=' values of a previous boot instead.")
     ap.add_argument(
+        "--p-prefill-graph-max-prefix", type=int, default=None, metavar="TOKENS",
+        help="Only with --p-prefill-graph: a P chunk whose prefix is LONGER than "
+             "this many tokens runs eager instead of replaying the graph (rank "
+             "census reason 'deep_split'), so deep chunks can take the eager "
+             "KV-split prefill. Default: no threshold (every eligible chunk "
+             "replays). Reaches the ranks as SGLANG_PREFILL_GRAPH_MAX_PREFIX.")
+    ap.add_argument(
         "--d-replayssm-spec", choices=["off", "on"], default=D_REPLAYSSM_SPEC_DEFAULT,
         help="27B ReplaySSM package. 'on' gives group D --enable-linear-replayssm-spec "
              "(+ --linear-replayssm-cache-len, a power of two >= 16 and >= the draft "
@@ -13012,7 +13030,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # --p-prefill-graph: {} when off (env byte-identical). The pool vector is
     # the SAME call the cut's pool model was built from (solve_p_cut).
     _pg_pool = p_prefill_graph_pool_mib(ns)
-    env_p.update(p_prefill_graph_env(_pg_pool))
+    env_p.update(p_prefill_graph_env(
+        _pg_pool, max_prefix=getattr(ns, "p_prefill_graph_max_prefix", None)))
     if _pg_pool:
         log(
             "WEG2 P-PREFILL-GRAPH post 'prefill graph pool' MiB per stage = %s "

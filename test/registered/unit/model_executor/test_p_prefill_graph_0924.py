@@ -421,6 +421,54 @@ class TestFullGraphEligibility(CustomTestCase):
         self.assertEqual(runner._eager_reasons, {"bs>slots": 5})
 
 
+class TestDepthThreshold(CustomTestCase):
+    """Agent K (2026-09-24): deep P chunks lose in the FA2 prefill on the 5090
+    (192 CTAs on 170 SMs at 512, no KV split, and a captured plan cannot widen
+    its grid). Target form: shallow chunks replay the graph, deep chunks run
+    eager with K's KV split. The threshold is off by default."""
+
+    def _env(self, value):
+        import os
+
+        saved = os.environ.get(pcgr.PREFILL_GRAPH_MAX_PREFIX_ENV)
+        try:
+            if value is None:
+                os.environ.pop(pcgr.PREFILL_GRAPH_MAX_PREFIX_ENV, None)
+            else:
+                os.environ[pcgr.PREFILL_GRAPH_MAX_PREFIX_ENV] = value
+            return pcgr.graph_max_prefix_from_env()
+        finally:
+            if saved is None:
+                os.environ.pop(pcgr.PREFILL_GRAPH_MAX_PREFIX_ENV, None)
+            else:
+                os.environ[pcgr.PREFILL_GRAPH_MAX_PREFIX_ENV] = saved
+
+    def test_unset_means_no_threshold(self):
+        self.assertIsNone(self._env(None))
+        self.assertIsNone(self._env(""))
+        self.assertEqual(self._env("4096"), 4096)
+        self.assertEqual(self._env("0"), 0)
+        for bad in ("x", "-1", "1.5"):
+            with self.assertRaises(ValueError):
+                self._env(bad)
+
+    def _deep(self, prefix, threshold):
+        runner = _full_runner(static_keys=None)
+        runner._graph_max_prefix = threshold
+        fb = _extend_batch(9)
+        fb.extend_prefix_lens_cpu = [prefix]
+        return runner._full_graph_ineligible_reason(fb)
+
+    def test_deeper_than_the_threshold_goes_eager_by_name(self):
+        self.assertIsNone(self._deep(1024, 1024))
+        self.assertEqual(self._deep(1025, 1024), "deep_split")
+        self.assertEqual(self._deep(1, 0), "deep_split")
+        self.assertIsNone(self._deep(0, 0))
+
+    def test_no_threshold_replays_any_depth(self):
+        self.assertIsNone(self._deep(250000, None))
+
+
 class TestTypedChannelMetadataIsNotAStageKey(CustomTestCase):
     """Boot weg2xsn427 (2026-09-24 18:05:37Z, PP1, first replay): the live
     proxy off the typed channel carried ``__msg_type__`` beside
@@ -747,6 +795,127 @@ class TestExecuteFullPath(CustomTestCase):
         # a bare hs[:n] slices the tuple and hands the tail bucket-row tensors
         self.assertEqual(runner.model_runner.model.body_rows, (n, [n, n]))
         self.assertEqual(tuple(out.hidden_states.shape), (n, 3 * H))
+
+
+class _GraphPoolBackend(_FakeFullBackend):
+    """A replay that behaves like a real captured graph: it writes the chunk's
+    result into the SAME output memory on every replay (the capture pool) and
+    hands out views of it. ``aux_from_static_input`` makes the carried aux
+    entry a view of the runner's static INPUT buffer, as the captured
+    carry_aux_forward passthrough is."""
+
+    def __init__(self, runner, keys=("hidden_states", "residual"), aux_from_static_input=None):
+        self.pool = PPProxyTensors({k: torch.zeros(MAX_TOKENS, H) for k in keys})
+        super().__init__(runner, self.pool)
+        self.aux_key = aux_from_static_input
+        self.replays = 0
+
+    def replay(self, shape_key, static_forward_batch, **kw):
+        self.replays += 1
+        for t in self.pool.tensors.values():
+            t.fill_(100.0 * self.replays)
+        out = dict(self.pool.tensors)
+        if self.aux_key is not None:
+            out[self.aux_key] = self.runner._static_pp_proxy_tensors[self.aux_key]
+        return PPProxyTensors(out)
+
+
+class TestConsecutiveChunksOwnTheirStageOutput(CustomTestCase):
+    """Boot weg2xsn428: --p-prefill-graph 512 ran on all stages with the same
+    gpu-ms as eager and produced garbage from P-routed prompts (needle 4x
+    MISS). The fork posts a proxy send without joining it (#1015e, joined a
+    lap late; --p-host-overlap keeps a frame in flight on purpose), and the
+    non-last stage handed that send VIEWS of the graph's output memory: the
+    next chunk's replay rewrote chunk k's hidden_states/residual while the send
+    still read them. Pinned here with two consecutive chunks of one request,
+    the first chunk's frame held the way the lap-late send holds it."""
+
+    def test_the_first_chunks_frame_survives_the_second_replay(self):
+        runner = _exec_runner(first=True, last=False, static_keys=None)
+        runner.backend = _GraphPoolBackend(runner)
+        fb1 = self._chunk(prefix=0, n=MAX_TOKENS)
+        frame1 = runner.execute(fb1)  # posted, not joined
+        self.assertTrue(torch.equal(frame1["hidden_states"], torch.full((MAX_TOKENS, H), 100.0)))
+        fb2 = self._chunk(prefix=MAX_TOKENS, n=5)
+        frame2 = runner.execute(fb2)
+        self.assertTrue(torch.equal(frame2["hidden_states"], torch.full((5, H), 200.0)))
+        # chunk 1's frame still carries chunk 1's values
+        self.assertTrue(
+            torch.equal(frame1["hidden_states"], torch.full((MAX_TOKENS, H), 100.0)),
+            "the second replay rewrote the first chunk's frame: the send reads "
+            "graph-pool memory",
+        )
+        self.assertTrue(torch.equal(frame1["residual"], torch.full((MAX_TOKENS, H), 100.0)))
+        for t in list(frame1.tensors.values()) + list(frame2.tensors.values()):
+            for p in runner.backend.pool.tensors.values():
+                self.assertNotEqual(t.data_ptr(), p.data_ptr())
+
+    def test_a_carried_aux_entry_survives_the_next_load_batch(self):
+        keys = ("hidden_states", "residual", "aux_layer_6")
+        runner = _exec_runner(first=False, last=False, static_keys=keys)
+        runner.backend = _GraphPoolBackend(runner, aux_from_static_input="aux_layer_6")
+        frame1 = runner.execute(
+            self._chunk(prefix=0, n=5),
+            pp_proxy_tensors=_live_proxy(5, keys=keys, value=1.0),
+        )
+        aux1 = frame1["aux_layer_6"].clone()
+        runner.execute(
+            self._chunk(prefix=5, n=5),
+            pp_proxy_tensors=_live_proxy(5, keys=keys, value=7.0),
+        )
+        self.assertTrue(
+            torch.equal(frame1["aux_layer_6"], aux1),
+            "the next chunk's load_batch refilled the static input the first "
+            "chunk's frame still pointed at",
+        )
+
+    def _chunk(self, *, prefix, n):
+        fb = _extend_batch(n)
+        fb.extend_prefix_lens = torch.tensor([prefix], dtype=torch.int64)
+        fb.extend_prefix_lens_cpu = [prefix]
+        fb.seq_lens = torch.tensor([prefix + n], dtype=torch.int64)
+        fb.seq_lens_cpu = torch.tensor([prefix + n], dtype=torch.int64)
+        fb.positions = torch.arange(prefix, prefix + n, dtype=torch.int64)
+        fb.mrope_positions = fb.positions[None, :].repeat(3, 1)
+        return fb
+
+    def test_the_replay_metadata_carries_the_live_prefix(self):
+        """Candidate (1) of the operator's list, the part a desk can see: the
+        slot-padded view handed to init_forward_metadata_out_graph (flashinfer
+        plan + GDN metadata) carries THIS chunk's prefix and length, not the
+        capture's zero prefix."""
+        runner = _full_runner(slots=1)
+        seen = []
+        runner._full_cg_seq_lens_cpu = torch.zeros((1,), dtype=torch.int64)
+        runner.model_runner = types.SimpleNamespace(
+            attn_backend=types.SimpleNamespace(
+                init_forward_metadata_out_graph=lambda view: seen.append(
+                    (
+                        view.extend_prefix_lens.tolist(),
+                        view.seq_lens.tolist(),
+                        view.seq_lens_cpu.tolist(),
+                        view.extend_seq_lens.tolist(),
+                        view.extend_start_loc.tolist(),
+                    )
+                )
+            )
+        )
+        runner._prepare_forward_metadata_for_replay = types.MethodType(
+            pcgr.PrefillCudaGraphRunner._prepare_forward_metadata_for_replay, runner
+        )
+        for prefix, n in ((0, MAX_TOKENS), (MAX_TOKENS, MAX_TOKENS), (2 * MAX_TOKENS, 5)):
+            runner.load_batch(
+                self._chunk(prefix=prefix, n=n),
+                pp_proxy_tensors=_live_proxy(n, value=1.0),
+            )
+        self.assertEqual(
+            seen,
+            [
+                ([0], [16], [16], [16], [0]),
+                ([16], [32], [32], [16], [0]),
+                ([32], [37], [37], [5], [0]),
+            ],
+        )
 
 
 class _NoHostRead(torch.Tensor):

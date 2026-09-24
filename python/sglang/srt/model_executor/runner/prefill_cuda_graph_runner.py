@@ -136,6 +136,39 @@ def prefill_failure_msg(backend_name: str) -> str:
     )
 
 
+#: Depth threshold of the full prefill graph, in prefix tokens: a chunk whose
+#: largest prefix exceeds it runs eager (census reason ``deep_split``). Unset
+#: or empty = no threshold (today's behaviour). Set for group P by the weg2
+#: launcher's --p-prefill-graph-max-prefix; the value comes from Agent K's fit
+#: of where the eager KV-split prefill beats the captured plan.
+PREFILL_GRAPH_MAX_PREFIX_ENV = "SGLANG_PREFILL_GRAPH_MAX_PREFIX"
+
+
+def graph_max_prefix_from_env() -> Optional[int]:
+    """The depth threshold, or None for none. A malformed or negative value
+    is refused at runner construction -- a threshold that silently reads as
+    'none' would hand every deep chunk to the graph the operator meant to
+    keep it away from."""
+    import os
+
+    raw = os.environ.get(PREFILL_GRAPH_MAX_PREFIX_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"{PREFILL_GRAPH_MAX_PREFIX_ENV}={raw!r}: expected an integer "
+            "number of prefix tokens (unset = no threshold)"
+        ) from None
+    if value < 0:
+        raise ValueError(
+            f"{PREFILL_GRAPH_MAX_PREFIX_ENV}={value}: must be >= 0 "
+            "(unset = no threshold)"
+        )
+    return value
+
+
 def _stage_tensors_only(
     proxy: Optional[PPProxyTensors],
 ) -> Optional[PPProxyTensors]:
@@ -149,6 +182,26 @@ def _stage_tensors_only(
         return None
     return PPProxyTensors(
         {k: v for k, v in proxy.tensors.items() if k not in CHANNEL_META_KEYS}
+    )
+
+
+def _own_stage_output(output: PPProxyTensors, rows: int) -> PPProxyTensors:
+    """The stage output a non-last PP stage hands to its proxy send: the first
+    ``rows`` token rows of every tensor, COPIED into fresh allocations.
+
+    A replayed graph writes its output into the SAME memory on every replay
+    (the capture pool), and the carried aux entries are views of the static
+    input buffers the next load_batch refills. The PP send is posted without
+    being joined (joined a lap late, #1015e) and, under --p-host-overlap, one
+    frame is deliberately left in flight -- so an aliased output is rewritten
+    by the next chunk while the send still reads it. A fresh tensor is kept
+    alive by the send's own reference, exactly like the eager path's output.
+    One D2D copy of the frame (2 x 512 x 5120 x 2 B = 10 MiB) per chunk."""
+    return PPProxyTensors(
+        {
+            k: (v[:rows].clone() if torch.is_tensor(v) else v)
+            for k, v in output.tensors.items()
+        }
     )
 
 
@@ -298,6 +351,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Rate-limited eager-fallback census of the full backend (see
         # _note_eager): reason -> count. Instrument only, never a gate.
         self._eager_reasons: Dict[str, int] = {}
+        # Depth threshold of the full backend (graph_max_prefix_from_env):
+        # None = no threshold, today's behaviour.
+        self._graph_max_prefix: Optional[int] = graph_max_prefix_from_env()
 
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
@@ -790,6 +846,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     return "input_logprob"
         if len(forward_batch.input_ids) > self.max_num_tokens:
             return "tokens>bucket"
+        max_prefix = self.__dict__.get("_graph_max_prefix")
+        if max_prefix is not None:
+            prefix = max(forward_batch.extend_prefix_lens_cpu or [0])
+            if prefix > max_prefix:
+                # Deep chunks go eager, where the KV-split prefill (Agent K,
+                # 2026-09-24) can widen the attention grid past what a
+                # captured plan holds (5090: 192 CTAs on 170 SMs at 512).
+                return "deep_split"
         return None
 
     def _note_eager(self, reason: str, forward_batch: ForwardBatch) -> None:
@@ -1492,7 +1556,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         "CUDA graph backend only."
                     )
                 # Non-last PP stage under the full backend (upstream #35451):
-                # the stage output, raw rows only. Graph-pool tensors, valid
-                # until the next replay -- the PP loop commits this send
-                # (_pp_commit_comm_work) before it launches the next forward.
-                return output[: self.raw_num_tokens]
+                # the stage output, raw rows only -- and OWNED (_own_stage_
+                # output), never the graph's buffers. Boot weg2xsn428 read the
+                # opposite assumption: this fork POSTS a proxy send without
+                # joining it (_pp_commit_comm_work -> _pp_post_send, joined a
+                # lap late, #1015e; under --p-host-overlap bound_proxy_lead
+                # keeps one frame in flight on purpose), so the NEXT chunk's
+                # replay overwrote this chunk's hidden_states / residual --
+                # graph-pool memory, and the aux carry's views of the static
+                # input buffers -- while the send was still reading them.
+                # Eager is immune: its outputs are fresh allocations the send
+                # keeps alive until it is joined.
+                return _own_stage_output(output, self.raw_num_tokens)

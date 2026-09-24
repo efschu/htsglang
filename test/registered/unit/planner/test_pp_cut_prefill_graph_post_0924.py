@@ -107,7 +107,7 @@ class TestTheTwoSidesNameOnePost(CustomTestCase):
         src = open(L.__file__).read()
         # the pool model and the env are built from the same call
         self.assertIn("prefill_graph_pool_mib=p_prefill_graph_pool_mib(ns)", src)
-        self.assertIn("env_p.update(p_prefill_graph_env(_pg_pool))", src)
+        self.assertTrue(re.search(r"env_p\.update\(p_prefill_graph_env\(\s*_pg_pool", src))
         self.assertTrue(re.search(r"_pg_pool = p_prefill_graph_pool_mib\(ns\)", src))
 
 

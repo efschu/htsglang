@@ -155,6 +155,19 @@ class TestOnStatesTheCoupledForm(_SwitchCase):
             L.p_prefill_graph_pool_mib(ns), (2 * L.P_PREFILL_GRAPH_POOL_MIB_PER_512,) * 3
         )
 
+    def test_depth_threshold_reaches_p_only_when_given(self):
+        ns = self._apply(p_prefill_graph=512)
+        self.assertIsNone(ns.p_prefill_graph_max_prefix)
+        pool = L.p_prefill_graph_pool_mib(ns)
+        self.assertNotIn("SGLANG_PREFILL_GRAPH_MAX_PREFIX", L.p_prefill_graph_env(pool))
+        env = L.p_prefill_graph_env(pool, max_prefix=8192)
+        self.assertEqual(env["SGLANG_PREFILL_GRAPH_MAX_PREFIX"], "8192")
+        with self.assertRaises(SystemExit):
+            L.p_prefill_graph_env(pool, max_prefix=-1)
+        # the switch off: nothing at all, threshold or not
+        self._apply()
+        self.assertEqual(L.p_prefill_graph_env((), max_prefix=8192), {})
+
     def test_negative_bucket_is_refused(self):
         with self.assertRaises(SystemExit):
             self._apply(p_prefill_graph=-1)
