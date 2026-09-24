@@ -683,12 +683,21 @@ DFLASH_WINDOW_DEFAULT = 2048
 #: key, the census and the ledger are byte-identical under both values.
 DFLASH_PRODUCE_ON_P_DEFAULT = "off"
 DFLASH_PRODUCE_ENV = "SGLANG_WEG2_DFLASH_PRODUCE"
+#: --d-replayssm-spec (27B ReplaySSM package, S6). ``on`` gives group D
+#: ``--enable-linear-replayssm-spec``: its GDN target verify runs the compact
+#: spec ring instead of per-draft intermediate states, and the freed
+#: "speculative intermediate state" post goes to D's KV pool (desk: -0.41 GiB
+#: post / +0.41 GiB KV per rank at 18/6 heads, mrr 2). OFF BY DEFAULT until the
+#: metal gate (see d_replayssm_spec_line) has passed -- off leaves argv_d and
+#: the D pricing byte-identical. P never gets it: P runs no target verify.
+D_REPLAYSSM_SPEC_DEFAULT = "off"
 _SPEC_FORM: Dict[str, object] = {
     "form": SPEC_FORM_DEFAULT,
     "draft_path": DFLASH_DRAFT_PATH_DEFAULT,
     "block": DFLASH_BLOCK_DEFAULT,
     "window": DFLASH_WINDOW_DEFAULT,
     "produce_on_p": DFLASH_PRODUCE_ON_P_DEFAULT == "on",
+    "d_replayssm_spec": D_REPLAYSSM_SPEC_DEFAULT == "on",
 }
 
 
@@ -700,6 +709,10 @@ def apply_spec_form(ns) -> None:
     _SPEC_FORM["window"] = int(getattr(ns, "dflash_window", DFLASH_WINDOW_DEFAULT) or DFLASH_WINDOW_DEFAULT)
     _SPEC_FORM["produce_on_p"] = (
         str(getattr(ns, "dflash_produce_on_p", DFLASH_PRODUCE_ON_P_DEFAULT) or DFLASH_PRODUCE_ON_P_DEFAULT).lower()
+        == "on"
+    )
+    _SPEC_FORM["d_replayssm_spec"] = (
+        str(getattr(ns, "d_replayssm_spec", D_REPLAYSSM_SPEC_DEFAULT) or D_REPLAYSSM_SPEC_DEFAULT).lower()
         == "on"
     )
     if _SPEC_FORM["form"] == "DFLASH" and not os.path.isdir(_SPEC_FORM["draft_path"]):
@@ -801,17 +814,78 @@ def dflash_produce_line() -> str:
     )
 
 
+def d_replayssm_spec() -> bool:
+    """--d-replayssm-spec as installed by :func:`apply_spec_form`."""
+    return bool(_SPEC_FORM.get("d_replayssm_spec", D_REPLAYSSM_SPEC_DEFAULT == "on"))
+
+
+def d_replayssm_spec_ring_len() -> int:
+    """The ring length group D gets: a power of two, >= 16 (the commit
+    kernel's tl.dot floor) and >= the widest verify window (the draft block
+    under DFLASH, the draft tokens under NEXTN). With fold every commit the
+    ring holds one window, so the floor is also the whole cost."""
+    window = int(_SPEC_FORM["block"]) if spec_form_is_dflash() else int(SPEC_NUM_DRAFT_TOKENS)
+    ring = 16
+    while ring < window:
+        ring *= 2
+    return ring
+
+
+def d_replayssm_spec_flags() -> List[str]:
+    """Group D's ReplaySSM spec-ring flags -- empty unless --d-replayssm-spec on.
+
+    ONE FACTORY with :func:`spec_plan_fields`: the argv this ships and the
+    PlanInputs the launcher prices D with read the same switch, so the D pool
+    the boot sizes and the one the launcher publishes cannot disagree about
+    the "speculative intermediate state" post."""
+    if not d_replayssm_spec():
+        return []
+    return [
+        "--enable-linear-replayssm-spec",
+        "--linear-replayssm-cache-len", str(d_replayssm_spec_ring_len()),
+    ]
+
+
+def d_replayssm_spec_line() -> str:
+    """The one launcher line naming group D's verify form, with the metal gate
+    the ON arm must pass before it may become the default."""
+    if not d_replayssm_spec():
+        return (
+            "WEG2 D-REPLAYSSM-SPEC: off -- STANDARD FORM: group D's GDN target "
+            "verify writes per-draft intermediate states (the 'speculative "
+            "intermediate state' post); --d-replayssm-spec on is the A/B arm"
+        )
+    return (
+        "WEG2 D-REPLAYSSM-SPEC: on -- A/B ARM, METAL GATE PENDING: group D runs "
+        f"--enable-linear-replayssm-spec (ring L={d_replayssm_spec_ring_len()}, "
+        "fold every commit, bf16 checkpoint with hi/lo compensation). Expect in "
+        "D's log: 'GDN ReplaySSM SPEC ring allocated' and 'ReplaySSM spec ring: "
+        "'speculative intermediate state' priced at ...' per rank, the KV budget "
+        "posts line with the smaller post, and more D KV tokens. Gate before any "
+        "default: DFLASH acceptance length vs the off arm, needle MATCH at 262k, "
+        "greedy A/B on fixed prompts (first tokens identical, logprob drift), a "
+        "4-8k token generation without degeneration."
+    )
+
+
 def spec_plan_fields() -> Dict[str, object]:
     """The PlanInputs fields of the form (d_plan_inputs)."""
+    ring = (
+        {"linear_replayssm_spec_ring_len": d_replayssm_spec_ring_len()}
+        if d_replayssm_spec()
+        else {}
+    )
     if spec_form_is_dflash():
         return {
             "speculative_algorithm": "DFLASH",
             "speculative_num_draft_tokens": int(_SPEC_FORM["block"]),
             "speculative_draft_model_path": str(_SPEC_FORM["draft_path"]),
+            **ring,
         }
     return {
         "speculative_algorithm": SPEC_ALGORITHM,
         "speculative_num_draft_tokens": SPEC_NUM_DRAFT_TOKENS,
+        **ring,
     }
 
 
@@ -3318,7 +3392,7 @@ def argv_d(
         # from d_tp_ratio_decision as --d-tp-objective, priced on the launch
         # line; the default is still 'auto' because the maxkv law makes
         # capacity the default objective, not because nothing was decided.
-    ] + spec_flags(producer=False) + list(token_vector_flags) + [
+    ] + spec_flags(producer=False) + d_replayssm_spec_flags() + list(token_vector_flags) + [
         # NO TOKEN VECTOR BY DEFAULT (#1032). What stood here was
         # `--uneven-token-vector 29,19,16 --uneven-token-vector-role seed`, the
         # emitted value of RETRACTED investigation #602. See
@@ -10378,6 +10452,16 @@ def build_parser() -> argparse.ArgumentParser:
              "FORM key are byte-identical under both values, and the launcher names "
              "the form in one line (WEG2 DFLASH-PRODUCE-ON-P).")
     ap.add_argument(
+        "--d-replayssm-spec", choices=["off", "on"], default=D_REPLAYSSM_SPEC_DEFAULT,
+        help="27B ReplaySSM package. 'on' gives group D --enable-linear-replayssm-spec "
+             "(+ --linear-replayssm-cache-len, a power of two >= 16 and >= the draft "
+             "window): D's GDN target verify runs the compact spec ring instead of "
+             "per-draft intermediate states and the freed 'speculative intermediate "
+             "state' post goes to D's KV pool; the launcher's D pricing follows the "
+             "same switch. 'off' (default until the metal gate named on the WEG2 "
+             "D-REPLAYSSM-SPEC line has passed) leaves argv_d byte-identical. Group "
+             "P never gets it (P runs no target verify).")
+    ap.add_argument(
         "--transport", choices=["bar1", "nccl"], default="bar1",
         help="Collective transport for BOTH groups. 'bar1' is the shipping "
              "default. 'nccl' is the DEVELOPMENT mode of the user's order of "
@@ -11926,6 +12010,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # --dflash-produce-on-p (2026-09-24): P carries the DFlash producer
         # flags; whether it COMPUTES rides P's environment (spec_form_env).
         log(dflash_produce_line())
+    # --d-replayssm-spec (27B ReplaySSM S6): D's verify form, both states named.
+    log(d_replayssm_spec_line())
     # #1386: `hicache_disabled` was already resolved once, at the top of
     # `main`, before `log` even existed (the first `common_flags` sentinel
     # call needs it long before this point) -- this is only the LOG SIDE of
