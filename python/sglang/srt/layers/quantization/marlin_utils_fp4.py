@@ -519,3 +519,207 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         )
     if w2_bias is not None:
         layer.w2_bias = torch.nn.Parameter(_permute_bias(w2_bias), requires_grad=False)
+
+
+def nvfp4_marlin_global_scale_1d(global_scale: torch.Tensor) -> torch.Tensor:
+    """The per-expert Marlin global scale as the kernel indexes it: ``[E]``.
+
+    :func:`prepare_moe_nvfp4_layer_for_marlin_inplace` keeps it as ``[E, 1]``
+    (see there); a view, never a copy, so a captured graph reads the same
+    address the offload pool writes."""
+    if global_scale.dim() == 2 and global_scale.shape[1] == 1:
+        return global_scale.view(-1)
+    return global_scale
+
+
+def prepare_moe_nvfp4_layer_for_marlin_inplace(
+    layer: torch.nn.Module,
+    *,
+    device: torch.device | None = None,
+    outputs_survive: bool = True,
+    repack=None,
+    make_workspace=None,
+) -> None:
+    """H68b: :func:`prepare_moe_nvfp4_layer_for_marlin` for the expert-offload
+    form. The same bytes come out; three things differ, and each decides
+    whether the NF flip form can load an NVFP4 MoE at all:
+
+    1. PER EXPERT into ONE preallocated output instead of a list of E repacked
+       tensors plus ``torch.stack`` (input, list and stack: three [E] copies
+       alive at the end). When the checkpoint tensors are HOST-staged (the
+       offload presplit, ``ModelOptNvFp4FusedMoEMethod.create_weights``) the
+       input is read expert by expert from the host, so no full [E] device
+       copy of the INPUT exists either: the device peak is the output plus
+       one expert.
+    2. The Parameter OBJECTS are kept (``copy_or_rebind_param``). A fresh
+       ``torch.nn.Parameter`` left the old one -- and its [E] stack -- alive in
+       the loader's params_dict snapshot until load_weights returned: upstream
+       #38074 (+0.66 GiB per layer, OOM at layer 9 of 48), the same class
+       fn1l measured on the compressed-tensors door (+0.81 GiB per layer,
+       ``presplit_expert_offload_after_repack``).
+    3. The two global scales come out as ``[E, 1]``, not ``[E]``: one ROW per
+       expert, like every other expert-major tensor of the layer. The expert
+       presplit, the host store and the Platztausch manifest all cut experts
+       on dim 0, and ``StorageGeom.of`` reads a 1-D tensor as ONE row of E
+       columns -- the expert row cut (``_expert_pad_cut``, same columns on
+       every rank) could never match it. The kernel gets the ``[E]`` view
+       (:func:`nvfp4_marlin_global_scale_1d`), so its input is unchanged.
+
+    ``device``: the card that computes (default: the weights' device if CUDA,
+    else the current CUDA device). ``outputs_survive``: False when a presplit
+    follows and the outputs are transients of the repack (they stay outside the
+    weights tag pool); True when they ARE the resident weights (born back in
+    the tag pool). ``repack`` / ``make_workspace``: injectable for hermetic
+    tests (defaults: ``gptq_marlin_repack`` / ``marlin_make_workspace``).
+    """
+    import contextlib
+
+    def copy_or_rebind_param(module, name, value):
+        # ALWAYS rebind the data of the SAME Parameter object (never copy into
+        # the old storage): the old storage may be the host-staged checkpoint
+        # tensor, and it must go the moment its successor exists.
+        param = getattr(module, name, None)
+        if isinstance(param, torch.nn.Parameter):
+            param.data = value.detach()
+            param.requires_grad_(False)
+        else:
+            setattr(module, name, torch.nn.Parameter(value.detach(), requires_grad=False))
+
+    if layer.quant_config.group_size != 16:
+        raise ValueError(
+            f"NVFP4 Marlin MoE requires group_size=16, got {layer.quant_config.group_size}."
+        )
+    if repack is None:
+        repack = globals().get("gptq_marlin_repack")
+        if repack is None:
+            raise RuntimeError("NVFP4 Marlin MoE repack needs the CUDA JIT kernel")
+    if make_workspace is None:
+        make_workspace = marlin_make_workspace
+
+    w13 = layer.w13_weight.data
+    w2 = layer.w2_weight.data
+    w13_scale = layer.w13_weight_scale.data
+    w2_scale = layer.w2_weight_scale.data
+    w13_global_scale = layer.w13_weight_scale_2.data
+    w2_global_scale = layer.w2_weight_scale_2.data
+    w13_bias = getattr(layer, "w13_bias", None)
+    w2_bias = getattr(layer, "w2_bias", None)
+
+    num_experts = w13.shape[0]
+    num_shards = 2 if layer.moe_runner_config.is_gated else 1
+    intermediate_size = layer.intermediate_size_per_partition
+    hidden_size = w13.shape[2] * 2
+    param_dtype = layer.params_dtype
+    if param_dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError("NVFP4 Marlin MoE requires FP16 or BF16 activations.")
+    if device is None:
+        device = (
+            w13.device
+            if w13.device.type == "cuda"
+            else torch.device("cuda", torch.cuda.current_device())
+        )
+
+    try:
+        from sglang.srt.managers.weg2_memory_saver import back_into_tag_pool
+    except ImportError:  # pragma: no cover - stripped builds
+        back_into_tag_pool = contextlib.nullcontext
+    survivor = back_into_tag_pool
+    output_ctx = back_into_tag_pool if outputs_survive else contextlib.nullcontext
+
+    with survivor():
+        layer.workspace = make_workspace(device, 4)
+    perm = torch.empty(0, dtype=torch.int, device=device)
+
+    if not layer.moe_runner_config.is_gated:
+        padded_intermediate_size = ((intermediate_size + 127) // 128) * 128
+        intermediate_size_pad = padded_intermediate_size - intermediate_size
+        if intermediate_size_pad:
+            w13 = torch.nn.functional.pad(w13, (0, 0, 0, intermediate_size_pad))
+            w13_scale = torch.nn.functional.pad(
+                w13_scale, (0, 0, 0, intermediate_size_pad)
+            )
+            w2 = torch.nn.functional.pad(w2, (0, intermediate_size_pad // 2, 0, 0))
+            w2_scale = torch.nn.functional.pad(
+                w2_scale, (0, intermediate_size_pad // 16)
+            )
+            if w13_bias is not None:
+                w13_bias = torch.nn.functional.pad(w13_bias, (0, intermediate_size_pad))
+            intermediate_size = padded_intermediate_size
+
+    size_n13, size_k13 = intermediate_size * num_shards, hidden_size
+    size_n2, size_k2 = hidden_size, intermediate_size
+
+    def _per_expert(src: torch.Tensor, fn) -> torch.Tensor:
+        out = None
+        for i in range(num_experts):
+            x = src[i]
+            if x.device != device:
+                x = x.to(device)
+            y = fn(x)
+            if out is None:
+                with output_ctx():
+                    out = torch.empty(
+                        (num_experts,) + tuple(y.shape), dtype=y.dtype, device=device
+                    )
+            out[i].copy_(y)
+            del x, y
+        return out
+
+    def _repack(size_n: int, size_k: int):
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            assert x.shape == (size_n, size_k // 2), (tuple(x.shape), size_n, size_k)
+            return repack(
+                b_q_weight=x.view(torch.int32).T.contiguous(),
+                perm=perm,
+                size_k=size_k,
+                size_n=size_n,
+                num_bits=4,
+            )
+
+        return fn
+
+    def _scales(size_n: int, size_k: int):
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            s = marlin_permute_scales(
+                s=x.to(param_dtype).T.contiguous(),
+                size_k=size_k,
+                size_n=size_n,
+                group_size=16,
+            )
+            return nvfp4_marlin_process_scales(s)
+
+        return fn
+
+    def _global(gs: torch.Tensor) -> torch.Tensor:
+        g = nvfp4_marlin_process_global_scale(
+            gs.to(device=device, dtype=param_dtype)
+        ).reshape(num_experts, 1)
+        with output_ctx():
+            out = torch.empty_like(g)
+        out.copy_(g)
+        return out
+
+    # One tensor at a time, each rebound before the next is built: the old
+    # (checkpoint-format) data is released as soon as its successor exists.
+    copy_or_rebind_param(layer, "w13_weight", _per_expert(w13, _repack(size_n13, size_k13)))
+    del w13
+    copy_or_rebind_param(layer, "w2_weight", _per_expert(w2, _repack(size_n2, size_k2)))
+    del w2
+    copy_or_rebind_param(
+        layer, "w13_weight_scale", _per_expert(w13_scale, _scales(size_n13, size_k13))
+    )
+    del w13_scale
+    copy_or_rebind_param(
+        layer, "w2_weight_scale", _per_expert(w2_scale, _scales(size_n2, size_k2))
+    )
+    del w2_scale
+    copy_or_rebind_param(layer, "w13_weight_scale_2", _global(w13_global_scale))
+    copy_or_rebind_param(layer, "w2_weight_scale_2", _global(w2_global_scale))
+
+    def _bias(b: torch.Tensor) -> torch.Tensor:
+        return marlin_permute_bias(b.to(param_dtype))
+
+    if w13_bias is not None:
+        copy_or_rebind_param(layer, "w13_bias", _per_expert(w13_bias, _bias))
+    if w2_bias is not None:
+        copy_or_rebind_param(layer, "w2_bias", _per_expert(w2_bias, _bias))
