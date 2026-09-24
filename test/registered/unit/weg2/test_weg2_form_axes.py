@@ -42,6 +42,14 @@ from sglang.srt.weg2 import form as F
 from sglang.srt.weg2 import host_ledger
 from sglang.srt.weg2 import launcher
 
+#: --dflash-produce-on-p (0ae5d7dead/853c448693) lives on the 27B line only; the NF boot tree
+#: cherry-picks this file without it (NF operator 24.09.), so the two tests that pass the flag
+#: are conditional on the parser literal, not on a branch name.
+_HAS_DFLASH_PRODUCE_FLAG = '"--dflash-produce-on-p"' in open(launcher.__file__).read()
+_needs_produce_flag = unittest.skipUnless(
+    _HAS_DFLASH_PRODUCE_FLAG, "--dflash-produce-on-p not in this tree's launcher (27B line only)"
+)
+
 NF_MODEL_NAME = "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist"
 Q27_MODEL_NAME = "Qwen3.8-27B-INT8-gdncov-vocabembed"
 
@@ -140,6 +148,7 @@ class TestResolveRealForms(_Models):
         ns, form = _resolve(_q27_words(self.dense) + ["--weg2-disable-hicache"])
         self.assertEqual(form.p_draft, "none")
 
+    @_needs_produce_flag
     def test_produce_on_is_compute(self):
         ns, form = _resolve(_q27_words(self.dense) + ["--dflash-produce-on-p", "on"])
         self.assertEqual(form.p_draft, "compute")
@@ -187,6 +196,7 @@ class TestContradictions(_Models):
         self._refused(["--tree", "/tmp", "--tag", "t", "--model", self.dense,
                        "--form-p-draft", "cold"], "needs --spec-form DFLASH")
 
+    @_needs_produce_flag
     def test_form_p_draft_against_explicit_produce(self):
         self._refused(_q27_words(self.dense) + ["--dflash-produce-on-p", "off",
                                                 "--form-p-draft", "compute"],
