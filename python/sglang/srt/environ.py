@@ -480,7 +480,12 @@ class Envs:
     # tail 538/505 ms with the walk, 18/23 ms without). 1 = DEFER: the walk
     # runs 2 s after the sleep answered and logs WEG2-SLEEP-HOST-HEAP-CENSUS
     # with its own census_ms; 2 = INLINE (the old form); 0 = OFF.
-    SGLANG_WEG2_SLEEP_HEAP_CENSUS = EnvInt(Weg2HeapCensus.DEFER)
+    # DEFAULT OFF since fnFL2x131/x132: DEFER's walk (613 ms, 2 s after the
+    # sleep) lands in D's post-wake extend and made the census flips 0.2-0.3 s
+    # SLOWER (3.38/3.30 vs 3.18/3.01 s), OFF equals the pre-H16 flips; and once
+    # the extend shrinks, an INLINE walk of 500 ms is back on the critical
+    # path. The census is a leak instrument: switch it on by name when hunting.
+    SGLANG_WEG2_SLEEP_HEAP_CENSUS = EnvInt(Weg2HeapCensus.OFF)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)

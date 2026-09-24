@@ -42,8 +42,10 @@ def test_census_cadence_is_the_xsn297_one():
     assert due == [1, 2, 4, 8, 16]
 
 
-def test_default_mode_defers_and_every_mode_respects_the_cadence():
-    assert envs.SGLANG_WEG2_SLEEP_HEAP_CENSUS.get() == Weg2HeapCensus.DEFER
+def test_default_mode_is_off_and_every_mode_respects_the_cadence():
+    # x131/x132: DEFER lands in D's post-wake extend (+0.2-0.3 s per census
+    # flip), INLINE is 500 ms on P's tail once the extend shrinks -- OFF.
+    assert envs.SGLANG_WEG2_SLEEP_HEAP_CENSUS.get() == Weg2HeapCensus.OFF
     assert hc.census_action(mode=Weg2HeapCensus.DEFER, sleep_count=2) == "defer"
     assert hc.census_action(mode=Weg2HeapCensus.INLINE, sleep_count=4) == "inline"
     assert hc.census_action(mode=Weg2HeapCensus.OFF, sleep_count=2) == "off"
