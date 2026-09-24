@@ -19,6 +19,7 @@ Protocol (little endian, over stdin/stdout pipes):
   - kind 1 GATHER: payload = n x int64 destination rows, then n x int64 keys;
     key = (file index << 48) | byte offset, key < 0 = a zero row. Every row is
     ``row_bytes`` bytes, written at ``dest * row_bytes`` of slot ``slot``.
+    ``arg`` > 0 = rows per thread task (fnFL2 H40), 0 = the default split.
   - kind 2 MAP: (re)map slot ``slot`` at ``arg`` bytes (the owner has already
     sized the memfd with ftruncate).
   - kind 3 QUIT.
@@ -127,7 +128,10 @@ def main():
         if n and (buf is None or (max(dest) + 1) * rb > len(buf)):
             status = 22  # EINVAL: slot not mapped or too small
         elif n:
-            step = max(256, (n + threads - 1) // threads)
+            # fnFL2 H40: ``arg`` > 0 is the rows per thread task -- a
+            # decode-sized gather (tens of rows) spreads over the threads
+            # instead of landing whole on one of them
+            step = int(arg) if arg else max(256, (n + threads - 1) // threads)
             futs = [
                 pool.submit(_read_rows, buf, rb, fds, dest, keys, lo, min(n, lo + step), zero)
                 for lo in range(0, n, step)

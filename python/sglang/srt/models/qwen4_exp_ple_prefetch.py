@@ -298,11 +298,21 @@ class PlePreadProcs:
         procs: int = 4,
         threads: int = 4,
         delay_s: float = 0.0,
+        slot_fds: Optional[Sequence[int]] = None,
     ) -> None:
         self.row_bytes = int(row_bytes)
-        self.depth = int(depth)
-        self.slot_fds = [os.memfd_create(f"ple-prefetch-{i}", 0) for i in range(self.depth)]
+        if slot_fds is not None:
+            # fnFL2 H40: the owner's own memfds (dup'ed: close() closes only
+            # these copies) -- the decode stage must exist, at a fixed
+            # address, before any worker does
+            self.slot_fds = [os.dup(int(fd)) for fd in slot_fds]
+            self.depth = len(self.slot_fds)
+        else:
+            self.depth = int(depth)
+            self.slot_fds = [os.memfd_create(f"ple-prefetch-{i}", 0) for i in range(self.depth)]
         self.slot_bytes = [0] * self.depth
+        # fnFL2 H40: per worker, the destination rows of the gather in flight
+        self.parts: dict = {}
         cfg = json.dumps(
             {
                 "files": list(files),
@@ -378,9 +388,10 @@ class PlePreadProcs:
             self._recv(i, seq)
         self.slot_bytes[slot] = int(nbytes)
 
-    def submit(self, slot: int, dest: torch.Tensor, keys: torch.Tensor) -> int:
+    def submit(self, slot: int, dest: torch.Tensor, keys: torch.Tensor, step: int = 0) -> int:
         """Start reading row ``dest[j]`` of ``slot`` from ``keys[j]`` ((file
-        index << 48) | offset, < 0 = zero row). Returns the sequence number."""
+        index << 48) | offset, < 0 = zero row). Returns the sequence number.
+        ``step`` > 0: rows per worker-thread task (fnFL2 H40)."""
         if self._inflight is not None:
             raise RuntimeError("PLE prefetch: a second gather submitted while one is in flight")
         n = int(dest.numel())
@@ -393,15 +404,40 @@ class PlePreadProcs:
         seq = self._next_seq()
         per = (n + self.n_procs - 1) // self.n_procs if n else 0
         used = []
+        self.parts = {}
         for i in range(self.n_procs):
             lo, hi = i * per, min(n, (i + 1) * per)
             if hi <= lo:
                 continue
             payload = torch.cat([dest[lo:hi], keys[lo:hi]]).to(torch.int64).contiguous().numpy()
-            self._send(i, _KIND_GATHER, seq, slot, hi - lo, 0, payload)
+            self._send(i, _KIND_GATHER, seq, slot, hi - lo, max(0, int(step)), payload)
             used.append(i)
+            self.parts[i] = dest[lo:hi]
         self._inflight = (seq, used)
         return seq
+
+    def collect(self, seq: int, timeout_s: float) -> tuple:
+        """fnFL2 H40: wait at most ``timeout_s`` for gather ``seq``. Returns
+        (worker indices that answered, slowest read time). Workers that did
+        not answer stay in flight -- ``join`` drains them later; until then
+        their destination rows (``parts``) may still be written."""
+        if self._inflight is None or self._inflight[0] != seq:
+            return [], 0.0
+        pending = {self._procs[i].stdout.fileno(): i for i in self._inflight[1]}
+        done: List[int] = []
+        seconds = 0.0
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while pending:
+            left = deadline - time.monotonic()
+            readable, _, _ = select.select(list(pending), [], [], max(0.0, left))
+            if not readable:
+                break
+            for fd in readable:
+                i = pending.pop(fd)
+                seconds = max(seconds, self._recv(i, seq))
+                done.append(i)
+        self._inflight = (seq, sorted(pending.values())) if pending else None
+        return done, seconds
 
     def ready(self, seq: int) -> bool:
         """Whether gather ``seq`` has already finished (no wait)."""

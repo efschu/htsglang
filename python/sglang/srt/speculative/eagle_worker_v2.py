@@ -83,6 +83,10 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
+from sglang.srt.models.qwen4_exp_ple_decode_pread import (
+    begin_ple_verify_stage,
+    finish_ple_verify_stage,
+)
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -3548,6 +3552,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
+        # fnFL2 H40: the D2H of this round's PLE windows, queued behind the
+        # draft (no wait here; the rows are read before the forward below)
+        target_runner = self.target_worker.model_runner
+        ple_stage = begin_ple_verify_stage(
+            target_runner.model, target_runner.req_to_token_pool, batch, verify_input
+        )
 
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
@@ -3614,6 +3624,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # eagle_prepare_for_verify marked the batch in exactly that case; the
         # non-cuda-graph path stays unmarked and gets forward_extend's init
         # (post-pad).
+        # fnFL2 H40: stage the round's PLE rows (pread workers) so the verify
+        # gather reads them from host memory instead of faulting them in
+        finish_ple_verify_stage(ple_stage)
         with _module_sync_window(
             self.target_worker.model_runner.model, active=eager_round
         ):

@@ -4,6 +4,7 @@ import os
 import re
 import math
 import contextlib
+import functools
 from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple
 
@@ -208,9 +209,11 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.models.qwen4_exp_ple_prefetch import (
+    PleHashParams,
     make_ple_prefetch_gather,
     ple_next_chunk_hasher,
 )
+from sglang.srt.models.qwen4_exp_ple_decode_pread import make_ple_decode_stager
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, logger
 
@@ -1034,6 +1037,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # fnFL2 H32: the owning n-gram embedding's hash, for the next-chunk
         # prefetch (set by Qwen4ExpPLELayer; None = no prefetch)
         self.next_chunk_hasher = None
+        # fnFL2 H40: the owning n-gram embedding's hash constants for the
+        # decode stage (set by Qwen4ExpPLELayer; None = no stage), and the
+        # stage itself (attach_checkpoint_table)
+        self.decode_stage_params = None
+        self._decode_stager = None
+        self._retired_decode_stagers = []
         self._ckpt_backend = backend == "checkpoint"
         if self._ckpt_backend:
             host_table = torch.empty(
@@ -1080,6 +1089,17 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self._ckpt_prefetcher = make_ple_checkpoint_prefetcher(table)
         self._ckpt_pread = make_ple_prefetch_gather(
             make_ple_checkpoint_pread_gather(table), table, self.next_chunk_hasher
+        )
+        if self._decode_stager is not None:
+            # a graph captured against the old stage may still replay: retire
+            # it (every id -1) but keep its host memory alive
+            self._decode_stager.retire()
+            self._retired_decode_stagers.append(self._decode_stager)
+        self._decode_stager = make_ple_decode_stager(
+            table,
+            self.decode_stage_params,
+            vocab_start=self.shard_indices.org_vocab_start_index,
+            vocab_end=self.shard_indices.org_vocab_end_index,
         )
 
     def allocate_output(
@@ -1135,6 +1155,17 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     vocab_start=self.shard_indices.org_vocab_start_index,
                     vocab_end=self.shard_indices.org_vocab_end_index,
                 )
+            # fnFL2 H40: decode/verify-sized gathers read their staged rows
+            # from the host stage the pread workers filled before the replay
+            stager = self._decode_stager
+            if stager is not None and stager.launch(
+                flat_ids,
+                output,
+                vocab_start=self.shard_indices.org_vocab_start_index,
+                vocab_end=self.shard_indices.org_vocab_end_index,
+                block_d=self._block_d,
+            ):
+                return output
             _gather_ple_embedding_from_shards_kernel[(flat_ids.numel(),)](
                 table.bases_on(flat_ids.device),
                 table.shard_rows,
@@ -1215,6 +1246,12 @@ class Qwen4ExpPLELayer(nn.Module):
             self.ple_embedding.ngram_embedding.next_chunk_hasher = (
                 ple_next_chunk_hasher(self.ple_embedding)
             )
+            # fnFL2 H40: the decode stage hashes the verify windows on the
+            # host; the DP-gathered layout (gather_dp_tokens) is not staged
+            if not self.ple_embedding.gather_dp_tokens:
+                self.ple_embedding.ngram_embedding.decode_stage_params = (
+                    functools.partial(PleHashParams.of, self.ple_embedding)
+                )
         self.short_conv_dilation = self.ple_embedding.ngram_size
         self.short_conv_state_len = (
             self.conv_kernel_size - 1

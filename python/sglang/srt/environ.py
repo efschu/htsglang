@@ -649,6 +649,19 @@ class Envs:
     SGLANG_QWEN4_PLE_PREFETCH = EnvBool(True)
     SGLANG_QWEN4_PLE_PREFETCH_PROCS = EnvInt(4)
     SGLANG_QWEN4_PLE_PREFETCH_THREADS = EnvInt(4)
+    # fnFL2 H40 (checkpoint backend, qwen4_exp_ple_decode_pread.py): the
+    # decode/verify-sized PLE gather takes its rows from a page-locked host
+    # stage that pread worker PROCESSES fill between the draft and the verify
+    # replay (the round's tokens are known then); a row whose staged id is not
+    # its real id is read through HMM as before (bytes never depend on the
+    # stage). BUDGET_MS bounds the host wait per round; rows not read by then
+    # stay on the HMM path. LOG_EVERY rounds per PLE-DECODE-PREAD line. Off =
+    # the captured kernel reads every row through HMM (the pre-H40 graph).
+    SGLANG_QWEN4_PLE_DECODE_PREAD = EnvBool(True)
+    SGLANG_QWEN4_PLE_DECODE_PREAD_PROCS = EnvInt(4)
+    SGLANG_QWEN4_PLE_DECODE_PREAD_THREADS = EnvInt(4)
+    SGLANG_QWEN4_PLE_DECODE_PREAD_BUDGET_MS = EnvFloat(8.0)
+    SGLANG_QWEN4_PLE_DECODE_PREAD_LOG_EVERY = EnvInt(32)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     # Weight loader: read safetensors tensors with pread() instead of mmap
     # page faults (ZFS: ~0.5 GB/s per rank through mmap, ~3 GB/s through
