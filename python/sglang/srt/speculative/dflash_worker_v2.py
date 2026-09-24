@@ -7,7 +7,10 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs_func,
+    rebuild_compact_draft_req_to_token_func,
+)
 from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
@@ -263,6 +266,76 @@ class _SelectorDraftSampler:
         self.q_out[:bs].copy_(q_rows)
 
 
+def _is_dflash_decode_round(batch) -> bool:
+    try:
+        mode = batch.forward_mode
+        return not (
+            mode.is_extend() or batch.is_extend_in_batch or mode.is_idle()
+        )
+    except AttributeError:
+        return False
+
+
+def _dflash_sync_traced(fn, budget: int, tp_rank: int):
+    """SGLANG_DEBUG_DFLASH_SYNC_TRACE=N (#31468 metal check).
+
+    Runs the first N DFLASH decode rounds under torch's sync-debug "warn" mode
+    and logs, per round, how many implicit host syncs torch saw
+    (``DFLASH-SYNC-ROUND``) and each synchronising call site once
+    (``DFLASH-SYNC-SITE``). A diagnostic only: ``catch_warnings`` is
+    process-global, so another thread's sync in that window is counted too.
+    Same mechanism as hicache_write_path.sync_trace.
+    """
+    import functools
+    import warnings
+
+    state = {"used": 0, "seen": set()}
+
+    @functools.wraps(fn)
+    def wrapper(batch, *args, **kwargs):
+        if (
+            state["used"] >= budget
+            or not torch.cuda.is_available()
+            or not _is_dflash_decode_round(batch)
+        ):
+            return fn(batch, *args, **kwargs)
+        state["used"] += 1
+        prev = torch.cuda.get_sync_debug_mode()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            torch.cuda.set_sync_debug_mode("warn")
+            try:
+                result = fn(batch, *args, **kwargs)
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        n_sync = 0
+        for w in caught:
+            msg = str(w.message)
+            if "synchroniz" not in msg:
+                continue
+            n_sync += 1
+            site = "%s:%d" % (w.filename, w.lineno)
+            if site in state["seen"]:
+                continue
+            state["seen"].add(site)
+            logger.warning(
+                "DFLASH-SYNC-SITE rank=%d round=%d site=%s msg=%s",
+                tp_rank,
+                state["used"],
+                site,
+                msg.splitlines()[0][:160],
+            )
+        logger.warning(
+            "DFLASH-SYNC-ROUND rank=%d round=%d syncs=%d",
+            tp_rank,
+            state["used"],
+            n_sync,
+        )
+        return result
+
+    return wrapper
+
+
 def _log_draft_param_bytes(model, tp_rank: int) -> None:
     """One INFO line per rank: the draft's parameter bytes by module group
     (19.09., Task #37 shard proof -- a sharded draft shows the plan's ratio
@@ -489,6 +562,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
         self._use_triton_accept_bonus = supports_gpu_triton
+        # #31468: the legacy compact-rebuild path host-syncs twice per step
+        # (lengths.max().item() + the masked gather's implicit nonzero D2H);
+        # keep it only for platforms without GPU triton and for the solo small
+        # pool, whose mapper has to translate the gathered locations.
+        self._use_triton_compact_rebuild = supports_gpu_triton
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
         self._accept_len_buf: Optional[torch.Tensor] = None
@@ -531,6 +609,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._audit_pending_rounds: list = []
         self._audit_timing_flush_every = 200
         # === END DFLASH AUDIT INSTRUMENTATION ===
+
+        # #31468 host-sync census (env-gated, default off): an instance
+        # attribute shadows the class method only when armed.
+        _sync_trace_rounds = int(envs.SGLANG_DEBUG_DFLASH_SYNC_TRACE.get())
+        if _sync_trace_rounds > 0:
+            self.forward_batch_generation = _dflash_sync_traced(
+                self.forward_batch_generation, _sync_trace_rounds, int(self.tp_rank)
+            )
 
     # === DFLASH AUDIT INSTRUMENTATION (temporary, env-gated, remove-safe) ===
     def _audit_mark(self, label: str) -> None:
@@ -1388,6 +1474,25 @@ class DFlashWorkerV2(BaseSpecWorker):
         visible_start = seq_lens_i64 - visible_lens_i64
         aligned_start = visible_start - torch.remainder(visible_start, self.page_size)
         return (seq_lens_i64 - aligned_start).to(torch.int32)
+
+    def _compute_compact_draft_seq_lens_host(
+        self, host_seq_lens: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """Sync-free host upper bound for _compute_compact_draft_seq_lens (#31468).
+
+        Deliberately NOT the exact page-align arithmetic: that mapping is a
+        non-monotonic sawtooth in [window, window+page), so evaluating it on an
+        over-estimated host len could UNDER-shoot the true device value.
+        min(len, window+page) is its monotonic envelope (always >= the exact
+        compact len); consumers only need an upper bound. With page_size == 1
+        (the 27B D group) and an exact host mirror it is the exact value.
+        """
+        assert self.draft_window_size is not None
+        bound = int(self.draft_window_size) + (
+            self.page_size if self.page_size > 1 else 0
+        )
+        lens = host_seq_lens.to(dtype=torch.int64, device="cpu")
+        out.copy_(torch.clamp(lens, max=bound).to(torch.int32))
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -2787,46 +2892,76 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self.use_compact_draft_cache:
                 # Rebuild the draft-local sliding-window view from committed target state.
                 draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
-                seq_lens_cpu.copy_(
-                    draft_prefix_lens.to(device="cpu", dtype=torch.int32)
-                )
+                # #31468: host planning bound without a device sync; backends
+                # consume seq_lens_cpu as a safe upper bound (same contract as
+                # the non-compact branch below). The mirror resolved by
+                # overlap_utils.resolve_seq_lens_cpu is exact, so with
+                # page_size == 1 this is the exact compact length.
+                if batch.seq_lens_cpu is not None:
+                    self._compute_compact_draft_seq_lens_host(
+                        batch.seq_lens_cpu, out=seq_lens_cpu
+                    )
+                elif draft_input.nxt_kv_lens_cpu is not None:
+                    self._compute_compact_draft_seq_lens_host(
+                        draft_input.nxt_kv_lens_cpu, out=seq_lens_cpu
+                    )
+                else:
+                    # Last resort: the legacy blocking D2H copy.
+                    seq_lens_cpu.copy_(
+                        draft_prefix_lens.to(device="cpu", dtype=torch.int32)
+                    )
 
                 suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
                     torch.int64
                 )
-                suffix_cache_loc = self._gather_req_to_token_segments(
-                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                    req_pool_indices=batch.req_pool_indices,
-                    start=suffix_start,
-                    lengths=draft_prefix_lens,
-                )
                 block_loc = verify_out_cache_loc
-                if self._solo_pool_mapper is not None:
-                    # window pool: the draft rows live in draft-slot space;
-                    # unmapped prefix rows read the zero-KV hole slot.
-                    mapper = self._solo_pool_mapper
-                    mapper.begin_round()
-                    suffix_cache_loc = mapper.translate_read(suffix_cache_loc)
-                    block_loc = mapper.translate_write(verify_out_cache_loc)
-                assign_req_to_token_pool_func(
-                    batch.req_pool_indices,
-                    self.draft_model_runner.req_to_token_pool.req_to_token,
-                    torch.zeros_like(draft_prefix_lens),
-                    draft_prefix_lens,
-                    suffix_cache_loc,
-                    bs,
-                )
+                if self._use_triton_compact_rebuild and self._solo_pool_mapper is None:
+                    # #31468: one pass, fixed grid, no host reads: row
+                    # [0, prefix) = committed target suffix window,
+                    # [prefix, prefix + block) = this round's verify slots.
+                    rebuild_compact_draft_req_to_token_func(
+                        draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
+                        target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                        req_pool_indices=batch.req_pool_indices,
+                        suffix_start=suffix_start,
+                        draft_prefix_lens=draft_prefix_lens,
+                        verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+                        batch_size=bs,
+                        block_size=block_size,
+                    )
+                else:
+                    suffix_cache_loc = self._gather_req_to_token_segments(
+                        req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                        req_pool_indices=batch.req_pool_indices,
+                        start=suffix_start,
+                        lengths=draft_prefix_lens,
+                    )
+                    if self._solo_pool_mapper is not None:
+                        # window pool: the draft rows live in draft-slot space;
+                        # unmapped prefix rows read the zero-KV hole slot.
+                        mapper = self._solo_pool_mapper
+                        mapper.begin_round()
+                        suffix_cache_loc = mapper.translate_read(suffix_cache_loc)
+                        block_loc = mapper.translate_write(verify_out_cache_loc)
+                    assign_req_to_token_pool_func(
+                        batch.req_pool_indices,
+                        self.draft_model_runner.req_to_token_pool.req_to_token,
+                        torch.zeros_like(draft_prefix_lens),
+                        draft_prefix_lens,
+                        suffix_cache_loc,
+                        bs,
+                    )
 
-                block_end = self._draft_block_end_buf[:bs]
-                torch.add(draft_prefix_lens, block_size, out=block_end)
-                assign_req_to_token_pool_func(
-                    batch.req_pool_indices,
-                    self.draft_model_runner.req_to_token_pool.req_to_token,
-                    draft_prefix_lens,
-                    block_end,
-                    block_loc,
-                    bs,
-                )
+                    block_end = self._draft_block_end_buf[:bs]
+                    torch.add(draft_prefix_lens, block_size, out=block_end)
+                    assign_req_to_token_pool_func(
+                        batch.req_pool_indices,
+                        self.draft_model_runner.req_to_token_pool.req_to_token,
+                        draft_prefix_lens,
+                        block_end,
+                        block_loc,
+                        bs,
+                    )
                 draft_seq_lens = draft_prefix_lens
                 draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
                 draft_out_cache_loc = block_loc

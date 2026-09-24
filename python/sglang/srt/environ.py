@@ -254,6 +254,11 @@ class Envs:
     # ranks diverge. Comma separated presets ("all", "rng", "init", "off"), or
     # SpecTpSyncSite slugs and numbers, each negatable with a leading "-".
     SGLANG_SPEC_TP_SYNC = EnvStr("all")
+    # #1485 divergence instrument in SpecTpSync.sync: how many broadcasts per
+    # rank compare the rank-local value against rank 0's (each compare is a
+    # blocking device read). -1 = never retire (the pre-#31468 behaviour on the
+    # receiving ranks), 0 = off. The broadcast source never compares.
+    SGLANG_SPEC_TP_DIVERGE_CHECKS = EnvInt(64)
     # A/B: keep the DFLASH draft sampler (greedy head or DFlash2 selector) eager,
     # not folded into the draft cuda graph.
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
@@ -742,6 +747,12 @@ class Envs:
     # boundary of the full-KV match (else recompute from 0) instead of the
     # deepest surviving on-grid checkpoint.
     SGLANG_MAMBA_CKPT_STRICT_RESUME = EnvBool(False)
+    # Upstream #31648 (opt-in here): on a unified-radix prefix hit refresh only
+    # the CONSUMED node's mamba state in the mamba LRU (not the whole matched
+    # chain), and leave the insert walk out of it. Changes which mamba states
+    # the tree tombstones first under pool pressure, so it stays off until an
+    # A/B boot has priced it against the fork's anchor/retention policy.
+    SGLANG_MAMBA_LRU_REFRESH_USED_ONLY = EnvBool(False)
     # Per-request mamba checkpoint diagnostics: log match length, resume
     # length, checkpoint node/slot and cache-insert positions so a
     # nondeterministic resume (or a checkpoint at a wrong position) can be
@@ -1430,6 +1441,10 @@ class Envs:
     # H2: run the first N chunk publishes under torch's sync-debug "warn" mode
     # and log each implicit synchronising call site once (H2-SYNC-SITE). 0 = off.
     SGLANG_DEBUG_HICACHE_SYNC_TRACE = EnvInt(0)
+    # #31468 metal check: run the first N DFLASH decode rounds under torch's
+    # sync-debug "warn" mode; logs DFLASH-SYNC-ROUND (count per round) and each
+    # implicit host-sync call site once (DFLASH-SYNC-SITE). 0 = off.
+    SGLANG_DEBUG_DFLASH_SYNC_TRACE = EnvInt(0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
