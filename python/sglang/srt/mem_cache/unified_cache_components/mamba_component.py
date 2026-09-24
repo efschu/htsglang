@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    LRURefreshPhase,
     TreeComponent,
     get_and_increase_time_counter,
 )
@@ -176,6 +177,8 @@ class MambaComponent(TreeComponent):
         # degenerates to the pre-#747 behaviour.
         self.mamba_checkpoint_interval = get_server_args().mamba_checkpoint_interval
         self.mamba_ckpt_strict_resume = envs.SGLANG_MAMBA_CKPT_STRICT_RESUME.get()
+        # Upstream #31648, opt-in (see refresh_lru).
+        self._lru_refresh_used_only = envs.SGLANG_MAMBA_LRU_REFRESH_USED_ONLY.get()
         self._off_grid_insert_refusals = 0
         # #783: request ends that carried no on-grid state to file. Counted
         # because a grid coarser than the traffic makes EVERY end decline,
@@ -192,6 +195,40 @@ class MambaComponent(TreeComponent):
         #: tombstones under a full key), so one counter for each.
         self._foreign_pool_resume_refusals = 0
         self._stateless_resume_refusals = 0
+
+    def refresh_lru(
+        self,
+        phase: LRURefreshPhase,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
+    ) -> None:
+        """Upstream #31648 behind SGLANG_MAMBA_LRU_REFRESH_USED_ONLY.
+
+        A match consumes only best_match_node's mamba state (acquire_component_lock
+        pins just that node's value), unlike Full whose whole matched path is
+        reused as prefix. Refreshing ancestors keeps a session's states adjacent
+        in the mamba LRU and evicts cold sessions wholesale; the opt-in form
+        touches only the used state, and the insert walk (WALKDOWN) leaves the
+        mamba LRU alone -- new states enter via commit_insert_component_data.
+
+        Off (default): the base whole-chain refresh, byte-identical. Kept off by
+        default because it reorders what drive_eviction tombstones first, and
+        the fork's anchor/retention policy (#747/#773/#1470/#1481) has only
+        been measured against the whole-chain order.
+        """
+        if not self._lru_refresh_used_only:
+            return super().refresh_lru(phase, node, root_node)
+        ct = self.component_type
+        match phase:
+            case LRURefreshPhase.WALKDOWN:
+                return
+            case LRURefreshPhase.MATCH_END:
+                if node.component_data[ct].value is not None:
+                    self.cache.lru_lists[ct].reset_node_mru(node)
+            case LRURefreshPhase.INSERT_END:
+                return
+            case _:
+                raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
     def _raw_token_pos(self, key_units: int) -> int:
         """Absolute RAW-token position of a node measured in KEY units.
