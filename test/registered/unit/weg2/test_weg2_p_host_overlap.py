@@ -25,7 +25,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="stage-a-weg2-unit")
 
 _ENVS = (pov.P_HOST_OVERLAP_ENV, pov.P_HOSTGAP_ENV, pov.SKIP_PURE_CHUNK_OUTPUT_ENV,
-         pov.P_NOSYNC_ENV)
+         pov.P_NOSYNC_ENV, pov.L2NORM_RUNTIME_T_ENV)
 
 
 def _loop_src() -> str:
@@ -70,7 +70,8 @@ class TestLauncherSwitch(unittest.TestCase):
         env = launcher.p_host_overlap_env(True, False)
         self.assertEqual(env, {"SGLANG_WEG2_P_HOST_OVERLAP": "1",
                                "SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM": "1",
-                               "SGLANG_WEG2_P_NOSYNC": "1"})
+                               "SGLANG_WEG2_P_NOSYNC": "1",
+                               "SGLANG_FLA_L2NORM_RUNTIME_T": "1"})
         # the name the upstream predicate reads is the one the launcher sets
         src = inspect.getsource(ppm._pp_can_skip_output_comm)
         self.assertIn("SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM", src)
