@@ -406,18 +406,46 @@ def _item(feature=object(), embeddings=None):
     return types.SimpleNamespace(feature=feature, precomputed_embeddings=embeddings)
 
 
-def test_arming_installs_the_service_and_the_seam_then_runs_it(model_dir, monkeypatch):
+def test_arming_hands_the_images_to_the_RANK_stage(model_dir, monkeypatch):
+    """User design 2026-09-24: the stage runs inside the P group's PP0 rank
+    (weg2/vision_rank_runner.py) and REPLACES the tokenizer-process stage.
+    Arming builds no service here, and the seam passes the pixels on."""
     monkeypatch.setenv(vsb.VISION_ENV, "transient")
     monkeypatch.setenv(vsb.VISION_GROUP_ENV, "P")
-    service = vsb.arm_transient_vision(
+    armed = vsb.arm_transient_vision(
         types.SimpleNamespace(model_path=model_dir),
         types.SimpleNamespace(hf_config=_hf_config()),
-        snapshot=_snapshot,
-        context_runner=_probe_ok,
     )
-    assert service is not None
-    assert vss.installed() is service
+    assert armed is True
+    assert vss.installed() is None
+    assert vss.rank_stage_installed()
     assert vss.arm_refusal() == ""
+    item = _item()
+    assert vss.maybe_run([item]) is None
+    vss.assert_nothing_unstaged([item])  # the rank stages it: no refusal here
+    assert item.feature is not None and item.precomputed_embeddings is None
+
+
+def test_the_rank_stage_state_is_cleared_by_a_refusal_and_by_a_service(model_dir):
+    vss.install_rank_stage()
+    vss.install_refusal("a later refusal")
+    assert not vss.rank_stage_installed()
+    vss.install_rank_stage()
+    service, _ctx, _cfg = _build(model_dir)
+    vss.install(service)
+    assert not vss.rank_stage_installed()
+
+
+def test_arming_without_a_vision_config_refuses_by_name(model_dir, monkeypatch):
+    monkeypatch.setenv(vsb.VISION_ENV, "transient")
+    monkeypatch.setenv(vsb.VISION_GROUP_ENV, "P")
+    assert vsb.arm_transient_vision(
+        types.SimpleNamespace(model_path=model_dir),
+        types.SimpleNamespace(hf_config=types.SimpleNamespace(rms_norm_eps=1e-6)),
+    ) is False
+    assert "vision_config" in vss.arm_refusal()
+    with pytest.raises(vss.VisionStageNotArmed):
+        vss.maybe_run([_item()])
 
 
 def test_an_image_with_NO_service_under_transient_refuses_BY_NAME(caplog):
@@ -440,32 +468,37 @@ def test_a_failed_arming_records_the_reason_and_does_NOT_raise(monkeypatch, capl
         out = vsb.arm_transient_vision(
             types.SimpleNamespace(model_path=""),
             types.SimpleNamespace(hf_config=_hf_config()),
-            snapshot=_snapshot,
-            context_runner=_probe_ok,
         )
-    assert out is None
+    assert out is False
     assert vss.installed() is None
+    assert not vss.rank_stage_installed()
     assert "no model path" in vss.arm_refusal()
     assert any(vss.W_ARM_REFUSED in r.getMessage() for r in caplog.records)
 
 
-def test_a_transient_boot_whose_probe_dies_still_serves_TEXT(monkeypatch):
+def test_a_transient_boot_without_an_mm_processor_still_serves_TEXT(monkeypatch):
     """An arming failure makes the IMAGE path loud; it does not kill the boot."""
     monkeypatch.setenv(vsb.VISION_ENV, "transient")
     monkeypatch.setenv(vsb.VISION_GROUP_ENV, "P")
-
-    def dead(argv, env):
-        raise OSError("no cuda on this box")
-
     assert vsb.arm_transient_vision(
         types.SimpleNamespace(model_path="/nope"),
         types.SimpleNamespace(hf_config=_hf_config()),
-        snapshot=_snapshot, context_runner=dead,
-    ) is None
+        multimodal=False,
+    ) is False
+    assert "NO multimodal processor" in vss.arm_refusal()
     assert vss.maybe_run([]) is None                      # text: no items
     assert vss.maybe_run([_item(feature=None)]) is None   # text: nothing stageable
     with pytest.raises(vss.VisionStageNotArmed):
         vss.maybe_run([_item()])                          # image: named refusal
+
+
+def test_a_boot_that_is_not_transient_arms_nothing(model_dir, monkeypatch):
+    monkeypatch.delenv(vsb.VISION_ENV, raising=False)
+    assert vsb.arm_transient_vision(
+        types.SimpleNamespace(model_path=model_dir),
+        types.SimpleNamespace(hf_config=_hf_config()),
+    ) is False
+    assert not vss.rank_stage_installed() and vss.arm_refusal() == ""
 
 
 def test_an_item_that_already_carries_rows_is_not_a_refusal():
@@ -585,18 +618,15 @@ def test_the_mode_is_transient_for_P_and_for_a_group_less_process():
 
 
 def test_without_the_flag_arming_touches_NO_state_at_all(model_dir):
-    """Byte-for-byte the old path: no install, no refusal, no probe, no NVML."""
-    touched = []
+    """Byte-for-byte the old path: no install, no refusal, no rank handover."""
     out = vsb.arm_transient_vision(
         types.SimpleNamespace(model_path=model_dir),
         types.SimpleNamespace(hf_config=_hf_config()),
         env={},
-        snapshot=lambda: touched.append("nvml") or _snapshot(),
-        context_runner=lambda a, e: touched.append("probe") or _probe_ok(a, e),
     )
-    assert out is None
-    assert touched == []
+    assert out is False
     assert vss.installed() is None
+    assert not vss.rank_stage_installed()
     assert vss.arm_refusal() == ""
 
 
@@ -644,10 +674,8 @@ def test_a_transient_boot_with_no_multimodal_processor_REFUSES_by_name(model_dir
         types.SimpleNamespace(hf_config=_hf_config()),
         multimodal=False,
         env={"SGLANG_WEG2_VISION": "transient"},
-        snapshot=_snapshot,
-        context_runner=_probe_ok,
     )
-    assert out is None
+    assert out is False
     reason = vss.arm_refusal()
     assert "no multimodal processor" in reason.lower() or "NO multimodal" in reason
     assert "language_model_only" in reason
