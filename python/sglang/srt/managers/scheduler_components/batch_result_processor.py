@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.runtime_context import get_server_args
+from sglang.srt.speculative import accept_profile
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -726,6 +727,7 @@ class SchedulerBatchResultProcessor:
         # delayed result is processed. Use the draft token count recorded on result.
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
+        profile_head = accept_profile.head_rounds()
 
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
@@ -750,6 +752,7 @@ class SchedulerBatchResultProcessor:
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
                 req.spec_num_correct_drafts += num_correct_drafts
                 req.update_spec_correct_drafts_histogram(num_correct_drafts)
+                accept_profile.note_round(req, num_correct_drafts, profile_head)
 
                 if block_accept_lens is not None:
                     req.spec_num_block_accept_tokens += block_accept_lens[i]
@@ -1112,6 +1115,8 @@ class SchedulerBatchResultProcessor:
                     rid=req.rid,
                     natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
                 )
+            if req.spec_verify_ct > 0:
+                accept_profile.log_finished(req)
 
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:

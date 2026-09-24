@@ -263,6 +263,15 @@ class Envs:
     # a debugging escape hatch, not a supported configuration.
     SGLANG_ALLOW_UNLOADED_DRAFT_PARAMS = EnvBool(False)
 
+    # fnFL2 H36: per-request acceptance profile. When a speculative request
+    # finishes, TP rank 0 logs one SPEC-ACCEPT-PROFILE line: the correct-drafts
+    # histogram of the whole request, split into its first N verify rounds and
+    # the rest, plus the phase flip's draft-cold mark. It reads counters the
+    # batch-result processor already holds on the CPU (no device sync), so a
+    # flipped request's warm-up can be told from its steady state in the D log
+    # without SPEC-TRACE. 0 turns the line off.
+    SGLANG_LOG_SPEC_ACCEPT_PROFILE_HEAD_ROUNDS = EnvInt(64)
+
     # H25 (Nutzer-Order 24.09. 08:25Z, "Draft auf P streichen"): does the
     # Weg-2 prefill group P carry the MTP draft head? False = P boots with no
     # draft (no weights_draft tag, no draft-KV producer; P's draft KV has had
