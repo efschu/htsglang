@@ -67,6 +67,20 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 
+#: DFLASH target verify, TP > 1: keep the lm_head output as this rank's vocab
+#: SHARD (raw, before the TP gather) instead of gathering the full logits
+#: inside the verify forward. The DFLASH worker then either reduces the shard
+#: with a vocab-parallel argmax (all-greedy rounds: one tiny all_gather instead
+#: of the [rows, vocab] one) or gathers it itself exactly as ``_get_logits``
+#: would have (every other round). Default OFF: unset = the stock gather.
+VERIFY_LOCAL_VOCAB_ENV = "SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX"
+
+
+def verify_local_vocab_requested() -> bool:
+    import os
+
+    return os.environ.get(VERIFY_LOCAL_VOCAB_ENV, "") == "1"
+
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
     "UnquantizedLinearMethod",
@@ -417,6 +431,23 @@ class LogitsProcessor(nn.Module):
                     "--rank-vocab-ratio is not supported together with "
                     "--enable-dp-lm-head."
                 )
+
+        # SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX (see VERIFY_LOCAL_VOCAB_ENV): decided
+        # once per processor, so a captured verify graph and every later eager
+        # verify agree on the output layout. Only the plain TP gather qualifies
+        # (no attention-TP-group / DP-attention layouts), and only a DFLASH
+        # server has the worker that finishes the shard.
+        _sa = get_server_args()
+        self.verify_local_vocab = bool(
+            verify_local_vocab_requested()
+            and self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and str(getattr(_sa, "speculative_algorithm", "") or "").upper() == "DFLASH"
+            # A cross-algorithm server also verifies NEXTN/EAGLE rungs through
+            # this processor; their workers expect the full logits.
+            and not getattr(_sa, "speculative_cross_algorithm", False)
+        )
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -1001,6 +1032,15 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
+        if (
+            getattr(self, "verify_local_vocab", False)
+            and logits_metadata.forward_mode.is_target_verify()
+        ):
+            # The raw local shard, in the lm_head's dtype: no gather, no fp32
+            # copy, no softcap. finish_local_verify_logits() below is the one
+            # place that turns it into what the stock path returns.
+            return logits
+
         if self.do_tensor_parallel_all_gather:
             uneven_vocab_sizes = getattr(lm_head, "vocab_partition_sizes", None)
             if uneven_vocab_sizes is not None:
@@ -1027,6 +1067,30 @@ class LogitsProcessor(nn.Module):
                     logits / self.final_logit_softcapping
                 )
 
+        return logits
+
+    def finish_local_verify_logits(
+        self, logits: torch.Tensor, lm_head: VocabParallelEmbedding
+    ) -> torch.Tensor:
+        """The stock tail of ``_get_logits`` for a shard kept local by
+        ``verify_local_vocab``: the TP gather (even or ratio-weighted), the
+        vocab slice, the fp32 copy and the softcap -- same ops, same order,
+        so the full logits are the ones the in-graph gather produced."""
+        uneven_vocab_sizes = getattr(lm_head, "vocab_partition_sizes", None)
+        if uneven_vocab_sizes is not None:
+            logits = self._gather_uneven_vocab_logits(logits, uneven_vocab_sizes)
+        else:
+            logits = self._logits_gatherer(logits)
+        if logits.shape[-1] > self.vocab_size:
+            logits = logits[:, : self.vocab_size]
+        logits = logits.float()
+        if self.final_logit_softcapping:
+            if not (_is_npu or _is_cpu):
+                fused_softcap(logits, self.final_logit_softcapping)
+            else:
+                logits = self.final_logit_softcapping * torch.tanh(
+                    logits / self.final_logit_softcapping
+                )
         return logits
 
     def _compute_lm_head(

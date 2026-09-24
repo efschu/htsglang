@@ -191,6 +191,73 @@ def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
 
+def _verify_plain_greedy(sampling_info) -> bool:
+    """All-greedy AND ``apply_dflash_verify_logits_adjustments`` is a no-op:
+    no custom logit processor, no penalties (dense or accumulated), no vocab
+    mask, no logit bias. The exact complement of every branch of that
+    function, so a round that passes may argmax the raw verify logits."""
+    if sampling_info is None:
+        return True
+    if not sampling_info.is_all_greedy:
+        return False
+    if getattr(sampling_info, "has_custom_logit_processor", False):
+        return False
+    if getattr(sampling_info, "acc_linear_penalties", None) is not None:
+        return False
+    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+    if penalizer is not None and getattr(penalizer, "is_required", False):
+        return False
+    if getattr(sampling_info, "vocab_mask", None) is not None:
+        return False
+    if getattr(sampling_info, "logit_bias", None) is not None:
+        return False
+    return True
+
+
+def vocab_parallel_argmax(
+    local_logits: torch.Tensor, num_org: int, org_vocab_start: int, all_gather
+) -> torch.Tensor:
+    """``torch.argmax`` over the FULL vocab, from this rank's vocab shard.
+
+    Per row: the shard's max over its real columns ``[0, num_org)`` and that
+    column's global token id, packed as ``[id, fp32 bits]`` int64 pairs and
+    all-gathered ONCE across TP (``all_gather(t) -> [tp, rows, 2]``); the
+    global winner is the largest value, and among equal values the lowest
+    rank. Shards are contiguous prefix slices of the vocab in rank order and
+    ``torch.max`` returns the first maximal column, so this is exactly the
+    first maximal index of the concatenated logits -- the tie rule of
+    ``torch.argmax``. The value compare runs in fp32 on values converted from
+    the shard's dtype, which is exact, so bf16 ties stay ties."""
+    packed = vocab_shard_pack(local_logits, num_org, org_vocab_start)
+    return vocab_shard_select(all_gather(packed.unsqueeze(0)))
+
+
+def vocab_shard_pack(
+    local_logits: torch.Tensor, num_org: int, org_vocab_start: int
+) -> torch.Tensor:
+    """This rank's ``[rows, 2]`` int64 candidates: global id, fp32 bits of the
+    shard max (sign-extended int32, so the unpack is a lossless cast)."""
+    rows = int(local_logits.shape[0])
+    device = local_logits.device
+    if num_org > 0:
+        vals, idx = torch.max(local_logits[:, :num_org], dim=-1)
+        vals32 = vals.float().contiguous()
+        ids = idx.to(torch.int64) + int(org_vocab_start)
+    else:
+        vals32 = torch.full((rows,), float("-inf"), dtype=torch.float32, device=device)
+        ids = torch.zeros((rows,), dtype=torch.int64, device=device)
+    return torch.stack((ids, vals32.view(torch.int32).to(torch.int64)), dim=-1)
+
+
+def vocab_shard_select(gathered: torch.Tensor) -> torch.Tensor:
+    """``[tp, rows, 2]`` gathered candidates -> ``[rows]`` global argmax ids
+    (largest value; the lowest rank among equal values)."""
+    g_ids = gathered[..., 0]
+    g_vals = gathered[..., 1].to(torch.int32).view(torch.float32)
+    best = torch.argmax(g_vals, dim=0, keepdim=True)
+    return g_ids.gather(0, best).squeeze(0)
+
+
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
@@ -573,6 +640,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         # keep it only for platforms without GPU triton and for the solo small
         # pool, whose mapper has to translate the gathered locations.
         self._use_triton_compact_rebuild = supports_gpu_triton
+        # SGLANG_WEG2_D_DEFER_REBUILD (weg2_d_hostgap): stage 2 of the deferred
+        # length read -- read once; it only acts on a round whose read the
+        # scheduler actually deferred.
+        from sglang.srt.managers.weg2_d_hostgap import defer_rebuild_on
+
+        self._defer_rebuild = defer_rebuild_on()
         # SGLANG_DFLASH_PLAN_SYNC_FREE (layers/dcp/verify_preplan.py): build
         # the verify's uneven-DCP owned-slot index before the draft and plan
         # draft + verify from exact host metadata. Resolved lazily: the target
@@ -2826,6 +2899,30 @@ class DFlashWorkerV2(BaseSpecWorker):
         ).to(cache_loc.device)
         return target_hidden[mask], cache_loc[mask], positions[mask]
 
+    def _verify_local_vocab_processor(self):
+        """The target's LogitsProcessor when it keeps the verify logits as a
+        local vocab shard (SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX), else None.
+        Looked up per round: nothing is cached across a phase flip."""
+        model = getattr(getattr(self.target_worker, "model_runner", None), "model", None)
+        lp = getattr(model, "logits_processor", None)
+        return lp if getattr(lp, "verify_local_vocab", False) else None
+
+    def _verify_vocab_argmax_eligible(self, batch, sampling_info, lm_head, lp) -> bool:
+        """The rounds whose accept needs only the argmax of the RAW verify
+        logits: plain greedy (no adjustment applies), no DFlash2 selector
+        sample, no grammar, no logprobs, a head without added vocab and no
+        final softcap. Every other round gathers the full logits."""
+        if getattr(self, "_selector_sample", None) is not None:
+            return False
+        if getattr(batch, "has_grammar", False) or getattr(batch, "return_logprob", False):
+            return False
+        if getattr(lp, "final_logit_softcapping", None):
+            return False
+        shard = getattr(lm_head, "shard_indices", None)
+        if shard is None or int(shard.num_added_elements) != 0:
+            return False
+        return _verify_plain_greedy(sampling_info)
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -3059,7 +3156,26 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._audit_mark("embed")  # DFLASH AUDIT (env-gated)
             input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
-            if seq_lens_cpu_ready is not None:
+            # SGLANG_WEG2_D_DEFER_REBUILD (stage 2 of the deferred read, needs
+            # SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU): in the compact sync-free window
+            # pool the row rebuild below only needs a WIDTH, and the compact
+            # envelope of the reservation bound is one (>= every exact compact
+            # length, dflash_solo_pool.rebuild_window_rows_sync_free writes only
+            # [0, lengths[b]) per row). So the whole device part of the draft
+            # prep is queued before the host waits; the exact host lengths the
+            # draft PLAN needs are read right after it.
+            _defer_rebuild = (
+                seq_lens_cpu_ready is not None
+                and getattr(self, "_defer_rebuild", False)
+                and self.use_compact_draft_cache
+                and not (
+                    self._use_triton_compact_rebuild and self._solo_pool_mapper is None
+                )
+                and self._solo_pool_mapper is not None
+                and self._solo_pool_mapper.sync_free
+                and draft_input.nxt_kv_lens_cpu is not None
+            )
+            if seq_lens_cpu_ready is not None and not _defer_rebuild:
                 # SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU: the block prep, the DCP
                 # prebuild (sized by the reservation bound, see
                 # _dcp_verify_prebuild) and the embedding with its all_reduce
@@ -3080,7 +3196,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 # the non-compact branch below). The mirror resolved by
                 # overlap_utils.resolve_seq_lens_cpu is exact, so with
                 # page_size == 1 this is the exact compact length.
-                if batch.seq_lens_cpu is not None:
+                if _defer_rebuild:
+                    # Stage 2: the envelope of the reservation bound, for the
+                    # rebuild WIDTH only; overwritten with the exact lengths
+                    # after the wait below, before anything plans with it.
+                    self._compute_compact_draft_seq_lens_host(
+                        draft_input.nxt_kv_lens_cpu, out=seq_lens_cpu
+                    )
+                elif batch.seq_lens_cpu is not None:
                     self._compute_compact_draft_seq_lens_host(
                         batch.seq_lens_cpu, out=seq_lens_cpu
                     )
@@ -3148,6 +3271,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                         block_loc,
                         bs,
                     )
+                    if _defer_rebuild:
+                        # The device part of the draft prep is queued; now the
+                        # host waits for round N's lengths and takes the exact
+                        # compact mirror the draft plan reads (the same two
+                        # calls the non-deferred branch above makes).
+                        seq_lens_cpu_ready()
+                        self._compute_compact_draft_seq_lens_host(
+                            batch.seq_lens_cpu, out=seq_lens_cpu
+                        )
+                        draft_host_lens_exact = self._compact_draft_host_lens_exact()
                 else:
                     suffix_cache_loc = self._gather_req_to_token_segments(
                         req_to_token=self.model_runner.req_to_token_pool.req_to_token,
@@ -3393,6 +3526,28 @@ class DFlashWorkerV2(BaseSpecWorker):
         can_run_cuda_graph = target_out.can_run_cuda_graph
         self._audit_mark("verify")  # DFLASH AUDIT (env-gated)
 
+        # SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX: the verify forward left this
+        # rank's vocab SHARD (no [rows, vocab] all_gather at the end of the
+        # graph). A plain-greedy round takes the vocab-parallel argmax -- one
+        # [rows, 2] int64 all_gather; every other round gathers the full
+        # logits here, with the processor's own ops, and proceeds unchanged.
+        vocab_target_predict = None
+        _vlp = self._verify_local_vocab_processor()
+        if _vlp is not None and logits_output.next_token_logits is not None:
+            if self._verify_vocab_argmax_eligible(batch, sampling_info, lm_head, _vlp):
+                _shard = lm_head.shard_indices
+                _tp = get_tp_group()
+                vocab_target_predict = vocab_parallel_argmax(
+                    logits_output.next_token_logits,
+                    int(_shard.num_org_elements),
+                    int(_shard.org_vocab_start_index),
+                    lambda t: _tp.all_gather(t, dim=0),
+                ).view(bs, int(self.block_size))
+            else:
+                logits_output.next_token_logits = _vlp.finish_local_verify_logits(
+                    logits_output.next_token_logits, lm_head
+                )
+
         grammar_vocab_mask = None
         if grammar_draft_tokens_cpu is not None:
             grammar_vocab_mask = self._dflash_grammar_vocab_mask(
@@ -3402,7 +3557,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 device=logits_output.next_token_logits.device,
             )
 
-        if sampling_info is not None:
+        if sampling_info is not None and vocab_target_predict is None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -3451,9 +3606,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
-            )
+            if vocab_target_predict is not None:
+                target_predict = vocab_target_predict
+            else:
+                target_predict = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).view(bs, int(self.block_size))
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
             # #1488 instrument: per-slot draft quality.  candidates[:, i] is the
             # draft's proposal for slot i (slot 0 = the verified anchor);
