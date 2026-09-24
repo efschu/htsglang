@@ -101,6 +101,8 @@ class FormCase:
     #: seat boots with its own overrides (FR_P/FR_D, chunk, draft on P ...),
     #: so the reference diff there is information, not a verdict.
     strict_ref: bool = True
+    #: the P cut must be THE STANDARD (see :func:`standard_cut_problems`)
+    standard_cut: bool = False
 
 
 _Q27_MODEL = f"{MODELS}/Qwen3.8-27B-INT8-gdncov-vocabembed"
@@ -134,6 +136,7 @@ CASE_27B = FormCase(
         "NCCL_BUFFSIZE": "1048576", "NCCL_MAX_NCHANNELS": "8", "PARK_N": "4", "PARK_REPS": "2750",
     },
     good_ref="weg2xsn411",
+    standard_cut=True,
 )
 
 _NF_EXTRA_P = (
@@ -208,6 +211,7 @@ CASES = {c.name: c for c in (CASE_27B, CASE_NF)}
 _ARGV_RE = re.compile(r"WEG2-LAUNCH group (?P<g>[PD]) argv: (?P<argv>.*)$")
 _ENV_RE = re.compile(r"WEG2-LAUNCH WEG2-GROUP-ENV (?P<g>[PD]): (?P<env>.*)$")
 _FRONT_LOG_TAG_RE = re.compile(r"^boot_weg2_(?P<tag>.+)_[0-9a-f]{7,40}_\d{4}_\d{6}\.front\.log$")
+_BOOT_HEADER_TAG_RE = re.compile(r"=== WEG2 BOOT tag=(\S+)")
 
 
 @dataclass
@@ -223,6 +227,15 @@ def parse_boot_lines(path: str) -> BootLines:
     out = BootLines(path=path)
     m = _FRONT_LOG_TAG_RE.match(os.path.basename(path))
     out.tag = m.group("tag") if m else ""
+    if not out.tag:
+        with open(path, errors="replace") as f:
+            for i, line in enumerate(f):
+                h = _BOOT_HEADER_TAG_RE.search(line)
+                if h:
+                    out.tag = h.group(1)
+                    break
+                if i > 50:
+                    break
     ident = weg2_form.log_identity(path)
     out.form = ident.form
     with open(path, errors="replace") as f:
@@ -576,6 +589,454 @@ def run_dry(case: FormCase, tree: str, work_dir: str, launcher_args: Optional[Se
         except subprocess.TimeoutExpired:
             rc = 124
     return rc, log_path
+
+
+# --------------------------------------------------------------------------
+# THE STANDARD P CUT (27B): makespan, one 262k request, the fastest that holds it
+# --------------------------------------------------------------------------
+
+_FLOOR_RULE_CAP_RE = re.compile(
+    r"PP-CUT POOL FLOOR RULE: source=cap\+chunk \(p_bs=1[^)]*\) floor=(\d+) = "
+    r"max_kv_per_request (\d+) \+ chunk (\d+)")
+_SOLVER_OBJECTIVE_RE = re.compile(r"PP-CUT solver: objective=(\w+) layers=([\d,]+)")
+_FRONTIER_RE = re.compile(r"PP-CUT FRONTIER: pool_floor=(\d+) objective=(\w+) .*?fastest first: (.*)$")
+_FRONTIER_ROW_RE = re.compile(r"([\d,]+)/([\d,]+) total_ms=([\d.]+) pool=(\d+) (BELOW|CLEARS)")
+#: the user's standard (memory kv-vs-perf-waehlbar-fast-getrennt, orders
+#: 2026-09-08 and 16.09., restated 24.09. 11:3xZ): the FAST layout that holds
+#: ONE request of the full context -- "das schnelle layout mit 262k max
+#: content ist als standard definiert ... weniger layer auf der 5090
+#: verringert DIREKT die prefill tok/s".
+STANDARD_CONTEXT_TOKENS = 262144
+
+
+def standard_cut_problems(dry_log: str, good_ref_argv_p: Sequence[str] = ()) -> Tuple[List[str], str]:
+    """``(problems, summary)`` -- empty problems = the shipped P cut IS the
+    standard: (1) the pool floor is cap+chunk with the cap at the full 262144
+    context (one request, --p-bs 1), not the bs2 ordered cut 39,13,12;
+    (2) the objective is makespan; (3) the shipped cut is the FASTEST frontier
+    row that clears that floor (a slower one means something else -- a host
+    price, a pin -- moved it); (4) group P's first stage (the 5090) carries at
+    least as many layers as the last good boot's."""
+    body = open(dry_log, errors="replace").read()
+    problems: List[str] = []
+    m = _FLOOR_RULE_CAP_RE.search(body)
+    if not m:
+        rule = re.search(r"PP-CUT POOL FLOOR RULE: (source=\S+[^\n]{0,80})", body)
+        problems.append("pool floor is not cap+chunk (p_bs=1): "
+                        + (rule.group(1) if rule else "no floor rule line"))
+    elif int(m.group(2)) != STANDARD_CONTEXT_TOKENS:
+        problems.append(f"cap {m.group(2)} != {STANDARD_CONTEXT_TOKENS}: the floor holds no full-context request")
+    o = _SOLVER_OBJECTIVE_RE.search(body)
+    if not o or o.group(1) != "makespan":
+        problems.append(f"objective {o.group(1) if o else '?'} != makespan")
+    f = _FRONTIER_RE.search(body)
+    fastest = None
+    if f:
+        for row in _FRONTIER_ROW_RE.finditer(f.group(3)):
+            if row.group(5) == "CLEARS":
+                fastest = (row.group(1), row.group(2), int(row.group(4)), float(row.group(3)))
+                break
+    shipped = None
+    for line in body.splitlines():
+        a = _ARGV_RE.search(line)
+        if a and a.group("g") == "P":
+            shipped = (flag_map(shlex.split(a.group("argv"))).get("--pp-stage-ratio") or (None,))[0]
+    if fastest is None:
+        problems.append("no frontier row clears the floor")
+    elif shipped != fastest[0]:
+        problems.append(f"shipped cut {shipped} is not the fastest cut clearing the floor ({fastest[0]} "
+                        f"pool {fastest[2]} {fastest[3]:.1f} ms)")
+    good = (flag_map(good_ref_argv_p).get("--pp-stage-ratio") or (None,))[0] if good_ref_argv_p else None
+    if shipped and good:
+        try:
+            if int(shipped.split(",")[0]) < int(good.split(",")[0]):
+                problems.append(f"the 5090 stage carries {shipped.split(',')[0]} layers, the last good boot "
+                                f"{good.split(',')[0]} ({good}) -- fewer layers on the 5090 cost prefill tok/s")
+        except ValueError:
+            problems.append(f"unparseable cut {shipped} / {good}")
+    summary = (f"shipped {shipped}; fastest clearing {fastest[0] if fastest else '?'}"
+               f" (pool {fastest[2] if fastest else '?'}); floor "
+               f"{m.group(1) if m else '?'} (cap {m.group(2) if m else '?'} + chunk {m.group(3) if m else '?'}); "
+               f"objective {o.group(1) if o else '?'}; last good {good or '-'}")
+    return problems, summary
+
+
+# --------------------------------------------------------------------------
+# THE ARM READER: the exact launcher invocations of an arm_xsn4xx.sh
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ArmCall:
+    kind: str                     # probe | dry | launch
+    name: str                     # probe_off_authoritative | dry_control | launch
+    argv: List[str]               # launcher argv (after -m sglang.srt.weg2.launcher)
+    env: Dict[str, str]           # the arm's exported environment at the call
+    must_rc0: bool = False
+    must_have: Tuple[str, ...] = ()
+    must_not: Tuple[str, ...] = ()
+
+
+_LAUNCHER_CMD = "-m sglang.srt.weg2.launcher"
+_ASSIGN_RE = re.compile(r"^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=")
+_FUNC_ONE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{(.*)\}\s*(?:#.*)?$")
+_FUNC_OPEN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{\s*(?:#.*)?$")
+_REPLAYED_FUNCS = ("gate_run", "gate_run3", "run", "gates_run")
+_BENIGN_BODY_RE = re.compile(
+    r"^(say\b|die\b|:|else$|fi$|then$|(?:gates_run|gate_run3|gate_run|run)(?:\s|;|$))")
+_COND_OK_RE = re.compile(r"^(?:if|elif)\s+(?:!\s*)?(?:\[\[?\s|test\s|grep\s)")
+_ENV_SKIP = {"PATH", "HOME", "PWD", "OLDPWD", "SHLVL", "_"}
+
+
+def _scan(s: str):
+    """Yield (index, char, in_quote) with bash quoting: '...' literal, "..."
+    with backslash escapes, $'...' treated as '...'."""
+    q = None
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if q is None:
+            if c == "\\" and i + 1 < len(s):
+                yield i, c, None
+                i += 1
+                yield i, s[i], None
+                i += 1
+                continue
+            if c in ("'", '"'):
+                q = c
+                yield i, c, None
+                i += 1
+                continue
+            yield i, c, None
+        elif q == "'":
+            if c == "'":
+                q = None
+            yield i, c, "'"
+        else:
+            if c == "\\" and i + 1 < len(s):
+                yield i, c, '"'
+                i += 1
+                yield i, s[i], '"'
+                i += 1
+                continue
+            if c == '"':
+                q = None
+            yield i, c, '"'
+        i += 1
+
+
+def _balanced(s: str) -> bool:
+    q = None
+    for _, c, inq in _scan(s):
+        q = inq
+    # the last char decides: _scan reports the state BEFORE the closing quote
+    depth = None
+    for _, c, inq in _scan(s + " "):
+        depth = inq
+    return depth is None
+
+
+def _split_top(s: str, sep: str) -> List[str]:
+    parts, cur = [], []
+    for _, c, inq in _scan(s):
+        if inq is None and c == sep:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+    parts.append("".join(cur))
+    return parts
+
+
+def _cut_redirect(cmd: str) -> Tuple[str, str]:
+    """``(command before the first unquoted '>', redirect target word)``."""
+    for i, c, inq in _scan(cmd):
+        if inq is None and c == ">":
+            rest = cmd[i + 1:].strip()
+            target = shlex.split(rest, posix=True)[0] if rest else ""
+            # keep the target as SHELL TEXT so the replay expands it
+            words = rest.split()
+            return cmd[:i].rstrip(), (words[0] if words else target)
+    return cmd, ""
+
+
+def _logical_lines(text: str) -> List[str]:
+    out, cur = [], ""
+    for raw in text.split("\n"):
+        if raw.rstrip().endswith("\\") and not raw.lstrip().startswith("#"):
+            cur += raw.rstrip()[:-1] + " "
+            continue
+        out.append(cur + raw)
+        cur = ""
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _strip_comment(line: str) -> str:
+    for i, c, inq in _scan(line):
+        if inq is None and c == "#" and (i == 0 or line[i - 1] in " \t;"):
+            return line[:i].rstrip()
+    return line.rstrip()
+
+
+def _rewrite_launcher_stmt(stmt: str, kind: str) -> Optional[str]:
+    """``... -m sglang.srt.weg2.launcher ARGS > TARGET ...`` -> ``__emit KIND TARGET ARGS``."""
+    k = stmt.find(_LAUNCHER_CMD)
+    if k < 0:
+        return None
+    args, target = _cut_redirect(stmt[k + len(_LAUNCHER_CMD):])
+    args = args.rstrip().rstrip("&").rstrip()
+    return f"__emit {kind} {target or kind} {args}"
+
+
+def _rewrite_function(name: str, body: str) -> str:
+    kind = "probe" if name.startswith("gate_run") else "dry"
+    keep = []
+    for stmt in _split_top(body, ";"):
+        st = stmt.strip()
+        if not st:
+            continue
+        if _LAUNCHER_CMD in st:
+            keep.append(_rewrite_launcher_stmt(st, kind))
+        elif _ASSIGN_RE.match(st) and "$(" not in st and "`" not in st:
+            keep.append(st)
+        elif st == "shift":
+            keep.append(st)
+    return f"{name}(){{ {'; '.join(k for k in keep if k)}; }}"
+
+
+def _parse_gate_criteria(body_lines: Sequence[str]) -> Dict[str, Dict[str, object]]:
+    """Per probe log basename: rc required, must-have / must-not strings --
+    read off the arm's own gates_run body (gate_assert / gate_refuse / rc die)."""
+    crit: Dict[str, Dict[str, object]] = {}
+    logvar: Dict[str, str] = {}
+    rcvar: Dict[str, str] = {}
+    current = None
+    for line in body_lines:
+        st = _strip_comment(line).strip()
+        if not st:
+            continue
+        m = re.match(r"^(gate_run3|gate_run)\b([^;]*);\s*([A-Za-z_]\w*)=\$\?", st)
+        if m:
+            current = {"call": (m.group(1) + m.group(2)).strip(), "rc_var": m.group(3)}
+            continue
+        m = re.match(r'^([A-Za-z_]\w*)="?\$EVIDPROBE/([^"\s]+)\.log"?$', st)
+        if m and current is not None:
+            name = m.group(2)
+            logvar[m.group(1)] = name
+            rcvar[current["rc_var"]] = name
+            crit[name] = {"rc0": False, "have": [], "not": [], "call": current["call"]}
+            continue
+        m = re.match(r'^\[\s*"\$([A-Za-z_]\w*)"\s*=\s*"0"\s*\]\s*\|\|\s*die', st)
+        if m and m.group(1) in rcvar:
+            crit[rcvar[m.group(1)]]["rc0"] = True
+            continue
+        m = re.match(r'^gate_assert\s+"\$([A-Za-z_]\w*)"\s+(.*)$', st)
+        if m and m.group(1) in logvar:
+            crit[logvar[m.group(1)]]["have"] += shlex.split(m.group(2))
+            continue
+        m = re.match(r'^gate_refuse\s+"\$([A-Za-z_]\w*)"\s+(.*)$', st)
+        if m and m.group(1) in logvar:
+            crit[logvar[m.group(1)]]["not"] += shlex.split(m.group(2))
+    return crit
+
+
+def build_arm_replay(arm_text: str, tree: str, positional: Sequence[str]) -> Tuple[str, Dict[str, Dict[str, object]]]:
+    """The arm reduced to a side-effect-free bash program: its assignments,
+    its exports, the if-blocks that only assign, and its launcher calls
+    rewritten to PRINT the argv and the exported environment instead of
+    running. Anything else -- service stops, mounts, git, sleeps, the boot --
+    is dropped. Returns ``(program, probe criteria)``."""
+    lines = _logical_lines(arm_text)
+    out: List[str] = []
+    placeholders: List[str] = []
+    criteria: Dict[str, Dict[str, object]] = {}
+    i = 0
+    n = len(lines)
+    while i < n:
+        raw = lines[i]
+        line = _strip_comment(raw)
+        st = line.strip()
+        i += 1
+        if not st:
+            continue
+        m1 = _FUNC_ONE_RE.match(st)
+        if m1:
+            if m1.group(1) in _REPLAYED_FUNCS:
+                out.append(_rewrite_function(m1.group(1), m1.group(2)))
+            continue
+        mo = _FUNC_OPEN_RE.match(st)
+        if mo:
+            body = []
+            while i < n and not lines[i].startswith("}"):
+                body.append(lines[i])
+                i += 1
+            i += 1
+            if mo.group(1) == "gates_run":
+                criteria = _parse_gate_criteria(body)
+                calls = []
+                for b in body:
+                    bs = _strip_comment(b).strip()
+                    fm = _FUNC_ONE_RE.match(bs)
+                    if fm and fm.group(1) in _REPLAYED_FUNCS:
+                        calls.append(_rewrite_function(fm.group(1), fm.group(2)))
+                    cm = re.match(r"^(gate_run3|gate_run)\b([^;]*)", bs)
+                    if cm and not fm:
+                        calls.append((cm.group(1) + cm.group(2)).strip())
+                out.append("gates_run(){ " + "; ".join(calls) + "; }")
+            continue
+        if st.startswith("if ") or st.startswith("if\t"):
+            block = [st]
+            depth = 1
+            while i < n and depth > 0:
+                b = _strip_comment(lines[i]).strip()
+                i += 1
+                if not b:
+                    continue
+                if re.match(r"^if\s", b):
+                    depth += 1
+                if b == "fi" or b.startswith("fi ") or b.endswith("; fi") or b == "fi;":
+                    depth -= 1
+                block.append(b)
+            ok = _COND_OK_RE.match(block[0]) and "$(" not in block[0] and "`" not in block[0] and "|" not in block[0]
+            for b in block[1:]:
+                if not ok:
+                    break
+                if b.startswith("elif "):
+                    ok = bool(_COND_OK_RE.match(b)) and "$(" not in b and "|" not in b
+                elif _ASSIGN_RE.match(b):
+                    ok = "$(" not in b and "`" not in b
+                else:
+                    ok = bool(_BENIGN_BODY_RE.match(b))
+            if ok:
+                out.extend(block)
+            continue
+        if _ASSIGN_RE.match(st):
+            stmt = st
+            while not _balanced(stmt) and i < n:
+                stmt += "\n" + _strip_comment(lines[i])
+                i += 1
+            if "$(" in stmt or "`" in stmt:
+                for name in re.findall(r"(?:^|\s)([A-Za-z_]\w*)=", stmt.split("=", 1)[0] + "="):
+                    placeholders.append(name)
+                continue
+            out.append(stmt)
+            continue
+        if re.match(r"^\[\[?\s.*\]\]?\s*&&\s*[A-Za-z_]\w*=", st) and "$(" not in st:
+            out.append(st)
+            continue
+        if _LAUNCHER_CMD in st and "$BASE" in st:
+            rw = _rewrite_launcher_stmt(st, "launch")
+            if rw:
+                out.append(rw.replace("__emit launch", "__emit launch launch", 1)
+                           if rw.startswith("__emit launch ") and " launch " not in rw[:22] else rw)
+            continue
+        if re.match(r"^(gates_run|run)(\s|$)", st):
+            out.append(st)
+            continue
+    prelude = [
+        "set +e",
+        "say(){ :; }",
+        "die(){ :; }",
+        "__emit(){ local kind=\"$1\" name=\"$2\"; shift 2; printf 'CALL\\0%s\\0%s\\0' \"$kind\" \"$name\"; "
+        "for __a in \"$@\"; do printf 'ARG\\0%s\\0' \"$__a\"; done; printf 'ENV\\0'; env -0; printf '\\0END\\0'; }",
+        "set -- " + " ".join(shlex.quote(p) for p in positional),
+        f"WT_OVERRIDE={shlex.quote(tree)}",
+    ] + [f"{p}=__GATE_{p}__" for p in dict.fromkeys(placeholders)]
+    return "\n".join(prelude + out) + "\n", criteria
+
+
+def read_arm(arm_path: str, tree: str, positional: Sequence[str] = ("GATE-SHA", "GATE-CUSHION"),
+             timeout_s: int = 60) -> List[ArmCall]:
+    """Every launcher invocation of ``arm_path`` -- probes, dry runs, the
+    launch -- with its argv and the arm's exported environment at that point,
+    in the arm's own order. Runs ONLY the reduced program (no side effects)."""
+    with open(arm_path, errors="replace") as f:
+        text = f.read()
+    program, criteria = build_arm_replay(text, tree, positional)
+    with tempfile.TemporaryDirectory(prefix="arm_replay_") as td:
+        res = subprocess.run(["bash", "--noprofile", "--norc", "-c", program], cwd=td,
+                             env={"PATH": "/usr/bin:/bin", "HOME": td},
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_s)
+    toks = res.stdout.decode("utf-8", "replace").split("\0")
+    calls: List[ArmCall] = []
+    k = 0
+    while k < len(toks):
+        if toks[k] != "CALL":
+            k += 1
+            continue
+        kind, name = toks[k + 1], toks[k + 2]
+        k += 3
+        argv: List[str] = []
+        while k < len(toks) and toks[k] == "ARG":
+            argv.append(toks[k + 1])
+            k += 2
+        env: Dict[str, str] = {}
+        if k < len(toks) and toks[k] == "ENV":
+            k += 1
+            while k < len(toks) and toks[k] != "END":
+                if "=" in toks[k]:
+                    key, val = toks[k].split("=", 1)
+                    if key not in _ENV_SKIP:
+                        env[key] = val
+                k += 1
+            k += 1
+        base = os.path.basename(name)
+        base = base[:-4] if base.endswith(".log") else base
+        c = criteria.get(base, {})
+        calls.append(ArmCall(kind=kind, name=base, argv=argv, env=env,
+                             must_rc0=bool(c.get("rc0")), must_have=tuple(c.get("have", ())),
+                             must_not=tuple(c.get("not", ()))))
+    if not calls:
+        raise RuntimeError(f"arm replay of {arm_path} produced no launcher call "
+                           f"(bash rc={res.returncode}: {res.stderr.decode('utf-8', 'replace')[-400:]})")
+    return calls
+
+
+def run_arm_call(call: ArmCall, tree: str, work_dir: str, timeout_s: int = 900,
+                 reuse: bool = False) -> Tuple[int, str]:
+    log_path = os.path.join(work_dir, f"arm_{call.name}.log")
+    if reuse and os.path.exists(log_path):
+        with open(log_path, errors="replace") as f:
+            head = f.read()
+        if "DRY-RUN complete" in head or "WEG2-LAUNCH REFUSED" in head:
+            m = re.search(r"^# rc=(-?\d+)$", head, re.M)
+            return (int(m.group(1)) if m else 0), log_path
+    argv = [VENV_PY, "-m", "sglang.srt.weg2.launcher"] + list(call.argv)
+    if "--dry-run" not in argv:
+        argv.append("--dry-run")
+    env = dict(os.environ)
+    env.update(call.env)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["PYTHONPATH"] = os.path.join(tree, "python")
+    with open(log_path, "w") as fh:
+        fh.write("# " + " ".join(shlex.quote(a) for a in argv) + "\n")
+        fh.write("# env " + " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(call.env.items())) + "\n")
+        fh.flush()
+        try:
+            rc = subprocess.run(argv, cwd=tree, env=env, stdout=fh, stderr=subprocess.STDOUT,
+                                timeout=timeout_s).returncode
+        except subprocess.TimeoutExpired:
+            rc = 124
+        fh.write(f"# rc={rc}\n")
+    return rc, log_path
+
+
+def judge_probe(call: ArmCall, rc: int, log_path: str) -> Tuple[bool, str]:
+    body = open(log_path, errors="replace").read()
+    why = []
+    if call.must_rc0 and rc != 0:
+        refused = re.findall(r"WEG2-LAUNCH REFUSED: .*", body)
+        why.append(f"rc={rc} (the arm dies on rc!=0): {refused[-1][:300] if refused else body[-300:]}")
+    for w in call.must_have:
+        if w not in body:
+            why.append(f"emitter '{w}' missing")
+    for w in call.must_not:
+        if w in body:
+            why.append(f"'{w}' must not appear")
+    return (not why), "; ".join(why) or (
+        f"rc={rc}, have {list(call.must_have)}, not {list(call.must_not)}")
 
 
 # --------------------------------------------------------------------------

@@ -1385,6 +1385,11 @@ def p_prefill_transient_vector_mib(chunk_tokens: int) -> Tuple[float, ...]:
 P_PREFILL_TRANSIENT_CALIBRATION_MODELS: Tuple[str, ...] = (
     "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",
 )
+#: ... keyed by its architecture family (weg2_form.model_family), the one
+#: calibration identity every measured source is matched on.
+P_PREFILL_TRANSIENT_CALIBRATION_FAMILIES: Tuple[str, ...] = (
+    "qwen4_exp_text/L48/H2560/E512",
+)
 
 
 def p_prefill_transient_for(boot_form) -> Tuple[bool, str]:
@@ -1394,7 +1399,8 @@ def p_prefill_transient_for(boot_form) -> Tuple[bool, str]:
     """
     if boot_form is None:
         return True, "no WEG2-FORM (desk caller): published as before"
-    if boot_form.model in P_PREFILL_TRANSIENT_CALIBRATION_MODELS:
+    if (boot_form.family in P_PREFILL_TRANSIENT_CALIBRATION_FAMILIES
+            or boot_form.model in P_PREFILL_TRANSIENT_CALIBRATION_MODELS):
         return True, (
             f"published: {P_PREFILL_TRANSIENT_MIB_PER_CHUNK_TOKEN} MiB/chunk-token "
             f"x {P_CHUNKED_PREFILL_TOKENS} = "
@@ -1404,8 +1410,10 @@ def p_prefill_transient_for(boot_form) -> Tuple[bool, str]:
     return False, (
         f"NOT published: the slopes {P_PREFILL_TRANSIENT_MIB_PER_CHUNK_TOKEN} "
         f"MiB/chunk-token were measured on "
-        f"{', '.join(P_PREFILL_TRANSIENT_CALIBRATION_MODELS)}; this boot runs "
-        f"{boot_form.model or '?'}, on which no prefill transient was measured. "
+        f"{', '.join(P_PREFILL_TRANSIENT_CALIBRATION_MODELS)} (family "
+        f"{', '.join(P_PREFILL_TRANSIENT_CALIBRATION_FAMILIES)}); this boot runs "
+        f"{boot_form.model or '?'} (family {boot_form.family or '?'}), on which no "
+        f"prefill transient was measured. "
         f"Its P ranks size the pool without that post, as every boot of this "
         f"model before #114 did (27B line xsn411: PP0 277606 tokens; xsn417 with "
         f"the foreign slopes: 246155 < 262144). An operator-exported "
@@ -11300,7 +11308,7 @@ def solve_p_cut(
             "prefix is one chunk -- the shallowest depth this boot can run. "
             "This is an absence of the instrument, not a measured shallow rig."
             % (
-                ("of " + weg2_form.model_key(model) + " (WEG2-FORM calibration identity) ")
+                ("of family " + weg2_form.model_family(model) + " (WEG2-FORM calibration identity) ")
                 if calib_log_accept_of(ns) is not None else "",
                 EVIDENCE_DIR,
             )
@@ -13123,8 +13131,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # WEG2-FORM: THE CALIBRATION IDENTITY. Every measured source this boot
     # prices from (the sidecar record, the P logs the cut and the depth read)
     # is taken only from boots of THIS checkpoint. None (teardown) = no filter.
+    # Two strictnesses, one identity (weg2_form: the checkpoint FAMILY plus
+    # axes): the #1444 D DEVICE residue is keyed on RESIDUE_AXES (the drafter
+    # D carries changes what it leaves on the card); the host ledger on
+    # HOST_AXES (the ledger names the draft's host terms itself).
     calib_sample_accept = (
-        weg2_form.same_model_sample(ns.model, EVIDENCE_DIR, boot_form)
+        weg2_form.same_model_sample(ns.model, EVIDENCE_DIR, boot_form,
+                                    axes=weg2_form.RESIDUE_AXES)
+        if boot_form is not None else None)
+    calib_host_accept = (
+        weg2_form.same_model_sample(ns.model, EVIDENCE_DIR, boot_form,
+                                    axes=weg2_form.HOST_AXES)
         if boot_form is not None else None)
     calib_log_accept = calib_log_accept_of(ns)
     apply_spec_form(ns)
@@ -13431,13 +13448,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _dc_rec_d, cards, ns.weg2_weight_source)
     if _dc_rec_d is None and calib_sample_accept is not None:
         _dc_record_prov = (
-            f"no group-D dormant-image record MEASURED ON {boot_form.model} under "
+            f"no group-D dormant-image record MEASURED ON family {boot_form.family} under "
             f"this form ({' '.join(a + '=' + getattr(boot_form, a) for a in weg2_form.RESIDUE_AXES)}) "
-            f"in the sidecar -- samples of another checkpoint or form are not this "
+            f"in the sidecar -- samples of another model family or form are not this "
             f"boot's residue (WEG2-FORM; xsn418 died W19 on fnFL2x144's) -> constant")
     elif calib_sample_accept is not None:
         _dc_record_prov += (
-            f" [WEG2-FORM calibration identity: {boot_form.model}, "
+            f" [WEG2-FORM calibration identity: family {boot_form.family}, "
             f"{' '.join(a + '=' + getattr(boot_form, a) for a in weg2_form.RESIDUE_AXES)}]")
     dc_expect_d = {
         c.uuid: (
@@ -14261,8 +14278,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # plain equality filter) rather than raise, so the two producers are
             # kept to the one literal construction, not re-derived twice.
             flip_ratchet_form_key=f"wtags={len(weights_tags)}",
-            # WEG2-FORM: only samples measured on THIS checkpoint.
-            record_accept=calib_sample_accept,
+            # WEG2-FORM: only samples of THIS checkpoint family and host form.
+            record_accept=calib_host_accept,
             # #1362 [22-fix]: content digest, snapshot-independent. `None` (an
             # unreadable checkpoint) stays empty and the arm keeps the pre-#1362
             # behaviour rather than refusing on a digest it could not compute.

@@ -134,6 +134,9 @@ class Weg2Form:
     vision: str
     profile: str = ""
     model: str = ""
+    #: the checkpoint's ARCHITECTURE family (:func:`model_family`) -- the key
+    #: every calibration source is matched on, see CALIBRATION IDENTITY below
+    family: str = ""
     #: axis -> where the value came from (printed only, never published)
     sources: Tuple[Tuple[str, str], ...] = field(default=(), compare=False)
 
@@ -151,13 +154,14 @@ class Weg2Form:
         parts = [f"{a}={getattr(self, a)}" for a in AXES]
         parts.append(f"profile={self.profile}")
         parts.append(f"model={self.model}")
+        parts.append(f"family={self.family}")
         return ",".join(parts)
 
     def line(self) -> str:
         src = "; ".join(f"{a} <- {s}" for a, s in self.sources)
         return (
             f"{FORM_LINE_TAG} {self.describe()} profile={self.profile} "
-            f"model={self.model}" + (f" (sources: {src})" if src else "")
+            f"model={self.model} family={self.family}" + (f" (sources: {src})" if src else "")
         )
 
     def matches(self, **want: Iterable[str]) -> bool:
@@ -184,6 +188,7 @@ def parse_form(value: str) -> Optional[Weg2Form]:
         **{a: kv[a] for a in AXES},
         profile=kv.get("profile", ""),
         model=kv.get("model", ""),
+        family=kv.get("family", ""),
     )
 
 
@@ -313,6 +318,58 @@ def _fractions(value: str) -> List[float]:
 def model_key(model: str) -> str:
     """The calibration identity of a checkpoint: its directory name."""
     return os.path.basename(str(model or "").rstrip("/").strip("'\""))
+
+
+@lru_cache(maxsize=256)
+def _config_family(config_path: str, _mtime: float) -> Optional[str]:
+    try:
+        with open(config_path) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    scopes = [d for d in (cfg.get("text_config"), cfg) if isinstance(d, dict)]
+
+    def pick(*keys):
+        for d in scopes:
+            for k in keys:
+                v = d.get(k)
+                if isinstance(v, (int, str)) and not isinstance(v, bool) and v != "":
+                    return v
+        return None
+
+    mt = pick("model_type")
+    layers = pick("num_hidden_layers", "num_layers", "n_layer")
+    hidden = pick("hidden_size", "d_model", "n_embd")
+    if mt is None or layers is None or hidden is None:
+        return None
+    experts = pick(*_EXPERT_CONFIG_KEYS) or 0
+    return f"{mt}/L{layers}/H{hidden}/E{experts}"
+
+
+def model_family(model: str) -> str:
+    """The CALIBRATION IDENTITY of a checkpoint: its architecture family
+    ``<model_type>/L<layers>/H<hidden>/E<routed experts>`` from config.json.
+
+    WHY THE FAMILY AND NOT THE DIRECTORY (xsn419, 24.09.): every quantity the
+    launcher calibrates from earlier boots -- the D device residue after a
+    sleep, the host run-moment residual, the flip ratchet, the prefill census,
+    the P bubble -- is a property of the architecture and the runtime form,
+    not of how one checkpoint stores its vocab embedding. Keyed on the
+    directory name, the arm's gate probe (``Qwen3.8-27B-INT8-gdncov``, the
+    same qwen3_5 64x5120 dense model the boot runs as ``...-vocabembed``)
+    found no history at all and fell to the ledger's no-record stand-in.
+    A checkpoint whose config cannot be read keys on its directory name
+    (``ckpt:<name>``) -- it then matches only itself, never a family.
+    """
+    path = str(model or "").rstrip("/").strip("'\"")
+    cfg = os.path.join(path, "config.json")
+    try:
+        fam = _config_family(cfg, os.path.getmtime(cfg))
+    except OSError:
+        fam = None
+    return fam or f"ckpt:{model_key(path)}"
 
 
 def checkpoint_arch(model: str) -> Tuple[Optional[str], str]:
@@ -550,6 +607,7 @@ def resolve_form(
     return Weg2Form(
         arch=arch, experts=experts, draft=draft, p_draft=p_draft, kv=kv,
         flip=flip, vision=vision, profile=profile, model=model_key(model),
+        family=model_family(model),
         sources=tuple((a, sources[a]) for a in AXES if a in sources),
     )
 
@@ -579,7 +637,7 @@ def add_form_arguments(ap) -> None:
 _FORM_LINE_MODEL_RE = re.compile(re.escape(FORM_LINE_TAG) + r" .*?\bmodel=(\S+)")
 _FORM_LINE_AXES_RE = re.compile(
     re.escape(FORM_LINE_TAG) + r" (arch=\S+ experts=\S+ draft=\S+ p_draft=\S+ kv=\S+ "
-    r"flip=\S+ vision=\S+) profile=(\S*) model=(\S+)")
+    r"flip=\S+ vision=\S+) profile=(\S*) model=(\S+)(?: family=(\S+))?")
 _MODEL_PATH_RE = re.compile(r"--model-path[= ]'?([^\s']+)")
 _SPEC_ALGO_RE = re.compile(r"--speculative-algorithm[= ]'?([A-Z_]+)")
 _SERVER_ARGS_MODEL_RE = re.compile(r"\bmodel_path='([^']+)'")
@@ -590,16 +648,21 @@ _SCAN_MAX_BYTES = 16 << 20
 
 @dataclass(frozen=True)
 class BootIdentity:
-    """What a boot log says it ran: the checkpoint, and -- when it can tell --
-    its form (a WEG2-FORM line) or at least its draft (the groups' argv)."""
+    """What a boot log says it ran: the checkpoint (name and architecture
+    family), and -- when it can tell -- its form (a WEG2-FORM line) or at
+    least its drafter (group D's argv: D always carries the boot's drafter,
+    P only when it produces, and xsn414/415 shipped P a NEXTN head under a
+    DFLASH D)."""
     model: Optional[str]
     form: Optional[Weg2Form] = None
     draft: Optional[str] = None
+    family: Optional[str] = None
 
 
 def log_identity(path: str) -> BootIdentity:
-    """Scan a boot log's head for its checkpoint and draft (and form line)."""
-    model = draft = None
+    """Scan a boot log's head for its checkpoint, family and drafter."""
+    model_path = form = None
+    d_draft = other_draft = None
     try:
         with open(path, "rb") as f:
             seen = 0
@@ -608,29 +671,34 @@ def log_identity(path: str) -> BootIdentity:
                 if seen > _SCAN_MAX_BYTES:
                     break
                 line = raw.decode("utf-8", "replace")
-                if FORM_LINE_TAG in line:
+                if FORM_LINE_TAG in line and form is None:
                     m = _FORM_LINE_AXES_RE.search(line)
                     if m:
                         kv = dict(x.split("=", 1) for x in m.group(1).split())
-                        form = Weg2Form(**kv, profile=m.group(2), model=m.group(3))
-                        return BootIdentity(model=form.model, form=form, draft=form.draft)
-                    m = _FORM_LINE_MODEL_RE.search(line)
-                    if m and model is None:
-                        model = m.group(1)
+                        form = Weg2Form(**kv, profile=m.group(2), model=m.group(3),
+                                        family=m.group(4) or "")
                 if "argv" in line or "model_path=" in line:
-                    if model is None:
-                        m = _MODEL_PATH_RE.search(line) or _SERVER_ARGS_MODEL_RE.search(line)
-                        if m:
-                            model = model_key(m.group(1))
-                    if draft is None and model is not None:
-                        m = _SPEC_ALGO_RE.search(line)
-                        if m:
-                            draft = _SPEC_TO_DRAFT.get(m.group(1))
-                if model is not None and draft is not None:
+                    m = _MODEL_PATH_RE.search(line) or _SERVER_ARGS_MODEL_RE.search(line)
+                    if m and model_path is None:
+                        model_path = m.group(1)
+                    a = _SPEC_ALGO_RE.search(line)
+                    if a and "group D argv" in line:
+                        d_draft = _SPEC_TO_DRAFT.get(a.group(1))
+                    elif a and other_draft is None:
+                        other_draft = _SPEC_TO_DRAFT.get(a.group(1))
+                if form is not None and form.family:
+                    break
+                if model_path is not None and d_draft is not None:
                     break
     except OSError:
         return BootIdentity(model=None)
-    return BootIdentity(model=model, draft=draft)
+    if form is not None:
+        fam = form.family or (model_family(model_path) if model_path else None)
+        return BootIdentity(model=form.model, form=form, draft=form.draft, family=fam)
+    if model_path is None:
+        return BootIdentity(model=None)
+    return BootIdentity(model=model_key(model_path), draft=d_draft or other_draft,
+                        family=model_family(model_path))
 
 
 def log_model(path: str) -> Optional[str]:
@@ -639,26 +707,30 @@ def log_model(path: str) -> Optional[str]:
 
 
 @lru_cache(maxsize=4096)
-def _group_log_model_cached(path: str, mtime: float) -> Optional[str]:
+def _group_log_identity_cached(path: str, mtime: float) -> BootIdentity:
     front = None
     for suffix in (".P.log", ".D.log"):
         if path.endswith(suffix):
             front = path[: -len(suffix)] + ".front.log"
     if front and os.path.exists(front):
-        got = log_model(front)
-        if got:
+        got = log_identity(front)
+        if got.model:
             return got
-    return log_model(path)
+    return log_identity(path)
 
 
-def group_log_model(path: str) -> Optional[str]:
-    """Model of a ``*.P.log``/``*.D.log``: its sibling front log first (it
+def group_log_identity(path: str) -> BootIdentity:
+    """Identity of a ``*.P.log``/``*.D.log``: its sibling front log first (it
     carries the argv), the group log's own ServerArgs line second."""
     try:
         mtime = os.path.getmtime(path)
     except OSError:
-        return None
-    return _group_log_model_cached(path, mtime)
+        return BootIdentity(model=None)
+    return _group_log_identity_cached(path, mtime)
+
+
+def group_log_model(path: str) -> Optional[str]:
+    return group_log_identity(path).model
 
 
 _FRONT_LOG_RE = re.compile(
@@ -711,43 +783,56 @@ def boot_tag_model(tag: str, evidence_dir: str) -> Optional[str]:
     return boot_tag_identity(tag, evidence_dir).model
 
 
-#: The axes that change what a group leaves on the device and in the host
-#: image (the D residue, the dormant image, the run peak): a sample measured
-#: under another value of any of them is not this form's measurement.
+#: CALIBRATION IDENTITY, per consumer (the family of :func:`model_family`
+#: always; these axes on top, compared exactly on a boot that printed a
+#: WEG2-FORM line):
+#:
+#: RESIDUE_AXES -- the #1444 D DEVICE residue: what a sleeping D leaves on the
+#: card depends on the drafter D carries (DFLASH window pool vs MTP head), the
+#: flip form, Form A and an expert store, so all of them key it. A pre-form
+#: boot is judged by the drafter its group-D argv names.
 RESIDUE_AXES: Tuple[str, ...] = ("arch", "experts", "draft", "kv", "flip")
+#: HOST_AXES -- the host-ledger record (run-moment residual, flip ratchet):
+#: the ledger NAMES the draft's host terms itself (draft pools, arena, heaps),
+#: and what it reads from the record is exactly the remainder it does not
+#: name, so the drafter does not key it; the flip form, Form A and a tmpfs
+#: expert store change the host itself and do.
+HOST_AXES: Tuple[str, ...] = ("arch", "experts", "kv", "flip")
 
 
 def same_model_sample(
-    model: str, evidence_dir: str, form: Optional[Weg2Form] = None
+    model: str, evidence_dir: str, form: Optional[Weg2Form] = None,
+    axes: Sequence[str] = RESIDUE_AXES,
 ) -> Callable[[dict], bool]:
-    """Predicate for measured-record samples: measured on ``model`` (and, with
-    ``form``, under the same residue axes)?
+    """Predicate for measured-record samples: measured on ``model``'s family
+    (and, with ``form``, under the same ``axes``)?
 
     A sample whose boot names no model is NOT accepted -- an unproven
-    provenance is exactly the mix-up this predicate exists to stop. A boot
-    with a WEG2-FORM line is compared on :data:`RESIDUE_AXES`; an older boot
-    (no form line) on its draft when its argv names one, else on its model.
+    provenance is exactly the mix-up this predicate exists to stop.
     """
-    want = model_key(model)
+    want = model_family(model)
+    axes = tuple(axes)
 
     def accept(sample: dict) -> bool:
         ident = boot_tag_identity(str(sample.get("boot_tag", "")), evidence_dir)
-        if ident.model != want:
+        if not ident.model or ident.family != want:
             return False
         if form is None:
             return True
         if ident.form is not None:
-            return all(getattr(ident.form, a) == getattr(form, a) for a in RESIDUE_AXES)
-        return ident.draft is None or ident.draft == form.draft
+            return all(getattr(ident.form, a) == getattr(form, a) for a in axes)
+        if "draft" in axes:
+            return ident.draft is None or ident.draft == form.draft
+        return True
 
     return accept
 
 
 def same_model_log(model: str) -> Callable[[str], bool]:
-    """Predicate for ``*.P.log`` calibration sources: this boot's checkpoint?"""
-    want = model_key(model)
+    """Predicate for ``*.P.log`` calibration sources: this checkpoint's family?"""
+    want = model_family(model)
 
     def accept(path: str) -> bool:
-        return group_log_model(path) == want
+        return group_log_identity(path).family == want
 
     return accept
