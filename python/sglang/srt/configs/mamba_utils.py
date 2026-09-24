@@ -186,6 +186,41 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
+    def replayssm_ring_bytes_per_req(self, record_len: int) -> int:
+        """ReplaySSM spec-verify scratch bytes of ONE request row, all layers.
+
+        Upstream main (configs/mamba_utils.py, chain #28695..#35544). GDN keeps
+        compact d/k/g plus low parts for the activation-dtype d/k rings; KDA
+        keeps its raw-input fold window and d/k rings. The shape is this
+        rank's (uneven GDN TP: num_k_heads_per_tp / temporal come from the
+        per-rank plan), so the same formula prices every rank of the group.
+        """
+        hv, v_dim, k_dim = self.shape.temporal
+        h_k = self.shape.num_k_heads_per_tp
+        conv_b = self.dtype.conv.itemsize
+        fp32_b = 4
+        if self.is_kda:
+            per_layer = (
+                hv * record_len * v_dim * conv_b  # rawv
+                + h_k * record_len * k_dim * conv_b  # rawk
+                + hv * record_len * fp32_b  # beta
+                + hv * record_len * k_dim * fp32_b  # vector g
+                + hv * record_len * v_dim * conv_b  # d
+                + h_k * record_len * k_dim * conv_b  # k
+            )
+        else:
+            per_layer = (
+                hv * record_len * v_dim * conv_b  # d
+                + h_k * record_len * k_dim * conv_b  # normalized k
+                + hv * record_len * fp32_b  # scalar g
+            )
+            if self.dtype.conv != torch.float32:
+                per_layer += (
+                    hv * record_len * v_dim * conv_b  # d low part
+                    + h_k * record_len * k_dim * conv_b  # normalized-k low part
+                )
+        return per_layer * len(self.layers)
+
     @property
     def is_kda(self) -> bool:
         """KDA per-K-channel gate vs GDN/Mamba2 per-head scalar gate. Selects
