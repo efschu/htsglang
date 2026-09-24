@@ -147,7 +147,15 @@ class TestTheGateIsWiredAndOrdered(CustomTestCase):
         the way refused_tokens_by_component is documented to."""
         src = self._src()
         self.assertIn("if not locally_eligible:", src)
-        self.assertIn("elif prefetch_length < self.prefetch_threshold:", src)
+        # xsn437: the too_short term reads `_min_len`, which IS
+        # `self.prefetch_threshold` unless a read completes an earlier short
+        # store read (min_tokens) -- the same term, the same place in the order.
+        self.assertIn(
+            "_min_len = self.prefetch_threshold if min_tokens is None else "
+            "max(1, int(min_tokens))",
+            src,
+        )
+        self.assertIn("elif prefetch_length < _min_len:", src)
         self.assertIn("elif self.cache_controller.prefetch_rate_limited():", src)
 
     def test_the_rate_limit_check_is_still_called_at_most_once(self):

@@ -4687,9 +4687,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
         locally_eligible: bool = True,
+        min_tokens: Optional[int] = None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
+        # `min_tokens` (xsn437): the smallest read worth issuing. None = the
+        # tree's `prefetch_threshold` (256), the unchanged default. A read that
+        # COMPLETES an earlier store read which terminated short (the tail P's
+        # asynchronous write-through had not landed yet) passes 1: the
+        # threshold prices whether opening a read is worth it, and a tail
+        # below it that nobody re-reads can only end in the standstill exit
+        # (W88 503 for 219 and 1 missing tokens on weg2xsn437).
+        _min_len = self.prefetch_threshold if min_tokens is None else max(1, int(min_tokens))
 
         # #580: decide the MODE before any rank-local predicate runs. Under
         # `symmetric` the participation vote below is the group's decision
@@ -4751,7 +4760,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # is documented to.
         if not locally_eligible:
             reason = "anchor"
-        elif prefetch_length < self.prefetch_threshold:
+        elif prefetch_length < _min_len:
             reason = "too_short"
         elif self.cache_controller.prefetch_rate_limited():
             reason = "rate_limited"
@@ -4796,7 +4805,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if host_indices is None and not symmetric:
                 available_size = self.cache_controller.mem_pool_host.available_size()
                 prefetch_length = available_size - (available_size % self.page_size)
-                if prefetch_length >= self.prefetch_threshold:
+                if prefetch_length >= _min_len:
                     # #1068 L2: the span is CUT to the room the pool has.
                     # Counted and spoken, NOT a refusal -- the shortened
                     # prefetch registers below. `lost` against the chunk
@@ -4847,7 +4856,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     prefetch_length,
                     available_size - (available_size % self.page_size),
                 )
-                if _partial >= self.prefetch_threshold:
+                if _partial >= _min_len:
                     host_indices = self.cache_controller.mem_pool_host.alloc(
                         _partial
                     )

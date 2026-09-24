@@ -666,6 +666,79 @@ def _weg2_prefetch_stall_s() -> float:
         return 30.0
 
 
+#: xsn437 STORE-SHORT TAIL (weg2xsn437, rids weg2-6-2 / weg2-20-37): a store
+#: read that TERMINATED short owes its TAIL. P's write-through is asynchronous,
+#: so D's first read of a prompt P has just answered can land before P's last
+#: node does (219 and 1 tokens short); the owed re-read was then refused below
+#: the prefetch threshold (#915 vote_negative need=219 threshold=256,
+#: HOLD-REFETCH declined:too_short), the chain stood still and W88 answered
+#: 503. Two repairs, one switch (SGLANG_WEG2_STORE_SHORT_TAIL, default on; 0 =
+#: both old forms, for A/B and rollback):
+#:   * the re-read that completes a short read may be smaller than the
+#:     threshold (``_weg2_store_tail_min_tokens``);
+#:   * a store-short read that stands still with a remainder WITHIN X is
+#:     admitted and D prefills the remainder (``_weg2_store_short_recompute``)
+#:     -- store-short must recompute; over X it stays the named W88, the
+#:     user's veto against a prefill over X is untouched.
+_WEG2_STORE_SHORT_TAIL_ENV = "SGLANG_WEG2_STORE_SHORT_TAIL"
+
+
+def _weg2_store_short_tail_on() -> bool:
+    return str(os.environ.get(_WEG2_STORE_SHORT_TAIL_ENV, "1")).strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _weg2_store_tail_min_tokens(req) -> Optional[int]:
+    """1 when this read COMPLETES an earlier store read of ``req`` that
+    terminated short (``_weg2_note_store_shortfall`` stamped what it
+    delivered; the stamp comes from the group-synced record, so every rank
+    of the group asks the same), else None = the tree's threshold."""
+    if not _weg2_store_short_tail_on():
+        return None
+    return 1 if getattr(req, "_weg2_store_delivered", None) is not None else None
+
+
+def _weg2_store_short_remainder(req) -> Optional[int]:
+    """Tokens D prefills if ``req`` is admitted on what its short read
+    materialised (device-resident prefix after the read); None = no stamp."""
+    delivered = getattr(req, "_weg2_store_delivered", None)
+    ids = getattr(req, "full_untruncated_fill_ids", None)
+    if delivered is None or ids is None:
+        return None
+    return max(0, len(ids) - int(delivered))
+
+
+def _weg2_store_short_recompute(sched, req, reason: str, span) -> Optional[str]:
+    """The standstill exit of a STORE-SHORT read whose remainder fits in X:
+    clear the mark and return ``'expired'`` -- the request goes to its
+    admission and the X gate prices it with the group's match (a remainder
+    the mamba validator widens past X is still refused there, by name).
+    None = not this case: the caller answers W88 as before."""
+    if not _weg2_store_short_tail_on() or reason != _DEFER_REASON_STORE_SHORT:
+        return None
+    x = int(getattr(getattr(sched, "server_args", None), "tp_prefill_max_tokens", 0) or 0)
+    remainder = _weg2_store_short_remainder(req)
+    if x <= 0 or remainder is None or remainder > x:
+        return None
+    from sglang.srt.mem_cache.match_refusal_census import (
+        note_prefetch_gate as _note_prefetch_gate,
+    )
+
+    sched._clear_prefetch_deferral_fields(req)
+    _note_prefetch_gate("defer_expired")
+    n = getattr(sched, "_weg2_store_tail_recomputed", 0) + 1
+    sched._weg2_store_tail_recomputed = n
+    logger.warning(
+        "#1324 STORE-SHORT TAIL RECOMPUTE rid=%s delivered=%d remainder=%d X=%d "
+        "span=%s n=%d -- the store read stood still short of the prefix, and "
+        "the remainder fits in X: admitted, D prefills it (store-short must "
+        "recompute; over X this stays the named W88)",
+        str(getattr(req, "rid", "?"))[:16], int(getattr(req, "_weg2_store_delivered", 0)),
+        remainder, x, span, n,
+    )
+    return "expired"
+
+
 def _weg2_windowed_path(sched) -> bool:
     """Is this group's store read WINDOWED? Asked so a stand-in cannot raise.
 
@@ -6027,6 +6100,10 @@ class Scheduler(
         except Exception as exc:  # noqa: BLE001 -- the hand-off is a shortcut, never a gate
             logger.info("#1442 HANDOFF-KEYS n/a rid=%s (%s: %s)", req.rid, type(exc).__name__, exc)
 
+        # xsn437 STORE-SHORT TAIL: a read that completes an earlier short store
+        # read may be smaller than the prefetch threshold ({} = unchanged call).
+        _tail_min = _weg2_store_tail_min_tokens(req)
+        _tail_kw = {"min_tokens": _tail_min} if _tail_min is not None else {}
         if group_decides:
             self.tree_cache.prefetch_from_storage(
                 req.rid,
@@ -6035,6 +6112,7 @@ class Scheduler(
                 last_hash,
                 prefix_keys,
                 locally_eligible=locally_eligible,
+                **_tail_kw,
             )
         else:
             self.tree_cache.prefetch_from_storage(
@@ -6043,6 +6121,7 @@ class Scheduler(
                 new_input_tokens,
                 last_hash,
                 prefix_keys,
+                **_tail_kw,
             )
 
         if _ongoing is None:
@@ -7501,6 +7580,10 @@ class Scheduler(
         progress = self._weg2_note_prefetch_progress(req)
         if progress == "terminal":
             if _weg2_windowed_path(self):
+                # xsn437: a store-short remainder within X is recomputed, not 503.
+                _tail = _weg2_store_short_recompute(self, req, reason, span)
+                if _tail is not None:
+                    return _tail
                 return self._weg2_store_load_terminal(
                     req, arm=reason, span=span, site=site
                 )
