@@ -3216,14 +3216,19 @@ class ServerArgs:
     ] = None
     chat_template_default_kwargs: A[
         Optional[str],
-        "JSON object of default chat_template_kwargs applied to every chat "
-        "completion before rendering, e.g. '{\"preserve_thinking\": true}'. "
-        "Per-request chat_template_kwargs override these key by key. Use this "
-        "to make a template flag that only exists per request into a serving "
-        "default; 'preserve_thinking' in particular keeps prior-turn think "
-        "blocks in the rendered prompt so multi-turn prompts stay a byte-exact "
-        "prefix of what was generated, which is what lets the KV prefix cache "
-        "hit instead of re-prefilling the conversation on every turn.",
+        Arg(
+            help="JSON object of default chat_template_kwargs applied to every chat "
+            "completion before rendering, e.g. '{\"preserve_thinking\": true}'. "
+            "Per-request chat_template_kwargs override these key by key. Use this "
+            "to make a template flag that only exists per request into a serving "
+            "default; 'preserve_thinking' in particular keeps prior-turn think "
+            "blocks in the rendered prompt so multi-turn prompts stay a byte-exact "
+            "prefix of what was generated, which is what lets the KV prefix cache "
+            "hit instead of re-prefilling the conversation on every turn. "
+            "--default-chat-template-kwargs (upstream #29579 spelling) is an "
+            "alias of this flag.",
+            aliases=["--default-chat-template-kwargs"],
+        ),
     ] = None
     completion_template: A[
         Optional[str],
@@ -17912,6 +17917,19 @@ class ServerArgs:
         engine args unchanged) and is decoded once by the serving layer.
         """
         if self.chat_template_default_kwargs is None:
+            return
+        if isinstance(self.chat_template_default_kwargs, dict):
+            # Programmatic callers written against upstream #29579
+            # (default_chat_template_kwargs is a dict there): keep the raw-JSON
+            # contract of this field by normalizing to the JSON string.
+            if not all(isinstance(k, str) for k in self.chat_template_default_kwargs):
+                raise ValueError(
+                    "--chat-template-default-kwargs keys must be strings "
+                    "(they are passed as keyword arguments to the chat template)."
+                )
+            self.chat_template_default_kwargs = json.dumps(
+                self.chat_template_default_kwargs
+            )
             return
         try:
             parsed = json.loads(self.chat_template_default_kwargs)

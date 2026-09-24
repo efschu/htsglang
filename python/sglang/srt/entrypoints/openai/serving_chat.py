@@ -683,10 +683,45 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return adapted_request, request
 
+    def _apply_default_chat_template_kwargs(
+        self, request: ChatCompletionRequest
+    ) -> None:
+        """Fold the server-wide chat_template_kwargs defaults into the request.
+
+        #29579 semantics: the defaults become part of
+        ``request.chat_template_kwargs`` (request keys win), so every reader of
+        that field -- reasoning detection (``_get_reasoning_from_request``),
+        the reasoning parser, tool handling -- sees the same effective value
+        the template renders with. A default ``reasoning_effort`` is mirrored
+        onto ``request.reasoning_effort`` when the request sets none.
+
+        The fork precedence of ``merge_chat_template_kwargs`` is kept exactly:
+        an explicit ``request.reasoning_effort`` outranks a default
+        ``reasoning_effort``, so that default is not folded in then (it would
+        otherwise reach the merge as a request key and win).
+        """
+        if not self.default_chat_template_kwargs:
+            return
+        ctk = dict(request.chat_template_kwargs or {})
+        for key, value in self.default_chat_template_kwargs.items():
+            if key == "reasoning_effort" and request.reasoning_effort is not None:
+                continue
+            ctk.setdefault(key, value)
+        request.chat_template_kwargs = ctk
+        default_effort = self.default_chat_template_kwargs.get("reasoning_effort")
+        if (
+            default_effort is not None
+            and request.reasoning_effort is None
+            and ctk.get("reasoning_effort") == default_effort
+        ):
+            request.reasoning_effort = default_effort
+
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
+        self._apply_default_chat_template_kwargs(request)
+
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
             request.skip_special_tokens = False
