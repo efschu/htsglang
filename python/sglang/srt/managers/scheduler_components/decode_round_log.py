@@ -178,6 +178,25 @@ logger = logging.getLogger(__name__)
 __all__ = ["DecodeRoundLog", "RoundAcc"]
 
 
+def _ar_round_census(rank: int, family_acc) -> None:
+    """fnFL2 H28 hook; imported late so this module stays import-light."""
+    from sglang.srt.distributed.device_communicators.barlink_round_census import (
+        census_on,
+        on_decode_round,
+    )
+
+    if _AR_CENSUS_BROKEN or not census_on():
+        return
+    try:
+        on_decode_round(rank, family_acc)
+    except Exception as exc:  # noqa: BLE001 - a census never stops a decode round
+        globals()["_AR_CENSUS_BROKEN"] = True
+        logger.warning("BARLINK-ROUND-CENSUS disabled after error: %r", exc)
+
+
+_AR_CENSUS_BROKEN = False
+
+
 class RoundAcc:
     """One round's folded brackets, before it is readable."""
 
@@ -484,6 +503,10 @@ class DecodeRoundLog:
 
         self._overhead_rounds += 1
         self._overhead_gpu_ms += round_ms
+        if split_known and family_acc:
+            # fnFL2 H28: BARLINK-ROUND-CENSUS every N rounds; no-op unless
+            # SGLANG_WEG2_AR_ROUND_CENSUS.
+            _ar_round_census(self.rank, family_acc)
         if self.wake_census.armed:
             self.wake_census.on_round(
                 round_id=acc.round_id,

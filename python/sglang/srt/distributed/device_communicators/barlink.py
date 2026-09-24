@@ -771,6 +771,15 @@ class BarlinkCommunicator:
                    ).strip().lower() == "refuse"
             else "warn"
         )
+        #: fnFL2 H28: SGLANG_WEG2_AR_ROUND_CENSUS -- record, at CAPTURE time
+        #: only, which all-reduce sizes a graph bakes in and which kernel
+        #: topology the transport picks for them (the census line's
+        #: ``bytes=``/``mode=``). Read once; replay runs no Python.
+        from sglang.srt.distributed.device_communicators import (
+            barlink_round_census as _round_census,
+        )
+
+        self._round_census = _round_census if _round_census.census_on() else None
         self.transport = _build_transport(
             _TRANSPORT, cpu_group, device, disabled=self.disabled, group=group,
         )
@@ -1172,6 +1181,9 @@ class BarlinkCommunicator:
         inp = input_.contiguous()
         nbytes = inp.numel() * inp.element_size()
         t = self._select("all_reduce", nbytes)
+        _census = getattr(self, "_round_census", None)
+        if _census is not None and graph_capture_running():
+            _census.note_captured("all_reduce", nbytes, t)
         if t is not None:
             result = t.barlink_all_reduce(self, inp)
             self._after_transport(t, "all_reduce")

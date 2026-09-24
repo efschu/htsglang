@@ -1818,6 +1818,14 @@ class Envs:
     # so their sum is the forward's span and the line is comparable with the
     # rank's gpu-ms. No host sync in the forward; read at the next forward.
     SGLANG_WEG2_PREFILL_TIMING = EnvBool(False)
+    # fnFL2 H28 (Task #53): the decode round's all-reduce census by class.
+    # On: the Form A MoE-input carrier records under its own collective-clock
+    # family 'tp.moe_carrier' (the combine keeps 'tp.all_reduce'), and every
+    # _EVERY decode rounds each rank prints BARLINK-ROUND-CENSUS (count,
+    # bytes and kernel mode as captured, mean/min span, transport floor vs
+    # skew). Names only -- no collective changes. Off: byte-identical.
+    SGLANG_WEG2_AR_ROUND_CENSUS = EnvBool(False)
+    SGLANG_WEG2_AR_ROUND_CENSUS_EVERY = EnvInt(50)
     # Weg2 launcher: group P's --chunked-prefill-size (tokens). The launcher
     # names the chunk ONCE (CHUNKED_PREFILL_TOKENS) because the PP-cut solver,
     # the depth funding and P's argv must all price the same chunk; an argv

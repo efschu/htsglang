@@ -132,6 +132,16 @@ def _default_broadcast(tensor, src: int):
     return get_tp_group().broadcast(tensor, src=src)
 
 
+def _carrier_scope():
+    # Imported late: the desk tests run this module without a process group,
+    # and the census module is import-light but lives under distributed/.
+    from sglang.srt.distributed.device_communicators.barlink_round_census import (
+        carrier_scope,
+    )
+
+    return carrier_scope()
+
+
 def publish_moe_input(
     hidden_states,
     *,
@@ -155,9 +165,12 @@ def publish_moe_input(
     if hidden_states.shape[0] == 0:
         return hidden_states
     mode = carrier or moe_input_carrier()
-    if mode == "broadcast":
-        return (broadcast or _default_broadcast)(hidden_states, host_rank)
-    return (all_reduce or _default_all_reduce)(hidden_states)
+    # fnFL2 H28: SGLANG_WEG2_AR_ROUND_CENSUS names this span 'tp.moe_carrier'
+    # so the round line tells the carrier from the combine. Off: no-op.
+    with _carrier_scope():
+        if mode == "broadcast":
+            return (broadcast or _default_broadcast)(hidden_states, host_rank)
+        return (all_reduce or _default_all_reduce)(hidden_states)
 
 
 def receive_moe_input(
@@ -199,9 +212,10 @@ def receive_moe_input(
 
         make = torch.zeros
     buf = make((num_tokens, hidden_size), dtype=dtype, device=device)
-    if mode == "broadcast":
-        return (broadcast or _default_broadcast)(buf, host_rank)
-    return (all_reduce or _default_all_reduce)(buf)
+    with _carrier_scope():
+        if mode == "broadcast":
+            return (broadcast or _default_broadcast)(buf, host_rank)
+        return (all_reduce or _default_all_reduce)(buf)
 
 
 # ---------------------------------------------------------------------------
