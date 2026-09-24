@@ -4635,6 +4635,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
 
+        # Upstream #37165: the extend's deferred mamba COW/clear indices must
+        # not ride into decode. The non-spec path below clears them late; the
+        # spec path returns early, so clear them here. The fork's
+        # ModelRunner._maybe_execute_deferred_mamba_cow_and_clear already skips
+        # target-verify / draft-extend / non-extend forwards (the consequence
+        # upstream hit), so this is the second guard, at the source.
+        self.mamba_cow_src_indices = None
+        self.mamba_cow_dst_indices = None
+        self.mamba_clear_indices = None
+
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
