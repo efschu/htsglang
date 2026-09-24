@@ -8912,12 +8912,12 @@ def read_pp_bubble(path: str) -> Optional[BubbleMeasurement]:
 #: [N/128, K/128]`` -- and the exchange copies bytes between the cards, so the
 #: layouts must agree. Forcing Marlin everywhere makes them agree (the geometry
 #: is the one compressed-tensors pack-quantized already moves: MIXED_FUSED_COLS,
-#: weg2xsn258) and costs the 5090 its native FP8 GEMM. The private workspace
-#: takes Marlin's per-card lock buffer off the module (W84) and re-zeroes it
-#: after every weights resume (marlin_utils_fp8).
+#: weg2xsn258) and costs the 5090 its native FP8 GEMM. Marlin's per-card lock
+#: workspace stays on the module: the exchange coverage books it as
+#: local_scratch and every weights resume re-zeroes it
+#: (weight_exchange.zero_local_scratch, adopted from the NF line).
 FP8_UNIFORM_MARLIN_ENV = {
     "SGLANG_FORCE_FP8_MARLIN": "1",
-    "SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE": "1",
 }
 
 
@@ -8962,8 +8962,8 @@ def fp8_layout_decision(
             "BOTH groups -- one byte layout for the flip exchange (Marlin int32 "
             "[K/16,4N] + group scales [K/128,N] on the 5090 as on the 3080s; the "
             "5090 gives up its native block-FP8 GEMM for it); the Marlin lock "
-            "workspace leaves the module and is re-zeroed after every weights "
-            "resume (rank line 'WEG2-WAKE FP8-MARLIN workspaces re-zeroed')"
+            "workspace is booked local_scratch and re-zeroed after every weights "
+            "resume (rank line 'WEG2-RESUME local-scratch zeroed=')"
             % " ".join("%s=%s" % kv for kv in sorted(FP8_UNIFORM_MARLIN_ENV.items())))
     if str(weight_source) == WEIGHT_SOURCE_EXCHANGE:
         raise Weg2LaunchRefused(
@@ -11428,9 +11428,9 @@ def build_parser() -> argparse.ArgumentParser:
              "(SGLANG_FORCE_FP8_MARLIN=1) so the 5090 holds the same byte layout "
              "as the 3080s (Marlin int32 [K/16,4N] + group scales) and the "
              "exchange can move bytes between them; the 5090 gives up its native "
-             "block-FP8 GEMM for it. Also takes Marlin's per-card lock workspace "
-             "off the module (else W84 UNCOVERED) and re-zeroes it after every "
-             "weights resume (SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE=1). Without it an "
+             "block-FP8 GEMM for it. Marlin's per-card lock workspace is booked "
+             "local_scratch by the exchange coverage and re-zeroed after every "
+             "weights resume (weight_exchange.zero_local_scratch). Without it an "
              "FP8 checkpoint under --weg2-weight-source exchange is refused (W160). "
              "Inert on a non-FP8 checkpoint; default off = argv and env "
              "byte-identical.")

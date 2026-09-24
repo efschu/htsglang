@@ -1108,16 +1108,6 @@ class SchedulerWeightUpdaterManager:
         return list(tags) + [GPU_MEMORY_TYPE_CUDA_GRAPH]
 
     @staticmethod
-    def _weg2_zero_fp8_marlin_workspaces() -> int:
-        """Re-zero the registered FP8 Marlin lock workspaces; the count (0 when
-        none are registered -- every boot without --fp8-uniform-marlin)."""
-        from sglang.srt.layers.quantization.marlin_utils_fp8 import (
-            zero_fp8_marlin_workspaces,
-        )
-
-        return int(zero_fp8_marlin_workspaces())
-
-    @staticmethod
     def _weg2_zero_graph_scratch() -> Optional[int]:
         """Re-zero the registered flashinfer FLOAT workspaces; count, or None.
 
@@ -5942,6 +5932,21 @@ class SchedulerWeightUpdaterManager:
         self._weg2_owned_name_keys_cache = keys
         return keys
 
+    def _weg2_wake_models(self) -> list:
+        """Every model this rank computes with after a wake -- the TARGET
+        (tp_worker's runner) and, when present and distinct, the DRAFT.  The
+        exchange asks :meth:`_weg2_model_for_group` for the REGION's runner (D:
+        the draft); the scratch zeroing must reach the layers that run.
+        Adopted from the NF line (fnFL2x38, ba5847a7c0)."""
+        out: list = []
+        for m in (
+            getattr(getattr(getattr(self, "tp_worker", None), "model_runner", None), "model", None),
+            self._weg2_model_for_group("D"),
+        ):
+            if m is not None and all(m is not o for o in out):
+                out.append(m)
+        return out
+
     def _weg2_model_for_group(self, group: str):
         """The model runner for the given group."""
         if group == "D":
@@ -8280,17 +8285,43 @@ class SchedulerWeightUpdaterManager:
                     self.stashed_model_static_state,
                 )
                 del self.stashed_model_static_state
-                # 27B FP8 on the flip (--fp8-uniform-marlin): the FP8 Marlin lock
-                # workspaces live under the weights tags, no plan sources them and
-                # the resume mapped recycled pages -- their zero contract comes back
-                # HERE, before the first forward. Registry empty on every boot
-                # without SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE: no work, no line.
-                _nz = self._weg2_zero_fp8_marlin_workspaces()
-                if _nz:
-                    logger.info(
-                        "WEG2-WAKE FP8-MARLIN workspaces re-zeroed n=%d (lock buffers "
-                        "under the weights tags; the resume mapped recycled pages)",
-                        _nz,
+                # THE WEIGHTS-SIDE MIRROR of the graph tag's
+                # `_weg2_zero_graph_scratch`, adopted from the NF line (fnFL2
+                # v43/v44/x38: 54266526b8, 1a87bef818, ba5847a7c0).
+                # `marlin_make_workspace` puts a lock array on every Marlin
+                # linear (FP8 / NVFP4 under --fp8-uniform-marlin: `layer.workspace`,
+                # sms x int32, zero at rest), in no checkpoint and therefore in no
+                # exchange plan (the coverage books it as local_scratch). The
+                # resume maps RECYCLED pages under the weights tags and nothing
+                # writes it, so it holds the pages' residue; Marlin needs it at
+                # zero -- a non-zero lock makes the kernel spin or read a partial
+                # tile. 27B PLACEMENT: here, with the weights family COMPLETE,
+                # not per wake chunk as on the NF line -- a partial chunk leaves
+                # other tags unmapped and a whole-model memset would write into
+                # them. BOTH runners of this rank (target + draft): the exchange
+                # asks `_weg2_model_for_group` for the REGION's runner, the
+                # kernels run in both. A boot without Marlin linears finds none:
+                # no work, no line.
+                try:
+                    from sglang.srt.weg2.weight_exchange import zero_local_scratch
+
+                    _scratch = []
+                    for _m in self._weg2_wake_models():
+                        _scratch.extend(zero_local_scratch(_m))
+                    if _scratch:
+                        logger.info(
+                            "WEG2-RESUME local-scratch zeroed=%d first=%s "
+                            "(runtime-built tensors the exchange has no source "
+                            "for; see weight_exchange.LOCAL_SCRATCH_REASON)",
+                            len(_scratch), _scratch[0],
+                        )
+                except Exception as _sexc:  # noqa: BLE001
+                    # NAMED, never swallowed: a failure here means the first
+                    # forward after this wake runs on the pages' residue.
+                    logger.error(
+                        "WEG2-RESUME local-scratch zeroing FAILED (%s) -- the "
+                        "first forward after this wake reads recycled pages "
+                        "in every Marlin workspace", _sexc,
                     )
                 # #1273 S5b: the DESTINATION half.  This hook runs after
                 # family_complete and after the reload, so whatever DID

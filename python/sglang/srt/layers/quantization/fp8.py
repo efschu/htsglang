@@ -78,10 +78,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     requant_block_scale_ue8m0_for_deepgemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp8 import (
-    fp8_marlin_workspace_off_module,
-    prepare_fp8_layer_for_marlin,
-)
+from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -1045,12 +1042,6 @@ class Fp8LinearMethod(LinearMethodBase):
             prepare_fp8_layer_for_marlin(layer, not self.block_quant, born_in=born_in)
             # Activations not quantized for marlin.
             del layer.input_scale
-            # 27B FP8 on the weg2 flip (launcher --fp8-uniform-marlin; default
-            # off): the lock workspace leaves the module -- a per-card tensor the
-            # exchange cannot source (W84) -- and is re-zeroed after every weights
-            # resume (marlin_utils_fp8.zero_fp8_marlin_workspaces).
-            if envs.SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE.get():
-                self.workspace = fp8_marlin_workspace_off_module(layer)
 
     def apply(
         self,
@@ -1059,12 +1050,11 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_marlin:
-            private_ws = self.__dict__.get("workspace")
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
-                workspace=layer.workspace if private_ws is None else private_ws,
+                workspace=layer.workspace,
                 size_n=layer.output_size_per_partition,
                 size_k=layer.input_size_per_partition,
                 bias=bias,
