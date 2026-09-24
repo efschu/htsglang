@@ -1674,7 +1674,7 @@ class Scheduler(
 
             log_vram_family_census(
                 draft_model,
-                f"pp{self.pp_rank}-draft-vs-target",
+                f"pp{self.ps.pp_rank}-draft-vs-target",
                 "after draft load",
                 peer=self.tp_worker.model_runner.model,
             )
@@ -1766,7 +1766,7 @@ class Scheduler(
             if not dflash_produce_on_p():
                 logger.info(
                     dflash_produce_off_line(
-                        where=f"scheduler pp_rank={self.pp_rank} (producer built, never asked)"
+                        where=f"scheduler pp_rank={self.ps.pp_rank} (producer built, never asked)"
                     )
                 )
 

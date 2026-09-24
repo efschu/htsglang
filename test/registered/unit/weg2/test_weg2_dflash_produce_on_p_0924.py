@@ -318,3 +318,25 @@ def test_main_routes_w10_through_the_gate():
     assert "gate_w10(spec_p.log, spec_d.log, log," in src
     assert "p_produces_draft_pages=p_produces_draft_pages()" in src
     assert "check_drafter_identity(" not in src  # one grader, not two
+
+
+def test_scheduler_names_its_pp_rank_through_ps_in_the_producer_init():
+    """weg2xsn416 (24.09.): the off-form line read ``self.pp_rank`` -- an
+    attribute the Scheduler does not have (it is ``self.ps.pp_rank``) -- and
+    PP2 died in ``_maybe_init_draft_kv_producer`` before READY."""
+    import ast
+    import inspect
+
+    from sglang.srt.managers import scheduler as sched_mod
+
+    src = inspect.getsource(sched_mod.Scheduler._maybe_init_draft_kv_producer)
+    tree = ast.parse(src.lstrip())
+    bad = [
+        n.lineno
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Attribute)
+        and n.attr == "pp_rank"
+        and isinstance(n.value, ast.Name)
+        and n.value.id == "self"
+    ]
+    assert not bad, f"self.pp_rank read at relative line(s) {bad}; use self.ps.pp_rank"
