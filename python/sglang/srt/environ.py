@@ -538,6 +538,15 @@ class Envs:
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # H13 (fnFL2x109, D-TP0 cgroup-OOM mid D-prefill, anon +7.4 GiB in 1 s):
+    # debug_utils/host_anon_probe.py. RssAnon of the rank at every decoder
+    # layer / MoE wave (fetch, apply) / Form A worker layer, and a sampler
+    # thread; a move of >= DELTA_MIB logs HOST-ANON-DELTA with the site (and,
+    # from the sampler, HOST-ANON-STACK per Python thread + HOST-ANON-VMAS),
+    # one HOST-ANON-PASS line per extend pass. SAMPLE_MS=0: no sampler thread.
+    SGLANG_DEBUG_HOST_ANON_PROBE = EnvBool(False)
+    SGLANG_DEBUG_HOST_ANON_PROBE_DELTA_MIB = EnvInt(256)
+    SGLANG_DEBUG_HOST_ANON_PROBE_SAMPLE_MS = EnvInt(50)
     # #790: the #767 mamba carry-without-copy instrument. Its log line sits on
     # the prefill admission path (alloc <- alloc_for_extend <- prepare_for_
     # extend <- get_new_batch_prefill), where a WARNING that fires on ordinary

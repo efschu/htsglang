@@ -125,6 +125,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+from sglang.srt.debug_utils import host_anon_probe as _hap
 from sglang.srt.layers.moe import pinned_host_ledger
 from sglang.srt.layers.prefill_timing import StageHead
 from sglang.srt.utils.break_cost_clock import break_cost_phase
@@ -4461,6 +4462,9 @@ class MoEExpertOffloadCache:
 
         self._observe_routing(ids_list)
         self._nan_trace_begin(ids_list)
+        # H13: SGLANG_DEBUG_HOST_ANON_PROBE -- RssAnon at every MoE site.
+        _hap_layer = getattr(self.layer, "layer_id", None)
+        _hap.checkpoint("moe.routed", layer=_hap_layer, T=len(ids_list))
 
         # Task #45 (19.09.): expert-oracle dump, eager decode only, rank 0
         try:
@@ -4521,6 +4525,8 @@ class MoEExpertOffloadCache:
             needed = sorted({e for r in rows for e in ids_list[r] if e >= 0})
             slot_of_needed, fetch_plan = self.planner.resolve(needed)
             self._fetch(fetch_plan)
+            _hap.checkpoint("moe.fetch", layer=_hap_layer, wave=f"{_w}/{len(waves)}",
+                            fetched=len(fetch_plan))
             self._nan_trace_wave(_w, needed, slot_of_needed)
             lut = self._build_lut(slot_of_needed, topk_ids.dtype, topk_ids.device)
 
@@ -4552,6 +4558,8 @@ class MoEExpertOffloadCache:
             out_full.index_copy_(
                 0, rows_t, combine_out.hidden_states.to(out_full.dtype)
             )
+            _hap.checkpoint("moe.apply", layer=_hap_layer, wave=f"{_w}/{len(waves)}",
+                            rows=len(rows))
 
         # Reuse the last wave's CombineInput type/fields, swapping in full output.
         self._log_wave_h2d("token", len(waves), h2d_before)
@@ -4674,6 +4682,8 @@ class MoEExpertOffloadCache:
             topk_output=topk_output._replace(topk_ids=remapped)
         )
         out = apply_fn(sub)
+        _hap.checkpoint("moe.single", layer=getattr(self.layer, "layer_id", None),
+                        fetched=len(fetch_plan))
         if _tm:
             _e2 = torch.cuda.Event(enable_timing=True); _e2.record()
             _wave_timing_note(getattr(self.layer, "layer_id", None), _e0, _e1, _e2,
@@ -4760,6 +4770,8 @@ class MoEExpertOffloadCache:
                 if _tm:
                     _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
                 self._fetch(fetch_plan)
+                _hap.checkpoint("moe.fetch", layer=getattr(self.layer, "layer_id", None),
+                                wave=f"{w}/{len(spill_waves) + 1}", fetched=len(fetch_plan))
                 self._nan_trace_wave(w, needed, slot_of_needed)
                 if _tm:
                     _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
@@ -4817,6 +4829,8 @@ class MoEExpertOffloadCache:
                             (T * K, part.shape[-1]), dtype=part.dtype, device=device
                         )
                     partials.index_copy_(0, idx, part.to(partials.dtype))
+                _hap.checkpoint("moe.apply", layer=getattr(self.layer, "layer_id", None),
+                                wave=f"{w}/{len(spill_waves) + 1}", pairs=int(idx_np.size))
                 if _tm:
                     _e2 = torch.cuda.Event(enable_timing=True); _e2.record()
                     _tm_ev.append((_e0, _e1, _e2))

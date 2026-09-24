@@ -269,9 +269,15 @@ def run_form_a_worker_layers(
             "weights; running it on the host would skip the whole dense "
             "model and silently produce garbage."
         )
+    from sglang.srt.debug_utils import host_anon_probe as _hap
+
     recv = receive or receive_moe_input
     served = 0
+    # H13: SGLANG_DEBUG_HOST_ANON_PROBE -- the worker's pass and its layers.
+    _mode = getattr(forward_batch, "forward_mode", None)
+    _hap.pass_begin(getattr(_mode, "name", "WORKER"), int(num_tokens), role="worker")
     for _layer_id, mlp in blocks:
+        _hap.checkpoint("worker.layer", layer=_layer_id)
         moe_in = recv(
             num_tokens,
             hidden_size,
@@ -282,4 +288,5 @@ def run_form_a_worker_layers(
         )
         mlp(moe_in, forward_batch)
         served += 1
+    _hap.pass_end()
     return served

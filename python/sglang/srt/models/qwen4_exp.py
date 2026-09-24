@@ -2092,8 +2092,15 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         )
         residual = None
         aux_hidden_states = []
+        # H13: SGLANG_DEBUG_HOST_ANON_PROBE -- one pass per model forward, a
+        # RssAnon checkpoint before every decoder layer (no-op when off).
+        _hap.pass_begin(
+            getattr(forward_batch.forward_mode, "name", str(forward_batch.forward_mode)),
+            int(hidden_states.shape[0]),
+        )
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
+            _hap.checkpoint("layer", layer=i)
             if i + 1 < self.end_layer:
                 next_ple = getattr(self.layers[i + 1], "ple", None)
                 if next_ple is not None:
@@ -2114,6 +2121,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
 
         if ple_batch is not None:
             _commit_ple_batch(ple_batch, forward_batch)
+        _hap.pass_end()
 
         if not self.pp_group.is_last_rank:
             # Hand the hyper-connection stream to the next stage. The residual
@@ -2179,6 +2187,7 @@ _LAYER_ID_RE = re.compile(r"\.layers\.(\d+)\.")
 # tensor -- 225.300 of them for this model.
 from sglang.srt.form_a_construction import skip_on_worker  # noqa: E402
 from sglang.srt.form_a_worker_forward import publish_moe_input  # noqa: E402
+from sglang.srt.debug_utils import host_anon_probe as _hap  # noqa: E402
 from sglang.srt.rank_role import (  # noqa: E402
     form_a_dense_is_unsharded,
     this_rank_is_form_a_worker,
