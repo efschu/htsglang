@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import CacheOperation as BaseCacheOperation
+from sglang.srt.mem_cache.hicache_drain_budget import coalesce_host_releases
 
 
 def _draft_device_rows(draft_pool, device_indices, direction: str):
@@ -459,6 +460,14 @@ class HybridCacheController(BaseHiCacheController):
         self, release_queue: Queue, host_indices: torch.Tensor, page_size: int
     ) -> None:
         if host_indices.numel() == 0:
+            return
+        if coalesce_host_releases() and host_indices.numel() % max(1, int(page_size or 1)) == 0:
+            # SGLANG_HICACHE_DRAIN_BUDGET (27B, 24.09.): ONE entry per release.
+            # Page size 1 (the arena host pool) made a 95k-token prefetch span
+            # 95k entries -- ~1.5 us each here and again in the scheduler
+            # thread's drain (xsn429: 171.96 ms drain spike). The budgeted
+            # drain cuts large entries on page boundaries itself.
+            release_queue.put(host_indices)
             return
         for page in host_indices.split(page_size):
             release_queue.put(page)
