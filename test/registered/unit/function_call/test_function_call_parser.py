@@ -29,6 +29,7 @@ from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sglang.srt.function_call.utils import get_schema_properties
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -1903,6 +1904,27 @@ class TestQwen3CoderDetector(unittest.TestCase):
                     },
                 ),
             ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_current_time",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "cities": {
+                                "anyOf": [
+                                    {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    {"type": "null"},
+                                ],
+                                "default": None,
+                            }
+                        },
+                    },
+                ),
+            ),
         ]
         self.detector = Qwen3CoderDetector()
 
@@ -2107,6 +2129,75 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertEqual(params["todos"][0]["content"], "Buy groceries")
         self.assertEqual(params["todos"][1]["status"], "completed")
 
+    def test_anyof_array_parameter_conversion(self):
+        """
+        Test array parameter conversion for nullable anyOf schemas.
+
+        Scenario: A Pydantic-style nullable list schema is represented by anyOf.
+        Purpose: Verify array values are parsed as arrays, not JSON-looking strings.
+        """
+        text = """<tool_call>
+<function=get_current_time>
+<parameter=cities>
+["NYC"]
+</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertIsInstance(params["cities"], list)
+        self.assertEqual(params["cities"], ["NYC"])
+
+    def test_anyof_array_parameter_conversion_null(self):
+        """
+        Test 'null' is converted correctly for nullable anyOf schemas.
+
+        Scenario: A Pydantic-style nullable list schema is represented by anyOf.
+        Purpose: Verify null values are parsed as 'None', not as strings.
+        """
+        text = """<tool_call>
+<function=get_current_time>
+<parameter=cities>
+null
+</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["cities"], None)
+
+    def test_streaming_anyof_array_parameter_conversion(self):
+        """
+        Test streaming array parameter conversion for nullable anyOf schemas.
+
+        Scenario: A Pydantic-style nullable list schema is streamed in Qwen3 Coder format.
+        Purpose: Verify the streamed JSON fragments encode an array value, not a string value.
+        """
+        chunks = [
+            "<tool_call>",
+            "<function=get_current_time>",
+            "<parameter=cities>",
+            '["NYC"]',
+            "</parameter>",
+            "</function>",
+            "</tool_call>",
+        ]
+
+        detector = Qwen3CoderDetector()
+        collected_params = ""
+
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.parameters:
+                    collected_params += call.parameters
+
+        params = json.loads(collected_params)
+        self.assertIsInstance(params["cities"], list)
+        self.assertEqual(params["cities"], ["NYC"])
+
     # ==================== Edge Cases ====================
 
     def test_empty_parameter_value(self):
@@ -2159,6 +2250,63 @@ class TestQwen3CoderDetector(unittest.TestCase):
         # Should not crash
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertIsInstance(result, StreamingParseResult)
+
+    def test_nested_anyof_array_with_multiple_types_parameter_conversion(self):
+        """
+        Test several edge cases of parameter conversion for nullable anyOf schemas.
+        1) Test nested anyOf 'T | None' extracts 'T' correctly.
+        2) Test that order of null and non-null type doesn't affect schema parsing.
+        3) Test that list of multiple types (including dict) is parsed correctly.
+        """
+
+        tool = Tool(
+            type="function",
+            function=Function(
+                name="process_optional_list",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "optional_items_to_process": {
+                            "anyOf": [
+                                {
+                                    "anyOf": [
+                                        # Note: here "null" is listed before the non-null type.
+                                        {"type": "null"},
+                                        {
+                                            "anyOf": [
+                                                {
+                                                    "type": "array",
+                                                    "items": {},
+                                                },
+                                                {"type": "null"},
+                                            ],
+                                        },
+                                    ],
+                                },
+                                {"type": "null"},
+                            ],
+                            "default": None,
+                        }
+                    },
+                },
+            ),
+        )
+
+        text = """<tool_call>
+<function=process_optional_list>
+<parameter=optional_items_to_process>
+[true, null, {"enabled": false}]
+</parameter>
+</function>
+</tool_call>"""
+
+        result = self.detector.detect_and_parse(text, [tool])
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertIsInstance(params["optional_items_to_process"], list)
+        self.assertEqual(
+            params["optional_items_to_process"], [True, None, {"enabled": False}]
+        )
 
     # ==================== Structural tag (xgrammar builtin) ====================
     # Qwen3 Coder uses the new builtin structural tag path. supports_structural_tag()
@@ -4668,6 +4816,129 @@ class TestGemma4Detector(unittest.TestCase):
         params1 = json.loads(tool_calls_by_index[1]["parameters"])
         self.assertEqual(params0["location"], "Paris")
         self.assertEqual(params1["timezone"], "UTC")
+
+
+class TestGetSchemaProperties(unittest.TestCase):
+    """#36626: top-level properties, descending into anyOf/oneOf/allOf."""
+
+    def test_flat_properties(self):
+        schema = {"type": "object", "properties": {"a": {"type": "string"}}}
+        self.assertEqual(get_schema_properties(schema), {"a": {"type": "string"}})
+
+    def test_top_level_combinators(self):
+        schema = {
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"const": "acme"},
+                        "payload": {"type": "object"},
+                    },
+                },
+                {"type": "object", "properties": {"kind": {"const": "other"}}},
+            ],
+        }
+        # duplicate keys resolve to the first branch that declares them
+        self.assertEqual(
+            get_schema_properties(schema),
+            {"kind": {"const": "acme"}, "payload": {"type": "object"}},
+        )
+
+    def test_anyof_allof_and_nesting(self):
+        anyof = {
+            "anyOf": [{"properties": {"x": {"type": "integer"}}}, {"type": "null"}]
+        }
+        self.assertEqual(get_schema_properties(anyof), {"x": {"type": "integer"}})
+        allof = {
+            "allOf": [
+                {"oneOf": [{"properties": {"y": {"type": "boolean"}}}]},
+                {"properties": {"z": {"type": "string"}}},
+            ]
+        }
+        self.assertEqual(
+            get_schema_properties(allof),
+            {"y": {"type": "boolean"}, "z": {"type": "string"}},
+        )
+
+    def test_non_dict_and_missing(self):
+        self.assertEqual(get_schema_properties(None), {})
+        self.assertEqual(get_schema_properties({"type": "object"}), {})
+        self.assertEqual(get_schema_properties({"oneOf": "not-a-list"}), {})
+
+
+class TestTopLevelCompositeToolSchemaQwen3Coder(unittest.TestCase):
+    """#36626 (qwen3_coder part): argument types must resolve when tool
+    ``parameters`` declares its properties under a top-level oneOf instead of
+    directly. The glm4/glm47 halves of the upstream test are not ported (those
+    detectors are not touched here)."""
+
+    def setUp(self):
+        self.oneof_tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="acme",
+                    description="Send a value to Acme.",
+                    parameters={
+                        "type": "object",
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"const": "acme"},
+                                    "payload": {
+                                        "type": "object",
+                                        "properties": {
+                                            "value": {"type": "string"},
+                                        },
+                                        "required": ["value"],
+                                    },
+                                },
+                                "required": ["kind", "payload"],
+                            },
+                            {
+                                "type": "object",
+                                "properties": {"kind": {"const": "other"}},
+                                "required": ["kind"],
+                            },
+                        ],
+                    },
+                ),
+            ),
+        ]
+        self.qwen_text = (
+            "<tool_call><function=acme>"
+            "<parameter=kind>acme</parameter>"
+            '<parameter=payload>{"value": "hello"}</parameter>'
+            "</function></tool_call>"
+        )
+        self.expected = {"kind": "acme", "payload": {"value": "hello"}}
+
+    def _stream_arguments(self, detector, text, tools, chunk_size=8):
+        name = None
+        arguments = ""
+        for i in range(0, len(text), chunk_size):
+            result = detector.parse_streaming_increment(text[i : i + chunk_size], tools)
+            for call in result.calls:
+                if call.name:
+                    name = call.name
+                arguments += call.parameters
+        return name, arguments
+
+    def test_qwen3_coder_detect_and_parse(self):
+        detector = Qwen3CoderDetector()
+        result = detector.detect_and_parse(self.qwen_text, self.oneof_tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), self.expected)
+
+    def test_qwen3_coder_streaming(self):
+        detector = Qwen3CoderDetector()
+        name, arguments = self._stream_arguments(
+            detector, self.qwen_text, self.oneof_tools
+        )
+        self.assertEqual(name, "acme")
+        self.assertEqual(json.loads(arguments), self.expected)
 
 
 if __name__ == "__main__":
