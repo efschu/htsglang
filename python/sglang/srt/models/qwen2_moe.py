@@ -46,6 +46,7 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.fwd_timeline import fwd_mark
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -927,6 +928,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output = self._forward_shared_experts(
                 hidden_states, apply_gate=not use_fused_gate
             )
+            # fnFL2 H20 (FWD-TIMING-PREFILL): no-op unless a timed forward is open.
+            fwd_mark("shared")
             final_hidden_states = self._forward_router_experts(hidden_states)
 
         if shared_output is not None:

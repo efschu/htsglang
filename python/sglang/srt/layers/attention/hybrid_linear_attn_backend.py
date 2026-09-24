@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     track_mamba_states_if_needed,
 )
 from sglang.srt.layers.prefill_timing import StageHead
+from sglang.srt.layers.fwd_timeline import fwd_mark
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -1077,6 +1078,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         **kwargs,
     ):
         is_full = self._is_full_attn(layer, kwargs.get("layer_id"))
+        # fnFL2 H20: the projections before the backend end here.
+        fwd_mark("dense")
         # Never inside a graph capture: the verify graph is an extend forward
         # through this very method, and the flush's synchronize (and the
         # events' elapsed_time) are not permitted while a stream captures
@@ -1096,6 +1099,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             if _tm:
                 _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
                 _attn_timing_note("full", _e0, _e1)
+            fwd_mark("attn")
             return out
         out = self.linear_attn_backend.forward_extend(
             q=q,
@@ -1112,6 +1116,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         if _tm:
             _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
             _attn_timing_note("linear", _e0, _e1)
+        fwd_mark("linear")
         return out
 
     def forward(

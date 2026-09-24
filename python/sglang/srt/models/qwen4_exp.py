@@ -16,6 +16,13 @@ import triton.language as tl
 from torch import nn
 
 from sglang.srt.layers.elementwise import fused_sigmoid_mul
+from sglang.srt.layers.fwd_timeline import (
+    begin_if_timed,
+    fwd_abort,
+    fwd_end,
+    fwd_mark,
+    fwd_timing_on,
+)
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -1608,6 +1615,7 @@ class Qwen4ExpLayerExtensionMixin:
             )
 
         if self.ple is not None:
+            fwd_mark("other")
             if ple_batch is None:
                 if not _get_ple_forward_mode(forward_batch).is_idle():
                     raise RuntimeError(
@@ -1621,8 +1629,10 @@ class Qwen4ExpLayerExtensionMixin:
                 hidden_states = hidden_states + self.ple(
                     ple_query, forward_batch, ple_batch
                 )
+            fwd_mark("ple")
 
         hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
+        fwd_mark("hc")
         return hidden_states, residual
 
     def _prepare_qwen4_exp_mlp(
@@ -1631,12 +1641,16 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
+        # fnFL2 H20: the segment ending here is the attention block's output
+        # side -- o_proj / GDN norm + out_proj, the output gate.
+        fwd_mark("dense")
         # FORM A (F12): see LinearBase.reduce -- unsharded dense means no
         # attn-TP partial to all-reduce.
         if not forward_batch.forward_mode.is_idle() and not form_a_dense_is_unsharded():
             hidden_states = attn_tp_all_reduce(hidden_states)
         hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
         hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
+        fwd_mark("hc")
         return hidden_states, residual
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
@@ -1692,6 +1706,8 @@ class Qwen4ExpLayerExtensionMixin:
 
         mlp_in = hidden_states if _nan_guard_on() else None
         hidden_states = self.mlp(hidden_states, forward_batch)
+        # fnFL2 H20: the routed experts' tail (top-k combine, shared add).
+        fwd_mark("moe_apply")
 
         # Task #49 (19.09.): SGLANG_NAN_GUARD=1 names the first layer whose
         # MoE output stops being finite (the '!!!' = token-0 answers at 259k);
@@ -1731,6 +1747,7 @@ class Qwen4ExpLayerExtensionMixin:
         forward_batch: ForwardBatch,
     ):
         hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
+        fwd_mark("hc")
         return hidden_states, None
 
 
@@ -1821,6 +1838,8 @@ class Qwen4ExpAttentionDecoderLayer(
             resolve_qsa_sparse_backend,
         )
 
+        # fnFL2 H20: q/k/v projection, q/k norm and rope end here.
+        fwd_mark("dense")
         backend = get_attn_backend()
         sparse_backend = resolve_qsa_sparse_backend(backend)
         should_reuse = getattr(sparse_backend, "should_reuse_mtp_sparse_indices", None)
@@ -1846,6 +1865,7 @@ class Qwen4ExpAttentionDecoderLayer(
             sparse_backend.capture_mtp_sparse_indices(
                 topk_indices, forward_batch, self.layer_id, metadata=indexer_metadata
             )
+        fwd_mark("qsa_idx")
         return topk_indices
 
     def self_attention(
@@ -2085,6 +2105,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 "pp_proxy_tensors: the hyper-connection stream of the previous "
                 "stage did not arrive."
             )
+        fwd_mark("embed")
 
         ple_batch = (
             _prepare_ple_batch(
@@ -2096,6 +2117,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if self._stage_has_ple
             else None
         )
+        fwd_mark("ple")
         residual = None
         aux_hidden_states = []
         # H13: SGLANG_DEBUG_HOST_ANON_PROBE -- one pass per model forward, a
@@ -2111,6 +2133,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 next_ple = getattr(self.layers[i + 1], "ple", None)
                 if next_ple is not None:
                     next_ple.start_prefetch(ple_batch, forward_batch)
+                    # the pread gather blocks the host here (PLE-GATHER-PREFILL)
+                    fwd_mark("ple")
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual = layer(
                     positions=positions,
@@ -2127,6 +2151,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
 
         if ple_batch is not None:
             _commit_ple_batch(ple_batch, forward_batch)
+            fwd_mark("ple")
         _hap.pass_end()
 
         if not self.pp_group.is_last_rank:
@@ -2426,10 +2451,25 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # `"pp_proxy_tensors" in inspect.signature(model.forward).parameters`;
         # the former `*args, **kwargs` wrapper hid the base signature and PP=3
         # died at init ("Pipeline Parallel is not compatible with this model").
-        output = super().forward(
-            input_ids, positions, forward_batch,
-            get_embedding=get_embedding, pp_proxy_tensors=pp_proxy_tensors,
+        # fnFL2 H20: FWD-TIMING-PREFILL spans exactly this call -- the body
+        # the rank's gpu-ms event pair wraps (eager_runner -> model.forward).
+        # Switch off: one env read, nothing else evaluated.
+        timed = fwd_timing_on() and begin_if_timed(
+            forward_mode=forward_batch.forward_mode,
+            tokens=int(forward_batch.input_ids.shape[0]),
+            layers=self.model.end_layer - self.model.start_layer,
         )
+        try:
+            output = super().forward(
+                input_ids, positions, forward_batch,
+                get_embedding=get_embedding, pp_proxy_tensors=pp_proxy_tensors,
+            )
+        except BaseException:
+            if timed:
+                fwd_abort()
+            raise
+        if timed:
+            fwd_end()
         hc_hidden_states = self.model.last_hc_hidden_states
         if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
             output.hidden_states = hc_hidden_states

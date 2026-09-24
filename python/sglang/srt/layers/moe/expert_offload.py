@@ -127,6 +127,7 @@ logger = logging.getLogger(__name__)
 
 from sglang.srt.debug_utils import host_anon_probe as _hap
 from sglang.srt.layers.moe import pinned_host_ledger
+from sglang.srt.layers.fwd_timeline import fwd_mark
 from sglang.srt.layers.prefill_timing import StageHead
 from sglang.srt.utils.break_cost_clock import break_cost_phase
 
@@ -4468,11 +4469,16 @@ class MoEExpertOffloadCache:
 
         topk_output = dispatch_output.topk_output
         topk_ids = topk_output.topk_ids
+        # fnFL2 H20 (FWD-TIMING-PREFILL): router GEMM + top-k end here; the
+        # segment up to the first wave is the rendezvous + host planning.
+        fwd_mark("gate")
 
         if self.planner.fully_resident:
             if lookahead is not None:
                 self._issue_lookahead(lookahead, None)
-            return apply_fn(dispatch_output)
+            out = apply_fn(dispatch_output)
+            fwd_mark("moe_apply")
+            return out
 
         prefetch = None
         if lookahead is None:
@@ -4555,7 +4561,9 @@ class MoEExpertOffloadCache:
             rows_t = torch.tensor(rows, device=topk_ids.device, dtype=torch.long)
             needed = sorted({e for r in rows for e in ids_list[r] if e >= 0})
             slot_of_needed, fetch_plan = self.planner.resolve(needed)
+            fwd_mark("moe_plan")
             self._fetch(fetch_plan)
+            fwd_mark("moe_fetch")
             _hap.checkpoint("moe.fetch", layer=_hap_layer, wave=f"{_w}/{len(waves)}",
                             fetched=len(fetch_plan))
             self._nan_trace_wave(_w, needed, slot_of_needed)
@@ -4589,6 +4597,7 @@ class MoEExpertOffloadCache:
             out_full.index_copy_(
                 0, rows_t, combine_out.hidden_states.to(out_full.dtype)
             )
+            fwd_mark("moe_apply")
             _hap.checkpoint("moe.apply", layer=_hap_layer, wave=f"{_w}/{len(waves)}",
                             rows=len(rows))
 
@@ -4698,11 +4707,13 @@ class MoEExpertOffloadCache:
         else:
             slot_of_needed, fetch_plan = self.planner.resolve(needed)
         _tm = _wave_timing_on() and topk_ids.is_cuda
+        fwd_mark("moe_plan")
         if _tm:
             import torch
             _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
         self._fetch(fetch_plan)
         self._nan_trace_wave(0, needed, slot_of_needed)
+        fwd_mark("moe_fetch")
         if _tm:
             _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
         if prefetch is not None:
@@ -4713,6 +4724,7 @@ class MoEExpertOffloadCache:
             topk_output=topk_output._replace(topk_ids=remapped)
         )
         out = apply_fn(sub)
+        fwd_mark("moe_apply")
         _hap.checkpoint("moe.single", layer=getattr(self.layer, "layer_id", None),
                         fetched=len(fetch_plan))
         if _tm:
@@ -4798,12 +4810,14 @@ class MoEExpertOffloadCache:
                 if idx_np.size == 0:
                     continue
                 slot_of_needed, fetch_plan = self.planner.resolve(needed)
+                fwd_mark("moe_plan")
                 if _tm:
                     _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
                 self._fetch(fetch_plan)
                 _hap.checkpoint("moe.fetch", layer=getattr(self.layer, "layer_id", None),
                                 wave=f"{w}/{len(spill_waves) + 1}", fetched=len(fetch_plan))
                 self._nan_trace_wave(w, needed, slot_of_needed)
+                fwd_mark("moe_fetch")
                 if _tm:
                     _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
                 lut = self._build_lut(slot_of_needed, topk_ids.dtype, device)
@@ -4862,6 +4876,7 @@ class MoEExpertOffloadCache:
                     partials.index_copy_(0, idx, part.to(partials.dtype))
                 _hap.checkpoint("moe.apply", layer=getattr(self.layer, "layer_id", None),
                                 wave=f"{w}/{len(spill_waves) + 1}", pairs=int(idx_np.size))
+                fwd_mark("moe_apply")
                 if _tm:
                     _e2 = torch.cuda.Event(enable_timing=True); _e2.record()
                     _tm_ev.append((_e0, _e1, _e2))

@@ -1733,6 +1733,13 @@ class Envs:
     # attention) and PLE-GATHER-PREFILL (the stage-0 CPU gather). One host sync
     # per forward per rank. The older call sites still read the raw key.
     SGLANG_MOE_OFFLOAD_TIMING = EnvBool(False)
+    # fnFL2 H20: FWD-TIMING-PREFILL -- one CUDA-event TIMELINE per plain
+    # prefill forward (layers/fwd_timeline.py): every component boundary
+    # (embed, ple, hc, dense, qsa_idx, attn, linear, shared, gate, moe_plan,
+    # moe_fetch, moe_apply, other) records one event, the segments telescope,
+    # so their sum is the forward's span and the line is comparable with the
+    # rank's gpu-ms. No host sync in the forward; read at the next forward.
+    SGLANG_WEG2_PREFILL_TIMING = EnvBool(False)
     # Weg2 launcher: group P's --chunked-prefill-size (tokens). The launcher
     # names the chunk ONCE (CHUNKED_PREFILL_TOKENS) because the PP-cut solver,
     # the depth funding and P's argv must all price the same chunk; an argv
