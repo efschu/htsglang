@@ -76,6 +76,8 @@ from sglang.srt.weg2 import (
     DEFAULT_PP_ORDERED_CUT,
 )
 from sglang.srt.weg2 import admin_key as admin_key_mod
+# WEG2-FORM (24.09.): the boot's form axes -- ONE resolver, ONE line, ONE env.
+from sglang.srt.weg2 import form as weg2_form
 # Task #58: the arming variable's name comes from the module that READS it, so
 # the publisher and the reader cannot drift into two spellings of one key.
 from sglang.srt.weg2.vision_stage_boot import VISION_ENV as VISION_STAGE_ENV
@@ -1373,6 +1375,41 @@ def p_prefill_transient_vector_mib(chunk_tokens: int) -> Tuple[float, ...]:
     return tuple(
         round(float(per_token) * float(chunk_tokens), 1)
         for per_token in P_PREFILL_TRANSIENT_MIB_PER_CHUNK_TOKEN
+    )
+
+
+#: WEG2-FORM (24.09.): the checkpoint(s) the #114 slopes above were MEASURED
+#: on -- fnFL2x113/x116/x118 all ran Qwen3.8-Flash-Next-INT4. A transient is a
+#: property of one model's prefill (hidden size, expert fan-out, attention
+#: form), so the slopes are published only for that checkpoint.
+P_PREFILL_TRANSIENT_CALIBRATION_MODELS: Tuple[str, ...] = (
+    "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",
+)
+
+
+def p_prefill_transient_for(boot_form) -> Tuple[bool, str]:
+    """``(publish?, provenance)`` of the #114 transient for this boot's form.
+
+    No form (a desk caller of ``build_env``) publishes exactly as before.
+    """
+    if boot_form is None:
+        return True, "no WEG2-FORM (desk caller): published as before"
+    if boot_form.model in P_PREFILL_TRANSIENT_CALIBRATION_MODELS:
+        return True, (
+            f"published: {P_PREFILL_TRANSIENT_MIB_PER_CHUNK_TOKEN} MiB/chunk-token "
+            f"x {P_CHUNKED_PREFILL_TOKENS} = "
+            f"{p_prefill_transient_vector_mib(P_CHUNKED_PREFILL_TOKENS)} MiB per P stage, "
+            f"MEASURED on {boot_form.model} (fnFL2x113/x116/x118)"
+        )
+    return False, (
+        f"NOT published: the slopes {P_PREFILL_TRANSIENT_MIB_PER_CHUNK_TOKEN} "
+        f"MiB/chunk-token were measured on "
+        f"{', '.join(P_PREFILL_TRANSIENT_CALIBRATION_MODELS)}; this boot runs "
+        f"{boot_form.model or '?'}, on which no prefill transient was measured. "
+        f"Its P ranks size the pool without that post, as every boot of this "
+        f"model before #114 did (27B line xsn411: PP0 277606 tokens; xsn417 with "
+        f"the foreign slopes: 246155 < 262144). An operator-exported "
+        f"{P_PREFILL_TRANSIENT_ENV} still wins."
     )
 
 
@@ -5074,6 +5111,8 @@ def _env_knobs(ns) -> Dict[str, object]:
         # function exists: three call sites build an environment and a value
         # spelled out at each of them is a value that drifts.
         "vision": str(getattr(ns, "weg2_vision", VISION_OFF)),
+        # WEG2-FORM: the one resolved form (launcher.main sets it on ns).
+        "boot_form": getattr(ns, "weg2_boot_form", None),
     }
 
 
@@ -5223,7 +5262,12 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               profile: str = PROFILE_QWEN27B,
               flip_weights: str = "family",
               group_env_extra: Optional[Dict[str, str]] = None,
-              xchg_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+              xchg_env: Optional[Dict[str, str]] = None,
+              # WEG2-FORM (24.09.): the ONE resolved form of this boot
+              # (``weg2_form.resolve_form``), gathered by ``_env_knobs``. None
+              # = a desk caller: every form-keyed branch below keeps its
+              # pre-form behaviour and SGLANG_WEG2_FORM is popped.
+              boot_form: Optional["weg2_form.Weg2Form"] = None) -> Dict[str, str]:
     env = dict(os.environ)
     # Task #58: THE ARMING SIGNAL for the transient vision stage, and the ONE
     # thing that turns `vision_stage_service`'s seam from a no-op into a stage.
@@ -5592,16 +5636,30 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # sized 262144 tokens into the transient's room and died in the first
     # chunk's forward. The operator's own value wins (setdefault); every other
     # group gets the family POPPED, so D never inherits P's post.
+    #
+    # WEG2-FORM (24.09.): only for the checkpoint the slopes were MEASURED on
+    # (p_prefill_transient_for). xsn417 published the Next-Flash slopes to a
+    # Qwen3.8-27B group P and its PP0 pool fell to 246155 tokens (< 262144;
+    # xsn411 on the 27B line: 277606) for a transient nobody measured there.
     if group == "P":
-        env.setdefault(
-            P_PREFILL_TRANSIENT_ENV,
-            ",".join(
-                "%.0f" % v for v in p_prefill_transient_vector_mib(P_CHUNKED_PREFILL_TOKENS)
-            ),
-        )
+        if p_prefill_transient_for(boot_form)[0]:
+            env.setdefault(
+                P_PREFILL_TRANSIENT_ENV,
+                ",".join(
+                    "%.0f" % v for v in p_prefill_transient_vector_mib(P_CHUNKED_PREFILL_TOKENS)
+                ),
+            )
     else:
         env.pop(P_PREFILL_TRANSIENT_ENV, None)
     env.update(spec_form_env(group))  # --spec-form: D's window pool under DFLASH
+    # WEG2-FORM: launcher OUTPUT, the R19 discipline of SGLANG_WEG2_GROUP --
+    # written from the resolved form, POPPED when this call names none, so a
+    # value inherited from a shell (or from an earlier main() in the same
+    # process) can never describe a boot it did not resolve.
+    if boot_form is not None:
+        env[weg2_form.FORM_ENV] = boot_form.env_value()
+    else:
+        env.pop(weg2_form.FORM_ENV, None)
     return env
 
 
@@ -6648,6 +6706,11 @@ def choose_host_ledger(
     # not know its own form gets the byte-identical pre-Stage-2 behaviour,
     # never a guess at what "this form" means.
     flip_ratchet_form_key: str = "",
+    # WEG2-FORM (24.09.): the calibration identity of the record read below
+    # (``weg2_form.same_model_sample``). None = every sample, as before --
+    # xsn417's RUN-PEAK ADVISORY then priced the Next-Flash boot fnFL2x142's
+    # run sample (-90.18 GiB, a death sample) for a Qwen3.8-27B arm.
+    record_accept: Optional[Callable[[dict], bool]] = None,
 
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
@@ -6713,7 +6776,7 @@ def choose_host_ledger(
     _record_path_resolved = (
         measured_record_path() if record_path is None else record_path
     )
-    record = host_ledger.read_measured_record(_record_path_resolved)
+    record = host_ledger.read_measured_record(_record_path_resolved, accept=record_accept)
     # #1378 Stage 2 (order): SELF-READ the prior boot's cushion from the same
     # sidecar `record` came from -- flags stay an OVERRIDE, never the only
     # path, so a boot that names nobody by hand still gets the gate. The
@@ -9254,8 +9317,13 @@ def read_pp_bubble(path: str) -> Optional[BubbleMeasurement]:
     )
 
 
-def newest_bubble_log(evidence_dir: str) -> Optional[str]:
+def newest_bubble_log(
+    evidence_dir: str, accept: Optional[Callable[[str], bool]] = None
+) -> Optional[str]:
     """Newest ``*.P.log`` in ``evidence_dir`` that actually CARRIES the line.
+
+    ``accept`` (WEG2-FORM, 24.09.): only logs of this boot's checkpoint
+    (``weg2_form.same_model_log``); None = every log, as before.
 
     Not simply the newest P log: a boot that died before its first bubble
     window, or one built before the instrument existed, has no measurement,
@@ -9270,6 +9338,8 @@ def newest_bubble_log(evidence_dir: str) -> Optional[str]:
         return None
     paths = [os.path.join(evidence_dir, n) for n in names]
     for path in sorted(paths, key=lambda p: os.path.getmtime(p), reverse=True):
+        if accept is not None and not accept(path):
+            continue
         if read_pp_bubble(path) is not None:
             return path
     return None
@@ -9365,8 +9435,12 @@ def read_mean_prefill_prefix(path: str) -> Optional[Tuple[float, int, str]]:
     return (sum(prefixes) / float(len(prefixes)), len(prefixes), rank)
 
 
-def newest_prefill_census_log(evidence_dir: str) -> Optional[str]:
+def newest_prefill_census_log(
+    evidence_dir: str, accept: Optional[Callable[[str], bool]] = None
+) -> Optional[str]:
     """Newest ``*.P.log`` that actually CARRIES a prefill census.
+
+    ``accept``: as :func:`newest_bubble_log` (WEG2-FORM calibration identity).
 
     Same rule and the same reason as :func:`newest_bubble_log`: a boot that
     died before its first prefill has no census, and reading its silence as
@@ -9382,9 +9456,21 @@ def newest_prefill_census_log(evidence_dir: str) -> Optional[str]:
         key=lambda p: os.path.getmtime(p),
         reverse=True,
     ):
+        if accept is not None and not accept(path):
+            continue
         if read_mean_prefill_prefix(path) is not None:
             return path
     return None
+
+
+def calib_log_accept_of(ns) -> Optional[Callable[[str], bool]]:
+    """WEG2-FORM: the P-log calibration filter of this boot -- logs of THIS
+    checkpoint only (xsn417, a Qwen3.8-27B boot, cut its P stages on the
+    Next-Flash boot fnFL2x142's prefill census). None when ``ns`` carries no
+    resolved form (a desk caller): every log, as before."""
+    if getattr(ns, "weg2_boot_form", None) is None:
+        return None
+    return weg2_form.same_model_log(getattr(ns, "model", ""))
 
 
 def pcie_lanes(cards: Sequence[Card]) -> List[Optional[int]]:
@@ -10400,6 +10486,17 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     )
 
     # ---- 2. die Fraction-Decke, nur bei VOLLSTAENDIGER Geometrie ----------
+    # WEG2-FORM: the fraction solve and the H14 wake credit it feeds are
+    # declared for arch=moe; any other form says so by name instead of
+    # listing the MoE vectors it was never meant to carry as "missing".
+    _form = getattr(ns, "weg2_boot_form", None)
+    _skips = [x for x in (
+        weg2_form.gate_skip_line("#145 D-RANK FRACTION-SOLVE", _form),
+        weg2_form.gate_skip_line("H14 WAKE-CREDIT", _form)) if x]
+    if _skips:
+        for _x in _skips:
+            log(f"{D_RANK_SOLVE_MARKER} {label}: {_x}")
+        return
     luecken: List[str] = []
     ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
     tp_ratio = _argv_vector(getattr(ns, "extra_d", ""), "--rank-tp-ratio")
@@ -10583,6 +10680,10 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
     """
     import json as _json
 
+    _skip = weg2_form.gate_skip_line("#107 WEG2-EXPERT-MAP", getattr(ns, "weg2_boot_form", None))
+    if _skip:
+        log(_skip)
+        return ""
     try:
         # LOKAL importieren wie jede andere Funktion hier: `_pp_cut` ist im
         # Modulraum NICHT gebunden (nur in solve_p_cut/solve_d_ranks). Ohne
@@ -10817,6 +10918,10 @@ def solve_p_cut(
     # name, because the 27B constants priced 8 layers on rank 0 and refused
     # every cut (W40, 19.09. dry run nfdry4).
     layer_mib_by_stage: Tuple[float, ...] = ()
+    _skip_140 = weg2_form.gate_skip_line(
+        "#140 PP-CUT FRACTION-SOLVE", getattr(ns, "weg2_boot_form", None))
+    if _skip_140 and terms.expert_layer_weight_bytes <= 0.0:
+        log(_skip_140)
     if terms.expert_layer_weight_bytes > 0.0:
         frac_text = str(getattr(ns, "pp_cut_expert_device_fraction", "") or "").strip()
         rows_text = str(getattr(ns, "pp_cut_expert_lru_rows", "") or "").strip()
@@ -11175,7 +11280,8 @@ def solve_p_cut(
     # attention/linear cost ratio moves by more than an order of magnitude
     # between 4,096 and 262,144 tokens of prefix, so "the optimal cut" is a
     # function of it and a table without it stated is a table about nothing.
-    design_src = ns.pp_cut_design_prefix_from or newest_prefill_census_log(EVIDENCE_DIR)
+    design_src = ns.pp_cut_design_prefix_from or newest_prefill_census_log(
+        EVIDENCE_DIR, accept=calib_log_accept_of(ns))
     census = read_mean_prefill_prefix(design_src) if design_src else None
     if ns.pp_cut_design_prefix_tokens is not None:
         design_prefix = int(ns.pp_cut_design_prefix_tokens)
@@ -11190,10 +11296,14 @@ def solve_p_cut(
     else:
         design_prefix = int(DESIGN_PREFIX_FALLBACK_TOKENS)
         design_prov = (
-            "FALLBACK: no P log in %s carries a prefill census, so the design "
+            "FALLBACK: no P log %sin %s carries a prefill census, so the design "
             "prefix is one chunk -- the shallowest depth this boot can run. "
             "This is an absence of the instrument, not a measured shallow rig."
-            % EVIDENCE_DIR
+            % (
+                ("of " + weg2_form.model_key(model) + " (WEG2-FORM calibration identity) ")
+                if calib_log_accept_of(ns) is not None else "",
+                EVIDENCE_DIR,
+            )
         )
 
     measured_attn = _pp_cut.attention_counts(families, incumbent)
@@ -11680,6 +11790,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--profile", choices=list(PROFILES), default=PROFILE_QWEN27B,
                     help="Task #47 Scheibe 6a: checkpoint profile of the two groups; "
                          "nextflash = P PP3 + D Form A, uneven-DCP env per group, no DCP flag half.")
+    # WEG2-FORM: --form-arch/--form-experts/--form-draft/--form-p-draft/--form-kv
+    weg2_form.add_form_arguments(ap)
     # #1360: THE NAMED DEVIATION, flag only. The user's standing rule of
     # 2026-09-12 makes the reap mark soft -- crossing it is allowed WITH a
     # reason and a runtime latch, never silently -- and until now the launcher
@@ -12996,6 +13108,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # shape anyway) must never make a fast pre-spawn refusal look post-spawn.
     _ACTIVE_BOOT_STATE = None
     ns = build_parser().parse_args(argv)
+    # WEG2-FORM: resolved ONCE, before apply_spec_form (--form-draft and
+    # --form-p-draft may drive --spec-form / --draft-kv-on-p /
+    # --dflash-produce-on-p), and PUBLISHED into this process's own environment
+    # so build_env (dict(os.environ)) and the front hand the SAME value to every
+    # rank -- the #1273 B4k pattern below. A teardown boots nothing: no form.
+    boot_form = None
+    if not ns.teardown:
+        boot_form = weg2_form.resolve_form(
+            ns, list(sys.argv[1:] if argv is None else argv),
+            parse_group_env=parse_group_env, shlex_split=shlex.split)
+        os.environ[weg2_form.FORM_ENV] = boot_form.env_value()
+    ns.weg2_boot_form = boot_form
+    # WEG2-FORM: THE CALIBRATION IDENTITY. Every measured source this boot
+    # prices from (the sidecar record, the P logs the cut and the depth read)
+    # is taken only from boots of THIS checkpoint. None (teardown) = no filter.
+    calib_sample_accept = (
+        weg2_form.same_model_sample(ns.model, EVIDENCE_DIR, boot_form)
+        if boot_form is not None else None)
+    calib_log_accept = calib_log_accept_of(ns)
     apply_spec_form(ns)
     # #1386: THE SWITCH IS RESOLVED HERE, ONCE, AS EARLY AS `ns` EXISTS --
     # earlier than `draft_kv_on_p` below, because the FIRST `common_flags`
@@ -13124,6 +13255,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # header records a launcher whose LOG= template hard-coded a stale SHA into
     # the name while the header read correctly.
     log(f"tree: {tree} @ {tip}")
+    if boot_form is not None:
+        log(boot_form.line())
+        log("#114 P-PREFILL-TRANSIENT (form " + boot_form.describe() + "): "
+            + p_prefill_transient_for(boot_form)[1])
     if dirty and not dry:
         raise Weg2LaunchRefused("tree is not clean -- boot from a COMMITTED tip only")
     py = f"{ns.venv}/bin/python"
@@ -13285,9 +13420,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # object exists.
     # #1444: the MEASURED residue of the previous boot on this form wins over
     # the xsn14 constant; the constant is the fallback with a printed reason.
-    _dc_rec_d = host_ledger.read_measured_record(measured_record_path()).get("D")
+    # WEG2-FORM (24.09.): only a record MEASURED ON THIS CHECKPOINT -- xsn417
+    # (Qwen3.8-27B) priced the Next-Flash boot fnFL2x142's D residue here.
+    _dc_rec_d = host_ledger.read_measured_record(
+        measured_record_path(), accept=calib_sample_accept).get("D")
     _dc_from_record, _dc_record_prov = dc_residue_from_record(
         _dc_rec_d, cards, ns.weg2_weight_source)
+    if _dc_rec_d is None and calib_sample_accept is not None:
+        _dc_record_prov = (
+            f"no group-D dormant-image record MEASURED ON {boot_form.model} under "
+            f"this form ({' '.join(a + '=' + getattr(boot_form, a) for a in weg2_form.RESIDUE_AXES)}) "
+            f"in the sidecar -- samples of another checkpoint or form are not this "
+            f"boot's residue (WEG2-FORM; xsn418 died W19 on fnFL2x144's) -> constant")
+    elif calib_sample_accept is not None:
+        _dc_record_prov += (
+            f" [WEG2-FORM calibration identity: {boot_form.model}, "
+            f"{' '.join(a + '=' + getattr(boot_form, a) for a in weg2_form.RESIDUE_AXES)}]")
     dc_expect_d = {
         c.uuid: (
             _dc_from_record[c.uuid] if _dc_from_record is not None
@@ -13854,7 +14002,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _geom_ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
     _geom_fracs = _argv_vector(getattr(ns, "extra_d", ""),
                                "--rank-moe-resident-fraction")
-    if _geom_ratios and _geom_fracs and len(_geom_ratios) == len(_geom_fracs):
+    _skip_106 = weg2_form.gate_skip_line("#106 WEG2-STORE-GEOMETRY", boot_form)
+    if _skip_106:
+        log(_skip_106)
+    elif _geom_ratios and _geom_fracs and len(_geom_ratios) == len(_geom_fracs):
         xchg_env["SGLANG_MOE_EXPERT_STORE_GEOMETRY"] = (
             f"{','.join(_geom_ratios)}|{','.join(_geom_fracs)}")
         log(f"WEG2-STORE-GEOMETRY shared={xchg_env['SGLANG_MOE_EXPERT_STORE_GEOMETRY']}"
@@ -13925,6 +14076,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # vram, kein zusaetzlicher systemram". Der Store haelt darum
     # `total - resident` Zeilen -- 324 bei 188 residenten, exakt die in
     # fnFL2w24/w30 gemessene Zahl -- und nicht die Vereinigung (420).
+    # WEG2-FORM: bands and map are declared for arch=moe (FORM_GATES).
+    _moe_skips = [x for x in (
+        weg2_form.gate_skip_line("#134 WEG2-EXPERT-BAND", boot_form),
+        weg2_form.gate_skip_line("#107 WEG2-EXPERT-MAP", boot_form)) if x]
+    for _x in _moe_skips:
+        log(_x)
     try:
         from sglang.srt.layers.moe import expert_map as _em
 
@@ -14040,7 +14197,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     f"Gruppen lesen diese Karte statt zu rechnen (#107); "
                     f"slots ist der TAUSCH (total-resident), nicht die "
                     f"Vereinigung")
-        else:
+        elif not _moe_skips:
             log(f"WEG2-EXPERT-MAP none ratios={_geom_ratios} "
                 f"fracs={_geom_fracs} pp_frac={_pp_frac} -- ohne alle drei "
                 f"Angaben wird KEINE Karte publiziert (eine halbe waere "
@@ -14101,6 +14258,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # plain equality filter) rather than raise, so the two producers are
             # kept to the one literal construction, not re-derived twice.
             flip_ratchet_form_key=f"wtags={len(weights_tags)}",
+            # WEG2-FORM: only samples measured on THIS checkpoint.
+            record_accept=calib_sample_accept,
             # #1362 [22-fix]: content digest, snapshot-independent. `None` (an
             # unreadable checkpoint) stays empty and the arm keeps the pre-#1362
             # behaviour rather than refusing on a digest it could not compute.
@@ -14359,7 +14518,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # the newest log in EVIDENCE_DIR that actually carries the instrument, else
     # no measurement at all and the depth is today's 0 -- printed, so the
     # absence is visible rather than inferred from a missing line.
-    bubble_src = ns.p_bubble_measured_from or newest_bubble_log(EVIDENCE_DIR)
+    bubble_src = ns.p_bubble_measured_from or newest_bubble_log(
+        EVIDENCE_DIR, accept=calib_log_accept)
     if ns.p_bubble_measured_from and read_pp_bubble(ns.p_bubble_measured_from) is None:
         raise Weg2LaunchRefused(
             f"W42 Weg2DepthUnfunded: --p-bubble-measured-from "
@@ -15498,7 +15658,7 @@ class Weg2CarrierFloorUnreachable(Weg2LaunchRefused):
 #: a future exchange refusal inherits the handler instead of needing a line.
 REFUSALS = (Weg2LaunchRefused, ring_table.Weg2RingRefused,
             host_ledger.Weg2HostLedgerRefused, host_ledger.Weg2HostRunPeakRefused,
-            xchg_residency.Weg2XchgRefused)
+            xchg_residency.Weg2XchgRefused, weg2_form.Weg2FormContradiction)
 
 
 def cli(argv: Optional[Sequence[str]] = None) -> int:
