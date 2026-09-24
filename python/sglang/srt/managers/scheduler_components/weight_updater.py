@@ -72,6 +72,7 @@ from sglang.srt.managers.weg2_sleep_drain import (
 )
 from sglang.srt.mem_cache.hicache_collective import collective_rank_desc
 from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreIndexBlind
+from sglang.srt.model_executor.vram_peak_window import flip_leg as _vram_peak_leg  # H55
 from sglang.srt.weg2 import seam_digest
 
 #: C21 / spec R13.  The group fence's budget, named so the ONE place that owns
@@ -8080,6 +8081,7 @@ class SchedulerWeightUpdaterManager:
         return out
 
     @_weg2_group_stop_on_leg_failure
+    @_vram_peak_leg("release")
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         # #1285 FIRST STATEMENT, before the idle assert and before any mutation:
         # a leg that is already applied returns its recorded answer.  It has to
@@ -8647,6 +8649,7 @@ class SchedulerWeightUpdaterManager:
         ))
 
     @_weg2_group_stop_on_leg_failure
+    @_vram_peak_leg("resume")
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
         # #1285: see the release leg.  This one is the sharper case -- the wake's
         # very first mutation below drops each tag from the offload set, which

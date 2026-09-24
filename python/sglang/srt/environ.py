@@ -486,6 +486,15 @@ class Envs:
     # Same bytes from the same pinned store into the same buffers: no new host
     # RAM, no VRAM reserve. 0 = the serial rearm of the 2026-09-24 form.
     SGLANG_WEG2_REARM_PREFETCH = EnvBool(True)
+    # VRAM_PEAK (H55): one WEG2-VRAM-PEAK line per P chunk, per D round window
+    # (VRAM_PEAK_ROUNDS decode/verify forwards or 5 s) and per flip leg: the
+    # allocator peak of that window (memory_stats + reset_peak_memory_stats,
+    # no device sync) and the card's free bytes at both ends, with ms wall
+    # stamps for the NVML probe weg2/tools/vram_hires.py. The since-pools peak
+    # of [vram-peak]/WEG2-GRAPH-POOL is kept through a folded shadow. 0 = no
+    # line and no re-base, the 2026-09-24 form.
+    SGLANG_WEG2_VRAM_PEAK = EnvBool(True)
+    SGLANG_WEG2_VRAM_PEAK_ROUNDS = EnvInt(64)
     # TAIL_HANDOFF (H18, E1 of H17, fnFL2x132): P ends the prompt's last-but-one
     # chunk at c = floor_r(N-1) (r = QSA compress ratio) instead of the page,
     # and hands the GDN state after c plus the KV/QSA rows of the partial page

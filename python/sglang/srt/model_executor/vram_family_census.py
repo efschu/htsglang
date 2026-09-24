@@ -223,6 +223,11 @@ def log_vram_family_census(
         # weights -- [vram-peak] below reads it
         try:
             torch.cuda.reset_peak_memory_stats()
+            # H55: WEG2-VRAM-PEAK re-bases the counter per window and folds
+            # it into a shadow; "since pools" starts over for both here
+            from sglang.srt.model_executor import vram_peak_window
+
+            vram_peak_window.reset_since_pools()
         except Exception:  # noqa: BLE001
             pass
         # #58: and THIS is the moment the idle reading is honest -- pools
@@ -343,7 +348,8 @@ def log_graph_pool(runner, phase: str, cuda=torch.cuda) -> Optional[str]:
         free, total = cuda.mem_get_info()
         reserved = int(cuda.memory_reserved())
         allocated = int(cuda.memory_allocated())
-        peak = int(cuda.max_memory_allocated())
+        # H55: since the pools, across the WEG2-VRAM-PEAK window re-bases
+        peak = int(_cum_peak_allocated(cuda))
     except Exception as exc:  # noqa: BLE001
         logger.debug("%s skipped: %s", gpl.MARKER, exc)
         return None
@@ -412,7 +418,30 @@ def _peak_state(runner):
     return st
 
 
+def _cum_peak_allocated(cuda) -> int:
+    """H55: ``max_memory_allocated`` since the pools, including the peaks that
+    WEG2-VRAM-PEAK folded before re-basing the counter per window."""
+    from sglang.srt.model_executor import vram_peak_window
+
+    return vram_peak_window.cum_peak_allocated(cuda)
+
+
 def maybe_log_vram_peak(runner, forward_batch, cuda=torch.cuda) -> Optional[str]:
+    """Forward-end hook: the ``[vram-peak]``/``WEG2-GRAPH-POOL`` records (which
+    read the cumulative peak), THEN the H55 ``WEG2-VRAM-PEAK`` window, which
+    re-bases the counter -- in this order, so the cumulative readers see this
+    forward's peak before the re-base (the shadow keeps it anyway)."""
+    kind = _maybe_log_vram_peak_since_pools(runner, forward_batch, cuda=cuda)
+    try:
+        from sglang.srt.model_executor import vram_peak_window
+
+        vram_peak_window.on_forward_end(runner, forward_batch, cuda)
+    except Exception as exc:  # noqa: BLE001 -- an instrument never kills a forward
+        logger.debug("WEG2-VRAM-PEAK skipped: %s", exc)
+    return kind
+
+
+def _maybe_log_vram_peak_since_pools(runner, forward_batch, cuda=torch.cuda) -> Optional[str]:
     """Once after the first big extend (>= PEAK_EXTEND_MIN_TOKENS rows), once
     at the PEAK_DECODE_AT-th decode forward, and AGAIN on every new allocator
     high-water: allocator peak since the pools, allocated, reserved and the
@@ -457,7 +486,7 @@ def maybe_log_vram_peak(runner, forward_batch, cuda=torch.cuda) -> Optional[str]
             st["decode_done"] = True
             kind = "decode"
     try:
-        peak = cuda.max_memory_allocated() / 2**30
+        peak = _cum_peak_allocated(cuda) / 2**30
     except Exception as exc:  # noqa: BLE001
         logger.debug("[vram-peak] skipped: %s", exc)
         return None
