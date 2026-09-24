@@ -483,6 +483,12 @@ def _hicache_round_timing_every() -> int:
 # #1233 zero-remainder: END-OF-PREFILL ANCHOR instrument, armed by the Weg-2
 # launcher on group P together with the schedule_policy split (same env).
 _WEG2_END_ANCHOR = os.environ.get("SGLANG_WEG2_END_ANCHOR", "0") == "1"
+# P-TRIM-END-ANCHOR (weg2/p_trim_end_anchor.py): the held-back token of a
+# request P's intake cut to N-1, and the prompt ids as the client sent them.
+from sglang.srt.weg2.p_trim_end_anchor import TRIM_ATTR as _P_TRIM_ATTR  # noqa: E402
+from sglang.srt.weg2.p_trim_end_anchor import (  # noqa: E402
+    full_prompt_ids as _p_trim_full_prompt_ids,
+)
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -3868,7 +3874,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 chain.append(list(hv))
                 node = node.parent
             keys = [k for part in reversed(chain) for k in part]
-            ids = list(getattr(req, "origin_input_ids", None) or [])
+            # D's tokenizer takes these ids AS ITS PROMPT (#1442) and the
+            # scheduler derives the key offset from their count: a request P
+            # cut to N-1 (P-TRIM-END-ANCHOR) still hands over all N.
+            ids = _p_trim_full_prompt_ids(req)
             if not keys or not ids:
                 return
             if _ho.write(rid, ids, keys):
@@ -3891,12 +3900,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         n = getattr(UnifiedRadixCache, "_weg2_end_anchor_n", 0) + 1
         UnifiedRadixCache._weg2_end_anchor_n = n
-        tokens = len(token_ids)
+        # P-TRIM-END-ANCHOR (weg2/p_trim_end_anchor.py): a request P cut to
+        # N-1 at its intake committed exactly the tokens a reader claims, so
+        # its FINAL node is the N-1 anchor -- probed (and marked) whole. `tokens`
+        # stays the prompt the client sent (N), so `target` means N-1 on both
+        # forms.
+        _trim_tail = getattr(req, _P_TRIM_ATTR, None)
+        _trim = len(_trim_tail) if _trim_tail is not None else 0
+        tokens = len(token_ids) + _trim
         try:
             # RadixKey asserts the array('q') type of `token_ids` (boot weg2zr1:
             # a list raised at the probe); slicing keeps the type.
             probe = RadixKey(
-                token_ids[:-1], req.extra_key, is_bigram=self.is_eagle
+                token_ids if _trim else token_ids[:-1], req.extra_key, is_bigram=self.is_eagle
             ).page_aligned(self.page_size)
             target_units = len(probe)
             mr = self.match_prefix(MatchPrefixParams(key=probe))
@@ -3926,7 +3942,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not ok:
             UnifiedRadixCache._weg2_end_anchor_short = getattr(UnifiedRadixCache, "_weg2_end_anchor_short", 0) + 1
         logger.warning(
-            "WEG2 END-ANCHOR n=%d rid=%s tokens=%d anchor=%d target=%d units=%d/%d ok=%s short=%d",
+            "WEG2 END-ANCHOR n=%d rid=%s tokens=%d anchor=%d target=%d units=%d/%d ok=%s short=%d"
+            + (" trim=%d" % _trim if _trim else ""),
             n, str(getattr(req, "rid", "?"))[:12], tokens, anchor, tokens - 1,
             usable_units, target_units, ok, getattr(UnifiedRadixCache, "_weg2_end_anchor_short", 0),
         )
