@@ -899,8 +899,87 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def reset(self) -> None:
         self._reset_full()
 
+    def _release_host_values_before_reset(self) -> int:
+        """Give back the arena references the tree still holds, before
+        `_reset_full` drops the tree.
+
+        THE LEAK THIS CLOSES (weg2xsn420; the same on xsn408-411): an arena
+        host pool keeps ONE reader reference per row a node holds
+        (`complete_write` +1 on a publish, a join or read +1) and releases it
+        in `free` (-1). The reset dropped the tree and called
+        `mem_pool_host.clear()`, which resets only the staging bookkeeping:
+        every reference stayed, no slot of the phase ever became an eviction
+        candidate, and the 112-slot mamba arena was full after one 4x100k
+        needle phase -- every later publish refused (`mamba_claim`,
+        RETAIN-PUBLISH stopped=mamba_full, ARENA-CLAIM statuses=[4] with the
+        evict round finding nothing), D's store read answered zero, and the
+        request went W50 -> requeue -> second P prefill -> W53 -> the front's
+        413. Released here, the pages stay COMPLETE in the arena (every rank
+        still finds them by stem) until a claim needs their slot.
+
+        Host-side bookkeeping only, and only at the reset's idle points (the
+        flush of an idle group before it sleeps, the VRAM dial's shrink
+        commit): no device sync, no copy, no wait -- a node an in-flight host
+        operation still uses (a pending write-through, a host lock) is
+        SKIPPED, never waited for. One numpy pass per pool
+        (`release_tree_rows`), not a `free()` per node. Arena pools are the
+        only host pools holding such references; any other is fully reset by
+        `clear()`, so the default path is unchanged. Returns the references
+        dropped."""
+        cc = getattr(self, "cache_controller", None)
+        root = getattr(self, "root_node", None)
+        if cc is None or root is None:
+            return 0
+        if not getattr(getattr(cc, "mem_pool_host", None), "arena_read", False):
+            return 0
+        per_pool: dict = {}
+        skipped = 0
+        stack = list(root.children.values())
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children.values())
+            if getattr(node, "write_through_pending_id", None) is not None:
+                skipped += 1
+                continue
+            for comp in self._components_tuple:
+                cd = node.component_data[comp.component_type]
+                if cd.host_value is None:
+                    continue
+                if cd.host_lock_ref > 0:
+                    skipped += 1
+                    continue
+                pool = (getattr(comp, "_full_kv_pool_host", None)
+                        or getattr(comp, "_mamba_pool_host", None)
+                        or getattr(comp, "_swa_kv_pool_host", None))
+                if pool is None or not hasattr(pool, "release_tree_rows"):
+                    continue
+                per_pool.setdefault(id(pool), (pool, []))[1].append(cd.host_value)
+        released = failed = 0
+        first_error = None
+        for pool, values in per_pool.values():
+            # Best effort per pool: the reset that follows must happen
+            # whatever one pool says (before this release it leaked them all).
+            try:
+                released += int(pool.release_tree_rows(torch.cat([v.reshape(-1).cpu() for v in values])))
+            except Exception as exc:  # noqa: BLE001
+                failed += 1
+                if first_error is None:
+                    first_error = f"{type(exc).__name__}: {exc}"
+        if released or skipped or failed:
+            logger.info(
+                "#1427 ARENA-REF RESET-RELEASE released=%d pools=%d skipped_in_use=%d "
+                "failed=%d%s (the reset gives the tree's arena references back "
+                "before the host pools are cleared -- weg2xsn420 mamba_full)",
+                released, len(per_pool), skipped, failed,
+                f" first_error={first_error}" if first_error else "",
+            )
+        return released
+
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        # The old tree's host rows go back through their pools FIRST -- see
+        # `_release_host_values_before_reset` (weg2xsn420, arena references).
+        self._release_host_values_before_reset()
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.priority = -sys.maxsize
         self.root_node.key = RadixKey(array("q"), None)
