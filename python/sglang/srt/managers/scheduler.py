@@ -218,6 +218,7 @@ from sglang.srt.managers.phase_purity import (
 from sglang.srt.managers import prefetch_ballot
 from sglang.srt.managers import tp_head_congruence
 from sglang.srt.managers import weg2_store_told
+from sglang.srt.managers import weg2_d_hostgap as _d_hostgap
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers.pp_admission_congruence import (
     PP_ADMISSION_VACUOUS_ROLLUP_EVERY,
@@ -12812,7 +12813,12 @@ class Scheduler(
                 self._add_request_to_queue(req)
 
         if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
-            self.tree_cache.check_hicache_events()
+            _dgap = _d_hostgap.meter()  # #DGAP (SGLANG_WEG2_D_HOSTGAP)
+            if _dgap is None:
+                self.tree_cache.check_hicache_events()
+            else:
+                with _dgap.span("hicache"):
+                    self.tree_cache.check_hicache_events()
             # #811: release anchor pins whose write-through ack just drained,
             # BEFORE this tick's admissions allocate -- so an acked-but-still
             # -pinned checkpoint can never crowd out an admission in the same
@@ -15809,7 +15815,16 @@ class Scheduler(
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
-                self.future_map.resolve_seq_lens_cpu(batch)
+                # SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU (weg2_d_hostgap): the host
+                # half of the read is handed to the worker, which completes it
+                # at its first use of the exact lengths; unset = the old read.
+                _pending_lens = None
+                if _d_hostgap.defer_eligible(self, batch):
+                    _pending_lens = self.future_map.resolve_seq_lens_cpu(
+                        batch, defer=True
+                    )
+                else:
+                    self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 
@@ -15836,6 +15851,10 @@ class Scheduler(
                             if not batch.spec_algorithm.is_none()
                             else {}
                         )
+                        if _pending_lens is not None:
+                            fwd_kwargs["seq_lens_cpu_ready"] = partial(
+                                _pending_lens.complete, batch
+                            )
 
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
@@ -15887,6 +15906,16 @@ class Scheduler(
                                     )
                         else:
                             batch_result.future_indices = future_indices
+
+                if _pending_lens is not None:
+                    # The isolation restore put back the pre-forward snapshot,
+                    # taken while the mirror was still None: re-apply it (and
+                    # complete it, should the worker not have), so the batch
+                    # leaves run_batch with the mirror the old read left.
+                    _pending_lens.complete(batch)
+                _dgap = _d_hostgap.meter()
+                if _dgap is not None and batch.forward_mode.is_decode():
+                    _dgap.end_round(deferred=_pending_lens is not None)
 
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None

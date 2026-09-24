@@ -24,6 +24,7 @@ from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.weg2_d_hostgap import meter as _d_hostgap_meter
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -362,6 +363,11 @@ class DFlashWorkerV2(BaseSpecWorker):
     Drives both overlap and non-overlap scheduling, same as EAGLE: the
     scheduler runs it synchronously when overlap is disabled.
     """
+
+    # SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU (managers/weg2_d_hostgap.py): a decode
+    # round accepts a `seq_lens_cpu_ready` callback and calls it before its
+    # first host read of the exact lengths, so the scheduler may defer that read.
+    supports_deferred_seq_lens_cpu = True
 
     def __init__(
         self,
@@ -2824,11 +2830,24 @@ class DFlashWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         on_publish=None,
+        seq_lens_cpu_ready=None,
     ) -> GenerationBatchResult:
         # upstream #33459: return_logprob is served (verify-time
         # compute_spec_v2_logprobs, see _dflash_verify_logprobs); the refusal
         # that stood here is gone. The target prefill computes its own.
         self._validate_phase1_sampling_support(batch)
+        # seq_lens_cpu_ready (SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU): the scheduler
+        # deferred the host half of this batch's length read; batch.seq_lens_cpu
+        # / seq_lens_sum are None until it is called. Idempotent. The decode
+        # round calls it right before the draft prep (the first exact read);
+        # the target-prefill and idle paths below call it before anything else
+        # (the scheduler defers only decode batches -- this is the belt).
+        if seq_lens_cpu_ready is not None and (
+            batch.forward_mode.is_extend()
+            or batch.is_extend_in_batch
+            or batch.forward_mode.is_idle()
+        ):
+            seq_lens_cpu_ready()
 
         _mapper = self._solo_pool_mapper
         if _mapper is not None and _mapper.sync_free:
@@ -3040,6 +3059,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._audit_mark("embed")  # DFLASH AUDIT (env-gated)
             input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
+            if seq_lens_cpu_ready is not None:
+                # SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU: the block prep, the DCP
+                # prebuild (sized by the reservation bound, see
+                # _dcp_verify_prebuild) and the embedding with its all_reduce
+                # are queued; the draft prep below is the first exact read.
+                seq_lens_cpu_ready()
             seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
             # SGLANG_DFLASH_PLAN_SYNC_FREE: True only when seq_lens_cpu below
             # is the device length itself (published mirror, page_size 1,
@@ -3222,6 +3247,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     draft_out = self.draft_model_runner.forward(forward_batch)
             finally:
                 self._draft_block_spec_info.host_lens_exact = False
+            _dgap = _d_hostgap_meter()  # #DGAP (SGLANG_WEG2_D_HOSTGAP)
+            if _dgap is not None:
+                _dgap.mark_draft_launched()
             self._audit_mark("draft_fwd")  # DFLASH AUDIT (env-gated)
             draft_logits_output = draft_out.logits_output
 
@@ -3300,6 +3328,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._audit_mark("blk_bcast")  # DFLASH AUDIT (env-gated)
 
         # --- 2) Target verify.
+        if seq_lens_cpu_ready is not None:
+            # Idempotent belt (the solo-shadow branch above has no draft prep):
+            # the verify's host bound below reads the exact mirror.
+            seq_lens_cpu_ready()
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
 
