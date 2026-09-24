@@ -226,17 +226,9 @@ class DraftKVSlotMapper:
         # the masked scatters (the stack itself never holds more than S-1
         # entries, so indices 0..S-2 are the only ones ever popped).
         self._dump_pos = S - 1
-        self._free_init = torch.cat(
-            [
-                torch.arange(1, S, dtype=torch.int32, device=dev),
-                torch.zeros(1, dtype=torch.int32, device=dev),
-            ]
-        )
-        self._free = self._free_init.clone()
+        self._free = torch.zeros(S, dtype=torch.int32, device=dev)
         # [0] = free count (authoritative in sync-free mode), [1] = holes read.
         self._counters = torch.zeros(2, dtype=torch.int64, device=dev)
-        self._counters[0].fill_(S - 1)
-        self._host_free_lb = S - 1
         self._alloc_ub_total = 0
         self._holes_dev_seen = 0
         self._owner_stream = None
@@ -244,6 +236,7 @@ class DraftKVSlotMapper:
         self._snap_alloc_ub = 0
         self._snap_host = None
         self._snap_event = None
+        self._fill_sync_free_device_state(fold_holes=False)
         if dev.type == "cuda":
             self._stream_mode = "cuda"
             try:
@@ -264,13 +257,31 @@ class DraftKVSlotMapper:
             # CPU: every op is synchronous, so a read IS the snapshot.
             self._stream_mode = "immediate"
 
-    def _reset_sync_free_state(self) -> None:
-        self._free.copy_(self._free_init)
-        self._counters[0].fill_(self.num_draft_slots - 1)
-        self._host_free_lb = self.num_draft_slots - 1
-        # An in-flight snapshot predates the reset; the next one is queued on
-        # the same (owner) stream behind it, so dropping it is safe.
+    def _fill_sync_free_device_state(self, fold_holes: bool) -> None:
+        """(Re)build the device stack and counters from HOST constants only.
+
+        Never from device bytes the mapper held before: a phase release of an
+        un-backed memory-saver region can hand them back arbitrary, and the
+        legacy ``_reset`` never read them either (it allocates a fresh
+        arange). The device hole counter restarts at zero; on a CPU mapper its
+        unharvested part is folded in first (a free read), on CUDA at most one
+        snapshot's worth of hole COUNTS is dropped -- observability only."""
+        S = self.num_draft_slots
+        dev = self._free.device
+        if fold_holes and dev.type == "cpu":
+            self._note_holes(int(self._counters[1]))
+        self._free[: S - 1].copy_(torch.arange(1, S, dtype=torch.int32, device=dev))
+        self._free[S - 1 :].zero_()
+        self._counters[0].fill_(S - 1)
+        self._counters[1].zero_()
+        self._holes_dev_seen = 0
+        self._host_free_lb = S - 1
+        # A snapshot in flight predates this; the next one is queued on the
+        # same (owner) stream behind it, so dropping its bookkeeping is safe.
         self._snap_inflight = False
+
+    def _reset_sync_free_state(self) -> None:
+        self._fill_sync_free_device_state(fold_holes=True)
 
     def bind_owner_stream(self) -> None:
         """Make the CURRENT stream the one that takes the sync-free path.

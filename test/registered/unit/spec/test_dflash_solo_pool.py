@@ -399,6 +399,25 @@ class TestSyncFreeMapperEquivalence(CustomTestCase):
         for seed in range(6):
             self._run(seed, num_global=200, num_draft=40, steps=250, starve=True)
 
+    def test_clear_rebuilds_from_host_constants(self):
+        # A phase release can hand the mapper's device bytes back arbitrary;
+        # the reset must rebuild from host constants, as the legacy one does.
+        fresh = DraftKVSlotMapper(500, 40, 64, device="cpu")
+        m = DraftKVSlotMapper(500, 40, 64, device="cpu", sync_free=True)
+        m.translate_write(_t([3, 4, 5]))
+        m._free.fill_(-123456)
+        m._counters.fill_(-7)
+        m.map.fill_(999)
+        m._slot_global.fill_(-9)
+        m._slot_epoch.fill_(77)
+        m.on_global_clear()
+        fresh.on_global_clear()
+        a = fresh.translate_write(_t([10, 11, 12]))
+        b = m.translate_write(_t([10, 11, 12]))
+        self.assertEqual(a.tolist(), b.tolist())
+        self.assertEqual(_state(fresh, with_holes=False), _state(m, with_holes=False))
+        self.assertEqual(int(m._counters[1]), 0)
+
     def test_holes_are_counted_like_legacy(self):
         legacy = DraftKVSlotMapper(1000, 16, 64, device="cpu")
         fast = DraftKVSlotMapper(1000, 16, 64, device="cpu", sync_free=True)
