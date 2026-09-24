@@ -28,6 +28,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.weg2.p_trim_end_anchor import full_prompt_len as _p_trim_full_prompt_len
 
 logger = logging.getLogger(__name__)
 
@@ -391,7 +392,10 @@ class _GenerationStreamAccumulator:
             req.sampling_params.spaces_between_special_tokens
         )
         self.no_stop_trim.append(req.sampling_params.no_stop_trim)
-        self.prompt_tokens.append(len(req.origin_input_ids))
+        # The prompt the client sent: a leg-1 request group P cut to N-1
+        # (weg2/p_trim_end_anchor.py) still reports N -- the front prices
+        # spans, D's seat and its exact tokenisation off this number.
+        self.prompt_tokens.append(_p_trim_full_prompt_len(req))
         self.reasoning_tokens.append(req.reasoning_tokens)
         self.completion_tokens.append(len(output_ids_))
         self.cached_tokens.append(req.cached_tokens)

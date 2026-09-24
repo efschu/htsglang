@@ -8893,6 +8893,15 @@ def read_pp_bubble(path: str) -> Optional[BubbleMeasurement]:
     )
 
 
+def p_trim_end_anchor_env(on: bool) -> Dict[str, str]:
+    """Group P's environment for ``--p-trim-end-anchor``: {} when off (the
+    byte-identity guarantee). The variable NAME lives in
+    weg2/p_trim_end_anchor.py, the one module the ranks read it from."""
+    from sglang.srt.weg2 import p_trim_end_anchor as _pt
+
+    return {_pt.TRIM_ENV: "1"} if on else {}
+
+
 def p_host_overlap_env(overlap: bool, hostgap: bool) -> Dict[str, str]:
     """Group P's extra environment for ``--p-host-overlap`` / ``--p-hostgap``.
 
@@ -11198,6 +11207,17 @@ def build_parser() -> argparse.ArgumentParser:
              "... capture_mib='. Changes P's form key (chunk + graph config "
              "are device allocations). User goal: 512.")
     ap.add_argument(
+        "--p-trim-end-anchor", action="store_true",
+        help="Group P (27B line): take every front leg-1 prompt of N tokens as "
+             "N-1, at the token level in P's intake. P's last regular chunk then "
+             "ends at N-1 and its finish insert is the N-1 anchor D resumes from "
+             "(D claims at most N-1 tokens and computes the last one itself), so "
+             "the 1-token END-OF-PREFILL ANCHOR forward (xsn430/433: 35-40 ms per "
+             "stage) never runs. prompt_tokens and the #1442 hand-off still carry "
+             "all N; N<2, read outputs, sessions, input embeds and multimodal "
+             "prompts keep today's split. Adds SGLANG_WEG2_P_TRIM_END_ANCHOR=1 to "
+             "group P only; default off = argv and env byte-identical.")
+    ap.add_argument(
         "--p-prefill-graph-tiny", default="", metavar="TOKENS[,TOKENS]",
         help="Only with --p-prefill-graph (27B line). Empty (the default) = off: "
              "one captured bucket, argv byte-identical. TOKENS = extra, smaller "
@@ -13353,6 +13373,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
+    # P-TRIM-END-ANCHOR (weg2/p_trim_end_anchor.py): {} when off, so the
+    # default env stays byte-identical; on, P takes a leg-1 prompt as N-1 and
+    # the 1-token END-ANCHOR forward above never runs for it.
+    _p_trim_env = p_trim_end_anchor_env(bool(getattr(ns, "p_trim_end_anchor", False)))
+    env_p.update(_p_trim_env)
+    if _p_trim_env:
+        log("WEG2 P-TRIM-END-ANCHOR: on (--p-trim-end-anchor) -- group P takes every "
+            "front leg-1 prompt of N tokens as N-1 (token level, at its intake): the "
+            "last regular chunk ends at N-1, the finish insert is the N-1 anchor D "
+            "claims, no 1-token END-ANCHOR forward; prompt_tokens and the #1442 "
+            "hand-off still carry N; N<2, read outputs, sessions, embeds and "
+            "multimodal prompts stay on the split path (rank line 'WEG2 "
+            "P-TRIM-END-ANCHOR kept(<reason>)')")
     # #1465: group P's write-through copy kernels at high stream priority, so
     # the backlog measured on weg2xsn219 (P running-req 2: 72 -> 103 un-backed
     # nodes, 2.0-2.8 s flush drain at the flip) does not build behind a

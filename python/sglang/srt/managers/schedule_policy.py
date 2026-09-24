@@ -180,6 +180,9 @@ from collections import Counter, defaultdict
 # chunk-publish path (`UnifiedRadixCache._inc_hit_count`, #1028) writes the
 # N-1 anchor with no second bookkeeping. Set by the Weg-2 launcher on group P.
 _WEG2_END_ANCHOR = os.environ.get("SGLANG_WEG2_END_ANCHOR", "0") == "1"
+# P-TRIM-END-ANCHOR (weg2/p_trim_end_anchor.py): a request P's intake cut to
+# N-1 carries its held-back token under this attribute; the split leaves it be.
+from sglang.srt.weg2.p_trim_end_anchor import TRIM_ATTR as _P_TRIM_ATTR
 from contextlib import contextmanager
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple, Union
@@ -1525,6 +1528,11 @@ class PrefillAdder:
         schedule the held token), or when the extend does not reach the end.
         """
         if not _WEG2_END_ANCHOR or self.rem_chunk_tokens is None or length < 2:
+            return length, False
+        if getattr(req, _P_TRIM_ATTR, None) is not None:
+            # P-TRIM-END-ANCHOR: this request is the first N-1 tokens already;
+            # its natural end IS the N-1 anchor (the finish insert writes it),
+            # and holding one more token back would anchor at N-2.
             return length, False
         if start + length != len(req.full_untruncated_fill_ids):
             return length, False

@@ -219,6 +219,7 @@ from sglang.srt.managers import prefetch_ballot
 from sglang.srt.managers import tp_head_congruence
 from sglang.srt.managers import weg2_store_told
 from sglang.srt.managers import weg2_d_hostgap as _d_hostgap
+from sglang.srt.weg2 import p_trim_end_anchor as _weg2_trim
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers.pp_admission_congruence import (
     PP_ADMISSION_VACUOUS_ROLLUP_EVERY,
@@ -5451,10 +5452,19 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            # P-TRIM-END-ANCHOR (weg2/p_trim_end_anchor.py, group P, default
+            # off): a front leg-1 prompt of N tokens enters as N-1 -- its last
+            # regular chunk ends at N-1 and its finish anchor IS the N-1 anchor
+            # D claims, so the 1-token END-ANCHOR forward never runs. Unarmed:
+            # the Req gets recv_req.input_ids exactly as before.
+            _weg2_ids, _weg2_tail = recv_req.input_ids, None
+            if _weg2_trim.trim_armed():
+                _weg2_ids, _weg2_tail = _weg2_trim.split_ids(recv_req)
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
-                recv_req.input_ids,
+                _weg2_ids,
                 recv_req.sampling_params,
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
@@ -5492,6 +5502,8 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
+            if _weg2_tail is not None:
+                setattr(req, _weg2_trim.TRIM_ATTR, _weg2_tail)
             req.tokenizer = self.tokenizer
             # Fast lane (Variant C Stage 0): tag the request's lane so the
             # anti-starvation reserved-heavy-slots floor can distinguish fast
