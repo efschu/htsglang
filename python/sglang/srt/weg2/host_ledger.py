@@ -131,7 +131,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 GIB = float(2**30)
 GB = 1e9
@@ -4701,7 +4701,9 @@ def format_dormant_image(rec: Dict[str, object]) -> str:
 
 
 def read_measured_record(
-    path: str, boot_tag: Optional[str] = None
+    path: str,
+    boot_tag: Optional[str] = None,
+    accept: Optional[Callable[[dict], bool]] = None,
 ) -> Dict[str, dict]:
     """The newest entry per group from the sidecar, or ``{}``.
 
@@ -4728,6 +4730,12 @@ def read_measured_record(
     Passing the tag makes sample and correction ONE boot's pair, which is what
     the correction was always documented to be, and makes a re-solve from the
     same source deterministic forever.
+
+    ``accept`` (WEG2-FORM, 24.09.) RESTRICTS THE ANSWER TO ONE CALIBRATION
+    IDENTITY -- in practice ``weg2_form.same_model_sample``: the sidecar is
+    shared by every model this rig boots, and "the newest entry" handed a
+    Qwen3.8-27B boot the Next-Flash boot fnFL2x142's D residue and run sample
+    (xsn417). ``None`` (every caller before the form) keeps today's answer.
     """
     try:
         with open(path) as f:
@@ -4762,6 +4770,8 @@ def read_measured_record(
         if not g:
             continue
         if boot_tag is not None and str(e.get("boot_tag", "")) != boot_tag:
+            continue
+        if accept is not None and not accept(e):
             continue
         if g not in out or str(e.get("at", "")) >= str(out[g].get("at", "")):
             out[g] = e
