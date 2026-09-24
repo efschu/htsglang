@@ -4423,6 +4423,7 @@ def dormant_image_sample(
     model_digest_: str = "",
     vram_residue_mib: Optional[Dict[str, int]] = None,
     vram_residue_form: str = "",
+    vram_residue_capture_bs: Optional[int] = None,
 ) -> Dict[str, object]:
     """One group's dormant image, measured at its FIRST sleep.  Pure but for /proc.
 
@@ -4640,6 +4641,14 @@ def dormant_image_sample(
         # measured none.
         "vram_residue_mib": {str(k): int(v) for k, v in (vram_residue_mib or {}).items()},
         "vram_residue_form": str(vram_residue_form or ""),
+        # RC1 (24.09.): the residue is a function of the group's CAPTURE SET
+        # too -- group D's --max-running-requests sizes the CUDA graphs that
+        # stay resident through its sleep (xsn439 at 32: 3206/2742/2740 MiB,
+        # at 6: 2096/1512/1512) -- so a D sample names it, and the launcher
+        # prices only a sample of its own capture set
+        # (launcher.d_residue_record_accept). Absent when not given.
+        **({"vram_residue_capture_bs": int(vram_residue_capture_bs)}
+           if vram_residue_capture_bs is not None else {}),
     }
 
 

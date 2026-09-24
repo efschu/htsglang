@@ -332,6 +332,45 @@ DC_RECORD_MARGIN_MIB = 256
 DC_RECORD_ENV = "SGLANG_WEG2_DC_D_RECORD"
 
 
+def d_residue_capture_bs(sample: Dict[str, object], line_id) -> Optional[int]:
+    """The capture set (group D's ``--max-running-requests``) a D dormant
+    sample was measured under: the sample's own field, or -- a sample written
+    before the field existed -- the ``group D argv:`` line of its boot's
+    front log (the log the line identity already judges it by)."""
+    v = sample.get("vram_residue_capture_bs")
+    if v is not None:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+    reader = getattr(line_id, "d_max_running_requests", None)
+    return reader(sample.get("boot_tag")) if callable(reader) else None
+
+
+def d_residue_record_accept(line_id, d_bs: int) -> Callable[[dict], bool]:
+    """#1444 + RC1 (24.09.): which measured-record samples may price THIS
+    boot's group-D dormant residue. The line's own samples (line identity),
+    and for group D only those of the SAME capture set: D's residue is
+    mostly the CUDA graphs that stay resident through its sleep, and their
+    set follows --max-running-requests. Measured: xsn439 at 32 left
+    3206/2742/2740 MiB, xsn438 and RC1 at 6 left 2096/1512/1512 and
+    2072/1490/1490. xsn439's was the newest sample when RC1 (6) launched,
+    priced dormant_other 3526/3062/3060, took 1112-1232 MiB off every P rank
+    and pushed the 42,11,11 pool from 269,805 to 212,871 tokens, under the
+    262,656 floor -- the cut fell to 39,13,12 (ranked #57). A sample whose
+    capture set cannot be proven is not this boot's residue either."""
+    want = int(d_bs)
+
+    def _accept(sample: dict) -> bool:
+        if not line_id.accepts_sample(sample):
+            return False
+        if str((sample or {}).get("group", "")).upper() != "D":
+            return True
+        return d_residue_capture_bs(sample, line_id) == want
+
+    return _accept
+
+
 def dc_residue_from_record(
     rec: Optional[Dict[str, object]], cards: Sequence[Card], weight_source: str
 ) -> Tuple[Optional[Dict[str, int]], str]:
@@ -12673,13 +12712,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # the xsn14 constant; the constant is the fallback with a printed reason.
     # 27B line: only a record of THIS checkpoint and line (xsn418 died W19 on
     # the Next-Flash boot fnFL2x144's 3080 residue, 768 vs a 27B D's 1404).
+    # RC1: only a sample of THIS capture set (D --max-running-requests d_bs)
+    # prices D's dormant residue (d_residue_record_accept).
     _dc_rec_d = host_ledger.read_measured_record(
-        measured_record_path(), accept=line_id.accepts_sample).get("D")
+        measured_record_path(), accept=d_residue_record_accept(line_id, d_bs)).get("D")
     _dc_from_record, _dc_record_prov = dc_residue_from_record(
         _dc_rec_d, cards, ns.weg2_weight_source)
     if _dc_rec_d is None:
         _dc_record_prov = ("no group-D dormant-image record of " + line_id.describe()
-                           + " -> constant")
+                           + f" with capture set --max-running-requests {int(d_bs)} -> constant")
+    else:
+        _dc_record_prov += f" [capture set --max-running-requests {int(d_bs)}]"
     dc_expect_d = {
         c.uuid: (
             _dc_from_record[c.uuid] if _dc_from_record is not None

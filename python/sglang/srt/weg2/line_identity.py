@@ -71,6 +71,28 @@ def _front_log_model(path: str, _mtime: float) -> Optional[str]:
     return None
 
 
+_D_MAX_RUNNING_RE = re.compile(r"--max-running-requests[= ]'?(\d+)")
+
+
+@lru_cache(maxsize=8192)
+def _front_log_d_max_running(path: str, _mtime: float) -> Optional[int]:
+    """Group D's ``--max-running-requests`` in a front log's ``group D argv:``
+    line (the launcher prints it once per boot); None = no such line."""
+    try:
+        with open(path, "rb") as f:
+            seen = 0
+            for raw in f:
+                seen += len(raw)
+                if seen > _SCAN_MAX_BYTES:
+                    return None
+                if b"group D argv:" in raw:
+                    m = _D_MAX_RUNNING_RE.search(raw.decode("utf-8", "replace"))
+                    return int(m.group(1)) if m else None
+    except OSError:
+        return None
+    return None
+
+
 @lru_cache(maxsize=16)
 def _ancestor_index(repo: str, head: str) -> Optional[Dict[str, Tuple[str, ...]]]:
     """Every commit reachable from ``head`` (``git rev-list``), indexed by its
@@ -169,6 +191,24 @@ class LineIdentity:
         for tip, front in _front_logs_by_tag(self.evidence_dir, stamp).get(tag, ()):
             return self.accepts_boot(tip, front)
         return False
+
+    def d_max_running_requests(self, tag: str) -> Optional[int]:
+        """Group D's ``--max-running-requests`` of boot ``tag``, read off the
+        ``group D argv:`` line of its newest front log (the same log
+        :meth:`accepts_sample` judges it by); None = not provable."""
+        tag = str(tag or "")
+        if not tag:
+            return None
+        try:
+            stamp = int(os.path.getmtime(self.evidence_dir))
+        except OSError:
+            return None
+        for _tip, front in _front_logs_by_tag(self.evidence_dir, stamp).get(tag, ()):
+            try:
+                return _front_log_d_max_running(front, os.path.getmtime(front))
+            except OSError:
+                return None
+        return None
 
     def warm(self, record_path: str) -> Tuple[int, int]:
         """Judge every sample of ``record_path`` once, so the caches are full
