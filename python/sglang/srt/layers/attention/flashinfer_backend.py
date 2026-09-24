@@ -52,6 +52,7 @@ from sglang.srt.layers.dcp.lockstep import (
     weightless_has_prefix,
 )
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -7599,18 +7600,23 @@ class FlashInferIndicesUpdaterPrefill:
                 if self.attn_backend.uneven_dcp
                 else self.num_kv_heads
             )
-            wrapper_ragged.begin_forward(
-                qo_indptr,
-                qo_indptr,
-                ragged_qo_heads,
-                ragged_kv_heads,
-                self.head_dim,
-                q_data_type=self.q_data_type,
-                # Tree-spec only (topk > 1): flashinfer packs this bool mask into
-                # the per-bucket ragged wrapper's custom_mask_buf on every replay
-                # -> CUSTOM mask mode over the draft->draft block. None elsewhere.
-                custom_mask=ragged_custom_mask,
-            )
+            # #PGAP fi_plan (weg2_p_overlap.py): flashinfer's plan() reads
+            # qo_indptr device->host BLOCKING (prefill.py `qo_indptr.to("cpu")`),
+            # i.e. it waits for everything queued on the forward stream. The
+            # span names that wait inside the launch; off = a bare yield.
+            with _weg2_p_overlap.span("fi_plan"):
+                wrapper_ragged.begin_forward(
+                    qo_indptr,
+                    qo_indptr,
+                    ragged_qo_heads,
+                    ragged_kv_heads,
+                    self.head_dim,
+                    q_data_type=self.q_data_type,
+                    # Tree-spec only (topk > 1): flashinfer packs this bool mask into
+                    # the per-bucket ragged wrapper's custom_mask_buf on every replay
+                    # -> CUSTOM mask mode over the draft->draft block. None elsewhere.
+                    custom_mask=ragged_custom_mask,
+                )
 
         if use_sliding_window_kv_pool:
             assert self._swa_kv_pool is not None
@@ -7672,26 +7678,27 @@ class FlashInferIndicesUpdaterPrefill:
                 max_kv_len=int(seq_lens_cpu_i32.max()),
             )
 
-        wrapper_paged.begin_forward(
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            self.kv_last_page_len[:bs],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            1,
-            q_data_type=self.q_data_type,
-            kv_data_type=self.data_type,
-            custom_mask=use_custom_mask,
-            non_blocking=True,
-            fixed_split_size=fixed_split_size,
-            prefix_len_ptr=prefix_len_ptr,
-            token_pos_in_items_ptr=token_pos_in_items_ptr,
-            token_pos_in_items_len=token_pos_in_items_len,
-            max_item_len_ptr=max_item_len_ptr,
-            **paged_plan_kwargs,
-        )
+        with _weg2_p_overlap.span("fi_plan"):  # #PGAP, see the ragged plan above
+            wrapper_paged.begin_forward(
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.kv_last_page_len[:bs],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+                custom_mask=use_custom_mask,
+                non_blocking=True,
+                fixed_split_size=fixed_split_size,
+                prefix_len_ptr=prefix_len_ptr,
+                token_pos_in_items_ptr=token_pos_in_items_ptr,
+                token_pos_in_items_len=token_pos_in_items_len,
+                max_item_len_ptr=max_item_len_ptr,
+                **paged_plan_kwargs,
+            )
 
 
 class FlashInferMultiStepDraftBackend:
