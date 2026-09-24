@@ -747,6 +747,12 @@ class Envs:
     # boundary of the full-KV match (else recompute from 0) instead of the
     # deepest surviving on-grid checkpoint.
     SGLANG_MAMBA_CKPT_STRICT_RESUME = EnvBool(False)
+    # Upstream #31648 (opt-in here): on a unified-radix prefix hit refresh only
+    # the CONSUMED node's mamba state in the mamba LRU (not the whole matched
+    # chain), and leave the insert walk out of it. Changes which mamba states
+    # the tree tombstones first under pool pressure, so it stays off until an
+    # A/B boot has priced it against the fork's anchor/retention policy.
+    SGLANG_MAMBA_LRU_REFRESH_USED_ONLY = EnvBool(False)
     # Per-request mamba checkpoint diagnostics: log match length, resume
     # length, checkpoint node/slot and cache-insert positions so a
     # nondeterministic resume (or a checkpoint at a wrong position) can be

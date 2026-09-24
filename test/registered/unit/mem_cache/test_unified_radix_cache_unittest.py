@@ -4062,6 +4062,87 @@ class UnifiedLRUListBoundedRefreshTest(CustomTestCase):
         self.assertEqual(self._lru_order(lru), before)
 
 
+class TestUnifiedMambaLRUMatchRefresh(CustomTestCase):
+    """Upstream #31648, opt-in here (SGLANG_MAMBA_LRU_REFRESH_USED_ONLY).
+
+    ON: a prefix-cache hit refreshes only best_match_node's mamba state in the
+    mamba LRU, not its ancestors (upstream test). OFF (default): the base
+    whole-chain refresh is kept byte-identical, so the ancestor moves too.
+    """
+
+    cfg = CacheConfig(page_size=1, components=(ComponentType.FULL, ComponentType.MAMBA))
+
+    def _mamba_lru_mru_to_lru(self, cache):
+        lru = cache.lru_lists[ComponentType.MAMBA]
+        pt = lru._pt
+        out, cur = [], lru.head.lru_next[pt]
+        while cur is not lru.tail:
+            out.append(cur)
+            cur = cur.lru_next[pt]
+        return out
+
+    def _make_req(self, req_to_token_pool):
+        req = Req(
+            rid=0,
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_to_token_pool.alloc([req])
+        return req
+
+    def _two_sessions_then_rematch_first(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        def insert(tokens):
+            value = allocator.alloc(len(tokens))
+            req = self._make_req(req_to_token_pool)
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", tokens)),
+                    value=value[: len(tokens)],
+                    mamba_value=req.mamba_pool_idx.unsqueeze(0),
+                )
+            )
+
+        def match_leaf(tokens):
+            return cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).best_match_node
+
+        # Two independent sessions, each a 2-node mamba chain:
+        #   root -> a1 -> b1  and  root -> a2 -> b2
+        insert([1, 2, 3])
+        insert([1, 2, 3, 4, 5, 6])
+        insert([7, 8, 9])
+        insert([7, 8, 9, 10, 11, 12])
+
+        b1 = match_leaf([1, 2, 3, 4, 5, 6])
+        a1 = b1.parent
+        b2 = match_leaf([7, 8, 9, 10, 11, 12])
+        a2 = b2.parent
+        # Session 2 matched last, so session 1's ancestor a1 is older than a2.
+        order = self._mamba_lru_mru_to_lru(cache)
+        self.assertGreater(order.index(a1), order.index(a2))
+
+        self.assertIs(match_leaf([1, 2, 3, 4, 5, 6]), b1)
+        return self._mamba_lru_mru_to_lru(cache), a1, b1, a2
+
+    def test_match_refreshes_only_used_node_when_opted_in(self):
+        with envs.SGLANG_MAMBA_LRU_REFRESH_USED_ONLY.override(True):
+            order, a1, b1, a2 = self._two_sessions_then_rematch_first()
+        # Only the consumed leaf b1 moves to MRU; ancestor a1 stays put.
+        self.assertIs(order[0], b1)
+        self.assertGreater(order.index(a1), order.index(a2))
+
+    def test_default_keeps_whole_chain_refresh(self):
+        with envs.SGLANG_MAMBA_LRU_REFRESH_USED_ONLY.override(False):
+            order, a1, b1, a2 = self._two_sessions_then_rematch_first()
+        # Byte-identical to the pre-port order: the whole matched chain is MRU.
+        self.assertIs(order[0], b1)
+        self.assertLess(order.index(a1), order.index(a2))
+
+
 class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.MAMBA),
