@@ -342,8 +342,16 @@ class AdaptiveController:
         num_correct_drafts_per_req: list[int],
         batch_size: int,
         result_steps: int | None = None,
+        allow_switch: bool = True,
     ) -> None:
         """Feed verify results; switch runtime state if the estimator warrants it.
+
+        ``allow_switch=False`` records the observation and never switches:
+        the per-round chain policy (SGLANG_SPEC_ADAPTIVE_CHAIN) owns the
+        chain length while it is armed, and this EMA switching the state from
+        the result path as well made two regulators move one runtime state --
+        each switch a graph-memory swap, and the chain policy undoing it at
+        the next round start (fnFL2 H27).
 
         DETERMINISM INVARIANT (#50): *num_correct_drafts_per_req* MUST derive
         from the rank-0-broadcast accept counts (``result.accept_lens``, whose
@@ -371,6 +379,8 @@ class AdaptiveController:
                 num_correct_drafts_per_req,
                 batch_size,
             )
+        if not allow_switch:
+            return
         if self._maybe_forced_swap():
             return
         new_step = self.params.on_verify_complete(
@@ -378,6 +388,32 @@ class AdaptiveController:
         )
         if new_step is not None:
             self._activate(new_step)
+
+    @property
+    def baseline_steps(self) -> int:
+        """The externally registered (static-path, untagged) chain length --
+        the boot's --speculative-num-steps; never needs a graph-memory swap."""
+        if self._registered_steps:
+            return min(self._registered_steps)
+        return self.worker.speculative_num_steps
+
+    def park(self, speculative_num_steps: int) -> int:
+        """Activate *speculative_num_steps* and unmap every other built state.
+
+        For a Weg-2 group sleep: the ladder's tagged scratch lives under the
+        ``adaptive_state_k*`` tags, which the group sleep does not release
+        (it pauses weights / kv_cache / cuda_graph), so a non-baseline state
+        left mapped holds its VRAM through the whole P phase. Parking on the
+        untagged baseline first is what makes the unmap safe: no worker
+        pointer references a paused state afterwards. Returns the bytes
+        unmapped (0 in resident mode).
+        """
+        if speculative_num_steps in self._states:
+            if speculative_num_steps != self.worker.speculative_num_steps:
+                self._activate(speculative_num_steps)
+        return self.graph_memory.pause_resident(
+            keep=self.graph_memory.tag_for_steps(speculative_num_steps)
+        )
 
     def _maybe_forced_swap(self) -> bool:
         """TEST-ONLY stress hook (SGLANG_ADAPTIVE_FORCE_SWAP_INTERVAL=N):

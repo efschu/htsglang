@@ -2574,6 +2574,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         manager = get_active_manager()
         swap_ms_for = manager.swap_ms_for if manager is not None else None
+        # fnFL2 H27: the rank whose proposal the consensus broadcasts. Under
+        # draft-solo placement (Form A: TP0 5090 host, TP1/TP2 expert
+        # workers) that must be the SOLO HOST -- only it drafts, so only its
+        # survival curve is real; a shadow's probe is never written.
+        decider_rank = self._chain_consensus_src_rank()
         self.chain_policy = AdaptiveChainPolicy(
             k_max=k_max,
             k_min=envs.SGLANG_SPEC_ADAPTIVE_CHAIN_MIN_STEPS.get(),
@@ -2588,6 +2593,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             switch_margin=(
                 envs.SGLANG_SPEC_ADAPTIVE_CHAIN_SWITCH_MARGIN_PCT.get() / 100.0
             ),
+            # The boot's static length (k=3 on Next Flash) is both the state
+            # the worker starts in and the one a fallback returns to.
+            fallback_k=self.speculative_num_steps,
+            initial_k=self.speculative_num_steps,
+            census_every=envs.SGLANG_SPEC_ADAPTIVE_CHAIN_CENSUS_EVERY.get(),
+            decider=int(self.tp_rank) == decider_rank,
+            rank=int(self.tp_rank),
+            regret_pct=envs.SGLANG_SPEC_ADAPTIVE_CHAIN_REGRET_PCT.get(),
         )
         self.round_cost_probe = RoundCostProbe(device=self.device)
         logger.info(
@@ -2596,7 +2609,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             f"(cold start only -- unmeasured k are fitted from measured rounds), "
             f"min_dwell={self.chain_policy.min_dwell} rounds, "
             f"switch_margin={100.0 * self.chain_policy.switch_margin:.0f}%, "
-            f"swap_cost={'per-target from graph memory' if swap_ms_for else 'none'}"
+            f"swap_cost={'per-target from graph memory' if swap_ms_for else 'none'}, "
+            f"fallback_k={self.chain_policy.fallback_k}, "
+            f"decider_rank={decider_rank} (this rank {self.tp_rank}), "
+            f"census_every={self.chain_policy.census_every}, "
+            f"regret={self.chain_policy.regret_pct:.0f}%"
         )
 
     @property
@@ -3179,12 +3196,40 @@ class EAGLEWorkerV2(BaseSpecWorker):
         batch_size: int = 0,
         steps: int | None = None,
     ) -> None:
-        if self.adaptive_controller is not None:
-            self.adaptive_controller.on_verify_complete(
-                num_correct_drafts_per_req,
-                batch_size=batch_size,
-                result_steps=steps,
+        if self.adaptive_controller is None:
+            return
+        chain_armed = self.chain_policy is not None
+        if chain_armed and num_correct_drafts_per_req:
+            # Measured acceptance per chain length (incl. bonus token), from
+            # the rank-0-broadcast accept counts -- identical on every rank.
+            k = steps if steps is not None else self.speculative_num_steps
+            self.chain_policy.record_accept(
+                k,
+                1.0
+                + sum(num_correct_drafts_per_req) / len(num_correct_drafts_per_req),
             )
+        self.adaptive_controller.on_verify_complete(
+            num_correct_drafts_per_req,
+            batch_size=batch_size,
+            result_steps=steps,
+            # An armed chain policy owns k; the batch-size EMA only observes.
+            allow_switch=not chain_armed,
+        )
+
+    def park_adaptive_for_sleep(self) -> int:
+        """Weg-2 group sleep: park the ladder on the static length, unmap the rest.
+
+        Must run on EVERY rank of the group at the same point (the sleep
+        RPC), before the group's tags are paused. Returns the bytes unmapped.
+        The call site is the D group's release path
+        (``weight_updater.release_memory_occupation``) -- see fnFL2 H27.
+        """
+        if self.adaptive_controller is None:
+            return 0
+        k = self.adaptive_controller.baseline_steps
+        if self.chain_policy is not None:
+            k = self.chain_policy.park(k)
+        return self.adaptive_controller.park(k)
 
     def activate_step_by_batch(self, batch_size: int) -> None:
         if self.adaptive_controller is None:
@@ -3234,37 +3279,46 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.adaptive_controller.activate_steps(self.chain_policy.choose())
         return True
 
+    def _chain_consensus_src_rank(self) -> int:
+        """Group-local rank whose chain-length proposal every rank adopts.
+
+        The solo draft host under ``--speculative-draft-placement solo`` (its
+        survival curve is the only one a draft ever wrote), else rank 0.
+        """
+        if getattr(self, "_spec_solo_active", False):
+            return int(self._spec_solo_rank)
+        return 0
+
     def _agree_chain_length(self, proposal: int) -> int:
-        """Broadcast rank 0's chain length to the TP group.
+        """Broadcast the deciding rank's chain length to the TP group.
 
         The proposal is derived from rank-local quantities (a cost EMA over
         this rank's CUDA-event timings, and whether this rank's survival copy
         had landed), so it cannot be relied on to match across ranks. One
         broadcast per decision round -- with the default dwell, well under one
         per ten rounds -- buys structural agreement instead.
+
+        A failure is NOT swallowed (it used to keep the local proposal): the
+        policy turns it into ChainConsensusError, crash-stop, because a rank
+        continuing on its own k sizes the solo draft-token broadcast and the
+        verify graph differently from its peers.
         """
-        try:
-            import torch.distributed as dist
+        import torch.distributed as dist
 
-            from sglang.srt.distributed import get_tp_group
+        from sglang.srt.distributed import get_tp_group
 
-            if not dist.is_initialized():
-                return proposal
-            group = get_tp_group().cpu_group
-            if dist.get_world_size(group) == 1:
-                return proposal
-            box = [int(proposal)]
-            dist.broadcast_object_list(
-                box, src=dist.get_global_rank(group, 0), group=group
-            )
-            return int(box[0])
-        except Exception:
-            logger.warning(
-                "[spec-adaptive] chain-length broadcast failed; keeping the "
-                "local proposal.",
-                exc_info=True,
-            )
+        if not dist.is_initialized():
             return proposal
+        group = get_tp_group().cpu_group
+        if dist.get_world_size(group) == 1:
+            return proposal
+        box = [int(proposal)]
+        dist.broadcast_object_list(
+            box,
+            src=dist.get_global_rank(group, self._chain_consensus_src_rank()),
+            group=group,
+        )
+        return int(box[0])
 
     # -- Adaptive speculative decoding protocol --
 

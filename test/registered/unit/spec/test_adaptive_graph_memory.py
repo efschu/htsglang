@@ -137,6 +137,7 @@ def _offload_init(self, mode="offload"):
     # state evicts whatever is mapped. Tests that exercise budget-driven
     # residency raise it explicitly.
     self._resident_budget_bytes = 0
+    self._max_resident = 0
     self.last_swap_ms = None
     self._last_real_swap_ms = None
     self._tp_cpu_group = None

@@ -23,6 +23,7 @@ import unittest
 
 from sglang.srt.speculative.adaptive_chain import (
     AdaptiveChainPolicy,
+    ChainConsensusError,
     ChainCostModel,
     break_even_rounds,
     expected_tokens,
@@ -275,14 +276,22 @@ class TestRankConsensus(unittest.TestCase):
             k1 = rank1.choose()
             self.assertEqual(k0, k1, f"ranks diverged at round {i}")
 
-    def test_consensus_outside_the_candidate_set_is_ignored(self):
+    def test_consensus_outside_the_candidate_set_stops_the_group(self):
+        """fnFL2 H27: this used to keep the local proposal. A length no rank
+        built is a detected disagreement -- crash-stop (Nutzer-Gesetz
+        2026-08-29), never continue on a rank-local k."""
         policy = AdaptiveChainPolicy(
             k_max=3, candidates=[1, 3], min_dwell=0, consensus=lambda _k: 7
         )
         policy.record_survival([0.0, 0.0, 0.0])
-        self.assertIn(policy.choose(), (1, 3))
+        with self.assertRaises(ChainConsensusError):
+            policy.choose()
 
-    def test_a_raising_consensus_hook_does_not_kill_the_round(self):
+    def test_a_raising_consensus_hook_stops_the_group(self):
+        """fnFL2 H27: a failed broadcast used to be swallowed ("Ranks may now
+        disagree"); on Form A that rank would size the solo draft-token
+        broadcast from its own k and hang or misread the next collective."""
+
         def boom(_k):
             raise RuntimeError("broadcast failed")
 
@@ -290,7 +299,8 @@ class TestRankConsensus(unittest.TestCase):
             k_max=3, candidates=[1, 3], min_dwell=0, consensus=boom
         )
         policy.record_survival([0.9, 0.9, 0.9])
-        self.assertIn(policy.choose(), (1, 3))
+        with self.assertRaises(ChainConsensusError):
+            policy.choose()
 
     def test_frozen_rounds_post_no_consensus_call(self):
         """Between decision rounds nothing rank-local is read and no

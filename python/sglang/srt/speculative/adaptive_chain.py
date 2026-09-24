@@ -82,6 +82,26 @@ DEFAULT_VERIFY_MS = 26.0
 #: ULP-level differences between TP ranks cannot select different chain lengths.
 SURVIVAL_QUANTUM_DIGITS = 4
 
+#: Consensus value that means "every rank leaves the adaptive ladder now and
+#: holds the fixed chain length" (fnFL2 H27). 0 is never a chain-policy
+#: candidate (``eligible_candidates`` drops k < 1), so it cannot collide with a
+#: real proposal. Only the deciding rank ever sends it; every rank receives the
+#: same broadcast, so the fallback is entered on the same round everywhere.
+FALLBACK_SENTINEL = 0
+
+
+class ChainConsensusError(RuntimeError):
+    """The chain-length agreement failed or produced a length no rank built.
+
+    Crash-stop, never keep-local (Nutzer-Gesetz 2026-08-29 "raenge duerfen sich
+    niemals uneins sein. wenn uneins crash stop"): a rank that keeps its local
+    proposal after a failed broadcast replays a different verify graph and a
+    different draft-token broadcast width than its peers, and the next
+    collective hangs or -- worse -- reads a wrongly sized payload.  The Form A
+    workers make this concrete: the shadow's ``_solo_recv_draft_tokens``
+    allocates ``(bs, speculative_num_steps)`` from ITS OWN k.
+    """
+
 
 def _sanitize_survival(value: float) -> float:
     """Map one raw survival entry into ``[0.0, 1.0]``.
@@ -629,6 +649,14 @@ class AdaptiveChainPolicy:
         swap_ms_for: Callable[[int], float] | None = None,
         consensus: Callable[[int], int] | None = None,
         switch_margin: float = 0.0,
+        fallback_k: int | None = None,
+        census_every: int = 0,
+        decider: bool = True,
+        rank: int = 0,
+        regret_pct: float = 0.0,
+        regret_periods: int = 2,
+        accept_alpha: float = 0.2,
+        initial_k: int | None = None,
     ):
         self.k_max = int(k_max)
         self.k_min = max(0, min(int(k_min), self.k_max))
@@ -669,12 +697,135 @@ class AdaptiveChainPolicy:
         self._consensus_overrides = 0
         self._warmup_switches = 0
         self._last_switch: dict[str, float] | None = None
+        # -- fnFL2 H27: measured acceptance, named switches, census, fallback --
+        #: The fixed chain length the ladder falls back to (the boot's
+        #: --speculative-num-steps, k=3 on Next Flash). Must be a built
+        #: candidate; anything else degrades to the longest one, which is what
+        #: choose_chain_length already treats as "no information".
+        fb = int(fallback_k) if fallback_k is not None else self.k_max
+        self.fallback_k = (
+            fb
+            if fb in self.candidates
+            else (self.candidates[-1] if self.candidates else self.k_max)
+        )
+        #: Emit one SPEC-ADAPT-CENSUS line every N rounds (0 = never).
+        self.census_every = max(0, int(census_every))
+        #: True on the rank whose proposal the consensus broadcasts (the solo
+        #: draft host). Only the decider may REQUEST a fallback; the others
+        #: learn it from the broadcast, on the same round.
+        self.decider = bool(decider)
+        self.rank = int(rank)
+        #: Regret guard (off at 0): after warm-up, if the rounds of a whole
+        #: census period delivered fewer tokens per second than the fixed
+        #: length's own measured estimate minus this many percent, for
+        #: ``regret_periods`` periods in a row, the decider requests the
+        #: fallback. Measured on both sides -- accept counts from the verify
+        #: (rank-invariant) and round durations from CUDA events.
+        self.regret_pct = max(0.0, float(regret_pct))
+        self.regret_periods = max(1, int(regret_periods))
+        self.accept_alpha = float(accept_alpha)
+        self._accept_ema: dict[int, float] = {}
+        self._accept_n: Counter[int] = Counter()
+        self._fallback = False
+        self._fallback_reason: str | None = None
+        self._pending_fallback: str | None = None
+        self._decision_reason = "hold"
+        #: The chain length the worker runs before the first choose() (the
+        #: boot's static state); a first decision that keeps it is no switch.
+        self._last_k: int | None = None if initial_k is None else int(initial_k)
+        self._period_tokens = 0.0
+        self._period_ms = 0.0
+        self._regret_streak = 0
+        self._named_switches = 0
 
     def record_survival(self, survival: Sequence[float]) -> None:
         self._survival = normalize_survival(survival, self.k_max)
 
     def record_duration(self, k: int, duration_ms: float) -> None:
         self.cost_model.observe(k, duration_ms)
+        try:
+            v = float(duration_ms)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(v) and v > 0.0:
+            self._period_ms += v
+
+    def record_accept(self, k: int, accept_length: float) -> None:
+        """Measured tokens per verify for a round that ran chain length *k*.
+
+        *accept_length* is the per-request mean of accepted tokens INCLUDING
+        the bonus token (paper tau, ``accept_length``), taken from the
+        verify's accept counts -- which every rank receives from the same
+        broadcast (#50), so this EMA is rank-invariant, unlike the survival
+        curve (solo host only) and the cost EMA (CUDA events per rank).
+        """
+        try:
+            k = int(k)
+            v = float(accept_length)
+        except (TypeError, ValueError):
+            return
+        if k < 1 or not math.isfinite(v) or v <= 0.0:
+            return
+        self._accept_n[k] += 1
+        if k not in self._accept_ema:
+            self._accept_ema[k] = v
+        else:
+            a = self.accept_alpha
+            self._accept_ema[k] = (1.0 - a) * self._accept_ema[k] + a * v
+        # Per-stream tokens (the batch-mean accept length), so the period
+        # rate compares like with like against tok_s_ema at any batch size.
+        self._period_tokens += v
+
+    def accept_ema(self, k: int) -> float:
+        """Measured accept length EMA for *k*, NaN before the first verify."""
+        return float(self._accept_ema.get(int(k), float("nan")))
+
+    def tok_s_ema(self, k: int) -> float:
+        """Per-stream decode rate at *k*: accept_ema(k) / cost(k), in tok/s.
+
+        NaN until *k* has both a measured acceptance and a measured round
+        cost -- a rate made of the cold-start prior is not a measurement and
+        is not printed as one.
+        """
+        k = int(k)
+        acc = self._accept_ema.get(k)
+        if acc is None or not self.cost_model.is_measured(k):
+            return float("nan")
+        c = self.cost_model.cost(k)
+        if not math.isfinite(c) or c <= 0.0:
+            return float("nan")
+        return 1000.0 * acc / c
+
+    def request_fallback(self, reason: str) -> None:
+        """Ask for the fixed chain length on the next decision round.
+
+        Only honoured on the decider: the request travels as the consensus
+        value, so every rank enters the fallback on the same round. On any
+        other rank this is a no-op -- a rank-local fallback would be exactly
+        the divergence the broadcast exists to prevent.
+        """
+        if self.decider and not self._fallback:
+            self._pending_fallback = str(reason)
+
+    @property
+    def in_fallback(self) -> bool:
+        return self._fallback
+
+    def park(self, k: int | None = None) -> int:
+        """Reset to *k* (default: the fallback length) outside the round loop.
+
+        For the Weg-2 sleep: the group is about to hand the card to P, and a
+        tagged ladder state left mapped would hold its VRAM through the whole
+        P phase. The caller activates *k* on every rank at the same RPC, so
+        resetting the decision clock here keeps the round counters
+        rank-uniform: every rank's next choose() is a frozen round at *k*.
+        """
+        k = self.fallback_k if k is None else int(k)
+        self._current = k
+        self._last_k = k
+        self._dwell = 0
+        self._rounds_since_decision = 0
+        return k
 
     def _swap_cost(self, k: int) -> float:
         if self.swap_ms_for is None:
@@ -734,6 +885,8 @@ class AdaptiveChainPolicy:
         previous = self._current
         self._current = target
         self._dwell = 0
+        # The warm-up block holds *target* for a whole dwell to time it.
+        self._decision_reason = "dwell"
         if previous is not None:
             self._switches += 1
             self._warmup_switches += 1
@@ -792,6 +945,7 @@ class AdaptiveChainPolicy:
             self._held_breakeven += 1
             return current
         self._log_switch(current, candidate, e_inc, c_inc, e_new, c_new, swap_ms)
+        self._decision_reason = "throughput"
         self._current = candidate
         self._dwell = 0
         self._switches += 1
@@ -874,6 +1028,14 @@ class AdaptiveChainPolicy:
         for the price of one small collective per decision round.
         """
         self._rounds += 1
+        if self._fallback:
+            # Sticky and collective-free: every rank entered the fallback on
+            # the same broadcast, so none of them posts another consensus.
+            k = self.fallback_k
+            self._current = k
+            self._histogram[k] += 1
+            self._after_round(k)
+            return k
         if self._current is not None and self._rounds_since_decision < max(
             1, self.min_dwell
         ):
@@ -886,57 +1048,173 @@ class AdaptiveChainPolicy:
             # min_dwell and the policy would hold its first choice forever.
             self._dwell += 1
             self._histogram[self._current] += 1
-            self._maybe_log()
+            self._after_round(self._current)
             return self._current
 
-        warmup = self._warmup_target()
-        if warmup is not None:
-            proposal = self._take_warmup(warmup)
+        self._decision_reason = "hold"
+        if self._pending_fallback is not None:
+            proposal = FALLBACK_SENTINEL
         else:
-            raw = choose_chain_length(
-                self._survival,
-                self.cost_model.cost,
-                k_max=self.k_max,
-                k_min=self.k_min,
-                candidates=self.candidates,
-            )
-            proposal = self._gate(raw)
+            warmup = self._warmup_target()
+            if warmup is not None:
+                proposal = self._take_warmup(warmup)
+            else:
+                raw = choose_chain_length(
+                    self._survival,
+                    self.cost_model.cost,
+                    k_max=self.k_max,
+                    k_min=self.k_min,
+                    candidates=self.candidates,
+                )
+                proposal = self._gate(raw)
         k = self._agree(proposal)
-        if k != self._current:
+        if k == FALLBACK_SENTINEL:
+            k = self._enter_fallback(self._pending_fallback or "decider")
+        elif k != self._current:
             # Consensus overrode this rank's gate outcome; adopt it wholesale
             # so the residency bookkeeping and the dwell clock stay truthful.
             self._current = k
             self._dwell = 0
         self._rounds_since_decision = 1
         self._histogram[k] += 1
-        self._maybe_log()
+        self._after_round(k)
         return k
 
+    def _enter_fallback(self, reason: str) -> int:
+        self._fallback = True
+        self._fallback_reason = str(reason)
+        self._pending_fallback = None
+        self._decision_reason = "fallback"
+        self._current = self.fallback_k
+        self._dwell = 0
+        return self.fallback_k
+
     def _agree(self, proposal: int) -> int:
-        """Run *proposal* through the consensus hook, falling back to it."""
+        """Run *proposal* through the consensus hook.
+
+        No hook (world size 1, off-GPU tests) is agreement with oneself. A
+        hook that raises, or that returns a length no rank built, is a
+        detected disagreement and stops the group (:class:`ChainConsensusError`)
+        -- it used to keep the local proposal and log "Ranks may now
+        disagree", which is the one outcome the broadcast was bought to rule
+        out. :data:`FALLBACK_SENTINEL` is the one non-candidate value that is
+        legal: it is the decider asking every rank for the fixed length.
+        """
         if self.consensus is None:
             return proposal
         try:
             agreed = int(self.consensus(proposal))
-        except Exception:  # pragma: no cover - defensive
-            logger.warning(
-                "[spec-adaptive] chain-length consensus failed; keeping the "
-                "local proposal. Ranks may now disagree.",
-                exc_info=True,
-            )
-            return proposal
+        except Exception as e:
+            raise ChainConsensusError(
+                f"[spec-adaptive] chain-length consensus failed at round "
+                f"{self._rounds} (local proposal k={proposal}): {e!r}. "
+                "Stopping instead of continuing on a rank-local chain length."
+            ) from e
+        if agreed == FALLBACK_SENTINEL:
+            return agreed
         if agreed not in self.candidates:
-            logger.warning(
-                "[spec-adaptive] consensus returned k=%s which is not a built "
-                "candidate %s; keeping local proposal k=%s.",
-                agreed,
-                self.candidates,
-                proposal,
+            raise ChainConsensusError(
+                f"[spec-adaptive] consensus returned k={agreed}, which is not a "
+                f"built candidate {self.candidates} (local proposal k={proposal}, "
+                f"round {self._rounds})."
             )
-            return proposal
         if agreed != proposal:
             self._consensus_overrides += 1
+            self._decision_reason = "consensus"
         return agreed
+
+    @staticmethod
+    def _fmt(v: float, digits: int = 2) -> str:
+        return f"{v:.{digits}f}" if math.isfinite(v) else "na"
+
+    def _after_round(self, k: int) -> None:
+        """Per-round bookkeeping: the named switch line, histogram, census."""
+        prev = self._last_k
+        if prev is not None and k != prev:
+            self._named_switches += 1
+            logger.info(
+                "SPEC-ADAPT k=%d->%d reason=%s accept_ema=%s->%s "
+                "tok_s_ema=%s->%s round=%d rank=%d",
+                prev,
+                k,
+                self._decision_reason,
+                self._fmt(self.accept_ema(prev)),
+                self._fmt(self.accept_ema(k)),
+                self._fmt(self.tok_s_ema(prev), 1),
+                self._fmt(self.tok_s_ema(k), 1),
+                self._rounds,
+                self.rank,
+            )
+        self._last_k = k
+        self._maybe_log()
+        self._maybe_census()
+
+    def census_line(self) -> str:
+        """The SPEC-ADAPT-CENSUS body: what was held, what it bought, why."""
+        total = sum(self._histogram.values()) or 1
+        hist = ",".join(
+            f"{k}:{self._histogram[k]}({100.0 * self._histogram[k] / total:.0f}%)"
+            for k in self.candidates
+        )
+        acc = ",".join(
+            f"{k}:{self._fmt(self.accept_ema(k))}/n{self._accept_n[k]}"
+            for k in self.candidates
+        )
+        cost = ",".join(
+            f"{k}:{self.cost_model.cost(k):.1f}"
+            f"{'' if self.cost_model.is_measured(k) else '(prior)'}"
+            for k in self.candidates
+        )
+        rate = ",".join(
+            f"{k}:{self._fmt(self.tok_s_ema(k), 1)}" for k in self.candidates
+        )
+        realized = (
+            1000.0 * self._period_tokens / self._period_ms
+            if self._period_ms > 0.0
+            else float("nan")
+        )
+        return (
+            f"round={self._rounds} k={self._current} hist={{{hist}}} "
+            f"accept_ema={{{acc}}} cost_ms={{{cost}}} tok_s_ema={{{rate}}} "
+            f"period_tok_s={self._fmt(realized, 1)} "
+            f"switches={self._named_switches} warmup={int(self.warming_up)} "
+            f"held_dwell={self._held_dwell} held_breakeven={self._held_breakeven} "
+            f"consensus_overrides={self._consensus_overrides} "
+            f"fallback={self._fallback_reason if self._fallback else 'no'} "
+            f"rank={self.rank}"
+        )
+
+    def _maybe_census(self) -> None:
+        if self.census_every <= 0 or self._rounds % self.census_every != 0:
+            return
+        logger.info("SPEC-ADAPT-CENSUS %s", self.census_line())
+        self._check_regret()
+        self._period_tokens = 0.0
+        self._period_ms = 0.0
+
+    def _check_regret(self) -> None:
+        """Decider only: request the fixed length after sustained regret."""
+        if (
+            self.regret_pct <= 0.0
+            or not self.decider
+            or self._fallback
+            or self._pending_fallback is not None
+            or self.warming_up
+            or self._period_ms <= 0.0
+        ):
+            return
+        realized = 1000.0 * self._period_tokens / self._period_ms
+        reference = self.tok_s_ema(self.fallback_k)
+        if not math.isfinite(reference) or not math.isfinite(realized):
+            return
+        if realized < reference * (1.0 - self.regret_pct / 100.0):
+            self._regret_streak += 1
+        else:
+            self._regret_streak = 0
+        if self._regret_streak >= self.regret_periods:
+            self.request_fallback(
+                f"regret:{realized:.1f}<{reference:.1f}tok/s" f"x{self._regret_streak}"
+            )
 
     def _maybe_log(self) -> None:
         if self.log_every > 0 and self._rounds % self.log_every == 0:
@@ -997,6 +1275,9 @@ class AdaptiveChainPolicy:
             "held_dwell": self._held_dwell,
             "held_breakeven": self._held_breakeven,
             "rounds": self._rounds,
+            "named_switches": self._named_switches,
+            "consensus_overrides": self._consensus_overrides,
+            "fallback": int(self._fallback),
         }
 
     @property

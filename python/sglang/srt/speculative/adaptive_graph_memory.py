@@ -410,6 +410,7 @@ def plan_residency(
     resident: Sequence[str],
     sizes: Mapping[str, int],
     budget_bytes: int,
+    max_resident: int = 0,
 ) -> list[str]:
     """Tags to unmap so *target* can be mapped, keeping the rest resident.
 
@@ -440,6 +441,16 @@ def plan_residency(
     new reserve -- the boot check already proves that much memory is free and
     that a mapped state may occupy it; this only declines to hand it back.
 
+    *max_resident* (> 0) additionally caps the COUNT of mapped tagged states
+    at that number, target included -- ``1`` is #93/#102's original rule
+    "reserve max(one state), not sum".  The budget alone is measured once, at
+    ``finalize_boot``; it cannot see memory taken later by anything that is
+    not a ladder state.  fnFA25/26/27 (Form A, 2026-09-20) died identically
+    on it: swap #2 kept k1 AND k2 mapped (budget said both fit), and the next
+    prefill's GDN chunk transient found 82 MiB free on the 5090.  Under a
+    Weg-2 flip the boot-time reading is staler still: the card changes hands
+    between P and D every flip.
+
     Returns the tags to unmap, in eviction order.  Never evicts *target*.
     """
     resident_list = [t for t in resident if t != target]
@@ -450,12 +461,17 @@ def plan_residency(
         return []
     budget = int(budget_bytes)
     used = sum(int(sizes.get(t, 0)) for t in resident_list)
+    cap = int(max_resident) if max_resident and int(max_resident) > 0 else None
     evict: list[str] = []
+    kept = len(resident_list)
     for tag in resident_list:
-        if used + need <= budget:
+        over_budget = used + need > budget
+        over_count = cap is not None and kept + 1 > cap
+        if not over_budget and not over_count:
             break
         evict.append(tag)
         used -= int(sizes.get(tag, 0))
+        kept -= 1
     return evict
 
 
@@ -719,6 +735,10 @@ class AdaptiveGraphMemoryManager:
     is a pure pointer swap in the worker).
     """
 
+    #: Cap on mapped tagged states (0 = budget only); class default so a
+    #: manager built without __init__ (tests) reads the pre-H27 behaviour.
+    _max_resident: int = 0
+
     def __init__(self, mode: str, tp_cpu_group=None, server_args=None):
         assert mode in ("resident",) + OFFLOAD_MODES, mode
         self.mode = mode
@@ -751,6 +771,13 @@ class AdaptiveGraphMemoryManager:
         #: finalize_boot; 0 until then, which reproduces the strict
         #: one-state-at-a-time behaviour during the build phase.
         self._resident_budget_bytes = 0
+        # fnFL2 H27: cap on the number of mapped tagged states (0 = the
+        # budget alone decides); see plan_residency.
+        from sglang.srt.environ import envs as _envs
+
+        self._max_resident = max(
+            0, int(_envs.SGLANG_ADAPTIVE_GRAPH_MEMORY_MAX_RESIDENT.get())
+        )
         self.last_swap_ms: Optional[float] = None
         #: Duration of the last activation that actually did driver work.
         #: Distinct from last_swap_ms, which is 0.0 after a free activation.
@@ -1077,7 +1104,17 @@ class AdaptiveGraphMemoryManager:
         # simply not handed back and re-taken every round.
         self._resident_budget_bytes = max(0, free_bytes - margin_bytes)
         self._resident = []
-        fits_all = sum(sizes.values()) <= self._resident_budget_bytes
+        fits_all = sum(sizes.values()) <= self._resident_budget_bytes and (
+            self._max_resident <= 0 or len(sizes) <= self._max_resident
+        )
+        if self._max_resident > 0:
+            logger.info(
+                "Adaptive graph memory: at most %d tagged state(s) mapped at "
+                "once (SGLANG_ADAPTIVE_GRAPH_MEMORY_MAX_RESIDENT) -- reserve "
+                "max(one state)=%.1f MiB, not the budget's sum",
+                self._max_resident,
+                max_bytes / (1 << 20),
+            )
         logger.info(
             "Adaptive graph memory: residency budget %.1f MiB (free %.1f - "
             "margin %.1f); all %d state(s) sum to %.1f MiB -> %s",
@@ -1226,6 +1263,7 @@ class AdaptiveGraphMemoryManager:
                 if r.tensors or t in self._capture_pools
             },
             budget_bytes=self._resident_budget_bytes,
+            max_resident=self._max_resident,
         )
 
         tic = time.perf_counter()
@@ -1263,6 +1301,37 @@ class AdaptiveGraphMemoryManager:
             list(self._resident),
             self.last_swap_ms,
         )
+
+    def pause_resident(self, keep: Optional[str] = None) -> int:
+        """Unmap every mapped tagged state except *keep*; return bytes freed.
+
+        Only safe once no worker pointer references the victims, i.e. after
+        the caller activated *keep* (or the untagged baseline). Used by
+        ``AdaptiveController.park`` ahead of a Weg-2 group sleep.
+        """
+        if not self.offload_enabled or not self._finalized:
+            return 0
+        victims = [t for t in list(self._resident) if t != keep]
+        if not victims:
+            return 0
+        torch.cuda.synchronize()
+        freed = 0
+        for victim in victims:
+            rec = self._states.get(victim)
+            self._adapter.pause(victim)
+            self._paused.add(victim)
+            self._resident.remove(victim)
+            if self._resumed_tag == victim:
+                self._resumed_tag = None
+            if rec is not None:
+                freed += int(rec.footprint_bytes)
+        logger.info(
+            "Adaptive graph memory park: unmapped %s (%.1f MiB), resident=%s",
+            victims,
+            freed / (1 << 20),
+            list(self._resident),
+        )
+        return freed
 
     def _touch_resident(self, tag: str) -> None:
         """Move *tag* to the most-recently-used end of the residency list."""
@@ -1387,6 +1456,7 @@ class AdaptiveGraphMemoryManager:
                 resident=list(self._resident),
                 sizes=sizes,
                 budget_bytes=self._resident_budget_bytes,
+                max_resident=self._max_resident,
             )
         )
         free, _ = torch.cuda.mem_get_info()

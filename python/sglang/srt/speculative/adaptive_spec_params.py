@@ -162,11 +162,28 @@ HIGH_ACCEPT_ADAPTIVE_CONFIG: dict[str, dict] = {
     },
 }
 
+# fnFL2 H27: the per-round chain policy's ladder for decode at bs 1-2 (the
+# only decode batch sizes the flip form serves, memory `decode-leiter-nur-
+# bs1-bs2`). Exactly the lengths the policy may choose -- k=1..3, no step-0
+# rung: the policy never picks k=0 (eligible_candidates drops it), so the
+# default config's k0 state would be captured, reserved and never replayed
+# (fnFA25 built it on all three ranks). One slot covers every batch size, so
+# no rung is pruned off a capture batch size.
+CHAIN_1_3_ADAPTIVE_CONFIG: dict[str, dict] = {
+    "1": {
+        "candidate_steps": [1, 2, 3],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": -0.25,
+        "ceiling_coeff": 0,
+    },
+}
+
 # --speculative-adaptive-config accepts these names instead of a JSON path.
 # "default" resolves to the per-algorithm built-in default.
 BUILTIN_ADAPTIVE_PROFILES: dict[str, dict[str, dict] | None] = {
     "default": None,
     "high-accept": HIGH_ACCEPT_ADAPTIVE_CONFIG,
+    "chain-1-3": CHAIN_1_3_ADAPTIVE_CONFIG,
 }
 
 

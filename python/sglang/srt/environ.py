@@ -2154,6 +2154,13 @@ class Envs:
     # over undefined resume content. Costs ~capture-pool-size of host RAM per
     # state and a PCIe round-trip per swap.
     SGLANG_ADAPTIVE_CAPTURE_CPU_BACKUP = EnvBool(False)
+    # Cap on the number of TAGGED adaptive states mapped at once (offload
+    # modes). 0 = the finalize_boot residency budget alone decides (fn8s4
+    # behaviour: every state that fits stays mapped). 1 = #93/#102's rule
+    # "reserve max(one state), not sum". fnFA25/26/27 (Form A, 2026-09-20)
+    # OOM'd on the 5090 in round 17 with k1+k2 both mapped under the budget
+    # rule; under a Weg-2 flip the boot-time budget is stale by construction.
+    SGLANG_ADAPTIVE_GRAPH_MEMORY_MAX_RESIDENT = EnvInt(0)
     # Per-round adaptive draft chain length (topk=1 chains only), on top of
     # --speculative-adaptive. Where --speculative-adaptive picks the chain
     # length from the EMA of *observed* accept lengths every update_interval
@@ -2198,6 +2205,16 @@ class Envs:
     # therefore a decision about which real gains to give up, not a safety
     # tightening; re-measure the spread before touching it.
     SGLANG_SPEC_ADAPTIVE_CHAIN_SWITCH_MARGIN_PCT = EnvFloat(2.0)
+    # fnFL2 H27: one "SPEC-ADAPT-CENSUS" line every N chain-policy rounds
+    # (histogram, measured accept/cost/tok-s per k, switches, fallback). 0 =
+    # never. The per-switch "SPEC-ADAPT k=a->b reason=..." line is always on.
+    SGLANG_SPEC_ADAPTIVE_CHAIN_CENSUS_EVERY = EnvInt(50)
+    # fnFL2 H27 regret guard, in percent; 0 = off. After warm-up, when a whole
+    # census period delivered fewer tok/s than the fixed length's own measured
+    # rate minus this margin, for two periods in a row, the deciding rank
+    # broadcasts the fallback and EVERY rank holds --speculative-num-steps for
+    # the rest of the process (sticky, collective-free from then on).
+    SGLANG_SPEC_ADAPTIVE_CHAIN_REGRET_PCT = EnvFloat(0.0)
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
