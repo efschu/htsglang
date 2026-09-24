@@ -40,7 +40,7 @@ import logging
 import time
 import warnings
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Iterator, Optional
 
 import msgspec
 import torch
@@ -221,12 +221,16 @@ def format_publish_line(
 class PublishClock:
     """Wraps one chunk publish: wall, thread CPU, and the write-op deltas."""
 
-    __slots__ = ("_w0", "_c0", "_s0")
+    __slots__ = ("_w0", "_c0", "_s0", "wall_ms", "cpu_ms", "delta")
 
     def __init__(self) -> None:
         self._s0 = STATS.copy()
         self._w0 = time.perf_counter()
         self._c0 = time.thread_time()
+        #: fnFL2 H49: the readings of ``finish``, kept for WEG2-PUBLISH-CHUNK.
+        self.wall_ms = 0.0
+        self.cpu_ms = 0.0
+        self.delta: Optional[WritePathStats] = None
 
     def finish(self, n: int) -> str:
         wall_ms = (time.perf_counter() - self._w0) * 1000.0
@@ -234,11 +238,14 @@ class PublishClock:
         TALLY.n += 1
         TALLY.wall_ms += wall_ms
         TALLY.cpu_ms += cpu_ms
+        self.wall_ms = wall_ms
+        self.cpu_ms = cpu_ms
+        self.delta = STATS.since(self._s0)
         return format_publish_line(
             n=n,
             wall_ms=wall_ms,
             cpu_ms=cpu_ms,
-            delta=STATS.since(self._s0),
+            delta=self.delta,
             tally=TALLY,
         )
 

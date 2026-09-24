@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -21,6 +22,9 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_MATCHED_TOKEN,
     Req,
     ScheduleBatch,
+)
+from sglang.srt.managers.scheduler_components.host_round_cost import (
+    note_result_wait,
 )
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
@@ -826,7 +830,11 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
+            # fnFL2 H49: the host blocked on the round's device result
+            # (result_wait_ms of DECODE-HOST-PERIOD); timing only.
+            _h49_t0 = time.perf_counter()
             result.copy_done.synchronize()
+            note_result_wait((time.perf_counter() - _h49_t0) * 1000.0)
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None

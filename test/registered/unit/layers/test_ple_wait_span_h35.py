@@ -198,9 +198,10 @@ class PleWaitSpanTest(unittest.TestCase):
                       "spec_verify:tp.all_reduce": AR_MS},
             graphed=True, now_mono=1.2)
         self.assertAlmostEqual(on.ple_ms, PLE_STALL_MS)
-        self.assertTrue(on.line().endswith("ple_ms=6.4"), on.line())
+        # fnFL2 H49 appends host fields after ple_ms: match the token, not the end
+        self.assertRegex(on.line(), r" ple_ms=6\.4( |$)")
         self.assertIsNone(off.ple_ms)
-        self.assertTrue(off.line().endswith("ple_ms=-"), off.line())
+        self.assertRegex(off.line(), r" ple_ms=-( |$)")
         # the existing fields keep their place (H23 readers match substrings)
         self.assertIn("compute_ms=10.0 fetch_ms=8.8 allreduce_ms=8.2", on.line())
 

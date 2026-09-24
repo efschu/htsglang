@@ -169,6 +169,9 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple
 
+from sglang.srt.managers.scheduler_components.host_round_cost import (
+    DecodeHostCost,
+)
 from sglang.srt.managers.scheduler_components.wake_round_census import (
     WakeRoundCensus,
 )
@@ -256,6 +259,10 @@ class DecodeRoundLog:
         #: fnFL2 H23: DECODE-ROUND-COST for the first rounds after a Weg-2
         #: wake. Inert until ``arm_wake_census``.
         self.wake_census = WakeRoundCensus(rank=self.rank)
+        #: fnFL2 H49: the host side of every round's interval (HiCache poll,
+        #: its CPU all_reduce, the result sync), joined into
+        #: DECODE-ROUND-COST and stated as DECODE-HOST-PERIOD.
+        self.host_cost = DecodeHostCost.from_env(rank=self.rank)
 
     def arm_wake_census(self, *, wake_mono: Optional[float]) -> None:
         """fnFL2 H23: price the next decode rounds (the wake happened at
@@ -275,6 +282,9 @@ class DecodeRoundLog:
         if self.wake_census.armed:
             # before the drain: the round it may price ends at this open
             self.wake_census.note_open(round_id=round_id, mono=t0 / 1e9)
+        # before the drain too: the round it may price has its host interval
+        # closed at this open
+        self.host_cost.on_round_open(round_id=round_id, mono=t0 / 1e9)
         self._retire_open()
         self.flush()
         self._open = RoundAcc(round_id, bs, rows)
@@ -296,6 +306,7 @@ class DecodeRoundLog:
         Idempotent: outside a round it is two branches and a flush.
         """
         t0 = time.perf_counter_ns()
+        self.host_cost.on_round_end(mono=t0 / 1e9)
         self._retire_open()
         self.flush()
         self._overhead_ns += time.perf_counter_ns() - t0
@@ -515,6 +526,7 @@ class DecodeRoundLog:
                 families={name: v[0] for name, v in family_acc.items()},
                 graphed=graphed_fwd == len(results),
                 now_mono=time.perf_counter(),
+                host=self.host_cost.round_host(acc.round_id),
             )
         self._maybe_report_overhead()
 

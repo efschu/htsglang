@@ -545,6 +545,13 @@ class Envs:
     # inside the verify graph; its cold-page faults otherwise sit in TP0's
     # ``compute``. Debug instrumentation, per rank env (set it in group D).
     SGLANG_DEBUG_DECODE_PLE_WAIT = EnvBool(False)
+    # DECODE/PP HOST PERIOD (fnFL2 H49, scheduler_components/host_round_cost.py):
+    # every N decode rounds a DECODE-HOST-PERIOD line (host share of the
+    # round: HiCache poll, its CPU all_reduce, result sync, the rest), every N
+    # synced PP chunks a PP-HOST-PERIOD line (d2h sync wait vs host work).
+    # perf_counter around existing calls only; 0 = no line.
+    SGLANG_DEBUG_DECODE_HOST_PERIOD = EnvInt(64)
+    SGLANG_DEBUG_PP_HOST_PERIOD = EnvInt(8)
     # LRU_WARM_FROM_HANDOFF (H29b): after rearm_after_wake the free LRU rows
     # of every pool layer are filled with P's most-routed experts of the last
     # LRU_WARM_TOKENS prompt tokens (no new VRAM: only rows the reinit left

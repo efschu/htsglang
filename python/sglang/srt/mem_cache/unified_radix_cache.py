@@ -50,6 +50,9 @@ from sglang.srt.mem_cache.common import (
     uniform_host_floor_active,
 )
 from sglang.srt.mem_cache import hicache_write_path
+from sglang.srt.managers.scheduler_components.host_round_cost import (
+    COUNTERS as _HOST_COST,
+)
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_collective import (
     COLLECTIVE_POLL_MAX_S,
@@ -807,6 +810,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return [int(v) for v in tensor.tolist()]
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op, label: str = "hicache"):
+        _h49_t0 = time.perf_counter()  # fnFL2 H49: hc_allreduce_ms of the round
         reduced = False
         for name, group in (
             ("attn_cp", self.attn_cp_group),
@@ -827,6 +831,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 ),
                 f"{label}/all_reduce/tp",
             )
+            reduced = True
+        if reduced:
+            _HOST_COST.ar_ms += (time.perf_counter() - _h49_t0) * 1000.0
+            _HOST_COST.ar_n += 1
 
     def _hicache_prefetch_symmetric(self) -> bool:
         """Uneven-DCP (a non-uniform token vector installed) makes the per-rank
@@ -3480,28 +3488,40 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """xsn338: publish the finished request's (and every other unbacked)
         node NOW -- parents first, bounded, the sweep's own pin budget -- instead
         of waiting for a PP bubble or the sleep flush (weg2.retain_publish)."""
+        _h49_retain_ms = None
         try:
-            from sglang.srt.weg2 import retain_publish as _rp
-            if not _rp.publish_at_retain_on() or not self.enable_storage:
-                return
-            _t0 = time.perf_counter()
-            # xsn344: the finished request's OWN chain first (parents first),
-            # then the rest -- with a budget the BFS from the root spent it on
-            # older nodes and D's dormant read of this request found half.
-            first = self._weg2_chain_nodes(radix_key) if radix_key is not None else []
-            self._weg2_tag_retain_chain(first, str(req.rid))
-            stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue(),
-                                                clock=_rp.SweepClock(_rp.budget_s()),
-                                                first=first) or {}
-            stats["chain"] = len(first)
-            n = getattr(self, "_weg2_retain_publish_n", 0) + 1
-            self._weg2_retain_publish_n = n
-            if n <= 16 or n % 64 == 0:
-                logger.info("WEG2 RETAIN-PUBLISH rid=%s %s ms=%.0f (n=%d)", str(getattr(req, "rid", "?"))[:12],
-                            stats, (time.perf_counter() - _t0) * 1000.0, n)
-            self._weg2_log_rid_anchors(str(req.rid), first)
-        except Exception as exc:  # noqa: BLE001 -- a publisher never takes the retain down
-            logger.warning("WEG2 RETAIN-PUBLISH raised %s: %s", type(exc).__name__, exc)
+            try:
+                from sglang.srt.weg2 import retain_publish as _rp
+                if not _rp.publish_at_retain_on() or not self.enable_storage:
+                    return
+                _t0 = time.perf_counter()
+                # xsn344: the finished request's OWN chain first (parents first),
+                # then the rest -- with a budget the BFS from the root spent it on
+                # older nodes and D's dormant read of this request found half.
+                first = self._weg2_chain_nodes(radix_key) if radix_key is not None else []
+                self._weg2_tag_retain_chain(first, str(req.rid))
+                stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue(),
+                                                    clock=_rp.SweepClock(_rp.budget_s()),
+                                                    first=first) or {}
+                stats["chain"] = len(first)
+                n = getattr(self, "_weg2_retain_publish_n", 0) + 1
+                self._weg2_retain_publish_n = n
+                _h49_retain_ms = (time.perf_counter() - _t0) * 1000.0
+                if n <= 16 or n % 64 == 0:
+                    logger.info("WEG2 RETAIN-PUBLISH rid=%s %s ms=%.0f (n=%d)", str(getattr(req, "rid", "?"))[:12],
+                                stats, (time.perf_counter() - _t0) * 1000.0, n)
+                self._weg2_log_rid_anchors(str(req.rid), first)
+            except Exception as exc:  # noqa: BLE001 -- a publisher never takes the retain down
+                logger.warning("WEG2 RETAIN-PUBLISH raised %s: %s", type(exc).__name__, exc)
+        finally:
+            # fnFL2 H49: the request's publish sum (its chunks + this retain).
+            try:
+                from sglang.srt.weg2 import publish_cost as _pc
+                _line = _pc.LEDGER.close(str(getattr(req, "rid", "?")), retain_ms=_h49_retain_ms)
+                if _line is not None:
+                    logger.info("%s", _line)
+            except Exception:  # noqa: BLE001 -- an instrument never takes the retain down
+                pass
 
     def _weg2_tag_retain_chain(self, chain, rid: str) -> None:
         """H19: the finished request owns its final node and its END-ANCHOR
@@ -3586,6 +3606,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 logger.info("WEG2 CHUNK-PUBLISH rid=%s chain=%d %s (n=%d)", str(getattr(req, "rid", "?"))[:12],
                             len(first), stats, n)
                 logger.info("%s", h2_line)
+            # fnFL2 H49: every chunk, with its budget and its request's sum.
+            from sglang.srt.weg2 import publish_cost as _pc
+            logger.info("%s", _pc.LEDGER.note_chunk(
+                rid=str(getattr(req, "rid", "?")), ms=h2.wall_ms,
+                budget_ms=_rp.chunk_budget_s() * 1000.0, stopped=stats.get("stopped"),
+                issued=int(stats.get("issued", 0) or 0), parts=_pc.format_parts(h2)))
         except Exception as exc:  # noqa: BLE001 -- a publisher never takes the chunk down
             logger.warning("WEG2 CHUNK-PUBLISH raised %s: %s", type(exc).__name__, exc)
 
@@ -6508,11 +6534,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             local_qsize_list,
             dtype=torch.int,
         )
+        _h49_t0 = time.perf_counter()
         self._all_reduce_attn_groups(
             qsizes,
             torch.distributed.ReduceOp.MIN,
             label="drain_storage_control_queues",
         )
+        _HOST_COST.drain_ar_ms += (time.perf_counter() - _h49_t0) * 1000.0
         qsize_list = list(map(int, qsizes.tolist()))
         n_revoke, n_backup, n_release = qsize_list[:3]
         # xsn332: the release drain after a wake carried the whole dormant
@@ -7409,6 +7437,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        # fnFL2 H49 (host_round_cost.py): wall of this poll and its parts,
+        # perf_counter around the existing calls only (a poll that raises is
+        # not counted -- it ends the round anyway).
+        _h49_t0 = time.perf_counter()
         # #1028 ROUND CENSUS -- the instrument that decides whether a per-ROUND
         # carrier is viable at all, taken BEFORE any such carrier is built.
         #
@@ -7462,16 +7494,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             pass
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
+        _h49_t = time.perf_counter()
         self.writing_check()
+        _h49_w = time.perf_counter()
         self.loading_check()
+        _h49_l = time.perf_counter()
+        _HOST_COST.writing_ms += (_h49_w - _h49_t) * 1000.0
+        _HOST_COST.loading_ms += (_h49_l - _h49_w) * 1000.0
         if self._pin_trace_every:
             self._emit_pin_trace()
         if self.enable_storage:
+            _h49_t = time.perf_counter()
             self.drain_storage_control_queues()
+            _HOST_COST.drain_ms += (time.perf_counter() - _h49_t) * 1000.0
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+        _HOST_COST.hc_ms += (time.perf_counter() - _h49_t0) * 1000.0
+        _HOST_COST.hc_calls += 1
 
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""

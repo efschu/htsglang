@@ -72,6 +72,7 @@ from sglang.srt.managers.pp_stash_disposition import (
     stash_keys_with_disposition,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch, release_req
+from sglang.srt.managers.scheduler_components.host_round_cost import pp_host_period
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
@@ -5197,6 +5198,10 @@ class SchedulerPPMixin:
                         self, "_pp_launched_batches", {}
                     )
                     self._pp_launched_batches[mb_id] = cur_batch
+                    # fnFL2 H49: PP-HOST-PERIOD host_work ends at this launch.
+                    _h49_php = pp_host_period()
+                    if _h49_php.on:
+                        _h49_php.note_launch(time.perf_counter())
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         cur_batch,
@@ -5213,6 +5218,7 @@ class SchedulerPPMixin:
                     # records no duration; the gap is still measured at
                     # the next `begin`, this only classifies it.
                     self._pp_bubble_note_no_batch()
+                    pp_host_period().note_no_batch()  # fnFL2 H49: starved, not timed
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -5223,7 +5229,16 @@ class SchedulerPPMixin:
                 if self.mbs[next_mb_id] is not None:
                     # #1002d: a declined output leaves this unset by design.
                     if d2h_event is not None:
+                        # fnFL2 H49: PP-HOST-PERIOD sync_wait (timing only).
+                        _h49_t0 = time.perf_counter()
                         d2h_event.synchronize()
+                        _h49_php = pp_host_period()
+                        if _h49_php.on:
+                            _h49_php.note_sync(
+                                stage=self.pp_rank,
+                                entry=_h49_t0,
+                                exit=time.perf_counter(),
+                            )
                     # #1009: THE OTHER HALF OF THE PRECONDITION. `self.mbs[
                     # next_mb_id] is not None` asks whether the slot HOLDS a
                     # batch; it does not ask whether that batch has RUN. On a

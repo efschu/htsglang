@@ -26,6 +26,11 @@ arms on the first pass after the wake, i.e. after the extend was launched):
   (``ple.wait``, only under SGLANG_DEBUG_DECODE_PLE_WAIT, else ``-``); it is
   part of ``gpu_ms`` and, when present, no longer part of ``compute_ms``;
 * ``graph`` -- every forward of the round replayed a captured graph;
+* ``host_ms`` / ``hicache_ms`` / ``hc_allreduce_ms`` -- fnFL2 H49
+  (host_round_cost.py): the HOST side of the same interval ``wall_ms``
+  prices -- wall minus the overlap loop's result sync, the HiCache poll
+  (``check_hicache_events``) and every HiCache CPU collective in it; ``-``
+  when the round's host interval is unknown (never a fabricated 0.0);
 * ``cold`` -- the largest single term of the round (``compute`` when the
   round is compute-bound, i.e. stationary on this form; ``pool.fetch`` when
   the expert pool missed; ``eager`` when a forward did not replay a graph;
@@ -74,12 +79,18 @@ class RoundCost(msgspec.Struct, frozen=True, kw_only=True):
     #: fnFL2 H35: ``ple.wait`` of the round; None when the family was not
     #: recorded (switch off) -- printed ``-``, never a fabricated 0.0.
     ple_ms: Optional[float] = None
+    #: fnFL2 H49: the round's host interval (host_round_cost.RoundHost);
+    #: None when unknown -- printed ``-``.
+    host_ms: Optional[float] = None
+    hicache_ms: Optional[float] = None
+    hc_allreduce_ms: Optional[float] = None
 
     def line(self) -> str:
         return (
             "DECODE-ROUND-COST n=%d round=%d rank=%d gpu_ms=%.1f compute_ms=%s "
             "fetch_ms=%.1f allreduce_ms=%.1f wall_ms=%.1f since_wake_ms=%s "
-            "graph=%s cold=%s ple_ms=%s"
+            "graph=%s cold=%s ple_ms=%s host_ms=%s hicache_ms=%s "
+            "hc_allreduce_ms=%s"
             % (
                 self.n,
                 self.round_id,
@@ -93,8 +104,15 @@ class RoundCost(msgspec.Struct, frozen=True, kw_only=True):
                 "yes" if self.graphed else "no",
                 self.cold,
                 "-" if self.ple_ms is None else "%.1f" % self.ple_ms,
+                _opt(self.host_ms),
+                _opt(self.hicache_ms),
+                _opt(self.hc_allreduce_ms),
             )
         )
+
+
+def _opt(v: Optional[float]) -> str:
+    return "-" if v is None else "%.1f" % v
 
 
 def fold_families(families: Dict[str, float]) -> Dict[str, float]:
@@ -160,6 +178,7 @@ class WakeRoundCensus:
         families: Dict[str, float],
         graphed: bool,
         now_mono: float,
+        host=None,
     ) -> Optional[RoundCost]:
         """Price one emitted round if it is among the first ROUNDS opened
         after the arm; log and return it, else None."""
@@ -179,6 +198,7 @@ class WakeRoundCensus:
             families=families,
             graphed=graphed,
             now_mono=now_mono,
+            host=host,
         )
         logger.info(cost.line())
         # Rounds are emitted in order; once position ROUNDS is priced the
@@ -206,6 +226,7 @@ class WakeRoundCensus:
         families: Dict[str, float],
         graphed: bool,
         now_mono: float,
+        host=None,
     ) -> RoundCost:
         folded = fold_families(families)
         end = self._next_open(round_id)
@@ -226,4 +247,7 @@ class WakeRoundCensus:
             graphed=bool(graphed),
             cold=cold_term(graphed=graphed, compute_ms=compute_ms, folded=folded),
             ple_ms=folded.get(PLE_WAIT_FAMILY),
+            host_ms=None if host is None else float(host.host_ms),
+            hicache_ms=None if host is None else float(host.hicache_ms),
+            hc_allreduce_ms=None if host is None else float(host.hc_allreduce_ms),
         )
