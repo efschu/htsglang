@@ -283,6 +283,102 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertFalse(adapted.require_reasoning)
 
+    def test_default_chat_template_kwargs_applied_when_request_unset(self):
+        """#29579 (upstream test)."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"enable_thinking": False}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertIs(kwargs["enable_thinking"], False)
+
+    def test_default_chat_template_kwargs_overridden_per_request(self):
+        """#29579 (upstream test)."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"enable_thinking": False}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            chat_template_kwargs={"enable_thinking": True},
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertIs(kwargs["enable_thinking"], True)
+
+    def test_default_chat_template_kwargs_mirrors_reasoning_effort(self):
+        """#29579 (upstream test)."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"reasoning_effort": "high"}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertEqual(req.reasoning_effort, "high")
+
+    def test_default_chat_template_kwargs_visible_to_reasoning_detection(self):
+        """#29579 semantics in this tree: a server default that disables
+        thinking must reach _get_reasoning_from_request too. Before the fold
+        the template rendered without thinking while the detection still read
+        an empty request and forced reasoning on, which routes the whole answer
+        into reasoning_content."""
+        self.template_manager.reasoning_config = None
+        self.chat.reasoning_parser = "qwen3"
+        self.chat._reasoning_detector = Mock(reasoning_default="enable_thinking")
+        self.chat.default_chat_template_kwargs = {"enable_thinking": False}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+        self.chat._apply_default_chat_template_kwargs(req)
+
+        self.assertEqual(req.chat_template_kwargs, {"enable_thinking": False})
+        self.assertFalse(self.chat._get_reasoning_from_request(req))
+
+    def test_default_reasoning_effort_does_not_beat_explicit_request_effort(self):
+        """Fork precedence (merge_chat_template_kwargs) is kept: an explicit
+        request.reasoning_effort outranks a server-default reasoning_effort,
+        both on the request and in the rendered template kwargs."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {
+            "reasoning_effort": "high",
+            "preserve_thinking": True,
+        }
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            reasoning_effort="low",
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertEqual(req.reasoning_effort, "low")
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(kwargs["reasoning_effort"], "low")
+        self.assertIs(kwargs["preserve_thinking"], True)
+
     def test_kimi_tool_call_keeps_template_default_thinking(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
