@@ -18305,6 +18305,8 @@ class Scheduler(
         if n >= 8:
             self._weg2_post_wake_pass_n = None
             return
+        if n == 0:
+            self._weg2_arm_wake_round_census()
         self._weg2_post_wake_pass_n = n + 1
         import time as _t
         now = _t.perf_counter()
@@ -18344,6 +18346,13 @@ class Scheduler(
             _pt_read(self, "_1474_prefetch_ms"), _pt_read(self, "_1475_process_input_ms"),
             _g[0], _g[1], _g[2], float(getattr(self, '_weg2_ready_ms', -1.0) or -1.0), _addreq, _lb_ms, _lb_n, _initr,
         )
+
+    def _weg2_arm_wake_round_census(self) -> None:
+        """fnFL2 H23: the first pass after the wake arms DECODE-ROUND-COST
+        (decode_round_log / wake_round_census) for the next decode rounds."""
+        drl = self.metrics_reporter.decode_round_log
+        if drl is not None:
+            drl.arm_wake_census(wake_mono=self._weg2_last_wake_t)
 
     def _weg2_intake_stall_observe(self, req, adder, note: str = "",
                                    immediate: bool = False) -> None:

@@ -169,6 +169,10 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple
 
+from sglang.srt.managers.scheduler_components.wake_round_census import (
+    WakeRoundCensus,
+)
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["DecodeRoundLog", "RoundAcc"]
@@ -230,6 +234,14 @@ class DecodeRoundLog:
         self.last_compute_ms: Optional[float] = None
         self.last_split_known: bool = False
         self.last_seq: int = 0
+        #: fnFL2 H23: DECODE-ROUND-COST for the first rounds after a Weg-2
+        #: wake. Inert until ``arm_wake_census``.
+        self.wake_census = WakeRoundCensus(rank=self.rank)
+
+    def arm_wake_census(self, *, wake_mono: Optional[float]) -> None:
+        """fnFL2 H23: price the next decode rounds (the wake happened at
+        ``wake_mono``, a ``time.perf_counter`` reading, or None if unknown)."""
+        self.wake_census.arm(wake_mono=wake_mono)
 
     # -- round boundary --------------------------------------------------
 
@@ -241,6 +253,9 @@ class DecodeRoundLog:
         forwards of round N.
         """
         t0 = time.perf_counter_ns()
+        if self.wake_census.armed:
+            # before the drain: the round it may price ends at this open
+            self.wake_census.note_open(round_id=round_id, mono=t0 / 1e9)
         self._retire_open()
         self.flush()
         self._open = RoundAcc(round_id, bs, rows)
@@ -469,6 +484,15 @@ class DecodeRoundLog:
 
         self._overhead_rounds += 1
         self._overhead_gpu_ms += round_ms
+        if self.wake_census.armed:
+            self.wake_census.on_round(
+                round_id=acc.round_id,
+                gpu_ms=round_ms,
+                compute_ms=self.last_compute_ms,
+                families={name: v[0] for name, v in family_acc.items()},
+                graphed=graphed_fwd == len(results),
+                now_mono=time.perf_counter(),
+            )
         self._maybe_report_overhead()
 
     def _maybe_report_overhead(self) -> None:
