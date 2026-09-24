@@ -214,6 +214,46 @@ FORM_GATES: Dict[str, Dict[str, Tuple[str, ...]]] = {
 }
 
 
+#: DEFAULT-ON switches of SHARED (form-independent) code that arrived with the
+#: Next-Flash line (git diff eb5d04453f 1e49837c84 -- environ.py) and were
+#: proven on the metal only by MoE boots. Not switched per form -- there is no
+#: evidence against them on the 27B, only no evidence FOR them -- but a boot of
+#: another form names them, so a first-flip failure has its candidates and
+#: their off-switches in the boot's own log (FORM_AXES_INVENTORY H5).
+#: env -> (default, where it acts, the value that switches it off)
+NF_LINE_DEFAULT_ON: Dict[str, Tuple[str, str, str]] = {
+    "SGLANG_WEG2_SLEEP_RELEASE_LMEM": ("1", "weight_updater sleep: LMEM park", "0"),
+    "SGLANG_WEG2_TAG_PLAN_PREWARM": ("1", "weight_updater: tag-plan prewarm", "0"),
+    "SGLANG_WEG2_WAKE_LANE_TURNS": ("1", "weight_updater wake: lane turns", "0"),
+    "SGLANG_WEG2_WAKE_COLLECT_SPARE": ("1", "weight_updater wake: spare collect worker", "0"),
+    "SGLANG_WEG2_FLIP_ORDER_CREDIT": ("1", "front: credit-ordered flip", "0"),
+    "SGLANG_WEG2_CREDIT_LIVE_STAGING": ("1", "memory saver: live credit staging", "0"),
+    "SGLANG_OPT_HICACHE_DEVICE_INDEX_WRITE": ("1", "hicache write path: device index write", "0"),
+    "SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": ("-1", "unified radix: mamba arena rid anchors (auto)", "0"),
+}
+#: The forms those switches were proven on.
+NF_LINE_PROVEN = {"arch": ("moe",)}
+
+
+def first_use_line(form: Optional[Weg2Form], environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """The one line naming the NF-line default-on switches THIS form runs
+    without a metal proof (None for a form they were proven on)."""
+    if form is None or form.matches(**NF_LINE_PROVEN):
+        return None
+    env = os.environ if environ is None else environ
+    parts = []
+    for k, (default, where, off) in NF_LINE_DEFAULT_ON.items():
+        v = env.get(k)
+        if v is not None and str(v).strip() == off:
+            continue
+        parts.append(f"{k}={v if v is not None else default}{'' if v is not None else '(default)'} [{where}; off: {off}]")
+    if not parts:
+        return None
+    return (f"{FORM_LINE_TAG} FIRST-USE (form {form.describe()}): {len(parts)} default-on switch(es) "
+            f"of the Next-Flash line run here without a metal proof on this form -- "
+            + "; ".join(parts))
+
+
 def gate_applies(name: str, form: Optional[Weg2Form]) -> bool:
     if form is None:
         return True

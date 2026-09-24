@@ -13259,6 +13259,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(boot_form.line())
         log("#114 P-PREFILL-TRANSIENT (form " + boot_form.describe() + "): "
             + p_prefill_transient_for(boot_form)[1])
+        _first_use = weg2_form.first_use_line(boot_form)
+        if _first_use:
+            log(_first_use)
     if dirty and not dry:
         raise Weg2LaunchRefused("tree is not clean -- boot from a COMMITTED tip only")
     py = f"{ns.venv}/bin/python"

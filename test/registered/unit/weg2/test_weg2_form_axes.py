@@ -325,6 +325,29 @@ class TestGateDeclarations(_Models):
         self.assertIn("#107 WEG2-EXPERT-MAP SKIPPED (form arch=dense", lines[0])
 
 
+class TestFirstUse(_Models):
+    def test_dense_names_the_nf_line_switches(self):
+        ns, form = _resolve(_q27_words(self.dense))
+        line = F.first_use_line(form, {})
+        self.assertIn("FIRST-USE", line)
+        for k in F.NF_LINE_DEFAULT_ON:
+            self.assertIn(k, line)
+        # a switch the arm turned off is not a first use
+        line2 = F.first_use_line(form, {"SGLANG_WEG2_SLEEP_RELEASE_LMEM": "0"})
+        self.assertNotIn("SGLANG_WEG2_SLEEP_RELEASE_LMEM", line2)
+
+    def test_moe_and_no_form_print_nothing(self):
+        ns, form = _resolve(_nf_words(self.moe))
+        self.assertIsNone(F.first_use_line(form, {}))
+        self.assertIsNone(F.first_use_line(None, {}))
+
+    def test_switches_exist_with_their_defaults(self):
+        from sglang.srt.environ import envs
+        for k, (default, _where, _off) in F.NF_LINE_DEFAULT_ON.items():
+            got = getattr(envs, k).default
+            self.assertEqual(str(int(got) if isinstance(got, bool) else got), default, k)
+
+
 def _front_log(ev, tag, tip, stamp, model):
     path = os.path.join(ev, f"boot_weg2_{tag}_{tip}_{stamp}.front.log")
     with open(path, "w") as f:
