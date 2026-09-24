@@ -24,6 +24,7 @@ from typing import Optional
 import msgspec
 
 from sglang.srt.environ import envs
+from sglang.srt.layers import host_contention
 
 logger = logging.getLogger(__name__)
 
@@ -70,3 +71,106 @@ def log_ple_gather(rows: int, zero_rows: int, seconds: float, workers: int) -> N
         seconds * 1000.0,
         workers,
     )
+    _log_host_period(rows)
+
+
+class _HostPeriod(msgspec.Struct):
+    """The host snapshot taken at the previous PLE gather of this process."""
+
+    last: Optional[host_contention.HostSample] = None
+
+
+_PERIOD = _HostPeriod()
+
+
+def format_ple_host_period(rows: int, host: "host_contention.HostDelta") -> str:
+    """The PLE-HOST-PERIOD line (fnFL2 H38): the host between the previous
+    PLE gather of this process and this one -- on PP0 one chunk period. With
+    PLE-PREFETCH (H32) the next chunk's rows are read in exactly this window,
+    by worker processes the gather's own line does not see; the serial gather
+    (PLE-GATHER-HOST) is split finer. The first period of a request spans the
+    idle time since the previous request: read period_ms."""
+    return (
+        "PLE-HOST-PERIOD rows=%d period_ms=%.1f host_busy_cores=%.2f "
+        "self_cores=%.2f foreign_cores=%.2f psi_cpu_ms=%.1f psi_io_ms=%.1f "
+        "arc_hits=%d arc_misses=%d (host since the previous PLE gather of this "
+        "process; foreign = host CPU minus this process)"
+        % (
+            rows,
+            host.wall_ms,
+            host.host_busy_cores,
+            host.self_cores,
+            host.foreign_cores,
+            host.psi_cpu_ms,
+            host.psi_io_ms,
+            host.arc_hits,
+            host.arc_misses,
+        )
+    )
+
+
+def _log_host_period(rows: int) -> None:
+    now = host_contention.sample()
+    last, _PERIOD.last = _PERIOD.last, now
+    if last is not None:
+        logger.info("%s", format_ple_host_period(rows, host_contention.delta(last, now)))
+
+
+def format_ple_gather_host(
+    rows: int,
+    wall_ms: float,
+    prep_ms: float,
+    read_ms: float,
+    copy_ms: float,
+    split,
+    host,
+) -> str:
+    """The PLE-GATHER-HOST line (fnFL2 H38): the host split of one
+    PLE-GATHER-PREFILL wall. ``split`` is a host_contention.ThreadSplit over
+    the worker tasks, ``host`` a host_contention.HostDelta over the gather.
+
+    prep_ms  = ids to host (a stream sync) + in-range/sort/tolist
+    read_ms  = the main thread's wait for the worker tasks
+    copy_ms  = staging -> device enqueue (+ the reshape copy)
+    thr_*    = summed over the worker tasks: on a core / runnable without a
+               core (CPU contention) / neither (IO or the GIL)
+    foreign_cores = host CPU busy minus this process, averaged over the gather
+    arc_*    = ZFS demand-data hits/misses on the whole host meanwhile
+    """
+    blocked = split.blocked_ns
+    return (
+        "PLE-GATHER-HOST rows=%d wall_ms=%.1f prep_ms=%.1f read_ms=%.1f "
+        "copy_ms=%.1f tasks=%d thr_wall_ms=%.1f thr_cpu_ms=%.1f "
+        "thr_runq_ms=%.1f thr_blocked_ms=%.1f lead=%s host_busy_cores=%.2f "
+        "self_cores=%.2f foreign_cores=%.2f psi_cpu_ms=%.1f psi_io_ms=%.1f "
+        "arc_hits=%d arc_misses=%d (host split of PLE-GATHER-PREFILL: runq = "
+        "runnable without a core, blocked = IO or GIL, foreign = host CPU "
+        "minus this process)"
+        % (
+            rows,
+            wall_ms,
+            prep_ms,
+            read_ms,
+            copy_ms,
+            split.tasks,
+            split.wall_ns / 1e6,
+            split.cpu_ns / 1e6,
+            split.runq_ns / 1e6,
+            blocked / 1e6 if blocked >= 0 else -1.0,
+            split.lead(),
+            host.host_busy_cores,
+            host.self_cores,
+            host.foreign_cores,
+            host.psi_cpu_ms,
+            host.psi_io_ms,
+            host.arc_hits,
+            host.arc_misses,
+        )
+    )
+
+
+def log_ple_gather_host(*args) -> None:
+    """Emit PLE-GATHER-HOST while the timing switch is on (see the formatter)."""
+    if not timing_on():
+        return
+    logger.info("%s", format_ple_gather_host(*args))

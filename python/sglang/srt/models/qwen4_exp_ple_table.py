@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import functools
 import logging
 import os
 import re
@@ -41,7 +42,12 @@ from typing import Optional, Sequence, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.prefill_timing import log_ple_gather
+from sglang.srt.layers import host_contention
+from sglang.srt.layers.prefill_timing import (
+    log_ple_gather,
+    log_ple_gather_host,
+    timing_on,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -329,7 +335,12 @@ class PleCheckpointPreadGather:
         """Fill ``out`` ([n, dim] bf16) with the rows of ``flat_ids``."""
         import time as _time
 
+        # fnFL2 H38: the host split (PLE-GATHER-HOST) rides the timing switch
+        timed = timing_on()
+        host0 = host_contention.sample() if timed else None
         t0 = _time.monotonic()
+        t_read0 = t_read1 = t0
+        split = host_contention.ThreadSplit()
         ids = flat_ids.detach().reshape(-1).cpu().to(torch.int64)
         n = int(ids.numel())
         dim = self._table.embedding_dim
@@ -366,23 +377,42 @@ class PleCheckpointPreadGather:
             offs_l = offs[order].tolist()
             buf = memoryview(staging.view(torch.uint8).numpy().reshape(-1))
             chunk = max(256, (nv + self._workers - 1) // self._workers)
+            # timed: every task also returns its (wall, on-CPU, run-queue) ns
+            task = functools.partial(host_contention.timed_task, self._read_rows) if timed else self._read_rows
+            t_read0 = _time.monotonic()
             futs = [
                 self._pool.submit(
-                    self._read_rows, buf, self._row_bytes, rows[lo : lo + chunk], fds_l[lo : lo + chunk], offs_l[lo : lo + chunk]
+                    task, buf, self._row_bytes, rows[lo : lo + chunk], fds_l[lo : lo + chunk], offs_l[lo : lo + chunk]
                 )
                 for lo in range(0, nv, chunk)
             ]
             for f in futs:
-                f.result()
+                r = f.result()
+                if timed:
+                    split.add(*r)
+            t_read1 = _time.monotonic()
+        else:
+            t_read0 = t_read1 = _time.monotonic()
         flat_out.copy_(staging, non_blocking=out.is_cuda)
         if flat_out.data_ptr() != out.data_ptr():
             out.copy_(flat_out.reshape(out.shape))
-        dt = _time.monotonic() - t0
+        t_end = _time.monotonic()
+        dt = t_end - t0
         self.stats["gathers"] += 1
         self.stats["rows"] += n
         self.stats["zero_rows"] += n - nv
         self.stats["seconds"] += dt
         log_ple_gather(n, n - nv, dt, self._workers)
+        if timed:
+            log_ple_gather_host(
+                n,
+                dt * 1000.0,
+                (t_read0 - t0) * 1000.0,
+                (t_read1 - t_read0) * 1000.0,
+                (t_end - t_read1) * 1000.0,
+                split,
+                host_contention.delta(host0, host_contention.sample()),
+            )
         return out
 
     def close(self) -> None:
