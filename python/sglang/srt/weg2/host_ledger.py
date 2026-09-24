@@ -131,7 +131,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 GIB = float(2**30)
 GB = 1e9
@@ -2756,7 +2756,9 @@ def record_run_residual_gib(
 
 
 def run_origin_gib(
-    cg_nonreclaim_gib: Optional[float], record: Optional[Dict[str, dict]] = None
+    cg_nonreclaim_gib: Optional[float],
+    record: Optional[Dict[str, dict]] = None,
+    identity_refused: Sequence[str] = (),
 ) -> Tuple[Optional[float], str]:
     """The origin the RUN PEAK is predicted from, and where it came from.
 
@@ -2961,6 +2963,21 @@ def run_origin_gib(
             "(#1350e). The dk7 stand-in is NOT used here -- it answers 'no record "
             "at all', not 'the record was refused', and at 24.50 GiB it would be a "
             "worse origin than the reading just rejected"
+        )
+    elif identity_refused:
+        # 27B line (24.09.): the sidecar HOLDS run-moment samples, but none of
+        # this boot's checkpoint and line -- every one was refused by the
+        # calibration identity (weg2/line_identity.py). That is the #1350e
+        # case, not the empty-sidecar one: a REFUSED sample is not "no
+        # sample", and the dk7 stand-in (24.50 GiB, another boot of another
+        # era) is not a better origin than this box's own launch reading.
+        floor = cg_nonreclaim_gib
+        floor_src = (
+            "no run-moment residual of this checkpoint and line survives: "
+            + ", ".join(identity_refused)
+            + " refused by the calibration identity, so the launch-moment reading "
+            "stands alone (#1350e rule). The dk7 stand-in answers 'no record at "
+            "all', not 'the record was refused'"
         )
     else:
         floor = dk7_run_residual_gib()
@@ -3808,6 +3825,7 @@ def price(
     # arm and every pre-existing caller, so those are byte-identical.
     s_gb_d: Optional[int] = None,
     measured_record: Optional[Dict[str, dict]] = None,
+    identity_refused: Sequence[str] = (),
     xchg_bounce_host_bytes: int = 0,
     # #1350 THE FLIP RATCHET, HANDED IN RATHER THAN RESOLVED HERE. Same shape
     # as `xchg_bounce_host_bytes` and for the same reason: the ONE call site
@@ -4034,6 +4052,7 @@ def price(
     origin_gib, origin_source = run_origin_gib(
         None if cg_nonreclaim_bytes is None else cg_nonreclaim_bytes / GIB,
         measured_record,
+        identity_refused=identity_refused,
     )
     arm = Arm(
         s_gb=s_gb,
@@ -4653,7 +4672,9 @@ def format_dormant_image(rec: Dict[str, object]) -> str:
 
 
 def read_measured_record(
-    path: str, boot_tag: Optional[str] = None
+    path: str,
+    boot_tag: Optional[str] = None,
+    accept: Optional[Callable[[dict], bool]] = None,
 ) -> Dict[str, dict]:
     """The newest entry per group from the sidecar, or ``{}``.
 
@@ -4714,6 +4735,13 @@ def read_measured_record(
         if not g:
             continue
         if boot_tag is not None and str(e.get("boot_tag", "")) != boot_tag:
+            continue
+        # 27B line (24.09.): ``accept`` restricts the answer to samples of
+        # this boot's checkpoint AND line (weg2/line_identity.py) -- the
+        # sidecar is shared with the Next-Flash boots and the NF line's 27B
+        # boots, whose newest samples are not this line's measurements.
+        # None (every caller that does not pass it) keeps today's answer.
+        if accept is not None and not accept(e):
             continue
         if g not in out or str(e.get("at", "")) >= str(out[g].get("at", "")):
             out[g] = e
@@ -4834,7 +4862,9 @@ def cushion_headroom_gib(cushion_min_gib: Optional[float],
     return float(cushion_min_gib) - (float(bounce_now_gib) - float(bounce_then_gib))
 
 
-def flip_ratchet_candidates(path: str, form_key: str) -> List[Dict[str, object]]:
+def flip_ratchet_candidates(
+    path: str, form_key: str, accept: Optional[Callable[[dict], bool]] = None
+) -> List[Dict[str, object]]:
     """Every "FLIP" sidecar entry of the given FORM, in file order.
 
     #1378 Stage 2 order: NOT :func:`read_measured_record`, which collapses to
@@ -4867,12 +4897,16 @@ def flip_ratchet_candidates(path: str, form_key: str) -> List[Dict[str, object]]
             continue
         if e.get("cushion_min_gib") is None or e.get("xchg_bounce_gib") is None:
             continue
+        # 27B line: only this checkpoint's and this line's boots (see
+        # read_measured_record); None keeps every candidate of the form key.
+        if accept is not None and not accept(e):
+            continue
         out.append(e)
     return out
 
 
 def resolve_prior_cushion(
-    path: str, form_key: str
+    path: str, form_key: str, accept: Optional[Callable[[dict], bool]] = None
 ) -> Tuple[Optional[float], Optional[float], str]:
     """#1378 Stage 2: the PRIOR boot's own numbers, SELF-read from the
     sidecar -- no operator has to type them.
@@ -4892,7 +4926,7 @@ def resolve_prior_cushion(
     silent guess, and never a refusal: the caller's own "not measured" line
     is what an absent auto-resolution produces.
     """
-    candidates = flip_ratchet_candidates(path, form_key)
+    candidates = flip_ratchet_candidates(path, form_key, accept=accept)
     if not candidates:
         return None, None, (
             f"auto-resolve found no measured FLIP record of form_key="
@@ -5060,6 +5094,7 @@ def choose(
     # (order item 1: "kein stilles Verkleinern" -- but also no silent silence).
     d_cap_terms: Optional[Dict[str, float]] = None,
     measured_record: Optional[Dict[str, dict]] = None,
+    identity_refused: Sequence[str] = (),
     margin: Optional[Margin] = None,
     xchg_bounce_host_bytes: int = 0,
     # #1350: resolved by the caller (`resolve_flip_ratchet_gib`) and handed in,
@@ -5163,6 +5198,7 @@ def choose(
             cg_ceiling_bytes=cg_ceiling_bytes,
             s_gb_d=s_gb_d,
             measured_record=measured_record,
+            identity_refused=identity_refused,
             xchg_bounce_host_bytes=xchg_bounce_host_bytes,
             flip_ratchet=flip_ratchet,
             model_digest_want=model_digest_want,
@@ -5719,6 +5755,7 @@ def choose(
                         cg_ceiling_bytes=cg_ceiling_bytes, s_gb_d=sd,
                         ring_absent_by_design=ring_absent_by_design,
                         measured_record=measured_record,
+                        identity_refused=identity_refused,
                         # #1350: the cap advice must be priced by the SAME model
                         # the ladder was, or it would name a cap that only fits
                         # an arm the ledger no longer offers.

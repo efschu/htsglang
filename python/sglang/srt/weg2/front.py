@@ -1887,7 +1887,8 @@ class Front:
                  measured_record: str = "", commit: str = "",
                  ledger_arm: Optional[Dict[str, float]] = None,
                  admin_key_file: str = "",
-                 vision: str = VISION_MODE_OFF):
+                 vision: str = VISION_MODE_OFF,
+                 record_line: str = ""):
         # #1275: the key arrives as a PATH, never as an argv value. The groups
         # have no choice (`server_args` offers only `--admin-api-key`, so their
         # key is world-readable in /proc/<pid>/cmdline), but the front does, and
@@ -2080,6 +2081,13 @@ class Front:
         # and is therefore INTERLEAVED -- the sample says so, and only the
         # RssShmem instrument measures that group's image there.
         self.measured_record = measured_record
+        # 27B line (24.09.): the calibration identity the launcher resolved
+        # (weg2/line_identity.py, handed over as --record-line); this front's
+        # own record reader takes only this checkpoint's and this line's
+        # samples. Empty = every sample, as before.
+        from sglang.srt.weg2 import line_identity as _line_identity
+
+        self.record_line = _line_identity.parse_spec(record_line)
         self.commit = commit
         self.ledger_arm = dict(ledger_arm or {})
         self.dormant_image: Dict[str, dict] = {}
@@ -4321,7 +4329,9 @@ class Front:
         if not self.measured_record:
             return None, "no-sidecar"
         try:
-            rec = host_ledger.read_measured_record(self.measured_record)
+            rec = host_ledger.read_measured_record(
+                self.measured_record,
+                accept=self.record_line.accepts_sample if self.record_line is not None else None)
         except Exception:  # noqa: BLE001 - a gate must never break the flip
             return None, "unreadable"
         e = (rec or {}).get(str(group))
@@ -5851,6 +5861,10 @@ def main():
                          "and that level requires the admin key once one is configured. A path, "
                          "not a value, so the key does not appear in this process's argv too.")
     ap.add_argument("--commit", default="", help="#1233 fix 8: the tip this boot runs, stamped into every measurement")
+    ap.add_argument("--record-line", default="",
+                    help="27B line (24.09.): the calibration identity of this boot "
+                         "(weg2/line_identity.py spec) -- the record readers of this front take only "
+                         "samples of this checkpoint and this line. Empty = every sample.")
     ap.add_argument("--anon-preboot-bytes", type=int, default=0,
                     help="#1269 fix 3: cgroup memory.stat `anon` measured by the "
                          "launcher preflight BEFORE this boot existed. The only "
@@ -5891,7 +5905,8 @@ def main():
                   measured_record=args.measured_record, commit=args.commit,
                   ledger_arm=json.loads(args.ledger_arm) if args.ledger_arm else {},
                   admin_key_file=args.admin_key_file,
-                  vision=args.vision)
+                  vision=args.vision,
+                  record_line=args.record_line)
     # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
     # against. Kept from weg2/idle-anon-0908.
     if args.anon_preboot_bytes > 0:

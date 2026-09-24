@@ -75,6 +75,8 @@ from sglang.srt.weg2 import (
     DEFAULT_PP_ORDERED_CUT,
 )
 from sglang.srt.weg2 import admin_key as admin_key_mod
+# 27B line (24.09.): every measured source must be this checkpoint's AND this line's.
+from sglang.srt.weg2 import line_identity
 # Task #58: the arming variable's name comes from the module that READS it, so
 # the publisher and the reader cannot drift into two spellings of one key.
 from sglang.srt.weg2.vision_stage_boot import VISION_ENV as VISION_STAGE_ENV
@@ -6063,6 +6065,9 @@ def choose_host_ledger(
     # not know its own form gets the byte-identical pre-Stage-2 behaviour,
     # never a guess at what "this form" means.
     flip_ratchet_form_key: str = "",
+    # 27B line: the record samples this ledger may read (line_identity).
+    # None = every sample, as before (every caller that does not pass it).
+    record_accept: Optional[Callable[[dict], bool]] = None,
 
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
@@ -6128,7 +6133,17 @@ def choose_host_ledger(
     _record_path_resolved = (
         measured_record_path() if record_path is None else record_path
     )
-    record = host_ledger.read_measured_record(_record_path_resolved)
+    record = host_ledger.read_measured_record(_record_path_resolved, accept=record_accept)
+    # 27B line: the run-moment samples the identity REFUSED, named -- so an
+    # origin with no sample of this checkpoint and line is the launch reading
+    # (the #1350e rule for a refused sample), not the no-record dk7 stand-in.
+    _identity_refused: List[str] = []
+    if record_accept is not None:
+        for _g, _e in host_ledger.read_measured_record(_record_path_resolved).items():
+            if (isinstance(_e, dict) and _e.get("run_residual_gib") is not None
+                    and not record_accept(_e)):
+                _identity_refused.append(
+                    f"sample of boot {_e.get('boot_tag', '?')} (group {_g}, another checkpoint or line)")
     # #1378 Stage 2 (order): SELF-READ the prior boot's cushion from the same
     # sidecar `record` came from -- flags stay an OVERRIDE, never the only
     # path, so a boot that names nobody by hand still gets the gate. The
@@ -6141,7 +6156,7 @@ def choose_host_ledger(
             "override it")
     elif flip_ratchet_form_key:
         _auto_cushion, _auto_bounce, _auto_prov = host_ledger.resolve_prior_cushion(
-            _record_path_resolved, flip_ratchet_form_key)
+            _record_path_resolved, flip_ratchet_form_key, accept=record_accept)
     else:
         _auto_cushion, _auto_bounce, _auto_prov = None, None, (
             "auto-resolve skipped: caller passed no flip_ratchet_form_key")
@@ -6332,6 +6347,7 @@ def choose_host_ledger(
         cg_ceiling_source=cg_ceiling_source,
         cg_oom_kill=cg["oom_kill"],
         measured_record=record,
+        identity_refused=tuple(_identity_refused),
         # #1360: handed to the ONE place that computes the verdict, exactly as
         # every other arm property is. The launcher does not re-implement the
         # decision; it passes the operator's declaration down to it.
@@ -8332,7 +8348,9 @@ def read_pp_bubble(path: str) -> Optional[BubbleMeasurement]:
     )
 
 
-def newest_bubble_log(evidence_dir: str) -> Optional[str]:
+def newest_bubble_log(
+    evidence_dir: str, accept: Optional[Callable[[str], bool]] = None
+) -> Optional[str]:
     """Newest ``*.P.log`` in ``evidence_dir`` that actually CARRIES the line.
 
     Not simply the newest P log: a boot that died before its first bubble
@@ -8348,6 +8366,10 @@ def newest_bubble_log(evidence_dir: str) -> Optional[str]:
         return None
     paths = [os.path.join(evidence_dir, n) for n in names]
     for path in sorted(paths, key=lambda p: os.path.getmtime(p), reverse=True):
+        # 27B line: ``accept`` (line_identity) skips another checkpoint's or
+        # another line's log; None = every log, as before.
+        if accept is not None and not accept(path):
+            continue
         if read_pp_bubble(path) is not None:
             return path
     return None
@@ -8443,7 +8465,9 @@ def read_mean_prefill_prefix(path: str) -> Optional[Tuple[float, int, str]]:
     return (sum(prefixes) / float(len(prefixes)), len(prefixes), rank)
 
 
-def newest_prefill_census_log(evidence_dir: str) -> Optional[str]:
+def newest_prefill_census_log(
+    evidence_dir: str, accept: Optional[Callable[[str], bool]] = None
+) -> Optional[str]:
     """Newest ``*.P.log`` that actually CARRIES a prefill census.
 
     Same rule and the same reason as :func:`newest_bubble_log`: a boot that
@@ -8460,6 +8484,8 @@ def newest_prefill_census_log(evidence_dir: str) -> Optional[str]:
         key=lambda p: os.path.getmtime(p),
         reverse=True,
     ):
+        if accept is not None and not accept(path):
+            continue
         if read_mean_prefill_prefix(path) is not None:
             return path
     return None
@@ -9623,7 +9649,9 @@ def solve_p_cut(
     # attention/linear cost ratio moves by more than an order of magnitude
     # between 4,096 and 262,144 tokens of prefix, so "the optimal cut" is a
     # function of it and a table without it stated is a table about nothing.
-    design_src = ns.pp_cut_design_prefix_from or newest_prefill_census_log(EVIDENCE_DIR)
+    _line = getattr(ns, "weg2_line_id", None)
+    design_src = ns.pp_cut_design_prefix_from or newest_prefill_census_log(
+        EVIDENCE_DIR, accept=_line.accepts_log if _line is not None else None)
     census = read_mean_prefill_prefix(design_src) if design_src else None
     if ns.pp_cut_design_prefix_tokens is not None:
         design_prefix = int(ns.pp_cut_design_prefix_tokens)
@@ -11448,6 +11476,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     front_log = None if dry else f"{base}.front.log"
     log = Log(front_log)
     log(f"=== WEG2 BOOT tag={ns.tag} tree={tree} @ {tip} ({'DIRTY: ' + dirty[:200] if dirty else 'clean'}) stamp={stamp} dry={dry}")
+    # 27B line (user order 2026-09-24 11:4xZ, "getrennt von nf und separat
+    # fuers 27b"): THE CALIBRATION IDENTITY every reader of a measured source
+    # below applies -- the #1444 D residue record, the host-ledger record and
+    # its flip-ratchet cushion, the P logs the cut and the depth read, and
+    # (handed over as --record-line) the front's sleep-leg gate. Newest-first
+    # alone read Next-Flash boots and the NF line's 27B boots (xsn412-419).
+    line_id = line_identity.LineIdentity(
+        model=str(ns.model), repo=tree, head=tip or "HEAD", evidence_dir=EVIDENCE_DIR)
+    ns.weg2_line_id = line_id
+    log("WEG2-27B-LINE calibration identity: a measured source counts only when its boot ran "
+        + line_id.describe())
     if dirty and not dry:
         raise Weg2LaunchRefused("tree is not clean -- boot from a COMMITTED tip only")
     py = f"{ns.venv}/bin/python"
@@ -11609,9 +11648,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # object exists.
     # #1444: the MEASURED residue of the previous boot on this form wins over
     # the xsn14 constant; the constant is the fallback with a printed reason.
-    _dc_rec_d = host_ledger.read_measured_record(measured_record_path()).get("D")
+    # 27B line: only a record of THIS checkpoint and line (xsn418 died W19 on
+    # the Next-Flash boot fnFL2x144's 3080 residue, 768 vs a 27B D's 1404).
+    _dc_rec_d = host_ledger.read_measured_record(
+        measured_record_path(), accept=line_id.accepts_sample).get("D")
     _dc_from_record, _dc_record_prov = dc_residue_from_record(
         _dc_rec_d, cards, ns.weg2_weight_source)
+    if _dc_rec_d is None:
+        _dc_record_prov = ("no group-D dormant-image record of " + line_id.describe()
+                           + " -> constant")
     dc_expect_d = {
         c.uuid: (
             _dc_from_record[c.uuid] if _dc_from_record is not None
@@ -12152,6 +12197,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # plain equality filter) rather than raise, so the two producers are
             # kept to the one literal construction, not re-derived twice.
             flip_ratchet_form_key=f"wtags={len(weights_tags)}",
+            # 27B line: only this checkpoint's and this line's samples.
+            record_accept=line_id.accepts_sample,
             # #1362 [22-fix]: content digest, snapshot-independent. `None` (an
             # unreadable checkpoint) stays empty and the arm keeps the pre-#1362
             # behaviour rather than refusing on a digest it could not compute.
@@ -12406,7 +12453,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # the newest log in EVIDENCE_DIR that actually carries the instrument, else
     # no measurement at all and the depth is today's 0 -- printed, so the
     # absence is visible rather than inferred from a missing line.
-    bubble_src = ns.p_bubble_measured_from or newest_bubble_log(EVIDENCE_DIR)
+    bubble_src = ns.p_bubble_measured_from or newest_bubble_log(
+        EVIDENCE_DIR, accept=line_id.accepts_log)
     if ns.p_bubble_measured_from and read_pp_bubble(ns.p_bubble_measured_from) is None:
         raise Weg2LaunchRefused(
             f"W42 Weg2DepthUnfunded: --p-bubble-measured-from "
@@ -13132,6 +13180,11 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         "--idle-layout", idle_layout_front,
         "--drain-deadline-s", str(ns.drain_deadline_s),
     ]
+    # 27B line: the front's own record reader (the sleep-leg page-cache gate)
+    # takes the same calibration identity as the launcher's readers.
+    _line = getattr(ns, "weg2_line_id", None)
+    if _line is not None:
+        argv += ["--record-line", _line.spec()]
     # #1275: the front is handed the PATH, never the key. Its argv is as
     # world-readable as any other; the groups have no alternative (server_args
     # takes only --admin-api-key) but the front does, so it uses it.
