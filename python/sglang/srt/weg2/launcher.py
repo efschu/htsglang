@@ -11081,6 +11081,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="K8: which layout is awake at rest -- tp = group D (today's shape), "
                          "pp = group P. The front's idle guard always counts the requests P has "
                          "just prefilled, so resting on P loses no request.")
+    ap.add_argument("--d-short-drain-tokens", type=int, default=0,
+                    help="27B idle policy (b), passed to the front: while D is awake, a queued "
+                         "backlog made ONLY of SHORT requests (each <= X, law 4 -- D never prefills "
+                         "above X) whose uncached tokens sum to at most N is served on D instead of "
+                         "waiting for a flip. 0 (default) = off = today: such a backlog waits for "
+                         "FLIP-ECONOMICS (--flip-min-work-tokens) or the fairness bound.")
+    ap.add_argument("--d-hold-s", type=float, default=None,
+                    help="27B idle policy (c), passed to the front: D stays awake this many seconds "
+                         "after its own work ended before it flips -- at rest under --idle-layout pp, "
+                         "and in front of a small backlog FLIP-ECONOMICS holds -- so a SHORT arrival "
+                         "inside the hold is served without a flip. Unset (default) = today: the idle "
+                         "flip waits for --min-dwell-ms only, a held backlog for --fairness-w-s only.")
     ap.add_argument("--d-admit-max-tokens", type=int, default=None,
                     help="FIX 4 (round 4): OPERATOR CEILING on the aggregate store-read budget "
                          "group D may hold in flight. Unset (the default) is NOT a derived number "
@@ -12526,6 +12538,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     x_tokens, x_provenance = x_seed.tokens, x_seed.provenance
     flip_min_work_tokens = int(ns.flip_min_work_tokens) if ns.flip_min_work_tokens is not None else x_tokens
     idle_layout_front = "P" if ns.idle_layout == "pp" else "D"
+    if int(ns.d_short_drain_tokens or 0) < 0 or (ns.d_hold_s is not None and float(ns.d_hold_s) < 0):
+        raise SystemExit(f"--d-short-drain-tokens {ns.d_short_drain_tokens} / --d-hold-s {ns.d_hold_s}: "
+                         f"both must be >= 0 (0 / unset = off)")
     # THE OPERATING POINT, WITH ITS PROVENANCE, ON EVERY BOOT RECORD. The pair
     # is provisional by the order that set it (2026-09-09, "vorerst"), so a
     # later re-measurement has to be able to sort past boots into "told" and
@@ -12546,6 +12561,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"{'derived from the last flip in that direction' if ns.min_dwell_ms is None else ns.min_dwell_ms}")
     log(f"X PROVENANCE: {x_provenance}; --flip-min-work-tokens {flip_min_work_tokens} "
         f"({'= X, the same break-even at aggregate granularity' if ns.flip_min_work_tokens is None else 'operator override'})")
+    log(f"IDLE POLICY (27B, user order 2026-09-24): (a) --idle-layout {ns.idle_layout} -> the "
+        f"front rests on {idle_layout_front}; (b) --d-short-drain-tokens "
+        f"{int(ns.d_short_drain_tokens or 0)} ({'off' if not ns.d_short_drain_tokens else 'a queued SHORT-only backlog up to this many tokens is served on D, each request <= X=' + str(x_tokens)}); "
+        f"(c) --d-hold-s {'unset (off)' if ns.d_hold_s is None else ns.d_hold_s} "
+        f"({'the idle flip waits for min-dwell only, a held backlog for the fairness bound' if ns.d_hold_s is None else 'D stays this long after its own work ended before it flips'})")
 
     log(f"SCHEDULING FLAGS AS EMITTED -- group P: --max-running-requests {p_bs} "
         f"--max-kv-per-request {max_kv_per_request} (no --tp-prefill-max-tokens: the PP prefill "
@@ -14224,6 +14244,12 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         argv += ["--anon-preboot-bytes", str(int(anon_preboot_bytes))]
     if ns.min_dwell_ms is not None:
         argv += ["--min-dwell-ms", str(ns.min_dwell_ms)]
+    # 27B idle policy (b)/(c): emitted only when set, so a boot without them
+    # ships the front argv byte for byte as before.
+    if int(getattr(ns, "d_short_drain_tokens", 0) or 0) > 0:
+        argv += ["--d-short-drain-tokens", str(int(ns.d_short_drain_tokens))]
+    if getattr(ns, "d_hold_s", None) is not None:
+        argv += ["--d-hold-s", str(float(ns.d_hold_s))]
     if ns.d_admit_max_tokens is not None:
         argv += ["--d-admit-max-tokens", str(ns.d_admit_max_tokens)]
     # #1233 weg2dk4/fix 8 (merged into this ONE builder rather than a second
