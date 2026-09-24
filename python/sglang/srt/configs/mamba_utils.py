@@ -186,6 +186,29 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
+    def spec_ring_workspace_bytes_per_req(self, draft_tokens: int, ring_len: int) -> int:
+        """27B ReplaySSM package (S5): the target-verify workspace of ONE request
+        row, all layers, when the spec ring replaces the per-draft intermediate
+        state (--enable-linear-replayssm-spec).
+
+        Exactly what the pool allocates per request row in that mode: the conv
+        verify windows, which stay (the deduplicated sliding-window layout,
+        ``[conv_dim, D + (K-1) - 1]`` per layer -- the layout of every
+        ring-eligible verify, CUDA with a linear draft chain), plus the ring
+        (:meth:`replayssm_ring_bytes_per_req`). The recurrent route keeps its
+        established post, ``mamba_cache_per_req * D``.
+        """
+        conv_b = self.dtype.conv.itemsize
+        conv_windows = (
+            sum(
+                int(dim) * (int(draft_tokens) + int(win) - 1)
+                for dim, win in self.shape.conv
+            )
+            * conv_b
+            * len(self.layers)
+        )
+        return conv_windows + self.replayssm_ring_bytes_per_req(ring_len)
+
     def replayssm_ring_bytes_per_req(self, record_len: int) -> int:
         """ReplaySSM spec-verify scratch bytes of ONE request row, all layers.
 

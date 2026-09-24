@@ -233,6 +233,7 @@ class TestServerArgsStaticChecks(_Base):
             "linear draft chain": dict(speculative_eagle_topk=2),
             "power of": dict(linear_replayssm_cache_len=12),
             ">= 16": dict(linear_replayssm_cache_len=8),
+            "unified-memory": dict(enable_unified_memory=True),
             "PD disaggregation": dict(disaggregation_mode="decode"),
         }
         for msg, kw in cases.items():
