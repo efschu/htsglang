@@ -434,6 +434,17 @@ class Envs:
     SGLANG_PHASE_FLIP_REFILL_CHUNK_MIB = EnvInt(32)
     SGLANG_PHASE_FLIP_REFILL_DEPTH = EnvInt(2)
     SGLANG_PHASE_FLIP_REFILL_SAVE_SLICES = EnvInt(4)
+    # Weg-2 load, H39 port to the 27B line (code: NF line d6b7d4a1d3): the
+    # dense Marlin linears (compressed_tensors_wNa16 -- on the 27B only the
+    # DFlash2-W8 drafter; the W8A8-INT8 target has no repack) keep their
+    # checkpoint-format tensors and the repack working set OUTSIDE the private
+    # weg2 tag pools, in two load pools handed back after the weights region;
+    # only the survivors (repacked weight, permuted scales, g_idx, workspace)
+    # are born in the tag pool. Measured on weg2xsn423/xsn424: the drafter's
+    # 'weights_draft' pool held 431/209/199 MiB dead on D TP0/TP1/TP2 and
+    # 771 MiB on P PP2. DEFAULT OFF on this line: False = the 2026-09-24 form,
+    # byte for byte (everything born in the tag pool, no load pool created).
+    SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL = EnvBool(False)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
