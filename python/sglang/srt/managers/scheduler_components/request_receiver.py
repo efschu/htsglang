@@ -112,6 +112,12 @@ class SchedulerRequestReceiver:
     # The ipc of a dropped probe goes back through this so the tokenizer's
     # /health_generate still gets its answer (the scheduler's deque).
     return_health_check_ipc: Optional[Callable[[Any], None]] = None
+    # WEG2 VISION (in-rank stage): returns the origin's own requests to add to
+    # this pass -- the named aborts of a refused vision stage on PP0 -- so
+    # they ride the SAME relay the tokenizer's requests do and every rank
+    # applies them in the same pass. Called only on the request origin.
+    # None (every other boot) leaves the intake exactly as it was.
+    origin_extra_reqs_hook: Optional[Callable[[], List[Any]]] = None
 
     #: How many drain turns one chain receive may trigger before the stall
     #: is allowed to propagate. A closed ring is cut by the FIRST turn; a
@@ -276,6 +282,13 @@ class SchedulerRequestReceiver:
             decision = self.phase_flip_decision_hook()
             if decision is not None:
                 recv_reqs.append(decision)
+
+        if (
+            is_request_origin
+            and recv_reqs is not None
+            and self.origin_extra_reqs_hook is not None
+        ):
+            recv_reqs.extend(self.origin_extra_reqs_hook() or ())
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
