@@ -90,6 +90,11 @@ SKIP_PURE_CHUNK_OUTPUT_ENV = "SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM"
 #: P-NOSYNC: the per-chunk cache path never makes the host wait on a stream --
 #: see `p_nosync_on` for the three sites and the measurement.
 P_NOSYNC_ENV = "SGLANG_WEG2_P_NOSYNC"
+#: FLA l2norm with the row count as a RUN-TIME bound (fla/l2norm.py
+#: ``L2NORM_RUNTIME_T_ENV``, same name): no new Triton kernel -- compile/load on
+#: the scheduler thread inside the launch -- per token count (weg2xsn423 P: 63
+#: cold loads, 3.20 s). Its own switch; --p-host-overlap sets it for group P.
+L2NORM_RUNTIME_T_ENV = "SGLANG_FLA_L2NORM_RUNTIME_T"
 
 
 def p_host_overlap_on() -> bool:
@@ -143,7 +148,8 @@ def p_nosync_on() -> bool:
 def launcher_env_p_host_overlap() -> Dict[str, str]:
     """The group-P environment ``--p-host-overlap`` adds. ONE place, read by the
     launcher and pinned by the tests, so the two halves cannot drift."""
-    return {P_HOST_OVERLAP_ENV: "1", SKIP_PURE_CHUNK_OUTPUT_ENV: "1", P_NOSYNC_ENV: "1"}
+    return {P_HOST_OVERLAP_ENV: "1", SKIP_PURE_CHUNK_OUTPUT_ENV: "1", P_NOSYNC_ENV: "1",
+            L2NORM_RUNTIME_T_ENV: "1"}
 
 
 def launcher_env_p_hostgap() -> Dict[str, str]:
