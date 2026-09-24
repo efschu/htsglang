@@ -4514,6 +4514,9 @@ class Front:
             sampled_at_flip_epoch=self.epoch,
             vram_residue_mib=vram_residue_mib,
             vram_residue_form=self.weight_form,
+            # RC1: D's residue belongs to its capture set (--max-running-requests
+            # = this front's --d-bs); P's sample stays as it was.
+            vram_residue_capture_bs=(getattr(self, "d_bs", None) if group == "D" else None),
             load_witness={
                 "queued": len(self.queue),
                 "outstanding": sum(
