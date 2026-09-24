@@ -216,6 +216,13 @@ _qknorm_use_alt_stream = _is_cuda or (
 )
 _is_amx_available = cpu_has_amx_support()
 
+# Head-group ratios (num_v_heads // num_k_heads) served by the fused
+# split/reshape/cat Triton kernel. Upstream #34859: on CUDA the ratio-3 dense
+# 27B layout is handled by the kernel's per-head walk (the CPU fused op still
+# requires a power-of-two group), replacing the split + 2x .contiguous() +
+# torch.cat (+ z copy) of the unfused fallback on every decode/verify step.
+_GDN_FUSED_QKVZBA_RATIOS = (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
+
 cached_get_processor = lru_cache(get_processor)
 
 
@@ -736,7 +743,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.head_v_dim,
             )
         elif (
-            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+            self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
             and not _is_cpu
             and not _is_npu
         ):
