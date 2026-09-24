@@ -2259,6 +2259,13 @@ class Envs:
     # SGLANG_FORCE_QSA_ROWS_CONFIG grammar, for this launch only, e.g.
     # "inf=32/8/2". Empty = the table (default). Launch parameters only.
     SGLANG_WEG2_QSA_PREFILL_CONFIG = EnvStr("")
+    # QSA rows resolve on EAGER forwards (fnFL2 H65, qwen_sparse_attn_backend
+    # _qsa_rows_fused_route): True routes the P prefix chunks through the
+    # fused Triton resolve the graph path already uses (qsa/rows_resolve.py)
+    # instead of the torch chain, whose int64 top-k copy, gather, full_like and
+    # where hold ~0.57 GB per full-attention layer of a 16k chunk above the
+    # 134-MB rows. Same rows, bit-identical attention. False = torch chain.
+    SGLANG_WEG2_QSA_ROWS_FUSED_EAGER = EnvBool(False)
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)

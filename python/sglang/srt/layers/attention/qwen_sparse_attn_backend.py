@@ -79,6 +79,28 @@ def _qsa_rows_fused_on() -> bool:
     return _QSA_ROWS_FUSED["on"]
 
 
+def _qsa_rows_fused_route(metadata, topk_indices, req_to_token, eager: bool) -> bool:
+    """Whether _rows_and_counts resolves through the fused Triton launch
+    (qsa/rows_resolve.py): always on the graph path (Task #53), and on an
+    EAGER forward only with SGLANG_WEG2_QSA_ROWS_FUSED_EAGER (fnFL2 H65).
+
+    H65: the eager torch chain (_logical_to_physical -> _local_rows) of a
+    16k P prefix chunk holds, per full-attention layer, the int64 copy of the
+    [16384, 2051] top-k (269 MB), the gathered slots, a full_like and the
+    where result (134 MB each) plus the masks -- ~0.57 GB of transient above
+    the 134-MB rows it returns; the fused kernel writes the rows (and the
+    counts) directly. Same rows for the valid-first top-k QSA hands over;
+    the counts bound the kernel loop, whose trailing all -1 blocks were exact
+    no-ops -- the attention output is bit-identical."""
+    return bool(
+        _qsa_rows_fused_on()
+        and (getattr(metadata, "is_cuda_graph", False) or eager)
+        and topk_indices.is_cuda
+        and req_to_token is not None
+        and metadata.row_req_pool_indices is not None
+    )
+
+
 def _qsa_rows_compact_on() -> bool:
     """SGLANG_QSA_ROWS_COMPACT (default 1): under DCP, bound every query's
     sparse-attention loop to the rows this rank owns instead of masking the
@@ -513,14 +535,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         """(rows, counts-or-None): the graph path resolves and compacts in ONE
         Triton launch (qsa/rows_resolve.py, Task #53 Sitz 5) when
         SGLANG_QSA_ROWS_FUSED is on (default); every other path keeps the
-        torch chain and lets _attend_rows compact."""
-        if (
-            _qsa_rows_fused_on()
-            and getattr(metadata, "is_cuda_graph", False)
-            and topk_indices.is_cuda
-            and self.req_to_token is not None
-            and metadata.row_req_pool_indices is not None
-        ):
+        torch chain and lets _attend_rows compact -- unless
+        SGLANG_WEG2_QSA_ROWS_FUSED_EAGER routes the eager forwards (the P
+        prefix chunks) through the same launch (_qsa_rows_fused_route, H65)."""
+        from sglang.srt.environ import envs
+
+        eager = bool(envs.SGLANG_WEG2_QSA_ROWS_FUSED_EAGER.get())
+        if _qsa_rows_fused_route(metadata, topk_indices, self.req_to_token, eager):
             from sglang.srt.layers.attention.qsa.rows_resolve import (
                 MODE_EVEN,
                 MODE_NONE,
@@ -541,6 +562,15 @@ class QwenSparseAttnBackend(AttentionBackend):
                 logger.info(
                     "[qsa-rows] fused resolve+compaction armed (mode %d, dcp %d, K %d)",
                     mode, self.dcp_size, int(topk_indices.shape[1]),
+                )
+            if not getattr(metadata, "is_cuda_graph", False) and not getattr(
+                self, "_rows_fused_eager_logged", False
+            ):
+                self._rows_fused_eager_logged = True
+                logger.info(
+                    "[qsa-rows] EAGER forwards resolve through the fused launch too "
+                    "(SGLANG_WEG2_QSA_ROWS_FUSED_EAGER, H65; first: %d rows x K %d, mode %d)",
+                    int(topk_indices.shape[0]), int(topk_indices.shape[1]), mode,
                 )
             return qsa_rows_resolve(
                 topk_indices,
