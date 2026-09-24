@@ -367,8 +367,9 @@ def _launcher_ns(tmp_path, fractions, scratch, card_logs=""):
         model=str(tmp_path / MODEL),
         extra_d=("--rank-tp-ratio 1,0,0 --rank-moe-ratio 183,137,168 "
                  "--rank-moe-resident-fraction " + fractions),
+        # x128/x141/x144 liefen vor H39 (H50: der Zustand waehlt die Referenzen)
         env_d=("SGLANG_MOE_POOL_STAGING=12;SGLANG_MOE_SCRATCH_SLOTS=" + scratch
-               + ";SGLANG_UNEVEN_MOE_EXPERT_SHARD=1"),
+               + ";SGLANG_UNEVEN_MOE_EXPERT_SHARD=1;SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL=0"),
         d_foreign_context_mib="", d_nontorch_mib="", d_reserve_mib="",
         d_residency_reference_logs="", d_card_reference_logs=card_logs,
         wake_credit_reference_logs="",

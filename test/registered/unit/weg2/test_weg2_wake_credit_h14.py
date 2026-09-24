@@ -184,8 +184,9 @@ def _launcher_ns(tmp_path, fr_p, fr_d):
         model=str(tmp_path / MODEL),
         extra_d=("--rank-tp-ratio 1,0,0 --rank-moe-ratio 183,137,168 "
                  "--rank-moe-resident-fraction " + fr_d),
+        # x114c/d liefen vor H39 (H50: der Zustand waehlt die Referenzen)
         env_d=("SGLANG_MOE_POOL_STAGING=8;SGLANG_MOE_SCRATCH_SLOTS=44,48,48;"
-               "SGLANG_UNEVEN_MOE_EXPERT_SHARD=1"),
+               "SGLANG_UNEVEN_MOE_EXPERT_SHARD=1;SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL=0"),
         extra_p="--rank-moe-resident-fraction " + fr_p,
         env_p="SGLANG_MOE_SCRATCH_SLOTS=32",
         pp_cut_expert_device_fraction="",

@@ -234,9 +234,11 @@ def _launcher_ns(tmp_path, fractions):
             "--rank-tp-ratio 1,0,0 --rank-moe-ratio 183,137,168 "
             "--rank-moe-resident-fraction " + fractions
         ),
+        # x98-x100 liefen vor H39 (H50: der Zustand waehlt die Referenzen)
         env_d=(
             "SGLANG_MOE_POOL_STAGING=8;SGLANG_MOE_SCRATCH_SLOTS=70,48,48;"
-            "SGLANG_UNEVEN_MOE_EXPERT_SHARD=1;SGLANG_WEG2_DRAFT_SHARE_EMBED=0"
+            "SGLANG_UNEVEN_MOE_EXPERT_SHARD=1;SGLANG_WEG2_DRAFT_SHARE_EMBED=0;"
+            "SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL=0"
         ),
         d_foreign_context_mib="",
         d_nontorch_mib="",

@@ -39,8 +39,11 @@ SLOT_MIB = 1297637376 / 512 / (1 << 20)
 SPLIT, CHUNK, N_LAYERS = (29, 11, 8), 3, 48
 BASE = (0.06, 0.44, 0.365)
 EDGE_K = (0.06, 0.51, 0.48)   # H30 Stufe K, Boot x145
-P_ROWS = {"x141": (166, 263, 232), "x144": (166, 263, 408)}
-FR_P = {"x141": (0.26, 0.45, 0.39), "x144": (0.26, 0.45, 0.733887)}  # x144: H25 draft post
+P_ROWS = {"x141": (166, 263, 232), "x144": (166, 263, 408), "x158": (166, 263, 408)}
+FR_P = {"x141": (0.26, 0.45, 0.39), "x144": (0.26, 0.45, 0.733887),  # x144: H25 draft post
+        "x158": (0.26, 0.45, 0.733887)}
+#: H50: x158 (H39-Zustand) lief die Kante K; x141/x144 die Basis.
+FR_D_BOOT = {"x141": BASE, "x144": BASE, "x158": EDGE_K}
 E_D, S_D = (193, 145, 177), (82, 48, 48)
 
 
@@ -108,7 +111,7 @@ def test_the_shipped_references_are_the_logs_own_measurement(key):
     got = pd.reference_to_dict(_ref(boot, int(flip)))
     assert got == refs.REFERENCES[key]
     assert got["p_resident"] == [er.resident_rows(512, f) for f in FR_P[boot]]
-    assert got["d_resident"] == _d_res(BASE)
+    assert got["d_resident"] == _d_res(FR_D_BOOT[boot])
 
 
 def test_the_x141_tail_is_what_the_logs_say():
@@ -361,8 +364,9 @@ def _launcher_ns(tmp_path, fr_d):
         model=str(tmp_path / MODEL),
         extra_d=("--rank-tp-ratio 1,0,0 --rank-moe-ratio 183,137,168 "
                  "--rank-moe-resident-fraction " + fr_d),
+        # x141/x144 liefen vor H39 (H50: der Zustand waehlt die Referenzen)
         env_d=("SGLANG_MOE_POOL_STAGING=8;SGLANG_MOE_SCRATCH_SLOTS=82,48,48;"
-               "SGLANG_UNEVEN_MOE_EXPERT_SHARD=1"),
+               "SGLANG_UNEVEN_MOE_EXPERT_SHARD=1;SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL=0"),
         extra_p="--rank-moe-resident-fraction 0.26,0.45,0.39",
         env_p="SGLANG_MOE_SCRATCH_SLOTS=32",
         pp_cut_expert_device_fraction="",

@@ -42,6 +42,14 @@ ihm, und alle drei sind am Metall gemessen, nicht geraten:
    keinem Budget-Posten. Abschnitt 4b rechnet den Kopfraum gegen die near-
    OOM-Grenze aus gemessenen Punkten (``graph_pool_ledger``, W130).
 
+5. (H50) DER BAUM-ZUSTAND: Posten 3 und 4 sind Messungen EINES Baums. H39
+   (SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL, d6b7d4a1d3) nahm auf D-TP0 4354 MiB
+   tote Checkpoint-/Repack-Bloecke aus den Tag-Pools (fest 11618 -> 7264 MiB,
+   privat_frei 4993 -> 625 MiB, fnFL2x150 gegen x151/x158). Die Referenzen
+   gibt es deshalb je Zustand; gewaehlt wird nach dem Schalter der D-Gruppe,
+   und der Zustand eines Logs ist die WIRKUNG ("checkpoint-format pool
+   RELEASED"), nie "der neueste Boot".
+
 Alles hier ist rein (kein torch), damit der Launcher es ohne CUDA-Import
 rechnen kann; die zwei gespiegelten Runtime-Formeln (``resident_rows``,
 ``expert_span_by_rank``) sind per Test an ihre Runtime-Quellen gebunden.
@@ -71,6 +79,17 @@ DRAFT_SHARE_EMBED_DEFAULT = True
 #: Die Runtime-Defaults der zwei Pool-Envs (``expert_offload``).
 POOL_STAGING_ENV = "SGLANG_MOE_POOL_STAGING"
 POOL_STAGING_DEFAULT = 12
+
+#: fnFL2 H50: SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL (H39, d6b7d4a1d3) ist ein
+#: EnvBool mit Default AN (environ.py). Er entscheidet, ob die Checkpoint-
+#: Tensoren der Dense-Marlin-Linears und der Repack als tote Bloecke in den
+#: Tag-Pools liegen (AUS: D-TP0 der Next-Flash-Form 4354 MiB mehr 'weights +
+#: runtime state', 4993 statt 625 MiB privat_frei) oder im eigenen Lade-Pool
+#: und nach dem Laden zurueckgegeben werden (AN). Die gemessenen Referenzen
+#: unten gelten deshalb je Zustand dieses Schalters -- gespiegelt wie
+#: DRAFT_SHARE_EMBED, weil der Launcher die Env der GRUPPE D liest.
+DENSE_REPACK_OUTSIDE_POOL_ENV = "SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL"
+DENSE_REPACK_OUTSIDE_POOL_DEFAULT = True
 
 _TRUE = ("true", "1", "yes", "y")
 _FALSE = ("false", "0", "no", "n")
@@ -165,6 +184,21 @@ def largest_fraction_for_rows(
     return f
 
 
+def scratch_edge(
+    *, local_experts: int, fraction: float, max_rows: int
+) -> Tuple[int, Optional[int]]:
+    """H50: die KANTE bei GEGEBENER Fraction -- ``(Zeilen, Scratch)``: wie viele
+    Pufferzeilen je Layer hoechstens tragen (``max_rows``, gedeckelt auf E) und
+    welches SGLANG_MOE_SCRATCH_SLOTS sie ergibt (``Zeilen - R``); ``None``,
+    wenn weniger als die zwei Scratch-Zeilen bleiben, die die Runtime verlangt
+    (``scratch_slot_count``). Keine Reserve: die Grenze ist die der Bilanz."""
+    E = int(local_experts)
+    R = resident_rows(E, fraction) if float(fraction) < 1.0 else E
+    rows = min(int(max_rows), E)
+    s = rows - R
+    return rows, (s if s >= 2 else None)
+
+
 # ---------------------------------------------------------------------------
 # 2. der Draft mit geteiltem Vokabular
 # ---------------------------------------------------------------------------
@@ -180,6 +214,47 @@ def draft_share_embed(env: Mapping[str, str]) -> bool:
     if raw in _FALSE:
         return False
     raise ValueError(f'{DRAFT_SHARE_EMBED_ENV}="{raw}" ist kein Boolean')
+
+
+def dense_repack_outside_pool(env: Mapping[str, str]) -> bool:
+    """SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL aus der Gruppen-Env, EnvBool-Semantik
+    (H50: welcher Baum-Zustand die gemessene Referenz waehlt)."""
+    raw = str(env.get(DENSE_REPACK_OUTSIDE_POOL_ENV, "")).strip().lower()
+    if not raw:
+        return DENSE_REPACK_OUTSIDE_POOL_DEFAULT
+    if raw in _TRUE:
+        return True
+    if raw in _FALSE:
+        return False
+    raise ValueError(f'{DENSE_REPACK_OUTSIDE_POOL_ENV}="{raw}" ist kein Boolean')
+
+
+#: Die Zeile, die ein Rang NUR druckt, wenn H39 am Metall gewirkt hat: der
+#: Checkpoint-Format-Pool existierte und wurde nach dem Laden zurueckgegeben
+#: (``weg2_memory_saver._release_one_load_pool("ckpt")``; ein noch lebender
+#: Block haelt den Pool und die Zeile bleibt aus). Der Zustand einer Referenz
+#: ist damit die gemessene WIRKUNG, nicht der Schalter.
+_RX_H39_RELEASED = re.compile(
+    r"\[(?:[0-9-]+ [0-9:]+ )?TP\d+\] WEG2-TAG-POOL checkpoint-format pool RELEASED"
+)
+
+
+def boot_dense_repack_outside_pool(text: str) -> bool:
+    """Hat dieser D-Log den H39-Zustand (Checkpoint-Format-Pool freigegeben)?"""
+    return _RX_H39_RELEASED.search(text) is not None
+
+
+def _boots_dense_repack_state(boots: Sequence[Tuple[str, str]]) -> bool:
+    """Der H39-Zustand EINER Referenz; Boots aus beiden Zustaenden mischen hiesse
+    ueber 4,3 GiB auf der 5090 das Maximum bzw. Minimum zweier Baeume nehmen --
+    das wird verweigert, nicht gemittelt."""
+    states = {name: boot_dense_repack_outside_pool(text) for name, text in boots}
+    if len(set(states.values())) > 1:
+        raise ValueError(
+            "Referenz mischt Baeume vor und nach H39 (checkpoint-format pool "
+            "RELEASED): %s" % states
+        )
+    return bool(next(iter(states.values()), False))
 
 
 def draft_vocab_mib(
@@ -216,6 +291,9 @@ class DRankReference(msgspec.Struct, frozen=True, kw_only=True):
     draft_host_rank: int
     #: Hielt der Draft-Host in der Referenz eigene embed_tokens/lm_head?
     draft_vocab_held: bool
+    #: H50: lief die Referenz im H39-Zustand (Dense-Repack ausserhalb der
+    #: Tag-Pools, :func:`boot_dense_repack_outside_pool`)?
+    dense_repack_outside_pool: bool = False
 
 
 _TP = r"\[(?:[0-9-]+ [0-9:]+ )?TP(\d+)\]"
@@ -308,6 +386,7 @@ def d_rank_reference_from_logs(
     in ALLEN Boots, wird verweigert, statt eine Null einzusetzen.
     """
     layer_mib = float(n_layers) * float(slot_bytes) / MIB
+    h39 = _boots_dense_repack_state(boots)
     fixed: Dict[int, float] = {}
     best: Dict[str, Dict[int, float]] = {
         k: {} for k in ("mamba", "spec", "act", "cell")
@@ -354,6 +433,7 @@ def d_rank_reference_from_logs(
         kv_cell_bytes=tuple(int(best["cell"][r]) for r in range(n_ranks)),
         draft_host_rank=host,
         draft_vocab_held=vocab_held,
+        dense_repack_outside_pool=h39,
     )
 
 
@@ -375,6 +455,30 @@ D_RESIDENCY_REFERENCE_FNFL2 = DRankReference(
     kv_cell_bytes=(14143, 768, 768),
     draft_host_rank=0,
     draft_vocab_held=True,
+    dense_repack_outside_pool=False,
+)
+
+#: fnFL2 H50: dieselbe Messung im H39-Zustand (Baum ab d6b7d4a1d3), von
+#: :func:`d_rank_reference_from_logs` aus fnFL2x151 (d6b7d4a1d3) und fnFL2x158
+#: (c01951e3e1), beide FR_D 0.06,0.51,0.48 / SCRATCH_D 82,48,48
+#: (/spinning/evidence-665-f1/boot_weg2_fnFL2x1{51,58}_*.D.log, Fixture unter
+#: test/registered/unit/weg2/fixtures/d_h39_h50/). D-TP0: 'weights + runtime
+#: state' 17.744 GiB (x150 vor H39: 21.996) bei 94 Pufferzeilen -> fest 7264
+#: statt 11618 MiB; die 4354 MiB sind dieselben, um die die Gewichts-Tags im
+#: WEG2-DC-BREAKDOWN schrumpfen (20720 -> 16366 MiB ohne weights_draft).
+#: TP1/TP2 tragen keine Dense-Marlin-Linears, ihr Posten ist x150 gleich.
+D_RESIDENCY_REFERENCE_FNFL2_H39 = DRankReference(
+    source="fnFL2x151 + fnFL2x158",
+    model="Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",
+    rank_tp_ratio="1,0,0",
+    fixed_mib=(7264.2, 1044.0, 921.9),
+    mamba_mib=(393.2, 0.0, 0.0),
+    spec_mib=(224.3, 0.0, 0.0),
+    activation_mib=(1024.0, 1024.0, 1024.0),
+    kv_cell_bytes=(14143, 768, 768),
+    draft_host_rank=0,
+    draft_vocab_held=False,
+    dense_repack_outside_pool=True,
 )
 
 
@@ -706,6 +810,8 @@ class DCardReference(msgspec.Struct, frozen=True, kw_only=True):
     precision_mib: Tuple[float, ...]
     draft_host_rank: int
     draft_vocab_held: bool
+    #: H50: lief die Referenz im H39-Zustand (siehe DRankReference)?
+    dense_repack_outside_pool: bool = False
 
 
 def d_card_reference_from_logs(
@@ -728,6 +834,7 @@ def d_card_reference_from_logs(
     from sglang.srt.planner import graph_pool_ledger as gpl
 
     layer_mib = float(n_layers) * float(slot_bytes) / MIB
+    h39 = _boots_dense_repack_state(boots)
     best: Dict[int, Tuple[float, object, int]] = {}
     dec: Dict[int, float] = {}
     host = -1
@@ -780,6 +887,7 @@ def d_card_reference_from_logs(
         ),
         draft_host_rank=host,
         draft_vocab_held=vocab_held,
+        dense_repack_outside_pool=h39,
     )
 
 
@@ -806,7 +914,53 @@ D_CARD_REFERENCE_FNFL2 = DCardReference(
     precision_mib=(15.4, 15.4, 15.4),
     draft_host_rank=0,
     draft_vocab_held=False,
+    dense_repack_outside_pool=False,
 )
+
+#: fnFL2 H50: die Karten-Referenz im H39-Zustand, von
+#: :func:`d_card_reference_from_logs` aus fnFL2x151 + fnFL2x158 (Fixture
+#: ``d_h39_h50``). Bindend ist auf jedem Rang ``WEG2-GRAPH-POOL phase=decode``;
+#: D-TP0 aus x158: cap 29369 - peak 23800 - privat_frei 625 = 4944 MiB
+#: Kopfraum bei 94 Zeilen (x151 4969; x150 vor H39: privat_frei 4993,
+#: Kopfraum 618). Die 4368 MiB weniger privat_frei sind die toten Bloecke,
+#: die H39 aus den Tag-Pools genommen hat (Pool 0.2 'weights' 2494 -> 1258).
+#: Decode-frei (Befund, kein Stopper) ist das Minimum: x151 hielt im Decode
+#: 3485 MiB allgemeinen Allokator-Cache (card_free 2429), x158 488 (5399).
+D_CARD_REFERENCE_FNFL2_H39 = DCardReference(
+    source="fnFL2x151 + fnFL2x158",
+    model="Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",
+    rank_tp_ratio="1,0,0",
+    headroom0_mib=(15849.7, 16701.2, 16873.4),
+    free_decode0_mib=(13334.7, 16114.2, 15926.4),
+    buffer_rows=(94, 122, 133),
+    cap_mib=(29369.0, 18782.0, 18802.0),
+    peak_mib=(23800.0, 15551.0, 16788.0),
+    private_free_mib=(625.0, 684.0, 571.0),
+    phase=("decode", "decode", "decode"),
+    precision_mib=(3.0, 3.0, 3.0),
+    draft_host_rank=0,
+    draft_vocab_held=False,
+    dense_repack_outside_pool=True,
+)
+
+#: Die eingebauten Referenzen je Baum-Zustand (H50): gewaehlt wird nach
+#: SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL der D-Gruppe, nie nach "neuester".
+D_RESIDENCY_REFERENCES: Tuple[DRankReference, ...] = (
+    D_RESIDENCY_REFERENCE_FNFL2,
+    D_RESIDENCY_REFERENCE_FNFL2_H39,
+)
+D_CARD_REFERENCES: Tuple[DCardReference, ...] = (
+    D_CARD_REFERENCE_FNFL2,
+    D_CARD_REFERENCE_FNFL2_H39,
+)
+
+
+def h39_state_text(state: bool) -> str:
+    return (
+        "H39 an: Dense-Repack ausserhalb der Tag-Pools"
+        if state
+        else "H39 aus: Checkpoint-Tensoren und Repack in den Tag-Pools"
+    )
 
 
 class DCardFit(msgspec.Struct, frozen=True, kw_only=True):
@@ -919,13 +1073,19 @@ def solve_d_card(
 
 def describe_card(card: DCardFit, reference: DCardReference) -> str:
     r = card.rank
+    edge = scratch_edge(
+        local_experts=card.local_experts,
+        fraction=card.fraction,
+        max_rows=card.ceiling_max_rows,
+    )
     ceiling = "KEINE" if card.ceiling_fraction is None else "%.3f" % card.ceiling_fraction
     free_dec = "n/a" if card.free_decode_mib is None else "%.0f" % card.free_decode_mib
     return (
         "rang%d: Referenz %d Zeilen, Kopfraum %.0f = cap %.0f - peak %.0f - "
         "privat_frei %.0f MiB am Punkt '%s' (+-%.0f); hier f %.3f S %d -> %s "
         "Zeilen, Puffer %+.0f MiB%s -> Kopfraum %.0f MiB (near-OOM %.0f), Decode "
-        "frei %s MiB (Band-Floor %.0f) -> %s | KARTEN-DECKE f %s (<= %d Zeilen)"
+        "frei %s MiB (Band-Floor %.0f) -> %s | KARTEN-DECKE f %s (<= %d Zeilen) | "
+        "KARTEN-KANTE bei f %.3f: <= %d Zeilen = SCRATCH <= %s"
         % (
             r,
             reference.buffer_rows[r],
@@ -949,6 +1109,9 @@ def describe_card(card: DCardFit, reference: DCardReference) -> str:
             card.verdict,
             ceiling,
             card.ceiling_max_rows,
+            card.fraction,
+            edge[0],
+            "KEINE" if edge[1] is None else edge[1],
         )
     )
 
@@ -1021,8 +1184,10 @@ def _reference_for(
     n_ranks: int,
     n_layers: int,
     slot_bytes: float,
+    dense_repack: bool = DENSE_REPACK_OUTSIDE_POOL_DEFAULT,
 ) -> Tuple[Optional[DRankReference], str]:
-    """Die Referenz fuer DIESE Form, oder ``(None, warum nicht)``."""
+    """Die Referenz fuer DIESE Form und DIESEN Baum-Zustand (H50: H39 an/aus),
+    oder ``(None, warum nicht)``."""
     import os
 
     model = os.path.basename(os.path.normpath(model_path))
@@ -1032,38 +1197,60 @@ def _reference_for(
         for p in paths:
             with open(p, errors="replace") as fh:
                 boots.append((os.path.basename(p), fh.read()))
-        return (
-            d_rank_reference_from_logs(
-                boots,
-                n_ranks=n_ranks,
-                n_layers=n_layers,
-                slot_bytes=slot_bytes,
-                model=model,
-                rank_tp_ratio=rank_tp_ratio,
-            ),
-            "",
+        ref = d_rank_reference_from_logs(
+            boots,
+            n_ranks=n_ranks,
+            n_layers=n_layers,
+            slot_bytes=slot_bytes,
+            model=model,
+            rank_tp_ratio=rank_tp_ratio,
         )
+        if ref.dense_repack_outside_pool != bool(dense_repack):
+            return None, _h39_mismatch_text(
+                ref.source, ref.dense_repack_outside_pool, dense_repack,
+                "--d-residency-reference-logs",
+            )
+        return ref, ""
     ref = D_RESIDENCY_REFERENCE_FNFL2
+    for cand in D_RESIDENCY_REFERENCES:
+        if cand.dense_repack_outside_pool == bool(dense_repack):
+            ref = cand
+            break
     if (
         ref.model != model
         or ref.rank_tp_ratio != rank_tp_ratio
         or len(ref.fixed_mib) != n_ranks
+        or ref.dense_repack_outside_pool != bool(dense_repack)
     ):
         return None, (
             "die eingebaute Referenz (%s) gilt fuer %s mit --rank-tp-ratio %s auf %d "
-            "Raengen, dieser Boot faehrt %s mit %s auf %d; den festen Rang-Posten "
-            "per --d-residency-reference-logs <D.log,...> aus Boots DIESER Form messen"
+            "Raengen (%s), dieser Boot faehrt %s mit %s auf %d (%s); den festen "
+            "Rang-Posten per --d-residency-reference-logs <D.log,...> aus Boots "
+            "DIESER Form messen"
             % (
                 ref.source,
                 ref.model,
                 ref.rank_tp_ratio,
                 len(ref.fixed_mib),
+                h39_state_text(ref.dense_repack_outside_pool),
                 model,
                 rank_tp_ratio,
                 n_ranks,
+                h39_state_text(bool(dense_repack)),
             )
         )
     return ref, ""
+
+
+def _h39_mismatch_text(source: str, have: bool, want: bool, flag: str) -> str:
+    return (
+        "die Referenz-Logs %s sind im Zustand '%s' gemessen, die D-Gruppe faehrt "
+        "'%s' (%s) -- auf D-TP0 der Next-Flash-Form liegen dazwischen 4354 MiB "
+        "'weights + runtime state' und 4368 MiB privat_frei (fnFL2x150 gegen "
+        "x158); %s aus Boots DESSELBEN Zustands angeben"
+        % (source, h39_state_text(have), h39_state_text(want),
+           DENSE_REPACK_OUTSIDE_POOL_ENV, flag)
+    )
 
 
 def plan_d_residency(
@@ -1110,6 +1297,7 @@ def plan_d_residency(
         cfg = json.load(fh)
     text_cfg = cfg.get("text_config") or cfg
     slot_bytes = float(terms.expert_layer_weight_bytes) / int(terms.num_experts)
+    dense_repack = dense_repack_outside_pool(env_d)
     ref, why = _reference_for(
         model_path=model_path,
         rank_tp_ratio=rank_tp_ratio,
@@ -1117,6 +1305,7 @@ def plan_d_residency(
         n_ranks=n,
         n_layers=int(terms.n_layers),
         slot_bytes=slot_bytes,
+        dense_repack=dense_repack,
     )
     if ref is None:
         return DResidencyPlan(
@@ -1154,7 +1343,8 @@ def plan_d_residency(
         "%s FRACTION-SOLVE %s (Pufferregel, H8): Budget je Rang %s MiB, %d Layer x "
         "%.3f MiB/Zeile, %d Experten nach --rank-moe-ratio %s + 1 Pad-Zeile, Scratch "
         "%s, Staging %d, Draft-Vokabular %s (%s=%s, %.0f MiB), %d Token KV Pflicht, "
-        "fester Rang-Posten gemessen in %s -> DECKE je Rang %s (gegeben: %s)%s"
+        "fester Rang-Posten gemessen in %s (%s, %s=%s) -> DECKE je Rang %s "
+        "(gegeben: %s)%s"
         % (
             marker,
             label,
@@ -1171,6 +1361,9 @@ def plan_d_residency(
             vocab,
             int(kv_tokens),
             ref.source,
+            h39_state_text(ref.dense_repack_outside_pool),
+            DENSE_REPACK_OUTSIDE_POOL_ENV,
+            "1" if dense_repack else "0",
             [
                 "KEINE" if f.ceiling_fraction is None else "%.3f" % f.ceiling_fraction
                 for f in fits
@@ -1193,6 +1386,7 @@ def plan_d_residency(
         share_embed=share,
         label=label,
         marker=marker,
+        dense_repack=dense_repack,
     )
     refusals = [t for t in (refusal_text(fits, label=label), card_refusal) if t]
     return DResidencyPlan(
@@ -1211,8 +1405,10 @@ def _card_reference_for(
     n_ranks: int,
     n_layers: int,
     slot_bytes: float,
+    dense_repack: bool = DENSE_REPACK_OUTSIDE_POOL_DEFAULT,
 ) -> Tuple[Optional[DCardReference], str]:
-    """Die Karten-Referenz fuer DIESE Form, oder ``(None, warum nicht)``."""
+    """Die Karten-Referenz fuer DIESE Form und DIESEN Baum-Zustand (H50), oder
+    ``(None, warum nicht)``."""
     import os
 
     model = os.path.basename(os.path.normpath(model_path))
@@ -1222,36 +1418,46 @@ def _card_reference_for(
         for p in paths:
             with open(p, errors="replace") as fh:
                 boots.append((os.path.basename(p), fh.read()))
-        return (
-            d_card_reference_from_logs(
-                boots,
-                n_ranks=n_ranks,
-                n_layers=n_layers,
-                slot_bytes=slot_bytes,
-                model=model,
-                rank_tp_ratio=rank_tp_ratio,
-            ),
-            "",
+        ref = d_card_reference_from_logs(
+            boots,
+            n_ranks=n_ranks,
+            n_layers=n_layers,
+            slot_bytes=slot_bytes,
+            model=model,
+            rank_tp_ratio=rank_tp_ratio,
         )
+        if ref.dense_repack_outside_pool != bool(dense_repack):
+            return None, _h39_mismatch_text(
+                ref.source, ref.dense_repack_outside_pool, dense_repack,
+                "--d-card-reference-logs",
+            )
+        return ref, ""
     ref = D_CARD_REFERENCE_FNFL2
+    for cand in D_CARD_REFERENCES:
+        if cand.dense_repack_outside_pool == bool(dense_repack):
+            ref = cand
+            break
     if (
         ref.model != model
         or ref.rank_tp_ratio != rank_tp_ratio
         or len(ref.headroom0_mib) != n_ranks
+        or ref.dense_repack_outside_pool != bool(dense_repack)
     ):
         return None, (
             "die eingebaute Karten-Referenz (%s) gilt fuer %s mit --rank-tp-ratio %s "
-            "auf %d Raengen, dieser Boot faehrt %s mit %s auf %d; den Posten "
-            "ausserhalb des Budgets per --d-card-reference-logs <D.log,...> aus "
-            "Boots DIESER Form messen (WEG2-GRAPH-POOL bzw. [vram-peak] + #1027)"
+            "auf %d Raengen (%s), dieser Boot faehrt %s mit %s auf %d (%s); den "
+            "Posten ausserhalb des Budgets per --d-card-reference-logs <D.log,...> "
+            "aus Boots DIESER Form messen (WEG2-GRAPH-POOL bzw. [vram-peak] + #1027)"
             % (
                 ref.source,
                 ref.model,
                 ref.rank_tp_ratio,
                 len(ref.headroom0_mib),
+                h39_state_text(ref.dense_repack_outside_pool),
                 model,
                 rank_tp_ratio,
                 n_ranks,
+                h39_state_text(bool(dense_repack)),
             )
         )
     return ref, ""
@@ -1269,6 +1475,7 @@ def _plan_d_card(
     share_embed: bool,
     label: str,
     marker: str,
+    dense_repack: bool = DENSE_REPACK_OUTSIDE_POOL_DEFAULT,
 ) -> Tuple[Tuple[str, ...], Tuple[DCardFit, ...], Optional[str]]:
     """H33: die Karten-Bilanz neben der Budget-Bilanz. Eine unlesbare Referenz
     verweigert nicht, sie wird benannt (wie H8); verweigert wird nur aus einer
@@ -1286,6 +1493,7 @@ def _plan_d_card(
             n_ranks=len(fits),
             n_layers=n_layers,
             slot_bytes=slot_bytes,
+            dense_repack=dense_repack,
         )
     except (OSError, ValueError) as exc:
         ref, why = None, "%s: %s" % (type(exc).__name__, exc)
@@ -1304,19 +1512,29 @@ def _plan_d_card(
         near_oom_mib=float(NEAR_OOM_MIB),
         band_floor_mib=floor,
     )
+    edges = [
+        scratch_edge(
+            local_experts=f.local_experts,
+            fraction=f.fraction,
+            max_rows=min(f.ceiling_max_rows, c.ceiling_max_rows),
+        )
+        for f, c in zip(fits, cards)
+    ]
     head = (
         "%s KARTE %s (H33, Posten ausserhalb des Budgets GEMESSEN): Kopfraum je Rang "
         "= cap - peak - privat_frei am bindenden Messpunkt von %s (cap = card free + "
         "reserved, peak = allocator peak since pools, privat_frei = freie Bloecke "
-        "privater Graph-/Tag-Pools, fuer empty_cache unerreichbar), verschoben um "
-        "die Pufferbytes dieses Boots; Grenze near-OOM %d MiB "
+        "privater Graph-/Tag-Pools, fuer empty_cache unerreichbar; %s), verschoben "
+        "um die Pufferbytes dieses Boots; Grenze near-OOM %d MiB "
         "(corridor_guard.NEAR_OOM_MIB, Stopper in jeder Phase), Decode gegen den "
         "Band-Floor %d MiB (Befund) -> KARTEN-DECKE je Rang %s, BUDGET-DECKE %s "
-        "(gegeben: %s)"
+        "(gegeben: %s) | KANTE bei gegebener f (min Budget, Karte): Zeilen %s = "
+        "SCRATCH <= %s (gegeben: %s)"
         % (
             marker,
             label,
             ref.source,
+            h39_state_text(ref.dense_repack_outside_pool),
             NEAR_OOM_MIB,
             floor,
             [
@@ -1328,6 +1546,9 @@ def _plan_d_card(
                 for f in fits
             ],
             ["%.3f" % f.fraction for f in fits],
+            [e[0] for e in edges],
+            ["KEINE" if e[1] is None else e[1] for e in edges],
+            [int(f.scratch_rows) for f in fits],
         )
     )
     lines = (head,) + tuple(

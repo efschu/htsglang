@@ -10933,6 +10933,7 @@ def log_wake_credit_solve_pd(ns, cards: List[Card], log, label: str, *, p_split,
     Verweigerung (W126, Kreditmangel P->D) oder None; die Front-Tabelle
     haengt an ``_WAKE_CREDIT_FRONT_PLAN``."""
     global _WAKE_CREDIT_FRONT_PLAN
+    from sglang.srt.planner import expert_residency as _er
     from sglang.srt.weg2 import wake_credit_pd as _wpd
 
     try:
@@ -10944,6 +10945,10 @@ def log_wake_credit_solve_pd(ns, cards: List[Card], log, label: str, *, p_split,
             p_rows=p_rows, d_rows=d_rows, slot_mib=float(slot_mib), label=label,
             apply=bool(envs.SGLANG_WEG2_ENABLE_PD_TIMED_ORDER.get()),
             p_resident=p_resident, d_resident=d_resident,
+            # H50: der Baum-Zustand H39 der D-Gruppe waehlt die Referenz mit
+            # (dieselbe Env, aus der der D-FRACTION-SOLVE seine liest).
+            dense_repack=_er.dense_repack_outside_pool(
+                parse_group_env(getattr(ns, "env_d", "") or "")),
         )
     except (KeyError, ValueError, IndexError) as _exc:
         log(f"{_wpd.MARKER} {_wpd.DIRECTION} {label} failed: {type(_exc).__name__}: {_exc}")
@@ -12500,10 +12505,14 @@ def build_parser() -> argparse.ArgumentParser:
              "denen der D-FRACTION-SOLVE den festen Rang-Posten MISST "
              "('weights + runtime state' minus Experten-Puffer, Aktivierung, "
              "mamba/spec, KV-Zelle, Draft-Vokabular; je Term das Maximum ueber "
-             "die Boots). Leer = die eingebaute Referenz "
-             "expert_residency.D_RESIDENCY_REFERENCE_FNFL2 (fnFL2x98/x99/x100, "
-             "Next Flash Form A, --rank-tp-ratio 1,0,0); fuer jede andere Form "
-             "entfaellt die Decke mit Namen, bis Logs DIESER Form gegeben sind.")
+             "die Boots). Leer = die eingebaute Referenz des Baum-Zustands "
+             "(H50, SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL der D-Gruppe): an = "
+             "expert_residency.D_RESIDENCY_REFERENCE_FNFL2_H39 (fnFL2x151 + x158), "
+             "aus = D_RESIDENCY_REFERENCE_FNFL2 (fnFL2x98/x99/x100), beide Next "
+             "Flash Form A, --rank-tp-ratio 1,0,0; fuer jede andere Form "
+             "entfaellt die Decke mit Namen, bis Logs DIESER Form gegeben sind. "
+             "Logs im anderen H39-Zustand als die D-Gruppe werden benannt, nicht "
+             "gerechnet.")
     ap.add_argument(
         "--d-card-reference-logs", default="",
         help="H33: Komma-Liste von D-Boot-Logs, aus denen die KARTEN-Bilanz des "
@@ -12512,8 +12521,10 @@ def build_parser() -> argparse.ArgumentParser:
              "(WEG2-GRAPH-POOL-Zeilen; aeltere Logs: [vram-peak] + #1027 "
              "trapped=), normiert auf den Pufferbytes des Logs; je Rang das "
              "Minimum ueber die Boots. Unter corridor_guard.NEAR_OOM_MIB "
-             "verweigert W130. Leer = die eingebaute Referenz "
-             "expert_residency.D_CARD_REFERENCE_FNFL2 (fnFL2x141 + fnFL2x144).")
+             "verweigert W130. Leer = die eingebaute Referenz des Baum-Zustands "
+             "(H50): H39 an = expert_residency.D_CARD_REFERENCE_FNFL2_H39 "
+             "(fnFL2x151 + fnFL2x158), aus = D_CARD_REFERENCE_FNFL2 (fnFL2x141 + "
+             "fnFL2x144).")
     ap.add_argument(
         "--p-card-reference-logs", default="",
         help="H41: Komma-Liste von P-Boot-Logs (WEG2-GRAPH-POOL-Zeilen), aus denen "

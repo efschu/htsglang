@@ -720,21 +720,33 @@ def plan_wake_credit_pd(*, model: str, p_split: Sequence[int], chunk_layers: int
                         p_resident: Optional[Sequence[int]] = None,
                         d_resident: Optional[Sequence[int]] = None,
                         references: Optional[Mapping[str, Mapping[str, object]]] = None,
-                        form_keys: Optional[Mapping[str, Mapping[str, object]]] = None
+                        form_keys: Optional[Mapping[str, Mapping[str, object]]] = None,
+                        dense_repack: Optional[bool] = None,
                         ) -> WakeCreditPlanPD:
     """Der Planer-Riegel P->D: der Wake der GEPLANTEN Form gegen die gemessene
     Referenz derselben Form (Draft auf P: fnFL2x141, H25: fnFL2x144), Delta =
     Pufferregel. ``p_rows``/``d_rows``: Pufferzeilen je Stufe/Rang (H8);
     ``p_resident``/``d_resident``: deren residente Zeilen (ohne Scratch), aus
     denen die Lane-Bytes folgen (``shared_rows``); ``slot_mib``: MiB je Zeile
-    und Layer."""
+    und Layer. ``dense_repack`` (H50): der Baum-Zustand H39 der Gruppen
+    (SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL); er waehlt die Referenz mit, weil
+    D-Bedarf und P-Freigabe derselben Form sich um die toten Tag-Pool-Bloecke
+    unterscheiden (x144 gegen x158: D TP0 20720 gegen 16366 MiB). ``None`` =
+    der Zustand vor H39 (die Referenzen, die es vor H50 gab)."""
     import os
 
     from sglang.srt.weg2 import wake_credit_pd_refs as _refs
 
     refs = dict(references if references is not None else _refs.REFERENCES)
     keys = dict(form_keys if form_keys is not None else _refs.FORM_KEYS)
+    want_repack = bool(dense_repack) if dense_repack is not None else False
     boot = "fnFL2x141" if draft_on_p else "fnFL2x144"
+    for name in sorted(keys):
+        k = keys[name]
+        if (bool(k.get("draft_on_p")) == bool(draft_on_p)
+                and bool(k.get("dense_repack", False)) == want_repack):
+            boot = name
+            break
     have = {
         "model": os.path.basename(os.path.normpath(str(model))),
         "p_split": tuple(int(x) for x in p_split),
@@ -742,6 +754,7 @@ def plan_wake_credit_pd(*, model: str, p_split: Sequence[int], chunk_layers: int
         "p_card": tuple(int(x) for x in p_card),
         "d_ratio": ",".join("%g" % float(x) for x in str(d_ratio).split(",") if x.strip()),
         "draft_on_p": bool(draft_on_p),
+        "dense_repack": want_repack,
     }
     key = dict(keys.get(boot) or {})
     diff = [k for k in key if key[k] != have.get(k)]
