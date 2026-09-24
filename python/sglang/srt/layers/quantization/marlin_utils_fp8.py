@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import weakref
 from typing import Optional
 
 import torch
@@ -98,6 +99,50 @@ def apply_fp8_marlin_linear(
         output.add_(bias)
 
     return output.reshape(out_shape)
+
+
+#: Workspaces taken off their modules by :func:`fp8_marlin_workspace_off_module`,
+#: weakly held, so :func:`zero_fp8_marlin_workspaces` can restore their zero
+#: contract after a weg2 weights resume. Empty on every boot without the switch.
+_PRIVATE_WORKSPACES: "weakref.WeakValueDictionary[int, torch.Tensor]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def fp8_marlin_workspace_off_module(layer: torch.nn.Module) -> Optional[torch.Tensor]:
+    """Take the Marlin lock workspace OFF the module and register it; return it
+    (``None`` if the layer has none). The tensor itself is unchanged.
+
+    27B line, FP8 on the weg2 flip (SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE, set by
+    the launcher's --fp8-uniform-marlin; default off).
+    ``prepare_fp8_layer_for_marlin`` leaves ``layer.workspace`` as a PLAIN tensor
+    attribute: ``sms x int32``, zero at rest, sized by THIS card's SM count (170
+    on the 5090, 68 on a 3080), allocated inside the layer's weights tag.
+    * On the module the flip exchange's coverage walk sees it in
+      ``vars(module)``, no plan can source it (its size is per CARD, the plan
+      moves bytes between cards) and the flip refuses: W84 UNCOVERED.
+      compressed-tensors' Marlin keeps its workspace on the scheme object
+      (compressed_tensors_wNa16.py); the FP8 method now does the same.
+    * A weights resume maps RECYCLED pages under the tag (weight_updater: "Recycled
+      pages are not zero"), and the kernel's inter-block locks need zero. The
+      registry below is what :func:`zero_fp8_marlin_workspaces` re-zeroes after
+      every weights resume, before the first forward.
+    """
+    ws = layer.__dict__.pop("workspace", None)
+    if ws is None:
+        return None
+    _PRIVATE_WORKSPACES[id(ws)] = ws
+    return ws
+
+
+def zero_fp8_marlin_workspaces() -> int:
+    """Re-zero every registered FP8 Marlin workspace; the count (0 = none
+    registered, i.e. every boot without SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE)."""
+    n = 0
+    for ws in list(_PRIVATE_WORKSPACES.values()):
+        ws.zero_()
+        n += 1
+    return n
 
 
 def prepare_fp8_layer_for_marlin(

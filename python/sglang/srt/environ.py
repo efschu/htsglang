@@ -1494,6 +1494,14 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    # 27B line FP8 (weg2 --fp8-uniform-marlin, default off): the FP8 Marlin
+    # linear keeps its lock workspace (sms x int32, zero at rest, sized by the
+    # card's SM count) on the quant METHOD instead of the module, and every weg2
+    # weights resume re-zeroes it. On the module it is a plain tensor attribute
+    # under a weights tag, which the flip exchange's coverage walk refuses (W84
+    # UNCOVERED); and a resume maps recycled, non-zero pages under the tag.
+    # compressed-tensors' Marlin already keeps its workspace on the scheme.
+    SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE = EnvBool(False)
     # Opt-in BIT-DETERMINISM for fp8 linears on sm80..sm88 (#192, from #190).
     #
     # WHAT IS BROKEN. On sm80..88 an fp8 checkpoint has exactly one GEMM
