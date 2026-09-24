@@ -15850,6 +15850,15 @@ class Scheduler(
             )
 
             arm_draft_cold_for_admission(self, batch)
+        # fnFL2 H32: the chunked request's NEXT chunk, for the PLE gather to
+        # read on its worker processes while this forward runs (no-op unless
+        # a PLE prefetcher lives in this process).
+        if batch.forward_mode.is_extend():
+            from sglang.srt.models.qwen4_exp_ple_prefetch import (
+                publish_ple_next_chunk,
+            )
+
+            publish_ple_next_chunk(batch.reqs, self.chunked_prefill_size)
         # Pairing objective (#274 slice D): publish this batch's grain shape
         # for the lane's pairing policy. Read-only for the policy, one tuple
         # store here; None on every default path. Publishing must not alter

@@ -206,6 +206,10 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_checkpoint_pread_gather,
     make_ple_file_rss_trimmer,
 )
+from sglang.srt.models.qwen4_exp_ple_prefetch import (
+    make_ple_prefetch_gather,
+    ple_next_chunk_hasher,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, logger
 
@@ -1026,6 +1030,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # refuses by name.
         self._ckpt_table = None
         self._ckpt_pread = None
+        # fnFL2 H32: the owning n-gram embedding's hash, for the next-chunk
+        # prefetch (set by Qwen4ExpPLELayer; None = no prefetch)
+        self.next_chunk_hasher = None
         self._ckpt_backend = backend == "checkpoint"
         if self._ckpt_backend:
             host_table = torch.empty(
@@ -1070,7 +1077,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             )
         self._ckpt_table = table
         self._ckpt_prefetcher = make_ple_checkpoint_prefetcher(table)
-        self._ckpt_pread = make_ple_checkpoint_pread_gather(table)
+        self._ckpt_pread = make_ple_prefetch_gather(
+            make_ple_checkpoint_pread_gather(table), table, self.next_chunk_hasher
+        )
 
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
@@ -1201,6 +1210,9 @@ class Qwen4ExpPLELayer(nn.Module):
                 self.ple_embedding.ngram_embedding,
                 backend=getattr(config, "ple_offload_backend", "pinned"),
                 table_dir=getattr(config, "ple_offload_dir", None),
+            )
+            self.ple_embedding.ngram_embedding.next_chunk_hasher = (
+                ple_next_chunk_hasher(self.ple_embedding)
             )
         self.short_conv_dilation = self.ple_embedding.ngram_size
         self.short_conv_state_len = (

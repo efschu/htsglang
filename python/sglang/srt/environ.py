@@ -610,6 +610,13 @@ class Envs:
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+    # fnFL2 H32 (checkpoint backend with SGLANG_QWEN4_PLE_CKPT_GATHER=pread):
+    # the prefill pread gather runs in worker PROCESSES, and the chunked
+    # request's NEXT chunk is gathered while the current chunk's forward runs
+    # (ring of two shared host slots). Off = the in-process serial gather.
+    SGLANG_QWEN4_PLE_PREFETCH = EnvBool(True)
+    SGLANG_QWEN4_PLE_PREFETCH_PROCS = EnvInt(4)
+    SGLANG_QWEN4_PLE_PREFETCH_THREADS = EnvInt(4)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     # Weight loader: read safetensors tensors with pread() instead of mmap
     # page faults (ZFS: ~0.5 GB/s per rank through mmap, ~3 GB/s through
