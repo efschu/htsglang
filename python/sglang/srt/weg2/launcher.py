@@ -1995,6 +1995,9 @@ class BootState:
     logs: Dict[str, str] = field(default_factory=dict)
     pids: Dict[str, int] = field(default_factory=dict)
     helper_pids: List[int] = field(default_factory=list)
+    #: H52: the mem time series supervisor (session leader, pgid == pid);
+    #: also in ``helper_pids``. teardown() stops it by process group.
+    memts_pid: int = 0
     #: #1236: WHERE this boot's store directory is, on disk. Replaces
     #: ``store_mount`` + ``store_gib`` -- there is no mount and no RAM size.
     store_dir: str = ""
@@ -7415,6 +7418,123 @@ def arm_deadman(log: Log, boot_log: str, port: int, pattern: str, probe_s: int, 
     n = len(proof.splitlines())
     log(f"deadman {name}: pid {pid} GRACE_S=600 PROBE_S={probe_s} pattern={pattern!r} verdict -> {out}; pgrep proof: {n} process(es) whose argv carries THIS log ({proof or 'NONE -- UNKNOWN, never alive'})")
     return pid
+
+
+# --------------------------------------------------------------------------
+# H52: the host memory time series, bound to the boot's lifetime
+# --------------------------------------------------------------------------
+#
+# MEASURED 24.09. 14:00Z (27B session, sar): 107 mem_timeseries.sh loggers of
+# fnFL2x33 .. x153b were still sampling, 3397 process starts/s instead of 258,
+# %sys 15.7 instead of 4.0. Root (H52): the logger was stopped ONLY by
+# teardown(), and teardown() runs only for `--teardown PATH` and for a refusal
+# AFTER a spawn (26 of 157 fnFL2 boots). The normal end -- LAUNCHED, the arm
+# probes, the arm's own teardown TERMs front/launcher and kill -9s the
+# schedulers -- never runs it, and the logger lives in its OWN session
+# (setsid), so nothing the arm kills takes it along. The pid was right
+# (`$!` == the logger, state json carried it: x157 3358575 in both) and the
+# script dies on SIGTERM; nobody sent one.
+#
+# So the logger now watches its OWNER itself: a supervisor shell (session
+# leader, pgid == its pid) runs the logger as a child and polls for a live
+# launcher or front of THIS tag; when neither is left it TERMs its whole
+# process group. teardown() still stops it explicitly (killpg + an anchored
+# pgrep net on this tag's csv) and says so in one line.
+
+#: Seconds between two owner-liveness polls of the memts supervisor.
+MEMTS_OWNER_POLL_S = 5
+
+#: The supervisor: logger as a background child (same pgid), then poll the
+#: owner pattern; "$4" empty = no owner watch (only teardown stops it).
+_MEMTS_SUPERVISOR_SH = (
+    '"$1" "$2" "$3" & '
+    'if [ -n "$4" ]; then '
+    'while sleep "$5"; pgrep -f "$4" > /dev/null; do :; done; '
+    'kill -TERM 0; '
+    'else wait; fi'
+)
+
+
+def memts_csv_path(tag: str) -> str:
+    return f"{GPU_ARB}/memts_weg2_{tag}.csv"
+
+
+def memts_pgrep_pattern(tag: str) -> str:
+    """Anchored argv pattern of THIS tag's logger and its supervisor, and of
+    nothing else: starts with ``bash``, carries the script path, and the csv
+    path must END at a space or the line end (``..._fnFL2x15.csv`` never
+    matches ``..._fnFL2x157.csv``, and never another line's tag)."""
+    return rf"^bash .*{re.escape(MEMTS)} {re.escape(memts_csv_path(tag))}( |$)"
+
+
+def memts_owner_pattern(tag: str) -> str:
+    """argv pattern of the processes whose life the logger is bound to: the
+    launcher (until it returns after LAUNCHED) and the front (from before the
+    launcher returns until the arm's teardown). Escaped, so the supervisor's
+    own argv -- which carries this string -- never matches it."""
+    return rf"sglang\.srt\.weg2\.(launcher|front) .*--tag {re.escape(tag)}( |$)"
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def start_memts(state: "BootState", log: Log) -> int:
+    """Start the logger under its owner-watching supervisor, record the pid in
+    the boot state AND persist the state before returning: a crash or refusal
+    between here and the next _write_state() must still leave the pid on file
+    for `--teardown PATH`."""
+    csv = memts_csv_path(state.tag)
+    owner = memts_owner_pattern(state.tag)
+    if not re.search(owner, _proc_cmdline(os.getpid())):
+        log(f"memts owner watch OFF: this launcher's own argv does not match {owner!r} "
+            f"-- only teardown() stops the logger")
+        owner = ""
+    p = subprocess.Popen(
+        ["bash", "-c", _MEMTS_SUPERVISOR_SH, "memts-guard", MEMTS, csv, "5", owner,
+         str(MEMTS_OWNER_POLL_S)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+    state.memts_pid = p.pid
+    state.helper_pids.append(p.pid)
+    _write_state(state)
+    log(f"mem time series pid {p.pid} (pgid, supervisor; owner watch {owner!r}, "
+        f"poll {MEMTS_OWNER_POLL_S} s) csv {csv} (started before group P: launch AND run "
+        f"moments sampled; state {state_path(state)} carries the pid)")
+    return p.pid
+
+
+def stop_memts(tag: str, pid: int) -> str:
+    """TERM the logger's process group (only if its leader is still OURS, by
+    argv -- a recycled pid is never signalled), then TERM whatever the
+    anchored pgrep net still finds for THIS tag. Returns the teardown line."""
+    killed: List[int] = []
+    csv = memts_csv_path(tag)
+    if pid and csv in _proc_cmdline(pid):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+            killed.append(pid)
+        except OSError:
+            pass
+    net: List[int] = []
+    if tag:
+        out = subprocess.run(["pgrep", "-f", memts_pgrep_pattern(tag)],
+                             capture_output=True, text=True).stdout.split()
+        for s in out:
+            q = int(s)
+            if q == os.getpid() or q in killed:
+                continue
+            try:
+                os.kill(q, signal.SIGTERM)
+                net.append(q)
+            except OSError:
+                pass
+    verdict = "killed" if killed or net else "already-gone"
+    return f"WEG2-TEARDOWN memts pid={pid} {verdict} (killpg={killed} pgrep-net={net} csv={csv})"
 
 
 def flip_weights_tags(ns, family: List[str]) -> List[str]:
@@ -14924,10 +15044,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # moment (P image resident, D loading) is measured this time, not only
     # the run moment (record 1h: the ls1b2 sampler started after D READY).
     if not dry:
-        memts = f"{GPU_ARB}/memts_weg2_{ns.tag}.csv"
-        mpid = int(subprocess.run(["bash", "-c", f"setsid {MEMTS} {shlex.quote(memts)} 5 > /dev/null 2>&1 & echo $!"], capture_output=True, text=True).stdout.strip() or 0)
-        state.helper_pids.append(mpid)
-        log(f"mem time series pid {mpid} csv {memts} (started before group P: launch AND run moments sampled)")
+        start_memts(state, log)
 
     # 3. store -- ON DISK, SIZED FROM THE P KV POOL (#1236).
     #
@@ -16039,8 +16156,13 @@ def teardown(path: str, report: dict | None = None) -> int:
             pids.add(int(pid))
     out = subprocess.run(["pgrep", "-f", r"launch_server.*--port 3003[12]|sglang\.srt\.weg2\.front"], capture_output=True, text=True).stdout.split()
     pids |= {int(p) for p in out}
+    # H52: the logger first, by process group, with its own verdict line --
+    # the helper loop below only TERMs a pid, and this is the helper that
+    # outlived 107 boots.
+    memts_pid = int(st.get("memts_pid") or 0)
+    print(stop_memts(st.get("tag", ""), memts_pid), flush=True)
     for hp in st.get("helper_pids", []):
-        if hp:
+        if hp and int(hp) != memts_pid:
             try:
                 os.kill(int(hp), signal.SIGTERM)
             except OSError:
@@ -16255,7 +16377,10 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
         spawned = {name: pid for name, pid in (st.pids if st else {}).items() if pid}
         if not spawned:
             # Refused before the first launch_group() call -- nothing to tear
-            # down. Today's behavior, unchanged.
+            # down. Today's behavior, unchanged -- except the memts logger,
+            # which starts BEFORE group P (H52): stop it here, not teardown().
+            if st is not None and st.memts_pid:
+                print(f"[{_now()}] {stop_memts(st.tag, st.memts_pid)}", flush=True)
             return 2
         # #1248: at least one group is already running. Go through the SAME
         # teardown() the operator's `--teardown PATH` mode and the killer use
