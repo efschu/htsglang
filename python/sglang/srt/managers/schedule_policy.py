@@ -1403,7 +1403,15 @@ class PrefillAdder:
         retracted_stain: bool,
         mamba_gap_reserve: int = 0,
         mamba_slot_charge: int = 0,
+        computed_input_len: Optional[int] = None,
     ):
+        # H24: the LOG counters (#new-token of the prefill lines, input
+        # throughput) count the tokens the forward computes; only the BUDGET
+        # is page-ceiled. fnFL2x137 D printed '#new-token: 64' for a 1-token
+        # extend (#998 EXTENT (97840, 97841, 1), HOST-ANON-PASS tokens=1):
+        # the caller passes the already-ceiled length, so it names the
+        # computed one separately.
+        logged_input_len = extend_input_len if computed_input_len is None else computed_input_len
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
@@ -1439,10 +1447,10 @@ class PrefillAdder:
         # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
         # when computing the first-attempt prefix cache hit rate.
         self.log_hit_tokens += prefix_len
-        self.log_input_tokens += extend_input_len
+        self.log_input_tokens += logged_input_len
         if retracted_stain:
             self.reprocessed_log_hit_tokens += prefix_len
-            self.reprocessed_log_input_tokens += extend_input_len
+            self.reprocessed_log_input_tokens += logged_input_len
 
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
@@ -2729,6 +2737,7 @@ class PrefillAdder:
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                     mamba_slot_charge=self._mamba_slots_for_req(req),
+                    computed_input_len=_ea_len if _ea_forced else len(req.full_untruncated_fill_ids) - _ea_start,
                 )
             else:
                 # Make sure at least one page is available
