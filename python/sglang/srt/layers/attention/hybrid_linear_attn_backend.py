@@ -1199,6 +1199,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
+        if intermediate_state_cache is None:
+            # 27B ReplaySSM package: the spec ring replaced the intermediate
+            # state; this route is not wired to it (S3). Refuse, never scatter
+            # a None.
+            raise RuntimeError(
+                "ReplaySSM spec ring allocated (--enable-linear-replayssm-spec) "
+                "but this commit path still reads intermediate_ssm"
+            )
 
         if os.getenv("SGLANG_767_TRACE", "") not in ("", "0"):
             import logging as _logging
