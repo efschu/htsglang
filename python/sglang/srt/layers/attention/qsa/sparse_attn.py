@@ -1,10 +1,13 @@
 """Validated sparse GQA operators migrated from the QSA reference branch."""
 
+import logging
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 _H20_CONFIGS = [
     (32, (32, 8, 2)),
@@ -95,6 +98,102 @@ def _get_rows_config(total_q: int):
         if table is not None:
             return next(cfg for limit, cfg in table if total_q <= limit)
     return _get_best_config(total_q)
+
+
+# fnFL2 H65: which in-kernel fp8 decode the rows kernel runs (FP8_DECODE_*,
+# see the decode helpers above _sparse_attn_rows_fwd).
+# SGLANG_WEG2_QSA_FP8_DECODE, grammar  [smXX:]MODE[;[smYY:]MODE]  with
+# MODE = exp2 | bits | ptx; an arch group wins over a generic one, whatever
+# the order; an arch no group names keeps exp2 (the default -- the kernel
+# then compiles to the same SASS as before H65). "ptx" needs sm80+
+# (fma.rn.bf16x2) and is refused below.
+FP8_DECODE_EXP2 = 0
+FP8_DECODE_BITS = 1
+FP8_DECODE_PTX = 2
+_FP8_DECODE_MODES = {"exp2": FP8_DECODE_EXP2, "bits": FP8_DECODE_BITS, "ptx": FP8_DECODE_PTX}
+_FP8_DECODE_NAMES = {v: k for k, v in _FP8_DECODE_MODES.items()}
+
+
+def parse_fp8_decode(raw: str, arch: int) -> int:
+    """The FP8_DECODE constexpr SGLANG_WEG2_QSA_FP8_DECODE names for ``arch``
+    (e.g. 86, 120); 0 (exp2) when it names none."""
+    generic = chosen = None
+    for group in (g.strip() for g in str(raw or "").split(";")):
+        if not group:
+            continue
+        target = None
+        if group.startswith("sm") and ":" in group:
+            head, group = group.split(":", 1)
+            target = int(head[2:])
+        mode = group.strip().lower()
+        if mode not in _FP8_DECODE_MODES:
+            raise ValueError(
+                f"SGLANG_WEG2_QSA_FP8_DECODE group {group!r}: mode must be one of "
+                f"{sorted(_FP8_DECODE_MODES)}"
+            )
+        if target is None:
+            generic = _FP8_DECODE_MODES[mode]
+        elif target == int(arch):
+            chosen = _FP8_DECODE_MODES[mode]
+    value = chosen if chosen is not None else generic if generic is not None else FP8_DECODE_EXP2
+    if value == FP8_DECODE_PTX and int(arch) < 80:
+        raise ValueError(
+            f"SGLANG_WEG2_QSA_FP8_DECODE={raw!r}: 'ptx' needs sm80+ "
+            f"(fma.rn.bf16x2), this device is sm{int(arch)}"
+        )
+    return value
+
+
+_FP8_DECODE_CACHE: dict = {}
+
+
+def _rows_fp8_decode() -> int:
+    """FP8_DECODE for this device: 0 (exp2) unless SGLANG_WEG2_QSA_FP8_DECODE
+    names a mode for its arch."""
+    from sglang.srt.environ import envs
+
+    raw = envs.SGLANG_WEG2_QSA_FP8_DECODE.get()
+    if not raw:
+        return FP8_DECODE_EXP2
+    major, minor = torch.cuda.get_device_capability()
+    key = (raw, major * 10 + minor)
+    if key not in _FP8_DECODE_CACHE:
+        _FP8_DECODE_CACHE[key] = parse_fp8_decode(raw, key[1])
+    return _FP8_DECODE_CACHE[key]
+
+
+_ROWS_LAUNCH_SEEN: set = set()
+
+
+def _note_rows_launch(total_q, block_n, warps, stages, kv_fp8, fp8_decode) -> None:
+    """One QSA-ROWS-LAUNCH line per process and launch form: proof in the
+    rank's own log that the arm's launch config and fp8 decode arrived
+    (an env var in the launcher is not an env var in the rank)."""
+    form = (block_n, warps, stages, bool(kv_fp8), int(fp8_decode))
+    if form in _ROWS_LAUNCH_SEEN:
+        return
+    _ROWS_LAUNCH_SEEN.add(form)
+    from sglang.srt.environ import envs
+
+    try:
+        major, minor = torch.cuda.get_device_capability()
+        arch = f"sm{major * 10 + minor}"
+    except Exception:  # noqa: BLE001 -- a log line never fails a launch
+        arch = "sm?"
+    logger.info(
+        "QSA-ROWS-LAUNCH arch=%s kv=%s decode=%s cfg=%d/%d/%d first_total_q=%d "
+        "(SGLANG_FORCE_QSA_ROWS_CONFIG=%r SGLANG_WEG2_QSA_FP8_DECODE=%r; one line "
+        "per launch form)",
+        arch,
+        "fp8" if kv_fp8 else "16bit",
+        _FP8_DECODE_NAMES.get(int(fp8_decode), str(fp8_decode)) if kv_fp8 else "-",
+        block_n,
+        warps,
+        stages,
+        int(total_q),
+        envs.SGLANG_FORCE_QSA_ROWS_CONFIG.get(),
+        envs.SGLANG_WEG2_QSA_FP8_DECODE.get(),
+    )
 
 
 @triton.jit
@@ -609,6 +708,79 @@ def _fp8_e4m3_bytes_to_f32(x):
     return tl.where(nan, float("nan"), val)
 
 
+# fnFL2 H65: the rows kernel decodes EVERY selected K/V byte once per
+# (query, kv head) program -- a 16k prefix chunk decodes each prefix row
+# thousands of times -- and the exp2 decode above costs ~23 SASS instructions
+# per element (MUFU.EX2, two I2F, FMULs, ISETP/SEL chains). Offline compiled
+# (Triton 3.6, cuobjdump), it is ~95 % of the loop of every spill-free launch
+# config on sm86 AND sm120 (~370 of ~390 warp instructions per key). The two
+# decodes below give the SAME bits for all 254 non-NaN codes (0x80 -> +0.0
+# like the exp2 decode, see below; the two NaN codes stay NaN) with far
+# fewer instructions; SGLANG_WEG2_QSA_FP8_DECODE picks one
+# (_rows_fp8_decode, FP8_DECODE_*), default = the exp2 decode above.
+
+
+@triton.jit
+def _fp8_e4m3_bytes_to_f32_bits(x):
+    """Same value as ``_fp8_e4m3_bytes_to_f32`` without exp2 or int->float:
+    a normal code (exp field e >= 1) IS the fp32 word
+    ``(e + 120) << 23 | m << 20`` = ``((x & 0x7F) << 20) + (120 << 23)``;
+    for e == 0 that word is 2^-7 + m 2^-10, and ``2 f - 2^-6`` = m 2^-9 is the
+    subnormal, exactly (both operands normal, no denormal arithmetic);
+    0x7F/0xFF stay NaN, the sign comes last -- with the same ``-f`` as the
+    exp2 decode, which Triton lowers as ``0 - f``: 0x80 is +0.0 in both
+    (torch says -0.0; no dot can tell, every dot adds onto a +0 accumulator)."""
+    xi = x.to(tl.int32)
+    t = xi & 0x7F
+    f = ((t << 20) + 0x3C000000).to(tl.float32, bitcast=True)
+    f = tl.where(t < 8, f * 2.0 - 0.015625, f)
+    f = tl.where(t == 0x7F, float("nan"), f)
+    return tl.where(xi > 0x7F, -f, f)
+
+
+@triton.jit
+def _fp8_e4m3_bytes_to_bf16_ptx(x):
+    """Four fp8 bytes -> four bf16 per inline-PTX instance (sm80+), the
+    packed form of the same value: each byte goes to the high byte of a
+    16-bit half (prmt), ``(half >> 4) & 0x07F0`` puts exp/mantissa where bf16
+    keeps them (bias still 120 short), the sign bit is OR-ed back (lop3) and
+    ``fma.rn.bf16x2(s, 2^120, +0.0)`` rebiases -- exact for normals and for the
+    subnormals (bf16 denormal inputs, no .ftz on bf16). The +0.0 addend turns
+    0x80 into +0.0, bit for bit what the exp2 decode gives (see
+    _fp8_e4m3_bytes_to_f32_bits). The NaN codes (magnitude half 0x07F0) come
+    out of the fma as +-480; ``set.eq`` on that half forces 0x7FC0 into them,
+    so they stay NaN. 7 instructions per two elements instead of ~46."""
+    return tl.inline_asm_elementwise(
+        asm="""
+        {
+        .reg .b32 a<2>, m<2>, s<2>, v<2>, n<2>, k120, knan, kzero;
+        mov.b32 k120, 0x7B807B80;
+        mov.b32 knan, 0x07F007F0;
+        mov.b32 kzero, 0;
+        prmt.b32 a0, 0, $2, 0x5040;
+        prmt.b32 a1, 0, $2, 0x7060;
+        shr.b32 m0, a0, 4;
+        shr.b32 m1, a1, 4;
+        and.b32 m0, m0, 0x07F007F0;
+        and.b32 m1, m1, 0x07F007F0;
+        lop3.b32 s0, a0, 0x80008000, m0, 0xEA;
+        lop3.b32 s1, a1, 0x80008000, m1, 0xEA;
+        fma.rn.bf16x2 v0, s0, k120, kzero;
+        fma.rn.bf16x2 v1, s1, k120, kzero;
+        set.eq.u32.f16x2 n0, m0, knan;
+        set.eq.u32.f16x2 n1, m1, knan;
+        lop3.b32 $0, n0, 0x7FC07FC0, v0, 0xEA;
+        lop3.b32 $1, n1, 0x7FC07FC0, v1, 0xEA;
+        }
+        """,
+        constraints="=r,=r,r",
+        args=[x],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=4,
+    )
+
+
 @triton.jit
 def _sparse_attn_rows_fwd(
     q,
@@ -643,6 +815,7 @@ def _sparse_attn_rows_fwd(
     HEAD_DIM: tl.constexpr,
     KV_FP8: tl.constexpr,
     USE_COUNTS: tl.constexpr,
+    FP8_DECODE: tl.constexpr = 0,
 ):
     """WP3b: sparse GQA over ABSOLUTE K/V rows, with the LSE.
 
@@ -700,8 +873,15 @@ def _sparse_attn_rows_fwd(
             other=0,
         )
         if KV_FP8:
-            keys = _fp8_e4m3_bytes_to_f32(keys_raw).to(q_values.dtype)
-            values = _fp8_e4m3_bytes_to_f32(values_raw).to(q_values.dtype)
+            if FP8_DECODE == 2:
+                keys = _fp8_e4m3_bytes_to_bf16_ptx(keys_raw).to(q_values.dtype)
+                values = _fp8_e4m3_bytes_to_bf16_ptx(values_raw).to(q_values.dtype)
+            elif FP8_DECODE == 1:
+                keys = _fp8_e4m3_bytes_to_f32_bits(keys_raw).to(q_values.dtype)
+                values = _fp8_e4m3_bytes_to_f32_bits(values_raw).to(q_values.dtype)
+            else:
+                keys = _fp8_e4m3_bytes_to_f32(keys_raw).to(q_values.dtype)
+                values = _fp8_e4m3_bytes_to_f32(values_raw).to(q_values.dtype)
         else:
             keys = keys_raw.to(q_values.dtype)
             values = values_raw.to(q_values.dtype)
@@ -784,6 +964,10 @@ def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale, row_counts=None):
         raise TypeError(f"sparse rows kernel: unsupported KV dtype {k_pool.dtype}")
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_rows_config(total_q)
+    # fnFL2 H65: the fp8 decode only exists for an fp8 pool; a 16-bit pool
+    # keeps FP8_DECODE=0 so it never compiles a second variant.
+    fp8_decode = _rows_fp8_decode() if kv_fp8 else FP8_DECODE_EXP2
+    _note_rows_launch(total_q, block_n, warps, stages, kv_fp8, fp8_decode)
     _sparse_attn_rows_fwd[(total_q, num_kv_heads)](
         q,
         k_pool,
@@ -817,6 +1001,7 @@ def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale, row_counts=None):
         HEAD_DIM=head_dim,
         KV_FP8=kv_fp8,
         USE_COUNTS=use_counts,
+        FP8_DECODE=fp8_decode,
         num_warps=warps,
         num_stages=stages,
     )

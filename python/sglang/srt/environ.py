@@ -2242,6 +2242,16 @@ class Envs:
     # "sm86:512=32/4/2,inf=64/4/2" (only sm86 changes) or "inf=32/8/2" (all).
     # Empty = the table (default). Launch parameters only, same math.
     SGLANG_FORCE_QSA_ROWS_CONFIG = EnvStr("")
+    # QSA rows kernel fp8 decode (fnFL2 H65, same file): the kernel decodes
+    # every selected fp8 K/V byte once per (query, kv head) program; the
+    # default exp2 decode costs ~23 SASS instructions per element, ~95 % of
+    # the loop of every spill-free launch config (offline compiled, sm86 and
+    # sm120). "bits" = fp32 bit construction (~12), "ptx" = packed inline PTX,
+    # four bytes per instance (sm80+, ~3.5); both give the same value for all
+    # 256 codes. Grammar [smXX:]MODE[;...] (MODE exp2|bits|ptx), an arch group
+    # wins over a generic one, e.g. "sm86:ptx" moves only the 3080 stages.
+    # Empty = exp2 (default; the kernel compiles to the same SASS as before).
+    SGLANG_WEG2_QSA_FP8_DECODE = EnvStr("")
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
