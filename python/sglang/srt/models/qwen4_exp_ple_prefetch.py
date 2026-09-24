@@ -177,6 +177,15 @@ def ple_next_chunk_hasher(emb) -> Callable[[torch.Tensor, int], torch.Tensor]:
         windows = ple_chunk_windows(tokens, lead, p.ngram_size, p.eos_token_id)
         return ple_ngram_lookup_ids(windows, p).reshape(-1)
 
+    # fnFL2 H43: the admission hashes outside a forward, possibly while the
+    # weights are paused -- it asks first whether the constants are on the
+    # host, and the gather copies them there inside a forward.
+    def _warm() -> None:
+        if not params:
+            params.append(PleHashParams.of(emb))
+
+    _hash.ple_hash_ready = lambda: bool(params)
+    _hash.ple_hash_warm = _warm
     return _hash
 
 
@@ -747,7 +756,11 @@ def make_ple_prefetch_gather(base, table, hasher, *, delay_s: float = 0.0):
     returns ``base`` itself when the switch is off or there is nothing to wrap."""
     if base is None or hasher is None or not envs.SGLANG_QWEN4_PLE_PREFETCH.get():
         return base
-    return PlePrefetchGather(
+    # fnFL2 H43: plus the first chunk's read from the request's admission
+    from sglang.srt.models import qwen4_exp_ple_admit as _admit
+
+    cls = _admit.PleAdmitPrefetchGather if _admit.ple_admission_wanted() else PlePrefetchGather
+    return cls(
         base,
         table,
         hasher,

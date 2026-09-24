@@ -156,6 +156,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PlePrefetchHintReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -2807,6 +2808,7 @@ class Scheduler(
                 (SessionHandoverReqInput, self.handle_session_handover),
                 (SessionCheckpointReqInput, self.handle_session_checkpoint),
                 (VramBudgetReqInput, self.handle_vram_budget),
+                (PlePrefetchHintReqInput, self.handle_ple_prefetch_hint),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -6341,6 +6343,11 @@ class Scheduler(
                 pass
             # The population marker is consumed by this intake (see above).
             req._969c_population = None
+            # fnFL2 H43: the PLE gather of this request's first chunk starts
+            # here, on the pread workers, not at its first forward (no-op
+            # unless an admitting PLE gather lives in this process: PP0 of P).
+            if not is_retracted:
+                self._ple_admit_on_intake(req)
             # #1455 (reverts the #1448 order): the hold sits AFTER the prefetch
             # again -- the arena lookup, ref and pin run in the prefetch
             # executor for every held request WHILE the flip runs, and the
@@ -6380,6 +6387,30 @@ class Scheduler(
                 req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _ple_admit_on_intake(self, req: Req) -> None:
+        """fnFL2 H43: delegate a new request to the PLE first-chunk admission."""
+        from sglang.srt.models.qwen4_exp_ple_admit import admit_ple_request
+
+        admit_ple_request(
+            req,
+            self.chunked_prefill_size,
+            dormant=bool(getattr(self, "weg2_dormant", False)),
+        )
+
+    def handle_ple_prefetch_hint(self, recv_req: PlePrefetchHintReqInput) -> None:
+        """fnFL2 H43: the front's hint -- a request that will come to this
+        group (P still asleep, or its leg 1 not yet dispatched) -- starts the
+        first chunk's PLE read now. No reply; a no-op on ranks without an
+        admitting PLE gather (PP1/PP2, group D)."""
+        from sglang.srt.models.qwen4_exp_ple_admit import admit_ple_hint
+
+        admit_ple_hint(
+            recv_req.rid,
+            recv_req.input_ids,
+            self.chunked_prefill_size,
+            dormant=bool(getattr(self, "weg2_dormant", False)),
+        )
 
     def readmit_seam_residents(
         self, reqs: List[Req], requeue_waiting: bool = True
@@ -15859,6 +15890,11 @@ class Scheduler(
             )
 
             publish_ple_next_chunk(batch.reqs, self.chunked_prefill_size)
+            # fnFL2 H43: this batch's request order, for the first chunk's
+            # admission read to find its request
+            from sglang.srt.models.qwen4_exp_ple_admit import note_ple_batch
+
+            note_ple_batch(batch.reqs)
         # Pairing objective (#274 slice D): publish this batch's grain shape
         # for the lane's pairing policy. Read-only for the policy, one tuple
         # store here; None on every default path. Publishing must not alter
@@ -18298,6 +18334,13 @@ class Scheduler(
             getattr(recv_req, "rid", None),
             getattr(recv_req, "abort_all", None),
             deferred,
+        )
+        # fnFL2 H43: an aborted request's first-chunk PLE admission is dropped
+        from sglang.srt.models.qwen4_exp_ple_admit import drop_ple_admission
+
+        drop_ple_admission(
+            getattr(recv_req, "rid", None),
+            abort_all=bool(getattr(recv_req, "abort_all", False)),
         )
         self._abort_request_now(recv_req)
 

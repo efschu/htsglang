@@ -3427,6 +3427,7 @@ class Front:
         self.queue.append(p)
         logger.info("WEG2-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d)",
                     rid, self.awake, self.admit_d, est_prompt, remainder, len(self.queue))
+        self._maybe_ple_admit_hint(p)  # fnFL2 H43
         try:
             await fut  # leg 1 done and D awake
         except Weg2Stop as e:
@@ -3435,6 +3436,35 @@ class Front:
             return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
         self._mark_posted(p)
         return await self.leg2(request, rid, payload, text, stream, pending=p, seat=p.seat)
+
+    def _maybe_ple_admit_hint(self, p: Pending) -> None:
+        """fnFL2 H43: a BATCH arrival P will prefill while P is not awake --
+        tell P now, so PP0 reads the first chunk's PLE rows while P wakes
+        (weg2/ple_admit_hint.py). Fire and forget; never delays the route."""
+        if not envs.SGLANG_WEG2_PLE_ADMIT_HINT.get():
+            return
+        from sglang.srt.weg2.ple_admit_hint import HINT_PATH, ple_hint_body, ple_hint_wanted
+
+        if not ple_hint_wanted(awake=self.awake, skip_leg1=p.skip_leg1):
+            return
+        body = ple_hint_body(p.path, p.payload)
+        g = self.groups.get("P")
+        if body is None or g is None or self.session is None:
+            return
+
+        async def _post() -> None:
+            t0 = time.time()
+            try:  # rpc: the admin bearer token rides along (#1275)
+                code, _ = await self.rpc(g, HINT_PATH, body, 30)
+                logger.info("WEG2 PLE-HINT rid=%s awake=%s status=%d ms=%.0f",
+                            p.rid, self.awake, code, (time.time() - t0) * 1000.0)
+            except Exception as e:  # noqa: BLE001 -- a lost hint costs the gain only
+                logger.info("WEG2 PLE-HINT rid=%s failed: %r", p.rid, e)
+
+        tasks = self.__dict__.setdefault("_ple_hint_tasks", set())
+        task = asyncio.ensure_future(_post())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     # ---------------- D admission (C4, C5) ----------------
     @staticmethod

@@ -671,6 +671,15 @@ class Envs:
     SGLANG_QWEN4_PLE_DECODE_PREAD_THREADS = EnvInt(4)
     SGLANG_QWEN4_PLE_DECODE_PREAD_BUDGET_MS = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_DECODE_PREAD_LOG_EVERY = EnvInt(32)
+    # fnFL2 H43: the FIRST chunk's gather starts at the request's admission
+    # (scheduler intake, or the front's hint while P still sleeps) into a third
+    # shared slot, whenever the H32 ring is idle. Off = H32 alone. Never on
+    # group D.
+    SGLANG_QWEN4_PLE_PREFETCH_ADMIT = EnvBool(True)
+    # fnFL2 H43 (Weg-2 front): a BATCH arrival queued while P is not awake is
+    # hinted to P (/weg2/ple_prefetch_hint) so P's first-chunk PLE read runs
+    # while P wakes. Off = P learns of the request at its leg 1 only.
+    SGLANG_WEG2_PLE_ADMIT_HINT = EnvBool(True)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     # Weight loader: read safetensors tensors with pread() instead of mmap
     # page faults (ZFS: ~0.5 GB/s per rank through mmap, ~3 GB/s through

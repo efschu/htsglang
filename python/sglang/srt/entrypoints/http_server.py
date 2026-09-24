@@ -1411,6 +1411,35 @@ async def vram_budget(obj: Annotated[VramBudgetReqInput, Body()], request: Reque
     )
 
 
+@app.api_route("/weg2/ple_prefetch_hint", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def weg2_ple_prefetch_hint(raw_request: Request):
+    """fnFL2 H43: the Weg-2 front's hint that a leg 1 (body: {"path", "payload"})
+    is coming; tokenized here as its POST will be, the PP0 scheduler starts the
+    PLE read of its first chunk now (weg2/ple_admit_hint.py). Always 200 when
+    well-formed; a pure prefetch."""
+    from sglang.srt.weg2.ple_admit_hint import build_ple_prefetch_hint
+
+    tm = _global_state.tokenizer_manager
+    try:
+        hint = await build_ple_prefetch_hint(
+            await raw_request.json(),
+            serving_chat=raw_request.app.state.openai_serving_chat,
+            serving_completion=raw_request.app.state.openai_serving_completion,
+            encode=tm.tokenizer.encode,
+            raw_request=raw_request,
+        )
+    except Exception as e:
+        return _create_error_response(e)
+    if hint is None:
+        return ORJSONResponse({"hinted": False}, status_code=200)
+    tm._dispatch_to_scheduler(hint)
+    return ORJSONResponse(
+        {"hinted": True, "rid": hint.rid, "tokens": len(hint.input_ids)},
+        status_code=200,
+    )
+
+
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def flush_cache(timeout: float = Query(0.0, ge=0.0)):

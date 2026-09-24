@@ -1629,6 +1629,14 @@ class VramBudgetReqOutput(BaseReq, kw_only=True):
     state: Optional[dict] = None
 
 
+class PlePrefetchHintReqInput(BaseReq, kw_only=True):
+    """fnFL2 H43: the front's hint that request ``rid`` (its prompt tokenized
+    here, ``input_ids``) will come to this group; the PP0 scheduler starts the
+    PLE read of its first chunk now (no reply, a pure prefetch)."""
+
+    input_ids: List[int] = []
+
+
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None
