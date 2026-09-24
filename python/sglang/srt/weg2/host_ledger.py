@@ -3320,7 +3320,9 @@ MANIFEST_CENSUS_SURCHARGE_SOURCE = (
 #: the argv form key.  The form key answers "same boot form?"; this answers
 #: "same model?", and the fossil this closes is a 64-layer measurement being
 #: spent on a 32-layer model because nothing asked.
-CALIB_DIR = "/spinning/gpu-arb/weg2/calib"
+#: Follows SGLANG_WEG2_GPU_ARB like the launcher's GPU_ARB (docker plan, stage
+#: B); unset or empty -> byte-identical to the rig literal.
+CALIB_DIR = f"{os.environ.get('SGLANG_WEG2_GPU_ARB') or '/spinning/gpu-arb'}/weg2/calib"
 CALIB_SCHEMA = "weg2-pp-calib/1"
 
 

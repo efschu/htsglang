@@ -10,8 +10,10 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 TREE=$(cd "$HERE/../../.." && pwd)
 SRC="$TREE/python/sglang/srt/weg2/tms_csrc"
-VENV=/spinning/htsglang-gpu/.venv
-OUT_DIR=/spinning/gpu-arb/weg2/tms
+# Rig defaults; an image overrides them by environment (docker plan, stage B).
+# Unset or empty -> the literals below, exactly as before. --venv/--out-dir win.
+VENV=${SGLANG_WEG2_VENV:-/spinning/htsglang-gpu/.venv}
+OUT_DIR=${SGLANG_WEG2_TMS_OUT_DIR:-${SGLANG_WEG2_GPU_ARB:-/spinning/gpu-arb}/weg2/tms}
 while [ $# -gt 0 ]; do
   case "$1" in
     --out-dir) OUT_DIR=$2; shift 2;;
