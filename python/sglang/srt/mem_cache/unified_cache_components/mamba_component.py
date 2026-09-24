@@ -43,11 +43,15 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     get_and_increase_time_counter,
 )
 from sglang.srt.mem_cache.mamba_ckpt_utils import (
+    RESUME_REFUSAL_PATH_CAP,
     floor_to_interval,
     is_on_interval,
     is_resume_candidate,
     resume_refusal_reason,
     retention_shrinks_protected,
+    weg2_anchor_interval,
+    weg2_anchor_step,
+    weg2_max_states_per_path,
 )
 from sglang.srt.runtime_context import get_server_args
 
@@ -261,7 +265,25 @@ class MambaComponent(TreeComponent):
         # lineages cannot drift. With interval=None this is byte-identical
         # to the old pure presence test.
         raw_pos = self._raw_token_pos
+        # 27B line (24.09.): a node the per-path cap took is no resume anchor
+        # any more, whatever copy of its state is still physically there
+        # (UnifiedRadixCache._weg2_cap_path_states). Refused HERE, in the one
+        # predicate every walk asks, so the cap's decision -- taken on
+        # rank-uniform facts -- is what every rank matches against, while the
+        # rank-local release of the copies (lock, pending write) may lag.
+        # Switch off (default, and every group but P): the walk is unchanged.
+        capped = (
+            (lambda node: getattr(node, "_weg2_capped", False))
+            if weg2_max_states_per_path() > 0
+            else None
+        )
         if match_device_only:
+            if capped is not None:
+                return lambda node, depth: not capped(node) and is_resume_candidate(
+                    raw_pos(depth),
+                    interval,
+                    has_device_value=node.component_data[ct].value is not None,
+                )
             return lambda node, depth: is_resume_candidate(
                 raw_pos(depth),
                 interval,
@@ -285,6 +307,8 @@ class MambaComponent(TreeComponent):
         # emitter is reached. A host-only acceptance is exactly the rare event
         # being counted, and it is the one that triggers load_back.
         def _resume_with_host(node, depth):
+            if capped is not None and capped(node):
+                return False
             data = node.component_data[ct]
             has_dev = data.value is not None
             ok = is_resume_candidate(
@@ -340,6 +364,10 @@ class MambaComponent(TreeComponent):
         """
         ct = self.component_type
         data = node.component_data[ct]
+        if getattr(node, "_weg2_capped", False) and weg2_max_states_per_path() > 0:
+            # the per-path cap took this anchor (27B line, 24.09.): the census
+            # names the cap, not a missing state or the grid
+            return RESUME_REFUSAL_PATH_CAP
         return resume_refusal_reason(
             self._raw_token_pos(depth),
             self.mamba_checkpoint_interval,
@@ -666,6 +694,11 @@ class MambaComponent(TreeComponent):
                 )
             result.mamba_exist = True
             return
+        if weg2_max_states_per_path() > 0:
+            # 27B line (24.09.): every branch below leaves `node` carrying an
+            # anchor -- note it for the per-path cap, which the caller runs
+            # after the insert (UnifiedRadixCache._weg2_cap_after_insert).
+            self._weg2_note_anchored(node)
         if is_new_leaf:
             # #928: the anchor enters the tree here, so THIS is the moment its
             # bytes' owner is known -- the stack that was computing when the
@@ -695,6 +728,84 @@ class MambaComponent(TreeComponent):
         self.cache.lru_lists[self.component_type].reset_node_mru(node)
         node.last_access_time = get_and_increase_time_counter()
         result.mamba_exist = True
+
+    def _weg2_note_anchored(self, node: UnifiedTreeNode) -> None:
+        """Per-path cap bookkeeping (27B line, 24.09.): after this insert
+        `node` carries an anchor.
+
+        `_weg2_anchored` is the cap's HOLDER set, and it is a flag rather than
+        "has a value" on purpose: the copies behind an anchor come and go
+        RANK-LOCALLY (a write-through acks at a different time on every rank,
+        Agent B's release follows the ack, the device LRU's victim follows the
+        write-through locks), while this insert happens at the same step on
+        every rank. Counting the flag keeps the cap's selection -- and with it
+        which nodes stay matchable -- identical across ranks
+        (raenge-nie-uneins); the copies are released when they are free.
+
+        A node the cap took and that an insert anchors again at the same
+        position is an anchor again: the flag returns, the cap's mark goes,
+        and a release still waiting for it is called off (the copy it would
+        have freed is this anchor's state).
+        """
+        node._weg2_anchored = True
+        if getattr(node, "_weg2_capped", False):
+            node._weg2_capped = False
+            deferred = getattr(self.cache, "_weg2_cap_deferred", None)
+            if deferred:
+                deferred.pop(node.id, None)
+        self.cache._weg2_cap_tail = node
+
+    def _weg2_anchor_step_declines(self, req: Req, cache_len: int) -> bool:
+        """27B line (24.09., user decision point 3): does this UNFINISHED chunk
+        boundary stay anchorless? ``SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL`` (group
+        P, no_buffer, default off).
+
+        MEASURED NEED: the per-node law anchors every chunk boundary. At
+        4096-token chunks a 98k prompt donated 25 states (#1427 A: ~25 per
+        100k); at the 512-token chunks the user wants for P that is 193 per
+        98k prompt, 193 x 74.8 MiB = 14.1 GiB of state copies (device slot +
+        arena) per prompt. With the spacing it is 25 at EITHER chunk size
+        (every 8th 512-chunk + N-1 + N) -- see `weg2_anchor_step` for the
+        two reasons a boundary keeps its anchor (end / interval) and why
+        both read rank-uniform inputs only.
+
+        A declined boundary returns `_decline_retention(False)` == 0: the step
+        inserts NOTHING, the request keeps its KV (`req.prefix_indices` is the
+        request's own rows), and the next anchor step inserts the whole span
+        in one node and publishes it. That is the only correct form: an
+        anchorless node inserted mid-flight is unmatchable by design, so the
+        insert-then-rematch of `cache_unfinished_req` would come back short
+        and the rows would be owned twice (the 122-slot leak `_decline_retention`
+        documents). Nothing is allocated or copied before this answer.
+
+        Units: ``cache_len`` is RAW tokens; ``cache_protected_len`` (the
+        previous anchor, the tree-owned prefix) is KEY units, converted like
+        every other position test here (`_raw_token_pos`).
+        """
+        interval = weg2_anchor_interval()
+        if interval <= 0 or self.enable_mamba_extra_buffer:
+            return False
+        prompt_len = len(getattr(req, "origin_input_ids", None) or ())
+        last = self._raw_token_pos(int(getattr(req, "cache_protected_len", 0) or 0))
+        why = weg2_anchor_step(int(cache_len), prompt_len, last, interval)
+        cls = type(self)
+        n = getattr(cls, "_weg2_anchor_step_n", 0) + 1
+        cls._weg2_anchor_step_n = n
+        counts = getattr(cls, "_weg2_anchor_step_counts", None)
+        if counts is None:
+            counts = cls._weg2_anchor_step_counts = {}
+        key = why or "declined"
+        counts[key] = counts.get(key, 0) + 1
+        if n <= 16 or n % 256 == 0:
+            logger.info(
+                "WEG2 ANCHOR-STEP n=%d rid=%s pos=%d prompt=%d last_anchor=%d "
+                "interval=%d -> %s counts=%s (group P: an anchor every ~interval "
+                "tokens + N-1/N; a declined boundary keeps its KV with the request "
+                "until the next anchor step)",
+                n, str(getattr(req, "rid", "?"))[:12], int(cache_len), prompt_len,
+                last, interval, why or "DECLINED", counts,
+            )
+        return why is None
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
@@ -1237,6 +1348,12 @@ class MambaComponent(TreeComponent):
         else:
             if cache_len is None:
                 return 0
+            # 27B line (24.09.): the anchor spacing -- an anchorless chunk
+            # boundary declines BEFORE any slot is drawn or state copied, and
+            # the request keeps its KV (see `_weg2_anchor_step_declines`).
+            if self._weg2_anchor_step_declines(req, cache_len):
+                insert_params.mamba_value = None
+                return _decline_retention(is_finished)
             # Donate the mamba index to the radix cache instead of copying.
             # CACHE-INSERT path: an unservable slot degrades to "cache nothing
             # this step" (returning 0 makes UnifiedRadixCache take its

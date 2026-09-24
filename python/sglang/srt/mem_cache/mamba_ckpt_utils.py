@@ -288,3 +288,117 @@ def retention_shrinks_protected(
     if cache_len is None or protected_len is None:
         return False
     return int(cache_len) < int(protected_len)
+
+
+# ---------------------------------------------------------------------------
+# 27B line, 2026-09-24: WHERE P'S MAMBA ANCHORS GO, AND HOW MANY A PATH KEEPS.
+#
+# The user's decision of 24.09. (~15:20Z, "1 ja 2 ja 3 ja 4 spaeter") on the
+# anchor question, points 2 and 3 (1 is Agent B's c255e10ddb, 4 -- the int8
+# checkpoint pool -- is deferred):
+#   2. inner anchors are deletable once the chain moved on; LRU like upstream;
+#      an upper bound per path (~4); forks stay;
+#   3. "the anchors are simply spread wider, not after every chunk": with
+#      512-token chunks an anchor every ~4096 tokens (every 8th chunk) + at
+#      forks + at the request end -- NO rigid 8192 grid.
+# Point 3 is NOT the #747 `--mamba-checkpoint-interval` grid: that grid is also
+# a READ rule (`is_resume_candidate` refuses every off-grid anchor, the end
+# anchor N-1 included), which is exactly what made every short prefix hit
+# unservable (#873, the per-node law of 27./28.08.). The spacing below is a
+# WRITE-side thinning only: which chunk boundaries of an UNFINISHED request
+# donate a state. Every anchor that exists stays matchable wherever it sits.
+#
+# Both switches are group-P-only (SGLANG_WEG2_GROUP=P) and default OFF; the arm
+# switches them on with the approved values (4096, 4). Unset / empty / <= 0 /
+# unparsable = off, byte-identical to the per-node default.
+# ---------------------------------------------------------------------------
+
+import os as _os
+from typing import Mapping as _Mapping
+
+#: Token spacing of the anchors a group-P chunked prefill donates.
+ANCHOR_INTERVAL_ENV = "SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL"
+#: Upstream --mamba-max-states-per-path (1417345f5f, `_evict_excess_path_states`).
+MAX_STATES_PER_PATH_ENV = "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH"
+
+#: Why a chunk boundary carries an anchor (`weg2_anchor_step`).
+ANCHOR_STEP_END = "end"
+ANCHOR_STEP_INTERVAL = "interval"
+
+#: `resume_refusal_reason`'s third answer, given by the component for a node the
+#: per-path cap took (see UnifiedRadixCache._weg2_cap_path_states).
+RESUME_REFUSAL_PATH_CAP = "path_cap"
+
+
+def _weg2_group_p(env: _Mapping[str, str]) -> bool:
+    return str(env.get("SGLANG_WEG2_GROUP", "")).strip().upper() == "P"
+
+
+def _positive_int(env: _Mapping[str, str], name: str) -> int:
+    raw = str(env.get(name, "") or "").strip()
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    return value if value > 0 else 0
+
+
+def weg2_anchor_interval(env: Optional[_Mapping[str, str]] = None) -> int:
+    """Token spacing of group P's inner mamba anchors; 0 = off (an anchor at
+    every chunk boundary, the per-node law's default)."""
+    env = _os.environ if env is None else env
+    if not _weg2_group_p(env):
+        return 0
+    return _positive_int(env, ANCHOR_INTERVAL_ENV)
+
+
+def weg2_max_states_per_path(env: Optional[_Mapping[str, str]] = None) -> int:
+    """Upper bound of mamba anchors one root-to-tail path of group P's tree
+    keeps; -1 = off (unbounded, upstream's default)."""
+    env = _os.environ if env is None else env
+    if not _weg2_group_p(env):
+        return -1
+    value = _positive_int(env, MAX_STATES_PER_PATH_ENV)
+    return value if value > 0 else -1
+
+
+def weg2_anchor_step(
+    pos: int, prompt_len: int, last_anchor: int, interval: int
+) -> Optional[str]:
+    """Why the chunk boundary at RAW token position ``pos`` of an UNFINISHED
+    request donates a mamba anchor -- or ``None``: this boundary stays
+    anchorless and the request keeps its KV until the next anchor step.
+
+    * ``end`` -- ``pos >= prompt_len - 1``: the #1481 hand-back anchor N-1 (the
+      end-anchor split puts a chunk boundary exactly there) and everything
+      after it. Never thinned: it is the one anchor D resumes from, and the
+      one a repeat of the prompt, the next turn or a regeneration resumes
+      from -- the forks real traffic makes.
+    * ``interval`` -- ``pos - last_anchor >= interval``: at least ``interval``
+      tokens since this request's previous anchor (its resume anchor or the
+      last one it donated). A DISTANCE, not an absolute grid: after a prefix
+      hit at 1234 the next anchor sits ~4096 further on, whatever the chunk
+      size and the alignment.
+
+    Every input is RANK-UNIFORM on a PP group: ``pos`` is the forwarded
+    extent, ``last_anchor`` the tree-owned prefix after PP0's geometry
+    (`cap_req_geometry` / `truncate_prefix_to`), ``prompt_len`` the request.
+    That is why there is no third, "fork" reason fed by the admission's
+    ``key_match_depth``: on group P only PP0 reads the store (one
+    `#1423 INSERT-PLACED`, PP0 only, in xsn422 and xsn423), so a rank's own
+    key match depth can differ from its peers', and an anchor decided on it
+    would be inserted on one rank and not on the others (raenge-nie-uneins).
+    Forks keep their anchors under the per-path cap instead (a fork marked by
+    the device insert that made it); an anchor exactly AT an arbitrary fork
+    would need a chunk boundary there that PP0 decides and forwards.
+
+    Everything else declines. ``interval <= 0`` means the switch is off; the
+    caller does not ask then.
+    """
+    if pos >= prompt_len - 1:
+        return ANCHOR_STEP_END
+    if interval > 0 and pos - last_anchor >= interval:
+        return ANCHOR_STEP_INTERVAL
+    return None
