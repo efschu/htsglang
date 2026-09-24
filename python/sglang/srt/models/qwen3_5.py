@@ -25,6 +25,7 @@ import triton
 
 from sglang.jit_kernel.triton.gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
+    qwen3_5_gdn_prefill_projection_views,
 )
 
 # Configs
@@ -721,7 +722,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if (
+        # Upstream #36267: prefill (extend without speculative verify) reads
+        # the block-contiguous in_proj output through strided views -- no
+        # split/cat copy of q/k/v, no b/a copies and no z copy before the
+        # gated norm. Decode/verify keep the per-token split below. Any v/k
+        # head ratio (the 27B's is 3); the head counts are rank-local.
+        use_strided_prefill_z = (
+            _is_cuda
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        )
+        if use_strided_prefill_z:
+            mixed_qkv, z, b, a = qwen3_5_gdn_prefill_projection_views(
+                projected_states_qkvz,
+                projected_states_ba,
+                self.local_num_k_heads,
+                self.local_num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
+        elif (
             self.num_v_heads // self.num_k_heads in [1, 2, 4]
             and not _is_cpu
             and not _is_npu
@@ -767,11 +786,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z_shape_og = z.shape
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
+        if use_strided_prefill_z:
+            # the gated norm reads the strided [T, Hv, Dv] gate in place
+            z_flat_shape = (z.numel() // z.shape[-1], z.shape[-1])
+        else:
+            z = z.reshape(-1, z.shape[-1])
+            z_flat_shape = z.shape
 
         # Add padding for DP-Attn
-        if core_attn_out.shape != z.shape:
-            core_attn_out_pad = torch.zeros_like(z)
+        if core_attn_out.shape != z_flat_shape:
+            core_attn_out_pad = z.new_zeros(z_flat_shape)
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 

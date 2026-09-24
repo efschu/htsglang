@@ -310,6 +310,33 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     return mixed_qkv, z, b, a
 
 
+def qwen3_5_gdn_prefill_projection_views(
+    mixed_qkvz,
+    mixed_ba,
+    num_heads_qk,
+    num_heads_v,
+    head_qk,
+    head_v,
+):
+    """Return strided views accepted by the prefill GDN consumers (#36267).
+
+    The Qwen3.5 in_proj output is already block-contiguous per token
+    (``[all_q | all_k | all_v | all_z]`` and ``[all_b | all_a]``), so for
+    prefill no split/cat copy is needed: ``mixed_qkv`` is the leading
+    ``qkv_dim`` columns, ``z`` a [T, Hv, Dv] view, ``b``/``a`` column views.
+    The consumers (Triton causal_conv1d, fused_qkv_split_gdn_prefill,
+    fused_gdn_gating, rms_norm_gated with a 3-D gate) all honour row strides.
+    Head counts are the rank-LOCAL ones (uneven GDN TP).
+    """
+    tokens = mixed_qkvz.shape[0]
+    qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
+    mixed_qkv = mixed_qkvz[:, :qkv_dim]
+    z = mixed_qkvz[:, qkv_dim:].view(tokens, num_heads_v, head_v)
+    b = mixed_ba[:, :num_heads_v]
+    a = mixed_ba[:, num_heads_v : 2 * num_heads_v]
+    return mixed_qkv, z, b, a
+
+
 @triton.jit
 def fused_qkv_split_gdn_prefill_kernel(
     q,
