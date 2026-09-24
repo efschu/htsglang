@@ -1909,6 +1909,62 @@ def resolve_xchg_lanes(cut_key: str) -> Tuple[int, str]:
     )
 
 
+# ---------------------------------------------------------------------------
+# H44 (Task #17): DER POSTEN 'LANES' -- die On-card-Host-Lanes des
+# sequenziellen Transports (/dev/shm/weg2-seq-<boot>/c<k>[_s1]_*.bin).
+#
+# ZENSUS-LUECKE bis hierher: kein Term dieses Ledgers kannte sie; sie standen
+# nur implizit im GEMESSENEN ``flip_ratchet_gib`` (die Lanes sind ab dem
+# ersten Flip boot-lang resident), und die Notiz host-ram-posten-nf-0923
+# schaetzte sie von Hand ("Lanes ~9"). x148 gemessen: 3,18 GiB (sechs
+# Dateien, Tiefe 2, je Lane der groesste Tag).
+#
+# DIE RINGFORM PREIST SICH SELBST: je Karte und Pufferslot hoechstens EINE
+# Ringdatei ``hdr + slots x slot_bytes``, und nur, wenn ein Tag den Host-Weg
+# nimmt (IPC-Staging verweigert). Der Ganz-Tag-Rueckfall (Collector nicht
+# bereit) bleibt eine Laufzeitgroesse -- er steht in der Zensuszeile als
+# ``whole=`` neben dem Preis, statt geschaetzt zu werden. NICHT in die
+# Arm-Summe (``charge_terms``): der gemessene flip_ratchet eines Vorgaenger-
+# boots enthaelt die Lanes bereits, ein zweiter Term waere
+# Weg2HostRatchetDoubleCharged.
+# ---------------------------------------------------------------------------
+
+#: Kopf einer Ringdatei, identisch mit ``weight_exchange_bounce.SEQ_RING_HDR_BYTES``
+#: (ein Test haelt die beiden gleich; hier ohne Import, das Ledger laeuft im
+#: Launcher ohne die Transportmodule).
+SEQ_RING_HDR_BYTES = 4096
+LANES_MARKER = "WEG2-HOST-LEDGER LANES"
+
+
+def seq_lanes_priced_bytes(*, ring_on: bool, cards: int, depth: int,
+                           slots: int, slot_bytes: int) -> int:
+    """Obergrenze der Ringform: ``cards x depth x (hdr + slots x slot_bytes)``.
+    Ohne Ring gibt es keinen Preis aus der Geometrie (je Lane der groesste
+    Tag, erst am Join bekannt) -> 0 und die Zeile sagt ``priced=unpriced``."""
+    if not ring_on:
+        return 0
+    return int(cards) * max(1, int(depth)) * (
+        SEQ_RING_HDR_BYTES + int(slots) * int(slot_bytes))
+
+
+def lanes_ledger_line(*, event: str, lane_key: str, file: str, nbytes: int,
+                      files: int, ring_bytes: int, whole_bytes: int,
+                      priced_bytes: int) -> str:
+    """Eine Zeile je neuem/gewachsenem Lane-File. ``held`` ist die Summe der
+    Lane-Dateien im Verzeichnis (tmpfs, je Datei einmal), ``priced`` der
+    Ring-Preis; ``over`` > 0 heisst: ein Ganz-Tag-Rueckfall haelt mehr als
+    der Ring kostet (die Zeile davor nennt den Grund)."""
+    held = int(ring_bytes) + int(whole_bytes)
+    _p = (f"{priced_bytes / GIB:.3f} GiB" if priced_bytes > 0 else "unpriced")
+    over = held - int(priced_bytes) if priced_bytes > 0 else 0
+    return (f"{LANES_MARKER} event={event} lane={lane_key} file={file} "
+            f"bytes={int(nbytes)} files={int(files)} "
+            f"held={held / GIB:.3f} GiB (ring={int(ring_bytes) / GIB:.3f} "
+            f"whole={int(whole_bytes) / GIB:.3f}) priced={_p} "
+            f"over={max(0, over) / GIB:.3f} GiB -- tmpfs, gepinnt, boot-lang "
+            f"(der Posten 'Lanes'; im flip_ratchet gemessen, nicht in der Arm-Summe)")
+
+
 class Weg2SleepLegCushionDeficit(Weg2HostLedgerRefused):
     """W100 (#1361 fix6): this sleep leg needs more page cache than is left.
 

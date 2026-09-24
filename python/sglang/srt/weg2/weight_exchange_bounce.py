@@ -2436,6 +2436,16 @@ def _persistent_host_buffer(path: str, biggest: int, ops, lane_key: str, log):
         _SEQ_HOST_BUF[path] = {"fh": fh, "mm": mm, "addr": int(addr),
                                "size": int(biggest), "registered": registered,
                                "ops": ops, "lane": lane_key}
+        # H44 (Task #17): every new/grown lane file is a host-census event --
+        # the Posten 'Lanes' of the host ledger, read off the lane directory
+        # (tmpfs truth, both groups' files counted once) beside the ring
+        # form's priced size.
+        try:
+            log(lanes_census_line(event=how.split(" ")[0], lane_key=lane_key,
+                                  path=path, nbytes=int(biggest)))
+        except Exception as _cen_exc:  # noqa: BLE001 -- a census line never fails a lane
+            log(f"WEG2-HOST-LEDGER LANES census failed: {type(_cen_exc).__name__}: "
+                f"{_cen_exc}")
         return mm, int(addr), registered, ""
 
 
@@ -2619,6 +2629,537 @@ def sequential_digest_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT,
                            lane: str = "") -> str:
     return (f"{shm_root}/weg2-seq-{boot_nonce}/"
             + (f"{lane}_" if lane else "") + "unit_digests.json")
+
+
+# ---------------------------------------------------------------------------
+# H44 (Task #17, Nutzer 18.09. "bauen, verdrahten, Standard"): DER LANE-RING.
+#
+# WURZEL, gemessen an x148 (D+P-Log, 152 c-Tag-Transfers je Boot): die
+# On-card-Host-Lanes c0/c1/c2 waren je Pufferslot (Tiefe 2) auf den GROESSTEN
+# TAG ihrer Lane angelegt, persistent und gepinnt -- 646+346, 563+563,
+# 647+647 MB = 3,18 GiB tmpfs ab dem ersten Flip, sichtbar als Sprung
+# shm_G 7 -> 10 GiB im hostram-Log. 151 der 152 Transfers liefen ueber das
+# On-card-IPC-Staging (``ipc=yes``) und fassten den Host-Puffer NIE an; er
+# wurde trotzdem je Tag gemappt und registriert. Der eine Host-Transfer
+# (x148 TP1 c1 weights_11, 537 MiB, Staging vom Kartenkredit verweigert)
+# fand seinen Collector schon wartend vor (PP1 lane-time t0 0,45 s VOR dem
+# Deposit).
+#
+# FORM: (1) der Host-Puffer wird erst gemappt, wenn ein Tag wirklich den
+# Host-Weg nimmt (Depositor: IPC verweigert; Collector: der Record u0 traegt
+# kein IPC-Handle); (2) dann als RING aus R Slots a Sync-Batch
+# (``seq_sync_batch()``, 64 MiB) mit Freigabe je Batch -- aber NUR, wenn der
+# Collector seine Bereitschaft angezeigt hat (Ready-Datei: er steht in
+# seinem Collect, ist resumed und leert ohne weitere Bedingung). Sonst der
+# ganze Tag wie bisher: auf der Diagonale wartet das Resume des Collectors
+# auf den Kredit genau dieses Depositors (C14, #1374 Option 1); ein Ring,
+# der den Deposit blockiert, bevor der Collector laeuft, waere der
+# weg2xsn30-Deadlock (``test_the_per_band_claim_cannot_return``).
+#
+# PROTOKOLL: Einheit = Stueck aus ``tp.batch_descs(descs, slot_bytes)``;
+# je Stueck wie bisher EIN Record-File + EIN ``full``-Token (Zeile 0), der
+# Record traegt zusaetzlich ``ring`` (slots, slot_bytes, token, batches).
+# Die Freigabe: der Collector schreibt nach dem Sync des Batches b das Wort
+# ``(token << 32) | (b + 1)`` in den Kopf der Ringdatei und postet die
+# bisher tote Diagonal-Zeile 1 ``full`` (nur Weckruf; die Wahrheit steht im
+# Kopf, ein veralteter Post weckt nur). Der Depositor schreibt Batch b in
+# Slot ``b % R`` erst, wenn der Kopf ``freed >= b - R + 1`` fuer SEIN Token
+# zeigt. Kein Fortschritt innerhalb des Budgets = W146 benannt, kein
+# stiller Stall.
+# ---------------------------------------------------------------------------
+
+#: Kopf der Ringdatei: das Fortschrittswort des Collectors (u64) + Rand.
+SEQ_RING_HDR_BYTES = 4096
+#: Diagonal-Zeile 1 ``full``: seit #1374 tot (``_COUNT_SLOT``/``_DRAIN_SLOT``
+#: sind 0, das Band-Guthaben der Zeile 1 gilt nur fuer Cross-Paare).
+SEQ_RING_WAKE_SLOT = 1
+SEQ_RING_STALL_CODE = "W146 Weg2SeqRingStall"
+
+
+def seq_lane_ring_on() -> bool:
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_SEQ_LANE_RING.get())
+
+
+def seq_lane_ring_slots() -> int:
+    from sglang.srt.environ import envs
+
+    try:
+        r = int(envs.SGLANG_WEG2_SEQ_LANE_RING_SLOTS.get())
+    except (TypeError, ValueError):
+        r = 4
+    return 2 if r < 2 else (64 if r > 64 else r)
+
+
+def seq_lane_ring_ready_ms() -> int:
+    from sglang.srt.environ import envs
+
+    try:
+        ms = int(envs.SGLANG_WEG2_SEQ_LANE_RING_READY_MS.get())
+    except (TypeError, ValueError):
+        ms = 50
+    return 0 if ms < 0 else (5000 if ms > 5000 else ms)
+
+
+def seq_ring_bytes(slots: int, slot_bytes: int) -> int:
+    """Die Groesse EINER Ringdatei: Kopf + R Slots."""
+    return SEQ_RING_HDR_BYTES + int(slots) * int(slot_bytes)
+
+
+def seq_ring_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT,
+                  lane: str = "") -> str:
+    """Die Ringdatei eines Lane-Pufferslots, NEBEN dem Ganz-Tag-Puffer: ein
+    Tag im Ganz-Modus darf die Ringdatei nicht auf Taggroesse wachsen lassen."""
+    return (f"{shm_root}/weg2-seq-{boot_nonce}/"
+            + (f"{lane}_" if lane else "") + "ring.bin")
+
+
+def seq_ready_path(dpath: str) -> str:
+    return f"{dpath}.ready"
+
+
+def _ring_word(token: int, freed: int) -> int:
+    return ((int(token) & 0x7FFFFFFF) << 32) | (int(freed) & 0xFFFFFFFF)
+
+
+def ring_progress_read(mm) -> Tuple[int, int]:
+    """``(token, freed)`` aus dem Kopf. Zwei 4-Byte-Haelften: ein Riss kann
+    nur ein ALTES Token (= kein Fortschritt) oder einen kleineren Stand
+    DIESES Tokens zeigen -- der Depositor setzt den Kopf vor dem ersten
+    Batch auf 0, Reste frueherer Tags gibt es danach nicht mehr."""
+    word = struct.unpack_from("<Q", mm, 0)[0]
+    return int(word >> 32), int(word & 0xFFFFFFFF)
+
+
+def ring_progress_write(mm, token: int, freed: int) -> None:
+    struct.pack_into("<Q", mm, 0, _ring_word(token, freed))
+
+
+def ring_post_ready(dpath: str, *, tag: str, total_bytes: int) -> str:
+    """Der Collector: 'ich stehe im Collect dieses Tags' (atomar, tmp+rename)."""
+    import json as _json
+
+    p = seq_ready_path(dpath)
+    tmp = f"{p}.tmp{os.getpid()}"
+    with open(tmp, "w") as fh:
+        _json.dump({"tag": str(tag), "total": int(total_bytes),
+                    "pid": int(os.getpid())}, fh)
+    os.replace(tmp, p)
+    return p
+
+
+def ring_clear_ready(dpath: str) -> None:
+    try:
+        os.unlink(seq_ready_path(dpath))
+    except OSError:
+        pass
+
+
+def ring_collector_ready(dpath: str, *, tag: str, total_bytes: int,
+                         wait_ms: int) -> Tuple[bool, str]:
+    """Der Depositor: ist der Collector DIESES Tags schon in seinem Collect?
+    Wartet hoechstens ``wait_ms`` (1-ms-Takt). ``(ok, why)``."""
+    import json as _json
+
+    p = seq_ready_path(dpath)
+    deadline = time.monotonic() + max(0, int(wait_ms)) / 1000.0
+    why = "no-ready-file"
+    while True:
+        rec = None
+        try:
+            with open(p) as fh:
+                rec = _json.load(fh) or {}
+        except (OSError, ValueError):
+            rec = None
+        if rec:
+            if str(rec.get("tag", "")) != str(tag):
+                why = f"ready-for-other-tag({rec.get('tag')!r})"
+            elif int(rec.get("total", -1)) != int(total_bytes):
+                why = (f"ready-total-disagrees({int(rec.get('total', -1))}!="
+                       f"{int(total_bytes)})")
+            else:
+                pid = int(rec.get("pid", 0) or 0)
+                try:
+                    if pid > 0:
+                        os.kill(pid, 0)
+                    return True, "collector-ready"
+                except ProcessLookupError:
+                    why = f"ready-pid-gone({pid})"
+                except PermissionError:
+                    return True, "collector-ready"
+        if time.monotonic() >= deadline:
+            return False, f"collector-not-ready({why}, waited {int(wait_ms)} ms)"
+        time.sleep(0.001)
+
+
+def lanes_census_line(*, event: str, lane_key: str, path: str,
+                      nbytes: int) -> str:
+    """Der Posten 'Lanes' des Host-Zensus nach einem neuen/gewachsenen
+    Lane-File: die tmpfs-Wahrheit des Lane-Verzeichnisses (beide Gruppen
+    mappen dieselben Dateien -- je Datei EINMAL gezaehlt) gegen den Preis
+    der Ringform (``host_ledger.seq_lanes_priced_bytes``)."""
+    from sglang.srt.weg2 import host_ledger as hl
+
+    d = os.path.dirname(path)
+    ring_b = whole_b = files = 0
+    try:
+        for e in os.scandir(d):
+            if e.name.endswith("_ring.bin") or e.name == "ring.bin":
+                ring_b += int(e.stat().st_size)
+                files += 1
+            elif e.name.endswith("unit_buffer.bin"):
+                whole_b += int(e.stat().st_size)
+                files += 1
+    except OSError:
+        pass
+    priced = hl.seq_lanes_priced_bytes(
+        ring_on=seq_lane_ring_on(), cards=xr.N_CARDS,
+        depth=seq_buffer_depth(), slots=seq_lane_ring_slots(),
+        slot_bytes=seq_sync_batch()[0])
+    return hl.lanes_ledger_line(
+        event=event, lane_key=lane_key, file=os.path.basename(path),
+        nbytes=int(nbytes), files=files, ring_bytes=ring_b,
+        whole_bytes=whole_b, priced_bytes=priced)
+
+
+def _ring_line(*, lane_key, phase, tag, slots, slot_bytes, n_batches,
+               wait_full_s, wait_free_s, waited_batches, total_bytes,
+               token) -> str:
+    return (f"WEG2-SEQ ring lane={lane_key} phase={phase} tag={tag} "
+            f"slots={int(slots)} slot_mib={int(slot_bytes) >> 20} "
+            f"tag_batches={int(n_batches)} "
+            f"wraps={max(0, (int(n_batches) - 1) // max(1, int(slots)))} "
+            f"wait_full_ms={wait_full_s * 1000:.0f} "
+            f"wait_free_ms={wait_free_s * 1000:.0f} "
+            f"waited_batches={int(waited_batches)} bytes={int(total_bytes)} "
+            f"token={int(token):x}")
+
+
+def _ring_lane_time(*, lane_key, phase, units, total_bytes, t_lane0, wait_s,
+                    copy_s, rec_s, n_sync, slots, slot_bytes) -> str:
+    """Dieselbe lane-time-Zeile wie die Ganz-Tag-Form (wake_credit_pd._RX_SEQ
+    liest sie), ``batch=`` nennt den Ring, ``host=ring`` am Ende."""
+    import time as _time
+
+    return (f"WEG2-SEQ lane-time lane={lane_key} phase={phase} units={int(units)} "
+            f"bytes={int(total_bytes)} "
+            f"total_ms={(time.perf_counter() - t_lane0) * 1000:.0f} "
+            f"wait_ms={wait_s * 1000:.0f} copy_sync_ms={copy_s * 1000:.0f} "
+            f"record_ms={rec_s * 1000:.0f} ipc=no syncs={int(n_sync)} "
+            f"batch=ring{int(slots)}x{int(slot_bytes) >> 20}MiB "
+            f"t={_time.time():.3f} "
+            f"t0={_time.time() - (time.perf_counter() - t_lane0):.3f} host=ring")
+
+
+def _ring_write_record(dpath: str, g: int, rec: dict) -> None:
+    import json as _json
+
+    upath = f"{dpath}.u{int(g)}"
+    tmp = upath + ".tmp"
+    with open(tmp, "w") as fh:
+        _json.dump(rec, fh)
+    os.replace(tmp, upath)
+
+
+def _ring_read_record(dpath: str, g: int, timeout_s: float = 5.0) -> dict:
+    import json as _json
+
+    t0 = time.perf_counter()
+    upath = f"{dpath}.u{int(g)}"
+    while True:
+        dep = {}
+        if os.path.exists(upath):
+            try:
+                with open(upath) as rf:
+                    dep = _json.load(rf) or {}
+            except ValueError:
+                dep = {}
+        if dep:
+            return dep
+        if time.perf_counter() - t0 > float(timeout_s):
+            return {}
+        time.sleep(0.002)
+
+
+def run_ring_deposit(descs, ops, *, sems, stream, card: int, lane_key: str,
+                     ring_path: str, dpath: str, batches, slots: int,
+                     slot_bytes: int, digest_on: bool, liveness, budget_s: float,
+                     log, t_lane0: float) -> str:
+    """Der Depositor der Ringform: Batch b in Slot ``b % slots``, ab
+    ``b >= slots`` erst nach der Freigabe von Batch ``b - slots`` im Kopf.
+    Je Stueck ein Record und ein ``full`` wie die Ganz-Tag-Form. Rueckgabe
+    '' oder die benannte Verweigerung."""
+    import hashlib
+
+    R, S = int(slots), int(slot_bytes)
+    mm, addr, reg, refusal = _persistent_host_buffer(
+        ring_path, seq_ring_bytes(R, S), ops, lane_key, log)
+    if refusal:
+        return refusal
+    log(f"WEG2-SEQ register lane={lane_key} bytes={seq_ring_bytes(R, S)} "
+        f"addr={int(addr)} registered={reg} ring={R}x{S >> 20}MiB")
+    token = (int.from_bytes(os.urandom(4), "little") & 0x7FFFFFFF) or 1
+    # der Kopf zurueck auf DIESES Token, Stand 0 -- vor dem ersten Batch, also
+    # bevor der Collector dieses Tags irgendetwas schreiben kann
+    ring_progress_write(mm, token, 0)
+    # veraltete Weckrufe (Posts frueherer Ring-Tags dieser Karte) abraeumen;
+    # die Wahrheit steht im Kopf, das hier spart nur Leerlaeufe
+    for _ in range(100000):
+        if not sems.diagonal_timedwait(int(card), SEQ_RING_WAKE_SLOT, "full", 0.0):
+            break
+    n_units = sum(len(b.pieces) for b in batches)
+    n_b = len(batches)
+    total = sum(int(b.total_bytes) for b in batches)
+    tag0 = str(getattr(descs[0], "tag", "") or "") if descs else ""
+    ring_meta = {"slots": R, "slot_bytes": S, "token": int(token),
+                 "batches": n_b, "units": n_units}
+    g = 0
+    t_free = t_copy = t_rec = 0.0
+    n_sync = waited = 0
+    for b, batch in enumerate(batches):
+        slot = b % R
+        if b >= R:
+            need = b - R + 1
+            tw0 = time.perf_counter()
+            last_freed, last_move, last_live = -1, time.monotonic(), time.monotonic()
+            while True:
+                tok, freed = ring_progress_read(mm)
+                if tok == token and freed >= need:
+                    break
+                now = time.monotonic()
+                if tok == token and freed != last_freed:
+                    last_freed, last_move = freed, now
+                if now - last_move > float(budget_s):
+                    dump_rank_stacks(
+                        "ring-stall-seq", tag=tag0, rank=int(card),
+                        extra=f"lane {lane_key} batch {b}/{n_b} needs freed>={need}, "
+                              f"head=({tok:x},{freed})")
+                    return (f"{SEQ_RING_STALL_CODE}: lane={lane_key} tag={tag0!r} "
+                            f"batch {b}/{n_b} waited {now - last_move:.0f} s "
+                            f"(budget {float(budget_s):.0f} s) for the collector "
+                            f"to free batch {need - 1} of the {R}-slot ring "
+                            f"(head token={tok:x} freed={freed}, mine={token:x}) -- "
+                            f"the collector announced readiness and then stopped "
+                            f"draining; refusing instead of a silent stall")
+                sems.diagonal_timedwait(int(card), SEQ_RING_WAKE_SLOT, "full", 0.05)
+                if liveness is not None and now - last_live > 2.0:
+                    last_live = now
+                    if not liveness():
+                        return (f"PeerGone at ring batch {b}/{n_b} on lane "
+                                f"{lane_key}: the collector is no longer a live "
+                                f"holder of this boot's lane files")
+            dt = time.perf_counter() - tw0
+            t_free += dt
+            if dt > 0.0005:
+                waited += 1
+        base_off = SEQ_RING_HDR_BYTES + slot * S
+        tc0 = time.perf_counter()
+        issued = []
+        for piece in batch.pieces:
+            desc = descs[piece.desc_index]
+            name = getattr(desc, "param_name", "?")
+            if desc.src_ptr is None:
+                return (f"deposit at piece {g} {name!r}: the desc carries no "
+                        f"src_ptr -- this rank does not hold the bytes this "
+                        f"lane says it moves")
+            src_ptr = int(desc.src_ptr) + int(piece.src_off)
+            dst = int(addr) + base_off + int(piece.slot_off)
+            if piece.kind == tp.FLAT:
+                ops.memcpy_async(dst, src_ptr, int(piece.nbytes), stream)
+            else:
+                ops.memcpy2d_async(dst, int(piece.run_bytes), src_ptr,
+                                   int(piece.spitch), int(piece.run_bytes),
+                                   int(piece.rows), stream)
+            issued.append((g, piece, desc))
+            g += 1
+        ops.synchronize(stream)
+        n_sync += 1
+        t_copy += time.perf_counter() - tc0
+        for (gi, piece, desc) in issued:
+            off = base_off + int(piece.slot_off)
+            nbytes = int(piece.nbytes)
+            digest = (hashlib.sha256(bytes(mm[off:off + nbytes])).hexdigest()[:16]
+                      if digest_on else "")
+            tr0 = time.perf_counter()
+            _ring_write_record(dpath, gi, {
+                "name": getattr(desc, "param_name", "?"),
+                "tag": getattr(desc, "tag", ""), "digest": digest, "ipc": "",
+                "nbytes": nbytes, "ring": ring_meta})
+            t_rec += time.perf_counter() - tr0
+            sems.diagonal_post(int(card), _SEQ_SLOT, "full")
+            if _piece_verbose(gi, n_units):
+                log(f"WEG2-SEQ deposit piece {gi} {getattr(desc, 'param_name', '?')!r} "
+                    f"tag={getattr(desc, 'tag', '')!r} nbytes={nbytes} ring_slot={slot} "
+                    f"window={off} digest={digest}")
+    log(_ring_line(lane_key=lane_key, phase=PHASE_DEPOSIT, tag=tag0, slots=R,
+                   slot_bytes=S, n_batches=n_b, wait_full_s=0.0, wait_free_s=t_free,
+                   waited_batches=waited, total_bytes=total, token=token))
+    log(_ring_lane_time(lane_key=lane_key, phase=PHASE_DEPOSIT, units=n_units,
+                        total_bytes=total, t_lane0=t_lane0, wait_s=t_free,
+                        copy_s=t_copy, rec_s=t_rec, n_sync=n_sync, slots=R,
+                        slot_bytes=S))
+    return ""
+
+
+def run_ring_collect(descs, ops, *, sems, stream, card: int, lane_key: str,
+                     ring_path: str, dpath: str, first_dep: dict,
+                     first_wait_s: float, liveness, budget_s: float, log,
+                     t_lane0: float, no_write=None, dst_digest_fn=None) -> str:
+    """Der Collector der Ringform. Das ``full``-Token und der Record des
+    Stuecks 0 sind schon genommen (``first_dep``, daran erkannte er die
+    Ringform). Nach dem Sync jedes Batches: Kopf ``(token, b+1)`` und ein
+    Weckruf auf Zeile 1."""
+    import hashlib
+
+    ring = dict(first_dep.get("ring") or {})
+    R, S = int(ring.get("slots", 0)), int(ring.get("slot_bytes", 0))
+    token = int(ring.get("token", 0))
+    if R < 1 or S < 1 or token < 1:
+        return (f"ring record of lane {lane_key} is malformed ({ring!r}) -- "
+                f"refused before any copy")
+    try:
+        batches = tp.batch_descs(list(descs), slot_bytes=S, first_seq=0)
+    except Exception as exc:  # noqa: BLE001 -- named below
+        return (f"W68 Weg2XchgPlanDisagree ring: lane {lane_key} cannot cut its "
+                f"descs at {S} bytes ({type(exc).__name__}: {exc}) while the "
+                f"depositor did")
+    n_units = sum(len(b.pieces) for b in batches)
+    if len(batches) != int(ring.get("batches", -1)) or n_units != int(ring.get("units", -1)):
+        return (f"W68 Weg2XchgPlanDisagree ring: lane {lane_key} derives "
+                f"{len(batches)} batches / {n_units} pieces at {S} bytes, the "
+                f"depositor recorded {ring.get('batches')} / {ring.get('units')}")
+    mm, addr, reg, refusal = _persistent_host_buffer(
+        ring_path, seq_ring_bytes(R, S), ops, lane_key, log)
+    if refusal:
+        return refusal
+    log(f"WEG2-SEQ register lane={lane_key} bytes={seq_ring_bytes(R, S)} "
+        f"addr={int(addr)} registered={reg} ring={R}x{S >> 20}MiB")
+    n_b = len(batches)
+    total = sum(int(b.total_bytes) for b in batches)
+    tag0 = str(getattr(descs[0], "tag", "") or "") if descs else ""
+    probe, probed = tp.dst_pointer_probe(ops), set()
+    g = 0
+    t_wait, t_copy, t_rec = float(first_wait_s), 0.0, 0.0
+    n_sync = 0
+    for b, batch in enumerate(batches):
+        slot = b % R
+        base_off = SEQ_RING_HDR_BYTES + slot * S
+        issued = []
+        for piece in batch.pieces:
+            desc = descs[piece.desc_index]
+            name = getattr(desc, "param_name", "?")
+            tag = getattr(desc, "tag", "")
+            nbytes = int(piece.nbytes)
+            off = base_off + int(piece.slot_off)
+            if g == 0:
+                dep = first_dep
+            else:
+                tw0 = time.perf_counter()
+                deadline = time.monotonic() + float(budget_s)
+                got = False
+                while time.monotonic() < deadline:
+                    if sems.diagonal_timedwait(int(card), _SEQ_SLOT, "full", 0.2):
+                        got = True
+                        break
+                    if liveness is not None and not liveness():
+                        dump_rank_stacks(
+                            "PeerGone-seq", tag=str(name), rank=int(off),
+                            extra=f"ring unit {g} {name!r} -- the deposit peer is "
+                                  f"gone while the collect waited")
+                        return f"PeerGone at unit {g} {name!r}"
+                if not got:
+                    dump_rank_stacks("budget-expired-seq", tag=str(name),
+                                     rank=int(off),
+                                     extra=f"ring unit {g} {name!r} budget={budget_s}s")
+                    return f"budget expired at unit {g} {name!r}"
+                t_wait += time.perf_counter() - tw0
+                tr0 = time.perf_counter()
+                dep = _ring_read_record(dpath, g)
+                t_rec += time.perf_counter() - tr0
+                if not dep:
+                    return (f"record missing for unit {g} {name!r} on lane "
+                            f"{lane_key} after 5 s -- the deposit posts 'full' "
+                            f"only after writing it")
+            _dep_name = str(dep.get("name", "") or "")
+            _dep_tag = str(dep.get("tag", "") or "")
+            _my_tag = str(tag or "")
+            if (_dep_name != str(name)
+                    or (_dep_tag and _my_tag and _dep_tag != _my_tag)
+                    or int((dep.get("ring") or {}).get("token", -1)) != token):
+                dump_rank_stacks(
+                    "unit-identity-mismatch-seq", tag=str(name), rank=int(off),
+                    extra=f"ring unit {g} deposit={_dep_name!r}/{_dep_tag} "
+                          f"collect={name!r}/{_my_tag}")
+                return (f"unit identity mismatch at unit {g}: the deposit record "
+                        f"names {_dep_name!r} tag={_dep_tag or '-'} token="
+                        f"{(dep.get('ring') or {}).get('token')}, this ring collect "
+                        f"expects {name!r} tag={_my_tag or '-'} token={token} -- "
+                        f"refused before the copy-out")
+            dep_digest = str(dep.get("digest", ""))
+            my_digest = (hashlib.sha256(bytes(mm[off:off + nbytes])).hexdigest()[:16]
+                         if dep_digest else "off")
+            if dep_digest and my_digest != dep_digest:
+                dump_rank_stacks("digest-mismatch-seq", tag=str(name), rank=int(off),
+                                 extra=f"ring unit {g} {name!r} deposit={dep_digest} "
+                                       f"collect={my_digest}")
+                return (f"digest mismatch at unit {g} {name!r}: "
+                        f"deposit={dep_digest} collect={my_digest}")
+            if no_write and (str(tag or ""), str(name)) in no_write:
+                log(f"WEG2-SEQ collect piece {g} {name!r} tag={tag!r} "
+                    f"digest={my_digest} matches deposit NO-WRITE (ring)")
+                g += 1
+                continue
+            if desc.dst_ptr is None:
+                return (f"collect at piece {g} {name!r}: the desc carries no "
+                        f"dst_ptr -- this rank does not hold the destination "
+                        f"this lane says it fills")
+            _why = tp.refuse_unmapped_dst(probe, probed, dst=int(desc.dst_ptr),
+                                          lane_key=lane_key, i=g, name=name, tag=tag)
+            if _why:
+                return _why
+            dst_ptr = int(desc.dst_ptr) + int(piece.dst_off)
+            src = int(addr) + off
+            tc0 = time.perf_counter()
+            if piece.kind == tp.FLAT:
+                ops.memcpy_async(dst_ptr, src, nbytes, stream)
+            else:
+                ops.memcpy2d_async(dst_ptr, int(piece.dpitch), src,
+                                   int(piece.run_bytes), int(piece.run_bytes),
+                                   int(piece.rows), stream)
+            t_copy += time.perf_counter() - tc0
+            issued.append((g, name, dst_ptr, nbytes, dep_digest, my_digest))
+            if _piece_verbose(g, n_units):
+                log(f"WEG2-SEQ cf lane={lane_key} i={g}/{n_units} dst={dst_ptr} "
+                    f"src={src} ring_slot={slot} off={off} n={nbytes} nm={name!r}")
+            g += 1
+        if issued:
+            tc0 = time.perf_counter()
+            ops.synchronize(stream)
+            n_sync += 1
+            t_copy += time.perf_counter() - tc0
+        for (gi, name, dst_ptr, nbytes, dep_digest, my_digest) in issued:
+            if dst_digest_fn is not None:
+                dst_digest = dst_digest_fn(int(dst_ptr), nbytes)
+                if dep_digest and dst_digest != dep_digest:
+                    dump_rank_stacks(
+                        "placement-mismatch-seq", tag=str(name), rank=int(gi),
+                        extra=f"ring unit {gi} {name!r} deposit={dep_digest} "
+                              f"destination={dst_digest}")
+                    return (f"placement mismatch at unit {gi} {name!r}: "
+                            f"deposit={dep_digest} destination={dst_digest}")
+        # DIE FREIGABE: erst NACH dem Sync dieses Batches (die H2D-Kopien
+        # haben die Host-Seiten gelesen), dann der Weckruf.
+        ring_progress_write(mm, token, b + 1)
+        sems.diagonal_post(int(card), SEQ_RING_WAKE_SLOT, "full")
+    log(_ring_line(lane_key=lane_key, phase=PHASE_COLLECT, tag=tag0, slots=R,
+                   slot_bytes=S, n_batches=n_b, wait_full_s=t_wait, wait_free_s=0.0,
+                   waited_batches=0, total_bytes=total, token=token))
+    log(_ring_lane_time(lane_key=lane_key, phase=PHASE_COLLECT, units=n_units,
+                        total_bytes=total, t_lane0=t_lane0, wait_s=t_wait,
+                        copy_s=t_copy, rec_s=t_rec, n_sync=n_sync, slots=R,
+                        slot_bytes=S))
+    return ""
 
 
 def _mmap_addr(mmv: "_mmap.mmap") -> int:
@@ -2922,12 +3463,27 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     _persist = False
+    # H44 (Task #17): THE LAZY RING FORM, on-card lanes only (the cross lanes
+    # p* ride BAR1 and keep their form). No host buffer is mapped here: the
+    # depositor maps one only when its IPC staging is refused, the collector
+    # only when record 0 carries no IPC handle -- and then as a ring when
+    # the collector was ready (see `ring_collector_ready`).
+    _lazy = bool(buffer is None and card is not None and seq_persist_buffers()
+                 and seq_lane_ring_on())
+    _host_mode = ""
+    _tag0 = str(getattr(descs[0], "tag", "") or "") if descs else ""
     if buffer is not None:
         # the desk path: the test provides the buffer directly
         buf = buffer
         _owns_buf = False
         _seq_mm = None
         _fh = None
+    elif _lazy:
+        buf = None
+        _owns_buf = False
+        _seq_mm = None
+        _fh = None
+        _persist = True
     elif seq_persist_buffers():
         buf, _p_addr, _p_reg, _p_refusal = _persistent_host_buffer(
             path, int(biggest), ops, lane_key, log)
@@ -2979,7 +3535,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
         # without that method raises AttributeError first and an inline
         # assignment would never run -- which is exactly how the desk suite
         # caught this on the first execution (UnboundLocalError, 8 failures).
-    if buffer is None:
+    if buffer is None and not _lazy:
         _seq_addr = _mmap_addr(buf)
         _seq_registered = "no"
         _reg_refusal = ""
@@ -3047,6 +3603,58 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                     f"({type(_ipc_exc).__name__}: {_ipc_exc}) -- host path for "
                     f"this tag")
                 _ipc_base, _ipc_hex = 0, ""
+
+        def _map_whole_lazily() -> str:
+            # H44: the whole-tag buffer of the old form, mapped only now that
+            # this tag really takes the host path -- same file, same persist
+            # cache, same register line.
+            nonlocal buf, _seq_mm, base_addr, _host_mode
+            _mw, _mw_addr, _mw_reg, _mw_refusal = _persistent_host_buffer(
+                path, int(biggest), ops, lane_key, log)
+            if _mw_refusal:
+                return _mw_refusal
+            buf, _seq_mm, base_addr = _mw, _mw, int(_mw_addr)
+            _host_mode = "whole"
+            log(f"WEG2-SEQ register lane={lane_key} bytes={int(biggest)} "
+                f"addr={int(_mw_addr)} registered={_mw_reg}")
+            return ""
+
+        _ring_path = seq_ring_path(boot_nonce, shm_root, lane=_lane_file)
+        if _lazy and phase == PHASE_DEPOSIT:
+            if _ipc_base:
+                _host_mode = "ipc"
+            else:
+                _R, _S = seq_lane_ring_slots(), int(seq_sync_batch()[0])
+                _ok, _why = ring_collector_ready(
+                    dpath, tag=_tag0, total_bytes=int(total_bytes),
+                    wait_ms=seq_lane_ring_ready_ms())
+                _rb = None
+                if _ok:
+                    try:
+                        _rb = tp.batch_descs(list(descs), slot_bytes=_S, first_seq=0)
+                    except Exception as _rb_exc:  # noqa: BLE001 -- whole-tag form then
+                        _ok = False
+                        _why = f"ring-plan-refused({type(_rb_exc).__name__}: {_rb_exc})"
+                log(f"WEG2-SEQ ring-choice lane={lane_key} phase=deposit tag={_tag0} "
+                    f"host={'ring' if _ok else 'whole'} why={_why} bytes={int(total_bytes)} "
+                    f"slots={_R} slot_mib={_S >> 20}"
+                    + ("" if _ok else f" -- whole-tag buffer {int(biggest)} B, "
+                       f"the #1374 Option-1 form (deposit completes without its "
+                       f"collector)"))
+                if _ok:
+                    return run_ring_deposit(
+                        descs, ops, sems=sems, stream=stream, card=int(card),
+                        lane_key=lane_key, ring_path=_ring_path, dpath=dpath,
+                        batches=_rb, slots=_R, slot_bytes=_S, digest_on=_digest_on,
+                        liveness=liveness, budget_s=float(budget_s), log=log,
+                        t_lane0=_t_lane0)
+                _mw_why = _map_whole_lazily()
+                if _mw_why:
+                    return _mw_why
+        if _lazy and phase == PHASE_COLLECT:
+            # H44: 'I stand in my collect' -- resumed, draining without any
+            # further condition; only now may the depositor choose the ring.
+            ring_post_ready(dpath, tag=_tag0, total_bytes=int(total_bytes))
         # #1378 xsn55 (WO DER DEPOSIT STEHT): xsn55's diagonal lane blocked with
         # NO c0 buffer file and NO c0 digest json, while both cross lanes wrote
         # buffers and digests immediately -- so the block was between the lane
@@ -3055,7 +3663,8 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
         # mapping (with the lane's byte size), one after the FIRST piece's copy
         # + digest.  Everything between them is the piece loop's own body.
         log(f"WEG2-SEQ mapped lane={lane_key} phase={phase} bytes={total_bytes} "
-            f"units={len(_batch.pieces)} path={path}")
+            f"units={len(_batch.pieces)} path={path}"
+            + (f" host={_host_mode or 'lazy'}" if _lazy else ""))
         # Order point 2: batched syncs (see `seq_sync_batch`). The unit loop
         # keeps every witness of the per-unit form -- identity by name, the
         # transport digest, NO-WRITE, the placement digest, one `full` per
@@ -3189,6 +3798,21 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                                 f"'full' only after writing it")
                     time.sleep(0.002)
                 _t_rec += time.perf_counter() - _t_rec0
+                if _lazy and i == 0 and _seq_mm is None:
+                    # H44: record 0 says which form the depositor chose.
+                    if dep.get("ring"):
+                        return run_ring_collect(
+                            descs, ops, sems=sems, stream=stream, card=int(card),
+                            lane_key=lane_key, ring_path=_ring_path, dpath=dpath,
+                            first_dep=dep, first_wait_s=_t_wait, liveness=liveness,
+                            budget_s=float(budget_s), log=log, t_lane0=_t_lane0,
+                            no_write=no_write, dst_digest_fn=dst_digest_fn)
+                    if dep.get("ipc"):
+                        _host_mode = "ipc"
+                    else:
+                        _mw_why = _map_whole_lazily()
+                        if _mw_why:
+                            return _mw_why
                 if dep.get("ipc") and not _ipc_base:
                     # the deposit staged on-card: open its handle once
                     _ipc_base = int(ops.ipc_open_handle(bytes.fromhex(str(dep["ipc"]))))
@@ -3300,7 +3924,8 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
             f"wait_ms={_t_wait * 1000:.0f} copy_sync_ms={_t_copy * 1000:.0f} "
             f"record_ms={_t_rec * 1000:.0f} ipc={'yes' if _ipc_base else 'no'} "
             f"syncs={_n_sync} batch={_bat_units}u/{_bat_bytes >> 20}MiB "
-            f"t={_time.time():.3f} t0={_time.time() - (time.perf_counter() - _t_lane0):.3f}")
+            f"t={_time.time():.3f} t0={_time.time() - (time.perf_counter() - _t_lane0):.3f}"
+            + (f" host={_host_mode or 'none'}" if _lazy else ""))
         if phase == PHASE_COLLECT and _owns_buf and _seq_mm is not None:
             # #1385's lesson, at this form's own site: the file is freed by the
             # side that reads it LAST (the collect; the deposit's next tag is
@@ -3312,6 +3937,11 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 pass
         return ""
     finally:
+        if _lazy and phase == PHASE_COLLECT:
+            # H44: the ready file lives exactly as long as this collect; the
+            # caller posts `drained` only after this returns, so a depositor
+            # reusing this buffer slot never finds this tag's readiness.
+            ring_clear_ready(dpath)
         if _ipc_opened:
             try:
                 ops.ipc_close_handle(int(_ipc_base))

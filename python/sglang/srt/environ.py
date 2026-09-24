@@ -643,6 +643,23 @@ class Envs:
     # (weights pool 1.22 GiB = lm_head, bands 3.45 GiB). False = the
     # 2026-09-24 form, byte for byte (everything born in the tag pool).
     SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL = EnvBool(True)
+    # SEQ_LANE_RING (H44, Task #17): the on-card HOST lanes (c0/c1/c2,
+    # /dev/shm/weg2-seq-<boot>/c<card>[_s1]_unit_buffer.bin) were sized to
+    # the lane's biggest TAG, persisted and pinned per buffer slot -- 3.2 GiB
+    # of tmpfs at depth 2 (x148: 646+346, 563+563, 647+647 MB), while 151 of
+    # 152 tag transfers per boot rode the on-card IPC staging and never
+    # touched them. 1 = a tag maps a host lane only when it really takes the
+    # host path (IPC staging refused), and then as a RING of
+    # RING_SLOTS x sync-batch slots (SGLANG_WEG2_SEQ_SYNC_BATCH_MIB) with a
+    # free handshake per batch -- IF the collector has announced it is
+    # already inside its collect (resumed, draining unconditionally). A
+    # collector that is not ready within RING_READY_MS gets the whole-tag
+    # buffer as before (#1374 Option 1: on the diagonal the collector's
+    # resume may wait for this depositor's pause, a blocking ring would be
+    # the xsn30 deadlock). 0 = the eager whole-tag form byte for byte.
+    SGLANG_WEG2_SEQ_LANE_RING = EnvBool(True)
+    SGLANG_WEG2_SEQ_LANE_RING_SLOTS = EnvInt(4)
+    SGLANG_WEG2_SEQ_LANE_RING_READY_MS = EnvInt(50)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
