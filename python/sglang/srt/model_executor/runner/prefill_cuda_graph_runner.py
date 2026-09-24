@@ -45,6 +45,7 @@ import torch
 import tqdm
 
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.distributed.pp_typed_channel import CHANNEL_META_KEYS
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -132,6 +133,22 @@ def prefill_failure_msg(backend_name: str) -> str:
         )
     return PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG.format(
         backend=backend_name, suggestions=hint
+    )
+
+
+def _stage_tensors_only(
+    proxy: Optional[PPProxyTensors],
+) -> Optional[PPProxyTensors]:
+    """``proxy`` without the typed channel's metadata entries.
+
+    The keys left out are ``pp_typed_channel.CHANNEL_META_KEYS`` -- an
+    explicit list, so a real stage tensor with a dunder name still counts as a
+    stage key. A new PPProxyTensors over the same tensors (no copy); the
+    caller's dict is untouched."""
+    if proxy is None:
+        return None
+    return PPProxyTensors(
+        {k: v for k, v in proxy.tensors.items() if k not in CHANNEL_META_KEYS}
     )
 
 
@@ -1114,17 +1131,28 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         live_pp = kwargs.get("pp_proxy_tensors")
         static_pp = getattr(self, "_static_pp_proxy_tensors", None)
+        stage_pp = None
         if static_pp is not None:
+            # The live proxy is the typed channel's message: stage tensors PLUS
+            # the channel's metadata (``__msg_type__`` always rides along into
+            # the PPProxyTensors -- boot weg2xsn427 died here reading it as a
+            # stage key). Only the stage tensors are compared and copied; the
+            # metadata is left out by its EXPLICIT name list, never by prefix.
+            # The caller's dict is not mutated: the eager tail still gets the
+            # message exactly as it arrived.
+            stage_pp = _stage_tensors_only(live_pp)
             # The captured body of a non-first stage reads EXACTLY these keys.
             # A different live key set is a configuration drift (e.g. the
             # DFlash aux carry armed on one stage and not on its peer), never a
             # batch property -- refuse by name rather than replay a static
             # buffer the live proxy did not refresh.
-            live_keys = sorted(live_pp.tensors) if live_pp is not None else None
+            live_keys = sorted(stage_pp.tensors) if stage_pp is not None else None
             if live_keys != sorted(static_pp.tensors):
                 raise RuntimeError(
                     "PREFILL-GRAPH pp proxy key mismatch on a non-first stage: "
-                    f"captured {sorted(static_pp.tensors)}, live {live_keys}. "
+                    f"captured {sorted(static_pp.tensors)}, live stage keys "
+                    f"{live_keys} (channel metadata left out: "
+                    f"{sorted(k for k in (live_pp.tensors if live_pp is not None else ()) if k in CHANNEL_META_KEYS)}). "
                     "The captured body would read stale stage input."
                 )
 
@@ -1134,7 +1162,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_bs=bs,
             raw_num_tokens=num_tokens,
             padded_num_tokens=static_num_tokens,
-            pp_proxy_tensors=live_pp if static_pp is not None else None,
+            pp_proxy_tensors=stage_pp,
         )
 
         registry = self.buffer_registry

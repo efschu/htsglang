@@ -421,6 +421,86 @@ class TestFullGraphEligibility(CustomTestCase):
         self.assertEqual(runner._eager_reasons, {"bs>slots": 5})
 
 
+class TestTypedChannelMetadataIsNotAStageKey(CustomTestCase):
+    """Boot weg2xsn427 (2026-09-24 18:05:37Z, PP1, first replay): the live
+    proxy off the typed channel carried ``__msg_type__`` beside
+    hidden_states/residual, and load_batch refused it as a key drift:
+    ``captured ['hidden_states', 'residual'], live ['__msg_type__',
+    'hidden_states', 'residual']``. The channel metadata is left out by its
+    EXPLICIT name list -- a real stage tensor with a dunder name is not."""
+
+    def _live_with_meta(self, n, keys=KEYS, **meta):
+        live = _live_proxy(n, keys=keys, value=3.0)
+        for k, v in meta.items():
+            live.tensors[k] = v
+        return live
+
+    def test_the_xsn427_message_replays(self):
+        runner = _full_runner(static_keys=("hidden_states", "residual"))
+        live = self._live_with_meta(
+            5, keys=("hidden_states", "residual"), __msg_type__="proxy"
+        )
+        runner.load_batch(_extend_batch(5), pp_proxy_tensors=live)
+        hs = runner.buffers.pp_proxy_tensors["hidden_states"]
+        self.assertTrue(torch.equal(hs[:5], torch.full((5, H), 3.0)))
+        self.assertTrue(torch.equal(hs[5:], torch.zeros(MAX_TOKENS - 5, H)))
+        # the caller's message is not mutated: the eager tail gets it as sent
+        self.assertEqual(live.tensors["__msg_type__"], "proxy")
+
+    def test_every_listed_metadata_key_is_left_out(self):
+        from sglang.srt.distributed.pp_typed_channel import CHANNEL_META_KEYS
+
+        runner = _full_runner()
+        live = self._live_with_meta(
+            5,
+            __msg_type__="proxy",
+            __stamp__=(2, 1, 512, -1, 1, ("r", 0, 512)),
+            __admission_decision__=((1, 2),),
+        )
+        self.assertTrue({"__msg_type__", "__stamp__", "__admission_decision__"} <= set(live.tensors))
+        self.assertEqual(
+            CHANNEL_META_KEYS,
+            frozenset({"__msg_type__", "__stamp__", "__admission_decision__"}),
+        )
+        runner.load_batch(_extend_batch(5), pp_proxy_tensors=live)
+
+    def test_a_missing_stage_tensor_is_still_refused(self):
+        runner = _full_runner(static_keys=("hidden_states", "residual"))
+        live = self._live_with_meta(5, keys=("hidden_states",), __msg_type__="proxy")
+        with self.assertRaisesRegex(RuntimeError, r"live stage keys \['hidden_states'\]"):
+            runner.load_batch(_extend_batch(5), pp_proxy_tensors=live)
+
+    def test_a_dunder_named_stage_tensor_is_not_swallowed(self):
+        """The list is explicit, not a prefix rule: an unknown dunder-named
+        TENSOR stays a stage key, so a body that never captured it refuses."""
+        runner = _full_runner(static_keys=("hidden_states", "residual"))
+        live = self._live_with_meta(
+            5,
+            keys=("hidden_states", "residual"),
+            __msg_type__="proxy",
+            __extra_stage__=torch.zeros(5, H),
+        )
+        with self.assertRaisesRegex(RuntimeError, "__extra_stage__"):
+            runner.load_batch(_extend_batch(5), pp_proxy_tensors=live)
+
+    def test_the_names_are_the_senders_names(self):
+        """The list mirrors the writer: Scheduler._pp_send_dict_to_next_stage
+        writes these three, _pp_recv_proxy_tensors pops two of them."""
+        import os
+
+        from sglang.srt.distributed import pp_typed_channel as ch
+
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(ch.__file__))),
+            "managers",
+            "scheduler_pp_mixin.py",
+        )
+        src = open(path).read()
+        self.assertIn(f'tensor_dict["{ch.MSG_TYPE_KEY}"] = msg_type', src)
+        self.assertIn(f'tensor_dict["{ch.STAMP_KEY}"] = stamp', src)
+        self.assertIn(f'_ADMISSION_DECISION_PAYLOAD_KEY = "{ch.ADMISSION_DECISION_KEY}"', src)
+
+
 class TestNonFirstStageLoadBatch(CustomTestCase):
     def test_the_live_proxy_lands_in_the_static_buffers(self):
         runner = _full_runner()
@@ -654,7 +734,9 @@ class TestExecuteFullPath(CustomTestCase):
             [torch.full((MAX_TOKENS, H), 3.0), torch.full((MAX_TOKENS, H), 4.0)],
         )
         runner.backend = _FakeFullBackend(runner, body_out)
-        out = runner.execute(self._batch(n), pp_proxy_tensors=_live_proxy(n, keys=keys, value=6.0))
+        live = _live_proxy(n, keys=keys, value=6.0)
+        live.tensors["__msg_type__"] = "proxy"  # as the typed channel delivers it
+        out = runner.execute(self._batch(n), pp_proxy_tensors=live)
         self.assertTrue(
             torch.equal(runner.backend.seen["hidden"][:n], torch.full((n, H), 6.0))
         )

@@ -39,6 +39,9 @@ from typing import Any, Callable, Deque, Dict, Optional, Tuple
 
 __all__ = [
     "MSG_TYPE_KEY",
+    "STAMP_KEY",
+    "ADMISSION_DECISION_KEY",
+    "CHANNEL_META_KEYS",
     "CROSSING_KIND",
     "resolve_src",
     "typed_inbox",
@@ -51,6 +54,25 @@ __all__ = [
 #: The entry that carries a message's kind. A non-tensor entry travelling in
 #: this dict is established practice on this channel, not a new risk.
 MSG_TYPE_KEY = "__msg_type__"
+
+#: The two OTHER non-tensor entries a proxy dict carries beside the stage
+#: tensors, both written by ``Scheduler._pp_send_dict_to_next_stage`` (the
+#: #631 sender stamp; the #968/#1035 admission row, the mixin's
+#: ``_ADMISSION_DECISION_PAYLOAD_KEY``) and popped by ``_pp_recv_proxy_tensors``
+#: before a PPProxyTensors is built. ``MSG_TYPE_KEY`` is NOT popped: it rides
+#: into the PPProxyTensors the model is handed.
+STAMP_KEY = "__stamp__"
+ADMISSION_DECISION_KEY = "__admission_decision__"
+
+#: EVERY metadata entry of this channel, as an EXPLICIT list. A consumer that
+#: maps over a PPProxyTensors (the full prefill graph copies each stage tensor
+#: into a static buffer and compares the key set with the captured one) must
+#: leave exactly these out. Deliberately not a ``__`` prefix rule: a prefix
+#: would also swallow a real stage tensor that happened to carry a dunder
+#: name, and a stage tensor dropped from the copy is a stale graph input.
+#: Boot weg2xsn427 died on this: the live proxy on PP1 carried ``__msg_type__``
+#: and the prefill graph read it as a stage key.
+CHANNEL_META_KEYS = frozenset((MSG_TYPE_KEY, STAMP_KEY, ADMISSION_DECISION_KEY))
 
 #: The crossing wire's kind. Distinct from "proxy" and "output" so that a
 #: mid-loop activation can never be mistaken for a stage-boundary one.
