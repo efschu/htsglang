@@ -11133,6 +11133,8 @@ def log_wake_credit_solve(ns, cards: List[Card], fits, log, label: str, *,
             d_ratio=",".join(str(x) for x in ratios), p_rows=p_rows, d_rows=d_rows,
             slot_mib=float(fits[0].slot_mib), label=label,
             reorder=bool(envs.SGLANG_WEG2_FLIP_ORDER_CREDIT.get()), double_staging=double,
+            # H54: dieselbe Suche, die die Front faehrt (die Tabelle traegt sie mit)
+            search=bool(envs.SGLANG_WEG2_ENABLE_FLIP_ORDER_CREDIT_SEARCH.get()),
             reference=ref,
             reference_key=None if ref is None else {
                 "p_card": tuple(ref.p_card), "p_split": tuple(int(x) for x in p_split),

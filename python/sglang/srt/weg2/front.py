@@ -1716,9 +1716,14 @@ def credit_pause_order(order: List[str], why: str, plan: Optional[Dict[str, Any]
             return list(order), why + ", credit order SKIPPED (floor unreadable: %s)" % type(exc).__name__
         if f is not None:
             floors[int(c.nvml_index)] = float(f)
+    # H54: the full-simulation search when this front's env asks for it OR the
+    # planner's pass rested on it (its table carries the mark) -- the riegel's
+    # promise and the front's order are the same question.
+    search = bool(envs.SGLANG_WEG2_ENABLE_FLIP_ORDER_CREDIT_SEARCH.get()
+                  or (plan or {}).get(_wc.SEARCH_KEY))
     new, note = _wc.front_order(
         order, table, free_mib=free, floor_mib=floors,
-        double_staging=not envs.SGLANG_WEG2_CREDIT_LIVE_STAGING.get())
+        double_staging=not envs.SGLANG_WEG2_CREDIT_LIVE_STAGING.get(), search=search)
     return new, why + ", " + note
 
 

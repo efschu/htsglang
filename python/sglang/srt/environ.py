@@ -572,6 +572,17 @@ class Envs:
     # planner refuses (W126) a form no order can fund. 0 = the round-robin as
     # before, and the planner then refuses every form whose given order cycles.
     SGLANG_WEG2_FLIP_ORDER_CREDIT = EnvBool(True)
+    # FLIP_ORDER_CREDIT_SEARCH (H54, dry fnFL2x162 at FR_P 0.410/0.712): the
+    # credit order builds greedily over PREFIXES, and a prefix simulation
+    # knows no sleeper run-ahead -- it reported "NO order funds the wake" for a
+    # form whose full simulation finds a funded order (min headroom 263/8/5
+    # MiB). On: when the greedy build finds none, credit_order searches over
+    # FULL simulations (single-tag moves from the given order, steepest
+    # ascent). The planner riegel (W126) and the front both ask credit_order,
+    # and the planner marks its front table when its pass rests on the
+    # search, so the front runs the same search. A cycle-free order stays
+    # unchanged either way. Off by default: never run on metal.
+    SGLANG_WEG2_ENABLE_FLIP_ORDER_CREDIT_SEARCH = EnvBool(False)
     # PD_TIMED_ORDER (H34, fnFL2x141): the planner times the P->D wake per card
     # in ms (weg2/wake_credit_pd.py) and recommends a rearrangement of the
     # tightest card's own P bands when the credit wait there lengthens the leg
