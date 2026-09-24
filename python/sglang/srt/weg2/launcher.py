@@ -70,6 +70,8 @@ from typing import (
 from sglang.srt.environ import envs
 from sglang.srt.managers import corridor_guard
 from sglang.srt.planner import p_card_chunk as _p_card
+# fnFL2 H57: das Power-Limit je Karte (Startzeile, Referenz-Datierung, Raten-Schnitt).
+from sglang.srt.planner import power_limit as _power
 from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import (
     DEFAULT_D_BS,
@@ -2158,6 +2160,11 @@ class BootState:
     #: #1233 fix 8: the DORMANT-IMAGE sample taken at group P's first sleep --
     #: the term the next boot's ledger prices its image from.
     dormant_image_p: Dict[str, object] = field(default_factory=dict)
+    #: fnFL2 H57: the power limit per card this boot ran under (NVML, read
+    #: only) -- ``power_limit.state_dict``: the POWER-LIMIT line, and per
+    #: ``nvmlN`` limit/max/default W and the max SM clock. Every time or rate a
+    #: later reader takes from this boot is only comparable at this limit.
+    power_limits: Dict[str, object] = field(default_factory=dict)
 
 
 def _now() -> str:
@@ -2206,6 +2213,30 @@ def order_cards(cards: List[Card]) -> List[Card]:
             f"NVML inventory is not 1x5090 + 2x3080: {[(c.nvml_index, c.name) for c in cards]}"
         )
     return [big[0], small[0], small[1]]
+
+
+def log_power_limits(state: BootState, cards: List[Card], log, *,
+                     reading: Optional["_power.PowerReading"] = None) -> "_power.PowerReading":
+    """fnFL2 H57 (Nutzer 24.09. 18:53Z: "... im powerlimit bei 400 und 230 ...
+    da ich spaeter das powerlimit ggf. erhoehen werde").
+
+    Druckt ``POWER-LIMIT nvml0=230/320W nvml1=400/600W nvml2=230/320W
+    sm_clock_max=...`` (NVML, nur lesend), legt dasselbe in ``state.power_limits``
+    (-> ``boot_<TAG>.json``) und datiert jede Zeit-/Raten-Referenz des Planers
+    dagegen: weicht ihr Limit ab, ``REFERENZ VERALTET (Power-Limit ...)`` mit
+    Namen. VERWEIGERT NIE -- die VRAM-Riegel (W122/W130/W132/W126) lesen die
+    Lesung nicht, und ein unlesbares NVML macht die Referenzen ``undatiert``,
+    nicht den Boot unmoeglich. ``cards`` in CUDA-Ordinal-Reihenfolge (die
+    Kartenraten-Bibliothek wird je Stufe gestempelt, wie der Solver sie liest).
+    """
+    reading = _power.read_card_power() if reading is None else reading
+    state.power_limits = _power.state_dict(reading)
+    log(_power.launch_line(reading))
+    library_ref = _power.card_library_reference(reading, cards)
+    for line in _power.reference_lines(
+            reading, _power.TIMED_REFERENCES + ((library_ref,) if library_ref else ())):
+        log(line)
+    return reading
 
 
 def nvml_memory(cards: List[Card]) -> Dict[str, "nvml_registry.MemoryInfo"]:
@@ -11607,6 +11638,7 @@ def solve_p_cut(
     log,
     chunk_tokens: int = 4096,
     user_reserve_by_card: Optional[Dict[str, int]] = None,
+    power_reading: Optional["_power.PowerReading"] = None,
 ) -> PCutFacts:
     """Group P's layer + attention cut, and the ONE provenance line for it.
 
@@ -11632,6 +11664,19 @@ def solve_p_cut(
             f"in layer_types, so the attention axis cannot be solved and the "
             f"KV pool cannot be priced. Refusing rather than defaulting."
         )
+    # fnFL2 H57: THE CUT THE MEASURED STAGE RATES RECOMMEND FOR THIS POWER
+    # LIMIT, printed before anything below can refuse (x164 died at W40 inside
+    # the solve) -- and ONLY printed: the shipped cut stays --pp-stage-ratio
+    # (the arm's PP_RATIO), nothing here reads the line back.
+    log(_power.rate_cut_line(
+        power_reading,
+        stage_cards=cards,
+        model_name=os.path.basename(os.path.normpath(str(model))),
+        is_full_attention=[str(k) == "full_attention" for k in kinds],
+        pinned=_csv_ints(ns.pp_stage_ratio) if getattr(ns, "pp_stage_ratio", None) else None,
+        chunk_tokens=int(chunk_tokens),
+        fr_p=str(getattr(ns, "pp_cut_expert_device_fraction", "") or ""),
+    ))
     # The KV cell is CONSUMED from config, never fitted (#704 D1).
     kv_mib = _pp_cut.kv_mib_per_token_per_attn_layer_from_config(
         cfg, "fp8_e4m3", n_layers
@@ -13299,7 +13344,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="OVERRIDE the solved layer cut for group P (e.g. '32,18,14'). "
              "Passing it is announced as 'PINNED (user override)' in the "
              "PP-CUT provenance line and priced on the same two axes as the "
-             "solved cut. Unset = the solver decides.",
+             "solved cut. Unset = the solver decides. Next-Flash arm: this is "
+             "the ONE cut variable, PP_RATIO in arm_fnFL2_long.sh (default "
+             "29,11,8), with PP_ATTN_RATIO = the attention count that cut "
+             "lands on (fnFL2 H57). The 'PP-CUT RATEN-SCHNITT' line prints the "
+             "cut the measured stage rates recommend for the CURRENT power "
+             "limit (or 'keine Raten fuer <Limit>, Schnitt bleibt gepinnt'); "
+             "it is never applied.",
     )
     ap.add_argument(
         "--pp-attn-stage-ratio", default=None,
@@ -14135,6 +14186,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"while a leg is open, so NO ms/round, prefill, decode or flip "
             f"duration from this boot is quotable as a measurement.")
     log("NVML -> CUDA ordinal map: " + ", ".join(f"ordinal {i} = nvml {c.nvml_index} {c.name} {c.uuid} total {c.total_mib} MiB" for i, c in enumerate(cards)))
+    # fnFL2 H57: the power limit per card -- one line, the state JSON, and the
+    # date check of every time/rate reference (a line, never a refusal).
+    power_reading = log_power_limits(state, cards, log)
 
     # 1a2. WEG2_SCHEDULING_SPEC_0907 slice A -- THE SCHEDULING KNOBS, RESOLVED
     # BEFORE THE BUDGET SOLVE (R-13), and the host ledger is part of that
@@ -14386,7 +14440,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     cut = solve_p_cut(
         ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens,
-        user_reserve_by_card=user_reserve_by_card,
+        user_reserve_by_card=user_reserve_by_card, power_reading=power_reading,
     )
     stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio
     # 1b' (moved here by the argv slice's FIX 2) -- P's PP LAYER SPLIT, of the
