@@ -3591,7 +3591,95 @@ def argv_p(
         # H25: no draft on P means ZERO --speculative-* tokens on P, including
         # the ones an arm passes through --extra-p for both forms (the
         # Next-Flash arm's --speculative-draft-model-path).
-    ) + (list(extra) if draft_kv_on_p else strip_speculative_flags(extra)[0])
+    ) + p_micro_batch_flags(p_bs, list(extra or ())) + (
+        list(extra) if draft_kv_on_p else strip_speculative_flags(extra)[0])
+
+
+#: fnFL2 H37 (Task #118): the scheduler flag that bounds how many requests ONE
+#: prefill forward of group P may carry.
+P_MICRO_BATCH_FLAG = "--pp-max-micro-batch-size"
+
+
+def _last_flag_value(argv: Sequence[str], flag: str) -> Optional[str]:
+    """The value argparse KEEPS for ``flag`` in a token list: the LAST one,
+    in either spelling (``--flag v`` / ``--flag=v``). ``None`` when absent.
+
+    The list twin of :func:`_argv_scalar` (which takes the --extra-* STRING):
+    ``argv_p`` holds ``extra`` already split, and the finished argv is a list.
+    """
+    found = None
+    toks = list(argv or ())
+    for i, tok in enumerate(toks):
+        tok = str(tok)
+        if tok == flag and i + 1 < len(toks):
+            found = str(toks[i + 1])
+        elif tok.startswith(flag + "="):
+            found = tok[len(flag) + 1:]
+    return found
+
+
+def p_micro_batch_flags(p_bs: int, extra: Sequence[str]) -> List[str]:
+    """fnFL2 H37: group P's ``--pp-max-micro-batch-size``, or nothing.
+
+    WHAT IT LIFTS. Unset, the scheduler derives the width as
+    ``max_running_requests // pp_size`` (scheduler.default_pp_micro_batch_size)
+    and ``get_num_allocatable_reqs`` caps every forward at it -- on PP3 that is
+    ONE request per forward for ``--p-bs`` 1..5, so ``--p-bs 3`` buys three
+    requests in flight on three stages but never two in one forward (and every
+    END-ANCHOR tail of 1-4 tokens runs as a forward of its own). For a
+    prefill-only group whose requests finish at the end of their prefill, the
+    forward is bounded by the chunk TOKEN budget (``rem_chunk_tokens`` is a
+    per-batch budget in ``PrefillAdder``), not by a request count; the total
+    stays bounded by ``req_to_token_pool`` (= ``--max-running-requests``).
+
+    The width is P's EFFECTIVE ``--max-running-requests`` -- the one argparse
+    keeps, i.e. an ``--extra-p`` value if the arm doubled the flag -- so the two
+    never disagree. An ``--extra-p`` ``--pp-max-micro-batch-size`` wins and
+    nothing is emitted (same rule as ``--max-mamba-cache-size``).
+
+    Off (the default): ``[]``, the argv is byte-identical to before H37.
+    """
+    if not envs.SGLANG_WEG2_ENABLE_P_UNDIVIDED_MICRO_BATCH.get():
+        return []
+    if _last_flag_value(extra, P_MICRO_BATCH_FLAG) is not None:
+        return []
+    mrr = _last_flag_value(extra, "--max-running-requests")
+    width = int(mrr) if mrr is not None else int(p_bs)
+    return [P_MICRO_BATCH_FLAG, str(max(1, width))]
+
+
+def p_micro_batch_line(argv_of_p: Sequence[str]) -> str:
+    """fnFL2 H37: ONE line at launch that says how many requests one P
+    forward may carry, and why -- the reading the burst probe is checked
+    against (``Prefill batch, #new-seq: k`` on PP0 cannot exceed it).
+
+    Also names a DOUBLED ``--max-running-requests`` (launcher value and an
+    ``--extra-p`` value that differ): argparse keeps the last, so ``--p-bs``
+    then no longer states P's concurrency -- the front still dispatches
+    ``--p-bs`` + P_QUEUE_AHEAD.
+    """
+    toks = [str(t) for t in argv_of_p]
+    mrr_all = [toks[i + 1] for i, t in enumerate(toks)
+               if t == "--max-running-requests" and i + 1 < len(toks)]
+    mrr_all += [t.split("=", 1)[1] for t in toks if t.startswith("--max-running-requests=")]
+    try:
+        mrr = int(_last_flag_value(toks, "--max-running-requests") or 0)
+        pp = int(_last_flag_value(toks, "--pp-size") or 1)
+    except ValueError:
+        return ("P-MICRO-BATCH unreadable argv "
+                "(--max-running-requests/--pp-size not integers)")
+    stock = max(mrr // max(pp, 1), 1) if mrr > 0 else 1
+    doubled = (f" DOUBLED --max-running-requests {'/'.join(mrr_all)}: argparse keeps {mrr}"
+               if len(set(mrr_all)) > 1 else "")
+    mb = _last_flag_value(toks, P_MICRO_BATCH_FLAG)
+    if mb is None:
+        return (f"P-MICRO-BATCH mode=stock width={stock} (= --max-running-requests "
+                f"{mrr} // pp {pp}): one P forward admits at most {stock} request(s); "
+                f"SGLANG_WEG2_ENABLE_P_UNDIVIDED_MICRO_BATCH=1 lifts it to {max(mrr, 1)}{doubled}")
+    return (f"P-MICRO-BATCH mode=undivided width={mb} (--max-running-requests {mrr}, "
+            f"stock would be {stock}): one P forward admits up to {mb} request(s) within the "
+            f"chunk budget; END-ANCHOR still mints ONE continuation per pass (#959/#996), so at "
+            f"most one request REACHES ITS END per forward{doubled}")
 
 
 def w38_armed_line(argv_of_p: Sequence[str]) -> str:
@@ -15111,6 +15199,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     spec_p = GroupSpec("P", PORT_P, transport_argv(shipped_argv_p, ns.transport), state.logs["P"], env_p)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
     log(w38_armed_line(spec_p.argv))
+    # fnFL2 H37: how many requests one P forward may carry, off the SHIPPED argv.
+    log(p_micro_batch_line(spec_p.argv))
     state.deviations = [
         "transports stay OPEN across sleep (barlink_reopen() unwired this round; BAR1 windows sized to fit both groups: P 24+96, D 16+32+40 MiB "
         "= 208 of 224 usable, measured Used 224/256 incl. RM carve-out; #1234 C1 raised dcp:0 from 24 so the 96-MiB dcp all_reduce plans to 10 rounds "

@@ -568,6 +568,11 @@ FORM_KEY_EXCLUDED_FLAGS: Tuple[str, ...] = (
     #: launcher already varies it per arm (--p-bs/--d-bs) between boots whose
     #: loaded image is identical.
     "--max-running-requests",
+    #: fnFL2 H37: the per-forward REQUEST cap (`get_num_allocatable_reqs`'
+    #: first min() term). Emitted by SGLANG_WEG2_ENABLE_P_UNDIVIDED_MICRO_BATCH;
+    #: it sizes no pool and moves no weight -- the token width of a forward is
+    #: --chunked-prefill-size, which stays IN the key.
+    "--pp-max-micro-batch-size",
     #: The scheduler's own queue ceiling: how many requests may WAIT. Pure
     #: admission bookkeeping, no device allocation at all.
     "--max-queued-requests",

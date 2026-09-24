@@ -1923,6 +1923,15 @@ class Envs:
     # 4096 is the flip form; 8192 is the fn7t best form (L2 lever, 24.09.).
     # D keeps 4096 (X's floor, K5).
     SGLANG_WEG2_P_CHUNKED_PREFILL_TOKENS = EnvInt(4096)
+    # fnFL2 H37 (Task #118, agent load = many small prefills): group P's
+    # --pp-max-micro-batch-size. Unset/False = stock: the scheduler derives it
+    # as max_running_requests // pp_size (scheduler.default_pp_micro_batch_size),
+    # i.e. ONE request per forward for --p-bs 1..5 on PP3. True: the launcher
+    # emits P's effective --max-running-requests UNDIVIDED, so one forward may
+    # carry several requests up to the chunk budget (the requests' total stays
+    # bounded by req_to_token_pool = --max-running-requests). Admission cap
+    # only, no allocation: kept out of the ring form key.
+    SGLANG_WEG2_ENABLE_P_UNDIVIDED_MICRO_BATCH = EnvBool(False)
     # Device-planned expert pool (SGLANG_MOE_OFFLOAD_GRAPH_MODE=pool): what an
     # EAGER forward (extend, eager first verify) leaves of the decode LRU.
     # True (default): only the LRU rows the eager pass actually WROTE take its
