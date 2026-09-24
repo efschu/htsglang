@@ -183,6 +183,35 @@ class BaseReasoningFormatDetector:
 
         return StreamingParseResult()
 
+    def _strip_leading_think_start(self, text: str) -> str:
+        think_start_text = self.think_start_token + self.think_start_self_label
+        if text.startswith(think_start_text):
+            return text[len(think_start_text) :]
+        return text
+
+    def finish(self) -> StreamingParseResult:
+        """Flush reasoning buffered under stream_reasoning=False when the stream ends
+        before the end token (e.g. max_tokens cut it short), instead of dropping it.
+
+        Port of upstream #32225 without the #30533 force_nonempty_content
+        streaming accumulator (this tree applies force_nonempty_content only in
+        the non-streaming detect_and_parse of the detectors that take it). With
+        stream_reasoning=True the reasoning was already emitted chunk by chunk,
+        so only an incomplete end-tag fragment can remain and it is dropped.
+        """
+        if not self._in_reasoning:
+            return StreamingParseResult()
+
+        # stream_reasoning=False never clears _buffer, so the opening think token
+        # (stripped only from the base class's local view) survives here.
+        buffer = self._strip_leading_think_start(self._buffer)
+        self._buffer = ""
+
+        if not self.stream_reasoning and buffer:
+            return StreamingParseResult(reasoning_text=buffer)
+
+        return StreamingParseResult()
+
 
 class DeepSeekR1Detector(BaseReasoningFormatDetector):
     """
@@ -1114,6 +1143,19 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
 
         return StreamingParseResult()
 
+    def finish(self) -> StreamingParseResult:
+        # _in_reasoning stays pinned True here (phase tracked via _reasoning_done), so
+        # the base finish() would misfile a truncated answer tail as reasoning.
+        buffer = self._buffer
+        self._buffer = ""
+        if not self._reasoning_done:
+            return StreamingParseResult(
+                reasoning_text=self._strip_leading_think_start(buffer)
+            )
+        if self._saw_text_start and not self._saw_text_end:
+            return StreamingParseResult(normal_text=buffer)
+        return StreamingParseResult()
+
 
 class ReasoningParser:
     """
@@ -1229,4 +1271,10 @@ class ReasoningParser:
     ) -> Tuple[Optional[str], Optional[str]]:
         """Streaming call: incremental parsing"""
         ret = self.detector.parse_streaming_increment(chunk_text)
+        return ret.reasoning_text, ret.normal_text
+
+    def parse_stream_end(self) -> Tuple[Optional[str], Optional[str]]:
+        """Streaming call: flush any detector-specific buffered state once
+        the stream ends."""
+        ret = self.detector.finish()
         return ret.reasoning_text, ret.normal_text
