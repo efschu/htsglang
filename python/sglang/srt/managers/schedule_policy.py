@@ -188,10 +188,17 @@ def _weg2_end_anchor_grain(allocator, page_size) -> int:
     the pool's own construction check, and QSA refuses an extend whose prefix
     splits a compressed group (fnFL2x14)."""
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+    from sglang.srt.weg2 import tail_handoff
 
     if allocator is None or int(page_size or 1) <= 1:
         return 1
-    return int(page_size) if isinstance(allocator.get_kvcache(), QSATokenToKVPool) else 1
+    kv = allocator.get_kvcache()
+    if not isinstance(kv, QSATokenToKVPool):
+        return 1
+    # H18 (E1): with the tail hand-off the cut lands on the compress ratio,
+    # c = floor_r(N-1) -- the anchor node stays at floor_page(c), the rows
+    # [floor_page(c), c) and the state at c go to D (weg2/tail_handoff.py).
+    return tail_handoff.anchor_grain(int(page_size), int(kv.qsa_compress_ratio))
 
 
 from contextlib import contextmanager
@@ -2636,6 +2643,11 @@ class PrefillAdder:
                 # Per-branch bail patches are how #965 was paid for twice.
                 req.set_extend_range(prefix_len, prefix_len)
                 _note_988_loadback(req, prefix_len)
+                # H18 (E1): can this rank serve P's tail (rows + state at c)?
+                # A probe only -- the adoption is not wired (see tail_handoff).
+                from sglang.srt.weg2 import tail_handoff
+
+                tail_handoff.probe(req, prefix_len, self.tree_cache, self.page_size)
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)

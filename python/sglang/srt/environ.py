@@ -459,6 +459,13 @@ class Envs:
     # already missing from the free reading (x105 TP2: 943 MiB counted twice,
     # 311 + 293 ms credit waits).
     SGLANG_WEG2_CREDIT_LIVE_STAGING = EnvBool(True)
+    # TAIL_HANDOFF (H18, E1 of H17, fnFL2x132): P ends the prompt's last-but-one
+    # chunk at c = floor_r(N-1) (r = QSA compress ratio) instead of the page,
+    # and hands the GDN state after c plus the KV/QSA rows of the partial page
+    # [floor_page(c), c) to D through the arena dir (weg2/tail_handoff.py);
+    # D probes them at its load-back (WEG2-TAIL-READY). 0 = the 64-token cut
+    # and no tail files, byte for byte the 2026-09-24 form.
+    SGLANG_WEG2_TAIL_HANDOFF = EnvBool(True)
     # FLIP_ORDER_CREDIT (H14, fnFL2x114c/x114d): the front simulates the
     # D->P wake per card (weg2/wake_credit.py) before it hands out the pause
     # order; an order that ends in the W109 credit cycle is replaced by one in

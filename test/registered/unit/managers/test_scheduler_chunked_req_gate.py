@@ -155,6 +155,11 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.waiting_queue = []
     s.req_to_token_pool = tree_cache.req_to_token_pool
     s.congruent_prefill_lane = None
+    # H18 STUB DRIFT: `stash_chunked_request` hands the tail capture the page
+    # size and the forward stream (weg2/tail_handoff.capture_state); a plain
+    # (non-weg2) request never captures, so any values do.
+    s.page_size = tree_cache.page_size
+    s.forward_stream = None
     # #815 STUB DRIFT: `get_next_batch_to_run` grew a `self.ps.pp_size` read
     # with 6f42d7f923 [#797] (2026-08-21), five days after this helper was last
     # repaired. `ps` is not optional on a real Scheduler -- __init__ assigns it

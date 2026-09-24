@@ -156,19 +156,33 @@ def test_x14_under_qsa_the_anchor_lands_on_a_page_boundary():
     token chunk had prefix 259414 -- not a multiple of the QSA compress ratio
     -- and _qsa_build_write_plan's device assert killed PP0 after the whole
     prefill. On a QSA pool the cut is the last page boundary before N."""
+    from sglang.srt.environ import envs
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
-    qsa = SimpleNamespace(get_kvcache=lambda: object.__new__(QSATokenToKVPool))
+    pool = object.__new__(QSATokenToKVPool)
+    pool.qsa_compress_ratio = 4
+    qsa = SimpleNamespace(get_kvcache=lambda: pool)
     plain = SimpleNamespace(get_kvcache=lambda: object())
-    assert _adder_split(True, 4096, 258048, 1367, 259415,
-                        page_size=64, allocator=qsa) == (259392 - 258048, True)
-    # Not QSA: N-1 as before, page size or not (27B keeps its anchor).
-    assert _adder_split(True, 4096, 258048, 1367, 259415,
-                        page_size=64, allocator=plain) == (1366, True)
-    # The extend lies inside the last page: no split, the previous chunk
-    # boundary (page-aligned) is the anchor.
-    assert _adder_split(True, 4096, 259392, 23, 259415,
-                        page_size=64, allocator=qsa) == (23, False)
+    # H18: the page grain is the form with the tail hand-off OFF.
+    with envs.SGLANG_WEG2_TAIL_HANDOFF.override(False):
+        assert _adder_split(True, 4096, 258048, 1367, 259415,
+                            page_size=64, allocator=qsa) == (259392 - 258048, True)
+        # Not QSA: N-1 as before, page size or not (27B keeps its anchor).
+        assert _adder_split(True, 4096, 258048, 1367, 259415,
+                            page_size=64, allocator=plain) == (1366, True)
+        # The extend lies inside the last page: no split, the previous chunk
+        # boundary (page-aligned) is the anchor.
+        assert _adder_split(True, 4096, 259392, 23, 259415,
+                            page_size=64, allocator=qsa) == (23, False)
+    # H18 ON: the cut lands on the compress ratio, never splitting a group
+    # (259412 % 4 == 0) -- also inside the last page.
+    with envs.SGLANG_WEG2_TAIL_HANDOFF.override(True):
+        assert _adder_split(True, 4096, 258048, 1367, 259415,
+                            page_size=64, allocator=qsa) == (259412 - 258048, True)
+        assert _adder_split(True, 4096, 259392, 23, 259415,
+                            page_size=64, allocator=qsa) == (20, True)
+        assert _adder_split(True, 4096, 258048, 1367, 259415,
+                            page_size=64, allocator=plain) == (1366, True)
 
 
 def test_split_is_identity_when_disarmed_off_chunking_or_mid_prompt():

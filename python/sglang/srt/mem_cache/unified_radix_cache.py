@@ -29,6 +29,7 @@ from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.utils import uneven_dcp_active
 from sglang.srt.environ import envs
+from sglang.srt.weg2 import tail_handoff
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -1655,6 +1656,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
+            # H18 (E1): the partial page's rows [floor_page(c), c) leave with
+            # the state captured at c, before the unaligned tail is freed.
+            tail_handoff.publish_rows(
+                req, kv_indices, self.token_to_kv_pool_allocator, f"pp{self.pp_rank}-{os.getpid()}"
+            )
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
             if _WEG2_END_ANCHOR:

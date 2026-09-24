@@ -314,6 +314,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.mem_cache.hicache_collective import bounded_wait
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.planner import transient_census as _transient_census
+from sglang.srt.weg2 import tail_handoff
 from sglang.srt.mem_cache.common import (
     release_admission_acquired_mamba_slot,
     evict_from_tree_cache,
@@ -8054,6 +8055,15 @@ class Scheduler(
             )
 
     def stash_chunked_request(self, req: Req):
+        # H18 (E1): the chunk that just ran may end at the tail cut c; its GDN
+        # state is captured on the forward stream before the final chunk runs.
+        tail_handoff.capture_state(
+            req,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.page_size,
+            self.forward_stream,
+        )
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
     def process_pending_weg2_park(self) -> None:
