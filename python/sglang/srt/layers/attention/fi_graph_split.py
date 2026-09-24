@@ -438,4 +438,23 @@ def flashinfer_contract_ok(wrapper) -> Tuple[bool, str]:
         return False, "wrapper is not a cuda-graph wrapper"
     if getattr(wrapper, "_custom_mask_buf", None) is not None:
         return False, "custom mask"
+    window_left = getattr(wrapper, "_window_left", -1)
+    if window_left is not None and int(window_left) >= 0:
+        # the kernel's chunk count is ceil(min(kv, window_left + CTA_TILE_Q) /
+        # chunk) (prefill.cuh:3343); split_arrays counts ceil(kv / chunk), so a
+        # sliding window would misplace the partials. The one-wrapper rule
+        # already keeps SWA models out; this names it.
+        return False, "sliding window (window_left=%d)" % int(window_left)
     return True, "ok"
+
+
+def stock_eager_split_float_bytes(num_qo_heads: int, work_items: int, cta_tile_q: int, head_dim_vo: int) -> int:
+    """The float workspace flashinfer 0.6.14's EAGER plan demands once it
+    splits (PrefillPlan, scheduler.cuh:772-776): tmp_v = heads x work items x
+    CTA_TILE_Q x head_dim x sizeof(float), then tmp_s, 16-aligned -- the GQA
+    over-reservation #5177 removes upstream. Sizes the GPU parity test's
+    reference plan: at 98k / 7 chunks it is 506 MiB, and a 384 MiB workspace
+    makes the C++ planner refuse ("Buffer overflow ... batch_prefill_tmp_v").
+    The graph path never plans this way (its partials are sized by rows)."""
+    rows = int(num_qo_heads) * int(work_items) * int(cta_tile_q)
+    return _align(rows * int(head_dim_vo) * 4) + rows * 4

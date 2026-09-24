@@ -13,6 +13,8 @@ test_fi_graph_split_gpu_0924.py.
 import math
 import os
 import struct
+import sys
+import types
 import unittest
 from unittest import mock
 
@@ -26,7 +28,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 HQ, HKV, HD = 24, 4, 256
-# the graph-mode stock plan of a 512-row bucket on the 5090 (padded 85)
+# a graph-mode stock plan of a 512-row bucket on the 5090 (padded 85); its int
+# offsets are illustrative -- test_fi_graph_split_cpp_parity_0924.py feeds the
+# real planner's vector (compiled from the venv header) to layout_from_stock
 STOCK = [85, 512, 1568, 64, 0, 352, 704, 1584, 1056, 1072, 0, 133693440, 3664, 1, 1]
 
 
@@ -177,6 +181,39 @@ class TestEnvironment(CustomTestCase):
         self.assertEqual(G.launcher_env_p_graph_split(0), {})
         self.assertEqual(G.launcher_env_p_graph_split(1), {})
         self.assertEqual(G.launcher_env_p_graph_split(7), {G.GRAPH_SPLIT_ENV: "7"})
+
+
+class _ContractWrapper:
+    _backend = "fa2"
+    is_cuda_graph_enabled = True
+    _custom_mask_buf = None
+
+    def __init__(self, window_left=-1):
+        self._window_left = window_left
+
+
+class TestContract(CustomTestCase):
+    def _ok(self, wrapper):
+        fake = types.SimpleNamespace(__version__=G.FLASHINFER_VERSION)
+        with mock.patch.dict(sys.modules, {"flashinfer": fake}):
+            return G.flashinfer_contract_ok(wrapper)
+
+    def test_full_attention_passes(self):
+        self.assertEqual(self._ok(_ContractWrapper()), (True, "ok"))
+
+    def test_sliding_window_stands_down(self):
+        # the kernel counts chunks over window_left + CTA_TILE_Q, split_arrays over kv
+        for window_left in (0, 4096):
+            ok, why = self._ok(_ContractWrapper(window_left))
+            self.assertFalse(ok)
+            self.assertIn("sliding window", why)
+
+    def test_eager_reference_reservation(self):
+        # 98k / 7 chunks: 24 heads x 336 items x tile 64 x (256 x 4 + 4) B -- more
+        # than the 384 MiB the first GPU parity run gave its reference plan
+        self.assertEqual(G.stock_eager_split_float_bytes(HQ, 48 * 7, 64, HD), 530546688)
+        self.assertGreater(G.stock_eager_split_float_bytes(HQ, 48 * 7, 64, HD), 384 << 20)
+        self.assertLess(G.stock_eager_split_float_bytes(HQ, 48 * 5, 64, HD), 384 << 20)
 
 
 class TestJitCacheCheck(CustomTestCase):
