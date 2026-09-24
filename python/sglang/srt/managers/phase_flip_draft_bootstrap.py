@@ -286,6 +286,20 @@ def scrub_draft_kv(pool, slot_rows: Sequence[torch.Tensor]) -> tuple:
     if pool is None:
         return 0, []
     layer_ids = draft_kv_layer_ids(pool)
+    if getattr(pool, "weg2_slot_mapper", None) is not None:
+        # A SLOT-MAPPED draft pool (DFlash window / small solo pool,
+        # dflash_solo_pool.DraftKVSlotMapper) is NOT indexed by target slots:
+        # its buffers hold num_draft_slots rows (24673 on the 27B D) while the
+        # slots here are TARGET slots (up to 625280) -- indexing with them
+        # writes out of bounds, or zeroes another request's rows below the
+        # bound. And there is nothing to scrub: every read translates through
+        # the mapper after draining the allocator's frees, so a target slot a
+        # restored prefix was just given is UNMAPPED and reads the zero HOLE
+        # slot, and a mapped one holds the draft rows this drafter wrote for
+        # that slot's current owner (a device prefix hit -- real, kept).
+        # Reached since the HICACHE-DRAFT-TIER switch (2026-09-24): off makes
+        # the tier disarmed on group D, whose pool is exactly this one.
+        return 0, layer_ids
     rows = 0
     for slots in slot_rows:
         if slots.numel() == 0:
@@ -794,6 +808,31 @@ WARM_LOGGED_ATTR = "weg2_draft_warm_logged"
 from sglang.srt.managers.schedule_batch import prefix_len  # noqa: E402,F401
 
 
+def _draft_tier_off_by_switch() -> bool:
+    from sglang.srt.mem_cache.hicache_storage import hicache_draft_tier_off
+
+    return hicache_draft_tier_off()
+
+
+def _prefix_came_through_host(req) -> bool:
+    """Did any part of this request's cached prefix come back through the
+    host tier (L2 load-back, whatever filled L2 -- a store/arena prefetch
+    lands in host rows first)? ``Req.needs_host_load_back`` where it exists,
+    the base host hit otherwise; unknown reads as True (cold is the safe
+    direction: one non-drafting round, never a speculation over bytes nothing
+    wrote)."""
+    probe = getattr(req, "needs_host_load_back", None)
+    if callable(probe):
+        try:
+            return bool(probe())
+        except Exception:  # noqa: BLE001 -- unknown -> the safe answer
+            return True
+    hit = getattr(req, "host_hit_length", None)
+    if hit is None:
+        return True
+    return int(hit or 0) > 0
+
+
 def draft_cold_reason(scheduler, req, tier_armed: bool) -> Optional[str]:
     """Why this request's cached prefix carries no draft rows, or None.
 
@@ -833,6 +872,14 @@ def draft_cold_reason(scheduler, req, tier_armed: bool) -> Optional[str]:
             f"{n_prefix} prefix token(s) whose draft rows nothing wrote"
         )
     if not tier_armed:
+        if _draft_tier_off_by_switch() and not _prefix_came_through_host(req):
+            # HICACHE-DRAFT-TIER off (2026-09-24): the tier is not disarmed
+            # for a phase, it does not exist -- so "restored target-only" is
+            # decidable per request instead of over-approximated. A prefix
+            # that needed NO host load-back is a device radix hit: its draft
+            # rows were written by this drafter and never left the card, warm
+            # by construction (draft_tier_armed_for's no-host-tier argument).
+            return None
         return (
             f"the draft half of the HiCache tier is disarmed, so this "
             f"{n_prefix}-token cached prefix was restored target-only (#861)"

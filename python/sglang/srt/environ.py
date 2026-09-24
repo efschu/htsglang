@@ -1944,6 +1944,17 @@ class Envs:
     # under --spec-form DFLASH (--dflash-produce-on-p, default off -> 0).
     # Unset = 1 = the producer form as before (non-launcher boots).
     SGLANG_WEG2_DFLASH_PRODUCE = EnvBool(True)
+    # HICACHE-DRAFT-TIER (user order 2026-09-24 14:15Z: "und schreiben wir in D
+    # auch draft context in den hicache? das muesste raus, weil draft ja keinen
+    # hicacheplatz mehr bekommt"). off = the draft gets NO HiCache space on
+    # this rank: no draft host pool is registered (has_draft stays False), so
+    # there is no draft arena, no draft write-back, no draft lookup/read at a
+    # prefix restore or at admission; D builds its draft context cold (#993
+    # zeros + one bootstrap round). The weg2 launcher resolves its default
+    # `auto` (off when group P carries no draft producer, launcher
+    # p_group_has_draft_producer) and writes `off` into BOTH groups; on a rank
+    # anything but `off` (unset, auto, on) is the draft tier as before.
+    SGLANG_WEG2_HICACHE_DRAFT_TIER = EnvStr("auto")
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
