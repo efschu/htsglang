@@ -678,6 +678,8 @@ class SchedulerWeightUpdaterManager:
     _weg2_prewarm_thread: Any = None
     #: fnFL2x40: the boot-time manifest-join warm-up thread (or None).
     _weg2_join_prewarm_thread: Any = None
+    #: H46: the boot-time ring-file registration thread (or None).
+    _weg2_ring_prereg_thread: Any = None
     _weg2_bar1: Any = None            # BAR1 lanes registry (weg2/bar1_lanes.py), built at boot
     _weg2_bar1_thread: Any = None     # its setup thread (windows served, peers mapped)
     _weg2_flip_index_now: object = None  # the flip index of the leg in progress (BAR1 flag seq = '<flip>-<tag>')
@@ -775,6 +777,12 @@ class SchedulerWeightUpdaterManager:
             # for a mode file that never comes.
             self._weg2_bar1_start()
             self._weg2_join_prewarm_start()
+            # H46: the H44 ring files of this rank's diagonal lane, created
+            # and registered now instead of at the first host-path tag.
+            try:
+                self._weg2_ring_preregister_start()
+            except Exception as _rp_exc:  # noqa: BLE001 -- never costs the other warm-ups
+                logger.info("WEG2-SEQ preregister not started: %r", _rp_exc)
             if (os.environ.get("SGLANG_WEG2_LANE_PREWARM", "0") or "0") != "1":
                 return
             import threading
@@ -785,6 +793,81 @@ class SchedulerWeightUpdaterManager:
             t.start()
         except Exception as exc:  # noqa: BLE001 -- a warm-up never breaks a boot
             logger.info("WEG2-LANE-PREWARM not started: %r", exc)
+
+    def _weg2_ring_preregister_start(self) -> None:
+        """H46: create, populate and cudaHostRegister this rank's lane ring
+        files (``c<rank>[_s<k>]_ring.bin``, H44) on a daemon thread at boot.
+
+        x148 paid every lane-buffer registration of the boot inside the first
+        D->P flip (register_ms 5918-7867 for sizes that x147/x150 registered in
+        293-342 ms); D deposits then waited 6-8.4 s for their collectors. The
+        ring's size is pure geometry (``seq_ring_bytes`` of the ring slots and
+        the sync batch), so nothing waits for manifests: the files exist
+        before either group can flip, and the flip's ``_persistent_host_buffer``
+        finds them (``persist ... reuse``). The co-card peer process maps and
+        registers the same files (the tmpfs pages exist once).
+        SGLANG_WEG2_SEQ_LANE_RING_PREREGISTER=0 keeps the first-use form."""
+        from sglang.srt.weg2 import weight_exchange_bounce as bx
+        from sglang.srt.weg2 import weight_exchange_region as xr
+
+        why = bx.ring_preregister_skip_reason()
+        if why:
+            logger.info("WEG2-SEQ preregister skipped: %s", why)
+            return
+        boot_nonce = (os.environ.get(xr.ENV_REGION_BOOT, "") or "").strip()
+        rank = self._weg2_rank()
+        if not boot_nonce or rank is None or int(rank) < 0:
+            logger.info("WEG2-SEQ preregister skipped: boot=%r rank=%r",
+                        boot_nonce, rank)
+            return
+        device = -1
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                device = int(torch.cuda.current_device())
+        except Exception:  # noqa: BLE001 -- the thread then names the device it lacks
+            device = -1
+        import threading
+
+        t = threading.Thread(
+            target=self._weg2_ring_preregister,
+            kwargs={"boot_nonce": boot_nonce, "rank": int(rank), "device": device},
+            name="weg2-ring-prereg", daemon=True)
+        self._weg2_ring_prereg_thread = t
+        t.start()
+
+    def _weg2_ring_preregister(self, *, boot_nonce: str, rank: int, device: int,
+                               ops=None, set_device=None) -> dict:
+        """The thread body: bind THIS rank's device first (a fresh thread's
+        runtime device is 0 -- a register there would open a context on a
+        foreign card), then register. The hooks exist for the hermetic test."""
+        from sglang.srt.weg2 import weight_exchange_bounce as bx
+
+        try:
+            if ops is None:
+                ops = self._weg2_xchg_device_ops()
+            if ops is None:
+                logger.info("WEG2-SEQ preregister skipped: no device ops on rank %d",
+                            int(rank))
+                return {}
+            if int(device) < 0:
+                logger.info("WEG2-SEQ preregister skipped: rank %d has no CUDA "
+                            "device to bind the registering thread to", int(rank))
+                return {}
+            if set_device is None:
+                def set_device(dev):
+                    import torch
+
+                    torch.cuda.set_device(int(dev))
+                    ops.set_device(int(dev))
+            set_device(int(device))
+            return bx.preregister_ring_lanes(boot_nonce, [f"c{int(rank)}"], ops,
+                                             log=logger.info)
+        except Exception as exc:  # noqa: BLE001 -- a warm-up never breaks a boot
+            logger.info("WEG2-SEQ preregister stopped: %r -- the first host-path "
+                        "tag maps its ring file as before", exc)
+            return {}
 
     def _weg2_join_prewarm_start(self) -> None:
         """fnFL2x40: join this boot's manifests on a daemon thread, before the

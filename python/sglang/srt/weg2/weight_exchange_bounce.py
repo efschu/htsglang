@@ -2357,17 +2357,21 @@ _SEQ_STAGE: dict = {}      # (boot_nonce, lane_file) -> {"ptr","size","device","
 _SEQ_CACHE_LOCK = __import__("threading").Lock()
 
 
-def _persistent_host_buffer(path: str, biggest: int, ops, lane_key: str, log):
+def _persistent_host_buffer(path: str, biggest: int, ops, lane_key: str, log,
+                            *, first_use: str = "new"):
     """``(mm, addr, registered_str, refusal_str)`` for one lane slot, cached
     per process; grown (unregister, remap, re-register) when ``biggest``
-    exceeds the cached size."""
+    exceeds the cached size. ``first_use`` names a creation on the persist
+    line (H46: ``preregister`` at boot, ``new`` at first use in a flip); the
+    line ends in ``file=`` so a ring file and a whole-tag file of the same
+    lane stay apart."""
     with _SEQ_CACHE_LOCK:
         ent = _SEQ_HOST_BUF.get(path)
         if ent is not None and int(ent["size"]) >= int(biggest):
             log(f"WEG2-SEQ persist lane={lane_key} reuse size={int(ent['size'])} "
-                f"registered={ent['registered']}")
+                f"registered={ent['registered']} file={os.path.basename(path)}")
             return ent["mm"], ent["addr"], ent["registered"], ""
-        how = "new"
+        how = str(first_use or "new")
         if ent is not None:
             how = f"grow {int(ent['size'])}->{int(biggest)}"
             if ent["registered"] == "yes":
@@ -2428,7 +2432,7 @@ def _persistent_host_buffer(path: str, biggest: int, ops, lane_key: str, log):
         log(f"WEG2-SEQ persist lane={lane_key} {how} size={int(biggest)} "
             f"addr={int(addr)} registered={registered} "
             f"register_ms={(time.perf_counter() - t0) * 1000:.0f} "
-            f"populate_ms={_pop_ms:.0f}")
+            f"populate_ms={_pop_ms:.0f} file={os.path.basename(path)}")
         if refusal:
             mm.close()
             fh.close()
@@ -2717,6 +2721,107 @@ def seq_ring_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT,
 
 def seq_ready_path(dpath: str) -> str:
     return f"{dpath}.ready"
+
+
+# ---------------------------------------------------------------------------
+# H46: DIE RINGDATEIEN BEIM BOOT, NICHT IM ERSTEN FLIP.
+#
+# x148 (P+D-Log): alle new/grow-Zeilen des Boots fielen in den ersten D->P-
+# Flip (18) und den ersten P->D (2); cudaHostRegister derselben Groesse
+# brauchte dort 5,9-7,9 s (TP2 c2 646 MB 7324/7820 ms, PP1 c1 7867, PP0 c0
+# 5918), in x147/x150 fuer dieselben Bytes 293-342 ms -- das Populate davor
+# 20-205 ms. Seit H44 mappt ein IPC-Tag keine Host-Lane mehr; der Ring
+# (hdr + R x Sync-Batch je Karte und Pufferslot) entsteht beim ersten Tag,
+# der wirklich den Host-Weg nimmt -- also wieder im Flip, unter derselben
+# Treiberkonkurrenz. Hier werden genau diese Dateien vorab angelegt,
+# befuellt und registriert: dieselben Pfade (``seq_ring_path`` ueber
+# ``seq_lane_file_name``), dieselbe Groesse (``seq_ring_bytes``), derselbe
+# Prozess-Cache (``_persistent_host_buffer``) -- der Flip findet ``reuse``.
+# Die Ganz-Tag-Rueckfalldatei (Collector nicht bereit) bleibt lazy: sie ist
+# taggross (bis 646 MB je Slot) und selten; vorab gepinnt waeren es wieder
+# die 3,18 GiB, die H44 gestrichen hat.
+# ---------------------------------------------------------------------------
+
+
+def ring_preregister_skip_reason() -> str:
+    """'' wenn die Ringdateien beim Boot vorab registriert werden, sonst der
+    Grund. Die Form, die der Flip faehrt, entscheidet: ohne persistente
+    Puffer, ohne Ring oder mit Freigabe je Leg (die Datei wird am Leg-Ende
+    abgeschnitten) gibt es nichts, das ein Vorab-Register dem Flip abnimmt."""
+    from sglang.srt.environ import envs
+
+    if not bool(envs.SGLANG_WEG2_SEQ_LANE_RING_PREREGISTER.get()):
+        return "SGLANG_WEG2_SEQ_LANE_RING_PREREGISTER=0"
+    if not seq_persist_buffers():
+        return f"{SEQ_PERSIST_BUFFERS_ENV}=0 (per-tag buffers)"
+    if not seq_lane_ring_on():
+        return "SGLANG_WEG2_SEQ_LANE_RING=0 (whole-tag form, see SGLANG_WEG2_LANE_PREWARM)"
+    if seq_release_lanes():
+        return f"{SEQ_RELEASE_LANES_ENV}=1 (lanes released per leg)"
+    return ""
+
+
+def ring_preregister_files(boot_nonce: str, lane_keys, *,
+                           shm_root: str = xr.SHM_ROOT,
+                           depth: Optional[int] = None) -> List[Tuple[str, str, int]]:
+    """``[(lane_key, path, nbytes)]`` -- jede Ringdatei, die ein Flip dieses
+    Prozesses anlegen kann: nur Diagonal-Lanes (``c<k>``; die p*-Lanes fahren
+    BAR1 bzw. die Ganz-Tag-Form), je Pufferslot ``0 .. depth-1``."""
+    d = max(1, int(seq_buffer_depth() if depth is None else depth))
+    nbytes = seq_ring_bytes(seq_lane_ring_slots(), int(seq_sync_batch()[0]))
+    out = []
+    for lk in lane_keys:
+        lk = str(lk)
+        if not (lk.startswith("c") and lk[1:].isdigit()):
+            continue
+        for slot in range(d):
+            out.append((lk, seq_ring_path(boot_nonce, shm_root,
+                                          lane=seq_lane_file_name(lk, slot)),
+                        int(nbytes)))
+    return out
+
+
+def preregister_ring_lanes(boot_nonce: str, lane_keys, ops, *, log,
+                           shm_root: str = xr.SHM_ROOT,
+                           depth: Optional[int] = None) -> dict:
+    """Legt jede Ringdatei dieses Prozesses an, befuellt sie (MADV_POPULATE_
+    WRITE) und registriert sie (cudaHostRegister) -- beim Boot, ausserhalb
+    der Flipzeit. Rueckgabe ``{"files", "bytes", "registered", "refused",
+    "skipped", "ms"}``; ein Fehler je Datei wird benannt, der Flip legt die
+    Datei dann wie bisher beim ersten Host-Tag an."""
+    t0 = time.perf_counter()
+    why = ring_preregister_skip_reason()
+    if why:
+        log(f"WEG2-SEQ preregister skipped: {why} -- the first host-path tag "
+            f"of a flip maps its lane file as before")
+        return {"files": 0, "bytes": 0, "registered": 0, "refused": 0,
+                "skipped": why, "ms": 0.0}
+    files = ring_preregister_files(boot_nonce, lane_keys, shm_root=shm_root,
+                                   depth=depth)
+    n = total = reg = refused = 0
+    for lk, path, nbytes in files:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            _mm, _addr, registered, refusal = _persistent_host_buffer(
+                path, int(nbytes), ops, lk, log, first_use="preregister")
+        except Exception as exc:  # noqa: BLE001 -- the flip maps at first use
+            registered, refusal = "no", f"{type(exc).__name__}: {exc}"
+        if refusal:
+            refused += 1
+            log(f"WEG2-SEQ preregister lane={lk} file={os.path.basename(path)} "
+                f"REFUSED {refusal} -- this file is mapped at its first host-path "
+                f"tag instead")
+            continue
+        n += 1
+        total += int(nbytes)
+        reg += 1 if registered == "yes" else 0
+    ms = (time.perf_counter() - t0) * 1000
+    log(f"WEG2-SEQ preregister done lanes={','.join(sorted({f[0] for f in files})) or '-'} "
+        f"files={n}/{len(files)} bytes={total} registered={reg} refused={refused} "
+        f"ms={ms:.0f} -- a flip's host-path tag finds its ring file registered "
+        f"(persist ... reuse), nothing to register on its critical path")
+    return {"files": n, "bytes": total, "registered": reg, "refused": refused,
+            "skipped": "", "ms": ms}
 
 
 def _ring_word(token: int, freed: int) -> int:
