@@ -500,6 +500,7 @@ class Envs:
     SGLANG_WEG2_TAIL_SKIP_EXTEND = EnvBool(True)
     # DECODE WARM FROM P (fnFL2 H29). P publishes what it saw at the END of
     # the prompt into the hand-off dir (<SGLANG_HICACHE_ARENA_DIR>/handoff):
+    # the routed experts of the last LRU_WARM_TOKENS tokens per MoE layer and
     # the PLE rows of its last prefill gather. D reads them after the wake.
     # Both groups need the switch (the launcher env is not the rank env).
     # PLE_DECODE_PREFETCH (H29a): D faults the published PLE rows' pages into
@@ -509,6 +510,15 @@ class Envs:
     # cold). At most PLE_DECODE_PREFETCH_PAGES pages per wake.
     SGLANG_WEG2_PLE_DECODE_PREFETCH = EnvBool(False)
     SGLANG_WEG2_PLE_DECODE_PREFETCH_PAGES = EnvInt(16384)
+    # LRU_WARM_FROM_HANDOFF (H29b): after rearm_after_wake the free LRU rows
+    # of every pool layer are filled with P's most-routed experts of the last
+    # LRU_WARM_TOKENS prompt tokens (no new VRAM: only rows the reinit left
+    # free, at most LRU_WARM_ROWS per layer, 0 = every free row). The copy is
+    # synchronous in the wake: it moves bytes the first decode rounds would
+    # fetch anyway from the rounds into the flip (measured by LRU-WARM ms=).
+    SGLANG_WEG2_LRU_WARM_FROM_HANDOFF = EnvBool(False)
+    SGLANG_WEG2_LRU_WARM_TOKENS = EnvInt(64)
+    SGLANG_WEG2_LRU_WARM_ROWS = EnvInt(8)
     # a published file older than this is another prompt's and is ignored
     SGLANG_WEG2_DECODE_WARM_MAX_AGE_S = EnvFloat(600.0)
     # FLIP_ORDER_CREDIT (H14, fnFL2x114c/x114d): the front simulates the

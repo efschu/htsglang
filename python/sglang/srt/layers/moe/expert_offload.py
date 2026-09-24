@@ -3195,6 +3195,9 @@ class MoEExpertOffloadCache:
     tested on CPU now (tests/moe_offload/test_planner.py).
     """
 
+    #: fnFL2 H29b: P notes its tail routing (set per instance in __init__)
+    _route_note = False
+
     #: names of the stacked per-expert tensors to pool/fetch (dim 0 == expert).
     EXPERT_TENSOR_ATTRS = (
         # FP8 / triton fused path (M-B original).
@@ -3285,6 +3288,10 @@ class MoEExpertOffloadCache:
         self._pool_ready = False
         self._pool_tables = None
         self._pool_buffers = None
+        # fnFL2 H29b: on P, every eager forward notes its tail routing for D's
+        # LRU warm after the wake (weg2/decode_warm_handoff). False off P or
+        # with SGLANG_WEG2_LRU_WARM_FROM_HANDOFF=0 -- then nothing is paid.
+        self._route_note = _route_note_armed(layer, self.num_local_experts)
         self._pool_srcs = None
         self._pool_dsts = None
         self._pool_view_holders = []
@@ -4335,6 +4342,57 @@ class MoEExpertOffloadCache:
         )
         return hot_slot_of, host_row
 
+    def _note_route(self, ids) -> None:
+        """fnFL2 H29b, P side: this forward's host ids -> the stage's route
+        file (written once per forward, at the stage's last layer). Never
+        kills a forward."""
+        try:
+            import numpy as np
+
+            from sglang.srt.environ import envs
+
+            _ROUTE_RECORDER.note(
+                getattr(self.layer, "layer_id", -1),
+                np.asarray(ids, dtype=np.int64).reshape(len(ids), -1),
+                self.num_local_experts,
+                int(envs.SGLANG_WEG2_LRU_WARM_TOKENS.get()),
+            )
+        except Exception as exc:  # noqa: BLE001 -- a warm hint never kills a forward
+            logger.debug("[H29b] route note skipped: %s", exc)
+
+    def warm_lru_from_route(self, route, limit: int = 0) -> int:
+        """fnFL2 H29b, D side, right after ``rearm_after_wake``: fill the LRU
+        rows the reinit left free with P's most-routed experts of this layer
+        (``route`` = [(GLOBAL expert, count)], most routed first).
+
+        No new VRAM: only rows that own no expert are written, at most
+        ``limit`` (0 = every free row). The bytes come from the same pinned
+        store rows the step's own misses copy from (``host_row``), on the
+        current stream, BEFORE any replay reads the tables; the tables are
+        written by ``seed_lru_rows`` so the bijection holds. Returns the rows
+        filled."""
+        if not self._pool_ready or not route:
+            return 0
+        import torch
+
+        from sglang.srt.layers.moe.expert_pool_device import copy_rows, seed_lru_rows
+
+        ids = [int(e) for e, _c in route]
+        to_local = getattr(self.layer, "pool_prefetch_local_ids", None)
+        if to_local is not None:
+            dev = self._pool_tables.hot_phys.device
+            local = to_local(torch.tensor(ids, dtype=torch.int64, device=dev))
+            ids = [int(x) for x in local.tolist()]
+        pairs = seed_lru_rows(self._pool_tables, ids, limit=int(limit))
+        if not pairs:
+            return 0
+        dev = self._pool_dsts[0].device
+        src = torch.tensor([p[0] for p in pairs], dtype=torch.int32, device=dev)
+        dst = torch.tensor([p[1] for p in pairs], dtype=torch.int32, device=dev)
+        count = torch.tensor([len(pairs)], dtype=torch.int32, device=dev)
+        copy_rows(self._pool_srcs, self._pool_dsts, src, dst, count)
+        return len(pairs)
+
     def rearm_after_wake(self) -> int:
         """Nach dem Wake, bevor irgendein Forward laeuft (Platztausch).
 
@@ -4555,6 +4613,8 @@ class MoEExpertOffloadCache:
             ).cpu().numpy()
         flat_np = both_np[:n_own].astype(np.int64)
         k = int(topk_ids.shape[-1])
+        if self._route_note:
+            self._note_route(flat_np.reshape(-1, k))
         # [T, K] int64 rows: nan_disc2 reads ids_list[r] per row, which an
         # array answers exactly like the list (H20c).
         self._nan_trace_begin(flat_np.reshape(-1, k))
@@ -4647,6 +4707,8 @@ class MoEExpertOffloadCache:
             prefetch = self._issue_lookahead(lookahead, pred_list)
 
         self._observe_routing(ids_list)
+        if self._route_note:
+            self._note_route(ids_list)
         self._nan_trace_begin(ids_list)
         # H13: SGLANG_DEBUG_HOST_ANON_PROBE -- RssAnon at every MoE site.
         _hap_layer = getattr(self.layer, "layer_id", None)
@@ -5677,6 +5739,11 @@ def _warm_after_wake(model):
     default and neither can refuse the wake."""
     from sglang.srt.environ import envs
 
+    if envs.SGLANG_WEG2_LRU_WARM_FROM_HANDOFF.get():
+        try:
+            warm_lru_after_wake(model, int(envs.SGLANG_WEG2_LRU_WARM_ROWS.get()))
+        except Exception as exc:  # noqa: BLE001 -- the warm is a hint
+            logger.warning("LRU-WARM skipped: %s", exc)
     if envs.SGLANG_WEG2_PLE_DECODE_PREFETCH.get():
         try:
             from sglang.srt.models.qwen4_exp_ple_table import start_ple_decode_warm
@@ -5684,6 +5751,44 @@ def _warm_after_wake(model):
             start_ple_decode_warm(model)
         except Exception as exc:  # noqa: BLE001
             logger.warning("PLE-DECODE-PREFETCH skipped: %s", exc)
+
+
+def warm_lru_after_wake(model, limit: int, routes=None):
+    """``(rows_filled, layers)``: every pool layer's free LRU rows from P's
+    published tail routing (weg2/decode_warm_handoff). Synchronous: the copies
+    finish before this returns, and ``ms=`` is what the flip pays for them."""
+    import time
+
+    import torch
+
+    from sglang.srt.environ import envs
+    from sglang.srt.weg2 import decode_warm_handoff as dwh
+
+    t0 = time.monotonic()
+    files = None
+    if routes is None:
+        routes, files = dwh.load_routes()
+    rows = layers = considered = 0
+    for module in model.modules():
+        cache = getattr(module, "_expert_offload", None)
+        if not isinstance(cache, MoEExpertOffloadCache) or not cache._pool_ready:
+            continue
+        considered += 1
+        n = cache.warm_lru_from_route(routes.get(getattr(module, "layer_id", -1)), limit)
+        if n:
+            rows += n
+            layers += 1
+    if rows and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    ms = (time.monotonic() - t0) * 1000.0
+    logger.info(
+        "LRU-WARM rows_filled=%d layers=%d ms=%.1f pool_layers=%d route_layers=%d "
+        "route_files=%s limit=%d (fnFL2 H29b: free LRU rows after the wake from "
+        "P's last %d tokens' routing; ms is paid inside the flip)",
+        rows, layers, ms, considered, len(routes), files if files is not None else "given",
+        limit, int(envs.SGLANG_WEG2_LRU_WARM_TOKENS.get()),
+    )
+    return rows, layers
 
 
 def _refill_runs(refill):
@@ -6660,3 +6765,32 @@ def _router_probe(router_logits, topk_weights, flat_weights, T, K) -> None:
     except Exception as exc:  # noqa: BLE001 -- an instrument never kills a layer
         logger.debug("[nan-probe-rw] router probe skipped: %s", exc)
 
+
+# ---- fnFL2 H29b: P's tail routing for D's LRU warm ---------------------------
+def _make_route_recorder():
+    from sglang.srt.weg2.decode_warm_handoff import RouteRecorder
+
+    return RouteRecorder()
+
+
+_ROUTE_RECORDER = _make_route_recorder()
+
+
+def _route_note_armed(layer, num_local: int) -> bool:
+    """True on a P-stage layer that holds EVERY expert (its local ids are the
+    global ids D's shards translate) with SGLANG_WEG2_LRU_WARM_FROM_HANDOFF on;
+    the layer is registered so the stage writes its file once per forward."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_WEG2_LRU_WARM_FROM_HANDOFF.get():
+        return False
+    if _group_of_layer(layer) != "P":
+        return False
+    num_global = int(getattr(layer, "num_experts", 0) or 0)
+    if not num_global or int(num_local) != num_global:
+        return False
+    lid = getattr(layer, "layer_id", None)
+    if lid is None:
+        return False
+    _ROUTE_RECORDER.register(int(lid))
+    return True

@@ -307,6 +307,54 @@ def sync_tables(
     return SyncReport(owned=int((key[lo:hi] >= 0).sum()), twins_freed=twins)
 
 
+def seed_lru_rows(tables: PoolTables, experts: Sequence[int],
+                  limit: int = 0) -> List[Tuple[int, int]]:
+    """fnFL2 H29b: hand FREE LRU rows to ``experts`` (most wanted first) and
+    return the ``(host_row, bank_row)`` pairs whose bytes the caller must copy
+    BEFORE the next step reads the tables.
+
+    Only rows that own no expert are taken (after ``reinit_pool_tables`` that
+    is the whole LRU region); a resident expert (``host_row == -1``), an
+    expert that already owns a row, an id outside ``[0, E)`` and a repeat are
+    skipped. ``limit`` > 0 caps the pairs. Each taken row is stamped with the
+    current clock, like a row the last step used, so the next step's victim
+    choice treats it as the freshest working set. The bijection
+    ``row_key[r] == e`` iff ``hot_phys[e] == r`` holds by construction.
+    One host read and one write-back of three tables; call it outside any
+    capture and before the next replay."""
+    E, lo, hi = tables.num_experts, tables.lru_start, tables.pool_rows
+    hot = tables.hot_phys.cpu()
+    key = tables.row_key.cpu()
+    use = tables.row_use.cpu()
+    host_row = tables.host_row.cpu()
+    clock = int(tables.clock[0])
+    free = [r for r in range(lo, hi) if int(key[r]) < 0]
+    pairs: List[Tuple[int, int]] = []
+    seen = set()
+    for e in experts:
+        e = int(e)
+        if limit > 0 and len(pairs) >= limit:
+            break
+        if not free:
+            break
+        if e in seen or not 0 <= e < E:
+            continue
+        seen.add(e)
+        if int(host_row[e]) < 0 or int(hot[e]) >= 0:
+            continue
+        r = free.pop(0)
+        hot[e] = r
+        key[r] = e
+        use[r] = clock
+        pairs.append((int(host_row[e]), r))
+    if pairs:
+        dev = tables.hot_phys.device
+        tables.hot_phys.copy_(hot.to(dev))
+        tables.row_key.copy_(key.to(dev))
+        tables.row_use.copy_(use.to(dev))
+    return pairs
+
+
 def bijection_breaks(tables: PoolTables) -> int:
     """LRU rows that break ``row_key[r] == e`` iff ``hot_phys[e] == r``: a row
     naming an expert whose ``hot_phys`` points elsewhere, or an expert pointing
@@ -798,7 +846,7 @@ def _copy_kernel():
 __all__ = [
     "PLAN_WIDTH", "ROW_USE_NEVER", "PoolTables", "StepBuffers", "SyncReport",
     "allocate_pool_tables", "allocate_step_buffers", "copy_rows",
-    "bijection_breaks", "copy_rows_reference", "step", "step_reference", "sync_tables",
+    "bijection_breaks", "copy_rows_reference", "seed_lru_rows", "step", "step_reference", "sync_tables",
     "take_report",
     "take_prefetch_report",
     "check_pool_error",
