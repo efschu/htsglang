@@ -65,6 +65,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _target_model_runner(model_worker):
+    """The TARGET model runner behind a scheduler's model worker:
+    `.model_runner` on a plain TpModelWorker, `.target_worker.model_runner`
+    under speculation (a BaseSpecWorker carries no model_runner of its own;
+    the draft runner is never a weightless or Form A worker)."""
+    model_runner = getattr(model_worker, "model_runner", None)
+    if model_runner is None:
+        target_worker = getattr(model_worker, "target_worker", None)
+        model_runner = getattr(target_worker, "model_runner", None)
+    return model_runner
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
@@ -209,14 +221,25 @@ class SchedulerBatchResultProcessor:
         deliberately never weightless (see the role assignment in
         ModelRunner.__init__), so resolving through target_worker is the right
         object, not merely the reachable one."""
-        model_worker = self.model_worker
-        model_runner = getattr(model_worker, "model_runner", None)
-        if model_runner is None:
-            target_worker = getattr(model_worker, "target_worker", None)
-            model_runner = getattr(target_worker, "model_runner", None)
+        model_runner = _target_model_runner(self.model_worker)
         return model_runner is not None and getattr(
             model_runner, "is_weightless_worker", False
         )
+
+    def _is_form_a_worker(self) -> bool:
+        """fnFL2 H72 (x171): True on a Form A EXPERT WORKER rank. Its forward
+        is the MoE route only, so result.logits_output is None exactly as on a
+        weightless worker; tp_worker and the spec verify already treat the two
+        roles alike (`is_weightless_worker or is_form_a_worker`), this processor
+        did not. x171 died there: a greedy request with logprobs=True reached
+        D, TP1/TP2 walked into `logits_output.next_token_logprobs` on a None in
+        move_logprobs_to_cpu. Logprobs are host-only (TP0 computes and streams
+        them); the worker skips every logprob / hidden-state dereference."""
+        model_runner = _target_model_runner(self.model_worker)
+        return model_runner is not None and getattr(
+            model_runner, "is_form_a_worker", False
+        )
+
 
     def process_batch_result_prefill(
         self,
@@ -285,8 +308,11 @@ class SchedulerBatchResultProcessor:
 
             # Weightless-KV fast lane (Option-B): a weightless worker rank has
             # logits_output=None (no lm_head); logprob / hidden-state
-            # processing is head-only, so skip it here on the workers.
-            wl_worker = self._is_weightless_worker() and logits_output is None
+            # processing is head-only, so skip it here on the workers. A Form A
+            # expert worker has no logits either (fnFL2 H72).
+            wl_worker = (
+                self._is_weightless_worker() or self._is_form_a_worker()
+            ) and logits_output is None
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
@@ -850,8 +876,11 @@ class SchedulerBatchResultProcessor:
 
         # Weightless-KV fast lane (Option-B): a weightless worker rank has
         # logits_output=None (no lm_head); logprob / hidden-state processing
-        # is head-only, so skip it here on the workers.
-        wl_worker = self._is_weightless_worker() and logits_output is None
+        # is head-only, so skip it here on the workers. A Form A expert worker
+        # has no logits either (fnFL2 H72).
+        wl_worker = (
+            self._is_weightless_worker() or self._is_form_a_worker()
+        ) and logits_output is None
 
         next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
             batch=batch,
