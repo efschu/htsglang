@@ -989,6 +989,8 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        # upstream #36738: load-back H2D waits for the in-flight forward.
+        self._bind_hicache_load_fence()
         self._pool_phase_probe("tree_cache")
 
         # #847 (W33): the WRITER for the phase-matched host pools. HERE, AND
@@ -2577,6 +2579,8 @@ class Scheduler(
                 "kv-session-offload DECOUPLE: second forward stream "
                 "'spill_stream' leased for the concurrent spill lane (S4b)."
             )
+        # upstream #36738: re-bind now that the spill lane's stream exists.
+        self._bind_hicache_load_fence()
 
         if not self.enable_overlap:
             return
@@ -2594,6 +2598,41 @@ class Scheduler(
         # (the ring is an overlap-only asset); harmless when decoupling is off.
         self._spill_record_buf = [None] * 2
         self._spill_record_ct = 0
+
+    def _bind_hicache_load_fence(self) -> None:
+        """upstream #36738: fence HiCache load-back H2D behind the forward stream(s).
+
+        The fence names every stream this scheduler launches a forward on: the
+        device lane's ``forward_stream`` (overlap loop, and the PP loops via
+        ``forward_stream_ctx``) plus the concurrent spill lane's
+        ``spill_stream`` when SGLANG_KVSO_DECOUPLE leased one. Phase flip:
+        weg2 keeps ONE scheduler, ONE tp_worker/model_runner and ONE
+        tree_cache/cache_controller per process for its whole life
+        (``forward_stream`` is written only by the get_worker_info unpack at
+        init and the spill lane's try/finally swap), so the stream bound here
+        stays the valid one across every cutover; the cutover therefore needs
+        no re-bind. Idempotent -- called after tree_cache init and again from
+        init_overlap once the spill stream exists."""
+        if not getattr(self, "enable_hierarchical_cache", False):
+            return
+        cache_controller = getattr(
+            getattr(self, "tree_cache", None), "cache_controller", None
+        )
+        if cache_controller is None:
+            return
+        streams = tuple(
+            s
+            for s in (
+                getattr(self, "forward_stream", None),
+                getattr(self, "spill_stream", None),
+            )
+            if s is not None
+        )
+        if not streams:
+            return
+        cache_controller.load_fence_stream = (
+            streams[0] if len(streams) == 1 else streams
+        )
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
