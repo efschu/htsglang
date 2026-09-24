@@ -96,6 +96,32 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _dcp_uneven_merge(o, lse, group, head_counts, return_lse: bool = False):
+    """The uneven-DCP LSE merge of the paged-prefix / decode partials.
+
+    ``SGLANG_DCP_LSE_MERGE=a2a`` (layers/dcp/comm.py ``lse_merge_mode``) routes
+    it through ``cp_lse_ag_out_a2a_mha_uneven``: the same LSE math, but the
+    scaled partials travel as ONE uneven all_to_all of the heads each peer owns
+    instead of an all_reduce of all heads followed by a slice -- (W-1)/W of the
+    bytes a one-shot sends, and one barrier instead of the mesh's two. Unset
+    (the default 'ar') is ``cp_lse_ag_out_ar_mha_uneven`` exactly as before.
+    Both return this rank's fp32 head slice (and its global LSE)."""
+    from sglang.srt.layers.dcp.comm import (
+        cp_lse_ag_out_a2a_mha_uneven,
+        lse_merge_mode,
+        weightless_kv_active,
+    )
+
+    # The weightless-KV workers' own merge sites (forward_*_weightless_worker)
+    # stay on the all_reduce, so a weightless boot must too, or the head and its
+    # workers would enter different collectives.
+    if lse_merge_mode() == "a2a" and not weightless_kv_active():
+        return cp_lse_ag_out_a2a_mha_uneven(
+            o, lse, group, head_counts, return_lse=return_lse
+        )
+    return cp_lse_ag_out_ar_mha_uneven(o, lse, group, head_counts, return_lse=return_lse)
+
 # Target-VERIFY spec inputs that take the uneven-DCP verify split in
 # call_begin_forward: the committed prefix is read paged over this rank's OWNED
 # token slots (non-causal, cross-rank LSE-merged) and the draft tokens attend
@@ -6160,7 +6186,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         # o: [tokens, 24, D], lse: [tokens, 24]; combine across the DCP token
         # shards and slice back to this rank's [12/6/6] head shard.
-        o = cp_lse_ag_out_ar_mha_uneven(o, lse, group, self.dcp_q_head_counts)
+        o = _dcp_uneven_merge(o, lse, group, self.dcp_q_head_counts)
         return o.reshape(-1, layer.tp_q_head_num * layer.head_dim).to(q.dtype)
 
     def forward_decode_weightless_worker(self, layer, forward_batch):
@@ -6432,7 +6458,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     k_scale=layer.k_scale_float,
                     v_scale=layer.v_scale_float,
                 )
-            o_pre, lse_pre = cp_lse_ag_out_ar_mha_uneven(
+            o_pre, lse_pre = _dcp_uneven_merge(
                 o_pre_raw,
                 lse_pre_raw,
                 group,
@@ -6546,7 +6572,7 @@ class FlashInferAttnBackend(AttentionBackend):
             else torch.cuda.stream(comm_stream)
         )
         with _merge_ctx:
-            o_pre, lse_pre = cp_lse_ag_out_ar_mha_uneven(
+            o_pre, lse_pre = _dcp_uneven_merge(
                 o_pre_raw,
                 lse_pre_raw,
                 group,

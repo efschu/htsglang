@@ -59,6 +59,10 @@ from typing import Dict, Optional
 logger = logging.getLogger(__name__)
 
 D_DEFER_SEQ_LENS_CPU_ENV = "SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU"
+#: Stage 2 of the deferred read (needs D_DEFER_SEQ_LENS_CPU_ENV): the DFLASH
+#: worker also queues the compact window-pool row rebuild before the wait,
+#: sized by the reservation envelope (dflash_worker_v2, ``_defer_rebuild``).
+D_DEFER_REBUILD_ENV = "SGLANG_WEG2_D_DEFER_REBUILD"
 D_HOSTGAP_ENV = "SGLANG_WEG2_D_HOSTGAP"
 D_HOSTGAP_DEFAULT_ROUNDS = 512
 
@@ -67,6 +71,11 @@ def defer_seq_lens_cpu_on() -> bool:
     """The deferred length read.  Read per call (an env lookup), so a test can
     flip it; the scheduler caches it once at its first decode round."""
     return os.environ.get(D_DEFER_SEQ_LENS_CPU_ENV, "") == "1"
+
+
+def defer_rebuild_on() -> bool:
+    """Stage 2 of the deferred read; inert unless the deferral itself is on."""
+    return os.environ.get(D_DEFER_REBUILD_ENV, "") == "1"
 
 
 def hostgap_rounds() -> int:

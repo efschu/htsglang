@@ -543,3 +543,61 @@ class TestDGapMeter(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeferRebuildStage2(CustomTestCase):
+    """SGLANG_WEG2_D_DEFER_REBUILD: the compact sync-free window rebuild is
+    queued before the host wait, with the WIDTH taken from the compact
+    envelope of the reservation bound. The two properties that make that
+    correct are pinned where they live: the envelope is >= every exact compact
+    length (test_dflash_overlap_hostsync.TestCompactSeqLensHostBound) and a
+    width >= the exact max rebuilds the identical rows
+    (test_dflash_solo_pool.TestWindowRowsSyncFree, random max_len slack). Here:
+    the switch, and the order in forward_batch_generation."""
+
+    def test_switch_default_off(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(dg.D_DEFER_REBUILD_ENV, None)
+            self.assertFalse(dg.defer_rebuild_on())
+            os.environ[dg.D_DEFER_REBUILD_ENV] = "1"
+            self.assertTrue(dg.defer_rebuild_on())
+            os.environ.pop(dg.D_DEFER_REBUILD_ENV, None)
+
+    def test_order_in_the_draft_prep(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        src = textwrap.dedent(inspect.getsource(DFlashWorkerV2.forward_batch_generation))
+        keys = [
+            "noise_embedding = embed_module(block_ids)",
+            "_defer_rebuild = (",
+            "if seq_lens_cpu_ready is not None and not _defer_rebuild:",
+            "if _defer_rebuild:\n",
+            "draft_input.nxt_kv_lens_cpu, out=seq_lens_cpu",
+            "rebuild_window_rows_sync_free(",
+            "max_len=int(seq_lens_cpu.max()) if bs > 0 else 0",
+            "block_loc = mapper.translate_write(verify_out_cache_loc)",
+            "# The device part of the draft prep is queued",
+            "draft_seq_lens_sum = int(seq_lens_cpu.sum().item())",
+            "draft_out = self.draft_model_runner.forward(forward_batch)",
+        ]
+        pos = [src.find(k) for k in keys]
+        self.assertTrue(all(p >= 0 for p in pos), list(zip(keys, pos)))
+        self.assertEqual(pos, sorted(pos), list(zip(keys, pos)))
+        # inside the stage-2 block: wait, THEN the exact compact mirror
+        blk = src[pos[keys.index("# The device part of the draft prep is queued")]:
+                  pos[keys.index("draft_seq_lens_sum = int(seq_lens_cpu.sum().item())")]]
+        seq = ["seq_lens_cpu_ready()", "batch.seq_lens_cpu, out=seq_lens_cpu",
+               "draft_host_lens_exact = self._compact_draft_host_lens_exact()"]
+        bpos = [blk.find(k) for k in seq]
+        self.assertTrue(all(p >= 0 for p in bpos), list(zip(seq, bpos)))
+        self.assertEqual(bpos, sorted(bpos), list(zip(seq, bpos)))
+        guard = src[src.find("_defer_rebuild = ("): src.find("if seq_lens_cpu_ready is not None and not _defer_rebuild:")]
+        for need in ("seq_lens_cpu_ready is not None", "_defer_rebuild", "use_compact_draft_cache",
+                     "_solo_pool_mapper.sync_free", "draft_input.nxt_kv_lens_cpu is not None"):
+            self.assertIn(need, guard)
+
+    def test_worker_reads_the_switch_once(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        init_src = inspect.getsource(DFlashWorkerV2.__init__)
+        self.assertIn("self._defer_rebuild = defer_rebuild_on()", init_src)
