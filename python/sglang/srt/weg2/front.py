@@ -2912,18 +2912,19 @@ class Front:
         _vid = _video_parts(payload)
         _verdict, _why = vision_verdict(_img, _vid, self.vision)
         if _verdict == VERDICT_STAGE:
-            # Task #58 slice 9: THE STAGE RUNS IN THE GROUP, and the request
-            # that carries the image IS the message that asks for it. The
-            # front does not RPC separately: the P group's
-            # multimodal-processor process holds the pixels already, runs
-            # `weg2.vision_stage_service.maybe_run` on them, and attaches
-            # `precomputed_embeddings` before the request ever reaches a
-            # scheduler. So the front's whole job here is (a) say so in the
-            # log and (b) make sure the request goes to P.
+            # Task #58: THE STAGE RUNS IN THE GROUP, and the request that
+            # carries the image IS the message that asks for it. The front
+            # does not RPC separately. Since the user design of 2026-09-24
+            # it runs INSIDE the P group's PP0 rank (weg2/vision_rank_runner):
+            # the pixels ride the request to the scheduler, and PP0 encodes
+            # them on its KV tail after the wake and before its admission,
+            # attaching `precomputed_embeddings`. So the front's whole job
+            # here is (a) say so in the log and (b) make sure the request
+            # goes to P.
             logger.info(
                 "W102 Weg2VisionStage rid=%s image_parts=%d -- routing to P; "
-                "the group's processor runs the transient tower and attaches "
-                "precomputed_embeddings before the prefill",
+                "PP0 of the group runs the transient tower before its admission "
+                "and attaches precomputed_embeddings before the prefill",
                 f"weg2-{self.epoch}-{self._rid + 1}", int(_img))
         elif _verdict != VERDICT_ROUTE:
             # #1356 THE REFUSAL IS LOGGED, NOT ONLY RETURNED. Without this line
@@ -2998,8 +2999,8 @@ class Front:
         # Memory `vision-tower-platzierung` records the rule (user 12.09.):
         # "D braucht den vision tower niemals, weil dort nicht prefillt wird
         # ... Front routet Bild-Requests nach P". Under `transient` the reason
-        # is sharper still: the stage attaches `precomputed_embeddings` in the
-        # P group's processor, so those rows exist only on P's side. Routing
+        # is sharper still: the stage attaches `precomputed_embeddings` on the
+        # P group's PP0 rank, so those rows exist only on P's side. Routing
         # such a request to D would hand D a request whose image was never
         # encoded -- `_require_visual` on a tower-less rank, i.e. wrong text.
         #
@@ -3010,7 +3011,7 @@ class Front:
             logger.info(
                 "W102 Weg2VisionStage rid=%s -- route %s -> long (P): an image "
                 "request is prefilled on P by rule; its embeddings are "
-                "attached in P's processor and do not exist on D",
+                "attached on P's PP0 and do not exist on D",
                 rid, route)
             route = "long"
         # THE COMPARED NUMBER IS PRINTED (#1290 round 2). The CARRIER-EXCEEDS
