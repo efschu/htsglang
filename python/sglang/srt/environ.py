@@ -666,6 +666,11 @@ class Envs:
     # x148/x149/x151 paid 5.9-9.7 s per register in the first flip (same
     # bytes: 293-342 ms in x147/x150). False = mapped at first use (H44 form).
     SGLANG_WEG2_SEQ_LANE_RING_PREREGISTER = EnvBool(True)
+    # H46b: D's draft host image (weg2/draft_park.DraftHostPark, 1.5 GB pinned,
+    # ledger post d_draft_host) is allocated at scheduler init, not at the first
+    # sleep's park -- x148/x151: cudaHostAlloc 7989/10442 ms inside TP0's first
+    # sleep, TP0's first deposit 8.1 s behind TP1/TP2. False = first-park form.
+    SGLANG_WEG2_DRAFT_PARK_PREALLOC = EnvBool(True)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)

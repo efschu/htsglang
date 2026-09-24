@@ -175,6 +175,25 @@ class DraftHostPark:
         self.entries, self.views = entries, [v for _n, v in population]
         return (time.perf_counter() - t0) * 1000
 
+    def preallocate(self, population: Sequence[Tuple[str, torch.Tensor]]) -> Tuple[int, float]:
+        """H46b: allocate the pinned host image at BOOT, sized to the same
+        population the first park will lay out. ``(bytes, ms)``; ms = -1 when
+        an image of that size already exists. The entries stay empty -- the
+        image holds no draft until a park wrote it (``holds_image`` False), so
+        the wake's W4 exemption is unchanged -- and the first park's
+        :meth:`_layout` finds ``host.numel() >= off`` and reuses it.
+
+        x148/x151: the first park's ``torch.empty(pin_memory=True)`` of 1.5 GB
+        (cudaHostAlloc) took 7989 / 10442 ms inside TP0's first sleep, and
+        TP0's first deposit started 8.1 s after TP1/TP2's."""
+        off = sum(int(view.numel()) for _name, view in population)
+        if self.host is not None and int(self.host.numel()) >= off:
+            return off, -1.0
+        t0 = time.perf_counter()
+        self.host = torch.empty(max(1, off), dtype=torch.uint8, pin_memory=self.pin)
+        self.entries, self.views = [], []
+        return off, (time.perf_counter() - t0) * 1000
+
     def park(self, population: Sequence[Tuple[str, torch.Tensor]], *, tag: str,
              pause: Callable[[str], None], sync: Callable[[], None]) -> ParkRecord:
         """D2H every storage into the host image, then ``pause(tag)``.

@@ -783,6 +783,12 @@ class SchedulerWeightUpdaterManager:
                 self._weg2_ring_preregister_start()
             except Exception as _rp_exc:  # noqa: BLE001 -- never costs the other warm-ups
                 logger.info("WEG2-SEQ preregister not started: %r", _rp_exc)
+            # H46b: D's draft host image, allocated now (main thread, the
+            # rank's device current) instead of in the first sleep's park.
+            try:
+                self._weg2_draft_prealloc_at_boot()
+            except Exception as _dp_exc:  # noqa: BLE001 -- the first park allocates as before
+                logger.info("WEG2-DRAFT-PARK host image not preallocated: %r", _dp_exc)
             if (os.environ.get("SGLANG_WEG2_LANE_PREWARM", "0") or "0") != "1":
                 return
             import threading
@@ -1806,6 +1812,44 @@ class SchedulerWeightUpdaterManager:
         draft reads it (``_weg2_unpark_draft_start``), never the disk."""
         park = self._weg2_draft_park
         return park is not None and park.holds_image
+
+    def _weg2_draft_prealloc_at_boot(self) -> None:
+        """H46b: allocate the draft's pinned host image at scheduler init
+        (after the draft runner and its graphs exist), sized from the SAME
+        population the first park lays out, so that park finds ``host image
+        reused``. Only where a park would run (``_weg2_draft_park_armed`` and
+        bytes to park -- TP0 on the Next-Flash form); the ledger books
+        ``d_draft_host`` for the whole boot already, so the image exists
+        earlier, not bigger. SGLANG_WEG2_DRAFT_PARK_PREALLOC=0 keeps the
+        first-park allocation."""
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_WEG2_DRAFT_PARK_PREALLOC.get():
+            logger.info("WEG2-DRAFT-PARK host image not preallocated: "
+                        "SGLANG_WEG2_DRAFT_PARK_PREALLOC=0")
+            return
+        if not self._weg2_draft_park_armed():
+            return
+        from sglang.srt.managers.weg2_memory_saver import GPU_MEMORY_TYPE_WEIGHTS_DRAFT
+        from sglang.srt.weg2.draft_park import DraftHostPark, park_population
+
+        drafter = _weg2_drafter_of(self)
+        target = self.tp_worker.model_runner.model
+        population = park_population(drafter.model, target)
+        tag_bytes = int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_WEIGHTS_DRAFT) or 0)
+        if not population or tag_bytes <= 0:
+            logger.info("WEG2-DRAFT-PARK host image not preallocated: nothing to "
+                        "park on this rank (storages=%d tms_bytes=%d)",
+                        len(population), tag_bytes)
+            return
+        if self._weg2_draft_park is None:
+            self._weg2_draft_park = DraftHostPark(new_stream=torch.cuda.Stream)
+        nbytes, ms = self._weg2_draft_park.preallocate(population)
+        logger.info("WEG2-DRAFT-PARK host image preallocated bytes=%d mib=%.1f "
+                    "storages=%d ms=%.0f tag=%s tms_bytes=%d -- the first sleep's "
+                    "park finds it (host image reused), no cudaHostAlloc in the flip",
+                    int(nbytes), int(nbytes) / float(1 << 20), len(population), ms,
+                    GPU_MEMORY_TYPE_WEIGHTS_DRAFT, tag_bytes)
 
     def _weg2_park_draft_at_sleep(self, credit) -> None:
         """H25 (C): D2H the draft into the pinned host image, pause its tag,
