@@ -10787,6 +10787,9 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
             _nj = _em.nested_join_verdict(karte)
             if _nj:
                 log("PLATZTAUSCH FLIP-JOIN UNMOEGLICH: " + " | ".join(_nj))
+            log_draft_swap(ns, karte, fr_pp_before=getattr(ns, "_h25_fr_p_before", None),
+                           total=total, ratios=ratios, fr_tp=fr_tp,
+                           layer_stage=_layer_stage, row_mib=_row_mib, log=log)
             return pfad
         _join = _em.join_verdict(karte)
         if _join:
@@ -10861,6 +10864,74 @@ def _refuse_unbuilt_platztausch_buffers(karte: dict, *,
         "Namen -- der Flip-Join findet fuer diese Layer kein Gegenstueck "
         "(x100: W106 auf D TP1 weights_14, 120 s spaeter W29, Gruppe tot). "
         "Bei der genannten Fraction umfasst der Puffer weiterhin jede Zeile.")
+
+
+def log_draft_swap(ns, karte, *, fr_pp_before, total, ratios, fr_tp, layer_stage,
+                   row_mib: float, log) -> None:
+    """H25 (Praezisierung 08:30Z "ein systemram gegen vram tausch"): the host
+    balance of the swap in ONE line -- the Platztausch store before and after
+    the draft post (the map is rebuilt with the arm's own FR_P for "before"),
+    plus D's parked draft. Only when group P carries no draft."""
+    if str(getattr(ns, "draft_kv_on_p", "on")) != "off":
+        return
+    from sglang.srt.layers.moe import expert_map as _em
+    from sglang.srt.weg2 import draft_post as _dp
+
+    slots_after = int(karte["slots"])
+    slots_before = slots_after
+    if fr_pp_before:
+        slots_before = int(_em.build_nested(
+            total=total, ratios=[int(float(x)) for x in ratios],
+            fr_pp=[float(x) for x in fr_pp_before], fr_tp=[float(x) for x in fr_tp],
+            p_layer_stage=layer_stage, pad_tp=1)["slots"])
+    path = _argv_scalar(getattr(ns, "extra_d", ""), "--speculative-draft-model-path") or ""
+    host = _dp.d_draft_host_mib(str(path), share_embed=d_draft_share_embed(ns)) if path else None
+    log(_dp.draft_swap_line(slots_before=slots_before, slots_after=slots_after,
+                            layers=len(layer_stage), row_mib=float(row_mib),
+                            d_draft_host=host))
+
+
+def d_draft_share_embed(ns) -> bool:
+    """Group D's SGLANG_WEG2_DRAFT_SHARE_EMBED (H1b): --env-d wins over the
+    launcher's own environment, which the ranks inherit."""
+    raw = parse_group_env(getattr(ns, "env_d", "") or "").get("SGLANG_WEG2_DRAFT_SHARE_EMBED")
+    if raw is None:
+        return bool(envs.SGLANG_WEG2_DRAFT_SHARE_EMBED.get())
+    return str(raw).strip().lower() in ("1", "true", "yes", "y")
+
+
+def apply_p_draft_post(ns, cards, fracs, stage_layers, row_mib: float,
+                       num_experts: int, log) -> List[float]:
+    """H25: raise the last P stage's expert fraction by the draft's post and
+    publish it to ``--pp-cut-expert-device-fraction``, ``--extra-p
+    --rank-moe-resident-fraction`` and ``--env-p
+    SGLANG_MOE_RESIDENT_EXPERT_FRACTION`` -- the three places FR_P lives
+    (arm_fnFL2.sh: "FR_P steht an DREI Stellen"); a reader left on the old
+    value would be the argv-doppelung class. Returns the fractions the pool
+    model prices."""
+    from sglang.srt.weg2 import draft_post as _dp
+
+    path = (_argv_scalar(getattr(ns, "extra_p", ""), "--speculative-draft-model-path")
+            or _argv_scalar(getattr(ns, "extra_d", ""), "--speculative-draft-model-path")
+            or "")
+    new, post, why = _dp.raise_for_draft_post(
+        fracs=fracs, stage_layers=stage_layers, row_mib=row_mib,
+        num_experts=num_experts, draft_path=str(path), cards=cards)
+    if post is None:
+        log(f"PP-CUT draft post (H25) ENTFAELLT: {why}")
+        return list(fracs)
+    log(post.line())
+    ns._h25_draft_post = _dp.summary(post)
+    ns._h25_fr_p_before = [float(x) for x in fracs]
+    ns.pp_cut_expert_device_fraction = ",".join(_dp._fmt(x) for x in new)
+    ns.extra_p = _dp.replace_vector_flag(ns.extra_p, "--rank-moe-resident-fraction", new)
+    ns.env_p = _dp.replace_env_vector(getattr(ns, "env_p", ""),
+                                      "SGLANG_MOE_RESIDENT_EXPERT_FRACTION", new)
+    log(f"PP-CUT draft post (H25) FR_P {[round(float(x), 4) for x in fracs]} -> "
+        f"{ns.pp_cut_expert_device_fraction} (published to --pp-cut-expert-device-"
+        f"fraction, --extra-p --rank-moe-resident-fraction, --env-p "
+        f"SGLANG_MOE_RESIDENT_EXPERT_FRACTION)")
+    return new
 
 
 def solve_p_cut(
@@ -10958,6 +11029,22 @@ def solve_p_cut(
         else:
             _stage_layers_for_solve = [
                 int(terms.n_layers) // max(1, n_stages_p)] * n_stages_p
+
+        # H25 (Nutzer-Order 24.09.): "Draft auf P streichen. dadurch koennen
+        # auch mehr experten im P layout gehalten werden." The draft's post on
+        # P's draft card (the last stage) becomes expert rows of THAT stage
+        # before anything is priced, and the raised fraction is written back
+        # to all three places FR_P lives (weg2/draft_post.py).
+        ns._expert_row_mib = row_bytes / _pp_cut.MIB
+        if str(getattr(ns, "draft_kv_on_p", "on")) == "off":
+            fracs = apply_p_draft_post(ns, cards, fracs, _stage_layers_for_solve,
+                                       row_bytes / _pp_cut.MIB,
+                                       int(terms.num_experts), log)
+            layer_mib_by_stage = tuple(
+                mean_layer_mib
+                + (terms.expert_layer_weight_bytes * float(f) + row_bytes * float(r)) / _pp_cut.MIB
+                for f, r in zip(fracs, rows)
+            )
 
         # #140 (Nutzer-Order 22.09.: "der planner muss sie ausspucken"):
         # DIE UMKEHRUNG, neben der gegebenen Zahl. Was hier steht, ist bis
