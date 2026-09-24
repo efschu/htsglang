@@ -129,13 +129,15 @@ class HoldTimeline(CustomTestCase):
             self.assertTrue(f._d_hold_expired("idle", t), "idle: only min-dwell gates, as today")
             self.assertFalse(f._d_hold_expired("backlog", t), "backlog: only fairness releases, as today")
 
-    def test_zero_hold_releases_at_once_but_only_on_a_free_d(self):
+    def test_zero_hold_is_off_like_unset(self):
+        # RC2 review (L4): 0 = off, as the launcher's ">= 0 (0 / unset = off)"
+        # refusal promised (test_weg2_idle_hold_zero_rc2_0924.py). It used to
+        # release a held backlog the moment D went free.
         f = _front(d_hold_s=0.0)
-        self.assertFalse(f._d_hold_expired("idle", 1.0), "no free observation yet -> no hold started")
+        self.assertIsNone(f.d_hold_s)
         f._note_d_free(True, 1.0)
-        self.assertTrue(f._d_hold_expired("idle", 1.0))
-        f._note_d_free(False, 1.5)
-        self.assertFalse(f._d_hold_expired("backlog", 1.5), "D holds work -> never leaves on a hold")
+        self.assertTrue(f._d_hold_expired("idle", 1.0), "idle: only min-dwell gates, as unset")
+        self.assertFalse(f._d_hold_expired("backlog", 60.0), "backlog: only fairness, as unset")
 
     def test_unknown_kind_is_refused(self):
         with self.assertRaises(ValueError):

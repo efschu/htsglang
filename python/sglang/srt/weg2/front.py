@@ -2156,8 +2156,13 @@ class Front:
         #     under --idle-layout P, and in front of a backlog FLIP-ECONOMICS
         #     holds -- then flips. None = off = today (rest: min-dwell only;
         #     held backlog: only the fairness bound releases it).
+        #     RC2 review (L4): 0 (or less) is OFF too, exactly like unset -- the
+        #     launcher's ">= 0 (0 / unset = off)" refusal promised it, and a 0 s
+        #     hold released a held backlog the moment D went free, which is a
+        #     different policy (a tiny positive T still gives that, by name).
         self.d_short_drain_tokens = max(0, int(d_short_drain_tokens or 0))
-        self.d_hold_s = None if d_hold_s is None else max(0.0, float(d_hold_s))
+        self.d_hold_s = (None if d_hold_s is None or float(d_hold_s) <= 0
+                         else float(d_hold_s))
         # (c) the moment D's own work last ended (no outstanding leg 2, no
         # hand-off in flight, nothing waiting in _ready_for_d); None while D is
         # busy or asleep. Read by _d_hold_expired, written by _note_d_free.
@@ -6377,8 +6382,8 @@ def main():
     ap.add_argument("--d-hold-s", type=float, default=None,
                     help="27B idle policy (c): D stays awake this many seconds after its own work "
                          "ended -- at rest under --idle-layout P, and in front of a backlog "
-                         "FLIP-ECONOMICS holds -- then flips. Unset (default) = today: the idle flip "
-                         "waits for min-dwell only, a held backlog for the fairness bound only.")
+                         "FLIP-ECONOMICS holds -- then flips. Unset (default) or 0 = off = today: the "
+                         "idle flip waits for min-dwell only, a held backlog for the fairness bound only.")
     ap.add_argument("--weight-chunks", type=int, default=0, help="#1233: number of weights_<k> chunk tags both groups were built with (0 = single weights tag)")
     ap.add_argument("--carrier-max-tokens", type=int, default=0,
                     help="#1233 zero-remainder: longest prompt group D can read from the store. "

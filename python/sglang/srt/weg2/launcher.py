@@ -1534,6 +1534,15 @@ def refuse_short_drain_above_x(n_tokens: int, x_tokens: int, x_provenance: str) 
         )
 
 
+def d_hold_active(d_hold_s: Optional[float]) -> bool:
+    """RC2 review (L4): is ``--d-hold-s`` ON? Unset OR 0 is OFF, like
+    ``--d-short-drain-tokens 0`` and as the >= 0 refusal already promised
+    ("0 / unset = off"). A 0 s hold is not a hold: it used to release a held
+    backlog the moment D went free -- a different policy under the same flag.
+    ONE definition for the argv and the IDLE POLICY line, so they agree."""
+    return d_hold_s is not None and float(d_hold_s) > 0
+
+
 def resolve_pool_floor(
     override: Optional[int],
 ) -> Tuple[Optional[int], Optional[Tuple[int, ...]], str]:
@@ -11198,8 +11207,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="27B idle policy (c), passed to the front: D stays awake this many seconds "
                          "after its own work ended before it flips -- at rest under --idle-layout pp, "
                          "and in front of a small backlog FLIP-ECONOMICS holds -- so a SHORT arrival "
-                         "inside the hold is served without a flip. Unset (default) = today: the idle "
-                         "flip waits for --min-dwell-ms only, a held backlog for --fairness-w-s only.")
+                         "inside the hold is served without a flip. Unset (default) or 0 = off = today: "
+                         "the idle flip waits for --min-dwell-ms only, a held backlog for "
+                         "--fairness-w-s only.")
     ap.add_argument("--d-admit-max-tokens", type=int, default=None,
                     help="FIX 4 (round 4): OPERATOR CEILING on the aggregate store-read budget "
                          "group D may hold in flight. Unset (the default) is NOT a derived number "
@@ -12685,8 +12695,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(f"IDLE POLICY (27B, user order 2026-09-24): (a) --idle-layout {ns.idle_layout} -> the "
         f"front rests on {idle_layout_front}; (b) --d-short-drain-tokens "
         f"{int(ns.d_short_drain_tokens or 0)} ({'off' if not ns.d_short_drain_tokens else 'a queued SHORT-only backlog up to this many tokens is served on D, each request <= X=' + str(x_tokens)}); "
-        f"(c) --d-hold-s {'unset (off)' if ns.d_hold_s is None else ns.d_hold_s} "
-        f"({'the idle flip waits for min-dwell only, a held backlog for the fairness bound' if ns.d_hold_s is None else 'D stays this long after its own work ended before it flips'})")
+        f"(c) --d-hold-s {ns.d_hold_s if d_hold_active(ns.d_hold_s) else ('unset (off)' if ns.d_hold_s is None else f'{ns.d_hold_s} (off, like unset)')} "
+        f"({'D stays this long after its own work ended before it flips' if d_hold_active(ns.d_hold_s) else 'the idle flip waits for min-dwell only, a held backlog for the fairness bound'})")
 
     log(f"SCHEDULING FLAGS AS EMITTED -- group P: --max-running-requests {p_bs} "
         f"--max-kv-per-request {max_kv_per_request} (no --tp-prefill-max-tokens: the PP prefill "
@@ -14386,7 +14396,8 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
     # ships the front argv byte for byte as before.
     if int(getattr(ns, "d_short_drain_tokens", 0) or 0) > 0:
         argv += ["--d-short-drain-tokens", str(int(ns.d_short_drain_tokens))]
-    if getattr(ns, "d_hold_s", None) is not None:
+    # RC2 review (L4): --d-hold-s 0 is OFF and ships the argv of unset.
+    if d_hold_active(getattr(ns, "d_hold_s", None)):
         argv += ["--d-hold-s", str(float(ns.d_hold_s))]
     if ns.d_admit_max_tokens is not None:
         argv += ["--d-admit-max-tokens", str(ns.d_admit_max_tokens)]
