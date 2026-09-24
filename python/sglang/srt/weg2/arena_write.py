@@ -116,6 +116,43 @@ def run_split_indices(slots, n: int, page_bytes: int, element: int = RUN_ELEMENT
     return idx_dst, idx_src
 
 
+def page_load_element(page_bytes: int, element: int = RUN_ELEMENT_BYTES) -> Tuple[int, int]:
+    """fnFL2 H47: ``(element_bytes, elements_per_page)`` of the arena page load's
+    "kernel" mode (the MLA one-buffer gather, one row per page). A page whose
+    per-thread LocalStorage (jit_kernel.hicache.local_bytes_per_thread at the
+    default unroll) stays at or under LOCAL_BYTES_WARN_THRESHOLD keeps the
+    whole page as the element ``(page_bytes, 1)``; above it the page goes in
+    ``element``-byte rows -- an NF page (786432 B, unroll 1) would be 24576 B
+    per thread, ~6.1 GiB of LMEM on the 5090 that the driver keeps. Raises
+    ValueError when the page is not a whole number of elements: the caller's
+    named fallback (cpu mode) takes it, never the whole-page element."""
+    from sglang.jit_kernel.hicache import (
+        LOCAL_BYTES_WARN_THRESHOLD,
+        _default_unroll,
+        local_bytes_per_thread,
+    )
+
+    pb, e = int(page_bytes), int(element)
+    if local_bytes_per_thread(pb, _default_unroll(pb)) <= LOCAL_BYTES_WARN_THRESHOLD:
+        return pb, 1
+    if e <= 0 or pb % e:
+        raise ValueError(
+            f"H47: page {pb} B is not a whole number of {e}-B elements; the whole-page "
+            f"element would hold {local_bytes_per_thread(pb, _default_unroll(pb))} B per "
+            f"thread in local memory")
+    return e, pb // e
+
+
+def split_row_indices(rows, n: int):
+    """Row r of ``n`` elements -> element rows ``r * n + j`` (j < n), flattened
+    in row order; stays on ``rows``' device and is int64."""
+    import torch
+
+    rows = rows.to(dtype=torch.int64).reshape(-1, 1)
+    j = torch.arange(int(n), dtype=torch.int64, device=rows.device)
+    return (rows * int(n) + j).reshape(-1)
+
+
 MAMBA_MODE_ENV = "SGLANG_WEG2_MAMBA_WRITE_MODE"   # kernel (default) | copy
 
 

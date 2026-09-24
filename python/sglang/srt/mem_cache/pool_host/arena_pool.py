@@ -123,7 +123,8 @@ ARENA_PAGE_LOAD_MODES = ("cpu", "kernel", "dma")
 
 
 def _arena_page_load_mode(page_bytes: int = 0) -> str:
-    """"kernel" = the MLA one-buffer JIT gather with element_dim = page bytes;
+    """"kernel" = the MLA one-buffer JIT gather of whole pages (element = the
+    page up to 256 B per thread, else 1-KiB rows, H47: ``_page_block_kernel``);
     "cpu" = the pinned-stage index_select; "dma" = one H2D copy per run of
     consecutive slots straight out of the registered arena (no CPU gather, no
     JIT, no pinned stage).
@@ -203,6 +204,39 @@ def _page_block_dma(pool, dev_stage, block_slots) -> int:
     for row, first, count in runs:
         dev_stage[row:row + count].copy_(view[first:first + count], non_blocking=True)
     return len(runs)
+
+
+def _page_block_kernel(pool, dev_stage, src_idx, b: int) -> int:
+    """"kernel" mode: the GPU gathers ``b`` whole pages from the mapped arena
+    rows ``src_idx`` (device int64) into ``dev_stage[:b]``. Returns the
+    element size launched.
+
+    fnFL2 H47: the page is NOT the kernel element when that would spill --
+    an NF page (786432 B, unroll 1) is 24576 B of LocalStorage per thread and
+    the driver would grow the card's LMEM to ~6.1 GiB on the 5090 and keep it
+    (the run write's 229376-B element did exactly that: fnFL2x151 stack
+    7104 B, +1458 MiB). Such a page goes as 1-KiB element rows, on the module
+    the run/mamba writes already build (same element, the write's block quota
+    unless the load quota is set), so there is no JIT build at the wake
+    either (x66)."""
+    from sglang.jit_kernel.hicache import transfer_hicache_one_layer_mla
+
+    from sglang.srt.weg2 import arena_write as _aw
+
+    pb = int(pool._page_bytes)
+    elem, n = _aw.page_load_element(pb)
+    if n == 1:
+        transfer_hicache_one_layer_mla(
+            cache_dst=dev_stage[:b], indices_dst=torch.arange(b, device=dev_stage.device, dtype=torch.int64),
+            cache_src=pool._page_view, indices_src=src_idx,
+            element_dim=pb, block_quota=_arena_load_block_quota())
+        return pb
+    stage_rows = torch.arange(b, device=dev_stage.device, dtype=torch.int64)
+    transfer_hicache_one_layer_mla(
+        cache_dst=dev_stage[:b], indices_dst=_aw.split_row_indices(stage_rows, n),
+        cache_src=pool._page_view, indices_src=_aw.split_row_indices(src_idx, n),
+        element_dim=elem, block_quota=_arena_load_block_quota() or _aw.write_block_quota())
+    return elem
 
 
 def _arena_page_load_timing() -> bool:
@@ -788,13 +822,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     _ensure_page_stages(self, B, pb, dev)
             if mode == "kernel":
                 try:
-                    from sglang.jit_kernel.hicache import transfer_hicache_one_layer_mla
                     src_idx = _slots_dev[start:start + b] if _async_idx else slots[start:start + b].to(device=dev, dtype=torch.int64)
-                    stage_idx = torch.arange(b, device=dev, dtype=torch.int64)
-                    transfer_hicache_one_layer_mla(
-                        cache_dst=dev_stage[:b], indices_dst=stage_idx,
-                        cache_src=self._page_view, indices_src=src_idx,
-                        element_dim=pb, block_quota=_arena_load_block_quota())
+                    _page_block_kernel(self, dev_stage, src_idx, b)   # H47: 1-KiB elements for an NF page
                 except Exception as exc:  # noqa: BLE001 -- one named fallback, then cpu
                     logger.warning("WEG2-ARENA-PAGE-LOAD kernel mode failed (%s: %s); cpu mode from now on",
                                    type(exc).__name__, exc)
