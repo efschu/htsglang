@@ -1882,6 +1882,38 @@ def _sleep_gate_by_name() -> bool:
         "1", "true", "yes", "on")
 
 
+# ---------------------------------------------------------------------------
+# 27B flipfast (desk/27b-up-flipfast-0924): three FRONT costs every P-routed
+# request pays, each behind its own switch, all default OFF (= today's path,
+# byte for byte). Measured on boots weg2xsn429/430/432/433/435 (45 ladder
+# requests; "client wall minus P wall" median 3.95-4.24 s is TWO flips plus
+# front time):
+#   route -> D->P flip begin      74-133 ms median  (controller tick, F2)
+#   D->P done -> P leg 1 start    199-203 ms        (controller tick, F3)
+#   kv wake answered -> D->P done 43-53 ms          (ps + nvidia-smi on the
+#                                                    event loop, F1)
+# None of the three touches the P->D direction's first-token path: there the
+# dormant D admission already posts leg 2 during the flip.
+# ---------------------------------------------------------------------------
+#: F2: a request joining the P queue wakes the controller at once.
+CTL_KICK_ARRIVAL_ENV = "SGLANG_WEG2_CTL_KICK_ARRIVAL"
+#: F3: a completed flip wakes the controller at once (P's drain starts right
+#: after the D->P flip instead of one tick later).
+CTL_KICK_AFTER_FLIP_ENV = "SGLANG_WEG2_CTL_KICK_AFTER_FLIP"
+#: F1: the post-wake residue reading runs in a worker thread after the flip
+#: closed -- only once nothing gates on it (see Front._dc_reading_deferrable).
+DC_OFF_PATH_ENV = "SGLANG_WEG2_DC_OFF_PATH"
+#: The controller's tick. Unchanged; with a kick switch on it is the UPPER
+#: bound of a wait, not its length.
+CTL_TICK_S = 0.2
+#: The reasons a kick may name -- one per switch, refused by name otherwise.
+CTL_KICK_REASONS = {"arrival": CTL_KICK_ARRIVAL_ENV, "after_flip": CTL_KICK_AFTER_FLIP_ENV}
+
+
+def _env_switch_on(name: str) -> bool:
+    return str(os.environ.get(name, "0")).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _measured_record_stat_key(path: str) -> Optional[Tuple[int, int, int, int]]:
     """The sidecar's identity for the sleep-leg memo: (dev, ino, size, mtime_ns).
 
@@ -2122,6 +2154,18 @@ class Front:
         self.commit = commit
         self.ledger_arm = dict(ledger_arm or {})
         self.dormant_image: Dict[str, dict] = {}
+        # 27B flipfast: read ONCE, like every other front switch; the startup
+        # line names all three (flipfast_line), so a boot's log says which ran.
+        self._kick_on: Dict[str, bool] = {
+            why: _env_switch_on(env) for why, env in CTL_KICK_REASONS.items()}
+        self._dc_off_path = _env_switch_on(DC_OFF_PATH_ENV)
+        # The kick event is created lazily in the running loop (_ctl_evt), so a
+        # Front built outside a loop -- the unit tests, main() -- binds nothing.
+        self._ctl_evt_obj: Optional[asyncio.Event] = None
+        self._ctl_evt_loop: Optional[asyncio.AbstractEventLoop] = None
+        # F1: the off-path readings in flight; held so the loop cannot drop a
+        # task it only references weakly.
+        self._dc_tasks: Set[asyncio.Task] = set()
         # FIX 4a (round 1), boot weg2sc1 LINK 1 -- D's CONCURRENCY IS A
         # TOKEN BUDGET, NOT ONLY A COUNT.
         #
@@ -2550,12 +2594,16 @@ class Front:
                     "group D's own #915 reading (/server_info hicache_prefetch), "
                     "no operator ceiling" if self.d_admit_max_tokens is None
                     else "that reading under an operator ceiling")
+        # 27B flipfast: which of the three front switches this boot runs.
+        logger.info("%s", self.flipfast_line())
 
     async def cleanup(self, app):
         for k in ("controller", "admitter", "health", "corridor", "flip_stall"):
             t = app.get(k)
             if t:
                 t.cancel()
+        for t in list(getattr(self, "_dc_tasks", ())):  # 27B flipfast F1: readings still in flight
+            t.cancel()
         if self.session:
             await self.session.close()
 
@@ -3094,6 +3142,7 @@ class Front:
                         est_uncached=remainder, span_known=known,
                         skip_leg1=True, store_span_est=store_span)
             self.queue.append(p)
+            self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
             try:
                 await fut
             except Weg2Stop as e:
@@ -3152,6 +3201,7 @@ class Front:
                         est_uncached=remainder, span_known=known,
                     store_span_est=store_span)
         self.queue.append(p)
+        self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         logger.info("WEG2-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d)",
                     rid, self.awake, self.admit_d, est_prompt, remainder, len(self.queue))
         try:
@@ -3727,6 +3777,7 @@ class Front:
                         seat.release("reroute")
                     pending.seat = None
                     self.queue.append(pending)
+                    self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
                     logger.warning("WEG2-REROUTE rid=%s uncached=%d > %d: rejoining route BATCH once (spec 3.6)",
                                    rid, pt - ct, self.tp_prefill_max_tokens)
                     g.outstanding.pop(rid, None)
@@ -3759,6 +3810,11 @@ class Front:
                 # refused, raised, cancelled -- passes here, so a freed seat
                 # is always visible to the admitter within one tick.
                 seat.release("leg2_finished")
+            # 27B flipfast F2: D's LAST leg 2 just ended while the P queue holds
+            # work -- the D->P decision (which waits for D's work to be
+            # exhausted) can run now instead of at the next tick. No-op when off.
+            if self.queue and not g.outstanding:
+                self._kick_controller("arrival")
 
     async def _requeue_after_x_refusal(self, request: web.Request, rid: str, payload: dict, text: str,
                                        stream: bool, pending: Optional[Pending], seat: Optional[Seat],
@@ -3982,6 +4038,7 @@ class Front:
             seat.release("W50_requeue")
         p.seat = None
         self.queue.append(p)
+        self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         try:
             await p.fut
         except Weg2Stop as e:
@@ -4950,26 +5007,40 @@ class Front:
             return
         # #1455: the residue measurement (NVML + host image) runs AFTER the wake answered -- it is
         # instrumentation, not a precondition; ~250 ms off the critical path.
-        pids = _session_pids(S.sid) if S.sid else set()
-        dc = _nvml_process_mib(pids) if pids else {}
-        # #1444: the device residue rides in the dormant-image record, so the
-        # NEXT boot prices this form's MEASURED residue instead of the xsn14
-        # constant (launcher.dc_residue_from_record).
-        self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc)
-        for uuid, mib in sorted(dc.items()):
-            logger.info("WEG2-DC group=%s uuid=%s measured=%d MiB reserve=%s", src, uuid, mib, self.dc_reserve.get(uuid))
-        if src == "D" and not self.dc_measured_d and dc:
-            self.dc_measured_d = dc
-            over = {u: (m, self.dc_reserve.get(u)) for u, m in dc.items() if self.dc_reserve.get(u) is not None and m > self.dc_reserve[u]}
-            if over:
-                self.do_stop("W19 DormantResidueRefused",
-                             f"measured D_c(D) exceeds the reserve P's budget assumed: {over} (measured, reserved) MiB -- waking P would overcommit the card")
-                return
+        # 27B flipfast F1: and once nothing gates on it any more, OFF the flip
+        # too (43-53 ms of blocking ps + nvidia-smi before the controller could
+        # dispatch P's leg 1, xsn429-435) -- see _dc_reading_deferrable.
+        dc_off_path = self._dc_reading_deferrable(src)
+        if dc_off_path:
+            dc: Dict[str, int] = {}  # filled into the flip record by _dc_reading_off_path
+        else:
+            pids = _session_pids(S.sid) if S.sid else set()
+            dc = _nvml_process_mib(pids) if pids else {}
+            # #1444: the device residue rides in the dormant-image record, so the
+            # NEXT boot prices this form's MEASURED residue instead of the xsn14
+            # constant (launcher.dc_residue_from_record).
+            self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc)
+            for uuid, mib in sorted(dc.items()):
+                logger.info("WEG2-DC group=%s uuid=%s measured=%d MiB reserve=%s", src, uuid, mib, self.dc_reserve.get(uuid))
+            if src == "D" and not self.dc_measured_d and dc:
+                self.dc_measured_d = dc
+                over = {u: (m, self.dc_reserve.get(u)) for u, m in dc.items() if self.dc_reserve.get(u) is not None and m > self.dc_reserve[u]}
+                if over:
+                    self.do_stop("W19 DormantResidueRefused",
+                                 f"measured D_c(D) exceeds the reserve P's budget assumed: {over} (measured, reserved) MiB -- waking P would overcommit the card")
+                    return
         self._flip_marks["dc"] = time.time()
         self.awake = dst
         self.epoch += 1
         self.admit_d = True
         self.state = "serving"
+        # 27B flipfast F3: after a D->P flip the controller that awaits it starts
+        # P's drain at once instead of one tick later (no-op with the switch off).
+        # NOT after P->D: nothing on D waits for the controller there (leg 2 is
+        # admitted by d_admitter), and an immediate D-branch pass could only race
+        # the admitter for requests still in _ready_for_d.
+        if dst == "P":
+            self._kick_controller("after_flip")
         # #1262 tier 3: the flip is closed, so there is nothing open to stall.
         self._flip_t0 = None
         self._flip_stage = "none"
@@ -5022,7 +5093,15 @@ class Front:
                "overlap_ms": round(overlap_ms), "overlap_pct": round(overlap_pct, 1),
                "critical_path": f"{crit_leg} {crit_note}",
                "dc_mib": dc, "t": time.time()}
+        if dc_off_path:
+            # F1: the reading lands in THIS record from the worker; the key says so
+            # while it is in flight (dc_mib {} until then, never a fake zero).
+            rec["dc_off_path"] = True
         self.flip_log.append(rec)
+        if dc_off_path:
+            _t = asyncio.get_running_loop().create_task(self._dc_reading_off_path(src, S.sid, rec))
+            self._dc_tasks.add(_t)
+            _t.add_done_callback(self._dc_tasks.discard)
         self.counters["flips"] += 1
         # #1271 (b): this boot's own flip cost feeds the live X.
         # #1289: THE KEY IS `flip_ms`. `rec` has never had a `flip_total_ms`
@@ -5043,7 +5122,8 @@ class Front:
                     rec["epoch"], src, dst, rec["drain_quiesce_ms"], rec["sleep_ms"], src,
                     rec["wake_ms"], dst, rec["interleave_ms"], rec["legs_wall_ms"],
                     rec["sleep_leg_ms"], rec["wake_leg_ms"], rec["overlap_ms"], rec["overlap_pct"],
-                    rec["critical_path"], rec["flip_ms"], len(self.weights_tags), dc)
+                    rec["critical_path"], rec["flip_ms"], len(self.weights_tags),
+                    "off-path" if dc_off_path else dc)
 
     # ---------------- phase economics (C7, C8) ----------------
     def _derived_min_dwell_ms(self, src: str, dst: str) -> Tuple[float, str]:
@@ -5399,6 +5479,115 @@ class Front:
                        queue_name, len(self.queue))
         return True
 
+    # ---------------- 27B flipfast: the controller's wake-ups (F2, F3) ----------------
+    def flipfast_line(self) -> str:
+        """The three switches as one line, printed at startup."""
+        on = lambda b: "on" if b else "off"  # noqa: E731
+        return ("WEG2-FLIPFAST kick_arrival=%s kick_after_flip=%s dc_off_path=%s tick_s=%.2f "
+                "(%s / %s / %s; off = the controller sleeps its full tick and the post-wake "
+                "residue reading runs on the flip, exactly as before)" % (
+                    on(self._kick_on["arrival"]), on(self._kick_on["after_flip"]),
+                    on(self._dc_off_path), CTL_TICK_S,
+                    CTL_KICK_ARRIVAL_ENV, CTL_KICK_AFTER_FLIP_ENV, DC_OFF_PATH_ENV))
+
+    def _ctl_evt(self) -> asyncio.Event:
+        loop = asyncio.get_running_loop()
+        if getattr(self, "_ctl_evt_obj", None) is None or getattr(self, "_ctl_evt_loop", None) is not loop:
+            self._ctl_evt_obj = asyncio.Event()
+            self._ctl_evt_loop = loop
+        return self._ctl_evt_obj
+
+    def _kick_controller(self, why: str) -> None:
+        """Wake the controller before its tick ends -- if ``why``'s switch is on.
+
+        ``arrival``: a request joined ``self.queue``, or D's last leg 2 ended
+        while the queue holds work (F2) -- held while ``_ready_for_d`` is not
+        empty. ``after_flip``: a D->P flip closed (F3). With the switch off
+        this is a no-op, so the call sites cost nothing on the default path.
+        A kick only ends ONE wait early; it never runs a decision the tick
+        would not have run -- every latch (economics, dwell, fairness, the
+        hand-off window) is evaluated exactly as on a tick.
+        """
+        if why not in CTL_KICK_REASONS:
+            raise ValueError(f"unknown controller kick reason {why!r}; known: {sorted(CTL_KICK_REASONS)}")
+        # getattr: a Front assembled without __init__ (the unit tests' partial
+        # fronts) has no switches -- that is the default path, a no-op.
+        if not (getattr(self, "_kick_on", None) or {}).get(why):
+            return
+        if why == "arrival" and getattr(self, "_ready_for_d", None):
+            # Prefilled requests still wait for a D seat. The D->P decision does
+            # not read _ready_for_d (only D.outstanding + the hand-off window),
+            # so an early pass could flip D away before d_admitter's next 50 ms
+            # poll hands them over. No kick: the tick keeps today's ordering.
+            self.counters["ctl_kick_held_ready_for_d"] += 1
+            return
+        try:
+            evt = self._ctl_evt()
+        except RuntimeError:  # no running loop: nothing is waiting either
+            self.counters["ctl_kick_no_loop"] += 1
+            return
+        self.counters[f"ctl_kick_{why}"] += 1
+        evt.set()
+
+    async def _ctl_wait(self) -> None:
+        """The controller's tick. Both kick switches off: ``asyncio.sleep(CTL_TICK_S)``,
+        today's path. Either on: the same bound, ended early by a kick; a kick
+        set while the controller was busy ends the next wait at once."""
+        kick_on = getattr(self, "_kick_on", None) or {}
+        if not (kick_on.get("arrival") or kick_on.get("after_flip")):
+            await asyncio.sleep(CTL_TICK_S)
+            return
+        evt = self._ctl_evt()
+        if not evt.is_set():
+            try:
+                await asyncio.wait_for(evt.wait(), CTL_TICK_S)
+            except asyncio.TimeoutError:
+                return
+        evt.clear()
+        self.counters["ctl_kicked"] += 1
+
+    # ---------------- 27B flipfast: the post-wake residue reading (F1) ----------------
+    def _dc_reading_deferrable(self, src: str) -> bool:
+        """F1: may ``src``'s post-wake residue reading leave the flip?
+
+        Only when NOTHING gates on it any more:
+        * W19 reads it at the FIRST D sleep (``dc_measured_d`` empty) and stops
+          the boot on an over-reserve residue -- that reading stays on the flip,
+          and so does every D sleep after an EMPTY first reading (the gate never
+          settled -- the conservative side);
+        * ``sample_dormant_image`` takes each group's image at its FIRST sleep
+          and stamps this reading into the #1444 record -- that stays too.
+        Every later reading is instrumentation (the WEG2-DC lines and the flip
+        record's ``dc_mib``), and it still lands, from a worker thread.
+        """
+        if not getattr(self, "_dc_off_path", False) or src not in self.dormant_image:
+            return False
+        return src != "D" or bool(self.dc_measured_d)
+
+    async def _dc_reading_off_path(self, src: str, sid: int, rec: dict) -> None:
+        """F1: the reading the flip used to take inline, same lines, same record
+        field -- run in the default executor so the event loop never blocks on
+        ``ps``/``nvidia-smi``. An instrument: it never stops anything."""
+        t0 = time.time()
+        loop = asyncio.get_running_loop()
+        try:
+            pids = await loop.run_in_executor(None, _session_pids, sid) if sid else set()
+            dc = await loop.run_in_executor(None, _nvml_process_mib, pids) if pids else {}
+        except Exception as e:  # noqa: BLE001 -- an instrument never breaks serving
+            self.counters["dc_off_path_failed"] += 1
+            logger.warning("WEG2-DC-OFFPATH epoch=%s group=%s reading failed: %s: %s",
+                           rec.get("epoch"), src, type(e).__name__, e)
+            return
+        for uuid, mib in sorted(dc.items()):
+            logger.info("WEG2-DC group=%s uuid=%s measured=%d MiB reserve=%s", src, uuid, mib, self.dc_reserve.get(uuid))
+        rec["dc_mib"] = dc
+        self.counters["dc_off_path"] += 1
+        logger.info("WEG2-DC-OFFPATH epoch=%s group=%s cards=%d ms=%.0f (the post-wake residue "
+                    "reading of this flip, taken in a worker thread after the flip closed; W19 "
+                    "settled at the first D sleep and this group's dormant image is sampled, so "
+                    "nothing gates on it -- %s=1)",
+                    rec.get("epoch"), src, len(dc), (time.time() - t0) * 1000.0, DC_OFF_PATH_ENV)
+
     async def controller(self) -> None:
         # #1459: P takes p_concurrency + P_QUEUE_AHEAD requests at once; the
         # extra one waits in P's queue (max-running-requests bounds compute)
@@ -5408,7 +5597,9 @@ class Front:
         _ahead = max(0, int(os.environ.get("SGLANG_WEG2_P_QUEUE_AHEAD", "1") or 0))
         sem = asyncio.Semaphore(self.p_concurrency + _ahead)
         while True:
-            await asyncio.sleep(0.2)
+            # 27B flipfast F2/F3: the 0.2 s tick, ended early by a kick when a
+            # kick switch is on; both off = asyncio.sleep(0.2) as before.
+            await self._ctl_wait()
             try:
                 if self.state != "serving":
                     continue
