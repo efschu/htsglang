@@ -29,6 +29,34 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: HICACHE-DRAFT-TIER (user order 2026-09-24, see environ.py): the one
+#: rank-side reader of the switch. Measured reason (boot weg2xsn420, the P
+#: side without a draft producer): the draft arena (720896 slots x 10240 B =
+#: 7.76 GiB) was pre-pinned on P-PP2 (14.2 s) and every D rank (17.4 s) and
+#: carried nothing -- 30 of 30 D requests draft_pages=0, '#993 draft L3 READ'
+#: >= 276728 pages asked, 0 hits.
+HICACHE_DRAFT_TIER_ENV = "SGLANG_WEG2_HICACHE_DRAFT_TIER"
+
+
+def hicache_draft_tier_off() -> bool:
+    """True when this rank's draft gets no HiCache space (``off``); unset,
+    ``auto`` and ``on`` keep the draft tier as before (a rank cannot resolve
+    ``auto`` -- group D does not know P's form; the launcher does)."""
+    from sglang.srt.environ import envs
+
+    return str(envs.SGLANG_WEG2_HICACHE_DRAFT_TIER.get() or "").strip().lower() == "off"
+
+
+def hicache_draft_tier_off_line(*, where: str) -> str:
+    """The one rank-side line naming the form (never silent)."""
+    return (
+        f"WEG2 HICACHE-DRAFT-TIER off ({HICACHE_DRAFT_TIER_ENV}=off) at {where}: the "
+        "draft gets no HiCache space -- no draft host pool, no draft arena, no draft "
+        "write-back, no draft lookup/read at a restore or at admission; D builds its "
+        "draft context cold (#993 zeros + 1 bootstrap round; user order 2026-09-24)"
+    )
+
+
 # Max pages per batched storage IO call.
 # Task #3 (17.09.): the per-call overhead of `_page_transfer`'s batches
 # (ctypes marshalling of the stems, one find_slots + ref_slots + resolve
@@ -2472,6 +2500,31 @@ class HiCacheFile(HiCacheStorage):
     def _arena_dir(self) -> str:
         return os.environ.get("SGLANG_HICACHE_ARENA_DIR", "").strip()
 
+    def _draft_arena_refused(self, total_bytes: int) -> bool:
+        """HICACHE-DRAFT-TIER off: the canonical DRAFT width gets no arena.
+
+        Structural, beside the registration (kv_cache_builder never registers
+        a draft host pool under the switch, so nothing asks): a width that is
+        the draft page's and neither the KV page's nor the mamba blob's is
+        refused here, the file is never created, nothing is pinned. Logged
+        once per process."""
+        if not hicache_draft_tier_off():
+            return False
+        dpage = getattr(self, "canonical_draft_page", None)
+        if dpage is None or int(total_bytes) != int(dpage.total_bytes):
+            return False
+        kv = getattr(self, "_canonical_kv_extents", None)
+        if kv is not None and int(total_bytes) == int(kv.total_bytes):
+            return False
+        blob = getattr(self, "canonical_mamba_blob", None)
+        if blob is not None and int(total_bytes) == int(blob.total_bytes):
+            return False
+        if not getattr(self, "_draft_arena_refused_logged", False):
+            self._draft_arena_refused_logged = True
+            logger.info("[arena] draft width %d refused: %s", int(total_bytes),
+                        hicache_draft_tier_off_line(where="HiCacheFile._arena_for"))
+        return True
+
     def _arena_for(self, total_bytes: int):
         """The shared arena for pages of this canonical width, or None.
 
@@ -2489,6 +2542,9 @@ class HiCacheFile(HiCacheStorage):
             arenas = self._arenas = {}
         if total_bytes in arenas:
             return arenas[total_bytes]
+        if self._draft_arena_refused(int(total_bytes)):
+            arenas[total_bytes] = None
+            return None
         try:
             from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
 

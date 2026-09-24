@@ -323,6 +323,16 @@ def rebind_hicache_draft_for_phase(scheduler, phase: str) -> bool:
     if cc is None or not hasattr(cc, "disarm_draft_kv_pool"):
         return False
 
+    from sglang.srt.mem_cache.hicache_storage import (
+        hicache_draft_tier_off,
+        hicache_draft_tier_off_line,
+    )
+
+    if hicache_draft_tier_off():
+        # The switch outranks the phase: no host pool is built for any phase.
+        cc.disarm_draft_kv_pool(hicache_draft_tier_off_line(where=f"cutover into '{phase}'"))
+        return False
+
     reg = resolve_draft_registration(scheduler, phase)
     if reg is None:
         cc.disarm_draft_kv_pool(
@@ -456,6 +466,23 @@ def maybe_register_hicache_draft(
     boundary rather than a wider boot-time reach.
     """
     if not enable_hierarchical_cache:
+        return
+
+    from sglang.srt.mem_cache.hicache_storage import (
+        hicache_draft_tier_off,
+        hicache_draft_tier_off_line,
+    )
+
+    if hicache_draft_tier_off():
+        # HICACHE-DRAFT-TIER off (user order 2026-09-24): no draft host pool,
+        # no set_draft_kv_pool -- `has_draft` stays False, so draft_tier_armed
+        # answers False for every direction (write, load, l3-load, admission)
+        # and nothing binds a draft arena. Returned BEFORE the solo-shadow
+        # marker below on purpose: with no rank armed, a marked shadow would
+        # reduce the packed claim vector against the host's scalar (the
+        # xsn392 shape), so the switch leaves every rank unmarked alike.
+        if draft_worker is not None and spec_algorithm is not None:
+            logger.info(hicache_draft_tier_off_line(where="boot registration"))
         return
 
     draft_kv_pool = get_draft_kv_pool(
