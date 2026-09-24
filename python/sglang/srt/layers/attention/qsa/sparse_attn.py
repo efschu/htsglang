@@ -100,6 +100,35 @@ def _get_rows_config(total_q: int):
     return _get_best_config(total_q)
 
 
+# fnFL2 H65 (F2 of H58): the prefix-free prefill kernel (_sparse_gqa_prefill,
+# every prompt's first chunk and every short prefill) takes the same L20 row:
+# (16, 1, 2) above 512 rows. Offline compiled for head_dim 256 and the boot's
+# top-k width 2051 that build is REG 255 (STACK 24 B sm86 / 32 B sm120) in
+# 24.6 KB smem per 1-warp CTA -> 3 CTAs = 3 warps per SM on sm86 AND sm120, a
+# latency-bound kernel (x166: 59 ms per layer on the 3080s, 17 on the 5090,
+# ~8x above its issue bound); (32, 8, 2) is REG 80-89 / STACK 0 in 42 KB ->
+# 2 CTAs = 16 warps per SM on both. SGLANG_WEG2_QSA_PREFILL_CONFIG takes
+# the SGLANG_FORCE_QSA_ROWS_CONFIG grammar for this launch only; empty = table.
+_PREFILL_CONFIG_CACHE: dict = {}
+
+
+def _get_prefill_config(total_q: int):
+    """``_get_best_config`` for the prefix-free prefill kernel, unless
+    SGLANG_WEG2_QSA_PREFILL_CONFIG names a table for this device's arch."""
+    from sglang.srt.environ import envs
+
+    raw = envs.SGLANG_WEG2_QSA_PREFILL_CONFIG.get()
+    if raw:
+        major, minor = torch.cuda.get_device_capability()
+        key = (raw, major * 10 + minor)
+        if key not in _PREFILL_CONFIG_CACHE:
+            _PREFILL_CONFIG_CACHE[key] = parse_rows_config(raw, key[1])
+        table = _PREFILL_CONFIG_CACHE[key]
+        if table is not None:
+            return next(cfg for limit, cfg in table if total_q <= limit)
+    return _get_best_config(total_q)
+
+
 # fnFL2 H65: which in-kernel fp8 decode the rows kernel runs (FP8_DECODE_*,
 # see the decode helpers above _sparse_attn_rows_fwd).
 # SGLANG_WEG2_QSA_FP8_DECODE, grammar  [smXX:]MODE[;[smYY:]MODE]  with
@@ -297,7 +326,7 @@ def sparse_gqa_fwd_interface_triton(q, k, v, max_seqlen_k, indices, cu_seqlens, 
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
     block_m = max(16, triton.next_power_of_2(group_size))
-    block_n, warps, stages = _get_best_config(total_q)
+    block_n, warps, stages = _get_prefill_config(total_q)
     out = torch.empty_like(q)
     _sparse_gqa_prefill[(max_seqlen_k, (cu_seqlens.shape[0] - 1) * num_kv_heads)](
         q,

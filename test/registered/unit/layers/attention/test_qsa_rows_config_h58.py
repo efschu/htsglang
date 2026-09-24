@@ -82,10 +82,17 @@ class WiringTest(unittest.TestCase):
         rows = text[text.index("def sparse_attn_rows_triton("):text.index("def fp8_e4m3_bytes_to_f32_reference(")]
         self.assertIn("block_n, warps, stages = _get_rows_config(total_q)", rows)
         self.assertNotIn("_get_best_config(", rows)
-        for fn in ("def sparse_gqa_fwd_interface_triton(", "def sparse_gqa_fwd_interface_triton_ck("):
+        # H65: the prefix-free launch reads its own knob
+        # (SGLANG_WEG2_QSA_PREFILL_CONFIG, _get_prefill_config), never this one;
+        # the chunk variant keeps the table.
+        expected = {
+            "def sparse_gqa_fwd_interface_triton(": "_get_prefill_config(total_q)",
+            "def sparse_gqa_fwd_interface_triton_ck(": "_get_best_config(total_q)",
+        }
+        for fn, reader in expected.items():
             body = text[text.index(fn):]
             body = body[: body.index("\ndef ", 1)]
-            self.assertIn("_get_best_config(total_q)", body, fn)
+            self.assertIn(reader, body, fn)
             self.assertNotIn("_get_rows_config", body, fn)
         self.assertEqual(len(re.findall(r"_get_rows_config\(total_q\)", text)), 1)
 

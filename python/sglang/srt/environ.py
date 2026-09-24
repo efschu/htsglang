@@ -2252,6 +2252,13 @@ class Envs:
     # wins over a generic one, e.g. "sm86:ptx" moves only the 3080 stages.
     # Empty = exp2 (default; the kernel compiles to the same SASS as before).
     SGLANG_WEG2_QSA_FP8_DECODE = EnvStr("")
+    # QSA prefix-free prefill launch (fnFL2 H65, F2 of H58, same file): the
+    # first chunk of a prompt and every short prefill run _sparse_gqa_prefill
+    # with the same table row, (16, 1, 2) above 512 rows = 3 warps per SM on
+    # sm86 and sm120 (offline compiled, latency-bound). The
+    # SGLANG_FORCE_QSA_ROWS_CONFIG grammar, for this launch only, e.g.
+    # "inf=32/8/2". Empty = the table (default). Launch parameters only.
+    SGLANG_WEG2_QSA_PREFILL_CONFIG = EnvStr("")
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
