@@ -669,6 +669,14 @@ def scatter_mamba_states_after_mtp_verify(
     persistent caches, plus the interval-crossing track slots."""
     ssm_states = mamba_caches.temporal
     intermediate_state_cache = mamba_caches.intermediate_ssm
+    if intermediate_state_cache is None:
+        # 27B ReplaySSM package: the spec ring replaced the intermediate
+        # state; this route is not wired to it (S3). Refuse, never scatter
+        # a None.
+        raise RuntimeError(
+            "ReplaySSM spec ring allocated (--enable-linear-replayssm-spec) "
+            "but this commit path still reads intermediate_ssm"
+        )
 
     if ssm_states.numel() > 0:
         fused_mamba_state_scatter_with_mask(

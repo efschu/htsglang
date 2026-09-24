@@ -661,6 +661,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
+            if intermediate_state_cache is None:
+                # 27B ReplaySSM package: the spec ring replaced the
+                # intermediate state; the ring's verify route is S3.
+                raise RuntimeError(
+                    "ReplaySSM spec ring allocated "
+                    "(--enable-linear-replayssm-spec) but the GDN target "
+                    "verify route to it is not wired"
+                )
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )

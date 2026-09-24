@@ -4479,6 +4479,21 @@ class ServerArgs:
         int,
         "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
     ] = 16
+    # 27B ReplaySSM package (upstream #28695..#35544, GDN route; this line's own
+    # DFLASH commit wiring): a compact per-REQUEST (d, k, g) ring replaces the
+    # target verify's per-draft full-state snapshots -- the "speculative
+    # intermediate state" post of the mamba budget.
+    enable_linear_replayssm_spec: A[
+        bool,
+        "Enable the ReplaySSM GDN spec-verify ring: a compact per-request "
+        "(d, k, g) ring (plus low parts for 16-bit activations) replaces the "
+        "target verify's per-draft full-state snapshots, the 'speculative "
+        "intermediate state' of the mamba budget. GDN hybrid models, linear "
+        "draft chains (--speculative-eagle-topk None or 1: NEXTN/MTP/DFLASH) "
+        "only. The ring length is --linear-replayssm-cache-len (a power of two, "
+        ">= the widest verify window). Mutually exclusive with "
+        "--enable-linear-replayssm.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical cache
@@ -16164,6 +16179,58 @@ class ServerArgs:
                 raise ValueError(
                     "--linear-replayssm-cache-len must be >= 1, got "
                     f"{self.linear_replayssm_cache_len}."
+                )
+
+        # 27B ReplaySSM package, S2: the GDN spec-verify ring. The static
+        # half of its preconditions; the ring width against the widest verify
+        # window and the GDN-only model check sit at the pool
+        # (MambaPool.__init__), where the resolved draft maximum and the
+        # model's cache params are known.
+        if self.enable_linear_replayssm_spec:
+            flag = "--enable-linear-replayssm-spec"
+            if self.enable_linear_replayssm:
+                raise ValueError(
+                    f"{flag} and --enable-linear-replayssm are mutually "
+                    "exclusive: the decode ring is keyed by mamba slot and "
+                    "advanced per decode forward, the spec ring by request row "
+                    "and advanced per verify commit."
+                )
+            if self.speculative_algorithm is None:
+                raise ValueError(
+                    f"{flag} replaces the target verify's intermediate state and "
+                    "needs a speculative algorithm."
+                )
+            if self.speculative_eagle_topk not in (None, 1):
+                raise ValueError(
+                    f"{flag} requires a linear draft chain "
+                    "(--speculative-eagle-topk None or 1); the ring's verify "
+                    "kernel uses a strictly-lower causal mask. Got "
+                    f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
+                )
+            if decode != "triton":
+                raise ValueError(
+                    f"{flag} requires the Triton linear-attn decode backend "
+                    f"(the only verify route wired on this line), got {decode!r}."
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    f"{flag} is not wired for PD disaggregation, got "
+                    f"--disaggregation-mode={self.disaggregation_mode!r}."
+                )
+            ring = self.linear_replayssm_cache_len
+            if ring < 1 or ring & (ring - 1):
+                raise ValueError(
+                    f"{flag}: --linear-replayssm-cache-len must be a power of "
+                    f"two (the ring indexes modulo L), got {ring}."
+                )
+            if self.mamba_ssm_dtype not in (None, "float32"):
+                logger.warning(
+                    "%s with --mamba-ssm-dtype=%s: accepted verify windows are "
+                    "materialized into the 16-bit checkpoint every commit "
+                    "(compensated hi/lo); validate acceptance and long-sequence "
+                    "accuracy on metal before making it a default.",
+                    flag,
+                    self.mamba_ssm_dtype,
                 )
 
     def _handle_legacy_cp_arguments(self):
