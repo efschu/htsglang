@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
@@ -9,6 +10,9 @@ import torch
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.debug_utils import index_race_guard
 from sglang.srt.environ import envs
+from sglang.srt.managers.scheduler_components.decode_host_split import (
+    note_span as _h58_span,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -674,8 +678,13 @@ class FutureMap:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
+        # fnFL2 H58: the host waits here for the PREVIOUS round's publish
+        # (verify end + accept + mamba commit) -- seq_wait of DECODE-HOST-SPLIT.
+        # Timing only; the two device reads below are the pre-existing ones.
+        _h58_t0 = time.perf_counter()
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
+            _h58_span("seq_wait_ms", _h58_t0)
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
             if _DEBUG_ASSERT:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
@@ -687,6 +696,7 @@ class FutureMap:
         with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
             self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
         self.fwd_prepare_d2h_stream.synchronize()
+        _h58_span("seq_wait_ms", _h58_t0)
 
         # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.
         batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]

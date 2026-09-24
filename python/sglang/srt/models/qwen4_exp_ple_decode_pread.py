@@ -68,6 +68,9 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.scheduler_components.decode_host_split import (
+    note_span as _h58_span,
+)
 from sglang.srt.models.qwen4_exp_ple_prefetch import (
     PleHashParams,
     PlePreadProcs,
@@ -693,9 +696,14 @@ def finish_ple_verify_stage(stage: Optional[PleVerifyStage]) -> None:
     if stage is None:
         return
     t0 = time.monotonic()
+    # fnFL2 H58: ple_sync (the wait for the draft) and ple_stage (hash + pread
+    # while the stream idles) of DECODE-HOST-SPLIT; timing only.
+    h58_t = time.perf_counter()
     if stage.event is not None:
         stage.event.synchronize()
     t_ready = time.monotonic()
+    h58_t = _h58_span("ple_sync_ms", h58_t)
     rows = stage.ctx_host.tolist()
     for st in stage.stagers:
         st.stage(rows, sync_s=t_ready - t0, t_ready=t_ready)
+    _h58_span("ple_stage_ms", h58_t)

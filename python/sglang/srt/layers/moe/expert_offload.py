@@ -129,6 +129,9 @@ from sglang.srt.debug_utils import host_anon_probe as _hap
 from sglang.srt.layers.moe import pinned_host_ledger
 from sglang.srt.layers.fwd_timeline import fwd_mark
 from sglang.srt.layers.prefill_timing import StageHead
+from sglang.srt.managers.scheduler_components.decode_host_split import (
+    timed as _h58_timed,
+)
 from sglang.srt.utils.break_cost_clock import break_cost_phase
 
 # --- M-C routing trace ------------------------------------------------------
@@ -613,6 +616,11 @@ class ExpertResidencyPlanner:
             [e for e in needed_unique if e not in self.resident_ids],
         )
 
+    # fnFL2 H58: host expert planning, fetch_plan of DECODE-HOST-SPLIT (the
+    # pool mode plans on the device, so a graphed decode round never calls
+    # it). resolve_sticky (WP8 lookahead, prefill waves only) is not timed:
+    # its fallback calls this method and would count twice.
+    @_h58_timed("fetch_plan_ms", "fetch_plan_n")
     def resolve(
         self, needed: Sequence[int]
     ) -> Tuple[Dict[int, int], List[Tuple[int, int]]]:

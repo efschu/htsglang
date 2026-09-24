@@ -33,6 +33,7 @@ Limitations (v1):
 
 import logging
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -42,6 +43,9 @@ from sglang.srt.distributed.device_communicators import (
     barlink_env_guard,  # noqa: F401  (rejects retired SGLANG_HTCCL* vars)
     barlink_liveness,
     barlink_uniformity,
+)
+from sglang.srt.managers.scheduler_components.decode_host_split import (
+    note_span as _h58_span,
 )
 
 logger = logging.getLogger(__name__)
@@ -1588,10 +1592,14 @@ class BarlinkCommunicator:
         # path below synchronizes with the host and is therefore ILLEGAL
         # inside a CUDA-graph capture, which the speculative draft-pick sync
         # performs. See BarlinkDeviceTransport.barlink_broadcast.
+        # fnFL2 H58: host wall of every host-path broadcast (a decode round's
+        # draft tokens and accept payload) -- bcast of DECODE-HOST-SPLIT.
+        _h58_t0 = time.perf_counter()
         t = self._select("broadcast", tensor.numel() * tensor.element_size())
         if t is not None:
             result = t.barlink_broadcast(self, tensor, src)
             self._after_transport(t, "broadcast")
+            _h58_span("bcast_ms", _h58_t0, "bcast_n")
             return result
         host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
         if self.rank == src:
@@ -1606,6 +1614,7 @@ class BarlinkCommunicator:
         )
         if self.rank != src:
             tensor.copy_(host, non_blocking=False)
+        _h58_span("bcast_ms", _h58_t0, "bcast_n")
         return tensor
 
     # ------------------------------------------------------------------

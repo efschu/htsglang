@@ -43,6 +43,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.managers.scheduler_components import decode_host_split as _h58
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -2845,6 +2846,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # into a draft worker that had never seen it; Weg 2's decode group
         # builds its draft worker at boot and keeps it for the group's
         # whole life, so no request in this process ever arrives cold.
+        # fnFL2 H58 (DECODE-HOST-SPLIT): host spans draft / verify / dext and
+        # the six stream marks of the round; timing only, no sync.
+        _h58_t = time.perf_counter()
+        _h58.mark(_h58.MARK_DRAFT_BEGIN)
         if self.speculative_num_steps == 0:
             # Drafting disabled (high batch size). _draft_extend below still
             # runs, keeping draft KV warm for when the batch shrinks.
@@ -2860,10 +2865,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ):
                 verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
         _stage_sync("draft")
+        _h58.mark(_h58.MARK_DRAFT_END)
+        _h58_t = _h58.note_span("draft_ms", _h58_t)
         assert verify_input.is_verify_input()
         batch.spec_info = verify_input
         batch_output = self.verify(batch)
         _stage_sync("verify-end")
+        _h58_t = _h58.note_span("verify_ms", _h58_t)
+        _h58.mark(_h58.MARK_DEXT_BEGIN)
         # Publish before draft_extend so the fence is at verify-end.
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
@@ -2909,6 +2918,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     verify_width=int(verify_input.draft_token_num),
                 )
         _stage_sync("draft-extend")
+        _h58.mark(_h58.MARK_DEXT_END)
+        _h58.note_span("dext_ms", _h58_t)
 
         # The bootstrap is discharged only HERE -- after the
         # draft_extend that turned this round's hidden states into a
@@ -3549,6 +3560,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch):
+        # fnFL2 H58: vprep / launch / accept of DECODE-HOST-SPLIT (ple_sync and
+        # ple_stage are noted inside finish_ple_verify_stage); timing only.
+        _h58_t = time.perf_counter()
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
@@ -3626,16 +3640,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # (post-pad).
         # fnFL2 H40: stage the round's PLE rows (pread workers) so the verify
         # gather reads them from host memory instead of faulting them in
+        _h58.note_span("vprep_ms", _h58_t)
         finish_ple_verify_stage(ple_stage)
+        _h58_t = time.perf_counter()
         with _module_sync_window(
             self.target_worker.model_runner.model, active=eager_round
         ):
+            _h58.mark(_h58.MARK_VERIFY_LAUNCH)
             forward_batch_output = self.target_worker.forward_batch_generation(
                 batch=None,
                 forward_batch=verify_forward_batch,
                 is_verify=True,
             )
+            _h58.mark(_h58.MARK_VERIFY_END)
         _stage_sync("verify-forward")
+        _h58_t = _h58.note_span("launch_ms", _h58_t)
         logits_output = forward_batch_output.logits_output
 
         # Generate vocab mask for constrained decoding
@@ -3825,6 +3844,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch, accept_index, accept_lens, predict, logits_output, bs
             )
 
+        _h58.note_span("accept_ms", _h58_t)
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 
         # verify_forward_batch transitively holds verify-time GPU tensors

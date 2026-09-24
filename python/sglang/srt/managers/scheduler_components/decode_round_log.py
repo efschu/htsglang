@@ -169,6 +169,10 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple
 
+from sglang.srt.managers.scheduler_components.decode_host_split import (
+    DecodeHostSplit,
+    register_active,
+)
 from sglang.srt.managers.scheduler_components.host_round_cost import (
     DecodeHostCost,
 )
@@ -263,6 +267,12 @@ class DecodeRoundLog:
         #: its CPU all_reduce, the result sync), joined into
         #: DECODE-ROUND-COST and stated as DECODE-HOST-PERIOD.
         self.host_cost = DecodeHostCost.from_env(rank=self.rank)
+        #: fnFL2 H58: the same interval split into the device waits inside
+        #: run_batch and the named host spans, plus the GPU idle the host
+        #: caused (DECODE-HOST-SPLIT). The forward path's marks reach it
+        #: through the process registration.
+        self.host_split = DecodeHostSplit.from_env(rank=self.rank)
+        register_active(self.host_split)
 
     def arm_wake_census(self, *, wake_mono: Optional[float]) -> None:
         """fnFL2 H23: price the next decode rounds (the wake happened at
@@ -285,6 +295,7 @@ class DecodeRoundLog:
         # before the drain too: the round it may price has its host interval
         # closed at this open
         self.host_cost.on_round_open(round_id=round_id, mono=t0 / 1e9)
+        self.host_split.on_round_open(round_id=round_id, mono=t0 / 1e9)
         self._retire_open()
         self.flush()
         self._open = RoundAcc(round_id, bs, rows)
@@ -307,6 +318,7 @@ class DecodeRoundLog:
         """
         t0 = time.perf_counter_ns()
         self.host_cost.on_round_end(mono=t0 / 1e9)
+        self.host_split.on_round_end(mono=t0 / 1e9)
         self._retire_open()
         self.flush()
         self._overhead_ns += time.perf_counter_ns() - t0

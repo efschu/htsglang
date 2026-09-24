@@ -561,6 +561,13 @@ class Envs:
     # perf_counter around existing calls only; 0 = no line.
     SGLANG_DEBUG_DECODE_HOST_PERIOD = EnvInt(64)
     SGLANG_DEBUG_PP_HOST_PERIOD = EnvInt(8)
+    # DECODE HOST SPLIT (fnFL2 H58, scheduler_components/decode_host_split.py):
+    # every N decode rounds a DECODE-HOST-SPLIT line -- H49's host_other split
+    # into the device waits inside run_batch (seq_lens resolve, PLE sync, BAR1
+    # abort-check waits) and the named host spans, plus six stream events per
+    # round read late by query (GPU idle the host caused). perf_counter around
+    # existing calls, no sync; 0 = no line and no events.
+    SGLANG_DEBUG_DECODE_HOST_SPLIT = EnvInt(64)
     # LRU_WARM_FROM_HANDOFF (H29b): after rearm_after_wake the free LRU rows
     # of every pool layer are filled with P's most-routed experts of the last
     # LRU_WARM_TOKENS prompt tokens (no new VRAM: only rows the reinit left

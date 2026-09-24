@@ -261,6 +261,9 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.decode_host_split import (
+    note_span as _h58_span,
+)
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
@@ -3103,17 +3106,21 @@ class Scheduler(
 
         def pop_and_process():
             # Process the results of the last batch
+            _h58_t0 = time.perf_counter()  # fnFL2 H58: DECODE-HOST-SPLIT result
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
             _stage_sync(f"result-{tmp_batch.forward_mode.name}")
+            _h58_span("result_ms", _h58_t0)
 
         while True:
             if self.gracefully_exit:
                 break
 
             # Receive requests
+            _h58_t0 = time.perf_counter()  # fnFL2 H58: DECODE-HOST-SPLIT recv
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            _h58_span("recv_ms", _h58_t0)
             if self._engine_paused:
                 continue
 
@@ -3129,9 +3136,11 @@ class Scheduler(
             self._apply_war_barrier()
 
             # Get the next batch to run
+            _h58_t0 = time.perf_counter()  # fnFL2 H58: DECODE-HOST-SPLIT sched
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
             )
+            _h58_span("sched_ms", _h58_t0)
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch

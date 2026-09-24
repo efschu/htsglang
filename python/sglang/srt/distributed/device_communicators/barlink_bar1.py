@@ -6024,7 +6024,17 @@ class BarlinkBar1Transport:
                     # window is preserved (``_deferred_launches`` is only
                     # cleared by a RESOLVED clean read), so nothing is lost
                     # but the latency.
-                    if self._wait_ctl_event():
+                    #
+                    # fnFL2 H58: the one forced host wait of the staged read
+                    # -- ctl_wait of DECODE-HOST-SPLIT (timing only).
+                    from sglang.srt.managers.scheduler_components.decode_host_split import (
+                        note_span as _h58_span,
+                    )
+
+                    _h58_t0 = time.perf_counter()
+                    _h58_resolved = self._wait_ctl_event()
+                    _h58_span("ctl_wait_ms", _h58_t0, "ctl_wait_n")
+                    if _h58_resolved:
                         self._ctl_inflight = False
                         value = int(self._ctl_stage[0])
                     else:
