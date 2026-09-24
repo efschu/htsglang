@@ -854,21 +854,32 @@ def build_dflash_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
-    if req.return_logprob:
-        return "DFLASH speculative decoding does not support return_logprob yet."
+def validate_dflash_request(
+    req: Req, enable_overlap: bool, spec_algorithm: Any = None
+) -> Optional[str]:
+    # upstream #33459 / #30096: DFLASH serves return_logprob (verify-time
+    # compute_spec_v2_logprobs) and grammar-constrained decoding (verify-time
+    # bitmask over the linear block, dflash_worker_v2). DSpark keeps both
+    # refusals (it has neither path). ``spec_algorithm=None`` is the DFLASH
+    # family default of the pre-port signature.
+    is_dspark = bool(
+        spec_algorithm is not None
+        and getattr(spec_algorithm, "is_dspark", lambda: False)()
+    )
+    if is_dspark and req.return_logprob:
+        return "DSpark speculative decoding does not support return_logprob yet."
 
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 
-    if (
+    if is_dspark and (
         req.sampling_params.json_schema is not None
         or req.sampling_params.regex is not None
         or req.sampling_params.ebnf is not None
         or req.sampling_params.structural_tag is not None
     ):
         return (
-            "DFLASH speculative decoding does not support "
+            "DSpark speculative decoding does not support "
             "grammar-constrained decoding yet."
         )
 
