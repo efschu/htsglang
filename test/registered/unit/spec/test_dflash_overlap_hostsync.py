@@ -26,6 +26,158 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
+def _compact_lens_exact(seq_lens, window, page):
+    fake_self = SimpleNamespace(
+        device=seq_lens.device, draft_window_size=window, page_size=page
+    )
+    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+    return DFlashWorkerV2._compute_compact_draft_seq_lens(fake_self, seq_lens)
+
+
+def _compact_lens_host(seq_lens, window, page):
+    fake_self = SimpleNamespace(draft_window_size=window, page_size=page)
+    out = torch.empty(seq_lens.numel(), dtype=torch.int32)
+    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+    DFlashWorkerV2._compute_compact_draft_seq_lens_host(fake_self, seq_lens, out)
+    return out
+
+
+class TestCompactSeqLensHostBound(CustomTestCase):
+    def test_upper_bound_of_exact(self):
+        g = torch.Generator().manual_seed(0)
+        for window, page in [(4096, 64), (4096, 1), (128, 32), (64, 1), (2048, 1)]:
+            seq = torch.randint(1, 3 * window, (512,), generator=g)
+            exact = _compact_lens_exact(seq, window, page).to(torch.int64)
+            bound = _compact_lens_host(seq, window, page).to(torch.int64)
+            self.assertTrue(
+                bool((bound >= exact).all()),
+                f"host bound under-shoots exact at window={window} page={page}",
+            )
+
+    def test_exact_at_page_size_one(self):
+        # The 27B D group: page_size 1, window 2048, exact host mirror
+        # (overlap_utils.resolve_seq_lens_cpu) -> the bound IS the device value.
+        g = torch.Generator().manual_seed(1)
+        seq = torch.randint(1, 3 * 2048, (256,), generator=g)
+        exact = _compact_lens_exact(seq, 2048, 1).to(torch.int64)
+        bound = _compact_lens_host(seq, 2048, 1).to(torch.int64)
+        torch.testing.assert_close(bound, exact, rtol=0, atol=0)
+
+    def test_sawtooth_counterexample(self):
+        # exact(4160) = 4096 < exact(4100) = 4100 at window=4096 page=64:
+        # a host mirror of the exact math fed the reserved over-estimate
+        # (4160 >= true 4100) would under-shoot; the envelope must not.
+        window, page = 4096, 64
+        true_len = torch.tensor([4100])
+        reserved = torch.tensor([4160])
+        exact_true = _compact_lens_exact(true_len, window, page).to(torch.int64)
+        exact_reserved = _compact_lens_exact(reserved, window, page).to(torch.int64)
+        self.assertLess(int(exact_reserved), int(exact_true))
+        bound = _compact_lens_host(reserved, window, page).to(torch.int64)
+        self.assertGreaterEqual(int(bound), int(exact_true))
+
+
+_INTERPRETED_REBUILD = textwrap.dedent(
+    """
+    import os
+    os.environ["TRITON_INTERPRET"] = "1"
+    import torch
+    from sglang.kernels.ops.speculative.cache_locs import (
+        assign_req_to_token_pool_func,
+        rebuild_compact_draft_req_to_token_func,
+    )
+
+    def compact_lens(seq, window, page):
+        vis = torch.clamp(seq, max=window)
+        if page <= 1:
+            return vis.to(torch.int32)
+        start = seq - vis
+        aligned = start - torch.remainder(start, page)
+        return (seq - aligned).to(torch.int32)
+
+    def legacy(draft, target, req_idx, start, lens, verify_2d, bs, block):
+        # DFlashWorkerV2._gather_req_to_token_segments + the two assigns.
+        lens64 = lens.to(torch.int64)
+        max_len = int(lens64.max().item())
+        offs = torch.arange(max_len).unsqueeze(0)
+        pos2d = start.to(torch.int64).unsqueeze(1) + offs
+        mask = offs < lens64.unsqueeze(1)
+        packed = target[req_idx.to(torch.int64)[:, None], pos2d.masked_fill(~mask, 0)][
+            mask
+        ].to(torch.int64)
+        assign_req_to_token_pool_func(
+            req_idx, draft, torch.zeros_like(lens), lens, packed, bs
+        )
+        assign_req_to_token_pool_func(
+            req_idx, draft, lens, lens + block, verify_2d.reshape(-1), bs
+        )
+
+    n = 0
+    for bs, window, page, block, seed in [
+        (1, 64, 1, 8, 0),
+        (6, 2048, 1, 8, 4),
+        (16, 64, 32, 8, 1),
+        (13, 128, 64, 8, 2),
+        (7, 512, 64, 16, 3),
+    ]:
+        g = torch.Generator().manual_seed(seed)
+        pool_rows, width = 4 * bs, 4 * window
+        seq = torch.randint(1, width - block - 1, (bs,), generator=g).to(torch.int64)
+        lens = compact_lens(seq, window, page)
+        start = seq - lens.to(torch.int64)
+        req_idx = torch.randperm(pool_rows, generator=g)[:bs]
+        target = torch.randint(0, 2**30, (pool_rows, width), generator=g).to(
+            torch.int32
+        )
+        verify_2d = torch.randint(0, 2**30, (bs, block), generator=g).to(torch.int64)
+        draft_width = window + page + block + 8
+        draft_a = torch.full((pool_rows, draft_width), -1, dtype=torch.int32)
+        draft_b = draft_a.clone()
+        legacy(draft_a, target, req_idx, start, lens, verify_2d, bs, block)
+        rebuild_compact_draft_req_to_token_func(
+            draft_req_to_token=draft_b,
+            target_req_to_token=target,
+            req_pool_indices=req_idx,
+            suffix_start=start,
+            draft_prefix_lens=lens,
+            verify_out_cache_loc_2d=verify_2d,
+            batch_size=bs,
+            block_size=block,
+        )
+        assert torch.equal(draft_b, draft_a), (bs, window, page, block)
+        for i in range(bs):
+            total = int(lens[i]) + block
+            assert bool((draft_b[req_idx[i], total:] == -1).all()), "wrote past block"
+        n += 1
+    print("REBUILD-BITEXACT-OK", n)
+    """
+)
+
+
+class TestRebuildCompactDraftReqToTokenInterpreted(CustomTestCase):
+    """The #31468 kernel against the legacy path, in the triton interpreter.
+
+    TRITON_INTERPRET must be set before the kernels are decorated, hence the
+    subprocess (this test process may already have imported cache_locs).
+    """
+
+    def test_bitexact_vs_legacy(self):
+        env = dict(os.environ)
+        env["TRITON_INTERPRET"] = "1"
+        env["CUDA_VISIBLE_DEVICES"] = ""
+        proc = subprocess.run(
+            [sys.executable, "-c", _INTERPRETED_REBUILD],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-4000:])
+        self.assertIn("REBUILD-BITEXACT-OK 5", proc.stdout)
+
+
 class TestHybridNeedsCpuSeqLens(CustomTestCase):
     def _make(self, prefill_flag, decode_flag):
         from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
@@ -136,6 +288,28 @@ class TestSpecTpSyncDivergeBudget(CustomTestCase):
 
     def test_zero_turns_it_off(self):
         self.assertEqual(self._sync(rank=1, budget=0, rounds=10), 0)
+
+
+class TestDflashSyncTraceUnarmed(CustomTestCase):
+    def test_passthrough_without_cuda_or_for_prefill(self):
+        from sglang.srt.speculative.dflash_worker_v2 import _dflash_sync_traced
+
+        seen = []
+
+        def fn(batch, on_publish=None):
+            seen.append(batch)
+            return "result"
+
+        wrapped = _dflash_sync_traced(fn, budget=4, tp_rank=0)
+        extend = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_extend=lambda: True, is_idle=lambda: False
+            ),
+            is_extend_in_batch=False,
+        )
+        self.assertEqual(wrapped(extend), "result")
+        self.assertEqual(wrapped(object()), "result")  # no forward_mode at all
+        self.assertEqual(len(seen), 2)
 
 
 if __name__ == "__main__":
