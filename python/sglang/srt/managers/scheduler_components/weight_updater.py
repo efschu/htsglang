@@ -1744,53 +1744,63 @@ class SchedulerWeightUpdaterManager:
         Standard). Each rank held ~2.5 GiB of glibc heap while serving
         (/proc/<pid>/smaps [heap], xsn296 desk reading); a sleeping rank is the
         moment to hand freed arenas back to the kernel (malloc_trim(0)) and
-        to say what the heap is made of (a gc census by type, once per sleep,
-        top 8). Never raises."""
+        to say what the heap is made of (a gc census by type on sleeps
+        1, 2, 4, 8, ..., top 8). H16: the census runs AFTER the sleep answered
+        unless SGLANG_WEG2_SLEEP_HEAP_CENSUS=2 (weg2/heap_census.py has the
+        fnFL2x127 tails it took off the flip's critical path). Never raises."""
         try:
-            import ctypes
-            import gc
-            import os
-            import sys
+            from sglang.srt.environ import envs  # noqa: PLC0415
+            from sglang.srt.weg2 import heap_census  # noqa: PLC0415
 
-            def _rss_anon() -> int:
-                with open("/proc/self/status") as fh:
-                    for line in fh:
-                        if line.startswith("RssAnon:"):
-                            return int(line.split()[1]) * 1024
-                return -1
-
-            before = _rss_anon()
-            trimmed = -1
-            try:
-                trimmed = int(ctypes.CDLL("libc.so.6").malloc_trim(0))
-            except Exception:  # noqa: BLE001
-                pass
-            after = _rss_anon()
-            census = ""
-            try:
-                n = int(getattr(self, "_weg2_sleep_count", 0) or 0)
-                if n <= 2 or (n & (n - 1)) == 0:   # 1, 2, 4, 8, ... sleeps
-                    counts: Dict[str, int] = {}
-                    sizes: Dict[str, int] = {}
-                    for o in gc.get_objects():
-                        k = type(o).__name__
-                        counts[k] = counts.get(k, 0) + 1
-                        try:
-                            sizes[k] = sizes.get(k, 0) + sys.getsizeof(o)
-                        except Exception:  # noqa: BLE001
-                            pass
-                    top = sorted(sizes.items(), key=lambda kv: kv[1], reverse=True)[:8]
-                    census = " census=" + ",".join(f"{k}:{counts[k]}x{v >> 20}MiB" for k, v in top)
-            except Exception as exc:  # noqa: BLE001
-                census = f" census=n/a({type(exc).__name__})"
+            before = self._weg2_rss_anon()
+            trimmed = self._weg2_malloc_trim()
+            after = self._weg2_rss_anon()
+            n = int(self._weg2_sleep_count or 0)
+            action = heap_census.census_action(
+                mode=envs.SGLANG_WEG2_SLEEP_HEAP_CENSUS.get(), sleep_count=n
+            )
+            census = self._weg2_census_now(heap_census=heap_census, action=action, n=n)
             logger.info(
                 "WEG2-SLEEP-HOST-HEAP rss_anon=%d MiB -> %d MiB after malloc_trim(0) (returned=%d MiB, "
-                "trim_rc=%d)%s (instrument: /proc/self/status RssAnon; census = sys.getsizeof over "
-                "gc-tracked objects by type, shallow sizes, top 8 -- containers' payloads not included)",
-                before >> 20, after >> 20, max(0, before - after) >> 20, trimmed, census,
+                "trim_rc=%d) census_mode=%s%s (instrument: /proc/self/status RssAnon; census = "
+                "sys.getsizeof over gc-tracked objects by type, shallow sizes, top 8 -- containers' "
+                "payloads not included)",
+                before >> 20, after >> 20, max(0, before - after) >> 20, trimmed, action, census,
             )
         except Exception as exc:  # noqa: BLE001
             logger.info("WEG2-SLEEP-HOST-HEAP instrument raised (%s: %s)", type(exc).__name__, str(exc)[:160])
+
+    @staticmethod
+    def _weg2_rss_anon() -> int:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("RssAnon:"):
+                    return int(line.split()[1]) * 1024
+        return -1
+
+    @staticmethod
+    def _weg2_malloc_trim() -> int:
+        try:
+            import ctypes  # noqa: PLC0415
+
+            return int(ctypes.CDLL("libc.so.6").malloc_trim(0))
+        except Exception:  # noqa: BLE001
+            return -1
+
+    @staticmethod
+    def _weg2_census_now(*, heap_census: Any, action: str, n: int) -> str:
+        """The census suffix of the trim line: inline text, or the deferral
+        (the timer logs WEG2-SLEEP-HOST-HEAP-CENSUS itself)."""
+        if action == "inline":
+            try:
+                text, ms = heap_census.timed_census()
+                return f" census_ms={ms:.0f} census={text}"
+            except Exception as exc:  # noqa: BLE001
+                return f" census=n/a({type(exc).__name__})"
+        if action == "defer":
+            heap_census.defer_census(sleep_count=n, log=logger.info)
+            return f" census=deferred({heap_census.DEFER_S:.0f}s)"
+        return ""
 
     #: The four possible carriers of the weight bytes on a wake.  Module-level
     #: strings on the class rather than literals at the branches: the seam's

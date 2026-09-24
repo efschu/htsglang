@@ -232,6 +232,19 @@ class ToolStrictLevel(IntEnum):
     PARAMETER = 2
 
 
+class Weg2HeapCensus(IntEnum):
+    """Where the sleep's gc census of the host heap runs (weg2/heap_census.py).
+
+    OFF: no census (the trim and its line stay)
+    DEFER: on a daemon timer after the sleep answered -- off the flip's path
+    INLINE: inside the sleep RPC, the form before fnFL2 H16
+    """
+
+    OFF = 0
+    DEFER = 1
+    INLINE = 2
+
+
 class Envs:
     # Raise on bare server_args field assignments after resolution; mutation
     # must go through ServerArgs.override() (enabled by the test harness).
@@ -461,6 +474,13 @@ class Envs:
     # 102 MiB on a 3080); the wake puts the saved limit back before its
     # kv_cache fit check (weg2/sleep_lmem.py). 0 = the context keeps it.
     SGLANG_WEG2_SLEEP_RELEASE_LMEM = EnvBool(True)
+    # SLEEP_HEAP_CENSUS (H16, fnFL2x127): the gc walk of WEG2-SLEEP-HOST-HEAP
+    # (sleeps 1, 2, 4, 8, ...) cost 505-639 ms INSIDE the sleep RPC, which the
+    # front waits for before the wake -- on the flip's critical path (P PP0
+    # tail 538/505 ms with the walk, 18/23 ms without). 1 = DEFER: the walk
+    # runs 2 s after the sleep answered and logs WEG2-SLEEP-HOST-HEAP-CENSUS
+    # with its own census_ms; 2 = INLINE (the old form); 0 = OFF.
+    SGLANG_WEG2_SLEEP_HEAP_CENSUS = EnvInt(Weg2HeapCensus.DEFER)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)

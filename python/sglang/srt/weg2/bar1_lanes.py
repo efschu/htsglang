@@ -899,6 +899,51 @@ class Bar1Lanes:
 
 # -- the transport: ONE tag over the ring -------------------------------------
 
+class LaneClock:
+    """Where one lane's tag time goes (fnFL2 H16), beside the old
+    ``wait_ms``/``copy_sync_ms`` pair of the lane-time line.
+
+    fnFL2x127 read the P->D deposit lanes of PP0 as "0.7 GB/s, credit-bound".
+    The line said otherwise (weights_9: wait_ms 2-5, copy_sync_ms 404-410),
+    but copy_sync_ms cannot tell a DMA the copy engine is still running from a
+    thread that got the GIL (or the CPU) back late after the sync returned.
+    ``sync_cpu_ms`` is the thread's CPU time inside the syncs: a spinning
+    ``cudaStreamSynchronize`` burns CPU while the DMA runs (cpu ~ wall), a
+    thread parked on the GIL or descheduled does not (cpu << wall). With
+    blocking-sync scheduling both read ~0 -- then ``max_sync_ms`` (one batch at
+    link rate is < 1 ms for a 3-MiB slot) is the discriminator.
+    ``credit_ms`` is the credit/plan/done waiting (= wait_ms), ``issue_ms`` the
+    enqueue of the copies, ``send_ms`` the credit sends.
+    """
+
+    __slots__ = ("credit", "issue", "sync", "sync_cpu", "max_sync", "send")
+
+    def __init__(self) -> None:
+        self.credit = 0.0
+        self.issue = 0.0
+        self.sync = 0.0
+        self.sync_cpu = 0.0
+        self.max_sync = 0.0
+        self.send = 0.0
+
+    def add_sync(self, *, wall_s: float, cpu_s: float) -> None:
+        self.sync += wall_s
+        self.sync_cpu += cpu_s
+        self.max_sync = max(self.max_sync, wall_s)
+
+    def fields(self) -> str:
+        ms = 1000.0
+        return (f"credit_ms={self.credit * ms:.0f} issue_ms={self.issue * ms:.0f} "
+                f"sync_ms={self.sync * ms:.0f} sync_cpu_ms={self.sync_cpu * ms:.0f} "
+                f"max_sync_ms={self.max_sync * ms:.1f} send_ms={self.send * ms:.0f}")
+
+
+def timed_sync(ops, stream, clock: LaneClock) -> None:
+    tc, cc = time.perf_counter(), time.thread_time()
+    ops.synchronize(stream)
+    clock.add_sync(wall_s=time.perf_counter() - tc, cpu_s=time.thread_time() - cc)
+
+
 def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
                    seq, phase: str, no_write=None, liveness=None,
                    budget_s: float = 120.0, device: int = 0, log=None,
@@ -1034,7 +1079,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
     npieces = sum(len(b.pieces) for b in batches)
     _nw = no_write or ()
     t0 = time.perf_counter()
-    t_wait = t_copy = 0.0
+    clk = LaneClock()
     log(f"WEG2-BAR1 mapped lane={lane_key} phase={phase} seq={seq} bytes={total} "
         f"units={npieces} batches={len(batches)} slot={slot_bytes >> 20}MiB ring={ring} credits={via}")
     nb = len(batches)
@@ -1053,7 +1098,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         else:
             tw = time.perf_counter()
             got = cred.recv("plan", 0, budget_s)
-            t_wait += time.perf_counter() - tw
+            clk.credit += time.perf_counter() - tw
             if got is None:
                 return (f"bar1 collect lane={lane_key} seq={seq}: no plan record within "
                         f"{budget_s:.0f} s (depositor gone or stuck)")
@@ -1063,11 +1108,10 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                         f"({len(plan)}) -- the two plans disagree")
 
         def _finish(g):
-            nonlocal t_copy
-            tc = time.perf_counter()
-            ops.synchronize(streams[ring_slot(g, ring)])
-            t_copy += time.perf_counter() - tc
+            timed_sync(ops, streams[ring_slot(g, ring)], clk)
+            ts = time.perf_counter()
             cred.send("full" if role == "src" else "free", g)
+            clk.send += time.perf_counter() - ts
 
         for g, batch in enumerate(batches):
             sbase = base + ring_slot(g, ring) * slot_bytes
@@ -1079,7 +1123,8 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                                     lanes.rank, "free") is None:
                         return (f"bar1 deposit lane={lane_key} seq={seq}: no 'free' for batch "
                                 f"{g - ring} within {budget_s:.0f} s (collector gone or stuck)")
-                    t_wait += time.perf_counter() - tw
+                    clk.credit += time.perf_counter() - tw
+                ti = time.perf_counter()
                 for piece in batch.pieces:
                     desc = descs[piece.desc_index]
                     if desc.src_ptr is None:
@@ -1092,13 +1137,15 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                     else:
                         ops.memcpy2d_async(dst, int(piece.run_bytes), src, int(piece.spitch),
                                            int(piece.run_bytes), int(piece.rows), stream)
+                clk.issue += time.perf_counter() - ti
                 if g >= lag:
                     _finish(g - lag)
                 continue
             # ---- COLLECT ----
             tw = time.perf_counter()
             got = cred.recv("full", g, budget_s)
-            t_wait += time.perf_counter() - tw
+            clk.credit += time.perf_counter() - tw
+            ti = time.perf_counter()
             if got is None:
                 return (f"bar1 collect lane={lane_key} seq={seq}: no 'full' for batch {g} "
                         f"within {budget_s:.0f} s (depositor gone or stuck)")
@@ -1126,6 +1173,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                 else:
                     ops.memcpy2d_async(dst, int(piece.dpitch), src, int(piece.run_bytes),
                                        int(piece.run_bytes), int(piece.rows), stream)
+            clk.issue += time.perf_counter() - ti
             if g >= lag:
                 _finish(g - lag)
         for g in range(max(0, nb - lag), nb):
@@ -1153,12 +1201,13 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                             lanes.rank, "done") is None:
                 return (f"bar1 deposit lane={lane_key} seq={seq}: the collector never reported "
                         f"done within {budget_s:.0f} s")
-            t_wait += time.perf_counter() - tw
+            clk.credit += time.perf_counter() - tw
     except RuntimeError as exc:
         return f"bar1 lane={lane_key} seq={seq}: {exc}"
     total_s = time.perf_counter() - t0
     log(f"WEG2-BAR1 lane-time lane={lane_key} phase={phase} seq={seq} units={npieces} "
         f"batches={nb} bytes={total} total_ms={total_s * 1000:.0f} "
-        f"wait_ms={t_wait * 1000:.0f} copy_sync_ms={t_copy * 1000:.0f} "
-        f"rate_GBs={(total / max(total_s, 1e-9)) / 1e9:.1f} via=bar1 credits={via}")
+        f"wait_ms={clk.credit * 1000:.0f} copy_sync_ms={clk.sync * 1000:.0f} "
+        f"rate_GBs={(total / max(total_s, 1e-9)) / 1e9:.1f} via=bar1 credits={via} "
+        f"{clk.fields()}")
     return ""
