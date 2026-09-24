@@ -461,8 +461,14 @@ class NeutralReference:
 LIMIT_NEUTRAL_REFERENCES: Tuple[NeutralReference, ...] = (
     NeutralReference(
         "p_card_chunk.P_CARD_REFERENCE_FNFL2",
+        "fnFL2x163 + fnFL2x164 + fnFL2x165",
+        "VRAM: Kopfraum je P-Stufe (MiB), 4 Sitze, Mitbewohner-Term (H59)",
+        "W132",
+    ),
+    NeutralReference(
+        "p_card_chunk.P_CARD_REFERENCE_FNFL2_X160",
         "fnFL2x160",
-        "VRAM: Kopfraum je P-Stufe (MiB)",
+        "VRAM: Kopfraum je P-Stufe (MiB), 1 Sitz, historisch",
         "W132",
     ),
     NeutralReference(
