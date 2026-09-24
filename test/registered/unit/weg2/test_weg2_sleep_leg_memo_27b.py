@@ -190,6 +190,123 @@ class NothingIsMemoisedThatWasNotRead(CustomTestCase):
         self.assertEqual(f_._sleep_leg_need_gib("D"), (None, "no-sidecar"))
 
 
+class TheFlipPassesTheGroupObject(CustomTestCase):
+    """xsn421: `self._sleep_leg_gate(S)` hands over the Group dataclass. Its
+    repr carries `served`/`outstanding`, so a memo keyed on str(group) missed
+    on every flip once the group served requests (epoch 7 on: 26-57 ms again),
+    and the record lookup by that repr never matches a group name."""
+
+    def setUp(self):
+        super().setUp()
+        self._env = os.environ.pop("SGLANG_WEG2_SLEEP_GATE_BY_NAME", None)
+
+    def tearDown(self):
+        os.environ.pop("SGLANG_WEG2_SLEEP_GATE_BY_NAME", None)
+        if self._env is not None:
+            os.environ["SGLANG_WEG2_SLEEP_GATE_BY_NAME"] = self._env
+
+    def test_the_memo_survives_the_group_serving_requests(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "rec.json")
+            _write(p, [_sample("P", "a", 1.5)])
+            f_ = _front(p)
+            g = fr.Group(name="P", url="http://127.0.0.1:1")
+            with mock.patch.object(hl, "read_measured_record",
+                                   wraps=hl.read_measured_record) as rd:
+                first = f_._sleep_leg_need_gib(g)
+                for i in range(4):
+                    g.served += 3
+                    g.outstanding[f"r{i}"] = 1.0
+                    self.assertEqual(f_._sleep_leg_need_gib(g), first)
+                self.assertEqual(rd.call_count, 1, "the repr of a serving group re-keyed the memo")
+
+    def test_the_live_answer_for_a_group_object_is_unchanged(self):
+        """Today's production answer, kept byte-identical by default: the repr
+        matches no record key, so the gate has no need and never refuses."""
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "rec.json")
+            _write(p, [_sample("P", "a", 1.5)])
+            g = fr.Group(name="P", url="http://127.0.0.1:1")
+            self.assertEqual(_front(p)._sleep_leg_need_gib(g), (None, "absent"))
+            self.assertEqual(_uncached(p, str(g)), (None, "absent"))
+
+    def test_by_name_switch_makes_the_gate_see_its_record(self):
+        os.environ["SGLANG_WEG2_SLEEP_GATE_BY_NAME"] = "1"
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "rec.json")
+            _write(p, [_sample("P", "a", 1.5, at="2026-09-24T12:00:00Z")])
+            g = fr.Group(name="P", url="http://127.0.0.1:1")
+            self.assertEqual(_front(p)._sleep_leg_need_gib(g),
+                             (1.5, "record:a@2026-09-24T12:00:00Z"))
+
+    def test_by_name_switch_lets_w100_refuse_on_the_xsn25_numbers(self):
+        os.environ["SGLANG_WEG2_SLEEP_GATE_BY_NAME"] = "1"
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "rec.json")
+            _write(p, [_sample("D", "weg2xsn25", 4.32)])
+            f_ = _front(p)
+            g = fr.Group(name="D", url="http://127.0.0.1:1")
+            with mock.patch.object(hl, "read_cgroup_pressure",
+                                   return_value={"file_gib": 62.697, "shmem_gib": 60.0}):
+                with self.assertRaises(hl.Weg2SleepLegCushionDeficit):
+                    f_._sleep_leg_gate(g)
+
+
+class TheGateNamesItsOwnTime(CustomTestCase):
+    """xsn421: ORDER -> gathered-legs stayed 26-57 ms from epoch 7 on with the
+    sidecar unchanged. One line per gate call splits that window."""
+
+    def test_one_line_per_gate_with_the_memo_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "rec.json")
+            _write(p, [_sample("D", "a", 1.0)])
+            f_ = _front(p)
+            pressure = {"file_gib": 100.0, "shmem_gib": 10.0}
+            with mock.patch.object(hl, "read_cgroup_pressure", return_value=pressure):
+                with self.assertLogs(fr.logger, level="INFO") as cm:
+                    f_._sleep_leg_gate("D")
+                    f_._sleep_leg_gate("D")
+                    _write(p, [_sample("D", "a", 1.0), _sample("D", "b", 2.0)])
+                    f_._sleep_leg_gate("D")
+            lines = [m for m in cm.output if "WEG2-SLEEP-GATE-TIME" in m]
+            self.assertEqual(len(lines), 3)
+            self.assertIn("memo=miss(first)", lines[0])
+            self.assertIn("memo=hit", lines[1])
+            self.assertIn("memo=miss(changed:", lines[2])
+            self.assertIn("size", lines[2])
+            for m in lines:
+                self.assertIn("group=D total_ms=", m)
+
+    def test_the_line_names_the_group_and_the_absent_source(self):
+        """On the live path (a Group object, switch unset) the line must say
+        src=absent -- the evidence that W100 has no need there."""
+        os.environ.pop("SGLANG_WEG2_SLEEP_GATE_BY_NAME", None)
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "rec.json")
+            _write(p, [_sample("P", "a", 1.5)])
+            f_ = _front(p)
+            g = fr.Group(name="P", url="http://127.0.0.1:1")
+            with mock.patch.object(hl, "read_cgroup_pressure",
+                                   return_value={"file_gib": 100.0, "shmem_gib": 10.0}):
+                with self.assertLogs(fr.logger, level="INFO") as cm:
+                    f_._sleep_leg_gate(g)
+            line = [m for m in cm.output if "WEG2-SLEEP-GATE-TIME" in m][0]
+            self.assertIn("group=P total_ms=", line)
+            self.assertIn("src=absent", line)
+
+    def test_a_refusal_still_raises_and_still_logs(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "rec.json")
+            _write(p, [_sample("D", "a", 4.32)])
+            f_ = _front(p)
+            with mock.patch.object(hl, "read_cgroup_pressure",
+                                   return_value={"file_gib": 62.697, "shmem_gib": 60.0}):
+                with self.assertLogs(fr.logger, level="INFO") as cm:
+                    with self.assertRaises(hl.Weg2SleepLegCushionDeficit):
+                        f_._sleep_leg_gate("D")
+            self.assertTrue(any("WEG2-SLEEP-GATE-TIME" in m for m in cm.output))
+
+
 class TheSavingIsReal(CustomTestCase):
     def test_a_2000_sample_sidecar_is_parsed_once(self):
         """The xsn420 size class: the uncached read costs tens of ms, the memo

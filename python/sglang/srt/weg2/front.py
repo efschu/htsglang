@@ -1872,6 +1872,16 @@ def _session_pids(sid: int) -> set:
     return {int(a) for a, b in (l.split() for l in out.splitlines()[1:] if len(l.split()) == 2) if b == str(sid)}
 
 
+def _sleep_gate_by_name() -> bool:
+    """SGLANG_WEG2_SLEEP_GATE_BY_NAME=1: the #1361 sleep-leg gate looks the
+    sidecar up by the sleeping group's NAME. Default off = today's lookup by
+    ``str(<Group>)``, which matches no record key (see _sleep_leg_need_gib), so
+    the gate keeps answering "absent" -- turning it on makes W100 able to
+    refuse a sleep leg and is an operator decision, not a side effect."""
+    return str(os.environ.get("SGLANG_WEG2_SLEEP_GATE_BY_NAME", "0")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _measured_record_stat_key(path: str) -> Optional[Tuple[int, int, int, int]]:
     """The sidecar's identity for the sleep-leg memo: (dev, ino, size, mtime_ns).
 
@@ -4348,6 +4358,7 @@ class Front:
         # spelling of it: `self.measured_record` is the sidecar the launcher
         # handed this process, and `sample_dormant_image` appends to exactly it.
         if not self.measured_record:
+            self._sleep_leg_memo_note = "no-sidecar"
             return None, "no-sidecar"
         # xsn420 (24.09.): this read runs synchronously in the flip path,
         # between 'WEG2-FLIP-ORDER' and 'gathered-legs' -- the whole
@@ -4364,9 +4375,35 @@ class Front:
         memo = getattr(self, "_sleep_leg_need_memo", None)
         if memo is None:
             memo = self._sleep_leg_need_memo = {}
-        hit = memo.get(str(group))
+        # xsn421: THE FLIP PASSES THE Group OBJECT (the gate is called with S,
+        # S = self.groups[src]), not its name. `str(group)` is then the
+        # dataclass repr -- it carries `served` and `outstanding`, so it changed
+        # between two sleeps of the same group as soon as the group served
+        # requests (epoch 7 on) and this memo, keyed on it, missed on every
+        # such flip: ORDER -> gathered-legs 26-57 ms again with the sidecar
+        # unchanged. The memo is keyed on the group's NAME (stable) plus the
+        # lookup key's KIND, never on the repr.
+        #
+        # THE LOOKUP ITSELF IS UNCHANGED: the record's keys are group names
+        # ("P", "D", "FLIP"), and a Group repr ("Group(name='P', ...)") matches
+        # none of them, so for the Group object the gate has always answered
+        # (None, "absent") -- the #1361 W100 gate has never had a `need` on the
+        # live flip path and has never refused. SGLANG_WEG2_SLEEP_GATE_BY_NAME=1
+        # looks up by the name (the gate goes live); unset keeps today's answer.
+        gname = str(getattr(group, "name", group))
+        lookup = gname if _sleep_gate_by_name() else str(group)
+        memo_key = gname if lookup == gname else gname + ":repr"
+        hit = memo.get(memo_key)
         if key0 is not None and hit is not None and hit[0] == key0:
+            self._sleep_leg_memo_note = "hit"
             return hit[1]
+        if key0 is None:
+            self._sleep_leg_memo_note = "miss(no-stat)"
+        elif hit is None:
+            self._sleep_leg_memo_note = "miss(first)"
+        else:
+            self._sleep_leg_memo_note = "miss(changed:%s)" % ",".join(
+                n for n, a, b in zip(("dev", "ino", "size", "mtime"), hit[0], key0) if a != b)
         # getattr: a Front built without __init__ (the #1361 execution smoke)
         # has no identity; the live front always sets it in __init__.
         record_line = getattr(self, "record_line", None)
@@ -4375,10 +4412,13 @@ class Front:
                 self.measured_record,
                 accept=record_line.accepts_sample if record_line is not None else None)
         except Exception:  # noqa: BLE001 - a gate must never break the flip
+            self._sleep_leg_memo_note += "+unreadable"
             return None, "unreadable"
-        out = self._sleep_leg_need_from_record(rec, group)
+        out = self._sleep_leg_need_from_record(rec, lookup)
         if key0 is not None and _measured_record_stat_key(self.measured_record) == key0:
-            memo[str(group)] = (key0, out)
+            memo[memo_key] = (key0, out)
+        elif key0 is not None:
+            self._sleep_leg_memo_note += "+torn"
         return out
 
     @staticmethod
@@ -4395,15 +4435,34 @@ class Front:
 
     def _sleep_leg_gate(self, group: str) -> None:
         """#1361 fix6: refuse a sleep leg that does not fit, BEFORE it starts."""
+        _t0 = time.perf_counter()
         try:
             pr = host_ledger.read_cgroup_pressure()
             f, sh = pr.get("file_gib"), pr.get("shmem_gib")
             cushion = None if f is None or sh is None else float(f) - float(sh)
         except Exception:  # noqa: BLE001
             cushion = None
+        _t1 = time.perf_counter()
         need, src = self._sleep_leg_need_gib(group)
-        host_ledger.refuse_sleep_leg_deficit(
-            cushion, need, margin_gib=0.0, source=src, group=str(group))
+        _t2 = time.perf_counter()
+        try:
+            host_ledger.refuse_sleep_leg_deficit(
+                cushion, need, margin_gib=0.0, source=src, group=str(group))
+        finally:
+            # xsn421: ORDER -> gathered-legs stayed 26-57 ms from epoch 7 on
+            # with the sidecar unchanged since 14:53:27 (memo expected to
+            # hit; epochs 4-6 took 1 ms). This line splits that window: the
+            # synchronous gate itself (cgroup read, record, memo state), and
+            # -- by its timestamp against the next 'WEG2-RPC ISSUED' -- the
+            # event loop's share. An instrument, one line per flip.
+            logger.info(
+                "WEG2-SLEEP-GATE-TIME group=%s total_ms=%.1f cgroup_ms=%.1f record_ms=%.1f "
+                "memo=%s need=%s src=%s (the synchronous gate before the gathered legs; "
+                "src=absent on a Group object = the lookup by repr, see _sleep_leg_need_gib)",
+                getattr(group, "name", group), (time.perf_counter() - _t0) * 1e3,
+                (_t1 - _t0) * 1e3, (_t2 - _t1) * 1e3,
+                getattr(self, "_sleep_leg_memo_note", "-"), need, src,
+            )
 
     def sample_dormant_image(self, group: str, shmem_before: Optional[int],
                              vram_residue_mib: Optional[Dict[str, int]] = None) -> Optional[dict]:
