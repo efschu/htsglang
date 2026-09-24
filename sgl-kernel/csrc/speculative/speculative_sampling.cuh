@@ -77,7 +77,12 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
       DType target_prob_single = target_probs[cur_prob_offset + draft_token_id];
       prob_acc += target_prob_single;
 
-      if (coin <= prob_acc / threshold_acc || target_prob_single >= threshold_single) {
+      // Upstream #35798: a draft token the target gives zero mass is never
+      // accepted (coin == 0 with threshold_single == 0 used to take it), and
+      // the CDF boundary is half-open (coin < acc), so a coin sitting exactly
+      // on a boundary selects the next interval, as inverse-CDF sampling must.
+      const bool has_target_mass = target_prob_single > DType(0);
+      if (has_target_mass && (coin < prob_acc / threshold_acc || target_prob_single >= threshold_single)) {
         // accept token
         prob_acc = 0.;
         cur_prob_offset = (bx * num_draft_tokens + cur_index) * d;
