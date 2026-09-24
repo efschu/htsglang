@@ -11281,9 +11281,14 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
             for path in ref_logs:
                 with open(path, errors="replace") as fh:
                     boots.append((os.path.basename(path), fh.read()))
+            deaths = []
+            for path in [x.strip() for x in str(
+                    getattr(ns, "p_card_death_logs", "") or "").split(",") if x.strip()]:
+                with open(path, errors="replace") as fh:
+                    deaths.append((os.path.basename(path), fh.read()))
             reference = _p_card.p_card_reference_from_logs(
                 boots, stage_layers=stage_layers, row_mib=row_mib,
-                support=support, model=name)
+                support=support, model=name, death_boots=deaths)
         else:
             reference = _p_card.P_CARD_REFERENCE_FNFL2
     except (OSError, ValueError) as exc:
@@ -12502,8 +12507,16 @@ def build_parser() -> argparse.ArgumentParser:
              "Chunk-Transiente des Logs; je Stufe das Minimum ueber die Boots. "
              "Unter corridor_guard.NEAR_OOM_MIB verweigert W132. Leer = die "
              "eingebaute Referenz p_card_chunk.P_CARD_REFERENCE_FNFL2 (fnFL2x145 + "
-             "fnFL2x146, Schnitt 29,11,8, Chunk 16384); ein anderer Schnitt "
-             "laesst die Bilanz mit Namen entfallen.")
+             "fnFL2x146, Schnitt 29,11,8, Chunk 16384, Zeilenpreis aus dem Tod "
+             "fnFL2x149); ein anderer Schnitt laesst die Bilanz mit Namen entfallen.")
+    ap.add_argument(
+        "--p-card-death-logs", default="",
+        help="H41b: Komma-Liste von P-Boot-Logs DERSELBEN Form mit mehr "
+             "Pufferzeilen, die im Chunk-Forward an der Karte starben (OOM-Text + "
+             "WEG2-GRAPH-POOL + #969 EXTENT). Sie messen, was eine Zeile ueber der "
+             "Referenz die Karte kostet (untere Schranke, je Stufe; Stufen ohne "
+             "eigenen Tod erben das Verhaeltnis). Nur zusammen mit "
+             "--p-card-reference-logs; leer = eingebaut (fnFL2x149).")
     ap.add_argument(
         "--wake-credit-reference-logs", default="",
         help="H14: P.log,D.log,front.log EINES Boots, dessen erster Wake (D->P) "

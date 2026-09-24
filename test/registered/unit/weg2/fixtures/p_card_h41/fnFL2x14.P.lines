@@ -14,3 +14,5 @@
 [2026-09-23 01:40:14 PP1] [vram-peak] extend (4096 rows): allocator peak since pools 12.33 GiB, allocated now 11.53, reserved 15.12, card free 2.99 of 19.58 GiB -> transient headroom used = peak - allocated 0.80 GiB | cache = reserved - allocated 3.60 GiB, of which fragmentation (inactive split) 0.55 GiB, alloc retries 0
 [2026-09-23 01:40:15 PP2] [vram-peak] extend (4096 rows): allocator peak since pools 12.33 GiB, allocated now 11.48, reserved 16.52, card free 1.59 of 19.58 GiB -> transient headroom used = peak - allocated 0.85 GiB | cache = reserved - allocated 5.04 GiB, of which fragmentation (inactive split) 1.63 GiB, alloc retries 0
 [2026-09-23 01:40:16 PP2] [vram-peak] extend (4096 rows): allocator peak since pools 12.09 GiB, allocated now 11.48, reserved 16.52, card free 1.59 of 19.58 GiB -> transient headroom used = peak - allocated 0.61 GiB | cache = reserved - allocated 5.04 GiB, of which fragmentation (inactive split) 1.63 GiB, alloc retries 0
+[2026-09-23 01:42:58 PP0] Scheduler hit an exception: Traceback (most recent call last):
+[2026-09-23 01:42:59 PP2] Scheduler hit an exception: Traceback (most recent call last):
