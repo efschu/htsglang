@@ -97,11 +97,18 @@ def _mtp_quant_config(quant_config):
     The MTP module often ships unquantized even though the target checkpoint
     is quantized.
     """
-    # The MTP model is unquantized in the nvfp4 / modelopt-mixed checkpoints.
-    if quant_config and quant_config.get_name() in (
-        "modelopt_fp4",
-        "modelopt_mixed",
-    ):
+    # H68 (upstream #39126 hunk): a MIXED_PRECISION export lists mtp.* layers
+    # in quantized_layers exactly when its MTP head IS quantized --
+    # nvidia/Qwen3.8-Flash-Next-NVFP4 ships 128x128 block-FP8 MTP experts
+    # (mtp.layers.0.mlp.experts: FP8_PB_WO / FP8_BLOCK_SCALES). Returning None
+    # there built the head in bf16 over E4M3 weights + weight_scale_inv.
+    if quant_config and quant_config.get_name() == "modelopt_mixed":
+        quantized_layers = getattr(quant_config, "quantized_layers", None) or {}
+        if any(str(name).startswith("mtp.") for name in quantized_layers):
+            return quant_config
+        return None
+    # The MTP model is unquantized in the serialized nvfp4 checkpoints.
+    if quant_config and quant_config.get_name() == "modelopt_fp4":
         return None
     if is_npu() and get_server_args().speculative_draft_model_quantization is None:
         return None

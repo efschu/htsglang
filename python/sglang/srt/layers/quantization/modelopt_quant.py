@@ -662,6 +662,34 @@ class ModelOptFp8KVCacheMethod(BaseKVCacheMethod):
         super().__init__(quant_config)
 
 
+#: H68: ModelOpt's 2-D block-FP8 ``quant_algo`` spellings. ``FP8_PB_WO`` is the
+#: canonical name; early composed Qwen3.8-Flash-Next exports wrote
+#: ``FP8_BLOCK_SCALES`` for the same layout (``weight`` E4M3 +
+#: ``weight_scale_inv`` per 128x128 block). nvidia/Qwen3.8-Flash-Next-NVFP4 @
+#: fc694b54fb carries BOTH: config.json says FP8_PB_WO, hf_quant_config.json
+#: FP8_BLOCK_SCALES, for its MTP experts. Same alias pair as vLLM PR #55513.
+MODELOPT_BLOCK_FP8_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
+
+
+def modelopt_block_fp8_size(quantized_layers: Dict[str, Dict[str, Any]]) -> Optional[int]:
+    """The ONE block edge of every block-FP8 layer, ``None`` when there is none.
+
+    Read from each layer's ``group_size`` (ModelOpt writes 128); a checkpoint
+    that mixes two edges is refused rather than served with one of them."""
+    sizes = {
+        int((info or {}).get("group_size") or 128)
+        for info in (quantized_layers or {}).values()
+        if isinstance(info, dict)
+        and str(info.get("quant_algo", "")).upper() in MODELOPT_BLOCK_FP8_ALGOS
+    }
+    if len(sizes) > 1:
+        raise ValueError(
+            "MIXED_PRECISION requires one block size for all block-FP8 layers, "
+            f"got {sorted(sizes)}."
+        )
+    return next(iter(sizes), None)
+
+
 class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     """Configuration for ModelOpt MIXED_PRECISION checkpoints."""
 
@@ -674,12 +702,16 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         fp8_config: ModelOptFp8Config,
         nvfp4_config: ModelOptFp4Config,
         nvfp4a16_config: ModelOptFp4Config,
+        fp8_block_config: Optional[Fp8Config] = None,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
+        # H68: block-FP8 layers (MODELOPT_BLOCK_FP8_ALGOS); None when the
+        # checkpoint has none, so no fp8 config is built for nothing.
+        self.fp8_block_config = fp8_block_config
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -779,6 +811,20 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             group_size=group_size,
             use_per_token_activation=False,
         )
+        # H68: 2-D block FP8 (the MTP experts of nvidia/Qwen3.8-Flash-Next-NVFP4).
+        # Before this, such a layer resolved to no method at all and loaded its
+        # E4M3 weights + weight_scale_inv into an unquantized bf16 layer.
+        block = modelopt_block_fp8_size(quantized_layers)
+        fp8_block_config = (
+            Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+                weight_block_size=[block, block],
+                packed_modules_mapping=packed_modules_mapping,
+            )
+            if block is not None
+            else None
+        )
 
         return cls(
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -788,6 +834,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             fp8_config=fp8_config,
             nvfp4_config=nvfp4_config,
             nvfp4a16_config=nvfp4a16_config,
+            fp8_block_config=fp8_block_config,
         )
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
@@ -871,6 +918,10 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
+            if quant_algo in MODELOPT_BLOCK_FP8_ALGOS and self.fp8_block_config:
+                from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+                return Fp8LinearMethod(self.fp8_block_config)
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
@@ -885,6 +936,10 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return None
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(self.fp8_config)
+            if quant_algo in MODELOPT_BLOCK_FP8_ALGOS and self.fp8_block_config:
+                from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+                return Fp8MoEMethod(self.fp8_block_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
