@@ -1051,6 +1051,19 @@ class MambaPool:
                     f"verify window {speculative_num_draft_tokens} (adaptive "
                     "ladder included); raise it to the next power of two"
                 )
+            if linear_replayssm_cache_len < 16:
+                # The compact commit contracts over the ring axis with tl.dot,
+                # whose operand dims must be >= 16.
+                raise ValueError(
+                    "--linear-replayssm-cache-len must be >= 16 for the spec "
+                    f"ring's commit kernel, got {linear_replayssm_cache_len}"
+                )
+        # 27B ReplaySSM package (S3): the widest verify window, handed to the
+        # cursor advance as a constant (one compiled variant across the
+        # adaptive draft ladder).
+        self.replayssm_spec_max_window = (
+            speculative_num_draft_tokens if enable_linear_replayssm_spec else None
+        )
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (

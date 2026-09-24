@@ -658,16 +658,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
+        # 27B ReplaySSM package (S3): the verify metadata planned request rows
+        # iff the pool runs the GDN spec ring (see _replayssm_spec_rows).
+        # getattr: metadata doubles predating the field are not ring batches
+        # (the #624 stub-drift class).
+        replayssm_spec_rows = getattr(forward_metadata, "replayssm_spec_rows", None)
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
-            if intermediate_state_cache is None:
-                # 27B ReplaySSM package: the spec ring replaced the
-                # intermediate state; the ring's verify route is S3.
+            if intermediate_state_cache is None and replayssm_spec_rows is None:
                 raise RuntimeError(
-                    "ReplaySSM spec ring allocated "
-                    "(--enable-linear-replayssm-spec) but the GDN target "
-                    "verify route to it is not wired"
+                    "GDN target verify: the pool has neither the per-draft "
+                    "intermediate state nor planned ReplaySSM spec-ring rows "
+                    "(forward_metadata.replayssm_spec_rows is None)"
+                )
+            if replayssm_spec_rows is not None and retrieve_parent_token is not None:
+                raise RuntimeError(
+                    "GDN target verify: the ReplaySSM spec ring replays a "
+                    "linear draft chain only; this batch carries a draft tree "
+                    "(retrieve_parent_token)"
                 )
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
@@ -747,9 +756,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # token strides (Triton), instead of materializing q/k/v copies every
         # layer every verify step. Prefill keeps the fused split (FLA chunk
         # kernels want dense [1, T, H, D]).
-        use_strided_verify_qkv = (
-            is_target_verify
-            and self.kernel_dispatcher.target_verify_supports_strided_qkv(
+        use_strided_verify_qkv = is_target_verify and (
+            # The ring's verify kernel reads q/k/v by token stride with a
+            # dense head axis, like the Triton recurrent one.
+            replayssm_spec_rows is not None
+            or self.kernel_dispatcher.target_verify_supports_strided_qkv(
                 retrieve_parent_token
             )
         )
@@ -777,7 +788,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
             key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
-        if is_target_verify:
+        if is_target_verify and replayssm_spec_rows is not None:
+            core_attn_out = self._replayssm_target_verify(
+                layer=layer,
+                query=query,
+                key=key,
+                value=value,
+                a=a,
+                b=b,
+                layer_cache=mamba_cache_params,
+                cache_indices=cache_indices,
+                replay_indices=replayssm_spec_rows,
+                query_start_loc=query_start_loc,
+                draft_token_num=forward_batch.spec_info.draft_token_num,
+            )
+        elif is_target_verify:
             core_attn_out = self.kernel_dispatcher.target_verify(
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
@@ -825,3 +850,88 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
         return core_attn_out
+
+    def _replayssm_target_verify(
+        self,
+        *,
+        layer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        layer_cache: "MambaPool.SpeculativeState",
+        cache_indices: torch.Tensor,
+        replay_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        draft_token_num: int,
+    ) -> torch.Tensor:
+        """27B ReplaySSM package (S3): the GDN target verify on the spec ring.
+
+        Port of upstream ``GDNAttnBackend._replayssm_target_verify`` (#28695 ..
+        #35544), same kernel call. The verify output is reconstructed from the
+        frozen checkpoint (``temporal``, read-only here) plus the ring history,
+        and this window's compact records (d, k, g; low parts for 16-bit
+        activations) are written at ``replay_indices`` -- request rows, the
+        cursors are request-row pool tensors shared by all GDN layers of the
+        step. Nothing here advances a cursor or touches ``temporal``: the
+        commit (HybridLinearAttnBackend._commit_replayssm_spec_after_verify)
+        folds the accepted prefix once per step for every layer.
+
+        HV / H are this layer's (this rank's) own heads, read off the layer,
+        so the uneven GDN split per rank needs no special case: the ring was
+        allocated from the same rank-local temporal shape.
+
+        ``launch_mode="verify"``: the fold is never done in the verify on this
+        line (fold every commit), so no row is in the flush state here.
+        """
+        from sglang.srt.layers.attention.fla.gdn_replayssm_spec_decode import (
+            gdn_replayssm_spec_decode,
+        )
+
+        mamba_pool = self.req_to_token_pool.mamba_pool
+        H, K = layer.num_k_heads, layer.head_k_dim
+        HV, V = layer.num_v_heads, layer.head_v_dim
+        # q/k/v may be [1, seq, *] (split views) or [seq, *] (fused split);
+        # derive the packed token count from numel so both layouts flatten
+        # without a copy (the split views keep their token stride).
+        seq_len = query.numel() // (H * K)
+        q = query.reshape(seq_len, H, K)
+        k = key.reshape(seq_len, H, K)
+        v = value.reshape(seq_len, HV, V)
+        a = a.reshape(seq_len, HV)
+        b = b.reshape(seq_len, HV)
+        d_cache = layer_cache.replayssm_d  # [request rows, HV, L, V]
+        out = q.new_empty(seq_len, HV, V)
+        gdn_replayssm_spec_decode(
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            checkpoint_state=layer_cache.temporal,
+            d_cache=d_cache,
+            k_cache=layer_cache.replayssm_k,
+            g_cache=layer_cache.replayssm_g,
+            rawv_cache=layer_cache.replayssm_rawv,
+            rawk_cache=layer_cache.replayssm_rawk,
+            beta_cache=None,
+            out=out,
+            query_start_loc=query_start_loc,
+            ssm_state_indices=cache_indices,
+            replay_indices=replay_indices,
+            write_pos=mamba_pool.replayssm_spec_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            max_cache_len=d_cache.shape[-2],
+            max_spec_len=draft_token_num,
+            scale=K**-0.5,
+            use_qk_l2norm_in_kernel=True,
+            # Padded rows carry mamba slot -1 (valid slots start at 0).
+            null_block_id=-1,
+            launch_mode="verify",
+        )
+        # The recurrent route's output shape (== value.shape).
+        return out.reshape(value.shape)

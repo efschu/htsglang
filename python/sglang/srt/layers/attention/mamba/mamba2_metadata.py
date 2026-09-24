@@ -45,6 +45,13 @@ class ForwardMetadata:
     # state. Fires on EXACTLY the rows the radix track snapshots, i.e. the same
     # condition the track uses: seq_lens_cpu % mamba_track_interval == 0.
     replayssm_force_flush: Optional[torch.Tensor] = None
+    # 27B ReplaySSM package (S3): the REQUEST rows (req_pool_indices) of a
+    # target verify whose pool runs the GDN spec ring; None otherwise (also
+    # None for every non-verify forward). The GDN verify writes this step's
+    # ring records at these rows and the commit
+    # (update_mamba_state_after_mtp_verify) folds them from the same tensor --
+    # like mamba_cache_indices, the commit reads the metadata the verify used.
+    replayssm_spec_rows: Optional[torch.Tensor] = None
     # For topk > 1 eagle
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
