@@ -170,16 +170,22 @@ def allocate_step_buffers(device, num_experts: int, width: int = PLAN_WIDTH) -> 
     )
 
 
-def reinit_pool_tables(tables: PoolTables, hot_slot_of: Dict[int, int],
-                       host_row: Sequence[int]) -> None:
-    """Die Tabellen IN PLACE auf den Zustand von ``allocate_pool_tables``
-    zuruecksetzen -- dieselben Adressen, denn die Decode-Graphen haben genau
-    diese Zeiger aufgenommen (Platztausch, Wake).
+@dataclass
+class PoolLayout:
+    """A table layout already on the tables' device: what ``reinit`` writes.
+    fnFL2 H31b keeps one per deferred layer so the later promotion is four
+    device-to-device copies on the forward stream, no host round trip."""
 
-    Nach einem Flip halten die LRU-Zeilen Reste der anderen Gruppe, und lagen
-    die Tabellen unter einem pausierten Tag, sind auch die Residenten-Eintraege
-    Muell. Neu schreiben ist billiger als herauszufinden, welcher Fall vorliegt.
-    """
+    hot_phys: Any
+    host_row: Any
+    row_key: Any
+    row_use: Any
+
+
+def pool_layout_tensors(tables: PoolTables, hot_slot_of: Dict[int, int],
+                        host_row: Sequence[int]) -> PoolLayout:
+    """The layout ``allocate_pool_tables`` would build for these residents, as
+    device tensors next to ``tables`` (validated exactly as there)."""
     import torch
 
     E, rows = tables.num_experts, int(tables.row_key.shape[0])
@@ -197,10 +203,23 @@ def reinit_pool_tables(tables: PoolTables, hot_slot_of: Dict[int, int],
     use[: tables.lru_start] = ROW_USE_NEVER
     use[pool_rows:] = ROW_USE_NEVER
     dev = tables.hot_phys.device
-    tables.hot_phys.copy_(hot.to(dev))
-    tables.host_row.copy_(torch.tensor(list(host_row), dtype=torch.int32).to(dev))
-    tables.row_key.copy_(key.to(dev))
-    tables.row_use.copy_(use.to(dev))
+    return PoolLayout(
+        hot_phys=hot.to(dev),
+        host_row=torch.tensor(list(host_row), dtype=torch.int32).to(dev),
+        row_key=key.to(dev), row_use=use.to(dev))
+
+
+def apply_pool_layout(tables: PoolTables, layout: PoolLayout) -> None:
+    """Write ``layout`` into the tables IN PLACE and reset every counter --
+    device ops only, stream-ordered on the current stream."""
+    import torch
+
+    rows = int(tables.row_key.shape[0])
+    dev = tables.hot_phys.device
+    tables.hot_phys.copy_(layout.hot_phys)
+    tables.host_row.copy_(layout.host_row)
+    tables.row_key.copy_(layout.row_key)
+    tables.row_use.copy_(layout.row_use)
     tables.clock.fill_(0)
     tables.gate.fill_(1)
     tables.error.fill_(0)
@@ -211,10 +230,23 @@ def reinit_pool_tables(tables: PoolTables, hot_slot_of: Dict[int, int],
     tables.protect_recent.fill_(0)
     tables.miss_count.zero_()
     tables.staging_rows.copy_(
-        torch.arange(pool_rows, rows, dtype=torch.int32).to(dev))
+        torch.arange(tables.pool_rows, rows, dtype=torch.int32, device=dev))
     tables.misses_total.fill_(0)
     tables.pf_row.fill_(-1)
     tables.pf_counts.zero_()
+
+
+def reinit_pool_tables(tables: PoolTables, hot_slot_of: Dict[int, int],
+                       host_row: Sequence[int]) -> None:
+    """Die Tabellen IN PLACE auf den Zustand von ``allocate_pool_tables``
+    zuruecksetzen -- dieselben Adressen, denn die Decode-Graphen haben genau
+    diese Zeiger aufgenommen (Platztausch, Wake).
+
+    Nach einem Flip halten die LRU-Zeilen Reste der anderen Gruppe, und lagen
+    die Tabellen unter einem pausierten Tag, sind auch die Residenten-Eintraege
+    Muell. Neu schreiben ist billiger als herauszufinden, welcher Fall vorliegt.
+    """
+    apply_pool_layout(tables, pool_layout_tensors(tables, hot_slot_of, host_row))
 
 
 class SyncReport(msgspec.Struct, frozen=True):

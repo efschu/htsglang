@@ -3205,6 +3205,8 @@ class MoEExpertOffloadCache:
 
     #: fnFL2 H29b: P notes its tail routing (set per instance in __init__)
     _route_note = False
+    #: H31b: the Pad+Extra rows this pool layer has NOT loaded yet (DeferredRows)
+    _deferred_rows = None
 
     #: names of the stacked per-expert tensors to pool/fetch (dim 0 == expert).
     EXPERT_TENSOR_ATTRS = (
@@ -4269,6 +4271,7 @@ class MoEExpertOffloadCache:
         in the pool's eager order (SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR,
         H12: expert-major -- each spill expert fetched once and held by one
         row), then republish those rows to the device tables."""
+        self.land_deferred_rows()  # H31b: run_waves plans with every resident row
         self.begin_eager_pool()
         out = self.run_waves(
             dispatch_output, apply_fn, lookahead=None, order=self._pool_eager_wave_order
@@ -4401,7 +4404,7 @@ class MoEExpertOffloadCache:
         copy_rows(self._pool_srcs, self._pool_dsts, src, dst, count)
         return len(pairs)
 
-    def rearm_after_wake(self, rows_loaded: bool = False) -> int:
+    def rearm_after_wake(self, rows_loaded: bool = False, defer: bool = False) -> int:
         """Nach dem Wake, bevor irgendein Forward laeuft (Platztausch).
 
         Der Resume mappt FRISCHE Seiten; der Austausch hat nur den Praefix
@@ -4415,26 +4418,98 @@ class MoEExpertOffloadCache:
         schon waehrend der Legs geladen (und der Aufrufer hat dessen Strom
         gejoint) -- dann bleibt nur der Rest (LRU, Tabellen).
 
+        ``defer`` (H31b): an einem Pool-Layer (Decode) werden die Extra-Zeilen
+        NICHT vor dem ersten Forward geladen. Die Tabellen fuehren diese
+        Experten bis dahin als kalt (Store-Platz als ``host_row``, ein Miss
+        holt sie wie jeden anderen kalten Experten), der Pad wird sofort
+        genullt, und :class:`DeferredRowsFill` laedt die Zeilen nach dem ersten
+        Decode-Forward und befoerdert den Layer dann auf das volle Layout.
+
         Gibt die Zahl der HIER nachgeladenen Experten-Zeilen zurueck.
         """
         import torch
 
+        deferred_rows_fill().drop(self)
+        self._deferred_rows = None
+        runs = tuple(getattr(self.layer, "_moe_offload_refill_runs", ()) or ())
+        entries = [(attr, buf, self._pinned.get(attr))
+                   for attr, buf in self._resident.items()]
+        lid = getattr(self.layer, "layer_id", "?")
+        extra = tuple(r for r in runs if r[1] >= 0)
+        plan = None
+        if defer and not rows_loaded and self._pool_ready and extra:
+            plan = self._deferred_layout(extra, entries)
         zeilen = 0
-        if not rows_loaded:
-            runs = getattr(self.layer, "_moe_offload_refill_runs", ()) or ()
-            zeilen = load_refill_rows(
-                [(attr, buf, self._pinned.get(attr))
-                 for attr, buf in self._resident.items()],
-                runs, layer_id=getattr(self.layer, "layer_id", "?"))
+        if plan is not None:
+            load_refill_rows(entries, tuple(r for r in runs if r[1] < 0), layer_id=lid)
+        elif not rows_loaded:
+            zeilen = load_refill_rows(entries, runs, layer_id=lid)
         self._scratch_holds.clear()
         if self._pool_ready:
-            from sglang.srt.layers.moe.expert_pool_device import reinit_pool_tables
+            from sglang.srt.layers.moe.expert_pool_device import (
+                apply_pool_layout,
+                pool_layout_tensors,
+                reinit_pool_tables,
+            )
 
             hot_slot_of, host_row = self._pool_layout()
-            reinit_pool_tables(self._pool_tables, hot_slot_of, host_row)
+            if plan is None:
+                reinit_pool_tables(self._pool_tables, hot_slot_of, host_row)
+            else:
+                hot_cold, host_cold = plan
+                full = pool_layout_tensors(self._pool_tables, hot_slot_of, host_row)
+                apply_pool_layout(self._pool_tables,
+                                  pool_layout_tensors(self._pool_tables, hot_cold, host_cold))
+                self._deferred_rows = DeferredRows(
+                    entries=entries, runs=extra, full=full,
+                    rows=sum(n for _z, _p, n in extra) * len(entries), layer_id=lid)
+                deferred_rows_fill().add(self)
             if self._pool_pf_buffers is not None:
                 self._pool_pf_armed = False
         return zeilen
+
+    def _deferred_layout(self, extra, entries):
+        """``(hot_slot_of, host_row)`` mit den Extra-Zeilen als KALT, oder None
+        (dann laedt der Rearm seriell): jede Extra-Zeile muss genau einen
+        residenten Experten tragen, und jedes Attribut braucht seinen Store."""
+        if any(spill is None for _a, _b, spill in entries):
+            return None
+        hot_slot_of, host_row = self._pool_layout()
+        expert_of_row = {r: e for e, r in hot_slot_of.items()}
+        hot = dict(hot_slot_of)
+        host = list(host_row)
+        for z0, p0, n in extra:
+            for i in range(n):
+                e = expert_of_row.get(z0 + i)
+                if e is None or host[e] >= 0:
+                    return None
+                del hot[e]
+                host[e] = p0 + i
+        return hot, host
+
+    def land_deferred_rows(self) -> bool:
+        """H31b, vor jedem EAGER Forward dieses Layers: die Host-Planung
+        (``run_waves``) haelt die Extra-Zeilen fuer resident, also muessen sie
+        auf der Karte sein. Laeuft der Nachlader schon, wartet der laufende
+        Strom auf DIESES Layers Event; sonst kommen die Zeilen hier auf den
+        laufenden Strom. Danach das volle Layout. True = es war etwas offen."""
+        if self._deferred_rows is None:
+            return False
+        deferred_rows_fill().land(self)
+        return True
+
+    def _promote_deferred(self) -> None:
+        """Das volle Layout in die Tabellen (laufender Strom, geraeteintern)."""
+        from sglang.srt.layers.moe.expert_pool_device import apply_pool_layout
+
+        d = self._deferred_rows
+        if d is None:
+            return
+        apply_pool_layout(self._pool_tables, d.full)
+        self._scratch_holds.clear()
+        if self._pool_pf_buffers is not None:
+            self._pool_pf_armed = False
+        self._deferred_rows = None
 
     def prepare_breakable(self, topk_ids, bridge, stage=None):
         """#462 breakable route: the EAGER pre-replay phase, in one call.
@@ -4673,6 +4748,8 @@ class MoEExpertOffloadCache:
         """
         import numpy as np
         import torch
+
+        self.land_deferred_rows()  # H31b: the host plan counts the extras as resident
 
         topk_output = dispatch_output.topk_output
         topk_ids = topk_output.topk_ids
@@ -5743,7 +5820,7 @@ def _rearm_targets(module):
                                for attr, (buf, spill) in presplit.items()]
 
 
-def rearm_expert_offload_after_wake(model, prefetch=None):
+def rearm_expert_offload_after_wake(model, prefetch=None, defer=False, sync=True):
     """``(layer, zeilen)``: jeden Offload-Layer des Modells nach dem Wake
     wieder rechenfaehig machen (Platztausch). Laeuft auf der AUFWACHENDEN Seite,
     nachdem die Tags gemappt und die Austausch-Stuecke gesammelt sind, und
@@ -5759,6 +5836,14 @@ def rearm_expert_offload_after_wake(model, prefetch=None):
     Pad+Extra er schon geladen hat, laden hier nichts mehr (LRU und Tabellen
     macht der Rearm weiter selbst); alle anderen laden wie bisher seriell.
     ``zeilen`` zaehlt nur die HIER geladenen Zeilen.
+
+    ``defer`` (H31b): Pool-Layer laden ihre Extra-Zeilen erst nach dem ersten
+    Decode-Forward (:class:`DeferredRowsFill`); ``sync`` (H31b): am Ende nur
+    den LAUFENDEN Strom abwarten, nie das ganze Geraet -- ein geraeteweites
+    ``synchronize`` wartete auch auf den Draft-Unpark (1,5 GB auf der 5090,
+    x146 TP0 rearm 139 ms bei 232 Zeilen) und auf das KV-Laden der Arena.
+    Die Ordnung zum ersten Forward gibt der Strom (forward_stream wartet
+    schedule_stream); ``sync=False`` laesst auch das Host-Warten weg.
     """
     import torch
 
@@ -5776,15 +5861,217 @@ def rearm_expert_offload_after_wake(model, prefetch=None):
         cache, runs, entries = target
         pre = id(module) in loaded
         if cache is not None:
-            zeilen += cache.rearm_after_wake(rows_loaded=pre)
+            zeilen += cache.rearm_after_wake(rows_loaded=pre, defer=defer)
         elif not pre:
             zeilen += load_refill_rows(entries, runs,
                                        layer_id=getattr(module, "layer_id", "?"))
         layers += 1
-    if layers and torch.cuda.is_available():
-        torch.cuda.synchronize()
+    if sync and layers and torch.cuda.is_available():
+        torch.cuda.current_stream().synchronize()
     _warm_after_wake(model)
     return layers, zeilen
+
+
+@dataclass
+class DeferredRows:
+    """H31b: what one pool layer still owes after a deferred rearm."""
+
+    entries: list  # (attr, buf, spill)
+    runs: tuple  # the extra runs (zeile0, platz0, n), platz0 >= 0
+    full: object  # expert_pool_device.PoolLayout of the full residency
+    rows: int  # rows over all attrs, the unit of rows_from_store
+    layer_id: object = "?"
+
+
+class DeferredRowsFill:
+    """fnFL2 H31b: die Extra-Zeilen des Platztauschs NACH dem ersten Token.
+
+    x147 (H31, Prefetch in den Legs): Mechanik gruen, Flip P->D 4,10 s statt
+    2,57 s. Der Eingang der Worker-Karten ist in den Legs KEIN freier Platz --
+    TP1 (x4, 6,5 GB/s) empfaengt dort ~14 GB Austausch plus das KV der Arena;
+    jede zusaetzliche Kopie verlaengert die Legs (+286 ms leg_collects) und
+    liess das KV-Lesen kurz vor dem Drain unfertig (94208/97792, Settle
+    +0,9 s). Seriell nach den Legs (x146) kosten dieselben Bytes TP1 ~165 ms
+    vor der Fence. Beides liegt VOR dem ersten Token; frei ist der Eingang
+    erst danach.
+
+    Also: der Rearm fuehrt die Extra-Experten eines Pool-Layers als KALT (ein
+    Decode-Miss holt sie aus demselben Store-Platz, rechnet also dieselben
+    Bytes), der erste Decode-Tick startet das Laden auf einem Seitenstrom
+    (ein Event je Layer), jeder spaetere Tick befoerdert die fertigen Layer
+    auf das volle Layout -- auf dem Forward-Strom, zwischen zwei Forwards,
+    ohne Host-Warten. Ein EAGER Forward (Extend) eines noch offenen Layers
+    landet ihn vorher (:meth:`land`), weil ``run_waves`` auf dem Host mit
+    voller Residenz plant. Der Schlaf wartet einen laufenden Nachlader ab
+    (:meth:`settle`), bevor irgendein Tag pausiert.
+    """
+
+    LINE = "WEG2-REARM-DEFER"
+
+    def __init__(self, *, stream_ops="cuda", clock=None):
+        import time
+
+        self._ops_arg = stream_ops
+        self._clock = clock or time.perf_counter
+        self.reset()
+
+    def reset(self) -> None:
+        self.pending: List["MoEExpertOffloadCache"] = []
+        self.events: Dict[int, object] = {}
+        self.stream = None
+        self.started = False
+        self.t_rearm = None
+        self.t_start = None
+        self.rows_total = 0
+        self.rows_landed = 0
+        self.by_tick = 0
+        self.by_eager = 0
+        self.ticks = 0
+
+    def _ops(self):
+        if self._ops_arg == "cuda":
+            self._ops_arg = _default_stream_ops()
+        return self._ops_arg
+
+    # -- rearm side ---------------------------------------------------------
+    def add(self, cache) -> None:
+        if not self.pending:
+            self.t_rearm = self._clock()
+        self.pending.append(cache)
+        self.rows_total += int(cache._deferred_rows.rows)
+
+    def drop(self, cache) -> None:
+        if cache in self.pending:
+            self.pending.remove(cache)
+            self.events.pop(id(cache), None)
+
+    def rows_pending(self) -> int:
+        return sum(int(c._deferred_rows.rows) for c in self.pending
+                   if c._deferred_rows is not None)
+
+    # -- forward side -------------------------------------------------------
+    def start(self) -> None:
+        """Alle offenen Layer auf den Seitenstrom, ein Event je Layer."""
+        if self.started or not self.pending:
+            return
+        ops = self._ops()
+        self.started = True
+        self.t_start = self._clock()
+        if ops is not None and self.stream is None:
+            self.stream = ops.new_stream()
+        self._issue(list(self.pending))
+        logger.info("%s fill-start layers=%d rows=%d since_rearm_ms=%.0f (the extra rows "
+                    "load now, behind the first forward, on a side stream)", self.LINE,
+                    len(self.pending), self.rows_pending(),
+                    (self.t_start - (self.t_rearm or self.t_start)) * 1000)
+
+    def _issue(self, caches) -> None:
+        """Die Zeilen dieser Layer auf den Seitenstrom, ein Event je Layer
+        (ohne Strom-Handgriffe -- CPU -- synchron auf dem laufenden Strom)."""
+        import contextlib
+
+        ops = self._ops()
+        ctx = ops.stream_ctx(self.stream) if ops is not None else contextlib.nullcontext()
+        with ctx:
+            if ops is not None:
+                # hinter alles, was der Forward-Strom schon eingereiht hat
+                # (Rearm, Pad, kalte Tabellen)
+                ops.after_current(self.stream)
+            for cache in caches:
+                d = cache._deferred_rows
+                load_refill_rows(d.entries, d.runs, layer_id=d.layer_id)
+                self.events[id(cache)] = ops.record(self.stream) if ops is not None else None
+
+    def _promote(self, cache, how: str) -> None:
+        ops = self._ops()
+        ev = self.events.pop(id(cache), None)
+        if ev is not None and ops is not None:
+            ops.current_waits(ev)
+        rows = int(cache._deferred_rows.rows)
+        cache._promote_deferred()
+        self.pending.remove(cache)
+        self.rows_landed += rows
+        if how == "tick":
+            self.by_tick += 1
+        else:
+            self.by_eager += 1
+        if not self.pending:
+            now = self._clock()
+            logger.info(
+                "%s landed layers=%d rows=%d by_tick=%d by_eager=%d ticks=%d "
+                "fill_ms=%s since_rearm_ms=%.0f (every pool layer is on its full layout "
+                "again)", self.LINE, self.by_tick + self.by_eager, self.rows_landed,
+                self.by_tick, self.by_eager, self.ticks,
+                "n/a" if self.t_start is None else "%.0f" % ((now - self.t_start) * 1000),
+                (now - (self.t_rearm or now)) * 1000)
+            self.reset()
+
+    def land(self, cache) -> None:
+        """Vor einem EAGER Forward dieses Layers (laufender Strom = Forward-Strom)."""
+        if cache not in self.pending:
+            cache._deferred_rows = None
+            return
+        if id(cache) not in self.events:
+            d = cache._deferred_rows
+            # noch nicht auf dem Seitenstrom: dieser Layer allein, hier
+            load_refill_rows(d.entries, d.runs, layer_id=d.layer_id)
+        self._promote(cache, "eager")
+
+    def tick(self, is_decode: bool) -> None:
+        """Vor jedem Forward, auf dem Strom des Forwards."""
+        if not self.pending:
+            return
+        self.ticks += 1
+        if not self.started:
+            if is_decode:
+                self.start()
+            return
+        late = [c for c in self.pending if id(c) not in self.events]
+        if late:
+            self._issue(late)  # nach dem Start dazugekommen: hinten anstellen
+        for cache in list(self.pending):
+            ev = self.events.get(id(cache))
+            if ev is not None and not bool(ev.query()):
+                break  # ein Strom: dahinter ist auch noch nichts fertig
+            self._promote(cache, "tick")
+
+    def settle(self) -> None:
+        """Vor dem Schlaf: einen laufenden Nachlader abwarten (die Puffer
+        werden gleich pausiert), dann alles vergessen -- der naechste Wake
+        schreibt die Tabellen ohnehin neu."""
+        for cache in self.pending:
+            ev = self.events.get(id(cache))
+            if ev is not None:
+                ev.synchronize()
+            cache._deferred_rows = None
+        if self.pending:
+            logger.info("%s settled-at-sleep layers=%d started=%s (not promoted; the next "
+                        "wake rewrites the tables)", self.LINE, len(self.pending),
+                        "yes" if self.started else "no")
+        self.reset()
+
+
+_DEFERRED_ROWS_FILL: Optional[DeferredRowsFill] = None
+
+
+def deferred_rows_fill() -> DeferredRowsFill:
+    global _DEFERRED_ROWS_FILL
+    if _DEFERRED_ROWS_FILL is None:
+        _DEFERRED_ROWS_FILL = DeferredRowsFill()
+    return _DEFERRED_ROWS_FILL
+
+
+def deferred_rows_tick(batch) -> None:
+    """Der Scheduler-Haken vor jedem Forward (H31b); ohne offene Zeilen ein
+    Attributzugriff."""
+    fill = _DEFERRED_ROWS_FILL
+    if fill is None or not fill.pending:
+        return
+    try:
+        is_decode = bool(batch.forward_mode.is_decode())
+    except Exception:  # noqa: BLE001 -- unknown batch shape: no start, promotion still runs
+        is_decode = False
+    fill.tick(is_decode)
 
 
 def _buffer_mapped(buf) -> bool:

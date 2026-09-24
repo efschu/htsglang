@@ -172,7 +172,11 @@ class TestWiring(unittest.TestCase):
     def test_unpark_behind_the_legs_and_joined_at_the_admission(self):
         s = self.res.index("self._weg2_unpark_draft_start(")
         self.assertLess(self.res.index('_weg2_ph("leg_collects")'), s)
-        self.assertLess(s, self.res.index("rearm_expert_offload_after_wake"))
+        # H31b: the TARGET is rearmed before the unpark (its closing sync must
+        # not wait for the 1.5 GB copy), the DRAFT's own tensors behind it
+        self.assertLess(self.res.index("for _m in _early:"), s)
+        self.assertLess(s, self.res.index("_scratch += self._weg2_zero_local_scratch(_late)"))
+        self.assertLess(s, self.res.index("for _m in _late:"))
         # joined at the last instant before a request can reach the verifier:
         # inside the admission block, BEFORE the DORMANT flag drops
         j = self.res.index('self._weg2_unpark_draft_join(_weg2_ph_l, where="admit")')

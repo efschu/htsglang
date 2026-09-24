@@ -190,9 +190,15 @@ class TheWakeRearmsEveryModelOfTheRank(unittest.TestCase):
         src = inspect.getsource(wu)
         i = src.index("_wake_models = self._weg2_wake_models()")
         blk = src[i:i + 3000]
-        self.assertIn("for _m in _wake_models:\n                    _scratch.extend(zero_local_scratch(_m))", blk)
-        # H31: the rearm takes the joined prefetch; still one call per wake model
-        self.assertIn("for _m in _wake_models:\n                _l, _z = rearm_expert_offload_after_wake(_m, prefetch=_rearm_pf)", blk)
+        # H31b: the wake models split into the target part (before the draft
+        # unpark) and the draft part (behind it) -- together still EVERY wake
+        # model, each zeroed and rearmed exactly once
+        self.assertIn("_early = [_m for _m in _wake_models if _m is not _draft_m]", blk)
+        self.assertIn("_late = [_m for _m in _wake_models if _m is _draft_m]", blk)
+        self.assertIn("_scratch = self._weg2_zero_local_scratch(_early)", blk)
+        self.assertIn("_scratch += self._weg2_zero_local_scratch(_late)", blk)
+        self.assertIn("for _m in _early:\n                _l, _z = rearm_expert_offload_after_wake(", blk)
+        self.assertIn("for _m in _late:\n                _l, _z = rearm_expert_offload_after_wake(", blk)
         self.assertNotIn("_m = self._weg2_model_for_group(self._weg2_group_name())", blk)
 
 

@@ -186,7 +186,7 @@ def test_wake_source_issues_behind_resume_and_joins_before_the_rearm():
         "self._weg2_wake_collect_one, tag)))",
         '_weg2_ph("leg_collects")',
         "_pf_join = _rearm_pf.join(_weg2_ph_l)",
-        "rearm_expert_offload_after_wake(_m, prefetch=_rearm_pf)",
+        "_m, prefetch=_rearm_pf, defer=_defer, sync=True)",
         "WEG2-RESUME expert-rearm layers=%d rows_from_store=%d",
     ]
     pos = [src.find(mk) for mk in marks]

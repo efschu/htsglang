@@ -16110,6 +16110,8 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
+            if not self.enable_overlap:
+                self._weg2_rearm_defer_tick(batch)  # H31b: on the forward's own stream
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
@@ -16119,6 +16121,8 @@ class Scheduler(
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    # H31b: behind the previous forward, before this one
+                    self._weg2_rearm_defer_tick(batch)
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring
@@ -18515,6 +18519,14 @@ class Scheduler(
             abort_all=bool(getattr(recv_req, "abort_all", False)),
         )
         self._abort_request_now(recv_req)
+
+    def _weg2_rearm_defer_tick(self, batch) -> None:
+        """H31b: start / promote the deferred Platztausch extra rows
+        (expert_offload.DeferredRowsFill). Called on the stream the forward
+        runs on, before it; one attribute read while nothing is pending."""
+        from sglang.srt.layers.moe.expert_offload import deferred_rows_tick
+
+        deferred_rows_tick(batch)
 
     def _weg2_post_wake_pass_log(self, batch) -> None:
         """Wake-Parallel item 2 (user 18.09.): the first 8 passes after DORMANT

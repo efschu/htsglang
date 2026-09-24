@@ -1938,6 +1938,44 @@ class SchedulerWeightUpdaterManager:
         if line:
             logger.info("%s", line)
 
+    def _weg2_rearm_defer_armed(self) -> bool:
+        """H31b: defer the extra rows past the first token? Only on the
+        DECODE group (its MoE layers run the device pool; P's prefill plans
+        on the host with full residency and would land every layer at once)."""
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_REARM_DEFER.get()) and self._weg2_group_name() == "D"
+
+    def _weg2_rearm_defer_settle(self) -> None:
+        """H31b: before the first pause of a sleep -- wait for a running
+        deferred fill and forget what is pending (the next wake rewrites the
+        tables). Only a module lookup when nothing is pending."""
+        from sglang.srt.layers.moe.expert_offload import deferred_rows_fill
+
+        deferred_rows_fill().settle()
+
+    def _weg2_zero_local_scratch(self, models) -> list:
+        """fnFL2 v43: zero the runtime-built parameters (Marlin workspaces)
+        of these models; the names zeroed. A failure is NAMED, never raised
+        and never swallowed silently."""
+        out: list = []
+        if not models:
+            return out
+        try:
+            from sglang.srt.weg2.weight_exchange import zero_local_scratch
+
+            for _m in models:
+                out.extend(zero_local_scratch(_m))
+        except Exception as _sexc:  # noqa: BLE001
+            # a failure here means the first forward after this wake runs
+            # on the peer's semaphores
+            logger.error(
+                "WEG2-RESUME local-scratch zeroing FAILED (%s) -- the "
+                "first forward after this wake reads the peer's residue "
+                "in every Marlin workspace", _sexc,
+            )
+        return out
+
     def _weg2_rearm_prefetch_begin(self, phases):
         """H31: plan the Platztausch pad+extra rows of every wake model by the
         tag their buffer lives under, so each tag's rows can be issued right
@@ -8336,6 +8374,9 @@ class SchedulerWeightUpdaterManager:
             _weg2_ph("census_credit")
             # H25 (C): the draft goes to host RAM FIRST, while every page is
             # still mapped, and its VRAM is credited before the family's.
+            # H31b: a deferred extra-row fill still running writes into pages
+            # this sleep is about to pause (and the park reads); idempotent
+            self._weg2_rearm_defer_settle()
             if not family_paused_before:
                 self._weg2_park_draft_at_sleep(credit)
                 _weg2_ph("draft_park")
@@ -9396,9 +9437,6 @@ class SchedulerWeightUpdaterManager:
                 logger.info("WEG2-SEQ lane-release skipped: %r", _rel_exc)
             weg2_leg_ms = (time.perf_counter() - t_w0) * 1000
             _weg2_ph("leg_collects")
-            # H25 (C): the parked draft comes back BEHIND the legs, on a side
-            # stream, and overlaps everything below up to the fence.
-            self._weg2_unpark_draft_start(credit, credit_epoch, weights_tags, _weg2_ph_l)
             # fnFL2 v43: THE WEIGHTS-SIDE MIRROR of the graph tag's
             # `_weg2_zero_graph_scratch` above, and for the identical reason.
             # `marlin_make_workspace` registers a semaphore array as a
@@ -9419,26 +9457,14 @@ class SchedulerWeightUpdaterManager:
             # forward on P's expert rows and stale pool tables, TP2 died of an
             # illegal memory access two seconds after layer 47.
             _wake_models = self._weg2_wake_models()
-            try:
-                from sglang.srt.weg2.weight_exchange import zero_local_scratch
-                _scratch = []
-                for _m in _wake_models:
-                    _scratch.extend(zero_local_scratch(_m))
-                if _scratch:
-                    logger.info(
-                        "WEG2-RESUME local-scratch zeroed=%d first=%s "
-                        "(runtime-built parameters the exchange has no source "
-                        "for; see weight_exchange.LOCAL_SCRATCH_REASON)",
-                        len(_scratch), _scratch[0],
-                    )
-            except Exception as _sexc:  # noqa: BLE001
-                # NAMED, never swallowed: a failure here means the first
-                # forward after this wake runs on the peer's semaphores.
-                logger.error(
-                    "WEG2-RESUME local-scratch zeroing FAILED (%s) -- the "
-                    "first forward after this wake reads the peer's residue "
-                    "in every Marlin workspace", _sexc,
-                )
+            # H31b: the TARGET is zeroed and rearmed BEFORE the draft unpark,
+            # the draft behind it. The unpark makes the current stream wait for
+            # its 1.5 GB H2D (5090); rearmed behind it, the target's closing
+            # sync waited for that copy too (x146 TP0 rearm 139 ms for 232
+            # rows, the longest pre-fence tail once the extras are deferred).
+            _draft_m = self._weg2_model_for_group("D")
+            _early = [_m for _m in _wake_models if _m is not _draft_m]
+            _late = [_m for _m in _wake_models if _m is _draft_m]
             # PLATZTAUSCH (Nutzer-Entscheid 22.09.): der Austausch hat nur den
             # Experten-PRAEFIX gefuellt. Pad nullen, Extra-Zeilen aus ihren
             # festen Store-Plaetzen laden, LRU und Pool-Tabellen verwerfen --
@@ -9447,28 +9473,54 @@ class SchedulerWeightUpdaterManager:
             # rechnet falsch und sagt es nicht.
             from sglang.srt.layers.moe.expert_offload import (
                 REARM_PREFETCH_OFF_FIELDS,
+                deferred_rows_fill,
                 rearm_expert_offload_after_wake,
             )
 
+            _defer = self._weg2_rearm_defer_armed()
             _t_rearm = time.perf_counter()
             # H31: join the side stream first -- only the rest is paid here.
             _pf_join = _rearm_pf.join(_weg2_ph_l) if _rearm_pf is not None else None
+            _scratch = self._weg2_zero_local_scratch(_early)
             _rl = _rz = 0
-            for _m in _wake_models:
-                _l, _z = rearm_expert_offload_after_wake(_m, prefetch=_rearm_pf)
+            for _m in _early:
+                _l, _z = rearm_expert_offload_after_wake(
+                    _m, prefetch=_rearm_pf, defer=_defer, sync=True)
                 _rl += int(_l)
                 _rz += int(_z)
+            _early_ms = (time.perf_counter() - _t_rearm) * 1000
+            # H25 (C): the parked draft comes back BEHIND the legs, on a side
+            # stream, and overlaps everything below up to the fence.
+            self._weg2_unpark_draft_start(credit, credit_epoch, weights_tags, _weg2_ph_l)
+            # the draft's own tensors: stream-ordered behind the unpark, no
+            # host wait (the admission joins the unpark; forward_stream waits
+            # this stream before the first forward)
+            _scratch += self._weg2_zero_local_scratch(_late)
+            for _m in _late:
+                _l, _z = rearm_expert_offload_after_wake(
+                    _m, prefetch=_rearm_pf, defer=_defer, sync=False)
+                _rl += int(_l)
+                _rz += int(_z)
+            if _scratch:
+                logger.info(
+                    "WEG2-RESUME local-scratch zeroed=%d first=%s "
+                    "(runtime-built parameters the exchange has no source "
+                    "for; see weight_exchange.LOCAL_SCRATCH_REASON)",
+                    len(_scratch), _scratch[0],
+                )
             if _rl:
                 _pf_rows = _pf_join.rows if _pf_join is not None else 0
+                _deferred = deferred_rows_fill().rows_pending()
                 logger.info(
                     "WEG2-RESUME expert-rearm layers=%d rows_from_store=%d "
-                    "serial=%d %s ms=%.0f models=%d (Platztausch: Praefix kam ueber den "
-                    "Austausch, Pad+Extra aus dem Store, LRU verworfen; H31: prefetched "
-                    "= waehrend der Legs auf dem Seitenstrom, wait_ms = was der Wake "
-                    "davon noch selbst zahlt)",
-                    _rl, _rz + _pf_rows, _rz,
+                    "serial=%d deferred=%d %s ms=%.0f target_ms=%.0f models=%d "
+                    "(Platztausch: Praefix kam ueber den Austausch, Pad+Extra aus dem "
+                    "Store, LRU verworfen; H31: prefetched = waehrend der Legs auf dem "
+                    "Seitenstrom; H31b: deferred = erst nach dem ersten Decode-Forward, "
+                    "bis dahin kalt in den Tabellen)",
+                    _rl, _rz + _pf_rows + _deferred, _rz, _deferred,
                     _pf_join.fields() if _pf_join is not None else REARM_PREFETCH_OFF_FIELDS,
-                    (time.perf_counter() - _t_rearm) * 1000, len(_wake_models),
+                    (time.perf_counter() - _t_rearm) * 1000, _early_ms, len(_wake_models),
                 )
             else:
                 logger.warning(

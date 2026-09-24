@@ -485,7 +485,18 @@ class Envs:
     # (WEG2-RESUME expert-rearm ... prefetched=N rows wait_ms=... overlap=...).
     # Same bytes from the same pinned store into the same buffers: no new host
     # RAM, no VRAM reserve. 0 = the serial rearm of the 2026-09-24 form.
-    SGLANG_WEG2_REARM_PREFETCH = EnvBool(True)
+    # DEFAULT OFF since x147 (H31b): the worker cards' input link is the pacer
+    # of the legs (TP1 x4), the copies made them 286 ms longer and left the
+    # arena's KV read short at the drain (+0.9 s to the first token).
+    SGLANG_WEG2_REARM_PREFETCH = EnvBool(False)
+    # REARM_DEFER (H31b): on the waking DECODE group the extra rows of every
+    # POOL layer are not loaded before the first token at all. The rearm puts
+    # those experts into the tables as cold (a decode miss fetches them from
+    # the same store slot), the first decode forward starts the load on a side
+    # stream, later forwards promote the finished layers to the full layout;
+    # an eager forward (extend) lands its layer first (WEG2-REARM-DEFER
+    # fill-start / landed, expert-rearm ... deferred=N). 0 = serial as before.
+    SGLANG_WEG2_REARM_DEFER = EnvBool(True)
     # VRAM_PEAK (H55): one WEG2-VRAM-PEAK line per P chunk, per D round window
     # (VRAM_PEAK_ROUNDS decode/verify forwards or 5 s) and per flip leg: the
     # allocator peak of that window (memory_stats + reset_peak_memory_stats,
