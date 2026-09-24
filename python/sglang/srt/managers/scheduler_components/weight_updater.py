@@ -695,6 +695,9 @@ class SchedulerWeightUpdaterManager:
     #: weg2xsn271: WEG2-CREDIT-FLOOR logged once per rank.
     _weg2_floor_noted: bool = False
     _weg2_sleep_count: int = 0
+    #: H15: the local-memory park of the last complete sleep (weg2/sleep_lmem.py
+    #: LmemPark), None once the wake restored it. slots=True: declared here.
+    _weg2_lmem_park: Any = None
     _weg2_kv_deferred: bool = False       # Wake-Parallel: kv resume deferred to the weights call
     _weg2_kv_epoch_done: object = None    # Wake-Parallel: flip epoch whose kv resume is done
     _weg2_kv_resumed_epoch: object = None  # Wake-Parallel: flip epoch whose kv_cache tms resume (the RESUME half) already ran
@@ -1652,7 +1655,8 @@ class SchedulerWeightUpdaterManager:
                 "WEG2-SLEEP-RESIDUE sleep=%d untagged_live=%d MiB tagged=%d MiB torch_active=%d MiB "
                 "torch_reserved=%d MiB nvml_proc_used=%s MiB outside_torch=%s MiB snapshot=%s "
                 "(untagged_live = torch active minus every tag's bytes: what no pause covers; "
-                "outside_torch = NVML per-process minus untagged_live: context + comm windows)",
+                "outside_torch = NVML per-process minus untagged_live: context + comm windows) "
+                + self._weg2_residue_posts().replace("%", "%%"),
                 n, terms["untagged_live"] >> 20, terms["tagged_bytes"] >> 20, active >> 20,
                 reserved >> 20,
                 "n/a" if getattr(census, "proc_used_bytes", None) is None
@@ -1663,6 +1667,77 @@ class SchedulerWeightUpdaterManager:
         except Exception as exc:  # noqa: BLE001 -- an instrument never kills the sleep
             logger.info("WEG2-SLEEP-RESIDUE instrument raised (%s: %s)", type(exc).__name__, str(exc)[:160])
         self._weg2_trim_host_heap_at_sleep()
+
+    @staticmethod
+    def _weg2_sm_threads() -> int:
+        """SMs x max resident threads per SM: the driver's local-memory multiplier."""
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return int(props.multi_processor_count) * int(props.max_threads_per_multi_processor)
+
+    def _weg2_park_lmem_at_sleep(self) -> None:
+        """H15: lower the stack limit of this sleeping context (weg2/sleep_lmem.py).
+        An unrestored park is kept as is: parking again would save the PARKED
+        limit as the one to restore. Never raises."""
+        from sglang.srt.environ import envs  # noqa: PLC0415
+
+        if not envs.SGLANG_WEG2_SLEEP_RELEASE_LMEM.get() or self._weg2_lmem_park is not None:
+            return
+        try:
+            from sglang.srt.weg2.sleep_lmem import CudaDriverStackLimit, park_lmem  # noqa: PLC0415
+
+            park = park_lmem(
+                driver=CudaDriverStackLimit(),
+                threads=self._weg2_sm_threads(),
+                nvml_bytes=self._weg2_nvml_self_bytes,
+            )
+        except Exception as exc:  # noqa: BLE001 -- an unparked context is the old state
+            logger.info("WEG2-SLEEP-LMEM n/a (%s: %s)", type(exc).__name__, str(exc)[:160])
+            return
+        self._weg2_lmem_park = park
+        logger.info("WEG2-SLEEP-LMEM %s", park.format_post())
+
+    def _weg2_restore_lmem_at_wake(self) -> None:
+        """H15: put the limit saved at the park back. Never raises."""
+        park = self._weg2_lmem_park
+        if park is None:
+            return
+        self._weg2_lmem_park = None
+        if park.refused:
+            return
+        try:
+            from sglang.srt.weg2.sleep_lmem import CudaDriverStackLimit, restore_lmem  # noqa: PLC0415
+
+            rec = restore_lmem(
+                driver=CudaDriverStackLimit(), park=park, nvml_bytes=self._weg2_nvml_self_bytes
+            )
+        except Exception as exc:  # noqa: BLE001 -- the driver grows it on demand
+            logger.warning("WEG2-WAKE-LMEM n/a (%s: %s)", type(exc).__name__, str(exc)[:160])
+            return
+        (logger.warning if rec.refused else logger.info)("%s", rec.format_line(park=park))
+
+    def _weg2_residue_posts(self) -> str:
+        """H15: the per-post split of the sleep residue that is readable in-process.
+        Never raises: a failed read prints n/a, the residue line stays."""
+        try:
+            from sglang.srt.distributed.device_communicators.barlink_matrix_transport import (  # noqa: PLC0415
+                ledger_balance,
+            )
+            from sglang.srt.weg2.bar1_lanes import Bar1Lanes  # noqa: PLC0415
+            from sglang.srt.weg2.sleep_lmem import format_residue_posts  # noqa: PLC0415
+
+            lanes = self._weg2_bar1
+            lane_windows = []
+            if isinstance(lanes, Bar1Lanes):
+                lane_windows = [
+                    (k, int(w.size)) for k, w in sorted(lanes.recv.items()) if not w.borrowed
+                ]
+            return format_residue_posts(
+                park=self._weg2_lmem_park,
+                group_windows=ledger_balance(torch.cuda.current_device()),
+                lane_windows=lane_windows,
+            )
+        except Exception as exc:  # noqa: BLE001 -- an instrument never kills the sleep
+            return f"posts=n/a({type(exc).__name__}: {str(exc)[:80]})"
 
     def _weg2_trim_host_heap_at_sleep(self) -> None:
         """weg2xsn297 (Nutzer-Order 18.09.: Scheduler-Heap -- bauen, verdrahten,
@@ -8216,6 +8291,10 @@ class SchedulerWeightUpdaterManager:
             torch.get_device_module().empty_cache()
             cache_after = self._weg2_allocator_cache_bytes()
             self._weg2_log_allocator_cache_released(cache_before, cache_after)
+            # H15: the context's local-memory reservation, which no tag and no
+            # empty_cache() reaches -- parked BEFORE the census below, so the
+            # WEG2-SLEEP-RESIDUE line reads the card after it.
+            self._weg2_park_lmem_at_sleep()
             self._weg2_log_sleep_acceptance(
                 weg2_before_census, sorted(self.offload_tags)
             )
@@ -8319,6 +8398,9 @@ class SchedulerWeightUpdaterManager:
             # co-resident group's prefill, on the same card -- was never in
             # any log. Emitted before the fit check so that a refused wake is
             # explained by the line above it, not only named by the line below.
+            # H15: the local-memory reservation goes back FIRST, so the census
+            # and the fit check below read the card with it in place.
+            self._weg2_restore_lmem_at_wake()
             self._weg2_log_dc_breakdown("wake-pre-kv epoch=%s" % (_kv_epoch,))
 
             _kv_need = None

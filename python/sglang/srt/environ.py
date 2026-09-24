@@ -455,6 +455,12 @@ class Envs:
     # planner refuses (W126) a form no order can fund. 0 = the round-robin as
     # before, and the planner then refuses every form whose given order cycles.
     SGLANG_WEG2_FLIP_ORDER_CREDIT = EnvBool(True)
+    # SLEEP_RELEASE_LMEM (H15, fnFL2x120): a complete sleep lowers the context's
+    # per-thread stack limit (cuCtxSetLimit), which frees the driver's
+    # local-memory reservation (derived 255 MiB per process on the 5090,
+    # 102 MiB on a 3080); the wake puts the saved limit back before its
+    # kv_cache fit check (weg2/sleep_lmem.py). 0 = the context keeps it.
+    SGLANG_WEG2_SLEEP_RELEASE_LMEM = EnvBool(True)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
