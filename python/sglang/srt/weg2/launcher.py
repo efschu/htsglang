@@ -5374,11 +5374,16 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # operator's own shell can never arm a coupling nobody asked for.
     if group:
         env["SGLANG_WEG2_GROUP"] = group
+    else:
+        env.pop("SGLANG_WEG2_GROUP", None)
+    # 24.09. (weg2xsn412, first 27B boot on the NF line): this block used to
+    # sit BETWEEN the `if group:` above and its `else:`, so the pop answered
+    # "no expert map" instead of "no group" -- every boot without a map (the
+    # whole 27B profile) lost SGLANG_WEG2_GROUP and the exchange plan provider
+    # refused at the first release (W68 -> W84 -> W29 on all three P ranks).
     if expert_map_path:
         # BEIDE Gruppen, derselbe Pfad -- das ist der ganze Punkt der Karte.
         env["SGLANG_MOE_EXPERT_MAP"] = expert_map_path
-    else:
-        env.pop("SGLANG_WEG2_GROUP", None)
     # C18: the shared host granule ring (spec C1-C8).  These four variables are
     # LAUNCHER OUTPUT, never operator input (R19): every size in them is solved
     # by ring_table from the previous boot's own lines, and the whole family is
