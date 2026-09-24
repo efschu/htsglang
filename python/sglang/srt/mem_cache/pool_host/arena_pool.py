@@ -1209,23 +1209,35 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                         kv.view(torch.uint8).reshape(kv.shape[0], -1)[didx].reshape(b, block))
                     stage[:, run + l * block:run + (l + 1) * block].copy_(
                         vv.view(torch.uint8).reshape(vv.shape[0], -1)[didx].reshape(b, block))
-                dst_ptrs, src_ptrs, src_stride = _aw.run_pointers(
+                dst_ptrs, src_ptrs, _src_stride = _aw.run_pointers(
                     self._data_base, k_off, v_off, run, stage.data_ptr())
+                # fnFL2 H47: the run goes in RUN_ELEMENT_BYTES items, never as
+                # one element -- a 229376-B element is a 7 KiB per-thread
+                # LocalStorage, and the driver grew PP0's LMEM by 1458 MiB for
+                # it (x151 stack 1248 -> 7104 B; x149 died of it in chunk 1).
+                _E = _aw.RUN_ELEMENT_BYTES
+                _n = _aw.run_split_elements(run, self._page_bytes, _E)
+                if _n is None:
+                    raise ValueError(
+                        f"run {run} B / page {self._page_bytes} B not a whole number of "
+                        f"{_E}-B elements (H47: the whole-run element would grow the card's LMEM)")
+                idx_dst, idx_src = _aw.run_split_indices(slots, _n, self._page_bytes, _E)
                 _nb = lambda t: t.pin_memory().to(dev, non_blocking=True)   # noqa: E731 -- no stream sync
                 jit_transfer_hicache_all_layer_mla(
                     ptr_dst=_nb(torch.tensor(dst_ptrs, dtype=torch.uint64)),
-                    indices_dst=_nb(slots.to(dtype=torch.int64)),
+                    indices_dst=_nb(idx_dst),
                     ptr_src=_nb(torch.tensor(src_ptrs, dtype=torch.uint64)),
-                    indices_src=torch.arange(b, device=dev, dtype=torch.int64),
-                    cache_src_stride_bytes=src_stride,
-                    cache_dst_stride_bytes=self._page_bytes,
-                    element_size=run,
+                    indices_src=_nb(idx_src),
+                    cache_src_stride_bytes=_E,
+                    cache_dst_stride_bytes=_E,
+                    element_size=_E,
                     block_quota=_quota,
                 )
                 self._write_stage_keep = stage   # alive until the write stream is done with it
                 if _n_log <= 8 or _n_log % 256 == 0:
-                    logger.info("WEG2-ARENA-WRITE n=%d pages=%d bytes=%d mode=run runs=2x%dB quota=%s",
-                                _n_log, b, b * 2 * run, run, _quota)
+                    logger.info("WEG2-ARENA-WRITE n=%d pages=%d bytes=%d mode=run runs=2x%dB "
+                                "elem=%dB items=%d quota=%s",
+                                _n_log, b, b * 2 * run, run, _E, b * _n, _quota)
                 return
             except Exception as exc:  # noqa: BLE001 -- one named fallback, then the cell kernel
                 logger.warning("WEG2-ARENA-WRITE run mode failed (%s: %s); cell mode from now on",

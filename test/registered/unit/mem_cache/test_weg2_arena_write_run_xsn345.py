@@ -62,3 +62,74 @@ def test_mamba_pieces_split_into_cached_1k_elements():
     assert rest == [(1000, 200, 600, 4096)]
     g = aw.group_pieces(kern)
     assert list(g.keys()) == [(1024, 4096)] and g[(1024, 4096)][0] == [100, 1124, 2148]
+
+
+# --- fnFL2 H47: the run is written in 1-KiB items, never as one element ------
+
+def _emulate_all_layer_mla(mem, ptr_dst, idx_dst, ptr_src, idx_src, src_stride, dst_stride, element):
+    """hicache.cuh hicache_transfer_all_layer<kIsMLA=true> on a flat byte
+    buffer: for every item i and pseudo-layer l, copy `element` bytes from
+    ptr_src[l] + idx_src[i] * src_stride to ptr_dst[l] + idx_dst[i] * dst_stride."""
+    for i in range(len(idx_src)):
+        for l in range(len(ptr_src)):
+            s = int(ptr_src[l]) + int(idx_src[i]) * src_stride
+            d = int(ptr_dst[l]) + int(idx_dst[i]) * dst_stride
+            mem[d:d + element] = mem[s:s + element]
+
+
+def test_split_run_writes_the_same_bytes_as_the_whole_run():
+    import numpy as np
+
+    E = 1024
+    L, block = 3, 2048                 # 3 layers x 2 KiB block -> run 6 KiB
+    run = L * block
+    page = 4 * run                     # arena page (multiple of E)
+    k_off, v_off = 1024, 1024 + 2 * run
+    n_slots, b = 6, 3
+    slots = [4, 0, 2]
+    stage_base = 0
+    data_base = b * 2 * run + 4096     # arena region after the stage
+    size = data_base + n_slots * page
+    rng = np.random.default_rng(47)
+    stage = rng.integers(0, 256, size=b * 2 * run, dtype=np.uint8)
+
+    whole = np.zeros(size, dtype=np.uint8)
+    whole[:stage.size] = stage
+    dst, src, stride = aw.run_pointers(data_base, k_off, v_off, run, stage_base)
+    _emulate_all_layer_mla(whole, dst, slots, src, list(range(b)), stride, page, run)
+
+    split = np.zeros(size, dtype=np.uint8)
+    split[:stage.size] = stage
+    n = aw.run_split_elements(run, page, E)
+    assert n == run // E
+    idx_dst, idx_src = aw.run_split_indices(slots, n, page, E)
+    assert idx_dst.numel() == idx_src.numel() == b * n
+    _emulate_all_layer_mla(split, dst, idx_dst.tolist(), src, idx_src.tolist(), E, E, E)
+
+    assert np.array_equal(whole, split)
+    # and both put page p's K run / V run into slot_p
+    for p, s in enumerate(slots):
+        base = data_base + s * page
+        assert np.array_equal(split[base + k_off:base + k_off + run], stage[p * 2 * run:p * 2 * run + run])
+        assert np.array_equal(split[base + v_off:base + v_off + run], stage[p * 2 * run + run:(p + 1) * 2 * run])
+
+
+def test_split_refuses_a_non_whole_element_run_or_page():
+    assert aw.run_split_elements(229376, 786432) == 224          # PP0 of the NF canonical page
+    assert aw.run_split_elements(98304, 786432) == 96            # PP1
+    assert aw.run_split_elements(65536, 786432) == 64            # PP2
+    assert aw.run_split_elements(1536, 786432, 1024) is None
+    assert aw.run_split_elements(229376, 786433, 1024) is None
+    assert aw.run_split_elements(0, 786432) is None
+    assert aw.run_split_elements(229376, 786432, 0) is None
+
+
+def test_run_element_keeps_the_thread_storage_small():
+    # the measured law (fnFL2x151): stack = run / 32 - 64 B for the whole-run
+    # element (unroll 1) -- 7104 / 3008 / 1984 B on PP0 / PP1 / PP2
+    for run, stack in ((229376, 7104), (98304, 3008), (65536, 1984)):
+        assert aw.kernel_thread_bytes(run, 1) - 64 == stack
+    # the split element: the 1-KiB module (unroll 2), 64 B per thread, the one
+    # the mamba write already launches without growing the 1248-B base stack
+    assert aw.RUN_ELEMENT_BYTES == aw.mamba_element_bytes({}) == 1024
+    assert aw.kernel_thread_bytes(aw.RUN_ELEMENT_BYTES, 2) == 64

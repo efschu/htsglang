@@ -63,6 +63,59 @@ def run_pointers(data_base: int, k_off: int, v_off: int, run_bytes: int, stage_p
     return dst, src, 2 * int(run_bytes)
 
 
+#: fnFL2 H47: bytes per kernel element of the run-mode write. The pointer/stride
+#: kernel (hicache.cuh load_vec/store_vec) holds ONE element per worker in a
+#: per-thread LocalStorage of element / (32 / unroll) bytes; a whole run as the
+#: element (unroll 1 above 1 KiB) spills that array to local memory and the
+#: driver grows the card's LMEM reservation to it for every resident thread --
+#: and keeps it. Measured (fnFL2x151, d6b7d4a1d3): stack = run/32 - 64 B, i.e.
+#: PP0 run 229376 B -> 7104 B/thread x 261120 threads = 1769 MiB (base 1248 B =
+#: 311 MiB, +1458 MiB), PP1 98304 -> 3008 B, PP2 65536 -> 1984 B. On fnFL2x149
+#: (FR_P 0.351) that +1458 MiB landed between chunk 0 and chunk 1 of the 97k
+#: prompt (cap 28951 -> 27494) and the GDN extend of chunk 1 died. 1024 B is the
+#: element the mamba write already launches (same module, same block quota: no
+#: new JIT build) and it leaves the stack at the base (x146/x150: 1248 B after
+#: the mamba write).
+RUN_ELEMENT_BYTES = 1024
+
+
+def kernel_thread_bytes(element: int, unroll: int) -> int:
+    """Per-thread LocalStorage of the pointer/stride kernel for one element
+    (hicache.cuh: kNumThreads = 32 / unroll threads share one element)."""
+    return int(element) * int(unroll) // 32
+
+
+def run_split_elements(run_bytes: int, page_bytes: int, element: int = RUN_ELEMENT_BYTES) -> Optional[int]:
+    """Elements per run when the run is written in ``element``-byte items
+    (fnFL2 H47), or None when run or page is not a whole number of elements
+    (the caller then keeps the cell/paged path -- never the whole-run element)."""
+    run_bytes, page_bytes, element = int(run_bytes), int(page_bytes), int(element)
+    if element <= 0 or run_bytes <= 0 or page_bytes <= 0:
+        return None
+    if run_bytes % element or page_bytes % element:
+        return None
+    return run_bytes // element
+
+
+def run_split_indices(slots, n: int, page_bytes: int, element: int = RUN_ELEMENT_BYTES):
+    """Index plan of the split run write: item (page p, element j) of the two
+    pseudo-layers (K run, V run; pointers from :func:`run_pointers`) goes
+
+      dst = ptr_dst[side] + idx_dst * element = base + off + slot_p * page_bytes + j * element
+      src = ptr_src[side] + idx_src * element = stage + side * run + p * 2 * run + j * element
+
+    so the kernel strides are ``element`` on both sides. Returns
+    ``(idx_dst, idx_src)`` as int64 CPU tensors of ``len(slots) * n``."""
+    import torch
+
+    n, page_elems = int(n), int(page_bytes) // int(element)
+    sl = torch.as_tensor(slots, dtype=torch.int64).reshape(-1, 1)
+    j = torch.arange(n, dtype=torch.int64)
+    idx_dst = (sl * page_elems + j).reshape(-1)
+    idx_src = (torch.arange(sl.shape[0], dtype=torch.int64).reshape(-1, 1) * (2 * n) + j).reshape(-1)
+    return idx_dst, idx_src
+
+
 MAMBA_MODE_ENV = "SGLANG_WEG2_MAMBA_WRITE_MODE"   # kernel (default) | copy
 
 
