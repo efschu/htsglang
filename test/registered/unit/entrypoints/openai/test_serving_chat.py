@@ -283,6 +283,102 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertFalse(adapted.require_reasoning)
 
+    def test_default_chat_template_kwargs_applied_when_request_unset(self):
+        """#29579 (upstream test)."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"enable_thinking": False}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertIs(kwargs["enable_thinking"], False)
+
+    def test_default_chat_template_kwargs_overridden_per_request(self):
+        """#29579 (upstream test)."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"enable_thinking": False}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            chat_template_kwargs={"enable_thinking": True},
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertIs(kwargs["enable_thinking"], True)
+
+    def test_default_chat_template_kwargs_mirrors_reasoning_effort(self):
+        """#29579 (upstream test)."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {"reasoning_effort": "high"}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertEqual(req.reasoning_effort, "high")
+
+    def test_default_chat_template_kwargs_visible_to_reasoning_detection(self):
+        """#29579 semantics in this tree: a server default that disables
+        thinking must reach _get_reasoning_from_request too. Before the fold
+        the template rendered without thinking while the detection still read
+        an empty request and forced reasoning on, which routes the whole answer
+        into reasoning_content."""
+        self.template_manager.reasoning_config = None
+        self.chat.reasoning_parser = "qwen3"
+        self.chat._reasoning_detector = Mock(reasoning_default="enable_thinking")
+        self.chat.default_chat_template_kwargs = {"enable_thinking": False}
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+        self.chat._apply_default_chat_template_kwargs(req)
+
+        self.assertEqual(req.chat_template_kwargs, {"enable_thinking": False})
+        self.assertFalse(self.chat._get_reasoning_from_request(req))
+
+    def test_default_reasoning_effort_does_not_beat_explicit_request_effort(self):
+        """Fork precedence (merge_chat_template_kwargs) is kept: an explicit
+        request.reasoning_effort outranks a server-default reasoning_effort,
+        both on the request and in the rendered template kwargs."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.default_chat_template_kwargs = {
+            "reasoning_effort": "high",
+            "preserve_thinking": True,
+        }
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            reasoning_effort="low",
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertEqual(req.reasoning_effort, "low")
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(kwargs["reasoning_effort"], "low")
+        self.assertIs(kwargs["preserve_thinking"], True)
+
     def test_kimi_tool_call_keeps_template_default_thinking(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
@@ -1016,6 +1112,42 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(tool_calls[1].id, "functions.get_weather:2")
             self.assertEqual(tool_calls[1].function.name, "get_weather")
 
+    def test_non_streaming_tool_call_index_is_the_call_ordinal(self):
+        """Two calls to one tool are numbered 0 and 1, as in the streaming deltas,
+        not by the detector's tool_index (0 for both)."""
+        self.chat.tool_call_parser = "deepseekv4"
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as ParserMock:
+            parser_instance = ParserMock.return_value
+            calls = []
+            for city in ("San Francisco", "London"):
+                call_info = Mock()
+                call_info.name = "get_weather"
+                call_info.parameters = json.dumps({"location": city})
+                call_info.tool_index = 0
+                calls.append(call_info)
+            parser_instance.has_tool_call.return_value = True
+            parser_instance.parse_non_stream.return_value = ("", calls)
+
+            tool_calls, _, finish_reason = self.chat._process_tool_calls(
+                text="<｜DSML｜tool_calls>...",
+                tools=tools,
+                finish_reason={"type": "stop", "matched": None},
+                history_tool_calls_cnt=0,
+            )
+
+        self.assertEqual([tc.index for tc in tool_calls], [0, 1])
+        self.assertEqual(
+            [tc.function.arguments for tc in tool_calls],
+            [
+                json.dumps({"location": "San Francisco"}),
+                json.dumps({"location": "London"}),
+            ],
+        )
+        self.assertEqual(finish_reason["type"], "tool_calls")
+
     def test_kimi_k2_streaming_tool_call_id_with_history(self):
         """Ensure streaming first chunk tool_call.id increase with tool calls history for kimi_k2 parser."""
 
@@ -1405,6 +1537,77 @@ class ServingChatTestCase(unittest.TestCase):
         ):
             chunks.append(chunk)
         return chunks
+
+    def test_stream_end_flushes_truncated_reasoning_without_stream_reasoning(self):
+        """#32225: with stream_reasoning=False the qwen3 detector buffers the
+        whole trace until </think>. A stream cut before it (finish_reason
+        length) must deliver the trace as reasoning_content on the final chunk
+        instead of dropping it; an abort must not flush."""
+        self.chat.reasoning_parser = "qwen3"
+        self.tm.server_args.incremental_streaming_output = True
+
+        def run(finish_on_last):
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                stream=True,
+                separate_reasoning=True,
+                stream_reasoning=False,
+            )
+            reasoning_parser_dict = {}
+
+            async def step(text, finish_reason_type):
+                content = {
+                    "text": text,
+                    "meta_info": {
+                        "id": "chatcmpl-trunc",
+                        "prompt_tokens": 5,
+                        "completion_tokens": 2,
+                        "cached_tokens": 0,
+                        "finish_reason": (
+                            {"type": finish_reason_type}
+                            if finish_reason_type
+                            else None
+                        ),
+                    },
+                    "index": 0,
+                }
+                out = []
+                async for chunk in self.chat._generate_stream_content(
+                    content=content,
+                    index=0,
+                    request=req,
+                    stream_offsets={},
+                    reasoning_parser_dict=reasoning_parser_dict,
+                    parser_dict={},
+                    has_tool_calls={},
+                    choice_logprobs=None,
+                    finish_reason_type=finish_reason_type,
+                    continuous_usage_stats=False,
+                    prompt_tokens={0: 5},
+                    reasoning_tokens={0: 0},
+                    completion_tokens={0: 2},
+                ):
+                    out.append(chunk)
+                return out
+
+            loop = get_or_create_event_loop()
+            first = loop.run_until_complete(step("<think>half a", None))
+            last = loop.run_until_complete(step(" thought", finish_on_last))
+            return self._parse_chunks(first), self._parse_chunks(last)
+
+        def reasoning_of(parsed):
+            return "".join(
+                c["choices"][0]["delta"].get("reasoning_content") or ""
+                for c in parsed
+            )
+
+        first, last = run("length")
+        self.assertEqual(reasoning_of(first), "")
+        self.assertEqual(reasoning_of(last), "half a thought")
+
+        first, last = run("abort")
+        self.assertEqual(reasoning_of(first) + reasoning_of(last), "")
 
     def test_streaming_logprobs_attached_with_reasoning_parser(self):
         """Logprobs must ride on the reasoning chunk when a reasoning parser is active."""

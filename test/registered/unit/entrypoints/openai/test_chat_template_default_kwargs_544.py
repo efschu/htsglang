@@ -212,6 +212,42 @@ class TestPreserveThinkingPrefixIdentity(CustomTestCase):
         self.assertEqual(pt_hit, pt_total)
 
 
+class TestUpstreamFlagAlias(CustomTestCase):
+    """#29579: upstream's --default-chat-template-kwargs is an alias of the
+    fork flag; the fork spelling stays valid and both land in the same field."""
+
+    @classmethod
+    def setUpClass(cls):
+        import argparse
+
+        cls.parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(cls.parser)
+
+    def _parse_dest(self, argv):
+        ns = self.parser.parse_args(["--model", "dummy"] + argv)
+        return ns.chat_template_default_kwargs
+
+    def test_fork_spelling_still_parses(self):
+        raw = '{"preserve_thinking": true}'
+        self.assertEqual(
+            self._parse_dest(["--chat-template-default-kwargs", raw]), raw
+        )
+
+    def test_upstream_spelling_is_an_alias(self):
+        raw = '{"enable_thinking": false}'
+        self.assertEqual(
+            self._parse_dest(["--default-chat-template-kwargs", raw]), raw
+        )
+
+    def test_dict_value_is_normalized_to_json_string(self):
+        args = ServerArgs.__new__(ServerArgs)
+        args.chat_template_default_kwargs = {"preserve_thinking": True}
+        args._handle_chat_template_default_kwargs()
+        self.assertEqual(
+            json.loads(args.chat_template_default_kwargs), {"preserve_thinking": True}
+        )
+
+
 class TestBootConfigIsParseable(CustomTestCase):
     """The exact JSON we intend to boot with must survive validation."""
 

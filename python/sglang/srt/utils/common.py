@@ -25,6 +25,7 @@ import gc
 import importlib
 import inspect
 import io
+import ipaddress
 import itertools
 import json
 import logging
@@ -77,7 +78,7 @@ from typing import (
 )
 from unittest import SkipTest
 from unittest.case import _ShouldStop
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import numpy as np
 import orjson
@@ -87,7 +88,7 @@ import requests
 import torch
 import torch.distributed as dist
 from packaging import version as pkg_version
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
@@ -2129,6 +2130,158 @@ def set_random_seed(seed: int) -> None:
 
 _mm_http_session = threading.local()
 
+_DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB = 64
+_MAX_MEDIA_URL_REDIRECTS = 5
+_MEDIA_URL_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+_allowed_media_domains: frozenset[str] = frozenset()
+_media_url_max_file_size_bytes = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB * 1024 * 1024
+
+
+def _normalize_media_domain(domain: str) -> str:
+    if not isinstance(domain, str):
+        raise ValueError("allowed media domains must be strings")
+
+    domain = domain.strip().rstrip(".")
+    if not domain:
+        raise ValueError("allowed media domains cannot be empty")
+    if "://" in domain or any(char in domain for char in "/?#@"):
+        raise ValueError(
+            f"Invalid allowed media domain {domain!r}: provide a hostname only"
+        )
+
+    # Brackets are URL syntax, not part of an IPv6 hostname.
+    if domain.startswith("[") and domain.endswith("]"):
+        domain = domain[1:-1]
+    try:
+        return str(ipaddress.ip_address(domain))
+    except ValueError:
+        if ":" in domain:
+            raise ValueError(
+                f"Invalid allowed media domain {domain!r}: ports are not supported"
+            )
+
+    try:
+        normalized = domain.encode("idna").decode("ascii").lower()
+    except UnicodeError as e:
+        raise ValueError(f"Invalid allowed media domain {domain!r}") from e
+    if not normalized:
+        raise ValueError("allowed media domains cannot be empty")
+    return normalized
+
+
+def configure_media_url_security(
+    allowed_media_domains: Optional[Sequence[str]] = None,
+    max_file_size_mb: int = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB,
+) -> list[str]:
+    """Configure process-wide safeguards for client-supplied media URLs.
+
+    A serving worker hosts one engine configuration, while media loading fans
+    out to worker threads. Keeping the immutable policy here makes the same
+    checks apply to image, video, audio, cache, and model-specific loaders.
+    """
+
+    if max_file_size_mb < 0:
+        raise ValueError("media_url_max_file_size_mb must be non-negative")
+
+    normalized_domains = sorted(
+        {_normalize_media_domain(domain) for domain in allowed_media_domains or []}
+    )
+    global _allowed_media_domains, _media_url_max_file_size_bytes
+    _allowed_media_domains = frozenset(normalized_domains)
+    _media_url_max_file_size_bytes = max_file_size_mb * 1024 * 1024
+    return normalized_domains
+
+
+def _assert_media_url_allowed(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+        raise ValueError(f"Invalid media URL: {url!r}")
+
+    hostname = _normalize_media_domain(parsed.hostname)
+    if _allowed_media_domains and hostname not in _allowed_media_domains:
+        raise ValueError(
+            "Media URL domain is not allowed. "
+            f"Allowed domains: {sorted(_allowed_media_domains)}; "
+            f"input domain: {hostname}"
+        )
+
+
+def download_remote_media(url: str, timeout: float) -> bytes:
+    """Download one HTTP(S) media object under the configured URL policy.
+
+    Redirects are followed manually so every destination is validated before
+    a connection is made. The response is streamed to enforce both the total
+    request deadline and the configured byte limit without first buffering an
+    attacker-controlled body in memory.
+    """
+
+    if timeout <= 0:
+        raise ValueError("media URL timeout must be positive")
+
+    session = get_mm_http_session()
+    deadline = time.monotonic() + timeout
+    current_url = url
+
+    for redirect_count in range(_MAX_MEDIA_URL_REDIRECTS + 1):
+        # Validate the same normalized URL representation that requests sends
+        # to urllib3. This avoids parser disagreements around backslashes and
+        # userinfo separators.
+        prepared_url = requests.Request("GET", current_url).prepare().url
+        if prepared_url is None:
+            raise ValueError(f"Invalid media URL: {current_url!r}")
+        _assert_media_url_allowed(prepared_url)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise requests.exceptions.Timeout(
+                f"Timed out while downloading media URL: {url}"
+            )
+
+        with session.get(
+            prepared_url,
+            allow_redirects=False,
+            stream=True,
+            timeout=remaining,
+        ) as response:
+            location = response.headers.get("Location")
+            if response.status_code in _MEDIA_URL_REDIRECT_STATUS_CODES and location:
+                if redirect_count == _MAX_MEDIA_URL_REDIRECTS:
+                    raise requests.exceptions.TooManyRedirects(
+                        f"Media URL exceeded {_MAX_MEDIA_URL_REDIRECTS} redirects: {url}"
+                    )
+                current_url = urljoin(response.url, location)
+                continue
+
+            response.raise_for_status()
+            max_bytes = _media_url_max_file_size_bytes
+            content_length = response.headers.get("Content-Length")
+            if max_bytes and content_length is not None:
+                try:
+                    declared_size = int(content_length)
+                except ValueError:
+                    declared_size = None
+                if declared_size is not None and declared_size > max_bytes:
+                    raise ValueError(
+                        f"Remote media exceeds the {max_bytes} byte download limit"
+                    )
+
+            content = bytearray()
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                if time.monotonic() > deadline:
+                    raise requests.exceptions.Timeout(
+                        f"Timed out while downloading media URL: {url}"
+                    )
+                if max_bytes and len(content) + len(chunk) > max_bytes:
+                    raise ValueError(
+                        f"Remote media exceeds the {max_bytes} byte download limit"
+                    )
+                content.extend(chunk)
+            return bytes(content)
+
+    raise AssertionError("unreachable")
+
 
 def get_mm_http_session() -> requests.Session:
     """Per-thread HTTP session for multimodal downloads, to pool/reuse TCP
@@ -2141,6 +2294,15 @@ def get_mm_http_session() -> requests.Session:
         _mm_http_session.session = session
         _mm_http_session.pid = pid
     return session
+
+
+# Raised by the loaders below when client-supplied media cannot be fetched or
+# decoded. ValueError is in the set because invalid base64 raises binascii.Error.
+CLIENT_MEDIA_EXCEPTIONS = (
+    ValueError,
+    UnidentifiedImageError,
+    requests.exceptions.RequestException,
+)
 
 
 def load_audio(
@@ -2158,9 +2320,7 @@ def load_audio(
         audio_file.startswith("http://") or audio_file.startswith("https://")
     ):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        with get_mm_http_session().get(audio_file, timeout=timeout) as response:
-            response.raise_for_status()
-            source = response.content
+        source = download_remote_media(audio_file, timeout=timeout)
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
         source = unquote(urlparse(audio_file).path)
     elif isinstance(audio_file, str):
@@ -2193,10 +2353,13 @@ def load_audio(
     import torch
     import torchaudio
 
-    if isinstance(source, bytes):
-        audio, original_sr = sf.read(BytesIO(source))
-    else:
-        audio, original_sr = sf.read(source)
+    try:
+        if isinstance(source, bytes):
+            audio, original_sr = sf.read(BytesIO(source))
+        else:
+            audio, original_sr = sf.read(source)
+    except sf.LibsndfileError as e:
+        raise ValueError(f"Could not decode audio: {e}") from e
 
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
@@ -2325,13 +2488,7 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         return image_file
     if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = get_mm_http_session().get(image_file, timeout=timeout)
-        try:
-            response.raise_for_status()
-            result = response.content
-        finally:
-            response.close()
-        return result
+        return download_remote_media(image_file, timeout=timeout)
     if image_file.startswith(("file://", "/")):
         with open(image_file, "rb") as f:
             return f.read()
@@ -2357,11 +2514,7 @@ def _normalize_video_input(
     elif isinstance(video_file, str):
         if video_file.startswith(("http://", "https://")):
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-            with get_mm_http_session().get(
-                video_file, stream=True, timeout=timeout
-            ) as response:
-                response.raise_for_status()
-                return response.content
+            return download_remote_media(video_file, timeout=timeout)
         elif video_file.startswith("data:"):
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
@@ -2388,7 +2541,13 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
         raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
     device = "cuda" if use_gpu else "cpu"
-    return VideoDecoderWrapper(source, device=device)
+    try:
+        return VideoDecoderWrapper(source, device=device)
+    except (ImportError, MemoryError):
+        raise  # missing backend / OOM is not a bad payload
+    except Exception as e:
+        # Broad on purpose: torchcodec raises RuntimeError, decord its own type.
+        raise ValueError(f"Could not decode video: {e}") from e
 
 
 def sample_video_frames(video, *, desired_fps: int, max_frames: int) -> list[int]:
@@ -3438,77 +3597,239 @@ def normalize_serialized_named_tensor_payloads(
     return [normalize_serialized_named_tensor_payload(data) for data in payloads]
 
 
-class SafeUnpickler(pickle.Unpickler):
-    ALLOWED_MODULE_PREFIXES = {
-        # --- Python types ---
-        "builtins.",
-        "collections.",
-        "copyreg.",
-        "functools.",
-        "itertools.",
-        "operator.",
-        "types.",
-        "weakref.",
-        # --- PyTorch types ---
-        "torch.",
-        "torch._tensor.",
-        "torch.storage.",
-        "torch.nn.parameter.",
-        "torch.autograd.function.",
-        # --- torch distributed ---
-        "torch.distributed.",
-        "torch.distributed._shard.",
-        "torch.distributed._composable.",
-        "torch._C._distributed_c10d.",
-        "torch._C._distributed_fsdp.",
-        "torch.distributed.optim.",
-        # --- multiprocessing ---
-        "multiprocessing.resource_sharer.",
-        "multiprocessing.reduction.",
-        "pickletools.",
-        # --- PEFT / LoRA ---
-        "peft.",
-        "transformers.",
-        "huggingface_hub.",
-        # --- SGLang & Unitest ---
-        "sglang.srt.weight_sync.tensor_bucket.",
-        "sglang.srt.model_executor.model_runner.",
-        "sglang.srt.layers.",
-        "sglang.srt.utils.",
-        "sglang.srt.disaggregation.",
-        "sglang.srt.managers.",
-        "torch_npu.",
-    }
+def _safe_load_torch_storage(data: bytes):
+    storage = torch.load(io.BytesIO(data), weights_only=True)
+    if not isinstance(storage, (torch.storage.TypedStorage, torch.UntypedStorage)):
+        raise pickle.UnpicklingError(
+            f"Expected a Torch storage, got {type(storage).__name__}"
+        )
+    return storage
 
-    DENY_CLASSES = {
-        ("builtins", "eval"),
-        ("builtins", "exec"),
-        ("builtins", "compile"),
-        ("os", "system"),
-        ("subprocess", "Popen"),
-        ("subprocess", "run"),
-        ("codecs", "decode"),
-        ("types", "CodeType"),
-        ("types", "FunctionType"),
+
+class SafeUnpickler(pickle.Unpickler):
+    # Standard-library modules expose powerful callables alongside harmless data
+    # types. Keep these globals exact so a newly added callable is denied by
+    # default instead of silently expanding the unpickling attack surface.
+    ALLOWED_GLOBALS = {
+        # --- Python types ---
+        ("builtins", "bool"),
+        ("builtins", "bytearray"),
+        ("builtins", "bytes"),
+        ("builtins", "complex"),
+        ("builtins", "dict"),
+        ("builtins", "float"),
+        ("builtins", "frozenset"),
+        ("builtins", "int"),
+        ("builtins", "list"),
+        ("builtins", "range"),
+        ("builtins", "set"),
+        ("builtins", "slice"),
+        ("builtins", "str"),
+        ("builtins", "tuple"),
+        ("collections", "OrderedDict"),
+        ("collections", "defaultdict"),
+        ("collections", "deque"),
+        ("collections", "Counter"),
+        ("copyreg", "__newobj__"),
+        ("copyreg", "__newobj_ex__"),
+        ("functools", "partial"),
+        ("itertools", "chain"),
+        ("itertools", "repeat"),
+        ("multiprocessing.reduction", "_rebuild_partial"),
+        ("multiprocessing.reduction", "_rebuild_socket"),
+        ("multiprocessing.resource_sharer", "DupFd"),
+        ("types", "SimpleNamespace"),
+        ("_codecs", "encode"),
+        # --- PyTorch data containers & rebuild functions ---
+        # Code-module prefixes (torch.*, sglang.srt.*) are NOT allowed: they
+        # contain gadgets like sglang.srt.utils.common.dynamic_import
+        ("torch", "Tensor"),
+        ("torch", "BFloat16Tensor"),
+        ("torch", "BoolTensor"),
+        ("torch", "ByteTensor"),
+        ("torch", "CharTensor"),
+        ("torch", "DoubleTensor"),
+        ("torch", "FloatTensor"),
+        ("torch", "HalfTensor"),
+        ("torch", "IntTensor"),
+        ("torch", "LongTensor"),
+        ("torch", "ShortTensor"),
+        ("torch.cuda", "BFloat16Tensor"),
+        ("torch.cuda", "BoolTensor"),
+        ("torch.cuda", "ByteTensor"),
+        ("torch.cuda", "CharTensor"),
+        ("torch.cuda", "DoubleTensor"),
+        ("torch.cuda", "FloatTensor"),
+        ("torch.cuda", "HalfTensor"),
+        ("torch.cuda", "IntTensor"),
+        ("torch.cuda", "LongTensor"),
+        ("torch.cuda", "ShortTensor"),
+        ("torch.cuda.sparse", "BFloat16Tensor"),
+        ("torch.cuda.sparse", "ByteTensor"),
+        ("torch.cuda.sparse", "CharTensor"),
+        ("torch.cuda.sparse", "DoubleTensor"),
+        ("torch.cuda.sparse", "FloatTensor"),
+        ("torch.cuda.sparse", "HalfTensor"),
+        ("torch.cuda.sparse", "IntTensor"),
+        ("torch.cuda.sparse", "LongTensor"),
+        ("torch.cuda.sparse", "ShortTensor"),
+        ("torch.sparse", "BFloat16Tensor"),
+        ("torch.sparse", "ByteTensor"),
+        ("torch.sparse", "CharTensor"),
+        ("torch.sparse", "DoubleTensor"),
+        ("torch.sparse", "FloatTensor"),
+        ("torch.sparse", "HalfTensor"),
+        ("torch.sparse", "IntTensor"),
+        ("torch.sparse", "LongTensor"),
+        ("torch.sparse", "ShortTensor"),
+        ("torch", "Size"),
+        ("torch", "device"),
+        ("torch", "dtype"),
+        ("torch", "bfloat16"),
+        ("torch", "bit"),
+        ("torch", "bits16"),
+        ("torch", "bits1x8"),
+        ("torch", "bits2x4"),
+        ("torch", "bits4x2"),
+        ("torch", "bits8"),
+        ("torch", "bool"),
+        ("torch", "cdouble"),
+        ("torch", "cfloat"),
+        ("torch", "chalf"),
+        ("torch", "complex128"),
+        ("torch", "complex32"),
+        ("torch", "complex64"),
+        ("torch", "double"),
+        ("torch", "float"),
+        ("torch", "float16"),
+        ("torch", "float32"),
+        ("torch", "float4_e2m1fn_x2"),
+        ("torch", "float64"),
+        ("torch", "float8_e4m3fn"),
+        ("torch", "float8_e4m3fnuz"),
+        ("torch", "float8_e5m2"),
+        ("torch", "float8_e5m2fnuz"),
+        ("torch", "float8_e8m0fnu"),
+        ("torch", "half"),
+        ("torch", "int"),
+        ("torch", "int1"),
+        ("torch", "int16"),
+        ("torch", "int2"),
+        ("torch", "int3"),
+        ("torch", "int32"),
+        ("torch", "int4"),
+        ("torch", "int5"),
+        ("torch", "int6"),
+        ("torch", "int64"),
+        ("torch", "int7"),
+        ("torch", "int8"),
+        ("torch", "long"),
+        ("torch", "qint32"),
+        ("torch", "qint8"),
+        ("torch", "quint2x4"),
+        ("torch", "quint4x2"),
+        ("torch", "quint8"),
+        ("torch", "short"),
+        ("torch", "uint1"),
+        ("torch", "uint16"),
+        ("torch", "uint2"),
+        ("torch", "uint3"),
+        ("torch", "uint32"),
+        ("torch", "uint4"),
+        ("torch", "uint5"),
+        ("torch", "uint6"),
+        ("torch", "uint64"),
+        ("torch", "uint7"),
+        ("torch", "uint8"),
+        ("torch.nn.parameter", "Parameter"),
+        ("torch.serialization", "_get_layout"),
+        ("torch._utils", "_rebuild_tensor"),
+        ("torch._utils", "_rebuild_tensor_v2"),
+        ("torch._utils", "_rebuild_tensor_v3"),
+        ("torch._utils", "_rebuild_parameter"),
+        ("torch._utils", "_rebuild_parameter_with_state"),
+        ("torch._utils", "_rebuild_qtensor"),
+        ("torch._utils", "_rebuild_sparse_tensor"),
+        ("torch._utils", "_rebuild_meta_tensor_no_storage"),
+        ("torch._utils", "_rebuild_wrapper_subclass"),
+        ("torch._utils", "_rebuild_device_tensor_from_numpy"),
+        ("torch._utils", "_rebuild_device_tensor_from_cpu_tensor"),
+        ("torch._tensor", "_rebuild_from_type_v2"),
+        ("torch.storage", "UntypedStorage"),
+        ("torch.storage", "_UntypedStorage"),
+        ("torch.storage", "TypedStorage"),
+        ("torch", "UntypedStorage"),
+        ("torch", "BFloat16Storage"),
+        ("torch", "BoolStorage"),
+        ("torch", "ByteStorage"),
+        ("torch", "CharStorage"),
+        ("torch", "ComplexDoubleStorage"),
+        ("torch", "ComplexFloatStorage"),
+        ("torch", "DoubleStorage"),
+        ("torch", "FloatStorage"),
+        ("torch", "HalfStorage"),
+        ("torch", "IntStorage"),
+        ("torch", "LongStorage"),
+        ("torch", "QInt32Storage"),
+        ("torch", "QInt8Storage"),
+        ("torch", "QUInt2x4Storage"),
+        ("torch", "QUInt4x2Storage"),
+        ("torch", "QUInt8Storage"),
+        ("torch", "ShortStorage"),
+        ("torch.cuda", "BFloat16Storage"),
+        ("torch.cuda", "BoolStorage"),
+        ("torch.cuda", "ByteStorage"),
+        ("torch.cuda", "CharStorage"),
+        ("torch.cuda", "ComplexDoubleStorage"),
+        ("torch.cuda", "ComplexFloatStorage"),
+        ("torch.cuda", "DoubleStorage"),
+        ("torch.cuda", "FloatStorage"),
+        ("torch.cuda", "HalfStorage"),
+        ("torch.cuda", "IntStorage"),
+        ("torch.cuda", "LongStorage"),
+        ("torch.cuda", "ShortStorage"),
+        ("torch.multiprocessing.reductions", "rebuild_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_meta_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_cuda_tensor"),
+        ("sglang.srt.utils.patch_torch", "_rebuild_cuda_tensor_modified"),
+        ("torch_npu.multiprocessing.reductions", "rebuild_npu_tensor"),
+        ("sglang.srt.utils.patch_torch", "_rebuild_npu_tensor_modified"),
+        ("torch.multiprocessing.reductions", "rebuild_nested_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_sparse_coo_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_sparse_compressed_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_storage_fd"),
+        ("torch.multiprocessing.reductions", "rebuild_storage_filename"),
+        ("torch.multiprocessing.reductions", "rebuild_storage_empty"),
+        ("torch.multiprocessing.reductions", "rebuild_typed_storage"),
+        ("torch.multiprocessing.reductions", "rebuild_typed_storage_child"),
+        ("torch", "per_tensor_affine"),
+        ("torch", "per_tensor_symmetric"),
+        ("torch", "per_channel_affine"),
+        ("torch", "per_channel_symmetric"),
+        ("torch", "per_channel_affine_float_qparams"),
+        # --- SGLang data containers only (no code modules) ---
+        ("sglang.srt.managers.io_struct", "GenerateReqInput"),
+        ("sglang.srt.managers.io_struct", "EmbeddingReqInput"),
+        # Fork layout: EmbeddingData lives in disaggregation/encode_receiver.py
+        # (upstream moved it to disaggregation/encoder/receiver.py).
+        ("sglang.srt.disaggregation.encode_receiver", "EmbeddingData"),
+        ("sglang.srt.managers.schedule_batch", "Modality"),
+        ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorMetadata"),
+        ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorBucket"),
+        # Fork layout: LocalSerializedTensor is defined only in model_runner.py
+        # (no model_runner_components/weight_updater.py in this tree).
+        ("sglang.srt.model_executor.model_runner", "LocalSerializedTensor"),
     }
 
     def find_class(self, module, name):
-        # Block deterministic attacks
-        if (module, name) in self.DENY_CLASSES:
-            raise RuntimeError(
-                f"Blocked unsafe class loading ({module}.{name}), "
-                f"to prevent exploitation of CVE-2025-10164"
-            )
-        # Allowlist of safe-to-load modules.
-        if any(
-            (module + ".").startswith(prefix) for prefix in self.ALLOWED_MODULE_PREFIXES
-        ):
+        if (module, name) == ("torch.storage", "_load_from_bytes"):
+            # Torch's helper calls an unrestricted nested torch.load.
+            return _safe_load_torch_storage
+        if (module, name) in self.ALLOWED_GLOBALS:
             return super().find_class(module, name)
 
-        # Block everything else. (Potential attack surface)
         raise RuntimeError(
-            f"Blocked unsafe class loading ({module}.{name}), "
-            f"to prevent exploitation of CVE-2025-10164"
+            f"Blocked unsafe global ({module}.{name}) during pickle deserialization"
         )
 
 
