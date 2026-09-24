@@ -254,6 +254,19 @@ class Envs:
     # is not held behind the verify (dflash_solo_pool sync-free mode). Off =
     # the legacy mapper, byte-identical.
     SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE = EnvBool(False)
+    # DFLASH decode round, stage 2 of the host-sync removal: plan the draft
+    # and the uneven-DCP target verify with HOST-known FlashInfer metadata so
+    # the host never waits for the draft forward (owner.py compact[owned] /
+    # repeat_interleave, prefill.py plan .to("cpu"), flashinfer_backend
+    # _host_sum_or_device). The verify's owned-slot index is built BEFORE the
+    # draft in stream order and read back through an event that fires ahead
+    # of the draft. Off = the old planning path, byte-identical.
+    SGLANG_DFLASH_PLAN_SYNC_FREE = EnvBool(False)
+    # [vram-peak] high-water check (model_runner, every forward): read the
+    # allocator peak straight from torch's nested stats dict instead of the
+    # flattened memory_stats() -- the same number without the Python flatten
+    # (~0.7 ms per DFLASH round on D). Off = torch.cuda.max_memory_allocated().
+    SGLANG_VRAM_PEAK_FAST_READ = EnvBool(False)
 
     # Downgrade the draft-model unloaded-parameter check (#290/#318) from a
     # hard error to a log line. An unloaded drafter proposes noise, so this is

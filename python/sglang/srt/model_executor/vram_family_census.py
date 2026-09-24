@@ -171,6 +171,30 @@ PEAK_DECODE_AT = 64
 PEAK_HIGHWATER_STEP_GIB = 0.25
 
 
+def _max_allocated_bytes(cuda) -> int:
+    """``cuda.max_memory_allocated()``, optionally without the flatten.
+
+    ``torch.cuda.max_memory_allocated`` is ``memory_stats()["allocated_bytes.
+    all.peak"]``, and ``memory_stats`` flattens the whole nested allocator dict
+    in Python first (``_recurse_add_to_result``). That flatten was 11-39 py-spy
+    samples per 75 s window on D TP0 (xsn421/xsn422), paid on every forward --
+    draft AND verify -- because the high-water check runs on each one.
+    SGLANG_VRAM_PEAK_FAST_READ=1 reads the same key straight from the nested
+    dict (``torch._C._cuda_memoryStats``): the identical number, without the
+    flatten. Off, or on any surprise, it is the public call, byte-identical.
+    """
+    if cuda is torch.cuda:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_VRAM_PEAK_FAST_READ.get():
+            try:
+                stats = torch._C._cuda_memoryStats(torch.cuda.current_device())
+                return int(stats["allocated_bytes"]["all"]["peak"])
+            except Exception:  # noqa: BLE001 -- fall back to the public read
+                pass
+    return cuda.max_memory_allocated()
+
+
 def _peak_state(runner):
     st = getattr(runner, "_vram_peak_state", None)
     if st is None:
@@ -227,7 +251,7 @@ def maybe_log_vram_peak(runner, forward_batch, cuda=torch.cuda) -> Optional[str]
             st["decode_done"] = True
             kind = "decode"
     try:
-        peak = cuda.max_memory_allocated() / 2**30
+        peak = _max_allocated_bytes(cuda) / 2**30
     except Exception as exc:  # noqa: BLE001
         logger.debug("[vram-peak] skipped: %s", exc)
         return None

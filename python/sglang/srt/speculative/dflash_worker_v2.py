@@ -567,6 +567,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         # keep it only for platforms without GPU triton and for the solo small
         # pool, whose mapper has to translate the gathered locations.
         self._use_triton_compact_rebuild = supports_gpu_triton
+        # SGLANG_DFLASH_PLAN_SYNC_FREE (layers/dcp/verify_preplan.py): build
+        # the verify's uneven-DCP owned-slot index before the draft and plan
+        # draft + verify from exact host metadata. Resolved lazily: the target
+        # attention backend may be swapped (phase flip) after construction.
+        self._plan_sync_free = bool(envs.SGLANG_DFLASH_PLAN_SYNC_FREE.get())
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
         self._accept_len_buf: Optional[torch.Tensor] = None
@@ -1506,6 +1511,59 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         lens = host_seq_lens.to(dtype=torch.int64, device="cpu")
         out.copy_(torch.clamp(lens, max=bound).to(torch.int32))
+
+    def _compact_draft_host_lens_exact(self) -> bool:
+        """May the draft plan schedule from the compact host lengths?
+
+        Only when they ARE the device lengths: the switch is on, the draft uses
+        the compact window, the page size is 1 (min(len, W) exactly -- with
+        pages the host value is the page-aligned envelope), and the caller
+        derived them from the published ``batch.seq_lens_cpu`` (not from the
+        reservation bound ``nxt_kv_lens_cpu``). FA2 lays its split output out
+        by the DEVICE length, so an upper bound would mis-address partials.
+        """
+        return bool(
+            self._plan_sync_free
+            and self.use_compact_draft_cache
+            and self.page_size <= 1
+        )
+
+    def _target_dcp_verify_backend(self):
+        """The target's FlashInfer backend when it takes the weighted-DCP
+        verify split (directly or as a hybrid model's full-attention half),
+        else None. Looked up per round: the phase flip may install a new
+        backend object."""
+        backend = getattr(self.target_worker.model_runner, "attn_backend", None)
+        backend = getattr(backend, "full_attn_backend", backend)
+        if backend is None or not hasattr(backend, "dcp_verify_prebuild"):
+            return None
+        if not (
+            getattr(backend, "uneven_dcp", False)
+            and getattr(backend, "uneven_dcp_weighted", False)
+        ):
+            return None
+        return backend
+
+    def _dcp_verify_prebuild(self, batch: ScheduleBatch, draft_input):
+        """SGLANG_DFLASH_PLAN_SYNC_FREE: the verify's owned-slot index, built
+        now -- after the block prep, BEFORE the draft forward on this stream.
+
+        The verify reads the committed prefix [0, seq_lens), whose slot ids
+        are settled, so nothing here depends on the draft. The owned counts
+        reach the host through an event recorded right after this build; the
+        verify plan reads them while the GPU runs the draft. The host length
+        mirror (exact when published, the reservation bound otherwise) only
+        sizes the slot buffer.
+        """
+        backend = self._target_dcp_verify_backend()
+        if backend is None:
+            return None
+        host = batch.seq_lens_cpu
+        if host is None:
+            host = getattr(draft_input, "nxt_kv_lens_cpu", None)
+        if host is None:
+            return None
+        return backend.dcp_verify_prebuild(batch.req_pool_indices, batch.seq_lens, host)
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -2915,6 +2973,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
         self._audit_mark("prep")  # DFLASH AUDIT (env-gated)
+        # SGLANG_DFLASH_PLAN_SYNC_FREE: every rank runs the target verify, so
+        # every rank (solo shadows included) prebuilds its index here, ahead
+        # of the draft. None -> the verify plans the old way.
+        dcp_verify_prebuilt = (
+            self._dcp_verify_prebuild(batch, draft_input)
+            if self._plan_sync_free
+            else None
+        )
         # positions + verify cache locs are pure functions of batch state and
         # are needed on EVERY rank for the target verify below (identical bytes
         # on all ranks), so compute them outside the host-only draft region.
@@ -2975,6 +3041,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
             seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
+            # SGLANG_DFLASH_PLAN_SYNC_FREE: True only when seq_lens_cpu below
+            # is the device length itself (published mirror, page_size 1,
+            # compact window) -- the one case in which the draft plan may
+            # schedule from it. An upper bound is NOT enough there (FA2 lays
+            # its split output out by the device length).
+            draft_host_lens_exact = False
             if self.use_compact_draft_cache:
                 # Rebuild the draft-local sliding-window view from committed target state.
                 draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
@@ -2987,6 +3059,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self._compute_compact_draft_seq_lens_host(
                         batch.seq_lens_cpu, out=seq_lens_cpu
                     )
+                    draft_host_lens_exact = self._compact_draft_host_lens_exact()
                 elif draft_input.nxt_kv_lens_cpu is not None:
                     self._compute_compact_draft_seq_lens_host(
                         draft_input.nxt_kv_lens_cpu, out=seq_lens_cpu
@@ -3140,8 +3213,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self._draft_sampler.stage_sampling_params(
                         bs=bs, sampling_info=batch.sampling_info
                     )
-            with torch.inference_mode():
-                draft_out = self.draft_model_runner.forward(forward_batch)
+            # SGLANG_DFLASH_PLAN_SYNC_FREE: the flag lives on the shared draft
+            # block spec info, so it is raised for exactly this forward and
+            # lowered again whatever happens inside it.
+            self._draft_block_spec_info.host_lens_exact = draft_host_lens_exact
+            try:
+                with torch.inference_mode():
+                    draft_out = self.draft_model_runner.forward(forward_batch)
+            finally:
+                self._draft_block_spec_info.host_lens_exact = False
             self._audit_mark("draft_fwd")  # DFLASH AUDIT (env-gated)
             draft_logits_output = draft_out.logits_output
 
@@ -3236,6 +3316,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.block_size),
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            dcp_verify_prebuilt=dcp_verify_prebuilt,
         )
 
         batch.out_cache_loc = verify_out_cache_loc
