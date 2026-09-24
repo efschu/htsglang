@@ -10804,9 +10804,65 @@ def log_wake_credit_solve(ns, cards: List[Card], fits, log, label: str, *,
     for line in wplan.lines:
         log(line)
     _WAKE_CREDIT_FRONT_PLAN = wplan.front_plan
+    # H34: the other direction, P->D (P sleeps, D wakes), timed per card --
+    # printed BEFORE either riegel refuses, so the dry run shows both walls.
+    pd_refusal = log_wake_credit_solve_pd(
+        ns, cards, log, label, p_split=p_split, chunk_layers=int(chunk_layers),
+        n_layers=int(fits[0].n_layers), ratios=ratios, p_rows=p_rows, d_rows=d_rows,
+        slot_mib=float(fits[0].slot_mib),
+        p_resident=[_er.resident_rows(num_experts, float(f)) for f in fr_pp],
+        d_resident=[int(f.resident_rows) for f in fits])
     if wplan.refusal is not None:
         log(f"{_wc.MARKER} {wplan.refusal}")
         raise Weg2LaunchRefused(wplan.refusal)
+    if pd_refusal is not None:
+        raise Weg2LaunchRefused(pd_refusal)
+
+
+def log_wake_credit_solve_pd(ns, cards: List[Card], log, label: str, *, p_split,
+                             chunk_layers: int, n_layers: int, ratios, p_rows, d_rows,
+                             slot_mib: float, p_resident=None,
+                             d_resident=None) -> Optional[str]:
+    """H34: der Wake P->D der geplanten Form, je Karte in Millisekunden.
+
+    fnFL2x141: im P->D-Wake wartet D TP2 (nvml2) 73-94 ms an weights_4 und
+    427-472 ms an weights_6 auf Kredit; H14 rechnet nur D->P. Dieser Riegel
+    rechnet die gemessene Referenz derselben Form (Draft auf P: fnFL2x141,
+    H25: fnFL2x144, ``wake_credit_pd_refs``) plus die Pufferregel als Delta:
+    welche P-Freigabe auf welcher Karte wann kommt, welcher D-Tag wann
+    Kredit bekommt, engste Luft, Kreditwarten und was es das Leg kostet;
+    dazu die Empfehlung einer Band-Umstellung der knappsten Quelle (die Front
+    faehrt sie nur mit SGLANG_WEG2_ENABLE_PD_TIMED_ORDER=1). Rueckgabe: die
+    Verweigerung (W126, Kreditmangel P->D) oder None; die Front-Tabelle
+    haengt an ``_WAKE_CREDIT_FRONT_PLAN``."""
+    global _WAKE_CREDIT_FRONT_PLAN
+    from sglang.srt.weg2 import wake_credit_pd as _wpd
+
+    try:
+        pplan = _wpd.plan_wake_credit_pd(
+            model=ns.model, p_split=p_split, chunk_layers=int(chunk_layers),
+            n_layers=int(n_layers), p_card=[c.nvml_index for c in cards],
+            d_ratio=",".join(str(x) for x in ratios),
+            draft_on_p=bool(envs.SGLANG_WEG2_DRAFT_ON_P.get()),
+            p_rows=p_rows, d_rows=d_rows, slot_mib=float(slot_mib), label=label,
+            apply=bool(envs.SGLANG_WEG2_ENABLE_PD_TIMED_ORDER.get()),
+            p_resident=p_resident, d_resident=d_resident,
+        )
+    except (KeyError, ValueError, IndexError) as _exc:
+        log(f"{_wpd.MARKER} {_wpd.DIRECTION} {label} failed: {type(_exc).__name__}: {_exc}")
+        return None
+    for line in pplan.lines:
+        log(line)
+    if pplan.front_plan:
+        _WAKE_CREDIT_FRONT_PLAN = dict(_WAKE_CREDIT_FRONT_PLAN or {}, **pplan.front_plan)
+    if pplan.refusal is None:
+        return None
+    log(f"{_wpd.MARKER} {pplan.refusal}")
+    if not envs.SGLANG_WEG2_ENABLE_PD_CREDIT_REFUSAL.get():
+        log(f"{_wpd.MARKER} {_wpd.DIRECTION} {label}: Verweigerung abgeschaltet "
+            f"(SGLANG_WEG2_ENABLE_PD_CREDIT_REFUSAL=0) -- der Boot geht weiter")
+        return None
+    return pplan.refusal
 
 
 def publish_expert_map(ns, model: str, evidence_dir: str, log,

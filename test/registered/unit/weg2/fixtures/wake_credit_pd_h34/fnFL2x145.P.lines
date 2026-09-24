@@ -1,0 +1,220 @@
+[2026-09-24 11:14:21 PP2] MoE expert-offload active on layer 40: 376/512 experts resident + 32 scratch (buffer=408,
+[2026-09-24 11:14:31 PP1] MoE expert-offload active on layer 29: 231/512 experts resident + 32 scratch (buffer=263,
+[2026-09-24 11:15:26 PP0] MoE expert-offload active on layer 0: 134/512 experts resident + 32 scratch (buffer=166,
+[2026-09-24 11:20:16 PP0] WEG2-DC-BREAKDOWN stage=release tags=['kv_cache', 'cuda_graph'] nvml_proc=18620 MiB = tms_resident 16906 {'weights': 630, 'weights_0': 1686, 'weights_1': 1772, 'weights_2': 1650, 'weights_3': 1650, 'weights_4': 1660, 'weights_5': 1710, 'weights_6': 1650, 'weights_7': 1650, 'weights_8': 1660, 'weights_9': 1188}
+[2026-09-24 11:20:16 PP1] WEG2-DC-BREAKDOWN stage=release tags=['kv_cache', 'cuda_graph'] nvml_proc=9832 MiB = tms_resident 8824 {'weights_10': 2418, 'weights_11': 2354, 'weights_12': 2364, 'weights_13': 836, 'weights_9': 852}
+[2026-09-24 11:20:16 PP2] WEG2-DC-BREAKDOWN stage=release tags=['kv_cache', 'cuda_graph'] nvml_proc=11912 MiB = tms_resident 11020 {'weights': 1866, 'weights_13': 2302, 'weights_14': 3458, 'weights_15': 3394}
+[2026-09-24 11:20:16 PP0] WEG2-SLEEP-TAG-TIME tag=weights_13 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248816.953 t=1790248816.954
+[2026-09-24 11:20:16 PP2] WEG2-SEQ lane-time lane=c2 phase=deposit units=10 bytes=431022080 total_ms=6 wait_ms=0 copy_sync_ms=2 record_ms=1 ipc=yes syncs=8 batch=32u/64MiB t=1790248816.985 t0=1790248816.980
+[2026-09-24 11:20:16 PP1] WEG2-SEQ lane-time lane=c1 phase=deposit units=5 bytes=187632640 total_ms=5 wait_ms=0 copy_sync_ms=1 record_ms=0 ipc=yes syncs=3 batch=32u/64MiB t=1790248816.988 t0=1790248816.983
+[2026-09-24 11:20:17 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=80 bytes=201530672 total_ms=7 wait_ms=0 copy_sync_ms=1 record_ms=3 ipc=yes syncs=4 batch=32u/64MiB t=1790248817.053 t0=1790248817.046
+[2026-09-24 11:20:17 PP1] WEG2-BAR1 lane-time lane=p3 phase=deposit seq=1-weights_13 units=73 batches=69 bytes=215511040 total_ms=168 wait_ms=138
+[2026-09-24 11:20:17 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=1-weights_9 units=105 batches=96 bytes=299233280 total_ms=140 wait_ms=59
+[2026-09-24 11:20:17 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=1-weights_9 units=119 batches=110 bytes=344852480 total_ms=151 wait_ms=78
+[2026-09-24 11:20:17 PP2] WEG2-BAR1 lane-time lane=p5 phase=deposit seq=1-weights_13 units=129 batches=120 bytes=375265280 total_ms=220 wait_ms=119
+[2026-09-24 11:20:17 PP0] WEG2-SLEEP-TAG-TIME tag=weights_9 deposit_ms=244 sync_ms=0 pause_ms=4 credit_ms=0 gap_ms=0 total_ms=248 t0=1790248816.954 t=1790248817.202
+[2026-09-24 11:20:17 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=127 bytes=346247168 total_ms=18 wait_ms=0 copy_sync_ms=3 record_ms=8 ipc=yes syncs=6 batch=32u/64MiB t=1790248817.291 t0=1790248817.272
+[2026-09-24 11:20:17 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=1-weights_0 units=157 batches=143 bytes=448849920 total_ms=144 wait_ms=3
+[2026-09-24 11:20:17 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=1-weights_0 units=179 batches=165 bytes=517278720 total_ms=146 wait_ms=3
+[2026-09-24 11:20:17 PP0] WEG2-SLEEP-TAG-TIME tag=weights_0 deposit_ms=159 sync_ms=0 pause_ms=5 credit_ms=0 gap_ms=0 total_ms=164 t0=1790248817.202 t=1790248817.367
+[2026-09-24 11:20:17 PP0] WEG2-SLEEP-TAG-TIME tag=weights_14 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248817.367 t=1790248817.367
+[2026-09-24 11:20:17 PP0] WEG2-SLEEP-TAG-TIME tag=weights_10 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248817.367 t=1790248817.368
+[2026-09-24 11:20:17 PP1] WEG2-BAR1 lane-time lane=p2 phase=deposit seq=1-weights_13 units=44 batches=4 bytes=102324880 total_ms=624 wait_ms=606
+[2026-09-24 11:20:17 PP1] WEG2-SLEEP-TAG-TIME tag=weights_13 deposit_ms=661 sync_ms=0 pause_ms=12 credit_ms=0 gap_ms=0 total_ms=674 t0=1790248816.948 t=1790248817.622
+[2026-09-24 11:20:17 PP2] WEG2-BAR1 lane-time lane=p4 phase=deposit seq=1-weights_13 units=84 batches=7 bytes=218686784 total_ms=643 wait_ms=628
+[2026-09-24 11:20:17 PP1] WEG2-SEQ lane-time lane=c1 phase=deposit units=5 bytes=187632640 total_ms=9 wait_ms=0 copy_sync_ms=1 record_ms=0 ipc=yes syncs=3 batch=32u/64MiB t=1790248817.639 t0=1790248817.629
+[2026-09-24 11:20:17 PP2] WEG2-SLEEP-TAG-TIME tag=weights_13 deposit_ms=676 sync_ms=0 pause_ms=24 credit_ms=1 gap_ms=0 total_ms=701 t0=1790248816.948 t=1790248817.649
+[2026-09-24 11:20:17 PP2] WEG2-SLEEP-TAG-TIME tag=weights_9 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248817.649 t=1790248817.650
+[2026-09-24 11:20:17 PP2] WEG2-SLEEP-TAG-TIME tag=weights_0 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248817.650 t=1790248817.650
+[2026-09-24 11:20:17 PP1] WEG2-BAR1 lane-time lane=p2 phase=deposit seq=1-weights_9 units=42 batches=4 bytes=109343392 total_ms=44 wait_ms=24
+[2026-09-24 11:20:17 PP2] WEG2-SEQ lane-time lane=c2 phase=deposit units=15 bytes=646533120 total_ms=17 wait_ms=0 copy_sync_ms=3 record_ms=2 ipc=yes syncs=12 batch=32u/64MiB t=1790248817.676 t0=1790248817.659
+[2026-09-24 11:20:17 PP1] WEG2-BAR1 lane-time lane=p3 phase=deposit seq=1-weights_9 units=73 batches=69 bytes=215511040 total_ms=62 wait_ms=12
+[2026-09-24 11:20:17 PP1] WEG2-SLEEP-TAG-TIME tag=weights_9 deposit_ms=71 sync_ms=0 pause_ms=9 credit_ms=0 gap_ms=0 total_ms=80 t0=1790248817.623 t=1790248817.703
+[2026-09-24 11:20:17 PP1] WEG2-SLEEP-TAG-TIME tag=weights_0 deposit_ms=1 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248817.703 t=1790248817.704
+[2026-09-24 11:20:17 PP1] WEG2-SLEEP-TAG-TIME tag=weights_14 deposit_ms=1 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248817.704 t=1790248817.705
+[2026-09-24 11:20:17 PP1] WEG2-SEQ lane-time lane=c1 phase=deposit units=15 bytes=562897920 total_ms=15 wait_ms=0 copy_sync_ms=2 record_ms=1 ipc=yes syncs=9 batch=32u/64MiB t=1790248817.725 t0=1790248817.711
+[2026-09-24 11:20:17 PP2] WEG2-BAR1 lane-time lane=p5 phase=deposit seq=1-weights_14 units=193 batches=179 bytes=562897920 total_ms=127 wait_ms=11
+[2026-09-24 11:20:17 PP2] WEG2-BAR1 lane-time lane=p4 phase=deposit seq=1-weights_14 units=128 batches=10 bytes=321011664 total_ms=157 wait_ms=138
+[2026-09-24 11:20:17 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=119 bytes=305805264 total_ms=28 wait_ms=0 copy_sync_ms=6 record_ms=8 ipc=yes syncs=6 batch=32u/64MiB t=1790248817.841 t0=1790248817.813
+[2026-09-24 11:20:17 PP1] WEG2-BAR1 lane-time lane=p3 phase=deposit seq=1-weights_10 units=220 batches=206 bytes=646533120 total_ms=167 wait_ms=3
+[2026-09-24 11:20:17 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=1-weights_1 units=157 batches=143 bytes=448849920 total_ms=537 wait_ms=6
+[2026-09-24 11:20:17 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=1-weights_1 units=179 batches=165 bytes=517278720 total_ms=542 wait_ms=6
+[2026-09-24 11:20:17 PP2] WEG2-SLEEP-TAG-TIME tag=weights_14 deposit_ms=167 sync_ms=0 pause_ms=97 credit_ms=0 gap_ms=0 total_ms=264 t0=1790248817.651 t=1790248817.915
+[2026-09-24 11:20:17 PP2] WEG2-SLEEP-TAG-TIME tag=weights_10 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248817.915 t=1790248817.916
+[2026-09-24 11:20:17 PP2] WEG2-SLEEP-TAG-TIME tag=weights_1 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248817.916 t=1790248817.916
+[2026-09-24 11:20:17 PP0] WEG2-SLEEP-TAG-TIME tag=weights_1 deposit_ms=547 sync_ms=0 pause_ms=8 credit_ms=0 gap_ms=0 total_ms=555 t0=1790248817.368 t=1790248817.923
+[2026-09-24 11:20:17 PP0] WEG2-SLEEP-TAG-TIME tag=weights_15 deposit_ms=1 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248817.923 t=1790248817.924
+[2026-09-24 11:20:17 PP0] WEG2-SLEEP-TAG-TIME tag=weights_11 deposit_ms=1 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248817.924 t=1790248817.925
+[2026-09-24 11:20:17 PP1] WEG2-BAR1 lane-time lane=p2 phase=deposit seq=1-weights_10 units=128 batches=10 bytes=321011664 total_ms=214 wait_ms=168
+[2026-09-24 11:20:17 PP2] WEG2-SEQ lane-time lane=c2 phase=deposit units=15 bytes=646533120 total_ms=10 wait_ms=0 copy_sync_ms=2 record_ms=1 ipc=yes syncs=12 batch=32u/64MiB t=1790248817.932 t0=1790248817.922
+[2026-09-24 11:20:17 PP1] WEG2-SLEEP-TAG-TIME tag=weights_10 deposit_ms=225 sync_ms=0 pause_ms=33 credit_ms=0 gap_ms=0 total_ms=259 t0=1790248817.705 t=1790248817.964
+[2026-09-24 11:20:17 PP1] WEG2-SLEEP-TAG-TIME tag=weights_1 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248817.964 t=1790248817.965
+[2026-09-24 11:20:17 PP1] WEG2-SLEEP-TAG-TIME tag=weights_15 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248817.965 t=1790248817.965
+[2026-09-24 11:20:17 PP1] WEG2-SEQ lane-time lane=c1 phase=deposit units=15 bytes=562897920 total_ms=10 wait_ms=0 copy_sync_ms=2 record_ms=1 ipc=yes syncs=9 batch=32u/64MiB t=1790248817.979 t0=1790248817.969
+[2026-09-24 11:20:18 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=119 bytes=305805264 total_ms=19 wait_ms=0 copy_sync_ms=2 record_ms=12 ipc=yes syncs=6 batch=32u/64MiB t=1790248818.001 t0=1790248817.982
+[2026-09-24 11:20:18 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=1-weights_2 units=179 batches=165 bytes=517278720 total_ms=145 wait_ms=54
+[2026-09-24 11:20:18 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=1-weights_2 units=157 batches=143 bytes=448849920 total_ms=146 wait_ms=33
+[2026-09-24 11:20:18 PP0] WEG2-SLEEP-TAG-TIME tag=weights_2 deposit_ms=151 sync_ms=0 pause_ms=6 credit_ms=0 gap_ms=0 total_ms=157 t0=1790248817.925 t=1790248818.082
+[2026-09-24 11:20:18 PP0] WEG2-SLEEP-TAG-TIME tag=weights_12 deposit_ms=1 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248818.083 t=1790248818.083
+[2026-09-24 11:20:18 PP2] WEG2-BAR1 lane-time lane=p4 phase=deposit seq=1-weights_15 units=128 batches=10 bytes=321011664 total_ms=188 wait_ms=142
+[2026-09-24 11:20:18 PP1] WEG2-BAR1 lane-time lane=p2 phase=deposit seq=1-weights_11 units=128 batches=10 bytes=321011664 total_ms=170 wait_ms=103
+[2026-09-24 11:20:18 PP2] WEG2-BAR1 lane-time lane=p5 phase=deposit seq=1-weights_15 units=193 batches=179 bytes=562897920 total_ms=221 wait_ms=31
+[2026-09-24 11:20:18 PP1] WEG2-BAR1 lane-time lane=p3 phase=deposit seq=1-weights_11 units=220 batches=206 bytes=646533120 total_ms=173 wait_ms=2
+[2026-09-24 11:20:18 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=119 bytes=305805264 total_ms=8 wait_ms=0 copy_sync_ms=1 record_ms=5 ipc=yes syncs=6 batch=32u/64MiB t=1790248818.148 t0=1790248818.140
+[2026-09-24 11:20:18 PP1] WEG2-SLEEP-TAG-TIME tag=weights_11 deposit_ms=180 sync_ms=0 pause_ms=32 credit_ms=0 gap_ms=0 total_ms=212 t0=1790248817.965 t=1790248818.177
+[2026-09-24 11:20:18 PP1] WEG2-SLEEP-TAG-TIME tag=weights_2 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.178 t=1790248818.178
+[2026-09-24 11:20:18 PP2] WEG2-SLEEP-TAG-TIME tag=weights_15 deposit_ms=228 sync_ms=0 pause_ms=34 credit_ms=0 gap_ms=0 total_ms=263 t0=1790248817.916 t=1790248818.179
+[2026-09-24 11:20:18 PP2] WEG2-SLEEP-TAG-TIME tag=weights_11 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.179 t=1790248818.180
+[2026-09-24 11:20:18 PP2] WEG2-SLEEP-TAG-TIME tag=weights_2 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.180 t=1790248818.180
+[2026-09-24 11:20:18 PP2] WEG2-SLEEP-TAG-TIME tag=weights_12 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.181 t=1790248818.181
+[2026-09-24 11:20:18 PP2] WEG2-SLEEP-TAG-TIME tag=weights_3 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.181 t=1790248818.181
+[2026-09-24 11:20:18 PP2] WEG2-SLEEP-TAG-TIME tag=weights_4 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.181 t=1790248818.182
+[2026-09-24 11:20:18 PP2] WEG2-SLEEP-TAG-TIME tag=weights_5 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248818.182 t=1790248818.183
+[2026-09-24 11:20:18 PP2] WEG2-SLEEP-TAG-TIME tag=weights_6 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.183 t=1790248818.183
+[2026-09-24 11:20:18 PP2] WEG2-SLEEP-TAG-TIME tag=weights_7 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.183 t=1790248818.184
+[2026-09-24 11:20:18 PP2] WEG2-SLEEP-TAG-TIME tag=weights_8 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.184 t=1790248818.184
+[2026-09-24 11:20:18 PP1] WEG2-SEQ lane-time lane=c1 phase=deposit units=15 bytes=562897920 total_ms=9 wait_ms=0 copy_sync_ms=2 record_ms=1 ipc=yes syncs=9 batch=32u/64MiB t=1790248818.193 t0=1790248818.184
+[2026-09-24 11:20:18 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=1-weights_3 units=179 batches=165 bytes=517278720 total_ms=194 wait_ms=87
+[2026-09-24 11:20:18 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=1-weights_3 units=157 batches=143 bytes=448849920 total_ms=202 wait_ms=107
+[2026-09-24 11:20:18 PP1] WEG2-BAR1 lane-time lane=p2 phase=deposit seq=1-weights_12 units=126 batches=10 bytes=328030176 total_ms=109 wait_ms=49
+[2026-09-24 11:20:18 PP0] WEG2-SLEEP-TAG-TIME tag=weights_3 deposit_ms=208 sync_ms=0 pause_ms=6 credit_ms=0 gap_ms=0 total_ms=214 t0=1790248818.084 t=1790248818.297
+[2026-09-24 11:20:18 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=117 bytes=312823776 total_ms=18 wait_ms=0 copy_sync_ms=5 record_ms=8 ipc=yes syncs=6 batch=32u/64MiB t=1790248818.323 t0=1790248818.305
+[2026-09-24 11:20:18 PP1] WEG2-BAR1 lane-time lane=p3 phase=deposit seq=1-weights_12 units=220 batches=206 bytes=646533120 total_ms=192 wait_ms=3
+[2026-09-24 11:20:18 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=1-weights_4 units=157 batches=143 bytes=448849920 total_ms=100 wait_ms=4
+[2026-09-24 11:20:18 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=1-weights_4 units=179 batches=165 bytes=517278720 total_ms=107 wait_ms=6
+[2026-09-24 11:20:18 PP0] WEG2-SLEEP-TAG-TIME tag=weights_4 deposit_ms=115 sync_ms=0 pause_ms=7 credit_ms=0 gap_ms=0 total_ms=122 t0=1790248818.298 t=1790248818.419
+[2026-09-24 11:20:18 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=119 bytes=305805264 total_ms=12 wait_ms=0 copy_sync_ms=2 record_ms=5 ipc=yes syncs=6 batch=32u/64MiB t=1790248818.438 t0=1790248818.426
+[2026-09-24 11:20:18 PP1] WEG2-SLEEP-TAG-TIME tag=weights_12 deposit_ms=201 sync_ms=0 pause_ms=59 credit_ms=0 gap_ms=0 total_ms=260 t0=1790248818.178 t=1790248818.439
+[2026-09-24 11:20:18 PP1] WEG2-SLEEP-TAG-TIME tag=weights_3 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.439 t=1790248818.439
+[2026-09-24 11:20:18 PP1] WEG2-SLEEP-TAG-TIME tag=weights_4 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.439 t=1790248818.440
+[2026-09-24 11:20:18 PP1] WEG2-SLEEP-TAG-TIME tag=weights_5 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.440 t=1790248818.440
+[2026-09-24 11:20:18 PP1] WEG2-SLEEP-TAG-TIME tag=weights_6 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.440 t=1790248818.441
+[2026-09-24 11:20:18 PP1] WEG2-SLEEP-TAG-TIME tag=weights_7 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.441 t=1790248818.441
+[2026-09-24 11:20:18 PP1] WEG2-SLEEP-TAG-TIME tag=weights_8 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.441 t=1790248818.441
+[2026-09-24 11:20:18 PP1] WEG2-SLEEP-TAG-TIME tag=weights deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248818.442 t=1790248818.442
+[2026-09-24 11:20:18 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=1-weights_5 units=157 batches=143 bytes=448849920 total_ms=94 wait_ms=2
+[2026-09-24 11:20:18 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=1-weights_5 units=179 batches=165 bytes=517278720 total_ms=100 wait_ms=2
+[2026-09-24 11:20:18 PP0] WEG2-SLEEP-TAG-TIME tag=weights_5 deposit_ms=108 sync_ms=0 pause_ms=6 credit_ms=0 gap_ms=0 total_ms=114 t0=1790248818.420 t=1790248818.534
+[2026-09-24 11:20:18 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=119 bytes=305805264 total_ms=11 wait_ms=0 copy_sync_ms=2 record_ms=4 ipc=yes syncs=6 batch=32u/64MiB t=1790248818.551 t0=1790248818.541
+[2026-09-24 11:20:18 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=1-weights_6 units=157 batches=143 bytes=448849920 total_ms=100 wait_ms=1
+[2026-09-24 11:20:18 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=1-weights_6 units=179 batches=165 bytes=517278720 total_ms=104 wait_ms=1
+[2026-09-24 11:20:18 PP0] WEG2-SLEEP-TAG-TIME tag=weights_6 deposit_ms=112 sync_ms=0 pause_ms=5 credit_ms=0 gap_ms=0 total_ms=117 t0=1790248818.534 t=1790248818.651
+[2026-09-24 11:20:18 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=119 bytes=305805264 total_ms=14 wait_ms=0 copy_sync_ms=2 record_ms=7 ipc=yes syncs=6 batch=32u/64MiB t=1790248818.672 t0=1790248818.659
+[2026-09-24 11:20:18 PP2] WEG2-BAR1 lane-time lane=p4 phase=deposit seq=1-weights units=25 batches=20 bytes=658759696 total_ms=511 wait_ms=386
+[2026-09-24 11:20:18 PP2] WEG2-SLEEP-TAG-TIME tag=weights deposit_ms=512 sync_ms=0 pause_ms=18 credit_ms=0 gap_ms=0 total_ms=530 t0=1790248818.184 t=1790248818.715
+[2026-09-24 11:20:18 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=1-weights_7 units=157 batches=143 bytes=448849920 total_ms=66 wait_ms=4
+[2026-09-24 11:20:18 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=1-weights_7 units=179 batches=165 bytes=517278720 total_ms=116 wait_ms=80
+[2026-09-24 11:20:18 PP0] WEG2-SLEEP-TAG-TIME tag=weights_7 deposit_ms=124 sync_ms=0 pause_ms=5 credit_ms=0 gap_ms=0 total_ms=129 t0=1790248818.651 t=1790248818.780
+[2026-09-24 11:20:18 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=117 bytes=312823776 total_ms=13 wait_ms=0 copy_sync_ms=4 record_ms=6 ipc=yes syncs=6 batch=32u/64MiB t=1790248818.801 t0=1790248818.788
+[2026-09-24 11:20:18 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=1-weights_8 units=157 batches=143 bytes=448849920 total_ms=100 wait_ms=4
+[2026-09-24 11:20:18 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=1-weights_8 units=179 batches=165 bytes=517278720 total_ms=101 wait_ms=2
+[2026-09-24 11:20:18 PP0] WEG2-SLEEP-TAG-TIME tag=weights_8 deposit_ms=109 sync_ms=0 pause_ms=6 credit_ms=1 gap_ms=0 total_ms=115 t0=1790248818.780 t=1790248818.896
+[2026-09-24 11:20:18 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=3 bytes=645632016 total_ms=3 wait_ms=0 copy_sync_ms=1 record_ms=0 ipc=yes syncs=2 batch=32u/64MiB t=1790248818.905 t0=1790248818.902
+[2026-09-24 11:20:18 PP0] WEG2-SLEEP-TAG-TIME tag=weights deposit_ms=9 sync_ms=0 pause_ms=1 credit_ms=0 gap_ms=1 total_ms=10 t0=1790248818.897 t=1790248818.906
+[2026-09-24 11:20:40 PP0] WEG2-SLEEP-TAG-TIME tag=weights_13 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248840.270 t=1790248840.271
+[2026-09-24 11:20:40 PP2] WEG2-SEQ lane-time lane=c2 phase=deposit units=10 bytes=431022080 total_ms=5 wait_ms=0 copy_sync_ms=2 record_ms=1 ipc=yes syncs=8 batch=32u/64MiB t=1790248840.276 t0=1790248840.271
+[2026-09-24 11:20:40 PP1] WEG2-SEQ lane-time lane=c1 phase=deposit units=5 bytes=187632640 total_ms=3 wait_ms=0 copy_sync_ms=1 record_ms=0 ipc=yes syncs=3 batch=32u/64MiB t=1790248840.276 t0=1790248840.273
+[2026-09-24 11:20:40 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=80 bytes=201530672 total_ms=6 wait_ms=0 copy_sync_ms=1 record_ms=3 ipc=yes syncs=4 batch=32u/64MiB t=1790248840.286 t0=1790248840.279
+[2026-09-24 11:20:40 PP1] WEG2-BAR1 lane-time lane=p2 phase=deposit seq=3-weights_13 units=44 batches=4 bytes=102324880 total_ms=19 wait_ms=0
+[2026-09-24 11:20:40 PP2] WEG2-BAR1 lane-time lane=p4 phase=deposit seq=3-weights_13 units=84 batches=7 bytes=218686784 total_ms=40 wait_ms=3
+[2026-09-24 11:20:40 PP1] WEG2-BAR1 lane-time lane=p3 phase=deposit seq=3-weights_13 units=73 batches=69 bytes=215511040 total_ms=54 wait_ms=7
+[2026-09-24 11:20:40 PP1] WEG2-SLEEP-TAG-TIME tag=weights_13 deposit_ms=59 sync_ms=0 pause_ms=12 credit_ms=0 gap_ms=0 total_ms=71 t0=1790248840.268 t=1790248840.339
+[2026-09-24 11:20:40 PP1] WEG2-SEQ lane-time lane=c1 phase=deposit units=5 bytes=187632640 total_ms=4 wait_ms=0 copy_sync_ms=1 record_ms=0 ipc=yes syncs=3 batch=32u/64MiB t=1790248840.347 t0=1790248840.343
+[2026-09-24 11:20:40 PP1] WEG2-BAR1 lane-time lane=p2 phase=deposit seq=3-weights_9 units=42 batches=4 bytes=109343392 total_ms=19 wait_ms=0
+[2026-09-24 11:20:40 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=3-weights_9 units=105 batches=96 bytes=299233280 total_ms=115 wait_ms=19
+[2026-09-24 11:20:40 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=3-weights_9 units=119 batches=110 bytes=344852480 total_ms=118 wait_ms=20
+[2026-09-24 11:20:40 PP1] WEG2-BAR1 lane-time lane=p3 phase=deposit seq=3-weights_9 units=73 batches=69 bytes=215511040 total_ms=53 wait_ms=1
+[2026-09-24 11:20:40 PP0] WEG2-SLEEP-TAG-TIME tag=weights_9 deposit_ms=126 sync_ms=0 pause_ms=5 credit_ms=0 gap_ms=0 total_ms=131 t0=1790248840.271 t=1790248840.402
+[2026-09-24 11:20:40 PP1] WEG2-SLEEP-TAG-TIME tag=weights_9 deposit_ms=57 sync_ms=0 pause_ms=9 credit_ms=0 gap_ms=0 total_ms=66 t0=1790248840.340 t=1790248840.406
+[2026-09-24 11:20:40 PP1] WEG2-SLEEP-TAG-TIME tag=weights_0 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248840.406 t=1790248840.407
+[2026-09-24 11:20:40 PP1] WEG2-SLEEP-TAG-TIME tag=weights_14 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=2 total_ms=1 t0=1790248840.409 t=1790248840.409
+[2026-09-24 11:20:40 PP2] WEG2-BAR1 lane-time lane=p5 phase=deposit seq=3-weights_13 units=129 batches=120 bytes=375265280 total_ms=139 wait_ms=2
+[2026-09-24 11:20:40 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=127 bytes=346247168 total_ms=21 wait_ms=0 copy_sync_ms=4 record_ms=11 ipc=yes syncs=6 batch=32u/64MiB t=1790248840.433 t0=1790248840.412
+[2026-09-24 11:20:40 PP1] WEG2-SEQ lane-time lane=c1 phase=deposit units=15 bytes=562897920 total_ms=18 wait_ms=0 copy_sync_ms=4 record_ms=1 ipc=yes syncs=9 batch=32u/64MiB t=1790248840.435 t0=1790248840.417
+[2026-09-24 11:20:40 PP2] WEG2-SLEEP-TAG-TIME tag=weights_13 deposit_ms=145 sync_ms=0 pause_ms=41 credit_ms=0 gap_ms=0 total_ms=186 t0=1790248840.266 t=1790248840.452
+[2026-09-24 11:20:40 PP2] WEG2-SLEEP-TAG-TIME tag=weights_9 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248840.452 t=1790248840.453
+[2026-09-24 11:20:40 PP2] WEG2-SLEEP-TAG-TIME tag=weights_0 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248840.453 t=1790248840.453
+[2026-09-24 11:20:40 PP2] WEG2-SEQ lane-time lane=c2 phase=deposit units=15 bytes=646533120 total_ms=10 wait_ms=0 copy_sync_ms=3 record_ms=1 ipc=yes syncs=12 batch=32u/64MiB t=1790248840.471 t0=1790248840.461
+[2026-09-24 11:20:40 PP1] WEG2-BAR1 lane-time lane=p2 phase=deposit seq=3-weights_10 units=128 batches=10 bytes=321011664 total_ms=74 wait_ms=1
+[2026-09-24 11:20:40 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=3-weights_0 units=157 batches=143 bytes=448849920 total_ms=117 wait_ms=13
+[2026-09-24 11:20:40 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=3-weights_0 units=179 batches=165 bytes=517278720 total_ms=131 wait_ms=18
+[2026-09-24 11:20:40 PP0] WEG2-SLEEP-TAG-TIME tag=weights_0 deposit_ms=142 sync_ms=0 pause_ms=6 credit_ms=0 gap_ms=0 total_ms=149 t0=1790248840.403 t=1790248840.552
+[2026-09-24 11:20:40 PP2] WEG2-BAR1 lane-time lane=p4 phase=deposit seq=3-weights_14 units=128 batches=10 bytes=321011664 total_ms=88 wait_ms=1
+[2026-09-24 11:20:40 PP0] WEG2-SLEEP-TAG-TIME tag=weights_14 deposit_ms=1 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248840.552 t=1790248840.553
+[2026-09-24 11:20:40 PP0] WEG2-SLEEP-TAG-TIME tag=weights_10 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248840.553 t=1790248840.553
+[2026-09-24 11:20:40 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=119 bytes=305805264 total_ms=14 wait_ms=0 copy_sync_ms=2 record_ms=7 ipc=yes syncs=6 batch=32u/64MiB t=1790248840.577 t0=1790248840.563
+[2026-09-24 11:20:40 PP1] WEG2-BAR1 lane-time lane=p3 phase=deposit seq=3-weights_10 units=220 batches=206 bytes=646533120 total_ms=167 wait_ms=7
+[2026-09-24 11:20:40 PP1] WEG2-SLEEP-TAG-TIME tag=weights_10 deposit_ms=180 sync_ms=0 pause_ms=34 credit_ms=0 gap_ms=0 total_ms=214 t0=1790248840.409 t=1790248840.623
+[2026-09-24 11:20:40 PP1] WEG2-SLEEP-TAG-TIME tag=weights_1 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248840.624 t=1790248840.624
+[2026-09-24 11:20:40 PP1] WEG2-SLEEP-TAG-TIME tag=weights_15 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248840.625 t=1790248840.625
+[2026-09-24 11:20:40 PP1] WEG2-SEQ lane-time lane=c1 phase=deposit units=15 bytes=562897920 total_ms=14 wait_ms=0 copy_sync_ms=3 record_ms=1 ipc=yes syncs=9 batch=32u/64MiB t=1790248840.648 t0=1790248840.633
+[2026-09-24 11:20:40 PP1] WEG2-BAR1 lane-time lane=p2 phase=deposit seq=3-weights_11 units=128 batches=10 bytes=321011664 total_ms=53 wait_ms=0
+[2026-09-24 11:20:40 PP2] WEG2-BAR1 lane-time lane=p5 phase=deposit seq=3-weights_14 units=193 batches=179 bytes=562897920 total_ms=240 wait_ms=2
+[2026-09-24 11:20:40 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=3-weights_1 units=157 batches=143 bytes=448849920 total_ms=144 wait_ms=3
+[2026-09-24 11:20:40 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=3-weights_1 units=179 batches=165 bytes=517278720 total_ms=146 wait_ms=4
+[2026-09-24 11:20:40 PP0] WEG2-SLEEP-TAG-TIME tag=weights_1 deposit_ms=156 sync_ms=0 pause_ms=6 credit_ms=0 gap_ms=0 total_ms=162 t0=1790248840.553 t=1790248840.716
+[2026-09-24 11:20:40 PP0] WEG2-SLEEP-TAG-TIME tag=weights_15 deposit_ms=1 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248840.716 t=1790248840.717
+[2026-09-24 11:20:40 PP0] WEG2-SLEEP-TAG-TIME tag=weights_11 deposit_ms=1 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=2 t0=1790248840.718 t=1790248840.719
+[2026-09-24 11:20:40 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=119 bytes=305805264 total_ms=28 wait_ms=0 copy_sync_ms=2 record_ms=5 ipc=yes syncs=6 batch=32u/64MiB t=1790248840.756 t0=1790248840.728
+[2026-09-24 11:20:40 PP2] WEG2-SLEEP-TAG-TIME tag=weights_14 deposit_ms=250 sync_ms=0 pause_ms=55 credit_ms=0 gap_ms=0 total_ms=305 t0=1790248840.454 t=1790248840.759
+[2026-09-24 11:20:40 PP2] WEG2-SLEEP-TAG-TIME tag=weights_10 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248840.759 t=1790248840.759
+[2026-09-24 11:20:40 PP2] WEG2-SLEEP-TAG-TIME tag=weights_1 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248840.759 t=1790248840.759
+[2026-09-24 11:20:40 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=3-weights_2 units=157 batches=143 bytes=448849920 total_ms=71 wait_ms=7
+[2026-09-24 11:20:40 PP2] WEG2-SEQ lane-time lane=c2 phase=deposit units=15 bytes=646533120 total_ms=41 wait_ms=0 copy_sync_ms=3 record_ms=1 ipc=yes syncs=12 batch=32u/64MiB t=1790248840.805 t0=1790248840.764
+[2026-09-24 11:20:40 PP1] WEG2-BAR1 lane-time lane=p3 phase=deposit seq=3-weights_11 units=220 batches=206 bytes=646533120 total_ms=221 wait_ms=105
+[2026-09-24 11:20:40 PP2] WEG2-BAR1 lane-time lane=p4 phase=deposit seq=3-weights_15 units=128 batches=10 bytes=321011664 total_ms=98 wait_ms=0
+[2026-09-24 11:20:40 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=3-weights_2 units=179 batches=165 bytes=517278720 total_ms=144 wait_ms=84
+[2026-09-24 11:20:40 PP0] WEG2-SLEEP-TAG-TIME tag=weights_2 deposit_ms=159 sync_ms=0 pause_ms=7 credit_ms=0 gap_ms=0 total_ms=166 t0=1790248840.719 t=1790248840.885
+[2026-09-24 11:20:40 PP0] WEG2-SLEEP-TAG-TIME tag=weights_12 deposit_ms=1 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248840.886 t=1790248840.887
+[2026-09-24 11:20:40 PP1] WEG2-SLEEP-TAG-TIME tag=weights_11 deposit_ms=235 sync_ms=0 pause_ms=32 credit_ms=0 gap_ms=0 total_ms=267 t0=1790248840.625 t=1790248840.893
+[2026-09-24 11:20:40 PP1] WEG2-SLEEP-TAG-TIME tag=weights_2 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=1 t0=1790248840.893 t=1790248840.893
+[2026-09-24 11:20:40 PP1] WEG2-SEQ lane-time lane=c1 phase=deposit units=15 bytes=562897920 total_ms=8 wait_ms=0 copy_sync_ms=3 record_ms=1 ipc=yes syncs=9 batch=32u/64MiB t=1790248840.908 t0=1790248840.900
+[2026-09-24 11:20:40 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=119 bytes=305805264 total_ms=12 wait_ms=0 copy_sync_ms=2 record_ms=7 ipc=yes syncs=6 batch=32u/64MiB t=1790248840.909 t0=1790248840.897
+[2026-09-24 11:20:40 PP2] WEG2-BAR1 lane-time lane=p5 phase=deposit seq=3-weights_15 units=193 batches=179 bytes=562897920 total_ms=183 wait_ms=1
+[2026-09-24 11:20:40 PP1] WEG2-BAR1 lane-time lane=p2 phase=deposit seq=3-weights_12 units=126 batches=10 bytes=328030176 total_ms=57 wait_ms=0
+[2026-09-24 11:20:41 PP2] WEG2-SLEEP-TAG-TIME tag=weights_15 deposit_ms=191 sync_ms=0 pause_ms=85 credit_ms=0 gap_ms=0 total_ms=277 t0=1790248840.760 t=1790248841.036
+[2026-09-24 11:20:41 PP2] WEG2-SLEEP-TAG-TIME tag=weights_11 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.036 t=1790248841.037
+[2026-09-24 11:20:41 PP2] WEG2-SLEEP-TAG-TIME tag=weights_2 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.037 t=1790248841.037
+[2026-09-24 11:20:41 PP2] WEG2-SLEEP-TAG-TIME tag=weights_12 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.037 t=1790248841.037
+[2026-09-24 11:20:41 PP2] WEG2-SLEEP-TAG-TIME tag=weights_3 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.038 t=1790248841.038
+[2026-09-24 11:20:41 PP2] WEG2-SLEEP-TAG-TIME tag=weights_4 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.038 t=1790248841.038
+[2026-09-24 11:20:41 PP2] WEG2-SLEEP-TAG-TIME tag=weights_5 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.038 t=1790248841.039
+[2026-09-24 11:20:41 PP2] WEG2-SLEEP-TAG-TIME tag=weights_6 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.039 t=1790248841.040
+[2026-09-24 11:20:41 PP2] WEG2-SLEEP-TAG-TIME tag=weights_7 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.040 t=1790248841.040
+[2026-09-24 11:20:41 PP2] WEG2-SLEEP-TAG-TIME tag=weights_8 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.040 t=1790248841.041
+[2026-09-24 11:20:41 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=3-weights_3 units=157 batches=143 bytes=448849920 total_ms=166 wait_ms=77
+[2026-09-24 11:20:41 PP1] WEG2-BAR1 lane-time lane=p3 phase=deposit seq=3-weights_12 units=220 batches=206 bytes=646533120 total_ms=175 wait_ms=7
+[2026-09-24 11:20:41 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=3-weights_3 units=179 batches=165 bytes=517278720 total_ms=187 wait_ms=94
+[2026-09-24 11:20:41 PP0] WEG2-SLEEP-TAG-TIME tag=weights_3 deposit_ms=198 sync_ms=0 pause_ms=6 credit_ms=0 gap_ms=0 total_ms=204 t0=1790248840.887 t=1790248841.091
+[2026-09-24 11:20:41 PP1] WEG2-SLEEP-TAG-TIME tag=weights_12 deposit_ms=184 sync_ms=0 pause_ms=36 credit_ms=0 gap_ms=0 total_ms=221 t0=1790248840.894 t=1790248841.114
+[2026-09-24 11:20:41 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=117 bytes=312823776 total_ms=16 wait_ms=0 copy_sync_ms=3 record_ms=7 ipc=yes syncs=6 batch=32u/64MiB t=1790248841.115 t0=1790248841.099
+[2026-09-24 11:20:41 PP1] WEG2-SLEEP-TAG-TIME tag=weights_3 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.114 t=1790248841.115
+[2026-09-24 11:20:41 PP1] WEG2-SLEEP-TAG-TIME tag=weights_4 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.115 t=1790248841.115
+[2026-09-24 11:20:41 PP1] WEG2-SLEEP-TAG-TIME tag=weights_5 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.115 t=1790248841.116
+[2026-09-24 11:20:41 PP1] WEG2-SLEEP-TAG-TIME tag=weights_6 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.116 t=1790248841.116
+[2026-09-24 11:20:41 PP1] WEG2-SLEEP-TAG-TIME tag=weights_7 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.116 t=1790248841.117
+[2026-09-24 11:20:41 PP1] WEG2-SLEEP-TAG-TIME tag=weights_8 deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.117 t=1790248841.117
+[2026-09-24 11:20:41 PP1] WEG2-SLEEP-TAG-TIME tag=weights deposit_ms=0 sync_ms=0 pause_ms=0 credit_ms=0 gap_ms=0 total_ms=0 t0=1790248841.117 t=1790248841.117
+[2026-09-24 11:20:41 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=3-weights_4 units=157 batches=143 bytes=448849920 total_ms=94 wait_ms=6
+[2026-09-24 11:20:41 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=3-weights_4 units=179 batches=165 bytes=517278720 total_ms=99 wait_ms=4
+[2026-09-24 11:20:41 PP0] WEG2-SLEEP-TAG-TIME tag=weights_4 deposit_ms=109 sync_ms=0 pause_ms=5 credit_ms=0 gap_ms=0 total_ms=115 t0=1790248841.091 t=1790248841.206
+[2026-09-24 11:20:41 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=119 bytes=305805264 total_ms=17 wait_ms=0 copy_sync_ms=2 record_ms=9 ipc=yes syncs=6 batch=32u/64MiB t=1790248841.231 t0=1790248841.214
+[2026-09-24 11:20:41 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=3-weights_5 units=157 batches=143 bytes=448849920 total_ms=96 wait_ms=2
+[2026-09-24 11:20:41 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=3-weights_5 units=179 batches=165 bytes=517278720 total_ms=101 wait_ms=2
+[2026-09-24 11:20:41 PP0] WEG2-SLEEP-TAG-TIME tag=weights_5 deposit_ms=109 sync_ms=0 pause_ms=6 credit_ms=0 gap_ms=0 total_ms=115 t0=1790248841.206 t=1790248841.321
+[2026-09-24 11:20:41 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=119 bytes=305805264 total_ms=14 wait_ms=0 copy_sync_ms=4 record_ms=6 ipc=yes syncs=6 batch=32u/64MiB t=1790248841.344 t0=1790248841.330
+[2026-09-24 11:20:41 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=3-weights_6 units=157 batches=143 bytes=448849920 total_ms=106 wait_ms=12
+[2026-09-24 11:20:41 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=3-weights_6 units=179 batches=165 bytes=517278720 total_ms=107 wait_ms=7
+[2026-09-24 11:20:41 PP0] WEG2-SLEEP-TAG-TIME tag=weights_6 deposit_ms=117 sync_ms=0 pause_ms=7 credit_ms=1 gap_ms=0 total_ms=125 t0=1790248841.321 t=1790248841.446
+[2026-09-24 11:20:41 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=119 bytes=305805264 total_ms=22 wait_ms=0 copy_sync_ms=2 record_ms=11 ipc=yes syncs=6 batch=32u/64MiB t=1790248841.481 t0=1790248841.460
+[2026-09-24 11:20:41 PP2] WEG2-BAR1 lane-time lane=p4 phase=deposit seq=3-weights units=25 batches=20 bytes=658759696 total_ms=442 wait_ms=349
+[2026-09-24 11:20:41 PP2] WEG2-SLEEP-TAG-TIME tag=weights deposit_ms=444 sync_ms=0 pause_ms=16 credit_ms=0 gap_ms=0 total_ms=460 t0=1790248841.041 t=1790248841.501
+[2026-09-24 11:20:41 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=3-weights_7 units=157 batches=143 bytes=448849920 total_ms=70 wait_ms=9
+[2026-09-24 11:20:41 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=3-weights_7 units=179 batches=165 bytes=517278720 total_ms=110 wait_ms=75
+[2026-09-24 11:20:41 PP0] WEG2-SLEEP-TAG-TIME tag=weights_7 deposit_ms=127 sync_ms=0 pause_ms=5 credit_ms=0 gap_ms=0 total_ms=132 t0=1790248841.446 t=1790248841.579
+[2026-09-24 11:20:41 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=117 bytes=312823776 total_ms=18 wait_ms=0 copy_sync_ms=6 record_ms=6 ipc=yes syncs=6 batch=32u/64MiB t=1790248841.607 t0=1790248841.589
+[2026-09-24 11:20:41 PP0] WEG2-BAR1 lane-time lane=p0 phase=deposit seq=3-weights_8 units=157 batches=143 bytes=448849920 total_ms=99 wait_ms=5
+[2026-09-24 11:20:41 PP0] WEG2-BAR1 lane-time lane=p1 phase=deposit seq=3-weights_8 units=179 batches=165 bytes=517278720 total_ms=101 wait_ms=4
+[2026-09-24 11:20:41 PP0] WEG2-SLEEP-TAG-TIME tag=weights_8 deposit_ms=110 sync_ms=0 pause_ms=6 credit_ms=0 gap_ms=0 total_ms=116 t0=1790248841.579 t=1790248841.695
+[2026-09-24 11:20:41 PP0] WEG2-SEQ lane-time lane=c0 phase=deposit units=3 bytes=645632016 total_ms=3 wait_ms=0 copy_sync_ms=1 record_ms=0 ipc=yes syncs=2 batch=32u/64MiB t=1790248841.701 t0=1790248841.697
+[2026-09-24 11:20:41 PP0] WEG2-SLEEP-TAG-TIME tag=weights deposit_ms=6 sync_ms=0 pause_ms=1 credit_ms=0 gap_ms=0 total_ms=6 t0=1790248841.695 t=1790248841.702

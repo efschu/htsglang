@@ -1721,6 +1721,33 @@ def credit_pause_order(order: List[str], why: str, plan: Optional[Dict[str, Any]
     return new, why + ", " + note
 
 
+def timed_pause_order(order: List[str], why: str, plan: Optional[Dict[str, Any]],
+                      src: str, dst: str, cards_now: List["CardFree"], *,
+                      floor_of=None) -> Tuple[List[str], str]:
+    """H34 (fnFL2x141): the planner's timed recommendation for the P->D wake.
+
+    ``wake_credit_pd`` timed THIS form's P->D wake in ms and, where the credit
+    wait on the tightest card lengthened the leg (x141: D TP2 466 ms at
+    weights_6, PP0's chain +90 ms), recommended a rearrangement of that card's
+    own P bands. Applied only with SGLANG_WEG2_ENABLE_PD_TIMED_ORDER=1, only
+    when the live order is exactly the one the planner timed, and only when
+    the H14 fixpoint (``credit_pause_order``) keeps it unchanged -- a
+    recommendation that would cycle is dropped, the live order stays."""
+    if "%s->%s" % (src, dst) != "P->D" or not plan or "P->D-order" not in plan:
+        return list(order), why
+    if not envs.SGLANG_WEG2_ENABLE_PD_TIMED_ORDER.get():
+        return list(order), why + ", timed order OFF (SGLANG_WEG2_ENABLE_PD_TIMED_ORDER=0)"
+    from sglang.srt.weg2 import wake_credit_pd as _wpd
+
+    new, note = _wpd.front_timed_order(order, plan)
+    if list(new) == list(order):
+        return list(order), why + ", " + note
+    checked, cnote = credit_pause_order(new, "", plan, src, dst, cards_now, floor_of=floor_of)
+    if list(checked) != list(new):
+        return list(order), why + ", timed order REJECTED by the credit fixpoint (%s)" % cnote.lstrip(", ")
+    return list(new), why + ", " + note
+
+
 @dataclass
 class Group:
     name: str
@@ -5000,6 +5027,9 @@ class Front:
             # free sample; an order that ends in the W109 cycle is replaced,
             # a cycle-free one stays byte-identical.
             pause_order, why = credit_pause_order(
+                pause_order, why, self.wake_credit_plan, src, dst, _cards_now)
+            # H34: the planner's timed P->D recommendation (off by default)
+            pause_order, why = timed_pause_order(
                 pause_order, why, self.wake_credit_plan, src, dst, _cards_now)
         logger.info(
             "WEG2-FLIP-ORDER epoch=%d src=%s driver_free=%s pause_order=%s resume_order=%s (%s) "

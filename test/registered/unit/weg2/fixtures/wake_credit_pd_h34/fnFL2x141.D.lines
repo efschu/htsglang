@@ -1,0 +1,415 @@
+[2026-09-24 09:37:08 TP1] MoE expert-offload active on layer 0: 64/145 experts resident + 48 scratch (buffer=112,
+[2026-09-24 09:37:12 TP2] MoE expert-offload active on layer 0: 65/177 experts resident + 48 scratch (buffer=113,
+[2026-09-24 09:37:28 TP0] MoE expert-offload active on layer 0: 12/193 experts resident + 82 scratch (buffer=94,
+[2026-09-24 09:39:08 TP0] WEG2-RESUME begin tag=weights_13 need_mib=1154 
+[2026-09-24 09:39:08 TP1] WEG2-RESUME begin tag=weights_13 need_mib=856 
+[2026-09-24 09:39:08 TP2] WEG2-RESUME begin tag=weights_13 need_mib=868 
+[2026-09-24 09:39:08 TP2] WEG2-WAKE-TAG-TIME tag=weights_13 resume_ms=2 t0=1790242748.992 t=1790242748.994
+[2026-09-24 09:39:08 TP1] WEG2-WAKE-TAG-TIME tag=weights_13 resume_ms=2 t0=1790242748.992 t=1790242748.994
+[2026-09-24 09:39:08 TP1] WEG2-RESUME begin tag=weights_9 need_mib=856 
+[2026-09-24 09:39:08 TP2] WEG2-RESUME begin tag=weights_9 need_mib=868 
+[2026-09-24 09:39:09 TP1] WEG2-WAKE-TAG-TIME tag=weights_9 resume_ms=5 t0=1790242749.012 t=1790242749.016
+[2026-09-24 09:39:09 TP2] WEG2-WAKE-TAG-TIME tag=weights_9 resume_ms=2 t0=1790242749.017 t=1790242749.020
+[2026-09-24 09:39:09 TP1] WEG2-RESUME begin tag=weights_0 need_mib=856 
+[2026-09-24 09:39:09 TP2] WEG2-RESUME begin tag=weights_0 need_mib=868 
+[2026-09-24 09:39:09 TP1] WEG2-SEQ lane-time lane=c1 phase=collect units=5 bytes=162288640 total_ms=3 wait_ms=0 copy_sync_ms=0 record_ms=0 ipc=yes syncs=2 batch=32u/64MiB t=1790242749.028 t0=1790242749.025
+[2026-09-24 09:39:09 TP1] WEG2-WAKE-TAG-TIME tag=weights_0 resume_ms=5 t0=1790242749.026 t=1790242749.031
+[2026-09-24 09:39:09 TP2] WEG2-SEQ lane-time lane=c2 phase=collect units=10 bytes=329646080 total_ms=9 wait_ms=0 copy_sync_ms=1 record_ms=1 ipc=yes syncs=4 batch=32u/64MiB t=1790242749.034 t0=1790242749.025
+[2026-09-24 09:39:09 TP2] WEG2-WAKE-TAG-TIME tag=weights_0 resume_ms=8 t0=1790242749.026 t=1790242749.034
+[2026-09-24 09:39:09 TP2] WEG2-BAR1 lane-time lane=p3 phase=collect seq=1-weights_13 units=57 batches=53 bytes=164823040 total_ms=33 wait_ms=17
+[2026-09-24 09:39:09 TP2] WEG2-RESUME begin tag=weights_14 need_mib=868 
+[2026-09-24 09:39:09 TP2] WEG2-WAKE-TAG-TIME tag=weights_14 resume_ms=2 t0=1790242749.057 t=1790242749.058
+[2026-09-24 09:39:09 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=1-weights_9 units=109 batches=100 bytes=314439680 total_ms=94 wait_ms=85
+[2026-09-24 09:39:09 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=1-weights_9 units=111 batches=102 bytes=319508480 total_ms=94 wait_ms=77
+[2026-09-24 09:39:09 TP1] WEG2-BAR1 lane-time lane=p5 phase=collect seq=1-weights_13 units=113 batches=104 bytes=324577280 total_ms=96 wait_ms=86
+[2026-09-24 09:39:09 TP1] WEG2-RESUME begin tag=weights_14 need_mib=856 
+[2026-09-24 09:39:09 TP1] WEG2-WAKE-TAG-TIME tag=weights_14 resume_ms=2 t0=1790242749.121 t=1790242749.123
+[2026-09-24 09:39:09 TP0] WEG2-WAKE-TAG-TIME tag=weights_13 resume_ms=145 t0=1790242748.992 t=1790242749.137
+[2026-09-24 09:39:09 TP0] WEG2-RESUME begin tag=weights_9 need_mib=1154 
+[2026-09-24 09:39:09 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_9 waited=0 ms credit=1188 MiB published=1188 MiB consumed=1154 MiB available_after=34 MiB requested=1154 MiB free_mib=11340 allocatable_est=10573 corridor_floor_mib=767
+[2026-09-24 09:39:09 TP0] WEG2-WAKE-TAG-TIME tag=weights_9 resume_ms=23 t0=1790242749.184 t=1790242749.207
+[2026-09-24 09:39:09 TP0] WEG2-RESUME begin tag=weights_0 need_mib=1184 
+[2026-09-24 09:39:09 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=1-weights_0 units=167 batches=153 bytes=479262720 total_ms=139 wait_ms=98
+[2026-09-24 09:39:09 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=1-weights_0 units=164 batches=150 bytes=471659520 total_ms=147 wait_ms=94
+[2026-09-24 09:39:09 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_0 waited=0 ms credit=1188 MiB published=1188 MiB consumed=2338 MiB available_after=-1150 MiB requested=1184 MiB free_mib=9840 allocatable_est=9073 corridor_floor_mib=767
+[2026-09-24 09:39:09 TP0] WEG2-WAKE-TAG-TIME tag=weights_0 resume_ms=36 t0=1790242749.285 t=1790242749.321
+[2026-09-24 09:39:09 TP0] WEG2-BAR1 lane-time lane=p2 phase=collect seq=1-weights_13 units=44 batches=4 bytes=102324880 total_ms=23 wait_ms=4
+[2026-09-24 09:39:09 TP0] WEG2-BAR1 lane-time lane=p4 phase=collect seq=1-weights_13 units=84 batches=7 bytes=218686784 total_ms=51 wait_ms=3
+[2026-09-24 09:39:09 TP0] WEG2-RESUME begin tag=weights_14 need_mib=1160 
+[2026-09-24 09:39:09 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_14 waited=0 ms credit=2874 MiB published=2874 MiB consumed=3498 MiB available_after=-624 MiB requested=1160 MiB free_mib=10340 allocatable_est=9573 corridor_floor_mib=767
+[2026-09-24 09:39:09 TP0] WEG2-WAKE-TAG-TIME tag=weights_14 resume_ms=4 t0=1790242749.425 t=1790242749.429
+[2026-09-24 09:39:09 TP1] WEG2-SEQ lane-time lane=c1 phase=collect units=5 bytes=162288640 total_ms=403 wait_ms=399 copy_sync_ms=0 record_ms=0 ipc=yes syncs=2 batch=32u/64MiB t=1790242749.434 t0=1790242749.031
+[2026-09-24 09:39:09 TP1] WEG2-RESUME begin tag=weights_10 need_mib=856 
+[2026-09-24 09:39:09 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_10 waited=0 ms credit=836 MiB published=836 MiB consumed=1010 MiB available_after=-175 MiB requested=856 MiB free_mib=6349 allocatable_est=5649 corridor_floor_mib=700
+[2026-09-24 09:39:09 TP1] WEG2-WAKE-TAG-TIME tag=weights_10 resume_ms=2 t0=1790242749.437 t=1790242749.438
+[2026-09-24 09:39:09 TP1] WEG2-RESUME begin tag=weights_1 need_mib=956 
+[2026-09-24 09:39:09 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_1 waited=0 ms credit=836 MiB published=836 MiB consumed=1966 MiB available_after=-956 MiB requested=956 MiB free_mib=5493 allocatable_est=4793 corridor_floor_mib=700
+[2026-09-24 09:39:09 TP1] WEG2-WAKE-TAG-TIME tag=weights_1 resume_ms=2 t0=1790242749.441 t=1790242749.443
+[2026-09-24 09:39:09 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=80 bytes=211668272 total_ms=48 wait_ms=1 copy_sync_ms=8 record_ms=25 ipc=yes syncs=4 batch=32u/64MiB t=1790242749.443 t0=1790242749.395
+[2026-09-24 09:39:09 TP2] WEG2-SEQ lane-time lane=c2 phase=collect units=15 bytes=494469120 total_ms=405 wait_ms=392 copy_sync_ms=1 record_ms=1 ipc=yes syncs=6 batch=32u/64MiB t=1790242749.465 t0=1790242749.060
+[2026-09-24 09:39:09 TP2] WEG2-BAR1 lane-time lane=p3 phase=collect seq=1-weights_9 units=57 batches=53 bytes=164823040 total_ms=55 wait_ms=36
+[2026-09-24 09:39:09 TP2] WEG2-RESUME begin tag=weights_10 need_mib=868 
+[2026-09-24 09:39:09 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_10 waited=0 ms credit=1462 MiB published=1462 MiB consumed=1339 MiB available_after=122 MiB requested=868 MiB free_mib=4939 allocatable_est=4238 corridor_floor_mib=701
+[2026-09-24 09:39:09 TP2] WEG2-WAKE-TAG-TIME tag=weights_10 resume_ms=2 t0=1790242749.483 t=1790242749.486
+[2026-09-24 09:39:09 TP2] WEG2-RESUME begin tag=weights_1 need_mib=968 
+[2026-09-24 09:39:09 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_1 waited=0 ms credit=1462 MiB published=1462 MiB consumed=2307 MiB available_after=-846 MiB requested=968 MiB free_mib=4071 allocatable_est=3370 corridor_floor_mib=701
+[2026-09-24 09:39:09 TP2] WEG2-WAKE-TAG-TIME tag=weights_1 resume_ms=2 t0=1790242749.489 t=1790242749.491
+[2026-09-24 09:39:09 TP2] WEG2-RESUME begin tag=weights_15 need_mib=868 
+[2026-09-24 09:39:09 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_15 waited=0 ms credit=1462 MiB published=1462 MiB consumed=3175 MiB available_after=-868 MiB requested=868 MiB free_mib=3103 allocatable_est=2402 corridor_floor_mib=701
+[2026-09-24 09:39:09 TP2] WEG2-WAKE-TAG-TIME tag=weights_15 resume_ms=8 t0=1790242749.496 t=1790242749.504
+[2026-09-24 09:39:09 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=1-weights_1 units=164 batches=150 bytes=471659520 total_ms=91 wait_ms=80
+[2026-09-24 09:39:09 TP0] WEG2-BAR1 lane-time lane=p2 phase=collect seq=1-weights_9 units=42 batches=4 bytes=109343392 total_ms=118 wait_ms=13
+[2026-09-24 09:39:09 TP0] WEG2-RESUME begin tag=weights_10 need_mib=1160 
+[2026-09-24 09:39:09 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_10 waited=0 ms credit=2874 MiB published=2874 MiB consumed=4658 MiB available_after=-1160 MiB requested=1160 MiB free_mib=9072 allocatable_est=8305 corridor_floor_mib=767
+[2026-09-24 09:39:09 TP0] WEG2-WAKE-TAG-TIME tag=weights_10 resume_ms=12 t0=1790242749.550 t=1790242749.562
+[2026-09-24 09:39:09 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=1-weights_1 units=167 batches=153 bytes=479262720 total_ms=76 wait_ms=63
+[2026-09-24 09:39:09 TP1] WEG2-SEQ lane-time lane=c1 phase=collect units=15 bytes=486865920 total_ms=140 wait_ms=129 copy_sync_ms=1 record_ms=1 ipc=yes syncs=6 batch=32u/64MiB t=1790242749.580 t0=1790242749.441
+[2026-09-24 09:39:09 TP0] WEG2-BAR1 lane-time lane=p4 phase=collect seq=1-weights_14 units=128 batches=10 bytes=321011664 total_ms=76 wait_ms=2
+[2026-09-24 09:39:09 TP1] WEG2-BAR1 lane-time lane=p5 phase=collect seq=1-weights_14 units=169 batches=155 bytes=486865920 total_ms=174 wait_ms=161
+[2026-09-24 09:39:09 TP1] WEG2-RESUME begin tag=weights_15 need_mib=856 
+[2026-09-24 09:39:09 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_15 waited=0 ms credit=1688 MiB published=1688 MiB consumed=2822 MiB available_after=-856 MiB requested=856 MiB free_mib=5079 allocatable_est=4379 corridor_floor_mib=700
+[2026-09-24 09:39:09 TP1] WEG2-WAKE-TAG-TIME tag=weights_15 resume_ms=1 t0=1790242749.623 t=1790242749.625
+[2026-09-24 09:39:09 TP1] WEG2-RESUME begin tag=weights_11 need_mib=856 
+[2026-09-24 09:39:09 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_11 waited=0 ms credit=1688 MiB published=1688 MiB consumed=3678 MiB available_after=-856 MiB requested=856 MiB free_mib=4223 allocatable_est=3523 corridor_floor_mib=700
+[2026-09-24 09:39:09 TP1] WEG2-WAKE-TAG-TIME tag=weights_11 resume_ms=1 t0=1790242749.627 t=1790242749.629
+[2026-09-24 09:39:09 TP1] WEG2-RESUME begin tag=weights_2 need_mib=856 
+[2026-09-24 09:39:09 TP0] WEG2-BAR1 lane-time lane=p2 phase=collect seq=1-weights_10 units=128 batches=10 bytes=321011664 total_ms=55 wait_ms=12
+[2026-09-24 09:39:09 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_2 waited=0 ms credit=1688 MiB published=1688 MiB consumed=4534 MiB available_after=-856 MiB requested=856 MiB free_mib=3367 allocatable_est=2667 corridor_floor_mib=700
+[2026-09-24 09:39:09 TP1] WEG2-WAKE-TAG-TIME tag=weights_2 resume_ms=1 t0=1790242749.631 t=1790242749.633
+[2026-09-24 09:39:09 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=127 bytes=361453568 total_ms=154 wait_ms=2 copy_sync_ms=11 record_ms=30 ipc=yes syncs=7 batch=32u/64MiB t=1790242749.678 t0=1790242749.524
+[2026-09-24 09:39:09 TP0] WEG2-RESUME begin tag=weights_1 need_mib=1218 
+[2026-09-24 09:39:09 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_1 waited=0 ms credit=4646 MiB published=4646 MiB consumed=5876 MiB available_after=-1218 MiB requested=1218 MiB free_mib=9684 allocatable_est=8917 corridor_floor_mib=767
+[2026-09-24 09:39:09 TP2] WEG2-SEQ lane-time lane=c2 phase=collect units=15 bytes=494469120 total_ms=186 wait_ms=170 copy_sync_ms=1 record_ms=1 ipc=yes syncs=6 batch=32u/64MiB t=1790242749.693 t0=1790242749.507
+[2026-09-24 09:39:09 TP0] WEG2-WAKE-TAG-TIME tag=weights_1 resume_ms=5 t0=1790242749.691 t=1790242749.696
+[2026-09-24 09:39:09 TP0] WEG2-RESUME begin tag=weights_15 need_mib=1098 
+[2026-09-24 09:39:09 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_15 waited=0 ms credit=4646 MiB published=4646 MiB consumed=6974 MiB available_after=-1098 MiB requested=1098 MiB free_mib=8502 allocatable_est=7735 corridor_floor_mib=767
+[2026-09-24 09:39:09 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=1-weights_2 units=164 batches=150 bytes=471659520 total_ms=70 wait_ms=36
+[2026-09-24 09:39:09 TP2] WEG2-BAR1 lane-time lane=p3 phase=collect seq=1-weights_10 units=172 batches=158 bytes=494469120 total_ms=147 wait_ms=104
+[2026-09-24 09:39:09 TP2] WEG2-RESUME begin tag=weights_11 need_mib=868 
+[2026-09-24 09:39:09 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_11 waited=0 ms credit=3664 MiB published=3664 MiB consumed=4515 MiB available_after=-852 MiB requested=868 MiB free_mib=4281 allocatable_est=3580 corridor_floor_mib=701
+[2026-09-24 09:39:09 TP0] WEG2-WAKE-TAG-TIME tag=weights_15 resume_ms=7 t0=1790242749.704 t=1790242749.711
+[2026-09-24 09:39:09 TP0] WEG2-RESUME begin tag=weights_11 need_mib=1098 
+[2026-09-24 09:39:09 TP2] WEG2-WAKE-TAG-TIME tag=weights_11 resume_ms=2 t0=1790242749.711 t=1790242749.713
+[2026-09-24 09:39:09 TP2] WEG2-RESUME begin tag=weights_2 need_mib=868 
+[2026-09-24 09:39:09 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_2 waited=0 ms credit=3664 MiB published=3664 MiB consumed=5383 MiB available_after=-868 MiB requested=868 MiB free_mib=3413 allocatable_est=2712 corridor_floor_mib=701
+[2026-09-24 09:39:09 TP2] WEG2-WAKE-TAG-TIME tag=weights_2 resume_ms=2 t0=1790242749.715 t=1790242749.717
+[2026-09-24 09:39:09 TP2] WEG2-RESUME begin tag=weights_draft need_mib=0 
+[2026-09-24 09:39:09 TP2] WEG2-WAKE-TAG-TIME tag=weights_draft resume_ms=1 t0=1790242749.718 t=1790242749.719
+[2026-09-24 09:39:09 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_11 waited=0 ms credit=4646 MiB published=4646 MiB consumed=8072 MiB available_after=-1098 MiB requested=1098 MiB free_mib=7404 allocatable_est=6637 corridor_floor_mib=767
+[2026-09-24 09:39:09 TP0] WEG2-WAKE-TAG-TIME tag=weights_11 resume_ms=5 t0=1790242749.722 t=1790242749.727
+[2026-09-24 09:39:09 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=119 bytes=321011664 total_ms=47 wait_ms=1 copy_sync_ms=9 record_ms=17 ipc=yes syncs=6 batch=32u/64MiB t=1790242749.751 t0=1790242749.704
+[2026-09-24 09:39:09 TP0] WEG2-RESUME begin tag=weights_2 need_mib=1160 
+[2026-09-24 09:39:09 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_2 waited=0 ms credit=4646 MiB published=4646 MiB consumed=9232 MiB available_after=-1160 MiB requested=1160 MiB free_mib=6306 allocatable_est=5539 corridor_floor_mib=767
+[2026-09-24 09:39:09 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=1-weights_2 units=167 batches=153 bytes=479262720 total_ms=44 wait_ms=33
+[2026-09-24 09:39:09 TP0] WEG2-BAR1 lane-time lane=p4 phase=collect seq=1-weights_15 units=128 batches=10 bytes=321011664 total_ms=47 wait_ms=16
+[2026-09-24 09:39:09 TP1] WEG2-SEQ lane-time lane=c1 phase=collect units=15 bytes=486865920 total_ms=140 wait_ms=126 copy_sync_ms=1 record_ms=1 ipc=yes syncs=6 batch=32u/64MiB t=1790242749.771 t0=1790242749.631
+[2026-09-24 09:39:09 TP0] WEG2-WAKE-TAG-TIME tag=weights_2 resume_ms=17 t0=1790242749.763 t=1790242749.780
+[2026-09-24 09:39:09 TP0] WEG2-RESUME begin tag=weights_draft need_mib=1556 
+[2026-09-24 09:39:09 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_draft waited=0 ms credit=6296 MiB published=6296 MiB consumed=10788 MiB available_after=-1556 MiB requested=1556 MiB free_mib=6796 allocatable_est=6029 corridor_floor_mib=767
+[2026-09-24 09:39:09 TP0] WEG2-WAKE-TAG-TIME tag=weights_draft resume_ms=6 t0=1790242749.793 t=1790242749.800
+[2026-09-24 09:39:09 TP1] WEG2-BAR1 lane-time lane=p5 phase=collect seq=1-weights_15 units=169 batches=155 bytes=486865920 total_ms=157 wait_ms=137
+[2026-09-24 09:39:09 TP1] WEG2-RESUME begin tag=weights_draft need_mib=0 
+[2026-09-24 09:39:09 TP1] WEG2-WAKE-TAG-TIME tag=weights_draft resume_ms=1 t0=1790242749.827 t=1790242749.828
+[2026-09-24 09:39:09 TP1] WEG2-RESUME begin tag=weights_12 need_mib=856 
+[2026-09-24 09:39:09 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_12 waited=0 ms credit=4106 MiB published=4106 MiB consumed=5390 MiB available_after=-856 MiB requested=856 MiB free_mib=4619 allocatable_est=3919 corridor_floor_mib=700
+[2026-09-24 09:39:09 TP1] WEG2-WAKE-TAG-TIME tag=weights_12 resume_ms=2 t0=1790242749.830 t=1790242749.832
+[2026-09-24 09:39:09 TP1] WEG2-RESUME begin tag=weights_3 need_mib=856 
+[2026-09-24 09:39:09 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_3 waited=0 ms credit=4106 MiB published=4106 MiB consumed=6246 MiB available_after=-856 MiB requested=856 MiB free_mib=3763 allocatable_est=3063 corridor_floor_mib=700
+[2026-09-24 09:39:09 TP1] WEG2-WAKE-TAG-TIME tag=weights_3 resume_ms=2 t0=1790242749.836 t=1790242749.838
+[2026-09-24 09:39:09 TP1] WEG2-RESUME begin tag=weights_4 need_mib=856 
+[2026-09-24 09:39:09 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_4 waited=0 ms credit=4106 MiB published=4106 MiB consumed=7102 MiB available_after=-856 MiB requested=856 MiB free_mib=2907 allocatable_est=2207 corridor_floor_mib=700
+[2026-09-24 09:39:09 TP1] WEG2-WAKE-TAG-TIME tag=weights_4 resume_ms=29 t0=1790242749.844 t=1790242749.873
+[2026-09-24 09:39:09 TP2] WEG2-BAR1 lane-time lane=p3 phase=collect seq=1-weights_11 units=172 batches=158 bytes=494469120 total_ms=140 wait_ms=109
+[2026-09-24 09:39:09 TP2] WEG2-RESUME begin tag=weights_12 need_mib=868 
+[2026-09-24 09:39:09 TP0] WEG2-BAR1 lane-time lane=p2 phase=collect seq=1-weights_11 units=128 batches=10 bytes=321011664 total_ms=130 wait_ms=20
+[2026-09-24 09:39:09 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_12 waited=0 ms credit=5802 MiB published=5802 MiB consumed=6251 MiB available_after=-450 MiB requested=868 MiB free_mib=4683 allocatable_est=3982 corridor_floor_mib=701
+[2026-09-24 09:39:09 TP0] WEG2-RESUME begin tag=weights_12 need_mib=1110 
+[2026-09-24 09:39:09 TP2] WEG2-WAKE-TAG-TIME tag=weights_12 resume_ms=5 t0=1790242749.892 t=1790242749.897
+[2026-09-24 09:39:09 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_12 waited=0 ms credit=6296 MiB published=6296 MiB consumed=11898 MiB available_after=-1110 MiB requested=1110 MiB free_mib=5240 allocatable_est=4473 corridor_floor_mib=767
+[2026-09-24 09:39:09 TP2] WEG2-RESUME begin tag=weights_3 need_mib=868 
+[2026-09-24 09:39:09 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_3 waited=0 ms credit=5802 MiB published=5802 MiB consumed=7119 MiB available_after=-868 MiB requested=868 MiB free_mib=3815 allocatable_est=3114 corridor_floor_mib=701
+[2026-09-24 09:39:09 TP2] WEG2-WAKE-TAG-TIME tag=weights_3 resume_ms=2 t0=1790242749.900 t=1790242749.902
+[2026-09-24 09:39:09 TP2] WEG2-RESUME begin tag=weights_4 need_mib=868 
+[2026-09-24 09:39:09 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_4 waited=0 ms credit=5802 MiB published=5802 MiB consumed=7987 MiB available_after=-868 MiB requested=868 MiB free_mib=2947 allocatable_est=2246 corridor_floor_mib=701
+[2026-09-24 09:39:09 TP2] WEG2-WAKE-TAG-TIME tag=weights_4 resume_ms=2 t0=1790242749.906 t=1790242749.908
+[2026-09-24 09:39:09 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=1-weights_3 units=164 batches=150 bytes=471659520 total_ms=71 wait_ms=22
+[2026-09-24 09:39:09 TP0] WEG2-WAKE-TAG-TIME tag=weights_12 resume_ms=33 t0=1790242749.898 t=1790242749.930
+[2026-09-24 09:39:09 TP1] WEG2-SEQ lane-time lane=c1 phase=collect units=15 bytes=486865920 total_ms=119 wait_ms=106 copy_sync_ms=1 record_ms=1 ipc=yes syncs=6 batch=32u/64MiB t=1790242749.955 t0=1790242749.835
+[2026-09-24 09:39:09 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=119 bytes=321011664 total_ms=167 wait_ms=2 copy_sync_ms=20 record_ms=59 ipc=yes syncs=6 batch=32u/64MiB t=1790242749.959 t0=1790242749.792
+[2026-09-24 09:39:09 TP1] WEG2-RESUME begin tag=weights_5 need_mib=856 
+[2026-09-24 09:39:09 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=1-weights_3 units=167 batches=153 bytes=479262720 total_ms=58 wait_ms=48
+[2026-09-24 09:39:09 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_5 waited=0 ms credit=6460 MiB published=6460 MiB consumed=7958 MiB available_after=-856 MiB requested=856 MiB free_mib=4405 allocatable_est=3705 corridor_floor_mib=700
+[2026-09-24 09:39:09 TP0] WEG2-RESUME begin tag=weights_3 need_mib=1098 
+[2026-09-24 09:39:09 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_3 waited=0 ms credit=6296 MiB published=6296 MiB consumed=12996 MiB available_after=-1098 MiB requested=1098 MiB free_mib=4556 allocatable_est=3789 corridor_floor_mib=767
+[2026-09-24 09:39:09 TP1] WEG2-WAKE-TAG-TIME tag=weights_5 resume_ms=6 t0=1790242749.963 t=1790242749.970
+[2026-09-24 09:39:09 TP1] WEG2-RESUME begin tag=weights_6 need_mib=856 
+[2026-09-24 09:39:09 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_6 waited=0 ms credit=6460 MiB published=6460 MiB consumed=8814 MiB available_after=-856 MiB requested=856 MiB free_mib=3549 allocatable_est=2849 corridor_floor_mib=700
+[2026-09-24 09:39:09 TP0] WEG2-WAKE-TAG-TIME tag=weights_3 resume_ms=7 t0=1790242749.967 t=1790242749.973
+[2026-09-24 09:39:09 TP1] WEG2-WAKE-TAG-TIME tag=weights_6 resume_ms=3 t0=1790242749.973 t=1790242749.976
+[2026-09-24 09:39:09 TP0] WEG2-BAR1 lane-time lane=p2 phase=collect seq=1-weights_12 units=126 batches=10 bytes=328030176 total_ms=54 wait_ms=27
+[2026-09-24 09:39:10 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=119 bytes=321011664 total_ms=27 wait_ms=1 copy_sync_ms=3 record_ms=11 ipc=yes syncs=6 batch=32u/64MiB t=1790242750.008 t0=1790242749.980
+[2026-09-24 09:39:10 TP2] WEG2-BAR1 lane-time lane=p3 phase=collect seq=1-weights_12 units=172 batches=158 bytes=494469120 total_ms=130 wait_ms=123
+[2026-09-24 09:39:10 TP2] WEG2-RESUME begin tag=weights_5 need_mib=868 
+[2026-09-24 09:39:10 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_5 waited=0 ms credit=5802 MiB published=5802 MiB consumed=8855 MiB available_after=-868 MiB requested=868 MiB free_mib=2079 allocatable_est=1378 corridor_floor_mib=701
+[2026-09-24 09:39:10 TP2] WEG2-WAKE-TAG-TIME tag=weights_5 resume_ms=2 t0=1790242750.067 t=1790242750.069
+[2026-09-24 09:39:10 TP2] WEG2-RESUME begin tag=weights_6 need_mib=868 
+[2026-09-24 09:39:10 TP0] WEG2-BAR1 lane-time lane=p4 phase=collect seq=1-weights_draft units=122 batches=87 bytes=2887978528 total_ms=295 wait_ms=278
+[2026-09-24 09:39:10 TP0] WEG2-RESUME begin tag=weights_4 need_mib=1110 
+[2026-09-24 09:39:10 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_4 waited=0 ms credit=7946 MiB published=7946 MiB consumed=14106 MiB available_after=-1110 MiB requested=1110 MiB free_mib=4676 allocatable_est=3909 corridor_floor_mib=767
+[2026-09-24 09:39:10 TP0] WEG2-WAKE-TAG-TIME tag=weights_4 resume_ms=3 t0=1790242750.193 t=1790242750.196
+[2026-09-24 09:39:10 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_6 waited=125 ms credit=5802 MiB published=5802 MiB consumed=9723 MiB available_after=-868 MiB requested=868 MiB free_mib=2211 allocatable_est=1510 corridor_floor_mib=701
+[2026-09-24 09:39:10 TP0] WEG2-RESUME begin tag=weights_5 need_mib=1154 
+[2026-09-24 09:39:10 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_5 waited=0 ms credit=7946 MiB published=7946 MiB consumed=15260 MiB available_after=-1154 MiB requested=1154 MiB free_mib=3566 allocatable_est=2799 corridor_floor_mib=767
+[2026-09-24 09:39:10 TP2] WEG2-WAKE-TAG-TIME tag=weights_6 resume_ms=17 t0=1790242750.197 t=1790242750.213
+[2026-09-24 09:39:10 TP0] WEG2-WAKE-TAG-TIME tag=weights_5 resume_ms=15 t0=1790242750.202 t=1790242750.217
+[2026-09-24 09:39:10 TP0] WEG2-RESUME begin tag=weights_6 need_mib=1160 
+[2026-09-24 09:39:10 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_6 waited=0 ms credit=7946 MiB published=7946 MiB consumed=16420 MiB available_after=-1160 MiB requested=1160 MiB free_mib=2412 allocatable_est=1645 corridor_floor_mib=767
+[2026-09-24 09:39:10 TP0] WEG2-WAKE-TAG-TIME tag=weights_6 resume_ms=3 t0=1790242750.221 t=1790242750.224
+[2026-09-24 09:39:10 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=117 bytes=328030176 total_ms=168 wait_ms=156 copy_sync_ms=5 record_ms=3 ipc=yes syncs=6 batch=32u/64MiB t=1790242750.370 t0=1790242750.202
+[2026-09-24 09:39:10 TP0] WEG2-RESUME begin tag=weights_7 need_mib=1098 
+[2026-09-24 09:39:10 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=1-weights_4 units=167 batches=153 bytes=479262720 total_ms=473 wait_ms=441
+[2026-09-24 09:39:10 TP2] WEG2-RESUME begin tag=weights_7 need_mib=868 
+[2026-09-24 09:39:10 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=1-weights_4 units=164 batches=150 bytes=471659520 total_ms=475 wait_ms=429
+[2026-09-24 09:39:10 TP1] WEG2-RESUME begin tag=weights_7 need_mib=856 
+[2026-09-24 09:39:10 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_7 waited=0 ms credit=8572 MiB published=8572 MiB consumed=10591 MiB available_after=-868 MiB requested=868 MiB free_mib=3113 allocatable_est=2412 corridor_floor_mib=701
+[2026-09-24 09:39:10 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_7 waited=0 ms credit=8824 MiB published=8824 MiB consumed=9516 MiB available_after=-692 MiB requested=856 MiB free_mib=6289 allocatable_est=5589 corridor_floor_mib=700
+[2026-09-24 09:39:10 TP2] WEG2-WAKE-TAG-TIME tag=weights_7 resume_ms=2 t0=1790242750.455 t=1790242750.457
+[2026-09-24 09:39:10 TP1] WEG2-WAKE-TAG-TIME tag=weights_7 resume_ms=2 t0=1790242750.456 t=1790242750.458
+[2026-09-24 09:39:10 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_7 waited=80 ms credit=9606 MiB published=9606 MiB consumed=17518 MiB available_after=-1098 MiB requested=1098 MiB free_mib=2912 allocatable_est=2145 corridor_floor_mib=767
+[2026-09-24 09:39:10 TP0] WEG2-WAKE-TAG-TIME tag=weights_7 resume_ms=2 t0=1790242750.462 t=1790242750.465
+[2026-09-24 09:39:10 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=119 bytes=321011664 total_ms=124 wait_ms=95 copy_sync_ms=11 record_ms=3 ipc=yes syncs=6 batch=32u/64MiB t=1790242750.506 t0=1790242750.382
+[2026-09-24 09:39:10 TP0] WEG2-RESUME begin tag=weights_8 need_mib=1110 
+[2026-09-24 09:39:10 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=1-weights_5 units=164 batches=150 bytes=471659520 total_ms=100 wait_ms=56
+[2026-09-24 09:39:10 TP1] WEG2-RESUME begin tag=weights_8 need_mib=856 
+[2026-09-24 09:39:10 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=1-weights_5 units=167 batches=153 bytes=479262720 total_ms=102 wait_ms=72
+[2026-09-24 09:39:10 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_8 waited=0 ms credit=8824 MiB published=8824 MiB consumed=10372 MiB available_after=-856 MiB requested=856 MiB free_mib=5433 allocatable_est=4733 corridor_floor_mib=700
+[2026-09-24 09:39:10 TP2] WEG2-RESUME begin tag=weights_8 need_mib=868 
+[2026-09-24 09:39:10 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_8 waited=0 ms credit=8572 MiB published=8572 MiB consumed=11459 MiB available_after=-868 MiB requested=868 MiB free_mib=2245 allocatable_est=1544 corridor_floor_mib=701
+[2026-09-24 09:39:10 TP1] WEG2-WAKE-TAG-TIME tag=weights_8 resume_ms=2 t0=1790242750.569 t=1790242750.570
+[2026-09-24 09:39:10 TP2] WEG2-WAKE-TAG-TIME tag=weights_8 resume_ms=2 t0=1790242750.570 t=1790242750.572
+[2026-09-24 09:39:10 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_8 waited=55 ms credit=9606 MiB published=9606 MiB consumed=18628 MiB available_after=-1110 MiB requested=1110 MiB free_mib=3398 allocatable_est=2631 corridor_floor_mib=767
+[2026-09-24 09:39:10 TP0] WEG2-WAKE-TAG-TIME tag=weights_8 resume_ms=2 t0=1790242750.575 t=1790242750.577
+[2026-09-24 09:39:10 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=119 bytes=321011664 total_ms=89 wait_ms=67 copy_sync_ms=5 record_ms=3 ipc=yes syncs=6 batch=32u/64MiB t=1790242750.608 t0=1790242750.519
+[2026-09-24 09:39:10 TP0] WEG2-RESUME begin tag=weights need_mib=2494 
+[2026-09-24 09:39:10 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=1-weights_6 units=164 batches=150 bytes=471659520 total_ms=101 wait_ms=52
+[2026-09-24 09:39:10 TP1] WEG2-RESUME begin tag=weights need_mib=2 
+[2026-09-24 09:39:10 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=1-weights_6 units=167 batches=153 bytes=479262720 total_ms=102 wait_ms=69
+[2026-09-24 09:39:10 TP2] WEG2-RESUME begin tag=weights need_mib=2 
+[2026-09-24 09:39:10 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights waited=0 ms credit=8824 MiB published=8824 MiB consumed=10374 MiB available_after=-2 MiB requested=2 MiB free_mib=4577 allocatable_est=3877 corridor_floor_mib=700
+[2026-09-24 09:39:10 TP1] WEG2-WAKE-TAG-TIME tag=weights resume_ms=1 t0=1790242750.683 t=1790242750.684
+[2026-09-24 09:39:10 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights waited=0 ms credit=8572 MiB published=8572 MiB consumed=11461 MiB available_after=-2 MiB requested=2 MiB free_mib=1377 allocatable_est=676 corridor_floor_mib=701
+[2026-09-24 09:39:10 TP2] WEG2-WAKE-TAG-TIME tag=weights resume_ms=1 t0=1790242750.684 t=1790242750.685
+[2026-09-24 09:39:10 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights waited=69 ms credit=12966 MiB published=12966 MiB consumed=21122 MiB available_after=-2494 MiB requested=2494 MiB free_mib=4068 allocatable_est=3301 corridor_floor_mib=767
+[2026-09-24 09:39:10 TP0] WEG2-WAKE-TAG-TIME tag=weights resume_ms=2 t0=1790242750.689 t=1790242750.691
+[2026-09-24 09:39:10 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=119 bytes=321011664 total_ms=97 wait_ms=79 copy_sync_ms=1 record_ms=3 ipc=yes syncs=6 batch=32u/64MiB t=1790242750.716 t0=1790242750.619
+[2026-09-24 09:39:10 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=1-weights_7 units=164 batches=150 bytes=471659520 total_ms=112 wait_ms=106
+[2026-09-24 09:39:10 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=1-weights_7 units=167 batches=153 bytes=479262720 total_ms=111 wait_ms=104
+[2026-09-24 09:39:10 TP0] WEG2-BAR1 lane-time lane=p4 phase=collect seq=1-weights units=25 batches=20 bytes=658759696 total_ms=113 wait_ms=94
+[2026-09-24 09:39:10 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=117 bytes=328030176 total_ms=127 wait_ms=95 copy_sync_ms=12 record_ms=4 ipc=yes syncs=6 batch=32u/64MiB t=1790242750.855 t0=1790242750.729
+[2026-09-24 09:39:10 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=1-weights_8 units=167 batches=153 bytes=479262720 total_ms=102 wait_ms=67
+[2026-09-24 09:39:10 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=1-weights_8 units=164 batches=150 bytes=471659520 total_ms=103 wait_ms=53
+[2026-09-24 09:39:10 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=3 bytes=645632016 total_ms=65 wait_ms=60 copy_sync_ms=1 record_ms=0 ipc=yes syncs=2 batch=32u/64MiB t=1790242750.934 t0=1790242750.869
+[2026-09-24 09:39:31 TP1] WEG2-RESUME begin tag=weights_13 need_mib=856 
+[2026-09-24 09:39:31 TP2] WEG2-RESUME begin tag=weights_13 need_mib=868 
+[2026-09-24 09:39:31 TP0] WEG2-RESUME begin tag=weights_13 need_mib=1154 
+[2026-09-24 09:39:31 TP0] WEG2-WAKE-TAG-TIME tag=weights_13 resume_ms=3 t0=1790242771.960 t=1790242771.963
+[2026-09-24 09:39:31 TP0] WEG2-RESUME begin tag=weights_9 need_mib=1154 
+ allocs=11 bytes=910163968[2026-09-24 09:39:31 TP1] WEG2-WAKE-TAG-TIME tag=weights_13 resume_ms=16 t0=1790242771.960 t=1790242771.976
+[2026-09-24 09:39:31 TP2] WEG2-WAKE-TAG-TIME tag=weights_13 resume_ms=17 t0=1790242771.960 t=1790242771.976
+[2026-09-24 09:39:31 TP0] WEG2-WAKE-TAG-TIME tag=weights_9 resume_ms=6 t0=1790242771.971 t=1790242771.977
+[2026-09-24 09:39:31 TP1] WEG2-RESUME begin tag=weights_9 need_mib=856 
+[2026-09-24 09:39:31 TP2] WEG2-RESUME begin tag=weights_9 need_mib=868 
+[2026-09-24 09:39:31 TP0] WEG2-RESUME begin tag=weights_0 need_mib=1184 
+[2026-09-24 09:39:31 TP2] WEG2-WAKE-TAG-TIME tag=weights_9 resume_ms=5 t0=1790242771.981 t=1790242771.986
+[2026-09-24 09:39:31 TP1] WEG2-SEQ lane-time lane=c1 phase=collect units=5 bytes=162288640 total_ms=5 wait_ms=0 copy_sync_ms=0 record_ms=0 ipc=yes syncs=2 batch=32u/64MiB t=1790242771.986 t0=1790242771.981
+[2026-09-24 09:39:31 TP1] WEG2-WAKE-TAG-TIME tag=weights_9 resume_ms=5 t0=1790242771.982 t=1790242771.987
+[2026-09-24 09:39:31 TP2] WEG2-RESUME begin tag=weights_0 need_mib=868 
+[2026-09-24 09:39:31 TP1] WEG2-RESUME begin tag=weights_0 need_mib=856 
+[2026-09-24 09:39:31 TP0] WEG2-BAR1 lane-time lane=p2 phase=collect seq=3-weights_13 units=44 batches=4 bytes=102324880 total_ms=20 wait_ms=6
+[2026-09-24 09:39:31 TP2] WEG2-SEQ lane-time lane=c2 phase=collect units=10 bytes=329646080 total_ms=12 wait_ms=0 copy_sync_ms=3 record_ms=4 ipc=yes syncs=4 batch=32u/64MiB t=1790242771.992 t0=1790242771.980
+[2026-09-24 09:39:31 TP0] WEG2-WAKE-TAG-TIME tag=weights_0 resume_ms=7 t0=1790242771.986 t=1790242771.993
+[2026-09-24 09:39:31 TP1] WEG2-WAKE-TAG-TIME tag=weights_0 resume_ms=2 t0=1790242771.992 t=1790242771.994
+[2026-09-24 09:39:31 TP2] WEG2-WAKE-TAG-TIME tag=weights_0 resume_ms=5 t0=1790242771.992 t=1790242771.997
+[2026-09-24 09:39:32 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=80 bytes=211668272 total_ms=15 wait_ms=1 copy_sync_ms=2 record_ms=7 ipc=yes syncs=4 batch=32u/64MiB t=1790242772.002 t0=1790242771.987
+[2026-09-24 09:39:32 TP2] WEG2-BAR1 lane-time lane=p3 phase=collect seq=3-weights_13 units=57 batches=53 bytes=164823040 total_ms=33 wait_ms=19
+[2026-09-24 09:39:32 TP0] WEG2-BAR1 lane-time lane=p4 phase=collect seq=3-weights_13 units=84 batches=7 bytes=218686784 total_ms=43 wait_ms=20
+[2026-09-24 09:39:32 TP2] WEG2-RESUME begin tag=weights_14 need_mib=868 
+[2026-09-24 09:39:32 TP0] WEG2-RESUME begin tag=weights_14 need_mib=1160 
+[2026-09-24 09:39:32 TP2] WEG2-WAKE-TAG-TIME tag=weights_14 resume_ms=2 t0=1790242772.016 t=1790242772.018
+[2026-09-24 09:39:32 TP0] WEG2-WAKE-TAG-TIME tag=weights_14 resume_ms=6 t0=1790242772.015 t=1790242772.022
+[2026-09-24 09:39:32 TP1] WEG2-SEQ lane-time lane=c1 phase=collect units=5 bytes=162288640 total_ms=49 wait_ms=43 copy_sync_ms=1 record_ms=1 ipc=yes syncs=2 batch=32u/64MiB t=1790242772.040 t0=1790242771.991
+[2026-09-24 09:39:32 TP0] WEG2-BAR1 lane-time lane=p2 phase=collect seq=3-weights_9 units=42 batches=4 bytes=109343392 total_ms=20 wait_ms=18
+[2026-09-24 09:39:32 TP0] WEG2-RESUME begin tag=weights_10 need_mib=1160 
+[2026-09-24 09:39:32 TP0] WEG2-WAKE-TAG-TIME tag=weights_10 resume_ms=12 t0=1790242772.055 t=1790242772.066
+[2026-09-24 09:39:32 TP2] WEG2-BAR1 lane-time lane=p3 phase=collect seq=3-weights_9 units=57 batches=53 bytes=164823040 total_ms=45 wait_ms=37
+[2026-09-24 09:39:32 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=3-weights_9 units=109 batches=100 bytes=314439680 total_ms=92 wait_ms=79
+[2026-09-24 09:39:32 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=3-weights_9 units=111 batches=102 bytes=319508480 total_ms=96 wait_ms=80
+[2026-09-24 09:39:32 TP2] WEG2-RESUME begin tag=weights_10 need_mib=868 
+[2026-09-24 09:39:32 TP2] WEG2-WAKE-TAG-TIME tag=weights_10 resume_ms=3 t0=1790242772.090 t=1790242772.092
+[2026-09-24 09:39:32 TP1] WEG2-BAR1 lane-time lane=p5 phase=collect seq=3-weights_13 units=113 batches=104 bytes=324577280 total_ms=115 wait_ms=97
+[2026-09-24 09:39:32 TP1] WEG2-RESUME begin tag=weights_14 need_mib=856 
+[2026-09-24 09:39:32 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_14 waited=0 ms credit=1688 MiB published=1688 MiB consumed=1010 MiB available_after=677 MiB requested=856 MiB free_mib=8073 allocatable_est=7373 corridor_floor_mib=700
+[2026-09-24 09:39:32 TP1] WEG2-WAKE-TAG-TIME tag=weights_14 resume_ms=10 t0=1790242772.099 t=1790242772.109
+[2026-09-24 09:39:32 TP1] WEG2-RESUME begin tag=weights_10 need_mib=856 
+[2026-09-24 09:39:32 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_10 waited=0 ms credit=1688 MiB published=1688 MiB consumed=2331 MiB available_after=-644 MiB requested=856 MiB free_mib=6907 allocatable_est=6207 corridor_floor_mib=700
+[2026-09-24 09:39:32 TP1] WEG2-WAKE-TAG-TIME tag=weights_10 resume_ms=4 t0=1790242772.115 t=1790242772.119
+[2026-09-24 09:39:32 TP1] WEG2-SEQ lane-time lane=c1 phase=collect units=15 bytes=486865920 total_ms=14 wait_ms=0 copy_sync_ms=4 record_ms=2 ipc=yes syncs=6 batch=32u/64MiB t=1790242772.137 t0=1790242772.122
+[2026-09-24 09:39:32 TP2] WEG2-SEQ lane-time lane=c2 phase=collect units=15 bytes=494469120 total_ms=135 wait_ms=122 copy_sync_ms=2 record_ms=1 ipc=yes syncs=6 batch=32u/64MiB t=1790242772.156 t0=1790242772.020
+[2026-09-24 09:39:32 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=127 bytes=361453568 total_ms=146 wait_ms=116 copy_sync_ms=4 record_ms=9 ipc=yes syncs=7 batch=32u/64MiB t=1790242772.159 t0=1790242772.013
+[2026-09-24 09:39:32 TP0] WEG2-BAR1 lane-time lane=p2 phase=collect seq=3-weights_10 units=128 batches=10 bytes=321011664 total_ms=77 wait_ms=48
+[2026-09-24 09:39:32 TP0] WEG2-RESUME begin tag=weights_1 need_mib=1218 
+[2026-09-24 09:39:32 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_1 waited=0 ms credit=1188 MiB published=1188 MiB consumed=1562 MiB available_after=-375 MiB requested=1218 MiB free_mib=6058 allocatable_est=5291 corridor_floor_mib=767
+[2026-09-24 09:39:32 TP0] WEG2-WAKE-TAG-TIME tag=weights_1 resume_ms=9 t0=1790242772.178 t=1790242772.187
+[2026-09-24 09:39:32 TP2] WEG2-BAR1 lane-time lane=p3 phase=collect seq=3-weights_10 units=172 batches=158 bytes=494469120 total_ms=141 wait_ms=126
+[2026-09-24 09:39:32 TP0] WEG2-BAR1 lane-time lane=p4 phase=collect seq=3-weights_14 units=128 batches=10 bytes=321011664 total_ms=102 wait_ms=83
+[2026-09-24 09:39:32 TP0] WEG2-RESUME begin tag=weights_15 need_mib=1098 
+[2026-09-24 09:39:32 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_15 waited=0 ms credit=1188 MiB published=1188 MiB consumed=2660 MiB available_after=-1098 MiB requested=1098 MiB free_mib=4840 allocatable_est=4073 corridor_floor_mib=767
+[2026-09-24 09:39:32 TP0] WEG2-WAKE-TAG-TIME tag=weights_15 resume_ms=6 t0=1790242772.243 t=1790242772.249
+[2026-09-24 09:39:32 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=3-weights_0 units=164 batches=150 bytes=471659520 total_ms=144 wait_ms=111
+[2026-09-24 09:39:32 TP1] WEG2-RESUME begin tag=weights_1 need_mib=956 
+[2026-09-24 09:39:32 TP0] WEG2-RESUME begin tag=weights_11 need_mib=1098 
+[2026-09-24 09:39:32 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_1 waited=0 ms credit=1688 MiB published=1688 MiB consumed=3287 MiB available_after=-956 MiB requested=956 MiB free_mib=7009 allocatable_est=6309 corridor_floor_mib=700
+[2026-09-24 09:39:32 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=3-weights_0 units=167 batches=153 bytes=479262720 total_ms=147 wait_ms=114
+[2026-09-24 09:39:32 TP2] WEG2-RESUME begin tag=weights_1 need_mib=968 
+[2026-09-24 09:39:32 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_1 waited=0 ms credit=1462 MiB published=1462 MiB consumed=1439 MiB available_after=22 MiB requested=968 MiB free_mib=4091 allocatable_est=3390 corridor_floor_mib=701
+[2026-09-24 09:39:32 TP2] WEG2-WAKE-TAG-TIME tag=weights_1 resume_ms=2 t0=1790242772.252 t=1790242772.254
+[2026-09-24 09:39:32 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_11 waited=0 ms credit=1188 MiB published=1188 MiB consumed=3758 MiB available_after=-1098 MiB requested=1098 MiB free_mib=4556 allocatable_est=3789 corridor_floor_mib=767
+[2026-09-24 09:39:32 TP2] WEG2-RESUME begin tag=weights_15 need_mib=868 
+[2026-09-24 09:39:32 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_15 waited=0 ms credit=1462 MiB published=1462 MiB consumed=2307 MiB available_after=-846 MiB requested=868 MiB free_mib=3123 allocatable_est=2422 corridor_floor_mib=701
+[2026-09-24 09:39:32 TP2] WEG2-WAKE-TAG-TIME tag=weights_15 resume_ms=2 t0=1790242772.257 t=1790242772.259
+[2026-09-24 09:39:32 TP0] WEG2-WAKE-TAG-TIME tag=weights_11 resume_ms=5 t0=1790242772.255 t=1790242772.260
+[2026-09-24 09:39:32 TP2] WEG2-RESUME begin tag=weights_11 need_mib=868 
+[2026-09-24 09:39:32 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_11 waited=0 ms credit=1462 MiB published=1462 MiB consumed=3175 MiB available_after=-868 MiB requested=868 MiB free_mib=2255 allocatable_est=1554 corridor_floor_mib=701
+[2026-09-24 09:39:32 TP2] WEG2-WAKE-TAG-TIME tag=weights_11 resume_ms=2 t0=1790242772.262 t=1790242772.264
+[2026-09-24 09:39:32 TP1] WEG2-WAKE-TAG-TIME tag=weights_1 resume_ms=14 t0=1790242772.251 t=1790242772.265
+[2026-09-24 09:39:32 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=119 bytes=321011664 total_ms=100 wait_ms=74 copy_sync_ms=2 record_ms=4 ipc=yes syncs=6 batch=32u/64MiB t=1790242772.296 t0=1790242772.196
+[2026-09-24 09:39:32 TP0] WEG2-RESUME begin tag=weights_2 need_mib=1160 
+[2026-09-24 09:39:32 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_2 waited=0 ms credit=2874 MiB published=2874 MiB consumed=4918 MiB available_after=-1160 MiB requested=1160 MiB free_mib=4224 allocatable_est=3457 corridor_floor_mib=767
+[2026-09-24 09:39:32 TP0] WEG2-WAKE-TAG-TIME tag=weights_2 resume_ms=7 t0=1790242772.308 t=1790242772.315
+[2026-09-24 09:39:32 TP0] WEG2-BAR1 lane-time lane=p2 phase=collect seq=3-weights_11 units=128 batches=10 bytes=321011664 total_ms=49 wait_ms=32
+[2026-09-24 09:39:32 TP1] WEG2-BAR1 lane-time lane=p5 phase=collect seq=3-weights_14 units=169 batches=155 bytes=486865920 total_ms=227 wait_ms=214
+[2026-09-24 09:39:32 TP1] WEG2-RESUME begin tag=weights_15 need_mib=856 
+[2026-09-24 09:39:32 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_15 waited=0 ms credit=4106 MiB published=4106 MiB consumed=4452 MiB available_after=-347 MiB requested=856 MiB free_mib=7203 allocatable_est=6503 corridor_floor_mib=700
+[2026-09-24 09:39:32 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=3-weights_1 units=164 batches=150 bytes=471659520 total_ms=137 wait_ms=104
+[2026-09-24 09:39:32 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=3-weights_1 units=167 batches=153 bytes=479262720 total_ms=137 wait_ms=109
+[2026-09-24 09:39:32 TP2] WEG2-RESUME begin tag=weights_2 need_mib=868 
+[2026-09-24 09:39:32 TP1] WEG2-WAKE-TAG-TIME tag=weights_15 resume_ms=34 t0=1790242772.371 t=1790242772.405
+[2026-09-24 09:39:32 TP1] WEG2-RESUME begin tag=weights_11 need_mib=856 
+[2026-09-24 09:39:32 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_2 waited=0 ms credit=1462 MiB published=1462 MiB consumed=4043 MiB available_after=-868 MiB requested=868 MiB free_mib=1849 allocatable_est=1148 corridor_floor_mib=701
+[2026-09-24 09:39:32 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_11 waited=0 ms credit=4106 MiB published=4106 MiB consumed=5308 MiB available_after=-856 MiB requested=856 MiB free_mib=6347 allocatable_est=5647 corridor_floor_mib=700
+[2026-09-24 09:39:32 TP1] WEG2-WAKE-TAG-TIME tag=weights_11 resume_ms=2 t0=1790242772.408 t=1790242772.410
+[2026-09-24 09:39:32 TP1] WEG2-RESUME begin tag=weights_2 need_mib=856 
+[2026-09-24 09:39:32 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_2 waited=0 ms credit=4106 MiB published=4106 MiB consumed=6164 MiB available_after=-856 MiB requested=856 MiB free_mib=5491 allocatable_est=4791 corridor_floor_mib=700
+[2026-09-24 09:39:32 TP1] WEG2-WAKE-TAG-TIME tag=weights_2 resume_ms=4 t0=1790242772.414 t=1790242772.418
+[2026-09-24 09:39:32 TP2] WEG2-WAKE-TAG-TIME tag=weights_2 resume_ms=14 t0=1790242772.406 t=1790242772.420
+[2026-09-24 09:39:32 TP2] WEG2-BAR1 lane-time lane=p3 phase=collect seq=3-weights_11 units=172 batches=158 bytes=494469120 total_ms=142 wait_ms=114
+[2026-09-24 09:39:32 TP1] WEG2-SEQ lane-time lane=c1 phase=collect units=15 bytes=486865920 total_ms=14 wait_ms=0 copy_sync_ms=4 record_ms=4 ipc=yes syncs=6 batch=32u/64MiB t=1790242772.427 t0=1790242772.413
+[2026-09-24 09:39:32 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=119 bytes=321011664 total_ms=127 wait_ms=106 copy_sync_ms=2 record_ms=4 ipc=yes syncs=6 batch=32u/64MiB t=1790242772.450 t0=1790242772.323
+[2026-09-24 09:39:32 TP2] WEG2-SEQ lane-time lane=c2 phase=collect units=15 bytes=494469120 total_ms=200 wait_ms=181 copy_sync_ms=1 record_ms=1 ipc=yes syncs=6 batch=32u/64MiB t=1790242772.462 t0=1790242772.261
+[2026-09-24 09:39:32 TP2] WEG2-RESUME begin tag=weights_draft need_mib=0 
+[2026-09-24 09:39:32 TP2] WEG2-WAKE-TAG-TIME tag=weights_draft resume_ms=1 t0=1790242772.470 t=1790242772.471
+[2026-09-24 09:39:32 TP2] WEG2-RESUME begin tag=weights_12 need_mib=868 
+[2026-09-24 09:39:32 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_12 waited=0 ms credit=3664 MiB published=3664 MiB consumed=4911 MiB available_after=-868 MiB requested=868 MiB free_mib=2565 allocatable_est=1864 corridor_floor_mib=701
+[2026-09-24 09:39:32 TP2] WEG2-WAKE-TAG-TIME tag=weights_12 resume_ms=3 t0=1790242772.474 t=1790242772.477
+[2026-09-24 09:39:32 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=3-weights_2 units=164 batches=150 bytes=471659520 total_ms=108 wait_ms=93
+[2026-09-24 09:39:32 TP0] WEG2-BAR1 lane-time lane=p4 phase=collect seq=3-weights_15 units=128 batches=10 bytes=321011664 total_ms=103 wait_ms=100
+[2026-09-24 09:39:32 TP0] WEG2-RESUME begin tag=weights_draft need_mib=1556 
+[2026-09-24 09:39:32 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_draft waited=0 ms credit=4646 MiB published=4646 MiB consumed=6436 MiB available_after=-1556 MiB requested=1556 MiB free_mib=4874 allocatable_est=4107 corridor_floor_mib=767
+[2026-09-24 09:39:32 TP0] WEG2-WAKE-TAG-TIME tag=weights_draft resume_ms=4 t0=1790242772.546 t=1790242772.550
+[2026-09-24 09:39:32 TP0] WEG2-RESUME begin tag=weights_12 need_mib=1110 
+[2026-09-24 09:39:32 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=3-weights_2 units=167 batches=153 bytes=479262720 total_ms=133 wait_ms=96
+[2026-09-24 09:39:32 TP2] WEG2-RESUME begin tag=weights_3 need_mib=868 
+[2026-09-24 09:39:32 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_3 waited=0 ms credit=3664 MiB published=3664 MiB consumed=5779 MiB available_after=-868 MiB requested=868 MiB free_mib=1697 allocatable_est=996 corridor_floor_mib=701
+[2026-09-24 09:39:32 TP2] WEG2-WAKE-TAG-TIME tag=weights_3 resume_ms=2 t0=1790242772.558 t=1790242772.559
+[2026-09-24 09:39:32 TP2] WEG2-RESUME begin tag=weights_4 need_mib=868 
+[2026-09-24 09:39:32 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_12 waited=0 ms credit=6296 MiB published=6296 MiB consumed=7546 MiB available_after=-1110 MiB requested=1110 MiB free_mib=3952 allocatable_est=3185 corridor_floor_mib=767
+[2026-09-24 09:39:32 TP2] WEG2-BAR1 lane-time lane=p3 phase=collect seq=3-weights_12 units=172 batches=158 bytes=494469120 total_ms=88 wait_ms=77
+[2026-09-24 09:39:32 TP0] WEG2-WAKE-TAG-TIME tag=weights_12 resume_ms=4 t0=1790242772.566 t=1790242772.570
+[2026-09-24 09:39:32 TP0] WEG2-RESUME begin tag=weights_3 need_mib=1098 
+[2026-09-24 09:39:32 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_3 waited=0 ms credit=6296 MiB published=6296 MiB consumed=8644 MiB available_after=-1098 MiB requested=1098 MiB free_mib=3858 allocatable_est=3091 corridor_floor_mib=767
+[2026-09-24 09:39:32 TP0] WEG2-WAKE-TAG-TIME tag=weights_3 resume_ms=6 t0=1790242772.598 t=1790242772.605
+[2026-09-24 09:39:32 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=3-weights_3 units=167 batches=153 bytes=479262720 total_ms=48 wait_ms=41
+[2026-09-24 09:39:32 TP1] WEG2-BAR1 lane-time lane=p5 phase=collect seq=3-weights_15 units=169 batches=155 bytes=486865920 total_ms=189 wait_ms=181
+[2026-09-24 09:39:32 TP1] WEG2-RESUME begin tag=weights_draft need_mib=0 
+[2026-09-24 09:39:32 TP1] WEG2-WAKE-TAG-TIME tag=weights_draft resume_ms=1 t0=1790242772.626 t=1790242772.627
+[2026-09-24 09:39:32 TP0] WEG2-BAR1 lane-time lane=p2 phase=collect seq=3-weights_12 units=126 batches=10 bytes=328030176 total_ms=44 wait_ms=7
+[2026-09-24 09:39:32 TP1] WEG2-RESUME begin tag=weights_12 need_mib=856 
+[2026-09-24 09:39:32 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_12 waited=0 ms credit=6460 MiB published=6460 MiB consumed=7020 MiB available_after=-561 MiB requested=856 MiB free_mib=7029 allocatable_est=6329 corridor_floor_mib=700
+[2026-09-24 09:39:32 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_4 waited=73 ms credit=3664 MiB published=3664 MiB consumed=6647 MiB available_after=-868 MiB requested=868 MiB free_mib=1579 allocatable_est=878 corridor_floor_mib=701
+[2026-09-24 09:39:32 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=119 bytes=321011664 total_ms=14 wait_ms=1 copy_sync_ms=2 record_ms=5 ipc=yes syncs=6 batch=32u/64MiB t=1790242772.635 t0=1790242772.621
+[2026-09-24 09:39:32 TP1] WEG2-WAKE-TAG-TIME tag=weights_12 resume_ms=15 t0=1790242772.630 t=1790242772.645
+[2026-09-24 09:39:32 TP1] WEG2-RESUME begin tag=weights_3 need_mib=856 
+[2026-09-24 09:39:32 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_3 waited=0 ms credit=6460 MiB published=6460 MiB consumed=7876 MiB available_after=-856 MiB requested=856 MiB free_mib=7837 allocatable_est=7137 corridor_floor_mib=700
+[2026-09-24 09:39:32 TP2] WEG2-WAKE-TAG-TIME tag=weights_4 resume_ms=25 t0=1790242772.634 t=1790242772.659
+[2026-09-24 09:39:32 TP2] WEG2-RESUME begin tag=weights_5 need_mib=868 
+[2026-09-24 09:39:32 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_5 waited=0 ms credit=3664 MiB published=3664 MiB consumed=7515 MiB available_after=-868 MiB requested=868 MiB free_mib=1585 allocatable_est=884 corridor_floor_mib=701
+[2026-09-24 09:39:32 TP1] WEG2-SEQ lane-time lane=c1 phase=collect units=15 bytes=486865920 total_ms=16 wait_ms=0 copy_sync_ms=1 record_ms=1 ipc=yes syncs=6 batch=32u/64MiB t=1790242772.664 t0=1790242772.647
+[2026-09-24 09:39:32 TP2] WEG2-WAKE-TAG-TIME tag=weights_5 resume_ms=13 t0=1790242772.662 t=1790242772.675
+[2026-09-24 09:39:32 TP2] WEG2-RESUME begin tag=weights_6 need_mib=868 
+[2026-09-24 09:39:32 TP1] WEG2-WAKE-TAG-TIME tag=weights_3 resume_ms=20 t0=1790242772.658 t=1790242772.678
+[2026-09-24 09:39:32 TP1] WEG2-RESUME begin tag=weights_4 need_mib=856 
+[2026-09-24 09:39:32 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_4 waited=0 ms credit=8824 MiB published=8824 MiB consumed=8268 MiB available_after=555 MiB requested=856 MiB free_mib=8107 allocatable_est=7407 corridor_floor_mib=700
+[2026-09-24 09:39:32 TP1] WEG2-WAKE-TAG-TIME tag=weights_4 resume_ms=13 t0=1790242772.682 t=1790242772.695
+[2026-09-24 09:39:32 TP1] WEG2-RESUME begin tag=weights_5 need_mib=856 
+[2026-09-24 09:39:32 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_5 waited=0 ms credit=8824 MiB published=8824 MiB consumed=8660 MiB available_after=164 MiB requested=856 MiB free_mib=8017 allocatable_est=7317 corridor_floor_mib=700
+[2026-09-24 09:39:32 TP1] WEG2-WAKE-TAG-TIME tag=weights_5 resume_ms=14 t0=1790242772.698 t=1790242772.712
+[2026-09-24 09:39:32 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=3-weights_3 units=164 batches=150 bytes=471659520 total_ms=66 wait_ms=55
+[2026-09-24 09:39:32 TP1] WEG2-RESUME begin tag=weights_6 need_mib=856 
+[2026-09-24 09:39:32 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_6 waited=0 ms credit=8824 MiB published=8824 MiB consumed=9516 MiB available_after=-692 MiB requested=856 MiB free_mib=7161 allocatable_est=6461 corridor_floor_mib=700
+[2026-09-24 09:39:32 TP1] WEG2-WAKE-TAG-TIME tag=weights_6 resume_ms=2 t0=1790242772.749 t=1790242772.750
+[2026-09-24 09:39:32 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=3-weights_4 units=167 batches=153 bytes=479262720 total_ms=106 wait_ms=97
+[2026-09-24 09:39:32 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=3-weights_4 units=164 batches=150 bytes=471659520 total_ms=112 wait_ms=99
+[2026-09-24 09:39:32 TP1] WEG2-RESUME begin tag=weights_7 need_mib=856 
+[2026-09-24 09:39:32 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_7 waited=0 ms credit=8824 MiB published=8824 MiB consumed=10372 MiB available_after=-856 MiB requested=856 MiB free_mib=6305 allocatable_est=5605 corridor_floor_mib=700
+[2026-09-24 09:39:32 TP1] WEG2-WAKE-TAG-TIME tag=weights_7 resume_ms=4 t0=1790242772.879 t=1790242772.882
+[2026-09-24 09:39:33 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=3-weights_5 units=167 batches=153 bytes=479262720 total_ms=109 wait_ms=101
+[2026-09-24 09:39:33 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=3-weights_5 units=164 batches=150 bytes=471659520 total_ms=112 wait_ms=103
+[2026-09-24 09:39:33 TP1] WEG2-RESUME begin tag=weights_8 need_mib=856 
+[2026-09-24 09:39:33 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights_8 waited=0 ms credit=8824 MiB published=8824 MiB consumed=11228 MiB available_after=-856 MiB requested=856 MiB free_mib=5449 allocatable_est=4749 corridor_floor_mib=700
+[2026-09-24 09:39:33 TP1] WEG2-WAKE-TAG-TIME tag=weights_8 resume_ms=2 t0=1790242773.009 t=1790242773.011
+[2026-09-24 09:39:33 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=3-weights_6 units=164 batches=150 bytes=471659520 total_ms=68 wait_ms=59
+[2026-09-24 09:39:33 TP1] WEG2-RESUME begin tag=weights need_mib=2 
+[2026-09-24 09:39:33 TP1] WEG2-VRAM-CREDIT card=GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 tag=weights waited=0 ms credit=8824 MiB published=8824 MiB consumed=11230 MiB available_after=-2 MiB requested=2 MiB free_mib=4593 allocatable_est=3893 corridor_floor_mib=700
+[2026-09-24 09:39:33 TP1] WEG2-WAKE-TAG-TIME tag=weights resume_ms=1 t0=1790242773.091 t=1790242773.093
+[2026-09-24 09:39:33 TP0] WEG2-BAR1 lane-time lane=p4 phase=collect seq=3-weights_draft units=122 batches=87 bytes=2887978528 total_ms=460 wait_ms=451
+[2026-09-24 09:39:33 TP0] WEG2-RESUME begin tag=weights_4 need_mib=1110 
+[2026-09-24 09:39:33 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_4 waited=0 ms credit=11316 MiB published=11316 MiB consumed=10060 MiB available_after=1255 MiB requested=1110 MiB free_mib=7772 allocatable_est=7005 corridor_floor_mib=767
+[2026-09-24 09:39:33 TP0] WEG2-WAKE-TAG-TIME tag=weights_4 resume_ms=3 t0=1790242773.144 t=1790242773.147
+[2026-09-24 09:39:33 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_6 waited=472 ms credit=5802 MiB published=5802 MiB consumed=8383 MiB available_after=-868 MiB requested=868 MiB free_mib=2231 allocatable_est=1530 corridor_floor_mib=701
+[2026-09-24 09:39:33 TP0] WEG2-RESUME begin tag=weights_5 need_mib=1154 
+[2026-09-24 09:39:33 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_5 waited=0 ms credit=11316 MiB published=11316 MiB consumed=11214 MiB available_after=101 MiB requested=1154 MiB free_mib=6662 allocatable_est=5895 corridor_floor_mib=767
+11.4192 copy_ms=0.004799 sync_ms=2e-05 allocs=27 bytes=[2026-09-24 09:39:33 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=117 bytes=328030176 total_ms=13 wait_ms=1 copy_sync_ms=2 record_ms=4 ipc=yes syncs=6 batch=32u/64MiB t=1790242773.168 t0=1790242773.154
+[2026-09-24 09:39:33 TP0] WEG2-WAKE-TAG-TIME tag=weights_5 resume_ms=13 t0=1790242773.156 t=1790242773.169
+[core.cpp] WEG2-RING LEG tag=weights_6 remap_ms=19.9714 copy_ms=[2026-09-24 09:39:33 TP0] WEG2-RESUME begin tag=weights_6 need_mib=1160 
+[2026-09-24 09:39:33 TP2] WEG2-WAKE-TAG-TIME tag=weights_6 resume_ms=21 t0=1790242773.149 t=1790242773.170
+[2026-09-24 09:39:33 TP2] WEG2-RESUME begin tag=weights_7 need_mib=868 
+[2026-09-24 09:39:33 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_7 waited=0 ms credit=8572 MiB published=8572 MiB consumed=9251 MiB available_after=-680 MiB requested=868 MiB free_mib=3133 allocatable_est=2432 corridor_floor_mib=701
+[2026-09-24 09:39:33 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_6 waited=0 ms credit=11316 MiB published=11316 MiB consumed=12374 MiB available_after=-1059 MiB requested=1160 MiB free_mib=5514 allocatable_est=4747 corridor_floor_mib=767
+[2026-09-24 09:39:33 TP2] WEG2-WAKE-TAG-TIME tag=weights_7 resume_ms=15 t0=1790242773.178 t=1790242773.192
+[2026-09-24 09:39:33 TP2] WEG2-RESUME begin tag=weights_8 need_mib=868 
+[2026-09-24 09:39:33 TP0] WEG2-WAKE-TAG-TIME tag=weights_6 resume_ms=15 t0=1790242773.181 t=1790242773.196
+[2026-09-24 09:39:33 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights_8 waited=0 ms credit=8572 MiB published=8572 MiB consumed=10119 MiB available_after=-868 MiB requested=868 MiB free_mib=2265 allocatable_est=1564 corridor_floor_mib=701
+[2026-09-24 09:39:33 TP0] WEG2-RESUME begin tag=weights_7 need_mib=1098 
+[2026-09-24 09:39:33 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_7 waited=0 ms credit=11316 MiB published=11316 MiB consumed=13472 MiB available_after=-1098 MiB requested=1098 MiB free_mib=4354 allocatable_est=3587 corridor_floor_mib=767
+[2026-09-24 09:39:33 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=119 bytes=321011664 total_ms=26 wait_ms=1 copy_sync_ms=4 record_ms=7 ipc=yes syncs=6 batch=32u/64MiB t=1790242773.207 t0=1790242773.181
+[core.cpp] WEG2-RING LEG tag=[2026-09-24 09:39:33 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=3-weights_6 units=167 batches=153 bytes=479262720 total_ms=40 wait_ms=26
+[2026-09-24 09:39:33 TP2] WEG2-WAKE-TAG-TIME tag=weights_8 resume_ms=19 t0=1790242773.198 t=1790242773.218
+[2026-09-24 09:39:33 TP2] WEG2-RESUME begin tag=weights need_mib=2 
+[2026-09-24 09:39:33 TP0] WEG2-WAKE-TAG-TIME tag=weights_7 resume_ms=18 t0=1790242773.202 t=1790242773.220
+[2026-09-24 09:39:33 TP0] WEG2-RESUME begin tag=weights_8 need_mib=1110 
+[2026-09-24 09:39:33 TP2] WEG2-VRAM-CREDIT card=GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 tag=weights waited=0 ms credit=8572 MiB published=8572 MiB consumed=10121 MiB available_after=-2 MiB requested=2 MiB free_mib=1397 allocatable_est=696 corridor_floor_mib=701
+[2026-09-24 09:39:33 TP2] WEG2-WAKE-TAG-TIME tag=weights resume_ms=1 t0=1790242773.222 t=1790242773.223
+[2026-09-24 09:39:33 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights_8 waited=0 ms credit=12966 MiB published=12966 MiB consumed=14582 MiB available_after=-1110 MiB requested=1110 MiB free_mib=4906 allocatable_est=4139 corridor_floor_mib=767
+[2026-09-24 09:39:33 TP0] WEG2-WAKE-TAG-TIME tag=weights_8 resume_ms=4 t0=1790242773.225 t=1790242773.229
+[2026-09-24 09:39:33 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=119 bytes=321011664 total_ms=22 wait_ms=3 copy_sync_ms=6 record_ms=8 ipc=yes syncs=6 batch=32u/64MiB t=1790242773.242 t0=1790242773.220
+[2026-09-24 09:39:33 TP0] WEG2-RESUME begin tag=weights need_mib=2494 
+[2026-09-24 09:39:33 TP0] WEG2-VRAM-CREDIT card=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d tag=weights waited=0 ms credit=12966 MiB published=12966 MiB consumed=16770 MiB available_after=-2494 MiB requested=2494 MiB free_mib=3796 allocatable_est=3029 corridor_floor_mib=767
+[2026-09-24 09:39:33 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=119 bytes=321011664 total_ms=36 wait_ms=1 copy_sync_ms=15 record_ms=3 ipc=yes syncs=6 batch=32u/64MiB t=1790242773.291 t0=1790242773.255
+[2026-09-24 09:39:33 TP0] WEG2-WAKE-TAG-TIME tag=weights resume_ms=46 t0=1790242773.259 t=1790242773.305
+[2026-09-24 09:39:33 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=3-weights_7 units=164 batches=150 bytes=471659520 total_ms=103 wait_ms=67
+[2026-09-24 09:39:33 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=3-weights_7 units=167 batches=153 bytes=479262720 total_ms=107 wait_ms=86
+[2026-09-24 09:39:33 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=117 bytes=328030176 total_ms=75 wait_ms=54 copy_sync_ms=2 record_ms=4 ipc=yes syncs=6 batch=32u/64MiB t=1790242773.379 t0=1790242773.305
+[2026-09-24 09:39:33 TP0] WEG2-BAR1 lane-time lane=p4 phase=collect seq=3-weights units=25 batches=20 bytes=658759696 total_ms=85 wait_ms=68
+[2026-09-24 09:39:33 TP1] WEG2-BAR1 lane-time lane=p0 phase=collect seq=3-weights_8 units=164 batches=150 bytes=471659520 total_ms=107 wait_ms=69
+[2026-09-24 09:39:33 TP2] WEG2-BAR1 lane-time lane=p1 phase=collect seq=3-weights_8 units=167 batches=153 bytes=479262720 total_ms=106 wait_ms=80
+[2026-09-24 09:39:33 TP0] WEG2-SEQ lane-time lane=c0 phase=collect units=3 bytes=645632016 total_ms=87 wait_ms=80 copy_sync_ms=1 record_ms=0 ipc=yes syncs=2 batch=32u/64MiB t=1790242773.476 t0=1790242773.389

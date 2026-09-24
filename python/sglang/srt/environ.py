@@ -554,6 +554,23 @@ class Envs:
     # planner refuses (W126) a form no order can fund. 0 = the round-robin as
     # before, and the planner then refuses every form whose given order cycles.
     SGLANG_WEG2_FLIP_ORDER_CREDIT = EnvBool(True)
+    # PD_TIMED_ORDER (H34, fnFL2x141): the planner times the P->D wake per card
+    # in ms (weg2/wake_credit_pd.py) and recommends a rearrangement of the
+    # tightest card's own P bands when the credit wait there lengthens the leg
+    # (x141, draft on P: D TP2 waited 466 ms at weights_6, PP0's chain paid
+    # ~90 ms). With this on, the front replaces the pause order by that
+    # recommendation -- only when its live order is exactly the one the
+    # planner timed and the H14 fixpoint finds no credit cycle in it. Off by
+    # default: modelled -90 ms (x141 form) / -52..-71 ms (H25 form with FR_D
+    # 0.06,0.51,0.48, checked on x145's own flips) on the short P->D flips and
+    # 0 on the 97k flip, never measured on metal; the proven H25 form
+    # (FR_D 0.06,0.44,0.365) gets no recommendation.
+    SGLANG_WEG2_ENABLE_PD_TIMED_ORDER = EnvBool(False)
+    # PD_CREDIT_REFUSAL (H34): the dry run refuses (W126) a form whose P->D
+    # wake cannot finish on some card (after every pause of its P stage the
+    # card still lacks free - floor - staging for the next D tag: W35 after
+    # the 120 s credit budget). 0 = the lines are printed, the boot goes on.
+    SGLANG_WEG2_ENABLE_PD_CREDIT_REFUSAL = EnvBool(True)
     # SLEEP_RELEASE_LMEM (H15, fnFL2x120): a complete sleep lowers the context's
     # per-thread stack limit (cuCtxSetLimit), which frees the driver's
     # local-memory reservation (derived 255 MiB per process on the 5090,
