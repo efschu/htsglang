@@ -1435,6 +1435,10 @@ class Envs:
     # H2: run the first N chunk publishes under torch's sync-debug "warn" mode
     # and log each implicit synchronising call site once (H2-SYNC-SITE). 0 = off.
     SGLANG_DEBUG_HICACHE_SYNC_TRACE = EnvInt(0)
+    # #31468 metal check: run the first N DFLASH decode rounds under torch's
+    # sync-debug "warn" mode; logs DFLASH-SYNC-ROUND (count per round) and each
+    # implicit host-sync call site once (DFLASH-SYNC-SITE). 0 = off.
+    SGLANG_DEBUG_DFLASH_SYNC_TRACE = EnvInt(0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
