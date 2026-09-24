@@ -102,6 +102,49 @@ def arena_host_enabled() -> bool:
     return os.environ.get(ENV_ARENA_HOST, "0") == "1"
 
 
+def load_index_async() -> bool:
+    """SGLANG_HICACHE_LOAD_ASYNC_INDEX=1 (27B D rounds, 24.09.; default off).
+
+    The load-back runs on the load stream, and since upstream #36738 that
+    stream first WAITS FOR THE FORWARD STREAM (`start_loading` fences the H2D
+    behind the forward in flight). Every host-blocking index copy on the load
+    path -- a pageable ``.to(dev)``, a ``.cpu()`` of a device index, a device
+    tensor indexed by a host mask -- therefore holds the scheduler thread until
+    the running decode forward has finished: a request admitted with a store
+    hit between two D rounds stalls the next round by up to one forward.
+
+    On, the index tensors cross through pinned memory with ``non_blocking``
+    (the xsn338 pattern of the page load) or are selected on the device, so
+    the thread never waits on the load stream. The copies are the same bytes
+    into the same rows in the same stream order; only the host wait is gone.
+    """
+    return str(os.environ.get("SGLANG_HICACHE_LOAD_ASYNC_INDEX", "0")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def index_to_device_async(idx: torch.Tensor, dev) -> torch.Tensor:
+    """An int64 index on ``dev`` without a host wait: a tensor already there
+    stays (a dtype cast runs on the device), a host tensor crosses through
+    pinned memory with ``non_blocking``. Anything else (CPU desk, a second
+    card) takes the ordinary ``.to`` -- the call sites' old behaviour."""
+    dev = torch.device(dev)
+    if idx.device.type == dev.type and (dev.index is None or idx.device.index == dev.index):
+        return idx if idx.dtype == torch.int64 else idx.to(dtype=torch.int64)
+    if idx.device.type == "cpu" and dev.type == "cuda":
+        return idx.to(dtype=torch.int64).pin_memory().to(dev, non_blocking=True)
+    return idx.to(device=dev, dtype=torch.int64)
+
+
+def _select_rows_async(t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """``t[mask]`` for a host bool ``mask`` without a host wait when ``t`` lives
+    on a card: the positions are taken on the host (ascending, as boolean
+    indexing orders them) and gathered on the device."""
+    if t.device.type == "cpu":
+        return t[mask.to(t.device)]
+    pos = mask.to("cpu").nonzero(as_tuple=True)[0]
+    return t.index_select(0, index_to_device_async(pos, t.device))
+
+
 class ArenaMHAHostPool(MHATokenToKVPoolHost):
     """MHA host pool whose rows beyond the staging ring are arena slots."""
 
@@ -593,8 +636,13 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # failed for Tensor<4313>[dtype=int64, device=cpu]" -- both live on
         # the card, like the ordinary path's indices.
         dev = dst_k.device
-        src_idx = src_idx.to(device=dev, dtype=torch.int64, non_blocking=False)
-        dst_idx = dst_idx.to(device=dev, dtype=torch.int64, non_blocking=False)
+        if load_index_async():
+            # no host wait on the (forward-fenced) load stream; see load_index_async
+            src_idx = index_to_device_async(src_idx, dev)
+            dst_idx = index_to_device_async(dst_idx, dev)
+        else:
+            src_idx = src_idx.to(device=dev, dtype=torch.int64, non_blocking=False)
+            dst_idx = dst_idx.to(device=dev, dtype=torch.int64, non_blocking=False)
         transfer_hicache_one_layer(
             k_cache_dst=dst_k,
             v_cache_dst=device_pool.v_buffer[layer_id],
