@@ -1653,7 +1653,7 @@ class MambaPool:
         round-trip bit-identical.
         """
         from sglang.srt.model_executor.offload_gdn_states import (
-            _TRANSIENT_SPEC_FIELDS,
+            transient_state_fields,
         )
 
         idx = int(slot)
@@ -1663,10 +1663,14 @@ class MambaPool:
                 "session slots (slot 0 is the pool's dummy padding target "
                 "and never vacates)"
             )
+        # 27B ReplaySSM S4: the spec ring is request-row verify scratch.
+        transient = transient_state_fields(
+            bool(getattr(self, "enable_linear_replayssm_spec", False))
+        )
         current_platform.synchronize()
         blob = {}
         for f in fields(self.mamba_cache):
-            if f.name in _TRANSIENT_SPEC_FIELDS:
+            if f.name in transient:
                 continue
             value = getattr(self.mamba_cache, f.name, None)
             if value is None:
@@ -1724,13 +1728,16 @@ class MambaPool:
         """Names a blob of this pool carries, in a stable order. Used by the
         round-trip check and by callers sizing a blob tier."""
         from sglang.srt.model_executor.offload_gdn_states import (
-            _TRANSIENT_SPEC_FIELDS,
+            transient_state_fields,
         )
 
+        transient = transient_state_fields(
+            bool(getattr(self, "enable_linear_replayssm_spec", False))
+        )
         names = [
             f.name
             for f in fields(self.mamba_cache)
-            if f.name not in _TRANSIENT_SPEC_FIELDS
+            if f.name not in transient
             and getattr(self.mamba_cache, f.name, None) is not None
         ]
         if self.replayssm_write_pos is not None:
@@ -1855,6 +1862,10 @@ class MambaPool:
                 "replayssm_d",
                 "replayssm_k",
                 "replayssm_g",
+                # 27B ReplaySSM S4: the spec ring's low parts, excluded like
+                # d/k/g in get_contiguous_buf_infos (element-wise mirror).
+                "replayssm_rawv",
+                "replayssm_rawk",
             ):
                 continue
             value = getattr(self.mamba_cache, field)
@@ -1914,6 +1925,10 @@ class MambaPool:
                 "replayssm_d",
                 "replayssm_k",
                 "replayssm_g",
+                # 27B ReplaySSM S4: the spec ring's low parts, excluded like
+                # d/k/g in get_contiguous_buf_infos (element-wise mirror).
+                "replayssm_rawv",
+                "replayssm_rawk",
             ):
                 continue
             value = getattr(self.mamba_cache, field)
@@ -2007,6 +2022,10 @@ class MambaPool:
                 "replayssm_d",
                 "replayssm_k",
                 "replayssm_g",
+                # 27B ReplaySSM S4: the spec ring's low parts, excluded like
+                # d/k/g in get_contiguous_buf_infos (element-wise mirror).
+                "replayssm_rawv",
+                "replayssm_rawk",
             ):
                 continue
             value = getattr(self.mamba_cache, field)

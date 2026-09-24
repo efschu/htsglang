@@ -81,6 +81,26 @@ GDN_STATE_SET_CLASS = "gdn_state_sets"
 # get_contiguous_buf_infos / transfer inventory.
 _TRANSIENT_SPEC_FIELDS = ("intermediate_ssm", "intermediate_conv_window")
 
+# 27B ReplaySSM package (S4): under --enable-linear-replayssm-spec the ring
+# fields are the verify scratch that replaced intermediate_ssm -- keyed by
+# REQUEST row ([layers, spec_state_size + 1, ...]), not by state slot, and
+# empty between steps (fold every commit). They are transient exactly like
+# the intermediates. The same NAMES under the decode ring
+# (--enable-linear-replayssm) are slot-keyed persistent state and stay in the
+# set, so the exclusion depends on the pool, not on the name alone.
+_SPEC_RING_FIELDS = (
+    "replayssm_d",
+    "replayssm_k",
+    "replayssm_g",
+    "replayssm_rawv",
+    "replayssm_rawk",
+)
+
+
+def transient_state_fields(spec_ring: bool) -> Tuple[str, ...]:
+    """Fields of MambaPool.State that are NOT part of a session state set."""
+    return _TRANSIENT_SPEC_FIELDS + (_SPEC_RING_FIELDS if spec_ring else ())
+
 # Lowering waits this many consecutive admission cycles below the threshold
 # before the rung drops (raising is always immediate). Deliberately > 1 so a
 # single idle admission window does not already unpark/park sets back and
@@ -232,7 +252,7 @@ class SessionSetLadder:
         return max(self._current, min(needed, self.max_sets))
 
 
-def mamba_state_set_nbytes(mamba_cache, num_slots: int) -> int:
+def mamba_state_set_nbytes(mamba_cache, num_slots: int, *, spec_ring: bool = False) -> int:
     """Per-set bytes of one session slot across all GDN layers, from the
     REAL tensor shapes of the pool's persistent state (conv states, temporal
     state, ReplaySSM rings when allocated). All these tensors are laid out
@@ -245,9 +265,10 @@ def mamba_state_set_nbytes(mamba_cache, num_slots: int) -> int:
 
     if num_slots < 1:
         raise ValueError(f"num_slots must be >= 1, got {num_slots}")
+    transient = transient_state_fields(spec_ring)
     total = 0
     for f in dataclasses.fields(mamba_cache):
-        if f.name in _TRANSIENT_SPEC_FIELDS:
+        if f.name in transient:
             continue
         value = getattr(mamba_cache, f.name, None)
         if value is None:
@@ -347,7 +368,11 @@ def register_mamba_state_sets(
     if set_bytes_fn is None:
 
         def set_bytes_fn() -> int:
-            return mamba_state_set_nbytes(pool.mamba_cache, num_slots)
+            return mamba_state_set_nbytes(
+                pool.mamba_cache,
+                num_slots,
+                spec_ring=bool(getattr(pool, "enable_linear_replayssm_spec", False)),
+            )
 
     item_ids: List[str] = []
     for slot in range(1, pool.size + 1):
