@@ -1637,6 +1637,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # finish path publishes its own node, so the chain keeps parents first.
         # Nothing is deferred unless SGLANG_WEG2_P_HOST_OVERLAP=1.
         self.weg2_flush_deferred_chunk_publish()
+        if _weg2_p_overlap.p_host_overlap_on():
+            # SERVED-AFTER-ACK (xsn422/xsn423 HOLD-REFETCH, rid weg2-18-36): the
+            # deferred publish of the N-1 node is issued after the LAST chunk's
+            # launch, and PP0 then blocks in the output wait of that chunk -- no
+            # plan, so no ack poll, between the issue and this finish. The copy
+            # is done by now, its ack is not processed, the page is not
+            # COMPLETE in the arena, the response goes out (RETAIN-PUBLISH
+            # pending=2) and D's dormant read in the same second finds no
+            # leading page. xsn421 (inline publish in the plan, then a plan and
+            # its ack poll before the finish) had none. Poll the acks HERE,
+            # without waiting: only copies whose events are complete are
+            # retired (writing_check's non-blocking branch, Event.query()).
+            self.writing_check()
 
         kv_committed_len = req.pop_committed_kv_cache()
         # #969L: THE VALUE AT THE PARK INSERT. §S proved this insert IS reached
