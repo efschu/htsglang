@@ -146,6 +146,11 @@ class DraftHostPark:
         self.unpark_issue_ms = 0.0
 
     @property
+    def holds_image(self) -> bool:
+        """A park has written the host image: the draft's wake source (H25d)."""
+        return self.host is not None and bool(self.entries)
+
+    @property
     def nbytes(self) -> int:
         return sum(e.nbytes for e in self.entries)
 

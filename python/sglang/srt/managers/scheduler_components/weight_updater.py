@@ -1712,6 +1712,14 @@ class SchedulerWeightUpdaterManager:
         return (_weg2_drafter_of(self) is not None and bool(exchange_armed())
                 and not draft_tag_in_family())
 
+    def _weg2_draft_carried_by_park(self) -> bool:
+        """H25d: does this rank's draft wake from its own pinned host image?
+        True once a park wrote the image (``DraftHostPark.holds_image``); the
+        image is kept for the process's life and every later wake of the
+        draft reads it (``_weg2_unpark_draft_start``), never the disk."""
+        park = self._weg2_draft_park
+        return park is not None and park.holds_image
+
     def _weg2_park_draft_at_sleep(self, credit) -> None:
         """H25 (C): D2H the draft into the pinned host image, pause its tag,
         and credit the released VRAM to the waking group on this card. Runs
@@ -2046,8 +2054,19 @@ class SchedulerWeightUpdaterManager:
                                        and bool(_dtf()))
             except Exception:  # noqa: BLE001 -- unreadable arm: keep the refusal
                 _draft_via_exchange = False
+            # H25d (fnFL2x142, 24.09.): the draft's bytes may also come from
+            # its OWN pinned host image. Under SGLANG_WEG2_DRAFT_ON_P=0 the
+            # draft tag is out of the family (no partner on P), so the clause
+            # above is False, and x142 died here on all three D ranks at the
+            # first P->D wake -- AFTER `WEG2-DRAFT-PARK ... credited=yes` on
+            # TP0 and BEFORE `_weg2_unpark_draft_start` could copy the image
+            # back. Nothing is refilled from disk on that path; the objection
+            # below does not apply. Keyed on the image EXISTING on this rank
+            # (a park happened), never on the arm alone: a rank that never
+            # parked has no host source and keeps the refusal.
+            _draft_via_park = self._weg2_draft_carried_by_park()
             if (draft_path is not None and draft_path != server_args.model_path
-                    and not _draft_via_exchange):
+                    and not _draft_via_exchange and not _draft_via_park):
                 raise Weg2WakeRefused(
                     "W4 Weg2WakeRefused: the draft worker loads from "
                     f"{draft_path!r}, not from {server_args.model_path!r}, and "
