@@ -1069,6 +1069,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 s["extend_start_loc"][bs:r].fill_(self.raw_num_tokens)
                 s["req_pool_indices"][bs:r].zero_()
                 s["orig_seq_lens"][bs:r].zero_()
+                # Upstream #34184: the captured track scatter reads these rows
+                # too, and a stale mask row still carries a live destination
+                # slot: it would land this replay's conv/GDN window in an
+                # earlier request's checkpoint. fill_from() runs with
+                # padded_bs == raw_bs here, so it never resets [bs:r] itself.
+                registry = self.buffer_registry
+                for name in ("mamba_track_mask", "mamba_track_indices"):
+                    if registry.has_slot(name):
+                        registry.get_slot(name).buffer[bs:r].zero_()
 
         # Refresh the static buffer the captured graph reads from.
         if (
