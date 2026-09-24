@@ -1753,6 +1753,20 @@ class Scheduler(
             self.draft_kv_producer.embed_dtype,
             self.draft_kv_producer.build_s,
         )
+        # DFLASH-PRODUCE-ON-P (2026-09-24): the armed line above stays
+        # byte-identical (W11/W11b read it); the form is named on its own line.
+        if self.draft_kv_producer_algorithm.is_dflash():
+            from sglang.srt.speculative.dflash_draft_kv_producer import (
+                dflash_produce_off_line,
+                dflash_produce_on_p,
+            )
+
+            if not dflash_produce_on_p():
+                logger.info(
+                    dflash_produce_off_line(
+                        where=f"scheduler pp_rank={self.pp_rank} (producer built, never asked)"
+                    )
+                )
 
     def init_target_memory_pool(self):
         """Allocate target KV cache pools if they have not been allocated yet."""
@@ -16083,11 +16097,22 @@ class Scheduler(
         An unfalsifiable term reads as protection that is not there -- the
         wants-matrix row for IDLE passes with or without it, so the guard was
         pinning nothing while looking like it did.
+
+        DFLASH-PRODUCE-ON-P (user decision 2026-09-24, "P ohne draft
+        rechnen"): under ``SGLANG_WEG2_DFLASH_PRODUCE=0`` a DFlash producer
+        is built (cold-resident weights) but never asked -- no FULL capture,
+        no ``produce()``, no ``publish_draft_rows_direct``.
         """
-        return (
-            self.draft_kv_producer is not None
-            and batch.forward_mode.is_extend()
-        )
+        if self.draft_kv_producer is None or not batch.forward_mode.is_extend():
+            return False
+        _is_dflash = getattr(self.draft_kv_producer_algorithm, "is_dflash", None)
+        if callable(_is_dflash) and _is_dflash():
+            from sglang.srt.speculative.dflash_draft_kv_producer import (
+                dflash_produce_on_p,
+            )
+
+            return dflash_produce_on_p()
+        return True
 
     @contextmanager
     def _draft_kv_full_capture(self, batch: ScheduleBatch):

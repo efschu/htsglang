@@ -725,11 +725,25 @@ DFLASH_DRAFT_PATH_DEFAULT = (
 )
 DFLASH_BLOCK_DEFAULT = 8
 DFLASH_WINDOW_DEFAULT = 2048
+#: --dflash-produce-on-p (user decision 2026-09-24, verbatim: "ne wir lassen
+#: den draft produzenten auf P weg. wir lassen seine layer kalt dort liegen im
+#: vram, oder im systemram. entscheidung ist gefallen. P ohne draft rechnen").
+#: THE STANDARD FORM under --spec-form DFLASH is ``off``: group P still loads
+#: the DFlash2 draft on its last PP stage (cold-resident bytes: same VRAM, same
+#: planner cut, same exchange census and flip) but computes nothing with it.
+#: ``on`` is the old producer form, A/B only. Measured reason (boot xsn410, P
+#: log): DRAFT-KV-PRODUCE took 19.5 s of a 21 s prefill span per 98k prompt,
+#: growing linearly per 4096 chunk (393 ms @28k -> 1197 ms @94k). The switch
+#: rides group P's ENVIRONMENT only (spec_form_env("P")) -- argv_p, the P FORM
+#: key, the census and the ledger are byte-identical under both values.
+DFLASH_PRODUCE_ON_P_DEFAULT = "off"
+DFLASH_PRODUCE_ENV = "SGLANG_WEG2_DFLASH_PRODUCE"
 _SPEC_FORM: Dict[str, object] = {
     "form": SPEC_FORM_DEFAULT,
     "draft_path": DFLASH_DRAFT_PATH_DEFAULT,
     "block": DFLASH_BLOCK_DEFAULT,
     "window": DFLASH_WINDOW_DEFAULT,
+    "produce_on_p": DFLASH_PRODUCE_ON_P_DEFAULT == "on",
 }
 
 
@@ -739,6 +753,10 @@ def apply_spec_form(ns) -> None:
     _SPEC_FORM["draft_path"] = str(getattr(ns, "dflash_draft_path", DFLASH_DRAFT_PATH_DEFAULT) or DFLASH_DRAFT_PATH_DEFAULT)
     _SPEC_FORM["block"] = int(getattr(ns, "dflash_block", DFLASH_BLOCK_DEFAULT) or DFLASH_BLOCK_DEFAULT)
     _SPEC_FORM["window"] = int(getattr(ns, "dflash_window", DFLASH_WINDOW_DEFAULT) or DFLASH_WINDOW_DEFAULT)
+    _SPEC_FORM["produce_on_p"] = (
+        str(getattr(ns, "dflash_produce_on_p", DFLASH_PRODUCE_ON_P_DEFAULT) or DFLASH_PRODUCE_ON_P_DEFAULT).lower()
+        == "on"
+    )
     if _SPEC_FORM["form"] == "DFLASH" and not os.path.isdir(_SPEC_FORM["draft_path"]):
         raise SystemExit(
             f"--spec-form DFLASH: draft checkpoint {_SPEC_FORM['draft_path']} is not a directory"
@@ -794,15 +812,48 @@ def dflash_placement() -> str:
     return "solo" if v == "solo" else "split"
 
 
+def dflash_produce_on_p() -> bool:
+    """--dflash-produce-on-p as installed by :func:`apply_spec_form`."""
+    return bool(_SPEC_FORM.get("produce_on_p", DFLASH_PRODUCE_ON_P_DEFAULT == "on"))
+
+
 def spec_form_env(group: str) -> Dict[str, str]:
     """Environment the form needs on one group: D's window pool under DFLASH,
-    and (solo placement) the solo host's compact draft cache."""
+    and (solo placement) the solo host's compact draft cache; P's
+    draft-KV producer switch under DFLASH (--dflash-produce-on-p, ALWAYS
+    written so the rank never falls back to its unset default)."""
     if spec_form_is_dflash() and group == "D":
         env = {"SGLANG_DFLASH_WINDOW_POOL": "1"}
         if dflash_placement() == "solo":
             env["SGLANG_DFLASH_SOLO_COMPACT"] = "1"
         return env
+    if spec_form_is_dflash() and group == "P":
+        return {DFLASH_PRODUCE_ENV: "1" if dflash_produce_on_p() else "0"}
     return {}
+
+
+def dflash_produce_line() -> str:
+    """The one launcher line naming group P's DFlash producer form (the
+    draft_kv_off_line pattern: an A/B arm that reads like the default is how a
+    measurement gets attributed to the wrong tree)."""
+    if dflash_produce_on_p():
+        return (
+            "WEG2 DFLASH-PRODUCE-ON-P: on -- group P's DFlash draft-KV producer "
+            "COMPUTES (aux capture on every PP stage, produce() per prefill chunk, "
+            "hash-keyed publish into the draft arena); the old producer form, A/B only "
+            f"({DFLASH_PRODUCE_ENV}=1 in P's environment)"
+        )
+    return (
+        "WEG2 DFLASH-PRODUCE-ON-P: off -- STANDARD FORM (user decision 2026-09-24): "
+        "group P loads the DFlash2 draft on its last PP stage (cold-resident bytes, "
+        "same VRAM, same planner cut, same exchange census and flip) and computes "
+        "nothing with it: no aux capture on any PP stage, no produce(), no "
+        "publish_draft_rows_direct. Group D is unchanged (DFLASH sharded, window "
+        f"{int(_SPEC_FORM['window'])}) and finds no draft pages -> its cold path "
+        "(#993 zeros + 1 bootstrap round); expect DRAFT-PRESENCE mode=cold and "
+        f"draft_pages=0 on the front's served lines ({DFLASH_PRODUCE_ENV}=0 in P's "
+        "environment; argv_p and the P FORM key are identical under on/off)"
+    )
 
 
 def spec_plan_fields() -> Dict[str, object]:
@@ -5537,6 +5588,43 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         env.pop(P_PREFILL_TRANSIENT_ENV, None)
     env.update(spec_form_env(group))  # --spec-form: D's window pool under DFLASH
     return env
+
+
+def p_produces_draft_pages() -> bool:
+    """Does group P WRITE draft pages this boot (given it carries the
+    producer flags)? False only under --spec-form DFLASH with
+    --dflash-produce-on-p off (the 2026-09-24 standard form)."""
+    return not (spec_form_is_dflash() and not dflash_produce_on_p())
+
+
+W10_SKIPPED_NO_DRAFT_PAGES = (
+    "W10 SKIPPED: P produces no draft pages (--dflash-produce-on-p off)"
+)
+
+
+def gate_w10(log_p: str, log_d: str, log, *, p_produces_draft_pages: bool) -> Dict[str, object]:
+    """W10 (#1233) as a function so its skip is pinnable.
+
+    Under --dflash-produce-on-p off group P registers its drafter (the
+    producer is built) but writes no page under it, so D's draft reads miss
+    whatever the identities say -- a mismatch there refuses a boot for a
+    route that does not exist (metal: weg2xsn414 refused W10 with
+    P=b53f8c336da51155 D=f0c73316257fec1d on the old producer form; the
+    cause of that disagreement is noted, not chased -- the producer form is
+    retired). The identities are still read and logged, never graded."""
+    w10 = check_drafter_identity(log_p, log_d)
+    ids = (f"P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} layout_D={w10['layout_D']} "
+           f"match={w10['match']} (P lines {w10['n_P']}, D lines {w10['n_D']})")
+    if not p_produces_draft_pages:
+        log(f"{W10_SKIPPED_NO_DRAFT_PAGES} -- D's draft reads miss by construction and take the cold path "
+            f"(#993 zeros + 1 bootstrap round); identities read, NOT graded: {ids}")
+        return w10
+    log(f"W10 DRAFTER-IDENTITY {ids}")
+    if not w10["match"]:
+        raise Weg2LaunchRefused(f"W10 Weg2DrafterIdentityMismatch: P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} "
+                                f"layout_D={w10['layout_D']} -- the decode group would ask the carrier for draft pages under "
+                                f"an identity the prefill group never writes")
+    return w10
 
 
 _DRAFTER_RE = re.compile(r"HiCache draft KV registered: .*drafter=([0-9a-f]{16}|None)")
@@ -11820,6 +11908,19 @@ def build_parser() -> argparse.ArgumentParser:
                     help="D's compact draft cache window = --speculative-draft-window-size "
                          "(the draft's sliding_window, 2048 for DFlash2).")
     ap.add_argument(
+        "--dflash-produce-on-p", choices=["off", "on"], default=DFLASH_PRODUCE_ON_P_DEFAULT,
+        help="--spec-form DFLASH only (user decision 2026-09-24). 'off' (the default, "
+             "the standard form): group P keeps loading the DFlash2 draft on its last "
+             "PP stage -- the bytes stay cold-resident, so VRAM, the planner cut, the "
+             "exchange census and the flip are unchanged -- but computes NOTHING with "
+             "it: no aux-hidden capture on any PP stage, no DFlashDraftKvProducer."
+             "produce(), no publish_draft_rows_direct. Group D is unchanged and finds "
+             "no draft pages (its existing cold path). 'on' is the old producer form, "
+             "A/B only. The value reaches group P's ranks through its environment "
+             "(" + DFLASH_PRODUCE_ENV + "=0/1, spec_form_env('P')); argv_p and the P "
+             "FORM key are byte-identical under both values, and the launcher names "
+             "the form in one line (WEG2 DFLASH-PRODUCE-ON-P).")
+    ap.add_argument(
         "--transport", choices=["bar1", "nccl"], default="bar1",
         help="Collective transport for BOTH groups. 'bar1' is the shipping "
              "default. 'nccl' is the DEVELOPMENT mode of the user's order of "
@@ -13415,6 +13516,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     draft_kv_on_p = _draft_kv_on_p_requested and not hicache_disabled
     if not draft_kv_on_p:
         log(draft_kv_off_line())
+    elif spec_form_is_dflash():
+        # --dflash-produce-on-p (2026-09-24): P carries the DFlash producer
+        # flags; whether it COMPUTES rides P's environment (spec_form_env).
+        log(dflash_produce_line())
     # #1386: `hicache_disabled` was already resolved once, at the top of
     # `main`, before `log` even existed (the first `common_flags` sentinel
     # call needs it long before this point) -- this is only the LOG SIDE of
@@ -14714,13 +14819,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "state is COLD after every flip. Expect draft_pages=0 on the front's served lines; that is this "
             "arm, not a carrier fault. KV and Mamba across the flip are untouched.")
     else:
-        w10 = check_drafter_identity(spec_p.log, spec_d.log)
-        log(f"W10 DRAFTER-IDENTITY P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} layout_D={w10['layout_D']} "
-            f"match={w10['match']} (P lines {w10['n_P']}, D lines {w10['n_D']})")
-        if not w10["match"]:
-            raise Weg2LaunchRefused(f"W10 Weg2DrafterIdentityMismatch: P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} "
-                                    f"layout_D={w10['layout_D']} -- the decode group would ask the carrier for draft pages under "
-                                    f"an identity the prefill group never writes")
+        # --dflash-produce-on-p off (2026-09-24): P builds the producer but
+        # writes NO draft pages, so there is no identity for D to be matched
+        # against -- W10 is skipped by name (the identities are still logged).
+        # W11 still grades the cold-resident draft bytes on P's last stage.
+        gate_w10(spec_p.log, spec_d.log, log,
+                 p_produces_draft_pages=p_produces_draft_pages())
         # #1233 fix 2: W11 DRAFT-RESIDENT gate. The last stage's pool is priced
         # against a budgeted draft residue (P_DRAFT_RESIDENT_BUDGET_MIB); the L2
         # line carries the MEASURED one. Over budget = the corridor derivation is refuted by this
