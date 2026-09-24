@@ -396,6 +396,12 @@ def _replayssm_spec_for(runner) -> bool:
     """
     if not getattr(runner.server_args, "enable_linear_replayssm_spec", False):
         return False
+    if _is_draft_kv_only_producer(runner):
+        # S3: the producer builds no verify workspace at all (#1233 FIX 4,
+        # speculative_num_draft_tokens=None), so there is nothing to replace;
+        # the flag is a no-op there instead of the pool's missing-window
+        # refusal.
+        return False
     if runner.hybrid_gdn_config is None:
         raise ValueError(
             "--enable-linear-replayssm-spec: only the GDN verify route is ported "
