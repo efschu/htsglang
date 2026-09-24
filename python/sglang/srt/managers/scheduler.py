@@ -17246,6 +17246,14 @@ class Scheduler(
             tp_group_verdict=tp_group_verdict
         )
         if group_idle:
+            # fnFL2 H63d (#1470b): the reset below restarts the storage
+            # pipeline and drops every store write still queued behind the one
+            # in flight; the write-through acks joined above queue the plain
+            # sidecars of a direct write (#106S).  PP0 decides this flush on
+            # the idle lap that landed at the previous sleep, not on its own
+            # blockers -- x169: hicache_backup(5) on PP1/PP2 in the same
+            # second, D's store read short by 11776 tokens.  Join them first.
+            self._weg2_join_store_writes_before_reset()
             self.cur_batch_for_debug = None
             self.last_batch = None
             self.tree_cache.reset()
@@ -17288,6 +17296,24 @@ class Scheduler(
             )
             success = False
         return success
+
+    def _weg2_join_store_writes_before_reset(self) -> None:
+        """#1470b: delegate the bounded join to the tree (same switch as #1470)."""
+        if not self.enable_hierarchical_cache or os.environ.get("SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP", "1") == "0":
+            return
+        join = getattr(self.tree_cache, "join_storage_backups", None)
+        if join is None:
+            return
+        from sglang.srt.managers.cache_controller import STORAGE_THREAD_JOIN_BOUND_S
+
+        drained, left, waited_ms = join(STORAGE_THREAD_JOIN_BOUND_S)
+        if drained or left:
+            (logger.warning if left else logger.info)(
+                "#1470b FLUSH-STORE-JOIN drained=%d left=%d waited_ms=%.0f (store writes the "
+                "write-through acks had queued behind the backup thread's current one, handed to "
+                "it BEFORE the reset rebuilds the queue; left>0 = the bound or a dead backup "
+                "thread, those pages miss in the store)",
+                drained, left, waited_ms)
 
     def group_idle_verdict(self, tp_group_verdict: bool = False) -> Tuple[bool, str]:
         """#1268: is THE GROUP idle -- not "is this rank idle".

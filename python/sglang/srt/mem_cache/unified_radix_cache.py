@@ -1682,6 +1682,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
 
+            # H18 (E1): the partial page's rows [floor_page(c), c) leave with
+            # the state captured at c; H24 (E2): with the END state after N
+            # (rows up to N, the open QSA group's ring rows, GDN slot, P's
+            # sampled token).  fnFL2 H63d: HERE, before the retention
+            # truncation below frees [effective_cache_len, N) -- under the H63
+            # fold the last chunk's extra_buffer track leaves
+            # mamba_last_track_seqlen = floor_page(N) pending at the finish (the
+            # cut form consumed it at c's unfinished insert, so its finish saw
+            # None and never truncated), and the publish behind the free read
+            # 97792 rows for a cut of 97840 (x169: "WEG2-TAIL-PUBLISH refused",
+            # D no_parts).  No capture armed = a no-op (tail_handoff).
+            tail_handoff.publish_rows(
+                req, kv_indices, self.token_to_kv_pool_allocator, f"pp{self.pp_rank}-{os.getpid()}",
+                req_to_token_pool=self.req_to_token_pool, n_parts=self.pp_size,
+            )
+
             # Truncate if needed
             if effective_cache_len < len(token_ids):
                 free_start = max(effective_cache_len, req.cache_protected_len)
@@ -1729,18 +1745,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
-            # H18 (E1): the partial page's rows [floor_page(c), c) leave with
-            # the state captured at c, before the unaligned tail is freed.
-            # H24 (E2): with the END state after N (rows up to N, the open
-            # QSA group's ring rows, GDN slot, P's sampled token).
-            tail_handoff.publish_rows(
-                req, kv_indices, self.token_to_kv_pool_allocator, f"pp{self.pp_rank}-{os.getpid()}",
-                req_to_token_pool=self.req_to_token_pool, n_parts=self.pp_size,
-            )
-            # Free unaligned tail
+            # Free unaligned tail (the tail hand-off above has its rows)
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
             if _WEG2_END_ANCHOR:
-                self._weg2_note_end_anchor(req, token_ids)
+                # fnFL2 H63d: the probe asks for the anchor at or below N-1 of
+                # the PROMPT, not of the retained key -- on the truncated ids
+                # (the fold's finish) it split the last node one page short and
+                # read ok=False (x169: units=81920/97728 short=1, #1481 mark lost)
+                self._weg2_note_end_anchor(req, token_ids_full)
             self._weg2_handoff_write(req, radix_key)
             self._weg2_publish_at_retain(req, radix_key)
         else:
@@ -7213,6 +7225,53 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     len(ack_queue) - ready,
                 )
         return ready
+
+    def join_storage_backups(self, bound_s: float) -> "tuple[int, int, float]":
+        """fnFL2 H63d (#1470b): before a reset, wait until none of this
+        tree's store writes (``ongoing_backup``) is still QUEUED on the
+        backup thread.
+
+        ``cache_controller.reset()`` stops the backup thread
+        (``_stop_storage_threads``: the operation in flight finishes -- the
+        loop tests the stop event only at its top -- and the join waits for
+        it) and ``_start_storage_threads`` builds a fresh ``backup_queue``:
+        every operation still QUEUED behind the one in flight is gone without
+        a trace (#1068 RESET JOIN counts prefetch operations only:
+        ``terminated_ops=0 drained_ops=0``).  #1470 joins the write-throughs;
+        the store writes their acks issue (a direct write's plain sidecars,
+        #106S: the QSA index of Next Flash) are one stage later and were not
+        joined.  Measured x169 (fnFL2, H63 fold): the retain publish issued
+        the whole last chunk at the finish, its acks queued the sidecar
+        writes, PP0's flush -- decided on the idle lap that had landed at the
+        previous sleep -- reset 50 ms later; the write in flight survived,
+        the queued ones did not, and D's store read stopped at 1344 of 1528
+        pages (``deliverable=97792 shortfall=11776``, 2757 re-reads).
+
+        Only the queue is waited on: the write in flight is the reset's own
+        join, and a record whose operation is in no queue (none is known
+        today; a queue rebuilt under a live tree would leave one) must not
+        hold the flush.  Rank-local (no collective), bounded, a dead backup
+        thread answers at once.  Returns ``(drained, left, waited_ms)``: the
+        queued writes that reached the thread, those still queued."""
+        cc = self.cache_controller
+        pending = set((getattr(self, "ongoing_backup", None) or {}).keys())
+        q = getattr(cc, "backup_queue", None) if cc is not None else None
+        if q is None or not getattr(self, "enable_storage", False) or not pending:
+            return 0, 0, 0.0
+
+        def queued() -> set:
+            with q.mutex:
+                return pending & {getattr(op, "id", None) for op in list(q.queue)}
+
+        thread = getattr(cc, "backup_thread", None)
+        t0 = time.perf_counter()
+        first = left = queued()
+        while left:
+            if thread is None or not thread.is_alive() or time.perf_counter() - t0 >= float(bound_s):
+                break  # the bound, or nobody left to drain the queue: the reset proceeds, named
+            time.sleep(0.002)
+            left = queued()
+        return len(first) - len(left), len(left), (time.perf_counter() - t0) * 1000.0
 
     def writing_check(self, write_back: bool = False) -> None:
         """Poll write-through completions."""
