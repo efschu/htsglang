@@ -334,6 +334,11 @@ class PrefillInputBuffers(ForwardInputBuffers):
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
+    # Pipeline-parallel stage input of a NON-first stage under the full
+    # prefill graph (ported from upstream #35451): hidden_states, residual and
+    # every ``aux_layer_<id>`` DFlash capture an earlier stage carries
+    # (distributed/pp_aux_capture). None on the first stage and without PP.
+    pp_proxy_tensors: Optional[Dict[str, torch.Tensor]] = None
 
     @classmethod
     def create(
@@ -347,6 +352,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         hidden_size: int,
         dtype: torch.dtype,
         enable_mamba_track: bool,
+        pp_proxy_keys: Optional[Tuple[str, ...]] = None,
     ) -> PrefillInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_tokens,), dtype=torch.int64)
@@ -374,6 +380,19 @@ class PrefillInputBuffers(ForwardInputBuffers):
                 input_embeds = None
                 mrope_positions = None
 
+            # Every key is a [tokens, hidden] activation of the model dtype:
+            # hidden_states / residual are the stage boundary, aux_layer_<id>
+            # is a DFlash capture (communicator.py: the pre-attention residual
+            # of the capture layer). No key -> no buffer (first stage, no PP).
+            pp_proxy_tensors = (
+                {
+                    key: torch.zeros((max_num_tokens, hidden_size), dtype=dtype)
+                    for key in pp_proxy_keys
+                }
+                if pp_proxy_keys
+                else None
+            )
+
         return cls(
             input_ids=input_ids,
             out_cache_loc=out_cache_loc,
@@ -384,6 +403,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
     def populate_from_forward_batch(

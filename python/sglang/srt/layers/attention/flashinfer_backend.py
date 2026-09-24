@@ -1119,6 +1119,9 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             self.workspace_buffer = global_workspace_buffer
+        # Read only by _full_cg_prefill_float_workspace (the memory-saver half
+        # of the weg2 graph-scratch region's arming gate).
+        self._full_cg_server_args = model_runner.server_args
         max_bs = _cuda_graph_capture_max_bs(
             model_runner.server_args, model_runner.req_to_token_pool.size
         )
@@ -1962,6 +1965,60 @@ class FlashInferAttnBackend(AttentionBackend):
         tmp_s = per_row
         return int((tmp_v + tmp_s) * FULL_CG_PREFILL_WORKSPACE_MARGIN)
 
+    def _full_cg_prefill_float_workspace(
+        self, workspace_bytes: int, device
+    ) -> torch.Tensor:
+        """The float (split-kv scratch) workspace of the full prefill graph.
+
+        Default (unchanged): a dedicated buffer, because on a server that
+        also captures DECODE graphs those wrappers' plans pin the shared
+        workspace. Two 27B-line refinements, both only reachable when a full
+        prefill graph captures:
+
+        * ``SGLANG_FULL_CG_PREFILL_SHARED_WORKSPACE=1`` (set by the weg2
+          launcher for group P under --p-prefill-graph; P never captures a
+          decode graph, #1233 FIX 4): reuse the backend's float workspace when
+          it is large enough. Measured by the sizing below it would otherwise
+          cost ~167 MiB on the 5090 (170 SMs -> padded batch 85) and ~94 MiB
+          on a 3080 per stage -- more than the graph's own pool. Same content
+          contract as the eager wrappers that already share it: scratch
+          written before read inside one launch sequence, zeroed per finished
+          request and on every wake (zero_flashinfer_workspaces).
+        * otherwise the dedicated buffer is allocated inside
+          ``weg2_graph_scratch_region`` -- on a Weg-2 rank whose graph tag is
+          armed (the same condition under which the capture itself routes
+          into that tag) it is released by the group's sleep with the graph
+          pool instead of staying resident for the other group's phase; a
+          no-op everywhere else.
+        """
+        if (
+            os.environ.get("SGLANG_FULL_CG_PREFILL_SHARED_WORKSPACE", "0").strip()
+            not in ("", "0")
+            and self.workspace_buffer.numel() * self.workspace_buffer.element_size()
+            >= int(workspace_bytes)
+        ):
+            logger.info(
+                "Full-CG prefill workspace SHARED with the float workspace "
+                "(%.1f MiB >= %.1f MiB needed; no decode graph on this group)",
+                self.workspace_buffer.numel()
+                * self.workspace_buffer.element_size()
+                / (1024 * 1024),
+                int(workspace_bytes) / (1024 * 1024),
+            )
+            return self.workspace_buffer
+        from sglang.srt.managers.weg2_memory_saver import weg2_graph_scratch_region
+
+        memory_saver_on = bool(
+            getattr(
+                getattr(self, "_full_cg_server_args", None),
+                "enable_memory_saver",
+                False,
+            )
+        )
+        with weg2_graph_scratch_region(int(workspace_bytes), memory_saver_on):
+            buf = torch.empty(int(workspace_bytes), dtype=torch.uint8, device=device)
+        return register_flashinfer_workspace_buffer(buf)
+
     def _create_full_cg_prefill_wrappers(
         self, num_slots: int, max_num_tokens: int
     ) -> list:
@@ -1993,8 +2050,8 @@ class FlashInferAttnBackend(AttentionBackend):
             max_num_tokens,
             num_slots,
         )
-        self.full_cg_prefill_workspace_buffer = register_flashinfer_workspace_buffer(
-            torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
+        self.full_cg_prefill_workspace_buffer = self._full_cg_prefill_float_workspace(
+            workspace_bytes, device
         )
         self.full_cg_prefill_qo_indptr = [
             torch.zeros((num_slots + 1,), dtype=torch.int32, device=device)

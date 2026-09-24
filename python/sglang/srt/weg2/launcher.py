@@ -727,6 +727,154 @@ def apply_spec_form(ns) -> None:
         )
 
 
+#: --p-prefill-graph (27B line, 2026-09-24; user: P on 512-token chunks, and
+#: for the fixed chunk a prefill CUDA graph -- "ja unbedingt"). 0 = off, the
+#: default: argv_p, the P form key and every ledger input are byte-identical
+#: to a tree without the switch. N > 0 = group P captures ONE full prefill
+#: graph of N tokens (backend 'full', the only prefill backend that can put
+#: its capture pool in the memory saver's cuda_graph tag -- the same
+#: sleep/wake the decode graphs on D ride) and runs its chunks at N tokens,
+#: because a bucket below the chunk size would replay only the rest chunk.
+#: Measured motive (xsn422 #PGAP): the host launch of one P forward is
+#: 63/42/74 ms per stage, ~24 ms fixed + ~0.9 ms per layer, independent of the
+#: token count, against ~48-71 ms of compute for a 512-token chunk.
+P_PREFILL_GRAPH_DEFAULT = 0
+_P_PREFILL_GRAPH: Dict[str, int] = {"bucket": P_PREFILL_GRAPH_DEFAULT}
+
+
+def apply_p_prefill_graph(ns) -> None:
+    """Install --p-prefill-graph once, before any argv is built (the same
+    install-once shape as apply_spec_form: every common_flags("P") call --
+    the cut solve's chunk read, its armed re-check, the form key, the shipped
+    argv -- reads this ONE value, so they cannot disagree)."""
+    bucket = int(getattr(ns, "p_prefill_graph", P_PREFILL_GRAPH_DEFAULT) or 0)
+    if bucket < 0:
+        raise SystemExit(f"--p-prefill-graph must be >= 0, got {bucket}")
+    _P_PREFILL_GRAPH["bucket"] = bucket
+
+
+def p_prefill_graph_bucket() -> int:
+    """The P prefill graph's token bucket, 0 when the switch is off."""
+    return int(_P_PREFILL_GRAPH["bucket"])
+
+
+def p_chunked_prefill_tokens() -> int:
+    """Group P's --chunked-prefill-size: the graph bucket when the P prefill
+    graph is on, the common constant otherwise (byte-identical default)."""
+    return p_prefill_graph_bucket() or CHUNKED_PREFILL_TOKENS
+
+
+def p_prefill_graph_flags() -> List[str]:
+    """The ONE argv term of the P prefill graph ([] when off).
+
+    ``--cuda-graph-config`` JSON rather than the convenience flags because it
+    states all three keys in one token and wins over every other source
+    (server_args._parse_cuda_graph_config), and an EXPLICIT prefill backend is
+    also what skips the breakable-only auto-disable cascade (multimodal /
+    memory-saver rules) that turned P's prefill graph off until now:
+      * backend 'full' -- captures into the memory saver's cuda_graph tag
+        (full_cuda_graph_backend.py), released by P's sleep like D's graphs;
+      * bs [bucket]    -- one shape; a shorter rest chunk pads up to it;
+      * full_prefill_max_req 1 -- one request slot: a chunk holding two
+        requests runs eager (named by the runner's PREFILL-GRAPH eager line),
+        and the captured linear-attention metadata never sees a sentinel row.
+    """
+    bucket = p_prefill_graph_bucket()
+    if not bucket:
+        return []
+    return [
+        "--cuda-graph-config",
+        json.dumps(
+            {
+                "prefill": {
+                    "backend": "full",
+                    "bs": [bucket],
+                    "full_prefill_max_req": 1,
+                }
+            },
+            separators=(",", ":"),
+        ),
+    ]
+
+
+#: The `prefill graph pool` post, MiB per 512 graph tokens per P stage. AN
+#: ESTIMATE, NOT A MEASUREMENT (desk, 2026-09-24) -- the capture runs after
+#: KV sizing, so the first boot can only book a forecast, and every later
+#: boot should book the MEASURED rank line 'PREFILL-GRAPH captured ...
+#: capture_mib=' via --p-prefill-graph-pool-mib. Derivation for one 512-token
+#: chunk of the 27B (hidden 5120, intermediate 17408, bf16): the capture pool
+#: reuses freed blocks inside the capture, so it holds ONE layer's working
+#: set -- MLP gate_up 34 MiB + activation 17 + int8 activation 8.5 + the GDN
+#: chunk intermediates ~30 + the residual stream 10 -- plus the stage's
+#: outputs (hidden + residual 10 MiB, + 5 MiB per DFlash capture when the
+#: producer computes) and the static inputs (embeddings / proxy 5-35 MiB).
+#: The flashinfer full-CG split-kv workspace (~167 MiB on the 5090, ~94 MiB
+#: on a 3080) is NOT in it: under the switch P shares the float workspace
+#: that is already in the cuda_graph tag (SGLANG_FULL_CG_PREFILL_SHARED_
+#: WORKSPACE). The task's own forecast was ~0.1 GiB per stage.
+P_PREFILL_GRAPH_POOL_MIB_PER_512 = 160.0
+#: Group P's stage count (argv_p ships --pp-size 3).
+P_PREFILL_GRAPH_STAGES = 3
+
+
+def p_prefill_graph_pool_mib(ns) -> Tuple[float, ...]:
+    """The per-stage `prefill graph pool` post, MiB; () when the switch is
+    off. ONE vector for both sides of the seam: the pool model's
+    PhasePoolModel.prefill_graph_pool_mib and the ranks' SGLANG_KV_BUDGET_
+    PREFILL_GRAPH_MIB (p_prefill_graph_env) are both built from this call."""
+    bucket = p_prefill_graph_bucket()
+    if not bucket:
+        return ()
+    raw = str(getattr(ns, "p_prefill_graph_pool_mib", "") or "").strip()
+    if raw:
+        vals = tuple(float(x) for x in raw.split(",") if x.strip())
+        if len(vals) == 1:
+            vals = vals * P_PREFILL_GRAPH_STAGES
+        if len(vals) != P_PREFILL_GRAPH_STAGES or any(v < 0 for v in vals):
+            raise SystemExit(
+                f"--p-prefill-graph-pool-mib {raw!r}: one value or "
+                f"{P_PREFILL_GRAPH_STAGES} non-negative per-stage values expected"
+            )
+        return vals
+    est = P_PREFILL_GRAPH_POOL_MIB_PER_512 * float(bucket) / 512.0
+    return (est,) * P_PREFILL_GRAPH_STAGES
+
+
+def p_prefill_graph_env(pool_mib: Sequence[float]) -> Dict[str, str]:
+    """Group P's environment under --p-prefill-graph ({} when off, so the
+    default env stays byte-identical)."""
+    if not p_prefill_graph_bucket():
+        return {}
+    return {
+        # model_runner_kv_cache_mixin.PREFILL_GRAPH_POOL_ENV: the runtime
+        # books the same post the pool model priced.
+        "SGLANG_KV_BUDGET_PREFILL_GRAPH_MIB": ",".join("%.1f" % v for v in pool_mib),
+        # flashinfer_backend._full_cg_prefill_float_workspace: P captures no
+        # decode graph (#1233 FIX 4), so the full-CG prefill wrappers may
+        # share the float workspace instead of a second split-kv buffer.
+        "SGLANG_FULL_CG_PREFILL_SHARED_WORKSPACE": "1",
+    }
+
+
+def p_prefill_graph_line() -> str:
+    """The one launcher line naming group P's prefill-graph form."""
+    bucket = p_prefill_graph_bucket()
+    if not bucket:
+        return (
+            "WEG2 P-PREFILL-GRAPH: off -- group P prefills eager at "
+            f"--chunked-prefill-size {CHUNKED_PREFILL_TOKENS} (default form)"
+        )
+    return (
+        f"WEG2 P-PREFILL-GRAPH: on bucket={bucket} -- group P runs "
+        f"--chunked-prefill-size {bucket} and captures ONE full prefill graph "
+        f"of {bucket} tokens per PP stage ({' '.join(p_prefill_graph_flags())}); "
+        "capture pool in the memory saver's cuda_graph tag (released by P's "
+        "sleep, remapped by its wake); rank lines 'PREFILL-GRAPH captured ... "
+        "capture_mib=' (cost) and 'PREFILL-GRAPH eager reason=' (every batch "
+        "the graph did not take)"
+    )
+
+
 def spec_form_is_dflash() -> bool:
     return str(_SPEC_FORM["form"]) == "DFLASH"
 
@@ -3113,7 +3261,10 @@ def common_flags(
         "--hicache-canonical-kv-page",
     ]) + [
         "--host", "127.0.0.1",
-        "--chunked-prefill-size", str(CHUNKED_PREFILL_TOKENS),
+        # --p-prefill-graph N moves GROUP P's chunk to the graph bucket N
+        # (p_chunked_prefill_tokens); D and the default keep the constant.
+        "--chunked-prefill-size",
+        str(p_chunked_prefill_tokens() if group == "P" else CHUNKED_PREFILL_TOKENS),
         "--scheduler-distributed-teardown",
         "--page-size", "1",
         # #1235: arbitrary and FIXED, which is the whole provenance -- see
@@ -3333,7 +3484,8 @@ def argv_p(
         []
         if any(str(a).startswith("--max-mamba-cache-size") for a in extra)
         else ["--max-mamba-cache-size", str(P_MAX_MAMBA_CACHE_SIZE)]
-    ) + extra
+        # --p-prefill-graph: [] when off (the default argv is unchanged).
+    ) + p_prefill_graph_flags() + extra
 
 
 def w38_armed_line(argv_of_p: Sequence[str]) -> str:
@@ -9889,6 +10041,9 @@ def solve_p_cut(
         # arming floor and nothing else, and boot weg2sb5f published 499,967
         # tokens for the cut group P then sized at 304,655 (+64.1 %).
         stage_fixed_mib=tuple(_csv_floats(ns.pp_cut_stage_fixed_mib)),
+        # --p-prefill-graph: the SAME vector the ranks book (env_p, see
+        # p_prefill_graph_env); () when off -- the pool model is unchanged.
+        prefill_graph_pool_mib=p_prefill_graph_pool_mib(ns),
         activation_reserve_mib=float(ns.pp_cut_activation_reserve_mib),
         # #1257c: None = follow the reserve (the runtime charges exactly it);
         # a number = the operator pinned it.
@@ -10753,6 +10908,34 @@ def build_parser() -> argparse.ArgumentParser:
              "(" + DFLASH_PRODUCE_ENV + "=0/1, spec_form_env('P')); argv_p and the P "
              "FORM key are byte-identical under both values, and the launcher names "
              "the form in one line (WEG2 DFLASH-PRODUCE-ON-P).")
+    ap.add_argument(
+        "--p-prefill-graph", type=int, default=P_PREFILL_GRAPH_DEFAULT,
+        metavar="TOKENS",
+        help="Group P prefill CUDA graph (27B line). 0 (the default) = off: "
+             "argv_p, the P form key and every ledger input are byte-identical "
+             "to a tree without this flag. N > 0 = P captures ONE full prefill "
+             "graph of N tokens (--cuda-graph-config prefill backend 'full', "
+             "bs [N], one request slot) AND runs its chunks at N tokens "
+             "(--chunked-prefill-size N on group P only; D keeps its chunk) -- "
+             "a bucket below the chunk would replay only the rest chunk. The "
+             "capture pool lives in the memory saver's cuda_graph tag, so P's "
+             "sleep releases it and the wake remaps it, like D's decode graphs. "
+             "A shorter rest chunk pads up to N. Batches the graph cannot take "
+             "(two requests, multimodal inputs, input logprobs) run eager and "
+             "are named by the rank line 'PREFILL-GRAPH eager reason='. The "
+             "capture cost per stage is the rank line 'PREFILL-GRAPH captured "
+             "... capture_mib='. Changes P's form key (chunk + graph config "
+             "are device allocations). User goal: 512.")
+    ap.add_argument(
+        "--p-prefill-graph-pool-mib", default="", metavar="MIB[,MIB,MIB]",
+        help="Only with --p-prefill-graph: the 'prefill graph pool' budget post "
+             "per P stage, MiB -- booked by the ranks "
+             "(SGLANG_KV_BUDGET_PREFILL_GRAPH_MIB) AND by the P cut's pool "
+             "model (PhasePoolModel.prefill_graph_pool_mib), one vector for "
+             "both. Empty (default) = the desk ESTIMATE "
+             f"{P_PREFILL_GRAPH_POOL_MIB_PER_512:.0f} MiB per 512 graph tokens "
+             "per stage; pass the measured 'PREFILL-GRAPH captured ... "
+             "capture_mib=' values of a previous boot instead.")
     ap.add_argument(
         "--d-replayssm-spec", choices=["off", "on"], default=D_REPLAYSSM_SPEC_DEFAULT,
         help="27B ReplaySSM package. 'on' gives group D --enable-linear-replayssm-spec "
@@ -11781,6 +11964,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _ACTIVE_BOOT_STATE = None
     ns = build_parser().parse_args(argv)
     apply_spec_form(ns)
+    apply_p_prefill_graph(ns)
     # #1386: THE SWITCH IS RESOLVED HERE, ONCE, AS EARLY AS `ns` EXISTS --
     # earlier than `draft_kv_on_p` below, because the FIRST `common_flags`
     # call (the sentinel `chunk_tokens` solve, several hundred lines down)
@@ -12343,6 +12527,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # --dflash-produce-on-p (2026-09-24): P carries the DFlash producer
         # flags; whether it COMPUTES rides P's environment (spec_form_env).
         log(dflash_produce_line())
+    if p_prefill_graph_bucket():
+        # Only when on: the default boot's front log stays byte-identical.
+        log(p_prefill_graph_line())
     if not hicache_disabled:
         log(hicache_draft_tier_line())
     # --d-replayssm-spec (27B ReplaySSM S6): D's verify form, both states named.
@@ -12822,6 +13009,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for _pline in p_host_overlap_lines(
             getattr(ns, "p_host_overlap", False), getattr(ns, "p_hostgap", False)):
         log(_pline)
+    # --p-prefill-graph: {} when off (env byte-identical). The pool vector is
+    # the SAME call the cut's pool model was built from (solve_p_cut).
+    _pg_pool = p_prefill_graph_pool_mib(ns)
+    env_p.update(p_prefill_graph_env(_pg_pool))
+    if _pg_pool:
+        log(
+            "WEG2 P-PREFILL-GRAPH post 'prefill graph pool' MiB per stage = %s "
+            "(%s; booked by the ranks via SGLANG_KV_BUDGET_PREFILL_GRAPH_MIB and "
+            "by the cut's pool model; full-CG split-kv workspace shared with the "
+            "float workspace via SGLANG_FULL_CG_PREFILL_SHARED_WORKSPACE=1)"
+            % (
+                ",".join("%.1f" % v for v in _pg_pool),
+                "operator value"
+                if str(getattr(ns, "p_prefill_graph_pool_mib", "") or "").strip()
+                else "DESK ESTIMATE, replace by the measured capture_mib",
+            )
+        )
     # TRAIN FIX 5: the chunk size the cut solver was given BEFORE the ring is
     # re-read here against the arm this boot actually chose.  The hoist above
     # rests on --chunked-prefill-size being a CONSTANT of common_flags rather
