@@ -1299,6 +1299,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.head_dim,
             self.rotary_emb.rotary_dim,
             has_gate=self.attn_output_gate,
+            # Upstream #34446: [3, T] mrope positions (Qwen3_5ForConditional-
+            # Generation passes forward_batch.mrope_positions) need the axis
+            # map, or height/width are dropped for every image token. A 2-D
+            # positions tensor on a rope without the map fails the kernel's
+            # assertion instead of silently rotating by the temporal row.
+            mrope_axis_map=(
+                getattr(self.rotary_emb, "axis_map", None)
+                if positions.dim() == 2
+                else None
+            ),
         )
         seq_len = hidden_states.shape[0]
         q = q_out.view(seq_len, -1)
