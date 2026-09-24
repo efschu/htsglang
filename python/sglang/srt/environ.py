@@ -479,6 +479,15 @@ class Envs:
     # resume) and reads the written rows/state back once per request for the
     # WEG2-TAIL-ADOPT line (digest=match|MISMATCH).
     SGLANG_WEG2_TAIL_VERIFY = EnvBool(True)
+    # TAIL_SKIP_EXTEND (H24, E2): P also publishes its END state -- the KV
+    # rows [floor_page(c), N), the QSA pending-ring rows of the open group,
+    # the GDN state after all N tokens and the token it sampled -- and D,
+    # when every rank of the group can serve it (vote 2 in the same MIN
+    # slot), runs NO extend forward: the request enters the decode queue
+    # with prefix N and P's token as its first output. Effective only under
+    # TAIL_ADOPT; any refusal falls back to E1 (extend [c, N)), then to the
+    # page resume. 0 = the H21 form.
+    SGLANG_WEG2_TAIL_SKIP_EXTEND = EnvBool(True)
     # FLIP_ORDER_CREDIT (H14, fnFL2x114c/x114d): the front simulates the
     # D->P wake per card (weg2/wake_credit.py) before it hands out the pause
     # order; an order that ends in the W109 credit cycle is replaced by one in

@@ -624,6 +624,8 @@ def _budget_state_stub(*, avail: int, evictable: int, deficit: int):
 
     adder = PrefillAdder.__new__(PrefillAdder)
     adder.prefill_spill_deep_taken = False
+    #: H24: budget_state closes the batch behind a skip-extend admission too
+    adder.weg2_skip_extend_taken = False
     adder.is_hybrid_swa = False
     adder.is_all_swa = False
     adder.is_hybrid_ssm_cache = False

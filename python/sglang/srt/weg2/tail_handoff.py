@@ -32,6 +32,17 @@ D takes the parts over in weg2/tail_adopt.py (H21): a group MIN vote in the
 prefetch-progress collective, the partial page as a request-owned page at the
 admission commit, rows + state written at the extend's first GDN layer,
 extend [c, N).
+
+E2 (H24, ``SGLANG_WEG2_TAIL_SKIP_EXTEND``). P has computed the final chunk
+[c, N) itself and sampled the first output token (leg 1 is
+``max_new_tokens=1``), so at ``cache_finished_req`` it also owns the END
+state: the KV rows [floor_page(c), N), the QSA pending-ring rows of the open
+group [floor_r(N), N) (plus their RoPE positions), the GDN working slot after
+all N tokens, and ``req.output_ids[-1]``. The same part file carries them as
+an ``end`` section (``EndHeader`` + payload key ``"end"``), gathered on the
+FORWARD STREAM after that chunk's forward (no host sync on P) and written by
+the publish thread once the gather's event fired. D then needs no extend
+forward at all (weg2/tail_adopt.py, "SKIP").
 """
 
 from __future__ import annotations
@@ -58,6 +69,15 @@ KEEP_RIDS = 2
 
 def enabled() -> bool:
     return bool(envs.SGLANG_WEG2_TAIL_HANDOFF.get())
+
+
+def skip_extend_enabled() -> bool:
+    """E2 (H24): SGLANG_WEG2_TAIL_SKIP_EXTEND under TAIL_HANDOFF + TAIL_ADOPT."""
+    return (
+        enabled()
+        and bool(envs.SGLANG_WEG2_TAIL_ADOPT.get())
+        and bool(envs.SGLANG_WEG2_TAIL_SKIP_EXTEND.get())
+    )
 
 
 # -- geometry (pure) -------------------------------------------------------------
@@ -122,6 +142,17 @@ def extend_range(spec: TailSpec) -> Tuple[int, int]:
     return spec.cut, spec.n_tokens
 
 
+def end_geometry(spec: TailSpec, ratio: int) -> Tuple[int, int, int]:
+    """E2: (rows, complete_groups, ring_rows) of the END section -- the rows
+    [page_prefix, N), the QSA groups in them that are complete (their
+    compressed row exists), and the open group's members [floor_r(N), N)
+    that live only in the per-request pending ring. ratio 0 = no QSA."""
+    rows = spec.n_tokens - spec.page_prefix
+    if not ratio:
+        return rows, 0, 0
+    return rows, rows // int(ratio), spec.n_tokens % int(ratio)
+
+
 def agree_cut(page_prefix: int, cut: int, local_ok: bool, reduce_min: Callable[[int], int]) -> int:
     """The group's resume depth: c only when EVERY rank can serve it (a rank
     without GDN/KV layers answers 1, like FormAWorkerNullStorage), else the
@@ -139,6 +170,41 @@ def digest(tensors: Sequence[torch.Tensor]) -> str:
 
 
 # -- file layout -----------------------------------------------------------------
+class EndHeader(msgspec.Struct, frozen=True):
+    """E2: the END section of a part -- state after all N tokens."""
+
+    first_token: int
+    key: str  # tail_key(ids, N): the section belongs to exactly this prompt
+    rows: int  # N - page_prefix KV rows
+    groups: int  # complete QSA groups among them (0 without QSA)
+    ring_rows: int  # N % ratio open-group members (0 without QSA)
+    fa_digest: str
+    gdn_digest: str
+    ring_digest: str
+    nbytes: int
+
+
+class EndPayload(msgspec.Struct):
+    """E2 payload of one rank, host tensors once ``event`` fired. fa: gid ->
+    (K, V[, compressed]) rows; gdn: gid -> (temporal, conv...) after N; ring:
+    gid -> (index-K pending rows,); rope: [ring_rows, 3] or None."""
+
+    first_token: int
+    key: str
+    rows: int
+    groups: int
+    ring_rows: int
+    fa: Dict[int, Tuple[torch.Tensor, ...]]
+    gdn: Dict[int, Tuple[torch.Tensor, ...]]
+    ring: Dict[int, Tuple[torch.Tensor, ...]]
+    rope: Optional[torch.Tensor]
+    event: object = None
+
+
+def ring_order(ring: Dict[int, Tuple[torch.Tensor, ...]], rope: Optional[torch.Tensor]) -> List[torch.Tensor]:
+    return _fa_order(ring) + ([rope] if rope is not None else [])
+
+
 class TailHeader(msgspec.Struct, frozen=True):
     spec: TailSpec
     part: str
@@ -149,6 +215,7 @@ class TailHeader(msgspec.Struct, frozen=True):
     fa_digest: str
     gdn_digest: str
     nbytes: int
+    end: Optional[EndHeader] = None
 
 
 def _dir() -> str:
@@ -184,10 +251,24 @@ def _gdn_order(bundle_gdn: Dict[int, Tuple[torch.Tensor, ...]]) -> List[torch.Te
     return [t for gid in sorted(bundle_gdn) for t in bundle_gdn[gid]]
 
 
+def _nbytes(tensors: Sequence[torch.Tensor]) -> int:
+    return sum(int(t.numel() * t.element_size()) for t in tensors)
+
+
+def _end_header(end: EndPayload) -> EndHeader:
+    fa_t, gdn_t, ring_t = _fa_order(end.fa), _gdn_order(end.gdn), ring_order(end.ring, end.rope)
+    return EndHeader(
+        first_token=int(end.first_token), key=end.key, rows=int(end.rows), groups=int(end.groups),
+        ring_rows=int(end.ring_rows), fa_digest=digest(fa_t), gdn_digest=digest(gdn_t),
+        ring_digest=digest(ring_t), nbytes=_nbytes(fa_t + gdn_t + ring_t),
+    )
+
+
 def write_part(spec: TailSpec, part: str, fa: Dict[int, Tuple[torch.Tensor, ...]],
-               gdn: Dict[int, Tuple[torch.Tensor, ...]]) -> Optional[TailHeader]:
+               gdn: Dict[int, Tuple[torch.Tensor, ...]], end: Optional[EndPayload] = None) -> Optional[TailHeader]:
     """Atomically write one rank's part (payload first, header last: a
-    present header means a complete payload)."""
+    present header means a complete payload). ``end`` (E2) rides along as
+    payload key "end" and header field ``end``."""
     if not _dir():
         return None
     fa_t, gdn_t = _fa_order(fa), _gdn_order(gdn)
@@ -196,12 +277,16 @@ def write_part(spec: TailSpec, part: str, fa: Dict[int, Tuple[torch.Tensor, ...]
         fa_row_shapes={str(g): list(fa[g][0].shape[1:]) for g in sorted(fa)},
         gdn_row_shapes={str(g): list(gdn[g][0].shape[1:]) for g in sorted(gdn)},
         fa_digest=digest(fa_t), gdn_digest=digest(gdn_t),
-        nbytes=sum(int(t.numel() * t.element_size()) for t in fa_t + gdn_t),
+        nbytes=_nbytes(fa_t + gdn_t),
+        end=_end_header(end) if end is not None else None,
     )
     jpath, ppath = part_paths(spec.rid, part)
     os.makedirs(os.path.dirname(jpath), exist_ok=True)
     tmp = f"{ppath}.{os.getpid()}.tmp"
-    torch.save({"fa": fa, "gdn": gdn}, tmp)
+    bundle = {"fa": fa, "gdn": gdn}
+    if end is not None:
+        bundle["end"] = {"fa": end.fa, "gdn": end.gdn, "ring": end.ring, "rope": end.rope}
+    torch.save(bundle, tmp)
     os.replace(tmp, ppath)
     tmp = f"{jpath}.{os.getpid()}.tmp"
     with open(tmp, "wb") as f:
@@ -228,6 +313,22 @@ def read_part(header: TailHeader, check_digest: bool = True) -> Tuple[Optional[d
         logger.warning("WEG2-TAIL DIGEST MISMATCH rid=%s part=%s", header.spec.rid, header.part)
         return None, "digest_MISMATCH"
     return bundle, ""
+
+
+def end_digest_refusal(header: TailHeader, bundle: dict) -> str:
+    """E2: '' when the bundle's END section matches its header digests,
+    else 'end_missing' | 'end_digest_MISMATCH' (the E1 section is unaffected)."""
+    end, sec = header.end, bundle.get("end")
+    if end is None or sec is None:
+        return "end_missing"
+    if (
+        digest(_fa_order(sec["fa"])) != end.fa_digest
+        or digest(_gdn_order(sec["gdn"])) != end.gdn_digest
+        or digest(ring_order(sec["ring"], sec["rope"])) != end.ring_digest
+    ):
+        logger.warning("WEG2-TAIL END DIGEST MISMATCH rid=%s part=%s", header.spec.rid, header.part)
+        return "end_digest_MISMATCH"
+    return ""
 
 
 def verify_part(header: TailHeader) -> Optional[dict]:
@@ -268,6 +369,8 @@ class _Capture(msgspec.Struct):
     spec: TailSpec
     gdn: Dict[int, Tuple[torch.Tensor, ...]]
     event: object
+    #: the scheduler's forward stream (E2 gathers the end state on it)
+    stream: object = None
 
 
 _CAPTURES: Dict[str, _Capture] = {}
@@ -313,29 +416,43 @@ def _capture_state(req, req_to_token_pool, allocator, page_size: int, stream) ->
     spec = spec_for(req.rid, ids, req.extra_key, page_size, _grain_of(allocator, page_size))
     if spec is None or int(req.extend_range.end) != spec.cut or len(req.full_untruncated_fill_ids) != spec.n_tokens:
         return False
-    pool = req_to_token_pool
-    phys = pool.translate_mamba_indices(req.mamba_pool_idx.reshape(1).to(torch.int64))
-    cache = pool.mamba_pool.mamba_cache
-    pin = torch.cuda.is_available()
-    gdn: Dict[int, Tuple[torch.Tensor, ...]] = {}
     ctx = torch.cuda.stream(stream) if stream is not None else _null_ctx()
     with ctx:
-        phys = phys.to(cache.temporal.device, non_blocking=True)
-        for gid, local in sorted(pool.mamba_map.items()):
-            parts = [cache.temporal[local].index_select(0, phys)] + [c[local].index_select(0, phys) for c in cache.conv]
-            host = []
-            for t in parts:
-                h = torch.empty(t.shape, dtype=t.dtype, pin_memory=pin)
-                h.copy_(t, non_blocking=pin)
-                host.append(h)
-            gdn[int(gid)] = tuple(host)
-        event = torch.cuda.Event() if pin else None
-        if event is not None:
-            event.record(stream if stream is not None else torch.cuda.current_stream())
-    _CAPTURES[str(req.rid)] = _Capture(spec=spec, gdn=gdn, event=event)
+        gdn = _gdn_slot_to_host(req_to_token_pool, req.mamba_pool_idx)
+        event = _record(stream)
+    _CAPTURES[str(req.rid)] = _Capture(spec=spec, gdn=gdn, event=event, stream=stream)
     while len(_CAPTURES) > KEEP_RIDS:  # an aborted prompt never publishes: drop the oldest
         _CAPTURES.pop(next(iter(_CAPTURES)))
     return True
+
+
+def _to_host(t: torch.Tensor) -> torch.Tensor:
+    """Async D2H into pinned memory on the current stream (CPU: a copy)."""
+    pin = t.is_cuda
+    h = torch.empty(t.shape, dtype=t.dtype, pin_memory=pin)
+    h.copy_(t, non_blocking=pin)
+    return h
+
+
+def _record(stream) -> object:
+    if not torch.cuda.is_available():
+        return None
+    event = torch.cuda.Event()
+    event.record(stream if stream is not None else torch.cuda.current_stream())
+    return event
+
+
+def _gdn_slot_to_host(pool, mamba_pool_idx: torch.Tensor) -> Dict[int, Tuple[torch.Tensor, ...]]:
+    """Every local GDN layer's temporal + conv state of one request slot,
+    gathered on the CURRENT stream into host tensors (keyed by global id)."""
+    cache = pool.mamba_pool.mamba_cache
+    phys = pool.translate_mamba_indices(mamba_pool_idx.reshape(1).to(torch.int64))
+    phys = phys.to(cache.temporal.device, non_blocking=True)
+    gdn: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    for gid, local in sorted(pool.mamba_map.items()):
+        parts = [cache.temporal[local].index_select(0, phys)] + [c[local].index_select(0, phys) for c in cache.conv]
+        gdn[int(gid)] = tuple(_to_host(t) for t in parts)
+    return gdn
 
 
 class _null_ctx:
@@ -346,40 +463,46 @@ class _null_ctx:
         return False
 
 
-def _fa_rows(kvpool, rows: torch.Tensor) -> Dict[int, Tuple[torch.Tensor, ...]]:
-    """K, V (and the QSA compressed index rows) of every full-attention layer
-    of this rank at the device token slots ``rows``."""
-    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+def group_slots(rows: torch.Tensor, ratio: int, groups: Optional[int] = None) -> torch.Tensor:
+    """Compressed slots (slot // ratio) of the first ``groups`` groups of the
+    page-aligned token slots ``rows`` (all rows//ratio groups when None)."""
+    n = len(rows) // int(ratio) if groups is None else int(groups)
+    return rows[: n * int(ratio) : int(ratio)] // int(ratio)
 
+
+def _fa_rows(kvpool, rows: torch.Tensor, groups: Optional[int] = None,
+             host: Callable[[torch.Tensor], torch.Tensor] = torch.Tensor.cpu) -> Dict[int, Tuple[torch.Tensor, ...]]:
+    """K, V (and the QSA compressed index rows of the first ``groups``
+    complete groups) of every full-attention layer of this rank at the device
+    token slots ``rows``; ``host`` moves each gathered tensor off the card."""
     full = kvpool.full_kv_pool
-    qsa = isinstance(kvpool, QSATokenToKVPool)
+    ratio = _qsa_ratio(kvpool)
     out: Dict[int, Tuple[torch.Tensor, ...]] = {}
     for gid, local in sorted(kvpool.full_attention_layer_id_mapping.items()):
         dev_rows = rows.to(full.k_buffer[local].device)
-        k = full.k_buffer[local].index_select(0, dev_rows).cpu()
-        v = full.v_buffer[local].index_select(0, dev_rows).cpu()
-        if qsa:
-            ratio = int(kvpool.qsa_compress_ratio)
-            groups = dev_rows[::ratio] // ratio
-            c = kvpool.qsa_compressed_k_buffer_pool[local].index_select(0, groups).cpu()
+        k = host(full.k_buffer[local].index_select(0, dev_rows))
+        v = host(full.v_buffer[local].index_select(0, dev_rows))
+        if ratio:
+            slots = group_slots(dev_rows, ratio, groups)
+            c = host(kvpool.qsa_compressed_k_buffer_pool[local].index_select(0, slots))
             out[int(gid)] = (k, v, c)
         else:
             out[int(gid)] = (k, v)
     return out
 
 
-def publish_rows(req, kv_indices: torch.Tensor, allocator, part: str) -> None:
+def publish_rows(req, kv_indices: torch.Tensor, allocator, part: str, req_to_token_pool=None) -> None:
     """cache_finished_req entry: never raises into the tree."""
     if not _CAPTURES:
         return
     try:
-        _publish_rows(req, kv_indices, allocator, part)
+        _publish_rows(req, kv_indices, allocator, part, req_to_token_pool)
     except Exception as exc:  # noqa: BLE001 -- a failed publish is the page-prefix resume, named
         logger.warning("WEG2-TAIL-PUBLISH failed rid=%s (%s: %s)", req.rid, type(exc).__name__, exc)
         _CAPTURES.pop(str(req.rid), None)
 
 
-def _publish_rows(req, kv_indices: torch.Tensor, allocator, part: str) -> None:
+def _publish_rows(req, kv_indices: torch.Tensor, allocator, part: str, req_to_token_pool) -> None:
     """At cache_finished_req, before the unaligned tail is freed: read the
     partial page's rows, join the state capture, write this rank's part."""
     cap = _CAPTURES.pop(str(req.rid), None)
@@ -389,18 +512,97 @@ def _publish_rows(req, kv_indices: torch.Tensor, allocator, part: str) -> None:
     if int(kv_indices.numel()) < spec.cut:
         logger.warning("WEG2-TAIL-PUBLISH refused rid=%s: kv rows %d < cut %d", spec.rid, int(kv_indices.numel()), spec.cut)
         return
+    # E2 first: enqueued on the forward stream BEHIND the final chunk's
+    # forward, never a host wait here (P's next microbatch may be running)
+    try:
+        end = _capture_end(req, kv_indices, allocator, req_to_token_pool, cap)
+    except Exception as exc:  # noqa: BLE001 -- a failed END capture is E1, named
+        logger.warning("WEG2-TAIL-PUBLISH end=none rid=%s reason=raised:%s: %s", spec.rid, type(exc).__name__, exc)
+        end = None
     if cap.event is not None:
         # recorded on the forward stream after the chunk [X, c): once it has
         # fired, that chunk's KV rows are written too (stream order)
         cap.event.synchronize()
     fa = _fa_rows(allocator.get_kvcache(), kv_indices[spec.page_prefix:spec.cut].to(torch.int64))
-    threading.Thread(target=_write_and_log, args=(spec, part, fa, cap.gdn), daemon=True,
+    threading.Thread(target=_write_and_log, args=(spec, part, fa, cap.gdn, end), daemon=True,
                      name="weg2-tail-publish").start()
 
 
-def _write_and_log(spec: TailSpec, part: str, fa, gdn) -> None:
+def end_refusal(req, kv_rows: int, spec: TailSpec) -> str:
+    """E2 on P: '' when this finished request can hand over its END state,
+    else why not (named in the publish line; D then adopts E1)."""
+    if not skip_extend_enabled():
+        return "off"
+    if kv_rows < spec.n_tokens:
+        return f"kv_rows:{kv_rows}<{spec.n_tokens}"
+    if not req.output_ids:
+        return "no_sampled_token"
+    if req.return_logprob or req.return_hidden_states:
+        return "logprob_or_hidden_requested"
+    return ""
+
+
+def _capture_end(req, kv_indices: torch.Tensor, allocator, req_to_token_pool, cap: _Capture) -> Optional[EndPayload]:
+    """E2: gather rows [page_prefix, N), the open group's pending-ring rows
+    and the GDN slot (state after N) on the forward stream; None + a named
+    reason when the END state cannot be handed over."""
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+    spec = cap.spec
+    if not skip_extend_enabled():
+        return None
+    if not isinstance(req_to_token_pool, HybridReqToTokenPool) or req.mamba_pool_idx is None:
+        why = "no_mamba_slot"
+    else:
+        why = end_refusal(req, int(kv_indices.numel()), spec)
+    if why:
+        logger.info("WEG2-TAIL-PUBLISH end=none rid=%s reason=%s", spec.rid, why)
+        return None
+    kvpool = allocator.get_kvcache()
+    ratio = _qsa_ratio(kvpool)
+    rows, groups, ring_rows = end_geometry(spec, ratio)
+    ctx = torch.cuda.stream(cap.stream) if cap.stream is not None else _null_ctx()
+    with ctx:
+        fa = _fa_rows(kvpool, kv_indices[spec.page_prefix:spec.n_tokens].to(torch.int64), groups=groups, host=_to_host)
+        ring, rope = _ring_rows(kvpool, req.req_pool_idx, ring_rows)
+        gdn = _gdn_slot_to_host(req_to_token_pool, req.mamba_pool_idx)
+        event = _record(cap.stream)
+    return EndPayload(
+        first_token=int(req.output_ids[-1]), key=tail_key(req.origin_input_ids, spec.n_tokens, req.extra_key),
+        rows=rows, groups=groups, ring_rows=ring_rows, fa=fa, gdn=gdn, ring=ring, rope=rope, event=event,
+    )
+
+
+def _qsa_ratio(kvpool) -> int:
+    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+    return int(kvpool.qsa_compress_ratio) if isinstance(kvpool, QSATokenToKVPool) else 0
+
+
+def ring_slots(req_pool_idx: int, ratio: int, ring_rows: int) -> torch.Tensor:
+    """Pending-ring rows of the open group: ``req_pool_idx * ratio +
+    position % ratio`` for positions [floor_r(N), N) = offsets [0, N % r)."""
+    return int(req_pool_idx) * int(ratio) + torch.arange(int(ring_rows), dtype=torch.int64)
+
+
+def _ring_rows(kvpool, req_pool_idx: int, ring_rows: int):
+    """(gid -> (index-K ring rows,), rope rows) of the open QSA group."""
+    ratio = _qsa_ratio(kvpool)
+    if not ratio:
+        return {}, None
+    idx = ring_slots(req_pool_idx, ratio, ring_rows).to(kvpool.qsa_rope_position_buffer.device)
+    ring = {
+        int(gid): (_to_host(kvpool.qsa_key_state_buffer_pool[local].index_select(0, idx)),)
+        for gid, local in sorted(kvpool.full_attention_layer_id_mapping.items())
+    }
+    return ring, _to_host(kvpool.qsa_rope_position_buffer.index_select(0, idx))
+
+
+def _write_and_log(spec: TailSpec, part: str, fa, gdn, end: Optional[EndPayload] = None) -> None:
     try:
-        header = write_part(spec, part, fa, gdn)
+        if end is not None and end.event is not None:
+            end.event.synchronize()  # the forward-stream gather has landed
+        header = write_part(spec, part, fa, gdn, end=end)
         _prune(spec.rid)
     except Exception:  # noqa: BLE001 -- a hand-off that fails is the page-prefix resume
         logger.warning("WEG2-TAIL-PUBLISH write failed rid=%s", spec.rid, exc_info=True)
@@ -408,11 +610,23 @@ def _write_and_log(spec: TailSpec, part: str, fa, gdn) -> None:
     if header is None:
         return
     _PUBLISH_N[0] += 1
+    if header.end is None:
+        logger.info(
+            "WEG2-TAIL-PUBLISH rid=%s page_prefix=%d tail_rows=%d state_at=%d n_tokens=%d part=%s "
+            "fa_layers=%d gdn_layers=%d bytes=%d key=%s fa_digest=%s gdn_digest=%s (n=%d)",
+            spec.rid, spec.page_prefix, spec.rows, spec.cut, spec.n_tokens, part, len(header.fa_layers),
+            len(header.gdn_layers), header.nbytes, spec.key, header.fa_digest, header.gdn_digest, _PUBLISH_N[0],
+        )
+        return
+    e = header.end
     logger.info(
-        "WEG2-TAIL-PUBLISH rid=%s page_prefix=%d tail_rows=%d state_at=%d n_tokens=%d part=%s "
-        "fa_layers=%d gdn_layers=%d bytes=%d key=%s fa_digest=%s gdn_digest=%s (n=%d)",
-        spec.rid, spec.page_prefix, spec.rows, spec.cut, spec.n_tokens, part, len(header.fa_layers),
-        len(header.gdn_layers), header.nbytes, spec.key, header.fa_digest, header.gdn_digest, _PUBLISH_N[0],
+        "WEG2-TAIL-PUBLISH rid=%s page_prefix=%d tail_rows=%d state_at=%d first_token=%d n_tokens=%d part=%s "
+        "fa_layers=%d gdn_layers=%d groups=%d ring_rows=%d bytes=%d end_key=%s end_digests=%s/%s/%s "
+        "| E1 tail_rows=%d state_at=%d bytes=%d key=%s fa_digest=%s gdn_digest=%s (n=%d)",
+        spec.rid, spec.page_prefix, e.rows, spec.n_tokens, e.first_token, spec.n_tokens, part,
+        len(header.fa_layers), len(header.gdn_layers), e.groups, e.ring_rows, e.nbytes, e.key, e.fa_digest,
+        e.gdn_digest, e.ring_digest, spec.rows, spec.cut, header.nbytes, spec.key, header.fa_digest,
+        header.gdn_digest, _PUBLISH_N[0],
     )
 
 

@@ -43,6 +43,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -57,6 +58,7 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.weg2 import tail_adopt
 from sglang.srt.speculative import accept_position_probe
 from sglang.srt.speculative.adaptive_chain import (
     AdaptiveChainPolicy,
@@ -2418,6 +2420,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
+        # H24 (weg2 E2): forward_batch_generation's extend branch serves
+        # skip-extend batches (tail_adopt.skip_tokens -> run_skip)
+        tail_adopt.register_skip_server()
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -2692,6 +2697,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     mgr.capture_tick_hidden(batch.reqs[0].req_pool_idx, hs[-1:])
             return batch_output
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            # H24 (weg2 E2): a batch admitted with P's END state runs no
+            # target forward and no draft prefill (weg2/tail_adopt.py).
+            first_tokens = tail_adopt.skip_tokens(batch)
+            if first_tokens is not None:
+                return self._forward_skip_extend(batch, first_tokens, on_publish)
             # Target prefill
             target_capture_mode = (
                 CaptureHiddenMode.NULL
@@ -3064,6 +3074,36 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dtype=hidden_dtype,
                 device=device,
             )
+
+    def _forward_skip_extend(
+        self, batch: ScheduleBatch, first_tokens: List[int], on_publish=None
+    ) -> GenerationBatchResult:
+        """H24 (weg2 E2): the extend [N-1, N) of a request whose END state P
+        handed over -- no forward. On the forward stream: join the batch's
+        HiCache load, write P's rows/ring/GDN state (tail_adopt.run_skip),
+        inside the prefill rank timer so the per-rank prefill line keeps its
+        1:1 pairing. The result is P's sampled token; the draft seed is the
+        shape-valid stub whose first verify re-seeds the chain from its own
+        hidden states (``_draft_extend_for_decode``). Every rank of the group
+        takes this branch for the same batch (the vote was a MIN)."""
+        runner = self.target_worker.model_runner
+        timer = runner.prefill_rank_timer
+        ctx = timer.wrap(metadata={"category": "extend"}) if timer else contextlib.nullcontext()
+        with ctx:
+            tail_adopt.run_skip(batch, counter=self.target_worker.hicache_layer_transfer_counter)
+        _stage_sync("extend-forward")
+        next_token_ids = torch.tensor(first_tokens, dtype=torch.int64, device=self.device)
+        batch_output = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            next_token_ids=next_token_ids,
+            can_run_cuda_graph=False,
+        )
+        batch_output.new_seq_lens = batch.seq_lens
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+        batch_output.next_draft_input = self._solo_stub_draft_input(batch, next_token_ids)
+        _stage_sync("extend-draft")
+        return batch_output
 
     def _solo_stub_draft_input(
         self, batch: ScheduleBatch, next_token_ids: torch.Tensor

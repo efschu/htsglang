@@ -77,6 +77,9 @@ def _d_pools(worker: bool):
         v_buffer=[torch.zeros(KV_ROWS, heads, 8, dtype=FP8) for _ in FA_GIDS],
     )
     kv.qsa_compressed_k_buffer_pool = [torch.zeros(KV_ROWS // RATIO, 1, 4, dtype=torch.bfloat16) for _ in FA_GIDS]
+    # H24: the pending ring (index-K state) and its RoPE rows, as on the real pool
+    kv.qsa_key_state_buffer_pool = [torch.zeros(SLOTS * RATIO, 1, 4, dtype=torch.bfloat16) for _ in FA_GIDS]
+    kv.qsa_rope_position_buffer = torch.zeros(SLOTS * RATIO, 3, dtype=torch.int64)
     rp = object.__new__(HybridReqToTokenPool)
     rp.mamba_map = {gid: len(GDN_GIDS) - 1 - i for i, gid in enumerate(GDN_GIDS)}  # reversed locals
     h = 0 if worker else 2

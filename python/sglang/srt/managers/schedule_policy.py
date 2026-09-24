@@ -920,6 +920,10 @@ class PrefillAdder:
         self.prefill_spill_deep = bool(prefill_spill_deep)
         self.prefill_spill_region_tokens = int(prefill_spill_region_tokens)
         self.prefill_spill_deep_taken = False
+        # H24 (E2): a request admitted with P's END state runs NO forward --
+        # its batch is closed behind it, like the born-spilled-deep one (a
+        # neighbour needing a real extend would share the skipped forward).
+        self.weg2_skip_extend_taken = False
         # RANK-UNIFORM admission under uneven DCP (kv-session-offload): a
         # non-negative correction (local_avail - min_reduce(local_avail))
         # subtracted from every `available_size()`-based admission budget so all
@@ -1276,7 +1280,7 @@ class PrefillAdder:
         # PS2 batch separation: once a born-spilled-deep prompt is in the list
         # the extend batch is CLOSED -- its out_cache_loc is a row of host
         # sentinels and must not be concatenated with real device slots.
-        if self.prefill_spill_deep_taken:
+        if self.prefill_spill_deep_taken or self.weg2_skip_extend_taken:
             return AddReqResult.OTHER
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
@@ -2206,8 +2210,8 @@ class PrefillAdder:
         self, req: Req, truncation_align_size: Optional[int]
     ):
         # PS2 batch separation (see budget_state): a born-spilled-deep prompt
-        # owns its extend batch exclusively.
-        if self.prefill_spill_deep_taken:
+        # owns its extend batch exclusively; so does an H24 skip-extend one.
+        if self.prefill_spill_deep_taken or self.weg2_skip_extend_taken:
             return AddReqResult.OTHER
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
@@ -2683,9 +2687,12 @@ class PrefillAdder:
                 # completion, the inputs here are rank-uniform, so every rank
                 # runs the same extend [c, N) (1-4 tokens instead of
                 # N - floor_page(c)). None = today's extend.
-                _tail = tail_adopt.plan_adopt(req, _ea_start)
+                # H24 (E2): with the group's level-2 vote and an EMPTY batch
+                # the extend is [N-1, N) as a shape only -- no forward runs
+                # (EAGLEWorkerV2 -> tail_adopt.run_skip).
+                _tail = tail_adopt.plan_adopt(req, _ea_start, batch_empty=not self.can_run_list)
                 if _tail is not None:
-                    _ea_start = _tail.staged.spec.cut
+                    _ea_start = _tail.resume_at
                 _ea_len, _ea_forced = self._weg2_end_anchor_split(
                     req, _ea_start, len(req.full_untruncated_fill_ids) - _ea_start
                 )
@@ -2702,6 +2709,7 @@ class PrefillAdder:
                     prefix_len = tail_adopt.commit_adopt(
                         req, _tail, tree_cache=self.tree_cache, page_size=self.page_size
                     )
+                    self.weg2_skip_extend_taken = _tail.skip
                 req.set_extend_range(
                     _ea_start,
                     (_ea_start + _ea_len) if _ea_forced else len(req.full_untruncated_fill_ids),

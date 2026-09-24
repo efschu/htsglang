@@ -55,8 +55,36 @@ carried in the part; the per-request pending ring holds nothing at a group
 boundary. D therefore runs no indexer step for the partial page; its extend
 starts a new group at c (the QSA ``prefix_lens % ratio == 0`` assert holds).
 
+4. SKIP (E2, H24, ``SGLANG_WEG2_TAIL_SKIP_EXTEND``). When P's parts also
+   carry the END section (rows [floor_page(c), N), the open QSA group's
+   pending-ring rows + RoPE positions, the GDN state after N, P's sampled
+   token), the vote slot carries a LEVEL: 2 = this rank can serve the END
+   state too, 1 = only E1, 0 = neither; the group's MIN is the one answer.
+   On 2 (and rank-uniform admission checks: the batch is still empty, no
+   logprob/hidden/grammar/penalty request, key over ids[0:N]) the prefix
+   grows to N-1 inside ONE page and the batch's extend is the single token
+   [N-1, N) -- a shape, not a forward: EAGLEWorkerV2 runs NO target forward
+   for it (``skip_tokens`` / ``run_skip``). On the forward stream it joins
+   the batch's HiCache load (last layer event of its consumer), writes the
+   END rows at the request's slots [floor_page(c), N) (read from
+   req_to_token, so the extend's own slot N-1 included), the complete
+   groups' compressed rows, the ring rows at ``req_pool_idx * r + j``, and
+   the GDN slot; the result is P's token as ``next_token_ids`` and a stub
+   draft seed (hidden zeros) whose first verify round re-seeds the chain
+   from its own hidden states. The request then merges into the running
+   batch like any finished prefill: its next forward is a DECODE round. A
+   batch holding a skip request holds nothing else (PrefillAdder refuses the
+   next request, like the born-spilled-deep batch).
+
+QSA at an OPEN group (N % r != 0): decode compresses the group its length
+completes, from the per-request pending ring (qwen_sparse_attn_backend
+``_qsa_build_write_plan``: members come from the ring). P's final chunk wrote
+the members [floor_r(N), N) into ITS ring rows (P's req_pool_idx); they move
+to D's ring rows, so D's decode completes the group bit-identically.
+
 Any refusal, on any rank, before the commit: today's path (extend from
-floor_page(c)), never an abort. After the commit the extend length is fixed
+floor_page(c)), never an abort. A refused SKIP (level < 2 or an admission
+refusal) is the E1 path, byte for byte. After the commit the extend length is fixed
 for the group; a post-write readback MISMATCH is reported loudly
 (WEG2-TAIL-ADOPT digest=MISMATCH, ERROR) -- the digest gate that can still
 fall back uniformly is the pre-write one inside the vote.
@@ -115,6 +143,10 @@ class HeldShapes(msgspec.Struct, frozen=True):
     #: uneven DCP compacts this rank's KV rows (slot ids are not rows); the
     #: tail rows are written by global slot and are refused under it
     dcp: bool = False
+    #: E2: per held attention layer the QSA pending-ring row (index-K state)
+    ring: Dict[int, RowSpec] = {}
+    #: E2: the layer-independent RoPE position row of the ring
+    rope: Optional[RowSpec] = None
 
     @property
     def holds_nothing(self) -> bool:
@@ -131,6 +163,8 @@ def held_shapes(kvpool, req_to_token_pool) -> HeldShapes:
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
     fa: Dict[int, List[RowSpec]] = {}
+    ring: Dict[int, RowSpec] = {}
+    rope: Optional[RowSpec] = None
     ratio = 0
     if isinstance(kvpool, HybridLinearKVPool):
         full = kvpool.full_kv_pool
@@ -143,6 +177,8 @@ def held_shapes(kvpool, req_to_token_pool) -> HeldShapes:
             rows = [_row(k), _row(full.v_buffer[local])]
             if qsa:
                 rows.append(_row(kvpool.qsa_compressed_k_buffer_pool[local]))
+                ring[int(gid)] = _row(kvpool.qsa_key_state_buffer_pool[local])
+                rope = _row(kvpool.qsa_rope_position_buffer)
             fa[int(gid)] = rows
     gdn: Dict[int, List[RowSpec]] = {}
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
@@ -152,7 +188,8 @@ def held_shapes(kvpool, req_to_token_pool) -> HeldShapes:
             if math.prod(t.shape[1:]) == 0:
                 continue
             gdn[int(gid)] = [_row(t)] + [_row(c[local]) for c in cache.conv]
-    return HeldShapes(fa=fa, gdn=gdn, qsa_ratio=ratio, dcp=bool(fa) and bool(uneven_dcp_active()))
+    return HeldShapes(fa=fa, gdn=gdn, qsa_ratio=ratio, dcp=bool(fa) and bool(uneven_dcp_active()),
+                      ring=ring, rope=rope)
 
 
 # -- 1. VOTE ---------------------------------------------------------------------------
@@ -169,10 +206,27 @@ class Staged(msgspec.Struct):
     #: host buffers the post-write readback lands in, keyed "fa<gid>" /
     #: "gdn<gid>" (allocated here, off the forward's launch path)
     readback: Dict[str, Tuple[torch.Tensor, ...]] = {}
+    #: E2 (H24): "ready" | "not_mine" | "absent" | refusal reason, the END
+    #: payload of the held layers and P's sampled token (every rank reads it)
+    end_verdict: str = "absent"
+    first_token: int = -1
+    end_fa: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    end_gdn: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    end_ring: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    end_rope: Optional[torch.Tensor] = None
+    #: keyed "fa<gid>" / "gdn<gid>" / "ring<gid>" / "rope"
+    end_readback: Dict[str, Tuple[torch.Tensor, ...]] = {}
 
     @property
     def ok(self) -> bool:
         return self.verdict in READY_VERDICTS
+
+    @property
+    def end_ok(self) -> bool:
+        return self.ok and self.end_verdict in READY_VERDICTS
+
+    def drop_end(self) -> None:
+        self.end_fa, self.end_gdn, self.end_ring, self.end_rope, self.end_readback = {}, {}, {}, None, {}
 
 
 def _check_rows(kind: str, gid: int, tensors, want: List[RowSpec], lead: List[int]) -> str:
@@ -187,7 +241,20 @@ def _check_rows(kind: str, gid: int, tensors, want: List[RowSpec], lead: List[in
 
 
 def stage_parts(headers: List[th.TailHeader], held: HeldShapes, check_digest: bool) -> Staged:
-    """Pure-ish (reads the part files): the local verdict and payload."""
+    """Pure-ish (reads the part files): the local verdict and payload, E1
+    and -- when the parts carry it and SKIP is on -- the END section (E2)."""
+    bundles: List[dict] = []
+    st = _stage_e1(headers, held, check_digest, bundles)
+    if st.ok and th.skip_extend_enabled():
+        st.end_verdict = _stage_end(st, bundles, held, check_digest)
+        if st.end_verdict not in READY_VERDICTS:
+            st.drop_end()
+    return st
+
+
+def _stage_e1(headers: List[th.TailHeader], held: HeldShapes, check_digest: bool, bundles: List[dict]) -> Staged:
+    """E1 (H21): rows [floor_page(c), c) + state at c; ``bundles`` receives
+    the part payloads read (holding rank only)."""
     spec = headers[0].spec
     st = Staged(spec=spec, headers=list(headers), verdict="ready", qsa_ratio=held.qsa_ratio)
     for h in headers:
@@ -214,6 +281,7 @@ def stage_parts(headers: List[th.TailHeader], held: HeldShapes, check_digest: bo
         if bundle is None:
             st.verdict = f"{why}:{h.part}"
             return st
+        bundles.append(bundle)
         fa.update({int(g): tuple(t) for g, t in bundle["fa"].items() if int(g) in held.fa})
         gdn.update({int(g): tuple(t) for g, t in bundle["gdn"].items() if int(g) in held.gdn})
     rows = spec.rows
@@ -234,13 +302,111 @@ def stage_parts(headers: List[th.TailHeader], held: HeldShapes, check_digest: bo
         gdn = {g: tuple(t.pin_memory() for t in ts) for g, ts in gdn.items()}
     st.fa, st.gdn = fa, gdn
     if check_digest:
-        rb = {f"fa{g}": ts for g, ts in fa.items()}
-        rb.update({f"gdn{g}": ts for g, ts in gdn.items()})
-        st.readback = {
-            k: tuple(torch.empty(_as_bytes(t).shape, dtype=torch.uint8, pin_memory=pin) for t in ts)
-            for k, ts in rb.items()
-        }
+        st.readback = _readback_buffers(fa, gdn, {}, None, pin)
     return st
+
+
+def _end_header_refusal(headers: List[th.TailHeader]) -> str:
+    """The END sections of all parts name ONE state: same token, key, rows."""
+    ends = [h.end for h in headers]
+    if any(e is None for e in ends):
+        return "end_missing"
+    first = ends[0]
+    shape = (first.first_token, first.key, first.rows, first.groups, first.ring_rows)
+    for h, e in zip(headers, ends):
+        if (e.first_token, e.key, e.rows, e.groups, e.ring_rows) != shape:
+            return f"end_differs:{h.part}"
+    if first.first_token < 0:
+        return "no_first_token"
+    return ""
+
+
+def _stage_end(st: Staged, bundles: List[dict], held: HeldShapes, check_digest: bool) -> str:
+    """E2 staging: the verdict; on a holding rank also the END payload of
+    the layers it holds (pinned) and its readback buffers, set on ``st``."""
+    headers = st.headers
+    why = _end_header_refusal(headers)
+    if why:
+        return why
+    end = headers[0].end
+    st.first_token = int(end.first_token)
+    if held.holds_nothing:
+        return "not_mine"
+    if (end.rows, end.groups, end.ring_rows) != th.end_geometry(st.spec, held.qsa_ratio):
+        return f"end_geometry:{end.rows}/{end.groups}/{end.ring_rows}"
+    fa: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    gdn: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    ring: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    ropes: List[torch.Tensor] = []
+    for h, bundle in zip(headers, bundles):
+        why = th.end_digest_refusal(h, bundle) if check_digest else ("" if "end" in bundle else "end_missing")
+        if why:
+            return f"{why}:{h.part}"
+        sec = bundle["end"]
+        fa.update({int(g): tuple(t) for g, t in sec["fa"].items() if int(g) in held.fa})
+        gdn.update({int(g): tuple(t) for g, t in sec["gdn"].items() if int(g) in held.gdn})
+        ring.update({int(g): tuple(t) for g, t in sec["ring"].items() if int(g) in held.fa})
+        if sec["rope"] is not None:
+            ropes.append(sec["rope"])
+    why = _end_shape_refusal(end, held, fa, gdn, ring, ropes)
+    if why:
+        return why
+    pin = torch.cuda.is_available()
+    st.end_fa = {g: tuple(_pin(t, pin) for t in ts) for g, ts in fa.items()}
+    st.end_gdn = {g: tuple(_pin(t, pin) for t in ts) for g, ts in gdn.items()}
+    st.end_ring = {g: tuple(_pin(t, pin) for t in ts) for g, ts in ring.items()}
+    st.end_rope = _pin(ropes[0], pin) if ropes and held.ring else None
+    if check_digest:
+        st.end_readback = _readback_buffers(st.end_fa, st.end_gdn, st.end_ring, st.end_rope, pin)
+    return "ready"
+
+
+def _end_shape_refusal(end: th.EndHeader, held: HeldShapes, fa, gdn, ring, ropes: List[torch.Tensor]) -> str:
+    rows, groups, ring_rows = end.rows, end.groups, end.ring_rows
+    for g, want in held.fa.items():
+        if g not in fa:
+            return f"end_fa_layer_missing:{g}"
+        lead = [rows, rows] + ([groups] if held.qsa_ratio else [])
+        why = _check_rows("end_fa", g, fa[g], want, lead)
+        if why:
+            return why
+        if held.ring:
+            if g not in ring:
+                return f"end_ring_layer_missing:{g}"
+            why = _check_rows("end_ring", g, ring[g], [held.ring[g]], [ring_rows])
+            if why:
+                return why
+    for g, want in held.gdn.items():
+        if g not in gdn:
+            return f"end_gdn_layer_missing:{g}"
+        why = _check_rows("end_gdn", g, gdn[g], want, [1] * len(want))
+        if why:
+            return why
+    if held.ring and held.fa:
+        if not ropes:
+            return "end_rope_missing"
+        why = _check_rows("end_rope", -1, (ropes[0],), [held.rope], [ring_rows])
+        if why:
+            return why
+        if any(not torch.equal(r, ropes[0]) for r in ropes[1:]):
+            return "end_rope_differs"
+    return ""
+
+
+def _pin(t: torch.Tensor, pin: bool) -> torch.Tensor:
+    return t.pin_memory() if pin else t
+
+
+def _readback_buffers(fa, gdn, ring, rope, pin: bool) -> Dict[str, Tuple[torch.Tensor, ...]]:
+    src = {f"fa{g}": ts for g, ts in fa.items()}
+    src.update({f"gdn{g}": ts for g, ts in gdn.items()})
+    src.update({f"ring{g}": ts for g, ts in ring.items()})
+    if rope is not None:
+        src["rope"] = (rope,)
+    return {
+        k: tuple(torch.empty(_as_bytes(t).shape, dtype=torch.uint8, pin_memory=pin) for t in ts)
+        for k, ts in src.items()
+    }
 
 
 class _Job(msgspec.Struct):
@@ -254,6 +420,17 @@ class Agreed(msgspec.Struct):
 
     staged: Staged
     agreed: bool
+    #: E2: the group voted 2 (every rank can serve the END state); cleared
+    #: by a uniform admission refusal (then E1)
+    skip: bool = False
+    skip_note: str = ""
+
+    @property
+    def resume_at(self) -> int:
+        """Where the admission's extend starts: N-1 under SKIP (a shape
+        only, no forward), else c (E1)."""
+        spec = self.staged.spec
+        return spec.n_tokens - 1 if self.skip else spec.cut
 
 
 _JOBS: Dict[str, _Job] = {}
@@ -300,13 +477,28 @@ def stage(rid: str, tree_cache) -> None:
         logger.warning("WEG2-TAIL stage refused rid=%s (%s: %s)", rid, type(exc).__name__, exc)
 
 
+#: E2 needs a worker that honours a skip batch (EAGLEWorkerV2's extend
+#: branch). A process whose model worker would run the extend forward anyway
+#: -- over a GDN state already at N -- never votes 2 (it adopts E1 instead).
+_SKIP_SERVER = [False]
+
+
+def register_skip_server() -> None:
+    """Called by a model worker that routes ``skip_tokens`` batches to
+    ``run_skip`` instead of the target forward."""
+    _SKIP_SERVER[0] = True
+
+
 def local_vote(rid: str) -> int:
-    """This rank's slot in the group MIN: 1 = can serve (or holds nothing)."""
+    """This rank's slot in the group MIN: 2 = can serve the END state (E2),
+    1 = can serve E1 (or holds nothing), 0 = neither."""
     job = _JOBS.get(rid)
     if job is None:
         return 0
     job.thread.join(STAGE_JOIN_S)
-    return 1 if job.box and job.box[0].ok else 0
+    if not job.box or not job.box[0].ok:
+        return 0
+    return 2 if job.box[0].end_ok and _SKIP_SERVER[0] else 1
 
 
 def agree(rid: str, group_vote: int) -> None:
@@ -317,10 +509,14 @@ def agree(rid: str, group_vote: int) -> None:
     st = job.box[0] if job.box else None
     if st is None:
         return  # still reading after STAGE_JOIN_S: voted 0, nothing to remember
-    agreed = bool(group_vote) and st.ok
+    agreed = group_vote >= 1 and st.ok
+    skip = group_vote >= 2 and st.end_ok
+    if not skip:
+        st.drop_end()
     if not agreed:
         st.fa, st.gdn, st.readback = {}, {}, {}  # never applied: drop the payload now
-    _AGREED[rid] = Agreed(staged=st, agreed=agreed)
+    _AGREED[rid] = Agreed(staged=st, agreed=agreed, skip=skip,
+                          skip_note="" if skip else f"level{int(group_vote)}:{st.end_verdict}")
     while len(_AGREED) > KEEP_AGREED:
         _AGREED.pop(next(iter(_AGREED)))
 
@@ -341,19 +537,44 @@ def uniform_refusal(spec: th.TailSpec, ids, fill_len: int, extra_key, prefix_len
     return ""
 
 
-def _log_ready(st: Staged, adopt: str) -> None:
+def _log_ready(st: Staged, adopt: str, skip: bool = False, skip_note: str = "") -> None:
     spec = st.spec
+    if skip:
+        rows, state_at, extend = spec.n_tokens - spec.page_prefix, spec.n_tokens, 0
+    else:
+        rows, state_at, extend = spec.rows, spec.cut, spec.extend
     logger.info(
         "WEG2-TAIL-READY rid=%s page_prefix=%d tail_rows=%d state_at=%d extend=%d parts=%d key=%s "
-        "verdict=%s adopt=%s",
-        spec.rid, spec.page_prefix, spec.rows, spec.cut, spec.extend, len(st.headers), spec.key,
-        st.verdict, adopt,
+        "verdict=%s adopt=%s end=%s first_token=%d%s",
+        spec.rid, spec.page_prefix, rows, state_at, extend, len(st.headers), spec.key,
+        st.verdict, adopt, st.end_verdict, st.first_token, f" skip_refused={skip_note}" if skip_note else "",
     )
 
 
-def plan_adopt(req, prefix_len: int) -> Optional[Agreed]:
+def skip_refusal(entry: Agreed, req, batch_empty: bool) -> str:
+    """E2 admission: '' when the group may take the END state; every input
+    is rank-uniform (the batch's contents, the request's own parameters,
+    its token ids), so every rank decides the same."""
+    spec = entry.staged.spec
+    if not batch_empty:
+        return "batch_not_empty"  # the skipped batch must hold nothing else
+    if req.return_logprob or req.return_hidden_states:
+        return "logprob_or_hidden"
+    if req.grammar is not None:
+        return "grammar"
+    sp = req.sampling_params
+    if sp.frequency_penalty or sp.presence_penalty or sp.repetition_penalty != 1.0 or sp.min_new_tokens:
+        return "penalty_or_min_new_tokens"  # P's token never reached D's penalizer state
+    end = entry.staged.headers[0].end
+    if th.tail_key(req.origin_input_ids, spec.n_tokens, req.extra_key) != end.key:
+        return "end_key_mismatch"
+    return ""
+
+
+def plan_adopt(req, prefix_len: int, batch_empty: bool = True) -> Optional[Agreed]:
     """Admission, before the commit: the agreed outcome for ``req`` if the
-    group takes the tail now, else None (today's extend). One-shot per rid."""
+    group takes the tail now, else None (today's extend). One-shot per rid.
+    ``entry.skip`` says whether it takes the END state (E2) or E1."""
     if not adopt_enabled():
         return None
     entry = _AGREED.pop(str(req.rid), None)
@@ -367,6 +588,11 @@ def plan_adopt(req, prefix_len: int) -> Optional[Agreed]:
     if why:
         _log_ready(entry.staged, f"skipped:{why}")
         return None
+    if entry.skip:
+        why = skip_refusal(entry, req, batch_empty)
+        if why:
+            entry.skip, entry.skip_note = False, f"admission:{why}"
+            entry.staged.drop_end()
     return entry
 
 
@@ -378,10 +604,12 @@ def commit_adopt(req, entry: Agreed, tree_cache, page_size: int) -> int:
 
     st = entry.staged
     spec = st.spec
+    if entry.skip:
+        return _commit_skip(req, entry, tree_cache, page_size)
     page = alloc_token_slots(tree_cache, int(page_size))
     rows = page[: spec.rows].to(dtype=req.prefix_indices.dtype, device=req.prefix_indices.device)
     req.prefix_indices = torch.cat([req.prefix_indices, rows])
-    _log_ready(st, "done")
+    _log_ready(st, "done", skip_note=entry.skip_note)
     if st.verdict == "not_mine":
         _log_adopt(spec, fa_rows=0, fa_layers=0, gdn_layers=0, digest="not_mine", ms=0.0, issue_ms=0.0)
         return spec.cut
@@ -405,6 +633,18 @@ class Install(msgspec.Struct):
     last_gid: int = -1
     issue_ms: float = 0.0
     readback: Dict[str, Tuple[torch.Tensor, ...]] = {}
+    #: E2 (SKIP): the END state -- written in one go by ``run_skip``; rows,
+    #: groups, ring slots and the mamba slot are resolved there (the
+    #: request's req_pool_idx and its extend slot N-1 exist only after
+    #: prepare_for_extend)
+    end: bool = False
+    ring: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    ring_dst: Dict[int, torch.Tensor] = {}
+    rope: Optional[torch.Tensor] = None
+    rope_dst: Optional[torch.Tensor] = None
+    req_to_token: Optional[torch.Tensor] = None
+    translate: Optional[object] = None
+    ratio: int = 0
 
 
 #: installs waiting for the extend forward's GDN layer reads (memory_pool
@@ -412,17 +652,41 @@ class Install(msgspec.Struct):
 PENDING_INSTALLS: List[Install] = []
 
 
-def _queue_install(req, st: Staged, rows: torch.Tensor, tree_cache) -> None:
-    kvpool = tree_cache.token_to_kv_pool_allocator.get_kvcache()
-    rtp = tree_cache.req_to_token_pool
-    fa_dst: Dict[int, Tuple[torch.Tensor, ...]] = {}
-    for gid in st.fa:
+class SkipPlan(msgspec.Struct):
+    """E2: a request admitted with the END state; its batch runs no forward."""
+
+    spec: th.TailSpec
+    first_token: int
+    install: Optional[Install]  # None on a rank that holds no layer
+    t0: float
+
+
+#: rid -> plan, from the admission commit to the batch's (skipped) forward.
+SKIP_PLANS: Dict[str, SkipPlan] = {}
+
+
+def _fa_dst(kvpool, fa: Dict[int, Tuple[torch.Tensor, ...]]) -> Dict[int, Tuple[torch.Tensor, ...]]:
+    out: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    for gid in fa:
         local = kvpool.full_attention_layer_id_mapping[gid]
         full = kvpool.full_kv_pool
         dst = (full.k_buffer[local], full.v_buffer[local])
-        if len(st.fa[gid]) == 3:
+        if len(fa[gid]) == 3:
             dst = dst + (kvpool.qsa_compressed_k_buffer_pool[local],)
-        fa_dst[gid] = dst
+        out[gid] = dst
+    return out
+
+
+def _gdn_dst(rtp, gdn: Dict[int, Tuple[torch.Tensor, ...]]) -> Dict[int, Tuple[torch.Tensor, ...]]:
+    cache = rtp.mamba_pool.mamba_cache
+    return {gid: (cache.temporal[rtp.mamba_map[gid]],) + tuple(c[rtp.mamba_map[gid]] for c in cache.conv)
+            for gid in gdn}
+
+
+def _queue_install(req, st: Staged, rows: torch.Tensor, tree_cache) -> None:
+    kvpool = tree_cache.token_to_kv_pool_allocator.get_kvcache()
+    rtp = tree_cache.req_to_token_pool
+    fa_dst = _fa_dst(kvpool, st.fa)
     gdn_dst: Dict[int, Tuple[torch.Tensor, ...]] = {}
     slot = None
     if st.gdn:
@@ -432,16 +696,126 @@ def _queue_install(req, st: Staged, rows: torch.Tensor, tree_cache) -> None:
             logger.error("WEG2-TAIL-ADOPT rid=%s FAILED: no mamba slot on a GDN-holding rank", st.spec.rid)
             return
         slot = rtp.translate_mamba_indices(req.mamba_pool_idx.reshape(1).to(torch.int64))
-        cache = rtp.mamba_pool.mamba_cache
-        for gid in st.gdn:
-            local = rtp.mamba_map[gid]
-            gdn_dst[gid] = (cache.temporal[local],) + tuple(c[local] for c in cache.conv)
+        gdn_dst = _gdn_dst(rtp, st.gdn)
     ratio = st.qsa_ratio
     groups = (rows[::ratio] // ratio) if (ratio and st.fa) else None
     PENDING_INSTALLS.append(Install(
         spec=st.spec, headers=st.headers, fa=st.fa, gdn=st.gdn, fa_dst=fa_dst, gdn_dst=gdn_dst,
         rows=rows, groups=groups, slot=slot, t0=time.perf_counter(), readback=st.readback,
     ))
+
+
+# -- 4. SKIP (E2) ----------------------------------------------------------------------
+def _commit_skip(req, entry: Agreed, tree_cache, page_size: int) -> int:
+    """E2 admission commit: ONE page, the prefix grows to N-1 inside it (its
+    first N-1-page_prefix slots), the extend [N-1, N) is a shape only; the
+    holding rank prepares the END install. Returns N-1."""
+    from sglang.srt.mem_cache.common import alloc_token_slots
+
+    st = entry.staged
+    spec = st.spec
+    page = alloc_token_slots(tree_cache, int(page_size))
+    n_prefix = spec.n_tokens - 1 - spec.page_prefix
+    rows = page[:n_prefix].to(dtype=req.prefix_indices.dtype, device=req.prefix_indices.device)
+    req.prefix_indices = torch.cat([req.prefix_indices, rows])
+    _log_ready(st, "done", skip=True)
+    inst = None
+    if st.end_verdict == "ready":
+        inst = _skip_install(st, tree_cache)
+    SKIP_PLANS[str(req.rid)] = SkipPlan(spec=spec, first_token=st.first_token, install=inst,
+                                        t0=time.perf_counter())
+    while len(SKIP_PLANS) > KEEP_AGREED:  # an admitted batch that never ran
+        SKIP_PLANS.pop(next(iter(SKIP_PLANS)))
+    return spec.n_tokens - 1
+
+
+def _skip_install(st: Staged, tree_cache) -> Install:
+    kvpool = tree_cache.token_to_kv_pool_allocator.get_kvcache()
+    rtp = tree_cache.req_to_token_pool
+    ring_dst = {g: kvpool.qsa_key_state_buffer_pool[kvpool.full_attention_layer_id_mapping[g]]
+                for g in st.end_ring}
+    return Install(
+        spec=st.spec, headers=st.headers, fa=st.end_fa, gdn=dict(st.end_gdn), fa_dst=_fa_dst(kvpool, st.end_fa),
+        gdn_dst=_gdn_dst(rtp, st.end_gdn), rows=torch.empty(0, dtype=torch.int64), groups=None, slot=None,
+        t0=time.perf_counter(), readback=st.end_readback, end=True, ring=st.end_ring, ring_dst=ring_dst,
+        rope=st.end_rope, rope_dst=kvpool.qsa_rope_position_buffer if st.end_rope is not None else None,
+        req_to_token=rtp.req_to_token, translate=rtp.translate_mamba_indices, ratio=st.qsa_ratio,
+    )
+
+
+def skip_tokens(batch) -> Optional[List[int]]:
+    """Worker entry, extend branch: P's tokens when EVERY request of the
+    batch was admitted with the END state (then no forward runs), else None.
+    A batch mixing the two cannot be formed (PrefillAdder) and is refused
+    loudly: running the extend over a state already at N would advance it
+    twice."""
+    if not SKIP_PLANS:
+        return None
+    rids = [str(r.rid) for r in batch.reqs]
+    hits = [rid in SKIP_PLANS for rid in rids]
+    if not any(hits):
+        return None
+    if not all(hits):
+        raise RuntimeError(
+            f"WEG2-TAIL-SKIP-EXTEND mixed batch {rids}: a request already at its END state shares an "
+            f"extend batch with one that needs a forward -- the adder's batch separation was bypassed"
+        )
+    return [SKIP_PLANS[rid].first_token for rid in rids]
+
+
+def run_skip(batch, counter) -> None:
+    """Worker entry, on the forward stream, instead of the target forward:
+    join the batch's HiCache load, write every END install, log."""
+    t = time.perf_counter()
+    if counter is not None and batch.hicache_consumer_index >= 0:
+        # the load-back of [0, floor_page(c)) (+ its GDN anchor into the
+        # same slot) rides the load stream; the next forward is a graph
+        # replay that joins nothing, and our state must land after the anchor
+        counter.set_consumer(batch.hicache_consumer_index)
+        counter.wait_until(counter.num_layers - 1)
+    for req in batch.reqs:
+        plan = SKIP_PLANS.pop(str(req.rid))
+        if plan.install is not None:
+            _install_end(plan.install, req)
+        logger.info(
+            "WEG2-TAIL-SKIP-EXTEND rid=%s prefix=%d first_token=%d draft=no held=%s ms=%.1f since_commit_ms=%.1f "
+            "(no extend forward: P's END state + token; the first decode round verifies off a stub seed)",
+            plan.spec.rid, plan.spec.n_tokens, plan.first_token, "yes" if plan.install is not None else "not_mine",
+            (time.perf_counter() - t) * 1000.0, (time.perf_counter() - plan.t0) * 1000.0,
+        )
+
+
+def _install_end(inst: Install, req) -> None:
+    """Write the END state at this request's own slots (device indices only,
+    no host sync): rows [page_prefix, N) from req_to_token, the complete
+    groups at slot // r, the open group's ring rows, the GDN slot."""
+    t = time.perf_counter()
+    spec = inst.spec
+    end = inst.headers[0].end
+    rows = inst.req_to_token[int(req.req_pool_idx), spec.page_prefix:spec.n_tokens].to(torch.int64)
+    inst.rows = rows
+    if inst.ratio:
+        inst.groups = th.group_slots(rows, inst.ratio, end.groups)
+    for gid in sorted(inst.fa):
+        back = inst.readback.get(f"fa{gid}")
+        for j, (dst, src) in enumerate(zip(inst.fa_dst[gid], inst.fa[gid])):
+            _put(dst, inst.groups if j == 2 else rows, src, None if back is None else back[j])
+    if inst.ratio and (inst.ring or inst.rope is not None):
+        ring_idx = th.ring_slots(req.req_pool_idx, inst.ratio, end.ring_rows)
+        for gid in sorted(inst.ring):
+            back = inst.readback.get(f"ring{gid}")
+            _put(inst.ring_dst[gid], ring_idx, inst.ring[gid][0], None if back is None else back[0])
+        if inst.rope is not None:
+            back = inst.readback.get("rope")
+            _put(inst.rope_dst, ring_idx, inst.rope, None if back is None else back[0])
+    if inst.gdn:
+        inst.slot = inst.translate(req.mamba_pool_idx.reshape(1).to(torch.int64))
+        for gid in sorted(inst.gdn):
+            back = inst.readback.get(f"gdn{gid}")
+            for j, (dst, s) in enumerate(zip(inst.gdn_dst[gid], inst.gdn[gid])):
+                _put(dst, inst.slot, s, None if back is None else back[j])
+    inst.issue_ms = (time.perf_counter() - t) * 1000.0
+    _finish(inst, bool(inst.readback))
 
 
 def _as_bytes(t: torch.Tensor) -> torch.Tensor:
@@ -517,9 +891,18 @@ def readback_digest(inst: Install) -> str:
             return "partial"
         fa = [t for g in sorted(h.fa_layers) for t in inst.readback[f"fa{g}"]]
         gdn = [t for g in sorted(h.gdn_layers) for t in inst.readback[f"gdn{g}"]]
-        if th.digest(fa) != h.fa_digest or th.digest(gdn) != h.gdn_digest:
+        want = (h.end.fa_digest, h.end.gdn_digest) if inst.end else (h.fa_digest, h.gdn_digest)
+        if (th.digest(fa), th.digest(gdn)) != want:
             return f"MISMATCH:{h.part}"
+        if inst.end and h.end.ring_digest != _ring_readback_digest(inst, h):
+            return f"MISMATCH:{h.part}:ring"
     return "match"
+
+
+def _ring_readback_digest(inst: Install, h: th.TailHeader) -> str:
+    ring = [inst.readback[f"ring{g}"][0] for g in sorted(h.fa_layers) if f"ring{g}" in inst.readback]
+    rope = inst.readback.get("rope")
+    return th.digest(ring + ([rope[0]] if rope is not None else []))
 
 
 def _verify_and_log(inst: Install, verify: bool, event) -> None:
@@ -529,17 +912,19 @@ def _verify_and_log(inst: Install, verify: bool, event) -> None:
         dig = readback_digest(inst) if verify else "off"
     except Exception as exc:  # noqa: BLE001 -- an instrument, named
         dig = f"verify_raised:{type(exc).__name__}"
-    _log_adopt(inst.spec, fa_rows=inst.spec.rows, fa_layers=len(inst.fa_dst), gdn_layers=len(inst.gdn_dst),
-               digest=dig, ms=(time.perf_counter() - inst.t0) * 1000.0, issue_ms=inst.issue_ms)
+    rows = inst.spec.n_tokens - inst.spec.page_prefix if inst.end else inst.spec.rows
+    _log_adopt(inst.spec, fa_rows=rows, fa_layers=len(inst.fa_dst), gdn_layers=len(inst.gdn_dst),
+               digest=dig, ms=(time.perf_counter() - inst.t0) * 1000.0, issue_ms=inst.issue_ms, end=inst.end)
 
 
 def _log_adopt(spec: th.TailSpec, fa_rows: int, fa_layers: int, gdn_layers: int, digest: str, ms: float,
-               issue_ms: float) -> None:
+               issue_ms: float, end: bool = False) -> None:
     level = logging.ERROR if digest.startswith("MISMATCH") else logging.INFO
+    rows, state_at, extend = (fa_rows, spec.n_tokens, 0) if end else (spec.rows, spec.cut, spec.extend)
     logger.log(
         level,
         "WEG2-TAIL-ADOPT rid=%s page_prefix=%d tail_rows=%d state_at=%d extend=%d fa_rows_written=%d "
         "fa_layers=%d gdn_layers=%d digest=%s ms=%.1f issue_ms=%.1f",
-        spec.rid, spec.page_prefix, spec.rows, spec.cut, spec.extend, fa_rows, fa_layers, gdn_layers,
+        spec.rid, spec.page_prefix, rows, state_at, extend, fa_rows, fa_layers, gdn_layers,
         digest, ms, issue_ms,
     )

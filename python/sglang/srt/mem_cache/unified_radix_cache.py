@@ -1676,8 +1676,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             # H18 (E1): the partial page's rows [floor_page(c), c) leave with
             # the state captured at c, before the unaligned tail is freed.
+            # H24 (E2): with the END state after N (rows up to N, the open
+            # QSA group's ring rows, GDN slot, P's sampled token).
             tail_handoff.publish_rows(
-                req, kv_indices, self.token_to_kv_pool_allocator, f"pp{self.pp_rank}-{os.getpid()}"
+                req, kv_indices, self.token_to_kv_pool_allocator, f"pp{self.pp_rank}-{os.getpid()}",
+                req_to_token_pool=self.req_to_token_pool,
             )
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
