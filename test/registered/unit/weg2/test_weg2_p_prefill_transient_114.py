@@ -5,8 +5,9 @@ passed every launch gate (W120/W122, the runtime's KV sizing) and died in the
 FIRST chunk's forward with a CUDA OOM 320-384 MiB short. Both books priced the
 reference boots' 1024 MiB activation post (chunk 4096) on a 16384-token chunk,
 while the boot's own ``[vram-peak]`` instrument measured 3.58 GiB on that stage
--- linear in the chunk on every stage (8192 -> 1.79 / 1.59 / 1.21 GiB, 16384
--> 3.58 / 3.19 / 2.43 GiB for PP0 / PP1 / PP2).
+-- growing with the chunk on every stage (H41 support points, PP0/PP1/PP2:
+512 -> 0.13/0.13/0.13, 4096 -> 0.92/0.82/0.85, 8192 -> 1.82/1.63/1.60, 16384
+-> 3.61/3.21/3.19 GiB; linear between them, W131 outside).
 
 Two seams, one measurement:
 
@@ -40,20 +41,34 @@ def _build(group: str):
 
 
 class TestMeasuredVector:
-    def test_reproduces_the_two_measured_points_per_stage(self):
-        # x113/x116 at chunk 8192 and x118 at 16384, GiB from the log lines.
-        measured = {8192: (1.79, 1.59, 1.21), 16384: (3.58, 3.19, 2.43)}
+    def test_reproduces_the_measured_points_per_stage(self):
+        # H41: the support points, GiB from the [vram-peak] lines (max over
+        # the boots of each point). PP2 at 16384 is 3.19, not #114's 2.43
+        # (that was the draft forward's line after a peak reset, x118).
+        measured = {
+            512: (0.13, 0.13, 0.13),
+            4096: (0.92, 0.82, 0.85),
+            8192: (1.82, 1.63, 1.60),
+            16384: (3.61, 3.21, 3.19),
+        }
         for chunk, gib in measured.items():
             vec = launcher.p_prefill_transient_vector_mib(chunk)
             assert len(vec) == 3
             for got_mib, want_gib in zip(vec, gib):
-                assert abs(got_mib / 1024.0 - want_gib) < 0.03, (chunk, vec)
+                assert abs(got_mib / 1024.0 - want_gib) < 0.006, (chunk, vec)
 
-    def test_linear_in_the_chunk(self):
-        v1 = launcher.p_prefill_transient_vector_mib(4096)
-        v2 = launcher.p_prefill_transient_vector_mib(8192)
-        for a, b in zip(v1, v2):
-            assert abs(b - 2 * a) < 0.5
+    def test_linear_between_the_points(self):
+        a = launcher.p_prefill_transient_vector_mib(8192)
+        b = launcher.p_prefill_transient_vector_mib(16384)
+        mid = launcher.p_prefill_transient_vector_mib(12288)
+        for x, y, m in zip(a, b, mid):
+            assert abs(m - (x + y) / 2.0) <= 0.1
+
+    def test_outside_the_support_is_refused_by_name(self):
+        with pytest.raises(launcher.Weg2LaunchRefused, match="W131"):
+            launcher.p_prefill_transient_vector_mib(32768)
+        with pytest.raises(launcher.Weg2LaunchRefused, match="W131"):
+            launcher.p_prefill_transient_vector_mib(256)
 
     def test_the_binding_stage_is_the_5090_stage(self):
         vec = launcher.p_prefill_transient_vector_mib(16384)
@@ -62,13 +77,21 @@ class TestMeasuredVector:
 
 class TestPoolModelPost:
     def test_reference_chunk_prices_byte_identically_to_1286(self):
-        # chunk 4096: 0.224 * 4096 = 917 < 1024 -> the reference post stands.
+        # chunk 4096: measured 942 MiB < 1024 -> the reference post stands.
         assert launcher.p_prefill_activation_reserve_mib(None, 4096) == 1024.0
+
+    def test_below_the_support_the_reference_post_dominates(self):
+        # the transient grows with the chunk: below 512 it is <= 133 MiB.
+        assert launcher.p_prefill_activation_reserve_mib(None, 256) == 1024.0
 
     def test_wide_chunk_prices_the_measured_transient(self):
         post = launcher.p_prefill_activation_reserve_mib(None, 16384)
         assert post == max(launcher.p_prefill_transient_vector_mib(16384))
-        assert 3600.0 < post < 3700.0  # 3.58 GiB measured on x118
+        assert 3690.0 < post < 3700.0  # 3.61 GiB, max of x118/x141/x145/x146
+
+    def test_unmeasured_wide_chunk_is_refused(self):
+        with pytest.raises(launcher.Weg2LaunchRefused, match="W131"):
+            launcher.p_prefill_activation_reserve_mib(None, 32768)
 
     def test_operator_pin_wins(self):
         assert launcher.p_prefill_activation_reserve_mib(2048.0, 16384) == 2048.0

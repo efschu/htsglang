@@ -69,6 +69,7 @@ from typing import (
 
 from sglang.srt.environ import envs
 from sglang.srt.managers import corridor_guard
+from sglang.srt.planner import p_card_chunk as _p_card
 from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import (
     DEFAULT_D_BS,
@@ -1404,20 +1405,22 @@ P_PP_STAGE_FIXED_MIB = "2342.0,1105.5,3518.0"
 #: rank of both boots. It had NO FIELD in the pool model before #1286.
 P_PREFILL_ACTIVATION_RESERVE_MIB = 1024.0
 
-#: Task #114 (24.09.): group P's prefill TRANSIENT per chunk token, MiB, one
-#: entry per P stage (PP0 = the 5090 stage, PP1/PP2 = the 3080 stages).
-#: MEASURED by the boot's own ``[vram-peak] high-water`` instrument
-#: (allocator peak minus allocated at the chunk's high-water mark), and
-#: LINEAR in the chunk width on every stage:
-#:   PP0  chunk  8192 -> 1.79 GiB (fnFL2x113, x116)   16384 -> 3.58 GiB (x118)
-#:   PP1  chunk  8192 -> 1.59 GiB                     16384 -> 3.19 GiB
-#:   PP2  chunk  8192 -> 1.21 GiB                     16384 -> 2.43 GiB
+#: Task #114 (24.09.), fnFL2 H41: group P's prefill TRANSIENT per stage as a
+#: FUNCTION OF THE CHUNK -- measured support points, linear between them,
+#: REFUSED (W131) outside, never extrapolated
+#: (``planner.p_card_chunk.P_TRANSIENT_SUPPORT_FNFL2``; the boot's own
+#: ``[vram-peak]`` instrument, peak minus allocated of the full chunk):
+#:   chunk    PP0 (5090)  PP1 (3080)  PP2 (3080)
+#:     512      0.13        0.13        0.13      GiB  x130, x134
+#:    4096      0.92        0.82        0.85           x12, x14, x101, x107
+#:    8192      1.82        1.63        1.60           x113, x116
+#:   16384      3.61        3.21        3.19           x118, x141, x145, x146
 #: fnFL2x121/x122 (5090 stage at residency 0.45/0.40, chunk 16384) passed
 #: every launch gate and died in the FIRST chunk's forward (CUDA OOM, 320 and
-#: 384 MiB short) because the post above priced the reference boots' 1024 MiB
-#: (chunk 4096) on every chunk width. NOT a demand decision of its own: the
-#: instrument's two measured points per stage, transcribed.
-P_PREFILL_TRANSIENT_MIB_PER_CHUNK_TOKEN = (0.224, 0.199, 0.152)
+#: 384 MiB short). #114 (add357d7c2) carried per-token slopes and read PP2 at
+#: 2.43 GiB -- the DRAFT forward's line after a peak reset; the target forward
+#: on PP2 draws 3.19 GiB (x118 02:36:24, and x145/x146 without a draft on P).
+P_PREFILL_TRANSIENT_SUPPORT = _p_card.P_TRANSIENT_SUPPORT_FNFL2
 
 #: The runtime's residual post for exactly this transient
 #: (``model_runner_kv_cache_mixin.PREFILL_TRANSIENT_ENV``): a comma vector,
@@ -1429,11 +1432,12 @@ P_PREFILL_TRANSIENT_ENV = "SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB"
 
 def p_prefill_transient_vector_mib(chunk_tokens: int) -> Tuple[float, ...]:
     """Group P's MEASURED prefill transient for ``chunk_tokens``, MiB per
-    stage (#114) -- the instrument's per-token slope times the chunk width."""
-    return tuple(
-        round(float(per_token) * float(chunk_tokens), 1)
-        for per_token in P_PREFILL_TRANSIENT_MIB_PER_CHUNK_TOKEN
-    )
+    stage (#114, H41) -- linear between the measured support points; a chunk
+    outside them is REFUSED by name (W131), never extrapolated."""
+    try:
+        return _p_card.transient_vector_mib(P_PREFILL_TRANSIENT_SUPPORT, int(chunk_tokens))
+    except _p_card.PChunkUnmeasured as exc:
+        raise Weg2LaunchRefused(str(exc)) from None
 
 
 #: WEG2-FORM (24.09.): the checkpoint(s) the #114 slopes above were MEASURED
@@ -1454,14 +1458,14 @@ def p_prefill_transient_for(boot_form) -> Tuple[bool, str]:
         return True, "no WEG2-FORM (desk caller): published as before"
     if boot_form.model in P_PREFILL_TRANSIENT_CALIBRATION_MODELS:
         return True, (
-            f"published: {P_PREFILL_TRANSIENT_MIB_PER_CHUNK_TOKEN} MiB/chunk-token "
-            f"x {P_CHUNKED_PREFILL_TOKENS} = "
+            f"published: chunk {P_CHUNKED_PREFILL_TOKENS} -> "
             f"{p_prefill_transient_vector_mib(P_CHUNKED_PREFILL_TOKENS)} MiB per P stage, "
-            f"MEASURED on {boot_form.model} (fnFL2x113/x116/x118)"
+            f"MEASURED on {boot_form.model} (support points "
+            f"{list(P_PREFILL_TRANSIENT_SUPPORT.chunks)}, linear between, H41)"
         )
     return False, (
-        f"NOT published: the slopes {P_PREFILL_TRANSIENT_MIB_PER_CHUNK_TOKEN} "
-        f"MiB/chunk-token were measured on "
+        f"NOT published: the support points "
+        f"{list(P_PREFILL_TRANSIENT_SUPPORT.chunks)} were measured on "
         f"{', '.join(P_PREFILL_TRANSIENT_CALIBRATION_MODELS)}; this boot runs "
         f"{boot_form.model or '?'}, on which no prefill transient was measured. "
         f"Its P ranks size the pool without that post, as every boot of this "
@@ -1481,9 +1485,16 @@ def p_prefill_activation_reserve_mib(pinned: Optional[float], chunk_tokens: int)
     ``[vram-peak]`` measured. The pool model carries ONE post for every rank,
     and the max over stages is the safe way to be wrong -- an over-charge
     under-prices a pool, an under-charge OOMs a forward (fnFL2x121).
+
+    H41: BELOW the smallest support point (512) the transient is at most the
+    measured 133 MiB (it grows with the chunk), so the 1024 MiB reference post
+    dominates without extrapolating; ABOVE the largest the chunk is REFUSED
+    (W131) -- the width x121/x122 died of was exactly an unmeasured one.
     """
     if pinned is not None:
         return float(pinned)
+    if int(chunk_tokens) < P_PREFILL_TRANSIENT_SUPPORT.chunks[0]:
+        return float(P_PREFILL_ACTIVATION_RESERVE_MIB)
     return max(
         float(P_PREFILL_ACTIVATION_RESERVE_MIB),
         max(p_prefill_transient_vector_mib(chunk_tokens)),
@@ -11083,6 +11094,91 @@ def apply_p_draft_post(ns, cards, fracs, stage_layers, row_mib: float,
     return new
 
 
+def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
+                   fracs: Sequence[float], lru_rows: Sequence[int],
+                   stage_layers: Sequence[int], kv_mib, num_experts: int,
+                   row_mib: float) -> None:
+    """H41: ``PP-CUT ACTIVATION`` (T_s(chunk) je Stufe mit Quelle) und
+    ``PP-CUT P-KARTE`` (Kopfraum je Stufe im Chunk-Forward); W132, wenn eine
+    Stufe unter near-OOM faellt, W131 fuer einen ungemessenen Chunk.
+
+    Eine Referenz, die nicht zu DIESER Form passt (anderes Modell, anderer
+    Schnitt, fehlender KV-Preis oder Draft-Posten), laesst die Karten-Bilanz
+    MIT NAMEN entfallen -- verweigert wird nur aus einer GERECHNETEN Bilanz.
+    """
+    from sglang.srt.weg2 import draft_post as _dp
+
+    support = P_PREFILL_TRANSIENT_SUPPORT
+    name = os.path.basename(os.path.normpath(str(model)))
+    if name != support.model:
+        log(f"{_p_card.CARD_MARKER} ENTFAELLT: die Chunk-Transiente ist auf "
+            f"{support.model} gemessen, dieser Boot faehrt {name}.")
+        return
+    try:
+        for line in _p_card.activation_lines(support, int(chunk_tokens)):
+            log(line)
+    except _p_card.PChunkUnmeasured as exc:
+        log(f"{_p_card.ACTIVATION_MARKER} {exc}")
+        raise Weg2LaunchRefused(str(exc)) from None
+    ref_logs = [x.strip() for x in str(getattr(ns, "p_card_reference_logs", "") or "").split(",")
+                if x.strip()]
+    try:
+        if ref_logs:
+            boots = []
+            for path in ref_logs:
+                with open(path, errors="replace") as fh:
+                    boots.append((os.path.basename(path), fh.read()))
+            reference = _p_card.p_card_reference_from_logs(
+                boots, stage_layers=stage_layers, row_mib=row_mib,
+                support=support, model=name)
+        else:
+            reference = _p_card.P_CARD_REFERENCE_FNFL2
+    except (OSError, ValueError) as exc:
+        log(f"{_p_card.CARD_MARKER} ENTFAELLT: Referenz unlesbar: "
+            f"{type(exc).__name__}: {exc}")
+        return
+    if kv_mib is None:
+        log(f"{_p_card.CARD_MARKER} ENTFAELLT: kein KV-Preis je Stufe (#156 entfiel "
+            f"oder --pp-cut-reserve-mib ersetzt ihn); ohne KV ist der Kopfraum "
+            f"nicht rechenbar.")
+        return
+    draft_on_p = str(getattr(ns, "draft_kv_on_p", "off")) == "on"
+    draft_mib = 0.0
+    if draft_on_p != bool(reference.draft_on_p):
+        path = (_argv_scalar(getattr(ns, "extra_p", ""), "--speculative-draft-model-path")
+                or _argv_scalar(getattr(ns, "extra_d", ""), "--speculative-draft-model-path")
+                or "")
+        weights, transient = _dp.p_draft_post_mib(str(path))
+        if weights is None:
+            log(f"{_p_card.CARD_MARKER} ENTFAELLT: Draft auf P "
+                f"{'an' if draft_on_p else 'aus'}, die Referenz ({reference.source}) "
+                f"{'an' if reference.draft_on_p else 'aus'}, und der Draft-Posten "
+                f"ist nicht lesbar ({path!r}).")
+            return
+        draft_mib = float(weights) + float(transient)
+    try:
+        fits = _p_card.solve_p_card(
+            reference=reference, support=support, fractions=fracs,
+            lru_rows=lru_rows, stage_layers=stage_layers, chunk=int(chunk_tokens),
+            kv_mib=[float(x) for x in kv_mib], num_experts=int(num_experts),
+            row_mib=float(row_mib), draft_on_p=draft_on_p,
+            draft_mib_last_stage=draft_mib,
+            cards=[_dp.stage_card_label(cards, s) for s in range(len(stage_layers))],
+            near_oom_mib=float(corridor_guard.NEAR_OOM_MIB),
+        )
+    except _p_card.PChunkUnmeasured as exc:
+        raise Weg2LaunchRefused(str(exc)) from None
+    except ValueError as exc:
+        log(f"{_p_card.CARD_MARKER} ENTFAELLT: {exc}")
+        return
+    for fit in fits:
+        log(_p_card.describe_p_card(fit, reference))
+    refusal = _p_card.p_card_refusal_text(fits, reference, chunk=int(chunk_tokens))
+    if refusal is not None:
+        log(f"{_p_card.CARD_MARKER} {refusal}")
+        raise Weg2LaunchRefused(refusal)
+
+
 def solve_p_cut(
     ns,
     cards: List[Card],
@@ -11350,6 +11446,24 @@ def solve_p_cut(
                 row_bytes / _pp_cut.MIB, list(fracs), [int(x) for x in rows],
                 [round(x) for x in layer_mib_by_stage], terms.ple_layer_weight_bytes / _pp_cut.MIB,
             )
+        )
+        # H41 (Task #114): DIE P-KARTE ALS FUNKTION DES CHUNKS. Die Decke oben
+        # (#140) und das Pool-Modell unten entscheiden das BUDGET; bei
+        # --max-total-tokens 262144 bleibt dessen Rest liegen, und was die
+        # KARTE im Chunk-Forward fuellt, steht in keinem Posten -- x121/x122
+        # (FR_P[0] 0.45/0.40, Chunk 16384) passierten beides und starben im
+        # ersten Chunk. Hier: gemessener Kopfraum je Stufe, verschoben um
+        # Puffer, KV, die Chunk-Transiente T_s(chunk) und den Draft.
+        p_card_verdict(
+            ns, cards, log,
+            model=model,
+            chunk_tokens=int(chunk_tokens),
+            fracs=[float(f) for f in fracs],
+            lru_rows=[int(round(float(r))) for r in rows],
+            stage_layers=[int(x) for x in _stage_layers_for_solve],
+            kv_mib=_kv_p,
+            num_experts=int(terms.num_experts),
+            row_mib=row_bytes / _pp_cut.MIB,
         )
     ms = _csv_floats(ns.pp_cut_measured_ms_per_layer)
     model_pool = _pp_cut.PhasePoolModel(
@@ -11673,12 +11787,12 @@ def solve_p_cut(
     # #114: the post's OWN provenance, next to the posts line it feeds.
     log(
         "PP-CUT activation post (#114): chunk %d -> measured prefill transient "
-        "per stage %s MiB (%s MiB per chunk token, [vram-peak] high-water on "
-        "fnFL2x113/x116 at 8192 and x118 at 16384); post = %.1f MiB/rank (%s)"
+        "per stage %s MiB (support points %s, linear between, H41 -- see the "
+        "PP-CUT ACTIVATION lines); post = %.1f MiB/rank (%s)"
         % (
             int(chunk_tokens),
             list(p_prefill_transient_vector_mib(int(chunk_tokens))),
-            list(P_PREFILL_TRANSIENT_MIB_PER_CHUNK_TOKEN),
+            list(P_PREFILL_TRANSIENT_SUPPORT.chunks),
             float(model_pool.activation_reserve_mib),
             "pinned by --pp-cut-activation-reserve-mib"
             if ns.pp_cut_activation_reserve_mib is not None
@@ -12227,6 +12341,16 @@ def build_parser() -> argparse.ArgumentParser:
              "Minimum ueber die Boots. Unter corridor_guard.NEAR_OOM_MIB "
              "verweigert W130. Leer = die eingebaute Referenz "
              "expert_residency.D_CARD_REFERENCE_FNFL2 (fnFL2x141 + fnFL2x144).")
+    ap.add_argument(
+        "--p-card-reference-logs", default="",
+        help="H41: Komma-Liste von P-Boot-Logs (WEG2-GRAPH-POOL-Zeilen), aus denen "
+             "die P-KARTE je Stufe ihren Kopfraum misst: cap - peak - privat_frei "
+             "am bindenden Punkt, normiert auf Puffer, KV-Zelle x Token und die "
+             "Chunk-Transiente des Logs; je Stufe das Minimum ueber die Boots. "
+             "Unter corridor_guard.NEAR_OOM_MIB verweigert W132. Leer = die "
+             "eingebaute Referenz p_card_chunk.P_CARD_REFERENCE_FNFL2 (fnFL2x145 + "
+             "fnFL2x146, Schnitt 29,11,8, Chunk 16384); ein anderer Schnitt "
+             "laesst die Bilanz mit Namen entfallen.")
     ap.add_argument(
         "--wake-credit-reference-logs", default="",
         help="H14: P.log,D.log,front.log EINES Boots, dessen erster Wake (D->P) "
@@ -13000,8 +13124,9 @@ def build_parser() -> argparse.ArgumentParser:
              f"(#1286). Unset = max({P_PREFILL_ACTIVATION_RESERVE_MIB:.0f} MiB, "
              f"the 1.000 GiB both reference boots measured at chunk 4096, and "
              f"the MEASURED prefill transient of the binding P stage for the "
-             f"chunk P boots with: {P_PREFILL_TRANSIENT_MIB_PER_CHUNK_TOKEN} "
-             f"MiB per chunk token per stage, #114). A number pins the post.",
+             f"chunk P boots with: support points "
+             f"{list(P_PREFILL_TRANSIENT_SUPPORT.chunks)} per stage, linear "
+             f"between, W131 above, #114/H41). A number pins the post.",
     )
     ap.add_argument(
         "--pp-cut-corridor-holdback-mib", type=float, default=None,
