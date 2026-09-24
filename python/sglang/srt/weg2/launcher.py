@@ -689,6 +689,9 @@ _SPEC_FORM: Dict[str, object] = {
     "block": DFLASH_BLOCK_DEFAULT,
     "window": DFLASH_WINDOW_DEFAULT,
     "produce_on_p": DFLASH_PRODUCE_ON_P_DEFAULT == "on",
+    # --draft-kv-on-p as RESOLVED by main (on, and HiCache enabled); the
+    # CLI value until then. Read by p_group_has_draft_producer only.
+    "draft_kv_on_p": DRAFT_KV_ON_P_DEFAULT == "on",
 }
 
 
@@ -701,6 +704,9 @@ def apply_spec_form(ns) -> None:
     _SPEC_FORM["produce_on_p"] = (
         str(getattr(ns, "dflash_produce_on_p", DFLASH_PRODUCE_ON_P_DEFAULT) or DFLASH_PRODUCE_ON_P_DEFAULT).lower()
         == "on"
+    )
+    _SPEC_FORM["draft_kv_on_p"] = (
+        str(getattr(ns, "draft_kv_on_p", DRAFT_KV_ON_P_DEFAULT) or DRAFT_KV_ON_P_DEFAULT).lower() == "on"
     )
     if _SPEC_FORM["form"] == "DFLASH" and not os.path.isdir(_SPEC_FORM["draft_path"]):
         raise SystemExit(
@@ -762,6 +768,85 @@ def dflash_produce_on_p() -> bool:
     return bool(_SPEC_FORM.get("produce_on_p", DFLASH_PRODUCE_ON_P_DEFAULT == "on"))
 
 
+def p_group_has_draft_producer() -> bool:
+    """THE ONE detection of "does group P produce draft pages" (27B line),
+    read off P's FORM -- never off whether D has a draft model (D always has
+    one). True only when P carries the draft-KV producer (--draft-kv-on-p,
+    resolved: on and HiCache enabled) AND that producer computes: under
+    --spec-form DFLASH that is --dflash-produce-on-p on
+    (SGLANG_WEG2_DFLASH_PRODUCE=1); the NEXTN producer always computes.
+    Line-specific by design (the NF line's P form is --draft-kv-on-p off /
+    SGLANG_WEG2_DRAFT_ON_P); a pick onto another line adapts only this."""
+    if not bool(_SPEC_FORM.get("draft_kv_on_p", DRAFT_KV_ON_P_DEFAULT == "on")):
+        return False
+    if spec_form_is_dflash():
+        return dflash_produce_on_p()
+    return True
+
+
+#: HICACHE-DRAFT-TIER (user order 2026-09-24 14:15Z, verbatim: "und schreiben
+#: wir in D auch draft context in den hicache? das muesste raus, weil draft ja
+#: keinen hicacheplatz mehr bekommt"). The operator's input, default ``auto``:
+#: off when group P has no draft producer (p_group_has_draft_producer), on
+#: otherwise; ``on``/``off`` force it (A/B). The RESOLVED ``off`` rides BOTH
+#: groups' environment (a rank cannot resolve auto: group D does not know P's
+#: form); a resolved ``on`` writes nothing, so the producer form's environment
+#: stays byte-identical. Same name as the NF line; code and values per line.
+HICACHE_DRAFT_TIER_ENV = "SGLANG_WEG2_HICACHE_DRAFT_TIER"
+HICACHE_DRAFT_TIER_DEFAULT = "auto"
+HICACHE_DRAFT_TIER_VALUES = ("auto", "on", "off")
+
+
+def resolve_hicache_draft_tier() -> Tuple[str, str]:
+    """``(tier, provenance)``: ``tier`` is ``on`` or ``off``."""
+    raw = os.environ.get(HICACHE_DRAFT_TIER_ENV, HICACHE_DRAFT_TIER_DEFAULT)
+    value = str(raw or HICACHE_DRAFT_TIER_DEFAULT).strip().lower()
+    if value not in HICACHE_DRAFT_TIER_VALUES:
+        raise Weg2LaunchRefused(
+            f"W151 Weg2HicacheDraftTierInvalid: {HICACHE_DRAFT_TIER_ENV}={raw!r} -- "
+            f"expected one of {', '.join(HICACHE_DRAFT_TIER_VALUES)}"
+        )
+    if value == "off" and p_group_has_draft_producer():
+        # A producer that computes into a tier that does not exist: the DFlash
+        # producer's first publish raises (DFlashDraftKvProduceError, no
+        # registered draft pool), the NEXTN one computes for nothing. Named,
+        # before a rank starts -- switch the producer off instead.
+        raise Weg2LaunchRefused(
+            f"W152 Weg2HicacheDraftTierConflict: {HICACHE_DRAFT_TIER_ENV}=off but group P "
+            "produces draft pages (--dflash-produce-on-p on, or the NEXTN producer with "
+            "--draft-kv-on-p on) -- the draft would get no HiCache space to publish into. "
+            "Drop the override (auto follows P's form) or switch P's producer off."
+        )
+    if value in ("on", "off"):
+        return value, f"{HICACHE_DRAFT_TIER_ENV}={value} (operator)"
+    if p_group_has_draft_producer():
+        return "on", f"auto: group P produces draft pages"
+    return "off", "auto: group P has no draft producer"
+
+
+def hicache_draft_tier_env() -> Dict[str, str]:
+    """What BOTH groups' environment carries for the tier: ``off`` only."""
+    tier, _ = resolve_hicache_draft_tier()
+    return {HICACHE_DRAFT_TIER_ENV: "off"} if tier == "off" else {}
+
+
+def hicache_draft_tier_line() -> str:
+    """The one launcher line naming the tier (never silent)."""
+    tier, why = resolve_hicache_draft_tier()
+    if tier == "off":
+        return (
+            f"WEG2 HICACHE-DRAFT-TIER: off ({why}) -- the draft gets no HiCache space: "
+            "no draft host pool on any rank, no draft arena, no draft write-back, no "
+            "draft lookup/read at a restore or at admission; D builds its draft context "
+            f"cold (#993 zeros + 1 bootstrap round); {HICACHE_DRAFT_TIER_ENV}=off in both "
+            "groups' environment, the ledger prices no draft arena"
+        )
+    return (
+        f"WEG2 HICACHE-DRAFT-TIER: on ({why}) -- the draft tier as before (draft host "
+        "pools, draft arena, write-back and restore of draft pages)"
+    )
+
+
 def spec_form_env(group: str) -> Dict[str, str]:
     """Environment the form needs on one group: D's window pool under DFLASH,
     and (solo placement) the solo host's compact draft cache; P's
@@ -794,8 +879,9 @@ def dflash_produce_line() -> str:
         "same VRAM, same planner cut, same exchange census and flip) and computes "
         "nothing with it: no aux capture on any PP stage, no produce(), no "
         "publish_draft_rows_direct. Group D is unchanged (DFLASH sharded, window "
-        f"{int(_SPEC_FORM['window'])}) and finds no draft pages -> its cold path "
-        "(#993 zeros + 1 bootstrap round); expect DRAFT-PRESENCE mode=cold and "
+        f"{int(_SPEC_FORM['window'])}) and builds its draft context cold "
+        "(#993 zeros + 1 bootstrap round); under the default HICACHE-DRAFT-TIER auto "
+        "the draft gets no HiCache space at all, so expect no DRAFT-PRESENCE line and "
         f"draft_pages=0 on the front's served lines ({DFLASH_PRODUCE_ENV}=0 in P's "
         "environment; argv_p and the P FORM key are identical under on/off)"
     )
@@ -5184,6 +5270,10 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     env.setdefault("SGLANG_IDLE_BLOCKING_POLL", "1")
     env.setdefault("MALLOC_ARENA_MAX", "4")
     env.update(spec_form_env(group))  # --spec-form: D's window pool under DFLASH
+    # HICACHE-DRAFT-TIER: the RESOLVED value, the same on both groups; an
+    # operator's `auto` never reaches a rank (it cannot resolve it there).
+    env.pop(HICACHE_DRAFT_TIER_ENV, None)
+    env.update(hicache_draft_tier_env())
     return env
 
 
@@ -6575,7 +6665,11 @@ def _weg2_arena_ledger_terms(model: str) -> dict:
                                   * int(_dc["num_key_value_heads"]) * int(_dc["head_dim"]) * _kv_item)
         except Exception as _dexc:  # noqa: BLE001 -- unreadable draft config keeps the target cell
             _logging.getLogger("weg2.launcher").info("WEG2-ARENA-LEDGER draft page not derived: %r", _dexc)
-        arena_bytes = kv_slots * kv_page + kv_slots * draft_cell + mamba_slots * blob
+        # HICACHE-DRAFT-TIER off: no rank registers a draft host pool, so no
+        # draft arena file exists -- the ledger prices none (same resolver as
+        # the environment the ranks get, hicache_draft_tier_env).
+        draft_slots = kv_slots if resolve_hicache_draft_tier()[0] == "on" else 0
+        arena_bytes = kv_slots * kv_page + draft_slots * draft_cell + mamba_slots * blob
         out = dict(
             arena_gib=arena_bytes / (1 << 30),
             staging_gb=float(os.environ.get("SGLANG_HICACHE_ARENA_STAGING_GB", "0.05") or 0.05),
@@ -6584,7 +6678,7 @@ def _weg2_arena_ledger_terms(model: str) -> dict:
         _logging.getLogger("weg2.launcher").info(
             "WEG2-ARENA-LEDGER kv=%d slots x %d B + draft %d x %d B + mamba %d x %d B = %.2f GiB "
             "(term arena_gib); fallback pools staging=%s GB anchor=%s MiB",
-            kv_slots, kv_page, kv_slots, draft_cell, mamba_slots, blob, out["arena_gib"],
+            kv_slots, kv_page, draft_slots, draft_cell, mamba_slots, blob, out["arena_gib"],
             out["staging_gb"], out["anchor_mib"])
         return out
     except Exception as exc:  # noqa: BLE001 - a mispriced arena is refused, never guessed
@@ -12157,12 +12251,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "auto-fallback."
         )
     draft_kv_on_p = _draft_kv_on_p_requested and not hicache_disabled
+    # HICACHE-DRAFT-TIER: p_group_has_draft_producer reads the RESOLVED value.
+    _SPEC_FORM["draft_kv_on_p"] = bool(draft_kv_on_p)
     if not draft_kv_on_p:
         log(draft_kv_off_line())
     elif spec_form_is_dflash():
         # --dflash-produce-on-p (2026-09-24): P carries the DFlash producer
         # flags; whether it COMPUTES rides P's environment (spec_form_env).
         log(dflash_produce_line())
+    if not hicache_disabled:
+        log(hicache_draft_tier_line())
     # #1386: `hicache_disabled` was already resolved once, at the top of
     # `main`, before `log` even existed (the first `common_flags` sentinel
     # call needs it long before this point) -- this is only the LOG SIDE of
