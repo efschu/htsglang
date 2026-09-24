@@ -1980,6 +1980,15 @@ class Envs:
     # its own (`Scheduler.anchor_tails`); the tails [N-1', N) are re-added
     # together in the next pass. Inert without the END-ANCHOR (group D).
     SGLANG_WEG2_ENABLE_P_MULTI_ANCHOR_TAILS = EnvBool(False)
+    # fnFL2 H42b: burst assembly on the DECIDING P rank (PP0), only while
+    # multi anchor tails are armed. A pass that would carry nothing but new
+    # bodies is held back up to this many ms while more of a burst is still
+    # arriving (a new rid seen within the last window/4 ms) or still waiting
+    # for its #1400 store verdict -- so the burst runs as ONE body forward
+    # instead of the first arrival alone (x153b: fwd13 carried one 7.8k body
+    # for 2.4 s while three more requests were already on P). Released at
+    # once when the chunk budget or the seats are full. 0 = off.
+    SGLANG_WEG2_P_BURST_ASSEMBLY_MS = EnvInt(0)
     # Device-planned expert pool (SGLANG_MOE_OFFLOAD_GRAPH_MODE=pool): what an
     # EAGER forward (extend, eager first verify) leaves of the decode LRU.
     # True (default): only the LRU rows the eager pass actually WROTE take its

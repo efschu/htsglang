@@ -143,6 +143,9 @@ class FakeRank:
         self.anchor_at = {}  # rid -> [stash ends]: where this rank's anchors land
         self.outputs = {}  # rid -> number of output tokens (must end at 1)
         self.batches = []
+        #: H42b: PP0-side store-told readiness and the burst-assembly gate
+        self.ready_fn = None
+        self.hold_fn = None
 
     def _stash_one(self, r):
         self.anchor_at.setdefault(r.rid, []).append(r.extend_range.end)
@@ -185,8 +188,13 @@ class FakeRank:
             if incoming is None or incoming.get(self.chunked.rid) is not None:
                 self.chunked = adder.add_chunked_req(self.chunked)
         adder.chunked_req_outstanding = self.chunked is not None
-        for r in list(self.waiting):
+        admit_from = list(self.waiting)
+        if not follower and self.hold_fn is not None and self.hold_fn(self, adder):
+            admit_from = []
+        for r in admit_from:
             if follower and r.rid not in decision:
+                continue
+            if not follower and self.ready_fn is not None and not self.ready_fn(r):
                 continue
             if any(x is r for x in adder.can_run_list):
                 continue
@@ -535,3 +543,158 @@ def test_capture_bound_follows_the_switch():
         assert th.capture_keep() == 6
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         assert th.capture_keep() == th.KEEP_CAPTURES_MULTI_TAIL == 4
+
+
+# ============================================================ H42b
+# x153b (13:54:40-13:55:00, epoch 9): PP0 admitted rid 10 ALONE (fwd13, 7848
+# tokens, 2.4 s) because rid 11's #1400 store verdict was published one pass
+# later and rids 14/15 reached P's loop only after that forward; and rid 16
+# (queued since 13:54:43) sat out fwd17 because the lone re-added tail of rid
+# 15 was counted against the one free seat.
+
+
+def test_count_arm_uses_the_fresh_admission_count():
+    import inspect
+
+    from sglang.srt.managers.scheduler import Scheduler
+
+    src = inspect.getsource(Scheduler._get_new_batch_prefill_raw)
+    # the carried continuations (re-added tails, the chunked request) hold
+    # their seats already: x153b fwd17 counted rid 15's lone tail against the
+    # one seat rid 10 had freed, and rid 16 waited a pass
+    assert ">= self._uniform_allocatable_reqs(running_bs, _head_inputs) + _carried_n:" in src
+    assert "_carried_n = len(adder.can_run_list) if adder.multi_anchor_tails else 0" in src
+    assert "_burst_hold = self._weg2_burst_assembly_hold(adder, running_batch)" in src
+    loop = src.index("for req in self.waiting_queue:")
+    assert src.index("if _burst_hold is not None:", loop) - loop < 80
+
+
+def _v(**kw):
+    base = dict(window_ms=300, now=10.0, carried=0, ready_arrivals=[9.95], ready_tokens=7849,
+                pending=1, last_arrival=9.99, budget_tokens=CHUNK, seat_cap=4)
+    base.update(kw)
+    return at.burst_hold_verdict(**base)
+
+
+def test_burst_verdict_rules():
+    assert _v().hold and _v().reason == "assembling"  # the x153b fwd13 state
+    assert _v(window_ms=0).reason == "off"
+    assert _v(carried=2).reason == "carried"
+    assert _v(ready_arrivals=[], ready_tokens=0).reason == "nothing-ready"
+    assert _v(budget_tokens=None).reason == "no-chunk-budget"
+    assert _v(ready_tokens=CHUNK).reason == "budget-full"
+    assert _v(ready_arrivals=[9.95] * 4).reason == "seats-full"
+    assert _v(ready_arrivals=[9.6]).reason == "window"
+    assert _v(pending=0, last_arrival=9.9).reason == "quiet"  # 100 ms >= 75 ms
+    assert _v(pending=0, last_arrival=9.99).hold  # a rid arrived 10 ms ago
+    assert _v(pending=0, last_arrival=None).reason == "quiet"
+    assert _v(pending=1, last_arrival=9.5).hold  # quiet, but a #1400 verdict is outstanding
+
+
+def _holder_sched(queue, told, held, seats=4):
+    return SimpleNamespace(
+        waiting_queue=queue,
+        _weg2_store_told_armed=True,
+        _weg2_store_told=dict(told),
+        _weg2_store_held=dict(held),
+        get_num_allocatable_reqs=lambda running_bs: seats,
+    )
+
+
+def test_the_scheduler_method_holds_and_releases(monkeypatch):
+    import time as _time
+
+    from sglang.srt.managers.scheduler import Scheduler
+
+    clock = [100.0]
+    monkeypatch.setattr(_time, "monotonic", lambda: clock[0])
+    a, b = _req("A", N_TOK), _req("B", N_TOK)
+    h = _holder_sched([a, b], told={"A": 0}, held={"B": b})
+    adder = SimpleNamespace(can_run_list=[], rem_chunk_tokens=CHUNK)
+    rb = SimpleNamespace(reqs=[])
+    with envs.SGLANG_WEG2_P_BURST_ASSEMBLY_MS.override(300):
+        assert Scheduler._weg2_burst_assembly_hold(h, adder, rb) == "assembling"
+        clock[0] += 0.05
+        h._weg2_store_told["B"] = 0
+        h._weg2_store_held.pop("B")
+        assert Scheduler._weg2_burst_assembly_hold(h, adder, rb) == "assembling"  # not quiet yet
+        clock[0] += 0.08
+        assert Scheduler._weg2_burst_assembly_hold(h, adder, rb) is None  # quiet
+        adder.can_run_list = [a]
+        assert Scheduler._weg2_burst_assembly_hold(h, adder, rb) is None  # carried
+    with envs.SGLANG_WEG2_P_BURST_ASSEMBLY_MS.override(0):
+        fresh = SimpleNamespace(can_run_list=[], rem_chunk_tokens=CHUNK)
+        assert Scheduler._weg2_burst_assembly_hold(h, fresh, rb) is None
+
+
+def _burst_run(window_ms):
+    """PP0 + followers, x153b's arrival shape: A and B reach P in pass 0 (A's
+    store verdict at pass 1, B's at pass 2), C and D in pass 2 (verdicts at
+    pass 3). An idle pass costs 10 ms, a forward 2.4 s."""
+    sp = _sp()
+    specs = [("A", N_TOK), ("B", N_TOK), ("C", N_TOK), ("D", N_TOK)]
+    arrive = {"A": 0, "B": 0, "C": 2, "D": 2}
+    told_at = {"A": 1, "B": 2, "C": 3, "D": 3}
+    ranks = [FakeRank(sp, k, specs) for k in range(PP)]
+    for rk in ranks:
+        rk.waiting = []
+    clock = [0.0]
+    seen = {}
+    k_now = [0]
+
+    def ready(r):
+        return told_at[r.rid] <= k_now[0]
+
+    def hold(rk, adder):
+        queued = list(rk.waiting)
+        for r in queued:
+            seen.setdefault(r.rid, clock[0])
+        rdy = [r for r in queued if ready(r)]
+        v = at.burst_hold_verdict(
+            window_ms=window_ms, now=clock[0], carried=len(adder.can_run_list),
+            ready_arrivals=[seen[r.rid] for r in rdy],
+            ready_tokens=sum(len(r.full_untruncated_fill_ids) for r in rdy),
+            pending=sum(1 for r in queued if not ready(r)),
+            last_arrival=max(seen.values()) if seen else None,
+            budget_tokens=CHUNK, seat_cap=4)
+        return v.hold
+
+    ranks[0].ready_fn = ready
+    ranks[0].hold_fn = hold
+    trace, pending = [], []
+    for k in range(12):
+        k_now[0] = k
+        for rk in ranks:
+            rk.waiting += [rk.reqs[rid] for rid, a in arrive.items() if a == k]
+        while pending and pending[0][0] <= k:
+            _, per_rank = pending.pop(0)
+            for rk, b in zip(ranks, per_rank):
+                rk.process(b)
+        b0, decision = ranks[0].run_pass()
+        if not b0.reqs:
+            clock[0] += 0.01
+            continue
+        per_rank = [b0] + [rk.run_pass(dict(decision))[0] for rk in ranks[1:]]
+        trace.append(tuple(b0.extents))
+        pending.append((k + LAP, per_rank))
+        clock[0] += 2.4
+    for _, per_rank in pending:
+        for rk, b in zip(ranks, per_rank):
+            rk.process(b)
+    return ranks, trace
+
+
+def test_without_assembly_the_first_arrival_runs_alone(armed):
+    _, trace = _burst_run(0)
+    assert trace[0] == (("A", 0, N_TOK - 1),)  # the x153b fwd13 shape
+    assert len(trace) >= 4
+
+
+def test_assembly_runs_the_burst_as_one_body_forward(armed):
+    ranks, trace = _burst_run(300)
+    assert trace[0] == tuple((rid, 0, N_TOK - 1) for rid in "ABCD"), trace  # '#new-seq: 4'
+    assert trace[1] == tuple((rid, N_TOK - 1, N_TOK) for rid in "ABCD"), trace
+    assert len(trace) == 2
+    for rk in ranks:
+        assert rk.outputs == {rid: 1 for rid in "ABCD"}
+        assert rk.anchor_at == {rid: [N_TOK - 1] for rid in "ABCD"}

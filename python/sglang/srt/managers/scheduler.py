@@ -12926,6 +12926,65 @@ class Scheduler(
         except Exception:  # noqa: BLE001 - a diagnostic may never mask a death
             pass
 
+    def _weg2_burst_assembly_hold(self, adder, running_batch) -> Optional[str]:
+        """fnFL2 H42b: the burst-assembly verdict of THIS pass (decider only).
+
+        Coordination only: gathers the queue's arrival stamps, the #1400
+        store-told state and the budgets, and asks
+        `anchor_tails.burst_hold_verdict`. Returns the hold reason, or None to
+        admit. Stamps are first-seen times on this rank (monotonic), kept for
+        rids still queued.
+        """
+        window_ms = int(envs.SGLANG_WEG2_P_BURST_ASSEMBLY_MS.get() or 0)
+        if window_ms <= 0:
+            return None
+        now = time.monotonic()
+        seen = self.__dict__.setdefault("_weg2_burst_seen", {})
+        queued = {str(r.rid): r for r in self.waiting_queue}
+        for rid in list(seen):
+            if rid not in queued:
+                seen.pop(rid, None)
+        for rid in queued:
+            seen.setdefault(rid, now)
+        told_on = weg2_store_told.armed(self)
+        told_map = getattr(self, "_weg2_store_told", None) or {}
+        held = getattr(self, "_weg2_store_held", None) or {}
+        ready = [
+            r for rid, r in queued.items() if not told_on or rid in told_map
+        ]
+        verdict = _anchor_tails.burst_hold_verdict(
+            window_ms=window_ms,
+            now=now,
+            carried=len(adder.can_run_list),
+            ready_arrivals=[seen[str(r.rid)] for r in ready],
+            ready_tokens=sum(len(r.origin_input_ids) for r in ready),
+            pending=sum(1 for rid in queued if told_on and rid in held),
+            last_arrival=max(seen.values()) if seen else None,
+            budget_tokens=adder.rem_chunk_tokens,
+            seat_cap=self.get_num_allocatable_reqs(len(running_batch.reqs)),
+        )
+        t0 = getattr(self, "_weg2_burst_hold_t0", None)
+        if verdict.hold:
+            if t0 is None:
+                self._weg2_burst_hold_t0 = now
+                logger.info(
+                    "WEG2 BURST-ASSEMBLY hold window_ms=%d ready=%d tokens=%d "
+                    "pending_told=%d oldest_ms=%.0f budget=%s seats=%d",
+                    window_ms, verdict.ready, verdict.ready_tokens,
+                    verdict.pending, verdict.oldest_ms, adder.rem_chunk_tokens,
+                    self.get_num_allocatable_reqs(len(running_batch.reqs)),
+                )
+            return verdict.reason
+        if t0 is not None:
+            self._weg2_burst_hold_t0 = None
+            logger.info(
+                "WEG2 BURST-ASSEMBLY release reason=%s held_ms=%.0f ready=%d "
+                "tokens=%d pending_told=%d",
+                verdict.reason, (now - t0) * 1000.0, verdict.ready,
+                verdict.ready_tokens, verdict.pending,
+            )
+        return None
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -13833,8 +13892,21 @@ class Scheduler(
             _pp_parked_priority(self)
 
         self._pp_batch_full_at_loop_entry = bool(running_batch.batch_is_full)
+        # fnFL2 H42b: with anchor tails armed, the carried continuations
+        # (re-added tails, the chunked request) already hold their seats; the
+        # count arm below counts only this pass's fresh admissions. And on the
+        # DECIDING rank a pass of nothing but new bodies may wait (bounded)
+        # for the rest of a burst (SGLANG_WEG2_P_BURST_ASSEMBLY_MS). Unarmed:
+        # 0 carried, the full queue -- the stock loop.
+        _carried_n = len(adder.can_run_list) if adder.multi_anchor_tails else 0
+        _burst_hold = None
+        if adder.multi_anchor_tails and _count_veto:
+            _burst_hold = self._weg2_burst_assembly_hold(adder, running_batch)
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if _burst_hold is not None:  # fnFL2 H42b: the burst is still assembling
+                _note_skip("weg2_burst_assembly", req.rid)
+                continue
             # #988 A REQUEST ALREADY COLLECTED THIS PASS IS NOT A CANDIDATE.
             # `add_chunked_req` appends the continuation to `can_run_list`
             # while the request may still be resident in `waiting_queue` (the
@@ -13906,7 +13978,7 @@ class Scheduler(
             # STOP. See `rank_local_count_veto_applies`.
             if _count_veto and len(
                 adder.can_run_list
-            ) >= self._uniform_allocatable_reqs(running_bs, _head_inputs):
+            ) >= self._uniform_allocatable_reqs(running_bs, _head_inputs) + _carried_n:
                 running_batch.batch_is_full = True
                 self._pp_batch_full_setter = "count_arm"
             _disagg_full = False

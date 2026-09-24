@@ -249,6 +249,74 @@ def log_pass(
         len(kept_ids),
         len(readd.not_named) if readd is not None else 0,
         len(tails),
-        ",".join(str(getattr(r, "rid", "?"))[:8] for r in minted) or "-",
-        ",".join(str(getattr(r, "rid", "?"))[:8] for r in ended) or "-",
+        # H42b: 16 chars -- x153b printed `weg2-8-1,weg2-8-1` for rids 11 and 14
+        ",".join(str(getattr(r, "rid", "?"))[:16] for r in minted) or "-",
+        ",".join(str(getattr(r, "rid", "?"))[:16] for r in ended) or "-",
     )
+
+
+# ---------------------------------------------------------------- H42b
+# The count arm's own fix (carried continuations already hold their seats,
+# x153b fwd17) lives at the arm in scheduler.py: `+ _carried_n`.
+class BurstVerdict(NamedTuple):
+    hold: bool
+    reason: str
+    ready: int
+    ready_tokens: int
+    pending: int
+    oldest_ms: float
+
+
+def burst_quiet_ms(window_ms: float) -> float:
+    """How long no new rid may have arrived before an assembled burst counts
+    as complete: a quarter of the window, at least 20 ms (the tokenizer hands
+    a burst over one request at a time)."""
+    return max(20.0, float(window_ms) / 4.0)
+
+
+def burst_hold_verdict(
+    *,
+    window_ms: float,
+    now: float,
+    carried: int,
+    ready_arrivals: Sequence[float],
+    ready_tokens: int,
+    pending: int,
+    last_arrival: Optional[float],
+    budget_tokens: Optional[int],
+    seat_cap: int,
+) -> BurstVerdict:
+    """fnFL2 H42b: hold THIS pass's fresh admissions for the rest of a burst?
+
+    Only a pass that would carry NOTHING but new bodies is ever held: a
+    forward that runs anyway (carried tails, the chunked request) takes the
+    ready bodies along. Admit at once when the chunk budget or the seats are
+    already full (nothing more could join), when the oldest ready request has
+    waited the window, or when the queue is quiet (no rid seen within
+    ``burst_quiet_ms`` and no #1400 store verdict outstanding). ``now`` and the
+    arrivals are ``time.monotonic()`` seconds.
+    """
+    n = len(ready_arrivals)
+    oldest_ms = (now - min(ready_arrivals)) * 1000.0 if n else 0.0
+
+    def _v(hold: bool, reason: str) -> BurstVerdict:
+        return BurstVerdict(hold, reason, n, int(ready_tokens), int(pending), oldest_ms)
+
+    if window_ms <= 0:
+        return _v(False, "off")
+    if carried > 0:
+        return _v(False, "carried")
+    if n == 0:
+        return _v(False, "nothing-ready")
+    if budget_tokens is None:
+        return _v(False, "no-chunk-budget")
+    if ready_tokens >= budget_tokens:
+        return _v(False, "budget-full")
+    if n >= seat_cap:
+        return _v(False, "seats-full")
+    if oldest_ms >= window_ms:
+        return _v(False, "window")
+    quiet = last_arrival is None or (now - last_arrival) * 1000.0 >= burst_quiet_ms(window_ms)
+    if pending == 0 and quiet:
+        return _v(False, "quiet")
+    return _v(True, "assembling")
