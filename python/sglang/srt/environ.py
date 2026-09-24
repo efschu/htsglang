@@ -794,6 +794,15 @@ class Envs:
     # round, all three cards idle) off the device's critical path. Off = the
     # H40 order and the H40 kernel, byte-identical.
     SGLANG_WEG2_PLE_STAGE_BEHIND_REPLAY = EnvBool(False)
+    # fnFL2 H69b (Form A only, D's host): build the PLE n-gram table with the
+    # full vocabulary (enable_tp=False), as F13 does for embed_tokens. Without
+    # it the host holds the even TP=3 shard [0, V/3) of the n-gram ids and --
+    # with the F12 reduce skipped and no worker holding the rest -- reads the
+    # other two thirds (bigram heads 5-7, every trigram head) as zero rows
+    # (x168: kernel_rows/rows 33.4 %). A correctness fix: it changes D's
+    # numerics back to P's model and triples D's staged PLE rows per round
+    # (21 -> 64 at bs 1). Off = the pre-H69b layout, byte-identical.
+    SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB = EnvBool(False)
     # fnFL2 H43: the FIRST chunk's gather starts at the request's admission
     # (scheduler intake, or the front's hint while P still sleeps) into a third
     # shared slot, whenever the H32 ring is idle. Off = H32 alone. Never on

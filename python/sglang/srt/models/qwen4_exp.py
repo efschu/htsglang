@@ -543,6 +543,48 @@ def _use_attn_tp_ngram() -> bool:
     return is_dp_attention_enabled() and envs.SGLANG_USE_ATTN_TP_NGRAM.get()
 
 
+def ple_ngram_vocab_tp_kwargs(config, use_attn_tp_ngram: bool) -> dict:
+    """fnFL2 H69b: the vocab-parallel layout of the PLE n-gram table.
+
+    FORM A (F13, the seam's missing sibling): F13 builds the host's
+    ``embed_tokens`` with ``enable_tp=False`` because ``tp_vocab_ratios`` keeps
+    every vocab dimension EVEN under ``--rank-tp-ratio 1,0,0`` -- the host
+    would hold one third of the rows. The n-gram table is a vocab dimension
+    too and was left on the default: on D's host (TP=3) its shard is
+    ``[0, V/3)`` of the n-gram id space, i.e. bigram heads 0-4 and a third of
+    head 5, while ``Qwen4ExpPinnedHostEmbedding.reduce`` (F12) skips the
+    all-reduce that would have added the workers' shards -- which a Form A
+    worker never builds. The rest of head 5, bigram heads 6-7 and all eight
+    trigram heads read as zero rows on D; x168 counted it: kernel_rows 685 of
+    rows 2048 per 32 rounds (33.4 %). P (PP3, tp_size 1 per stage) is
+    unaffected, so D decodes a different model than P prefilled.
+
+    ``SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB=1`` gives the host the full table, like
+    F13 does for ``embed_tokens``: tp_size 1, full range, no mask, no
+    collective. Only with the ``checkpoint`` offload backend, which maps the
+    whole table anyway; a copying backend would materialize all of it in host
+    memory, so there the switch is refused by name and the layout stays.
+    Off, or outside Form A: the pre-H69b layout, byte-identical."""
+    if not (
+        envs.SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB.get()
+        and form_a_dense_is_unsharded()
+        and not use_attn_tp_ngram
+    ):
+        return {}
+    if not (
+        getattr(config, "ple_offload_embedding", False)
+        and getattr(config, "ple_offload_backend", None) == "checkpoint"
+    ):
+        logger.warning(
+            "SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB refused: the full n-gram table "
+            "is only taken with the 'checkpoint' PLE offload backend (got %r); "
+            "the host keeps its even TP shard",
+            getattr(config, "ple_offload_backend", None),
+        )
+        return {}
+    return {"enable_tp": False}
+
+
 class Qwen4ExpPLEGroupedNorm(nn.Module):
     def __init__(
         self,
@@ -684,6 +726,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 ),
                 output_dtype=torch.bfloat16,
                 use_attn_tp_group=self.use_attn_tp_ngram,
+                **ple_ngram_vocab_tp_kwargs(config, self.use_attn_tp_ngram),
             )
         self.ngram_embedding.register_buffer(
             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
