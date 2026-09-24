@@ -186,6 +186,85 @@ _WORKER = textwrap.dedent(
             "state_equal": bool(torch.equal(cs_g, cs_r)),
         })
     res["conv"] = conv
+
+    # CONSECUTIVE CHUNKS OF ONE REQUEST (prefix > 0): the state written by
+    # chunk k is the initial state of chunk k+1. Eager: every chunk exactly its
+    # own tokens, fresh cu_seqlens. Graph: bucket tensors, garbage past n, the
+    # ONE pinned static cu_seqlens refreshed per chunk. Same chunk boundaries on
+    # both sides, so the comparison is bit-exact.
+    multi = []
+    for plan in ((100, 130, 64), (BUCKET, BUCKET, 40), (1, BUCKET, 7)):
+        total = sum(plan)
+        g = torch.Generator().manual_seed(31 + total)
+        q = torch.randn(1, total, H, K, generator=g)
+        k = torch.randn(1, total, H, K, generator=g)
+        v = torch.randn(1, total, H, V, generator=g)
+        gg = torch.nn.functional.logsigmoid(torch.randn(1, total, H, generator=g))
+        beta = torch.rand(1, total, H, generator=g).sigmoid()
+        st_e, st_g = s0(), s0()
+        outs_e, outs_g = [], []
+        pos = 0
+        for i, n in enumerate(plan):
+            sl = slice(pos, pos + n)
+            outs_e.append(run(
+                q[:, sl].contiguous(), k[:, sl].contiguous(), v[:, sl].contiguous(),
+                gg[:, sl].contiguous(), beta[:, sl].contiguous(), st_e,
+                torch.tensor([0, n], dtype=torch.int32),
+            ))
+            gb = torch.Generator().manual_seed(97 + i)
+            def padded(x, fill):
+                y = fill((1, BUCKET) + tuple(x.shape[2:]))
+                y[:, :n] = x[:, sl]
+                return y
+            big = lambda s: 50.0 * torch.randn(s, generator=gb)
+            static_cu[1] = n
+            o = run(
+                padded(q, big), padded(k, big), padded(v, big),
+                padded(gg, lambda s: -30.0 * torch.rand(s, generator=gb)),
+                padded(beta, lambda s: torch.rand(s, generator=gb)),
+                st_g, static_cu,
+            )
+            outs_g.append(o[:, :n])
+            pos += n
+        multi.append({
+            "plan": list(plan),
+            "o_equal": bool(torch.equal(torch.cat(outs_g, 1), torch.cat(outs_e, 1))),
+            "state_equal": bool(torch.equal(st_g[1], st_e[1])),
+            "state_moved": not bool(torch.equal(st_e[1], s0()[1])),
+        })
+    res["gdn_multi"] = multi
+
+    conv_multi = []
+    for plan in ((100, 130, 3), (BUCKET, 1, BUCKET)):
+        total = sum(plan)
+        g = torch.Generator().manual_seed(61 + total)
+        x = torch.randn(total, DIM, generator=g)
+        cs0 = torch.randn(SLOTS, DIM, W - 1, generator=g)
+        cs_e, cs_g = cs0.clone(), cs0.clone()
+        idx = torch.tensor([2], dtype=torch.int32)
+        outs_e, outs_g = [], []
+        pos = 0
+        for i, n in enumerate(plan):
+            hin = torch.tensor([i > 0])
+            xe = x[pos:pos + n]
+            outs_e.append(causal_conv1d_fn(
+                xe.transpose(0, 1), wts, bias, cs_e, torch.tensor([0, n], dtype=torch.int32), [n],
+                cache_indices=idx, has_initial_state=hin, activation="silu",
+            ))
+            xg = torch.full((BUCKET, DIM), 1e4)
+            xg[:n] = xe
+            og = causal_conv1d_fn(
+                xg.transpose(0, 1), wts, bias, cs_g, torch.tensor([0, n], dtype=torch.int32), [BUCKET],
+                cache_indices=idx, has_initial_state=hin, activation="silu",
+            )
+            outs_g.append(og[:, :n])
+            pos += n
+        conv_multi.append({
+            "plan": list(plan),
+            "out_equal": bool(torch.equal(torch.cat(outs_g, 1), torch.cat(outs_e, 1))),
+            "state_equal": bool(torch.equal(cs_g, cs_e)),
+        })
+    res["conv_multi"] = conv_multi
     print("__RESULT__" + json.dumps(res))
     """
 ).replace("__BUCKET__", str(BUCKET))
@@ -245,6 +324,22 @@ class TestGdnBakedGridLiveBound(CustomTestCase):
 
     def test_conv_rows_and_state_are_bit_identical_to_eager(self):
         for case in self.res["conv"]:
+            self.assertTrue(case["out_equal"], case)
+            self.assertTrue(case["state_equal"], case)
+
+    def test_consecutive_chunks_carry_the_state_like_eager(self):
+        """Prefix > 0, several chunks of one request (the xsn428 question,
+        candidate 2): the graph form's chunk k+1 starts from the state its
+        chunk k wrote, bit-identical to eager chunk by chunk."""
+        self.assertEqual(len(self.res["gdn_multi"]), 3)
+        for case in self.res["gdn_multi"]:
+            self.assertTrue(case["state_moved"], case)  # control: real carry
+            self.assertTrue(case["o_equal"], case)
+            self.assertTrue(case["state_equal"], case)
+
+    def test_consecutive_conv_chunks_carry_the_window_like_eager(self):
+        self.assertEqual(len(self.res["conv_multi"]), 2)
+        for case in self.res["conv_multi"]:
             self.assertTrue(case["out_equal"], case)
             self.assertTrue(case["state_equal"], case)
 
