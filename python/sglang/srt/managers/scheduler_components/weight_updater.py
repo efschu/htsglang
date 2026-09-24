@@ -701,6 +701,10 @@ class SchedulerWeightUpdaterManager:
     #: H25: the draft's pinned host image (weg2/draft_park.DraftHostPark),
     #: created at the first park and reused for the life of the process.
     _weg2_draft_park: Any = None
+    #: H25e: the park's own verdict "this rank's draft tag holds nothing"
+    #: ('storages=0 tms_bytes=0', a Form-A worker's shadow draft), recorded
+    #: at the sleep; None = no such verdict (parked, or never asked).
+    _weg2_draft_not_carried: Any = None
     #: H25: (phase list, index) of the wake RPC where the draft H2D started.
     _weg2_draft_unpark_ph0: Any = None
     _weg2_kv_deferred: bool = False       # Wake-Parallel: kv resume deferred to the weights call
@@ -1737,10 +1741,14 @@ class SchedulerWeightUpdaterManager:
         population = park_population(drafter.model, target)
         tag_bytes = int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_WEIGHTS_DRAFT) or 0)
         if not population or tag_bytes <= 0:
+            # H25e: the ONE verdict the wake's W4 exemption reads.
+            self._weg2_draft_not_carried = (
+                f"storages={len(population)} tms_bytes={tag_bytes}")
             logger.info("WEG2-DRAFT-PARK tag=%s nothing to park on this rank "
-                        "(storages=%d tms_bytes=%d)", GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
-                        len(population), tag_bytes)
+                        "(%s) -- the wake needs no draft source here (H25e)",
+                        GPU_MEMORY_TYPE_WEIGHTS_DRAFT, self._weg2_draft_not_carried)
             return
+        self._weg2_draft_not_carried = None
         if self._weg2_draft_park is None:
             self._weg2_draft_park = DraftHostPark(new_stream=torch.cuda.Stream)
         rec = self._weg2_draft_park.park(
@@ -2065,8 +2073,18 @@ class SchedulerWeightUpdaterManager:
             # (a park happened), never on the arm alone: a rank that never
             # parked has no host source and keeps the refusal.
             _draft_via_park = self._weg2_draft_carried_by_park()
+            # H25e (fnFL2x143, 24.09.): THE THIRD SOURCE -- none needed. A
+            # Form-A worker's draft is a shadow whose tag holds no byte on the
+            # card; its sleep logged 'WEG2-DRAFT-PARK ... nothing to park on
+            # this rank (storages=0 tms_bytes=0)' and x143's TP1/TP2 then died
+            # here (W4) at the first P->D wake, while TP0 (parked) passed. A
+            # rank whose draft tag carries nothing has nothing to refill; W4
+            # guards nothing there. The verdict is the park's own, recorded at
+            # the sleep (`_weg2_draft_not_carried`), never re-guessed here.
+            _draft_not_carried = self._weg2_draft_not_carried is not None
             if (draft_path is not None and draft_path != server_args.model_path
-                    and not _draft_via_exchange and not _draft_via_park):
+                    and not _draft_via_exchange and not _draft_via_park
+                    and not _draft_not_carried):
                 raise Weg2WakeRefused(
                     "W4 Weg2WakeRefused: the draft worker loads from "
                     f"{draft_path!r}, not from {server_args.model_path!r}, and "
