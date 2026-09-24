@@ -1581,6 +1581,15 @@ class Pending:
     #: could take it. Read by ``_flip_economics_ok`` under
     #: SGLANG_WEG2_VISION_FLIP_URGENT.
     p_only: bool = False
+    #: 27B idle policy (b): this request's OWN route verdict was SHORT (uncached
+    #: <= X, no vision stage) and it sits in the P queue only because of the
+    #: phase (it arrived while P was awake or a flip ran). The one kind of queued
+    #: request `--d-short-drain-tokens` may hand to D -- never a LONG, vision,
+    #: carrier or re-queued one (law 4: D never prefills above X).
+    d_eligible: bool = False
+    #: set when that drain handed it to D: its leg 2 then runs exactly as the
+    #: SHORT route's (pending=None -- no leg 1 ever ran for it).
+    d_direct: bool = False
 
 
 class Seat:
@@ -1964,7 +1973,9 @@ class Front:
                  ledger_arm: Optional[Dict[str, float]] = None,
                  admin_key_file: str = "",
                  vision: str = VISION_MODE_OFF,
-                 record_line: str = ""):
+                 record_line: str = "",
+                 d_short_drain_tokens: int = 0,
+                 d_hold_s: Optional[float] = None):
         # #1275: the key arrives as a PATH, never as an argv value. The groups
         # have no choice (`server_args` offers only `--admin-api-key`, so their
         # key is world-readable in /proc/<pid>/cmdline), but the front does, and
@@ -2134,6 +2145,23 @@ class Front:
         self.idle_layout = "P" if str(idle_layout).upper().startswith("P") else "D"
         # MF-1: the IDLE-REST line's edge trigger (see _idle_disposition).
         self._idle_rest_shown = False
+        # 27B idle policy (user order 24.09., three settings beside --idle-layout):
+        # (b) --d-short-drain-tokens N: a queued backlog made ONLY of SHORT
+        #     requests (each <= X, law 4) totalling <= N is handed to D instead of
+        #     waiting for a flip. 0 = off = today (it waits for FLIP-ECONOMICS /
+        #     the fairness bound).
+        # (c) --d-hold-s T: D stays awake T s after its own work ended -- at rest
+        #     under --idle-layout P, and in front of a backlog FLIP-ECONOMICS
+        #     holds -- then flips. None = off = today (rest: min-dwell only;
+        #     held backlog: only the fairness bound releases it).
+        self.d_short_drain_tokens = max(0, int(d_short_drain_tokens or 0))
+        self.d_hold_s = None if d_hold_s is None else max(0.0, float(d_hold_s))
+        # (c) the moment D's own work last ended (no outstanding leg 2, no
+        # hand-off in flight, nothing waiting in _ready_for_d); None while D is
+        # busy or asleep. Read by _d_hold_expired, written by _note_d_free.
+        self._d_free_since: Optional[float] = None
+        # (c) the D-HOLD line's edge trigger: the free period it was printed for.
+        self._d_hold_shown: Optional[Tuple[str, float]] = None
         self.drain_deadline_s = float(drain_deadline_s)
         # C4: oldest-first, one seat per running request on D.
         self._ready_for_d: Deque[Pending] = collections.deque()
@@ -2628,6 +2656,8 @@ class Front:
                     else "that reading under an operator ceiling")
         # 27B flipfast: which of the three front switches this boot runs.
         logger.info("%s", self.flipfast_line())
+        # 27B idle policy: the resting layout and the two hold/drain settings.
+        logger.info("%s", self.idle_policy_line())
 
     async def cleanup(self, app):
         for k in ("controller", "admitter", "health", "corridor", "flip_stall"):
@@ -3236,7 +3266,10 @@ class Front:
                     store_span_est=store_span,
                     # xsn438: routed `long` by the W102 rule above, not by
                     # length -- only P can serve it (Pending.p_only).
-                    p_only=_verdict == VERDICT_STAGE)
+                    p_only=_verdict == VERDICT_STAGE,
+                    # 27B idle policy (b): only a request whose OWN route is SHORT
+                    # may later be handed to D by --d-short-drain-tokens.
+                    d_eligible=short_ok)
         self.queue.append(p)
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         logger.info("WEG2-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d)",
@@ -3248,6 +3281,10 @@ class Front:
         except Exception as e:  # noqa: BLE001
             return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
         self._mark_posted(p)
+        if p.d_direct:
+            # 27B idle policy (b): handed to D by the SHORT drain -- no leg 1 ran,
+            # so leg 2 is the SHORT route's (its X refusal re-queues it for P).
+            return await self.leg2(request, rid, payload, text, stream, pending=None, seat=p.seat)
         return await self.leg2(request, rid, payload, text, stream, pending=p, seat=p.seat)
 
     # ---------------- D admission (C4, C5) ----------------
@@ -3813,6 +3850,7 @@ class Front:
                     if seat is not None:
                         seat.release("reroute")
                     pending.seat = None
+                    pending.d_eligible = pending.d_direct = False  # idle policy (b): P's now
                     self.queue.append(pending)
                     self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
                     logger.warning("WEG2-REROUTE rid=%s uncached=%d > %d: rejoining route BATCH once (spec 3.6)",
@@ -4074,6 +4112,7 @@ class Front:
         if seat is not None:
             seat.release("W50_requeue")
         p.seat = None
+        p.d_eligible = p.d_direct = False  # idle policy (b): D refused it -- P's now
         self.queue.append(p)
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         try:
@@ -5071,6 +5110,9 @@ class Front:
         self.epoch += 1
         self.admit_d = True
         self.state = "serving"
+        # 27B idle policy (c): a hold never spans a flip -- D's free period
+        # starts again at its next observation on the awake D.
+        self._d_free_since = None
         # 27B flipfast F3: after a D->P flip the controller that awaits it starts
         # P's drain at once instead of one tick later (no-op with the switch off).
         # NOT after P->D: nothing on D waits for the controller there (leg 2 is
@@ -5644,6 +5686,107 @@ class Front:
                     "nothing gates on it -- %s=1)",
                     rec.get("epoch"), src, len(dc), (time.time() - t0) * 1000.0, DC_OFF_PATH_ENV)
 
+    # ---------------- 27B idle policy (user order 24.09.): (b) and (c) ----------------
+    # (a) is --idle-layout (law 5, K8), unchanged. Neither method below runs a
+    # decision the controller did not already have: (b) resolves a SHORT-only
+    # backlog the way the SHORT route resolves an arrival, (c) bounds how long
+    # D stays -- at rest, or in front of a backlog FLIP-ECONOMICS holds. Both off
+    # by default, and off is today's path.
+    def idle_policy_line(self) -> str:
+        """The resting/holding settings as one line, printed at startup."""
+        return ("WEG2-IDLE-POLICY idle_layout=%s d_short_drain_tokens=%d X=%d flip_min_work_tokens=%d "
+                "d_hold_s=%s min_dwell_ms=%s fairness_w_s=%.0f (a: the group that rests when nothing "
+                "is pending; b: a queued SHORT-only backlog of at most d_short_drain_tokens is served "
+                "on D, 0 = off; c: D stays d_hold_s after its own work ended before the idle flip to "
+                "P and before a backlog FLIP-ECONOMICS holds flips, off = min-dwell / fairness only)" % (
+                    self.idle_layout, self.d_short_drain_tokens, int(self.tp_prefill_max_tokens),
+                    int(self.flip_min_work_tokens),
+                    "off" if self.d_hold_s is None else f"{self.d_hold_s:.1f}",
+                    "derived" if self.min_dwell_ms is None else f"{self.min_dwell_ms:.0f}",
+                    float(self.w_s)))
+
+    def _d_short_drain(self, now: float) -> int:
+        """(b) --d-short-drain-tokens N: hand a SHORT-only backlog to D.
+
+        Applies while D is awake, serving and admitting, when EVERY queued
+        request is ``d_eligible`` (its own route verdict was SHORT: uncached
+        <= X, no vision stage, not carrier, never re-queued) and the queued
+        uncached tokens sum to <= N. Then the whole queue moves, oldest first,
+        into ``_ready_for_d`` marked ``d_direct``: the admitter seats them with
+        D's own bs and budget, and each leg 2 runs as the SHORT route's. One
+        LONG / vision / re-queued request in the queue and nothing is split
+        off -- the flip follows and P drains the whole backlog (law 1).
+        Returns the number of requests handed over (0 = nothing done).
+        """
+        n_max = self.d_short_drain_tokens
+        if n_max <= 0 or not self.queue:
+            return 0
+        if not (self.awake == "D" and self.state == "serving" and self.admit_d):
+            return 0
+        x = int(self.tp_prefill_max_tokens)
+        for p in self.queue:
+            if not (p.d_eligible and not p.skip_leg1 and not p.intake_stalled and not p.leg1_done
+                    and not p.reroutes and not p.x_requeues and 0 <= int(p.est_uncached) <= x):
+                return 0
+        total = sum(int(p.est_uncached) for p in self.queue)
+        if total > n_max:
+            return 0
+        moved = list(self.queue)
+        self.queue.clear()
+        for p in moved:
+            p.d_direct = True
+            self._ready_for_d.append(p)
+        self._sync_batch_gate()
+        self.counters["d_short_drain_requests"] += len(moved)
+        self.counters["d_short_drain_tokens"] += total
+        logger.info("WEG2 D-SHORT-DRAIN n=%d tokens=%d max=%d X=%d rids=%s oldest_wait_s=%.1f "
+                    "(27B idle policy b: a queued SHORT-only backlog is served on D like the SHORT "
+                    "route, no flip; every request <= X, law 4)",
+                    len(moved), total, n_max, x, [p.rid for p in moved][:8],
+                    max(0.0, now - min(p.t_arrive for p in moved)))
+        return len(moved)
+
+    def _note_d_free(self, free: bool, now: float) -> None:
+        """(c) keep the moment D's own work ended: set on the first observation
+        of a free D, cleared the moment D holds work again (a SHORT arrival
+        served within the hold restarts it)."""
+        if not free:
+            self._d_free_since = None
+        elif self._d_free_since is None:
+            self._d_free_since = now
+
+    def _d_hold_expired(self, kind: str, now: float) -> bool:
+        """(c) --d-hold-s T: may D leave now?
+
+        ``kind`` ``idle``: D rests but ``--idle-layout P`` wants P -- D stays
+        until it has been free for T. ``backlog``: FLIP-ECONOMICS holds a small
+        backlog D cannot serve -- it flips once D has been free for T instead of
+        waiting for the fairness bound. With the switch off: ``idle`` -> True
+        (today: only min-dwell gates the idle flip), ``backlog`` -> False
+        (today: only the fairness bound releases a held backlog).
+        """
+        if kind not in ("idle", "backlog"):
+            raise ValueError(f"unknown D-hold kind {kind!r}")
+        if self.d_hold_s is None:
+            return kind == "idle"
+        since = self._d_free_since
+        if since is None:  # D holds work: no hold has started
+            return False
+        held = now - since
+        expired = held >= self.d_hold_s
+        verdict = "release" if expired else "hold"
+        if self._d_hold_shown != (kind + "/" + verdict, since):
+            self._d_hold_shown = (kind + "/" + verdict, since)
+            if expired:
+                self.counters[f"d_hold_released_{kind}"] += 1
+            logger.info("WEG2 D-HOLD kind=%s verdict=%s held_s=%.1f hold_s=%.1f queue=%d queued_uncached=%d "
+                        "idle_layout=%s (27B idle policy c: D stays --d-hold-s after its own work ended "
+                        "so a SHORT arrival is served without a flip; release = the flip may follow, "
+                        "behind min-dwell)",
+                        kind, verdict, held, self.d_hold_s, len(self.queue),
+                        sum(int(p.est_uncached) for p in self.queue), self.idle_layout)
+        return expired
+
     async def controller(self) -> None:
         # #1459: P takes p_concurrency + P_QUEUE_AHEAD requests at once; the
         # extra one waits in P's queue (max-running-requests bounds compute)
@@ -5661,8 +5804,16 @@ class Front:
                     continue
                 if self.awake == "D":
                     D = self.groups["D"]
+                    _now = time.time()
+                    # 27B idle policy (b): a SHORT-only backlog <= --d-short-drain-tokens
+                    # is served on D -- no flip, no economics hold (off by default).
+                    if self.queue and self._d_short_drain(_now):
+                        continue
                     oldest = self.queue[0].t_arrive if self.queue else None
                     fairness_fired = self._fairness_switch(oldest, "batch")
+                    # 27B idle policy (c): when D's own work last ended (--d-hold-s).
+                    self._note_d_free(not D.outstanding and not self._handoff_in_flight()
+                                      and not self._ready_for_d, _now)
                     if not self.queue:
                         # law 5 / C6 / R-34: the idle mirror.  D->P at rest
                         # only under --idle-layout pp, only when D holds
@@ -5692,7 +5843,10 @@ class Front:
                         at_rest = (not D.outstanding and not self._handoff_in_flight()
                                    and not self._ready_for_d and self.state == "serving")
                         if self._idle_disposition("D", at_rest) == "flip":
-                            if self._dwell_ok("D", "P", fairness_fired, work_exhausted=True, oldest_wait_s=0.0):
+                            # (c) --d-hold-s: rest on D that long after its work ended
+                            # before the idle flip to P (off = no hold, today).
+                            if (self._d_hold_expired("idle", _now)
+                                    and self._dwell_ok("D", "P", fairness_fired, work_exhausted=True, oldest_wait_s=0.0)):
                                 await self.flip("D", "P")
                         continue
                     # FIX 2 (round 2): the work arm reads the SAME hand-off
@@ -5710,7 +5864,11 @@ class Front:
                     d_work_exhausted = not D.outstanding and not handing_off
                     if (d_work_exhausted or not self.admit_d) and not handing_off:
                         if not self._flip_economics_ok(fairness_fired):
-                            continue
+                            # (c) --d-hold-s bounds the economics hold: a small backlog
+                            # D cannot serve flips once D has been free that long
+                            # (off = held until the fairness bound, today).
+                            if not self._d_hold_expired("backlog", _now):
+                                continue
                         if not self._dwell_ok("D", "P", fairness_fired, work_exhausted=d_work_exhausted,
                                               oldest_wait_s=time.time() - (oldest or time.time())):
                             continue
@@ -6181,6 +6339,15 @@ def main():
     ap.add_argument("--drain-deadline-s", type=float, default=DRAIN_DEADLINE_DEFAULT_S,
                     help="C13/K10: seconds a group may still hold requests before a flip is refused "
                          "by name (W1 -> W2). Today's shipped value, promoted from a literal.")
+    ap.add_argument("--d-short-drain-tokens", type=int, default=0,
+                    help="27B idle policy (b): while D is awake, a queued backlog made ONLY of SHORT "
+                         "requests (each <= X, law 4) whose uncached tokens sum to at most N is served "
+                         "on D instead of waiting for a flip. 0 (default) = off = today.")
+    ap.add_argument("--d-hold-s", type=float, default=None,
+                    help="27B idle policy (c): D stays awake this many seconds after its own work "
+                         "ended -- at rest under --idle-layout P, and in front of a backlog "
+                         "FLIP-ECONOMICS holds -- then flips. Unset (default) = today: the idle flip "
+                         "waits for min-dwell only, a held backlog for the fairness bound only.")
     ap.add_argument("--weight-chunks", type=int, default=0, help="#1233: number of weights_<k> chunk tags both groups were built with (0 = single weights tag)")
     ap.add_argument("--carrier-max-tokens", type=int, default=0,
                     help="#1233 zero-remainder: longest prompt group D can read from the store. "
@@ -6261,7 +6428,9 @@ def main():
                   ledger_arm=json.loads(args.ledger_arm) if args.ledger_arm else {},
                   admin_key_file=args.admin_key_file,
                   vision=args.vision,
-                  record_line=args.record_line)
+                  record_line=args.record_line,
+                  d_short_drain_tokens=args.d_short_drain_tokens,
+                  d_hold_s=args.d_hold_s)
     # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
     # against. Kept from weg2/idle-anon-0908.
     if args.anon_preboot_bytes > 0:
