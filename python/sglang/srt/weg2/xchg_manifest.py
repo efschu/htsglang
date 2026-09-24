@@ -555,11 +555,41 @@ def vocab_pad_unit() -> int:
     return int(DEFAULT_VOCAB_PADDING_SIZE)
 
 
-def _pad_vocab_size(n: int) -> int:
-    """``pad_vocab_size`` from the tree -- the loader's OWN rounding."""
+def _pad_vocab_size(n: int, pad_to: Optional[int] = None) -> int:
+    """``pad_vocab_size`` from the tree -- the loader's OWN rounding.
+
+    ``pad_to`` None is the tree's default unit (:func:`vocab_pad_unit`)."""
     from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
-    return int(pad_vocab_size(int(n)))
+    if pad_to is None:
+        return int(pad_vocab_size(int(n)))
+    return int(pad_vocab_size(int(n), int(pad_to)))
+
+
+#: The tensor classes the loader PADS on the vocabulary axis: the parameters
+#: of ``VocabParallelEmbedding`` / ``ParallelLMHead`` (weight, and the INT8
+#: embedding's per-row ``weight_scale``, which weg2xsn23 found padded on the
+#: same axis), as ``weight_exchange_shadow.tensor_class`` names them -- the
+#: class every manifest piece stores.  Only these may take the RATIO-WEIGHTED
+#: padded cut in :func:`_axis_of`: its arithmetic alone (whole units summing
+#: to the padded extent) can be met by an ordinary tensor that genuinely
+#: disagrees, and no other layer of the tree pads.  A model naming its
+#: vocabulary layers otherwise is REFUSED (W68), never guessed.
+VOCAB_PADDED_CLASSES = frozenset({"embed_tokens", "lm_head"})
+
+
+def ratio_vocab_pad_unit(n: int) -> int:
+    """The padding unit of the RATIO-WEIGHTED vocabulary split on ``n`` ranks.
+
+    ``VocabParallelEmbedding.__init__``: under an active uneven-TP plan the
+    padding becomes ``lcm(padding_size, tp_size)`` and ``--rank-vocab-ratio``
+    hands every rank a whole number (>= 1) of those units of the PADDED
+    vocabulary (``partition_units``), as prefix-sum slices -- so the pad sits
+    in the LAST rank's tail, exactly as in the even split.
+    """
+    import math
+
+    return int(math.lcm(vocab_pad_unit(), int(n)))
 
 
 def _mixed_fused_axis(
@@ -701,6 +731,13 @@ def _axis_of(name: str, whole: ManifestPiece,
     genuinely disagreeing pair into a "padded" one and move the wrong bytes, so
     the excess must be smaller than ``len(cut) * pad_unit`` -- the most any
     correct per-rank rounding can add.  Anything larger is still refused.
+
+    **THE RATIO-WEIGHTED PADDED CUT** (``--rank-vocab-ratio``) is the same
+    class with unequal widths: the loader pads to ``lcm(pad_unit, n)``
+    (:func:`ratio_vocab_pad_unit`) and gives each rank a whole number of those
+    units, so the widths sum to exactly ``pad_vocab_size(full, unit)`` and the
+    pad sits in the last rank's tail.  Recognised on
+    :data:`VOCAB_PADDED_CLASSES` only; everything else still refuses.
     """
     rows = [int(p.rows_full) for p in cut]
     cols = [int(p.cols_full) for p in cut]
@@ -755,6 +792,33 @@ def _axis_of(name: str, whole: ManifestPiece,
     if same_rows and _padded(w_cols, cols):
         return wx.COLS, w_rows, sum(cols), tuple(cols), sum(cols) - w_cols
 
+    # THE RATIO-WEIGHTED PADDED CUT (--rank-vocab-ratio, 27B A/B 2026-09-24).
+    #
+    # The even predicate above is the loader's rounding for the EVEN split
+    # only.  With an explicit vocab vector the loader splits the PADDED
+    # vocabulary in units of ``lcm(pad_unit, n)`` by ``partition_units``:
+    # 58,25,25 on TP3 gives 133440/57600/57408 rows for 248320 (pad 128, all
+    # of it in rank 2's tail).  Before this case the join refused that with
+    # W68, the leg became ``unjoinable`` and the first authoritative wake died
+    # with W4.  Still the tree's arithmetic and NOT a band: every width a whole
+    # number (>= 1) of the unit, the sum EXACTLY ``pad_vocab_size(full,
+    # unit)``, and only on the classes the loader pads -- an ordinary tensor
+    # that happens to sit on the unit grid is refused below.
+    def _ratio_padded(total_full: int, widths: Sequence[int]) -> bool:
+        n = len(widths)
+        if n < 2 or len(set(widths)) == 1:
+            return False  # one rank, or the even split (its own case above)
+        unit = ratio_vocab_pad_unit(n)
+        padded = _pad_vocab_size(total_full, unit)
+        return (all(int(w) >= unit and int(w) % unit == 0 for w in widths)
+                and sum(int(w) for w in widths) == padded
+                and padded > int(total_full))
+
+    if (same_cols and whole.tensor_class in VOCAB_PADDED_CLASSES
+            and all(p.tensor_class == whole.tensor_class for p in cut)
+            and _ratio_padded(w_rows, rows)):
+        return wx.ROWS, sum(rows), w_cols, tuple(rows), sum(rows) - w_rows
+
     # THE MIXED-FUSED FALLBACK (#1384).  Only reached once all five outer
     # tests above have already failed, so every geometry that used to
     # classify (kv >= tp: Q and KV split TOGETHER, no replication skew, the
@@ -773,7 +837,12 @@ def _axis_of(name: str, whole: ManifestPiece,
         f"rows or {_pad_vocab_size((w_cols + len(cut) - 1) // len(cut))} "
         f"columns, the tree's OWN per-rank rounding at pad unit "
         f"{vocab_pad_unit()}; a tolerance band here would read a genuine "
-        f"disagreement as padding) -- so the "
+        f"disagreement as padding), nor a RATIO-WEIGHTED padded vocabulary "
+        f"cut (--rank-vocab-ratio: on the classes "
+        f"{sorted(VOCAB_PADDED_CLASSES)} only, every rank a whole number of "
+        f"{ratio_vocab_pad_unit(len(cut))}-row units summing to exactly "
+        f"pad_vocab_size({w_rows}, {ratio_vocab_pad_unit(len(cut))}) = "
+        f"{_pad_vocab_size(w_rows, ratio_vocab_pad_unit(len(cut)))}) -- so the "
         f"two groups cannot both be describing the same tensor. Guessing "
         f"REPLICATED here is what made the shard cut invisible; the join "
         f"refuses instead."
