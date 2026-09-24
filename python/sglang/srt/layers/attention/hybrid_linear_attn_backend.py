@@ -123,7 +123,9 @@ class MambaAttnBackendBase(AttentionBackend):
         self._cuda_graph_max_bs: int = 0
         self.conv_states_shape: tuple[int, int] = None
         # P prefill graph (full backend, plain EXTEND): static query_start_loc
-        # and state-index buffers per request-slot count. Deliberately NOT the
+        # and state-index buffers per (request-slot count, captured token
+        # bucket) -- every captured bucket owns its pair, see
+        # _extend_graph_buffers. Deliberately NOT the
         # decode lists above: the prefill runner captures BEFORE the decode
         # runner (model_runner.init_cuda_graphs), and init_cuda_graph_state
         # APPENDS -- sharing those lists would shift every decode bucket by
@@ -349,11 +351,27 @@ class MambaAttnBackendBase(AttentionBackend):
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
         )
 
-    def _extend_graph_buffers(self, slots: int):
+    def _extend_graph_buffers(self, slots: int, bucket: Optional[int] = None):
         """(query_start_loc [slots+1] int32, state indices [slots] int32) for
-        a full prefill graph with ``slots`` request slots; allocated once,
-        outside any capture, and refreshed IN PLACE on every replay."""
-        bufs = self._extend_graph_static.get(slots)
+        ONE captured full prefill graph: keyed by its request-slot count AND
+        its token bucket (``forward_batch.prefill_graph_bucket``, set by the
+        prefill runner at capture and at replay). Allocated once, outside any
+        capture, and refreshed IN PLACE on every replay of that bucket.
+
+        Per bucket, not per slot count (xsn434, --p-prefill-graph-tiny 16): a
+        pair shared by several buckets also shares FLA's chunk tables, which
+        are pinned to the query_start_loc OBJECT and computed once from the
+        content it holds at its first capture (fla/index.py) -- so the 16-token
+        graph was captured on the 512 bucket's chunk grid (8 chunk programs
+        for at most one live chunk) and an ``h`` sized for 8 chunks. The FLA
+        kernels bound themselves by the live length, so that stays in bounds
+        (test_p_prefill_graph_gdn_baked_grid_0924, two-bucket case), but no
+        bucket after the first owned its GDN metadata. One pair per bucket:
+        each graph owns its buffers and its tables, sized for its own bucket.
+        ``bucket`` None (a caller that does not name it) keeps the per-slot
+        key."""
+        key = (int(slots), None if bucket is None else int(bucket))
+        bufs = self._extend_graph_static.get(key)
         if bufs is None:
             bufs = (
                 torch.zeros((slots + 1,), dtype=torch.int32, device=self.device),
@@ -361,7 +379,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     (slots,), self.pad_slot_id, dtype=torch.int32, device=self.device
                 ),
             )
-            self._extend_graph_static[slots] = bufs
+            self._extend_graph_static[key] = bufs
         return bufs
 
     def _extend_graph_metadata(
@@ -402,7 +420,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 "by the full prefill graph's EXTEND metadata."
             )
         slots = int(forward_batch.batch_size)
-        qsl, state_idx = self._extend_graph_buffers(slots)
+        qsl, state_idx = self._extend_graph_buffers(
+            slots, getattr(forward_batch, "prefill_graph_bucket", None)
+        )
         # Real rows are the ones with a nonzero HOST seq_len (sentinels carry
         # 0). Host tensor or list: no device sync.
         seq_lens_cpu = forward_batch.seq_lens_cpu

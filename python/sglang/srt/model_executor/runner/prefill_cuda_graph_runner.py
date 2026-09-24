@@ -778,6 +778,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # the start locations, so it needs the slot-padded vector too
             # (sentinel starts = the real token count, set in load_batch).
             padded_view.extend_start_loc = s["extend_start_loc"][:r]
+            # The bucket whose graph replays (num_tokens is the padded bucket
+            # here, not the live count): its OWN static GDN metadata, the same
+            # objects its capture pinned (capture_one_shape).
+            padded_view.prefill_graph_bucket = int(num_tokens)
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
         if not self.use_captured_attn_metadata:
@@ -1153,6 +1157,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        # The captured bucket, for the backends that keep static metadata PER
+        # GRAPH (the GDN query_start_loc / state indices and the FLA chunk
+        # tables pinned to them, hybrid_linear_attn_backend._extend_graph_
+        # buffers): the replay path names the same bucket.
+        forward_batch.prefill_graph_bucket = int(num_tokens)
         if self._is_full_backend:
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
         else:
