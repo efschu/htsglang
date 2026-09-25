@@ -5093,7 +5093,8 @@ def _env_knobs(ns) -> Dict[str, object]:
         # 27B FP8: one byte layout on every rank of BOTH groups (the two
         # groups flip bytes into each other), hence gathered here once.
         "fp8_uniform_marlin": bool(getattr(ns, "fp8_uniform_marlin", False))
-        and checkpoint_quant_method(str(getattr(ns, "model", ""))) == "fp8",
+        and checkpoint_quant_method(str(getattr(ns, "model", "")))
+        in UNIFORM_MARLIN_QUANT_METHODS,
     }
 
 
@@ -8920,10 +8921,27 @@ FP8_UNIFORM_MARLIN_ENV = {
     "SGLANG_FORCE_FP8_MARLIN": "1",
 }
 
+#: The checkpoint families --fp8-uniform-marlin makes one byte layout for:
+#: ``fp8`` (Qwen/Qwen3.8-27B-FP8) and ``modelopt`` -- NVIDIA ModelOpt exports,
+#: e.g. RadixArk Qwen3.8-27B-NVFP4 (MIXED_PRECISION: FP8 per-tensor attention
+#: and GDN projections, NVFP4 g16 MLP and lm_head). Under ``modelopt`` the FP8
+#: linears take Marlin through SGLANG_FORCE_FP8_MARLIN (ModelOptFp8LinearMethod,
+#: upstream #31340) and the NVFP4 linears through the server argument below; on
+#: the 5090 both would otherwise run native kernels with other byte layouts
+#: (fp8 [N,K] + scalar scale; NVFP4 CUTLASS with 128x4-swizzled block scales).
+UNIFORM_MARLIN_QUANT_METHODS = ("fp8", "modelopt")
+
+#: The server argument that puts every NVFP4 linear of a ModelOpt checkpoint on
+#: Marlin (fp4_utils.initialize_fp4_gemm_config: ``auto`` resolves per rank --
+#: cutlass on sm_120, marlin on sm_80..89).
+FP4_UNIFORM_MARLIN_ARGV = ("--fp4-gemm-backend", "marlin")
+
 
 def checkpoint_quant_method(model_path: str) -> str:
     """``quantization_config.quant_method`` of the checkpoint's config.json (top
-    level or ``text_config``), lower case; ``""`` for none or unreadable."""
+    level or ``text_config``), lower case; for an export that states its
+    quantization only in ``hf_quant_config.json`` (older ModelOpt exports)
+    ``"modelopt"``; ``""`` for none or unreadable."""
     try:
         with open(os.path.join(str(model_path), "config.json")) as f:
             cfg = json.load(f)
@@ -8933,7 +8951,50 @@ def checkpoint_quant_method(model_path: str) -> str:
         qc = holder.get("quantization_config") if isinstance(holder, dict) else None
         if isinstance(qc, dict) and qc.get("quant_method"):
             return str(qc["quant_method"]).strip().lower()
+    try:
+        with open(os.path.join(str(model_path), "hf_quant_config.json")) as f:
+            hf = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    section = hf.get("quantization") if isinstance(hf, dict) else None
+    if isinstance(section, dict) and section.get("quant_algo"):
+        return "modelopt"
     return ""
+
+
+def uniform_marlin_argv(quant_method: str, uniform_marlin: bool) -> List[str]:
+    """The server argv BOTH groups get for --fp8-uniform-marlin: the NVFP4
+    Marlin backend for a ModelOpt checkpoint, nothing otherwise (FP8 is forced
+    through the environment)."""
+    if uniform_marlin and str(quant_method or "").lower() == "modelopt":
+        return list(FP4_UNIFORM_MARLIN_ARGV)
+    return []
+
+
+def with_uniform_marlin_argv(extra: str, argv: Sequence[str]) -> str:
+    """``--extra-p`` / ``--extra-d`` with :func:`uniform_marlin_argv` appended;
+    unchanged when it is empty or already carries the same backend. A different
+    --fp4-gemm-backend in the extras is REFUSED (W160): the flag promises one
+    layout on every rank and an operator-pinned backend would break it."""
+    if not argv:
+        return extra
+    toks = shlex.split(extra or "")
+    flag, value = argv[0], argv[1]
+    for i, tok in enumerate(toks):
+        got = None
+        if tok == flag and i + 1 < len(toks):
+            got = toks[i + 1]
+        elif tok.startswith(flag + "="):
+            got = tok.split("=", 1)[1]
+        if got is None:
+            continue
+        if got == value:
+            return extra
+        raise Weg2LaunchRefused(
+            "W160 Weg2Fp8LayoutRefused: --fp8-uniform-marlin puts every NVFP4 linear "
+            "on Marlin (%s %s) on BOTH groups, but the group extras pin %s %s -- one "
+            "tensor would have two byte layouts across the flip" % (flag, value, flag, got))
+    return " ".join(shlex.quote(t) for t in toks + list(argv))
 
 
 def fp8_layout_decision(
@@ -8951,21 +9012,40 @@ def fp8_layout_decision(
       native per-card layouts never meet, nothing to force; named, not forced.
     """
     qm = str(quant_method or "").lower()
-    if qm != "fp8":
+    if qm not in UNIFORM_MARLIN_QUANT_METHODS:
         if uniform_marlin:
             return {}, ("WEG2 FP8-UNIFORM-MARLIN inert: the checkpoint's quant_method is %r, "
-                        "not fp8 -- no environment added" % (qm or "none"))
+                        "not one of %s -- no environment added"
+                        % (qm or "none", "/".join(UNIFORM_MARLIN_QUANT_METHODS)))
         return {}, None
     if uniform_marlin:
+        if qm == "modelopt":
+            layout = ("FP8 linears Marlin int32 [K/16,4N] + per-channel scales [1,N], "
+                      "NVFP4 linears Marlin int32 [K/16,2N] + fp8 scales [K/16,N] via "
+                      "server argv %s on both groups; the 5090 gives up its native "
+                      "FP8 and NVFP4 CUTLASS GEMMs for it" % " ".join(FP4_UNIFORM_MARLIN_ARGV))
+        else:
+            layout = ("Marlin int32 [K/16,4N] + group scales [K/128,N] on the 5090 as on "
+                      "the 3080s; the 5090 gives up its native block-FP8 GEMM for it")
         return dict(FP8_UNIFORM_MARLIN_ENV), (
-            "WEG2 FP8-UNIFORM-MARLIN on (--fp8-uniform-marlin): %s on every rank of "
-            "BOTH groups -- one byte layout for the flip exchange (Marlin int32 "
-            "[K/16,4N] + group scales [K/128,N] on the 5090 as on the 3080s; the "
-            "5090 gives up its native block-FP8 GEMM for it); the Marlin lock "
-            "workspace is booked local_scratch and re-zeroed after every weights "
-            "resume (rank line 'WEG2-RESUME local-scratch zeroed=')"
-            % " ".join("%s=%s" % kv for kv in sorted(FP8_UNIFORM_MARLIN_ENV.items())))
+            "WEG2 FP8-UNIFORM-MARLIN on (--fp8-uniform-marlin, %s checkpoint): %s on "
+            "every rank of BOTH groups -- one byte layout for the flip exchange (%s); "
+            "the Marlin lock workspace is booked local_scratch and re-zeroed after "
+            "every weights resume (rank line 'WEG2-RESUME local-scratch zeroed=')"
+            % (qm, " ".join("%s=%s" % kv for kv in sorted(FP8_UNIFORM_MARLIN_ENV.items())),
+               layout))
     if str(weight_source) == WEIGHT_SOURCE_EXCHANGE:
+        if qm == "modelopt":
+            raise Weg2LaunchRefused(
+                "W160 Weg2Fp8LayoutRefused: the checkpoint is a ModelOpt export "
+                "(quant_method modelopt: FP8 and/or NVFP4 linears) and --weg2-weight-source "
+                "exchange moves weight BYTES card to card, but both kernel choices are "
+                "rank-local: a 3080 repacks to Marlin (FP8 int32 [K/16,4N], NVFP4 int32 "
+                "[K/16,2N] + fp8 scales [K/16,N]), the 5090 keeps native layouts (fp8 "
+                "[N,K] + scalar scale; NVFP4 CUTLASS with swizzled block scales). One "
+                "tensor would have two layouts and the flip would copy one onto the "
+                "other. Pass --fp8-uniform-marlin (Marlin on every rank, one layout), or "
+                "run --weg2-weight-source ring.")
         raise Weg2LaunchRefused(
             "W160 Weg2Fp8LayoutRefused: the checkpoint is FP8 (quant_method fp8) and "
             "--weg2-weight-source exchange moves weight BYTES card to card, but the "
@@ -8974,9 +9054,9 @@ def fp8_layout_decision(
             "weight_scale_inv. One tensor would have two layouts and the flip would "
             "copy one onto the other. Pass --fp8-uniform-marlin (Marlin on every "
             "rank, one layout), or run --weg2-weight-source ring.")
-    return {}, ("WEG2 FP8 native per-card layouts under --weg2-weight-source %s: each "
+    return {}, ("WEG2 %s native per-card layouts under --weg2-weight-source %s: each "
                 "group refills its own bytes on its own card, no byte crosses a card "
-                "boundary, nothing forced" % weight_source)
+                "boundary, nothing forced" % (qm.upper(), weight_source))
 
 
 def p_cut_calibration_line(model_path: str, quant_method: str) -> Optional[str]:
@@ -8998,8 +9078,8 @@ def p_cut_calibration_line(model_path: str, quant_method: str) -> Optional[str]:
         return None
     return ("WEG2 P-CUT UNCALIBRATED %s checkpoint %s: %s. The P cut of this boot is "
             "the pinned --pp-layer-ratio / --pp-stage-ratio or the INT8 incumbent "
-            "%s -- per-layer costs of %s differ per card (FP8 runs Marlin W8A16 on "
-            "both kinds under --fp8-uniform-marlin), so measure it: #PGAP ladder, "
+            "%s -- per-layer costs of %s differ per card (under --fp8-uniform-marlin "
+            "every rank runs Marlin: FP8 W8A16, NVFP4 W4A16), so measure it: #PGAP ladder, "
             "then weg2/tools/pcut_refit.py or --pp-cut-stage-fit with THIS "
             "checkpoint's P log" % (qm, dg[:12], rec_why, _csv(P_PP_STAGE_RATIO_SCORES), qm))
 
@@ -11430,10 +11510,12 @@ def build_parser() -> argparse.ArgumentParser:
              "exchange can move bytes between them; the 5090 gives up its native "
              "block-FP8 GEMM for it. Marlin's per-card lock workspace is booked "
              "local_scratch by the exchange coverage and re-zeroed after every "
-             "weights resume (weight_exchange.zero_local_scratch). Without it an "
-             "FP8 checkpoint under --weg2-weight-source exchange is refused (W160). "
-             "Inert on a non-FP8 checkpoint; default off = argv and env "
-             "byte-identical.")
+             "weights resume (weight_exchange.zero_local_scratch). Also a ModelOpt "
+             "checkpoint (quant_method modelopt, e.g. RadixArk Qwen3.8-27B-NVFP4): "
+             "its FP8 linears the same way, its NVFP4 linears through "
+             "--fp4-gemm-backend marlin on both groups. Without it such a checkpoint "
+             "under --weg2-weight-source exchange is refused (W160). Inert on any "
+             "other checkpoint; default off = argv and env byte-identical.")
     ap.add_argument(
         "--p-prefill-graph-tiny", default="", metavar="TOKENS[,TOKENS]",
         help="Only with --p-prefill-graph (27B line). Empty (the default) = off: "
@@ -12811,6 +12893,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         bool(getattr(ns, "fp8_uniform_marlin", False)))
     if _fp8_line:
         log(_fp8_line)
+    # RadixArk NVFP4 (ModelOpt): the NVFP4 linears' Marlin backend is a SERVER
+    # argument, appended to both groups' extras here, before any argv is built.
+    _um_argv = uniform_marlin_argv(_quant, bool(getattr(ns, "fp8_uniform_marlin", False)))
+    if _um_argv:
+        ns.extra_p = with_uniform_marlin_argv(ns.extra_p, _um_argv)
+        ns.extra_d = with_uniform_marlin_argv(ns.extra_d, _um_argv)
+        log("WEG2 FP8-UNIFORM-MARLIN argv for BOTH groups: %s (--extra-p now %r, "
+            "--extra-d now %r)" % (" ".join(_um_argv), ns.extra_p, ns.extra_d))
     _calib_line = p_cut_calibration_line(str(ns.model), _quant)
     if _calib_line:
         log(_calib_line)
