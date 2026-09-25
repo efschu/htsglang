@@ -145,6 +145,10 @@ class _Bag:
         f._d_admissions = 0
         f._x_r_d_src = "none yet"
         f.x_floor_tokens = 4096
+        # H84: mirrors the constructor (no --x-ceiling-tokens: the ceiling is
+        # the start X, D's own W50 riegel).
+        f.x_start_tokens = x
+        f.x_ceiling_tokens = x
         f.flip_min_work_tokens = x
         f._x_min_work_follows = True
         f._x_since_resolve = 0

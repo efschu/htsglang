@@ -975,6 +975,49 @@ def usage_of_stream_tail(tail: bytes) -> Tuple[int, int, int, bool]:
     return 0, 0, 0, False
 
 
+def d_prefill_seconds(body: Any) -> Optional[float]:
+    """H84: D's OWN prefill time for this request, or None.
+
+    Group D reports ``weg2_prefill_s`` -- scheduler forward entry to prefill
+    finished: every chunk of a chunked prefill, no queue wait, no decode -- in
+    ``meta_info`` on ``/generate`` and in ``sglext`` on the OpenAI wire. None
+    when the body carries neither; the leg then yields NO r_D sample, never
+    the leg-2 wall as a stand-in.
+    """
+    if not isinstance(body, dict):
+        return None
+    for holder in (body.get("meta_info"), body.get("sglext")):
+        if isinstance(holder, dict) and holder.get("weg2_prefill_s") is not None:
+            try:
+                s = float(holder["weg2_prefill_s"])
+            except (TypeError, ValueError):
+                return None
+            return s if s > 0 else None
+    return None
+
+
+def r_d_probe(uncached: int, prefill_s: Optional[float],
+              min_uncached: int) -> Tuple[Optional[float], str]:
+    """H84: ``(r_D, "sample")`` or ``(None, why)`` for ONE solo leg 2 on D.
+
+    r_D = uncached / D's own prefill time. THE LEG-2 WALL IS NOT A PREFILL
+    TIME: it carries the decode of the answer, and on a P-routed leg 2 it
+    prices a 1-4 token tail extend as a whole request. Measured on boot x177:
+    683 tokens over an 8.77 s wall read 78 tok/s while D prefilled them in
+    3.17 s (215 tok/s); ``1 / 4.21 s`` entered the same median; X stuck at its
+    4096 floor (`X RE-SOLVE ... r_D=78`) against D's honest ~1,036 tok/s warm.
+
+    ``why`` is ``no_prefill_time`` (D sent no time) or ``short`` (an extent
+    below ``min_uncached`` is dominated by D's fixed per-request cost, x177:
+    48-64 tokens took 0.87-1.23 s).
+    """
+    if prefill_s is None or prefill_s <= 0:
+        return None, "no_prefill_time"
+    if uncached < max(1, int(min_uncached)):
+        return None, "short"
+    return uncached / prefill_s, "sample"
+
+
 #: H61 (boot fnFL2x165, 2026-09-24): the markers that say the client has
 #: ALREADY been sent the end of the answer. OpenAI wire: a chunk whose
 #: ``finish_reason`` is a string (it is ``null`` while decoding). Anthropic
@@ -2444,7 +2487,8 @@ class Front:
                  ledger_arm: Optional[Dict[str, float]] = None,
                  admin_key_file: str = "",
                  wake_credit_plan: Optional[Dict[str, Any]] = None,
-                 vision: str = VISION_MODE_OFF):
+                 vision: str = VISION_MODE_OFF,
+                 x_ceiling_tokens: int = 0):
         # #1275: the key arrives as a PATH, never as an argv value. The groups
         # have no choice (`server_args` offers only `--admin-api-key`, so their
         # key is world-readable in /proc/<pid>/cmdline), but the front does, and
@@ -2611,6 +2655,16 @@ class Front:
         self._d_admissions = 0
         #: Where the last r_D sample came from, printed with every X decision.
         self._x_r_d_src = "none yet"
+        # H84: THE LIVE X MAY NOT CROSS D'S OWN RIEGEL. The front's X is only
+        # the front's; D refuses by W50 on its own --tp-prefill-max-tokens, the
+        # START X unless the launcher raised it with --x-ceiling-tokens. An X
+        # re-solved above that routed 5-9k to D and D sent it back through P.
+        # So the ceiling is the flag (never below the start X), else the start
+        # X itself; and the start X is also the floor of the X-SOLO band.
+        self.x_start_tokens = self.tp_prefill_max_tokens
+        self.x_ceiling_tokens = max(self.x_start_tokens, int(x_ceiling_tokens or 0))
+        #: H84: band requests inside their X-SOLO window right now.
+        self._x_solo_waiting = 0
         # C8/K7: None = derive from the last completed flip in that direction.
         self.min_dwell_ms = None if min_dwell_ms is None else float(min_dwell_ms)
         # law 5 / C6: which group is awake when nothing is pending.
@@ -3746,6 +3800,19 @@ class Front:
                 "attached in P's processor and do not exist on D",
                 rid, route)
             route = "long"
+        # H84: THE BAND ABOVE THE START X GOES TO D ONLY AS A SINGLETON. A
+        # live X above the start X would send a burst of 4-8k prompts to D one
+        # after another -- NF's D is bs1, so x177's 8x4.2k burst (22.8 s
+        # batched over P) would take ~35 s. Below/at the start X and above the
+        # live X nothing changes; `x_route` is the X this request was actually
+        # routed on, and every line below prints it.
+        x_route = self.tp_prefill_max_tokens
+        if route == "short" and remainder > self.x_start_tokens:
+            if not await self._x_solo_admits(rid, remainder):
+                x_route = self.x_start_tokens
+                route = serviceable_route(remainder, carrier_est, x_route,
+                                          self.carrier_max_tokens,
+                                          carrier_exact=exact is not None)
         # THE COMPARED NUMBER IS PRINTED (#1290 round 2). The CARRIER-EXCEEDS
         # line below printed `est_prompt=... exact=None > carrier_max=...`,
         # and NEITHER of those is the value the branch compares -- `est_prompt`
@@ -3765,7 +3832,7 @@ class Front:
             "(THE COMPARED VALUE for carrier_max=%d: the WHOLE prompt's KV "
             "through the host staging pool, at CARRIER_CHARS_PER_TOKEN=%.1f) "
             "est_prompt=%d chars=%d (#1290)",
-            rid, route, remainder, self.tp_prefill_max_tokens, CHARS_PER_TOKEN,
+            rid, route, remainder, x_route, CHARS_PER_TOKEN,
             store_span, presence_src,
             carrier_est, "exact" if exact is not None else "estimate",
             self.carrier_max_tokens, CARRIER_CHARS_PER_TOKEN, est_prompt,
@@ -3832,7 +3899,7 @@ class Front:
         # tokenizer at the front.  D re-derives the real extent after
         # match_prefix and refuses by name there (L9/W31).
         logger.info("WEG2 X-ROUTE rid=%s est_uncached=%d X=%d (ESTIMATE, front pricing, no tokenizer)",
-                    rid, remainder, self.tp_prefill_max_tokens)
+                    rid, remainder, x_route)
         if self.awake == "D" and self.admit_d and self.state == "serving" and short_ok:
             seat = await self._acquire_short_seat(rid, est_prompt)
             if seat is not None:
@@ -3860,7 +3927,7 @@ class Front:
                 "WEG2-ROUTE rid=%s LONG -> P leg 1 (uncached=%d > X=%d, so D "
                 "cannot prefill it; carrier_est=%d <= carrier_max=%d, so P's "
                 "KV can come back to D) est_prompt=%d queue=%d",
-                rid, remainder, self.tp_prefill_max_tokens, carrier_est,
+                rid, remainder, x_route, carrier_est,
                 self.carrier_max_tokens, est_prompt, len(self.queue))
         if self.awake != "D" and short_ok:
             # L4/R-10: law 1 read literally means every arrival during a P
@@ -3926,6 +3993,59 @@ class Front:
         hand-off, not the decode."""
         if p is not None and p.posted_evt is not None and not p.posted_evt.is_set():
             p.posted_evt.set()
+
+    def _x_solo_busy(self) -> Optional[str]:
+        """H84: None when the system is otherwise EMPTY, else what is in it.
+
+        Empty = D serving and holding nothing -- the idle mirror's terms
+        (``D.outstanding``, a hand-off, ``_ready_for_d``) -- P's queue empty,
+        P holding no leg 1, and no other band request inside its window.
+        """
+        D = self.groups["D"]
+        if not (self.awake == "D" and self.admit_d and self.state == "serving"):
+            return f"d_not_serving(awake={self.awake},state={self.state},admit_d={self.admit_d})"
+        if D.outstanding:
+            return f"d_outstanding={len(D.outstanding)}"
+        if self._handoff_in_flight():
+            return f"d_handoff={self._handoff_in_flight()}"
+        if self._ready_for_d:
+            return f"ready_for_d={len(self._ready_for_d)}"
+        if self.queue:
+            return f"p_queue={len(self.queue)}"
+        if self.groups["P"].outstanding:
+            return f"p_outstanding={len(self.groups['P'].outstanding)}"
+        if self._x_solo_waiting:
+            return f"solo_window_busy={self._x_solo_waiting}"
+        return None
+
+    async def _x_solo_admits(self, rid: str, uncached: int) -> bool:
+        """H84: may this BAND request (start X < uncached <= live X) go to D?
+
+        Only as a singleton: the system is empty now (:meth:`_x_solo_busy`)
+        and nothing arrives for ``SGLANG_WEG2_X_SOLO_WINDOW_MS`` -- the request
+        is held that long and decided at the window's end. Anything in flight
+        at arrival decides at once (it cannot be a singleton). False = route it
+        with the start X, i.e. to P, as before the live X could rise.
+        """
+        window_ms = max(0, int(envs.SGLANG_WEG2_X_SOLO_WINDOW_MS.get()))
+        busy = self._x_solo_busy()
+        if busy is None:
+            arrivals0 = self._rid
+            self._x_solo_waiting += 1
+            try:
+                await asyncio.sleep(window_ms / 1000.0)
+            finally:
+                self._x_solo_waiting -= 1
+            if self._rid != arrivals0:
+                busy = f"arrival_in_window={self._rid - arrivals0}"
+            else:
+                busy = self._x_solo_busy()
+        self.counters["x_solo_d" if busy is None else "x_solo_p"] += 1
+        logger.info("WEG2 X-SOLO rid=%s uncached=%d X_live=%d verdict=%s reason=%s "
+                    "(band floor = start X %d, window_ms=%d; verdict=p routes on the start X)",
+                    rid, uncached, self.tp_prefill_max_tokens, "d" if busy is None else "p",
+                    busy or "solo", self.x_start_tokens, window_ms)
+        return busy is None
 
     async def _acquire_short_seat(self, rid: str, est_tokens: int = 0) -> Optional[Seat]:
         """A SHORT arrival's seat -- behind the BATCH gate (C5/R-16).
@@ -4497,10 +4617,23 @@ class Front:
                 _solo = (_solo_entry
                          and self._d_admissions == _solo_adm0
                          and len(g.outstanding) == 1)
-                if _solo and _unc > 0 and _w > 0:
-                    self._x_r_d_src = f"solo leg2 verdict={verdict}"
-                    self.note_x_sample("r_d", _unc / _w)
-                elif _unc > 0 and _w > 0:
+                if _solo and _unc > 0:
+                    # H84: THE RATE IS D'S OWN PREFILL TIME, never this wall
+                    # (the wall holds the decode; see `r_d_probe`).
+                    _pfs = d_prefill_seconds(js)
+                    _r_d, _why = r_d_probe(_unc, _pfs, envs.SGLANG_WEG2_X_RD_MIN_UNCACHED.get())
+                    logger.info("WEG2 X R_D rid=%s uncached=%d d_prefill_s=%s wall=%.2fs verdict=%s "
+                                "r_D=%s (r_D = uncached / d_prefill_s; the wall is shown, never used)",
+                                rid, _unc, "none" if _pfs is None else f"{_pfs:.3f}", _w, _why,
+                                "-" if _r_d is None else f"{_r_d:.0f}")
+                    if _r_d is not None:
+                        self._x_r_d_src = f"d_prefill_s verdict={verdict}"
+                        self.note_x_sample("r_d", _r_d)
+                    elif _why == "short":
+                        self.counters["r_d_skipped_short"] += 1
+                    else:
+                        self.counters["r_d_skipped_no_prefill_time"] += 1
+                elif _unc > 0:
                     self.counters["r_d_skipped_concurrent"] += 1
                 if pt:
                     # #1324, as on the streamed branch above: `ct` is the
@@ -6094,8 +6227,11 @@ class Front:
             # alone, r_P is a drain's tokens over the drain's own wall. Passing
             # the units explicitly is what makes a future estimator swap fail
             # loudly instead of silently re-introducing (a).
-            x = derive_x_star(
-                flip_s, r_d, r_p, self.x_floor_tokens,
+            # H84: X* unfloored (floor 0 here), then clamped to
+            # [x_floor_tokens, x_ceiling_tokens] below, so the line can say
+            # which bound acted.
+            x_star = derive_x_star(
+                flip_s, r_d, r_p, 0,
                 unit_d=RATE_UNIT_GROUP_THROUGHPUT,
                 unit_p=RATE_UNIT_GROUP_THROUGHPUT,
             )
@@ -6111,18 +6247,26 @@ class Front:
                 len(s["r_d"]), len(s["r_p"]), len(s["flip_s"]),
             )
             return None
+        # H84: D refuses above its own riegel (W50), so the live X is clamped
+        # to it: [x_floor_tokens, x_ceiling_tokens], the ceiling winning.
+        x = min(max(x_star, self.x_floor_tokens), self.x_ceiling_tokens)
+        clamp = ("ceiling" if x_star > self.x_ceiling_tokens
+                 else "floor" if x_star < self.x_floor_tokens else "none")
         self.tp_prefill_max_tokens = x
         if self._x_min_work_follows:
             self.flip_min_work_tokens = x
         self.counters["x_resolves"] += 1
         logger.info(
-            "WEG2 X RE-SOLVE n=%d X=%d <- X_prev=%d r_D=%.0f r_P=%.0f flip_s=%.2f "
+            "WEG2 X RE-SOLVE n=%d X=%d <- X_prev=%d X*=%d clamp=%s floor=%d "
+            "ceiling=%d (D's W50 riegel: --x-ceiling-tokens, else the start X) "
+            "r_D=%.0f r_P=%.0f flip_s=%.2f "
             + self.x_flip_s_provenance() +
             " source=live (medians over this boot's own samples: %d r_D, %d r_P "
             "drains, %d flips, window %d; seeded from %s. Both rates are "
             "group_throughput -- tokens the group moved over the wall it was "
             "busy -- so 1/r_D-1/r_P is a time-per-token difference; #1271)",
-            len(s["r_p"]), x, prev, r_d, r_p, flip_s,
+            len(s["r_p"]), x, prev, x_star, clamp, self.x_floor_tokens,
+            self.x_ceiling_tokens, r_d, r_p, flip_s,
             len(s["r_d"]), len(s["r_p"]), len(s["flip_s"]), self.X_SAMPLE_WINDOW,
             self._x_seed_note,
         )
@@ -6939,6 +7083,12 @@ def main():
                          "from this boot's own rate and flip lines (floor = D's --chunked-prefill-size); "
                          "the front's use of it is an ESTIMATE (no tokenizer here) and D enforces it "
                          "for real after match_prefix (W31).")
+    ap.add_argument("--x-ceiling-tokens", type=int, default=0,
+                    help="H84: the ceiling of the live X re-solve = group D's own "
+                         "--tp-prefill-max-tokens (its W50 riegel), written by the launcher's "
+                         "--x-ceiling-tokens. 0 = the start X (--tp-prefill-max-tokens), so a front "
+                         "without it never routes above D's riegel. Requests between the start X "
+                         "and the live X go to D only as singletons (WEG2 X-SOLO).")
     ap.add_argument("--flip-min-work-tokens", type=int, default=None,
                     help="C7/K6: queued prompt tokens that make a D->P round trip worth its cost. "
                          "Defaults to --tp-prefill-max-tokens because it IS the same break-even "
@@ -7042,7 +7192,8 @@ def main():
                   measured_record=args.measured_record, commit=args.commit,
                   ledger_arm=json.loads(args.ledger_arm) if args.ledger_arm else {},
                   admin_key_file=args.admin_key_file,
-                  vision=args.vision)
+                  vision=args.vision,
+                  x_ceiling_tokens=args.x_ceiling_tokens)
     # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
     # against. Kept from weg2/idle-anon-0908.
     if args.anon_preboot_bytes > 0:

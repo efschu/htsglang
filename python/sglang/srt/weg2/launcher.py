@@ -1512,6 +1512,33 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> 
     ), False)
 
 
+def resolve_x_ceiling(ceiling_flag: Optional[int], x_tokens: int) -> Tuple[int, int, str]:
+    """H84: ``(D's --tp-prefill-max-tokens, the front's --x-ceiling-tokens or 0, line)``.
+
+    D refuses by W50 on its OWN ``--tp-prefill-max-tokens``; the front routes on
+    its LIVE X. Without the flag both stay the start X, byte-identical to before.
+    With it, D's riegel is raised to the ceiling and the front is told the same
+    number, so the live X may rise up to exactly what D accepts and never above
+    it -- raising only the front's X sent 5-9k to D, D answered W50 and the
+    request went round through P. A ceiling below the start X is lifted to it:
+    D's riegel may never sit below what the front already routes to D. Group P
+    carries no ``--tp-prefill-max-tokens`` and is not touched.
+    """
+    asked = int(ceiling_flag or 0)
+    x = int(x_tokens)
+    if asked <= 0:
+        return x, 0, (f"X CEILING: off (--x-ceiling-tokens 0) -- group D --tp-prefill-max-tokens {x} "
+                      f"= the front's start X, which is also the ceiling of the front's live X")
+    ceiling = max(asked, x)
+    lifted = "" if ceiling == asked else f" (asked {asked} < start X {x}: lifted to the start X)"
+    return ceiling, ceiling, (
+        f"X CEILING: --x-ceiling-tokens {ceiling}{lifted} -- group D --tp-prefill-max-tokens "
+        f"{ceiling} (its W50 riegel; D prefills in --chunked-prefill-size {CHUNKED_PREFILL_TOKENS} "
+        f"chunks); front --tp-prefill-max-tokens {x} (start X, unchanged) --x-ceiling-tokens "
+        f"{ceiling}: the live X re-solves within [{CHUNKED_PREFILL_TOKENS}, {ceiling}] and a request "
+        f"between {x} and the live X goes to D only as a singleton (WEG2 X-SOLO); group P unchanged")
+
+
 def resolve_pool_floor(
     override: Optional[int],
 ) -> Tuple[Optional[int], Optional[Tuple[int, ...]], str]:
@@ -12953,6 +12980,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "2*flip_s/(1/r_D - 1/r_P) from this rig's own front-log rate and flip "
                          "lines, else the recorded PRE-BARLINK pair; floor = --chunked-prefill-size. "
                          "The derivation and its three inputs are printed at launch.")
+    ap.add_argument("--x-ceiling-tokens", type=int, default=0,
+                    help="H84: group D's --tp-prefill-max-tokens (its W50 riegel) and the ceiling "
+                         "of the front's live X re-solve. 0 (default) = off: D and the front both "
+                         "keep the start X, argv unchanged. >0: D starts with this riegel, the "
+                         "front keeps its start X and gets --x-ceiling-tokens, so the live X may "
+                         "rise up to it; a request between the start X and the live X goes to D "
+                         "only when nothing else is in flight (WEG2 X-SOLO). Lifted to the start X "
+                         "when below it. Group P is not affected.")
     ap.add_argument("--flip-min-work-tokens", type=int, default=None,
                     help="K6: queued tokens that make a D->P round trip worth its cost. Unset = X.")
     ap.add_argument("--min-dwell-ms", type=float, default=None,
@@ -14437,6 +14472,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # 0 = derive (the flag's default is the 4096 pin since 2026-09-15).
     x_seed = resolve_x(ns.tp_prefill_max_tokens or None, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS)
     x_tokens, x_provenance = x_seed.tokens, x_seed.provenance
+    # H84: D's riegel and the front's live-X ceiling, one number (0 = off).
+    d_x_tokens, front_x_ceiling, x_ceiling_line = resolve_x_ceiling(ns.x_ceiling_tokens, x_tokens)
     flip_min_work_tokens = int(ns.flip_min_work_tokens) if ns.flip_min_work_tokens is not None else x_tokens
     idle_layout_front = "P" if ns.idle_layout == "pp" else "D"
     # THE OPERATING POINT, WITH ITS PROVENANCE, ON EVERY BOOT RECORD. The pair
@@ -14459,13 +14496,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"{'derived from the last flip in that direction' if ns.min_dwell_ms is None else ns.min_dwell_ms}")
     log(f"X PROVENANCE: {x_provenance}; --flip-min-work-tokens {flip_min_work_tokens} "
         f"({'= X, the same break-even at aggregate granularity' if ns.flip_min_work_tokens is None else 'operator override'})")
+    log(x_ceiling_line)
 
     log(f"SCHEDULING FLAGS AS EMITTED -- group P: --max-running-requests {p_bs} "
         f"--max-kv-per-request {max_kv_per_request} (no --tp-prefill-max-tokens: the PP prefill "
         f"group is not the one law 4 bounds); group D: --max-running-requests {d_bs} "
-        f"--max-kv-per-request {max_kv_per_request} --tp-prefill-max-tokens {x_tokens}; "
+        f"--max-kv-per-request {max_kv_per_request} --tp-prefill-max-tokens {d_x_tokens}; "
         f"front: --p-concurrency {p_bs} --d-bs {d_bs} --tp-prefill-max-tokens {x_tokens} "
-        f"--flip-min-work-tokens {flip_min_work_tokens} --idle-layout {idle_layout_front} "
+        + (f"--x-ceiling-tokens {front_x_ceiling} " if front_x_ceiling > 0 else "")
+        + f"--flip-min-work-tokens {flip_min_work_tokens} --idle-layout {idle_layout_front} "
         f"--drain-deadline-s {ns.drain_deadline_s} --fairness-w-s {ns.fairness_w_s}"
         + ("" if ns.min_dwell_ms is None else f" --min-dwell-ms {ns.min_dwell_ms}"))
 
@@ -15836,13 +15875,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
                            if str(k).startswith("SGLANG_"))
             log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns)), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns)), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
             flip_min_work_tokens, idle_layout_front, admin_key_file=admin_key_file,
             wake_credit_plan=_WAKE_CREDIT_FRONT_PLAN,
-            anon_preboot_bytes=anon_preboot_bytes, front_host=ns.front_host)))
+            anon_preboot_bytes=anon_preboot_bytes, front_host=ns.front_host,
+            x_ceiling_tokens=front_x_ceiling)))
         log("DRY-RUN complete: nothing started, mounted, armed or written")
         return 0
     state.pids["P"] = spec_p.pid
@@ -15952,7 +15992,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
                        if str(k).startswith("SGLANG_"))
         log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns)), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns)), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
@@ -16229,6 +16269,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         admin_key_file=admin_key_file,
         anon_preboot_bytes=anon_preboot_bytes,
         front_host=ns.front_host,
+        x_ceiling_tokens=front_x_ceiling,
     )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
@@ -16410,7 +16451,8 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
                    ledger_arm: Optional[Dict[str, float]] = None,
                    admin_key_file: str = "",
                    anon_preboot_bytes: int = 0,
-                   front_host: str = DEFAULT_FRONT_HOST) -> List[str]:
+                   front_host: str = DEFAULT_FRONT_HOST,
+                   x_ceiling_tokens: int = 0) -> List[str]:
     """ONE front argv builder, so --dry-run prints exactly what a real boot runs.
 
     C2/R-6: the front is TOLD the two bs numbers and X. It never asks a
@@ -16447,6 +16489,10 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
     # takes only --admin-api-key) but the front does, so it uses it.
     if admin_key_file:
         argv += ["--admin-key-file", admin_key_file]
+    # H84: the live X's ceiling = group D's riegel (resolve_x_ceiling); 0 = off
+    # and the argv stays byte-identical to the one before the flag existed.
+    if x_ceiling_tokens > 0:
+        argv += ["--x-ceiling-tokens", str(int(x_ceiling_tokens))]
     # #1269 fix 4 follow-up: THE PRE-BOOT ANON BASELINE, MEASURED ONCE AND
     # CARRIED. The W22 guard splits its reading into `sglang=` and `foreign=`
     # by subtracting this baseline, and the split is only subtractable because

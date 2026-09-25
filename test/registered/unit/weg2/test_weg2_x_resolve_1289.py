@@ -91,6 +91,11 @@ def _front(x=SB5F_SHIPPED_X):
     f._x_last_missing = []
     # #1291: r_D now carries provenance too, so the stub carries its source.
     f._x_r_d_src = "none yet"
+    # H84: sb5f's re-solve RISES above the seed, so the stub models a boot
+    # with --x-ceiling-tokens; the default ceiling (the start X, D's riegel)
+    # is pinned in test_weg2_x_live_ceiling_h84.
+    f.x_start_tokens = x
+    f.x_ceiling_tokens = 262144
     f.counters = collections.Counter()
     # TOLERANT ON PURPOSE, and only here: this helper must also construct
     # against the PARENT commit `4f762260ba`, where `x_flip_s_provenance` does

@@ -883,6 +883,16 @@ class Envs:
     # hinted to P (/weg2/ple_prefetch_hint) so P's first-chunk PLE read runs
     # while P wakes. Off = P learns of the request at its leg 1 only.
     SGLANG_WEG2_PLE_ADMIT_HINT = EnvBool(True)
+    # H84 (Weg-2 front, live X): an r_D sample is D's own prefill time
+    # (meta_info weg2_prefill_s) over the uncached extent, and only from an
+    # extent of at least this many tokens -- below it the fixed per-request
+    # cost dominates (x177: 48-64 tokens took 0.87-1.23 s on D).
+    SGLANG_WEG2_X_RD_MIN_UNCACHED = EnvInt(2048)
+    # H84 (Weg-2 front, X-SOLO): a request between the start X and the live X
+    # goes to D only when nothing else arrives within this window and nothing
+    # is in flight; otherwise it is routed with the start X (to P). NF D is
+    # bs1, so a burst served serially on D would be slower than P's batch.
+    SGLANG_WEG2_X_SOLO_WINDOW_MS = EnvInt(250)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     # Weight loader: read safetensors tensors with pread() instead of mmap
     # page faults (ZFS: ~0.5 GB/s per rank through mmap, ~3 GB/s through

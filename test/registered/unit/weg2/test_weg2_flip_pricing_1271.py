@@ -133,6 +133,12 @@ class RollingResolve(CustomTestCase):
         f._x_last_missing = []
         # #1291: r_D now carries provenance too, so the stub carries its source.
         f._x_r_d_src = "none yet"
+        # H84: these cases pin the re-solve ARITHMETIC, whose X rises above
+        # the seed -- i.e. a boot with --x-ceiling-tokens. The ceiling itself
+        # (default = the start X, D's riegel) is pinned in
+        # test_weg2_x_live_ceiling_h84.
+        f.x_start_tokens = x
+        f.x_ceiling_tokens = 262144
         f.counters = collections.Counter()
         f.note_x_sample = Front.note_x_sample.__get__(f)
         f.resolve_x_live = Front.resolve_x_live.__get__(f)
