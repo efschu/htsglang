@@ -1,0 +1,26 @@
+# .dockerignore fuer den Build-KONTEXT ctx/<linie>-<sha10>/ -- ENTWURF (27B-Sitz R, 24.09.2026).
+# prepare_context.sh kopiert diese Datei in die Kontext-Wurzel (sie ersetzt dort die
+# Upstream-.dockerignore des Repos, die z.B. **/lib/ und *.so ausschliesst).
+#
+# Der Kontext ist KURATIERT (Whitelist-Kopie + flacher git-Klon), darum steht hier wenig.
+# WICHTIG: unter src/ darf nichts VERSIONIERTES ausgeschlossen werden -- jede fehlende
+# versionierte Datei machte den Baum im Image DIRTY (git status), und der Launcher stempelt
+# den Boot dann als DIRTY (launcher.py:12419); der Dockerfile-Schritt 4 bricht vorher ab.
+
+# Unversionierter Ballast
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+
+# Verteidigung in der Tiefe: Geheimnisse duerfen den Kontext nie erreichen (prepare_context.sh
+# kopiert nur Whitelist-Dateien und scannt zusaetzlich; diese Muster sind die dritte Linie).
+**/*.adminkey
+**/gpuq_booking.json
+**/GITHUB_PAT*
+**/.git-credentials
+**/.netrc
+**/*openrouter*key*
+**/*.pem
+!src/**/*.pem

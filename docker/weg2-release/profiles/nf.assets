@@ -1,0 +1,6 @@
+# Profil-Daten der NF-Linie ueber die festen Dateien hinaus (Census _graph/_computed, Korridor-Sample kopiert
+# prepare_context.sh selbst). Eine Rig-Datei je Zeile; im Image unter /opt/htsglang/profiles/nf/<name>.
+# x177-Form (weg2/boot_nf_bestform_0925_x177.sh): --wake-credit-reference-logs auf den gemessenen Wake-Kredit von fnFL2x162.
+/spinning/evidence-665-f1/boot_weg2_fnFL2x162_7517ff598d_0924_171421.P.log
+/spinning/evidence-665-f1/boot_weg2_fnFL2x162_7517ff598d_0924_171421.D.log
+/spinning/evidence-665-f1/boot_weg2_fnFL2x162_7517ff598d_0924_171421.front.log
