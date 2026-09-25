@@ -2335,7 +2335,10 @@ def _process_weights_after_loading_by_layer_chunk(
 
     # The shared dequant workspace (one per lane/device/dtype) is not a layer's
     # bytes: its growth is held back during the per-layer pass and allocated
-    # once afterwards, outside every chunk scope -- in the base weights tag.
+    # once afterwards, at its largest size, in the chunk tag of the layer whose
+    # request set that size (F1b, dequant_workspace_deferred) -- no longer in
+    # the base weights tag, where it was the one allocation of a layers-only PP
+    # stage and the first P->D flip died on W106 (boot weg2rc6gg).
     with dequant_workspace_deferred():
         for name, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
