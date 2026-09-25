@@ -388,6 +388,14 @@ class TestDerivedWidth(CustomTestCase):
         self.assertEqual(comm.lse_merge_block_tokens(4096, [24], 256, 2, "a2a"), 0)
         self.assertEqual(comm.lse_merge_block_tokens(0, [12, 6, 6], 256, 2, "a2a"), 0)
 
+    def test_head_dim_zero_is_one_block_not_width_one(self):
+        # H86b (V2): head_dim 0 made the bound 0 bytes and max(1, 0 // per_tok) returned width 1 --
+        # 4096 one-row blocks per layer at a 4096 chunk. No geometry -> 0 (one block).
+        for mode in ("a2a", "ar"):
+            for hd in (0, -1):
+                self.assertEqual(comm.lse_merge_block_tokens(4096, [12, 6, 6], hd, 2, mode), 0, (mode, hd))
+        self.assertEqual(len(comm.lse_merge_token_spans(4096, 0)), 1)
+
     def test_bytes_model_bounds_the_real_allocations(self):
         """Sum every new storage the ONE-SHOT body allocates (TorchDispatchMode)
         and demand it stays under the model's per-token figure x T."""
@@ -577,6 +585,24 @@ class TestDispatcherAndSites(CustomTestCase):
             self.assertEqual(
                 fb._resolve_dcp_merge_block_tokens(self._runner(None, chunk=-1), [12, 6, 6]),
                 comm.lse_merge_block_tokens(16384, [12, 6, 6], 256, 2, "a2a"))
+
+    def test_resolver_head_dim_zero_logs_and_does_not_block(self):
+        # H86b (V2): the DCP-MERGE-BLOCK line was bound to head_dim > 0 and stayed silent exactly when the
+        # geometry was missing. It must now speak, with block_tokens=0 and head_dim=0, and not raise.
+        from sglang.srt.layers.attention import flashinfer_backend as fb
+
+        runner = self._runner(None)
+        runner.model_config = mock.Mock(head_dim=0)
+        with mock.patch.object(comm, "lse_merge_mode", return_value="a2a"), \
+             mock.patch.object(comm, "weightless_kv_active", return_value=False), \
+             mock.patch.object(comm, "lse_merge_reduce_dtype", return_value="fp32"), \
+             mock.patch.object(fb, "_DCP_MERGE_BLOCK_LOGGED", set()):
+            with self.assertLogs(fb.logger, level="INFO") as cm:
+                self.assertEqual(fb._resolve_dcp_merge_block_tokens(runner, [12, 6, 6]), 0)
+        lines = [m for m in cm.output if "DCP-MERGE-BLOCK" in m]
+        self.assertEqual(len(lines), 1, cm.output)
+        self.assertIn("block_tokens=0 source=derived", lines[0])
+        self.assertIn("head_dim=0", lines[0])
 
     def test_server_arg_parses(self):
         import argparse

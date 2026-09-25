@@ -483,13 +483,19 @@ def lse_merge_block_tokens(
     answer is the same on every rank (the largest shard binds)."""
     counts = [int(c) for c in head_counts]
     W = len(counts)
-    if W <= 1 or int(budget_tokens) <= 0 or sum(counts) <= 0:
+    # head_dim <= 0 = no head geometry known: the bound (one full-head partial)
+    # is then 0 bytes and the old max(1, 0 // per_tok) returned width 1 --
+    # 4096 one-row blocks per layer at a 4096 chunk. No geometry -> no derived
+    # blocking (0 = one block); the resolver's DCP-MERGE-BLOCK line says so.
+    if W <= 1 or int(budget_tokens) <= 0 or sum(counts) <= 0 or int(head_dim) <= 0:
         return 0
     mode = mode or lse_merge_effective_mode()
     wire = 2 if lse_merge_reduce_dtype() == "bf16" else 4
     per_tok = lse_merge_bytes_per_token(
         mode, wire, sum(counts), max(counts), W, head_dim, out_itemsize
     )
+    if per_tok <= 0:
+        return 0
     ref = int(budget_tokens) * sum(counts) * int(head_dim) * int(out_itemsize)
     return max(1, ref // per_tok)
 

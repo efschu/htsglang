@@ -204,12 +204,17 @@ def _resolve_dcp_merge_block_tokens(model_runner, head_counts) -> int:
             )
         src = "flag (hand pin: planner debt)" if width > 0 else "flag 0 = OFF (diagnosis)"
     key = (width, tuple(counts), mode, wire, budget)
-    if key not in _DCP_MERGE_BLOCK_LOGGED and len(counts) > 1 and head_dim > 0:
+    # The line is NOT bound to head_dim > 0 (H86b/V2): a head_dim of 0 is exactly
+    # the case an operator must see, and it used to leave this line silent.
+    if key not in _DCP_MERGE_BLOCK_LOGGED and len(counts) > 1:
         _DCP_MERGE_BLOCK_LOGGED.add(key)
-        per_tok = lse_merge_bytes_per_token(
-            mode, wire, sum(counts), max(counts), len(counts), head_dim, out_itemsize
-        )
-        ref = budget * sum(counts) * head_dim * out_itemsize
+        if head_dim > 0 and sum(counts) > 0:
+            per_tok = lse_merge_bytes_per_token(
+                mode, wire, sum(counts), max(counts), len(counts), head_dim, out_itemsize
+            )
+        else:
+            per_tok = 0
+        ref = budget * sum(counts) * max(head_dim, 0) * out_itemsize
         logger.info(
             "DCP-MERGE-BLOCK block_tokens=%d source=%s mode=%s wire=%s heads=%s "
             "head_dim=%d budget=%d (%s) | one-shot working set %.1f KiB/token = "
