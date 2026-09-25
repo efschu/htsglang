@@ -19,6 +19,12 @@ there is no such transient, the hold only rides out one loop's jitter).
 The front recognises the message (:func:`is_intake_stall`), puts the request
 back at the HEAD of its queue, stops dispatching and flips to D; the request
 is prefilled in the next P phase, when the flip has emptied P's pool.
+
+H91a (25.09.2026): the premise "P keeps the backlog's device rows" no longer
+holds -- a finished prefill's rows are evictable (published to the host
+arena / L3 before a demotion). The watch is now consulted only for a request
+:func:`intake_verdict` calls impossible; a request that fits free + evictable
+rows stays queued and is admitted in order (weg2/p_intake.py).
 """
 
 from __future__ import annotations
@@ -35,6 +41,38 @@ TOO_LARGE_MARK = "WEG2-INTAKE-TOO-LARGE"
 
 #: Refused-with-empty-batch this long -> a stall, not a transient.
 HOLD_S_DEFAULT = 1.0
+
+#: H91a (25.09.2026) -- the three answers of :func:`intake_verdict`.
+#: The free + evictable rows cover the request: it is admitted in order.
+INTAKE_FITS = "fits"
+#: Short right now, but a write-through / load-back in flight frees rows.
+INTAKE_WAITS = "waits"
+#: No row this phase can give covers it: the stall (503, requeue, flip).
+INTAKE_IMPOSSIBLE = "impossible"
+
+
+def intake_verdict(*, need_tokens: int, pool_tokens: int, free_tokens: int,
+                   evictable_tokens: int, inflight: bool) -> str:
+    """H91a: is a refused request the intake stall, or merely queued?
+
+    Since P's finished prefills stay EVICTABLE (released into the tree at
+    their finish, written back to the shared host arena on eviction and read
+    by D from there or from the L3 file store), the prefilled backlog of a
+    phase no longer holds P's pool. The stall is therefore only what no row
+    of this phase can fund: a request larger than the whole pool, or one
+    larger than free + evictable with nothing in flight that would free
+    more (rows locked by something only the flip releases). Everything else
+    waits in the queue and is admitted in order -- no 503, no extra flip
+    (cu130 53572be2: need 42,442 against free 220,480 + evictable 41,664 was
+    answered 503 after 61 s)."""
+    need = int(need_tokens)
+    if int(pool_tokens) > 0 and need > int(pool_tokens):
+        return INTAKE_IMPOSSIBLE
+    if need <= max(0, int(free_tokens)) + max(0, int(evictable_tokens)):
+        return INTAKE_FITS
+    if inflight:
+        return INTAKE_WAITS
+    return INTAKE_IMPOSSIBLE
 
 
 class IntakeStallWatch:
