@@ -120,7 +120,10 @@ def test_abort_frees_fresh_claims_and_a_full_arena_is_refused(tmp_path, monkeypa
     a.abort_write(rows)
     assert not a._pending and arena.find_slots(["x0.sfx"]) == [(-1, 0)]
     assert a.alloc_write(["y0", "y1", "y2", "y3"]) is not None
-    assert a.alloc_write(["z0"]) is None and a._backend.evicted == 1
+    # Still refused (the four slots are claimed, not complete: nothing to
+    # evict). H81 (27B 479f6eccb0, user rule 24.09.): the claim never runs the
+    # disk evict round any more -- it frees what it needs in C, without I/O.
+    assert a.alloc_write(["z0"]) is None and a._backend.evicted == 0
 
 
 def test_draft_role_maps_kv_rows_to_draft_slots(tmp_path, monkeypatch):

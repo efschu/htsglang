@@ -718,6 +718,13 @@ class Envs:
     # max(2, arena_slots // 4) (32 -> 8; chunk 16384 stays untouched),
     # N >= 2 = N, 0 = off (first-come as before).
     SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS = EnvInt(-1)
+    # MAMBA_CARRIER_HOLD (H81, fnNV4f2): the flip's tree reset gives the
+    # tree's arena references back (27B 479f6eccb0 on the NF line) -- except,
+    # on group P, the END anchors (#1481 mark) of the phase: those stay
+    # referenced across D's phase and are released at P's next wake, so no
+    # claim D makes can drop a hand-over anchor D has not read yet. False =
+    # the end anchors are released with the rest at the reset (the 27B A form).
+    SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD = EnvBool(True)
     # LANE_PARALLEL_COPY (H22, fnFL2x127/x132): a BAR1 deposit lane writes into
     # the peer's window as REGISTERED HOST memory, so cudaMemcpyAsync makes
     # every deposit copy a D2H on the card's ONE D2H copy engine

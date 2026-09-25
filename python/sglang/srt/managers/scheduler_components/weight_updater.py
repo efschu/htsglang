@@ -6358,6 +6358,22 @@ class SchedulerWeightUpdaterManager:
         self.weg2_seam_ref = after
         return None
 
+    def _weg2_release_carrier_hold_at_wake(self) -> int:
+        """H81: the wake of a group gives back the hand-over anchors its
+        last sleep reset held (``UnifiedRadixCache.weg2_release_carrier_hold``;
+        only group P holds any). Host bookkeeping only; never fails a wake.
+        Returns the references released."""
+        sched = self.scheduler
+        tc = getattr(sched, "tree_cache", None) if sched is not None else None
+        release = getattr(tc, "weg2_release_carrier_hold", None)
+        if not callable(release):
+            return 0
+        try:
+            return int(release("wake") or 0)
+        except Exception as exc:  # noqa: BLE001 -- a release never takes the wake down
+            logger.warning("WEG2 CARRIER-HOLD wake release raised %s: %s", type(exc).__name__, exc)
+            return 0
+
     def _weg2_wake_restore_pools(self) -> bool:
         """#1455: Scheduler.flush_cache minus tree_cache.reset(): the pool
         state the remap left undefined is restored, the radix tree with the
@@ -8839,6 +8855,9 @@ class SchedulerWeightUpdaterManager:
                     flushed = self.flush_cache()
                 else:
                     flushed = self._weg2_wake_restore_pools()
+                # H81: D's phase is over (the front drained it, #1011) -- the
+                # END anchors P's sleep reset held for D go back to the arena
+                self._weg2_release_carrier_hold_at_wake()
                 _weg2_ph("flush")
                 logger.info(
                     "WEG2-WAKE-INVARIANT kv_cache pools re-zeroed after resume: flush_cache=%s in %.0f ms "

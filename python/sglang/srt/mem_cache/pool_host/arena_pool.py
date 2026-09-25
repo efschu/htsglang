@@ -1043,12 +1043,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                         sorted(set(st.tolist())), getattr(arena, "path", "?"))
         bad = (st == 3) | (st == 4)
         if bool(bad.any()):
-            ev = getattr(self._backend, "_arena_evict_to_disk", None)
-            if callable(ev) and bool((st == 4).any()):
-                try:
-                    ev(arena, max(256, len(stems)))
-                except Exception as exc:  # noqa: BLE001 - loud, the claim below decides
-                    logger.warning("#1427 arena evict-to-disk failed: %r", exc)
+            if bool((st == 4).any()):
+                # H81 (27B 479f6eccb0): room in C, no disk round in the claim
+                self._evict_for_claim(arena, int((st == 4).sum()))
                 redo = np.nonzero(st == 4)[0]
                 s2, st2, g2 = arena.claim_slots_np([stems[int(i)] for i in redo], [self._page_bytes] * int(redo.size))
                 slots[redo] = s2; st[redo] = st2; gens[redo] = g2
@@ -1148,11 +1145,73 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             return 0
         return int(self.arena.ref_slots_np(slots.numpy(), -1))
 
+    def release_tree_rows(self, host_indices: torch.Tensor) -> int:
+        """H81 (27B 479f6eccb0 on the NF line): the references a DROPPED tree
+        held on these rows, given back by the tree reset
+        (``UnifiedRadixCache._release_host_values_before_reset``).
+
+        THE LEAK (fnNV4f2, NVFP4, 16 mamba slots): a node holds ONE reader
+        reference per arena page / anchor (``complete_write`` +1 on a publish
+        or a join, the read resolve +1) and drops it in ``free`` (-1); the
+        flush before every sleep dropped the tree and called
+        ``mem_pool_host.clear()``, which resets only the staging bookkeeping.
+        Every anchor P or D ever wrote stayed referenced, the clock never saw
+        a candidate, and from the burst on every end-anchor claim was refused
+        (ARENA-CLAIM REFUSED statuses=[4], RETAIN-PUBLISH stopped=mamba_full)
+        -> D's FETCH CAP by=mamba -> W50 -> requeue -> W53 -> 413.
+
+        The rules are exactly the release queue's (H62, ``release_queued_rows``,
+        the PAGED form of the 27B body): arena rows only (staging rows are
+        ``clear()``'s), ONE reference per page of P token ids, rows of a
+        pending (un-acked) write belong to their writer and are skipped. The
+        mamba pool borrows this (its ids are unpaged, P = 1). Host
+        bookkeeping only: a numpy mask and one C call, no wait, no copy.
+        Returns the references dropped."""
+        return ArenaMHAHostPool.release_queued_rows(self, host_indices)
+
+    def _evict_for_claim(self, arena, need: int) -> int:
+        """H81 (27B 479f6eccb0): make room for a claim that found no free
+        slot -- free the ``need`` oldest UNREFERENCED complete slots (the
+        arena clock, second chance) WITHOUT writing them to disk. Returns how
+        many were freed.
+
+        User rule 24.09. (HiCache and Mamba anchors never brake a running
+        prefill or decode): the claim runs in the scheduler thread (chunk and
+        retain publishes), and the round it used to call
+        (``_arena_evict_to_disk``, up to 256 slots -- for the mamba arena
+        256 x 56.1 MiB on NVFP4) writes every evicted page to disk right
+        there. It never fired while the reset leaked every reference -- with
+        the references given back (``release_tree_rows``) it would. A slot
+        freed here is a miss for a later reader (recomputed), as an evicted
+        page without a disk copy always was; a slot any reader, tree node or
+        carrier hold still references is never a candidate."""
+        need = int(need)
+        if need <= 0:
+            return 0
+        try:
+            cands = arena.evict_candidates(need)
+            if cands:
+                arena.free_slots([c[0] for c in cands])
+                stems = getattr(arena, "_stems", None)
+                if isinstance(stems, dict):
+                    for c in cands:
+                        stems.pop((c[1], c[2]), None)
+        except Exception as exc:  # noqa: BLE001 - loud, the claim below decides
+            logger.warning("#1427 ARENA-DROP failed: %r", exc)
+            return 0
+        k = getattr(ArenaMHAHostPool, "_1427_drop_n", 0) + 1
+        ArenaMHAHostPool._1427_drop_n = k
+        if k <= 8 or k % 256 == 0:
+            logger.info("#1427 ARENA-DROP n=%d need=%d freed=%d slot_bytes=%d (claim-time room "
+                        "without disk I/O -- H81, user rule 24.09.: no copy in the compute path)",
+                        k, need, len(cands), int(getattr(arena, "slot_bytes", 0) or 0))
+        return len(cands)
+
     def _claim(self, stems):
         """Claim (or join, or find complete) one slot per stem. Returns the
-        slot list, or None when a slot could not be had even after one
-        arena-to-disk eviction round; fresh claims of a failed batch are
-        freed again so the key is not poisoned."""
+        slot list, or None when a slot could not be had even after the
+        claim made room (``_evict_for_claim``, no disk I/O); fresh claims of
+        a failed batch are freed again so the key is not poisoned."""
         arena = self.arena
         totals = [self._page_bytes] * len(stems)
         if self._pending_mask is not None:
@@ -1167,12 +1226,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                         _cn, len(stems), stems[0] if stems else "-", stems[-1] if stems else "-",
                         sorted({st for _, st, _ in got}), getattr(arena, "path", "?"))
         if any(st in (3, 4) for _, st, _ in got):
-            ev = getattr(self._backend, "_arena_evict_to_disk", None)
-            if callable(ev) and any(st == 4 for _, st, _ in got):
-                try:
-                    ev(arena, max(256, len(stems)))
-                except Exception as exc:  # noqa: BLE001 - loud, the claim below decides
-                    logger.warning("#1427 arena evict-to-disk failed: %r", exc)
+            if any(st == 4 for _, st, _ in got):
+                # H81 (27B 479f6eccb0): room in C, no disk round in the claim
+                self._evict_for_claim(arena, sum(1 for _, st, _ in got if st == 4))
                 redo = [i for i, (_, st, _) in enumerate(got) if st == 4]
                 again = arena.claim_slots([stems[i] for i in redo], [self._page_bytes] * len(redo))
                 for i, g in zip(redo, again):

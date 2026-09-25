@@ -539,6 +539,20 @@ def _hicache_retired_agree_every() -> int:
 _WEG2_END_ANCHOR = os.environ.get("SGLANG_WEG2_END_ANCHOR", "0") == "1"
 
 
+def _weg2_carrier_hold_on() -> bool:
+    """H81: does the flip's reset hold the phase's END anchors (see
+    `UnifiedRadixCache._weg2_carrier_rotate`)? Group P of a weg2 boot, only
+    while the #1481 end-anchor mark is armed (SGLANG_WEG2_END_ANCHOR, which
+    the launcher sets on P only -- the mark names the hand-back anchor), and
+    unless SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD=0. Group D never marks an
+    end anchor, so it holds nothing either way."""
+    if not _WEG2_END_ANCHOR:
+        return False
+    if os.environ.get("SGLANG_WEG2_GROUP", "").strip().upper() != "P":
+        return False
+    return bool(envs.SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD.get())
+
+
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
 
@@ -1027,8 +1041,158 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def reset(self) -> None:
         self._reset_full()
 
+    def _release_host_values_before_reset(self) -> int:
+        """H81 (27B 479f6eccb0 on the NF line): give back the arena references
+        the tree still holds, before `_reset_full` drops the tree.
+
+        THE LEAK THIS CLOSES (fnNV4f2, d93a17316b, the 8 x 4.2k burst): an
+        arena host pool keeps ONE reader reference per page / anchor a node
+        holds (`complete_write` +1 on a publish or a join, the read resolve
+        +1) and releases it in `free` (-1). The flush before every sleep
+        dropped the tree and called `mem_pool_host.clear()`, which resets only
+        the staging bookkeeping: every anchor of every finished phase stayed
+        referenced, `arena_evict_candidates` (refcount != 0) never saw one,
+        and the 16-slot mamba arena of the NVFP4 arm was full at the burst --
+        ARENA-EVICT found nothing, ARENA-CLAIM REFUSED statuses=[4], the END
+        anchors of weg2-8-12/-14/-15/-16/-17 were refused (RETAIN-PUBLISH
+        stopped=mamba_full, MAMBA-ARENA end_anchor=refused), D capped its
+        claim at zero (#1028B FETCH CAP ... by=mamba, #1035c CAPPED), W50,
+        requeue, P prefilled into the same pinned arena, W53, 413. INT4 x176/
+        x177 carried the same leak with 32 slots, which that probe set never
+        filled (18 P anchors). Released here, the pages stay COMPLETE in the
+        arena (every rank still finds them by stem) until a claim needs their
+        slot (`_evict_for_claim`, no disk I/O).
+
+        Host bookkeeping only, at the reset's idle points (the flush of an
+        idle group, the VRAM dial's shrink commit): no device sync, no copy,
+        no wait -- a node an in-flight host operation still uses (a pending
+        write-through, a host lock) is SKIPPED, never waited for. One numpy
+        pass per pool (`release_tree_rows`). On group P the phase's END
+        anchors are not released here but held one D phase
+        (`_weg2_carrier_rotate`). Arena pools are the only host pools holding
+        such references; any other is fully reset by `clear()`, so the
+        default path is unchanged. Returns the references dropped now."""
+        cc = getattr(self, "cache_controller", None)
+        root = getattr(self, "root_node", None)
+        if cc is None or root is None:
+            return 0
+        if not getattr(getattr(cc, "mem_pool_host", None), "arena_read", False):
+            return 0
+        t0 = time.perf_counter()
+        hold_end = _weg2_carrier_hold_on()
+        per_pool: dict = {}
+        end_rows: dict = {}
+        skipped = visited = 0
+        stack = list(root.children.values())
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children.values())
+            visited += 1
+            if getattr(node, "write_through_pending_id", None) is not None:
+                skipped += 1
+                continue
+            for comp in self._components_tuple:
+                cd = node.component_data[comp.component_type]
+                if cd.host_value is None:
+                    continue
+                if cd.host_lock_ref > 0:
+                    skipped += 1
+                    continue
+                pool = (getattr(comp, "_full_kv_pool_host", None)
+                        or getattr(comp, "_mamba_pool_host", None)
+                        or getattr(comp, "_swa_kv_pool_host", None))
+                if pool is None or not hasattr(pool, "release_tree_rows"):
+                    continue
+                if (hold_end and comp.component_type == ComponentType.MAMBA
+                        and getattr(node, "_weg2_end_anchor", False)):
+                    # the hand-back anchor of a request D may not have read
+                    # yet: held one D phase, see _weg2_carrier_rotate
+                    end_rows.setdefault(id(pool), (pool, []))[1].append(cd.host_value)
+                    continue
+                per_pool.setdefault(id(pool), (pool, []))[1].append(cd.host_value)
+        released = failed = 0
+        first_error = None
+        if hold_end and visited:
+            # rotated on NON-EMPTY resets only: a sleep flushes twice (the
+            # front's quiesce and release_memory_occupation) and the second
+            # reset sees an empty tree -- it keeps the standing hold
+            released += self._weg2_carrier_rotate(end_rows)
+        for pool, values in per_pool.values():
+            # Best effort per pool: the reset that follows must happen
+            # whatever one pool says (before this release it leaked them all).
+            try:
+                released += int(pool.release_tree_rows(torch.cat([v.reshape(-1).cpu() for v in values])))
+            except Exception as exc:  # noqa: BLE001
+                failed += 1
+                if first_error is None:
+                    first_error = f"{type(exc).__name__}: {exc}"
+        if released or skipped or failed:
+            logger.info(
+                "#1427 ARENA-REF RESET-RELEASE released=%d pools=%d nodes=%d skipped_in_use=%d "
+                "failed=%d ms=%.1f%s (H81: the reset gives the tree's arena references back "
+                "before the host pools are cleared -- fnNV4f2 mamba_full -> W50 -> W53)",
+                released, len(per_pool), visited, skipped, failed, (time.perf_counter() - t0) * 1000.0,
+                f" first_error={first_error}" if first_error else "",
+            )
+        return released
+
+    def _weg2_carrier_rotate(self, end_rows: dict) -> int:
+        """H81: the flip's reset on group P holds the END anchors (#1481 mark)
+        of this phase and gives back the ones still held from the previous
+        rotation (normally none: P's wake released them). Returns the
+        references released now.
+
+        WHY: once P's reset has given its references back, a hand-over anchor
+        is COMPLETE but unreferenced until D's prefetch takes D's own
+        reference -- and D admits a burst one seat at a time (fnNV4f2 D-ADMIT
+        seat=1/1, weg2-8-17 read 7.5 s after the flip). Any claim D makes in
+        that window (a write-back under device pressure, its flush publish,
+        an L3 fill) may drop the oldest unreferenced slot; with a 16-slot
+        arena that is the anchor D is about to read -> #1035c CAPPED -> W50.
+        Held, the flip never loses what P published for an admitted request.
+
+        BOUND (the small extra buffer): one anchor per request of ONE P phase
+        (the retain's end anchor; inner anchors are released as before), held
+        only across D's phase -- `weg2_release_carrier_hold` gives them back
+        at P's next wake, when the front has drained D (#1011). A rotation at
+        the next non-empty reset is the fallback. `end_rows` is
+        {id(pool): (pool, [host values])}."""
+        released = self.weg2_release_carrier_hold("reset")
+        self._weg2_carrier_rows = end_rows
+        held = sum(sum(int(v.numel()) for v in vals) for _, vals in end_rows.values())
+        if held:
+            logger.info(
+                "WEG2 CARRIER-HOLD held=%d end-anchor row(s) of this P phase across the flip, "
+                "released=%d of the previous one (H81: D reads them; P's next wake gives them back)",
+                held, released)
+        return released
+
+    def weg2_release_carrier_hold(self, reason: str = "wake") -> int:
+        """H81: give back the END-anchor references `_weg2_carrier_rotate`
+        held across D's phase. Called by P's wake (the resume handler, after
+        the pools were restored: D is drained and every prompt of the held
+        phase was admitted by D, #1011) and by the next non-empty reset.
+        Host bookkeeping only; never raises into the wake. Returns the
+        references released."""
+        prev = getattr(self, "_weg2_carrier_rows", None) or {}
+        self._weg2_carrier_rows = {}
+        released = failed = 0
+        for pool, values in prev.values():
+            try:
+                released += int(pool.release_tree_rows(torch.cat([v.reshape(-1).cpu() for v in values])))
+            except Exception as exc:  # noqa: BLE001 -- best effort, named
+                failed += 1
+                logger.warning("WEG2 CARRIER-HOLD release raised at %s: %r", reason, exc)
+        if prev and reason != "reset":
+            logger.info("WEG2 CARRIER-HOLD released=%d failed=%d at=%s (the D phase that read "
+                        "them is over)", released, failed, reason)
+        return released
+
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        # H81: the old tree's arena references go back FIRST -- see
+        # `_release_host_values_before_reset` (fnNV4f2 mamba_full).
+        self._release_host_values_before_reset()
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.priority = -sys.maxsize
         self.root_node.key = RadixKey(array("q"), None)
