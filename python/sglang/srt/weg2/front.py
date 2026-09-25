@@ -48,6 +48,7 @@ import argparse
 import asyncio
 import collections
 import contextvars
+import gc
 import hashlib
 import importlib
 import json
@@ -58,7 +59,7 @@ import statistics
 import subprocess
 import time
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 from aiohttp import (
     ClientConnectionError,
@@ -311,6 +312,182 @@ def make_rpc_trace_config() -> TraceConfig:
     tc.on_connection_reuseconn.append(on_reuse)
     tc.on_connection_create_end.append(on_create_end)
     return tc
+
+
+# ---------------------------------------------------------------------------
+# H78 (fnFL2x174): A POOLED CONNECTION MUST NOT OUTLIVE THE PEER'S KEEP-ALIVE.
+#
+# The groups serve HTTP through uvicorn with `timeout_keep_alive =
+# SGLANG_TIMEOUT_KEEP_ALIVE` (default 5 s, http_server.py); aiohttp's connector
+# keeps an idle connection reusable for 15 s. In between, the peer has closed
+# the socket and only the FIN tells the front so -- and a FIN is an event the
+# LOOP has to process. x174: P's kv-wake leg released its connection at
+# 00:20:22,464, the front's loop froze 7.5 s (the launcher import, H75), P
+# closed the idle socket at ~:27.5, and at 00:20:30,127 the controller took the
+# same connection out of the pool (idle 7.66 s <= 15 s, FIN still unread) and
+# wrote leg 1 of the 97k needle into it: `WEG2 leg1 rid=weg2-0-4 failed:
+# Server disconnected`, 3 ms after `WEG2-FLIP done`.
+#
+# THE SAFE HANDLING IS A SHORTER CLIENT KEEP-ALIVE, NOT A RETRY. aiohttp tests
+# `now - released_at <= keepalive_timeout` at the moment it takes a connection
+# out of the pool, and the server's timer starts BEFORE the client's release
+# (it runs from the moment the response was written), so a client bound below
+# the server's makes "the peer already closed it" impossible for any
+# connection whose response was read without a freeze -- and after a freeze
+# the idle age is measured across it, so the stale connection is dropped
+# instead of written into. Nothing is sent twice. A retry of leg 1/leg 2 is
+# NOT built: no request id is deduplicated server-side (TokenizerManager keys
+# its state by rid and overwrites it), so "no response bytes" cannot prove
+# the group never accepted the request. The two flip legs keep their own
+# #1285 retry, which IS deduplicated (the epoch ledger).
+# ---------------------------------------------------------------------------
+#: Seconds the front's idle keep-alive stays BELOW the groups' own. It covers
+#: the time between the server writing a response and the front releasing the
+#: connection (sub-millisecond on loopback while the loop is free -- H78 keeps
+#: every flip stage off it); half the server's value when that is smaller.
+RPC_KEEPALIVE_MARGIN_S = 1.0
+
+
+def rpc_keepalive(server_keepalive_s: Optional[float] = None) -> Tuple[Optional[float], float, str]:
+    """``(client keepalive_timeout, server keep-alive, source)``.
+
+    The client value is ``None`` when the server keeps nothing alive long
+    enough to leave a margin: then every request gets its own connection
+    (``force_close``). The server value is the groups' OWN setting, read
+    through the same ``envs`` accessor ``http_server`` reads it with.
+    """
+    if server_keepalive_s is None:
+        server = float(envs.SGLANG_TIMEOUT_KEEP_ALIVE.get())
+        source = "SGLANG_TIMEOUT_KEEP_ALIVE (the groups' uvicorn timeout_keep_alive)"
+    else:
+        server = float(server_keepalive_s)
+        source = "argument"
+    client = server - min(RPC_KEEPALIVE_MARGIN_S, 0.5 * server)
+    if client <= 0.0:
+        return None, server, source
+    return client, server, source
+
+
+def rpc_connector(server_keepalive_s: Optional[float] = None) -> "SportTCPConnector":
+    """The front's pooled connector with its keep-alive below the groups' (H78)."""
+    client, _server, _source = rpc_keepalive(server_keepalive_s)
+    if client is None:
+        return SportTCPConnector(force_close=True)
+    return SportTCPConnector(keepalive_timeout=client)
+
+
+# ---------------------------------------------------------------------------
+# H78: THE CYCLIC GC IS A LOOP BLOCKER TOO. A full (generation-2) pass walks
+# every tracked object with the GIL held -- no worker thread helps. MEASURED on
+# the desk in a front-shaped heap (front + launcher imported, 731k tracked
+# objects): 219-225 ms per full pass, 0.0 ms after `gc.freeze()`. And the H75
+# prewarm, a REAL launcher import in a worker thread, stalled a 2 ms loop ticker
+# 6 times > 40 ms (max 201 ms) in its 5.7 s -- full passes the import's own
+# allocation triggered; with the collector off during the import: 0 stalls
+# (and the import 4.6 s instead of 5.7 s). x175's first request arrived 3.5 s
+# after `WEG2-FRONT up`, i.e. inside that window.
+# ---------------------------------------------------------------------------
+#: A full collection holding the GIL at least this long gets a WEG2-FRONT GC-PAUSE line.
+GC_PAUSE_LOG_MS = 50.0
+
+
+def _import_without_full_gc(name: str):
+    """Import ``name`` with the cyclic collector paused, then freeze the heap.
+
+    ``gc.freeze()`` moves every object tracked at that moment -- the imported
+    modules, classes and functions, all of them alive for the life of the
+    process -- into the permanent generation, so no later full pass walks them
+    again. Cycles among objects that exist at that moment are never collected;
+    at startup that is the module heap (never garbage) and a handful of live
+    tasks. The collector's enabled state is restored as it was found.
+    """
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        return importlib.import_module(name)
+    finally:
+        gc.freeze()
+        if was_enabled:
+            gc.enable()
+
+
+def install_gc_pause_probe(threshold_ms: float = GC_PAUSE_LOG_MS) -> Callable[[str, dict], None]:
+    """Name every FULL cyclic-GC pass that holds the GIL >= ``threshold_ms``.
+
+    An instrument only: it times generation-2 passes via ``gc.callbacks`` and
+    logs the slow ones; it never triggers, delays or skips a collection.
+    Returns the callback (a test removes it again)."""
+    state: Dict[str, float] = {}
+
+    def _probe(phase: str, info: dict) -> None:
+        if info.get("generation") != 2:
+            return
+        if phase == "start":
+            state["t0"] = time.perf_counter()
+            return
+        t0 = state.pop("t0", None)
+        if t0 is None:
+            return
+        ms = (time.perf_counter() - t0) * 1000.0
+        if ms >= threshold_ms:
+            logger.warning("WEG2-FRONT GC-PAUSE generation=2 ms=%.0f collected=%s frozen=%d -- the event "
+                           "loop was held that long; a front whose module heap is frozen (H78) should "
+                           "not print this line", ms, info.get("collected"), gc.get_freeze_count())
+
+    gc.callbacks.append(_probe)
+    return _probe
+
+
+class SidecarView:
+    """H78: the measured-record sidecar as the sleep-leg gate reads it --
+    parsed once per FILE VERSION, not once per flip.
+
+    MEASURED: ``_sleep_leg_gate`` (#1361 fix6) ran ``read_measured_record``
+    on the event loop at EVERY flip, between ``WEG2-FLIP-ORDER`` and the
+    gathered sleep leg: 18-47 ms per flip on x172-x175 (median ~22 ms). The
+    sidecar is append-only across every boot of the rig (3.2 MB, 2040 samples
+    on 2026-09-25), so the cost only grows; its content changes three times per
+    boot. The answer is exactly ``host_ledger.read_measured_record(path)``:
+    the key is the file's identity (device, inode, size, mtime_ns), taken
+    BEFORE the read, so a replace racing the read leaves a key older than the
+    content -- the next ``fresh`` check then reloads; it can never keep content
+    older than the file. Every writer of this file replaces it
+    (``append_measured_record``: tmp + ``os.replace`` = a new inode).
+
+    The state is ONE tuple, swapped whole, so a ``load`` in a worker thread and
+    a ``fresh``/``read`` on the loop never see half of an update.
+    """
+
+    def __init__(self) -> None:
+        self._state: Tuple[Optional[str], Optional[tuple], Optional[Dict[str, dict]]] = (None, None, None)
+        self.loads = 0
+
+    @staticmethod
+    def file_key(path: str) -> Optional[tuple]:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+    def fresh(self, path: str) -> bool:
+        p, key, rec = self._state
+        return rec is not None and p == path and key is not None and key == self.file_key(path)
+
+    def load(self, path: str) -> Dict[str, dict]:
+        key = self.file_key(path)
+        rec = host_ledger.read_measured_record(path)
+        self._state = (path, key, rec)
+        self.loads += 1
+        return rec
+
+    def read(self, path: str) -> Dict[str, dict]:
+        p, key, rec = self._state
+        if rec is not None and p == path and key is not None and key == self.file_key(path):
+            return rec
+        return self.load(path)
+
+
 #: #1262 TIER 3.  How many times its OWN measured cost a flip may take before
 #: the front says it is not progressing.  Dimensionless on purpose: the bound
 #: itself is this boot's last measured flip in the same direction, so it is
@@ -2234,6 +2411,10 @@ CTL_KICK_ARRIVAL_ENV = "SGLANG_WEG2_CTL_KICK_ARRIVAL"
 CTL_KICK_AFTER_FLIP_ENV = "SGLANG_WEG2_CTL_KICK_AFTER_FLIP"
 #: F1: the post-wake residue reading runs in a worker thread after the flip
 #: closed -- only once nothing gates on it (see Front._dc_reading_deferrable).
+#: H78 (fnFL2): with the same switch the readings that DO gate (each group's
+#: first sleep) leave the event loop too -- a worker thread the flip awaits --
+#: and the sidecar appends (dormant image, flip ratchet) go to the FIFO writer
+#: (Front._sidecar_submit). Off = both exactly as before.
 DC_OFF_PATH_ENV = "SGLANG_WEG2_DC_OFF_PATH"
 #: The controller's tick. Unchanged; with a kick switch on it is the UPPER
 #: bound of a wait, not its length.
@@ -2885,13 +3066,19 @@ class Front:
     async def startup(self, app):
         # #1285: the trace config is the ONLY way to learn whether a request
         # went out on a pooled connection or a fresh one; it adds two awaits
-        # per request and no behaviour.  The connector stays aiohttp's default
-        # ON PURPOSE in this commit -- changing pooling and instrumenting it in
-        # the same step would leave the boot unable to say which of the two
-        # moved the symptom.
+        # per request and no behaviour.  #1285 kept aiohttp's default pooling
+        # on purpose, to change one thing at a time; H78 changes it now, on
+        # the instrument's own evidence (x174: `conn=reused` P socket idle
+        # 7.66 s against P's 5 s keep-alive -> "Server disconnected"). See
+        # rpc_keepalive: the client's idle bound sits below the groups'.
         self.session = ClientSession(timeout=ClientTimeout(total=3600),
-                                     connector=SportTCPConnector(),
+                                     connector=rpc_connector(),
                                      trace_configs=[make_rpc_trace_config()])
+        _ka_client, _ka_server, _ka_src = rpc_keepalive()
+        logger.info("WEG2-FRONT RPC-KEEPALIVE client=%s server=%.1f s (%s) -- a pooled connection "
+                    "idle longer than the client bound is closed, never written into; the groups "
+                    "close theirs at the server bound (H78, x174 leg 1 'Server disconnected')",
+                    "force_close" if _ka_client is None else "%.1f s" % _ka_client, _ka_server, _ka_src)
         app["controller"] = asyncio.create_task(self.controller())
         app["admitter"] = asyncio.create_task(self.d_admitter())
         app["health"] = asyncio.create_task(self.health_poller())
@@ -2907,6 +3094,14 @@ class Front:
         # during the freeze: "Server disconnected", 97k needle lost. Import it
         # once here, in a worker thread, while the front is still idle.
         app["launcher_prewarm"] = asyncio.create_task(self._prewarm_launcher_import())
+        # H78: the same move for the flip path's small lazy imports (wake_credit
+        # alone put ~5 ms into x175's first FLIP-ORDER) and for the sidecar the
+        # sleep-leg gate reads at every flip (18-47 ms of JSON on the loop).
+        app["flip_imports_prewarm"] = asyncio.create_task(self._prewarm_flip_path_imports())
+        app["sidecar_prewarm"] = asyncio.create_task(self._sidecar_ready())
+        # H78: a full GC pass holds the loop ~220 ms in this heap; the launcher
+        # prewarm freezes the module heap, and this names any pass still slow.
+        app["gc_pause_probe"] = install_gc_pause_probe()
         logger.info("WEG2-FRONT up tag=%s awake=%s P=%s D=%s W=%.0f s (operator V1 fairness bound, 0 = off) "
                     "carrier_max_tokens=%d p_concurrency=%d d_bs=%d X=%d flip_min_work_tokens=%d "
                     "idle_layout=%s min_dwell_ms=%s drain_deadline_s=%.0f d_admit_max_tokens=%d "
@@ -2932,7 +3127,7 @@ class Front:
         """
         t0 = time.monotonic()
         try:
-            await asyncio.to_thread(importlib.import_module, "sglang.srt.weg2.launcher")
+            await asyncio.to_thread(_import_without_full_gc, "sglang.srt.weg2.launcher")
         except Exception as e:  # noqa: BLE001 -- the lazy import stays the fallback
             logger.warning("WEG2-FRONT launcher prewarm failed after %.1f s: %r -- resolve_x_live "
                            "imports it on the event loop at the first flip instead (H75)",
@@ -2942,6 +3137,121 @@ class Front:
                     "(H75: resolve_x_live no longer freezes the front in the first flip)",
                     time.monotonic() - t0)
 
+    #: H78: the modules the flip / leg path imports lazily on its FIRST use --
+    #: credit_pause_order (wake_credit), timed_pause_order (wake_credit_pd),
+    #: the gathered legs (wake_kv), a BATCH arrival's PLE hint (ple_admit_hint).
+    FLIP_PATH_IMPORTS = (
+        "sglang.srt.weg2.wake_credit",
+        "sglang.srt.weg2.wake_credit_pd",
+        "sglang.srt.weg2.wake_kv",
+        "sglang.srt.weg2.ple_admit_hint",
+    )
+
+    async def _prewarm_flip_path_imports(self) -> None:
+        """H78: import :attr:`FLIP_PATH_IMPORTS` off the event loop, once.
+
+        Only WHEN they are imported moves; the lazy imports at their sites stay
+        and are the fallback if this fails (they then run on the loop as before).
+        """
+        t0 = time.monotonic()
+
+        def _all() -> None:
+            for name in self.FLIP_PATH_IMPORTS:
+                importlib.import_module(name)
+
+        try:
+            await asyncio.to_thread(_all)
+        except Exception as e:  # noqa: BLE001 -- the lazy imports stay the fallback
+            logger.warning("WEG2-FRONT flip-path prewarm failed after %.2f s: %r -- the first flip "
+                           "imports them on the event loop instead (H78)", time.monotonic() - t0, e)
+            return
+        logger.info("WEG2-FRONT flip-path modules prewarmed off the event loop in %.2f s (H78): %s",
+                    time.monotonic() - t0, ", ".join(n.rsplit(".", 1)[-1] for n in self.FLIP_PATH_IMPORTS))
+
+    # ---------------- H78: the measured-record sidecar, off the event loop ----------------
+    def _sidecar_view(self) -> SidecarView:
+        """The gate's parse cache; created on first use, so a Front assembled
+        via ``__new__`` (the unit tests' stubs) gets one too."""
+        v = self.__dict__.get("_sidecar_view_obj")
+        if v is None:
+            v = self.__dict__["_sidecar_view_obj"] = SidecarView()
+        return v
+
+    async def _sidecar_writes_settled(self) -> None:
+        """Every sidecar append submitted so far has landed (or failed by name).
+
+        The writes are a FIFO chain (:meth:`_sidecar_submit`), so waiting for
+        the newest waits for all of them. A reader of the sidecar in this front
+        calls this first: it then reads exactly the file the old synchronous
+        appends would have left."""
+        tail = self.__dict__.get("_sidecar_tail")
+        if tail is not None and not tail.done():
+            await asyncio.wait([tail])
+
+    async def _sidecar_ready(self) -> None:
+        """Pending appends landed, and the gate's view is current -- the parse,
+        if one is due, in a worker thread (H78). Never raises: a view that
+        could not be prepared leaves the gate its synchronous read, as before."""
+        try:
+            await self._sidecar_writes_settled()
+            path = getattr(self, "measured_record", "")
+            if not path:
+                return
+            view = self._sidecar_view()
+            if not view.fresh(path):
+                await asyncio.to_thread(view.load, path)
+        except Exception as e:  # noqa: BLE001 -- the gate falls back to its own read
+            logger.warning("WEG2 SIDECAR view not prepared off the loop: %r -- the sleep-leg gate "
+                           "reads the sidecar itself (H78)", e)
+
+    def _sidecar_submit(self, fn: Callable[..., Any], *args: Any) -> "asyncio.Task":
+        """Run one sidecar append in a worker thread, FIFO behind the previous
+        one, and re-warm the gate's view from the file it wrote (H78).
+
+        NOT awaited by the flip: the append only persists a record for the NEXT
+        boot's ledger (79-96 ms of JSON on x172-x175, on the loop and on the flip
+        before this). The only reader inside this front -- the next flip's
+        sleep-leg gate -- waits for it first (:meth:`_sidecar_ready`), and
+        ``cleanup`` waits for it before the session closes."""
+        prev = self.__dict__.get("_sidecar_tail")
+        path = getattr(self, "measured_record", "")
+        view = self._sidecar_view()
+
+        def _job() -> None:
+            try:
+                fn(*args)
+            finally:
+                if path:
+                    view.load(path)
+
+        async def _run() -> None:
+            if prev is not None and not prev.done():
+                await asyncio.wait([prev])
+            try:
+                await asyncio.to_thread(_job)
+            except Exception:  # noqa: BLE001 -- a lost record is logged, never a dead front
+                counters = getattr(self, "counters", None)
+                if counters is not None:
+                    counters["sidecar_write_failed"] += 1
+                logger.exception("WEG2 SIDECAR write %s failed in the writer thread -- the record "
+                                 "may be missing from %s (H78)", getattr(fn, "__name__", fn), path)
+
+        task = asyncio.ensure_future(_run())
+        self.__dict__["_sidecar_tail"] = task
+        return task
+
+    def _first_sleep_reading(self, S: Group, src: str,
+                             shmem_before: Optional[int]) -> Tuple[Dict[str, int], Optional[dict]]:
+        """The residue reading of ``src``'s FIRST sleep, as the flip took it
+        inline: ``ps`` + ``nvidia-smi`` + the dormant-image sample -- minus
+        the sidecar append, which the caller hands to the writer (H78).
+        Runs in a worker thread; the flip awaits it, so W19 and the sample
+        keep their place in the flip."""
+        pids = _session_pids(S.sid) if S.sid else set()
+        dc = _nvml_process_mib(pids) if pids else {}
+        rec = self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc, persist=False)
+        return dc, rec
+
     async def cleanup(self, app):
         for k in ("controller", "admitter", "health", "corridor", "flip_stall"):
             t = app.get(k)
@@ -2949,6 +3259,14 @@ class Front:
                 t.cancel()
         for t in list(getattr(self, "_dc_tasks", ())):  # 27B flipfast F1: readings still in flight
             t.cancel()
+        # H78: sidecar appends still in the writer land before the front goes.
+        try:
+            await asyncio.wait_for(self._sidecar_writes_settled(), 30.0)
+        except Exception as e:  # noqa: BLE001 -- shutdown goes on
+            logger.error("WEG2 SIDECAR writes not settled at cleanup: %r (H78)", e)
+        probe = app.get("gc_pause_probe")
+        if probe is not None and probe in gc.callbacks:
+            gc.callbacks.remove(probe)
         if self.session:
             await self.session.close()
 
@@ -4858,7 +5176,10 @@ class Front:
         if not self.measured_record:
             return None, "no-sidecar"
         try:
-            rec = host_ledger.read_measured_record(self.measured_record)
+            # H78: through the view -- the same answer as a fresh
+            # read_measured_record, parsed once per file version; the flip
+            # prepares it off the loop (_sidecar_ready) before calling the gate.
+            rec = self._sidecar_view().read(self.measured_record)
         except Exception:  # noqa: BLE001 - a gate must never break the flip
             return None, "unreadable"
         e = (rec or {}).get(str(group))
@@ -4884,7 +5205,8 @@ class Front:
             cushion, need, margin_gib=0.0, source=src, group=str(group))
 
     def sample_dormant_image(self, group: str, shmem_before: Optional[int],
-                             vram_residue_mib: Optional[Dict[str, int]] = None) -> Optional[dict]:
+                             vram_residue_mib: Optional[Dict[str, int]] = None,
+                             persist: bool = True) -> Optional[dict]:
         """Measure ``group``'s dormant host image, once, at its first sleep.
 
         The term boot weg2dk7 refuted: the ledger charged the weight-tag byte
@@ -4893,6 +5215,9 @@ class Front:
         image, not only the ``weights_*`` tags.  Returns ``None`` (and measures
         nothing) once that group has a sample, so a boot's images are the ones
         its FIRST sleeps produced and not a moving average of its flips.
+
+        ``persist=False`` (H78): the caller appends the record itself, through
+        the sidecar writer (:meth:`_persist_dormant_image`), off the flip.
         """
         if group in self.dormant_image:
             return None
@@ -4942,16 +5267,27 @@ class Front:
         )
         self.dormant_image[group] = rec
         logger.info("%s", host_ledger.format_dormant_image(rec))
+        if persist:
+            self._persist_dormant_image(rec)
+        return rec
+
+    def _persist_dormant_image(self, rec: dict) -> None:
+        """Append one dormant-image sample to the sidecar (append-only)."""
         if self.measured_record:
             try:
                 host_ledger.append_measured_record(self.measured_record, rec)
             except OSError as e:  # noqa: BLE001
                 logger.error("WEG2 DORMANT-IMAGE not persisted to %s: %s -- the next boot "
                              "will price the recorded dk7 reading instead", self.measured_record, e)
-        return rec
 
-    def _write_flip_ratchet(self, done_epoch: int) -> None:
+    def _write_flip_ratchet(self, done_epoch: int,
+                            taken: Optional[Tuple[Optional[float], str]] = None) -> None:
         """#1350 READING 2 OF 2: the FIRST FULL PAIR's permanent step, recorded.
+
+        ``taken`` (H78): ``(post, at)`` already read by the caller AT
+        ``done epoch=2`` -- the caller claimed the latch there and runs the rest
+        of this method (the cushion CSV, the line, the append) in the sidecar
+        writer thread. ``None``: both are read here, as always.
 
         Called from the `WEG2-FLIP done` path and does nothing unless this is
         ``done epoch=2`` -- one D->P leg plus one P->D leg after the ``begin
@@ -4972,11 +5308,14 @@ class Front:
         ``flip_ratchet_gib: None``, because why a boot could not measure is
         evidence.
         """
-        if self._flip_ratchet_written or int(done_epoch) != 2:
-            return
-        self._flip_ratchet_written = True
-        post = host_ledger.read_flip_currency_gib()
-        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        if taken is None:
+            if self._flip_ratchet_written or int(done_epoch) != 2:
+                return
+            self._flip_ratchet_written = True
+            post = host_ledger.read_flip_currency_gib()
+            at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        else:
+            post, at = taken
         # #1377 W11: the cushion minimum rides with the ratchet, from the
         # ONE producer, so the next boot's arm can predict W98.
         # #1378 Posten 4: the producer now returns the case NAMED beside the
@@ -5287,6 +5626,9 @@ class Front:
             # the write size from the sidecar's own measurement of this group's
             # last sleep. Either unreadable -> no verdict, and the leg proceeds
             # exactly as before fix6.
+            # H78: the sidecar parse (18-47 ms per flip on x172-x175, on the
+            # loop) happens once per file version, in a worker thread, here.
+            await self._sidecar_ready()
             self._sleep_leg_gate(S)
             self._flip_stage = "gathered-legs"
             self._flip_marks["gathered-legs"] = time.time()
@@ -5422,6 +5764,15 @@ class Front:
         dc_off_path = self._dc_reading_deferrable(src)
         if dc_off_path:
             dc: Dict[str, int] = {}  # filled into the flip record by _dc_reading_off_path
+        elif getattr(self, "_dc_off_path", False):
+            # H78, same switch as F1: the reading that still GATES (each group's
+            # first sleep: W19 and the dormant image) runs in a worker thread and
+            # the flip AWAITS it -- the gate keeps its place, the loop is free
+            # (x172-x175: 51-63 ms of ps + nvidia-smi + /proc on the loop). The
+            # sidecar append (79-94 ms of JSON) goes to the writer, off the flip.
+            dc, _img = await asyncio.to_thread(self._first_sleep_reading, S, src, shmem_before)
+            if _img is not None and self.measured_record:
+                self._sidecar_submit(self._persist_dormant_image, _img)
         else:
             pids = _session_pids(S.sid) if S.sid else set()
             dc = _nvml_process_mib(pids) if pids else {}
@@ -5429,6 +5780,7 @@ class Front:
             # NEXT boot prices this form's MEASURED residue instead of the xsn14
             # constant (launcher.dc_residue_from_record).
             self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc)
+        if not dc_off_path:
             for uuid, mib in sorted(dc.items()):
                 logger.info("WEG2-DC group=%s uuid=%s measured=%d MiB reserve=%s", src, uuid, mib, self.dc_reserve.get(uuid))
             if src == "D" and not self.dc_measured_d and dc:
@@ -5537,7 +5889,17 @@ class Front:
         # None at its first line for the whole boot. Read from the SAME key
         # the log line reads, so the two can never disagree again.
         self.note_x_sample("flip_s", float(rec["flip_ms"]) / 1000.0)
-        self._write_flip_ratchet(rec["epoch"])
+        if (getattr(self, "_dc_off_path", False) and not self._flip_ratchet_written
+                and int(rec["epoch"]) == 2):
+            # H78, same switch: the post reading is taken HERE, at done epoch=2 as
+            # always; the cushion CSV, the RATCHET line and the sidecar append
+            # (83-96 ms of JSON on the loop, x172-x175) run in the writer thread.
+            self._flip_ratchet_written = True
+            self._sidecar_submit(self._write_flip_ratchet, rec["epoch"], (
+                host_ledger.read_flip_currency_gib(),
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+        else:
+            self._write_flip_ratchet(rec["epoch"])
         logger.info("WEG2-FLIP done epoch=%d slept=%s woke=%s drain+quiesce=%d ms sleep=%d ms (kv RPC + the %s leg of the gathered pair) "
                     "wake=%d ms (the %s leg + kv RPC) "
                     "interleave=%d ms (NOT sleep+wake: the legs overlap -- gather wall %d ms against %d + %d ms of legs) "
