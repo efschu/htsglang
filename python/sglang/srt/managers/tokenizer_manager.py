@@ -2287,6 +2287,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                 state.time_stats.set_finished_time()
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
+                # H84: a Weg-2 D group's own prefill time (scheduler forward
+                # entry -> prefill finished), independent of --enable-metrics;
+                # the front's r_D probe reads it instead of the leg-2 wall.
+                if (
+                    int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0) > 0
+                    and recv_obj.time_stats is not None
+                ):
+                    weg2_prefill_s = getattr(recv_obj.time_stats[i], "weg2_prefill_s", 0.0)
+                    if weg2_prefill_s > 0.0:
+                        meta_info["weg2_prefill_s"] = weg2_prefill_s
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
