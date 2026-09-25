@@ -204,9 +204,19 @@ class TestRankUniformCollectiveShape(unittest.TestCase):
         got = self._drain_vector({PoolName.MAMBA: _FakeQueue(4)})
         self.assertEqual(got["values"][:3], [1, 2, 3])
         self.assertEqual(got["impl"]["n_revoke"], 1)
-        self.assertEqual(got["impl"]["n_backup"], 2)
+        # fnFL2 H74 (x172): the backup acks drain rank-locally (None = every
+        # ready ack of THIS rank); the reduced vector keeps its slot, so the
+        # collective's shape above is unchanged
+        self.assertIsNone(got["impl"]["n_backup"])
         self.assertEqual(got["impl"]["n_release"], 3)
         self.assertEqual(got["impl"]["extra_release_counts"], {PoolName.MAMBA: 4})
+
+    def test_drain_vector_min_backup_count_when_h74_is_off(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_WEG2_ENABLE_LOCAL_BACKUP_ACK_DRAIN.override(False):
+            got = self._drain_vector({PoolName.MAMBA: _FakeQueue(4)})
+        self.assertEqual(got["impl"]["n_backup"], 2)
 
     def test_pool_outside_the_fixed_universe_raises(self):
         with self.assertRaises(HiCacheCollectiveError):

@@ -3858,7 +3858,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _weg2_publish_window(self) -> int:
         """Tokens one publish piece may span: a quarter of the host pool,
-        page-aligned, at least one chunk; 0 = no splitting (no host pool)."""
+        page-aligned, at least one chunk; 0 = no splitting (no host pool).
+
+        fnFL2 H74: on a TP group (``_attn_reduce_world() > 1``) the window is
+        the chunk on every rank -- the split must not depend on THIS rank's
+        host pool, or the ranks' trees and store-write counts part (x172:
+        TP0's 4096-row arena staging pool split a 6080-token node, the
+        workers' 353,600-row host pool did not)."""
+        page = max(1, int(getattr(self, "page_size", 1) or 1))
+        chunk = 4096
+        if envs.SGLANG_WEG2_ENABLE_TP_UNIFORM_PUBLISH_WINDOW.get() and self._attn_reduce_world() > 1:
+            return chunk // page * page
         pool = getattr(self.cache_controller, "mem_pool_host", None)
         size = int(getattr(pool, "size", 0) or 0)
         if size <= 0:
@@ -6669,6 +6679,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             pool_name: (min(qsize_list[_pool_slot(pool_name, 3)], _cap) if _cap > 0 else qsize_list[_pool_slot(pool_name, 3)])
             for pool_name in extra_release_queues
         }
+        if envs.SGLANG_WEG2_ENABLE_LOCAL_BACKUP_ACK_DRAIN.get():
+            # fnFL2 H74 (x172): this rank's storage-write acks are drained in
+            # full. `_drain_backup` touches only this rank's own state (its
+            # `ongoing_backup`, its node flags and host lock refs, its host
+            # rows) -- the #737 argument for the write-through acks, one queue
+            # over. The MIN above presumed identical store-write sequences on
+            # every TP rank; on D (Form A) TP0 issued 7, TP1/TP2 6 (PUBLISH-SPLIT
+            # on TP0 only), the MIN drained 6 and TP0's seventh ack stayed:
+            # hicache_backup(1) for good, every /flush_cache refused, W3.
+            _local = int(local_qsize_list[1])
+            if _local > n_backup:
+                _n = getattr(UnifiedRadixCache, "_h74_surplus_n", 0) + 1
+                UnifiedRadixCache._h74_surplus_n = _n
+                if _n <= 16 or _n % 256 == 0:
+                    logger.info(
+                        "H74 BACKUP-ACK DRAIN rank-local: acks=%d group_min=%d ongoing_backup=%d "
+                        "(the MIN drain would have left %d of this rank's acks queued) n=%d",
+                        _local, n_backup, len(getattr(self, "ongoing_backup", None) or {}), _local - n_backup, _n,
+                    )
+            n_backup = None
         self._drain_storage_control_queues_impl(
             n_revoke=n_revoke,
             n_backup=n_backup,

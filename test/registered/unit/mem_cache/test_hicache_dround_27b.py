@@ -123,7 +123,9 @@ class TheDrainReportsWhatTheGroupAgreed(_EnvCase):
         c._drain_storage_control_queues_impl = mock.Mock()
         self.assertFalse(c.drain_storage_control_queues())
         kw = c._drain_storage_control_queues_impl.call_args.kwargs
-        self.assertEqual((kw["n_revoke"], kw["n_backup"], kw["n_release"]), (0, 0, 0))
+        # fnFL2 H74 (x172/x174): the backup acks drain rank-locally (None = every
+        # ready ack of THIS rank); `hot` and the revoke/release counts stay the MIN
+        self.assertEqual((kw["n_revoke"], kw["n_backup"], kw["n_release"]), (0, None, 0))
 
     def test_a_pending_ack_is_agreed_and_drained_with_the_same_count(self):
         c = _cache()
@@ -133,6 +135,20 @@ class TheDrainReportsWhatTheGroupAgreed(_EnvCase):
         c._all_reduce_attn_groups = lambda t, op, label="": None
         c._drain_storage_control_queues_impl = mock.Mock()
         self.assertTrue(c.drain_storage_control_queues())
+        kw = c._drain_storage_control_queues_impl.call_args.kwargs
+        self.assertEqual((kw["n_revoke"], kw["n_backup"], kw["n_release"]), (0, None, 0))
+
+    def test_switched_off_the_backup_acks_drain_the_agreed_count(self):
+        from sglang.srt.environ import envs
+
+        c = _cache()
+        c.cache_controller = self._cc()
+        c.cache_controller.ack_backup_queue.put("op1")
+        c.cache_controller.ack_backup_queue.put("op2")
+        c._all_reduce_attn_groups = lambda t, op, label="": None
+        c._drain_storage_control_queues_impl = mock.Mock()
+        with envs.SGLANG_WEG2_ENABLE_LOCAL_BACKUP_ACK_DRAIN.override(False):
+            self.assertTrue(c.drain_storage_control_queues())
         kw = c._drain_storage_control_queues_impl.call_args.kwargs
         self.assertEqual((kw["n_revoke"], kw["n_backup"], kw["n_release"]), (0, 2, 0))
 

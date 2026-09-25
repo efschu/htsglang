@@ -1733,6 +1733,24 @@ class Envs:
     # H2: run the first N chunk publishes under torch's sync-debug "warn" mode
     # and log each implicit synchronising call site once (H2-SYNC-SITE). 0 = off.
     SGLANG_DEBUG_HICACHE_SYNC_TRACE = EnvInt(0)
+    # fnFL2 H74 (x172): each rank drains its OWN storage-write acks, the full
+    # ready count -- no MIN over the TP group. The MIN presumed that every TP
+    # rank issues the same store writes; Form A does not (TP0's arena staging
+    # pool vs the workers' plain host pool, TP0's mamba pin budget), so a rank
+    # with one write more than its peers kept that ack forever: ongoing_backup
+    # never emptied, hicache_backup(1) refused every /flush_cache and the front
+    # stopped with W3. The revoke and host-release drains keep the MIN. False
+    # restores the MIN for the backup acks too.
+    SGLANG_WEG2_ENABLE_LOCAL_BACKUP_ACK_DRAIN = EnvBool(True)
+    # fnFL2 H74 (x172): on a TP group the publish split window (#1407) is the
+    # chunk (4096, page-aligned) on every rank instead of a quarter of the
+    # rank's OWN host pool -- x172 split a 6080-token node into 4096 + 1984 on
+    # TP0 (arena staging pool, 4096 rows) and not on TP1/TP2 (353,600-row host
+    # pool, window 86,016): one node and one store write more on TP0, a tree
+    # that no longer has the same nodes on every rank. Single-rank groups (P,
+    # PP stages) keep the quarter-of-the-pool window. False restores the
+    # per-rank window.
+    SGLANG_WEG2_ENABLE_TP_UNIFORM_PUBLISH_WINDOW = EnvBool(True)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
