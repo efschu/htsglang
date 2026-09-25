@@ -120,12 +120,16 @@ def test_budget_never_keeps_fewer_rids_than_the_count_rule(store):
 
 
 def test_census_ignores_a_part_being_written(store):
+    """A part another rank is writing (``*.tmp``) costs no bytes. H81
+    (fnNV4f2): its rid is NEW, though -- the census names it with the temp
+    file's mtime, so no prune takes a rid under write for an old one."""
     with _keep_mib(16):
         _publish("weg2-8-10", 1000.0)
     tmp = store / "weg2-8-11.tail.pp1-2.pt.99.tmp"
     tmp.write_bytes(b"x" * 4096)
     newest, size = th.census(str(store))
-    assert set(newest) == {"weg2-8-10"} and "weg2-8-11" not in size
+    assert set(size) == {"weg2-8-10"} and "weg2-8-11" not in size
+    assert newest["weg2-8-11"] > newest["weg2-8-10"]
 
 
 def test_prune_victims_is_newest_first_and_keeps_the_rid_just_written():

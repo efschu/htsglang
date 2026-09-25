@@ -48,8 +48,10 @@ forward at all (weg2/tail_adopt.py, "SKIP").
 from __future__ import annotations
 
 from array import array
+import contextlib
 import glob
 import hashlib
+import itertools
 import logging
 import os
 import threading
@@ -288,6 +290,66 @@ def _part_index(part: str) -> str:
     return part.split("-", 1)[0]
 
 
+# -- H81: a part file under write is never another writer's or a pruner's ------
+#: fnNV4f2 P PP0 05:08:43: the publish thread of weg2-8-14 (its second leg 1,
+#: a requeue) died at `os.replace(tmp, ppath)` with FileNotFoundError -- the
+#: publish thread of weg2-8-12, one second earlier, had pruned "weg2-8-14" as
+#: an OLD rid (its only header was the first leg's, 05:08:22) and `remove`
+#: globbed `weg2-8-14.tail.*`, the in-flight `...pt.267295.tmp` included. The
+#: temp name was `<path>.<pid>.tmp`, so two writers of one part in one process
+#: would have shared it too. Now: one temp name per WRITE, a temp file is never
+#: removed by `remove`/`_remove_consumed`, a rid under write (a temp file on any
+#: rank, or a writer of this process) is the NEWEST rid for the prune, and the
+#: writers of one (rid, part) in this process take turns so the payload and the
+#: header they leave belong together.
+_TMP_SEQ = itertools.count()
+_WRITERS_GUARD = threading.Lock()
+_WRITERS: Dict[Tuple[str, str], list] = {}  # (rid, part) -> [RLock, writers]
+_INFLIGHT: Dict[str, int] = {}  # rid -> writers of this process
+
+
+def _tmp_path(path: str) -> str:
+    """H81: the temp name of ONE write: pid, thread and a process-wide
+    sequence number -- two writers never share it."""
+    return f"{path}.{os.getpid()}.{threading.get_ident()}.{next(_TMP_SEQ)}.tmp"
+
+
+def _is_tmp(path: str) -> bool:
+    return path.endswith(".tmp")
+
+
+@contextlib.contextmanager
+def _writing(rid: str, part: str):
+    """H81: this process writes (rid, part) -- writers of the same part take
+    turns, and `_prune` of this process never picks the rid meanwhile."""
+    key = (str(rid), str(part))
+    with _WRITERS_GUARD:
+        ent = _WRITERS.get(key)
+        if ent is None:
+            ent = _WRITERS[key] = [threading.RLock(), 0]
+        ent[1] += 1
+        _INFLIGHT[key[0]] = _INFLIGHT.get(key[0], 0) + 1
+    ent[0].acquire()
+    try:
+        yield
+    finally:
+        ent[0].release()
+        with _WRITERS_GUARD:
+            ent[1] -= 1
+            if ent[1] <= 0 and _WRITERS.get(key) is ent:
+                del _WRITERS[key]
+            n = _INFLIGHT.get(key[0], 0) - 1
+            if n > 0:
+                _INFLIGHT[key[0]] = n
+            else:
+                _INFLIGHT.pop(key[0], None)
+
+
+def _inflight_rids() -> set:
+    with _WRITERS_GUARD:
+        return set(_INFLIGHT)
+
+
 def manifest_state(headers: Sequence[TailHeader]) -> Tuple[str, int, int]:
     """H45: (state, have, want) of the parts D sees for one rid -- 'none'
     (no header yet), 'partial' (fewer PP ranks than the manifest names:
@@ -376,7 +438,6 @@ def write_part(spec: TailSpec, part: str, fa: Dict[int, Tuple[torch.Tensor, ...]
     )
     jpath, ppath = part_paths(spec.rid, part)
     os.makedirs(os.path.dirname(jpath), exist_ok=True)
-    tmp = f"{ppath}.{os.getpid()}.tmp"
     bundle = {"fa": fa, "gdn": gdn}
     if ple is not None and e1:
         bundle["ple"] = ple  # H63c: E1's PLE rows (state at c)
@@ -384,12 +445,21 @@ def write_part(spec: TailSpec, part: str, fa: Dict[int, Tuple[torch.Tensor, ...]
         bundle["end"] = {"fa": end.fa, "gdn": end.gdn, "ring": end.ring, "rope": end.rope}
         if end.ple is not None:
             bundle["end"]["ple"] = end.ple  # H63c: the PLE rows after N
-    torch.save(bundle, tmp)
-    os.replace(tmp, ppath)
-    tmp = f"{jpath}.{os.getpid()}.tmp"
-    with open(tmp, "wb") as f:
-        f.write(msgspec.json.encode(header))
-    os.replace(tmp, jpath)
+    with _writing(spec.rid, part):  # H81: this writer's own temp names, one writer per part
+        tmp = _tmp_path(ppath)
+        try:
+            torch.save(bundle, tmp)
+            os.replace(tmp, ppath)
+            tmp = _tmp_path(jpath)
+            with open(tmp, "wb") as f:
+                f.write(msgspec.json.encode(header))
+            os.replace(tmp, jpath)
+        finally:
+            if os.path.exists(tmp):  # a write that failed half-way leaves no temp file
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
     return header
 
 
@@ -435,10 +505,15 @@ def verify_part(header: TailHeader) -> Optional[dict]:
 
 
 def remove(rid: str) -> None:
+    """Remove the FINISHED part files of `rid`. A ``*.tmp`` is a write in
+    flight on some rank -- its writer renames it or removes it itself; taking
+    it away is the fnNV4f2 FileNotFoundError (H81)."""
     d = _dir()
     if not d:
         return
     for p in glob.glob(os.path.join(d, f"{glob.escape(rid)}.tail.*")):
+        if _is_tmp(p):
+            continue
         try:
             os.remove(p)
         except OSError:
@@ -452,19 +527,21 @@ def keep_budget_bytes() -> int:
 
 def census(d: str) -> Tuple[Dict[str, float], Dict[str, int]]:
     """H63b: rid -> newest mtime and rid -> bytes of its finished part files
-    in ``d`` (a ``*.tmp`` is a part another rank is writing right now)."""
+    in ``d``. A ``*.tmp`` is a part some rank is writing right now: it costs
+    no bytes yet, but its mtime makes the rid NEW (H81) -- a rid under write
+    is never the oldest one a prune picks (fnNV4f2: weg2-8-14's second leg 1
+    was pruned as the first leg's old parts)."""
     newest: Dict[str, float] = {}
     size: Dict[str, int] = {}
     for p in glob.glob(os.path.join(d, "*.tail.*")):
-        if p.endswith(".tmp"):
-            continue
         rid = os.path.basename(p).split(".tail.", 1)[0]
         try:
             st = os.stat(p)
         except OSError:
             continue
         newest[rid] = max(newest.get(rid, 0.0), float(st.st_mtime))
-        size[rid] = size.get(rid, 0) + int(st.st_size)
+        if not _is_tmp(p):
+            size[rid] = size.get(rid, 0) + int(st.st_size)
     return newest, size
 
 
@@ -496,10 +573,12 @@ def _prune(keep_rid: str, part: str = "") -> None:
     d = _dir()
     if not d:
         return
+    busy = _inflight_rids()  # H81: a rid this process is writing is never a victim
     budget = keep_budget_bytes()
     if budget > 0:
         newest, size = census(d)
-        victims = prune_victims(newest, size, keep_rid, capture_keep() - 1, budget)
+        victims = [r for r in prune_victims(newest, size, keep_rid, capture_keep() - 1, budget)
+                   if r not in busy]
         for rid in victims:
             remove(rid)
         if part.startswith("pp0"):
@@ -511,16 +590,15 @@ def _prune(keep_rid: str, part: str = "") -> None:
                 len(victims), f" removed_rids={','.join(victims)}" if victims else "", _KEEP_N[0],
             )
         return
-    newest: Dict[str, float] = {}
-    for p in glob.glob(os.path.join(d, "*.tail.*.json")):
-        rid = os.path.basename(p).split(".tail.", 1)[0]
-        try:
-            newest[rid] = max(newest.get(rid, 0.0), os.path.getmtime(p))
-        except OSError:
-            pass
+    # H81: every file of a rid counts for its age -- a header of the rid's
+    # PREVIOUS leg 1 is old, but the temp file (or fresh payload) of its
+    # current write is not (fnNV4f2 weg2-8-14: pruned by its old header while
+    # its second leg 1 was being written)
+    newest, _size = census(d)
     newest.pop(keep_rid, None)
     for rid in sorted(newest, key=newest.get, reverse=True)[capture_keep() - 1:]:
-        remove(rid)
+        if rid not in busy:
+            remove(rid)
 
 
 _CONSUMED_N = [0]
@@ -542,6 +620,8 @@ def _remove_consumed(rid: str) -> None:
     d = _dir()
     n = 0
     for p in glob.glob(os.path.join(d, f"{glob.escape(rid)}.tail.*")):
+        if _is_tmp(p):
+            continue  # H81: a write in flight (P republishing the rid) is its writer's
         try:
             os.remove(p)
             n += 1

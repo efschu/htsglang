@@ -204,7 +204,11 @@ def test_prune_keeps_the_newest_rids(arena):
     for i in range(4):
         spec = th.spec_for(f"weg2-{i}", list(range(N)), None, PAGE, RATIO)
         th.write_part(spec, "pp0", {}, {})
-        os.utime(th.part_paths(f"weg2-{i}", "pp0")[0], (1000 + i, 1000 + i))
+        # H81: payload and header of one part are written together (ms
+        # apart), so both carry the part's age -- the prune reads every file
+        # of a rid now, a payload newer than its header is a write in flight
+        for p in th.part_paths(f"weg2-{i}", "pp0"):
+            os.utime(p, (1000 + i, 1000 + i))
     th._prune("weg2-3")
     left = sorted({p.split(".tail.")[0] for p in os.listdir(os.path.join(arena, "handoff"))})
     assert left == ["weg2-2", "weg2-3"]
