@@ -218,6 +218,7 @@ from sglang.srt.managers.phase_purity import (
 from sglang.srt.managers import prefetch_ballot
 from sglang.srt.managers import tp_head_congruence
 from sglang.srt.managers import weg2_store_told
+from sglang.srt.weg2 import p_intake as _p_intake  # H91a: told kept until the queue lets go
 from sglang.srt.managers import weg2_d_hostgap as _d_hostgap
 from sglang.srt.layers.quantization import gguf_path_census as _gguf_path_census
 from sglang.srt.weg2 import p_trim_end_anchor as _weg2_trim
@@ -14191,7 +14192,12 @@ class Scheduler(
                 # form -- PP0 admits only what it has put on the wire, the
                 # followers only what has arrived and what their own read
                 # reproduced. Nothing below this branch decides.
-                _told_loaded = weg2_store_told.admission(self, req, _note_skip)
+                # H91a: the verdict stands until the request leaves the queue
+                # (a visit the adder could not seat used to consume it, and
+                # every later visit skipped as weg2_store_told_pending).
+                _told_loaded = _p_intake.told_admission(
+                    self, req, _note_skip, weg2_store_told.admission
+                )
                 if _told_loaded is None:
                     continue
             if self.enable_hicache_storage and _pp_group:
@@ -15006,6 +15012,7 @@ class Scheduler(
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        _p_intake.settle_told(self, self.waiting_queue)  # H91a: admitted/aborted verdicts go
 
         # #791 PP ADMISSION UNIFORMITY: PP0 publishes this pass's admission
         # decision here; scheduler_pp_mixin.py's _event_loop_pp_body drains
