@@ -69,6 +69,9 @@ _HELLO = 0x504C4531
 _KIND_GATHER = 1
 _KIND_MAP = 2
 _KIND_QUIT = 3
+# fnFL2 H73: the autonomous decode stage (qwen4_exp_ple_pread_worker.AutoStage)
+_KIND_AUTO = 4
+_KIND_ROUND = 5
 _F_SETPIPE_SZ = 1031
 _PIPE_BYTES = 1 << 20
 _CUDA_HOST_REGISTER_PORTABLE = 1
@@ -396,6 +399,30 @@ class PlePreadProcs:
         for i in range(self.n_procs):
             self._recv(i, seq)
         self.slot_bytes[slot] = int(nbytes)
+
+    def configure_auto(self, slot: int, cfgs: Sequence[dict]) -> None:
+        """fnFL2 H73: worker ``i`` fills its share of slot ``slot`` on its own,
+        as ``cfgs[i]`` describes (``AutoStage`` of the worker script). The
+        slot must be mapped; nothing may be in flight."""
+        if self._inflight is not None:
+            raise RuntimeError("PLE pread: auto-stage setup with a gather in flight")
+        if len(cfgs) != self.n_procs:
+            raise ValueError(f"auto stage: {len(cfgs)} configs for {self.n_procs} workers")
+        seq = self._next_seq()
+        for i, cfg in enumerate(cfgs):
+            payload = json.dumps(cfg).encode()
+            self._send(i, _KIND_AUTO, seq, slot, len(payload), 0, payload)
+        for i in range(self.n_procs):
+            self._recv(i, seq)
+
+    def ping(self, slot: int, part: int, seq: int, bs: int, cols: int, width: int = 0) -> None:
+        """fnFL2 H73: announce round ``seq`` of part ``part`` of the auto stage
+        in ``slot`` (``bs`` requests of ``cols`` tokens in the mailbox, verify
+        width ``width``). No reply is ever read: the workers poll the round's
+        flag on their own."""
+        arg = ((int(part) & 0xFF) << 32) | ((int(width) & 0xFFFF) << 16) | (int(cols) & 0xFFFF)
+        for i in range(self.n_procs):
+            self._send(i, _KIND_ROUND, int(seq), slot, int(bs), arg)
 
     def submit(self, slot: int, dest: torch.Tensor, keys: torch.Tensor, step: int = 0) -> int:
         """Start reading row ``dest[j]`` of ``slot`` from ``keys[j]`` ((file

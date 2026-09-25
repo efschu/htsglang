@@ -91,6 +91,7 @@ from sglang.srt.models.qwen4_exp_ple_decode_pread import (
     disarm_ple_verify_gate,
     finish_ple_verify_stage,
     ple_stage_is_gated,
+    post_ple_bonus_stage,
 )
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
@@ -3862,6 +3863,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 bonus_tokens,
                 accept_index.shape[1],
                 bs,
+            )
+            # fnFL2 H73 (SGLANG_WEG2_PLE_STAGE_BONUS_EARLY): the next verify
+            # row starts with this bonus; its PLE rows are read by the pread
+            # workers while the draft extend and the next draft run. After the
+            # mamba commit (the n-gram history is the next round's). No-op
+            # unless the autonomous stage lives in this process.
+            post_ple_bonus_stage(
+                target_runner.model,
+                target_runner.req_to_token_pool,
+                batch,
+                bonus_tokens,
+                int(verify_input.draft_token_num),
             )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)

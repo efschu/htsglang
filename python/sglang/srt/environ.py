@@ -805,6 +805,24 @@ class Envs:
     # round, all three cards idle) off the device's critical path. Off = the
     # H40 order and the H40 kernel, byte-identical.
     SGLANG_WEG2_PLE_STAGE_BEHIND_REPLAY = EnvBool(False)
+    # fnFL2 H73 (D, verify rounds): the pread WORKERS stage the round on their
+    # own. The verify's windows are posted by the device into a mailbox of the
+    # stage right behind the draft (D2H copy, then the round number into a
+    # flag word, stream-ordered); the workers poll the flag, hash, pread their
+    # share of the rows into the stage and publish one done word each; the
+    # gate (H69, gated kernel) waits for every word. The scheduler thread
+    # neither waits for the draft nor hashes nor preads (x172: ple_stage
+    # 2.8-3.0 ms host, ple.wait 3.2-3.8 ms device per round), and the reads
+    # start at the draft's end instead of after the verify replay returned.
+    # Implies the gated kernel; supersedes BEHIND_REPLAY (no hook). Off = the
+    # H40/H69 paths, byte-identical.
+    SGLANG_WEG2_PLE_STAGE_AUTONOMOUS = EnvBool(False)
+    # fnFL2 H73 (with AUTONOMOUS): the NEXT round's first verify token is this
+    # round's bonus -- after the accept its window [committed history | bonus]
+    # is posted as well, and the workers read those rows (16 per request)
+    # while the draft extend and the next draft run; the verify round then
+    # keeps every row whose id is already staged. Off = only the verify post.
+    SGLANG_WEG2_PLE_STAGE_BONUS_EARLY = EnvBool(False)
     # fnFL2 H69b (Form A only, D's host): build the PLE n-gram table with the
     # full vocabulary (enable_tp=False), as F13 does for embed_tokens. Without
     # it the host holds the even TP=3 shard [0, V/3) of the n-gram ids and --
