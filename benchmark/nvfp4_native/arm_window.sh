@@ -15,6 +15,7 @@ case "$n1" in *5090*) ;; *) echo "ABORT card1 is $n1"; exit 3;; esac
 case "$n2" in *3080*) ;; *) echo "ABORT card2 is $n2"; exit 3;; esac
 [ "$u1" -lt 500 ] && [ "$u2" -lt 500 ] || { echo "ABORT cards busy ($u1/$u2 MiB)"; exit 4; }
 (
+  CUDA_VISIBLE_DEVICES=1 timeout 60 $WT/.jit/mma/probe_sm120a > "$OUT/mma_int4_5090.txt" 2>&1; echo "5090 mma rc=$?" >> "$OUT/status.txt"
   CUDA_VISIBLE_DEVICES=1 timeout 780 "$R" --out "$OUT/b5090_lanes.json" --fi-backends cutlass,cudnn > "$OUT/b5090_lanes.log" 2>&1
   echo "5090 lanes rc=$?" >> "$OUT/status.txt"
   CUDA_VISIBLE_DEVICES=1 BENCH_SCRIPT=bench_layer_components.py timeout 240 "$R" --out "$OUT/b5090_comp.json" > "$OUT/b5090_comp.log" 2>&1
@@ -23,6 +24,7 @@ case "$n2" in *3080*) ;; *) echo "ABORT card2 is $n2"; exit 3;; esac
 ) &
 P1=$!
 (
+  CUDA_VISIBLE_DEVICES=2 timeout 60 $WT/.jit/mma/probe_sm86 > "$OUT/mma_int4_3080.txt" 2>&1; echo "3080 mma rc=$?" >> "$OUT/status.txt"
   CUDA_VISIBLE_DEVICES=2 FLASHINFER_CUDA_ARCH_LIST=8.6 BENCH_SCRIPT=bench_layer_components.py timeout 300 "$R" --out "$OUT/b3080_comp.json" > "$OUT/b3080_comp.log" 2>&1
   echo "3080 comp rc=$?" >> "$OUT/status.txt"
   CUDA_VISIBLE_DEVICES=2 FLASHINFER_CUDA_ARCH_LIST=8.6 timeout 780 "$R" --out "$OUT/b3080_lanes.json" --shapes P.gate_up,P.down,D.gate_up,D.down --ms 1,8,16,48,512,2048 > "$OUT/b3080_lanes.log" 2>&1
