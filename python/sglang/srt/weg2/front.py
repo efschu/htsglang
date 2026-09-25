@@ -3105,6 +3105,10 @@ class Front:
             # sb5f shipped `flip_s=3.79 (median of 30)` from a different
             # layout's flips and nobody noticed for a whole run.
             "x_tokens": self.tp_prefill_max_tokens,
+            # RC7-X: the split and its bound, read by the metal probe.
+            "x_busy_tokens": max(0, min(int(getattr(self, "x_busy_tokens", X_BUSY_DEFAULT_TOKENS)),
+                                        int(self.tp_prefill_max_tokens))),
+            "x_ceiling_tokens": getattr(self, "x_ceiling_tokens", self.tp_prefill_max_tokens),
             "flip_min_work_tokens": self.flip_min_work_tokens,
             "x_flip_s": self.x_flip_s_provenance(),
             "vision_flip_urgent": bool(getattr(self, "vision_flip_urgent", False)),

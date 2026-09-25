@@ -398,6 +398,9 @@ class LiveXAndTheCeiling(CustomTestCase):
             self.assertIn(want, line)
         src = inspect.getsource(Front.resolve_x_live)
         self.assertIn("X*=%d X_ceiling=%s X_busy=%d", src)
+        st = f.state_dict()
+        self.assertEqual((st["x_busy_tokens"], st["x_ceiling_tokens"]), (4096, CEIL))
+        self.assertGreater(st["x_tokens"], 4096)
 
 
 # ===========================================================================
@@ -701,6 +704,39 @@ class LauncherFrontSeam(CustomTestCase):
             L.resolve_x_ceiling(CEIL, 4096, -1)
         self.assertIn("W155", str(cm.exception))
         self.assertEqual(L.resolve_x_ceiling(CEIL, 4096, 0)[0], CEIL, "0 is legal")
+
+
+class StoreShortTailStaysAtTheLaunchX(CustomTestCase):
+    """D's riegel rises to the ceiling; the #1324/#1471 store-short tail (a
+    RECOVERY prefill on D, which halts every running decode like a SHORT grant)
+    keeps pricing against the launch X. Writer = launcher env for D, reader =
+    D's scheduler."""
+
+    def test_writer(self):
+        from sglang.srt.weg2 import launcher as L
+
+        self.assertEqual(L.store_short_tail_env(4096, 4096), {}, "unset ceiling: D env as before")
+        self.assertEqual(L.store_short_tail_env(4096, CEIL), {L.STORE_SHORT_TAIL_X_ENV: "4096"})
+        src = inspect.getsource(L.main)
+        self.assertEqual(src.count("env_d.update(store_short_tail_env(x_tokens, x_d_riegel))"), 2)
+
+    def test_reader_both_directions(self):
+        from sglang.srt.managers import scheduler as S
+        from sglang.srt.weg2 import launcher as L
+
+        self.assertEqual(S.STORE_SHORT_TAIL_X_ENV, L.STORE_SHORT_TAIL_X_ENV, "one name, both ends")
+        sched = types.SimpleNamespace(server_args=types.SimpleNamespace(tp_prefill_max_tokens=CEIL))
+        req = types.SimpleNamespace(_weg2_store_delivered=4000,
+                                    full_untruncated_fill_ids=list(range(10000)))  # remainder 6000
+        env = {k: v for k, v in os.environ.items() if k != S.STORE_SHORT_TAIL_X_ENV}
+        env["SGLANG_WEG2_STORE_SHORT_TAIL"] = "1"
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(S._weg2_store_short_tail_x(sched), CEIL)
+            self.assertTrue(S._weg2_store_tail_settles(sched, req), "no cap: priced at the riegel")
+        env[S.STORE_SHORT_TAIL_X_ENV] = "4096"
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(S._weg2_store_short_tail_x(sched), 4096)
+            self.assertFalse(S._weg2_store_tail_settles(sched, req), "capped at the launch X")
 
 
 if __name__ == "__main__":

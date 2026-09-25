@@ -709,6 +709,27 @@ def _weg2_store_short_remainder(req) -> Optional[int]:
     return max(0, len(ids) - int(delivered))
 
 
+#: RC7-X: group D's W50 riegel now stands at --x-ceiling-tokens, above the
+#: launch X. The launcher hands D the LAUNCH X here so the two store-short
+#: tail paths below keep pricing a stalled read's remainder against it -- a
+#: recovery prefill on D halts every running decode just like a SHORT grant
+#: does, and the front bounds those by X_busy. Unset = D's riegel, as before.
+STORE_SHORT_TAIL_X_ENV = "SGLANG_WEG2_STORE_SHORT_TAIL_X"
+
+
+def _weg2_store_short_tail_x(sched) -> int:
+    """The X the #1324/#1471 store-short tail is priced against: D's law-4
+    riegel (``--tp-prefill-max-tokens``), capped by ``STORE_SHORT_TAIL_X_ENV``
+    when the launcher set it. 0 = off, exactly as the riegel's own 0."""
+    x = int(getattr(getattr(sched, "server_args", None), "tp_prefill_max_tokens", 0) or 0)
+    raw = (os.environ.get(STORE_SHORT_TAIL_X_ENV, "") or "").strip()
+    try:
+        cap = int(raw) if raw else 0
+    except ValueError:
+        cap = 0
+    return min(x, cap) if (x > 0 and cap > 0) else x
+
+
 def _weg2_store_short_recompute(sched, req, reason: str, span) -> Optional[str]:
     """The standstill exit of a STORE-SHORT read whose remainder fits in X:
     clear the mark and return ``'expired'`` -- the request goes to its
@@ -717,7 +738,7 @@ def _weg2_store_short_recompute(sched, req, reason: str, span) -> Optional[str]:
     None = not this case: the caller answers W88 as before."""
     if not _weg2_store_short_tail_on() or reason != _DEFER_REASON_STORE_SHORT:
         return None
-    x = int(getattr(getattr(sched, "server_args", None), "tp_prefill_max_tokens", 0) or 0)
+    x = _weg2_store_short_tail_x(sched)
     remainder = _weg2_store_short_remainder(req)
     if x <= 0 or remainder is None or remainder > x:
         return None
@@ -759,7 +780,7 @@ def _weg2_store_tail_settles(sched, req) -> bool:
     before -- over X (weg2xsn229, 4095 of 98210) the request waits for its read."""
     if not _weg2_store_short_tail_on():
         return False
-    x = int(getattr(getattr(sched, "server_args", None), "tp_prefill_max_tokens", 0) or 0)
+    x = _weg2_store_short_tail_x(sched)
     remainder = _weg2_store_short_remainder(req)
     return x > 0 and remainder is not None and remainder <= x
 

@@ -1583,6 +1583,21 @@ def resolve_x_ceiling(ceiling: Optional[int], x_tokens: int,
                f"--tp-prefill-max-tokens {c}; the front's live X* is clamped to it)")
 
 
+#: RC7-X: read by group D's scheduler (``_weg2_store_short_tail_x``).
+STORE_SHORT_TAIL_X_ENV = "SGLANG_WEG2_STORE_SHORT_TAIL_X"
+
+
+def store_short_tail_env(x_tokens: int, x_d_riegel: int) -> Dict[str, str]:
+    """RC7-X: group D's env addition when its W50 riegel stands above the
+    launch X: the #1324/#1471 store-short tail keeps pricing a stalled read's
+    remainder against the LAUNCH X (a recovery prefill on D halts every running
+    decode, like a SHORT grant, which the front bounds by X_busy). Empty when
+    the ceiling is unset -- D's env byte for byte as before."""
+    if int(x_d_riegel) <= int(x_tokens):
+        return {}
+    return {STORE_SHORT_TAIL_X_ENV: str(int(x_tokens))}
+
+
 def d_hold_active(d_hold_s: Optional[float]) -> bool:
     """RC2 review (L4): is ``--d-hold-s`` ON? Unset OR 0 is OFF, like
     ``--d-short-drain-tokens 0`` and as the >= 0 refusal already promised
@@ -14424,6 +14439,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.op_line)
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
+        env_d.update(store_short_tail_env(x_tokens, x_d_riegel))  # RC7-X
         spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
@@ -14524,6 +14540,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.op_line)
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
+    env_d.update(store_short_tail_env(x_tokens, x_d_riegel))  # RC7-X
     spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
