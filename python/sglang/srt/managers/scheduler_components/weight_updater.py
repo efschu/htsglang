@@ -234,6 +234,21 @@ def _weg2_identity(owner, method: str, default):
     return default if got is None else got
 
 
+def _runner_load_format(runner, fallback):
+    """The load format THIS runner was loaded with -- its own ``load_config``,
+    built from ``server_args.load_format`` at the moment the runner was created
+    (the target before, the draft after the scheduler's
+    ``--speculative-draft-load-format`` override). Never the process-wide
+    ``server_args.load_format``, which after that override names the DRAFT's
+    format for the whole process (27B line GGUF, 2026-09-25: a GGUF target with
+    ``--speculative-draft-load-format auto`` would reload its ``.gguf`` with
+    ``auto``). ``fallback`` only where no runner or no ``load_config`` exists."""
+    fmt = getattr(getattr(runner, "load_config", None), "load_format", None)
+    if fmt is None:
+        return fallback
+    return getattr(fmt, "value", fmt)
+
+
 def _get_draft_model_runner(draft_worker):
     # DFlash / FrozenKVMTP workers expose draft_model_runner directly
     runner = getattr(draft_worker, "draft_model_runner", None)
@@ -2197,7 +2212,12 @@ class SchedulerWeightUpdaterManager:
                     success, message = self.draft_worker.update_weights_from_disk(
                         UpdateWeightFromDiskReqInput(
                             model_path=draft_path,
-                            load_format=getattr(server_args, "load_format", None),
+                            # the DRAFT runner's own format, never the
+                            # process-wide one (_runner_load_format)
+                            load_format=_runner_load_format(
+                                _get_draft_model_runner(self.draft_worker),
+                                getattr(server_args, "load_format", None),
+                            ),
                             flush_cache=False,
                             torch_empty_cache=False,
                         )
@@ -2608,7 +2628,12 @@ class SchedulerWeightUpdaterManager:
                     out = self.update_weights_from_disk(
                         UpdateWeightFromDiskReqInput(
                             model_path=server_args.model_path,
-                            load_format=getattr(server_args, "load_format", None),
+                            # the TARGET runner's own format, never the
+                            # process-wide one (_runner_load_format)
+                            load_format=_runner_load_format(
+                                getattr(self.tp_worker, "model_runner", None),
+                                getattr(server_args, "load_format", None),
+                            ),
                             flush_cache=False,
                             torch_empty_cache=False,
                         )
