@@ -738,6 +738,12 @@ class AnthropicServing:
                 anthropic_request.chat_template_kwargs
             )
 
+        # H90: the caller's request id reaches the scheduler, so an abort by
+        # that id (the Weg 2 front after WEG2-INTAKE-STALL) finds the request
+        # on every rank. Absent stays absent: the server then mints its own.
+        if anthropic_request.rid is not None:
+            request_data["rid"] = anthropic_request.rid
+
         # Enable usage in stream so we can report it
         if anthropic_request.stream:
             request_data["stream_options"] = StreamOptions(

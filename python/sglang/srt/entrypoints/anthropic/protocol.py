@@ -466,6 +466,14 @@ class AnthropicMessagesRequest(BaseModel):
     #: Anthropic's typed ``thinking`` field stays authoritative over the
     #: toggle itself.
     chat_template_kwargs: Optional[dict[str, Any]] = None
+    #: H90 (cu130 abnahme dkrnfbar1agent09252021): the request id the caller
+    #: chose, as ``/v1/chat/completions`` and ``/generate`` already accept it.
+    #: The Weg 2 front names every request (``weg2-<epoch>-<n>``) and aborts it
+    #: by that name on every PP rank after a WEG2-INTAKE-STALL; undeclared, the
+    #: field was dropped (``extra="ignore"``), the scheduler ran the request
+    #: under a fresh uuid, the abort matched nothing, and PP1/PP2 kept it in
+    #: their waiting queues -> W3 at the next flip.
+    rid: Optional[str] = None
 
     @field_validator("model")
     @classmethod
