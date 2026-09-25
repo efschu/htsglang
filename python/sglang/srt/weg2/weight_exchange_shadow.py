@@ -752,6 +752,27 @@ def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
 # ---------------------------------------------------------------------------
 
 
+_LEAFS = frozenset({"weight", "bias", "weight_scale", "weight_zero_point", "scale",
+                    "input_scale", "weight_packed", "weight_shape", "g_idx"})
+
+#: Backlog #38 L4: the NVFP4 native-layout parameters are LEAVES of their
+#: linear's class, not classes of their own. Gated on a BOOT-UNIFORM env the
+#: weg2 launcher sets for itself and every rank under --fp4-native-mixed, so
+#: (a) the launcher's checkpoint census and every rank's manifest read ONE
+#: answer, and (b) the class names of today's Marlin NVFP4 profile
+#: (``weight_global_scale``, ``alpha``, ... as classes) do not change.
+NVFP4_NATIVE_LEAFS_ENV = "SGLANG_FP4_NATIVE_MIXED_BOOT"
+NVFP4_NATIVE_LEAF_NAMES = frozenset({
+    "weight_scale_interleaved", "alpha", "input_scale_inv", "weight_scale_2",
+    "weight_global_scale", "weight_global_scale_w4a16",
+})
+_LEAFS_NATIVE = _LEAFS | NVFP4_NATIVE_LEAF_NAMES
+
+
+def nvfp4_native_leafs_on() -> bool:
+    return os.environ.get(NVFP4_NATIVE_LEAFS_ENV, "").strip() == "1"
+
+
 def tensor_class(param_name: str) -> str:
     """The spec section 2.2 CLASS of a parameter, from its own name.
 
@@ -765,8 +786,7 @@ def tensor_class(param_name: str) -> str:
     parts = [p for p in str(param_name).split(".") if p]
     if not parts:
         return "?"
-    leafs = {"weight", "bias", "weight_scale", "weight_zero_point", "scale",
-             "input_scale", "weight_packed", "weight_shape", "g_idx"}
+    leafs = _LEAFS_NATIVE if nvfp4_native_leafs_on() else _LEAFS
     for part in reversed(parts):
         if part in leafs or part.isdigit():
             continue
@@ -2947,6 +2967,22 @@ def card_manifest_entries(inventory: Sequence[object],
         for g in inventory))
 
 
+def _in_nvfp4_sf_tiles(owner, leaf: str, rows: Tuple[int, ...]) -> Tuple[int, ...]:
+    """Backlog #38: a 128x4-swizzled NVFP4 scale is described in 128-row tiles
+    (``weight_exchange.StorageGeom._nvfp4_sf_tile_view``), so its declared
+    components are too. A component that is not a whole number of tiles has no
+    tile-view boundary; the declaration is then dropped (``()``) and the join
+    refuses the tensor by name rather than cutting a tile in half."""
+    from sglang.srt.weg2 import weight_exchange as wx
+
+    if not wx.is_nvfp4_sf_tile_view(getattr(owner, leaf, None)):
+        return rows
+    tile = wx.NVFP4_SF_TILE_ROWS
+    if any(int(r) % tile for r in rows):
+        return ()
+    return tuple(int(r) // tile for r in rows)
+
+
 def _qkv_component_rows(model, name: str) -> Tuple[int, ...]:
     """#1384: this parameter's DECLARED (q, k, v) row split, if any.
 
@@ -2987,14 +3023,14 @@ def _qkv_component_rows(model, name: str) -> Tuple[int, ...]:
     k = getattr(owner, "kv_proj_shard_size", None)
     v = getattr(owner, "v_proj_shard_size", None)
     if q is not None and k is not None and v is not None:
-        return (int(q), int(k), int(v))
+        return _in_nvfp4_sf_tiles(owner, _leaf, (int(q), int(k), int(v)))
     parts = getattr(owner, "output_partition_sizes", None)
     try:
         parts = tuple(int(x) for x in (parts or ()))
     except (TypeError, ValueError):
         parts = ()
     if len(parts) >= 2:
-        return parts
+        return _in_nvfp4_sf_tiles(owner, _leaf, parts)
     if mod_path.endswith(".conv1d"):
         parent_path = mod_path.rpartition(".")[0]
         try:

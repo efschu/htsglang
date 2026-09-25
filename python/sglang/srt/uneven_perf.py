@@ -793,6 +793,29 @@ _FORMAT_LANES: Dict[str, Tuple[str, ...]] = {
     "int8": (LANE_INT8_NATIVE,),
 }
 
+#: Backlog #38 L7: MEASURED NVFP4 lane rates for --fp4-gemm-backend native-mixed
+#: (5090 native W4A4, 3080 Marlin W4A16 on the shared layout). The NVFP4 lanes
+#: have no planner probe, so without them every card fell back to the dense
+#: bf16 score. The measurements live in the evidence register
+#: ``sglang.srt.planner.nvfp4_lane_record`` (window zcx7pv, provenance and power
+#: limits there); this module only looks the DETECTED card up. Used ONLY when the
+#: boot runs native-mixed (NVFP4_NATIVE_MIXED_ENV, set by the weg2 launcher for
+#: itself and both groups) and ONLY for a lane the profile did not measure
+#: itself; every other boot reads the profile exactly as before.
+NVFP4_NATIVE_MIXED_ENV = "SGLANG_FP4_NATIVE_MIXED_BOOT"
+_NVFP4_LANES = (LANE_NVFP4_NATIVE, LANE_NVFP4_MARLIN)
+
+
+def nvfp4_native_mixed_boot() -> bool:
+    return os.environ.get(NVFP4_NATIVE_MIXED_ENV, "").strip() == "1"
+
+
+def nvfp4_record_lanes(card_name: str) -> Dict[str, float]:
+    from sglang.srt.planner.nvfp4_lane_record import lanes_for
+
+    return lanes_for(card_name)
+
+
 #: Formats this table RECOGNISES but has no measured lane for. The distinction
 #: is #606's: "we know this format and no lane of it is measurable here" is a
 #: different statement from "we do not recognise this format at all", and a
@@ -2513,6 +2536,14 @@ def rank_gemm_scores(
         # unconditionally -- so it is not carried in the per-card lane map.
         available = dict(entry.get("gemm_lanes") or {})
         available[LANE_BF16] = float(entry["gemm_tflops"])
+        from_record = set()
+        if nvfp4_native_mixed_boot() and any(lane in _NVFP4_LANES for lane in lanes):
+            # #38 L7: the profile's own measurement wins; the record fills only
+            # what the rig profile never probed. Every other boot: untouched.
+            for lane, v in nvfp4_record_lanes(entry.get("name", "")).items():
+                if lane not in available:
+                    available[lane] = float(v)
+                    from_record.add(lane)
         chosen = next((lane for lane in lanes if lane in available), None)
         if chosen is None:
             scores.append(float(entry["gemm_tflops"]))
@@ -2540,7 +2571,12 @@ def rank_gemm_scores(
             )
         else:
             scores.append(float(available[chosen]))
-            labels.append(_LANE_LABELS.get(chosen, chosen))
+            label = _LANE_LABELS.get(chosen, chosen)
+            if chosen in from_record:
+                from sglang.srt.planner.nvfp4_lane_record import SOURCE
+
+                label += f" [{SOURCE}]"
+            labels.append(label)
     return scores, labels, warnings
 
 

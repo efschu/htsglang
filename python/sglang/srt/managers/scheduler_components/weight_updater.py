@@ -5984,6 +5984,27 @@ class SchedulerWeightUpdaterManager:
         self._weg2_owned_name_keys_cache = keys
         return keys
 
+    def _weg2_nvfp4_marlin_to_native(self) -> None:
+        """#38 L8, SLEEP side: Marlin -> native content of every flagged NVFP4
+        linear (nvfp4_marlin_inplace). RAISES on failure: a deposit of Marlin
+        bytes into the native plan would serve wrong weights on the peer."""
+        from sglang.srt.layers.quantization import nvfp4_marlin_inplace as mi
+
+        mi.model_to_native(self._weg2_wake_models())
+
+    def _weg2_nvfp4_marlin_after_wake(self) -> None:
+        """#38 L8, WAKE side: native -> Marlin content. When the exchange
+        carried the bytes they are native whatever the stamps say."""
+        from sglang.srt.layers.quantization import nvfp4_marlin_inplace as mi
+
+        models = self._weg2_wake_models()
+        if not mi.flagged_layers(models):
+            return
+        mi.model_to_marlin(
+            models,
+            delivered_native=self._weg2_wake_weight_carrier() == self.CARRIER_EXCHANGE,
+        )
+
     def _weg2_wake_models(self) -> list:
         """Every model this rank computes with after a wake -- the TARGET
         (tp_worker's runner) and, when present and distinct, the DRAFT.  The
@@ -7271,6 +7292,11 @@ class SchedulerWeightUpdaterManager:
             # arrives with part of the family already paused, and reading then
             # would be the campaign (a) fault.
             if not family_paused_before:
+                # #38 L8: an sm_8x native-mixed rank holds Marlin CONTENT in
+                # the native parameters; the digest and the deposit below must
+                # read NATIVE bytes. No flagged layer (every other boot): no
+                # work, no line.
+                self._weg2_nvfp4_marlin_to_native()
                 self._weg2_seam_digest_before(recv_req, weights_tags)
                 _weg2_ph("seam_before")
             # #1284: the NEED series, and the refusal that reads it.  The pause
@@ -8448,6 +8474,11 @@ class SchedulerWeightUpdaterManager:
                 # have reached the log before it does.
                 self._weg2_seam_digest_after(recv_req, weights_tags)
                 _weg2_ph("seam_after")
+                # #38 L8: AFTER the grader (it hashes the landed native bytes),
+                # before any forward: native -> Marlin content on an sm_8x
+                # native-mixed rank.
+                self._weg2_nvfp4_marlin_after_wake()
+                _weg2_ph("nvfp4_marlin")
 
         if any(is_weights_family_tag(t) for t in tags):
             self._weg2_weights_epoch_done = _kv_epoch  # the legs of this epoch are collected
