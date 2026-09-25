@@ -124,7 +124,24 @@ def apply_fp4_marlin_linear(
     return output.reshape(out_shape)
 
 
-def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
+def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module, *, born_in=None) -> None:
+    """Repack a dense NVFP4 linear into Marlin's layout.
+
+    ``born_in`` (27B line, weg2 H39 for NVFP4; default None = unchanged): the
+    same survivor hook as ``marlin_utils_fp8.prepare_fp8_layer_for_marlin`` --
+    the caller runs this OUTSIDE the weg2 tag pool and passes
+    ``weg2_memory_saver.back_into_tag_pool``; the workspace, the repacked
+    weight, the Marlin scales, the global scale and the bias are born back in
+    the tag pool, the checkpoint-format weight and scales are released right
+    before their survivors (same byte counts: uint8 [N, K/2] -> int32
+    [K/16, 2N], fp8 [N, K/16] -> fp8 [K/16, N]), everything else dies in the
+    load's transient pool (weg2xsn441 measured the FP8 twin of this residue at
+    1.5-4.1 GiB per rank)."""
+    from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+        _as_survivor,
+        _survivor_scope,
+    )
+
     # Probe, not requirement: ModelOpt binds its ModelOptFp4Config (which
     # carries group_size) to layer.quant_config, while a compressed-tensors
     # linear carries the CompressedTensorsConfig, whose group size lives per
@@ -148,38 +165,46 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         )
 
     device = layer.weight.device
-    layer.workspace = marlin_make_workspace(device)
+    with _survivor_scope(born_in):
+        layer.workspace = marlin_make_workspace(device)
 
     perm = torch.empty(0, dtype=torch.int, device=device)
     qweight = layer.weight.view(torch.int32).T.contiguous()
-    marlin_qweight = gptq_marlin_repack(
-        b_q_weight=qweight,
-        perm=perm,
-        size_k=part_size_k,
-        size_n=part_size_n,
-        num_bits=4,
-    )
+    if born_in is not None:
+        # H39: ``qweight`` is a copy; the checkpoint weight dies before its
+        # survivor is born, which takes its block of the tag pool.
+        layer.weight = None
+    with _survivor_scope(born_in):
+        marlin_qweight = gptq_marlin_repack(
+            b_q_weight=qweight,
+            perm=perm,
+            size_k=part_size_k,
+            size_n=part_size_n,
+            num_bits=4,
+        )
     layer.weight = torch.nn.Parameter(marlin_qweight, requires_grad=False)
 
     weight_scale = layer.weight_scale.T.contiguous().to(param_dtype)
+    if born_in is not None:
+        layer.weight_scale = None  # H39: the checkpoint scales die before theirs
     weight_scale = marlin_permute_scales(
         s=weight_scale,
         size_k=part_size_k,
         size_n=part_size_n,
         group_size=16,
     )
-    weight_scale = nvfp4_marlin_process_scales(weight_scale)
+    weight_scale = _as_survivor(nvfp4_marlin_process_scales(weight_scale), born_in)
     layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 
     weight_global_scale = layer.weight_global_scale.to(param_dtype)
     weight_global_scale = nvfp4_marlin_process_global_scale(weight_global_scale)
     layer.weight_global_scale = torch.nn.Parameter(
-        weight_global_scale, requires_grad=False
+        _as_survivor(weight_global_scale, born_in), requires_grad=False
     )
 
     if hasattr(layer, "bias") and layer.bias is not None:
         assert layer.bias.shape == (part_size_n,)
-        bias = marlin_permute_bias(layer.bias)
+        bias = _as_survivor(marlin_permute_bias(layer.bias), born_in)
         layer.bias = torch.nn.Parameter(bias, requires_grad=False)
 
 

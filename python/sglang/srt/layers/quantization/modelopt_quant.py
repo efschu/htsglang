@@ -40,6 +40,7 @@ from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_linear_bmm_flashinfer,
+    can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     is_blackwell_supported,
 )
@@ -49,6 +50,9 @@ from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     prepare_moe_nvfp4_layer_for_marlin,
     prepare_nvfp4_layer_for_marlin,
+)
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    prepare_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
@@ -445,6 +449,13 @@ class ModelOptQuantConfig(QuantizationConfig):
 class ModelOptFp8Config(ModelOptQuantConfig):
     """Configuration for ModelOpt FP8 quantization, including serialization and compatibility checks."""
 
+    # ModelOptFp8LinearMethod repacks through ``prepare_fp8_layer_for_marlin``
+    # whenever ``use_marlin`` resolves True (upstream sglang #31340: sm80..88
+    # auto, or SGLANG_FORCE_FP8_MARLIN) -- the fork's contract in
+    # base_config.marlin_packable_linear: a backend that repacks through Marlin
+    # ANYWHERE declares it, so an uneven-TP split lands on Marlin's tiles.
+    marlin_packable_linear = True
+
     def __init__(
         self,
         is_checkpoint_fp8_serialized: bool = False,
@@ -566,6 +577,16 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.enable_flashinfer_bmm = is_sm100_supported() and is_flashinfer_available()
+        # Adopted from upstream sglang #31340 (7de8792758, "Fix FP8 Triton dtype
+        # selection on A100"): weight-only FP8 through Marlin where there is no
+        # FP8 tensor core (sm80..88), or everywhere with SGLANG_FORCE_FP8_MARLIN
+        # -- the 27B weg2 flip forces it on every rank (--fp8-uniform-marlin) so
+        # the 5090 holds the same byte layout as the 3080s.
+        self.use_marlin = False
+        if is_cuda():
+            self.use_marlin = (
+                envs.SGLANG_FORCE_FP8_MARLIN.get() or can_auto_enable_marlin_fp8()
+            )
 
     def create_weights(
         self,
@@ -590,6 +611,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
 
         # Register weight
         layer.register_parameter(
@@ -619,6 +641,23 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Requantizes weights after loading using the maximum scale."""
+        # 27B line, weg2 H39 (same switch and same reason as Fp8LinearMethod,
+        # weg2xsn441): a Marlin rank runs the whole pass outside the weg2 tag
+        # pool; only the Marlin survivors are born back in it.
+        if self.use_marlin and envs.SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL.get():
+            from sglang.srt.managers.weg2_memory_saver import (
+                back_into_tag_pool,
+                outside_tag_pool,
+            )
+
+            with outside_tag_pool(reason="modelopt-fp8-marlin") as stepped_out:
+                self._process_weights_after_loading(
+                    layer, born_in=back_into_tag_pool if stepped_out else None
+                )
+            return
+        self._process_weights_after_loading(layer, born_in=None)
+
+    def _process_weights_after_loading(self, layer: torch.nn.Module, born_in=None) -> None:
         max_w_scale, quantized_weight = requantize_with_max_scale(
             layer.weight, layer.weight_scale, layer.logical_widths
         )
@@ -627,6 +666,12 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
+        if self.use_marlin:
+            # Upstream sglang #31340; ``born_in``: the 27B H39 survivor hook.
+            del quantized_weight, max_w_scale
+            prepare_fp8_layer_for_marlin(layer, born_in=born_in)
+            # Marlin uses FP8 weights with unquantized activations.
+            del layer.input_scale
 
     def apply(
         self,
@@ -635,6 +680,17 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Applies FP8 linear transformation."""
+        if self.use_marlin:
+            # Upstream sglang #31340.
+            return torch.ops.sglang.apply_fp8_marlin_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                workspace=layer.workspace,
+                size_n=layer.output_size_per_partition,
+                size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
         if self.enable_flashinfer_bmm and layer.input_scale is not None:
             return apply_fp8_linear_bmm_flashinfer(
                 input=x,
@@ -664,6 +720,54 @@ class ModelOptFp8KVCacheMethod(BaseKVCacheMethod):
 
 class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     """Configuration for ModelOpt MIXED_PRECISION checkpoints."""
+
+    # Its FP8 linears repack through Marlin (ModelOptFp8LinearMethod, upstream
+    # #31340) and its NVFP4 linears do on sm80..89 or under --fp4-gemm-backend
+    # marlin: declared per the fork's contract (base_config.marlin_packable_linear).
+    marlin_packable_linear = True
+
+    #: The sub-config each MIXED_PRECISION algorithm resolves to in
+    #: :meth:`get_quant_method` (attribute name). ``fp8_block_config`` exists
+    #: only on lines that carry the block-FP8 algorithms (NF H68 c7bd1bcb0f);
+    #: a missing attribute is skipped.
+    _ALGO_SUBCONFIG = (
+        ("FP8", "fp8_config"),
+        ("NVFP4", "nvfp4_config"),
+        ("W4A16_NVFP4", "nvfp4a16_config"),
+        ("FP8_PB_WO", "fp8_block_config"),
+        ("FP8_BLOCK_SCALES", "fp8_block_config"),
+    )
+
+    @property
+    def weight_block_size(self) -> Optional[List[int]]:
+        """Uneven-TP shard block (``layers/linear._quant_block_aligned_units``):
+        the lcm, per axis, of the blocks the sub-configs of the algorithms THIS
+        checkpoint lists expose -- one block for every layer of the model, so a
+        column-parallel output split and its coupled row-parallel input split
+        land on the same boundary whatever algorithm each carries. RadixArk
+        Qwen3.8-27B-NVFP4 (FP8 per-tensor + NVFP4 g16): NVFP4's
+        ``modelopt_fp4_uneven_tp_block(16)`` = [128, 128], FP8 exposes none ->
+        [128, 128] (NF H68's proposal, "lcm der Teilbloecke"). None when no
+        listed algorithm exposes a block (then marlin_packable_linear folds
+        Marlin's tile in). Inert without an installed ratio plan."""
+        listed = {
+            str(v.get("quant_algo", "")).upper()
+            for v in (self.quantized_layers or {}).values()
+            if isinstance(v, dict)
+        }
+        blocks = []
+        for algo, attr in self._ALGO_SUBCONFIG:
+            if algo not in listed:
+                continue
+            raw = getattr(getattr(self, attr, None), "weight_block_size", None)
+            if raw and len(raw) == 2:
+                blocks.append((int(raw[0]), int(raw[1])))
+        if not blocks:
+            return None
+        return [
+            math.lcm(*(b[0] for b in blocks)),
+            math.lcm(*(b[1] for b in blocks)),
+        ]
 
     def __init__(
         self,
@@ -1590,7 +1694,21 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             copy_or_rebind_param(layer, "input_global_scale", input_scale_2)
             copy_or_rebind_param(layer, "weight_global_scale", weight_scale_2)
             layer.quant_config = self.quant_config
-            prepare_nvfp4_layer_for_marlin(layer)
+            if envs.SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL.get():
+                # 27B line, weg2 H39 (weg2xsn441's class): the Marlin repack's
+                # working set outside the weg2 tag pool, its survivors back in
+                # it; the scalar survivors above stay where they always were.
+                from sglang.srt.managers.weg2_memory_saver import (
+                    back_into_tag_pool,
+                    outside_tag_pool,
+                )
+
+                with outside_tag_pool(reason="modelopt-nvfp4-marlin") as stepped_out:
+                    prepare_nvfp4_layer_for_marlin(
+                        layer, born_in=back_into_tag_pool if stepped_out else None
+                    )
+            else:
+                prepare_nvfp4_layer_for_marlin(layer)
             layer.weights_padding_cols = 0
             return
 

@@ -743,17 +743,30 @@ def _axis_of(name: str, whole: ManifestPiece,
     # ``pad_vocab_size(ceil(full / n))`` produces -- equal widths, the tree's
     # own rounding, no slack. weg2xsn23: ceil(248320/3) = 82774 -> 82816 on
     # all three, total 248448, declared pad 128.
-    def _padded(total_full: int, widths: Sequence[int]) -> bool:
+    def _padded(total_full: int, widths: Sequence[int], pack: int = 1) -> bool:
         if len(set(widths)) != 1 or widths[0] <= 0:
             return False
         n = len(widths)
-        expect = _pad_vocab_size((int(total_full) + n - 1) // n)
-        return int(widths[0]) == int(expect) and n * int(expect) > int(total_full)
+        if pack > 1 and (int(total_full) % pack or int(widths[0]) % pack):
+            return False
+        total_u, width_u = int(total_full) // pack, int(widths[0]) // pack
+        expect = _pad_vocab_size((total_u + n - 1) // n)
+        return width_u == int(expect) and n * int(expect) > total_u
 
     if same_cols and _padded(w_rows, rows):
         return wx.ROWS, sum(rows), w_cols, tuple(rows), sum(rows) - w_rows
-    if same_rows and _padded(w_cols, cols):
-        return wx.COLS, w_rows, sum(cols), tuple(cols), sum(cols) - w_cols
+    # 27B line, RadixArk NVFP4 (lm_head NVFP4 on Marlin under --fp8-uniform-
+    # marlin): a Marlin-packed vocab-parallel head keeps the vocabulary on its
+    # COLUMN axis, ``pack`` int32 columns per vocab entry (int32 [K/16, 2V] for
+    # 4-bit, [K/16, 4V] for 8-bit; Marlin's 64-wide tiles keep a vocab slice a
+    # contiguous column range). The per-rank vocab padding is then read in
+    # VOCAB units, i.e. the columns divided by the pack -- only for an int32
+    # container (itemsize 4), the one a Marlin weight has, and with the same
+    # exact-rounding test as the unpacked case, so the danger bound holds.
+    _packs = (1,) + ((2, 4) if int(whole.itemsize) == 4 else ())
+    for _pack in _packs:
+        if same_rows and _padded(w_cols, cols, _pack):
+            return wx.COLS, w_rows, sum(cols), tuple(cols), sum(cols) - w_cols
 
     # THE MIXED-FUSED FALLBACK (#1384).  Only reached once all five outer
     # tests above have already failed, so every geometry that used to

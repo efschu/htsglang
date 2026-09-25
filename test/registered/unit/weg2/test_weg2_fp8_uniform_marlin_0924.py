@@ -4,12 +4,14 @@ variant (--fp8-uniform-marlin, default off). Desk, no GPU.
 Pinned here:
 * the launcher decision: FP8 under the exchange without the flag is REFUSED
   (W160, the 5090 and the 3080s would hold two layouts of one tensor); the flag
-  puts SGLANG_FORCE_FP8_MARLIN + SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE on BOTH
-  groups; non-FP8 checkpoints and the default argv/env stay byte-identical;
+  puts SGLANG_FORCE_FP8_MARLIN on BOTH groups; non-FP8 checkpoints and the
+  default argv/env stay byte-identical;
 * a non-incumbent checkpoint without a P-cut calibration record gets a NAMED line
   (argv_p would hand it the INT8 incumbent vector unasked);
-* the Marlin lock workspace leaves the module (the exchange coverage walk would
-  report it UNCOVERED, W84) and is re-zeroed by the wake hook;
+* the Marlin lock workspace stays on the module: the exchange coverage books it
+  as local_scratch and the wake re-zeroes it (NF mechanism, adopted; pinned in
+  test_weg2_local_scratch_coverage_0924.py -- the FP8-only private registry of
+  fdade8572f is gone);
 * the FP8-Marlin byte geometry is the one the exchange already moves for
   compressed-tensors pack-quantized (weg2xsn258): ``.weight`` int32 [K/16, 4N]
   declares its fused components scaled by the pack factor, ``.weight_scale``
@@ -28,13 +30,12 @@ import torch
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.layers.quantization import marlin_utils_fp8 as mu  # noqa: E402
 from sglang.srt.weg2 import launcher as L  # noqa: E402
 from sglang.srt.weg2 import weight_exchange as wx  # noqa: E402
 from sglang.srt.weg2 import weight_exchange_shadow as sh  # noqa: E402
 from sglang.srt.weg2 import xchg_manifest as xm  # noqa: E402
 
-FP8_VARS = ("SGLANG_FORCE_FP8_MARLIN", "SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE")
+FP8_VARS = ("SGLANG_FORCE_FP8_MARLIN",)
 
 
 def _ckpt(tmp_path, quant, nested=False):
@@ -126,29 +127,16 @@ def test_uncalibrated_non_incumbent_checkpoint_is_named(monkeypatch):
 # -- B. the Marlin lock workspace -------------------------------------------------
 
 
-def test_the_workspace_leaves_the_module_and_the_wake_hook_zeroes_it():
-    layer = torch.nn.Linear(4, 4)
-    layer.workspace = torch.ones(68, dtype=torch.int)  # a PLAIN attribute, like prepare_fp8_layer_for_marlin's
-    assert "workspace" in vars(layer)
-    ws = mu.fp8_marlin_workspace_off_module(layer)
-    assert ws is not None and "workspace" not in vars(layer) and not hasattr(layer, "workspace")
-    assert int(ws.sum()) == 68
-    n = mu.zero_fp8_marlin_workspaces()
-    assert n >= 1 and int(ws.sum()) == 0
-    assert mu.fp8_marlin_workspace_off_module(torch.nn.Linear(2, 2)) is None
-
-
-def test_the_exchange_walk_sees_a_module_workspace_and_not_a_private_one():
+def test_the_workspace_stays_on_the_module_and_the_walk_books_it_as_scratch():
     model = torch.nn.Module()
     model.layers = torch.nn.ModuleList([torch.nn.Module()])
     lin = torch.nn.Linear(8, 8, bias=False)
     model.layers[0].mlp = lin
-    lin.workspace = torch.zeros(170, dtype=torch.int)
+    lin.workspace = torch.zeros(170, dtype=torch.int)  # prepare_fp8_layer_for_marlin's plain attribute
     kinds = {t.name: t.kind for t in wx.walk_live_tensors(model)}
-    assert kinds.get("layers.0.mlp.workspace") == wx.ATTRIBUTE   # -> W84 UNCOVERED under a weights tag
-    mu.fp8_marlin_workspace_off_module(lin)
-    names = {t.name for t in wx.walk_live_tensors(model)}
-    assert "layers.0.mlp.workspace" not in names
+    assert kinds.get("layers.0.mlp.workspace") == wx.ATTRIBUTE
+    assert wx.is_local_scratch("layers.0.mlp.workspace")
+    assert "SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE" not in L.FP8_UNIFORM_MARLIN_ENV
 
 
 # -- C. the FP8-Marlin byte geometry in the exchange ------------------------------
