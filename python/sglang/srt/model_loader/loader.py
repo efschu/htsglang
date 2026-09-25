@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import re
+import resource
 import socket
 import tempfile
 import threading
@@ -2233,6 +2234,76 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         return model.eval()
 
 
+#: (g) The #89 STEP-0 lines' CPU reading is the LOADING THREAD's own, not the
+#: process's: the producer and the consumer both run on it, and background
+#: threads (barlink samplers, watchdogs) would dilute the one number that
+#: matters -- did this thread compute, or wait?
+_STEP0_RUSAGE_WHO = getattr(resource, "RUSAGE_THREAD", resource.RUSAGE_SELF)
+
+
+class Step0Rusage(
+    collections.namedtuple("Step0Rusage", "user sys minflt majflt vcsw ivcsw")
+):
+    """CPU seconds (user, sys), page faults (minor, major) and context switches
+    (voluntary, involuntary) of the loading thread.
+
+    Why these six (boot weg2rc6gg, 2026-09-25: group D's GGUF producer 699-715 s
+    per rank against 60-72 s on group P for the same code): cpu/wall ~ 1 means
+    the thread computed; far below 1 means it waited -- runnable but not
+    running (many INVOLUNTARY switches: starvation) or blocked on the disk
+    (MAJOR faults and voluntary switches)."""
+
+    __slots__ = ()
+
+    @staticmethod
+    def delta(a: "Step0Rusage", b: "Step0Rusage") -> "Step0Rusage":
+        return Step0Rusage(*(y - x for x, y in zip(a, b)))
+
+
+def step0_rusage_now() -> Step0Rusage:
+    r = resource.getrusage(_STEP0_RUSAGE_WHO)
+    return Step0Rusage(float(r.ru_utime), float(r.ru_stime), int(r.ru_minflt),
+                       int(r.ru_majflt), int(r.ru_nvcsw), int(r.ru_nivcsw))
+
+
+def step0_cpu_note(wall: float, d: Step0Rusage) -> str:
+    """The suffix every #89 STEP-0 line carries (g)."""
+    cpu = float(d.user) + float(d.sys)
+    ratio = f"{cpu / wall:.2f}" if wall > 0 else "n/a"
+    return (f" | cpu[thread] user={d.user:.2f}s sys={d.sys:.2f}s "
+            f"minflt={int(d.minflt)} majflt={int(d.majflt)} "
+            f"vcsw={int(d.vcsw)} ivcsw={int(d.ivcsw)} cpu/wall={ratio}")
+
+
+class Step0ProducerMeter:
+    """The load_weights iterator wrapper: WALL time and the thread's rusage
+    spent INSIDE next() -- the producer (GGUFReader, disk page-in, inverse
+    transforms) -- never the consumer's work between two next() calls."""
+
+    def __init__(self, rusage=step0_rusage_now):
+        self._rusage = rusage
+        self.t = 0.0
+        self.n = 0
+        self.cpu = Step0Rusage(0.0, 0.0, 0, 0, 0, 0)
+
+    def _add(self, a: Step0Rusage, b: Step0Rusage) -> None:
+        self.cpu = Step0Rusage(*(s + d for s, d in zip(self.cpu, Step0Rusage.delta(a, b))))
+
+    def wrap(self, it):
+        while True:
+            p0, r0 = time.perf_counter(), self._rusage()
+            try:
+                item = next(it)
+            except StopIteration:
+                self.t += time.perf_counter() - p0
+                self._add(r0, self._rusage())
+                return
+            self.t += time.perf_counter() - p0
+            self._add(r0, self._rusage())
+            self.n += 1
+            yield item
+
+
 def _process_weights_after_loading_by_layer_chunk(
     model: nn.Module, target_device: torch.device
 ) -> None:
@@ -2371,6 +2442,9 @@ class GGUFModelLoader(BaseModelLoader):
         # loading (flat-assembly). Hibernate can only skip (a)+(b)+(d); (c)-ish
         # H2D and everything outside this function repeats on every restart.
         _t_phase0 = time.perf_counter()
+        # (g) every phase line also carries the loading thread's CPU and
+        # faults: wall alone could not tell starvation from work (weg2rc6gg).
+        _r_phase0 = step0_rusage_now()
 
         local_model_path = self._prepare_weights(model_config.model_path)
 
@@ -2436,21 +2510,26 @@ class GGUFModelLoader(BaseModelLoader):
         # #89 STEP-0: name-map (meta-model + gguf<->hf map) is CPU-only work
         # that hibernate could skip (it is subsumed by the parked manifest).
         _t_namemap = time.perf_counter() - _t_phase0
+        _r_namemap = Step0Rusage.delta(_r_phase0, step0_rusage_now())
         logger.info(
-            "[#89 STEP-0] gguf name-map (rank %s) done. elapsed=%.2f s",
+            "[#89 STEP-0] gguf name-map (rank %s) done. elapsed=%.2f s%s",
             self.load_config.tp_rank,
             _t_namemap,
+            step0_cpu_note(_t_namemap, _r_namemap),
         )
         with set_default_torch_dtype(model_config.dtype):
             _t_struct0 = time.perf_counter()
+            _r_struct0 = step0_rusage_now()
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
             _t_struct = time.perf_counter() - _t_struct0
+            _r_struct = Step0Rusage.delta(_r_struct0, step0_rusage_now())
             logger.info(
                 "[#89 STEP-0] structure alloc (_initialize_model, rank %s) done. "
-                "elapsed=%.2f s (NOT skippable: repeats on hibernate restore)",
+                "elapsed=%.2f s (NOT skippable: repeats on hibernate restore)%s",
                 self.load_config.tp_rank,
                 _t_struct,
+                step0_cpu_note(_t_struct, _r_struct),
             )
             weights_iterator = self._get_weights_iterator(
                 local_model_path, gguf_weights_map
@@ -2477,23 +2556,15 @@ class GGUFModelLoader(BaseModelLoader):
             # minus the disk read which repeats) vs consumer (weight_loader
             # bookkeeping + H2D copy into GPU params -> NOT skippable, repeats
             # on hibernate restore as copy_ of parked bytes).
-            _produce = {"t": 0.0, "n": 0}
-
-            def _timed(it):
-                while True:
-                    _p0 = time.perf_counter()
-                    try:
-                        item = next(it)
-                    except StopIteration:
-                        _produce["t"] += time.perf_counter() - _p0
-                        return
-                    _produce["t"] += time.perf_counter() - _p0
-                    _produce["n"] += 1
-                    yield item
+            # (g) Step0ProducerMeter keeps the wall split exactly as the old
+            # `_timed` closure did and adds the thread's rusage inside next().
+            _producer = Step0ProducerMeter()
 
             _t_lw0 = time.perf_counter()
-            _loaded_params = model.load_weights(_timed(iter(weights_iterator)))
+            _r_lw0 = step0_rusage_now()
+            _loaded_params = model.load_weights(_producer.wrap(iter(weights_iterator)))
             _t_lw = time.perf_counter() - _t_lw0
+            _r_lw = Step0Rusage.delta(_r_lw0, step0_rusage_now())
             # #514/#505-A1-01: the draft-load completeness check used to run in
             # DefaultModelLoader only, so a GGUF draft -- the fork's own #113
             # territory, where a packed-name mismatch is exactly the failure
@@ -2509,34 +2580,44 @@ class GGUFModelLoader(BaseModelLoader):
             logger.info(
                 "[#89 STEP-0] load_weights (rank %s) done. elapsed=%.2f s "
                 "(producer parse+disk+transform=%.2f s over %d tensors | "
-                "consumer H2D+copy=%.2f s). Producer minus disk-read = skippable.",
+                "consumer H2D+copy=%.2f s). Producer minus disk-read = skippable."
+                "%s | producer%s",
                 self.load_config.tp_rank,
                 _t_lw,
-                _produce["t"],
-                _produce["n"],
-                _t_lw - _produce["t"],
+                _producer.t,
+                _producer.n,
+                _t_lw - _producer.t,
+                step0_cpu_note(_t_lw, _r_lw),
+                step0_cpu_note(_producer.t, _producer.cpu).replace(" | ", " ", 1),
             )
 
             _t_pw0 = time.perf_counter()
+            _r_pw0 = step0_rusage_now()
             _process_weights_after_loading_by_layer_chunk(model, target_device)
             _t_pw = time.perf_counter() - _t_pw0
+            _r_pw = Step0Rusage.delta(_r_pw0, step0_rusage_now())
             logger.info(
                 "[#89 STEP-0] process_weights_after_loading (flat-assembly, "
-                "rank %s) done. elapsed=%.2f s (SKIPPABLE derive slice)",
+                "rank %s) done. elapsed=%.2f s (SKIPPABLE derive slice)%s",
                 self.load_config.tp_rank,
                 _t_pw,
+                step0_cpu_note(_t_pw, _r_pw),
             )
             logger.info(
                 "[#89 STEP-0] SUMMARY rank %s: namemap=%.2f struct=%.2f "
                 "load_weights=%.2f (producer=%.2f) process_weights=%.2f | "
-                "candidate-skippable(namemap+producer+process_weights)=%.2f s",
+                "candidate-skippable(namemap+producer+process_weights)=%.2f s%s",
                 self.load_config.tp_rank,
                 _t_namemap,
                 _t_struct,
                 _t_lw,
-                _produce["t"],
+                _producer.t,
                 _t_pw,
-                _t_namemap + _produce["t"] + _t_pw,
+                _t_namemap + _producer.t + _t_pw,
+                step0_cpu_note(
+                    time.perf_counter() - _t_phase0,
+                    Step0Rusage.delta(_r_phase0, step0_rusage_now()),
+                ),
             )
         # #89 hibernate: stash the info a restore needs to rebuild this exact
         # skeleton without re-reading the GGUF (parked into the manifest).
