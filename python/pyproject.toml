@@ -30,8 +30,8 @@ dependencies = [
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "einops",
   "fastapi",
-  "flash-attn-4==4.0.0b15",
-  "flashinfer_python[cu13]==0.6.14", # keep it aligned with jit-cache version in Dockerfile
+  "flash-attn-4==4.0.0b32",  # b15 breaks at import under cutlass-dsl 4.7 (cute.core.ThrMma removed)
+  "flashinfer_python[cu13]==0.7.0", # source build of flashinfer 2f3bc5ac (0.7.0 + #5242 native NVFP4 W4A16); PyPI 0.7.0 lacks #5242. Keep aligned with flashinfer-cubin in Dockerfile
   "gguf",
   "interegular",
   "IPython",
@@ -42,7 +42,7 @@ dependencies = [
   "msgspec",
   "ninja",
   "numpy",
-  "nvidia-cutlass-dsl[cu13]==4.5.2",
+  "nvidia-cutlass-dsl[cu13]==4.7.1",
   "nvidia-mathdx==25.6.0",
   "nvidia-ml-py",
   "openai==2.6.1",
@@ -59,7 +59,7 @@ dependencies = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
-  "quack-kernels>=0.4.1",
+  "quack-kernels>=0.6.5",  # 0.5.x breaks at import under cutlass-dsl 4.7
   "requests",
   "scipy",
   "sentencepiece",

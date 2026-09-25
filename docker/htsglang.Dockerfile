@@ -17,7 +17,7 @@
 #     libcairo2 at runtime.
 #
 # Strategy: reproduce the validated host venv via pip (torch 2.11.0,
-# sgl-kernel 0.3.21, flashinfer-python 0.6.14, triton 3.6.0, py3.12, cu13),
+# sgl-kernel 0.3.21, flashinfer-python 0.7.0 (src 2f3bc5ac), triton 3.6.0, py3.12, cu13),
 # then install the fork editable. NOT the upstream multi-stage Dockerfile.
 #
 # ---------------------------------------------------------------------------
@@ -87,7 +87,13 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 ARG TORCH_VERSION=2.11.0
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
 ARG SGL_KERNEL_VERSION=0.3.21
-ARG FLASHINFER_VERSION=0.6.14
+ARG FLASHINFER_VERSION=0.7.0
+# flashinfer #5242 (native-layout NVFP4 W4A16, mm_bf16_fp4 backend
+# "cute-dsl-native", SM12x) is in no release and no nightly (v0.7.0 and
+# nightly 0.7.0.dev20260923 predate it). The image builds flashinfer-python
+# from this commit (version string 0.7.0, pure-Python wheel, ~35 s, no CUDA
+# compile at build time; kernels JIT at runtime). Empty = PyPI release.
+ARG FLASHINFER_GIT_SHA=2f3bc5acff26e239696b57fe27d86af1624a8f86
 ARG TRITON_VERSION=3.6.0
 ARG NCCL_VERSION=2.30.7
 ARG NCCL_PACKAGE=nvidia-nccl-cu13
@@ -184,9 +190,24 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
 ARG INSTALL_SGL_KERNEL
 ARG SGL_KERNEL_VERSION
 ARG FLASHINFER_VERSION
+ARG FLASHINFER_GIT_SHA
 ARG TRITON_VERSION
 RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
-    python3 -m pip install -c /sgl-workspace/constraints.txt \
+    if [ -n "${FLASHINFER_GIT_SHA}" ]; then \
+      git init -q /tmp/flashinfer && cd /tmp/flashinfer \
+      && git remote add origin https://github.com/flashinfer-ai/flashinfer.git \
+      && git fetch -q --depth 1 origin "${FLASHINFER_GIT_SHA}" \
+      && git checkout -q FETCH_HEAD \
+      && git submodule update -q --init --depth 1 \
+           3rdparty/cutlass 3rdparty/cccl 3rdparty/spdlog \
+      && BUILD_NVEP=0 FLASHINFER_BUILD_NO_PIP=1 \
+           python3 -m pip wheel --no-deps -w /tmp/flashinfer-whl . \
+      && python3 -m pip install --no-deps /tmp/flashinfer-whl/flashinfer_python-*.whl \
+      && cd / && rm -rf /tmp/flashinfer /tmp/flashinfer-whl \
+      && python3 -c "import flashinfer._build_meta as m, sys; \
+           sys.exit(0 if m.__git_commit__ == '${FLASHINFER_GIT_SHA}' and m.__version__ == '${FLASHINFER_VERSION}' else 'flashinfer build mismatch')"; \
+    fi \
+    && python3 -m pip install -c /sgl-workspace/constraints.txt \
        "flashinfer-python==${FLASHINFER_VERSION}" "triton==${TRITON_VERSION}" \
     && if [ "${INSTALL_SGL_KERNEL}" = "1" ]; then \
          python3 -m pip install -c /sgl-workspace/constraints.txt \
