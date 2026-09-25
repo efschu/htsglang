@@ -156,25 +156,75 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     return cache_dir / f"rank_tp{mr.tp_rank}_pp{mr.pp_rank}_dp{mr.dp_rank or 0}.json"
 
 
-@contextlib.contextmanager
-def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool):
-    from flashinfer.autotuner import autotune
+def agree_flashinfer_autotune_across_group(model_runner: ModelRunner, local: bool) -> bool:
+    """Make the warmup-autotune decision GROUP-UNIFORM (OR over the TP group).
 
-    mr = model_runner
-    cache_path = flashinfer_autotune_cache_path(mr)
-    if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
-        autotune_cache = cache_path
-        logger.info("Running FlashInfer autotune with cache: %s", autotune_cache)
-    else:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        runs_dir = cache_path.parent / "runs"
-        runs_dir.mkdir(parents=True, exist_ok=True)
-        autotune_cache = runs_dir / f"{cache_path.stem}.{timestamp}{cache_path.suffix}"
+    ``should_run_flashinfer_autotune`` answers per rank, from that rank's own
+    card and backend. The autotune dummy forward, however, is a full TP
+    forward: ``enter_capture_group_barrier`` and every row-parallel
+    all-reduce pair up across the TP group. On a heterogeneous group the
+    answers differ -- rc9b D (RC9 e914e89fde, 25.09. 19:53Z): TP0 = 5090
+    ``flashinfer_cutlass`` said yes, TP1/TP2 = 3080 ``w4a8_int8`` (sm_86, no
+    FlashInfer backend) said no, so TP0 entered the dummy forward ALONE and
+    died after 120 s in ``group barrier (tp:0) made no progress``.
+
+    Any rank that tunes -> every rank runs the SAME dummy forward; only the
+    ranks whose own answer is yes run it under flashinfer's autotuner (see
+    ``run_flashinfer_autotune_forward(tune=...)``). One int all-reduce on the
+    TP group's CPU (gloo) group, at the point where every rank already asks
+    the question. Rank-local graph runners (``spec_solo_rank_local_graphs``,
+    no group barrier by construction) and single-rank groups keep the local
+    answer without any collective.
+    """
+    if getattr(model_runner, "spec_solo_rank_local_graphs", False):
+        return bool(local)
+    group = getattr(model_runner, "tp_group", None)
+    if group is None or int(getattr(group, "world_size", 1) or 1) <= 1:
+        return bool(local)
+    import torch.distributed as dist
+
+    flag = torch.tensor([1 if local else 0], dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group.cpu_group)
+    agreed = bool(int(flag.item()))
+    if agreed and not local:
         logger.info(
-            "Running FlashInfer autotune (cache reuse DISABLED via "
-            "SGLANG_FLASHINFER_AUTOTUNE_CACHE=0); writing fresh result to: %s",
-            autotune_cache,
+            "FlashInfer warmup autotune: another rank of this TP group tunes; this "
+            "rank has no autotunable backend and runs the same dummy forward "
+            "UNTUNED so the group's collectives stay paired."
         )
+    return agreed
+
+
+@contextlib.contextmanager
+def flashinfer_autotune_context(
+    model_runner: ModelRunner, *, skip_logits: bool, tune: bool = True
+):
+    """The autotune dummy forward's context. ``tune=False`` is the same
+    forward (same stream, inference mode and logits skipping -- the logits
+    path carries TP collectives of its own) WITHOUT flashinfer's autotuner,
+    for a rank that only keeps its group's collectives paired."""
+    mr = model_runner
+    tune_ctx = contextlib.nullcontext()
+    if tune:
+        from flashinfer.autotuner import autotune
+
+        cache_path = flashinfer_autotune_cache_path(mr)
+        if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
+            autotune_cache = cache_path
+            logger.info("Running FlashInfer autotune with cache: %s", autotune_cache)
+        else:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            runs_dir = cache_path.parent / "runs"
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            autotune_cache = runs_dir / f"{cache_path.stem}.{timestamp}{cache_path.suffix}"
+            logger.info(
+                "Running FlashInfer autotune (cache reuse DISABLED via "
+                "SGLANG_FLASHINFER_AUTOTUNE_CACHE=0); writing fresh result to: %s",
+                autotune_cache,
+            )
+        tune_ctx = autotune(True, cache=str(autotune_cache))
+    else:
+        logger.info("Running the FlashInfer autotune dummy forward untuned (group peer).")
 
     # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
     # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
@@ -185,20 +235,32 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
             from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
             maybe_skip_logits = autotune_dummy_run_mode()
-        with torch.inference_mode(), autotune(
-            True, cache=str(autotune_cache)
-        ), maybe_skip_logits:
+        with torch.inference_mode(), tune_ctx, maybe_skip_logits:
             yield
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
-    logger.info("FlashInfer autotune completed.")
+    logger.info(
+        "FlashInfer autotune completed." if tune else "FlashInfer autotune dummy forward (untuned peer) completed."
+    )
 
 
 def run_flashinfer_autotune_forward(
-    model_runner: ModelRunner, forward_fn: Callable[[], None], *, skip_logits: bool
+    model_runner: ModelRunner,
+    forward_fn: Callable[[], None],
+    *,
+    skip_logits: bool,
+    tune: bool = True,
 ) -> None:
-    """Run flashinfer autotune forward."""
-    with flashinfer_autotune_context(model_runner, skip_logits=skip_logits):
-        forward_fn()
+    """Run the autotune dummy forward (tuned, or untuned as a group peer).
+
+    Inside the JIT cold-build window on every rank: the tuning rank spends
+    extra time per GEMM profiling tactics (and may JIT-build them) while its
+    peers already wait in the next TP collective.
+    """
+    from sglang.srt.utils.jit_cold_build import cold_build_window
+
+    with cold_build_window("flashinfer warmup autotune"):
+        with flashinfer_autotune_context(model_runner, skip_logits=skip_logits, tune=tune):
+            forward_fn()
 
 
 def maybe_flashinfer_autotune_speculative_draft(
@@ -217,11 +279,10 @@ def maybe_flashinfer_autotune_speculative_draft(
         mr._flashinfer_spec_draft_autotuned_phases = tuned_phases
     if phase_key in tuned_phases:
         return
-    if (
-        not mr.spec_algorithm.is_speculative()
-        or not mr.is_draft_model_runner
-        or not should_run_flashinfer_autotune(mr, for_speculative_draft=True)
-    ):
+    if not mr.spec_algorithm.is_speculative() or not mr.is_draft_model_runner:
+        return
+    tune = should_run_flashinfer_autotune(mr, for_speculative_draft=True)
+    if not agree_flashinfer_autotune_across_group(mr, tune):
         return
 
     def run_and_reset():
@@ -229,5 +290,5 @@ def maybe_flashinfer_autotune_speculative_draft(
         if post_warmup_hook is not None:
             post_warmup_hook()
 
-    run_flashinfer_autotune_forward(mr, run_and_reset, skip_logits=skip_logits)
+    run_flashinfer_autotune_forward(mr, run_and_reset, skip_logits=skip_logits, tune=tune)
     tuned_phases.add(phase_key)

@@ -41,6 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    agree_flashinfer_autotune_across_group,
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
@@ -271,12 +272,16 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
 
-        if should_run_flashinfer_autotune(self.model_runner):
+        # Group-uniform (#rc9b D): the dummy forward is a TP forward, so every
+        # rank of the group runs it when ANY rank tunes; only ranks whose own
+        # answer is yes tune.
+        tune = should_run_flashinfer_autotune(self.model_runner)
+        if agree_flashinfer_autotune_across_group(self.model_runner, tune):
             buffers, batch_size = self._autotune_buffers()
             assert (
                 buffers is not None
             ), "_autotune_buffers() must return a reusable buffer set for autotune"
-            self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
+            self._flashinfer_autotune(buffers=buffers, batch_size=batch_size, tune=tune)
 
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
@@ -308,7 +313,7 @@ class BaseRunner(ABC):
             dtype=mr.dtype,
         )
 
-    def _flashinfer_autotune(self, *, buffers, batch_size):
+    def _flashinfer_autotune(self, *, buffers, batch_size, tune: bool = True):
         """Run flashinfer autotune.
 
         buffers / batch_size: a prepared static decode-buffer set and its bs,
@@ -339,7 +344,9 @@ class BaseRunner(ABC):
                 forward_mode_override=mode_override,
             )
 
-        run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
+        run_flashinfer_autotune_forward(
+            self.model_runner, forward_fn, skip_logits=True, tune=tune
+        )
 
     def _alloc_dummy_decode_buffers(self, max_bs: int, *, num_tokens_per_bs: int = 1):
         """Allocate one static decode-buffer set for a dummy forward, sized to
