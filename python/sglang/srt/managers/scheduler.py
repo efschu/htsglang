@@ -728,15 +728,39 @@ def _weg2_store_short_recompute(sched, req, reason: str, span) -> Optional[str]:
     _note_prefetch_gate("defer_expired")
     n = getattr(sched, "_weg2_store_tail_recomputed", 0) + 1
     sched._weg2_store_tail_recomputed = n
-    logger.warning(
-        "#1324 STORE-SHORT TAIL RECOMPUTE rid=%s delivered=%d remainder=%d X=%d "
-        "span=%s n=%d -- the store read stood still short of the prefix, and "
-        "the remainder fits in X: admitted, D prefills it (store-short must "
-        "recompute; over X this stays the named W88)",
-        str(getattr(req, "rid", "?"))[:16], int(getattr(req, "_weg2_store_delivered", 0)),
-        remainder, x, span, n,
-    )
+    # weg2rc2: one parked request printed this line 569 times per rank in 20 s.
+    # Per request: the 1st, 2nd, 4th, 8th, ... occurrence (n stays the total).
+    rid = str(getattr(req, "rid", "?"))[:16]
+    per = getattr(sched, "_weg2_store_tail_per_rid", None)
+    if per is None or len(per) > 4096:
+        per = sched._weg2_store_tail_per_rid = {}
+    k = per.get(rid, 0) + 1
+    per[rid] = k
+    if k & (k - 1) == 0:
+        logger.warning(
+            "#1324 STORE-SHORT TAIL RECOMPUTE rid=%s delivered=%d remainder=%d X=%d "
+            "span=%s n=%d k=%d -- the store read stood still short of the prefix, and "
+            "the remainder fits in X: released to admission, D prefills it (store-short "
+            "must recompute; over X this stays the named W88; k = this request's "
+            "occurrence, printed at powers of two)",
+            rid, int(getattr(req, "_weg2_store_delivered", 0)), remainder, x, span, n, k,
+        )
     return "expired"
+
+
+def _weg2_store_tail_settles(sched, req) -> bool:
+    """#1324 x #1471 (weg2rc2): a request parked at the wake whose SHORT store
+    read leaves a remainder within X is SETTLED -- D prefills the remainder (the
+    tail recompute above), so waiting for a re-read the store does not complete
+    only costs the #1471 bound. weg2rc2: weg2-6-2 (4316 tokens, 4095 delivered)
+    sat out the whole 20.1 s. False = not this case (switch off, no short-read
+    stamp, over X, a stand-in without server_args): the settle hold decides as
+    before -- over X (weg2xsn229, 4095 of 98210) the request waits for its read."""
+    if not _weg2_store_short_tail_on():
+        return False
+    x = int(getattr(getattr(sched, "server_args", None), "tp_prefill_max_tokens", 0) or 0)
+    remainder = _weg2_store_short_remainder(req)
+    return x > 0 and remainder is not None and remainder <= x
 
 
 def _weg2_windowed_path(sched) -> bool:
@@ -5336,7 +5360,9 @@ class Scheduler(
                             type(exc).__name__, exc)
                 state = "complete"
             lapsed = now - float(getattr(req, "_1471_since", now)) >= self.WEG2_POST_WAKE_SETTLE_S
-            _local.append((req, state, lapsed, state == "complete" or lapsed))
+            # weg2rc2: a remainder within X is D's to prefill -- settled now, not at the bound.
+            _local.append((req, state, lapsed,
+                           state == "complete" or lapsed or _weg2_store_tail_settles(self, req)))
         _gmin = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
         _agreed = _gmin([x[3] for x in _local])  # #1471e
         for (req, state, lapsed, _r), ok in zip(_local, _agreed):
@@ -5405,7 +5431,16 @@ class Scheduler(
                 _state = "complete"
             _states.append(_state)
         _gmin = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
-        _agreed = _gmin([st == "complete" for st in _states])  # #1471e
+        # weg2rc2: a short read whose remainder fits in X is settled -- D
+        # prefills the remainder (#1324 tail) instead of parking for 20 s.
+        _tail = [_weg2_store_tail_settles(self, _r) for _r in list(hold)]
+        _agreed = _gmin([st == "complete" or t for st, t in zip(_states, _tail)])  # #1471e
+        for _r, ok, st, t in zip(list(hold), _agreed, _states, _tail):
+            if ok and t and st != "complete":
+                logger.info("#1471 SETTLE-TAIL rid=%s delivered=%s remainder=%s -- released at the "
+                            "wake: the short read's remainder fits in X, D prefills it (#1324)",
+                            str(_r.rid)[:12], getattr(_r, "_weg2_store_delivered", None),
+                            _weg2_store_short_remainder(_r))
         for _r, ok in zip(list(hold), _agreed):
             if ok:
                 released.append(_r)
