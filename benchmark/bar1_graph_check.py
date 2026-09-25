@@ -302,8 +302,12 @@ def _zeichne_auf(t, n: int, rang: int, geraet):
     torch.cuda.synchronize(geraet)
     dist.barrier()
 
+    # The serve path pauses the abort-gate watchdog poll around every capture (parallel_state.py:3404);
+    # without it a poll can land inside the capture (W113, capture invalidated) -- flaky T0b broadcast.
+    from sglang.srt.distributed.device_communicators import barlink_abort_gate
+
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with barlink_abort_gate.pause_polling(), torch.cuda.graph(graph):
         ausgabe = t.barlink_all_reduce(None, eingabe)
     torch.cuda.synchronize(geraet)
     dist.barrier()
@@ -335,8 +339,12 @@ def _zeichne_auf_broadcast(t, n: int, rang: int, geraet, src: int):
     torch.cuda.synchronize(geraet)
     dist.barrier()
 
+    # The serve path pauses the abort-gate watchdog poll around every capture (parallel_state.py:3404);
+    # without it a poll can land inside the capture (W113, capture invalidated) -- flaky T0b broadcast.
+    from sglang.srt.distributed.device_communicators import barlink_abort_gate
+
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with barlink_abort_gate.pause_polling(), torch.cuda.graph(graph):
         t.barlink_broadcast(None, puffer, src)
     torch.cuda.synchronize(geraet)
     dist.barrier()
