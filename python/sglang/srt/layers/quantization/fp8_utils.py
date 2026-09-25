@@ -306,6 +306,49 @@ def fp8_native_gemm_available(device_id: int) -> bool:
         return False
 
 
+def prewarm_fp8_native_gemm_probe(quantization: Optional[str]) -> Optional[bool]:
+    """Ask the loader's fp8 capability question for the current device NOW, before
+    the weg2 weights region opens (27B line, weg2xsn442 R7); ``None`` = nothing to
+    ask for this checkpoint.
+
+    :func:`fp8_native_gemm_available` runs ``torch._scaled_mm``, and where the
+    device has a native fp8 GEMM (the RTX 5090) that first call creates the
+    cuBLAS/cuBLASLt workspace (8.125 + 1 MiB). Without this, its first call is the
+    loader's ``quant_config.needs_device_kernel()`` INSIDE the weights region,
+    where the probe steps out of the tag pool into the load's transient pool
+    (b434831067) -- and the workspace, alive for the whole process, then keeps that
+    pool: ``WEG2-TAG-POOL transient pool KEPT reason=after-load pool=load live=9.1
+    MiB`` on PP0 and TP0 in weg2xsn442, its cached segments reserved on the 5090
+    through every flip. Asked here, the workspace sits in the default pool like in
+    any process, and the in-region check is a cache hit that allocates nothing.
+
+    Asks EXACTLY what the loader would ask first, so it adds no probe the load
+    would not have run: ``Fp8Config.needs_device_kernel()`` is
+    ``not fp8_needs_dequant_fallback()``, which reaches the probe unless
+    SGLANG_FORCE_FP8_DEQUANT / SGLANG_DETERMINISTIC_FP8_GEMM answer first, and it
+    never asks for ``mxfp8``. Returns the value that check will then read.
+
+    Only for a checkpoint whose config is an ``Fp8Config``: its capability check
+    is the CUDA caller that opens the load. Every other checkpoint -- INT8
+    compressed-tensors, ModelOpt FP8/NVFP4, GGUF, unquantized -- keeps its load
+    order byte for byte. Bound, stated: a config that builds ``Fp8LinearMethod``
+    without being an ``Fp8Config`` (w4afp8, quark_int4fp8_moe, nvfp4_online,
+    compressed-tensors ``linear_fp8_config``) and a part loaded under another
+    ``torch.cuda.device`` still probe in the region, stepped out as before."""
+    if not quantization or quantization == "mxfp8" or not torch.cuda.is_available():
+        return None
+    try:
+        from sglang.srt.layers.quantization import get_quantization_config
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+        cls = get_quantization_config(quantization)
+    except Exception:  # noqa: BLE001 -- an unknown method is the loader's to refuse
+        return None
+    if not (isinstance(cls, type) and issubclass(cls, Fp8Config)):
+        return None
+    return not fp8_needs_dequant_fallback()
+
+
 @per_device_gate
 def deterministic_fp8_marlin_disabled(device_id: int) -> bool:
     """True when SGLANG_DETERMINISTIC_FP8_GEMM must switch the fp8 Marlin path off.
