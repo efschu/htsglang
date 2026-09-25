@@ -1,7 +1,7 @@
 # Docker-Release htsglang: Upgrade des August-Containers (27B + NF, barlink BAR1 und NCCL, Modellformate)
 
 **Stand:** 2026-09-25 ~01:55Z · **Verfasser:** 27B-Sitz, Agent R · **Status:** ENTWURF, Kontext für RC2-final erzeugt.
-Nichts veröffentlicht, kein Image gebaut, keine GPU, kein Boot. Auf dem Proxmox-Host nur lesend (SSH als root mit dem Schlüssel aus `/root/.ssh/`, vom Nutzer erlaubt).
+Nichts veröffentlicht, kein Image gebaut, keine GPU, kein Boot. Auf dem Proxmox-Host nur lesend (vom Nutzer erlaubt).
 **Auftrag (Nutzer 24.09. ~20:40Z):** „du und der nf agent solltet solangsam auch das docker release planen und vorbereiten, es soll mit barlink und nccl funktionieren“
 **Nutzer-Entscheide (über den Operator, wörtlich):** „docker auf host, den von august weiterverwenden und aktualisieren upgraden / 1 ja / 2 auf host / 3 veröffentlichung geplant als upgrade zu unserem bisher angebotenen docker container auf meinem github / 4 ja / 5 ja / 6 ja muss aber optional sein“; „nein die modellformate müssen schon mit dem docker funktionieren“.
 **NF-Teil:** [`NF_PROFILE.md`](NF_PROFILE.md) (NF-Sitz, fertig, 1166 Z.). Das NF-Profil `profiles/nf.env` ist daraus §11.1 **wörtlich** übernommen.
@@ -96,13 +96,13 @@ Belege: `L:` = `python/sglang/srt/weg2/launcher.py` der 27B-Linie (Worktree `/sp
 |---|---|---|
 | Docker | `docker.io 29.1.3`, overlayfs/containerd, cgroup v2 | **Docker 29.5.3**, Storage-Driver **zfs** (`spinning/docker`, 927 GiB belegt), cgroup v2 |
 | NVIDIA-Runtime | **keine** (`Runtimes: runc`, kein Toolkit, kein CDI) | **`nvidia`** in `daemon.json`, Toolkit 1.13.5 (alt), `/etc/cdi/nvidia.yaml` vom 30.04. (veraltet, ungenutzt) |
-| Treiber | 595.58.03 open (Userspace im LXC) | **595.58.03 open**, gebaut „root@proxmox“ 29.07., Host oben seit 05.08. 21:02 |
+| Treiber | 595.58.03 open (Userspace im LXC) | **595.58.03 open**, gebaut 29.07., Host oben seit 05.08. 21:02 |
 | BAR1-Kette | RegistryDwords ok, Holder 0666, `resource1_wc` 666 | **dieselbe**, `dmabuf_holder` geladen (18 Nutzer) |
 | RAM | lxcfs-Sicht 118 GiB | **125 GiB gesamt**; beim laufenden CT999-Boot 9 GiB verfügbar |
 | Platz | `/` 180 GiB frei (Pool `spinning`) | derselbe Pool: 180 GiB frei; Host-Wurzel `rpool` 59 GiB frei |
 | memlock | hart 8 MiB (nicht hebbar, reicht) | root 8 MiB, `--ulimit memlock=-1` möglich |
 | Werkzeuge | — | python3 3.12.8, curl, jq, `pct` |
-| Sonstiges | IP 192.168.0.88, gpuq auf 0.0.0.0:8770 | Haus-Container laufen (Vaultwarden, Home Assistant, Nextcloud, ioBroker, …) → **nie** `docker system prune` o.ä. auf dem Host ohne Nutzer |
+| Sonstiges | gpuq im LXC | Haus-Container laufen → **nie** `docker system prune` o.ä. auf dem Host ohne Nutzer |
 
 Die frühere Annahme aus dem ersten Entwurf ist damit überholt: Die Abnahme läuft auf dem **Host** (Nutzer F2), nicht verschachtelt in CT999.
 
@@ -282,7 +282,7 @@ Die Laufzeile steht in `host_acceptance.sh`, Funktion `run_args`.
   - Spitzen: 27B nativ 89,9–91,4 GiB, NF 83,7–85,1 GiB nonreclaim.
 - **Zustand** (Bind-Verzeichnisse `/spinning/docker-acceptance/<linie>/…` im LXC, für logindex lesbar):
   - `evidence` (Boot-Logs und Kalibrierquellen)
-  - `arb` (State, Admin-Key, Deadman-Ausgaben; die ARB-Saat ergänzt nur fehlende Dateien)
+  - `arb` (State, Deadman-Ausgaben; die ARB-Saat ergänzt nur fehlende Dateien)
   - `store` (HiCache-L3)
   - `sglang` (card_probe, phase_footprint …)
   - `triton`
@@ -296,7 +296,7 @@ Die Laufzeile steht in `host_acceptance.sh`, Funktion `run_args`.
 - **Modelle:** read-only unter **demselben** Pfad (`/spinning/llm_stuff/club-3090/models-cache`, das ganze Verzeichnis, wegen der absoluten Draft-Symlinks von NF).
 - **Ports:** Front `0.0.0.0:30030` im Container, auf dem Host nur auf `127.0.0.1:31030` veröffentlicht (Proben laufen auf dem Host; die Front hat keine Authentifizierung). Gruppen 30031/30032 bleiben intern. Router 30099 liegt in CT999 und wird nicht berührt.
 - **Geheimnisse:**
-  - Kein Token im Image, der Admin-Key wird je Boot neu erzeugt.
+  - Keine Zugangsdaten im Image; Laufzeit-Schlüssel entstehen je Boot neu.
   - `GPUQ_*` nie in den Container, weil `build_env` die ganze Umgebung an alle Ränge vererbt.
   - PAT-Dateien werden weder gelesen noch kopiert. Der Git-Push läuft über den konfigurierten Credential-Helper.
 
@@ -330,7 +330,7 @@ Die Laufzeile steht in `host_acceptance.sh`, Funktion `run_args`.
 - **P-Trim (27B):** `HTSGLANG_P_TRIM=0|1` hängt `--p-trim-end-anchor` an; der Launcher setzt `SGLANG_WEG2_P_TRIM_END_ANCHOR=1` nur für Gruppe P. Abweichung von der Bestform wird laut gemeldet.
 - **Lebenszyklus:**
   - Der Launcher kehrt nach `LAUNCHED` zurück (L:14068-14069). Der Entrypoint wartet signalfest, beaufsichtigt danach die Front und baut über `--teardown <state.json>` ab (L:12362-12367, 14307).
-  - Laufzeit-Artefakte gehen nach `evidence/docker_<tag>/`, der Admin-Key nie.
+  - Laufzeit-Artefakte gehen nach `evidence/docker_<tag>/`, Schlüsseldateien nie.
   - `docker stop -t 180`.
 
 ---

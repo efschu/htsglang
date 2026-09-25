@@ -385,7 +385,7 @@ STATE=$GPU_ARB/weg2/boot_${HTSGLANG_TAG}.json   # launcher.py:14258-14259
 LOGCOPY=$EVIDENCE_DIR/docker_${HTSGLANG_TAG}
 mkdir -p "$LOGCOPY"
 
-archive_artifacts() {   # Laufzeit-Artefakte aus GPU_ARB sichern -- NIE den .adminkey
+archive_artifacts() {   # Laufzeit-Artefakte aus GPU_ARB sichern (nur benannte Dateien, nie Schluesseldateien)
   local f
   for f in "$GPU_ARB"/deadman_"${HTSGLANG_TAG}"_*.out "$GPU_ARB"/memts_weg2_"${HTSGLANG_TAG}".csv \
            "$GPU_ARB"/preflight_weg2_"${HTSGLANG_TAG}".log "$STATE" "$GPU_ARB/weg2/boot_${HTSGLANG_TAG}.logpath"; do

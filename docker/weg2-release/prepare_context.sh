@@ -18,8 +18,8 @@
 # sieht es als /spinning/subvol-999-disk-0/spinning/gpu-arb/docker/ctx/... (host_acceptance.sh).
 #
 # Geheimnisse: nur WHITELIST-Dateien werden kopiert (unten einzeln benannt); zum Schluss ein
-# Namens- und Inhalts-Scan, der bei jedem Treffer abbricht. Nie gelesen: PAT-Dateien, *.adminkey,
-# gpuq_booking.json, Router-/OpenRouter-Schluessel, /root/.claude/jobs/*.
+# Namens- und Inhalts-Scan, der bei jedem Treffer abbricht. Zugangsdaten- und Schluesseldateien werden nie
+# gelesen und nie kopiert.
 set -euo pipefail
 
 HERE=/spinning/gpu-arb/docker
