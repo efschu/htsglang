@@ -50,7 +50,7 @@ def _fake_w4a8(x, weight, scale, gscale, n):
     return torch.zeros(x.shape[0], n, dtype=x.dtype)
 
 
-def _resolve_rig(backend, caps, *, kernel=True, allow_marlin=False):
+def _resolve_rig(backend, caps, *, kernel=True, sm8x="w4a8"):
     """One scheduler process per rank: TP0 = 5090, TP1/TP2 = 3080."""
     args = mock.Mock(fp4_gemm_runner_backend=backend)
     out = []
@@ -64,8 +64,8 @@ def _resolve_rig(backend, caps, *, kernel=True, allow_marlin=False):
             mock.patch.object(fp4_utils, "has_fork_nvfp4_cutlass_kernel", return_value=True),
             mock.patch.object(nm, "_try_autoload_w4a8_kernel", return_value=None),
             mock.patch(
-                "sglang.srt.environ.envs.SGLANG_FP4_NATIVE_MIXED_ALLOW_MARLIN.get",
-                return_value=allow_marlin,
+                "sglang.srt.environ.envs.SGLANG_FP4_NATIVE_MIXED_SM8X.get",
+                return_value=sm8x,
             ),
         ):
             if kernel:
@@ -88,28 +88,31 @@ RIG = [(12, 0), (8, 6), (8, 6)]
 
 class TestRankResolution(CustomTestCase):
     def test_pure_table(self):
-        c = nm.resolve_rank_backend((12, 0), w4a8_available=False, allow_marlin=False)
+        c = nm.resolve_rank_backend((12, 0), w4a8_available=False)
         self.assertEqual((c.backend, c.shared_layout), ("cutlass", True))
-        c = nm.resolve_rank_backend((8, 6), w4a8_available=True, allow_marlin=False)
+        # sm_8x default (#38 N4C): Marlin W4A16 on the SHARED native layout
+        c = nm.resolve_rank_backend((8, 6), w4a8_available=False)
+        self.assertEqual((c.backend, c.shared_layout), ("marlin_native_inplace", True))
+        c = nm.resolve_rank_backend((8, 6), w4a8_available=True)
+        self.assertEqual(c.backend, "marlin_native_inplace")
+        c = nm.resolve_rank_backend((8, 6), w4a8_available=True, sm8x_choice="w4a8")
         self.assertEqual((c.backend, c.shared_layout), ("w4a8_int8", True))
-        c = nm.resolve_rank_backend((8, 6), w4a8_available=False, allow_marlin=True)
-        self.assertEqual((c.backend, c.shared_layout), ("marlin", False))
-        c = nm.resolve_rank_backend((10, 0), w4a8_available=False, allow_marlin=False)
+        c = nm.resolve_rank_backend((10, 0), w4a8_available=False)
         self.assertEqual(c.backend, "flashinfer_cutedsl")
 
     def test_refusals_are_named(self):
         with self.assertRaisesRegex(nm.NativeMixedUnsupported, "W4A8 INT8 kernel"):
-            nm.resolve_rank_backend((8, 6), w4a8_available=False, allow_marlin=False)
+            nm.resolve_rank_backend((8, 6), w4a8_available=False, sm8x_choice="w4a8")
+        with self.assertRaisesRegex(nm.NativeMixedUnsupported, "neither 'marlin' nor 'w4a8'"):
+            nm.resolve_rank_backend((8, 6), w4a8_available=True, sm8x_choice="int4")
         with self.assertRaisesRegex(nm.NativeMixedUnsupported, "7.5"):
-            nm.resolve_rank_backend((7, 5), w4a8_available=True, allow_marlin=True)
+            nm.resolve_rank_backend((7, 5), w4a8_available=True)
         with self.assertRaisesRegex(nm.NativeMixedUnsupported, "CUTLASS"):
-            nm.resolve_rank_backend(
-                (12, 0), w4a8_available=True, allow_marlin=True, native_sm120_available=False
-            )
+            nm.resolve_rank_backend((12, 0), w4a8_available=True, native_sm120_available=False)
 
-    def test_mixed_rig_native_mixed(self):
+    def test_mixed_rig_native_mixed_w4a8(self):
         with _fp4_state():
-            got = _resolve_rig("native-mixed", RIG)
+            got = _resolve_rig("native-mixed", RIG, sm8x="w4a8")
         self.assertEqual(
             got,
             [
@@ -119,15 +122,21 @@ class TestRankResolution(CustomTestCase):
             ],
         )
 
-    def test_mixed_rig_without_kernel_refuses(self):
-        with _fp4_state(), self.assertRaises(nm.NativeMixedUnsupported):
-            _resolve_rig("native-mixed", RIG, kernel=False)
-
-    def test_marlin_escape_is_marked_as_leaving_the_layout(self):
+    def test_mixed_rig_default_is_marlin_inplace(self):
         with _fp4_state():
-            got = _resolve_rig("native-mixed", RIG, kernel=False, allow_marlin=True)
-        self.assertEqual(got[1], (Fp4GemmRunnerBackend.MARLIN, True, False))
-        self.assertEqual(got[0], (Fp4GemmRunnerBackend.CUTLASS, True, True))
+            got = _resolve_rig("native-mixed", RIG, kernel=False, sm8x="marlin")
+        self.assertEqual(
+            got,
+            [
+                (Fp4GemmRunnerBackend.CUTLASS, True, True),
+                (Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE, True, True),
+                (Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE, True, True),
+            ],
+        )
+
+    def test_mixed_rig_w4a8_without_kernel_refuses(self):
+        with _fp4_state(), self.assertRaises(nm.NativeMixedUnsupported):
+            _resolve_rig("native-mixed", RIG, kernel=False, sm8x="w4a8")
 
     def test_default_paths_unchanged(self):
         """auto / marlin resolve exactly as before and leave the mode off."""
@@ -147,6 +156,7 @@ class TestRankResolution(CustomTestCase):
 
         self.assertIn("native-mixed", FP4_GEMM_RUNNER_BACKEND_CHOICES)
         self.assertNotIn("w4a8_int8", FP4_GEMM_RUNNER_BACKEND_CHOICES)
+        self.assertNotIn("marlin_native_inplace", FP4_GEMM_RUNNER_BACKEND_CHOICES)
 
 
 def _swizzle_reference(s):
@@ -279,7 +289,8 @@ class TestLoaderUnderNativeMixed(CustomTestCase):
         names = [n for n, _ in layer.named_parameters()]
         self.assertEqual(
             names,
-            ["weight", "input_scale", "weight_scale_2", "weight_scale", "alpha", "input_scale_inv", "weight_global_scale"],
+            ["weight", "input_scale", "weight_scale_2", "weight_scale", "alpha", "input_scale_inv",
+             "weight_global_scale", "weight_global_scale_w4a16"],
         )
         self.assertEqual(tuple(out.shape), (3, 512))
 

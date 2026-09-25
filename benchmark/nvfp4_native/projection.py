@@ -267,7 +267,23 @@ def window_projection(d, w4a8_tops=(117.0, 150.0)):
     cal_n = (8192 / ((N_CHUNKS_8K + 2) * max(ref_n) / 1e3)) / 4246.0
     print(f"  Probe: INT8 42/11/11 -> {8192/((N_CHUNKS_8K+2)*max(ref_i)/1e3):.0f} tok/s (gem. 8905); "
           f"NVFP4-Marlin 42/11/11 -> {8192/((N_CHUNKS_8K+2)*max(ref_n)/1e3):.0f} (gem. 4246)")
+    # N4C (#38, 3080 = Marlin W4A16 on the shared layout): the MEASURED Marlin MLP
+    # of the 3080, plus the in-place band penalty -- the banded apply concatenates
+    # the band outputs of every banded linear (P gate_up [512, 34816] bf16 = 35.6 MB,
+    # read+write ~0.12 ms at ~600 GB/s on the 3080; down is one band at 16 MiB? no:
+    # 44.6 MB -> 3 bands, [512, 5120] out = 5 MB, ~0.02 ms). RECHNUNG, not measured.
+    card["3080"]["mlp"]["mar_banded"] = card["3080"]["mlp"]["mar"] + 0.14
     res = []
+    for p5, lab in (("f8nat", "FP8 nativ (cuBLASLt)"), ("f8mar", "FP8 Marlin")):
+        for m3, lab3 in (("mar", "Marlin W4A16"), ("mar_banded", "Marlin W4A16 + Band-Concat")):
+            cut, ts = best("nat", p5, m3, "f8mar")
+            tps = 8192 / ((N_CHUNKS_8K + 2) * max(ts) / 1e3)
+            lo_, hi_ = sorted((tps / cal_i, tps / cal_n))
+            vram = vram_5090(cut[0])
+            print(f"  3080 {lab3} | 5090 NVFP4 nativ + {lab}: Schnitt {cut}, Stufen "
+                  f"{[round(x,1) for x in ts]} ms -> P8k {tps/1e3:.2f}k (kalibriert {lo_/1e3:.1f}-{hi_/1e3:.1f}k) tok/s; "
+                  f"5090-VRAM P {vram}")
+            res.append((m3, lab, cut, ts, tps))
     for t in w4a8_tops:
         for p5, lab in (("f8nat", "FP8 nativ (cuBLASLt)"), ("f8mar", "FP8 Marlin")):
             cut, ts = best("nat", p5, f"w4a8_{int(t)}", "f8mar")

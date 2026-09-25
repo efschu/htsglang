@@ -1494,10 +1494,11 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
-    # --fp4-gemm-backend native-mixed (Backlog #38): let an sm_8x rank without the
-    # W4A8 INT8 kernel fall back to Marlin W4A16. Marlin repacks the native NVFP4
-    # bytes, so that rank leaves the shared flip layout -- opt-in only.
-    SGLANG_FP4_NATIVE_MIXED_ALLOW_MARLIN = EnvBool(False)
+    # --fp4-gemm-backend native-mixed (Backlog #38): the kernel of an sm_8x rank.
+    # "marlin" (default): Marlin W4A16 on the SHARED native layout, content
+    # permuted in place at every flip (nvfp4_marlin_inplace.py). "w4a8": the
+    # registered W4A8 INT8 kernel (nvfp4_native_mixed.register_w4a8_kernel).
+    SGLANG_FP4_NATIVE_MIXED_SM8X = EnvStr("marlin")
     # Opt-in BIT-DETERMINISM for fp8 linears on sm80..sm88 (#192, from #190).
     #
     # WHAT IS BROKEN. On sm80..88 an fp8 checkpoint has exactly one GEMM

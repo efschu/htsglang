@@ -108,6 +108,10 @@ class Fp4GemmRunnerBackend(Enum):
     # Never a CLI value: only `native-mixed` resolves to it, on an sm_8x rank
     # with the W4A8 INT8 kernel registered (nvfp4_native_mixed.py).
     W4A8_INT8 = "w4a8_int8"
+    # Never a CLI value: `native-mixed` on an sm_8x rank (default there). Marlin
+    # W4A16 on the SHARED native layout -- the content is permuted in place and
+    # back at every flip (nvfp4_marlin_inplace.py, contract gap L8).
+    MARLIN_NATIVE_INPLACE = "marlin_native_inplace"
 
     def is_auto(self) -> bool:
         return self == Fp4GemmRunnerBackend.AUTO
@@ -132,6 +136,9 @@ class Fp4GemmRunnerBackend(Enum):
 
     def is_w4a8_int8(self) -> bool:
         return self == Fp4GemmRunnerBackend.W4A8_INT8
+
+    def is_marlin_native_inplace(self) -> bool:
+        return self == Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE
 
     def is_flashinfer(self) -> bool:
         return self.value.startswith("flashinfer_")

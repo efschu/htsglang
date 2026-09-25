@@ -13,16 +13,20 @@ Only the GEMM differs:
 * sm_12x (5090)   -> ``cutlass`` (W4A4 on the FP4 tensor cores, the path ``auto``
                      already takes there);
 * sm_10x          -> ``flashinfer_cutedsl`` (what ``auto`` takes there);
-* sm_8x  (3080)   -> ``w4a8_int8``: a kernel that reads the native bytes and runs
-                     on the INT8 tensor cores (agent N4A). It is plugged in via
-                     :func:`register_w4a8_kernel`; this module owns only the seam.
-* no W4A8 kernel  -> HARD ERROR by default. Marlin is reachable only with
-                     ``SGLANG_FP4_NATIVE_MIXED_ALLOW_MARLIN=1``, and that is
-                     stated as what it is: Marlin repacks the native bytes into
-                     its own layout (marlin_utils_fp4.prepare_nvfp4_layer_for_marlin),
-                     so such a rank no longer holds the shared layout and a flip
-                     would have to reshape -- the premise of this mode is broken
-                     on that rank, loudly, never silently.
+* sm_8x  (3080)   -> ``marlin_native_inplace`` (default): Marlin W4A16, the
+                     measured best on sm_86 (decode 635 vs 233 GB/s; prefill
+                     W4A8-g16 74 TOPS barely beats W4A16 55 TF). Marlin wants
+                     its own layout, so the CONTENT of this rank's NVFP4
+                     parameters is permuted in place -- same byte counts, same
+                     Parameter objects and shapes -- and back to native around
+                     every flip (nvfp4_marlin_inplace.py). The exchange only
+                     ever sees native bytes.
+                  -> ``w4a8_int8`` with ``SGLANG_FP4_NATIVE_MIXED_SM8X=w4a8``:
+                     the registered W4A8 INT8 kernel (agent N4A's seam, kept).
+* sm_12x kernel choice is ONE replaceable function per arch:
+  :func:`register_sm12x_apply` lets the FlashInfer-next strand hook its own
+  per-call choice (cute-dsl-native W4A16 at small M, W4A4 otherwise) without
+  touching this module; unregistered, the rank runs the fork CUTLASS W4A4.
 
 Default OFF: nothing here runs unless ``--fp4-gemm-backend native-mixed`` is
 passed; every other backend value resolves exactly as before.
@@ -61,7 +65,7 @@ class RankKernelChoice:
 
     backend: str  # a Fp4GemmRunnerBackend value
     capability: Tuple[int, int]
-    shared_layout: bool  # False only for the explicit Marlin escape
+    shared_layout: bool  # the exchange sees the native layout (True on every branch today)
     reason: str
 
 
@@ -123,6 +127,55 @@ def _try_autoload_w4a8_kernel() -> None:
 
 
 # ---------------------------------------------------------------------------
+# sm_12x kernel-choice seam (filled by the FlashInfer-next strand).
+# ---------------------------------------------------------------------------
+
+#: fn(layer, x, bias) -> out, or None to fall through to the fork CUTLASS W4A4
+#: path. It reads the NATIVE parameters only (weight u8 [N, K/2],
+#: weight_scale_interleaved 128x4, alpha, input_scale_inv) -- e.g. FlashInfer
+#: ``mm_bf16_fp4(backend="cute-dsl-native")`` for small M, which needs no
+#: preparation and no second weight copy. One function per arch: sm_8x has its
+#: own (nvfp4_marlin_inplace.apply), sm_12x this one.
+Sm12xApply = Callable[[torch.nn.Module, torch.Tensor, Optional[torch.Tensor]], Optional[torch.Tensor]]
+
+_SM12X_APPLY: Optional[Sm12xApply] = None
+_SM12X_APPLY_NAME: str = ""
+
+
+def register_sm12x_apply(fn: Sm12xApply, name: str) -> None:
+    global _SM12X_APPLY, _SM12X_APPLY_NAME
+    _SM12X_APPLY = fn
+    _SM12X_APPLY_NAME = str(name)
+
+
+def unregister_sm12x_apply() -> None:
+    global _SM12X_APPLY, _SM12X_APPLY_NAME
+    _SM12X_APPLY = None
+    _SM12X_APPLY_NAME = ""
+
+
+def sm12x_apply() -> Optional[Sm12xApply]:
+    return _SM12X_APPLY
+
+
+def sm12x_apply_name() -> str:
+    return _SM12X_APPLY_NAME
+
+
+def _try_autoload_sm12x_apply() -> None:
+    """Import the FlashInfer-next strand's sm_12x choice module if this tree has
+    it; it registers itself. Absent module = fork CUTLASS W4A4, never an error."""
+    if _SM12X_APPLY is not None:
+        return
+    try:
+        import importlib
+
+        importlib.import_module("sglang.srt.layers.quantization.nvfp4_sm12x_choice")
+    except ImportError:
+        return
+
+
+# ---------------------------------------------------------------------------
 # Per-rank resolution (pure; the desk tests drive it with a fake capability).
 # ---------------------------------------------------------------------------
 
@@ -131,9 +184,12 @@ def resolve_rank_backend(
     capability: Tuple[int, int],
     *,
     w4a8_available: bool,
-    allow_marlin: bool,
+    sm8x_choice: str = "marlin",
     native_sm120_available: bool = True,
 ) -> RankKernelChoice:
+    """The per-arch table. Every branch keeps the SHARED native layout at the
+    exchange; the sm_8x Marlin rank does so by permuting its content in place
+    around each flip (nvfp4_marlin_inplace)."""
     major, minor = int(capability[0]), int(capability[1])
     cap = (major, minor)
     if major == 12:
@@ -149,29 +205,32 @@ def resolve_rank_backend(
             "flashinfer_cutedsl", cap, True, "sm_10x: native W4A4 (auto's choice there)"
         )
     if major == 8:
-        if w4a8_available:
+        choice = str(sm8x_choice or "marlin").strip().lower()
+        if choice == "w4a8":
+            if not w4a8_available:
+                raise NativeMixedUnsupported(
+                    f"native-mixed: SGLANG_FP4_NATIVE_MIXED_SM8X=w4a8 on sm_{major}{minor}, "
+                    "but no W4A8 INT8 kernel is registered "
+                    "(sglang.srt.layers.quantization.nvfp4_w4a8_int8)."
+                )
             return RankKernelChoice(
                 "w4a8_int8", cap, True, "sm_8x: W4A8 on INT8 tensor cores, native layout"
             )
-        if allow_marlin:
+        if choice == "marlin":
             return RankKernelChoice(
-                "marlin",
+                "marlin_native_inplace",
                 cap,
-                False,
-                "sm_8x: no W4A8 kernel registered; SGLANG_FP4_NATIVE_MIXED_ALLOW_MARLIN=1 "
-                "-> Marlin W4A16, which REPACKS the native bytes (this rank leaves the "
-                "shared layout; a flip onto it would have to reshape)",
+                True,
+                "sm_8x: Marlin W4A16 on the shared native layout (content permuted "
+                "in place around every flip, N-bands bound the transient)",
             )
         raise NativeMixedUnsupported(
-            f"native-mixed: sm_{major}{minor} rank needs the W4A8 INT8 kernel that "
-            "reads the native NVFP4 layout, and none is registered "
-            "(sglang.srt.layers.quantization.nvfp4_w4a8_int8). Marlin would repack "
-            "the weights into a different byte layout and break the no-reshape flip; "
-            "set SGLANG_FP4_NATIVE_MIXED_ALLOW_MARLIN=1 to accept that explicitly."
+            f"native-mixed: SGLANG_FP4_NATIVE_MIXED_SM8X={sm8x_choice!r} is neither "
+            "'marlin' nor 'w4a8'."
         )
     raise NativeMixedUnsupported(
         f"native-mixed: compute capability {major}.{minor} has neither FP4 nor a "
-        "supported INT8 W4A8 path."
+        "supported W4A16/W4A8 path."
     )
 
 
@@ -182,6 +241,7 @@ def resolve_this_rank() -> RankKernelChoice:
     from sglang.srt.utils.common import get_device_capability
 
     _try_autoload_w4a8_kernel()
+    _try_autoload_sm12x_apply()
     cap = get_device_capability()
     if cap is None or cap[0] is None:
         raise NativeMixedUnsupported("native-mixed needs a CUDA device.")
@@ -191,7 +251,7 @@ def resolve_this_rank() -> RankKernelChoice:
     choice = resolve_rank_backend(
         (int(cap[0]), int(cap[1])),
         w4a8_available=w4a8_kernel() is not None,
-        allow_marlin=bool(envs.SGLANG_FP4_NATIVE_MIXED_ALLOW_MARLIN.get()),
+        sm8x_choice=str(envs.SGLANG_FP4_NATIVE_MIXED_SM8X.get()),
         native_sm120_available=native,
     )
     log = logger.info if choice.shared_layout else logger.warning
@@ -201,7 +261,12 @@ def resolve_this_rank() -> RankKernelChoice:
         choice.capability[1],
         choice.backend,
         choice.reason,
-        f" [kernel {w4a8_kernel_name()}]" if choice.backend == "w4a8_int8" else "",
+        f" [kernel {w4a8_kernel_name()}]" if choice.backend == "w4a8_int8"
+        else (
+            f" [sm12x hook {sm12x_apply_name()}]"
+            if sm12x_apply() is not None and int(cap[0]) == 12
+            else ""
+        ),
     )
     return choice
 

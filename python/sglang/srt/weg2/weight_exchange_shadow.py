@@ -752,6 +752,27 @@ def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
 # ---------------------------------------------------------------------------
 
 
+_LEAFS = frozenset({"weight", "bias", "weight_scale", "weight_zero_point", "scale",
+                    "input_scale", "weight_packed", "weight_shape", "g_idx"})
+
+#: Backlog #38 L4: the NVFP4 native-layout parameters are LEAVES of their
+#: linear's class, not classes of their own. Gated on a BOOT-UNIFORM env the
+#: weg2 launcher sets for itself and every rank under --fp4-native-mixed, so
+#: (a) the launcher's checkpoint census and every rank's manifest read ONE
+#: answer, and (b) the class names of today's Marlin NVFP4 profile
+#: (``weight_global_scale``, ``alpha``, ... as classes) do not change.
+NVFP4_NATIVE_LEAFS_ENV = "SGLANG_FP4_NATIVE_MIXED_BOOT"
+NVFP4_NATIVE_LEAF_NAMES = frozenset({
+    "weight_scale_interleaved", "alpha", "input_scale_inv", "weight_scale_2",
+    "weight_global_scale", "weight_global_scale_w4a16",
+})
+_LEAFS_NATIVE = _LEAFS | NVFP4_NATIVE_LEAF_NAMES
+
+
+def nvfp4_native_leafs_on() -> bool:
+    return os.environ.get(NVFP4_NATIVE_LEAFS_ENV, "").strip() == "1"
+
+
 def tensor_class(param_name: str) -> str:
     """The spec section 2.2 CLASS of a parameter, from its own name.
 
@@ -765,8 +786,7 @@ def tensor_class(param_name: str) -> str:
     parts = [p for p in str(param_name).split(".") if p]
     if not parts:
         return "?"
-    leafs = {"weight", "bias", "weight_scale", "weight_zero_point", "scale",
-             "input_scale", "weight_packed", "weight_shape", "g_idx"}
+    leafs = _LEAFS_NATIVE if nvfp4_native_leafs_on() else _LEAFS
     for part in reversed(parts):
         if part in leafs or part.isdigit():
             continue

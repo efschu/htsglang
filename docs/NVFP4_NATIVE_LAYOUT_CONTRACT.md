@@ -194,11 +194,11 @@ Der 27B-Flip läuft über `--weg2-weight-source exchange` (docker/profiles/27b.e
 | L1 | weg2/xchg_manifest.py:665-843 `_axis_of` + weg2/weight_exchange.py `StorageGeom.of` | down_proj.weight_scale (geswizzelt) wird im P→D-Join als gewöhnlicher COLS-Schnitt gelesen. Das ergibt **falsche Bytes ohne Fehler**, am Test gezeigt: `test_plain_column_slice_is_wrong`. | Kachelsicht (N/128, K_pad·128) für gestempelte row-parallel-Skalen in `StorageGeom.of`. Alle vier Aufrufer laufen durch diese eine Stelle: ParamGeom.of, Drift-Check xchg_manifest.py:1279, flat-tables weight_exchange.py:1882/2155. | S | **gebaut**, gegatet durch den Stempel |
 | L2 | weg2/weight_exchange_shadow.py:2950 `_qkv_component_rows` | Deklarierte Komponenten einer Kachelsicht-Skala müssen in Kacheln gezählt werden. | `_in_nvfp4_sf_tiles`: Division durch 128; eine nicht ganze Kachel ergibt `()`, der Join verweigert dann. | S | **gebaut** (betrifft heute keine Klasse, weil row-parallel nicht fusioniert ist) |
 | L3 | Zeilenschnitte gate_up / lm_head | kein Bruch: 128er-Grenzen sind layout-neutral. lm_head D: 82816 = 647 Kacheln, das Vokabular-Pad (128 Zeilen) ist genau 1 Kachel und wird ZEROFILL (Skala 0). | Element-Sicht beibehalten, damit die Vokabular-Pad-Arithmetik (`_padded`, :800-812) weiter in Zeilen zählt. | – | Test `test_fused_row_shard_is_layout_neutral` |
-| L4 | weight_exchange_shadow.py:755-775 `tensor_class` | `weight_scale_2`, `input_scale_inv`, `alpha`, `weight_global_scale`, `weight_scale_interleaved` fehlen in den `leafs` und werden als eigene Klasse gezählt. Rotation und Manifest-Klassennamen sind dadurch falsch gruppiert, die Bytes aber korrekt. | Die fünf Namen in `leafs` aufnehmen. Das ändert die Klassennamen im Manifest AUCH für das heutige Marlin-NVFP4-Profil (`weight_global_scale`), darum nicht in dieser Runde. | S | Plan |
+| L4 | weight_exchange_shadow.py:755-775 `tensor_class` | `weight_scale_2`, `input_scale_inv`, `alpha`, `weight_global_scale`, `weight_scale_interleaved` fehlen in den `leafs` und werden als eigene Klasse gezählt. Rotation und Manifest-Klassennamen sind dadurch falsch gruppiert, die Bytes aber korrekt. | Die Namen (plus `weight_global_scale_w4a16`, §13) als Blätter, NUR unter dem boot-einheitlichen Env `SGLANG_FP4_NATIVE_MIXED_BOOT=1` (Launcher setzt es für sich und beide Gruppen). Das heutige Marlin-Profil behält seine Klassennamen. | S | **gebaut** (N4C), Test `TestExchangeClassesL4` |
 | L5 | modelopt_quant.py:1775-1813 Polster | Ein N- oder K/16-Polster erzeugt zwei Skalen-Tensoren (roh + interleaved) mit abweichender Shape. | Im Modus verweigert (`check_shard_alignment`). Für 27B nie nötig (Block [128,128]). | S | **gebaut** |
 | L6 | weg2/launcher.py:9247-9296 `uniform_marlin_argv` | `--fp8-uniform-marlin` + modelopt erzwingt `--fp4-gemm-backend marlin` für beide Gruppen. Es fehlt ein Launcher-Weg zu `native-mixed`. | Launcher-Flag (z. B. `--fp4-native-mixed`), das statt `marlin` die Form `native-mixed` ausgibt, FP8 bleibt vorerst Marlin. Dazu argv_gate-Zählung P/D nachziehen. | S | **gebaut**: Launcher-Flag `--fp4-native-mixed` (nur mit `--fp8-uniform-marlin` auf ModelOpt, sonst W160), Default byte-gleich |
-| L7 | uneven_perf.py:736-760, 2005-2030 | Die Planer-Lanes kennen `nvfp4_native` (5090) und `nvfp4_marlin`, aber keine Lane `nvfp4_w4a8` für sm_86. P-Schnitt und D-Ratio würden mit Marlin-Raten der 3080 geplant. | Lane `nvfp4_w4a8_int8` mit N4As Mikrobench-Werten; Familienauflösung `mlp`/`vocab` für native-mixed. | M | Plan |
-| L8 | Marlin-Rückfall (marlin_utils_fp4.py:127-221) | Ein anderes Layout auf demselben Parameternamen: P-Ganzes und D-Stück haben andere Shapes, int32 [K/16, 2N] gegen u8 [N, K/2], der Join antwortet mit W68. | Im Modus nur mit ausdrücklicher Env-Freigabe. Richtig wäre abgeleitete Marlin-Kopie + Repack nach jedem Flip-Eingang (Zeit + Transient). | M | Refusal gebaut, Repack-Pfad Plan |
+| L7 | uneven_perf.py:736-760, 2005-2030 | Die Planer-Lanes kennen `nvfp4_native` (5090) und `nvfp4_marlin`, aber keine Lane `nvfp4_w4a8` für sm_86. P-Schnitt und D-Ratio würden mit Marlin-Raten der 3080 geplant. | N4C: Weg (b), also keine W4A8-Lane. Die Lanes `nvfp4_native` (5090) / `nvfp4_marlin` (3080) bekommen unter native-mixed Messwerte aus dem Evidenz-Register `planner/nvfp4_lane_record.py` (zcx7pv, M=512, mit Power-Limit), nur wo das Rig-Profil selbst nichts gemessen hat. Default-Boot liest das Profil unverändert. | M | **gebaut** (N4C), Test `TestPlannerLanesL7` |
+| L8 | Marlin-Rückfall (marlin_utils_fp4.py:127-221) | Ein anderes Layout auf demselben Parameternamen: P-Ganzes und D-Stück haben andere Shapes, int32 [K/16, 2N] gegen u8 [N, K/2], der Join antwortet mit W68. | N4C: KEINE Kopie. Die Parameter behalten die native Form; nur der INHALT wird in place und blockweise (N-Bänder) permutiert, vor dem Einschlafen zurück nach native, nach dem Aufwachen nach Marlin (§13). | M | **gebaut** (N4C), Tests `test_nvfp4_marlin_inplace.py` |
 | L9 | Skalare `alpha`, `input_scale_inv`, `weight_global_scale` (0-dim), `input_scale`/`weight_scale_2` [n_parts] | kein Bruch: `StorageGeom.of` beschreibt 0-dim als 1×1 (weight_exchange.py, Zweig `len(shape)==0`), der Join liest REPLICATED. | – | – | – |
 | L10 | Parameter-Aliase | `weight_scale_interleaved` IST `weight_scale`; `named_parameters` sieht es einmal. Gestempelt wird das Objekt, der Stempel gilt für beide Namen. | Kein Code nötig. Nicht über `.data` gehen: das verliert den Stempel. | – | – |
 | L11 | Ladeweg nach Flip-Eingang | Der Tausch schreibt Bytes in bestehende Parameter-Storages; `process_weights_after_loading` läuft nicht erneut. | Kein Bruch: Swizzle und Skalare sind Zustand der Bytes, nicht des Ladens. | – | – |
@@ -360,3 +360,55 @@ angenommen, dazu der gemessene unerklärte Rest je Karte):
 
 - NVFP4-DFlash2-Draft: geht durch dieselbe Methode, also derselbe Vertrag. Shapes nicht geprüft.
 - Mikrobench-Zahlen dieses Sitzes: siehe Bericht (GPU-Fenster nach der NF-Nachabnahme).
+
+## 13. N4C (25.09.): 3080 = Marlin W4A16 auf dem gemeinsamen Layout (Weg b)
+
+**Entscheidung.** FlashInfer `mm_bf16_fp4(backend="cute-dsl-native")` (PR #5242, Squash 2f3bc5a, 23.09.) liest das
+native Layout direkt, ist aber auf SM120/121 gegatet (`@supported_compute_capability([120, 121])`). Der Dequant ist
+Inline-PTX `cvt.rn.bf16x2.e2m1x2` / `cvt.rn.bf16x2.e4m3x2` (nur Blackwell bzw. sm_90+). Auf sm_86 gibt es diese
+Instruktionen nicht; das ist eine Architekturgrenze, kein Upgrade-Risiko. Das Release 0.7.0 (22.09.) enthält ihn nicht.
+Das `cute-dsl`-Backend in 0.6.14 ist sm_100+ (TMA, Cluster) und packt um. Also Weg (b).
+Für die **5090 im Decode** ist cute-dsl-native dagegen genau richtig (W4A16 nativ, Upstream: down M=1 1,25× gegen
+Marlin). Das hängt am FlashInfer-Upgrade (Strang F) und kommt über die Naht `register_sm12x_apply` (unten).
+
+**Dispatch** (`nvfp4_native_mixed.resolve_rank_backend`), Default der Option bleibt AUS:
+- sm_12x → `cutlass` (W4A4). Optional ein registrierter Hook `register_sm12x_apply(fn)` je Aufruf
+  (fn gibt `None` zurück → W4A4). Autoload: Modul `nvfp4_sm12x_choice`, falls vorhanden.
+- sm_8x → `marlin_native_inplace` (Default) oder `w4a8_int8` mit `SGLANG_FP4_NATIVE_MIXED_SM8X=w4a8` (N4A-Naht bleibt).
+- Die frühere Env `SGLANG_FP4_NATIVE_MIXED_ALLOW_MARLIN` (Marlin mit eigenem Layout) entfällt.
+
+**In-place-Umformung** (`nvfp4_marlin_inplace.py`):
+- Gleiche Bytezahl: `weight` u8 [N,K/2] ↔ int32 [K/16,2R] je Band; `weight_scale` e4m3 [N,K/16] (128x4) ↔ fp8 [K/16,R].
+  Parameter-Objekte, Shapes, dtypes und Storages bleiben; Tausch, Join, CUDA-Graphen und Coverage sehen die native Menge.
+- N-Bänder: R Vielfaches von 128, Band ≤ 16 MiB (`SGLANG_FP4_NATIVE_MIXED_BAND_MIB`), K-Schritte ≤ 2 MiB
+  (`..._CHUNK_MIB`). Arbeitsmenge je Schritt ≤ Band + 6 Schritte = 28 MiB. KEINE Reserve (keine-korridor-reserve-nie).
+- GEMM je Band (`apply_fp4_marlin_linear`), Ausgaben entlang N verkettet (exakt, keine Reduktion über N).
+- Skalen: `nvfp4_marlin_process_scales` ist für E4M3 ≥ 0 verlustfrei und umkehrbar; negative Skalen werden beim Laden
+  verweigert.
+- Globale Marlin-Skala: Parameter `weight_global_scale_w4a16` (bf16 [1]) auf JEDEM native-mixed-Rang (replizierter
+  Wert, einheitliche Parametermenge). Workspace = lokales Scratch (wird beim Aufwachen genullt, wie heute).
+- Stempel `nvfp4_content` je Parameter-Objekt macht jede Umformung idempotent.
+- Hooks (`weight_updater`): Schlafseite `_weg2_nvfp4_marlin_to_native` VOR dem Seam-Digest und dem ersten Deposit;
+  Wachseite `_weg2_nvfp4_marlin_after_wake` NACH dem Seam-Digest-After, vor jedem Forward. Hat der Tausch getragen
+  (`CARRIER_EXCHANGE`), gilt der Inhalt als nativ, egal was der Stempel sagt.
+- Log-Zeilen: `NVFP4-MARLIN-INPLACE to_native layers=.. bytes=..MiB ms=..` und `... to_marlin ... delivered_native=..`.
+
+**Kosten (RECHNUNG, nicht gemessen).** Je 3080 D ~2,5 GB (64 × 35 MB MLP-Stück + lm_head-Stück 238 MB), P 1,35–1,9 GB (8–9 Schichten à 150 MB, letzte Stufe + lm_head 716 MB) NVFP4; Verkehr ~8–10× bei ~600 GB/s plus
+~10k Kernelstarts: ~40–80 ms je Richtung und Karte, beide 3080 parallel, also ~+2–4 % auf 3,1–4,0 s Flip.
+Band-Verkettung im P-Forward: ~0,14 ms je 3080-Schicht (gate_up [512,34816] bf16 lesen+schreiben).
+
+**Hochrechnung P8k** (`projection.py --window`, Kerne gemessen, Zusammensetzung gerechnet; 3080 = gemessenes Marlin):
+
+| 3080 | 5090 | Schnitt | P8k (kalibriert) | 5090-VRAM P (fix / KV 262k / frei für KV) |
+|---|---|---|---|---|
+| Marlin W4A16 | NVFP4 nativ + FP8 Marlin (heute) | **50/7/7** | 7,1k (6,3–7,2k) | 17,8 / 8,5 / 12,7 GiB = 391k Token |
+| Marlin W4A16 | NVFP4 nativ + FP8 nativ (sgl-kernel 120a offen) | **52/6/6** | 8,2k (7,2–8,3k) | 18,4 / 9,0 / 12,2 GiB = 354k Token |
+| W4A8 117 TOPS (zum Vergleich) | + FP8 nativ | 47/9/8 | 8,9k (7,9–9,1k) | 17,0 / 8,0 / 13,5 GiB |
+
+KV-Zelle mit 5 Draft-Schichten gerechnet (N4Bs Modell). Ohne Draft-Seiten auf P (`--dflash-produce-on-p off`) ist sie
+kleiner, 262k passt dann erst recht. Der Unterschied W4A16 gegen W4A8 in P ist ~9–10 %, nicht „kaum“.
+
+**FP8-Anteil.** 5090 nativ FP8 wartet auf den sgl-kernel-Neubau `86;120a` (CUTLASS FP8 bricht heute auf sm_120 ab).
+Bis dahin bleibt FP8 auf allen Karten Marlin W8A16 (`--fp8-uniform-marlin`): **OFFEN**. Wird die 5090 FP8-nativ,
+braucht die 3080 vermutlich dieselbe In-place-Behandlung für ihre FP8-Marlin-Gewichte (FP8-Marlin dürfte ebenfalls eine
+Permutation gleicher Bytezahl sein; NICHT geprüft, eigene Aufgabe).

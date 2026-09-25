@@ -1736,6 +1736,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         if (
             not get_fp4_gemm_runner_backend().is_w4a8_int8()
+            and not get_fp4_gemm_runner_backend().is_marlin_native_inplace()
             and not is_blackwell_supported()
         ):
             raise ValueError(
@@ -1846,6 +1847,15 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 layer.weight_scale_interleaved,
                 k_sharded=isinstance(layer, RowParallelLinear),
             )
+            # The processed Marlin global scale, bound on EVERY native-mixed
+            # rank (replicated value, uniform parameter set for the join).
+            from sglang.srt.layers.quantization import nvfp4_marlin_inplace
+
+            nvfp4_marlin_inplace.bind_global_scale(layer, layer.params_dtype)
+            if get_fp4_gemm_runner_backend().is_marlin_native_inplace():
+                # sm_8x: Marlin W4A16 on the shared layout -- the content is
+                # permuted in place (per N-band), never the parameter set.
+                nvfp4_marlin_inplace.prepare_layer(layer)
 
         if getattr(layer, "_interleave_for_swiglu_fusion", False):
             from sglang.srt.layers.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
@@ -1914,6 +1924,18 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             from sglang.srt.layers.quantization.nvfp4_native_mixed import apply_w4a8
 
             return apply_w4a8(layer, x, bias)
+        if get_fp4_gemm_runner_backend().is_marlin_native_inplace():
+            from sglang.srt.layers.quantization import nvfp4_marlin_inplace
+
+            return nvfp4_marlin_inplace.apply(layer, x, bias)
+        if is_fp4_native_mixed():
+            from sglang.srt.layers.quantization.nvfp4_native_mixed import sm12x_apply
+
+            hook = sm12x_apply()
+            if hook is not None and not isinstance(x, tuple):
+                out = hook(layer, x, bias)
+                if out is not None:
+                    return out
 
         # `_accepts_prequantized_fp4` is the explicit opt-in so an accidental
         # tuple from unrelated code can't silently bypass quantization.

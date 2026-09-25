@@ -9294,7 +9294,7 @@ def checkpoint_quant_method(model_path: str) -> str:
 
 #: Backlog #38 (--fp4-native-mixed): the NVFP4 linears keep the NATIVE byte
 #: layout on every rank and pick their kernel per rank (sm_120 W4A4 CUTLASS,
-#: sm_86 W4A8 INT8) -- docs/NVFP4_NATIVE_LAYOUT_CONTRACT.md.
+#: sm_86 Marlin W4A16 in place) -- docs/NVFP4_NATIVE_LAYOUT_CONTRACT.md.
 FP4_NATIVE_MIXED_ARGV = ("--fp4-gemm-backend", "native-mixed")
 
 
@@ -9309,6 +9309,17 @@ def uniform_marlin_argv(
     if uniform_marlin and str(quant_method or "").lower() == "modelopt":
         return list(FP4_NATIVE_MIXED_ARGV if fp4_native_mixed else FP4_UNIFORM_MARLIN_ARGV)
     return []
+
+
+def fp4_native_mixed_env(um_argv: Sequence[str]) -> Dict[str, str]:
+    """The environment --fp4-native-mixed adds (launcher + both groups), ONE
+    boot-uniform switch read by (a) the exchange class names -- the NVFP4 native
+    parameters become leaves of their linear's class (contract L4) -- and (b)
+    the planner's NVFP4 lanes (uneven_perf.NVFP4_LANE_RECORD, L7). Empty for
+    every other argv, so no other boot changes."""
+    if tuple(um_argv or ()) == FP4_NATIVE_MIXED_ARGV:
+        return {"SGLANG_FP4_NATIVE_MIXED_BOOT": "1"}
+    return {}
 
 
 def fp4_native_mixed_refusal(
@@ -11921,8 +11932,11 @@ def build_parser() -> argparse.ArgumentParser:
              "checkpoint: the NVFP4 linears get --fp4-gemm-backend native-mixed on "
              "both groups instead of marlin -- ONE native NVFP4 byte layout on every "
              "rank (E2M1 [N,K/2] + 128x4-swizzled E4M3 block scales), the kernel "
-             "chosen per rank (sm_120 native W4A4, sm_86 W4A8 on the INT8 tensor "
-             "cores; an sm_86 rank without that kernel refuses at start). The FP8 "
+             "chosen per rank (sm_120 native W4A4, sm_86 Marlin W4A16 whose "
+             "parameter content is permuted in place around every flip; "
+             "SGLANG_FP4_NATIVE_MIXED_SM8X=w4a8 selects a registered W4A8 kernel). "
+             "Sets SGLANG_FP4_NATIVE_MIXED_BOOT=1 for launcher and ranks (exchange "
+             "class leaves L4, planner NVFP4 lane record L7). The FP8 "
              "linears stay on Marlin. Refused (W160) without --fp8-uniform-marlin "
              "or on a non-ModelOpt checkpoint. Default off = argv and env "
              "byte-identical.")
@@ -13334,6 +13348,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _um_argv = uniform_marlin_argv(
         _quant, bool(getattr(ns, "fp8_uniform_marlin", False)),
         bool(getattr(ns, "fp4_native_mixed", False)))
+    _nm_env = fp4_native_mixed_env(_um_argv)
+    if _nm_env:
+        # #38 L4: ONE class reading for the launcher's census and every rank
+        # (build_env copies os.environ), set before any census is taken.
+        os.environ.update(_nm_env)
+        log("WEG2 FP4-NATIVE-MIXED env for launcher and BOTH groups: %s"
+            % " ".join("%s=%s" % kv for kv in sorted(_nm_env.items())))
     if _um_argv:
         ns.extra_p = with_uniform_marlin_argv(ns.extra_p, _um_argv)
         ns.extra_d = with_uniform_marlin_argv(ns.extra_d, _um_argv)
