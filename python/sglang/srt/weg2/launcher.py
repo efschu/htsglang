@@ -12980,6 +12980,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "2*flip_s/(1/r_D - 1/r_P) from this rig's own front-log rate and flip "
                          "lines, else the recorded PRE-BARLINK pair; floor = --chunked-prefill-size. "
                          "The derivation and its three inputs are printed at launch.")
+    ap.add_argument("--d-only", action="store_true",
+                    help="Nutzer 25.09.: NUR Gruppe D (TP3 auf allen Karten), kein P, kein Flip, keine "
+                         "Front. D wird mit derselben Env und demselben argv gebaut wie im Flip-Boot "
+                         "(Budgets aus der Erwartung wie im Dry-Run), nimmt aber jede ungecachte Laenge "
+                         "selbst an (--tp-prefill-max-tokens = --max-kv-per-request) und wird direkt auf "
+                         f":{PORT_D} angesprochen. Fuer Hosts, deren RAM den Flip nicht traegt.")
     ap.add_argument("--x-ceiling-tokens", type=int, default=0,
                     help="H84: group D's --tp-prefill-max-tokens (its W50 riegel) and the ceiling "
                          "of the front's live X re-solve. 0 (default) = off: D and the front both "
@@ -15850,6 +15856,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # window the front cannot see, because the front is started further down.
     _launch_guard = None if dry else LaunchGuard(
         log, host_ledger.OBSERVED_REAP_NONRECLAIM_BYTES / host_ledger.GIB).start()
+    if ns.d_only:
+        # D-ONLY (Nutzer 25.09., NVFP4 im Container: der Host traegt den Flip nicht). Nur Gruppe D,
+        # gebaut wie im Dry-Run aus der Erwartung -- P's Ruherest bleibt eingeplant, also exakt die
+        # D-Form des Flip-Boots. Kein Flip heisst: D muss jede ungecachte Laenge selbst prefillen,
+        # der W50-Riegel steht deshalb auf dem Kontext statt auf X.
+        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(d-only, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card)
+        log_d_rank_vram_solve(ns, cards, budgets_d, log, "D(d-only, expectation)",
+                              p_split=p_split, chunk_layers=chunk_layers)
+        d_ratio = d_tp_ratio_decision(
+            ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
+            d_bs, getattr(ns, "env_d", "") or "",
+            user_reserve_by_card=user_reserve_by_card,
+        )
+        log(d_ratio.line)
+        log(d_ratio.op_line)
+        log(d_tokvec.line)
+        env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap)
+        _sg = ";".join(f"{k}={v}" for k, v in sorted(env_d.items()) if str(k).startswith("SGLANG_"))
+        log(f"WEG2-GROUP-ENV D: {_sg or '(leer)'}")
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, max_kv_per_request, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns)), ns.transport), state.logs["D"], env_d)
+        state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
+        launch_group(spec_d, tree, log, dry)
+        if dry:
+            log(f"DRY-RUN complete (d-only): group D alone on :{PORT_D}, no P, no flip, no front; nothing started")
+            return 0
+        state.pids["D"] = spec_d.pid
+        _write_state(state)
+        state.t_ready["D"] = wait_ready(PORT_D, spec_d.pid, ns.ready_deadline_s, log, "D", spec_d.proc)
+        log(f"WEG2-LAUNCH D-ONLY READY group=D port={PORT_D} after {state.t_ready['D']:.1f} s -- no P, no flip, "
+            f"no front; D prefills every uncached length itself (W50 = {max_kv_per_request})")
+        while spec_d.proc.poll() is None:
+            time.sleep(5)
+        log(f"WEG2-LAUNCH D-ONLY group D exited rc={spec_d.proc.returncode}")
+        return int(spec_d.proc.returncode or 0)
     launch_group(spec_p, tree, log, dry)
     if dry:
         budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card)
