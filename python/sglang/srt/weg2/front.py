@@ -2051,6 +2051,9 @@ class Front:
         self.drain_deadline_s = float(drain_deadline_s)
         # C4: oldest-first, one seat per running request on D.
         self._ready_for_d: Deque[Pending] = collections.deque()
+        # Law 2 (27B redtests): rid -> t_arrive of every request whose leg 1
+        # is in flight on P (see _older_leg1_in_flight).
+        self._leg1_inflight: Dict[str, float] = {}
         self._d_seat = asyncio.Semaphore(self.d_bs)
         # C5/R-16: an asyncio.Semaphore is FIFO among waiters with NO
         # priority, so a SHORT arrival would take a seat ahead of BATCH work
@@ -3187,6 +3190,30 @@ class Front:
         from sglang.srt.weg2.retain_publish import d_accepts_leg2 as _acc
         return _acc(self.awake, self.state, self.dormant_admit)   # xsn347: also during the P->D flip
 
+    def _queue_ready_for_d(self, p: "Pending") -> None:
+        """Law 2 (user 2026-09-07: D takes the OLDEST requests): keep
+        ``_ready_for_d`` in ``t_arrive`` order.
+
+        27B redtests: since #1459c the P pool calls ``_on_leg1_done`` in
+        leg-1 COMPLETION order -- and within one ``asyncio.wait`` batch in set
+        order -- so a plain ``append`` made the admitter's head the first
+        request P happened to finish, not the oldest (T3 red on e15e7602b7:
+        D admitted r03, r02, r04, r05, r00, r06). Completions arrive nearly in
+        order, so the walk from the right is short."""
+        dq = self._ready_for_d
+        i = len(dq)
+        while i > 0 and dq[i - 1].t_arrive > p.t_arrive:
+            i -= 1
+        dq.insert(i, p)
+
+    def _older_leg1_in_flight(self, t_arrive: float) -> bool:
+        """Law 2 under dormant admit (#1443): while P is still prefilling an
+        OLDER request, a younger one whose leg 1 already ended does not take
+        a D seat -- at the flip that seat is the older request's. Only legs in
+        flight count: a request waiting in the queue (an intake-stall requeue)
+        does not hold D back, so nothing here can wait for a next P phase."""
+        return any(t < t_arrive for t in self._leg1_inflight.values())
+
     def _log_admit(self, rid: str, source: str, t_arrive: float, rank: Optional[int] = None) -> None:
         """L2.  ``rank`` is this admission's ORDINAL in the current epoch.
 
@@ -3257,6 +3284,10 @@ class Front:
                     self._sync_batch_gate()
                     self.counters["d_admit_skipped_done"] += 1
                     continue
+                if self._older_leg1_in_flight(p.t_arrive):
+                    # Law 2: an older request is still on P; the head stays
+                    # queued (not popped), so do_stop still reaches it.
+                    continue
                 # FIX 7: the realised count when leg 1 has answered for this
                 # rid, the arrival estimate only for a cold one -- and the
                 # SAME number is charged to the seat below, so the gate and
@@ -3281,9 +3312,15 @@ class Front:
                     continue
                 if not self._ready_for_d or self._ready_for_d[0] is not p or p.fut.done():
                     # do_stop cleared the deque, or answered this request,
-                    # while the seat was being waited for.
+                    # while the seat was being waited for (or an older request
+                    # was queued ahead of it -- law 2 takes that one first).
                     self._d_seat.release()
                     self.counters["d_admit_skipped_done"] += 1
+                    continue
+                if self._older_leg1_in_flight(p.t_arrive):
+                    # Law 2, after the (possibly long) acquire: a P phase that
+                    # started meanwhile runs an older, requeued request first.
+                    self._d_seat.release()
                     continue
                 self._ready_for_d.popleft()
                 self._sync_batch_gate()
@@ -5395,6 +5432,10 @@ class Front:
                         p.leg1_done = True
                         return p
                     async with sem:
+                        # Law 2 (27B redtests): an OLDER request still on P
+                        # holds back younger ready ones (d_admitter); cleared
+                        # in _on_leg1_done, in the same step that queues it.
+                        self._leg1_inflight[p.rid] = p.t_arrive
                         try:
                             await self.leg1(p)
                         except Exception as e:  # noqa: BLE001
@@ -5426,11 +5467,14 @@ class Front:
 
                 def _on_leg1_done(p: Pending) -> None:
                     nonlocal _drain_uncached, prefilled
+                    self._leg1_inflight.pop(p.rid, None)
                     if p.intake_stalled:
                         return  # weg2xsn272: back in the queue, not ready for D
                     _drain_uncached += int(p.est_uncached)
                     if not p.fut.done():
-                        self._ready_for_d.append(p)
+                        # Law 2: by ARRIVAL, not by leg-1 completion (#1459c
+                        # runs on_done in completion order).
+                        self._queue_ready_for_d(p)
                         self._sync_batch_gate()
                         prefilled += 1
 
@@ -5442,9 +5486,15 @@ class Front:
                 # 29.5 s again -- the 3 s store probe was back on every
                 # second request).  The pool refills the moment ONE leg
                 # finishes, so P always has the next request queued.
-                passes = await _p_drain_pool(
-                    self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
-                    lambda: self.state == "serving" and not self._p_intake_stalled)
+                try:
+                    passes = await _p_drain_pool(
+                        self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
+                        lambda: self.state == "serving" and not self._p_intake_stalled)
+                finally:
+                    # Returned: every leg it started has ended. Raised: the
+                    # legs it abandoned never reach _on_leg1_done. Either way
+                    # no entry may stay behind and hold D's admission back.
+                    self._leg1_inflight.clear()
                 if passes:
                     oldest_short = 0.0
                     if self._ready_for_d:

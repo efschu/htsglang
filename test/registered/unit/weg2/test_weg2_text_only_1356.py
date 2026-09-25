@@ -122,8 +122,12 @@ class ImagesAreRefusedByName(CustomTestCase):
 
         src = inspect.getsource(fr.Front.handle_generate)
         self.assertIn("W101 Weg2VisionRefused", src)
-        self.assertIn("--weg2-vision resident", src)
         self.assertIn("status=501", src)
+        # #58 (0aeb52e070): the way out is written by vision_verdict, whose
+        # text handle_generate returns in the 501 body -- asserted there.
+        verdict, why = fr.vision_verdict(1, 0, fr.VISION_MODE_OFF)
+        self.assertEqual(verdict, fr.VERDICT_REFUSE_IMAGE)
+        self.assertIn("--weg2-vision resident", why)
 
 
 if __name__ == "__main__":

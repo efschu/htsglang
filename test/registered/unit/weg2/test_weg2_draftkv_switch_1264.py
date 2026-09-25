@@ -314,7 +314,7 @@ class TestFrontArgvDoesNotFollowTheSwitch(unittest.TestCase):
     def test_front_argv_is_byte_identical_under_both_values(self):
         import argparse
 
-        from sglang.srt.weg2.launcher import front_argv_for
+        from sglang.srt.weg2.launcher import WEIGHT_SOURCE_DEFAULT, front_argv_for
 
         class C:
             uuid, nvml_index = "GPU-aaa", 0
@@ -322,6 +322,8 @@ class TestFrontArgvDoesNotFollowTheSwitch(unittest.TestCase):
         ns = argparse.Namespace(
             tag="t", fairness_w_s=1.0, drain_deadline_s=30.0,
             min_dwell_ms=None, d_admit_max_tokens=None,
+            # #1444 (dc15687a63): front_argv_for stamps --weight-form from it
+            weg2_weight_source=WEIGHT_SOURCE_DEFAULT,
         )
         kw = dict(
             py=PY, store_dir="/tmp/s", p_pid=1, d_pid=2, dc_expect_d={"GPU-aaa": 0},

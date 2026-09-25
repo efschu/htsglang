@@ -13,6 +13,7 @@ There is no pytest-asyncio in this venv, so every async test body is run by
 import asyncio
 import inspect
 import logging
+import os
 import re
 import time
 from types import SimpleNamespace
@@ -248,7 +249,11 @@ def test_t1_p_drains_the_whole_backlog_before_the_flip_at_p_concurrency():
                               if e.startswith("rpc:release_memory_occupation"))
             leg1_marks = [e for e in h.p.timeline[:first_flip] if e.startswith("gen:")]
             assert len(leg1_marks) == 16, h.p.timeline[:40]
-            assert h.p.peak_in_flight <= 4, h.p.peak_in_flight
+            # #1459 (34b6d145c3): the front keeps P_QUEUE_AHEAD requests
+            # queued on P beyond --p-concurrency (P's max-running-requests
+            # bounds compute; the extra one's store probe runs in the shadow).
+            ahead = max(0, int(os.environ.get("SGLANG_WEG2_P_QUEUE_AHEAD", "1") or 0))
+            assert h.p.peak_in_flight <= 4 + ahead, h.p.peak_in_flight
             assert not h.front.queue
             assert not h.front._ready_for_d
 
@@ -313,7 +318,9 @@ def test_t4_the_two_bs_values_are_per_group_argv_and_not_in_common_flags():
     the right value, NONE in common_flags."""
     common = launcher_mod.common_flags("/m", 8, 512, 16.0, 262144)
     assert "--max-running-requests" not in common
-    ap = launcher_mod.argv_p("py", "/m", [1, 2, 3], 8, 512, 16.0, [], 4, 262144)
+    # #1356 [fix] (bfc252c172): argv_p is keyword-only from its first optional.
+    ap = launcher_mod.argv_p("py", "/m", [1, 2, 3], 8, 512, 16.0, [],
+                             p_bs=4, max_kv_per_request=262144)
     ad = launcher_mod.argv_d("py", "/m", [1, 2, 3], 8, 512, 16.0, [], 6, 262144, 22000)
     assert ap.count("--max-running-requests") == 1
     assert ad.count("--max-running-requests") == 1
@@ -753,8 +760,11 @@ def test_f1a_the_batch_admitter_rechecks_the_phase_after_the_seat_acquire():
         # The admitter is now queued on the seat for p2.
         await asyncio.sleep(0.3)
         assert not p2.fut.done()
-        # THE FLIP: state='flipping' (front.py:1097) and then awake='P'.
-        f.state, f.awake = "flipping", "P"
+        # THE FLIP D->P: state='flipping' while awake stays 'D' until the
+        # flip's end (Front.flip sets awake=dst last) -- drain(D) runs now.
+        # xsn347/348 (4336934ff4, a27841d0fd): ('flipping', 'P') is the P->D
+        # flip, during which a dormant-admit D takes leg 2 BY DESIGN.
+        f.state = "flipping"
         p1.seat.release("leg2_finished")
         await asyncio.sleep(0.3)
         task.cancel()
@@ -1058,13 +1068,16 @@ def test_f4c_zero_disables_the_token_budget_and_it_is_a_flag():
     argv = launcher_mod.front_argv_for(
         "py", "/tmp/store", 1, 2, {}, [],
         SimpleNamespace(tag="t", fairness_w_s=45.0, min_dwell_ms=None,
-                        drain_deadline_s=120.0, d_admit_max_tokens=None),
+                        drain_deadline_s=120.0, d_admit_max_tokens=None,
+                        # #1444 (dc15687a63): the front's --weight-form
+                        weg2_weight_source=launcher_mod.WEIGHT_SOURCE_DEFAULT),
         0, 27466, 4, 6, 10000, 10000, "D")
     assert "--d-admit-max-tokens" not in argv
     argv = launcher_mod.front_argv_for(
         "py", "/tmp/store", 1, 2, {}, [],
         SimpleNamespace(tag="t", fairness_w_s=45.0, min_dwell_ms=None,
-                        drain_deadline_s=120.0, d_admit_max_tokens=0),
+                        drain_deadline_s=120.0, d_admit_max_tokens=0,
+                        weg2_weight_source=launcher_mod.WEIGHT_SOURCE_DEFAULT),
         0, 27466, 4, 6, 10000, 10000, "D")
     assert argv[argv.index("--d-admit-max-tokens") + 1] == "0"
 
@@ -1500,7 +1513,9 @@ def test_g3_the_launcher_states_the_carrierless_pp_arm_at_launch_from_the_argv_i
     and it is read off the P argv this launcher is about to run rather than
     asserted from memory, so a group P that stopped being a PP group would
     change the line instead of leaving it lying."""
-    argv = launcher_mod.argv_p("py", "/m", [1, 2, 3], 8, 512, 1.0, [], 4, 30000)
+    # #1356 [fix] (bfc252c172): argv_p is keyword-only from its first optional.
+    argv = launcher_mod.argv_p("py", "/m", [1, 2, 3], 8, 512, 1.0, [],
+                               p_bs=4, max_kv_per_request=30000)
     line = launcher_mod.w38_armed_line(argv)
     # RECONCILED on the 0908 train: W38's own gate is deleted and the banner
     # states the ONE surviving arm, #1245's undistributable drop.

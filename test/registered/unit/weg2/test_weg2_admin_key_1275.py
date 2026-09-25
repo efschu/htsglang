@@ -211,8 +211,11 @@ class TheSecretDoesNotLeak(CustomTestCase):
 
         from sglang.srt.weg2 import launcher as L
 
+        # #1444 (dc15687a63): front_argv_for stamps --weight-form from
+        # weg2_weight_source.
         ns = SimpleNamespace(tag="t", fairness_w_s=45.0, drain_deadline_s=90.0,
-                             min_dwell_ms=None, d_admit_max_tokens=None)
+                             min_dwell_ms=None, d_admit_max_tokens=None,
+                             weg2_weight_source=L.WEIGHT_SOURCE_DEFAULT)
         argv = L.front_argv_for("py", "/store", 1, 2, {}, [], ns, 0, 0, 8, 8,
                                 22000, 22000, "D",
                                 admin_key_file="/g/weg2/boot_t.adminkey")
@@ -234,8 +237,11 @@ class TheSecretDoesNotLeak(CustomTestCase):
 
         from sglang.srt.weg2 import launcher as L
 
+        # #1444 (dc15687a63): front_argv_for stamps --weight-form from
+        # weg2_weight_source.
         ns = SimpleNamespace(tag="t", fairness_w_s=45.0, drain_deadline_s=90.0,
-                             min_dwell_ms=None, d_admit_max_tokens=None)
+                             min_dwell_ms=None, d_admit_max_tokens=None,
+                             weg2_weight_source=L.WEIGHT_SOURCE_DEFAULT)
         base = L.front_argv_for("py", "/s", 1, 2, {}, [], ns, 0, 0, 8, 8, 1, 1, "D")
         self.assertNotIn("--admin-key-file", base)
 
