@@ -8238,9 +8238,17 @@ def _max_running_requests(model: str, group: str = "D", bs: int = DEFAULT_D_BS) 
     two callers ask about different groups and now say which: the P pool
     model's mamba slots are P's ``--p-bs``, and D's ping-pong price is D's
     ``--d-bs``. Sharing one value was the very coupling C1/R-12 removed.
+
+    H68c: the probe argv states NO cut (``stage_ratio=""``, the omit-both
+    form). With ``None`` argv_p hands over the incumbent ratio and first checks
+    the model's PP calibration (#1362 W99) -- a check about a CUT this reader
+    never looks at. It refused the first NVFP4 dry run (48 layers, no record
+    yet) although that arm pins its cut (--pp-stage-ratio 29,11,8), whose own
+    argv never asks for the incumbent.
     """
     if str(group) == "P":
-        flags = argv_p("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG, [], p_bs=int(bs))
+        flags = argv_p("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG, [], p_bs=int(bs),
+                       stage_ratio="", attn_stage_ratio="")
     else:
         flags = argv_d("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG, [], d_bs=int(bs))
     return int(flags[flags.index("--max-running-requests") + 1])
@@ -8253,9 +8261,11 @@ def _p_page_size(model: str, p_bs: int = DEFAULT_P_BS) -> int:
     (``pool_configurator.calculate_pool_sizes``), and the page is the second
     floor. Read off the argv for the same reason ``_max_running_requests`` is:
     the flag lives in ``common_flags`` today and the model must follow it if it
-    moves, rather than carrying a second copy of the value.
+    moves, rather than carrying a second copy of the value. No cut on the
+    probe argv (H68c, see ``_max_running_requests``).
     """
-    flags = argv_p("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG, [], p_bs=int(p_bs))
+    flags = argv_p("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG, [], p_bs=int(p_bs),
+                   stage_ratio="", attn_stage_ratio="")
     try:
         return int(flags[flags.index("--page-size") + 1])
     except ValueError:
@@ -8301,7 +8311,10 @@ def p_activation_reserve_provenance(model: str, p_bs: int = DEFAULT_P_BS) -> Tup
     """
     from sglang.srt.server_args import ServerArgs
 
-    flags = argv_p("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG, [], p_bs=int(p_bs))
+    # H68c: no cut on the probe argv (see ``_max_running_requests``); the view
+    # below reads none of the ratio flags
+    flags = argv_p("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG, [], p_bs=int(p_bs),
+                   stage_ratio="", attn_stage_ratio="")
 
     def _flag(name: str, default):
         try:
