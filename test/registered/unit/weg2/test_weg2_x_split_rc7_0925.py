@@ -47,7 +47,9 @@ from sglang.srt.weg2.front import (
     X_SOLO_WINDOW_S,
     Front,
     Pending,
-    r_d_sample,
+    r_d_probe,
+    x_rd_min_uncached,
+    x_solo_window_s,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -115,38 +117,51 @@ async def _arrive(f, rid, uncached, delay=0.0):
 # ===========================================================================
 
 
+M = X_RD_MIN_UNCACHED
+
+
 class RdSampleArithmetic(CustomTestCase):
-    def test_the_prefill_clock_is_the_denominator(self):
-        rate, why = r_d_sample(8000, 3.9, True)
-        self.assertEqual(why, "d_prefill_clock")
+    """r_d_probe: the NF line's H84 contract and name (one function, both lines)."""
+
+    def test_the_prefill_time_is_the_denominator(self):
+        rate, why = r_d_probe(8000, 3.9, M)
+        self.assertEqual(why, "sample")
         self.assertAlmostEqual(rate, 8000 / 3.9)
 
     def test_there_is_no_wall_argument_at_all(self):
         """The danger direction: a wall parameter is how the decode got back in."""
-        params = inspect.signature(r_d_sample).parameters
+        params = inspect.signature(r_d_probe).parameters
         self.assertFalse([p for p in params if "wall" in p], params)
 
-    def test_no_clock_is_no_sample_never_the_wall(self):
-        self.assertEqual(r_d_sample(8000, None, True), (None, "no_prefill_clock"))
-        self.assertEqual(r_d_sample(8000, 0.0, True), (None, "bad_prefill_clock"))
+    def test_no_prefill_time_is_no_sample_never_the_wall(self):
+        self.assertEqual(r_d_probe(8000, None, M), (None, "no_prefill_time"))
+        self.assertEqual(r_d_probe(8000, 0.0, M), (None, "no_prefill_time"))
 
     def test_the_rc4_sample_is_refused(self):
         # weg2rc4 weg2-0-1: prompt 4316, cached 4314 -> uncached 2, wall 6.85 s
-        self.assertEqual(r_d_sample(2, 0.004, True), (None, "below_min"))
-        self.assertEqual(r_d_sample(0, 1.0, True), (None, "below_min"))
+        self.assertEqual(r_d_probe(2, 0.004, M), (None, "short"))
+        self.assertEqual(r_d_probe(0, 1.0, M), (None, "short"))
 
-    def test_the_minimum_is_2048_both_sides(self):
-        self.assertEqual(X_RD_MIN_UNCACHED, 2048)
-        self.assertIsNone(r_d_sample(2047, 1.0, True)[0])
-        self.assertIsNotNone(r_d_sample(2048, 1.0, True)[0])
+    def test_the_minimum_is_2048_both_sides_and_an_env_knob(self):
+        self.assertEqual((X_RD_MIN_UNCACHED, x_rd_min_uncached()), (2048, 2048))
+        self.assertIsNone(r_d_probe(2047, 1.0, M)[0])
+        self.assertIsNotNone(r_d_probe(2048, 1.0, M)[0])
+        with mock.patch.dict(os.environ, {"SGLANG_WEG2_X_RD_MIN_UNCACHED": "1000",
+                                          "SGLANG_WEG2_X_SOLO_WINDOW_MS": "100"}):
+            self.assertEqual(x_rd_min_uncached(), 1000)
+            self.assertAlmostEqual(x_solo_window_s(), 0.1)
+        self.assertAlmostEqual(x_solo_window_s(), X_SOLO_WINDOW_S)
 
-    def test_a_concurrent_leg_is_refused(self):
-        self.assertEqual(r_d_sample(8000, 3.9, False), (None, "concurrent"))
+    def test_a_concurrent_leg_is_refused_before_the_probe(self):
+        src = inspect.getsource(Front.leg2)
+        i = src.index("if not _solo:")
+        self.assertIn('self.counters["r_d_skipped_concurrent"] += 1', src[i:i + 200])
+        self.assertLess(i, src.index("r_d_probe(_unc, _ps, x_rd_min_uncached())"))
 
     def test_mutant_leg2_no_longer_divides_by_its_wall(self):
         src = inspect.getsource(Front.leg2)
         self.assertNotIn("_unc / _w", src, "the whole-wall r_D is back")
-        self.assertIn("r_d_sample(_unc, _ps, _solo)", src)
+        self.assertIn("r_d_probe(_unc, _ps, x_rd_min_uncached())", src)
         # both wire shapes sample
         self.assertEqual(src.count("_sample_r_d(pt, ct, comp, verdict, dterms)"), 2)
 
@@ -212,6 +227,32 @@ class PrefillClockDSide(CustomTestCase):
         self.assertIn("ret[_weg2_prefill_clock.INTERNAL_STATE_KEY] = _weg2_prefill_clock.snapshot()", gis)
         self.assertIn("_weg2_prefill_clock.armed(self.server_args)", gis)
 
+    def test_the_body_field_wins_over_server_info(self):
+        """NF H84's carrier (meta_info / sglext weg2_prefill_s) first, the 27B's
+        internal_states[0] block second -- same name, same quantity."""
+        prefill_clock.note_prefill_finished(self._req("weg2-1-1", 10.0, 12.5), self.D)
+        body = {"internal_states": [{prefill_clock.INTERNAL_STATE_KEY: prefill_clock.snapshot()}]}
+
+        class _R:
+            status = 200
+
+            async def json(self):
+                return body
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        me = types.SimpleNamespace(session=types.SimpleNamespace(get=lambda url: _R()))
+        g = types.SimpleNamespace(url="http://d")
+        out = asyncio.run(Front._draft_terms(me, g, {"sglext": {"weg2_prefill_s": 1.25}},
+                                             rid="weg2-1-1", pt=8200, ct=200))
+        self.assertEqual((out["prefill_s"], out["prefill_src"]), (1.25, "body"))
+        out = asyncio.run(Front._draft_terms(me, g, {"usage": {}}, rid="weg2-1-1", pt=8200, ct=200))
+        self.assertEqual((out["prefill_s"], out["prefill_src"]), (2.5, "server_info"))
+
     def test_the_front_reads_what_d_publishes(self):
         """Writer (snapshot) -> the internal_states[0] body -> reader (_draft_terms)."""
         prefill_clock.note_prefill_finished(self._req("weg2-1-1", 10.0, 12.5), self.D)
@@ -255,7 +296,7 @@ class FakeD:
     async def _chat(self, request):
         body = await request.json()
         key = body.get("rid") if self.publish == "rid" else "d-own-rid"
-        if self.publish != "none":
+        if self.publish not in ("none", "body"):
             self.block[key] = {"s": self.prefill_s, "prompt": self.PROMPT, "cached": self.CACHED}
         await asyncio.sleep(self.wall_s)  # prefill AND the decode of COMP tokens
         usage = {"prompt_tokens": self.PROMPT, "completion_tokens": self.COMP,
@@ -269,7 +310,10 @@ class FakeD:
             await resp.write(b"data: [DONE]\n\n")
             await resp.write_eof()
             return resp
-        return web.json_response({"choices": [{"message": {"content": "hi"}}], "usage": usage})
+        out = {"choices": [{"message": {"content": "hi"}}], "usage": usage}
+        if self.publish == "body":  # the NF H84 carrier: sglext on the OpenAI wire
+            out["sglext"] = {"weg2_prefill_s": self.prefill_s}
+        return web.json_response(out)
 
     async def _info(self, request):
         return web.json_response(
@@ -322,7 +366,7 @@ class TheProbeEndToEnd(CustomTestCase):
         self.assertNotAlmostEqual(f._x_samples["r_d"][0], self.UNC / 0.6, delta=1000,
                                   msg="the leg wall (prefill + decode) is the weg2rc4 defect")
         self.assertEqual(f.counters["r_d_sampled"], 1)
-        self.assertTrue(f._x_r_d_src.startswith("d_prefill_clock solo"), f._x_r_d_src)
+        self.assertTrue(f._x_r_d_src.startswith("d_prefill_s verdict="), f._x_r_d_src)
 
     def test_non_streamed_leg_samples_the_prefill_clock(self):
         self._check_sampled(*asyncio.run(_probe(stream=False)))
@@ -331,6 +375,9 @@ class TheProbeEndToEnd(CustomTestCase):
         # it used to sample on the non-streamed branch only
         self._check_sampled(*asyncio.run(_probe(stream=True)))
 
+    def test_the_nf_body_carrier_alone_suffices(self):
+        self._check_sampled(*asyncio.run(_probe(stream=False, publish="body")))
+
     def test_messages_shape_matches_by_usage_when_d_dropped_the_rid(self):
         self._check_sampled(*asyncio.run(_probe(stream=False, publish="shape")))
 
@@ -338,7 +385,7 @@ class TheProbeEndToEnd(CustomTestCase):
         f, res = asyncio.run(_probe(stream=False, publish="none"))
         self.assertTrue(all(s == 200 for s, _ in res), res)
         self.assertEqual(len(f._x_samples["r_d"]), 0)
-        self.assertEqual(f.counters["r_d_skipped_no_prefill_clock"], 1)
+        self.assertEqual(f.counters["r_d_skipped_no_prefill_time"], 1)
 
     def test_two_overlapping_legs_are_not_samples(self):
         f, res = asyncio.run(_probe(stream=False, n=2))
@@ -375,6 +422,15 @@ class LiveXAndTheCeiling(CustomTestCase):
         self.assertEqual(f.tp_prefill_max_tokens, 8192)
         self.assertEqual(f.counters["x_ceiling_clamped"], 1)
 
+    def test_the_line_names_which_bound_acted(self):
+        with self.assertLogs("weg2.front", level="INFO") as cm:
+            self._solve(x_ceiling_tokens=8192)
+        line = [ln for ln in cm.output if "WEG2 X RE-SOLVE n=" in ln][-1]
+        self.assertIn("X=8192 <- X_prev=4096", line)
+        self.assertIn("clamp=ceiling floor=4096 ceiling=8192", line)
+        self.assertIn("r_d source=live n=1", line)
+        self.assertIn("X_busy=4096", line)
+
     def test_unset_ceiling_is_the_launch_x_so_x_cannot_rise(self):
         f = self._solve(x_ceiling_tokens=0)
         self.assertEqual(f.x_ceiling_tokens, 4096)
@@ -393,11 +449,12 @@ class LiveXAndTheCeiling(CustomTestCase):
     def test_the_lines_carry_x_busy_and_the_r_d_source(self):
         f = self._solve(x_ceiling_tokens=CEIL)
         line = f.idle_policy_line()
-        for want in ("X_busy=4096", f"X_ceiling={CEIL}", "r_d_src=d_prefill_clock",
+        for want in ("X_busy=4096", f"X_ceiling={CEIL}", "r_d_src=d_prefill_s",
                      "r_d_min_uncached=2048", "x_solo_window_ms=250"):
             self.assertIn(want, line)
         src = inspect.getsource(Front.resolve_x_live)
-        self.assertIn("X*=%d X_ceiling=%s X_busy=%d", src)
+        self.assertIn('"WEG2 X RE-SOLVE n=%d X=%d <- X_prev=%d X*=%d clamp=%s floor=%d "', src)
+        self.assertIn('" X_busy=%d (27B', src)
         st = f.state_dict()
         self.assertEqual((st["x_busy_tokens"], st["x_ceiling_tokens"]), (4096, CEIL))
         self.assertGreater(st["x_tokens"], 4096)
@@ -420,7 +477,7 @@ class GrantDecision(CustomTestCase):
         self.assertIsNotNone(seat, "a lone 8k prompt on an idle D stays on D")
         self.assertEqual(deferred, [])
         self.assertGreaterEqual(dt, X_SOLO_WINDOW_S * 0.9)
-        self.assertEqual(f.counters["x_idle_granted"], 1)
+        self.assertEqual(f.counters["x_solo_d"], 1)
 
     def test_busy_d_defers_the_same_prompt(self):
         async def body():
@@ -431,7 +488,8 @@ class GrantDecision(CustomTestCase):
 
         f, seat, deferred = asyncio.run(body())
         self.assertIsNone(seat, "while D decodes, 8k > X_busy must not go to D")
-        self.assertEqual(deferred, ["busy"])
+        self.assertEqual(deferred, ["d_outstanding=1"])
+        self.assertEqual(f.counters["x_solo_p"], 1)
         self.assertEqual(f._seats_in_use(), 0)
 
     def test_busy_d_still_takes_a_prompt_within_x_busy(self):
@@ -481,12 +539,18 @@ class GrantDecision(CustomTestCase):
                 await _arrive(f, "lone", 8000)
                 f.groups["D"].outstanding["decoding"] = time.time()
                 await _arrive(f, "big", 8000)
-            return [ln for ln in cm.output if "WEG2 SHORT-DECISION" in ln]
+                await _arrive(f, "small", 3000)
+            return [ln for ln in cm.output if "WEG2 X-SOLO rid=" in ln]
 
         lines = asyncio.run(body())
-        self.assertEqual(len(lines), 2, lines)
-        self.assertIn("d_state=idle X_applied=10000 uncached=8000 d_running=0 verdict=grant", lines[0])
-        self.assertIn("d_state=busy X_applied=4096 uncached=8000 d_running=1 verdict=defer", lines[1])
+        self.assertEqual(len(lines), 3, lines)
+        # the NF line's X-SOLO shape + the 27B fields (busy, x_applied, d_running)
+        self.assertIn("rid=lone uncached=8000 X_live=10000 verdict=d reason=solo busy=0 "
+                      "x_applied=10000 d_running=0", lines[0])
+        self.assertIn("rid=big uncached=8000 X_live=10000 verdict=p reason=d_outstanding=1 busy=1 "
+                      "x_applied=4096 d_running=1", lines[1])
+        self.assertIn("rid=small uncached=3000 X_live=10000 verdict=d reason=within_x_busy busy=1 "
+                      "x_applied=4096", lines[2])
 
     def test_handle_generate_marks_the_deferred_pending(self):
         src = inspect.getsource(Front.handle_generate)
@@ -682,7 +746,12 @@ class LauncherFrontSeam(CustomTestCase):
         from sglang.srt.weg2 import launcher as L
 
         self.assertEqual(L.resolve_x_ceiling(None, 4096, None)[0], 4096)
-        self.assertEqual(L.resolve_x_ceiling(CEIL, 4096, 2048)[0], CEIL)
+        self.assertEqual(L.resolve_x_ceiling(0, 4096, None)[0], 4096, "0 = off (NF H84)")
+        c, line = L.resolve_x_ceiling(CEIL, 4096, 2048)
+        self.assertEqual(c, CEIL)
+        self.assertTrue(line.startswith(f"X CEILING: --x-ceiling-tokens {CEIL} -- group D "
+                                        f"--tp-prefill-max-tokens {CEIL}"), line)
+        self.assertTrue(L.resolve_x_ceiling(0, 4096, None)[1].startswith("X CEILING: off"))
         src = inspect.getsource(L.main)
         self.assertEqual(src.count("max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps"), 2,
                          "both argv_d calls (dry and real) arm D's W50 riegel at the ceiling")
@@ -694,16 +763,21 @@ class LauncherFrontSeam(CustomTestCase):
         src = inspect.getsource(L.argv_d)
         self.assertIn('"--tp-prefill-max-tokens", str(x_tokens)', src)
 
-    def test_refusals(self):
+    def test_below_the_start_x_is_lifted_and_a_negative_x_busy_refused(self):
         from sglang.srt.weg2 import launcher as L
 
-        with self.assertRaises(SystemExit) as cm:
-            L.resolve_x_ceiling(2048, 4096, None)
-        self.assertIn("W154", str(cm.exception))
+        c, line = L.resolve_x_ceiling(2048, 4096, None)
+        self.assertEqual(c, 4096)
+        self.assertIn("(asked 2048 < start X 4096: lifted to the start X)", line)
+        argv = self._argv("--x-ceiling-tokens", "2048")
+        self.assertEqual(argv[argv.index("--x-ceiling-tokens") + 1], "4096",
+                         "the front is told the SAME number D's riegel got")
         with self.assertRaises(SystemExit) as cm:
             L.resolve_x_ceiling(CEIL, 4096, -1)
         self.assertIn("W155", str(cm.exception))
-        self.assertEqual(L.resolve_x_ceiling(CEIL, 4096, 0)[0], CEIL, "0 is legal")
+        self.assertEqual(L.resolve_x_ceiling(CEIL, 4096, 0)[0], CEIL, "x_busy 0 is legal")
+        src = inspect.getsource(L.main)
+        self.assertIn("log(x_ceiling_provenance)", src)
 
 
 class StoreShortTailStaysAtTheLaunchX(CustomTestCase):

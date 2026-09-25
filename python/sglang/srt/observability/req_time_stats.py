@@ -623,9 +623,24 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
 
+    # H84 (Weg-2 D): this request's own prefill time, first forward entry to
+    # prefill finished -- every chunk of a chunked prefill, no queue wait, no
+    # decode. Stamped once, on the finishing output, by the output streamer of
+    # a Weg-2 D group (tp_prefill_max_tokens > 0); 0.0 everywhere else.
+    weg2_prefill_s: float = 0.0
+
+    def stamp_weg2_prefill_s(self) -> None:
+        if self.forward_entry_time > 0.0 and self.prefill_finished_time > 0.0:
+            self.weg2_prefill_s = self.prefill_finished_time - self.forward_entry_time
+
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
         if not self.enable_metrics:
+            # H84: a duration, not a timestamp (no cross-process conversion),
+            # and present only once stamped -- so it rides WITHOUT
+            # --enable-metrics and costs nothing where it is never stamped.
+            if self.weg2_prefill_s > 0.0:
+                return {"weg2_prefill_s": self.weg2_prefill_s}
             return {}
 
         state = {
@@ -634,6 +649,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "prefill_finished_time": self.prefill_finished_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
+        if self.weg2_prefill_s > 0.0:
+            state["weg2_prefill_s"] = self.weg2_prefill_s
         return state
 
     def set_scheduler_recv_time(self, ts=None):

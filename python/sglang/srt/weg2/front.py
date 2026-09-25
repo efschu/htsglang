@@ -226,36 +226,69 @@ X_FALLBACK_TOKENS = 22000
 #: X_busy default: ONE chunk (D's --chunked-prefill-size), the bound the SHORT
 #: route had before X was live. 0 = no D prefill while D decodes others.
 X_BUSY_DEFAULT_TOKENS = 4096
-#: The least uncached extent an r_D sample may come from: a rate over a few
+#: The least uncached extent an r_D sample may come from (default of
+#: SGLANG_WEG2_X_RD_MIN_UNCACHED, the NF line's H84 knob): a rate over a few
 #: hundred tokens prices the fixed per-prefill overhead, not throughput, and
-#: uncached=0 (a leg 2 behind P's prefill) is no D prefill at all. The NF
-#: line's value (H84), one number on both lines.
+#: uncached=2 (a leg 2 behind P's prefill) is no D prefill at all.
 X_RD_MIN_UNCACHED = 2048
-#: The singleton window (NF H84 "Einzelgaenger-Sperre"): a grant above X_busy
-#: needs D idle AND no other request arriving within this window. A burst of
-#: 4 x 8k then goes to P together over ONE flip instead of the first taking D
-#: and the rest waiting behind its whole decode (drain-and-flip never cuts a
-#: decode). Also the quiet time the idle re-grant (a) waits for.
+#: The singleton window (default of SGLANG_WEG2_X_SOLO_WINDOW_MS, NF H84
+#: "Einzelgaenger-Sperre"): a grant above X_busy needs D idle AND no other
+#: request arriving within this window. A burst of 4 x 8k then goes to P
+#: together over ONE flip instead of the first taking D and the rest waiting
+#: behind its whole decode (drain-and-flip never cuts a decode). Also the quiet
+#: time the idle re-grant (a) waits for.
 X_SOLO_WINDOW_S = 0.25
 
 
-def r_d_sample(uncached: int, prefill_s: Optional[float], solo: bool,
-               min_uncached: int = X_RD_MIN_UNCACHED) -> Tuple[Optional[float], str]:
-    """RC7-X: ONE r_D sample -- ``(tokens/s, "d_prefill_clock")`` or ``(None, why)``.
+def x_rd_min_uncached() -> int:
+    """SGLANG_WEG2_X_RD_MIN_UNCACHED (default :data:`X_RD_MIN_UNCACHED`)."""
+    return max(1, int(envs.SGLANG_WEG2_X_RD_MIN_UNCACHED.get()))
 
-    r_D = uncached tokens / D's own prefill seconds of a prefill D ran ALONE.
-    There is deliberately NO wall argument: the leg's wall is prefill plus the
-    decode of every completion token, and dividing by it is the weg2rc4
-    defect. No clock -> no sample, never a fallback to the wall."""
-    if not solo:
-        return None, "concurrent"
+
+def x_solo_window_s() -> float:
+    """SGLANG_WEG2_X_SOLO_WINDOW_MS in seconds (default :data:`X_SOLO_WINDOW_S`)."""
+    return max(0, int(envs.SGLANG_WEG2_X_SOLO_WINDOW_MS.get())) / 1000.0
+
+
+def d_prefill_seconds(body: Any) -> Optional[float]:
+    """RC7-X (the NF line's H84 reader, same name and fields): D's OWN prefill
+    time for this request from the response BODY, or None.
+
+    Group D reports ``weg2_prefill_s`` -- scheduler forward entry to prefill
+    finished: every chunk of a chunked prefill, no queue wait, no decode -- in
+    ``meta_info`` on ``/generate`` and in ``sglext`` on a non-streamed OpenAI
+    chat/completions answer. Streamed answers and ``/v1/messages`` carry
+    neither; for those the front reads the same quantity off D's
+    ``/get_server_info`` (``internal_states[0].weg2_prefill_s``, see
+    weg2/prefill_clock.py). None -> NO r_D sample, never the leg-2 wall.
+    """
+    if not isinstance(body, dict):
+        return None
+    for holder in (body.get("meta_info"), body.get("sglext")):
+        if isinstance(holder, dict) and holder.get("weg2_prefill_s") is not None:
+            try:
+                s = float(holder["weg2_prefill_s"])
+            except (TypeError, ValueError):
+                return None
+            return s if s > 0 else None
+    return None
+
+
+def r_d_probe(uncached: int, prefill_s: Optional[float],
+              min_uncached: int) -> Tuple[Optional[float], str]:
+    """RC7-X (the NF line's H84 contract, same name): ``(r_D, "sample")`` or
+    ``(None, why)`` for ONE solo leg 2 on D.
+
+    r_D = uncached / D's own prefill seconds. There is deliberately NO wall
+    argument: the leg's wall is prefill plus the decode of every completion
+    token, and dividing by it is the weg2rc4 defect. ``why`` is
+    ``no_prefill_time`` (D gave no time -- never a fallback to the wall) or
+    ``short`` (an extent below ``min_uncached``)."""
+    if prefill_s is None or float(prefill_s) <= 0.0:
+        return None, "no_prefill_time"
     if int(uncached) < max(1, int(min_uncached)):
-        return None, "below_min"
-    if prefill_s is None:
-        return None, "no_prefill_clock"
-    if float(prefill_s) <= 0.0:
-        return None, "bad_prefill_clock"
-    return float(uncached) / float(prefill_s), "d_prefill_clock"
+        return None, "short"
+    return float(uncached) / float(prefill_s), "sample"
 
 
 QUIESCE_DEADLINE_S = 90.0
@@ -3550,33 +3583,46 @@ class Front:
         handoff = max(0, self._seats_in_use() - own_seats - len(D.outstanding))
         return bool(D.outstanding or self._ready_for_d or handoff)
 
-    def _x_d_state(self, own_seats: int = 0, own_windows: int = 0) -> Tuple[str, int]:
-        """``(state, d_running)`` for one SHORT decision.
+    def _x_solo_busy(self, own_seats: int = 0, own_windows: int = 0) -> Optional[str]:
+        """RC7-X (the NF line's H84 terms and reason strings): None when the
+        system is otherwise EMPTY, else what is in it.
 
-        ``busy``: D holds work -- X_busy applies. ``burst``: D holds nothing
-        but the front does (a queued request, another singleton window, a
-        P leg in flight) -- X_busy applies too (NF "sonst nichts in Flug").
-        ``idle``: nothing anywhere -- X_idle may apply, behind the window."""
-        n = len(self.groups["D"].outstanding)
-        if self._d_holds_work(own_seats):
-            return "busy", n
-        if (self.queue or self._x_windows > own_windows
-                or self.groups["P"].outstanding):
-            return "burst", n
-        return "idle", n
+        Empty = D serving and holding nothing -- the idle mirror's terms
+        (``D.outstanding``, a hand-off, ``_ready_for_d``) -- P's queue empty, P
+        holding no leg 1, and no other singleton window open. ``own_seats`` /
+        ``own_windows``: the caller's own, not work."""
+        D = self.groups["D"]
+        if not (self.awake == "D" and self.admit_d and self.state == "serving"):
+            return f"d_not_serving(awake={self.awake},state={self.state},admit_d={self.admit_d})"
+        if D.outstanding:
+            return f"d_outstanding={len(D.outstanding)}"
+        _handoff = max(0, self._seats_in_use() - own_seats - len(D.outstanding))
+        if _handoff:
+            return f"d_handoff={_handoff}"
+        if self._ready_for_d:
+            return f"ready_for_d={len(self._ready_for_d)}"
+        if self.queue:
+            return f"p_queue={len(self.queue)}"
+        if self.groups["P"].outstanding:
+            return f"p_outstanding={len(self.groups['P'].outstanding)}"
+        if self._x_windows > own_windows:
+            return f"solo_window_busy={self._x_windows - own_windows}"
+        return None
 
-    def _x_short_decision_line(self, rid: str, state: str, applied: int, uncached: int,
-                               d_running: int, verdict: str, window_ms: int) -> None:
-        """RC7-X: ONE line per SHORT decision (operator order): busy/idle, the X
-        applied, and how many requests D is running."""
+    def _x_solo_line(self, rid: str, uncached: int, verdict: str, reason: str, busy: bool,
+                     applied: int, window_ms: int) -> None:
+        """RC7-X: ONE line per SHORT decision, in the NF line's ``WEG2 X-SOLO``
+        shape (verdict=d|p, reason=) plus the 27B split: ``busy=0|1`` (D decodes
+        others) and ``x_applied`` (X_busy while busy or not a singleton, else
+        X_idle), and ``d_running`` (D's requests in flight)."""
+        self.counters["x_solo_d" if verdict == "d" else "x_solo_p"] += 1
         logger.info(
-            "WEG2 SHORT-DECISION rid=%s d_state=%s X_applied=%d uncached=%d d_running=%d "
-            "verdict=%s window_ms=%d (X_idle=%d live <= X_ceiling=%d while D holds nothing, "
-            "X_busy=%d while D decodes others; above X_busy only after a quiet %d ms window "
-            "with nothing else in flight -- RC7-X)",
-            rid, state, int(applied), int(uncached), int(d_running), verdict, int(window_ms),
-            int(self.tp_prefill_max_tokens), int(self.x_ceiling_tokens),
-            self._x_busy_in_force(), int(X_SOLO_WINDOW_S * 1000))
+            "WEG2 X-SOLO rid=%s uncached=%d X_live=%d verdict=%s reason=%s busy=%d x_applied=%d "
+            "d_running=%d x_busy=%d window_ms=%d (27B RC7-X: X_live = X_idle while D holds nothing "
+            "and the request is a singleton, X_busy while D decodes others; verdict=p queues it "
+            "for P or the idle re-grant)",
+            rid, int(uncached), int(self.tp_prefill_max_tokens), verdict, reason, int(bool(busy)),
+            int(applied), len(self.groups["D"].outstanding), self._x_busy_in_force(), int(window_ms))
 
     async def _x_short_grant(self, rid: str, uncached: int, est_tokens: int, seq: int,
                              refused: List[str], deferred: List[str]) -> Optional[Seat]:
@@ -3584,51 +3630,53 @@ class Front:
 
         The route verdict already said ``uncached <= X_idle`` (the X in force).
         Then: ``uncached <= X_busy`` -> granted in any state, exactly the SHORT
-        route as it was. Above X_busy: only while D is idle -- the arrival
-        takes its seat (so the controller's hand-off window keeps D awake and
-        every other arrival reads D as busy), waits ``X_SOLO_WINDOW_S``, and
-        keeps the seat only if nothing arrived after it and nothing else is in
-        flight. Otherwise it is queued for P with ``deferred`` set -- the idle
-        re-grant serves it on D once D is idle and quiet, a flip if the backlog
-        outgrows X_idle, the fairness bound in the worst case. ``None`` = route
-        BATCH, the contract ``_acquire_short_seat`` already has."""
+        route as it was. Above X_busy (the NF line's X-SOLO band): only as a
+        singleton -- the system empty now (:meth:`_x_solo_busy`) and nothing
+        arriving for ``SGLANG_WEG2_X_SOLO_WINDOW_MS``. The arrival takes its
+        seat first (so the controller's hand-off window keeps D awake and every
+        other arrival reads D as busy), waits, and keeps the seat only if it
+        stayed a singleton. Otherwise it is queued for P with ``deferred`` set
+        -- the idle re-grant serves it on D once D is idle and quiet, a flip if
+        the backlog outgrows X_idle, the fairness bound in the worst case.
+        ``None`` = route BATCH, the contract ``_acquire_short_seat`` has."""
         x_idle = int(self.tp_prefill_max_tokens)
         x_busy = self._x_busy_in_force()
-        state, n_d = self._x_d_state()
-        applied = x_idle if state == "idle" else x_busy
+        why = self._x_solo_busy()
+        d_busy = self._d_holds_work()
         if uncached <= x_busy:
             seat = await self._acquire_short_seat(rid, est_tokens, refused)
-            self._x_short_decision_line(rid, state, applied, uncached, n_d,
-                                        "grant" if seat is not None else "seat_refused", 0)
+            self._x_solo_line(rid, uncached, "d" if seat is not None else "p",
+                              "within_x_busy" if seat is not None else
+                              ("d_budget" if refused else "seat_refused"),
+                              d_busy, x_idle if why is None else x_busy, 0)
             return seat
-        if state != "idle":
-            deferred.append(state)
-            self.counters[f"x_deferred_{state}"] += 1
-            self._x_short_decision_line(rid, state, applied, uncached, n_d, "defer", 0)
+        if why is not None:
+            deferred.append(why)
+            self._x_solo_line(rid, uncached, "p", why, d_busy, x_busy, 0)
             return None
         seat = await self._acquire_short_seat(rid, est_tokens, refused)
         if seat is None:
-            self._x_short_decision_line(rid, state, applied, uncached, n_d, "seat_refused", 0)
+            self._x_solo_line(rid, uncached, "p", "d_budget" if refused else "seat_refused",
+                              d_busy, x_idle, 0)
             return None
         self._x_windows += 1
         t_w = time.time()
         try:
-            await asyncio.sleep(X_SOLO_WINDOW_S)
+            await asyncio.sleep(x_solo_window_s())
         finally:
             self._x_windows -= 1
-        state2, n_d2 = self._x_d_state(own_seats=1)
-        solo = (self._rid == seq and state2 == "idle"
-                and self.awake == "D" and self.admit_d and self.state == "serving")
         waited_ms = int((time.time() - t_w) * 1000)
-        if not solo:
+        if self._rid != seq:
+            why2: Optional[str] = f"arrival_in_window={self._rid - seq}"
+        else:
+            why2 = self._x_solo_busy(own_seats=1)
+        if why2 is not None:
             seat.release("x_solo_window")
-            deferred.append("burst")
-            self.counters["x_deferred_burst"] += 1
-            self._x_short_decision_line(rid, "burst" if self._rid != seq else state2, x_busy,
-                                        uncached, n_d2, "defer", waited_ms)
+            deferred.append(why2)
+            self._x_solo_line(rid, uncached, "p", why2, self._d_holds_work(own_seats=1),
+                              x_busy, waited_ms)
             return None
-        self.counters["x_idle_granted"] += 1
-        self._x_short_decision_line(rid, "idle", x_idle, uncached, n_d2, "grant", waited_ms)
+        self._x_solo_line(rid, uncached, "d", "solo", False, x_idle, waited_ms)
         return seat
 
     def _x_idle_regrant(self, now: float) -> str:
@@ -3669,7 +3717,7 @@ class Front:
             return "none"
         if self._d_holds_work():
             return "none"  # D decodes: no flip happens anyway; re-evaluated when it ends
-        if self._x_windows > 0 or (now - self._x_last_arrival) < X_SOLO_WINDOW_S:
+        if self._x_windows > 0 or (now - self._x_last_arrival) < x_solo_window_s():
             return "wait"
         moved = list(self.queue)
         self.queue.clear()
@@ -4011,29 +4059,28 @@ class Front:
                      and self._d_admissions == _solo_adm0
                      and len(g.outstanding) == 1)
             _ps = (dterms or {}).get("prefill_s")
-            rate, why = r_d_sample(_unc, _ps, _solo)
-            if rate is not None:
-                self._x_r_d_src = f"d_prefill_clock solo verdict={verdict}"
-                self.counters["r_d_sampled"] += 1
-                logger.info("WEG2 X R_D-SAMPLE rid=%s uncached=%d prefill_s=%.3f r_D=%.0f "
-                            "leg_wall_s=%.2f completion_tokens=%d verdict=%s src=d_prefill_clock "
-                            "(D's own prefill_finished - forward_entry of a solo prefill, "
-                            "uncached >= %d; the leg wall is printed, never divided -- RC7-X)",
-                            rid, _unc, float(_ps), rate, _w, comp, verdict, X_RD_MIN_UNCACHED)
-                self.note_x_sample("r_d", rate)
-                return
-            if why == "concurrent":
+            if not _solo:
                 if _unc > 0 and _w > 0:
                     self.counters["r_d_skipped_concurrent"] += 1
+                return
+            rate, why = r_d_probe(_unc, _ps, x_rd_min_uncached())
+            # ONE line per solo leg, the NF line's H84 shape: the wall is shown
+            # for comparison, never divided.
+            logger.info("WEG2 X R_D rid=%s uncached=%d d_prefill_s=%s wall=%.2fs verdict=%s "
+                        "r_D=%s d_prefill_src=%s completion_tokens=%d leg_verdict=%s (r_D = "
+                        "uncached / d_prefill_s, D's own prefill_finished - forward_entry of "
+                        "this solo prefill; the wall is shown, never used -- RC7-X)",
+                        rid, _unc, "none" if _ps is None else f"{float(_ps):.3f}", _w, why,
+                        "-" if rate is None else f"{rate:.0f}",
+                        (dterms or {}).get("prefill_src", "none"), comp, verdict)
+            if rate is not None:
+                self._x_r_d_src = f"d_prefill_s verdict={verdict}"
+                self.counters["r_d_sampled"] += 1
+                self.note_x_sample("r_d", rate)
+            elif why == "short":
+                self.counters["r_d_skipped_short"] += 1
             else:
-                self.counters[f"r_d_skipped_{why}"] += 1
-            if _unc >= X_RD_MIN_UNCACHED:
-                # A leg big enough to be a sample that was not one -- named, so
-                # an empty r_D deque reads as a reason, not as silence.
-                logger.info("WEG2 X R_D-SKIP rid=%s uncached=%d reason=%s solo=%s prefill_s=%s "
-                            "leg_wall_s=%.2f (RC7-X: no sample without D's prefill clock of a "
-                            "solo prefill; never the leg wall)",
-                            rid, _unc, why, _solo, "none" if _ps is None else f"{float(_ps):.3f}", _w)
+                self.counters["r_d_skipped_no_prefill_time"] += 1
         if pending is not None and pending.skip_leg1:
             single_prefill = True
         if (stream and pending is not None and request.path.startswith("/v1/")
@@ -4535,9 +4582,12 @@ class Front:
         Never raises: a missing instrument is ``accept_src=none``.
         """
         out = {"draft_pages": 0, "draft_miss": 0, "accept_len": 0.0, "accept_src": "none",
-               # RC7-X: this leg's prefill seconds by D's own clock, off the SAME
-               # read (internal_states[0].weg2_prefill_s); None = unknown.
-               "prefill_s": None}
+               # RC7-X: this leg's prefill seconds by D's own clock -- the body's
+               # meta_info/sglext weg2_prefill_s (NF H84) first, else the SAME
+               # read below (internal_states[0].weg2_prefill_s); None = unknown.
+               "prefill_s": d_prefill_seconds(body), "prefill_src": "none"}
+        if out["prefill_s"] is not None:
+            out["prefill_src"] = "body"
         try:
             mi = (body or {}).get("meta_info") if isinstance(body, dict) else None
             if isinstance(mi, dict) and mi.get("spec_accept_length") is not None:
@@ -4569,8 +4619,11 @@ class Front:
             if out["accept_src"] == "none" and info.get("avg_spec_accept_length") is not None:
                 out["accept_len"] = float(info["avg_spec_accept_length"])
                 out["accept_src"] = "server_info_avg"
-            out["prefill_s"] = prefill_clock.lookup(
-                info.get(prefill_clock.INTERNAL_STATE_KEY), rid, pt, ct)
+            if out["prefill_s"] is None:
+                out["prefill_s"] = prefill_clock.lookup(
+                    info.get(prefill_clock.INTERNAL_STATE_KEY), rid, pt, ct)
+                if out["prefill_s"] is not None:
+                    out["prefill_src"] = "server_info"
         except Exception as e:  # noqa: BLE001 - an instrument never breaks serving
             logger.debug("draft terms unavailable: %s: %s", type(e).__name__, e)
         return out
@@ -5788,8 +5841,11 @@ class Front:
             # alone, r_P is a drain's tokens over the drain's own wall. Passing
             # the units explicitly is what makes a future estimator swap fail
             # loudly instead of silently re-introducing (a).
-            x = derive_x_star(
-                flip_s, r_d, r_p, self.x_floor_tokens,
+            # RC7-X (the NF line's H84 form): X* UNFLOORED (floor 0 here), then
+            # clamped to [x_floor_tokens, ceiling] below, so the line can say
+            # which bound acted.
+            x_star = derive_x_star(
+                flip_s, r_d, r_p, 0,
                 unit_d=RATE_UNIT_GROUP_THROUGHPUT,
                 unit_p=RATE_UNIT_GROUP_THROUGHPUT,
             )
@@ -5807,11 +5863,14 @@ class Front:
             return None
         # RC7-X: THE CEILING. D's W50 riegel stands at --x-ceiling-tokens, so an
         # X above it would be granted here and refused there by name -- a W50
-        # detour through P for every such request. Clamped, and both printed.
-        x_star = x
+        # detour through P for every such request. [floor, ceiling], the
+        # ceiling winning; both printed (the NF line's H84 clamp field).
         _ceil = int(getattr(self, "x_ceiling_tokens", 0) or 0)
+        x = max(int(x_star), int(self.x_floor_tokens))
+        clamp = "floor" if x_star < self.x_floor_tokens else "none"
         if _ceil > 0 and x > _ceil:
             x = _ceil
+            clamp = "ceiling"
             self.counters["x_ceiling_clamped"] += 1
         self.tp_prefill_max_tokens = x
         if self._x_min_work_follows:
@@ -5819,16 +5878,18 @@ class Front:
         self.counters["x_resolves"] += 1
         _xb = max(0, min(int(getattr(self, "x_busy_tokens", X_BUSY_DEFAULT_TOKENS)), x))
         logger.info(
-            "WEG2 X RE-SOLVE n=%d X=%d <- X_prev=%d r_D=%.0f r_P=%.0f flip_s=%.2f "
+            "WEG2 X RE-SOLVE n=%d X=%d <- X_prev=%d X*=%d clamp=%s floor=%d "
+            "ceiling=%d (D's W50 riegel: --x-ceiling-tokens, else the launch X) "
+            "r_D=%.0f r_P=%.0f flip_s=%.2f "
             + self.x_flip_s_provenance() +
-            " X*=%d X_ceiling=%s X_busy=%d (X = X_idle, applied while D holds nothing; X_busy "
-            "while D decodes others -- RC7-X) source=live (medians over this boot's own "
+            " X_busy=%d (27B: X is X_idle, applied while D holds nothing; X_busy while D "
+            "decodes others -- RC7-X) source=live (medians over this boot's own "
             "samples: %d r_D, %d r_P drains, %d flips, window %d; seeded from %s. Both rates are "
             "group_throughput -- tokens the group moved over the wall it was "
             "busy -- so 1/r_D-1/r_P is a time-per-token difference; #1271; r_D is D's own "
-            "prefill clock of a solo prefill since RC7-X, never a leg wall)",
-            len(s["r_p"]), x, prev, r_d, r_p, flip_s, x_star,
-            (f"{_ceil}{' CLAMPED' if x_star > x else ''}" if _ceil > 0 else "none"), _xb,
+            "prefill time of a solo prefill since RC7-X, never a leg wall)",
+            len(s["r_p"]), x, prev, int(x_star), clamp, int(self.x_floor_tokens),
+            _ceil if _ceil > 0 else 0, r_d, r_p, flip_s, _xb,
             len(s["r_d"]), len(s["r_p"]), len(s["flip_s"]), self.X_SAMPLE_WINDOW,
             self._x_seed_note,
         )
@@ -6125,9 +6186,9 @@ class Front:
                     "off" if self.d_hold_s is None else f"{self.d_hold_s:.1f}",
                     "derived" if self.min_dwell_ms is None else f"{self.min_dwell_ms:.0f}",
                     float(self.w_s), self._x_busy_in_force(), int(self.x_ceiling_tokens),
-                    int(X_SOLO_WINDOW_S * 1000),
-                    "d_prefill_clock" if self._x_r_d_src == "none yet" else self._x_r_d_src,
-                    X_RD_MIN_UNCACHED))
+                    int(x_solo_window_s() * 1000),
+                    "d_prefill_s" if self._x_r_d_src == "none yet" else self._x_r_d_src,
+                    x_rd_min_uncached()))
 
     def _d_short_drain(self, now: float) -> int:
         """(b) --d-short-drain-tokens N: hand a SHORT-only backlog to D.
@@ -6167,7 +6228,7 @@ class Front:
                 self.counters["d_short_drain_x_capped"] += 1
             return 0
         if (not d_busy and total > self._x_busy_in_force()
-                and (self._x_windows > 0 or (now - self._x_last_arrival) < X_SOLO_WINDOW_S)):
+                and (self._x_windows > 0 or (now - self._x_last_arrival) < x_solo_window_s())):
             # RC7-X: above X_busy on an idle D only once the singleton window is
             # quiet -- the same rule an arrival obeys (next tick decides).
             return 0

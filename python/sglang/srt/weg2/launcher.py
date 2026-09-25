@@ -1544,43 +1544,46 @@ def refuse_short_drain_above_x(n_tokens: int, x_tokens: int, x_provenance: str) 
         )
 
 
-#: RC7-X: the names the two X flags are refused with at launch.
-X_CEILING_BELOW_X_NAME = "W154 Weg2XCeilingBelowX"
+#: RC7-X: the name a negative --x-busy-tokens is refused with at launch.
 X_BUSY_NEGATIVE_NAME = "W155 Weg2XBusyNegative"
 
 
 def resolve_x_ceiling(ceiling: Optional[int], x_tokens: int,
                       x_busy: Optional[int]) -> Tuple[int, str]:
-    """RC7-X: group D's W50 riegel and its provenance -- ``(tokens, line)``.
+    """RC7-X: group D's W50 riegel and the ``X CEILING:`` line -- ``(tokens, line)``.
 
-    D enforces law 4 for real, after ``match_prefix`` (argv_d
-    ``--tp-prefill-max-tokens``). With the live X* re-solve working (r_D from
-    D's own prefill clock), the front's X rises above the launch X -- and every
-    grant above the riegel D was given would come back as W50 and detour
-    through P. So D's riegel is armed at ``--x-ceiling-tokens`` and the front
-    clamps its live X to the same number (front ``--x-ceiling-tokens``).
+    The NF line's H84 form and wording, so both lines log alike. D enforces
+    law 4 for real, after ``match_prefix`` (argv_d ``--tp-prefill-max-tokens``).
+    With the live X* re-solve working (r_D from D's own prefill time), the
+    front's X rises above the launch X -- and every grant above the riegel D
+    was given would come back as W50 and detour through P. So D's riegel is
+    armed at ``--x-ceiling-tokens`` and the front clamps its live X to the same
+    number (front ``--x-ceiling-tokens``).
 
-    Unset = the launch X: D's riegel and the front's X are exactly today's,
-    the live X cannot rise. A ceiling below the launch X is refused (W154): the
-    front would grant what D refuses. A negative ``--x-busy-tokens`` is refused
-    (W155); 0 is legal and means no D prefill while D decodes others.
+    0 / unset = off: D's riegel and the front's X are exactly today's, the live
+    X cannot rise. A ceiling below the launch X is LIFTED to it (H84; the line
+    says so). A negative ``--x-busy-tokens`` is refused (W155, the 27B's own
+    flag); 0 is legal and means no D prefill while D decodes others.
     """
     if x_busy is not None and int(x_busy) < 0:
         raise SystemExit(
             f"{X_BUSY_NEGATIVE_NAME}: --x-busy-tokens {x_busy} < 0. It bounds the uncached "
             f"tokens D prefills while it decodes other requests; 0 = none, unset = one chunk.")
     x = int(x_tokens)
-    if ceiling is None:
-        return x, (f"X_ceiling={x} source=unset (= the launch X; D's W50 riegel and the "
-                   f"front's X as before, the live X cannot rise above it)")
-    c = int(ceiling)
-    if c < x:
-        raise SystemExit(
-            f"{X_CEILING_BELOW_X_NAME}: --x-ceiling-tokens {c} is below the launch X={x}. "
-            f"Group D refuses above its riegel by W50, so the front would grant from the "
-            f"start what D refuses. Pass --x-ceiling-tokens >= {x}, or leave it unset.")
-    return c, (f"X_ceiling={c} source=flag (--x-ceiling-tokens: group D's W50 riegel "
-               f"--tp-prefill-max-tokens {c}; the front's live X* is clamped to it)")
+    busy = ("4096 (front default, one chunk)" if x_busy is None else str(int(x_busy)))
+    asked = int(ceiling or 0)
+    if asked <= 0:
+        return x, (f"X CEILING: off (--x-ceiling-tokens 0) -- group D --tp-prefill-max-tokens {x} "
+                   f"= the front's start X, which is also the ceiling of the front's live X; "
+                   f"27B X_busy={busy} while D decodes others")
+    c = max(asked, x)
+    lifted = "" if c == asked else f" (asked {asked} < start X {x}: lifted to the start X)"
+    return c, (f"X CEILING: --x-ceiling-tokens {c}{lifted} -- group D --tp-prefill-max-tokens "
+               f"{c} (its W50 riegel; D prefills in --chunked-prefill-size {CHUNKED_PREFILL_TOKENS} "
+               f"chunks); front --tp-prefill-max-tokens {x} (start X, unchanged) --x-ceiling-tokens "
+               f"{c}: the live X re-solves within [{CHUNKED_PREFILL_TOKENS}, {c}] from THIS boot's own "
+               f"samples (r_D = D's own prefill time of a solo prefill); 27B X_busy={busy} while "
+               f"D decodes others, X_idle = the live X only while D holds nothing (X-SOLO)")
 
 
 #: RC7-X: read by group D's scheduler (``_weg2_store_short_tail_x``).
@@ -11703,13 +11706,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "2*flip_s/(1/r_D - 1/r_P) from this rig's own front-log rate and flip "
                          "lines, else the recorded PRE-BARLINK pair; floor = --chunked-prefill-size. "
                          "The derivation and its three inputs are printed at launch.")
-    ap.add_argument("--x-ceiling-tokens", type=int, default=None,
+    ap.add_argument("--x-ceiling-tokens", type=int, default=0,
                     help="RC7-X: the most the front's LIVE X (re-solved from this boot's own "
                          "r_D, r_P and flip samples) may rise to. Group D's W50 riegel "
                          "(its --tp-prefill-max-tokens) is armed at this value, so a grant up "
-                         "to it is not refused by D. Unset (default) = the launch X (today: D's "
+                         "to it is not refused by D. 0 (default) = off = the launch X (today: D's "
                          "riegel and the front's X both at --tp-prefill-max-tokens, the live X "
-                         "cannot rise). Below the launch X is refused (W154).")
+                         "cannot rise; argv byte for byte as before). Below the launch X it is "
+                         "lifted to the launch X (NF H84, same flag).")
     ap.add_argument("--x-busy-tokens", type=int, default=None,
                     help="RC7-X, passed to the front: X_busy -- the uncached tokens D may prefill "
                          "itself while it decodes OTHER requests (a D prefill halts every running "
@@ -13230,7 +13234,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # hands out is refused by name (W153), never quietly cut.
     refuse_short_drain_above_x(int(ns.d_short_drain_tokens or 0), x_tokens, x_provenance)
     # RC7-X: group D's W50 riegel = the ceiling the front's live X may rise to
-    # (unset = the launch X, today). W154/W155 refuse by name before any spawn.
+    # (0 / unset = the launch X, today; below it lifted). W155 refuses a negative X_busy.
     x_d_riegel, x_ceiling_provenance = resolve_x_ceiling(
         ns.x_ceiling_tokens, x_tokens, ns.x_busy_tokens)
     # THE OPERATING POINT, WITH ITS PROVENANCE, ON EVERY BOOT RECORD. The pair
@@ -13253,11 +13257,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"{'derived from the last flip in that direction' if ns.min_dwell_ms is None else ns.min_dwell_ms}")
     log(f"X PROVENANCE: {x_provenance}; --flip-min-work-tokens {flip_min_work_tokens} "
         f"({'= X, the same break-even at aggregate granularity' if ns.flip_min_work_tokens is None else 'operator override'})")
-    log(f"X SPLIT (RC7-X, user decision 2026-09-25 'x entscheidung mit in den release'): "
-        f"{x_ceiling_provenance}; X_busy="
-        f"{'4096 (front default, one chunk)' if ns.x_busy_tokens is None else int(ns.x_busy_tokens)} "
-        f"while D decodes others, X_idle = the live X (seed {x_tokens}, re-solved from THIS boot's "
-        f"own samples only, r_D = D's prefill clock of a solo prefill) while D holds nothing")
+    log(x_ceiling_provenance)  # RC7-X: "X CEILING: ..." (the NF line's H84 line)
     log(f"IDLE POLICY (27B, user order 2026-09-24): (a) --idle-layout {ns.idle_layout} -> the "
         f"front rests on {idle_layout_front}; (b) --d-short-drain-tokens "
         f"{int(ns.d_short_drain_tokens or 0)} ({'off' if not ns.d_short_drain_tokens else 'a queued SHORT-only backlog up to this many tokens is served on D, each request <= X=' + str(x_tokens)}); "
@@ -13272,7 +13272,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"--flip-min-work-tokens {flip_min_work_tokens} --idle-layout {idle_layout_front} "
         f"--drain-deadline-s {ns.drain_deadline_s} --fairness-w-s {ns.fairness_w_s}"
         + ("" if ns.min_dwell_ms is None else f" --min-dwell-ms {ns.min_dwell_ms}")
-        + ("" if ns.x_ceiling_tokens is None else f" --x-ceiling-tokens {x_d_riegel}")
+        + ("" if not ns.x_ceiling_tokens or int(ns.x_ceiling_tokens) <= 0 else f" --x-ceiling-tokens {x_d_riegel}")
         + ("" if ns.x_busy_tokens is None else f" --x-busy-tokens {int(ns.x_busy_tokens)}"))
 
     # 1a'. 27B FP8: one byte layout for the flip (W160 refusal without the
@@ -15001,9 +15001,9 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         argv += ["--d-hold-s", str(float(ns.d_hold_s))]
     # RC7-X: the X split, emitted only when set (unset ships the argv as before).
     # The ceiling is the SAME number group D's W50 riegel was armed with
-    # (resolve_x_ceiling; main() refuses one below the launch X, W154).
-    if getattr(ns, "x_ceiling_tokens", None) is not None:
-        argv += ["--x-ceiling-tokens", str(int(ns.x_ceiling_tokens))]
+    # (resolve_x_ceiling: 0 = off, below the start X lifted to it).
+    if int(getattr(ns, "x_ceiling_tokens", 0) or 0) > 0:
+        argv += ["--x-ceiling-tokens", str(max(int(ns.x_ceiling_tokens), int(x_tokens)))]
     if getattr(ns, "x_busy_tokens", None) is not None:
         argv += ["--x-busy-tokens", str(int(ns.x_busy_tokens))]
     if ns.d_admit_max_tokens is not None:

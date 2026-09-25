@@ -20,12 +20,15 @@ ANOTHER request cannot run between the chunks (prefill first, scheduler.py
 "Run prefill first if possible") -- which is exactly why the front only takes a
 sample from a prefill D ran ALONE.
 
-THE CARRIER. ``internal_states[0]["weg2_prefill_s"]`` of ``/get_server_info``
--- the endpoint the front ALREADY reads after every leg 2 (``_draft_terms``)
-and the one ``weg2_decode_progress`` rides on (#1317c). Chosen over the
-response body because the front's leg-2 traffic is mostly ``/v1/*``, whose
-bodies carry ``usage`` and never ``meta_info``; the name ``weg2_prefill_s`` is
-the NF line's ``meta_info`` key, so both lines speak of one quantity.
+THE CARRIERS. Two, one name. (1) The NF line's H84 D patch, applied verbatim:
+``meta_info.weg2_prefill_s`` on ``/generate`` and ``sglext.weg2_prefill_s`` on
+a NON-streamed OpenAI chat/completions answer (req_time_stats /
+output_streamer / tokenizer_manager / serving_*). (2) This module:
+``internal_states[0]["weg2_prefill_s"]`` of ``/get_server_info`` -- the
+endpoint the front ALREADY reads after every leg 2 (``_draft_terms``) and the
+one ``weg2_decode_progress`` rides on (#1317c). The front takes (1) when the
+body has it and (2) otherwise; (2) is what covers STREAMED legs and
+``/v1/messages`` (the agent fleet's wire), which carry neither field.
 
 KEYED BY RID AND BY SHAPE. The front sets ``payload["rid"]`` (#1442), which
 ``/generate`` and ``/v1/chat/completions`` honour; the Anthropic request model

@@ -1984,6 +1984,15 @@ class Envs:
     # p_group_has_draft_producer) and writes `off` into BOTH groups; on a rank
     # anything but `off` (unset, auto, on) is the draft tier as before.
     SGLANG_WEG2_HICACHE_DRAFT_TIER = EnvStr("auto")
+    # RC7-X (27B line; the NF line's H84 names, one knob on both lines): an r_D
+    # sample of the Weg-2 front is D's own prefill time (weg2_prefill_s) over
+    # the uncached extent of a solo leg, and only from an extent of at least
+    # this many tokens -- below it D's fixed per-request cost dominates.
+    SGLANG_WEG2_X_RD_MIN_UNCACHED = EnvInt(2048)
+    # RC7-X / H84 X-SOLO: a grant above X_busy (27B) / the start X (NF) goes to
+    # D only when nothing else is in flight and nothing arrives within this
+    # window; a burst goes to P together over one flip.
+    SGLANG_WEG2_X_SOLO_WINDOW_MS = EnvInt(250)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)

@@ -1390,11 +1390,14 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        # H84: only a Weg-2 D group puts weg2_prefill_s into meta_info.
+        weg2_prefill_s = first_ret["meta_info"].get("weg2_prefill_s")
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or weg2_prefill_s:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                weg2_prefill_s=weg2_prefill_s,
             )
 
         for idx, ret_item in enumerate(ret):
