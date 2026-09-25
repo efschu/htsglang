@@ -114,7 +114,26 @@ def test_the_adapter_takes_require_agreement_explicitly():
     assert "require_agreement" in sig.parameters, (
         "the adapter must take the narrowing decision from its caller"
     )
-    node = _func_ast("_weg2_shadow_plan")
+    # weg2xsn94 (c11cd2e352): the adapter became a per-leg CACHE in front of
+    # `_weg2_shadow_plan_uncached`, which now holds the one derive_leg_plan
+    # call. The decision must survive BOTH layers: the cache forwards the
+    # caller's value on every path to the uncached method and keys its entries
+    # on it (a key without it would hand the injection caller the shadow
+    # hook's narrowed plan -- this test's defect, through the cache).
+    wrapper = _func_ast("_weg2_shadow_plan")
+    fwd = _calls_to(wrapper, "_impl")
+    assert fwd, "the cache must call the uncached derivation"
+    for call in fwd:
+        kw = _keyword_of_call(call, "require_agreement")
+        assert kw is not None and isinstance(kw.value, ast.Name) and kw.value.id == "require_agreement", (
+            "the cache must FORWARD the caller's require_agreement, never a literal"
+        )
+    keys = [n for n in ast.walk(wrapper) if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "key" for t in n.targets)]
+    assert keys and all("require_agreement" in ast.unparse(k.value) for k in keys), (
+        "the cache key must carry require_agreement"
+    )
+    node = _func_ast("_weg2_shadow_plan_uncached")
     calls = _calls_to(node, "derive_leg_plan")
     assert len(calls) == 1, f"expected ONE derive_leg_plan call, got {len(calls)}"
     kw = _keyword_of_call(calls[0], "require_agreement")
