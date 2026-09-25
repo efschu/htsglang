@@ -93,6 +93,7 @@ from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import host_ledger
+from sglang.srt.weg2 import prefill_clock  # H85: D's prefill clock reader (no deps)
 
 logger = logging.getLogger("weg2.front")
 
@@ -2655,6 +2656,10 @@ class Front:
         self._d_admissions = 0
         #: Where the last r_D sample came from, printed with every X decision.
         self._x_r_d_src = "none yet"
+        #: H85: ``(boot, seq)`` of D's prefill clock as of the last
+        #: ``/get_server_info`` read (weg2/prefill_clock.py). A leg 2 snapshots
+        #: it at entry; only a record newer than that snapshot can be its own.
+        self._d_prefill_mark: Optional[Tuple[str, int]] = None
         # H84: THE LIVE X MAY NOT CROSS D'S OWN RIEGEL. The front's X is only
         # the front's; D refuses by W50 on its own --tp-prefill-max-tokens, the
         # START X unless the launcher raised it with --x-ceiling-tokens. An X
@@ -4384,7 +4389,46 @@ class Front:
         self._d_admissions += 1
         _solo_adm0 = self._d_admissions
         _solo_entry = len(g.outstanding) == 1
+        # H85: D's prefill-clock mark as of this leg's start -- a server-info
+        # record counts for this leg only if it is newer (prefill_clock.py).
+        _pfc_mark0 = getattr(self, "_d_prefill_mark", None)
         t0 = time.time()
+
+        def _sample_r_d(pt: int, ct: int, verdict: str, dterms: dict) -> None:
+            """#1271 (b)'s r_D sample, on BOTH wire shapes (H85; H84 sampled
+            the non-streamed branch only). The solo witness (#1289 round 2)
+            and the H84 probe are unchanged: r_D = uncached / D's own prefill
+            time, never the wall. The time comes from the body (H84) or, when
+            the body has none -- streamed legs, /v1/messages -- from D's
+            ``/get_server_info``, attributed to this leg (``_draft_terms``)."""
+            _unc = max(0, pt - ct)
+            _w = time.time() - t0
+            _solo = (_solo_entry
+                     and self._d_admissions == _solo_adm0
+                     and len(g.outstanding) == 1)
+            if _solo and _unc > 0:
+                # H84: THE RATE IS D'S OWN PREFILL TIME, never this wall
+                # (the wall holds the decode; see `r_d_probe`).
+                _pfs = dterms.get("prefill_s")
+                _src = dterms.get("prefill_src", "none")
+                _r_d, _why = r_d_probe(_unc, _pfs, envs.SGLANG_WEG2_X_RD_MIN_UNCACHED.get())
+                logger.info("WEG2 X R_D rid=%s uncached=%d d_prefill_s=%s wall=%.2fs verdict=%s "
+                            "r_D=%s d_prefill_src=%s d_prefill_attr=%s stream=%d path=%s "
+                            "(r_D = uncached / d_prefill_s; the wall is shown, never used)",
+                            rid, _unc, "none" if _pfs is None else f"{_pfs:.3f}", _w, _why,
+                            "-" if _r_d is None else f"{_r_d:.0f}", _src,
+                            dterms.get("prefill_attr", "-"), int(bool(stream)), request.path)
+                if _r_d is not None:
+                    self._x_r_d_src = f"d_prefill_s verdict={verdict} via={_src}"
+                    self.counters[f"r_d_sampled_{_src}"] += 1
+                    self.note_x_sample("r_d", _r_d)
+                elif _why == "short":
+                    self.counters["r_d_skipped_short"] += 1
+                else:
+                    self.counters["r_d_skipped_no_prefill_time"] += 1
+            elif _unc > 0:
+                self.counters["r_d_skipped_concurrent"] += 1
+
         if pending is not None and pending.skip_leg1:
             single_prefill = True
         if (stream and pending is not None and request.path.startswith("/v1/")
@@ -4550,11 +4594,23 @@ class Front:
                         # answer to "can D serve this text back".
                         self.spans.record_presence(text, ct)
                         self._note_exact(text, pt)
-                    dterms = await self._draft_terms(g, None)
+                    dterms = await self._draft_terms(g, None, rid=rid, uncached=max(0, pt - ct),
+                                                     mark=_pfc_mark0)
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                                 "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
                                 rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
                                 dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
+                    # H85: the streamed leg samples r_D too -- a served 200
+                    # with a price, not a refusal that arrived in band. The
+                    # answer is already committed to the client here, so an
+                    # instrument fault must not reach the except below.
+                    if r.status == 200 and priced and not x_inband:
+                        try:
+                            _sample_r_d(pt, ct, verdict, dterms)
+                        except Exception as e:  # noqa: BLE001 - never breaks serving
+                            self.counters["r_d_probe_errors"] += 1
+                            logger.warning("WEG2 X R_D-PROBE-ERROR rid=%s %s: %s (no sample)",
+                                           rid, type(e).__name__, e)
                     if pending is not None and ct > 0:
                         self.counters["cross_group_prefix_hits"] += 1
                     return resp
@@ -4577,7 +4633,8 @@ class Front:
                     return web.json_response({"error": f"W28 Weg2Leg2Unpriced rid={rid}"}, status=503)
                 verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, False, rid)
                 g.served += 1
-                dterms = await self._draft_terms(g, js)
+                dterms = await self._draft_terms(g, js, rid=rid, uncached=max(0, pt - ct),
+                                                 mark=_pfc_mark0)
                 logger.info("WEG2-SERVED group=D leg=2 rid=%s status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                             "uncached=%d verdict=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
                             rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, time.time() - t0, self.epoch,
@@ -4612,29 +4669,10 @@ class Front:
                 # not moving rules out an arrival that came and went inside
                 # this window, which `len(outstanding)` at two instants
                 # cannot.
-                _unc = max(0, pt - ct)
-                _w = time.time() - t0
-                _solo = (_solo_entry
-                         and self._d_admissions == _solo_adm0
-                         and len(g.outstanding) == 1)
-                if _solo and _unc > 0:
-                    # H84: THE RATE IS D'S OWN PREFILL TIME, never this wall
-                    # (the wall holds the decode; see `r_d_probe`).
-                    _pfs = d_prefill_seconds(js)
-                    _r_d, _why = r_d_probe(_unc, _pfs, envs.SGLANG_WEG2_X_RD_MIN_UNCACHED.get())
-                    logger.info("WEG2 X R_D rid=%s uncached=%d d_prefill_s=%s wall=%.2fs verdict=%s "
-                                "r_D=%s (r_D = uncached / d_prefill_s; the wall is shown, never used)",
-                                rid, _unc, "none" if _pfs is None else f"{_pfs:.3f}", _w, _why,
-                                "-" if _r_d is None else f"{_r_d:.0f}")
-                    if _r_d is not None:
-                        self._x_r_d_src = f"d_prefill_s verdict={verdict}"
-                        self.note_x_sample("r_d", _r_d)
-                    elif _why == "short":
-                        self.counters["r_d_skipped_short"] += 1
-                    else:
-                        self.counters["r_d_skipped_no_prefill_time"] += 1
-                elif _unc > 0:
-                    self.counters["r_d_skipped_concurrent"] += 1
+                #
+                # H84/H85: the probe itself is `_sample_r_d` at the top of this
+                # method (the streamed branch above samples through it too).
+                _sample_r_d(pt, ct, verdict, dterms)
                 if pt:
                     # #1324, as on the streamed branch above: `ct` is the
                     # measured presence, `pt` the tokenisation fact. On a W31
@@ -4928,7 +4966,8 @@ class Front:
         self._mark_posted(p)
         return await self.leg2(request, rid, payload, text, stream, pending=p, seat=p.seat)
 
-    async def _draft_terms(self, g, body) -> dict:
+    async def _draft_terms(self, g, body, rid: str = "", uncached: int = 0,
+                           mark: Optional[Tuple[str, int]] = None) -> dict:
         """#1233 (C16, L12): the draft terms of one served request.
 
         ``accept_len`` comes from ``meta_info.spec_accept_length`` when the
@@ -4938,8 +4977,22 @@ class Front:
         counters (``internal_states[0]`` of the body) between this call and the previous one (one request in
         flight at a time on the leg-2 route, so the delta is this request's).
         Never raises: a missing instrument is ``accept_src=none``.
+
+        H85: ``prefill_s`` is this leg's prefill time by D's own clock -- the
+        body's ``meta_info``/``sglext`` ``weg2_prefill_s`` (H84,
+        ``prefill_src=body``) first, else the record on the SAME read
+        (``internal_states[0].weg2_prefill_s``, ``prefill_src=server_info``)
+        that :func:`prefill_clock.attribute` assigns to this leg: newer than
+        ``mark`` (the leg's entry snapshot of ``_d_prefill_mark``), its rid or
+        the only new prefill, and the leg's own ``uncached`` extent.
+        ``prefill_attr`` says how, or why not. Every read advances the mark.
         """
-        out = {"draft_pages": 0, "draft_miss": 0, "accept_len": 0.0, "accept_src": "none"}
+        out = {"draft_pages": 0, "draft_miss": 0, "accept_len": 0.0, "accept_src": "none",
+               "prefill_s": d_prefill_seconds(body), "prefill_src": "none",
+               "prefill_attr": "no_read"}
+        if out["prefill_s"] is not None:
+            out["prefill_src"] = "body"
+            out["prefill_attr"] = "body"
         try:
             mi = (body or {}).get("meta_info") if isinstance(body, dict) else None
             if isinstance(mi, dict) and mi.get("spec_accept_length") is not None:
@@ -4971,6 +5024,20 @@ class Front:
             if out["accept_src"] == "none" and info.get("avg_spec_accept_length") is not None:
                 out["accept_len"] = float(info["avg_spec_accept_length"])
                 out["accept_src"] = "server_info_avg"
+            # H85: D's prefill clock (weg2/prefill_clock.py). Attributed
+            # against the leg's ENTRY mark, then the mark moves to this read.
+            _pfc = info.get(prefill_clock.INTERNAL_STATE_KEY)
+            if out["prefill_s"] is None:
+                if uncached > 0:
+                    _s, _how = prefill_clock.attribute(_pfc, rid, uncached, mark)
+                else:
+                    _s, _how = None, "no_extent"
+                out["prefill_attr"] = _how
+                if _s is not None:
+                    out["prefill_s"] = _s
+                    out["prefill_src"] = "server_info"
+            self._d_prefill_mark = prefill_clock.advance(
+                getattr(self, "_d_prefill_mark", None), prefill_clock.mark_of(_pfc))
         except Exception as e:  # noqa: BLE001 - an instrument never breaks serving
             logger.debug("draft terms unavailable: %s: %s", type(e).__name__, e)
         return out

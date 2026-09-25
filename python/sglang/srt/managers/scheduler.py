@@ -17946,6 +17946,13 @@ class Scheduler(
             "forward_ct": int(getattr(self, "forward_ct", 0) or 0),
             "running": len(getattr(_rb, "reqs", ()) or ()) if _rb is not None else 0,
         }
+        # H85: D's own prefill clock of its newest prefills, on the same read
+        # (the front's r_D carrier for streamed legs and /v1/messages, whose
+        # bodies carry no weg2_prefill_s; weg2/prefill_clock.py). Weg-2 D only.
+        from sglang.srt.weg2 import prefill_clock as _weg2_prefill_clock
+
+        if _weg2_prefill_clock.armed(self.server_args):
+            ret[_weg2_prefill_clock.INTERNAL_STATE_KEY] = _weg2_prefill_clock.snapshot()
 
         if (
             not self.spec_algorithm.is_none()

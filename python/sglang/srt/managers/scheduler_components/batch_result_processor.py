@@ -35,6 +35,7 @@ from sglang.srt.speculative import accept_profile
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.weg2 import prefill_clock as _weg2_prefill_clock
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -337,6 +338,12 @@ class SchedulerBatchResultProcessor:
 
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
+                    # H85: D's own prefill clock for the front's r_D sample on
+                    # legs whose body cannot carry it (streamed, /v1/messages),
+                    # published on /get_server_info (weg2/prefill_clock.py).
+                    # Host-side bookkeeping, last chunk only; a no-op off the
+                    # Weg-2 D group.
+                    _weg2_prefill_clock.note_prefill_finished(req, self.server_args)
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
