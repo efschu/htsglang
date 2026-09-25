@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import bisect
+import contextlib
 import logging
 import os
 import warnings
@@ -864,6 +865,10 @@ def _mmq_threshold_prefers_mmq(m: int, qweight: torch.Tensor, qweight_type: int)
 # identically to the previous fresh-allocation behavior.
 # ---------------------------------------------------------------------------
 _DEQUANT_WS: dict = {}  # (lane_id, device_index, dtype) -> 1-D buffer
+# #1233 (27B GGUF): while a chunk-scoped post-load pass runs, the workspace
+# growth it asks for is recorded here instead of allocated (see
+# dequant_workspace_deferred); None = allocate at once, as always.
+_DEQUANT_WS_DEFERRED: Optional[dict] = None
 # (lane_id, device_index, dtype) -> largest dequant TARGET this rank can be
 # asked for, in bytes, INCLUDING the over-cap ones the workspace deliberately
 # refuses to hold. See gguf_dequant_scratch_residual_bytes.
@@ -961,7 +966,48 @@ def _reserve_dequant_workspace(numel: int, dtype: torch.dtype, device) -> None:
         return
     buf = _DEQUANT_WS.get(key)
     if buf is None or buf.numel() < numel:
+        if _DEQUANT_WS_DEFERRED is not None:
+            pending = _DEQUANT_WS_DEFERRED.get(key)
+            if pending is None or pending[0] < numel:
+                _DEQUANT_WS_DEFERRED[key] = (numel, dtype, device)
+            return
         _DEQUANT_WS[key] = torch.empty(numel, dtype=dtype, device=device)
+
+
+@contextlib.contextmanager
+def dequant_workspace_deferred():
+    """Hold back the #63 workspace growth of a post-load pass, then allocate
+    each workspace ONCE, at its largest requested size, after the pass.
+
+    #1233 (27B GGUF, weg2rc5gg 2026-09-25): the GGUF post-load pass now runs
+    every module inside its LAYER's weight chunk scope, so the flat qweight
+    containers land in the chunk tag that is paused and resumed with the layer.
+    The dequant workspace is not a layer's bytes -- one buffer per lane,
+    device and dtype, shared by every layer -- and stays in the BASE weights
+    tag: grown inside the pass it would land in whichever chunk asked for the
+    largest target. The allocation on exit happens outside the chunk scopes
+    (the caller closes them first), still inside load_model, so the KV-budget
+    profiling that runs afterwards sees it (#63). The peak targets
+    (gguf_dequant_scratch_residual_bytes) are recorded as before. Nested use
+    folds into the outer scope.
+    """
+    global _DEQUANT_WS_DEFERRED
+    outer = _DEQUANT_WS_DEFERRED
+    mine: dict = {}
+    _DEQUANT_WS_DEFERRED = mine
+    try:
+        yield
+    finally:
+        _DEQUANT_WS_DEFERRED = outer
+    if outer is not None:
+        for key, item in mine.items():
+            if key not in outer or outer[key][0] < item[0]:
+                outer[key] = item
+        return
+    for key, (numel, dtype, device) in mine.items():
+        buf = _DEQUANT_WS.get(key)
+        if buf is None or buf.numel() < numel:
+            _DEQUANT_WS[key] = torch.empty(numel, dtype=dtype, device=device)
 
 
 def _ggml_dequantize_ws(
@@ -1355,6 +1401,17 @@ def _flat_container_declaration(qweight, shard_id, tensors, offsets, total):
     return table
 
 
+def _layer_id_of(prefix: str) -> Optional[int]:
+    """The layer index in a module's state-dict path, the way the weg2 chunk
+    tags read it (weg2_memory_saver.layer_id_from_module_name); None outside a
+    layer or when the path is unknown."""
+    if not prefix:
+        return None
+    from sglang.srt.managers.weg2_memory_saver import layer_id_from_module_name
+
+    return layer_id_from_module_name(prefix)
+
+
 class GGUFLinearMethod(LinearMethodBase):
     """Linear method for GGUF.
 
@@ -1393,6 +1450,10 @@ class GGUFLinearMethod(LinearMethodBase):
                 # G1 (weg2 exchange): the checkpoint rows each shard's loader
                 # copied (linear.py _declare_gguf_src_rows), per shard key.
                 "xchg_src_rows": {},
+                # #1233 (27B GGUF, weg2rc5gg): the layer whose weight chunk tag
+                # this qweight is materialized under (materialize()); None
+                # outside a layer (embedding, head) = the base weights tag.
+                "weg2_layer_id": _layer_id_of(getattr(layer, "prefix", "")),
             },
         )
         set_weight_attrs(qweight, extra_weight_attrs)
@@ -1757,6 +1818,19 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
 class GGUFUninitializedParameter(UninitializedParameter):
     cls_to_become = Parameter
     data_container: list[torch.Tensor]
+
+    def materialize(self, shape, device=None, dtype=None):
+        """#1233 (27B GGUF, weg2rc5gg 2026-09-25): a single-shard GGUF qweight
+        gets its bytes HERE, in load_weights -- after model construction, whose
+        per-layer chunk scope (make_layers) it therefore never saw. Allocate it
+        in the chunk tag of its layer (``weg2_layer_id``, recorded by
+        GGUFLinearMethod.create_weights), like every other weight of that
+        layer; a module outside a layer keeps the base tag. No-op unless the
+        flip's weight chunking is on (weg2_memory_saver.weight_chunk_scope)."""
+        from sglang.srt.managers.weg2_memory_saver import weight_chunk_scope
+
+        with weight_chunk_scope(getattr(self, "weg2_layer_id", None)):
+            return super().materialize(shape, device=device, dtype=dtype)
 
 
 # =============================================================================

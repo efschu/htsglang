@@ -2233,6 +2233,47 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         return model.eval()
 
 
+def _process_weights_after_loading_by_layer_chunk(
+    model: nn.Module, target_device: torch.device
+) -> None:
+    """The GGUF post-load pass, each module inside its LAYER's weight chunk scope.
+
+    #1233 Weg-2 (the rule DefaultModelLoader's post-load pass follows): a
+    post-load pass that ALLOCATES must land in the chunk tag of its layer,
+    because the chunk is what the flip pauses and resumes per leg; modules
+    outside a layer keep the base tag. GGUF's pass allocates the bulk of every
+    layer's bytes -- ``GGUFLinearMethod._create_flat_weight_param`` builds the
+    flat qweight container (in_proj_qkvz, gate_up_proj, qkv_proj, ...) -- and
+    ran WITHOUT the scope, so all of it was born under the BASE weights tag
+    (the single-shard qweights, materialized in load_weights, get their chunk
+    from GGUFUninitializedParameter.materialize). Boot weg2rc5gg (RC5
+    5f13f1aad9, 2026-09-25): PP0 booked 7766 MiB under ``weights`` against a
+    walk of 521 MiB, the chunk tags 122-522 MiB against 477-1804; the wake
+    resumes chunks first and the base tag last, so ``resume(weights_5)`` left
+    ``model.layers.40.linear_attn.in_proj_qkvz.qweight`` unmapped
+    (WEG2-RESUME-PTRATTR unmapped=8), the BAR1 collect copied into it and
+    PP1 died in cudaMemcpyAsync (SIGSEGV, 05:41:08Z). No-op unless the
+    launcher set the chunk envs and the base weights region is open
+    (``weg2_memory_saver.weight_chunk_scope``).
+    """
+    from sglang.srt.layers.quantization.gguf import dequant_workspace_deferred
+    from sglang.srt.managers.weg2_memory_saver import (
+        layer_id_from_module_name,
+        weight_chunk_scope,
+    )
+
+    # The shared dequant workspace (one per lane/device/dtype) is not a layer's
+    # bytes: its growth is held back during the per-layer pass and allocated
+    # once afterwards, outside every chunk scope -- in the base weights tag.
+    with dequant_workspace_deferred():
+        for name, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                with weight_chunk_scope(layer_id_from_module_name(name)):
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+
+
 class GGUFModelLoader(BaseModelLoader):
     """
     Model loader that can load GGUF files. This is useful for loading models
@@ -2477,11 +2518,7 @@ class GGUFModelLoader(BaseModelLoader):
             )
 
             _t_pw0 = time.perf_counter()
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
+            _process_weights_after_loading_by_layer_chunk(model, target_device)
             _t_pw = time.perf_counter() - _t_pw0
             logger.info(
                 "[#89 STEP-0] process_weights_after_loading (flat-assembly, "
