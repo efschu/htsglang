@@ -12,13 +12,19 @@ weight_global_scale fp32 0-dim (max(weight_scale_2)); out bf16 [M, out_features]
 
 Importing this module in a tree without the seam does nothing (the kernel itself lives in
 ``sglang.jit_kernel.nvfp4_w4a8`` and is usable directly).
+
+Small M (decode, M <= ``SGLANG_W4A8_DECODE_MAX_M``, default 48) runs agent N4D's decode GEMV
+(``sglang.jit_kernel.nvfp4_w4a8_decode``) on the same bytes with the same arithmetic; larger M and shapes it does
+not take (K not a multiple of 128, K padding) run N4A's tiled GEMM. ``SGLANG_W4A8_DECODE_MAX_M=0`` turns the
+decode GEMV off. Both only ever run when native-mixed resolved ``w4a8_int8`` for the rank
+(``SGLANG_FP4_NATIVE_MIXED_SM8X=w4a8``); the default boot never imports a kernel from here.
 """
 
 from __future__ import annotations
 
 import torch
 
-KERNEL_NAME = "nvfp4_w4a8_int8_sm86"
+KERNEL_NAME = "nvfp4_w4a8_int8_sm86+decode"
 
 
 def nvfp4_w4a8_int8_apply(
@@ -32,6 +38,18 @@ def nvfp4_w4a8_int8_apply(
         raise NotImplementedError(
             f"{KERNEL_NAME}: activations must be bf16 (got {x.dtype}); the 27B line serves bf16"
         )
+    from sglang.jit_kernel import nvfp4_w4a8_decode as dec
+
+    k = x.shape[-1]
+    x2 = x.reshape(-1, k)
+    if 0 < x2.shape[0] <= dec.decode_max_m() and dec.eligible(k, weight):
+        if x2.stride(-1) != 1 or x2.data_ptr() % 16 != 0 or x2.stride(0) % 8 != 0:
+            x2 = x2.contiguous()
+        y = dec.nvfp4_w4a8_decode_linear(
+            x2, weight, weight_scale_swizzled, weight_global_scale, int(out_features)
+        )
+        return y.view(*x.shape[:-1], int(out_features))
+
     from sglang.jit_kernel.nvfp4_w4a8 import nvfp4_w4a8_linear
 
     return nvfp4_w4a8_linear(

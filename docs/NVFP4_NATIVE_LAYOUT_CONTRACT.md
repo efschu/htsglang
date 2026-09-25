@@ -434,3 +434,61 @@ b24c1_3080.jsonl), Skript benchmark/nvfp4_native/n4c_micro.py.
 - 5090, Fs Hook (cute-dsl-native W4A16) gegen W4A4, CUDA-Graph: D.gate_up M=1 24,7 gegen 53,3 µs, M=8 28,7 gegen 59,4;
   D.down M=1 12,6 gegen 32,9, M=8 14,5 gegen 32,9. Fehler gegen fp32-Dequant-Referenz: W4A16 0,17 %, W4A4 9,6 %
   (Aktivierungs-FP4). Unzerteiltes Marlin auf der 5090 zum Vergleich: D.gate_up M=1 18,5 µs, D.down 12,5 µs.
+
+## 14. N4D (25.09.): W4A8-Decode-GEMV auf dem nativen Layout (sm_86, kleines M)
+
+Kern `jit_kernel/csrc/gemm/nvfp4_w4a8_decode_sm86.cuh` + `jit_kernel/nvfp4_w4a8_decode.py`. Er liest dieselben
+Bytes wie N4A (§3), rechnet dieselbe Arithmetik und ist auf dem 3080 bitgleich zu N4A (Stichprobe lm_head M=1/4/16,
+max|Δ| = 0). N4As Kern ist per Cherry-Pick im Zweig und läuft weiter für M > 48.
+
+**Upstream geprüft, alle mit eigenem Layout, also am Flip wieder eine Umformung:**
+- vLLM Marlin W4A8-INT8 (#24722): Marlin-Repack, NVFP4 laut PR nicht unterstützt.
+- Humming (sglang #23754 = vllm-project/humming 0.1.4): `transform()` ins Humming-Format.
+- QQQ und QServe: g128, eigene Layouts.
+- llama.cpp #20644/#21074: NVFP4 als AoS-Block; mmvq per dp4a, mmq über q8_0_16-mma.
+
+Übernommen ist nur das Prinzip (INT8-Blocksumme je 16 plus Blockskala).
+
+**Warum N4A im Decode ~230 GB/s schafft:** je k-Tile holt es 32 B pro Zeile über Shared Memory, also einen Sektor je
+Zeile bei 2–8,7 KB Zeilenabstand.
+
+**Bauweise:**
+- 128-Bit-Loads der Zeilensegmente (64 B) direkt ins Register, L1 no-allocate, L2 evict-first.
+- u Segmente je Schritt, der nächste Schritt ist schon unterwegs.
+- kw Warps teilen K einer 16-Zeilen-Kachel; Reduktion im Shared Memory in fester Reihenfolge, deterministisch, kein
+  Zweitkernel.
+- Zeilenlage: Lane-Zeilen rA und rA+32 teilen ein Swizzle-Granulat, EIN 8-Byte-Load holt beide Skalen.
+- Modus diag (M ≤ 4): m16n8k32, Spalten = die 8 Blöcke eines Segments, B blockdiagonal maskiert. Kein Datentausch.
+- Modus xpose (M ≤ 48): Quad-Transposition im Register (4 PRMT + 4 SHFL je Zeile), m16n8k16 je Block, Aktivierung
+  im segment-permutierten Layout des Quantisierers.
+- Konfiguration je (M, N, K) aus dem Sweep (`n4d_sweep.py`, Regeln in `config_for`).
+
+**Einhängen:** `nvfp4_w4a8_int8_apply` (N4B-Naht) leitet 0 < M ≤ `SGLANG_W4A8_DECODE_MAX_M` (Default 48) auf den
+Decode-GEMV, sonst N4A. Das Ganze läuft nur mit `SGLANG_FP4_NATIVE_MIXED_SM8X=w4a8`; der Default-Boot ist unberührt.
+
+**MESSUNG** (3080 = NVML 0, gpuq wgbsqk/sch2gr, 25.09. 16:02–16:19Z, CUDA-Graph, Gewichte >48 MB rotiert).
+Rohdaten `/spinning/evidence-665-f1/n4d_decode_0925/` (q*.json Bench, s1/s2.json Sweep).
+- µs je GEMM, in Klammern GB/s (Gewicht + Skalen).
+- „neu“ = GEMM allein in der Sweep-besten Konfiguration (= Regel). Die Aktivierungs-Quantisierung kostet +2,2–2,5 µs.
+
+| Shape | M=1 Marlin / N4A / neu | M=4 | M=8 | M=16 | M=32 | M=48 |
+|---|---|---|---|---|---|---|
+| D.gate_up 8192×5120 | 39,1 / 92,4 / 39,8 (592) | 39,2 / 92,6 / 42,0 | 39,5 / 94,3 / 44,2 | 41,0 / 101 / 48,4 | 66,5 / 113 / 67,8 | 96,9 / 111 / 85,9 |
+| D.down 5120×4096 | 21,9 / 42,8 / 20,5 (575) | 22,0 / 43,3 / 22,1 | 22,3 / 44,4 / 22,5 | 24,1 / 49,1 / 27,6 | 38,9 / 56,1 / 38,4 | 57,4 / 59,4 / 59,4 |
+| P.down 5120×17408 | 77,3 / 232 / 81,9 (612) | 77,6 / 233 / 86,2 | 78,5 / 234 / – | 82,3 / 249 / 105 | 117 / 268 / – | 184 / 261 / 225 |
+| D.lm_head 82816×5120 | 350 / 1017 / 348 (686) | 354 / 1021 / 363 | 357 / 1021 / – | 370 / 1010 / 401 | 629 / 1020 / – | 933 / 1059 / 845 |
+| P.gate_up 34816×5120 | 154 / 421 / – | 154 / 423 / – | 155 / 434 / 170 | 162 / 449 / – | 248 / 429 / 225 | 342 / 448 / – |
+
+- „–“: nicht gesweept. Frühere Voll-Pfad-Läufe mit älteren Konfigurationen (q4/q8) liegen daneben.
+- M=512: N4A D.gate_up 701 µs (61 TOPS) gegen Marlin 849 µs (51 TF); P.gate_up 2749 (66 TOPS) gegen 3231 (57 TF).
+- **Fehler gegen die fp32-W4A16-Referenz** (x_bf16 @ dequant(W)ᵀ): W4A8 (neu = N4A) rel. Frobenius 0,85–0,91 %, Marlin
+  W4A16 0,25 %. Gegen die exakte W4A8-Emulation: 0,165 %, das ist die bf16-Ausgaberundung.
+- **Messfalle lm_head:** Der reine GEMM-Loop mit liegender Aktivierung streut 340–1100 µs. Der Voll-Pfad
+  (Quantisierer direkt davor) liegt stabil bei 349–363 µs für M=4–16, also auf Marlin-Niveau. Für lm_head gilt
+  deshalb der Voll-Pfad.
+- **Offen:**
+  - M=8–16 auf den D-MLP-Shards ist 14–18 % langsamer als Marlin. Ursache: Aktivierungsverkehr aus L2. Je n-Tile
+    und Segment liest eine Warp 1 KB Aktivierung zu 1 KB Gewicht; Gegenmittel sind rw>1 mit L1-Treffern (seit dem
+    Stagger je CTA möglich) oder Aktivierung im Shared Memory.
+  - P.down (K=17408) liegt 6–28 % hinter Marlin.
+  - Die Voll-Pfad-Messung mit den Regel-Konfigurationen fehlt noch (Fenster nach der Abnahme).
