@@ -8306,14 +8306,19 @@ class SchedulerWeightUpdaterManager:
                     from sglang.srt.weg2.weight_exchange import zero_local_scratch
 
                     _scratch = []
+                    _residue: list = []
                     for _m in self._weg2_wake_models():
-                        _scratch.extend(zero_local_scratch(_m))
+                        _scratch.extend(zero_local_scratch(_m, residue=_residue))
                     if _scratch:
+                        # residue_nonzero: lock entries the recycled pages
+                        # handed back NON-ZERO, counted before the memset
+                        # (27B line 2026-09-25: the scheme-held workspace of
+                        # the W8 draft was not reached before).
                         logger.info(
-                            "WEG2-RESUME local-scratch zeroed=%d first=%s "
-                            "(runtime-built tensors the exchange has no source "
-                            "for; see weight_exchange.LOCAL_SCRATCH_REASON)",
-                            len(_scratch), _scratch[0],
+                            "WEG2-RESUME local-scratch zeroed=%d residue_nonzero=%d "
+                            "first=%s (runtime-built tensors the exchange has no "
+                            "source for; see weight_exchange.LOCAL_SCRATCH_REASON)",
+                            len(_scratch), sum(_residue), _scratch[0],
                         )
                 except Exception as _sexc:  # noqa: BLE001
                     # NAMED, never swallowed: a failure here means the first
