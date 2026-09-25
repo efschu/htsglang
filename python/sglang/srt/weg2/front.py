@@ -4126,36 +4126,45 @@ class Front:
             the decode of `comp` completion tokens) is printed, never divided
             -- weg2rc4 sampled `uncached=2 wall=6.85s` and X never left 4096.
             """
-            _unc = max(0, pt - ct)
-            _w = time.time() - t0
-            _solo = (_solo_entry
-                     and self._d_admissions == _solo_adm0
-                     and len(g.outstanding) == 1)
-            if not _solo:
-                if _unc > 0:
-                    self.counters["r_d_skipped_concurrent"] += 1
-                return
-            if _unc <= 0:
-                return
-            _ps = (dterms or {}).get("prefill_s")
-            _src = (dterms or {}).get("prefill_src", "none")
-            rate, why = r_d_probe(_unc, _ps, x_rd_min_uncached())
-            # ONE line per solo leg, the NF line's H85 shape exactly: the wall
-            # is shown for comparison, never divided.
-            logger.info("WEG2 X R_D rid=%s uncached=%d d_prefill_s=%s wall=%.2fs verdict=%s "
-                        "r_D=%s d_prefill_src=%s d_prefill_attr=%s stream=%d path=%s "
-                        "(r_D = uncached / d_prefill_s; the wall is shown, never used)",
-                        rid, _unc, "none" if _ps is None else f"{float(_ps):.3f}", _w, why,
-                        "-" if rate is None else f"{rate:.0f}", _src,
-                        (dterms or {}).get("prefill_attr", "-"), int(bool(stream)), request.path)
-            if rate is not None:
-                self._x_r_d_src = f"d_prefill_s verdict={verdict} via={_src}"
-                self.counters[f"r_d_sampled_{_src}"] += 1
-                self.note_x_sample("r_d", rate)
-            elif why == "short":
-                self.counters["r_d_skipped_short"] += 1
-            else:
-                self.counters["r_d_skipped_no_prefill_time"] += 1
+            # Review V (RC7b): the guard lives HERE, for both wire shapes. It sat on
+            # the streamed call site only, so a probe error on the non-streamed
+            # branch turned a SERVED 200 into a 503 -- a measurement must never
+            # decide a request's fate.
+            try:
+                _unc = max(0, pt - ct)
+                _w = time.time() - t0
+                _solo = (_solo_entry
+                         and self._d_admissions == _solo_adm0
+                         and len(g.outstanding) == 1)
+                if not _solo:
+                    if _unc > 0:
+                        self.counters["r_d_skipped_concurrent"] += 1
+                    return
+                if _unc <= 0:
+                    return
+                _ps = (dterms or {}).get("prefill_s")
+                _src = (dterms or {}).get("prefill_src", "none")
+                rate, why = r_d_probe(_unc, _ps, x_rd_min_uncached())
+                # ONE line per solo leg, the NF line's H85 shape exactly: the wall
+                # is shown for comparison, never divided.
+                logger.info("WEG2 X R_D rid=%s uncached=%d d_prefill_s=%s wall=%.2fs verdict=%s "
+                            "r_D=%s d_prefill_src=%s d_prefill_attr=%s stream=%d path=%s "
+                            "(r_D = uncached / d_prefill_s; the wall is shown, never used)",
+                            rid, _unc, "none" if _ps is None else f"{float(_ps):.3f}", _w, why,
+                            "-" if rate is None else f"{rate:.0f}", _src,
+                            (dterms or {}).get("prefill_attr", "-"), int(bool(stream)), request.path)
+                if rate is not None:
+                    self._x_r_d_src = f"d_prefill_s verdict={verdict} via={_src}"
+                    self.counters[f"r_d_sampled_{_src}"] += 1
+                    self.note_x_sample("r_d", rate)
+                elif why == "short":
+                    self.counters["r_d_skipped_short"] += 1
+                else:
+                    self.counters["r_d_skipped_no_prefill_time"] += 1
+            except Exception as e:  # noqa: BLE001 - never breaks serving
+                self.counters["r_d_probe_errors"] += 1
+                logger.warning("WEG2 X R_D-PROBE-ERROR rid=%s %s: %s (no sample)",
+                               rid, type(e).__name__, e)
         if pending is not None and pending.skip_leg1:
             single_prefill = True
         if (stream and pending is not None and request.path.startswith("/v1/")
@@ -4286,12 +4295,7 @@ class Front:
                                 rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
                                 dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
                     if r.status == 200 and priced and not x_inband:
-                        try:
-                            _sample_r_d(pt, ct, verdict, dterms)
-                        except Exception as e:  # noqa: BLE001 - never breaks serving
-                            self.counters["r_d_probe_errors"] += 1
-                            logger.warning("WEG2 X R_D-PROBE-ERROR rid=%s %s: %s (no sample)",
-                                           rid, type(e).__name__, e)
+                        _sample_r_d(pt, ct, verdict, dterms)  # guarded inside (Review V)
                         self._note_x_grant_realized(rid, _x_grant, pt, ct)
                     if pending is not None and ct > 0:
                         self.counters["cross_group_prefix_hits"] += 1
