@@ -2595,6 +2595,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         weights_tag = weights_region_tag_for(RunnerShape.of(self))
+        # 27B line (weg2xsn442 R7): the fp8 capability probe's first call creates
+        # the cuBLAS workspace on a card with native fp8 (the 5090). Answer it
+        # here, outside the weights region, so the workspace sits in the default
+        # pool and the loader's in-region check is a cache hit; a no-op for every
+        # checkpoint that is not an Fp8Config (fp8_utils.prewarm_fp8_native_gemm_probe).
+        from sglang.srt.layers.quantization.fp8_utils import (
+            prewarm_fp8_native_gemm_probe,
+        )
+
+        prewarm_fp8_native_gemm_probe(self.model_config.quantization)
         with weights_region(
             self.memory_saver_adapter,
             weights_tag,
