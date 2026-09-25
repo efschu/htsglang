@@ -124,7 +124,7 @@ MIB = 2**20
 # #721 floor as host_ledger_preflight.sh FLOOR_G applies it: 16 GiB, not the
 # spec's "16 GB" literal (unit slip; operator decision 2026-09-02).
 FLOOR_BYTES = 16 * GIB
-RESERVE_BYTES = 10 * GIB  # PINNED_HOST_RESERVE_BYTES, pinned_host_budget.py:59
+RESERVE_BYTES = 10 * GIB  # the DEFAULT of pinned_host_budget.pinned_host_reserve() (SGLANG_PINNED_HOST_RESERVE_GIB); sizing reads that
 LOAD_TRANSIENT_BYTES = 27 * GIB  # weights-load transient, #721
 CHAIN_LAG = 1  # spec section 5: +1 queue occupant on PP1/PP2 at every cutover
 KV_MULTIPLE_OF_S = 8  # PP 2S + TP pin 6S (rows-coupled), spec section 5
@@ -297,7 +297,11 @@ def size_host_pools(
     anchor_floor = int(device_slots + max_running_requests + 1)
     anchors_bytes = 2 * ranks * m_mib * MIB
 
-    cap_bytes = int(memavail_bytes) - FLOOR_BYTES - RESERVE_BYTES - LOAD_TRANSIENT_BYTES
+    # RC7b: the same reserve the pinned-host checks keep free (one reader, env-settable, default 10 GiB)
+    from sglang.srt.mem_cache.pinned_host_budget import pinned_host_reserve
+
+    reserve_bytes, reserve_src = pinned_host_reserve()
+    cap_bytes = int(memavail_bytes) - FLOOR_BYTES - reserve_bytes - LOAD_TRANSIENT_BYTES
     kv_budget = cap_bytes - anchors_bytes
     s_ledger = int(math.floor(kv_budget / (KV_MULTIPLE_OF_S * GB))) if kv_budget > 0 else 0
 
@@ -312,7 +316,7 @@ def size_host_pools(
         f"cell_pp0={cell_pp0_bytes} B ({p('cell_pp0')}) "
         f"memavail={memavail_bytes / GB:.2f} GB ({p('memavail')}) "
         f"floor={floor_txt} (#721 as host_ledger_preflight.sh FLOOR_G gates it; spec section 5 '16 GB' is a unit slip) "
-        f"reserve={RESERVE_BYTES / GIB:.0f} GiB (pinned_host_budget.py:59) "
+        f"reserve={reserve_bytes / GIB:.2f} GiB ({reserve_src}) "
         f"load_transient={LOAD_TRANSIENT_BYTES / GIB:.0f} GiB (#721) "
         f"ranks={ranks} ({p('ranks')}) "
         f"m_mib={m_mib} ({p('m_mib')}) "
@@ -329,7 +333,7 @@ def size_host_pools(
     lines.append(
         f"#1068 WEG1 LEDGER cap={cap_bytes / GB:.2f} GB = memavail "
         f"{memavail_bytes / GB:.2f} GB - floor {floor_txt} - reserve "
-        f"{RESERVE_BYTES / GB:.2f} GB (10 GiB) - load transient "
+        f"{reserve_bytes / GB:.2f} GB ({reserve_src}) - load transient "
         f"{LOAD_TRANSIENT_BYTES / GB:.2f} GB (27 GiB); anchors={anchors_bytes / GB:.2f} GB "
         f"(2 phases x {ranks} ranks x {m_mib} MiB); kv_budget={kv_budget / GB:.2f} GB "
         f"over {KV_MULTIPLE_OF_S} x S (PP 2S + TP pin 6S) -> S_ledger={s_ledger} GB"
@@ -338,7 +342,7 @@ def size_host_pools(
         raise SizingRefused(
             f"{REFUSED_PREFIX}: ledger cap leaves no KV budget: memavail "
             f"{memavail_bytes / GB:.2f} GB - floor {floor_txt} - "
-            f"reserve {RESERVE_BYTES / GB:.2f} GB - load transient "
+            f"reserve {reserve_bytes / GB:.2f} GB ({reserve_src}) - load transient "
             f"{LOAD_TRANSIENT_BYTES / GB:.2f} GB - anchors {anchors_bytes / GB:.2f} GB "
             f"= {kv_budget / GB:.2f} GB < {KV_MULTIPLE_OF_S} GB (one GB of S costs "
             f"{KV_MULTIPLE_OF_S} GB pinned). No fallback: free host RAM or lower "
@@ -353,7 +357,7 @@ def size_host_pools(
             f"{max_running_requests} x chunked_prefill_size {chunked_prefill_size} "
             f"= {floor_rows} rows (the in-tree floor G10 refuses this too); memavail "
             f"{memavail_bytes / GB:.2f} GB, floor {floor_txt}, reserve "
-            f"{RESERVE_BYTES / GB:.2f} GB, load transient {LOAD_TRANSIENT_BYTES / GB:.2f} GB, "
+            f"{reserve_bytes / GB:.2f} GB ({reserve_src}), load transient {LOAD_TRANSIENT_BYTES / GB:.2f} GB, "
             f"anchors {anchors_bytes / GB:.2f} GB"
         )
     if anchor_slots_rank0 < anchor_floor:

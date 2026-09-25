@@ -2109,10 +2109,12 @@ def _pin_refusal(
     never there".
     """
     from sglang.srt.mem_cache.pinned_host_budget import (
-        PINNED_HOST_RESERVE_BYTES,
         pinned_host_memory_bytes,
+        pinned_host_reserve,
         registered_posts,
     )
+
+    reserve_bytes, reserve_src = pinned_host_reserve()
 
     said = (
         str(local_exc)
@@ -2134,7 +2136,7 @@ def _pin_refusal(
         f"posts already registered: [{others or 'none'}]; host total "
         f"{(machine_total or 0) / 1e9:.2f} GB, available "
         f"{(available or 0) / 1e9:.2f} GB, reserve floor "
-        f"{PINNED_HOST_RESERVE_BYTES / 1e9:.2f} GB. Lower one of the named "
+        f"{reserve_bytes / 1e9:.2f} GB ({reserve_src}). Lower one of the named "
         f"flags or set {FLIP_IMAGE_PIN_FLAG} and boot without the "
         f"read-ahead; the file-backed image is unchanged either way. "
         f"{stage} said: {said}"
@@ -2170,9 +2172,9 @@ def create_flip_image_pin(nbytes: int) -> FlipImagePin:
     rank-uniform on every path.
     """
     from sglang.srt.mem_cache.pinned_host_budget import (
-        PINNED_HOST_RESERVE_BYTES,
         check_and_register_pinned_post,
         pinned_host_memory_bytes,
+        pinned_host_reserve,
         unregister_pinned_post,
     )
 
@@ -2229,15 +2231,17 @@ def create_flip_image_pin(nbytes: int) -> FlipImagePin:
     pin = FlipImagePin(buffer, post_name=FLIP_IMAGE_PIN_POST_NAME)
     install_flip_image_pin(pin)
     _, available = pinned_host_memory_bytes()
+    _reserve_bytes, _reserve_src = pinned_host_reserve()
     logger.info(
         "#809 FLIP IMAGE PIN post %r: %.2f GB page-locked, registered against "
-        "the #721 ledger (available %.2f GB, reserve %.2f GB). It is a "
+        "the #721 ledger (available %.2f GB, reserve %.2f GB, %s). It is a "
         "READ-AHEAD of the file-backed image, not a second image: the file "
         "stays the carrier.",
         FLIP_IMAGE_PIN_POST_NAME,
         total / 1e9,
         (available or 0) / 1e9,
-        PINNED_HOST_RESERVE_BYTES / 1e9,
+        _reserve_bytes / 1e9,
+        _reserve_src,
     )
     return pin
 
