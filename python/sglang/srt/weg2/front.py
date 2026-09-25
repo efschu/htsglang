@@ -49,6 +49,7 @@ import asyncio
 import collections
 import contextvars
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -2898,6 +2899,14 @@ class Front:
         # #1262 tier 3 -- the deadman's third signal, see flip_stall_check.
         app["flip_stall"] = asyncio.create_task(self.flip_stall_sampler())
         app["host_watermark"] = asyncio.create_task(self.host_watermark_sampler())
+        # H75 (x174): resolve_x_live imports the launcher module on its first
+        # call, i.e. inside the first completed flip, and that import costs
+        # 5-7 s. On the event loop it froze the whole front for that long
+        # (RATE-GAP 7.7/7.7/7.9 s on x172/x173/x174), and on x174 the P leg
+        # dispatched right after went out on a pooled connection P had closed
+        # during the freeze: "Server disconnected", 97k needle lost. Import it
+        # once here, in a worker thread, while the front is still idle.
+        app["launcher_prewarm"] = asyncio.create_task(self._prewarm_launcher_import())
         logger.info("WEG2-FRONT up tag=%s awake=%s P=%s D=%s W=%.0f s (operator V1 fairness bound, 0 = off) "
                     "carrier_max_tokens=%d p_concurrency=%d d_bs=%d X=%d flip_min_work_tokens=%d "
                     "idle_layout=%s min_dwell_ms=%s drain_deadline_s=%.0f d_admit_max_tokens=%d "
@@ -2913,6 +2922,25 @@ class Front:
                     else "that reading under an operator ceiling")
         # 27B flipfast: which of the three front switches this boot runs.
         logger.info("%s", self.flipfast_line())
+
+    async def _prewarm_launcher_import(self) -> None:
+        """H75: import ``sglang.srt.weg2.launcher`` off the event loop.
+
+        The import is the one ``resolve_x_live`` does lazily; doing it here
+        first only moves WHEN it happens. A failure is not fatal: the lazy
+        import in ``resolve_x_live`` still runs, just on the loop as before.
+        """
+        t0 = time.monotonic()
+        try:
+            await asyncio.to_thread(importlib.import_module, "sglang.srt.weg2.launcher")
+        except Exception as e:  # noqa: BLE001 -- the lazy import stays the fallback
+            logger.warning("WEG2-FRONT launcher prewarm failed after %.1f s: %r -- resolve_x_live "
+                           "imports it on the event loop at the first flip instead (H75)",
+                           time.monotonic() - t0, e)
+            return
+        logger.info("WEG2-FRONT launcher prewarmed off the event loop in %.1f s "
+                    "(H75: resolve_x_live no longer freezes the front in the first flip)",
+                    time.monotonic() - t0)
 
     async def cleanup(self, app):
         for k in ("controller", "admitter", "health", "corridor", "flip_stall"):
