@@ -168,6 +168,11 @@ def build_p_group(clock):
     )
     pp0._flush_zero_kv_wanted = lambda _zero_kv: False
     pp0.group_idle_verdict = Scheduler.group_idle_verdict.__get__(pp0)
+    # H63d (#1470b): the real flush joins the store writes before the reset;
+    # bound real as well -- a no-op here, the model runs without HiCache.
+    pp0._weg2_join_store_writes_before_reset = (
+        Scheduler._weg2_join_store_writes_before_reset.__get__(pp0)
+    )
     pp0.flush_cache = Scheduler.flush_cache.__get__(pp0)
     wrapper = SchedulerFlushWrapper(
         # the RPC's own call (tp_group_verdict=True); empty_cache off only so
