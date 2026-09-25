@@ -2441,6 +2441,33 @@ class SchedulerWeightUpdaterManager:
         # `covered_lanes` for the lane-sparse-tag shape a pipeline source
         # produces.
         from sglang.srt.weg2 import weight_exchange_bounce as _bx
+        # F2 (boot weg2rc5gg, 2026-09-25): READ THE COLLECT'S OWN TARGETS
+        # BEFORE ANY LANE WRITES.  weg2rc5gg's first flip died in a SIGSEGV in
+        # `memcpy_async` on P PP1 (lane p0, weights_5): the GGUF qweights sit
+        # in the BASE tag (allocated at load time) while the plan files them
+        # under their layer's chunk tag, so the collect wrote into pages no
+        # resumed tag held.  The resume loop's PTRATTR row had read it three
+        # seconds earlier (`unmapped=24`) and only printed it.  The refusal
+        # reads THIS slice's descriptors, not that row's name census, which
+        # walks the DRAFT model on D and misreads 150 of 750 RC4 readings
+        # there (collect_target_census says why).  The device bind is the
+        # lanes' own first step (`create_stream` -> `set_device`), taken one
+        # step early so the driver probe has the rank's context on the wake
+        # worker's fresh thread.
+        if _cdescs:
+            _bind = getattr(ops, "set_device", None)
+            if callable(_bind):
+                try:
+                    _bind(int(device))
+                except Exception:  # noqa: BLE001 -- the lanes bind it themselves
+                    pass
+            _dst = _bx.collect_target_census(
+                _cdescs, tag=tag,
+                no_write=getattr(self, "_weg2_xchg_no_write", None))
+            logger.info("WEG2-XCHG-DST-CENSUS group=%s rank=%s %s", group,
+                        rank, _dst.line())
+            if _dst.unmapped:
+                raise Weg2WakeRefused(_dst.refusal(group=group, rank=int(rank)))
         try:
             _covered_lanes = set(_bx.group_descs_by_pair(list(plan.descs)).keys())
         except Exception:  # noqa: BLE001 -- an unbuildable coverage keeps the per-tag set
