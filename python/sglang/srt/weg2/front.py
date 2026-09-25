@@ -49,10 +49,12 @@ import asyncio
 import collections
 import contextvars
 import hashlib
+import importlib
 import json
 import logging
 import os
 import re
+import statistics
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -85,12 +87,92 @@ from sglang.srt.managers.weg2_memory_saver import (
     is_weights_chunk_tag,
     weights_family_tags,
 )
+from sglang.srt.environ import envs
 from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import host_ledger
 
 logger = logging.getLogger("weg2.front")
+
+# ---------------------------------------------------------------------------
+# RC2 BLOCKER A (boot weg2rc2, 2026-09-24 23:18Z): NO IMPORT STARTS INSIDE THE
+# EVENT LOOP, AND NO POOLED CONNECTION OUTLIVES THE GROUPS' KEEP-ALIVE.
+#
+# resolve_x_live imported sglang.srt.weg2.launcher lazily at the first flip's
+# end. That import pulls transformers and the mem_cache stack (6.5-9.6 s
+# measured) and ran ON the loop: the front stood still 5.36 s (WEG2-HOST
+# RATE-GAP gap_s=5.9), P's uvicorn closed the idle pooled connection after its
+# keep-alive (SGLANG_TIMEOUT_KEEP_ALIVE, 5 s), and the after-flip kick sent leg
+# 1 one millisecond after FLIP done -- aiohttp handed out the pooled socket
+# whose FIN the stalled loop had not read yet: `Server disconnected`, HTTP 503
+# for the first LONG request of the boot.
+#
+# Two independent closures, either one alone would have prevented that 503:
+# * the launcher names (and the two small modules the loop path imports
+#   lazily) are loaded ONCE when the Front is built -- main() builds it before
+#   web.run_app starts the loop -- see preload_loop_imports();
+# * the connector reuses a pooled connection only while it is younger than
+#   group_keepalive_s(), below the groups' own server keep-alive. aiohttp checks
+#   that age at REUSE time (connector._get: `t1 - t0 <= keepalive_timeout`), so
+#   it holds even after a stalled loop; the default was 15 s, three times the
+#   server's 5.
+#
+# NO LEG-1 RETRY, deliberately. `Server disconnected` before any response line
+# does not say P never saw the request: uvicorn may have handed it to the
+# tokenizer manager before the connection died, and P dedups a rid only while
+# it is in flight (tokenizer_manager rid_to_state), not after it finished -- a
+# resend could prefill it twice. The flip legs' #1285 retry is safe only
+# because the far side keeps an epoch ledger; leg 1 has none.
+# ---------------------------------------------------------------------------
+#: The launcher's X* solver names, loaded once by preload_loop_imports().
+_X_SOLVER: Optional[Tuple[Any, Any, str]] = None
+#: Loop-path modules imported lazily at their call sites (_d_accepts_leg2 in
+#: the admitter, flip's wake-kv switch): tiny, but a first import is still an
+#: import inside the loop, so they are loaded with the solver.
+LOOP_PATH_LAZY_MODULES = ("sglang.srt.weg2.retain_publish", "sglang.srt.weg2.wake_kv")
+
+
+def x_solver() -> Tuple[Any, Any, str]:
+    """``(derive_x_star, MixedRateUnits, RATE_UNIT_GROUP_THROUGHPUT)``.
+
+    From the launcher, imported ONCE. :meth:`Front.__init__` calls it through
+    :func:`preload_loop_imports`, so on the serving path this is a cache read.
+    """
+    global _X_SOLVER
+    if _X_SOLVER is None:
+        from sglang.srt.weg2.launcher import (
+            RATE_UNIT_GROUP_THROUGHPUT,
+            MixedRateUnits,
+            derive_x_star,
+        )
+        _X_SOLVER = (derive_x_star, MixedRateUnits, RATE_UNIT_GROUP_THROUGHPUT)
+    return _X_SOLVER
+
+
+def preload_loop_imports() -> None:
+    """RC2 Blocker A: every import the serving loop would otherwise start."""
+    x_solver()
+    for name in LOOP_PATH_LAZY_MODULES:
+        importlib.import_module(name)
+
+
+#: The front's pooled keep-alive as a fraction of the groups' server keep-alive.
+#: 0.6 gives 3 s against the default 5 s: the margin covers the gap between the
+#: server starting its idle timer (response sent) and aiohttp starting its own
+#: (connection released after the response was read).
+GROUP_KEEPALIVE_FRACTION = 0.6
+
+
+def group_keepalive_s() -> float:
+    """How long the front may reuse a pooled connection to P or D.
+
+    DERIVED from the groups' own uvicorn keep-alive -- the same accessor
+    http_server passes to uvicorn (``envs.SGLANG_TIMEOUT_KEEP_ALIVE``, default
+    5), read from the same environment the launcher hands both the front and
+    the groups -- so it stays below it if the operator moves it.
+    """
+    return max(0.0, float(envs.SGLANG_TIMEOUT_KEEP_ALIVE.get()) * GROUP_KEEPALIVE_FRACTION)
 
 #: Q0-B: ``/v1/messages`` IS FORWARDED LIKE ``/v1/chat/completions``.  Both
 #: groups serve the Anthropic Messages API natively (measured 2026-09-09 on
@@ -1978,6 +2060,9 @@ class Front:
                  record_line: str = "",
                  d_short_drain_tokens: int = 0,
                  d_hold_s: Optional[float] = None):
+        # RC2 Blocker A: load what the serving loop would otherwise import on
+        # its first flip -- here, before main() hands control to web.run_app.
+        preload_loop_imports()
         # #1275: the key arrives as a PATH, never as an argv value. The groups
         # have no choice (`server_args` offers only `--admin-api-key`, so their
         # key is world-readable in /proc/<pid>/cmdline), but the front does, and
@@ -2634,13 +2719,22 @@ class Front:
     async def startup(self, app):
         # #1285: the trace config is the ONLY way to learn whether a request
         # went out on a pooled connection or a fresh one; it adds two awaits
-        # per request and no behaviour.  The connector stays aiohttp's default
-        # ON PURPOSE in this commit -- changing pooling and instrumenting it in
-        # the same step would leave the boot unable to say which of the two
-        # moved the symptom.
+        # per request and no behaviour.  The connector stayed aiohttp's default
+        # ON PURPOSE in the #1285 commit -- changing pooling and instrumenting
+        # it in the same step would have left the boot unable to say which of
+        # the two moved the symptom.
+        # RC2 Blocker A changes the pooling now, with that instrument in place
+        # (conn=reused/new still on every WEG2-RPC line): the pool never hands
+        # out a connection older than the groups' server keep-alive allows
+        # (group_keepalive_s, 3 s against 5).
+        keepalive_s = group_keepalive_s()
         self.session = ClientSession(timeout=ClientTimeout(total=3600),
-                                     connector=SportTCPConnector(),
+                                     connector=SportTCPConnector(keepalive_timeout=keepalive_s),
                                      trace_configs=[make_rpc_trace_config()])
+        logger.info("WEG2-FRONT POOL keepalive_s=%.1f server_keep_alive_s=%s fraction=%.2f "
+                    "(a pooled connection to P or D is reused only below the groups' own "
+                    "uvicorn keep-alive, SGLANG_TIMEOUT_KEEP_ALIVE; RC2 Blocker A)",
+                    keepalive_s, envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(), GROUP_KEEPALIVE_FRACTION)
         app["controller"] = asyncio.create_task(self.controller())
         app["admitter"] = asyncio.create_task(self.d_admitter())
         app["health"] = asyncio.create_task(self.health_poller())
@@ -5379,13 +5473,10 @@ class Front:
         A missing input is now a named, rate-limited line that says WHICH
         input is missing.
         """
-        import statistics as _st
-
-        from sglang.srt.weg2.launcher import (
-            RATE_UNIT_GROUP_THROUGHPUT,
-            MixedRateUnits,
-            derive_x_star,
-        )
+        # RC2 Blocker A: no import here -- this runs on the event loop at a
+        # flip's end; the names were loaded when the Front was built.
+        _st = statistics
+        derive_x_star, MixedRateUnits, RATE_UNIT_GROUP_THROUGHPUT = x_solver()
 
         s = self._x_samples
         if not (s["r_d"] and s["r_p"] and s["flip_s"]):
