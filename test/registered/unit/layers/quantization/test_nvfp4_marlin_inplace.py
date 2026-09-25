@@ -417,6 +417,25 @@ class TestFlipHooks(CustomTestCase):
         WU._weg2_nvfp4_marlin_after_wake(stub)
         self.assertTrue(torch.equal(l_mar.weight, marlin_bytes))
 
+    def test_a_draft_reloaded_from_disk_keeps_its_own_stamp(self):
+        """The disk refill of the draft goes through the loader, which leaves
+        Marlin content stamped 'marlin'; forcing it 'native' would permute
+        Marlin bytes a second time. The target stays exchange-carried."""
+        _, t_nat = _loaded_layer(Fp4GemmRunnerBackend.CUTLASS, seed=5)
+        _, target = _loaded_layer(Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE, seed=5)
+        _, draft = _loaded_layer(Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE, seed=6)
+        t_marlin, d_marlin = target.weight.clone(), draft.weight.clone()
+        WU, stub = self._stub([target, draft], "exchange")
+        stub.tp_worker.model_runner.model = target
+        stub._weg2_model_for_group = lambda g: draft if g == "D" else target
+        target.weight.data.copy_(t_nat.weight)  # the exchange wrote native bytes
+        target.weight_scale.data.copy_(t_nat.weight_scale)
+        stub._weg2_nvfp4_draft_disk_reloaded = True
+        WU._weg2_nvfp4_marlin_after_wake(stub)
+        self.assertTrue(torch.equal(target.weight, t_marlin))
+        self.assertTrue(torch.equal(draft.weight, d_marlin))  # untouched
+        self.assertFalse(stub._weg2_nvfp4_draft_disk_reloaded)  # read-and-clear
+
     def test_no_flagged_layer_is_a_no_op(self):
         _, l_nat = _loaded_layer(Fp4GemmRunnerBackend.CUTLASS)
         before = l_nat.weight.clone()

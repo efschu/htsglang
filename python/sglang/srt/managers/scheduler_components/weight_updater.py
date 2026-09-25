@@ -2237,6 +2237,10 @@ class SchedulerWeightUpdaterManager:
                 "pages are committed but their content is undefined; this "
                 "group is fatal."
             )
+        # #38 L8: the draft's NVFP4 bytes came from the loader (which stamps
+        # them itself), not from the exchange -- the after-wake hook must not
+        # re-stamp them native.
+        self._weg2_nvfp4_draft_disk_reloaded = True
         return True
 
     def _weg2_xchg_inject_from_peer(self, *, terms, tag=None, **kw) -> bool:
@@ -5998,12 +6002,19 @@ class SchedulerWeightUpdaterManager:
         from sglang.srt.layers.quantization import nvfp4_marlin_inplace as mi
 
         models = self._weg2_wake_models()
+        draft_reloaded = bool(getattr(self, "_weg2_nvfp4_draft_disk_reloaded", False))
+        self._weg2_nvfp4_draft_disk_reloaded = False  # read-and-clear, per wake
         if not mi.flagged_layers(models):
             return
-        mi.model_to_marlin(
-            models,
-            delivered_native=self._weg2_wake_weight_carrier() == self.CARRIER_EXCHANGE,
-        )
+        exchanged = self._weg2_wake_weight_carrier() == self.CARRIER_EXCHANGE
+        target = getattr(getattr(getattr(self, "tp_worker", None), "model_runner", None), "model", None)
+        draft = self._weg2_model_for_group("D")
+        for m in models:
+            # The draft reloaded from disk went through the loader, whose
+            # prepare_layer stamps the truth; everything else the exchange
+            # carried is native whatever its stamp said.
+            native = exchanged and not (draft_reloaded and m is draft and m is not target)
+            mi.model_to_marlin([m], delivered_native=native)
 
     def _weg2_wake_models(self) -> list:
         """Every model this rank computes with after a wake -- the TARGET

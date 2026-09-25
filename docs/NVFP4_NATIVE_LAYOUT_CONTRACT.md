@@ -382,8 +382,10 @@ Marlin). Das hängt am FlashInfer-Upgrade (Strang F); Fs Kernelwahl ist eingehä
 **In-place-Umformung** (`nvfp4_marlin_inplace.py`):
 - Gleiche Bytezahl: `weight` u8 [N,K/2] ↔ int32 [K/16,2R] je Band; `weight_scale` e4m3 [N,K/16] (128x4) ↔ fp8 [K/16,R].
   Parameter-Objekte, Shapes, dtypes und Storages bleiben; Tausch, Join, CUDA-Graphen und Coverage sehen die native Menge.
-- N-Bänder: R Vielfaches von 128, Band ≤ 16 MiB (`SGLANG_FP4_NATIVE_MIXED_BAND_MIB`), K-Schritte ≤ 2 MiB
-  (`..._CHUNK_MIB`). Arbeitsmenge je Schritt ≤ Band + 6 Schritte = 28 MiB. KEINE Reserve (keine-korridor-reserve-nie).
+- N-Bänder: R Vielfaches von 128, Band ≤ 24 MiB (`SGLANG_FP4_NATIVE_MIXED_BAND_MIB`), K-Schritte ≤ 1 MiB
+  (`..._CHUNK_MIB`). Arbeitsmenge je Schritt ≤ Band + 6 Schritte = 30 MiB, gemessen ≤ 27,3 MiB. KEINE Reserve.
+  (16/2 kostete am Metall P.gate_up M=512 +22 % Marlin-Zeit: Marlin-Effizienz hängt an der Bandbreite N; 24 MiB gibt
+  P.gate_up 4 Bänder à 8704 Zeilen, +1,5 %.)
 - GEMM je Band (`apply_fp4_marlin_linear`), Ausgaben entlang N verkettet (exakt, keine Reduktion über N).
 - Skalen: `nvfp4_marlin_process_scales` ist für E4M3 ≥ 0 verlustfrei und umkehrbar; negative Skalen werden beim Laden
   verweigert.
@@ -414,3 +416,21 @@ kleiner, 262k passt dann erst recht. Der Unterschied W4A16 gegen W4A8 in P ist ~
 Bis dahin bleibt FP8 auf allen Karten Marlin W8A16 (`--fp8-uniform-marlin`): **OFFEN**. Wird die 5090 FP8-nativ,
 braucht die 3080 vermutlich dieselbe In-place-Behandlung für ihre FP8-Marlin-Gewichte (FP8-Marlin dürfte ebenfalls eine
 Permutation gleicher Bytezahl sein; NICHT geprüft, eigene Aufgabe).
+
+### 13a. GPU-Mikrotest hcfd7c (25.09. 14:08–14:14Z, RC8 0f98d61095, venv-fi-next, 3080 = NVML 0, 5090 = NVML 1)
+
+MESSUNG. Rohdaten /spinning/evidence-665-f1/n4c_micro_0925/ (micro_3080.json, micro_5090.json, band_sweep_3080.json,
+b24c1_3080.jsonl), Skript benchmark/nvfp4_native/n4c_micro.py.
+- Rundlauf native→Marlin→native byte-gleich auf allen 8 27B-Shapes, beide Karten; `gptq_marlin_repack` byte-gleich zur
+  torch-Referenz (jedes Band); Skalen voller E4M3-Bereich byte-gleich.
+- Band-Apply gegen unzerteilt: NICHT bitgleich, sobald >1 Band (Marlin partitioniert die K-Reduktion nach N), Abweichung
+  ≤ 1 bf16-ulp (max 0,0156–0,0625 bei |y| 4–9); 1 Band bitgleich.
+- 3080, Band 24 / Schritt 1 (Default): to_marlin / to_native ms — D.gate_up 1,81/2,83, D.down 0,93/1,66, D.lm_head
+  14,9/28,3, P.gate_up 6,44/12,2, P.down 3,31/6,20, P.lm_head 45,3/89,0; Spitze ≤ 27,3 MiB. Apply M=512: P.gate_up 3280 µs
+  (unzerteilt 3231), P.down 1613 (1655), D.gate_up 794 (810).
+- Je 3080 und Flip damit (Rechnung aus den Kernzeiten): D-Seite to_marlin ~190 ms, to_native ~320 ms; P-Seite (7 Schichten)
+  ~70/130 ms, letzte Stufe + lm_head ~115/220 ms. Ein Flip kostet ~0,3–0,4 s zusätzlich (+8–12 % auf 3,1–4,0 s).
+  Hebel: fusionierter Rückweg-Kern (to_native ist das reine torch und doppelt so teuer wie to_marlin).
+- 5090, Fs Hook (cute-dsl-native W4A16) gegen W4A4, CUDA-Graph: D.gate_up M=1 24,7 gegen 53,3 µs, M=8 28,7 gegen 59,4;
+  D.down M=1 12,6 gegen 32,9, M=8 14,5 gegen 32,9. Fehler gegen fp32-Dequant-Referenz: W4A16 0,17 %, W4A4 9,6 %
+  (Aktivierungs-FP4). Unzerteiltes Marlin auf der 5090 zum Vergleich: D.gate_up M=1 18,5 µs, D.down 12,5 µs.

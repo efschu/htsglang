@@ -76,8 +76,8 @@ BANDS_ATTR = "_nvfp4_marlin_bands"
 GSCALE_PARAM = "weight_global_scale_w4a16"
 
 MIB = 1 << 20
-_DEF_BAND_MIB = 16
-_DEF_CHUNK_MIB = 2
+_DEF_BAND_MIB = 24
+_DEF_CHUNK_MIB = 1
 
 SF_TILE_ROWS = 128
 MARLIN_TILE_K = 16
@@ -500,7 +500,9 @@ def prepare_layer(layer, *, repack: Optional[RepackFn] = None, make_workspace: b
         )
     setattr(layer, BANDS_ATTR, band_table(n, k))
     setattr(layer, LAYER_FLAG, True)
-    if make_workspace:
+    if make_workspace and getattr(layer, "workspace", None) is None:
+        # Once per layer: a reload (draft disk refill) keeps the workspace a
+        # captured CUDA graph already addresses.
         from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
         layer.workspace = marlin_make_workspace(layer.weight.device)
