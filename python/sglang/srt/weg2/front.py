@@ -2309,6 +2309,9 @@ class Front:
         #: X_SOLO_WINDOW_S holding its seat), and the time of the last arrival.
         self._x_windows = 0
         self._x_last_arrival = 0.0
+        #: Review V (3): rid -> (X applied, D busy) of each SHORT grant, popped
+        #: by that rid's leg 2, which prices the REALISED extent against it.
+        self._x_grants: Dict[str, Tuple[int, bool]] = {}
         # C7/R-5: the SAME break-even quantity at aggregate granularity --
         # the D->P departure latch.  Defaults to X because it IS X.
         self.flip_min_work_tokens = (
@@ -3649,6 +3652,8 @@ class Front:
                               "within_x_busy" if seat is not None else
                               ("d_budget" if refused else "seat_refused"),
                               d_busy, x_idle if why is None else x_busy, 0)
+            if seat is not None:
+                self._note_x_grant(rid, x_idle if why is None else x_busy, d_busy)
             return seat
         if why is not None:
             deferred.append(why)
@@ -3663,6 +3668,15 @@ class Front:
         t_w = time.time()
         try:
             await asyncio.sleep(x_solo_window_s())
+        except BaseException:
+            # Review V A1: the window holds a D SEAT across an await. A cancel
+            # here (the client disconnected, the handler task was cancelled)
+            # left it taken forever: `_handoff_in_flight()` >= 1 for good, so
+            # the controller never saw D at rest and never flipped D->P again
+            # -- a wedge. The seat goes back on EVERY abnormal exit of the
+            # window; the normal exit keeps it for the grant below.
+            seat.release("x_solo_cancel")
+            raise
         finally:
             self._x_windows -= 1
         waited_ms = int((time.time() - t_w) * 1000)
@@ -3677,7 +3691,36 @@ class Front:
                               x_busy, waited_ms)
             return None
         self._x_solo_line(rid, uncached, "d", "solo", False, x_idle, waited_ms)
+        self._note_x_grant(rid, x_idle, False)
         return seat
+
+    def _note_x_grant(self, rid: str, x_applied: int, busy: bool) -> None:
+        """Review V (3): remember the X a SHORT grant was decided on, for leg 2."""
+        grants = self.__dict__.setdefault("_x_grants", {})
+        grants[rid] = (int(x_applied), bool(busy))
+        while len(grants) > 1024:  # bounded: every grant's leg 2 pops its own
+            grants.pop(next(iter(grants)))
+
+    def _note_x_grant_realized(self, rid: str, grant: Optional[Tuple[int, bool]],
+                               pt: int, ct: int) -> None:
+        """Review V (3): the X_busy OVERRUN, counted and named.
+
+        A SHORT granted while D decoded others (busy=1) on the front's
+        ESTIMATE <= X_busy, whose REALISED uncached extent (D's own usage,
+        prompt - cached) exceeded that X_busy: the running decodes stalled
+        longer than X_busy allows. The grant cannot be undone -- this makes the
+        estimator's miss visible (counter ``x_busy_overrun``, one line)."""
+        if grant is None or not pt:
+            return
+        x_applied, busy = grant
+        unc = max(0, int(pt) - int(ct))
+        if busy and unc > int(x_applied):
+            self.counters["x_busy_overrun"] += 1
+            logger.warning(
+                "WEG2 X-BUSY-OVERRUN rid=%s uncached=%d x_applied=%d busy=1 over=%d (granted on the "
+                "front's estimate within X_busy while D decoded others; D prefilled more, so the "
+                "running decodes stalled longer than X_busy allows -- counted, the grant stands)",
+                rid, unc, int(x_applied), unc - int(x_applied))
 
     def _x_idle_regrant(self, now: float) -> str:
         """RC7-X (a): serve a DEFERRED backlog on D once D is idle and quiet.
@@ -4042,6 +4085,9 @@ class Front:
         _solo_adm0 = self._d_admissions
         _solo_entry = len(g.outstanding) == 1
         t0 = time.time()
+        # Review V (3): the X this rid's SHORT grant was decided on (None for a
+        # BATCH / re-granted / re-queued leg 2 -- no front estimate to audit).
+        _x_grant = self.__dict__.get("_x_grants", {}).pop(rid, None)
 
         def _sample_r_d(pt: int, ct: int, comp: int, verdict: str, dterms: dict) -> None:
             """RC7-X: #1271 (b)'s r_D sample, on BOTH wire shapes (it used to
@@ -4211,6 +4257,7 @@ class Front:
                                 dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
                     if r.status == 200 and priced and not x_inband:
                         _sample_r_d(pt, ct, comp, verdict, dterms)
+                        self._note_x_grant_realized(rid, _x_grant, pt, ct)
                     if pending is not None and ct > 0:
                         self.counters["cross_group_prefix_hits"] += 1
                     return resp
@@ -4275,6 +4322,7 @@ class Front:
                 # refusal body is no prefill.
                 if r.status == 200:
                     _sample_r_d(pt, ct, comp, verdict, dterms)
+                    self._note_x_grant_realized(rid, _x_grant, pt, ct)
                 if pt:
                     # #1324, as on the streamed branch above: `ct` is the
                     # measured presence, `pt` the tokenisation fact. On a W31
@@ -4555,6 +4603,16 @@ class Front:
         else:
             p.fut = asyncio.get_event_loop().create_future()
             p.t_arrive = time.time()
+        # Review V A2: THE BACKLOG IS PRICED AT D's MEASURED EXTENT when D said
+        # it. D refused because its extent after match_prefix exceeded its
+        # riegel; the char estimate above can sit BELOW the live X (and so
+        # below flip_min_work_tokens, which follows X) -- FLIP-ECONOMICS then
+        # held the request on an idle D until the fairness bound (45 s), and
+        # the re-grant cannot take it (d_eligible False: it is P's). A
+        # measurement only ever RAISES the price; an unparsed refusal keeps
+        # the estimate (never a number invented here).
+        if d_extent is not None and int(d_extent) > int(p.est_uncached):
+            p.est_uncached = int(d_extent)
         if seat is not None:
             seat.release("W50_requeue")
         p.seat = None

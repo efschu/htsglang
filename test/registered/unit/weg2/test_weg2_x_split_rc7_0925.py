@@ -328,14 +328,18 @@ class FakeD:
         self.url = str(self.server.make_url("")).rstrip("/")
 
 
-async def _probe(stream, publish="rid", n=1):
+async def _probe(stream, publish="rid", n=1, busy=False, prompt=None, cached=None):
     d = FakeD(publish=publish)
+    if prompt is not None:
+        d.PROMPT, d.CACHED = prompt, cached
     await d.start()
     f = front_mod.Front(
         prefill="http://127.0.0.1:9", decode=d.url, awake="D", tag="rc7x", store_dir="/tmp",
         prefill_sid=0, decode_sid=0, dc_reserve={}, w_s=45.0,
         tp_prefill_max_tokens=X_IDLE, x_ceiling_tokens=CEIL, d_admit_max_tokens=0)
     f.session = ClientSession(timeout=ClientTimeout(total=30))
+    if busy:  # D decodes another request (Review V (3))
+        f.groups["D"].outstanding["decoding-other"] = time.time()
     app = web.Application()
     app.router.add_post("/v1/chat/completions", f.handle_generate)
     srv = TestServer(app)
@@ -778,6 +782,138 @@ class LauncherFrontSeam(CustomTestCase):
         self.assertEqual(L.resolve_x_ceiling(CEIL, 4096, 0)[0], CEIL, "x_busy 0 is legal")
         src = inspect.getsource(L.main)
         self.assertIn("log(x_ceiling_provenance)", src)
+
+
+# ===========================================================================
+# Review V (2026-09-25 ~08:20Z): A1, A2, (3)
+# ===========================================================================
+
+
+class ReviewA1TheWindowNeverLeaksItsSeat(CustomTestCase):
+    """A1: the singleton window holds a D seat across an await. Cancelled there
+    (client gone), the seat stayed taken -- `_handoff_in_flight()` >= 1 for
+    good, D never at rest, no D->P flip again (V-1 measured (1, 1))."""
+
+    def test_a_cancel_inside_the_window_gives_the_seat_back(self):
+        async def body():
+            f = _front()
+            task = asyncio.create_task(_arrive(f, "lone", 8000))
+            for _ in range(200):
+                if f._x_windows:
+                    break
+                await asyncio.sleep(0.005)
+            opened = (f._x_windows, f._seats_in_use())
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return opened, (f._seats_in_use(), f._handoff_in_flight(), f._x_windows)
+
+        opened, after = asyncio.run(body())
+        self.assertEqual(opened, (1, 1), "the window holds its seat while open")
+        self.assertEqual(after, (0, 0, 0), "V-1: (seats_in_use, handoff) stayed (1, 1)")
+
+    def test_the_normal_exit_keeps_the_seat_for_the_grant(self):
+        async def body():
+            f = _front()
+            seat, _ = await _arrive(f, "lone", 8000)
+            return seat.held, f._seats_in_use()
+
+        self.assertEqual(asyncio.run(body()), (True, 1))
+
+    def test_after_the_cancel_the_idle_d_flips_again(self):
+        async def body():
+            f = _front(idle_layout="P")
+            task = asyncio.create_task(_arrive(f, "lone", 8000))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return await _run_controller(f, lambda s: "flip" in s, 1.0)
+
+        seen = asyncio.run(body())
+        self.assertIn("flip", seen, "a leaked seat would hold D awake forever")
+        self.assertEqual(seen["flip"][:2], ("D", "P"))
+
+
+class ReviewA2RequeuePricedAtDsExtent(CustomTestCase):
+    """A2: a SHORT D refused (W50) is re-queued for P priced at D's MEASURED
+    extent, not at the char estimate that let it through (V-5: est 9000 < X =
+    min_work 10000 -> held on an idle D until the fairness bound)."""
+
+    W50 = (b'{"error": {"message": "W50 Weg2TpPrefillExceeded: this group may prefill at '
+           b'most 12288 uncached tokens itself (--tp-prefill-max-tokens); this request\'s '
+           b'extent after prefix matching is 13000. Refused by name so the caller re-routes '
+           b'it through the prefill group -- never prefilled here silently."}}')
+
+    def _requeue(self, body):
+        async def run():
+            f = _front()  # X = 10000, flip_min_work_tokens follows X
+            req = types.SimpleNamespace(path="/v1/chat/completions")
+            text = "w" * 27000  # char estimate 27000 // 3 + 1 = 9001 < X
+            task = asyncio.create_task(
+                f._requeue_after_x_refusal(req, "weg2-1-1", {}, text, False, None, None, body))
+            for _ in range(200):
+                if f.queue:
+                    break
+                await asyncio.sleep(0.005)
+            est = f.queue[0].est_uncached
+            seen = await _run_controller(f, lambda s: "flip" in s, 1.0)
+            await _cancel(task)
+            return est, seen
+
+        return asyncio.run(run())
+
+    def test_with_ds_extent_the_backlog_is_worth_its_flip(self):
+        est, seen = self._requeue(self.W50)
+        self.assertEqual(est, 13000)
+        self.assertIn("flip", seen, "13000 >= min_work 10000 on an idle D: P prefills it now")
+        self.assertEqual(seen["flip"][:2], ("D", "P"))
+
+    def test_without_a_parsed_extent_the_estimate_stands(self):
+        est, seen = self._requeue(b'{"error": "W50 Weg2TpPrefillExceeded"}')
+        self.assertEqual(est, 9001, "no measurement, no invented number")
+        self.assertNotIn("flip", seen)
+
+    def test_a_measurement_never_lowers_the_price(self):
+        body = self.W50.replace(b"is 13000", b"is 5000")
+        est, _ = self._requeue(body)
+        self.assertEqual(est, 9001)
+
+
+class ReviewX3BusyOverrunIsCounted(CustomTestCase):
+    """(3): a SHORT granted within X_busy while D decoded others (busy=1), whose
+    REALISED uncached exceeded X_busy -> counter x_busy_overrun + one line."""
+
+    def _run(self, **kw):
+        async def body():
+            with self.assertLogs("weg2.front", level="INFO") as cm:
+                f, res = await _probe(**kw)
+            return f, res, [ln for ln in cm.output if "WEG2 X-BUSY-OVERRUN" in ln]
+
+        return asyncio.run(body())
+
+    def test_busy_grant_that_prefilled_more_than_x_busy_is_counted_both_wire_shapes(self):
+        for stream in (False, True):
+            f, res, lines = self._run(stream=stream, busy=True)  # est ~1k, realised 8000
+            self.assertTrue(all(s == 200 for s, _ in res), res)
+            self.assertEqual(f.counters["x_busy_overrun"], 1, stream)
+            self.assertEqual(len(lines), 1, lines)
+            self.assertIn("uncached=8000 x_applied=4096 busy=1 over=3904", lines[0])
+            self.assertEqual(f._x_grants, {}, "the grant record is consumed by its leg 2")
+
+    def test_busy_grant_within_x_busy_is_not(self):
+        f, res, lines = self._run(stream=False, busy=True, prompt=3000, cached=0)
+        self.assertEqual((f.counters["x_busy_overrun"], lines), (0, []))
+
+    def test_idle_grant_is_not_an_x_busy_overrun(self):
+        # realised 12000 > X_busy AND > X_idle, but D decoded nobody: no stall
+        f, res, lines = self._run(stream=False, busy=False, prompt=12000, cached=0)
+        self.assertTrue(all(s == 200 for s, _ in res), res)
+        self.assertEqual((f.counters["x_busy_overrun"], lines), (0, []))
 
 
 class StoreShortTailStaysAtTheLaunchX(CustomTestCase):
