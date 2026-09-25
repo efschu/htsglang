@@ -154,6 +154,50 @@ def allocate_pool_tables(
     )
 
 
+def plan_width_for(max_step_ids: Optional[int]) -> int:
+    """H91b: the step buffers' width (the kernel's ``WIDTH`` constexpr, a
+    power of two) for the widest captured step. One bs1 MTP verify routes
+    4 rows x top-10 = 40 ids and fits the historic 64; bs2 routes 80 and needs
+    128. Never below ``PLAN_WIDTH``, so a bs1 form keeps its exact width (and
+    its kernel)."""
+    if max_step_ids is None or int(max_step_ids) <= PLAN_WIDTH:
+        return PLAN_WIDTH
+    return _next_power_of_two(int(max_step_ids))
+
+
+def pool_max_step_ids(
+    *,
+    graph_bs: Optional[Sequence[int]],
+    max_graph_bs: Optional[int],
+    max_running: Optional[int],
+    verify_tokens: Optional[int],
+    top_k: Optional[int],
+) -> Optional[int]:
+    """The widest step a captured decode graph can route: the largest captured
+    batch x the rows each request carries (the MTP verify window, else 1) x
+    top_k. ``None`` when top_k is unknown (the caller keeps ``PLAN_WIDTH``)."""
+    if not top_k:
+        return None
+    if graph_bs:
+        bs = max(int(b) for b in graph_bs)
+    elif max_graph_bs:
+        bs = int(max_graph_bs)
+    elif max_running:
+        bs = int(max_running)
+    else:
+        return None
+    return int(bs) * max(1, int(verify_tokens or 1)) * int(top_k)
+
+
+def step_row_demand(n_ids: int, num_experts: int, n_resident: int) -> int:
+    """H91b: the rows one step can demand beyond the residents -- the Task #40
+    bound, tightened by the fact that a step can touch at most every
+    NON-resident expert once: ``min(ids, E - R)``. With scratch clamped to
+    ``E - R`` (every non-resident expert has a row) the old ``ids``-only form
+    refused steps that cannot overflow."""
+    return int(min(int(n_ids), max(int(num_experts) - int(n_resident), 0)))
+
+
 def allocate_step_buffers(device, num_experts: int, width: int = PLAN_WIDTH) -> StepBuffers:
     import torch
 
@@ -465,7 +509,9 @@ def step_reference(
     raw = [int(v) for v in ids.reshape(-1).tolist()]
     if len(raw) > buffers.gather_src.shape[0]:
         raise ValueError("Step ids exceed the plan width")
-    if len(raw) > (tables.pool_rows - tables.lru_start) + len(staging_rows):
+    if step_row_demand(len(raw), E, tables.lru_start) > (
+        tables.pool_rows - tables.lru_start
+    ) + len(staging_rows):
         # Overflow-impossible bound (Task #40): a miss takes an LRU victim
         # (rows not used this step) or a staging row; hits protect at most
         # `len(raw)` LRU rows, so victims + staging >= lru + staging - hits
@@ -613,7 +659,9 @@ def step(tables: PoolTables, ids, buffers: StepBuffers, prefetch: bool = False) 
     n_staging = int(tables.staging_rows.shape[0])
     if flat.numel() > width:
         raise ValueError("Step ids exceed the plan width")
-    if flat.numel() > (tables.pool_rows - tables.lru_start) + n_staging:
+    if step_row_demand(flat.numel(), tables.num_experts, tables.lru_start) > (
+        tables.pool_rows - tables.lru_start
+    ) + n_staging:
         raise ValueError("Step ids exceed the LRU rows plus the staging rows")
     _step_kernel()[(1,)](
         flat, flat.numel(),
@@ -890,6 +938,7 @@ def _copy_kernel():
 __all__ = [
     "PLAN_WIDTH", "ROW_USE_NEVER", "PoolTables", "StepBuffers", "SyncReport",
     "allocate_pool_tables", "allocate_step_buffers", "copy_rows",
+    "plan_width_for", "pool_max_step_ids", "step_row_demand",
     "bijection_breaks", "copy_rows_reference", "seed_lru_rows", "step", "step_reference", "sync_tables",
     "take_report",
     "take_prefetch_report",
