@@ -147,6 +147,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.decode_host_split import (
     note_span as _h58_span,
 )
+from sglang.srt.models.qwen4_exp_ple_fp8 import ple_fp8_bytes_to_bf16, ple_fp8_decode_arg
 from sglang.srt.models.qwen4_exp_ple_prefetch import (
     PleHashParams,
     PlePreadProcs,
@@ -300,13 +301,16 @@ def _gather_ple_embedding_staged_kernel(
     tp_vocab_end,
     is_fp8: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    FP8_DECODE: tl.constexpr = 3,
 ):
     """``_gather_ple_embedding_from_shards_kernel`` with a stage in front:
     row ``r`` comes from ``stage_rows[r]`` when ``stage_ids[r]`` is its id,
     else from the table (HMM). ``stage_addrs_ptr`` = [host address of the
     stage ids, host address of the stage rows] (fixed for the process, like
     the table's shard bases), ``counters_ptr`` = [in-range rows, rows taken
-    from the stage]."""
+    from the stage]. FP8_DECODE (H68d, qwen4_exp_ple_fp8.py): 3 = native
+    fp8e4nv (sm90+; this branch and the bf16 one are the pre-H68d code),
+    0..2 = table AND stage bytes decoded in the kernel."""
     row_id = tl.program_id(0)
     global_idx = tl.load(ids_ptr + row_id).to(tl.int64)
     in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
@@ -321,21 +325,35 @@ def _gather_ple_embedding_staged_kernel(
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < embedding_dim
     if is_fp8:
-        weight_ptr = base.to(tl.pointer_type(tl.float8e4nv))
-        stage_ptr = stage_rows_addr.to(tl.pointer_type(tl.float8e4nv))
+        if FP8_DECODE == 3:
+            weight_ptr = base.to(tl.pointer_type(tl.float8e4nv))
+            stage_ptr = stage_rows_addr.to(tl.pointer_type(tl.float8e4nv))
+        else:
+            weight_ptr = base.to(tl.pointer_type(tl.uint8))
+            stage_ptr = stage_rows_addr.to(tl.pointer_type(tl.uint8))
     else:
         weight_ptr = base.to(tl.pointer_type(tl.bfloat16))
         stage_ptr = stage_rows_addr.to(tl.pointer_type(tl.bfloat16))
-    from_table = tl.load(
-        weight_ptr + local * embedding_dim + offsets,
-        mask=mask & in_range & (~hit),
-        other=0.0,
-    ).to(tl.bfloat16)
-    from_stage = tl.load(
-        stage_ptr + row_id * embedding_dim + offsets,
-        mask=mask & hit,
-        other=0.0,
-    ).to(tl.bfloat16)
+    if is_fp8 and FP8_DECODE != 3:
+        from_table = ple_fp8_bytes_to_bf16(
+            tl.load(weight_ptr + local * embedding_dim + offsets, mask=mask & in_range & (~hit), other=0),
+            FP8_DECODE,
+        )
+        from_stage = ple_fp8_bytes_to_bf16(
+            tl.load(stage_ptr + row_id * embedding_dim + offsets, mask=mask & hit, other=0),
+            FP8_DECODE,
+        )
+    else:
+        from_table = tl.load(
+            weight_ptr + local * embedding_dim + offsets,
+            mask=mask & in_range & (~hit),
+            other=0.0,
+        ).to(tl.bfloat16)
+        from_stage = tl.load(
+            stage_ptr + row_id * embedding_dim + offsets,
+            mask=mask & hit,
+            other=0.0,
+        ).to(tl.bfloat16)
     values = tl.where(hit, from_stage, from_table)
     tl.store(
         output_ptr + row_id * embedding_dim + offsets,
@@ -425,12 +443,14 @@ def _gather_ple_embedding_gated_kernel(
     tp_vocab_end,
     is_fp8: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    FP8_DECODE: tl.constexpr = 3,
 ):
     """fnFL2 H69: :func:`_gather_ple_embedding_staged_kernel` behind the gate.
     The stage is read only when ``go_ptr`` (written by
     :func:`_ple_stage_gate_kernel` just before, same stream) says the host
     finished this round; otherwise every row comes from the table (HMM) and
-    the stage -- which the host may still be writing -- is not touched."""
+    the stage -- which the host may still be writing -- is not touched.
+    FP8_DECODE as in the staged kernel (H68d)."""
     row_id = tl.program_id(0)
     global_idx = tl.load(ids_ptr + row_id).to(tl.int64)
     in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
@@ -448,21 +468,35 @@ def _gather_ple_embedding_gated_kernel(
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < embedding_dim
     if is_fp8:
-        weight_ptr = base.to(tl.pointer_type(tl.float8e4nv))
-        stage_ptr = stage_rows_addr.to(tl.pointer_type(tl.float8e4nv))
+        if FP8_DECODE == 3:
+            weight_ptr = base.to(tl.pointer_type(tl.float8e4nv))
+            stage_ptr = stage_rows_addr.to(tl.pointer_type(tl.float8e4nv))
+        else:
+            weight_ptr = base.to(tl.pointer_type(tl.uint8))
+            stage_ptr = stage_rows_addr.to(tl.pointer_type(tl.uint8))
     else:
         weight_ptr = base.to(tl.pointer_type(tl.bfloat16))
         stage_ptr = stage_rows_addr.to(tl.pointer_type(tl.bfloat16))
-    from_table = tl.load(
-        weight_ptr + local * embedding_dim + offsets,
-        mask=mask & in_range & (~hit),
-        other=0.0,
-    ).to(tl.bfloat16)
-    from_stage = tl.load(
-        stage_ptr + row_id * embedding_dim + offsets,
-        mask=mask & hit,
-        other=0.0,
-    ).to(tl.bfloat16)
+    if is_fp8 and FP8_DECODE != 3:
+        from_table = ple_fp8_bytes_to_bf16(
+            tl.load(weight_ptr + local * embedding_dim + offsets, mask=mask & in_range & (~hit), other=0),
+            FP8_DECODE,
+        )
+        from_stage = ple_fp8_bytes_to_bf16(
+            tl.load(stage_ptr + row_id * embedding_dim + offsets, mask=mask & hit, other=0),
+            FP8_DECODE,
+        )
+    else:
+        from_table = tl.load(
+            weight_ptr + local * embedding_dim + offsets,
+            mask=mask & in_range & (~hit),
+            other=0.0,
+        ).to(tl.bfloat16)
+        from_stage = tl.load(
+            stage_ptr + row_id * embedding_dim + offsets,
+            mask=mask & hit,
+            other=0.0,
+        ).to(tl.bfloat16)
     values = tl.where(hit, from_stage, from_table)
     tl.store(
         output_ptr + row_id * embedding_dim + offsets,
@@ -942,6 +976,7 @@ class PleDecodeStager:
             tp_vocab_end=vocab_end,
             is_fp8=table.dtype == torch.float8_e4m3fn,
             BLOCK_D=block_d,
+            FP8_DECODE=ple_fp8_decode_arg(table.dtype, flat_ids.device),
         )
         return True
 
@@ -974,6 +1009,7 @@ class PleDecodeStager:
             tp_vocab_end=vocab_end,
             is_fp8=table.dtype == torch.float8_e4m3fn,
             BLOCK_D=block_d,
+            FP8_DECODE=ple_fp8_decode_arg(table.dtype, flat_ids.device),
         )
 
     # -- the gate (fnFL2 H69) ----------------------------------------------------

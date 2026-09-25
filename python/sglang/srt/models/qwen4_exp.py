@@ -214,6 +214,7 @@ from sglang.srt.models.qwen4_exp_ple_prefetch import (
     ple_next_chunk_hasher,
 )
 from sglang.srt.models.qwen4_exp_ple_decode_pread import make_ple_decode_stager
+from sglang.srt.models.qwen4_exp_ple_fp8 import ple_fp8_bytes_to_bf16, ple_fp8_decode_arg
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, logger
 
@@ -952,7 +953,11 @@ def _gather_ple_embedding_from_pinned_kernel(
     tp_vocab_end,
     is_fp8: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    FP8_DECODE: tl.constexpr = 3,
 ):
+    # H68d: FP8_DECODE (qwen4_exp_ple_fp8.py) -- 3 = the native fp8e4nv
+    # pointer (sm90+; this branch and the bf16 one are the pre-H68d code),
+    # 0..2 = uint8 bytes decoded in the kernel (sm86: no fp8e4nv there)
     row_id = tl.program_id(0)
     global_idx = tl.load(ids_ptr + row_id)
     in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
@@ -960,14 +965,23 @@ def _gather_ple_embedding_from_pinned_kernel(
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < embedding_dim
     if is_fp8:
-        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+        if FP8_DECODE == 3:
+            weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+        else:
+            weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
     else:
         weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
-    values = tl.load(
-        weight_ptr + local_idx * embedding_dim + offsets,
-        mask=mask,
-        other=0.0,
-    ).to(tl.bfloat16)
+    if is_fp8 and FP8_DECODE != 3:
+        values = ple_fp8_bytes_to_bf16(
+            tl.load(weight_ptr + local_idx * embedding_dim + offsets, mask=mask, other=0),
+            FP8_DECODE,
+        )
+    else:
+        values = tl.load(
+            weight_ptr + local_idx * embedding_dim + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.bfloat16)
     tl.store(
         output_ptr + row_id * embedding_dim + offsets,
         tl.where(in_range, values, 0.0),
@@ -986,10 +1000,12 @@ def _gather_ple_embedding_from_shards_kernel(
     tp_vocab_end,
     is_fp8: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    FP8_DECODE: tl.constexpr = 3,
 ):
     """Same gather as the pinned kernel, but the table is a list of shard
     base pointers (read-only mmaps of the checkpoint files): global row ->
-    (row // shard_rows, row % shard_rows)."""
+    (row // shard_rows, row % shard_rows). FP8_DECODE as in the pinned
+    kernel (H68d)."""
     row_id = tl.program_id(0)
     global_idx = tl.load(ids_ptr + row_id).to(tl.int64)
     in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
@@ -1000,14 +1016,23 @@ def _gather_ple_embedding_from_shards_kernel(
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < embedding_dim
     if is_fp8:
-        weight_ptr = base.to(tl.pointer_type(tl.float8e4nv))
+        if FP8_DECODE == 3:
+            weight_ptr = base.to(tl.pointer_type(tl.float8e4nv))
+        else:
+            weight_ptr = base.to(tl.pointer_type(tl.uint8))
     else:
         weight_ptr = base.to(tl.pointer_type(tl.bfloat16))
-    values = tl.load(
-        weight_ptr + local * embedding_dim + offsets,
-        mask=mask,
-        other=0.0,
-    ).to(tl.bfloat16)
+    if is_fp8 and FP8_DECODE != 3:
+        values = ple_fp8_bytes_to_bf16(
+            tl.load(weight_ptr + local * embedding_dim + offsets, mask=mask, other=0),
+            FP8_DECODE,
+        )
+    else:
+        values = tl.load(
+            weight_ptr + local * embedding_dim + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.bfloat16)
     tl.store(
         output_ptr + row_id * embedding_dim + offsets,
         tl.where(in_range, values, 0.0),
@@ -1219,6 +1244,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 tp_vocab_end=self.shard_indices.org_vocab_end_index,
                 is_fp8=table.dtype == torch.float8_e4m3fn,
                 BLOCK_D=self._block_d,
+                FP8_DECODE=ple_fp8_decode_arg(table.dtype, flat_ids.device),
             )
             return output
         if flat_ids.numel():
@@ -1237,6 +1263,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 tp_vocab_end=self.shard_indices.org_vocab_end_index,
                 is_fp8=self.weight.dtype == torch.float8_e4m3fn,
                 BLOCK_D=self._block_d,
+                FP8_DECODE=ple_fp8_decode_arg(self.weight.dtype, flat_ids.device),
             )
         return output
 

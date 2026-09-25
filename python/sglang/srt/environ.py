@@ -832,6 +832,16 @@ class Envs:
     # numerics back to P's model and triples D's staged PLE rows per round
     # (21 -> 64 at bs 1). Off = the pre-H69b layout, byte-identical.
     SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB = EnvBool(False)
+    # H68d (models/qwen4_exp_ple_fp8.py): how the PLE gathers read an fp8
+    # (float8_e4m3fn) table -- the nvidia NVFP4 export's PLE is fp8, and Triton
+    # refuses the fp8e4nv pointer below sm89 (NVFP4 slice smoke on a 3080:
+    # "type fp8e4nv not supported in this architecture" at the first forward).
+    # Grammar [smXX:]MODE[;...] with MODE native | exp2 | bits | ptx (the QSA
+    # decoders of H65, bytes loaded as uint8); an arch group wins over a
+    # generic one. Empty = native from sm90 on (the pre-H68d kernels; sm89
+    # types fp8e4nv but cannot convert it to bf16), bits below. native below
+    # sm90 and ptx below sm80 are refused by name. A bf16 table never reads it.
+    SGLANG_WEG2_PLE_FP8_DECODE = EnvStr("")
     # fnFL2 H43: the FIRST chunk's gather starts at the request's admission
     # (scheduler intake, or the front's hint while P still sleeps) into a third
     # shared slot, whenever the H32 ring is idle. Off = H32 alone. Never on
