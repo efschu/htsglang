@@ -146,6 +146,9 @@ class SchedulerOutputStreamer:
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
         )
+        # H84: a Weg-2 D group reports each request's own prefill time on its
+        # finishing output (meta_info weg2_prefill_s); decode outputs unchanged.
+        weg2_prefill_report = self.server_args.tp_prefill_max_tokens > 0
         for req in reqs:
             if req is skip_req:
                 continue
@@ -154,6 +157,8 @@ class SchedulerOutputStreamer:
                 # because of the one additional delayed token. This "continue" prevented the dummy output.
                 continue
 
+            if weg2_prefill_report and req.finished():
+                req.time_stats.stamp_weg2_prefill_s()
             acc.accept(req=req)
             self._maybe_log_time_stats(req=req)
 

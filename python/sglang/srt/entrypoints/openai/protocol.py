@@ -516,6 +516,9 @@ class SglExt(BaseModel):
 
     routed_experts: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
+    # H84: a Weg-2 D group's own prefill time for this request (meta_info
+    # weg2_prefill_s), read by the Weg-2 front's r_D probe.
+    weg2_prefill_s: Optional[float] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
