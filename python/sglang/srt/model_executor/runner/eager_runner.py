@@ -44,7 +44,7 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
-from sglang.srt.model_executor.runner.base_runner import BaseRunner
+from sglang.srt.model_executor.runner.base_runner import BaseRunner, runs_target_verify
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
@@ -152,7 +152,7 @@ class EagerRunner(BaseRunner):
         """
         mr = self.model_runner
         num_tokens_per_bs = 1
-        if mr.spec_algorithm.is_speculative():
+        if runs_target_verify(mr):
             num_tokens_per_bs = (
                 mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
                     mr.server_args.speculative_num_draft_tokens, mr.is_draft_model_runner
