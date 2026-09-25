@@ -141,7 +141,8 @@ def test_the_family_complete_wake_zeroes_both_runners_after_the_static_import():
     # 27B placement: inside the family_complete block, after the static-state
     # import (the whole family is mapped), never per partial wake chunk
     fc = src.index("if family_complete:")
-    assert fc < src.index("_import_static_state(") < src.index("zero_local_scratch(_m)")
+    # (2026-09-25: the call also takes the residue counter -- matched on its prefix)
+    assert fc < src.index("_import_static_state(") < src.index("zero_local_scratch(_m")
     assert src.index('_weg2_ph("leg_collects")') < fc
     # the FP8-only registry of fdade8572f is gone
     full = inspect.getsource(WU)

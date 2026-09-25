@@ -3327,6 +3327,12 @@ def walk_live_tensors(
             if not isinstance(value, torch.Tensor):
                 continue
             _add(_join(module_path, attr), value, ATTRIBUTE, module_path)
+        # Local scratch held on a plain object attached to the module (the
+        # compressed-tensors scheme's Marlin lock array): booked like the
+        # module-level form, so its bytes are local_scratch on the cover line
+        # instead of unattributed tag bytes.
+        for path, value in scratch_on_objects(module):
+            _add(_join(module_path, path), value, ATTRIBUTE, module_path)
     return out
 
 
@@ -3831,6 +3837,41 @@ LOCAL_SCRATCH_REASON = ("runtime-local scratch (in no checkpoint and no plan; "
                         "the WAKING side memsets it -- zero_local_scratch)")
 
 
+#: Values held on a module that are never descended into for local scratch.
+_NOT_A_HOLDER = (list, tuple, dict, set, frozenset, str, bytes, int, float, bool)
+
+
+def scratch_on_objects(module) -> List[Tuple[str, "torch.Tensor"]]:
+    """``(attr.leaf, tensor)`` for every local-scratch tensor a module keeps on a
+    PLAIN OBJECT attached to it -- one level deep, leaf-named, nothing else.
+
+    The case this exists for: ``compressed_tensors_wNa16`` keeps its Marlin lock
+    array on the SCHEME (``layer.scheme.workspace``, ``self.workspace =
+    marlin_make_workspace(device)``), not on the layer, so neither the module
+    ``__dict__`` walk nor :func:`zero_local_scratch`'s ``getattr(mod,
+    "workspace")`` reached it: born in the runner's weights tag pool, released
+    at every sleep, resumed on recycled pages, it kept their residue -- and
+    Marlin's ``barrier_acquire`` spins until a slice's lock equals its index, so
+    slice 0 needs it at zero (27B line, the production draft
+    Qwen3.8-27B-DFlash2-W8-lued, 2026-09-25). Tensors, modules and containers
+    are not descended into, and only ``LOCAL_SCRATCH_LEAF_NAMES`` are taken:
+    a scheme's other tensors are not scratch and stay the plan's question."""
+    import torch
+
+    out: List[Tuple[str, torch.Tensor]] = []
+    for attr, obj in list(vars(module).items()):
+        if obj is None or isinstance(obj, (torch.Tensor, torch.nn.Module) + _NOT_A_HOLDER):
+            continue
+        held = getattr(obj, "__dict__", None)
+        if not isinstance(held, dict):
+            continue
+        for leaf in LOCAL_SCRATCH_LEAF_NAMES:
+            value = held.get(leaf)
+            if isinstance(value, torch.Tensor):
+                out.append((f"{attr}.{leaf}", value))
+    return out
+
+
 def is_local_scratch(name: str) -> bool:
     """``True`` for a tensor the runtime creates and the plan cannot name.
 
@@ -3841,8 +3882,13 @@ def is_local_scratch(name: str) -> bool:
     return str(name).rsplit(".", 1)[-1] in LOCAL_SCRATCH_LEAF_NAMES
 
 
-def zero_local_scratch(model) -> List[str]:
+def zero_local_scratch(model, residue: Optional[List[int]] = None) -> List[str]:
     """Memset every local-scratch tensor of ``model``; returns the names touched.
+
+    ``residue``, when given, gets ONE number appended: the non-zero elements
+    found across those tensors BEFORE the memset (one device reduction, one
+    sync) -- the instrument that shows on metal whether a wake ever handed back
+    a dirty page under a lock array.
 
     Called on the WAKING side after the weights are back, which is the only
     moment the pages exist and no kernel is reading them.  Returning the names
@@ -3859,6 +3905,7 @@ def zero_local_scratch(model) -> List[str]:
 
     done: List[str] = []
     seen: set = set()
+    nonzero: list = []
 
     def _zero(name, obj) -> None:
         data = getattr(obj, "data", obj)
@@ -3869,6 +3916,8 @@ def zero_local_scratch(model) -> List[str]:
             return
         seen.add(key)
         with torch.no_grad():
+            if residue is not None:
+                nonzero.append(torch.count_nonzero(data))
             data.zero_()
         done.append(name)
 
@@ -3881,6 +3930,12 @@ def zero_local_scratch(model) -> List[str]:
             if obj is None:
                 continue
             _zero(f"{mod_name}.{leaf}" if mod_name else leaf, obj)
+        # The scheme-held lock arrays (compressed_tensors_wNa16): one object
+        # deeper than the two walks above reach.
+        for path, obj in scratch_on_objects(mod):
+            _zero(f"{mod_name}.{path}" if mod_name else path, obj)
+    if residue is not None:
+        residue.append(int(torch.stack(nonzero).sum().item()) if nonzero else 0)
     return done
 
 
