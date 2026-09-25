@@ -478,6 +478,17 @@ class Envs:
     # already missing from the free reading (x105 TP2: 943 MiB counted twice,
     # 311 + 293 ms credit waits).
     SGLANG_WEG2_CREDIT_LIVE_STAGING = EnvBool(True)
+    # IDLE_VOTE_FRESHNESS (fnFL2 H77, #1268): PP0 reads a landed idle lap as
+    # the PP group's /flush_cache verdict only while the state it witnessed
+    # holds -- the lap of PP0's latest stamp, PP0 neither asleep nor busy
+    # since that stamp, younger than IDLE_VOTE_TTL_S seconds, and PP0 idle
+    # itself at the read; any other lap is dropped ("#1268 IDLE-ROUND stale
+    # ... dropped") and a new one is wanted. fnFL2x166/x169: the sleep leg's
+    # own flush left a lap that the NEXT quiesce's first poll read minutes
+    # later (x169: 22:00:34 -> 22:04:26, PP1/PP2 at hicache_backup(5)).
+    # False = any landed lap answers, the 2026-09-24 form.
+    SGLANG_WEG2_ENABLE_IDLE_VOTE_FRESHNESS = EnvBool(True)
+    SGLANG_WEG2_IDLE_VOTE_TTL_S = EnvFloat(2.0)
     # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
     # not carry (pad + D-extra rows, loaded from the host store) are issued on
     # a side stream right behind the resume of their layer's chunk tag, i.e.

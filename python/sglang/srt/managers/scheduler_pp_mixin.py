@@ -31,8 +31,13 @@ from sglang.srt.managers.weg2_idle_vote import (
     VOTE_HOME_STEP_BUDGET_S,
     WEG2_VOTE_TAG,
     Weg2IdleVoteReq,
+    Weg2LapWitness,
     attach_slot,
+    entrypoint_taint,
+    expiry_reason,
     home_ranks,
+    lap_clock,
+    log_stale_drop,
     log_verdict,
     send_home,
     tally,
@@ -6275,6 +6280,9 @@ class SchedulerPPMixin:
         if not self._weg2_vote_is_wire_rank():
             return
         if self.pp_group.is_first_rank:
+            # fnFL2 H77: judge the lap on the ring / the landed one BEFORE a
+            # new landing or stamp, on this pass-top state of PP0.
+            self._weg2_vote_watch_witness()
             self._weg2_vote_harvest_home()
             self._weg2_vote_maybe_stamp(recv_reqs)
             return
@@ -6346,10 +6354,57 @@ class SchedulerPPMixin:
             origin=int(self.ps.pp_rank),
             world=int(self.ps.pp_size),
         )
+        # fnFL2 H77: PP0's own record of what this lap will witness -- kept
+        # here, never sent. A lap stamped into a sleep (the sleep leg's own
+        # flush wants one, x166/x169) is void from the start.
+        self._weg2_vote_witness = Weg2LapWitness(
+            epoch=vote.epoch, stamped_at=lap_clock()
+        )
+        if getattr(self, "weg2_dormant", False):
+            self._weg2_vote_witness.spoil(entrypoint_taint(dormant=True, idle=True))
         self._weg2_vote_attach_own_slot(vote)
         self._weg2_vote_outstanding = vote.epoch
         self._weg2_vote_wanted = False
         recv_reqs.append(vote)
+
+    def _weg2_vote_watch_witness(self: Scheduler) -> None:
+        """PP0 only, top of every pass: does what the lap witnesses still hold?
+
+        fnFL2 H77. Works only while a lap is on the ring or a landed one waits
+        for its reader; an ordinary serving pass pays three attribute reads. The lap's
+        slots were taken as it passed; PP0 is the one rank that sees work
+        enter the group, and it sees it here, a pass after the stamp at the
+        earliest (the stamp pass's own state is in PP0's slot). A busy or
+        dormant PP0 spoils the witness for good; a landed lap whose witness is
+        spoiled or expired is dropped at once, by name, and NOT re-wanted --
+        only a reader wants a lap, so a sleep leg's leftover costs one lap per
+        sleep, never one per pass. PP0-local: no collective, nothing sent, the
+        followers' side of the lap unchanged (Raenge-nie-uneins).
+        """
+        witness = getattr(self, "_weg2_vote_witness", None)
+        if witness is None:
+            return
+        held = getattr(self, "_weg2_vote_verdict", None)
+        if held is None and getattr(self, "_weg2_vote_outstanding", None) is None:
+            return
+        if not envs.SGLANG_WEG2_ENABLE_IDLE_VOTE_FRESHNESS.get():
+            return
+        if not witness.taint:
+            witness.spoil(
+                entrypoint_taint(
+                    dormant=bool(getattr(self, "weg2_dormant", False)),
+                    idle=self.is_fully_idle(),
+                )
+            )
+        if held is None:
+            return
+        now = lap_clock()
+        why = witness.taint or expiry_reason(
+            witness, now=now, ttl_s=envs.SGLANG_WEG2_IDLE_VOTE_TTL_S.get()
+        )
+        if why:
+            log_stale_drop(held, witness, why, where="pass-top", now=now)
+            self._weg2_vote_verdict = None
 
     def _weg2_vote_after_forward(self: Scheduler, recv_reqs: List) -> List:
         """Close the ring on the last stage; take the vote out of the dispatch.

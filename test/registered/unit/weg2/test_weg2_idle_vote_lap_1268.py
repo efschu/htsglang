@@ -107,6 +107,8 @@ def build_ring(idle=(True, True, True), world=3, storage=False):
             "_weg2_vote_harvest_home",
             "_weg2_vote_dp_offset",
             "_weg2_vote_is_wire_rank",
+            # fnFL2 H77: PP0's pass hook judges the lap's witness first
+            "_weg2_vote_watch_witness",
         ):
             setattr(s, name, getattr(Scheduler, name).__get__(s))
 

@@ -75,11 +75,32 @@ upstream does; that action is rank-local and always was.  What #1268 is about
 is the fact that LEAVES the group toward the front, on which the front then
 commands ``sleep(P, kv_cache)``.  That one fact is now reduced over every
 rank before it is answered, and it is answered in ONE place (PP0).
+
+A LANDED LAP ANSWERS ONLY FOR THE STATE IT WITNESSED (fnFL2 H77).  The lap is a
+snapshot: each slot says "this rank was idle when the object passed".  It used
+to be kept in ``_weg2_vote_verdict`` with no round binding and no expiry, and
+the first reader took it -- whoever that was, whenever that was.  On boots
+fnFL2x166/x169 that reader was the NEXT quiesce on every P flip: the sleep
+leg's own flush (``release_memory_occupation`` -> ``flush_cache``) wanted a
+lap, the lap was stamped with P already dormant, came home 3/3 idle and
+waited; the first /flush_cache poll of the next quiesce read it and answered
+200 in 36 ms (x169: stamped 22:00:34, read 22:04:26, while PP1/PP2 held
+``hicache_backup(5)`` and PP2 was still in the last prefill pass).  PP0 now
+keeps a :class:`Weg2LapWitness` per stamp -- never sent -- and reads a landed
+lap only while (i) it is the lap of PP0's latest stamp, (ii) PP0 neither slept
+nor was busy since that stamp (work enters the group through PP0, so a busy
+entrypoint means work may have entered behind the lap), (iii) it is younger
+than ``SGLANG_WEG2_IDLE_VOTE_TTL_S``, and (iv) PP0 itself is idle at the read.
+Anything else drops the lap by name (``#1268 IDLE-ROUND stale ... dropped``)
+and wants a new one; the front keeps polling as it does for ``pending``.  All
+of it is PP0-local bookkeeping: no collective, nothing on the wire, and the
+followers' side of the lap is unchanged.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -239,6 +260,157 @@ def refusal_detail(vote: Weg2IdleVoteReq, t: Weg2VoteTally, note: str) -> str:
         f"{list(t.blocking_ranks) or 'none'}. A missing slot is not a consenting "
         f"rank -- it is a rank this lap has no statement from, and answering "
         f"for it is the #1268 defect (boot weg2sb1)."
+    )
+
+
+# --------------------------------------------------------------------------
+# fnFL2 H77: how long a landed lap may answer (PP0-local, never sent)
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Weg2LapWitness:
+    """PP0's own record of what ONE lap witnesses.
+
+    Minted with the stamp and never put on the wire: the lap carries the
+    slots, this carries the conditions under which those slots still describe
+    the group.  ``taint`` is the first reason the witnessed state stopped
+    holding, as PP0 saw it; empty while it holds.
+    """
+
+    epoch: int
+    stamped_at: float
+    taint: str = ""
+
+    def spoil(self, reason: str) -> bool:
+        """Record ``reason`` unless an earlier one is already recorded."""
+        if reason and not self.taint:
+            self.taint = str(reason)
+            return True
+        return False
+
+
+def lap_clock() -> float:
+    """The one clock every stamp and every read uses (CLOCK_MONOTONIC)."""
+    return time.monotonic()
+
+
+def entrypoint_taint(*, dormant: bool, idle: bool) -> str:
+    """Why PP0's own state since the stamp voids the lap ('' = it does not).
+
+    Work enters the group only through PP0, so a PP0 that was busy after the
+    stamp may have put work on the chain BEHIND the lap -- the followers'
+    slots were taken ahead of it.  A sleep voids every slot taken before it.
+    """
+    if dormant:
+        return (
+            "the entrypoint went to sleep with the lap on the ring (a sleep "
+            "voids every slot taken before it)"
+        )
+    if not idle:
+        return (
+            "the entrypoint was busy after the stamp (work may have entered "
+            "the group behind the lap)"
+        )
+    return ""
+
+
+def expiry_reason(witness: Weg2LapWitness, *, now: float, ttl_s: float) -> str:
+    age = float(now) - float(witness.stamped_at)
+    if ttl_s > 0 and age > ttl_s:
+        return f"expired (age={age:.3f}s > ttl={float(ttl_s):.3f}s)"
+    return ""
+
+
+def stale_reason(
+    vote: Weg2IdleVoteReq,
+    witness: Optional[Weg2LapWitness],
+    *,
+    latest_epoch: int,
+    now: float,
+    ttl_s: float,
+    own_idle: bool,
+    own_blockers: str,
+) -> str:
+    """'' iff the landed lap may answer for the group NOW; else why not.
+
+    Round id first (a lap PP0 has no current stamp record of answers for
+    nothing), then what PP0 saw since the stamp, then the expiry, then the
+    entrypoint's own state at the read -- the lap's PP0 slot is from the
+    stamp, and the read is later.
+    """
+    if witness is None:
+        return f"no stamp record for the lap of epoch={int(vote.epoch)}"
+    if int(witness.epoch) != int(vote.epoch) or int(vote.epoch) != int(latest_epoch):
+        return (
+            f"round id mismatch (lap epoch={int(vote.epoch)}, stamp record "
+            f"epoch={int(witness.epoch)}, latest stamp epoch={int(latest_epoch)})"
+        )
+    if witness.taint:
+        return witness.taint
+    expired = expiry_reason(witness, now=now, ttl_s=ttl_s)
+    if expired:
+        return expired
+    if not own_idle:
+        return f"the entrypoint is not idle at the read (blockers=[{own_blockers}])"
+    return ""
+
+
+def _age_ms(witness: Optional[Weg2LapWitness], now: float) -> float:
+    if witness is None:
+        return -1.0
+    return (float(now) - float(witness.stamped_at)) * 1000.0
+
+
+def log_stale_drop(
+    vote: Weg2IdleVoteReq,
+    witness: Optional[Weg2LapWitness],
+    why: str,
+    *,
+    where: str,
+    now: float,
+) -> str:
+    """The metal marker: a landed lap was dropped, never read as the verdict."""
+    t = tally(vote)
+    line = (
+        "#1268 IDLE-ROUND stale epoch=%d age_ms=%.0f where=%s lap_idle=%s "
+        "participation=%d/%d blocking=%s reason=%s -- dropped, never read as "
+        "the group's verdict; the next poll wants a new lap"
+    ) % (
+        int(vote.epoch),
+        _age_ms(witness, now),
+        where,
+        bool(t.idle),
+        t.n_present,
+        t.world,
+        list(t.blocking_ranks) or "none",
+        why,
+    )
+    logger.info(line)
+    return line
+
+
+def log_fresh_read(
+    vote: Weg2IdleVoteReq, witness: Optional[Weg2LapWitness], *, now: float
+) -> str:
+    t = tally(vote)
+    line = (
+        "#1268 IDLE-ROUND fresh epoch=%d age_ms=%.0f participation=%d/%d "
+        "entrypoint idle -- read as the group's verdict"
+    ) % (int(vote.epoch), _age_ms(witness, now), t.n_present, t.world)
+    logger.info(line)
+    return line
+
+
+def stale_detail(vote: Weg2IdleVoteReq, why: str, own_blockers: str) -> str:
+    """The refusal body the front's poll gets for a dropped lap."""
+    t = tally(vote)
+    return (
+        f"GROUP VERDICT STALE: the landed lap of epoch={int(vote.epoch)} "
+        f"(idle={bool(t.idle)}, participation={t.n_present}/{t.world}, "
+        f"blocking={list(t.blocking_ranks) or 'none'}) was dropped: {why}. A "
+        f"lap answers only for the state it witnessed; a new one is wanted and "
+        f"the front keeps polling. This rank 0 blockers=[{own_blockers}]."
     )
 
 

@@ -110,7 +110,15 @@ from sglang.srt.managers.corridor_admission import (
     guard_prefill_admission,
 )
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-from sglang.srt.managers.weg2_idle_vote import refusal_detail, tally
+from sglang.srt.managers.weg2_idle_vote import (
+    lap_clock,
+    log_fresh_read,
+    log_stale_drop,
+    refusal_detail,
+    stale_detail,
+    stale_reason,
+    tally,
+)
 from sglang.srt.managers.wedge_recovery import drain_recovery_request
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -17342,6 +17350,18 @@ class Scheduler(
         carries the full argument and the six stacks' reading). This method
         only STAMPS a want and READS a landed lap; it never waits for a peer.
 
+        A LANDED LAP ANSWERS ONLY FOR THE STATE IT WITNESSED (fnFL2 H77).
+        Boots fnFL2x166/x169, every P flip: the sleep leg's own flush wanted a
+        lap, it came home 3/3 idle while P slept, and the NEXT quiesce's first
+        poll read it (x169: stamped 22:00:34, read 22:04:26 as "Cache flushed
+        successfully!" while PP1/PP2 held hicache_backup(5) and PP2 was still
+        in the last prefill pass). The read now requires the lap of PP0's
+        latest stamp, a stamp record PP0 did not see spoiled (asleep or busy
+        since the stamp), an age under SGLANG_WEG2_IDLE_VOTE_TTL_S, and THIS
+        rank idle at the read; otherwise the lap is dropped by name and a new
+        one is wanted (``weg2_idle_vote.stale_reason``).
+        SGLANG_WEG2_ENABLE_IDLE_VOTE_FRESHNESS=0 restores the unbound read.
+
         Returns ``(group_idle, detail)``. Off PP, at ``pp_size <= 1``, and on
         every rank that is not the entrypoint, it returns this rank's own
         answer unchanged -- so a single-rank engine and every stock path are
@@ -17382,8 +17402,32 @@ class Scheduler(
             # nothing later; reusing it across polls would let a stale "idle"
             # outlive the state that produced it.
             self._weg2_vote_verdict = None
+            # fnFL2 H77: consuming on read did not bound WHEN the one read
+            # happens -- x166/x169 read the sleep leg's lap at the next
+            # quiesce, minutes later. The lap answers only for the state it
+            # witnessed (weg2_idle_vote.stale_reason), and this rank must be
+            # idle itself now.
+            fresh_witness, now = None, 0.0
+            if envs.SGLANG_WEG2_ENABLE_IDLE_VOTE_FRESHNESS.get():
+                fresh_witness = getattr(self, "_weg2_vote_witness", None)
+                now = lap_clock()
+                why = stale_reason(
+                    vote,
+                    fresh_witness,
+                    latest_epoch=int(getattr(self, "_weg2_vote_epoch", 0)),
+                    now=now,
+                    ttl_s=envs.SGLANG_WEG2_IDLE_VOTE_TTL_S.get(),
+                    own_idle=my_idle,
+                    own_blockers=own,
+                )
+                if why:
+                    log_stale_drop(vote, fresh_witness, why, where="read", now=now)
+                    self._weg2_vote_wanted = True
+                    return False, stale_detail(vote, why, own)
             t = tally(vote)
             if t.idle:
+                if fresh_witness is not None:
+                    log_fresh_read(vote, fresh_witness, now=now)
                 return True, (
                     f"group idle (epoch={vote.epoch}, "
                     f"participation={t.n_present}/{t.world}, every rank agreed)"
