@@ -5192,6 +5192,12 @@ class SchedulerWeightUpdaterManager:
         except Exception:  # noqa: BLE001 -- stubs without the fields
             return None
 
+    def _weg2_collect_lane_is_bar1(self, lane_key: str, pair) -> bool:
+        """H89: the collector's tag-order gate reads the depositor's mapping,
+        not only this side's window (bar1_lanes.collect_gate_is_bar1)."""
+        from sglang.srt.weg2 import bar1_lanes as b1
+        return b1.collect_gate_is_bar1(getattr(self, "_weg2_bar1", None), lane_key, pair)
+
     def _weg2_bar1_register(self, tag) -> None:
         """Main thread, in tag order: the tag is pending on every BAR1 lane
         this rank receives on (bar1_lanes.register_turns)."""
@@ -7415,16 +7421,14 @@ class SchedulerWeightUpdaterManager:
                     # lanes, BEFORE the slot counter below is read -- with two
                     # collects in flight, tag t+1 read the same `_seq` as tag
                     # t and their unit records collided on the lane (xsn370:
-                    # c0/weights_2 identity mismatch). Whether a lane is BAR1
-                    # is static per boot (window mapped at setup), so the
-                    # check needs no mode file here.
+                    # c0/weights_2 identity mismatch). H89: a lane is BAR1 for
+                    # this gate only when the DEPOSITOR mapped the window, not
+                    # when this side merely serves one (cu130 image: P's boot
+                    # connect ran out, P deposited p0/p2/p4 on the host ring,
+                    # D skipped the gate, two collects shared slot 0 -> W68
+                    # p0/weights_0 identity mismatch).
                     if phase == bx.PHASE_COLLECT:
-                        _b1g = getattr(self, "_weg2_bar1", None)
-                        _b1g_role = (_b1g.role(_lane_key)
-                                     if (_b1g is not None and pair is not None) else None)
-                        _is_bar1_lane = bool(
-                            _b1g_role is not None
-                            and _b1g.window_for(_lane_key, _b1g_role) is not None)
+                        _is_bar1_lane = self._weg2_collect_lane_is_bar1(_lane_key, pair)
                         _turns = self._weg2_lane_turns
                         if not _is_bar1_lane and _turns is not None:
                             # H11: THE LANE'S TURN, not every earlier tag.

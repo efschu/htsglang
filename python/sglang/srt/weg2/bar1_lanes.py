@@ -57,6 +57,13 @@ ENV_RING = "SGLANG_WEG2_BAR1_RING_SLOTS"
 ENV_SMALL_SLOT_MIB = "SGLANG_WEG2_BAR1_SMALL_SLOT_MIB"
 ENV_BIG_SLOT_MIB = "SGLANG_WEG2_BAR1_BIG_SLOT_MIB"
 ENV_CONNECT_S = "SGLANG_WEG2_BAR1_CONNECT_S"
+#: H89 (dkrnfbar1agent09251908, cu130 image): a depositor whose boot connect ran
+#: out (the receiving group served its window after the budget -- D took 4 min
+#: longer on a cold JIT volume) tries ONCE more at its first flip, this long.
+ENV_RECONNECT_S = "SGLANG_WEG2_BAR1_RECONNECT_S"
+#: H89: written by the depositor into the lane's directory once its mapping of
+#: the receiver's window stands; the collector's tag-order gate reads it.
+MAPPED_MARKER = "peer-mapped"
 ENV_SMALL_BAR_GROUPS = "SGLANG_WEG2_BAR1_SMALL_BAR_GROUPS"
 #: #22 (xsn323): a credit wait that waits longer than this while the sleeper
 #: co-located with it is itself blocked on a deposit this group's waker will
@@ -195,6 +202,19 @@ def _slotted(name: str, offset: int, size: int, ring: int):
     if slot < (2 << 20):
         return f"small BAR1: window {name} too small for a ring of {ring} ({size >> 20} MiB)"
     return (name, int(offset), slot * int(ring), slot)
+
+
+def collect_gate_is_bar1(lanes, lane_key: str, pair) -> bool:
+    """H89: may a collector skip the host lanes' tag-order gate on this lane?
+    Only for a cross lane whose window this rank serves AND whose depositor
+    mapped it; a registry without the H89 query keeps the window-only rule."""
+    if lanes is None or pair is None:
+        return False
+    role = lanes.role(lane_key)
+    if role is None or lanes.window_for(lane_key, role) is None:
+        return False
+    rides = getattr(lanes, "collect_rides_bar1", None)
+    return True if rides is None else bool(rides(lane_key))
 
 
 def other_group(group: str) -> str:
@@ -545,6 +565,8 @@ class Bar1Lanes:
         self._dst_lanes: list = []
         self._windows_logged = False
         self.last_seq: dict = {}       # lane -> the seq this side ran last (the depositor's done-wait)
+        self._reconnect_tried: set = set()   # H89: lanes whose one flip-time reconnect is spent
+        self._reconnect_lock = threading.Lock()
         self.turn: dict = {}           # lane -> {(flip, index), ...} pending tags, oldest runs first
         self.turn_cv = threading.Condition()
 
@@ -750,6 +772,8 @@ class Bar1Lanes:
         d = self.flags(lane_key, role)
         if role == "src":
             p = self.peers.get(lane_key)
+            if p is None:
+                p = self._reconnect_once(lane_key)
             mode = MODE_BAR1 if p is not None else MODE_HOST
             why = "" if p is not None else self.refusals.get(lane_key, "no peer window")
             post_flag(d, "mode", seq, 0, {"mode": mode, "reason": why})
@@ -763,6 +787,57 @@ class Bar1Lanes:
             self.log(f"WEG2-BAR1 lane={lane_key} role=dst mode=bar1 but no window here -> host")
             return MODE_HOST
         return mode
+
+    def _reconnect_once(self, lane_key: str):
+        """H89: the boot connect of this lane ran out of time -- the receiver
+        may well serve its window by now. One more short attempt, at the first
+        tag of the first flip; a lane the receiver refused by name (no-window
+        marker, map failure) is not retried."""
+        why = str(self.refusals.get(lane_key, ""))
+        if not why.startswith("connect: no window served"):
+            return None
+        with self._reconnect_lock:
+            if lane_key in self._reconnect_tried:
+                return self.peers.get(lane_key)
+            self._reconnect_tried.add(lane_key)
+            try:
+                timeout_s = float(os.environ.get(ENV_RECONNECT_S, "5"))
+            except ValueError:
+                timeout_s = 5.0
+            try:
+                import torch
+                torch.cuda.set_device(self._ordinal())
+            except Exception:  # noqa: BLE001 -- the driver calls will name it
+                pass
+            p = self.connect_peer(lane_key, timeout_s=timeout_s)
+            self.log(f"WEG2-BAR1 lane={lane_key} role=src RECONNECT "
+                     f"{'mapped' if p is not None else 'refused ' + str(self.refusals.get(lane_key, ''))[:80]} "
+                     f"(boot connect: {why[:60]})")
+            return p
+
+    def _mark_mapped(self, lane_key: str) -> None:
+        """H89: the depositor's mapping stands -- tell the collector's gate."""
+        try:
+            d = lane_dir(self.boot_nonce, lane_key, other_group(self.group), self.root)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, MAPPED_MARKER), "w") as fh:
+                fh.write(f"{self.group}{self.rank}")
+        except OSError as exc:
+            self.log(f"WEG2-BAR1 lane={lane_key} mapped marker failed: {exc!r}")
+
+    def peer_mapped(self, lane_key: str) -> bool:
+        """H89, collector side: has the depositor mapped THIS rank's window of
+        the lane? A served window alone does not make the lane BAR1 -- the
+        depositor whose connect ran out deposits on the host ring, and the
+        collector must then keep the host lane's tag order (one slot counter)."""
+        return os.path.exists(os.path.join(
+            lane_dir(self.boot_nonce, lane_key, self.group, self.root), MAPPED_MARKER))
+
+    def collect_rides_bar1(self, lane_key: str) -> bool:
+        """H89: the collector's view of the lane -- a window here AND a mapped
+        depositor. False keeps the host lanes' tag-order gate, which is safe on
+        a lane that turns out to run BAR1 (it only serialises)."""
+        return lane_key in self.recv and self.peer_mapped(lane_key)
 
     def _mark_no_window(self, lane_key: str, why: str) -> None:
         """Tell the would-be depositor at once that no window will be served
@@ -831,16 +906,20 @@ class Bar1Lanes:
                     conn, _ = ls.accept()
                 except OSError:
                     return
+                # the connection STAYS OPEN: it is the lane's credit channel
+                # (blocking recv on both sides, no file polling, no GIL spin).
+                # H89: set BEFORE the fd goes out -- a depositor that connects
+                # at flip time maps and posts its mode within milliseconds,
+                # and the collector must then find the channel, not None.
+                old = w.conn
+                w.conn = conn
                 try:
                     socket.send_fds(conn, [meta], [w.dmabuf_fd])
                 except OSError as exc:
                     self.log(f"WEG2-BAR1 lane={lane_key} serve failed: {exc!r}")
+                    w.conn = old
                     conn.close()
                     continue
-                # the connection STAYS OPEN: it is the lane's credit channel
-                # (blocking recv on both sides, no file polling, no GIL spin)
-                old = w.conn
-                w.conn = conn
                 if old is not None:
                     try:
                         old.close()
@@ -956,6 +1035,7 @@ class Bar1Lanes:
         p = PeerWindow(lane_key, int(dev), int(meta["size"]), int(meta["slot_bytes"]), int(meta["ring"]),
                        peer_bdf, int(handle_), mapped, host - lead_in, sock=s)
         self.peers[lane_key] = p
+        self._mark_mapped(lane_key)
         self.log(f"WEG2-BAR1 lane={lane_key} role=src group={self.group} mapped peer={peer_bdf} "
                  f"window={p.size >> 20} MiB slot={p.slot_bytes >> 20} MiB ring={p.ring} "
                  f"borrowed={meta.get('borrowed') or '-'} "
