@@ -655,9 +655,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         function unchanged; an unfused layer (INT4/FP8 qkvz) returns before
         anything is allocated or scoped.
 
+        H79 (A), operator decision 25.09.: a Weg-2 FLIP RANK (group P or D,
+        ``weg2_group_name``) does NOT fuse. The cat cannot reuse the storage
+        it replaces -- the block (80.47 MiB) is larger than qkvz's own 80 MiB
+        segment, and a tag pool never hands a freed block back -- so every
+        fused layer left an 80 MiB hole in its band (fnNV4f1: band
+        ``inactive_gib`` 0.18-0.26 against 0.00-0.01 unfused; 22/8/6 layers on
+        P, 36 on D-TP0 = 1.73/0.63/0.47 and 2.83 GiB) for a decode gain of
+        0.15-0.6 %. That VRAM goes to experts: qkvz/ba keep the storages they
+        were built with, in their band, and nothing is allocated. Asked only
+        for a layer that WOULD fuse, so the census names the real reason for
+        every other one. Outside Weg-2 (no group) upstream is unchanged.
+
         Returns a status word for the loader's census line
         (``fused@<tag>``, ``fused@-`` = no band scope, ``already``,
-        ``skip:<why>``).
+        ``skip:<why>``, ``skip:weg2-flip``).
         """
         if not _is_cuda:
             return "skip:not-cuda"
@@ -683,15 +695,45 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and ba.bias is None
         ):
             return "skip:dtype-or-bias"
-        from sglang.srt.managers.weg2_memory_saver import weight_chunk_scope
+        from sglang.srt.managers import weg2_memory_saver as _wms
 
-        with weight_chunk_scope(getattr(self, "layer_id", None)) as band:
+        if _wms.weg2_group_name():
+            return "skip:weg2-flip"
+        with _wms.weight_chunk_scope(getattr(self, "layer_id", None)) as band:
             fused = torch.cat([qkvz.weight.data, ba.weight.data], dim=0).contiguous()
         self._fused_in_proj_qkvz_width = qkvz.weight.shape[0]
         qkvz.weight.data = fused[: self._fused_in_proj_qkvz_width]
         ba.weight.data = fused[self._fused_in_proj_qkvz_width :]
         self._fused_in_proj_weight = fused
         return f"fused@{band or '-'}"
+
+    @staticmethod
+    def fused_in_proj_census_line(statuses: Iterable[str]) -> str:
+        """H79: one line per rank over ``finalize_fused_in_proj``'s statuses.
+
+        ``unbanded`` = blocks fused OUTSIDE their layer's band (no Weg-2 chunk
+        scope); ``reason`` = the skip reasons with counts (``weg2-flip`` is the
+        flip form declining a layer that would fuse); ``tags`` = the bands the
+        fused blocks were allocated in.
+        """
+        counts: dict = {}
+        for s in statuses:
+            s = str(s or "none")
+            counts[s] = counts.get(s, 0) + 1
+        fused = {k[len("fused@"):]: v for k, v in counts.items()
+                 if k.startswith("fused@")}
+        skipped = {k[len("skip:"):]: v for k, v in counts.items()
+                   if k.startswith("skip:")}
+
+        def _join(d):
+            return ",".join(f"{k}:{v}" for k, v in sorted(d.items())) or "-"
+
+        return (
+            f"#H79 GDN-FUSED-IN-PROJ gdn={sum(counts.values())} "
+            f"fused={sum(fused.values())} skipped={sum(skipped.values())} "
+            f"already={counts.get('already', 0)} unbanded={fused.get('-', 0)} "
+            f"reason={_join(skipped)} tags={_join(fused)}"
+        )
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         if (
