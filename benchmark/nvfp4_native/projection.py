@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 
 H, I, L = 5120, 17408, 64
 FLOP_MLP = 2 * 512 * 3 * H * I  # 273.8 GF per layer per 512 chunk
@@ -174,7 +175,7 @@ def d_gemm_term(bench_path, Ms=(8, 16, 48)):
     out = {}
     for M in Ms:
         res = {}
-        for label, k4, k8 in (("heute Marlin", "apply_mar", "f8_mar"), ("nativ", "apply_nat", "f8_nat")):
+        for label, k4, k8 in (("heute Marlin", "apply_mar", "f8_mar"), ("nativ", "apply_nat", "f8_torch"), ("FP4 nativ, FP8 Marlin", "apply_nat", "f8_mar")):
             g, d = us("D.gate_up", k4, M), us("D.down", k4, M)
             fq, fo, fa = us("F.qkvz", k8, M), us("F.o", k8, M), us("F.qkv", k8, M)
             if None in (g, d, fq, fo, fa):
@@ -187,5 +188,117 @@ def d_gemm_term(bench_path, Ms=(8, 16, 48)):
     return out
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and "--window" not in sys.argv:
     main()
+
+
+# ---------------------------------------------------------------------------
+# v3: every per-kernel term MEASURED in window zcx7pv (analyze_window.py); only
+# the composition, the 3080 W4A8 rate and the cut are HOCHRECHNUNG.
+# ---------------------------------------------------------------------------
+def window_projection(d, w4a8_tops=(117.0, 150.0)):
+    import os
+    def rows(p):
+        return json.load(open(p))["rows"] if os.path.exists(p) else []
+    l5, c5 = rows(f"{d}/b5090_all.json"), rows(f"{d}/b5090_comp.json")
+    l3, c3 = rows(f"{d}/b3080_lanes.json"), rows(f"{d}/b3080_comp.json")
+    u = lambda R, s, k: next(r["us"] for r in R if r.get("shape") == s and r.get("kernel") == k and r.get("M") == 512 and "us" in r) / 1e3  # noqa: E731
+    c = lambda R, n, **kw: next(r["us"] for r in R if r.get("comp") == n and all(r.get(a) == b for a, b in kw.items())) / 1e3  # noqa: E731
+    P = 3.75
+    def attn_ms(C):
+        a1, a4 = c(C, "attn_pre", prefix=1024), c(C, "attn_pre", prefix=4096)
+        return a1 + (a4 - a1) * (P * 1024 - 1024) / (3072) + c(C, "attn_diag")
+    card = {
+        "5090": {"gdn": c(c5, "gdn"), "attn": attn_ms(c5), "elt": 2 * c(c5, "rmsnorm") + c(c5, "silu_mul"),
+                 "mlp": {"nat": u(l5, "P.gate_up", "apply_nat") + u(l5, "P.down", "apply_nat"),
+                         "int8": u(l5, "P.gate_up", "i8_q") + u(l5, "P.gate_up", "i8_mm") + u(l5, "P.down", "i8_q") + u(l5, "P.down", "i8_mm"),
+                         "mar": u(l5, "P.gate_up", "apply_mar") + u(l5, "P.down", "apply_mar")},
+                 "proj_g": {k: u(l5, "F.qkvz", v) + u(l5, "F.o", v) for k, v in (("f8nat", "f8_torch"), ("f8mar", "f8_mar"), ("int8", "i8_q+mm"))},
+                 "proj_a": {k: u(l5, "F.qkv", v) + u(l5, "F.o", v) for k, v in (("f8nat", "f8_torch"), ("f8mar", "f8_mar"), ("int8", "i8_q+mm"))}},
+        "3080": {"gdn": c(c3, "gdn"), "attn": attn_ms(c3), "elt": 2 * c(c3, "rmsnorm") + c(c3, "silu_mul"),
+                 "mlp": {"int8": u(l3, "P.gate_up", "i8_q") + u(l3, "P.gate_up", "i8_mm") + u(l3, "P.down", "i8_q") + u(l3, "P.down", "i8_mm"),
+                         "mar": u(l3, "P.gate_up", "apply_mar") + u(l3, "P.down", "apply_mar")},
+                 "proj_g": {k: u(l3, "F.qkvz", v) + u(l3, "F.o", v) for k, v in (("f8mar", "f8_mar"), ("int8", "i8_q+mm"))},
+                 "proj_a": {k: u(l3, "F.qkv", v) + u(l3, "F.o", v) for k, v in (("f8mar", "f8_mar"), ("int8", "i8_q+mm"))}},
+    }
+    for t in w4a8_tops:
+        card["3080"]["mlp"][f"w4a8_{int(t)}"] = FLOP_MLP / (t * 1e12) * 1e3
+
+    def layer(cd, i, mlp, proj):
+        k = card[cd]
+        is_attn = i % 4 == 3
+        return k["mlp"][mlp] + (k["proj_a"][proj] + k["attn"] if is_attn else k["proj_g"][proj] + k["gdn"]) + k["elt"]
+
+    # unexplained per layer = #PGAP INT8 stage at p=3.75k minus the measured INT8 layer sum (42/11/11 cut)
+    stage_meas = {0: 48.6 + 0.894 * P, 1: 38.1 + 1.083 * P, 2: 42.1 + 1.111 * P}
+    sums = {r: sum(layer("5090" if r == 0 else "3080", i, "int8", "int8") for i in range(lo, hi))
+            for r, (lo, hi) in enumerate(ranks(CUT0))}
+    unexpl = {r: (stage_meas[r] - sums[r]) / (hi - lo) for r, (lo, hi) in enumerate(ranks(CUT0))}
+    extra_last = (unexpl[2] - unexpl[1]) * 11
+    print("\n== v3: Kerne GEMESSEN (zcx7pv), Zusammensetzung/Schnitt/W4A8 = HOCHRECHNUNG ==")
+    for r in (0, 1, 2):
+        lo, hi = ranks(CUT0)[r]
+        print(f"  PP{r}: gemessene Kernsumme INT8 {sums[r]:.1f} ms vs #PGAP {stage_meas[r]:.1f} ms "
+              f"-> unerklaert {unexpl[r]:.3f} ms/Schicht ({100*(stage_meas[r]-sums[r])/stage_meas[r]:.0f} %)")
+
+    def stage_times(cut, m5, p5, m3, p3):
+        ts = []
+        for r, (lo, hi) in enumerate(ranks(cut)):
+            cd = "5090" if r == 0 else "3080"
+            mlp, proj = (m5, p5) if r == 0 else (m3, p3)
+            t = sum(layer(cd, i, mlp, proj) for i in range(lo, hi)) + (hi - lo) * unexpl[0 if r == 0 else 1]
+            if r == 2:
+                t += extra_last
+            ts.append(t)
+        return ts
+
+    def best(m5, p5, m3, p3):
+        out = None
+        for l0 in range(30, 58):
+            rest = L - l0
+            cut = (l0, rest - rest // 2, rest // 2)
+            ts = stage_times(cut, m5, p5, m3, p3)
+            if out is None or max(ts) < max(out[1]):
+                out = (cut, ts)
+        return out
+    ref_i = stage_times(CUT0, "int8", "int8", "int8", "int8")
+    ref_n = stage_times(CUT0, "mar", "f8mar", "mar", "f8mar")
+    cal_i = (8192 / ((N_CHUNKS_8K + 2) * max(ref_i) / 1e3)) / 8905.0
+    cal_n = (8192 / ((N_CHUNKS_8K + 2) * max(ref_n) / 1e3)) / 4246.0
+    print(f"  Probe: INT8 42/11/11 -> {8192/((N_CHUNKS_8K+2)*max(ref_i)/1e3):.0f} tok/s (gem. 8905); "
+          f"NVFP4-Marlin 42/11/11 -> {8192/((N_CHUNKS_8K+2)*max(ref_n)/1e3):.0f} (gem. 4246)")
+    res = []
+    for t in w4a8_tops:
+        for p5, lab in (("f8nat", "FP8 nativ (cuBLASLt)"), ("f8mar", "FP8 Marlin")):
+            cut, ts = best("nat", p5, f"w4a8_{int(t)}", "f8mar")
+            tps = 8192 / ((N_CHUNKS_8K + 2) * max(ts) / 1e3)
+            lo_, hi_ = sorted((tps / cal_i, tps / cal_n))
+            vram = vram_5090(cut[0])
+            print(f"  3080 W4A8 {t:.0f} TOPS | 5090 NVFP4 nativ + {lab}: Schnitt {cut}, Stufen "
+                  f"{[round(x,1) for x in ts]} ms -> P8k {tps/1e3:.2f}k (kalibriert {lo_/1e3:.1f}-{hi_/1e3:.1f}k) tok/s; "
+                  f"5090-VRAM P {vram}")
+            res.append((t, lab, cut, ts, tps))
+    return card, res
+
+
+def vram_5090(l0, ctx_tokens=262144):
+    """P-group VRAM on the 5090 for layers [0, l0) (GiB). Weights per layer from the
+    checkpoint (NVFP4 MLP 150.4 MB; FP8 proj GDN 115.3 + ~1.2 MB bf16, attn 104.9 MB),
+    base (embed etc.) 2.35 GiB = weg2rc7n4 PP0 13.18 GiB minus its 42 layers; mamba
+    36.6 MB per GDN layer (1.17 GB / 32); KV fp8 2048 B/token per attn layer + 5 draft
+    layers (cell 30720 at 10 attn layers); graph+reserve 1.2 GiB; avail 30.54 GiB."""
+    na = sum(1 for i in range(l0) if i % 4 == 3)
+    ng = l0 - na
+    w = 2.35 + (ng * (150.4 + 116.5) + na * (150.4 + 105.0)) / 1024
+    mamba = 0.0366 * ng
+    cell = 2048 * (na + 5)
+    kv_ctx = cell * ctx_tokens / 2**30
+    fixed = w + mamba + 1.2
+    free_for_kv = 30.54 - fixed
+    return (f"Gewichte {w:.1f} + Mamba {mamba:.2f} + Graph/Reserve 1.2 = {fixed:.1f} GiB; "
+            f"KV fuer 262k Kontext {kv_ctx:.1f} GiB (Zelle {cell} B); frei fuer KV {free_for_kv:.1f} GiB "
+            f"= {int(free_for_kv*2**30/cell/1000)}k Token")
+
+
+if __name__ == "__main__" and len(sys.argv) > 2 and sys.argv[1] == "--window":
+    window_projection(sys.argv[2])

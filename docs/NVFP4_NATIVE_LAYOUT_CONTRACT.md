@@ -287,6 +287,75 @@ Heute gemessen: NVFP4-Marlin 4246, INT8 8905 tok/s.
 - **Offen:** Das 5090-VRAM für 47–49 P-Schichten. Im Vergleich zu 42 kommen ~1,6 GB Gewichte dazu, plus der P-KV bzw.
   Mamba-Zustand der zusätzlichen Schichten. Der Planer muss neu passen (P-Schnitt ist Flag + Messung).
 
+## 12. Messung Fenster zcx7pv (25.09. ~12:40Z, Karten 1+2, Rohdaten /spinning/evidence-665-f1/n4b_bench_0925_1239/)
+
+**MESSUNG.** µs je Aufruf, CUDA-Graph, Gewichte über >L2 rotiert. 5090 bei 400 W. `apply_nat` enthält die
+FP4-Aktivierungs-Quantisierung.
+
+| 5090, M=512 | NVFP4 nativ (apply_nat) | INT8 W8A8 (q+mm) | NVFP4 Marlin | BF16 |
+|---|---|---|---|---|
+| gate_up 34816×5120 | 220,6 (828 TF) | 391 (470 T) | 874 (209 TF) | 970 |
+| down 5120×17408 | 119,4 (764 TF) | 192 (500 T) | 415 (220 TF) | 498 |
+| M=4096 gate_up | 1575 (927 TF; mm allein 1344 = 1086 TF) | 2739 (535 T) | 7546 (194 TF) | 7714 |
+
+| 5090, M=512, FP8-Projektionen | FP8 nativ cuBLASLt (`_scaled_mm` + Quant) | FP8 Marlin | INT8 q+mm |
+|---|---|---|---|
+| qkvz 16384×5120 | 260,6 (330 TF) | 417,2 | 218,8 |
+| qkv 14336×5120 | 207,6 (362 TF) | 366,4 | 165,0 |
+| o 5120×6144 | 107,2 (301 TF) | 161,6 | 77,7 |
+
+Das `sgl_kernel`-FP8-CUTLASS auf sm_120 bricht ab: „Arch conditional MMA instruction used without targeting appropriate
+compute capability“, der Kern ist nicht für sm_120a gebaut. flashinfer-b12x verlangt CUDA 13, am Rig ist nvcc 12.9.
+
+**Decode, kleines M, 5090:**
+- gate_up M=1: nativ 96 µs (1135 GB/s), Marlin **64 µs (1565 GB/s)**.
+- M=16: 91 gegen 68 µs.
+- M=48: 87 gegen 95 µs.
+- **Marlin ist bis M≈32 schneller.**
+
+**Rest-Kerne, T=512:**
+
+| Kern | 5090 | 3080 |
+|---|---|---|
+| GDN-Chunk | 70 µs | 272 µs |
+| Attention (SDPA) Präfix 4k | 332 µs (155 TF) | 1056 µs (49 TF) |
+| Attention Diagonale | 42 µs | 115 µs |
+| RMSNorm | 3,8 µs | 15,9 µs |
+| silu_mul | 13,5 µs | 79,7 µs |
+| Quant int8 (h/i) | 2,8 / 10,1 µs | 12,5 / 44,4 µs |
+
+**Schichtsumme** (Messung je Kern, Summe gerechnet) gegen #PGAP bei 8k:
+- **5090:** INT8-Kerne 1,025 ms gegen 1,237 ms gemessen, unerklärt 0,21 ms (17 %); GEMM-Anteil 0,87 ms = 70 %.
+  NVFP4 nativ + FP8 nativ: 0,853 + 0,21 = **1,06 ms**. Marlin heute 2,01 + 0,21 = 2,22 ms. Nativ ist also **2,1×
+  schneller als heute**, aber nur 1,17× schneller als INT8.
+- **3080:** INT8-Kerne 3,59 ms gegen 3,83 ms gemessen, unerklärt 0,24 ms (6 %); GEMM-Anteil 2,99 ms = 78 %;
+  Nicht-GEMM gemessen 0,61 ms je Schicht.
+  - GDN: 0,27 ms × 8/11 Schichten.
+  - Attention: 3 Schichten × (0,97 + 0,11) ms, auf 11 Schichten verteilt.
+  - Norm und silu: 0,11 ms.
+
+**INT4 (Nutzerfrage):**
+- 3080: `mma.m16n8k64.s4` 471 TOPS = 2,00× INT8 (235). Nativ, SASS IMMA.16864.S4.S4.
+- 5090: s4 wird emuliert (CALL, ~180 ALU-Ops + 2× IMMA.16832.S8). Gemessen 92–101 TOPS, also 0,1× INT8
+  (1007–1010 TOPS mma.sync).
+
+**HOCHRECHNUNG** (projection.py `--window`: Kernzeiten gemessen, Zusammensetzung, Schnitt und W4A8-Rate
+angenommen, dazu der gemessene unerklärte Rest je Karte):
+
+| 3080 W4A8 | 5090 NVFP4 nativ + FP8 nativ | 5090 NVFP4 nativ + FP8 Marlin |
+|---|---|---|
+| ≤117 TOPS (N4A, synthetische Obergrenze) | Schnitt 47/9/8, P8k **8,9k** (kalibriert 7,9–9,1k) | 45/10/9, 7,9k (7,0–8,0k) |
+| 150 TOPS | 47/9/8, **9,1k** (8,0–9,3k) | 43/11/10, 8,1k (7,1–8,2k) |
+
+- Es bindet die 5090 (47 Schichten zu ~1,06 ms). Darum hilft W4A8 117 → 150 kaum.
+- 5090-VRAM in P bei 47 Schichten: Gewichte 14,5 GiB, Mamba 1,32, Graph/Reserve 1,2. Für KV bleiben ~13,5 GiB
+  (~443k Token, Zelle 32 KiB), 262k Kontext passt.
+- **D (Hochrechnung aus gemessenen Kernen), GEMM-Anteil des 5090-Rangs je Verify-Runde:**
+  - M ≤ 16: Marlin 6,3–6,6 ms gegen nativ 8,3–9,0 ms, also **+2 ms bei bs1**.
+  - M = 48: 9,8 gegen 8,5 ms.
+  - Auf der 3080 bei M=48 ist Marlin rechengebunden (47 TF). W4A8 spart dort ~4–5 ms je Runde.
+  - Folge: bs6 unter Last ~+15 %, bs1 ohne ein FP4-GEMV für kleines M auf dem nativen Layout eher −10 %.
+
 ## 11. Offen
 
 - NVFP4-DFlash2-Draft: geht durch dieselbe Methode, also derselbe Vertrag. Shapes nicht geprüft.

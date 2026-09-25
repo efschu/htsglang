@@ -158,6 +158,8 @@ def main():
     ap.add_argument("--fi-backends", default="cutlass,cudnn,b12x")
     ap.add_argument("--fp8-shapes", default=",".join(s[0] for s in FP8_SHAPES))
     ap.add_argument("--only-fp8", action="store_true")
+    ap.add_argument("--fp8-variants", default="f8_nat,f8_mar",
+                    help="ModelOptFp8LinearMethod variants; f8_nat needs an sm_120a FP8 GEMM in sgl_kernel")
     ap.add_argument("--lanes", default="nat,fi,mar,i8,bf16,fp8",
                     help="subset of lane groups: nat (fp4 quant+sgl mm+apply_nat), fi, mar, i8, bf16, fp8")
     args = ap.parse_args()
@@ -374,7 +376,8 @@ def main():
         N = sum(parts)
         wbytes = N * K
         C8 = min(8, max(1, math.ceil(ROT_TARGET / wbytes)))
-        for variant, use_marlin in (("f8_nat", False), ("f8_mar", True)):
+        for variant, use_marlin in [v for v in (("f8_nat", False), ("f8_mar", True))
+                                    if v[0] in args.fp8_variants.split(",")]:
             try:
                 m8 = ModelOptFp8LinearMethod(fcfg)
                 m8.use_marlin = use_marlin
@@ -400,6 +403,29 @@ def main():
             except Exception as e:  # noqa: BLE001
                 traceback.print_exc()
                 rec_err(shape, 0, variant, e)
+            torch.cuda.empty_cache()
+        # native FP8 W8A8 through cuBLASLt (torch._scaled_mm), static per-tensor activation scale
+        if "f8_torch" in args.fp8_variants.split(","):
+            try:
+                wt = [(torch.randn(N, K, device="cuda") * 0.5).to(torch.float8_e4m3fn) for _ in range(C8)]
+                one = torch.tensor(1.0, device="cuda")
+                inv = torch.tensor(20.0, device="cuda")
+                for M in ms:
+                    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+                    rot = Rot(wt)
+
+                    def f_t():
+                        xq = (x * inv).to(torch.float8_e4m3fn)
+                        return torch._scaled_mm(xq, rot.next().t(), scale_a=one, scale_b=one,
+                                                out_dtype=torch.bfloat16)
+                    try:
+                        us, mode = timed(f_t, args.reps)
+                        rec(shape, M, N, K, "f8_torch", us, mode, {"GBps_w": round(wbytes / us / 1e3, 0)})
+                    except Exception as e:  # noqa: BLE001
+                        rec_err(shape, M, "f8_torch", e)
+                del wt
+            except Exception as e:  # noqa: BLE001
+                rec_err(shape, 0, "f8_torch", e)
             torch.cuda.empty_cache()
         # dequant e4m3 -> bf16 per call, then cuBLAS (the "no special kernel" W8A16 path)
         try:

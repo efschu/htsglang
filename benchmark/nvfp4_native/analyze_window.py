@@ -14,7 +14,7 @@ PEAK = {  # dense datasheet peaks (TFLOPS/TOPS); GeForce FP32-accumulate halving
 }
 KFAM = {"q_fi": None, "q_sgl": None, "mm_sgl": "fp4", "mm_fi_cutlass": "fp4", "mm_fi_cudnn": "fp4",
         "mm_fi_b12x": "fp4", "apply_nat": "fp4", "apply_mar": "bf16", "i8_q": None, "i8_mm": "int8",
-        "bf16_mm": "bf16", "f8_nat": "fp8", "f8_mar": "bf16", "f8_deq_bf16": "bf16", "i8_q+mm": "int8"}
+        "bf16_mm": "bf16", "f8_nat": "fp8", "f8_mar": "bf16", "f8_deq_bf16": "bf16", "i8_q+mm": "int8", "f8_torch": "fp8"}
 # #PGAP fits (weg2rc4, INT8) at the 8k mean start position 3.75k, per layer:
 STAGE_PER_LAYER = {"5090": (48.6 + 0.894 * 3.75) / 42, "3080": (38.1 + 1.083 * 3.75) / 11}
 MIX = {"5090": (10, 32), "3080": (3, 8)}  # (attn, gdn) layers in the 42/11/11 cut
@@ -87,7 +87,8 @@ def layer_sum(card, lanes, comps, M=512):
     variants = {
         "INT8": (lambda: (g("P.gate_up", "i8_q") or 0) + g("P.gate_up", "i8_mm") + (us(lanes, "P.down", "i8_q", M) or 0) + g("P.down", "i8_mm"),
                  "i8_q+mm"),
-        "NVFP4 nativ": (lambda: g("P.gate_up", "apply_nat") + g("P.down", "apply_nat"), "f8_nat"),
+        "NVFP4 nativ + FP8 nativ": (lambda: g("P.gate_up", "apply_nat") + g("P.down", "apply_nat"), "f8_torch"),
+        "NVFP4 nativ + FP8 Marlin": (lambda: g("P.gate_up", "apply_nat") + g("P.down", "apply_nat"), "f8_mar"),
         "Marlin (heute)": (lambda: g("P.gate_up", "apply_mar") + g("P.down", "apply_mar"), "f8_mar"),
     }
     attn_pre = comp(comps, "attn_pre", prefix=4096)
@@ -120,7 +121,7 @@ def layer_sum(card, lanes, comps, M=512):
 
 if __name__ == "__main__":
     d = sys.argv[1]
-    l5, c5 = load(f"{d}/b5090_lanes.json"), load(f"{d}/b5090_comp.json")
+    l5, c5 = load(f"{d}/b5090_all.json"), load(f"{d}/b5090_comp.json")
     l3, c3 = load(f"{d}/b3080_lanes.json"), load(f"{d}/b3080_comp.json")
     b12 = load(f"{d}/b5090_b12x.json")
     kernel_table("5090", l5 + [r for r in b12 if r.get("kernel") == "mm_fi_b12x"])
