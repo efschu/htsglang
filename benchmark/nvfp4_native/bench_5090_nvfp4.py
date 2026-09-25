@@ -158,6 +158,8 @@ def main():
     ap.add_argument("--fi-backends", default="cutlass,cudnn,b12x")
     ap.add_argument("--fp8-shapes", default=",".join(s[0] for s in FP8_SHAPES))
     ap.add_argument("--only-fp8", action="store_true")
+    ap.add_argument("--lanes", default="nat,fi,mar,i8,bf16,fp8",
+                    help="subset of lane groups: nat (fp4 quant+sgl mm+apply_nat), fi, mar, i8, bf16, fp8")
     args = ap.parse_args()
     shapes = [] if args.only_fp8 else [s for s in SHAPES if s[0] in args.shapes.split(",")]
     ms = [int(x) for x in args.ms.split(",")]
@@ -166,7 +168,8 @@ def main():
     cap = torch.cuda.get_device_capability(dev)
     name = torch.cuda.get_device_name(dev)
     assert cap[0] in (8, 12), f"this bench is for sm_120 (and sm_86 for the Marlin/INT8/FP8 lanes), got {cap} {name}"
-    native_fp4 = cap[0] >= 10
+    lanes = set(args.lanes.split(","))
+    native_fp4 = cap[0] >= 10 and bool(lanes & {"nat", "fi"})
     meta = {"device": name, "cap": cap, "torch": torch.__version__,
             "clock_note": "clocks/power as set on the rig (5090 400 W limit per operator)",
             "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
@@ -259,7 +262,7 @@ def main():
                     rec_err(shape, M, "mm_sgl", e)
                     ref = None
                 # flashinfer mm_fp4 backends
-                if mm_fp4 is not None:
+                if mm_fp4 is not None and "fi" in lanes:
                     xq_fi, xs_fi = fp4_quantize(x, L0.input_scale_inv)
                     for be in [b for b in args.fi_backends.split(",") if b]:
                         try:
@@ -298,6 +301,8 @@ def main():
         torch.cuda.empty_cache()
         # --- marlin layers ---
         try:
+            if "mar" not in lanes:
+                raise StopIteration
             mar = [make_nvfp4_layer(method, N, K, "marlin", fused=shape.endswith("gate_up")) for _ in range(C)]
             from sglang.srt.layers.quantization import fp4_utils
             for M in ms:
@@ -311,12 +316,14 @@ def main():
                 except Exception as e:  # noqa: BLE001
                     rec_err(shape, M, "apply_mar", e)
             del mar
+        except StopIteration:
+            pass
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
             rec_err(shape, 0, "make_marlin", e)
         torch.cuda.empty_cache()
         # --- int8 W8A8 ---
-        if int8_scaled_mm is not None:
+        if int8_scaled_mm is not None and "i8" in lanes:
             i8_bytes = N * K
             Ci = min(8, max(1, math.ceil(ROT_TARGET / i8_bytes))) if shape != "P.lm_head" else 1
             try:
@@ -342,7 +349,7 @@ def main():
                 rec_err(shape, 0, "make_int8", e)
             torch.cuda.empty_cache()
         # --- bf16 reference ---
-        if N * K * 2 <= 1.2e9:
+        if N * K * 2 <= 1.2e9 and "bf16" in lanes:
             Cb = min(4, max(1, math.ceil(ROT_TARGET / (N * K * 2))))
             wb = [torch.randn(N, K, device="cuda", dtype=torch.bfloat16) for _ in range(Cb)]
             for M in ms:
@@ -363,7 +370,7 @@ def main():
     )
     fcfg = ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
     ms = all_ms
-    for shape, parts, K in [s for s in FP8_SHAPES if s[0] in args.fp8_shapes.split(",")]:
+    for shape, parts, K in [s for s in FP8_SHAPES if s[0] in args.fp8_shapes.split(",") and "fp8" in lanes]:
         N = sum(parts)
         wbytes = N * K
         C8 = min(8, max(1, math.ceil(ROT_TARGET / wbytes)))
