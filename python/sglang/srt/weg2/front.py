@@ -92,6 +92,7 @@ from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import host_ledger
+from sglang.srt.weg2 import prefill_clock  # RC7-X: D's prefill clock reader (tiny, no deps)
 
 logger = logging.getLogger("weg2.front")
 
@@ -208,6 +209,55 @@ DRAIN_DEADLINE_DEFAULT_S = 120.0
 #: weg2zr2 pair) that produce X's fallback.  Only the FRONT's default; the
 #: launcher recomputes from this boot's own lines and tells the front (C2).
 X_FALLBACK_TOKENS = 22000
+# ---------------------------------------------------------------------------
+# RC7-X (27B line, user decision 2026-09-25 ~06:43Z: "x entscheidung mit in den
+# release"). X is the bound up to which D prefills a prompt itself (the SHORT
+# route); above it the prompt goes through P with a flip. Two parts:
+#
+# 1. r_D, the D-direct prefill rate the live X* is solved from, is taken from
+#    D's OWN prefill clock of a solo prefill (weg2/prefill_clock.py) and never
+#    from the leg's wall, which carried the decode of every completion token
+#    (weg2rc4: `uncached=2 wall=6.85s` -> r_D 0.29 tok/s, X stuck at 4096).
+# 2. X splits by D's load: X_idle = the live X* while D holds nothing, X_busy
+#    (--x-busy-tokens, one chunk) while D decodes other requests -- a SHORT
+#    prefill halts every running decode for N/r_D (prefill first, mixed chunk
+#    off by user order), so a 10k prefill would stall six decodes ~5 s.
+# ---------------------------------------------------------------------------
+#: X_busy default: ONE chunk (D's --chunked-prefill-size), the bound the SHORT
+#: route had before X was live. 0 = no D prefill while D decodes others.
+X_BUSY_DEFAULT_TOKENS = 4096
+#: The least uncached extent an r_D sample may come from: a rate over a few
+#: hundred tokens prices the fixed per-prefill overhead, not throughput, and
+#: uncached=0 (a leg 2 behind P's prefill) is no D prefill at all. The NF
+#: line's value (H84), one number on both lines.
+X_RD_MIN_UNCACHED = 2048
+#: The singleton window (NF H84 "Einzelgaenger-Sperre"): a grant above X_busy
+#: needs D idle AND no other request arriving within this window. A burst of
+#: 4 x 8k then goes to P together over ONE flip instead of the first taking D
+#: and the rest waiting behind its whole decode (drain-and-flip never cuts a
+#: decode). Also the quiet time the idle re-grant (a) waits for.
+X_SOLO_WINDOW_S = 0.25
+
+
+def r_d_sample(uncached: int, prefill_s: Optional[float], solo: bool,
+               min_uncached: int = X_RD_MIN_UNCACHED) -> Tuple[Optional[float], str]:
+    """RC7-X: ONE r_D sample -- ``(tokens/s, "d_prefill_clock")`` or ``(None, why)``.
+
+    r_D = uncached tokens / D's own prefill seconds of a prefill D ran ALONE.
+    There is deliberately NO wall argument: the leg's wall is prefill plus the
+    decode of every completion token, and dividing by it is the weg2rc4
+    defect. No clock -> no sample, never a fallback to the wall."""
+    if not solo:
+        return None, "concurrent"
+    if int(uncached) < max(1, int(min_uncached)):
+        return None, "below_min"
+    if prefill_s is None:
+        return None, "no_prefill_clock"
+    if float(prefill_s) <= 0.0:
+        return None, "bad_prefill_clock"
+    return float(uncached) / float(prefill_s), "d_prefill_clock"
+
+
 QUIESCE_DEADLINE_S = 90.0
 #: Spec C4/R-15/O9: the admitter resolves ONE future and then waits for that
 #: request's coroutine to actually POST to D before resolving the next.  A
@@ -1674,6 +1724,12 @@ class Pending:
     #: set when that drain handed it to D: its leg 2 then runs exactly as the
     #: SHORT route's (pending=None -- no leg 1 ever ran for it).
     d_direct: bool = False
+    #: RC7-X: its route was SHORT at X_idle but the busy/idle split queued it
+    #: (X_busy < uncached <= X_idle while D held work, or the singleton window
+    #: saw a burst). The idle re-grant (Front._x_idle_regrant) serves such a
+    #: backlog on D once D is idle and quiet -- it must neither starve behind
+    #: FLIP-ECONOMICS nor cost a flip D does not need.
+    x_deferred: bool = False
 
 
 class Seat:
@@ -2059,7 +2115,9 @@ class Front:
                  vision: str = VISION_MODE_OFF,
                  record_line: str = "",
                  d_short_drain_tokens: int = 0,
-                 d_hold_s: Optional[float] = None):
+                 d_hold_s: Optional[float] = None,
+                 x_busy_tokens: int = X_BUSY_DEFAULT_TOKENS,
+                 x_ceiling_tokens: int = 0):
         # RC2 Blocker A: load what the serving loop would otherwise import on
         # its first flip -- here, before main() hands control to web.run_app.
         preload_loop_imports()
@@ -2198,6 +2256,26 @@ class Front:
         # is an ESTIMATE (no tokenizer here) -- D enforces it for real at
         # get_new_batch_prefill after match_prefix (C11, W31).
         self.tp_prefill_max_tokens = max(1, int(tp_prefill_max_tokens))
+        # RC7-X: THE CEILING. D enforces law 4 for real after match_prefix
+        # (its W50 riegel, argv_d --tp-prefill-max-tokens), and the launcher
+        # now arms that riegel at --x-ceiling-tokens, so the live X may rise to
+        # the measured X* without every grant above the launch X coming back
+        # as a W50 detour through P. The front clamps its live X to it; 0 /
+        # unset = the launch X (the riegel D was given), i.e. X never rises.
+        _ceil = int(x_ceiling_tokens or 0)
+        self.x_ceiling_tokens = _ceil if _ceil > 0 else self.tp_prefill_max_tokens
+        if self.tp_prefill_max_tokens > self.x_ceiling_tokens:
+            logger.warning("WEG2 X-CEILING: launch X=%d above --x-ceiling-tokens %d -- X clamped to "
+                           "the ceiling (D refuses above it by W50)",
+                           self.tp_prefill_max_tokens, self.x_ceiling_tokens)
+            self.tp_prefill_max_tokens = self.x_ceiling_tokens
+        # RC7-X: X_busy, the bound while D decodes other requests (see
+        # X_BUSY_DEFAULT_TOKENS). Never above X in force (_x_busy_in_force).
+        self.x_busy_tokens = max(0, int(X_BUSY_DEFAULT_TOKENS if x_busy_tokens is None else x_busy_tokens))
+        #: RC7-X: singleton windows open right now (a grant above X_busy waits
+        #: X_SOLO_WINDOW_S holding its seat), and the time of the last arrival.
+        self._x_windows = 0
+        self._x_last_arrival = 0.0
         # C7/R-5: the SAME break-even quantity at aggregate granularity --
         # the D->P departure latch.  Defaults to X because it IS X.
         self.flip_min_work_tokens = (
@@ -2225,6 +2303,7 @@ class Front:
         #: #1289 round 2: arrivals at D, the denominator of the solo witness.
         self._d_admissions = 0
         #: Where the last r_D sample came from, printed with every X decision.
+        #: RC7-X: the instrument is D's prefill clock of a solo prefill.
         self._x_r_d_src = "none yet"
         # C8/K7: None = derive from the last completed flip in that direction.
         self.min_dwell_ms = None if min_dwell_ms is None else float(min_dwell_ms)
@@ -3176,6 +3255,10 @@ class Front:
             return web.json_response({"error": f"{_code}: {_why}"}, status=501)
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
+        # RC7-X: the arrival ordinal and time the singleton window and the idle
+        # re-grant read ("did anything arrive after me / in the last window").
+        _x_seq = self._rid
+        self._x_last_arrival = time.time()
         if isinstance(payload, dict):
             payload["rid"] = rid  # #1442: P and D see the same rid (the hand-off key)
         text = request_text(payload)
@@ -3326,8 +3409,11 @@ class Front:
         # RC2 review (idle policy b): why a SHORT falls through to BATCH. Only
         # D's own #915 refusal is recorded -- see `d_eligible` below.
         short_refused: List[str] = []
+        # RC7-X: why the busy/idle split queued a SHORT (see Pending.x_deferred).
+        x_deferred: List[str] = []
         if self.awake == "D" and self.admit_d and self.state == "serving" and short_ok:
-            seat = await self._acquire_short_seat(rid, est_prompt, short_refused)
+            seat = await self._x_short_grant(rid, remainder, est_prompt, _x_seq,
+                                             short_refused, x_deferred)
             if seat is not None:
                 self.counters["route_short"] += 1
                 # #1324: `span_known=True` used to stand alone here and read as
@@ -3371,6 +3457,8 @@ class Front:
                     # xsn438: routed `long` by the W102 rule above, not by
                     # length -- only P can serve it (Pending.p_only).
                     p_only=_verdict == VERDICT_STAGE,
+                    # RC7-X: queued by the busy/idle split, not by the phase.
+                    x_deferred=bool(x_deferred) and not short_refused,
                     # 27B idle policy (b): only a request whose OWN route is SHORT
                     # may later be handed to D by --d-short-drain-tokens -- and
                     # only when it is queued because of the PHASE (the field's
@@ -3444,6 +3532,155 @@ class Front:
             self._d_seat.release()
             return None
         return Seat(self, rid, "short", tokens=est_tokens)
+
+    # ---------------- RC7-X: the busy/idle split of X (part 2) ----------------
+    def _x_busy_in_force(self) -> int:
+        """X_busy as applied: never above the X in force (X_idle)."""
+        return max(0, min(int(self.x_busy_tokens), int(self.tp_prefill_max_tokens)))
+
+    def _d_holds_work(self, own_seats: int = 0) -> bool:
+        """D decodes (or is about to): a leg 2 in flight, a request handed to D
+        and not yet there, or one waiting in ``_ready_for_d``. ``own_seats`` =
+        seats the caller itself holds (the singleton window's own), not work."""
+        D = self.groups["D"]
+        handoff = max(0, self._seats_in_use() - own_seats - len(D.outstanding))
+        return bool(D.outstanding or self._ready_for_d or handoff)
+
+    def _x_d_state(self, own_seats: int = 0, own_windows: int = 0) -> Tuple[str, int]:
+        """``(state, d_running)`` for one SHORT decision.
+
+        ``busy``: D holds work -- X_busy applies. ``burst``: D holds nothing
+        but the front does (a queued request, another singleton window, a
+        P leg in flight) -- X_busy applies too (NF "sonst nichts in Flug").
+        ``idle``: nothing anywhere -- X_idle may apply, behind the window."""
+        n = len(self.groups["D"].outstanding)
+        if self._d_holds_work(own_seats):
+            return "busy", n
+        if (self.queue or self._x_windows > own_windows
+                or self.groups["P"].outstanding):
+            return "burst", n
+        return "idle", n
+
+    def _x_short_decision_line(self, rid: str, state: str, applied: int, uncached: int,
+                               d_running: int, verdict: str, window_ms: int) -> None:
+        """RC7-X: ONE line per SHORT decision (operator order): busy/idle, the X
+        applied, and how many requests D is running."""
+        logger.info(
+            "WEG2 SHORT-DECISION rid=%s d_state=%s X_applied=%d uncached=%d d_running=%d "
+            "verdict=%s window_ms=%d (X_idle=%d live <= X_ceiling=%d while D holds nothing, "
+            "X_busy=%d while D decodes others; above X_busy only after a quiet %d ms window "
+            "with nothing else in flight -- RC7-X)",
+            rid, state, int(applied), int(uncached), int(d_running), verdict, int(window_ms),
+            int(self.tp_prefill_max_tokens), int(self.x_ceiling_tokens),
+            self._x_busy_in_force(), int(X_SOLO_WINDOW_S * 1000))
+
+    async def _x_short_grant(self, rid: str, uncached: int, est_tokens: int, seq: int,
+                             refused: List[str], deferred: List[str]) -> Optional[Seat]:
+        """RC7-X: a route-SHORT arrival's seat under the busy/idle split.
+
+        The route verdict already said ``uncached <= X_idle`` (the X in force).
+        Then: ``uncached <= X_busy`` -> granted in any state, exactly the SHORT
+        route as it was. Above X_busy: only while D is idle -- the arrival
+        takes its seat (so the controller's hand-off window keeps D awake and
+        every other arrival reads D as busy), waits ``X_SOLO_WINDOW_S``, and
+        keeps the seat only if nothing arrived after it and nothing else is in
+        flight. Otherwise it is queued for P with ``deferred`` set -- the idle
+        re-grant serves it on D once D is idle and quiet, a flip if the backlog
+        outgrows X_idle, the fairness bound in the worst case. ``None`` = route
+        BATCH, the contract ``_acquire_short_seat`` already has."""
+        x_idle = int(self.tp_prefill_max_tokens)
+        x_busy = self._x_busy_in_force()
+        state, n_d = self._x_d_state()
+        applied = x_idle if state == "idle" else x_busy
+        if uncached <= x_busy:
+            seat = await self._acquire_short_seat(rid, est_tokens, refused)
+            self._x_short_decision_line(rid, state, applied, uncached, n_d,
+                                        "grant" if seat is not None else "seat_refused", 0)
+            return seat
+        if state != "idle":
+            deferred.append(state)
+            self.counters[f"x_deferred_{state}"] += 1
+            self._x_short_decision_line(rid, state, applied, uncached, n_d, "defer", 0)
+            return None
+        seat = await self._acquire_short_seat(rid, est_tokens, refused)
+        if seat is None:
+            self._x_short_decision_line(rid, state, applied, uncached, n_d, "seat_refused", 0)
+            return None
+        self._x_windows += 1
+        t_w = time.time()
+        try:
+            await asyncio.sleep(X_SOLO_WINDOW_S)
+        finally:
+            self._x_windows -= 1
+        state2, n_d2 = self._x_d_state(own_seats=1)
+        solo = (self._rid == seq and state2 == "idle"
+                and self.awake == "D" and self.admit_d and self.state == "serving")
+        waited_ms = int((time.time() - t_w) * 1000)
+        if not solo:
+            seat.release("x_solo_window")
+            deferred.append("burst")
+            self.counters["x_deferred_burst"] += 1
+            self._x_short_decision_line(rid, "burst" if self._rid != seq else state2, x_busy,
+                                        uncached, n_d2, "defer", waited_ms)
+            return None
+        self.counters["x_idle_granted"] += 1
+        self._x_short_decision_line(rid, "idle", x_idle, uncached, n_d2, "grant", waited_ms)
+        return seat
+
+    def _x_idle_regrant(self, now: float) -> str:
+        """RC7-X (a): serve a DEFERRED backlog on D once D is idle and quiet.
+
+        A request with X_busy < uncached <= X_idle that arrived while D
+        decoded is queued for P. When D then empties, FLIP-ECONOMICS alone
+        would either hold it (backlog < flip_min_work_tokens, which follows
+        X: starvation until the fairness bound) or flip for it (a round trip X*
+        says does not pay). Neither: it is re-evaluated here and handed to D.
+
+        ``moved``: the whole queue went to D (d_direct, the admitter seats it
+        with D's own bs and budget, each leg 2 runs as the SHORT route's).
+        ``wait``: it qualifies but D is not quiet yet (an arrival or a
+        singleton window inside X_SOLO_WINDOW_S) -- the caller must not flip
+        for it meanwhile. ``none``: not this case.
+
+        Law 4 holds per request AND summed (every request and the total <=
+        X_idle, the X in force), law 1 holds (one LONG / vision / carrier /
+        re-queued / budget-refused request in the queue and nothing is split
+        off -- the flip follows and P drains all), the fairness bound is not
+        bypassed (admit_d False -> nothing moves)."""
+        if not self.queue:
+            return "none"
+        if not (self.awake == "D" and self.state == "serving" and self.admit_d):
+            return "none"
+        if not any(getattr(p, "x_deferred", False) for p in self.queue):
+            return "none"
+        x_idle = int(self.tp_prefill_max_tokens)
+        for p in self.queue:
+            if not (p.d_eligible and not p.skip_leg1 and not p.intake_stalled
+                    and not p.leg1_done and not p.reroutes and not p.x_requeues
+                    and not getattr(p, "p_only", False)
+                    and 0 <= int(p.est_uncached) <= x_idle):
+                return "none"
+        total = sum(int(p.est_uncached) for p in self.queue)
+        if total > x_idle:
+            return "none"
+        if self._d_holds_work():
+            return "none"  # D decodes: no flip happens anyway; re-evaluated when it ends
+        if self._x_windows > 0 or (now - self._x_last_arrival) < X_SOLO_WINDOW_S:
+            return "wait"
+        moved = list(self.queue)
+        self.queue.clear()
+        for p in moved:
+            p.d_direct = True
+            self._ready_for_d.append(p)
+        self._sync_batch_gate()
+        self.counters["x_idle_regrant_requests"] += len(moved)
+        self.counters["x_idle_regrant_tokens"] += total
+        logger.info("WEG2 X-IDLE-REGRANT n=%d tokens=%d X_idle=%d X_busy=%d rids=%s oldest_wait_s=%.1f "
+                    "(RC7-X (a): a backlog the busy/idle split queued is served on D now that D is idle "
+                    "and quiet -- no flip; every request and their sum <= X_idle, law 4)",
+                    len(moved), total, x_idle, self._x_busy_in_force(),
+                    [p.rid for p in moved][:8], max(0.0, now - min(p.t_arrive for p in moved)))
+        return "moved"
 
     def _d_accepts_leg2(self) -> bool:
         """#1443: D takes leg-2 requests when awake, and -- dormant-admit armed --
@@ -3753,6 +3990,46 @@ class Front:
         _solo_adm0 = self._d_admissions
         _solo_entry = len(g.outstanding) == 1
         t0 = time.time()
+
+        def _sample_r_d(pt: int, ct: int, comp: int, verdict: str, dterms: dict) -> None:
+            """RC7-X: #1271 (b)'s r_D sample, on BOTH wire shapes (it used to
+            exist on the non-streamed branch only), from D's OWN prefill clock.
+
+            The solo witness is #1289 round 2's, unchanged: nothing else was
+            admitted to D over the whole leg and D held only this rid at both
+            ends. What changed is the DENOMINATOR: the leg wall (prefill plus
+            the decode of `comp` completion tokens) is printed, never divided
+            -- weg2rc4 sampled `uncached=2 wall=6.85s` and X never left 4096.
+            """
+            _unc = max(0, pt - ct)
+            _w = time.time() - t0
+            _solo = (_solo_entry
+                     and self._d_admissions == _solo_adm0
+                     and len(g.outstanding) == 1)
+            _ps = (dterms or {}).get("prefill_s")
+            rate, why = r_d_sample(_unc, _ps, _solo)
+            if rate is not None:
+                self._x_r_d_src = f"d_prefill_clock solo verdict={verdict}"
+                self.counters["r_d_sampled"] += 1
+                logger.info("WEG2 X R_D-SAMPLE rid=%s uncached=%d prefill_s=%.3f r_D=%.0f "
+                            "leg_wall_s=%.2f completion_tokens=%d verdict=%s src=d_prefill_clock "
+                            "(D's own prefill_finished - forward_entry of a solo prefill, "
+                            "uncached >= %d; the leg wall is printed, never divided -- RC7-X)",
+                            rid, _unc, float(_ps), rate, _w, comp, verdict, X_RD_MIN_UNCACHED)
+                self.note_x_sample("r_d", rate)
+                return
+            if why == "concurrent":
+                if _unc > 0 and _w > 0:
+                    self.counters["r_d_skipped_concurrent"] += 1
+            else:
+                self.counters[f"r_d_skipped_{why}"] += 1
+            if _unc >= X_RD_MIN_UNCACHED:
+                # A leg big enough to be a sample that was not one -- named, so
+                # an empty r_D deque reads as a reason, not as silence.
+                logger.info("WEG2 X R_D-SKIP rid=%s uncached=%d reason=%s solo=%s prefill_s=%s "
+                            "leg_wall_s=%.2f (RC7-X: no sample without D's prefill clock of a "
+                            "solo prefill; never the leg wall)",
+                            rid, _unc, why, _solo, "none" if _ps is None else f"{float(_ps):.3f}", _w)
         if pending is not None and pending.skip_leg1:
             single_prefill = True
         if (stream and pending is not None and request.path.startswith("/v1/")
@@ -3876,11 +4153,13 @@ class Front:
                         # answer to "can D serve this text back".
                         self.spans.record_presence(text, ct)
                         self._note_exact(text, pt)
-                    dterms = await self._draft_terms(g, None)
+                    dterms = await self._draft_terms(g, None, rid=rid, pt=pt, ct=ct)
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                                 "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
                                 rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
                                 dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
+                    if r.status == 200 and priced and not x_inband:
+                        _sample_r_d(pt, ct, comp, verdict, dterms)
                     if pending is not None and ct > 0:
                         self.counters["cross_group_prefix_hits"] += 1
                     return resp
@@ -3903,7 +4182,7 @@ class Front:
                     return web.json_response({"error": f"W28 Weg2Leg2Unpriced rid={rid}"}, status=503)
                 verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, False, rid)
                 g.served += 1
-                dterms = await self._draft_terms(g, js)
+                dterms = await self._draft_terms(g, js, rid=rid, pt=pt, ct=ct)
                 logger.info("WEG2-SERVED group=D leg=2 rid=%s status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                             "uncached=%d verdict=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
                             rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, time.time() - t0, self.epoch,
@@ -3938,16 +4217,13 @@ class Front:
                 # not moving rules out an arrival that came and went inside
                 # this window, which `len(outstanding)` at two instants
                 # cannot.
-                _unc = max(0, pt - ct)
-                _w = time.time() - t0
-                _solo = (_solo_entry
-                         and self._d_admissions == _solo_adm0
-                         and len(g.outstanding) == 1)
-                if _solo and _unc > 0 and _w > 0:
-                    self._x_r_d_src = f"solo leg2 verdict={verdict}"
-                    self.note_x_sample("r_d", _unc / _w)
-                elif _unc > 0 and _w > 0:
-                    self.counters["r_d_skipped_concurrent"] += 1
+                #
+                # RC7-X: AND THE DENOMINATOR IS D's PREFILL CLOCK, not this
+                # leg's wall (see `_sample_r_d` at the top of this method; the
+                # streamed branch above now samples too). A 200 only -- a
+                # refusal body is no prefill.
+                if r.status == 200:
+                    _sample_r_d(pt, ct, comp, verdict, dterms)
                 if pt:
                     # #1324, as on the streamed branch above: `ct` is the
                     # measured presence, `pt` the tokenisation fact. On a W31
@@ -4243,7 +4519,7 @@ class Front:
         self._mark_posted(p)
         return await self.leg2(request, rid, payload, text, stream, pending=p, seat=p.seat)
 
-    async def _draft_terms(self, g, body) -> dict:
+    async def _draft_terms(self, g, body, rid: str = "", pt: int = 0, ct: int = 0) -> dict:
         """#1233 (C16, L12): the draft terms of one served request.
 
         ``accept_len`` comes from ``meta_info.spec_accept_length`` when the
@@ -4254,7 +4530,10 @@ class Front:
         flight at a time on the leg-2 route, so the delta is this request's).
         Never raises: a missing instrument is ``accept_src=none``.
         """
-        out = {"draft_pages": 0, "draft_miss": 0, "accept_len": 0.0, "accept_src": "none"}
+        out = {"draft_pages": 0, "draft_miss": 0, "accept_len": 0.0, "accept_src": "none",
+               # RC7-X: this leg's prefill seconds by D's own clock, off the SAME
+               # read (internal_states[0].weg2_prefill_s); None = unknown.
+               "prefill_s": None}
         try:
             mi = (body or {}).get("meta_info") if isinstance(body, dict) else None
             if isinstance(mi, dict) and mi.get("spec_accept_length") is not None:
@@ -4286,6 +4565,8 @@ class Front:
             if out["accept_src"] == "none" and info.get("avg_spec_accept_length") is not None:
                 out["accept_len"] = float(info["avg_spec_accept_length"])
                 out["accept_src"] = "server_info_avg"
+            out["prefill_s"] = prefill_clock.lookup(
+                info.get(prefill_clock.INTERNAL_STATE_KEY), rid, pt, ct)
         except Exception as e:  # noqa: BLE001 - an instrument never breaks serving
             logger.debug("draft terms unavailable: %s: %s", type(e).__name__, e)
         return out
@@ -5520,18 +5801,30 @@ class Front:
                 len(s["r_d"]), len(s["r_p"]), len(s["flip_s"]),
             )
             return None
+        # RC7-X: THE CEILING. D's W50 riegel stands at --x-ceiling-tokens, so an
+        # X above it would be granted here and refused there by name -- a W50
+        # detour through P for every such request. Clamped, and both printed.
+        x_star = x
+        _ceil = int(getattr(self, "x_ceiling_tokens", 0) or 0)
+        if _ceil > 0 and x > _ceil:
+            x = _ceil
+            self.counters["x_ceiling_clamped"] += 1
         self.tp_prefill_max_tokens = x
         if self._x_min_work_follows:
             self.flip_min_work_tokens = x
         self.counters["x_resolves"] += 1
+        _xb = max(0, min(int(getattr(self, "x_busy_tokens", X_BUSY_DEFAULT_TOKENS)), x))
         logger.info(
             "WEG2 X RE-SOLVE n=%d X=%d <- X_prev=%d r_D=%.0f r_P=%.0f flip_s=%.2f "
             + self.x_flip_s_provenance() +
-            " source=live (medians over this boot's own samples: %d r_D, %d r_P "
-            "drains, %d flips, window %d; seeded from %s. Both rates are "
+            " X*=%d X_ceiling=%s X_busy=%d (X = X_idle, applied while D holds nothing; X_busy "
+            "while D decodes others -- RC7-X) source=live (medians over this boot's own "
+            "samples: %d r_D, %d r_P drains, %d flips, window %d; seeded from %s. Both rates are "
             "group_throughput -- tokens the group moved over the wall it was "
-            "busy -- so 1/r_D-1/r_P is a time-per-token difference; #1271)",
-            len(s["r_p"]), x, prev, r_d, r_p, flip_s,
+            "busy -- so 1/r_D-1/r_P is a time-per-token difference; #1271; r_D is D's own "
+            "prefill clock of a solo prefill since RC7-X, never a leg wall)",
+            len(s["r_p"]), x, prev, r_d, r_p, flip_s, x_star,
+            (f"{_ceil}{' CLAMPED' if x_star > x else ''}" if _ceil > 0 else "none"), _xb,
             len(s["r_d"]), len(s["r_p"]), len(s["flip_s"]), self.X_SAMPLE_WINDOW,
             self._x_seed_note,
         )
@@ -5814,15 +6107,23 @@ class Front:
     def idle_policy_line(self) -> str:
         """The resting/holding settings as one line, printed at startup."""
         return ("WEG2-IDLE-POLICY idle_layout=%s d_short_drain_tokens=%d X=%d flip_min_work_tokens=%d "
-                "d_hold_s=%s min_dwell_ms=%s fairness_w_s=%.0f (a: the group that rests when nothing "
+                "d_hold_s=%s min_dwell_ms=%s fairness_w_s=%.0f X_busy=%d X_ceiling=%d "
+                "x_solo_window_ms=%d r_d_src=%s r_d_min_uncached=%d (a: the group that rests when nothing "
                 "is pending; b: a queued SHORT-only backlog of at most d_short_drain_tokens is served "
                 "on D, 0 = off; c: D stays d_hold_s after its own work ended before the idle flip to "
-                "P and before a backlog FLIP-ECONOMICS holds flips, off = min-dwell / fairness only)" % (
+                "P and before a backlog FLIP-ECONOMICS holds flips, off = min-dwell / fairness only; "
+                "RC7-X: X is X_idle -- the live X*, clamped to X_ceiling, D's W50 riegel -- while D "
+                "holds nothing, X_busy while D decodes others; above X_busy only after a quiet "
+                "singleton window; a backlog the split deferred is re-granted on an idle quiet D; "
+                "r_D = uncached / D's own prefill clock of a solo prefill)" % (
                     self.idle_layout, self.d_short_drain_tokens, int(self.tp_prefill_max_tokens),
                     int(self.flip_min_work_tokens),
                     "off" if self.d_hold_s is None else f"{self.d_hold_s:.1f}",
                     "derived" if self.min_dwell_ms is None else f"{self.min_dwell_ms:.0f}",
-                    float(self.w_s)))
+                    float(self.w_s), self._x_busy_in_force(), int(self.x_ceiling_tokens),
+                    int(X_SOLO_WINDOW_S * 1000),
+                    "d_prefill_clock" if self._x_r_d_src == "none yet" else self._x_r_d_src,
+                    X_RD_MIN_UNCACHED))
 
     def _d_short_drain(self, now: float) -> int:
         """(b) --d-short-drain-tokens N: hand a SHORT-only backlog to D.
@@ -5843,7 +6144,11 @@ class Front:
             return 0
         if not (self.awake == "D" and self.state == "serving" and self.admit_d):
             return 0
-        x = int(self.tp_prefill_max_tokens)
+        # RC7-X: the X that bounds this drain is the busy/idle one -- X_busy
+        # while D decodes others (a drained prefill halts their decodes like a
+        # SHORT arrival does), X_idle when D holds nothing.
+        d_busy = self._d_holds_work()
+        x = self._x_busy_in_force() if d_busy else int(self.tp_prefill_max_tokens)
         for p in self.queue:
             if not (p.d_eligible and not p.skip_leg1 and not p.intake_stalled and not p.leg1_done
                     and not p.reroutes and not p.x_requeues and 0 <= int(p.est_uncached) <= x):
@@ -5856,6 +6161,11 @@ class Front:
         if total > min(n_max, x):
             if total <= n_max:
                 self.counters["d_short_drain_x_capped"] += 1
+            return 0
+        if (not d_busy and total > self._x_busy_in_force()
+                and (self._x_windows > 0 or (now - self._x_last_arrival) < X_SOLO_WINDOW_S)):
+            # RC7-X: above X_busy on an idle D only once the singleton window is
+            # quiet -- the same rule an arrival obeys (next tick decides).
             return 0
         moved = list(self.queue)
         self.queue.clear()
@@ -5935,6 +6245,13 @@ class Front:
                     # is served on D -- no flip, no economics hold (off by default).
                     if self.queue and self._d_short_drain(_now):
                         continue
+                    # RC7-X (a): a backlog the busy/idle split deferred is served on
+                    # D once D is idle and quiet; while it only waits for the quiet
+                    # window no flip is taken for it (below). Before the fairness
+                    # switch like (b), and never past it: admit_d False moves nothing.
+                    _x_rg = self._x_idle_regrant(_now) if self.queue else "none"
+                    if _x_rg == "moved":
+                        continue
                     oldest = self.queue[0].t_arrive if self.queue else None
                     fairness_fired = self._fairness_switch(oldest, "batch")
                     # 27B idle policy (c): when D's own work last ended (--d-hold-s).
@@ -5989,6 +6306,11 @@ class Front:
                     handing_off = self._handoff_in_flight()
                     d_work_exhausted = not D.outstanding and not handing_off
                     if (d_work_exhausted or not self.admit_d) and not handing_off:
+                        if _x_rg == "wait" and self.admit_d and not fairness_fired:
+                            # RC7-X (a): D will take this backlog itself once the
+                            # singleton window is quiet -- a flip now would buy a
+                            # round trip X* says does not pay.
+                            continue
                         if not self._flip_economics_ok(fairness_fired):
                             # (c) --d-hold-s bounds the economics hold: a small backlog
                             # D cannot serve flips once D has been free that long
@@ -6475,6 +6797,17 @@ def main():
                          "ended -- at rest under --idle-layout P, and in front of a backlog "
                          "FLIP-ECONOMICS holds -- then flips. Unset (default) or 0 = off = today: the "
                          "idle flip waits for min-dwell only, a held backlog for the fairness bound only.")
+    ap.add_argument("--x-busy-tokens", type=int, default=X_BUSY_DEFAULT_TOKENS,
+                    help="RC7-X: X_busy -- the uncached tokens D may prefill itself while it decodes "
+                         "OTHER requests (a SHORT prefill halts every running decode for N/r_D: "
+                         "prefill runs first, mixed chunk is off). X_idle = the X in force (--tp-"
+                         "prefill-max-tokens, live re-solved, <= --x-ceiling-tokens) applies only "
+                         f"while D holds nothing. Default {X_BUSY_DEFAULT_TOKENS} = one chunk; 0 = no D "
+                         "prefill while D decodes others.")
+    ap.add_argument("--x-ceiling-tokens", type=int, default=0,
+                    help="RC7-X: the most the live X may rise to -- D's own W50 riegel (the launcher "
+                         "arms group D's --tp-prefill-max-tokens at this value). 0 (default) = the "
+                         "launch X, i.e. X never rises above what D was told.")
     ap.add_argument("--weight-chunks", type=int, default=0, help="#1233: number of weights_<k> chunk tags both groups were built with (0 = single weights tag)")
     ap.add_argument("--carrier-max-tokens", type=int, default=0,
                     help="#1233 zero-remainder: longest prompt group D can read from the store. "
@@ -6557,7 +6890,9 @@ def main():
                   vision=args.vision,
                   record_line=args.record_line,
                   d_short_drain_tokens=args.d_short_drain_tokens,
-                  d_hold_s=args.d_hold_s)
+                  d_hold_s=args.d_hold_s,
+                  x_busy_tokens=args.x_busy_tokens,
+                  x_ceiling_tokens=args.x_ceiling_tokens)
     # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
     # against. Kept from weg2/idle-anon-0908.
     if args.anon_preboot_bytes > 0:
