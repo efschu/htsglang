@@ -173,6 +173,13 @@ class WatchdogRaw:
                 else:
                     watchdog_last_counter = current_counter
                     watchdog_last_time = current
+            else:
+                # H86: idle is not a stall. The clock only ran while is_active(), so a scheduler that slept past the
+                # timeout carried its sleep into the first active comparison: fnNV4f4 P was dormant 293 s, PP1/PP2
+                # set cur_batch on the wake and waited seconds for PP0's proxy tensors before forward_ct moved, and
+                # the hard watchdog tripped 7 s into the needle (SIGQUIT, whole P group torn down). A real stall --
+                # active with a frozen counter -- is still caught one timeout after it begins.
+                watchdog_last_time = current
             time.sleep(self.watchdog_timeout / 2)
 
         if self.dump_info is not None and (info_msg := self.dump_info()):
