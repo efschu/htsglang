@@ -1499,6 +1499,7 @@ class Envs:
     # permuted in place at every flip (nvfp4_marlin_inplace.py). "w4a8": the
     # registered W4A8 INT8 kernel (nvfp4_native_mixed.register_w4a8_kernel).
     SGLANG_FP4_NATIVE_MIXED_SM8X = EnvStr("marlin")
+    SGLANG_FP4_NATIVE_MIXED_SM12X = EnvStr("flashinfer_cutlass")
     # Opt-in BIT-DETERMINISM for fp8 linears on sm80..sm88 (#192, from #190).
     #
     # WHAT IS BROKEN. On sm80..88 an fp8 checkpoint has exactly one GEMM

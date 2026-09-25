@@ -63,6 +63,7 @@ def _resolve_rig(backend, caps, *, kernel=True, sm8x="w4a8"):
             mock.patch.object(fp4_utils, "is_cuda", return_value=True),
             mock.patch.object(fp4_utils, "has_fork_nvfp4_cutlass_kernel", return_value=True),
             mock.patch.object(nm, "_try_autoload_w4a8_kernel", return_value=None),
+            mock.patch.object(nm, "_flashinfer_fp4_gemm_available", return_value=True),
             mock.patch(
                 "sglang.srt.environ.envs.SGLANG_FP4_NATIVE_MIXED_SM8X.get",
                 return_value=sm8x,
@@ -90,6 +91,20 @@ class TestRankResolution(CustomTestCase):
     def test_pure_table(self):
         c = nm.resolve_rank_backend((12, 0), w4a8_available=False)
         self.assertEqual((c.backend, c.shared_layout), ("cutlass", True))
+        # F bench p6vrwg: FlashInfer CUTLASS when importable (same bytes), else fork
+        c = nm.resolve_rank_backend(
+            (12, 0), w4a8_available=False, sm12x_choice="flashinfer_cutlass",
+            flashinfer_fp4_available=True,
+        )
+        self.assertEqual((c.backend, c.shared_layout), ("flashinfer_cutlass", True))
+        c = nm.resolve_rank_backend(
+            (12, 0), w4a8_available=False, sm12x_choice="flashinfer_cutlass",
+            flashinfer_fp4_available=False,
+        )
+        self.assertEqual((c.backend, c.shared_layout), ("cutlass", True))
+        self.assertIn("not importable", c.reason)
+        with self.assertRaises(nm.NativeMixedUnsupported):
+            nm.resolve_rank_backend((12, 0), w4a8_available=False, sm12x_choice="b12x")
         # sm_8x default (#38 N4C): Marlin W4A16 on the SHARED native layout
         c = nm.resolve_rank_backend((8, 6), w4a8_available=False)
         self.assertEqual((c.backend, c.shared_layout), ("marlin_native_inplace", True))
@@ -116,7 +131,7 @@ class TestRankResolution(CustomTestCase):
         self.assertEqual(
             got,
             [
-                (Fp4GemmRunnerBackend.CUTLASS, True, True),
+                (Fp4GemmRunnerBackend.FLASHINFER_CUTLASS, True, True),
                 (Fp4GemmRunnerBackend.W4A8_INT8, True, True),
                 (Fp4GemmRunnerBackend.W4A8_INT8, True, True),
             ],
@@ -128,7 +143,7 @@ class TestRankResolution(CustomTestCase):
         self.assertEqual(
             got,
             [
-                (Fp4GemmRunnerBackend.CUTLASS, True, True),
+                (Fp4GemmRunnerBackend.FLASHINFER_CUTLASS, True, True),
                 (Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE, True, True),
                 (Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE, True, True),
             ],

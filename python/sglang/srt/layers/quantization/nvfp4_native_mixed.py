@@ -137,6 +137,8 @@ def resolve_rank_backend(
     w4a8_available: bool,
     sm8x_choice: str = "marlin",
     native_sm120_available: bool = True,
+    sm12x_choice: str = "cutlass",
+    flashinfer_fp4_available: bool = False,
 ) -> RankKernelChoice:
     """The per-arch table. Every branch keeps the SHARED native layout at the
     exchange; the sm_8x Marlin rank does so by permuting its content in place
@@ -150,7 +152,24 @@ def resolve_rank_backend(
                 "kernel (sglang.jit_kernel.nvfp4 not importable); refusing rather "
                 "than falling back to a different byte layout."
             )
-        return RankKernelChoice("cutlass", cap, True, "sm_12x: native W4A4 FP4 tensor cores")
+        # F bench p6vrwg (25.09., FI 0.7.0, autotuned): FlashInfer's CUTLASS mm_fp4
+        # is 30-37 % faster than the fork kernel for M <= 48 and equal at 512/4096.
+        # Same bytes: flashinfer_cutlass only passes transposed VIEWS of weight /
+        # weight_scale_interleaved, so the shared native layout is untouched.
+        want = str(sm12x_choice or "cutlass").strip().lower()
+        if want not in ("cutlass", "flashinfer_cutlass"):
+            raise NativeMixedUnsupported(
+                f"native-mixed: SGLANG_FP4_NATIVE_MIXED_SM12X={sm12x_choice!r} is neither "
+                "'flashinfer_cutlass' nor 'cutlass'."
+            )
+        if want == "flashinfer_cutlass" and flashinfer_fp4_available:
+            return RankKernelChoice(
+                "flashinfer_cutlass", cap, True, "sm_12x: native W4A4 via FlashInfer CUTLASS mm_fp4"
+            )
+        reason = "sm_12x: native W4A4 FP4 tensor cores"
+        if want == "flashinfer_cutlass":
+            reason += " (flashinfer mm_fp4 not importable -> fork CUTLASS, same bytes)"
+        return RankKernelChoice("cutlass", cap, True, reason)
     if major == 10:
         return RankKernelChoice(
             "flashinfer_cutedsl", cap, True, "sm_10x: native W4A4 (auto's choice there)"
@@ -185,6 +204,16 @@ def resolve_rank_backend(
     )
 
 
+def _flashinfer_fp4_gemm_available() -> bool:
+    try:
+        from sglang.srt.layers.quantization import modelopt_quant
+
+        return bool(getattr(modelopt_quant, "enable_flashinfer_fp4_gemm", False))
+    except Exception as exc:  # import-time failure is a real answer: not available
+        logger.warning("native-mixed: flashinfer fp4 gemm probe failed: %r", exc)
+        return False
+
+
 def resolve_this_rank() -> RankKernelChoice:
     """Resolve for the current CUDA device (called once per scheduler process)."""
     from sglang.srt.environ import envs
@@ -203,6 +232,8 @@ def resolve_this_rank() -> RankKernelChoice:
         w4a8_available=w4a8_kernel() is not None,
         sm8x_choice=str(envs.SGLANG_FP4_NATIVE_MIXED_SM8X.get()),
         native_sm120_available=native,
+        sm12x_choice=str(envs.SGLANG_FP4_NATIVE_MIXED_SM12X.get()),
+        flashinfer_fp4_available=_flashinfer_fp4_gemm_available(),
     )
     log = logger.info if choice.shared_layout else logger.warning
     log(
