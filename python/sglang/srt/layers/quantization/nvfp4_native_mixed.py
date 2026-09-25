@@ -23,10 +23,10 @@ Only the GEMM differs:
                      ever sees native bytes.
                   -> ``w4a8_int8`` with ``SGLANG_FP4_NATIVE_MIXED_SM8X=w4a8``:
                      the registered W4A8 INT8 kernel (agent N4A's seam, kept).
-* sm_12x kernel choice is ONE replaceable function per arch:
-  :func:`register_sm12x_apply` lets the FlashInfer-next strand hook its own
-  per-call choice (cute-dsl-native W4A16 at small M, W4A4 otherwise) without
-  touching this module; unregistered, the rank runs the fork CUTLASS W4A4.
+* sm_12x small-M: ``nvfp4_sm12x_w4a16.maybe_apply_sm12x_w4a16`` (strand F,
+  FlashInfer ``cute-dsl-native`` W4A16 on the same native bytes), called once in
+  ModelOptFp4LinearMethod.apply; ``SGLANG_FP4_SM12X_W4A16_MAX_M`` (default off).
+  Its alpha is ``weight_global_scale``, bound on EVERY native-mixed rank here.
 
 Default OFF: nothing here runs unless ``--fp4-gemm-backend native-mixed`` is
 passed; every other backend value resolves exactly as before.
@@ -127,55 +127,6 @@ def _try_autoload_w4a8_kernel() -> None:
 
 
 # ---------------------------------------------------------------------------
-# sm_12x kernel-choice seam (filled by the FlashInfer-next strand).
-# ---------------------------------------------------------------------------
-
-#: fn(layer, x, bias) -> out, or None to fall through to the fork CUTLASS W4A4
-#: path. It reads the NATIVE parameters only (weight u8 [N, K/2],
-#: weight_scale_interleaved 128x4, alpha, input_scale_inv) -- e.g. FlashInfer
-#: ``mm_bf16_fp4(backend="cute-dsl-native")`` for small M, which needs no
-#: preparation and no second weight copy. One function per arch: sm_8x has its
-#: own (nvfp4_marlin_inplace.apply), sm_12x this one.
-Sm12xApply = Callable[[torch.nn.Module, torch.Tensor, Optional[torch.Tensor]], Optional[torch.Tensor]]
-
-_SM12X_APPLY: Optional[Sm12xApply] = None
-_SM12X_APPLY_NAME: str = ""
-
-
-def register_sm12x_apply(fn: Sm12xApply, name: str) -> None:
-    global _SM12X_APPLY, _SM12X_APPLY_NAME
-    _SM12X_APPLY = fn
-    _SM12X_APPLY_NAME = str(name)
-
-
-def unregister_sm12x_apply() -> None:
-    global _SM12X_APPLY, _SM12X_APPLY_NAME
-    _SM12X_APPLY = None
-    _SM12X_APPLY_NAME = ""
-
-
-def sm12x_apply() -> Optional[Sm12xApply]:
-    return _SM12X_APPLY
-
-
-def sm12x_apply_name() -> str:
-    return _SM12X_APPLY_NAME
-
-
-def _try_autoload_sm12x_apply() -> None:
-    """Import the FlashInfer-next strand's sm_12x choice module if this tree has
-    it; it registers itself. Absent module = fork CUTLASS W4A4, never an error."""
-    if _SM12X_APPLY is not None:
-        return
-    try:
-        import importlib
-
-        importlib.import_module("sglang.srt.layers.quantization.nvfp4_sm12x_choice")
-    except ImportError:
-        return
-
-
-# ---------------------------------------------------------------------------
 # Per-rank resolution (pure; the desk tests drive it with a fake capability).
 # ---------------------------------------------------------------------------
 
@@ -241,7 +192,6 @@ def resolve_this_rank() -> RankKernelChoice:
     from sglang.srt.utils.common import get_device_capability
 
     _try_autoload_w4a8_kernel()
-    _try_autoload_sm12x_apply()
     cap = get_device_capability()
     if cap is None or cap[0] is None:
         raise NativeMixedUnsupported("native-mixed needs a CUDA device.")
@@ -261,12 +211,7 @@ def resolve_this_rank() -> RankKernelChoice:
         choice.capability[1],
         choice.backend,
         choice.reason,
-        f" [kernel {w4a8_kernel_name()}]" if choice.backend == "w4a8_int8"
-        else (
-            f" [sm12x hook {sm12x_apply_name()}]"
-            if sm12x_apply() is not None and int(cap[0]) == 12
-            else ""
-        ),
+        f" [kernel {w4a8_kernel_name()}]" if choice.backend == "w4a8_int8" else "",
     )
     return choice
 
