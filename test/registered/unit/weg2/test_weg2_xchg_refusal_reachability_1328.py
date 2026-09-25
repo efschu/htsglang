@@ -327,6 +327,13 @@ class _Index:
         self.global_writers: dict[tuple[str, str], set[str]] = defaultdict(set)
         #: module-level names read -> {reader qual}
         self.global_readers: dict[tuple[str, str], set[str]] = defaultdict(set)
+        #: module-level names a function hands back in a ``return`` -> {qual}
+        #: (a memoizing getter: written and read by ONE function whose callers
+        #: receive the value -- acted on, so not the W84 shape)
+        self.global_returned: dict[tuple[str, str], set[str]] = defaultdict(set)
+        #: module-level names a function tests against ``None`` (``X is None``)
+        #: -> {qual}: the memo guard, the second half of the getter shape
+        self.global_none_checked: dict[tuple[str, str], set[str]] = defaultdict(set)
         #: every module-level assignment target, per module
         self.module_globals: dict[str, set[str]] = defaultdict(set)
 
@@ -445,6 +452,22 @@ class _IndexVisitor(ast.NodeVisitor):
                 self.idx.refs[owner].add(node.attr)
         self.generic_visit(node)
 
+    def visit_Compare(self, node: ast.Compare) -> None:
+        owner = self._owner()
+        if (owner is not None and isinstance(node.left, ast.Name)
+                and any(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops)
+                and any(isinstance(c, ast.Constant) and c.value is None for c in node.comparators)):
+            self.idx.global_none_checked[(self.rel, node.left.id)].add(owner)
+        self.generic_visit(node)
+
+    def visit_Return(self, node: ast.Return) -> None:
+        owner = self._owner()
+        if owner is not None and node.value is not None:
+            for sub in ast.walk(node.value):
+                if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                    self.idx.global_returned[(self.rel, sub.id)].add(owner)
+        self.generic_visit(node)
+
     # -- raises ------------------------------------------------------------
     def visit_Raise(self, node: ast.Raise) -> None:
         if self.is_lane and node.exc is not None:
@@ -546,7 +569,14 @@ def orphan_verdicts(idx: _Index, entries: tuple[tuple[str, str], ...],
         live_writers = sorted(w for w in writers if w in reach)
         if not live_writers:
             continue          # nothing records it on a live path -> no debt
-        readers = {r for r in idx.global_readers.get((rel, name), ()) if r not in writers}
+        # A writer that guards the slot with ``is None`` AND RETURNS it is a memoizing getter
+        # (weight_exchange_bounce ``_ptr_attrs_binding`` / ``_PTR_ATTRS_BINDING``, 3ff1ff3e6b):
+        # its callers receive the value, so it is read. Any other self-read stays excluded --
+        # a setter that merely returns what it stored is still the W84 shape.
+        memo = (idx.global_returned.get((rel, name), set())
+                & idx.global_none_checked.get((rel, name), set()))
+        readers = {r for r in idx.global_readers.get((rel, name), ())
+                   if r not in writers or r in memo}
         live_readers = sorted(r for r in readers if r in reach)
         if not live_readers:
             out.append((rel, name, live_writers, sorted(readers)))

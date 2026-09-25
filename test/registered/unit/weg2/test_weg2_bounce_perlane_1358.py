@@ -100,10 +100,18 @@ class TheLaneChecksTheLedgersCount(CustomTestCase):
         # have compared against the wrong occurrence -- the same trap as
         # matching a marker inside the prose that describes it (#1362
         # [22-fix3]).
-        guard = src.index("the ledger priced ")
-        alloc = src.index("bx.run_bounce_leg(", guard)
+        # #1378 xsn45 (a60ef6efc9) retired the lane machinery: the production
+        # legs allocate through `bx.run_sequential_units(`, and the one
+        # `bx.run_bounce_leg(` left is the unsplit form for hermetic callers
+        # and diagonal-only legs, which returns ABOVE the guard (one lane, it
+        # cannot out-count the ledger). The pin follows the production call.
+        leg = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_xchg_bounce_leg)
+        guard = leg.index("the ledger priced ")
+        alloc = leg.index("bx.run_sequential_units(", guard)
         self.assertLess(guard, alloc,
                         "the count must be checked BEFORE a buffer is created")
+        # and the guard is a RAISE, not a comment that names it
+        self.assertIn("raise hl.Weg2XchgLanesUnmeasured(", leg[:alloc])
 
 
 class TheCushionIsReservedNotOnlyPredicted(CustomTestCase):
