@@ -359,19 +359,15 @@ class TestLayer(CustomTestCase):
 
 
 class TestSm12xSeam(CustomTestCase):
-    def tearDown(self):
-        nm.unregister_sm12x_apply()
+    """Strand F's sm_12x W4A16 hook: ONE call in apply, after the sm_8x
+    branches; the 3080 (marlin_native_inplace) never reaches it."""
 
-    def test_registered_hook_serves_and_none_falls_through(self):
+    def test_the_5090_rank_asks_the_hook_and_none_falls_through(self):
         method, l_nat = _loaded_layer(Fp4GemmRunnerBackend.CUTLASS)
-        seen = []
-
-        def hook(layer, x, bias):
-            seen.append(x.shape[0])
-            return torch.ones(x.shape[0], 512) if x.shape[0] <= 4 else None
-
-        nm.register_sm12x_apply(hook, "test")
-        with _backend(Fp4GemmRunnerBackend.CUTLASS):
+        with _backend(Fp4GemmRunnerBackend.CUTLASS), mock.patch(
+            "sglang.srt.layers.quantization.modelopt_quant.maybe_apply_sm12x_w4a16",
+            side_effect=lambda layer, x, bias, be: torch.ones(x.shape[0], 512) if x.shape[0] <= 4 else None,
+        ) as hook:
             out = method.apply(l_nat, torch.randn(2, 512, dtype=torch.bfloat16))
             self.assertTrue(torch.equal(out, torch.ones(2, 512)))
             with mock.patch(
@@ -379,7 +375,22 @@ class TestSm12xSeam(CustomTestCase):
                 side_effect=RuntimeError("fell through to W4A4"),
             ), self.assertRaisesRegex(RuntimeError, "fell through"):
                 method.apply(l_nat, torch.randn(8, 512, dtype=torch.bfloat16))
-        self.assertEqual(seen, [2, 8])
+        self.assertEqual(hook.call_count, 2)
+        self.assertEqual(hook.call_args[0][3], "cutlass")
+
+    def test_the_3080_rank_never_reaches_the_hook(self):
+        method, l_mar = _loaded_layer(Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE)
+        with _backend(Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE), mock.patch(
+            "sglang.srt.layers.quantization.modelopt_quant.maybe_apply_sm12x_w4a16"
+        ) as hook, mock.patch.object(mi, "apply", return_value=torch.zeros(1)):
+            method.apply(l_mar, torch.randn(2, 512, dtype=torch.bfloat16))
+        hook.assert_not_called()
+
+    def test_weight_global_scale_is_bound_on_every_native_mixed_rank(self):
+        """F's alpha = weight_global_scale (= max(weight_scale_2))."""
+        for b in (Fp4GemmRunnerBackend.CUTLASS, Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE):
+            _, layer = _loaded_layer(b)
+            self.assertAlmostEqual(float(layer.weight_global_scale), 0.003, places=6)
 
 
 class TestFlipHooks(CustomTestCase):

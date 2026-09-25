@@ -369,11 +369,13 @@ Inline-PTX `cvt.rn.bf16x2.e2m1x2` / `cvt.rn.bf16x2.e4m3x2` (nur Blackwell bzw. s
 Instruktionen nicht; das ist eine Architekturgrenze, kein Upgrade-Risiko. Das Release 0.7.0 (22.09.) enthält ihn nicht.
 Das `cute-dsl`-Backend in 0.6.14 ist sm_100+ (TMA, Cluster) und packt um. Also Weg (b).
 Für die **5090 im Decode** ist cute-dsl-native dagegen genau richtig (W4A16 nativ, Upstream: down M=1 1,25× gegen
-Marlin). Das hängt am FlashInfer-Upgrade (Strang F) und kommt über die Naht `register_sm12x_apply` (unten).
+Marlin). Das hängt am FlashInfer-Upgrade (Strang F); Fs Kernelwahl ist eingehängt (unten).
 
 **Dispatch** (`nvfp4_native_mixed.resolve_rank_backend`), Default der Option bleibt AUS:
-- sm_12x → `cutlass` (W4A4). Optional ein registrierter Hook `register_sm12x_apply(fn)` je Aufruf
-  (fn gibt `None` zurück → W4A4). Autoload: Modul `nvfp4_sm12x_choice`, falls vorhanden.
+- sm_12x → `cutlass` (W4A4). Für kleines M Strang Fs `nvfp4_sm12x_w4a16.maybe_apply_sm12x_w4a16` (FlashInfer
+  cute-dsl-native W4A16 auf denselben nativen Bytes, `SGLANG_FP4_SM12X_W4A16_MAX_M`, Default AUS), EIN Aufruf in
+  `ModelOptFp4LinearMethod.apply` nach den sm_8x-Zweigen; `None` → W4A4. alpha = `weight_global_scale`, auf jedem
+  native-mixed-Rang gebunden. Braucht FlashInfer nach 0.7.0 (2f3bc5a) plus CuTe DSL 4.7.1 (Fs Zweig).
 - sm_8x → `marlin_native_inplace` (Default) oder `w4a8_int8` mit `SGLANG_FP4_NATIVE_MIXED_SM8X=w4a8` (N4A-Naht bleibt).
 - Die frühere Env `SGLANG_FP4_NATIVE_MIXED_ALLOW_MARLIN` (Marlin mit eigenem Layout) entfällt.
 

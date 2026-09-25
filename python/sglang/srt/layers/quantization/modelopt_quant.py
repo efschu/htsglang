@@ -1929,14 +1929,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             from sglang.srt.layers.quantization import nvfp4_marlin_inplace
 
             return nvfp4_marlin_inplace.apply(layer, x, bias)
-        if is_fp4_native_mixed():
-            from sglang.srt.layers.quantization.nvfp4_native_mixed import sm12x_apply
-
-            hook = sm12x_apply()
-            if hook is not None and not isinstance(x, tuple):
-                out = hook(layer, x, bias)
-                if out is not None:
-                    return out
 
         # sm_12x small-M W4A16 on the same native bytes (default OFF:
         # SGLANG_FP4_SM12X_W4A16_MAX_M unset -> None after one int compare).
