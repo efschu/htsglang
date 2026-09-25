@@ -498,6 +498,23 @@ def prepare_layer(layer, *, repack: Optional[RepackFn] = None, make_workspace: b
             "marlin-inplace: negative NVFP4 block scales; the Marlin scale format "
             "drops the sign, so the flip round trip would not be exact. Refusing."
         )
+    if getattr(layer, "params_dtype", torch.bfloat16) == torch.bfloat16:
+        # vLLM #34694 (V50 25.09.): Marlin's dequant_fp8_scales<bf16> widens an
+        # E4M3 SUBNORMAL block scale (exponent bits 0, value < 2^-6) to ~2^-112,
+        # zeroing that block. The kernel is shared with upstream and unfixed; the
+        # upstream fix (#34577) rescales the stored scales, which would change
+        # the shared native bytes. Our 27B checkpoints have none (min scale 0.94);
+        # name it loudly for any other checkpoint instead of refusing a model
+        # over a few near-zero blocks.
+        u8 = layer.weight_scale.view(torch.uint8)
+        n_sub = int(((u8 & 0x78) == 0).logical_and((u8 & 0x07) != 0).sum())
+        if n_sub:
+            logger.warning(
+                "marlin-inplace: %d subnormal E4M3 block scales (< 2^-6) in a bf16 "
+                "layer [%d x %d]; Marlin bf16 dequant reads them as ~0 (vLLM #34694), "
+                "those blocks contribute nothing.",
+                n_sub, n, k,
+            )
     setattr(layer, BANDS_ATTR, band_table(n, k))
     setattr(layer, LAYER_FLAG, True)
     if make_workspace and getattr(layer, "workspace", None) is None:

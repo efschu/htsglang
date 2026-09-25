@@ -318,6 +318,22 @@ class TestLayer(CustomTestCase):
         with _backend(Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE), self.assertRaisesRegex(RuntimeError, "negative"):
             method.process_weights_after_loading(layer)
 
+    def test_subnormal_scales_are_named_in_bf16(self):
+        """vLLM #34694: a subnormal E4M3 block scale is read as ~0 by Marlin bf16."""
+        method = ModelOptFp4LinearMethod(ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True, group_size=16))
+        layer = torch.nn.Module()
+        method.create_weights(layer, 256, [128], 256, 128, torch.bfloat16, weight_loader=None)
+        sc = torch.full(layer.weight_scale.shape, 0x38, dtype=torch.uint8)  # 1.0
+        sc[0, :3] = 0x05  # three subnormals
+        layer.weight_scale.data.copy_(sc.view(torch.float8_e4m3fn))
+        layer.input_scale.data.fill_(0.02)
+        layer.weight_scale_2.data.fill_(0.003)
+        with _backend(Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE), self.assertLogs(
+            mi.logger, level="WARNING"
+        ) as cm:
+            method.process_weights_after_loading(layer)
+        self.assertTrue(any("3 subnormal E4M3 block scales" in m for m in cm.output), cm.output)
+
     def test_apply_runs_one_gemm_per_band_and_concatenates(self):
         """A fake Marlin GEMM that reads the Marlin band views back through the
         reference inverse: the banded apply must equal the dense native GEMM."""
