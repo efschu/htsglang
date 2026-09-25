@@ -7,5 +7,5 @@ export PYTHONPATH=$WT/python
 export TVM_FFI_CACHE_DIR=$J/tvm-ffi TRITON_CACHE_DIR=$J/triton TORCH_EXTENSIONS_DIR=$J/torch_ext
 export FLASHINFER_WORKSPACE_BASE=$J/fi CUTE_DSL_CACHE_DIR=$J/cutedsl TMPDIR=$J/tmp
 export TORCHINDUCTOR_CACHE_DIR=$J/inductor XDG_CACHE_HOME=$J/xdg CUDA_CACHE_PATH=$J/nvcache
-export FLASHINFER_CUDA_ARCH_LIST="12.0f"
+export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-12.0f}"
 exec /spinning/htsglang-gpu/.venv/bin/python $WT/benchmark/nvfp4_native/bench_5090_nvfp4.py "$@"

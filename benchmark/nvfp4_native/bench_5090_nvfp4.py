@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""5090 NVFP4 native micro-bench (Backlog #38, N4B, 25.09.).
+"""5090 NVFP4 native micro-bench (Backlog #38, N4B, 25.09.); also runs on sm_86
+(native FP4 lanes skipped there) for the 3080 Marlin/INT8/FP8 lanes.
 
 Measures on ONE sm_120 card, per 27B NVFP4 linear shape (RadixArk
 Qwen3.8-27B-NVFP4, modelopt MIXED_PRECISION: NVFP4 only on mlp gate/up/down and
@@ -164,7 +165,8 @@ def main():
     dev = torch.cuda.current_device()
     cap = torch.cuda.get_device_capability(dev)
     name = torch.cuda.get_device_name(dev)
-    assert cap[0] == 12, f"this bench is for sm_120, got {cap} {name}"
+    assert cap[0] in (8, 12), f"this bench is for sm_120 (and sm_86 for the Marlin/INT8/FP8 lanes), got {cap} {name}"
+    native_fp4 = cap[0] >= 10
     meta = {"device": name, "cap": cap, "torch": torch.__version__,
             "clock_note": "clocks/power as set on the rig (5090 400 W limit per operator)",
             "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
@@ -217,12 +219,14 @@ def main():
         C = max(1, math.ceil(ROT_TARGET / fp4_bytes)) if shape != "P.lm_head" else 1
         C = min(C, 8)
         # --- native layers (backend cutlass) ---
-        try:
-            nat = [make_nvfp4_layer(method, N, K, "cutlass", fused=shape.endswith("gate_up")) for _ in range(C)]
-        except Exception as e:  # noqa: BLE001
-            traceback.print_exc()
-            rec_err(shape, 0, "make_native", e)
-            nat = []
+        nat = []
+        if native_fp4:
+            try:
+                nat = [make_nvfp4_layer(method, N, K, "cutlass", fused=shape.endswith("gate_up")) for _ in range(C)]
+            except Exception as e:  # noqa: BLE001
+                traceback.print_exc()
+                rec_err(shape, 0, "make_native", e)
+                nat = []
         for M in ms:
             x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
             if nat:
@@ -390,6 +394,21 @@ def main():
                 traceback.print_exc()
                 rec_err(shape, 0, variant, e)
             torch.cuda.empty_cache()
+        # dequant e4m3 -> bf16 per call, then cuBLAS (the "no special kernel" W8A16 path)
+        try:
+            w8 = [(torch.randn(N, K, device="cuda") * 0.5).to(torch.float8_e4m3fn) for _ in range(C8)]
+            for M in ms:
+                x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+                rot = Rot(w8)
+                try:
+                    us, mode = timed(lambda: torch.mm(x, rot.next().to(torch.bfloat16).t()), args.reps)
+                    rec(shape, M, N, K, "f8_deq_bf16", us, mode, {"GBps_w": round(wbytes / us / 1e3, 0)})
+                except Exception as e:  # noqa: BLE001
+                    rec_err(shape, M, "f8_deq_bf16", e)
+            del w8
+        except Exception as e:  # noqa: BLE001
+            rec_err(shape, 0, "f8_deq_bf16", e)
+        torch.cuda.empty_cache()
         if int8_scaled_mm is not None:
             try:
                 ws = [torch.randint(-127, 127, (N, K), dtype=torch.int8, device="cuda").t() for _ in range(C8)]
