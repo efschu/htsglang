@@ -78,6 +78,9 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.model_loader.gguf_numpy_hugepage import (
+    numpy_hugepage_off_during_load,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -2431,6 +2434,13 @@ class GGUFModelLoader(BaseModelLoader):
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config.model_path)
 
+    # The whole GGUF load -- reader, name map, weight stream, dequant, inverse
+    # transforms -- runs with numpy's MADV_HUGEPAGE hint OFF, in the rank
+    # process itself (no env hop). Under the host's THP defrag=madvise every
+    # 2 MiB first-touch fault of a dequant buffer compacted synchronously;
+    # behind group P's pinned arena that was 670 s of sys per D rank
+    # (weg2rc7gg, 2026-09-25). See gguf_numpy_hugepage.py.
+    @numpy_hugepage_off_during_load
     def load_model(
         self,
         *,
