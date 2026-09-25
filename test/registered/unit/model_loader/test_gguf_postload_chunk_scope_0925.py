@@ -254,10 +254,12 @@ class RealGgufAllocations(CustomTestCase):
         )
         self.assertEqual(saver.current, "weights")
 
-    def test_flat_container_in_the_chunk_workspace_in_the_base_tag(self):
+    def test_flat_container_and_its_workspace_in_the_layer_chunk(self):
         """The merged qweight's flat container is allocated in the post-load
-        pass under weights_5; the dequant workspace ONCE, afterwards, under the
-        base tag (Operator order: _DEQUANT_WS stays in the base scope)."""
+        pass under weights_5; the dequant workspace ONCE, afterwards, in the
+        chunk of the layer that sized it -- weights_5 as well (F1b, boot
+        weg2rc6gg: in the base tag it was the one allocation of a layers-only
+        PP stage and the first P->D flip died on W106)."""
         layer = _gguf_layer("model.layers.40.mlp.gate_up_proj", MERGED)
         fake = SimpleNamespace(
             output_sizes=MERGED, tp_size=1, tp_rank=0, tp_units=None, tp_family=None
@@ -290,7 +292,7 @@ class RealGgufAllocations(CustomTestCase):
         self.assertTrue(flat, log)
         self.assertEqual({tag for *_x, tag in flat}, {"weights_5"})
         self.assertEqual(
-            work, [("empty", torch.bfloat16, max(MERGED) * K_IN, "weights")]
+            work, [("empty", torch.bfloat16, max(MERGED) * K_IN, "weights_5")]
         )
         self.assertEqual(len(G._DEQUANT_WS), 1)
         self.assertEqual(saver.current, "weights")
