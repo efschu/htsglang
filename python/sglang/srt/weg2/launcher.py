@@ -3352,6 +3352,8 @@ def common_flags(
     """
     return [
         "--model-path", model,
+        # 27B line G2: [] unless --tokenizer-path was installed (apply_tokenizer_path).
+        *tokenizer_path_flags(),
         "--trust-remote-code",
         # #1356: TEXT-ONLY BY DEFAULT, on BOTH groups, via the ONE decision the
         # model config already makes (`model_config.py:436-447`, read at
@@ -7094,19 +7096,168 @@ def _weg2_arena_ledger_terms(model: str) -> dict:
         raise Weg2LaunchRefused(f"W108 Weg2ArenaLedgerRefused: the arena term could not be derived: {exc!r}")
 
 
+def model_config_path(model: str) -> str:
+    """The ``config.json`` that describes ``model``, by the SERVER's own rule
+    (``server_args.declared_config_path_for``, the body of
+    ``ServerArgs.declared_config_path``) -- never a second copy of it.
+
+    27B line G2 (2026-09-25): a GGUF launch names the ``.gguf`` FILE, whose
+    config is the SIBLING ``config.json``; ``os.path.join(model, "config.json")``
+    found ``<...>.gguf/config.json`` and every launcher reader died on it. A
+    directory resolves exactly as before. None found: ``FileNotFoundError`` (the
+    type a missing config always raised here, so callers that catch ``OSError``
+    keep their behaviour), naming every place that was looked at."""
+    from sglang.srt.server_args import (
+        declared_config_path_candidates,
+        declared_config_path_for,
+    )
+
+    path = declared_config_path_for(model)
+    if path is None:
+        looked = declared_config_path_candidates(model) or [
+            os.path.join(str(model), "config.json")
+        ]
+        raise FileNotFoundError(
+            2, "no config.json describes %s (looked at %s)" % (model, ", ".join(looked)),
+            looked[-1],
+        )
+    return path
+
+
+def model_is_gguf_file(model: str) -> bool:
+    """Whether ``model`` names a GGUF checkpoint FILE -- the server's own
+    predicate (``check_gguf_file``: a file with the ``.gguf`` suffix or the GGUF
+    magic), the one that turns ``--load-format auto`` into ``gguf`` and the
+    quantization into ``gguf`` (arg_groups/overrides._gguf_quantization)."""
+    from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+
+    return bool(model) and check_gguf_file(model)
+
+
 def _model_config(model: str) -> dict:
-    with open(os.path.join(model, "config.json")) as f:
+    with open(model_config_path(model)) as f:
         return json.load(f)
 
 
+def gguf_backbone_depth(model: str) -> Optional[int]:
+    """A GGUF file's backbone depth as the SERVER reconciles it
+    (``gguf_registry.reconcile_sibling_config``): ``block_count`` minus the
+    NEXTN/MTP draft blocks it counts (``nextn_predict_layers``). None where the
+    metadata does not say. Read once per file (host_ledger.gguf_header_facts)."""
+    return host_ledger.gguf_header_facts(model).backbone_depth
+
+
 def model_num_layers(model: str) -> int:
-    """The backbone depth, through the SERVER's own probe order (fix 6)."""
+    """The backbone depth, through the SERVER's own probe order (fix 6).
+
+    For a GGUF file the loader's authority is the FILE: a depth that differs
+    from the sibling config is reconciled there (the file wins, layer_types
+    rebuilt), and every layer map this launcher derives from the config would
+    then describe another model -- W162, before any card is touched."""
     from sglang.srt.server_args import declared_num_hidden_layers_from_config
 
     n = declared_num_hidden_layers_from_config(_model_config(model))
     if not n or n <= 0:
-        raise Weg2LaunchRefused(f"num_hidden_layers not found in {model}/config.json")
+        raise Weg2LaunchRefused(f"num_hidden_layers not found in {model_config_path(model)}")
+    if model_is_gguf_file(model):
+        depth = gguf_backbone_depth(model)
+        if depth is not None and depth != int(n):
+            raise Weg2LaunchRefused(
+                f"W162 Weg2GgufDepthRefused: {model} carries {depth} backbone "
+                f"blocks, its sibling {model_config_path(model)} declares "
+                f"num_hidden_layers={n}. The loader runs the FILE's depth "
+                "(gguf_registry.reconcile_sibling_config) while the chunk map, "
+                "the P cut and the layer kinds of this launcher come from the "
+                "config -- two sides of one seam on different models. Supply "
+                "the config.json of exactly this GGUF next to it."
+            )
     return int(n)
+
+
+#: --tokenizer-path (27B line G2, 2026-09-25): the tokenizer BOTH groups load.
+#: None, the default, adds nothing to either argv (the server reads the
+#: tokenizer from --model-path, byte-identical to every argv before the flag).
+#: Installed once by :func:`apply_tokenizer_path`, read by every
+#: :func:`common_flags` call, so P and D can never tokenize differently.
+_TOKENIZER_PATH: Dict[str, Optional[str]] = {"path": None}
+
+
+def tokenizer_path_decision(
+    model: str, explicit: str = ""
+) -> Tuple[Optional[str], Optional[str]]:
+    """``(the --tokenizer-path both groups get, or None; a log line or None)``.
+
+    * given: used on BOTH groups, refused (W163) unless it is a directory with
+      one of the server's own sibling tokenizer files -- a typo dies here, not
+      in two groups' tokenizer managers;
+    * not given, not a GGUF file: ``(None, None)`` -- the argv is unchanged;
+    * not given, a GGUF file whose tokenizer the server can find itself
+      (transformers' GGUF route for a non-bespoke arch, or sibling files next
+      to the .gguf): ``(None, line)``;
+    * not given, a bespoke-arch GGUF (qwen35, qwen35moe, gemma4, ...) with no
+      tokenizer next to it: W163 now, instead of the same ValueError in both
+      groups' tokenizer managers after the cards are taken. Nothing is guessed:
+      the fix is named, not applied (the unsloth Qwen3.8-27B GGUF directory
+      ships no tokenizer; the FP8/INT8 checkpoints of the same model carry the
+      same tokenizer.json).
+    """
+    from pathlib import Path
+
+    from sglang.srt.utils.hf_transformers.tokenizer import (
+        _SIBLING_TOKENIZER_FILES,
+        _has_sibling_tokenizer,
+    )
+
+    wanted = ", ".join(_SIBLING_TOKENIZER_FILES)
+    explicit = str(explicit or "").strip()
+    if explicit:
+        if not (os.path.isdir(explicit) and _has_sibling_tokenizer(Path(explicit))):
+            raise Weg2LaunchRefused(
+                f"W163 Weg2TokenizerRefused: --tokenizer-path {explicit!r} is not "
+                f"a directory holding any of {wanted}."
+            )
+        return explicit, f"WEG2 TOKENIZER --tokenizer-path {explicit} (both groups)"
+    if not model_is_gguf_file(model):
+        return None, None
+    from sglang.srt.model_loader.gguf_registry import sibling_config_gguf_archs
+
+    parent = os.path.dirname(os.path.abspath(model))
+    # _peek_bespoke_gguf_arch's derivation (general.architecture of the metadata
+    # part, in the registry's sibling-config set) over the header this launch
+    # reads once anyway -- its own call would parse the GGUF again (8.5 s).
+    header_arch = host_ledger.gguf_header_facts(model).arch
+    arch = header_arch if header_arch in sibling_config_gguf_archs() else None
+    if arch is None:
+        return None, (
+            f"WEG2 TOKENIZER {model}: read by transformers from the GGUF itself "
+            "(not a sibling-config arch)"
+        )
+    if _has_sibling_tokenizer(Path(parent)):
+        return None, f"WEG2 TOKENIZER {model}: the sibling files in {parent} (arch {arch})"
+    raise Weg2LaunchRefused(
+        f"W163 Weg2TokenizerRefused: {model} is a {arch} GGUF, whose tokenizer "
+        f"the server reads ONLY from sibling files, and {parent} holds none of "
+        f"{wanted}. Pass --tokenizer-path <dir> with this model's tokenizer "
+        "(the safetensors checkpoint of the same model), or place the files "
+        "next to the .gguf."
+    )
+
+
+def apply_tokenizer_path(ns) -> Optional[str]:
+    """Install --tokenizer-path once, before any argv is built (the install-once
+    shape of apply_p_prefill_graph); returns the log line, if any."""
+    path, line = tokenizer_path_decision(
+        str(getattr(ns, "model", "") or ""),
+        str(getattr(ns, "tokenizer_path", "") or ""),
+    )
+    _TOKENIZER_PATH["path"] = path
+    return line
+
+
+def tokenizer_path_flags() -> List[str]:
+    """The installed tokenizer as argv words: ``[]`` when none was installed."""
+    path = _TOKENIZER_PATH.get("path")
+    return ["--tokenizer-path", str(path)] if path else []
 
 
 def model_layer_kinds(model: str) -> List[bool]:
@@ -9038,9 +9189,16 @@ FP8_UNIFORM_MARLIN_ENV = {
 
 def checkpoint_quant_method(model_path: str) -> str:
     """``quantization_config.quant_method`` of the checkpoint's config.json (top
-    level or ``text_config``), lower case; ``""`` for none or unreadable."""
+    level or ``text_config``), lower case; ``""`` for none or unreadable.
+
+    A GGUF file is ``"gguf"``: the server's own override for it
+    (arg_groups/overrides._gguf_quantization), and its sibling config.json is an
+    upstream config that says nothing about the file's quantization (27B line
+    G2)."""
+    if model_is_gguf_file(str(model_path)):
+        return "gguf"
     try:
-        with open(os.path.join(str(model_path), "config.json")) as f:
+        with open(model_config_path(str(model_path))) as f:
             cfg = json.load(f)
     except (OSError, ValueError):
         return ""
@@ -10523,7 +10681,7 @@ def solve_p_cut(
     from sglang.srt.planner import pp_cut as _pp_cut
     from sglang.srt.planner import pp_cut_launch as _cut
 
-    cfg_path = os.path.join(model, "config.json")
+    cfg_path = model_config_path(model)
     with open(cfg_path) as fh:
         cfg = json.load(fh)
     text_cfg = cfg.get("text_config") or cfg
@@ -11268,6 +11426,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--tag", required=True)
     ap.add_argument("--venv", default=VENV_DEFAULT)
     ap.add_argument("--model", default=MODEL_DEFAULT)
+    ap.add_argument(
+        "--tokenizer-path", default="",
+        help="27B line G2: the tokenizer directory BOTH groups load "
+             "(--tokenizer-path on P and D). Default empty: nothing is added and "
+             "the server reads the tokenizer from --model -- byte-identical argv. "
+             "Needed for a GGUF --model whose directory holds no tokenizer files "
+             "(qwen35 GGUFs load their tokenizer only from sibling files); the "
+             "launcher refuses such a GGUF without it (W163) before any card is "
+             "touched.",
+    )
     # #1360: THE NAMED DEVIATION, flag only. The user's standing rule of
     # 2026-09-12 makes the reap mark soft -- crossing it is allowed WITH a
     # reason and a runtime latch, never silently -- and until now the launcher
@@ -12697,6 +12865,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ns = build_parser().parse_args(argv)
     apply_spec_form(ns)
     apply_p_prefill_graph(ns)
+    # 27B line G2: the one tokenizer both groups load, installed before any
+    # argv is built; its line is logged with the checkpoint lines under 1a'.
+    tokenizer_line = apply_tokenizer_path(ns)
     # #1386: THE SWITCH IS RESOLVED HERE, ONCE, AS EARLY AS `ns` EXISTS --
     # earlier than `draft_kv_on_p` below, because the FIRST `common_flags`
     # call (the sentinel `chunk_tokens` solve, several hundred lines down)
@@ -12955,6 +13126,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _calib_line = p_cut_calibration_line(str(ns.model), _quant)
     if _calib_line:
         log(_calib_line)
+    if tokenizer_line:
+        log(tokenizer_line)
 
     # 1b. #1233 one-backup flip geometry + the patched saver hook
     n_layers = model_num_layers(ns.model)
