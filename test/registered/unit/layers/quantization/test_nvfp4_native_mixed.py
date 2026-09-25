@@ -344,5 +344,38 @@ class TestExchangeTileView(CustomTestCase):
         self.assertEqual(sh._in_nvfp4_sf_tiles(owner, "weight", (128, 128)), (128, 128))
 
 
+class TestLauncherFlag(CustomTestCase):
+    def test_default_argv_unchanged(self):
+        from sglang.srt.weg2 import launcher as L
+
+        self.assertEqual(L.uniform_marlin_argv("modelopt", True), ["--fp4-gemm-backend", "marlin"])
+        self.assertEqual(L.uniform_marlin_argv("modelopt", False), [])
+        self.assertEqual(L.uniform_marlin_argv("compressed-tensors", True), [])
+        self.assertIsNone(L.fp4_native_mixed_refusal("modelopt", True, False))
+        self.assertIsNone(L.fp4_native_mixed_refusal("fp8", False, False))
+
+    def test_native_mixed_argv(self):
+        from sglang.srt.weg2 import launcher as L
+
+        self.assertEqual(
+            L.uniform_marlin_argv("modelopt", True, True), ["--fp4-gemm-backend", "native-mixed"]
+        )
+        self.assertIsNone(L.fp4_native_mixed_refusal("modelopt", True, True))
+
+    def test_native_mixed_refusals(self):
+        from sglang.srt.weg2 import launcher as L
+
+        self.assertIn("--fp8-uniform-marlin", L.fp4_native_mixed_refusal("modelopt", False, True))
+        self.assertIn("ModelOpt", L.fp4_native_mixed_refusal("compressed-tensors", True, True))
+
+    def test_pinned_marlin_extra_is_refused_against_native_mixed(self):
+        from sglang.srt.weg2 import launcher as L
+
+        with self.assertRaises(L.Weg2LaunchRefused):
+            L.with_uniform_marlin_argv(
+                "--fp4-gemm-backend marlin", L.uniform_marlin_argv("modelopt", True, True)
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

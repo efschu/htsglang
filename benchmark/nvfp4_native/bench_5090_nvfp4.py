@@ -209,7 +209,10 @@ def main():
         rows.append(r)
         print(json.dumps(r), flush=True)
 
+    all_ms = ms
     for shape, N, K in shapes:
+        # lm_head only ever sees the sampled rows; M=4096 would be a 2 GB logits tensor.
+        ms = [m for m in all_ms if m <= 512] if shape == "P.lm_head" else all_ms
         fp4_bytes = N * K // 2 + N * K // 16
         C = max(1, math.ceil(ROT_TARGET / fp4_bytes)) if shape != "P.lm_head" else 1
         C = min(C, 8)
@@ -355,6 +358,7 @@ def main():
         ModelOptFp8LinearMethod,
     )
     fcfg = ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+    ms = all_ms
     for shape, parts, K in [s for s in FP8_SHAPES if s[0] in args.fp8_shapes.split(",")]:
         N = sum(parts)
         wbytes = N * K
