@@ -467,6 +467,11 @@ class SchedulerWeightUpdaterManager:
     #: ``AttributeError`` raised ONLY on the retry path, i.e. only after a
     #: failure has already happened -- the worst possible place to learn it.
     weg2_leg_ledger: Any = None
+    #: #38 N4C (93bc802e34): set when the NVFP4 draft was refilled from disk at
+    #: this wake (its content is native, not Marlin), read-and-cleared by
+    #: :meth:`_weg2_nvfp4_marlin_after_wake`. A FIELD for the sixth time in this
+    #: class: the lazy write killed EVERY rank's first wake in rc8a (INT8 too).
+    _weg2_nvfp4_draft_disk_reloaded: bool = False
 
     #: #1329: FIELDS FOR THE FOURTH AND FIFTH TIME IN THIS CLASS, and the
     #: comment above called it three commits early. ``slots=True`` turns a
