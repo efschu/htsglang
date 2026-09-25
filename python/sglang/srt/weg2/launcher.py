@@ -845,7 +845,14 @@ def p_prefill_graph_bucket() -> int:
 
 def p_chunked_prefill_tokens() -> int:
     """Group P's --chunked-prefill-size: the graph bucket when the P prefill
-    graph is on, the common constant otherwise (byte-identical default)."""
+    graph is on, the common constant otherwise (byte-identical default).
+    Under --p-chunk-policy dynamic it is the plan's CEILING (--p-chunk-max):
+    the per-forward width comes from the plan, and every allocation sized
+    from this value (corridor, frames, barlink buffers) must fund the widest
+    chunk the plan may choose."""
+    spec = _P_CHUNK.get("spec")
+    if spec is not None:
+        return int(spec.limits.max_tokens)
     return p_prefill_graph_bucket() or CHUNKED_PREFILL_TOKENS
 
 
@@ -978,6 +985,214 @@ def p_prefill_graph_line() -> str:
         "capture_mib=' (cost) and 'PREFILL-GRAPH eager reason=' (every batch "
         "the graph did not take)"
     )
+
+
+#: --p-chunk-policy (27B + NF line, user orders 25.09. ~21:40Z/21:41Z:
+#: "dynamische chunkgroesse brauchen wir. umsetzen"). The rule lives in
+#: weg2/p_chunk_policy.py (pure; the NF line takes the same interface). This
+#: block only turns the launcher's flags into a PolicySpec, prices P's
+#: --chunked-prefill-size at the plan's CEILING and hands the spec to group P.
+#: 'fixed' (the default for this release candidate) changes NOTHING: no env,
+#: argv_p and the P form key byte-identical.
+P_CHUNK_POLICY_DEFAULT = "fixed"
+#: The plan's ceiling. 2048 = 4x the 512 graph chunk and half the 4096 P ran
+#: eager before the graph (so inside the envelope P's corridor already funded);
+#: the planner prices group P's activation corridor, frames and barlink
+#: buffers at it, because under 'dynamic' it IS P's --chunked-prefill-size.
+P_CHUNK_MAX_DEFAULT = 2048
+P_CHUNK_MODEL_DEFAULT = "builtin-int8"
+P_CHUNK_MSCALE_DEFAULT = "int8"
+#: BUILTIN INT8 stage model (desk, 25.09., MEASURED where stated):
+#: a_ms / b_ms_per_1k = pgap_stage_fit.fit_rank_lines over prefixes [0, 32768)
+#: of boot weg2rc7c (a54f21cda0, INT8, cut 42/11/11, 512 graph, 1076-1082
+#: device-bound chunks per rank, sd 2.1-2.5 ms): per 512 chunk,
+#: t = a + b * (prefix + 256) / 1000.
+#: fwd_overhead_ms = PP0's mean #PGAP gpu_gap_ms below 50 ms (3.73, n=2101):
+#: the bottleneck stage's per-forward idle, i.e. a per-CHUNK cost; PP1/PP2's
+#: gaps are pipeline waiting, which the flow shop produces itself.
+#: eager_floor_ms = the host launch of an EAGER P forward, xsn422 #PGAP
+#: (63/42/74 ms per stage, before the graph): a chunk above the largest graph
+#: bucket runs eager and is paced by it when its device time is shorter.
+P_CHUNK_BUILTIN_INT8 = (
+    {"a_ms": 43.94, "b_ms_per_1k": 1.022, "fwd_overhead_ms": 3.73, "eager_floor_ms": 63.0},
+    {"a_ms": 36.87, "b_ms_per_1k": 0.922, "fwd_overhead_ms": 0.0, "eager_floor_ms": 42.0},
+    {"a_ms": 40.41, "b_ms_per_1k": 0.995, "fwd_overhead_ms": 0.0, "eager_floor_ms": 74.0},
+)
+#: Per-token cost relative to M=512, per stage, as a function of the chunk.
+#: 'int8' PP0 (5090): kernel bench n4b_bench_0925_1239 -- the INT8 GEMMs
+#: (gate_up/down/qkvz/o) cost 12.3 % less per token at M=4096 than at 512
+#: (470 -> 535 TOPS gate_up), GEMMs are ~87 % of PP0's 512 chunk (35.8 of
+#: ~41 ms by the same bench), log-interpolated between 512 and 4096 -- a
+#: HOCHRECHNUNG, not a measurement. 256 is a guess (+15 %). The 3080 stages
+#: have NO bench above M=512, so they are FLAT (no gain assumed) until the
+#: metal ladder measures them. 'nvfp4' PP0: NVFP4 GEMM 5090 -21 % (gate_up)
+#: / -28 % (down) per token at 4096, same share -- also a HOCHRECHNUNG.
+P_CHUNK_MSCALES = {
+    "flat": ({512: 1.0}, {512: 1.0}, {512: 1.0}),
+    "int8": (
+        {256: 1.15, 512: 1.0, 1024: 0.964, 2048: 0.929, 4096: 0.893},
+        {256: 1.10, 512: 1.0},
+        {256: 1.10, 512: 1.0},
+    ),
+    "nvfp4": (
+        {256: 1.10, 512: 1.0, 1024: 0.93, 2048: 0.87, 4096: 0.80},
+        {256: 1.10, 512: 1.0},
+        {256: 1.10, 512: 1.0},
+    ),
+}
+#: The fixed part of a GRAPH forward that does not scale with the chunk
+#: (replay launch, stage in/out), ms. Small by the #PGAP host lines (launch 3).
+P_CHUNK_GRAPH_FIXED_MS = 2.0
+#: The dry-run ladder the launcher prints its plan for (the Messplan rungs).
+P_CHUNK_DRY_RUN_TOKENS = (2048, 8192, 32768, 131072)
+_P_CHUNK: Dict[str, object] = {"policy": P_CHUNK_POLICY_DEFAULT, "spec": None}
+
+
+def _p_chunk_stage(a_ms: float, b_ms_per_1k: float, fwd_overhead_ms: float,
+                   eager_floor_ms: float, mscale: Dict[int, float], name: str):
+    """One stage of the policy model from a 512-chunk line and a scale curve."""
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+    ref = 512
+    fixed = min(P_CHUNK_GRAPH_FIXED_MS, float(a_ms))
+    grid = sorted(set(mscale) | {256, 512, 1024, 2048, 4096})
+    pts = []
+    for m in grid:
+        r = _p_chunk_interp(mscale, m)
+        pts.append((m, float(fwd_overhead_ms) + fixed + (float(a_ms) - fixed) * (m / ref) * r))
+    return _pcp.StageModel(tuple(pts), float(b_ms_per_1k) / ref, float(eager_floor_ms), name)
+
+
+def _p_chunk_interp(curve: Dict[int, float], m: int) -> float:
+    """``curve`` in log2(M), flat beyond its ends (a missing point is no gain)."""
+    keys = sorted(curve)
+    if m <= keys[0]:
+        return float(curve[keys[0]])
+    if m >= keys[-1]:
+        return float(curve[keys[-1]])
+    for lo, hi in zip(keys, keys[1:]):
+        if lo <= m <= hi:
+            f = (math.log2(m) - math.log2(lo)) / (math.log2(hi) - math.log2(lo))
+            return float(curve[lo]) + f * (float(curve[hi]) - float(curve[lo]))
+    return 1.0
+
+
+def p_chunk_stage_model(src: str, mscale: str, stages: int = 3):
+    """``(stage models, source text)`` for --p-chunk-model / --p-chunk-mscale."""
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+    src = str(src or P_CHUNK_MODEL_DEFAULT).strip()
+    if mscale not in P_CHUNK_MSCALES:
+        raise SystemExit(f"--p-chunk-mscale {mscale!r}: one of {sorted(P_CHUNK_MSCALES)}")
+    curves = P_CHUNK_MSCALES[mscale]
+    if src == "builtin-int8":
+        rows = P_CHUNK_BUILTIN_INT8
+        source = f"builtin-int8 (weg2rc7c fit [0,32k), mscale={mscale})"
+    elif src.startswith("fit:"):
+        from sglang.srt.planner import pgap_stage_fit as _psf
+
+        path = src[4:]
+        try:
+            lines = _psf.fit_rank_lines(_psf.read_pgap_log(path), lo=0, hi=32768)
+        except (OSError, _psf.StageFitRefused) as exc:
+            raise SystemExit(f"--p-chunk-model {src}: {exc}")
+        rows = tuple(
+            {"a_ms": ln.a_ms, "b_ms_per_1k": ln.b_ms_per_1k,
+             "fwd_overhead_ms": P_CHUNK_BUILTIN_INT8[min(i, 2)]["fwd_overhead_ms"],
+             "eager_floor_ms": P_CHUNK_BUILTIN_INT8[min(i, 2)]["eager_floor_ms"]}
+            for i, ln in enumerate(lines)
+        )
+        source = f"fit:{os.path.basename(path)} [0,32k) mscale={mscale}"
+    else:
+        try:
+            with open(src) as fh:
+                data = json.load(fh)
+            models = tuple(_pcp.StageModel.from_json(s) for s in data["stages"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise SystemExit(f"--p-chunk-model {src}: not builtin-int8, fit:<P.log> or a "
+                             f"readable JSON with 'stages': {exc}")
+        if len(models) != stages:
+            raise SystemExit(f"--p-chunk-model {src}: {len(models)} stages, group P has {stages}")
+        return models, f"json:{os.path.basename(src)}"
+    if len(rows) != stages:
+        raise SystemExit(f"--p-chunk-model {src}: {len(rows)} stages, group P has {stages}")
+    models = tuple(
+        _p_chunk_stage(r["a_ms"], r["b_ms_per_1k"], r["fwd_overhead_ms"], r["eager_floor_ms"],
+                       curves[min(i, len(curves) - 1)], f"PP{i}")
+        for i, r in enumerate(rows)
+    )
+    return models, source
+
+
+def apply_p_chunk_policy(ns) -> None:
+    """Install --p-chunk-policy once, AFTER apply_p_prefill_graph (it reads the
+    graph buckets) and before any argv is built: p_chunked_prefill_tokens()
+    reads the ceiling from here, so the cut solve, the ledger, the form key
+    and the shipped argv see ONE value."""
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+    policy = str(getattr(ns, "p_chunk_policy", P_CHUNK_POLICY_DEFAULT) or P_CHUNK_POLICY_DEFAULT)
+    if policy not in _pcp.POLICIES:
+        raise SystemExit(f"--p-chunk-policy {policy!r}: one of {list(_pcp.POLICIES)}")
+    _P_CHUNK["policy"] = policy
+    _P_CHUNK["spec"] = None
+    if policy == _pcp.POLICY_FIXED:
+        return
+    bucket = p_prefill_graph_bucket()
+    fixed = int(getattr(ns, "p_chunk_fixed", 0) or 0) or bucket or CHUNKED_PREFILL_TOKENS
+    cap = int(getattr(ns, "p_chunk_max", P_CHUNK_MAX_DEFAULT) or P_CHUNK_MAX_DEFAULT)
+    low = int(getattr(ns, "p_chunk_min", 0) or 0) or fixed
+    buckets = tuple(b for b in p_prefill_graph_buckets())
+    if bucket and cap < bucket:
+        raise SystemExit(f"--p-chunk-max {cap} is below the P prefill graph bucket {bucket}")
+    models, source = p_chunk_stage_model(
+        str(getattr(ns, "p_chunk_model", P_CHUNK_MODEL_DEFAULT) or P_CHUNK_MODEL_DEFAULT),
+        str(getattr(ns, "p_chunk_mscale", P_CHUNK_MSCALE_DEFAULT) or P_CHUNK_MSCALE_DEFAULT),
+        P_PREFILL_GRAPH_STAGES,
+    )
+    try:
+        limits = _pcp.ChunkLimits(
+            max_tokens=cap, min_tokens=low, fixed_tokens=fixed, page=1,
+            grid=int(getattr(ns, "p_chunk_grid", 0) or 0),
+            graph_buckets=buckets, eager=True,
+            min_gain=float(getattr(ns, "p_chunk_min_gain", _pcp.DEFAULT_MIN_GAIN)),
+        )
+    except _pcp.ChunkPolicyError as exc:
+        raise SystemExit(f"--p-chunk-policy dynamic: {exc}")
+    _P_CHUNK["spec"] = _pcp.PolicySpec(tuple(models), limits, source)
+
+
+def p_chunk_policy_spec():
+    """The installed PolicySpec, None under 'fixed'."""
+    return _P_CHUNK.get("spec")
+
+
+def p_chunk_policy_env() -> Dict[str, str]:
+    """Group P's environment for the policy; {} under 'fixed' (byte-identical)."""
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+    spec = p_chunk_policy_spec()
+    if spec is None:
+        return {}
+    return {_pcp.POLICY_ENV: _pcp.POLICY_DYNAMIC, _pcp.SPEC_ENV: spec.to_json()}
+
+
+def p_chunk_policy_lines() -> List[str]:
+    """The launcher's lines: the armed spec plus the plan it WOULD pick for the
+    dry-run rungs (a prediction on the model, printed so the metal ladder is
+    read against a stated expectation). [] under 'fixed'."""
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+    spec = p_chunk_policy_spec()
+    if spec is None:
+        return []
+    out = ["WEG2 " + _pcp.armed_line(spec, "group=P")
+           + f" -- group P's --chunked-prefill-size is the ceiling {spec.limits.max_tokens}"]
+    for n in P_CHUNK_DRY_RUN_TOKENS:
+        res = _pcp.plan_detail(n, len(spec.stages), spec.stages, spec.limits)
+        out.append("WEG2 " + _pcp.plan_line(res, key=f"dry-run-{n}", start=0, end=n)
+                   + " (HOCHRECHNUNG on the model, not a measurement)")
+    return out
 
 
 def spec_form_is_dflash() -> bool:
@@ -11901,6 +12116,54 @@ def build_parser() -> argparse.ArgumentParser:
              "... capture_mib='. Changes P's form key (chunk + graph config "
              "are device allocations). User goal: 512.")
     ap.add_argument(
+        "--p-chunk-policy", choices=["fixed", "dynamic"], default=P_CHUNK_POLICY_DEFAULT,
+        help="Group P prefill chunk width (27B and NF line, weg2/p_chunk_policy.py). "
+             "'fixed' (the default for this release candidate) = today: every forward "
+             "takes --chunked-prefill-size; argv, env and the P form key are "
+             "byte-identical. 'dynamic' = a per-request plan priced on a per-stage "
+             "time model as a pipeline (flow shop): a middle size from the ladder "
+             "--p-chunk-min * 2^k .. --p-chunk-max, optional doubling head ramp and "
+             "halving tail ramp; the fixed plan wins unless another is predicted "
+             "--p-chunk-min-gain faster. Group P's --chunked-prefill-size becomes "
+             "--p-chunk-max (the planner prices the corridor at it); chunks above the "
+             "largest prefill graph bucket run eager. Rank lines 'P-CHUNK-POLICY "
+             "armed' / 'P-CHUNK-POLICY plan', launcher lines with the dry-run plans.")
+    ap.add_argument(
+        "--p-chunk-max", type=int, default=P_CHUNK_MAX_DEFAULT, metavar="TOKENS",
+        help="Only with --p-chunk-policy dynamic: the widest chunk (default "
+             f"{P_CHUNK_MAX_DEFAULT}); becomes group P's --chunked-prefill-size.")
+    ap.add_argument(
+        "--p-chunk-min", type=int, default=0, metavar="TOKENS",
+        help="Only with --p-chunk-policy dynamic: the smallest planned chunk (a "
+             "final rest may be shorter). 0 (default) = --p-chunk-fixed.")
+    ap.add_argument(
+        "--p-chunk-fixed", type=int, default=0, metavar="TOKENS",
+        help="Only with --p-chunk-policy dynamic: the fixed baseline the plan must "
+             "beat. 0 (default) = the fixed policy's chunk (the --p-prefill-graph "
+             "bucket, else 4096). With --p-chunk-min = --p-chunk-max = this value the "
+             "width is FORCED (a metal probe of one chunk size).")
+    ap.add_argument(
+        "--p-chunk-model", default=P_CHUNK_MODEL_DEFAULT, metavar="SRC",
+        help="Only with --p-chunk-policy dynamic: the per-stage time model. "
+             "'builtin-int8' (default; the weg2rc7c #PGAP fit, INT8 cut 42/11/11), "
+             "'fit:<P.log>' (fit the #PGAP lines of that boot's P log, prefixes "
+             "[0,32k)), or a JSON file {\"stages\": [StageModel JSON, ...]}.")
+    ap.add_argument(
+        "--p-chunk-mscale", choices=sorted(P_CHUNK_MSCALES), default=P_CHUNK_MSCALE_DEFAULT,
+        help="Only with --p-chunk-policy dynamic and a builtin/fit model: the "
+             "per-token cost curve over the chunk width per stage ('int8' / "
+             "'nvfp4': the 5090 kernel-bench HOCHRECHNUNG on PP0, 3080 stages flat "
+             "until measured; 'flat': no kernel gain anywhere).")
+    ap.add_argument(
+        "--p-chunk-grid", type=int, default=0, metavar="TOKENS",
+        help="Only with --p-chunk-policy dynamic: no chunk crosses an absolute "
+             "multiple of TOKENS (0 = off, the 27B default: its P anchors are "
+             "distance-based). The NF line sets 4096.")
+    ap.add_argument(
+        "--p-chunk-min-gain", type=float, default=0.01, metavar="FRACTION",
+        help="Only with --p-chunk-policy dynamic: a plan other than fixed is taken "
+             "only when predicted at least this much faster (default 0.01).")
+    ap.add_argument(
         "--p-trim-end-anchor", action="store_true",
         help="Group P (27B line): take every front leg-1 prompt of N tokens as "
              "N-1, at the token level in P's intake. P's last regular chunk then "
@@ -13073,6 +13336,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ns = build_parser().parse_args(argv)
     apply_spec_form(ns)
     apply_p_prefill_graph(ns)
+    # --p-chunk-policy: after the graph (reads its buckets), before any argv.
+    apply_p_chunk_policy(ns)
     # 27B line G2: the one tokenizer both groups load, installed before any
     # argv is built; its line is logged with the checkpoint lines under 1a'.
     tokenizer_line = apply_tokenizer_path(ns)
@@ -13707,6 +13972,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if p_prefill_graph_bucket():
         # Only when on: the default boot's front log stays byte-identical.
         log(p_prefill_graph_line())
+    # --p-chunk-policy: [] under 'fixed' (front log byte-identical).
+    for _pcl in p_chunk_policy_lines():
+        log(_pcl)
     if not hicache_disabled:
         log(hicache_draft_tier_line())
     # --d-replayssm-spec (27B ReplaySSM S6): D's verify form, both states named.
@@ -14232,6 +14500,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     # --p-prefill-graph: {} when off (env byte-identical). The pool vector is
     # the SAME call the cut's pool model was built from (solve_p_cut).
+    # --p-chunk-policy: {} under 'fixed' (env byte-identical).
+    env_p.update(p_chunk_policy_env())
     _pg_pool = p_prefill_graph_pool_mib(ns)
     env_p.update(p_prefill_graph_env(
         _pg_pool, max_prefix=getattr(ns, "p_prefill_graph_max_prefix", None)))
