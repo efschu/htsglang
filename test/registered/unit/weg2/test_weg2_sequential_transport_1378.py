@@ -730,3 +730,74 @@ class SyncGroupsAreDeterministic(unittest.TestCase):
         self.assertEqual(bx._sync_groups(pieces, 10**9, 2), [[0, 1], [2, 3], [4, 5]])
         self.assertEqual(bx._sync_groups(pieces, 10**9, 1), [[i] for i in range(6)])
         self.assertEqual(bx._sync_groups([], 1, 1), [])
+
+
+class LaneStreamIsDestroyedN4E(_TransportHarness):
+    """25.09. (N4E, boot dkr27bnvfp4bar109252110): every run_sequential_units
+    call created a CUDA stream and never destroyed it -- ~0.55 MiB of driver
+    memory per call on the 5090 (0.17 on a 3080), the 'other' post of
+    WEG2-DC-BREAKDOWN, 16 calls per flip per 5090 process. D TP0's post-KV
+    headroom fell 1101 -> 201 MiB over 39 wakes and the HiCache page
+    loadback OOMed there. #1492 closed the same leak for the BAR1 ring."""
+
+    class _StreamOps(_MemOps):
+        def __init__(self):
+            super().__init__()
+            self.created, self.destroyed, self.synced = [], [], []
+            self._next = 0x5000
+
+        def create_stream(self, device):
+            self._next += 1
+            self.created.append(self._next)
+            return self._next
+
+        def destroy_stream(self, stream):
+            self.destroyed.append(stream)
+
+        def synchronize(self, stream=0):
+            self.synced.append(stream)
+            return None
+
+    def _descs(self, n=3):
+        out = []
+        for i in range(n):
+            src, dst = self._vram_pair(64, i)
+            self.ops.write(src, bytes([0x30 + i]) * 64)
+            out.append(_desc(f"s{i}", 64, src_ptr=src, dst_ptr=dst))
+        return out
+
+    def test_every_created_stream_is_destroyed_on_both_phases(self):
+        self.ops = self._StreamOps()
+        descs = self._descs()
+        self.assertEqual(self._deposit(descs), "")
+        self.assertEqual(self._collect(descs), "")
+        self.assertEqual(len(self.ops.created), 2)
+        self.assertEqual(sorted(self.ops.destroyed), sorted(self.ops.created),
+                         "a lane call must give its stream back (the leak)")
+
+    def test_the_stream_is_destroyed_when_the_lane_raises(self):
+        class _Boom(self._StreamOps):
+            def memcpy_async(self, dst, src, nbytes, stream):
+                raise RuntimeError("copy failed")
+        self.ops = _Boom()
+        descs = self._descs()
+        with self.assertRaises(RuntimeError):
+            self._deposit(descs)
+        self.assertEqual(self.ops.destroyed, self.ops.created)
+        # the teardown drains the stream before the mappings close
+        self.assertIn(self.ops.created[0], self.ops.synced)
+
+    def test_ops_without_streams_still_run(self):
+        # _MemOps has no create_stream: stream 0, nothing to destroy
+        descs = self._descs()
+        self.assertEqual(self._deposit(descs), "")
+        self.assertEqual(self._collect(descs), "")
+
+    def test_a_failing_destroy_never_masks_the_result(self):
+        class _BadDestroy(self._StreamOps):
+            def destroy_stream(self, stream):
+                raise RuntimeError("driver said no")
+        self.ops = _BadDestroy()
+        descs = self._descs()
+        self.assertEqual(self._deposit(descs), "")
+        self.assertTrue(any("destroy failed" in l for l in self.lines))

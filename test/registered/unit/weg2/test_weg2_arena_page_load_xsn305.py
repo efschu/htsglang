@@ -92,3 +92,50 @@ def test_the_layer_zero_key_is_the_callers_objects_not_the_per_layer_temporaries
     ap.ArenaMHAHostPool._load_arena(s, pool, host2 - 10, dst2, 0)
     ap.ArenaMHAHostPool._load_arena(s, pool, host2 - 10, dst2, 1)
     assert calls == [3, 1] and transfers == []
+
+
+def test_stage_layer_view_is_a_view_not_a_copy_n4e():
+    """25.09. (N4E): the per-layer slice of the device stage used to be
+    materialised by `.reshape(-1)` (b * cell bytes, twice per layer per block,
+    outside every VRAM budget) -- D TP0 of dkr27bnvfp4bar109252110 died on
+    exactly that 20 MiB allocation after a wake. It is a strided view now."""
+    for dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.uint8):
+        s, pool, page, cell = _stand_in(dtype=dtype)
+        stage = page.clone()
+        b = 5
+        for off in s._k_offs_b + s._v_offs_b:
+            v = ap._stage_layer_view(stage, b, off, cell, dtype, 2, 4)
+            old = stage[:b, off:off + cell].reshape(-1).view(dtype).view(b, 2, 4)
+            assert v.shape == (b, 2, 4) and v.dtype == dtype
+            assert torch.equal(v.reshape(-1).view(torch.uint8), old.reshape(-1).view(torch.uint8))
+            # shares the stage's storage: no allocation
+            assert v.untyped_storage().data_ptr() == stage.untyped_storage().data_ptr()
+
+
+def test_stage_layer_view_misaligned_offset_falls_back_to_the_copy():
+    stage = torch.randint(0, 255, (4, 64), dtype=torch.uint8)
+    v = ap._stage_layer_view(stage, 3, 1, 16, torch.bfloat16, 2, 4)  # odd byte offset
+    old = stage[:3, 1:17].reshape(-1).view(torch.bfloat16).view(3, 2, 4)
+    assert torch.equal(v.reshape(-1).view(torch.uint8), old.reshape(-1).view(torch.uint8))
+
+
+def test_multi_block_load_is_byte_exact_with_the_view_n4e():
+    os.environ[ap.ARENA_PAGE_LOAD_BLOCK_ENV] = "64"
+    try:
+        # (fp8: CPU index_copy_ has no Float8 kernel; the view itself is
+        # checked for fp8 above, the metal copies on CUDA as before)
+        for dtype in (torch.bfloat16, torch.float16):
+            s, pool, page, cell = _stand_in(A=160, dtype=dtype)
+            pool.k_buffer = [torch.zeros((200, 2, 4), dtype=dtype) for _ in range(3)]
+            pool.v_buffer = [torch.zeros((200, 2, 4), dtype=dtype) for _ in range(3)]
+            slots = torch.randperm(160)[:150]
+            dst = torch.randperm(200)[:150]
+            ap.ArenaMHAHostPool._load_pages_all_layers(s, pool, slots, dst)
+            for l in range(3):
+                ko, vo = s._k_offs_b[l], s._v_offs_b[l]
+                got_k = pool.k_buffer[l][dst].reshape(150, -1).view(torch.uint8)
+                got_v = pool.v_buffer[l][dst].reshape(150, -1).view(torch.uint8)
+                assert torch.equal(got_k, page[slots, ko:ko + cell])
+                assert torch.equal(got_v, page[slots, vo:vo + cell])
+    finally:
+        os.environ.pop(ap.ARENA_PAGE_LOAD_BLOCK_ENV, None)

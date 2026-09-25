@@ -85,6 +85,32 @@ def _arena_page_load_block() -> int:
         return 8192
 
 
+#: N4E rollback switch without a rebuild: =0 restores the copying slice.
+_STAGE_VIEW_ON = str(os.environ.get("SGLANG_WEG2_ARENA_STAGE_VIEW", "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _stage_layer_view(dev_stage, b: int, off_b: int, cell: int, dtype, H: int, D: int):
+    """One layer's K (or V) cells of the first ``b`` staged pages, typed
+    ``(b, H, D)`` -- a VIEW of the stage, no copy.
+
+    25.09. (N4E, boot dkr27bnvfp4bar109252110): the former
+    ``stage[:b, off:off + cell].reshape(-1)`` could not be a view (rows are
+    ``page_bytes`` apart, the slice is ``cell`` wide), so it materialised
+    ``b * cell`` bytes (20 MiB at b=8192 on D TP0) twice per layer per block
+    -- an allocation outside every budget, made right after a wake, which is
+    exactly where D TP0 died (torch OOM "Tried to allocate 20.00 MiB", 6.81
+    MiB free). ``index_copy_`` takes a strided source, so the typed slice is
+    handed over as it is. The page layout keeps every layer offset a
+    multiple of the element size (the arena refs above are built with
+    ``k_offs[l] // e``); should one ever not be, the old copying form is the
+    fallback rather than a misaligned view."""
+    e = int(dtype.itemsize)
+    if _STAGE_VIEW_ON and off_b % e == 0 and cell % e == 0 and dev_stage.shape[1] % e == 0 and cell == H * D * e:
+        o = off_b // e
+        return dev_stage.view(dtype)[:b, o:o + H * D].view(b, H, D)
+    return dev_stage[:b, off_b:off_b + cell].reshape(-1).view(dtype).view(b, H, D)
+
+
 def _arena_load_block_quota():
     """Task #3 (17.09.): the JIT gather's block quota for the ARENA -> device
     load. The kernel default (2 blocks = 64 warps in flight) is tuned for
@@ -564,9 +590,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             for l in range(L):
                 ko, vo = self._k_offs_b[l], self._v_offs_b[l]
                 device_pool.k_buffer[l].index_copy_(
-                    0, dst, dev_stage[:b, ko:ko + cell].reshape(-1).view(self.dtype).view(b, H, D))
+                    0, dst, _stage_layer_view(dev_stage, b, ko, cell, self.dtype, H, D))
                 device_pool.v_buffer[l].index_copy_(
-                    0, dst, dev_stage[:b, vo:vo + cell].reshape(-1).view(self.dtype).view(b, H, D))
+                    0, dst, _stage_layer_view(dev_stage, b, vo, cell, self.dtype, H, D))
             if _ev is not None:
                 _e2 = torch.cuda.Event(enable_timing=True); _e2.record()
                 _ev.append((_e0, _e1, _e2))
