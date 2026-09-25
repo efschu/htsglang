@@ -219,7 +219,7 @@ def _speculative_rows_route(
 def _resolve_flash_attn_varlen_func_or_none():
     try:
         return _resolve_flash_attn_varlen_func()
-    except ImportError:
+    except (ImportError, AttributeError):
         return None
 
 
@@ -247,7 +247,9 @@ def _resolve_flash_attn_varlen_func():
             return output[0] if isinstance(output, tuple) else output
 
         return flash_attn_varlen_func
-    except ImportError as exc:
+    except (ImportError, AttributeError) as exc:
+        # AttributeError: an FA4 build that does not match the installed CuTe DSL (e.g. FA4 b15 with
+        # cutlass-dsl 4.7.1) fails inside its own import; treat it like a missing FA4.
         raise ImportError(
             "QSA decode requires flash_attn (FA2) or flash-attn-4 "
             "(FA4 cute) for its packed varlen fallback."
