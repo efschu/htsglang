@@ -6182,6 +6182,21 @@ class ServerArgs:
             "SGLANG_UNEVEN_DCP_WEIGHTED (#781)."
         ),
     ] = None
+    dcp_lse_merge_block_tokens: A[
+        Optional[int],
+        Arg(
+            help="Token-block width of the uneven-DCP LSE merge of the "
+            "paged-prefix / decode partials (flashinfer). Unset (default) = "
+            "DERIVED and ON: the largest width whose per-block merge working "
+            "set fits in one full-head prefix partial at the budgeted forward "
+            "width (--chunked-prefill-size), from the head geometry -- the "
+            "same on every DCP rank. A merge of at most that many rows is "
+            "today's single call; a wider one runs in token blocks, each one "
+            "whole merge (27B RC7: a 4096-row prefix-bearing forward OOMed "
+            "the one-shot merge on the 5090). 0 = off (one block always; "
+            "diagnosis only). N > 0 = explicit width, a hand pin."
+        ),
+    ] = None
     kv_backing_relief: A[
         Optional[bool],
         Arg(

@@ -35,6 +35,11 @@ from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.layers.dcp.comm import (
+    cp_lse_merge_token_blocks,
+    lse_merge_is_blocked,
+    lse_merge_token_spans,
+)
 from sglang.srt.layers.dcp import (
     build_dcp_weighted_kv_indices,
     cp_all_gather_heads_uneven,
@@ -97,7 +102,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _dcp_uneven_merge(o, lse, group, head_counts, return_lse: bool = False):
+def _dcp_uneven_merge(
+    o, lse, group, head_counts, return_lse: bool = False, block_tokens: int = 0
+):
     """The uneven-DCP LSE merge of the paged-prefix / decode partials.
 
     ``SGLANG_DCP_LSE_MERGE=a2a`` (layers/dcp/comm.py ``lse_merge_mode``) routes
@@ -106,9 +113,17 @@ def _dcp_uneven_merge(o, lse, group, head_counts, return_lse: bool = False):
     instead of an all_reduce of all heads followed by a slice -- (W-1)/W of the
     bytes a one-shot sends, and one barrier instead of the mesh's two. Unset
     (the default 'ar') is ``cp_lse_ag_out_ar_mha_uneven`` exactly as before.
-    Both return this rank's fp32 head slice (and its global LSE)."""
+    Both return this rank's fp32 head slice (and its global LSE).
+
+    ``block_tokens`` (27B RC7, comm.py ``cp_lse_merge_token_blocks``): more
+    rows than that are merged in token blocks, each block one whole merge, so
+    the transient never exceeds one full-head partial at the budgeted width.
+    Rows <= block_tokens (every decode / verify / short tail) take the call
+    below unchanged."""
     from sglang.srt.layers.dcp.comm import (
         cp_lse_ag_out_a2a_mha_uneven,
+        cp_lse_merge_token_blocks,
+        lse_merge_is_blocked,
         lse_merge_mode,
         weightless_kv_active,
     )
@@ -117,10 +132,95 @@ def _dcp_uneven_merge(o, lse, group, head_counts, return_lse: bool = False):
     # stay on the all_reduce, so a weightless boot must too, or the head and its
     # workers would enter different collectives.
     if lse_merge_mode() == "a2a" and not weightless_kv_active():
-        return cp_lse_ag_out_a2a_mha_uneven(
-            o, lse, group, head_counts, return_lse=return_lse
+        merge = cp_lse_ag_out_a2a_mha_uneven
+    else:
+        merge = cp_lse_ag_out_ar_mha_uneven
+    if block_tokens and lse_merge_is_blocked(o.shape[0], block_tokens, group.world_size):
+        return cp_lse_merge_token_blocks(
+            merge, o, lse, group, head_counts,
+            return_lse=return_lse, block_tokens=block_tokens,
         )
-    return cp_lse_ag_out_ar_mha_uneven(o, lse, group, head_counts, return_lse=return_lse)
+    return merge(o, lse, group, head_counts, return_lse=return_lse)
+
+
+def _dcp_final_merge_rows(o_cur, lse_cur, o_pre, lse_pre, dtype):
+    """The body of FlashInferAttnBackend._dcp_extend_final_merge for a set of
+    rows (all of them, or one token block): natural-log LSE combine of the
+    current-chunk and the merged-prefix partials, cast to ``dtype``."""
+    lse_cur = lse_cur.float()
+    lse_pre = lse_pre.float()
+    final_lse = torch.logaddexp(lse_cur, lse_pre)
+    sc_cur = torch.nan_to_num(
+        torch.exp(lse_cur - final_lse), nan=0.0, posinf=0.0, neginf=0.0
+    ).unsqueeze(-1)
+    sc_pre = torch.nan_to_num(
+        torch.exp(lse_pre - final_lse), nan=0.0, posinf=0.0, neginf=0.0
+    ).unsqueeze(-1)
+    o = o_cur.float() * sc_cur + o_pre.float() * sc_pre
+    return o.to(dtype)
+
+
+_DCP_MERGE_BLOCK_LOGGED = set()
+
+
+def _resolve_dcp_merge_block_tokens(model_runner, head_counts) -> int:
+    """The uneven LSE merge's token-block width for this backend (27B RC7).
+
+    ``--dcp-lse-merge-block-tokens``: unset = DERIVED (default ON) from the
+    budgeted forward width (``--chunked-prefill-size``, else
+    ``--max-prefill-tokens``) and the head geometry, see
+    comm.lse_merge_block_tokens; 0 = off (one block, today's merge -- for
+    diagnosis only); N > 0 = an explicit width (a hand pin: planner debt).
+    Every input is replicated, so every DCP rank resolves the same width."""
+    from sglang.srt.layers.dcp.comm import (
+        lse_merge_block_tokens,
+        lse_merge_bytes_per_token,
+        lse_merge_effective_mode,
+        lse_merge_reduce_dtype,
+    )
+
+    sa = model_runner.server_args
+    counts = [int(c) for c in head_counts]
+    mc = model_runner.model_config
+    head_dim = int(getattr(mc, "head_dim", 0) or 0)
+    out_itemsize = torch.empty((), dtype=model_runner.dtype).element_size()
+    budget = int(getattr(sa, "chunked_prefill_size", 0) or 0)
+    budget_src = "--chunked-prefill-size"
+    if budget <= 0:
+        budget = int(getattr(sa, "max_prefill_tokens", 0) or 0)
+        budget_src = "--max-prefill-tokens"
+    mode = lse_merge_effective_mode()
+    wire = 2 if lse_merge_reduce_dtype() == "bf16" else 4
+    asked = getattr(sa, "dcp_lse_merge_block_tokens", None)
+    if asked is None:
+        width = lse_merge_block_tokens(budget, counts, head_dim, out_itemsize, mode)
+        src = "derived"
+    else:
+        width = int(asked)
+        if width < 0:
+            raise ValueError(
+                f"--dcp-lse-merge-block-tokens {width} < 0: unset = derived, "
+                "0 = off (one block), N > 0 = explicit width"
+            )
+        src = "flag (hand pin: planner debt)" if width > 0 else "flag 0 = OFF (diagnosis)"
+    key = (width, tuple(counts), mode, wire, budget)
+    if key not in _DCP_MERGE_BLOCK_LOGGED and len(counts) > 1 and head_dim > 0:
+        _DCP_MERGE_BLOCK_LOGGED.add(key)
+        per_tok = lse_merge_bytes_per_token(
+            mode, wire, sum(counts), max(counts), len(counts), head_dim, out_itemsize
+        )
+        ref = budget * sum(counts) * head_dim * out_itemsize
+        logger.info(
+            "DCP-MERGE-BLOCK block_tokens=%d source=%s mode=%s wire=%s heads=%s "
+            "head_dim=%d budget=%d (%s) | one-shot working set %.1f KiB/token = "
+            "%.1f MiB at the budget; bound = one [%d x %d x %d] partial = %.1f MiB; "
+            "per block <= %.1f MiB (rows <= block_tokens: one block, unchanged)",
+            width, src, mode, "bf16" if wire == 2 else "fp32", counts, head_dim,
+            budget, budget_src, per_tok / 1024.0, per_tok * budget / 2**20,
+            budget, sum(counts), head_dim, ref / 2**20,
+            per_tok * (width or budget) / 2**20,
+        )
+    return width
 
 # Target-VERIFY spec inputs that take the uneven-DCP verify split in
 # call_begin_forward: the committed prefix is read paged over this rank's OWNED
@@ -902,6 +1002,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 "SGLANG_UNEVEN_DCP_WEIGHTED=1 for the weighted owner rule) "
                 "so dcp_size == tp_size."
             )
+        # 27B RC7: token-block width of the uneven LSE merge (0 = one block,
+        # today's call). Derived below once the head partition is known.
+        self._dcp_merge_block_tokens = 0
         if self.uneven_dcp:
             mc = model_runner.model_config
             attn_tp_size = get_parallel().attn_tp_size
@@ -1028,6 +1131,9 @@ class FlashInferAttnBackend(AttentionBackend):
             # FULL gathered counts the paged wrappers are planned with.
             self.dcp_full_qo_heads = mc.num_attention_heads
             self.dcp_full_kv_heads = total_kv
+            self._dcp_merge_block_tokens = _resolve_dcp_merge_block_tokens(
+                model_runner, self.dcp_q_head_counts
+            )
 
         # #128 DCP collective/compute overlap: issue the per-layer DCP
         # collectives (kv-head gathers, q-head gather, LSE-merge) on a
@@ -6186,7 +6292,10 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         # o: [tokens, 24, D], lse: [tokens, 24]; combine across the DCP token
         # shards and slice back to this rank's [12/6/6] head shard.
-        o = _dcp_uneven_merge(o, lse, group, self.dcp_q_head_counts)
+        o = _dcp_uneven_merge(
+            o, lse, group, self.dcp_q_head_counts,
+            block_tokens=self._dcp_merge_block_tokens,
+        )
         return o.reshape(-1, layer.tp_q_head_num * layer.head_dim).to(q.dtype)
 
     def forward_decode_weightless_worker(self, layer, forward_batch):
@@ -6252,7 +6361,15 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         # (4) LSE-merge: contribute this rank's partial; receive the empty
         # [T,0,D] slice (the merged output goes to the head rank only).
-        cp_lse_ag_out_ar_mha_uneven(o, lse, group, self.dcp_q_head_counts)
+        # 27B RC7: the SAME token blocks as the head's _dcp_uneven_merge (same
+        # width, same T) -- one block is the call below, unchanged.
+        if lse_merge_is_blocked(o.shape[0], self._dcp_merge_block_tokens, group.world_size):
+            cp_lse_merge_token_blocks(
+                cp_lse_ag_out_ar_mha_uneven, o, lse, group, self.dcp_q_head_counts,
+                block_tokens=self._dcp_merge_block_tokens,
+            )
+        else:
+            cp_lse_ag_out_ar_mha_uneven(o, lse, group, self.dcp_q_head_counts)
 
     def forward_extend_weightless_worker(self, layer, forward_batch):
         """Weightless-KV WORKER dispatch for one full-attention layer in
@@ -6322,7 +6439,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
-        cp_lse_ag_out_ar_mha_uneven(o_pre, lse_pre, group, self.dcp_q_head_counts)
+        # 27B RC7: the SAME token blocks as the head's prefix merge.
+        if lse_merge_is_blocked(o_pre.shape[0], self._dcp_merge_block_tokens, group.world_size):
+            cp_lse_merge_token_blocks(
+                cp_lse_ag_out_ar_mha_uneven, o_pre, lse_pre, group,
+                self.dcp_q_head_counts, block_tokens=self._dcp_merge_block_tokens,
+            )
+        else:
+            cp_lse_ag_out_ar_mha_uneven(o_pre, lse_pre, group, self.dcp_q_head_counts)
 
     def _replicated_kv_ragged_reindex(self, local_q, local_kv, device):
         """REPLICATED-KV geometry (#105): map each of this rank's LOCAL kv
@@ -6464,6 +6588,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 group,
                 self.dcp_q_head_counts,
                 return_lse=True,
+                block_tokens=self._dcp_merge_block_tokens,
             )
             if do_write and _scatter_late:
                 if os.environ.get("SGLANG_DCP_DEBUG") == "1" and layer.layer_id < 8:
@@ -6578,6 +6703,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 group,
                 self.dcp_q_head_counts,
                 return_lse=True,
+                block_tokens=self._dcp_merge_block_tokens,
             )
         # main lane: the masked scatter-write targets the current chunk's
         # out_cache_loc slots, disjoint from the paged prefix read above and
@@ -6688,17 +6814,25 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_return_lse also returns natural-log LSE, so logaddexp mixes
         them consistently. (flashinfer's merge_state uses a different
         internal convention and must NOT be used across these two sources.)"""
-        lse_cur = lse_cur.float()
-        lse_pre = lse_pre.float()
-        final_lse = torch.logaddexp(lse_cur, lse_pre)
-        sc_cur = torch.nan_to_num(
-            torch.exp(lse_cur - final_lse), nan=0.0, posinf=0.0, neginf=0.0
-        ).unsqueeze(-1)
-        sc_pre = torch.nan_to_num(
-            torch.exp(lse_pre - final_lse), nan=0.0, posinf=0.0, neginf=0.0
-        ).unsqueeze(-1)
-        o = o_cur.float() * sc_cur + o_pre.float() * sc_pre
-        return o.to(q.dtype).contiguous().view(-1, layer.tp_q_head_num * layer.head_dim)
+        # 27B RC7: rows beyond the LSE merge's token-block width are combined
+        # in the same blocks. Purely local and elementwise, so each row's
+        # value is the one-shot value; one block is the expression unchanged.
+        spans = lse_merge_token_spans(
+            o_cur.shape[0], getattr(self, "_dcp_merge_block_tokens", 0)
+        )
+        if len(spans) == 1:
+            o = _dcp_final_merge_rows(o_cur, lse_cur, o_pre, lse_pre, q.dtype)
+            return o.contiguous().view(-1, layer.tp_q_head_num * layer.head_dim)
+        out = torch.empty(
+            (o_cur.shape[0],) + tuple(o_cur.shape[1:]), dtype=q.dtype, device=o_cur.device
+        )
+        for s, e in spans:
+            out[s:e].copy_(
+                _dcp_final_merge_rows(
+                    o_cur[s:e], lse_cur[s:e], o_pre[s:e], lse_pre[s:e], q.dtype
+                )
+            )
+        return out.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:

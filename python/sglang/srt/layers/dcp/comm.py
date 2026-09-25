@@ -388,6 +388,197 @@ def cp_lse_ag_out_ar_mha_uneven(
     return out
 
 
+# ---------------------------------------------------------------------------
+# 27B RC7 (25.09.): THE UNEVEN LSE MERGE IN TOKEN BLOCKS.
+#
+# Measured, boot weg2rc7_186c022f80 D TP0 (5090), 09:22:19: `Tried to
+# allocate 144.00 MiB` in cp_lse_ag_out_a2a_mha_uneven's `recv` =
+# (W*H_local, T, D) fp32 = (3*12, 4096, 256) * 4 B -- T = 4096, the chunk
+# width (`#969 EXTENT ... (4096, 8192, 4096, 4096)`: prefix 4096, extend 4096).
+# The width did NOT grow past the chunk; what the X ceiling (and, equally, a
+# multi-turn follow-up with <= X uncached tokens over a D-radix prefix) made
+# possible is a PREFIX-BEARING forward at full chunk width. Every 27B D boot
+# with X <= 4096 topped out at 229-231 prefix-bearing tokens, so the one-shot
+# merge's working set at 4096 (~483 MiB on TP0 in a2a/fp32: out, send, recv,
+# merged, merged^T) was never exercised and sits in no budget.
+#
+# THE BOUND. Blocking along the token axis is exact: every step of both merge
+# bodies is per (token, head) -- the LSE all-gather, the logsumexp over the
+# RANK axis, the scale, the head all_to_all / all_reduce and the local sum --
+# so a block is today's call on a token slice. The block width is derived, not
+# pinned: the working set of one block is at most ONE full-head prefix partial
+# (the paged read's own output, [budget_tokens, H_total, D] in the attention
+# dtype) at the budgeted width. The merge then never holds more than the
+# partial it redistributes, whatever the forward width.
+#
+# RANK-UNIFORM BY CONSTRUCTION: the width is a function of budget_tokens,
+# sum/max/len of head_counts, head_dim, the attention dtype and the merge mode
+# (all replicated), never of this rank's own head count; the split of T is a
+# function of T (the gathered-q token count, equal on every rank -- the q/LSE
+# all-gathers require it) and the width. Every rank therefore runs the same
+# number of blocks and issues the same collectives in the same order.
+# ---------------------------------------------------------------------------
+
+#: The merge's per-token working set, per mode. Every full-width tensor the
+#: one-shot body allocates is counted (the SUM, an upper bound on the peak --
+#: independent of when the allocator frees what, and of whether the transport's
+#: all_reduce is in-place), so the per-block bound holds on any transport.
+def lse_merge_bytes_per_token(
+    mode: str,
+    wire_bytes: int,
+    total_heads: int,
+    max_local_heads: int,
+    world: int,
+    head_dim: int,
+    out_itemsize: int,
+) -> int:
+    H, m, W, D = int(total_heads), int(max_local_heads), int(world), int(head_dim)
+    f32 = 4
+    # prologue, both modes (fp32 [H] per token each): lse.contiguous(), the
+    # gathered [W, H] lses, logsumexp's own temporaries (amax, |amax|, the
+    # W-wide sub and exp, the sum), then (lse - global_lse), exp and
+    # nan_to_num(scale) -- 3W + 8 in all; then nan_to_num(o) in the attention
+    # dtype and `* scale` in fp32 (`out`).
+    b = f32 * H * (3 * W + 8) + H * D * int(out_itemsize) + f32 * H * D
+    if mode == "a2a":
+        b += f32 * H * D  # out.transpose(0, 1).contiguous()
+        if wire_bytes != f32:
+            b += wire_bytes * H * D  # .to(wire)
+        b += wire_bytes * W * m * D  # recv
+        if wire_bytes != f32:
+            b += f32 * W * m * D  # recv.to(fp32)
+        b += f32 * m * D  # .sum(0)
+        b += f32 * m * D  # merged.transpose(0, 1).contiguous()
+    else:
+        if wire_bytes != f32:
+            b += wire_bytes * H * D  # out.to(bf16)
+        b += wire_bytes * H * D  # all_reduce, out-of-place (barlink)
+        if wire_bytes != f32:
+            b += f32 * H * D  # .to(fp32)
+        b += f32 * m * D  # out[:, start:stop].contiguous()
+    b += f32 * m  # global_lse[:, start:stop].contiguous() (return_lse)
+    return int(b)
+
+
+def lse_merge_effective_mode() -> str:
+    """The merge the flashinfer head sites actually run: a2a only when asked
+    for AND not weightless (the weightless workers' sites stay on the
+    all_reduce, so a weightless boot does too -- see _dcp_uneven_merge)."""
+    return "a2a" if (lse_merge_mode() == "a2a" and not weightless_kv_active()) else "ar"
+
+
+def lse_merge_block_tokens(
+    budget_tokens: int,
+    head_counts: list,
+    head_dim: int,
+    out_itemsize: int,
+    mode: Optional[str] = None,
+) -> int:
+    """Derived token-block width of the uneven LSE merge (0 = one block).
+
+    The largest width whose per-block working set
+    (:func:`lse_merge_bytes_per_token`) fits in ONE full-head prefix partial at
+    the budgeted width, ``budget_tokens * H_total * head_dim * out_itemsize``
+    bytes. ``max(head_counts)`` stands in for the local head count so the
+    answer is the same on every rank (the largest shard binds)."""
+    counts = [int(c) for c in head_counts]
+    W = len(counts)
+    if W <= 1 or int(budget_tokens) <= 0 or sum(counts) <= 0:
+        return 0
+    mode = mode or lse_merge_effective_mode()
+    wire = 2 if lse_merge_reduce_dtype() == "bf16" else 4
+    per_tok = lse_merge_bytes_per_token(
+        mode, wire, sum(counts), max(counts), W, head_dim, out_itemsize
+    )
+    ref = int(budget_tokens) * sum(counts) * int(head_dim) * int(out_itemsize)
+    return max(1, ref // per_tok)
+
+
+def lse_merge_token_spans(tokens: int, block_tokens: int) -> list:
+    """[(start, stop), ...] covering [0, tokens): ONE span (today's call) when
+    blocking is off or ``tokens <= block_tokens``, else ceil(tokens/block)
+    near-equal spans, each <= block_tokens (no ragged straggler block)."""
+    T, b = int(tokens), int(block_tokens or 0)
+    if b <= 0 or T <= b:
+        return [(0, T)]
+    n = -(-T // b)
+    base, extra = divmod(T, n)
+    spans, s = [], 0
+    for i in range(n):
+        e = s + base + (1 if i < extra else 0)
+        spans.append((s, e))
+        s = e
+    return spans
+
+
+def lse_merge_is_blocked(tokens: int, block_tokens: int, world_size: int) -> bool:
+    """True when the merge of ``tokens`` rows runs in more than one block.
+    world_size 1 never blocks: the merge is the identity there."""
+    return int(world_size) > 1 and len(lse_merge_token_spans(tokens, block_tokens)) > 1
+
+
+_BLOCKED_MERGE_N = [0]
+_BLOCKED_MERGE_LAST_T = [-1]
+
+
+def cp_lse_merge_token_blocks(
+    merge_fn,
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    head_counts: list,
+    return_lse: bool = False,
+    block_tokens: int = 0,
+):
+    """``merge_fn`` (cp_lse_ag_out_{ar,a2a}_mha_uneven) over token blocks of
+    at most ``block_tokens`` rows, results written into one [T, H_local, D]
+    fp32 output (and [T, H_local] lse). One block -- blocking off, T <= width,
+    or a single-rank group -- is EXACTLY today's call and returns its result
+    object unchanged. Each block is also exactly today's call, on a token
+    slice, so the collectives per block (LSE all-gather, a2a/all-reduce) and
+    the weightless guard step are those of one merge; see the module note on
+    rank uniformity."""
+    T = int(cp_attn_out.shape[0])
+    world = int(cp_group.world_size)
+    if not lse_merge_is_blocked(T, block_tokens, world):
+        return merge_fn(
+            cp_attn_out, cp_attn_lse, cp_group, head_counts, return_lse=return_lse
+        )
+    spans = lse_merge_token_spans(T, block_tokens)
+    out = lse_out = None
+    for s, e in spans:
+        res = merge_fn(
+            cp_attn_out[s:e], cp_attn_lse[s:e], cp_group, head_counts,
+            return_lse=return_lse,
+        )
+        o_b, l_b = res if return_lse else (res, None)
+        if out is None:
+            out = o_b.new_empty((T,) + tuple(o_b.shape[1:]))
+            if return_lse:
+                lse_out = l_b.new_empty((T,) + tuple(l_b.shape[1:]))
+        out[s:e].copy_(o_b)
+        if return_lse:
+            lse_out[s:e].copy_(l_b)
+        del res, o_b, l_b
+    _BLOCKED_MERGE_N[0] += 1
+    n = _BLOCKED_MERGE_N[0]
+    # one line per forward width in practice: the 16 full-attention layers of
+    # a forward merge the same T back to back, so "T changed" fires on the
+    # forward's first layer; plus calls 1-3 and every 64th.
+    if n <= 3 or T != _BLOCKED_MERGE_LAST_T[0] or n % 64 == 0:
+        _BLOCKED_MERGE_LAST_T[0] = T
+        logger.info(
+            "DCP-MERGE-BLOCKED n=%d fn=%s T=%d blocks=%d block_tokens=%d "
+            "max_block=%d world=%d heads=%s return_lse=%s (each block is one "
+            "whole merge: LSE all-gather + head exchange; logged on calls 1-3, "
+            "on every change of T and every 64th blocked call)",
+            n, getattr(merge_fn, "__name__", "?"), T, len(spans),
+            int(block_tokens), max(e - s for s, e in spans), world,
+            list(head_counts), bool(return_lse),
+        )
+    return (out, lse_out) if return_lse else out
+
+
 def cp_lse_ag_out_rs_mla(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
