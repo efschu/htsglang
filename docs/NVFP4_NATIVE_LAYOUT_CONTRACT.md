@@ -235,7 +235,59 @@ Der 27B-Flip läuft über `--weg2-weight-source exchange` (docker/profiles/27b.e
   - **Hebel P:** nur die 5090-Stufe gewinnt (FP8-Anteil 0,54 → 0,20 ms je Schicht und 512er-Chunk). Die 3080-Stufe
     bleibt beim FP8-Anteil gleich.
 
-## 9. Offen
+## 9. Das „other“ der P-Stufen (Operator-Auftrag 25.09., Desk aus #PGAP)
+
+**Messung.** Quelle: #PGAP `gpu_fwd_ms` je 512er-Chunk, je Rang linear über die Chunk-Startposition p (k Token,
+p ≤ 64k) gefittet. Boot weg2rc4 (INT8), Schnitt 42/11/11, Attention 10/3/3. Parser:
+benchmark/nvfp4_native/pgap_fit.py (die Zeilenform steht in logindex nur als raw_shape, darum eigener Parser).
+
+| Rang | Karte | Schichten (Attn/GDN) | gpu_fwd(p) INT8 | gpu_fwd(p) NVFP4-Marlin (weg2rc4n4) |
+|---|---|---|---|---|
+| PP0 | 5090 | 42 (10/32) | 48,6 + 0,894·p ms | 94,6 + 1,133·p ms |
+| PP1 | 3080 | 11 (3/8) | 38,1 + 1,083·p ms | 93,8 + 1,113·p ms |
+| PP2 | 3080 | 11 (3/8) | 42,1 + 1,111·p ms | 94,3 + 1,116·p ms |
+
+Die Backlog-Werte 1,8 / 6,1 ms je Schicht sind **Mediane über den ganzen Boot** (Kontexte bis 148k). Für 8k gilt ein
+mittleres p von 3,75k.
+
+**Zerlegung pro Schicht und 512er-Chunk.** Zeilen 1 und 2 sind gemessen, Zeilen 3 bis 5 abgeleitet bzw. geschätzt,
+wie in der Spalte „Quelle“ angegeben.
+
+| Anteil | 5090 | 3080 | Quelle |
+|---|---|---|---|
+| Attention, kontextabhängig | 0,089 ms je Attn-Schicht je 1k Kontext (~144 TFLOPS, 69 % der BF16/FP32-Akku-Spitze) | 0,361 ms (~35,7 TFLOPS, 60 % von 59,5) | Steigung der Fits |
+| GDN (linear attention, fla/triton) | ~0,11 ms je GDN-Schicht | ~0,31–0,39 ms | NF-Boots fnFL2x16x–x178, fnNV4f*, `ATTN-TIMING-PREFILL`, gleiche GDN-Dims (16/48 × 128), 8k/16k-Chunks. Bei 512 eher mehr. |
+| Nicht-GEMM-Konstante gesamt | 0,58 ms je Schicht | 1,30 ms (PP1), 1,67 ms (PP2, letzte Stufe) | Fit(p=0) minus INT8-GEMM zur Lane-Rate bei M=2048; **Obergrenze** |
+| davon Norm/Aktivierung/Quant/Residual | ~0,12 ms (Bandbreite ~1,5 TB/s) | ~0,28 ms (~180 MB bei ~650 GB/s) | Rechnung |
+| unerklärter Rest | ~0,3 ms | ~0,6 ms | vermutlich INT8-GEMM bei M=512 langsamer als bei M=2048; Messung im Fenster zcx7pv |
+
+**Modellprobe:** (16 + 2) × max Stufe bei p = 3,75k. INT8 8760 tok/s gegen gemessen 8905, NVFP4-Marlin 4468 gegen 4246.
+Die 3080-Marlin-Rate bei M=512 ergibt sich aus dem NVFP4-Fit zu 53,8 TFLOPS (Lane-Wert bei M=2048: 63/60).
+
+**Physik (Hochrechnung):**
+- Attention auf sm_86 läuft schon bei ~60 % der FP16-MMA-Spitze (FP32-Akku). Der einzige große Hebel ist INT8-QK nach
+  Sage-Art (INT8 238 TOPS). Der ist qualitätspflichtig (Nutzerorder 08.09.).
+- GDN ist bei T=512 latenzgebunden: viele kleine Triton-Kerne. Hebel wäre ein fusionierter Chunk-Kern, Umfang unbekannt.
+- Das P-Layout 42/11/11 legt 10 von 16 Attention-Schichten auf die 5090 (dort 4× schneller je FLOP). Die 3080-Stufen
+  tragen je 3 Attention-Schichten: das ist der Kontext-Term 1,08 ms/k.
+
+## 10. Hochrechnung P8k und D (benchmark/nvfp4_native/projection.py)
+
+**HOCHRECHNUNG, keine Messung.** Kontextbewusstes Modell aus §9, kalibriert auf beide Boots.
+
+| 3080 W4A8 (TOPS bei M=512) | 5090 FP4 + FP8 nativ | 5090 FP4 nativ, FP8 Marlin |
+|---|---|---|
+| 100 | Schnitt 49/8/7, **8,2–8,8k tok/s** | 45/10/9, 6,7–7,2k |
+| 120 | 48/8/8, **8,2–8,8k** | 45/10/9, 6,8–7,3k |
+| 155 | 47/9/8, **8,5–9,1k** | 43/11/10, 7,0–7,5k |
+
+Heute gemessen: NVFP4-Marlin 4246, INT8 8905 tok/s.
+- Neu bindet die **5090-Stufe** mit ihrer Nicht-GEMM-Konstante (0,58 ms je Schicht bei 47–49 Schichten).
+- 10k tok/s bräuchte weniger „other“ auf der 5090 oder die Attention-/GDN-Hebel aus §9. GEMMs allein reichen nicht.
+- **Offen:** Das 5090-VRAM für 47–49 P-Schichten. Im Vergleich zu 42 kommen ~1,6 GB Gewichte dazu, plus der P-KV bzw.
+  Mamba-Zustand der zusätzlichen Schichten. Der Planer muss neu passen (P-Schnitt ist Flag + Messung).
+
+## 11. Offen
 
 - NVFP4-DFlash2-Draft: geht durch dieselbe Methode, also derselbe Vertrag. Shapes nicht geprüft.
 - Mikrobench-Zahlen dieses Sitzes: siehe Bericht (GPU-Fenster nach der NF-Nachabnahme).
