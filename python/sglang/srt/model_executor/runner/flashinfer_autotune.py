@@ -74,9 +74,14 @@ def should_run_flashinfer_autotune(
         "modelopt_fp4",
         "modelopt_mixed",
     )
+    from sglang.srt.layers.quantization.nvfp4_sm12x_w4a16 import sm12x_w4a16_max_m
+
     fp4_gemm_needs_autotune = model_uses_fp4 and (
         get_fp4_gemm_runner_backend().is_flashinfer_cutlass()
         or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
+        # sm_12x small-M W4A16 (flashinfer cute-dsl-native) picks its tactic
+        # through flashinfer's AutoTuner; untuned it runs the default tactic.
+        or sm12x_w4a16_max_m() > 0
     )
 
     from sglang.srt.layers.quantization.fp8_utils import (
