@@ -151,3 +151,42 @@ class LoadConfig:
                 f"Supported load formats are "
                 f"{rocm_supported_load_format}"
             )
+
+
+def resolve_draft_load_format(server_args: Any, draft_model_path: Optional[str]) -> Any:
+    """The load format of a runner that loads a DRAFT checkpoint.
+
+    * ``--speculative-draft-load-format``, when given, is the draft's own
+      statement and is returned as is.
+    * Otherwise the draft inherits the target's ``--load-format`` (upstream's
+      documented semantics) -- EXCEPT that a GGUF target's ``gguf`` is never
+      handed to a draft that is not a GGUF file. ``server_args.
+      _handle_load_format`` turns the TARGET's ``auto`` into ``gguf``
+      (``check_gguf_file`` on ``model_path``), and ``GGUFModelLoader.
+      _prepare_weights`` takes one ``.gguf`` FILE only, so an inherited
+      ``gguf`` dies on a draft DIRECTORY: ``ValueError: <draft> is not a
+      file`` (27B line, weg2rc4gg PP2, 2026-09-25 04:41Z: the DFlash2-lued-W8
+      safetensors draft beside the unsloth IQ4_XS target; the same class as
+      12ca175896 and TICKET_470 Fixed 2). Such a draft loads ``auto``.
+
+    ``draft_model_path`` is the path the draft ACTUALLY loads from (the
+    draft ``ModelConfig.model_path``; an in-checkpoint MTP head resolves to
+    the target file and keeps ``gguf``).
+
+    Byte-identical for every target that is not GGUF when the flag is unset:
+    the inherited object itself is returned, not a copy or a normalised form.
+    """
+    explicit = getattr(server_args, "speculative_draft_load_format", None)
+    if explicit is not None:
+        return explicit
+    inherited = getattr(server_args, "load_format", LoadFormat.AUTO)
+    name = getattr(inherited, "value", inherited)
+    if not isinstance(name, str) or name.lower() != LoadFormat.GGUF.value:
+        return inherited
+    if not draft_model_path:
+        return inherited
+    from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+
+    if check_gguf_file(draft_model_path):
+        return inherited
+    return LoadFormat.AUTO.value
