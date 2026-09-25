@@ -97,6 +97,20 @@ def test_what_stays_on_todays_path_is_named(recv, why):
     assert tail is None and ids is recv.input_ids
 
 
+def test_both_census_lines_format_without_a_logging_error(caplog, monkeypatch):
+    """RC2 metal (weg2rc2 P log 23:27:58, the image request weg2-50-74): the kept()
+    line raised in logging -- "TypeError: %d format: a real number is required, not
+    str" -- because _note() puts n FIRST and the kept format put the reason first.
+    Every kept() line was lost as '--- Logging error ---' plus a traceback."""
+    monkeypatch.setattr(pt, "_counts", {})
+    with caplog.at_level(logging.INFO, logger=pt.logger.name):
+        pt.split_ids(_recv(PROMPT, mm_inputs=object()))
+        pt.split_ids(_recv(PROMPT))
+    msgs = [r.getMessage() for r in caplog.records if "P-TRIM-END-ANCHOR" in str(r.msg)]
+    assert any("kept(mm)" in m and "n=1 " in m and "tokens=%d" % N in m for m in msgs), msgs
+    assert any("tokens=%d->%d" % (N, N - 1) in m and "n=1 " in m for m in msgs), msgs
+
+
 def test_the_scheduler_trims_only_when_armed_and_marks_the_req():
     """The normal-path Req is built from the trimmed ids and carries the tail;
     unarmed, the Req gets recv_req.input_ids as before."""

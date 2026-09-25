@@ -107,8 +107,10 @@ def split_ids(recv_req: Any) -> Tuple[Sequence[int], Optional[Sequence[int]]]:
     ids = recv_req.input_ids
     why = keep_reason(recv_req)
     if why is not None:
+        # _note() puts n FIRST, so the format opens with n=%d (weg2rc2: the reason
+        # first raised TypeError in logging and every kept() line was lost).
         _note("kept:" + why,
-              "WEG2 P-TRIM-END-ANCHOR kept(%s) n=%d rid=%s tokens=%d -- the last token "
+              "WEG2 P-TRIM-END-ANCHOR n=%d kept(%s) rid=%s tokens=%d -- the last token "
               "stays on P (today's path, END-ANCHOR split included)",
               why, str(getattr(recv_req, "rid", "?"))[:24], len(ids) if ids is not None else -1)
         return ids, None
