@@ -31,6 +31,14 @@ WHAT THIS PINS
 * ``TilingStaysStrict`` -- W84 still refuses a gap, an overlap, a plan without
   ``ba`` and a claim past the view, and the holder of an untiled storage stays
   UNCOVERED.
+* ``FlipFormDoesNotFuse`` (H79 part 2, operator decision 25.09.: variant (A)
+  on top of (B)) -- a Weg-2 flip rank (group P or D) does NOT fuse: the post-
+  load cat cannot reuse the 80 MiB storage it replaces, a tag pool never
+  returns a freed block, and every fused layer left an 80 MiB hole in its band
+  (fnNV4f1: band ``inactive_gib`` 0.18-0.26 against 0.00-0.01 unfused) for a
+  0.15-0.6 % decode gain.  qkvz/ba keep their own storages, nothing is
+  allocated, W84 passes without a tiled storage.  Without Weg-2 upstream still
+  fuses.  RED on the (B)-only commit, GREEN with (A).
 
 Hermetic: CPU tensors, ``CUDA_VISIBLE_DEVICES=""``, a fake saver cdll, no
 checkpoint, no region.
@@ -38,6 +46,7 @@ checkpoint, no region.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import unittest
 import unittest.mock
@@ -148,20 +157,25 @@ class _FakeCdll:
         self.sets.append(self.tag)
 
 
-def _cuda_no_lora():
-    """``finalize_fused_in_proj`` returns at once off CUDA and under LoRA."""
-    stack = unittest.mock.patch.multiple(
+@contextlib.contextmanager
+def _cuda_no_lora(group: str = ""):
+    """``finalize_fused_in_proj`` returns at once off CUDA and under LoRA.
+
+    ``group`` is this rank's Weg-2 group as ``weg2_group_name`` answers it --
+    ``""`` for an engine that is none, ``"P"``/``"D"`` for a flip rank.  The
+    READER is substituted, never the env: it caches for the process lifetime,
+    so an env set here would pass or fail depending on test order."""
+    with unittest.mock.patch.multiple(
         q35,
         _is_cuda=True,
         get_lora=lambda: SimpleNamespace(enable_lora=False, lora_paths=None),
-    )
-    return stack
+    ), unittest.mock.patch.object(wms, "weg2_group_name", lambda: group):
+        yield
 
 
-def _fuse_all(model: _Model) -> None:
-    with _cuda_no_lora():
-        for g in model.model.layers.values():
-            g.linear_attn.finalize()
+def _fuse_all(model: _Model, group: str = "") -> list:
+    with _cuda_no_lora(group):
+        return [g.linear_attn.finalize() for g in model.model.layers.values()]
 
 
 def _plan_bytes(model):
@@ -366,28 +380,32 @@ INT4_GOLDEN = [
 
 class Int4PathIsUnchanged(_ChunkedCase):
     def test_an_unfused_layer_is_not_touched(self):
-        gdn = _GDN(1, 64, 8, 64, int4=True)
-        before = {n: (p.data_ptr(), p.detach().clone())
-                  for n, p in gdn.named_parameters()}
-        fake = _FakeCdll()
-        cats = []
-        real_cat = torch.cat
+        # Outside Weg-2 AND on a flip rank: the INT4 qkvz declines before the
+        # flip veto is even asked, so both read the same.
+        for group in ("", "P", "D"):
+            gdn = _GDN(1, 64, 8, 64, int4=True)
+            before = {n: (p.data_ptr(), p.detach().clone())
+                      for n, p in gdn.named_parameters()}
+            fake = _FakeCdll()
+            cats = []
+            real_cat = torch.cat
 
-        def _cat(*a, **kw):
-            cats.append(1)
-            return real_cat(*a, **kw)
+            def _cat(*a, **kw):
+                cats.append(1)
+                return real_cat(*a, **kw)
 
-        with unittest.mock.patch.object(wms, "_tms_cdll_in_region", lambda: fake), \
-                unittest.mock.patch.object(torch, "cat", _cat), _cuda_no_lora():
-            with wms.weights_region_tag(GPU_MEMORY_TYPE_WEIGHTS):
-                gdn.finalize()
-        self.assertEqual(cats, [])
-        self.assertEqual(fake.sets, [], "an unfused layer entered a band scope")
-        self.assertIsNone(gdn._fused_in_proj_weight)
-        for n, p in gdn.named_parameters():
-            ptr, data = before[n]
-            self.assertEqual(p.data_ptr(), ptr, n)
-            self.assertTrue(torch.equal(p.detach(), data), n)
+            with unittest.mock.patch.object(wms, "_tms_cdll_in_region", lambda: fake), \
+                    unittest.mock.patch.object(torch, "cat", _cat), \
+                    _cuda_no_lora(group):
+                with wms.weights_region_tag(GPU_MEMORY_TYPE_WEIGHTS):
+                    gdn.finalize()
+            self.assertEqual(cats, [], group)
+            self.assertEqual(fake.sets, [], "an unfused layer entered a band scope")
+            self.assertIsNone(gdn._fused_in_proj_weight)
+            for n, p in gdn.named_parameters():
+                ptr, data = before[n]
+                self.assertEqual(p.data_ptr(), ptr, n)
+                self.assertTrue(torch.equal(p.detach(), data), n)
 
     def test_the_int4_coverage_lines_are_byte_identical(self):
         model = _Model([_GDN(1, 64, 8, 64, int4=True)])
@@ -493,6 +511,99 @@ class TilingStaysStrict(_ChunkedCase):
         row = self._rows(model)["weights_0"]
         self.assertTrue(row.ok, row.tiling)
         self.assertEqual(len(row.tiled), 1)
+
+
+# ===========================================================================
+# (A): THE WEG-2 FLIP FORM DOES NOT FUSE -- RED on the (B)-only commit.
+# ===========================================================================
+
+
+class FlipFormDoesNotFuse(_ChunkedCase):
+    def _finalize_recorded(self, gdn, group):
+        fake = _FakeCdll()
+        at_cat = []
+        real_cat = torch.cat
+
+        def _cat(*a, **kw):
+            at_cat.append(fake.tag)
+            return real_cat(*a, **kw)
+
+        with unittest.mock.patch.object(wms, "_tms_cdll_in_region", lambda: fake), \
+                unittest.mock.patch.object(torch, "cat", _cat), _cuda_no_lora(group):
+            with wms.weights_region_tag(GPU_MEMORY_TYPE_WEIGHTS):
+                status = gdn.finalize()
+        return status, fake, at_cat
+
+    def test_a_flip_rank_keeps_qkvz_and_ba_in_their_own_storages(self):
+        for group in ("P", "D"):
+            gdn = _GDN(9, 64, 8, 32)
+            gdn.in_proj_qkvz.weight.data.fill_(1)
+            gdn.in_proj_ba.weight.data.fill_(2)
+            before = {n: (p.data_ptr(), p.untyped_storage().data_ptr(),
+                          p.untyped_storage().nbytes())
+                      for n, p in gdn.named_parameters()}
+            status, fake, at_cat = self._finalize_recorded(gdn, group)
+            self.assertEqual(status, "skip:weg2-flip", group)
+            # Nothing allocated -- the cat is the fusion's ONLY allocation --
+            # and no band scope entered, so no pool grew.
+            self.assertEqual(at_cat, [], group)
+            self.assertEqual(fake.sets, [], group)
+            self.assertIsNone(gdn._fused_in_proj_weight)
+            self.assertEqual(gdn._fused_in_proj_qkvz_width, 0)
+            for n, p in gdn.named_parameters():
+                self.assertEqual(
+                    (p.data_ptr(), p.untyped_storage().data_ptr(),
+                     p.untyped_storage().nbytes()), before[n], (group, n))
+                # its OWN storage, exactly its own bytes
+                self.assertEqual(p.untyped_storage().nbytes(),
+                                 p.numel() * p.element_size(), (group, n))
+            self.assertNotEqual(
+                gdn.in_proj_qkvz.weight.untyped_storage().data_ptr(),
+                gdn.in_proj_ba.weight.untyped_storage().data_ptr())
+            self.assertTrue(bool((gdn.in_proj_qkvz.weight == 1).all()))
+            self.assertTrue(bool((gdn.in_proj_ba.weight == 2).all()))
+
+    def test_the_metal_shape_on_a_flip_rank_needs_no_tiling(self):
+        """fnNV4f1's own layer on group P: W84 passes on the one-Parameter-
+        one-storage path, the plan claims each storage whole."""
+        model = _Model([_GDN(0, NQ, NB, K)])
+        self.assertEqual(_fuse_all(model, group="P"), ["skip:weg2-flip"])
+        got = _plan_bytes(model)
+        self.assertEqual(got["weights_0"][QKVZ.format(0)], NQ * K * 2)
+        self.assertEqual(got["weights_0"][BA.format(0)], NB * K * 2)
+        rows = wx.build_coverage(
+            model, rank=0, planned_bytes_by_tag=got, tag_bytes=_zero)
+        row = rows["weights_0"]
+        self.assertTrue(row.ok, wx.coverage_refusal_message(rows))
+        self.assertEqual((row.tiled, row.view_holders, row.tiling), ((), (), ()))
+        self.assertNotIn(" tiled=", row.cover_line())
+        self.assertEqual(row.planned_bytes, (NQ + NB) * K * 2)
+
+    def test_without_weg2_upstream_still_fuses(self):
+        gdn = _GDN(9, 64, 8, 32)
+        status, fake, at_cat = self._finalize_recorded(gdn, "")
+        self.assertEqual(status, "fused@weights_1")
+        self.assertEqual(at_cat, ["weights_1"])
+        self.assertEqual(gdn.in_proj_qkvz.weight.data_ptr(),
+                         gdn._fused_in_proj_weight.data_ptr())
+
+    def test_the_census_line_says_what_the_flip_form_did(self):
+        census = q35.Qwen3_5GatedDeltaNet.fused_in_proj_census_line
+        self.assertEqual(
+            census(["skip:weg2-flip"] * 22),
+            "#H79 GDN-FUSED-IN-PROJ gdn=22 fused=0 skipped=22 already=0 "
+            "unbanded=0 reason=weg2-flip:22 tags=-")
+        self.assertEqual(
+            census(["fused@weights_0"] * 3 + ["fused@weights_1"] * 2
+                   + ["fused@-"]),
+            "#H79 GDN-FUSED-IN-PROJ gdn=6 fused=6 skipped=0 already=0 "
+            "unbanded=1 reason=- tags=-:1,weights_0:3,weights_1:2")
+        int4 = "skip:qkvz=CompressedTensorsLinearMethod/ba=UnquantizedLinearMethod"
+        self.assertEqual(
+            census([int4] * 22 + ["already"]),
+            "#H79 GDN-FUSED-IN-PROJ gdn=23 fused=0 skipped=22 already=1 "
+            "unbanded=0 reason=qkvz=CompressedTensorsLinearMethod/"
+            "ba=UnquantizedLinearMethod:22 tags=-")
 
 
 if __name__ == "__main__":
