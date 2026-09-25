@@ -814,10 +814,16 @@ def _tie_word_embeddings(model_path: str) -> bool:
     out not to exist refuses nothing, while the reverse under-sizes it.
     """
     import json
-    import os
 
+    # The server's own rule for WHICH config.json describes the checkpoint: a
+    # GGUF launch names the file, whose config is its sibling (27B line G2).
+    from sglang.srt.server_args import declared_config_path_for
+
+    cfg_path = declared_config_path_for(model_path)
+    if cfg_path is None:
+        return False
     try:
-        with open(os.path.join(model_path, "config.json")) as fh:
+        with open(cfg_path) as fh:
             cfg = json.load(fh)
     except OSError:
         return False

@@ -618,6 +618,31 @@ def _probe_declared(cfg: dict, key):
     return value if value is not None else (cfg.get("text_config") or {}).get(key)
 
 
+def declared_config_path_candidates(model_path: Optional[str]) -> List[str]:
+    """The ``config.json`` locations that may describe ``model_path``, in probe
+    order (see :func:`declared_config_path_for`)."""
+    if not model_path:
+        return []
+    candidates = [os.path.join(model_path, "config.json")]
+    if model_path.endswith(".gguf"):
+        candidates.append(os.path.join(os.path.dirname(model_path), "config.json"))
+    return candidates
+
+
+def declared_config_path_for(model_path: Optional[str]) -> Optional[str]:
+    """Path of the ``config.json`` that describes ``model_path``, or None.
+
+    The rule of :meth:`ServerArgs.declared_config_path`, as a function of the
+    path alone, so a process that has no ``ServerArgs`` -- the weg2 launcher --
+    calls the server's own rule instead of re-implementing it (a GGUF launch
+    names the ``.gguf`` FILE, and its config is the sibling ``config.json``).
+    """
+    for candidate in declared_config_path_candidates(model_path):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 def declared_num_hidden_layers_from_config(cfg: dict) -> Optional[int]:
     """The backbone depth ``cfg`` declares, or None.  Advisory (see
     :meth:`ServerArgs.declared_num_hidden_layers` for why it is never
@@ -16593,16 +16618,7 @@ class ServerArgs:
         Returns None when neither candidate is a readable file; the depth
         remains advisory either way (see :meth:`declared_num_hidden_layers`).
         """
-        model_path = getattr(self, "model_path", None)
-        if not model_path:
-            return None
-        candidates = [os.path.join(model_path, "config.json")]
-        if model_path.endswith(".gguf"):
-            candidates.append(os.path.join(os.path.dirname(model_path), "config.json"))
-        for candidate in candidates:
-            if os.path.isfile(candidate):
-                return candidate
-        return None
+        return declared_config_path_for(getattr(self, "model_path", None))
 
     def _read_declared_config(self) -> Optional[dict]:
         """The parsed ``config.json``, or None when it cannot be read."""

@@ -3132,6 +3132,151 @@ def flip_ratchet_record(
     }
 
 
+def _config_path(model_path: str) -> str:
+    """The ``config.json`` describing ``model_path`` by the server's own rule
+    (``server_args.declared_config_path_for``: a GGUF file's config is its
+    sibling); the plain join when nothing is found, so the caller's open()
+    raises exactly what it raised before (27B line G2)."""
+    from sglang.srt.server_args import declared_config_path_for
+
+    return declared_config_path_for(model_path) or os.path.join(
+        model_path, "config.json"
+    )
+
+
+def _is_gguf_file(model_path: str) -> bool:
+    """The server's own GGUF predicate (``check_gguf_file``), for a path that
+    names a file; a directory is never one (and never imports anything)."""
+    if not model_path or not os.path.isfile(model_path):
+        return False
+    from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+
+    return bool(check_gguf_file(model_path))
+
+
+@dataclass(frozen=True)
+class GgufHeaderFacts:
+    """What the launch path needs from a GGUF checkpoint's header (27B line G2),
+    read ONCE per file per process: gguf-py parses every metadata field when it
+    opens a file -- measured 8.5 s for Qwen3.8-27B-UD-IQ4_XS.gguf (its 248,320
+    tokenizer strings), twice with the loader's split resolution -- and a launch
+    asks for the depth, the arch and the digest (five sites)."""
+
+    arch: str  # general.architecture of the metadata part, "" when absent
+    block_count: Optional[int]
+    nextn_predict_layers: Optional[int]
+    tensor_digest: str  # sha256 over the sorted name:ggml_type:shape rows
+    n_tensors: int
+    n_parts: int
+
+    @property
+    def backbone_depth(self) -> Optional[int]:
+        """``block_count`` minus the NEXTN/MTP draft blocks it counts -- the
+        depth ``gguf_registry.reconcile_sibling_config`` compares and, on a
+        depth-only difference, loads."""
+        if self.block_count is None:
+            return None
+        return self.block_count - (self.nextn_predict_layers or 0)
+
+
+#: (realpath, size, mtime_ns) of the named file -> its facts. A split set is
+#: keyed by the part it was named by (bound: a later part replaced under a
+#: running launcher is not seen -- the loader's own resolution cache has the
+#: same one).
+_GGUF_HEADER_FACTS: Dict[Tuple[str, int, int], GgufHeaderFacts] = {}
+
+
+def _gguf_int(reader, key: str) -> Optional[int]:
+    field = reader.fields.get(key)
+    if field is None:
+        return None
+    try:
+        return int(field.contents())
+    except (TypeError, ValueError):
+        return None
+
+
+def gguf_header_facts(gguf_file: str) -> GgufHeaderFacts:
+    """The :class:`GgufHeaderFacts` of ``gguf_file``'s whole split set (the
+    loader's own ``resolve_gguf_shard_paths`` / ``gguf_metadata_path``). Header
+    only -- no tensor byte is read."""
+    st = os.stat(gguf_file)
+    key = (os.path.realpath(gguf_file), int(st.st_size), int(st.st_mtime_ns))
+    hit = _GGUF_HEADER_FACTS.get(key)
+    if hit is not None:
+        return hit
+    import gguf
+
+    from sglang.srt.model_loader.gguf_shards import (
+        gguf_metadata_path,
+        resolve_gguf_shard_paths,
+    )
+
+    parts = resolve_gguf_shard_paths(gguf_file)
+    meta = os.path.realpath(gguf_metadata_path(gguf_file))
+    arch, block_count, nextn, rows, seen_meta = "", None, None, [], False
+    for part in parts:
+        reader = gguf.GGUFReader(part, "r")
+        if os.path.realpath(part) == meta:
+            seen_meta = True
+            field = reader.fields.get("general.architecture")
+            arch = str(field.contents()) if field is not None else ""
+            if arch:
+                block_count = _gguf_int(reader, f"{arch}.block_count")
+                nextn = _gguf_int(reader, f"{arch}.nextn_predict_layers")
+        rows.extend(
+            "%s:%s:%s"
+            % (
+                t.name,
+                getattr(t.tensor_type, "name", t.tensor_type),
+                "x".join(str(int(d)) for d in t.shape),
+            )
+            for t in reader.tensors
+        )
+    if not seen_meta:
+        raise RuntimeError(
+            f"GGUF {gguf_file}: its metadata part {meta} is not in its own split "
+            f"set {parts}"
+        )
+    rows.sort()
+    facts = GgufHeaderFacts(
+        arch=arch,
+        block_count=block_count,
+        nextn_predict_layers=nextn,
+        tensor_digest=hashlib.sha256("\n".join(rows).encode()).hexdigest(),
+        n_tensors=len(rows),
+        n_parts=len(parts),
+    )
+    _GGUF_HEADER_FACTS[key] = facts
+    return facts
+
+
+def _gguf_checkpoint_digest(model_path: str) -> Tuple[Optional[str], str]:
+    try:
+        with open(_config_path(model_path)) as f:
+            cfg = json.load(f)
+        tc = cfg.get("text_config", cfg)
+        c = hashlib.sha256(
+            json.dumps(tc, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        facts = gguf_header_facts(model_path)
+        g, n_tensors, n_parts = facts.tensor_digest, facts.n_tensors, facts.n_parts
+    except Exception as e:  # noqa: BLE001 -- gguf reader errors are not OSError
+        return None, (
+            f"checkpoint digest unavailable for {model_path}: {e!r}. A GGUF "
+            f"content digest needs the sibling config.json and a readable GGUF "
+            f"tensor directory; without them this boot has no stable model "
+            f"identity and every recorded figure must be treated as another "
+            f"model's"
+        )
+    return hashlib.sha256((c + g).encode()).hexdigest(), (
+        f"gguf content digest over the sibling config.text_config + the sorted "
+        f"(name, ggml type, shape) of {n_tensors} tensors in {n_parts} part(s) "
+        f"(config {c[:12]}..., tensors {g[:12]}...) -- snapshot-independent; "
+        f"types included because quantizations of one model share every name"
+    )
+
+
 def checkpoint_digest(model_path: str) -> Tuple[Optional[str], str]:
     """#1362 [22-fix]: the model's CONTENT identity, or ``(None, why)``.
 
@@ -3156,9 +3301,18 @@ def checkpoint_digest(model_path: str) -> Tuple[Optional[str], str]:
     ``89dcd9c4195338...``; the launcher could not have found the file at all.
     The path form stays as the launch-path fallback for a checkpoint whose
     config or index cannot be read, and says which one it is wherever printed.
+
+    A GGUF FILE (27B line G2) has no index: its config is the sibling
+    ``config.json`` (the server's ``declared_config_path_for``) and its tensor
+    part is :attr:`GgufHeaderFacts.tensor_digest` -- names WITH their ggml types
+    and shapes, because two quantizations of one model (UD-IQ4_XS, UD-Q8_K_XL)
+    share every name and every config byte, and a names-only digest would hand
+    one the other's calibration. A directory digests exactly as before.
     """
+    if _is_gguf_file(model_path):
+        return _gguf_checkpoint_digest(model_path)
     try:
-        with open(os.path.join(model_path, "config.json")) as f:
+        with open(_config_path(model_path)) as f:
             cfg = json.load(f)
         tc = cfg.get("text_config", cfg)
         c = hashlib.sha256(
@@ -3193,7 +3347,7 @@ def checkpoint_layers(model_path: str) -> Optional[int]:
     pre-#1362 behaviour rather than refusing on a number it does not have.
     """
     try:
-        with open(os.path.join(model_path, "config.json")) as f:
+        with open(_config_path(model_path)) as f:
             cfg = json.load(f)
     except (OSError, ValueError):
         return None
