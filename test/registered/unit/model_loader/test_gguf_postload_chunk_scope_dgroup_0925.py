@@ -177,8 +177,9 @@ class GroupDTensorParallelShards(_Isolated):
                     self.assertEqual(flat, {want})
                     # the shard is really a shard: a third of the one-rank container
                     self.assertEqual(nbytes * 3, FULL_FLAT_BYTES)
-                    # the shared dequant workspace stays in the base tag (operator order)
-                    self.assertEqual(work, {"weights"})
+                    # F1b: the shared dequant workspace is born in the chunk of the layer
+                    # that sized it -- here the pass's only layer
+                    self.assertEqual(work, {want})
                     self.assertEqual(current, "weights")
 
     def test_a_tp_shard_materialized_in_load_weights_lands_in_its_layers_chunk(self):
@@ -206,7 +207,8 @@ class GroupPStageSubset(_Isolated):
                     f"model.layers.{layer_id}.linear_attn.in_proj_qkvz", 1, 0
                 )
                 self.assertEqual(flat, {want})
-                self.assertEqual(work, {"weights"})
+                # F1b: a layers-only stage allocates nothing under the base tag
+                self.assertEqual(work, {want})
                 self.assertEqual(current, "weights")
 
 
