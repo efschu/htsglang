@@ -896,7 +896,10 @@ def checkpoint_stage_weights(
     drafter_head_from_target: bool = False,
     external_drafter_mib: float = 0.0,
 ) -> List[StageWeights]:
-    """Per-PP-stage weight MiB from the safetensors HEADERS and the shipped cut.
+    """Per-PP-stage weight MiB from the safetensors HEADERS and the shipped cut
+    -- or, for a GGUF ``--model-path`` (27B line G6), from the GGUF file's own
+    tensor directory through the same ``pp_cut.checkpoint_weight_terms``
+    (exact per-tensor header bytes, the NEXTN block under ``mtp.*``).
 
     THE INDEPENDENT SOURCE.  It touches no boot log, no census and no
     predecessor: only the checkpoint this boot will load and the cut this boot
