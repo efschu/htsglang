@@ -234,15 +234,31 @@ def test_launcher_with_the_flag_d_gets_the_riegel_the_front_the_ceiling():
 
 def test_main_hands_the_riegel_to_d_at_both_launch_sites_and_never_to_p():
     """Fehler 2 was a front raised alone. Both argv_d calls (dry and real) take
-    D's riegel; argv_p takes no X term at all -- group P does not change."""
+    D's riegel; argv_p takes no X term at all -- group P does not change.
+
+    --d-only is a third argv_d site with its own riegel: no P, no flip, no
+    front, D prefills every uncached length itself, so x_tokens is W50
+    (max_kv_per_request) there and never the flip X."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(L.main)))
+    donly = [n for n in ast.walk(tree) if isinstance(n, ast.If) and ast.unparse(n.test) == "ns.d_only"]
+    assert len(donly) == 1, "the --d-only branch of main not found"
+    in_donly = {id(n) for n in ast.walk(donly[0])}
     names = {"argv_d": [], "argv_p": [], "front_argv_for": []}
+    donly_calls = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in names:
+            if id(node) in in_donly:
+                donly_calls.append(node)
+                continue
             used = {n.id for a in list(node.args) + [k.value for k in node.keywords]
                     for n in ast.walk(a) if isinstance(n, ast.Name)}
             names[node.func.id].append(used)
     assert len(names["argv_d"]) == 2 and all("d_x_tokens" in u for u in names["argv_d"])
+    # --d-only: exactly one argv_d, no argv_p, no front -- and its riegel is W50.
+    assert [c.func.id for c in donly_calls] == ["argv_d"]
+    x_pos = list(inspect.signature(L.argv_d).parameters).index("x_tokens")
+    x_arg = donly_calls[0].args[x_pos]
+    assert isinstance(x_arg, ast.Name) and x_arg.id == "max_kv_per_request"
     # ...and the front is told the same number at both sites, or D's riegel
     # rises while the live X stays pinned to the start X.
     assert len(names["front_argv_for"]) == 2
