@@ -826,7 +826,27 @@ class TheCollectorFreesTheFileNotOnlyThePermit(CustomTestCase):
     def _round_trip(self, *, cap):
         """Deposit ALL of this rank's lanes for ONE tag, then collect them
         -- two separate calls, matching D's and P's separate processes --
-        and return (terms, lane_paths, mismatched_rows)."""
+        and return (terms, lane_paths, mismatched_rows).
+
+        PINNED TO THE TRANSIENT FORM (SEQ_PERSIST_BUFFERS=0).  Since
+        3a0e16bda4 (2026-09-15, user order "persistente puffer") the shipped
+        default keeps each lane's buffer created, mapped and registered for
+        the PROCESS -- "never unlinked per tag", the files stay on tmpfs
+        until the launcher's preflight `shm_residue_sweep` ("weg2-seq-"),
+        and `SGLANG_WEG2_SEQ_RELEASE_LANES=1` truncates them at the
+        collector's leg end instead.  The collector frees the file only in
+        the transient form, which is the promise this class pins; 3a0e16bda4
+        pinned its own witness the same way
+        (test_weg2_sequential_transport_1378.py setUp) and missed this file.
+        The persistent form's reuse is pinned by
+        test_weg2_sequential_transport_1378.py
+        test_the_lane_buffer_is_registered_once_and_reused."""
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {bx.SEQ_PERSIST_BUFFERS_ENV: "0"}):
+            return self._round_trip_transient(cap=cap)
+
+    def _round_trip_transient(self, *, cap):
         import tempfile
 
         from sglang.srt.weg2 import weight_exchange_region as xr

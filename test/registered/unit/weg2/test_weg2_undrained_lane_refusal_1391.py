@@ -320,11 +320,17 @@ def test_undrained_lanes_ignores_other_cards(real_sems):
 
 
 def test_an_empty_collect_plan_beside_real_undrained_bands_refuses_by_name(
-        monkeypatch, armed, real_sems):
+        monkeypatch, armed, real_sems, tmp_path):
     """RED-FIRST: this is boot weg2xsn31's own shape, driven through the real
     product method. Before this commit, `_cdescs=[]` logged one INFO line and
     returned -- the peer's `wait_drained` and this rank's own later credit
     wait were left to find out 120 s later."""
+    # The real leg creates its bounce slot record (`weg2-xchg-bnc-<nonce>`)
+    # under `xr.SHM_ROOT`, read at CALL time by `_weg2_xchg_bounce_leg`; the
+    # production entry point has no shm_root parameter, so the root is moved
+    # here -- otherwise every run left /dev/shm/weg2-xchg-bnc-1391boot behind,
+    # a name the conftest's own-pid guard (`weg2-xchg-s4b<pid>x`) never sees.
+    monkeypatch.setattr(xr, "SHM_ROOT", str(tmp_path))
     _post_diagonal_bands(real_sems, 0, 16)
     m = _manager(monkeypatch, group="P", rank=0, sems=real_sems)
     # This rank's plan carries real work for weights_3 ONLY -- the #1233
@@ -876,7 +882,7 @@ def _run_two_tag_leg(*, dest_per_tag: bool, tmp_path, timeout=8.0):
                     descs=[_diag_desc(t, ops_src=src_ops, ops_dst=dst_ops)],
                     ops=src_ops, boot_nonce=nonce, terms=terms,
                     mode=wx.INJECT_AUTHORITATIVE, device=0, hook="source",
-                    sems=sems_src, tag=f"weights_{t}", rank=0,
+                    sems=sems_src, tag=f"weights_{t}", rank=0, shm_root=root,
                 )
             results["source"] = "deposited"
         except Exception as exc:  # noqa: BLE001
@@ -892,7 +898,7 @@ def _run_two_tag_leg(*, dest_per_tag: bool, tmp_path, timeout=8.0):
                         ops=dst_ops, boot_nonce=nonce, terms=terms,
                         mode=wx.INJECT_AUTHORITATIVE, device=0,
                         hook="authoritative", sems=sems_dst,
-                        tag=f"weights_{t}", rank=0,
+                        tag=f"weights_{t}", rank=0, shm_root=root,
                     )
             else:
                 # THE OLD SHAPE: give resume() time to map both tags (as
@@ -906,6 +912,7 @@ def _run_two_tag_leg(*, dest_per_tag: bool, tmp_path, timeout=8.0):
                     ops=dst_ops, boot_nonce=nonce, terms=terms,
                     mode=wx.INJECT_AUTHORITATIVE, device=0,
                     hook="authoritative", sems=sems_dst, tag=None, rank=0,
+                    shm_root=root,
                 )
             results["dest"] = "collected"
         except Exception as exc:  # noqa: BLE001

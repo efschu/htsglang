@@ -374,7 +374,19 @@ def _publish_inconsistent_term(monkeypatch, *, max_tag_bytes):
         pairs=1, depth=1, slot_bytes=4096, n_lanes=1,
         max_tag_bytes=max_tag_bytes, lanes_concurrent=0,
         band_credit=1, n_cross_lanes=1,
+        # #1464b (9f625b91c4) added this field to `_TERM_FIELDS`; without it
+        # `read_published_terms` refuses the term as partial BEFORE
+        # `bounce_terms` runs, so the #1397 refusal below was never reached
+        # (and the consistent-term guard passed on the wrong error).
+        price_lane_cap=0,
     )
+    # The docstring's promise ("every `_TERM_FIELDS` key present") as a check:
+    # the next field added to the published term fails HERE, by name, instead
+    # of silently turning this fixture into a partial-term test.
+    missing = [f for f in xb._TERM_FIELDS if f not in fields]
+    assert not missing, (
+        f"fixture misses published term field(s) {missing}: "
+        "read_published_terms would refuse the partial term first")
     raw = ",".join(f"{k}={v}" for k, v in fields.items()
                    if k in xb._TERM_FIELDS)
     monkeypatch.setenv(xb.ENV_BOUNCE_TERMS, raw)
@@ -413,6 +425,9 @@ def test_a_consistent_term_passes_the_same_gate_cleanly(monkeypatch):
         m._weg2_xchg_inject_weights(tag=TAG)
     # Must NOT be the #1397 ValueError this time.
     assert "band_credit=True with n_cross_lanes" not in str(exc.value)
+    # ... and not the partial-term refusal either: that one fires BEFORE the
+    # #1397 gate, so a pass on it would prove nothing about the gate.
+    assert "is missing" not in str(exc.value), str(exc.value)
 
 
 # ===========================================================================
