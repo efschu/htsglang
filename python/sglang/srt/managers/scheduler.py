@@ -1695,14 +1695,12 @@ class Scheduler(
             moe_dp_rank=self.ps.moe_dp_rank,
         )
 
-        if self.server_args.speculative_draft_load_format is not None:
-            self.server_args.override(
-                "scheduler.draft_load_format",
-                load_format=self.server_args.speculative_draft_load_format,
-            )
-            logger.info(
-                f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
-            )
+        # --speculative-draft-load-format is applied by the DRAFT runner itself
+        # (ModelRunner._this_runners_load_format), on every draft build path.
+        # It used to be a process-wide server_args.override(load_format=...)
+        # here: on this speculative branch only (the draft-KV producer above
+        # never saw it), and it rewrote the TARGET's load_format for the rest
+        # of the process (27B line, GGUF target, 2026-09-25).
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
