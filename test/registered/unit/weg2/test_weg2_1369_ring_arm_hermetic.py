@@ -521,9 +521,15 @@ class TestDangerDirectionIIResumeNeverReadsAGhostRing(unittest.TestCase):
     def test_pause_and_resume_take_no_enable_cpu_backup_parameter(self):
         header = _read("core.h")
         self.assertIn("void pause(const std::string& tag);", header)
-        self.assertIn("void resume(const std::string& tag);", header)
-        self.assertNotIn("void pause(const std::string& tag, const bool", header)
-        self.assertNotIn("void resume(const std::string& tag, const bool", header)
+        # weg2xsn289 (663eade64b): resume RETURNS the CUresult (setUpClass reads
+        # `int TorchMemorySaver::resume(`); the pin followed the body but not the
+        # declaration. What this test guards is the PARAMETER list, whatever the
+        # return type: pause/resume take the tag and nothing else.
+        self.assertIn("int resume(const std::string& tag);", header)
+        for decl in ("void pause(const std::string& tag, const bool",
+                     "void resume(const std::string& tag, const bool",
+                     "int resume(const std::string& tag, const bool"):
+            self.assertNotIn(decl, header)
 
     def test_the_flag_is_fixed_once_at_malloc_and_stored_on_the_metadata(self):
         self.assertIn("const bool enable_cpu_backup", self.malloc)
