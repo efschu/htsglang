@@ -3155,12 +3155,29 @@ def _is_gguf_file(model_path: str) -> bool:
 
 
 @dataclass(frozen=True)
+class GgufTensorRow:
+    """One tensor of a GGUF split set, as its header states it (27B line G6):
+    no byte of tensor data is read. ``n_bytes`` is gguf-py's own count for the
+    tensor's ggml type (block size x type size for a quantized one), i.e. the
+    exact on-disk size of a mixed-quant tensor -- never dtype x shape."""
+
+    name: str
+    ggml_type: str  # GGMLQuantizationType name, e.g. "IQ4_XS", "Q8_0", "F32"
+    shape: Tuple[int, ...]  # gguf-py order (ne0 first)
+    n_bytes: int
+
+
+@dataclass(frozen=True)
 class GgufHeaderFacts:
     """What the launch path needs from a GGUF checkpoint's header (27B line G2),
     read ONCE per file per process: gguf-py parses every metadata field when it
     opens a file -- measured 8.5 s for Qwen3.8-27B-UD-IQ4_XS.gguf (its 248,320
     tokenizer strings), twice with the loader's split resolution -- and a launch
-    asks for the depth, the arch and the digest (five sites)."""
+    asks for the depth, the arch and the digest (five sites).
+
+    G6: the same single read also keeps every tensor's row (``tensors``), so the
+    weight readers -- P cut, ring stage weights, layer census -- price a GGUF
+    from its own header without opening it a second time."""
 
     arch: str  # general.architecture of the metadata part, "" when absent
     block_count: Optional[int]
@@ -3168,6 +3185,9 @@ class GgufHeaderFacts:
     tensor_digest: str  # sha256 over the sorted name:ggml_type:shape rows
     n_tensors: int
     n_parts: int
+    #: every tensor of the split set in part order (G6); empty on a facts object
+    #: built by hand
+    tensors: Tuple[GgufTensorRow, ...] = ()
 
     @property
     def backbone_depth(self) -> Optional[int]:
@@ -3215,6 +3235,7 @@ def gguf_header_facts(gguf_file: str) -> GgufHeaderFacts:
     parts = resolve_gguf_shard_paths(gguf_file)
     meta = os.path.realpath(gguf_metadata_path(gguf_file))
     arch, block_count, nextn, rows, seen_meta = "", None, None, [], False
+    tensors: List[GgufTensorRow] = []
     for part in parts:
         reader = gguf.GGUFReader(part, "r")
         if os.path.realpath(part) == meta:
@@ -3224,15 +3245,17 @@ def gguf_header_facts(gguf_file: str) -> GgufHeaderFacts:
             if arch:
                 block_count = _gguf_int(reader, f"{arch}.block_count")
                 nextn = _gguf_int(reader, f"{arch}.nextn_predict_layers")
-        rows.extend(
-            "%s:%s:%s"
-            % (
-                t.name,
-                getattr(t.tensor_type, "name", t.tensor_type),
-                "x".join(str(int(d)) for d in t.shape),
+        for t in reader.tensors:
+            row = GgufTensorRow(
+                name=str(t.name),
+                ggml_type=str(getattr(t.tensor_type, "name", t.tensor_type)),
+                shape=tuple(int(d) for d in t.shape),
+                n_bytes=int(t.n_bytes),
             )
-            for t in reader.tensors
-        )
+            tensors.append(row)
+            rows.append(
+                "%s:%s:%s" % (row.name, row.ggml_type, "x".join(str(d) for d in row.shape))
+            )
     if not seen_meta:
         raise RuntimeError(
             f"GGUF {gguf_file}: its metadata part {meta} is not in its own split "
@@ -3246,6 +3269,7 @@ def gguf_header_facts(gguf_file: str) -> GgufHeaderFacts:
         tensor_digest=hashlib.sha256("\n".join(rows).encode()).hexdigest(),
         n_tensors=len(rows),
         n_parts=len(parts),
+        tensors=tuple(tensors),
     )
     _GGUF_HEADER_FACTS[key] = facts
     return facts
