@@ -3679,6 +3679,19 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 _seq_mm.close()
                 _fh.close()
             return _reg_refusal
+    # 25.09. (N4E, boot dkr27bnvfp4bar109252110): the lane's stream is
+    # DESTROYED in the finally below. #1492 (feae4ee415) closed the same leak
+    # for the BAR1 ring and listed every other create_stream as paired -- this
+    # one was not: one cudaStreamCreate per call (per tag, per phase, per
+    # on-card lane c0/c1/c2, every flip), never destroyed. Measured as the
+    # 'other (context+driver+...)' post of WEG2-DC-BREAKDOWN stage=release,
+    # first->last, against the WEG2-SEQ lane-time count of the same rank:
+    # 5090 ranks 0.54-0.56 MiB per call (D TP0 +348/640, P PP0 +356/640; INT8
+    # boot dkr27bbar1agent09251922 +276/497, +274/497), 3080 ranks 0.16-0.20
+    # MiB per call. On the 5090 both groups' leaks sum to ~17 MiB per flip on
+    # ONE card; D TP0's post-KV headroom at wake fell 1101 -> 201 MiB over 39
+    # wakes and the HiCache page loadback died there (torch OOM, 6.81 MiB free).
+    stream = 0
     try:
         sems = tp.SemSet(boot_nonce)
         # The lane the lane-form ran its copies on, or the default stream when the
@@ -4042,6 +4055,21 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 pass
         return ""
     finally:
+        # The stream first: on the normal path every batch was already
+        # synchronised, so this sync is free; on an exception mid-batch it keeps
+        # a queued copy from reading the IPC mapping / host registration that
+        # the lines below close. A teardown never masks the real error.
+        if stream:
+            try:
+                ops.synchronize(stream)
+            except Exception as _sy_exc:  # noqa: BLE001
+                log(f"WEG2-SEQ stream lane={lane_key} teardown-sync failed: {_sy_exc}")
+            _destroy = getattr(ops, "destroy_stream", None)
+            if _destroy is not None:
+                try:
+                    _destroy(stream)
+                except Exception as _ds_exc:  # noqa: BLE001
+                    log(f"WEG2-SEQ stream lane={lane_key} destroy failed: {_ds_exc}")
         if _lazy and phase == PHASE_COLLECT:
             # H44: the ready file lives exactly as long as this collect; the
             # caller posts `drained` only after this returns, so a depositor
