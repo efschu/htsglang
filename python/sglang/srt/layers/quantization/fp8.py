@@ -78,7 +78,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     requant_block_scale_ue8m0_for_deepgemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    fp8_marlin_workspace_off_module,
+    prepare_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -886,7 +889,44 @@ class Fp8LinearMethod(LinearMethodBase):
         self._process_mxfp8_linear_weight_scale(layer)
         layer.input_scale = None
 
+    def _weg2_marlin_outside_pool(self) -> bool:
+        """27B line, weg2 H39 for FP8 (SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL, the
+        switch the wNa16 drafter already runs under): the Marlin repack's working
+        set belongs in the load's transient pool (handed back after load), not
+        in the weg2 tag pool, where it stayed as dead blocks that the flip pauses
+        and resumes with the tag -- weg2xsn441 (FP8, fdade8572f): tms minus walk
+        per rank P 4083/2182/1725 MiB, D 3759/1533/1664 MiB, against 56-292 MiB
+        on the INT8 boot weg2rc1. The checkpoint-format weight stays where
+        create_weights put it (the chunk's tag pool) and dies right before its
+        Marlin survivor is born there, which takes its block (same byte count):
+        a separate checkpoint pool would hold every layer's fp8 weight until the
+        end of the load, next to all survivors -- twice the weights at the load
+        peak. Off (the switch unset, a non-Marlin rank, MXFP8): the pre-H39
+        path, byte for byte."""
+        if not self.use_marlin or self.use_mxfp8:
+            return False
+        if getattr(self, "convert_mxfp8_to_block", False):
+            return False
+        return bool(envs.SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL.get())
+
     def process_weights_after_loading(self, layer: Module) -> None:
+        # 27B line, weg2 H39 for FP8 (see _weg2_marlin_outside_pool): the whole
+        # post-load pass runs OUTSIDE the tag pool; the Marlin survivors
+        # (workspace, repacked weight, scales, bias) are born back in it.
+        if self._weg2_marlin_outside_pool():
+            from sglang.srt.managers.weg2_memory_saver import (
+                back_into_tag_pool,
+                outside_tag_pool,
+            )
+
+            with outside_tag_pool(reason="fp8-dense-marlin") as stepped_out:
+                self._process_weights_after_loading(
+                    layer, born_in=back_into_tag_pool if stepped_out else None
+                )
+            return
+        self._process_weights_after_loading(layer, born_in=None)
+
+    def _process_weights_after_loading(self, layer: Module, born_in=None) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
         else:
@@ -1002,9 +1042,15 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.use_marlin:
             if self.block_quant:
                 layer.weight_block_size = self.quant_config.weight_block_size
-            prepare_fp8_layer_for_marlin(layer, not self.block_quant)
+            prepare_fp8_layer_for_marlin(layer, not self.block_quant, born_in=born_in)
             # Activations not quantized for marlin.
             del layer.input_scale
+            # 27B FP8 on the weg2 flip (launcher --fp8-uniform-marlin; default
+            # off): the lock workspace leaves the module -- a per-card tensor the
+            # exchange cannot source (W84) -- and is re-zeroed after every weights
+            # resume (marlin_utils_fp8.zero_fp8_marlin_workspaces).
+            if envs.SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE.get():
+                self.workspace = fp8_marlin_workspace_off_module(layer)
 
     def apply(
         self,
@@ -1013,11 +1059,12 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_marlin:
+            private_ws = self.__dict__.get("workspace")
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
-                workspace=layer.workspace,
+                workspace=layer.workspace if private_ws is None else private_ws,
                 size_n=layer.output_size_per_partition,
                 size_k=layer.input_size_per_partition,
                 bias=bias,

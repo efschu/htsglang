@@ -1108,6 +1108,16 @@ class SchedulerWeightUpdaterManager:
         return list(tags) + [GPU_MEMORY_TYPE_CUDA_GRAPH]
 
     @staticmethod
+    def _weg2_zero_fp8_marlin_workspaces() -> int:
+        """Re-zero the registered FP8 Marlin lock workspaces; the count (0 when
+        none are registered -- every boot without --fp8-uniform-marlin)."""
+        from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+            zero_fp8_marlin_workspaces,
+        )
+
+        return int(zero_fp8_marlin_workspaces())
+
+    @staticmethod
     def _weg2_zero_graph_scratch() -> Optional[int]:
         """Re-zero the registered flashinfer FLOAT workspaces; count, or None.
 
@@ -8270,6 +8280,18 @@ class SchedulerWeightUpdaterManager:
                     self.stashed_model_static_state,
                 )
                 del self.stashed_model_static_state
+                # 27B FP8 on the flip (--fp8-uniform-marlin): the FP8 Marlin lock
+                # workspaces live under the weights tags, no plan sources them and
+                # the resume mapped recycled pages -- their zero contract comes back
+                # HERE, before the first forward. Registry empty on every boot
+                # without SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE: no work, no line.
+                _nz = self._weg2_zero_fp8_marlin_workspaces()
+                if _nz:
+                    logger.info(
+                        "WEG2-WAKE FP8-MARLIN workspaces re-zeroed n=%d (lock buffers "
+                        "under the weights tags; the resume mapped recycled pages)",
+                        _nz,
+                    )
                 # #1273 S5b: the DESTINATION half.  This hook runs after
                 # family_complete and after the reload, so whatever DID
                 # carry the wake's bytes has already written them -- under

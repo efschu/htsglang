@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from collections import OrderedDict
@@ -239,6 +240,16 @@ def cutlass_fp8_supported(device_id: int) -> bool:
     return False
 
 
+def _outside_weg2_tag_pool(reason: str):
+    """A device probe's allocations OUT of the weg2 tag pool (27B line,
+    weg2xsn441); a no-op wherever no tag pool is open or weg2 is absent."""
+    try:
+        from sglang.srt.managers.weg2_memory_saver import outside_tag_pool
+    except Exception:  # noqa: BLE001 -- no weg2 in this build: nothing to leave
+        return contextlib.nullcontext(False)
+    return outside_tag_pool(reason=reason)
+
+
 @per_device_gate
 def fp8_native_gemm_available(device_id: int) -> bool:
     """Whether this device has a working native fp8 GEMM.
@@ -266,11 +277,25 @@ def fp8_native_gemm_available(device_id: int) -> bool:
     # process that spans two cards the answer differs between them (#343).
     device = torch.device("cuda", device_id)
     try:
-        a = torch.zeros((16, 32), dtype=torch.float8_e4m3fn, device=device)
-        # _scaled_mm wants the second operand column-major
-        b = torch.zeros((16, 32), dtype=torch.float8_e4m3fn, device=device).t()
-        scale = torch.ones((), dtype=torch.float32, device=device)
-        torch._scaled_mm(a, b, scale_a=scale, scale_b=scale, out_dtype=torch.float16)
+        # 27B line (weg2xsn441): the probe's tensors must not be born in a weg2
+        # weights tag pool. It runs from the loader's capability check
+        # (``quant_config.needs_device_kernel()``) INSIDE the base ``weights``
+        # region, and a private tag pool never hands a freed block back: the
+        # probe left one 2 MiB small-block segment under tag ``weights`` on
+        # every rank. Where that tag holds nothing else (P's middle stage, no
+        # embedding, no head) the segment is bytes the exchange plan has no
+        # descriptor for -- W106 at the first release, W29 on the whole group.
+        # Stepped out, the probe lands in the load's transient pool, handed
+        # back after load; outside a weg2 load this is a no-op.
+        with _outside_weg2_tag_pool("fp8-native-gemm-probe"):
+            a = torch.zeros((16, 32), dtype=torch.float8_e4m3fn, device=device)
+            # _scaled_mm wants the second operand column-major
+            b = torch.zeros((16, 32), dtype=torch.float8_e4m3fn, device=device).t()
+            scale = torch.ones((), dtype=torch.float32, device=device)
+            torch._scaled_mm(
+                a, b, scale_a=scale, scale_b=scale, out_dtype=torch.float16
+            )
+            del a, b, scale
         return True
     except Exception as e:  # noqa: BLE001 - any failure means "not available"
         logger.info(

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
-from typing import Optional
+import weakref
+from contextlib import nullcontext
+from typing import Callable, ContextManager, Optional
 
 import torch
 
@@ -100,9 +102,86 @@ def apply_fp8_marlin_linear(
     return output.reshape(out_shape)
 
 
+#: Workspaces taken off their modules by :func:`fp8_marlin_workspace_off_module`,
+#: weakly held, so :func:`zero_fp8_marlin_workspaces` can restore their zero
+#: contract after a weg2 weights resume. Empty on every boot without the switch.
+_PRIVATE_WORKSPACES: "weakref.WeakValueDictionary[int, torch.Tensor]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def fp8_marlin_workspace_off_module(layer: torch.nn.Module) -> Optional[torch.Tensor]:
+    """Take the Marlin lock workspace OFF the module and register it; return it
+    (``None`` if the layer has none). The tensor itself is unchanged.
+
+    27B line, FP8 on the weg2 flip (SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE, set by
+    the launcher's --fp8-uniform-marlin; default off).
+    ``prepare_fp8_layer_for_marlin`` leaves ``layer.workspace`` as a PLAIN tensor
+    attribute: ``sms x int32``, zero at rest, sized by THIS card's SM count (170
+    on the 5090, 68 on a 3080), allocated inside the layer's weights tag.
+    * On the module the flip exchange's coverage walk sees it in
+      ``vars(module)``, no plan can source it (its size is per CARD, the plan
+      moves bytes between cards) and the flip refuses: W84 UNCOVERED.
+      compressed-tensors' Marlin keeps its workspace on the scheme object
+      (compressed_tensors_wNa16.py); the FP8 method now does the same.
+    * A weights resume maps RECYCLED pages under the tag (weight_updater: "Recycled
+      pages are not zero"), and the kernel's inter-block locks need zero. The
+      registry below is what :func:`zero_fp8_marlin_workspaces` re-zeroes after
+      every weights resume, before the first forward.
+    """
+    ws = layer.__dict__.pop("workspace", None)
+    if ws is None:
+        return None
+    _PRIVATE_WORKSPACES[id(ws)] = ws
+    return ws
+
+
+def zero_fp8_marlin_workspaces() -> int:
+    """Re-zero every registered FP8 Marlin workspace; the count (0 = none
+    registered, i.e. every boot without SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE)."""
+    n = 0
+    for ws in list(_PRIVATE_WORKSPACES.values()):
+        ws.zero_()
+        n += 1
+    return n
+
+
+def _survivor_scope(born_in):
+    """The allocation context of a tensor that STAYS on the layer (see
+    ``prepare_fp8_layer_for_marlin(born_in=...)``); a no-op without a hook."""
+    return born_in() if born_in is not None else nullcontext()
+
+
+def _as_survivor(t: torch.Tensor, born_in) -> torch.Tensor:
+    """``t`` computed in the caller's (transient) pool: copied into a fresh
+    block born under ``born_in``. Without a hook ``t`` itself is the survivor."""
+    if born_in is None:
+        return t
+    with born_in():
+        fresh = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+    fresh.copy_(t)
+    return fresh
+
+
 def prepare_fp8_layer_for_marlin(
-    layer: torch.nn.Module, size_k_first: bool = True
+    layer: torch.nn.Module,
+    size_k_first: bool = True,
+    *,
+    born_in: Optional[Callable[[], ContextManager]] = None,
 ) -> None:
+    """Repack an fp8 linear into Marlin's layout.
+
+    ``born_in`` (27B line, weg2 H39 for FP8; default None = unchanged): a
+    context-manager factory under which the SURVIVORS are allocated -- the lock
+    workspace, the repacked weight, the permuted scales, the bias. The caller
+    runs this function OUTSIDE the weg2 tag pool
+    (``weg2_memory_saver.outside_tag_pool``) and passes
+    ``weg2_memory_saver.back_into_tag_pool``: the repack's working set then
+    dies in the load's transient pool (handed back after load), and the
+    checkpoint-format weight is released right before its Marlin survivor is
+    born, which takes its block of the tag pool -- instead of both staying as
+    dead blocks of the tag pool, which the flip pauses and resumes with the tag
+    (weg2xsn441: tms - walk 1.5-4.1 GiB per rank)."""
     logger.warning_once(
         "Your GPU does not have native support for FP8 computation but "
         "FP8 quantization is being used. Weight-only FP8 compression will "
@@ -121,8 +200,9 @@ def prepare_fp8_layer_for_marlin(
 
     device = layer.weight.device
 
-    # WORKSPACE
-    layer.workspace = marlin_make_workspace(device)
+    # WORKSPACE (a survivor)
+    with _survivor_scope(born_in):
+        layer.workspace = marlin_make_workspace(device)
 
     # WEIGHT
     # Repack weights to marlin format
@@ -130,14 +210,21 @@ def prepare_fp8_layer_for_marlin(
     qweight = pack_fp8_to_int32(layer.weight, size_k_first)
     if not size_k_first:
         qweight = qweight.T.contiguous()
+    if born_in is not None:
+        # H39: the checkpoint-format weight dies HERE, before its survivor is
+        # born -- ``qweight`` is a copy by now (``.T.contiguous()``) -- so the
+        # repacked weight takes the freed block of the tag pool (same byte
+        # count, N*K) instead of leaving it behind as a dead block.
+        layer.weight = None
 
-    marlin_qweight = gptq_marlin_repack(
-        b_q_weight=qweight,
-        perm=perm,
-        size_k=part_size_k,
-        size_n=part_size_n,
-        num_bits=8,
-    )
+    with _survivor_scope(born_in):
+        marlin_qweight = gptq_marlin_repack(
+            b_q_weight=qweight,
+            perm=perm,
+            size_k=part_size_k,
+            size_n=part_size_n,
+            num_bits=8,
+        )
     layer.weight = torch.nn.Parameter(marlin_qweight, requires_grad=False)
 
     # WEIGHT SCALES
@@ -184,11 +271,12 @@ def prepare_fp8_layer_for_marlin(
         s=scales, size_k=part_size_k, size_n=part_size_n, group_size=group_size
     )
     marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
+    marlin_scales = _as_survivor(marlin_scales, born_in)
     layer.weight_scale = torch.nn.Parameter(marlin_scales, requires_grad=False)
 
     if hasattr(layer, "bias") and layer.bias is not None:
         assert layer.bias.shape == (part_size_n,)
-        bias = marlin_permute_bias(layer.bias)
+        bias = _as_survivor(marlin_permute_bias(layer.bias), born_in)
         layer.bias = torch.nn.Parameter(bias, requires_grad=False)
 
 

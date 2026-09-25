@@ -5205,6 +5205,10 @@ def _env_knobs(ns) -> Dict[str, object]:
         # function exists: three call sites build an environment and a value
         # spelled out at each of them is a value that drifts.
         "vision": str(getattr(ns, "weg2_vision", VISION_OFF)),
+        # 27B FP8: one byte layout on every rank of BOTH groups (the two
+        # groups flip bytes into each other), hence gathered here once.
+        "fp8_uniform_marlin": bool(getattr(ns, "fp8_uniform_marlin", False))
+        and checkpoint_quant_method(str(getattr(ns, "model", ""))) == "fp8",
     }
 
 
@@ -5329,7 +5333,9 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               # Task #58: which vision form this boot runs. Published as
               # SGLANG_WEG2_VISION for the P group ONLY (see below).
               vision: str = VISION_OFF,
-              xchg_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+              xchg_env: Optional[Dict[str, str]] = None,
+              # 27B FP8 (--fp8-uniform-marlin): one byte layout on every rank.
+              fp8_uniform_marlin: bool = False) -> Dict[str, str]:
     env = dict(os.environ)
     # Task #58: THE ARMING SIGNAL for the transient vision stage, and the ONE
     # thing that turns `vision_stage_service`'s seam from a no-op into a stage.
@@ -5672,6 +5678,11 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # operator's `auto` never reaches a rank (it cannot resolve it there).
     env.pop(HICACHE_DRAFT_TIER_ENV, None)
     env.update(hicache_draft_tier_env())
+    # 27B FP8 (--fp8-uniform-marlin, resolved by _env_knobs against the
+    # checkpoint): the same two variables on BOTH groups, set only then --
+    # every other boot's environment stays exactly what it was.
+    if fp8_uniform_marlin:
+        env.update(FP8_UNIFORM_MARLIN_ENV)
     return env
 
 
@@ -9008,6 +9019,106 @@ def read_pp_bubble(path: str) -> Optional[BubbleMeasurement]:
     )
 
 
+#: 27B FP8 (Qwen/Qwen3.8-27B-FP8, block 128x128) on the weg2 flip, the simple
+#: variant: ONE byte layout on every card. The kernel choice is RANK-LOCAL
+#: (fp8.py: ``use_marlin = force_marlin or can_auto_enable_marlin_fp8()``,
+#: sm80..88): a 3080 repacks to Marlin ``int32 [K/16, 4N]`` + group scales
+#: ``[K/128, N]``, a 5090 keeps native ``fp8 [N, K]`` + ``weight_scale_inv
+#: [N/128, K/128]`` -- and the exchange copies bytes between the cards, so the
+#: layouts must agree. Forcing Marlin everywhere makes them agree (the geometry
+#: is the one compressed-tensors pack-quantized already moves: MIXED_FUSED_COLS,
+#: weg2xsn258) and costs the 5090 its native FP8 GEMM. The private workspace
+#: takes Marlin's per-card lock buffer off the module (W84) and re-zeroes it
+#: after every weights resume (marlin_utils_fp8).
+FP8_UNIFORM_MARLIN_ENV = {
+    "SGLANG_FORCE_FP8_MARLIN": "1",
+    "SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE": "1",
+}
+
+
+def checkpoint_quant_method(model_path: str) -> str:
+    """``quantization_config.quant_method`` of the checkpoint's config.json (top
+    level or ``text_config``), lower case; ``""`` for none or unreadable."""
+    try:
+        with open(os.path.join(str(model_path), "config.json")) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    for holder in (cfg, cfg.get("text_config") or {}):
+        qc = holder.get("quantization_config") if isinstance(holder, dict) else None
+        if isinstance(qc, dict) and qc.get("quant_method"):
+            return str(qc["quant_method"]).strip().lower()
+    return ""
+
+
+def fp8_layout_decision(
+    quant_method: str, weight_source: str, uniform_marlin: bool
+) -> Tuple[Dict[str, str], Optional[str]]:
+    """``(env for BOTH groups, log line or None)`` for --fp8-uniform-marlin;
+    raises W160 for the one combination that cannot flip correctly.
+
+    * not an FP8 checkpoint: ``{}``; the flag is inert (named once if given);
+    * FP8 + the flag: :data:`FP8_UNIFORM_MARLIN_ENV` on every rank;
+    * FP8 under ``--weg2-weight-source exchange`` WITHOUT the flag: REFUSED --
+      the 5090 and the 3080s would hold different bytes for one tensor and
+      the exchange would move one card's layout onto the other's;
+    * FP8 under the ring (each group refills ITS OWN bytes on the same card):
+      native per-card layouts never meet, nothing to force; named, not forced.
+    """
+    qm = str(quant_method or "").lower()
+    if qm != "fp8":
+        if uniform_marlin:
+            return {}, ("WEG2 FP8-UNIFORM-MARLIN inert: the checkpoint's quant_method is %r, "
+                        "not fp8 -- no environment added" % (qm or "none"))
+        return {}, None
+    if uniform_marlin:
+        return dict(FP8_UNIFORM_MARLIN_ENV), (
+            "WEG2 FP8-UNIFORM-MARLIN on (--fp8-uniform-marlin): %s on every rank of "
+            "BOTH groups -- one byte layout for the flip exchange (Marlin int32 "
+            "[K/16,4N] + group scales [K/128,N] on the 5090 as on the 3080s; the "
+            "5090 gives up its native block-FP8 GEMM for it); the Marlin lock "
+            "workspace leaves the module and is re-zeroed after every weights "
+            "resume (rank line 'WEG2-WAKE FP8-MARLIN workspaces re-zeroed')"
+            % " ".join("%s=%s" % kv for kv in sorted(FP8_UNIFORM_MARLIN_ENV.items())))
+    if str(weight_source) == WEIGHT_SOURCE_EXCHANGE:
+        raise Weg2LaunchRefused(
+            "W160 Weg2Fp8LayoutRefused: the checkpoint is FP8 (quant_method fp8) and "
+            "--weg2-weight-source exchange moves weight BYTES card to card, but the "
+            "FP8 kernel choice is rank-local: a 3080 repacks to Marlin int32 "
+            "[K/16,4N] + group scales, the 5090 keeps native fp8 [N,K] + "
+            "weight_scale_inv. One tensor would have two layouts and the flip would "
+            "copy one onto the other. Pass --fp8-uniform-marlin (Marlin on every "
+            "rank, one layout), or run --weg2-weight-source ring.")
+    return {}, ("WEG2 FP8 native per-card layouts under --weg2-weight-source %s: each "
+                "group refills its own bytes on its own card, no byte crosses a card "
+                "boundary, nothing forced" % weight_source)
+
+
+def p_cut_calibration_line(model_path: str, quant_method: str) -> Optional[str]:
+    """A NAMED line when a non-incumbent checkpoint has no P-cut calibration
+    record: ``argv_p`` otherwise hands it the INT8 incumbent vector unasked
+    (a 64-layer checkpoint without a record is not refused there). None for
+    the incumbent family (compressed-tensors) and for a checkpoint that HAS a
+    record -- default boots print nothing new."""
+    qm = str(quant_method or "").lower()
+    if qm in ("compressed-tensors", ""):
+        return None
+    dg, why = host_ledger.checkpoint_digest(model_path)
+    if not dg:
+        return ("WEG2 P-CUT UNCALIBRATED %s checkpoint: its content digest is unreadable "
+                "(%s) -- the P cut is the pinned one or the INT8 incumbent, NOT a "
+                "measurement of this checkpoint" % (qm, why))
+    rec, rec_why = host_ledger.read_pp_calibration(dg)
+    if rec is not None:
+        return None
+    return ("WEG2 P-CUT UNCALIBRATED %s checkpoint %s: %s. The P cut of this boot is "
+            "the pinned --pp-layer-ratio / --pp-stage-ratio or the INT8 incumbent "
+            "%s -- per-layer costs of %s differ per card (FP8 runs Marlin W8A16 on "
+            "both kinds under --fp8-uniform-marlin), so measure it: #PGAP ladder, "
+            "then weg2/tools/pcut_refit.py or --pp-cut-stage-fit with THIS "
+            "checkpoint's P log" % (qm, dg[:12], rec_why, _csv(P_PP_STAGE_RATIO_SCORES), qm))
+
+
 def p_trim_end_anchor_env(on: bool) -> Dict[str, str]:
     """Group P's environment for ``--p-trim-end-anchor``: {} when off (the
     byte-identity guarantee). The variable NAME lives in
@@ -9336,6 +9447,89 @@ def read_card_power_record(front_log: str) -> Optional[List[Tuple[str, Optional[
     return None
 
 
+_P_LOG_MODEL_RE = re.compile(r"server_args=ServerArgs\(model_path='([^']*)'")
+
+
+def p_log_model_path(path: str, max_lines: int = 20000) -> str:
+    """The ``model_path`` a P log's boot ran (its first server_args line); ``""``
+    when the log names none within ``max_lines``."""
+    try:
+        with open(path, errors="replace") as fh:
+            for n, line in enumerate(fh):
+                if "server_args=ServerArgs(" in line:
+                    m = _P_LOG_MODEL_RE.search(line)
+                    if m:
+                        return m.group(1)
+                if n >= max_lines:
+                    break
+    except OSError:
+        return ""
+    return ""
+
+
+#: The source boot of a census produced by weg2/xchg_census.py, as its
+#: provenance names it ("ring-table boot boot_weg2_<tag>_<tree>_<date>_<time>").
+_CENSUS_SOURCE_BOOT_RE = re.compile(r"ring-table boot (boot_weg2_[A-Za-z0-9_]+)")
+
+
+def census_checkpoint(census_path: str,
+                      evidence_dirs: Sequence[str]) -> Tuple[str, str]:
+    """``(checkpoint path, how it was read)`` of the checkpoint a census was
+    MEASURED on; ``("", why)`` when it cannot be named. The census's own
+    ``checkpoint`` field first (xchg_census.py writes it since weg2xsn441), else
+    the ``server_args`` model_path of its source boot's P log."""
+    try:
+        with open(census_path) as fh:
+            blob = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return "", "the census is unreadable (%s)" % exc
+    ck = blob.get("checkpoint") if isinstance(blob, dict) else None
+    if isinstance(ck, str) and ck:
+        return ck, "the census's own checkpoint field"
+    m = _CENSUS_SOURCE_BOOT_RE.search(str(blob.get("provenance", "")))
+    if not m:
+        return "", "the census names no source boot in its provenance"
+    stem = m.group(1)
+    for d in evidence_dirs:
+        if not d:
+            continue
+        path = os.path.join(d, stem + ".P.log")
+        if os.path.isfile(path):
+            model = p_log_model_path(path)
+            if model:
+                return model, "%s.P.log server_args" % stem
+    return "", ("its source boot %s has no readable P log with a server_args line "
+                "under %s" % (stem, ", ".join(d for d in evidence_dirs if d) or "-"))
+
+
+def census_checkpoint_decision(census_path: str, model_path: str,
+                               evidence_dirs: Sequence[str],
+                               allow_foreign: bool) -> Optional[str]:
+    """The census must price THIS checkpoint (weg2xsn441: the FP8 boot ran on the
+    INT8 census of weg2xsn246, the flip's VRAM was priced for the other
+    checkpoint's bytes, and nothing said so before the metal). None when it
+    does; a NAMED line when it cannot be verified or is allowed foreign;
+    W161 otherwise -- in the dry run, before any card is touched."""
+    src, how = census_checkpoint(census_path, evidence_dirs)
+    if not src:
+        return ("WEG2 XCHG-CENSUS checkpoint UNVERIFIED: %s -- the flip's VRAM peaks "
+                "are priced from %s for a checkpoint this launcher cannot name"
+                % (how, census_path))
+    if os.path.realpath(src) == os.path.realpath(str(model_path)):
+        return None
+    what = ("the census %s was measured on %s (%s); this boot runs %s -- its "
+            "per-tag bytes, dormant residue and flip peaks are the other "
+            "checkpoint's (format, scale geometry, embedding dtype, load residue)"
+            % (census_path, src, how, model_path))
+    if allow_foreign:
+        return ("WEG2 XCHG-CENSUS FOREIGN (allowed by --weg2-xchg-census-foreign): "
+                + what + " -- this boot MEASURES its own census, it is not priced by one")
+    raise Weg2LaunchRefused(
+        "W161 Weg2XchgCensusForeign: " + what + ". Produce this checkpoint's census "
+        "(weg2/xchg_census.py --ring-table-boot <a boot of it>), or pass "
+        "--weg2-xchg-census-foreign for the boot that measures it.")
+
+
 def stage_fit_family_cost(ns, cards: Sequence[Card], chunk_tokens: int,
                           limits_now: Sequence[Optional[float]], log):
     """--pp-cut-stage-fit: the P cut's stage cost FITTED from a boot's #PGAP
@@ -9372,6 +9566,16 @@ def stage_fit_family_cost(ns, cards: Sequence[Card], chunk_tokens: int,
                 f"it ran {fitted.chunk_tokens}-token P chunks, this boot runs "
                 f"{int(chunk_tokens)}; the attention cost per chunk is chunk-specific "
                 "(192 CTAs at 512 on the 5090), so a fit does not transfer")
+        _fit_model = p_log_model_path(path)
+        _want = str(getattr(ns, "model", "") or "")
+        # Checked where both checkpoints exist on disk (a log naming a path that
+        # is gone cannot be compared, and says so in the provenance below).
+        if (_fit_model and _want and os.path.isdir(_fit_model) and os.path.isdir(_want)
+                and os.path.realpath(_fit_model) != os.path.realpath(_want)):
+            raise _fit.StageFitRefused(
+                f"it ran checkpoint {_fit_model}, this boot runs {_want}; per-layer "
+                "costs are a property of the checkpoint's kernels (INT8 W8A8 vs FP8 "
+                "Marlin W8A16), so a fit does not transfer between checkpoints")
         cost, prov = _fit.fit_stage_cost(fitted, [c.name for c in cards])
     except (_fit.StageFitRefused, OSError, ValueError, ZeroDivisionError) as exc:
         raise Weg2LaunchRefused(f"W40 Weg2PPCutRefused: --pp-cut-stage-fit {path}: {exc}")
@@ -11348,6 +11552,19 @@ def build_parser() -> argparse.ArgumentParser:
              "prompts keep today's split. Adds SGLANG_WEG2_P_TRIM_END_ANCHOR=1 to "
              "group P only; default off = argv and env byte-identical.")
     ap.add_argument(
+        "--fp8-uniform-marlin", action="store_true",
+        help="27B line, an FP8 checkpoint (Qwen/Qwen3.8-27B-FP8, block 128x128) on "
+             "the flip: force the Marlin FP8 kernel on EVERY rank of both groups "
+             "(SGLANG_FORCE_FP8_MARLIN=1) so the 5090 holds the same byte layout "
+             "as the 3080s (Marlin int32 [K/16,4N] + group scales) and the "
+             "exchange can move bytes between them; the 5090 gives up its native "
+             "block-FP8 GEMM for it. Also takes Marlin's per-card lock workspace "
+             "off the module (else W84 UNCOVERED) and re-zeroes it after every "
+             "weights resume (SGLANG_FP8_MARLIN_PRIVATE_WORKSPACE=1). Without it an "
+             "FP8 checkpoint under --weg2-weight-source exchange is refused (W160). "
+             "Inert on a non-FP8 checkpoint; default off = argv and env "
+             "byte-identical.")
+    ap.add_argument(
         "--p-prefill-graph-tiny", default="", metavar="TOKENS[,TOKENS]",
         help="Only with --p-prefill-graph (27B line). Empty (the default) = off: "
              "one captured bucket, argv byte-identical. TOKENS = extra, smaller "
@@ -11758,6 +11975,15 @@ def build_parser() -> argparse.ArgumentParser:
              "never a number on this command line. Required by "
              "--weg2-weight-source exchange; absent, the launcher REFUSES by "
              "name (W71) rather than invent a table",
+    )
+    ap.add_argument(
+        "--weg2-xchg-census-foreign", action="store_true",
+        help="27B line (weg2xsn441): accept a --weg2-xchg-census that was MEASURED "
+             "on another checkpoint than --model (named line WEG2 XCHG-CENSUS "
+             "FOREIGN). Without it such a census is refused in the dry run (W161): "
+             "its tag bytes, dormant residue and flip peaks are the other "
+             "checkpoint's. For the boot that measures this checkpoint's census. "
+             "Default off; a census of the booted checkpoint prints nothing new.",
     )
     ap.add_argument("--ring-table-boot", default="",
                     help="pin the ring table to ONE boot instead of the newest usable "
@@ -12717,6 +12943,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"--drain-deadline-s {ns.drain_deadline_s} --fairness-w-s {ns.fairness_w_s}"
         + ("" if ns.min_dwell_ms is None else f" --min-dwell-ms {ns.min_dwell_ms}"))
 
+    # 1a'. 27B FP8: one byte layout for the flip (W160 refusal without the
+    # flag under the exchange), and a NAMED line when a non-incumbent checkpoint
+    # has no P-cut calibration record (argv_p would hand it the INT8 vector).
+    _quant = checkpoint_quant_method(str(ns.model))
+    _fp8_env, _fp8_line = fp8_layout_decision(
+        _quant, str(getattr(ns, "weg2_weight_source", WEIGHT_SOURCE_DEFAULT)),
+        bool(getattr(ns, "fp8_uniform_marlin", False)))
+    if _fp8_line:
+        log(_fp8_line)
+    _calib_line = p_cut_calibration_line(str(ns.model), _quant)
+    if _calib_line:
+        log(_calib_line)
+
     # 1b. #1233 one-backup flip geometry + the patched saver hook
     n_layers = model_num_layers(ns.model)
     chunk_count = max(0, int(ns.weight_chunks))
@@ -12835,6 +13074,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # `prepare_weight_exchange` (200 lines down) is the same named refusal
         # with the same text, only sooner; the richer W71 of an UNFUNDABLE peak
         # still comes from that gate, which is the only place that solves one.
+        # weg2xsn441: the census must be THIS checkpoint's (W161 in the dry run).
+        _census_line = census_checkpoint_decision(
+            ns.weg2_xchg_census, str(ns.model),
+            (ns.evidence_dir, EVIDENCE_DIR),
+            bool(getattr(ns, "weg2_xchg_census_foreign", False)))
+        if _census_line:
+            log(_census_line)
         xchg_form_dormant_reserve(cards, ns.weg2_xchg_census, log=log)
     # #1257c: the operator's external headroom, resolved ONCE per boot and
     # keyed by CARD UUID -- never by NVML index, which is not stable across
