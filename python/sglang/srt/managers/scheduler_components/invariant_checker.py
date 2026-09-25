@@ -1668,6 +1668,26 @@ def create_scheduler_watchdog(
             return False
         return (time.monotonic() - since) > watchdog_timeout
 
+    def pp_receive_stall_age() -> float:
+        """H86b: how long the blocked PP receive has lasted, in seconds.
+
+        pp_receive_is_overdue arms is_active only once the receive has
+        already blocked for a whole timeout, and the H86 watchdog resets its
+        clock while inactive -- so without this age the stall was counted
+        from the moment of arming and caught after 2T-2.5T instead of T-1.5T.
+
+        CLOCK: every writer of ``_pp_blocked_recv_since`` stamps
+        time.monotonic() (scheduler_pp_mixin._pp_recv_typed_dict,
+        pp_chain_receiver._block_on -> _note_pp_chain_blocked). The age is
+        therefore taken in time.monotonic() and handed over as a DURATION;
+        WatchdogRaw subtracts it from its own time.perf_counter(). A
+        timestamp never crosses the seam, so the two epochs never mix.
+        """
+        since = getattr(scheduler, "_pp_blocked_recv_since", None)
+        if since is None:
+            return 0.0
+        return max(0.0, time.monotonic() - since)
+
     def dump_info() -> str:
         if scheduler.is_initializing:
             return ""
@@ -1737,4 +1757,5 @@ def create_scheduler_watchdog(
         soft=soft,
         dump_info=dump_info,
         describe_arm=describe_arm,
+        stall_age=pp_receive_stall_age,
     )

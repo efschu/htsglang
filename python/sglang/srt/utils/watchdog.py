@@ -132,6 +132,7 @@ class WatchdogRaw:
         soft: bool = False,
         dump_info: Optional[Callable[[], str]] = None,
         describe_arm: Optional[Callable[[], str]] = None,
+        stall_age: Optional[Callable[[], float]] = None,
     ):
         self.debug_name = debug_name
         self.get_counter = get_counter
@@ -145,6 +146,14 @@ class WatchdogRaw:
         #: gone overdue was left to be reconstructed from a py-spy dump
         #: taken minutes later. Returning "" keeps the old wording.
         self.describe_arm = describe_arm
+        #: H86b: for an arm that switches is_active on LATE -- only after its
+        #: stall has already lasted a while (#821 pp_receive_is_overdue arms
+        #: once a PP receive has blocked longer than the timeout). Returns the
+        #: seconds the stall had already lasted, as a DURATION: only a
+        #: difference crosses this seam, never a timestamp, so the callee may
+        #: measure in its own clock (time.monotonic) and this class subtracts
+        #: it from its own (time.perf_counter) without mixing epochs.
+        self.stall_age = stall_age
 
         self.parent_process = psutil.Process().parent()
         t = threading.Thread(target=self._watchdog_thread, daemon=True)
@@ -159,6 +168,30 @@ class WatchdogRaw:
                 f"{self.debug_name} watchdog thread crashed: {e}", exc_info=True
             )
 
+    #: Class default so an instance built without __init__ (the H86 test does
+    #: that) keeps the plain H86 behaviour.
+    stall_age: Optional[Callable[[], float]] = None
+
+    def _read_stall_age(self) -> float:
+        """The late-arming arm's own stall age in seconds, 0.0 if unknown.
+
+        A raising callback must never escape: _watchdog_thread would log
+        "watchdog thread crashed" and RETURN, i.e. the process would lose its
+        watchdog for good (#821's dump_info lesson).
+        """
+        try:
+            age = self.stall_age()
+        except Exception as e:  # noqa: BLE001 - the watchdog must survive
+            logger.error(f"{self.debug_name} watchdog stall_age failed: {e}")
+            return 0.0
+        if age is None:
+            return 0.0
+        try:
+            age = float(age)
+        except (TypeError, ValueError):
+            return 0.0
+        return age if age > 0.0 else 0.0
+
     def _watchdog_once(self):
         watchdog_last_counter = 0
         watchdog_last_time = time.perf_counter()
@@ -168,6 +201,14 @@ class WatchdogRaw:
             if self.is_active():
                 current_counter = self.get_counter()
                 if watchdog_last_counter == current_counter:
+                    if self.stall_age is not None:
+                        # H86b: the H86 reset below forgot the stall's past
+                        # while the arm was still dark, so #821 (dark for the
+                        # first T of a blocked receive) fired only after 2T-2.5T.
+                        # Credit the age the arm itself measured.
+                        watchdog_last_time = min(
+                            watchdog_last_time, current - self._read_stall_age()
+                        )
                     if current > watchdog_last_time + self.watchdog_timeout:
                         break
                 else:
@@ -180,6 +221,14 @@ class WatchdogRaw:
                 # the hard watchdog tripped 7 s into the needle (SIGQUIT, whole P group torn down). A real stall --
                 # active with a frozen counter -- is still caught one timeout after it begins.
                 watchdog_last_time = current
+                if self.stall_age is not None:
+                    # H86b: keep the counter known through the dark phase, so
+                    # the first active sample of a late arm lands in the
+                    # "counter stands" branch above and trips at once instead
+                    # of spending one more half-period re-learning a counter
+                    # that last moved before the stall. Gated: without
+                    # stall_age this loop is exactly H86.
+                    watchdog_last_counter = self.get_counter()
             time.sleep(self.watchdog_timeout / 2)
 
         if self.dump_info is not None and (info_msg := self.dump_info()):
