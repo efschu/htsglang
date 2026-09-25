@@ -288,5 +288,61 @@ class TestLoaderUnderNativeMixed(CustomTestCase):
             self._run(1, 200, 512)
 
 
+class TestExchangeTileView(CustomTestCase):
+    """weight_exchange geometry for stamped (native-mixed) swizzled scales."""
+
+    def _scale(self, n, kb, *, k_sharded):
+        p = torch.nn.Parameter(torch.zeros(n, kb, dtype=torch.float8_e4m3fn), requires_grad=False)
+        nm.mark_swizzled(p, k_sharded=k_sharded)
+        return p
+
+    def test_row_parallel_scale_uses_the_tile_view(self):
+        from sglang.srt.weg2 import weight_exchange as wx
+
+        g = wx.StorageGeom.of(self._scale(5120, 1088, k_sharded=True))
+        self.assertEqual((g.rows, g.cols, g.pitch, g.itemsize), (40, 1088 * 128, 1088 * 128, 1))
+        self.assertEqual(g.nbytes, 5120 * 1088)
+
+    def test_unstamped_and_column_parallel_unchanged(self):
+        from sglang.srt.weg2 import weight_exchange as wx
+
+        for t in (
+            torch.zeros(5120, 1088, dtype=torch.float8_e4m3fn),
+            self._scale(34816, 320, k_sharded=False),
+        ):
+            g = wx.StorageGeom.of(t)
+            self.assertEqual((g.rows, g.cols), tuple(t.shape))
+
+    def test_the_join_reads_a_plain_cols_cut_in_the_tile_view(self):
+        from sglang.srt.weg2 import weight_exchange as wx
+        from sglang.srt.weg2 import xchg_manifest as xm
+
+        def piece(n, kb):
+            g = wx.StorageGeom.of(self._scale(n, kb, k_sharded=True))
+            return xm.ManifestPiece(
+                param_name="model.layers.0.mlp.down_proj.weight_scale",
+                tensor_class="down_proj", rows_full=g.rows, cols_full=g.cols,
+                itemsize=g.itemsize, tag="weights_0", nbytes=g.nbytes,
+            )
+
+        axis, rows_full, cols_full, widths, pad = xm._axis_of(
+            "down_proj.weight_scale", piece(5120, 1088),
+            [piece(5120, 584), piece(5120, 256), piece(5120, 248)],
+        )
+        self.assertEqual(axis, wx.COLS)
+        self.assertEqual((rows_full, cols_full, pad), (40, 1088 * 128, 0))
+        self.assertEqual(widths, (584 * 128, 256 * 128, 248 * 128))
+
+    def test_component_rows_in_tiles(self):
+        from sglang.srt.weg2 import weight_exchange_shadow as sh
+
+        owner = torch.nn.Module()
+        owner.weight_scale = self._scale(256, 8, k_sharded=True)
+        self.assertEqual(sh._in_nvfp4_sf_tiles(owner, "weight_scale", (128, 128)), (1, 1))
+        self.assertEqual(sh._in_nvfp4_sf_tiles(owner, "weight_scale", (192, 64)), ())
+        owner.weight = torch.nn.Parameter(torch.zeros(256, 4, dtype=torch.uint8), requires_grad=False)
+        self.assertEqual(sh._in_nvfp4_sf_tiles(owner, "weight", (128, 128)), (128, 128))
+
+
 if __name__ == "__main__":
     unittest.main()

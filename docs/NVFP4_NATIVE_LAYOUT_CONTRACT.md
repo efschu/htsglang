@@ -1,6 +1,6 @@
 # NVFP4 natives Byte-Layout: Vertrag (Backlog #38, N4B, 25.09.2026)
 
-Baum: `desk/27b-nvfp4-native-0925` auf `bb086e1120` (RC7b). Alle Zeilenangaben gelten für diesen Baum.
+Baum: `desk/27b-nvfp4-native-0925`, Basis `bb086e1120` (RC7b). Zeilenangaben in §0-§5 gelten für die Basis bb086e1120 (vor den Skelett-Commits, die modelopt_quant.py ab :1687 um ~30 Zeilen verschieben).
 Zweck: EIN Layout, das die 5090 (sm_120, FP4-Tensorkerne) direkt rechnet und das der 3080-Kernel W4A8 (N4A)
 direkt liest. Am Flip wird nichts umgeformt.
 
@@ -164,16 +164,78 @@ docker/profiles/27b-nvfp4.env („die Layouts passen im Tausch nicht zusammen“
 
 ## 6. Der nativ-gemischte Modus (Skelett in diesem Baum)
 
-`--fp4-gemm-backend native-mixed` (Default AUS):
-- Jeder Rang behält das native Layout aus §2.
-- Die Kernel-Wahl hängt an der Compute Capability des Rangs:
-  - sm_12x → `cutlass` (W4A4);
-  - sm_8x → `w4a8_int8`, der N4A-Kernel über eine Registry-Naht;
-  - ohne registrierten W4A8-Kernel → harter Fehler. Marlin nur mit ausdrücklicher Erlaubnis; es ist dann eine
-    abgeleitete Kopie mit Repack am Flip, siehe §5.
+`--fp4-gemm-backend native-mixed` ist per Default AUS. Mit AUS sind `auto` und `marlin` byte-gleich, das belegt der
+Test `test_default_paths_unchanged`.
 
-## 7. Offen
+- **Auswahl je Rang** (fp4_utils.initialize_fp4_gemm_config → nvfp4_native_mixed.resolve_this_rank):
+  - sm_12x → `cutlass`;
+  - sm_10x → `flashinfer_cutedsl`;
+  - sm_8x → `w4a8_int8`, wenn der N4A-Kern registriert ist (Registry-Naht `register_w4a8_kernel`; Autoload des Moduls
+    `sglang.srt.layers.quantization.nvfp4_w4a8_int8`, falls vorhanden);
+  - sonst: harter, benannter Fehler.
+  - Marlin gibt es nur mit `SGLANG_FP4_NATIVE_MIXED_ALLOW_MARLIN=1`. Der Rang ist dann als „verlässt das gemeinsame
+    Layout“ markiert (`is_fp4_native_mixed_shared_layout() == False`).
+- **Laden:**
+  - Ein Shard, den der native Pfad polstern müsste, wird verweigert (`check_shard_alignment`, auch für fusionierte
+    Komponenten).
+  - `weight_global_scale` (fp32, 0-dim) wird auf JEDEM Rang gebunden, damit die Parametermenge auf allen Rängen gleich ist.
+  - Die geswizzelte Skala bekommt einen Stempel: `nvfp4_sf_layout="128x4"`. Bei row-parallel-Schichten kommt
+    `nvfp4_sf_tile_view=True` dazu.
+  - Der Blackwell-Zwang entfällt nur für `w4a8_int8`.
+- **apply:** `w4a8_int8` → `nvfp4_native_mixed.apply_w4a8` → der registrierte Kernel.
+  Die Signatur steht im Modulkopf: (x, weight, weight_scale_swizzled, weight_global_scale, out_features).
 
-- FP8-Linears (30 % der Linear-FLOPs): nativ FP8 auf der 5090 hätte dasselbe Tauschproblem ([N,K] e4m3 + Skalar
-  gegen den Marlin-FP8-Repack). Nicht Teil dieser Runde.
+## 7. Tausch-Deskriptoren: Lückenliste (Stand fee61349c3 + Tile-View-Commit)
+
+Der 27B-Flip läuft über `--weg2-weight-source exchange` (docker/profiles/27b.env:64).
+
+| # | Stelle | Was bricht | Vorschlag | Aufwand | Stand |
+|---|---|---|---|---|---|
+| L1 | weg2/xchg_manifest.py:665-843 `_axis_of` + weg2/weight_exchange.py `StorageGeom.of` | down_proj.weight_scale (geswizzelt) wird im P→D-Join als gewöhnlicher COLS-Schnitt gelesen. Das ergibt **falsche Bytes ohne Fehler**, am Test gezeigt: `test_plain_column_slice_is_wrong`. | Kachelsicht (N/128, K_pad·128) für gestempelte row-parallel-Skalen in `StorageGeom.of`. Alle vier Aufrufer laufen durch diese eine Stelle: ParamGeom.of, Drift-Check xchg_manifest.py:1279, flat-tables weight_exchange.py:1882/2155. | S | **gebaut**, gegatet durch den Stempel |
+| L2 | weg2/weight_exchange_shadow.py:2950 `_qkv_component_rows` | Deklarierte Komponenten einer Kachelsicht-Skala müssen in Kacheln gezählt werden. | `_in_nvfp4_sf_tiles`: Division durch 128; eine nicht ganze Kachel ergibt `()`, der Join verweigert dann. | S | **gebaut** (betrifft heute keine Klasse, weil row-parallel nicht fusioniert ist) |
+| L3 | Zeilenschnitte gate_up / lm_head | kein Bruch: 128er-Grenzen sind layout-neutral. lm_head D: 82816 = 647 Kacheln, das Vokabular-Pad (128 Zeilen) ist genau 1 Kachel und wird ZEROFILL (Skala 0). | Element-Sicht beibehalten, damit die Vokabular-Pad-Arithmetik (`_padded`, :800-812) weiter in Zeilen zählt. | – | Test `test_fused_row_shard_is_layout_neutral` |
+| L4 | weight_exchange_shadow.py:755-775 `tensor_class` | `weight_scale_2`, `input_scale_inv`, `alpha`, `weight_global_scale`, `weight_scale_interleaved` fehlen in den `leafs` und werden als eigene Klasse gezählt. Rotation und Manifest-Klassennamen sind dadurch falsch gruppiert, die Bytes aber korrekt. | Die fünf Namen in `leafs` aufnehmen. Das ändert die Klassennamen im Manifest AUCH für das heutige Marlin-NVFP4-Profil (`weight_global_scale`), darum nicht in dieser Runde. | S | Plan |
+| L5 | modelopt_quant.py:1775-1813 Polster | Ein N- oder K/16-Polster erzeugt zwei Skalen-Tensoren (roh + interleaved) mit abweichender Shape. | Im Modus verweigert (`check_shard_alignment`). Für 27B nie nötig (Block [128,128]). | S | **gebaut** |
+| L6 | weg2/launcher.py:9247-9296 `uniform_marlin_argv` | `--fp8-uniform-marlin` + modelopt erzwingt `--fp4-gemm-backend marlin` für beide Gruppen. Es fehlt ein Launcher-Weg zu `native-mixed`. | Launcher-Flag (z. B. `--fp4-native-mixed`), das statt `marlin` die Form `native-mixed` ausgibt, FP8 bleibt vorerst Marlin. Dazu argv_gate-Zählung P/D nachziehen. | S | Plan (Boot erst mit N4A-Kern sinnvoll) |
+| L7 | uneven_perf.py:736-760, 2005-2030 | Die Planer-Lanes kennen `nvfp4_native` (5090) und `nvfp4_marlin`, aber keine Lane `nvfp4_w4a8` für sm_86. P-Schnitt und D-Ratio würden mit Marlin-Raten der 3080 geplant. | Lane `nvfp4_w4a8_int8` mit N4As Mikrobench-Werten; Familienauflösung `mlp`/`vocab` für native-mixed. | M | Plan |
+| L8 | Marlin-Rückfall (marlin_utils_fp4.py:127-221) | Ein anderes Layout auf demselben Parameternamen: P-Ganzes und D-Stück haben andere Shapes, int32 [K/16, 2N] gegen u8 [N, K/2], der Join antwortet mit W68. | Im Modus nur mit ausdrücklicher Env-Freigabe. Richtig wäre abgeleitete Marlin-Kopie + Repack nach jedem Flip-Eingang (Zeit + Transient). | M | Refusal gebaut, Repack-Pfad Plan |
+| L9 | Skalare `alpha`, `input_scale_inv`, `weight_global_scale` (0-dim), `input_scale`/`weight_scale_2` [n_parts] | kein Bruch: `StorageGeom.of` beschreibt 0-dim als 1×1 (weight_exchange.py, Zweig `len(shape)==0`), der Join liest REPLICATED. | – | – | – |
+| L10 | Parameter-Aliase | `weight_scale_interleaved` IST `weight_scale`; `named_parameters` sieht es einmal. Gestempelt wird das Objekt, der Stempel gilt für beide Namen. | Kein Code nötig. Nicht über `.data` gehen: das verliert den Stempel. | – | – |
+| L11 | Ladeweg nach Flip-Eingang | Der Tausch schreibt Bytes in bestehende Parameter-Storages; `process_weights_after_loading` läuft nicht erneut. | Kein Bruch: Swizzle und Skalare sind Zustand der Bytes, nicht des Ladens. | – | – |
+| L12 | Aufteilung P 42/11/11 | kein Schnitt in P (ganze Schichten) | – | – | – |
+| L13 | Aufteilung D 58/25/25 | Das MLP läuft in Einheiten à 128 (136 Einheiten). Nur Rang-Grenzen auf 128 sind zulässig, sonst verweigert L5. Heute erzwingt das der Block. | Planer-Rundung auf 128er-Einheiten (besteht). | – | – |
+
+## 8. FP8-Anteil (Attention/GDN, ~30 % der Linear-FLOPs), Operator-Auftrag 25.09.
+
+- **Heute:** ModelOptFp8LinearMethod mit `SGLANG_FORCE_FP8_MARLIN` auf allen Rängen (launcher.py:9247-9255):
+  W8A16 Marlin, Layout Marlin-FP8 (repacked).
+- **5090 nativ:**
+  - W8A8-FP8 statisch per-tensor. Die `input_scale` des Checkpoints ist die kalibrierte Aktivierungsskala, das ist der
+    vom Exporteur vorgesehene Modus.
+  - Pfad: `apply_fp8_linear` (fp8_utils.py:2203) → CUTLASS/`_scaled_mm` auf den FP8-Kernen.
+  - Das Layout nach dem Laden ist `weight` e4m3 [K, N] als `.t()`-View auf [N, K]-Storage; die per-channel-Skala kommt
+    aus `convert_to_channelwise` (modelopt_quant.py:661-668).
+  - Frühere Messung (INTEGRATION_R3_VALIDATION.md:15960-15970, 31.07., M=2048):
+    - fp8_native 529-568 TFLOPS gegen fp8_marlin 204-216;
+    - nvfp4_native 1147-1386 gegen nvfp4_marlin 223-233.
+- **3080** (kein FP8-Tensorpfad):
+  - (a) Marlin W8A16 ist heute das Maß: 54-61 TFLOPS bei M=2048 (gleiche Quelle).
+  - (b) Dequant nach FP16 plus FP16-MMA mit FP16-Akku: rechnerisch 119 TF, aber FP16-Akkumulation über K=5120/6144
+    kostet Präzision. Nicht ohne Qualitätsmessung.
+  - (c) INT8: E4M3 → INT8 ist NICHT verlustfrei (3 Mantissenbits bei 4 Exponentenbits Dynamik). Nach der Nutzerorder
+    vom 08.09. nur dort, wo es nachweislich keine Intelligenz kostet. Stumm nie.
+  - **Physikalisch schnellster verlustfreier Weg:** W8A16 (bf16-MMA mit FP32-Akku, 59,5 TF Spitze). Er ist bei großem M
+    rechengebunden und bei Decode bandbreitengebunden, der Kernel ist dafür zweitrangig.
+- **EIN Layout für FP8:**
+  - Das native [N, K]-e4m3-Storage plus Skalar-Skala ist trivial schneidbar (Zeilen- und Spaltenschnitte ohne Swizzle).
+  - Die 3080 bräuchte dann einen W8A16-Kernel, der [N, K] K-kontigu liest (CUTLASS-2.x-mixed-input oder
+    Triton-Dequant-GEMM), statt des Marlin-Repacks.
+  - Der Decode-GEMV auf [N, K]-Zeilen ist einfach und bandbreitengerecht.
+  - Aufwand: M bis L (neuer sm_86-Kern + Tausch wie INT8 heute).
+  - **Hebel P:** nur die 5090-Stufe gewinnt (FP8-Anteil 0,54 → 0,20 ms je Schicht und 512er-Chunk). Die 3080-Stufe
+    bleibt beim FP8-Anteil gleich.
+
+## 9. Offen
+
 - NVFP4-DFlash2-Draft: geht durch dieselbe Methode, also derselbe Vertrag. Shapes nicht geprüft.
+- Mikrobench-Zahlen dieses Sitzes: siehe Bericht (GPU-Fenster nach der NF-Nachabnahme).

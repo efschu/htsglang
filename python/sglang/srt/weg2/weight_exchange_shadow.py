@@ -2947,6 +2947,22 @@ def card_manifest_entries(inventory: Sequence[object],
         for g in inventory))
 
 
+def _in_nvfp4_sf_tiles(owner, leaf: str, rows: Tuple[int, ...]) -> Tuple[int, ...]:
+    """Backlog #38: a 128x4-swizzled NVFP4 scale is described in 128-row tiles
+    (``weight_exchange.StorageGeom._nvfp4_sf_tile_view``), so its declared
+    components are too. A component that is not a whole number of tiles has no
+    tile-view boundary; the declaration is then dropped (``()``) and the join
+    refuses the tensor by name rather than cutting a tile in half."""
+    from sglang.srt.weg2 import weight_exchange as wx
+
+    if not wx.is_nvfp4_sf_tile_view(getattr(owner, leaf, None)):
+        return rows
+    tile = wx.NVFP4_SF_TILE_ROWS
+    if any(int(r) % tile for r in rows):
+        return ()
+    return tuple(int(r) // tile for r in rows)
+
+
 def _qkv_component_rows(model, name: str) -> Tuple[int, ...]:
     """#1384: this parameter's DECLARED (q, k, v) row split, if any.
 
@@ -2987,14 +3003,14 @@ def _qkv_component_rows(model, name: str) -> Tuple[int, ...]:
     k = getattr(owner, "kv_proj_shard_size", None)
     v = getattr(owner, "v_proj_shard_size", None)
     if q is not None and k is not None and v is not None:
-        return (int(q), int(k), int(v))
+        return _in_nvfp4_sf_tiles(owner, _leaf, (int(q), int(k), int(v)))
     parts = getattr(owner, "output_partition_sizes", None)
     try:
         parts = tuple(int(x) for x in (parts or ()))
     except (TypeError, ValueError):
         parts = ()
     if len(parts) >= 2:
-        return parts
+        return _in_nvfp4_sf_tiles(owner, _leaf, parts)
     if mod_path.endswith(".conv1d"):
         parent_path = mod_path.rpartition(".")[0]
         try:

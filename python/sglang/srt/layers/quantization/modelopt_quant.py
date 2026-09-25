@@ -1836,11 +1836,16 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer, "weight_scale", "weight_scale_interleaved", padded_scales
         )
         if native_mixed:
+            from sglang.srt.layers.linear import RowParallelLinear
             from sglang.srt.layers.quantization.nvfp4_native_mixed import (
                 mark_swizzled,
             )
 
-            mark_swizzled(layer.weight_scale_interleaved)
+            # K-sharded (row-parallel) scales travel in the 128-row tile view.
+            mark_swizzled(
+                layer.weight_scale_interleaved,
+                k_sharded=isinstance(layer, RowParallelLinear),
+            )
 
         if getattr(layer, "_interleave_for_swiglu_fusion", False):
             from sglang.srt.layers.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (

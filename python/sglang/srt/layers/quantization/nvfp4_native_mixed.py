@@ -278,8 +278,19 @@ def swizzle_128x4(scale: torch.Tensor) -> torch.Tensor:
     )
 
 
-def mark_swizzled(param: torch.Tensor) -> None:
+#: Stamped IN ADDITION on the swizzled scale of a K-sharded (row-parallel)
+#: layer: the weight exchange then describes it in the 128-row tile view
+#: (weight_exchange.StorageGeom._nvfp4_sf_tile_view), where a K cut is a plain
+#: column slice. N-sharded layers (column-parallel, lm_head) keep the element
+#: view: a 128-aligned row cut is already layout-neutral there, and the vocab
+#: pad arithmetic of the join counts rows, not tiles.
+SF_TILE_VIEW_ATTR = "nvfp4_sf_tile_view"
+
+
+def mark_swizzled(param: torch.Tensor, *, k_sharded: bool = False) -> None:
     setattr(param, SF_LAYOUT_ATTR, SF_LAYOUT_128X4)
+    if k_sharded:
+        setattr(param, SF_TILE_VIEW_ATTR, True)
 
 
 def is_swizzled(param) -> bool:

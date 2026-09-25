@@ -294,6 +294,27 @@ class Weg2XchgSourceMissing(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+#: Backlog #38: the attributes ``nvfp4_native_mixed.mark_swizzled`` stamps on a
+#: 128x4-swizzled NVFP4 block-scale Parameter (duplicated here as literals so
+#: this module keeps no import on the layers package). Only the TILE-VIEW stamp
+#: (K-sharded, row-parallel layers) changes the geometry.
+NVFP4_SF_LAYOUT_ATTR = "nvfp4_sf_layout"
+NVFP4_SF_LAYOUT_128X4 = "128x4"
+NVFP4_SF_TILE_VIEW_ATTR = "nvfp4_sf_tile_view"
+NVFP4_SF_TILE_ROWS = 128
+NVFP4_SF_TILE_COLS = 4
+
+
+def is_nvfp4_sf_swizzled(tensor) -> bool:
+    return getattr(tensor, NVFP4_SF_LAYOUT_ATTR, None) == NVFP4_SF_LAYOUT_128X4
+
+
+def is_nvfp4_sf_tile_view(tensor) -> bool:
+    return is_nvfp4_sf_swizzled(tensor) and bool(
+        getattr(tensor, NVFP4_SF_TILE_VIEW_ATTR, False)
+    )
+
+
 @dataclass(frozen=True)
 class StorageGeom:
     """What a live tensor looks like in STORAGE, in elements plus an itemsize.
@@ -323,6 +344,8 @@ class StorageGeom:
         shape = tuple(int(s) for s in tensor.shape)
         stride = tuple(int(s) for s in tensor.stride())
         itemsize = int(tensor.element_size())
+        if is_nvfp4_sf_tile_view(tensor):
+            return cls._nvfp4_sf_tile_view(shape, stride, itemsize)
         if len(shape) == 0:
             return cls(rows=1, cols=1, pitch=1, itemsize=itemsize)
         if len(shape) == 1:
@@ -367,6 +390,39 @@ class StorageGeom:
                 f"which no memcpy2d can express."
             )
         return cls(rows=rows, cols=cols, pitch=pitch, itemsize=itemsize)
+
+    @classmethod
+    def _nvfp4_sf_tile_view(cls, shape, stride, itemsize) -> StorageGeom:
+        """Backlog #38 (docs/NVFP4_NATIVE_LAYOUT_CONTRACT.md section 4): a
+        128x4-SWIZZLED NVFP4 block-scale tensor [N_pad, K_pad] is described as
+        one storage row per 128-row tile, ``(N_pad/128, K_pad*128)``.
+
+        In that view a 128-aligned N cut is a row slice and a K cut on 64
+        elements (4 scale columns) is a plain column slice -- byte-identical to
+        the native swizzle of the destination's own shard. In the element view a
+        K cut is WRONG bytes with no error (the swizzle interleaves 4 columns x
+        128 rows inside each 512-byte block). Only tensors the loader stamped
+        for the tile view (``--fp4-gemm-backend native-mixed``, row-parallel
+        layers) take this branch, so every other geometry is unchanged.
+        """
+        if len(shape) != 2 or stride != (shape[1], 1):
+            raise Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: swizzled NVFP4 scale shape {shape} "
+                f"stride {stride} is not a contiguous 2-D tensor."
+            )
+        rows, cols = shape
+        if rows % NVFP4_SF_TILE_ROWS or cols % NVFP4_SF_TILE_COLS:
+            raise Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: swizzled NVFP4 scale {shape} is not a "
+                f"whole number of {NVFP4_SF_TILE_ROWS}x{NVFP4_SF_TILE_COLS} tiles."
+            )
+        tile_cols = cols * NVFP4_SF_TILE_ROWS
+        return cls(
+            rows=rows // NVFP4_SF_TILE_ROWS,
+            cols=tile_cols,
+            pitch=tile_cols,
+            itemsize=itemsize,
+        )
 
 
 # ---------------------------------------------------------------------------
