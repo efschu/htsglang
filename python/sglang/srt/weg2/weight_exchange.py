@@ -131,7 +131,10 @@ __all__ = [
     "STRIDED2D",
     "ShortParameter",
     "StorageGeom",
+    "TILED_LINE_PREFIX",
     "TagCoverage",
+    "TileFinding",
+    "TiledStorage",
     "VOCAB_FAMILY",
     "WEIGHT_SOURCE_ENV",
     "WEIGHT_SOURCE_EXCHANGE",
@@ -3061,6 +3064,12 @@ COVER_LINE_PREFIX = "WEG2-XCHG-COVER"
 #: bytes its tag does not hold -- see :func:`plan_param_lines`.
 PLAN_PARAM_LINE_PREFIX = "WEG2-XCHG-PLAN-PARAM"
 COVERAGE_REFUSAL_MARKER = "W84 Weg2XchgCoverageRefused"
+#: H79: one line per storage that SEVERAL plan Parameters share -- the
+#: upstream GDN fusion (``Qwen3_5GatedDeltaNet.finalize_fused_in_proj``) makes
+#: ``in_proj_qkvz.weight`` and ``in_proj_ba.weight`` row views of ONE block.
+#: Printed for the tiled ones AND for the refused ones, so the population is
+#: named where it is counted (see :func:`_tile_findings`).
+TILED_LINE_PREFIX = "WEG2-XCHG-TILED"
 
 #: MINIMAL INTERFACE, TODO(S1, branch weg2/xchg-s1-0908): the plan half of this
 #: module must expose its parameter population in exactly this shape --
@@ -3101,6 +3110,16 @@ class LiveTensor:
     storage_key: Tuple[Any, ...]
     dtype: str
     shape: Tuple[int, ...]
+    #: H79 (fnNV4f1, 25.09.): WHICH BYTES OF ITS STORAGE this tensor is --
+    #: the byte offset from the storage start, the byte length, and whether
+    #: that length is one run.  ``nbytes`` above stays the STORAGE, the unit
+    #: ``covered_storage`` dedups on; these three are what a storage shared by
+    #: several plan Parameters is judged by (:func:`_tile_findings`).  ``None``
+    #: = the walk could not read them (meta/fake tensor): such a tensor never
+    #: joins a tiled storage and keeps the one-storage judgement.
+    view_offset: Optional[int] = None
+    view_nbytes: Optional[int] = None
+    view_contiguous: bool = False
 
 
 @dataclass(frozen=True)
@@ -3111,6 +3130,50 @@ class ShortParameter:
     tag: str
     planned_bytes: int
     live_bytes: int
+
+
+#: H79: the words a shared storage is refused with.
+TILE_GAP = "GAP"
+TILE_OVERLAP = "OVERLAP"
+TILE_OVERRUN = "OVERRUN"
+TILE_NONCONTIGUOUS = "NONCONTIGUOUS"
+
+
+@dataclass(frozen=True)
+class TileFinding:
+    """H79: a storage several plan Parameters share, and why it is NOT tiled.
+
+    ``GAP`` -- bytes of the storage no member's view covers (the exchange has
+    no source for them); ``OVERLAP`` -- two members claim some bytes with
+    DIFFERENT extents; ``OVERRUN`` -- a view reaches past the storage;
+    ``NONCONTIGUOUS`` -- a member whose view is not one byte run, so its
+    bytes cannot be placed on the storage axis at all.  ``start``/``end`` are
+    byte offsets into the storage, ``members`` every plan Parameter on it.
+    """
+
+    tag: str
+    kind: str
+    members: Tuple[str, ...]
+    start: int
+    end: int
+    storage_bytes: int
+
+
+@dataclass(frozen=True)
+class TiledStorage:
+    """H79: a storage that plan Parameters tile WITHOUT a gap or an overlap.
+
+    ``members`` is ``(name, byte offset, byte length)`` in storage order,
+    aliases (a second name over the same range) folded into their range's
+    first name.  ``holders`` are the non-Parameter tensors that are views of
+    the same storage -- ``_fused_in_proj_weight`` is the one in the tree: it
+    is no source of its own, every byte of it arrives through the members.
+    """
+
+    tag: str
+    storage_bytes: int
+    members: Tuple[Tuple[str, int, int], ...]
+    holders: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3156,6 +3219,15 @@ class TagCoverage:
     #: ``weight_shape`` (``weight_exchange_shadow.not_a_source_here``).  Named
     #: and counted like ``local_scratch``: not a refusal, not a relabel.
     not_source: Tuple[str, ...] = ()
+    #: H79 (fnNV4f1, 25.09.): storages that SEVERAL plan Parameters share and
+    #: tile exactly (:class:`TiledStorage`), and the non-Parameter views of
+    #: them (``view_holders``).  Neither is a refusal: every byte of such a
+    #: storage has exactly one plan source.
+    tiled: Tuple["TiledStorage", ...] = ()
+    view_holders: Tuple[str, ...] = ()
+    #: H79: the shared storages whose members do NOT tile them -- a refusal,
+    #: counted in :attr:`ok` like ``uncovered``/``short``/``missing``.
+    tiling: Tuple["TileFinding", ...] = ()
 
     #: #1335 (B4r): the three verdicts of the two books' comparison.  Named
     #: because withholding a wrong number without putting a word in its place
@@ -3250,8 +3322,10 @@ class TagCoverage:
     def ok(self) -> bool:
         """``exempt`` is deliberately absent from this: a tensor the plan
         DECLARED as needing no source is accounted for, which is the whole
-        difference between classifying the population and relabelling it."""
-        return not (self.uncovered or self.short or self.missing)
+        difference between classifying the population and relabelling it.
+        H79: a shared storage that is not tiled (``tiling``) refuses exactly
+        like an uncovered tensor -- its gap is a page with no source."""
+        return not (self.uncovered or self.short or self.missing or self.tiling)
 
     def uncovered_lines(self) -> List[str]:
         """One line per uncovered tensor, named where it is counted."""
@@ -3315,7 +3389,34 @@ class TagCoverage:
             + (
             f"tms_answered={'yes' if self.tms_bytes else 'no'} "
             f"mode={self.mode}"
-        ))
+        )
+            # H79: APPENDED, and only when there is something to count -- so
+            # every line of a boot without a shared storage (INT4, 27B) stays
+            # byte for byte what it was.
+            + (f" tiled={len(self.tiled)} view_holders={len(self.view_holders)}"
+               f" tiling={len(self.tiling)}"
+               if (self.tiled or self.view_holders or self.tiling) else ""))
+
+    def tiled_lines(self) -> List[str]:
+        """H79: one line per shared storage, tiled or refused, named."""
+        out = []
+        for s in self.tiled:
+            spans = "|".join(
+                f"{name}[{off / MIB:.3f}:{(off + n) / MIB:.3f}]"
+                for name, off, n in s.members)
+            out.append(
+                f"{TILED_LINE_PREFIX} rank={int(self.rank)} tag={self.tag} "
+                f"verdict=tiled storage_mib={s.storage_bytes / MIB:.3f} "
+                f"members={len(s.members)} spans={spans} "
+                f"holders={','.join(s.holders) or '-'}")
+        for f in self.tiling:
+            out.append(
+                f"{TILED_LINE_PREFIX} rank={int(self.rank)} tag={self.tag} "
+                f"verdict=refused kind={f.kind} "
+                f"storage_mib={f.storage_bytes / MIB:.3f} "
+                f"range_mib=[{f.start / MIB:.3f}:{f.end / MIB:.3f}] "
+                f"members={'+'.join(f.members)}")
+        return out
 
 
 def tag_of_parameter_name(
@@ -3388,6 +3489,107 @@ def _join(module_path: str, attr: str) -> str:
     return f"{module_path}.{attr}" if module_path else attr
 
 
+def _view_extent(tensor: torch.Tensor) -> Tuple[Optional[int], Optional[int], bool]:
+    """H79: ``(byte offset into the storage, byte length, one run?)``.
+
+    The same three facts the exchange moves a Parameter by -- its descriptors
+    start at ``data_ptr()`` (storage start + this offset) and span the view's
+    own rows (``StorageGeom.of`` reads stride/itemsize, never the storage).
+    ``(None, None, False)`` when the tensor has no readable storage."""
+    try:
+        size = int(tensor.element_size())
+        return (int(tensor.storage_offset()) * size, int(tensor.numel()) * size,
+                bool(tensor.is_contiguous()))
+    except Exception:  # noqa: BLE001 -- meta/fake tensors
+        return None, None, False
+
+
+def _is_plan_member(t: "LiveTensor", planned_of_tag: Mapping[str, Any]) -> bool:
+    """A PARAMETER whose name the plan carries -- the only population a
+    shared storage is built from.  The expert buffers (#135/#139) stay out
+    on purpose: each is its own ``[R+C]`` allocation published as a PREFIX
+    view whose Pad/Extra/Scratch never travels, and their judgement
+    (``walk_live_tensors`` charges the view) is untouched by H79."""
+    return t.kind == PARAMETER and t.name in planned_of_tag
+
+
+def _tiled_storages(of_tag: Sequence["LiveTensor"],
+                    planned_of_tag: Mapping[str, Any],
+                    ) -> Dict[Tuple[Any, ...], List["LiveTensor"]]:
+    """H79: the storages of one tag that SEVERAL plan Parameters split.
+
+    fnNV4f1 (25.09., 77a89563c7) died on the first P->D flip with
+    ``W84 ... 44 finding(s)``, every one ``SHORT ... in_proj_qkvz.weight
+    planned_mib=80.000 live_mib=80.469`` / ``in_proj_ba.weight
+    planned_mib=0.469 live_mib=80.469``: the upstream fusion
+    (``qwen3_5.py`` ``finalize_fused_in_proj``) stacks both weights into ONE
+    block and rebinds them as its row views, and the one-Parameter-one-storage
+    judgement charged each view the whole block.  The exchange itself never
+    assumed that -- it addresses every Parameter by ``data_ptr()`` and its
+    view's geometry -- so the claims were right and the yardstick was wrong.
+
+    ONLY A STORAGE WHOSE PLAN MEMBERS SHOW AT LEAST TWO DIFFERENT BYTE RANGES
+    QUALIFIES.  One member, or several names over the SAME range (an alias),
+    keeps the judgement it had -- byte for byte, which is what keeps every
+    boot without a fused block (INT4, 27B) on the old path.
+    """
+    by_key: Dict[Tuple[Any, ...], List[LiveTensor]] = {}
+    for t in of_tag:
+        if not _is_plan_member(t, planned_of_tag):
+            continue
+        key = t.storage_key
+        if not key or key[0] != "storage":
+            continue
+        if t.view_offset is None or t.view_nbytes is None:
+            continue
+        by_key.setdefault(key, []).append(t)
+    return {
+        key: members for key, members in by_key.items()
+        if len({(int(m.view_offset), int(m.view_nbytes)) for m in members}) >= 2
+    }
+
+
+def _tile_findings(tag: str, key: Tuple[Any, ...],
+                   members: Sequence["LiveTensor"]) -> List["TileFinding"]:
+    """H79: why these members do NOT tile their storage -- ``[]`` when they do.
+
+    Tiled means: every member is one byte run, the runs start at byte 0, each
+    starts exactly where the previous one ends, and the last ends at the
+    storage's end.  Two names over the SAME run are an alias, not an overlap
+    (the pre-H79 judgement accepted them and still does).  Anything else is
+    named with its byte range -- W84 stays as strict for a shared storage as
+    it is for one Parameter: a gap is a page the destination never receives.
+    """
+    storage_bytes = int(key[2])
+    ordered = sorted(members, key=lambda m: (int(m.view_offset),
+                                             int(m.view_nbytes), m.name))
+    names = tuple(m.name for m in ordered)
+    out: List[TileFinding] = []
+    for m in ordered:
+        if not m.view_contiguous:
+            out.append(TileFinding(tag, TILE_NONCONTIGUOUS, names,
+                                   int(m.view_offset),
+                                   int(m.view_offset) + int(m.view_nbytes),
+                                   storage_bytes))
+    cursor = 0
+    for off, n in sorted({(int(m.view_offset), int(m.view_nbytes))
+                          for m in ordered}):
+        if off > cursor:
+            out.append(TileFinding(tag, TILE_GAP, names, cursor, off,
+                                   storage_bytes))
+        elif off < cursor:
+            out.append(TileFinding(tag, TILE_OVERLAP, names, off,
+                                   min(cursor, off + n), storage_bytes))
+        cursor = max(cursor, off + n)
+    if cursor < storage_bytes:
+        out.append(TileFinding(tag, TILE_GAP, names, cursor, storage_bytes,
+                               storage_bytes))
+    elif cursor > storage_bytes:
+        out.append(TileFinding(tag, TILE_OVERRUN, names, storage_bytes, cursor,
+                               storage_bytes))
+    return out
+
+
 def walk_live_tensors(
     model: torch.nn.Module, *, region_tag: str = GPU_MEMORY_TYPE_WEIGHTS
 ) -> List[LiveTensor]:
@@ -3420,6 +3622,7 @@ def walk_live_tensors(
         # bleibt der des Puffers, also zaehlt nichts doppelt.
         nbytes = (int(tensor.numel()) * int(tensor.element_size())
                   if ms_is_expert_buffer(name) else _nbytes(tensor))
+        v_off, v_len, v_run = _view_extent(tensor)
         out.append(
             LiveTensor(
                 name=name,
@@ -3430,6 +3633,9 @@ def walk_live_tensors(
                 storage_key=_storage_key(tensor),
                 dtype=str(tensor.dtype),
                 shape=tuple(tensor.shape),
+                view_offset=v_off,
+                view_nbytes=v_len,
+                view_contiguous=v_run,
             )
         )
 
@@ -3540,11 +3746,19 @@ def plan_param_lines(
             verdict = "here" if found.tag == tag else "elsewhere"
             live_mib = found.nbytes / MIB
             dtype, shape = found.dtype, list(found.shape)
+        # H79: a VIEW of a larger storage (the fused GDN in_proj) prints its
+        # own bytes beside the storage's -- appended, and only then, so every
+        # line of a parameter that owns its storage stays what it was.
+        view_note = ""
+        if (found is not None and found.view_nbytes is not None
+                and int(found.view_nbytes) != int(found.nbytes)):
+            view_note = (f" view_mib={int(found.view_nbytes) / MIB:.3f}"
+                         f" view_offset_mib={int(found.view_offset or 0) / MIB:.3f}")
         lines.append(
             f"{PLAN_PARAM_LINE_PREFIX} rank={int(rank)} tag={tag} "
             f"name={name} planned_mib={claim / MIB:.3f} "
             f"live_tag={live_tag} live_mib={live_mib:.3f} "
-            f"dtype={dtype} shape={shape} verdict={verdict}"
+            f"dtype={dtype} shape={shape} verdict={verdict}{view_note}"
         )
     return lines
 
@@ -3581,6 +3795,14 @@ def build_coverage(
       see (risk R5);
     * ``missing`` -- a plan parameter with no live tensor on this rank: a plan
       built against a different shard geometry.
+
+    H79: a storage SEVERAL plan parameters share (the fused GDN in_proj) is
+    judged by its VIEWS instead of charging every member the whole storage:
+    each member's claim against its own view (``short``), and the views
+    against the storage (``tiling``: gap, overlap, overrun, non-contiguous).
+    Only when they tile it exactly is the storage covered -- and then a
+    non-Parameter view of it (``_fused_in_proj_weight``) is a ``view_holder``,
+    no source of its own.  See :func:`_tiled_storages`.
     """
     mode = mode if mode is not None else weight_source()
     live = walk_live_tensors(model, region_tag=region_tag)
@@ -3609,6 +3831,12 @@ def build_coverage(
         local_scratch: List[str] = []
         not_source: List[str] = []
         n_par = n_buf = n_attr = 0
+        # H79: storages several plan Parameters share, decided BEFORE the
+        # walk below, so no member is charged the whole storage.
+        shared = _tiled_storages(of_tag, planned_of_tag)
+        tiled_ok: Dict[Tuple[Any, ...], Tuple[Tuple[str, int, int], ...]] = {}
+        holders_of: Dict[Tuple[Any, ...], List[str]] = {}
+        tiling: List[TileFinding] = []
 
         # Parameters and buffers first: they define WHICH allocations are
         # accounted for, and only then can an attribute be judged as an alias
@@ -3640,6 +3868,33 @@ def build_coverage(
                 if t.name in planned_of_tag:
                     seen_names.add(t.name)
                     claim = int(planned_of_tag[t.name])
+                    if t.storage_key in shared:
+                        # H79: a member of a SHARED storage answers for its
+                        # own view -- the same rows its descriptors move --
+                        # and the storage is judged once, after this walk.
+                        view = int(t.view_nbytes)
+                        if is_zerofill_by_design(claim, view):
+                            exempt.append(t.name)
+                            continue
+                        if claim > view:
+                            raise Weg2XchgPlanDisagree(
+                                f"W68 Weg2XchgPlanDisagree: {t.name} "
+                                f"(tag={tag}) is planned at {claim} B while "
+                                f"its view holds {view} B of a "
+                                f"{t.nbytes} B storage it shares -- the plan "
+                                f"claims {claim - view} B this parameter "
+                                f"does not have. Refusing at the plan site."
+                            )
+                        if claim != view:
+                            short.append(
+                                ShortParameter(
+                                    name=t.name,
+                                    tag=tag,
+                                    planned_bytes=claim,
+                                    live_bytes=view,
+                                )
+                            )
+                        continue
                     if is_zerofill_by_design(claim, t.nbytes):
                         # DECLARED as needing no source: accounted for, and
                         # named on the line rather than silently dropped.
@@ -3710,14 +3965,41 @@ def build_coverage(
                     uncovered.append(t)
             elif t.kind == BUFFER:
                 n_buf += 1
+                if t.storage_key in shared:
+                    # H79: a view of a shared storage -- judged with it below.
+                    holders_of.setdefault(t.storage_key, []).append(t.name)
+                    continue
                 if t.storage_key not in covered_storage:
                     covered_storage.add(t.storage_key)
                     buffers_bytes += t.nbytes
+        # H79: THE SHARED STORAGES, judged as a whole.  The plan's bytes are
+        # counted for every one (``planned_mib`` is the plan's claim, whatever
+        # the verdict); the storage is COVERED only when the members tile it,
+        # so a view of an untiled storage stays UNCOVERED below.
+        for key, members in shared.items():
+            spans: Dict[Tuple[int, int], str] = {}
+            for m in sorted(members, key=lambda m: (int(m.view_offset),
+                                                    int(m.view_nbytes),
+                                                    m.name)):
+                span = (int(m.view_offset), int(m.view_nbytes))
+                if span in spans:
+                    continue  # an alias of a range already counted
+                spans[span] = m.name
+                planned_bytes += int(planned_of_tag[m.name])
+            found = _tile_findings(tag, key, members)
+            if found:
+                tiling.extend(found)
+                continue
+            covered_storage.add(key)
+            tiled_ok[key] = tuple(
+                (name, off, n) for (off, n), name in sorted(spans.items()))
         for t in of_tag:
             if t.kind != ATTRIBUTE:
                 continue
             n_attr += 1
             if t.storage_key in covered_storage:
+                if t.storage_key in tiled_ok:
+                    holders_of.setdefault(t.storage_key, []).append(t.name)
                 continue
             # fnFL2 v44: THE SAME TWO POPULATIONS REACH THIS BRANCH, and the
             # first fix missed it by classifying only Parameters.  Marlin's
@@ -3756,6 +4038,15 @@ def build_coverage(
             n_parameters=n_par,
             n_buffers=n_buf,
             n_attributes=n_attr,
+            tiled=tuple(
+                TiledStorage(tag=tag, storage_bytes=int(key[2]),
+                             members=spans,
+                             holders=tuple(sorted(holders_of.get(key, ()))))
+                for key, spans in sorted(tiled_ok.items(),
+                                         key=lambda kv: kv[1][0][0])),
+            view_holders=tuple(sorted(
+                name for key in tiled_ok for name in holders_of.get(key, ()))),
+            tiling=tuple(tiling),
         )
     return rows
 
@@ -3780,6 +4071,14 @@ def coverage_refusal_message(rows: Mapping[str, TagCoverage]) -> str:
             )
         for name in row.missing:
             parts.append(f"MISSING tag={tag} name={name}")
+        for f in row.tiling:
+            # H79: a storage several plan Parameters share, not tiled by them.
+            parts.append(
+                f"TILING tag={tag} kind={f.kind} "
+                f"range_mib=[{f.start / MIB:.3f}:{f.end / MIB:.3f}] "
+                f"storage_mib={f.storage_bytes / MIB:.3f} "
+                f"members={'+'.join(f.members)}"
+            )
     return (
         f"{COVERAGE_REFUSAL_MARKER}: {len(parts)} finding(s). A live tensor "
         "under an exchanged tag that is neither a plan Parameter nor a "
@@ -3912,6 +4211,9 @@ def arm_coverage(
         # only caller.  One line per tensor here makes the classification a
         # ONE-BOOT deliverable, whatever the verdict downstream turns out to be.
         for ln in rows[tag].uncovered_lines():
+            emit(ln)
+        # H79: every shared storage, tiled or refused, by name.
+        for ln in rows[tag].tiled_lines():
             emit(ln)
         # #1273 B4r: and the PLAN's own per-parameter claim beside the tag
         # that actually holds each one.  Emitted for every tag, not only the

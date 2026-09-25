@@ -3231,9 +3231,28 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 f"{skipped_visual_count} visual weights"
             )
 
+        # H79: the fusion's census, one line per rank. `unbanded` counts fused
+        # blocks allocated OUTSIDE their layer's band (no Weg-2 chunk scope):
+        # on a chunked flip boot it must read 0, else the exchange would pause
+        # and resume those rows under the base tag while the plan addresses
+        # them by name in the band (fnNV4f1).
+        _fuse_census = {}
         for module in self.modules():
             if isinstance(module, Qwen3_5GatedDeltaNet):
-                module.finalize_fused_in_proj()
+                _st = str(module.finalize_fused_in_proj() or "none")
+                _fuse_census[_st] = _fuse_census.get(_st, 0) + 1
+        if _fuse_census:
+            _n_fused = sum(v for k, v in _fuse_census.items() if k.startswith("fused@"))
+            logger.info(
+                "#H79 GDN-FUSED-IN-PROJ gdn=%d fused=%d unbanded=%d census=%s "
+                "(fused@<tag>: qkvz+ba stacked into one block allocated in that "
+                "band; the module weights are its row views, which the coverage "
+                "walk judges as a TILED storage -- WEG2-XCHG-TILED)",
+                sum(_fuse_census.values()),
+                _n_fused,
+                _fuse_census.get("fused@-", 0),
+                ",".join(f"{k}:{v}" for k, v in sorted(_fuse_census.items())),
+            )
 
         # #68f: der Schalter sagt, was er sollte -- diese Zahl sagt, was er
         # TAT. gedreht=0 bei eingeschaltetem Schalter heisst: das Praedikat

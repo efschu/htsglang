@@ -637,31 +637,61 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
-    def finalize_fused_in_proj(self) -> None:
+    def finalize_fused_in_proj(self) -> str:
         """Stack in_proj_qkvz + in_proj_ba into one GEMM weight;
         the module weights become row views of it,
-        so weight reload and dtype checks still see them."""
-        if not _is_cuda or self._fused_in_proj_weight is not None:
-            return
+        so weight reload and dtype checks still see them.
+
+        H79 (fnNV4f1, 25.09.): the block is allocated in THIS LAYER'S BAND
+        (``weight_chunk_scope``), like every other allocation of the layer.
+        This runs at the end of ``load_weights``, outside any band, so the cat
+        landed in the BASE ``weights`` tag -- measured on fnNV4f1: the base
+        tag pool held 2.91/0.63/1.67 GiB active on PP0/1/2 against
+        0.60/0.00/0.61 on the unfused INT4 boot fnFL2x176, i.e. one 80.47 MiB
+        block per GDN layer -- while the plan and the coverage walk address
+        ``in_proj_*`` BY NAME in the layer's band. In the band, the tag the
+        flip pauses and resumes is the tag the names say. Outside a Weg-2
+        chunked weights region the scope is a no-op and this is the upstream
+        function unchanged; an unfused layer (INT4/FP8 qkvz) returns before
+        anything is allocated or scoped.
+
+        Returns a status word for the loader's census line
+        (``fused@<tag>``, ``fused@-`` = no band scope, ``already``,
+        ``skip:<why>``).
+        """
+        if not _is_cuda:
+            return "skip:not-cuda"
+        if self._fused_in_proj_weight is not None:
+            return "already"
         if get_lora().enable_lora or get_lora().lora_paths:
             # LoRA wraps the individual Linear modules; the fused GEMM would
             # bypass their adapters.
-            return
+            return "skip:lora"
         qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
         if not (
             isinstance(qkvz.quant_method, UnquantizedLinearMethod)
             and isinstance(ba.quant_method, UnquantizedLinearMethod)
-            and qkvz.weight.dtype == torch.bfloat16
+        ):
+            return (
+                f"skip:qkvz={type(qkvz.quant_method).__name__}"
+                f"/ba={type(ba.quant_method).__name__}"
+            )
+        if not (
+            qkvz.weight.dtype == torch.bfloat16
             and ba.weight.dtype == torch.bfloat16
             and qkvz.bias is None
             and ba.bias is None
         ):
-            return
-        fused = torch.cat([qkvz.weight.data, ba.weight.data], dim=0).contiguous()
+            return "skip:dtype-or-bias"
+        from sglang.srt.managers.weg2_memory_saver import weight_chunk_scope
+
+        with weight_chunk_scope(getattr(self, "layer_id", None)) as band:
+            fused = torch.cat([qkvz.weight.data, ba.weight.data], dim=0).contiguous()
         self._fused_in_proj_qkvz_width = qkvz.weight.shape[0]
         qkvz.weight.data = fused[: self._fused_in_proj_qkvz_width]
         ba.weight.data = fused[self._fused_in_proj_qkvz_width :]
         self._fused_in_proj_weight = fused
+        return f"fused@{band or '-'}"
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         if (
