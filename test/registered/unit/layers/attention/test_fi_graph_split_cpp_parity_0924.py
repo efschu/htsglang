@@ -180,6 +180,20 @@ def _first_diff(got, want):
 class TestCppPlannerParity(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # The harness calls PrefillPlan with the signature of the version
+        # fi_graph_split mirrors; under any other flashinfer the module stands
+        # down (flashinfer_contract_ok), so parity with that header is moot.
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            fi_ver = version("flashinfer-python")
+        except PackageNotFoundError:
+            fi_ver = ""
+        if not fi_ver.startswith(G.FLASHINFER_VERSION):
+            raise unittest.SkipTest(
+                "flashinfer %r installed, fi_graph_split mirrors %s (module stands down)"
+                % (fi_ver, G.FLASHINFER_VERSION)
+            )
         data, nvcc = _flashinfer_data(), _nvcc()
         if data is None or nvcc is None:
             raise unittest.SkipTest("needs nvcc and the flashinfer headers (data=%s nvcc=%s)" % (data, nvcc))
