@@ -9,10 +9,12 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, nvvm, vector
 from cutlass.cutlass_dsl import dsl_user_op
 
+# CuTe DSL 4.7 renamed nvvm.Tcgen05GroupKind to nvvm.CTAGroupKind (same members).
+_CTA_GROUP_KIND = getattr(nvvm, "Tcgen05GroupKind", None) or nvvm.CTAGroupKind
 NVVM_CTA_GROUP_MAP = [
     None,
-    nvvm.Tcgen05GroupKind.CTA_1,
-    nvvm.Tcgen05GroupKind.CTA_2,
+    _CTA_GROUP_KIND.CTA_1,
+    _CTA_GROUP_KIND.CTA_2,
 ]
 LDST_MAP = {
     "32x32b": (nvvm.Tcgen05LdStShape.SHAPE_32X32B, 1),
