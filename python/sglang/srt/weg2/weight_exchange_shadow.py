@@ -3026,6 +3026,22 @@ def _qkv_component_rows(model, name: str) -> Tuple[int, ...]:
     return ()
 
 
+def declared_flat_table(param):
+    """G1: the flat container THIS rank's loader declared on ``param``
+    (``xchg_flat_table``, set where the bytes were laid out -- the GGUF flat
+    container of ``layers/quantization/gguf.py``), as a ``FlatTable``; ``None``
+    for every other parameter. Read, never derived: the segments are not
+    visible in the tensor's extent."""
+    raw = getattr(param, "xchg_flat_table", None)
+    if raw is None:
+        return None
+    from sglang.srt.weg2.xchg_flat_segments import FlatTable
+
+    table = raw if isinstance(raw, FlatTable) else FlatTable.from_json(raw)
+    table.validate(str(getattr(param, "name", "") or "flat container"))
+    return table
+
+
 def card_inventory(
     *,
     rank: int,
@@ -3106,7 +3122,8 @@ def card_inventory(
                                    shard_axis=wx.REPLICATED, shard_total=0,
                                    stage=int(rank),
                                    component_rows=_qkv_component_rows(
-                                       model, str(name)))
+                                       model, str(name)),
+                                   flat_table=declared_flat_table(param))
         except BaseException as exc:  # noqa: BLE001 -- a shape this plan cannot name
             # THE SAME SKIP RULE AS THE PLAN'S, deliberately: a parameter the
             # plan cannot describe must not be in the manifest either, or the
