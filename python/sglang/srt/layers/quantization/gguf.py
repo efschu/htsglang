@@ -949,8 +949,14 @@ def _dequant_supports_out() -> bool:
     return _dequant_out_supported
 
 
-def _reserve_dequant_workspace(numel: int, dtype: torch.dtype, device) -> None:
-    """Grow the persistent workspace (load time, pre-KV-profiling)."""
+def _reserve_dequant_workspace(
+    numel: int, dtype: torch.dtype, device, layer_id: Optional[int] = None
+) -> None:
+    """Grow the persistent workspace (load time, pre-KV-profiling).
+
+    ``layer_id``: the layer whose dequant target this is (F1b). Inside a
+    deferred pass the workspace is later allocated in the chunk tag of the
+    layer whose request SET its size -- see dequant_workspace_deferred."""
     key = _dequant_ws_key(dtype, device)
     nbytes = numel * dtype.itemsize
     # Record the peak target BEFORE either early return (#257): both of them
@@ -969,7 +975,9 @@ def _reserve_dequant_workspace(numel: int, dtype: torch.dtype, device) -> None:
         if _DEQUANT_WS_DEFERRED is not None:
             pending = _DEQUANT_WS_DEFERRED.get(key)
             if pending is None or pending[0] < numel:
-                _DEQUANT_WS_DEFERRED[key] = (numel, dtype, device)
+                # strictly larger only: the FIRST layer that asked for the
+                # final size owns the workspace's chunk (F1b)
+                _DEQUANT_WS_DEFERRED[key] = (numel, dtype, device, layer_id)
             return
         _DEQUANT_WS[key] = torch.empty(numel, dtype=dtype, device=device)
 
@@ -982,14 +990,22 @@ def dequant_workspace_deferred():
     #1233 (27B GGUF, weg2rc5gg 2026-09-25): the GGUF post-load pass now runs
     every module inside its LAYER's weight chunk scope, so the flat qweight
     containers land in the chunk tag that is paused and resumed with the layer.
-    The dequant workspace is not a layer's bytes -- one buffer per lane,
-    device and dtype, shared by every layer -- and stays in the BASE weights
-    tag: grown inside the pass it would land in whichever chunk asked for the
-    largest target. The allocation on exit happens outside the chunk scopes
-    (the caller closes them first), still inside load_model, so the KV-budget
-    profiling that runs afterwards sees it (#63). The peak targets
-    (gguf_dequant_scratch_residual_bytes) are recorded as before. Nested use
-    folds into the outer scope.
+    The allocation on exit happens after the pass's own chunk scopes closed,
+    still inside load_model, so the KV-budget profiling that runs afterwards
+    sees it (#63). The peak targets (gguf_dequant_scratch_residual_bytes) are
+    recorded as before. Nested use folds into the outer scope.
+
+    F1b (boot weg2rc6gg, 2026-09-25): the workspace is allocated inside the
+    chunk scope of the layer whose request SET its size (the first one to ask
+    for the final numel), no longer under the base tag. In the base tag it
+    was the ONE allocation of a layers-only PP stage (P rank 1 of the 42,11,11
+    cut owns no embed/norm/head): 178257920 B resident under 'weights' with
+    zero source descriptors, and the first P->D flip died on W106
+    Weg2XchgWakeSourceGapRefused. One buffer per lane, device and dtype,
+    shared by every layer of the rank: it is scratch, carried by no plan, and
+    its chunk is paused and resumed with the rank's other layers before any
+    forward runs. A size set by a module outside every layer (layer id None)
+    keeps the base tag, exactly as before.
     """
     global _DEQUANT_WS_DEFERRED
     outer = _DEQUANT_WS_DEFERRED
@@ -1004,10 +1020,13 @@ def dequant_workspace_deferred():
             if key not in outer or outer[key][0] < item[0]:
                 outer[key] = item
         return
-    for key, (numel, dtype, device) in mine.items():
+    from sglang.srt.managers.weg2_memory_saver import weight_chunk_scope
+
+    for key, (numel, dtype, device, layer_id) in mine.items():
         buf = _DEQUANT_WS.get(key)
         if buf is None or buf.numel() < numel:
-            _DEQUANT_WS[key] = torch.empty(numel, dtype=dtype, device=device)
+            with weight_chunk_scope(layer_id):
+                _DEQUANT_WS[key] = torch.empty(numel, dtype=dtype, device=device)
 
 
 def _ggml_dequantize_ws(
@@ -1611,6 +1630,11 @@ class GGUFLinearMethod(LinearMethodBase):
             # which are replaced by module-level sharing right after the
             # loader finishes): nothing to size, and `.shape` would raise.
             return
+        # F1b: the layer this target belongs to (create_weights recorded it
+        # on the qweight; the prefix is the same fact for any other module).
+        layer_id = getattr(layer.qweight, "weg2_layer_id", None)
+        if layer_id is None:
+            layer_id = _layer_id_of(getattr(layer, "prefix", "") or "")
         shard_views = getattr(layer, "_gguf_shard_views", None)
         if shard_views:
             items = [
@@ -1624,7 +1648,9 @@ class GGUFLinearMethod(LinearMethodBase):
                 continue
             block_size, type_size = _gguf.GGML_QUANT_SIZES[qtype]
             numel = shape[0] * (shape[1] // type_size * block_size)
-            _reserve_dequant_workspace(numel, params_dtype, layer.qweight.device)
+            _reserve_dequant_workspace(
+                numel, params_dtype, layer.qweight.device, layer_id=layer_id
+            )
 
     def apply(
         self,
