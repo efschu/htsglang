@@ -748,6 +748,11 @@ LANE_NVFP4_NATIVE = "nvfp4_native"
 #: which card it lands on. That gap (measured band 2.6x on the reference rig's
 #: 5090) is what a single per-rank score cannot represent.
 LANE_NVFP4_MARLIN = "nvfp4_marlin"
+#: NVFP4 weights on INT8 tensor cores (W4A8): E2M1 x2 -> INT8 exactly, per-token INT8 activations, g16 block
+#: scale in an exact FP32 epilogue, straight from the NATIVE byte layout (N4A GEMM + N4D decode GEMV). Only
+#: ``--fp4-gemm-backend native-mixed`` resolves it (sm_8x default, user order 25.09.), so it has no probe and
+#: no profile measures it: its rate comes from the evidence register (nvfp4_lane_record), native-mixed boots only.
+LANE_NVFP4_W4A8 = "nvfp4_w4a8"
 #: Native INT8 W8A8 through ``sgl_kernel.int8_scaled_mm``: int8 weights AND
 #: dynamically per-token-quantized int8 activations on the IMMA tensor path.
 #: The kernel's SM dispatch is closed-ended (sm75, sm80..89, sm90, sm120+ since
@@ -788,13 +793,13 @@ LANE_INT8_NATIVE = "int8_native"
 _FORMAT_LANES: Dict[str, Tuple[str, ...]] = {
     "bf16": (LANE_BF16,),
     "fp8": (LANE_FP8_NATIVE, LANE_FP8_MARLIN, LANE_FP8_W8A16),
-    "nvfp4_a4": (LANE_NVFP4_NATIVE, LANE_NVFP4_MARLIN),
+    "nvfp4_a4": (LANE_NVFP4_NATIVE, LANE_NVFP4_W4A8, LANE_NVFP4_MARLIN),
     "nvfp4_a16": (LANE_NVFP4_MARLIN,),
     "int8": (LANE_INT8_NATIVE,),
 }
 
 #: Backlog #38 L7: MEASURED NVFP4 lane rates for --fp4-gemm-backend native-mixed
-#: (5090 native W4A4, 3080 Marlin W4A16 on the shared layout). The NVFP4 lanes
+#: (5090 native W4A4, 3080 W4A8 on the INT8 tensor cores; Marlin W4A16 only when opted in). The NVFP4 lanes
 #: have no planner probe, so without them every card fell back to the dense
 #: bf16 score. The measurements live in the evidence register
 #: ``sglang.srt.planner.nvfp4_lane_record`` (window zcx7pv, provenance and power
@@ -803,7 +808,7 @@ _FORMAT_LANES: Dict[str, Tuple[str, ...]] = {
 #: itself and both groups) and ONLY for a lane the profile did not measure
 #: itself; every other boot reads the profile exactly as before.
 NVFP4_NATIVE_MIXED_ENV = "SGLANG_FP4_NATIVE_MIXED_BOOT"
-_NVFP4_LANES = (LANE_NVFP4_NATIVE, LANE_NVFP4_MARLIN)
+_NVFP4_LANES = (LANE_NVFP4_NATIVE, LANE_NVFP4_W4A8, LANE_NVFP4_MARLIN)
 
 
 def nvfp4_native_mixed_boot() -> bool:
@@ -811,9 +816,14 @@ def nvfp4_native_mixed_boot() -> bool:
 
 
 def nvfp4_record_lanes(card_name: str) -> Dict[str, float]:
+    """The record's lanes for the detected card, minus W4A8 when the sm_8x ranks were opted into Marlin
+    (SGLANG_FP4_NATIVE_MIXED_SM8X=marlin): the plan scores the lane the serving path will take."""
     from sglang.srt.planner.nvfp4_lane_record import lanes_for
 
-    return lanes_for(card_name)
+    lanes = lanes_for(card_name)
+    if os.environ.get("SGLANG_FP4_NATIVE_MIXED_SM8X", "w4a8").strip().lower() == "marlin":
+        lanes.pop(LANE_NVFP4_W4A8, None)
+    return lanes
 
 
 #: Formats this table RECOGNISES but has no measured lane for. The distinction
@@ -837,6 +847,7 @@ _LANE_LABELS = {
     LANE_FP8_W8A16: "fp8 W8A16 dequant",
     LANE_NVFP4_NATIVE: "nvfp4 native (block-scaled FP4)",
     LANE_NVFP4_MARLIN: "nvfp4 Marlin (weight-only W4A16)",
+    LANE_NVFP4_W4A8: "nvfp4 W4A8 (INT8 tensor cores, native layout)",
     LANE_INT8_NATIVE: "int8 W8A8 native (int8_scaled_mm)",
 }
 

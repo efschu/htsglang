@@ -51,11 +51,17 @@ def _fake_w4a8(x, weight, scale, gscale, n):
 
 
 def _resolve_rig(backend, caps, *, kernel=True, sm8x="w4a8"):
-    """One scheduler process per rank: TP0 = 5090, TP1/TP2 = 3080."""
+    """One scheduler process per rank: TP0 = 5090, TP1/TP2 = 3080. ``sm8x=None``: the env default."""
     args = mock.Mock(fp4_gemm_runner_backend=backend)
     out = []
+    def env_patch():
+        if sm8x is None:
+            return contextlib.nullcontext()
+        return mock.patch("sglang.srt.environ.envs.SGLANG_FP4_NATIVE_MIXED_SM8X.get", return_value=sm8x)
+
     for cap in caps:
         with (
+            env_patch(),
             mock.patch("sglang.srt.utils.common.get_device_capability", return_value=cap),
             mock.patch.object(fp4_utils, "get_device_capability", return_value=cap),
             mock.patch.object(fp4_utils, "is_sm100_supported", return_value=cap[0] == 10),
@@ -64,10 +70,6 @@ def _resolve_rig(backend, caps, *, kernel=True, sm8x="w4a8"):
             mock.patch.object(fp4_utils, "has_fork_nvfp4_cutlass_kernel", return_value=True),
             mock.patch.object(nm, "_try_autoload_w4a8_kernel", return_value=None),
             mock.patch.object(nm, "_flashinfer_fp4_gemm_available", return_value=True),
-            mock.patch(
-                "sglang.srt.environ.envs.SGLANG_FP4_NATIVE_MIXED_SM8X.get",
-                return_value=sm8x,
-            ),
         ):
             if kernel:
                 nm.register_w4a8_kernel(_fake_w4a8, "fake")
@@ -105,13 +107,19 @@ class TestRankResolution(CustomTestCase):
         self.assertIn("not importable", c.reason)
         with self.assertRaises(nm.NativeMixedUnsupported):
             nm.resolve_rank_backend((12, 0), w4a8_available=False, sm12x_choice="b12x")
-        # sm_8x default (#38 N4C): Marlin W4A16 on the SHARED native layout
-        c = nm.resolve_rank_backend((8, 6), w4a8_available=False)
-        self.assertEqual((c.backend, c.shared_layout), ("marlin_native_inplace", True))
+        # sm_8x default (user order 25.09. ~17:33Z): W4A8 on the INT8 tensor cores, native bytes
         c = nm.resolve_rank_backend((8, 6), w4a8_available=True)
-        self.assertEqual(c.backend, "marlin_native_inplace")
+        self.assertEqual((c.backend, c.shared_layout), ("w4a8_int8", True))
         c = nm.resolve_rank_backend((8, 6), w4a8_available=True, sm8x_choice="w4a8")
         self.assertEqual((c.backend, c.shared_layout), ("w4a8_int8", True))
+        # no silent fallback to Marlin when the kernel is missing
+        with self.assertRaisesRegex(nm.NativeMixedUnsupported, "W4A8 INT8 kernel"):
+            nm.resolve_rank_backend((8, 6), w4a8_available=False)
+        # Marlin W4A16 in place only on explicit request
+        c = nm.resolve_rank_backend((8, 6), w4a8_available=True, sm8x_choice="marlin")
+        self.assertEqual((c.backend, c.shared_layout), ("marlin_native_inplace", True))
+        c = nm.resolve_rank_backend((8, 6), w4a8_available=False, sm8x_choice="marlin")
+        self.assertEqual(c.backend, "marlin_native_inplace")
         c = nm.resolve_rank_backend((10, 0), w4a8_available=False)
         self.assertEqual(c.backend, "flashinfer_cutedsl")
 
@@ -137,7 +145,23 @@ class TestRankResolution(CustomTestCase):
             ],
         )
 
-    def test_mixed_rig_default_is_marlin_inplace(self):
+    def test_mixed_rig_default_is_w4a8(self):
+        """Env unset: 5090 native W4A4, both 3080 W4A8 (user order 25.09.)."""
+        with _fp4_state(), mock.patch.dict("os.environ", {}, clear=False):
+            import os as _os
+
+            _os.environ.pop("SGLANG_FP4_NATIVE_MIXED_SM8X", None)
+            got = _resolve_rig("native-mixed", RIG, sm8x=None)
+        self.assertEqual(
+            got,
+            [
+                (Fp4GemmRunnerBackend.FLASHINFER_CUTLASS, True, True),
+                (Fp4GemmRunnerBackend.W4A8_INT8, True, True),
+                (Fp4GemmRunnerBackend.W4A8_INT8, True, True),
+            ],
+        )
+
+    def test_mixed_rig_marlin_inplace_is_opt_in(self):
         with _fp4_state():
             got = _resolve_rig("native-mixed", RIG, kernel=False, sm8x="marlin")
         self.assertEqual(
@@ -312,6 +336,153 @@ class TestLoaderUnderNativeMixed(CustomTestCase):
     def test_misaligned_shard_fails_at_load(self):
         with self.assertRaises(nm.NativeMixedUnsupported):
             self._run(1, 200, 512)
+
+
+class TestW4A8RankHasNoFlipReshape(CustomTestCase):
+    """User order 25.09.: a W4A8 sm_8x rank computes on the native bytes, so the #38 L8 flip hooks
+    (to_native before the deposit, to_marlin after the wake) must find nothing and touch nothing."""
+
+    def _loaded(self, backend):
+        method = ModelOptFp4LinearMethod(ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True, group_size=16))
+        layer, _ = _make_layer(method, 2, 256, 512)
+        with (
+            _fp4_state(),
+            mock.patch.object(torch.Tensor, "cuda", lambda self, *a, **kw: self),
+            mock.patch(
+                "sglang.srt.layers.quantization.modelopt_quant.is_blackwell_supported",
+                return_value=False,
+            ),
+        ):
+            fp4_utils.FP4_GEMM_RUNNER_BACKEND = backend
+            fp4_utils.FP4_NATIVE_MIXED = True
+            fp4_utils.FP4_NATIVE_MIXED_SHARED_LAYOUT = True
+            method.process_weights_after_loading(layer)
+        model = torch.nn.Module()
+        model.mlp = layer
+        return model, layer
+
+    def test_hooks_are_noops_on_a_w4a8_rank(self):
+        from sglang.srt.layers.quantization import nvfp4_marlin_inplace as mi
+
+        model, layer = self._loaded(Fp4GemmRunnerBackend.W4A8_INT8)
+        self.assertFalse(getattr(layer, mi.LAYER_FLAG, False))
+        self.assertEqual(mi.flagged_layers([model]), [])
+        w0 = layer.weight.detach().clone()
+        s0 = layer.weight_scale.detach().view(torch.uint8).clone()
+        with mock.patch.object(mi, "layer_to_native") as to_nat, mock.patch.object(mi, "layer_to_marlin") as to_mar:
+            self.assertEqual(mi.model_to_native([model]), 0)
+            self.assertEqual(mi.model_to_marlin([model], delivered_native=True), 0)
+            self.assertEqual(mi.model_to_marlin([model], delivered_native=False), 0)
+        to_nat.assert_not_called()
+        to_mar.assert_not_called()
+        self.assertTrue(torch.equal(layer.weight, w0))
+        self.assertTrue(torch.equal(layer.weight_scale.view(torch.uint8), s0))
+
+    def test_weight_updater_hooks_do_nothing_on_a_w4a8_rank(self):
+        """The two WeightUpdater methods the sleep/wake legs call, on a stub owner."""
+        from sglang.srt.layers.quantization import nvfp4_marlin_inplace as mi
+        from sglang.srt.managers.scheduler_components.weight_updater import (
+            SchedulerWeightUpdaterManager as WeightUpdater,
+        )
+
+        model, layer = self._loaded(Fp4GemmRunnerBackend.W4A8_INT8)
+        stub = mock.Mock()
+        stub._weg2_wake_models.return_value = [model]
+        stub._weg2_nvfp4_draft_disk_reloaded = True
+        w0 = layer.weight.detach().clone()
+        with mock.patch.object(mi, "layer_to_native") as to_nat, mock.patch.object(mi, "layer_to_marlin") as to_mar:
+            WeightUpdater._weg2_nvfp4_marlin_to_native(stub)
+            WeightUpdater._weg2_nvfp4_marlin_after_wake(stub)
+        to_nat.assert_not_called()
+        to_mar.assert_not_called()
+        stub._weg2_wake_weight_carrier.assert_not_called()  # returned before asking for the carrier
+        self.assertFalse(stub._weg2_nvfp4_draft_disk_reloaded)  # read-and-clear still happens
+        self.assertTrue(torch.equal(layer.weight, w0))
+
+    def test_marlin_opt_in_still_flags_the_layer(self):
+        """Control: the same load on the opt-in Marlin rank IS flagged (the hooks have work there)."""
+        from sglang.srt.layers.quantization import nvfp4_marlin_inplace as mi
+
+        with mock.patch.object(mi, "prepare_layer", side_effect=lambda l, **kw: setattr(l, mi.LAYER_FLAG, True)):
+            model, layer = self._loaded(Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE)
+        self.assertEqual(mi.flagged_layers([model]), [layer])
+
+
+#: hf_quant_config.json of Qwen3.8-27B-DFlash2-NVFP4-RTNcal (HF maurienne-ai @ bd7a934213c4), verbatim.
+DRAFT_HF_QUANT_CONFIG = {
+    "producer": {"name": "modelopt", "version": "dflash2-nvfp4-rtn-calibrated-1.0"},
+    "quantization": {
+        "quant_algo": "NVFP4",
+        "kv_cache_quant_algo": "FP8",
+        "group_size": 16,
+        "exclude_modules": [
+            "candidate_selector.hidden_projection",
+            "fc",
+        ]
+        + [f"layers.{i}.{m}.kernel_projection" for i in range(5) for m in ("attention_conv", "mlp_conv")],
+    },
+}
+
+
+class TestNvfp4DraftTakesTheSameBackend(CustomTestCase):
+    """User order 25.09.: main model AND NVFP4 draft on the same per-rank path (3080 W4A8, 5090 W4A4).
+    The draft's config is modelopt NVFP4 (not MIXED_PRECISION): its linears get the SAME
+    ModelOptFp4LinearMethod as the target's MLP, and that method dispatches on the ONE process-wide
+    FP4 backend (fp4_utils, resolved once per scheduler process) -- no draft-specific branch exists."""
+
+    def _draft_method(self, prefix):
+        from sglang.srt.layers.linear import LinearBase
+
+        cfg = ModelOptFp4Config.from_config(DRAFT_HF_QUANT_CONFIG)
+        # set by the model loader from the model class (qwen3-style fused projections)
+        cfg.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"], "gate_up_proj": ["gate_proj", "up_proj"]}
+        return cfg.get_quant_method(mock.Mock(spec=LinearBase), prefix)
+
+    def test_draft_linears_are_modelopt_fp4(self):
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        for p in ("layers.0.mlp.gate_up_proj", "layers.0.mlp.down_proj", "layers.4.self_attn.qkv_proj",
+                  "layers.2.self_attn.o_proj"):
+            self.assertIsInstance(self._draft_method(p), ModelOptFp4LinearMethod, p)
+        for p in ("fc", "layers.0.mlp_conv.kernel_projection"):
+            self.assertIsInstance(self._draft_method(p), UnquantizedLinearMethod, p)
+
+    def test_draft_layer_on_a_w4a8_rank_runs_the_w4a8_kernel_without_reshape(self):
+        from sglang.srt.layers.quantization import nvfp4_marlin_inplace as mi
+
+        method = self._draft_method("layers.0.mlp.gate_up_proj")
+        layer, raw = _make_layer(method, 2, 256, 512)
+        calls = []
+
+        def spy(x, weight, scale, gscale, n):
+            calls.append((tuple(x.shape), weight is layer.weight, scale is layer.weight_scale))
+            return torch.zeros(x.shape[0], n, dtype=x.dtype)
+
+        with (
+            _fp4_state(),
+            mock.patch.object(torch.Tensor, "cuda", lambda self, *a, **kw: self),
+            mock.patch(
+                "sglang.srt.layers.quantization.modelopt_quant.is_blackwell_supported",
+                return_value=False,
+            ),
+        ):
+            fp4_utils.FP4_GEMM_RUNNER_BACKEND = Fp4GemmRunnerBackend.W4A8_INT8
+            fp4_utils.FP4_NATIVE_MIXED = True
+            fp4_utils.FP4_NATIVE_MIXED_SHARED_LAYOUT = True
+            method.process_weights_after_loading(layer)
+            nm.register_w4a8_kernel(spy, "spy")
+            out = method.apply(layer, torch.randn(8, 512, dtype=torch.bfloat16))
+        self.assertEqual(calls, [((8, 512), True, True)])
+        self.assertEqual(tuple(out.shape), (8, 512))
+        self.assertTrue(torch.equal(layer.weight_scale.view(torch.uint8), nm.swizzle_128x4(raw.view(torch.uint8))))
+        self.assertFalse(getattr(layer, mi.LAYER_FLAG, False))
+
+    def test_draft_and_target_resolve_the_same_backend_per_rank(self):
+        """One resolution per scheduler process; target and draft both read get_fp4_gemm_runner_backend()."""
+        with _fp4_state():
+            got = _resolve_rig("native-mixed", RIG, sm8x=None)
+        self.assertEqual([g[0] for g in got], [Fp4GemmRunnerBackend.FLASHINFER_CUTLASS,
+                                                Fp4GemmRunnerBackend.W4A8_INT8, Fp4GemmRunnerBackend.W4A8_INT8])
 
 
 class TestExchangeTileView(CustomTestCase):

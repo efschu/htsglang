@@ -513,23 +513,44 @@ class TestPlannerLanesL7(CustomTestCase):
     def test_native_mixed_scores_from_the_measured_record(self):
         from sglang.srt import uneven_perf as up
 
-        with mock.patch.dict(os.environ, {up.NVFP4_NATIVE_MIXED_ENV: "1"}):
+        env = {k: v for k, v in os.environ.items() if k != "SGLANG_FP4_NATIVE_MIXED_SM8X"}
+        env[up.NVFP4_NATIVE_MIXED_ENV] = "1"
+        with mock.patch.dict(os.environ, env, clear=True):
             scores, labels, warns = up.rank_gemm_scores(self.ENTRIES, "nvfp4_a4")
-        self.assertEqual(scores, [805.4, 55.4, 55.4])
+        # user order 25.09.: the 3080 ranks compute W4A8 (record wgbsqk, 62.7 TOPS at M=512)
+        self.assertEqual(scores, [805.4, 62.7, 62.7])
         self.assertIn("native", labels[0])
-        self.assertIn("Marlin", labels[1])
+        self.assertIn("W4A8", labels[1])
         self.assertTrue(all("zcx7pv" in l for l in labels))
         self.assertEqual(warns, [])
+
+    def test_marlin_opt_in_scores_the_marlin_lane(self):
+        from sglang.srt import uneven_perf as up
+
+        with mock.patch.dict(os.environ, {up.NVFP4_NATIVE_MIXED_ENV: "1", "SGLANG_FP4_NATIVE_MIXED_SM8X": "marlin"}):
+            scores, labels, _ = up.rank_gemm_scores(self.ENTRIES, "nvfp4_a4")
+        self.assertEqual(scores, [805.4, 55.4, 55.4])
+        self.assertIn("Marlin", labels[1])
 
     def test_profile_measurement_wins_over_the_record(self):
         from sglang.srt import uneven_perf as up
 
         entries = [dict(e) for e in self.ENTRIES]
-        entries[1] = dict(entries[1], gemm_lanes={"nvfp4_marlin": 57.0})
-        with mock.patch.dict(os.environ, {up.NVFP4_NATIVE_MIXED_ENV: "1"}):
+        entries[1] = dict(entries[1], gemm_lanes={"nvfp4_w4a8": 57.0})
+        env = {k: v for k, v in os.environ.items() if k != "SGLANG_FP4_NATIVE_MIXED_SM8X"}
+        env[up.NVFP4_NATIVE_MIXED_ENV] = "1"
+        with mock.patch.dict(os.environ, env, clear=True):
             scores, labels, _ = up.rank_gemm_scores(entries, "nvfp4_a4")
         self.assertEqual(scores[1], 57.0)
         self.assertNotIn("zcx7pv", labels[1])
+        # a profile-measured MARLIN rate does not displace the W4A8 lane the rank serves
+        entries[1] = dict(entries[1], gemm_lanes={"nvfp4_marlin": 57.0})
+        with mock.patch.dict(os.environ, env, clear=True):
+            scores, labels, _ = up.rank_gemm_scores(entries, "nvfp4_a4")
+        self.assertEqual(scores[1], 62.7)
+        with mock.patch.dict(os.environ, {up.NVFP4_NATIVE_MIXED_ENV: "1", "SGLANG_FP4_NATIVE_MIXED_SM8X": "marlin"}):
+            scores, labels, _ = up.rank_gemm_scores(entries, "nvfp4_a4")
+        self.assertEqual(scores[1], 57.0)
 
     def test_default_boot_is_the_pre_38_view(self):
         from sglang.srt import uneven_perf as up

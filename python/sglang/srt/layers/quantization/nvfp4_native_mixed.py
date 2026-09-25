@@ -13,16 +13,16 @@ Only the GEMM differs:
 * sm_12x (5090)   -> ``cutlass`` (W4A4 on the FP4 tensor cores, the path ``auto``
                      already takes there);
 * sm_10x          -> ``flashinfer_cutedsl`` (what ``auto`` takes there);
-* sm_8x  (3080)   -> ``marlin_native_inplace`` (default): Marlin W4A16, the
-                     measured best on sm_86 (decode 635 vs 233 GB/s; prefill
-                     W4A8-g16 74 TOPS barely beats W4A16 55 TF). Marlin wants
-                     its own layout, so the CONTENT of this rank's NVFP4
-                     parameters is permuted in place -- same byte counts, same
-                     Parameter objects and shapes -- and back to native around
-                     every flip (nvfp4_marlin_inplace.py). The exchange only
-                     ever sees native bytes.
-                  -> ``w4a8_int8`` with ``SGLANG_FP4_NATIVE_MIXED_SM8X=w4a8``:
-                     the registered W4A8 INT8 kernel (agent N4A's seam, kept).
+* sm_8x  (3080)   -> ``w4a8_int8`` (default; user order 25.09. ~17:33Z: "auf
+                     unseren 3080ern unser nvfp4 @ int8 kerne", main model AND
+                     draft): W4A8 on the INT8 tensor cores straight from the
+                     native bytes -- N4D's decode GEMV for M <= 48, N4A's tiled
+                     GEMM above (nvfp4_w4a8_int8.py). Nothing is reshaped at a
+                     flip. No kernel registered -> hard, named error.
+                  -> ``marlin_native_inplace`` only with
+                     ``SGLANG_FP4_NATIVE_MIXED_SM8X=marlin``: Marlin W4A16, its
+                     content permuted in place around every flip
+                     (nvfp4_marlin_inplace.py).
 * sm_12x small-M: ``nvfp4_sm12x_w4a16.maybe_apply_sm12x_w4a16`` (strand F,
   FlashInfer ``cute-dsl-native`` W4A16 on the same native bytes), called once in
   ModelOptFp4LinearMethod.apply; ``SGLANG_FP4_SM12X_W4A16_MAX_M`` (default off).
@@ -135,14 +135,14 @@ def resolve_rank_backend(
     capability: Tuple[int, int],
     *,
     w4a8_available: bool,
-    sm8x_choice: str = "marlin",
+    sm8x_choice: str = "w4a8",
     native_sm120_available: bool = True,
     sm12x_choice: str = "cutlass",
     flashinfer_fp4_available: bool = False,
 ) -> RankKernelChoice:
     """The per-arch table. Every branch keeps the SHARED native layout at the
-    exchange; the sm_8x Marlin rank does so by permuting its content in place
-    around each flip (nvfp4_marlin_inplace)."""
+    exchange. sm_8x defaults to W4A8 (reads the native bytes); the opt-in Marlin
+    rank keeps the layout by permuting its content in place around each flip."""
     major, minor = int(capability[0]), int(capability[1])
     cap = (major, minor)
     if major == 12:
@@ -175,7 +175,7 @@ def resolve_rank_backend(
             "flashinfer_cutedsl", cap, True, "sm_10x: native W4A4 (auto's choice there)"
         )
     if major == 8:
-        choice = str(sm8x_choice or "marlin").strip().lower()
+        choice = str(sm8x_choice or "w4a8").strip().lower()
         if choice == "w4a8":
             if not w4a8_available:
                 raise NativeMixedUnsupported(

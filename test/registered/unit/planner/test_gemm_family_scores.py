@@ -490,11 +490,12 @@ class TestProfileShapeUntouched(CustomTestCase):
                 self.assertIn(lane, uneven_perf._LANE_LABELS)
 
     def test_nvfp4_lane_order_mirrors_the_serving_dispatch(self):
-        """``initialize_fp4_gemm_config`` resolves a native backend first and
-        Marlin on sm_80..sm_89; a W4A16 checkpoint never reaches native."""
+        """``initialize_fp4_gemm_config`` resolves a native backend first, W4A8 on sm_80..sm_89 under
+        native-mixed (the lane exists only in the native-mixed record), Marlin otherwise; a W4A16
+        checkpoint never reaches native."""
         self.assertEqual(
             uneven_perf._FORMAT_LANES["nvfp4_a4"],
-            (uneven_perf.LANE_NVFP4_NATIVE, uneven_perf.LANE_NVFP4_MARLIN),
+            (uneven_perf.LANE_NVFP4_NATIVE, uneven_perf.LANE_NVFP4_W4A8, uneven_perf.LANE_NVFP4_MARLIN),
         )
         self.assertEqual(
             uneven_perf._FORMAT_LANES["nvfp4_a16"],

@@ -361,3 +361,16 @@ def test_decode_k_shard_tile_view_and_parity_with_n4a():
         # same arithmetic, different FP32 accumulation order -> within a few bf16 ulp
         d = (y.float() - y2.float()).abs().max() / y2.float().abs().max()
         assert float(d) < 2e-2, (m, float(d))
+
+
+def test_prebuild_names_the_modules_load_jit_builds():
+    """The image pre-build (prebuild_nvfp4_w4a8) must name exactly the modules the serving path loads, or the
+    first boot compiles after all."""
+    import inspect
+
+    from sglang.jit_kernel import nvfp4_w4a8, nvfp4_w4a8_decode, prebuild_nvfp4_w4a8
+
+    names = [n for n, _ in prebuild_nvfp4_w4a8._modules()]
+    assert names == ["nvfp4_w4a8_decode_sm86", "nvfp4_w4a8_sm86"]
+    for name, mod in zip(names, (nvfp4_w4a8_decode, nvfp4_w4a8)):
+        assert f'load_jit(\n        "{name}",' in inspect.getsource(mod)

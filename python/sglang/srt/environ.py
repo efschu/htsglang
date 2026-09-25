@@ -1495,10 +1495,11 @@ class Envs:
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
     # --fp4-gemm-backend native-mixed (Backlog #38): the kernel of an sm_8x rank.
-    # "marlin" (default): Marlin W4A16 on the SHARED native layout, content
-    # permuted in place at every flip (nvfp4_marlin_inplace.py). "w4a8": the
-    # registered W4A8 INT8 kernel (nvfp4_native_mixed.register_w4a8_kernel).
-    SGLANG_FP4_NATIVE_MIXED_SM8X = EnvStr("marlin")
+    # "w4a8" (default, user order 25.09.): the registered W4A8 INT8 kernel on the
+    # native bytes (N4D decode GEMV M<=48, N4A GEMM above; main model and draft).
+    # "marlin" (opt-in): Marlin W4A16 on the SHARED native layout, content
+    # permuted in place at every flip (nvfp4_marlin_inplace.py).
+    SGLANG_FP4_NATIVE_MIXED_SM8X = EnvStr("w4a8")
     SGLANG_FP4_NATIVE_MIXED_SM12X = EnvStr("flashinfer_cutlass")
     # Opt-in BIT-DETERMINISM for fp8 linears on sm80..sm88 (#192, from #190).
     #

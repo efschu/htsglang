@@ -492,3 +492,24 @@ Rohdaten `/spinning/evidence-665-f1/n4d_decode_0925/` (q*.json Bench, s1/s2.json
     Stagger je CTA möglich) oder Aktivierung im Shared Memory.
   - P.down (K=17408) liegt 6–28 % hinter Marlin.
   - Die Voll-Pfad-Messung mit den Regel-Konfigurationen fehlt noch (Fenster nach der Abnahme).
+
+## 15. RC9 (Nutzer-Order 25.09. ~17:33Z): sm_8x immer W4A8, sm_12x immer W4A4, Hauptmodell und Draft
+
+Wortlaut: „es muss für ein nvfp4 checkpoint auf der 5090 immer nativ nvfp4 genutzt werden und auf unseren 3080ern
+unser nvfp4 @ int8 kerne. sowohl für hauptmodell als auch für draft.“
+
+- **Auswahl je Rang** (`resolve_rank_backend`, Env `SGLANG_FP4_NATIVE_MIXED_SM8X`):
+  - Der Default für sm_8x ist jetzt `w4a8`: N4D-Decode-GEMV für M ≤ 48, darüber N4As GEMM.
+  - Fehlt der Kern, ist das ein harter, benannter Fehler. Einen stillen Rückfall auf Marlin gibt es nicht.
+  - `marlin_native_inplace` gibt es nur noch mit `SGLANG_FP4_NATIVE_MIXED_SM8X=marlin`.
+- **Flip:** Ein W4A8-Rang lädt ohne `prepare_layer`. Kein Layer trägt das Marlin-Flag, also tun die Hooks
+  `_weg2_nvfp4_marlin_to_native` und `_after_wake` nichts. Beleg: Test `TestW4A8RankHasNoFlipReshape`.
+- **Draft (DFlash2-NVFP4-RTNcal):**
+  - Die Config ist modelopt NVFP4 g16, also `ModelOptFp4Config`. Die Linears bekommen dieselbe
+    `ModelOptFp4LinearMethod` wie das Target-MLP.
+  - Das Backend ist prozessweit und wird einmal je Scheduler aufgelöst. Einen Draft-Sonderweg gibt es nicht.
+  - Beleg: `TestNvfp4DraftTakesTheSameBackend`.
+- **Planer:** neue Lane `nvfp4_w4a8`. Record: 3080 W4A8 62,7 TOPS bei M=512, gemessen im Fenster wgbsqk bei 230 W.
+  Die Lane greift nur in native-mixed-Boots und fällt bei `SM8X=marlin` weg.
+- **Image-Vorbau:** `python -m sglang.jit_kernel.prebuild_nvfp4_w4a8 --arch 8.6` baut beide tvm-ffi-Module ohne
+  GPU und ohne libcuda. Geprüft mit maskierter libcuda.so.1: .so und Provenienz liegen danach vor.
