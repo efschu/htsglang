@@ -738,6 +738,12 @@ class AnthropicServing:
                 anthropic_request.chat_template_kwargs
             )
 
+        # RC7 (Review V (4a)): the caller's request id reaches the pipeline, as
+        # on /v1/chat/completions. Set only when present -- an ordinary client
+        # sends none and the server picks the id exactly as before.
+        if anthropic_request.rid is not None:
+            request_data["rid"] = anthropic_request.rid
+
         # Enable usage in stream so we can report it
         if anthropic_request.stream:
             request_data["stream_options"] = StreamOptions(
