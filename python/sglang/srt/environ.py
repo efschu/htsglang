@@ -2420,6 +2420,14 @@ class Envs:
     # bytes, so the streamed bytes are identical either way. Set to False to
     # restore the pre-#391 accumulation.
     SGLANG_GGUF_STREAM_DROP_CACHE = EnvBool(True)
+    # numpy madvise(MADV_HUGEPAGE)s every array >= 4 MiB. Under the host's THP
+    # defrag=madvise each first-touch fault of such an array compacts memory
+    # synchronously; behind group P's pinned arena that cost group D's GGUF
+    # load 670 s of kernel time per rank (weg2rc7gg, 2026-09-25). False
+    # (default): the hint is off for the GGUF weight stream and numpy's own
+    # setting is restored afterwards (model_loader/gguf_numpy_hugepage.py).
+    # True: numpy keeps its setting during the load (pre-fix behaviour).
+    SGLANG_GGUF_NUMPY_HUGEPAGE = EnvBool(False)
     # Synchronous cgroup reclaim during the GGUF stream, in GiB of
     # memory.current. 0 (default) = off, behaviour byte-identical to before.
     # The dropper only releases page cache BEHIND the consumer while the
