@@ -105,6 +105,9 @@ class Fp4GemmRunnerBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     MARLIN = "marlin"
+    # Never a CLI value: only `native-mixed` resolves to it, on an sm_8x rank
+    # with the W4A8 INT8 kernel registered (nvfp4_native_mixed.py).
+    W4A8_INT8 = "w4a8_int8"
 
     def is_auto(self) -> bool:
         return self == Fp4GemmRunnerBackend.AUTO
@@ -126,6 +129,9 @@ class Fp4GemmRunnerBackend(Enum):
 
     def is_marlin(self) -> bool:
         return self == Fp4GemmRunnerBackend.MARLIN
+
+    def is_w4a8_int8(self) -> bool:
+        return self == Fp4GemmRunnerBackend.W4A8_INT8
 
     def is_flashinfer(self) -> bool:
         return self.value.startswith("flashinfer_")
@@ -149,6 +155,22 @@ class Fp4GemmRunnerBackend(Enum):
 
 
 FP4_GEMM_RUNNER_BACKEND: Fp4GemmRunnerBackend | None = None
+
+#: True only under ``--fp4-gemm-backend native-mixed``: every rank keeps the
+#: native NVFP4 layout (docs/NVFP4_NATIVE_LAYOUT_CONTRACT.md); the resolved
+#: per-rank kernel is in FP4_GEMM_RUNNER_BACKEND as usual.
+FP4_NATIVE_MIXED: bool = False
+FP4_NATIVE_MIXED_SHARED_LAYOUT: bool = True
+
+
+def is_fp4_native_mixed() -> bool:
+    return FP4_NATIVE_MIXED
+
+
+def is_fp4_native_mixed_shared_layout() -> bool:
+    """native-mixed AND this rank keeps the shared native layout (False only on
+    the explicit Marlin escape)."""
+    return FP4_NATIVE_MIXED and FP4_NATIVE_MIXED_SHARED_LAYOUT
 
 
 def has_fork_nvfp4_cutlass_kernel() -> bool:
@@ -189,9 +211,22 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
     Called once per scheduler process, i.e. once per rank, so a mixed-arch rig
     resolves a different backend per rank without any extra code.
     """
-    global FP4_GEMM_RUNNER_BACKEND
+    global FP4_GEMM_RUNNER_BACKEND, FP4_NATIVE_MIXED, FP4_NATIVE_MIXED_SHARED_LAYOUT
 
     backend = server_args.fp4_gemm_runner_backend
+    FP4_NATIVE_MIXED = False
+    FP4_NATIVE_MIXED_SHARED_LAYOUT = True
+    if backend == "native-mixed":
+        # Backlog #38: gated branch, the default path below is untouched.
+        from sglang.srt.layers.quantization.nvfp4_native_mixed import (
+            resolve_this_rank,
+        )
+
+        choice = resolve_this_rank()
+        FP4_NATIVE_MIXED = True
+        FP4_NATIVE_MIXED_SHARED_LAYOUT = choice.shared_layout
+        FP4_GEMM_RUNNER_BACKEND = Fp4GemmRunnerBackend(choice.backend)
+        return
     if backend == "auto":
         if is_sm100_supported():
             backend = "flashinfer_cutedsl"

@@ -34,6 +34,8 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp4_utils import (
     fp4_quantize,
     get_fp4_gemm_runner_backend,
+    is_fp4_native_mixed,
+    is_fp4_native_mixed_shared_layout,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
@@ -1686,6 +1688,26 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         # Store original output size before any padding
         layer.output_size_per_partition = layer.weight.shape[0]
 
+        native_mixed = is_fp4_native_mixed()
+        if native_mixed and is_fp4_native_mixed_shared_layout():
+            # Backlog #38 (docs/NVFP4_NATIVE_LAYOUT_CONTRACT.md): one layout on
+            # every rank. Refuse a shard the native path would pad, and carry
+            # the W4A8 kernel's global weight scale on EVERY rank so all ranks
+            # hold the same parameter set (the exchange joins them by name).
+            from sglang.srt.layers.quantization.nvfp4_native_mixed import (
+                check_shard_alignment,
+            )
+
+            check_shard_alignment(
+                getattr(layer, "prefix", "") or type(layer).__name__,
+                int(layer.weight.shape[0]),
+                int(layer.input_size_per_partition),
+                components=tuple(getattr(layer, "logical_widths", ()) or ())
+                if len(getattr(layer, "logical_widths", ()) or ()) > 1
+                else (),
+            )
+            copy_or_rebind_param(layer, "weight_global_scale", weight_scale_2)
+
         if get_fp4_gemm_runner_backend().is_marlin():
             if self.quant_config.group_size != 16:
                 raise ValueError(
@@ -1712,7 +1734,10 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer.weights_padding_cols = 0
             return
 
-        if not is_blackwell_supported():
+        if (
+            not get_fp4_gemm_runner_backend().is_w4a8_int8()
+            and not is_blackwell_supported()
+        ):
             raise ValueError(
                 "ModelOpt NVFP4 native dense GEMM backends require SM100+. "
                 "Use --fp4-gemm-backend marlin on SM80-SM90."
@@ -1810,6 +1835,12 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         alias_or_bind_derived_param(
             layer, "weight_scale", "weight_scale_interleaved", padded_scales
         )
+        if native_mixed:
+            from sglang.srt.layers.quantization.nvfp4_native_mixed import (
+                mark_swizzled,
+            )
+
+            mark_swizzled(layer.weight_scale_interleaved)
 
         if getattr(layer, "_interleave_for_swiglu_fusion", False):
             from sglang.srt.layers.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
@@ -1874,6 +1905,10 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
+        if get_fp4_gemm_runner_backend().is_w4a8_int8():
+            from sglang.srt.layers.quantization.nvfp4_native_mixed import apply_w4a8
+
+            return apply_w4a8(layer, x, bias)
 
         # `_accepts_prequantized_fp4` is the explicit opt-in so an accidental
         # tuple from unrelated code can't silently bypass quantization.
