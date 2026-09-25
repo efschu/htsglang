@@ -1032,15 +1032,39 @@ def resolve_margin(
 
 
 def watermark_provenance(margin: Optional[Margin] = None,
-                         watermark_gib: Optional[float] = None) -> str:
-    """`WEG2-HOST WATERMARK=<v> source=<events> margin=<v> (terms)`."""
+                         watermark_gib: Optional[float] = None, *,
+                         refuse_unreadable: bool = False) -> str:
+    """`WEG2-HOST WATERMARK=<v> source=<events> margin=<v> (terms)`.
+
+    RC7 (Docker host acceptance 2026-09-25 07:21Z): with ``-v /sys:/sys`` the
+    container read the HOST's root cgroup, which has ``memory.stat`` but no
+    ``memory.current``; ``read_cgroup_pressure`` then took its sum FALLBACK
+    (``nonreclaim_gib`` set, ``current_gib`` None) and this line died formatting
+    ``None:.2f`` -- a TypeError where the ledger owed a named refusal. A missing
+    ``memory.current`` is never formatted: the ledger (``choose``,
+    ``refuse_unreadable=True``) REFUSES by name -- its currency is that file --
+    and every other caller (the front's periodic line) prints that it is
+    unreadable.
+    """
     m = margin if margin is not None else resolve_margin()
     w = watermark_gib if watermark_gib is not None else OBSERVED_REAP_NONRECLAIM_BYTES / GIB
     events = ", ".join(f"{k} {v:.2f}" for k, v in sorted(REAP_SAMPLES_GIB.items()))
     excl = ", ".join(f"{k} {v:.2f} EXCLUDED ({why})"
                      for k, (v, why) in sorted(REAP_SAMPLE_EXCLUDED.items()))
     live = read_cgroup_pressure()
-    if live.get("nonreclaim_gib") is not None:
+    if live.get("current_gib") is None:
+        if refuse_unreadable:
+            raise Weg2HostLedgerRefused(
+                "W20 Weg2HostLedgerRefused: memory.current is unreadable under "
+                "/sys/fs/cgroup -- the ledger prices in that file's currency (the "
+                "reaper acts on it) and refuses to price without it rather than "
+                f"guess from memory.stat [{live.get('source')}]. In a container, "
+                "mount the process's own cgroup (not the host's /sys) or run "
+                "where /sys/fs/cgroup/memory.current exists."
+            )
+        cur = (f" LIVE memory.current unreadable [{live.get('source')}] -- no "
+               f"live reading formatted")
+    elif live.get("nonreclaim_gib") is not None and live.get("file_reclaimable_gib") is not None:
         cur = (
             f" LIVE nonreclaim={live['nonreclaim_gib']:.2f} "
             f"raw_current={live['current_gib']:.2f} "
@@ -5581,7 +5605,7 @@ def choose(
             f"if it were measured (got prior_cushion_min_gib={prior_cushion_min_gib!r} "
             f"prior_bounce_gib={prior_bounce_gib!r})."
         )
-    lines.append(watermark_provenance(margin, watermark_gib))
+    lines.append(watermark_provenance(margin, watermark_gib, refuse_unreadable=True))
     chosen: Optional[Arm] = None
     peak_bound_any = False
     # #1236: the STORE TERM IS GONE FROM THIS LOOP.  Train fix 3 sized it here
