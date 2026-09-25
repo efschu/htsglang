@@ -419,6 +419,16 @@ class Envs:
     # reads the incoming layout's OWN image file, and under one rotating
     # image there is no such file to read ahead of.
     SGLANG_PHASE_FLIP_IMAGE_PIN_INCOMING = EnvBool(False)
+    # The OS reserve every pinned-host admission keeps free (pinned_host_budget.py
+    # PINNED_HOST_RESERVE_BYTES), in GiB. The default 10 is the historical constant,
+    # so a native boot is byte-identical. A container under a cgroup cap lowers it:
+    # there the cap, oom_score_adj and the cap+4 <= MemAvailable invariant already
+    # protect the host, and 10 GiB INSIDE the cgroup is the same protection twice.
+    # Measured NF host acceptance 25.09. (cap 82g): available = 82 - 73.9 = 8.73 GB
+    # minus 10.74 GB reserve = 0 usable, so the lazily registered hand-back read
+    # buffers (0.54 GB) were refused -> W53 Weg2StoreHandbackFailed -> 413 on the
+    # 148k needle. Same name on the 27B line (RC7b).
+    SGLANG_PINNED_HOST_RESERVE_GIB = EnvFloat(10.0)
     # #1159: how long the #1033c post-cutover forward warmup may stay OPEN
     # before the scheduler says so in ONE named line. It is a REPORTING bound,
     # not a stop: the group stop for a one-sided cutover belongs to #1158

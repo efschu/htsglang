@@ -51,12 +51,16 @@ import threading
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 # Host RAM left free for the OS and every non-pool consumer. Pinned memory is
 # non-swappable and this box has no swap at all, so the reserve is the only
 # thing standing between a tight configuration and the OOM killer.
-PINNED_HOST_RESERVE_BYTES: int = 10 * (1024**3)
+# SGLANG_PINNED_HOST_RESERVE_GIB (default 10 = the historical constant) lets a
+# container whose cgroup cap already guards the host lower it -- see environ.py.
+PINNED_HOST_RESERVE_BYTES: int = int(envs.SGLANG_PINNED_HOST_RESERVE_GIB.get() * (1024**3))
 
 
 @dataclass(frozen=True)
