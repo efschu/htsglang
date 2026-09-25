@@ -466,6 +466,14 @@ class AnthropicMessagesRequest(BaseModel):
     #: Anthropic's typed ``thinking`` field stays authoritative over the
     #: toggle itself.
     chat_template_kwargs: Optional[dict[str, Any]] = None
+    #: RC7 (Review V (4a), 27B release): the request id, passed through to the
+    #: chat request like the OpenAI front's own ``rid`` (ChatCompletionRequest
+    #: carries it). DECLARED for the same reason as ``chat_template_kwargs``:
+    #: undeclared, pydantic's ``extra="ignore"`` drops it silently -- and the
+    #: Weg-2 front keys the P->D hand-off (#1442), P's end-anchor trim and
+    #: /abort_request on the rid it sets. On /v1/messages all three missed.
+    #: Absent (every ordinary client) = None = the server picks the id, as before.
+    rid: Optional[str] = None
 
     @field_validator("model")
     @classmethod

@@ -163,7 +163,7 @@ class RdSampleArithmetic(CustomTestCase):
         self.assertNotIn("_unc / _w", src, "the whole-wall r_D is back")
         self.assertIn("r_d_probe(_unc, _ps, x_rd_min_uncached())", src)
         # both wire shapes sample
-        self.assertEqual(src.count("_sample_r_d(pt, ct, comp, verdict, dterms)"), 2)
+        self.assertEqual(src.count("_sample_r_d(pt, ct, verdict, dterms)"), 2)
 
 
 class PrefillClockDSide(CustomTestCase):
@@ -188,32 +188,56 @@ class PrefillClockDSide(CustomTestCase):
     def test_the_clock_is_prefill_finished_minus_forward_entry(self):
         prefill_clock.note_prefill_finished(self._req("r1", 100.0, 103.9), self.D)
         snap = prefill_clock.snapshot()
-        self.assertAlmostEqual(snap["r1"]["s"], 3.9)
-        self.assertEqual((snap["r1"]["prompt"], snap["r1"]["cached"]), (8200, 200))
+        rec = snap["recent"][-1]
+        self.assertAlmostEqual(rec["s"], 3.9)
+        self.assertEqual((rec["rid"], rec["prompt"], rec["cached"], rec["seq"]), ("r1", 8200, 200, 1))
+        self.assertEqual((snap["boot"], snap["seq"]), (prefill_clock.BOOT, 1))
 
-    def test_nothing_off_the_d_group_or_without_both_stamps(self):
+    def test_nothing_off_the_d_group_unstamped_takes_a_seq_only(self):
         prefill_clock.note_prefill_finished(self._req("p", 1.0, 2.0),
                                             types.SimpleNamespace(tp_prefill_max_tokens=0))
+        self.assertEqual(prefill_clock.snapshot()["seq"], 0, "not a Weg-2 D: nothing at all")
         prefill_clock.note_prefill_finished(self._req("u", 0.0, 2.0), self.D)
         prefill_clock.note_prefill_finished(self._req("i", 5.0, 2.0), self.D)
-        self.assertEqual(prefill_clock.snapshot(), {})
+        snap = prefill_clock.snapshot()
+        self.assertEqual((snap["seq"], snap["recent"]), (2, []),
+                         "a prefill without both stamps is visible as a seq, never as a value")
 
     def test_the_ring_is_bounded(self):
         for i in range(prefill_clock.RING_MAX + 7):
             prefill_clock.note_prefill_finished(self._req(f"r{i}", 1.0, 2.0), self.D)
         snap = prefill_clock.snapshot()
-        self.assertEqual(len(snap), prefill_clock.RING_MAX)
-        self.assertNotIn("r0", snap)
+        self.assertEqual(len(snap["recent"]), prefill_clock.RING_MAX)
+        self.assertEqual(snap["seq"], prefill_clock.RING_MAX + 7)
+        self.assertNotIn("r0", [r["rid"] for r in snap["recent"]])
 
-    def test_lookup_by_rid_then_by_shape(self):
-        blk = {"a": {"s": 1.0, "prompt": 8200, "cached": 200},
-               "d-own": {"s": 2.0, "prompt": 9000, "cached": 0}}
-        self.assertEqual(prefill_clock.lookup(blk, "a", 1, 1), 1.0)
-        # /v1/messages: D ran it under its own rid -- matched by its usage
-        self.assertEqual(prefill_clock.lookup(blk, "weg2-3-9", 9000, 0), 2.0)
-        self.assertIsNone(prefill_clock.lookup(blk, "weg2-3-9", 9000, 1))
-        self.assertIsNone(prefill_clock.lookup({}, "a", 8200, 200))
-        self.assertIsNone(prefill_clock.lookup(None, "a", 8200, 200))
+    def test_attribution_needs_a_record_newer_than_the_mark(self):
+        """The NF line's H85 rule (Operator 25.09.: the shape fallback may hit an
+        OLD record of the same shape): newer than the leg's entry mark AND (its
+        rid OR the only new prefill) AND D's prompt - cached == the leg's
+        uncached; else no sample, the reason in d_prefill_attr."""
+        B = "b"
+
+        def blk(seq, *recs):
+            return {"boot": B, "seq": seq, "recent": [
+                {"seq": q, "rid": r, "s": s, "prompt": p, "cached": c} for q, r, s, p, c in recs]}
+
+        att = prefill_clock.attribute
+        old_same_shape = (1, "old", 9.0, 8200, 200)
+        mine = (2, "weg2-3-9", 2.0, 8200, 200)
+        d_own = (2, "d-own", 2.0, 8200, 200)
+        self.assertEqual(att(blk(2, old_same_shape, mine), "weg2-3-9", 8000, (B, 1)), (2.0, "rid"))
+        self.assertEqual(att(blk(2, old_same_shape, d_own), "weg2-3-9", 8000, (B, 1)),
+                         (2.0, "sole_new"), "/v1/messages before the rid fix")
+        self.assertEqual(att(blk(1, old_same_shape), "weg2-3-9", 8000, (B, 1)), (None, "absent"),
+                         "an OLD record of the same shape is never this leg's")
+        self.assertEqual(att(blk(2, old_same_shape, mine), "weg2-3-9", 8000, None),
+                         (None, "no_mark"), "the first leg of a boot has no mark")
+        self.assertEqual(att(blk(3, old_same_shape, d_own, (3, "hc", 0.1, 5, 0)), "weg2-3-9", 8000,
+                             (B, 1)), (None, "ambiguous(new=2)"))
+        self.assertEqual(att(blk(2, mine), "weg2-3-9", 7999, (B, 1))[0], None, "extent mismatch")
+        self.assertEqual(att(blk(2, mine), "weg2-3-9", 8000, ("other-boot", 1)),
+                         (None, "d_restarted"))
 
     def test_writer_sites_in_the_scheduler(self):
         from sglang.srt.managers import scheduler as sched_mod
@@ -247,11 +271,15 @@ class PrefillClockDSide(CustomTestCase):
 
         me = types.SimpleNamespace(session=types.SimpleNamespace(get=lambda url: _R()))
         g = types.SimpleNamespace(url="http://d")
+        mark = (prefill_clock.BOOT, 0)
         out = asyncio.run(Front._draft_terms(me, g, {"sglext": {"weg2_prefill_s": 1.25}},
-                                             rid="weg2-1-1", pt=8200, ct=200))
-        self.assertEqual((out["prefill_s"], out["prefill_src"]), (1.25, "body"))
-        out = asyncio.run(Front._draft_terms(me, g, {"usage": {}}, rid="weg2-1-1", pt=8200, ct=200))
-        self.assertEqual((out["prefill_s"], out["prefill_src"]), (2.5, "server_info"))
+                                             rid="weg2-1-1", uncached=8000, mark=mark))
+        self.assertEqual((out["prefill_s"], out["prefill_src"], out["prefill_attr"]),
+                         (1.25, "body", "body"))
+        out = asyncio.run(Front._draft_terms(me, g, {"usage": {}}, rid="weg2-1-1",
+                                             uncached=8000, mark=mark))
+        self.assertEqual((out["prefill_s"], out["prefill_src"], out["prefill_attr"]),
+                         (2.5, "server_info", "rid"))
 
     def test_the_front_reads_what_d_publishes(self):
         """Writer (snapshot) -> the internal_states[0] body -> reader (_draft_terms)."""
@@ -272,10 +300,14 @@ class PrefillClockDSide(CustomTestCase):
 
         me = types.SimpleNamespace(session=types.SimpleNamespace(get=lambda url: _R()))
         g = types.SimpleNamespace(url="http://d")
-        out = asyncio.run(Front._draft_terms(me, g, None, rid="weg2-1-1", pt=8200, ct=200))
+        out = asyncio.run(Front._draft_terms(me, g, None, rid="weg2-1-1", uncached=8000,
+                                             mark=(prefill_clock.BOOT, 0)))
         self.assertAlmostEqual(out["prefill_s"], 2.5)
-        out2 = asyncio.run(Front._draft_terms(me, g, None, rid="other", pt=1, ct=0))
-        self.assertIsNone(out2["prefill_s"])
+        self.assertEqual(me._d_prefill_mark, (prefill_clock.BOOT, 1), "every read moves the mark")
+        out2 = asyncio.run(Front._draft_terms(me, g, None, rid="weg2-1-1", uncached=8000,
+                                              mark=me._d_prefill_mark))
+        self.assertEqual((out2["prefill_s"], out2["prefill_attr"]), (None, "absent"),
+                         "the same record read again is not newer than the mark")
 
 
 # --------------------------------------------------------------------------
@@ -287,17 +319,22 @@ class PrefillClockDSide(CustomTestCase):
 class FakeD:
     PROMPT, CACHED, COMP = 8200, 200, 300
 
+    BOOT = "fake-d-boot"
+
     def __init__(self, *, prefill_s=0.2, wall_s=0.6, publish="rid"):
         self.prefill_s, self.wall_s, self.publish = prefill_s, wall_s, publish
-        self.block = {}
+        self.seq = 0
+        self.recent = []
         self.server = None
         self.url = ""
 
     async def _chat(self, request):
         body = await request.json()
         key = body.get("rid") if self.publish == "rid" else "d-own-rid"
+        self.seq += 1  # every finished prefill takes a seq (prefill_clock)
         if self.publish not in ("none", "body"):
-            self.block[key] = {"s": self.prefill_s, "prompt": self.PROMPT, "cached": self.CACHED}
+            self.recent.append({"seq": self.seq, "rid": key, "s": self.prefill_s,
+                                "prompt": self.PROMPT, "cached": self.CACHED})
         await asyncio.sleep(self.wall_s)  # prefill AND the decode of COMP tokens
         usage = {"prompt_tokens": self.PROMPT, "completion_tokens": self.COMP,
                  "prompt_tokens_details": {"cached_tokens": self.CACHED}}
@@ -316,8 +353,8 @@ class FakeD:
         return web.json_response(out)
 
     async def _info(self, request):
-        return web.json_response(
-            {"internal_states": [{prefill_clock.INTERNAL_STATE_KEY: dict(self.block)}]})
+        return web.json_response({"internal_states": [{prefill_clock.INTERNAL_STATE_KEY: {
+            "boot": self.BOOT, "seq": self.seq, "recent": list(self.recent)}}]})
 
     async def start(self):
         app = web.Application()
@@ -328,7 +365,7 @@ class FakeD:
         self.url = str(self.server.make_url("")).rstrip("/")
 
 
-async def _probe(stream, publish="rid", n=1, busy=False, prompt=None, cached=None):
+async def _probe(stream, publish="rid", n=1, busy=False, prompt=None, cached=None, mark=True):
     d = FakeD(publish=publish)
     if prompt is not None:
         d.PROMPT, d.CACHED = prompt, cached
@@ -338,6 +375,8 @@ async def _probe(stream, publish="rid", n=1, busy=False, prompt=None, cached=Non
         prefill_sid=0, decode_sid=0, dc_reserve={}, w_s=45.0,
         tp_prefill_max_tokens=X_IDLE, x_ceiling_tokens=CEIL, d_admit_max_tokens=0)
     f.session = ClientSession(timeout=ClientTimeout(total=30))
+    if mark:  # a previous /get_server_info read of this D (not the boot's first leg)
+        f._d_prefill_mark = (FakeD.BOOT, d.seq)
     if busy:  # D decodes another request (Review V (3))
         f.groups["D"].outstanding["decoding-other"] = time.time()
     app = web.Application()
@@ -369,7 +408,7 @@ class TheProbeEndToEnd(CustomTestCase):
                          "r_D must be uncached / D's prefill clock (0.2 s)")
         self.assertNotAlmostEqual(f._x_samples["r_d"][0], self.UNC / 0.6, delta=1000,
                                   msg="the leg wall (prefill + decode) is the weg2rc4 defect")
-        self.assertEqual(f.counters["r_d_sampled"], 1)
+        self.assertEqual(f.counters["r_d_sampled_server_info"] + f.counters["r_d_sampled_body"], 1)
         self.assertTrue(f._x_r_d_src.startswith("d_prefill_s verdict="), f._x_r_d_src)
 
     def test_non_streamed_leg_samples_the_prefill_clock(self):
@@ -382,8 +421,17 @@ class TheProbeEndToEnd(CustomTestCase):
     def test_the_nf_body_carrier_alone_suffices(self):
         self._check_sampled(*asyncio.run(_probe(stream=False, publish="body")))
 
-    def test_messages_shape_matches_by_usage_when_d_dropped_the_rid(self):
-        self._check_sampled(*asyncio.run(_probe(stream=False, publish="shape")))
+    def test_d_own_rid_is_attributed_as_the_sole_new_prefill(self):
+        f, res = asyncio.run(_probe(stream=False, publish="shape"))
+        self._check_sampled(f, res)
+        self.assertEqual(f.counters["r_d_sampled_server_info"], 1)
+
+    def test_the_first_leg_of_a_boot_has_no_mark_and_no_sample(self):
+        f, res = asyncio.run(_probe(stream=True, mark=False))
+        self.assertTrue(all(s == 200 for s, _ in res), res)
+        self.assertEqual(len(f._x_samples["r_d"]), 0)
+        self.assertEqual(f.counters["r_d_skipped_no_prefill_time"], 1)
+        self.assertEqual(f._d_prefill_mark, (FakeD.BOOT, 1), "its read sets the mark")
 
     def test_no_clock_means_no_sample_never_the_wall(self):
         f, res = asyncio.run(_probe(stream=False, publish="none"))

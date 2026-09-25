@@ -913,8 +913,15 @@ def usage_of(body: Any) -> Tuple[int, int, int, bool]:
         # body reads as UNPRICED and `leg2` refuses a healthy 200 by W28 --
         # i.e. forwarding the path without teaching the pricer would turn the
         # front's 404 into a 503, which is not an improvement.
-        pt = int(u.get("input_tokens", 0) or 0)
+        #
+        # RC7 (Review V (4b)): `input_tokens` is NOT the prompt. The adapter
+        # reports prompt - cached there (anthropic/serving.py
+        # `_anthropic_input_tokens`) and the cached part in
+        # `cache_read_input_tokens`, as the Anthropic API does. The prompt is
+        # their sum; reading `input_tokens` alone priced uncached as
+        # prompt - 2*cached and fed `_note_exact` a wrong tokenisation.
         ct = int(u.get("cache_read_input_tokens", 0) or 0)
+        pt = int(u.get("input_tokens", 0) or 0) + ct
         return pt, ct, int(u.get("output_tokens", 0) or 0), True
     if not isinstance(u, dict) or "prompt_tokens" not in u:
         return 0, 0, 0, False
@@ -1020,8 +1027,17 @@ class AnthropicStreamUsage:
                 self.output_tokens = max(
                     self.output_tokens, int(u.get("output_tokens", 0) or 0)
                 )
-                if not self.input_tokens:
+                # RC7 (Review V (4b)): the closing message_delta CORRECTS the
+                # totals (anthropic/serving.py ships message_start before usage
+                # is known, with input 0 and no cache field) -- the last value
+                # seen wins, for the input AND the cached count. The cached
+                # count used to be read off message_start only, i.e. always 0:
+                # every streamed /v1/messages leg recorded "D holds nothing of
+                # this text" into the span LRU.
+                if "input_tokens" in u or not self.input_tokens:
                     self.input_tokens = int(u.get("input_tokens", 0) or 0)
+                if "cache_read_input_tokens" in u:
+                    self.cached_tokens = int(u.get("cache_read_input_tokens", 0) or 0)
         elif kind == "message_stop":
             self.saw_stop = True
 
@@ -1034,8 +1050,12 @@ class AnthropicStreamUsage:
         refusing to price it would re-introduce the W28 fail-closed this class
         exists to prevent.
         """
-        if self.saw_start and self.input_tokens > 0:
-            return self.input_tokens, self.cached_tokens, self.output_tokens, True
+        # RC7 (Review V (4b)): the prompt is input + cache_read (the adapter's
+        # input_tokens is prompt - cached). Priced when a prompt was seen at
+        # all -- a fully cached prompt (input 0, cache_read N) is priced too.
+        prompt = self.input_tokens + self.cached_tokens
+        if self.saw_start and prompt > 0:
+            return prompt, self.cached_tokens, self.output_tokens, True
         return 0, 0, 0, False
 
 
@@ -2312,6 +2332,11 @@ class Front:
         #: Review V (3): rid -> (X applied, D busy) of each SHORT grant, popped
         #: by that rid's leg 2, which prices the REALISED extent against it.
         self._x_grants: Dict[str, Tuple[int, bool]] = {}
+        #: RC7 (the NF line's H85 attribution, same name): the (boot, seq) head
+        #: of D's prefill clock at the front's last /get_server_info read. A
+        #: leg 2 snapshots it at entry; a server_info record counts for that
+        #: leg only when it is newer (weg2/prefill_clock.attribute).
+        self._d_prefill_mark: Optional[Tuple[str, int]] = None
         # C7/R-5: the SAME break-even quantity at aggregate granularity --
         # the D->P departure latch.  Defaults to X because it IS X.
         self.flip_min_work_tokens = (
@@ -4088,8 +4113,10 @@ class Front:
         # Review V (3): the X this rid's SHORT grant was decided on (None for a
         # BATCH / re-granted / re-queued leg 2 -- no front estimate to audit).
         _x_grant = self.__dict__.get("_x_grants", {}).pop(rid, None)
+        # RC7 / NF H85: the prefill-clock mark as this leg starts.
+        _pfc_mark0 = getattr(self, "_d_prefill_mark", None)
 
-        def _sample_r_d(pt: int, ct: int, comp: int, verdict: str, dterms: dict) -> None:
+        def _sample_r_d(pt: int, ct: int, verdict: str, dterms: dict) -> None:
             """RC7-X: #1271 (b)'s r_D sample, on BOTH wire shapes (it used to
             exist on the non-streamed branch only), from D's OWN prefill clock.
 
@@ -4104,24 +4131,26 @@ class Front:
             _solo = (_solo_entry
                      and self._d_admissions == _solo_adm0
                      and len(g.outstanding) == 1)
-            _ps = (dterms or {}).get("prefill_s")
             if not _solo:
-                if _unc > 0 and _w > 0:
+                if _unc > 0:
                     self.counters["r_d_skipped_concurrent"] += 1
                 return
+            if _unc <= 0:
+                return
+            _ps = (dterms or {}).get("prefill_s")
+            _src = (dterms or {}).get("prefill_src", "none")
             rate, why = r_d_probe(_unc, _ps, x_rd_min_uncached())
-            # ONE line per solo leg, the NF line's H84 shape: the wall is shown
-            # for comparison, never divided.
+            # ONE line per solo leg, the NF line's H85 shape exactly: the wall
+            # is shown for comparison, never divided.
             logger.info("WEG2 X R_D rid=%s uncached=%d d_prefill_s=%s wall=%.2fs verdict=%s "
-                        "r_D=%s d_prefill_src=%s completion_tokens=%d leg_verdict=%s (r_D = "
-                        "uncached / d_prefill_s, D's own prefill_finished - forward_entry of "
-                        "this solo prefill; the wall is shown, never used -- RC7-X)",
+                        "r_D=%s d_prefill_src=%s d_prefill_attr=%s stream=%d path=%s "
+                        "(r_D = uncached / d_prefill_s; the wall is shown, never used)",
                         rid, _unc, "none" if _ps is None else f"{float(_ps):.3f}", _w, why,
-                        "-" if rate is None else f"{rate:.0f}",
-                        (dterms or {}).get("prefill_src", "none"), comp, verdict)
+                        "-" if rate is None else f"{rate:.0f}", _src,
+                        (dterms or {}).get("prefill_attr", "-"), int(bool(stream)), request.path)
             if rate is not None:
-                self._x_r_d_src = f"d_prefill_s verdict={verdict}"
-                self.counters["r_d_sampled"] += 1
+                self._x_r_d_src = f"d_prefill_s verdict={verdict} via={_src}"
+                self.counters[f"r_d_sampled_{_src}"] += 1
                 self.note_x_sample("r_d", rate)
             elif why == "short":
                 self.counters["r_d_skipped_short"] += 1
@@ -4250,13 +4279,19 @@ class Front:
                         # answer to "can D serve this text back".
                         self.spans.record_presence(text, ct)
                         self._note_exact(text, pt)
-                    dterms = await self._draft_terms(g, None, rid=rid, pt=pt, ct=ct)
+                    dterms = await self._draft_terms(g, None, rid=rid, uncached=max(0, pt - ct),
+                                                     mark=_pfc_mark0)
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                                 "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
                                 rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
                                 dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
                     if r.status == 200 and priced and not x_inband:
-                        _sample_r_d(pt, ct, comp, verdict, dterms)
+                        try:
+                            _sample_r_d(pt, ct, verdict, dterms)
+                        except Exception as e:  # noqa: BLE001 - never breaks serving
+                            self.counters["r_d_probe_errors"] += 1
+                            logger.warning("WEG2 X R_D-PROBE-ERROR rid=%s %s: %s (no sample)",
+                                           rid, type(e).__name__, e)
                         self._note_x_grant_realized(rid, _x_grant, pt, ct)
                     if pending is not None and ct > 0:
                         self.counters["cross_group_prefix_hits"] += 1
@@ -4280,7 +4315,8 @@ class Front:
                     return web.json_response({"error": f"W28 Weg2Leg2Unpriced rid={rid}"}, status=503)
                 verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, False, rid)
                 g.served += 1
-                dterms = await self._draft_terms(g, js, rid=rid, pt=pt, ct=ct)
+                dterms = await self._draft_terms(g, js, rid=rid, uncached=max(0, pt - ct),
+                                                 mark=_pfc_mark0)
                 logger.info("WEG2-SERVED group=D leg=2 rid=%s status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                             "uncached=%d verdict=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
                             rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, time.time() - t0, self.epoch,
@@ -4321,7 +4357,7 @@ class Front:
                 # streamed branch above now samples too). A 200 only -- a
                 # refusal body is no prefill.
                 if r.status == 200:
-                    _sample_r_d(pt, ct, comp, verdict, dterms)
+                    _sample_r_d(pt, ct, verdict, dterms)
                     self._note_x_grant_realized(rid, _x_grant, pt, ct)
                 if pt:
                     # #1324, as on the streamed branch above: `ct` is the
@@ -4628,7 +4664,8 @@ class Front:
         self._mark_posted(p)
         return await self.leg2(request, rid, payload, text, stream, pending=p, seat=p.seat)
 
-    async def _draft_terms(self, g, body, rid: str = "", pt: int = 0, ct: int = 0) -> dict:
+    async def _draft_terms(self, g, body, rid: str = "", uncached: int = 0,
+                           mark: Optional[Tuple[str, int]] = None) -> dict:
         """#1233 (C16, L12): the draft terms of one served request.
 
         ``accept_len`` comes from ``meta_info.spec_accept_length`` when the
@@ -4640,12 +4677,15 @@ class Front:
         Never raises: a missing instrument is ``accept_src=none``.
         """
         out = {"draft_pages": 0, "draft_miss": 0, "accept_len": 0.0, "accept_src": "none",
-               # RC7-X: this leg's prefill seconds by D's own clock -- the body's
-               # meta_info/sglext weg2_prefill_s (NF H84) first, else the SAME
-               # read below (internal_states[0].weg2_prefill_s); None = unknown.
-               "prefill_s": d_prefill_seconds(body), "prefill_src": "none"}
+               # RC7 / NF H85: this leg's prefill seconds by D's own clock -- the
+               # body's meta_info/sglext weg2_prefill_s (H84) first, else the
+               # record on the SAME read below that prefill_clock.attribute
+               # assigns to this leg; prefill_attr says how, or why not.
+               "prefill_s": d_prefill_seconds(body), "prefill_src": "none",
+               "prefill_attr": "no_read"}
         if out["prefill_s"] is not None:
             out["prefill_src"] = "body"
+            out["prefill_attr"] = "body"
         try:
             mi = (body or {}).get("meta_info") if isinstance(body, dict) else None
             if isinstance(mi, dict) and mi.get("spec_accept_length") is not None:
@@ -4677,11 +4717,20 @@ class Front:
             if out["accept_src"] == "none" and info.get("avg_spec_accept_length") is not None:
                 out["accept_len"] = float(info["avg_spec_accept_length"])
                 out["accept_src"] = "server_info_avg"
+            # RC7 / NF H85: D's prefill clock (weg2/prefill_clock.py), attributed
+            # against the leg's ENTRY mark; then the mark moves to this read.
+            _pfc = info.get(prefill_clock.INTERNAL_STATE_KEY)
             if out["prefill_s"] is None:
-                out["prefill_s"] = prefill_clock.lookup(
-                    info.get(prefill_clock.INTERNAL_STATE_KEY), rid, pt, ct)
-                if out["prefill_s"] is not None:
+                if uncached > 0:
+                    _s, _how = prefill_clock.attribute(_pfc, rid, uncached, mark)
+                else:
+                    _s, _how = None, "no_extent"
+                out["prefill_attr"] = _how
+                if _s is not None:
+                    out["prefill_s"] = _s
                     out["prefill_src"] = "server_info"
+            self._d_prefill_mark = prefill_clock.advance(
+                getattr(self, "_d_prefill_mark", None), prefill_clock.mark_of(_pfc))
         except Exception as e:  # noqa: BLE001 - an instrument never breaks serving
             logger.debug("draft terms unavailable: %s: %s", type(e).__name__, e)
         return out
