@@ -36,6 +36,7 @@ from sglang.srt.layers.quantization.fp4_utils import (
     get_fp4_gemm_runner_backend,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.nvfp4_sm12x_w4a16 import maybe_apply_sm12x_w4a16
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
@@ -1874,6 +1875,14 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
+
+        # sm_12x small-M W4A16 on the same native bytes (default OFF:
+        # SGLANG_FP4_SM12X_W4A16_MAX_M unset -> None after one int compare).
+        out = maybe_apply_sm12x_w4a16(
+            layer, x, bias, get_fp4_gemm_runner_backend().value
+        )
+        if out is not None:
+            return out
 
         # `_accepts_prequantized_fp4` is the explicit opt-in so an accidental
         # tuple from unrelated code can't silently bypass quantization.
