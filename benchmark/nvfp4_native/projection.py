@@ -2,15 +2,13 @@
 """HOCHRECHNUNG (not a measurement): P-prefill 8k and the D GEMM term under bs6
 for native-mixed NVFP4 (Backlog #38). Every input is named with its source.
 
-Model P (PP3, one layer = MLP [NVFP4] + one attention-family projection set [FP8]):
-  t_stage(card) = other(card) + FLOP_mlp / R_mlp(card) + FLOP_fp8 / R_fp8(card)
-  per layer per 512-token chunk. "other" is DERIVED from the measured INT8 stage
-  (#PGAP RC4 medians, BACKLOG_NVFP4_NATIVE_LAYOUT.md point 3) minus its INT8 GEMM
-  time at the measured INT8 lane rate. Cut: L5*t5 = L3*t3, L5 + 2*L3 = 64.
-  Throughput is ANCHORED on measured boots: tok/s_new = tok/s_meas * T_meas/T_new,
-  with T = max stage time of the anchor's own cut, computed by the same model.
-  Two anchors (INT8 RC2-final 8905 @8k, NVFP4-Marlin RC7b 4246 @8k) bracket the
-  model error.
+Model P (PP3): per rank and 512-token chunk starting at position p (k tokens)
+  t = n_layers * const(card) + GEMM(rates) + slope(card) * n_attn * p
+  const and slope come from linear fits of the MEASURED #PGAP gpu_fwd_ms of the
+  INT8 boot weg2rc4 (minus its INT8 GEMM at the lane rate); the 3080 Marlin rate
+  at M=512 from the NVFP4 boot weg2rc4n4. 8k wall = (16 chunks + 2) * max rank
+  time at mean p = 3.75k. The model reproduces INT8 8760 (measured 8905) and
+  NVFP4-Marlin 4468 (measured 4246); both calibration factors bracket the answer.
 
 Model D (GEMM term only, per verify round, per rank):
   sum over the rank's linears of the MEASURED kernel time at M (bench JSON), or,
@@ -36,106 +34,129 @@ R = {
     "5090": {"int8": 678.0, "nvfp4_native": 1304.0, "nvfp4_marlin": 233.0, "fp8_native": 568.0, "fp8_marlin": 215.0},
     "3080": {"int8": 180.0, "nvfp4_marlin": 63.0, "fp8_marlin": 60.0},
 }
-# Measured stage medians (ms / layer / 512 chunk), BACKLOG point 3.
-STAGE = {"int8": {"5090": 1.8, "3080": 6.1}, "nvfp4_marlin": {"5090": 2.9, "3080": 11.0}}
-ANCHOR = {"int8": (8905.0, None), "nvfp4_marlin": (4246.0, (42, 11, 11))}
+# MEASURED (#PGAP gpu_fwd_ms per 512-token chunk, linear fit over chunk start
+# position p in k tokens, p <= 64k; RC4 boots, cut 42/11/11, attn 10/3/3; parser
+# benchmark/nvfp4_native/pgap_fit.py):
+#   weg2rc4   (INT8):        PP0 48.6 + 0.894 p | PP1 38.1 + 1.083 p | PP2 42.1 + 1.111 p
+#   weg2rc4n4 (NVFP4-Marlin): PP0 94.6 + 1.133 p | PP1 93.8 + 1.113 p | PP2 94.3 + 1.116 p
+FIT_INT8 = {0: (48.6, 0.894), 1: (38.1, 1.083), 2: (42.1, 1.111)}
+FIT_NV = {0: (94.6, 1.133), 1: (93.8, 1.113), 2: (94.3, 1.116)}
+CUT0 = (42, 11, 11)
+MEAS_8K = {"int8": 8905.0, "nvfp4_marlin": 4246.0}
+N_CHUNKS_8K, P_MEAN_8K = 16, 3.75  # 8k prompt: 16 chunks, mean start position 3.75k
 
 
-def other(card):
-    return STAGE["int8"][card] - (FLOP_MLP + FLOP_FP8) / (R[card]["int8"] * 1e12) * 1e3
+def attn_count(lo, hi):
+    return sum(1 for i in range(lo, hi) if i % 4 == 3)
 
 
-def t_stage(card, r_mlp, r_fp8, extra_ms=0.0):
-    return other(card) + FLOP_MLP / (r_mlp * 1e12) * 1e3 + FLOP_FP8 / (r_fp8 * 1e12) * 1e3 + extra_ms
+def stage_flops(lo, hi):
+    n = hi - lo
+    na = attn_count(lo, hi)
+    return n * FLOP_MLP, na * FLOP_ATT + (n - na) * FLOP_GDN
 
 
-def balanced_T(t5, t3):
-    l5 = L / (1 + 2 * t5 / t3)
-    return l5 * t5, l5
+def ranks(cut):
+    b = [0, cut[0], cut[0] + cut[1], L]
+    return [(b[i], b[i + 1]) for i in range(3)]
 
 
-def int_cut_T(t5, t3):
-    best = None
-    for l5 in range(1, L):
-        rest = L - l5
-        a, b = rest // 2, rest - rest // 2
-        T = max(l5 * t5, b * t3)
-        if best is None or T < best[0]:
-            best = (T, (l5, b, a))
-    return best
+def derive_constants():
+    """Non-GEMM constant per layer and attention slope per attn-layer, per card."""
+    out = {}
+    for r, (lo, hi) in enumerate(ranks(CUT0)):
+        card = "5090" if r == 0 else "3080"
+        fm, fa = stage_flops(lo, hi)
+        gemm = (fm + fa) / (R[card]["int8"] * 1e12) * 1e3
+        a, b = FIT_INT8[r]
+        out[r] = {"card": card, "const_per_layer": (a - gemm) / (hi - lo),
+                  "slope_per_attn": b / attn_count(lo, hi), "gemm_int8": gemm, "a": a}
+    return out
 
 
-def anchor_T(name):
-    t5, t3 = STAGE[name]["5090"], STAGE[name]["3080"]
-    cut = ANCHOR[name][1]
-    if cut:
-        return max(cut[0] * t5, max(cut[1], cut[2]) * t3)
-    return int_cut_T(t5, t3)[0]
+def model_wall(cut, rates, consts, extra_last=None):
+    """8k-prompt pipeline wall (s) = (chunks + stages - 1) x max stage time at mean p."""
+    if extra_last is None:
+        extra_last = consts[2]["const_per_layer"] * 11 - consts[1]["const_per_layer"] * 11
+    ts = []
+    for r, (lo, hi) in enumerate(ranks(cut)):
+        card = "5090" if r == 0 else "3080"
+        cl = consts[0 if r == 0 else 1]
+        fm, fa = stage_flops(lo, hi)
+        t = (hi - lo) * cl["const_per_layer"] + fm / (rates[card][0] * 1e12) * 1e3 \
+            + fa / (rates[card][1] * 1e12) * 1e3 + cl["slope_per_attn"] * attn_count(lo, hi) * P_MEAN_8K
+        if r == 2:
+            t += extra_last
+        ts.append(t)
+    return (N_CHUNKS_8K + 2) * max(ts) / 1e3, ts
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench", help="bench_5090_nvfp4.py JSON; overrides the 5090 rates at M=512")
-    ap.add_argument("--w4a8-tops", type=float, nargs="*", default=[120.0, 155.0],
-                    help="3080 W4A8 effective rate(s) until N4A measures (user estimate 65%% of 238 = 155)")
-    ap.add_argument("--q-overhead-ms", type=float, default=0.03,
-                    help="5090 fp4 activation quant per layer per chunk (2 calls)")
+    ap.add_argument("--w4a8-tops", type=float, nargs="*", default=[100.0, 120.0, 155.0],
+                    help="3080 W4A8 effective rate(s) at M=512 until N4A measures")
+    ap.add_argument("--marlin3080-m512", type=float, default=None,
+                    help="3080 FP8-Marlin rate at M=512; default: derived from the NVFP4 PGAP fit")
     a = ap.parse_args()
     if a.bench:
         rows = json.load(open(a.bench))["rows"]
 
-        def rate(shape, kern, M=512):
-            for r in rows:
-                if r.get("shape") == shape and r.get("kernel") == kern and r.get("M") == M and "us" in r:
-                    return r
-            return None
-        fl = 0.0
-        us = 0.0
-        for sh in ("P.gate_up", "P.down"):
-            r = rate(sh, "apply_nat")
-            if r:
-                us += r["us"]; fl += 2 * 512 * r["N"] * r["K"]
-        if us:
-            R["5090"]["nvfp4_native"] = fl / (us * 1e-6) / 1e12
-            a.q_overhead_ms = 0.0  # apply_nat includes the quant
-        fl = us = 0.0
-        for sh in ("P.gate_up", "P.down"):
-            r = rate(sh, "apply_mar")
-            if r:
-                us += r["us"]; fl += 2 * 512 * r["N"] * r["K"]
-        if us:
-            R["5090"]["nvfp4_marlin"] = fl / (us * 1e-6) / 1e12
-        for kern, key in (("f8_nat", "fp8_native"), ("f8_mar", "fp8_marlin")):
-            fl = us = 0.0
-            for sh in ("F.qkvz", "F.o"):
-                r = rate(sh, kern)
-                if r:
-                    us += r["us"]; fl += 2 * 512 * r["N"] * r["K"]
-            if us:
-                R["5090"][key] = fl / (us * 1e-6) / 1e12
-    print("HOCHRECHNUNG -- keine Messung")
-    print(f"FLOP/Schicht/512er-Chunk: MLP {FLOP_MLP/1e9:.1f} GF, FP8-Familie {FLOP_FP8/1e9:.1f} GF")
-    print(f"'other' abgeleitet: 5090 {other('5090'):.2f} ms, 3080 {other('3080'):.2f} ms")
-    print("5090-Raten (TFLOPS):", {k: round(v) for k, v in R["5090"].items()})
-    Ti, Tn = anchor_T("int8"), anchor_T("nvfp4_marlin")
-    print(f"Anker: INT8 T={Ti:.1f} ms (8905 tok/s), NVFP4-Marlin T={Tn:.1f} ms (4246 tok/s, Schnitt 42/11/11)")
-    t5_nat = t_stage("5090", R["5090"]["nvfp4_native"], R["5090"]["fp8_native"], a.q_overhead_ms)
-    t5_nat_fp8m = t_stage("5090", R["5090"]["nvfp4_native"], R["5090"]["fp8_marlin"], a.q_overhead_ms)
+        def rate(shapes, kern, M=512):
+            us = fl = 0.0
+            for sh in shapes:
+                for r in rows:
+                    if r.get("shape") == sh and r.get("kernel") == kern and r.get("M") == M and "us" in r:
+                        us += r["us"]; fl += 2 * M * r["N"] * r["K"]
+                        break
+            return fl / (us * 1e-6) / 1e12 if us else None
+        for key, shapes, kern in (("nvfp4_native", ("P.gate_up", "P.down"), "apply_nat"),
+                                  ("nvfp4_marlin", ("P.gate_up", "P.down"), "apply_mar"),
+                                  ("fp8_native", ("F.qkvz", "F.o", "F.qkv"), "f8_nat"),
+                                  ("fp8_marlin", ("F.qkvz", "F.o", "F.qkv"), "f8_mar")):
+            v = rate(shapes, kern)
+            if v:
+                R["5090"][key] = v
+    C = derive_constants()
+    print("HOCHRECHNUNG -- keine Messung (Eingaben: #PGAP-Fits = Messung, Lane-Raten = Messung, Rest = Modell)")
+    for r in (0, 1, 2):
+        c = C[r]
+        print(f"  PP{r} ({c['card']}): gpu_fwd(p=0) {c['a']:.1f} ms = INT8-GEMM {c['gemm_int8']:.1f} (Lane-Rate) "
+              f"+ Nicht-GEMM {c['a']-c['gemm_int8']:.1f} ms ({c['const_per_layer']:.2f} ms/Schicht); "
+              f"Attention {c['slope_per_attn']:.3f} ms je Attn-Schicht je 1k Kontext")
+    # 3080 Marlin at M=512, derived from the NVFP4 fit of PP1 (same constants)
+    lo, hi = ranks(CUT0)[1]
+    fm, fa = stage_flops(lo, hi)
+    g_nv = FIT_NV[1][0] - (C[1]["a"] - C[1]["gemm_int8"])
+    m3080 = a.marlin3080_m512 or (fm + fa) / (g_nv * 1e-3) / 1e12
+    print(f"  3080 Marlin (FP4+FP8) bei M=512 aus PP1-NVFP4-Fit: {m3080:.1f} TFLOPS (Lane-Wert M=2048: 63/60)")
+    rates_int8 = {"5090": (R["5090"]["int8"], R["5090"]["int8"]), "3080": (R["3080"]["int8"], R["3080"]["int8"])}
+    rates_nv = {"5090": (R["5090"]["nvfp4_marlin"], R["5090"]["fp8_marlin"]), "3080": (m3080, m3080)}
+    w_i, _ = model_wall(CUT0, rates_int8, C)
+    w_n, _ = model_wall(CUT0, rates_nv, C)
+    cal_i, cal_n = (8192 / w_i) / MEAS_8K["int8"], (8192 / w_n) / MEAS_8K["nvfp4_marlin"]
+    print(f"  Modellprobe 8k: INT8 {8192/w_i:.0f} (gemessen 8905, Faktor {1/cal_i:.3f}), "
+          f"NVFP4-Marlin {8192/w_n:.0f} (gemessen 4246, Faktor {1/cal_n:.3f})")
+    print("  5090-Raten (TFLOPS):", {k: round(v) for k, v in R["5090"].items()})
     for w in a.w4a8_tops:
-        t3 = t_stage("3080", w, R["3080"]["fp8_marlin"])
-        for label, t5 in (("5090 FP4+FP8 nativ", t5_nat), ("5090 FP4 nativ, FP8 Marlin", t5_nat_fp8m)):
-            T, cut = int_cut_T(t5, t3)
-            lo, hi = 4246 * Tn / T, 8905 * Ti / T
-            print(f"  W4A8 {w:.0f} TOPS | {label}: t5={t5:.2f} t3={t3:.2f} ms, Schnitt {cut}, "
-                  f"T={T:.1f} ms -> P8k ~{min(lo,hi)/1e3:.1f}-{max(lo,hi)/1e3:.1f}k tok/s")
-    # what 10k would need
-    Tneed = 8905 * Ti / 10000
+        for label, r5 in (("5090 FP4+FP8 nativ", (R["5090"]["nvfp4_native"], R["5090"]["fp8_native"])),
+                          ("5090 FP4 nativ/FP8 Marlin", (R["5090"]["nvfp4_native"], R["5090"]["fp8_marlin"]))):
+            rates = {"5090": r5, "3080": (w, m3080)}
+            best = None
+            for l0 in range(30, 56):
+                rest = L - l0
+                cut = (l0, rest - rest // 2, rest // 2)
+                wall, ts = model_wall(cut, rates, C)
+                if best is None or wall < best[0]:
+                    best = (wall, cut, ts)
+            wall, cut, ts = best
+            tps = 8192 / wall
+            print(f"  W4A8 {w:.0f} TOPS | {label}: Schnitt {cut}, Stufen {[round(t,1) for t in ts]} ms -> "
+                  f"P8k ~{tps/cal_n/1e3:.1f}-{tps/cal_i/1e3:.1f}k tok/s (kalibriert NVFP4/INT8)")
     if a.bench:
         print("D, 5090-Rang, GEMM-Anteil je Verify-Runde (ms), gemessen je Kernel, summiert:")
         for M, res in d_gemm_term(a.bench).items():
             print(f"  M={M}: {res}")
-    print(f"  10k tok/s braucht T<={Tneed:.1f} ms; bei t5={t5_nat:.2f}: L5<={Tneed/t5_nat:.1f}, "
-          f"3080-Stufe <= {Tneed/((L-Tneed/t5_nat)/2):.2f} ms/Schicht (other allein {other('3080'):.2f})")
 
 
 def d_gemm_term(bench_path, Ms=(8, 16, 48)):
