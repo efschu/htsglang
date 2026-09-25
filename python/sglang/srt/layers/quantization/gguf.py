@@ -16,6 +16,9 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.quantization.gguf_path_census import (
+    census as _gguf_path_census,  # #GGUFPATH, default off
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -1031,8 +1034,16 @@ def _mul_mat_dequant_chunked(
 
 
 def fused_mul_mat_gguf(
-    x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
+    x: torch.Tensor, qweight: torch.Tensor, qweight_type: int, on_path=None
 ) -> torch.Tensor:
+    # #GGUFPATH (SGLANG_GGUF_PATH_CENSUS, default off: one None check and the
+    # dispatch below runs exactly as before). On, the census re-enters here with
+    # ``on_path`` set, brackets the call with two captured device kernels and
+    # attributes it to the branch this dispatch reports -- never re-derived.
+    if on_path is None:
+        census = _gguf_path_census()
+        if census is not None:
+            return census.measure(fused_mul_mat_gguf, x, qweight, qweight_type)
     if qweight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
     else:
@@ -1057,6 +1068,8 @@ def fused_mul_mat_gguf(
         return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
+        if on_path is not None:
+            on_path("dense")
         return x @ qweight.T
     # enable MMVQ in contiguous batching with batch_size=1
     if (
@@ -1070,16 +1083,22 @@ def fused_mul_mat_gguf(
         # the dispatch below is byte-identical when the flag is not set.
         and not _mmq_threshold_prefers_mmq(x.shape[0], qweight, qweight_type)
     ):
+        if on_path is not None:
+            on_path("mmvq")
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
     # MMQ (quantized GEMM) only for small batches (standard + k-quants): it is
     # weight-bandwidth-bound and does not scale with token count, so above
     # _MMQ_MAX_TOKENS the dequant + cuBLAS branch below is far faster.
     elif qweight_type in MMQ_QUANT_TYPES and x.shape[0] <= _MMQ_MAX_TOKENS:
+        if on_path is not None:
+            on_path("mmq")
         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     # Large batch (or a type without an MMQ kernel): dequantize once, then a
     # single fp16 cuBLAS GEMM. All MMQ types are also in DEQUANT_TYPES, so
     # large-batch K-quants land here.
     elif qweight_type in DEQUANT_TYPES:
+        if on_path is not None:
+            on_path("deq")
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
         # #70: an over-cap dequant during CUDA-graph capture (draft-extend /

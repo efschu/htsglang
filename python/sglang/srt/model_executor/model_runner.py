@@ -1704,6 +1704,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # batch.
         self.eager_runner = EagerRunner(self)
 
+        # #GGUFPATH (SGLANG_GGUF_PATH_CENSUS, default off: no-op): the dispatch
+        # census's accumulator is allocated HERE -- outside every memory-saver
+        # region, before any graph captures its address; born in the
+        # cuda_graph or a weights tag it would come back from a weg2 wake on
+        # recycled pages.
+        if self.model_config.quantization == "gguf":
+            from sglang.srt.layers.quantization.gguf_path_census import (
+                arm as _gguf_path_census_arm,
+            )
+
+            _gguf_path_census_arm(self.device)
+
         # cuda-graph capture: prefill before decode, so both coalesce onto the
         # eager buffer allocated above. (init_prefill_cuda_graph routes prefill
         # to the eager runner when the prefill graph is disabled.)

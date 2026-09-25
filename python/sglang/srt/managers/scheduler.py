@@ -219,6 +219,7 @@ from sglang.srt.managers import prefetch_ballot
 from sglang.srt.managers import tp_head_congruence
 from sglang.srt.managers import weg2_store_told
 from sglang.srt.managers import weg2_d_hostgap as _d_hostgap
+from sglang.srt.layers.quantization import gguf_path_census as _gguf_path_census
 from sglang.srt.weg2 import p_trim_end_anchor as _weg2_trim
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers.pp_admission_congruence import (
@@ -16174,6 +16175,12 @@ class Scheduler(
                 _dgap = _d_hostgap.meter()
                 if _dgap is not None and batch.forward_mode.is_decode():
                     _dgap.end_round(deferred=_pending_lens is not None)
+                # #GGUFPATH (SGLANG_GGUF_PATH_CENSUS, default off): the same
+                # decode round closes the dispatch census; host counters and a
+                # queued non-blocking snapshot only, never a wait.
+                _gpc = _gguf_path_census.census()
+                if _gpc is not None and batch.forward_mode.is_decode():
+                    _gpc.end_round(bs=batch.batch_size())
 
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None
