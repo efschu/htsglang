@@ -328,6 +328,7 @@ from sglang.srt.mem_cache.hicache_collective import bounded_wait
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.planner import transient_census as _transient_census
 from sglang.srt.weg2 import tail_handoff
+from sglang.srt.weg2 import p_intake as _p_intake
 from sglang.srt.mem_cache.common import (
     release_admission_acquired_mamba_slot,
     evict_from_tree_cache,
@@ -14131,7 +14132,11 @@ class Scheduler(
                 # form -- PP0 admits only what it has put on the wire, the
                 # followers only what has arrived and what their own read
                 # reproduced. Nothing below this branch decides.
-                _told_loaded = weg2_store_told.admission(self, req, _note_skip)
+                # H91a: the verdict stands until the request leaves the queue
+                # (a visit the adder could not seat used to consume it).
+                _told_loaded = _p_intake.told_admission(
+                    self, req, _note_skip, weg2_store_told.admission
+                )
                 if _told_loaded is None:
                     continue
             if self.enable_hicache_storage and _pp_group:
@@ -14933,6 +14938,7 @@ class Scheduler(
 
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        _p_intake.settle_told(self, self.waiting_queue)  # H91a: admitted/aborted verdicts go
 
         # #791 PP ADMISSION UNIFORMITY: PP0 publishes this pass's admission
         # decision here; scheduler_pp_mixin.py's _event_loop_pp_body drains
@@ -18709,6 +18715,13 @@ class Scheduler(
         _pool = int(getattr(self, "max_total_num_tokens", 0) or 0)
         _too_large = bool(_pool > 0 and need > _pool)
         _extra = note or "gate=adder_no_token"
+        # H91a: the stall is only what no row of this phase can fund; a
+        # request that fits free + evictable stays queued (no 503, no flip).
+        if not _too_large and _p_intake.intake_phase_verdict(
+            self, str(req.rid), need, _pool, _extra
+        ) in (_p_intake.INTAKE_FITS, _p_intake.INTAKE_WAITS):
+            watch.progress()
+            return
         if _too_large:
             from sglang.srt.weg2.intake_stall import TOO_LARGE_MARK
             _extra = f"{_extra} {TOO_LARGE_MARK} pool_tokens={_pool}"
@@ -18766,6 +18779,7 @@ class Scheduler(
         if _watch is not None:
             try:
                 _watch.forget(None if recv_req.abort_all else recv_req.rid)
+                _p_intake.forget(self, None if recv_req.abort_all else recv_req.rid)
             except Exception:  # noqa: BLE001 -- bookkeeping never blocks an abort
                 logger.warning("WEG2-INTAKE-STALL watch.forget raised", exc_info=True)
         if (chunked_req := self.chunked_req) is not None:
