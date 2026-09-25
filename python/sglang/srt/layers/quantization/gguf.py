@@ -1301,6 +1301,41 @@ def apply_gguf_embedding(
         raise NotImplementedError(f"Unsupported GGUF quantization type: {qweight_type}")
 
 
+
+def _flat_container_declaration(qweight, shard_id, tensors, offsets, total):
+    """G1 (weg2 exchange): the flat container as THIS rank laid it out -- per
+    segment its byte offset, its row width in bytes and the checkpoint rows the
+    loader copied into it (``xchg_src_rows``, written where the rows were
+    chosen) -- as a ``weg2.xchg_flat_segments.FlatTable``. ``None`` when a shard
+    carries no declaration or the declared rows are not the rows it holds: the
+    exchange then refuses this tensor by name instead of guessing its segments.
+    Metadata only; no byte moves here."""
+    from sglang.srt.weg2 import xchg_flat_segments as fs
+
+    src_rows = getattr(qweight, "xchg_src_rows", None) or {}
+    segments = []
+    for idx, t, off in zip(shard_id, tensors, offsets):
+        comps = src_rows.get(fs.shard_key(idx))
+        if not comps or sum(int(c[3]) for c in comps) != int(t.size(0)):
+            return None
+        segments.append(
+            fs.FlatSegment(
+                key=fs.shard_key(idx),
+                offset=int(off),
+                row_bytes=int(t.size(1)) * int(t.element_size()),
+                components=tuple(fs.FlatComponent(*c) for c in comps),
+            )
+        )
+    table = fs.FlatTable(nbytes=int(total), segments=tuple(segments))
+    try:
+        table.validate("gguf flat container")
+    except Exception:  # noqa: BLE001 -- metadata must never fail a load
+        # Unpublished, the container is undeclared and the weg2 join refuses
+        # it by name (W68); a plain GGUF serve never reads the declaration.
+        return None
+    return table
+
+
 class GGUFLinearMethod(LinearMethodBase):
     """Linear method for GGUF.
 
@@ -1336,6 +1371,9 @@ class GGUFLinearMethod(LinearMethodBase):
                 "data_container": [],
                 "shard_id": [],
                 "shard_id_map": {},
+                # G1 (weg2 exchange): the checkpoint rows each shard's loader
+                # copied (linear.py _declare_gguf_src_rows), per shard key.
+                "xchg_src_rows": {},
             },
         )
         set_weight_attrs(qweight, extra_weight_attrs)
@@ -1442,6 +1480,11 @@ class GGUFLinearMethod(LinearMethodBase):
             flat_param = Parameter(flat_data, requires_grad=False)
             set_weight_attrs(flat_param, vars(qweight))
             set_weight_attrs(flat_param, {"shard_offset_map": shard_offset_map})
+            table = _flat_container_declaration(
+                qweight, shard_id, tensors, offsets, total
+            )
+            if table is not None:
+                set_weight_attrs(flat_param, {"xchg_flat_table": table})
             layer.register_parameter("qweight", flat_param)
             # Pre-built contiguous 2-D typed views into the flat parameter,
             # used by apply() instead of slice+contiguous. Plain attribute on
