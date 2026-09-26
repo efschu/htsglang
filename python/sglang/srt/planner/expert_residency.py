@@ -100,6 +100,14 @@ _FALSE = ("false", "0", "no", "n")
 # ---------------------------------------------------------------------------
 
 
+def _same_footprint(model_path: str, reference_model: str) -> bool:
+    """H87: is ``model_path`` the reference checkpoint in MEMORY FOOTPRINT (an
+    abliterated derivative with identical config, shapes and formats counts)?"""
+    from sglang.srt.weg2 import form as _form
+
+    return _form.reference_model_verdict(str(model_path), str(reference_model))[0]
+
+
 def resident_rows(local_experts: int, fraction: float) -> int:
     """``expert_offload.resident_slot_count``, Zeichen fuer Zeichen."""
     n = int(math.ceil(float(fraction) * int(local_experts)))
@@ -1520,7 +1528,7 @@ def _reference_for(
             ref = cand
             break
     if (
-        ref.model != model
+        (ref.model != model and not _same_footprint(model_path, ref.model))
         or ref.rank_tp_ratio != rank_tp_ratio
         or len(ref.fixed_mib) != n_ranks
         or ref.dense_repack_outside_pool != bool(dense_repack)
@@ -1788,7 +1796,7 @@ def _card_reference_for(
             ref = cand
             break
     if (
-        ref.model != model
+        (ref.model != model and not _same_footprint(model_path, ref.model))
         or ref.rank_tp_ratio != rank_tp_ratio
         or len(ref.headroom0_mib) != n_ranks
         or ref.dense_repack_outside_pool != bool(dense_repack)

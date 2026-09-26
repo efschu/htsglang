@@ -799,6 +799,28 @@ REFERENCE_KEY_FNFL2X114D = {
 }
 
 
+def _model_same_footprint(model: str, key: Mapping[str, object],
+                          have: Dict[str, object]) -> str:
+    """H87: der Modell-Schluessel einer Referenz ist der SPEICHER-FUSSABDRUCK,
+    nicht der Verzeichnisname. Ein Derivat mit identischen Shapes und Formaten
+    (abliteriert) traegt die Referenz seiner Basis: ``have["model"]`` wird dann
+    auf den Referenznamen gesetzt und die Zeile sagt es. Ein anderer
+    Fussabdruck unter demselben Namen ENTFAELLT (``have["model"]`` bekommt den
+    Grund). Ohne ``model`` im Schluessel: nichts, wie bisher."""
+    if "model" not in key:
+        return ""
+    from sglang.srt.weg2 import form as _form
+
+    ref = str(key["model"])
+    ok, why = _form.reference_model_verdict(str(model), ref)
+    if ok:
+        have["model"] = ref
+        return "" if _form.model_key(str(model)) == ref and "DERIVATIVE" not in why else (
+            "H87 Modell = Referenz nach Speicher-Fussabdruck: " + why)
+    have["model"] = "%s (H87: %s)" % (have.get("model"), why)
+    return ""
+
+
 @dataclass(frozen=True)
 class WakeCreditPlan:
     """Was der Launcher druckt, ob er verweigert, und was die Front bekommt."""
@@ -842,6 +864,7 @@ def plan_wake_credit(*, model: str, p_split: Sequence[int], chunk_layers: int,
         "p_card": tuple(int(x) for x in p_card),
         "d_ratio": ",".join("%g" % float(x) for x in str(d_ratio).split(",") if x.strip()),
     }
+    _model_note = _model_same_footprint(model, key, have)
     diff = [k for k in key if key[k] != have.get(k)]
     if diff:
         return WakeCreditPlan(lines=(
@@ -863,6 +886,8 @@ def plan_wake_credit(*, model: str, p_split: Sequence[int], chunk_layers: int,
            STAGING_DEPTH, COLLECT_RUNAHEAD))
     if search and reorder:
         head += "; Ordnungssuche ueber volle Simulationen AN (H54)"
+    if _model_note:
+        head += "; " + _model_note
     lines, refusal, _chosen = verdict_lines(ref.order, cards, label=label, reorder=reorder,
                                             search=search, double_staging=double_staging)
     front_plan: Dict[str, object] = {"D->P": [
