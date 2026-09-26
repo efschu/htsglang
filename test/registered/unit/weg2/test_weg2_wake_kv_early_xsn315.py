@@ -38,7 +38,10 @@ def test_handler_plans_and_the_post_wake_pass_timer_is_armed():
     src = open(wu.__file__).read()
     assert "_weg2_kv_deferred: bool = False" in src and "_weg2_kv_epoch_done: object = None" in src
     i = src.index("_plan = _wk_plan(")
-    blk = src[i:i + 1600]
+    # the plan's whole branch block, up to the statement after it: #1490
+    # (f3fded40af) put six comment lines into the "early" branch and pushed
+    # the "done" branch past a fixed 1600-character window.
+    blk = src[i:src.index("        for tag in tags:", i)]
     for w in ('_plan == "early"', '_plan == "defer"', '_plan == "done"', "self._weg2_kv_deferred = True"):
         assert w in blk, w
     assert "(GPU_MEMORY_TYPE_KV_CACHE in tags or self._weg2_kv_deferred) and not _weg2_kv_done" in src

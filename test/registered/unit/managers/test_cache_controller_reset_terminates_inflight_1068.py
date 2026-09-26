@@ -123,6 +123,12 @@ def _hybrid_op(rid: str, base: int):
 
 def _shell(stop_event: threading.Event, cls=HiCacheController):
     cc = cls.__new__(cls)
+    # draft KV across the flip (ae04c43ed1): the hybrid hit query asks
+    # `draft_tier_armed("admission")`, which reads `has_draft` -- False is the
+    # constructor's own initial state (no draft pool registered). Without it
+    # the prefetch thread died on AttributeError and never reached the
+    # transfer this file parks.
+    cc.has_draft = False
     cc.enable_storage = True
     cc.storage_stop_event = stop_event
     cc.page_size = PAGE
