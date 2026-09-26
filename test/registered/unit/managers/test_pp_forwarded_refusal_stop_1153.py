@@ -424,6 +424,9 @@ def _loop_holder(*, rank):
         _pp_admission_incoming_schedule={RID_TOLD_A: (0, 64)},
         policy=types.SimpleNamespace(calc_priority=_stop),
         yield_calls=[],
+        # H93 RU (6cda2aa44c): the plan plants the group's usable-match floor
+        # on the tree; None is "no tree" (plant is a no-op on it).
+        tree_cache=None,
     )
     h._drain_prefetch_progress = lambda: {}
     h._take_uniform_head_inputs = lambda: None

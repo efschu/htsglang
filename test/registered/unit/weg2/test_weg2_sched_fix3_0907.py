@@ -202,7 +202,29 @@ def _consults_state(test) -> bool:
     can change, so an ``if`` of that shape whose body jumps is an
     unconditional skip wearing a condition.
     """
-    return any(isinstance(n, (ast.Call, ast.Attribute)) for n in ast.walk(test))
+    return any(isinstance(n, (ast.Call, ast.Attribute)) for n in ast.walk(test)) or any(
+        isinstance(n, ast.Name) and n.id in _STATEFUL_LOCALS for n in ast.walk(test))
+
+
+#: Locals of the function under test that hold STATE: assigned (``=``) from an
+#: expression that makes a call or reads an attribute. fnFL2 H42b (7370b10062)
+#: hoisted its pass-level burst verdict into one such local
+#: (``_burst_hold = self._weg2_burst_assembly_hold(...)``) and tests it inside
+#: the loop; that is a condition on scheduler state, not "a test that consults
+#: nothing". The loop variable (``req``) is bound by the ``for``, never by an
+#: assignment, so the round-5 mutant ``if req is not None: continue`` stays
+#: caught. Filled by :func:`_note_stateful_locals` before each check.
+_STATEFUL_LOCALS: set = set()
+
+
+def _note_stateful_locals(tree) -> None:
+    _STATEFUL_LOCALS.clear()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign) and any(
+                isinstance(m, (ast.Call, ast.Attribute)) for m in ast.walk(n.value)):
+            for t in n.targets:
+                if isinstance(t, ast.Name):
+                    _STATEFUL_LOCALS.add(t.id)
 
 
 def _always_jumps(stmt) -> bool:
@@ -267,6 +289,7 @@ def test_b1d_no_stateless_guard_skips_the_request_before_the_x_gate():
         "wraps it, and the AST placement check at the gate cannot see that"
     )
     before = loops[0].body[: loops[0].body.index(gate)]
+    _note_stateful_locals(tree)
     dominating = [st for st in before if _always_jumps(st)]
     assert not dominating, (
         "an unconditional continue/break/return above the gate makes law 4 "
@@ -426,6 +449,22 @@ def _run_law4_reach(refuses: bool, drive_pp: bool = False):
 
     over = dict(waiting_queue=[req], _weg2_x_refuses=_spy)
     kw = {name: _NO for name in free}
+    # fnFL2 H42b (7370b10062): the pass-level burst verdict is computed ABOVE
+    # the loop and is a free name of the slice. `_NO` is not None, so it read
+    # as "the burst is assembling" and skipped every request. None is the
+    # stock value (`_burst_hold = None` unless anchor tails are armed and the
+    # count veto applies), i.e. the path law 4 is about.
+    if "_burst_hold" in kw:
+        kw["_burst_hold"] = None
+    # ... and the carried-seat count of the same change: 0 unless anchor
+    # tails are armed (`_carried_n = len(adder.can_run_list) if
+    # adder.multi_anchor_tails else 0`).
+    if "_carried_n" in kw:
+        kw["_carried_n"] = 0
+    # xsn326 re-admission timing reads the module `time` (a module global,
+    # so a free name of the slice): the real clock, never a `_No`.
+    if "time" in kw:
+        kw["time"] = time
     if drive_pp:
         # Group P's OWN shape, and every override is one of its facts:
         # PP=3 with no #631 row carrier (so `_pp0_may_withhold` is False and
