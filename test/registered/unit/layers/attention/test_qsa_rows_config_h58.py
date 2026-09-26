@@ -60,9 +60,10 @@ class SelectionTest(unittest.TestCase):
 
     def test_default_is_the_l20_table_for_the_rigs_cards(self):
         self.assertEqual(envs.SGLANG_FORCE_QSA_ROWS_CONFIG.get(), "")
-        # a 16k P prefix chunk: the spilling one-warp build
+        # a 16k P prefix chunk: the spilling one-warp build on sm86; H101: the
+        # sm120 default replaces that one entry with the spill-free (64, 8, 2)
         self.assertEqual(self._pick(16384, (8, 6), ""), (16, 1, 2))
-        self.assertEqual(self._pick(16384, (12, 0), ""), (16, 1, 2))
+        self.assertEqual(self._pick(16384, (12, 0), ""), (64, 8, 2))
         # the D draft decode (1 row) and a 4-row verify: (32, 8, 2)
         self.assertEqual(self._pick(1, (12, 0), ""), (32, 8, 2))
         self.assertEqual(self._pick(4, (12, 0), ""), (32, 8, 2))
@@ -70,7 +71,7 @@ class SelectionTest(unittest.TestCase):
     def test_override_moves_only_the_named_arch(self):
         raw = "sm86:inf=32/8/2"
         self.assertEqual(self._pick(16384, (8, 6), raw), (32, 8, 2))
-        self.assertEqual(self._pick(16384, (12, 0), raw), (16, 1, 2))
+        self.assertEqual(self._pick(16384, (12, 0), raw), (64, 8, 2))  # H101 sm120 default
         self.assertEqual(self._pick(700, (8, 6), "sm86:512=32/4/2,inf=32/8/2"), (32, 8, 2))
         self.assertEqual(self._pick(300, (8, 6), "sm86:512=32/4/2,inf=32/8/2"), (32, 4, 2))
 
