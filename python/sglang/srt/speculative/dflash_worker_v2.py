@@ -680,6 +680,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         # draft + verify from exact host metadata. Resolved lazily: the target
         # attention backend may be swapped (phase flip) after construction.
         self._plan_sync_free = bool(envs.SGLANG_DFLASH_PLAN_SYNC_FREE.get())
+        # SGLANG_DFLASH_WINDOW_HOLE_MASK (default off; dflash_window_holes.py):
+        # take the window's hole rows out of the draft softmax. Acts only in
+        # the sync-free window-pool rebuild; resolved per draft attention
+        # backend on first use (_window_hole_resolve).
+        self._window_hole_mask = bool(envs.SGLANG_DFLASH_WINDOW_HOLE_MASK.get())
+        self._window_hole_wl: Optional[int] = None
+        self._window_hole_state = None
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
         self._accept_len_buf: Optional[torch.Tensor] = None
@@ -1642,6 +1649,90 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         lens = host_seq_lens.to(dtype=torch.int64, device="cpu")
         out.copy_(torch.clamp(lens, max=bound).to(torch.int32))
+
+    def _window_hole_resolve(self, backend, buf) -> bool:
+        """SGLANG_DFLASH_WINDOW_HOLE_MASK: may this draft attention backend
+        take the hole correction? Decided once per backend object (a phase
+        flip may install a new one) and logged once. Not armed = the buffer is
+        never written, i.e. exactly the switch-off behaviour."""
+        st = self._window_hole_state
+        if st is not None and st[0] is backend:
+            return st[1]
+        ok, why = True, ""
+        if buf is None:
+            ok, why = False, (
+                f"draft attention backend {type(backend).__name__} has no hole "
+                "buffer (not the FlashInfer draft backend)"
+            )
+        elif getattr(backend, "uneven_dcp", False):
+            ok, why = False, "draft attention backend runs the uneven-DCP path"
+        else:
+            from sglang.srt.layers.radix_attention import (
+                AttentionType,
+                RadixAttention,
+            )
+
+            wls = {
+                -1 if m.sliding_window_size is None else int(m.sliding_window_size)
+                for m in self.draft_model.modules()
+                if isinstance(m, RadixAttention)
+                and m.attn_type == AttentionType.ENCODER_ONLY
+            }
+            if len(wls) != 1:
+                ok, why = False, (
+                    f"draft layers carry {sorted(wls)} sliding windows "
+                    "(needs exactly one)"
+                )
+            else:
+                self._window_hole_wl = wls.pop()
+        self._window_hole_state = (backend, ok)
+        if ok:
+            logger.info(
+                "DFLASH window hole mask armed (SGLANG_DFLASH_WINDOW_HOLE_MASK=1): "
+                "window rows without draft KV leave the draft softmax "
+                "(window_left=%s).",
+                self._window_hole_wl,
+            )
+        else:
+            logger.warning(
+                "DFLASH window hole mask NOT armed: %s -- holes stay in the "
+                "draft softmax (switch-off behaviour).",
+                why,
+            )
+        return ok
+
+    def _stage_window_hole_counts(
+        self,
+        holes: Optional[torch.Tensor],
+        lengths: torch.Tensor,
+        block_size: int,
+        bs: int,
+    ) -> Optional[torch.Tensor]:
+        """Write this round's per-token visible hole counts into the draft
+        backend's static buffer (device only, fixed shape). Returns the
+        buffer, which the caller zeroes after the draft forward, or None."""
+        backend = getattr(self.draft_model_runner, "attn_backend", None)
+        # A hybrid wrapper keeps the FlashInfer half as full_attn_backend.
+        backend = getattr(backend, "full_attn_backend", backend)
+        buf = getattr(backend, "_dflash_window_hole_tok", None)
+        if not self._window_hole_resolve(backend, buf):
+            return None
+        from sglang.srt.speculative.dflash_window_holes import (
+            window_hole_counts_per_token,
+        )
+
+        counts = window_hole_counts_per_token(
+            holes, lengths, int(block_size), self._window_hole_wl, int(bs)
+        )
+        n = int(counts.numel())
+        if n > int(buf.numel()):
+            raise RuntimeError(
+                f"SGLANG_DFLASH_WINDOW_HOLE_MASK: {n} draft query rows exceed "
+                f"the hole-count buffer ({int(buf.numel())} rows)."
+            )
+        buf.zero_()
+        buf[:n].copy_(counts)
+        return buf
 
     def _compact_draft_host_lens_exact(self) -> bool:
         """May the draft plan schedule from the compact host lengths?
@@ -3321,6 +3412,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # schedule from it. An upper bound is NOT enough there (FA2 lays
             # its split output out by the device length).
             draft_host_lens_exact = False
+            _hole_buf = None  # SGLANG_DFLASH_WINDOW_HOLE_MASK, staged below
             if self.use_compact_draft_cache:
                 # Rebuild the draft-local sliding-window view from committed target state.
                 draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
@@ -3389,7 +3481,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
                     mapper = self._solo_pool_mapper
                     mapper.begin_round()
-                    rebuild_window_rows_sync_free(
+                    _holes = rebuild_window_rows_sync_free(
                         mapper=mapper,
                         target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                         draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
@@ -3397,7 +3489,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                         start=suffix_start,
                         lengths=draft_prefix_lens,
                         max_len=int(seq_lens_cpu.max()) if bs > 0 else 0,
+                        return_holes=self._window_hole_mask,
                     )
+                    if self._window_hole_mask:
+                        _hole_buf = self._stage_window_hole_counts(
+                            _holes, draft_prefix_lens, block_size, bs
+                        )
                     block_loc = mapper.translate_write(verify_out_cache_loc)
                     block_end = self._draft_block_end_buf[:bs]
                     torch.add(draft_prefix_lens, block_size, out=block_end)
@@ -3525,6 +3622,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                     draft_out = self.draft_model_runner.forward(forward_batch)
             finally:
                 self._draft_block_spec_info.host_lens_exact = False
+                if _hole_buf is not None:
+                    # Stream-ordered after the draft forward: any other forward
+                    # through this backend sees zero counts (the identity).
+                    _hole_buf.zero_()
             _dgap = _d_hostgap_meter()  # #DGAP (SGLANG_WEG2_D_HOSTGAP)
             if _dgap is not None:
                 _dgap.mark("draft")

@@ -1407,6 +1407,28 @@ class FlashInferAttnBackend(AttentionBackend):
                 for _ in range(self.num_wrappers)
             ]
 
+        # SGLANG_DFLASH_WINDOW_HOLE_MASK (default off, draft backends only;
+        # speculative/dflash_window_holes.py): per draft query token, the
+        # number of window hole rows it sees. Allocated HERE, before any graph
+        # capture, so the replayed draft forward reads the live buffer the
+        # DFLASH worker writes each round. Off = None, no other change.
+        self._dflash_window_hole_tok = None
+        if (
+            envs.SGLANG_DFLASH_WINDOW_HOLE_MASK.get()
+            and bool(getattr(model_runner, "is_draft_worker", False))
+            and not bool(getattr(model_runner, "is_phase_flip_tp_stack", False))
+            and not self.skip_prefill
+        ):
+            from sglang.srt.speculative.dflash_window_holes import (
+                draft_hole_buffer_rows,
+            )
+
+            self._dflash_window_hole_tok = torch.zeros(
+                (draft_hole_buffer_rows(max_bs, model_runner.server_args),),
+                dtype=torch.float32,
+                device=model_runner.device,
+            )
+
         fmha_backend = "auto"
         if is_sm100_supported():
             # Disable CUTLASS backend when piecewise cuda graph is enabled
@@ -2891,30 +2913,48 @@ class FlashInferAttnBackend(AttentionBackend):
                                    str(forward_batch.forward_mode), self._ragged_wrapper_override is not None)
                 except Exception as _e:  # noqa: BLE001
                     logger.warning("#1490 DRAFT-ATTN n/a (%s: %s)", type(_e).__name__, _e)
-            o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=causal,
-                sm_scale=layer.scaling,
-                # Disable sliding window attention for multi-item scoring:
-                # - Sliding window could cut across item boundaries, breaking semantic coherence
-                # - Multi-item sequences need full attention to properly handle delimiter tokens
-                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                #   provide more precise attention control than simple sliding windows
-                # - Item-aware masking takes precedence over window-based masking
-                window_left=(
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                ),
-                logits_soft_cap=logits_soft_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
-            )
+            _hole_tok = getattr(self, "_dflash_window_hole_tok", None)
+            if (
+                _hole_tok is not None
+                and layer.attn_type == AttentionType.ENCODER_ONLY
+                and forward_batch.forward_mode.is_target_verify()
+                and not logits_soft_cap
+                and not (
+                    self.forward_metadata.multi_item_params
+                    and self.forward_metadata.multi_item_params.is_enabled()
+                )
+            ):
+                # SGLANG_DFLASH_WINDOW_HOLE_MASK: the DFLASH draft block
+                # forward with the window's hole rows removed from the softmax
+                # (same kernel/plan, plus its LSE; dflash_window_holes.py).
+                o = self._forward_paged_window_hole_corrected(
+                    q, layer, prefill_wrapper_paged, causal, _hole_tok
+                )
+            else:
+                o = prefill_wrapper_paged.forward(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    # Disable sliding window attention for multi-item scoring:
+                    # - Sliding window could cut across item boundaries, breaking semantic coherence
+                    # - Multi-item sequences need full attention to properly handle delimiter tokens
+                    # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
+                    #   provide more precise attention control than simple sliding windows
+                    # - Item-aware masking takes precedence over window-based masking
+                    window_left=(
+                        layer.sliding_window_size
+                        if not (
+                            self.forward_metadata.multi_item_params
+                            and self.forward_metadata.multi_item_params.is_enabled()
+                        )
+                        else -1
+                    ),
+                    logits_soft_cap=logits_soft_cap,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
             # `self.token_to_kv_pool` for this layer. This enables attention over
@@ -6905,6 +6945,57 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
         return out.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _forward_paged_window_hole_corrected(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        prefill_wrapper_paged,
+        causal: bool,
+        hole_tok: torch.Tensor,
+    ) -> torch.Tensor:
+        """SGLANG_DFLASH_WINDOW_HOLE_MASK: the plain paged prefill call of
+        ``forward_extend`` (same wrapper, plan and arguments) with its LSE,
+        then the window's hole rows (all reading slot 0) are taken out of the
+        softmax exactly (speculative/dflash_window_holes.py). Fixed shape, no
+        host read, no collective; a zero count returns the kernel's bytes."""
+        from sglang.srt.speculative.dflash_window_holes import (
+            correct_window_hole_attention,
+        )
+
+        q3 = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        if int(q3.shape[0]) > int(hole_tok.numel()):
+            raise RuntimeError(
+                "SGLANG_DFLASH_WINDOW_HOLE_MASK: draft forward with "
+                f"{int(q3.shape[0])} query rows exceeds the hole-count buffer "
+                f"({int(hole_tok.numel())} rows)."
+            )
+        kv = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        o, lse = prefill_wrapper_paged.forward_return_lse(
+            q3,
+            kv,
+            causal=causal,
+            sm_scale=layer.scaling,
+            window_left=layer.sliding_window_size,
+            logits_soft_cap=layer.logit_cap,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+        )
+        k_buf, v_buf = kv
+        hkv = int(layer.tp_k_head_num)
+        k0 = k_buf.reshape(-1, hkv, k_buf.shape[-1])[0]
+        v0 = v_buf.reshape(-1, hkv, v_buf.shape[-1])[0]
+        return correct_window_hole_attention(
+            o,
+            lse,
+            q3,
+            k0,
+            v0,
+            hole_tok,
+            sm_scale=layer.scaling,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+        )
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
