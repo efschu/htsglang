@@ -52,6 +52,37 @@ In the LRU region a correct prediction IS the cache line the next round wants,
 and a wrong one costs a single LRU slot out of 126 for one round. Staging is
 never used by the prefetch: staging rows are per-step scratch that the target
 layer's own real step overwrites in the same round.
+
+H95 OVERFLOW WAVES (SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES=N, default 0 = off)
+------------------------------------------------------------------------
+The step is exact whenever the step's DISTINCT NON-RESIDENT ids fit the
+layer's rows above the residents, ``D_nr <= C`` (C = LRU + staging): every
+such expert is an LRU hit, takes an LRU victim not used in this step, or a
+staging row -- ``misses + lru_hits = D_nr`` and ``victims + staging =
+C - lru_hits``. Task #40 / H91b booked the WORST case of that at capture
+(``min(ids, E - R) <= C``), which makes C grow with the batch (bs2: 80 rows,
+bs6: 240 ids, not representable on a 3080 worker).
+
+With waves the bound is split over up to N pool steps of the SAME batch.
+Wave 1 is the ordinary step with ``spill=True``: an expert that finds neither
+a victim nor a staging row does not set the sticky error, it keeps route -1
+and its LANES are recomputed by the next wave. Wave k+1 is an ordinary step
+(``wave=True``: the clock advances, which releases the previous wave's rows
+-- their GEMM is ordered before it on the same stream -- and ``forwards`` is
+not counted twice) over exactly the lanes wave k could not serve. Wave k
+serves ``min(D_k, C)`` distinct experts, so N waves serve ``N x C``: the
+capture-time bound becomes ``min(ids, E - R) <= N x C`` -- the scratch C
+stays that of bs1, the WAVE COUNT carries the batch. Each lane is computed in
+exactly one wave (the caller zeroes its weight in every other wave and points
+its route at a resident row), each expert's bytes are read in one wave only,
+and a step with ``D_nr <= C`` runs wave 1 exactly as without waves; the later
+waves then route nothing and copy nothing.
+
+H95 DEMAND PROBE (SGLANG_DEBUG_MOE_POOL_DEMAND=N replays, default 0 = off)
+-------------------------------------------------------------------------
+``demand`` = [max D_nr of one step, steps with D_nr > C, steps] since the last
+``take_demand_report``: the measured quantity the bound above is about, per
+layer, instead of the worst case.
 """
 from __future__ import annotations
 
@@ -90,6 +121,9 @@ class PoolTables:
     misses_total: Any  # [1] int64 misses (promoted + staged) since the last report
     pf_row: Any  # [pool_rows + staging] int64 clock at which a prefetch filled the row
     pf_counts: Any  # [4] int64 predicted, fetched, hits, skipped (no victim)
+    # H95: [3] int64 max distinct non-resident ids of one step, steps with
+    # more of them than LRU + staging rows, steps -- None unless probed
+    demand: Any = None
 
 
 @dataclass
@@ -110,11 +144,12 @@ class StepBuffers:
 
 def allocate_pool_tables(
     device, num_experts: int, rows: int, lru_start: int, staging: int,
-    hot_slot_of: Dict[int, int], host_row: Sequence[int],
+    hot_slot_of: Dict[int, int], host_row: Sequence[int], demand: bool = False,
 ) -> PoolTables:
     """``rows`` = R + C of the layer's arena; the last ``staging`` of them are
     staging rows, the ones in [lru_start, rows - staging) the LRU region.
-    ``hot_slot_of`` = expert -> row for every initially resident expert."""
+    ``hot_slot_of`` = expert -> row for every initially resident expert.
+    ``demand`` (H95 probe) allocates the per-step demand counters."""
     import torch
 
     if staging < 1 or not 0 <= lru_start < rows - staging:
@@ -151,6 +186,7 @@ def allocate_pool_tables(
         misses_total=one(0, torch.int64),
         pf_row=torch.full((rows,), -1, dtype=torch.int64, device=device),
         pf_counts=torch.zeros(4, dtype=torch.int64, device=device),
+        demand=torch.zeros(3, dtype=torch.int64, device=device) if demand else None,
     )
 
 
@@ -196,6 +232,21 @@ def step_row_demand(n_ids: int, num_experts: int, n_resident: int) -> int:
     ``E - R`` (every non-resident expert has a row) the old ``ids``-only form
     refused steps that cannot overflow."""
     return int(min(int(n_ids), max(int(num_experts) - int(n_resident), 0)))
+
+
+def pool_row_capacity(tables: PoolTables) -> int:
+    """H95: C = LRU + staging rows -- the distinct non-resident experts ONE
+    pool step can serve (module docstring)."""
+    return int(tables.pool_rows - tables.lru_start + int(tables.staging_rows.shape[0]))
+
+
+def pool_waves_for(n_ids: int, num_experts: int, n_resident: int, capacity: int) -> int:
+    """H95: how many waves a step of ``n_ids`` routed ids needs so that the
+    worst case ``min(ids, E - R)`` is served -- ``ceil(demand / C)``, at least
+    1. One wave is today's step."""
+    need = step_row_demand(n_ids, num_experts, n_resident)
+    cap = max(1, int(capacity))
+    return max(1, -(-need // cap))
 
 
 def allocate_step_buffers(device, num_experts: int, width: int = PLAN_WIDTH) -> StepBuffers:
@@ -477,8 +528,20 @@ def take_prefetch_report(tables: PoolTables) -> Tuple[int, int, int, int]:
     return v[0], v[1], v[2], v[3]
 
 
+def take_demand_report(tables: PoolTables) -> Optional[Tuple[int, int, int]]:
+    """H95 probe: (max distinct non-resident ids of one step, steps whose
+    count exceeded LRU + staging, steps) since the last report; reset. None
+    when the tables were built without the probe. One host read."""
+    if tables.demand is None:
+        return None
+    v = [int(x) for x in tables.demand.tolist()]
+    tables.demand.zero_()
+    return v[0], v[1], v[2]
+
+
 def step_reference(
-    tables: PoolTables, ids, buffers: StepBuffers, prefetch: bool = False
+    tables: PoolTables, ids, buffers: StepBuffers, prefetch: bool = False,
+    spill: bool = False, wave: bool = False, waves: int = 1,
 ) -> Tuple[List[Tuple[int, int]], Any]:
     """Plan and flip one step on the host (torch, synchronizing).
 
@@ -496,7 +559,16 @@ def step_reference(
     dropped -- the real step will stage it), and writes neither ``routes`` nor
     ``step_map``. It marks every row it fills in ``pf_row`` with the current
     clock; the next real step, which advances the clock by one, counts a hit on
-    a row whose ``pf_row`` is ``clock - 1`` as a prefetch hit."""
+    a row whose ``pf_row`` is ``clock - 1`` as a prefetch hit.
+
+    H95 (module docstring, OVERFLOW WAVES): ``spill=True`` -- a miss with
+    neither a victim nor a staging row keeps route -1 WITHOUT the sticky
+    error (the caller's next wave serves its lanes); ``wave=True`` -- a later
+    wave of the same batch: the clock advances, ``forwards`` does not, the
+    promote interval does not throttle it, and the demand probe does not
+    count it; ``waves`` -- how many waves the caller runs for this batch, the
+    capture-time bound becomes ``min(ids, E - R) <= waves x (LRU + staging)``.
+    With the defaults the step is byte-identical to the one before H95."""
     import torch
 
     E = tables.num_experts
@@ -509,13 +581,15 @@ def step_reference(
     raw = [int(v) for v in ids.reshape(-1).tolist()]
     if len(raw) > buffers.gather_src.shape[0]:
         raise ValueError("Step ids exceed the plan width")
-    if step_row_demand(len(raw), E, tables.lru_start) > (
-        tables.pool_rows - tables.lru_start
-    ) + len(staging_rows):
+    if step_row_demand(len(raw), E, tables.lru_start) > max(1, int(waves)) * (
+        (tables.pool_rows - tables.lru_start) + len(staging_rows)
+    ):
         # Overflow-impossible bound (Task #40): a miss takes an LRU victim
         # (rows not used this step) or a staging row; hits protect at most
         # `len(raw)` LRU rows, so victims + staging >= lru + staging - hits
-        # >= misses whenever len(raw) <= lru + staging.
+        # >= misses whenever len(raw) <= lru + staging. H95: every wave serves
+        # min(D_k, lru + staging) distinct experts, so `waves` of them serve
+        # waves x (lru + staging).
         raise ValueError("Step ids exceed the LRU rows plus the staging rows")
     error = bool(int(tables.error[0]))
     selected: List[int] = []
@@ -531,9 +605,20 @@ def step_reference(
     forwards = int(tables.forwards[0])
     pf_row = tables.pf_row.tolist()
     pf_counts = [int(v) for v in tables.pf_counts.tolist()]
+    demand = None
+    if tables.demand is not None and not prefetch and not wave:
+        # H95 probe: distinct ids that are not FIXED residents -- what the
+        # rows above the residents have to hold in this step (LRU hits too).
+        nonres = sum(1 for e in selected if not 0 <= hot[e] < tables.lru_start)
+        cap = (tables.pool_rows - tables.lru_start) + len(staging_rows)
+        demand = [int(v) for v in tables.demand.tolist()]
+        demand[0] = max(demand[0], nonres)
+        demand[1] += 1 if nonres > cap else 0
+        demand[2] += 1
     if gate and not prefetch:
         clock += 1
-        forwards += 1
+        if not wave:
+            forwards += 1
         for e in selected:
             r = hot[e]
             if r >= tables.lru_start:
@@ -550,7 +635,7 @@ def step_reference(
     # The prefetch is not throttled by the promote interval / min-miss ramp:
     # those damp thrash between real forwards, and a speculative pass that
     # waited for them would never fetch anything.
-    promote_ok = gate if prefetch else (gate and (forwards - 1) % interval == 0)
+    promote_ok = gate if (prefetch or wave) else (gate and (forwards - 1) % interval == 0)
     gathers: List[Tuple[int, int]] = []
     staged: List[Tuple[int, int]] = []
     for e in selected:
@@ -583,8 +668,10 @@ def step_reference(
             if len(staged) >= len(staging_rows):
                 # Cannot happen under the bound above (protect_recent=0); with
                 # protect_recent it can, and the sticky error says so instead
-                # of routing the expert to a row it never reached.
-                error = True
+                # of routing the expert to a row it never reached. H95: under
+                # ``spill`` the next wave serves it -- route -1, no error.
+                if not spill:
+                    error = True
                 continue
             staged.append((e, staging_rows[len(staged)]))
             continue
@@ -622,6 +709,8 @@ def step_reference(
     write(tables.miss_count, miss_count, torch.int32)
     write(tables.pf_row, pf_row, torch.int64)
     write(tables.pf_counts, pf_counts, torch.int64)
+    if demand is not None:
+        write(tables.demand, demand, torch.int64)
     tables.error.fill_(1 if error else 0)
     pairs = gathers + [(host_row[e], row) for e, row in staged]
     buffers.gather_count.fill_(len(pairs))
@@ -642,15 +731,18 @@ def step_reference(
     return pairs, buffers.step_map
 
 
-def step(tables: PoolTables, ids, buffers: StepBuffers, prefetch: bool = False) -> None:
+def step(tables: PoolTables, ids, buffers: StepBuffers, prefetch: bool = False,
+         spill: bool = False, wave: bool = False, waves: int = 1) -> None:
     """Plan and flip one step: Triton on CUDA, the reference elsewhere.
 
     ``prefetch=True`` runs the speculative pass (module docstring); it needs
     its OWN ``buffers``, because its gather list must survive on the side
     stream until the copy is done while the target layer's real step writes
-    the layer's normal buffers."""
+    the layer's normal buffers. ``spill``/``wave``/``waves``: H95 overflow
+    waves (``step_reference``); the defaults are the step before H95."""
     if tables.hot_phys.device.type != "cuda":
-        step_reference(tables, ids, buffers, prefetch=prefetch)
+        step_reference(tables, ids, buffers, prefetch=prefetch, spill=spill,
+                       wave=wave, waves=waves)
         return
     flat = ids.reshape(-1)
     if not flat.is_contiguous():
@@ -659,10 +751,22 @@ def step(tables: PoolTables, ids, buffers: StepBuffers, prefetch: bool = False) 
     n_staging = int(tables.staging_rows.shape[0])
     if flat.numel() > width:
         raise ValueError("Step ids exceed the plan width")
-    if step_row_demand(flat.numel(), tables.num_experts, tables.lru_start) > (
-        tables.pool_rows - tables.lru_start
-    ) + n_staging:
+    if step_row_demand(flat.numel(), tables.num_experts, tables.lru_start) > max(
+        1, int(waves)
+    ) * ((tables.pool_rows - tables.lru_start) + n_staging):
         raise ValueError("Step ids exceed the LRU rows plus the staging rows")
+    _launch_step_kernel(tables, flat, buffers, prefetch=prefetch, spill=spill, wave=wave)
+
+
+def _launch_step_kernel(tables: PoolTables, flat, buffers: StepBuffers,
+                        prefetch: bool = False, spill: bool = False,
+                        wave: bool = False) -> None:
+    """The Triton launch of one step (no host checks; ``step`` makes them).
+    H95: ``DEMAND`` counts only a real first-wave step, and the demand
+    pointer is a live int64 word of the tables when the probe is off (the
+    constexpr drops every access to it)."""
+    demand = tables.demand
+    probe = demand is not None and not prefetch and not wave
     _step_kernel()[(1,)](
         flat, flat.numel(),
         tables.hot_phys, tables.host_row, tables.row_key, tables.row_use,
@@ -670,12 +774,15 @@ def step(tables: PoolTables, ids, buffers: StepBuffers, prefetch: bool = False) 
         tables.promote_interval, tables.forwards, tables.promote_min_misses,
         tables.protect_recent, tables.miss_count, tables.staging_rows,
         tables.misses_total, tables.pf_row, tables.pf_counts,
+        demand if demand is not None else tables.misses_total,
         buffers.gather_src, buffers.gather_dst, buffers.gather_count,
         buffers.routes, buffers.staged_expert, buffers.staged_row,
         buffers.staged_count, buffers.promoted_count, buffers.step_map,
-        tables.num_experts, tables.pool_rows, tables.lru_start, n_staging,
-        WIDTH=width, BLOCK_R=_next_power_of_two(tables.pool_rows),
-        MAP_BLOCK=1024, PREFETCH=bool(prefetch), num_warps=8,
+        tables.num_experts, tables.pool_rows, tables.lru_start,
+        int(tables.staging_rows.shape[0]),
+        WIDTH=buffers.gather_src.shape[0], BLOCK_R=_next_power_of_two(tables.pool_rows),
+        MAP_BLOCK=1024, PREFETCH=bool(prefetch), DEMAND=bool(probe),
+        SPILL=bool(spill), WAVE=bool(wave), num_warps=8,
     )
 
 
@@ -698,12 +805,13 @@ def _step_kernel():
         hot_phys_ptr, host_row_ptr, row_key_ptr, row_use_ptr,
         clock_ptr, gate_ptr, error_ptr, limit_ptr, interval_ptr, forwards_ptr,
         min_misses_ptr, protect_ptr, miss_count_ptr, staging_ptr, misses_total_ptr,
-        pf_row_ptr, pf_counts_ptr,
+        pf_row_ptr, pf_counts_ptr, demand_ptr,
         gather_src_ptr, gather_dst_ptr, gather_count_ptr, routes_ptr,
         staged_expert_ptr, staged_row_ptr, staged_count_ptr, promoted_count_ptr,
         step_map_ptr, num_experts, pool_rows, lru_start, n_staging,
         WIDTH: tl.constexpr, BLOCK_R: tl.constexpr, MAP_BLOCK: tl.constexpr,
-        PREFETCH: tl.constexpr,
+        PREFETCH: tl.constexpr, DEMAND: tl.constexpr, SPILL: tl.constexpr,
+        WAVE: tl.constexpr,
     ):
         never = 0x7FFFFFFFFFFFFFFF
         lane = tl.arange(0, WIDTH)
@@ -723,6 +831,15 @@ def _step_kernel():
         gate = tl.load(gate_ptr) != 0
         clock = tl.load(clock_ptr)
         forwards = tl.load(forwards_ptr)
+        if DEMAND:
+            # H95 probe: distinct ids that are not FIXED residents -- the rows
+            # above the residents this step needs (LRU hits included).
+            fixed = hit & (resident < lru_start)
+            nonres = tl.sum((distinct & (~fixed)).to(tl.int32), 0).to(tl.int64)
+            tl.store(demand_ptr, tl.maximum(tl.load(demand_ptr), nonres))
+            over = nonres > (pool_rows - lru_start + n_staging)
+            tl.store(demand_ptr + 1, tl.load(demand_ptr + 1) + over.to(tl.int64))
+            tl.store(demand_ptr + 2, tl.load(demand_ptr + 2) + 1)
         if PREFETCH:
             # The speculative pass leaves the clock where it is: that is what
             # protects the target layer's last real working set from being
@@ -736,8 +853,9 @@ def _step_kernel():
             if gate:
                 clock = clock + 1
                 tl.store(clock_ptr, clock)
-                forwards = forwards + 1
-                tl.store(forwards_ptr, forwards)
+                if WAVE == 0:
+                    forwards = forwards + 1
+                    tl.store(forwards_ptr, forwards)
                 stamp = hit & (resident >= lru_start)
                 marked = tl.load(
                     pf_row_ptr + tl.where(stamp, resident, 0), mask=stamp, other=-1
@@ -753,6 +871,9 @@ def _step_kernel():
         min_misses = tl.load(min_misses_ptr)
         protect = tl.load(protect_ptr).to(tl.int64)
         if PREFETCH:
+            promote_ok = gate
+        elif WAVE:
+            # H95: a later wave of the same batch is not a forward of its own
             promote_ok = gate
         else:
             promote_ok = gate & (((forwards - 1) % interval) == 0)
@@ -774,7 +895,13 @@ def _step_kernel():
             use = tl.where(in_lru & (key < 0), -1, use)
         promoted = 0
         staged = 0
-        for i in range(0, WIDTH):
+        if WAVE:
+            # H95: a wave that routes no miss (the usual later wave) skips
+            # the per-lane loop instead of paying WIDTH serial iterations
+            n_loop = tl.where(misses > 0, WIDTH, 0)
+        else:
+            n_loop = WIDTH
+        for i in range(0, n_loop):
             is_miss = tl.sum(tl.where(lane == i, (distinct & (~hit)).to(tl.int32), 0), 0)
             if is_miss > 0:
                 # From the registers, never a second load: the ids buffer is
@@ -827,8 +954,11 @@ def _step_kernel():
                         else:
                             # no victim and no staging row left: never write
                             # past the staging table; the sticky error is
-                            # read at the next host rendezvous
-                            tl.store(error_ptr, 1)
+                            # read at the next host rendezvous. H95: under
+                            # SPILL the lane keeps route -1 and the caller's
+                            # next wave serves it.
+                            if SPILL == 0:
+                                tl.store(error_ptr, 1)
             tl.debug_barrier()
         tl.store(promoted_count_ptr, promoted)
         if PREFETCH:
@@ -942,5 +1072,8 @@ __all__ = [
     "bijection_breaks", "copy_rows_reference", "seed_lru_rows", "step", "step_reference", "sync_tables",
     "take_report",
     "take_prefetch_report",
+    "take_demand_report",
+    "pool_row_capacity",
+    "pool_waves_for",
     "check_pool_error",
 ]

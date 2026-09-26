@@ -1565,6 +1565,22 @@ def describe_seat_rebook(rb: SeatRebook, *, source: str) -> str:
 #: the device-planned pool (``expert_offload.prepare_pool``).
 POOL_GRAPH_MODE_ENV = "SGLANG_MOE_OFFLOAD_GRAPH_MODE"
 
+#: H95: SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES (environ.py, EnvInt default 0) --
+#: mirrored like DRAFT_SHARE_EMBED because the launcher reads GROUP D's env.
+POOL_OVERFLOW_WAVES_ENV = "SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES"
+
+
+def pool_overflow_waves(env: Mapping[str, str]) -> int:
+    """H95: the wave cap group D runs with; 1 when off (0, 1 or unset)."""
+    raw = str(env.get(POOL_OVERFLOW_WAVES_ENV, "")).strip()
+    if not raw:
+        return 1
+    try:
+        n = int(raw)
+    except ValueError as exc:
+        raise ValueError('%s="%s" ist keine Zahl' % (POOL_OVERFLOW_WAVES_ENV, raw)) from exc
+    return max(1, n)
+
 
 def pool_step_rows_needed(
     *, seats: int, verify_tokens: int, top_k: int, local_experts: int, resident_rows: int
@@ -1578,6 +1594,12 @@ def pool_step_rows_needed(
     return int(min(ids, max(int(local_experts) - int(resident_rows), 0)))
 
 
+def pool_step_waves_needed(*, need_rows: int, scratch_rows: int) -> int:
+    """H95: ``ceil(min(ids, E-R) / Scratch)`` -- the overflow waves a captured
+    step needs when Scratch (LRU + staging) rows serve one wave."""
+    return max(1, -(-int(need_rows) // max(1, int(scratch_rows))))
+
+
 def pool_step_rows_check(
     fits: Sequence[DRankResidency],
     *,
@@ -1587,13 +1609,19 @@ def pool_step_rows_check(
     pool_mode: bool,
     marker: str,
     label: str,
+    waves: int = 1,
 ) -> Tuple[Tuple[str, ...], Optional[str]]:
     """H91b: the per-step row bound at D's seat count, per rank.
 
     Measured by the Form-A bs2 audit: at bs1 a verify step routes 4 x 10 = 40
     ids, at bs2 80 -- and a worker with Scratch 48 then raises 'Step ids exceed
     the LRU rows plus the staging rows' while the bs2 verify graph is CAPTURED
-    (loud, every boot). Refused here with the numbers instead."""
+    (loud, every boot). Refused here with the numbers instead.
+
+    H95: with ``waves`` = SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES >= 2 the bound is
+    ``min(ids, E-R) <= waves x Scratch`` -- the scratch no longer grows with
+    the seats, the number of waves a graph captures does (per rank, named in
+    the line)."""
     if seats is None or not pool_mode:
         return (), None
     if verify_tokens is None or top_k is None:
@@ -1616,11 +1644,27 @@ def pool_step_rows_check(
         )
         for f in fits
     ]
-    short = [f.rank for f, n in zip(fits, need) if int(f.scratch_rows) < n]
+    w = max(1, int(waves))
+    short = [f.rank for f, n in zip(fits, need) if w * int(f.scratch_rows) < n]
+    wave_text = ""
+    if w > 1:
+        wave_text = (
+            " -- H95 Ueberlaufwellen (%s=%d): Schranke min(Ids, E-R) <= %d x Scratch, "
+            "Wellen je Rang %s"
+            % (
+                POOL_OVERFLOW_WAVES_ENV,
+                w,
+                w,
+                [
+                    pool_step_waves_needed(need_rows=n, scratch_rows=int(f.scratch_rows))
+                    for f, n in zip(fits, need)
+                ],
+            )
+        )
     line = (
         "%s FRACTION-SOLVE %s POOL-SCHRITT (H91b): %d Sitz(e) x %d Verify-Zeilen x "
         "top_k %d = %d Ids je Schritt -> Zeilen (LRU+Staging) Pflicht je Rang %s = "
-        "min(Ids, E-R), Scratch gegeben %s%s"
+        "min(Ids, E-R), Scratch gegeben %s%s%s"
         % (
             marker,
             label,
@@ -1630,11 +1674,30 @@ def pool_step_rows_check(
             int(seats) * int(verify_tokens) * int(top_k),
             need,
             [int(f.scratch_rows) for f in fits],
+            wave_text,
             (" -- ZU KLEIN auf Rang %s" % short) if short else " -- passt",
         )
     )
     if not short:
         return (line,), None
+    if w > 1:
+        refusal = (
+            "W-SITZE D-Pool-Schritt: bei %d Sitz(en) braucht ein Decode-Schritt je Rang "
+            "%s Zeilen (LRU+Staging), %d Ueberlaufwellen x SGLANG_MOE_SCRATCH_SLOTS %s "
+            "tragen %s -- Rang %s wirft beim Capture des bs%d-Graphen 'Step ids exceed "
+            "the LRU rows plus the staging rows'; %s anheben oder Scratch dort anheben"
+            % (
+                int(seats),
+                need,
+                w,
+                [int(f.scratch_rows) for f in fits],
+                [w * int(f.scratch_rows) for f in fits],
+                short,
+                int(seats),
+                POOL_OVERFLOW_WAVES_ENV,
+            )
+        )
+        return (line,), refusal
     refusal = (
         "W-SITZE D-Pool-Schritt: bei %d Sitz(en) braucht ein Decode-Schritt je Rang "
         "%s Zeilen (LRU+Staging), SGLANG_MOE_SCRATCH_SLOTS gibt %s -- Rang %s "
@@ -1943,6 +2006,7 @@ def plan_d_residency(
         pool_mode=str(env_d.get(POOL_GRAPH_MODE_ENV, "")).strip().lower() == "pool",
         marker=marker,
         label=label,
+        waves=pool_overflow_waves(env_d),
     )
     lines = lines + step_lines
     card_lines, cards, card_refusal = _plan_d_card(

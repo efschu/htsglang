@@ -2110,6 +2110,26 @@ class Envs:
     # the pool's eager forwards follow SGLANG_MOE_OFFLOAD_WAVE_ORDER again.
     # Rank-uniform: every rank reads the same launcher env.
     SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR = EnvBool(True)
+    # H95: the captured decode step of the device-planned pool
+    # (SGLANG_MOE_OFFLOAD_GRAPH_MODE=pool) in up to N OVERFLOW WAVES. 0 or 1
+    # (default) = off, the Task #40 worst case: a captured batch needs
+    # min(bs x verify x top_k, E - R) <= LRU + staging rows, so the scratch
+    # grows with the seats (Form A D bs2: 80 rows, residency 0.29 on the 3080
+    # workers; bs6: 240 ids). N >= 2: the bound is min(ids, E - R) <= N x
+    # (LRU + staging) -- wave 1 is the ordinary step, the experts it cannot
+    # hold are served by the next wave over exactly their lanes (weight 0 in
+    # every other wave), so the scratch stays that of bs1 and a step that fits
+    # computes exactly as without waves. A graph whose batch fits one wave
+    # captures no second one. Rank-uniform: every rank reads the launcher env;
+    # the wave count itself is rank-local (no collective inside the MoE).
+    SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES = EnvInt(0)
+    # H95 probe: every N decode graph replays, one line per rank
+    # 'MOE-POOL-DEMAND (H95)' with, per MoE layer since the last line, the
+    # MAXIMUM number of distinct non-resident expert ids one step routed and
+    # how many steps exceeded LRU + staging -- the measured demand the pool
+    # bound is about, instead of its worst case. 0 (default) = off; the pool
+    # tables then carry no demand counters and the step kernel is unchanged.
+    SGLANG_DEBUG_MOE_POOL_DEMAND = EnvInt(0)
     # #254: how a prefill forward that overflows the scratch region is split.
     #   "token"  (default) -- waves are disjoint TOKEN subsets; every wave
     #     re-fetches the spill experts its tokens need, so a spill expert is
