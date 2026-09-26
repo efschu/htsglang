@@ -5000,6 +5000,9 @@ class Scheduler(
         if not gone:
             return 0
         hold[:] = keep
+        from sglang.srt.weg2 import d_park_draft as _dpd  # H91d: the park's draft buffer
+
+        _dpd.drop_all(self, gone, "abort")
         try:
             _cc = self.tree_cache.cache_controller
             for _r in gone:
@@ -5051,6 +5054,22 @@ class Scheduler(
         from sglang.srt.weg2 import d_park_runtime
 
         return d_park_runtime.park_abort(self, recv_req)
+
+    # H91d: a parked request's MTP draft rows (weg2/d_park_draft.py).
+    def _weg2_d_park_draft_snapshot(self, batch):
+        from sglang.srt.weg2 import d_park_draft
+
+        return d_park_draft.snapshot(self, batch)
+
+    def _weg2_d_park_draft_save(self, retracted_reqs, snap) -> int:
+        from sglang.srt.weg2 import d_park_draft
+
+        return d_park_draft.save_retracted(self, retracted_reqs, snap)
+
+    def _weg2_d_park_draft_restore(self, batch) -> int:
+        from sglang.srt.weg2 import d_park_draft
+
+        return d_park_draft.restore_admitted(self, batch)
 
     def _weg2_group_min_flags(self, flags):
         """#1471e: ONE verdict for the group.  weg2xsn240: rank 2 released a
@@ -15615,9 +15634,11 @@ class Scheduler(
         old_mamba_available = (
             mamba_allocator.available_size() if mamba_allocator is not None else None
         )
+        _draft_snap = self._weg2_d_park_draft_snapshot(batch)  # H91d
         retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
             self.server_args
         )
+        self._weg2_d_park_draft_save(retracted_reqs, _draft_snap)  # H91d
         new_available_tokens = self.token_to_kv_pool_allocator.available_size()
         new_token_gained = new_available_tokens - old_available_tokens
         mamba_num_gained = (
@@ -16151,6 +16172,7 @@ class Scheduler(
             )
 
             arm_draft_cold_for_admission(self, batch)
+            self._weg2_d_park_draft_restore(batch)  # H91d: a resumed park's draft rows
         # fnFL2 H32: the chunked request's NEXT chunk, for the PLE gather to
         # read on its worker processes while this forward runs (no-op unless
         # a PLE prefetcher lives in this process).

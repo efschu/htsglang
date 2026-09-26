@@ -2559,6 +2559,23 @@ class Envs:
     # p_group_has_draft_producer) and writes `off` into BOTH groups; on a rank
     # anything but `off` (unset, auto, on) is the draft tier as before.
     SGLANG_WEG2_HICACHE_DRAFT_TIER = EnvStr("auto")
+    # H91d D-PARK DRAFT KV (user decision 2026-09-25: "Ausnahme nur fuers
+    # Parken"): the one exception to the tier being off. A PARKED group-D
+    # request (flip park before D's sleep, pressure park of the youngest)
+    # keeps its MTP draft rows -- the non-zero rows of its committed context,
+    # copied off the draft pool before the retraction into one pageable host
+    # buffer per request (L2, in-process, it survives the sleep) and written
+    # back at its new slots on the resume (weg2/d_park_draft.py). Effective
+    # only on group D with SGLANG_WEG2_D_PARK active and the draft tier off;
+    # nothing is pinned, nothing un-parked is touched. False = H91b byte for
+    # byte (the resumed request drafts over whatever its new slots held).
+    SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV = EnvBool(True)
+    # H91d: the L2 bound of those buffers per rank (MiB). A FLIP park whose
+    # buffer would pass it goes to L3 (a file under
+    # SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR/weg2_d_park_draft, written in the
+    # background, the RAM freed once written); a PRESSURE park (no sleep) is
+    # then not carried. 256 = one full 262k context of NF's draft (~1 KiB/token).
+    SGLANG_WEG2_D_PARK_DRAFT_KV_HOST_MIB = EnvInt(256)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
