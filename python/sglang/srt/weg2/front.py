@@ -4632,29 +4632,42 @@ class Front:
                 # not moving rules out an arrival that came and went inside
                 # this window, which `len(outstanding)` at two instants
                 # cannot.
-                _unc = max(0, pt - ct)
-                _w = time.time() - t0
-                _solo = (_solo_entry
-                         and self._d_admissions == _solo_adm0
-                         and len(g.outstanding) == 1)
-                if _solo and _unc > 0:
-                    # H84: THE RATE IS D'S OWN PREFILL TIME, never this wall
-                    # (the wall holds the decode; see `r_d_probe`).
-                    _pfs = d_prefill_seconds(js)
-                    _r_d, _why = r_d_probe(_unc, _pfs, envs.SGLANG_WEG2_X_RD_MIN_UNCACHED.get())
-                    logger.info("WEG2 X R_D rid=%s uncached=%d d_prefill_s=%s wall=%.2fs verdict=%s "
-                                "r_D=%s (r_D = uncached / d_prefill_s; the wall is shown, never used)",
-                                rid, _unc, "none" if _pfs is None else f"{_pfs:.3f}", _w, _why,
-                                "-" if _r_d is None else f"{_r_d:.0f}")
-                    if _r_d is not None:
-                        self._x_r_d_src = f"d_prefill_s verdict={verdict}"
-                        self.note_x_sample("r_d", _r_d)
-                    elif _why == "short":
-                        self.counters["r_d_skipped_short"] += 1
-                    else:
-                        self.counters["r_d_skipped_no_prefill_time"] += 1
-                elif _unc > 0:
-                    self.counters["r_d_skipped_concurrent"] += 1
+                #
+                # rc2.1g (27B Review V RC7b, bb086e1120): A MEASUREMENT NEVER
+                # DECIDES A REQUEST'S FATE. D has answered; an exception in
+                # this sample used to escape leg 2 and turn a SERVED answer
+                # into a 503. Counted (`r_d_probe_errors`) and logged, never
+                # propagated -- the 27B line guards its `_sample_r_d` the same
+                # way (NF has no `_sample_r_d`: H84's sample lives inline here,
+                # on the non-streamed branch only).
+                try:
+                    _unc = max(0, pt - ct)
+                    _w = time.time() - t0
+                    _solo = (_solo_entry
+                             and self._d_admissions == _solo_adm0
+                             and len(g.outstanding) == 1)
+                    if _solo and _unc > 0:
+                        # H84: THE RATE IS D'S OWN PREFILL TIME, never this wall
+                        # (the wall holds the decode; see `r_d_probe`).
+                        _pfs = d_prefill_seconds(js)
+                        _r_d, _why = r_d_probe(_unc, _pfs, envs.SGLANG_WEG2_X_RD_MIN_UNCACHED.get())
+                        logger.info("WEG2 X R_D rid=%s uncached=%d d_prefill_s=%s wall=%.2fs verdict=%s "
+                                    "r_D=%s (r_D = uncached / d_prefill_s; the wall is shown, never used)",
+                                    rid, _unc, "none" if _pfs is None else f"{_pfs:.3f}", _w, _why,
+                                    "-" if _r_d is None else f"{_r_d:.0f}")
+                        if _r_d is not None:
+                            self._x_r_d_src = f"d_prefill_s verdict={verdict}"
+                            self.note_x_sample("r_d", _r_d)
+                        elif _why == "short":
+                            self.counters["r_d_skipped_short"] += 1
+                        else:
+                            self.counters["r_d_skipped_no_prefill_time"] += 1
+                    elif _unc > 0:
+                        self.counters["r_d_skipped_concurrent"] += 1
+                except Exception as e:  # noqa: BLE001 - never breaks serving
+                    self.counters["r_d_probe_errors"] += 1
+                    logger.warning("WEG2 X R_D-PROBE-ERROR rid=%s %s: %s (no sample)",
+                                   rid, type(e).__name__, e)
                 if pt:
                     # #1324, as on the streamed branch above: `ct` is the
                     # measured presence, `pt` the tokenisation fact. On a W31
