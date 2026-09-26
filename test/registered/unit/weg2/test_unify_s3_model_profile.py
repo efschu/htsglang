@@ -189,7 +189,10 @@ def test_the_27b_constants_moved_unchanged_and_the_nf_row_is_separate():
     assert n["P_DRAFT_RESIDENT_BUDGET_MIB"].value == pytest.approx(615.7 + 1522.7)
     assert n["P_DRAFT_RESIDENT_BUDGET_MIB"].measured_on == "nextflash"
     borrowed = dict(F.borrowed_constants("nextflash"))
-    assert set(borrowed) == set(n) - {"P_DRAFT_RESIDENT_BUDGET_MIB"}
+    # rc12 OOM: the NF row's second own record (WEG2-DORMANT-SERVED)
+    assert n["P_DORMANT_SERVED_GROWTH_MIB"].measured_on == "nextflash"
+    assert "P_DORMANT_SERVED_GROWTH_MIB" not in q
+    assert set(borrowed) == set(n) - {"P_DRAFT_RESIDENT_BUDGET_MIB", "P_DORMANT_SERVED_GROWTH_MIB"}
     assert set(borrowed.values()) == {"qwen27b"}
     assert F.borrowed_constants("qwen27b") == ()
     assert "P_OVERSHOOT_MIB" in F.borrowed_constants_line("nextflash")

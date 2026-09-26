@@ -10538,6 +10538,21 @@ def parse_user_reserve(raw, cards) -> Dict[str, int]:
     return {c.uuid: v for c, v in zip(cards, values)}
 
 
+def served_dormant_growth(cards: List[Card], profile: Optional[str] = None) -> Tuple[Optional[List[int]], str]:
+    """``P_DORMANT_SERVED_GROWTH_MIB`` of the profile, per card ordinal, or
+    ``(None, "")`` where the profile never measured it (27B today: its budgets
+    stay byte-identical until a WEG2-DORMANT-SERVED record lands)."""
+    try:
+        vals = [int(v) for v in _pconst("P_DORMANT_SERVED_GROWTH_MIB", profile)]
+    except KeyError:
+        return None, ""
+    if len(vals) != len(cards):
+        raise Weg2LaunchRefused(
+            f"P_DORMANT_SERVED_GROWTH_MIB has {len(vals)} entries for {len(cards)} cards; "
+            f"re-measure with python -m sglang.srt.weg2.dormant_residue")
+    return vals, "WEG2-DORMANT-SERVED record"
+
+
 def budgets_from_dc(
     cards: List[Card],
     dc_mib: Dict[str, int],
@@ -10548,6 +10563,8 @@ def budgets_from_dc(
     corridor_sample_path: Optional[str] = None,
     corridor_constrain: bool = False,
     user_reserve_by_card: Optional[Dict[str, int]] = None,
+    dormant_growth_mib: Optional[List[int]] = None,
+    dormant_growth_provenance: str = "",
 ) -> List[int]:
     out = []
     # #1257c: ONE derivation, per card, for the group this budget is for.
@@ -10565,7 +10582,12 @@ def budgets_from_dc(
         over = int(overshoot_mib[i]) if overshoot_mib is not None else 0
         cf = floors[c.uuid]
         corridor = int(cf.mib) + D_AWAKE_OVERSHOOT_MIB
-        b = c.total_mib - corridor - dc_mib[c.uuid] - over
+        # rc12 OOM (D TP0, 22:59:07Z): ``dc_mib`` is the other group's residue
+        # at its FIRST sleep; a group that has served sleeps heavier
+        # (P PP0 1320 -> 1802 MiB). The growth is a measured record
+        # (weg2/dormant_residue.py), charged here as its own term.
+        grow = int(dormant_growth_mib[i]) if dormant_growth_mib is not None else 0
+        b = c.total_mib - corridor - dc_mib[c.uuid] - grow - over
         b = (b // 8) * 8
         out.append(b)
         log(
@@ -10575,6 +10597,7 @@ def budgets_from_dc(
             f"(floor {cf.mib} source={cf.source} reserve={cf.reserve_mib} "
             f"+ awake_overshoot {D_AWAKE_OVERSHOOT_MIB}) "
             f"- dormant_other {dc_mib[c.uuid]}"
+            + (f" - served_dormant_growth {grow} ({dormant_growth_provenance})" if grow else "")
             + (f" - measured_awake_overshoot {over} ({overshoot_provenance})" if over else "")
             + " MiB"
         )
@@ -10610,6 +10633,8 @@ def budgets_from_dc(
     # inputs to price it are missing and when the only card that needs the
     # margin is the one the world pool is bound by.
     sample, why = corridor_budget.load_sample(corridor_sample_path)
+    if dormant_growth_mib is not None:
+        dc_mib = {c.uuid: dc_mib[c.uuid] + int(dormant_growth_mib[i]) for i, c in enumerate(cards)}
     solve = corridor_budget.solve_corridor_budgets(
         cards, out, dc_mib, sample, why, floors=floors, group=f"{group} pass={label}"
     )
@@ -20351,7 +20376,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return int(spec_d.proc.returncode or 0)
     launch_group(spec_p, tree, log, dry)
     if dry:
-        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card)
+        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))))
         # #145 AN BEIDEN STELLEN -- siehe #114 direkt darunter: es gibt ZWEI
         # Stellen, an denen budgets_d entsteht, und eine Fassung, die nur die
         # untere trifft, fehlt genau im Dry-Run, wo das Gate sie sucht.
@@ -20470,10 +20495,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.dc_measured_p = dc_p
 
     # 5. group D
+    _grow, _grow_prov = served_dormant_growth(cards, ns.profile)
     budgets_d = budgets_from_dc(
         cards, dc_p, log, "D", overshoot_mib=list(_pconst("D_OVERSHOOT_MIB", ns.profile)), overshoot_provenance="boot weg2ls4b1",
         corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
         user_reserve_by_card=user_reserve_by_card,
+        dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
     )
     state.budgets["D"] = budgets_d
     log_d_rank_vram_solve(ns, cards, budgets_d, log, "D",

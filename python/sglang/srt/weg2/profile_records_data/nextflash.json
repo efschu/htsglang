@@ -16,6 +16,23 @@
    "kind": "memory",
    "power_limit_w": null,
    "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "P_DORMANT_SERVED_GROWTH_MIB",
+   "value": [
+    482,
+    572,
+    384
+   ],
+   "provenance": "WEG2-DORMANT-SERVED (weg2/dormant_residue.py) over the P logs of the Dauerlauf boots dkrnfh91bar1dauer09262249 (530fb713ce) + 09262231 + 09262218 (2a7f992c14): sleeping P rank per card ordinal, max served residue - fresh residue (PP0 5090 1802-1320, PP1 1284-712, PP2 1080-696 MiB); rc12 D TP0 OOM 22:59:07Z ('Process 477 has 1.69 GiB')",
+   "boots": [
+    "dkrnfh91bar1dauer09262249",
+    "dkrnfh91bar1dauer09262231",
+    "dkrnfh91bar1dauer09262218"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not a power-dependent quantity (bytes a sleeping rank keeps)"
   }
  ],
  "borrow": {
