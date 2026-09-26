@@ -4,7 +4,7 @@ Design and model: /spinning/gpu-arb/docs/ATTN_HEAD_SPLIT.md (sec. 2, 5, 6, 8).
 Micro measurement 26.09. (ah_micro_09261050.json): share 0.913, eta 1.10,
 ov 0.026 ms -> the sec. 8.1 phase-2 condition is met; this module is phase 2.
 
-WHAT IT DOES (V1, one direction)
+WHAT IT DOES (V1 form; V2 below)
 ================================
 An OWNER stage (a 3080 stage, PP1/PP2) hands the attention of the LAST
 G KV groups (``G * gqa`` query heads, a :class:`HeadRange`) of its LAST
@@ -28,33 +28,56 @@ no weights. The mirror is P-phase scratch in the KV_CACHE memory-saver region:
 it pauses/resumes with the pool across the flip, and the split state is reset
 at every KV release, so no request ever reads a mirror across a flip.
 
-WHY UPSTREAM ONLY (V1)
-======================
-The helper must enqueue work for chunk i before the owner needs it. PP0 is the
-leader and runs chunk i FIRST, so it knows every chunk before any owner does:
-no pre-announcement is needed and no deadlock is possible. The opposite
-direction (5090 owner, 3080 helpers -- NVFP4 long) needs the split row of
-chunk i on the helper BEFORE it blocks on chunk i's proxy (ATTN_HEAD_SPLIT.md
-sec. 6); that is V2 and refused here by name.
+V2: DOWNSTREAM HELPERS AS SERVERS (NVFP4 long, 5090 owner -> both 3080s)
+=====================================================================
+Spec ``0:1:4:h18-20,0:2:4:h21-23`` (P_MICROBATCH_AH2.md sec. 4): PP0 keeps
+heads 0-17 (groups 0-2, one flashinfer call) and hands the two halves of
+group 3 to PP1 and PP2, on its last 4 full-attention layers. Any head range
+works that is whole groups or lies inside ONE group; the owner's own heads
+are the complement, cut into :func:`own_pieces` (whole-group runs and partial
+groups, one flashinfer call each, concatenated back in head order).
 
-WHERE V2 STARTS (NVFP4 long: 5090 owner -> both 3080s, half groups)
-==================================================================
-Kept open on purpose, nothing below assumes "whole group" or "upstream":
-  * spec     -- ``Delegation.part`` already parses ``hA-B`` (query heads);
-               :func:`validate` refuses it (and helper >= owner) by name.
-  * header   -- carries the query-head range and the kv-group range, not a
-               group count; message sizes, mirror shape and the helper plan
-               are functions of :class:`HeadRange`.
-  * owner    -- V2 adds the owner's own heads as up to two ranges (the second
-               flashinfer call over the shared group, ``ov_partial``) in
-               ``forward_extend_head_subset`` and the concat order here.
-  * helper   -- :meth:`HelperThread.push` is the seam: V1 pushes from the
-               helper's own rule (it runs chunk i first); V2 pushes from the
-               OWNER's announcement (the owner decides alone, the helper only
-               serves), enqueues the whole chunk after its first payload
-               (GIL), and gets its own barlink ring for head payloads plus an
-               owner-side deadline and a per-request A/B switch
-               (/spinning/gpu-arb/docs/P_MICROBATCH_AH2.md).
+  * The OWNER DECIDES ALONE. Only its :class:`SplitRule` counts; a downstream
+    helper never sees chunk i's batch before PP0 needs the answer, so it does
+    not decide, it SERVES (:class:`ServerHelper`): the first payload header of
+    a chunk (layer = the owner's first delegated layer) announces the chunk;
+    the helper checks continuity itself (p == 0 starts a request, otherwise
+    same rid hash, p == next_pos, chunk_no + 1 -- anything else is a named
+    crash-stop) and enqueues the WHOLE chunk (recv -> mirror -> attend -> send
+    for every delegated layer) on its side stream at once. Later headers are
+    checked on the device. One Python wake-up per chunk, not per layer (GIL).
+    An announced chunk is a contract: the owner sends every layer's payload,
+    whatever it does with the answers.
+  * NO DEADLOCK, by construction. PP1/PP2 sit downstream: while PP0 waits for
+    O of chunk i, PP1's main thread is blocked on PP0's frame of chunk i (or
+    still in chunk i-1). The helper work therefore never runs on the main
+    thread or main stream: its own host thread polls pinned publish counters
+    and its own CUDA stream (priority -1) does the work; nothing on it waits
+    for the helper's main stream, and nothing on the owner's main stream waits
+    for the owner's side stream except the one output event the host has
+    already SEEN published. Pinned by ``test_weg2_attn_head_split_v2_0926``:
+    a simulated 3-stage pipeline with blocking frames completes; the naive
+    variant (helper served between the stage's own forwards) hangs.
+  * DEADLINE AND FALLBACK on the owner (``deadline_ms``): the owner's host
+    waits for a helper's output to be PUBLISHED (pinned counter, no spin
+    kernel on the 5090) at most ``deadline_ms`` after its own heads finished.
+    Past it the owner computes that range itself from its always-complete pool
+    (bit-identical input: the pool holds all groups), keeps the late output as
+    owed (drained later on its side stream, so barlink's two slots never fill
+    up), stops waiting for the rest of the chunk, and ENDS the split for the
+    rest of the request. The helper is never told: its mirror just stops being
+    read. ``deadline_ms <= 0`` = no fallback, a named stall after
+    HELPER_STALL_S.
+  * OWN RING: the split's :class:`BarlinkHostTransport` is its own pinned
+    segment with its own per-pair sequences, never the PP proxy transport's,
+    so a proxy frame and a head payload can never share a FIFO.
+  * A/B PER REQUEST (``ab="alt"``): every second new request is not split
+    (pure function of the request sequence, logged ``AH-AB ... arm=``), so one
+    boot measures both arms.
+
+V1 (UPSTREAM HELPER, INT8: 3080 owner -> 5090 helper) is unchanged: the
+helper runs chunk i first, pushes its own jobs from the same rule, the owner
+waits on the device (no deadline -- the helper is never late on purpose).
 
 THE SPLIT RULE (no second bookkeeping)
 ======================================
@@ -108,6 +131,12 @@ HDR_RING = 64
 #: a helper waits at most this long for one payload before it names a stall.
 HELPER_STALL_S = float(os.environ.get("SGLANG_P_ATTN_HEAD_SPLIT_STALL_S", "120"))
 HELPER_POLL_S = 0.0002
+#: V2 owner: how long past its own heads the owner waits for a downstream
+#: helper's output before it computes the range itself (AHConfig.deadline_ms).
+DEADLINE_MS_DEFAULT = 20.0
+#: V2 server helper ranks: GIL switch interval (default 5 ms would put up to
+#: one interval of latency on every chunk announcement, P_MICROBATCH_AH2 4.1-2).
+SERVER_SWITCH_INTERVAL_S = 5e-4
 
 
 class AHSpecError(ValueError):
@@ -149,9 +178,10 @@ class HeadRange:
 
 @dataclass(frozen=True)
 class Delegation:
-    """``part``: ``"G"`` = the last G whole kv groups (V1), or ``"hA-B"`` =
-    query heads A..B inclusive (the V2 head granularity; parsed, refused by
-    :func:`validate` until the owner's partial-group call exists)."""
+    """``part``: ``"G"`` = the last G whole kv groups, or ``"hA-B"`` = query
+    heads A..B inclusive (whole groups or inside ONE group). ``helper <
+    owner`` = V1 (upstream helper runs its own rule), ``helper > owner`` = V2
+    (downstream helper serves the owner's announcements)."""
 
     owner: int
     helper: int
@@ -160,6 +190,11 @@ class Delegation:
 
     def text(self) -> str:
         return f"{self.owner}:{self.helper}:{self.n_layers}:{self.part}"
+
+    @property
+    def downstream(self) -> bool:
+        """V2: the helper sits behind the owner in the pipeline -> it serves."""
+        return self.helper > self.owner
 
     def heads(self, num_kv_heads: int, gqa: int) -> HeadRange:
         num_q = num_kv_heads * gqa
@@ -184,21 +219,29 @@ class AHConfig:
     head_dim: int = 256
     gqa: int = 6
     num_kv_heads: int = 4
+    #: V2 owner deadline past its own heads; <= 0 = wait (named stall).
+    deadline_ms: float = DEADLINE_MS_DEFAULT
+    #: "" = split every eligible request; "alt" = every second new request
+    #: runs unsplit (A/B inside one boot).
+    ab: str = ""
 
     # -- wire format (launcher -> ranks) ---------------------------------
     def to_env(self) -> str:
-        return json.dumps(
-            {
-                "spec": ",".join(d.text() for d in self.delegations),
-                "min_w": self.min_w,
-                "cap_tokens": self.cap_tokens,
-                "max_w": self.max_w,
-                "head_dim": self.head_dim,
-                "gqa": self.gqa,
-                "num_kv_heads": self.num_kv_heads,
-            },
-            sort_keys=True,
-        )
+        raw = {
+            "spec": ",".join(d.text() for d in self.delegations),
+            "min_w": self.min_w,
+            "cap_tokens": self.cap_tokens,
+            "max_w": self.max_w,
+            "head_dim": self.head_dim,
+            "gqa": self.gqa,
+            "num_kv_heads": self.num_kv_heads,
+        }
+        # V2 knobs only when set: a V1 config serialises byte-identically.
+        if self.deadline_ms != DEADLINE_MS_DEFAULT:
+            raw["deadline_ms"] = self.deadline_ms
+        if self.ab:
+            raw["ab"] = self.ab
+        return json.dumps(raw, sort_keys=True)
 
     @classmethod
     def from_env(cls, text: str) -> "AHConfig":
@@ -214,7 +257,11 @@ class AHConfig:
             head_dim=int(raw.get("head_dim", 256)),
             gqa=int(raw.get("gqa", 6)),
             num_kv_heads=int(raw.get("num_kv_heads", 4)),
+            deadline_ms=float(raw.get("deadline_ms", DEADLINE_MS_DEFAULT)),
+            ab=str(raw.get("ab", "")),
         )
+        if cfg.ab not in ("", "alt"):
+            raise AHSpecError(f"{ENV}: ab={cfg.ab!r}, expected '' or 'alt'")
         return cfg
 
     # -- derived ---------------------------------------------------------
@@ -229,6 +276,17 @@ class AHConfig:
             if d.owner == stage:
                 return d
         return None
+
+    def of_owner_all(self, stage: int) -> Tuple[Delegation, ...]:
+        """All delegations of one owner, in head order (V2: one per helper)."""
+        ds = [d for d in self.delegations if d.owner == stage]
+        return tuple(sorted(ds, key=lambda d: self.heads_of(d).q0))
+
+    def delegation(self, owner: int, helper: int) -> Delegation:
+        for d in self.delegations:
+            if d.owner == owner and d.helper == helper:
+                return d
+        raise KeyError((owner, helper))
 
     def of_helper(self, stage: int) -> Tuple[Delegation, ...]:
         return tuple(d for d in self.delegations if d.helper == stage)
@@ -283,42 +341,62 @@ def validate(
     full-attention layers it owns (checked when known)."""
     if not delegations:
         raise AHSpecError("--p-attn-head-split: empty spec")
-    owners = [d.owner for d in delegations]
-    if len(set(owners)) != len(owners):
-        raise AHSpecError(f"--p-attn-head-split: an owner stage appears twice ({owners})")
+    pairs = [(d.owner, d.helper) for d in delegations]
+    if len(set(pairs)) != len(pairs):
+        raise AHSpecError(f"--p-attn-head-split: an owner:helper pair appears twice ({pairs})")
     helpers = {d.helper for d in delegations}
+    num_q = num_kv_heads * gqa
+    by_owner: Dict[int, List[Delegation]] = {}
     for d in delegations:
         if not (0 <= d.owner < pp_size and 0 <= d.helper < pp_size):
             raise AHSpecError(f"--p-attn-head-split {d.text()}: stage outside PP{pp_size}")
-        if d.helper >= d.owner:
-            raise AHSpecError(
-                f"--p-attn-head-split {d.text()}: REFUSED -- the helper must be "
-                "UPSTREAM of the owner (helper < owner). A downstream helper "
-                "must know chunk i's split row before it blocks on chunk i's "
-                "proxy; that pre-announcement is V2 (ATTN_HEAD_SPLIT.md sec. 6)."
-            )
+        if d.helper == d.owner:
+            raise AHSpecError(f"--p-attn-head-split {d.text()}: a stage cannot be its own helper")
         if d.owner in helpers:
             raise AHSpecError(
                 f"--p-attn-head-split {d.text()}: stage {d.owner} would be owner "
                 "AND helper; one barlink instance serves one stream per role"
             )
-        hr = d.heads(num_kv_heads, gqa)
-        if hr.q0 == 0:
-            raise AHSpecError(f"--p-attn-head-split {d.text()}: the owner must keep at least one head")
-        if not hr.whole_groups(gqa) or hr.q1 != num_kv_heads * gqa:
-            raise AHSpecError(
-                f"--p-attn-head-split {d.text()}: heads [{hr.q0},{hr.q1}) -- V1 delegates the "
-                "LAST whole kv groups only (one flashinfer call on the owner). Part groups and "
-                "non-suffix ranges are V2: the owner needs its second call over the shared "
-                "group (ATTN_HEAD_SPLIT.md sec. 6, ov_partial)"
-            )
         if d.n_layers < 1:
             raise AHSpecError(f"--p-attn-head-split {d.text()}: n_layers must be >= 1")
+        hr = d.heads(num_kv_heads, gqa)
+        if not hr.whole_groups(gqa) and hr.n_kv != 1:
+            raise AHSpecError(
+                f"--p-attn-head-split {d.text()}: heads [{hr.q0},{hr.q1}) -- a delegated range is "
+                "whole kv groups or lies inside ONE group (the helper runs one flashinfer call "
+                "with one GQA ratio)"
+            )
+        by_owner.setdefault(d.owner, []).append(d)
+    for h in helpers:
+        dirs = {d.downstream for d in delegations if d.helper == h}
+        if len(dirs) != 1:
+            raise AHSpecError(
+                f"--p-attn-head-split: helper stage {h} serves an upstream AND a downstream "
+                "owner; one helper role per stage (V1 rule-driven or V2 server)"
+            )
+    for o, ds in by_owner.items():
+        text = ",".join(d.text() for d in ds)
+        if len({d.n_layers for d in ds}) != 1:
+            raise AHSpecError(
+                f"--p-attn-head-split {text}: owner {o} delegates the same layers to every "
+                "helper (one n_layers per owner)"
+            )
+        if len({d.downstream for d in ds}) != 1:
+            raise AHSpecError(
+                f"--p-attn-head-split {text}: owner {o} mixes upstream and downstream helpers; "
+                "all helpers of an owner are upstream (V1) or all downstream (V2)"
+            )
+        ranges = sorted((d.heads(num_kv_heads, gqa) for d in ds), key=lambda r: r.q0)
+        for x, y in zip(ranges, ranges[1:]):
+            if y.q0 < x.q1:
+                raise AHSpecError(f"--p-attn-head-split {text}: head ranges of owner {o} overlap")
+        if sum(r.n_q for r in ranges) >= num_q:
+            raise AHSpecError(f"--p-attn-head-split {text}: the owner must keep at least one head")
         if owner_attn_layers is not None:
-            have = int(owner_attn_layers.get(d.owner, 0))
-            if d.n_layers > have:
+            have = int(owner_attn_layers.get(o, 0))
+            if ds[0].n_layers > have:
                 raise AHSpecError(
-                    f"--p-attn-head-split {d.text()}: stage {d.owner} owns only "
+                    f"--p-attn-head-split {text}: stage {o} owns only "
                     f"{have} full-attention layers"
                 )
 
@@ -348,6 +426,32 @@ def own_counts(hr: HeadRange) -> Tuple[int, int]:
     return hr.q0, hr.g0
 
 
+def own_pieces(delegated: Sequence[HeadRange], num_q: int, gqa: int) -> Tuple[HeadRange, ...]:
+    """The owner's own heads = the complement of its delegated ranges, cut
+    into pieces one flashinfer call each can run: runs of whole groups, and
+    partial groups (a group shared with a helper). Head order."""
+    cover = sorted((r.q0, r.q1) for r in delegated)
+    gaps, at = [], 0
+    for q0, q1 in cover:
+        if q0 > at:
+            gaps.append((at, q0))
+        at = max(at, q1)
+    if at < num_q:
+        gaps.append((at, num_q))
+    out: List[HeadRange] = []
+    for a, b in gaps:
+        while a < b:
+            if a % gqa:
+                e = min(b, (a // gqa + 1) * gqa)
+            else:
+                e = (b // gqa) * gqa
+                if e <= a:
+                    e = b
+            out.append(HeadRange(a, e, a // gqa, -(-e // gqa)))
+            a = e
+    return tuple(out)
+
+
 def message_bytes(n_q: int, n_kv: int, w: int, head_dim: int) -> Tuple[int, int]:
     """(payload bytes owner->helper, output bytes helper->owner), bf16:
     [hdr | q (n_q heads) | k, v (n_kv groups)] and [hdr | O (n_q heads)]."""
@@ -362,9 +466,13 @@ def stage_post_mib(cfg: AHConfig, stage: int, *, kv_elem_bytes: int = 1) -> floa
     ``PhasePoolModel.attn_head_split_mib[stage]``.
 
     helper: mirror (2 x cap x G x D x fp8 per delegated layer) + float/int
-            workspace + one in-flight payload and output per owner.
-    owner : its subset wrapper's int workspace + payload, output, own-head q
-            copy of one layer at max_w.
+            workspace + one in-flight payload and output per owner (a server
+            helper's whole-chunk queue reuses them stream-ordered).
+    owner : one int workspace per subset-wrapper shape (own pieces; V2 also
+            the fallback shapes of its delegated ranges) + every helper's
+            payload and output of one layer at max_w + the q copies of the own
+            pieces (V2: of all heads, the fallback copies too) + V2 one owed
+            late output per helper.
     """
     mib = 0.0
     D = cfg.head_dim
@@ -377,12 +485,22 @@ def stage_post_mib(cfg: AHConfig, stage: int, *, kv_elem_bytes: int = 1) -> floa
             hr = cfg.heads_of(d)
             pay, out = message_bytes(hr.n_q, hr.n_kv, cfg.max_w, D)
             mib += (pay + out) / 2**20
-    own = cfg.of_owner(stage)
-    if own is not None:
-        hr = cfg.heads_of(own)
-        pay, out = message_bytes(hr.n_q, hr.n_kv, cfg.max_w, D)
-        q_own, _ = own_counts(hr)
-        mib += INT_WS_MIB + (pay + out + cfg.max_w * q_own * D * 2) / 2**20
+    own = cfg.of_owner_all(stage)
+    if own:
+        ranges = [cfg.heads_of(d) for d in own]
+        server = own[0].downstream
+        pieces = own_pieces(ranges, cfg.num_kv_heads * cfg.gqa, cfg.gqa)
+        shapes = {(p.n_q, p.n_kv) for p in pieces}
+        q_heads = sum(p.n_q for p in pieces)
+        nbytes = 0
+        for hr in ranges:
+            pay, out = message_bytes(hr.n_q, hr.n_kv, cfg.max_w, D)
+            nbytes += pay + out
+            if server:
+                shapes.add((hr.n_q, hr.n_kv))
+                q_heads += hr.n_q
+                nbytes += out
+        mib += INT_WS_MIB * len(shapes) + (nbytes + cfg.max_w * q_heads * D * 2) / 2**20
     return mib
 
 
@@ -425,17 +543,27 @@ class SplitRule:
     (retract + re-prefill) to exactly the old ``next_pos``; the CPU test
     ``test_a_rank_blind_to_graph_forwards_diverges`` pins that."""
 
-    def __init__(self, min_w: int, cap_tokens: int):
+    def __init__(self, min_w: int, cap_tokens: int, ab: str = ""):
         self.min_w = int(min_w)
         self.cap = int(cap_tokens)
+        self.ab = ab
         self.active: Optional[str] = None
         self.next_pos = 0
         self.chunk_no = 0
+        #: new eligible requests seen (A/B counter; survives reset())
+        self.n_req = 0
+        #: (rid, arm, n_req) of a request that started in the last decide()
+        self.last_start: Optional[Tuple[str, str, int]] = None
 
     def reset(self) -> None:
         self.active = None
         self.next_pos = 0
         self.chunk_no = 0
+
+    def end_request(self) -> None:
+        """V2 owner fallback: the active request is not split any further
+        (its helpers' mirrors stop being read; they are never told)."""
+        self.reset()
 
     def decide(
         self,
@@ -447,6 +575,7 @@ class SplitRule:
         if rids is None or prefix_lens is None or extend_lens is None:
             return None  # capture / warmup / dummy forwards: not a request
         rids = list(rids)
+        self.last_start = None
         if self.active is not None and self.active in rids:
             touched = True
         else:
@@ -458,6 +587,12 @@ class SplitRule:
         rid, p, w = rids[0], int(prefix_lens[0]), int(extend_lens[0])
         eligible = w >= self.min_w and p + w <= self.cap
         if eligible and p == 0:
+            self.n_req += 1
+            if self.ab == "alt" and self.n_req % 2 == 0:
+                self.last_start = (rid, "base", self.n_req)
+                self.reset()
+                return None
+            self.last_start = (rid, "split", self.n_req)
             self.active, self.next_pos, self.chunk_no = rid, w, 0
             return ChunkRow(rid, rid_hash(rid), 0, w, 0)
         if eligible and rid == self.active and p == self.next_pos:
@@ -529,8 +664,10 @@ def reference_attention(
     """The chunk attention the paged kernel computes, as plain math: queries
     at positions p..p+w-1 over keys 0..p+w-1 (causal, bottom-right aligned),
     stored K/V dequantised by the scales. q [w, Hq, D], k/v [>= p+w, Hk, D].
-    One GQA group per iteration, so a head's result never depends on how many
-    other heads share the call (CPU bit-equality of the split)."""
+    One query head per iteration (head h reads kv group ``h // (Hq // Hk)``),
+    so a head's result never depends on how many other heads share the call
+    -- whole groups, half groups, the owner's fallback (CPU bit-equality of
+    V1 and V2 splits)."""
     w, hq, d = q.shape
     hk = k_all.shape[1]
     gs = hq // hk
@@ -542,15 +679,16 @@ def reference_attention(
     pos_k = torch.arange(L).unsqueeze(0)
     mask = pos_k <= pos_q
     out = torch.empty(w, hq, d, dtype=torch.float32)
-    for g in range(hk):
+    for h in range(hq):
+        g = h // gs
         # contiguous operands: the result must not depend on the caller's
         # layout (pool view, mirror, full tensor)
-        qs = qf[:, g * gs:(g + 1) * gs, :].contiguous()  # [w, gs, D]
+        qh = qf[:, h, :].contiguous()  # [w, D]
         kg, vg = kf[:, g, :].contiguous(), vf[:, g, :].contiguous()
-        s = torch.einsum("thd,ld->htl", qs, kg) * sm_scale
-        s = s.masked_fill(~mask.unsqueeze(0), float("-inf"))
+        s = torch.matmul(qh, kg.t()) * sm_scale  # [w, L]
+        s = s.masked_fill(~mask, float("-inf"))
         a = torch.softmax(s, dim=-1)
-        out[:, g * gs:(g + 1) * gs, :] = torch.einsum("htl,ld->thd", a, vg)
+        out[:, h, :] = torch.matmul(a, vg)
     return out.to(q.dtype)
 
 
@@ -569,6 +707,80 @@ def _stream_ctx(stream):
 
 def _new_event(dev):
     return torch.cuda.Event() if _is_cuda(dev) else None
+
+
+class _DoneEvent:
+    """An event that was complete when it was born (inline execution)."""
+
+    def query(self) -> bool:
+        return True
+
+    def synchronize(self) -> None:
+        return None
+
+
+class InlineExec:
+    """No side stream (CPU, V1 tests): everything runs now, in order."""
+
+    failure: Optional[str] = None
+
+    def submit(self, fn: Callable[[], None]) -> None:
+        fn()
+
+    def record(self):
+        return _DoneEvent()
+
+    def main_record(self):
+        return _DoneEvent()
+
+    def side_waits(self, ev) -> None:
+        return None
+
+    def main_waits(self, ev) -> None:
+        return None
+
+    def keep(self, t: torch.Tensor) -> None:
+        return None
+
+    def synchronize(self) -> None:
+        return None
+
+
+class CudaExec:
+    """One CUDA side stream. ``submit`` enqueues (never blocks the host on
+    the device); ``record``/``main_record`` return torch events whose
+    ``query()`` is a host poll, never a sync."""
+
+    failure: Optional[str] = None
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def submit(self, fn: Callable[[], None]) -> None:
+        with torch.cuda.stream(self.stream):
+            fn()
+
+    def record(self):
+        ev = torch.cuda.Event()
+        ev.record(self.stream)
+        return ev
+
+    def main_record(self):
+        ev = torch.cuda.Event()
+        ev.record()
+        return ev
+
+    def side_waits(self, ev) -> None:
+        self.stream.wait_event(ev)
+
+    def main_waits(self, ev) -> None:
+        torch.cuda.current_stream().wait_event(ev)
+
+    def keep(self, t: torch.Tensor) -> None:
+        t.record_stream(self.stream)
+
+    def synchronize(self) -> None:
+        self.stream.synchronize()
 
 
 # ---------------------------------------------------------------------------
@@ -734,7 +946,7 @@ class HelperThread:
                 job = q[0] if q else None
             if job is None:
                 continue
-            d = self.cfg.of_owner(owner)
+            d = self.cfg.delegation(owner, self.wire.rank)
             seq = self.rx_seq[owner]
             if self.wire.published(owner) < seq:
                 t0 = self._wait_since[owner]
@@ -802,31 +1014,226 @@ class HelperThread:
             logger.error("AH helper thread died: %s", self.failure)
 
 
+class ServerHelper:
+    """V2: a DOWNSTREAM helper serves the owner's announcements.
+
+    It runs no split rule. Its host thread polls the pinned publish counter of
+    every owner it serves; a new message at ``rx_seq`` must be the FIRST
+    delegated layer of a chunk (the announcement). The header is checked on
+    the host (magic, layer, head range, and the request continuity the helper
+    keeps itself), then the WHOLE chunk goes onto the side stream at once:
+    for every delegated layer recv -> device header check -> mirror write +
+    attention -> send. The host thread wakes once per chunk, not per layer
+    (GIL); the device waits for the later payloads (barlink recv), and that
+    wait sits on the side stream only -- the helper stage's own forward on
+    its main stream never waits for it and it never waits for that forward,
+    which is why a downstream helper cannot deadlock the pipeline."""
+
+    serves_announced = True
+
+    def __init__(self, cfg: AHConfig, wire, engine: HelperEngine, infos: Dict[Tuple[int, int], LayerInfo],
+                 layers_of: Dict[int, Tuple[int, ...]], exec_=None, plan: Optional[Callable] = None, device=None):
+        self.cfg = cfg
+        self.wire = wire
+        self.engine = engine
+        self.infos = infos
+        self.exec = exec_ if exec_ is not None else InlineExec()
+        self.plan = plan
+        self.device = device
+        self.dels = {d.owner: d for d in cfg.of_helper(wire.rank)}
+        if not all(d.downstream for d in self.dels.values()):
+            raise AHSpecError(f"ServerHelper PP{wire.rank}: serves downstream (V2) delegations only")
+        self.layers_of = {o: tuple(layers_of[o]) for o in self.dels}
+        self.rx_seq: Dict[int, int] = {o: 1 for o in self.dels}
+        self.last_ev: Dict[int, object] = {o: None for o in self.dels}
+        #: per owner: (rid_hash, next_pos, chunk_no) of the request being mirrored
+        self.req: Dict[int, Optional[Tuple[int, int, int]]] = {o: None for o in self.dels}
+        self.failure: Optional[str] = None
+        self.stats = {"chunks": 0, "layers": 0, "bytes_in": 0, "bytes_out": 0}
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # the V1 HelperThread surface the runtime uses
+    def push(self, row, layers_of) -> None:  # noqa: D401 -- V2 never pushes
+        return None
+
+    def pending(self) -> int:
+        return 0
+
+    def drop_all(self) -> int:
+        """KV release: the mirror is about to be unmapped. Every announced
+        chunk was completed by the owner before the flip; forget the request
+        (the next announcement must start at p == 0)."""
+        for o in self.req:
+            self.req[o] = None
+        return 0
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="ah-server", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _accept(self, owner: int, got: Sequence[int]) -> ChunkRow:
+        d = self.dels[owner]
+        hr = self.cfg.heads_of(d)
+        magic, layer, rh, p, w, no, qs, gs = (int(x) for x in got[:HDR_I64])
+        bad = []
+        if magic != MAGIC:
+            bad.append(f"magic {magic:#x}")
+        if layer != self.layers_of[owner][0]:
+            bad.append(f"layer {layer}, a chunk announcement is layer {self.layers_of[owner][0]}")
+        if (qs, gs) != hr.packed():
+            bad.append(f"head range {qs:#x}/{gs:#x}, mine {hr}")
+        if not (1 <= w <= self.cfg.max_w) or p < 0 or p + w > self.cfg.cap_tokens:
+            bad.append(f"p={p} w={w} outside max_w {self.cfg.max_w} / mirror cap {self.cfg.cap_tokens}")
+        cur = self.req[owner]
+        if p == 0:
+            if no != 0:
+                bad.append(f"p=0 with chunk_no {no}")
+        elif cur is None:
+            bad.append(f"p={p} continues a request this helper never started (no p=0 chunk)")
+        elif (rh, p, no) != (cur[0], cur[1], cur[2] + 1):
+            bad.append(f"rid_hash/p/chunk_no {rh}/{p}/{no}, expected {cur[0]}/{cur[1]}/{cur[2] + 1}")
+        if bad:
+            raise RuntimeError(
+                f"AH RANKS DISAGREE (raenge-nie-uneins): owner PP{owner} announced a chunk the "
+                f"server helper PP{self.wire.rank} cannot serve: " + "; ".join(bad)
+            )
+        return ChunkRow(f"#{rh}", rh, p, w, no)
+
+    def poll_once(self) -> int:
+        """One pass over the owners; returns how many CHUNKS it enqueued."""
+        if self.exec.failure:
+            raise RuntimeError(f"AH server helper side stream failed: {self.exec.failure}")
+        issued = 0
+        for owner in self.dels:
+            seq = self.rx_seq[owner]
+            if self.wire.published(owner) < seq:
+                continue  # idle is legitimate: the owner announces when it splits
+            row = self._accept(owner, self.wire.peek_header(owner, seq))
+            self._issue_chunk(owner, row)
+            issued += 1
+        return issued
+
+    def _issue_chunk(self, owner: int, row: ChunkRow) -> None:
+        d = self.dels[owner]
+        hr = self.cfg.heads_of(d)
+        layers = self.layers_of[owner]
+        pay_b, out_b = message_bytes(hr.n_q, hr.n_kv, row.w, self.cfg.head_dim)
+        if self.plan is not None:
+            ev = self.last_ev[owner]
+            if ev is not None:
+                ev.synchronize()  # the wrapper's previous plan has been consumed
+            self.exec.submit(lambda: self.plan(owner, row.p, row.w, hr.n_q, hr.n_kv))
+        wants = [header_values(row, lid, hr) for lid in layers]
+        refs: Dict[str, torch.Tensor] = {}
+        if self.device is not None and _is_cuda(self.device):
+            # the later layers' expected headers, pinned -> device without a
+            # host sync (a pageable .to() would block this thread on the
+            # side stream, i.e. on the owner's later payloads)
+            host = torch.tensor(wants, dtype=torch.int64).pin_memory()
+            self.exec.submit(lambda: refs.__setitem__("dev", host.to(self.device, non_blocking=True)))
+        for i, lid in enumerate(layers):
+            self.exec.submit(self._layer_fn(owner, hr, row, lid, wants[i], pay_b, check=i > 0, refs=refs, i=i))
+            self.rx_seq[owner] += self.wire.pieces(pay_b)
+        self.last_ev[owner] = self.exec.record()
+        self.req[owner] = (row.rid_hash, row.p + row.w, row.chunk_no)
+        self.stats["chunks"] += 1
+        self.stats["layers"] += len(layers)
+        self.stats["bytes_in"] += pay_b * len(layers)
+        self.stats["bytes_out"] += out_b * len(layers)
+
+    def _layer_fn(self, owner, hr, row, lid, want, pay_b, check, refs, i):
+        def run():
+            buf = torch.empty(pay_b // 2, dtype=torch.bfloat16, device=self.device)
+            self.wire.recv(buf, owner)
+            if check:
+                got = buf[:HDR_BF16].view(torch.int64)
+                if "dev" in refs:
+                    torch._assert_async(torch.all(got == refs["dev"][i]))
+                else:
+                    bad = header_mismatch(got.tolist(), want)
+                    if bad:
+                        raise RuntimeError(
+                            f"AH RANKS DISAGREE (raenge-nie-uneins): owner PP{owner} layer {lid} "
+                            f"payload inside an announced chunk: {bad}"
+                        )
+            out = self.engine.step(owner, self.infos[(owner, lid)], buf, row, hr)
+            self.wire.send(out, owner)
+        return run
+
+    def _run(self) -> None:
+        if self.device is not None and _is_cuda(self.device):
+            torch.cuda.set_device(self.device)
+        try:
+            while not self._stop.is_set():
+                if self.poll_once() == 0:
+                    time.sleep(HELPER_POLL_S)
+        except BaseException as exc:  # noqa: BLE001 -- named, surfaced on the forward thread
+            self.failure = f"{type(exc).__name__}: {exc}"
+            logger.error("AH server helper thread died: %s", self.failure)
+
+
 # ---------------------------------------------------------------------------
 # owner side
 # ---------------------------------------------------------------------------
 
 
 class OwnerSide:
-    """One delegated layer on the owner. ``own_attention(q_own, k, v)`` stores
-    ALL kv groups into the pool and returns the own heads' output
-    (``FlashInferAttnBackend.forward_extend_head_subset`` on the card)."""
+    """The delegated layers on the owner, for all of its helpers.
 
-    def __init__(self, cfg: AHConfig, d: Delegation, wire, device, stream=None):
+    ``own_attention(q_sub, k, v, g0, g1, store)`` returns the output of the
+    query heads ``q_sub`` over kv groups [g0, g1) of the pool; ``store=True``
+    (first call of a layer only) first writes ALL kv groups of the chunk into
+    the pool, as the stock call does
+    (``FlashInferAttnBackend.forward_extend_head_subset`` on the card).
+
+    V1 (upstream helpers): payloads out, own pieces, outputs in, all barlink
+    ops on one side stream, the main stream waits for the outputs' event.
+    V2 (downstream helpers, ``server``): the same, except that the host looks
+    at the helper's publish counter before it enqueues a recv, with the
+    deadline and the self-computing fallback described in the module
+    docstring."""
+
+    def __init__(self, cfg: AHConfig, dels, wire, device, stream=None, *, exec_=None,
+                 layers: Sequence[int] = (), on_veto: Optional[Callable[[], None]] = None,
+                 clock: Callable[[], float] = time.monotonic):
+        if isinstance(dels, Delegation):
+            dels = (dels,)
         self.cfg = cfg
-        self.d = d
+        self.dels = tuple(sorted(dels, key=lambda d: cfg.heads_of(d).q0))
+        self.d = self.dels[0]
         self.wire = wire
         self.device = device
         self.stream = stream
-        self.hr = cfg.heads_of(d)
+        if exec_ is None:
+            exec_ = CudaExec(stream) if stream is not None else InlineExec()
+        self.exec = exec_
+        self.hr = cfg.heads_of(self.d)
+        self.ranges = tuple(cfg.heads_of(d) for d in self.dels)
+        self.pieces = own_pieces(self.ranges, cfg.num_kv_heads * cfg.gqa, cfg.gqa)
         self.q_own, self.kv_own = own_counts(self.hr)
+        self.server = self.d.downstream
+        self.deadline_s = float(cfg.deadline_ms) / 1000.0
+        self.layers = tuple(sorted(int(x) for x in layers))
+        self.on_veto = on_veto
+        self.clock = clock
+        #: V2: pieces each helper has published in total once this layer's
+        #: output is out (the owner's expectation of the helper's counter)
+        self.need: Dict[int, int] = {d.helper: 0 for d in self.dels}
+        #: V2: outputs the owner stopped waiting for, owed in FIFO order
+        self.late: Dict[int, List[Tuple[int, List[int]]]] = {d.helper: [] for d in self.dels}
+        self.degraded = False
+        self._keep: List[Tuple[object, torch.Tensor]] = []
         self._ring = None
         self._ring_ev: List[object] = []
         self._ring_i = 0
         if _is_cuda(device):
             self._ring = torch.empty(HDR_RING, HDR_I64, dtype=torch.int64).pin_memory()
             self._ring_ev = [None] * HDR_RING
-        self.stats = {"layers": 0}
+        self.stats = {"layers": 0, "fallback": 0, "late_drained": 0, "wait_s": 0.0, "vetoes": 0}
 
     def _hdr_dev(self, vals: Sequence[int]) -> torch.Tensor:
         if self._ring is None:
@@ -843,41 +1250,153 @@ class OwnerSide:
         self._ring_ev[i] = ev
         return dev
 
+    def _echo_check(self, obuf: torch.Tensor, hdr_vals: Sequence[int], hdr_dev: Optional[torch.Tensor]) -> None:
+        got = obuf[:HDR_BF16].view(torch.int64)
+        if hdr_dev is not None and _is_cuda(obuf.device):
+            torch._assert_async(torch.all(got == hdr_dev))
+            return
+        bad = header_mismatch(got.tolist(), hdr_vals)
+        if bad:
+            raise RuntimeError(f"AH RANKS DISAGREE: the helper's output header does not echo the payload's: {bad}")
+
+    def _recv_fn(self, helper: int, obuf: torch.Tensor, hdr_vals, hdr_dev):
+        def run():
+            self.wire.recv(obuf, helper)
+            self._echo_check(obuf, hdr_vals, hdr_dev)
+        return run
+
+    def _drain(self, helper: int, only_published: bool = False) -> None:
+        """Enqueue the recvs of owed late outputs on the side stream (FIFO,
+        before any newer output of that helper); ``only_published`` = only
+        those the helper has already published (no device wait at all)."""
+        owed = self.late[helper]
+        n = 0
+        pub = self.wire.published(helper) if only_published else None
+        for out_b, hv in owed:
+            if pub is not None and pub < upto_seq(self, helper, n):
+                break
+            scratch = torch.empty(out_b // 2, dtype=torch.bfloat16, device=self.device)
+            self.exec.submit(self._recv_fn(helper, scratch, hv, None))
+            self._keep.append((self.exec.record(), scratch))
+            n += 1
+        if n:
+            del owed[:n]
+            self.stats["late_drained"] += n
+
+    def _gc(self) -> None:
+        self._keep = [(e, t) for e, t in self._keep if not e.query()]
+
+    def _await_published(self, helper: int, own_done, sent, t_own: List[Optional[float]]) -> bool:
+        """V2: True = the output is published (recv it), False = fall back.
+        The deadline runs from the moment BOTH the own heads are done and the
+        payloads have left (the side stream may still be draining owed
+        outputs of an earlier chunk -- that backlog is the owner's, not the
+        helper's lateness)."""
+        need = self.need[helper]
+        t0 = self.clock()
+        try:
+            while True:
+                if self.wire.published(helper) >= need:
+                    return True
+                if self.degraded:
+                    return False
+                if self.deadline_s > 0:
+                    if t_own[0] is None:
+                        if own_done.query() and sent.query():
+                            t_own[0] = self.clock()
+                    elif self.clock() - t_own[0] > self.deadline_s:
+                        return False
+                elif self.clock() - t0 > HELPER_STALL_S:
+                    raise RuntimeError(
+                        f"AH owner stall: waited {self.clock() - t0:.0f} s for helper PP{helper}'s "
+                        "output with no deadline -- the helper died or never served the chunk"
+                    )
+                if self.exec.failure:
+                    raise RuntimeError(f"AH owner side stream failed: {self.exec.failure}")
+                time.sleep(HELPER_POLL_S)
+        finally:
+            self.stats["wait_s"] += self.clock() - t0
+
     def attention(self, row: ChunkRow, layer_id: int, q, k, v, own_attention: Callable) -> torch.Tensor:
-        cfg, hr = self.cfg, self.hr
+        cfg = self.cfg
         D, H, Hk = cfg.head_dim, cfg.num_kv_heads * cfg.gqa, cfg.num_kv_heads
         w = q.shape[0]
         qv = q.view(w, H, D)
         kv3 = k.view(w, Hk, D)
         vv3 = v.view(w, Hk, D)
-        hdr = self._hdr_dev(header_values(row, layer_id, hr))
+        if self.layers and layer_id == self.layers[0]:
+            self.degraded = False
+            self._gc()
         # Pack BEFORE the pool write: set_kv_buffer may divide k/v in place.
-        payload = pack_payload(hdr, qv[:, hr.q0:hr.q1], kv3[:, hr.g0:hr.g1], vv3[:, hr.g0:hr.g1])
-        sent = None
-        if self.stream is not None:
-            ready = torch.cuda.Event()
-            ready.record()
-            self.stream.wait_event(ready)
-            with torch.cuda.stream(self.stream):
-                self.wire.send(payload, self.d.helper)
-                sent = torch.cuda.Event()
-                sent.record(self.stream)
-            payload.record_stream(self.stream)
-        else:
-            self.wire.send(payload, self.d.helper)
-        o_own = own_attention(qv[:, :self.q_own].contiguous(), kv3, vv3, self.kv_own)
-        _, out_b = message_bytes(hr.n_q, hr.n_kv, w, D)
-        obuf = torch.empty(out_b // 2, dtype=q.dtype, device=q.device)
-        if sent is not None:
-            torch.cuda.current_stream().wait_event(sent)  # one stream per barlink op at a time
-        self.wire.recv(obuf, self.d.helper)
-        if _is_cuda(q.device):
-            torch._assert_async(torch.all(obuf[:HDR_BF16].view(torch.int64) == hdr))
-        elif not torch.equal(obuf[:HDR_BF16].view(torch.int64), hdr):
-            raise RuntimeError("AH RANKS DISAGREE: the helper's output header does not echo the payload's")
+        sends = []
+        for d, hr in zip(self.dels, self.ranges):
+            hv = header_values(row, layer_id, hr)
+            hdr = self._hdr_dev(hv)
+            sends.append((d, hr, hv, hdr, pack_payload(hdr, qv[:, hr.q0:hr.q1], kv3[:, hr.g0:hr.g1], vv3[:, hr.g0:hr.g1])))
+        self.exec.side_waits(self.exec.main_record())
+        for d, _, _, _, payload in sends:
+            self.exec.submit(lambda payload=payload, dst=d.helper: self.wire.send(payload, dst))
+            self.exec.keep(payload)
+        sent = self.exec.record()
+        # own pieces (the first call stores all kv groups into the pool)
+        outs: List[Tuple[int, torch.Tensor]] = []
+        for i, pc in enumerate(self.pieces):
+            o = own_attention(qv[:, pc.q0:pc.q1].contiguous(), kv3, vv3, pc.g0, pc.g1, i == 0)
+            outs.append((pc.q0, o.reshape(w, pc.n_q * D)))
+        own_done = self.exec.main_record()
+        if not self.server:
+            # V1: the outputs' recv (a device wait) starts after the own heads,
+            # as V1's main-stream recv did -- no spin beside them
+            self.exec.side_waits(own_done)
+        t_own: List[Optional[float]] = [None]
+        got_ev = None
+        for d, hr, hv, hdr, _ in sends:
+            _, out_b = message_bytes(hr.n_q, hr.n_kv, w, D)
+            h = d.helper
+            self.need[h] += self.wire.pieces(out_b)
+            if self.server and not self._await_published(h, own_done, sent, t_own):
+                # fallback: the owner's pool is complete -- compute the range here
+                o = own_attention(qv[:, hr.q0:hr.q1].contiguous(), kv3, vv3, hr.g0, hr.g1, False)
+                outs.append((hr.q0, o.reshape(w, hr.n_q * D)))
+                self.late[h].append((out_b, hv))
+                self._drain(h, only_published=True)  # free barlink's two slots early
+                self.stats["fallback"] += 1
+                if not self.degraded:
+                    self.degraded = True
+                    self.stats["vetoes"] += 1
+                    if self.on_veto is not None:
+                        self.on_veto()
+                continue
+            if self.server:
+                self._drain(h)  # all owed outputs are published: they precede this one
+            obuf = torch.empty(out_b // 2, dtype=q.dtype, device=q.device)
+            self.exec.submit(self._recv_fn(h, obuf, hv, hdr))
+            self.exec.keep(hdr)  # the echo check reads it on the side stream
+            got_ev = self.exec.record()
+            outs.append((hr.q0, obuf[HDR_BF16:].view(w, hr.n_q * D)))
+        if got_ev is not None:
+            self.exec.main_waits(got_ev)
+        if self.server and self.layers and layer_id == self.layers[-1]:
+            for h in self.late:
+                self._drain(h)  # chunk end: owed outputs leave the two barlink slots
         self.stats["layers"] += 1
-        # V1: own heads [0, q0) + delegated suffix [q0, H) = the stock order.
-        return torch.cat([o_own.reshape(w, -1), obuf[HDR_BF16:].view(w, hr.n_q * D)], dim=1)
+        outs.sort(key=lambda t: t[0])
+        return torch.cat([o for _, o in outs], dim=1)
+
+    def on_kv_release(self) -> None:
+        for h in self.late:
+            self._drain(h)
+        self.exec.synchronize()
+        self._keep.clear()
+
+
+def upto_seq(side: "OwnerSide", helper: int, n: int) -> int:
+    """The publish count at which owed output ``n`` (0-based, FIFO) of
+    ``helper`` is out: the current expectation minus the pieces of every
+    later owed output."""
+    owed = side.late[helper]
+    later = sum(side.wire.pieces(ob) for ob, _ in owed[n + 1:])
+    return side.need[helper] - later
 
 
 # ---------------------------------------------------------------------------
@@ -903,17 +1422,18 @@ class AHRuntime:
         self.cfg = cfg
         self.pp_rank = pp_rank
         self.pp_size = pp_size
-        self.rule = SplitRule(cfg.min_w, cfg.cap_tokens)
+        self.rule = SplitRule(cfg.min_w, cfg.cap_tokens, cfg.ab)
         self.row: Optional[ChunkRow] = None
         self.owner: Optional[OwnerSide] = None
         self.owner_layer_ids: frozenset = frozenset()
-        self.helper: Optional[HelperThread] = None
+        self.helper = None  # HelperThread (V1) or ServerHelper (V2)
         self.layers_of: Dict[int, Tuple[int, ...]] = {}
         self.n_split = 0
         self.n_forwards = 0
+        helped = cfg.of_helper(pp_rank)
         self.role = (
             "owner" if cfg.of_owner(pp_rank) is not None
-            else "helper" if cfg.of_helper(pp_rank) else "none"
+            else ("server" if helped[0].downstream else "helper") if helped else "none"
         )
 
     # -- hooks --------------------------------------------------------------
@@ -928,10 +1448,13 @@ class AHRuntime:
             getattr(forward_batch, "extend_seq_lens_cpu", None),
         )
         self.n_forwards += 1
+        st = self.rule.last_start
+        if st is not None and self.role == "owner" and self.cfg.ab:
+            logger.info("AH-AB PP%d rid=%s arm=%s req=%d", self.pp_rank, st[0], st[1], st[2])
         if self.row is None:
             return
         self.n_split += 1
-        if self.helper is not None:
+        if self.helper is not None and not getattr(self.helper, "serves_announced", False):
             self.helper.push(self.row, self.layers_of)
         if self.n_split in (1, 2, 4, 8, 16, 64, 256, 1024) or self.n_split % 4096 == 0:
             logger.info(
@@ -954,8 +1477,8 @@ class AHRuntime:
                 "forward_extend_head_subset (flashinfer only)"
             )
 
-        def own(q_own, k_all, v_all, kv_own):
-            return fn(q_own, k_all, v_all, radix_attn, forward_batch, kv_own)
+        def own(q_sub, k_all, v_all, g0, g1, store):
+            return fn(q_sub, k_all, v_all, radix_attn, forward_batch, (g0, g1), store)
 
         return self.owner.attention(self.row, radix_attn.layer_id, q, k, v, own)
 
@@ -963,7 +1486,14 @@ class AHRuntime:
         """The KV region (and the mirror in it) is about to be unmapped."""
         self.rule.reset()
         self.row = None
-        if self.helper is not None:
+        if self.owner is not None:
+            self.owner.on_kv_release()
+            if self.owner.stats["fallback"]:
+                logger.warning("AH owner PP%d: %s", self.pp_rank, self.owner.stats)
+        if self.helper is not None and getattr(self.helper, "serves_announced", False):
+            self.helper.drop_all()
+            self.helper.exec.synchronize()
+        elif self.helper is not None:
             dropped = self.helper.drop_all()
             if self.helper.stream is not None:
                 self.helper.stream.synchronize()
@@ -1033,6 +1563,7 @@ def install(runner) -> Optional[AHRuntime]:
     gathered: List[dict] = [None] * pp_size  # type: ignore[list-item]
     mine: Dict[str, object] = {"rank": pp_rank, "n_attn": len(my_attn), "layers": {}}
     d_own = cfg.of_owner(pp_rank)
+    dels_own = cfg.of_owner_all(pp_rank)
     if d_own is not None:
         for lid in owner_layers(my_attn, d_own.n_layers):
             a = lm.layers[lid].attn
@@ -1046,6 +1577,9 @@ def install(runner) -> Optional[AHRuntime]:
     from sglang.srt.distributed.device_communicators.barlink_host import BarlinkHostTransport
 
     device = torch.device("cuda", torch.cuda.current_device())
+    # OWN RING: a separate pinned segment with its own per-pair sequences --
+    # never the PP proxy transport, so a head payload and a proxy frame can
+    # never share one FIFO (P_MICROBATCH_AH2.md 4.1-3).
     transport = BarlinkHostTransport(pp.cpu_group, device, slot_bytes=4096, p2p_bytes=cfg.p2p_bytes())
     wire = BarlinkP2P(transport)
     rt = AHRuntime(cfg, pp_rank, pp_size)
@@ -1053,7 +1587,9 @@ def install(runner) -> Optional[AHRuntime]:
         if cfg.of_owner(int(g["rank"])) is not None:
             rt.layers_of[int(g["rank"])] = tuple(sorted(int(x) for x in g["layers"]))
     if d_own is not None:
-        rt.owner = OwnerSide(cfg, d_own, wire, device, stream=torch.cuda.Stream(device))
+        side = torch.cuda.Stream(device)
+        rt.owner = OwnerSide(cfg, dels_own, wire, device, stream=side, exec_=CudaExec(side),
+                             layers=rt.layers_of[pp_rank], on_veto=rt.rule.end_request)
         rt.owner_layer_ids = frozenset(rt.layers_of[pp_rank])
         for lid in rt.owner_layer_ids:
             lm.layers[lid]._ah_split = True
@@ -1075,7 +1611,15 @@ def install(runner) -> Optional[AHRuntime]:
             engine.allocate(d.owner, rt.layers_of[d.owner], cfg.heads_of(d).n_kv)
             kernel.add_owner(d.owner)
         stream = torch.cuda.Stream(device, priority=-1)
-        rt.helper = HelperThread(cfg, wire, engine, infos, stream=stream, plan=kernel.plan, device=device)
+        if helped[0].downstream:
+            import sys
+
+            # one wake-up per chunk announcement; keep the GIL hand-over short
+            sys.setswitchinterval(SERVER_SWITCH_INTERVAL_S)
+            rt.helper = ServerHelper(cfg, wire, engine, infos, rt.layers_of, exec_=CudaExec(stream),
+                                     plan=kernel.plan, device=device)
+        else:
+            rt.helper = HelperThread(cfg, wire, engine, infos, stream=stream, plan=kernel.plan, device=device)
         rt.helper.start()
     runner._ah_runtime = rt
     _RUNTIME = rt
@@ -1084,10 +1628,13 @@ def install(runner) -> Optional[AHRuntime]:
         "(ATTN_HEAD_SPLIT.md; %s) barlink p2p %.2f MiB/pair, pinned host %.1f MiB",
         pp_rank, pp_size, rt.role, ",".join(d.text() for d in cfg.delegations), cfg.min_w,
         cfg.cap_tokens, stage_post_mib(cfg, pp_rank),
-        ("owner layers %s -> PP%d, q heads %s" % (
-            sorted(rt.owner_layer_ids), d_own.helper, cfg.heads_of(d_own))) if d_own else
-        ("helper for %s, mirror %.1f MiB" % (
-            {d.owner: rt.layers_of[d.owner] for d in helped}, rt.helper.engine.mirror_mib())) if helped else "idle",
+        ("owner layers %s -> %s, own pieces %s, deadline %.1f ms, ab=%s" % (
+            sorted(rt.owner_layer_ids),
+            ", ".join("PP%d q heads %s" % (d.helper, cfg.heads_of(d)) for d in dels_own),
+            rt.owner.pieces, cfg.deadline_ms if dels_own[0].downstream else 0.0, cfg.ab or "off")) if d_own else
+        ("%s for %s, mirror %.1f MiB" % (
+            rt.role, {d.owner: rt.layers_of[d.owner] for d in helped},
+            rt.helper.engine.mirror_mib())) if helped else "idle",
         cfg.p2p_bytes() / 2**20, host_pinned_mib(cfg, pp_size),
     )
     return rt

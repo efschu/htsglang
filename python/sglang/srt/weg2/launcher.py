@@ -10388,8 +10388,14 @@ def p_attn_head_split_cfg(ns, pp_size: int, chunk_tokens: int, model: str):
         raise SystemExit(str(exc))
     if num_q % num_kv:
         raise SystemExit(f"--p-attn-head-split: {num_q} q heads over {num_kv} kv heads")
+    ab = str(getattr(ns, "p_attn_head_split_ab", "off") or "off")
+    ab = "" if ab == "off" else ab
+    deadline = float(getattr(ns, "p_attn_head_split_deadline_ms", _ah.DEADLINE_MS_DEFAULT))
+    if not any(d.downstream for d in dels) and deadline != _ah.DEADLINE_MS_DEFAULT:
+        raise SystemExit("--p-attn-head-split-deadline-ms: only a downstream (V2) owner has a deadline; "
+                         "the spec has upstream helpers only")
     return _ah.AHConfig(dels, min_w, int(getattr(ns, "max_kv_per_request", 0) or CONTEXT_LENGTH_TOKENS),
-                        max_w, head_dim, num_q // num_kv, num_kv)
+                        max_w, head_dim, num_q // num_kv, num_kv, deadline_ms=deadline, ab=ab)
 
 
 def _p_ah_post_vector(ns, pp_size: int, chunk_tokens: int, model: str) -> Tuple[float, ...]:
@@ -10409,10 +10415,12 @@ def p_attn_head_split_line(cfg, pp_size: int) -> str:
     from sglang.srt.weg2 import attn_head_split as _ah
 
     return (
-        "WEG2 P-ATTN-HEAD-SPLIT: on %s (owner:helper:layers:groups), min_w %d, mirror cap %d "
-        "tokens, max_w %d; post '%s' MiB per stage = %s (booked by the ranks and by the cut's "
-        "pool model), barlink p2p %.2f MiB/pair, pinned host %.1f MiB (ATTN_HEAD_SPLIT.md)"
+        "WEG2 P-ATTN-HEAD-SPLIT: on %s (owner:helper:layers:G|hA-B), min_w %d, mirror cap %d "
+        "tokens, max_w %d, deadline %.1f ms, ab %s; post '%s' MiB per stage = %s (booked by the "
+        "ranks and by the cut's pool model), barlink p2p %.2f MiB/pair, pinned host %.1f MiB "
+        "(ATTN_HEAD_SPLIT.md, P_MICROBATCH_AH2.md)"
         % (",".join(d.text() for d in cfg.delegations), cfg.min_w, cfg.cap_tokens, cfg.max_w,
+           cfg.deadline_ms if any(d.downstream for d in cfg.delegations) else 0.0, cfg.ab or "off",
            _ah.POST_NAME, ",".join("%.1f" % v for v in _ah.stage_post_vector(cfg, pp_size)),
            cfg.p2p_bytes() / 2**20, _ah.host_pinned_mib(cfg, pp_size))
     )
@@ -13117,17 +13125,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--p-attn-head-split", default=P_ATTN_HEAD_SPLIT_DEFAULT, metavar="SPEC",
         help="Group P attention split BY HEADS (27B, release table row 22; "
              "ATTN_HEAD_SPLIT.md phase 2). 'off' (default) = no env, argv and the "
-             "pool model byte-identical. SPEC = owner:helper:n_layers:G[,...]: "
+             "pool model byte-identical. SPEC = owner:helper:n_layers:G|hA-B[,...]: "
              "stage OWNER hands the attention of its last G kv groups "
-             "(G x 6 q heads) of its last n_layers full-attention layers to "
-             "stage HELPER, which must be UPSTREAM (helper < owner; V1). Example "
-             "'2:0:2:1,1:0:1:1' = INT8 128k model optimum. Cold single-request eager "
+             "(G x 6 q heads), or of q heads A..B (whole groups or inside one "
+             "group), of its last n_layers full-attention layers to stage "
+             "HELPER. helper < owner = V1 (upstream helper runs the same rule), "
+             "e.g. '2:0:2:1,1:0:1:1' = INT8 128k model optimum; helper > owner = "
+             "V2 (downstream helper serves the owner's announcements, owner "
+             "deadline + self-computing fallback), e.g. '0:1:4:h18-20,0:2:4:h21-23' "
+             "= NVFP4 long (P_MICROBATCH_AH2.md). Cold single-request eager "
              "chunks only; KV of all groups stays in the owner's pool.")
     ap.add_argument(
         "--p-attn-head-split-min-w", type=int, default=P_ATTN_HEAD_SPLIT_MIN_W_DEFAULT,
         metavar="TOKENS",
         help="Only with --p-attn-head-split: the narrowest chunk that splits (must be "
              "above every captured prefill bucket, so a split chunk is eager).")
+    ap.add_argument(
+        "--p-attn-head-split-deadline-ms", type=float, default=20.0, metavar="MS",
+        help="Only with a downstream (V2) --p-attn-head-split: how long past its own "
+             "heads the owner waits for a helper's output before it computes the range "
+             "itself and ends the split for that request (<= 0: wait, named stall).")
+    ap.add_argument(
+        "--p-attn-head-split-ab", choices=("off", "alt"), default="off",
+        help="Only with --p-attn-head-split: 'alt' = every second new request runs "
+             "unsplit (rank line 'AH-AB ... arm=split|base'), A/B inside one boot.")
     ap.add_argument(
         "--p-trim-end-anchor", action="store_true",
         help="Group P (27B line): take every front leg-1 prompt of N tokens as "
