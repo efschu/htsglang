@@ -174,7 +174,11 @@ class SchedulerInvariantChecker:
         held out of the free list so that nothing is handed out over unmapped
         memory. It is not available, not cached and not held by a session, so
         without a term of its own it reads as a leak -- and it killed the boot
-        that first exercised it ("total=500000, available=419745").
+        that first exercised it ("total=500000, available=419745"). The mamba
+        ledger carries the same term for the slots a D phase of n < cap seats
+        holds above its slot limit (H95c/H95d, ``_mamba_phase_withheld``) --
+        the second boot killed by an unnamed withheld set ("total=38,
+        available=7", fnFL2h91bb2).
 
         It is a NAMED POSTEN for the #486 reason: anything that durably occupies
         or removes pool slots must be named in this ledger, or the next
@@ -487,12 +491,21 @@ class SchedulerInvariantChecker:
           leaving it unnamed makes a surplus read as an unexplained leak.
 
         ``None`` when the free list cannot be read. ``None`` is not zero.
+
+        H95d: the ids a D phase's slot limit withholds
+        (``MambaSlotAllocator.phase_withheld_ids``) are FREE ids kept off the
+        list, so they join it here: a duplicate between the two, or inside
+        the withheld set, is the same double free, and a withheld id the tree
+        still names is the same aliasing.
         """
         free_slots = getattr(mamba_allocator, "free_slots", None)
         try:
             free_list = [int(v) for v in free_slots.tolist()]
         except (AttributeError, TypeError, ValueError):
             return None
+        withheld_ids = getattr(mamba_allocator, "phase_withheld_ids", None)
+        if callable(withheld_ids):
+            free_list += withheld_ids()
         free_set = frozenset(free_list)
         duplicate_ids = sorted(
             slot for slot, seen in Counter(free_list).items() if seen > 1
@@ -532,6 +545,30 @@ class SchedulerInvariantChecker:
                     )
         return double_owned, source, duplicate_count, suffix
 
+    def _mamba_phase_withheld(self) -> Tuple[int, str]:
+        """``(withheld, suffix)`` -- H95d: the slots a D phase of n < cap seats
+        holds out of the mamba free list (``MambaSlotAllocator.set_phase_limit``,
+        H95c): free, unowned, and without pages behind them. The mamba twin of
+        the KV pool's #656 ``withheld`` posten, and NAMED for the #486 reason:
+        boot fnFL2h91bb2 died on this ledger at the first idle after the first
+        n=1 wake (``[mamba] total=38, available=7, withheld=0``) with
+        ``leaked_mamba_pages`` exactly the withheld 8..38.
+
+        Only ids ABOVE the limit are withheld (``_split_phase_withheld``), and
+        ``set_phase_limit`` refuses while any of them is live, so this term can
+        never absorb a slot that lost its owner inside the phase's 1..L: that
+        one is still missing from available + evictable + withheld and the
+        ledger stays fatal. Replicated (the limit is a function of the wake
+        request), so every rank reads the same term -- no collective."""
+        allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        withheld = int(getattr(allocator, "phase_withheld_slots", 0) or 0)
+        if withheld <= 0:
+            return 0, ""
+        limit = getattr(allocator, "phase_limit", None)
+        return withheld, (
+            f", withheld_by=d-seat-phase(H95c) limit=1..{limit}"
+        )
+
     def _check_mamba_pool(self, ps: PoolStats) -> Tuple[bool, str]:
         ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
         if ckpt_pool is not None:
@@ -539,6 +576,7 @@ class SchedulerInvariantChecker:
         _diag_double, double_owned_src, duplicates, detail = (
             self._mamba_double_owned_terms()
         )
+        phase_withheld, phase_note = self._mamba_phase_withheld()
         leak, msg = self._check_pool_invariant(
             "mamba",
             ps.mamba_available_size,
@@ -547,9 +585,9 @@ class SchedulerInvariantChecker:
             self.pool_stats_observer.session_held_mamba_slots(),
             self.req_to_token_pool.mamba_pool.size,
             0,
-            0,
+            phase_withheld,
         )
-        msg = f"{msg}, double_owned_src={double_owned_src}{detail}"
+        msg = f"{msg}{phase_note}, double_owned_src={double_owned_src}{detail}"
         if duplicates:
             # A DUPLICATE IN THE FREE LIST IS NOT ABSOLVED BY BALANCING THE
             # EQUATION. Subtracting it stops the reader hunting a leak that is
@@ -583,14 +621,20 @@ class SchedulerInvariantChecker:
         # looks like on an allocator whose free set is not a set.
         alloc_for_span = self.req_to_token_pool.mamba_allocator
         pool_size = self.req_to_token_pool.mamba_pool.size
-        num_used = pool_size - (ps.mamba_available_size + ps.mamba_evictable_size)
+        # H95d: the phase-withheld slots are on the credit side too (free,
+        # held off the list); a withheld id the tree also holds is the same
+        # double count and drives this negative.
+        num_used = pool_size - (
+            ps.mamba_available_size + ps.mamba_evictable_size + phase_withheld
+        )
         free_span = int(getattr(alloc_for_span, "size", pool_size) or pool_size)
-        if num_used < 0 or ps.mamba_available_size > free_span:
+        if num_used < 0 or ps.mamba_available_size + phase_withheld > free_span:
             leak = True
             msg += (
                 f", #924 MAMBA SLOT ALIASING: mamba_num_used={num_used}"
                 f" (pool_size={pool_size} - available={ps.mamba_available_size}"
-                f" - evictable={ps.mamba_evictable_size}), allocator_size="
+                f" - evictable={ps.mamba_evictable_size}"
+                f" - withheld={phase_withheld}), allocator_size="
                 f"{free_span}. A negative occupancy means one slot is counted"
                 " on both credit sides -- free AND tree-held -- so alloc()"
                 " hands a live anchor's GDN state to the next request"
@@ -610,6 +654,10 @@ class SchedulerInvariantChecker:
             )
             mamba_allocator = self.req_to_token_pool.mamba_allocator
             free_mamba_pages = set(mamba_allocator.free_slots.tolist())
+            # H95d: ids withheld by the phase's slot limit are free, not lost
+            _withheld_ids = getattr(mamba_allocator, "phase_withheld_ids", None)
+            if callable(_withheld_ids):
+                free_mamba_pages |= set(_withheld_ids())
             cached_mamba_pages = set(
                 self.tree_cache.all_mamba_values_flatten().tolist()
             )
@@ -673,6 +721,7 @@ class SchedulerInvariantChecker:
         _diag_double, double_owned_src, duplicates, detail = (
             self._mamba_double_owned_terms()
         )
+        phase_withheld, phase_note = self._mamba_phase_withheld()  # H95d
         active_leak, active_msg = self._check_pool_invariant(
             "mamba-active",
             ps.mamba_available_size,
@@ -681,9 +730,11 @@ class SchedulerInvariantChecker:
             self.pool_stats_observer.session_held_mamba_slots(),
             self.req_to_token_pool.mamba_pool.size,
             0,
-            0,
+            phase_withheld,
         )
-        active_msg = f"{active_msg}, double_owned_src={double_owned_src}{detail}"
+        active_msg = (
+            f"{active_msg}{phase_note}, double_owned_src={double_owned_src}{detail}"
+        )
         if duplicates:
             active_leak = True
         int8_leak, int8_msg = self._check_pool_invariant(
