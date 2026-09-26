@@ -28,7 +28,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 from sglang.srt import uneven_perf as UP
 from sglang.srt.weg2 import launcher as L
-from sglang.srt.weg2 import line_identity as LI
+from sglang.srt.weg2 import form as F  # UNIFY S7: LineIdentity -> form.CalibrationIdentity
 
 MODEL = L.MODEL_DEFAULT
 DRAFT = L.DFLASH_DRAFT_PATH_DEFAULT
@@ -163,11 +163,21 @@ class TestCalibration(unittest.TestCase):
             for r, b in self.kv.items():
                 f.write(f"[2026-09-24 12:34:10 TP{r}] KV pool sizing: available_bytes={b} (x GiB), "
                         f"cell_size=32768, page_size=1 -> max_total_num_tokens={b // 32768}\n")
-        self.line = LI.LineIdentity(model=MODEL, repo=self.repo, head=self.tip, evidence_dir=self.ev)
+        self.line = F.CalibrationIdentity(model=MODEL, evidence_dir=self.ev, form=None,
+                                          fields=("checkpoint", "line"), repo=self.repo)
+        # UNIFY S7: the 27B planner semantics (early-read facts, the capacity
+        # vector on every position) follow the published qwen27b profile.
+        self._form_saved = os.environ.get(F.FORM_ENV)
+        os.environ[F.FORM_ENV] = F.Weg2Form(arch="dense", experts="none", draft="dflash",
+                                          p_draft="none", kv="paged_dcp", flip="family",
+                                          vision="off", profile="qwen27b", model="m").env_value()
 
     def tearDown(self):
         self._td.cleanup()
         _nextn()
+        os.environ.pop(F.FORM_ENV, None)
+        if self._form_saved is not None:
+            os.environ[F.FORM_ENV] = self._form_saved
 
     def test_reproduces_the_measured_capacities(self):
         _dflash()
@@ -197,8 +207,8 @@ class TestCalibration(unittest.TestCase):
 
     def test_refuses_without_a_line_boot(self):
         _dflash()
-        other = LI.LineIdentity(model=MODEL, repo=self.repo, head=self.tip,
-                                evidence_dir=os.path.join(self._td.name, "empty"))
+        other = F.CalibrationIdentity(model=MODEL, evidence_dir=os.path.join(self._td.name, "empty"),
+                                      form=None, fields=("checkpoint", "line"), repo=self.repo)
         os.makedirs(other.evidence_dir)
         ovh, why = L.d_overhead_calibration(MODEL, other, evidence_dir=other.evidence_dir)
         self.assertIsNone(ovh)

@@ -153,9 +153,20 @@ END_ANCHOR_SWITCHES: Dict[str, Dict[str, object]] = {
 #: displacement nor arena_drop_unreferenced is reached. ``grid4096`` is the 27B
 #: form (anchor every 4096, max 4 per path, inner anchors released; Schritt 8).
 MAMBA_ANCHOR_SWITCHES: Dict[str, Dict[str, object]] = {
-    "deepest": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": -1},
-    "grid4096": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": 0},
-    "none": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": 0},
+    "deepest": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": -1,
+                "SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL": 0,
+                "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 0},
+    # UNIFY S7/S8: the 27B mechanism is in the tree now (34965fc3fa: group P
+    # anchors every 4096 tokens whatever the chunk, at most 4 per path) -- the
+    # profile carries the 27B arm's values (docker 27b.env), an explicit env
+    # still wins. INNER_ANCHOR_RELEASE stays arm-set (it is also the S2 alias
+    # of the carrier hold).
+    "grid4096": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": 0,
+                 "SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL": 4096,
+                 "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 4},
+    "none": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": 0,
+             "SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL": 0,
+             "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 0},
 }
 
 

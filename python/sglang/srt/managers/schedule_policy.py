@@ -1582,20 +1582,24 @@ class PrefillAdder:
         end = start + length
         if end != len(req.full_untruncated_fill_ids):
             return length, False
+        # UNIFY S7: read once, tolerant of the 27B desk stubs (an adder without
+        # a pool reads page 1 / no allocator: every token is a grain, no fold).
+        _page = int(getattr(self, "page_size", 1) or 1)
+        _alloc = getattr(self, "token_to_kv_pool_allocator", None)
         # fnFL2 H63 (SGLANG_WEG2_ENABLE_P_TAIL_FOLD, on top of E2): the tail
         # runs inside this last chunk. The page anchor the tree keeps is the
         # same -- the chunk's extra_buffer track lands on floor_page(end),
         # which is floor_page(end - 1) unless end is a page multiple (then the
         # cut below stays) -- and D takes the END state P publishes at the
         # finish (weg2/tail_handoff.arm_fold); no state at c is ever needed.
-        if tail_handoff.fold_applies(end, self.page_size):
+        if tail_handoff.fold_applies(end, _page):
             n = getattr(PrefillAdder, "_weg2_end_anchor_folds", 0) + 1
             PrefillAdder._weg2_end_anchor_folds = n
             if n <= 8 or n % 64 == 0:
                 logger.info(
                     "WEG2 END-ANCHOR FOLD n=%d rid=%s: the last chunk [%d, %d) carries the tail, "
                     "no own forward (page %d)",
-                    n, getattr(req, "rid", "?"), start, end, int(self.page_size),
+                    n, getattr(req, "rid", "?"), start, end, _page,
                 )
             return length, False
         # fnFL2x14 (23.09.): under QSA the anchor lands on a PAGE boundary,
@@ -1604,7 +1608,7 @@ class PrefillAdder:
         # _qsa_build_write_plan: `prefix_lens % ratio == 0`, a device assert);
         # the QSA pool pins page_size to a ratio multiple. x14 prefilled
         # 259414 tokens and died on the one-token chunk at prefix 259414.
-        grain = _weg2_end_anchor_grain(self.token_to_kv_pool_allocator, self.page_size)
+        grain = _weg2_end_anchor_grain(_alloc, _page)
         cut = (end - 1) // grain * grain
         if cut <= start:
             return length, False

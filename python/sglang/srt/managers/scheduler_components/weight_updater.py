@@ -578,6 +578,15 @@ class SchedulerWeightUpdaterManager:
     #: :meth:`_weg2_nvfp4_marlin_after_wake`. A FIELD for the sixth time in this
     #: class: the lazy write killed EVERY rank's first wake in rc8a (INT8 too).
     _weg2_nvfp4_draft_disk_reloaded: bool = False
+    #: UNIFY S7 (found by the 27B slots pin test_weight_updater_slots_fields):
+    #: FIELDS FOR THE SEVENTH AND EIGHTH TIME. ``_weg2_scratch_residue`` (S2
+    #: local-scratch residue, written unguarded before the wake's scratch
+    #: zeroing -- an AttributeError on the first wake of the NF expert-rearm
+    #: path) and ``_weg2_xchg_leg_lock`` (fnFL2x82 single-flight lock; its
+    #: write was wrapped in ``except AttributeError`` and silently never
+    #: stored, so every lane derived its own plan again).
+    _weg2_scratch_residue: Any = None
+    _weg2_xchg_leg_lock: Any = None
 
     #: #1329: FIELDS FOR THE FOURTH AND FIFTH TIME IN THIS CLASS, and the
     #: comment above called it three commits early. ``slots=True`` turns a

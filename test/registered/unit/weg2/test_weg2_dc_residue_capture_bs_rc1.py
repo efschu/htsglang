@@ -35,7 +35,7 @@ import pytest
 
 from sglang.srt.weg2 import host_ledger
 from sglang.srt.weg2 import launcher as L
-from sglang.srt.weg2 import line_identity
+from sglang.srt.weg2 import form as F  # UNIFY S7: LineIdentity -> form.CalibrationIdentity
 
 CARDS = [
     L.Card(nvml_index=1, uuid="GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d",
@@ -84,8 +84,8 @@ def rc1_state(tmp_path):
     record = tmp_path / "weg2_measured_record.json"
     samples = [_sample(tag, at, commit, res) for tag, at, commit, _m, res in BOOTS]
     record.write_text(json.dumps({"samples": samples}))
-    ident = line_identity.LineIdentity(model="/m/Qwen3.8-27B", repo="/r", head="fe316bdf40",
-                                       evidence_dir=str(evidence))
+    ident = F.CalibrationIdentity(model="/m/Qwen3.8-27B", evidence_dir=str(evidence), form=None,
+                                  fields=("checkpoint", "line", "d_capture_set"), repo="/r")
     # the line/ancestry verdict is not this test's subject (every boot above is
     # of the line); the capture-set reader is the real one
     line_id = SimpleNamespace(

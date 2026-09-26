@@ -439,6 +439,21 @@ def install_gc_pause_probe(threshold_ms: float = GC_PAUSE_LOG_MS) -> Callable[[s
     return _probe
 
 
+def record_identity_from_spec(spec: str):
+    """UNIFY S7: ``--record-line`` (``model=..|repo=..|head=..|evidence=..``, the
+    27B line's spec) -> the form's :class:`CalibrationIdentity` for the
+    published form (SGLANG_WEG2_FORM); None for an empty/unusable spec."""
+    if not spec:
+        return None
+    kv = dict(p.split("=", 1) for p in str(spec).split("|") if "=" in p)
+    if "model" not in kv or "evidence" not in kv:
+        return None
+    from sglang.srt.weg2 import form as _form
+
+    return _form.calibration_identity(
+        kv["model"], kv["evidence"], _form.current_form(), repo=kv.get("repo", ""))
+
+
 class SidecarView:
     """H78: the measured-record sidecar as the sleep-leg gate reads it --
     parsed once per FILE VERSION, not once per flip.
@@ -459,9 +474,12 @@ class SidecarView:
     a ``fresh``/``read`` on the loop never see half of an update.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, accept: Optional[Callable[[dict], bool]] = None) -> None:
         self._state: Tuple[Optional[str], Optional[tuple], Optional[Dict[str, dict]]] = (None, None, None)
         self.loads = 0
+        #: UNIFY S7 (27B 76e87ac3b2 / --record-line): only samples of this
+        #: boot's calibration identity count; None = every sample (NF form).
+        self.accept = accept
 
     @staticmethod
     def file_key(path: str) -> Optional[tuple]:
@@ -477,7 +495,8 @@ class SidecarView:
 
     def load(self, path: str) -> Dict[str, dict]:
         key = self.file_key(path)
-        rec = host_ledger.read_measured_record(path)
+        rec = (host_ledger.read_measured_record(path) if self.accept is None
+               else host_ledger.read_measured_record(path, accept=self.accept))
         self._state = (path, key, rec)
         self.loads += 1
         return rec
@@ -2664,7 +2683,8 @@ class Front:
                  x_ceiling_tokens: int = 0,
                  x_busy_tokens: Optional[int] = None,
                  d_short_drain_tokens: int = 0,
-                 d_hold_s: Optional[float] = None):
+                 d_hold_s: Optional[float] = None,
+                 record_line: str = ""):
         # #1275: the key arrives as a PATH, never as an argv value. The groups
         # have no choice (`server_args` offers only `--admin-api-key`, so their
         # key is world-readable in /proc/<pid>/cmdline), but the front does, and
@@ -2929,6 +2949,23 @@ class Front:
         # and is therefore INTERLEAVED -- the sample says so, and only the
         # RssShmem instrument measures that group's image there.
         self.measured_record = measured_record
+        # UNIFY S7 (27B 76e87ac3b2 --record-line, in the form of S3): the
+        # calibration identity the launcher resolved; this front's own record
+        # reader (the sleep-leg page-cache gate) takes only its samples.
+        # Empty = every sample, as before (the NF form).
+        self.record_identity = record_identity_from_spec(record_line)
+        if self.record_identity is not None and self.measured_record:
+            # WARMED HERE, before READY: the first judgement of the sidecar (one
+            # git rev-list + every boot tag's front-log head) must not land in
+            # the first flip's sleep-leg gate.
+            _t0 = time.time()
+            try:
+                _rec = host_ledger.read_measured_record(
+                    self.measured_record, accept=self.record_identity.accepts_sample)
+                logger.info("WEG2-FRONT record identity warmed: group(s) %s of %s in %.2f s",
+                            sorted(_rec or {}), self.record_identity.describe(), time.time() - _t0)
+            except Exception as e:  # noqa: BLE001 -- a warm-up never blocks the front
+                logger.warning("WEG2-FRONT record identity warm-up failed: %r", e)
         self.commit = commit
         self.ledger_arm = dict(ledger_arm or {})
         self.dormant_image: Dict[str, dict] = {}
@@ -3459,7 +3496,9 @@ class Front:
         via ``__new__`` (the unit tests' stubs) gets one too."""
         v = self.__dict__.get("_sidecar_view_obj")
         if v is None:
-            v = self.__dict__["_sidecar_view_obj"] = SidecarView()
+            _ident = self.__dict__.get("record_identity")
+            v = self.__dict__["_sidecar_view_obj"] = SidecarView(
+                accept=_ident.accepts_sample if _ident is not None else None)
         return v
 
     async def _sidecar_writes_settled(self) -> None:
@@ -7760,6 +7799,10 @@ def main():
     ap.add_argument("--weights-resident", action="store_true",
                     help="Task #47 Scheibe 6a: both groups keep their weights resident; the flip "
                          "moves only kv_cache (no weights family, no gathered legs).")
+    ap.add_argument("--record-line", default="",
+                    help="UNIFY S7 (27B line 76e87ac3b2): the calibration identity the launcher "
+                         "resolved, as model=..|repo=..|head=..|evidence=..; the sleep-leg gate's "
+                         "record reader takes only its samples. Empty = every sample.")
     ap.add_argument("--d-short-drain-tokens", type=int, default=0,
                     help="27B idle policy (b): while D is awake, a queued backlog made ONLY of SHORT "
                          "requests (each <= X, law 4) whose uncached tokens sum to at most min(N, X) "
@@ -7857,7 +7900,8 @@ def main():
                   x_ceiling_tokens=args.x_ceiling_tokens,
                   x_busy_tokens=args.x_busy_tokens,
                   d_short_drain_tokens=args.d_short_drain_tokens,
-                  d_hold_s=args.d_hold_s)
+                  d_hold_s=args.d_hold_s,
+                  record_line=args.record_line)
     # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
     # against. Kept from weg2/idle-anon-0908.
     if args.anon_preboot_bytes > 0:

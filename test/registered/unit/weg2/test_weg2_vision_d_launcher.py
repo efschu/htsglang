@@ -35,7 +35,9 @@ def test_main_passes_the_form_to_both_d_argv_calls():
 
     src = inspect.getsource(lz)
     calls = [line for line in src.splitlines() if "spec_d = GroupSpec(\"D\"" in line]
-    assert len(calls) == 2
+    # UNIFY S7: three builders now -- dry run, boot and the NF line's --d-only
+    # (Nutzer 25.09.); every one carries the vision form.
+    assert len(calls) == 3
     assert all("vision=ns.weg2_vision" in line for line in calls)
 
 

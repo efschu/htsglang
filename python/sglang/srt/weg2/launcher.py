@@ -11647,6 +11647,14 @@ def calib_identity_of(ns) -> Optional["weg2_form.CalibrationIdentity"]:
         repo=os.path.abspath(tree) if tree else "")
 
 
+def record_line_spec(ns) -> str:
+    """UNIFY S7: the one-string identity the front's ``--record-line`` parses
+    (27B line_identity.spec form: model|repo|head|evidence)."""
+    tree = getattr(ns, "tree", "") or ""
+    return (f"model={getattr(ns, 'model', '')}|repo={os.path.abspath(tree) if tree else ''}"
+            f"|head=HEAD|evidence={EVIDENCE_DIR}")
+
+
 def calib_log_accept_of(ns) -> Optional[Callable[[str], bool]]:
     """WEG2-FORM: the P-log calibration filter of this boot -- logs of THIS
     checkpoint only (xsn417, a Qwen3.8-27B boot, cut its P stages on the
@@ -18772,6 +18780,13 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         "--idle-layout", idle_layout_front,
         "--drain-deadline-s", str(ns.drain_deadline_s),
     ]
+    # 27B line (76e87ac3b2) / UNIFY S7: the front's own record reader (the
+    # sleep-leg page-cache gate) takes the same calibration identity as the
+    # launcher's readers -- handed over where the profile's records row names
+    # the LINE term (qwen27b); nextflash keeps its front argv byte-identical.
+    _ident = calib_identity_of(ns)
+    if _ident is not None and _ident.uses_line:
+        argv += ["--record-line", record_line_spec(ns)]
     # #1275: the front is handed the PATH, never the key. Its argv is as
     # world-readable as any other; the groups have no alternative (server_args
     # takes only --admin-api-key) but the front does, so it uses it.

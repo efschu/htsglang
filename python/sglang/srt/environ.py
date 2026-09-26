@@ -992,6 +992,13 @@ class Envs:
     # form. The scheduler keeps the 27B parse of an explicit value
     # (0/false/no/off = off, anything else on); this entry carries the default.
     SGLANG_WEG2_STORE_SHORT_TAIL = EnvBool(_profile_default("SGLANG_WEG2_STORE_SHORT_TAIL", True))
+    # UNIFY S7/S8 (27B 34965fc3fa, mamba_anchor=grid4096): group P's anchor
+    # spacing and per-path cap. The readers are mem_cache/mamba_ckpt_utils
+    # (weg2_anchor_interval / weg2_max_states_per_path, per-node path, cached per
+    # form); these entries carry the profile default (qwen27b 4096 / 4, the 27B
+    # arm's values; nextflash 0 = off). An explicit value always wins.
+    SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL = EnvInt(_profile_default("SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL", 0))
+    SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH = EnvInt(_profile_default("SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH", 0))
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     # Weight loader: read safetensors tensors with pread() instead of mmap
     # page faults (ZFS: ~0.5 GB/s per rank through mmap, ~3 GB/s through

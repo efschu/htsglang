@@ -313,6 +313,7 @@ def retention_shrinks_protected(
 # unparsable = off, byte-identical to the per-node default.
 # ---------------------------------------------------------------------------
 
+import functools as _functools
 import os as _os
 from typing import Mapping as _Mapping
 
@@ -345,13 +346,36 @@ def _positive_int(env: _Mapping[str, str], name: str) -> int:
     return value if value > 0 else 0
 
 
+@_functools.lru_cache(maxsize=16)
+def _profile_int_default(form_env: str, name: str) -> int:
+    """UNIFY S7/S8: the published weg2 form's MODEL PROFILE default of ``name``
+    (weg2/form.py MAMBA_ANCHOR_SWITCHES: grid4096 = 4096 / 4 per path, the 27B
+    line's arm values; deepest / none = 0 = off). Cached per form string: the
+    readers sit on the scheduler's per-node path."""
+    if not form_env:
+        return 0
+    from sglang.srt.weg2.form import FORM_ENV, profile_switch_default
+
+    return int(profile_switch_default(name, 0, {FORM_ENV: form_env}) or 0)
+
+
+def _positive_int_or_profile(env: _Mapping[str, str], name: str, is_process_env: bool) -> int:
+    """``name`` from ``env``; when unset in the PROCESS env, the profile default
+    (an explicit mapping -- a desk caller -- keeps the plain read)."""
+    if is_process_env and not str(env.get(name, "") or "").strip():
+        # weg2/form.py FORM_ENV, spelled here: no import on the per-node path
+        v = _profile_int_default(str(env.get("SGLANG_WEG2_FORM", "") or ""), name)
+        return v if v > 0 else 0
+    return _positive_int(env, name)
+
+
 def weg2_anchor_interval(env: Optional[_Mapping[str, str]] = None) -> int:
     """Token spacing of group P's inner mamba anchors; 0 = off (an anchor at
     every chunk boundary, the per-node law's default)."""
     env = _os.environ if env is None else env
     if not _weg2_group_p(env):
         return 0
-    return _positive_int(env, ANCHOR_INTERVAL_ENV)
+    return _positive_int_or_profile(env, ANCHOR_INTERVAL_ENV, env is _os.environ)
 
 
 def weg2_max_states_per_path(env: Optional[_Mapping[str, str]] = None) -> int:
@@ -360,7 +384,7 @@ def weg2_max_states_per_path(env: Optional[_Mapping[str, str]] = None) -> int:
     env = _os.environ if env is None else env
     if not _weg2_group_p(env):
         return -1
-    value = _positive_int(env, MAX_STATES_PER_PATH_ENV)
+    value = _positive_int_or_profile(env, MAX_STATES_PER_PATH_ENV, env is _os.environ)
     return value if value > 0 else -1
 
 

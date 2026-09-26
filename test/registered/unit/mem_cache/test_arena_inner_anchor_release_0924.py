@@ -152,7 +152,11 @@ def _tree(pool):
     t = types.SimpleNamespace(
         root_node=root, components={ComponentType.MAMBA: comp}, _components_tuple=(comp,),
         cache_controller=types.SimpleNamespace(mem_pool_host=types.SimpleNamespace(arena_read=True)))
-    t._weg2_carrier_hold = types.MethodType(UnifiedRadixCache._weg2_carrier_hold, t)
+    # UNIFY S7: the unified tree holds the END anchors through the NF H81 form
+    # (_weg2_carrier_rotate + weg2_release_carrier_hold, UNIFY S2), not the
+    # 27B _weg2_carrier_hold -- same one-phase contract.
+    t._weg2_carrier_rotate = types.MethodType(UnifiedRadixCache._weg2_carrier_rotate, t)
+    t.weg2_release_carrier_hold = types.MethodType(UnifiedRadixCache.weg2_release_carrier_hold, t)
     return t, root
 
 

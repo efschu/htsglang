@@ -12371,7 +12371,7 @@ class Scheduler(
             raise self._pp_forwarded_schedule_stop(refusal) from refusal
         finally:
             # RU: the usable-match floor lives for exactly one plan call.
-            tp_match_floor.clear(self.tree_cache)
+            tp_match_floor.clear(getattr(self, "tree_cache", None))
 
         if self.prefill_delayer:
             prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)

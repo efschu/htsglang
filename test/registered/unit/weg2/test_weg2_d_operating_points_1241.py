@@ -699,6 +699,27 @@ class Dec1PCM(FakePCM):
         }
 
 
+def _qwen27b_form(fn):
+    """UNIFY S7: the 27B line's #1293 semantics (159333c14d (d): the runtime
+    installs the capacity-matched token vector on EVERY position) hold for a
+    TP-symmetric D -- the profile d_layout paged_dcp (qwen27b). Published here
+    the way the launcher publishes it; without a form the NF #1293 pin stands."""
+    import functools
+
+    @functools.wraps(fn)
+    def _run(*a, **k):
+        from sglang.srt.weg2 import form as _F
+
+        val = _F.Weg2Form(arch="dense", experts="none", draft="dflash", p_draft="none",
+                          kv="paged_dcp", flip="family", vision="off", profile="qwen27b",
+                          model="m").env_value()
+        with mock.patch.dict(os.environ, {_F.FORM_ENV: val}):
+            return fn(*a, **k)
+
+    return _run
+
+
+
 class AttentionTokenAxis1293Test(unittest.TestCase):
     def rows(self, budgets=None, library=FakeLibrary, pcm=Dec1PCM):
         p1, p2 = _patched(library=library, pcm=pcm)
@@ -750,6 +771,7 @@ class AttentionTokenAxis1293Test(unittest.TestCase):
         # is which axis the family's COMPUTE is judged and priced on.
         self.assertEqual(bs1.attn_heads, (12, 6, 6))
 
+    @_qwen27b_form
     def test_1293_no_position_pins_the_token_vector_27b_line(self):
         """27B line (24.09., approved reversal of the pinned half of #1293):
         the launcher ships ONLY --rank-tp-ratio for every position, never
@@ -773,6 +795,7 @@ class AttentionTokenAxis1293Test(unittest.TestCase):
 
         self.assertEqual(tuple(partition_units(64, list(bs1.weights))), DEC1_BS1_TOKEN_UNITS)
 
+    @_qwen27b_form
     def test_1293_funded_ctx_is_the_capacity_install_not_a_rate_pin_27b_line(self):
         """27B line (24.09.): the funded context of every position is priced
         at the vector the runtime installs (capacity-matched), not at a
@@ -893,6 +916,7 @@ class AttentionTokenAxis1293Test(unittest.TestCase):
 
     # -- the line names the axis, per row ----------------------------------
 
+    @_qwen27b_form
     def test_1293_the_line_prints_attn_axis_and_token_units_per_row(self):
         rows, refusals = self.rows()
         line = d_operating_point_line(rows, refusals, "maxkv")
