@@ -1058,9 +1058,10 @@ class Envs:
     # and prices pending = tokens - the MEASURED cached-on-D token prefix; the
     # tokenizer runs in one worker thread, incremental per conversation
     # prefix. Every D leg 2 logs WEG2 X-EXACT-ERR (priced vs realised). Off
-    # (default, both profiles until an agent-load boot has measured it) = the
-    # chars/3 pricing byte for byte.
-    SGLANG_WEG2_FRONT_EXACT_TOKENS = EnvBool(False)
+    # = the chars/3 pricing byte for byte. Default per profile
+    # (ModelProfile.front_exact_tokens: qwen27b and nextflash off until an
+    # agent-load boot has measured it); off without a form; explicit wins.
+    SGLANG_WEG2_FRONT_EXACT_TOKENS = EnvBool(_profile_default("SGLANG_WEG2_FRONT_EXACT_TOKENS", False))
     # X-EXACT: longest wait for the count before the request is priced by the
     # chars/3 estimate instead (named: WEG2 X-EXACT-FALLBACK reason=timeout).
     SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS = EnvInt(3000)

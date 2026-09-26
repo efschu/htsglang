@@ -419,6 +419,15 @@ class ModelProfile:
     #: operator turns the row on); nextflash off (its wait bound is the NF
     #: seat's). Switch SGLANG_WEG2_D_PARK_IMMEDIATE (explicit value wins).
     d_park_immediate: bool = False
+    #: X-EXACT (user decision 26.09. ~19:00Z, memory d2p-sofort-flippen-und-
+    #: x-exakt-0926): the front prices a request's PENDING tokens exactly --
+    #: the group's own tokenizer and chat template at the front, minus the
+    #: MEASURED cached-on-D token prefix (weg2/front_tokens.py); X holds
+    #: exactly for that count, no 1.3*X band. Off = the chars/3 pricing byte
+    #: for byte. Both rows off until an agent-load boot has measured it
+    #: (X-EXACT-ERR / X-EXACT-TOKENS); then the operator turns the row on.
+    #: Switch SGLANG_WEG2_FRONT_EXACT_TOKENS (explicit value wins).
+    front_exact_tokens: bool = False
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -439,6 +448,7 @@ class ModelProfile:
         for fld, env_name in PREFIX_SWITCHES:
             out[env_name] = bool(getattr(self, fld))
         out["SGLANG_WEG2_D_PARK_IMMEDIATE"] = bool(self.d_park_immediate)
+        out["SGLANG_WEG2_FRONT_EXACT_TOKENS"] = bool(self.front_exact_tokens)
         # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
         # installed Form A role plan at run time).
         out["SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW"] = self.d_layout == "qsa_forma"
@@ -574,6 +584,8 @@ PROFILES: Dict[str, ModelProfile] = {
         # 27B park (user 26.09.): OFF until measured on the metal under agent
         # load (profiles/27b-park-draft.env turns it on per env).
         d_park_immediate=False,
+        # X-EXACT (user 26.09.): OFF until an agent-load boot measured it.
+        front_exact_tokens=False,
     ),
     PROFILE_NEXTFLASH: ModelProfile(
         id=PROFILE_NEXTFLASH,
@@ -649,6 +661,9 @@ PROFILES: Dict[str, ModelProfile] = {
         p_mamba_slots_from_argv=True,
         # NF keeps its H91 wait bound (standard_form); the NF seat decides.
         d_park_immediate=False,
+        # X-EXACT (user 26.09., "gilt fuer 27B und NF"): OFF until measured;
+        # the NF tokenizer is the group's own (Minachist INT4 tokenizer.json).
+        front_exact_tokens=False,
     ),
 }
 
@@ -679,6 +694,7 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: read the ENVIRONMENT, which the launcher writes from the row --
 #: :func:`publish_prefix_switches`).
 #: SGLANG_WEG2_D_PARK_IMMEDIATE (``d_park_immediate``, 27B park 26.09.).
+#: SGLANG_WEG2_FRONT_EXACT_TOKENS (``front_exact_tokens``, X-EXACT 26.09.).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }
