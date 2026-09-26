@@ -3299,6 +3299,9 @@ class Front:
         self._park_unsupported = False
         #: rule 3: ONE park attempt per D phase (the epoch that made it).
         self._park_attempt_epoch = -1
+        #: H91c3-3: the D phase's seat count n (H95) this front sent at the
+        #: last P->D wake; None before the first one (no seat cap known).
+        self._d_phase_n: Optional[int] = None
         #: part A companion: the bound on a leg 1 that never starts (0 = off).
         self.p_leg1_stall_s = max(0.0, float(p_leg1_stall_s or 0.0))
         #: when a leg 1 last completed -- P's work evidence for that bound.
@@ -4974,6 +4977,11 @@ class Front:
             return None
         if not (self.awake == "D" and self.admit_d and self.state == "serving"):
             return None
+        if self._d_phase_seats_full(rid):
+            # H91c3-3: D's seat cap n is full -- fall through to route BATCH
+            # (the P queue, where the wait bound sees it), the return
+            # contract this method already has.
+            return None
         if self._d_token_budget_blocks(rid, est_tokens, await self._d_reading_if_armed()):
             # FIX 4a: the same aggregate bound the BATCH admitter obeys.  A
             # SHORT arrival that does not fit falls through to route BATCH
@@ -4983,10 +4991,40 @@ class Front:
                 refused.append("d_budget")
             return None
         await self._d_seat.acquire()
-        if not (self.awake == "D" and self.admit_d and self.state == "serving"):
+        if (not (self.awake == "D" and self.admit_d and self.state == "serving")
+                or self._d_phase_seats_full(rid, own_seat=True)):
             self._d_seat.release()
             return None
         return Seat(self, rid, "short", tokens=est_tokens)
+
+    def _d_phase_seats_full(self, rid: str, own_seat: bool = False) -> bool:
+        """H91c3-3: are the D phase's n seats (H95, ``d_seats.phase_seats`` of
+        the ``handoff_n``/``parked_n`` this front sent at the P->D wake) all
+        taken? An X-route request D would get then waits on D behind the
+        H95c seat cap -- in neither the front's queue nor its ledger of
+        waiters, so the wait bound never saw it. It goes to the P queue
+        instead: the bound sees its arrival, and the next D phase counts it
+        in n. Only with the wait bound armed (H91 part C) and after a P->D
+        wake of this boot; otherwise never full (the pre-H91c3 path).
+
+        Taken = what the phase already owes D: its running ledger (the
+        wait-bound-parked ones excepted), the hand-offs in flight and the
+        prefilled requests still waiting for a front seat. ``own_seat``: the
+        caller already holds a seat for ``rid`` (counted in flight)."""
+        n = getattr(self, "_d_phase_n", None)
+        if self.d_wait_bound_s <= 0 or not n:
+            return False
+        D = self.groups["D"]
+        ready = [p for p in self._ready_for_d if getattr(p, "fut", None) is None or not p.fut.done()]
+        taken = (len(self._flip_ledger(D)) + max(0, self._handoff_in_flight()) + len(ready)
+                 - (1 if own_seat else 0))
+        if taken < n:
+            return False
+        self.counters["short_phase_seats_full"] += 1
+        logger.info("WEG2 X-ROUTE SEATS-FULL rid=%s epoch=%d taken=%d n=%d (H91c3: the D phase's "
+                    "seats are all taken; queued for P, where the wait bound sees it, instead of "
+                    "waiting on D behind the seat cap)", rid, self.epoch, taken, n)
+        return True
 
     def _d_accepts_leg2(self) -> bool:
         """#1443: D takes leg-2 requests when awake, and -- dormant-admit armed --
@@ -6717,6 +6755,9 @@ class Front:
         _wake_extra = (Front._wake_handoff_fields(self, dst)
                        if getattr(self, "standard_form", True) else {})
         if _wake_extra:
+            # H91c3-3: the phase's n as D derives it (the same pure function)
+            self._d_phase_n = phase_policy.d_phase_seats(
+                _wake_extra["handoff_n"], _wake_extra["parked_n"], self.d_bs)
             logger.info("WEG2 HANDOFF-N epoch=%d wake=%s handoff_n=%d parked_n=%d (the requests the "
                         "P phase that just ended handed over, and the wait-bound-parked ones D "
                         "resumes first; carried on the kv_cache resume to D, H91 part C)",
