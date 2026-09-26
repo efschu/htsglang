@@ -10040,6 +10040,46 @@ def read_pp_bubble(path: str) -> Optional[BubbleMeasurement]:
     )
 
 
+def p_host_overlap_env(overlap: bool, hostgap: bool) -> Dict[str, str]:
+    """Group P's extra environment for ``--p-host-overlap`` / ``--p-hostgap``.
+
+    Empty when both are off -- that is the byte-identity guarantee, pinned by
+    test_weg2_p_host_overlap.py. The variable NAMES live in
+    managers/weg2_p_overlap.py, the one module the runtime reads them from."""
+    from sglang.srt.managers import weg2_p_overlap as _pov
+
+    env: Dict[str, str] = {}
+    if overlap:
+        env.update(_pov.launcher_env_p_host_overlap())
+    if hostgap:
+        env.update(_pov.launcher_env_p_hostgap())
+    return env
+
+
+def p_host_overlap_lines(overlap: bool, hostgap: bool) -> List[str]:
+    """The provenance lines for the two switches -- none when both are off."""
+    lines: List[str] = []
+    if overlap:
+        lines.append(
+            "WEG2 P-HOST-OVERLAP: on (--p-host-overlap) -- group P gets %s: a "
+            "middle prefill chunk exchanges no output (upstream's pure-chunk "
+            "skip), the last rank fences its schedule stream on each forward "
+            "device-side, and the chunked-prefill HiCache publish runs after "
+            "the next launch instead of inside the plan. Reason: weg2xsn420 "
+            "4x98k PP2 pass 873 ms against 733 gpu-ms, ~95-140 ms card idle "
+            "per 4096 chunk from host work serialised behind the stage's own "
+            "forward (managers/weg2_p_overlap.py)."
+            % " ".join("%s=%s" % kv for kv in sorted(p_host_overlap_env(True, False).items()))
+        )
+    if hostgap:
+        lines.append(
+            "WEG2 P-HOSTGAP: on (--p-hostgap) -- group P prints one #PGAP line "
+            "per forward: gpu_gap_ms = card idle before it (timing events, no "
+            "sync), host phases since the previous launch."
+        )
+    return lines
+
+
 def newest_bubble_log(
     evidence_dir: str, accept: Optional[Callable[[str], bool]] = None
 ) -> Optional[str]:
@@ -13759,6 +13799,28 @@ def build_parser() -> argparse.ArgumentParser:
              "PINNED and priced on the same axis.",
     )
     ap.add_argument(
+        "--p-host-overlap", action="store_true",
+        help="Group P: let each stage's host work for the NEXT prefill chunk run "
+             "while the forward it just launched computes (managers/"
+             "weg2_p_overlap.py). Adds SGLANG_WEG2_P_HOST_OVERLAP=1 and "
+             "upstream's SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM=1 to group P "
+             "only: a middle chunk exchanges no output (the last rank stops "
+             "waiting on its own forward), the last rank fences its schedule "
+             "stream device-side instead, and the chunked-prefill HiCache "
+             "publish moves from the plan to right after the next launch. "
+             "Measured reason (weg2xsn420, 4x98k): PP2 pass 873 ms vs 733 "
+             "gpu-ms, ~95-140 ms card idle per 4096 chunk, flat over depth. "
+             "Default off = argv and env byte-identical to before.",
+    )
+    ap.add_argument(
+        "--p-hostgap", action="store_true",
+        help="Group P: the #PGAP instrument (SGLANG_WEG2_P_HOSTGAP=1) -- one "
+             "line per forward with the card's idle before it (timing events on "
+             "the forward stream, harvested without a sync) and the host phases "
+             "since the previous launch. For the --p-host-overlap A/B; default "
+             "off.",
+    )
+    ap.add_argument(
         "--p-bubble-measured-from", default="",
         help="Path of the group-P log whose PP-BUBBLE lines feed "
              f"--p-microbatch-depth. Unset = the newest log in {EVIDENCE_DIR} "
@@ -15604,6 +15666,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # nodes, 2.0-2.8 s flush drain at the flip) does not build behind a
     # prefill that never idles.  P only; D keeps the default (decode graphs).
     env_p.setdefault("SGLANG_HICACHE_WRITE_STREAM_PRIORITY", "-1")
+    # P-HOST-OVERLAP / #PGAP (managers/weg2_p_overlap.py): group P only, both
+    # default off -- off adds nothing, so argv and env stay byte-identical.
+    env_p.update(p_host_overlap_env(
+        getattr(ns, "p_host_overlap", False), getattr(ns, "p_hostgap", False)))
+    for _pline in p_host_overlap_lines(
+            getattr(ns, "p_host_overlap", False), getattr(ns, "p_hostgap", False)):
+        log(_pline)
     # TRAIN FIX 5: the chunk size the cut solver was given BEFORE the ring is
     # re-read here against the arm this boot actually chose.  The hoist above
     # rests on --chunked-prefill-size being a CONSTANT of common_flags rather
