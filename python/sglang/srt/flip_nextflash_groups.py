@@ -60,6 +60,8 @@ from sglang.srt.flip_nextflash_plan import (
     FlipInfeasible,
     Weg2FlipKvRelayInfeasible,
 )
+from sglang.srt.weg2.form import PROFILE_NEXTFLASH as _PROFILE_NEXTFLASH
+from sglang.srt.weg2.form import PROFILES as _PROFILES
 
 __all__ = [
     "FLIP_CONTEXT_TOKENS",
@@ -237,9 +239,12 @@ GROUP_OWNED_ENV: Dict[str, str] = {
 #: ``Uneven nie ab`` forbids unsetting an uneven axis; both sides state a
 #: value. ``launch_fnFA19.sh`` already passes ``DCP=0`` explicitly and this
 #: is that choice, moved from a shell line into testable data.
+#: UNIFY S3: the rows live in the model-profile registry (weg2/form.py,
+#: ``PROFILES["nextflash"].group_env``); this name is their view, so the
+#: launcher's build_env and this module read ONE table.
+
 GROUP_ENV_VALUES: Dict[str, Dict[str, str]] = {
-    P_GROUP: {"SGLANG_UNEVEN_DCP": "1", "SGLANG_UNEVEN_DCP_WEIGHTED": "1"},
-    D_GROUP: {"SGLANG_UNEVEN_DCP": "0", "SGLANG_UNEVEN_DCP_WEIGHTED": "0"},
+    g: dict(_PROFILES[_PROFILE_NEXTFLASH].group_env[g]) for g in (P_GROUP, D_GROUP)
 }
 
 

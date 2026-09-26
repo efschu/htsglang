@@ -81,6 +81,19 @@ from sglang.srt.weg2 import (
 from sglang.srt.weg2 import admin_key as admin_key_mod
 # WEG2-FORM (24.09.): the boot's form axes -- ONE resolver, ONE line, ONE env.
 from sglang.srt.weg2 import form as weg2_form
+
+#: UNIFY S3: the 27B row of the model-profile registry (weg2/form.py PROFILES).
+#: The module-level measured constants below are ALIASES of this row -- the
+#: launcher's default ``--profile`` -- kept for their readers and pins; every
+#: boot-time reader goes through :func:`_pconst` (the published form's profile),
+#: so a Next-Flash boot reads the nextflash row.
+_PROFILE_27B = weg2_form.PROFILES[weg2_form.PROFILE_QWEN27B]
+
+
+def _pconst(name: str, profile: Optional[str] = None):
+    """A measured constant of ``profile`` (default: the published WEG2-FORM's
+    profile, else the launcher's default profile) -- weg2_form.profile_constant."""
+    return weg2_form.profile_constant(name, profile)
 # Task #58: the arming variable's name comes from the module that READS it, so
 # the publisher and the reader cannot drift into two spellings of one key.
 from sglang.srt.weg2.vision_stage_boot import VISION_ENV as VISION_STAGE_ENV
@@ -249,8 +262,8 @@ DC_EXPECT_3080_MIB = 1442
 #: second accounting of the runtime's own sizing (see `d_overlap_cost_line`).
 #: The term is printed at boot beside the SCHEDULER line, and W19 grades the
 #: live residue rather than these expectations.
-DC_MEASURED_D_5090_MIB = 2228
-DC_MEASURED_D_3080_MIB = 1922
+DC_MEASURED_D_5090_MIB = _PROFILE_27B.constant("DC_MEASURED_D_5090_MIB")
+DC_MEASURED_D_3080_MIB = _PROFILE_27B.constant("DC_MEASURED_D_3080_MIB")
 DC_RESERVE_SLACK_MIB = 64
 #: #1234 C6 -- the DEVELOPMENT transport switch, and the one number it moves.
 #:
@@ -334,7 +347,7 @@ DC_RESERVE_SLACK_NCCL_MIB = 192
 #: WHOLESALE (AMENDMENT 7 item 2 = B4o, keyed on B4e's form token) -- nobody
 #: should read this triple as final, and nobody should re-derive a second
 #: constant that B4o then deletes.
-DC_MEASURED_D_XCHG_MIB = (2588, 3084, 2588)
+DC_MEASURED_D_XCHG_MIB = _PROFILE_27B.constant("DC_MEASURED_D_XCHG_MIB")
 DC_MEASURED_D_XCHG_3080_MIB = DC_MEASURED_D_XCHG_MIB[0]
 DC_MEASURED_D_XCHG_5090_MIB = DC_MEASURED_D_XCHG_MIB[1]
 
@@ -404,10 +417,12 @@ def dc_measured_d_mib(card: Card, weight_source: str) -> int:
     """
     name = str(getattr(card, "name", ""))
     xchg = str(weight_source) == WEIGHT_SOURCE_EXCHANGE
+    # UNIFY S3: the published profile's row (weg2/form.py), not the 27B alias.
+    xchg_triple = _pconst("DC_MEASURED_D_XCHG_MIB")
     if "5090" in name:
-        return DC_MEASURED_D_XCHG_5090_MIB if xchg else DC_MEASURED_D_5090_MIB
+        return xchg_triple[1] if xchg else _pconst("DC_MEASURED_D_5090_MIB")
     if "3080" in name:
-        return DC_MEASURED_D_XCHG_3080_MIB if xchg else DC_MEASURED_D_3080_MIB
+        return xchg_triple[0] if xchg else _pconst("DC_MEASURED_D_3080_MIB")
     raise Weg2LaunchRefused(
         f"W19 dormant-residue reserve: board {name!r} (nvml"
         f"{getattr(card, 'nvml_index', '?')}) is named by neither DC_MEASURED_D_* "
@@ -479,7 +494,7 @@ def strip_barlink_flags(argv: List[str]) -> List[str]:
 #: prices ~635 MiB of transient there; the #656 floor is 1024) and ~1.5 GiB on
 #: PP2; PP1 keeps its budget.  R5 grades the result; a boot that measures a
 #: different overshoot replaces these numbers, it does not add to them.
-P_OVERSHOOT_MIB = [920, 0, 512]
+P_OVERSHOOT_MIB = list(_PROFILE_27B.constant("P_OVERSHOOT_MIB"))
 #: #1233 boot weg2ls4b1 (2026-09-07 11:24-11:50Z, front corridor sampler with
 #: group D awake under three back-to-back agent-load rounds, 31 requests
 #: each): NVML free continuous minimum 535 / 1260 / 1724 MiB on the 5090
@@ -494,7 +509,7 @@ P_OVERSHOOT_MIB = [920, 0, 512]
 #: pool size follows the min-over-ranks token count, so the cheaper ranks
 #: allocate less), a planner item (uneven token vector), not a budget one.
 #: A boot that measures a different overshoot replaces this number.
-D_OVERSHOOT_MIB = [489, 0, 0]
+D_OVERSHOOT_MIB = list(_PROFILE_27B.constant("D_OVERSHOOT_MIB"))
 D_WINDOWS_MIB = 16 + 32 + 24
 P_WINDOWS_MIB = 24 + 96
 #: TRAIN FIX 5.  The group-P FORM KEY has to be computed BEFORE the host ring,
@@ -575,7 +590,11 @@ MODEL_DEFAULT = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdn
 #: Sum 2138.4 MiB; the measured 2202.6 sits 64.2 MiB above it, inside the 256
 #: tolerance -- the gate keeps its grip, it is only no longer aimed at a build
 #: that no longer exists.
-P_DRAFT_RESIDENT_BUDGET_MIB = 615.7 + 1522.7
+#: UNIFY S3: TWO measurements, one per model -- 27B 405.2 + 1213.0 (the NEXTN
+#: head of the 27B line), NF 615.7 + 1522.7 (fnFL2v71 above) -- each in its
+#: registry row (weg2/form.py). This alias is the 27B row; check_draft_resident
+#: reads the published profile's row.
+P_DRAFT_RESIDENT_BUDGET_MIB = _PROFILE_27B.constant("P_DRAFT_RESIDENT_BUDGET_MIB")
 P_DRAFT_RESIDENT_TOL_MIB = 256.0
 P_CORRIDOR_TOP_MIB = 1229.0
 
@@ -609,7 +628,7 @@ P_PP_STAGE_RATIO_SCORES = (32, 18, 14)
 #: has run); any other depth must bring its own calibration or be refused by
 #: name. The constant existed with no model reference at all, which is how a
 #: 64-layer measurement reached a 32-layer checkpoint.
-CALIBRATION_LAYERS = 64
+CALIBRATION_LAYERS = _PROFILE_27B.constant("CALIBRATION_LAYERS")
 #: Group P's per-stage FULL-ATTENTION scores (#485 ``--pp-attn-stage-ratio``),
 #: the incumbent's other half, defined once for the same three readers.
 P_PP_ATTN_STAGE_RATIO_SCORES = (8, 4, 4)
@@ -1065,7 +1084,8 @@ def d_replayssm_spec_plan_form(ns):
     except ValueError:
         mrr = d_bs
     ssm = _argv_scalar(extra, "--mamba-ssm-dtype")
-    if ssm is None and getattr(ns, "profile", None) == PROFILE_QWEN27B:
+    _row = weg2_form.profile_row(getattr(ns, "profile", None))
+    if ssm is None and _row is not None and _row.early_read_flags:
         ssm = _argv_scalar(" ".join(early_read_flags("D")), "--mamba-ssm-dtype")
     return ReplaySSMSpecForm(
         ring_len=d_replayssm_spec_ring_len(),
@@ -1276,9 +1296,9 @@ P_CHUNKED_PREFILL_TOKENS = int(envs.SGLANG_WEG2_P_CHUNKED_PREFILL_TOKENS.get())
 #: the barlink fix, which pushes X to ~69,000, and the flipcost build pulls
 #: it back; the launcher recomputes from this boot's lines and this pair is
 #: only the fallback (O4 -- do not freeze a table).
-X_RECORDED_R_D_TOKS = 690.0
-X_RECORDED_R_P_TOKS = 3640.0
-X_RECORDED_FLIP_S = 13.247
+X_RECORDED_R_D_TOKS = _PROFILE_27B.constant("X_RECORDED_R_D_TOKS")
+X_RECORDED_R_P_TOKS = _PROFILE_27B.constant("X_RECORDED_R_P_TOKS")
+X_RECORDED_FLIP_S = _PROFILE_27B.constant("X_RECORDED_FLIP_S")
 
 
 #: #1271: the UNIT a rate is expressed in. X* divides one rate by another, so
@@ -1501,11 +1521,14 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> 
             f"r_P={r_p:.0f} tok/s (median of {n_p} P leg 1s) floor={floor_tokens}; "
             f"skipped {skipped} newer front log(s) carrying no complete instrument set"
         ), True)
-    x = derive_x_star(X_RECORDED_FLIP_S, X_RECORDED_R_D_TOKS, X_RECORDED_R_P_TOKS, floor_tokens)
+    rec_flip_s = _pconst("X_RECORDED_FLIP_S")
+    rec_r_d = _pconst("X_RECORDED_R_D_TOKS")
+    rec_r_p = _pconst("X_RECORDED_R_P_TOKS")
+    x = derive_x_star(rec_flip_s, rec_r_d, rec_r_p, floor_tokens)
     return XSeed(x, (
         f"X={x} source=recorded PRE-BARLINK (examined {len(logs)} front log(s) on this rig, "
-        f"none carried all three instruments) X*=2*flip_s/(1/r_D-1/r_P) flip_s={X_RECORDED_FLIP_S} "
-        f"r_D={X_RECORDED_R_D_TOKS:.0f} tok/s r_P={X_RECORDED_R_P_TOKS:.0f} tok/s "
+        f"none carried all three instruments) X*=2*flip_s/(1/r_D-1/r_P) flip_s={rec_flip_s} "
+        f"r_D={rec_r_d:.0f} tok/s r_P={rec_r_p:.0f} tok/s "
         f"floor={floor_tokens} -- record 1l/1o weg2zr2, conservative corner of the measured "
         f"range; post-barlink r_D 1354 tok/s pushes X far higher and post-flipcost pulls it "
         f"back, so this is a fallback, never a table (O4)"
@@ -1666,7 +1689,7 @@ CONTEXT_LENGTH = CONTEXT_LENGTH_TOKENS
 #: that measurement's own A/A repeat established. Used as the ANCHOR for the
 #: card-rate library's ratios, and as the whole cost model when no measured
 #: library exists.
-MEASURED_MS_PER_LAYER = "8.10,35.16,33.59"
+MEASURED_MS_PER_LAYER = _PROFILE_27B.constant("MEASURED_MS_PER_LAYER")
 
 #: Per-rank arming floor for the pool model, MiB. The rig's VRAM corridor is
 #: 819-1229 MiB NVML-free per card under load and the desk pre-flight arming
@@ -1701,7 +1724,7 @@ ARMING_FLOOR_MIB = 1229.0
 #:   weg2rg6   2335.5 / 1111.2 / 3520.1 MiB
 #: The two agree to <= 12.7 MiB (<= 0.55 % of the term, <= 600 tokens on the
 #: binding stage), which is the residual this constant carries.
-P_PP_STAGE_FIXED_MIB = "2342.0,1105.5,3518.0"
+P_PP_STAGE_FIXED_MIB = _PROFILE_27B.constant("P_PP_STAGE_FIXED_MIB")
 
 #: The `prefill activation reserve` post, MiB per rank. 1.000 GiB on every
 #: rank of both boots. It had NO FIELD in the pool model before #1286.
@@ -1746,8 +1769,9 @@ def p_prefill_transient_vector_mib(chunk_tokens: int) -> Tuple[float, ...]:
 #: on -- fnFL2x113/x116/x118 all ran Qwen3.8-Flash-Next-INT4. A transient is a
 #: property of one model's prefill (hidden size, expert fan-out, attention
 #: form), so the slopes are published only for that checkpoint.
-P_PREFILL_TRANSIENT_CALIBRATION_MODELS: Tuple[str, ...] = (
-    "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",
+#: UNIFY S3: read off the registry rows (ModelProfile.prefill_transient_checkpoints).
+P_PREFILL_TRANSIENT_CALIBRATION_MODELS: Tuple[str, ...] = tuple(
+    c for _row in weg2_form.PROFILES.values() for c in _row.prefill_transient_checkpoints
 )
 
 
@@ -1832,7 +1856,7 @@ def p_corridor_holdback_default_mib(user_reserve_mib=None) -> float:
 #: 31.185/31.23/31.16 (weg2sb5f) and 31.19/31.16/31.13 (weg2rg6) MiB per
 #: linear layer, i.e. 1.5588 MiB per linear layer per slot. Cross-checked
 #: against the boot's own `per_req=51.43 MiB` at 33 linear layers.
-P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT = 1.5588
+P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT = _PROFILE_27B.constant("P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT")
 
 #: The runtime's OWN safety margin on the demand-driven mamba pool
 #: (model_runner_kv_cache_mixin.py:177 ``MAMBA_AUTO_SAFETY_MARGIN``). Restated
@@ -3129,11 +3153,11 @@ def cards_free_check(cards: List[Card], log: Log) -> None:
 #: wall.  The factor is therefore a SIZING INPUT with a flag
 #: (``--store-sidecar-factor``), not a law, and on disk it is cheap to be
 #: generous with -- which is the point of moving off RAM.
-STORE_CENSUS_PROVENANCE = "boot weg2sb5g W9 store census 2026-09-09T07:12:38Z"
-STORE_CENSUS_KV_PAGES = 50651
-STORE_CENSUS_MAMBA_BLOBS = 42
-STORE_CENSUS_DRAFT_PAGES = 26040
-STORE_CENSUS_KV_PAGE_BYTES = 32768
+STORE_CENSUS_PROVENANCE = _PROFILE_27B.constant("STORE_CENSUS_PROVENANCE")
+STORE_CENSUS_KV_PAGES = _PROFILE_27B.constant("STORE_CENSUS_KV_PAGES")
+STORE_CENSUS_MAMBA_BLOBS = _PROFILE_27B.constant("STORE_CENSUS_MAMBA_BLOBS")
+STORE_CENSUS_DRAFT_PAGES = _PROFILE_27B.constant("STORE_CENSUS_DRAFT_PAGES")
+STORE_CENSUS_KV_PAGE_BYTES = _PROFILE_27B.constant("STORE_CENSUS_KV_PAGE_BYTES")
 #: 39,223,296 + 19,611,648 + 19,611,648 measured on /spinning/hicache-l3.
 STORE_MAMBA_BLOB_BYTES = 39_223_296 + 19_611_648 + 19_611_648
 _CENSUS_KV_BYTES = STORE_CENSUS_KV_PAGES * STORE_CENSUS_KV_PAGE_BYTES
@@ -3144,6 +3168,15 @@ _CENSUS_DRAFT_BYTES = STORE_CENSUS_DRAFT_PAGES * host_ledger.DRAFT_PAGE_BYTES
 STORE_SIDECAR_FACTOR = (
     _CENSUS_KV_BYTES + _CENSUS_MAMBA_BYTES + _CENSUS_DRAFT_BYTES
 ) / float(_CENSUS_KV_BYTES)
+
+
+def store_sidecar_factor_of(profile: Optional[str] = None) -> float:
+    """UNIFY S3: the sidecar factor from ``profile``'s store census row (the
+    same arithmetic as :data:`STORE_SIDECAR_FACTOR`, which is the 27B row)."""
+    kv = _pconst("STORE_CENSUS_KV_PAGES", profile) * _pconst("STORE_CENSUS_KV_PAGE_BYTES", profile)
+    mamba = _pconst("STORE_CENSUS_MAMBA_BLOBS", profile) * STORE_MAMBA_BLOB_BYTES
+    draft = _pconst("STORE_CENSUS_DRAFT_PAGES", profile) * host_ledger.DRAFT_PAGE_BYTES
+    return (kv + mamba + draft) / float(kv)
 #: ``min_free_space`` FOR THE DISK, and the reason it is not the old 1 GiB:
 #: that 1 GiB was 1/6th of a 6 GiB tmpfs and it latched the write stop after
 #: 5 GiB.  Here the filesystem is the CONTAINER'S ROOT (``/`` is
@@ -3552,9 +3585,19 @@ VISION_TRANSIENT_OVERRIDE = '{"language_model_only": true}'
 #: inherited SGLANG_UNEVEN_DCP=1 -- so the uneven-DCP facts (EARLY_READ_FACTS,
 #: env AND flag half) are owned per group here (flip_nextflash_groups
 #: GROUP_ENV_VALUES: P 1/1, D 0/0) and the flag half is dropped on both.
-PROFILE_QWEN27B = "qwen27b"
-PROFILE_NEXTFLASH = "nextflash"
-PROFILES = (PROFILE_QWEN27B, PROFILE_NEXTFLASH)
+#: UNIFY S3: the names and their rows live in the registry (weg2/form.py
+#: PROFILES); what differs per profile is a table row there, never an ``if``
+#: on the name here.
+PROFILE_QWEN27B = weg2_form.PROFILE_QWEN27B
+PROFILE_NEXTFLASH = weg2_form.PROFILE_NEXTFLASH
+PROFILES = tuple(weg2_form.PROFILES)
+
+
+def _profile_early_read(profile: Optional[str]) -> bool:
+    """Does ``profile`` put the #1235 early-read facts' FLAG half in the argv
+    (ModelProfile.early_read_flags; 27B yes, NF no)? Unknown profile: no."""
+    row = weg2_form.profile_row(profile)
+    return bool(row is not None and row.early_read_flags)
 
 
 def vision_model_flags(vision: str):
@@ -3705,7 +3748,7 @@ def common_flags(
         "--barlink", "--barlink-transport", "bar1",
         "--barlink-bar1-cap-cycles", str(barlink_cap_cycles),
         "--collective-census-interval", str(census_interval),
-    ] + (early_read_flags(group) if profile == PROFILE_QWEN27B else []) + [
+    ] + (early_read_flags(group) if _profile_early_read(profile) else []) + [
         # THE DOUBLY-STATED FACTS COME FROM ONE TABLE (#1235). --mamba-ssm-dtype
         # is here for both groups and the two uneven-DCP flags for group D; the
         # matching environment keys are written by build_env from the SAME
@@ -3827,7 +3870,7 @@ def argv_p(
         if _dg:
             _calib, _calib_why = host_ledger.read_pp_calibration(_dg)
             _depth = host_ledger.checkpoint_layers(model)
-            if _calib is None and _depth is not None and _depth != CALIBRATION_LAYERS:
+            if _calib is None and _depth is not None and _depth != _pconst("CALIBRATION_LAYERS", profile):
                 raise host_ledger.refuse_foreign_calibration(_dg, _calib_why)
             if _calib is not None:
                 stage_ratio = _csv(tuple(_calib["measured_counts"]))
@@ -6197,13 +6240,15 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # same three facts and this loop is the one that survives.)
     for fact in EARLY_READ_FACTS:
         env[fact.env_key] = fact.env_value
-    if profile == PROFILE_NEXTFLASH and group:
-        # Scheibe 6a: the uneven-DCP axis is GROUP-OWNED on Next Flash (seam D):
-        # P (PP3, tp 1) keeps 1/1 (inert), D (Form A) gets 0/0 -- an inherited 1
-        # lands in RankRoleError (rank_role.py resolve_dcp_under_host_kv).
-        from sglang.srt.flip_nextflash_groups import GROUP_ENV_VALUES
-
-        env.update(GROUP_ENV_VALUES[group])
+    if group:
+        # Scheibe 6a / UNIFY S3: per-group env rows of the profile (weg2/form.py
+        # ModelProfile.group_env). Next Flash owns the uneven-DCP axis per group
+        # (seam D): P (PP3, tp 1) keeps 1/1 (inert), D (Form A) gets 0/0 -- an
+        # inherited 1 lands in RankRoleError (rank_role.py
+        # resolve_dcp_under_host_kv). The 27B row has none.
+        _row = weg2_form.profile_row(profile)
+        if _row is not None:
+            env.update(_row.group_env.get(group, {}))
     if flip_weights == "resident":
         from sglang.srt.managers.weg2_memory_saver import WEIGHTS_RESIDENT_ENV
 
@@ -6426,7 +6471,8 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
     (-1) in either instrument: silence is not a pass, and a build nobody
     measured is not a build anybody checked.
     """
-    budget = P_DRAFT_RESIDENT_BUDGET_MIB if budget_mib is None else float(budget_mib)
+    budget = (float(_pconst("P_DRAFT_RESIDENT_BUDGET_MIB")) if budget_mib is None
+              else float(budget_mib))
     tol = P_DRAFT_RESIDENT_TOL_MIB if tol_mib is None else float(tol_mib)
     out: Dict[str, object] = {
         "resident_mib": None, "budget_mib": budget, "tol_mib": tol, "over_mib": None,
@@ -10196,6 +10242,45 @@ def calib_log_accept_of(ns) -> Optional[Callable[[str], bool]]:
     return weg2_form.same_model_log(getattr(ns, "model", ""))
 
 
+#: UNIFY S3: argparse defaults that are MEASURED constants of one model. The
+#: parser's default is the 27B row (the launcher's default --profile); after
+#: parsing, an UNSET flag takes the booted profile's row. A given flag, or a
+#: value that is no longer the parser default (argparse abbreviations), wins.
+PROFILE_ARG_DEFAULTS: Tuple[Tuple[str, str, Callable[[str], object]], ...] = (
+    ("--pp-cut-measured-ms-per-layer", "pp_cut_measured_ms_per_layer",
+     lambda p: _pconst("MEASURED_MS_PER_LAYER", p)),
+    ("--pp-cut-stage-fixed-mib", "pp_cut_stage_fixed_mib",
+     lambda p: _pconst("P_PP_STAGE_FIXED_MIB", p)),
+    ("--pp-cut-mamba-mib-per-linear-layer-per-slot", "pp_cut_mamba_mib_per_linear_layer_per_slot",
+     lambda p: float(_pconst("P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT", p))),
+    ("--store-sidecar-factor", "store_sidecar_factor", store_sidecar_factor_of),
+)
+
+
+def apply_profile_arg_defaults(ns, argv_words: Sequence[str]) -> List[str]:
+    """Rewrite the unset :data:`PROFILE_ARG_DEFAULTS` to ``ns.profile``'s row;
+    returns the dests that changed (none for the 27B and, today, for NF, whose
+    rows borrow these 27B measurements)."""
+    parser_default = {
+        "pp_cut_measured_ms_per_layer": MEASURED_MS_PER_LAYER,
+        "pp_cut_stage_fixed_mib": P_PP_STAGE_FIXED_MIB,
+        "pp_cut_mamba_mib_per_linear_layer_per_slot": P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT,
+        "store_sidecar_factor": STORE_SIDECAR_FACTOR,
+    }
+    profile = getattr(ns, "profile", None) or PROFILE_QWEN27B
+    changed: List[str] = []
+    for flag, dest, of in PROFILE_ARG_DEFAULTS:
+        if weg2_form.flag_given(argv_words, flag) or not hasattr(ns, dest):
+            continue
+        if getattr(ns, dest) != parser_default[dest]:
+            continue
+        want = of(profile)
+        if want != getattr(ns, dest):
+            setattr(ns, dest, want)
+            changed.append(dest)
+    return changed
+
+
 def pcie_lanes(cards: Sequence[Card]) -> List[Optional[int]]:
     """Current PCIe link width per CUDA ordinal, from NVML. ``None`` if unknown.
 
@@ -12294,7 +12379,8 @@ def solve_p_cut(
     else:
         incumbent = (
             host_ledger.resolve_calibrated_stage_layer_counts(
-                model, ns.pp_stage_ratio, CALIBRATION_LAYERS)
+                model, ns.pp_stage_ratio,
+                _pconst("CALIBRATION_LAYERS", getattr(ns, "profile", None)))
             or list(P_PP_STAGE_RATIO_SCORES)
         )
     # THE GAPPED DEFAULT IS NOT TAKEN, AND THE HOOK IS NAMED RATHER THAN LEFT
@@ -14236,6 +14322,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ns, list(sys.argv[1:] if argv is None else argv),
             parse_group_env=parse_group_env, shlex_split=shlex.split)
         os.environ[weg2_form.FORM_ENV] = boot_form.env_value()
+        # UNIFY S3: argparse defaults that are MEASURED constants follow the
+        # profile's registry row (unset flags only).
+        apply_profile_arg_defaults(ns, list(sys.argv[1:] if argv is None else argv))
     ns.weg2_boot_form = boot_form
     # WEG2-FORM: THE CALIBRATION IDENTITY. Every measured source this boot
     # prices from (the sidecar record, the P logs the cut and the depth read)
@@ -14391,6 +14480,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(f"tree: {tree} @ {tip}")
     if boot_form is not None:
         log(boot_form.line())
+        _borrowed = weg2_form.borrowed_constants_line(boot_form.profile) \
+            if boot_form.profile in weg2_form.PROFILES else None
+        if _borrowed:
+            log(_borrowed)
         log("#114 P-PREFILL-TRANSIENT (form " + boot_form.describe() + "): "
             + p_prefill_transient_for(boot_form)[1])
     if dirty and not dry:
@@ -14687,7 +14780,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "nobody has to."
     )
     budgets_p = budgets_from_dc(
-        cards, dc_expect_d, log, "P", overshoot_mib=P_OVERSHOOT_MIB,
+        cards, dc_expect_d, log, "P", overshoot_mib=list(_pconst("P_OVERSHOOT_MIB", ns.profile)),
         overshoot_provenance="boot weg2ls2b2",
         user_reserve_by_card=user_reserve_by_card,
     )
@@ -16004,7 +16097,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # 5. group D
     budgets_d = budgets_from_dc(
-        cards, dc_p, log, "D", overshoot_mib=D_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls4b1",
+        cards, dc_p, log, "D", overshoot_mib=list(_pconst("D_OVERSHOOT_MIB", ns.profile)), overshoot_provenance="boot weg2ls4b1",
         corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
         user_reserve_by_card=user_reserve_by_card,
     )

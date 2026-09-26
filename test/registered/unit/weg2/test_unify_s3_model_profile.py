@@ -196,6 +196,21 @@ def test_the_27b_constants_moved_unchanged_and_the_nf_row_is_separate():
     assert F.borrowed_constants_line("qwen27b") is None
 
 
+def test_the_launcher_names_are_27b_row_aliases():
+    from sglang.srt.weg2 import launcher as L
+
+    q = F.PROFILES["qwen27b"]
+    for name in ("DC_MEASURED_D_5090_MIB", "DC_MEASURED_D_3080_MIB", "DC_MEASURED_D_XCHG_MIB",
+                 "P_DRAFT_RESIDENT_BUDGET_MIB", "CALIBRATION_LAYERS", "MEASURED_MS_PER_LAYER",
+                 "P_PP_STAGE_FIXED_MIB", "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT",
+                 "X_RECORDED_R_D_TOKS", "X_RECORDED_R_P_TOKS", "X_RECORDED_FLIP_S",
+                 "STORE_CENSUS_PROVENANCE", "STORE_CENSUS_KV_PAGES"):
+        assert getattr(L, name) == q.constant(name), name
+    assert L.P_OVERSHOOT_MIB == [920, 0, 512] and L.D_OVERSHOOT_MIB == [489, 0, 0]
+    assert L.STORE_SIDECAR_FACTOR == pytest.approx(L.store_sidecar_factor_of("qwen27b"))
+    assert L.PROFILES == tuple(F.PROFILES)
+
+
 def test_profile_constant_reads_the_published_profile(clean):
     assert F.profile_constant("P_DRAFT_RESIDENT_BUDGET_MIB") == pytest.approx(1618.2)
     clean.setenv(F.FORM_ENV, _form_env("nextflash"))
@@ -205,3 +220,95 @@ def test_profile_constant_reads_the_published_profile(clean):
         F.profile_constant("NOPE", "qwen27b")
     with pytest.raises(KeyError):
         F.profile_constant("CALIBRATION_LAYERS", "no-such-model")
+
+
+@pytest.fixture
+def third_model(clean):
+    """A NEW model = a new row, no code: prove the readers are table-driven."""
+    q = F.PROFILES["qwen27b"]
+    consts = dict(q.constants)
+    consts["DC_MEASURED_D_5090_MIB"] = F.Measured(1111, "desk", "third")
+    consts["P_OVERSHOOT_MIB"] = F.Measured((7, 8, 9), "desk", "third")
+    consts["P_DRAFT_RESIDENT_BUDGET_MIB"] = F.Measured(999.0, "desk", "third")
+    consts["MEASURED_MS_PER_LAYER"] = F.Measured("1.0,2.0,3.0", "desk", "third")
+    row = dataclasses.replace(q, id="third", constants=consts, early_read_flags=False,
+                              group_env={"D": {"SGLANG_THIRD_D": "1"}},
+                              end_anchor="tail_handoff", mamba_anchor="deepest")
+    clean.setitem(F.PROFILES, "third", row)
+    clean.setitem(F.PROFILE_SWITCH_DEFAULTS, "third", row.switch_defaults())
+    clean.setenv(F.FORM_ENV, _form_env("third"))
+    return row
+
+
+def test_a_new_row_drives_the_launcher_readers(third_model, clean):
+    from sglang.srt.weg2 import launcher as L
+    from sglang.srt.weg2 import tail_handoff
+
+    card = L.Card(nvml_index=1, uuid="u", name="NVIDIA GeForce RTX 5090", total_mib=32607)
+    assert L.dc_measured_d_mib(card, "disk") == 1111
+    assert L._pconst("P_OVERSHOOT_MIB", "third") == (7, 8, 9)
+    assert L._profile_early_read("third") is False
+    assert L._profile_early_read("qwen27b") is True
+    assert L._profile_early_read("nextflash") is False
+    assert tail_handoff.enabled() is True
+    assert envs.SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS.get() == -1
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "P.log")
+        open(p, "w").write("nothing\n")
+        assert L.check_draft_resident(p)["budget_mib"] == pytest.approx(999.0)
+
+
+def test_argparse_measured_defaults_follow_the_row_unless_given(third_model):
+    from sglang.srt.weg2 import launcher as L
+
+    ns = argparse.Namespace(profile="third", pp_cut_measured_ms_per_layer=L.MEASURED_MS_PER_LAYER,
+                            pp_cut_stage_fixed_mib=L.P_PP_STAGE_FIXED_MIB,
+                            pp_cut_mamba_mib_per_linear_layer_per_slot=L.P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT,
+                            store_sidecar_factor=L.STORE_SIDECAR_FACTOR)
+    assert L.apply_profile_arg_defaults(ns, []) == ["pp_cut_measured_ms_per_layer"]
+    assert ns.pp_cut_measured_ms_per_layer == "1.0,2.0,3.0"
+    ns2 = argparse.Namespace(**{**vars(ns), "pp_cut_measured_ms_per_layer": L.MEASURED_MS_PER_LAYER})
+    assert L.apply_profile_arg_defaults(
+        ns2, ["--pp-cut-measured-ms-per-layer", L.MEASURED_MS_PER_LAYER]) == []
+    for prof in ("qwen27b", "nextflash"):
+        ns3 = argparse.Namespace(**{**vars(ns2), "profile": prof})
+        assert L.apply_profile_arg_defaults(ns3, []) == [], prof
+
+
+def test_group_env_is_a_table_row_in_build_env(clean):
+    from sglang.srt.flip_nextflash_groups import GROUP_ENV_VALUES
+    from sglang.srt.weg2 import launcher as L
+
+    assert GROUP_ENV_VALUES == {g: dict(v) for g, v in F.PROFILES["nextflash"].group_env.items()}
+    assert F.PROFILES["qwen27b"].group_env == {}
+
+    def env_of(profile, group):
+        return L.build_env("/t", "/v", "0", "/s", False, "x", group=group, profile=profile)
+
+    for g in ("P", "D"):
+        nf = env_of("nextflash", g)
+        for k, v in GROUP_ENV_VALUES[g].items():
+            assert nf[k] == v, (g, k)
+    q = env_of("qwen27b", "D")
+    for fact in L.EARLY_READ_FACTS:
+        assert q[fact.env_key] == fact.env_value
+
+
+def test_no_profile_name_branch_left_in_weg2_code():
+    """`if profile == ...` / a model-name literal compared in weg2 code is a
+    table row in weg2/form.py now."""
+    names = {"PROFILE_QWEN27B", "PROFILE_NEXTFLASH"}
+    literals = set(F.PROFILES)
+    files = list(WEG2_DIR.glob("*.py")) + [SRT_DIR / "flip_nextflash_groups.py"] + list(
+        (SRT_DIR / "planner").glob("*.py"))
+    bad = []
+    for py in files:
+        tree = ast.parse(py.read_text(), filename=str(py))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare):
+                continue
+            for side in [node.left, *node.comparators]:
+                if (isinstance(side, ast.Name) and side.id in names) or (
+                        isinstance(side, ast.Constant) and side.value in literals):
+                    bad.append(f"{py.name}:{node.lineno}")
+    assert bad == []

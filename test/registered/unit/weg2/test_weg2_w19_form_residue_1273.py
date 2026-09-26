@@ -227,7 +227,9 @@ class TheExcessIsAttributedOnOneInstrument(CustomTestCase):
         import inspect
 
         src = inspect.getsource(launcher)
-        i = src.index("DC_MEASURED_D_XCHG_MIB = (")
+        # UNIFY S3: the value lives in the registry row (weg2/form.py); the name,
+        # its alias line and the provenance comment above it stay here.
+        i = src.index("DC_MEASURED_D_XCHG_MIB = _PROFILE_27B.constant(")
         head = src[max(0, i - 2600):i]
         self.assertIn("RETRACTED", head)
         self.assertIn("weights_draft", head)
