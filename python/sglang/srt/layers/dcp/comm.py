@@ -219,7 +219,24 @@ def cp_all_gather_heads_uneven(
     return torch.cat(parts, dim=1).contiguous()
 
 
-_KVQ_FUSE = {"on": None}
+_KVQ_FUSE = {"on": None, "max_rows": None}
+
+
+def dcp_fuse_max_rows() -> int:
+    """SGLANG_DCP_FUSE_MAX_ROWS (default 256): both DCP fusions only for
+    forwards of at most this many rows (decode / verify / short tails). The
+    latency they save is per collective, so a wide prefill-with-prefix gains
+    nothing -- and it would pay the fused buffers' extra transient at up to
+    4096 rows on D TP0, the regime of the RC7 merge OOM. Row count is equal on
+    every rank (the q/LSE gathers require it), so the gate is rank-uniform."""
+    if _KVQ_FUSE["max_rows"] is None:
+        import os
+
+        try:
+            _KVQ_FUSE["max_rows"] = max(0, int(os.environ.get("SGLANG_DCP_FUSE_MAX_ROWS", "256")))
+        except ValueError:
+            _KVQ_FUSE["max_rows"] = 256
+    return int(_KVQ_FUSE["max_rows"])
 
 
 def dcp_fuse_kvq_gather() -> bool:
@@ -469,7 +486,11 @@ def cp_lse_ag_out_a2a_mha_uneven(
     cp_attn_lse = cp_attn_lse.contiguous()
     _ng("merge.local_out", cp_attn_out, cp_group)
     _ng("merge.local_lse", cp_attn_lse, cp_group, allow_neg_inf=True)
-    if lse_merge_fused() and lse_merge_reduce_dtype() == "fp32":
+    if (
+        lse_merge_fused()
+        and lse_merge_reduce_dtype() == "fp32"
+        and cp_attn_out.shape[0] <= dcp_fuse_max_rows()
+    ):
         # SGLANG_DCP_LSE_MERGE_FUSED: one collective instead of two. The bf16
         # wire keeps the two-collective body -- the LSE must travel in fp32.
         return _cp_lse_a2a_fused_body(

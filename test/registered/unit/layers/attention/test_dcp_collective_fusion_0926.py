@@ -110,6 +110,7 @@ def _reset():
     comm._LSE_MERGE["dtype"] = None
     comm._LSE_MERGE["fused"] = None
     comm._KVQ_FUSE["on"] = None
+    comm._KVQ_FUSE["max_rows"] = None
 
 
 def _bitwise(a, b):
@@ -252,6 +253,15 @@ class TestFusedLseMerge(CustomTestCase):
         for r in range(w.W):
             self.assertEqual([o[0] for o in log_fused[r]], ["all_gather", "a2a"])
 
+    def test_wide_forward_keeps_two_collectives(self):
+        w = _MergeWorld([12, 6, 6], T=8, seed=8)
+        base, fused, _lb, log_fused = self._both(
+            w, True, env_extra={"SGLANG_DCP_FUSE_MAX_ROWS": "4"})
+        for r in range(w.W):
+            self.assertEqual([o[0] for o in log_fused[r]], ["all_gather", "a2a"])
+            for x, y in zip(fused[r], base[r]):
+                self.assertTrue(_bitwise(x, y))
+
     def test_token_blocks_compose(self):
         w = _MergeWorld([12, 6, 6], T=9, seed=6)
 
@@ -331,6 +341,10 @@ class TestBackendGate(CustomTestCase):
         self.assertFalse(self._gate(replicated=True))
         self.assertFalse(self._gate(weightless=True))
         self.assertFalse(self._gate(kdtype=torch.float16))
+        with mock.patch.dict(os.environ, {"SGLANG_DCP_FUSE_MAX_ROWS": "4"}):
+            comm._KVQ_FUSE["max_rows"] = None
+            self.assertFalse(self._gate())  # 8 rows > 4
+        comm._KVQ_FUSE["max_rows"] = None
 
     def test_wiring(self):
         from sglang.srt.layers.attention import flashinfer_backend as fb

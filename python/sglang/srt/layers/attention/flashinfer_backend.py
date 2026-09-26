@@ -39,6 +39,7 @@ from sglang.srt.layers.dcp.comm import (
     cp_all_gather_kvq_heads_uneven,
     cp_lse_merge_token_blocks,
     dcp_fuse_kvq_gather,
+    dcp_fuse_max_rows,
     lse_merge_is_blocked,
     lse_merge_token_spans,
 )
@@ -3098,6 +3099,8 @@ class FlashInferAttnBackend(AttentionBackend):
         if not (q_local.dtype == k.dtype == v.dtype):
             return False
         if layer.tp_k_head_num != layer.tp_v_head_num:
+            return False
+        if q_local.shape[0] > dcp_fuse_max_rows():
             return False
         return q_local.shape[-1] == layer.head_dim
 
