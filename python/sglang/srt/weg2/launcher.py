@@ -1444,6 +1444,157 @@ def p_chunk_policy_lines() -> List[str]:
     return out
 
 
+#: --p-layer-split (27B, user order 26.09. ~05:35Z: "dynamisches layersplit ...
+#: ohne neue ranks ... umsetzen"). The rule lives in weg2/p_layer_split.py
+#: (pure); design and evidence /spinning/gpu-arb/docs/DYN_LAYER_SPLIT.md.
+#: 'static' (the default until the metal ladder) changes NOTHING: no env, no
+#: line, argv and the P form key byte-identical. 'dynamic' builds and prints
+#: the spec, the swing slab and its dry-run plans and hands group P the spec
+#: env; the rank-side executor is weg2/p_layer_split_runtime.py (resident
+#: swing window under tag weights_swing, write-back on the proxy frame, the
+#: row on the #791 decision, prefix pull + weight refill upstream, graph
+#: bypass for non-home cuts). With PREFIX PULL by default (sec. 5: without
+#: pull there is no gain); --p-layer-split-pull-gbps 0 is the V1 frontier.
+P_LAYER_SPLIT_DEFAULT = "static"
+#: the measured x4-3080 BAR1 rate that bounds both 27B P edges (card probe
+#: 14.4 / 6.5 / 13.3 GB/s) -- the planner's price of a pull
+P_LAYER_SPLIT_PULL_GBPS_DEFAULT = 6.5
+P_LAYER_SPLIT_DRY_RUN_TOKENS = (32768, 131072)
+_P_LAYER_SPLIT: Dict[str, object] = {"policy": P_LAYER_SPLIT_DEFAULT, "spec": None, "lines": ()}
+
+
+def _int_list(raw: str, what: str) -> Tuple[int, ...]:
+    try:
+        return tuple(int(x) for x in str(raw).split(",") if x.strip() != "")
+    except ValueError:
+        raise SystemExit(f"{what} {raw!r}: expected comma-separated integers")
+
+
+def p_layer_split_spec_from_ns(ns):
+    """The SplitSpec a 'dynamic' boot would hand group P (no side effects).
+    The stage model is SG's per-layer-type model (weg2/p_stage_model.py):
+    a JSON path or a name under p_stage_model_data/ (27b_int8_rc9j,
+    27b_nvfp4_rc9j)."""
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+    from sglang.srt.weg2 import p_layer_split as _pls
+    from sglang.srt.weg2 import p_stage_model as _psm
+
+    home = _int_list(getattr(ns, "p_layer_split_home", "") or "", "--p-layer-split-home")
+    window = _int_list(getattr(ns, "p_layer_split_window", "") or "", "--p-layer-split-window")
+    max_attn = _int_list(getattr(ns, "p_layer_split_max_attn", "") or "", "--p-layer-split-max-attn")
+    src = str(getattr(ns, "p_layer_split_model", "") or "")
+    if not home or not window or not src:
+        raise SystemExit("--p-layer-split dynamic needs --p-layer-split-home, "
+                         "--p-layer-split-window and --p-layer-split-model")
+    path = src if os.path.sep in src or src.endswith(".json") else os.path.join(
+        os.path.dirname(_psm.__file__), "p_stage_model_data", src + ".json")
+    try:
+        model = _psm.load_model(path)
+    except (OSError, ValueError, KeyError, _psm.StageModelError) as exc:
+        raise SystemExit(f"--p-layer-split-model {src}: {exc}")
+    floors = tuple(float(r["eager_floor_ms"]) / n for r, n in zip(P_CHUNK_BUILTIN_INT8, (42, 11, 11)))
+    try:
+        geom = _pls.SplitGeometry(_pls.hybrid_families(model.n_layers, 4), home, window, max_attn)
+        chunk = p_chunk_policy_spec()
+        limits = chunk.limits if chunk is not None else _pcp.ChunkLimits(
+            max_tokens=P_CHUNK_MAX_DEFAULT, min_tokens=p_prefill_graph_bucket() or 512,
+            fixed_tokens=p_prefill_graph_bucket() or 512, page=1,
+            graph_buckets=tuple(p_prefill_graph_buckets()), eager=True)
+        _pull_raw = getattr(ns, "p_layer_split_pull_gbps", None)
+        pull = P_LAYER_SPLIT_PULL_GBPS_DEFAULT if _pull_raw is None else float(_pull_raw)
+        extra = _pls.ExtraCosts(
+            _pls.WritebackPrice(2048, 1634304, tuple(6.5 for _ in home), True),
+            floors[: len(home) + 1], tuple(pull for _ in home) if pull > 0 else ())
+        spec = _pls.SplitSpec(geom, model, limits,
+                              float(getattr(ns, "p_layer_split_min_gain", _pls.DEFAULT_MIN_GAIN)),
+                              "every", os.path.basename(path), extra)
+        _pls.check_layout(geom, model)
+        return spec
+    except (_pls.LayerSplitError, _pcp.ChunkPolicyError) as exc:
+        raise SystemExit(f"--p-layer-split dynamic: {exc}")
+
+
+def apply_p_layer_split(ns) -> None:
+    """Install --p-layer-split once, after --p-chunk-policy (joint plan)."""
+    from sglang.srt.weg2 import p_layer_split as _pls
+
+    policy = str(getattr(ns, "p_layer_split", P_LAYER_SPLIT_DEFAULT) or P_LAYER_SPLIT_DEFAULT)
+    if policy not in _pls.POLICIES:
+        raise SystemExit(f"--p-layer-split {policy!r}: one of {list(_pls.POLICIES)}")
+    _P_LAYER_SPLIT["policy"] = policy
+    _P_LAYER_SPLIT["spec"] = None
+    _P_LAYER_SPLIT["lines"] = ()
+    if policy == _pls.POLICY_STATIC:
+        return
+    if os.environ.get(PP_LAYER_SET_ENV, "").strip() or getattr(ns, "pp_layer_set", None):
+        raise SystemExit("--p-layer-split dynamic: REFUSED -- a layer SET (SGLANG_PP_LAYER_SET / "
+                         "--pp-layer-set) is not the contiguous home cut the split mirrors")
+    spec = p_layer_split_spec_from_ns(ns)
+    ratio = str(getattr(ns, "pp_stage_ratio", "") or "")
+    if ratio:
+        counts = _int_list(ratio, "--pp-stage-ratio")
+        ends = tuple(sum(counts[: i + 1]) for i in range(len(counts) - 1))
+        if ends != spec.geometry.home_cuts:
+            raise SystemExit(f"--p-layer-split dynamic: REFUSED -- --pp-stage-ratio {ratio} cuts at "
+                             f"{list(ends)} but --p-layer-split-home is {list(spec.geometry.home_cuts)}; "
+                             f"the home cut IS the P partition (one cut, one author)")
+    lines = ["WEG2 " + _pls.armed_line(spec, "group=P")]
+    lines += ["WEG2 " + x for x in p_layer_split_slab_lines(spec)]
+    for n in P_LAYER_SPLIT_DRY_RUN_TOKENS:
+        res = _pls.plan_split(n, spec.geometry, spec.model, spec.limits, min_gain=spec.min_gain,
+                              extra=spec.extra)
+        lines.append("WEG2 " + _pls.plan_line(res, key=f"dry-run-{n}", end=n)
+                     + " (HOCHRECHNUNG on the model, not a measurement)")
+    _P_LAYER_SPLIT["spec"] = spec
+    _P_LAYER_SPLIT["lines"] = tuple(lines)
+    for line in lines:
+        print(line, flush=True)
+
+
+def p_layer_split_swing_by_stage(n_stages: int) -> Tuple[Tuple[int, int], ...]:
+    """The planner's swing post: (attention, linear) swing layers per P stage;
+    () under static or when the spec's stage count is not P's."""
+    from sglang.srt.weg2 import p_layer_split as _pls
+
+    spec = _P_LAYER_SPLIT.get("spec")
+    if spec is None or spec.geometry.stages != int(n_stages):
+        return ()
+    g = spec.geometry
+    out = []
+    for s in range(g.stages):
+        win = tuple(g.swing_window(s))
+        na = sum(1 for i in win if g.families[i] == _pls.FAMILY_ATTENTION)
+        out.append((na, len(win) - na))
+    return tuple(out)
+
+
+def p_layer_split_slab_lines(spec) -> List[str]:
+    """The swing slab per stage as the planner's post (weights from the rc9
+    checkpoint census, DYN_LAYER_SPLIT.md sec. 2; the rank-side sizer prices
+    the mirrors exactly, pool_configurator swing_extra_layer_counts)."""
+    from sglang.srt.weg2 import p_layer_split as _pls
+
+    g = spec.geometry
+    out = []
+    for s in range(g.stages - 1):
+        win = tuple(g.swing_window(s))
+        na = sum(1 for i in win if g.families[i] == _pls.FAMILY_ATTENTION)
+        out.append(f"{_pls.LOG_TAG} slab stage={s} window={list(win)} attention={na} gdn={len(win) - na} "
+                   f"(KV mirror = {na} x pool x 2048 B/token, state mirror = {len(win) - na} x mamba slots "
+                   f"x 1.56 MiB, weights resident under tag weights_swing)")
+    return out
+
+
+def p_layer_split_env() -> Dict[str, str]:
+    """Group P's environment for the layer split; {} under 'static'."""
+    from sglang.srt.weg2 import p_layer_split as _pls
+
+    spec = _P_LAYER_SPLIT.get("spec")
+    if spec is None:
+        return {}
+    return {_pls.POLICY_ENV: _pls.POLICY_DYNAMIC, _pls.SPEC_ENV: spec.to_json()}
+
+
 #: --d-reshard (27B, user order 26.09. ~08:40Z/08:45Z: dynamic D resharding per
 #: load class, "nur auf TP1<, nicht fuers nf"). Rule and model live in
 #: weg2/d_reshard.py (pure); design/evidence /spinning/gpu-arb/docs/DYN_D_RESHARD.md.
@@ -11630,6 +11781,8 @@ def solve_p_cut(
         # --p-prefill-graph: the SAME vector the ranks book (env_p, see
         # p_prefill_graph_env); () when off -- the pool model is unchanged.
         prefill_graph_pool_mib=p_prefill_graph_pool_mib(ns),
+        # --p-layer-split dynamic: the swing slab per stage; () under static.
+        swing_layers_by_stage=p_layer_split_swing_by_stage(len(budgets_p)),
         activation_reserve_mib=float(ns.pp_cut_activation_reserve_mib),
         # #1257c: None = follow the reserve (the runtime charges exactly it);
         # a number = the operator pinned it.
@@ -12690,6 +12843,45 @@ def build_parser() -> argparse.ArgumentParser:
              "--p-chunk-max (the planner prices the corridor at it); chunks above the "
              "largest prefill graph bucket run eager. Rank lines 'P-CHUNK-POLICY "
              "armed' / 'P-CHUNK-POLICY plan', launcher lines with the dry-run plans.")
+    ap.add_argument(
+        "--p-layer-split", choices=["static", "dynamic"], default=P_LAYER_SPLIT_DEFAULT,
+        help="Group P stage boundaries (27B, weg2/p_layer_split.py, DYN_LAYER_SPLIT.md). "
+             "'static' (default) = today: the P cut is fixed; argv, env and the P form key "
+             "are byte-identical. 'dynamic' = PP0 moves each boundary chunk by chunk "
+             "inside [--p-layer-split-home, home + --p-layer-split-window] (upstream "
+             "stage executes the head of its neighbour's home span from a mirror and "
+             "writes KV/GDN state back; a rise pulls the prefix from home over the PP "
+             "link; non-home cuts run eager, the home cut keeps its graphs; the planner "
+             "stays on the home cut wherever it predicts < --p-layer-split-min-gain). "
+             "Rank lines 'P-LAYER-SPLIT runtime/slab/plan/census', 'PREFILL-GRAPH eager "
+             "reason=layer_split'.")
+    ap.add_argument(
+        "--p-layer-split-home", default="", metavar="CUT",
+        help="Only with --p-layer-split dynamic: the home cut as stage ends, e.g. 41,53.")
+    ap.add_argument(
+        "--p-layer-split-window", default="", metavar="W",
+        help="Only with --p-layer-split dynamic: per boundary, how many head layers of "
+             "the downstream stage the upstream stage may execute, e.g. 7,3.")
+    ap.add_argument(
+        "--p-layer-split-max-attn", default="", metavar="A",
+        help="Only with --p-layer-split dynamic: per boundary, the most attention "
+             "layers inside the window (each costs a pool-shaped KV mirror).")
+    ap.add_argument(
+        "--p-layer-split-model", default="", metavar="SRC",
+        help="Only with --p-layer-split dynamic: SG's per-layer-type stage model "
+             "(weg2/p_stage_model.py), a JSON path or a name under p_stage_model_data/ "
+             "(27b_int8_rc9j, 27b_nvfp4_rc9j).")
+    ap.add_argument(
+        "--p-layer-split-pull-gbps", type=float, default=None, metavar="GBPS",
+        help="Only with --p-layer-split dynamic: the link rate the planner prices a "
+             "PREFIX PULL at (a cut RISING mid-request pulls the KV prefix / GDN state "
+             "of the newly swung layers from home). Default "
+             f"{P_LAYER_SPLIT_PULL_GBPS_DEFAULT} (the x4-3080 edge); 0 = V1 (rises only on a "
+             "fresh request's first chunk, no pull).")
+    ap.add_argument(
+        "--p-layer-split-min-gain", type=float, default=0.01, metavar="FRACTION",
+        help="Only with --p-layer-split dynamic: a moving cut is taken only when "
+             "predicted at least this much faster than the home cut (default 0.01).")
     ap.add_argument(
         "--p-chunk-max", type=int, default=P_CHUNK_MAX_DEFAULT, metavar="TOKENS",
         help="Only with --p-chunk-policy dynamic: the widest chunk (default "
@@ -13922,6 +14114,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     apply_p_prefill_graph(ns)
     # --p-chunk-policy: after the graph (reads its buckets), before any argv.
     apply_p_chunk_policy(ns)
+    # --p-layer-split: after the chunk policy (the joint plan reads its limits).
+    apply_p_layer_split(ns)
     # --d-reshard: before any argv; 'off' installs nothing.
     apply_d_reshard(ns)
     apply_d_token_placement(ns)
@@ -15099,6 +15293,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # the SAME call the cut's pool model was built from (solve_p_cut).
     # --p-chunk-policy: {} under 'fixed' (env byte-identical).
     env_p.update(p_chunk_policy_env())
+    # --p-layer-split: {} under 'static' (env byte-identical).
+    env_p.update(p_layer_split_env())
     _pg_pool = p_prefill_graph_pool_mib(ns)
     env_p.update(p_prefill_graph_env(
         _pg_pool, max_prefix=getattr(ns, "p_prefill_graph_max_prefix", None)))

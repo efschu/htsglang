@@ -2778,6 +2778,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             release_load_transient_pool,
         )
 
+        # --p-layer-split dynamic: the swing modules were ordinary members of
+        # the layer list while the weights loaded and post-processed; they
+        # leave the model tree HERE, before the exchange arms below walks
+        # named_parameters. 0 (no-op) under static.
+        from sglang.srt.weg2.p_layer_split_runtime import detach_from_model
+
+        detach_from_model(self.model)
         release_load_transient_pool(reason="after-load")
         # #1273 S2 (spec section 6/S2): arm the exchange for this rank at the
         # END OF WEIGHT LOADING -- every weight page this runner will ever hold

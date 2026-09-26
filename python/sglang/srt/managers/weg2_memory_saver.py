@@ -3397,6 +3397,19 @@ def weight_chunk_scope(layer_id: Optional[int]) -> Iterator[Optional[str]]:
         if (layer_id is None or base != GPU_MEMORY_TYPE_WEIGHTS)
         else weight_chunk_tag(layer_id)
     )
+    # --p-layer-split dynamic: a SWING layer (the head of the next stage's
+    # span, built here as a mirror) is not a band of this stage's exchanged
+    # family -- its bytes carry their own tag, which the flip pauses with the
+    # KV pool and the runtime refills from home after the wake. False (and
+    # this line inert) whenever no split runtime is installed.
+    if layer_id is not None and base == GPU_MEMORY_TYPE_WEIGHTS:
+        from sglang.srt.weg2.p_layer_split_runtime import (
+            SWING_WEIGHTS_TAG,
+            is_swing_layer,
+        )
+
+        if is_swing_layer(layer_id):
+            tag = SWING_WEIGHTS_TAG
     cdll = None if tag is None else _tms_cdll_in_region()
     if cdll is None:
         yield None
