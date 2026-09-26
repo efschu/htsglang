@@ -3007,6 +3007,14 @@ class Front:
                 "A1-1 path at the wait bound)", self.epoch, len(running))
             return "unsupported"
         body = phase_policy.park_body(self.epoch, self.d_wait_bound_s)
+        # H91c3-1: the park's stamp is taken BEFORE the RPC. D stamps its park
+        # while serving the RPC and re-queues it after PARK_REQUEUE_S on its
+        # own clock; a front stamp taken after the answer ran that clock late
+        # by the RPC's duration, so for that long the front still counted as
+        # parked what D was running again. Stamped before, the front's lapse
+        # comes no later than D's re-queue. The stamp is written only for the
+        # rids D confirms: a failed/unsupported park writes none (withdrawn).
+        t_park = time.time()
         try:
             code, text = await self.rpc(D, phase_policy.PARK_PATH, body, phase_policy.PARK_TIMEOUT_S)
         except Exception as e:  # noqa: BLE001 -- a failed park falls back, never kills the phase
@@ -3030,19 +3038,19 @@ class Front:
                 "running decode(s) run to their end, then the flip", self.epoch, code, why,
                 len(running))
             return "failed"
-        t = time.time()
         known = [r for r in rids if r in D.outstanding]
         unknown = [r for r in rids if r not in D.outstanding]
         for r in known:
-            self._d_parked[r] = t
+            self._d_parked[r] = t_park
         self.counters["d_parked"] += len(known)
         still = self._flip_ledger(D)
         logger.warning(
             "WEG2 PARK-RUNNING epoch=%d reason=%s status=%d parked=%d rids=%s unknown_to_front=%s "
-            "still_running=%s -- parked requests stay in flight (client streams open, no requeue, "
-            "no second leg 1) and continue in the next D phase before the new ones; the D->P "
-            "drain waits only for still_running",
-            self.epoch, body["reason"], code, len(known), known[:8], unknown[:8], still[:8])
+            "still_running=%s rpc_s=%.2f -- parked requests stay in flight (client streams open, "
+            "no requeue, no second leg 1) and continue in the next D phase before the new ones; "
+            "the D->P drain waits only for still_running",
+            self.epoch, body["reason"], code, len(known), known[:8], unknown[:8], still[:8],
+            time.time() - t_park)
         return "parked"
 
     # ---------------- seat / gate bookkeeping (C4, C5) ----------------
