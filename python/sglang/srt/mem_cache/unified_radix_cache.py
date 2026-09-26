@@ -5701,7 +5701,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             from sglang.srt.weg2 import handoff as _ho
             # xsn330: keep the file -- the dormant hold re-reads every 2 s
             # (#1456); the wake's hold release removes it (scheduler).
-            _keys = _ho.read_keys(str(req_id), remove=False) if str(req_id).startswith("weg2-") else None
+            from sglang.srt.managers import cache_controller as _cc_off
+            # TK: a #1400 follower that adopted PP0's "no chain" reads none.
+            _keys = (_ho.read_keys(str(req_id), remove=False)
+                     if str(req_id).startswith("weg2-") and str(req_id) not in _cc_off.WEG2_HANDOFF_OFF
+                     else None)
             if _keys:
                 _pages = int(prefetch_length) // int(self.page_size)
                 _total = _keys  # chain length in pages == P's inserted page count

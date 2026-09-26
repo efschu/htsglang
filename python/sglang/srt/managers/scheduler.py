@@ -5545,6 +5545,7 @@ class Scheduler(
             for _r in hold:
                 _rid = getattr(_r, "rid", None)
                 _cc.WEG2_HANDOFF_PAGE_KEYS.pop(_rid, None)
+                _cc.WEG2_HANDOFF_OFF.pop(_rid, None)
                 try:
                     _p = _ho.path(str(_rid)) if _rid else ""
                     if _p and os.path.exists(_p):
@@ -6293,16 +6294,21 @@ class Scheduler(
             if new_input_tokens and isinstance(req.rid, str) and req.rid.startswith("weg2-"):
                 from sglang.srt.managers import cache_controller as _cc
                 from sglang.srt.weg2 import handoff as _ho
-                from sglang.srt.weg2.handoff_keys import keys_for_span
-                _hd = getattr(req, "_weg2_handoff_page_keys", None)
-                if not _hd:
-                    # xsn331: the first prefetch races P's hand-off write (the
-                    # leg-2 request lands on D the moment P finishes), so a
-                    # missing file is retried on every re-read, never cached.
-                    _rec = _ho.read(req.rid)
-                    _hd = list(_rec.get("page_keys") or []) if _rec else None
-                    if _hd:
-                        req._weg2_handoff_page_keys = _hd
+                from sglang.srt.weg2.handoff_keys import OFF_ATTR as _HK_OFF
+                from sglang.srt.weg2.handoff_keys import keys_for_span, resolve_chain
+                # xsn331: the first prefetch races P's hand-off write (the
+                # leg-2 request lands on D the moment P finishes), so a
+                # missing file is retried on every re-read, never cached.
+                # TK: a #1400 follower that adopted PP0's "no chain" never
+                # reads the file (weg2_store_told, handoff_keys.adopt_pp0_decision);
+                # the tree's own reader is told so through WEG2_HANDOFF_OFF.
+                _hd = resolve_chain(req, _ho.read)
+                if getattr(req, _HK_OFF, False):
+                    _cc.WEG2_HANDOFF_OFF[req.rid] = True
+                    while len(_cc.WEG2_HANDOFF_OFF) > 4096:
+                        _cc.WEG2_HANDOFF_OFF.pop(next(iter(_cc.WEG2_HANDOFF_OFF)))
+                else:
+                    _cc.WEG2_HANDOFF_OFF.pop(req.rid, None)
                 _span = keys_for_span(_hd, int(_matched_len), len(new_input_tokens), int(self.page_size))
                 if _span:
                     _cc.WEG2_HANDOFF_PAGE_KEYS[req.rid] = _span

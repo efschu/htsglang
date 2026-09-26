@@ -883,6 +883,9 @@ def weg2_suffixed_stems(backend, keys):
 
 
 WEG2_HANDOFF_PAGE_KEYS: dict = {}  # rid -> P's page keys for the span the dormant prefetch asks (weg2.handoff_keys)
+#: TK: rids whose registration adopted PP0's "no hand-off chain" (#1400 follower,
+#: weg2.handoff_keys.adopt_pp0_decision) -- the tree's own file read is skipped.
+WEG2_HANDOFF_OFF: dict = {}
 
 
 class HiCacheController:

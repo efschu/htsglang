@@ -93,7 +93,13 @@ def told_admission(
     if entry is not None:
         if entry.req is req and rid not in told_map:
             try:
-                req._weg2_prefix_cap = int(entry.told)
+                # TK: the same RAW-token cap admission planted (told counts
+                # keys; bigram trees need +1 -- prefix_cap_tokens)
+                from sglang.srt.managers.weg2_store_told import prefix_cap_tokens
+
+                req._weg2_prefix_cap = prefix_cap_tokens(
+                    getattr(scheduler, "tree_cache", None), int(entry.told)
+                )
             except Exception:  # noqa: BLE001 - a double without the field
                 pass
             n = getattr(scheduler, "_h91_told_kept_n", 0) + 1
