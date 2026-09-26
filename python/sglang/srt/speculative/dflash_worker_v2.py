@@ -7,7 +7,10 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs_func,
+    rebuild_compact_draft_req_to_token_func,
+)
 from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
@@ -21,6 +24,7 @@ from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.weg2_d_hostgap import meter as _d_hostgap_meter
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -54,6 +58,7 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     capture_safe_tp_broadcast,
+    mamba_track_grid,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
@@ -186,6 +191,73 @@ def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
 
+def _verify_plain_greedy(sampling_info) -> bool:
+    """All-greedy AND ``apply_dflash_verify_logits_adjustments`` is a no-op:
+    no custom logit processor, no penalties (dense or accumulated), no vocab
+    mask, no logit bias. The exact complement of every branch of that
+    function, so a round that passes may argmax the raw verify logits."""
+    if sampling_info is None:
+        return True
+    if not sampling_info.is_all_greedy:
+        return False
+    if getattr(sampling_info, "has_custom_logit_processor", False):
+        return False
+    if getattr(sampling_info, "acc_linear_penalties", None) is not None:
+        return False
+    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+    if penalizer is not None and getattr(penalizer, "is_required", False):
+        return False
+    if getattr(sampling_info, "vocab_mask", None) is not None:
+        return False
+    if getattr(sampling_info, "logit_bias", None) is not None:
+        return False
+    return True
+
+
+def vocab_parallel_argmax(
+    local_logits: torch.Tensor, num_org: int, org_vocab_start: int, all_gather
+) -> torch.Tensor:
+    """``torch.argmax`` over the FULL vocab, from this rank's vocab shard.
+
+    Per row: the shard's max over its real columns ``[0, num_org)`` and that
+    column's global token id, packed as ``[id, fp32 bits]`` int64 pairs and
+    all-gathered ONCE across TP (``all_gather(t) -> [tp, rows, 2]``); the
+    global winner is the largest value, and among equal values the lowest
+    rank. Shards are contiguous prefix slices of the vocab in rank order and
+    ``torch.max`` returns the first maximal column, so this is exactly the
+    first maximal index of the concatenated logits -- the tie rule of
+    ``torch.argmax``. The value compare runs in fp32 on values converted from
+    the shard's dtype, which is exact, so bf16 ties stay ties."""
+    packed = vocab_shard_pack(local_logits, num_org, org_vocab_start)
+    return vocab_shard_select(all_gather(packed.unsqueeze(0)))
+
+
+def vocab_shard_pack(
+    local_logits: torch.Tensor, num_org: int, org_vocab_start: int
+) -> torch.Tensor:
+    """This rank's ``[rows, 2]`` int64 candidates: global id, fp32 bits of the
+    shard max (sign-extended int32, so the unpack is a lossless cast)."""
+    rows = int(local_logits.shape[0])
+    device = local_logits.device
+    if num_org > 0:
+        vals, idx = torch.max(local_logits[:, :num_org], dim=-1)
+        vals32 = vals.float().contiguous()
+        ids = idx.to(torch.int64) + int(org_vocab_start)
+    else:
+        vals32 = torch.full((rows,), float("-inf"), dtype=torch.float32, device=device)
+        ids = torch.zeros((rows,), dtype=torch.int64, device=device)
+    return torch.stack((ids, vals32.view(torch.int32).to(torch.int64)), dim=-1)
+
+
+def vocab_shard_select(gathered: torch.Tensor) -> torch.Tensor:
+    """``[tp, rows, 2]`` gathered candidates -> ``[rows]`` global argmax ids
+    (largest value; the lowest rank among equal values)."""
+    g_ids = gathered[..., 0]
+    g_vals = gathered[..., 1].to(torch.int32).view(torch.float32)
+    best = torch.argmax(g_vals, dim=0, keepdim=True)
+    return g_ids.gather(0, best).squeeze(0)
+
+
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
@@ -262,6 +334,76 @@ class _SelectorDraftSampler:
         self.q_out[:bs].copy_(q_rows)
 
 
+def _is_dflash_decode_round(batch) -> bool:
+    try:
+        mode = batch.forward_mode
+        return not (
+            mode.is_extend() or batch.is_extend_in_batch or mode.is_idle()
+        )
+    except AttributeError:
+        return False
+
+
+def _dflash_sync_traced(fn, budget: int, tp_rank: int):
+    """SGLANG_DEBUG_DFLASH_SYNC_TRACE=N (#31468 metal check).
+
+    Runs the first N DFLASH decode rounds under torch's sync-debug "warn" mode
+    and logs, per round, how many implicit host syncs torch saw
+    (``DFLASH-SYNC-ROUND``) and each synchronising call site once
+    (``DFLASH-SYNC-SITE``). A diagnostic only: ``catch_warnings`` is
+    process-global, so another thread's sync in that window is counted too.
+    Same mechanism as hicache_write_path.sync_trace.
+    """
+    import functools
+    import warnings
+
+    state = {"used": 0, "seen": set()}
+
+    @functools.wraps(fn)
+    def wrapper(batch, *args, **kwargs):
+        if (
+            state["used"] >= budget
+            or not torch.cuda.is_available()
+            or not _is_dflash_decode_round(batch)
+        ):
+            return fn(batch, *args, **kwargs)
+        state["used"] += 1
+        prev = torch.cuda.get_sync_debug_mode()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            torch.cuda.set_sync_debug_mode("warn")
+            try:
+                result = fn(batch, *args, **kwargs)
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        n_sync = 0
+        for w in caught:
+            msg = str(w.message)
+            if "synchroniz" not in msg:
+                continue
+            n_sync += 1
+            site = "%s:%d" % (w.filename, w.lineno)
+            if site in state["seen"]:
+                continue
+            state["seen"].add(site)
+            logger.warning(
+                "DFLASH-SYNC-SITE rank=%d round=%d site=%s msg=%s",
+                tp_rank,
+                state["used"],
+                site,
+                msg.splitlines()[0][:160],
+            )
+        logger.warning(
+            "DFLASH-SYNC-ROUND rank=%d round=%d syncs=%d",
+            tp_rank,
+            state["used"],
+            n_sync,
+        )
+        return result
+
+    return wrapper
+
+
 def _log_draft_param_bytes(model, tp_rank: int) -> None:
     """One INFO line per rank: the draft's parameter bytes by module group
     (19.09., Task #37 shard proof -- a sharded draft shows the plan's ratio
@@ -288,6 +430,11 @@ class DFlashWorkerV2(BaseSpecWorker):
     Drives both overlap and non-overlap scheduling, same as EAGLE: the
     scheduler runs it synchronously when overlap is disabled.
     """
+
+    # SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU (managers/weg2_d_hostgap.py): a decode
+    # round accepts a `seq_lens_cpu_ready` callback and calls it before its
+    # first host read of the exact lengths, so the scheduler may defer that read.
+    supports_deferred_seq_lens_cpu = True
 
     def __init__(
         self,
@@ -488,6 +635,22 @@ class DFlashWorkerV2(BaseSpecWorker):
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
         self._use_triton_accept_bonus = supports_gpu_triton
+        # #31468: the legacy compact-rebuild path host-syncs twice per step
+        # (lengths.max().item() + the masked gather's implicit nonzero D2H);
+        # keep it only for platforms without GPU triton and for the solo small
+        # pool, whose mapper has to translate the gathered locations.
+        self._use_triton_compact_rebuild = supports_gpu_triton
+        # SGLANG_WEG2_D_DEFER_REBUILD (weg2_d_hostgap): stage 2 of the deferred
+        # length read -- read once; it only acts on a round whose read the
+        # scheduler actually deferred.
+        from sglang.srt.managers.weg2_d_hostgap import defer_rebuild_on
+
+        self._defer_rebuild = defer_rebuild_on()
+        # SGLANG_DFLASH_PLAN_SYNC_FREE (layers/dcp/verify_preplan.py): build
+        # the verify's uneven-DCP owned-slot index before the draft and plan
+        # draft + verify from exact host metadata. Resolved lazily: the target
+        # attention backend may be swapped (phase flip) after construction.
+        self._plan_sync_free = bool(envs.SGLANG_DFLASH_PLAN_SYNC_FREE.get())
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
         self._accept_len_buf: Optional[torch.Tensor] = None
@@ -530,6 +693,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._audit_pending_rounds: list = []
         self._audit_timing_flush_every = 200
         # === END DFLASH AUDIT INSTRUMENTATION ===
+
+        # #31468 host-sync census (env-gated, default off): an instance
+        # attribute shadows the class method only when armed.
+        _sync_trace_rounds = int(envs.SGLANG_DEBUG_DFLASH_SYNC_TRACE.get())
+        if _sync_trace_rounds > 0:
+            self.forward_batch_generation = _dflash_sync_traced(
+                self.forward_batch_generation, _sync_trace_rounds, int(self.tp_rank)
+            )
 
     # === DFLASH AUDIT INSTRUMENTATION (temporary, env-gated, remove-safe) ===
     def _audit_mark(self, label: str) -> None:
@@ -989,12 +1160,25 @@ class DFlashWorkerV2(BaseSpecWorker):
                 num_global,
             )
             return None
+        # SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE (default off): the window pool's
+        # mapper and per-round rebuild without host reads (dflash_solo_pool).
+        sync_free = bool(
+            self._window_pool and envs.SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE.get()
+        )
         mapper = DraftKVSlotMapper(
             num_global_slots=num_global,
             num_draft_slots=num_draft_slots,
             ctx_cap=int(cap),
             device=self.device,
+            sync_free=sync_free,
         )
+        if sync_free:
+            logger.info(
+                "DFLASH window pool: SYNC-FREE mapper armed "
+                "(SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE=1) -- no host read on "
+                "the per-round rebuild / draft-KV append; exact reads only "
+                "for writes beyond the free-count bound."
+            )
         token_to_kv_pool_allocator.register_free_listener(
             mapper.on_global_free, mapper.on_global_clear
         )
@@ -1387,6 +1571,78 @@ class DFlashWorkerV2(BaseSpecWorker):
         visible_start = seq_lens_i64 - visible_lens_i64
         aligned_start = visible_start - torch.remainder(visible_start, self.page_size)
         return (seq_lens_i64 - aligned_start).to(torch.int32)
+
+    def _compute_compact_draft_seq_lens_host(
+        self, host_seq_lens: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """Sync-free host upper bound for _compute_compact_draft_seq_lens (#31468).
+
+        Deliberately NOT the exact page-align arithmetic: that mapping is a
+        non-monotonic sawtooth in [window, window+page), so evaluating it on an
+        over-estimated host len could UNDER-shoot the true device value.
+        min(len, window+page) is its monotonic envelope (always >= the exact
+        compact len); consumers only need an upper bound. With page_size == 1
+        (the 27B D group) and an exact host mirror it is the exact value.
+        """
+        assert self.draft_window_size is not None
+        bound = int(self.draft_window_size) + (
+            self.page_size if self.page_size > 1 else 0
+        )
+        lens = host_seq_lens.to(dtype=torch.int64, device="cpu")
+        out.copy_(torch.clamp(lens, max=bound).to(torch.int32))
+
+    def _compact_draft_host_lens_exact(self) -> bool:
+        """May the draft plan schedule from the compact host lengths?
+
+        Only when they ARE the device lengths: the switch is on, the draft uses
+        the compact window, the page size is 1 (min(len, W) exactly -- with
+        pages the host value is the page-aligned envelope), and the caller
+        derived them from the published ``batch.seq_lens_cpu`` (not from the
+        reservation bound ``nxt_kv_lens_cpu``). FA2 lays its split output out
+        by the DEVICE length, so an upper bound would mis-address partials.
+        """
+        return bool(
+            self._plan_sync_free
+            and self.use_compact_draft_cache
+            and self.page_size <= 1
+        )
+
+    def _target_dcp_verify_backend(self):
+        """The target's FlashInfer backend when it takes the weighted-DCP
+        verify split (directly or as a hybrid model's full-attention half),
+        else None. Looked up per round: the phase flip may install a new
+        backend object."""
+        backend = getattr(self.target_worker.model_runner, "attn_backend", None)
+        backend = getattr(backend, "full_attn_backend", backend)
+        if backend is None or not hasattr(backend, "dcp_verify_prebuild"):
+            return None
+        if not (
+            getattr(backend, "uneven_dcp", False)
+            and getattr(backend, "uneven_dcp_weighted", False)
+        ):
+            return None
+        return backend
+
+    def _dcp_verify_prebuild(self, batch: ScheduleBatch, draft_input):
+        """SGLANG_DFLASH_PLAN_SYNC_FREE: the verify's owned-slot index, built
+        now -- after the block prep, BEFORE the draft forward on this stream.
+
+        The verify reads the committed prefix [0, seq_lens), whose slot ids
+        are settled, so nothing here depends on the draft. The owned counts
+        reach the host through an event recorded right after this build; the
+        verify plan reads them while the GPU runs the draft. The host length
+        mirror (exact when published, the reservation bound otherwise) only
+        sizes the slot buffer.
+        """
+        backend = self._target_dcp_verify_backend()
+        if backend is None:
+            return None
+        host = batch.seq_lens_cpu
+        if host is None:
+            host = getattr(draft_input, "nxt_kv_lens_cpu", None)
+        if host is None:
+            return None
+        return backend.dcp_verify_prebuild(batch.req_pool_indices, batch.seq_lens, host)
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -2210,11 +2466,80 @@ class DFlashWorkerV2(BaseSpecWorker):
             write_layer_kv=_write_layer_kv,
         )
 
+    @staticmethod
+    def _dflash_grammar_vocab_mask(
+        *,
+        batch: ScheduleBatch,
+        verify_input: DFlashVerifyInput,
+        draft_tokens_cpu: torch.Tensor,
+        device,
+    ) -> Optional[torch.Tensor]:
+        """upstream #30096, on the fork's synchronous bitmask path.
+
+        A DFLASH verify block is a LINEAR chain: node i's only child is i + 1
+        (column 0 is the already-committed anchor, so mask row i constrains
+        the target's prediction AFTER chain token i -- the same row the target
+        logits carry). The fork's ``generate_token_bitmask`` walks that chain
+        per grammar request (accept / fill / rollback, stopping below the
+        first draft token the grammar refuses) and stamps
+        ``verify_input.grammar``. Rows it never reaches stay all-allowed; they
+        lie past the first refused draft, which the masked target can never
+        accept. Deterministic on the rank-synced draft tokens and identical
+        grammar states, so every rank builds the same mask."""
+        from sglang.srt.speculative.spec_utils import generate_token_bitmask
+
+        bs, chain_len = draft_tokens_cpu.shape
+        next_token = torch.full((bs, chain_len), -1, dtype=torch.int64)
+        if chain_len > 1:
+            next_token[:, :-1] = torch.arange(1, chain_len, dtype=torch.int64)
+        next_sibling = torch.full((bs, chain_len), -1, dtype=torch.int64)
+        vocab_mask = generate_token_bitmask(
+            batch.reqs,
+            verify_input,
+            next_token,
+            next_sibling,
+            draft_tokens_cpu,
+            batch.sampling_info.vocab_size,
+        )
+        # As on the EAGLE v2 path: a mask left from the extend stage must not
+        # be applied to the verify block by the logit adjustments.
+        batch.sampling_info.vocab_mask = None
+        if vocab_mask is None:
+            return None
+        assert verify_input.grammar is not None
+        return vocab_mask.to(device)
+
+    @staticmethod
+    def _dflash_verify_logprobs(
+        *,
+        batch: ScheduleBatch,
+        logits_output,
+        out_tokens: torch.Tensor,
+        bs: int,
+        block_size: int,
+    ) -> None:
+        """upstream #33459: out_tokens[:, j] is the token the verify logits row
+        j predicts (accepted drafts, then the bonus), so every row is its own
+        accept index; the processor slices the first commit_len per request."""
+        from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
+
+        output_indices = torch.arange(
+            bs * block_size, dtype=torch.int64, device=out_tokens.device
+        ).view(bs, block_size)
+        compute_spec_v2_logprobs(
+            batch,
+            logits_output,
+            out_tokens.reshape(-1),
+            output_indices,
+            block_size - 1,
+        )
+
     def _update_target_mamba_state_after_verify(
         self,
         *,
         batch: ScheduleBatch,
         seq_lens_pre_verify: torch.Tensor,
+        seq_lens_post_verify: torch.Tensor,
         commit_lens: torch.Tensor,
     ) -> None:
         """Commit Mamba intermediate states for accepted verify steps.
@@ -2222,6 +2547,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         During TARGET_VERIFY, Mamba kernels run with `disable_state_update=True` and
         cache per-step intermediate states. After acceptance, we need to commit the
         state corresponding to each request's last accepted step.
+
+        upstream #37818: the track-boundary crossing is measured against the
+        POST-verify lengths (prefix_lens + commit_lens). ``batch.seq_lens`` is
+        still the pre-verify value here (it is advanced by the scheduler from
+        ``new_seq_lens`` afterwards), so comparing against it made
+        ``to_track_mask`` always False: DFLASH decode never wrote a tracked
+        Mamba state, while the scheduler (batch_result_processor
+        ``_mamba_check_track_boundary``) still flipped the ping-pong slot and
+        recorded ``mamba_last_track_seqlen`` for the cache insert.
         """
         if not self._need_mamba_verify_commit:
             return
@@ -2231,13 +2565,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
-            mamba_track_interval = self.server_args.mamba_track_interval
+            # upstream #35412 (DFlash hunk): the checkpoint must land on a
+            # radix node -> the fork's own grid (spec_utils.mamba_track_grid,
+            # lcm of tree page, mamba chunk and track interval). Under the
+            # weighted uneven DCP the tree page stays natural (page_size), so
+            # this equals the raw interval on the 27B D group.
+            mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
-                != batch.seq_lens // mamba_track_interval
+                != seq_lens_post_verify // mamba_track_interval
             )
             tracking_point = (
-                batch.seq_lens // mamba_track_interval * mamba_track_interval
+                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
             )
             to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
             can_track_mask = to_track_mask & (
@@ -2560,16 +2899,58 @@ class DFlashWorkerV2(BaseSpecWorker):
         ).to(cache_loc.device)
         return target_hidden[mask], cache_loc[mask], positions[mask]
 
+    def _verify_local_vocab_processor(self):
+        """The target's LogitsProcessor when it keeps the verify logits as a
+        local vocab shard (SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX), else None.
+        Looked up per round: nothing is cached across a phase flip."""
+        model = getattr(getattr(self.target_worker, "model_runner", None), "model", None)
+        lp = getattr(model, "logits_processor", None)
+        return lp if getattr(lp, "verify_local_vocab", False) else None
+
+    def _verify_vocab_argmax_eligible(self, batch, sampling_info, lm_head, lp) -> bool:
+        """The rounds whose accept needs only the argmax of the RAW verify
+        logits: plain greedy (no adjustment applies), no DFlash2 selector
+        sample, no grammar, no logprobs, a head without added vocab and no
+        final softcap. Every other round gathers the full logits."""
+        if getattr(self, "_selector_sample", None) is not None:
+            return False
+        if getattr(batch, "has_grammar", False) or getattr(batch, "return_logprob", False):
+            return False
+        if getattr(lp, "final_logit_softcapping", None):
+            return False
+        shard = getattr(lm_head, "shard_indices", None)
+        if shard is None or int(shard.num_added_elements) != 0:
+            return False
+        return _verify_plain_greedy(sampling_info)
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
         on_publish=None,
+        seq_lens_cpu_ready=None,
     ) -> GenerationBatchResult:
-        if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DFLASH speculative decoding does not support return_logprob yet."
-            )
+        # upstream #33459: return_logprob is served (verify-time
+        # compute_spec_v2_logprobs, see _dflash_verify_logprobs); the refusal
+        # that stood here is gone. The target prefill computes its own.
         self._validate_phase1_sampling_support(batch)
+        # seq_lens_cpu_ready (SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU): the scheduler
+        # deferred the host half of this batch's length read; batch.seq_lens_cpu
+        # / seq_lens_sum are None until it is called. Idempotent. The decode
+        # round calls it right before the draft prep (the first exact read);
+        # the target-prefill and idle paths below call it before anything else
+        # (the scheduler defers only decode batches -- this is the belt).
+        if seq_lens_cpu_ready is not None and (
+            batch.forward_mode.is_extend()
+            or batch.is_extend_in_batch
+            or batch.forward_mode.is_idle()
+        ):
+            seq_lens_cpu_ready()
+
+        _mapper = self._solo_pool_mapper
+        if _mapper is not None and _mapper.sync_free:
+            # Sync-free window pool: this forward's stream is the one whose
+            # mapper calls may skip the host reads (dflash_solo_pool).
+            _mapper.bind_owner_stream()
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
@@ -2708,6 +3089,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
         self._audit_mark("prep")  # DFLASH AUDIT (env-gated)
+        # SGLANG_DFLASH_PLAN_SYNC_FREE: every rank runs the target verify, so
+        # every rank (solo shadows included) prebuilds its index here, ahead
+        # of the draft. None -> the verify plans the old way.
+        dcp_verify_prebuilt = (
+            self._dcp_verify_prebuild(batch, draft_input)
+            if self._plan_sync_free
+            else None
+        )
         # positions + verify cache locs are pure functions of batch state and
         # are needed on EVERY rank for the target verify below (identical bytes
         # on all ranks), so compute them outside the host-only draft region.
@@ -2767,50 +3156,164 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._audit_mark("embed")  # DFLASH AUDIT (env-gated)
             input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
+            # SGLANG_WEG2_D_DEFER_REBUILD (stage 2 of the deferred read, needs
+            # SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU): in the compact sync-free window
+            # pool the row rebuild below only needs a WIDTH, and the compact
+            # envelope of the reservation bound is one (>= every exact compact
+            # length, dflash_solo_pool.rebuild_window_rows_sync_free writes only
+            # [0, lengths[b]) per row). So the whole device part of the draft
+            # prep is queued before the host waits; the exact host lengths the
+            # draft PLAN needs are read right after it.
+            _defer_rebuild = (
+                seq_lens_cpu_ready is not None
+                and getattr(self, "_defer_rebuild", False)
+                and self.use_compact_draft_cache
+                and not (
+                    self._use_triton_compact_rebuild and self._solo_pool_mapper is None
+                )
+                and self._solo_pool_mapper is not None
+                and self._solo_pool_mapper.sync_free
+                and draft_input.nxt_kv_lens_cpu is not None
+            )
+            if seq_lens_cpu_ready is not None and not _defer_rebuild:
+                # SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU: the block prep, the DCP
+                # prebuild (sized by the reservation bound, see
+                # _dcp_verify_prebuild) and the embedding with its all_reduce
+                # are queued; the draft prep below is the first exact read.
+                seq_lens_cpu_ready()
             seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
+            # SGLANG_DFLASH_PLAN_SYNC_FREE: True only when seq_lens_cpu below
+            # is the device length itself (published mirror, page_size 1,
+            # compact window) -- the one case in which the draft plan may
+            # schedule from it. An upper bound is NOT enough there (FA2 lays
+            # its split output out by the device length).
+            draft_host_lens_exact = False
             if self.use_compact_draft_cache:
                 # Rebuild the draft-local sliding-window view from committed target state.
                 draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
-                seq_lens_cpu.copy_(
-                    draft_prefix_lens.to(device="cpu", dtype=torch.int32)
-                )
+                # #31468: host planning bound without a device sync; backends
+                # consume seq_lens_cpu as a safe upper bound (same contract as
+                # the non-compact branch below). The mirror resolved by
+                # overlap_utils.resolve_seq_lens_cpu is exact, so with
+                # page_size == 1 this is the exact compact length.
+                if _defer_rebuild:
+                    # Stage 2: the envelope of the reservation bound, for the
+                    # rebuild WIDTH only; overwritten with the exact lengths
+                    # after the wait below, before anything plans with it.
+                    self._compute_compact_draft_seq_lens_host(
+                        draft_input.nxt_kv_lens_cpu, out=seq_lens_cpu
+                    )
+                elif batch.seq_lens_cpu is not None:
+                    self._compute_compact_draft_seq_lens_host(
+                        batch.seq_lens_cpu, out=seq_lens_cpu
+                    )
+                    draft_host_lens_exact = self._compact_draft_host_lens_exact()
+                elif draft_input.nxt_kv_lens_cpu is not None:
+                    self._compute_compact_draft_seq_lens_host(
+                        draft_input.nxt_kv_lens_cpu, out=seq_lens_cpu
+                    )
+                else:
+                    # Last resort: the legacy blocking D2H copy.
+                    seq_lens_cpu.copy_(
+                        draft_prefix_lens.to(device="cpu", dtype=torch.int32)
+                    )
 
                 suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
                     torch.int64
                 )
-                suffix_cache_loc = self._gather_req_to_token_segments(
-                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                    req_pool_indices=batch.req_pool_indices,
-                    start=suffix_start,
-                    lengths=draft_prefix_lens,
-                )
                 block_loc = verify_out_cache_loc
-                if self._solo_pool_mapper is not None:
-                    # window pool: the draft rows live in draft-slot space;
-                    # unmapped prefix rows read the zero-KV hole slot.
+                if self._use_triton_compact_rebuild and self._solo_pool_mapper is None:
+                    # #31468: one pass, fixed grid, no host reads: row
+                    # [0, prefix) = committed target suffix window,
+                    # [prefix, prefix + block) = this round's verify slots.
+                    rebuild_compact_draft_req_to_token_func(
+                        draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
+                        target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                        req_pool_indices=batch.req_pool_indices,
+                        suffix_start=suffix_start,
+                        draft_prefix_lens=draft_prefix_lens,
+                        verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+                        batch_size=bs,
+                        block_size=block_size,
+                    )
+                elif (
+                    self._solo_pool_mapper is not None
+                    and self._solo_pool_mapper.sync_free
+                ):
+                    # Window pool, SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE=1: the
+                    # same draft rows as the branch below, without its host
+                    # reads (lengths.max().item(), the boolean compaction and
+                    # the mapper's counts). Width = the host bound seq_lens_cpu
+                    # the backends plan with (>= every device length).
+                    from sglang.srt.speculative.dflash_solo_pool import (
+                        rebuild_window_rows_sync_free,
+                    )
+
                     mapper = self._solo_pool_mapper
                     mapper.begin_round()
-                    suffix_cache_loc = mapper.translate_read(suffix_cache_loc)
+                    rebuild_window_rows_sync_free(
+                        mapper=mapper,
+                        target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                        draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
+                        req_pool_indices=batch.req_pool_indices,
+                        start=suffix_start,
+                        lengths=draft_prefix_lens,
+                        max_len=int(seq_lens_cpu.max()) if bs > 0 else 0,
+                    )
                     block_loc = mapper.translate_write(verify_out_cache_loc)
-                assign_req_to_token_pool_func(
-                    batch.req_pool_indices,
-                    self.draft_model_runner.req_to_token_pool.req_to_token,
-                    torch.zeros_like(draft_prefix_lens),
-                    draft_prefix_lens,
-                    suffix_cache_loc,
-                    bs,
-                )
+                    block_end = self._draft_block_end_buf[:bs]
+                    torch.add(draft_prefix_lens, block_size, out=block_end)
+                    assign_req_to_token_pool_func(
+                        batch.req_pool_indices,
+                        self.draft_model_runner.req_to_token_pool.req_to_token,
+                        draft_prefix_lens,
+                        block_end,
+                        block_loc,
+                        bs,
+                    )
+                    if _defer_rebuild:
+                        # The device part of the draft prep is queued; now the
+                        # host waits for round N's lengths and takes the exact
+                        # compact mirror the draft plan reads (the same two
+                        # calls the non-deferred branch above makes).
+                        seq_lens_cpu_ready()
+                        self._compute_compact_draft_seq_lens_host(
+                            batch.seq_lens_cpu, out=seq_lens_cpu
+                        )
+                        draft_host_lens_exact = self._compact_draft_host_lens_exact()
+                else:
+                    suffix_cache_loc = self._gather_req_to_token_segments(
+                        req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                        req_pool_indices=batch.req_pool_indices,
+                        start=suffix_start,
+                        lengths=draft_prefix_lens,
+                    )
+                    if self._solo_pool_mapper is not None:
+                        # window pool: the draft rows live in draft-slot space;
+                        # unmapped prefix rows read the zero-KV hole slot.
+                        mapper = self._solo_pool_mapper
+                        mapper.begin_round()
+                        suffix_cache_loc = mapper.translate_read(suffix_cache_loc)
+                        block_loc = mapper.translate_write(verify_out_cache_loc)
+                    assign_req_to_token_pool_func(
+                        batch.req_pool_indices,
+                        self.draft_model_runner.req_to_token_pool.req_to_token,
+                        torch.zeros_like(draft_prefix_lens),
+                        draft_prefix_lens,
+                        suffix_cache_loc,
+                        bs,
+                    )
 
-                block_end = self._draft_block_end_buf[:bs]
-                torch.add(draft_prefix_lens, block_size, out=block_end)
-                assign_req_to_token_pool_func(
-                    batch.req_pool_indices,
-                    self.draft_model_runner.req_to_token_pool.req_to_token,
-                    draft_prefix_lens,
-                    block_end,
-                    block_loc,
-                    bs,
-                )
+                    block_end = self._draft_block_end_buf[:bs]
+                    torch.add(draft_prefix_lens, block_size, out=block_end)
+                    assign_req_to_token_pool_func(
+                        batch.req_pool_indices,
+                        self.draft_model_runner.req_to_token_pool.req_to_token,
+                        draft_prefix_lens,
+                        block_end,
+                        block_loc,
+                        bs,
+                    )
                 draft_seq_lens = draft_prefix_lens
                 draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
                 draft_out_cache_loc = block_loc
@@ -2868,8 +3371,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self._draft_sampler.stage_sampling_params(
                         bs=bs, sampling_info=batch.sampling_info
                     )
-            with torch.inference_mode():
-                draft_out = self.draft_model_runner.forward(forward_batch)
+            # SGLANG_DFLASH_PLAN_SYNC_FREE: the flag lives on the shared draft
+            # block spec info, so it is raised for exactly this forward and
+            # lowered again whatever happens inside it.
+            self._draft_block_spec_info.host_lens_exact = draft_host_lens_exact
+            try:
+                with torch.inference_mode():
+                    draft_out = self.draft_model_runner.forward(forward_batch)
+            finally:
+                self._draft_block_spec_info.host_lens_exact = False
+            _dgap = _d_hostgap_meter()  # #DGAP (SGLANG_WEG2_D_HOSTGAP)
+            if _dgap is not None:
+                _dgap.mark_draft_launched()
             self._audit_mark("draft_fwd")  # DFLASH AUDIT (env-gated)
             draft_logits_output = draft_out.logits_output
 
@@ -2948,6 +3461,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._audit_mark("blk_bcast")  # DFLASH AUDIT (env-gated)
 
         # --- 2) Target verify.
+        if seq_lens_cpu_ready is not None:
+            # Idempotent belt (the solo-shadow branch above has no draft prep):
+            # the verify's host bound below reads the exact mirror.
+            seq_lens_cpu_ready()
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
 
@@ -2964,6 +3481,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.block_size),
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            dcp_verify_prebuilt=dcp_verify_prebuilt,
         )
 
         batch.out_cache_loc = verify_out_cache_loc
@@ -2990,6 +3508,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_sum = seq_lens_sum_backup
         self._audit_mark("verify_prep")  # DFLASH AUDIT (env-gated)
 
+        # upstream #30096 (adapted to the fork's synchronous bitmask path, the
+        # one EAGLE v2 uses here; #31488's overlapped GrammarTree/barrier is
+        # not ported): the block's rank-synced draft tokens on the host, taken
+        # before the verify launch. Only a grammar batch pays this D2H.
+        grammar_draft_tokens_cpu = (
+            draft_tokens.cpu() if getattr(batch, "has_grammar", False) else None
+        )
+
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -3000,11 +3526,50 @@ class DFlashWorkerV2(BaseSpecWorker):
         can_run_cuda_graph = target_out.can_run_cuda_graph
         self._audit_mark("verify")  # DFLASH AUDIT (env-gated)
 
-        if sampling_info is not None:
+        # SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX: the verify forward left this
+        # rank's vocab SHARD (no [rows, vocab] all_gather at the end of the
+        # graph). A plain-greedy round takes the vocab-parallel argmax -- one
+        # [rows, 2] int64 all_gather; every other round gathers the full
+        # logits here, with the processor's own ops, and proceeds unchanged.
+        vocab_target_predict = None
+        _vlp = self._verify_local_vocab_processor()
+        if _vlp is not None and logits_output.next_token_logits is not None:
+            if self._verify_vocab_argmax_eligible(batch, sampling_info, lm_head, _vlp):
+                _shard = lm_head.shard_indices
+                _tp = get_tp_group()
+                vocab_target_predict = vocab_parallel_argmax(
+                    logits_output.next_token_logits,
+                    int(_shard.num_org_elements),
+                    int(_shard.org_vocab_start_index),
+                    lambda t: _tp.all_gather(t, dim=0),
+                ).view(bs, int(self.block_size))
+            else:
+                logits_output.next_token_logits = _vlp.finish_local_verify_logits(
+                    logits_output.next_token_logits, lm_head
+                )
+
+        grammar_vocab_mask = None
+        if grammar_draft_tokens_cpu is not None:
+            grammar_vocab_mask = self._dflash_grammar_vocab_mask(
+                batch=batch,
+                verify_input=verify_input,
+                draft_tokens_cpu=grammar_draft_tokens_cpu,
+                device=logits_output.next_token_logits.device,
+            )
+
+        if sampling_info is not None and vocab_target_predict is None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
+            )
+
+        # upstream #30096: constrain every chain position before accept picks
+        # from it (greedy argmax, the sampling kernels and the selector all
+        # read these logits).
+        if grammar_vocab_mask is not None:
+            verify_input.grammar.apply_vocab_mask(
+                logits=logits_output.next_token_logits, vocab_mask=grammar_vocab_mask
             )
 
         candidates = draft_tokens
@@ -3041,9 +3606,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
-            )
+            if vocab_target_predict is not None:
+                target_predict = vocab_target_predict
+            else:
+                target_predict = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).view(bs, int(self.block_size))
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
             # #1488 instrument: per-slot draft quality.  candidates[:, i] is the
             # draft's proposal for slot i (slot 0 = the verified anchor);
@@ -3128,11 +3696,29 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         # === END DFLASH AUDIT ===
 
+        # upstream #33459: logprobs of the committed run (drafts + bonus) off
+        # the verify logits, in the spec-v2 layout the result processor reads.
+        if getattr(batch, "return_logprob", False):
+            self._dflash_verify_logprobs(
+                batch=batch,
+                logits_output=logits_output,
+                out_tokens=out_tokens,
+                bs=bs,
+                block_size=int(self.block_size),
+            )
+
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
+            # upstream #37818: hand the POST-verify lengths to the Mamba
+            # commit (the Triton accept path already produced them; the
+            # eager/sampling paths derive them here, once, and the value is
+            # reused for the publish below).
+            if new_seq_lens is None:
+                new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
             self._update_target_mamba_state_after_verify(
                 batch=batch,
                 seq_lens_pre_verify=seq_lens_pre_verify,
+                seq_lens_post_verify=new_seq_lens,
                 commit_lens=commit_lens,
             )
 

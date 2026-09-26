@@ -138,6 +138,36 @@ class DraftKVSlotMapper:
     THREADING: all translate/drain mutation happens on the worker thread;
     ``on_global_free``/``on_global_clear`` (scheduler thread, allocator
     listener) only enqueue under a lock.
+
+    SYNC-FREE MODE (``sync_free=True``; the worker sets it only for the
+    window pool under ``SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE=1``, default
+    off). The legacy mapper reads the device on every call -- ``.item()``
+    for the allocation count, boolean-mask indexing (an implicit nonzero),
+    ``torch.unique`` and a scalar index_put -- and each of those makes the
+    host wait for the stream to drain. On the DFLASH decode round the last
+    of them sits AFTER the verify launch (the draft-KV append), so the host
+    cannot run ahead of the verify and the overlap scheduler has nothing to
+    overlap (census xsn421/422: dflash_solo_pool.py 253/271/294/300/309 on
+    every round). In this mode the allocation count lives on the device
+    (``_counters[0]``) and every translate/free is fixed-shape tensor math:
+    the j-th allocating entry pops ``_free[count - n + j]`` exactly as the
+    legacy pop does, frees push in the legacy (sorted, deduplicated) order,
+    so the map, the reverse map and the free stack stay IDENTICAL to the
+    legacy mapper's. What changes is only what the host knows: a lower
+    bound on the free count (``_host_free_lb``), kept from non-blocking
+    pinned snapshots minus the allocations issued since; a write whose size
+    exceeds that bound -- a large prefill append, or a pool close to full --
+    takes the legacy path with ONE exact read (and the legacy LRU reclaim /
+    exhaustion error unchanged). Hole counts are summed on the device and
+    reported from the snapshots, i.e. up to one snapshot late.
+
+    STREAMS. Only the stream bound by ``bind_owner_stream`` (the worker's
+    forward stream, bound at the start of every forward) takes the
+    sync-free path. A call from any other stream (the HiCache load/write
+    paths translate draft rows on their own streams) first orders itself
+    after the owner's queued work, then runs the legacy body on an exact
+    count and synchronizes its own stream before returning -- strictly more
+    ordered than the legacy mapper ever was, and off the decode hot path.
     """
 
     def __init__(
@@ -146,6 +176,7 @@ class DraftKVSlotMapper:
         num_draft_slots: int,
         ctx_cap: int,
         device,
+        sync_free: bool = False,
     ):
         assert num_draft_slots >= 2, "need at least the hole slot + one slot"
         self.num_global_slots = int(num_global_slots)
@@ -180,6 +211,188 @@ class DraftKVSlotMapper:
         self.reclaim_events = 0
         self.reclaimed_slots_total = 0
         self._holes_logged_at = 0
+        # Sync-free mode (class docstring). Off: nothing below is allocated
+        # and every method runs its legacy body unchanged.
+        self.sync_free = bool(sync_free)
+        self._in_exact = False
+        if self.sync_free:
+            self._init_sync_free_state()
+
+    # -- sync-free state -------------------------------------------------
+    def _init_sync_free_state(self) -> None:
+        S = self.num_draft_slots
+        dev = self.map.device
+        # Free stack with ONE extra cell at index S-1: the dump target of
+        # the masked scatters (the stack itself never holds more than S-1
+        # entries, so indices 0..S-2 are the only ones ever popped).
+        self._dump_pos = S - 1
+        self._free = torch.zeros(S, dtype=torch.int32, device=dev)
+        # [0] = free count (authoritative in sync-free mode), [1] = holes read.
+        self._counters = torch.zeros(2, dtype=torch.int64, device=dev)
+        self._alloc_ub_total = 0
+        self._holes_dev_seen = 0
+        self._owner_stream = None
+        self._snap_inflight = False
+        self._snap_alloc_ub = 0
+        self._snap_host = None
+        self._snap_event = None
+        self._fill_sync_free_device_state(fold_holes=False)
+        if dev.type == "cuda":
+            self._stream_mode = "cuda"
+            try:
+                self._snap_host = torch.zeros(2, dtype=torch.int64, pin_memory=True)
+                self._snap_event = torch.cuda.Event()
+            except Exception as e:  # noqa: BLE001 -- degrade to exact reads
+                logger.warning(
+                    "DFLASH window pool (sync-free): no pinned snapshot (%s); "
+                    "the free-count bound is refreshed by exact reads only.",
+                    e,
+                )
+                self._snap_host = None
+                self._snap_event = None
+        elif dev.type == "meta":
+            # Shape-only device (tests): no data, nothing to snapshot.
+            self._stream_mode = "off"
+        else:
+            # CPU: every op is synchronous, so a read IS the snapshot.
+            self._stream_mode = "immediate"
+
+    def _fill_sync_free_device_state(self, fold_holes: bool) -> None:
+        """(Re)build the device stack and counters from HOST constants only.
+
+        Never from device bytes the mapper held before: a phase release of an
+        un-backed memory-saver region can hand them back arbitrary, and the
+        legacy ``_reset`` never read them either (it allocates a fresh
+        arange). The device hole counter restarts at zero; on a CPU mapper its
+        unharvested part is folded in first (a free read), on CUDA at most one
+        snapshot's worth of hole COUNTS is dropped -- observability only."""
+        S = self.num_draft_slots
+        dev = self._free.device
+        if fold_holes and dev.type == "cpu":
+            self._note_holes(int(self._counters[1]))
+        self._free[: S - 1].copy_(torch.arange(1, S, dtype=torch.int32, device=dev))
+        self._free[S - 1 :].zero_()
+        self._counters[0].fill_(S - 1)
+        self._counters[1].zero_()
+        self._holes_dev_seen = 0
+        self._host_free_lb = S - 1
+        # A snapshot in flight predates this; the next one is queued on the
+        # same (owner) stream behind it, so dropping its bookkeeping is safe.
+        self._snap_inflight = False
+
+    def _reset_sync_free_state(self) -> None:
+        self._fill_sync_free_device_state(fold_holes=True)
+
+    def bind_owner_stream(self) -> None:
+        """Make the CURRENT stream the one that takes the sync-free path.
+
+        Called by the worker at the start of every forward. Rebinding to a
+        different stream orders the new stream after the old one's queued
+        work first -- including an in-flight snapshot copy, so the next copy
+        into the same pinned page still lands after it -- and drops that
+        snapshot's bookkeeping."""
+        if not self.sync_free or self._stream_mode != "cuda":
+            return
+        cur = torch.cuda.current_stream(self.map.device)
+        owner = self._owner_stream
+        if owner is None:
+            self._owner_stream = cur
+            return
+        if cur == owner:
+            return
+        cur.wait_stream(owner)
+        self._snap_inflight = False
+        self._owner_stream = cur
+
+    def _on_owner_stream(self) -> bool:
+        if self._stream_mode != "cuda":
+            return True
+        owner = self._owner_stream
+        return owner is not None and torch.cuda.current_stream(
+            self.map.device
+        ) == owner
+
+    def _note_holes(self, dev_total: int) -> None:
+        delta = int(dev_total) - self._holes_dev_seen
+        if delta <= 0:
+            return
+        self._holes_dev_seen = int(dev_total)
+        self.holes_read_total += delta
+        if (
+            self.holes_read_total - self._holes_logged_at >= _HOLE_LOG_EVERY
+            or self._holes_logged_at == 0
+        ):
+            self._holes_logged_at = self.holes_read_total
+            logger.warning(
+                "DFLASH small solo pool: %d unmapped prefix slots read "
+                "(total %d) -- zero-KV holes; accept rate degrades for "
+                "the affected radix prefixes (raise %s if frequent). "
+                "[sync-free mapper: counted on the device, reported up to "
+                "one snapshot late]",
+                delta,
+                self.holes_read_total,
+                SOLO_POOL_FACTOR_ENV,
+            )
+
+    def _poll_snapshot(self) -> None:
+        """Refresh the host's free-count lower bound WITHOUT waiting.
+
+        CUDA: harvest a completed pinned copy (``Event.query``, never a
+        synchronize) and queue the next one behind the work issued so far.
+        The bound is the snapshot minus every allocation upper bound issued
+        after the snapshot was queued; frees issued since only make the truth
+        larger, so the bound can lag but never overshoot."""
+        mode = self._stream_mode
+        if mode == "off":
+            return
+        if mode == "immediate":
+            vals = self._counters.tolist()
+            self._host_free_lb = int(vals[0])
+            self._note_holes(int(vals[1]))
+            return
+        if self._snap_host is None or not self._on_owner_stream():
+            return
+        if self._snap_inflight:
+            if not self._snap_event.query():
+                return
+            self._host_free_lb = int(self._snap_host[0]) - (
+                self._alloc_ub_total - self._snap_alloc_ub
+            )
+            self._note_holes(int(self._snap_host[1]))
+            self._snap_inflight = False
+        self._snap_host.copy_(self._counters, non_blocking=True)
+        self._snap_event.record()
+        self._snap_alloc_ub = self._alloc_ub_total
+        self._snap_inflight = True
+
+    def _exact_section(self, body, *args, **kwargs):
+        """Run a LEGACY body on an exact host free count (sync-free mode).
+
+        One device read for the count; the legacy body then mutates the
+        host count as it always did, and the result is written back to the
+        device counter. Off the owner stream, the read is first ordered
+        after the owner's queued mapper work and the call ends with a
+        synchronize of its own stream, so the owner's next op (issued later
+        by the host) can never overtake it."""
+        cuda = self._stream_mode == "cuda"
+        foreign = cuda and not self._on_owner_stream()
+        cur = torch.cuda.current_stream(self.map.device) if cuda else None
+        if foreign and self._owner_stream is not None:
+            cur.wait_stream(self._owner_stream)
+        self._free_count = int(self._counters[0].item())
+        self._in_exact = True
+        try:
+            return body(*args, **kwargs)
+        finally:
+            self._in_exact = False
+            self._counters[0].fill_(self._free_count)
+            if foreign:
+                cur.synchronize()
+            self._host_free_lb = self._free_count
+            # A snapshot queued before this call predates its writes. Its copy
+            # is behind the read above (owner stream, or ordered by the wait),
+            # so the next copy into the pinned page lands after it.
+            self._snap_inflight = False
 
     # -- allocator listener side (scheduler thread; enqueue only) --------
     def on_global_free(self, free_index: torch.Tensor) -> None:
@@ -213,14 +426,59 @@ class DraftKVSlotMapper:
     def _reset(self) -> None:
         self.map.fill_(-1)
         self.map[0] = 0
-        self._free = torch.arange(
-            1, self.num_draft_slots, dtype=torch.int32, device=self.device
-        )
+        if self.sync_free:
+            # Same state, in place (the stack keeps its dump cell).
+            self._reset_sync_free_state()
+        else:
+            self._free = torch.arange(
+                1, self.num_draft_slots, dtype=torch.int32, device=self.device
+            )
         self._free_count = self.num_draft_slots - 1
         self._slot_global.fill_(-1)
         self._slot_epoch.zero_()
 
     def _apply_free(self, free_index: torch.Tensor) -> None:
+        if self.sync_free and not self._in_exact and self._on_owner_stream():
+            self._apply_free_sync_free(free_index)
+            return
+        self._apply_free_legacy(free_index)
+
+    def _apply_free_sync_free(self, free_index: torch.Tensor) -> None:
+        """``_apply_free`` without a host read: the same pushes, in the same
+        (sorted, first-occurrence) order, as fixed-shape masked scatters."""
+        if free_index.device != self.map.device:
+            free_index = free_index.to(self.map.device)
+        idx = free_index.to(torch.int64).reshape(-1)
+        if idx.numel() == 0:
+            return
+        s, _ = torch.sort(idx)
+        first = torch.ones_like(s, dtype=torch.bool)
+        if s.numel() > 1:
+            first[1:] = s[1:] != s[:-1]
+        in_range = (s >= 0) & (s <= self.num_global_slots)
+        zero = torch.zeros_like(s)
+        s_safe = torch.where(in_range, s, zero)
+        d = self.map[s_safe]
+        live = (d > 0) & first & in_range  # never the hole slot
+        live64 = live.to(torch.int64)
+        rank = torch.cumsum(live64, 0) - 1
+        n = live64.sum()
+        # Non-live entries write harmless constants: the stack's dump cell,
+        # map[0] (always 0) and the hole slot's reverse entry (always -1).
+        pos = torch.where(
+            live, self._counters[0] + rank, torch.full_like(s, self._dump_pos)
+        )
+        self._free.index_put_((pos,), torch.where(live, d, torch.zeros_like(d)))
+        self.map.index_put_(
+            (torch.where(live, s_safe, zero),),
+            torch.where(live, torch.full_like(d, -1), torch.zeros_like(d)),
+        )
+        self._slot_global.index_put_(
+            (torch.where(live, d.to(torch.int64), zero),), torch.full_like(s, -1)
+        )
+        self._counters[0].add_(n)
+
+    def _apply_free_legacy(self, free_index: torch.Tensor) -> None:
         if free_index.device != self.map.device:
             free_index = free_index.to(self.map.device)
         # Dedupe defensively: a duplicated index would push the same draft
@@ -244,6 +502,55 @@ class DraftKVSlotMapper:
 
     def translate_read(self, global_locs: torch.Tensor) -> torch.Tensor:
         """Draft slots for *global_locs*; unmapped -> hole slot 0 (counted)."""
+        if self.sync_free and not self._in_exact:
+            if self._on_owner_stream():
+                return self._translate_read_sync_free(global_locs)
+            return self._exact_section(self._translate_read_legacy, global_locs)
+        return self._translate_read_legacy(global_locs)
+
+    def _translate_read_sync_free(self, global_locs: torch.Tensor) -> torch.Tensor:
+        self._drain_pending()
+        if global_locs.numel() == 0:
+            return global_locs.to(torch.int64)
+        g = global_locs.to(torch.int64)
+        d = self.map[g].to(torch.int64)
+        holes = d < 0
+        self._counters[1].add_(holes.sum())
+        d = torch.where(holes, torch.zeros_like(d), d)
+        self._slot_epoch.index_fill_(0, d.reshape(-1), self._epoch)
+        self._poll_snapshot()
+        return d
+
+    def translate_read_rows(
+        self, global_2d: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """``translate_read`` over a PADDED block, without compacting it.
+
+        ``mask`` (bool, same shape) marks the real entries. Masked entries get
+        exactly what ``translate_read`` of the compacted entries would give
+        (unmapped -> hole slot 0, counted); unmasked ones get 0 and are not
+        counted. Sync-free mode, owner stream only -- the legacy mapper
+        compacts with a boolean index instead (an implicit nonzero)."""
+        if not self.sync_free or not self._on_owner_stream():
+            raise RuntimeError(
+                "translate_read_rows is the sync-free window-pool path: it "
+                "needs sync_free=True and the owner stream "
+                "(bind_owner_stream() at the start of the forward)."
+            )
+        self._drain_pending()
+        if global_2d.numel() == 0:
+            return global_2d.to(torch.int64)
+        g = global_2d.to(torch.int64)
+        d = self.map[g].to(torch.int64)
+        m = mask.to(device=d.device, dtype=torch.bool)
+        holes = (d < 0) & m
+        self._counters[1].add_(holes.sum())
+        d = torch.where(m & (d >= 0), d, torch.zeros_like(d))
+        self._slot_epoch.index_fill_(0, d.reshape(-1), self._epoch)
+        self._poll_snapshot()
+        return d
+
+    def _translate_read_legacy(self, global_locs: torch.Tensor) -> torch.Tensor:
         self._drain_pending()
         if global_locs.numel() == 0:
             return global_locs.to(torch.int64)
@@ -281,6 +588,73 @@ class DraftKVSlotMapper:
         (e.g. beyond a request's commit length, or gated requests) get the
         hole slot and allocate nothing -- prefix-valid writers never touch
         those rows."""
+        if self.sync_free and not self._in_exact:
+            if self._on_owner_stream():
+                return self._translate_write_sync_free(global_locs, valid)
+            return self._exact_section(
+                self._translate_write_legacy, global_locs, valid
+            )
+        return self._translate_write_legacy(global_locs, valid)
+
+    def _translate_write_sync_free(
+        self,
+        global_locs: torch.Tensor,
+        valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """The allocation as fixed-shape device math (class docstring).
+
+        Needs the host to KNOW the pop cannot underflow: the entries that can
+        allocate are at most ``numel`` (a host fact), so the fast path runs
+        only while that fits under the snapshot bound; otherwise the legacy
+        body runs on one exact read, reclaim and exhaustion error included."""
+        self._drain_pending()
+        if global_locs.numel() == 0:
+            return global_locs.to(torch.int64)
+        n_max = int(global_locs.numel())
+        if n_max > self._host_free_lb:
+            self._poll_snapshot()
+            if n_max > self._host_free_lb:
+                return self._exact_section(
+                    self._translate_write_legacy, global_locs, valid
+                )
+        g = global_locs.to(torch.int64).reshape(-1)
+        if valid is None:
+            valid_mask = torch.ones_like(g, dtype=torch.bool)
+        else:
+            valid_mask = valid.reshape(-1).to(device=g.device, dtype=torch.bool)
+        cur = self.map[g]
+        need = (cur < 0) & valid_mask
+        need64 = need.to(torch.int64)
+        rank = torch.cumsum(need64, 0) - 1
+        n = need64.sum()
+        # Legacy pop: the j-th allocating entry takes _free[count - n + j].
+        pos = (self._counters[0] - n + rank).clamp_(min=0)
+        new_slots = self._free[pos]
+        zero = torch.zeros_like(g)
+        # Non-allocating entries write map[0] := 0 and the hole slot's
+        # reverse entry := -1, both of which already hold those values.
+        self.map.index_put_(
+            (torch.where(need, g, zero),),
+            torch.where(need, new_slots, torch.zeros_like(new_slots)),
+        )
+        self._slot_global.index_put_(
+            (torch.where(need, new_slots.to(torch.int64), zero),),
+            torch.where(need, g, torch.full_like(g, -1)),
+        )
+        self._counters[0].sub_(n)
+        cur = self.map[g]
+        d = torch.where(valid_mask & (cur >= 0), cur.to(torch.int64), zero)
+        self._slot_epoch.index_fill_(0, d, self._epoch)
+        self._alloc_ub_total += n_max
+        self._host_free_lb -= n_max
+        self._poll_snapshot()
+        return d.view(global_locs.shape)
+
+    def _translate_write_legacy(
+        self,
+        global_locs: torch.Tensor,
+        valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         self._drain_pending()
         if global_locs.numel() == 0:
             return global_locs.to(torch.int64)
@@ -363,11 +737,72 @@ class DraftKVSlotMapper:
         self._free_count += take
 
     def stats(self) -> dict:
+        free = self._free_count
+        if self.sync_free:
+            # The device counter is authoritative in sync-free mode; this is a
+            # diagnostic read (a sync), never on the decode hot path.
+            if (
+                self._stream_mode == "cuda"
+                and self._owner_stream is not None
+                and not self._on_owner_stream()
+            ):
+                torch.cuda.current_stream(self.map.device).wait_stream(
+                    self._owner_stream
+                )
+            vals = self._counters.tolist()
+            free = int(vals[0])
+            self._note_holes(int(vals[1]))
         return {
             "draft_slots": self.num_draft_slots,
             "mapped": int((self._slot_global >= 0).sum().item()),
-            "free": self._free_count,
+            "free": free,
             "holes_read_total": self.holes_read_total,
             "reclaim_events": self.reclaim_events,
             "reclaimed_slots_total": self.reclaimed_slots_total,
         }
+
+
+def rebuild_window_rows_sync_free(
+    *,
+    mapper: DraftKVSlotMapper,
+    target_req_to_token: torch.Tensor,
+    draft_req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    start: torch.Tensor,
+    lengths: torch.Tensor,
+    max_len: int,
+) -> None:
+    """Window pool, sync-free: rows ``[0, lengths[b])`` of the draft's private
+    req_to_token, in draft-slot space, WITHOUT a host read.
+
+    The legacy chain (``_gather_req_to_token_segments`` -> ``translate_read``
+    -> ``assign_req_to_token_pool_func``) reads ``lengths.max().item()`` and
+    compacts with a boolean mask -- two host syncs per round before the draft
+    forward. Here the width is the HOST bound ``max_len`` (the compact
+    seq-lens mirror the backends already plan with, >= every device length),
+    the block stays padded, and the write back is masked: row ``b`` gets
+    exactly the legacy values in ``[0, lengths[b])`` and every other column
+    keeps what it held (the verify block is written right after by the
+    caller, as before).
+    """
+    bs = int(req_pool_indices.shape[0])
+    if bs == 0 or max_len <= 0:
+        return
+    if max_len > int(draft_req_to_token.shape[1]):
+        raise RuntimeError(
+            f"DFLASH window pool: host length bound {max_len} exceeds the "
+            f"draft req_to_token width {int(draft_req_to_token.shape[1])}."
+        )
+    device = target_req_to_token.device
+    rows = req_pool_indices.to(device=device, dtype=torch.int64).unsqueeze(1)
+    offsets = torch.arange(max_len, device=device, dtype=torch.int64).unsqueeze(0)
+    mask = offsets < lengths.to(device=device, dtype=torch.int64).unsqueeze(1)
+    pos = (start.to(device=device, dtype=torch.int64).unsqueeze(1) + offsets)
+    pos = pos.masked_fill(~mask, 0)
+    draft_slots = mapper.translate_read_rows(target_req_to_token[rows, pos], mask)
+    rows2d = rows.expand(-1, max_len)
+    cols2d = offsets.expand(bs, -1)
+    held = draft_req_to_token[rows2d, cols2d]
+    draft_req_to_token[rows2d, cols2d] = torch.where(
+        mask, draft_slots.to(draft_req_to_token.dtype), held
+    )

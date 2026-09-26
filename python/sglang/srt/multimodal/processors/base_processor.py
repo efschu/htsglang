@@ -21,6 +21,8 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    configure_media_url_security,
     envs,
     is_cpu,
     is_npu,
@@ -262,6 +264,10 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
+        configure_media_url_security(
+            server_args.allowed_media_domains,
+            server_args.media_url_max_file_size_mb,
+        )
         self.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
         self.disable_fast_image_processor = server_args.disable_fast_image_processor
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -644,8 +650,7 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
-        except ValueError as e:
-            # Bad input (e.g. invalid base64) -> 400, not 500.
+        except CLIENT_MEDIA_EXCEPTIONS as e:
             data_str = str(data)
             if len(data_str) > 100:
                 data_str = data_str[:100] + "..."

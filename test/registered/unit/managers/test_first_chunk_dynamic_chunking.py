@@ -62,6 +62,13 @@ class _Sched:
     # pinning it. It writes ``_dyn_chunk_last_logged`` on this instance and
     # reads ``chunked_prefill_size``, both of which this harness already has.
     _log_dynamic_chunk_engagement = Scheduler._log_dynamic_chunk_engagement
+    # --p-chunk-policy (25.09.): the sizer asks the P chunk plan first. None =
+    # no planner (fixed/unset), the path these cases pin; bound off the real
+    # class so the surface guard below descends into the real method.
+    _p_chunk_planner = None
+    _p_chunk_policy_width = Scheduler._p_chunk_policy_width
+    waiting_queue = ()
+    _p_chunk_policy_errors = 0
 
 
 def _chunked_req(prefix_len):

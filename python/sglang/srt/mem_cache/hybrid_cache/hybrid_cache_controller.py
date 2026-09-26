@@ -834,6 +834,12 @@ class HybridCacheController(BaseHiCacheController):
         draft_rows, draft_host_rows, draft_rows_skipped = None, None, False
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            # upstream #36738 (see HiCacheController.start_loading): the H2D
+            # (KV + Mamba pool_transfers + draft rows) into reclaimed device
+            # rows waits for the forward(s) in flight -- this override is the
+            # load path the 27B/NF hybrid UnifiedRadixCache actually runs.
+            for fence_stream in self._load_fence_streams():
+                self.load_stream.wait_stream(fence_stream)
             for i in range(self.mem_pool_host.transfer_layer_domain):
                 _sl_a = time.perf_counter()
                 self.mem_pool_host.load_to_device_per_layer(

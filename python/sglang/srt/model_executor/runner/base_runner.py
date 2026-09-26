@@ -41,6 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    agree_flashinfer_autotune_across_group,
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
@@ -92,6 +93,24 @@ def enter_capture_group_barrier(model_runner: ModelRunner) -> bool:
         return False
     model_runner.tp_group.barrier()
     return True
+
+
+def runs_target_verify(model_runner) -> bool:
+    """Does THIS runner ever run a TARGET_VERIFY forward?
+
+    ``spec_algorithm.is_speculative()`` alone is not the answer: the draft-KV
+    PRODUCER (``--speculative-draft-kv-only``, Weg 2's prefill-only group P)
+    carries the decode group's full speculative flag set byte for byte
+    (drafter identity) but never decodes, proposes or verifies, and its mamba
+    pool has no ``SpeculativeState`` (#1233 FIX 4 carved its target-verify
+    graph set for exactly this reason). A dummy forward that followed the flag
+    ran the GDN target-verify branch there and died on
+    ``assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)``
+    (rc8b cu130 acceptance, flashinfer warmup autotune, 25.09. 17:29Z).
+    """
+    return bool(model_runner.spec_algorithm.is_speculative()) and not bool(
+        getattr(model_runner, "is_draft_kv_only_producer", False)
+    )
 
 
 def _allocate_decode_buffers(
@@ -253,12 +272,16 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
 
-        if should_run_flashinfer_autotune(self.model_runner):
+        # Group-uniform (#rc9b D): the dummy forward is a TP forward, so every
+        # rank of the group runs it when ANY rank tunes; only ranks whose own
+        # answer is yes tune.
+        tune = should_run_flashinfer_autotune(self.model_runner)
+        if agree_flashinfer_autotune_across_group(self.model_runner, tune):
             buffers, batch_size = self._autotune_buffers()
             assert (
                 buffers is not None
             ), "_autotune_buffers() must return a reusable buffer set for autotune"
-            self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
+            self._flashinfer_autotune(buffers=buffers, batch_size=batch_size, tune=tune)
 
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
@@ -290,7 +313,7 @@ class BaseRunner(ABC):
             dtype=mr.dtype,
         )
 
-    def _flashinfer_autotune(self, *, buffers, batch_size):
+    def _flashinfer_autotune(self, *, buffers, batch_size, tune: bool = True):
         """Run flashinfer autotune.
 
         buffers / batch_size: a prepared static decode-buffer set and its bs,
@@ -305,14 +328,25 @@ class BaseRunner(ABC):
             else empty_context()
         )
 
+        # The draft-KV producer only ever runs EXTEND (prefill); tune on the
+        # forward kind it actually executes, never on decode/verify.
+        mode_override = (
+            ForwardMode.EXTEND
+            if getattr(mr, "is_draft_kv_only_producer", False)
+            else None
+        )
+
         def forward_fn():
             self._dummy_run(
                 batch_size=batch_size,
                 buffers=buffers,
                 run_ctx=canary_run_ctx,
+                forward_mode_override=mode_override,
             )
 
-        run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
+        run_flashinfer_autotune_forward(
+            self.model_runner, forward_fn, skip_logits=True, tune=tune
+        )
 
     def _alloc_dummy_decode_buffers(self, max_bs: int, *, num_tokens_per_bs: int = 1):
         """Allocate one static decode-buffer set for a dummy forward, sized to
@@ -385,7 +419,7 @@ class BaseRunner(ABC):
             capture_forward_mode = ForwardMode.EXTEND
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_bs = 1
-        if mr.spec_algorithm.is_speculative():
+        if runs_target_verify(mr):
             if mr.is_draft_model_runner:
                 if not mr.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
@@ -514,12 +548,16 @@ class BaseRunner(ABC):
             global_dp_buffer_len = None
             global_num_tokens_cpu = None
 
-        spec_info = create_dummy_verify_input(
-            mr.spec_algorithm,
-            mr.server_args,
-            buffers.custom_mask,
-            num_tokens_per_bs,
-            mr.is_draft_model_runner,
+        spec_info = (
+            create_dummy_verify_input(
+                mr.spec_algorithm,
+                mr.server_args,
+                buffers.custom_mask,
+                num_tokens_per_bs,
+                mr.is_draft_model_runner,
+            )
+            if runs_target_verify(mr)
+            else None
         )
         if spec_info is not None and (
             mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()

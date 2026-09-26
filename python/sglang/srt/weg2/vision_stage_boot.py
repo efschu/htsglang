@@ -578,9 +578,22 @@ class TowerHooks:
 
     # -- release ------------------------------------------------------------
     def release_tower(self, handle: Any) -> None:
+        """Drop the LAST reference, then return the cache to the card.
+
+        xsn410: the runtime hands the tower in a one-slot box (its own name
+        already cleared), because a plain argument leaves the caller's
+        reference alive and ``empty_cache`` then returns nothing -- the
+        2.1 GiB that stayed on card0 refused D's kv resume one flip later.
+        ``gc.collect`` catches a module held only through a cycle.
+        """
+        import gc
+
         import torch
 
+        if isinstance(handle, list):
+            handle.clear()
         del handle
+        gc.collect()
         torch.cuda.empty_cache()
 
 
@@ -934,17 +947,20 @@ def arm_transient_vision(
     *,
     multimodal: bool = True,
     env: Optional[Dict[str, str]] = None,
-    snapshot: Optional[Callable[[], Sequence[Tuple[Any, Any]]]] = None,
-    context_runner: Optional[Callable[[Sequence[str], Dict[str, str]], str]] = None,
-    build_module: Optional[Callable[[Any, int], Any]] = None,
-    h2d_gbps: Optional[Dict[int, float]] = None,
-    booked_hw: Tuple[int, int] = BOOKED_IMAGE_HW,
-) -> Optional[Any]:
-    """Arm the transient stage for this process, or refuse BY NAME.
+) -> bool:
+    """Hand this boot's images to the IN-RANK stage, or refuse BY NAME.
 
-    Returns the installed service, or ``None``.  ``None`` has two meanings and
-    they are NOT the same, which is why the refusal is recorded rather than
-    returned:
+    User design 2026-09-24: the stage runs inside the P group's PP0 rank
+    (``weg2/vision_rank_runner.py``, tower on the KV tail, O_DIRECT reader),
+    which REPLACES the tokenizer-process stage this function used to build
+    here (own CUDA context, band displacement, host-RAM post). What is left
+    for the tokenizer process is to check that the images CAN reach the rank
+    -- a multimodal processor, a model path, a vision config -- and to pass
+    them on with their pixels.
+
+    Returns True when the images go to the rank stage. False has two
+    meanings, and they are NOT the same, which is why the refusal is recorded
+    rather than returned:
 
     * this is not a transient boot -- nothing happened, no state was touched,
       and the text path is byte-for-byte what it was;
@@ -957,7 +973,7 @@ def arm_transient_vision(
     is exactly what the recorded refusal does.
     """
     if not vision_mode(env):
-        return None
+        return False
 
     model_dir = ""
     for src, name in ((server_args, "model_path"), (model_config, "model_path")):
@@ -977,52 +993,17 @@ def arm_transient_vision(
             )
         if not model_dir:
             raise VisionStageArmRefused(
-                "no model path on the server args; the tower's shard cannot be "
-                "found and the stage cannot be sized"
+                "no model path on the server args; the rank cannot find the "
+                "tower's shard"
             )
-        if hf_config is None:
+        if hf_config is None or getattr(hf_config, "vision_config", None) is None:
             raise VisionStageArmRefused(
-                "no hf_config on the model config; the encoder geometry would "
-                "have to come from VisionEncoderConfig's defaults, which are "
-                "ANOTHER checkpoint's numbers"
+                "no vision_config on the model config; the rank would have no "
+                "tower geometry to build"
             )
-        snap = snapshot
-        if snap is None:
-            from sglang.srt.registry.nvml import memory_snapshot as snap  # noqa: N813
-        service, ctx, cfg = build_service(
-            model_dir=model_dir,
-            hf_config=hf_config,
-            snapshot=snap,
-            h2d_gbps=h2d_gbps,
-            context_runner=context_runner,
-            build_module=build_module,
-            booked_hw=booked_hw,
-        )
     except Exception as exc:  # noqa: BLE001 -- every path out is a named refusal
         _vss.install_refusal(f"{type(exc).__name__}: {exc}")
-        return None
+        return False
 
-    _vss.install(service)
-    tower = service.tower
-    logger.info(
-        "%s ARMED pid=%d model=%s tower=%d pieces %.3fGiB ctx=%.0fMiB "
-        "activation=%.0fMiB(booked for %dx%d = %d patch rows) "
-        "embeddings=%.0fMiB total=%.3fGiB read_gbps=%.2f(BUFFERED) "
-        "h2d_gbps=%s eviction=%s",
-        _vss.W_STAGE_OK,
-        os.getpid(),
-        model_dir,
-        tower.pieces,
-        tower.weight_bytes / GIB,
-        tower.ctx_bytes / MIB,
-        tower.activation_bytes / MIB,
-        booked_hw[0],
-        booked_hw[1],
-        cfg.patch_rows(booked_hw[0], booked_hw[1]),
-        tower.embedding_bytes / MIB,
-        tower.total_bytes / GIB,
-        service.read_gbps,
-        dict(sorted(service.h2d_gbps.items())),
-        "UNAVAILABLE in this process (rank-side only)",
-    )
-    return service
+    _vss.install_rank_stage()
+    return True

@@ -134,6 +134,16 @@ def manifest_filename(rank: int, group: str = "", region_tag: str = "",
     return f"{MANIFEST_PREFIX}_{grp}rank{axes}{reg}.json"
 
 
+def _flat_table_from_json(raw) -> Optional[object]:
+    """G1: a piece's ``flat_segments`` entry as a ``FlatTable`` (``None`` when
+    absent -- every tensor that is not a flat container)."""
+    if raw is None:
+        return None
+    from sglang.srt.weg2.xchg_flat_segments import FlatTable
+
+    return FlatTable.from_json(raw)
+
+
 @dataclass(frozen=True)
 class ManifestPiece:
     """One tensor as THIS rank's loader actually materialised it.
@@ -161,6 +171,12 @@ class ManifestPiece:
     #: is "no declared split", which is every manifest written before #1384
     #: and every non-fused tensor -- both round-trip unchanged.
     component_rows: Tuple[int, ...] = ()
+    #: G1: this rank's DECLARED flat container (``xchg_flat_segments.FlatTable``)
+    #: -- the segments the loader laid into one byte buffer, straight off the
+    #: parameter (``ParamGeom.flat_table``). ``None`` (default, and absent from
+    #: the JSON) for every other tensor, so every manifest written before G1
+    #: round-trips byte for byte.
+    flat_table: Optional[object] = None
 
     @property
     def key(self) -> Tuple[int, int, int, int, int]:
@@ -181,6 +197,8 @@ class ManifestPiece:
             "tag": self.tag,
             "nbytes": int(self.nbytes),
             "component_rows": [int(x) for x in self.component_rows],
+            **({} if self.flat_table is None
+               else {"flat_segments": self.flat_table.as_json()}),
         }
 
     @classmethod
@@ -196,6 +214,7 @@ class ManifestPiece:
             # ABSENT means a pre-#1384 manifest or a non-fused tensor --
             # both are "no declared split", not a shape to guess at.
             component_rows=tuple(int(x) for x in raw.get("component_rows", ())),
+            flat_table=_flat_table_from_json(raw.get("flat_segments")),
         )
 
 
@@ -301,6 +320,7 @@ def pieces_from_inventory(inventory: Iterable[object]) -> Tuple[ManifestPiece, .
                 tag=str(getattr(geom, "tag", "")),
                 nbytes=rows * cols * item,
                 component_rows=comp,
+                flat_table=getattr(geom, "flat_table", None),
             )
         )
     return tuple(sorted(out, key=lambda p: p.param_name))
@@ -444,6 +464,9 @@ class JoinedTensor:
     #: count of component ``i`` -- ``cut``'s own ``component_rows``, read off
     #: by the join and carried through untouched.
     component_rank_rows: Tuple[Tuple[int, ...], ...] = ()
+    #: G1: the joined flat-container declarations (``FlatJoin``) of a
+    #: ``FLAT_SEGMENTS`` tensor; ``None`` for every other class.
+    flat_join: Optional[object] = None
 
     @property
     def sharded(self) -> bool:
@@ -514,7 +537,8 @@ class JoinedTensor:
             # (siehe unten) und ein Vektor ohne Null aendert nichts.
             dst_widths=(tuple(int(w) for w in self.tp_widths)
                         if (tp_is_dst
-                            and self.shard_axis not in (wx.MIXED_FUSED, wx.MIXED_FUSED_COLS)
+                            and self.shard_axis not in (wx.MIXED_FUSED, wx.MIXED_FUSED_COLS,
+                                                        wx.FLAT_SEGMENTS)
                             and (self.sharded
                                  or any(int(w) == 0 for w in self.tp_widths)))
                         else None),
@@ -529,10 +553,12 @@ class JoinedTensor:
             # deponiert, P 90 s im Zeitbudget, alle drei PP-Raenge tot.
             src_widths=(tuple(int(w) for w in self.tp_widths)
                         if ((not tp_is_dst)
-                            and self.shard_axis not in (wx.MIXED_FUSED, wx.MIXED_FUSED_COLS)
+                            and self.shard_axis not in (wx.MIXED_FUSED, wx.MIXED_FUSED_COLS,
+                                                        wx.FLAT_SEGMENTS)
                             and (self.sharded
                                  or any(int(w) == 0 for w in self.tp_widths)))
                         else None),
+            flat_join=(self.flat_join if self.shard_axis == wx.FLAT_SEGMENTS else None),
             # #1384: MIXED_FUSED needs its declared components on the geom
             # regardless of `tp_is_dst` -- `_blocks_of` is called once per
             # SIDE (source and destination) for the same geom, and the TP
@@ -760,6 +786,30 @@ def _axis_of(name: str, whole: ManifestPiece,
     cols = [int(p.cols_full) for p in cut]
     w_rows, w_cols = int(whole.rows_full), int(whole.cols_full)
 
+    # G1: A DECLARED FLAT CONTAINER IS READ OFF ITS DECLARATIONS, FIRST. Its
+    # extent is one byte row per rank; the outer tests below would refuse it
+    # (every rank pads for itself) or -- when the byte totals add up by
+    # coincidence -- read a plain column cut and copy rank 0's segments over the
+    # whole's first bytes. Both sides must declare, or neither.
+    # (read with getattr: a piece from before G1 -- or a duck-typed one -- has
+    # no declaration, which is exactly "not a flat container")
+    w_flat = getattr(whole, "flat_table", None)
+    c_flat = [getattr(p, "flat_table", None) for p in cut]
+    declared = [t is not None for t in c_flat]
+    if w_flat is not None or any(declared):
+        if w_flat is None or not all(declared):
+            raise wx.Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: {name}: the PP side "
+                f"{'declares' if w_flat is not None else 'does not declare'} "
+                f"a flat container and the TP ranks declare {declared} -- one "
+                f"tensor cannot be a segment container on one side only."
+            )
+        from sglang.srt.weg2 import xchg_flat_segments as _fs
+
+        _fs.join_tables(name, w_flat, c_flat)
+        return (wx.FLAT_SEGMENTS, w_rows, w_cols,
+                tuple(int(t.nbytes) for t in c_flat), 0)
+
     same_cols = len(set(cols)) == 1 and cols[0] == w_cols
     same_rows = len(set(rows)) == 1 and rows[0] == w_rows
 
@@ -797,17 +847,30 @@ def _axis_of(name: str, whole: ManifestPiece,
     # ``pad_vocab_size(ceil(full / n))`` produces -- equal widths, the tree's
     # own rounding, no slack. weg2xsn23: ceil(248320/3) = 82774 -> 82816 on
     # all three, total 248448, declared pad 128.
-    def _padded(total_full: int, widths: Sequence[int]) -> bool:
+    def _padded(total_full: int, widths: Sequence[int], pack: int = 1) -> bool:
         if len(set(widths)) != 1 or widths[0] <= 0:
             return False
         n = len(widths)
-        expect = _pad_vocab_size((int(total_full) + n - 1) // n)
-        return int(widths[0]) == int(expect) and n * int(expect) > int(total_full)
+        if pack > 1 and (int(total_full) % pack or int(widths[0]) % pack):
+            return False
+        total_u, width_u = int(total_full) // pack, int(widths[0]) // pack
+        expect = _pad_vocab_size((total_u + n - 1) // n)
+        return width_u == int(expect) and n * int(expect) > total_u
 
     if same_cols and _padded(w_rows, rows):
         return wx.ROWS, sum(rows), w_cols, tuple(rows), sum(rows) - w_rows
-    if same_rows and _padded(w_cols, cols):
-        return wx.COLS, w_rows, sum(cols), tuple(cols), sum(cols) - w_cols
+    # 27B line, RadixArk NVFP4 (lm_head NVFP4 on Marlin under --fp8-uniform-
+    # marlin): a Marlin-packed vocab-parallel head keeps the vocabulary on its
+    # COLUMN axis, ``pack`` int32 columns per vocab entry (int32 [K/16, 2V] for
+    # 4-bit, [K/16, 4V] for 8-bit; Marlin's 64-wide tiles keep a vocab slice a
+    # contiguous column range). The per-rank vocab padding is then read in
+    # VOCAB units, i.e. the columns divided by the pack -- only for an int32
+    # container (itemsize 4), the one a Marlin weight has, and with the same
+    # exact-rounding test as the unpacked case, so the danger bound holds.
+    _packs = (1,) + ((2, 4) if int(whole.itemsize) == 4 else ())
+    for _pack in _packs:
+        if same_rows and _padded(w_cols, cols, _pack):
+            return wx.COLS, w_rows, sum(cols), tuple(cols), sum(cols) - w_cols
 
     # THE ZERO PAD EXPERT (#74, fnFL2w1).  The expert-dim shard carries ONE
     # extra local row per rank, and it is not a skew -- it is this tree's own
@@ -1250,6 +1313,13 @@ def _join_manifests_uncached(
             comp_axes = tuple(a for a, _w, _r in comps)
             comp_whole = tuple(w for _a, w, _r in comps)
             comp_rank = tuple(r for _a, _w, r in comps)
+        flat_join = None
+        if axis == wx.FLAT_SEGMENTS:
+            from sglang.srt.weg2 import xchg_flat_segments as _fs
+
+            flat_join = _fs.join_tables(
+                name, getattr(whole, "flat_table", None),
+                [getattr(p, "flat_table", None) for p in rows])
         tensors.append(
             JoinedTensor(
                 param_name=name,
@@ -1266,6 +1336,7 @@ def _join_manifests_uncached(
                 component_axes=comp_axes,
                 component_whole_rows=comp_whole,
                 component_rank_rows=comp_rank,
+                flat_join=flat_join,
             )
         )
 

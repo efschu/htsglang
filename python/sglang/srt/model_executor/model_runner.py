@@ -52,7 +52,11 @@ from sglang.srt.configs import (
 )
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.configs.load_config import (
+    LoadConfig,
+    LoadFormat,
+    resolve_draft_load_format,
+)
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
@@ -1740,6 +1744,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # batch.
         self.eager_runner = EagerRunner(self)
 
+        # #GGUFPATH (SGLANG_GGUF_PATH_CENSUS, default off: no-op): the dispatch
+        # census's accumulator is allocated HERE -- outside every memory-saver
+        # region, before any graph captures its address; born in the
+        # cuda_graph or a weights tag it would come back from a weg2 wake on
+        # recycled pages.
+        if self.model_config.quantization == "gguf":
+            from sglang.srt.layers.quantization.gguf_path_census import (
+                arm as _gguf_path_census_arm,
+            )
+
+            _gguf_path_census_arm(self.device)
+
         # cuda-graph capture: prefill before decode, so both coalesce onto the
         # eager buffer allocated above. (init_prefill_cuda_graph routes prefill
         # to the eager runner when the prefill graph is disabled.)
@@ -2421,6 +2437,51 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         except Exception:  # noqa: BLE001
             return 0
 
+    def _this_runners_load_format(self):
+        """The format THIS runner loads its checkpoint with.
+
+        The target -- and the #631 phase-flip TP stack, which is the target
+        model rebuilt -- loads with ``--load-format``, as always. A runner that
+        loads a DRAFT checkpoint (``is_draft_model_runner``) loads it with the
+        draft's own format, ``configs.load_config.resolve_draft_load_format``:
+        ``--speculative-draft-load-format`` when given, else the target's
+        format, except that a GGUF target's ``gguf`` is not handed to a draft
+        that is not a GGUF file.
+
+        This used to be a process-wide ``server_args.override(load_format=
+        <draft format>)`` in ``Scheduler.maybe_init_draft_worker`` -- on the
+        speculative branch only, so the P group's draft-KV producer (spec
+        algorithm NONE, ``_maybe_init_draft_kv_producer``) never saw the flag
+        (weg2rc4gg PP2 2026-09-25: ``<DFlash2-W8-lued> is not a file``), and on
+        D it rewrote the TARGET's ``load_format`` for the rest of the process.
+        Deciding it here covers every draft build path -- DFLASH/DSPARK through
+        ``build_draft_tp_worker``, the EAGLE family, which hands the target's
+        ServerArgs straight to ``TpModelWorker``, and both producers -- without
+        writing the shared ServerArgs.
+
+        Byte-identical for every target runner, and for every draft runner
+        whose target is not GGUF with the flag unset (the inherited value is
+        returned as is).
+        """
+        load_format = self.server_args.load_format
+        if not getattr(self, "is_draft_model_runner", False):
+            return load_format
+        draft_format = resolve_draft_load_format(
+            self.server_args, getattr(self.model_config, "model_path", None)
+        )
+        explicit = getattr(self.server_args, "speculative_draft_load_format", None)
+        if explicit is not None or draft_format != load_format:
+            logger.info(
+                "Using draft model load_format: '%s' (%s; the target's "
+                "--load-format stays '%s')",
+                getattr(draft_format, "value", draft_format),
+                "--speculative-draft-load-format"
+                if explicit is not None
+                else "a GGUF target's draft that is not a GGUF file",
+                getattr(load_format, "value", load_format),
+            )
+        return draft_format
+
     def load_model(self):
         tic_total = time.perf_counter()
         if os.environ.get("SGLANG_LOAD_MEMSNAP_DIR"):
@@ -2578,7 +2639,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         self.load_config = LoadConfig(
-            load_format=self.server_args.load_format,
+            load_format=self._this_runners_load_format(),
             download_dir=self.server_args.download_dir,
             model_loader_extra_config=self.server_args.model_loader_extra_config,
             tp_rank=self.tp_rank,
@@ -2600,8 +2661,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model_config, self.load_config, self.tp_size
             )
 
+        # The format THIS runner loads with (a draft runner may differ from the
+        # target's --load-format: _this_runners_load_format).
         if (
-            self.server_args.load_format == LoadFormat.REMOTE_INSTANCE
+            self.load_config.load_format == LoadFormat.REMOTE_INSTANCE
             and self.server_args.remote_instance_weight_loader_backend
             == RemoteInstanceWeightLoaderBackend.NCCL
         ):
@@ -2668,6 +2731,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         weights_tag = weights_region_tag_for(RunnerShape.of(self))
+        # 27B line (weg2xsn442 R7): the fp8 capability probe's first call creates
+        # the cuBLAS workspace on a card with native fp8 (the 5090). Answer it
+        # here, outside the weights region, so the workspace sits in the default
+        # pool and the loader's in-region check is a cache hit; a no-op for every
+        # checkpoint that is not an Fp8Config (fp8_utils.prewarm_fp8_native_gemm_probe).
+        from sglang.srt.layers.quantization.fp8_utils import (
+            prewarm_fp8_native_gemm_probe,
+        )
+
+        prewarm_fp8_native_gemm_probe(self.model_config.quantization)
         with weights_region(
             self.memory_saver_adapter,
             weights_tag,

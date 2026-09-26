@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -117,7 +117,12 @@ class NgramVerifyInput(SpecInput):
 
         return kv_indices, cum_kv_seq_len, self.qo_indptr, custom_mask
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        has_been_filtered: bool = True,
+        new_indices_cpu: Optional[List[int]] = None,
+    ):
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
         if self.new_seq_lens is not None:

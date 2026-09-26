@@ -1568,8 +1568,12 @@ def alloc_for_extend(
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
+        # #32575: build the empty-prefix sentinel on-device; torch.tensor([-1],
+        # device=cuda) is a pageable H2D copy, i.e. a host sync per call. Under
+        # DCP the allocator is paged even at page_size 1 (_alloc_page_size), so
+        # the 27B D group takes this branch.
         last_loc = [
-            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
+            (t[-1:] if len(t) > 0 else torch.full((1,), -1, device=batch.device))
             for t in prefix_tensors
         ]
         out_cache_loc = alloc_paged_token_slots_extend(

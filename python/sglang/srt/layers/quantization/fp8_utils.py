@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from collections import OrderedDict
@@ -239,6 +240,16 @@ def cutlass_fp8_supported(device_id: int) -> bool:
     return False
 
 
+def _outside_weg2_tag_pool(reason: str):
+    """A device probe's allocations OUT of the weg2 tag pool (27B line,
+    weg2xsn441); a no-op wherever no tag pool is open or weg2 is absent."""
+    try:
+        from sglang.srt.managers.weg2_memory_saver import outside_tag_pool
+    except Exception:  # noqa: BLE001 -- no weg2 in this build: nothing to leave
+        return contextlib.nullcontext(False)
+    return outside_tag_pool(reason=reason)
+
+
 @per_device_gate
 def fp8_native_gemm_available(device_id: int) -> bool:
     """Whether this device has a working native fp8 GEMM.
@@ -266,11 +277,25 @@ def fp8_native_gemm_available(device_id: int) -> bool:
     # process that spans two cards the answer differs between them (#343).
     device = torch.device("cuda", device_id)
     try:
-        a = torch.zeros((16, 32), dtype=torch.float8_e4m3fn, device=device)
-        # _scaled_mm wants the second operand column-major
-        b = torch.zeros((16, 32), dtype=torch.float8_e4m3fn, device=device).t()
-        scale = torch.ones((), dtype=torch.float32, device=device)
-        torch._scaled_mm(a, b, scale_a=scale, scale_b=scale, out_dtype=torch.float16)
+        # 27B line (weg2xsn441): the probe's tensors must not be born in a weg2
+        # weights tag pool. It runs from the loader's capability check
+        # (``quant_config.needs_device_kernel()``) INSIDE the base ``weights``
+        # region, and a private tag pool never hands a freed block back: the
+        # probe left one 2 MiB small-block segment under tag ``weights`` on
+        # every rank. Where that tag holds nothing else (P's middle stage, no
+        # embedding, no head) the segment is bytes the exchange plan has no
+        # descriptor for -- W106 at the first release, W29 on the whole group.
+        # Stepped out, the probe lands in the load's transient pool, handed
+        # back after load; outside a weg2 load this is a no-op.
+        with _outside_weg2_tag_pool("fp8-native-gemm-probe"):
+            a = torch.zeros((16, 32), dtype=torch.float8_e4m3fn, device=device)
+            # _scaled_mm wants the second operand column-major
+            b = torch.zeros((16, 32), dtype=torch.float8_e4m3fn, device=device).t()
+            scale = torch.ones((), dtype=torch.float32, device=device)
+            torch._scaled_mm(
+                a, b, scale_a=scale, scale_b=scale, out_dtype=torch.float16
+            )
+            del a, b, scale
         return True
     except Exception as e:  # noqa: BLE001 - any failure means "not available"
         logger.info(
@@ -279,6 +304,49 @@ def fp8_native_gemm_available(device_id: int) -> bool:
             e,
         )
         return False
+
+
+def prewarm_fp8_native_gemm_probe(quantization: Optional[str]) -> Optional[bool]:
+    """Ask the loader's fp8 capability question for the current device NOW, before
+    the weg2 weights region opens (27B line, weg2xsn442 R7); ``None`` = nothing to
+    ask for this checkpoint.
+
+    :func:`fp8_native_gemm_available` runs ``torch._scaled_mm``, and where the
+    device has a native fp8 GEMM (the RTX 5090) that first call creates the
+    cuBLAS/cuBLASLt workspace (8.125 + 1 MiB). Without this, its first call is the
+    loader's ``quant_config.needs_device_kernel()`` INSIDE the weights region,
+    where the probe steps out of the tag pool into the load's transient pool
+    (b434831067) -- and the workspace, alive for the whole process, then keeps that
+    pool: ``WEG2-TAG-POOL transient pool KEPT reason=after-load pool=load live=9.1
+    MiB`` on PP0 and TP0 in weg2xsn442, its cached segments reserved on the 5090
+    through every flip. Asked here, the workspace sits in the default pool like in
+    any process, and the in-region check is a cache hit that allocates nothing.
+
+    Asks EXACTLY what the loader would ask first, so it adds no probe the load
+    would not have run: ``Fp8Config.needs_device_kernel()`` is
+    ``not fp8_needs_dequant_fallback()``, which reaches the probe unless
+    SGLANG_FORCE_FP8_DEQUANT / SGLANG_DETERMINISTIC_FP8_GEMM answer first, and it
+    never asks for ``mxfp8``. Returns the value that check will then read.
+
+    Only for a checkpoint whose config is an ``Fp8Config``: its capability check
+    is the CUDA caller that opens the load. Every other checkpoint -- INT8
+    compressed-tensors, ModelOpt FP8/NVFP4, GGUF, unquantized -- keeps its load
+    order byte for byte. Bound, stated: a config that builds ``Fp8LinearMethod``
+    without being an ``Fp8Config`` (w4afp8, quark_int4fp8_moe, nvfp4_online,
+    compressed-tensors ``linear_fp8_config``) and a part loaded under another
+    ``torch.cuda.device`` still probe in the region, stepped out as before."""
+    if not quantization or quantization == "mxfp8" or not torch.cuda.is_available():
+        return None
+    try:
+        from sglang.srt.layers.quantization import get_quantization_config
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+        cls = get_quantization_config(quantization)
+    except Exception:  # noqa: BLE001 -- an unknown method is the loader's to refuse
+        return None
+    if not (isinstance(cls, type) and issubclass(cls, Fp8Config)):
+        return None
+    return not fp8_needs_dequant_fallback()
 
 
 @per_device_gate

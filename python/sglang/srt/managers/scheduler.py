@@ -228,6 +228,9 @@ from sglang.srt.managers import prefetch_ballot
 from sglang.srt.managers import tp_head_congruence
 from sglang.srt.managers import tp_match_floor
 from sglang.srt.managers import weg2_store_told
+from sglang.srt.managers import weg2_d_hostgap as _d_hostgap
+from sglang.srt.layers.quantization import gguf_path_census as _gguf_path_census
+from sglang.srt.weg2 import p_trim_end_anchor as _weg2_trim
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers import anchor_tails as _anchor_tails
 from sglang.srt.managers.pp_admission_congruence import (
@@ -1131,6 +1134,8 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        # upstream #36738: load-back H2D waits for the in-flight forward.
+        self._bind_hicache_load_fence()
         self._pool_phase_probe("tree_cache")
 
         # #847 (W33): the WRITER for the phase-matched host pools. HERE, AND
@@ -1735,14 +1740,12 @@ class Scheduler(
             moe_dp_rank=self.ps.moe_dp_rank,
         )
 
-        if self.server_args.speculative_draft_load_format is not None:
-            self.server_args.override(
-                "scheduler.draft_load_format",
-                load_format=self.server_args.speculative_draft_load_format,
-            )
-            logger.info(
-                f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
-            )
+        # --speculative-draft-load-format is applied by the DRAFT runner itself
+        # (ModelRunner._this_runners_load_format), on every draft build path.
+        # It used to be a process-wide server_args.override(load_format=...)
+        # here: on this speculative branch only (the draft-KV producer above
+        # never saw it), and it rewrote the TARGET's load_format for the rest
+        # of the process (27B line, GGUF target, 2026-09-25).
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
@@ -2408,6 +2411,13 @@ class Scheduler(
             and self.server_args.enable_mixed_chunk
         )
 
+        # --p-chunk-policy (weg2/p_chunk_policy.py, 25.09.): the P group's
+        # per-request chunk plan. None unless the launcher handed this rank
+        # SGLANG_P_CHUNK_POLICY=dynamic -- fixed/unset is byte-identical.
+        from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+        self._p_chunk_planner = _pcp.planner_from_env(os.environ, log=logger.info)
+
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
             self.server_args.enable_dynamic_chunking and self.ps.pp_size > 1
@@ -2787,6 +2797,8 @@ class Scheduler(
                 "kv-session-offload DECOUPLE: second forward stream "
                 "'spill_stream' leased for the concurrent spill lane (S4b)."
             )
+        # upstream #36738: re-bind now that the spill lane's stream exists.
+        self._bind_hicache_load_fence()
 
         if not self.enable_overlap:
             return
@@ -2804,6 +2816,41 @@ class Scheduler(
         # (the ring is an overlap-only asset); harmless when decoupling is off.
         self._spill_record_buf = [None] * 2
         self._spill_record_ct = 0
+
+    def _bind_hicache_load_fence(self) -> None:
+        """upstream #36738: fence HiCache load-back H2D behind the forward stream(s).
+
+        The fence names every stream this scheduler launches a forward on: the
+        device lane's ``forward_stream`` (overlap loop, and the PP loops via
+        ``forward_stream_ctx``) plus the concurrent spill lane's
+        ``spill_stream`` when SGLANG_KVSO_DECOUPLE leased one. Phase flip:
+        weg2 keeps ONE scheduler, ONE tp_worker/model_runner and ONE
+        tree_cache/cache_controller per process for its whole life
+        (``forward_stream`` is written only by the get_worker_info unpack at
+        init and the spill lane's try/finally swap), so the stream bound here
+        stays the valid one across every cutover; the cutover therefore needs
+        no re-bind. Idempotent -- called after tree_cache init and again from
+        init_overlap once the spill stream exists."""
+        if not getattr(self, "enable_hierarchical_cache", False):
+            return
+        cache_controller = getattr(
+            getattr(self, "tree_cache", None), "cache_controller", None
+        )
+        if cache_controller is None:
+            return
+        streams = tuple(
+            s
+            for s in (
+                getattr(self, "forward_stream", None),
+                getattr(self, "spill_stream", None),
+            )
+            if s is not None
+        )
+        if not streams:
+            return
+        cache_controller.load_fence_stream = (
+            streams[0] if len(streams) == 1 else streams
+        )
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
@@ -3566,6 +3613,35 @@ class Scheduler(
         # and takes the direct upstream path.
         self.pp_flip_counters = None
         self.pp_chain_receiver = None
+        # WEG2 VISION (user design 2026-09-24): PP0 of a transient P group
+        # encodes images in its OWN process, on its KV tail, before the
+        # admission (weg2/vision_rank_runner.py). False on every other boot
+        # and rank, and then nothing below changes.
+        self._weg2_vision_rank_stage = False
+        # WEG2 VISION (D side): a tower-less D with multimodal tokenization
+        # refuses an image inside its extent by name (W123) at the admission.
+        self._weg2_vision_d_guard = False
+        if os.environ.get("SGLANG_WEG2_GROUP", "").strip().upper() == "D":
+            from sglang.srt.weg2.vision_d_guard import d_guard_armed
+
+            self._weg2_vision_d_guard = d_guard_armed(self.model_config)
+            if self._weg2_vision_d_guard:
+                logger.info(
+                    "W102 Weg2VisionStage D-GUARD armed: this group tokenizes "
+                    "images (pad ids, mrope delta) and has no tower; an image "
+                    "position inside a request's extent is refused by name "
+                    "(W123) at the admission"
+                )
+        _vision_origin_aborts = None
+        if os.environ.get("SGLANG_WEG2_VISION", "").strip() == "transient":
+            from sglang.srt.weg2.vision_rank_runner import (
+                arm_rank_stage,
+                take_origin_aborts,
+            )
+
+            self._weg2_vision_rank_stage = arm_rank_stage(self)
+            if self._weg2_vision_rank_stage:
+                _vision_origin_aborts = lambda: take_origin_aborts(self)  # noqa: E731
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
@@ -3611,6 +3687,9 @@ class Scheduler(
             return_health_check_ipc=lambda ipc: self.return_health_check_ipcs.append(
                 ipc
             ),
+            # WEG2 VISION: PP0's named aborts of refused stages, injected at
+            # the origin so every rank drops the same rids in the same pass.
+            origin_extra_reqs_hook=_vision_origin_aborts,
         )
 
     def _health_check_gate(self) -> Tuple[bool, int, int]:
@@ -5652,10 +5731,19 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            # P-TRIM-END-ANCHOR (weg2/p_trim_end_anchor.py, group P, default
+            # off): a front leg-1 prompt of N tokens enters as N-1 -- its last
+            # regular chunk ends at N-1 and its finish anchor IS the N-1 anchor
+            # D claims, so the 1-token END-ANCHOR forward never runs. Unarmed:
+            # the Req gets recv_req.input_ids exactly as before.
+            _weg2_ids, _weg2_tail = recv_req.input_ids, None
+            if _weg2_trim.trim_armed():
+                _weg2_ids, _weg2_tail = _weg2_trim.split_ids(recv_req)
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
-                recv_req.input_ids,
+                _weg2_ids,
                 recv_req.sampling_params,
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
@@ -5693,6 +5781,8 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
+            if _weg2_tail is not None:
+                setattr(req, _weg2_trim.TRIM_ATTR, _weg2_tail)
             req.tokenizer = self.tokenizer
             # Fast lane (Variant C Stage 0): tag the request's lane so the
             # anti-starvation reserved-heavy-slots floor can distinguish fast
@@ -5769,7 +5859,9 @@ class Scheduler(
             return
 
         if self.spec_algorithm.is_dflash_family() or self._cross_schedule_mode:
-            error_msg = validate_dflash_request(req, self.enable_overlap)
+            error_msg = validate_dflash_request(
+                req, self.enable_overlap, self.spec_algorithm
+            )
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
@@ -11042,6 +11134,13 @@ class Scheduler(
         when profiling raises at init), so a None must fall back to the
         static size rather than be handed on as a chunk width.
         """
+        # --p-chunk-policy dynamic: the plan's width for the request this
+        # forward serves (0 = no request / not applicable -> the path below).
+        # getattr: harness stubs bind this method without the attribute.
+        if getattr(self, "_p_chunk_planner", None) is not None:
+            planned = self._p_chunk_policy_width()
+            if planned > 0:
+                return planned
         if not self.enable_dynamic_chunking:
             return self.chunked_prefill_size
         history_len = (
@@ -11052,6 +11151,49 @@ class Scheduler(
             return self.chunked_prefill_size
         self._log_dynamic_chunk_engagement(dynamic_size, history_len)
         return dynamic_size
+
+    def _p_chunk_policy_width(self) -> int:
+        """--p-chunk-policy dynamic: this forward's budget from the plan.
+
+        The request is the in-flight chunked request, else the head of the
+        waiting queue (already in the group's order: calc_priority and
+        _apply_uniform_head_order ran before this call). Its position is
+        ``len(prefix_indices)`` -- the same history the upstream predictor
+        reads (#656) -- and its end the full fill. On a PP group only PP0's
+        width is executed; downstream ranks run PP0's forwarded extents
+        (#791), so a downstream answer only sizes the local budget. Never
+        above the static --chunked-prefill-size, which under the dynamic
+        policy IS the plan's ceiling (the launcher prices the corridor at it).
+        Any failure returns 0: the caller then takes the static path.
+        """
+        from sglang.srt.weg2.p_chunk_policy import forward_budget
+
+        req = self.chunked_req
+        if req is None:
+            queue = getattr(self, "waiting_queue", None) or []
+            if not queue:
+                return 0
+            req = queue[0]
+        try:
+            fill = getattr(req, "full_untruncated_fill_ids", None)
+            end = len(fill) if fill is not None and len(fill) else (
+                len(req.origin_input_ids) + len(getattr(req, "output_ids", ()) or ())
+            )
+            prefix = getattr(req, "prefix_indices", None)
+            pos = 0 if prefix is None else len(prefix)
+            width = forward_budget(self._p_chunk_planner, req.rid, pos, end)
+        except Exception as exc:  # noqa: BLE001 - a plan must never stop a pass
+            n = getattr(self, "_p_chunk_policy_errors", 0) + 1
+            self._p_chunk_policy_errors = n
+            if n <= 4 or n % 256 == 0:
+                logger.warning(
+                    "P-CHUNK-POLICY plan failed (n=%d), static width this pass: %r",
+                    n,
+                    exc,
+                )
+            return 0
+        cap = int(self.chunked_prefill_size or 0)
+        return min(int(width), cap) if cap > 0 else int(width)
 
     def _log_dynamic_chunk_engagement(self, dynamic_size: int, history_len: int):
         """ENGAGEMENT PROOF for the dynamic-chunking arm, at INFO.
@@ -12085,6 +12227,72 @@ class Scheduler(
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
 
+    def _weg2_vision_d_covered(self, req: Req, head_inputs=None) -> Optional[int]:
+        """WEG2 VISION (D side): the request's covered prefix in tokens.
+
+        The GROUP's MIN-reduced match (device + host) where the group has one
+        -- the term W31's extent is priced on (``weg2_uncached_extent``), read
+        here without that method's instrument counters -- so the verdict is
+        rank-uniform with no new collective. None under ``tp_size > 1`` when
+        the group has no match for this rid: never a rank-local number.
+        """
+        gm = tp_head_congruence.group_match_for(
+            head_inputs, str(getattr(req, "rid", "") or "")
+        )
+        if gm is not None:
+            return min(int(gm), len(req.full_untruncated_fill_ids))
+        if int(getattr(getattr(self, "ps", None), "tp_size", 1) or 1) > 1:
+            return None
+        return len(req.prefix_indices) + int(getattr(req, "host_hit_length", 0) or 0)
+
+    def _weg2_vision_d_verdict(self, req: Req, head_inputs=None) -> str:
+        """WEG2 VISION (D side): admit / defer / refuse one request. A rid
+        the group has no covered length for is DEFERRED -- never admitted on
+        this rank's own number (an admitted image position is a dead group)
+        and never refused on it."""
+        from sglang.srt.weg2 import vision_d_guard as _vdg
+
+        if not _vdg.image_spans(req):
+            return _vdg.ADMIT
+        defers = getattr(self, "_weg2_vision_d_defers", None)
+        if defers is None:
+            defers = self._weg2_vision_d_defers = {}
+        return _vdg.bounded(
+            _vdg.verdict(req, self._weg2_vision_d_covered(req, head_inputs)),
+            str(req.rid),
+            defers,
+        )
+
+    def _weg2_answer_vision_d_refusals(self, refused: List[Req], head_inputs=None) -> None:
+        """Remove the W123-refused requests and answer them BY NAME -- the
+        W31 answer path (same queue mutation on every rank, the send a no-op
+        off rank 0), terminal: re-routing would bring the same prompt back."""
+        from sglang.srt.weg2 import vision_d_guard as _vdg
+
+        refused_ids = {id(r) for r in refused}
+        self.waiting_queue = [q for q in self.waiting_queue if id(q) not in refused_ids]
+        for req in refused:
+            covered = self._weg2_vision_d_covered(req, head_inputs)
+            message = _vdg.refusal_message(req, covered)
+            logger.error("%s rid=%s covered=%s", _vdg.W_NOT_IN_PREFIX, req.rid, covered)
+            _tc = getattr(self, "tree_cache", None)
+            if _tc is not None:
+                release_admission_acquired_mamba_slot(req, _tc, site="weg2_vision_d_refusal")
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+            elif self.enable_hierarchical_cache:
+                self.tree_cache.terminate_prefetch(req.rid)
+            abort_req = AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": message,
+                },
+                rid=req.rid,
+            )
+            req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         if getattr(self, "weg2_dormant", False) and self.waiting_queue:
             # fnFL2x36: a DORMANT group builds no prefill batch, whatever
@@ -12109,11 +12317,26 @@ class Scheduler(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
 
+        # WEG2 VISION (see init_request_receiver): pending images are encoded
+        # HERE, on PP0, before this admission (a dormant group stages
+        # nothing); what cannot be admitted in this pass is held out of it and
+        # put back below (followers adopt PP0's admissions, so they hold it too).
+        _vision_parked = ()
+        if getattr(self, "_weg2_vision_rank_stage", False):
+            from sglang.srt.weg2.vision_rank_runner import vision_rank_pass
+
+            _vision_parked = vision_rank_pass(self)
         try:
-            ret, running_batch = self._get_new_batch_prefill_raw(
-                prefill_delayer_single_pass=prefill_delayer_single_pass,
-                running_batch=running_batch,
-            )
+            try:
+                ret, running_batch = self._get_new_batch_prefill_raw(
+                    prefill_delayer_single_pass=prefill_delayer_single_pass,
+                    running_batch=running_batch,
+                )
+            finally:
+                if _vision_parked:
+                    from sglang.srt.weg2.vision_rank_runner import vision_unpark
+
+                    vision_unpark(self, _vision_parked)
         except PPScheduleRefused as refusal:
             # #791 CORE: THE LOUD REFUSAL. It may not narrow the batch, retry
             # with different numbers, or fall through to a decode batch --
@@ -13277,7 +13500,12 @@ class Scheduler(
                 self._add_request_to_queue(req)
 
         if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
-            self.tree_cache.check_hicache_events()
+            _dgap = _d_hostgap.meter()  # #DGAP (SGLANG_WEG2_D_HOSTGAP)
+            if _dgap is None:
+                self.tree_cache.check_hicache_events()
+            else:
+                with _dgap.span("hicache"):
+                    self.tree_cache.check_hicache_events()
             # #811: release anchor pins whose write-through ack just drained,
             # BEFORE this tick's admissions allocate -- so an acked-but-still
             # -pinned checkpoint can never crowd out an admission in the same
@@ -14134,6 +14362,8 @@ class Scheduler(
         # itself; they are removed and answered after the loop, where
         # mutating the list is safe. Empty on every boot with the flag off.
         _x_refused: List[Req] = []
+        # WEG2 VISION (D side): W123, collected and answered like W31.
+        _v_refused: List[Req] = []
 
         # #968 NAME WHAT THE FOLLOWER IS ALREADY HOLDING. A rank that parked a
         # chunked continuation after a #797 void has it in `self.chunked_req`
@@ -14624,6 +14854,17 @@ class Scheduler(
                 _note_skip("weg2_x_refused", req.rid)
                 _x_refused.append(req)
                 continue
+            # WEG2 VISION (D side): priced like W31 -- the GROUP's match, no
+            # new collective -- so the verdict is the same on every rank.
+            if getattr(self, "_weg2_vision_d_guard", False):
+                _vd = self._weg2_vision_d_verdict(req, _head_inputs)
+                if _vd == "defer":
+                    _note_skip("weg2_vision_defer", req.rid)
+                    continue
+                if _vd == "refuse":
+                    _note_skip("weg2_vision_refused", req.rid)
+                    _v_refused.append(req)
+                    continue
 
             # #791 PP ADMISSION UNIFORMITY. Every PP stage independently
             # re-derives its own admission verdict from its own local radix
@@ -15090,6 +15331,8 @@ class Scheduler(
         # request from that rank's queue with no client-visible signal.
         if _x_refused:
             self._weg2_answer_x_refusals(_x_refused, _head_inputs)
+        if _v_refused:
+            self._weg2_answer_vision_d_refusals(_v_refused, _head_inputs)
 
         # #1153: what this loop REACHED, recorded before any of the three
         # refusal raises below so the group-STOP line can name it (and once
@@ -16372,7 +16615,16 @@ class Scheduler(
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
-                self.future_map.resolve_seq_lens_cpu(batch)
+                # SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU (weg2_d_hostgap): the host
+                # half of the read is handed to the worker, which completes it
+                # at its first use of the exact lengths; unset = the old read.
+                _pending_lens = None
+                if _d_hostgap.defer_eligible(self, batch):
+                    _pending_lens = self.future_map.resolve_seq_lens_cpu(
+                        batch, defer=True
+                    )
+                else:
+                    self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 
@@ -16401,6 +16653,10 @@ class Scheduler(
                             if not batch.spec_algorithm.is_none()
                             else {}
                         )
+                        if _pending_lens is not None:
+                            fwd_kwargs["seq_lens_cpu_ready"] = partial(
+                                _pending_lens.complete, batch
+                            )
 
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
@@ -16452,6 +16708,22 @@ class Scheduler(
                                     )
                         else:
                             batch_result.future_indices = future_indices
+
+                if _pending_lens is not None:
+                    # The isolation restore put back the pre-forward snapshot,
+                    # taken while the mirror was still None: re-apply it (and
+                    # complete it, should the worker not have), so the batch
+                    # leaves run_batch with the mirror the old read left.
+                    _pending_lens.complete(batch)
+                _dgap = _d_hostgap.meter()
+                if _dgap is not None and batch.forward_mode.is_decode():
+                    _dgap.end_round(deferred=_pending_lens is not None)
+                # #GGUFPATH (SGLANG_GGUF_PATH_CENSUS, default off): the same
+                # decode round closes the dispatch census; host counters and a
+                # queued non-blocking snapshot only, never a wait.
+                _gpc = _gguf_path_census.census()
+                if _gpc is not None and batch.forward_mode.is_decode():
+                    _gpc.end_round(bs=batch.batch_size())
 
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None
@@ -19088,7 +19360,13 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            # WEG2 VISION: an origin-injected abort names its W-code; the
+            # tokenizer's own aborts carry no finish reason, so their echo is
+            # unchanged.
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(rid=req.rid, finished_reason=getattr(recv_req, "finished_reason", None)),
+                req,
+            )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)

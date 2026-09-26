@@ -229,7 +229,9 @@ class RecordKey:
     RESIDUE_AXES of its WEG2-FORM line, else its draft), ``line`` (the boot's
     commit is an ancestor of the commit this launcher runs -- the 27B
     line_identity 76e87ac3b2), ``power_limit`` (planner/power_limit.py scales
-    rates by the NVML limit; not a FILTER yet, Schritt 9).
+    rates by the NVML limit; not a FILTER yet, Schritt 9), ``d_capture_set``
+(27B RC1 f1c9a43964: a group-D dormant-residue sample counts only when D ran
+the same ``--max-running-requests``, the CUDA-graph set its sleep keeps).
 
     ``line_heads``: further line HEADS whose ancestors the ``line`` term also
     accepts, next to the tree this launcher runs -- an explicit allowlist of
@@ -240,7 +242,7 @@ class RecordKey:
     line_heads: Tuple[str, ...] = ()
 
 
-RECORD_KEY_FIELDS: Tuple[str, ...] = ("checkpoint", "form", "line", "power_limit")
+RECORD_KEY_FIELDS: Tuple[str, ...] = ("checkpoint", "form", "line", "power_limit", "d_capture_set")
 
 
 @dataclass(frozen=True)
@@ -412,7 +414,7 @@ PROFILES: Dict[str, ModelProfile] = {
         # line's last release head before the unification; its boots are its
         # ancestors, not ancestors of this tree. No recalibration forced.
         records=RecordKey(
-            fields=("checkpoint", "form", "line"),
+            fields=("checkpoint", "form", "line", "d_capture_set"),
             line_heads=("103712cdb2550f2fbe6a02696147de32690fbe14",),
         ),
         early_read_flags=True,
@@ -1302,6 +1304,28 @@ def is_line_ancestor(repo: str, commit: str, head: Optional[str] = None) -> bool
     return any(full.startswith(c) for full in idx.get(c[:7], ()))
 
 
+_D_MAX_RUNNING_RE = re.compile(r"--max-running-requests[= ]'?(\d+)")
+
+
+@lru_cache(maxsize=8192)
+def _front_log_d_max_running(path: str, _mtime: float) -> Optional[int]:
+    """Group D's ``--max-running-requests`` in a front log's ``group D argv:``
+    line (the launcher prints it once per boot); None = no such line."""
+    try:
+        with open(path, "rb") as f:
+            seen = 0
+            for raw in f:
+                seen += len(raw)
+                if seen > _SCAN_MAX_BYTES:
+                    return None
+                if b"group D argv:" in raw:
+                    m = _D_MAX_RUNNING_RE.search(raw.decode("utf-8", "replace"))
+                    return int(m.group(1)) if m else None
+    except OSError:
+        return None
+    return None
+
+
 def _boot_tag_tip(tag: str, evidence_dir: str) -> Optional[str]:
     """The commit of the newest front log of boot ``tag``; None = no such log."""
     try:
@@ -1332,6 +1356,29 @@ class CalibrationIdentity:
     @property
     def uses_line(self) -> bool:
         return "line" in self.fields and bool(self.repo)
+
+    @property
+    def uses_d_capture_set(self) -> bool:
+        return "d_capture_set" in self.fields
+
+    def d_max_running_requests(self, tag: str) -> Optional[int]:
+        """Group D's ``--max-running-requests`` of boot ``tag``, read off the
+        ``group D argv:`` line of its newest front log (the log
+        :meth:`accepts_sample` judges it by); None = not provable. 27B RC1
+        (f1c9a43964, line_identity) moved here with the identity (UNIFY S7)."""
+        tag = str(tag or "")
+        if not tag:
+            return None
+        try:
+            stamp = int(os.path.getmtime(self.evidence_dir))
+        except OSError:
+            return None
+        for path in _front_log_index(self.evidence_dir, stamp).get(tag, ()):
+            try:
+                return _front_log_d_max_running(path, os.path.getmtime(path))
+            except OSError:
+                return None
+        return None
 
     def describe(self) -> str:
         parts = [f"checkpoint {model_key(self.model)}"]

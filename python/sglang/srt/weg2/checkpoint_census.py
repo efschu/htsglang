@@ -208,11 +208,46 @@ def _tensor_bytes(meta: object) -> int:
     return int(nbytes)
 
 
+def _gguf_named_bytes(model_path: str) -> Optional[Tuple[Tuple[Tuple[str, int], ...], int]]:
+    """27B line G6: ``(((hf_name, bytes), ...), n_parts)`` of a GGUF FILE's
+    tensor directory in file order, or None for anything else (a directory is read
+    from its safetensors shards exactly as before).
+
+    The names are the loader's (``weg2.gguf_census``): the NEXTN block takes
+    the ``mtp.*`` names the safetensors checkpoint carries, so ``LAYER_RE``,
+    ``exclude_prefixes=MTP_TREE_PREFIXES`` and ``tensor_class`` see the same
+    trees on both formats; the bytes are the header's own per-tensor counts.
+    """
+    if not os.path.isfile(str(model_path)):
+        return None
+    from sglang.srt.weg2 import gguf_census as _gguf_census
+
+    if not _gguf_census.is_gguf_checkpoint(str(model_path)):
+        return None
+    try:
+        census = _gguf_census.gguf_tensor_census(str(model_path))
+    except BaseException as exc:  # noqa: BLE001 -- every shape is named
+        raise Weg2XchgWidestLayerUnreadable(
+            f"W14 Weg2XchgWidestLayerUnreadable: the GGUF tensor directory of "
+            f"{model_path} could not be read into the loader's names "
+            f"({type(exc).__name__}: {exc}); the widest layer is measured from "
+            f"the checkpoint's own header or the boot is refused"
+        ) from exc
+    return tuple((hf, int(nbytes)) for hf, _g, _t, _s, nbytes in census.rows), census.n_parts
+
+
 def layer_census_from_headers(model_dir: str, *,
                               exclude_prefixes: Sequence[str] = (),
                               exclude_segments: Sequence[str] = ()) -> LayerCensus:
-    """Bytes per layer, group-wide, from every shard's header. Never a default."""
+    """Bytes per layer, group-wide, from every shard's header -- or (27B line
+    G6) from a GGUF file's tensor directory. Never a default."""
     root = str(model_dir)
+    gguf = _gguf_named_bytes(root)
+    if gguf is not None:
+        named, n_parts = gguf
+        return _census_from_named_bytes(root, named, n_parts,
+                                        exclude_prefixes=exclude_prefixes,
+                                        exclude_segments=exclude_segments)
     try:
         names = sorted(f for f in os.listdir(root)
                        if f.endswith(".safetensors"))
@@ -228,56 +263,69 @@ def layer_census_from_headers(model_dir: str, *,
             f"headers; with no shard there is nothing to measure and the boot "
             f"is refused instead of sized against a default"
         )
-    per: Dict[int, int] = {}
-    classes: Dict[int, set] = {}
-    unlayered = 0
+    named: List[Tuple[str, int]] = []
     for fname in names:
         header = _read_header(os.path.join(root, fname))
         for name, meta in header.items():
             if name == METADATA_KEY:
                 continue
-            nbytes = _tensor_bytes(meta)
-            if nbytes <= 0:
-                continue
-            # #1374: A MODULE TREE MAY BE EXCLUDED BY NAME. `LAYER_RE` matches
-            # the substring `layers.<k>.`, and this checkpoint has TWO trees
-            # carrying that: `model.language_model.layers.<k>` and the MTP
-            # draft head's own `mtp.layers.<k>`. Measured on the shipped
-            # checkpoint: layer 0 is 366.2 MiB of model plus 355.1 MiB of mtp,
-            # and the 721.3 MiB sum is what made the tag bound overshoot boot
-            # weg2xsn30's own manifest by exactly that 355 MiB. Default ()
-            # keeps every existing caller -- including the widest-layer claim
-            # the #1332 guard grades -- byte-identical.
-            if exclude_prefixes and str(name).startswith(tuple(exclude_prefixes)):
-                continue
-            # #78 (21.09., Nutzer): EIN TEIL DES CHECKPOINTS WIRD NIE GELADEN.
-            # Die Per-Layer-Embeddings liegen unter `...layers.<k>.ple.<...>`
-            # und werden zur LAUFZEIT per mmap gelesen (#54: der PLE-Gather
-            # kostet 8,6 ms je Runde aus mmap-Shards) -- sie erreichen weder
-            # VRAM noch den Host-Store, also traegt sie auch kein Flip.
-            # GEMESSEN am Shipped-Checkpoint Qwen3.8-Flash-Next-INT4-Mixed:
-            #   gesamt                    163,20 GiB
-            #   davon PLE                  95,40 GiB  (58 %)
-            #   groesstes 3-Layer-Band mit PLE  99,21 GiB
-            #   groesstes 3-Layer-Band ohne PLE  3,81 GiB
-            # Der Bounce-Term dimensionierte also um FAKTOR 26 zu gross.
-            # ANDERS ALS `exclude_prefixes`: `ple` ist kein Baum-Praefix,
-            # sondern ein SEGMENT mitten im Namen -- derselbe Layer traegt
-            # geladene und nie geladene Tensoren nebeneinander.
-            if exclude_segments and any(str(seg) in str(name)
-                                        for seg in exclude_segments):
-                continue
-            m = LAYER_RE.search(str(name))
-            if m is None:
-                unlayered += nbytes
-                continue
-            idx = int(m.group(1))
-            per[idx] = per.get(idx, 0) + nbytes
-            classes.setdefault(idx, set()).add(tensor_class(name))
+            named.append((name, _tensor_bytes(meta)))
+    return _census_from_named_bytes(root, named, len(names),
+                                    exclude_prefixes=exclude_prefixes,
+                                    exclude_segments=exclude_segments)
+
+
+def _census_from_named_bytes(root: str, named: Sequence[Tuple[str, int]],
+                             files: int, *,
+                             exclude_prefixes: Sequence[str] = (),
+                             exclude_segments: Sequence[str] = ()) -> LayerCensus:
+    """The per-layer aggregation, over ``(name, bytes)`` pairs from either
+    format's header (safetensors shards or a GGUF tensor directory)."""
+    per: Dict[int, int] = {}
+    classes: Dict[int, set] = {}
+    unlayered = 0
+    for name, nbytes in named:
+        if nbytes <= 0:
+            continue
+        # #1374: A MODULE TREE MAY BE EXCLUDED BY NAME. `LAYER_RE` matches
+        # the substring `layers.<k>.`, and this checkpoint has TWO trees
+        # carrying that: `model.language_model.layers.<k>` and the MTP
+        # draft head's own `mtp.layers.<k>`. Measured on the shipped
+        # checkpoint: layer 0 is 366.2 MiB of model plus 355.1 MiB of mtp,
+        # and the 721.3 MiB sum is what made the tag bound overshoot boot
+        # weg2xsn30's own manifest by exactly that 355 MiB. Default ()
+        # keeps every existing caller -- including the widest-layer claim
+        # the #1332 guard grades -- byte-identical.
+        if exclude_prefixes and str(name).startswith(tuple(exclude_prefixes)):
+            continue
+        # #78 (21.09., Nutzer): EIN TEIL DES CHECKPOINTS WIRD NIE GELADEN.
+        # Die Per-Layer-Embeddings liegen unter `...layers.<k>.ple.<...>`
+        # und werden zur LAUFZEIT per mmap gelesen (#54: der PLE-Gather
+        # kostet 8,6 ms je Runde aus mmap-Shards) -- sie erreichen weder
+        # VRAM noch den Host-Store, also traegt sie auch kein Flip.
+        # GEMESSEN am Shipped-Checkpoint Qwen3.8-Flash-Next-INT4-Mixed:
+        #   gesamt                    163,20 GiB
+        #   davon PLE                  95,40 GiB  (58 %)
+        #   groesstes 3-Layer-Band mit PLE  99,21 GiB
+        #   groesstes 3-Layer-Band ohne PLE  3,81 GiB
+        # Der Bounce-Term dimensionierte also um FAKTOR 26 zu gross.
+        # ANDERS ALS `exclude_prefixes`: `ple` ist kein Baum-Praefix,
+        # sondern ein SEGMENT mitten im Namen -- derselbe Layer traegt
+        # geladene und nie geladene Tensoren nebeneinander.
+        if exclude_segments and any(str(seg) in str(name)
+                                    for seg in exclude_segments):
+            continue
+        m = LAYER_RE.search(str(name))
+        if m is None:
+            unlayered += nbytes
+            continue
+        idx = int(m.group(1))
+        per[idx] = per.get(idx, 0) + nbytes
+        classes.setdefault(idx, set()).add(tensor_class(name))
     if not per:
         raise Weg2XchgWidestLayerUnreadable(
             f"W14 Weg2XchgWidestLayerUnreadable: no layer-indexed tensor in "
-            f"any of the {len(names)} shard(s) under {root} (pattern "
+            f"any of the {files} shard(s) under {root} (pattern "
             f"{LAYER_RE.pattern!r}). A checkpoint whose layers cannot be "
             f"identified cannot be assembled a layer at a time, and reporting "
             f"n_layers=0 would divide by zero one call later in bounce_terms"
@@ -286,7 +334,7 @@ def layer_census_from_headers(model_dir: str, *,
     layer_classes = tuple((i, tuple(sorted(classes.get(i, ()))))
                           for i, _b in layer_bytes)
     return LayerCensus(layer_bytes=layer_bytes, layer_classes=layer_classes,
-                       unlayered_bytes=int(unlayered), files=len(names))
+                       unlayered_bytes=int(unlayered), files=int(files))
 
 
 def widest_layer(census: LayerCensus) -> Tuple[int, int, Tuple[str, ...]]:

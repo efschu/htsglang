@@ -3358,6 +3358,128 @@ def _cu_pointer_attr_int(fn, attribute: int, addr: int) -> Tuple[int, int]:
     return int(out.value), int(rc)
 
 
+#: ``cuPointerGetAttribute``'s answer for an address no context knows: the
+#: decisive "not mapped" reading (weg2rc5gg: ``rc=1 type=0 device=-1`` on every
+#: GGUF qweight after its chunk tag's resume).
+CU_ERROR_INVALID_VALUE = 1
+
+
+@dataclass(frozen=True)
+class CollectTargetCensus:
+    """F2 (boot weg2rc5gg, 2026-09-25): are this collect's OWN targets mapped?
+
+    WHAT IT GUARDS.  The first flip that carried GGUF weights died in a
+    SIGSEGV inside ``memcpy_async`` on the collect side (P PP1, lane p0,
+    ``weights_5``).  The GGUF qweights are allocated at load time in the BASE
+    tag, the plan files them under their layer's chunk tag by name
+    (``tag_of_parameter_name``), so the collect of ``weights_5`` wrote into
+    pages no resumed tag held.  ``cudaMemcpyAsync(cudaMemcpyDefault)`` takes
+    an address the driver does not know as pageable host memory and the CPU
+    copy faults -- no Python frame, no name, the whole group down.  The same
+    class killed weg2xsn61/62 (layer 0 norm), the D draft collect (the shared
+    embed, now ``_weg2_xchg_no_write``) and NF fnFL2x5 (4da5c56cc2).
+
+    WHY THE PLAN'S DESCRIPTORS AND NOT THE ``WEG2-RESUME-PTRATTR`` CENSUS.
+    That census walks ``_weg2_model_for_group``'s model by NAME -- on D the
+    DRAFT model -- so every RC4 boot (INT8, FP8, NVFP4) printed ``unmapped=160``
+    (the draft's ``layers.0.`` tensors, allocated under ``weights_draft``) and
+    ``unmapped=3`` (zero-byte ``fc.weight_g_idx``) on 150 of 750 D readings
+    while all its collects wrote correctly.  The collect's own targets are the
+    descriptors of THIS tag's slice, minus what the lane never writes:
+
+    * ``dst_ptr`` absent -- the lane already refuses that by name;
+    * zero bytes -- nothing is written;
+    * NO-WRITE -- ``(tag, name) in no_write or name in no_write``, the bar1
+      collect's own skip condition, so the census is never narrower than the
+      writer it guards (the draft embed IS the target's tensor on D and stays
+      paused while ``weights_draft`` is collected -- by design).
+
+    ONE READING PER ALLOCATION: descriptors are deduplicated on ``dst_ptr``
+    (a K-cut tensor is many descriptors on one destination), and the reading
+    is :func:`ptr_attrs` -- the one producer the PTRATTR row and the copy-out
+    probe already use.  Only the DECISIVE reading refuses: ``rc`` 1 (the
+    driver does not know the address) or ``rc`` 0 with type 0.  A probe that
+    cannot read (``-1``, a missing context, any other rc) is counted in
+    ``probe_failed`` and never refuses -- a diagnostic that cannot read must
+    not kill a wake.
+    """
+
+    tag: Optional[str]
+    targets: int
+    #: ``(tag, param_name, dst_ptr, nbytes, rc, mem_type)`` per unmapped target
+    unmapped: Tuple[Tuple[str, str, int, int, int, int], ...]
+    probe_failed: int
+    no_write: int
+
+    def line(self) -> str:
+        return (f"tag={self.tag} targets={self.targets} "
+                f"unmapped={len(self.unmapped)} probe_failed={self.probe_failed} "
+                f"no_write={self.no_write}")
+
+    def refusal(self, *, group: str, rank: int) -> str:
+        first = self.unmapped[0]
+        names = [u[1] for u in self.unmapped]
+        more = f" (+{len(names) - 8} more)" if len(names) > 8 else ""
+        return (
+            f"W4 Weg2WakeRefused: group={group} rank={rank} tag={self.tag}: "
+            f"{len(self.unmapped)} of {self.targets} collect target(s) of this "
+            f"tag are NOT MAPPED after resume({self.tag}) -- first {first[1]!r} "
+            f"({first[3]} B at {first[2]:#x}, cuPointerGetAttribute rc={first[4]} "
+            f"type={first[5]}); all: {names[:8]}{more}. The collect would write "
+            "into pages no resumed tag holds: cudaMemcpyAsync takes an address "
+            "the driver does not know as pageable host memory and the rank dies "
+            "in SIGSEGV without a name (boot weg2rc5gg, P PP1, weights_5). The "
+            "plan files a tensor under its NAME's chunk tag "
+            "(tag_of_parameter_name); its pages are wherever its allocation "
+            "scope put them -- a tensor allocated outside its layer's "
+            "weight_chunk_scope (e.g. at load time, in the base tag) breaks that "
+            "identity. Refusing before any byte moves; recovery is an operator "
+            "relaunch with the allocation scope fixed."
+        )
+
+
+def _decisive_unmapped(rc: int, mem_type: int) -> Optional[bool]:
+    """``True`` the driver does not know the address, ``False`` it does,
+    ``None`` no reading (the probe failed or answered something else)."""
+    if rc == 0:
+        return int(mem_type) == 0
+    if rc == CU_ERROR_INVALID_VALUE:
+        return True
+    return None
+
+
+def collect_target_census(descs, *, tag=None, no_write=None,
+                          probe=None) -> CollectTargetCensus:
+    """Read, per destination allocation, whether the driver maps this collect's
+    own targets NOW -- see :class:`CollectTargetCensus`."""
+    read = probe if probe is not None else ptr_attrs
+    nw = no_write or ()
+    seen = {}
+    skipped_nw = 0
+    for desc in descs:
+        dst = getattr(desc, "dst_ptr", None)
+        if dst is None or int(getattr(desc, "nbytes", 0) or 0) <= 0:
+            continue
+        dtag = str(getattr(desc, "tag", "") or "")
+        name = str(getattr(desc, "param_name", "?"))
+        if (dtag, name) in nw or name in nw:
+            skipped_nw += 1
+            continue
+        seen.setdefault(int(dst), (dtag, name, int(desc.nbytes)))
+    unmapped = []
+    failed = 0
+    for dst, (dtag, name, nbytes) in seen.items():
+        rc, mem_type, _dev = read(dst)
+        verdict = _decisive_unmapped(int(rc), int(mem_type))
+        if verdict is None:
+            failed += 1
+        elif verdict:
+            unmapped.append((dtag, name, dst, nbytes, int(rc), int(mem_type)))
+    return CollectTargetCensus(tag=tag, targets=len(seen),
+                               unmapped=tuple(unmapped), probe_failed=failed,
+                               no_write=skipped_nw)
+
+
 def _mmap_addr(mm: "_mmap.mmap") -> int:
     """The mmap's host virtual address, for ops.memcpy_async and
     ops.host_register. Same conversion the LayerBounce uses at :623-627:

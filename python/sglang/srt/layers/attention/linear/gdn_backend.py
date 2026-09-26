@@ -343,13 +343,8 @@ class GDNKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        # FlashInfer verify supports a linear MTP chain. Tree-shaped drafts
-        # carry parent indices and must use Triton even when decode/prefill use
-        # FlashInfer.
-        verify_kernel = (
-            self.tree_verify_kernel
-            if kwargs.get("retrieve_parent_token") is not None
-            else self.verify_kernel
+        verify_kernel = self._get_target_verify_kernel(
+            kwargs.get("retrieve_parent_token")
         )
         return verify_kernel.target_verify(
             A_log=A_log,
@@ -363,6 +358,26 @@ class GDNKernelDispatcher:
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             **kwargs,
+        )
+
+
+    def target_verify_supports_strided_qkv(
+        self, retrieve_parent_token: Optional[torch.Tensor]
+    ) -> bool:
+        """Upstream #33778: may the verify split stay torch.split views?"""
+        verify_kernel = self._get_target_verify_kernel(retrieve_parent_token)
+        return (
+            getattr(verify_kernel, "supports_strided_target_verify_qkv", False) is True
+        )
+
+    def _get_target_verify_kernel(self, retrieve_parent_token: Optional[torch.Tensor]):
+        # FlashInfer verify supports a linear MTP chain. Tree-shaped drafts
+        # carry parent indices and must use Triton even when decode/prefill use
+        # FlashInfer.
+        return (
+            self.tree_verify_kernel
+            if retrieve_parent_token is not None
+            else self.verify_kernel
         )
 
 
@@ -736,12 +751,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        # NF line (H64): this line carries no #33778 port, so the target verify
-        # takes the same q/k/v preparation as the recurrent route -- the fused
-        # dense split on CUDA, torch.split views elsewhere. The ring route
-        # (_replayssm_target_verify) flattens both layouts ([1, T, H, D] dense
-        # or strided views) by numel, so it needs no split of its own here.
-        if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        # Upstream #33778: target verify hands the verify kernel strided
+        # torch.split views of the post-conv mixed_qkv when that kernel honours
+        # token strides (Triton), instead of materializing q/k/v copies every
+        # layer every verify step. Prefill keeps the fused split (FLA chunk
+        # kernels want dense [1, T, H, D]). UNIFY S7: the NF ReplaySSM ring route
+        # (_replayssm_target_verify) flattens dense or strided q/k/v by numel.
+        use_strided_verify_qkv = (
+            is_target_verify
+            and self.kernel_dispatcher.target_verify_supports_strided_qkv(
+                retrieve_parent_token
+            )
+        )
+        if (
+            (is_cuda() or is_hip())
+            and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
+            and not use_strided_verify_qkv
+        ):
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,

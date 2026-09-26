@@ -17,6 +17,7 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.weg2_d_hostgap import meter as _d_hostgap_meter
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_MATCHED_TOKEN,
@@ -865,7 +866,12 @@ class SchedulerBatchResultProcessor:
             # fnFL2 H49: the host blocked on the round's device result
             # (result_wait_ms of DECODE-HOST-PERIOD); timing only.
             _h49_t0 = time.perf_counter()
-            result.copy_done.synchronize()
+            _dgap = _d_hostgap_meter()  # #DGAP (SGLANG_WEG2_D_HOSTGAP)
+            if _dgap is None:
+                result.copy_done.synchronize()
+            else:
+                with _dgap.span("copy_done_wait"):
+                    result.copy_done.synchronize()
             note_result_wait((time.perf_counter() - _h49_t0) * 1000.0)
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()

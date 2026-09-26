@@ -1032,15 +1032,39 @@ def resolve_margin(
 
 
 def watermark_provenance(margin: Optional[Margin] = None,
-                         watermark_gib: Optional[float] = None) -> str:
-    """`WEG2-HOST WATERMARK=<v> source=<events> margin=<v> (terms)`."""
+                         watermark_gib: Optional[float] = None, *,
+                         refuse_unreadable: bool = False) -> str:
+    """`WEG2-HOST WATERMARK=<v> source=<events> margin=<v> (terms)`.
+
+    RC7 (Docker host acceptance 2026-09-25 07:21Z): with ``-v /sys:/sys`` the
+    container read the HOST's root cgroup, which has ``memory.stat`` but no
+    ``memory.current``; ``read_cgroup_pressure`` then took its sum FALLBACK
+    (``nonreclaim_gib`` set, ``current_gib`` None) and this line died formatting
+    ``None:.2f`` -- a TypeError where the ledger owed a named refusal. A missing
+    ``memory.current`` is never formatted: the ledger (``choose``,
+    ``refuse_unreadable=True``) REFUSES by name -- its currency is that file --
+    and every other caller (the front's periodic line) prints that it is
+    unreadable.
+    """
     m = margin if margin is not None else resolve_margin()
     w = watermark_gib if watermark_gib is not None else OBSERVED_REAP_NONRECLAIM_BYTES / GIB
     events = ", ".join(f"{k} {v:.2f}" for k, v in sorted(REAP_SAMPLES_GIB.items()))
     excl = ", ".join(f"{k} {v:.2f} EXCLUDED ({why})"
                      for k, (v, why) in sorted(REAP_SAMPLE_EXCLUDED.items()))
     live = read_cgroup_pressure()
-    if live.get("nonreclaim_gib") is not None:
+    if live.get("current_gib") is None:
+        if refuse_unreadable:
+            raise Weg2HostLedgerRefused(
+                "W20 Weg2HostLedgerRefused: memory.current is unreadable under "
+                "/sys/fs/cgroup -- the ledger prices in that file's currency (the "
+                "reaper acts on it) and refuses to price without it rather than "
+                f"guess from memory.stat [{live.get('source')}]. In a container, "
+                "mount the process's own cgroup (not the host's /sys) or run "
+                "where /sys/fs/cgroup/memory.current exists."
+            )
+        cur = (f" LIVE memory.current unreadable [{live.get('source')}] -- no "
+               f"live reading formatted")
+    elif live.get("nonreclaim_gib") is not None and live.get("file_reclaimable_gib") is not None:
         cur = (
             f" LIVE nonreclaim={live['nonreclaim_gib']:.2f} "
             f"raw_current={live['current_gib']:.2f} "
@@ -3207,6 +3231,175 @@ def flip_ratchet_record(
     }
 
 
+def _config_path(model_path: str) -> str:
+    """The ``config.json`` describing ``model_path`` by the server's own rule
+    (``server_args.declared_config_path_for``: a GGUF file's config is its
+    sibling); the plain join when nothing is found, so the caller's open()
+    raises exactly what it raised before (27B line G2)."""
+    from sglang.srt.server_args import declared_config_path_for
+
+    return declared_config_path_for(model_path) or os.path.join(
+        model_path, "config.json"
+    )
+
+
+def _is_gguf_file(model_path: str) -> bool:
+    """The server's own GGUF predicate (``check_gguf_file``), for a path that
+    names a file; a directory is never one (and never imports anything)."""
+    if not model_path or not os.path.isfile(model_path):
+        return False
+    from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+
+    return bool(check_gguf_file(model_path))
+
+
+@dataclass(frozen=True)
+class GgufTensorRow:
+    """One tensor of a GGUF split set, as its header states it (27B line G6):
+    no byte of tensor data is read. ``n_bytes`` is gguf-py's own count for the
+    tensor's ggml type (block size x type size for a quantized one), i.e. the
+    exact on-disk size of a mixed-quant tensor -- never dtype x shape."""
+
+    name: str
+    ggml_type: str  # GGMLQuantizationType name, e.g. "IQ4_XS", "Q8_0", "F32"
+    shape: Tuple[int, ...]  # gguf-py order (ne0 first)
+    n_bytes: int
+
+
+@dataclass(frozen=True)
+class GgufHeaderFacts:
+    """What the launch path needs from a GGUF checkpoint's header (27B line G2),
+    read ONCE per file per process: gguf-py parses every metadata field when it
+    opens a file -- measured 8.5 s for Qwen3.8-27B-UD-IQ4_XS.gguf (its 248,320
+    tokenizer strings), twice with the loader's split resolution -- and a launch
+    asks for the depth, the arch and the digest (five sites).
+
+    G6: the same single read also keeps every tensor's row (``tensors``), so the
+    weight readers -- P cut, ring stage weights, layer census -- price a GGUF
+    from its own header without opening it a second time."""
+
+    arch: str  # general.architecture of the metadata part, "" when absent
+    block_count: Optional[int]
+    nextn_predict_layers: Optional[int]
+    tensor_digest: str  # sha256 over the sorted name:ggml_type:shape rows
+    n_tensors: int
+    n_parts: int
+    #: every tensor of the split set in part order (G6); empty on a facts object
+    #: built by hand
+    tensors: Tuple[GgufTensorRow, ...] = ()
+
+    @property
+    def backbone_depth(self) -> Optional[int]:
+        """``block_count`` minus the NEXTN/MTP draft blocks it counts -- the
+        depth ``gguf_registry.reconcile_sibling_config`` compares and, on a
+        depth-only difference, loads."""
+        if self.block_count is None:
+            return None
+        return self.block_count - (self.nextn_predict_layers or 0)
+
+
+#: (realpath, size, mtime_ns) of the named file -> its facts. A split set is
+#: keyed by the part it was named by (bound: a later part replaced under a
+#: running launcher is not seen -- the loader's own resolution cache has the
+#: same one).
+_GGUF_HEADER_FACTS: Dict[Tuple[str, int, int], GgufHeaderFacts] = {}
+
+
+def _gguf_int(reader, key: str) -> Optional[int]:
+    field = reader.fields.get(key)
+    if field is None:
+        return None
+    try:
+        return int(field.contents())
+    except (TypeError, ValueError):
+        return None
+
+
+def gguf_header_facts(gguf_file: str) -> GgufHeaderFacts:
+    """The :class:`GgufHeaderFacts` of ``gguf_file``'s whole split set (the
+    loader's own ``resolve_gguf_shard_paths`` / ``gguf_metadata_path``). Header
+    only -- no tensor byte is read."""
+    st = os.stat(gguf_file)
+    key = (os.path.realpath(gguf_file), int(st.st_size), int(st.st_mtime_ns))
+    hit = _GGUF_HEADER_FACTS.get(key)
+    if hit is not None:
+        return hit
+    import gguf
+
+    from sglang.srt.model_loader.gguf_shards import (
+        gguf_metadata_path,
+        resolve_gguf_shard_paths,
+    )
+
+    parts = resolve_gguf_shard_paths(gguf_file)
+    meta = os.path.realpath(gguf_metadata_path(gguf_file))
+    arch, block_count, nextn, rows, seen_meta = "", None, None, [], False
+    tensors: List[GgufTensorRow] = []
+    for part in parts:
+        reader = gguf.GGUFReader(part, "r")
+        if os.path.realpath(part) == meta:
+            seen_meta = True
+            field = reader.fields.get("general.architecture")
+            arch = str(field.contents()) if field is not None else ""
+            if arch:
+                block_count = _gguf_int(reader, f"{arch}.block_count")
+                nextn = _gguf_int(reader, f"{arch}.nextn_predict_layers")
+        for t in reader.tensors:
+            row = GgufTensorRow(
+                name=str(t.name),
+                ggml_type=str(getattr(t.tensor_type, "name", t.tensor_type)),
+                shape=tuple(int(d) for d in t.shape),
+                n_bytes=int(t.n_bytes),
+            )
+            tensors.append(row)
+            rows.append(
+                "%s:%s:%s" % (row.name, row.ggml_type, "x".join(str(d) for d in row.shape))
+            )
+    if not seen_meta:
+        raise RuntimeError(
+            f"GGUF {gguf_file}: its metadata part {meta} is not in its own split "
+            f"set {parts}"
+        )
+    rows.sort()
+    facts = GgufHeaderFacts(
+        arch=arch,
+        block_count=block_count,
+        nextn_predict_layers=nextn,
+        tensor_digest=hashlib.sha256("\n".join(rows).encode()).hexdigest(),
+        n_tensors=len(rows),
+        n_parts=len(parts),
+        tensors=tuple(tensors),
+    )
+    _GGUF_HEADER_FACTS[key] = facts
+    return facts
+
+
+def _gguf_checkpoint_digest(model_path: str) -> Tuple[Optional[str], str]:
+    try:
+        with open(_config_path(model_path)) as f:
+            cfg = json.load(f)
+        tc = cfg.get("text_config", cfg)
+        c = hashlib.sha256(
+            json.dumps(tc, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        facts = gguf_header_facts(model_path)
+        g, n_tensors, n_parts = facts.tensor_digest, facts.n_tensors, facts.n_parts
+    except Exception as e:  # noqa: BLE001 -- gguf reader errors are not OSError
+        return None, (
+            f"checkpoint digest unavailable for {model_path}: {e!r}. A GGUF "
+            f"content digest needs the sibling config.json and a readable GGUF "
+            f"tensor directory; without them this boot has no stable model "
+            f"identity and every recorded figure must be treated as another "
+            f"model's"
+        )
+    return hashlib.sha256((c + g).encode()).hexdigest(), (
+        f"gguf content digest over the sibling config.text_config + the sorted "
+        f"(name, ggml type, shape) of {n_tensors} tensors in {n_parts} part(s) "
+        f"(config {c[:12]}..., tensors {g[:12]}...) -- snapshot-independent; "
+        f"types included because quantizations of one model share every name"
+    )
+
+
 def checkpoint_digest(model_path: str) -> Tuple[Optional[str], str]:
     """#1362 [22-fix]: the model's CONTENT identity, or ``(None, why)``.
 
@@ -3231,9 +3424,18 @@ def checkpoint_digest(model_path: str) -> Tuple[Optional[str], str]:
     ``89dcd9c4195338...``; the launcher could not have found the file at all.
     The path form stays as the launch-path fallback for a checkpoint whose
     config or index cannot be read, and says which one it is wherever printed.
+
+    A GGUF FILE (27B line G2) has no index: its config is the sibling
+    ``config.json`` (the server's ``declared_config_path_for``) and its tensor
+    part is :attr:`GgufHeaderFacts.tensor_digest` -- names WITH their ggml types
+    and shapes, because two quantizations of one model (UD-IQ4_XS, UD-Q8_K_XL)
+    share every name and every config byte, and a names-only digest would hand
+    one the other's calibration. A directory digests exactly as before.
     """
+    if _is_gguf_file(model_path):
+        return _gguf_checkpoint_digest(model_path)
     try:
-        with open(os.path.join(model_path, "config.json")) as f:
+        with open(_config_path(model_path)) as f:
             cfg = json.load(f)
         tc = cfg.get("text_config", cfg)
         c = hashlib.sha256(
@@ -3268,7 +3470,7 @@ def checkpoint_layers(model_path: str) -> Optional[int]:
     pre-#1362 behaviour rather than refusing on a number it does not have.
     """
     try:
-        with open(os.path.join(model_path, "config.json")) as f:
+        with open(_config_path(model_path)) as f:
             cfg = json.load(f)
     except (OSError, ValueError):
         return None
@@ -4510,6 +4712,7 @@ def dormant_image_sample(
     model_digest_: str = "",
     vram_residue_mib: Optional[Dict[str, int]] = None,
     vram_residue_form: str = "",
+    vram_residue_capture_bs: Optional[int] = None,
 ) -> Dict[str, object]:
     """One group's dormant image, measured at its FIRST sleep.  Pure but for /proc.
 
@@ -4727,6 +4930,14 @@ def dormant_image_sample(
         # measured none.
         "vram_residue_mib": {str(k): int(v) for k, v in (vram_residue_mib or {}).items()},
         "vram_residue_form": str(vram_residue_form or ""),
+        # RC1 (24.09.): the residue is a function of the group's CAPTURE SET
+        # too -- group D's --max-running-requests sizes the CUDA graphs that
+        # stay resident through its sleep (xsn439 at 32: 3206/2742/2740 MiB,
+        # at 6: 2096/1512/1512) -- so a D sample names it, and the launcher
+        # prices only a sample of its own capture set
+        # (launcher.d_residue_record_accept). Absent when not given.
+        **({"vram_residue_capture_bs": int(vram_residue_capture_bs)}
+           if vram_residue_capture_bs is not None else {}),
     }
 
 
@@ -5475,7 +5686,7 @@ def choose(
             f"if it were measured (got prior_cushion_min_gib={prior_cushion_min_gib!r} "
             f"prior_bounce_gib={prior_bounce_gib!r})."
         )
-    lines.append(watermark_provenance(margin, watermark_gib))
+    lines.append(watermark_provenance(margin, watermark_gib, refuse_unreadable=True))
     chosen: Optional[Arm] = None
     peak_bound_any = False
     # #1236: the STORE TERM IS GONE FROM THIS LOOP.  Train fix 3 sized it here

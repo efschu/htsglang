@@ -291,9 +291,32 @@ class Envs:
     # ranks diverge. Comma separated presets ("all", "rng", "init", "off"), or
     # SpecTpSyncSite slugs and numbers, each negatable with a leading "-".
     SGLANG_SPEC_TP_SYNC = EnvStr("all")
+    # #1485 divergence instrument in SpecTpSync.sync: how many broadcasts per
+    # rank compare the rank-local value against rank 0's (each compare is a
+    # blocking device read). -1 = never retire (the pre-#31468 behaviour on the
+    # receiving ranks), 0 = off. The broadcast source never compares.
+    SGLANG_SPEC_TP_DIVERGE_CHECKS = EnvInt(64)
     # A/B: keep the DFLASH draft sampler (greedy head or DFlash2 selector) eager,
     # not folded into the draft cuda graph.
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # DFLASH window pool (SGLANG_DFLASH_WINDOW_POOL=1): run the draft-slot
+    # mapper and the per-round window rebuild without host reads, so the host
+    # is not held behind the verify (dflash_solo_pool sync-free mode). Off =
+    # the legacy mapper, byte-identical.
+    SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE = EnvBool(False)
+    # DFLASH decode round, stage 2 of the host-sync removal: plan the draft
+    # and the uneven-DCP target verify with HOST-known FlashInfer metadata so
+    # the host never waits for the draft forward (owner.py compact[owned] /
+    # repeat_interleave, prefill.py plan .to("cpu"), flashinfer_backend
+    # _host_sum_or_device). The verify's owned-slot index is built BEFORE the
+    # draft in stream order and read back through an event that fires ahead
+    # of the draft. Off = the old planning path, byte-identical.
+    SGLANG_DFLASH_PLAN_SYNC_FREE = EnvBool(False)
+    # [vram-peak] high-water check (model_runner, every forward): read the
+    # allocator peak straight from torch's nested stats dict instead of the
+    # flattened memory_stats() -- the same number without the Python flatten
+    # (~0.7 ms per DFLASH round on D). Off = torch.cuda.max_memory_allocated().
+    SGLANG_VRAM_PEAK_FAST_READ = EnvBool(False)
 
     # Downgrade the draft-model unloaded-parameter check (#290/#318) from a
     # hard error to a log line. An unloaded drafter proposes noise, so this is
@@ -1167,6 +1190,12 @@ class Envs:
     # boundary of the full-KV match (else recompute from 0) instead of the
     # deepest surviving on-grid checkpoint.
     SGLANG_MAMBA_CKPT_STRICT_RESUME = EnvBool(False)
+    # Upstream #31648 (opt-in here): on a unified-radix prefix hit refresh only
+    # the CONSUMED node's mamba state in the mamba LRU (not the whole matched
+    # chain), and leave the insert walk out of it. Changes which mamba states
+    # the tree tombstones first under pool pressure, so it stays off until an
+    # A/B boot has priced it against the fork's anchor/retention policy.
+    SGLANG_MAMBA_LRU_REFRESH_USED_ONLY = EnvBool(False)
     # Per-request mamba checkpoint diagnostics: log match length, resume
     # length, checkpoint node/slot and cache-insert positions so a
     # nondeterministic resume (or a checkpoint at a wrong position) can be
@@ -1890,6 +1919,10 @@ class Envs:
     # a Form A role plan is installed; False restores the H97 votes, byte-
     # identical to 138d9df01c.
     SGLANG_WEG2_ENABLE_FORM_A_TP0_FOLLOW = EnvBool(True)
+    # #31468 metal check: run the first N DFLASH decode rounds under torch's
+    # sync-debug "warn" mode; logs DFLASH-SYNC-ROUND (count per round) and each
+    # implicit host-sync call site once (DFLASH-SYNC-SITE). 0 = off.
+    SGLANG_DEBUG_DFLASH_SYNC_TRACE = EnvInt(0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
@@ -2029,6 +2062,13 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    # --fp4-gemm-backend native-mixed (Backlog #38): the kernel of an sm_8x rank.
+    # "w4a8" (default, user order 25.09.): the registered W4A8 INT8 kernel on the
+    # native bytes (N4D decode GEMV M<=48, N4A GEMM above; main model and draft).
+    # "marlin" (opt-in): Marlin W4A16 on the SHARED native layout, content
+    # permuted in place at every flip (nvfp4_marlin_inplace.py).
+    SGLANG_FP4_NATIVE_MIXED_SM8X = EnvStr("w4a8")
+    SGLANG_FP4_NATIVE_MIXED_SM12X = EnvStr("flashinfer_cutlass")
     # Opt-in BIT-DETERMINISM for fp8 linears on sm80..sm88 (#192, from #190).
     #
     # WHAT IS BROKEN. On sm80..88 an fp8 checkpoint has exactly one GEMM
@@ -3118,6 +3158,14 @@ class Envs:
     # bytes, so the streamed bytes are identical either way. Set to False to
     # restore the pre-#391 accumulation.
     SGLANG_GGUF_STREAM_DROP_CACHE = EnvBool(True)
+    # numpy madvise(MADV_HUGEPAGE)s every array >= 4 MiB. Under the host's THP
+    # defrag=madvise each first-touch fault of such an array compacts memory
+    # synchronously; behind group P's pinned arena that cost group D's GGUF
+    # load 670 s of kernel time per rank (weg2rc7gg, 2026-09-25). False
+    # (default): the hint is off for the GGUF weight stream and numpy's own
+    # setting is restored afterwards (model_loader/gguf_numpy_hugepage.py).
+    # True: numpy keeps its setting during the load (pre-fix behaviour).
+    SGLANG_GGUF_NUMPY_HUGEPAGE = EnvBool(False)
     # Synchronous cgroup reclaim during the GGUF stream, in GiB of
     # memory.current. 0 (default) = off, behaviour byte-identical to before.
     # The dropper only releases page cache BEHIND the consumer while the

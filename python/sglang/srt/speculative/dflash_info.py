@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 
@@ -43,6 +43,19 @@ class DFlashVerifyInput(SpecInput):
     num_tokens_per_req: int = -1
 
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+
+    # upstream #30096: stamped by spec_utils.generate_token_bitmask during a
+    # grammar-constrained verify, read back to apply the mask.
+    grammar: Optional[Any] = None
+
+    # SGLANG_DFLASH_PLAN_SYNC_FREE (layers/dcp/verify_preplan.py). On the
+    # target VERIFY input: the uneven-DCP owned-slot index the worker built
+    # before the draft forward (DcpVerifyPrebuilt), consumed by the FlashInfer
+    # verify plan. On the DRAFT block input: True only during a draft forward
+    # whose host lengths equal the device lengths, letting the draft plan
+    # schedule from them. Both stay at their defaults with the switch off.
+    dcp_verify_prebuilt: Optional[Any] = None
+    host_lens_exact: bool = False
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)

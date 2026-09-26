@@ -288,5 +288,340 @@ class TestCapResolution(CustomTestCase):
             self.assertIsNone(resolve_dflash_solo_pool_cap(args)[0])
 
 
+# ---------------------------------------------------------------------------
+# Sync-free mode (SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE, window pool, default off)
+# ---------------------------------------------------------------------------
+
+
+def _free_count(m):
+    return int(m._counters[0]) if m.sync_free else m._free_count
+
+
+def _state(m, with_holes=True):
+    fc = _free_count(m)
+    st = [
+        m.map.tolist(),
+        m._slot_global.tolist(),
+        m._slot_epoch.tolist(),
+        fc,
+        m._free[:fc].tolist(),
+        m.reclaim_events,
+        m.reclaimed_slots_total,
+    ]
+    if with_holes:
+        st.append(m.holes_read_total)
+    return st
+
+
+class TestSyncFreeMapperEquivalence(CustomTestCase):
+    """The sync-free mapper keeps the LEGACY mapper's state bit for bit.
+
+    Random op sequences (writes with and without a valid mask, 1-D and 2-D,
+    reads with holes, frees with duplicates and out-of-range ids, round
+    bumps, clears, pools small enough to reclaim and to exhaust) run on a
+    legacy and a sync-free mapper side by side; after EVERY op the returned
+    slots, the forward map, the reverse map, the epochs, the free count and
+    the live free stack must be equal. Mode "off" additionally starves the
+    host of snapshots, so the free-count bound only ever shrinks and the
+    exact fallback carries every write it cannot prove safe.
+    """
+
+    def _run(self, seed, num_global, num_draft, steps, starve):
+        g = torch.Generator().manual_seed(seed)
+        legacy = DraftKVSlotMapper(num_global, num_draft, 64, device="cpu")
+        fast = DraftKVSlotMapper(num_global, num_draft, 64, device="cpu", sync_free=True)
+        self.assertTrue(fast.sync_free)
+        self.assertFalse(legacy.sync_free)
+        if starve:
+            fast._stream_mode = "off"
+
+        def rnd(n, lo, hi):
+            return torch.randint(lo, hi, (n,), generator=g)
+
+        for step in range(steps):
+            op = int(rnd(1, 0, 100))
+            if op < 40:
+                k = int(rnd(1, 1, 13))
+                locs = torch.randperm(num_global + 1, generator=g)[:k].to(torch.int64)
+                valid = None
+                if int(rnd(1, 0, 2)):
+                    valid = rnd(k, 0, 2).to(torch.bool)
+                if k % 2 == 0 and int(rnd(1, 0, 2)):
+                    locs = locs.view(2, k // 2)
+                    valid = None if valid is None else valid.view(2, k // 2)
+                outs = []
+                for m in (legacy, fast):
+                    try:
+                        outs.append(m.translate_write(locs.clone(), valid=valid))
+                    except RuntimeError as e:
+                        outs.append(("raise", "exhausted" in str(e)))
+                if isinstance(outs[0], tuple) or isinstance(outs[1], tuple):
+                    self.assertEqual(outs[0], outs[1], f"seed {seed} step {step}")
+                else:
+                    self.assertEqual(outs[0].tolist(), outs[1].tolist())
+            elif op < 70:
+                k = int(rnd(1, 1, 17))
+                locs = rnd(k, 0, num_global + 1)
+                a = legacy.translate_read(locs.clone())
+                b = fast.translate_read(locs.clone())
+                self.assertEqual(a.tolist(), b.tolist())
+            elif op < 85:
+                k = int(rnd(1, 1, 9))
+                ids = rnd(k, -3, num_global + 6)
+                if k > 2:
+                    ids[1] = ids[0]  # a duplicate
+                legacy.on_global_free(ids.clone())
+                fast.on_global_free(ids.clone())
+            elif op < 97:
+                legacy.begin_round()
+                fast.begin_round()
+            else:
+                legacy.on_global_clear()
+                fast.on_global_clear()
+            self.assertEqual(
+                _state(legacy, with_holes=False),
+                _state(fast, with_holes=False),
+                f"seed {seed} step {step} op {op}",
+            )
+        ls, fs = legacy.stats(), fast.stats()
+        self.assertEqual(ls, fs)
+        self.assertEqual(legacy.holes_read_total, fast.holes_read_total)
+
+    def test_roomy_pool(self):
+        for seed in range(6):
+            self._run(seed, num_global=300, num_draft=200, steps=250, starve=False)
+
+    def test_tight_pool_reclaims_and_exhausts_alike(self):
+        for seed in range(6):
+            self._run(seed, num_global=120, num_draft=12, steps=250, starve=False)
+
+    def test_starved_bound_falls_back_exactly(self):
+        for seed in range(6):
+            self._run(seed, num_global=200, num_draft=40, steps=250, starve=True)
+
+    def test_clear_rebuilds_from_host_constants(self):
+        # A phase release can hand the mapper's device bytes back arbitrary;
+        # the reset must rebuild from host constants, as the legacy one does.
+        fresh = DraftKVSlotMapper(500, 40, 64, device="cpu")
+        m = DraftKVSlotMapper(500, 40, 64, device="cpu", sync_free=True)
+        m.translate_write(_t([3, 4, 5]))
+        m._free.fill_(-123456)
+        m._counters.fill_(-7)
+        m.map.fill_(999)
+        m._slot_global.fill_(-9)
+        m._slot_epoch.fill_(77)
+        m.on_global_clear()
+        fresh.on_global_clear()
+        a = fresh.translate_write(_t([10, 11, 12]))
+        b = m.translate_write(_t([10, 11, 12]))
+        self.assertEqual(a.tolist(), b.tolist())
+        self.assertEqual(_state(fresh, with_holes=False), _state(m, with_holes=False))
+        self.assertEqual(int(m._counters[1]), 0)
+
+    def test_holes_are_counted_like_legacy(self):
+        legacy = DraftKVSlotMapper(1000, 16, 64, device="cpu")
+        fast = DraftKVSlotMapper(1000, 16, 64, device="cpu", sync_free=True)
+        for m in (legacy, fast):
+            m.translate_write(_t([5]))
+            m.translate_read(_t([5, 77, 88]))
+        self.assertEqual(fast.holes_read_total, 2)
+        self.assertEqual(legacy.holes_read_total, fast.holes_read_total)
+
+    def test_default_is_the_legacy_mapper(self):
+        m = _mapper()
+        self.assertFalse(m.sync_free)
+        self.assertFalse(hasattr(m, "_counters"))
+        self.assertEqual(m._free.numel(), m.num_draft_slots - 1)
+
+    def test_env_switch_defaults_off(self):
+        from sglang.srt.environ import envs
+
+        old = os.environ.pop("SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE", None)
+        try:
+            self.assertFalse(envs.SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE.get())
+        finally:
+            if old is not None:
+                os.environ["SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE"] = old
+
+
+class TestSyncFreeNeverReadsTheDevice(CustomTestCase):
+    """On the META device a tensor has a shape and no data: any host read
+    (``.item()``, ``bool()``, boolean-mask indexing, ``unique``) raises. The
+    sync-free paths must run there end to end; the legacy mapper must not
+    (negative control -- proves the probe can see a host read)."""
+
+    @staticmethod
+    def _meta(*shape, dtype=torch.int64):
+        return torch.empty(*shape, dtype=dtype, device="meta")
+
+    def test_sync_free_paths_run_on_meta(self):
+        m = DraftKVSlotMapper(1000, 256, 64, device="meta", sync_free=True)
+        m.on_global_free(self._meta(7))
+        m.begin_round()
+        d = m.translate_write(self._meta(3, 8), valid=self._meta(3, 8, dtype=torch.bool))
+        self.assertEqual(tuple(d.shape), (3, 8))
+        self.assertEqual(tuple(m.translate_write(self._meta(24)).shape), (24,))
+        self.assertEqual(tuple(m.translate_read(self._meta(40)).shape), (40,))
+        rows = m.translate_read_rows(self._meta(3, 40), self._meta(3, 40, dtype=torch.bool))
+        self.assertEqual(tuple(rows.shape), (3, 40))
+        m.on_global_free(self._meta(5))
+        m.translate_read(self._meta(4))  # drains the free on meta, too
+
+    def test_window_rows_rebuild_runs_on_meta(self):
+        from sglang.srt.speculative.dflash_solo_pool import (
+            rebuild_window_rows_sync_free,
+        )
+
+        m = DraftKVSlotMapper(1000, 256, 64, device="meta", sync_free=True)
+        rebuild_window_rows_sync_free(
+            mapper=m,
+            target_req_to_token=self._meta(8, 4096, dtype=torch.int32),
+            draft_req_to_token=self._meta(8, 4096, dtype=torch.int32),
+            req_pool_indices=self._meta(3),
+            start=self._meta(3),
+            lengths=self._meta(3, dtype=torch.int32),
+            max_len=2048,
+        )
+
+    def test_legacy_mapper_reads_the_device(self):
+        m = DraftKVSlotMapper(1000, 256, 64, device="meta")
+        with self.assertRaises(Exception):
+            m.translate_write(self._meta(24))
+        with self.assertRaises(Exception):
+            m.translate_read(self._meta(24))
+
+
+class TestWindowRowsSyncFree(CustomTestCase):
+    """rebuild_window_rows_sync_free == the legacy gather -> translate_read ->
+    assign chain, per row, and leaves every other column alone."""
+
+    def test_matches_the_legacy_chain(self):
+        from sglang.srt.speculative.dflash_solo_pool import (
+            rebuild_window_rows_sync_free,
+        )
+
+        g = torch.Generator().manual_seed(7)
+        num_global, width = 5000, 700
+        for trial in range(20):
+            legacy = DraftKVSlotMapper(num_global, 3000, 64, device="cpu")
+            fast = DraftKVSlotMapper(num_global, 3000, 64, device="cpu", sync_free=True)
+            mapped = torch.randperm(num_global, generator=g)[:1500] + 1
+            for m in (legacy, fast):
+                m.translate_write(mapped.clone())
+                m.begin_round()
+            target = torch.randint(1, num_global + 1, (16, width), generator=g).to(torch.int32)
+            bs = int(torch.randint(1, 7, (1,), generator=g))
+            rpi = torch.randperm(16, generator=g)[:bs]
+            lengths = torch.randint(0, 300, (bs,), generator=g)
+            start = torch.stack(
+                [torch.randint(0, width - int(n) + 1, (1,), generator=g)[0] for n in lengths]
+            )
+            max_len = int(lengths.max()) + int(torch.randint(0, 40, (1,), generator=g))
+            sentinel = -7
+            draft_ref = torch.full((16, width), sentinel, dtype=torch.int32)
+            draft_new = draft_ref.clone()
+            # Legacy chain, emulated row by row (the Triton assign writes row
+            # b's segment [0, len_b) from the flat translated list, in order).
+            flat = torch.cat(
+                [target[int(r), int(s) : int(s) + int(n)] for r, s, n in zip(rpi, start, lengths)]
+            ).to(torch.int64)
+            translated = legacy.translate_read(flat)
+            off = 0
+            for r, n in zip(rpi, lengths):
+                draft_ref[int(r), : int(n)] = translated[off : off + int(n)].to(torch.int32)
+                off += int(n)
+            rebuild_window_rows_sync_free(
+                mapper=fast,
+                target_req_to_token=target,
+                draft_req_to_token=draft_new,
+                req_pool_indices=rpi,
+                start=start,
+                lengths=lengths.to(torch.int32),
+                max_len=max_len,
+            )
+            self.assertEqual(draft_ref.tolist(), draft_new.tolist(), f"trial {trial}")
+            self.assertEqual(legacy.holes_read_total, fast.holes_read_total)
+            self.assertEqual(legacy._slot_epoch.tolist(), fast._slot_epoch.tolist())
+
+    def test_rows_path_refuses_the_legacy_mapper(self):
+        m = _mapper()
+        with self.assertRaises(RuntimeError):
+            m.translate_read_rows(
+                torch.zeros(1, 4, dtype=torch.int64), torch.ones(1, 4, dtype=torch.bool)
+            )
+
+    def test_bound_wider_than_the_table_is_refused(self):
+        from sglang.srt.speculative.dflash_solo_pool import (
+            rebuild_window_rows_sync_free,
+        )
+
+        m = DraftKVSlotMapper(100, 16, 64, device="cpu", sync_free=True)
+        with self.assertRaises(RuntimeError):
+            rebuild_window_rows_sync_free(
+                mapper=m,
+                target_req_to_token=torch.zeros(2, 64, dtype=torch.int32),
+                draft_req_to_token=torch.zeros(2, 32, dtype=torch.int32),
+                req_pool_indices=_t([0]),
+                start=_t([0]),
+                lengths=_t([8]),
+                max_len=40,
+            )
+
+
+class TestWorkerArmsSyncFreeOnlyForTheWindowPool(CustomTestCase):
+    """_maybe_init_solo_small_pool builds a sync-free mapper exactly when the
+    window pool is on AND SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE=1."""
+
+    def _init(self, env):
+        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        alloc = object.__new__(TokenToKVPoolAllocator)
+        alloc.size = 70000
+        alloc.page_size = 1
+        alloc.register_free_listener = lambda on_free, on_clear: None
+        fake = types.SimpleNamespace(
+            use_compact_draft_cache=True,
+            draft_window_size=2048,
+            block_size=8,
+            device="cpu",
+            _spec_solo_active=True,
+            _spec_solo_is_host=True,
+            server_args=types.SimpleNamespace(max_running_requests=6),
+        )
+        cfg = types.SimpleNamespace(max_running_requests=6, max_total_num_tokens=70000)
+        keys = ("SGLANG_DFLASH_WINDOW_POOL", "SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE")
+        saved = {k: os.environ.get(k) for k in keys}
+        try:
+            for k in keys:
+                os.environ.pop(k, None)
+            os.environ.update(env)
+            return DFlashWorkerV2._maybe_init_solo_small_pool(fake, cfg, alloc)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_window_pool_default_stays_legacy(self):
+        m = self._init({"SGLANG_DFLASH_WINDOW_POOL": "1"})
+        self.assertIsNotNone(m)
+        self.assertFalse(m.sync_free)
+        self.assertEqual(m.num_draft_slots, 1 + (2048 + 8) * 6 * 2)
+
+    def test_window_pool_with_switch_is_sync_free(self):
+        m = self._init(
+            {"SGLANG_DFLASH_WINDOW_POOL": "1", "SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE": "1"}
+        )
+        self.assertIsNotNone(m)
+        self.assertTrue(m.sync_free)
+
+    def test_switch_without_window_pool_changes_nothing(self):
+        m = self._init({"SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE": "1"})
+        # compact draft cache without the window pool -> no small pool at all
+        self.assertIsNone(m)
+
+
 if __name__ == "__main__":
     unittest.main()

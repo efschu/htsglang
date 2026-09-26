@@ -369,6 +369,23 @@ def _quant_block_aligned_units(
     return block_aligned_units(total, units, block)
 
 
+
+def _declare_gguf_src_rows(param, shard_id, components) -> None:
+    """G1 (weg2 exchange): record which checkpoint rows this rank copied for a
+    GGUF shard -- ``(component, full rows, row start, rows)`` per component, in
+    the order they are stacked -- on the parameter the GGUF linear method
+    created (``xchg_src_rows``). ``_create_flat_weight_param`` turns it into
+    the flat container's declaration. Written where the rows are chosen, so
+    the exchange never re-derives a boundary; a no-op for any other param."""
+    table = getattr(param, "xchg_src_rows", None)
+    if isinstance(table, dict):
+        from sglang.srt.weg2.xchg_flat_segments import shard_key
+
+        table[shard_key(shard_id)] = tuple(
+            (str(k), int(f), int(a), int(n)) for k, f, a, n in components
+        )
+
+
 class LinearBase(torch.nn.Module):
     """Base linear layer.
 
@@ -960,6 +977,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 # cut through the q/k/v boundaries. At TP=1 each partition is the
                 # whole component, so this reproduces the un-sharded fused tensor.
                 parts = []
+                declared = []
                 offset = 0
                 for comp in loaded_shard_id:
                     comp_size = self.output_sizes[comp]
@@ -981,9 +999,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                         self.tp_family,
                     )
                     parts.append(comp_w.narrow(output_dim, my_start, my_size))
+                    declared.append((str(comp), comp_size, my_start, my_size))
                 loaded_weight = (
                     parts[0] if len(parts) == 1 else torch.cat(parts, dim=output_dim)
                 )
+                _declare_gguf_src_rows(param, loaded_shard_id, declared)
                 param.shard_id.append(loaded_shard_id)
                 param.shard_id_map[loaded_shard_id] = len(param.data_container)
                 param.data_container.append(loaded_weight)
@@ -1018,6 +1038,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             )
 
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            _declare_gguf_src_rows(
+                param,
+                loaded_shard_id,
+                [(str(loaded_shard_id), total, start_idx, shard_size)],
+            )
 
             param.shard_id.append(loaded_shard_id)
             param.shard_id_map[loaded_shard_id] = len(param.data_container)
@@ -1784,6 +1809,11 @@ class QKVParallelLinear(ColumnParallelLinear):
                 )
 
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            _declare_gguf_src_rows(
+                param,
+                loaded_shard_id,
+                [(str(loaded_shard_id), total, start_idx, shard_size)],
+            )
 
             param.shard_id.append(loaded_shard_id)
             param.shard_id_map[loaded_shard_id] = len(param.data_container)

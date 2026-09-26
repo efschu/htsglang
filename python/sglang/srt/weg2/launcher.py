@@ -364,6 +364,45 @@ DC_RECORD_MARGIN_MIB = 256
 DC_RECORD_ENV = "SGLANG_WEG2_DC_D_RECORD"
 
 
+def d_residue_capture_bs(sample: Dict[str, object], line_id) -> Optional[int]:
+    """The capture set (group D's ``--max-running-requests``) a D dormant
+    sample was measured under: the sample's own field, or -- a sample written
+    before the field existed -- the ``group D argv:`` line of its boot's
+    front log (the log the line identity already judges it by)."""
+    v = sample.get("vram_residue_capture_bs")
+    if v is not None:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+    reader = getattr(line_id, "d_max_running_requests", None)
+    return reader(sample.get("boot_tag")) if callable(reader) else None
+
+
+def d_residue_record_accept(line_id, d_bs: int) -> Callable[[dict], bool]:
+    """#1444 + RC1 (24.09.): which measured-record samples may price THIS
+    boot's group-D dormant residue. The line's own samples (line identity),
+    and for group D only those of the SAME capture set: D's residue is
+    mostly the CUDA graphs that stay resident through its sleep, and their
+    set follows --max-running-requests. Measured: xsn439 at 32 left
+    3206/2742/2740 MiB, xsn438 and RC1 at 6 left 2096/1512/1512 and
+    2072/1490/1490. xsn439's was the newest sample when RC1 (6) launched,
+    priced dormant_other 3526/3062/3060, took 1112-1232 MiB off every P rank
+    and pushed the 42,11,11 pool from 269,805 to 212,871 tokens, under the
+    262,656 floor -- the cut fell to 39,13,12 (ranked #57). A sample whose
+    capture set cannot be proven is not this boot's residue either."""
+    want = int(d_bs)
+
+    def _accept(sample: dict) -> bool:
+        if not line_id.accepts_sample(sample):
+            return False
+        if str((sample or {}).get("group", "")).upper() != "D":
+            return True
+        return d_residue_capture_bs(sample, line_id) == want
+
+    return _accept
+
+
 def dc_residue_from_record(
     rec: Optional[Dict[str, object]], cards: Sequence[Card], weight_source: str
 ) -> Tuple[Optional[Dict[str, int]], str]:
@@ -898,7 +937,14 @@ def p_prefill_graph_bucket() -> int:
 
 def p_chunked_prefill_tokens() -> int:
     """Group P's --chunked-prefill-size: the graph bucket when the P prefill
-    graph is on, the common constant otherwise (byte-identical default)."""
+    graph is on, the common constant otherwise (byte-identical default).
+    Under --p-chunk-policy dynamic it is the plan's CEILING (--p-chunk-max):
+    the per-forward width comes from the plan, and every allocation sized
+    from this value (corridor, frames, barlink buffers) must fund the widest
+    chunk the plan may choose."""
+    spec = _P_CHUNK.get("spec")
+    if spec is not None:
+        return int(spec.limits.max_tokens)
     # UNIFY S7: the common constant is group P's own (P_CHUNKED_PREFILL_TOKENS,
     # the NF form's SGLANG_WEG2_P_CHUNKED_PREFILL_TOKENS; default = the
     # constant, byte-identical on the 27B line).
@@ -1055,6 +1101,225 @@ def p_prefill_graph_line() -> str:
         "capture_mib=' (cost) and 'PREFILL-GRAPH eager reason=' (every batch "
         "the graph did not take)"
     )
+
+
+#: --p-chunk-policy (27B + NF line, user orders 25.09. ~21:40Z/21:41Z:
+#: "dynamische chunkgroesse brauchen wir. umsetzen"). The rule lives in
+#: weg2/p_chunk_policy.py (pure; the NF line takes the same interface). This
+#: block only turns the launcher's flags into a PolicySpec, prices P's
+#: --chunked-prefill-size at the plan's CEILING and hands the spec to group P.
+#: 'fixed' (the default for this release candidate) changes NOTHING: no env,
+#: argv_p and the P form key byte-identical.
+P_CHUNK_POLICY_DEFAULT = "fixed"
+#: The plan's ceiling. 2048 = 4x the 512 graph chunk and half the 4096 P ran
+#: eager before the graph (so inside the envelope P's corridor already funded);
+#: the planner prices group P's activation corridor, frames and barlink
+#: buffers at it, because under 'dynamic' it IS P's --chunked-prefill-size.
+P_CHUNK_MAX_DEFAULT = 2048
+P_CHUNK_MODEL_DEFAULT = "builtin-int8"
+P_CHUNK_MSCALE_DEFAULT = "int8"
+#: Short-prompt bypass (rc9j metal 26.09., Operator): at 2k/8k the plan is
+#: 512xn anyway, yet B measured 10-30 ms slower than A. At or below this rest
+#: the cursor does not plan and every forward gets the fixed width.
+P_CHUNK_DYNAMIC_MIN_TOKENS_DEFAULT = 8192
+#: BUILTIN INT8 stage model (desk, 25.09., MEASURED where stated):
+#: a_ms / b_ms_per_1k = pgap_stage_fit.fit_rank_lines over prefixes [0, 32768)
+#: of boot weg2rc7c (a54f21cda0, INT8, cut 42/11/11, 512 graph, 1076-1082
+#: device-bound chunks per rank, sd 2.1-2.5 ms): per 512 chunk,
+#: t = a + b * (prefix + 256) / 1000.
+#: fwd_overhead_ms = PP0's mean #PGAP gpu_gap_ms below 50 ms (3.73, n=2101):
+#: the bottleneck stage's per-forward idle, i.e. a per-CHUNK cost; PP1/PP2's
+#: gaps are pipeline waiting, which the flow shop produces itself.
+#: eager_floor_ms = the host launch of an EAGER P forward, xsn422 #PGAP
+#: (63/42/74 ms per stage, before the graph): a chunk above the largest graph
+#: bucket runs eager and is paced by it when its device time is shorter.
+P_CHUNK_BUILTIN_INT8 = (
+    {"a_ms": 43.94, "b_ms_per_1k": 1.022, "fwd_overhead_ms": 3.73, "eager_floor_ms": 63.0},
+    {"a_ms": 36.87, "b_ms_per_1k": 0.922, "fwd_overhead_ms": 0.0, "eager_floor_ms": 42.0},
+    {"a_ms": 40.41, "b_ms_per_1k": 0.995, "fwd_overhead_ms": 0.0, "eager_floor_ms": 74.0},
+)
+#: Per-token cost relative to M=512, per stage, as a function of the chunk.
+#: 'int8' PP0 (5090): kernel bench n4b_bench_0925_1239 -- the INT8 GEMMs
+#: (gate_up/down/qkvz/o) cost 12.3 % less per token at M=4096 than at 512
+#: (470 -> 535 TOPS gate_up), GEMMs are ~87 % of PP0's 512 chunk (35.8 of
+#: ~41 ms by the same bench), log-interpolated between 512 and 4096 -- a
+#: HOCHRECHNUNG, not a measurement. 256 is a guess (+15 %). The 3080 stages
+#: have NO bench above M=512, so they are FLAT (no gain assumed) until the
+#: metal ladder measures them. 'nvfp4' PP0: NVFP4 GEMM 5090 -21 % (gate_up)
+#: / -28 % (down) per token at 4096, same share -- also a HOCHRECHNUNG.
+P_CHUNK_MSCALES = {
+    "flat": ({512: 1.0}, {512: 1.0}, {512: 1.0}),
+    "int8": (
+        {256: 1.15, 512: 1.0, 1024: 0.964, 2048: 0.929, 4096: 0.893},
+        {256: 1.10, 512: 1.0},
+        {256: 1.10, 512: 1.0},
+    ),
+    "nvfp4": (
+        {256: 1.10, 512: 1.0, 1024: 0.93, 2048: 0.87, 4096: 0.80},
+        {256: 1.10, 512: 1.0},
+        {256: 1.10, 512: 1.0},
+    ),
+}
+#: The fixed part of a GRAPH forward that does not scale with the chunk
+#: (replay launch, stage in/out), ms. Small by the #PGAP host lines (launch 3).
+P_CHUNK_GRAPH_FIXED_MS = 2.0
+#: The dry-run ladder the launcher prints its plan for (the Messplan rungs).
+P_CHUNK_DRY_RUN_TOKENS = (2048, 8192, 32768, 131072)
+_P_CHUNK: Dict[str, object] = {"policy": P_CHUNK_POLICY_DEFAULT, "spec": None}
+
+
+def _p_chunk_stage(a_ms: float, b_ms_per_1k: float, fwd_overhead_ms: float,
+                   eager_floor_ms: float, mscale: Dict[int, float], name: str):
+    """One stage of the policy model from a 512-chunk line and a scale curve."""
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+    ref = 512
+    fixed = min(P_CHUNK_GRAPH_FIXED_MS, float(a_ms))
+    grid = sorted(set(mscale) | {256, 512, 1024, 2048, 4096})
+    pts = []
+    for m in grid:
+        r = _p_chunk_interp(mscale, m)
+        pts.append((m, float(fwd_overhead_ms) + fixed + (float(a_ms) - fixed) * (m / ref) * r))
+    return _pcp.StageModel(tuple(pts), float(b_ms_per_1k) / ref, float(eager_floor_ms), name)
+
+
+def _p_chunk_interp(curve: Dict[int, float], m: int) -> float:
+    """``curve`` in log2(M), flat beyond its ends (a missing point is no gain)."""
+    keys = sorted(curve)
+    if m <= keys[0]:
+        return float(curve[keys[0]])
+    if m >= keys[-1]:
+        return float(curve[keys[-1]])
+    for lo, hi in zip(keys, keys[1:]):
+        if lo <= m <= hi:
+            f = (math.log2(m) - math.log2(lo)) / (math.log2(hi) - math.log2(lo))
+            return float(curve[lo]) + f * (float(curve[hi]) - float(curve[lo]))
+    return 1.0
+
+
+def p_chunk_stage_model(src: str, mscale: str, stages: int = 3):
+    """``(stage models, source text)`` for --p-chunk-model / --p-chunk-mscale."""
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+    src = str(src or P_CHUNK_MODEL_DEFAULT).strip()
+    if mscale not in P_CHUNK_MSCALES:
+        raise SystemExit(f"--p-chunk-mscale {mscale!r}: one of {sorted(P_CHUNK_MSCALES)}")
+    curves = P_CHUNK_MSCALES[mscale]
+    if src == "builtin-int8":
+        rows = P_CHUNK_BUILTIN_INT8
+        source = f"builtin-int8 (weg2rc7c fit [0,32k), mscale={mscale})"
+    elif src.startswith("fit:"):
+        from sglang.srt.planner import pgap_stage_fit as _psf
+
+        path = src[4:]
+        try:
+            lines = _psf.fit_rank_lines(_psf.read_pgap_log(path), lo=0, hi=32768)
+        except (OSError, _psf.StageFitRefused) as exc:
+            raise SystemExit(f"--p-chunk-model {src}: {exc}")
+        rows = tuple(
+            {"a_ms": ln.a_ms, "b_ms_per_1k": ln.b_ms_per_1k,
+             "fwd_overhead_ms": P_CHUNK_BUILTIN_INT8[min(i, 2)]["fwd_overhead_ms"],
+             "eager_floor_ms": P_CHUNK_BUILTIN_INT8[min(i, 2)]["eager_floor_ms"]}
+            for i, ln in enumerate(lines)
+        )
+        source = f"fit:{os.path.basename(path)} [0,32k) mscale={mscale}"
+    else:
+        try:
+            with open(src) as fh:
+                data = json.load(fh)
+            models = tuple(_pcp.StageModel.from_json(s) for s in data["stages"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise SystemExit(f"--p-chunk-model {src}: not builtin-int8, fit:<P.log> or a "
+                             f"readable JSON with 'stages': {exc}")
+        if len(models) != stages:
+            raise SystemExit(f"--p-chunk-model {src}: {len(models)} stages, group P has {stages}")
+        return models, f"json:{os.path.basename(src)}"
+    if len(rows) != stages:
+        raise SystemExit(f"--p-chunk-model {src}: {len(rows)} stages, group P has {stages}")
+    models = tuple(
+        _p_chunk_stage(r["a_ms"], r["b_ms_per_1k"], r["fwd_overhead_ms"], r["eager_floor_ms"],
+                       curves[min(i, len(curves) - 1)], f"PP{i}")
+        for i, r in enumerate(rows)
+    )
+    return models, source
+
+
+def apply_p_chunk_policy(ns) -> None:
+    """Install --p-chunk-policy once, AFTER apply_p_prefill_graph (it reads the
+    graph buckets) and before any argv is built: p_chunked_prefill_tokens()
+    reads the ceiling from here, so the cut solve, the ledger, the form key
+    and the shipped argv see ONE value."""
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+    policy = str(getattr(ns, "p_chunk_policy", P_CHUNK_POLICY_DEFAULT) or P_CHUNK_POLICY_DEFAULT)
+    if policy not in _pcp.POLICIES:
+        raise SystemExit(f"--p-chunk-policy {policy!r}: one of {list(_pcp.POLICIES)}")
+    _P_CHUNK["policy"] = policy
+    _P_CHUNK["spec"] = None
+    if policy == _pcp.POLICY_FIXED:
+        return
+    bucket = p_prefill_graph_bucket()
+    fixed = int(getattr(ns, "p_chunk_fixed", 0) or 0) or bucket or CHUNKED_PREFILL_TOKENS
+    cap = int(getattr(ns, "p_chunk_max", P_CHUNK_MAX_DEFAULT) or P_CHUNK_MAX_DEFAULT)
+    low = int(getattr(ns, "p_chunk_min", 0) or 0) or fixed
+    buckets = tuple(b for b in p_prefill_graph_buckets())
+    if bucket and cap < bucket:
+        raise SystemExit(f"--p-chunk-max {cap} is below the P prefill graph bucket {bucket}")
+    models, source = p_chunk_stage_model(
+        str(getattr(ns, "p_chunk_model", P_CHUNK_MODEL_DEFAULT) or P_CHUNK_MODEL_DEFAULT),
+        str(getattr(ns, "p_chunk_mscale", P_CHUNK_MSCALE_DEFAULT) or P_CHUNK_MSCALE_DEFAULT),
+        P_PREFILL_GRAPH_STAGES,
+    )
+    try:
+        limits = _pcp.ChunkLimits(
+            max_tokens=cap, min_tokens=low, fixed_tokens=fixed, page=1,
+            grid=int(getattr(ns, "p_chunk_grid", 0) or 0),
+            graph_buckets=buckets, eager=True,
+            min_gain=float(getattr(ns, "p_chunk_min_gain", _pcp.DEFAULT_MIN_GAIN)),
+            dynamic_min_tokens=int(getattr(ns, "p_chunk_dynamic_min_tokens",
+                                           P_CHUNK_DYNAMIC_MIN_TOKENS_DEFAULT) or 0),
+        )
+    except _pcp.ChunkPolicyError as exc:
+        raise SystemExit(f"--p-chunk-policy dynamic: {exc}")
+    _P_CHUNK["spec"] = _pcp.PolicySpec(tuple(models), limits, source)
+
+
+def p_chunk_policy_spec():
+    """The installed PolicySpec, None under 'fixed'."""
+    return _P_CHUNK.get("spec")
+
+
+def p_chunk_policy_env() -> Dict[str, str]:
+    """Group P's environment for the policy; {} under 'fixed' (byte-identical)."""
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+    spec = p_chunk_policy_spec()
+    if spec is None:
+        return {}
+    return {_pcp.POLICY_ENV: _pcp.POLICY_DYNAMIC, _pcp.SPEC_ENV: spec.to_json()}
+
+
+def p_chunk_policy_lines() -> List[str]:
+    """The launcher's lines: the armed spec plus the plan it WOULD pick for the
+    dry-run rungs (a prediction on the model, printed so the metal ladder is
+    read against a stated expectation). [] under 'fixed'."""
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+    spec = p_chunk_policy_spec()
+    if spec is None:
+        return []
+    out = ["WEG2 " + _pcp.armed_line(spec, "group=P")
+           + f" -- group P's --chunked-prefill-size is the ceiling {spec.limits.max_tokens}"]
+    for n in P_CHUNK_DRY_RUN_TOKENS:
+        if spec.limits.dynamic_min_tokens and n <= spec.limits.dynamic_min_tokens:
+            out.append(f"WEG2 {_pcp.LOG_TAG} plan policy=dynamic key=dry-run-{n} tokens={n} "
+                       f"BYPASS (<= --p-chunk-dynamic-min-tokens {spec.limits.dynamic_min_tokens}): "
+                       f"fixed width {spec.limits.fixed_tokens}, no plan")
+            continue
+        res = _pcp.plan_detail(n, len(spec.stages), spec.stages, spec.limits)
+        out.append("WEG2 " + _pcp.plan_line(res, key=f"dry-run-{n}", start=0, end=n)
+                   + " (HOCHRECHNUNG on the model, not a measurement)")
+    return out
 
 
 def spec_form_is_dflash() -> bool:
@@ -4090,6 +4355,8 @@ def common_flags(
     """
     return [
         "--model-path", model,
+        # 27B line G2: [] unless --tokenizer-path was installed (apply_tokenizer_path).
+        *tokenizer_path_flags(),
         "--trust-remote-code",
         # #1356: TEXT-ONLY BY DEFAULT, on BOTH groups, via the ONE decision the
         # model config already makes (`model_config.py:436-447`, read at
@@ -4672,7 +4939,34 @@ def argv_d(
     profile: str = PROFILE_QWEN27B,
     # #108: kommt als WERT vom Launcher, nie aus der Env dieses Prozesses.
     d_adopt: bool = False,
+    # WEG2 VISION (D side, 24.09.): APPENDED LAST (argv_d has no `*`
+    # marker). Under `transient` D tokenizes images like P
+    # (language_model_only instead of --no-enable-multimodal): the same pad
+    # ids reach P's stored pages and the decode gets the mrope delta. D still
+    # has no tower and arms no stage (SGLANG_WEG2_VISION stays P-only,
+    # build_env); an image inside D's own extent is refused by name at its
+    # admission (W123).
+    vision: str = VISION_OFF,
 ) -> List[str]:
+    _extra = list(extra or ())
+    if vision == VISION_TRANSIENT and "--json-model-override-args" in _extra:
+        # EXTRA is appended LAST and argparse keeps the last occurrence, so
+        # EXTRA's override is the one D gets. It must carry the transient
+        # form's language_model_only itself, or D would build the tower it
+        # must not have -- refused by name instead of lost silently.
+        _i = _extra.index("--json-model-override-args")
+        try:
+            _lmo = bool(json.loads(_extra[_i + 1]).get("language_model_only"))
+        except (IndexError, ValueError, AttributeError):
+            _lmo = False
+        if not _lmo:
+            raise Weg2LaunchRefused(
+                "W111 Weg2VisionArmRefused: --extra-d carries its own "
+                "--json-model-override-args without language_model_only, and "
+                "argparse keeps only the last one -- --weg2-vision transient's "
+                f"{VISION_TRANSIENT_OVERRIDE} would be lost and D would build a "
+                'tower. Add "language_model_only": true to the EXTRA override.'
+            )
     _refuse_if_extra_raises_budget(budgets, list(extra or ()), "D")
     return [py, "-m", "sglang.launch_server"] + common_flags(
         model, s_gb, m_mib, store_cfg, max_kv_per_request, d_write_policy, "D",
@@ -4680,6 +4974,7 @@ def argv_d(
         hicache_disabled=hicache_disabled,
         weights_cpu_backup=weights_cpu_backup,
         profile=profile,
+        vision=vision,
     ) + (
         ["--disable-overlap-schedule"] if disable_overlap else []
     ) + (
@@ -6234,6 +6529,11 @@ def _env_knobs(ns) -> Dict[str, object]:
         "vision": str(getattr(ns, "weg2_vision", VISION_OFF)),
         # WEG2-FORM: the one resolved form (launcher.main sets it on ns).
         "boot_form": getattr(ns, "weg2_boot_form", None),
+        # 27B FP8: one byte layout on every rank of BOTH groups (the two
+        # groups flip bytes into each other), hence gathered here once.
+        "fp8_uniform_marlin": bool(getattr(ns, "fp8_uniform_marlin", False))
+        and checkpoint_quant_method(str(getattr(ns, "model", "")))
+        in UNIFORM_MARLIN_QUANT_METHODS,
     }
 
 
@@ -6388,7 +6688,9 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               # (``weg2_form.resolve_form``), gathered by ``_env_knobs``. None
               # = a desk caller: every form-keyed branch below keeps its
               # pre-form behaviour and SGLANG_WEG2_FORM is popped.
-              boot_form: Optional["weg2_form.Weg2Form"] = None) -> Dict[str, str]:
+              boot_form: Optional["weg2_form.Weg2Form"] = None,
+              # 27B FP8 (--fp8-uniform-marlin): one byte layout on every rank.
+              fp8_uniform_marlin: bool = False) -> Dict[str, str]:
     env = dict(os.environ)
     # Task #58: THE ARMING SIGNAL for the transient vision stage, and the ONE
     # thing that turns `vision_stage_service`'s seam from a no-op into a stage.
@@ -6787,6 +7089,11 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # operator's `auto` never reaches a rank (it cannot resolve it there).
     env.pop(HICACHE_DRAFT_TIER_ENV, None)
     env.update(hicache_draft_tier_env())
+    # 27B FP8 (--fp8-uniform-marlin, resolved by _env_knobs against the
+    # checkpoint): the same two variables on BOTH groups, set only then --
+    # every other boot's environment stays exactly what it was.
+    if fp8_uniform_marlin:
+        env.update(FP8_UNIFORM_MARLIN_ENV)
     return env
 
 
@@ -8443,19 +8750,168 @@ def _weg2_arena_ledger_terms(model: str) -> dict:
         raise Weg2LaunchRefused(f"W108 Weg2ArenaLedgerRefused: the arena term could not be derived: {exc!r}")
 
 
+def model_config_path(model: str) -> str:
+    """The ``config.json`` that describes ``model``, by the SERVER's own rule
+    (``server_args.declared_config_path_for``, the body of
+    ``ServerArgs.declared_config_path``) -- never a second copy of it.
+
+    27B line G2 (2026-09-25): a GGUF launch names the ``.gguf`` FILE, whose
+    config is the SIBLING ``config.json``; ``os.path.join(model, "config.json")``
+    found ``<...>.gguf/config.json`` and every launcher reader died on it. A
+    directory resolves exactly as before. None found: ``FileNotFoundError`` (the
+    type a missing config always raised here, so callers that catch ``OSError``
+    keep their behaviour), naming every place that was looked at."""
+    from sglang.srt.server_args import (
+        declared_config_path_candidates,
+        declared_config_path_for,
+    )
+
+    path = declared_config_path_for(model)
+    if path is None:
+        looked = declared_config_path_candidates(model) or [
+            os.path.join(str(model), "config.json")
+        ]
+        raise FileNotFoundError(
+            2, "no config.json describes %s (looked at %s)" % (model, ", ".join(looked)),
+            looked[-1],
+        )
+    return path
+
+
+def model_is_gguf_file(model: str) -> bool:
+    """Whether ``model`` names a GGUF checkpoint FILE -- the server's own
+    predicate (``check_gguf_file``: a file with the ``.gguf`` suffix or the GGUF
+    magic), the one that turns ``--load-format auto`` into ``gguf`` and the
+    quantization into ``gguf`` (arg_groups/overrides._gguf_quantization)."""
+    from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+
+    return bool(model) and check_gguf_file(model)
+
+
 def _model_config(model: str) -> dict:
-    with open(os.path.join(model, "config.json")) as f:
+    with open(model_config_path(model)) as f:
         return json.load(f)
 
 
+def gguf_backbone_depth(model: str) -> Optional[int]:
+    """A GGUF file's backbone depth as the SERVER reconciles it
+    (``gguf_registry.reconcile_sibling_config``): ``block_count`` minus the
+    NEXTN/MTP draft blocks it counts (``nextn_predict_layers``). None where the
+    metadata does not say. Read once per file (host_ledger.gguf_header_facts)."""
+    return host_ledger.gguf_header_facts(model).backbone_depth
+
+
 def model_num_layers(model: str) -> int:
-    """The backbone depth, through the SERVER's own probe order (fix 6)."""
+    """The backbone depth, through the SERVER's own probe order (fix 6).
+
+    For a GGUF file the loader's authority is the FILE: a depth that differs
+    from the sibling config is reconciled there (the file wins, layer_types
+    rebuilt), and every layer map this launcher derives from the config would
+    then describe another model -- W162, before any card is touched."""
     from sglang.srt.server_args import declared_num_hidden_layers_from_config
 
     n = declared_num_hidden_layers_from_config(_model_config(model))
     if not n or n <= 0:
-        raise Weg2LaunchRefused(f"num_hidden_layers not found in {model}/config.json")
+        raise Weg2LaunchRefused(f"num_hidden_layers not found in {model_config_path(model)}")
+    if model_is_gguf_file(model):
+        depth = gguf_backbone_depth(model)
+        if depth is not None and depth != int(n):
+            raise Weg2LaunchRefused(
+                f"W162 Weg2GgufDepthRefused: {model} carries {depth} backbone "
+                f"blocks, its sibling {model_config_path(model)} declares "
+                f"num_hidden_layers={n}. The loader runs the FILE's depth "
+                "(gguf_registry.reconcile_sibling_config) while the chunk map, "
+                "the P cut and the layer kinds of this launcher come from the "
+                "config -- two sides of one seam on different models. Supply "
+                "the config.json of exactly this GGUF next to it."
+            )
     return int(n)
+
+
+#: --tokenizer-path (27B line G2, 2026-09-25): the tokenizer BOTH groups load.
+#: None, the default, adds nothing to either argv (the server reads the
+#: tokenizer from --model-path, byte-identical to every argv before the flag).
+#: Installed once by :func:`apply_tokenizer_path`, read by every
+#: :func:`common_flags` call, so P and D can never tokenize differently.
+_TOKENIZER_PATH: Dict[str, Optional[str]] = {"path": None}
+
+
+def tokenizer_path_decision(
+    model: str, explicit: str = ""
+) -> Tuple[Optional[str], Optional[str]]:
+    """``(the --tokenizer-path both groups get, or None; a log line or None)``.
+
+    * given: used on BOTH groups, refused (W163) unless it is a directory with
+      one of the server's own sibling tokenizer files -- a typo dies here, not
+      in two groups' tokenizer managers;
+    * not given, not a GGUF file: ``(None, None)`` -- the argv is unchanged;
+    * not given, a GGUF file whose tokenizer the server can find itself
+      (transformers' GGUF route for a non-bespoke arch, or sibling files next
+      to the .gguf): ``(None, line)``;
+    * not given, a bespoke-arch GGUF (qwen35, qwen35moe, gemma4, ...) with no
+      tokenizer next to it: W163 now, instead of the same ValueError in both
+      groups' tokenizer managers after the cards are taken. Nothing is guessed:
+      the fix is named, not applied (the unsloth Qwen3.8-27B GGUF directory
+      ships no tokenizer; the FP8/INT8 checkpoints of the same model carry the
+      same tokenizer.json).
+    """
+    from pathlib import Path
+
+    from sglang.srt.utils.hf_transformers.tokenizer import (
+        _SIBLING_TOKENIZER_FILES,
+        _has_sibling_tokenizer,
+    )
+
+    wanted = ", ".join(_SIBLING_TOKENIZER_FILES)
+    explicit = str(explicit or "").strip()
+    if explicit:
+        if not (os.path.isdir(explicit) and _has_sibling_tokenizer(Path(explicit))):
+            raise Weg2LaunchRefused(
+                f"W163 Weg2TokenizerRefused: --tokenizer-path {explicit!r} is not "
+                f"a directory holding any of {wanted}."
+            )
+        return explicit, f"WEG2 TOKENIZER --tokenizer-path {explicit} (both groups)"
+    if not model_is_gguf_file(model):
+        return None, None
+    from sglang.srt.model_loader.gguf_registry import sibling_config_gguf_archs
+
+    parent = os.path.dirname(os.path.abspath(model))
+    # _peek_bespoke_gguf_arch's derivation (general.architecture of the metadata
+    # part, in the registry's sibling-config set) over the header this launch
+    # reads once anyway -- its own call would parse the GGUF again (8.5 s).
+    header_arch = host_ledger.gguf_header_facts(model).arch
+    arch = header_arch if header_arch in sibling_config_gguf_archs() else None
+    if arch is None:
+        return None, (
+            f"WEG2 TOKENIZER {model}: read by transformers from the GGUF itself "
+            "(not a sibling-config arch)"
+        )
+    if _has_sibling_tokenizer(Path(parent)):
+        return None, f"WEG2 TOKENIZER {model}: the sibling files in {parent} (arch {arch})"
+    raise Weg2LaunchRefused(
+        f"W163 Weg2TokenizerRefused: {model} is a {arch} GGUF, whose tokenizer "
+        f"the server reads ONLY from sibling files, and {parent} holds none of "
+        f"{wanted}. Pass --tokenizer-path <dir> with this model's tokenizer "
+        "(the safetensors checkpoint of the same model), or place the files "
+        "next to the .gguf."
+    )
+
+
+def apply_tokenizer_path(ns) -> Optional[str]:
+    """Install --tokenizer-path once, before any argv is built (the install-once
+    shape of apply_p_prefill_graph); returns the log line, if any."""
+    path, line = tokenizer_path_decision(
+        str(getattr(ns, "model", "") or ""),
+        str(getattr(ns, "tokenizer_path", "") or ""),
+    )
+    _TOKENIZER_PATH["path"] = path
+    return line
+
+
+def tokenizer_path_flags() -> List[str]:
+    """The installed tokenizer as argv words: ``[]`` when none was installed."""
+    path = _TOKENIZER_PATH.get("path")
+    return ["--tokenizer-path", str(path)] if path else []
 
 
 def model_layer_kinds(model: str) -> List[bool]:
@@ -9010,7 +9466,41 @@ def _weights_from_scores(scores: Sequence[float]) -> Tuple[int, ...]:
     return _gcd_reduce([int(round(float(s) / max(lo, 1e-9) * 1000.0)) for s in scores])
 
 
-def d_plan_inputs(model: str, tp_size: int, d_bs: int):
+def _published_profile() -> Optional[str]:
+    """The profile id of the weg2 form this launcher published (None = none)."""
+    f = weg2_form.current_form()
+    return f.profile if f is not None else None
+
+
+def _d_layout_is_tp_symmetric() -> bool:
+    """UNIFY S7: is the published profile's D TP-symmetric (d_layout
+    paged_dcp, the 27B)? No form / unknown profile: False (the NF rule)."""
+    row = weg2_form.profile_row(_published_profile())
+    return bool(row is not None and row.d_layout == "paged_dcp")
+
+
+def _group_fact_value(group: str, flag: str) -> Optional[str]:
+    """The value EARLY_READ_FACTS states for ``flag`` on ``group`` -- the same
+    row build_env exports and the argv builders emit."""
+    for fact in EARLY_READ_FACTS:
+        if fact.groups in ("both", group) and len(fact.flag) >= 2 and fact.flag[0] == flag:
+            return str(fact.flag[1])
+    return None
+
+
+def d_window_pool_fields() -> Dict[str, object]:
+    """PlanInputs fields of group D's DFLASH window pool: set exactly when
+    spec_form_env("D") publishes SGLANG_DFLASH_WINDOW_POOL=1 and the draft is
+    split (the solo host prices its own pool)."""
+    if spec_form_is_dflash() and spec_form_env("D").get("SGLANG_DFLASH_WINDOW_POOL") == "1" \
+            and dflash_placement() != "solo":
+        return {"dflash_window_pool": True,
+                "speculative_draft_window_size": int(_SPEC_FORM["window"])}
+    return {}
+
+
+def d_plan_inputs(model: str, tp_size: int, d_bs: int,
+                  overhead_mib_by_rank: Optional[Sequence[float]] = None):
     """The runtime ``PlanInputs`` describing THIS boot's group D.
 
     ONE FACTORY (refuter MF-6). Every field is read from the module constant
@@ -9026,7 +9516,152 @@ def d_plan_inputs(model: str, tp_size: int, d_bs: int):
         kv_cache_dtype=KV_CACHE_DTYPE,
         max_running_requests=int(d_bs),
         **spec_plan_fields(),
+        # 27B line (24.09.): the GROUP's facts, which this launcher process
+        # does not carry in its own environment -- the SSM dtype (priced fp32
+        # before: the planner read SGLANG_MAMBA_SSM_DTYPE off the launcher's
+        # env, where it is never set) and the DFLASH window pool (cell 32768 +
+        # constant draft reserve instead of 34816 per token).
+        # UNIFY S7: the group fact only where the profile ships the early-read
+        # flag half (27B TP-D); elsewhere None = the pre-existing env read.
+        mamba_ssm_dtype=(_group_fact_value("D", "--mamba-ssm-dtype")
+                         if _profile_early_read(_published_profile()) else None),
+        **d_window_pool_fields(),
+        overhead_mib_by_rank=(list(overhead_mib_by_rank)
+                              if overhead_mib_by_rank is not None else None),
     )
+
+
+def d_row_attn_units(pcm, weights: Sequence[int]) -> List[int]:
+    """The attention UNIT vector a D operating-point row prices ``weights``
+    with -- the runtime widens the grid to the q-heads when the o-group count
+    is below the world size (uneven_perf.py:4520-4528). ONE implementation for
+    the row and for the calibration that must reproduce the row exactly."""
+    from sglang.srt.distributed.utils import partition_units
+
+    n_ranks = len(weights)
+    a_units = int(pcm.attn_units)
+    grid = a_units if a_units >= n_ranks else max(int(pcm.q_heads), n_ranks)
+    return list(partition_units(grid, list(weights)))
+
+
+_KV_POOL_SIZING_RE = re.compile(
+    r"TP(\d+)\] KV pool sizing: available_bytes=(\d+) .*?cell_size=(\d+)")
+
+
+def _d_argv_of_front_log(front_log: str) -> List[str]:
+    try:
+        with open(front_log, errors="replace") as f:
+            for line in f:
+                if "group D argv:" in line:
+                    return shlex.split(line.split("group D argv:", 1)[1])
+    except OSError:
+        pass
+    return []
+
+
+def d_overhead_calibration(
+    model: str, line_id, evidence_dir: str = EVIDENCE_DIR,
+) -> Tuple[Optional[List[float]], str]:
+    """Per-rank MiB of group D's non-KV, non-weight, non-mamba posts, MEASURED
+    on the newest D log of THIS line (``line_id``: same checkpoint, a commit
+    of this line's own history) -- ``(None, why)`` when no such boot exists.
+
+    Against the planner's own weight and mamba model at THAT boot's vector
+    and budgets: ``O_r = budget_r - KV bytes_r - weights_r - mamba_r -
+    window reserve``, KV bytes the rank's own final 'KV pool sizing:
+    available_bytes' line. The planner then reproduces that boot's per-rank
+    capacity exactly at its own vector and moves weights / mamba with any
+    other vector. The flat 2304 MiB it replaces priced xsn420's D at 330939
+    tokens against 634087 realised. The measured cell must equal the
+    planner's cell, or the calibration does not transfer and is refused.
+    """
+    from sglang.srt.distributed.utils import partition_units
+    from sglang.srt.uneven_perf import PerfCostModel
+
+    if line_id is None:
+        return None, "no line identity (desk caller)"
+    try:
+        names = [n for n in os.listdir(evidence_dir) if n.endswith(".D.log")]
+    except OSError as exc:
+        return None, f"evidence dir unreadable: {exc}"
+    paths = sorted((os.path.join(evidence_dir, n) for n in names),
+                   key=os.path.getmtime, reverse=True)
+    skipped = 0
+    for d_log in paths:
+        if not line_id.accepts_log(d_log):
+            continue
+        front = d_log[: -len(".D.log")] + ".front.log"
+        argv = _d_argv_of_front_log(front)
+        if not argv:
+            skipped += 1
+            continue
+        kv: Dict[int, Tuple[int, int]] = {}
+        try:
+            with open(d_log, errors="replace") as f:
+                for line in f:
+                    if "KV pool sizing:" in line:
+                        m = _KV_POOL_SIZING_RE.search(line)
+                        if m:
+                            kv[int(m.group(1))] = (int(m.group(2)), int(m.group(3)))
+        except OSError:
+            skipped += 1
+            continue
+        fm: Dict[str, str] = {}
+        for i, tok in enumerate(argv[:-1]):
+            if tok.startswith("--"):
+                fm[tok] = argv[i + 1]
+        try:
+            budgets = [int(x) for x in fm["--rank-gpu-memory-mib"].split(",")]
+            mrr = int(fm.get("--max-running-requests", "1"))
+        except (KeyError, ValueError):
+            skipped += 1
+            continue
+        n = len(budgets)
+        if sorted(kv) != list(range(n)):
+            skipped += 1
+            continue
+        ratio = fm.get("--rank-tp-ratio", "auto")
+        if ratio == "auto":
+            weights = list(_gcd_reduce(budgets))
+        else:
+            try:
+                weights = [int(x) for x in ratio.split(",")]
+            except ValueError:
+                skipped += 1
+                continue
+            if len(weights) != n:
+                skipped += 1
+                continue
+        cells = {c for _, c in kv.values()}
+        try:
+            pcm = PerfCostModel(d_plan_inputs(model, n, mrr), weights, budgets)
+            mlp = list(partition_units(int(pcm.mlp_units), weights))
+            # the SAME joint candidate the row prices (predict_capacity(mlp,
+            # attn_units): attention/GDN/mamba follow the attn units), so the
+            # row reproduces this boot per rank, not only in the sum
+            attn_units = d_row_attn_units(pcm, weights)
+            w = pcm.per_rank_weight_bytes(mlp, attn_units)
+            mamba = pcm.mamba_pool_bytes_for(attn_units)
+        except Exception as exc:  # noqa: BLE001 -- a calibration never kills a boot
+            return None, f"planner not buildable for {os.path.basename(d_log)}: {exc}"
+        if cells != {int(pcm.kv_cell_bytes)}:
+            return None, (f"{os.path.basename(d_log)}: measured cell {sorted(cells)} != planner cell "
+                          f"{int(pcm.kv_cell_bytes)} -- the calibration would not transfer")
+        mib = float(1 << 20)
+        ovh = [
+            (budgets[r] * mib - kv[r][0] - w[r] - mamba[r] - pcm.window_pool_reserve_bytes) / mib
+            for r in range(n)
+        ]
+        if any(o < 0 or o > 8192 for o in ovh):
+            return None, (f"{os.path.basename(d_log)}: implausible measured overhead "
+                          f"{[round(o) for o in ovh]} MiB -- refused, flat default stays")
+        return ovh, (
+            f"MEASURED on {os.path.basename(d_log)} (this line, {os.path.basename(str(model).rstrip('/'))}): budgets {budgets}, "
+            f"--rank-tp-ratio {ratio}, mrr {mrr}, KV {[kv[r][0] for r in range(n)]} B at cell "
+            f"{sorted(cells)[0]} -> overhead {[round(o, 1) for o in ovh]} MiB/rank "
+            f"(flat default was {1280 + 1024}); skipped {skipped} newer log(s) without the instruments"
+        )
+    return None, f"no D log of this line carries 'KV pool sizing' and a group D argv (skipped {skipped})"
 
 
 def _attn_axis_for(weights: Sequence[int], plan_flags) -> str:
@@ -9328,6 +9963,7 @@ def d_operating_point_rows(
     measured_anchor: Optional[object] = None,
     anchor_evidence_dirs: Sequence[str] = (EVIDENCE_DIR,),
     provenance_out: Optional[List[str]] = None,
+    overhead_mib_by_rank: Optional[Sequence[float]] = None,
 ) -> Tuple[List[DOperatingPointRow], List[str]]:
     """Price the three D weight vectors side by side. Returns (rows, refusals).
 
@@ -9347,6 +9983,10 @@ def d_operating_point_rows(
     maxkv_weights = _gcd_reduce(budgets)
 
     # -- the geometry and the cost model, both the runtime's own -------------
+    # UNIFY S7 (27B 159333c14d (d)): does this D install the capacity-matched
+    # token vector on EVERY position? Only a TP-symmetric D (profile d_layout
+    # paged_dcp: the 27B, --rank-tp-ratio only); Form A / no form: no.
+    _tv_every_position = _d_layout_is_tp_symmetric()
     pcm = None
     plan = None
     try:
@@ -9374,7 +10014,7 @@ def d_operating_point_rows(
         # sink; one that does not is byte-identical to before.
         if provenance_out is not None:
             provenance_out.append(anchor_note)
-        plan = d_plan_inputs(model, len(budgets), d_bs)
+        plan = d_plan_inputs(model, len(budgets), d_bs, overhead_mib_by_rank)
         pcm = PerfCostModel(
             plan,
             list(maxkv_weights),
@@ -9512,7 +10152,7 @@ def d_operating_point_rows(
             # row quotes the geometry the model would actually shard on.
             a_units = int(pcm.attn_units)
             grid = a_units if a_units >= n_ranks else max(int(pcm.q_heads), n_ranks)
-            attn_units = list(partition_units(grid, list(weights)))
+            attn_units = d_row_attn_units(pcm, weights)
             scale = int(pcm.q_heads) // max(1, grid)
             attn = tuple(u * scale for u in attn_units)
             # #1293 THE AXIS THE ATTENTION COMPUTE RIDES. Under replicated-KV
@@ -9531,14 +10171,21 @@ def d_operating_point_rows(
             # gridding attention on kv-heads (placement.py:813 models it
             # right); the same class sat here.
             axis = _attn_axis_for(weights, dcp_flags)
+            # 27B line (24.09.): NO position pins the token vector. The
+            # launcher ships only --rank-tp-ratio for every position (never
+            # --rank-kv-ratio), so the runtime installs the CAPACITY-matched
+            # vector after profiling on every one of them (xsn420 D.log:
+            # 'installed measured KV-token ownership vector [32, 15, 17]').
+            # The rate-proportional vector this used to pin priced a funded
+            # context no boot of these positions can have (decode-bs6:
+            # 116416 vs ~625k). The derived vector is read off
+            # predict_capacity below, for every position as for maxkv.
+            # UNIFY S7: that is the TP-symmetric D's rule (_tv_every_position,
+            # profile d_layout paged_dcp); any other D keeps the NF line's
+            # #1293 pin -- token ownership proportional to the measured rates,
+            # integerised the way the runtime integerises its token vector.
             token_units: Tuple[int, ...] = ()
-            if axis == "token" and position != "maxkv":
-                # The position's own intent made concrete: token ownership
-                # proportional to the measured rates, integerised exactly the
-                # way the runtime integerises its token vector. For maxkv
-                # (auto) the runtime DERIVES its capacity-matched vector
-                # instead; that derived vector is read off predict_capacity
-                # below rather than re-spelled here.
+            if axis == "token" and position != "maxkv" and not _tv_every_position:
                 token_units = tuple(
                     partition_units(_CP_TOKEN_UNITS, list(weights))
                 )
@@ -9755,14 +10402,29 @@ def d_operating_point_rows(
             # a uniform-cell form it opens by itself; on this one the runtime's
             # own derivation keeps carrying the vector, which is what ran
             # 262144 tokens on fnFL2v72.
-            if (
-                position == "maxkv"
-                and axis == "token"
-                and cap.get("token_vector")
-                and getattr(pcm, "measured", None) is not None
-                and anchor_has_uniform_kv_cell(getattr(pcm, "measured", None))
+            #
+            # UNIFY S7 (27B 159333c14d (d)): on a TP-symmetric D
+            # (profile d_layout paged_dcp, the 27B) the launcher ships only
+            # --rank-tp-ratio, so the runtime installs the capacity-matched
+            # vector on EVERY position; the row reads it back for all of them.
+            if axis == "token" and cap.get("token_vector") and (
+                _tv_every_position
+                or (
+                    position == "maxkv"
+                    and getattr(pcm, "measured", None) is not None
+                    and anchor_has_uniform_kv_cell(getattr(pcm, "measured", None))
+                )
             ):
                 token_units = tuple(int(v) for v in cap["token_vector"])
+                # THE RUNTIME'S OWN INSTALLED POOL: the owner rule over the
+                # vector it installs (distributed/utils.cp_token_context_budget,
+                # the same arithmetic as 'max_total_num_tokens X -> ~Y'), i.e.
+                # the funded context after the 64-unit quantisation.
+                from sglang.srt.distributed.utils import cp_token_context_budget
+
+                funded_ctx = int(cp_token_context_budget(
+                    [max(int(v), 1) for v in token_units],
+                    [max(int(x), 1) for x in cap["p"]]))
         except Exception:
             pool = None
         refusal = None
@@ -10012,6 +10674,7 @@ def d_tp_ratio_decision(
     d_bs: int,
     env_d: str = "",
     user_reserve_by_card: Optional[Dict[str, int]] = None,
+    overhead_mib_by_rank: Optional[Sequence[float]] = None,
 ) -> DTpRatioDecision:
     """Choose group D's weight objective and PRICE the choice on one line.
 
@@ -10080,6 +10743,7 @@ def d_tp_ratio_decision(
         moe_resident_fraction=_moe_frac, moe_scratch_slots=_moe_scratch,
         user_reserve_by_card=user_reserve_by_card,
         provenance_out=_anchor_notes,
+        overhead_mib_by_rank=overhead_mib_by_rank,
     )
     op_line = d_operating_point_line(op_rows, op_refusals, objective)
     # Where group D's capacity numbers came from, on every boot -- an
@@ -10126,7 +10790,7 @@ def d_tp_ratio_decision(
         from sglang.srt.uneven_perf import PerfCostModel
 
         pcm = PerfCostModel(
-            d_plan_inputs(model, len(budgets), d_bs), weights, list(budgets)
+            d_plan_inputs(model, len(budgets), d_bs, overhead_mib_by_rank), weights, list(budgets)
         )
         n_q = int(pcm.q_heads)
         scale = n_q // max(1, int(pcm.attn_units))
@@ -10521,6 +11185,241 @@ def read_pp_bubble(path: str) -> Optional[BubbleMeasurement]:
     )
 
 
+#: 27B FP8 (Qwen/Qwen3.8-27B-FP8, block 128x128) on the weg2 flip, the simple
+#: variant: ONE byte layout on every card. The kernel choice is RANK-LOCAL
+#: (fp8.py: ``use_marlin = force_marlin or can_auto_enable_marlin_fp8()``,
+#: sm80..88): a 3080 repacks to Marlin ``int32 [K/16, 4N]`` + group scales
+#: ``[K/128, N]``, a 5090 keeps native ``fp8 [N, K]`` + ``weight_scale_inv
+#: [N/128, K/128]`` -- and the exchange copies bytes between the cards, so the
+#: layouts must agree. Forcing Marlin everywhere makes them agree (the geometry
+#: is the one compressed-tensors pack-quantized already moves: MIXED_FUSED_COLS,
+#: weg2xsn258) and costs the 5090 its native FP8 GEMM. Marlin's per-card lock
+#: workspace stays on the module: the exchange coverage books it as
+#: local_scratch and every weights resume re-zeroes it
+#: (weight_exchange.zero_local_scratch, adopted from the NF line).
+FP8_UNIFORM_MARLIN_ENV = {
+    "SGLANG_FORCE_FP8_MARLIN": "1",
+}
+
+#: The checkpoint families --fp8-uniform-marlin makes one byte layout for:
+#: ``fp8`` (Qwen/Qwen3.8-27B-FP8) and ``modelopt`` -- NVIDIA ModelOpt exports,
+#: e.g. RadixArk Qwen3.8-27B-NVFP4 (MIXED_PRECISION: FP8 per-tensor attention
+#: and GDN projections, NVFP4 g16 MLP and lm_head). Under ``modelopt`` the FP8
+#: linears take Marlin through SGLANG_FORCE_FP8_MARLIN (ModelOptFp8LinearMethod,
+#: upstream #31340) and the NVFP4 linears through the server argument below; on
+#: the 5090 both would otherwise run native kernels with other byte layouts
+#: (fp8 [N,K] + scalar scale; NVFP4 CUTLASS with 128x4-swizzled block scales).
+UNIFORM_MARLIN_QUANT_METHODS = ("fp8", "modelopt")
+
+#: The server argument that puts every NVFP4 linear of a ModelOpt checkpoint on
+#: Marlin (fp4_utils.initialize_fp4_gemm_config: ``auto`` resolves per rank --
+#: cutlass on sm_120, marlin on sm_80..89).
+FP4_UNIFORM_MARLIN_ARGV = ("--fp4-gemm-backend", "marlin")
+
+
+def checkpoint_quant_method(model_path: str) -> str:
+    """``quantization_config.quant_method`` of the checkpoint's config.json (top
+    level or ``text_config``), lower case; for an export that states its
+    quantization only in ``hf_quant_config.json`` (older ModelOpt exports)
+    ``"modelopt"``; ``""`` for none or unreadable.
+
+    A GGUF file is ``"gguf"``: the server's own override for it
+    (arg_groups/overrides._gguf_quantization), and its sibling config.json is an
+    upstream config that says nothing about the file's quantization (27B line
+    G2)."""
+    if model_is_gguf_file(str(model_path)):
+        return "gguf"
+    try:
+        with open(model_config_path(str(model_path))) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    for holder in (cfg, cfg.get("text_config") or {}):
+        qc = holder.get("quantization_config") if isinstance(holder, dict) else None
+        if isinstance(qc, dict) and qc.get("quant_method"):
+            return str(qc["quant_method"]).strip().lower()
+    try:
+        with open(os.path.join(str(model_path), "hf_quant_config.json")) as f:
+            hf = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    section = hf.get("quantization") if isinstance(hf, dict) else None
+    if isinstance(section, dict) and section.get("quant_algo"):
+        return "modelopt"
+    return ""
+
+
+#: Backlog #38 (--fp4-native-mixed): the NVFP4 linears keep the NATIVE byte
+#: layout on every rank and pick their kernel per rank (sm_120 W4A4 CUTLASS,
+#: sm_86 Marlin W4A16 in place) -- docs/NVFP4_NATIVE_LAYOUT_CONTRACT.md.
+FP4_NATIVE_MIXED_ARGV = ("--fp4-gemm-backend", "native-mixed")
+
+
+def uniform_marlin_argv(
+    quant_method: str, uniform_marlin: bool, fp4_native_mixed: bool = False
+) -> List[str]:
+    """The server argv BOTH groups get for --fp8-uniform-marlin: the NVFP4
+    Marlin backend for a ModelOpt checkpoint, nothing otherwise (FP8 is forced
+    through the environment). With --fp4-native-mixed the NVFP4 linears get
+    the native-mixed backend instead (one native layout, kernel per rank); the
+    FP8 linears stay on Marlin."""
+    if uniform_marlin and str(quant_method or "").lower() == "modelopt":
+        return list(FP4_NATIVE_MIXED_ARGV if fp4_native_mixed else FP4_UNIFORM_MARLIN_ARGV)
+    return []
+
+
+def fp4_native_mixed_env(um_argv: Sequence[str]) -> Dict[str, str]:
+    """The environment --fp4-native-mixed adds (launcher + both groups), ONE
+    boot-uniform switch read by (a) the exchange class names -- the NVFP4 native
+    parameters become leaves of their linear's class (contract L4) -- and (b)
+    the planner's NVFP4 lanes (uneven_perf.NVFP4_LANE_RECORD, L7). Empty for
+    every other argv, so no other boot changes."""
+    if tuple(um_argv or ()) == FP4_NATIVE_MIXED_ARGV:
+        return {"SGLANG_FP4_NATIVE_MIXED_BOOT": "1"}
+    return {}
+
+
+def fp4_native_mixed_refusal(
+    quant_method: str, uniform_marlin: bool, fp4_native_mixed: bool
+) -> Optional[str]:
+    """W160 text when --fp4-native-mixed cannot hold: it only re-routes the
+    NVFP4 linears of a ModelOpt checkpoint, and the FP8 linears of that same
+    checkpoint still need --fp8-uniform-marlin for one layout. None = fine."""
+    if not fp4_native_mixed:
+        return None
+    if str(quant_method or "").lower() != "modelopt":
+        return ("W160 Weg2Fp8LayoutRefused: --fp4-native-mixed applies to a ModelOpt "
+                "NVFP4 checkpoint only; this checkpoint's quant_method is %r"
+                % (quant_method or "none"))
+    if not uniform_marlin:
+        return ("W160 Weg2Fp8LayoutRefused: --fp4-native-mixed moves only the NVFP4 "
+                "linears to the native layout; the FP8 linears of the same ModelOpt "
+                "checkpoint still need --fp8-uniform-marlin (one layout on every rank)")
+    return None
+
+
+def with_uniform_marlin_argv(extra: str, argv: Sequence[str]) -> str:
+    """``--extra-p`` / ``--extra-d`` with :func:`uniform_marlin_argv` appended;
+    unchanged when it is empty or already carries the same backend. A different
+    --fp4-gemm-backend in the extras is REFUSED (W160): the flag promises one
+    layout on every rank and an operator-pinned backend would break it."""
+    if not argv:
+        return extra
+    toks = shlex.split(extra or "")
+    flag, value = argv[0], argv[1]
+    for i, tok in enumerate(toks):
+        got = None
+        if tok == flag and i + 1 < len(toks):
+            got = toks[i + 1]
+        elif tok.startswith(flag + "="):
+            got = tok.split("=", 1)[1]
+        if got is None:
+            continue
+        if got == value:
+            return extra
+        raise Weg2LaunchRefused(
+            "W160 Weg2Fp8LayoutRefused: --fp8-uniform-marlin puts every NVFP4 linear "
+            "on Marlin (%s %s) on BOTH groups, but the group extras pin %s %s -- one "
+            "tensor would have two byte layouts across the flip" % (flag, value, flag, got))
+    return " ".join(shlex.quote(t) for t in toks + list(argv))
+
+
+def fp8_layout_decision(
+    quant_method: str, weight_source: str, uniform_marlin: bool
+) -> Tuple[Dict[str, str], Optional[str]]:
+    """``(env for BOTH groups, log line or None)`` for --fp8-uniform-marlin;
+    raises W160 for the one combination that cannot flip correctly.
+
+    * not an FP8 checkpoint: ``{}``; the flag is inert (named once if given);
+    * FP8 + the flag: :data:`FP8_UNIFORM_MARLIN_ENV` on every rank;
+    * FP8 under ``--weg2-weight-source exchange`` WITHOUT the flag: REFUSED --
+      the 5090 and the 3080s would hold different bytes for one tensor and
+      the exchange would move one card's layout onto the other's;
+    * FP8 under the ring (each group refills ITS OWN bytes on the same card):
+      native per-card layouts never meet, nothing to force; named, not forced.
+    """
+    qm = str(quant_method or "").lower()
+    if qm not in UNIFORM_MARLIN_QUANT_METHODS:
+        if uniform_marlin:
+            return {}, ("WEG2 FP8-UNIFORM-MARLIN inert: the checkpoint's quant_method is %r, "
+                        "not one of %s -- no environment added"
+                        % (qm or "none", "/".join(UNIFORM_MARLIN_QUANT_METHODS)))
+        return {}, None
+    if uniform_marlin:
+        if qm == "modelopt":
+            layout = ("FP8 linears Marlin int32 [K/16,4N] + per-channel scales [1,N], "
+                      "NVFP4 linears Marlin int32 [K/16,2N] + fp8 scales [K/16,N] via "
+                      "server argv %s on both groups; the 5090 gives up its native "
+                      "FP8 and NVFP4 CUTLASS GEMMs for it" % " ".join(FP4_UNIFORM_MARLIN_ARGV))
+        else:
+            layout = ("Marlin int32 [K/16,4N] + group scales [K/128,N] on the 5090 as on "
+                      "the 3080s; the 5090 gives up its native block-FP8 GEMM for it")
+        return dict(FP8_UNIFORM_MARLIN_ENV), (
+            "WEG2 FP8-UNIFORM-MARLIN on (--fp8-uniform-marlin, %s checkpoint): %s on "
+            "every rank of BOTH groups -- one byte layout for the flip exchange (%s); "
+            "the Marlin lock workspace is booked local_scratch and re-zeroed after "
+            "every weights resume (rank line 'WEG2-RESUME local-scratch zeroed=')"
+            % (qm, " ".join("%s=%s" % kv for kv in sorted(FP8_UNIFORM_MARLIN_ENV.items())),
+               layout))
+    if str(weight_source) == WEIGHT_SOURCE_EXCHANGE:
+        if qm == "modelopt":
+            raise Weg2LaunchRefused(
+                "W160 Weg2Fp8LayoutRefused: the checkpoint is a ModelOpt export "
+                "(quant_method modelopt: FP8 and/or NVFP4 linears) and --weg2-weight-source "
+                "exchange moves weight BYTES card to card, but both kernel choices are "
+                "rank-local: a 3080 repacks to Marlin (FP8 int32 [K/16,4N], NVFP4 int32 "
+                "[K/16,2N] + fp8 scales [K/16,N]), the 5090 keeps native layouts (fp8 "
+                "[N,K] + scalar scale; NVFP4 CUTLASS with swizzled block scales). One "
+                "tensor would have two layouts and the flip would copy one onto the "
+                "other. Pass --fp8-uniform-marlin (Marlin on every rank, one layout), or "
+                "run --weg2-weight-source ring.")
+        raise Weg2LaunchRefused(
+            "W160 Weg2Fp8LayoutRefused: the checkpoint is FP8 (quant_method fp8) and "
+            "--weg2-weight-source exchange moves weight BYTES card to card, but the "
+            "FP8 kernel choice is rank-local: a 3080 repacks to Marlin int32 "
+            "[K/16,4N] + group scales, the 5090 keeps native fp8 [N,K] + "
+            "weight_scale_inv. One tensor would have two layouts and the flip would "
+            "copy one onto the other. Pass --fp8-uniform-marlin (Marlin on every "
+            "rank, one layout), or run --weg2-weight-source ring.")
+    return {}, ("WEG2 %s native per-card layouts under --weg2-weight-source %s: each "
+                "group refills its own bytes on its own card, no byte crosses a card "
+                "boundary, nothing forced" % (qm.upper(), weight_source))
+
+
+def p_cut_calibration_line(model_path: str, quant_method: str) -> Optional[str]:
+    """A NAMED line when a non-incumbent checkpoint has no P-cut calibration
+    record: ``argv_p`` otherwise hands it the INT8 incumbent vector unasked
+    (a 64-layer checkpoint without a record is not refused there). None for
+    the incumbent family (compressed-tensors) and for a checkpoint that HAS a
+    record -- default boots print nothing new."""
+    qm = str(quant_method or "").lower()
+    if qm in ("compressed-tensors", ""):
+        return None
+    dg, why = host_ledger.checkpoint_digest(model_path)
+    if not dg:
+        return ("WEG2 P-CUT UNCALIBRATED %s checkpoint: its content digest is unreadable "
+                "(%s) -- the P cut is the pinned one or the INT8 incumbent, NOT a "
+                "measurement of this checkpoint" % (qm, why))
+    rec, rec_why = host_ledger.read_pp_calibration(dg)
+    if rec is not None:
+        return None
+    return ("WEG2 P-CUT UNCALIBRATED %s checkpoint %s: %s. The P cut of this boot is "
+            "the pinned --pp-layer-ratio / --pp-stage-ratio or the INT8 incumbent "
+            "%s -- per-layer costs of %s differ per card (under --fp8-uniform-marlin "
+            "every rank runs Marlin: FP8 W8A16, NVFP4 W4A16), so measure it: #PGAP ladder, "
+            "then weg2/tools/pcut_refit.py or --pp-cut-stage-fit with THIS "
+            "checkpoint's P log" % (qm, dg[:12], rec_why, _csv(P_PP_STAGE_RATIO_SCORES), qm))
+
+
+def p_trim_end_anchor_env(on: bool) -> Dict[str, str]:
+    """Group P's environment for ``--p-trim-end-anchor``: {} when off (the
+    byte-identity guarantee). The variable NAME lives in
+    weg2/p_trim_end_anchor.py, the one module the ranks read it from."""
+    from sglang.srt.weg2 import p_trim_end_anchor as _pt
+
+    return {_pt.TRIM_ENV: "1"} if on else {}
+
+
 def p_host_overlap_env(overlap: bool, hostgap: bool) -> Dict[str, str]:
     """Group P's extra environment for ``--p-host-overlap`` / ``--p-hostgap``.
 
@@ -10886,6 +11785,89 @@ def read_card_power_record(front_log: str) -> Optional[List[Tuple[str, Optional[
     return None
 
 
+_P_LOG_MODEL_RE = re.compile(r"server_args=ServerArgs\(model_path='([^']*)'")
+
+
+def p_log_model_path(path: str, max_lines: int = 20000) -> str:
+    """The ``model_path`` a P log's boot ran (its first server_args line); ``""``
+    when the log names none within ``max_lines``."""
+    try:
+        with open(path, errors="replace") as fh:
+            for n, line in enumerate(fh):
+                if "server_args=ServerArgs(" in line:
+                    m = _P_LOG_MODEL_RE.search(line)
+                    if m:
+                        return m.group(1)
+                if n >= max_lines:
+                    break
+    except OSError:
+        return ""
+    return ""
+
+
+#: The source boot of a census produced by weg2/xchg_census.py, as its
+#: provenance names it ("ring-table boot boot_weg2_<tag>_<tree>_<date>_<time>").
+_CENSUS_SOURCE_BOOT_RE = re.compile(r"ring-table boot (boot_weg2_[A-Za-z0-9_]+)")
+
+
+def census_checkpoint(census_path: str,
+                      evidence_dirs: Sequence[str]) -> Tuple[str, str]:
+    """``(checkpoint path, how it was read)`` of the checkpoint a census was
+    MEASURED on; ``("", why)`` when it cannot be named. The census's own
+    ``checkpoint`` field first (xchg_census.py writes it since weg2xsn441), else
+    the ``server_args`` model_path of its source boot's P log."""
+    try:
+        with open(census_path) as fh:
+            blob = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return "", "the census is unreadable (%s)" % exc
+    ck = blob.get("checkpoint") if isinstance(blob, dict) else None
+    if isinstance(ck, str) and ck:
+        return ck, "the census's own checkpoint field"
+    m = _CENSUS_SOURCE_BOOT_RE.search(str(blob.get("provenance", "")))
+    if not m:
+        return "", "the census names no source boot in its provenance"
+    stem = m.group(1)
+    for d in evidence_dirs:
+        if not d:
+            continue
+        path = os.path.join(d, stem + ".P.log")
+        if os.path.isfile(path):
+            model = p_log_model_path(path)
+            if model:
+                return model, "%s.P.log server_args" % stem
+    return "", ("its source boot %s has no readable P log with a server_args line "
+                "under %s" % (stem, ", ".join(d for d in evidence_dirs if d) or "-"))
+
+
+def census_checkpoint_decision(census_path: str, model_path: str,
+                               evidence_dirs: Sequence[str],
+                               allow_foreign: bool) -> Optional[str]:
+    """The census must price THIS checkpoint (weg2xsn441: the FP8 boot ran on the
+    INT8 census of weg2xsn246, the flip's VRAM was priced for the other
+    checkpoint's bytes, and nothing said so before the metal). None when it
+    does; a NAMED line when it cannot be verified or is allowed foreign;
+    W161 otherwise -- in the dry run, before any card is touched."""
+    src, how = census_checkpoint(census_path, evidence_dirs)
+    if not src:
+        return ("WEG2 XCHG-CENSUS checkpoint UNVERIFIED: %s -- the flip's VRAM peaks "
+                "are priced from %s for a checkpoint this launcher cannot name"
+                % (how, census_path))
+    if os.path.realpath(src) == os.path.realpath(str(model_path)):
+        return None
+    what = ("the census %s was measured on %s (%s); this boot runs %s -- its "
+            "per-tag bytes, dormant residue and flip peaks are the other "
+            "checkpoint's (format, scale geometry, embedding dtype, load residue)"
+            % (census_path, src, how, model_path))
+    if allow_foreign:
+        return ("WEG2 XCHG-CENSUS FOREIGN (allowed by --weg2-xchg-census-foreign): "
+                + what + " -- this boot MEASURES its own census, it is not priced by one")
+    raise Weg2LaunchRefused(
+        "W161 Weg2XchgCensusForeign: " + what + ". Produce this checkpoint's census "
+        "(weg2/xchg_census.py --ring-table-boot <a boot of it>), or pass "
+        "--weg2-xchg-census-foreign for the boot that measures it.")
+
+
 def stage_fit_family_cost(ns, cards: Sequence[Card], chunk_tokens: int,
                           limits_now: Sequence[Optional[float]], log):
     """--pp-cut-stage-fit: the P cut's stage cost FITTED from a boot's #PGAP
@@ -10902,10 +11884,10 @@ def stage_fit_family_cost(ns, cards: Sequence[Card], chunk_tokens: int,
 
     arg = str(getattr(ns, "pp_cut_stage_fit", "") or "").strip()
     if arg == "auto":
-        _line = getattr(ns, "weg2_line_id", None)
+        # UNIFY S7: the form's calibration identity (27B line_identity merged, S3)
         path, seen = _fit.newest_pgap_log(
             EVIDENCE_DIR, int(chunk_tokens), len(cards),
-            accept=_line.accepts_log if _line is not None else None)
+            accept=calib_log_accept_of(ns))
         for s in seen:
             log("PP-CUT STAGE FIT auto: " + s)
         if path is None:
@@ -10922,6 +11904,16 @@ def stage_fit_family_cost(ns, cards: Sequence[Card], chunk_tokens: int,
                 f"it ran {fitted.chunk_tokens}-token P chunks, this boot runs "
                 f"{int(chunk_tokens)}; the attention cost per chunk is chunk-specific "
                 "(192 CTAs at 512 on the 5090), so a fit does not transfer")
+        _fit_model = p_log_model_path(path)
+        _want = str(getattr(ns, "model", "") or "")
+        # Checked where both checkpoints exist on disk (a log naming a path that
+        # is gone cannot be compared, and says so in the provenance below).
+        if (_fit_model and _want and os.path.isdir(_fit_model) and os.path.isdir(_want)
+                and os.path.realpath(_fit_model) != os.path.realpath(_want)):
+            raise _fit.StageFitRefused(
+                f"it ran checkpoint {_fit_model}, this boot runs {_want}; per-layer "
+                "costs are a property of the checkpoint's kernels (INT8 W8A8 vs FP8 "
+                "Marlin W8A16), so a fit does not transfer between checkpoints")
         cost, prov = _fit.fit_stage_cost(fitted, [c.name for c in cards])
     except (_fit.StageFitRefused, OSError, ValueError, ZeroDivisionError) as exc:
         raise Weg2LaunchRefused(f"W40 Weg2PPCutRefused: --pp-cut-stage-fit {path}: {exc}")
@@ -12622,7 +13614,7 @@ def solve_p_cut(
     from sglang.srt.planner import pp_cut as _pp_cut
     from sglang.srt.planner import pp_cut_launch as _cut
 
-    cfg_path = os.path.join(model, "config.json")
+    cfg_path = model_config_path(model)
     with open(cfg_path) as fh:
         cfg = json.load(fh)
     text_cfg = cfg.get("text_config") or cfg
@@ -13613,6 +14605,16 @@ def build_parser() -> argparse.ArgumentParser:
                          "nextflash = P PP3 + D Form A, uneven-DCP env per group, no DCP flag half.")
     # WEG2-FORM: --form-arch/--form-experts/--form-draft/--form-p-draft/--form-kv
     weg2_form.add_form_arguments(ap)
+    ap.add_argument(
+        "--tokenizer-path", default="",
+        help="27B line G2: the tokenizer directory BOTH groups load "
+             "(--tokenizer-path on P and D). Default empty: nothing is added and "
+             "the server reads the tokenizer from --model -- byte-identical argv. "
+             "Needed for a GGUF --model whose directory holds no tokenizer files "
+             "(qwen35 GGUFs load their tokenizer only from sibling files); the "
+             "launcher refuses such a GGUF without it (W163) before any card is "
+             "touched.",
+    )
     # #1360: THE NAMED DEVIATION, flag only. The user's standing rule of
     # 2026-09-12 makes the reap mark soft -- crossing it is allowed WITH a
     # reason and a runtime latch, never silently -- and until now the launcher
@@ -14031,6 +15033,102 @@ def build_parser() -> argparse.ArgumentParser:
              "capture cost per stage is the rank line 'PREFILL-GRAPH captured "
              "... capture_mib='. Changes P's form key (chunk + graph config "
              "are device allocations). User goal: 512.")
+    ap.add_argument(
+        "--p-chunk-policy", choices=["fixed", "dynamic"], default=P_CHUNK_POLICY_DEFAULT,
+        help="Group P prefill chunk width (27B and NF line, weg2/p_chunk_policy.py). "
+             "'fixed' (the default for this release candidate) = today: every forward "
+             "takes --chunked-prefill-size; argv, env and the P form key are "
+             "byte-identical. 'dynamic' = a per-request plan priced on a per-stage "
+             "time model as a pipeline (flow shop): a middle size from the ladder "
+             "--p-chunk-min * 2^k .. --p-chunk-max, optional doubling head ramp and "
+             "halving tail ramp; the fixed plan wins unless another is predicted "
+             "--p-chunk-min-gain faster. Group P's --chunked-prefill-size becomes "
+             "--p-chunk-max (the planner prices the corridor at it); chunks above the "
+             "largest prefill graph bucket run eager. Rank lines 'P-CHUNK-POLICY "
+             "armed' / 'P-CHUNK-POLICY plan', launcher lines with the dry-run plans.")
+    ap.add_argument(
+        "--p-chunk-max", type=int, default=P_CHUNK_MAX_DEFAULT, metavar="TOKENS",
+        help="Only with --p-chunk-policy dynamic: the widest chunk (default "
+             f"{P_CHUNK_MAX_DEFAULT}); becomes group P's --chunked-prefill-size.")
+    ap.add_argument(
+        "--p-chunk-min", type=int, default=0, metavar="TOKENS",
+        help="Only with --p-chunk-policy dynamic: the smallest planned chunk (a "
+             "final rest may be shorter). 0 (default) = --p-chunk-fixed.")
+    ap.add_argument(
+        "--p-chunk-fixed", type=int, default=0, metavar="TOKENS",
+        help="Only with --p-chunk-policy dynamic: the fixed baseline the plan must "
+             "beat. 0 (default) = the fixed policy's chunk (the --p-prefill-graph "
+             "bucket, else 4096). With --p-chunk-min = --p-chunk-max = this value the "
+             "width is FORCED (a metal probe of one chunk size).")
+    ap.add_argument(
+        "--p-chunk-model", default=P_CHUNK_MODEL_DEFAULT, metavar="SRC",
+        help="Only with --p-chunk-policy dynamic: the per-stage time model. "
+             "'builtin-int8' (default; the weg2rc7c #PGAP fit, INT8 cut 42/11/11), "
+             "'fit:<P.log>' (fit the #PGAP lines of that boot's P log, prefixes "
+             "[0,32k)), or a JSON file {\"stages\": [StageModel JSON, ...]}.")
+    ap.add_argument(
+        "--p-chunk-mscale", choices=sorted(P_CHUNK_MSCALES), default=P_CHUNK_MSCALE_DEFAULT,
+        help="Only with --p-chunk-policy dynamic and a builtin/fit model: the "
+             "per-token cost curve over the chunk width per stage ('int8' / "
+             "'nvfp4': the 5090 kernel-bench HOCHRECHNUNG on PP0, 3080 stages flat "
+             "until measured; 'flat': no kernel gain anywhere).")
+    ap.add_argument(
+        "--p-chunk-grid", type=int, default=0, metavar="TOKENS",
+        help="Only with --p-chunk-policy dynamic: no chunk crosses an absolute "
+             "multiple of TOKENS (0 = off, the 27B default: its P anchors are "
+             "distance-based). The NF line sets 4096.")
+    ap.add_argument(
+        "--p-chunk-dynamic-min-tokens", type=int, default=P_CHUNK_DYNAMIC_MIN_TOKENS_DEFAULT,
+        metavar="TOKENS",
+        help="Only with --p-chunk-policy dynamic: a request whose remaining prompt is at "
+             f"most TOKENS (default {P_CHUNK_DYNAMIC_MIN_TOKENS_DEFAULT}) is not planned -- "
+             "every forward gets the fixed width (--p-chunk-fixed), as under 'fixed'. "
+             "rc9j measured 2k/8k slower under dynamic although the plan was 512xn. "
+             "0 = plan every request.")
+    ap.add_argument(
+        "--p-chunk-min-gain", type=float, default=0.01, metavar="FRACTION",
+        help="Only with --p-chunk-policy dynamic: a plan other than fixed is taken "
+             "only when predicted at least this much faster (default 0.01).")
+    ap.add_argument(
+        "--p-trim-end-anchor", action="store_true",
+        help="Group P (27B line): take every front leg-1 prompt of N tokens as "
+             "N-1, at the token level in P's intake. P's last regular chunk then "
+             "ends at N-1 and its finish insert is the N-1 anchor D resumes from "
+             "(D claims at most N-1 tokens and computes the last one itself), so "
+             "the 1-token END-OF-PREFILL ANCHOR forward (xsn430/433: 35-40 ms per "
+             "stage) never runs. prompt_tokens and the #1442 hand-off still carry "
+             "all N; N<2, read outputs, sessions, input embeds and multimodal "
+             "prompts keep today's split. Adds SGLANG_WEG2_P_TRIM_END_ANCHOR=1 to "
+             "group P only; default off = argv and env byte-identical.")
+    ap.add_argument(
+        "--fp8-uniform-marlin", action="store_true",
+        help="27B line, an FP8 checkpoint (Qwen/Qwen3.8-27B-FP8, block 128x128) on "
+             "the flip: force the Marlin FP8 kernel on EVERY rank of both groups "
+             "(SGLANG_FORCE_FP8_MARLIN=1) so the 5090 holds the same byte layout "
+             "as the 3080s (Marlin int32 [K/16,4N] + group scales) and the "
+             "exchange can move bytes between them; the 5090 gives up its native "
+             "block-FP8 GEMM for it. Marlin's per-card lock workspace is booked "
+             "local_scratch by the exchange coverage and re-zeroed after every "
+             "weights resume (weight_exchange.zero_local_scratch). Also a ModelOpt "
+             "checkpoint (quant_method modelopt, e.g. RadixArk Qwen3.8-27B-NVFP4): "
+             "its FP8 linears the same way, its NVFP4 linears through "
+             "--fp4-gemm-backend marlin on both groups. Without it such a checkpoint "
+             "under --weg2-weight-source exchange is refused (W160). Inert on any "
+             "other checkpoint; default off = argv and env byte-identical.")
+    ap.add_argument(
+        "--fp4-native-mixed", action="store_true",
+        help="Backlog #38, together with --fp8-uniform-marlin on a ModelOpt NVFP4 "
+             "checkpoint: the NVFP4 linears get --fp4-gemm-backend native-mixed on "
+             "both groups instead of marlin -- ONE native NVFP4 byte layout on every "
+             "rank (E2M1 [N,K/2] + 128x4-swizzled E4M3 block scales), the kernel "
+             "chosen per rank (sm_120 native W4A4, sm_86 W4A8 on the INT8 tensor "
+             "cores from the same bytes; SGLANG_FP4_NATIVE_MIXED_SM8X=marlin opts into "
+             "Marlin W4A16 with its content permuted in place around every flip). "
+             "Sets SGLANG_FP4_NATIVE_MIXED_BOOT=1 for launcher and ranks (exchange "
+             "class leaves L4, planner NVFP4 lane record L7). The FP8 "
+             "linears stay on Marlin. Refused (W160) without --fp8-uniform-marlin "
+             "or on a non-ModelOpt checkpoint. Default off = argv and env "
+             "byte-identical.")
     ap.add_argument(
         "--p-prefill-graph-tiny", default="", metavar="TOKENS[,TOKENS]",
         help="Only with --p-prefill-graph (27B line). Empty (the default) = off: "
@@ -14465,6 +15563,15 @@ def build_parser() -> argparse.ArgumentParser:
              "never a number on this command line. Required by "
              "--weg2-weight-source exchange; absent, the launcher REFUSES by "
              "name (W71) rather than invent a table",
+    )
+    ap.add_argument(
+        "--weg2-xchg-census-foreign", action="store_true",
+        help="27B line (weg2xsn441): accept a --weg2-xchg-census that was MEASURED "
+             "on another checkpoint than --model (named line WEG2 XCHG-CENSUS "
+             "FOREIGN). Without it such a census is refused in the dry run (W161): "
+             "its tag bytes, dormant residue and flip peaks are the other "
+             "checkpoint's. For the boot that measures this checkpoint's census. "
+             "Default off; a census of the booted checkpoint prints nothing new.",
     )
     ap.add_argument("--ring-table-boot", default="",
                     help="pin the ring table to ONE boot instead of the newest usable "
@@ -15199,6 +16306,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     calib_log_accept = calib_log_accept_of(ns)
     apply_spec_form(ns)
     apply_p_prefill_graph(ns)
+    # --p-chunk-policy: after the graph (reads its buckets), before any argv.
+    apply_p_chunk_policy(ns)
+    # 27B line G2: the one tokenizer both groups load, installed before any
+    # argv is built; its line is logged with the checkpoint lines under 1a'.
+    tokenizer_line = apply_tokenizer_path(ns)
     # #1386: THE SWITCH IS RESOLVED HERE, ONCE, AS EARLY AS `ns` EXISTS --
     # earlier than `draft_kv_on_p` below, because the FIRST `common_flags`
     # call (the sentinel `chunk_tokens` solve, several hundred lines down)
@@ -15362,6 +16474,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "source counts only when its boot ran " + calib_identity.describe())
         log("#114 P-PREFILL-TRANSIENT (form " + boot_form.describe() + "): "
             + p_prefill_transient_for(boot_form)[1])
+    # 27B line (24.09., 159333c14d): group D's planner overhead, MEASURED on the
+    # newest D log that passes this boot's calibration identity (UNIFY S7: the
+    # form's CalibrationIdentity replaces the 27B LineIdentity).
+    # None = the flat default, named on the line.
+    d_overhead_mib, _d_overhead_prov = d_overhead_calibration(str(ns.model), calib_identity)
+    log("WEG2 D-PLANNER-CALIBRATION " + ("overhead " if d_overhead_mib is not None
+                                          else "UNCALIBRATED (flat 2304 MiB/rank): ")
+        + _d_overhead_prov)
     if dirty and not dry:
         raise Weg2LaunchRefused("tree is not clean -- boot from a COMMITTED tip only")
     py = f"{ns.venv}/bin/python"
@@ -15498,6 +16618,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"--drain-deadline-s {ns.drain_deadline_s} --fairness-w-s {ns.fairness_w_s}"
         + ("" if ns.min_dwell_ms is None else f" --min-dwell-ms {ns.min_dwell_ms}"))
 
+    # 1a'. 27B FP8: one byte layout for the flip (W160 refusal without the
+    # flag under the exchange), and a NAMED line when a non-incumbent checkpoint
+    # has no P-cut calibration record (argv_p would hand it the INT8 vector).
+    _quant = checkpoint_quant_method(str(ns.model))
+    _fp8_env, _fp8_line = fp8_layout_decision(
+        _quant, str(getattr(ns, "weg2_weight_source", WEIGHT_SOURCE_DEFAULT)),
+        bool(getattr(ns, "fp8_uniform_marlin", False)))
+    if _fp8_line:
+        log(_fp8_line)
+    # RadixArk NVFP4 (ModelOpt): the NVFP4 linears' Marlin backend is a SERVER
+    # argument, appended to both groups' extras here, before any argv is built.
+    _nm_refused = fp4_native_mixed_refusal(
+        _quant, bool(getattr(ns, "fp8_uniform_marlin", False)),
+        bool(getattr(ns, "fp4_native_mixed", False)))
+    if _nm_refused:
+        raise Weg2LaunchRefused(_nm_refused)
+    _um_argv = uniform_marlin_argv(
+        _quant, bool(getattr(ns, "fp8_uniform_marlin", False)),
+        bool(getattr(ns, "fp4_native_mixed", False)))
+    _nm_env = fp4_native_mixed_env(_um_argv)
+    if _nm_env:
+        # #38 L4: ONE class reading for the launcher's census and every rank
+        # (build_env copies os.environ), set before any census is taken.
+        os.environ.update(_nm_env)
+        log("WEG2 FP4-NATIVE-MIXED env for launcher and BOTH groups: %s"
+            % " ".join("%s=%s" % kv for kv in sorted(_nm_env.items())))
+    if _um_argv:
+        ns.extra_p = with_uniform_marlin_argv(ns.extra_p, _um_argv)
+        ns.extra_d = with_uniform_marlin_argv(ns.extra_d, _um_argv)
+        log("WEG2 FP8-UNIFORM-MARLIN argv for BOTH groups: %s (--extra-p now %r, "
+            "--extra-d now %r)" % (" ".join(_um_argv), ns.extra_p, ns.extra_d))
+    _calib_line = p_cut_calibration_line(str(ns.model), _quant)
+    if _calib_line:
+        log(_calib_line)
+    if tokenizer_line:
+        log(tokenizer_line)
+
     # 1b. #1233 one-backup flip geometry + the patched saver hook
     n_layers = model_num_layers(ns.model)
     chunk_count = max(0, int(ns.weight_chunks))
@@ -15547,8 +16704,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # the xsn14 constant; the constant is the fallback with a printed reason.
     # WEG2-FORM (24.09.): only a record MEASURED ON THIS CHECKPOINT -- xsn417
     # (Qwen3.8-27B) priced the Next-Flash boot fnFL2x142's D residue here.
+    # 27B RC1 (f1c9a43964) / UNIFY S7: with the profile's ``d_capture_set``
+    # record term, only a sample of THIS capture set (D --max-running-requests
+    # d_bs) prices D's dormant residue (d_residue_record_accept).
+    _dc_accept = (d_residue_record_accept(calib_identity, d_bs)
+                  if calib_identity is not None and calib_identity.uses_d_capture_set
+                  else calib_sample_accept)
     _dc_rec_d = host_ledger.read_measured_record(
-        measured_record_path(), accept=calib_sample_accept).get("D")
+        measured_record_path(), accept=_dc_accept).get("D")
     _dc_from_record, _dc_record_prov = dc_residue_from_record(
         _dc_rec_d, cards, ns.weg2_weight_source)
     if _dc_rec_d is None and calib_sample_accept is not None:
@@ -15561,6 +16724,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _dc_record_prov += (
             f" [WEG2-FORM calibration identity: {boot_form.model}, "
             f"{' '.join(a + '=' + getattr(boot_form, a) for a in weg2_form.RESIDUE_AXES)}]")
+    if calib_identity is not None and calib_identity.uses_d_capture_set:
+        _dc_record_prov += f" [capture set --max-running-requests {int(d_bs)}]"
     dc_expect_d = {
         c.uuid: (
             _dc_from_record[c.uuid] if _dc_from_record is not None
@@ -15619,6 +16784,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # `prepare_weight_exchange` (200 lines down) is the same named refusal
         # with the same text, only sooner; the richer W71 of an UNFUNDABLE peak
         # still comes from that gate, which is the only place that solves one.
+        # weg2xsn441: the census must be THIS checkpoint's (W161 in the dry run).
+        _census_line = census_checkpoint_decision(
+            ns.weg2_xchg_census, str(ns.model),
+            (ns.evidence_dir, EVIDENCE_DIR),
+            bool(getattr(ns, "weg2_xchg_census_foreign", False)))
+        if _census_line:
+            log(_census_line)
         _xr, _ = xchg_form_dormant_reserve(cards, ns.weg2_xchg_census, log=log)
         # Die Census-Messung ersetzt die Konstante auch im BUDGET von P
         # (`budgets_from_dc` zieht dc_expect_d ab) und im W19-Riegel -- EINE
@@ -15866,6 +17038,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if p_prefill_graph_bucket():
         # Only when on: the default boot's front log stays byte-identical.
         log(p_prefill_graph_line())
+    # --p-chunk-policy: [] under 'fixed' (front log byte-identical).
+    for _pcl in p_chunk_policy_lines():
+        log(_pcl)
     if not hicache_disabled:
         log(hicache_draft_tier_line())
     # --d-replayssm-spec (27B ReplaySSM S6): D's verify form, both states named.
@@ -16590,6 +17765,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
+    # P-TRIM-END-ANCHOR (weg2/p_trim_end_anchor.py): {} when off, so the
+    # default env stays byte-identical; on, P takes a leg-1 prompt as N-1 and
+    # the 1-token END-ANCHOR forward above never runs for it.
+    _p_trim_env = p_trim_end_anchor_env(bool(getattr(ns, "p_trim_end_anchor", False)))
+    env_p.update(_p_trim_env)
+    if _p_trim_env:
+        log("WEG2 P-TRIM-END-ANCHOR: on (--p-trim-end-anchor) -- group P takes every "
+            "front leg-1 prompt of N tokens as N-1 (token level, at its intake): the "
+            "last regular chunk ends at N-1, the finish insert is the N-1 anchor D "
+            "claims, no 1-token END-ANCHOR forward; prompt_tokens and the #1442 "
+            "hand-off still carry N; N<2, read outputs, sessions, embeds and "
+            "multimodal prompts stay on the split path (rank line 'WEG2 "
+            "P-TRIM-END-ANCHOR kept(<reason>)')")
     # #1465: group P's write-through copy kernels at high stream priority, so
     # the backlog measured on weg2xsn219 (P running-req 2: 72 -> 103 un-backed
     # nodes, 2.0-2.8 s flush drain at the flip) does not build behind a
@@ -16638,6 +17826,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if p_prefill_graph_bucket() else "",
             )
         )
+    # --p-chunk-policy: {} under 'fixed' (env byte-identical).
+    env_p.update(p_chunk_policy_env())
     if _pg_pool:
         log(
             "WEG2 P-PREFILL-GRAPH post 'prefill graph pool' MiB per stage = %s "
@@ -16915,6 +18105,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
             d_bs, getattr(ns, "env_d", "") or "",
             user_reserve_by_card=user_reserve_by_card,
+            overhead_mib_by_rank=d_overhead_mib,
         )
         log(d_ratio.line)
         log(d_ratio.op_line)
@@ -16922,7 +18113,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap)
         _sg = ";".join(f"{k}={v}" for k, v in sorted(env_d.items()) if str(k).startswith("SGLANG_"))
         log(f"WEG2-GROUP-ENV D: {_sg or '(leer)'}")
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, max_kv_per_request, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns)), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, max_kv_per_request, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
         state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
         launch_group(spec_d, tree, log, dry)
         if dry:
@@ -16963,7 +18154,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
                            if str(k).startswith("SGLANG_"))
             log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns)), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -17063,6 +18254,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
         d_bs, getattr(ns, "env_d", "") or "",
         user_reserve_by_card=user_reserve_by_card,
+        overhead_mib_by_rank=d_overhead_mib,
     )
     log(d_ratio.line)
     log(d_ratio.op_line)
@@ -17081,7 +18273,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
                        if str(k).startswith("SGLANG_"))
         log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns)), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid

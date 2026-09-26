@@ -261,6 +261,21 @@ def _weg2_identity(owner, method: str, default):
     return default if got is None else got
 
 
+def _runner_load_format(runner, fallback):
+    """The load format THIS runner was loaded with -- its own ``load_config``,
+    built from ``server_args.load_format`` at the moment the runner was created
+    (the target before, the draft after the scheduler's
+    ``--speculative-draft-load-format`` override). Never the process-wide
+    ``server_args.load_format``, which after that override names the DRAFT's
+    format for the whole process (27B line GGUF, 2026-09-25: a GGUF target with
+    ``--speculative-draft-load-format auto`` would reload its ``.gguf`` with
+    ``auto``). ``fallback`` only where no runner or no ``load_config`` exists."""
+    fmt = getattr(getattr(runner, "load_config", None), "load_format", None)
+    if fmt is None:
+        return fallback
+    return getattr(fmt, "value", fmt)
+
+
 def _get_draft_model_runner(draft_worker):
     # DFlash / FrozenKVMTP workers expose draft_model_runner directly
     runner = getattr(draft_worker, "draft_model_runner", None)
@@ -558,6 +573,11 @@ class SchedulerWeightUpdaterManager:
     #: ``AttributeError`` raised ONLY on the retry path, i.e. only after a
     #: failure has already happened -- the worst possible place to learn it.
     weg2_leg_ledger: Any = None
+    #: #38 N4C (93bc802e34): set when the NVFP4 draft was refilled from disk at
+    #: this wake (its content is native, not Marlin), read-and-cleared by
+    #: :meth:`_weg2_nvfp4_marlin_after_wake`. A FIELD for the sixth time in this
+    #: class: the lazy write killed EVERY rank's first wake in rc8a (INT8 too).
+    _weg2_nvfp4_draft_disk_reloaded: bool = False
 
     #: #1329: FIELDS FOR THE FOURTH AND FIFTH TIME IN THIS CLASS, and the
     #: comment above called it three commits early. ``slots=True`` turns a
@@ -3044,7 +3064,12 @@ class SchedulerWeightUpdaterManager:
                     success, message = self.draft_worker.update_weights_from_disk(
                         UpdateWeightFromDiskReqInput(
                             model_path=draft_path,
-                            load_format=getattr(server_args, "load_format", None),
+                            # the DRAFT runner's own format, never the
+                            # process-wide one (_runner_load_format)
+                            load_format=_runner_load_format(
+                                _get_draft_model_runner(self.draft_worker),
+                                getattr(server_args, "load_format", None),
+                            ),
                             flush_cache=False,
                             torch_empty_cache=False,
                         )
@@ -3064,6 +3089,10 @@ class SchedulerWeightUpdaterManager:
                 "pages are committed but their content is undefined; this "
                 "group is fatal."
             )
+        # #38 L8: the draft's NVFP4 bytes came from the loader (which stamps
+        # them itself), not from the exchange -- the after-wake hook must not
+        # re-stamp them native.
+        self._weg2_nvfp4_draft_disk_reloaded = True
         return True
 
     def _weg2_xchg_inject_from_peer(self, *, terms, tag=None, **kw) -> bool:
@@ -3272,6 +3301,33 @@ class SchedulerWeightUpdaterManager:
         # `covered_lanes` for the lane-sparse-tag shape a pipeline source
         # produces.
         from sglang.srt.weg2 import weight_exchange_bounce as _bx
+        # F2 (boot weg2rc5gg, 2026-09-25): READ THE COLLECT'S OWN TARGETS
+        # BEFORE ANY LANE WRITES.  weg2rc5gg's first flip died in a SIGSEGV in
+        # `memcpy_async` on P PP1 (lane p0, weights_5): the GGUF qweights sit
+        # in the BASE tag (allocated at load time) while the plan files them
+        # under their layer's chunk tag, so the collect wrote into pages no
+        # resumed tag held.  The resume loop's PTRATTR row had read it three
+        # seconds earlier (`unmapped=24`) and only printed it.  The refusal
+        # reads THIS slice's descriptors, not that row's name census, which
+        # walks the DRAFT model on D and misreads 150 of 750 RC4 readings
+        # there (collect_target_census says why).  The device bind is the
+        # lanes' own first step (`create_stream` -> `set_device`), taken one
+        # step early so the driver probe has the rank's context on the wake
+        # worker's fresh thread.
+        if _cdescs:
+            _bind = getattr(ops, "set_device", None)
+            if callable(_bind):
+                try:
+                    _bind(int(device))
+                except Exception:  # noqa: BLE001 -- the lanes bind it themselves
+                    pass
+            _dst = _bx.collect_target_census(
+                _cdescs, tag=tag,
+                no_write=getattr(self, "_weg2_xchg_no_write", None))
+            logger.info("WEG2-XCHG-DST-CENSUS group=%s rank=%s %s", group,
+                        rank, _dst.line())
+            if _dst.unmapped:
+                raise Weg2WakeRefused(_dst.refusal(group=group, rank=int(rank)))
         try:
             _covered_lanes = set(_bx.group_descs_by_pair(list(plan.descs)).keys())
         except Exception:  # noqa: BLE001 -- an unbuildable coverage keeps the per-tag set
@@ -3525,7 +3581,12 @@ class SchedulerWeightUpdaterManager:
                     out = self.update_weights_from_disk(
                         UpdateWeightFromDiskReqInput(
                             model_path=server_args.model_path,
-                            load_format=getattr(server_args, "load_format", None),
+                            # the TARGET runner's own format, never the
+                            # process-wide one (_runner_load_format)
+                            load_format=_runner_load_format(
+                                getattr(self.tp_worker, "model_runner", None),
+                                getattr(server_args, "load_format", None),
+                            ),
                             flush_cache=False,
                             torch_empty_cache=False,
                         )
@@ -4217,6 +4278,69 @@ class SchedulerWeightUpdaterManager:
         if not census:
             return weights_only
         return {str(t): int(v) for t, v in census.items()}, WEG2_TAG_POPULATION_ALL
+
+    def _weg2_kv_group_all(self, mine: bool, what: str) -> bool:
+        """xsn410: a per-rank yes/no made group-uniform (AND over the gloo cpu
+        group). Used for every decision that gates a path carrying a collective
+        (the kv resume half): the early/late plan and the mid-legs resume. Logs
+        only when the ranks disagree. World 1 / no group: the own answer."""
+        group = getattr(self, "tp_cpu_group", None)
+        try:
+            world = int(torch.distributed.get_world_size(group=group)) if group is not None else 1
+        except Exception:  # noqa: BLE001 -- no process group: single rank
+            world = 1
+        if world <= 1:
+            return bool(mine)
+        gathered: List[Optional[bool]] = [None] * world
+        torch.distributed.all_gather_object(gathered, bool(mine), group=group)
+        verdict = all(v is True for v in gathered)
+        if verdict != bool(mine) or len(set(gathered)) > 1:
+            logger.info("WEG2-WAKE-KV GROUP %s: votes=%s -> %s (this rank said %s)",
+                        what, gathered, verdict, bool(mine))
+        return verdict
+
+    def _weg2_kv_group_verdict(self, mine: bool, kv_epoch) -> bool:
+        """xsn409 (20.09.): the kv_cache resume verdict of a wake is the WHOLE TP
+        group's. Every rank contributes ok/refused over the gloo cpu group; if any
+        rank refused (W114 Weg2KvResumeRefused), a rank that already resumed and
+        cleared its pool pauses it again, sets the dormant flag back and forgets
+        the resumed epoch, so all ranks answer the front's post-legs kv call from
+        the same dormant image. A split group (awake ranks beside a dormant one)
+        hangs in the scheduler loop's next collective -- xsn409: three silent
+        ranks, the front's second kv RPC never dispatched. World 1: own verdict."""
+        group = getattr(self, "tp_cpu_group", None)
+        try:
+            world = int(torch.distributed.get_world_size(group=group)) if group is not None else 1
+        except Exception:  # noqa: BLE001 -- no process group: single rank
+            world = 1
+        if world <= 1:
+            return bool(mine)
+        gathered: List[Optional[bool]] = [None] * world
+        torch.distributed.all_gather_object(gathered, bool(mine), group=group)
+        refused = [i for i, v in enumerate(gathered) if v is not True]
+        if not refused:
+            return True
+        logger.error(
+            "W114 Weg2KvResumeRefused GROUP epoch=%s: rank(s) %s refused the kv_cache "
+            "resume, this rank had %s -- every rank steps back to the dormant image "
+            "(kv_cache paused, dormant set, epoch not done) so the post-legs kv call "
+            "resumes the group together instead of splitting it",
+            kv_epoch, refused, "resumed" if mine else "refused too",
+        )
+        if mine:
+            try:
+                self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            except Exception as exc:  # noqa: BLE001 -- named, never a silent split
+                logger.error("W114 group step-back: pause(kv_cache) raised %s: %s", type(exc).__name__, exc)
+            scheduler = getattr(self, "scheduler", None)
+            if scheduler is not None:
+                try:
+                    scheduler.weg2_dormant = True
+                except Exception:  # noqa: BLE001
+                    pass
+            self._weg2_kv_resumed_epoch = None
+        self._weg2_kv_deferred = True
+        return False
 
     def _weg2_wake_kv_first_ok(self, tags) -> bool:
         """Wake-Parallel (user 18.09.): may the kv_cache pool be resumed BEFORE
@@ -7041,6 +7165,34 @@ class SchedulerWeightUpdaterManager:
         self._weg2_owned_name_keys_cache = keys
         return keys
 
+    def _weg2_nvfp4_marlin_to_native(self) -> None:
+        """#38 L8, SLEEP side: Marlin -> native content of every flagged NVFP4
+        linear (nvfp4_marlin_inplace). RAISES on failure: a deposit of Marlin
+        bytes into the native plan would serve wrong weights on the peer."""
+        from sglang.srt.layers.quantization import nvfp4_marlin_inplace as mi
+
+        mi.model_to_native(self._weg2_wake_models())
+
+    def _weg2_nvfp4_marlin_after_wake(self) -> None:
+        """#38 L8, WAKE side: native -> Marlin content. When the exchange
+        carried the bytes they are native whatever the stamps say."""
+        from sglang.srt.layers.quantization import nvfp4_marlin_inplace as mi
+
+        models = self._weg2_wake_models()
+        draft_reloaded = bool(getattr(self, "_weg2_nvfp4_draft_disk_reloaded", False))
+        self._weg2_nvfp4_draft_disk_reloaded = False  # read-and-clear, per wake
+        if not mi.flagged_layers(models):
+            return
+        exchanged = self._weg2_wake_weight_carrier() == self.CARRIER_EXCHANGE
+        target = getattr(getattr(getattr(self, "tp_worker", None), "model_runner", None), "model", None)
+        draft = self._weg2_model_for_group("D")
+        for m in models:
+            # The draft reloaded from disk went through the loader, whose
+            # prepare_layer stamps the truth; everything else the exchange
+            # carried is native whatever its stamp said.
+            native = exchanged and not (draft_reloaded and m is draft and m is not target)
+            mi.model_to_marlin([m], delivered_native=native)
+
     def _weg2_wake_models(self) -> list:
         """fnFL2x38: every model this rank computes with after a wake -- the
         TARGET (tp_worker's runner: MoE layers, Marlin workspaces, expert
@@ -8468,6 +8620,11 @@ class SchedulerWeightUpdaterManager:
             # arrives with part of the family already paused, and reading then
             # would be the campaign (a) fault.
             if not family_paused_before:
+                # #38 L8: an sm_8x native-mixed rank holds Marlin CONTENT in
+                # the native parameters; the digest and the deposit below must
+                # read NATIVE bytes. No flagged layer (every other boot): no
+                # work, no line.
+                self._weg2_nvfp4_marlin_to_native()
                 self._weg2_seam_digest_before(recv_req, weights_tags)
                 _weg2_ph("seam_before")
             # #1284: the NEED series, and the refusal that reads it.  The pause
@@ -8828,6 +8985,14 @@ class SchedulerWeightUpdaterManager:
                 logger.info("WEG2-WAKE-KV-FIT skipped (%s: %s)", type(_exc).__name__, _exc)
                 _kv_floor = 0
             _unfit = kv_resume_fit_refusal(_kv_free, _kv_need, _kv_floor)
+            # xsn410 (20.09.): THE GROUP VERDICT SITS HERE, BETWEEN THE RESUME AND
+            # THE CLEAR HALF. Placed after the clear half (xsn409's fix), it
+            # deadlocked: the two resumed ranks ran the clear half's collective
+            # (_weg2_release_dormant_hold -> _weg2_group_min_flags) while the
+            # refused rank waited in the verdict's all_gather -- three silent
+            # ranks, the front's kv RPC never returned. Every path out of this
+            # resume half votes, the refused ones with False, so the clear half
+            # runs on no rank unless the whole group resumed.
             if _unfit is not None:
                 logger.error(
                     "W114 Weg2KvResumeRefused epoch=%s: %s. The kv_cache tag "
@@ -8841,7 +9006,7 @@ class SchedulerWeightUpdaterManager:
                     "of marking a grave.",
                     _kv_epoch, _unfit,
                 )
-                return False
+                return self._weg2_kv_group_verdict(False, _kv_epoch)
             try:
                 self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
             except Weg2TmsResumeRefused as _exc:
@@ -8850,7 +9015,9 @@ class SchedulerWeightUpdaterManager:
                     "cleared and NOT marked resumed; this rank stays DORMANT.",
                     _kv_epoch, _exc,
                 )
-                return False
+                return self._weg2_kv_group_verdict(False, _kv_epoch)
+            if not self._weg2_kv_group_verdict(True, _kv_epoch):
+                return False  # a sibling refused: the verdict paused this rank's pool again
             self._weg2_kv_resumed_epoch = _kv_epoch
             _weg2_ph("kv_resume")
             scheduler = self.scheduler
@@ -8975,10 +9142,16 @@ class SchedulerWeightUpdaterManager:
         from sglang.srt.weg2.wake_kv import wake_kv_plan as _wk_plan
         _kv_epoch = getattr(recv_req, "epoch", None)
         _kv_in = GPU_MEMORY_TYPE_KV_CACHE in tags
+        # xsn410: the fit is PER RANK (xsn377: TP1 funded, TP0 never) but the plan
+        # must be the GROUP's, because the resume half now carries a collective --
+        # one rank on "early" beside a sibling on "late" would deadlock there.
+        _fundable = (self._weg2_wake_kv_first_ok(tags) if _kv_in else False)
+        if _kv_in:
+            _fundable = self._weg2_kv_group_all(_fundable, "WAKE-KV-FIRST fundable")
         _plan = _wk_plan(
             kv_in_tags=_kv_in,
             weights_in_tags=any(is_weights_family_tag(t) for t in tags),
-            fundable=(self._weg2_wake_kv_first_ok(tags) if _kv_in else False),
+            fundable=_fundable,
             deferred=bool(self._weg2_kv_deferred),
             epoch=_kv_epoch, epoch_done=self._weg2_kv_epoch_done,
             weights_done=(self._weg2_weights_epoch_done is not None
@@ -9343,6 +9516,8 @@ class SchedulerWeightUpdaterManager:
                             _free_mid = self._weg2_free_bytes()
                             _floor_mid = int(self._weg2_corridor_floor_bytes() or 0)
                             _mid_ok = _kv_mid_ok(_free_mid, _floor_mid, _kv_need, _rest_need)
+                            # xsn410: group-uniform, the resume half carries a collective
+                            _mid_ok = self._weg2_kv_group_all(bool(_mid_ok), "WAKE-KV-MID tag=%s" % (tag,))
                             logger.info("WEG2-WAKE-KV-MID %s after tag=%s free=%s MiB floor=%d MiB kv=%d MiB "
                                         "remaining=%d tags(%d MiB)", "RESUME" if _mid_ok else "wait", tag,
                                         (int(_free_mid) >> 20) if _free_mid is not None else None,
@@ -9721,6 +9896,11 @@ class SchedulerWeightUpdaterManager:
                 # have reached the log before it does.
                 self._weg2_seam_digest_after(recv_req, weights_tags)
                 _weg2_ph("seam_after")
+                # #38 L8: AFTER the grader (it hashes the landed native bytes),
+                # before any forward: native -> Marlin content on an sm_8x
+                # native-mixed rank.
+                self._weg2_nvfp4_marlin_after_wake()
+                _weg2_ph("nvfp4_marlin")
 
         if any(is_weights_family_tag(t) for t in tags):
             self._weg2_weights_epoch_done = _kv_epoch  # the legs of this epoch are collected
@@ -9739,6 +9919,12 @@ class SchedulerWeightUpdaterManager:
             # refused resume that marked the epoch done would make the next
             # call answer "done: nothing to do" and leave the group dormant
             # forever with no second chance and no further line in the log.
+            # xsn409 (20.09.): a per-rank kv verdict split the TP group -- two ranks
+            # resumed and cleared, one refused (W114) and stayed DORMANT; the next
+            # collective of the scheduler loop then hung all three. The verdict is the
+            # GROUP's: any refused rank makes every rank step back to the dormant image.
+            # xsn410: the verdict moved INTO `_weg2_kv_resume_part` (between the
+            # resume and the clear half); `_weg2_kv_ok` is group-uniform here.
             if _weg2_kv_ok:
                 self._weg2_kv_epoch_done = _kv_epoch
                 self._weg2_kv_deferred = False

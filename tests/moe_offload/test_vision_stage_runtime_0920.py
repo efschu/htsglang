@@ -169,7 +169,8 @@ def test_the_whole_stage_runs_in_one_order_and_leaves_no_trace():
     rig = Rig([card(2, 4.0)])
     items = [_Item()]
     res = run(rig, items)
-    assert rig.calls == ["flip_armed", "census", "load:2", "encode:1", "release"]
+    # xsn410: the trailing census is the PROOF the tower left the card
+    assert rig.calls == ["flip_armed", "census", "load:2", "encode:1", "release", "census"]
     assert res.plan.card == 2
     assert res.rows == 1024
     assert res.displaced == ()
@@ -190,7 +191,7 @@ def test_a_band_is_displaced_and_restored_around_the_tower():
     assert res.displaced == ("weights_1",)
     assert rig.calls == [
         "flip_armed", "census", "pause:weights_1", "load:2", "encode:1",
-        "release", "resume:weights_1",
+        "release", "resume:weights_1", "census",
     ]
     rig.assert_card_restored()
 
@@ -299,7 +300,7 @@ def test_an_encoder_that_raises_releases_the_tower_and_restores_the_band():
     with pytest.raises(vsr.VisionStageEncodeFailed) as e:
         run(rig)
     assert "illegal memory access" in str(e.value)
-    assert rig.calls[-2:] == ["release", "resume:weights_1"]
+    assert rig.calls[-3:] == ["release", "resume:weights_1", "census"]
     rig.assert_card_restored()
 
 
@@ -310,7 +311,7 @@ def test_a_wrong_shaped_embedding_refuses_and_still_tears_down():
     )
     with pytest.raises(VisionEmbeddingRefused):
         run(rig)
-    assert rig.calls[-2:] == ["release", "resume:weights_1"]
+    assert rig.calls[-3:] == ["release", "resume:weights_1", "census"]
     rig.assert_card_restored()
 
 
@@ -377,3 +378,98 @@ def test_eviction_can_be_forbidden_end_to_end():
     with pytest.raises(vs.VisionStageNoRoom):
         run(rig, allow_eviction=False)
     assert not any(c.startswith("pause:") for c in rig.calls)
+
+
+# --- xsn410 (20.09.): the tower must actually LEAVE the card -------------------
+# Boot weg2xsn410: `release_tower(handle)` dropped only the callee's name, the
+# runtime frame kept the module alive, `empty_cache()` returned nothing and
+# ~2.1 GiB stayed reserved in P's tokenizer process on card0; D's TP1 was then
+# 1343 MiB short at its kv resume (W114) and the flip stalled.
+
+
+class _Tower:
+    pass
+
+
+def test_the_hook_receives_the_sole_reference_to_the_tower():
+    import gc
+    import weakref
+
+    seen = {}
+
+    class R(Rig):
+        def load_tower(self, card_idx):
+            self.calls.append(f"load:{card_idx}")
+            t = _Tower()
+            seen["ref"] = weakref.ref(t)
+            return t
+
+        def release_tower(self, handle):
+            self.calls.append("release")
+            assert isinstance(handle, list) and len(handle) == 1
+            handle.clear()
+            gc.collect()
+            # the runtime's own name is already gone: nothing else keeps it alive
+            assert seen["ref"]() is None, "the runtime still holds the tower during the release"
+
+    rig = R([card(2, 4.0)])
+    run(rig)
+    assert "release" in rig.calls and seen["ref"]() is None
+
+
+def test_a_residue_after_the_release_is_named_and_escalated():
+    class R(Rig):
+        def __init__(self, cards, after_gib):
+            super().__init__(cards)
+            self._after = after_gib
+
+        def census(self):
+            self.calls.append("census")
+            if "release" in self.calls:  # the second reading: after the release
+                return [card(2, self._after)]
+            return self._cards
+
+    # tower 0.858 GiB: a residue of the tower's size does not pass
+    with pytest.raises(vsr.VisionStageTeardownIncomplete) as e:
+        run(R([card(2, 4.0)], after_gib=4.0 - 0.9))
+    assert "did not come back" in str(e.value)
+    # a small residue (allocator noise below max(256 MiB, half the tower)) passes
+    res = run(R([card(2, 4.0)], after_gib=4.0 - 0.1))
+    assert res.rows is not None
+
+
+def test_the_per_process_reading_is_the_verdict_when_it_exists():
+    """xsn411: the card-wide census read 309 MiB while sibling ranks prefilled
+    on card0; the per-pid NVML figure is the residue the teardown owns."""
+    class R(Rig):
+        def __init__(self, cards, own):
+            super().__init__(cards)
+            self._own = list(own)
+            self.own_calls = 0
+
+        def census(self):
+            self.calls.append("census")
+            if "release" in self.calls:  # card-wide reading confounded by a sibling
+                return [card(2, 4.0 - 2.0)]
+            return self._cards
+
+        def own_bytes(self, card_idx):
+            self.own_calls += 1
+            return self._own.pop(0)
+
+        @property
+        def hooks(self):
+            h = super().hooks
+            return vsr.StageHooks(**{**h.__dict__, "own_bytes": self.own_bytes})
+
+    # process residue 40 MiB although the card lost 2 GiB to a sibling: passes
+    rig = R([card(2, 4.0)], own=[100 << 20, 140 << 20])
+    res = run(rig, rid="t")
+    assert res.rows is not None and rig.own_calls == 2
+    # process residue of the tower's size: escalated even if the card looks fine
+    class R2(R):
+        def census(self):
+            self.calls.append("census")
+            return self._cards
+    with pytest.raises(vsr.VisionStageTeardownIncomplete):
+        run(R2([card(2, 4.0)], own=[100 << 20, (100 << 20) + int(0.9 * GIB)]), rid="t")

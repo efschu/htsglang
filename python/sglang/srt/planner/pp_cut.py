@@ -2557,8 +2557,35 @@ class CheckpointWeightTerms:
     num_experts: int = 0
 
 
+def _gguf_weight_sizes(model_path: str) -> Optional[Dict[str, float]]:
+    """27B line G6: ``{hf_name: bytes}`` of a GGUF FILE, or None for anything else.
+
+    The GGUF header states every tensor's exact byte size (a UD mix of quant
+    types inside one layer included); ``weg2.gguf_census`` puts each tensor
+    under the loader's own HF name, the NEXTN block under ``mtp.*`` -- so the
+    classification below runs unchanged on both formats. A directory never
+    reaches the GGUF reader, so a safetensors checkpoint is priced exactly as
+    before.
+    """
+    if not os.path.isfile(model_path):
+        return None
+    from sglang.srt.weg2 import gguf_census as _gguf_census
+
+    if not _gguf_census.is_gguf_checkpoint(model_path):
+        return None
+    try:
+        census = _gguf_census.gguf_tensor_census(model_path)
+    except Exception as exc:  # noqa: BLE001 -- gguf/config errors are named here
+        raise DraftResidencyUnavailable(
+            f"the GGUF tensor directory of {model_path!r} could not be priced "
+            f"({type(exc).__name__}: {exc}); the weight terms cannot be defaulted."
+        ) from exc
+    return {name: float(nbytes) for name, nbytes in census.sizes().items()}
+
+
 def checkpoint_weight_terms(model_path: str) -> CheckpointWeightTerms:
-    """Measure the weight terms `PPCutInputs` needs from a safetensors dir.
+    """Measure the weight terms `PPCutInputs` needs from a safetensors dir
+    or (27B line G6) a GGUF file's tensor directory.
 
     Raises :class:`DraftResidencyUnavailable` when the directory holds no
     safetensors shards or no transformer layers -- never a zero-filled result,
@@ -2569,14 +2596,16 @@ def checkpoint_weight_terms(model_path: str) -> CheckpointWeightTerms:
     import glob as _glob
     import struct as _struct
 
-    shards = sorted(_glob.glob(os.path.join(model_path, "*.safetensors")))
-    if not shards:
+    gguf_sizes = _gguf_weight_sizes(model_path)
+    shards = [] if gguf_sizes is not None else sorted(
+        _glob.glob(os.path.join(model_path, "*.safetensors")))
+    if gguf_sizes is None and not shards:
         raise DraftResidencyUnavailable(
             f"no *.safetensors under {model_path!r}; the weight terms cannot "
             "be defaulted."
         )
 
-    sizes: Dict[str, float] = {}
+    sizes: Dict[str, float] = dict(gguf_sizes or {})
     for shard in shards:
         try:
             with open(shard, "rb") as fh:
@@ -2639,8 +2668,8 @@ def checkpoint_weight_terms(model_path: str) -> CheckpointWeightTerms:
 
     if not layer_bytes:
         raise DraftResidencyUnavailable(
-            f"{model_path!r} holds safetensors but no transformer layers; the "
-            "per-family weights cannot be measured from it."
+            f"{model_path!r} holds {'a GGUF tensor directory' if gguf_sizes is not None else 'safetensors'} "
+            "but no transformer layers; the per-family weights cannot be measured from it."
         )
 
     attn_idx = tuple(

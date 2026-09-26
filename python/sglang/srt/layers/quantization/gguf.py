@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import bisect
+import contextlib
 import logging
 import os
 import warnings
@@ -16,6 +17,9 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.quantization.gguf_path_census import (
+    census as _gguf_path_census,  # #GGUFPATH, default off
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -861,6 +865,10 @@ def _mmq_threshold_prefers_mmq(m: int, qweight: torch.Tensor, qweight_type: int)
 # identically to the previous fresh-allocation behavior.
 # ---------------------------------------------------------------------------
 _DEQUANT_WS: dict = {}  # (lane_id, device_index, dtype) -> 1-D buffer
+# #1233 (27B GGUF): while a chunk-scoped post-load pass runs, the workspace
+# growth it asks for is recorded here instead of allocated (see
+# dequant_workspace_deferred); None = allocate at once, as always.
+_DEQUANT_WS_DEFERRED: Optional[dict] = None
 # (lane_id, device_index, dtype) -> largest dequant TARGET this rank can be
 # asked for, in bytes, INCLUDING the over-cap ones the workspace deliberately
 # refuses to hold. See gguf_dequant_scratch_residual_bytes.
@@ -941,8 +949,14 @@ def _dequant_supports_out() -> bool:
     return _dequant_out_supported
 
 
-def _reserve_dequant_workspace(numel: int, dtype: torch.dtype, device) -> None:
-    """Grow the persistent workspace (load time, pre-KV-profiling)."""
+def _reserve_dequant_workspace(
+    numel: int, dtype: torch.dtype, device, layer_id: Optional[int] = None
+) -> None:
+    """Grow the persistent workspace (load time, pre-KV-profiling).
+
+    ``layer_id``: the layer whose dequant target this is (F1b). Inside a
+    deferred pass the workspace is later allocated in the chunk tag of the
+    layer whose request SET its size -- see dequant_workspace_deferred."""
     key = _dequant_ws_key(dtype, device)
     nbytes = numel * dtype.itemsize
     # Record the peak target BEFORE either early return (#257): both of them
@@ -958,7 +972,61 @@ def _reserve_dequant_workspace(numel: int, dtype: torch.dtype, device) -> None:
         return
     buf = _DEQUANT_WS.get(key)
     if buf is None or buf.numel() < numel:
+        if _DEQUANT_WS_DEFERRED is not None:
+            pending = _DEQUANT_WS_DEFERRED.get(key)
+            if pending is None or pending[0] < numel:
+                # strictly larger only: the FIRST layer that asked for the
+                # final size owns the workspace's chunk (F1b)
+                _DEQUANT_WS_DEFERRED[key] = (numel, dtype, device, layer_id)
+            return
         _DEQUANT_WS[key] = torch.empty(numel, dtype=dtype, device=device)
+
+
+@contextlib.contextmanager
+def dequant_workspace_deferred():
+    """Hold back the #63 workspace growth of a post-load pass, then allocate
+    each workspace ONCE, at its largest requested size, after the pass.
+
+    #1233 (27B GGUF, weg2rc5gg 2026-09-25): the GGUF post-load pass now runs
+    every module inside its LAYER's weight chunk scope, so the flat qweight
+    containers land in the chunk tag that is paused and resumed with the layer.
+    The allocation on exit happens after the pass's own chunk scopes closed,
+    still inside load_model, so the KV-budget profiling that runs afterwards
+    sees it (#63). The peak targets (gguf_dequant_scratch_residual_bytes) are
+    recorded as before. Nested use folds into the outer scope.
+
+    F1b (boot weg2rc6gg, 2026-09-25): the workspace is allocated inside the
+    chunk scope of the layer whose request SET its size (the first one to ask
+    for the final numel), no longer under the base tag. In the base tag it
+    was the ONE allocation of a layers-only PP stage (P rank 1 of the 42,11,11
+    cut owns no embed/norm/head): 178257920 B resident under 'weights' with
+    zero source descriptors, and the first P->D flip died on W106
+    Weg2XchgWakeSourceGapRefused. One buffer per lane, device and dtype,
+    shared by every layer of the rank: it is scratch, carried by no plan, and
+    its chunk is paused and resumed with the rank's other layers before any
+    forward runs. A size set by a module outside every layer (layer id None)
+    keeps the base tag, exactly as before.
+    """
+    global _DEQUANT_WS_DEFERRED
+    outer = _DEQUANT_WS_DEFERRED
+    mine: dict = {}
+    _DEQUANT_WS_DEFERRED = mine
+    try:
+        yield
+    finally:
+        _DEQUANT_WS_DEFERRED = outer
+    if outer is not None:
+        for key, item in mine.items():
+            if key not in outer or outer[key][0] < item[0]:
+                outer[key] = item
+        return
+    from sglang.srt.managers.weg2_memory_saver import weight_chunk_scope
+
+    for key, (numel, dtype, device, layer_id) in mine.items():
+        buf = _DEQUANT_WS.get(key)
+        if buf is None or buf.numel() < numel:
+            with weight_chunk_scope(layer_id):
+                _DEQUANT_WS[key] = torch.empty(numel, dtype=dtype, device=device)
 
 
 def _ggml_dequantize_ws(
@@ -1031,8 +1099,16 @@ def _mul_mat_dequant_chunked(
 
 
 def fused_mul_mat_gguf(
-    x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
+    x: torch.Tensor, qweight: torch.Tensor, qweight_type: int, on_path=None
 ) -> torch.Tensor:
+    # #GGUFPATH (SGLANG_GGUF_PATH_CENSUS, default off: one None check and the
+    # dispatch below runs exactly as before). On, the census re-enters here with
+    # ``on_path`` set, brackets the call with two captured device kernels and
+    # attributes it to the branch this dispatch reports -- never re-derived.
+    if on_path is None:
+        census = _gguf_path_census()
+        if census is not None:
+            return census.measure(fused_mul_mat_gguf, x, qweight, qweight_type)
     if qweight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
     else:
@@ -1057,6 +1133,8 @@ def fused_mul_mat_gguf(
         return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
+        if on_path is not None:
+            on_path("dense")
         return x @ qweight.T
     # enable MMVQ in contiguous batching with batch_size=1
     if (
@@ -1070,16 +1148,22 @@ def fused_mul_mat_gguf(
         # the dispatch below is byte-identical when the flag is not set.
         and not _mmq_threshold_prefers_mmq(x.shape[0], qweight, qweight_type)
     ):
+        if on_path is not None:
+            on_path("mmvq")
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
     # MMQ (quantized GEMM) only for small batches (standard + k-quants): it is
     # weight-bandwidth-bound and does not scale with token count, so above
     # _MMQ_MAX_TOKENS the dequant + cuBLAS branch below is far faster.
     elif qweight_type in MMQ_QUANT_TYPES and x.shape[0] <= _MMQ_MAX_TOKENS:
+        if on_path is not None:
+            on_path("mmq")
         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     # Large batch (or a type without an MMQ kernel): dequantize once, then a
     # single fp16 cuBLAS GEMM. All MMQ types are also in DEQUANT_TYPES, so
     # large-batch K-quants land here.
     elif qweight_type in DEQUANT_TYPES:
+        if on_path is not None:
+            on_path("deq")
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
         # #70: an over-cap dequant during CUDA-graph capture (draft-extend /
@@ -1301,6 +1385,52 @@ def apply_gguf_embedding(
         raise NotImplementedError(f"Unsupported GGUF quantization type: {qweight_type}")
 
 
+
+def _flat_container_declaration(qweight, shard_id, tensors, offsets, total):
+    """G1 (weg2 exchange): the flat container as THIS rank laid it out -- per
+    segment its byte offset, its row width in bytes and the checkpoint rows the
+    loader copied into it (``xchg_src_rows``, written where the rows were
+    chosen) -- as a ``weg2.xchg_flat_segments.FlatTable``. ``None`` when a shard
+    carries no declaration or the declared rows are not the rows it holds: the
+    exchange then refuses this tensor by name instead of guessing its segments.
+    Metadata only; no byte moves here."""
+    from sglang.srt.weg2 import xchg_flat_segments as fs
+
+    src_rows = getattr(qweight, "xchg_src_rows", None) or {}
+    segments = []
+    for idx, t, off in zip(shard_id, tensors, offsets):
+        comps = src_rows.get(fs.shard_key(idx))
+        if not comps or sum(int(c[3]) for c in comps) != int(t.size(0)):
+            return None
+        segments.append(
+            fs.FlatSegment(
+                key=fs.shard_key(idx),
+                offset=int(off),
+                row_bytes=int(t.size(1)) * int(t.element_size()),
+                components=tuple(fs.FlatComponent(*c) for c in comps),
+            )
+        )
+    table = fs.FlatTable(nbytes=int(total), segments=tuple(segments))
+    try:
+        table.validate("gguf flat container")
+    except Exception:  # noqa: BLE001 -- metadata must never fail a load
+        # Unpublished, the container is undeclared and the weg2 join refuses
+        # it by name (W68); a plain GGUF serve never reads the declaration.
+        return None
+    return table
+
+
+def _layer_id_of(prefix: str) -> Optional[int]:
+    """The layer index in a module's state-dict path, the way the weg2 chunk
+    tags read it (weg2_memory_saver.layer_id_from_module_name); None outside a
+    layer or when the path is unknown."""
+    if not prefix:
+        return None
+    from sglang.srt.managers.weg2_memory_saver import layer_id_from_module_name
+
+    return layer_id_from_module_name(prefix)
+
+
 class GGUFLinearMethod(LinearMethodBase):
     """Linear method for GGUF.
 
@@ -1336,6 +1466,13 @@ class GGUFLinearMethod(LinearMethodBase):
                 "data_container": [],
                 "shard_id": [],
                 "shard_id_map": {},
+                # G1 (weg2 exchange): the checkpoint rows each shard's loader
+                # copied (linear.py _declare_gguf_src_rows), per shard key.
+                "xchg_src_rows": {},
+                # #1233 (27B GGUF, weg2rc5gg): the layer whose weight chunk tag
+                # this qweight is materialized under (materialize()); None
+                # outside a layer (embedding, head) = the base weights tag.
+                "weg2_layer_id": _layer_id_of(getattr(layer, "prefix", "")),
             },
         )
         set_weight_attrs(qweight, extra_weight_attrs)
@@ -1442,6 +1579,11 @@ class GGUFLinearMethod(LinearMethodBase):
             flat_param = Parameter(flat_data, requires_grad=False)
             set_weight_attrs(flat_param, vars(qweight))
             set_weight_attrs(flat_param, {"shard_offset_map": shard_offset_map})
+            table = _flat_container_declaration(
+                qweight, shard_id, tensors, offsets, total
+            )
+            if table is not None:
+                set_weight_attrs(flat_param, {"xchg_flat_table": table})
             layer.register_parameter("qweight", flat_param)
             # Pre-built contiguous 2-D typed views into the flat parameter,
             # used by apply() instead of slice+contiguous. Plain attribute on
@@ -1488,6 +1630,11 @@ class GGUFLinearMethod(LinearMethodBase):
             # which are replaced by module-level sharing right after the
             # loader finishes): nothing to size, and `.shape` would raise.
             return
+        # F1b: the layer this target belongs to (create_weights recorded it
+        # on the qweight; the prefix is the same fact for any other module).
+        layer_id = getattr(layer.qweight, "weg2_layer_id", None)
+        if layer_id is None:
+            layer_id = _layer_id_of(getattr(layer, "prefix", "") or "")
         shard_views = getattr(layer, "_gguf_shard_views", None)
         if shard_views:
             items = [
@@ -1501,7 +1648,9 @@ class GGUFLinearMethod(LinearMethodBase):
                 continue
             block_size, type_size = _gguf.GGML_QUANT_SIZES[qtype]
             numel = shape[0] * (shape[1] // type_size * block_size)
-            _reserve_dequant_workspace(numel, params_dtype, layer.qweight.device)
+            _reserve_dequant_workspace(
+                numel, params_dtype, layer.qweight.device, layer_id=layer_id
+            )
 
     def apply(
         self,
@@ -1695,6 +1844,19 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
 class GGUFUninitializedParameter(UninitializedParameter):
     cls_to_become = Parameter
     data_container: list[torch.Tensor]
+
+    def materialize(self, shape, device=None, dtype=None):
+        """#1233 (27B GGUF, weg2rc5gg 2026-09-25): a single-shard GGUF qweight
+        gets its bytes HERE, in load_weights -- after model construction, whose
+        per-layer chunk scope (make_layers) it therefore never saw. Allocate it
+        in the chunk tag of its layer (``weg2_layer_id``, recorded by
+        GGUFLinearMethod.create_weights), like every other weight of that
+        layer; a module outside a layer keeps the base tag. No-op unless the
+        flip's weight chunking is on (weg2_memory_saver.weight_chunk_scope)."""
+        from sglang.srt.managers.weg2_memory_saver import weight_chunk_scope
+
+        with weight_chunk_scope(getattr(self, "weg2_layer_id", None)):
+            return super().materialize(shape, device=device, dtype=dtype)
 
 
 # =============================================================================

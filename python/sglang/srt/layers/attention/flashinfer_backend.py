@@ -35,6 +35,11 @@ from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.layers.dcp.comm import (
+    cp_lse_merge_token_blocks,
+    lse_merge_is_blocked,
+    lse_merge_token_spans,
+)
 from sglang.srt.layers.dcp import (
     build_dcp_weighted_kv_indices,
     cp_all_gather_heads_uneven,
@@ -52,6 +57,14 @@ from sglang.srt.layers.dcp.lockstep import (
     dcp_forces_prefix,
     draft_extend_prefix_lens,
     weightless_has_prefix,
+)
+from sglang.srt.layers.dcp.owner import build_dcp_weighted_kv_indices_sync_free
+from sglang.srt.layers.dcp.verify_preplan import (
+    DcpVerifyPrebuilt,
+    HostPlanMeta,
+    host_arange_indptr,
+    host_indptr_from_lens,
+    host_ones,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
@@ -87,6 +100,132 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _dcp_uneven_merge(
+    o, lse, group, head_counts, return_lse: bool = False, block_tokens: int = 0
+):
+    """The uneven-DCP LSE merge of the paged-prefix / decode partials.
+
+    ``SGLANG_DCP_LSE_MERGE=a2a`` (layers/dcp/comm.py ``lse_merge_mode``) routes
+    it through ``cp_lse_ag_out_a2a_mha_uneven``: the same LSE math, but the
+    scaled partials travel as ONE uneven all_to_all of the heads each peer owns
+    instead of an all_reduce of all heads followed by a slice -- (W-1)/W of the
+    bytes a one-shot sends, and one barrier instead of the mesh's two. Unset
+    (the default 'ar') is ``cp_lse_ag_out_ar_mha_uneven`` exactly as before.
+    Both return this rank's fp32 head slice (and its global LSE).
+
+    ``block_tokens`` (27B RC7, comm.py ``cp_lse_merge_token_blocks``): more
+    rows than that are merged in token blocks, each block one whole merge, so
+    the transient never exceeds one full-head partial at the budgeted width.
+    Rows <= block_tokens (every decode / verify / short tail) take the call
+    below unchanged."""
+    from sglang.srt.layers.dcp.comm import (
+        cp_lse_ag_out_a2a_mha_uneven,
+        cp_lse_merge_token_blocks,
+        lse_merge_is_blocked,
+        lse_merge_mode,
+        weightless_kv_active,
+    )
+
+    # The weightless-KV workers' own merge sites (forward_*_weightless_worker)
+    # stay on the all_reduce, so a weightless boot must too, or the head and its
+    # workers would enter different collectives.
+    if lse_merge_mode() == "a2a" and not weightless_kv_active():
+        merge = cp_lse_ag_out_a2a_mha_uneven
+    else:
+        merge = cp_lse_ag_out_ar_mha_uneven
+    if block_tokens and lse_merge_is_blocked(o.shape[0], block_tokens, group.world_size):
+        return cp_lse_merge_token_blocks(
+            merge, o, lse, group, head_counts,
+            return_lse=return_lse, block_tokens=block_tokens,
+        )
+    return merge(o, lse, group, head_counts, return_lse=return_lse)
+
+
+def _dcp_final_merge_rows(o_cur, lse_cur, o_pre, lse_pre, dtype):
+    """The body of FlashInferAttnBackend._dcp_extend_final_merge for a set of
+    rows (all of them, or one token block): natural-log LSE combine of the
+    current-chunk and the merged-prefix partials, cast to ``dtype``."""
+    lse_cur = lse_cur.float()
+    lse_pre = lse_pre.float()
+    final_lse = torch.logaddexp(lse_cur, lse_pre)
+    sc_cur = torch.nan_to_num(
+        torch.exp(lse_cur - final_lse), nan=0.0, posinf=0.0, neginf=0.0
+    ).unsqueeze(-1)
+    sc_pre = torch.nan_to_num(
+        torch.exp(lse_pre - final_lse), nan=0.0, posinf=0.0, neginf=0.0
+    ).unsqueeze(-1)
+    o = o_cur.float() * sc_cur + o_pre.float() * sc_pre
+    return o.to(dtype)
+
+
+_DCP_MERGE_BLOCK_LOGGED = set()
+
+
+def _resolve_dcp_merge_block_tokens(model_runner, head_counts) -> int:
+    """The uneven LSE merge's token-block width for this backend (27B RC7).
+
+    ``--dcp-lse-merge-block-tokens``: unset = DERIVED (default ON) from the
+    budgeted forward width (``--chunked-prefill-size``, else
+    ``--max-prefill-tokens``) and the head geometry, see
+    comm.lse_merge_block_tokens; 0 = off (one block, today's merge -- for
+    diagnosis only); N > 0 = an explicit width (a hand pin: planner debt).
+    Every input is replicated, so every DCP rank resolves the same width."""
+    from sglang.srt.layers.dcp.comm import (
+        lse_merge_block_tokens,
+        lse_merge_bytes_per_token,
+        lse_merge_effective_mode,
+        lse_merge_reduce_dtype,
+    )
+
+    sa = model_runner.server_args
+    counts = [int(c) for c in head_counts]
+    mc = model_runner.model_config
+    head_dim = int(getattr(mc, "head_dim", 0) or 0)
+    out_itemsize = torch.empty((), dtype=model_runner.dtype).element_size()
+    budget = int(getattr(sa, "chunked_prefill_size", 0) or 0)
+    budget_src = "--chunked-prefill-size"
+    if budget <= 0:
+        budget = int(getattr(sa, "max_prefill_tokens", 0) or 0)
+        budget_src = "--max-prefill-tokens"
+    mode = lse_merge_effective_mode()
+    wire = 2 if lse_merge_reduce_dtype() == "bf16" else 4
+    asked = getattr(sa, "dcp_lse_merge_block_tokens", None)
+    if asked is None:
+        width = lse_merge_block_tokens(budget, counts, head_dim, out_itemsize, mode)
+        src = "derived"
+    else:
+        width = int(asked)
+        if width < 0:
+            raise ValueError(
+                f"--dcp-lse-merge-block-tokens {width} < 0: unset = derived, "
+                "0 = off (one block), N > 0 = explicit width"
+            )
+        src = "flag (hand pin: planner debt)" if width > 0 else "flag 0 = OFF (diagnosis)"
+    key = (width, tuple(counts), mode, wire, budget)
+    # The line is NOT bound to head_dim > 0 (H86b/V2): a head_dim of 0 is exactly
+    # the case an operator must see, and it used to leave this line silent.
+    if key not in _DCP_MERGE_BLOCK_LOGGED and len(counts) > 1:
+        _DCP_MERGE_BLOCK_LOGGED.add(key)
+        if head_dim > 0 and sum(counts) > 0:
+            per_tok = lse_merge_bytes_per_token(
+                mode, wire, sum(counts), max(counts), len(counts), head_dim, out_itemsize
+            )
+        else:
+            per_tok = 0
+        ref = budget * sum(counts) * max(head_dim, 0) * out_itemsize
+        logger.info(
+            "DCP-MERGE-BLOCK block_tokens=%d source=%s mode=%s wire=%s heads=%s "
+            "head_dim=%d budget=%d (%s) | one-shot working set %.1f KiB/token = "
+            "%.1f MiB at the budget; bound = one [%d x %d x %d] partial = %.1f MiB; "
+            "per block <= %.1f MiB (rows <= block_tokens: one block, unchanged)",
+            width, src, mode, "bf16" if wire == 2 else "fp32", counts, head_dim,
+            budget, budget_src, per_tok / 1024.0, per_tok * budget / 2**20,
+            budget, sum(counts), head_dim, ref / 2**20,
+            per_tok * (width or budget) / 2**20,
+        )
+    return width
 
 # Target-VERIFY spec inputs that take the uneven-DCP verify split in
 # call_begin_forward: the committed prefix is read paged over this rank's OWNED
@@ -876,6 +1015,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 "SGLANG_UNEVEN_DCP_WEIGHTED=1 for the weighted owner rule) "
                 "so dcp_size == tp_size."
             )
+        # 27B RC7: token-block width of the uneven LSE merge (0 = one block,
+        # today's call). Derived below once the head partition is known.
+        self._dcp_merge_block_tokens = 0
         if self.uneven_dcp:
             mc = model_runner.model_config
             attn_tp_size = get_parallel().attn_tp_size
@@ -1002,6 +1144,9 @@ class FlashInferAttnBackend(AttentionBackend):
             # FULL gathered counts the paged wrappers are planned with.
             self.dcp_full_qo_heads = mc.num_attention_heads
             self.dcp_full_kv_heads = total_kv
+            self._dcp_merge_block_tokens = _resolve_dcp_merge_block_tokens(
+                model_runner, self.dcp_q_head_counts
+            )
 
         # #128 DCP collective/compute overlap: issue the per-layer DCP
         # collectives (kv-head gathers, q-head gather, LSE-merge) on a
@@ -1535,6 +1680,61 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cp_hi,
             self.cp_ratio,
         ) = dcp_weighted_owner_bounds(self.dcp_size, self.dcp_rank)
+
+    def dcp_verify_prebuild(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_host,
+    ) -> Optional[DcpVerifyPrebuilt]:
+        """SGLANG_DFLASH_PLAN_SYNC_FREE: the verify's owned-slot index, now.
+
+        Called by the DFLASH worker right after the block prep, i.e. BEFORE
+        the draft forward on the same stream. Builds exactly what the
+        target-verify branch of ``call_begin_forward`` would build for the
+        committed prefix ``[0, seq_lens)`` -- into the same ``kv_indptr[0]``
+        buffer the verify graph's paged wrapper reads -- without a host read,
+        and stages the counts to the host behind an event. None when this
+        backend does not take the weighted-DCP verify split, or when no host
+        length mirror is available to size the slot buffer (the verify then
+        plans the old way).
+
+        ``seq_lens_host`` sizes the buffer only; it may over-estimate (a
+        device-side assert refuses an under-estimate). The counts the verify
+        plans with are the device's, read back.
+        """
+        if not (self.uneven_dcp and self.uneven_dcp_weighted):
+            return None
+        host = dcp_host_lens(seq_lens_host)
+        bs = int(req_pool_indices.shape[0])
+        if host is None or bs == 0 or int(host.numel()) != bs:
+            return None
+        upd = self.indices_updater_prefill
+        kv_indptr_buf = upd.kv_indptr[0]
+        if kv_indptr_buf.numel() < bs + 1:
+            return None
+        kv_indptr, kv_indices = build_dcp_weighted_kv_indices_sync_free(
+            upd.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            kv_indptr_buf,
+            None,
+            self.cp_S,
+            self.cp_lo,
+            self.cp_hi,
+            self.cp_ratio,
+            total_tokens_bound=int(host.sum()),
+            pad=256,
+        )
+        buf = getattr(self, "_dcp_preplan_host_buf", None)
+        if buf is None or buf.numel() < bs + 1:
+            buf = torch.empty(max(bs + 1, 64), dtype=kv_indptr.dtype)
+            if kv_indptr.is_cuda:
+                buf = buf.pin_memory()
+            self._dcp_preplan_host_buf = buf
+        return DcpVerifyPrebuilt.launch(
+            bs=bs, kv_indptr=kv_indptr, kv_indices=kv_indices, host_buf=buf
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         """IN-graph hook, recorded at the START of every captured decode body
@@ -6105,7 +6305,10 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         # o: [tokens, 24, D], lse: [tokens, 24]; combine across the DCP token
         # shards and slice back to this rank's [12/6/6] head shard.
-        o = cp_lse_ag_out_ar_mha_uneven(o, lse, group, self.dcp_q_head_counts)
+        o = _dcp_uneven_merge(
+            o, lse, group, self.dcp_q_head_counts,
+            block_tokens=self._dcp_merge_block_tokens,
+        )
         return o.reshape(-1, layer.tp_q_head_num * layer.head_dim).to(q.dtype)
 
     def forward_decode_weightless_worker(self, layer, forward_batch):
@@ -6171,7 +6374,15 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         # (4) LSE-merge: contribute this rank's partial; receive the empty
         # [T,0,D] slice (the merged output goes to the head rank only).
-        cp_lse_ag_out_ar_mha_uneven(o, lse, group, self.dcp_q_head_counts)
+        # 27B RC7: the SAME token blocks as the head's _dcp_uneven_merge (same
+        # width, same T) -- one block is the call below, unchanged.
+        if lse_merge_is_blocked(o.shape[0], self._dcp_merge_block_tokens, group.world_size):
+            cp_lse_merge_token_blocks(
+                cp_lse_ag_out_ar_mha_uneven, o, lse, group, self.dcp_q_head_counts,
+                block_tokens=self._dcp_merge_block_tokens,
+            )
+        else:
+            cp_lse_ag_out_ar_mha_uneven(o, lse, group, self.dcp_q_head_counts)
 
     def forward_extend_weightless_worker(self, layer, forward_batch):
         """Weightless-KV WORKER dispatch for one full-attention layer in
@@ -6241,7 +6452,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
-        cp_lse_ag_out_ar_mha_uneven(o_pre, lse_pre, group, self.dcp_q_head_counts)
+        # 27B RC7: the SAME token blocks as the head's prefix merge.
+        if lse_merge_is_blocked(o_pre.shape[0], self._dcp_merge_block_tokens, group.world_size):
+            cp_lse_merge_token_blocks(
+                cp_lse_ag_out_ar_mha_uneven, o_pre, lse_pre, group,
+                self.dcp_q_head_counts, block_tokens=self._dcp_merge_block_tokens,
+            )
+        else:
+            cp_lse_ag_out_ar_mha_uneven(o_pre, lse_pre, group, self.dcp_q_head_counts)
 
     def _replicated_kv_ragged_reindex(self, local_q, local_kv, device):
         """REPLICATED-KV geometry (#105): map each of this rank's LOCAL kv
@@ -6377,12 +6595,13 @@ class FlashInferAttnBackend(AttentionBackend):
                     k_scale=layer.k_scale_float,
                     v_scale=layer.v_scale_float,
                 )
-            o_pre, lse_pre = cp_lse_ag_out_ar_mha_uneven(
+            o_pre, lse_pre = _dcp_uneven_merge(
                 o_pre_raw,
                 lse_pre_raw,
                 group,
                 self.dcp_q_head_counts,
                 return_lse=True,
+                block_tokens=self._dcp_merge_block_tokens,
             )
             if do_write and _scatter_late:
                 if os.environ.get("SGLANG_DCP_DEBUG") == "1" and layer.layer_id < 8:
@@ -6491,12 +6710,13 @@ class FlashInferAttnBackend(AttentionBackend):
             else torch.cuda.stream(comm_stream)
         )
         with _merge_ctx:
-            o_pre, lse_pre = cp_lse_ag_out_ar_mha_uneven(
+            o_pre, lse_pre = _dcp_uneven_merge(
                 o_pre_raw,
                 lse_pre_raw,
                 group,
                 self.dcp_q_head_counts,
                 return_lse=True,
+                block_tokens=self._dcp_merge_block_tokens,
             )
         # main lane: the masked scatter-write targets the current chunk's
         # out_cache_loc slots, disjoint from the paged prefix read above and
@@ -6607,17 +6827,25 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_return_lse also returns natural-log LSE, so logaddexp mixes
         them consistently. (flashinfer's merge_state uses a different
         internal convention and must NOT be used across these two sources.)"""
-        lse_cur = lse_cur.float()
-        lse_pre = lse_pre.float()
-        final_lse = torch.logaddexp(lse_cur, lse_pre)
-        sc_cur = torch.nan_to_num(
-            torch.exp(lse_cur - final_lse), nan=0.0, posinf=0.0, neginf=0.0
-        ).unsqueeze(-1)
-        sc_pre = torch.nan_to_num(
-            torch.exp(lse_pre - final_lse), nan=0.0, posinf=0.0, neginf=0.0
-        ).unsqueeze(-1)
-        o = o_cur.float() * sc_cur + o_pre.float() * sc_pre
-        return o.to(q.dtype).contiguous().view(-1, layer.tp_q_head_num * layer.head_dim)
+        # 27B RC7: rows beyond the LSE merge's token-block width are combined
+        # in the same blocks. Purely local and elementwise, so each row's
+        # value is the one-shot value; one block is the expression unchanged.
+        spans = lse_merge_token_spans(
+            o_cur.shape[0], getattr(self, "_dcp_merge_block_tokens", 0)
+        )
+        if len(spans) == 1:
+            o = _dcp_final_merge_rows(o_cur, lse_cur, o_pre, lse_pre, q.dtype)
+            return o.contiguous().view(-1, layer.tp_q_head_num * layer.head_dim)
+        out = torch.empty(
+            (o_cur.shape[0],) + tuple(o_cur.shape[1:]), dtype=q.dtype, device=o_cur.device
+        )
+        for s, e in spans:
+            out[s:e].copy_(
+                _dcp_final_merge_rows(
+                    o_cur[s:e], lse_cur[s:e], o_pre[s:e], lse_pre[s:e], q.dtype
+                )
+            )
+        return out.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
@@ -6776,6 +7004,88 @@ def _host_sum_or_device(
     if lens_cpu is None:
         return lens.sum().item()
     return int(lens_cpu.sum())
+
+
+# ---------------------------------------------------------------------------
+# SGLANG_DFLASH_PLAN_SYNC_FREE (layers/dcp/verify_preplan.py has the why).
+# ---------------------------------------------------------------------------
+
+
+def _plan_sync_free_on() -> bool:
+    return bool(envs.SGLANG_DFLASH_PLAN_SYNC_FREE.get())
+
+
+def _usable_verify_prebuilt(
+    spec_info,
+    bs: int,
+    kv_indptr_buf: torch.Tensor,
+    weighted: bool,
+) -> Optional[DcpVerifyPrebuilt]:
+    """The worker's prebuilt verify index, if it describes THIS plan.
+
+    It must be the weighted rule, the same row count (a padded graph bucket
+    differs and falls back), no draft->draft tree mask, and it must have been
+    written into the very ``kv_indptr`` buffer this plan was handed -- the
+    graph wrapper's ``paged_kv_indptr_buf`` aliases it.
+    """
+    pre = getattr(spec_info, "dcp_verify_prebuilt", None)
+    if pre is None or not weighted:
+        return None
+    if getattr(spec_info, "custom_mask", None) is not None:
+        return None
+    if int(pre.bs) != int(bs):
+        return None
+    if pre.kv_indptr.data_ptr() != kv_indptr_buf.data_ptr():
+        return None
+    return pre
+
+
+def _draft_host_plan(
+    spec_info,
+    bs: int,
+    paged_kernel_lens_cpu,
+    custom_mask,
+    use_sliding_window_kv_pool: bool,
+) -> Optional[HostPlanMeta]:
+    """Exact host plan metadata for a DFLASH draft block forward, or None.
+
+    ``host_lens_exact`` is set by the DFLASH worker only for the draft forward
+    of a round whose host lengths equal the device lengths. The kv layout is
+    then ``[0, cumsum(len + draft_token_num)]`` -- the same arithmetic
+    ``DFlashVerifyInput.generate_attn_arg_prefill`` runs on the device.
+    """
+    if not getattr(spec_info, "host_lens_exact", False):
+        return None
+    if custom_mask is not None or use_sliding_window_kv_pool:
+        return None
+    if getattr(spec_info, "ragged_verify_layout", None) is not None:
+        return None
+    lens = dcp_host_lens(paged_kernel_lens_cpu)
+    if lens is None or int(lens.numel()) != int(bs):
+        return None
+    draft_num = int(spec_info.draft_token_num)
+    return HostPlanMeta(
+        host_arange_indptr(bs, draft_num),
+        host_indptr_from_lens(lens, add=draft_num),
+        host_ones(bs),
+        check_device=True,
+    )
+
+
+def _assert_plan_indptr_matches(wrapper, kv_indptr_dev: torch.Tensor, bs: int):
+    """Device-side check that the planned kv_indptr is the device's own.
+
+    The draft plan scheduled from HOST lengths that are exact only by an
+    assumption about the scheduler's mirror. FlashInfer's FA2 kernel derives
+    its split layout from the DEVICE lengths, so a mismatch would mis-address
+    the partial outputs silently. ``torch._assert_async`` (no host wait) stops
+    the stream before the forward's graph can run on it instead.
+    """
+    buf = getattr(wrapper, "_paged_kv_indptr_buf", None)
+    if buf is None or not torch.is_tensor(buf) or buf.numel() < bs + 1:
+        return
+    same = torch.eq(buf[: bs + 1], kv_indptr_dev[: bs + 1].to(buf.dtype)).all()
+    torch._assert_async(same)
 
 
 class FlashInferIndicesUpdaterDecode:
@@ -7342,6 +7652,13 @@ class FlashInferIndicesUpdaterPrefill:
                     device=seq_lens.device, dtype=seq_lens.dtype
                 )
             )
+            if num_accept_tokens is None and _plan_sync_free_on():
+                # SGLANG_DFLASH_PLAN_SYNC_FREE: prefix_lens IS seq_lens here,
+                # so its host mirror is seq_lens' own (freshness-guarded) one.
+                # Without it the window branch below had no mirror and summed
+                # on the device (_host_sum_or_device, the 6439 host read in
+                # front of every DFLASH draft forward).
+                prefix_lens_cpu = fresh_seq_lens_cpu
         sliding_window_size = self.sliding_window_size
         assert sliding_window_size is not None
         for wrapper_id in range(2):
@@ -7576,6 +7893,12 @@ class FlashInferIndicesUpdaterPrefill:
         # P-NOSYNC host indptrs (_p_nosync_host_indptrs); set only by the
         # normal-extend branch below, None = the stock device plan.
         nosync_host = None
+        # SGLANG_DFLASH_PLAN_SYNC_FREE: exact host metadata for the plans at
+        # the bottom (paged: qo/kv indptr + last_page_len; ragged: qo). Stays
+        # None on every path the switch does not reach -> the plans read the
+        # device tensors as before. host_plan (D verify) and nosync_host
+        # (P normal extend) are never set together.
+        host_plan: Optional[HostPlanMeta] = None
         if spec_info is None and self.attn_backend.uneven_dcp:
             # Uneven-DCP extend: the paged (prefix) wrapper reads only this
             # rank's OWNED prefix token slots (even-modulo owner rule), with the
@@ -7804,8 +8127,29 @@ class FlashInferIndicesUpdaterPrefill:
                     "request. Disable SGLANG_RAGGED_VERIFY_MODE."
                 )
             draft_num = spec_info.draft_token_num
+            # SGLANG_DFLASH_PLAN_SYNC_FREE: the DFLASH worker built this very
+            # index before the draft forward (dcp_verify_prebuild) and staged
+            # the owned counts to the host behind an event that sits IN FRONT
+            # of the draft on the stream. Taking it here replaces the two
+            # host reads of the build below (compact[owned], repeat_interleave)
+            # and gives the plans below exact host metadata, so nothing in
+            # this verify prep waits for the draft.
+            prebuilt = _usable_verify_prebuilt(
+                spec_info, bs, kv_indptr, self.attn_backend.uneven_dcp_weighted
+            )
+            if prebuilt is not None:
+                prebuilt_host_indptr = prebuilt.host_kv_indptr()
+                kv_indptr = prebuilt.kv_indptr
+                kv_indices = prebuilt.kv_indices[
+                    : int(prebuilt_host_indptr[-1]) + 256
+                ]
+                host_plan = HostPlanMeta(
+                    host_arange_indptr(bs, draft_num),
+                    prebuilt_host_indptr,
+                    host_ones(bs),
+                )
             # Paged prefix (committed context) over this rank's OWNED slots.
-            if self.attn_backend.uneven_dcp_weighted:
+            elif self.attn_backend.uneven_dcp_weighted:
                 kv_indptr, kv_indices = _build_dcp_weighted_kv_indices(
                     self.req_to_token,
                     req_pool_indices,
@@ -7930,6 +8274,19 @@ class FlashInferIndicesUpdaterPrefill:
                         kv_start_idx=kv_start_idx,
                     )
                 )
+                # SGLANG_DFLASH_PLAN_SYNC_FREE, the DFLASH DRAFT forward: the
+                # worker flags a round whose host lengths are the EXACT device
+                # lengths (published seq_lens_cpu, page_size 1). Then the plan
+                # can schedule from host vectors instead of reading
+                # qo/kv_indptr back; the equality is re-checked on the device
+                # after the plan (see _assert_plan_indptr_matches).
+                host_plan = _draft_host_plan(
+                    spec_info,
+                    bs,
+                    paged_kernel_lens_cpu,
+                    custom_mask,
+                    use_sliding_window_kv_pool,
+                )
             else:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
@@ -7961,7 +8318,15 @@ class FlashInferIndicesUpdaterPrefill:
             # span names that wait inside the launch; off = a bare yield.
             # Under P-NOSYNC (nosync_host set) plan() gets the host indptr and
             # runs one plan ahead of the card (_p_nosync_plan).
+            # SGLANG_DFLASH_PLAN_SYNC_FREE (host_plan set, D verify): the ragged
+            # qo/kv layout is the constant draft-block stride, known on the host;
+            # handing the host copy to plan() skips its two .to("cpu") reads
+            # (prefill.py 3054/3055) and fills the graph buffers by a
+            # non-blocking H2D.
             _qo_r = qo_indptr if nosync_host is None else nosync_host[0]
+            if host_plan is not None and ragged_custom_mask is None:
+                # D verify only; nosync_host is None on this path.
+                _qo_r = host_plan.qo_indptr
             _plan_r = (
                 wrapper_ragged.begin_forward
                 if nosync_host is None
@@ -8041,12 +8406,25 @@ class FlashInferIndicesUpdaterPrefill:
                 max_kv_len=int(seq_lens_cpu_i32.max()),
             )
 
-        if nosync_host is None:
-            _qo_p, _kv_p, _last_p = qo_indptr, kv_indptr, self.kv_last_page_len[:bs]
+        # SGLANG_DFLASH_PLAN_SYNC_FREE: plan() schedules from the exact host
+        # copies (its .to("cpu") becomes a no-op) and copies them into the
+        # graph buffers H2D; kv_indices stays the device tensor (D2D).
+        # P-NOSYNC: host indptrs, one plan ahead (see the ragged plan).
+        if host_plan is not None and not uses_fast_prefill and use_custom_mask is None:
+            _qo_p, _kv_p, _last_p = (
+                host_plan.qo_indptr,
+                host_plan.kv_indptr,
+                host_plan.last_page_len,
+            )
             _plan_p = wrapper_paged.begin_forward
-        else:  # P-NOSYNC: host indptrs, one plan ahead (see the ragged plan)
-            _qo_p, _kv_p, _last_p = nosync_host
-            _plan_p = partial(_p_nosync_plan, wrapper_paged)
+        else:
+            host_plan = None
+            if nosync_host is None:
+                _qo_p, _kv_p, _last_p = qo_indptr, kv_indptr, self.kv_last_page_len[:bs]
+                _plan_p = wrapper_paged.begin_forward
+            else:
+                _qo_p, _kv_p, _last_p = nosync_host
+                _plan_p = partial(_p_nosync_plan, wrapper_paged)
         with _weg2_p_overlap.span("fi_plan"):  # #PGAP, see the ragged plan above
             _plan_p(
                 _qo_p,
@@ -8068,6 +8446,8 @@ class FlashInferIndicesUpdaterPrefill:
                 max_item_len_ptr=max_item_len_ptr,
                 **paged_plan_kwargs,
             )
+        if host_plan is not None and host_plan.check_device:
+            _assert_plan_indptr_matches(wrapper_paged, kv_indptr, bs)
 
 
 class FlashInferMultiStepDraftBackend:

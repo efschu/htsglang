@@ -819,10 +819,16 @@ def _tie_word_embeddings(model_path: str) -> bool:
     out not to exist refuses nothing, while the reverse under-sizes it.
     """
     import json
-    import os
 
+    # The server's own rule for WHICH config.json describes the checkpoint: a
+    # GGUF launch names the file, whose config is its sibling (27B line G2).
+    from sglang.srt.server_args import declared_config_path_for
+
+    cfg_path = declared_config_path_for(model_path)
+    if cfg_path is None:
+        return False
     try:
-        with open(os.path.join(model_path, "config.json")) as fh:
+        with open(cfg_path) as fh:
             cfg = json.load(fh)
     except OSError:
         return False
@@ -895,7 +901,10 @@ def checkpoint_stage_weights(
     drafter_head_from_target: bool = False,
     external_drafter_mib: float = 0.0,
 ) -> List[StageWeights]:
-    """Per-PP-stage weight MiB from the safetensors HEADERS and the shipped cut.
+    """Per-PP-stage weight MiB from the safetensors HEADERS and the shipped cut
+    -- or, for a GGUF ``--model-path`` (27B line G6), from the GGUF file's own
+    tensor directory through the same ``pp_cut.checkpoint_weight_terms``
+    (exact per-tensor header bytes, the NEXTN block under ``mtp.*``).
 
     THE INDEPENDENT SOURCE.  It touches no boot log, no census and no
     predecessor: only the checkpoint this boot will load and the cut this boot

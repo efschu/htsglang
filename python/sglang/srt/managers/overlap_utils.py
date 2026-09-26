@@ -206,6 +206,20 @@ _is_npu = is_npu()
 _DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
 
 
+_D_HOSTGAP_METER_FN = None
+
+
+def _d_hostgap_meter():
+    """The group-D ``#DGAP`` meter (SGLANG_WEG2_D_HOSTGAP), None when off.
+    Imported lazily (once): overlap_utils stays importable without weg2."""
+    global _D_HOSTGAP_METER_FN
+    if _D_HOSTGAP_METER_FN is None:
+        from sglang.srt.managers.weg2_d_hostgap import meter
+
+        _D_HOSTGAP_METER_FN = meter
+    return _D_HOSTGAP_METER_FN()
+
+
 @torch.compile(dynamic=True, disable=_is_npu)
 def _assert_nonneg_and_invalidate(
     values: torch.Tensor, buf: torch.Tensor, indices: torch.Tensor
@@ -629,10 +643,18 @@ class FutureMap:
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
             )
 
-    def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
+    def resolve_seq_lens_cpu(
+        self, batch: ScheduleBatch, defer: bool = False
+    ) -> Optional["PendingSeqLensCpu"]:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
         # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
+        #
+        # defer=True (SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU, managers/weg2_d_hostgap.py):
+        # the device half below runs unchanged, but the host wait for the D2H is
+        # handed back as a PendingSeqLensCpu (seq_lens_cpu / seq_lens_sum stay
+        # None until it is completed). Only the pinned-D2H path defers; every
+        # other path ignores the flag and returns None, as before.
         draft_input = batch.spec_info
         if draft_input is None:
             return
@@ -695,7 +717,31 @@ class FutureMap:
         self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
         with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
             self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
-        self.fwd_prepare_d2h_stream.synchronize()
+        if defer and not _DEBUG_ASSERT:
+            # The host half moves to PendingSeqLensCpu.complete: the D2H is
+            # queued behind the publish on the private stream, its completion
+            # recorded there; nothing here waits. (_DEBUG_ASSERT keeps the old
+            # read: its poison below must follow a COMPLETED copy.)
+            from sglang.srt.managers.weg2_d_hostgap import PendingSeqLensCpu
+
+            done = getattr(self, "_seq_lens_d2h_done", None)
+            if done is None:
+                done = self._seq_lens_d2h_done = torch.get_device_module(
+                    self.device
+                ).Event()
+            done.record(self.fwd_prepare_d2h_stream)
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+            return PendingSeqLensCpu(
+                self.new_seq_lens_cpu_pinned, done, batch.req_pool_indices_cpu
+            )
+        _dgap = _d_hostgap_meter()
+        if _dgap is None:
+            self.fwd_prepare_d2h_stream.synchronize()
+        else:
+            with _dgap.span("publish_wait"):
+                self.fwd_prepare_d2h_stream.synchronize()
+            _dgap.mark_wake()
         _h58_span("seq_wait_ms", _h58_t0)
 
         # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.

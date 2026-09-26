@@ -228,6 +228,14 @@ MIXED_FUSED = 2
 #: pack factor the tensor itself states), same block layout
 #: (``mixed_fused_blocks``), and ``_emit`` treats it as strided like ``COLS``.
 MIXED_FUSED_COLS = 3
+#: G1 (2026-09-25): a FLAT-SEGMENT container (``weg2/xchg_flat_segments.py``) --
+#: ONE byte buffer per rank whose aligned segments, row widths and per-component
+#: row ranges the LOADER declared (``ParamGeom.flat_table``; the GGUF flat
+#: container of ``layers/quantization/gguf.py``). Classified only by
+#: ``xchg_manifest._axis_of`` when BOTH groups declared it, never from extents;
+#: planned by :func:`_emit_flat_segments` from the joined declarations
+#: (``ParamGeom.flat_join``) as whole-row FLAT copies plus ZEROFILL for the pad.
+FLAT_SEGMENTS = 4
 
 #: E4 bounds the granularity: pieces >= 2 MiB issued async cost <= 1 %, while
 #: 256 KiB async costs 4.6-6.4 %.  Only a per-copy SYNC is expensive (2.04x),
@@ -294,6 +302,27 @@ class Weg2XchgSourceMissing(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+#: Backlog #38: the attributes ``nvfp4_native_mixed.mark_swizzled`` stamps on a
+#: 128x4-swizzled NVFP4 block-scale Parameter (duplicated here as literals so
+#: this module keeps no import on the layers package). Only the TILE-VIEW stamp
+#: (K-sharded, row-parallel layers) changes the geometry.
+NVFP4_SF_LAYOUT_ATTR = "nvfp4_sf_layout"
+NVFP4_SF_LAYOUT_128X4 = "128x4"
+NVFP4_SF_TILE_VIEW_ATTR = "nvfp4_sf_tile_view"
+NVFP4_SF_TILE_ROWS = 128
+NVFP4_SF_TILE_COLS = 4
+
+
+def is_nvfp4_sf_swizzled(tensor) -> bool:
+    return getattr(tensor, NVFP4_SF_LAYOUT_ATTR, None) == NVFP4_SF_LAYOUT_128X4
+
+
+def is_nvfp4_sf_tile_view(tensor) -> bool:
+    return is_nvfp4_sf_swizzled(tensor) and bool(
+        getattr(tensor, NVFP4_SF_TILE_VIEW_ATTR, False)
+    )
+
+
 @dataclass(frozen=True)
 class StorageGeom:
     """What a live tensor looks like in STORAGE, in elements plus an itemsize.
@@ -323,6 +352,8 @@ class StorageGeom:
         shape = tuple(int(s) for s in tensor.shape)
         stride = tuple(int(s) for s in tensor.stride())
         itemsize = int(tensor.element_size())
+        if is_nvfp4_sf_tile_view(tensor):
+            return cls._nvfp4_sf_tile_view(shape, stride, itemsize)
         if len(shape) == 0:
             return cls(rows=1, cols=1, pitch=1, itemsize=itemsize)
         if len(shape) == 1:
@@ -367,6 +398,39 @@ class StorageGeom:
                 f"which no memcpy2d can express."
             )
         return cls(rows=rows, cols=cols, pitch=pitch, itemsize=itemsize)
+
+    @classmethod
+    def _nvfp4_sf_tile_view(cls, shape, stride, itemsize) -> StorageGeom:
+        """Backlog #38 (docs/NVFP4_NATIVE_LAYOUT_CONTRACT.md section 4): a
+        128x4-SWIZZLED NVFP4 block-scale tensor [N_pad, K_pad] is described as
+        one storage row per 128-row tile, ``(N_pad/128, K_pad*128)``.
+
+        In that view a 128-aligned N cut is a row slice and a K cut on 64
+        elements (4 scale columns) is a plain column slice -- byte-identical to
+        the native swizzle of the destination's own shard. In the element view a
+        K cut is WRONG bytes with no error (the swizzle interleaves 4 columns x
+        128 rows inside each 512-byte block). Only tensors the loader stamped
+        for the tile view (``--fp4-gemm-backend native-mixed``, row-parallel
+        layers) take this branch, so every other geometry is unchanged.
+        """
+        if len(shape) != 2 or stride != (shape[1], 1):
+            raise Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: swizzled NVFP4 scale shape {shape} "
+                f"stride {stride} is not a contiguous 2-D tensor."
+            )
+        rows, cols = shape
+        if rows % NVFP4_SF_TILE_ROWS or cols % NVFP4_SF_TILE_COLS:
+            raise Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: swizzled NVFP4 scale {shape} is not a "
+                f"whole number of {NVFP4_SF_TILE_ROWS}x{NVFP4_SF_TILE_COLS} tiles."
+            )
+        tile_cols = cols * NVFP4_SF_TILE_ROWS
+        return cls(
+            rows=rows // NVFP4_SF_TILE_ROWS,
+            cols=tile_cols,
+            pitch=tile_cols,
+            itemsize=itemsize,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -783,6 +847,14 @@ class ParamGeom:
     #: (``ManifestPiece.component_rows``) as gathered by the join -- never
     #: recomputed from ``component_rows``/``dst_widths``/anything else.
     component_rank_rows: Tuple[Tuple[int, ...], ...] = ()
+    #: G1: THIS rank's declared flat container (``xchg_flat_segments.FlatTable``),
+    #: read off the parameter the loader built -- the inventory -> manifest
+    #: direction. ``None`` for every other tensor, which is every tensor this
+    #: field did not exist for.
+    flat_table: Optional[object] = None
+    #: G1: the JOINED declarations (``xchg_flat_segments.FlatJoin``) a
+    #: ``FLAT_SEGMENTS`` geom is planned from -- the join -> plan direction.
+    flat_join: Optional[object] = None
 
     def replace(self, **kw) -> ParamGeom:
         return _dc_replace(self, **kw)
@@ -806,11 +878,19 @@ class ParamGeom:
                 f"{self.itemsize} do not describe a tensor."
             )
         if self.shard_axis not in (ROWS, COLS, REPLICATED, MIXED_FUSED,
-                                   MIXED_FUSED_COLS):
+                                   MIXED_FUSED_COLS, FLAT_SEGMENTS):
             raise Weg2XchgPlanDisagree(
                 f"W68 Weg2XchgPlanDisagree: {self.name}: shard axis "
                 f"{self.shard_axis} is neither ROWS, COLS, REPLICATED, "
-                f"MIXED_FUSED nor MIXED_FUSED_COLS."
+                f"MIXED_FUSED, MIXED_FUSED_COLS nor FLAT_SEGMENTS."
+            )
+        if self.shard_axis == FLAT_SEGMENTS and self.flat_join is None:
+            # G1: the segments are not visible in the extents; a FLAT_SEGMENTS
+            # geom without the joined declarations could only be planned by
+            # guessing where each shard sits.
+            raise Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: {self.name}: FLAT_SEGMENTS without "
+                f"the joined segment declarations of both groups."
             )
         if self.shard_axis in (MIXED_FUSED, MIXED_FUSED_COLS):
             # #1384: MIXED_FUSED validates ONLY once the declared components
@@ -2025,6 +2105,8 @@ def _emit(
     """Every descriptor of one parameter: intersect the two sides' ranges in
     GLOBAL coordinates, then translate each overlap into both sides' own device
     coordinates."""
+    if geom.shard_axis == FLAT_SEGMENTS:
+        return _emit_flat_segments(geom, src, dst, ptr_of, geom_of)
     src_blocks = _blocks_of(geom, src, is_dst=False)
     dst_blocks = _blocks_of(geom, dst, is_dst=True)
     source_units = geom.source_units
@@ -2163,6 +2245,82 @@ def _emit(
                 )
                 covered.append((d_dev, d_dev + span))
         _check_tiles(geom, d_rank, d_extent, covered)
+    return out
+
+
+def _flat_tables_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> list:
+    """Per rank of ``layout``, the declared table that rank holds (``None`` =
+    none). The PP form (``tp_size == 1``) holds the whole on its stage rank; the
+    TP form holds rank ``r``'s own declaration."""
+    fj = geom.flat_join
+    if layout.tp_size == 1:
+        if geom.stage is None or not 0 <= int(geom.stage) < layout.n_ranks:
+            raise Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: {geom.name} names holder stage "
+                f"{geom.stage} for the tp_size==1 group {layout.name!r} of "
+                f"{layout.n_ranks} ranks; a flat container has one whole holder."
+            )
+        return [fj.whole if r == int(geom.stage) else None for r in range(layout.n_ranks)]
+    if layout.tp_size != layout.n_ranks or len(fj.ranks) != layout.n_ranks:
+        raise Weg2XchgPlanDisagree(
+            f"W68 Weg2XchgPlanDisagree: {geom.name}: {len(fj.ranks)} declared "
+            f"rank tables for group {layout.name!r} of {layout.n_ranks} ranks "
+            f"(tp_size {layout.tp_size})."
+        )
+    return list(fj.ranks)
+
+
+def _emit_flat_segments(
+    geom: ParamGeom,
+    src: GroupLayout,
+    dst: GroupLayout,
+    ptr_of: Optional[Callable[[str, int, str], Optional[int]]],
+    geom_of: Optional[Callable[[str, int, str], object]] = None,
+) -> List[XchgDesc]:
+    """G1: a FLAT_SEGMENTS parameter as FLAT whole-row copies plus ZEROFILL for
+    every pad byte -- ``xchg_flat_segments.copy_plan`` over the two sides'
+    declared tables, which already refuses a gap (W74) or a double cover (W68).
+    Where the caller has the live tensor, its byte count must be the declared
+    buffer's: the declaration is checked against the hardware, not trusted."""
+    from sglang.srt.weg2 import xchg_flat_segments as fs
+
+    src_tables = _flat_tables_of(geom, src, is_dst=False)
+    dst_tables = _flat_tables_of(geom, dst, is_dst=True)
+    for layout, tables in ((src, src_tables), (dst, dst_tables)):
+        for r, table in enumerate(tables):
+            if table is None or geom_of is None:
+                continue
+            live = geom_of(layout.name, r, geom.name)
+            if live is None:
+                continue
+            if not isinstance(live, StorageGeom):
+                live = StorageGeom.of(live)
+            if live.rows * live.pitch * live.itemsize != int(table.nbytes):
+                raise Weg2XchgPlanDisagree(
+                    f"W68 Weg2XchgPlanDisagree: {geom.name} on {layout.name!r} rank "
+                    f"{r}: the declared container is {table.nbytes} bytes, the live "
+                    f"tensor holds {live.rows * live.pitch * live.itemsize}."
+                )
+
+    def ptr(group: str, rank: int) -> Optional[int]:
+        return None if ptr_of is None else ptr_of(group, rank, geom.name)
+
+    copies, fills = fs.copy_plan(geom.name, src_tables, dst_tables)
+    out: List[XchgDesc] = []
+    for c in copies:
+        out.append(XchgDesc(
+            tag=geom.tag, src_rank=c.src_rank, dst_rank=c.dst_rank,
+            param_name=geom.name, kind=FLAT, nbytes=c.nbytes, rows=1,
+            run_bytes=c.nbytes, spitch=0, dpitch=0, src_off=c.src_off,
+            dst_off=c.dst_off, src_ptr=ptr(src.name, c.src_rank),
+            dst_ptr=ptr(dst.name, c.dst_rank),
+        ))
+    for f in fills:
+        out.append(XchgDesc(
+            tag=geom.tag, src_rank=-1, dst_rank=f.dst_rank, param_name=geom.name,
+            kind=ZEROFILL, nbytes=f.nbytes, rows=1, run_bytes=f.nbytes, spitch=0,
+            dpitch=0, src_off=0, dst_off=f.dst_off, dst_ptr=ptr(dst.name, f.dst_rank),
+        ))
     return out
 
 

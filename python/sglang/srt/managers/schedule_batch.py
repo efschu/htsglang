@@ -2314,7 +2314,12 @@ class Req(ReqDllmMixin):
 
     def _check_vocab_boundary_finish(self, new_accepted_tokens: List[int] = None):
         for i, token_id in enumerate(new_accepted_tokens):
-            if token_id >= self.vocab_size or token_id < 0:
+            # upstream #33758: prefill-only embedding/scoring requests carry
+            # vocab_size=None; since the length cap now runs AFTER this check,
+            # the upper bound must tolerate it instead of raising TypeError.
+            if token_id < 0 or (
+                self.vocab_size is not None and token_id >= self.vocab_size
+            ):
                 offset = len(self.output_ids) - len(new_accepted_tokens) + i
                 if self.sampling_params.stop_token_ids:
                     self.output_ids[offset] = next(
@@ -2327,6 +2332,18 @@ class Req(ReqDllmMixin):
                 return True
 
         return False
+
+    def _cap_finished_len_at_max_new_tokens(self) -> None:
+        """Demote a stop matched beyond the length budget to a length finish.
+
+        upstream #33758: speculative decoding (MTP / DFLASH) can accept a run
+        that both crosses ``max_new_tokens`` and contains a stop; a stop
+        located past the cap must not extend the emitted output beyond the cap.
+        """
+        max_new_tokens = self.sampling_params.max_new_tokens
+        if self.finished_len is not None and self.finished_len > max_new_tokens:
+            self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
+            self.finished_len = max_new_tokens
 
     def update_finish_state(self, new_accepted_len: int = 1):
         # #622: env-gated finish trace. On a divergent finish (one rank drops
@@ -2358,6 +2375,36 @@ class Req(ReqDllmMixin):
             self.to_finish = None
             return
 
+        # Order (upstream #33758 + #31738): vocab/NaN -> stop string -> stop
+        # token/EOS -> length cap -> grammar termination. The length cap used to
+        # run first; a spec accept run (MTP / DFLASH, always on here) that
+        # crosses max_new_tokens in the step its EOS lands then finished as
+        # FINISH_LENGTH at the cap and emitted the over-accepted tokens after
+        # the EOS. Each stop branch now caps finished_len at max_new_tokens
+        # instead. The grammar-terminated check runs last so a stop token inside
+        # the accept run trims precisely (it sets finished_len, grammar does
+        # not) and cannot bypass the length cap. Deterministic per rank on
+        # identical output_ids, so the #622 rank-identical finish verdict holds.
+        new_accepted_tokens = self.output_ids[-new_accepted_len:]
+
+        # Sanitize out-of-range / NaN token ids before any decode.
+        if self._check_vocab_boundary_finish(new_accepted_tokens):
+            self._cap_finished_len_at_max_new_tokens()
+            return
+
+        # Stop string beats EOS/stop-token matched in the same step (speculative
+        # decoding can accept >1 token): token-based would trim only the last
+        # token and leak the stop string.
+        if self._check_str_based_finish(new_accepted_len):
+            self._cap_finished_len_at_max_new_tokens()
+            return
+
+        # Stop token/EOS beats the length cap for the same reason: a spec accept
+        # run can cross max_new_tokens in the very step the EOS lands.
+        if self._check_token_based_finish(new_accepted_tokens):
+            self._cap_finished_len_at_max_new_tokens()
+            return
+
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(
                 length=self.sampling_params.max_new_tokens
@@ -2365,24 +2412,8 @@ class Req(ReqDllmMixin):
             self.finished_len = self.sampling_params.max_new_tokens
             return
 
-        if self.grammar is not None:
-            if self.grammar.is_terminated():
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
-                return
-
-        new_accepted_tokens = self.output_ids[-new_accepted_len:]
-
-        # Sanitize out-of-range / NaN token ids before any decode.
-        if self._check_vocab_boundary_finish(new_accepted_tokens):
-            return
-
-        # Stop string beats EOS/stop-token matched in the same step (speculative
-        # decoding can accept >1 token): token-based would trim only the last
-        # token and leak the stop string.
-        if self._check_str_based_finish(new_accepted_len):
-            return
-
-        if self._check_token_based_finish(new_accepted_tokens):
+        if self.grammar is not None and self.grammar.is_terminated():
+            self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
     def truncate_prefix_to(self, told: int) -> None:
@@ -4797,6 +4828,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
                 has_been_filtered=False,
+                # #31468: the host keep-list, so a CPU mirror is filtered
+                # without a device read of new_indices.
+                new_indices_cpu=keep_indices,
             )
 
     def merge_batch(self, other: ScheduleBatch):

@@ -135,7 +135,11 @@ def _stats(cuda):
 def cum_peak_allocated(cuda) -> int:
     """The allocator peak since the pools, in bytes, across every window
     re-base this module made. Replaces a bare ``max_memory_allocated()``."""
-    return max(int(_STATE["shadow_alloc"]), int(cuda.max_memory_allocated()))
+    # UNIFY S7: the 27B fast read (SGLANG_VRAM_PEAK_FAST_READ, ff3d9ccfc3)
+    # reads the same allocator key without memory_stats()'s flatten.
+    from sglang.srt.model_executor.vram_family_census import _max_allocated_bytes
+
+    return max(int(_STATE["shadow_alloc"]), int(_max_allocated_bytes(cuda)))
 
 
 def reset_since_pools() -> None:

@@ -79,6 +79,7 @@ from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
+    configure_media_url_security,
     get_device,
     get_device_memory_capacity,
     get_device_sm,
@@ -348,6 +349,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_trtllm",
     "marlin",
+    "native-mixed",
 ]
 
 BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl"]
@@ -627,6 +629,31 @@ def _probe_declared(cfg: dict, key):
     """
     value = cfg.get(key)
     return value if value is not None else (cfg.get("text_config") or {}).get(key)
+
+
+def declared_config_path_candidates(model_path: Optional[str]) -> List[str]:
+    """The ``config.json`` locations that may describe ``model_path``, in probe
+    order (see :func:`declared_config_path_for`)."""
+    if not model_path:
+        return []
+    candidates = [os.path.join(model_path, "config.json")]
+    if model_path.endswith(".gguf"):
+        candidates.append(os.path.join(os.path.dirname(model_path), "config.json"))
+    return candidates
+
+
+def declared_config_path_for(model_path: Optional[str]) -> Optional[str]:
+    """Path of the ``config.json`` that describes ``model_path``, or None.
+
+    The rule of :meth:`ServerArgs.declared_config_path`, as a function of the
+    path alone, so a process that has no ``ServerArgs`` -- the weg2 launcher --
+    calls the server's own rule instead of re-implementing it (a GGUF launch
+    names the ``.gguf`` FILE, and its config is the sibling ``config.json``).
+    """
+    for candidate in declared_config_path_candidates(model_path):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def declared_num_hidden_layers_from_config(cfg: dict) -> Optional[int]:
@@ -3215,14 +3242,19 @@ class ServerArgs:
     ] = None
     chat_template_default_kwargs: A[
         Optional[str],
-        "JSON object of default chat_template_kwargs applied to every chat "
-        "completion before rendering, e.g. '{\"preserve_thinking\": true}'. "
-        "Per-request chat_template_kwargs override these key by key. Use this "
-        "to make a template flag that only exists per request into a serving "
-        "default; 'preserve_thinking' in particular keeps prior-turn think "
-        "blocks in the rendered prompt so multi-turn prompts stay a byte-exact "
-        "prefix of what was generated, which is what lets the KV prefix cache "
-        "hit instead of re-prefilling the conversation on every turn.",
+        Arg(
+            help="JSON object of default chat_template_kwargs applied to every chat "
+            "completion before rendering, e.g. '{\"preserve_thinking\": true}'. "
+            "Per-request chat_template_kwargs override these key by key. Use this "
+            "to make a template flag that only exists per request into a serving "
+            "default; 'preserve_thinking' in particular keeps prior-turn think "
+            "blocks in the rendered prompt so multi-turn prompts stay a byte-exact "
+            "prefix of what was generated, which is what lets the KV prefix cache "
+            "hit instead of re-prefilling the conversation on every turn. "
+            "--default-chat-template-kwargs (upstream #29579 spelling) is an "
+            "alias of this flag.",
+            aliases=["--default-chat-template-kwargs"],
+        ),
     ] = None
     completion_template: A[
         Optional[str],
@@ -3544,7 +3576,7 @@ class ServerArgs:
     fp4_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'cutlass' (SGLang CUTLASS kernel), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
+            help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'cutlass' (SGLang CUTLASS kernel), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+), 'native-mixed' (every rank keeps the native NVFP4 byte layout at the weight exchange; the kernel is chosen per rank: native W4A4 on SM100/SM120, W4A8 on the INT8 tensor cores of SM80-SM89 reading the same bytes (default), or with SGLANG_FP4_NATIVE_MIXED_SM8X=marlin Marlin W4A16 with the parameter content permuted in place around each flip). ",
             cli_name="--fp4-gemm-backend",
             choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
         ),
@@ -4637,6 +4669,17 @@ class ServerArgs:
             type_parser=json.loads,
         ),
     ] = None
+    allowed_media_domains: A[
+        List[str],
+        "Restrict client-supplied HTTP(S) image, video, and audio URLs to these "
+        "exact hostnames. Redirect destinations are checked against the same "
+        "allowlist. When unset, remote media from any domain is allowed.",
+    ] = dataclasses.field(default_factory=list)
+    media_url_max_file_size_mb: A[
+        int,
+        "Maximum size in MiB for one client-supplied remote media download. "
+        "The limit is enforced while streaming; set to 0 to disable it.",
+    ] = 64
     limit_mm_data_per_request: A[
         Optional[Union[str, Dict[str, int]]],
         Arg(
@@ -6177,6 +6220,21 @@ class ServerArgs:
             "SGLANG_UNEVEN_DCP_WEIGHTED (#781)."
         ),
     ] = None
+    dcp_lse_merge_block_tokens: A[
+        Optional[int],
+        Arg(
+            help="Token-block width of the uneven-DCP LSE merge of the "
+            "paged-prefix / decode partials (flashinfer). Unset (default) = "
+            "DERIVED and ON: the largest width whose per-block merge working "
+            "set fits in one full-head prefix partial at the budgeted forward "
+            "width (--chunked-prefill-size), from the head geometry -- the "
+            "same on every DCP rank. A merge of at most that many rows is "
+            "today's single call; a wider one runs in token blocks, each one "
+            "whole merge (27B RC7: a 4096-row prefix-bearing forward OOMed "
+            "the one-shot merge on the 5090). 0 = off (one block always; "
+            "diagnosis only). N > 0 = explicit width, a hand pin."
+        ),
+    ] = None
     kv_backing_relief: A[
         Optional[bool],
         Arg(
@@ -7073,6 +7131,7 @@ class ServerArgs:
         # value and the user's figure becomes the float's start.
         self._handle_max_running_requests_ceiling()
 
+        self._handle_media_url_security()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -10011,6 +10070,13 @@ class ServerArgs:
                         f"mm_process_config['{key}'] must be a dict, "
                         f"but got {type(self.mm_process_config[key])}"
                     )
+
+    def _handle_media_url_security(self):
+        """Normalize and publish the media URL policy before workers start."""
+        self.allowed_media_domains = configure_media_url_security(
+            self.allowed_media_domains,
+            self.media_url_max_file_size_mb,
+        )
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -16764,16 +16830,7 @@ class ServerArgs:
         Returns None when neither candidate is a readable file; the depth
         remains advisory either way (see :meth:`declared_num_hidden_layers`).
         """
-        model_path = getattr(self, "model_path", None)
-        if not model_path:
-            return None
-        candidates = [os.path.join(model_path, "config.json")]
-        if model_path.endswith(".gguf"):
-            candidates.append(os.path.join(os.path.dirname(model_path), "config.json"))
-        for candidate in candidates:
-            if os.path.isfile(candidate):
-                return candidate
-        return None
+        return declared_config_path_for(getattr(self, "model_path", None))
 
     def _read_declared_config(self) -> Optional[dict]:
         """The parsed ``config.json``, or None when it cannot be read."""
@@ -17967,6 +18024,19 @@ class ServerArgs:
         engine args unchanged) and is decoded once by the serving layer.
         """
         if self.chat_template_default_kwargs is None:
+            return
+        if isinstance(self.chat_template_default_kwargs, dict):
+            # Programmatic callers written against upstream #29579
+            # (default_chat_template_kwargs is a dict there): keep the raw-JSON
+            # contract of this field by normalizing to the JSON string.
+            if not all(isinstance(k, str) for k in self.chat_template_default_kwargs):
+                raise ValueError(
+                    "--chat-template-default-kwargs keys must be strings "
+                    "(they are passed as keyword arguments to the chat template)."
+                )
+            self.chat_template_default_kwargs = json.dumps(
+                self.chat_template_default_kwargs
+            )
             return
         try:
             parsed = json.loads(self.chat_template_default_kwargs)

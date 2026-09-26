@@ -104,6 +104,11 @@ class SpecTpSync:
         # Parsed even on a single rank so a typo fails on every deployment.
         sites = parse_spec_tp_sync(envs.SGLANG_SPEC_TP_SYNC.get())
         self._sites = sites if tp_group.world_size > 1 else frozenset()
+        # #1485 divergence instrument budget (see sync). The broadcast source
+        # (rank 0) keeps its own value by construction, so it never compares.
+        self._diverge_checks_budget = int(envs.SGLANG_SPEC_TP_DIVERGE_CHECKS.get())
+        self._diverge_checks_left = self._diverge_checks_budget
+        self._is_broadcast_src = int(getattr(tp_group, "rank_in_group", 0)) == 0
         if sites != _ALL and tp_group.world_size > 1 and tp_group.rank_in_group == 0:
             logger.warning(
                 "Speculative TP sync limited to %s.",
@@ -113,15 +118,45 @@ class SpecTpSync:
     def enabled(self, site: SpecTpSyncSite) -> bool:
         return site in self._sites
 
+    def _take_diverge_check(self) -> bool:
+        """Whether this broadcast runs the #1485 divergence compare.
+
+        Each compare (``torch.equal`` / ``.item()`` on device tensors) blocks the
+        host until the stream drains -- on the DFLASH decode path that is up to
+        six blocking reads per round (#31468 host-sync census). Bounded by a
+        budget of COMPARES, not of mismatches: the old mismatch-only bound never
+        retired on ranks that agree, and rank 0 (the broadcast source) always
+        agrees with itself.
+        """
+        if self._tp_group.world_size <= 1 or self._is_broadcast_src:
+            return False
+        if getattr(self, "_1485_n", 0) >= 40:
+            return False
+        left = self._diverge_checks_left
+        if left == 0:
+            return False
+        if left > 0:
+            self._diverge_checks_left = left - 1
+            if left == 1:
+                logger.info(
+                    "#1485 SPEC-TP-DIVERGE check retired after its budget "
+                    "(SGLANG_SPEC_TP_DIVERGE_CHECKS=%d, mismatches=%d); "
+                    "set -1 to keep it on.",
+                    self._diverge_checks_budget,
+                    int(getattr(self, "_1485_n", 0)),
+                )
+        return True
+
     def sync(self, site: SpecTpSyncSite, values: torch.Tensor) -> torch.Tensor:
         if site in self._sites:
             # #1485 instrument (df2l6, 17.09.): the broadcast ENFORCES rank 0's
             # decision and thereby hides where the ranks diverged (TP0 finished
             # a 1024-token decode one round before TP1/TP2, which then hung in
             # the graph's collective).  Keep the rank-local value and report a
-            # mismatch, bounded.
+            # mismatch, bounded -- by mismatches (40 lines) AND by compares
+            # (SGLANG_SPEC_TP_DIVERGE_CHECKS), see _take_diverge_check.
             _local = None
-            if self._tp_group.world_size > 1 and getattr(self, "_1485_n", 0) < 40:
+            if self._take_diverge_check():
                 try:
                     _local = values.detach().clone()
                 except Exception:  # noqa: BLE001
