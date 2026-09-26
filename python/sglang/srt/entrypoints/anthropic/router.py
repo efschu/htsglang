@@ -314,6 +314,8 @@ UPSTREAM_WAIT_S = web.AppKey("upstream_wait_s", float)
 MAX_BUFFERED = web.AppKey("max_buffered", int)
 LOCAL_POLL_INTERVAL_S = web.AppKey("local_poll_interval_s", float)
 HELD_STARTS = web.AppKey("held_starts", dict)
+# Input-token cap for the LOCAL backend (--local-max-input-tokens); None = off.
+LOCAL_MAX_INPUT_TOKENS = web.AppKey("local_max_input_tokens", object)
 
 
 def _filter_headers(headers: Iterable[tuple[str, str]]) -> dict[str, str]:
@@ -523,18 +525,19 @@ def _rewrite_model(body: bytes, target_model: str) -> bytes:
     return json.dumps(payload).encode()
 
 
-def _count_tokens_body(body: bytes) -> bytes | None:
+def _count_tokens_body(body: bytes, require_stream: bool = True) -> bytes | None:
     """Derive a ``count_tokens`` request from a ``/v1/messages`` body.
 
     Returns ``None`` for anything the repair does not apply to: a
     non-streaming request (whose single response already carries correct
-    usage), or a body we cannot read.
+    usage), or a body we cannot read. ``require_stream=False`` counts a
+    non-streaming request too -- the input cap needs every prompt's length.
     """
     try:
         payload = json.loads(body)
     except (ValueError, UnicodeDecodeError):
         return None
-    if not isinstance(payload, dict) or not payload.get("stream"):
+    if not isinstance(payload, dict) or (require_stream and not payload.get("stream")):
         return None
     counted = {k: v for k, v in payload.items() if k in COUNT_TOKENS_FIELDS}
     if "model" not in counted or "messages" not in counted:
@@ -963,6 +966,49 @@ def _repair_message_start(
     usage["input_tokens"] = input_tokens
     repaired = frame[:payload_start] + json.dumps(event).encode() + frame[payload_end:]
     return repaired, True
+
+
+# llama.cpp's answer to a prompt longer than its n_ctx (measured 2026-09-26 on
+# cachyllama b8064): HTTP 400 with {"error": {"type": "exceed_context_size_error",
+# "n_prompt_tokens": N, "n_ctx": M, ...}} -- NOT Anthropic's error shape.
+LLAMACPP_CONTEXT_ERROR = "exceed_context_size_error"
+
+
+def _prompt_too_long_response(tokens: int, limit: int) -> web.Response:
+    """Anthropic's own context-overflow error, in the exact wording Claude Code parses.
+
+    Claude Code matches ``prompt is too long[^0-9]*(\\d+)\\s*tokens?\\s*>\\s*(\\d+)``
+    (read out of the 2.1.280 binary). A match triggers its REACTIVE compaction,
+    and when the compaction request is itself too long it drops the head of the
+    conversation by exactly ``tokens - limit`` and retries. Any other wording is
+    a plain invalid-request error the client cannot recover from: that is how a
+    cachyllama session ran into its 150k n_ctx and could not be compacted.
+    """
+    return web.json_response(
+        {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": f"prompt is too long: {tokens} tokens > {limit} maximum",
+            },
+        },
+        status=400,
+    )
+
+
+def _context_overflow_tokens(raw: bytes) -> Optional[tuple[int, int]]:
+    """``(n_prompt_tokens, n_ctx)`` from a llama.cpp context-overflow body, else None."""
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict) or error.get("type") != LLAMACPP_CONTEXT_ERROR:
+        return None
+    tokens, n_ctx = error.get("n_prompt_tokens"), error.get("n_ctx")
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (tokens, n_ctx)):
+        return None
+    return tokens, n_ctx
 
 
 def _extract_model(body: bytes) -> str | None:
@@ -1455,6 +1501,7 @@ def create_app(
     openrouter_base: str = DEFAULT_OPENROUTER,
     openrouter_key_file: Optional[str] = None,
     remote_models: Optional[dict[str, str]] = None,
+    local_max_input_tokens: Optional[int] = None,
 ) -> web.Application:
     """Build the proxy application.
 
@@ -1503,6 +1550,15 @@ def create_app(
     is replaced by a placeholder (``_without_client_credential``). No wait
     buffer: a down remote answers 502 at once, loud and by name, instead of
     holding a turn. Empty by default -- then this bucket is never consulted.
+
+    ``local_max_input_tokens`` caps the prompt the LOCAL backend is sent on
+    ``/v1/messages``, counted by that backend's own ``count_tokens``. A longer
+    prompt is answered 400 in Anthropic's "prompt is too long: N tokens > MAX
+    maximum" wording and never forwarded; a llama.cpp context-overflow 400 is
+    translated into the same shape. That wording is what makes Claude Code
+    compact, so a backend with a smaller context than the client assumes
+    (cachyllama, n_ctx 150016) stays usable past its limit. ``None`` (the
+    default) leaves every request and response exactly as before.
     """
     if upstream_wait_s < 0:
         logger.warning(
@@ -1558,12 +1614,17 @@ def create_app(
         # LIVE queue depth and current wait, which are not lifetime totals.
         "buffer_succeeded": 0,
         "buffer_gave_up": 0,
+        # Local /v1/messages answered with Anthropic's "prompt is too long"
+        # instead of being forwarded (--local-max-input-tokens), plus backend
+        # context overflows translated into that shape. Lifetime total.
+        "refused_too_long": 0,
     }
     app[LOCAL_WAIT_S] = local_wait_s
     app[UPSTREAM_WAIT_S] = upstream_wait_s
     app[MAX_BUFFERED] = max_buffered
     app[LOCAL_POLL_INTERVAL_S] = local_poll_interval_s
     app[HELD_STARTS] = {}
+    app[LOCAL_MAX_INPUT_TOKENS] = local_max_input_tokens
 
     async def _session(app: web.Application):
         # auto_decompress=False keeps the response body byte-identical, so a
@@ -1845,12 +1906,39 @@ def create_app(
         # of adding a round trip in front of it. Only the local streaming
         # /v1/messages path can need the repair.
         count_task: Optional[asyncio.Task] = None
+        limit = request.app[LOCAL_MAX_INPUT_TOKENS]
         if to_local and request.path == "/v1/messages":
-            count_body = _count_tokens_body(body)
+            count_body = _count_tokens_body(body, require_stream=limit is None)
             if count_body is not None:
                 count_task = asyncio.ensure_future(
                     _count_input_tokens(request.app[SESSION], base, count_body)
                 )
+
+        # Input cap (--local-max-input-tokens, set for a backend whose context
+        # is smaller than the window the client believes in). Checked on the
+        # count BEFORE the backend sees the prompt, so an over-long request
+        # never occupies the backend's slot; answered in Anthropic's own
+        # wording so the client compacts instead of failing (see
+        # _prompt_too_long_response). A count that is unavailable forwards
+        # unchecked -- the backend's own overflow error is translated below.
+        if limit is not None and count_task is not None:
+            counted = await _resolve_count(count_task)
+            if counted is not None and counted > limit:
+                request.app[STATS]["refused_too_long"] += 1
+                logger.warning(
+                    "%s %s REFUSED model=%s: prompt %d tokens > local max %d "
+                    "(answered as Anthropic prompt-too-long)",
+                    request.method,
+                    request.path,
+                    model,
+                    counted,
+                    limit,
+                )
+                return _prompt_too_long_response(counted, limit)
+            if _count_tokens_body(body) is None:
+                # Counted for the cap only: a non-streaming response already
+                # carries correct usage, so the message_start repair stays off.
+                count_task = None
 
         # Opening the connection is the one step that differs between the two
         # routes, and BOTH can now be held.
@@ -1941,6 +2029,31 @@ def create_app(
         upstream_response: Optional[aiohttp.ClientResponse] = None
         try:
             upstream_response = await opener
+            # Only with the cap configured: without it every response keeps
+            # going through the untouched byte pipe below.
+            if to_local and limit is not None and upstream_response.status == 400:
+                raw = await upstream_response.read()
+                overflow = _context_overflow_tokens(raw)
+                if overflow is None:
+                    return web.Response(
+                        status=400,
+                        body=raw,
+                        headers=_filter_headers(upstream_response.headers.items()),
+                    )
+                tokens, n_ctx = overflow
+                cap = min(limit, n_ctx)
+                request.app[STATS]["refused_too_long"] += 1
+                logger.warning(
+                    "%s %s backend context overflow model=%s: %d tokens > n_ctx %d "
+                    "(translated to Anthropic prompt-too-long, maximum %d)",
+                    request.method,
+                    request.path,
+                    model,
+                    tokens,
+                    n_ctx,
+                    cap,
+                )
+                return _prompt_too_long_response(tokens, cap)
             out = web.StreamResponse(
                 status=upstream_response.status,
                 headers=_filter_headers(upstream_response.headers.items()),
@@ -2211,6 +2324,18 @@ def main(argv: list[str] | None = None) -> None:
         "listed id must also be in the policy file's allowed_models.",
     )
     parser.add_argument(
+        "--local-max-input-tokens",
+        type=int,
+        default=None,
+        help="Largest prompt (tokens, counted by the local backend's own "
+        "count_tokens) forwarded to the local backend on /v1/messages. A longer "
+        "one is answered 400 'prompt is too long: N tokens > MAX maximum', the "
+        "exact Anthropic wording on which Claude Code compacts. Use it for a "
+        "backend whose context is smaller than the window the client assumes "
+        "(cachyllama: n_ctx 150016 -> 130016, leaving 20000 for the answer, the "
+        "same output reserve Claude Code keeps). Default: off.",
+    )
+    parser.add_argument(
         "--shutdown-timeout-s",
         type=float,
         default=DEFAULT_SHUTDOWN_TIMEOUT_S,
@@ -2253,7 +2378,13 @@ def main(argv: list[str] | None = None) -> None:
         openrouter_base=args.openrouter_base,
         openrouter_key_file=args.openrouter_key_file,
         remote_models=remote_models,
+        local_max_input_tokens=args.local_max_input_tokens,
     )
+    if args.local_max_input_tokens is not None:
+        logger.warning(
+            "local input cap: prompts > %d tokens answered as prompt-too-long",
+            args.local_max_input_tokens,
+        )
     if remote_models:
         logger.warning("remote models (fourth bucket): %s", remote_models)
     logger.info(

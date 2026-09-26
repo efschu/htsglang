@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -2056,3 +2057,207 @@ class NoRemoteModelsConfiguredTestCase(RouterTestCase):
         stats = await (await self.client.get(STATS_PATH)).json()
         self.assertEqual(stats["remote_models"], {})
         self.assertEqual(stats["remote"], 0)
+
+
+# The regex Claude Code 2.1.280 applies to an API error to decide it is a
+# context overflow it can compact its way out of (read out of the binary).
+CLAUDE_CODE_PTL_RE = r"prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)"
+
+
+def _make_llamacpp_backend(n_ctx):
+    """A llama.cpp-shaped local backend: count_tokens + its real overflow error.
+
+    The prompt length is the length of the first message's content, so a test
+    picks its token count by picking a string length. ``count_fails`` makes
+    count_tokens answer 500; ``miscount`` makes it under-report, so the prompt
+    reaches /v1/messages and overflows there.
+    """
+    state = {"requests": [], "count_fails": False, "miscount": False}
+
+    async def handler(request):
+        raw = await request.read()
+        body = json.loads(raw) if raw else {}
+        state["requests"].append({"path": request.path, "body": body})
+        tokens = len(body.get("messages", [{}])[0].get("content", ""))
+        if request.path == "/v1/messages/count_tokens":
+            if state["count_fails"]:
+                return web.json_response({"error": "boom"}, status=500)
+            return web.json_response(
+                {"input_tokens": 1 if state["miscount"] else tokens}
+            )
+        if body.get("bad_request"):
+            return web.json_response(
+                {"error": {"code": 400, "type": "invalid_request_error"}}, status=400
+            )
+        if tokens > n_ctx:
+            # Verbatim shape of cachyllama's answer, measured 2026-09-26.
+            return web.json_response(
+                {
+                    "error": {
+                        "code": 400,
+                        "message": f"request ({tokens} tokens) exceeds the available "
+                        f"context size ({n_ctx} tokens), try increasing it",
+                        "type": "exceed_context_size_error",
+                        "n_prompt_tokens": tokens,
+                        "n_ctx": n_ctx,
+                    }
+                },
+                status=400,
+            )
+        return web.json_response({"backend": "local", "type": "message"})
+
+    app = web.Application(client_max_size=1024**2 * 8)
+    app.router.add_route("*", "/{tail:.*}", handler)
+    return app, state
+
+
+class LocalMaxInputTokensTestCase(AioHTTPTestCase):
+    """--local-max-input-tokens: cachyllama's n_ctx behind a client assuming more.
+
+    Claude Code sized its window for this model larger than the backend's
+    context, so a session ran past n_ctx, got llama.cpp's own error shape and
+    could neither continue nor compact. The cap answers in Anthropic's wording
+    so the client compacts; these tests pin the wording against the client's
+    own regex, that an over-long prompt never reaches /v1/messages, and that
+    the backend's own overflow error is translated as the fallback.
+    """
+
+    N_CTX = 300
+    LIMIT = 200
+
+    async def get_application(self):
+        upstream_app, self.upstream = _make_backend("upstream")
+        local_app, self.local = _make_llamacpp_backend(self.N_CTX)
+        self.upstream_server = TestServer(upstream_app)
+        self.local_server = TestServer(local_app)
+        await self.upstream_server.start_server()
+        await self.local_server.start_server()
+        return create_app(
+            local_models=[LOCAL_MODEL],
+            upstream_base=str(self.upstream_server.make_url("")).rstrip("/"),
+            local_base=str(self.local_server.make_url("")).rstrip("/"),
+            local_wait_s=0,
+            local_max_input_tokens=self.LIMIT,
+        )
+
+    async def tearDownAsync(self):
+        await self.upstream_server.close()
+        await self.local_server.close()
+        await super().tearDownAsync()
+
+    def _body(self, tokens, model=LOCAL_MODEL, **overrides):
+        body = {
+            "model": model,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "x" * tokens}],
+        }
+        body.update(overrides)
+        return body
+
+    def _message_paths(self):
+        return [r["path"] for r in self.local["requests"] if r["path"] == "/v1/messages"]
+
+    async def _assert_prompt_too_long(self, resp, tokens, maximum):
+        self.assertEqual(resp.status, 400)
+        payload = await resp.json()
+        self.assertEqual(payload["type"], "error")
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        match = re.search(CLAUDE_CODE_PTL_RE, payload["error"]["message"], re.I)
+        self.assertIsNotNone(match, payload)
+        self.assertEqual((int(match[1]), int(match[2])), (tokens, maximum))
+
+    async def test_over_cap_is_prompt_too_long_and_never_forwarded(self):
+        for stream in (False, True):
+            resp = await self.client.post(
+                "/v1/messages", json=self._body(self.LIMIT + 1, stream=stream)
+            )
+            await self._assert_prompt_too_long(resp, self.LIMIT + 1, self.LIMIT)
+        self.assertEqual(self._message_paths(), [])
+        stats = await (await self.client.get(STATS_PATH)).json()
+        self.assertEqual(stats["refused_too_long"], 2)
+
+    async def test_at_cap_is_forwarded(self):
+        resp = await self.client.post("/v1/messages", json=self._body(self.LIMIT))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual((await resp.json())["backend"], "local")
+        self.assertEqual(self._message_paths(), ["/v1/messages"])
+
+    async def test_thinking_alias_is_capped_too(self):
+        resp = await self.client.post(
+            "/v1/messages", json=self._body(self.LIMIT + 5, model=THINKING_ALIAS)
+        )
+        await self._assert_prompt_too_long(resp, self.LIMIT + 5, self.LIMIT)
+        self.assertEqual(self._message_paths(), [])
+
+    async def test_backend_overflow_is_translated_when_the_count_misses_it(self):
+        self.local["miscount"] = True
+        resp = await self.client.post("/v1/messages", json=self._body(self.N_CTX + 7))
+        # maximum = min(cap, n_ctx): the client trims to what is forwardable.
+        await self._assert_prompt_too_long(resp, self.N_CTX + 7, self.LIMIT)
+
+    async def test_unavailable_count_forwards_unchecked(self):
+        self.local["count_fails"] = True
+        resp = await self.client.post("/v1/messages", json=self._body(self.LIMIT + 1))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self._message_paths(), ["/v1/messages"])
+
+    async def test_other_backend_400_passes_through_unchanged(self):
+        resp = await self.client.post(
+            "/v1/messages", json=self._body(10, bad_request=True)
+        )
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(
+            await resp.json(),
+            {"error": {"code": 400, "type": "invalid_request_error"}},
+        )
+
+    async def test_upstream_models_are_never_capped(self):
+        resp = await self.client.post(
+            "/v1/messages", json=self._body(self.LIMIT * 10, model=REMOTE_MODEL)
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertEqual((await resp.json())["backend"], "upstream")
+        self.assertEqual(self.local["requests"], [])
+
+    async def test_count_tokens_itself_is_not_capped(self):
+        resp = await self.client.post(
+            "/v1/messages/count_tokens", json=self._body(self.LIMIT * 2)
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertEqual((await resp.json())["input_tokens"], self.LIMIT * 2)
+
+
+class NoLocalInputCapTestCase(LocalMaxInputTokensTestCase):
+    """Without the flag nothing changes: the backend's own 400 passes verbatim."""
+
+    LIMIT = None
+
+    async def test_over_cap_is_prompt_too_long_and_never_forwarded(self):
+        resp = await self.client.post("/v1/messages", json=self._body(250))
+        self.assertEqual(resp.status, 200)
+
+    async def test_thinking_alias_is_capped_too(self):
+        pass
+
+    async def test_backend_overflow_is_translated_when_the_count_misses_it(self):
+        resp = await self.client.post("/v1/messages", json=self._body(self.N_CTX + 7))
+        self.assertEqual(resp.status, 400)
+        payload = await resp.json()
+        self.assertEqual(payload["error"]["type"], "exceed_context_size_error")
+
+    async def test_unavailable_count_forwards_unchecked(self):
+        pass
+
+    async def test_count_tokens_itself_is_not_capped(self):
+        pass
+
+    async def test_upstream_models_are_never_capped(self):
+        pass
+
+    async def test_at_cap_is_forwarded(self):
+        pass
+
+    async def test_stats_count_nothing(self):
+        await self.client.post("/v1/messages", json=self._body(self.N_CTX + 7))
+        stats = await (await self.client.get(STATS_PATH)).json()
+        self.assertEqual(stats["refused_too_long"], 0)
