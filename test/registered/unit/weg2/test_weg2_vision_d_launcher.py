@@ -28,7 +28,7 @@ def test_the_launcher_gives_d_the_vision_form_and_keeps_the_env_p_only():
     assert lz.VISION_STAGE_ENV not in env  # D arms no stage
 
 
-def test_main_passes_the_form_to_both_d_argv_calls():
+def test_main_passes_the_form_to_every_d_argv_call():
     import inspect
 
     from sglang.srt.weg2 import launcher as lz
@@ -56,3 +56,26 @@ def test_an_extra_override_without_language_model_only_is_refused_not_lost():
     # outside the transient form EXTRA stays the operator's business
     lz.argv_d("py", "/m", [1, 1, 1], 1, 1, lz.RING_FORM_SENTINEL_STORE_CFG,
               ["--json-model-override-args", '{"rope_theta": 1}'])
+
+
+def test_the_p_side_refuses_the_same_extra_override():
+    """NF H125 (5/n) delta: the W111 guard is ONE helper for P and D, and it
+    reads the LAST --json-model-override-args (the one argparse keeps)."""
+    import json
+
+    from sglang.srt.weg2 import launcher as lz
+
+    def p_argv(extra, vision=lz.VISION_TRANSIENT):
+        return lz.argv_p(py="/nonexistent/python", model="/nonexistent/model",
+                         budgets=[28208, 17840, 17168], s_gb=1, m_mib=600,
+                         store_cfg=json.dumps({"max_size": "1"}), extra=list(extra),
+                         vision=vision)
+
+    with pytest.raises(lz.Weg2LaunchRefused, match="W111 .*--extra-p"):
+        p_argv(["--json-model-override-args", '{"rope_theta": 1}'])
+    # an earlier override with language_model_only does not save a later one without
+    with pytest.raises(lz.Weg2LaunchRefused, match="W111"):
+        p_argv(["--json-model-override-args", '{"language_model_only": true}',
+                "--json-model-override-args", '{"rope_theta": 1}'])
+    p_argv(["--json-model-override-args", '{"language_model_only": true}'])
+    p_argv(["--json-model-override-args", '{"rope_theta": 1}'], vision=lz.VISION_OFF)

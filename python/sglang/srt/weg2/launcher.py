@@ -5336,6 +5336,7 @@ def argv_p(
     spec_flags: Optional[Sequence[str]] = None,
 ) -> List[str]:
     _refuse_if_extra_raises_budget(budgets, list(extra or ()), "P")
+    _refuse_if_extra_drops_transient_override(vision, extra, "P")
     # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
     # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
     # server_args hands to derive_pp_layer_split, which builds a CONTIGUOUS
@@ -5732,6 +5733,32 @@ def _adopt_load_format_flag(armed: bool) -> List[str]:
     return ["--load-format", "dummy"]
 
 
+def _refuse_if_extra_drops_transient_override(vision: str, extra, group: str) -> None:
+    """EXTRA is appended LAST and argparse keeps the last occurrence of
+    ``--json-model-override-args``, so an EXTRA override is the one the group
+    gets. Under ``--weg2-vision transient`` it must carry
+    ``language_model_only`` itself, or the group would build the tower it must
+    not have -- refused by name instead of lost silently (27B f09dc0d6e4,
+    extended to P on NF by H125: the NF arm's EXTRA_P and EXTRA_D both carry
+    ``{"language_model_only":true}``, which passes)."""
+    _extra = list(extra or ())
+    if vision != VISION_TRANSIENT or "--json-model-override-args" not in _extra:
+        return
+    _i = len(_extra) - 1 - _extra[::-1].index("--json-model-override-args")
+    try:
+        _lmo = bool(json.loads(_extra[_i + 1]).get("language_model_only"))
+    except (IndexError, ValueError, AttributeError):
+        _lmo = False
+    if not _lmo:
+        raise Weg2LaunchRefused(
+            f"W111 Weg2VisionArmRefused: --extra-{group.lower()} carries its own "
+            "--json-model-override-args without language_model_only, and "
+            "argparse keeps only the last one -- --weg2-vision transient's "
+            f"{VISION_TRANSIENT_OVERRIDE} would be lost and {group} would build a "
+            'tower. Add "language_model_only": true to the EXTRA override.'
+        )
+
+
 def argv_d(
     py: str,
     model: str,
@@ -5765,35 +5792,18 @@ def argv_d(
     profile: str = PROFILE_QWEN27B,
     # #108: kommt als WERT vom Launcher, nie aus der Env dieses Prozesses.
     d_adopt: bool = False,
-    # WEG2 VISION (D side, 24.09.): APPENDED LAST (argv_d has no `*`
-    # marker). Under `transient` D tokenizes images like P
+    # WEG2 VISION (D side, 24.09., 27B f09dc0d6e4; H125 on NF): APPENDED LAST
+    # (argv_d has no `*` marker). Under `transient` D tokenizes images like P
     # (language_model_only instead of --no-enable-multimodal): the same pad
     # ids reach P's stored pages and the decode gets the mrope delta. D still
     # has no tower and arms no stage (SGLANG_WEG2_VISION stays P-only,
     # build_env); an image inside D's own extent is refused by name at its
-    # admission (W123).
+    # admission (W123). `off` (default) is byte-identical to every argv
+    # before this parameter existed.
     vision: str = VISION_OFF,
 ) -> List[str]:
-    _extra = list(extra or ())
-    if vision == VISION_TRANSIENT and "--json-model-override-args" in _extra:
-        # EXTRA is appended LAST and argparse keeps the last occurrence, so
-        # EXTRA's override is the one D gets. It must carry the transient
-        # form's language_model_only itself, or D would build the tower it
-        # must not have -- refused by name instead of lost silently.
-        _i = _extra.index("--json-model-override-args")
-        try:
-            _lmo = bool(json.loads(_extra[_i + 1]).get("language_model_only"))
-        except (IndexError, ValueError, AttributeError):
-            _lmo = False
-        if not _lmo:
-            raise Weg2LaunchRefused(
-                "W111 Weg2VisionArmRefused: --extra-d carries its own "
-                "--json-model-override-args without language_model_only, and "
-                "argparse keeps only the last one -- --weg2-vision transient's "
-                f"{VISION_TRANSIENT_OVERRIDE} would be lost and D would build a "
-                'tower. Add "language_model_only": true to the EXTRA override.'
-            )
     _refuse_if_extra_raises_budget(budgets, list(extra or ()), "D")
+    _refuse_if_extra_drops_transient_override(vision, extra, "D")
     return [py, "-m", "sglang.launch_server"] + common_flags(
         model, s_gb, m_mib, store_cfg, max_kv_per_request, d_write_policy, "D",
         random_seed, barlink_cap_cycles, census_interval,
