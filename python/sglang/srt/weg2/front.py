@@ -2414,7 +2414,8 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                         stats: Optional[Dict[str, int]] = None) -> int:
     """#1459c: keep up to ``limit`` leg-1 calls in flight, refilling from
     ``queue`` (a deque; new arrivals appended while draining are taken too)
-    the moment ONE finishes.  ``on_done(p)`` runs in COMPLETION order.
+    the moment ONE finishes.  ``on_done(p)`` runs in COMPLETION order, and
+    within one completion round in DISPATCH order.
     ``may_dispatch()`` False stops NEW dispatches (the phase is leaving
     "serving"); what is already in flight is always awaited, never
     abandoned -- the old gather had the same property for its batch.
@@ -2439,6 +2440,12 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     inflight: Dict[Any, int] = {}
     inflight_tokens = 0
     dispatched_total = 0
+    # Dispatch sequence per task. `asyncio.wait` returns a SET, and a P batch
+    # finishes several leg 1s in the same round: walking that set handed them
+    # to `on_done` (-> `_ready_for_d`, which the D admitter pops oldest-first,
+    # law 2) in Task-id order, i.e. shuffled. Within one round they go in
+    # dispatch order, which is the queue's (arrival) order.
+    seq: Dict[Any, int] = {}
     rounds = 0
     if stats is not None:
         for k in ("dispatched", "peak_n", "peak_tokens", "pool_holds"):
@@ -2453,7 +2460,9 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                 if stats is not None:
                     stats["pool_holds"] += 1
                 break
-            inflight[asyncio.ensure_future(one(queue.popleft()))] = c
+            t = asyncio.ensure_future(one(queue.popleft()))
+            inflight[t] = c
+            seq[t] = dispatched_total
             inflight_tokens += c
             dispatched_total += 1
             dispatched = True
@@ -2466,8 +2475,9 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
         if not inflight:
             return rounds
         done, _pending = await asyncio.wait(set(inflight), return_when=asyncio.FIRST_COMPLETED)
-        for t in done:
+        for t in sorted(done, key=seq.__getitem__):
             inflight_tokens -= inflight.pop(t, 0)
+            seq.pop(t, None)
             on_done(t.result())
 
 
