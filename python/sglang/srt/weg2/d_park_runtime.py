@@ -15,13 +15,16 @@ Entry points (all no-ops off group D / with nothing parked):
   note_retracted -- a decode-pressure retraction is a PRESSURE park
   admission      -- D's admission verdict for one pass
   park_abort     -- an abort reaches the parked list
+
+H91d: the parked request's MTP draft rows ride along (``d_park_draft``):
+saved before the flip park's retraction, dropped with an abort.
 """
 from __future__ import annotations
 
 import logging
 import time
 
-from sglang.srt.weg2 import d_seats
+from sglang.srt.weg2 import d_park_draft, d_seats
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +83,9 @@ def park_running(sched, recv_req):
         running = list(sched.running_batch.reqs)
     for req in running:
         setattr(req, FORCE_HOST_WRITE_THROUGH_ATTR, True)
+    # H91d: the draft rows have no host twin (tier off) -- copy them off
+    # BEFORE the retraction hands the slots to the tree (d_park_draft).
+    d_park_draft.save_parked(sched, running, site=d_seats.SITE_FLIP)
     retracted = (
         sched.running_batch.retract_all(sched.server_args, offload_kv=False, retain=True)
         if running else []
@@ -230,6 +236,7 @@ def park_abort(sched, recv_req) -> int:
         return 0
     ids = {id(r) for r in gone}
     sched.weg2_d_parked = [r for r in parked if id(r) not in ids]
+    d_park_draft.drop_all(sched, gone, "abort")  # H91d
     for req in gone:
         if getattr(sched, "enable_hicache_storage", False):
             sched.tree_cache.release_aborted_request(req.rid)
