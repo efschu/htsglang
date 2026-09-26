@@ -104,6 +104,15 @@ def park_running(sched, recv_req):
     queued = list(sched.waiting_queue)
     sched.waiting_queue = []
     sched.weg2_d_parked = d_seats.order_waiting(list(parked) + list(retracted) + queued)
+    # H91c2: park_tick's awake requeue is the net for a sleep that never comes
+    # after THIS park, so its clock starts now for every request the park
+    # holds. A request decode pressure parked earlier kept its older stamp and
+    # awake_requeue_due reads the OLDEST: past 30 s the next pass re-queued the
+    # whole park, D decoded the parked requests again while the front, told
+    # they were parked, flipped (quiesce never idle -> W3). Rank-local
+    # monotonic, like every stamp here; park_tick MIN-reduces the verdict.
+    for req in sched.weg2_d_parked:
+        setattr(req, d_seats.SINCE_ATTR, now)
     sched._weg2_d_park_slept = False
     rids = [str(r.rid) for r in sched.weg2_d_parked if d_seats.park_site(r) is not None]
     held = [str(r.rid) for r in sched.weg2_d_parked if d_seats.park_site(r) is None]
@@ -192,8 +201,14 @@ def note_retracted(sched, retracted_reqs) -> int:
         return 0
     now = time.monotonic()
     for req in retracted_reqs:
-        if d_seats.park_site(req) is None:
-            d_seats.mark_parked(req, d_seats.SITE_PRESSURE, now=now)
+        # H91c2: ALWAYS a pressure park. A park site is never cleared, so a
+        # request resumed from a flip park still carries SITE_FLIP; keeping it
+        # let the admission gate resume it "as soon as it fits" -- the next
+        # pass, while the older request still decodes -- and the pressure
+        # retracted it again (thrash) instead of parking it until the older
+        # one is done. retract_decode only takes RUNNING requests, so no
+        # waiting flip park is ever re-marked here.
+        d_seats.mark_parked(req, d_seats.SITE_PRESSURE, now=now)
     mine = _to_queue_head(sched, retracted_reqs)
     logger.info("WEG2-D-PARK pressure: %d youngest request(s) parked %s (span retained; "
                 "resume when no older request is live)",

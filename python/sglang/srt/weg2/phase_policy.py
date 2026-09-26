@@ -186,6 +186,15 @@ def park_verdict(status: int, text: str) -> Tuple[str, List[str], str]:
     else, including a 200 whose body is not ``{"parked": [rid, ...]}`` -- a
     malformed answer must never be read as "nothing parked", because the
     front would then flip on requests it believes D is no longer running.
+
+    H91c2: the rids include D's ``held`` list -- requests that were only
+    QUEUED on D when the park came (an X-route request behind the H95c seat
+    cap n, a newcomer behind a pressure-park barrier). Part B keeps them in
+    the same park list (``weg2_d_parked``), holds them over the sleep and
+    resumes them after the parked ones, so for the front they are parked
+    too. Read as running, they held the D->P drain for its whole window
+    (120 s) and W1b then aborted them by rid. A malformed ``held`` is a
+    failed park for the same reason as a malformed ``parked``.
     """
     if status in PARK_UNSUPPORTED_STATUSES:
         return PARK_UNSUPPORTED, [], f"http {status}"
@@ -198,4 +207,7 @@ def park_verdict(status: int, text: str) -> Tuple[str, List[str], str]:
     rids = js.get("parked") if isinstance(js, dict) else None
     if not isinstance(rids, list) or not all(isinstance(r, str) for r in rids):
         return PARK_FAILED, [], f"http 200 without a parked=[rid, ...] list: {str(text)[:200]}"
-    return PARK_PARKED, list(rids), ""
+    held = js.get("held", [])
+    if not isinstance(held, list) or not all(isinstance(r, str) for r in held):
+        return PARK_FAILED, [], f"http 200 with a malformed held list: {str(text)[:200]}"
+    return PARK_PARKED, list(rids) + [r for r in held if r not in rids], ""
