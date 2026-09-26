@@ -7812,6 +7812,8 @@ def arm_deadman(log: Log, boot_log: str, port: int, pattern: str, probe_s: int, 
         log(f"DRY-RUN: would arm deadman: {cmd}")
         return 0
     pid = int(subprocess.run(["bash", "-c", cmd], capture_output=True, text=True).stdout.strip() or 0)
+    if pid:
+        register_helper(tag, f"deadman_{name}", pid, log)
     time.sleep(1)
     proof = subprocess.run(["pgrep", "-af", f"boot_deadman.sh {boot_log}"], capture_output=True, text=True).stdout.strip()
     n = len(proof.splitlines())
@@ -7852,6 +7854,86 @@ _MEMTS_SUPERVISOR_SH = (
     'kill -TERM 0; '
     'else wait; fi'
 )
+
+
+# --------------------------------------------------------------------------
+# #135: one process-group registry per boot, shared with the arm
+# --------------------------------------------------------------------------
+#
+# MEASURED 26.09. (fnFL2h91v1): the launcher-armed front deadman stayed alive
+# five minutes after the arm's teardown (teardown 08:00:50Z, its CRASH verdict
+# 08:05:58Z) -- nothing but its own grace ceiling ended it, because the arm
+# never learnt its pid (state json only, read by `--teardown PATH`, which the
+# normal end does not run). Every helper this launcher starts is a session
+# leader already (setsid / start_new_session, pgid == pid), so the missing
+# piece is only the ENTRY: the arm's boot_helpers.sh reads
+#   {EVIDENCE_DIR}/helpers_{tag}/{name}.pid = "PGID START OWNER OWNER_START NAME"
+# and stops each group in its teardown (and its owner guard does it when the
+# arm dies without one). OWNER is this launcher's parent -- the arm, which
+# starts it with `setsid nohup python -m ...` (setsid execs in place, the arm
+# stays the parent). START is /proc/<pid>/stat field 22, so a recycled pid is
+# never signalled. The format is a contract with boot_helpers.sh.
+
+
+def helper_registry_dir(tag: str) -> str:
+    return f"{EVIDENCE_DIR}/helpers_{tag}"
+
+
+def _proc_start_ticks(pid: int) -> int:
+    """/proc/<pid>/stat field 22 (starttime), 0 when unreadable. Split after the
+    LAST ')' -- comm may carry spaces and parentheses."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            rest = f.read().rsplit(b")", 1)[1].split()
+        return int(rest[19])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def register_helper(tag: str, name: str, pid: int, log: Optional[Log] = None) -> str:
+    """Write the registry entry for helper ``name`` (a session leader, pgid ==
+    pid). Never raises: a registry that cannot be written costs the arm its
+    group stop for this helper, not the boot -- and the line says so."""
+    path = f"{helper_registry_dir(tag)}/{name}.pid"
+    owner = os.getppid()
+    line = f"{pid} {_proc_start_ticks(pid)} {owner} {_proc_start_ticks(owner)} {name}\n"
+    try:
+        os.makedirs(helper_registry_dir(tag), exist_ok=True)
+        tmp = f"{helper_registry_dir(tag)}/.{name}.tmp"
+        with open(tmp, "w") as f:
+            f.write(line)
+        os.replace(tmp, path)
+        msg = f"WEG2-HELPER registered {name} pgid={pid} owner={owner} -> {path}"
+    except OSError as e:
+        msg = f"WEG2-HELPER NOT registered {name} pgid={pid}: {e} (the arm cannot stop it by group)"
+    if log is not None:
+        log(msg)
+    return msg
+
+
+def unregister_helper(tag: str, name: str) -> None:
+    try:
+        os.unlink(f"{helper_registry_dir(tag)}/{name}.pid")
+    except OSError:
+        pass
+
+
+def _stop_helper_pid(pid: int, expect: str = "boot_deadman") -> str:
+    """TERM a helper: its whole process group when it leads one AND its argv
+    still carries ``expect`` (a recycled pid that happens to lead some other
+    group is never group-signalled), else the pid alone -- the pre-#135
+    behaviour. Returns 'group', 'pid' or 'gone'."""
+    try:
+        if os.getpgid(pid) == pid and expect in _proc_cmdline(pid):
+            os.killpg(pid, signal.SIGTERM)
+            return "group"
+    except OSError:
+        pass
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return "pid"
+    except OSError:
+        return "gone"
 
 
 def memts_csv_path(tag: str) -> str:
@@ -7901,6 +7983,7 @@ def start_memts(state: "BootState", log: Log) -> int:
     state.memts_pid = p.pid
     state.helper_pids.append(p.pid)
     _write_state(state)
+    register_helper(state.tag, "memts", p.pid, log)
     log(f"mem time series pid {p.pid} (pgid, supervisor; owner watch {owner!r}, "
         f"poll {MEMTS_OWNER_POLL_S} s) csv {csv} (started before group P: launch AND run "
         f"moments sampled; state {state_path(state)} carries the pid)")
@@ -16739,12 +16822,17 @@ def teardown(path: str, report: dict | None = None) -> int:
     # outlived 107 boots.
     memts_pid = int(st.get("memts_pid") or 0)
     print(stop_memts(st.get("tag", ""), memts_pid), flush=True)
+    # #135: the deadmen are session leaders -- TERM the group, so a deadman
+    # caught inside `sleep` or a py-spy dump does not leave that child behind.
+    helper_verdicts = []
     for hp in st.get("helper_pids", []):
         if hp and int(hp) != memts_pid:
-            try:
-                os.kill(int(hp), signal.SIGTERM)
-            except OSError:
-                pass
+            helper_verdicts.append(f"{int(hp)}:{_stop_helper_pid(int(hp))}")
+    if helper_verdicts:
+        print(f"WEG2-TEARDOWN helpers {' '.join(helper_verdicts)}", flush=True)
+    if st.get("tag"):
+        for name in ("memts", "deadman_P", "deadman_D", "deadman_front"):
+            unregister_helper(st["tag"], name)
     print(f"TERM {sorted(pids)}")
     for p in pids:
         try:
