@@ -937,8 +937,12 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
         p = pacing[rid]
         if rid not in queued:
             if fb_on and rid in fb_parked:
-                # PF: held by the dormant hold / settle (TK path 4) -- the
-                # verdict waits until the release has queued it again.
+                # PF, DEFENSIVE ONLY: a paced rid cannot be parked on the
+                # current tree -- the #1443 hold is entered only at intake
+                # (before waiting_queue.append) and the #1471 settle only from
+                # the hold release, and (b) below never publishes a parked
+                # rid (TK path 4). Should a later path park a published rid,
+                # the verdict waits for its re-queue instead of dropping it.
                 continue
             # left the queue during the window (abort): no Admit, nothing
             # admits; the followers' reads end in their own drain.
