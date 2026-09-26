@@ -3277,6 +3277,12 @@ def _run_granian_server(
         server.serve()
 
 
+# rename transition: every flip route also answers under the other prefix (compat_shims).
+# Placed after the last @app route of this module and before the server can start.
+from sglang.srt.compat_shims import alias_fastapi_routes as _alias_fastapi_routes  # noqa: E402
+
+_alias_fastapi_routes(app)
+
 def _setup_and_run_http_server(
     server_args: ServerArgs,
     tokenizer_manager,

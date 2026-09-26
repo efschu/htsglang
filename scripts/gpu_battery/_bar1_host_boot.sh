@@ -183,7 +183,7 @@ bar1_altlast_pruefen() {
     raw="$(host_ssh_for 90 "
         echo \"PORT=\$( (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) \
                         | grep -c ':$port ' )\";
-        echo \"PROC=\$(pgrep -c -f '[s]glang.launch_server' 2>/dev/null || echo 0)\";
+        echo \"PROC=\$(pgrep -c -f '[s]glang.launch_server|[f]lliper.launch_server' 2>/dev/null || echo 0)\";
         # Bracket idiom [s]glang instead of the plain name: pgrep -f matches
         # against the full command line, and our own ssh session carries the
         # search pattern as text (this embedded heredoc). Without the bracket

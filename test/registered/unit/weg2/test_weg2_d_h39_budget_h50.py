@@ -109,8 +109,11 @@ def _weight_tags_tp0(text):
     import ast
     import re
 
+    from sglang.srt.name_compat import has_marker
+
     for ln in text.splitlines():
-        if "TP0] WEG2-DC-BREAKDOWN stage=release tags=['kv_cache', 'cuda_graph']" in ln:
+        # fixture logs are evidence from before the rename: either spelling (name_compat 1a)
+        if has_marker(ln, "TP0] WEG2-DC-BREAKDOWN stage=release tags=['kv_cache', 'cuda_graph']"):
             d = ast.literal_eval(re.search(r"tms_resident \d+ (\{[^}]*\})", ln).group(1))
             return sum(v for k, v in d.items() if k.startswith("weights") and k != "weights_draft")
     raise AssertionError("keine DC-BREAKDOWN-Zeile")

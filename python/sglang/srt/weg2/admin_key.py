@@ -105,7 +105,9 @@ def mint() -> str:
 
 def key_path(gpu_arb: str, tag: str) -> str:
     """Beside the boot's own state json, named for the boot."""
-    return f"{gpu_arb}/weg2/boot_{tag}.adminkey"
+    from sglang.srt.compat_shims import operator_dir   # host path: survives the rename
+
+    return operator_dir(gpu_arb, f"boot_{tag}.adminkey")
 
 
 def write(path: str, key: str) -> str:
