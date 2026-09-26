@@ -2832,13 +2832,16 @@ class Front:
         # xsn438: resolved once and named once -- a switch that changes the
         # D->P latch must be readable off the front log, not inferred.
         self.vision_flip_urgent = vision_flip_urgent()
-        logger.info(
-            "WEG2 VISION-FLIP-URGENT %s (%s=%r, default off; vision=%s): %s",
-            "on" if self.vision_flip_urgent else "off", VISION_FLIP_URGENT_ENV,
-            os.environ.get(VISION_FLIP_URGENT_ENV), self.vision,
-            "a queued request only P can serve satisfies the D->P latch on its own"
-            if self.vision_flip_urgent else
-            "such a request waits for X* of queued work or the fairness switch")
+        # H125: named only on a boot that serves images -- a text-only front
+        # (`off`, the default) logs exactly what it logged before.
+        if self.vision == VISION_MODE_TRANSIENT or self.vision_flip_urgent:
+            logger.info(
+                "WEG2 VISION-FLIP-URGENT %s (%s=%r, default off; vision=%s): %s",
+                "on" if self.vision_flip_urgent else "off", VISION_FLIP_URGENT_ENV,
+                os.environ.get(VISION_FLIP_URGENT_ENV), self.vision,
+                "a queued request only P can serve satisfies the D->P latch on its own"
+                if self.vision_flip_urgent else
+                "such a request waits for X* of queued work or the fairness switch")
         self.admin_key_file = admin_key_file or ""
         self.admin_key = admin_key_mod.read(admin_key_file) if admin_key_file else None
         self.groups = {"P": Group("P", prefill.rstrip("/"), prefill_sid), "D": Group("D", decode.rstrip("/"), decode_sid)}
@@ -7152,15 +7155,18 @@ class Front:
         except Exception:  # noqa: BLE001 - a report may never break the verdict
             stranded, oldest = -1, -1.0
 
+        # H125: the two vision fields only on a boot that serves images; a
+        # text-only front (`off`, the default) prints the pre-H125 line.
+        _vis = str(getattr(self, "vision", VISION_MODE_OFF)) == VISION_MODE_TRANSIENT or urgent_on
         logger.info(
             "WEG2 FLIP-ECONOMICS queued_uncached=%d queued_tokens=%d threshold=%d "
             "(X*, amortising 2*flip_s once over the backlog) fairness=%s "
-            "p_only=%d vision_flip_urgent=%s "
-            "stranded_decodes=%d oldest_wait_s=%.1f verdict=%s "
+            + ("p_only=%d vision_flip_urgent=%s " if _vis else "%s%s")
+            + "stranded_decodes=%d oldest_wait_s=%.1f verdict=%s "
             "(stranded is REPORTED, never a veto -- unbounded decode wait under a "
             "prefill stream is accepted; -1 means the census could not be taken)",
             queued_uncached, queued_tokens, threshold, fairness_fired,
-            p_only, urgent_on,
+            *((p_only, urgent_on) if _vis else ("", "")),
             stranded, oldest, "flip" if ok else "hold",
         )
         return ok
