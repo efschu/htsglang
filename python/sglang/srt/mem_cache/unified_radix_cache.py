@@ -5117,13 +5117,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # MIN gives the low end directly and the high end through the
             # negation, exactly as slots 0/1 already carry the tag both ways.
             local_span = len(prefetch_key)
+            # H99 (rc9o weg2-33-33, W65 min=320 max=6720): on a Form A group
+            # the span is the ATTENTION HOST's. An expert worker's span comes
+            # from its byteless shadow anchors (its intake match), so it
+            # abstains in both span slots the way the x22 claim vote abstains
+            # (cache_controller.CLAIM_VOTE_ABSTAIN): it can win neither the
+            # min nor the max. Its LENGTH vote stays -- it still caps what the
+            # group registers at what this rank can register. Every other
+            # group votes (span, -span) exactly as before.
+            from sglang.srt.managers.tp_match_floor import (
+                form_a_prefetch_span_vote as _fa_span_vote,
+            )
+
+            _span_vote, _neg_span_vote = _fa_span_vote(local_span)
             vote = torch.tensor(
                 [
                     _PREFETCH_VOTE_TAG,
                     -_PREFETCH_VOTE_TAG,
                     local_len,
-                    local_span,
-                    -local_span,
+                    _span_vote,
+                    _neg_span_vote,
                 ],
                 dtype=torch.int,
             )
@@ -5249,6 +5262,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # rows this trim just released. Rebuild from the trimmed
                 # tensor -- the builder wraps and allocates nothing, so this
                 # cannot fail after the consensus.
+                sidecar_xfers = self._build_sidecar_transfers(
+                    CacheTransferPhase.PREFETCH,
+                    PoolTransfer(name=PoolName.KV, host_indices=host_indices),
+                    comp_xfers,
+                )
+            # H99: an abstaining Form A worker registers exactly the group
+            # length too (release-only, like the group trim above): its own
+            # key/rows may be longer than the host's span, and a longer
+            # registration would make ITS `deliverable` exceed the group's
+            # completion -- a rank-local #1324 store-short mark and a retry
+            # set only the workers enter. The group span is kept for the
+            # scheduler, which re-derives the host's prefix from it.
+            from sglang.srt.managers.tp_match_floor import (
+                form_a_trim_to_group as _fa_trim,
+            )
+
+            _trimmed = _fa_trim(self, req_id, host_indices, prefetch_key, group_len, span_lo)
+            if _trimmed is not None:
+                host_indices, prefetch_key = _trimmed
                 sidecar_xfers = self._build_sidecar_transfers(
                     CacheTransferPhase.PREFETCH,
                     PoolTransfer(name=PoolName.KV, host_indices=host_indices),

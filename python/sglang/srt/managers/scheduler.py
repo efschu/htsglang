@@ -6071,6 +6071,9 @@ class Scheduler(
                 prefix_keys,
                 locally_eligible=locally_eligible,
             )
+            # H99: on a Form A expert worker the span bookkeeping is the host's
+            # (the vote carried it); a no-op on every other rank and boot.
+            tp_match_floor.adopt_host_prefetch_span(self.tree_cache, req, _match_end)
         else:
             self.tree_cache.prefetch_from_storage(
                 req.rid,
@@ -8741,14 +8744,17 @@ class Scheduler(
         # the COW). Placed BEFORE the ballot, which is indexed from the tail.
         # No new collective (MUST NOT 6).
         _usable_at = len(vals)
+        _usable_by_rid = {req.rid: req for req in self.waiting_queue}
+        _usable_local = tp_match_floor.local_usable_matches(
+            getattr(self, "tree_cache", None), _usable_by_rid, _head_local_matches
+        )
         vals = vals + tp_match_floor.build_usable_match_payload(
-            _head_canonical,
-            tp_match_floor.local_usable_matches(
-                getattr(self, "tree_cache", None),
-                {req.rid: req for req in self.waiting_queue},
-                _head_local_matches,
-            ),
-            tp_head_congruence.TP_HEAD_SLOTS,
+            _head_canonical, _usable_local, tp_head_congruence.TP_HEAD_SLOTS
+        )
+        # H97: the same vote negated, so this reduce also yields the group MAX.
+        _usable_max_at = len(vals)
+        vals = vals + tp_match_floor.build_usable_max_payload(
+            _head_canonical, _usable_local, tp_head_congruence.TP_HEAD_SLOTS
         )
         _ballot_rids = [
             req.rid
@@ -8814,9 +8820,41 @@ class Scheduler(
                 f"expected={tp_head_congruence.TP_HEAD_SLOTS}, "
                 f"available={len(vals) - _usable_at})"
             )
-        self._uniform_usable_floor = tp_match_floor.decode_group_usable(
+        _usable_group = tp_match_floor.decode_group_usable(
             _head_canonical, _usable_lens
         )
+        # H97 (rc9m weg2-18-15): MIN < MAX means the deeper ranks must cut to
+        # the group depth -- and may hold no anchor there. Every rank sees the
+        # same skew (same reduce), so every rank takes the same branch: one
+        # more small MIN over "I can realize the group depth", 0 -> group 0.
+        _usable_skew = tp_match_floor.skewed_rids(
+            _usable_group,
+            tp_match_floor.decode_group_max(
+                _head_canonical,
+                t[
+                    _usable_max_at : _usable_max_at + tp_head_congruence.TP_HEAD_SLOTS
+                ].tolist(),
+            ),
+        )
+        if _usable_skew:
+            _realize = torch.tensor(
+                tp_match_floor.build_realize_payload(
+                    _head_canonical,
+                    _usable_skew,
+                    _usable_local,
+                    getattr(self, "tree_cache", None),
+                    _usable_by_rid,
+                    tp_head_congruence.TP_HEAD_SLOTS,
+                ),
+                dtype=torch.int64,
+            )
+            torch.distributed.all_reduce(
+                _realize, op=torch.distributed.ReduceOp.MIN, group=grp
+            )
+            _usable_group = tp_match_floor.apply_realize_verdict(
+                _usable_group, _head_canonical, _usable_skew, _realize.tolist()
+            )
+        self._uniform_usable_floor = _usable_group
         _admit_limit = int(t[_limit_at])
         # #1203: read back by its captured head index, before the ballot, under
         # the same discipline as the corridor width and the head block.

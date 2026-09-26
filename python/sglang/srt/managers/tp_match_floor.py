@@ -50,13 +50,30 @@ THE TWO CLOSES, both on reduces that already run
   needed), so this is the delay-never-force direction: slower (a re-prefill
   the rank could have skipped), never wrong.
 
-WHAT THIS DOES NOT CLOSE, named rather than implied: a group usable match
-strictly between 0 and the local match is only COUNTED
-(``RU FLOOR ABOVE-GROUP``). The benign population there is host-hit skew
-that the synced prefetch extent + #988 LOADBACK already converge (rc9i
-weg2-33-27: host_hit 18304 vs 15744, identical extend); truncating to a
-non-zero group depth would need a recurrent state at exactly that depth on
-this rank, which only a second agreement could establish.
+H96 (rc9l, boot dkrnfbar1rc9l09260540, rid weg2-21-21): the band strictly
+between 0 and the local match was only COUNTED here, on the claim that the
+synced prefetch extent + #988 LOADBACK converge it. They do not: TP0 matched
+19712 on a host-backed anchor (MAMBA-HOST-RESUME depth=19712), TP1/TP2 16384;
+the group usable match was 16384; TP0 logged ``RU FLOOR ABOVE-GROUP``, set
+``#1042 EXTENT 19712`` and ``#988 LOADBACK prefix moved to 19712`` while
+TP1/TP2 took 16384 -- different extend shapes, TP0 JIT-built alone, the group
+stood until the watchdog. The band is therefore ACTED ON now:
+:func:`group_floor_cap` names the group depth and the admission site
+re-matches this rank's key cut to exactly that depth
+(:func:`rematch_at_group_depth`). The group value is the MIN of every rank's
+usable vote, so on the ranks that voted it the depth carries a usable anchor;
+on the asymmetric host tier TP0's host coverage is a superset of TP1/TP2's,
+so the same node carries one here too. If the re-match cannot reach exactly
+that depth on this rank, the rank stops LOUDLY (:class:`RankFloorCapMiss`)
+instead of resuming alone -- a named death, never a silent split
+(raenge-nie-uneins).
+
+H97 (rc9m) showed the superset premise above is false for the ANCHORS, and
+H98 names the root: on a Form A group (``--rank-role``) TP1/TP2 are expert
+workers with 0-byte KV/mamba/host pools, so their anchors are bookkeeping and
+must not vote. The host is the authority; the workers vote their KV reach,
+abstain in the MAX arm and adopt the group depth at admission (see the H98
+section below; switch ``SGLANG_WEG2_ENABLE_FORM_A_TP0_FOLLOW``).
 
 PURE ON PURPOSE: every decision is a function of its arguments, so the tests
 drive the real verdict with mock collectives instead of grepping for it.
@@ -65,6 +82,7 @@ drive the real verdict with mock collectives instead of grepping for it.
 from __future__ import annotations
 
 import logging
+from array import array
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
@@ -165,7 +183,13 @@ def local_usable_matches(
     could not price are absent there and stay absent here). The walk left
     ``best_match_node`` on each request; a match that ends on an unusable
     anchor is voted 0 -- what admission's #928 would reduce it to.
+
+    H98: on a Form A group every rank votes its ADMISSION probe instead
+    (:func:`form_a_usable_votes`): the host its exact admission match, a
+    worker its KV reach.
     """
+    if form_a_follow_active():
+        return form_a_usable_votes(tree_cache, by_rid, matches)
     out: Dict[str, int] = {}
     for rid, n in matches.items():
         n = int(n)
@@ -198,6 +222,153 @@ def decode_group_usable(
         value = int(value)
         if value > ABSENT:
             out[str(rid)] = value
+    return out
+
+
+# --------------------------------------------------------------------------
+# H97: the MAX arm and the realizability round (rc9m, dkrnfbar1rc9m09260642)
+# --------------------------------------------------------------------------
+#
+# rc9m, rid weg2-18-15: TP0 voted 18112 (host anchor there), TP1/TP2 15552;
+# group MIN 15552. H96 cut TP0's key to 15552 -- and TP0 holds NO recurrent
+# anchor at 15552 (its host-row release policy differs from TP1/TP2's, so the
+# ranks' anchors sit at DIFFERENT depths, not in a superset): capped_match=0,
+# H96 CAP-MISS, D dead. The MIN of each rank's own deepest usable depth is
+# not a depth every rank can USE. So the group now also learns the MAX (a
+# negated arm on the same reduce) and, only for rids where MIN < MAX -- the
+# skew every rank sees identically, so every rank takes the same path -- runs
+# ONE more small MIN over "I can realize exactly the group depth" (a
+# side-effect-free match on the key cut to that depth: length == depth and a
+# usable anchor there). A 0 anywhere plants group usable 0 for that rid: every
+# rank re-prefills from 0 (slower, never wrong) instead of one rank dying.
+
+#: MIN-neutral value of the MAX arm for a rid this rank does not hold (the
+#: MIN arm already abstains for it; every present vote is <= 0).
+MAX_ARM_NEUTRAL = 1
+
+
+def build_usable_max_payload(
+    canonical: Sequence[str], local_usable: Mapping[str, int], slots: int
+) -> List[int]:
+    """The negated usable vote, so the same MIN reduce yields the group MAX.
+
+    H98: a Form A worker abstains here (every slot MIN-neutral), so the MAX
+    is the host's depth and a worker's KV reach can never raise it."""
+    payload = [MAX_ARM_NEUTRAL] * slots
+    if this_rank_follows():
+        return payload
+    for i, rid in enumerate(list(canonical)[:slots]):
+        if rid in local_usable:
+            payload[i] = -int(local_usable[rid])
+    return payload
+
+
+def decode_group_max(canonical: Sequence[str], reduced: Sequence[int]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for rid, value in zip(list(canonical), list(reduced)):
+        value = int(value)
+        if value <= 0:
+            out[str(rid)] = -value
+    return out
+
+
+def skewed_rids(
+    group_usable: Mapping[str, int], group_max: Mapping[str, int]
+) -> Dict[str, int]:
+    """rid -> group depth for every rid with 0 < MIN < MAX. Identical on every
+    rank (both inputs come from the same reduce)."""
+    out: Dict[str, int] = {}
+    for rid, g in group_usable.items():
+        g = int(g)
+        if g > 0 and int(group_max.get(rid, g)) > g:
+            out[rid] = g
+    return out
+
+
+def can_realize(tree_cache: Any, req: Any, depth: int) -> bool:
+    """Can THIS rank admit exactly ``depth`` tokens of ``req``'s prefix?
+
+    Side-effect free on the request (no ``match_prefix_for_req``: it writes
+    the req's match fields): a plain ``match_prefix`` on the key cut to
+    ``depth`` (bigram-aware -- ``depth`` bigrams span ``depth + 1`` tokens),
+    ``cow_mamba=False`` so no COW and no #928 refusal side effects. Never
+    raises: an unpriceable rank votes 0 (the safe direction)."""
+    try:
+        from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        token_ids = list(req.origin_input_ids) + list(req.output_ids)
+        span = int(depth) + (1 if getattr(tree_cache, "is_eagle", False) else 0)
+        if span > len(token_ids):
+            return False
+        result = tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids=array("q", token_ids[:span]),
+                    extra_key=getattr(req, "extra_key", None),
+                ),
+                cow_mamba=False,
+                req=None,
+            )
+        )
+        if _local_match_len(result) != int(depth):
+            return False
+        return not anchor_unusable(tree_cache, getattr(result, "best_match_node", None))
+    except Exception:  # noqa: BLE001 - a vote may never break the reduce
+        return False
+
+
+def build_realize_payload(
+    canonical: Sequence[str],
+    skewed: Mapping[str, int],
+    local_usable: Mapping[str, int],
+    tree_cache: Any,
+    by_rid: Mapping[str, Any],
+    slots: int,
+) -> List[int]:
+    """1 = this rank can admit the group depth (or has no stake), 0 = it cannot.
+
+    H98: a Form A worker's vote IS its KV reach, and it admits any depth up
+    to that reach on the KV path (:func:`follow_rematch`) -- no walk needed."""
+    payload = [1] * slots
+    follows = this_rank_follows()
+    for i, rid in enumerate(list(canonical)[:slots]):
+        if rid not in skewed:
+            continue
+        g = int(skewed[rid])
+        if follows:
+            payload[i] = 1 if int(local_usable.get(rid, -1)) >= g else 0
+            continue
+        if int(local_usable.get(rid, -1)) == g:
+            continue  # this rank's own usable match IS the group depth
+        req = by_rid.get(rid)
+        payload[i] = 1 if (req is not None and can_realize(tree_cache, req, g)) else 0
+    return payload
+
+
+def apply_realize_verdict(
+    group_usable: Dict[str, int],
+    canonical: Sequence[str],
+    skewed: Mapping[str, int],
+    reduced: Sequence[int],
+) -> Dict[str, int]:
+    """Plant 0 for every skewed rid some rank cannot realize."""
+    out = dict(group_usable)
+    for rid, flag in zip(list(canonical), list(reduced)):
+        if rid in skewed and int(flag) <= 0:
+            out[rid] = 0
+            _STATS["skew_zeroed"] = _STATS.get("skew_zeroed", 0) + 1
+            n = _STATS["skew_zeroed"]
+            if n <= 20 or n % 256 == 0:
+                logger.warning(
+                    "RU FLOOR SKEW-ZERO rid=%s group_min=%d (n=%d): some TP rank "
+                    "cannot admit the group depth (no usable anchor there), so the "
+                    "group re-prefills this rid from 0 on every rank (H97, rc9m "
+                    "weg2-18-15 died on H96 CAP-MISS instead).",
+                    str(rid)[:16],
+                    int(skewed[rid]),
+                    n,
+                )
     return out
 
 
@@ -262,21 +433,497 @@ def group_floor_zeroes(tree_cache: Any, req: Any, result: Any) -> bool:
                 n,
             )
         return True
-    if verdict == "above_group":
-        _STATS["above_group"] += 1
-        n = _STATS["above_group"]
-        if n <= 20 or n % 256 == 0:
-            logger.info(
-                "RU FLOOR ABOVE-GROUP rid=%s local_match=%d group_usable=%d "
-                "(n=%d): counted, not acted on -- the extent/#988 LOADBACK "
-                "convergence owns this band; a split forward after this line "
-                "names the residual.",
-                rid[:16],
-                local,
-                int(group[rid]),
-                n,
-            )
     return False
+
+
+class RankFloorCapMiss(RuntimeError):
+    """H96: this rank cannot materialize the group's usable match depth."""
+
+
+def _local_match_len(result: Any) -> int:
+    di = getattr(result, "device_indices", None)
+    return (0 if di is None else len(di)) + int(
+        getattr(result, "host_hit_length", 0) or 0
+    )
+
+
+def group_floor_cap(tree_cache: Any, req: Any, result: Any) -> Optional[int]:
+    """Admission-site verdict: the depth THIS rank must cap its match to, or
+    None. Non-None exactly when 0 < group usable match < local match (the
+    ``above_group`` band): every rank then admits the group depth."""
+    group = getattr(tree_cache, TREE_ATTR, None) if tree_cache is not None else None
+    if not group or req is None:
+        return None
+    rid = str(getattr(req, "rid", "") or "")
+    try:
+        local = _local_match_len(result)
+    except Exception:  # noqa: BLE001
+        return None
+    if floor_verdict(local, group.get(rid)) != "above_group":
+        return None
+    return int(group[rid])
+
+
+def rematch_at_group_depth(tree_cache: Any, params: Any, cap: int, local: int) -> Any:
+    """Re-run this rank's match on its key cut to ``cap`` (the group depth).
+
+    Called from ``MambaComponent.finalize_match_result`` BEFORE the COW, so the
+    outer match leaves no copy source and no slot behind; the nested match runs
+    the full component chain (and its own COW) at the group depth, where the
+    planted group value now reads ``agree``. ``params.key`` is already in the
+    match's own units (``maybe_to_bigram_view`` flips it in place), so
+    ``key[:cap]`` cuts at exactly ``cap`` match positions."""
+    import dataclasses
+
+    cut = dataclasses.replace(params, key=params.key[: int(cap)])
+    capped = tree_cache.match_prefix(cut)
+    got = _local_match_len(capped)
+    rid = str(getattr(getattr(params, "req", None), "rid", "") or "")
+    _STATS["above_group"] += 1
+    n = _STATS["above_group"]
+    if got != int(cap):
+        raise RankFloorCapMiss(
+            f"H96 RU FLOOR CAP-MISS rid={rid[:16]} local_match={local} "
+            f"group_usable={cap} capped_match={got}: this rank has no usable "
+            "recurrent anchor at the group depth, so it cannot admit what the "
+            "other TP ranks admit -- stopping instead of resuming alone "
+            "(raenge-nie-uneins; a split extend would hang the group)."
+        )
+    if n <= 20 or n % 256 == 0:
+        logger.warning(
+            "RU FLOOR CAP rid=%s local_match=%d group_usable=%d capped=%d "
+            "(n=%d): this rank matched deeper than the group can use; it "
+            "admits the group depth so every TP rank runs the same extend "
+            "(H96, rc9l weg2-21-21 hung on the uncapped split).",
+            rid[:16],
+            local,
+            cap,
+            got,
+            n,
+        )
+    return capped
+
+
+# --------------------------------------------------------------------------
+# H98: on a Form A group the attention host decides, the workers follow
+# --------------------------------------------------------------------------
+#
+# rc9l (H96) and rc9m (H97) are one bug: a Form A expert worker (TP1/TP2 of
+# the NF D group, "no dense weights, no KV, no draft") holds 0-byte KV, mamba
+# and host pools and a null storage tier, yet it ran its own radix tree with
+# its own mamba "anchors" -- slot numbers without bytes -- and voted them into
+# the group MIN. Its host rows are released as transit after the store ack, so
+# its anchors die on device eviction while TP0's survive in the arena: the
+# anchors sit at DIFFERENT depths (rc9m: TP0 18112, workers 15552), and the
+# MIN of the two is a depth TP0 cannot realize (H96 CAP-MISS; H97 turned that
+# into a group re-prefill). What a worker's forward consumes is only the ROW
+# COUNT of the batch (model_runner `_forward_form_a_worker`: num_tokens =
+# input_ids.shape[0], the MoE-input carrier) -- i.e. extend_len = seq_len -
+# prefix_len per request, which must equal TP0's. No KV index, no recurrent
+# state of its own is ever read.
+#
+# So the vote changes, on the reduce that already runs (no new collective):
+#
+# * the HOST votes its exact ADMISSION match (same key, same limit as
+#   ``Req.init_next_round_input``, anchor-validated, #928 applied) -- so the
+#   depth the group plants is one the host admits, never a head-walk number
+#   the admission key cannot reach (page-multiple prompt, limit = len-1);
+# * a WORKER votes its KV REACH: the same admission key walked with the mamba
+#   rule suspended (:func:`follow_walk`). That is MIN-neutral wherever it can
+#   follow (reach >= host depth -> group = host), and it is the honest
+#   constraint where it cannot (a dead node): then MIN < MAX and H97's round
+#   decides (the host realizes the lower depth or every rank re-prefills);
+# * a worker abstains in the MAX arm, so MAX = the host's depth;
+# * at admission a worker with a group depth g adopts g on the KV path
+#   (:func:`follow_rematch`), whatever its own anchors say.
+#
+# Why no rank can disagree any more: g is the MIN over {host admission match,
+# worker reaches} (and H97 zeroes it where the host cannot realize it); the
+# host admits exactly g (== its probe, H96 cap when lower, a named stop if it
+# could not -- :class:`FormAHostBelowGroup`), every worker admits exactly g
+# (reach >= g by construction, a named stop otherwise --
+# :class:`FormAFollowMiss`). Same g, same extend on every rank.
+
+#: Set on the tree for the duration of ONE follow walk: the mamba validators
+#: accept every node and the mamba finalize skips #747/#928/RU (a worker's
+#: anchor carries no bytes, it cannot be a reason to diverge).
+FOLLOW_ATTR = "_tp_match_floor_follow_walk"
+
+
+class FormAFollowMiss(RuntimeError):
+    """H98: a Form A worker cannot present the host's depth on its KV path."""
+
+
+class FormAHostBelowGroup(RuntimeError):
+    """H98: the Form A host admits less than the depth the group planted."""
+
+
+def form_a_follow_active() -> bool:
+    """Group-uniform: the switch is on and a Form A role plan is installed
+    (the same plan on every rank of the group). False on every classic boot,
+    so every caller's pre-H98 path is untouched by construction."""
+    try:
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_WEG2_ENABLE_FORM_A_TP0_FOLLOW.get():
+            return False
+        from sglang.srt.rank_role import installed_role_plan
+
+        return installed_role_plan() is not None
+    except Exception:  # noqa: BLE001 - a predicate may never break the reduce
+        return False
+
+
+def this_rank_follows() -> bool:
+    """True only on a Form A EXPERT WORKER with the follow switch on."""
+    if not form_a_follow_active():
+        return False
+    from sglang.srt.rank_role import this_rank_is_form_a_worker
+
+    return this_rank_is_form_a_worker()
+
+
+def following_walk(tree_cache: Any) -> bool:
+    return tree_cache is not None and bool(getattr(tree_cache, FOLLOW_ATTR, False))
+
+
+class follow_walk:
+    """Context: one match walk on ``tree_cache`` with the mamba rule suspended."""
+
+    def __init__(self, tree_cache: Any):
+        self.tree_cache = tree_cache
+        self.prev = False
+
+    def __enter__(self):
+        self.prev = bool(getattr(self.tree_cache, FOLLOW_ATTR, False))
+        setattr(self.tree_cache, FOLLOW_ATTR, True)
+        return self
+
+    def __exit__(self, *exc):
+        setattr(self.tree_cache, FOLLOW_ATTR, self.prev)
+        return False
+
+
+def admission_probe(tree_cache: Any, req: Any, *, follow: bool) -> int:
+    """This rank's ADMISSION match for ``req``, side-effect free on the request.
+
+    Built from the same inputs ``Req.init_next_round_input`` hands
+    ``match_prefix`` (fill = origin + output [+ PP carried tail], limit =
+    ``_compute_max_prefix_len``, the SWA re-prefill tail and the #1419 store
+    cap), with ``cow_mamba=False``/``req=None`` so nothing is written to the
+    request and no slot is taken. ``follow`` walks with the mamba rule
+    suspended (a worker's KV reach); otherwise the #928 (a)/(b) test is
+    applied to the node the match ends on (the host's usable admission).
+    Never raises: an unpriceable rid votes 0 -- the group then re-prefills it
+    (slower, never wrong)."""
+    try:
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        if envs.SGLANG_RADIX_FORCE_MISS.get():
+            return 0
+        if getattr(req, "positional_embed_overrides", None) is not None:
+            return 0
+        token_ids = list(req.origin_input_ids) + list(req.output_ids)
+        carried = getattr(req, "pp_carried_fill_tail", None)
+        if carried:
+            token_ids += list(carried)
+        n_in = len(token_ids)
+        compute = getattr(req, "_compute_max_prefix_len", None)
+        limit = int(compute(n_in)) if callable(compute) else max(n_in - 1, 0)
+        tail_fn = getattr(tree_cache, "swa_reprefill_tail_tokens", None)
+        tail = int(tail_fn() or 0) if callable(tail_fn) else 0
+        if tail:
+            limit = min(limit, max(0, n_in - tail))
+        cap = getattr(req, "_weg2_prefix_cap", None)
+        if cap is not None:
+            limit = min(limit, int(cap))
+        params = MatchPrefixParams(
+            key=RadixKey(
+                token_ids=array("q", token_ids),
+                extra_key=getattr(req, "extra_key", None),
+                limit=limit,
+            ),
+            cow_mamba=False,
+            req=None,
+        )
+        if follow:
+            with follow_walk(tree_cache):
+                return _local_match_len(tree_cache.match_prefix(params))
+        result = tree_cache.match_prefix(params)
+        n = _local_match_len(result)
+        if n > 0 and anchor_unusable(tree_cache, getattr(result, "best_match_node", None)):
+            _STATS["unusable_votes"] += 1
+            return 0
+        return n
+    except Exception:  # noqa: BLE001 - a vote may never break the reduce
+        _STATS["probe_failed"] = _STATS.get("probe_failed", 0) + 1
+        return 0
+
+
+def form_a_usable_votes(
+    tree_cache: Any, by_rid: Mapping[str, Any], matches: Mapping[str, int]
+) -> Dict[str, int]:
+    """H98 usable-arm vote on a Form A group, for the rids the head walk priced
+    (the rest stay ABSENT, as before): the host its admission match, a worker
+    its KV reach."""
+    worker = this_rank_follows()
+    _announce_follow(worker)
+    out: Dict[str, int] = {}
+    for rid in matches:
+        req = by_rid.get(rid)
+        out[rid] = 0 if req is None else admission_probe(tree_cache, req, follow=worker)
+    return out
+
+
+_FOLLOW_ANNOUNCED = [False]
+
+
+def _announce_follow(worker: bool) -> None:
+    if _FOLLOW_ANNOUNCED[0]:
+        return
+    _FOLLOW_ANNOUNCED[0] = True
+    logger.info(
+        "RU FORM-A FOLLOW armed: this rank is the Form A %s -- %s (H98, "
+        "SGLANG_WEG2_ENABLE_FORM_A_TP0_FOLLOW=1).",
+        "EXPERT WORKER" if worker else "attention HOST",
+        "usable vote = KV reach, MAX arm abstains, admission adopts the group depth "
+        "without its own (byteless) anchor rule"
+        if worker
+        else "usable vote = exact admission match; the group depth is this rank's",
+    )
+
+
+def form_a_follow_admission(tree_cache: Any, req: Any, result: Any) -> Optional[int]:
+    """Admission-site verdict on a Form A group (called from
+    ``MambaComponent.finalize_match_result`` BEFORE the COW, outside a follow
+    walk). None = nothing to do here (the RU/H96 verdicts below still run).
+
+    Worker: 0 -> zero the match; g > 0 -> re-match at g on the KV path
+    (:func:`follow_rematch`), unless its own match already IS g on a usable
+    anchor (then the ordinary path admits exactly g).
+    Host: a group depth above what it admits is a named stop -- the workers
+    will admit g, a smaller extend here would split the group."""
+    if req is None or not form_a_follow_active():
+        return None
+    group = getattr(tree_cache, TREE_ATTR, None) if tree_cache is not None else None
+    if not group:
+        return None
+    rid = str(getattr(req, "rid", "") or "")
+    g = group.get(rid)
+    if g is None:
+        return None
+    g = int(g)
+    local = _local_match_len(result)
+    if this_rank_follows():
+        if g <= 0:
+            return 0 if local > 0 else None
+        if local == g and not anchor_unusable(
+            tree_cache, getattr(result, "best_match_node", None)
+        ):
+            return None
+        return g
+    if g > 0 and local < g:
+        raise FormAHostBelowGroup(
+            f"H98 RU FORM-A HOST-BELOW-GROUP rid={rid[:16]} local_match={local} "
+            f"group={g}: the attention host admits less than the depth the group "
+            "planted from its own admission probe; the workers adopt the group "
+            "depth, so admitting the smaller one would split the extend -- "
+            "stopping by name instead (raenge-nie-uneins)."
+        )
+    return None
+
+
+def form_a_host_zero_guard(tree_cache: Any, req: Any, why: str) -> None:
+    """Called where the host would ZERO its admission match on its own (#928
+    a/b, mamba slot starvation). Under follow the workers adopt the group
+    depth, so a host-local zero with a positive group depth is a named stop,
+    never a silent split. No-op everywhere else."""
+    if req is None or not form_a_follow_active() or this_rank_follows():
+        return
+    group = getattr(tree_cache, TREE_ATTR, None) if tree_cache is not None else None
+    if not group:
+        return
+    rid = str(getattr(req, "rid", "") or "")
+    g = group.get(rid)
+    if g is not None and int(g) > 0:
+        raise FormAHostBelowGroup(
+            f"H98 RU FORM-A HOST-BELOW-GROUP rid={rid[:16]} group={int(g)} "
+            f"local=0 ({why}): the attention host refuses a depth its own "
+            "admission probe voted; the workers adopt it -- stopping by name "
+            "instead of splitting the extend (raenge-nie-uneins)."
+        )
+
+
+def follow_rematch(tree_cache: Any, params: Any, depth: int, local: int) -> Any:
+    """A Form A worker adopts the group depth: its key cut to ``depth`` (in
+    the match's own units, like :func:`rematch_at_group_depth`), walked with
+    the mamba rule suspended. The nested finalize takes the ordinary COW only
+    where this worker happens to hold a (byteless) slot there. Anything but
+    exactly ``depth`` is a named stop -- its vote promised reach >= depth."""
+    import dataclasses
+
+    cut = dataclasses.replace(params, key=params.key[: int(depth)])
+    with follow_walk(tree_cache):
+        followed = tree_cache.match_prefix(cut)
+    got = _local_match_len(followed)
+    rid = str(getattr(getattr(params, "req", None), "rid", "") or "")
+    if got != int(depth):
+        raise FormAFollowMiss(
+            f"H98 RU FORM-A FOLLOW-MISS rid={rid[:16]} tp0_depth={int(depth)} "
+            f"worker_local={int(local)} followed={got}: this expert worker cannot "
+            "present the host's depth on its KV path although its reach vote "
+            "covered it -- stopping instead of extending a different shape."
+        )
+    _STATS["follow"] = _STATS.get("follow", 0) + 1
+    n = _STATS["follow"]
+    if n <= 20 or n % 256 == 0:
+        logger.warning(
+            "RU FORM-A FOLLOW rid=%s tp0_depth=%d worker_local=%d followed=%d "
+            "(n=%d): this expert worker holds no KV/mamba bytes, so its own "
+            "anchor verdict is bookkeeping; it admits the attention host's depth "
+            "(H98, rc9l/rc9m).",
+            rid[:16],
+            int(depth),
+            int(local),
+            got,
+            n,
+        )
+    return followed
+
+
+# --------------------------------------------------------------------------
+# H99: the prefetch span is the host's too (rc9o, weg2-33-33, W65)
+# --------------------------------------------------------------------------
+#
+# rc9o (2eed285057, boot dkrnfbar1rc9o09260808, 08:29:00): D died at INTAKE,
+# before any admission -- ``_add_request_to_queue`` -> ``_prefetch_kvcache``
+# -> ``prefetch_from_storage`` -> W65 Weg2PrefetchSpanSplit (min=320
+# max=6720). The span each rank voted is ``len(fill[_matched_len:_match_end])``
+# with ``_matched_len`` from the intake re-match
+# (``init_next_round_input(cow_mamba=False)``): the anchor-validated match of
+# the rank's OWN tree -- TP0 32768 (host anchor), TP1/TP2 26368 (their
+# byteless shadow anchors; the same numbers the #1042 EXTENT lines print). H98
+# only acts inside the admission plan call, so it never saw this rid.
+#
+# The fix is the x22 shape: a Form A worker ABSTAINS in the span pair
+# (:data:`PREFETCH_SPAN_ABSTAIN` in both slots), so the vote's span is the
+# host's alone and W65 compares the voters that hold bytes. The worker keeps
+# its LENGTH vote (it still caps the group length at what it can register),
+# registers exactly the group length (:func:`form_a_trim_to_group`,
+# release-only), and adopts the host's prefix/span for its request
+# bookkeeping (:func:`adopt_host_prefetch_span`) -- which the hold settle
+# (``_weg2_refetch_one``) compares against the group-reduced completion. The
+# worker's registered token range stays its own: its null storage tier moves
+# no bytes, and the range only feeds its bookkeeping tree, whose depth H98
+# already subordinates to the host at admission.
+
+#: The x22 abstain sentinel (``cache_controller.CLAIM_VOTE_ABSTAIN``), sized
+#: for the #580 vote's int32 payload.
+PREFETCH_SPAN_ABSTAIN = 1 << 30
+
+#: Tree attribute: rid -> the group span of a follower's last positive vote.
+PREFETCH_SPAN_ATTR = "_tp_match_floor_prefetch_group_span"
+
+
+def form_a_prefetch_span_vote(local_span: int):
+    """(slot 3, slot 4) of the #580 prefetch vote for this rank."""
+    if this_rank_follows():
+        return PREFETCH_SPAN_ABSTAIN, PREFETCH_SPAN_ABSTAIN
+    return int(local_span), -int(local_span)
+
+
+def form_a_trim_to_group(
+    tree_cache: Any,
+    req_id: Any,
+    host_indices: Any,
+    prefetch_key: Any,
+    group_len: int,
+    group_span: int,
+):
+    """On a Form A worker after a positive vote: cut the registration to the
+    group length (release-only) and remember the group span. Returns
+    ``(host_indices, prefetch_key)`` when it trimmed, None otherwise (and
+    always None off a follower)."""
+    if not this_rank_follows():
+        return None
+    try:
+        spans = getattr(tree_cache, PREFETCH_SPAN_ATTR, None)
+        if spans is None:
+            spans = {}
+            setattr(tree_cache, PREFETCH_SPAN_ATTR, spans)
+        spans[str(req_id)] = int(group_span)
+    except Exception:  # noqa: BLE001 - bookkeeping only
+        pass
+    group_len = int(group_len)
+    trimmed = False
+    if host_indices is not None and len(host_indices) > group_len:
+        tree_cache.cache_controller.append_host_mem_release(
+            host_indices=host_indices[group_len:]
+        )
+        host_indices = host_indices[:group_len]
+        trimmed = True
+    if prefetch_key is not None and len(prefetch_key) > group_len:
+        prefetch_key = prefetch_key[:group_len]
+        trimmed = True
+    return (host_indices, prefetch_key) if trimmed else None
+
+
+def host_prefix_from_group_span(
+    *, match_end: int, group_span: int, page_size: int, bigram: bool
+) -> int:
+    """The host's matched prefix, re-derived from the span it voted.
+
+    The host's span is ``len(RadixKey(fill[m0:match_end], is_bigram)
+    .page_aligned(P))`` = floor_P(match_end - m0 - d) with d = 1 for a bigram
+    key; ``m0`` is a whole number of pages (the match is walked on a
+    page-aligned key), so exactly one multiple of P satisfies it:
+    m0 = floor_P(match_end - d - span)."""
+    page = max(1, int(page_size))
+    x = int(match_end) - (1 if bigram else 0) - int(group_span)
+    return max(0, x // page * page)
+
+
+def adopt_host_prefetch_span(tree_cache: Any, req: Any, match_end: int) -> Optional[int]:
+    """Scheduler delegation after ``prefetch_from_storage``: on a Form A
+    worker whose vote just registered, the request's span bookkeeping
+    (``_prefetch_span_tokens``, ``_prefetch_registered_prefix_len``) becomes
+    the host's. Returns the host prefix, or None (no-op) everywhere else."""
+    if not this_rank_follows():
+        return None
+    spans = getattr(tree_cache, PREFETCH_SPAN_ATTR, None)
+    if not spans:
+        return None
+    rid = str(getattr(req, "rid", "") or "")
+    span = spans.pop(rid, None)
+    if span is None:
+        return None
+    m0 = host_prefix_from_group_span(
+        match_end=int(match_end),
+        group_span=int(span),
+        page_size=int(getattr(tree_cache, "page_size", 1) or 1),
+        bigram=bool(getattr(tree_cache, "is_eagle", False)),
+    )
+    local = int(getattr(req, "_prefetch_registered_prefix_len", 0) or 0)
+    req._prefetch_span_tokens = max(0, int(match_end) - m0)
+    req._prefetch_registered_prefix_len = m0
+    _STATS["prefetch_follow"] = _STATS.get("prefetch_follow", 0) + 1
+    n = _STATS["prefetch_follow"]
+    if local != m0 and (n <= 20 or n % 256 == 0):
+        logger.warning(
+            "RU FORM-A PREFETCH-FOLLOW rid=%s tp0_prefix=%d worker_prefix=%d "
+            "tp0_span=%d (n=%d): this expert worker's intake match comes from "
+            "byteless shadow anchors; its prefetch span abstained in the #580 "
+            "vote and its request bookkeeping takes the attention host's (H99, "
+            "rc9o weg2-33-33 W65 min=320 max=6720).",
+            rid[:16],
+            m0,
+            local,
+            int(span),
+            n,
+        )
+    return m0
 
 
 def stats() -> Dict[str, int]:

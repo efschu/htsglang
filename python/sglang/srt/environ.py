@@ -1862,6 +1862,17 @@ class Envs:
     # PP stages) keep the quarter-of-the-pool window. False restores the
     # per-rank window.
     SGLANG_WEG2_ENABLE_TP_UNIFORM_PUBLISH_WINDOW = EnvBool(True)
+    # H98 (rc2.1k, rc9l/rc9m): on a Form A group (--rank-role) the attention
+    # host is the ONLY authority for prefix match, anchor verdict and resume
+    # depth. The expert workers hold no KV, mamba or host bytes (0.00 GB pools,
+    # null storage tier), so their radix tree is bookkeeping: in the RU/H97
+    # usable-match reduce they vote their KV reach (MIN-neutral wherever they
+    # can follow) and abstain in the MAX arm, and at admission they adopt the
+    # group depth on the KV path without their own anchor rule
+    # (tp_match_floor.follow_rematch, line 'RU FORM-A FOLLOW'). Only read when
+    # a Form A role plan is installed; False restores the H97 votes, byte-
+    # identical to 138d9df01c.
+    SGLANG_WEG2_ENABLE_FORM_A_TP0_FOLLOW = EnvBool(True)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
