@@ -168,6 +168,10 @@ class _Tree:
 
     cache_finished_req = _U.cache_finished_req
     _note_protected_beyond_retention = _U._note_protected_beyond_retention
+    # 27B 34965fc3fa (per-path mamba cap, unified S7c 92666055b7): the finish
+    # runs the cap after the #1481 mark; this insert anchors nothing, so the
+    # real method caps nothing.
+    _weg2_cap_after_insert = _U._weg2_cap_after_insert
     disable = False
     is_eagle = True  # NF: MTP, bigram keys
     bigram_anchor_exact = True  # bigram keys + a recurrent component

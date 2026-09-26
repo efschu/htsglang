@@ -298,6 +298,10 @@ def _finish(rp, alloc, req):
         dec_lock_ref=lambda node, prm, skip_swa=False: None,
     )
     tree._note_protected_beyond_retention = lambda r, ecl: U._note_protected_beyond_retention(tree, r, ecl)
+    # 27B 34965fc3fa (per-path mamba cap, unified S7c 92666055b7): the finish
+    # runs the cap after the #1481 mark. Bound off the real class; this tree's
+    # insert anchors nothing (`_weg2_cap_tail` unset), so it caps nothing.
+    tree._weg2_cap_after_insert = lambda: U._weg2_cap_after_insert(tree)
     U.cache_finished_req(tree, req)
     _join("weg2-tail-publish")
 
