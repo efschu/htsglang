@@ -2144,10 +2144,20 @@ class Scheduler(
                 startup_available_gpu_memory_gb=avail_mem,
             )
 
+        # H101: every QSA rows launch form loaded (and its local memory booked)
+        # BEFORE the sampling warmup's barrier and the first sleep.
+        self.warm_qsa_rows_forms()
         # #603b: LAST in this method, after every worker, pool, backend and
         # graph exists. The warmup ends in a group barrier, so it must sit at a
         # point every rank reaches exactly once with the model fully built.
         self.warm_sampling_backend()
+
+    def warm_qsa_rows_forms(self):
+        """H101: delegate to qsa/rows_prewarm.run_boot_prewarm (rank-local, no
+        collective; the #603b barrier right after pairs the ranks up)."""
+        from sglang.srt.layers.attention.qsa.rows_prewarm import run_boot_prewarm
+
+        run_boot_prewarm()
 
     def warm_sampling_backend(self):
         """#603b: make the sampling JIT kernels resident BEFORE serving starts.

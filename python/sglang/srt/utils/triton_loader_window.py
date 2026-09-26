@@ -124,7 +124,15 @@ def install_triton_loader_window(reason_prefix: str = "triton cold module load")
             name = getattr(self, "name", "?")
             try:
                 with cold_build_window(f"{reason_prefix}: {name}"):
-                    return original(self)
+                    result = original(self)
+                    # H101: the module exists, the first launch has not
+                    # happened -- the one moment its local-memory need can be
+                    # read and booked (census + pre-grow) before cuLaunchKernel
+                    # would grow the context on its own. Never raises.
+                    from sglang.srt.utils.lmem_census import on_module_loaded
+
+                    on_module_loaded(self)
+                    return result
             except Exception:
                 # The load's own exception propagates UNCHANGED. The window is
                 # already closed by the context manager's __exit__ on this

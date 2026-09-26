@@ -326,11 +326,13 @@ class LaunchTest(unittest.TestCase):
 
     def test_default_launch_is_the_exp2_decode_and_the_table(self):
         self.assertEqual(envs.SGLANG_WEG2_QSA_FP8_DECODE.get(), "")
-        for cap in ((8, 6), (12, 0)):
+        # H101: sm120's default table replaces the >512-row entry (16, 1, 2)
+        # with the spill-free (64, 8, 2); sm86 keeps the L20 table.
+        for cap, cfg in (((8, 6), (16, 1, 2)), ((12, 0), (64, 8, 2))):
             kw = self._launch(cap)
             self.assertIs(kw["KV_FP8"], True)
             self.assertEqual(kw["FP8_DECODE"], sa.FP8_DECODE_EXP2)
-            self.assertEqual((kw["BLOCK_N"], kw["num_warps"], kw["num_stages"]), (16, 1, 2))
+            self.assertEqual((kw["BLOCK_N"], kw["num_warps"], kw["num_stages"]), cfg)
 
     def test_switch_moves_only_the_named_arch(self):
         kw86 = self._launch((8, 6), decode="sm86:ptx")
