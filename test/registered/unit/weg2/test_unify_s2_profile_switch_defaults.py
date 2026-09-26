@@ -1,8 +1,10 @@
 """UNIFY S2: switches whose default differs by model profile (weg2/form.py
 PROFILE_SWITCH_DEFAULTS), one environ.py entry each.
 
-* SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL (H39): 27B port 3c9bfeff95 default off,
-  NF d6b7d4a1d3 default on (pinned in test_weg2_dense_repack_outside_pool_27b.py).
+* SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL (H39): 27B port 3c9bfeff95 shipped off,
+  the qwen27b row is on since the operator decision of 26.09. (all 27B profiles
+  set 1), NF d6b7d4a1d3 default on (pinned in
+  test_weg2_dense_repack_outside_pool_27b.py).
 * SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD (H81): the 27B line held the END anchors
   only with SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE=1 (default off, its arms set
   1), the NF line holds by default. The 27B switch is read as an alias.

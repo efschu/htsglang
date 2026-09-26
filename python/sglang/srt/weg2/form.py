@@ -422,7 +422,12 @@ PROFILES: Dict[str, ModelProfile] = {
         end_anchor="trim",
         mamba_anchor="grid4096",
         mamba_carrier_hold=False,
-        repack_outside_pool=False,
+        # OPERATOR 26.09. (RM): on. Every 27B profile (27b.env and all derived
+        # docker profiles) sets SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL=1, the RC9
+        # metal ran with it; the repack lands in the default pool since
+        # 11cadf67a3. The S2 row carried the port's shipped default (3c9bfeff95
+        # off) and described the 27B best form wrongly (UN6 docker check).
+        repack_outside_pool=True,
         formats={
             "int8": WeightFormat("int8", note="compressed-tensors W8A8",
                                  checkpoint=_MC + "Qwen3.8-27B-INT8-gdncov-vocabembed"),
@@ -536,8 +541,9 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: profile (:func:`profile_switch_default`). An explicitly set env var always
 #: wins; no form / a profile not listed -> the fallback the environ entry names
 #: (the NF line's code default). DERIVED from the rows (``switch_defaults``):
-#: SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL (H39; 27B port 3c9bfeff95 off, NF
-#: d6b7d4a1d3 on), SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD (H81; the 27B alias
+#: SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL (H39; NF d6b7d4a1d3 on; 27B port
+#: 3c9bfeff95 shipped off, the registry row is on since the operator decision
+#: of 26.09. -- every 27B profile set 1), SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD (H81; the 27B alias
 #: SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE is read in environ.py), the four NF
 #: tail switches (``end_anchor``), SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS
 #: (``mamba_anchor``), SGLANG_WEG2_DRAFT_SHARE_EMBED (``draft.share_embed``).

@@ -384,9 +384,11 @@ def _form_env(profile):
                     flip="family", vision="off", profile=profile, model="m").env_value()
 
 
-@pytest.mark.parametrize("profile,want", [("qwen27b", False), ("nextflash", True), (None, True)])
+@pytest.mark.parametrize("profile,want", [("qwen27b", True), ("nextflash", True), (None, True)])
 def test_the_default_is_per_profile(monkeypatch, profile, want):
-    """UNIFY S2: 27B OFF, NF ON, no form ON -- one environ entry, no second one."""
+    """UNIFY S2: one environ entry, no second one. 27B ON since the operator
+    decision of 26.09. (every 27B profile set 1; S2 shipped the port's OFF),
+    NF ON, no form ON."""
     from sglang.srt.layers.quantization.compressed_tensors.schemes import (
         compressed_tensors_wNa16 as mod,
     )
@@ -412,8 +414,8 @@ def test_an_explicit_value_wins_over_the_profile(monkeypatch, profile, explicit,
 
 
 @pytest.mark.parametrize("profile,explicit,want", [
-    ("qwen27b", None, False), ("nextflash", None, True), (None, None, True),
-    ("qwen27b", "1", True), ("nextflash", "0", False)])
+    ("qwen27b", None, True), ("nextflash", None, True), (None, None, True),
+    ("qwen27b", "0", False), ("nextflash", "0", False)])
 def test_the_planner_reads_the_group_env_like_the_rank(profile, explicit, want):
     """H50's reader of the D-group env resolves the same default as the rank."""
     from sglang.srt.planner.expert_residency import dense_repack_outside_pool

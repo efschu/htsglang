@@ -315,7 +315,7 @@ class TestDockerProfiles(unittest.TestCase):
         open(os.path.join(d, "27b.env"), "w").close()
         lines, n = PD.check_dir(d, runner=self._runner({"SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL": "4096"}))
         self.assertEqual(n, 0, lines)
-        lines, n = PD.check_dir(d, runner=self._runner({"SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL": "1"}))
+        lines, n = PD.check_dir(d, runner=self._runner({"SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL": "0"}))
         self.assertEqual(n, 1, lines)
         self.assertTrue(any("DIFF" in ln and "DENSE_REPACK_OUTSIDE_POOL" in ln for ln in lines))
 

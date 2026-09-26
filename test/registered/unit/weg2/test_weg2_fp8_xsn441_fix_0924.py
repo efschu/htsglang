@@ -145,7 +145,8 @@ def _method(use_marlin=True, block=True):
 
 def _publish_qwen27b(monkeypatch):
     """UNIFY S2/S7: the switch's default is the published profile's (qwen27b
-    off, the 27B line's; nextflash on); the 27B assertions below run under it."""
+    on since the operator decision of 26.09. -- every 27B profile set 1;
+    nextflash on); the 27B assertions below run under it."""
     from sglang.srt.weg2 import form as _F
 
     monkeypatch.setenv(_F.FORM_ENV, _F.Weg2Form(
@@ -163,6 +164,8 @@ def test_h39_arms_only_for_a_marlin_rank_under_the_switch(monkeypatch):
     assert mx._weg2_marlin_outside_pool() is False
     monkeypatch.delenv("SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL")
     _publish_qwen27b(monkeypatch)
+    assert _method(use_marlin=True)._weg2_marlin_outside_pool() is True
+    monkeypatch.setenv("SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL", "0")
     assert _method(use_marlin=True)._weg2_marlin_outside_pool() is False
 
 
@@ -219,8 +222,8 @@ def test_the_post_load_pass_steps_out_and_hands_the_survivor_hook_down(monkeypat
     assert got == {"inside": True, "born_in": MS.back_into_tag_pool}
     assert state["calls"] == [("fp8-dense-marlin", "load")]
     # off: no step, no hook
-    monkeypatch.delenv("SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL")
     _publish_qwen27b(monkeypatch)
+    monkeypatch.setenv("SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL", "0")
     state.clear()
     _method().process_weights_after_loading(torch.nn.Module())
     assert got == {"inside": False, "born_in": None} and "calls" not in state

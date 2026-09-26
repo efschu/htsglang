@@ -842,8 +842,9 @@ class Envs:
     # (weights pool 1.22 GiB = lm_head, bands 3.45 GiB). False = the
     # 2026-09-24 form, byte for byte (everything born in the tag pool).
     # UNIFY S2: ONE entry for both profiles, the DEFAULT per profile
-    # (weg2/form.py PROFILE_SWITCH_DEFAULTS): qwen27b False (the 27B port
-    # 3c9bfeff95 shipped it off; its arms set 1 explicitly), nextflash True;
+    # (weg2/form.py PROFILE_SWITCH_DEFAULTS): qwen27b True since the operator
+    # decision of 26.09. (the 27B port 3c9bfeff95 shipped it off, but every 27B
+    # profile and arm set 1 and the RC9 metal ran with it), nextflash True;
     # no published form -> True (the NF line's default). Set explicitly, the
     # env always wins.
     SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL = EnvBool(_dense_repack_outside_pool_default)
