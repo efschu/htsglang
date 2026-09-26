@@ -85,7 +85,7 @@ class FakeWire:
 
 def mini_cfg(n_layers=2, n_groups=1, cap=256, min_w=32):
     return AH.AHConfig(
-        delegations=(AH.Delegation(owner=1, helper=0, n_layers=n_layers, n_groups=n_groups),),
+        delegations=(AH.Delegation(owner=1, helper=0, n_layers=n_layers, part=str(n_groups)),),
         min_w=min_w, cap_tokens=cap, max_w=64, head_dim=16, gqa=2, num_kv_heads=4,
     )
 
@@ -152,7 +152,7 @@ def build_pair(cfg, stage, k_scale):
         return AH.reference_attention(q_d, mk, mv, p, info.sm_scale, info.k_scale, info.v_scale)
 
     engine = AH.HelperEngine(cfg, "cpu", FP8, attend)
-    engine.allocate(1, layers, d.n_groups)
+    engine.allocate(1, layers, cfg.heads_of(d).n_kv)
     thread = AH.HelperThread(cfg, hw, engine, infos)
     ow.on_empty = lambda: thread.poll_once() > 0
     side = AH.OwnerSide(cfg, d, ow, "cpu")
@@ -298,6 +298,12 @@ class TestRanksAgree(unittest.TestCase):
         self.assertIn("RANKS DISAGREE", str(cm.exception))
         self.assertIn("w: got 64 want 48", str(cm.exception))
 
+    def test_the_header_names_the_head_range(self):
+        row = AH.ChunkRow("R", 5, 0, 64, 0)
+        a = AH.header_values(row, 3, AH.HeadRange(18, 24, 3, 4))
+        b = AH.header_values(row, 3, AH.HeadRange(18, 21, 3, 4))
+        self.assertIn("q_range", AH.header_mismatch(a, b))
+
     def test_an_owner_that_never_sends_is_a_named_stall(self):
         cfg = mini_cfg()
         stage = MiniOwnerStage(cfg)
@@ -326,10 +332,14 @@ class TestSpecAndPost(unittest.TestCase):
     def test_parse_and_refuse(self):
         self.assertEqual(AH.parse_spec("off"), ())
         self.assertEqual(AH.parse_spec("2:0:2:1,1:0:1:1"),
-                         (AH.Delegation(2, 0, 2, 1), AH.Delegation(1, 0, 1, 1)))
-        V = lambda s, **kw: AH.validate(AH.parse_spec(s), pp_size=3, num_kv_heads=4, **kw)
+                         (AH.Delegation(2, 0, 2, "1"), AH.Delegation(1, 0, 1, "1")))
+        V = lambda s, **kw: AH.validate(AH.parse_spec(s), pp_size=3, num_kv_heads=4, gqa=6, **kw)
         V("2:0:2:1,1:0:1:1")
-        for bad, word in (("0:1:1:1", "UPSTREAM"), ("1:0:1:4", "n_groups"), ("1:0:0:1", "n_layers"),
+        V("2:0:2:h18-23")  # the same as one whole group, written in heads
+        self.assertEqual(AH.parse_spec("2:0:2:h18-23")[0].heads(4, 6), AH.HeadRange(18, 24, 3, 4))
+        self.assertEqual(AH.parse_spec("1:0:4:h18-20")[0].heads(4, 6), AH.HeadRange(18, 21, 3, 4))
+        for bad, word in (("0:1:1:1", "UPSTREAM"), ("1:0:1:4", "keep at least one"), ("1:0:0:1", "n_layers"),
+                          ("1:0:4:h18-20", "V2"), ("1:0:4:h6-11", "V2"), ("1:0:1:h20-25", "outside"),
                           ("2:1:1:1,1:0:1:1", "owner AND helper"), ("1:0:1:1,1:0:1:1", "twice"),
                           ("3:0:1:1", "outside")):
             with self.assertRaises(AH.AHSpecError) as cm:
@@ -349,7 +359,7 @@ class TestSpecAndPost(unittest.TestCase):
         cfg = AH.AHConfig(AH.parse_spec("2:0:2:1,1:0:1:1"), 1024, 262144, 2048)
         mirror = 3 * 2 * 256 * 262144 / 2**20  # 3 group-layers, K+V, fp8
         self.assertEqual(mirror, 384.0)
-        pay, out = AH.message_bytes(1, 2048, 256, 6)
+        pay, out = AH.message_bytes(6, 1, 2048, 256)
         self.assertEqual(pay, (32 + 2048 * 8 * 256) * 2)
         helper = AH.stage_post_mib(cfg, 0)
         self.assertAlmostEqual(helper, 384.0 + AH.HELPER_FLOAT_WS_MIB + 2 * AH.INT_WS_MIB + 2 * (pay + out) / 2**20)
@@ -365,10 +375,10 @@ class TestSpecAndPost(unittest.TestCase):
         q = torch.randn(w, gs * G, D).to(torch.bfloat16)
         k = torch.randn(w, G, D).to(torch.bfloat16)
         v = torch.randn(w, G, D).to(torch.bfloat16)
-        hdr = torch.tensor([AH.MAGIC, 7, 9, 0, w, 0, G, 0], dtype=torch.int64)
+        hdr = torch.tensor([AH.MAGIC, 7, 9, 0, w, 0, 1, 2], dtype=torch.int64)
         buf = AH.pack_payload(hdr, q, k, v)
-        self.assertEqual(buf.numel() * 2, AH.message_bytes(G, w, D, gs)[0])
-        h2, q2, k2, v2 = AH.unpack_payload(buf, w, G, D, gs)
+        self.assertEqual(buf.numel() * 2, AH.message_bytes(gs * G, G, w, D)[0])
+        h2, q2, k2, v2 = AH.unpack_payload(buf, w, gs * G, G, D)
         for a, b in ((hdr, h2), (q, q2), (k, k2), (v, v2)):
             self.assertTrue(torch.equal(a, b))
             self.assertTrue(b.is_contiguous())

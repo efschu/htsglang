@@ -7,7 +7,7 @@ ov 0.026 ms -> the sec. 8.1 phase-2 condition is met; this module is phase 2.
 WHAT IT DOES (V1, one direction)
 ================================
 An OWNER stage (a 3080 stage, PP1/PP2) hands the attention of the LAST
-``n_groups`` KV groups (``n_groups * gqa`` query heads) of its LAST
+G KV groups (``G * gqa`` query heads, a :class:`HeadRange`) of its LAST
 ``n_layers`` full-attention layers to a HELPER stage upstream of it (the 5090,
 PP0). Per split chunk and delegated layer:
 
@@ -36,6 +36,25 @@ no pre-announcement is needed and no deadlock is possible. The opposite
 direction (5090 owner, 3080 helpers -- NVFP4 long) needs the split row of
 chunk i on the helper BEFORE it blocks on chunk i's proxy (ATTN_HEAD_SPLIT.md
 sec. 6); that is V2 and refused here by name.
+
+WHERE V2 STARTS (NVFP4 long: 5090 owner -> both 3080s, half groups)
+==================================================================
+Kept open on purpose, nothing below assumes "whole group" or "upstream":
+  * spec     -- ``Delegation.part`` already parses ``hA-B`` (query heads);
+               :func:`validate` refuses it (and helper >= owner) by name.
+  * header   -- carries the query-head range and the kv-group range, not a
+               group count; message sizes, mirror shape and the helper plan
+               are functions of :class:`HeadRange`.
+  * owner    -- V2 adds the owner's own heads as up to two ranges (the second
+               flashinfer call over the shared group, ``ov_partial``) in
+               ``forward_extend_head_subset`` and the concat order here.
+  * helper   -- :meth:`HelperThread.push` is the seam: V1 pushes from the
+               helper's own rule (it runs chunk i first); V2 pushes from the
+               OWNER's announcement (the owner decides alone, the helper only
+               serves), enqueues the whole chunk after its first payload
+               (GIL), and gets its own barlink ring for head payloads plus an
+               owner-side deadline and a per-request A/B switch
+               (/spinning/gpu-arb/docs/P_MICROBATCH_AH2.md).
 
 THE SPLIT RULE (no second bookkeeping)
 ======================================
@@ -101,14 +120,59 @@ class AHSpecError(ValueError):
 
 
 @dataclass(frozen=True)
+class HeadRange:
+    """The delegated part of ONE layer, in heads: query heads [q0, q1) and the
+    kv groups [g0, g1) they read. Everything below the spec (payload header,
+    message sizes, mirror shape, helper plan) is written against this, never
+    against "whole groups" -- V2's half groups (NVFP4: heads 18-20 -> PP1,
+    21-23 -> PP2) are a spec and an owner-side change, not a rewrite."""
+
+    q0: int
+    q1: int
+    g0: int
+    g1: int
+
+    @property
+    def n_q(self) -> int:
+        return self.q1 - self.q0
+
+    @property
+    def n_kv(self) -> int:
+        return self.g1 - self.g0
+
+    def whole_groups(self, gqa: int) -> bool:
+        return self.q0 == self.g0 * gqa and self.q1 == self.g1 * gqa
+
+    def packed(self) -> Tuple[int, int]:
+        return (self.q0 << 16) | self.q1, (self.g0 << 16) | self.g1
+
+
+@dataclass(frozen=True)
 class Delegation:
+    """``part``: ``"G"`` = the last G whole kv groups (V1), or ``"hA-B"`` =
+    query heads A..B inclusive (the V2 head granularity; parsed, refused by
+    :func:`validate` until the owner's partial-group call exists)."""
+
     owner: int
     helper: int
     n_layers: int
-    n_groups: int
+    part: str
 
     def text(self) -> str:
-        return f"{self.owner}:{self.helper}:{self.n_layers}:{self.n_groups}"
+        return f"{self.owner}:{self.helper}:{self.n_layers}:{self.part}"
+
+    def heads(self, num_kv_heads: int, gqa: int) -> HeadRange:
+        num_q = num_kv_heads * gqa
+        t = self.part.strip().lower()
+        if t.startswith("h"):
+            a, _, b = t[1:].partition("-")
+            q0, q1 = int(a), int(b or a) + 1
+        else:
+            g = int(t)
+            q0, q1 = (num_kv_heads - g) * gqa, num_q
+        if not (0 <= q0 < q1 <= num_q):
+            raise AHSpecError(f"--p-attn-head-split {self.text()}: heads [{q0},{q1}) outside 0..{num_q}")
+        return HeadRange(q0, q1, q0 // gqa, -(-q1 // gqa))
 
 
 @dataclass(frozen=True)
@@ -169,17 +233,21 @@ class AHConfig:
     def of_helper(self, stage: int) -> Tuple[Delegation, ...]:
         return tuple(d for d in self.delegations if d.helper == stage)
 
+    def heads_of(self, d: Delegation) -> HeadRange:
+        return d.heads(self.num_kv_heads, self.gqa)
+
     def p2p_bytes(self) -> int:
         """Per-pair barlink p2p buffer: one message of the largest delegation
         at ``max_w`` fits in one piece (header included), 4 KiB aligned."""
-        g = max(d.n_groups for d in self.delegations)
-        pay, out = message_bytes(g, self.max_w, self.head_dim, self.gqa)
-        need = max(pay, out)
+        need = 0
+        for d in self.delegations:
+            hr = self.heads_of(d)
+            need = max(need, *message_bytes(hr.n_q, hr.n_kv, self.max_w, self.head_dim))
         return int(-(-need // 4096) * 4096)
 
 
 def parse_spec(text: str) -> Tuple[Delegation, ...]:
-    """``"owner:helper:n_layers:n_groups[,...]"``; ``''``/``off`` -> ()."""
+    """``"owner:helper:n_layers:G|hA-B[,...]"``; ``''``/``off`` -> ()."""
     t = (text or "").strip().lower()
     if t in ("", "off", "0", "none"):
         return ()
@@ -189,13 +257,17 @@ def parse_spec(text: str) -> Tuple[Delegation, ...]:
         if len(bits) != 4:
             raise AHSpecError(
                 f"--p-attn-head-split entry {part!r}: expected "
-                "owner:helper:n_layers:n_groups (e.g. 2:0:2:1)"
+                "owner:helper:n_layers:G (e.g. 2:0:2:1) or owner:helper:n_layers:hA-B"
             )
         try:
-            o, h, n, g = (int(x) for x in bits)
+            o, h, n = (int(x) for x in bits[:3])
+            d = Delegation(o, h, n, bits[3].strip())
+            d.heads(4, 6)  # syntax only; the geometry check is validate()'s
+        except AHSpecError:
+            raise
         except ValueError:
             raise AHSpecError(f"--p-attn-head-split entry {part!r}: not integers")
-        out.append(Delegation(o, h, n, g))
+        out.append(d)
     return tuple(out)
 
 
@@ -204,6 +276,7 @@ def validate(
     *,
     pp_size: int,
     num_kv_heads: int,
+    gqa: int = 6,
     owner_attn_layers: Optional[Dict[int, int]] = None,
 ) -> None:
     """Hard refusals, each named. ``owner_attn_layers``: stage -> number of
@@ -229,10 +302,15 @@ def validate(
                 f"--p-attn-head-split {d.text()}: stage {d.owner} would be owner "
                 "AND helper; one barlink instance serves one stream per role"
             )
-        if not (1 <= d.n_groups < num_kv_heads):
+        hr = d.heads(num_kv_heads, gqa)
+        if hr.q0 == 0:
+            raise AHSpecError(f"--p-attn-head-split {d.text()}: the owner must keep at least one head")
+        if not hr.whole_groups(gqa) or hr.q1 != num_kv_heads * gqa:
             raise AHSpecError(
-                f"--p-attn-head-split {d.text()}: n_groups must be 1..{num_kv_heads - 1} "
-                "(whole KV groups only; the owner keeps at least one)"
+                f"--p-attn-head-split {d.text()}: heads [{hr.q0},{hr.q1}) -- V1 delegates the "
+                "LAST whole kv groups only (one flashinfer call on the owner). Part groups and "
+                "non-suffix ranges are V2: the owner needs its second call over the shared "
+                "group (ATTN_HEAD_SPLIT.md sec. 6, ov_partial)"
             )
         if d.n_layers < 1:
             raise AHSpecError(f"--p-attn-head-split {d.text()}: n_layers must be >= 1")
@@ -264,16 +342,17 @@ def owner_layers(owned_attn_layer_ids: Sequence[int], n_layers: int) -> Tuple[in
     return tuple(ids[len(ids) - n_layers:]) if n_layers > 0 else ()
 
 
-def own_counts(num_kv_heads: int, gqa: int, n_groups: int) -> Tuple[int, int]:
-    """(own q heads, own kv heads) of the owner: the FIRST groups stay."""
-    kv_own = num_kv_heads - n_groups
-    return kv_own * gqa, kv_own
+def own_counts(hr: HeadRange) -> Tuple[int, int]:
+    """(own q heads, own kv groups) of a V1 owner: the heads before the
+    delegated suffix, i.e. [0, q0) over groups [0, g0)."""
+    return hr.q0, hr.g0
 
 
-def message_bytes(n_groups: int, w: int, head_dim: int, gqa: int) -> Tuple[int, int]:
-    """(payload bytes owner->helper, output bytes helper->owner), bf16."""
-    pay = (HDR_BF16 + w * (gqa + 2) * n_groups * head_dim) * 2
-    out = (HDR_BF16 + w * gqa * n_groups * head_dim) * 2
+def message_bytes(n_q: int, n_kv: int, w: int, head_dim: int) -> Tuple[int, int]:
+    """(payload bytes owner->helper, output bytes helper->owner), bf16:
+    [hdr | q (n_q heads) | k, v (n_kv groups)] and [hdr | O (n_q heads)]."""
+    pay = (HDR_BF16 + w * (n_q + 2 * n_kv) * head_dim) * 2
+    out = (HDR_BF16 + w * n_q * head_dim) * 2
     return pay, out
 
 
@@ -288,19 +367,21 @@ def stage_post_mib(cfg: AHConfig, stage: int, *, kv_elem_bytes: int = 1) -> floa
             copy of one layer at max_w.
     """
     mib = 0.0
-    D, gs = cfg.head_dim, cfg.gqa
+    D = cfg.head_dim
     helped = cfg.of_helper(stage)
     if helped:
-        cells = sum(d.n_layers * d.n_groups for d in helped)
+        cells = sum(d.n_layers * cfg.heads_of(d).n_kv for d in helped)
         mib += cells * 2.0 * D * kv_elem_bytes * cfg.cap_tokens / 2**20
         mib += HELPER_FLOAT_WS_MIB + INT_WS_MIB * len(helped)
         for d in helped:
-            pay, out = message_bytes(d.n_groups, cfg.max_w, D, gs)
+            hr = cfg.heads_of(d)
+            pay, out = message_bytes(hr.n_q, hr.n_kv, cfg.max_w, D)
             mib += (pay + out) / 2**20
     own = cfg.of_owner(stage)
     if own is not None:
-        pay, out = message_bytes(own.n_groups, cfg.max_w, D, gs)
-        q_own, _ = own_counts(cfg.num_kv_heads, gs, own.n_groups)
+        hr = cfg.heads_of(own)
+        pay, out = message_bytes(hr.n_q, hr.n_kv, cfg.max_w, D)
+        q_own, _ = own_counts(hr)
         mib += INT_WS_MIB + (pay + out + cfg.max_w * q_own * D * 2) / 2**20
     return mib
 
@@ -388,12 +469,13 @@ class SplitRule:
         return None
 
 
-def header_values(row: ChunkRow, layer_id: int, n_groups: int) -> List[int]:
-    return [MAGIC, int(layer_id), row.rid_hash, row.p, row.w, row.chunk_no, int(n_groups), 0]
+def header_values(row: ChunkRow, layer_id: int, hr: HeadRange) -> List[int]:
+    qs, gs = hr.packed()
+    return [MAGIC, int(layer_id), row.rid_hash, row.p, row.w, row.chunk_no, qs, gs]
 
 
 def header_mismatch(got: Sequence[int], want: Sequence[int]) -> Optional[str]:
-    names = ("magic", "layer", "rid_hash", "p", "w", "chunk_no", "n_groups", "pad")
+    names = ("magic", "layer", "rid_hash", "p", "w", "chunk_no", "q_range", "kv_range")
     bad = [f"{n}: got {int(g)} want {int(w)}" for n, g, w in zip(names, got, want) if int(g) != int(w)]
     return "; ".join(bad) if bad else None
 
@@ -415,13 +497,13 @@ def pack_payload(hdr_i64: torch.Tensor, q_d: torch.Tensor, k_d: torch.Tensor, v_
     return buf
 
 
-def unpack_payload(buf: torch.Tensor, w: int, n_groups: int, head_dim: int, gqa: int):
-    nq = w * gqa * n_groups * head_dim
-    nk = w * n_groups * head_dim
+def unpack_payload(buf: torch.Tensor, w: int, n_q: int, n_kv: int, head_dim: int):
+    nq = w * n_q * head_dim
+    nk = w * n_kv * head_dim
     hdr = buf[:HDR_BF16].view(torch.int64)
-    q_d = buf[HDR_BF16:HDR_BF16 + nq].view(w, gqa * n_groups, head_dim)
-    k_d = buf[HDR_BF16 + nq:HDR_BF16 + nq + nk].view(w, n_groups, head_dim)
-    v_d = buf[HDR_BF16 + nq + nk:HDR_BF16 + nq + 2 * nk].view(w, n_groups, head_dim)
+    q_d = buf[HDR_BF16:HDR_BF16 + nq].view(w, n_q, head_dim)
+    k_d = buf[HDR_BF16 + nq:HDR_BF16 + nq + nk].view(w, n_kv, head_dim)
+    v_d = buf[HDR_BF16 + nq + nk:HDR_BF16 + nq + 2 * nk].view(w, n_kv, head_dim)
     return hdr, q_d, k_d, v_d
 
 
@@ -564,10 +646,10 @@ class HelperEngine:
         self.mirror: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
         self._alloc_ctx = alloc_ctx or contextlib.nullcontext
 
-    def allocate(self, owner: int, layers: Sequence[int], n_groups: int) -> None:
+    def allocate(self, owner: int, layers: Sequence[int], n_kv: int) -> None:
         with self._alloc_ctx():
             for lid in layers:
-                shape = (self.cfg.cap_tokens, n_groups, self.cfg.head_dim)
+                shape = (self.cfg.cap_tokens, n_kv, self.cfg.head_dim)
                 self.mirror[(owner, int(lid))] = (
                     torch.zeros(shape, dtype=self.kv_dtype, device=self.device),
                     torch.zeros(shape, dtype=self.kv_dtype, device=self.device),
@@ -576,11 +658,10 @@ class HelperEngine:
     def mirror_mib(self) -> float:
         return sum(k.numel() * k.element_size() * 2 for k, _ in self.mirror.values()) / 2**20
 
-    def step(self, owner: int, info: LayerInfo, payload: torch.Tensor, row: ChunkRow, n_groups: int) -> torch.Tensor:
+    def step(self, owner: int, info: LayerInfo, payload: torch.Tensor, row: ChunkRow, hr: HeadRange) -> torch.Tensor:
         """Mirror write + attention for one received payload; returns the
         output message [hdr | O_d]."""
-        D, gs = self.cfg.head_dim, self.cfg.gqa
-        hdr, q_d, k_d, v_d = unpack_payload(payload, row.w, n_groups, D, gs)
+        hdr, q_d, k_d, v_d = unpack_payload(payload, row.w, hr.n_q, hr.n_kv, self.cfg.head_dim)
         mk, mv = self.mirror[(owner, info.layer_id)]
         p, w = row.p, row.w
         mk[p:p + w].copy_(quantize_like_pool(k_d, info.k_scale, self.kv_dtype))
@@ -670,7 +751,7 @@ class HelperThread:
                 continue
             self._wait_since[owner] = None
             lid = job.layers[job.next_layer]
-            want = header_values(job.row, lid, d.n_groups)
+            want = header_values(job.row, lid, self.cfg.heads_of(d))
             got = self.wire.peek_header(owner, seq)
             bad = header_mismatch(got, want)
             if bad:
@@ -687,17 +768,18 @@ class HelperThread:
         return issued
 
     def _issue(self, owner: int, d: Delegation, job: HelperJob, lid: int) -> None:
-        pay_b, out_b = message_bytes(d.n_groups, job.row.w, self.cfg.head_dim, self.cfg.gqa)
+        hr = self.cfg.heads_of(d)
+        pay_b, out_b = message_bytes(hr.n_q, hr.n_kv, job.row.w, self.cfg.head_dim)
         if job.next_layer == 0 and self.plan is not None:
             ev = self.last_ev[owner]
             if ev is not None:
                 ev.synchronize()  # the wrapper's previous plan has been consumed
             with _stream_ctx(self.stream):
-                self.plan(owner, job.row.p, job.row.w, d.n_groups)
+                self.plan(owner, job.row.p, job.row.w, hr.n_q, hr.n_kv)
         with _stream_ctx(self.stream):
             buf = torch.empty(pay_b // 2, dtype=torch.bfloat16, device=self.device)
             self.wire.recv(buf, owner)
-            out = self.engine.step(owner, self.infos[(owner, lid)], buf, job.row, d.n_groups)
+            out = self.engine.step(owner, self.infos[(owner, lid)], buf, job.row, hr)
             self.wire.send(out, owner)
             if self.stream is not None:
                 ev = torch.cuda.Event()
@@ -736,7 +818,8 @@ class OwnerSide:
         self.wire = wire
         self.device = device
         self.stream = stream
-        self.q_own, self.kv_own = own_counts(cfg.num_kv_heads, cfg.gqa, d.n_groups)
+        self.hr = cfg.heads_of(d)
+        self.q_own, self.kv_own = own_counts(self.hr)
         self._ring = None
         self._ring_ev: List[object] = []
         self._ring_i = 0
@@ -761,15 +844,15 @@ class OwnerSide:
         return dev
 
     def attention(self, row: ChunkRow, layer_id: int, q, k, v, own_attention: Callable) -> torch.Tensor:
-        cfg, G = self.cfg, self.d.n_groups
-        D, gs, H, Hk = cfg.head_dim, cfg.gqa, cfg.num_kv_heads * cfg.gqa, cfg.num_kv_heads
+        cfg, hr = self.cfg, self.hr
+        D, H, Hk = cfg.head_dim, cfg.num_kv_heads * cfg.gqa, cfg.num_kv_heads
         w = q.shape[0]
         qv = q.view(w, H, D)
         kv3 = k.view(w, Hk, D)
         vv3 = v.view(w, Hk, D)
-        hdr = self._hdr_dev(header_values(row, layer_id, G))
+        hdr = self._hdr_dev(header_values(row, layer_id, hr))
         # Pack BEFORE the pool write: set_kv_buffer may divide k/v in place.
-        payload = pack_payload(hdr, qv[:, self.q_own:], kv3[:, self.kv_own:], vv3[:, self.kv_own:])
+        payload = pack_payload(hdr, qv[:, hr.q0:hr.q1], kv3[:, hr.g0:hr.g1], vv3[:, hr.g0:hr.g1])
         sent = None
         if self.stream is not None:
             ready = torch.cuda.Event()
@@ -783,7 +866,7 @@ class OwnerSide:
         else:
             self.wire.send(payload, self.d.helper)
         o_own = own_attention(qv[:, :self.q_own].contiguous(), kv3, vv3, self.kv_own)
-        _, out_b = message_bytes(G, w, D, gs)
+        _, out_b = message_bytes(hr.n_q, hr.n_kv, w, D)
         obuf = torch.empty(out_b // 2, dtype=q.dtype, device=q.device)
         if sent is not None:
             torch.cuda.current_stream().wait_event(sent)  # one stream per barlink op at a time
@@ -793,7 +876,8 @@ class OwnerSide:
         elif not torch.equal(obuf[:HDR_BF16].view(torch.int64), hdr):
             raise RuntimeError("AH RANKS DISAGREE: the helper's output header does not echo the payload's")
         self.stats["layers"] += 1
-        return torch.cat([o_own.reshape(w, -1), obuf[HDR_BF16:].view(w, gs * G * D)], dim=1)
+        # V1: own heads [0, q0) + delegated suffix [q0, H) = the stock order.
+        return torch.cat([o_own.reshape(w, -1), obuf[HDR_BF16:].view(w, hr.n_q * D)], dim=1)
 
 
 # ---------------------------------------------------------------------------
@@ -956,7 +1040,7 @@ def install(runner) -> Optional[AHRuntime]:
                                    None if a.k_scale_float is None else float(a.k_scale_float),
                                    None if a.v_scale_float is None else float(a.v_scale_float))
     dist.all_gather_object(gathered, mine, group=pp.cpu_group)
-    validate(cfg.delegations, pp_size=pp_size, num_kv_heads=num_kv,
+    validate(cfg.delegations, pp_size=pp_size, num_kv_heads=num_kv, gqa=cfg.gqa,
              owner_attn_layers={int(g["rank"]): int(g["n_attn"]) for g in gathered})
 
     from sglang.srt.distributed.device_communicators.barlink_host import BarlinkHostTransport
@@ -988,7 +1072,7 @@ def install(runner) -> Optional[AHRuntime]:
         engine = HelperEngine(cfg, device, engine_kv_dtype, kernel.attend,
                               alloc_ctx=lambda: adapter.region(GPU_MEMORY_TYPE_KV_CACHE))
         for d in helped:
-            engine.allocate(d.owner, rt.layers_of[d.owner], d.n_groups)
+            engine.allocate(d.owner, rt.layers_of[d.owner], cfg.heads_of(d).n_kv)
             kernel.add_owner(d.owner)
         stream = torch.cuda.Stream(device, priority=-1)
         rt.helper = HelperThread(cfg, wire, engine, infos, stream=stream, plan=kernel.plan, device=device)
@@ -1000,8 +1084,8 @@ def install(runner) -> Optional[AHRuntime]:
         "(ATTN_HEAD_SPLIT.md; %s) barlink p2p %.2f MiB/pair, pinned host %.1f MiB",
         pp_rank, pp_size, rt.role, ",".join(d.text() for d in cfg.delegations), cfg.min_w,
         cfg.cap_tokens, stage_post_mib(cfg, pp_rank),
-        ("owner layers %s -> PP%d, %d of %d kv groups" % (
-            sorted(rt.owner_layer_ids), d_own.helper, d_own.n_groups, num_kv)) if d_own else
+        ("owner layers %s -> PP%d, q heads %s" % (
+            sorted(rt.owner_layer_ids), d_own.helper, cfg.heads_of(d_own))) if d_own else
         ("helper for %s, mirror %.1f MiB" % (
             {d.owner: rt.layers_of[d.owner] for d in helped}, rt.helper.engine.mirror_mib())) if helped else "idle",
         cfg.p2p_bytes() / 2**20, host_pinned_mib(cfg, pp_size),
@@ -1059,11 +1143,11 @@ class FlashinferHelperKernel:
 
         self.wrappers[owner] = BatchPrefillWithPagedKVCacheWrapper(self.float_ws, "NHD")
 
-    def plan(self, owner: int, p: int, w: int, n_groups: int) -> None:
+    def plan(self, owner: int, p: int, w: int, n_q: int, n_kv: int) -> None:
         wr = self.wrappers[owner]
         qo = torch.tensor([0, w], dtype=torch.int32)
         kv = torch.tensor([0, p + w], dtype=torch.int32)
-        wr.plan(qo, kv, self.idx[:p + w], self._last_page, self.cfg.gqa * n_groups, n_groups,
+        wr.plan(qo, kv, self.idx[:p + w], self._last_page, n_q, n_kv,
                 self.cfg.head_dim, 1, causal=True, q_data_type=torch.bfloat16,
                 kv_data_type=self.kv_dtype, non_blocking=True, disable_split_kv=True)
 
