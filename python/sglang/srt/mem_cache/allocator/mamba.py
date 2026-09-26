@@ -391,6 +391,27 @@ class MambaSlotAllocator:
     def phase_limit(self) -> Optional[int]:
         return getattr(self, "_phase_limit", None)
 
+    @property
+    def phase_withheld_slots(self) -> int:
+        """H95d: slot ids the phase's limit holds out of the free list.
+
+        They are free (no owner, ``slot_used`` False -- ``set_phase_limit``
+        refuses while one above the limit is live) but not ``available``: they
+        have no pages. Without a term of their own the idle ledger reads them
+        as a leak -- boot fnFL2h91bb2 died on it at the first idle after the
+        first n=1 wake, all three ranks, ``[mamba] total=38, available=7``,
+        ``leaked_mamba_pages`` = exactly 8..38. The same NAMED POSTEN as the
+        KV pool's ``residency_withheld_slots`` (#656/#790). Replicated: a
+        function of the limit and of this pool's ledger, like the limit."""
+        withheld = getattr(self, "_phase_withheld", None)
+        return 0 if withheld is None else int(withheld.numel())
+
+    def phase_withheld_ids(self) -> list:
+        """The ids behind ``phase_withheld_slots`` (a list, duplicates kept --
+        the idle census asks the double-free question over them too)."""
+        withheld = getattr(self, "_phase_withheld", None)
+        return [] if withheld is None else [int(v) for v in withheld.tolist()]
+
     def _defer_double_free_check(self, safe: torch.Tensor, in_ledger: torch.Tensor) -> None:
         """#1467: the #924 double-free question, asked WITHOUT waiting.
 
