@@ -811,6 +811,13 @@ def vision_verdict(image_parts: int, video_parts: int, mode: str):
     )
 
 
+def front_span_inflight() -> bool:
+    """#49 rest (``SGLANG_WEG2_FRONT_SPAN_INFLIGHT``, default off): credit a D
+    leg 2's text at its first content event instead of at its finish. The #49
+    pricing it builds on runs unswitched in this tree (S7c, 196f6a8f57)."""
+    return bool(envs.SGLANG_WEG2_FRONT_SPAN_INFLIGHT.get())
+
+
 def request_text(payload: dict) -> str:
     """The prompt as ONE string, for the span estimate and the ledger.
 
@@ -984,6 +991,28 @@ class SpanLRU:
         if ct <= 0 and held is None:
             return
         self.entries[key] = (text, ct, pt, held)
+        while len(self.entries) > self.cap:
+            self.entries.popitem(last=False)
+
+    def record_inflight(self, text: str, prompt_tokens: int, held_epoch: int) -> None:
+        """#49 rest: D has prefilled ``text`` (its leg 2 delivered its first
+        content event in ``held_epoch``), so D's radix holds all of it for the
+        rest of that epoch. ``prompt_tokens`` is the best count to hand (the
+        exact tokenisation if known, else chars/3 -- an over-count, which
+        only matters after the epoch, where it can only raise a price).
+
+        Keeps an existing entry's MEASURED ``cached_tokens`` (a repeat of a
+        text D already served), so a leg that dies before its finish never
+        erases a measurement; the finish's :meth:`record_presence` replaces
+        this entry with the measured one in any case.
+        """
+        if not text or held_epoch is None:
+            return
+        key = hashlib.sha1(text.encode()).hexdigest()
+        old = self.entries.pop(key, None)
+        ct = old[1] if old else 0
+        pt = max(1, int(prompt_tokens or 0), old[2] if old else 0)
+        self.entries[key] = (text, ct, pt, int(held_epoch))
         while len(self.entries) > self.cap:
             self.entries.popitem(last=False)
 
@@ -1680,6 +1709,18 @@ async def _anthropic_refusal_lookahead(r) -> Tuple[Optional[bytes], bool]:
         if len(head) >= ANTHROPIC_LOOKAHEAD_MAX_BYTES:
             break
     return (bytes(head) if head else None), False
+
+
+def stream_has_content(head: Optional[bytes], path: str) -> bool:
+    """#49 rest: has a leg-2 stream's buffered head reached CONTENT, i.e. has
+    D finished prefilling? Anthropic: a content event (the envelope comes
+    first, see :func:`_anthropic_refusal_lookahead`). OpenAI and /generate:
+    the first ``data:`` chunk, which the server emits with the first token."""
+    if not head:
+        return False
+    if path == "/v1/messages":
+        return any(m in head for m in ANTHROPIC_CONTENT_MARKERS)
+    return b"data:" in head
 
 
 def witness_verdict(front_outstanding: int, rank_idle: bool) -> Optional[str]:
@@ -4962,6 +5003,34 @@ class Front:
                         return await self._requeue_after_x_refusal(
                             request, rid, payload, text, stream, pending, seat, first_chunk
                         )
+                _has_content = (stream and r.status == 200 and early_body is None
+                                and stream_has_content(first_chunk, request.path))
+                if _has_content:
+                    # #49 rest, INSTRUMENT (routing unchanged): D's first
+                    # content for this leg. Joined by rid with the
+                    # ROUTE-VERDICT line (the arrival), it is the
+                    # arrival-to-first-token the agent-load boot measures.
+                    logger.info("WEG2 LEG2-FIRST-CONTENT rid=%s epoch=%d via=%s leg2_ms=%.0f",
+                                rid, self.epoch, ("d_direct" if pending is None
+                                                 else "d_single" if single_prefill else "after_p"),
+                                (time.time() - t0) * 1000.0)
+                if _has_content and front_span_inflight():
+                    # #49 rest: D has produced this leg's first content, so it
+                    # has PREFILLED the whole prompt into its radix, where a
+                    # concurrent request with this prefix matches it (boot
+                    # dkr27bbar1agent09252206: weg2-12-11 matched 32972 of the
+                    # still-decoding weg2-12-10's 33003). Credit it NOW for
+                    # this epoch; the finish below replaces the entry with
+                    # the measured one. Without this the twin of a turn
+                    # (+~155 tokens, 1-10 s later) priced its predecessor as
+                    # uncached and went over P (weg2-14-15: 157 real tokens,
+                    # routed LONG at est 5327, 55 s wait; nvfp4 weg2-10-7: a
+                    # P epoch of its own).
+                    self.spans.record_inflight(
+                        text, self.exact_tokens.get(hashlib.sha1(text.encode(errors="replace")).hexdigest())
+                        or int(len(text) / CHARS_PER_TOKEN) + 1,
+                        held_epoch=self.epoch)
+                    self.counters["span_inflight_credited"] += 1
                 if stream:
                     resp = web.StreamResponse(status=r.status)
                     resp.content_type = r.content_type

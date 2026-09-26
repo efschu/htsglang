@@ -991,6 +991,14 @@ class Envs:
     # is in flight; otherwise it is routed with the start X (to P). NF D is
     # bs1, so a burst served serially on D would be slower than P's batch.
     SGLANG_WEG2_X_SOLO_WINDOW_MS = EnvInt(250)
+    # #49 rest (FS 26.09., desk/27b-frontspan2-0926 a561991382, inflight half
+    # only: #49 itself runs unswitched in the unified tree since S7c): a D leg
+    # 2 whose stream has delivered its first content event has PREFILLED its
+    # whole prompt into D's radix -- the front credits that text for the rest
+    # of the epoch at once, not only when the leg finishes. Closes the twin
+    # gap (a Claude-Code turn's second request, +~155 tokens on the first,
+    # arriving while the first decodes). Off = presence only at leg-2 finish.
+    SGLANG_WEG2_FRONT_SPAN_INFLIGHT = EnvBool(False)
     # UNIFY S7 (27B RC7-X, 7f81f09daf/e28c450a0d/0e8faa7178): the front half of
     # the 27B busy/idle split beyond the shared X-SOLO band -- a band request
     # the singleton rule sent to P is marked deferred and served on D by the
