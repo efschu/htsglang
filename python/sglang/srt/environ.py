@@ -2000,6 +2000,13 @@ class Envs:
     # D only when nothing else is in flight and nothing arrives within this
     # window; a burst goes to P together over one flip.
     SGLANG_WEG2_X_SOLO_WINDOW_MS = EnvInt(250)
+    # 27B DPWAIT (release table row 28, 26.09.): the front's min-dwell (K7) prices a
+    # round trip with the last same-direction flip's flip_ms, and flip_ms INCLUDES the
+    # drain wait for running decodes (drain_quiesce_ms). Measured dkr27bnvfp4bar1agent
+    # 09252328: a D->P flip that drained 29.7 s recorded flip_ms=31115, and the next
+    # D->P was held 39.2 s by min-dwell (need 31115 ms, awake 8758 ms) while a batch
+    # waiter queued. On: the price is flip_ms - drain_quiesce_ms (the flip itself).
+    SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
