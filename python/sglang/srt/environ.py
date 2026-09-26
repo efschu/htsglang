@@ -564,6 +564,21 @@ class Envs:
     # False = any landed lap answers, the 2026-09-24 form.
     SGLANG_WEG2_ENABLE_IDLE_VOTE_FRESHNESS = EnvBool(True)
     SGLANG_WEG2_IDLE_VOTE_TTL_S = EnvFloat(2.0)
+    # QUIESCE_FAST (fnFL2 H111, Tail-Buchhaltung): the front's quiesce polls
+    # /flush_cache every QUIESCE_FAST_POLL_MS instead of 50 ms, and PP0 no
+    # longer WANTS a new idle lap from a poll that finds its lap still on the
+    # ring. Measured x177/x178/h91v1, all 15 P->D flips: the last
+    # write-through lands +19..+189 ms after P-end, /flush_cache answers 200
+    # 95..189 ms later -- two polls at 50 ms per lap, and in 8 of 15 flips a
+    # poll during the lap wanted a second one, so the first lap came home
+    # "#1268 IDLE-ROUND stale ... round id mismatch" and cost one more poll.
+    # Without the guard a poll faster than a lap would drop EVERY lap (a new
+    # one is stamped at the harvest pass), so ONE switch arms both halves;
+    # the launcher hands its own environment to the front and to every rank
+    # (build_env / fenv = dict(os.environ)), so export it in the arm.
+    # False = the 50 ms poll and the unconditional want, byte-identical.
+    SGLANG_WEG2_QUIESCE_FAST = EnvBool(False)
+    SGLANG_WEG2_QUIESCE_FAST_POLL_MS = EnvInt(10)
     # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
     # not carry (pad + D-extra rows, loaded from the host store) are issued on
     # a side stream right behind the resume of their layer's chunk tag, i.e.
