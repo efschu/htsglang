@@ -991,6 +991,14 @@ class Envs:
     # is in flight; otherwise it is routed with the start X (to P). NF D is
     # bs1, so a burst served serially on D would be slower than P's batch.
     SGLANG_WEG2_X_SOLO_WINDOW_MS = EnvInt(250)
+    # #49 rest (FS 26.09., desk/27b-frontspan2-0926 a561991382, inflight half
+    # only: #49 itself runs unswitched in the unified tree since S7c): a D leg
+    # 2 whose stream has delivered its first content event has PREFILLED its
+    # whole prompt into D's radix -- the front credits that text for the rest
+    # of the epoch at once, not only when the leg finishes. Closes the twin
+    # gap (a Claude-Code turn's second request, +~155 tokens on the first,
+    # arriving while the first decodes). Off = presence only at leg-2 finish.
+    SGLANG_WEG2_FRONT_SPAN_INFLIGHT = EnvBool(False)
     # UNIFY S7 (27B RC7-X, 7f81f09daf/e28c450a0d/0e8faa7178): the front half of
     # the 27B busy/idle split beyond the shared X-SOLO band -- a band request
     # the singleton rule sent to P is marked deferred and served on D by the
@@ -1059,6 +1067,20 @@ class Envs:
     # pre-fix collapse for a deployment whose template names its top tier
     # "max" instead; the collapse is then logged by name.
     SGLANG_ANTHROPIC_XHIGH_EFFORT = EnvStr("xhigh")
+    # Befund M (26.09., boots dkr27bnvfp4bar1agent09252328 / dkr27bbar1final09260145):
+    # Claude Code sends mid-conversation ``role: "system"`` messages
+    # (api_system: tool additions/removals, output_config). For a template
+    # without inline-system support the front HOISTS them into the head system
+    # turn, so the turn that first carries one re-renders every token behind
+    # the system text: D's radix walk and the arena key chain both stop at the
+    # end of the system turn (3.7-4.7k tokens), the match census reads
+    # ``MambaComponent:absent`` there, and the turn goes W31 -> P. On: render
+    # each NON-LEADING inline system message IN PLACE as a user turn wrapped in
+    # <system-reminder>, so a turn stays a token-prefix of the next one. Leading
+    # inline system messages (before any user/assistant turn) are still merged
+    # into the head -- that position is prefix-stable. Set it identically on
+    # P and D: the P->D handoff keys are P's tokenization of the same body.
+    SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")

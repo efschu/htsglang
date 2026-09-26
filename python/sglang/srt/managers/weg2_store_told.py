@@ -94,6 +94,21 @@ class Weg2StoreTold:
 
     rid: str
     told: int
+    #: #1416e (paced, SGLANG_WEG2_TOLD_PACED): True = READ-AHEAD only -- the
+    #: followers register their read of the told span now, but the request's
+    #: MEMBERSHIP arrives later as :class:`Weg2StoreAdmit`. False = the
+    #: pre-#1416e single-phase told (read + membership in one object).
+    paced: bool = False
+
+
+@dataclass
+class Weg2StoreAdmit:
+    """#1416e: PP0's membership verdict for a PACED told -- PP0 admits the
+    request in the pass that puts this on the wire, every follower in the
+    pass that absorbs it (the lag of the single-phase told, unchanged)."""
+
+    rid: str
+    told: int
 
 
 class Weg2StoreToldTwin(Weg2StoreTold):
@@ -131,6 +146,11 @@ def armed(scheduler) -> bool:
     if value:
         scheduler._weg2_store_told = {}
         scheduler._weg2_store_held = {}
+        # #1416e: resolved ONCE, read on PP0 only -- a follower follows the
+        # `paced` flag of the object PP0 put on the wire, never its own env,
+        # so a launcher that armed the switch on one rank only cannot split
+        # the group.
+        scheduler._weg2_told_paced_on = _paced_env()
         logger.warning(
             "#1400 STORE-TOLD ARMED rank pp=%s: carrierless PP form with HiCache "
             "storage -- PP0 publishes its store verdict per request on the "
@@ -201,6 +221,9 @@ def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
             return _twin.VERDICT_DEFERRED
         verdict = scheduler._prefetch_kvcache(req)
         held[rid] = req
+        if getattr(scheduler, "_weg2_told_paced_on", False):
+            # #1416e: PP0's own read time is the pacing window's measure.
+            _pace_intake_t(scheduler).setdefault(rid, _clock())
         n = getattr(scheduler, "_weg2_store_told_intake_n", 0) + 1
         scheduler._weg2_store_told_intake_n = n
         if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
@@ -214,6 +237,9 @@ def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
             )
         return verdict
     told = scheduler._weg2_store_told.get(rid)
+    if told is None:
+        # #1416e: a paced read-ahead that arrived before the request did.
+        told = (getattr(scheduler, "_weg2_told_early", None) or {}).get(rid)
     if told is not None:
         # The verdict arrived before the request did (never on the ring's
         # order, but a re-queued request can find its told already stored):
@@ -427,6 +453,23 @@ def _anchor_clamp(scheduler, req, told: int) -> int:
         return int(told)
 
 
+def _pp0_told(scheduler, tree, req, rid: str) -> int:
+    """PP0's told for a terminated prefetch: the completed prefix, anchor-
+    clamped (#1416), with PP0's own record clamped alike (#1416b)."""
+    told = _completed_prefix(tree, rid)
+    clamped = _anchor_clamp(scheduler, req, told)
+    if clamped != told:
+        # #1416b (boot xsn169): PP0's OWN admission compares its recorded
+        # completed prefix with told; a clamped told against the stale
+        # record (told=0 vs own=4095) stopped PP0 itself. The record is
+        # "what this rank can admit" -- clamp it with the same number.
+        try:
+            tree._prefetch_completed_tokens[rid] = int(clamped)
+        except Exception:  # noqa: BLE001 - a tree without the dict keeps its number
+            pass
+    return int(clamped)
+
+
 def _twin_register(scheduler, req, twin: bool) -> str:
     """TW: the store read a held twin did not register at its intake --
     the same call and the same A12.2 routing as the intake site."""
@@ -444,6 +487,9 @@ def _twin_register(scheduler, req, twin: bool) -> str:
     apply = getattr(scheduler, "_apply_prefetch_deferral", None)
     if callable(apply):
         apply(req, verdict, site="twin_release")
+    if getattr(scheduler, "_weg2_told_paced_on", False):
+        # #1416e: PP0's own read time is the pacing window's measure.
+        _pace_intake_t(scheduler)[rid] = _clock()
     logger.info(
         "#TW TWIN-REGISTER rid=%s twin=%s verdict=%s head=%d span=%s",
         rid[:12], twin, verdict, _twin.registered_head(req),
@@ -452,11 +498,36 @@ def _twin_register(scheduler, req, twin: bool) -> str:
     return verdict
 
 
+def _twin_pp0_told(scheduler, tree, req, rid: str) -> int:
+    """TW: PP0's told for a released fork twin. The #1400 record counts only
+    the span beyond the registration's match (the host insert is rooted at
+    ``last_host_node``); a twin's point is the head it matched on the device
+    -- its sibling's rows -- so its told is head + span, ABSOLUTE, anchor-
+    clamped like every told, and PP0's own record is set to it."""
+    span = int(_completed_prefix(tree, rid))
+    head = _twin.registered_head(req)
+    told = head + span
+    clamped = int(_anchor_clamp(scheduler, req, told))
+    try:
+        tree._prefetch_completed_tokens[rid] = clamped
+    except Exception:  # noqa: BLE001 - a tree without the dict keeps its number
+        pass
+    logger.info(
+        "#TW TWIN-TOLD rid=%s head=%d span=%d told=%d clamped=%d: the twin's told "
+        "is absolute (the followers compare head + span)",
+        rid[:12], head, span, told, clamped,
+    )
+    return clamped
+
+
 def pp0_publish(scheduler, recv_reqs: List) -> List:
     """Top of a PP0 pass, before the forward: turn terminated prefetches of
     held rids into ``Weg2StoreTold`` objects appended to the outgoing list.
     Returns the list to SEND; the caller keeps dispatching ``recv_reqs``."""
     held: Dict[str, Any] = scheduler._weg2_store_held
+    paced_on = bool(getattr(scheduler, "_weg2_told_paced_on", False))
+    if paced_on:
+        return _pp0_publish_paced(scheduler, recv_reqs)
     if not held:
         return recv_reqs
     told_map: Dict[str, int] = scheduler._weg2_store_told
@@ -483,32 +554,11 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
             continue
         if not tree.check_prefetch_progress(rid):
             continue
-        told = _completed_prefix(tree, rid)
         twin = _twin.take_pp0_twin(scheduler, rid)
         if twin:
-            # TW: the #1400 record counts the span beyond the registration's
-            # match only; a twin's point is the head it matched on the device
-            # (its sibling's rows), so its told is head + span, absolute.
-            head = _twin.registered_head(req)
-            span_told = told
-            told = head + int(told)
-        clamped = _anchor_clamp(scheduler, req, told)
-        if twin:
-            logger.info(
-                "#TW TWIN-TOLD rid=%s head=%d span=%d told=%d clamped=%d: the "
-                "twin's told is absolute (the followers compare head + span)",
-                rid[:12], head, int(span_told), int(told), int(clamped),
-            )
-        if clamped != told or twin:
-            # #1416b (boot xsn169): PP0's OWN admission compares its recorded
-            # completed prefix with told; a clamped told against the stale
-            # record (told=0 vs own=4095) stopped PP0 itself. The record is
-            # "what this rank can admit" -- clamp it with the same number.
-            try:
-                tree._prefetch_completed_tokens[rid] = int(clamped)
-            except Exception:  # noqa: BLE001 - a tree without the dict keeps its number
-                pass
-        told = clamped
+            told = _twin_pp0_told(scheduler, tree, req, rid)
+        else:
+            told = _pp0_told(scheduler, tree, req, rid)
         told_map[rid] = told
         held.pop(rid, None)
         out.append((Weg2StoreToldTwin if twin else Weg2StoreTold)(rid=rid, told=told))
@@ -532,19 +582,35 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
 def _follower_absorb_impl(scheduler, recv_reqs: List) -> List:
     """After the forward, before dispatch: take the told objects off the list,
     store them, and register the held requests' prefetch with the told span."""
-    if not any(isinstance(r, Weg2StoreTold) for r in recv_reqs):
+    if not any(isinstance(r, (Weg2StoreTold, Weg2StoreAdmit)) for r in recv_reqs):
         return recv_reqs
     told_map: Dict[str, int] = scheduler._weg2_store_told
     held: Dict[str, Any] = scheduler._weg2_store_held
     rest = []
     for item in recv_reqs:
+        if isinstance(item, Weg2StoreAdmit):
+            _follower_admit(scheduler, item)
+            continue
         if not isinstance(item, Weg2StoreTold):
             rest.append(item)
             continue
         rid = str(item.rid)
         told = int(item.told)
-        told_map[rid] = told
+        if getattr(item, "paced", False):
+            # #1416e: read-ahead only. The read starts NOW, one pass behind
+            # PP0's verdict; admission still skips until the Admit arrives.
+            early = _early(scheduler)
+            early[rid] = told
+            if len(early) > 256:
+                # an aborted request never gets its Admit: keep the table
+                # to what is still queued (or just arrived, this rid)
+                queued = {_rid(r) for r in scheduler.waiting_queue}
+                for k in [k for k in early if k != rid and k not in queued]:
+                    early.pop(k, None)
+        else:
+            told_map[rid] = told
         if getattr(item, "twin", False):
+            # TW: an absolute twin told (read-ahead or single-phase alike).
             _twin.note_follower_twin(scheduler, rid)
         req = held.pop(rid, None)
         n = getattr(scheduler, "_weg2_store_told_absorbed", 0) + 1
@@ -563,6 +629,226 @@ def _follower_absorb_impl(scheduler, recv_reqs: List) -> List:
                 n,
             )
     return rest
+
+
+# ---------------------------------------------------------------------------
+# #1416e PACED TOLD (switch SGLANG_WEG2_TOLD_PACED, default OFF)
+# ---------------------------------------------------------------------------
+#
+# THE RISK IT REMOVES. With told > 0 (#1416d) the follower path runs again:
+# a follower registers its read when the told ARRIVES and then, in the same
+# pass, busy-waits for it in :func:`admission` (bounded by WAIT_CAP_S). That
+# wait sits in the follower's scheduler thread, so the whole stage stops --
+# every other request in pipeline flight on that stage with it (user order
+# 24.09.: HiCache work never slows a running prefill/decode).
+#
+# WHY THE FOLLOWER CANNOT SIMPLY DEFER. On the carrierless form every rank
+# plans rank-locally and the told arrival IS the membership signal: PP0
+# admitted the request in the pass it published, a follower that skipped it
+# would build a different batch (the W27 width split). A deferral with a
+# told=0 fallback must therefore be PP0's decision, and PP0 would need each
+# follower's read state -- a follower->PP0 channel this form does not have
+# live (#1175's return trip has no caller, the output ring only runs on
+# passes with a batch, the #1268 home hop is the idle vote's). So:
+#
+# THE PACED FORM, PP0-AUTHORITATIVE AND WIRELESS. Two objects instead of one:
+#   1. ``Weg2StoreTold(rid, told, paced=True)`` as soon as PP0's own read has
+#      terminated -- a READ-AHEAD: followers register exactly the told span,
+#      nobody admits.
+#   2. ``Weg2StoreAdmit(rid, told)`` once PP0's pacing window has passed --
+#      PP0 admits in that pass, every follower in the pass that absorbs it
+#      (the single-phase told's lag, unchanged). While the window runs, PP0
+#      skips the request (``weg2_store_told_pending``) and admits everything
+#      behind it; no rank waits.
+# The window is PP0's estimate of the followers' read: max(factor x PP0's own
+# read time, told tokens x the measured per-100k read rate), capped. A
+# follower whose read is still short at the Admit falls into the unchanged
+# bounded wait (named, WAIT_CAP_S) -- the residual, not the normal case.
+# Told 0 needs no read and is published single-phase as before.
+
+ENV_PACED = "SGLANG_WEG2_TOLD_PACED"
+ENV_PACE_FACTOR = "SGLANG_WEG2_TOLD_PACE_FACTOR"
+ENV_PACE_S_PER_100K = "SGLANG_WEG2_TOLD_PACE_S_PER_100K"
+ENV_PACE_CAP_S = "SGLANG_WEG2_TOLD_PACE_CAP_S"
+PACE_FACTOR_DEFAULT = 1.25
+#: ~1 s per 100k tokens per stage (follower store read, 27B P, 0926 estimate)
+PACE_S_PER_100K_DEFAULT = 1.0
+#: well below the #699 admission-wedge threshold (ADMISSION_WEDGE_SECONDS =
+#: 20 s of "queued, 0 running"): a window near it would have the idle P answer
+#: the paced request 503 WEG2-INTAKE-STALL and flip (PP0's own read time sits
+#: on the same queue clock). A follower slower than the cap takes the residual
+#: bounded wait at admission instead.
+PACE_CAP_S_DEFAULT = 10.0
+
+_clock = time.monotonic
+
+
+def _paced_env() -> bool:
+    return os.environ.get(ENV_PACED, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def pace_window_s(own_read_s: float, told: int) -> float:
+    """PP0's estimate of how long a follower's read of ``told`` tokens takes:
+    the larger of (factor x PP0's own read time) and (told x per-100k rate),
+    capped. The told floor covers the case PP0 read little itself (its host
+    tree already held the prefix) while the followers read it all."""
+    factor = _env_float(ENV_PACE_FACTOR, PACE_FACTOR_DEFAULT)
+    rate = _env_float(ENV_PACE_S_PER_100K, PACE_S_PER_100K_DEFAULT)
+    cap = _env_float(ENV_PACE_CAP_S, PACE_CAP_S_DEFAULT)
+    est = max(factor * max(0.0, float(own_read_s)), rate * max(0, int(told)) / 100000.0)
+    return min(cap, est)
+
+
+@dataclass
+class _Pace:
+    req: Any
+    told: int
+    published_at: float
+    published_pass: int
+    window_s: float
+
+
+def _pace_intake_t(scheduler) -> Dict[str, float]:
+    d = getattr(scheduler, "_weg2_told_intake_t", None)
+    if d is None:
+        d = scheduler._weg2_told_intake_t = {}
+    return d
+
+
+def _pacing(scheduler) -> Dict[str, _Pace]:
+    d = getattr(scheduler, "_weg2_told_pacing", None)
+    if d is None:
+        d = scheduler._weg2_told_pacing = {}
+    return d
+
+
+def _early(scheduler) -> Dict[str, int]:
+    d = getattr(scheduler, "_weg2_told_early", None)
+    if d is None:
+        d = scheduler._weg2_told_early = {}
+    return d
+
+
+def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
+    """PP0, paced form: publish read-aheads for terminated reads, then the
+    Admits whose window has passed. Never waits."""
+    held: Dict[str, Any] = scheduler._weg2_store_held
+    pacing = _pacing(scheduler)
+    if not held and not pacing:
+        return recv_reqs
+    told_map: Dict[str, int] = scheduler._weg2_store_told
+    tree = scheduler.tree_cache
+    intake_t = _pace_intake_t(scheduler)
+    queued = {_rid(r) for r in scheduler.waiting_queue}
+    now = _clock()
+    pass_n = int(getattr(scheduler, "_weg2_told_pass_n", 0)) + 1
+    scheduler._weg2_told_pass_n = pass_n
+    # TW: held fork twins whose sibling finished (or whose Frist ran out)
+    # register their store read now (the paced read clock starts here).
+    for _treq, _is_twin in _twin.release_due(scheduler, queued):
+        _twin_register(scheduler, _treq, _is_twin)
+    out: List[Any] = []
+    # (a) Admits first: an entry created in THIS pass is never admitted in it,
+    # so the read-ahead always precedes its Admit by at least one pass.
+    for rid in list(pacing):
+        p = pacing[rid]
+        if rid not in queued:
+            # left the queue during the window (abort): no Admit, nothing
+            # admits; the followers' reads end in their own drain.
+            pacing.pop(rid, None)
+            logger.info("#1416e PACED-DROP rid=%s told=%d: left the queue inside the window", rid[:8], p.told)
+            continue
+        if now - p.published_at < p.window_s:
+            continue
+        pacing.pop(rid, None)
+        told_map[rid] = p.told
+        out.append(Weg2StoreAdmit(rid=rid, told=p.told))
+        n = getattr(scheduler, "_1416e_admit_n", 0) + 1
+        scheduler._1416e_admit_n = n
+        if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+            logger.info(
+                "#1416e PACED-ADMIT rid=%s told=%d window=%.2fs waited=%.2fs passes=%d (n=%d): "
+                "PP0 admits in this pass, the followers in the pass that absorbs it; "
+                "nobody waited while the window ran",
+                rid[:8], p.told, p.window_s, now - p.published_at, pass_n - p.published_pass, n,
+            )
+    # (b) read-aheads for terminated reads (the single-phase checks)
+    for rid in list(held):
+        req = held[rid]
+        if rid not in queued:
+            held.pop(rid, None)
+            intake_t.pop(rid, None)
+            _twin.take_pp0_twin(scheduler, rid)
+            continue
+        if _twin.is_deferred(scheduler, rid):
+            continue  # TW: no store read registered yet
+        if getattr(req, "prefetch_deferred", None) is not None:
+            continue
+        if not tree.check_prefetch_progress(rid):
+            continue
+        twin = _twin.take_pp0_twin(scheduler, rid)
+        if twin:
+            told = _twin_pp0_told(scheduler, tree, req, rid)
+        else:
+            told = _pp0_told(scheduler, tree, req, rid)
+        _cls = Weg2StoreToldTwin if twin else Weg2StoreTold
+        held.pop(rid, None)
+        own_read_s = now - intake_t.pop(rid, now)
+        if told <= 0:
+            # nothing to read on any rank: single-phase, as before
+            told_map[rid] = told
+            out.append(_cls(rid=rid, told=told))
+            continue
+        window = pace_window_s(own_read_s, told)
+        pacing[rid] = _Pace(req=req, told=told, published_at=now, published_pass=pass_n, window_s=window)
+        out.append(_cls(rid=rid, told=told, paced=True))
+        n = getattr(scheduler, "_1416e_ahead_n", 0) + 1
+        scheduler._1416e_ahead_n = n
+        if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+            logger.info(
+                "#1416e PACED-TOLD rid=%s told=%d own_read=%.2fs window=%.2fs (n=%d pacing=%d): "
+                "read-ahead on the wire, admission follows the window",
+                rid[:8], told, own_read_s, window, n, len(pacing),
+            )
+    if not out:
+        return recv_reqs
+    return list(recv_reqs) + out
+
+
+def _follower_admit(scheduler, item: Weg2StoreAdmit) -> None:
+    """Follower: PP0 admitted this rid -- the told becomes the admission
+    verdict (the single-phase told's role from here on)."""
+    rid = str(item.rid)
+    told = int(item.told)
+    early = _early(scheduler)
+    ahead = early.pop(rid, None)
+    scheduler._weg2_store_told[rid] = told
+    held: Dict[str, Any] = scheduler._weg2_store_held
+    req = held.pop(rid, None)
+    if req is not None:
+        # no read-ahead reached this request (it was not queued yet): register
+        # now; admission then waits for it as the single-phase form does.
+        _follower_register(scheduler, req, told)
+    if ahead is not None and int(ahead) != told:
+        logger.warning(
+            "#1416e PACED-ADMIT rid=%s told=%d differs from the read-ahead %d; admission "
+            "compares against the admitted value", rid[:8], told, int(ahead),
+        )
+    n = getattr(scheduler, "_1416e_absorb_n", 0) + 1
+    scheduler._1416e_absorb_n = n
+    if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+        logger.info(
+            "#1416e PACED-ADMIT ABSORBED rank pp=%s rid=%s told=%d read_ahead=%s (n=%d)",
+            scheduler.ps.pp_rank, rid[:8], told, ahead, n,
+        )
 
 
 def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional[int]:
@@ -590,6 +876,9 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
         told_map.pop(rid, None)
         _twin.take_follower_twin(scheduler, rid)
         return 0
+    # The single-phase form waits here for a read registered THIS pass (the
+    # stage stops for it); the paced form (#1416e) registered it a window
+    # earlier, so this loop normally finds it terminated on the first call.
     deadline = time.monotonic() + WAIT_CAP_S
     waited = False
     while not tree.check_prefetch_progress(rid):

@@ -378,3 +378,46 @@ def test_shared_prefix_len_and_is_twin():
     assert tw.shared_prefix_len(array.array("i", x), y) == 9000
     ra, rb = _Req("a", x), _Req("b", y)
     assert tw.is_twin(ra, rb, 8192) and not tw.is_twin(ra, rb, 9001)
+
+
+# --------------------------------------------------------------------------
+# #1416e paced form: the twin rides the read-ahead, the Admit follows
+# --------------------------------------------------------------------------
+
+
+def test_paced_twin_read_ahead_then_admit_on_every_rank(on, clock, monkeypatch):
+    monkeypatch.setenv(m.ENV_PACED, "1")
+    monkeypatch.setattr(m, "_clock", clock)
+    ranks = [_Sched(0), _Sched(1)]
+    for r in ranks:
+        assert m.armed(r)
+    shared = 60000
+    a = [_Req("weg2-22-63", _ids(shared, 300, 1)) for _ in ranks]
+    b = [_Req("weg2-23-64", _ids(shared, 450, 2)) for _ in ranks]
+    for i, r in enumerate(ranks):
+        _intake(r, a[i])  # sibling: nothing to read (told 0, single-phase)
+        assert _intake(r, b[i]) == (tw.VERDICT_DEFERRED if i == 0 else "declined:weg2_held")
+    for r in ranks:
+        r.local[b[0].rid] = (57344, 0)
+    kinds, admitted = [], {}
+    for p in range(20):
+        if p == 2:
+            for i in range(2):
+                a[i].done = True
+                ranks[i].waiting_queue.remove(a[i])
+        clock.t += 0.2
+        out = [w for w in m.pp0_publish(ranks[0], [])
+               if isinstance(w, (m.Weg2StoreTold, m.Weg2StoreAdmit)) and w.rid == b[0].rid]
+        kinds += [(p, type(w).__name__, getattr(w, "paced", None), w.told) for w in out]
+        m.follower_absorb(ranks[1], out)
+        for i, r in enumerate(ranks):
+            if i not in admitted and b[i].rid in r._weg2_store_told:
+                assert m.admission(r, b[i], _skip()[1]) is not None
+                admitted[i] = p
+    assert [k[1:] for k in kinds] == [
+        ("Weg2StoreToldTwin", True, 57344),
+        ("Weg2StoreAdmit", None, 57344),
+    ]
+    assert kinds[1][0] > kinds[0][0]  # the Admit follows the read-ahead
+    assert admitted[0] == admitted[1] == kinds[1][0]
+    assert b[0]._weg2_prefix_cap == b[1]._weg2_prefix_cap == 57344
