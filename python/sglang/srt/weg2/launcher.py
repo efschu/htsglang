@@ -1168,7 +1168,97 @@ P_CHUNK_MSCALES = {
 P_CHUNK_GRAPH_FIXED_MS = 2.0
 #: The dry-run ladder the launcher prints its plan for (the Messplan rungs).
 P_CHUNK_DRY_RUN_TOKENS = (2048, 8192, 32768, 131072)
-_P_CHUNK: Dict[str, object] = {"policy": P_CHUNK_POLICY_DEFAULT, "spec": None}
+_P_CHUNK: Dict[str, object] = {"policy": P_CHUNK_POLICY_DEFAULT, "spec": None, "power_lines": ()}
+#: --p-power-scale (release table row 27, weg2/power_limit.py). 'off' = the
+#: model is used as calibrated (spec byte-identical); only warning lines added.
+P_POWER_SCALE_DEFAULT = "off"
+P_POWER_SCALE_LAWS = ("off", "linear", "power")
+#: The card class of each P stage: PP0 on the 5090, PP1/PP2 on the 3080s
+#: (order_cards; the builtin/fit models name no cards).
+P_STAGE_CARD_CLASSES = ("RTX5090", "RTX3080", "RTX3080")
+
+
+def p_chunk_model_power_limits(src: str, stages: int) -> Tuple[Optional[List[Optional[float]]], str]:
+    """(calibration power limit per P stage, where it came from) of a
+    --p-chunk-model source; ``None`` = the model does not know its limit (an
+    old JSON, or a fit log from before row 27): warned, never refused.
+
+    builtin-int8: the weg2rc7c fit (25.09.) ran under the rig limits of
+    24.09. (power_limit.RIG_POWER_LIMIT_W_0924, bracketing readings);
+    fit:<P.log>: that log's own ``POWER-LIMIT rank`` lines (PP<r>);
+    JSON: its ``power_limit_w`` field."""
+    from sglang.srt.weg2 import power_limit as _pl
+
+    src = str(src or P_CHUNK_MODEL_DEFAULT).strip()
+    classes = list(P_STAGE_CARD_CLASSES[:stages]) + [P_STAGE_CARD_CLASSES[-1]] * max(0, stages - 3)
+    if src == "builtin-int8":
+        return ([_pl.RIG_POWER_LIMIT_W_0924.get(c) for c in classes],
+                f"builtin rig limits ({_pl.RIG_POWER_LIMIT_PROVENANCE})")
+    if src.startswith("fit:"):
+        path = src[4:]
+        try:
+            with open(path, "rb") as fh:
+                found = _pl.parse_boot_lines(
+                    raw.decode("utf-8", "replace") for raw in fh if b"POWER-LIMIT rank " in raw)
+        except OSError:
+            found = {}
+        vals = [found.get(f"PP{r}", {}).get("power_limit_w") for r in range(stages)]
+        if not any(v is not None for v in vals):
+            return None, f"fit log {os.path.basename(path)} has no POWER-LIMIT rank line (predates row 27)"
+        return [None if v is None else float(v) for v in vals], f"fit log {os.path.basename(path)} POWER-LIMIT lines"
+    try:
+        with open(src) as fh:
+            data = json.load(fh)
+        vals = _pl.stage_limits_from_json(data, stages)
+    except (OSError, ValueError, _pl.PowerLimitError) as exc:
+        return None, f"json:{os.path.basename(src)} power_limit_w unreadable ({exc})"
+    if vals is None:
+        return None, f"json:{os.path.basename(src)} has no power_limit_w (old JSON)"
+    return vals, f"json:{os.path.basename(src)} power_limit_w"
+
+
+def p_stage_power_current(stages: int) -> Tuple[List[Optional[float]], List[str]]:
+    """(running power limit per P stage, stage labels): PP<r> is the r-th card
+    of order_cards (5090 first), read from NVML by UUID. Unknown (NVML
+    unavailable) = None per stage, labels without a card."""
+    from sglang.srt.weg2 import power_limit as _pl
+
+    try:
+        cards = order_cards(resolve_cards())
+        cur = _pl.read_current()
+    except Exception:  # noqa: BLE001 - the check degrades to 'unknown', it never blocks a boot
+        return [None] * stages, [f"PP{r}" for r in range(stages)]
+    vals, labels = [], []
+    for r in range(stages):
+        c = cards[r] if r < len(cards) else None
+        w = cur.get(c.uuid, (None, ""))[0] if c is not None else None
+        vals.append(None if w is None else float(w))
+        labels.append(f"PP{r}" + (f"(nvml{c.nvml_index} {_pl.card_class(c.name)})" if c is not None else ""))
+    return vals, labels
+
+
+def apply_p_power_check(ns, models, source: str, src: str):
+    """Row 27 on the installed chunk model: compare, warn, optionally rescale.
+    Returns (models, source); both unchanged under --p-power-scale off."""
+    from sglang.srt.weg2 import power_limit as _pl
+
+    law = str(getattr(ns, "p_power_scale", P_POWER_SCALE_DEFAULT) or P_POWER_SCALE_DEFAULT)
+    alpha = getattr(ns, "p_power_scale_exponent", None)
+    try:
+        _pl.exponent_of(law, alpha)
+    except _pl.PowerLimitError as exc:
+        raise SystemExit(f"--p-power-scale: {exc}")
+    n = len(models)
+    cal, cal_src = p_chunk_model_power_limits(src, n)
+    cur, labels = p_stage_power_current(n)
+    verdicts = _pl.check(labels, cal or [None] * n, cur, law, alpha)
+    lines = _pl.verdict_lines("p-chunk-model", verdicts, law, alpha, cal_src)
+    _P_CHUNK["power_lines"] = tuple(lines)
+    if not any(v.factor != 1.0 for v in verdicts):
+        return models, source
+    models = tuple(_pl.scale_stage_model(m, v.factor) for m, v in zip(models, verdicts))
+    tag = ",".join(f"PP{r}x{v.factor:.4f}" for r, v in enumerate(verdicts) if v.factor != 1.0)
+    return models, f"{source} +powerscale:law={law},{tag} ({_pl.MODEL_LABEL})"
 
 
 def _p_chunk_stage(a_ms: float, b_ms_per_1k: float, fwd_overhead_ms: float,
@@ -1259,6 +1349,7 @@ def apply_p_chunk_policy(ns) -> None:
         raise SystemExit(f"--p-chunk-policy {policy!r}: one of {list(_pcp.POLICIES)}")
     _P_CHUNK["policy"] = policy
     _P_CHUNK["spec"] = None
+    _P_CHUNK["power_lines"] = ()
     if policy == _pcp.POLICY_FIXED:
         return
     bucket = p_prefill_graph_bucket()
@@ -1282,6 +1373,12 @@ def apply_p_chunk_policy(ns) -> None:
 
         models = _pgp.overlay_stage_models(models, _cal, buckets)
         source = f"{source} +graphcal:{_cal.source or 'table'}"
+    # Release table row 27: the model's calibration power limit against the
+    # running one (after the graph overlay, so a rescale covers every point
+    # the plan prices). --p-power-scale off: models/source untouched.
+    models, source = apply_p_power_check(
+        ns, models, source,
+        str(getattr(ns, "p_chunk_model", P_CHUNK_MODEL_DEFAULT) or P_CHUNK_MODEL_DEFAULT))
     _sweep_raw = str(getattr(ns, "p_chunk_sweep", "") or "").strip()
     try:
         _sweep = tuple(int(x) for x in _sweep_raw.split(",") if x.strip())
@@ -1315,6 +1412,13 @@ def p_chunk_policy_env() -> Dict[str, str]:
     if spec is None:
         return {}
     return {_pcp.POLICY_ENV: _pcp.POLICY_DYNAMIC, _pcp.SPEC_ENV: spec.to_json()}
+
+
+def p_chunk_power_lines() -> List[str]:
+    """Row 27: the chunk model's power-limit check (one line per P stage, loud
+    on a > 5 % mismatch, a warning for a model without power_limit_w) plus the
+    SCALE line when --p-power-scale rescaled it. [] under 'fixed'."""
+    return ["WEG2 " + ln for ln in (_P_CHUNK.get("power_lines") or ())]
 
 
 def p_chunk_policy_lines() -> List[str]:
@@ -2867,6 +2971,29 @@ def resolve_cards() -> List[Card]:
         Card(d.index, d.uuid, d.name, d.total_mib, reserved_mib=d.reserved_mib)
         for d in nvml_registry.list_devices()
     ]
+
+
+def record_card_power(records: List[Dict], cards: List[Card], log) -> None:
+    """Release table row 27: the power limit and SM clock ceiling of every
+    card go into the boot record (``state.cards[i]``: power_limit_w,
+    power_limit_default_w, power_limit_max_w, sm_clock_max_mhz; None = NVML
+    did not answer) and one ``POWER-LIMIT rank`` line per card into the
+    launcher log. Never raises: a missing answer is recorded as such."""
+    from sglang.srt.registry import nvml as _nvml
+    from sglang.srt.weg2 import power_limit as _pl
+
+    try:
+        by_uuid = {p.uuid: p for p in _nvml.power_snapshot()}
+        why = ""
+    except Exception as exc:  # noqa: BLE001
+        by_uuid, why = {}, f"{type(exc).__name__}: {exc}"
+    for i, c in enumerate(cards[:len(records)]):
+        p = by_uuid.get(c.uuid)
+        # a COPY of the record: the Card object itself is not grown
+        records[i] = dict(records[i], **{
+            k: (getattr(p, k) if p is not None else None)
+            for k in ("power_limit_w", "power_limit_default_w", "power_limit_max_w", "sm_clock_max_mhz")})
+        log(_pl.boot_line({"launcher_card": i}, p, why or "card not in the NVML power snapshot"))
 
 
 def order_cards(cards: List[Card]) -> List[Card]:
@@ -12532,6 +12659,20 @@ def build_parser() -> argparse.ArgumentParser:
              "'nvfp4': the 5090 kernel-bench HOCHRECHNUNG on PP0, 3080 stages flat "
              "until measured; 'flat': no kernel gain anywhere).")
     ap.add_argument(
+        "--p-power-scale", choices=list(P_POWER_SCALE_LAWS), default=P_POWER_SCALE_DEFAULT,
+        help="Only with --p-chunk-policy dynamic (release table row 27): the chunk model "
+             "carries the power limit per card it was CALIBRATED under (power_limit_w; "
+             "builtin-int8 = the rig limits 5090 400 W / 3080 230 W; fit:<P.log> = that "
+             "log's POWER-LIMIT rank lines). A card whose running limit (NVML) is more "
+             "than 5%% away is ALWAYS warned about loudly. 'off' (default) uses the model "
+             "as calibrated; 'linear' / 'power' rescale its COMPUTE terms by "
+             "(P_cal/P_now)^alpha (alpha 1 / --p-power-scale-exponent) -- a MODEL, not a "
+             "measurement; bandwidth and host-launch terms stay unscaled. The only honest "
+             "fix for a changed limit is a new measurement.")
+    ap.add_argument(
+        "--p-power-scale-exponent", type=float, default=None, metavar="ALPHA",
+        help="alpha of --p-power-scale power (default 1/3: f ~ P^(1/3) on the DVFS curve).")
+    ap.add_argument(
         "--p-chunk-grid", type=int, default=0, metavar="TOKENS",
         help="Only with --p-chunk-policy dynamic: no chunk crosses an absolute "
              "multiple of TOKENS (0 = off, the 27B default: its P anchors are "
@@ -13883,6 +14024,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     host_preflight(log, ns.tag, dry)
     cards = order_cards(resolve_cards())
     state.cards = [c.__dict__ for c in cards]
+    record_card_power(state.cards, cards, log)
     if not dry:
         cards_free_check(cards, log)
     cvd = ",".join(c.uuid for c in cards)
@@ -14365,6 +14507,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # --p-chunk-policy: [] under 'fixed' (front log byte-identical).
     for _pcl in p_chunk_policy_lines():
         log(_pcl)
+    # Row 27: the chunk model's power-limit check ([] under 'fixed').
+    for _pwl in p_chunk_power_lines():
+        log(_pwl)
     # --d-reshard: () under 'off' (front log byte-identical).
     for _drl in d_reshard_lines():
         log(_drl)

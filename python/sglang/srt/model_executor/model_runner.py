@@ -2057,6 +2057,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     arch,
                 )
 
+        # Release table row 27: every rank names the power limit (and SM clock
+        # ceiling) its card runs under -- every compute figure of this boot is
+        # measured under it. One log line, NVML only, never raises.
+        if self.device == "cuda" and not getattr(self, "is_draft_worker", False):
+            from sglang.srt.weg2.power_limit import rank_boot_line
+
+            logger.info(rank_boot_line(self.tp_rank, self.pp_rank, self.gpu_id))
+
         backend = get_default_distributed_backend(self.device)
         if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
             backend = "mooncake"
