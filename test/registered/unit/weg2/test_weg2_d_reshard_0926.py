@@ -299,5 +299,90 @@ class TestLauncher(unittest.TestCase):
         self.assertIn("no D cost model", str(cm.exception.code))
 
 
+class TestDcpSpeedAdvisory(unittest.TestCase):
+    """Under uneven DCP the KV restart hint is replaced by the speed table."""
+
+    def test_table_rows_and_wake_vector(self):
+        for qm, units, tv, wake in (("compressed-tensors", 1088, (26, 19, 19), "707,191,190"),
+                                    ("modelopt", 136, (14, 9, 9), "98,19,19")):
+            cur = partition_units(units, [58, 25, 25])
+            lines = D.speed_advisory_lines(D._QWEN38_27B, qm, (58, 25, 25), cur, units, tv)
+            self.assertIn("KV sum is conserved", lines[0])
+            self.assertIn(f"--d-reshard wake takes mlp={wake}", lines[0])  # = the launcher's one preset
+            rows = [x for x in lines if "D-SPEED" in x]
+            self.assertEqual(len(rows), 4 * 3 + 1)
+            self.assertTrue(any("prefill-4k" in x for x in rows))
+            for r in rows:
+                gain = float(r.split("gain=")[1].split("%")[0])
+                wake_gain = float(r.split("wake mlp")[1].split("%")[0])
+                self.assertGreaterEqual(gain, wake_gain - 1e-9)   # the class optimum is never worse
+            fmt = D.advisory_format(qm)
+            self.assertEqual(",".join(map(str, D.rc9_presets(fmt, ("dec",))[0].mlp)), wake)
+
+    def test_running_optimum_gains_zero(self):
+        cur = D.rc9_presets("int8", ("dec",))[0].mlp
+        lines = D.speed_advisory_lines(D._QWEN38_27B, "compressed-tensors", (58, 25, 25), cur, 1088, (26, 19, 19))
+        row = [x for x in lines if "decode-bs1-2k" in x][0]
+        self.assertIn("gain= +0.0%", row)
+
+    def test_unmodelled_boots_say_why(self):
+        for args in (("gguf", (58, 25, 25)), ("compressed-tensors", (2, 1)),):
+            qm, base = args
+            cur = partition_units(68, list(base))
+            lines = D.speed_advisory_lines(D._QWEN38_27B, qm, base, cur, 68, None)
+            self.assertEqual(len(lines), 1)
+            self.assertIn("No speed table", lines[0])
+        other = dict(D._QWEN38_27B, hidden_size=4096)
+        lines = D.speed_advisory_lines(other, "compressed-tensors", (58, 25, 25),
+                                       partition_units(1088, [58, 25, 25]), 1088, None)
+        self.assertIn("No speed table", lines[0])
+
+    def test_predicate_rank_uniform(self):
+        self.assertTrue(D.uneven_dcp_token_split(3, 3, True, False))
+        self.assertTrue(D.uneven_dcp_token_split(3, 3, False, True))
+        self.assertFalse(D.uneven_dcp_token_split(1, 3, True, True))   # no DCP: old KV hint stays
+        self.assertFalse(D.uneven_dcp_token_split(3, 3, False, False))
+        self.assertFalse(D.uneven_dcp_token_split(1, 1, True, True))
+
+    def test_quant_method_of(self):
+        class Cfg:
+            quantization_config = {"quant_method": "modelopt"}
+        self.assertEqual(D.quant_method_of(Cfg()), "modelopt")
+        self.assertEqual(D.quant_method_of(Cfg(), "gguf"), "gguf")
+
+    def test_runner_branch_skips_kv_hint_collective(self):
+        """The mixin under uneven DCP: speed table on rank 0, True on every rank,
+        never the all_gather of the KV hint; without DCP it falls through."""
+        import types
+        from sglang.srt.distributed import utils as U
+        from sglang.srt.model_executor import model_runner_kv_cache_mixin as M
+
+        class Lin(torch.nn.Module):
+            tp_family, tp_units = "mlp", 1088
+
+        model = torch.nn.Sequential(Lin())
+        sa = types.SimpleNamespace(uneven_dcp=True, quantization=None,
+                                   uneven_memory_budgets_active=lambda: True)
+        mc = types.SimpleNamespace(hf_text_config=dict(D._QWEN38_27B),
+                                   hf_config=types.SimpleNamespace(
+                                       quantization_config={"quant_method": "compressed-tensors"}))
+        logged = []
+        orig_info = M.logger.info
+        M.logger.info = lambda msg, *a: logged.append(msg % a if a else msg)
+        try:
+            with U.scoped_tp_partition_ratios([58, 25, 25]):
+                for rank in (0, 1):
+                    r = types.SimpleNamespace(server_args=sa, dcp_size=3, tp_size=3, tp_rank=rank,
+                                              is_draft_worker=False, model=model, model_config=mc)
+                    self.assertTrue(M._dcp_speed_advisory(r))
+                nodcp = types.SimpleNamespace(server_args=sa, dcp_size=1, tp_size=3, tp_rank=0,
+                                              is_draft_worker=False, model=model, model_config=mc)
+                self.assertFalse(M._dcp_speed_advisory(nodcp))
+        finally:
+            M.logger.info = orig_info
+        self.assertTrue(any("D-SPEED decode-bs1-32k" in x for x in logged))
+        self.assertEqual(sum("KV sum is conserved" in x for x in logged), 1)   # rank 0 only
+
+
 if __name__ == "__main__":
     unittest.main()

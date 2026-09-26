@@ -678,3 +678,142 @@ def plan_lines(spec: ReshardSpec, fmt: str, loads: Sequence[LoadClass]) -> List[
     out.append(f"D-RESHARD kv spread_MiB={[round(x / 2**20) for x in sp]} capacity={caps} "
                f"(sum {sum(caps)}, rc9 sum {sum(RC9_KV_CAPACITY[fmt])})")
     return out
+
+
+# ---------------------------------------------------------------------------
+# Server advisory under uneven DCP (operator/user 26.09. ~09:35Z)
+# ---------------------------------------------------------------------------
+#
+# The old hint ``uneven TP: restart with SGLANG_UNEVEN_MLP_VECTOR=... to raise
+# the KV pool from X to ~Y`` (model_executor/model_runner_kv_cache_mixin.py
+# ``_maybe_suggest_mlp_rebalance`` -> distributed/utils.py
+# ``suggest_unit_rebalance_multi``) maximises the MIN-synced local capacity --
+# the pool of uneven TP WITHOUT a token split.  Under uneven DCP the token
+# vector follows each card's capacity and the KV cell is the same on every rank
+# (all kv heads, owned tokens), so moving MLP units conserves the SUM of the
+# capacities (the solver's own ceiling note says so) and only moves WHERE the KV
+# lives.  There is no maxkv objective left, only speed optima: this table.
+
+#: formats with a D cost model; 'fp8' borrows INT8's constants (same 1 B/param,
+#: sm86 runs it as W8A16 Marlin: labelled BORROWED on every line).
+ADVISORY_FORMATS = {"compressed-tensors": "int8", "modelopt": "nvfp4", "modelopt_fp4": "nvfp4",
+                    "fp8": "fp8"}
+ADVISORY_BS = (1, 2, 4, 6)
+ADVISORY_CTX = (2048, 32768, 131072)
+ADVISORY_SHARES = tuple(x / 100.0 for x in range(40, 96))
+#: the D time mix the one-preset 'wake' vector is optimised over (sec. 1.3:
+#: dkr27bbar1final09260145 agent boot, TP0 gpu-ms by class)
+ADVISORY_MIX = ((LoadClass("decode", 1, 32768), 0.887), (LoadClass("decode", 2, 32768), 0.021),
+                (LoadClass("decode", 4, 32768), 0.015), (LoadClass("prefill", 1, 4096), 0.077))
+
+
+def advisory_format(quant_method: Optional[str]) -> Optional[str]:
+    return ADVISORY_FORMATS.get(str(quant_method or "").strip().lower())
+
+
+def advisory_geometry(text_cfg: Mapping, fmt: str, mlp_units: int) -> DGeometry:
+    bpp = {"int8": 1.0, "nvfp4": 0.5625, "fp8": 1.0}[fmt]
+    return DGeometry.from_config(text_cfg, mlp_units=mlp_units, linear_bpp=bpp, draft_bpp=bpp)
+
+
+def advisory_calib(fmt: str) -> DCalib:
+    return rc9_calib("int8" if fmt == "fp8" else fmt)
+
+
+def _share_vectors(geom: DGeometry, n: int) -> List[Tuple[int, ...]]:
+    seen, out = set(), []
+    for s in ADVISORY_SHARES:
+        v = mlp_vector_for_share(geom, s, n)
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def best_static_mlp(geom: DGeometry, cal: DCalib, base: Sequence[int], ts: Sequence[float],
+                    mix=ADVISORY_MIX) -> Tuple[int, ...]:
+    """The one MLP vector a single-preset --d-reshard wake takes: minimal
+    time-weighted cost over the D mix (same grid as the table)."""
+    best = None
+    for v in _share_vectors(geom, len(base)):
+        vec = Vector(tuple(base), v)
+        c = sum(w * round_ms(geom, cal, vec, ld, ts) / round_ms(geom, cal, Vector(tuple(base)), ld, ts)
+                for ld, w in mix)
+        if best is None or c < best[0] - 1e-12:
+            best = (c, v)
+    return best[1]
+
+
+def speed_advisory_lines(text_cfg: Mapping, quant_method: Optional[str], base: Sequence[int],
+                         current_mlp: Sequence[int], mlp_units: int,
+                         token_vector: Optional[Sequence[int]]) -> List[str]:
+    """The uneven-DCP replacement of the KV restart hint: per load class the
+    speed-optimal MLP unit vector, its predicted gain against the RUNNING vector,
+    and the vector --d-reshard wake would take.  Never raises for an unmodelled
+    boot: it says why there is no table instead (one line)."""
+    n = len(base)
+    head = "uneven DCP: KV sum is conserved when MLP units move (token vector follows capacity)"
+    fmt = advisory_format(quant_method)
+    why = None
+    if fmt is None:
+        why = f"no D cost model for quant method {quant_method!r} (calibrated: INT8, NVFP4; FP8 borrowed)"
+    elif n != 3:
+        why = f"cost model is calibrated for TP=3 (5090 + 2x3080), this group has {n} ranks"
+    else:
+        try:
+            geom = advisory_geometry(text_cfg, fmt, mlp_units)
+        except (KeyError, TypeError, ValueError) as exc:
+            geom, why = None, f"config is not a Qwen3.5/3.8 dense hybrid ({exc!r})"
+        if geom is not None and (geom.hidden, geom.layers, geom.inter) != (5120, 64, 17408):
+            why = (f"cost model is calibrated for the Qwen3.8-27B geometry, this model is "
+                   f"hidden={geom.hidden} layers={geom.layers} inter={geom.inter}")
+    if why is not None:
+        return [f"{head}; the old 'restart with SGLANG_UNEVEN_MLP_VECTOR' KV hint does not apply. "
+                f"No speed table: {why}."]
+    cal = advisory_calib(fmt)
+    ts = token_share(token_vector) if token_vector and len(token_vector) == n else (1.0 / n,) * n
+    cur = Vector(tuple(base), tuple(int(u) for u in current_mlp))
+    wake = best_static_mlp(geom, cal, base, ts)
+    tag = " BORROWED(INT8 constants)" if fmt == "fp8" else ""
+    lines = [f"{head}; the old 'restart with SGLANG_UNEVEN_MLP_VECTOR' KV hint does not apply. "
+             f"D speed optima (HOCHRECHNUNG, weg2/d_reshard, fmt={fmt}{tag}, base={','.join(map(str, base))}, "
+             f"running mlp={','.join(map(str, current_mlp))}, --d-reshard wake takes "
+             f"mlp={','.join(map(str, wake))}):"]
+    loads = [LoadClass("decode", b, c) for b in ADVISORY_BS for c in ADVISORY_CTX] + [LoadClass("prefill", 1, 4096)]
+    vecs = _share_vectors(geom, n)
+    for ld in loads:
+        t_cur = round_ms(geom, cal, cur, ld, ts)
+        t_best, v_best = min((round_ms(geom, cal, Vector(tuple(base), v), ld, ts), v) for v in vecs)
+        t_wake = round_ms(geom, cal, Vector(tuple(base), wake), ld, ts)
+        lines.append(f"  D-SPEED {ld.key():16s} mlp={','.join(map(str, v_best)):14s} "
+                     f"gain={100.0 * (t_cur - t_best) / t_cur:+5.1f}% (wake mlp {100.0 * (t_cur - t_wake) / t_cur:+5.1f}%) "
+                     f"ms {t_cur:.1f}->{t_best:.1f}")
+    return lines
+
+
+def quant_method_of(hf_config, override: Optional[str] = None) -> Optional[str]:
+    """--quantization if set, else quantization_config.quant_method (dict or object,
+    top level or text_config)."""
+    if override:
+        return str(override)
+    for holder in (hf_config, getattr(hf_config, "text_config", None)):
+        qc = getattr(holder, "quantization_config", None) if holder is not None else None
+        if isinstance(qc, Mapping) and qc.get("quant_method"):
+            return str(qc["quant_method"])
+        if qc is not None and getattr(qc, "quant_method", None):
+            return str(qc.quant_method)
+    return None
+
+
+def config_dict(cfg) -> Mapping:
+    if isinstance(cfg, Mapping):
+        return cfg
+    to_dict = getattr(cfg, "to_dict", None)
+    return to_dict() if callable(to_dict) else dict(vars(cfg))
+
+
+def uneven_dcp_token_split(dcp_size: int, tp_size: int, uneven_dcp_flag: bool, vector_active: bool) -> bool:
+    """The token split is (or will be) in force: DCP over the whole TP group and
+    either a non-uniform vector installed or --uneven-dcp requested.  Every input
+    is rank-uniform, so the KV hint's collective is skipped on all ranks or none."""
+    return int(tp_size) > 1 and int(dcp_size) == int(tp_size) and (bool(vector_active) or bool(uneven_dcp_flag))
