@@ -16,6 +16,24 @@ def _dense_repack_outside_pool_default() -> bool:
     return profile_switch_default("SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL", True)
 
 
+#: The 27B line's switch that armed its END-anchor hold (together with its
+#: inner-anchor release, 479f6eccb0/c255e10ddb; the release half is the 27B
+#: mamba-anchor policy and comes with the profile field ``mamba_anchor``).
+_MAMBA_CARRIER_HOLD_27B_ALIAS = "SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE"
+
+
+def _mamba_carrier_hold_default() -> bool:
+    """UNIFY S2: SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD's default when unset --
+    the 27B alias if set (``1/true/yes/on`` = hold, as on the 27B line), else
+    the profile's default (weg2/form.py), else True (the NF line's default)."""
+    raw = os.environ.get(_MAMBA_CARRIER_HOLD_27B_ALIAS)
+    if raw is not None and raw.strip():
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    from sglang.srt.weg2.form import profile_switch_default
+
+    return profile_switch_default("SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD", True)
+
+
 @functools.lru_cache(maxsize=1)
 def _default_hip() -> bool:
     """Lazy ROCm/HIP detection for platform-conditional env defaults.
@@ -736,7 +754,11 @@ class Envs:
     # referenced across D's phase and are released at P's next wake, so no
     # claim D makes can drop a hand-over anchor D has not read yet. False =
     # the end anchors are released with the rest at the reset (the 27B A form).
-    SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD = EnvBool(True)
+    # UNIFY S2: default per profile (weg2/form.py PROFILE_SWITCH_DEFAULTS:
+    # qwen27b False, nextflash True), and the 27B line's switch
+    # SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE (which armed its hold, 27B arms =1)
+    # is read as its alias -- see _mamba_carrier_hold_default.
+    SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD = EnvBool(_mamba_carrier_hold_default)
     # LANE_PARALLEL_COPY (H22, fnFL2x127/x132): a BAR1 deposit lane writes into
     # the peer's window as REGISTERED HOST memory, so cudaMemcpyAsync makes
     # every deposit copy a D2H on the card's ONE D2H copy engine

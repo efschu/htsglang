@@ -107,9 +107,18 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL (H39): the 27B line shipped the port
 #: 3c9bfeff95 default OFF, the NF line d6b7d4a1d3 default ON -- each kept until a
 #: measurement of that model says otherwise (27B arms set 1 explicitly since xsn426).
+#: SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD (H81): the 27B line armed its END-anchor
+#: hold only with SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE=1 (default off, read as
+#: an alias in environ.py), the NF line holds by default.
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, bool]] = {
-    PROFILE_QWEN27B: {"SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL": False},
-    PROFILE_NEXTFLASH: {"SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL": True},
+    PROFILE_QWEN27B: {
+        "SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL": False,
+        "SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD": False,
+    },
+    PROFILE_NEXTFLASH: {
+        "SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL": True,
+        "SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD": True,
+    },
 }
 
 #: Checkpoint config keys that name routed experts (top level or text_config).
