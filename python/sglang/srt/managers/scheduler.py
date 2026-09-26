@@ -13150,6 +13150,16 @@ class Scheduler(
             release_pins = getattr(self.tree_cache, "release_acked_anchor_pins", None)
             if release_pins is not None and self.running_batch is not None:
                 release_pins(self.running_batch.reqs)
+            # 24c --d-kv-evict-for-placement (weg2/d_kv_evict.py, DYN_D_RESHARD
+            # sec. 14): cold, L2-backed radix leaves leave the device so the
+            # bandwidth placement keeps its shares. Here because every rank
+            # reaches this point each iteration (the storage-drain agreement
+            # above, the #580 prefetch collectives below); a dict lookup when
+            # SGLANG_WEG2_D_KV_EVICT is absent.
+            if self.__dict__.get("_weg2_d_kv_evictor", True) is not None:
+                from sglang.srt.weg2.d_kv_evict import scheduler_step as _d_kv_evict_step
+
+                _d_kv_evict_step(self)
 
         # #580: rank-uniform entry into the prefetch-progress collectives.
         # MUST stay above every early return and every loop exit below -- all
