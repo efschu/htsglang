@@ -18241,34 +18241,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             bool(getattr(ns, "weg2_xchg_census_foreign", False)))
         if _census_line:
             log(_census_line)
-        _xr, _ = xchg_form_dormant_reserve(cards, ns.weg2_xchg_census, log=log)
-        # Die Census-Messung ersetzt die Konstante auch im BUDGET von P
-        # (`budgets_from_dc` zieht dc_expect_d ab) und im W19-Riegel -- EINE
-        # Zahl je Karte, nicht Messung im Log und Konstante in der Rechnung.
-        # fnFL2x111 (24.09.): die Census-Zeile stammt aus Boot fnFL2x86 (1896 MiB
-        # auf der 5090), der #1444-Record des VORIGEN Boots (x110) mass 1950 und
-        # preiste 1950+256+64 = 2270. Diese Schleife ueberschrieb den Record mit
-        # der aelteren Census (1896+64 = 1960); mit P-Chunk 8192 hielt D-TP0 beim
-        # ersten Sleep 2000 MiB (torch_reserved +50 MiB) -> W19 vor dem ersten
-        # Flip. Eine aeltere Census unterbietet keine neuere Messung derselben
-        # Form: je Karte gewinnt die GROESSERE der beiden gepreisten Reserven,
-        # und die Zeile darunter nennt, welche.
-        _won: List[str] = []
-        for c in cards:
-            if c.uuid in _xr:
-                _census_reserve = int(_xr[c.uuid]) + slack_mib
-                _record_reserve = int(dc_expect_d[c.uuid]) if _dc_from_record is not None else 0
-                if _record_reserve > _census_reserve:
-                    dc_expect_d[c.uuid] = _record_reserve
-                    _won.append(f"nvml{c.nvml_index}=record({_record_reserve})>census({_census_reserve})")
-                else:
-                    dc_expect_d[c.uuid] = _census_reserve
-                    _won.append(f"nvml{c.nvml_index}=census({_census_reserve})>=record({_record_reserve})")
-        state.dc_expect_d = dc_expect_d
-        log("dormant residue RESERVE for group D (census-korrigiert, neuere Messung "
-            "unterbietet die aeltere nicht): "
-            + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}"
-                        for c in cards) + " -- " + ", ".join(_won))
+        _xr, _ = xchg_form_dormant_reserve(cards, ns.weg2_xchg_census, log=log, profile=ns.profile)
+        # UNIFY redfix: only on the profile whose census IS the reserve
+        # (xchg_census_is_reserve: Next Flash, cb1575e94e). The 27B line keeps
+        # dc_expect_d as priced above (record, else the weg2xsn14 constant);
+        # its census is only reported (the line just printed).
+        if xchg_census_is_reserve(ns.profile):
+            # Die Census-Messung ersetzt die Konstante auch im BUDGET von P
+            # (`budgets_from_dc` zieht dc_expect_d ab) und im W19-Riegel -- EINE
+            # Zahl je Karte, nicht Messung im Log und Konstante in der Rechnung.
+            # fnFL2x111 (24.09.): die Census-Zeile stammt aus Boot fnFL2x86 (1896 MiB
+            # auf der 5090), der #1444-Record des VORIGEN Boots (x110) mass 1950 und
+            # preiste 1950+256+64 = 2270. Diese Schleife ueberschrieb den Record mit
+            # der aelteren Census (1896+64 = 1960); mit P-Chunk 8192 hielt D-TP0 beim
+            # ersten Sleep 2000 MiB (torch_reserved +50 MiB) -> W19 vor dem ersten
+            # Flip. Eine aeltere Census unterbietet keine neuere Messung derselben
+            # Form: je Karte gewinnt die GROESSERE der beiden gepreisten Reserven,
+            # und die Zeile darunter nennt, welche.
+            _won: List[str] = []
+            for c in cards:
+                if c.uuid in _xr:
+                    _census_reserve = int(_xr[c.uuid]) + slack_mib
+                    _record_reserve = int(dc_expect_d[c.uuid]) if _dc_from_record is not None else 0
+                    if _record_reserve > _census_reserve:
+                        dc_expect_d[c.uuid] = _record_reserve
+                        _won.append(f"nvml{c.nvml_index}=record({_record_reserve})>census({_census_reserve})")
+                    else:
+                        dc_expect_d[c.uuid] = _census_reserve
+                        _won.append(f"nvml{c.nvml_index}=census({_census_reserve})>=record({_record_reserve})")
+            state.dc_expect_d = dc_expect_d
+            log("dormant residue RESERVE for group D (census-korrigiert, neuere Messung "
+                "unterbietet die aeltere nicht): "
+                + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}"
+                            for c in cards) + " -- " + ", ".join(_won))
     # #1257c: the operator's external headroom, resolved ONCE per boot and
     # keyed by CARD UUID -- never by NVML index, which is not stable across
     # boots on this rig. Everything downstream (both budget solves, the
@@ -20142,11 +20147,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 #: replaced the subtraction.
 
 
+def xchg_census_is_reserve(profile: Optional[str]) -> bool:
+    """Does ``profile``'s exchange-form census REPLACE the group-D constant?
+
+    The registry row decides (``ModelProfile.d_residue_census``): Next Flash
+    yes (cb1575e94e), the 27B no -- its line keeps the weg2xsn14 constant.
+    No/unknown profile = the launcher default (``--profile`` qwen27b)."""
+    row = weg2_form.profile_row(profile or weg2_form.DEFAULT_PROFILE)
+    return bool(getattr(row, "d_residue_census", False))
+
+
 def xchg_form_dormant_reserve(
     cards: List[Card],
     census_path: str,
     *,
     log: Optional[Log] = None,
+    profile: Optional[str] = None,
 ) -> Tuple[Dict[str, int], List[str]]:
     """``({uuid: the reserve W19 grades against}, printed lines)``.
 
@@ -20194,6 +20210,7 @@ def xchg_form_dormant_reserve(
     census = xchg_residency.load_census(census_path)
     out: Dict[str, int] = {}
     lines: List[str] = []
+    census_rules = xchg_census_is_reserve(profile)
     for c in cards:
         entry = census.cards.get(c.uuid)
         if entry is None:
@@ -20212,6 +20229,21 @@ def xchg_form_dormant_reserve(
         # sie P 1203 MiB auf der 5090 und 1114-1512 MiB je 3080. Die Konstante
         # bleibt nur, wo keine Census-Zeile existiert.
         _measured = int(getattr(entry, "dormant_proc_used_mib", 0) or 0)
+        if not census_rules:
+            # THE 27B LINE (bfc6bd87e2 form, byte-identical line): THE ONE
+            # SELECTOR, never a second copy of the triple -- this is the number
+            # W19 grades against, read where every other consumer reads it.
+            out[c.uuid] = dc_measured_d_mib(c, WEIGHT_SOURCE_EXCHANGE)
+            lines.append(
+                f"WEG2-XCHG-RESERVE nvml{c.nvml_index} {c.name} "
+                f"reserved_mib={out[c.uuid]} source=measured:weg2xsn14 "
+                f"measured_mib={int(entry.dormant_proc_used_mib)} "
+                f"instrument=WEG2-DC-at-sleep "
+                f"delta_mib={out[c.uuid] - int(entry.dormant_proc_used_mib)} "
+                f"delta_is=resident-weights_draft-tag-until-B4k "
+                f"census_source={entry.dormant_source[:120]}"
+            )
+            continue
         if _measured > 0:
             out[c.uuid] = _measured
             _src = f"census:{entry.dormant_source[:60]}"
