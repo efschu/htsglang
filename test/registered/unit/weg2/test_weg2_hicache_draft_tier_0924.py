@@ -187,8 +187,10 @@ def test_the_ledger_prices_no_draft_arena_when_off(monkeypatch, caplog):
     monkeypatch.setenv("SGLANG_HICACHE_ARENA_GIB", "22")
     monkeypatch.setenv("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "112")
     caplog.set_level(logging.INFO, logger="weg2.launcher")
+    # UNIFY S6: a DFLASH producer that COMPUTES (--dflash-produce-on-p on);
+    # under the 27B standard form cold it writes no pages and gets no arena.
     L.apply_spec_form(SimpleNamespace(spec_form="DFLASH", dflash_draft_path=DRAFT, dflash_block=8,
-                                      dflash_window=2048))
+                                      dflash_window=2048, dflash_produce_on_p="on"))
     L._SPEC_FORM["draft_kv_on_p"] = True
     on = L._weg2_arena_ledger_terms(MODEL)["arena_gib"]
     L._SPEC_FORM["draft_kv_on_p"] = False
