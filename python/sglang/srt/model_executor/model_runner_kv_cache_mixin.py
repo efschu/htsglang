@@ -389,6 +389,16 @@ def prefill_transient_mib_for_rank(text: str, rank: int) -> float:
 
 
 
+def _attn_head_split_post_mib(runner) -> float:
+    """AH post for this rank, MiB; 0.0 when --p-attn-head-split is off."""
+    from sglang.srt.weg2 import attn_head_split as _ah
+
+    cfg = _ah.config_from_env()
+    if cfg is None or getattr(runner, "is_draft_worker", False):
+        return 0.0
+    return float(_ah.stage_post_mib(cfg, int(getattr(runner, "pp_rank", 0) or 0)))
+
+
 def _replayssm_spec_for(runner) -> bool:
     """27B ReplaySSM package (S2): the spec ring is ported for GDN only.
 
@@ -1063,6 +1073,16 @@ class ModelRunnerKVCacheMixin:
             if _graph_pool_gb > 0.0:
                 rest_memory -= _graph_pool_gb
                 budget_posts.append(("prefill graph pool", _graph_pool_gb))
+            # AH, --p-attn-head-split (weg2/attn_head_split.py): the helper's
+            # position-indexed KV mirror + workspace, the owner's subset
+            # workspace and one layer's messages. Allocated AFTER this sizing
+            # (install() runs after the attention backend), so the pool must
+            # leave the bytes. ONE function prices it for this post and for
+            # the planner (PhasePoolModel.attn_head_split_mib). Env unset = 0.
+            _ah_gb = _attn_head_split_post_mib(self) / 1024.0
+            if _ah_gb > 0.0:
+                rest_memory -= _ah_gb
+                budget_posts.append(("attention head-split mirror", _ah_gb))
             # #260: the budget is ABSOLUTE, so a co-resident process must
             # never shrink it -- but it does bound what this rank can
             # physically allocate. That bound gets its own check and its own

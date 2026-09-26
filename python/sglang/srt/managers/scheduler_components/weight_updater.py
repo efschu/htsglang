@@ -8602,6 +8602,13 @@ class SchedulerWeightUpdaterManager:
                 _pls.on_sleep()
                 logger.info("%s", _pls.census_line())
             self.flush_cache(zero_kv=False)
+            # AH (--p-attn-head-split): the helper mirror lives in this region;
+            # reset the split rule and drain the helper before it is unmapped,
+            # so no request ever continues on a mirror from before the flip.
+            from sglang.srt.weg2 import attn_head_split as _ah_split
+
+            if _ah_split.runtime() is not None:
+                _ah_split.runtime().on_kv_release()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             if _pls is not None and _pls.modules:
                 # the swing weights sleep with the KV pool (their own tag,

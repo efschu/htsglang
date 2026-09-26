@@ -3239,6 +3239,17 @@ class PhasePoolModel:
     #: the model unchanged.
     swing_layers_by_stage: Tuple[Tuple[int, int], ...] = ()
 
+    #: The runtime's `attention head-split mirror` post, MiB PER STAGE (27B,
+    #: --p-attn-head-split, weg2/attn_head_split.py). The helper stage holds a
+    #: position-indexed fp8 KV mirror of the delegated kv groups
+    #: (2 x cap x G x head_dim per delegated layer) plus its flashinfer
+    #: workspace; an owner stage its subset wrapper and one layer's messages.
+    #: Priced by ``attn_head_split.stage_post_vector`` -- the SAME function the
+    #: rank books with. Cut-invariant (it depends on the spec, not on how many
+    #: layers a stage holds). Empty = the switch is off and the runtime books
+    #: nothing -- a legitimate zero, so it is not in :attr:`unfunded_posts`.
+    attn_head_split_mib: Tuple[float, ...] = ()
+
     #: The runtime's post NAMES, in the runtime's own order, mapped to the field
     #: that funds each (#1286 F2/F3). This is the model's statement of WHICH
     #: list it mirrors, and ``test_pp_cut_boot_sizing_1286`` scans
@@ -3252,6 +3263,8 @@ class PhasePoolModel:
         # Booked right after the holdback (model_runner_kv_cache_mixin, the
         # absolute-budget branch), only under --p-prefill-graph.
         ("prefill graph pool", "prefill_graph_pool_mib"),
+        # Booked right after it, only under --p-attn-head-split.
+        ("attention head-split mirror", "attn_head_split_mib"),
         ("mamba state pool", "mamba_mib_per_linear_layer_per_slot"),
         ("speculative intermediate state", "speculative_intermediate_mib"),
         ("prefill activation reserve", "activation_reserve_mib"),
@@ -4026,6 +4039,7 @@ def _stage_free_after_residency(
           - speculative intermediate st. (speculative_intermediate_mib)
           - prefill activation reserve   (activation_reserve_mib)
           - prefill graph pool           (prefill_graph_pool_mib[r]; empty = off)
+          - attention head-split mirror  (attn_head_split_mib[r]; empty = off)
           - mamba pre-capture reserve    (mamba_precapture_reserve_mib)
           = rest, which the sizer then divides by the cell.
 
@@ -4058,6 +4072,15 @@ def _stage_free_after_residency(
             "inputs of the captured body differ) and cannot be broadcast."
         )
     swing = tuple(getattr(model, "swing_layers_by_stage", ()) or ())
+    ah_split = tuple(
+        float(x) for x in getattr(model, "attn_head_split_mib", ()) or ()
+    )
+    if ah_split and len(ah_split) != len(list(counts)):
+        raise ValueError(
+            f"attn_head_split_mib has {len(ah_split)} entries for "
+            f"{len(list(counts))} stages; it is a PER-STAGE post (the mirror "
+            "sits on the helper stage only) and cannot be broadcast."
+        )
     for r, (n, a) in enumerate(zip(counts, attn_counts)):
         if swing:
             # the swing slab: its layers cost weights and mamba like owned ones
@@ -4080,6 +4103,7 @@ def _stage_free_after_residency(
             - float(model.speculative_intermediate_mib)
             - float(model.activation_reserve_mib)
             - (graph_pool[r] if graph_pool else 0.0)
+            - (ah_split[r] if ah_split else 0.0)
             - float(model.mamba_precapture_reserve_mib)
         )
     return tuple(out)

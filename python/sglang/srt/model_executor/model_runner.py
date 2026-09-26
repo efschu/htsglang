@@ -1475,6 +1475,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
+            # AH, --p-attn-head-split (weg2/attn_head_split.py): after the
+            # backend (the owner plans a subset wrapper on it) and after the
+            # pool sizing that booked its post. No-op when the env is unset.
+            from sglang.srt.weg2 import attn_head_split as _ah_split
+
+            _ah_split.install(self)
         elif self.device in ["cpu", "xpu"]:
             self.init_attention_backend()
         elif self.device == "npu":
@@ -4886,6 +4892,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
+        # AH, --p-attn-head-split: ONE split decision per forward, taken here
+        # (the funnel every forward passes, graph or eager) so every P rank
+        # runs the rule on the same sequence. None = off (the default).
+        _ah_rt = getattr(self, "_ah_runtime", None)
+        if _ah_rt is not None:
+            _ah_rt.on_forward(forward_batch)
 
         # #631: DOES THIS HIDDEN STATE BELONG TO THIS BATCH?
         #
