@@ -1206,6 +1206,111 @@ def p_chunk_policy_lines() -> List[str]:
     return out
 
 
+#: --d-reshard (27B, user order 26.09. ~08:40Z/08:45Z: dynamic D resharding per
+#: load class, "nur auf TP1<, nicht fuers nf"). Rule and model live in
+#: weg2/d_reshard.py (pure); design/evidence /spinning/gpu-arb/docs/DYN_D_RESHARD.md.
+#: 'off' (default) changes NOTHING: no env, no line, D argv byte-identical.
+#: 'wake' with ONE preset is the static MLP family vector (--rank-mlp-ratio on
+#: group D; the flip plan reads the loaders' own widths, xchg_manifest.family_ratios)
+#: and needs no executor. 'wake' with >= 2 presets and 'live' print the spec and
+#: the desk plan, then REFUSE: the rank-side executor (per-preset MLP views, graph
+#: sets, per-preset manifest rows, the planner's spread posten) is not wired.
+#: Any profile other than qwen27b (NF Form A) is refused, never ignored.
+D_RESHARD_DEFAULT = "off"
+D_RESHARD_DRY_RUN_LOADS = (("decode", 1, 32768), ("decode", 4, 32768), ("decode", 1, 131072),
+                           ("prefill", 1, 4096))
+_D_RESHARD: Dict[str, object] = {"policy": D_RESHARD_DEFAULT, "spec": None, "lines": ()}
+
+
+def d_reshard_format(model_path: str) -> str:
+    """'int8' | 'nvfp4' | '' -- the checkpoint formats the D model is calibrated for."""
+    qm = checkpoint_quant_method(str(model_path))
+    if qm == "compressed-tensors":
+        return "int8"
+    if qm == "modelopt":
+        return "nvfp4"
+    return ""
+
+
+def apply_d_reshard(ns) -> None:
+    """Install --d-reshard once, before any argv is built."""
+    from sglang.srt.weg2 import d_reshard as _dr
+
+    policy = str(getattr(ns, "d_reshard", D_RESHARD_DEFAULT) or D_RESHARD_DEFAULT)
+    if policy not in _dr.POLICIES:
+        raise SystemExit(f"--d-reshard {policy!r}: one of {list(_dr.POLICIES)}")
+    _D_RESHARD.update(policy=policy, spec=None, lines=())
+    if policy == _dr.POLICY_OFF:
+        return
+    model = str(getattr(ns, "model", "") or "")
+    try:
+        with open(model_config_path(model)) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"--d-reshard {policy}: cannot read the model config of {model!r}: {exc}")
+    try:
+        _dr.check_profile(_dr.profile_of_config(cfg), policy)
+    except _dr.ReshardProfileRefused as exc:
+        raise SystemExit(str(exc))
+    fmt = d_reshard_format(model)
+    if fmt not in ("int8", "nvfp4"):
+        raise SystemExit(f"--d-reshard {policy}: REFUSED -- no D cost model for checkpoint format "
+                         f"{checkpoint_quant_method(model)!r} (calibrated: INT8 compressed-tensors, "
+                         f"NVFP4 modelopt; DYN_D_RESHARD.md sec. 1)")
+    try:
+        presets = _dr.parse_presets(str(getattr(ns, "d_reshard_presets", "auto") or "auto"), fmt)
+        spec = _dr.ReshardSpec(policy, tuple(_dr.RC9_BASE), presets, presets[0].name,
+                               float(getattr(ns, "d_reshard_min_gain", _dr.DEFAULT_MIN_GAIN)), fmt)
+        spec.validate(_dr.rc9_geometry(fmt))
+    except _dr.ReshardError as exc:
+        raise SystemExit(f"--d-reshard {policy}: {exc}")
+    loads = [_dr.LoadClass(k, b, c) for k, b, c in D_RESHARD_DRY_RUN_LOADS]
+    lines = ["WEG2 " + _dr.armed_line(spec, "group=D")]
+    lines += ["WEG2 " + x + " (HOCHRECHNUNG on the model, not a measurement)"
+              for x in _dr.plan_lines(spec, fmt, loads)]
+    if policy == _dr.POLICY_LIVE:
+        raise SystemExit("\n".join(lines) + "\n--d-reshard live: REFUSED -- a live switch moves the "
+                         "MLP units over BAR1 (~0.2-0.3 s each way) for at most 33 ms (INT8) / 111 ms "
+                         "(NVFP4) per 4096-token D-prefill chunk, and D prefills at most 3 chunks under "
+                         "the X ceiling (DYN_D_RESHARD.md sec. 2.4).")
+    if len(spec.presets) > 1:
+        raise SystemExit("\n".join(lines) + "\n--d-reshard wake: REFUSED -- more than one preset "
+                         "needs the rank-side executor (per-preset MLP views, graph sets, manifest "
+                         "rows, spread posten), which is not wired (DYN_D_RESHARD.md sec. 7).")
+    _D_RESHARD.update(spec=spec, lines=tuple(lines))
+
+
+def d_reshard_lines() -> Tuple[str, ...]:
+    return tuple(_D_RESHARD.get("lines") or ())
+
+
+def d_reshard_argv(d_ratio_flags: Sequence[str], extra_d: Sequence[str]) -> List[str]:
+    """Group D's extra argv: [] under 'off'; under a single-preset 'wake' the MLP
+    family vector. Refuses a base vector the presets were not built for, and a
+    hand-written --rank-mlp-ratio next to it (two authors of one vector)."""
+    spec = _D_RESHARD.get("spec")
+    if spec is None:
+        return []
+    flags = list(d_ratio_flags)
+    base = ",".join(str(x) for x in spec.base)
+    if "--rank-tp-ratio" not in flags or flags[flags.index("--rank-tp-ratio") + 1] != base:
+        raise SystemExit(f"--d-reshard {spec.policy}: REFUSED -- group D's weight vector is "
+                         f"{flags} but the presets are built on --rank-tp-ratio {base}")
+    if any(str(a).startswith("--rank-mlp-ratio") for a in extra_d):
+        raise SystemExit("--d-reshard: REFUSED -- --extra-d already carries --rank-mlp-ratio")
+    return ["--rank-mlp-ratio", ",".join(str(u) for u in spec.presets[0].mlp)]
+
+
+def d_reshard_env() -> Dict[str, str]:
+    """Group D's environment for the reshard; {} under 'off'."""
+    from sglang.srt.weg2 import d_reshard as _dr
+
+    spec = _D_RESHARD.get("spec")
+    if spec is None:
+        return {}
+    return {_dr.POLICY_ENV: spec.policy, _dr.SPEC_ENV: spec.to_json()}
+
+
 def spec_form_is_dflash() -> bool:
     return str(_SPEC_FORM["form"]) == "DFLASH"
 
@@ -12127,6 +12232,24 @@ def build_parser() -> argparse.ArgumentParser:
              "... capture_mib='. Changes P's form key (chunk + graph config "
              "are device allocations). User goal: 512.")
     ap.add_argument(
+        "--d-reshard", choices=["off", "wake", "live"], default=D_RESHARD_DEFAULT,
+        help="Group D weight shards per load class (27B TP>1 uneven TP + uneven DCP only; "
+             "weg2/d_reshard.py, DYN_D_RESHARD.md). 'off' (default) = today, argv and env "
+             "byte-identical. 'wake' = the MLP family vector is chosen from "
+             "--d-reshard-presets at each P->D wake; with ONE preset that is the static "
+             "--rank-mlp-ratio on group D (bootable), with more the boot is refused until the "
+             "executor is wired. 'live' = refused (switch costs more than it gains). Refused "
+             "for the NF profile (Form A has no shard vector).")
+    ap.add_argument(
+        "--d-reshard-presets", default="auto", metavar="SPEC",
+        help="Only with --d-reshard wake: 'auto' (= dec), desk names 'dec,pf,rc9', or "
+             "explicit MLP unit vectors 'name=u0:u1:u2;name2=...' (sum = the MLP units, "
+             "1088 INT8 / 136 NVFP4). The first preset is the boot preset.")
+    ap.add_argument(
+        "--d-reshard-min-gain", type=float, default=0.02, metavar="FRACTION",
+        help="Only with --d-reshard wake: a different preset is taken at a wake only when "
+             "predicted at least this much faster than the one in force (default 0.02).")
+    ap.add_argument(
         "--p-chunk-policy", choices=["fixed", "dynamic"], default=P_CHUNK_POLICY_DEFAULT,
         help="Group P prefill chunk width (27B and NF line, weg2/p_chunk_policy.py). "
              "'fixed' (the default for this release candidate) = today: every forward "
@@ -13357,6 +13480,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     apply_p_prefill_graph(ns)
     # --p-chunk-policy: after the graph (reads its buckets), before any argv.
     apply_p_chunk_policy(ns)
+    # --d-reshard: before any argv; 'off' installs nothing.
+    apply_d_reshard(ns)
     # 27B line G2: the one tokenizer both groups load, installed before any
     # argv is built; its line is logged with the checkpoint lines under 1a'.
     tokenizer_line = apply_tokenizer_path(ns)
@@ -13994,6 +14119,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # --p-chunk-policy: [] under 'fixed' (front log byte-identical).
     for _pcl in p_chunk_policy_lines():
         log(_pcl)
+    # --d-reshard: () under 'off' (front log byte-identical).
+    for _drl in d_reshard_lines():
+        log(_drl)
     if not hicache_disabled:
         log(hicache_draft_tier_line())
     # --d-replayssm-spec (27B ReplaySSM S6): D's verify form, both states named.
@@ -14797,7 +14925,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
         env_d.update(store_short_tail_env(x_tokens, x_d_riegel))  # RC7-X
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
+        env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -14898,7 +15027,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
     env_d.update(store_short_tail_env(x_tokens, x_d_riegel))  # RC7-X
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
+    env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
