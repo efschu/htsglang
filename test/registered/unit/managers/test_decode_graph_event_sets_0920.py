@@ -117,7 +117,8 @@ class H:
     def __init__(self, ring=2):
         self.st = State()
         self.be = Backend(self.st)
-        self.clock = CollectiveClock(backend=self.be, graph_ring=ring)
+        # Register #52: the ON (measuring) form; off is test_..._reader_switch_52.
+        self.clock = CollectiveClock(backend=self.be, graph_ring=ring, graph_nodes=True)
         self.graph = FakeGraph()
         self.be.binder = FakeBinder(self.graph, self.be.by_handle)
 

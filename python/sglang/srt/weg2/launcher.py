@@ -3214,6 +3214,31 @@ P_PREFILL_TRANSIENT_CALIBRATION_MODELS: Tuple[str, ...] = tuple(
 )
 
 
+#: H87: ``{model_key of this boot: (calibration model, why)}`` -- set ONCE by
+#: :func:`note_calibration_footprint_alias` in ``main`` when this boot's
+#: checkpoint is not a calibration model by NAME but is one by MEMORY FOOTPRINT
+#: (an abliterated derivative). Keyed by the boot's own model name, so a stale
+#: entry can never answer for another checkpoint. ``build_env`` sees only the
+#: form's model NAME, which is why the verdict is taken where the path is known.
+_CALIBRATION_FOOTPRINT_ALIAS: Dict[str, Tuple[str, str]] = {}
+
+
+def note_calibration_footprint_alias(model_path: str) -> Optional[str]:
+    """H87: record whether ``model_path`` is a footprint-identical derivative
+    of a #114/H41 calibration checkpoint; returns the printed line (or None)."""
+    name = weg2_form.model_key(model_path)
+    _CALIBRATION_FOOTPRINT_ALIAS.pop(name, None)
+    if not name or name in P_PREFILL_TRANSIENT_CALIBRATION_MODELS:
+        return None
+    for ref in P_PREFILL_TRANSIENT_CALIBRATION_MODELS:
+        ok, why = weg2_form.reference_model_verdict(model_path, ref)
+        if ok:
+            _CALIBRATION_FOOTPRINT_ALIAS[name] = (ref, why)
+            return (f"H87 CALIBRATION-IDENTITY {name} -> {ref} by memory footprint "
+                    f"({why}): the #114/H41 prefill transient measured on {ref} applies")
+    return None
+
+
 def p_prefill_transient_for(boot_form) -> Tuple[bool, str]:
     """``(publish?, provenance)`` of the #114 transient for this boot's form.
 
@@ -3221,12 +3246,18 @@ def p_prefill_transient_for(boot_form) -> Tuple[bool, str]:
     """
     if boot_form is None:
         return True, "no WEG2-FORM (desk caller): published as before"
-    if boot_form.model in P_PREFILL_TRANSIENT_CALIBRATION_MODELS:
+    _alias = _CALIBRATION_FOOTPRINT_ALIAS.get(boot_form.model)
+    if boot_form.model in P_PREFILL_TRANSIENT_CALIBRATION_MODELS or (
+            _alias and _alias[0] in P_PREFILL_TRANSIENT_CALIBRATION_MODELS):
         return True, (
             f"published: chunk {P_CHUNKED_PREFILL_TOKENS} -> "
             f"{p_prefill_transient_vector_mib(P_CHUNKED_PREFILL_TOKENS)} MiB per P stage, "
-            f"MEASURED on {boot_form.model} (support points "
+            f"MEASURED on {_alias[0] if _alias and boot_form.model not in P_PREFILL_TRANSIENT_CALIBRATION_MODELS else boot_form.model} (support points "
             f"{list(P_PREFILL_TRANSIENT_SUPPORT.chunks)}, linear between, H41)"
+            + (f"; H87: this boot's checkpoint {boot_form.model} has the same memory "
+               f"footprint ({_alias[1]})"
+               if _alias and boot_form.model not in P_PREFILL_TRANSIENT_CALIBRATION_MODELS
+               else "")
         )
     return False, (
         f"NOT published: the support points "
@@ -3673,6 +3704,11 @@ BARLINK_BUILD_WINDOW_CAP_S = 60
 PP_CHAIN_RECV_STALL_S = 60
 PP_OCCUPANT_HORIZON_S = 90
 MATCH_REFUSAL_CENSUS_EVERY = 64
+
+#: H103: the FLA l2norm run-time-T switch (fla/l2norm.py ``L2NORM_RUNTIME_T_ENV``,
+#: same name, pinned by the test; spelled here so the launcher never imports
+#: triton/torch). build_env sets it for both groups.
+L2NORM_RUNTIME_T_ENV = "SGLANG_FLA_L2NORM_RUNTIME_T"
 
 #: #1235 THE ARGV LITERALS THAT WERE NOBODY'S.
 #:
@@ -5040,6 +5076,57 @@ VISION_CHOICES = (VISION_OFF, VISION_RESIDENT, VISION_TRANSIENT)
 #: so the launcher and the tests cannot drift.
 VISION_TRANSIENT_OVERRIDE = '{"language_model_only": true}'
 
+#: H125 (NF, user order 2026-09-24 10:15Z): where the transient tower's bytes
+#: come from (`disk` = the checkpoint shard, O_DIRECT, the 27B stage; `ram` =
+#: a tmpfs image of the tower extent, staged once by P's PP0) and where it
+#: sits on the card (`auto` = the KV tail, else free VRAM; `kvtail`; `free`).
+#: The defaults publish NOTHING: the P env of a transient boot is the 27B one,
+#: and a text-only boot is byte-identical to every boot before H125. The
+#: variable names are the rank's (`weg2.vision_rank_stage`), one spelling.
+VISION_SOURCE_DISK = "disk"
+VISION_SOURCE_RAM = "ram"
+VISION_SOURCES = (VISION_SOURCE_DISK, VISION_SOURCE_RAM)
+VISION_PLACE_AUTO = "auto"
+VISION_PLACES = (VISION_PLACE_AUTO, "kvtail", "free")
+VISION_SOURCE_ENV = "SGLANG_WEG2_VISION_SOURCE"
+VISION_PLACE_ENV = "SGLANG_WEG2_VISION_PLACE"
+
+
+def vision_stage_knobs_refusal(vision: str, source: str, place: str) -> str:
+    """A source/place that is not the default only means something under
+    `--weg2-vision transient`; anywhere else it is refused by name (a knob
+    that silently does nothing is a boot nobody can read)."""
+    if vision == VISION_TRANSIENT:
+        return ""
+    if source != VISION_SOURCE_DISK or place != VISION_PLACE_AUTO:
+        return (
+            f"W111 Weg2VisionArmRefused: --weg2-vision-source {source} / "
+            f"--weg2-vision-place {place} were given, but --weg2-vision is "
+            f"{vision!r} -- they act only on the transient stage"
+        )
+    return ""
+
+
+def vision_source_host_line(model: str, source: str) -> str:
+    """The host-RAM price of `--weg2-vision-source ram`, named at the launch:
+    the tower extent (header read only) lives in a tmpfs image for the life
+    of P's PP0 (shmem, charged to memory.current). Empty for `disk`."""
+    if source != VISION_SOURCE_RAM:
+        return ""
+    try:
+        from sglang.srt.planner.vision_stage_load import find_tower_shard, tower_extent
+
+        ext = tower_extent(find_tower_shard(model))
+        mib = f"{(ext.file_last_end - ext.file_first_offset) / (1 << 20):.1f} MiB"
+    except Exception as exc:  # noqa: BLE001 -- unmeasured is said, never guessed
+        mib = f"size unread ({type(exc).__name__}: {exc})"
+    return (
+        f"W102 Weg2VisionStage SOURCE=ram: P's PP0 stages the tower extent into a tmpfs "
+        f"image once ({mib}), held in host RAM for the life of the boot (shmem, counted in "
+        "memory.current, NOT in the host ledger's terms); every image then loads from RAM "
+        "instead of the disk"
+    )
+
 #: Task #47 Scheibe 6a (20.09.): the checkpoint PROFILE the two groups are built
 #: for. ``qwen27b`` is every boot before this flag existed (byte-identical argv
 #: and env). ``nextflash`` = Qwen3.8 Next Flash: P = PP3 (tp 1 per stage), D =
@@ -5300,6 +5387,7 @@ def argv_p(
     spec_flags: Optional[Sequence[str]] = None,
 ) -> List[str]:
     _refuse_if_extra_raises_budget(budgets, list(extra or ()), "P")
+    _refuse_if_extra_drops_transient_lmo(vision, extra, "P")
     # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
     # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
     # server_args hands to derive_pp_layer_split, which builds a CONTIGUOUS
@@ -5696,6 +5784,32 @@ def _adopt_load_format_flag(armed: bool) -> List[str]:
     return ["--load-format", "dummy"]
 
 
+def _refuse_if_extra_drops_transient_lmo(vision: str, extra, group: str) -> None:
+    """EXTRA is appended LAST and argparse keeps the last occurrence of
+    ``--json-model-override-args``, so an EXTRA override is the one the group
+    gets. Under ``--weg2-vision transient`` it must carry
+    ``language_model_only`` itself, or the group would build the tower it must
+    not have -- refused by name instead of lost silently (27B f09dc0d6e4,
+    extended to P on NF by H125: the NF arm's EXTRA_P and EXTRA_D both carry
+    ``{"language_model_only":true}``, which passes)."""
+    _extra = list(extra or ())
+    if vision != VISION_TRANSIENT or "--json-model-override-args" not in _extra:
+        return
+    _i = len(_extra) - 1 - _extra[::-1].index("--json-model-override-args")
+    try:
+        _lmo = bool(json.loads(_extra[_i + 1]).get("language_model_only"))
+    except (IndexError, ValueError, AttributeError):
+        _lmo = False
+    if not _lmo:
+        raise Weg2LaunchRefused(
+            f"W111 Weg2VisionArmRefused: --extra-{group.lower()} carries its own "
+            "--json-model-override-args without language_model_only, and "
+            "argparse keeps only the last one -- --weg2-vision transient's "
+            f"{VISION_TRANSIENT_OVERRIDE} would be lost and {group} would build a "
+            'tower. Add "language_model_only": true to the EXTRA override.'
+        )
+
+
 def argv_d(
     py: str,
     model: str,
@@ -5729,35 +5843,18 @@ def argv_d(
     profile: str = PROFILE_QWEN27B,
     # #108: kommt als WERT vom Launcher, nie aus der Env dieses Prozesses.
     d_adopt: bool = False,
-    # WEG2 VISION (D side, 24.09.): APPENDED LAST (argv_d has no `*`
-    # marker). Under `transient` D tokenizes images like P
+    # WEG2 VISION (D side, 24.09., 27B f09dc0d6e4; H125 on NF): APPENDED LAST
+    # (argv_d has no `*` marker). Under `transient` D tokenizes images like P
     # (language_model_only instead of --no-enable-multimodal): the same pad
     # ids reach P's stored pages and the decode gets the mrope delta. D still
     # has no tower and arms no stage (SGLANG_WEG2_VISION stays P-only,
     # build_env); an image inside D's own extent is refused by name at its
-    # admission (W123).
+    # admission (W123). `off` (default) is byte-identical to every argv
+    # before this parameter existed.
     vision: str = VISION_OFF,
 ) -> List[str]:
-    _extra = list(extra or ())
-    if vision == VISION_TRANSIENT and "--json-model-override-args" in _extra:
-        # EXTRA is appended LAST and argparse keeps the last occurrence, so
-        # EXTRA's override is the one D gets. It must carry the transient
-        # form's language_model_only itself, or D would build the tower it
-        # must not have -- refused by name instead of lost silently.
-        _i = _extra.index("--json-model-override-args")
-        try:
-            _lmo = bool(json.loads(_extra[_i + 1]).get("language_model_only"))
-        except (IndexError, ValueError, AttributeError):
-            _lmo = False
-        if not _lmo:
-            raise Weg2LaunchRefused(
-                "W111 Weg2VisionArmRefused: --extra-d carries its own "
-                "--json-model-override-args without language_model_only, and "
-                "argparse keeps only the last one -- --weg2-vision transient's "
-                f"{VISION_TRANSIENT_OVERRIDE} would be lost and D would build a "
-                'tower. Add "language_model_only": true to the EXTRA override.'
-            )
     _refuse_if_extra_raises_budget(budgets, list(extra or ()), "D")
+    _refuse_if_extra_drops_transient_lmo(vision, extra, "D")
     return [py, "-m", "sglang.launch_server"] + common_flags(
         model, s_gb, m_mib, store_cfg, max_kv_per_request, d_write_policy, "D",
         random_seed, barlink_cap_cycles, census_interval,
@@ -7318,6 +7415,9 @@ def _env_knobs(ns) -> Dict[str, object]:
         # function exists: three call sites build an environment and a value
         # spelled out at each of them is a value that drifts.
         "vision": str(getattr(ns, "weg2_vision", VISION_OFF)),
+        # H125: source and place of the transient stage (P only, see build_env).
+        "vision_source": _vision_knob(ns, "weg2_vision_source", VISION_SOURCE_DISK),
+        "vision_place": _vision_knob(ns, "weg2_vision_place", VISION_PLACE_AUTO),
         # WEG2-FORM: the one resolved form (launcher.main sets it on ns).
         "boot_form": getattr(ns, "weg2_boot_form", None),
         # 27B FP8: one byte layout on every rank of BOTH groups (the two
@@ -7326,6 +7426,20 @@ def _env_knobs(ns) -> Dict[str, object]:
         and checkpoint_quant_method(str(getattr(ns, "model", "")))
         in UNIFORM_MARLIN_QUANT_METHODS,
     }
+
+
+def _vision_knob(ns, attr: str, default: str) -> str:
+    """H125: one knob, refused by name when it cannot act (see
+    vision_stage_knobs_refusal)."""
+    val = str(getattr(ns, attr, default) or default)
+    why = vision_stage_knobs_refusal(
+        str(getattr(ns, "weg2_vision", VISION_OFF)),
+        str(getattr(ns, "weg2_vision_source", VISION_SOURCE_DISK) or VISION_SOURCE_DISK),
+        str(getattr(ns, "weg2_vision_place", VISION_PLACE_AUTO) or VISION_PLACE_AUTO),
+    )
+    if why:
+        raise Weg2LaunchRefused(why)
+    return val
 
 
 def weg2_boot_token(ns) -> str:
@@ -7475,6 +7589,10 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               vision: str = VISION_OFF,
               profile: str = PROFILE_QWEN27B,
               flip_weights: str = "family",
+              # H125: the transient stage's source and place, P only; the
+              # defaults publish nothing (byte-identical env).
+              vision_source: str = VISION_SOURCE_DISK,
+              vision_place: str = VISION_PLACE_AUTO,
               group_env_extra: Optional[Dict[str, str]] = None,
               xchg_env: Optional[Dict[str, str]] = None,
               # WEG2-FORM (24.09.): the ONE resolved form of this boot
@@ -7511,6 +7629,17 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         env[VISION_STAGE_ENV] = VISION_TRANSIENT
     else:
         env.pop(VISION_STAGE_ENV, None)
+    # H125: SAME DISCIPLINE -- launcher output, P of a transient boot only,
+    # and only when not the default; popped everywhere else so an operator's
+    # shell value can never pick a source the argv does not say.
+    if vision == VISION_TRANSIENT and group == "P" and vision_source != VISION_SOURCE_DISK:
+        env[VISION_SOURCE_ENV] = vision_source
+    else:
+        env.pop(VISION_SOURCE_ENV, None)
+    if vision == VISION_TRANSIENT and group == "P" and vision_place != VISION_PLACE_AUTO:
+        env[VISION_PLACE_ENV] = vision_place
+    else:
+        env.pop(VISION_PLACE_ENV, None)
     # #1348: the exchange lane's unexecuted-line instrument. SAME DISCIPLINE
     # as SGLANG_WEG2_GROUP and the host-ring family below (R19): this is
     # LAUNCHER OUTPUT, published only when `--xchg-coverage-diff` named a
@@ -7706,6 +7835,13 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # publish sweep runs bounded in the PP loop's bubbles, nothing is left
     # for the flip's flush. "0" in the operator's environment disables it.
     env.setdefault("SGLANG_WEG2_BUBBLE_PUBLISH", "1")
+    # H103: FLA l2norm with the row count as a RUN-TIME bound for BOTH groups
+    # (fla/l2norm.py L2NORM_RUNTIME_T_ENV, the 27B strand's switch, 6b24aa60da;
+    # there --p-host-overlap sets it for P only). The stock kernel takes T as
+    # tl.constexpr: rc9p D-TP0 loaded it 15x after READY, 16.7 s of cold-load
+    # windows (one 12.7 s), P 78x. Bit-identical output (same body). "0" in
+    # the operator's environment keeps the stock kernel.
+    env.setdefault(L2NORM_RUNTIME_T_ENV, "1")
     if arming_floor_solved:
         env["SGLANG_ARMING_FLOOR_SOLVED"] = "1"
     else:
@@ -8883,6 +9019,10 @@ def choose_host_ledger(
     # xsn417's RUN-PEAK ADVISORY then priced the Next-Flash boot fnFL2x142's
     # run sample (-90.18 GiB, a death sample) for a Qwen3.8-27B arm.
     record_accept: Optional[Callable[[dict], bool]] = None,
+    # H87 (rc2.1c2 container, NVFP4 --d-only, W87/W20): a D-only boot has NO
+    # flip arm -- no flip ratchet, no dormant group, no P host pools. False is
+    # byte-identical to every flip boot.
+    d_only: bool = False,
 
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
@@ -8949,6 +9089,15 @@ def choose_host_ledger(
         measured_record_path() if record_path is None else record_path
     )
     record = host_ledger.read_measured_record(_record_path_resolved, accept=record_accept)
+    # H87: IS THIS BOOT'S CHECKPOINT THE ONE THE BUILT-IN REFERENCES WERE
+    # MEASURED ON? Decided once, here, by memory footprint (an abliterated
+    # derivative of the reference counts, a different checkpoint under any
+    # name does not). No model named (a desk caller) = None = pre-H87 exactly.
+    if model_dir:
+        _ref_ok, _ref_why = weg2_form.reference_model_verdict(
+            model_dir, host_ledger.REFERENCE_MODEL)
+    else:
+        _ref_ok, _ref_why = None, ""
     # #1378 Stage 2 (order): SELF-READ the prior boot's cushion from the same
     # sidecar `record` came from -- flags stay an OVERRIDE, never the only
     # path, so a boot that names nobody by hand still gets the gate. The
@@ -8961,7 +9110,7 @@ def choose_host_ledger(
             "override it")
     elif flip_ratchet_form_key:
         _auto_cushion, _auto_bounce, _auto_prov = host_ledger.resolve_prior_cushion(
-            _record_path_resolved, flip_ratchet_form_key)
+            _record_path_resolved, flip_ratchet_form_key, accept=record_accept)
     else:
         _auto_cushion, _auto_bounce, _auto_prov = None, None, (
             "auto-resolve skipped: caller passed no flip_ratchet_form_key")
@@ -9181,7 +9330,15 @@ def choose_host_ledger(
         # an absent measurement becomes a silent 0 in the run peak. `record` is
         # the dict this function already read; the front writes the field into
         # it at `WEG2-FLIP done epoch=2`.
-        flip_ratchet=host_ledger.resolve_flip_ratchet_gib(record),
+        # H87: --d-only has no flip -- a DECLARED zero-flip ratchet, never the
+        # series of another model's flip boots.
+        flip_ratchet=(host_ledger.d_only_flip_ratchet() if d_only else
+                      host_ledger.resolve_flip_ratchet_gib(
+                          record, reference_model_ok=_ref_ok,
+                          reference_model_why=_ref_why)),
+        d_only=bool(d_only),
+        reference_model_ok=_ref_ok,
+        reference_model_why=_ref_why,
         # #1273 S6: the exchange's own pinned host carrier.  The ARM STRINGS
         # decide it here, at the one ledger call site, and not inside the
         # ledger -- `WEIGHT_SOURCE_CHOICES` is this module's, and a ledger that
@@ -9335,6 +9492,8 @@ def arm_deadman(log: Log, boot_log: str, port: int, pattern: str, probe_s: int, 
         log(f"DRY-RUN: would arm deadman: {cmd}")
         return 0
     pid = int(subprocess.run(["bash", "-c", cmd], capture_output=True, text=True).stdout.strip() or 0)
+    if pid:
+        register_helper(tag, f"deadman_{name}", pid, log)
     time.sleep(1)
     proof = subprocess.run(["pgrep", "-af", f"boot_deadman.sh {boot_log}"], capture_output=True, text=True).stdout.strip()
     n = len(proof.splitlines())
@@ -9375,6 +9534,115 @@ _MEMTS_SUPERVISOR_SH = (
     'kill -TERM 0; '
     'else wait; fi'
 )
+
+
+# --------------------------------------------------------------------------
+# #135: one process-group registry per boot, shared with the arm
+# --------------------------------------------------------------------------
+#
+# MEASURED 26.09. (fnFL2h91v1): the launcher-armed front deadman stayed alive
+# five minutes after the arm's teardown (teardown 08:00:50Z, its CRASH verdict
+# 08:05:58Z) -- nothing but its own grace ceiling ended it, because the arm
+# never learnt its pid (state json only, read by `--teardown PATH`, which the
+# normal end does not run). Every helper this launcher starts is a session
+# leader already (setsid / start_new_session, pgid == pid), so the missing
+# piece is only the ENTRY: the arm's boot_helpers.sh reads
+#   {EVIDENCE_DIR}/helpers_{tag}/{name}.pid = "PGID START OWNER OWNER_START NAME"
+# and stops each group in its teardown (and its owner guard does it when the
+# arm dies without one). OWNER is this launcher's parent -- the arm, which
+# starts it with `setsid nohup python -m ...` (setsid execs in place, the arm
+# stays the parent). START is /proc/<pid>/stat field 22, so a recycled pid is
+# never signalled. The format is a contract with boot_helpers.sh.
+
+
+def helper_registry_dir(tag: str) -> str:
+    return f"{EVIDENCE_DIR}/helpers_{tag}"
+
+
+def _proc_start_ticks(pid: int) -> int:
+    """/proc/<pid>/stat field 22 (starttime), 0 when unreadable. Split after the
+    LAST ')' -- comm may carry spaces and parentheses."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            rest = f.read().rsplit(b")", 1)[1].split()
+        return int(rest[19])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def register_helper(tag: str, name: str, pid: int, log: Optional[Log] = None, suffix: str = "pid") -> str:
+    """Write the registry entry for helper ``name`` (a session leader, pgid ==
+    pid). Never raises: a registry that cannot be written costs the arm its
+    group stop for this helper, not the boot -- and the line says so.
+    ``suffix`` "grp" writes a BOOT GROUP entry instead (H135b, see
+    :func:`register_boot_group`); the line is identical."""
+    path = f"{helper_registry_dir(tag)}/{name}.{suffix}"
+    owner = os.getppid()
+    line = f"{pid} {_proc_start_ticks(pid)} {owner} {_proc_start_ticks(owner)} {name}\n"
+    kind = "HELPER" if suffix == "pid" else "BOOT-GROUP"
+    try:
+        os.makedirs(helper_registry_dir(tag), exist_ok=True)
+        tmp = f"{helper_registry_dir(tag)}/.{name}.{suffix}.tmp"
+        with open(tmp, "w") as f:
+            f.write(line)
+        os.replace(tmp, path)
+        msg = f"WEG2-{kind} registered {name} pgid={pid} owner={owner} -> {path}"
+    except OSError as e:
+        msg = f"WEG2-{kind} NOT registered {name} pgid={pid}: {e} (the arm cannot stop it by group)"
+    if log is not None:
+        log(msg)
+    return msg
+
+
+def unregister_helper(tag: str, name: str, suffix: str = "pid") -> None:
+    try:
+        os.unlink(f"{helper_registry_dir(tag)}/{name}.{suffix}")
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# H135b: the BOOT GROUPS in the same registry -- no headless boot
+# --------------------------------------------------------------------------
+#
+# P, D and the front are session leaders (start_new_session, pgid == pid) and
+# this launcher RETURNS after LAUNCHED, so nothing but the arm's teardown ever
+# ended them. An arm killed by SIGKILL, the OOM killer or `timeout -k` runs no
+# teardown: the boot went on headless, holding the cards past the gpuq window.
+# PR_SET_PDEATHSIG is no answer -- the parent of the groups is THIS process,
+# which exits by design after LAUNCHED, so it would kill every healthy boot.
+# The arm's owner guard (boot_helpers.sh, setsid + `tail --pid`) already
+# outlives the arm; it needs the boot's groups by identity. Each group is
+# written as ``{name}.grp`` -- the SAME line as a helper's ``.pid`` entry
+# (PGID START OWNER OWNER_START NAME, OWNER = the arm, this launcher's parent),
+# but its own suffix, so the helper paths (bh_stop_all, bh_sweep_stale) never
+# touch a serving group. The guard acts on them only when its owner armed the
+# boot (``boot.arm``) and died without a teardown: ``--teardown`` first, then
+# TERM/KILL per group. ``--teardown`` removes the entries.
+
+BOOT_GROUP_NAMES = ("launcher", "P", "D", "front")
+
+
+def register_boot_group(tag: str, name: str, pid: int, log: Optional[Log] = None) -> str:
+    return register_helper(tag, name, pid, log, suffix="grp")
+
+
+def _stop_helper_pid(pid: int, expect: str = "boot_deadman") -> str:
+    """TERM a helper: its whole process group when it leads one AND its argv
+    still carries ``expect`` (a recycled pid that happens to lead some other
+    group is never group-signalled), else the pid alone -- the pre-#135
+    behaviour. Returns 'group', 'pid' or 'gone'."""
+    try:
+        if os.getpgid(pid) == pid and expect in _proc_cmdline(pid):
+            os.killpg(pid, signal.SIGTERM)
+            return "group"
+    except OSError:
+        pass
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return "pid"
+    except OSError:
+        return "gone"
 
 
 def memts_csv_path(tag: str) -> str:
@@ -9424,6 +9692,7 @@ def start_memts(state: "BootState", log: Log) -> int:
     state.memts_pid = p.pid
     state.helper_pids.append(p.pid)
     _write_state(state)
+    register_helper(state.tag, "memts", p.pid, log)
     log(f"mem time series pid {p.pid} (pgid, supervisor; owner watch {owner!r}, "
         f"poll {MEMTS_OWNER_POLL_S} s) csv {csv} (started before group P: launch AND run "
         f"moments sampled; state {state_path(state)} carries the pid)")
@@ -14033,6 +14302,14 @@ def log_wake_credit_solve(ns, cards: List[Card], fits, log, label: str, *,
             # still mit den P-Tags der alten Karten (weights_12 auf PP1 statt
             # PP2). Unbekannt (Log ohne Layerzeilen) -> ENTFAELLT mit Namen.
             reference_key=None if ref is None else {
+                # H87: DAS MODELL DER REFERENZ-LOGS. Bis hier fehlte es im
+                # Schluessel: die NVFP4-Profile rechneten ihren ersten Wake gegen
+                # die INT4-Logs fnFL2x162 (Tags, Zeilen, Freigaben eines anderen
+                # Checkpoints), ohne dass ein Vergleich es sah. Verglichen wird
+                # nach Speicher-Fussabdruck (wake_credit._model_same_footprint),
+                # ein Log ohne Modellnennung ENTFAELLT mit Namen.
+                "model": (weg2_form.log_model(_logs[2]) or weg2_form.log_model(_logs[0])
+                          or "ungemessen: %s nennt kein Modell" % ref.source),
                 "p_card": tuple(ref.p_card),
                 "p_split": _wc.reference_p_split(ref, int(fits[0].n_layers))
                 or ("ungemessen: %s ohne 'MoE expert-offload active on layer'-Zeilen"
@@ -14413,7 +14690,9 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
 
     support = P_PREFILL_TRANSIENT_SUPPORT
     name = os.path.basename(os.path.normpath(str(model)))
-    if name != support.model:
+    # H87: a footprint-identical derivative carries the support's measurement.
+    if name != support.model and not weg2_form.reference_model_verdict(
+            str(model), support.model)[0]:
         log(f"{_p_card.CARD_MARKER} ENTFAELLT: die Chunk-Transiente ist auf "
             f"{support.model} gemessen, dieser Boot faehrt {name}.")
         return
@@ -16564,6 +16843,22 @@ def build_parser() -> argparse.ArgumentParser:
              "widest-layer one.",
     )
     ap.add_argument(
+        "--weg2-vision-source", choices=list(VISION_SOURCES), default=VISION_SOURCE_DISK,
+        help="H125: where the TRANSIENT tower's bytes come from (only with "
+             "--weg2-vision transient). `disk` (default): the checkpoint shard, "
+             "O_DIRECT, per image request. `ram`: P's PP0 stages the tower extent "
+             "once into a tmpfs image (NF 856 MiB, 27B 879 MiB of host RAM for the "
+             "life of the boot) and every stage reads it from RAM.",
+    )
+    ap.add_argument(
+        "--weg2-vision-place", choices=list(VISION_PLACES), default=VISION_PLACE_AUTO,
+        help="H125: where the TRANSIENT tower sits on PP0's card (only with "
+             "--weg2-vision transient). `auto` (default): the KV tail when it is "
+             "wholly free (the phase start), else the card's free VRAM, else a "
+             "named refusal. `kvtail`: the 27B stage exactly. `free`: always the "
+             "card's free VRAM.",
+    )
+    ap.add_argument(
         # #1356: see VISION_OFF. Default `off` = P and D boot TEXT-ONLY.
         "--weg2-vision", choices=list(VISION_CHOICES), default=VISION_OFF,
         help="#1356: `off` (default) boots both groups text-only by passing "
@@ -17437,6 +17732,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # profile's registry row (unset flags only).
         apply_profile_arg_defaults(ns, list(sys.argv[1:] if argv is None else argv))
     ns.weg2_boot_form = boot_form
+    # H87: the #114/H41 calibration identity by memory footprint, decided once
+    # here where the checkpoint PATH is known (build_env sees only its name).
+    _h87_alias_line = (note_calibration_footprint_alias(ns.model)
+                       if boot_form is not None else None)
     # WEG2-FORM + UNIFY S3: THE CALIBRATION IDENTITY (one acceptor, its terms
     # from the profile's records row: checkpoint AND form, AND the 27B line
     # term where the row names it). Every measured source this boot prices
@@ -17620,6 +17919,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if calib_identity is not None:
             log("WEG2-PROFILE calibration identity (" + boot_form.profile + "): a measured "
                 "source counts only when its boot ran " + calib_identity.describe())
+        if _h87_alias_line:
+            log(_h87_alias_line)
         log("#114 P-PREFILL-TRANSIENT (form " + boot_form.describe() + "): "
             + p_prefill_transient_for(boot_form)[1])
     # 27B line (24.09., 159333c14d): group D's planner overhead, MEASURED on the
@@ -18798,7 +19099,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             hicache_disabled=hicache_disabled,
             # #1369: the SAME local `main` resolved once, above, from the SAME
             # predicate the shipped argvs read -- never re-read from `ns` here.
-            weights_cpu_backup_armed=weights_cpu_backup_armed)
+            weights_cpu_backup_armed=weights_cpu_backup_armed,
+            # H87: the D-ONLY branch below starts group D alone -- the ledger
+            # prices exactly that, not a flip boot.
+            d_only=bool(getattr(ns, "d_only", False)))
 
     arm, reap_headroom_gib, lines, cg = _price_host_ledger()
     # #1453 (user 16.09.: 'L2-Groesse aus Ledger-Spielraum'): the arena is the
@@ -18915,6 +19219,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                p_stage_layers=getattr(state, "p_stage_layers", None),
                                chunk_layers=chunk_layers)
     env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap)
+    # H125: the host-RAM price of `--weg2-vision-source ram`, named where the
+    # P env is built (the line is empty, and nothing is logged, for `disk`).
+    _vis_line = vision_source_host_line(
+        ns.model, str(getattr(ns, "weg2_vision_source", VISION_SOURCE_DISK)))
+    if _vis_line and str(getattr(ns, "weg2_vision", VISION_OFF)) == VISION_TRANSIENT:
+        log(_vis_line)
     # #1269 PUBLICATION: build_env's own comment says the decision is
     # "published explicitly so the boot log names the decision" -- but it only
     # SET the variables and logged nothing, so no boot log ever carried them.
@@ -19307,6 +19617,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         state.pids["D"] = spec_d.pid
         _write_state(state)
+        register_boot_group(ns.tag, "D", spec_d.pid, log)  # H135b
         state.t_ready["D"] = wait_ready(PORT_D, spec_d.pid, ns.ready_deadline_s, log, "D", spec_d.proc)
         log(f"WEG2-LAUNCH D-ONLY READY group=D port={PORT_D} after {state.t_ready['D']:.1f} s -- no P, no flip, "
             f"no front; D prefills every uncached length itself (W50 = {max_kv_per_request})")
@@ -19356,6 +19667,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     state.pids["P"] = spec_p.pid
     _write_state(state)
+    register_boot_group(ns.tag, "P", spec_p.pid, log)  # H135b
     state.t_ready["P"] = wait_ready(PORT_P, spec_p.pid, ns.ready_deadline_s, log, "P", spec_p.proc)
     # #1386 FOLLOW-UP 2 (xsn31/7 Versuch 2 wall): both markers this gate greps
     # for are printed by managers/cache_controller.py's HiCacheController
@@ -19472,6 +19784,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
     _write_state(state)
+    register_boot_group(ns.tag, "D", spec_d.pid, log)  # H135b
     state.t_ready["D"] = wait_ready(PORT_D, spec_d.pid, ns.ready_deadline_s, log, "D", spec_d.proc)
     # #1386 FOLLOW-UP 2: the mirror of group P's same skip above -- D's
     # cache_controller never builds under `hicache_disabled` either (D is a
@@ -19788,6 +20101,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ffh = open(front_log, "ab")
     fp = subprocess.Popen(front_argv, env=fenv, stdout=ffh, stderr=subprocess.STDOUT, cwd=tree, start_new_session=True)
     state.pids["front"] = fp.pid
+    # H135b: the front into the state json AND the registry at once -- until the
+    # LAUNCHED write below (behind wait_ready and the deadmen) a guard-run
+    # `--teardown` would not know the front by pid.
+    _write_state(state)
+    register_boot_group(ns.tag, "front", fp.pid, log)
     # PUBLISH THE LOG BEFORE WAITING, NOT AFTER.  This used to sit after the
     # LAUNCHED line, i.e. behind `wait_ready` below -- so a boot that never
     # reached a ready front never updated the symlink, and every reader
@@ -20106,12 +20424,17 @@ def teardown(path: str, report: dict | None = None) -> int:
     # outlived 107 boots.
     memts_pid = int(st.get("memts_pid") or 0)
     print(stop_memts(st.get("tag", ""), memts_pid), flush=True)
+    # #135: the deadmen are session leaders -- TERM the group, so a deadman
+    # caught inside `sleep` or a py-spy dump does not leave that child behind.
+    helper_verdicts = []
     for hp in st.get("helper_pids", []):
         if hp and int(hp) != memts_pid:
-            try:
-                os.kill(int(hp), signal.SIGTERM)
-            except OSError:
-                pass
+            helper_verdicts.append(f"{int(hp)}:{_stop_helper_pid(int(hp))}")
+    if helper_verdicts:
+        print(f"WEG2-TEARDOWN helpers {' '.join(helper_verdicts)}", flush=True)
+    if st.get("tag"):
+        for name in ("memts", "deadman_P", "deadman_D", "deadman_front"):
+            unregister_helper(st["tag"], name)
     print(f"TERM {sorted(pids)}")
     for p in pids:
         try:
@@ -20128,6 +20451,11 @@ def teardown(path: str, report: dict | None = None) -> int:
         except OSError:
             pass
     print(f"KILL leftovers {left}")
+    # H135b: the groups are gone -- their registry entries go with them, so the
+    # arm's owner guard finds nothing left to stop after this teardown.
+    if st.get("tag"):
+        for name in BOOT_GROUP_NAMES:
+            unregister_helper(st["tag"], name, suffix="grp")
     time.sleep(3)
     # #1236: the store is a DIRECTORY ON DISK, so teardown removes it instead
     # of unmounting a tmpfs. The umount pair is deleted, not kept behind a

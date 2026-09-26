@@ -1,4 +1,4 @@
-"""The in-rank vision stage MEETS the P prefill graph (27B line, merge 24.09.).
+"""The in-rank vision stage MEETS the P prefill graph (27B line, merge 24.09.; NF form H125).
 
 The vision line (V1-V3b) was built on b1f9b553af; the boot tree it lands on
 (682cae209e) carries H's full prefill CUDA graph on group P (--p-prefill-graph).
@@ -85,17 +85,16 @@ def _extend_batch(n, mm_inputs, *, mrope=True):
 
 
 def _full_runner():
-    """The eligibility half of a full-backend runner, captured on mrope
-    positions (a multimodal P: --weg2-vision transient keeps
-    model_config.is_multimodal on, language_model_only only drops the tower)."""
+    """The eligibility half of a full-backend runner. H125 (NF): the NF tree
+    has no 27B `_full_graph_ineligible_reason`; its rule is `can_run_graph`
+    itself, and that is what these tests ask."""
     runner = object.__new__(pcgr.PrefillCudaGraphRunner)
     runner.capture_num_tokens = [BUCKET]
     runner.max_num_tokens = BUCKET
-    runner.capture_hidden_mode = CaptureHiddenMode.FULL
+    runner.capture_hidden_mode = CaptureHiddenMode.NULL
     runner.prefill_backend_name = "full"
     runner._is_full_backend = True
     runner._capture_req_slots = 1
-    runner.__dict__["_captured_mrope"] = True
     return runner
 
 
@@ -116,27 +115,24 @@ def test_a_staged_image_request_runs_eager_by_name():
     fb = _extend_batch(9, [mm])
     assert fb.contains_mm_inputs()  # the real method, no stub
     runner = _full_runner()
-    assert runner._full_graph_ineligible_reason(fb) == "mm_inputs"
     assert runner.can_run_graph(fb) is False
-    assert runner.__dict__["_eager_reasons"] == {"mm_inputs": 1}
 
 
 def test_a_pp_follower_copy_with_pixels_only_is_refused_by_the_same_name():
     # PP1/PP2 hold the relayed request: pixels on the item, no embeddings.
     mm = MultimodalInputs(mm_items=[_image_item()])
     fb = _extend_batch(9, [mm])
-    assert _full_runner()._full_graph_ineligible_reason(fb) == "mm_inputs"
+    assert _full_runner().can_run_graph(fb) is False
 
 
 def test_the_text_control_replays_the_multimodal_p_graph():
     runner = _full_runner()
     fb = _extend_batch(9, [None])
     assert not fb.contains_mm_inputs()
-    assert runner._full_graph_ineligible_reason(fb) is None
     assert runner.can_run_graph(fb) is True
-    # and without the positions the capture was made on: named, not replayed
-    assert runner._full_graph_ineligible_reason(
-        _extend_batch(9, [None], mrope=False)) == "mrope_missing"
+    # NF: no mrope-capture rule in this tree; the text batch replays with or
+    # without the (3, n) positions, as before H125
+    assert runner.can_run_graph(_extend_batch(9, [None], mrope=False)) is True
 
 
 def _calls_in(fn):

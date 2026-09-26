@@ -94,6 +94,7 @@ from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import host_ledger
 from sglang.srt.weg2 import prefill_clock  # UNIFY S4 (H85): D's prefill clock reader (stdlib only)
+from sglang.srt.weg2 import dp_wait as _dp_wait  # R28: DP-WAIT instrument
 
 logger = logging.getLogger("weg2.front")
 
@@ -152,6 +153,20 @@ def flip_price_ms(rec: dict, *, exclude_drain: bool) -> Tuple[float, float]:
 
 
 QUIESCE_DEADLINE_S = 90.0
+
+
+def quiesce_poll_s() -> Tuple[float, bool]:
+    """fnFL2 H111: the quiesce poll interval and whether the fast form is armed.
+
+    Off (SGLANG_WEG2_QUIESCE_FAST unset/0): 0.05 s, the #1455 value, and the
+    loop is byte-identical to the pre-H111 form. On: the configured interval
+    (SGLANG_WEG2_QUIESCE_FAST_POLL_MS, default 10), never below 1 ms. The P
+    side's no-re-want guard is armed by the SAME variable -- the launcher
+    hands one environment to the front and to every rank."""
+    if not envs.SGLANG_WEG2_QUIESCE_FAST.get():
+        return 0.05, False
+    return max(1, int(envs.SGLANG_WEG2_QUIESCE_FAST_POLL_MS.get())) / 1000.0, True
+
 
 #: fnFL2 v22: how long the quiesce waits for /health_generate proxies the
 #: front forwarded before the flip began (a 1-token generate, ~1 s warm; the
@@ -667,6 +682,22 @@ def _content_text(c: Any) -> str:
     return str(c if c is not None else "")
 
 
+def _native_items(value) -> int:
+    """H125b: how many items a native ``/generate`` multimodal field carries.
+
+    The field is a single item (URL/path/base64 string, dict, or an already
+    decoded object), a list of items, or -- for a batch -- a list of such
+    lists. Every non-empty leaf counts; ``None``, ``""`` and empty lists count
+    0, so a client that sends ``image_data: null`` stays text."""
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple)):
+        return sum(_native_items(v) for v in value)
+    if isinstance(value, (str, bytes)) and not value:
+        return 0
+    return 1
+
+
 def _image_parts(payload) -> int:
     """#1356: how many image parts this request carries. 0 for text-only.
 
@@ -689,6 +720,15 @@ def _image_parts(payload) -> int:
                     n += 1
     except Exception:  # noqa: BLE001 - a malformed body is not an image
         return 0
+    # H125b: THE NATIVE FIELD. `/generate` carries images as `image_data`
+    # (io_struct.GenerateReqInput), not as chat content parts, so this
+    # counter scored 0 and the request routed as TEXT: under `off` both groups
+    # run --no-enable-multimodal, the tokenizer has no mm_processor
+    # (tokenizer_manager.should_run_mm_processor) and the image was DROPPED
+    # SILENTLY -- a plausible answer to a question about a picture nobody
+    # looked at. Counted here, so it gets the chat parts' verdict and line.
+    if isinstance(payload, dict):
+        n += _native_items(payload.get("image_data"))
     return n
 
 
@@ -724,6 +764,28 @@ def _video_parts(payload) -> int:
                     n += 1
     except Exception:  # noqa: BLE001 - a malformed body is not a video
         return 0
+    # H125b: the native `/generate` field, same hole as `image_data`.
+    if isinstance(payload, dict):
+        n += _native_items(payload.get("video_data"))
+    return n
+
+
+def _embed_parts(payload) -> int:
+    """H125b: native ``/generate`` inputs the Weg-2 path cannot carry at all.
+
+    ``input_embeds`` replaces the token ids with caller-computed embeddings:
+    the front prices and routes by text, P and D match their prefixes on token
+    ids, and the hand-off keys on those ids -- none of it sees an embedding.
+    ``audio_data`` names a modality this model family has no encoder for.
+    Both were passed through untouched and answered as whatever the text
+    around them said. Refused by name in EVERY vision mode (W125), because
+    no mode serves them."""
+    if not isinstance(payload, dict):
+        return 0
+    n = 0
+    if payload.get("input_embeds") is not None:
+        n += 1
+    n += _native_items(payload.get("audio_data"))
     return n
 
 
@@ -754,9 +816,11 @@ VERDICT_STAGE = "stage"
 VERDICT_REFUSE_IMAGE = "refuse-image"
 VERDICT_REFUSE_VIDEO = "refuse-video"
 VERDICT_REFUSE_MODE = "refuse-mode"
+#: H125b: input_embeds / audio_data on the native /generate (W125)
+VERDICT_REFUSE_EMBEDS = "refuse-embeds"
 
 
-def vision_verdict(image_parts: int, video_parts: int, mode: str):
+def vision_verdict(image_parts: int, video_parts: int, mode: str, embed_parts: int = 0):
     """PURE: what happens to a request, given its parts and the boot's mode.
 
     Split out of `handle_generate` so the decision can be enumerated at a
@@ -783,6 +847,14 @@ def vision_verdict(image_parts: int, video_parts: int, mode: str):
             f"unknown vision mode {mode!r} (expected one of {list(VISION_MODES)}); "
             "refusing rather than routing, because routing an image at a boot "
             "whose tower state is unknown returns plausible wrong text"
+        )
+    if embed_parts:
+        # H125b: before video and image -- no mode can carry these.
+        return VERDICT_REFUSE_EMBEDS, (
+            f"{embed_parts} input_embeds/audio_data field(s): the Weg-2 path "
+            "prices, routes, matches and hands off by TOKEN IDS, and this model "
+            "has no audio encoder, so these inputs cannot be served by either "
+            "group; refused by name rather than answered from the text alone"
         )
     if video_parts:
         return VERDICT_REFUSE_VIDEO, (
@@ -813,19 +885,28 @@ def vision_verdict(image_parts: int, video_parts: int, mode: str):
 
 def front_span_inflight() -> bool:
     """#49 rest (``SGLANG_WEG2_FRONT_SPAN_INFLIGHT``, default off): credit a D
-    leg 2's text at its first content event instead of at its finish. The #49
-    pricing it builds on runs unswitched in this tree (S7c, 196f6a8f57)."""
+    leg 2's text at its first content event instead of at its finish. It
+    builds on the #49 pricing (S7c, 196f6a8f57), which since the operator
+    decision of 26.09. runs behind ``SGLANG_WEG2_ENABLE_AGENT_SPAN`` (profile
+    field ``agent_span``); the caller credits only when BOTH are on -- a held
+    entry under agent span off would bring #49's held-epoch price back."""
     return bool(envs.SGLANG_WEG2_FRONT_SPAN_INFLIGHT.get())
 
 
 def front_span_inflight_line() -> str:
-    """The ONE start line of the front that names the #49 rest switch."""
-    return ("WEG2-FRONT #49 SPAN-INFLIGHT armed=%d role=front pid=%d "
+    """The ONE start line of the front that names the #49 rest switch -- and
+    the agent-span switch it only credits together with (both must be on)."""
+    try:
+        agent_span = int(bool(envs.SGLANG_WEG2_ENABLE_AGENT_SPAN.get()))
+    except Exception:  # noqa: BLE001 - a line never breaks the front's start
+        agent_span = -1
+    return ("WEG2-FRONT #49 SPAN-INFLIGHT armed=%d agent_span=%d role=front pid=%d "
             "(SGLANG_WEG2_FRONT_SPAN_INFLIGHT: D leg-2 text credited at its first "
-            "content event)" % (int(front_span_inflight()), os.getpid()))
+            "content event, only with SGLANG_WEG2_ENABLE_AGENT_SPAN on)"
+            % (int(front_span_inflight()), agent_span, os.getpid()))
 
 
-def request_text(payload: dict) -> str:
+def request_text(payload: dict, tools_first: Optional[bool] = None) -> str:
     """The prompt as ONE string, for the span estimate and the ledger.
 
     Q0-B: covers BOTH forwarded chat shapes. OpenAI carries the system turn
@@ -846,16 +927,25 @@ def request_text(payload: dict) -> str:
     whole block (13,302 chars on boot dkr27bbar1agent09251922, ~4.4k est
     tokens) was priced as uncached although D held it -- est_uncached 5.4k-11k
     > X=4096 on all 44 turns, each one over P with two flips.
+
+    NF (P49): the order is behind ``SGLANG_WEG2_ENABLE_AGENT_SPAN`` (default
+    off = the rc2.1l order, tools LAST, byte for byte). ``tools_first`` None
+    reads the switch; the Qwen3.8-Flash-Next template renders ``<tools>``
+    first exactly like the 27B one (chat_template.jinja:57-67).
     """
+    if tools_first is None:
+        tools_first = bool(envs.SGLANG_WEG2_ENABLE_AGENT_SPAN.get())
     if "messages" in payload and isinstance(payload["messages"], list):
         parts = []
         tools = payload.get("tools")
-        if isinstance(tools, list) and tools:
-            # The whole schema list, serialized once. Deterministic key order
-            # so the span LRU's prefix match is stable across identical turns.
-            parts.append(
-                "tools:" + json.dumps(tools, ensure_ascii=False, sort_keys=True) + "\n"
-            )
+        # The whole schema list, serialized once. Deterministic key order so
+        # the span LRU's prefix match is stable across identical turns.
+        tools_part = (
+            "tools:" + json.dumps(tools, ensure_ascii=False, sort_keys=True) + "\n"
+            if isinstance(tools, list) and tools else None
+        )
+        if tools_part is not None and tools_first:
+            parts.append(tools_part)
         sys_field = payload.get("system")
         if sys_field:
             parts.append(f"system:{_content_text(sys_field)}\n")
@@ -864,6 +954,8 @@ def request_text(payload: dict) -> str:
                 parts.append(f"{m}\n")
                 continue
             parts.append(f"{m.get('role', '')}:{_content_text(m.get('content', ''))}\n")
+        if tools_part is not None and not tools_first:
+            parts.append(tools_part)
         return "".join(parts)
     p = payload.get("prompt", payload.get("text", ""))
     if isinstance(p, list):
@@ -954,8 +1046,15 @@ class SpanLRU:
     credited_tokens)``. An entry without ``prompt_tokens`` prices as before.
     """
 
-    def __init__(self, cap: int = SPAN_LRU):
+    def __init__(self, cap: int = SPAN_LRU, agent_span: Optional[bool] = None):
         self.cap = cap
+        #: NF (P49): ``SGLANG_WEG2_ENABLE_AGENT_SPAN``, read ONCE here (None).
+        #: Off (default) = rc2.1l: ``record_presence`` keeps only the measured
+        #: ``cached_tokens`` (prompt_tokens and held_epoch are dropped), so
+        #: every entry prices through the pre-#49 arm of ``uncached_tokens``
+        #: and the pricing equals rc2.1l's ``max(0, est - max(ct*cp/len))``.
+        self.agent_span = (bool(envs.SGLANG_WEG2_ENABLE_AGENT_SPAN.get())
+                           if agent_span is None else bool(agent_span))
         # key -> (text, cached_tokens, prompt_tokens, held_epoch)
         self.entries: collections.OrderedDict[
             str, Tuple[str, int, int, Optional[int]]] = collections.OrderedDict()
@@ -992,6 +1091,9 @@ class SpanLRU:
             return
         key = hashlib.sha1(text.encode()).hexdigest()
         self.entries.pop(key, None)
+        if not self.agent_span:
+            # NF (P49) switch off: the rc2.1l entry -- the presence witness only.
+            prompt_tokens, held_epoch = 0, None
         ct = max(0, int(cached_tokens))
         pt = max(0, int(prompt_tokens or 0))
         held = held_epoch if (held_epoch is not None and pt > 0) else None
@@ -1066,7 +1168,21 @@ class SpanLRU:
 
         Kept for readers of the old spelling; the price is
         :meth:`uncached_tokens`.
+
+        NF (P49) switch off: rc2.1l's reading, uncapped -- the longest common
+        character prefix against a text D served times that text's measured
+        cached share (H61's presence pins read it; under #49 the credit is
+        capped by the chars/3 estimate of ``text``).
         """
+        if not self.agent_span:
+            best, known = 0, False
+            for etext, ct, _pt, _held in self.entries.values():
+                cp = common_prefix_len(etext, text)
+                if cp <= 0:
+                    continue
+                known = True
+                best = max(best, int(ct * (cp / max(1, len(etext)))))
+            return best, known
         est_prompt = int(len(text) / CHARS_PER_TOKEN) + 1
         rem, known = self.uncached_tokens(text, est_prompt, epoch)
         return max(0, est_prompt - rem), known
@@ -1220,6 +1336,18 @@ _STREAM_FINISH_RE = re.compile(
 def stream_finish_seen(buf: bytes) -> bool:
     """True when ``buf`` carries the end-of-answer marker of either wire (H61)."""
     return _STREAM_FINISH_RE.search(buf) is not None
+
+
+#: H61b (2026-09-26): after a client hang-up BEFORE D's end marker, how long
+#: leg 2 keeps reading D for that marker before it aborts D as before. The
+#: end marker and D's usage follow the last content token within the same
+#: scheduler step (Anthropic adapter: content_block_stop, message_delta and
+#: message_stop are yielded back to back after [DONE]; OpenAI wire: finish
+#: chunk, usage chunk, [DONE]), i.e. microseconds to one decode step. A
+#: client that left mid-answer costs D at most this much extra decode (about
+#: 25 tokens at 100 tok/s), then D is aborted. Kept below H61's mid-answer
+#: contract (end 0.6 s after the failed write -> still an abort).
+H61B_END_GRACE_S = 0.25
 
 
 class AnthropicStreamUsage:
@@ -2361,6 +2489,11 @@ class Pending:
     #: could take it. Read by ``_flip_economics_ok`` under
     #: SGLANG_WEG2_VISION_FLIP_URGENT.
     p_only: bool = False
+    #: R28: the arrival snapshot of a request queued while D was awake, i.e.
+    #: one that waits for a D->P flip; printed once as ``WEG2 DP-WAIT`` at
+    #: the ``WEG2-FLIP done`` that ends the wait, then cleared. Instrument
+    #: only -- nothing routes, admits or flips on it.
+    dp_arrival: Optional[_dp_wait.DpArrival] = None
 
 
 class Seat:
@@ -2769,13 +2902,16 @@ class Front:
         # xsn438: resolved once and named once -- a switch that changes the
         # D->P latch must be readable off the front log, not inferred.
         self.vision_flip_urgent = vision_flip_urgent()
-        logger.info(
-            "WEG2 VISION-FLIP-URGENT %s (%s=%r, default off; vision=%s): %s",
-            "on" if self.vision_flip_urgent else "off", VISION_FLIP_URGENT_ENV,
-            os.environ.get(VISION_FLIP_URGENT_ENV), self.vision,
-            "a queued request only P can serve satisfies the D->P latch on its own"
-            if self.vision_flip_urgent else
-            "such a request waits for X* of queued work or the fairness switch")
+        # H125: named only on a boot that serves images -- a text-only front
+        # (`off`, the default) logs exactly what it logged before.
+        if self.vision == VISION_MODE_TRANSIENT or self.vision_flip_urgent:
+            logger.info(
+                "WEG2 VISION-FLIP-URGENT %s (%s=%r, default off; vision=%s): %s",
+                "on" if self.vision_flip_urgent else "off", VISION_FLIP_URGENT_ENV,
+                os.environ.get(VISION_FLIP_URGENT_ENV), self.vision,
+                "a queued request only P can serve satisfies the D->P latch on its own"
+                if self.vision_flip_urgent else
+                "such a request waits for X* of queued work or the fairness switch")
         self.admin_key_file = admin_key_file or ""
         self.admin_key = admin_key_mod.read(admin_key_file) if admin_key_file else None
         self.groups = {"P": Group("P", prefill.rstrip("/"), prefill_sid), "D": Group("D", decode.rstrip("/"), decode_sid)}
@@ -2839,6 +2975,14 @@ class Front:
         self.admit_d = True
         self.queue: Deque[Pending] = collections.deque()
         self.spans = SpanLRU()
+        # NF (P49): a boot with the switch on says so once. Off prints nothing,
+        # so an off boot's front log keeps the pre-P49 lines (the arm's env
+        # line is the off witness).
+        if self.spans.agent_span:
+            logger.info(
+                "WEG2 AGENT-SPAN #49 on (SGLANG_WEG2_ENABLE_AGENT_SPAN=1: tools priced "
+                "first, a D serve holds its prompt_tokens for its epoch, prefix priced "
+                "in measured tokens)")
         self.session: Optional[ClientSession] = None
         self.counters: Dict[str, int] = collections.Counter()
         self.corridor_min: Dict[str, Dict[int, int]] = {"P": {}, "D": {}}
@@ -4042,7 +4186,8 @@ class Front:
         # lives in `vision_verdict`, where it can be enumerated at a desk.
         _img = _image_parts(payload)
         _vid = _video_parts(payload)
-        _verdict, _why = vision_verdict(_img, _vid, self.vision)
+        _emb = _embed_parts(payload)
+        _verdict, _why = vision_verdict(_img, _vid, self.vision, _emb)
         if _verdict == VERDICT_STAGE:
             # Task #58: THE STAGE RUNS IN THE GROUP, and the request that
             # carries the image IS the message that asks for it. The front
@@ -4058,7 +4203,7 @@ class Front:
                 "PP0 of the group runs the transient tower before its admission "
                 "and attaches precomputed_embeddings before the prefill",
                 f"weg2-{self.epoch}-{self._rid + 1}", int(_img))
-        elif _verdict != VERDICT_ROUTE:
+        elif _verdict != VERDICT_ROUTE and _verdict != VERDICT_REFUSE_EMBEDS:
             # #1356 THE REFUSAL IS LOGGED, NOT ONLY RETURNED. Without this line
             # W101 existed solely in the caller's response body: `grep W101
             # front.log` read 0 even when it had fired cleanly, so nobody
@@ -4084,6 +4229,18 @@ class Front:
                 "refused with 501 and NOT routed",
                 _code, _rid_peek, int(_img), int(_vid), self.vision)
             return web.json_response({"error": f"{_code}: {_why}"}, status=501)
+        elif _verdict == VERDICT_REFUSE_EMBEDS:
+            # H125b: its OWN emitter, the code a leading literal of the format
+            # string (the #1356 emitter rule above), placed AFTER the #1356
+            # branch so the W101/W103 line of an image or video refusal stays
+            # the line it always was, and stays the first one in this handler.
+            logger.warning(
+                "W125 Weg2InputEmbedsRefused rid=%s embed_parts=%d image_parts=%d "
+                "video_parts=%d mode=%s -- request refused with 501 and NOT routed",
+                f"weg2-{self.epoch}-{self._rid + 1}", int(_emb), int(_img), int(_vid),
+                self.vision)
+            return web.json_response(
+                {"error": f"W125 Weg2InputEmbedsRefused: {_why}"}, status=501)
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
         # UNIFY S7 (27B RC7-X): the arrival time the idle re-grant's quiet
@@ -4190,13 +4347,16 @@ class Front:
             "what D must PREFILL, at CHARS_PER_TOKEN=%.1f minus the MEASURED "
             "cached-on-D presence) presence_span=%d presence_src=%s (#1324: the "
             "credit's witness -- d_leg2_cached is a realised cached_tokens "
-            "reading from group D, never a prefill on P; #49 d_served_epoch = "
-            "prompt_tokens of a text D served in this epoch) carrier_est=%d src=%s "
+            "reading from group D, never a prefill on P%s) carrier_est=%d src=%s "
             "(THE COMPARED VALUE for carrier_max=%d: the WHOLE prompt's KV "
             "through the host staging pool, at CARRIER_CHARS_PER_TOKEN=%.1f) "
             "est_prompt=%d chars=%d (#1290)",
             rid, route, remainder, x_route, CHARS_PER_TOKEN,
             store_span, presence_src,
+            # NF (P49): the #49 witness is named only when the switch is on,
+            # so the line stays rc2.1l's byte for byte when it is off.
+            ("; #49 d_served_epoch = prompt_tokens of a text D served in this epoch"
+             if getattr(self.spans, "agent_span", False) else ""),
             carrier_est, "exact" if exact is not None else "estimate",
             self.carrier_max_tokens, CARRIER_CHARS_PER_TOKEN, est_prompt,
             len(text),
@@ -4247,6 +4407,7 @@ class Front:
                         est_uncached=remainder, span_known=known,
                         skip_leg1=True, store_span_est=store_span)
             self.queue.append(p)
+            self._dp_mark(p, "carrier")  # R28
             self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
             try:
                 await fut
@@ -4332,6 +4493,7 @@ class Front:
                     # up to --drain-deadline-s each. Today's path keeps it here.
                     d_eligible=short_ok and not short_refused)
         self.queue.append(p)
+        self._dp_mark(p, "long" if route == "long" else "batch")  # R28
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         logger.info("WEG2-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d)",
                     rid, self.awake, self.admit_d, est_prompt, remainder, len(self.queue))
@@ -4603,6 +4765,7 @@ class Front:
         if rank is None:
             rank = self._admitted_this_epoch
         self._admitted_this_epoch += 1
+        self.counters["d_admits"] += 1  # R28: DP-WAIT d_admitted_during_wait
         logger.info("WEG2 D-ADMIT rid=%s seat=%d/%d rank=%d oldest_wait_s=%.1f source=%s",
                     rid, self._seats_in_use(), self.d_bs, rank, max(0.0, time.time() - t_arrive), source)
 
@@ -5023,7 +5186,7 @@ class Front:
                                 rid, self.epoch, ("d_direct" if pending is None
                                                  else "d_single" if single_prefill else "after_p"),
                                 (time.time() - t0) * 1000.0)
-                if _has_content and front_span_inflight():
+                if _has_content and front_span_inflight() and self.spans.agent_span:
                     # #49 rest: D has produced this leg's first content, so it
                     # has PREFILLED the whole prompt into its radix, where a
                     # concurrent request with this prefix matches it (boot
@@ -5068,18 +5231,35 @@ class Front:
                     # finish marker the old abort stands: the error
                     # propagates and closing D's connection aborts decoding
                     # for a client that is gone.
-                    client_io = {"gone": False, "finished": False}
+                    #
+                    # H61b (2026-09-26): THE END IS D'S, NOT THE CLIENT'S.
+                    # Three windows H61 left open, each of which booked no
+                    # presence for a request D had fully served:
+                    #  (a) the finish marker was scanned AFTER the write, so
+                    #      when the hang-up landed between D's last content
+                    #      and its end (Anthropic: after the last
+                    #      content_block_stop, before message_delta), the
+                    #      write of the very chunk that carries the end --
+                    #      and D's usage -- raised with `finished` still
+                    #      False, and that chunk was never fed to the usage
+                    #      reader;
+                    #  (b) only ConnectionResetError was caught, but a write
+                    #      waiting on a paused transport gets aiohttp's plain
+                    #      ConnectionError("Connection lost") from the drain
+                    #      waiter (aiohttp base_protocol.connection_lost);
+                    #  (c) a hang-up one chunk BEFORE D's end marker aborted
+                    #      D although the end -- and D's usage -- was one
+                    #      scheduler step away.
+                    # So the chunk is scanned and fed before it is written,
+                    # any ConnectionError counts as a hang-up, and after a
+                    # hang-up before the marker D is read for at most
+                    # H61B_END_GRACE_S more: the marker arrives -> booked as
+                    # served; it does not -> the old abort (D's connection
+                    # closes, D stops decoding for a client that is gone).
+                    client_io = {"gone": False, "finished": False, "early": False,
+                                 "err": None, "deadline": 0.0}
 
                     async def _push(chunk: bytes) -> None:
-                        if not client_io["gone"]:
-                            try:
-                                await resp.write(chunk)
-                            except ConnectionResetError:
-                                # aiohttp's ClientConnectionResetError is a
-                                # ConnectionResetError.
-                                if not client_io["finished"]:
-                                    raise
-                                client_io["gone"] = True
                         if anth is not None:
                             anth.feed(chunk)
                         _scan_from = max(0, len(tail) - 64)
@@ -5088,6 +5268,31 @@ class Front:
                             client_io["finished"] = True
                         if len(tail) > 262144:
                             del tail[:-131072]
+                        if not client_io["gone"]:
+                            try:
+                                await resp.write(chunk)
+                            except ConnectionError as e:
+                                # aiohttp's ClientConnectionResetError is a
+                                # ConnectionResetError; the drain waiter's
+                                # "Connection lost" is a plain ConnectionError.
+                                client_io["gone"] = True
+                                if not client_io["finished"]:
+                                    client_io["early"] = True
+                                    client_io["err"] = e
+                                    client_io["deadline"] = time.monotonic() + H61B_END_GRACE_S
+
+                    async def _next_d_chunk() -> bytes:
+                        # Same reads as `r.content.iter_any()`; bounded by the
+                        # grace only while the client is gone before the end.
+                        if client_io["gone"] and not client_io["finished"]:
+                            left = client_io["deadline"] - time.monotonic()
+                            if left <= 0:
+                                raise client_io["err"]
+                            try:
+                                return await asyncio.wait_for(r.content.readany(), left)
+                            except asyncio.TimeoutError:
+                                raise client_io["err"]
+                        return await r.content.readany()
 
                     if early_body is not None:
                         # A non-200 whose body this method already consumed
@@ -5096,19 +5301,31 @@ class Front:
                     else:
                         if first_chunk is not None:
                             await _push(first_chunk)
-                        async for chunk in r.content.iter_any():
+                        while True:
+                            chunk = await _next_d_chunk()
+                            if not chunk:
+                                break
                             await _push(chunk)
+                    if client_io["gone"] and not client_io["finished"]:
+                        # The client left and D's stream ended without an end
+                        # marker: not served, exactly as before H61b.
+                        raise client_io["err"]
                     if not client_io["gone"]:
                         try:
                             await resp.write_eof()
-                        except ConnectionResetError:
+                        except ConnectionError:
                             if not client_io["finished"]:
                                 raise
                             client_io["gone"] = True
-                    if client_io["gone"]:
+                    if client_io["early"]:
+                        self.counters["leg2_client_closed_before_end_caught"] += 1
+                        logger.info("WEG2 leg2 rid=%s CLIENT-CLOSED-BEFORE-END-CAUGHT: the client hung up before D's "
+                                    "end marker, which arrived within %.2fs; D's stream was read to its end and is "
+                                    "booked as served (H61b)", rid, H61B_END_GRACE_S)
+                    elif client_io["gone"]:
                         self.counters["leg2_client_closed_after_finish"] += 1
                         logger.info("WEG2 leg2 rid=%s CLIENT-CLOSED-AFTER-FINISH: the client hung up after the "
-                                    "end of the answer was written; D's stream was read to its end and is "
+                                    "end of the answer was sent; D's stream was read to its end and is "
                                     "booked as served (H61)", rid)
                     g.served += 1
                     if anth is not None:
@@ -5243,6 +5460,7 @@ class Front:
                     pending.seat = None
                     pending.d_eligible = pending.d_direct = False  # idle policy (b): P's now
                     self.queue.append(pending)
+                    self._dp_mark(pending, "reroute")  # R28
                     self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
                     logger.warning("WEG2-REROUTE rid=%s uncached=%d > %d: rejoining route BATCH once (spec 3.6)",
                                    rid, pt - ct, self.tp_prefill_max_tokens)
@@ -5500,11 +5718,23 @@ class Front:
         else:
             p.fut = asyncio.get_event_loop().create_future()
             p.t_arrive = time.time()
+        # Review V A2: THE BACKLOG IS PRICED AT D's MEASURED EXTENT when D said
+        # it. D refused because its extent after match_prefix exceeded its
+        # riegel; the char estimate above can sit BELOW the live X (and so
+        # below flip_min_work_tokens, which follows X unless the launcher
+        # pins it -- NF pins 4096) -- FLIP-ECONOMICS then held the request on
+        # an idle D until the fairness bound (45 s). NF has no re-grant of a
+        # queued request to D (no RC7-X), so the flip is the only way out. A
+        # measurement only ever RAISES the price; an unparsed refusal keeps
+        # the estimate (never a number invented here).
+        if d_extent is not None and int(d_extent) > int(p.est_uncached):
+            p.est_uncached = int(d_extent)
         if seat is not None:
             seat.release("W50_requeue")
         p.seat = None
         p.d_eligible = p.d_direct = False  # idle policy (b): D refused it -- P's now
         self.queue.append(p)
+        self._dp_mark(p, "reroute")  # R28
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         try:
             await p.fut
@@ -5887,12 +6117,22 @@ class Front:
                 "WEG2-FLIP quiesce group=%s waited %.2f s for %s in-flight /health_generate "
                 "proxy(ies) before the flush (fnFL2 v22)", g.name, waited[0], waited[1]
             )
+        poll_s, fast = quiesce_poll_s()
+        polls = 0
         while time.time() - t0 < QUIESCE_DEADLINE_S:
             code, body = await self.rpc(g, "/flush_cache", None, 60)
+            polls += 1
             if code == 200:
+                if fast:
+                    logger.info(
+                        "WEG2-QUIESCE-FAST group=%s polls=%d ms=%.0f interval_ms=%.0f "
+                        "(fnFL2 H111: poll %.0f ms instead of 50, PP0 re-wants no lap "
+                        "that is still on the ring)",
+                        g.name, polls, (time.time() - t0) * 1000.0, poll_s * 1000.0,
+                        poll_s * 1000.0)
                 return True, body
             last = body
-            await asyncio.sleep(0.05)  # #1455: the P flush RPC answers in ~5 ms; 500 ms poll cost ~1 s per flip
+            await asyncio.sleep(poll_s)  # #1455: the P flush RPC answers in ~5 ms; 500 ms poll cost ~1 s per flip
         return False, last
 
     # #1236: `_store_used_bytes` IS DELETED, not repaired. It read
@@ -6583,6 +6823,7 @@ class Front:
                         self.epoch, src, dst, _parts, (self.t_awake - _b) * 1000)
         except Exception:  # noqa: BLE001 -- a timeline never breaks a flip
             pass
+        _dp_drain_end = self._flip_marks.get("quiesce")  # R28: drain(S) returned here
         self._flip_marks = {}
         self._admitted_this_epoch = 0
         # C11 / L5.  interleave_ms IS NOT sleep+wake any more, and saying so is
@@ -6661,6 +6902,55 @@ class Front:
                     rec["sleep_leg_ms"], rec["wake_leg_ms"], rec["overlap_ms"], rec["overlap_pct"],
                     rec["critical_path"], rec["flip_ms"], len(self.weights_tags),
                     "off-path" if dc_off_path else dc)
+        if src == "D" and dst == "P":
+            self._dp_report(t_flip0, _dp_drain_end)
+
+    # ---------------- R28: D->P wait instrument ----------------
+    def _dp_mark(self, p: Pending, origin: str) -> None:
+        """R28: snapshot a request that joins the queue while D is awake.
+
+        Such a request waits for a D->P flip (``WEG2 LATE-BATCH`` names the
+        LONG ones). A request queued while P is awake (or requeued by a P
+        intake stall) waits for no D->P flip and carries no snapshot.
+        Instrument only: see :mod:`sglang.srt.weg2.dp_wait`.
+        """
+        if self.awake != "D":
+            p.dp_arrival = None
+            return
+        try:
+            D = self.groups["D"]
+            p.dp_arrival = _dp_wait.take(
+                time.time(), origin, self.state == "flipping", len(D.outstanding),
+                self._handoff_in_flight(), len(self._ready_for_d), self.counters)
+        except Exception:  # noqa: BLE001 -- an instrument never breaks routing
+            p.dp_arrival = None
+
+    def _dp_report(self, t_flip0: float, t_drain_end: Optional[float]) -> None:
+        """R28: one ``WEG2 DP-WAIT`` line per queued request whose wait this
+        D->P flip ends, at its ``WEG2-FLIP done``; each request is reported
+        once. A D->P flip that returned early (DRAIN WAITING, W1) reports
+        nothing -- the next one that completes carries the whole wait, and
+        ``hold_by`` says ``flip-returned``."""
+        for p in list(self.queue):
+            a = p.dp_arrival
+            if a is None:
+                continue
+            p.dp_arrival = None
+            try:
+                dec = _dp_wait.decompose(a, t_flip0, t_drain_end, self.t_awake)
+                by = _dp_wait.hold_by(a, self.counters)
+                logger.info("%s", _dp_wait.line(
+                    p.rid, self.epoch, a, dec, by, self.counters, p.est_prompt,
+                    p.est_uncached, p.store_span_est, p.span_known))
+                self.counters["dp_wait_reported"] += 1
+                w_ms = int(round(dec["wait_s"] * 1000))
+                if w_ms > self.counters.get("dp_wait_max_ms", 0):
+                    self.counters["dp_wait_max_ms"] = w_ms
+                for lim in (10, 30, 60):
+                    if dec["wait_s"] >= lim:
+                        self.counters[f"dp_wait_ge{lim}s"] += 1
+            except Exception as e:  # noqa: BLE001 -- an instrument never breaks a flip
+                logger.debug("DP-WAIT rid=%s not reported: %s: %s", p.rid, type(e).__name__, e)
 
     # ---------------- phase economics (C7, C8) ----------------
     def _derived_min_dwell_ms(self, src: str, dst: str) -> Tuple[float, str]:
@@ -6715,6 +7005,8 @@ class Front:
         logger.info("WEG2 MIN-DWELL src=%s dst=%s awake_ms=%d derived_from_flip_ms=%d overridden_by=%s "
                     "provenance=%s verdict=%s",
                     src, dst, int(awake_ms), int(need), overridden, prov, "flip" if ok else "hold")
+        if not ok and src == "D":
+            self.counters["min_dwell_holds"] += 1  # R28: DP-WAIT hold_by=min-dwell
         return ok
 
     # ------------------------------------------------------------------
@@ -6948,15 +7240,18 @@ class Front:
         except Exception:  # noqa: BLE001 - a report may never break the verdict
             stranded, oldest = -1, -1.0
 
+        # H125: the two vision fields only on a boot that serves images; a
+        # text-only front (`off`, the default) prints the pre-H125 line.
+        _vis = str(getattr(self, "vision", VISION_MODE_OFF)) == VISION_MODE_TRANSIENT or urgent_on
         logger.info(
             "WEG2 FLIP-ECONOMICS queued_uncached=%d queued_tokens=%d threshold=%d "
             "(X*, amortising 2*flip_s once over the backlog) fairness=%s "
-            "p_only=%d vision_flip_urgent=%s "
-            "stranded_decodes=%d oldest_wait_s=%.1f verdict=%s "
+            + ("p_only=%d vision_flip_urgent=%s " if _vis else "%s%s")
+            + "stranded_decodes=%d oldest_wait_s=%.1f verdict=%s "
             "(stranded is REPORTED, never a veto -- unbounded decode wait under a "
             "prefill stream is accepted; -1 means the census could not be taken)",
             queued_uncached, queued_tokens, threshold, fairness_fired,
-            p_only, urgent_on,
+            *((p_only, urgent_on) if _vis else ("", "")),
             stranded, oldest, "flip" if ok else "hold",
         )
         return ok

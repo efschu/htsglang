@@ -372,7 +372,7 @@ class DirectReadReport:
 
 def read_into(shard: str, plan: Sequence[Tuple[CkptTensor, torch.Tensor]], *,
               bounce_bytes: int = BOUNCE_BYTES, bounce_count: int = BOUNCE_COUNT,
-              stream: Optional[Any] = None) -> DirectReadReport:
+              stream: Optional[Any] = None, direct: bool = True) -> DirectReadReport:
     """Read the planned checkpoint tensors straight into their destination
     tensors (the slab views), through ``bounce_count`` bounce buffers.
 
@@ -384,6 +384,11 @@ def read_into(shard: str, plan: Sequence[Tuple[CkptTensor, torch.Tensor]], *,
     Afterwards the bounce buffers are dropped and, on CUDA, the pinned host
     cache is emptied -- the host footprint of the whole read is the bounce
     buffers, for the duration of the read.
+
+    ``direct=False`` (H125, the RAM source): the file is a tmpfs image of the
+    tower extent, which refuses O_DIRECT by construction; it is opened
+    buffered on purpose and without the fallback warning, and the report
+    says ``direct=False``.
     """
     rep = DirectReadReport()
     if not plan:
@@ -401,7 +406,10 @@ def read_into(shard: str, plan: Sequence[Tuple[CkptTensor, torch.Tensor]], *,
     size = os.path.getsize(shard)
     bufs = [_alloc_bounce(bounce_bytes, rep.pinned) for _ in range(bounce_count)]
     events: List[Optional[Any]] = [None] * bounce_count
-    fd, rep.direct = _open_direct(shard)
+    if direct:
+        fd, rep.direct = _open_direct(shard)
+    else:
+        fd, rep.direct = os.open(shard, os.O_RDONLY), False
     ordered = sorted(plan, key=lambda p: p[0].file_offset)
     try:
         pos, i = start, 0
@@ -473,3 +481,206 @@ def plan_checkpoint_into(views: Dict[str, torch.Tensor], tensors: Sequence[CkptT
     if unfilled:
         raise VisionRankStageRefused(f"{len(unfilled)} parameter(s) have no checkpoint tensor: {unfilled[:3]}")
     return plan
+
+
+# ---------------------------------------------------------------------------
+# 5. H125 (NF): the SOURCE of the tower bytes -- disk or RAM, selectable
+# ---------------------------------------------------------------------------
+#
+# User order 2026-09-24 10:15Z: the tower exists on NF only transiently and
+# its source is selectable, RAM or disk. ``disk`` (default) is the 27B
+# stage's reader unchanged: the checkpoint shard, O_DIRECT, no page cache.
+# ``ram`` stages the tower's byte extent ONCE into a tmpfs file (one
+# contiguous extent on both checkpoints: NF 897,862,112 B in
+# model-00014-of-00014, 27B 921,460,192 B) and every stage reads that file
+# buffered -- a memcpy from host RAM instead of a disk read. The price is
+# named, never hidden: the extent stays in host RAM (shmem, charged to the
+# writer's memory cgroup) for the life of the file. The file is keyed by
+# the shard's path, size and mtime, so a later boot REUSES it instead of
+# writing a second copy -- one image per checkpoint is the bound.
+
+SOURCE_DISK = "disk"
+SOURCE_RAM = "ram"
+SOURCES = (SOURCE_DISK, SOURCE_RAM)
+SOURCE_ENV = "SGLANG_WEG2_VISION_SOURCE"
+RAM_DIR_ENV = "SGLANG_WEG2_VISION_RAM_DIR"
+DEFAULT_RAM_DIR = "/dev/shm/weg2-vision"
+#: staging read size (the shard is read once, sequentially)
+RAM_STAGE_CHUNK = 64 * MIB
+
+
+def vision_source(env: Optional[Dict[str, str]] = None) -> str:
+    """``SGLANG_WEG2_VISION_SOURCE``: unset/empty = ``disk``. An unknown
+    value is REFUSED -- a typo must not silently pick a source."""
+    e = os.environ if env is None else env
+    raw = (e.get(SOURCE_ENV, "") or "").strip().lower()
+    if not raw:
+        return SOURCE_DISK
+    if raw not in SOURCES:
+        raise VisionRankStageRefused(
+            f"{SOURCE_ENV}={raw!r} is not one of {list(SOURCES)}")
+    return raw
+
+
+def ram_dir(env: Optional[Dict[str, str]] = None) -> str:
+    e = os.environ if env is None else env
+    return (e.get(RAM_DIR_ENV, "") or "").strip() or DEFAULT_RAM_DIR
+
+
+@dataclass(frozen=True)
+class TowerSource:
+    """Where the stage reads the tower bytes from.
+
+    ``shift`` is subtracted from every checkpoint offset (0 for the shard
+    itself, the extent's first byte for a RAM image). ``host_bytes`` is what
+    the source holds in host RAM for as long as it exists (0 for disk)."""
+
+    kind: str
+    path: str
+    shift: int
+    direct: bool
+    host_bytes: int
+    reused: bool = False
+
+
+def disk_source(shard: str) -> TowerSource:
+    return TowerSource(SOURCE_DISK, shard, 0, True, 0)
+
+
+def ram_image_path(shard: str, directory: str) -> str:
+    base = os.path.basename(os.path.dirname(os.path.abspath(shard))) or "model"
+    return os.path.join(directory, f"{base}__{os.path.basename(shard)}.tower")
+
+
+def _image_meta(shard: str, lo: int, hi: int) -> Dict[str, Any]:
+    st = os.stat(shard)
+    return {"shard": os.path.abspath(shard), "size": int(st.st_size),
+            "mtime_ns": int(st.st_mtime_ns), "lo": int(lo), "hi": int(hi)}
+
+
+def stage_tower_to_ram(shard: str, tensors: Sequence[CkptTensor], directory: str) -> TowerSource:
+    """Copy the byte extent ``[min offset, max end)`` of ``tensors`` from the
+    shard into ``directory`` (a tmpfs), once. Reuses a matching image (same
+    shard path/size/mtime and extent); writes atomically (tmp + rename), so a
+    killed writer never leaves a half image under the real name."""
+    if not tensors:
+        raise VisionRankStageRefused(f"{shard}: no tower tensors to stage")
+    lo = min(t.file_offset for t in tensors)
+    hi = max(t.file_offset + t.nbytes for t in tensors)
+    meta = _image_meta(shard, lo, hi)
+    path = ram_image_path(shard, directory)
+    meta_path = path + ".json"
+    try:
+        with open(meta_path) as fh:
+            old = json.load(fh)
+        if old == meta and os.path.getsize(path) == hi - lo:
+            return TowerSource(SOURCE_RAM, path, lo, False, hi - lo, reused=True)
+    except (OSError, ValueError):
+        pass
+    os.makedirs(directory, exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        src = os.open(shard, os.O_RDONLY)
+        try:
+            with open(tmp, "wb") as out:
+                pos = lo
+                while pos < hi:
+                    buf = os.pread(src, min(RAM_STAGE_CHUNK, hi - pos), pos)
+                    if not buf:
+                        raise VisionRankStageRefused(f"{shard}: short read at {pos} while staging")
+                    out.write(buf)
+                    pos += len(buf)
+        finally:
+            os.close(src)
+        os.replace(tmp, path)
+        with open(meta_path + ".tmp", "w") as fh:
+            json.dump(meta, fh)
+        os.replace(meta_path + ".tmp", meta_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return TowerSource(SOURCE_RAM, path, lo, False, hi - lo)
+
+
+def remove_ram_image(src: TowerSource) -> None:
+    """Drop a RAM image and its key file (atexit of the staging rank)."""
+    if src.kind != SOURCE_RAM:
+        return
+    for p in (src.path, src.path + ".json"):
+        with contextlib.suppress(OSError):
+            os.unlink(p)
+
+
+def shift_plan(plan: Sequence[Tuple[CkptTensor, torch.Tensor]], shift: int
+               ) -> List[Tuple[CkptTensor, torch.Tensor]]:
+    """The same plan against a file that starts ``shift`` bytes into the
+    shard (a RAM image of the extent)."""
+    if not shift:
+        return list(plan)
+    out = []
+    for ck, dst in plan:
+        if ck.file_offset < shift:
+            raise VisionRankStageRefused(
+                f"{ck.name} starts at {ck.file_offset}, before the image's first byte {shift}")
+        out.append((CkptTensor(ck.name, ck.dtype, ck.shape, ck.file_offset - shift, ck.nbytes), dst))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 6. H125 (NF): the PLACE on the card -- KV tail or free VRAM
+# ---------------------------------------------------------------------------
+#
+# The order's two places, "freier VRAM oder ein kleiner temporaerer
+# Offload": the KV tail IS the temporary offload that costs nothing (free KV
+# pages at the phase start, handed back before the admission); free VRAM is
+# the card's own air (cudaMemGetInfo + this process's idle allocator cache)
+# when the tail is not wholly free -- e.g. a P group that still holds pages
+# at its wake. ``auto`` (default) tries the tail first, then free VRAM, and
+# refuses by name when neither fits. ``kvtail`` is the 27B stage exactly.
+
+PLACE_ENV = "SGLANG_WEG2_VISION_PLACE"
+PLACE_AUTO = "auto"
+PLACE_KVTAIL = "kvtail"
+PLACE_FREE = "free"
+PLACES = (PLACE_AUTO, PLACE_KVTAIL, PLACE_FREE)
+#: air kept on the card beyond the tower for the encoder's activations (one
+#: image at a time: a 1024x1024 image is 4096 patches x 1152 wide, tens of
+#: MiB per activation) and the allocator's rounding.
+FREE_HEADROOM_MIN = 512 * MIB
+
+
+def vision_place(env: Optional[Dict[str, str]] = None) -> str:
+    e = os.environ if env is None else env
+    raw = (e.get(PLACE_ENV, "") or "").strip().lower()
+    if not raw:
+        return PLACE_AUTO
+    if raw not in PLACES:
+        raise VisionRankStageRefused(f"{PLACE_ENV}={raw!r} is not one of {list(PLACES)}")
+    return raw
+
+
+def slab_bytes(named_nbytes: Iterable[int], align: int = SLAB_ALIGN) -> int:
+    """One contiguous slab holding these tensors in order, each aligned."""
+    off = 0
+    for n in named_nbytes:
+        off = (off + align - 1) // align * align + int(n)
+    return off
+
+
+def free_headroom(tower_bytes: int) -> int:
+    return max(FREE_HEADROOM_MIN, int(tower_bytes) // 4)
+
+
+def free_vram_verdict(need_bytes: int, card_free_bytes: int, cache_idle_bytes: int
+                      ) -> Tuple[bool, str]:
+    """May the tower go into free VRAM? ``card_free`` is cudaMemGetInfo's
+    free, ``cache_idle`` this process's reserved-but-unallocated cache (the
+    allocator serves the slab from it first)."""
+    air = int(card_free_bytes) + max(0, int(cache_idle_bytes))
+    head = free_headroom(need_bytes)
+    want = int(need_bytes) + head
+    why = (f"need {need_bytes / MIB:.0f} MiB + headroom {head / MIB:.0f} MiB "
+           f"vs air {air / MIB:.0f} MiB (card free {card_free_bytes / MIB:.0f} + idle cache "
+           f"{max(0, int(cache_idle_bytes)) / MIB:.0f})")
+    return air >= want, why

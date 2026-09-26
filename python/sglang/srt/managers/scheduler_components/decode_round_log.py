@@ -90,6 +90,11 @@ eager round spells them::
 ``split unavailable`` survives for the cases that genuinely are unknown, and
 each now NAMES THE MISSING THING rather than naming the mechanism:
 
+``graph-replay-reader-off``
+    Register #52: the clock's graph reader is off in this process (the
+    production form; ``SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES=1`` turns it
+    on), so no graph carries nodes by choice. ``gpu-ms`` stays; the split and
+    everything fed from it (BARLINK-ROUND-CENSUS) is absent by name;
 ``graph-replay-no-event-nodes``
     the graph was captured with no scope armed (or the replay declared no
     key), so there is nothing to read;

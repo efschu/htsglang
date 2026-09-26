@@ -2353,6 +2353,9 @@ class Scheduler(
         # H101: every QSA rows launch form loaded (and its local memory booked)
         # BEFORE the sampling warmup's barrier and the first sleep.
         self.warm_qsa_rows_forms()
+        # H103: the run-time-T FLA l2norm kernel loaded BEFORE the sampling
+        # warmup's barrier and the first sleep (behind H101's rows prewarm).
+        self.warm_fla_l2norm()
         # #603b: LAST in this method, after every worker, pool, backend and
         # graph exists. The warmup ends in a group barrier, so it must sit at a
         # point every rank reaches exactly once with the model fully built.
@@ -2364,6 +2367,17 @@ class Scheduler(
         from sglang.srt.layers.attention.qsa.rows_prewarm import run_boot_prewarm
 
         run_boot_prewarm()
+
+    def warm_fla_l2norm(self):
+        """H103: delegate to fla/l2norm_prewarm.run_boot_prewarm (rank-local, no
+        collective; the #603b barrier right after pairs the ranks up)."""
+        from sglang.srt.layers.attention.fla.l2norm_prewarm import run_boot_prewarm
+
+        run_boot_prewarm(
+            hf_text_config=self.model_config.hf_text_config,
+            dtype=self.model_config.dtype,
+            device=self.tp_worker.device,
+        )
 
     def warm_sampling_backend(self):
         """#603b: make the sampling JIT kernels resident BEFORE serving starts.
@@ -18178,8 +18192,25 @@ class Scheduler(
         # polls /flush_cache every 0.5 s to its own quiesce deadline
         # (`weg2/front.py`, `Front.quiesce`), so a non-200 simply keeps the
         # poll going and the LAST body is what a W3 refusal prints.
-        self._weg2_vote_wanted = True
         outstanding = getattr(self, "_weg2_vote_outstanding", None)
+        if outstanding is None or not envs.SGLANG_WEG2_QUIESCE_FAST.get():
+            self._weg2_vote_wanted = True
+        else:
+            # fnFL2 H111: a poll that finds its lap still on the ring does NOT
+            # want another one. Wanting here stamped a second lap at the very
+            # pass-top that harvested the first (harvest, then stamp), so the
+            # next poll read the first lap as "round id mismatch" and dropped
+            # it -- one extra poll in 8 of 15 P->D flips at 50 ms, EVERY lap at
+            # a poll faster than the lap. Unwanted, the landed lap waits for
+            # the next poll and is read fresh (latest stamp == its epoch).
+            n = int(getattr(self, "_h111_pending_no_rewant_n", 0)) + 1
+            self._h111_pending_no_rewant_n = n
+            if n <= 8 or n % 64 == 0:
+                logger.info(
+                    "H111 QUIESCE-FAST lap epoch=%d still on the ring: no "
+                    "re-want (n=%d; the landed lap is read fresh by the next "
+                    "poll)", int(outstanding), n,
+                )
         epoch = int(getattr(self, "_weg2_vote_epoch", 0))
         return False, (
             f"GROUP VERDICT PENDING: the idle vote is on the ring "

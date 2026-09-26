@@ -297,5 +297,6 @@ def test_front_49_armed_line_names_value_and_role(monkeypatch):
 
     monkeypatch.setattr(front, "front_span_inflight", lambda: True)
     line = front.front_span_inflight_line()
-    assert line.startswith("WEG2-FRONT #49 SPAN-INFLIGHT armed=1 role=front pid="), line
+    assert line.startswith("WEG2-FRONT #49 SPAN-INFLIGHT armed=1 agent_span="), line
+    assert " role=front pid=" in line, line
     assert "SGLANG_WEG2_FRONT_SPAN_INFLIGHT" in line

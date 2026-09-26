@@ -228,6 +228,20 @@ DK7_PROVENANCE = (
     "BOOT_weg2dk7_0907.md quiet row 2026-09-08T00:29:02Z (boot weg2dk7 @ 402a2df856), "
     "per-rank RssShmem of the SLEEPING group"
 )
+#: H87: THE CHECKPOINT every built-in reference of this module was measured on.
+#: weg2dk5/dk6/dk7 (reap point, dk7 residual and image), weg2xsn20..25 (the
+#: ratchet series), weg2rg2/rg3/sb4/rg6/sb5c (ring-era transient and residual
+#: rows): all ran ``--model-path .../Qwen3.8-27B-INT8-gdncov-vocabembed`` (front
+#: logs in /spinning/evidence-665-f1, checked 2026-09-26). A boot of ANOTHER
+#: checkpoint may not be priced from them silently: the NVFP4 D-only container
+#: boot (rc2.1c2, dkrnfdnvfp4dbar109251235) took the dk7 residual 24.50 GiB as
+#: its run origin and the xsn series 8.70 GiB as its ratchet, both 27B figures.
+#: The identity is the MEMORY FOOTPRINT (``weg2_form.reference_model_verdict``),
+#: not the directory name.
+REFERENCE_MODEL = "Qwen3.8-27B-INT8-gdncov-vocabembed"
+#: The marker every H87 fallback line carries, so a reader (and a test) finds
+#: each place a built-in reference was NOT applied to this boot's model.
+FOREIGN_REFERENCE_TAG = "WEG2-HOST-REFERENCE-MODEL"
 #:
 #: The old term was ``backup_resident / weight_chunks`` -- "one chunk in flight"
 #: -- a RESIDENCY model of an interleave whose PEAK is both images partially
@@ -2281,6 +2295,8 @@ def resolve_image_terms(
     record: Optional[Dict[str, dict]] = None,
     want_digest: str = "",
     form_key_match: bool = False,
+    reference_model_ok: Optional[bool] = None,
+    reference_model_why: str = "",
 ) -> ImageTerms:
     """The dormant image per group, in the fix-8 precedence order.
 
@@ -2345,6 +2361,15 @@ def resolve_image_terms(
     else:
         p_gib = DK7_DORMANT_IMAGE_P_GIB
         p_source = f"RECORDED MEASUREMENT of another boot: {DK7_PROVENANCE}"
+        if reference_model_ok is False:
+            # H87: named, not silent. The image terms SIZE H(c) and bound D's
+            # image; they are not charged by `price` (the ring is). The value
+            # stays the conservative stand-in, and the source says whose it is.
+            p_source = (
+                f"{FOREIGN_REFERENCE_TAG} FOREIGN-MODEL stand-in (measured on "
+                f"{REFERENCE_MODEL}, not this checkpoint: "
+                f"{reference_model_why or 'identity not the reference'}): {DK7_PROVENANCE}"
+            )
         p_measured = False
     extra_p = p_gib - wt_p
 
@@ -2587,6 +2612,9 @@ def charge_terms(
     # while P runs (weg2/draft_park.py), allocated once per process and held
     # for its life -- a permanent host post, charged at BOTH moments.
     d_draft_host_gib: float = 0.0,
+    # H87: `--d-only` -- group D alone. There is no P process, so no dormant
+    # heap, no P host ring pool, no P draft host pool. False is byte-identical.
+    d_only: bool = False,
 ) -> Dict[str, object]:
     """Everything the BOOT ITSELF adds to ``memory.current``, per term.
 
@@ -2625,10 +2653,14 @@ def charge_terms(
     else:
         _s_p = s_gb
     rings_gib = 0.0 if hicache_disabled else (
-        (RING_P_MULT_GB_PER_S * _s_p + RING_D_MULT_GB_PER_S * _s_d) * GB / GIB
+        ((0.0 if d_only else RING_P_MULT_GB_PER_S * _s_p)
+         + RING_D_MULT_GB_PER_S * _s_d) * GB / GIB
     )
     return {
-        "heaps_gib": ranks_per_group * (HEAP_AWAKE_GIB + HEAP_DORMANT_GIB),
+        # H87: one group, always awake, under --d-only.
+        "heaps_gib": ranks_per_group * (
+            HEAP_AWAKE_GIB + (0.0 if d_only else HEAP_DORMANT_GIB)),
+        "d_only": bool(d_only),
         "anchors_gib": anchors_gib,
         "rings_gib": rings_gib,
         "arena_gib": 0.0 if hicache_disabled else float(arena_gib),
@@ -2642,7 +2674,7 @@ def charge_terms(
         # prints what it CHARGED rather than what it was asked for.
         "s_gb_d": float(_s_d),
         "overhead_gib": HOST_POOL_OVERHEAD * (anchors_gib + rings_gib),
-        "draft_host_p_gib": DRAFT_HOST_P_MIB / 1024.0,
+        "draft_host_p_gib": 0.0 if d_only else DRAFT_HOST_P_MIB / 1024.0,
         "draft_host_d_gib": DRAFT_HOST_D_MIB / 1024.0,
         # H25: the ledger post 'd_draft_host' (parked D draft weights).
         "d_draft_host_gib": max(0.0, float(d_draft_host_gib)),
@@ -2872,7 +2904,8 @@ def record_run_residual_gib(
 
 
 def run_origin_gib(
-    cg_nonreclaim_gib: Optional[float], record: Optional[Dict[str, dict]] = None
+    cg_nonreclaim_gib: Optional[float], record: Optional[Dict[str, dict]] = None,
+    reference_model_ok: Optional[bool] = None, reference_model_why: str = "",
 ) -> Tuple[Optional[float], str]:
     """The origin the RUN PEAK is predicted from, and where it came from.
 
@@ -3077,6 +3110,25 @@ def run_origin_gib(
             "(#1350e). The dk7 stand-in is NOT used here -- it answers 'no record "
             "at all', not 'the record was refused', and at 24.50 GiB it would be a "
             "worse origin than the reading just rejected"
+        )
+    elif reference_model_ok is False:
+        # H87: NO RECORD OF THIS MODEL, AND THE STAND-IN IS ANOTHER MODEL'S.
+        # The dk7 residual is a 27B boot's remainder (dkrnfdnvfp4dbar109251235,
+        # Qwen3.8-Flash-Next-NVFP4: run origin 24.50 GiB from weg2dk7 against a
+        # launch reading of 0.77). It is not priced here; the launch-moment
+        # reading stands alone -- the same origin #1350e takes when every
+        # record was refused -- and the line names both the foreign figure and
+        # why it does not apply. The first boot of this model writes its own
+        # run-moment record at its first sleep; from then on (a) answers.
+        floor = cg_nonreclaim_gib
+        floor_src = (
+            f"{FOREIGN_REFERENCE_TAG} FALLBACK run-origin: no run-moment residual of "
+            f"THIS model in the record, and the built-in stand-in "
+            f"{dk7_run_residual_gib():.2f} GiB [{DK7_PROVENANCE}] was measured on "
+            f"{REFERENCE_MODEL}, not on this boot's checkpoint "
+            f"({reference_model_why or 'identity not the reference'}) -- NOT priced; "
+            f"the launch-moment reading is the origin until this model's first "
+            f"boot records its own residual"
         )
     else:
         floor = dk7_run_residual_gib()
@@ -3671,6 +3723,8 @@ def resolve_flip_ratchet_gib(
     *,
     flips_priced: Optional[int] = None,
     seed_allowed: bool = True,
+    reference_model_ok: Optional[bool] = None,
+    reference_model_why: str = "",
 ) -> FlipRatchet:
     """The charged flip ratchet and its provenance, or W94.
 
@@ -3729,10 +3783,22 @@ def resolve_flip_ratchet_gib(
         rows = " ".join(
             f"{b}:{v:+.3f}" for b, v in sorted(FLIP_RATCHET_SERIES_GIB.items())
         )
+        # H87: the series is six Qwen3.8-27B-INT8 boots. For another checkpoint
+        # it stays the charged figure -- the conservative direction, and the
+        # first boot of a new model must be pricable -- but it is NAMED as a
+        # foreign stand-in, never passed off as this model's term.
+        _foreign = (
+            f"{FOREIGN_REFERENCE_TAG} FOREIGN-MODEL stand-in: the series was measured "
+            f"on {REFERENCE_MODEL}, not this checkpoint "
+            f"({reference_model_why or 'identity not the reference'}); charged as a "
+            f"conservative bound until this model's first flip pair writes "
+            f"flip_ratchet_gib -- "
+            if reference_model_ok is False else ""
+        )
         return FlipRatchet(
             per_flip_gib=float(need),
             flips_priced=n,
-            source=(
+            source=_foreign + (
                 f"SERIES (NOT this line's own record, and NOT the retired "
                 f"first-pair seed): MAX over the measured 6-boot series [{rows}], "
                 f"binding {boot} {need:.3f} GiB. Each row is what that boot's "
@@ -3770,6 +3836,34 @@ def resolve_flip_ratchet_gib(
         "boot that never completes a first flip PAIR writes nothing, and a boot "
         "whose predecessor wrote nothing must be priced from the recorded seed or "
         "not at all."
+    )
+
+
+#: H87: the marker of a D-ONLY arm on every line that prices one.
+D_ONLY_TAG = "WEG2-HOST-LEDGER D-ONLY"
+
+
+def d_only_flip_ratchet() -> FlipRatchet:
+    """H87: the ratchet of a ``--d-only`` boot -- ZERO FLIPS, declared.
+
+    Not an absence (``None`` would print "NOT priced at 0" and read as a
+    missing measurement) and not :func:`resolve_flip_ratchet_gib` (whose
+    ``max(1, flips_priced)`` exists because a flip boot flips at least once).
+    A D-only boot starts group D alone, no P, no front, no flip: the permanent
+    step a flip adds never happens, so the run moment carries none of it.
+    Measured on the container boot dkrnfdnvfp4dbar109251235 (rc2.1c2, NVFP4
+    D-only): the ledger charged the 27B series 8.70 GiB for a flip that boot
+    cannot run and refused W87/W20 at run=-2.82 GiB.
+    """
+    return FlipRatchet(
+        per_flip_gib=0.0,
+        flips_priced=0,
+        source=(
+            f"{D_ONLY_TAG}: no flip arm -- --d-only starts group D alone (no P, no "
+            f"front, no flip), so no flip pair is priced and no series or record "
+            f"is consulted"
+        ),
+        from_record=False,
     )
 
 
@@ -4127,6 +4221,11 @@ def price(
     staging_gb: Optional[float] = None,
     anchor_mib: Optional[int] = None,
     d_draft_host_gib: float = 0.0,
+    # H87: see `charge_terms` (d_only) and `run_origin_gib`/`resolve_image_terms`
+    # (reference_model_ok). Defaults are byte-identical to every caller before.
+    d_only: bool = False,
+    reference_model_ok: Optional[bool] = None,
+    reference_model_why: str = "",
 ) -> Arm:
     """Price one arm at both moments.  Pure.
 
@@ -4276,7 +4375,9 @@ def price(
     # #1362 [22-fix]: the arm knows which model it prices, so the image check
     # happens here rather than in a comment about who ought to do it.
     images = resolve_image_terms(measured_record, want_digest=model_digest_want,
-                                form_key_match=form_key_matches)
+                                form_key_match=form_key_matches,
+                                reference_model_ok=reference_model_ok,
+                                reference_model_why=reference_model_why)
     charges = charge_terms(s_gb, m_mib, ranks_per_group, images, s_gb_d=s_gb_d,
                            xchg_bounce_host_bytes=xchg_bounce_host_bytes,
                            flip_ratchet_gib=(
@@ -4285,7 +4386,7 @@ def price(
                            ),
                            hicache_disabled=hicache_disabled,
                            arena_gib=arena_gib, staging_gb=staging_gb, anchor_mib=anchor_mib,
-                           d_draft_host_gib=d_draft_host_gib)
+                           d_draft_host_gib=d_draft_host_gib, d_only=d_only)
     heaps_gib = charges["heaps_gib"]
     anchors_gib = charges["anchors_gib"]
     rings_gib = charges["rings_gib"]
@@ -4332,6 +4433,8 @@ def price(
     origin_gib, origin_source = run_origin_gib(
         None if cg_nonreclaim_bytes is None else cg_nonreclaim_bytes / GIB,
         measured_record,
+        reference_model_ok=reference_model_ok,
+        reference_model_why=reference_model_why,
     )
     arm = Arm(
         s_gb=s_gb,
@@ -4372,6 +4475,7 @@ def price(
         # could verify the VALUE only by inverting the ring arithmetic.
         "s_gb_d": float(s_gb if s_gb_d is None else s_gb_d),
         "heaps_gib": heaps_gib,
+        "d_only": bool(d_only),
         "host_ring_gib": host_ring_gib,
         "host_ring_span1_gib": host_ring_span1_gib,
         # #1327: WHY the term is 0, so a reader never has to guess whether
@@ -5161,7 +5265,9 @@ def cushion_headroom_gib(cushion_min_gib: Optional[float],
     return float(cushion_min_gib) - (float(bounce_now_gib) - float(bounce_then_gib))
 
 
-def flip_ratchet_candidates(path: str, form_key: str) -> List[Dict[str, object]]:
+def flip_ratchet_candidates(
+    path: str, form_key: str, accept: Optional[Callable[[dict], bool]] = None,
+) -> List[Dict[str, object]]:
     """Every "FLIP" sidecar entry of the given FORM, in file order.
 
     #1378 Stage 2 order: NOT :func:`read_measured_record`, which collapses to
@@ -5194,12 +5300,18 @@ def flip_ratchet_candidates(path: str, form_key: str) -> List[Dict[str, object]]
             continue
         if e.get("cushion_min_gib") is None or e.get("xchg_bounce_gib") is None:
             continue
+        # H87: `form_key` is `wtags=<N>` -- a weight-tag COUNT, which two
+        # checkpoints share by accident. The caller's model predicate (the
+        # same one `read_measured_record` takes) keeps another model's cushion
+        # out. None = every candidate, as before.
+        if accept is not None and not accept(e):
+            continue
         out.append(e)
     return out
 
 
 def resolve_prior_cushion(
-    path: str, form_key: str
+    path: str, form_key: str, accept: Optional[Callable[[dict], bool]] = None,
 ) -> Tuple[Optional[float], Optional[float], str]:
     """#1378 Stage 2: the PRIOR boot's own numbers, SELF-read from the
     sidecar -- no operator has to type them.
@@ -5219,7 +5331,7 @@ def resolve_prior_cushion(
     silent guess, and never a refusal: the caller's own "not measured" line
     is what an absent auto-resolution produces.
     """
-    candidates = flip_ratchet_candidates(path, form_key)
+    candidates = flip_ratchet_candidates(path, form_key, accept=accept)
     if not candidates:
         return None, None, (
             f"auto-resolve found no measured FLIP record of form_key="
@@ -5440,6 +5552,9 @@ def choose(
     staging_gb: Optional[float] = None,
     anchor_mib: Optional[int] = None,
     d_draft_host_gib: float = 0.0,
+    d_only: bool = False,
+    reference_model_ok: Optional[bool] = None,
+    reference_model_why: str = "",
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
 
@@ -5499,10 +5614,35 @@ def choose(
             hicache_disabled=hicache_disabled,
             arena_gib=arena_gib, staging_gb=staging_gb, anchor_mib=anchor_mib,
             d_draft_host_gib=d_draft_host_gib,
+            d_only=d_only,
+            reference_model_ok=reference_model_ok,
+            reference_model_why=reference_model_why,
         )
         for s, m in arms
     ]
     t = priced[0].terms
+    # H87: the two new declarations are LOUD, one line each, before the terms.
+    if d_only:
+        lines.append(
+            f"{D_ONLY_TAG}: no flip arm -- --d-only starts group D alone (no P, no "
+            f"front, no flip). Charged: ONE awake group ({ranks_per_group}x"
+            f"{HEAP_AWAKE_GIB} heaps, no dormant {ranks_per_group}x{HEAP_DORMANT_GIB}), "
+            f"D's host rings only, no P draft host pool, flip ratchet "
+            f"{'0.00 (declared, zero flips)' if flip_ratchet is not None and flip_ratchet.flips_priced == 0 else 'AS HANDED IN'}. "
+            f"NOT a term of this ledger, flip or D-only: the MoE EXPERT STORE when it "
+            f"lives on a tmpfs charged to this cgroup (SGLANG_MOE_EXPERT_STORE_DIR; "
+            f"NVFP4 D-only fnNV4d1 measured 76.2 GiB non-reclaimable with a 46 GiB "
+            f"store) -- a FUNDABLE here does not fund that store"
+        )
+    if reference_model_ok is not None:
+        lines.append(
+            f"{FOREIGN_REFERENCE_TAG} built-in references (dk7 residual/image, "
+            f"ratchet series) were measured on {REFERENCE_MODEL}: "
+            + ("APPLY to this boot" if reference_model_ok else
+               "do NOT apply to this boot -- every place that would have priced "
+               "one says FALLBACK/FOREIGN-MODEL on its own line")
+            + f" ({reference_model_why or 'no reason given'})"
+        )
     # #1362 [22-fix2]: the transition path is LOUD. A legacy record admitted on
     # a form-key match prints exactly one line naming the record it admitted --
     # silent acceptance would make the pre-#1362 records indistinguishable from
@@ -6055,6 +6195,9 @@ def choose(
                         flip_ratchet=flip_ratchet,
                         arena_gib=arena_gib, staging_gb=staging_gb, anchor_mib=anchor_mib,
                         d_draft_host_gib=d_draft_host_gib,
+                        d_only=d_only,
+                        reference_model_ok=reference_model_ok,
+                        reference_model_why=reference_model_why,
                     )
                 except Exception:  # noqa: BLE001 - advice may never mask the refusal
                     return False

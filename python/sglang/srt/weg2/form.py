@@ -324,6 +324,12 @@ class ModelProfile:
     #: NF H34b warm min-dwell (SGLANG_WEG2_ENABLE_WARM_MIN_DWELL); the 27B metal
     #: priced K7 with the last same-direction flip.
     warm_min_dwell: bool
+    #: 27B #49 agent span on the front (SGLANG_WEG2_ENABLE_AGENT_SPAN, NF P49
+    #: c1988ff84f): tools priced first, a D serve holds its prompt_tokens for
+    #: its epoch, prefix priced in measured tokens. Operator 26.09.: the 27B
+    #: line ran it unswitched since RC9 (S7c); NF off until the NF seat
+    #: releases it with a boot tag.
+    agent_span: bool
     vision: str
     context_tokens: int
     records: RecordKey
@@ -348,6 +354,7 @@ class ModelProfile:
         out["SGLANG_WEG2_STORE_SHORT_TAIL"] = bool(self.store_short_tail)
         out["SGLANG_WEG2_BIGRAM_ANCHOR_EXACT"] = bool(self.bigram_anchor_exact)
         out["SGLANG_WEG2_ENABLE_WARM_MIN_DWELL"] = bool(self.warm_min_dwell)
+        out["SGLANG_WEG2_ENABLE_AGENT_SPAN"] = bool(self.agent_span)
         return out
 
     def constant(self, name: str) -> object:
@@ -451,6 +458,7 @@ PROFILES: Dict[str, ModelProfile] = {
         store_short_tail=True,
         bigram_anchor_exact=False,
         warm_min_dwell=False,
+        agent_span=True,
         vision="transient",
         context_tokens=262144,
         # OPERATOR 26.09. (UN4): the 27B-RC9 records count on this tree as a
@@ -512,6 +520,8 @@ PROFILES: Dict[str, ModelProfile] = {
         store_short_tail=False,
         bigram_anchor_exact=True,
         warm_min_dwell=True,
+        # NF P49: off until the NF seat releases #49 with a boot tag
+        agent_span=False,
         vision="off",
         context_tokens=262144,
         records=RecordKey(fields=("checkpoint", "form", "power_limit")),
@@ -546,7 +556,8 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: of 26.09. -- every 27B profile set 1), SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD (H81; the 27B alias
 #: SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE is read in environ.py), the four NF
 #: tail switches (``end_anchor``), SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS
-#: (``mamba_anchor``), SGLANG_WEG2_DRAFT_SHARE_EMBED (``draft.share_embed``).
+#: (``mamba_anchor``), SGLANG_WEG2_DRAFT_SHARE_EMBED (``draft.share_embed``),
+#: SGLANG_WEG2_ENABLE_AGENT_SPAN (``agent_span``, #49; operator 26.09.).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }
@@ -791,6 +802,233 @@ def _fractions(value: str) -> List[float]:
 def model_key(model: str) -> str:
     """The calibration identity of a checkpoint: its directory name."""
     return os.path.basename(str(model or "").rstrip("/").strip("'\""))
+
+
+# --------------------------------------------------------------------------
+# H87: the MEMORY-FOOTPRINT identity of a checkpoint
+# --------------------------------------------------------------------------
+#
+# WHY A THIRD KEY. This fork has two and neither answers "does this checkpoint
+# cost the host and the cards what the recorded one cost?":
+#
+# * ``model_key`` (the directory NAME) is too strict and too weak at once: an
+#   abliterated derivative (``...-abl-wxp``: config.json and every safetensors
+#   header byte-identical to its base, only the weight VALUES differ) is a
+#   different name, so every record of the base is refused and the ledger falls
+#   to a built-in reference of ANOTHER model; and a directory re-populated with
+#   a different quantisation keeps its name.
+# * ``host_ledger.checkpoint_digest`` (text_config + sorted tensor NAMES) sees
+#   no dtype and no shape and no top-level ``quantization_config``: an INT4
+#   g32 and a g128 re-quantisation of one model carry the same tensor names
+#   (``weight_packed``/``weight_scale``/``weight_zero_point``) and the same
+#   text_config, and collide.
+#
+# ``footprint_key`` hashes what decides the bytes: the whole config minus pure
+# provenance keys, the quantisation sidecars, and (name, dtype, shape) of every
+# tensor, read from the safetensors HEADERS only (8 bytes + a JSON header per
+# shard -- no weight byte is read). Weight VALUES are deliberately out: an
+# abliterated or otherwise re-trained derivative with identical shapes and
+# formats IS the same footprint, and a content hash of the weights would call
+# it foreign. Any change in a shape, a dtype, a tensor set, a quantisation
+# parameter or a config field is a different key.
+
+#: Config keys that name WHERE a checkpoint came from, not what it holds.
+FOOTPRINT_IGNORE_KEYS = frozenset({
+    "_name_or_path", "name_or_path", "_commit_hash", "transformers_version",
+})
+#: Quantisation sidecar files some exporters write beside config.json
+#: (ModelOpt NVFP4: hf_quant_config.json; llm-compressor: quantization_config.json).
+FOOTPRINT_QUANT_FILES = ("quantization_config.json", "hf_quant_config.json")
+FOOTPRINT_SCHEMA = "weg2-footprint/1"
+#: A safetensors header larger than this is not a header (corrupt/partial file).
+_SAFETENSORS_HEADER_MAX = 256 << 20
+
+
+def _strip_provenance(obj):
+    if isinstance(obj, dict):
+        return {k: _strip_provenance(v) for k, v in obj.items()
+                if k not in FOOTPRINT_IGNORE_KEYS}
+    if isinstance(obj, list):
+        return [_strip_provenance(v) for v in obj]
+    return obj
+
+
+def _safetensors_header(path: str) -> Dict[str, object]:
+    import struct
+
+    with open(path, "rb") as f:
+        raw = f.read(8)
+        if len(raw) != 8:
+            raise ValueError(f"{path}: shorter than a safetensors header")
+        (n,) = struct.unpack("<Q", raw)
+        if n <= 0 or n > _SAFETENSORS_HEADER_MAX:
+            raise ValueError(f"{path}: header length {n} out of range")
+        hdr = json.loads(f.read(n))
+    if not isinstance(hdr, dict):
+        raise ValueError(f"{path}: header is not an object")
+    return hdr
+
+
+def _footprint_stamp(model_dir: str) -> Tuple:
+    out = []
+    for n in ("config.json", "model.safetensors.index.json") + FOOTPRINT_QUANT_FILES:
+        try:
+            st = os.stat(os.path.join(model_dir, n))
+            out.append((n, st.st_size, st.st_mtime_ns))
+        except OSError:
+            out.append((n, None, None))
+    try:
+        st = os.stat(model_dir)
+        out.append((".", st.st_mtime_ns))
+    except OSError:
+        out.append((".", None))
+    return tuple(out)
+
+
+@lru_cache(maxsize=64)
+def _footprint_cached(model_dir: str, _stamp: Tuple) -> Tuple[Optional[str], str]:
+    import hashlib
+
+    try:
+        with open(os.path.join(model_dir, "config.json")) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as e:
+        return None, f"config.json unreadable in {model_dir} ({type(e).__name__})"
+    if not isinstance(cfg, dict):
+        return None, f"config.json in {model_dir} is not an object"
+    quant = {}
+    for n in FOOTPRINT_QUANT_FILES:
+        p = os.path.join(model_dir, n)
+        if os.path.exists(p):
+            try:
+                with open(p) as f:
+                    quant[n] = _strip_provenance(json.load(f))
+            except (OSError, ValueError) as e:
+                return None, f"{n} unreadable in {model_dir} ({type(e).__name__})"
+    idx_path = os.path.join(model_dir, "model.safetensors.index.json")
+    try:
+        if os.path.exists(idx_path):
+            with open(idx_path) as f:
+                files = sorted(set(json.load(f)["weight_map"].values()))
+        else:
+            files = sorted(n for n in os.listdir(model_dir) if n.endswith(".safetensors"))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        return None, f"tensor index unreadable in {model_dir} ({type(e).__name__})"
+    if not files:
+        return None, (f"no safetensors shard in {model_dir} (a GGUF or other format "
+                      f"has no header this key reads)")
+    tensors = []
+    for n in files:
+        p = os.path.join(model_dir, n)
+        if not os.path.exists(p):
+            return None, f"incomplete checkpoint: shard {n} named by the index is missing in {model_dir}"
+        try:
+            hdr = _safetensors_header(p)
+        except (OSError, ValueError) as e:
+            return None, f"safetensors header unreadable: {e}"
+        for name, meta in hdr.items():
+            if name == "__metadata__" or not isinstance(meta, dict):
+                continue
+            tensors.append([name, str(meta.get("dtype")), list(meta.get("shape") or [])])
+    tensors.sort()
+    blob = json.dumps({"schema": FOOTPRINT_SCHEMA, "config": _strip_provenance(cfg),
+                       "quant": quant, "tensors": tensors},
+                      sort_keys=True, separators=(",", ":"))
+    key = hashlib.sha256(blob.encode()).hexdigest()
+    return key, (f"{FOOTPRINT_SCHEMA}: config (minus {sorted(FOOTPRINT_IGNORE_KEYS)}) + "
+                 f"quant sidecars {sorted(quant) or 'none'} + (name, dtype, shape) of "
+                 f"{len(tensors)} tensors from {len(files)} safetensors headers; weight "
+                 f"values NOT hashed")
+
+
+def footprint_key(model: str) -> Tuple[Optional[str], str]:
+    """``(key, why)``: the memory-footprint identity of the checkpoint at
+    ``model``, or ``(None, why)`` when it cannot be read (missing/partial
+    checkpoint, no safetensors). ``None`` is UNKNOWN, never "same"."""
+    d = str(model or "").rstrip("/").strip("'\"")
+    if not d or not os.path.isdir(d):
+        return None, f"no checkpoint directory at {d!r}"
+    return _footprint_cached(d, _footprint_stamp(d))
+
+
+#: H87: the footprint keys of the checkpoints the BUILT-IN references were
+#: measured on, so a reference constant can be checked against a boot's model
+#: wherever the checkpoint lives (native path, container mount, renamed copy).
+#: Computed with :func:`footprint_key` on 2026-09-26 from
+#: /spinning/llm_stuff/club-3090/models-cache/<name>; pinned by
+#: test_weg2_record_model_identity_h87 against the live directories when present.
+REFERENCE_FOOTPRINTS: Dict[str, str] = {
+    # host_ledger's dk7 residual/image, the weg2xsn20..25 ratchet series, the
+    # ring-era transient and residual rows: every one a Qwen3.8-27B-INT8 boot.
+    "Qwen3.8-27B-INT8-gdncov-vocabembed": "28e1c5c3ec479cecc9ff90c3e6b54a9196087360484e0455c955bd327e811e82",
+    # wake_credit REFERENCE_FNFL2X114D, wake_credit_pd_refs FORM_KEYS.
+    "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist": "5d82a6f6b1f14bfccf79fe321eb448d40751fd9bdc9b50b504f66b2acfddcb7b",
+}
+
+
+def _config_differs(a_dir: str, b_dir: str) -> bool:
+    """Cheap pre-check: two checkpoints whose config.json (minus provenance)
+    differ cannot share a footprint -- the config is part of the key. Spares
+    reading tens of thousands of tensor headers for every foreign model name a
+    record scan meets. Unreadable on either side -> False (decide on the key)."""
+    try:
+        with open(os.path.join(a_dir, "config.json")) as f:
+            a = _strip_provenance(json.load(f))
+        with open(os.path.join(b_dir, "config.json")) as f:
+            b = _strip_provenance(json.load(f))
+    except (OSError, ValueError):
+        return False
+    return a != b
+
+
+def reference_footprint(reference: str, model: str = "") -> Tuple[Optional[str], str]:
+    """The footprint of a reference checkpoint named by its directory name:
+    the pinned constant first, else a sibling directory of ``model`` with that
+    name (the rig keeps every checkpoint in one models directory)."""
+    ref = model_key(reference)
+    if ref in REFERENCE_FOOTPRINTS:
+        return REFERENCE_FOOTPRINTS[ref], f"pinned footprint of {ref}"
+    parent = os.path.dirname(str(model or "").rstrip("/").strip("'\""))
+    if parent:
+        got, why = footprint_key(os.path.join(parent, ref))
+        if got:
+            return got, f"footprint of the sibling checkpoint {os.path.join(parent, ref)}"
+        return None, why
+    return None, f"no pinned footprint for {ref} and no models directory to look in"
+
+
+def reference_model_verdict(model: str, reference: str) -> Tuple[bool, str]:
+    """H87: is ``model`` (a checkpoint path) the checkpoint ``reference`` (a
+    directory name) was measured on -- in MEMORY FOOTPRINT?
+
+    ``True`` for the same directory name when neither footprint can be read
+    (the pre-H87 answer, said so), and for any name whose footprint equals the
+    reference's (an abliterated derivative). ``False`` for a different
+    footprint even under the same name, and for a different name whose
+    footprint is unknown -- an unproven identity is not a match."""
+    want_name, ref_name = model_key(model), model_key(reference)
+    _parent = os.path.dirname(str(model or "").rstrip("/").strip("'\""))
+    if (want_name != ref_name and ref_name not in REFERENCE_FOOTPRINTS and _parent
+            and _config_differs(str(model).rstrip("/"), os.path.join(_parent, ref_name))):
+        return False, (f"{want_name} is not the reference {ref_name}: config.json differs "
+                       f"(so the footprint does)")
+    mine, mine_why = footprint_key(model)
+    theirs, theirs_why = reference_footprint(ref_name, model)
+    if mine and theirs:
+        if mine == theirs:
+            return True, (f"footprint {mine[:12]}... of {want_name} == reference "
+                          f"{ref_name} ({theirs_why})"
+                          + ("" if want_name == ref_name else
+                             " -- a DERIVATIVE with identical shapes and formats"))
+        return False, (f"footprint {mine[:12]}... of {want_name} != {theirs[:12]}... "
+                       f"of reference {ref_name}")
+    if want_name == ref_name:
+        return True, (f"same checkpoint name {ref_name}; footprint not comparable "
+                      f"(this: {mine_why if not mine else 'ok'}; reference: "
+                      f"{theirs_why if not theirs else 'ok'}) -- identity held by the NAME alone")
+    return False, (f"{want_name} is not the reference {ref_name} and no footprint proves "
+                   f"otherwise (this: {mine_why if not mine else mine[:12] + '...'}; "
+                   f"reference: {theirs_why if not theirs else theirs[:12] + '...'})")
 
 
 def checkpoint_arch(model: str) -> Tuple[Optional[str], str]:
@@ -1262,10 +1500,23 @@ def same_model_sample(
     (no form line) on its draft when its argv names one, else on its model.
     """
     want = model_key(model)
+    # H87: a record of ANOTHER directory name counts when that checkpoint has
+    # this one's memory footprint (an abliterated derivative of the model the
+    # record was measured on). One verdict per recorded name, not per sample.
+    _same: Dict[str, bool] = {}
+
+    def _same_model(name: Optional[str]) -> bool:
+        if not name:
+            return False
+        if name == want:
+            return True
+        if name not in _same:
+            _same[name] = reference_model_verdict(model, name)[0]
+        return _same[name]
 
     def accept(sample: dict) -> bool:
         ident = boot_tag_identity(str(sample.get("boot_tag", "")), evidence_dir)
-        if ident.model != want:
+        if not _same_model(ident.model):
             return False
         if form is None:
             return True
@@ -1279,9 +1530,18 @@ def same_model_sample(
 def same_model_log(model: str) -> Callable[[str], bool]:
     """Predicate for ``*.P.log`` calibration sources: this boot's checkpoint?"""
     want = model_key(model)
+    _same: Dict[str, bool] = {}
 
     def accept(path: str) -> bool:
-        return group_log_model(path) == want
+        got = group_log_model(path)
+        if not got:
+            return False
+        if got == want:
+            return True
+        # H87: a footprint-identical derivative's logs calibrate this boot too.
+        if got not in _same:
+            _same[got] = reference_model_verdict(model, got)[0]
+        return _same[got]
 
     return accept
 

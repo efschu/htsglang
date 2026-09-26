@@ -11,6 +11,7 @@ from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
 from array import array
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from functools import partial
 from queue import Empty, Queue
 from typing import (
@@ -1841,8 +1842,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
         # P-HOST-OVERLAP: a chunk publish still deferred goes out before the
         # finish path publishes its own node, so the chain keeps parents first.
-        # Nothing is deferred unless SGLANG_WEG2_P_HOST_OVERLAP=1.
-        self.weg2_flush_deferred_chunk_publish()
+        # Nothing is deferred unless SGLANG_WEG2_P_HOST_OVERLAP=1 (the only
+        # deferral site, cache_unfinished_req, asks the same switch) -- so the
+        # flush is asked under that switch too, and the off path is the stock
+        # finish, byte for byte (rc2.1m Nachzug: the unconditional call broke
+        # the h63c/h63d finish harnesses, which bind cache_finished_req alone).
+        if _weg2_p_overlap.p_host_overlap_on():
+            self.weg2_flush_deferred_chunk_publish()
         if _weg2_p_overlap.p_host_overlap_on():
             # SERVED-AFTER-ACK (xsn422/xsn423 HOLD-REFETCH, rid weg2-18-36): the
             # deferred publish of the N-1 node is issued after the LAST chunk's
@@ -7506,7 +7512,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         agreement keeps finding work it runs every round, as today.
         """
         r = self._drain_gate_round = int(getattr(self, "_drain_gate_round", 0)) + 1
-        if r < int(getattr(self, "_drain_gate_next", 0)):
+        if r < int(getattr(self, "_drain_gate_next", 0)) and not getattr(
+            self, "_drain_gate_force", False
+        ):
             self._drain_gate_skipped = int(getattr(self, "_drain_gate_skipped", 0)) + 1
             return
         hot = self.drain_storage_control_queues()
@@ -7518,6 +7526,33 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "(rank-uniform cadence; unset SGLANG_HICACHE_DRAIN_AGREE_EVERY = every round)",
                 every, r, n, int(getattr(self, "_drain_gate_skipped", 0)), bool(hot),
             )
+
+    @contextmanager
+    def drain_gate_forced(self):
+        """H136 (NF): inside this block the storage-queue agreement runs on
+        EVERY ``check_hicache_events`` again, whatever the cadence gate says.
+
+        WHY. The gate (SGLANG_HICACHE_DRAIN_AGREE_EVERY=N) is for decode rounds.
+        The sleep drain before a flip (``weg2_sleep_drain``, fnFL2x105) polls
+        ``check_hicache_events`` every 10 ms until the GROUP verdict is idle; a
+        backup ack that lands while the MIN was zero would wait up to N-1 polls
+        there -- N=8 is up to ~70 ms added to the flip, the one number the flip
+        is judged by. Forced, the loop drains exactly as it does unset.
+
+        WHY IT STAYS RANK-UNIFORM. The block is entered and left by every rank
+        of the group at the same poll (the sleep drain is a group loop: the
+        verdict it leaves on is a MAX over the same attention group), so inside
+        it every rank posts the agreement on every call, as today; the round
+        counter keeps advancing once per call, and the next due round after the
+        block is computed from the last agreed MIN -- identical inputs on every
+        rank, identical sequence of collectives. With the gate unset the flag is
+        never read (``check_hicache_events`` takes the ungated drain)."""
+        prev = getattr(self, "_drain_gate_force", False)
+        self._drain_gate_force = True
+        try:
+            yield
+        finally:
+            self._drain_gate_force = prev
 
     def _apply_storage_runtime_config(
         self,

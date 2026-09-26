@@ -564,6 +564,34 @@ class Envs:
     # False = any landed lap answers, the 2026-09-24 form.
     SGLANG_WEG2_ENABLE_IDLE_VOTE_FRESHNESS = EnvBool(True)
     SGLANG_WEG2_IDLE_VOTE_TTL_S = EnvFloat(2.0)
+    # QUIESCE_FAST (fnFL2 H111, Tail-Buchhaltung): the front's quiesce polls
+    # /flush_cache every QUIESCE_FAST_POLL_MS instead of 50 ms, and PP0 no
+    # longer WANTS a new idle lap from a poll that finds its lap still on the
+    # ring. Measured x177/x178/h91v1, all 15 P->D flips: the last
+    # write-through lands +19..+189 ms after P-end, /flush_cache answers 200
+    # 95..189 ms later -- two polls at 50 ms per lap, and in 8 of 15 flips a
+    # poll during the lap wanted a second one, so the first lap came home
+    # "#1268 IDLE-ROUND stale ... round id mismatch" and cost one more poll.
+    # Without the guard a poll faster than a lap would drop EVERY lap (a new
+    # one is stamped at the harvest pass), so ONE switch arms both halves;
+    # the launcher hands its own environment to the front and to every rank
+    # (build_env / fenv = dict(os.environ)), so export it in the arm.
+    # False = the 50 ms poll and the unconditional want, byte-identical.
+    SGLANG_WEG2_QUIESCE_FAST = EnvBool(False)
+    SGLANG_WEG2_QUIESCE_FAST_POLL_MS = EnvInt(10)
+    # DEPOSIT_LANE_LOOKAHEAD (fnFL2 H111b, Legs): the sleeper's pair lanes
+    # (cross-card, BAR1 or host) leave the per-tag lockstep -- each runs in
+    # its own worker over the tag order, at most DEPOSIT_LANE_AHEAD tag(s)
+    # beyond the tag the loop pauses; the on-card lane, the pause and the
+    # credit stay on the loop thread in their old order (weg2/deposit_lookahead.py).
+    # Measured x177/x178/h91v1: lockstep idle 42-156 ms and pause+credit
+    # 5-7 ms x 10 tags per flip sit on PP0's chain above the 1.25 s copy-engine
+    # floor. False = the lockstep, byte for byte.
+    SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD = EnvBool(False)
+    SGLANG_WEG2_DEPOSIT_LANE_AHEAD = EnvInt(1)
+    # the sleeping group(s) that take the lookahead (comma list, default the
+    # P->D direction only: P sleeps, PP0's chain is the Flipzeit's legs).
+    SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD_GROUPS = EnvStr("P")
     # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
     # not carry (pad + D-extra rows, loaded from the host store) are issued on
     # a side stream right behind the resume of their layer's chunk tag, i.e.
@@ -712,6 +740,17 @@ class Envs:
     # round read late by query (GPU idle the host caused). perf_counter around
     # existing calls, no sync; 0 = no line and no events.
     SGLANG_DEBUG_DECODE_HOST_SPLIT = EnvInt(64)
+    # COLLECTIVE-CLOCK GRAPH READER (Register #52, utils/collective_clock.py):
+    # lay the clock's event-record NODES into every captured decode graph
+    # (#1241b), bind K event sets per graph (Task #52) and, before every
+    # replay, swap the set (2 cudaGraphExecEventRecordNodeSetEvent per pair)
+    # and record a launch fence (#1302). That is what makes a graphed
+    # 'Decode rank batch' line carry a compute/wait split (and feeds
+    # BARLINK-ROUND-CENSUS, H28). Measuring form only: x176 bound 192 pairs x
+    # 8 sets per graph; 20.09. Runden/s 26,0 -> 24,4..27,1. Off: no node, no
+    # set, no swap, no fence; graphed rounds print 'split unavailable:
+    # graph-replay-reader-off'. Per rank env (set it in group D).
+    SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES = EnvBool(False)
     # LRU_WARM_FROM_HANDOFF (H29b): after rearm_after_wake the free LRU rows
     # of every pool layer are filled with P's most-routed experts of the last
     # LRU_WARM_TOKENS prompt tokens (no new VRAM: only rows the reinit left
@@ -1039,6 +1078,18 @@ class Envs:
     # nextflash on (its metal), qwen27b off (upstream keying, the 27B metal);
     # on without a form (the NF code default).
     SGLANG_WEG2_BIGRAM_ANCHOR_EXACT = EnvBool(_profile_default("SGLANG_WEG2_BIGRAM_ANCHOR_EXACT", True))
+    # #49 (27B 196f6a8f57, S7c) behind a switch -- NF P49 c1988ff84f: agent
+    # turns priced so that a short tail on a prefix D already holds stays on D.
+    # On = (A) request_text renders tools FIRST (the Qwen3.8/Flash-Next template
+    # order), (B) a 200 D serve records prompt_tokens as held for that epoch
+    # while D is awake and serving, (C) a credited prefix is priced by its
+    # measured prompt_tokens, only the unmatched tail by chars/3. The law is
+    # unchanged: an uncached rest above X still routes LONG. Off = the pre-#49
+    # pricing (NF rc2.1l + H100). Default per profile (weg2/form.py
+    # ModelProfile.agent_span, operator 26.09.): qwen27b on (its line ran #49
+    # unswitched since RC9), nextflash off until the NF seat releases it with a
+    # boot tag; off without a form (the NF code default).
+    SGLANG_WEG2_ENABLE_AGENT_SPAN = EnvBool(_profile_default("SGLANG_WEG2_ENABLE_AGENT_SPAN", False))
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     # Weight loader: read safetensors tensors with pread() instead of mmap
     # page faults (ZFS: ~0.5 GB/s per rank through mmap, ~3 GB/s through

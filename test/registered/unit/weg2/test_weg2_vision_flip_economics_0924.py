@@ -174,3 +174,17 @@ def test_the_front_names_the_switch_at_start(caplog, monkeypatch):
     assert f.state_dict()["vision_flip_urgent"] is True
     monkeypatch.delenv("SGLANG_WEG2_VISION_FLIP_URGENT")
     assert _front().vision_flip_urgent is False, "default off"
+
+
+# ---------------------------------------------------------------- H125 (NF): off stays off
+def test_text_only_front_prints_the_pre_h125_line(caplog):
+    """H125: `--weg2-vision off` (the NF default) logs neither the start line
+    nor the two vision fields -- the text-only front is unchanged."""
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        f = _front(vision="off")
+        f._flip_economics_ok(fairness_fired=False)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert not any("VISION-FLIP-URGENT" in m for m in msgs)
+    line = [m for m in msgs if "FLIP-ECONOMICS" in m][-1]
+    assert "p_only" not in line and "vision_flip_urgent" not in line
+    assert "fairness=False stranded_decodes=" in line, line

@@ -1,5 +1,6 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
+import logging
 import os
 import re
 import math
@@ -269,6 +270,42 @@ def _get_processed_token_count(
             f"invalid PLE token counts: {processed_tokens=}, {physical_tokens=}"
         )
     return processed_tokens
+
+
+def images_tokenized() -> bool:
+    """H125: does this group TOKENIZE images (pad ids in ``input_ids``, mrope
+    positions and delta from the processor)?
+
+    ``--weg2-vision off`` passes ``--no-enable-multimodal`` (the explicit
+    ``False`` of the tri-state) and nothing is tokenized -- every NF boot
+    before H125. ``transient`` passes only ``language_model_only``: no tower,
+    but the tokenizer builds mm_items. No server args (desk, unit tests)
+    counts as not tokenized, so the model stays what it was."""
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        return getattr(get_server_args(), "enable_multimodal", None) is not False
+    except Exception:  # noqa: BLE001 -- no server args: the pre-H125 model
+        return False
+
+
+def ple_ids_for_images(input_ids: torch.Tensor, image_token_id: int) -> torch.Tensor:
+    """H125: the ids the PLE n-gram tables see at image positions.
+
+    The scheduler's ``input_ids`` carry each image's hash-based ``pad_value``
+    (``MM_PAD_SHIFT_VALUE`` + hash mod 2**30, so always >= 1,000,000 > the
+    vocab) at its positions -- the radix key, not a token. The embed routine
+    later clamps them IN PLACE to ``vocab_size - 1`` on the first PP stage
+    only (``mm_utils.embed_mm_inputs``), so without this the PLE n-grams at
+    and around an image hashed a random id on PP1/PP2 and ``vocab_size - 1``
+    on PP0. The model's training input has ``image_token_id`` there (the
+    processor's placeholder), so that is what PLE sees; text positions are
+    untouched. Pure and allocation-only: no host sync."""
+    from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+
+    return torch.where(
+        input_ids >= MM_PAD_SHIFT_VALUE, input_ids.new_tensor(int(image_token_id)), input_ids
+    )
 
 
 class _PLEBatch(msgspec.Struct, frozen=True):
@@ -2313,6 +2350,10 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
     ) -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self.last_hc_hidden_states = None
+        # H125: set by Qwen4ExpForConditionalGeneration.forward for one
+        # forward when the batch carries images (ple_ids_for_images); None on
+        # every text batch and on every boot that tokenizes no images.
+        self.ple_input_ids = None
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -2329,7 +2370,12 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
     ) -> torch.Tensor:
         self.last_hc_hidden_states = None
         # mm routine passes input_ids=None; PLE needs the real ids.
-        if input_ids is None:
+        # H125: with images in the batch, the ids captured BEFORE the embed
+        # routine clamped the pad ids in place, image positions mapped to
+        # image_token_id (ple_ids_for_images).
+        if self.ple_input_ids is not None:
+            input_ids = self.ple_input_ids
+        elif input_ids is None:
             input_ids = forward_batch.input_ids
         model_output = super().forward(
             input_ids=input_ids,
@@ -2564,9 +2610,34 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
         )
-        self.is_mrope_enabled = (
-            "mrope_section" in rope_config and not self.language_model_only
+        # H125 (transient vision on NF): a group that TOKENIZES images needs
+        # the 3D mrope positions its processor computed (and the decode needs
+        # the request's mrope delta), with or without a tower of its own --
+        # the 27B's Qwen3-VL keeps mrope on independent of
+        # language_model_only (qwen3_vl.py). The upstream #37500 gate (mrope
+        # off under language_model_only) stays exactly as it was on every
+        # group that tokenizes no images: `--weg2-vision off` passes
+        # --no-enable-multimodal, so images_tokenized() is False there.
+        self.images_tokenized = images_tokenized()
+        self.is_mrope_enabled = "mrope_section" in rope_config and (
+            not self.language_model_only or self.images_tokenized
         )
+        # H125: PLE's ids at image positions (ple_ids_for_images); None when
+        # no image can reach this model.
+        self.ple_image_token_id = (
+            int(getattr(config, "image_token_id"))
+            if self.images_tokenized and getattr(config, "image_token_id", None) is not None
+            else None
+        )
+        if self.ple_image_token_id is not None:
+            from sglang.srt.models import qwen4_exp_ple_prefetch as _ple_pf
+
+            _ple_pf.set_mm_pad_token(self.ple_image_token_id)
+            logging.getLogger(__name__).info(
+                "H125 Qwen4-Exp tokenizes images: mrope=%s, PLE reads image_token_id=%d "
+                "at image positions (pad ids >= MM_PAD_SHIFT_VALUE), also in the PLE "
+                "prefetch keys", self.is_mrope_enabled, self.ple_image_token_id,
+            )
         self.deepstack_visual_indexes = (
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
@@ -2592,6 +2663,18 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             tokens=int(forward_batch.input_ids.shape[0]),
             layers=self.model.end_layer - self.model.start_layer,
         )
+        # H125: captured BEFORE the embed routine clamps the pad ids in place;
+        # only on an extend that carries images, so a text batch (and every
+        # boot without image tokenization) takes the pre-H125 path.
+        if (
+            self.ple_image_token_id is not None
+            and not forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.contains_mm_inputs()
+        ):
+            self.model.ple_input_ids = ple_ids_for_images(
+                forward_batch.input_ids if input_ids is None else input_ids,
+                self.ple_image_token_id,
+            )
         try:
             output = super().forward(
                 input_ids, positions, forward_batch,
@@ -2601,6 +2684,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if timed:
                 fwd_abort()
             raise
+        finally:
+            self.model.ple_input_ids = None
         if timed:
             fwd_end()
         hc_hidden_states = self.model.last_hc_hidden_states
