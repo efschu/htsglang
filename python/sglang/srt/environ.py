@@ -309,6 +309,13 @@ class Envs:
     # own (same tokens), move the draft rows the fresh slots hold to the kept
     # slots instead of dropping them. Off = no alias listener, byte-identical.
     SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY = EnvBool(False)
+    # DFLASH window pool, hole rows out of the draft softmax (27b-draftwin
+    # 26.09.): window rows without draft KV (prefix from P / HiCache after a
+    # flip or loadback) read the hole slot 0 and dilute the draft attention.
+    # With the switch the draft attention removes their share exactly
+    # (speculative/dflash_window_holes.py); needs the sync-free window pool.
+    # Off = no buffer, no LSE path, byte-identical.
+    SGLANG_DFLASH_WINDOW_HOLE_MASK = EnvBool(False)
     # DFLASH decode round, stage 2 of the host-sync removal: plan the draft
     # and the uneven-DCP target verify with HOST-known FlashInfer metadata so
     # the host never waits for the draft forward (owner.py compact[owned] /
