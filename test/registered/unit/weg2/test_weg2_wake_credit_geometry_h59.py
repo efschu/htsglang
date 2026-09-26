@@ -71,16 +71,21 @@ def test_without_layer_lines_the_cut_is_unknown_not_guessed():
                                 N_LAYERS) is None
 
 
-def _run_launcher(split, fr_p, monkeypatch, tmp_path):
+def _run_launcher(split, fr_p, monkeypatch, tmp_path, model=MODEL):
     from sglang.srt.weg2 import launcher
 
     paths = []
     for kind, text in zip(("P", "D", "front"), _texts("x162")):
+        if kind == "front":
+            # H87: the reference key now carries the MODEL the logs name; the
+            # .lines excerpts dropped the argv, the real x162 front log has it.
+            text = ("group P argv: python -m sglang.launch_server --model-path /m/%s\n"
+                    % MODEL) + text
         p = tmp_path / ("boot_weg2_fnFL2x162_x.%s.log" % kind)
         p.write_text(text)
         paths.append(str(p))
     ns = types.SimpleNamespace(
-        model="/m/" + MODEL,
+        model="/m/" + model,
         extra_d=("--rank-tp-ratio 1,0,0 --rank-moe-ratio 183,137,168 "
                  "--rank-moe-resident-fraction " + ",".join("%g" % f for f in FR_D)),
         env_d="SGLANG_MOE_SCRATCH_SLOTS=118,48,48;SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL=1",
@@ -110,6 +115,15 @@ def test_another_cut_against_the_x162_logs_is_named_not_priced(monkeypatch, tmp_
     assert "ENTFAELLT" in lines[0]
     assert "{'p_split': (29, 11, 8)}" in lines[0] and "{'p_split': (26, 10, 12)}" in lines[0]
     assert not any("FERTIG" in ln for ln in lines)
+
+
+def test_another_model_against_the_x162_logs_is_named_not_priced(monkeypatch, tmp_path):
+    """H87: the x162 logs are INT4 (they name their --model-path); an NVFP4 boot
+    was priced against them without any model comparison. Now: ENTFAELLT, named."""
+    lines = _run_launcher((29, 11, 8), (0.41, 0.712, 0.733887), monkeypatch, tmp_path,
+                          model="Qwen3.8-Flash-Next-NVFP4-nvidia")
+    assert len(lines) == 1, lines
+    assert "ENTFAELLT" in lines[0] and "'model'" in lines[0] and "H87" in lines[0], lines[0]
 
 
 def test_the_measured_cut_still_prices(monkeypatch, tmp_path):

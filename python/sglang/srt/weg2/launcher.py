@@ -1950,6 +1950,31 @@ P_PREFILL_TRANSIENT_CALIBRATION_MODELS: Tuple[str, ...] = (
 )
 
 
+#: H87: ``{model_key of this boot: (calibration model, why)}`` -- set ONCE by
+#: :func:`note_calibration_footprint_alias` in ``main`` when this boot's
+#: checkpoint is not a calibration model by NAME but is one by MEMORY FOOTPRINT
+#: (an abliterated derivative). Keyed by the boot's own model name, so a stale
+#: entry can never answer for another checkpoint. ``build_env`` sees only the
+#: form's model NAME, which is why the verdict is taken where the path is known.
+_CALIBRATION_FOOTPRINT_ALIAS: Dict[str, Tuple[str, str]] = {}
+
+
+def note_calibration_footprint_alias(model_path: str) -> Optional[str]:
+    """H87: record whether ``model_path`` is a footprint-identical derivative
+    of a #114/H41 calibration checkpoint; returns the printed line (or None)."""
+    name = weg2_form.model_key(model_path)
+    _CALIBRATION_FOOTPRINT_ALIAS.pop(name, None)
+    if not name or name in P_PREFILL_TRANSIENT_CALIBRATION_MODELS:
+        return None
+    for ref in P_PREFILL_TRANSIENT_CALIBRATION_MODELS:
+        ok, why = weg2_form.reference_model_verdict(model_path, ref)
+        if ok:
+            _CALIBRATION_FOOTPRINT_ALIAS[name] = (ref, why)
+            return (f"H87 CALIBRATION-IDENTITY {name} -> {ref} by memory footprint "
+                    f"({why}): the #114/H41 prefill transient measured on {ref} applies")
+    return None
+
+
 def p_prefill_transient_for(boot_form) -> Tuple[bool, str]:
     """``(publish?, provenance)`` of the #114 transient for this boot's form.
 
@@ -1957,12 +1982,18 @@ def p_prefill_transient_for(boot_form) -> Tuple[bool, str]:
     """
     if boot_form is None:
         return True, "no WEG2-FORM (desk caller): published as before"
-    if boot_form.model in P_PREFILL_TRANSIENT_CALIBRATION_MODELS:
+    _alias = _CALIBRATION_FOOTPRINT_ALIAS.get(boot_form.model)
+    if boot_form.model in P_PREFILL_TRANSIENT_CALIBRATION_MODELS or (
+            _alias and _alias[0] in P_PREFILL_TRANSIENT_CALIBRATION_MODELS):
         return True, (
             f"published: chunk {P_CHUNKED_PREFILL_TOKENS} -> "
             f"{p_prefill_transient_vector_mib(P_CHUNKED_PREFILL_TOKENS)} MiB per P stage, "
-            f"MEASURED on {boot_form.model} (support points "
+            f"MEASURED on {_alias[0] if _alias and boot_form.model not in P_PREFILL_TRANSIENT_CALIBRATION_MODELS else boot_form.model} (support points "
             f"{list(P_PREFILL_TRANSIENT_SUPPORT.chunks)}, linear between, H41)"
+            + (f"; H87: this boot's checkpoint {boot_form.model} has the same memory "
+               f"footprint ({_alias[1]})"
+               if _alias and boot_form.model not in P_PREFILL_TRANSIENT_CALIBRATION_MODELS
+               else "")
         )
     return False, (
         f"NOT published: the support points "
@@ -7597,6 +7628,10 @@ def choose_host_ledger(
     # xsn417's RUN-PEAK ADVISORY then priced the Next-Flash boot fnFL2x142's
     # run sample (-90.18 GiB, a death sample) for a Qwen3.8-27B arm.
     record_accept: Optional[Callable[[dict], bool]] = None,
+    # H87 (rc2.1c2 container, NVFP4 --d-only, W87/W20): a D-only boot has NO
+    # flip arm -- no flip ratchet, no dormant group, no P host pools. False is
+    # byte-identical to every flip boot.
+    d_only: bool = False,
 
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
@@ -7663,6 +7698,15 @@ def choose_host_ledger(
         measured_record_path() if record_path is None else record_path
     )
     record = host_ledger.read_measured_record(_record_path_resolved, accept=record_accept)
+    # H87: IS THIS BOOT'S CHECKPOINT THE ONE THE BUILT-IN REFERENCES WERE
+    # MEASURED ON? Decided once, here, by memory footprint (an abliterated
+    # derivative of the reference counts, a different checkpoint under any
+    # name does not). No model named (a desk caller) = None = pre-H87 exactly.
+    if model_dir:
+        _ref_ok, _ref_why = weg2_form.reference_model_verdict(
+            model_dir, host_ledger.REFERENCE_MODEL)
+    else:
+        _ref_ok, _ref_why = None, ""
     # #1378 Stage 2 (order): SELF-READ the prior boot's cushion from the same
     # sidecar `record` came from -- flags stay an OVERRIDE, never the only
     # path, so a boot that names nobody by hand still gets the gate. The
@@ -7675,7 +7719,7 @@ def choose_host_ledger(
             "override it")
     elif flip_ratchet_form_key:
         _auto_cushion, _auto_bounce, _auto_prov = host_ledger.resolve_prior_cushion(
-            _record_path_resolved, flip_ratchet_form_key)
+            _record_path_resolved, flip_ratchet_form_key, accept=record_accept)
     else:
         _auto_cushion, _auto_bounce, _auto_prov = None, None, (
             "auto-resolve skipped: caller passed no flip_ratchet_form_key")
@@ -7895,7 +7939,15 @@ def choose_host_ledger(
         # an absent measurement becomes a silent 0 in the run peak. `record` is
         # the dict this function already read; the front writes the field into
         # it at `WEG2-FLIP done epoch=2`.
-        flip_ratchet=host_ledger.resolve_flip_ratchet_gib(record),
+        # H87: --d-only has no flip -- a DECLARED zero-flip ratchet, never the
+        # series of another model's flip boots.
+        flip_ratchet=(host_ledger.d_only_flip_ratchet() if d_only else
+                      host_ledger.resolve_flip_ratchet_gib(
+                          record, reference_model_ok=_ref_ok,
+                          reference_model_why=_ref_why)),
+        d_only=bool(d_only),
+        reference_model_ok=_ref_ok,
+        reference_model_why=_ref_why,
         # #1273 S6: the exchange's own pinned host carrier.  The ARM STRINGS
         # decide it here, at the one ledger call site, and not inside the
         # ledger -- `WEIGHT_SOURCE_CHOICES` is this module's, and a ledger that
@@ -11702,6 +11754,14 @@ def log_wake_credit_solve(ns, cards: List[Card], fits, log, label: str, *,
             # still mit den P-Tags der alten Karten (weights_12 auf PP1 statt
             # PP2). Unbekannt (Log ohne Layerzeilen) -> ENTFAELLT mit Namen.
             reference_key=None if ref is None else {
+                # H87: DAS MODELL DER REFERENZ-LOGS. Bis hier fehlte es im
+                # Schluessel: die NVFP4-Profile rechneten ihren ersten Wake gegen
+                # die INT4-Logs fnFL2x162 (Tags, Zeilen, Freigaben eines anderen
+                # Checkpoints), ohne dass ein Vergleich es sah. Verglichen wird
+                # nach Speicher-Fussabdruck (wake_credit._model_same_footprint),
+                # ein Log ohne Modellnennung ENTFAELLT mit Namen.
+                "model": (weg2_form.log_model(_logs[2]) or weg2_form.log_model(_logs[0])
+                          or "ungemessen: %s nennt kein Modell" % ref.source),
                 "p_card": tuple(ref.p_card),
                 "p_split": _wc.reference_p_split(ref, int(fits[0].n_layers))
                 or ("ungemessen: %s ohne 'MoE expert-offload active on layer'-Zeilen"
@@ -12082,7 +12142,9 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
 
     support = P_PREFILL_TRANSIENT_SUPPORT
     name = os.path.basename(os.path.normpath(str(model)))
-    if name != support.model:
+    # H87: a footprint-identical derivative carries the support's measurement.
+    if name != support.model and not weg2_form.reference_model_verdict(
+            str(model), support.model)[0]:
         log(f"{_p_card.CARD_MARKER} ENTFAELLT: die Chunk-Transiente ist auf "
             f"{support.model} gemessen, dieser Boot faehrt {name}.")
         return
@@ -14675,6 +14737,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parse_group_env=parse_group_env, shlex_split=shlex.split)
         os.environ[weg2_form.FORM_ENV] = boot_form.env_value()
     ns.weg2_boot_form = boot_form
+    # H87: the #114/H41 calibration identity by memory footprint, decided once
+    # here where the checkpoint PATH is known (build_env sees only its name).
+    _h87_alias_line = (note_calibration_footprint_alias(ns.model)
+                       if boot_form is not None else None)
     # WEG2-FORM: THE CALIBRATION IDENTITY. Every measured source this boot
     # prices from (the sidecar record, the P logs the cut and the depth read)
     # is taken only from boots of THIS checkpoint. None (teardown) = no filter.
@@ -14832,6 +14898,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(f"tree: {tree} @ {tip}")
     if boot_form is not None:
         log(boot_form.line())
+        if _h87_alias_line:
+            log(_h87_alias_line)
         log("#114 P-PREFILL-TRANSIENT (form " + boot_form.describe() + "): "
             + p_prefill_transient_for(boot_form)[1])
     if dirty and not dry:
@@ -15900,7 +15968,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             hicache_disabled=hicache_disabled,
             # #1369: the SAME local `main` resolved once, above, from the SAME
             # predicate the shipped argvs read -- never re-read from `ns` here.
-            weights_cpu_backup_armed=weights_cpu_backup_armed)
+            weights_cpu_backup_armed=weights_cpu_backup_armed,
+            # H87: the D-ONLY branch below starts group D alone -- the ledger
+            # prices exactly that, not a flip boot.
+            d_only=bool(getattr(ns, "d_only", False)))
 
     arm, reap_headroom_gib, lines, cg = _price_host_ledger()
     # #1453 (user 16.09.: 'L2-Groesse aus Ledger-Spielraum'): the arena is the
