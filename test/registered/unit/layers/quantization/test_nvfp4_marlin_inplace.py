@@ -452,6 +452,62 @@ class TestFlipHooks(CustomTestCase):
         self.assertTrue(torch.equal(draft.weight, d_marlin))  # untouched
         self.assertFalse(stub._weg2_nvfp4_draft_disk_reloaded)  # read-and-clear
 
+    def test_a_layer_shared_by_target_and_draft_is_converted_once(self):
+        """rc9meas n4old (26.09.): the DFlash2 draft's lm_head IS the target's
+        module (dflash_worker_v2: ``self.draft_model.lm_head = lm_head``). The
+        sleep converts it once (one flagged_layers over both models); the wake
+        converted target and draft separately, re-stamped it native in the
+        second call and permuted it a second time. Over several flips every
+        layer must come back to its load-time Marlin bytes."""
+        _, h_nat = _loaded_layer(Fp4GemmRunnerBackend.CUTLASS, seed=7)
+        _, t_nat = _loaded_layer(Fp4GemmRunnerBackend.CUTLASS, seed=8)
+        _, d_nat = _loaded_layer(Fp4GemmRunnerBackend.CUTLASS, seed=9)
+        _, head = _loaded_layer(Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE, seed=7)
+        _, t_own = _loaded_layer(Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE, seed=8)
+        _, d_own = _loaded_layer(Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE, seed=9)
+        target, draft = torch.nn.Module(), torch.nn.Module()
+        target.lm_head, target.own = head, t_own
+        draft.lm_head, draft.own = head, d_own  # the SAME module object
+        self.assertIs(target.lm_head, draft.lm_head)
+        marlin = {id(l): (l.weight.clone(), l.weight_scale.view(torch.uint8).clone())
+                  for l in (head, t_own, d_own)}
+        WU, stub = self._stub([target, draft], "exchange")
+        stub.tp_worker.model_runner.model = target
+        stub._weg2_model_for_group = lambda g: draft if g == "D" else target
+        stub._weg2_nvfp4_draft_disk_reloaded = False
+        logs = []
+        for _flip in range(3):
+            with mock.patch.object(mi.logger, "info", side_effect=logs.append):
+                WU._weg2_nvfp4_marlin_to_native(stub)
+            for l, ref in ((head, h_nat), (t_own, t_nat), (d_own, d_nat)):
+                self.assertTrue(torch.equal(l.weight, ref.weight))  # the deposit reads native
+                # "the exchange" writes the peer's native bytes
+                l.weight.data.copy_(ref.weight)
+                l.weight_scale.data.copy_(ref.weight_scale)
+            with mock.patch.object(mi.logger, "info", side_effect=logs.append):
+                WU._weg2_nvfp4_marlin_after_wake(stub)
+            for l in (head, t_own, d_own):
+                w, s = marlin[id(l)]
+                self.assertTrue(torch.equal(l.weight, w))
+                self.assertTrue(torch.equal(l.weight_scale.view(torch.uint8), s))
+        # the instrument agrees: layers to native == layers back to Marlin
+        n_native = sum(int(x.split("layers=")[1].split()[0]) for x in logs if "to_native" in x)
+        n_marlin = sum(int(x.split("layers=")[1].split()[0]) for x in logs if "to_marlin" in x)
+        self.assertEqual((n_native, n_marlin), (9, 9))
+
+    def test_model_to_marlin_with_one_seen_set_skips_a_layer_already_done(self):
+        _, nat = _loaded_layer(Fp4GemmRunnerBackend.CUTLASS, seed=7)
+        _, l = _loaded_layer(Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE, seed=7)
+        marlin_bytes = l.weight.clone()
+        l.weight.data.copy_(nat.weight)
+        l.weight_scale.data.copy_(nat.weight_scale)
+        seen: set = set()
+        self.assertGreater(
+            mi.model_to_marlin([l], delivered_native=True, seen=seen, log=lambda m: None), 0)
+        self.assertEqual(
+            mi.model_to_marlin([l], delivered_native=True, seen=seen, log=lambda m: None), 0)
+        self.assertTrue(torch.equal(l.weight, marlin_bytes))
+
     def test_no_flagged_layer_is_a_no_op(self):
         _, l_nat = _loaded_layer(Fp4GemmRunnerBackend.CUTLASS)
         before = l_nat.weight.clone()
