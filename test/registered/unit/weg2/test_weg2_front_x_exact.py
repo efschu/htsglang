@@ -449,3 +449,128 @@ def test_off_constructs_and_imports_nothing():
     assert "if self.x_exact:\n            from sglang.srt.weg2.front_tokens import" in init
     if "SGLANG_WEG2_FRONT_EXACT_TOKENS" not in os.environ:
         assert envs.SGLANG_WEG2_FRONT_EXACT_TOKENS.get() is False  # default off
+
+
+# ---------------------------------------------------------------------------
+# (6) registry: qwen27b and nextflash off until measured; explicit wins
+# ---------------------------------------------------------------------------
+
+from sglang.srt.weg2 import form as FM  # noqa: E402
+from sglang.srt.weg2 import phase_policy as PP  # noqa: E402
+
+XE = "SGLANG_WEG2_FRONT_EXACT_TOKENS"
+
+
+def _form_env(profile):
+    arch, experts, draft, kv = (("dense", "none", "dflash", "paged_dcp") if profile == "qwen27b"
+                                else ("moe", "offload", "mtp", "qsa_forma"))
+    return FM.Weg2Form(arch=arch, experts=experts, draft=draft, p_draft="none", kv=kv,
+                       flip="family", vision="off", profile=profile, model="m").env_value()
+
+
+def test_the_registry_rows_are_off_until_measured():
+    for prof in ("qwen27b", "nextflash"):
+        assert FM.PROFILES[prof].front_exact_tokens is False
+        assert FM.PROFILE_SWITCH_DEFAULTS[prof][XE] is False
+
+
+@pytest.mark.parametrize("profile,explicit,row_on,want", [
+    ("qwen27b", None, False, False), ("nextflash", None, False, False), (None, None, False, False),
+    ("qwen27b", None, True, True),    # the operator turns the row on -> on without an env
+    ("nextflash", None, True, True),
+    ("qwen27b", "1", False, True), ("qwen27b", "0", True, False), (None, "1", False, True)])
+def test_the_switch_follows_the_profile_row_and_an_explicit_value_wins(
+        monkeypatch, profile, explicit, row_on, want):
+    monkeypatch.delenv(XE, raising=False)
+    monkeypatch.delenv(FM.FORM_ENV, raising=False)
+    if profile is not None:
+        monkeypatch.setenv(FM.FORM_ENV, _form_env(profile))
+        if row_on:
+            monkeypatch.setitem(FM.PROFILE_SWITCH_DEFAULTS, profile,
+                                dict(FM.PROFILE_SWITCH_DEFAULTS[profile], **{XE: True}))
+    if explicit is not None:
+        monkeypatch.setenv(XE, explicit)
+    assert envs.SGLANG_WEG2_FRONT_EXACT_TOKENS.get() is want
+
+
+# ---------------------------------------------------------------------------
+# (7) the queue is re-priced exactly -- what PK's needs_p reads
+# ---------------------------------------------------------------------------
+
+def _queued(f, rid, text, n, est, **kw):
+    ids = np.arange(n, dtype=np.int32) + 10
+    f.ftok.remember(text, ids)
+    fut = asyncio.new_event_loop().create_future()
+    p = F.Pending(rid, "/v1/messages", {}, text, time.time(), fut,
+                  est_prompt=n, est_uncached=est, **kw)
+    f.queue.append(p)
+    return p, ids
+
+
+def test_a_new_d_credit_reprices_the_queue_and_needs_p_follows(caplog):
+    f = _front(True)
+    f.ftok = _FakeTokens(1)
+    p, ids = _queued(f, "weg2-1-2", "twin", X + 500, X + 500)
+    assert PP.immediate_park_trigger(f.queue, X) is p  # priced over X: the park would fire
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        # its twin's first content: D now holds the first X+300 tokens (#49 in-flight)
+        f.tspans.record_inflight(ids[:X + 300], f.epoch)
+        assert f._x_exact_reprice_queue("inflight") == 1
+    assert p.est_uncached == 200
+    assert PP.immediate_park_trigger(f.queue, X) is None  # 200 pending: no park, no flip
+    line = [r.getMessage() for r in caplog.records if "X-EXACT-REPRICE" in r.getMessage()][0]
+    assert f"est_uncached {X + 500} -> 200 X={X} crossed=down" in line
+
+
+def test_the_epoch_change_ends_the_held_credit_and_raises_the_price():
+    f = _front(True)
+    f.ftok = _FakeTokens(1)
+    f.tspans.agent_span = True  # #49 held credit (the qwen27b row's agent_span)
+    p, ids = _queued(f, "weg2-1-3", "held", X + 100, 100)
+    f.tspans.record_presence(ids[:X], cached_tokens=50, prompt_tokens=X, held_epoch=f.epoch)
+    assert f._x_exact_reprice_queue("x") == 0  # same epoch: 100 stays
+    f.epoch += 2  # a flip to P and back
+    assert f._x_exact_reprice_queue("epoch") == 1
+    assert p.est_uncached == X + 100 - 50  # only the measured 50 remain credited
+    assert PP.immediate_park_trigger(f.queue, X) is p
+
+
+def test_measured_and_final_prices_are_never_touched():
+    f = _front(True)
+    f.ftok = _FakeTokens(1)
+    keep = [
+        _queued(f, "a", "t-a", X + 9, X + 9, leg1_done=True)[0],
+        _queued(f, "b", "t-b", X + 9, X + 9, skip_leg1=True)[0],
+        _queued(f, "c", "t-c", X + 9, X + 9, p_only=True)[0],
+    ]
+    q, _ = _queued(f, "d", "t-d", X + 9, 7777)
+    q.x_requeues = 1  # D's own extent stands
+    fb = F.Pending("e", "/v1/messages", {}, "fallback-priced", time.time(),
+                   asyncio.new_event_loop().create_future(), est_prompt=1, est_uncached=4242)
+    f.queue.append(fb)  # chars/3 fallback: no ids
+    assert f._x_exact_reprice_queue("x") == 0
+    assert [p.est_uncached for p in keep] == [X + 9] * 3 and q.est_uncached == 7777
+    assert fb.est_uncached == 4242
+
+
+def test_off_never_reprices_and_the_hooks_sit_behind_the_switch():
+    import inspect
+
+    f = _front(False)
+    f.queue.append(F.Pending("z", "/v1/messages", {}, "t", time.time(),
+                             asyncio.new_event_loop().create_future(), est_prompt=1,
+                             est_uncached=99))
+    assert f._x_exact_reprice_queue("epoch") == 0 and f.queue[0].est_uncached == 99
+    src = inspect.getsource(F.Front)
+    assert "if self.x_exact:\n            # X-EXACT: a held (#49) credit is bound to its epoch" in src
+    assert src.count("self._x_exact_reprice_queue(") == 3
+
+
+def test_the_w31_requeue_counts_the_whole_prompt_exactly():
+    import inspect
+
+    src = inspect.getsource(F.Front)
+    i = src.index("_est = len(text) // int(CHARS_PER_TOKEN) + 1")
+    j = src.index("p = Pending(", i)
+    body = src[i:j]
+    assert "if self.x_exact:" in body and "_est = int(_ids.size)" in body

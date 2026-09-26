@@ -4165,6 +4165,44 @@ class Front:
 
         return SimpleNamespace(pending=pending, n=c.n, known=known, credit=credit, src=src)
 
+    def _x_exact_reprice_queue(self, why: str) -> int:
+        """Re-price every queued request whose price can still move, against
+        the CURRENT measured cached-on-D token prefix (``tspans``) and epoch.
+
+        The arrival price goes stale: a #49 held credit lives only in its
+        epoch, a D serve / in-flight first content adds credit, a measured
+        zero retracts it. PK's immediate park (``phase_policy.needs_p``) and
+        every backlog sum read ``Pending.est_uncached``, so it is kept exact
+        here. Not re-priced: a request whose leg 1 is done or skipped, a
+        P-only one, one D refused over X (``x_requeues``: D's own extent
+        stands) and one priced by the chars/3 fallback (no ids). Routing
+        eligibility is NOT changed -- only the number. Returns the count."""
+        if not self.x_exact or self.ftok is None or self.tspans is None:
+            return 0
+        epoch = self.epoch if self.awake == "D" and self.state == "serving" else None
+        x = int(self.tp_prefill_max_tokens)
+        n = 0
+        for p in self.queue:
+            if (p.leg1_done or p.skip_leg1 or p.p_only or p.x_requeues):
+                continue
+            ids = self.ftok.ids_for(p.text)
+            if ids is None:
+                continue
+            new, _credit, _known, src = self.tspans.pending(ids, epoch=epoch)
+            old = int(p.est_uncached)
+            if new == old:
+                continue
+            p.est_uncached = int(new)
+            n += 1
+            self.counters["x_exact_repriced"] += 1
+            logger.info("WEG2 X-EXACT-REPRICE rid=%s why=%s est_uncached %d -> %d X=%d "
+                        "crossed=%s src=%s epoch=%s (queued request re-priced against the "
+                        "current measured cached-on-D prefix; routing flags unchanged)",
+                        p.rid, why, old, new, x,
+                        ("down" if old > x >= new else "up" if new > x >= old else "no"),
+                        src, epoch)
+        return n
+
     def _x_exact_tokens_check(self, rid: str, group: str, prompt_tokens: int) -> None:
         got = self._x_exact_rid.get(rid)
         if got is None or not prompt_tokens:
@@ -4181,6 +4219,7 @@ class Front:
         error is printed, never folded back into the routing bound."""
         self.tspans.record_presence(self.ftok.ids_for(text), ct, prompt_tokens=pt,
                                     held_epoch=held_epoch)
+        self._x_exact_reprice_queue("presence")
         got = self._x_exact_rid.pop(rid, None)
         if got is None:
             return
@@ -5861,6 +5900,7 @@ class Front:
                         held_epoch=self.epoch)
                     if self.x_exact:
                         self.tspans.record_inflight(self.ftok.ids_for(text), self.epoch)
+                        self._x_exact_reprice_queue("inflight")
                     self.counters["span_inflight_credited"] += 1
                 if stream:
                     resp = web.StreamResponse(status=r.status)
@@ -6373,6 +6413,12 @@ class Front:
             # the prefix the span LRU would price as resident demonstrably did
             # not come back on D. `span_known=False` says that is an estimate.
             _est = len(text) // int(CHARS_PER_TOKEN) + 1
+            if self.x_exact:
+                # X-EXACT: the WHOLE prompt, counted (not chars/3) -- D's refusal
+                # says the credited prefix did not come back.
+                _ids = self.ftok.ids_for(text)
+                if _ids is not None:
+                    _est = int(_ids.size)
             p = Pending(rid, request.path, payload, text, time.time(),
                         asyncio.get_event_loop().create_future(),
                         est_prompt=_est, est_uncached=_est, span_known=False)
@@ -7563,6 +7609,10 @@ class Front:
         self.epoch += 1
         self.admit_d = True
         self.state = "serving"
+        if self.x_exact:
+            # X-EXACT: a held (#49) credit is bound to its epoch -- re-price
+            # the queue against the new one (PK's needs_p reads est_uncached).
+            self._x_exact_reprice_queue("epoch")
         # 27B idle policy (c): a hold never spans a flip -- D's free period
         # starts again at its next observation on the awake D.
         self._d_free_since = None
