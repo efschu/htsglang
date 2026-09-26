@@ -2863,11 +2863,46 @@ def _nvml_process_mib(pids: set) -> Dict[str, int]:
         ).stdout
     except Exception:  # noqa: BLE001
         return {}
+    return parse_compute_apps(out, pids)
+
+
+#: NS 26.09.: lines of ``--query-compute-apps`` output the parser could not
+#: read, summed over this process's lifetime (an instrument, never a gate).
+NVSMI_SKIPPED_LINES = 0
+_NVSMI_SKIP_WARNED = False
+
+
+def parse_compute_apps(out: str, pids: set) -> Dict[str, int]:
+    """``pid, used_memory, gpu_uuid`` rows (csv,noheader,nounits) -> {uuid: MiB}
+    summed over ``pids``.
+
+    A residue READING -- it may never kill the flip (boot
+    dkr27bbar1i8h109261950, 26.09. 19:53Z: W4 Weg2WakeRefused at stage
+    'wake-kv', ``not enough values to unpack (expected 3, got 1)`` on the first
+    flip ~40 min after a host driver reload). nvidia-smi can print rows that are
+    not data: "No running processes found", a warning/error text, ``[N/A]`` or
+    ``[Insufficient Permissions]`` in the memory field. Such a row is SKIPPED
+    and COUNTED (``NVSMI_SKIPPED_LINES``); the first one per process is logged
+    as a WARNING with the row text cut to 120 chars, so the cause is in the log
+    next time.
+    """
+    global NVSMI_SKIPPED_LINES, _NVSMI_SKIP_WARNED
     res: Dict[str, int] = {}
-    for line in out.strip().splitlines():
+    for line in (out or "").strip().splitlines():
         if not line.strip():
             continue
-        pid, used, uuid = [x.strip() for x in line.split(",")]
+        parts = [x.strip() for x in line.split(",")]
+        if (len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit()
+                or not parts[2]):
+            NVSMI_SKIPPED_LINES += 1
+            if not _NVSMI_SKIP_WARNED:
+                _NVSMI_SKIP_WARNED = True
+                logger.warning(
+                    "WEG2 NVSMI-PARSE skipped a --query-compute-apps row that is not "
+                    "'pid, used_memory, gpu_uuid' (warned once per process; total "
+                    "skipped so far %d): %r", NVSMI_SKIPPED_LINES, line.strip()[:120])
+            continue
+        pid, used, uuid = parts
         if int(pid) in pids:
             res[uuid] = res.get(uuid, 0) + int(used)
     return res

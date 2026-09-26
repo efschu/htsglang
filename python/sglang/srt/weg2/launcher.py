@@ -4311,14 +4311,12 @@ def nvml_process_mib(pids: set) -> Dict[str, int]:
         ["nvidia-smi", "--query-compute-apps=pid,used_memory,gpu_uuid", "--format=csv,noheader,nounits"],
         capture_output=True, text=True, check=True,
     ).stdout
-    res: Dict[str, int] = {}
-    for line in out.strip().splitlines():
-        if not line.strip():
-            continue
-        pid, used, uuid = [x.strip() for x in line.split(",")]
-        if int(pid) in pids:
-            res[uuid] = res.get(uuid, 0) + int(used)
-    return res
+    # NS 26.09.: the same row parser as the front's flip reading -- a row that is
+    # not 'pid, used, uuid' (e.g. "No running processes found", "[N/A]") is
+    # skipped and counted, never an unpack error (boot dkr27bbar1i8h109261950).
+    from sglang.srt.weg2.front import parse_compute_apps
+
+    return parse_compute_apps(out, pids)
 
 
 def session_pids(sid: int) -> set:
