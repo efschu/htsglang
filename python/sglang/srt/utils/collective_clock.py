@@ -166,15 +166,22 @@ therefore namespace the key by runner identity
 (``decode_cuda_graph_runner._clock_graph_key``); this module treats the key
 as opaque and only requires that two distinct graphs never share one.
 
-ALWAYS ON, FOR EVERY GRAPH-CAPTURING FORM, DELIBERATELY. The capture scope
-at the decode runner's two capture sites is not gated on weg-2 or on any
-flag: every form that captures decode graphs (weg-1, default serving)
-carries these nodes, re-executes them on every replay, and holds the events
-for the process lifetime. That follows the full-feature-default rule -- an
-instrument only the measuring form carries cannot compare the forms -- and
-the cost is bounded and printed (two events per wrapped region per graph,
-counted by ``graph_node_counts``). What is NOT gated is stated here so a
-reader of another form's log knows why the nodes are in it.
+OFF UNLESS ASKED FOR (Register #52, 26.09.). Until rc2.1l the capture scope
+was ungated: every form that captured decode graphs carried the nodes, bound
+K event sets (x176: ``bound: 192 pairs x 8 event sets``, fnFL2h91v1: 288
+pairs) and, before EVERY replay, swapped the set (two
+``cudaGraphExecEventRecordNodeSetEvent`` per pair) and recorded a launch
+fence -- an instrument priced into the production decode (20.09.: Runden/s
+26,0 -> 24,4..27,1). The graph half is now opt-in per rank via
+``SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES``, decided ONCE at the first
+capture scope and named by one ``collective clock: graph reader ON|OFF``
+line. Off, ``capture_scope`` arms nothing: the graph carries no node,
+``bind_graph`` finds nothing to bind, and ``note_graph_replay`` returns
+after one dict lookup -- no swap, no fence, no host API call per replay.
+A graphed round then reads ``graph-replay-reader-off``, never a zero and
+never the structural ``graph-replay-no-event-nodes``. The eager half
+(prefill #252, eager decode rounds) is not touched by the switch. On, every
+path below is byte-identical to rc2.1l.
 """
 
 from __future__ import annotations
@@ -608,6 +615,7 @@ class CollectiveClock:
         self,
         backend: Optional[ClockBackend] = None,
         graph_ring: int = DEFAULT_GRAPH_RING,
+        graph_nodes: Optional[bool] = None,
     ) -> None:
         self._slot: Optional[Slot] = None
         self._pool: List[torch.cuda.Event] = []
@@ -686,6 +694,15 @@ class CollectiveClock:
         self._graph_bind_refusals: int = 0
         self._swap_calls: int = 0
         self._swap_s: float = 0.0
+        #: Register #52. Graph reader state: None = not decided yet (no
+        #: capture scope entered), then fixed for the process by the first
+        #: ``capture_scope`` from SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES
+        #: (or by ``graph_nodes`` here, for tests). Fixed rather than re-read
+        #: so every graph of one process is captured the same way.
+        self._graph_reader_on: Optional[bool] = graph_nodes
+        self._graph_reader_logged: bool = False
+        #: Captures that laid no nodes because the reader is off.
+        self._graph_reader_off_captures: int = 0
 
     # -- arming ---------------------------------------------------------
 
@@ -864,6 +881,58 @@ class CollectiveClock:
 
     # -- graph capture / replay (#1241b) ---------------------------------
 
+    def graph_reader_on(self) -> bool:
+        """Register #52: does this process lay event nodes into its graphs?
+
+        Decided once, at the first call (the first ``capture_scope``), from
+        ``SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES`` unless the constructor
+        fixed it, and named by ONE boot line either way. Off is the
+        production form; the readers that need the nodes are named in the
+        line so their absence is a statement, not a silence.
+        """
+        on = self._graph_reader_on
+        if on is None:
+            from sglang.srt.environ import envs
+
+            on = bool(envs.SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES.get())
+            self._graph_reader_on = on
+        if not self._graph_reader_logged:
+            self._graph_reader_logged = True
+            if on:
+                logger.info(
+                    "collective clock: graph reader ON "
+                    "(SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES=1, measuring "
+                    "form): decode graphs carry event-record nodes, %d event "
+                    "sets per graph, one set swap + one launch fence per replay",
+                    self._graph_ring,
+                )
+            else:
+                logger.info(
+                    "collective clock: graph reader OFF "
+                    "(SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES unset/0, "
+                    "production form): decode graphs carry no event-record "
+                    "node, no event set is bound, no swap and no fence per "
+                    "replay. Graphed 'Decode rank batch' lines read 'split "
+                    "unavailable: graph-replay-reader-off', the wake census "
+                    "reads 'unsplit', BARLINK-ROUND-CENSUS (H28) emits no "
+                    "line for graphed rounds; eager rounds and the prefill "
+                    "split are unchanged"
+                )
+                try:
+                    from sglang.srt.environ import envs
+
+                    census = bool(envs.SGLANG_WEG2_AR_ROUND_CENSUS.get())
+                except Exception:  # pragma: no cover - env module shape
+                    census = False
+                if census:
+                    logger.warning(
+                        "collective clock: SGLANG_WEG2_AR_ROUND_CENSUS=1 but "
+                        "the graph reader is OFF -- BARLINK-ROUND-CENSUS will "
+                        "stay silent on graphed decode rounds; set "
+                        "SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES=1 as well"
+                    )
+        return on
+
     def _acquire_capture_pair(self, capture: GraphNodes):
         """Two timing events for one wrapped region of the graph.
 
@@ -897,7 +966,16 @@ class CollectiveClock:
 
         Nested captures are refused rather than merged: two graphs recording
         into one list would attribute one graph's regions to the other.
+
+        Register #52: with the graph reader OFF the scope arms nothing -- no
+        pair, no fence pool, no ``GraphNodes`` entry -- so the graph carries
+        no event-record node and its replays cost nothing (see
+        :meth:`graph_reader_on`).
         """
+        if not self.graph_reader_on():
+            self._graph_reader_off_captures += 1
+            yield
+            return
         if self._capture is not None:
             self._capture_refusals += 1
             yield
@@ -1476,6 +1554,11 @@ class CollectiveClock:
                 # destroyed the first's timestamps before anything could read
                 # them. Counted in ``note_graph_replay``.
                 refused = "graph-replay-key-replayed-twice"
+            elif not reads and self._graph_reader_on is False:
+                # Register #52: the graph reader is off in this process, so
+                # no graph carries nodes BY CHOICE -- named as the switch,
+                # not as the structural defect below.
+                refused = "graph-replay-reader-off"
             elif not reads:
                 # The graph ran, and it carries no event nodes: captured
                 # before this instrument existed, captured by a runner that

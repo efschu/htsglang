@@ -140,7 +140,9 @@ class Harness:
     def __init__(self, rank: int = 1) -> None:
         self.state = FakeState()
         self.backend = FakeBackend(self.state)
-        self.clock = CollectiveClock(backend=self.backend)
+        # Register #52: the graph reader is opt-in; this file tests the ON
+        # (measuring) form, which must stay byte-identical to rc2.1l.
+        self.clock = CollectiveClock(backend=self.backend, graph_nodes=True)
         self.log = DecodeRoundLog(clock=self.clock, rank=rank)
 
     # -- the fake graph layer -------------------------------------------
