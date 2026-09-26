@@ -15,6 +15,16 @@
 #include "hardware_amd_support.h"
 #endif
 
+#if defined(USE_CUDA)
+//: H95c (patch 3): one mapped piece of a SPAN-MAPPED allocation -- its own
+//: physical handle over ``[offset, offset + size)`` of the allocation's VA.
+struct Weg2SpanExtent {
+    size_t offset;
+    size_t size;
+    CUmemGenericAllocationHandle handle;
+};
+#endif
+
 enum class AllocationState {
     // Memory is mapped and accessible
     ACTIVE,
@@ -46,6 +56,19 @@ struct AllocationMetadata {
 #else
     #error "USE_PLATFORM is not set"
 #endif
+
+    // H95c (patch 3): THE SPAN MAP.  ``weg2_plan`` = the byte ranges the NEXT
+    // resume maps (granularity aligned, sorted, disjoint); EMPTY = the whole
+    // allocation under ONE handle, i.e. exactly the stock behaviour, and that
+    // is every allocation nobody called ``set_spans`` on.  The VA reservation
+    // is never touched -- a captured CUDA graph keeps its addresses; only the
+    // physical pages behind the unplanned ranges are absent.
+    std::vector<std::pair<size_t, size_t>> weg2_plan;
+#if defined(USE_CUDA)
+    //: the CURRENT mapping of a span-mapped allocation (one handle per
+    //: extent); EMPTY while ACTIVE = the stock whole mapping under allocHandle.
+    std::vector<Weg2SpanExtent> weg2_extents;
+#endif
 };
 
 class TorchMemorySaver {
@@ -61,9 +84,29 @@ public:
     //: again and left PAUSED, so a retry after a refund is legal.
     int resume(const std::string& tag);
 
+    //: H95c (patch 3): the SPAN MAP of one allocation (``ptr`` must be an
+    //: allocation BASE).  ``n`` ranges ``[lo[i], hi[i])``, granularity aligned,
+    //: sorted and disjoint, inside the allocation; ``n == 0`` = the whole
+    //: allocation (the stock mapping).  The plan is what every later resume
+    //: maps.  ``now`` on an ACTIVE allocation also applies it at once: an
+    //: extent that lies wholly inside the new plan KEEPS its pages (and its
+    //: bytes), anything else is unmapped, and the plan's uncovered ranges get
+    //: fresh pages (content undefined).  Returns 0; -1 not an allocation base;
+    //: -2 a cpu-backed allocation (the host backup walks the whole size);
+    //: -3 a malformed plan; -4 the granularity could not be read; -5 ROCm;
+    //: else the CUresult of the failing map (the extents mapped by THIS call
+    //: are rolled back, the rest of the allocation is left as it was).
+    int set_spans(void* ptr, size_t n, const uint64_t* lo, const uint64_t* hi, bool now);
+    //: H95c: 0 when ``ptr`` is an allocation base, then its VA ``size``, the
+    //: bytes mapped NOW (0 while paused), the bytes the next resume maps, and
+    //: ``active`` (1 ACTIVE, 0 PAUSED); -1 otherwise.  Any pointer may be null.
+    int alloc_info(void* ptr, uint64_t* size, uint64_t* mapped, uint64_t* planned, int* active);
+
     //: C7: the planner's sizing input.  Sum of ``metadata.size`` over the
-    //: allocations carrying ``tag``.  This REPLACES the RssShmem delta as the
-    //: per-tag instrument: ring granules are shared pages mapped by both
+    //: allocations carrying ``tag`` -- H95c: the PHYSICAL bytes, i.e. per
+    //: allocation the bytes mapped now (ACTIVE) or planned for the next
+    //: resume (PAUSED); without a span plan that is ``metadata.size`` exactly.
+    //: This REPLACES the RssShmem delta as the per-tag instrument: ring granules are shared pages mapped by both
     //: co-located processes, so RssShmem collapses to ~0 and a per-process sum
     //: double-counts (spec R8).
     uint64_t tag_bytes(const std::string& tag);

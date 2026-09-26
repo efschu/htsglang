@@ -48,9 +48,11 @@ speculative verify state (ReplaySSM spec ring rows ``spec_state_size + 1``),
 one decode CUDA graph per batch size 1..--d-bs, and -- before H95 -- expert
 pool scratch growing with n (``min(n x 4 x 10, E - R)``).  H95 A removes the
 last one (overflow waves, the scratch of bs1 serves every n); the first two
-are allocated at boot for --d-bs seats.  Loading them only for the n occupied
-seats and handing the rest to the experts per flip needs a VRAM re-partition
-at the wake (open, metal).
+are allocated at boot for --d-bs seats.  H95c (``weg2/d_seat_vram.py``,
+SGLANG_OPT_WEG2_D_SEAT_VRAM) backs the GDN slots with pages only for the n
+occupied seats per flip and hands the pages of the others to extra expert-LRU
+rows on the attention host; the spec ring (request-row keyed, < one granule
+per layer and tail) and the graph pool (shared by every bs) stay at the cap.
 """
 from __future__ import annotations
 

@@ -73,6 +73,11 @@ DEFAULT_D_BS_NEXTFLASH = 6
 #: all three ranks).  Written into --env-d unless the operator states it.
 DEFAULT_D_POOL_WAVES_NEXTFLASH = 2
 
+#: H95c: the Next-Flash D group backs its seat posts (GDN slots, expert seat
+#: rows) only for the seats a phase occupies (SGLANG_OPT_WEG2_D_SEAT_VRAM,
+#: weg2/d_seat_vram.py).  Written into --env-d unless the operator states it.
+DEFAULT_D_SEAT_VRAM_NEXTFLASH = True
+
 #: K3 -- THE ORDERED P CUT, from which the solver's POOL FLOOR is DERIVED AT
 #: BOOT.  Moved here from ``launcher.py`` by the serve-next5 train (2026-09-09)
 #: as a pool-token CONSTANT (448,027) and REPLACED on the same train by the

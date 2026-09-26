@@ -83,6 +83,32 @@ H95 DEMAND PROBE (SGLANG_DEBUG_MOE_POOL_DEMAND=N replays, default 0 = off)
 ``demand`` = [max D_nr of one step, steps with D_nr > C, steps] since the last
 ``take_demand_report``: the measured quantity the bound above is about, per
 layer, instead of the worst case.
+
+H95c SEAT ROWS (``seat_rows`` = X > 0, SGLANG_OPT_WEG2_D_SEAT_VRAM, default 0)
+----------------------------------------------------------------------------
+D's per-seat posts are backed only for the phase's n occupied seats; the VRAM
+the unoccupied seats leave is handed to X extra LRU rows at the END of the
+bank (weg2/d_seat_vram.py maps their pages per phase, the virtual range --
+and every captured graph address -- is fixed). So that the mapped part of an
+expert tensor stays ONE prefix ``[0, rows_boot + k)`` (the cap form maps
+exactly the rows it mapped before), the seat form moves the S staging rows to
+the FRONT of the scratch block::
+
+    [0, R)            residents               (R = ``resident_rows``)
+    [R, R+S)          staging                 (below ``lru_start`` = R+S: never scanned)
+    [R+S, R+C)        LRU
+    [R+C, R+C+k)      seat rows ON            (ordinary LRU rows this phase)
+    [R+C+k, R+C+X)    seat rows OFF           (unmapped pages)
+
+An OFF row is a DEVICE VALUE, not a kernel constant: ``row_key`` = SEAT_OFF_KEY
+(an occupied row) and ``row_use`` = ROW_USE_NEVER, so the scan's "free first"
+rule never picks it and "use >= clock" never makes it a victim; no expert is
+ever routed there, so the step never reads or writes its bytes. Switching k is
+a table write (:func:`set_seat_rows_on`), never a recapture. The capture-time
+bound and the wave count use C at k = 0 (:func:`pool_row_capacity`), i.e. the
+phase with every seat occupied; a phase with more rows only needs fewer waves.
+The kernel's own DEMAND probe counts OFF rows into its C (probe only).
+With ``seat_rows`` = 0 every table, bound and layout is the one before H95c.
 """
 from __future__ import annotations
 
@@ -95,6 +121,9 @@ ROW_USE_NEVER = 0x7FFFFFFFFFFFFFFF
 PLAN_WIDTH = 64
 COPY_PROGRAMS = 32
 COPY_WORDS = 4096  # int32 words per program iteration (16 KiB)
+#: H95c: ``row_key`` of an OFF seat row -- an OCCUPIED key (>= 0) that is no
+#: expert id (>= E for every E this pool can hold), with ``row_use`` NEVER.
+SEAT_OFF_KEY = 0x7FFFFFFF
 
 
 @dataclass
@@ -124,6 +153,35 @@ class PoolTables:
     # H95: [3] int64 max distinct non-resident ids of one step, steps with
     # more of them than LRU + staging rows, steps -- None unless probed
     demand: Any = None
+    # H95c seat form (module docstring): the TRUE resident count R when the
+    # staging block sits below ``lru_start`` (None = ``lru_start``), the first
+    # seat row, the seat rows reserved (X) and the ones ON this phase (k).
+    resident_rows: Optional[int] = None
+    seat_base: int = 0
+    seat_rows: int = 0
+    seat_on: int = 0
+
+
+def resident_count(tables: PoolTables) -> int:
+    """H95c: R, the fixed residents -- ``lru_start`` outside the seat form."""
+    r = tables.resident_rows
+    return int(tables.lru_start if r is None else r)
+
+
+def seat_off_range(tables: PoolTables) -> Optional[Tuple[int, int]]:
+    """H95c: the rows [lo, hi) that are OFF this phase, or None."""
+    if not tables.seat_rows:
+        return None
+    lo = int(tables.seat_base) + int(tables.seat_on)
+    hi = int(tables.seat_base) + int(tables.seat_rows)
+    return (lo, hi) if hi > lo else None
+
+
+def _staging_first(tables: PoolTables) -> int:
+    """First staging row: after the LRU region, or (seat form) after R."""
+    if tables.seat_rows:
+        return resident_count(tables)
+    return int(tables.pool_rows)
 
 
 @dataclass
@@ -145,11 +203,20 @@ class StepBuffers:
 def allocate_pool_tables(
     device, num_experts: int, rows: int, lru_start: int, staging: int,
     hot_slot_of: Dict[int, int], host_row: Sequence[int], demand: bool = False,
+    seat_rows: int = 0,
 ) -> PoolTables:
     """``rows`` = R + C of the layer's arena; the last ``staging`` of them are
     staging rows, the ones in [lru_start, rows - staging) the LRU region.
     ``hot_slot_of`` = expert -> row for every initially resident expert.
-    ``demand`` (H95 probe) allocates the per-step demand counters."""
+    ``demand`` (H95 probe) allocates the per-step demand counters.
+
+    ``seat_rows`` = X > 0 (H95c): ``rows`` = R + C + X and the layout is the
+    seat form of the module docstring -- staging [R, R+S), LRU [R+S, R+C),
+    X seat rows at the end, all OFF (the cap form, k = 0)."""
+    if int(seat_rows) > 0:
+        return _allocate_seat_tables(
+            device, num_experts, rows, lru_start, staging, hot_slot_of, host_row,
+            demand=demand, seat_rows=int(seat_rows))
     import torch
 
     if staging < 1 or not 0 <= lru_start < rows - staging:
@@ -188,6 +255,93 @@ def allocate_pool_tables(
         pf_counts=torch.zeros(4, dtype=torch.int64, device=device),
         demand=torch.zeros(3, dtype=torch.int64, device=device) if demand else None,
     )
+
+
+def _allocate_seat_tables(
+    device, num_experts: int, rows: int, resident: int, staging: int,
+    hot_slot_of: Dict[int, int], host_row: Sequence[int], *, demand: bool,
+    seat_rows: int,
+) -> PoolTables:
+    """H95c: :func:`allocate_pool_tables` in the seat form, k = 0."""
+    import torch
+
+    R, S, X = int(resident), int(staging), int(seat_rows)
+    C = int(rows) - X - R
+    if S < 1 or R < 0 or C - S < 1:
+        raise ValueError("pool needs staging rows and a non-empty LRU region")
+    if len(host_row) != num_experts:
+        raise ValueError("host_row must have one entry per expert")
+    lru_start = R + S
+    hot = torch.full((num_experts,), -1, dtype=torch.int32)
+    key = torch.full((rows,), -1, dtype=torch.int32)
+    use = torch.zeros(rows, dtype=torch.int64)
+    for e, r in hot_slot_of.items():
+        if not 0 <= r < R:
+            raise ValueError(f"expert {e} placed outside the residents at row {r}")
+        hot[e] = r
+        key[r] = e
+    use[:lru_start] = ROW_USE_NEVER
+    key[R + C:] = SEAT_OFF_KEY
+    use[R + C:] = ROW_USE_NEVER
+    hr = torch.tensor(list(host_row), dtype=torch.int32)
+    bad = [(e, r) for e, r in hot_slot_of.items() if int(hr[e]) >= 0]
+    if bad:
+        raise ValueError(f"resident experts must carry host_row -1: {bad[:3]}")
+
+    def one(v, dtype=torch.int32):
+        return torch.full((1,), v, dtype=dtype, device=device)
+
+    return PoolTables(
+        num_experts=num_experts, pool_rows=int(rows), lru_start=lru_start,
+        hot_phys=hot.to(device), host_row=hr.to(device), row_key=key.to(device),
+        row_use=use.to(device), clock=one(0, torch.int64), gate=one(1), error=one(0),
+        promote_limit=one(0), promote_interval=one(1), forwards=one(0),
+        promote_min_misses=one(1), protect_recent=one(0),
+        miss_count=torch.zeros(num_experts, dtype=torch.int32, device=device),
+        staging_rows=torch.arange(R, R + S, dtype=torch.int32, device=device),
+        misses_total=one(0, torch.int64),
+        pf_row=torch.full((rows,), -1, dtype=torch.int64, device=device),
+        pf_counts=torch.zeros(4, dtype=torch.int64, device=device),
+        demand=torch.zeros(3, dtype=torch.int64, device=device) if demand else None,
+        resident_rows=R, seat_base=R + C, seat_rows=X, seat_on=0,
+    )
+
+
+def set_seat_rows_on(tables: PoolTables, k: int, *, device_write: bool = True) -> int:
+    """H95c: turn the first ``k`` seat rows ON (ordinary free LRU rows) and
+    the rest OFF. ``device_write=False`` only records k on the host (the next
+    :func:`reinit_pool_tables` -- the wake's rearm -- writes the layout);
+    ``True`` writes the rows now, stream-ordered, IN PLACE: a row turned ON
+    becomes free (key -1, use 0), a row turned OFF drops the expert it held
+    (``hot_phys`` -> -1, the next miss fetches it again) and becomes OFF.
+    Returns the previous k. A table without seat rows accepts only k = 0."""
+    k = int(k)
+    X = int(tables.seat_rows)
+    if not 0 <= k <= X:
+        raise ValueError(f"seat rows on {k} outside [0, {X}]")
+    old = int(tables.seat_on)
+    tables.seat_on = k
+    if not device_write or k == old:
+        return old
+    base = int(tables.seat_base)
+    if k > old:
+        lo, hi = base + old, base + k
+        tables.row_key[lo:hi].fill_(-1)
+        tables.row_use[lo:hi].fill_(0)
+        tables.pf_row[lo:hi].fill_(-1)
+        return old
+    lo, hi = base + k, base + old
+    keys = tables.row_key[lo:hi].cpu()
+    hot = tables.hot_phys.cpu()
+    E = int(tables.num_experts)
+    for i, e in enumerate(keys.tolist()):
+        if 0 <= e < E and int(hot[e]) == lo + i:
+            hot[e] = -1
+    tables.hot_phys.copy_(hot.to(tables.hot_phys.device))
+    tables.row_key[lo:hi].fill_(SEAT_OFF_KEY)
+    tables.row_use[lo:hi].fill_(ROW_USE_NEVER)
+    tables.pf_row[lo:hi].fill_(-1)
+    return old
 
 
 def plan_width_for(max_step_ids: Optional[int]) -> int:
@@ -238,8 +392,10 @@ def step_row_demand(n_ids: int, num_experts: int, n_resident: int) -> int:
 
 def pool_row_capacity(tables: PoolTables) -> int:
     """H95: C = LRU + staging rows -- the distinct non-resident experts ONE
-    pool step can serve (module docstring)."""
-    return int(tables.pool_rows - tables.lru_start + int(tables.staging_rows.shape[0]))
+    pool step can serve (module docstring). H95c: OFF seat rows are no rows."""
+    off = seat_off_range(tables)
+    return int(tables.pool_rows - tables.lru_start + int(tables.staging_rows.shape[0])) - (
+        0 if off is None else off[1] - off[0])
 
 
 def pool_waves_for(n_ids: int, num_experts: int, n_resident: int, capacity: int) -> int:
@@ -299,6 +455,10 @@ def pool_layout_tensors(tables: PoolTables, hot_slot_of: Dict[int, int],
         key[r] = e
     use[: tables.lru_start] = ROW_USE_NEVER
     use[pool_rows:] = ROW_USE_NEVER
+    off = seat_off_range(tables)
+    if off is not None:
+        key[off[0]:off[1]] = SEAT_OFF_KEY
+        use[off[0]:off[1]] = ROW_USE_NEVER
     dev = tables.hot_phys.device
     return PoolLayout(
         hot_phys=hot.to(dev),
@@ -311,7 +471,6 @@ def apply_pool_layout(tables: PoolTables, layout: PoolLayout) -> None:
     device ops only, stream-ordered on the current stream."""
     import torch
 
-    rows = int(tables.row_key.shape[0])
     dev = tables.hot_phys.device
     tables.hot_phys.copy_(layout.hot_phys)
     tables.host_row.copy_(layout.host_row)
@@ -326,8 +485,9 @@ def apply_pool_layout(tables: PoolTables, layout: PoolLayout) -> None:
     tables.promote_min_misses.fill_(1)
     tables.protect_recent.fill_(0)
     tables.miss_count.zero_()
-    tables.staging_rows.copy_(
-        torch.arange(tables.pool_rows, rows, dtype=torch.int32, device=dev))
+    s0 = _staging_first(tables)
+    tables.staging_rows.copy_(torch.arange(
+        s0, s0 + int(tables.staging_rows.shape[0]), dtype=torch.int32, device=dev))
     tables.misses_total.fill_(0)
     tables.pf_row.fill_(-1)
     tables.pf_counts.zero_()
@@ -397,11 +557,14 @@ def sync_tables(
     clock = int(tables.clock[0])
     rows = int(key.shape[0])
     written = {r for r in lru_holds if lo <= r < rows}
+    off = seat_off_range(tables)
     for r in range(lo, rows):
         # staging rows are never owned; a written LRU row loses its old expert;
         # without keep every LRU row is cleared
         if keep_unwritten and r < hi and r not in written:
             continue
+        if off is not None and off[0] <= r < off[1]:
+            continue  # H95c: an OFF seat row has no pages and stays OFF
         old = int(key[r])
         if old >= 0 and int(hot[old]) == r:
             hot[old] = -1
@@ -415,6 +578,8 @@ def sync_tables(
     twins = 0
     for r, e in lru_holds.items():
         if not (lo <= r < hi and 0 <= e < E and int(host_row[e]) >= 0):
+            continue
+        if off is not None and off[0] <= r < off[1]:
             continue
         twin = int(hot[e])
         if twin >= lo and twin != r:
@@ -433,7 +598,11 @@ def sync_tables(
     # prefetch mark on them is stale and would count a later hit as a
     # prefetch hit it never was.
     tables.pf_row.copy_(pf_row.to(dev))
-    return SyncReport(owned=int((key[lo:hi] >= 0).sum()), twins_freed=twins)
+    if off is None:
+        owned = int((key[lo:hi] >= 0).sum())
+    else:
+        owned = int(((key[lo:hi] >= 0) & (key[lo:hi] < E)).sum())
+    return SyncReport(owned=owned, twins_freed=twins)
 
 
 def seed_lru_rows(tables: PoolTables, experts: Sequence[int],
@@ -492,7 +661,8 @@ def bijection_breaks(tables: PoolTables) -> int:
     lo, hi = tables.lru_start, tables.pool_rows
     hot = tables.hot_phys.tolist()
     key = tables.row_key.tolist()
-    breaks = sum(1 for r in range(lo, hi) if key[r] >= 0 and hot[key[r]] != r)
+    E = len(hot)
+    breaks = sum(1 for r in range(lo, hi) if 0 <= key[r] < E and hot[key[r]] != r)
     breaks += sum(1 for e, r in enumerate(hot) if lo <= r < hi and key[r] != e)
     return breaks
 
@@ -583,8 +753,8 @@ def step_reference(
     raw = [int(v) for v in ids.reshape(-1).tolist()]
     if len(raw) > buffers.gather_src.shape[0]:
         raise ValueError("Step ids exceed the plan width")
-    if step_row_demand(len(raw), E, tables.lru_start) > max(1, int(waves)) * (
-        (tables.pool_rows - tables.lru_start) + len(staging_rows)
+    if step_row_demand(len(raw), E, resident_count(tables)) > max(1, int(waves)) * (
+        pool_row_capacity(tables)
     ):
         # Overflow-impossible bound (Task #40): a miss takes an LRU victim
         # (rows not used this step) or a staging row; hits protect at most
@@ -612,7 +782,7 @@ def step_reference(
         # H95 probe: distinct ids that are not FIXED residents -- what the
         # rows above the residents have to hold in this step (LRU hits too).
         nonres = sum(1 for e in selected if not 0 <= hot[e] < tables.lru_start)
-        cap = (tables.pool_rows - tables.lru_start) + len(staging_rows)
+        cap = pool_row_capacity(tables)
         demand = [int(v) for v in tables.demand.tolist()]
         demand[0] = max(demand[0], nonres)
         demand[1] += 1 if nonres > cap else 0
@@ -750,12 +920,11 @@ def step(tables: PoolTables, ids, buffers: StepBuffers, prefetch: bool = False,
     if not flat.is_contiguous():
         flat = flat.contiguous()
     width = buffers.gather_src.shape[0]
-    n_staging = int(tables.staging_rows.shape[0])
     if flat.numel() > width:
         raise ValueError("Step ids exceed the plan width")
-    if step_row_demand(flat.numel(), tables.num_experts, tables.lru_start) > max(
+    if step_row_demand(flat.numel(), tables.num_experts, resident_count(tables)) > max(
         1, int(waves)
-    ) * ((tables.pool_rows - tables.lru_start) + n_staging):
+    ) * pool_row_capacity(tables):
         raise ValueError("Step ids exceed the LRU rows plus the staging rows")
     _launch_step_kernel(tables, flat, buffers, prefetch=prefetch, spill=spill, wave=wave)
 

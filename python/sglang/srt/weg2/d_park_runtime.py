@@ -16,6 +16,9 @@ Entry points (all no-ops off group D / with nothing parked):
   admission      -- D's admission verdict for one pass
   park_abort     -- an abort reaches the parked list
   note_wake_seats -- H95: the wake of D fixes the phase's seat count n
+  seat_vram_wake  -- H95c: every D resume request maps the posts of n seats
+  seat_cap        -- H95c: D admits at most n running requests
+  seat_guard      -- H95c: a forward batch wider than n is refused (W-SEAT)
 
 H91d: the parked request's MTP draft rows ride along (``d_park_draft``):
 saved before the flip park's retraction, dropped with an abort.
@@ -271,3 +274,28 @@ def note_wake_seats(sched, recv_req):
     sched.weg2_d_phase_seats = seats
     logger.info("%s", seats.line())
     return seats
+
+
+def seat_vram_wake(sched, recv_req, seats):
+    """H95c: every D resume request, BEFORE the saver resumes its tags --
+    the posts of the phase's ``seats`` (``d_seats.PhaseSeats``, None when the
+    request carries no count) become pages: the slot limit (replicated), the
+    Mamba span plan and the expert seat rows (TP0). A no-op unless
+    SGLANG_OPT_WEG2_D_SEAT_VRAM on group D (weg2/d_seat_vram.py)."""
+    from sglang.srt.weg2 import d_seat_vram
+
+    return d_seat_vram.on_wake(sched, recv_req, seats)
+
+
+def seat_cap(sched):
+    """H95c: the phase's n as a running-request cap, None = no cap."""
+    from sglang.srt.weg2 import d_seat_vram
+
+    return d_seat_vram.admission_cap(sched)
+
+
+def seat_guard(sched, batch) -> None:
+    """H95c W-SEAT: a batch wider than the phase's n never runs."""
+    from sglang.srt.weg2 import d_seat_vram
+
+    d_seat_vram.guard(sched, batch)

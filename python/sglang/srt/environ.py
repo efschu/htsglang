@@ -2141,6 +2141,25 @@ class Envs:
     # bound is about, instead of its worst case. 0 (default) = off; the pool
     # tables then carry no demand counters and the step kernel is unchanged.
     SGLANG_DEBUG_MOE_POOL_DEMAND = EnvInt(0)
+    # H95c (Nutzer 26.09.: "1,6gb experten cache kostet es nur bei tatsaechlich
+    # 6 sitzen"): D's per-seat posts are PHYSICALLY backed only for the seats
+    # the phase occupies (n = d_seats.phase_seats of the wake's handoff_n); the
+    # rest of the same VRAM backs extra expert-LRU rows on the attention host
+    # (Form A TP0). Mechanism (weg2/d_seat_vram.py): the Mamba/GDN temporal
+    # state and the expert buffers keep their FULL virtual range (CUDA graphs
+    # keep their addresses), the saver's span map (tms_csrc patch 3) maps only
+    # slots(n) per layer resp. rows(cap) + k(n) per expert tensor, the slot
+    # allocator hands out slots(n), the pool tables enable k(n) rows as device
+    # values, D admits at most n. False (default) = byte-identical to H95 B;
+    # the Next-Flash launcher profile writes it True into --env-d.
+    # Rank-uniform: every rank of D reads the same launcher env.
+    SGLANG_OPT_WEG2_D_SEAT_VRAM = EnvBool(False)
+    # H95c: the extra expert rows' VIRTUAL reservation per MoE TP rank
+    # ("16,0,0"), written by the launcher from the seat table (rows at n=1
+    # minus rows at the --d-bs cap, GERECHNET). Only the rows the runtime's
+    # exact granule arithmetic funds in a phase are ever mapped; unset/empty or
+    # 0 on a rank = no extra rows there.
+    SGLANG_WEG2_D_SEAT_EXPERT_ROWS = EnvStr("")
     # #254: how a prefill forward that overflows the scratch region is split.
     #   "token"  (default) -- waves are disjoint TOKEN subsets; every wave
     #     re-fetches the spill experts its tokens need, so a spill expert is
