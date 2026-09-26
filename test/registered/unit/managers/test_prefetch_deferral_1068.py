@@ -212,6 +212,11 @@ class _Intake:
     # the undeferrable exit asks whether a windowed store read is in flight;
     # the double has none
     _weg2_windowed_store_read_active = lambda self, *a, **k: False  # noqa: E731
+    # NF fnFL2 H43 (0244277a30): intake starts the PLE first-chunk gather; the
+    # double has no PLE gather in its process (the real call is a no-op there
+    # too). Missing since the unified base a3b9479f29: every intake raised
+    # AttributeError, 31 tests red behind "retry() exceed maximum" (UN6 26.09.).
+    _ple_admit_on_intake = lambda self, req: None  # noqa: E731
 
     def _stall_witness(self, req):
         """#1317k stand-in (installed per test): every retry is a no-progress
