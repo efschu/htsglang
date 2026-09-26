@@ -1787,6 +1787,18 @@ class SeatTableRow(msgspec.Struct, frozen=True, kw_only=True):
     fraction_max: Tuple[Optional[float], ...]
     #: the plan's own refusal at the GIVEN fractions/scratch (budget/card/step).
     refusal: Optional[str]
+    #: H95c (SGLANG_OPT_WEG2_D_SEAT_VRAM): the rows each rank RUNS with in a
+    #: phase of ``seats`` -- the boot books the cap (``max_rows`` of the last
+    #: row), the attention host adds ``seat_extra`` rows from the Mamba pages
+    #: the phase does not map (``d_seat_vram.seat_vram_rows``). None = not
+    #: computed (switch off / no geometry).
+    runtime_rows: Optional[Tuple[int, ...]] = None
+    seat_extra: Optional[Tuple[int, ...]] = None
+    #: the host's mapped Mamba+expert-seat MiB in this phase, and the cap's
+    seat_mapped_mib: Optional[float] = None
+    seat_cap_mib: Optional[float] = None
+    #: the host's GDN slots handed out in this phase (``phase_slot_limit``)
+    seat_slot_limit: Optional[int] = None
 
 
 def _fraction_of(E: int, R: Optional[int]) -> Optional[float]:
@@ -1843,19 +1855,154 @@ def seat_table_row(
     )
 
 
+class SeatVramForm(msgspec.Struct, frozen=True, kw_only=True):
+    """H95c: the geometry of the seat posts that become pages per phase --
+    the GDN temporal state per rank and the expert row per MoE layer.
+    GERECHNET from the checkpoint config; the runtime recomputes k(n) exactly
+    over its real tensors (``d_seat_vram.SeatVram``)."""
+
+    #: bytes of ONE slot of ONE GDN layer per rank (0 = no GDN state there)
+    temporal_slot_bytes: Tuple[int, ...]
+    gdn_layers: int
+    #: bytes of ONE expert row of ONE MoE layer (all its tensors)
+    expert_row_bytes: int
+    moe_layers: int
+    granule: int = 2 << 20
+    #: the part of ``expert_row_bytes`` in tensors too small to unmap (the
+    #: scales), GESCHAETZT as row - packed int4 weights; 0 = unknown
+    small_row_bytes: int = 0
+
+
+def seat_vram_form(
+    text_cfg: Mapping[str, object], *, ssm_dtype: Optional[str], rank_tp_ratio: str,
+    n_ranks: int, expert_row_bytes: float, moe_layers: int,
+) -> Optional[SeatVramForm]:
+    """H95c: :class:`SeatVramForm` from the config, the D group's
+    --mamba-ssm-dtype and --rank-tp-ratio (the GDN value heads split like the
+    attention); None without a linear-attention geometry."""
+    try:
+        hv = int(text_cfg.get("linear_num_value_heads") or 0)
+        v = int(text_cfg.get("linear_value_head_dim") or 0)
+        k = int(text_cfg.get("linear_key_head_dim") or 0)
+        kinds = list(text_cfg.get("layer_types") or ())
+    except (TypeError, ValueError):
+        return None
+    gdn = sum(1 for x in kinds if str(x) == "linear_attention")
+    if hv <= 0 or v <= 0 or k <= 0 or gdn <= 0:
+        return None
+    dtype = str(ssm_dtype or text_cfg.get("mamba_ssm_dtype") or "float32")
+    eb = _DTYPE_BYTES.get(dtype.replace("torch.", ""), 4)
+    try:
+        ratios = [float(x) for x in str(rank_tp_ratio).split(",") if str(x).strip()]
+    except ValueError:
+        ratios = []
+    if len(ratios) != int(n_ranks) or sum(ratios) <= 0:
+        ratios = [1.0] * int(n_ranks)
+    total = sum(ratios)
+    heads = [int(round(hv * r / total)) for r in ratios]
+    row = int(round(float(expert_row_bytes)))
+    try:
+        inter = int(text_cfg.get("moe_intermediate_size") or 0)
+        hidden = int(text_cfg.get("hidden_size") or 0)
+    except (TypeError, ValueError):
+        inter = hidden = 0
+    packed = 3 * inter * hidden // 2  # w13 (2 x I x H) + w2 (I x H) at 4 bit
+    small = row - packed if 0 < packed < row and (row - packed) * 10 < row else 0
+    return SeatVramForm(
+        temporal_slot_bytes=tuple(h * v * k * eb for h in heads), gdn_layers=gdn,
+        expert_row_bytes=row, moe_layers=int(moe_layers), small_row_bytes=int(small))
+
+
+def _seat_vram_columns(rows: Sequence[SeatTableRow], form: SeatVramForm) -> Tuple[SeatTableRow, ...]:
+    """H95c: fill the runtime columns of a full table (n = 1..cap)."""
+    from sglang.srt.weg2 import d_seat_vram as dsv
+    from sglang.srt.weg2.d_seats import mamba_slots_for_seats
+
+    cap = len(rows)
+    if cap < 1:
+        return tuple(rows)
+    cap_rows = rows[-1].max_rows
+    size = mamba_slots_for_seats(cap)
+    g = int(form.granule)
+    per_rank = []
+    for r, rows_cap in enumerate(cap_rows):
+        sb = int(form.temporal_slot_bytes[r]) if r < len(form.temporal_slot_bytes) else 0
+        x_max = max(0, int(rows[0].max_rows[r]) - int(rows_cap))
+        if sb <= 0 or x_max <= 0:
+            per_rank.append(None)
+            continue
+        slot = dsv.SlotTensorGeom("gdn_temporal", form.gdn_layers, size + 1, sb,
+                                  dsv.align_up(form.gdn_layers * (size + 1) * sb, g))
+        # the tensors whose seat rows can be unmapped: with the small part known,
+        # w13 (2/3 of the packed row) and w2 (1/3) -- each rounds on its own,
+        # as the runtime's do; unknown: one tensor per layer
+        packed = int(form.expert_row_bytes) - int(form.small_row_bytes)
+        parts = ((packed * 2 // 3, packed - packed * 2 // 3) if form.small_row_bytes
+                 else (int(form.expert_row_bytes),))
+        rows_t = [dsv.RowTensorGeom("layer%d.%d" % (i, j), int(rows_cap), int(rows_cap) + x_max,
+                                    rb, dsv.align_up((int(rows_cap) + x_max) * rb, g))
+                  for i in range(int(form.moe_layers)) for j, rb in enumerate(parts)]
+        per_rank.append(dsv.seat_vram_rows([slot], rows_t, cap=cap, pool_size=size,
+                                           extra_max=x_max, granule=g))
+    out = []
+    for i, row in enumerate(rows):
+        extra = tuple(0 if pr is None else int(pr[i].extra_rows) for pr in per_rank)
+        host = next((pr[i] for pr in per_rank if pr is not None), None)
+        out.append(msgspec.structs.replace(
+            row,
+            runtime_rows=tuple(int(c) + e for c, e in zip(cap_rows, extra)),
+            seat_extra=extra,
+            seat_mapped_mib=None if host is None else round(host.mapped / MIB, 1),
+            seat_cap_mib=None if host is None else round(host.cap_mapped / MIB, 1),
+            seat_slot_limit=None if host is None else int(host.slot_limit),
+        ))
+    return tuple(out)
+
+
+def seat_fixed_mib(rows: Sequence[SeatTableRow], form: "SeatVramForm",
+                   value: Optional[str]) -> Tuple[float, ...]:
+    """H95c: per rank the MiB the reserved seat rows cost at EVERY seat count
+    -- the rows of tensors too small to unmap (the scales:
+    ``form.small_row_bytes`` per row and MoE layer). GESCHAETZT; the runtime
+    line ``WEG2 D-SEAT-VRAM`` names the exact figure (fixed_mib)."""
+    if not value or not form.small_row_bytes:
+        return ()
+    xs = [int(v) for v in value.split(",")]
+    return tuple(round(x * form.small_row_bytes * form.moe_layers / MIB, 1) for x in xs)
+
+
+def seat_expert_rows_value(rows: Sequence[SeatTableRow]) -> Optional[str]:
+    """H95c: SGLANG_WEG2_D_SEAT_EXPERT_ROWS for the launcher -- per rank the
+    rows the runtime may reserve: k(1) + 1 (one row of margin for the
+    runtime's exact granule arithmetic), at most rows(1) - rows(cap)."""
+    if not rows or rows[0].seat_extra is None:
+        return None
+    first, last = rows[0], rows[-1]
+    vals = []
+    for r, k in enumerate(first.seat_extra):
+        room = max(0, int(first.max_rows[r]) - int(last.max_rows[r]))
+        vals.append(min(room, int(k) + 1) if int(k) > 0 else 0)
+    return ",".join(str(v) for v in vals)
+
+
 def seat_table(
     plan_for_seats, *, seats_max: int, verify_tokens: int, top_k: int, waves: int,
-    host_rank: int = 0,
+    host_rank: int = 0, seat_vram: Optional[SeatVramForm] = None,
 ) -> Tuple[SeatTableRow, ...]:
     """H95: n = 1..``seats_max`` -> :class:`SeatTableRow`. ``plan_for_seats(n)``
     is the D-FRACTION-SOLVE at ``n`` seats (the launcher passes a closure
-    over its own ``plan_d_residency`` arguments)."""
-    return tuple(
+    over its own ``plan_d_residency`` arguments). H95c: with ``seat_vram``
+    every row also carries the rows D RUNS with in that phase (the boot books
+    the cap, the host gets the seat rows the unmapped Mamba pages fund)."""
+    rows = tuple(
         seat_table_row(
             plan_for_seats(n), seats=n, verify_tokens=verify_tokens, top_k=top_k,
             waves=waves, host_rank=host_rank)
         for n in range(1, max(1, int(seats_max)) + 1)
     )
+    if seat_vram is not None:
+        rows = _seat_vram_columns(rows, seat_vram)
+    return rows
 
 
 def describe_seat_table(rows: Sequence[SeatTableRow], *, marker: str, label: str) -> Tuple[str, ...]:
@@ -1869,17 +2016,28 @@ def describe_seat_table(rows: Sequence[SeatTableRow], *, marker: str, label: str
 
     out = []
     for r in rows:
+        runtime = ""
+        if r.runtime_rows is not None:
+            # H95c: what the phase RUNS with -- the boot books the last row (the
+            # cap), the host adds the seat rows the unmapped Mamba pages fund
+            runtime = (
+                " | H95c Laufzeit-Zeilen %s (Seat-Zeilen %s vs n=%d), GDN-Slots 1..%s "
+                "gemappt, Host Mamba+Seat-Zeilen %s von %s MiB (Kappe)"
+                % (list(r.runtime_rows), ["+%d" % e for e in (r.seat_extra or ())],
+                   len(rows), "-" if r.seat_slot_limit is None else r.seat_slot_limit,
+                   "-" if r.seat_mapped_mib is None else "%.1f" % r.seat_mapped_mib,
+                   "-" if r.seat_cap_mib is None else "%.1f" % r.seat_cap_mib))
         out.append(
             "%s FRACTION-SOLVE %s D-SITZE (H95) n=%d: %d Ids/Schritt, Wellen-Deckel %d | "
             "Zeilen je Rang (Budget+Karte) %s | Scratch gegeben %s -> Wellen %s, FR %s | "
             "Scratch min %s -> FR max %s | GDN-Slots %d, Host-Posten Mamba %.1f + Spec %.1f "
-            "MiB | %s -- GERECHNET"
+            "MiB%s | %s -- GERECHNET"
             % (
                 marker, label, r.seats, r.ids_per_step, r.waves,
                 list(r.max_rows), list(r.scratch_given), list(r.waves_given),
                 [_f(x) for x in r.fraction_given], [_i(x) for x in r.scratch_min],
                 [_f(x) for x in r.fraction_max], r.mamba_slots, r.host_mamba_mib,
-                r.host_spec_mib,
+                r.host_spec_mib, runtime,
                 "passt bei gegebener Form" if r.refusal is None
                 else "VERWEIGERT bei gegebener Form: " + r.refusal[:160],
             )

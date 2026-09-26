@@ -79,6 +79,7 @@ from sglang.srt.weg2 import (
     DEFAULT_D_BS,
     DEFAULT_D_BS_NEXTFLASH,
     DEFAULT_D_POOL_WAVES_NEXTFLASH,
+    DEFAULT_D_SEAT_VRAM_NEXTFLASH,
     DEFAULT_P_BS,
     DEFAULT_PP_ORDERED_CUT,
 )
@@ -2488,6 +2489,56 @@ def d_seat_lines(ns) -> List[str]:
     return out
 
 
+def d_seat_vram_armed(env_d) -> bool:
+    """H95c: SGLANG_OPT_WEG2_D_SEAT_VRAM truthy in the D group's env."""
+    return str((env_d or {}).get("SGLANG_OPT_WEG2_D_SEAT_VRAM", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def d_seat_vram_plan_form(ns, er, plan_kwargs, cfg, form):
+    """H95c: the seat-post geometry for the seat table's runtime columns
+    (``expert_residency.seat_vram_form``), or None when the switch is off in
+    --env-d or the checkpoint has no GDN geometry."""
+    env_d = plan_kwargs.get("env_d") or {}
+    if not d_seat_vram_armed(env_d):
+        return None
+    from sglang.srt.planner import pp_cut as _pp
+
+    terms = _pp.checkpoint_weight_terms(ns.model)
+    text_cfg = cfg.get("text_config") or cfg
+    ratios = str(plan_kwargs.get("rank_tp_ratio") or "")
+    return er.seat_vram_form(
+        text_cfg, ssm_dtype=getattr(form, "ssm_dtype", None), rank_tp_ratio=ratios,
+        n_ranks=len(plan_kwargs.get("budgets_mib") or ()) or 1,
+        expert_row_bytes=float(terms.expert_layer_weight_bytes) / int(terms.num_experts),
+        moe_layers=int(terms.n_layers))
+
+
+def apply_d_seat_expert_rows(ns, er, rows, seat_vram, label) -> List[str]:
+    """H95c: write SGLANG_WEG2_D_SEAT_EXPERT_ROWS (the seat rows' virtual
+    reservation per rank, from the table) into --env-d -- before build_env
+    reads it -- unless the operator stated it. Returns the lines to log."""
+    env_d_raw = str(getattr(ns, "env_d", "") or "")
+    stated = parse_group_env(env_d_raw).get("SGLANG_WEG2_D_SEAT_EXPERT_ROWS")
+    value = er.seat_expert_rows_value(rows)
+    fixed = er.seat_fixed_mib(rows, seat_vram, value)
+    head = "%s FRACTION-SOLVE %s D-SITZ-VRAM (H95c)" % (D_RANK_SOLVE_MARKER, label)
+    fixed_txt = (
+        "; fest an JEDER Sitzzahl (auch der Kappe): die Seat-Zeilen der Skalen-Tensoren, "
+        "zu klein zum Entmappen, je Rang %s MiB GESCHAETZT -- NICHT im Kappen-Riegel "
+        "gebucht" % ["%.1f" % f for f in fixed] if fixed else "")
+    if stated is not None:
+        return ["%s: --env-d nennt SGLANG_WEG2_D_SEAT_EXPERT_ROWS=%s selbst (Tabelle: %s)%s"
+                % (head, stated, value, fixed_txt)]
+    if not value or all(v == "0" for v in value.split(",")):
+        return ["%s: keine Seat-Zeilen (die Tabelle finanziert bei n=1 keine Zeile)" % head]
+    item = "SGLANG_WEG2_D_SEAT_EXPERT_ROWS=%s" % value
+    ns.env_d = (env_d_raw.rstrip(";") + ";" + item) if env_d_raw.strip() else item
+    return ["%s: --env-d %s (virtuelle Reserve je Rang = k(n=1) + 1; gemappt wird je "
+            "Phase nur, was die Laufzeit exakt aus den ungemappten GDN-Slots finanziert)%s"
+            % (head, item, fixed_txt)]
+
+
 def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
     """H95: the D-FRACTION-SOLVE once per seat count n = 1..seats (the SAME
     ``plan_d_residency`` with ``seats=n`` -- seat_rebook re-books the posts;
@@ -2518,10 +2569,14 @@ def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
                 **plan_kwargs, seats=n,
                 replayssm_spec=msgspec.structs.replace(form, max_running=n))
 
+        seat_vram = d_seat_vram_plan_form(ns, er, plan_kwargs, cfg, form)
         rows = er.seat_table(
             plan_for, seats_max=int(seats), verify_tokens=int(form.draft_tokens),
-            top_k=top_k, waves=er.pool_overflow_waves(env_d))
-        return list(er.describe_seat_table(rows, marker=D_RANK_SOLVE_MARKER, label=label))
+            top_k=top_k, waves=er.pool_overflow_waves(env_d), seat_vram=seat_vram)
+        out = list(er.describe_seat_table(rows, marker=D_RANK_SOLVE_MARKER, label=label))
+        if seat_vram is not None:
+            out.extend(apply_d_seat_expert_rows(ns, er, rows, seat_vram, label))
+        return out
     except Exception as exc:  # noqa: BLE001 -- an informational table never kills a launch
         return ["%s FRACTION-SOLVE %s D-SITZE (H95) Tabelle entfaellt: %s: %s"
                 % (D_RANK_SOLVE_MARKER, label, type(exc).__name__, exc)]
@@ -17922,6 +17977,23 @@ def apply_profile_d_pool_waves_default(ns) -> Optional[str]:
             "H91b-Schranke)" % (item, POOL_OVERFLOW_WAVES_ENV))
 
 
+def apply_profile_d_seat_vram_default(ns) -> Optional[str]:
+    """H95c: ``--profile nextflash`` backs D's seat posts only for the
+    phase's occupied seats (SGLANG_OPT_WEG2_D_SEAT_VRAM=1 into ``ns.env_d``)
+    unless ``--env-d`` states the switch itself (=0: H95 B's fixed posts).
+    Returns the line naming it, or None when nothing was added."""
+    if getattr(ns, "profile", None) != PROFILE_NEXTFLASH or not DEFAULT_D_SEAT_VRAM_NEXTFLASH:
+        return None
+    env_d = str(getattr(ns, "env_d", "") or "")
+    if "SGLANG_OPT_WEG2_D_SEAT_VRAM" in parse_group_env(env_d):
+        return None
+    item = "SGLANG_OPT_WEG2_D_SEAT_VRAM=1"
+    ns.env_d = (env_d.rstrip(";") + ";" + item) if env_d.strip() else item
+    return ("D-SITZ-VRAM (H95c): --profile nextflash -> --env-d %s (Sitz-Posten nur fuer "
+            "die besetzten Sitze der Phase, der Rest als Experten-LRU-Zeilen auf TP0; "
+            "--env-d SGLANG_OPT_WEG2_D_SEAT_VRAM=0 = H95 B)" % item)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global _ACTIVE_BOOT_STATE
     # #1248: unclaimed until a BootState exists below -- a stale pointer from
@@ -17935,6 +18007,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _h95_waves_line = apply_profile_d_pool_waves_default(ns)
     if _h95_waves_line:
         print(_h95_waves_line, flush=True)
+    _h95c_line = apply_profile_d_seat_vram_default(ns)
+    if _h95c_line:
+        print(_h95c_line, flush=True)
     # WEG2-FORM: resolved ONCE, before apply_spec_form (--form-draft and
     # --form-p-draft may drive --spec-form / --draft-kv-on-p /
     # --dflash-produce-on-p), and PUBLISHED into this process's own environment

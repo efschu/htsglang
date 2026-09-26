@@ -343,7 +343,53 @@ class MambaSlotAllocator:
         # releases that genuinely flipped a slot True->False. A refused release
         # never becomes somebody's "first releaser".
         self._note_slot_event(safe, "FREE")
+        if getattr(self, "_phase_limit", None) is not None:
+            # H95c: a slot above the phase's limit goes back to the withheld
+            # set, never to the free list (unreachable while the limit holds:
+            # nothing above it is handed out)
+            self._split_phase_withheld(torch.cat((self.free_slots, free_index)))
+            return
         self.free_slots = torch.cat((self.free_slots, free_index))
+
+    # ---- H95c: the D phase's slot limit (weg2/d_seat_vram.py) ---------------
+    #
+    # In a D phase of n < --d-bs seats only slots 1..L(n) have pages behind
+    # them (the saver's span map). The allocator is what makes that safe: it
+    # hands out nothing above L(n), so no kernel can index an unmapped slot.
+    # The limit is a function of replicated inputs (n, the cap, this pool's
+    # size and its ownership ledger), so every rank withholds the same slots.
+
+    def _split_phase_withheld(self, candidates: torch.Tensor) -> None:
+        limit = int(self._phase_limit)
+        prev = getattr(self, "_phase_withheld", None)
+        if prev is not None and prev.numel():
+            candidates = torch.cat((candidates, prev))
+        keep = candidates <= limit
+        self.free_slots = candidates[keep]
+        self._phase_withheld = candidates[~keep]
+
+    def set_phase_limit(self, limit: Optional[int]) -> bool:
+        """Hand out only slots ``1..limit`` (None or >= size: all of them).
+        False -- and nothing changed -- when a slot above ``limit`` is in use:
+        its state is live and must stay reachable."""
+        if limit is None or int(limit) >= int(self.size):
+            withheld = getattr(self, "_phase_withheld", None)
+            if withheld is not None and withheld.numel():
+                self.free_slots = torch.cat((self.free_slots, withheld))
+            self._phase_withheld = None
+            self._phase_limit = None
+            return True
+        limit = max(1, int(limit))
+        self._drain_double_free_checks(wait=True)
+        if bool(self.slot_used[limit + 1:].any()):
+            return False
+        self._phase_limit = limit
+        self._split_phase_withheld(self.free_slots)
+        return True
+
+    @property
+    def phase_limit(self) -> Optional[int]:
+        return getattr(self, "_phase_limit", None)
 
     def _defer_double_free_check(self, safe: torch.Tensor, in_ledger: torch.Tensor) -> None:
         """#1467: the #924 double-free question, asked WITHOUT waiting.
@@ -510,3 +556,8 @@ class MambaSlotAllocator:
         self.slot_used = torch.zeros(
             self.size + 1, dtype=torch.bool, device=self.device
         )
+        # H95c: a flush inside a D phase keeps the phase's slot limit -- the
+        # slots above it still have no pages.
+        if getattr(self, "_phase_limit", None) is not None:
+            self._phase_withheld = None
+            self._split_phase_withheld(self.free_slots)

@@ -9135,10 +9135,17 @@ class SchedulerWeightUpdaterManager:
             return replay
         # H95: the P->D wake's kv_cache resume carries handoff_n/parked_n
         # (front rule 2); D's phase seat count follows from it on every rank.
+        _phase_seats = None
         if getattr(recv_req, "handoff_n", None) is not None:
             _note_seats = getattr(getattr(self, "scheduler", None), "weg2_d_note_wake_seats", None)
             if callable(_note_seats):
-                _note_seats(recv_req)
+                _phase_seats = _note_seats(recv_req)
+        # H95c: BEFORE any tag of this request resumes -- the posts of the
+        # phase's seats become pages (the first request of a wake without a
+        # count: the cap form). A no-op unless SGLANG_OPT_WEG2_D_SEAT_VRAM on D.
+        _seat_vram = getattr(getattr(self, "scheduler", None), "weg2_d_seat_vram_wake", None)
+        if callable(_seat_vram):
+            _seat_vram(recv_req, _phase_seats)
         # C16/C17: this rank's own per-tag report of THIS leg, filled by the
         # weights block below and reduced over the group at the fence.
         weg2_per_tag: Dict[str, List[float]] = {}
