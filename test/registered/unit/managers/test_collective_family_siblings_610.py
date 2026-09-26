@@ -35,6 +35,7 @@ so a rank that skips a collective its peer enters shows up as a broken barrier
 rather than as a silent pass.
 """
 
+import contextlib
 import inspect
 import threading
 import time
@@ -115,6 +116,27 @@ class ThreadCollective:
 
     def abort(self):
         self._barrier.abort()
+
+
+@contextlib.contextmanager
+def _process_patches(collective, *extra):
+    """The collective and env stand-ins, patched ONCE around all rank threads.
+
+    They are process-global, and they used to be entered inside each rank's
+    thread: two threads racing ``mock.patch`` enter/exit on the same attribute
+    restore each other's stand-in, so ``torch.distributed.all_reduce`` (and
+    ``get_world_size``, ``uneven_dcp_active``) stayed bound to this file's
+    aborted ThreadCollective after the test -- measured: the next file's
+    all_reduce was ``ThreadCollective.all_reduce``, and h63c's group vote read
+    [0, 2]. Entered on the main thread, they are restored exactly once."""
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(unittest.mock.patch.object(
+            torch.distributed, "all_reduce", collective.all_reduce))
+        stack.enter_context(unittest.mock.patch.object(
+            torch.distributed, "get_world_size", collective.get_world_size))
+        for p in extra:
+            stack.enter_context(p)
+        yield
 
 
 def run_ranks(fn, nranks: int = _NRANKS):
@@ -224,22 +246,17 @@ class WallClockAbortGateTest(unittest.TestCase):
             entry = now - timeout_s - 0.5 if rank == 0 else now - timeout_s + 0.5
             queue = [make_req("rid-0", entry)]
             harness = TimeoutHarness(collective, queue)
-            with (
-                unittest.mock.patch.object(
-                    torch.distributed, "all_reduce", collective.all_reduce
-                ),
-                unittest.mock.patch.object(
-                    torch.distributed, "get_world_size", collective.get_world_size
-                ),
-                unittest.mock.patch(
-                    "sglang.srt.managers.scheduler.envs.SGLANG_REQ_WAITING_TIMEOUT.get",
-                    lambda: timeout_s,
-                ),
-            ):
-                harness._abort_on_waiting_timeout()
+            harness._abort_on_waiting_timeout()
             return harness
 
-        results, errors = run_ranks(body)
+        with _process_patches(
+            collective,
+            unittest.mock.patch(
+                "sglang.srt.managers.scheduler.envs.SGLANG_REQ_WAITING_TIMEOUT.get",
+                lambda: timeout_s,
+            ),
+        ):
+            results, errors = run_ranks(body)
         collective.abort()
         return results, errors
 
@@ -274,22 +291,17 @@ class WallClockAbortGateTest(unittest.TestCase):
             req = make_req("rid-0", 0.0, forward_time=fwd)
             batch = SimpleNamespace(reqs=[req], is_empty=lambda: False)
             harness = TimeoutHarness(collective, [])
-            with (
-                unittest.mock.patch.object(
-                    torch.distributed, "all_reduce", collective.all_reduce
-                ),
-                unittest.mock.patch.object(
-                    torch.distributed, "get_world_size", collective.get_world_size
-                ),
-                unittest.mock.patch(
-                    "sglang.srt.managers.scheduler.envs.SGLANG_REQ_RUNNING_TIMEOUT.get",
-                    lambda: timeout_s,
-                ),
-            ):
-                harness._abort_on_running_timeout(batch)
+            harness._abort_on_running_timeout(batch)
             return req.to_finish is not None
 
-        results, errors = run_ranks(body)
+        with _process_patches(
+            collective,
+            unittest.mock.patch(
+                "sglang.srt.managers.scheduler.envs.SGLANG_REQ_RUNNING_TIMEOUT.get",
+                lambda: timeout_s,
+            ),
+        ):
+            results, errors = run_ranks(body)
         collective.abort()
         self.assertEqual(errors, [], f"a rank broke a collective: {errors}")
         self.assertEqual(
@@ -747,22 +759,17 @@ class PrefillAdmissionBudgetTest(unittest.TestCase):
             harness = BudgetHarness(
                 collective, self.AVAIL[rank], self.EVICT[rank], tp_rank=rank
             )
-            with (
-                unittest.mock.patch.object(
-                    torch.distributed, "all_reduce", collective.all_reduce
-                ),
-                unittest.mock.patch.object(
-                    torch.distributed, "get_world_size", collective.get_world_size
-                ),
-                unittest.mock.patch(
-                    "sglang.srt.distributed.utils.uneven_dcp_active", lambda *a: True
-                ),
-            ):
-                harness._update_uniform_pool_budget()
+            harness._update_uniform_pool_budget()
             local = self.AVAIL[rank] + self.EVICT[rank]
             return local - harness.uniform_budget_deficit()
 
-        results, errors = run_ranks(body)
+        with _process_patches(
+            collective,
+            unittest.mock.patch(
+                "sglang.srt.distributed.utils.uneven_dcp_active", lambda *a: True
+            ),
+        ):
+            results, errors = run_ranks(body)
         collective.abort()
         return results, errors
 
