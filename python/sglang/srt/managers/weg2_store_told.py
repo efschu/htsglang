@@ -274,7 +274,52 @@ def _local_prefix(req) -> int:
         return 0
 
 
-def _anchored_pages_full_span(cc, ids, page_size: int):
+#: #1416d switch (default OFF = the pre-#1416d probe, byte-identical): the
+#: told anchor clamp hashes the span the way the FETCH hashes it.
+ENV_TREE_KEY = "SGLANG_WEG2_TOLD_PROBE_TREE_KEY"
+
+
+def _tree_key_probe_armed() -> bool:
+    return os.environ.get(ENV_TREE_KEY, "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _probe_key(scheduler, req, ids, told: int):
+    """#1416d (27B agent boots 0925/0926, every P leg cached_tokens=0): the
+    probe below hashed ``origin_input_ids[:told]`` as plain UNIGRAM ids, while
+    the store read it clamps (``prefetch_from_storage``) keys the span as the
+    tree does -- ``RadixKey(..., is_bigram=tree.is_eagle)``, bigram on every
+    EAGLE/DFLASH/NEXTN group and on P under SGLANG_HICACHE_BIGRAM_KEYS=1
+    (#1233: page 0 bigram -> c90c5e64dea9, unigram -> f9ec16cdf22e). The
+    probe therefore asked the arena about keys nobody writes
+    (``#1439 ARENA-PRESENT ... leading_complete=0 first_stem=f9ec16cd``
+    right after the fetch's ``leading_complete=22934 first_stem=c90c5e64``),
+    answered 0 and clamped every told to 0 since #1416 (xsn171 on): P
+    re-prefilled prefixes it had just read back. Ask with the fetch's key:
+    ``told`` counts KEYS, so a bigram span needs ``told + 1`` raw tokens
+    (the same +1 as ``follower_limit_tokens``); P's handed-over page keys
+    (#1442), when registered for this rid, replace the covered prefix
+    exactly as ``_storage_hit_query`` does."""
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+
+    tree = getattr(scheduler, "tree_cache", None)
+    bigram = bool(getattr(tree, "is_eagle", False))
+    raw = list(ids[: int(told) + (1 if bigram else 0)])
+    key = RadixKey(raw, extra_key=getattr(req, "extra_key", None), is_bigram=bigram)
+    return key, bigram
+
+
+def _handoff_keys(rid: str):
+    try:
+        from sglang.srt.managers.cache_controller import WEG2_HANDOFF_PAGE_KEYS
+
+        return WEG2_HANDOFF_PAGE_KEYS.get(rid)
+    except Exception:  # noqa: BLE001 - no registry = own hashes only
+        return None
+
+
+def _anchored_pages_full_span(cc, ids, page_size: int, handoff_keys=None):
     """#1416c (boot xsn174): ``store_presence_pages`` asks the store about
     the FIRST ``STORAGE_BATCH_SIZE`` (128) pages only -- a 98,550-token span
     whose anchor sits on its last page answered 0, so told was clamped to 0
@@ -285,9 +330,16 @@ def _anchored_pages_full_span(cc, ids, page_size: int):
     question could not be asked.
     """
     try:
-        hashes = cc.get_hash_str(list(ids), None, page_size=page_size)
+        # a RadixKey (#1416d) goes in as is -- the hash reads its bigram flag;
+        # a plain id list keeps the pre-#1416d call.
+        hashes = cc.get_hash_str(
+            ids if not isinstance(ids, list) else list(ids), None, page_size=page_size
+        )
         if not hashes:
             return 0
+        if handoff_keys:
+            _k = min(len(handoff_keys), len(hashes))
+            hashes = list(handoff_keys[:_k]) + list(hashes[_k:])
         transfers = cc._presence_pool_transfers()
         backend = cc.storage_backend
         from sglang.srt.mem_cache.hicache_storage import HiCacheStorageExtraInfo
@@ -321,7 +373,24 @@ def _anchor_clamp(scheduler, req, told: int) -> int:
         if cc is None or not callable(getattr(cc, "get_hash_str", None)) or not ids:
             return int(told)
         page_size = int(getattr(cc, "page_size", 1) or 1)
-        pages = _anchored_pages_full_span(cc, list(ids[: int(told)]), page_size)
+        if _tree_key_probe_armed():
+            key, bigram = _probe_key(scheduler, req, ids, told)
+            pages = _anchored_pages_full_span(
+                cc, key, page_size, handoff_keys=_handoff_keys(_rid(req))
+            )
+            n = getattr(scheduler, "_1416d_probe_n", 0) + 1
+            try:
+                scheduler._1416d_probe_n = n
+            except Exception:  # noqa: BLE001 - a frozen double keeps no count
+                pass
+            if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+                logger.info(
+                    "#1416d TOLD-PROBE rid=%s told=%d keys=%d bigram=%s pages=%s "
+                    "(n=%d): the clamp asks the store with the fetch's key form",
+                    rid8(req), int(told), len(key), bigram, pages, n,
+                )
+        else:
+            pages = _anchored_pages_full_span(cc, list(ids[: int(told)]), page_size)
         if pages is None:
             # the full-span question could not be asked: no clamp (the
             # pre-#1416 number; #1419 caps every rank's match to told, so a
