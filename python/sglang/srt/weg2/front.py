@@ -2096,11 +2096,44 @@ class Pending:
     posted_evt: Optional[asyncio.Event] = None
     #: C12: how often D refused this rid with W31.  A second one is W35.
     x_requeues: int = 0
+    #: H102: the client closed its connection before its answer; nothing is
+    #: dispatched for it any more (no leg 1, no hand-off to D).
+    client_gone: bool = False
     #: MF-3: the tokens of this prompt whose prefix the front's OWN ROUTING
     #: PROBE already priced as store-resident, captured at arrival because
     #: the probe's source (:class:`SpanLRU`) is mutated by this very request
     #: once leg 1 answers.  See :meth:`Front._note_p_prefix_reuse`.
     store_span_est: int = 0
+
+
+#: H102 (#23p, dkrnfbar1agent0925): A CLIENT THAT HANGS UP BEFORE ITS ANSWER
+#: NEVER REACHED P. Leg 1 runs in the controller task, the handler only awaits
+#: the request's future, and aiohttp 3.14 does not cancel a handler on a
+#: hang-up (``handler_cancellation`` is off under ``web.run_app``; its
+#: ``connection_lost`` only sets an exception on the already-read body). So P
+#: prefilled for a dead client to the end -- up to 262k tokens -- and only
+#: leg 2 fell on ``ClientConnectionResetError``. aiohttp offers no disconnect
+#: event for a handler that is not reading, but the request's transport is
+#: ``None`` (``BaseProtocol.connection_lost``) or closing from that moment
+#: on; the per-request watcher reads it every tick.
+CLIENT_GONE_TICK_S = 0.2
+
+
+class Weg2ClientGone(Exception):
+    """H102: the client closed its connection before its answer was sent."""
+
+
+def client_gone(request: "web.BaseRequest") -> bool:
+    """H102: True once the client's connection is lost or closing."""
+    tr = request.transport
+    return tr is None or tr.is_closing()
+
+
+def response_complete(request: "web.BaseRequest") -> bool:
+    """H102: True once the whole answer was written (``write_eof``). A
+    hang-up after that is not a client-gone case -- H61/H61b own the
+    hang-ups inside leg 2 and after the end."""
+    return bool(getattr(request.writer, "_eof", False))
 
 
 class Seat:
@@ -3658,6 +3691,119 @@ class Front:
             logger.warning("WEG2 P-INTAKE-STALL rid=%s /abort_request on P raised: %s",
                            p.rid, exc)
 
+    # ---------------- H102: the client hung up before its answer ----------------
+    def _arm_client_watch(self, request: web.Request, rid: str,
+                          p: Optional[Pending] = None) -> None:
+        """H102: one watcher task per request, armed where the request enters
+        the queue or goes to D. It ends by itself when the answer was written
+        or once it has acted on a hang-up."""
+        if not envs.SGLANG_WEG2_ENABLE_CLIENT_GONE_ABORT.get():
+            return
+        tasks = self.__dict__.setdefault("_client_watch_tasks", set())
+        task = asyncio.ensure_future(self._client_watch(request, rid, p))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def _queued_pending(self, rid: str) -> Optional[Pending]:
+        for q in self.queue:
+            if q.rid == rid:
+                return q
+        return None
+
+    async def _client_watch(self, request: web.Request, rid: str,
+                            p: Optional[Pending]) -> None:
+        try:
+            while True:
+                await asyncio.sleep(CLIENT_GONE_TICK_S)
+                if response_complete(request):
+                    return
+                if p is None:
+                    # A W31 re-queue gives a SHORT its Pending only later; it
+                    # always passes through the queue, where it is found.
+                    p = self._queued_pending(rid)
+                if client_gone(request):
+                    await self._on_client_gone(rid, p)
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 -- a watcher never takes the front down
+            logger.warning("WEG2-CLIENT-GONE rid=%s watcher failed: %r", rid, e)
+
+    def _client_state(self, rid: str, p: Optional[Pending]) -> str:
+        """H102: where a request lives, in the order it moves:
+        ``queued`` (front queue) -> ``p-leg1`` (popped by the drain: waiting
+        for a P slot, or its leg 1 in ``P.outstanding``) -> ``handoff``
+        (leg 1 done, ``_ready_for_d``) -> ``d`` (leg 2 on D) / ``parked``
+        (H91c: D parked it on the wait bound). ``done`` = the handler has
+        already answered."""
+        parked = getattr(self, "_d_parked", None) or {}
+        if rid in parked:
+            return "parked"
+        if p is not None and any(q is p for q in self.queue):
+            return "queued"
+        if rid in self.groups["P"].outstanding:
+            return "p-leg1"
+        if p is not None and any(q is p for q in self._ready_for_d):
+            return "handoff"
+        if rid in self.groups["D"].outstanding:
+            return "d"
+        if p is not None and not p.fut.done() and not p.leg1_done:
+            return "p-leg1"
+        if p is not None and p.fut.done() and not p.fut.cancelled() and p.fut.exception() is None:
+            return "d"   # handed to D, leg 2 not entered yet
+        if p is None:
+            return "d"   # SHORT / CARRIER-EXCEEDS: armed at leg 2
+        return "done"
+
+    async def _on_client_gone(self, rid: str, p: Optional[Pending]) -> None:
+        """H102: cancel the work behind a client that left. One line per
+        request, ``WEG2-CLIENT-GONE rid=... state=... action=...``."""
+        state = self._client_state(rid, p)
+        self.counters[f"client_gone_{state}"] += 1
+        if state == "done":
+            return
+        action = "none"
+        if p is not None and state in ("queued", "p-leg1", "handoff"):
+            p.client_gone = True
+        if state == "queued":
+            self.queue.remove(p)
+            action = "dequeued"
+        elif state == "handoff":
+            self._ready_for_d.remove(p)
+            self._sync_batch_gate()
+            action = "dropped-before-d"
+        elif state == "p-leg1" and rid not in self.groups["P"].outstanding:
+            action = "leg1-skipped"
+        if (p is not None and state in ("queued", "p-leg1", "handoff")
+                and not p.fut.done()):
+            p.fut.set_exception(Weg2ClientGone(f"WEG2-CLIENT-GONE rid={rid} state={state}"))
+        if state == "p-leg1" and rid in self.groups["P"].outstanding:
+            # The intake-stall path: /abort_request on P's HTTP server (PP0);
+            # AbortReq reaches every rank through the recv broadcast (#1460
+            # CTRL-FWD, WEG2-PP-CHUNKED-ABORT). Idempotent where it is gone.
+            try:
+                code, _b = await self.rpc(self.groups["P"], "/abort_request", {"rid": rid}, 30)
+                action = f"abort-p status={code}"
+            except Exception as exc:  # noqa: BLE001
+                action = f"abort-p raised={type(exc).__name__}"
+        elif state == "parked":
+            # H91c: D holds the parked request while P runs; it is released
+            # on D the same way (D's /abort_request, TP broadcast).
+            getattr(self, "_d_parked", {}).pop(rid, None)
+            try:
+                code, _b = await self.rpc(self.groups["D"], "/abort_request", {"rid": rid}, 30)
+                action = f"abort-d-park status={code}"
+            except Exception as exc:  # noqa: BLE001
+                action = f"abort-d-park raised={type(exc).__name__}"
+        elif state == "d":
+            # Unchanged: leg 2's next write to the client fails and closes
+            # D's connection, which aborts D; a hang-up after D's end is
+            # booked as served (H61/H61b).
+            action = "none(leg2-path)"
+        logger.warning("WEG2-CLIENT-GONE rid=%s state=%s action=%s wait_s=%.1f (H102)",
+                       rid, state, action,
+                       max(0.0, time.time() - p.t_arrive) if p is not None else 0.0)
+
     async def handle_abort(self, request: web.Request) -> web.Response:
         payload = await request.json()
         rid = payload.get("rid")
@@ -3877,6 +4023,7 @@ class Front:
                 seat = await self._acquire_short_seat(rid, carrier_est)
                 if seat is not None:
                     self._log_admit(rid, source="short", t_arrive=time.time())
+                    self._arm_client_watch(request, rid)  # H102
                     return await self.leg2(request, rid, payload, text, stream, pending=None,
                                            single_prefill=True, seat=seat)
             fut = asyncio.get_event_loop().create_future()
@@ -3884,6 +4031,7 @@ class Front:
                         est_uncached=remainder, span_known=known,
                         skip_leg1=True, store_span_est=store_span)
             self.queue.append(p)
+            self._arm_client_watch(request, rid, p)  # H102
             self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
             try:
                 await fut
@@ -3910,6 +4058,7 @@ class Front:
                             "presence_span=%d presence_src=%s",
                             rid, est_prompt, remainder, store_span, presence_src)
                 self._log_admit(rid, source="short", t_arrive=time.time())
+                self._arm_client_watch(request, rid)  # H102
                 return await self.leg2(request, rid, payload, text, stream, pending=None, seat=seat)
         # #1290: NAME THE P ROUTE. `route == "long"` is X < uncached <=
         # carrier -- the case P exists for -- and it was counted only as
@@ -3943,6 +4092,7 @@ class Front:
                         est_uncached=remainder, span_known=known,
                     store_span_est=store_span)
         self.queue.append(p)
+        self._arm_client_watch(request, rid, p)  # H102
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         logger.info("WEG2-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d)",
                     rid, self.awake, self.admit_d, est_prompt, remainder, len(self.queue))
@@ -4665,6 +4815,8 @@ class Front:
                         await pending.fut
                     except Weg2Stop as e:
                         return web.json_response({"error": str(e)}, status=503)
+                    except Weg2ClientGone as e:  # H102: the client left during the re-route
+                        return web.json_response({"error": str(e)}, status=499)
                     self._mark_posted(pending)
                     return await self.leg2(request, rid, payload, text, stream, pending, seat=pending.seat)
                 if r.status == 200 and pending is not None and verdict == "W16":
@@ -6660,9 +6812,14 @@ class Front:
                         p.leg1_done = True
                         return p
                     async with sem:
+                        if p.client_gone:  # H102: its client left while it waited for a P slot
+                            return p
                         try:
                             await self.leg1(p)
                         except Exception as e:  # noqa: BLE001
+                            if p.client_gone:  # H102: aborted on P for a client that left
+                                self.counters["leg1_client_gone"] += 1
+                                return p
                             if is_intake_stall(e) and not is_too_large(e):
                                 await self._requeue_intake_stalled(p, e)
                                 return p
@@ -6693,6 +6850,8 @@ class Front:
                     nonlocal _drain_uncached, prefilled
                     if p.intake_stalled:
                         return  # weg2xsn272: back in the queue, not ready for D
+                    if p.client_gone:
+                        return  # H102: its client left; never handed to D
                     _drain_uncached += int(p.est_uncached)
                     if not p.fut.done():
                         self._ready_for_d.append(p)
