@@ -2227,6 +2227,12 @@ class Envs:
     # 4096 is the flip form; 8192 is the fn7t best form (L2 lever, 24.09.).
     # D keeps 4096 (X's floor, K5).
     SGLANG_WEG2_P_CHUNKED_PREFILL_TOKENS = EnvInt(4096)
+    # H92 (--p-chunk-policy dynamic, NF line): the forward budget of group P
+    # plans the token STREAM of every waiting request ('stream', set by the NF
+    # launcher) instead of the head request alone (unset/'request', the 27B
+    # budget). Read as a mapping by weg2/p_chunk_nf.budget_is_stream, like the
+    # shared SGLANG_P_CHUNK_POLICY/SPEC; inert without a dynamic planner.
+    SGLANG_P_CHUNK_BUDGET = EnvStr("")
     # fnFL2 H37 (Task #118, agent load = many small prefills): group P's
     # --pp-max-micro-batch-size. Unset/False = stock: the scheduler derives it
     # as max_running_requests // pp_size (scheduler.default_pp_micro_batch_size),
