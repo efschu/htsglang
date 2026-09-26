@@ -69,6 +69,11 @@ class _Sched:
     _p_chunk_policy_width = Scheduler._p_chunk_policy_width
     waiting_queue = ()
     _p_chunk_policy_errors = 0
+    # --p-layer-split dynamic (27B 714aa3b0e7, unified S7f 71bf068459): the
+    # sizer asks the joint chunk+cut plan first. Without a layer-split runtime
+    # (`p_layer_split_runtime.active()` is None here) it is never called;
+    # bound off the real class so the surface guard below descends into it.
+    _p_layer_split_width = Scheduler._p_layer_split_width
 
 
 def _chunked_req(prefix_len):

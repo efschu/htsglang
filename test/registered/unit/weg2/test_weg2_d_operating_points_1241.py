@@ -596,7 +596,18 @@ class OperatingPointVectorTest(unittest.TestCase):
         from sglang.srt.weg2 import launcher as lz
 
         src = inspect.getsource(lz)
-        self.assertEqual(src.count('"NEXTN"'), 1, "NEXTN typed more than once")
+        # d3e9625651 (DFlash2 part E, 2026-09-17) added --spec-form, whose
+        # VOCABULARY also spells "NEXTN": the form's default and the argparse
+        # choices. That is the name of a form, not a second writer of the
+        # speculative algorithm; the NEXTN form reads SPEC_ALGORITHM like
+        # every other consumer. Those two sites are removed by name (each
+        # exactly once), and the algorithm literal must then stand ONCE.
+        rest = src
+        for vocab in ('SPEC_FORM_DEFAULT = "NEXTN"', 'choices=["NEXTN", "DFLASH"]'):
+            self.assertEqual(rest.count(vocab), 1, vocab)
+            rest = rest.replace(vocab, "")
+        self.assertEqual(rest.count('"NEXTN"'), 1, "NEXTN typed more than once")
+        self.assertIn('SPEC_ALGORITHM = "NEXTN"', rest)
         self.assertEqual(
             src.count('speculative_num_draft_tokens=3'), 0,
             "a PlanInputs block still types the draft-token count",

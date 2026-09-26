@@ -236,11 +236,17 @@ class TheReadersAreEnumeratedAndStayThatWay(CustomTestCase):
 
         src = inspect.getsource(wu)
         count = src.count("xb.read_published_terms()")
+        # 27B e54ac95c65 (flipresume, 26.09., unified S7f 71bf068459) added
+        # the THIRD reader, and it is a reader of the SAME publication, not a
+        # reconstruction: the c-lane prewarm (SGLANG_WEG2_LANE_PREWARM=c)
+        # sizes its registration from the terms the launcher's ledger priced.
+        # Enumerated by the line it logs so a fourth reader still turns red.
+        self.assertIn("WEG2-LANE-PREWARM c NOT-PRICED", src)
         self.assertEqual(
-            count, 2,
-            "weight_updater.py must have EXACTLY two "
-            "xb.read_published_terms() call sites (verified at #1397 "
-            "wiring time: lines 1078 and 1213) -- a THIRD reader, or one "
+            count, 3,
+            "weight_updater.py must have EXACTLY three "
+            "xb.read_published_terms() call sites (two at #1397 wiring "
+            "time, the c-lane prewarm since e54ac95c65) -- a FOURTH reader, or one "
             "replaced by a local bounce_terms(...) reconstruction, could "
             "silently miss band_credit/n_cross_lanes the way a #1369-class "
             "defect misses a decision one layer down")
