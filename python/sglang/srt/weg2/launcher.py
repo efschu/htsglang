@@ -18155,11 +18155,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ns = build_parser().parse_args(argv)
     # H91b/H95: the Next-Flash form's own D seat bound (6, dynamic 1..6 per
     # phase) and its pool waves, before anything reads --d-bs or --env-d.
-    _sf_on, _sf_src = standard_form_resolved(ns)
-    if _sf_on or _sf_src.startswith("env "):
-        print("WEG2-STANDARD-FORM (NF H91, profile field standard_form): %s (%s) -- D seats per "
-              "phase, park, front phase policy%s" % ("on" if _sf_on else "off", _sf_src,
-              "" if _sf_on else " all OFF (pre-H91 form)"), flush=True)
     apply_profile_d_bs_default(ns, list(sys.argv[1:] if argv is None else argv))
     _h95_waves_line = apply_profile_d_pool_waves_default(ns)
     if _h95_waves_line:
@@ -18167,6 +18162,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _h95c_line = apply_profile_d_seat_vram_default(ns)
     if _h95c_line:
         print(_h95c_line, flush=True)
+    _sf_on, _sf_src = standard_form_resolved(ns)
+    if _sf_on or _sf_src.startswith("env "):
+        print("WEG2-STANDARD-FORM (NF H91, profile field standard_form): %s (%s) -- D seats per "
+              "phase, park, front phase policy%s" % ("on" if _sf_on else "off", _sf_src,
+              "" if _sf_on else " all OFF (pre-H91 form)"), flush=True)
     # WEG2-FORM: resolved ONCE, before apply_spec_form (--form-draft and
     # --form-p-draft may drive --spec-form / --draft-kv-on-p /
     # --dflash-produce-on-p), and PUBLISHED into this process's own environment
