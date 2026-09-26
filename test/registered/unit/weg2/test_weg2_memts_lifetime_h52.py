@@ -57,6 +57,10 @@ class _TmpArb(CustomTestCase):
         p = mock.patch.object(L, "GPU_ARB", self.tmp)
         p.start()
         self.addCleanup(p.stop)
+        # #135: start_memts() also writes the helper registry under EVIDENCE_DIR
+        e = mock.patch.object(L, "EVIDENCE_DIR", self.tmp)
+        e.start()
+        self.addCleanup(e.stop)
 
 
 class TestPatterns(_TmpArb):
