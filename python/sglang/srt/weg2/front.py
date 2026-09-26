@@ -3303,19 +3303,25 @@ class Front:
         self.p_leg1_stall_s = max(0.0, float(p_leg1_stall_s or 0.0))
         #: when a leg 1 last completed -- P's work evidence for that bound.
         self._p_leg1_done_t = 0.0
-        logger.info(
-            "WEG2-PHASE-POLICY p_phase_max_requests=%d p_pool_tokens=%d d_wait_bound_s=%.1f "
-            "p_leg1_stall_s=%.0f d_phase_preemption=%s (H91 part C: P prefills at most "
-            "p_phase_max_requests per phase, overlapping as far as their est_prompt fits "
-            "p_pool_tokens; a leg 1 with no P progress for p_leg1_stall_s is requeued as an "
-            "intake stall; D decodes every request it was handed before the flip back; a request "
-            "waiting for P longer than d_wait_bound_s during the D phase parks D's running "
-            "decodes via %s and flips; 0 = that rule off)",
-            self.p_phase_max_requests, self.p_pool_tokens, self.d_wait_bound_s,
-            self.p_leg1_stall_s,
-            ("wait-bound (replaces --fairness-w-s in the D phase)" if self.d_wait_bound_s > 0
-             else f"--fairness-w-s {self.w_s:g}"),
-            phase_policy.PARK_PATH)
+        #: UNIFY (operator 26.09.): the NF H91 standard form on this front --
+        #: rule 2's hand-over term and handoff_n/parked_n on D's wake. qwen27b
+        #: off: the 27B front byte-identical (profile field standard_form).
+        self.standard_form = bool(envs.SGLANG_WEG2_STANDARD_FORM.get())
+        if (self.standard_form or self.p_phase_max_requests or self.p_pool_tokens
+                or self.d_wait_bound_s or self.p_leg1_stall_s):
+            logger.info(
+                "WEG2-PHASE-POLICY p_phase_max_requests=%d p_pool_tokens=%d d_wait_bound_s=%.1f "
+                "p_leg1_stall_s=%.0f d_phase_preemption=%s (H91 part C: P prefills at most "
+                "p_phase_max_requests per phase, overlapping as far as their est_prompt fits "
+                "p_pool_tokens; a leg 1 with no P progress for p_leg1_stall_s is requeued as an "
+                "intake stall; D decodes every request it was handed before the flip back; a request "
+                "waiting for P longer than d_wait_bound_s during the D phase parks D's running "
+                "decodes via %s and flips; 0 = that rule off)",
+                self.p_phase_max_requests, self.p_pool_tokens, self.d_wait_bound_s,
+                self.p_leg1_stall_s,
+                ("wait-bound (replaces --fairness-w-s in the D phase)" if self.d_wait_bound_s > 0
+                 else f"--fairness-w-s {self.w_s:g}"),
+                phase_policy.PARK_PATH)
 
     # ---------------- H91 part C: parked requests and the wait bound ----------------
     def _flip_ledger(self, g: Group) -> List[str]:
@@ -6687,7 +6693,9 @@ class Front:
         # H91 part C rule 2: the wake message to D carries the hand-off count
         # (`handoff_n`, plus `parked_n`) on its kv_cache resume -- every one of
         # the three sites below. Unbound call: partial test fronts work too.
-        _wake_extra = Front._wake_handoff_fields(self, dst)
+        # UNIFY: only the standard form carries the seat counts (qwen27b: {}).
+        _wake_extra = (Front._wake_handoff_fields(self, dst)
+                       if getattr(self, "standard_form", True) else {})
         if _wake_extra:
             logger.info("WEG2 HANDOFF-N epoch=%d wake=%s handoff_n=%d parked_n=%d (the requests the "
                         "P phase that just ended handed over, and the wait-bound-parked ones D "
@@ -8064,7 +8072,8 @@ class Front:
                     # decode ending between two admitter polls read as "D is
                     # done" and flipped the rest of the P phase's batch away.
                     d_work_exhausted = (not self._flip_ledger(D) and not handing_off
-                                        and not self._ready_for_d)
+                                        and not (getattr(self, "standard_form", True)
+                                                 and self._ready_for_d))
                     if (d_work_exhausted or not self.admit_d) and not handing_off:
                         if _x_rg == "wait" and self.admit_d and not fairness_fired:
                             # UNIFY S7 (27B RC7-X (a)): D takes this backlog itself
@@ -8550,21 +8559,23 @@ def main():
                          "Seconds the oldest waiter may wait before the front stops admitting new "
                          "work to D and flips. 0 DISABLES it. Every fire names this switch, the "
                          "oldest wait and the queue it pre-empted.")
-    ap.add_argument("--p-phase-max-requests", type=int,
-                    default=phase_policy.P_PHASE_MAX_REQUESTS_DEFAULT,
+    # UNIFY (operator 26.09.): the four H91 part C defaults follow the
+    # profile's standard form (SGLANG_WEG2_STANDARD_FORM): None here, resolved
+    # after the parse -- nextflash the H91 values, qwen27b 0 (rule off).
+    ap.add_argument("--p-phase-max-requests", type=int, default=None,
                     help="H91 part C rule 1 (user 25.09.): at most this many requests per P phase; "
                          "the phase ends when they are dispatched or the queue is empty, and the "
                          "flip to D follows. 0 = law 1 unchanged (drain to empty).")
-    ap.add_argument("--p-pool-tokens", type=int, default=phase_policy.P_POOL_TOKENS_DEFAULT,
+    ap.add_argument("--p-pool-tokens", type=int, default=None,
                     help="H91 part C rule 1: P's unified KV pool in tokens (NF 262k). The next leg 1 "
                          "is dispatched only while the in-flight requests' est_prompt plus its own "
                          "fit it (one always goes). 0 = no token plan, --p-concurrency alone.")
-    ap.add_argument("--d-wait-bound-s", type=float, default=phase_policy.D_WAIT_BOUND_S_DEFAULT,
+    ap.add_argument("--d-wait-bound-s", type=float, default=None,
                     help="H91 part C rule 3 (user: 'wartegrenze 60 s, dann zurueck zu P'): a request "
                          "waiting for P longer than this during the D phase (from max(arrival, D phase "
                          "start)) parks D's running decodes via POST /weg2/park_running and flips to P. "
                          "Replaces --fairness-w-s in the D phase while > 0; 0 = off (fairness as before).")
-    ap.add_argument("--p-leg1-stall-s", type=float, default=phase_policy.P_LEG1_STALL_S_DEFAULT,
+    ap.add_argument("--p-leg1-stall-s", type=float, default=None,
                     help="H91 part C: a leg 1 older than this while P showed no work for as long (no "
                          "leg 1 completed, P's progress counters unchanged) is aborted on P and "
                          "requeued at the head as WEG2-INTAKE-STALL; the flip to D follows. Part A "
@@ -8696,6 +8707,7 @@ def main():
                     help="#1233 fix 8: JSON {s_gb, m_mib, store_gib} -- the arm the ledger chose, needed to "
                          "derive the RUN-MOMENT residual from the front's own cgroup reading")
     args = ap.parse_args()
+    phase_policy.resolve_front_defaults(args, bool(envs.SGLANG_WEG2_STANDARD_FORM.get()))
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
     dc = {}
     for kv in filter(None, args.dc_reserve.split(",")):

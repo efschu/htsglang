@@ -249,16 +249,29 @@ def test_pure_phase_policy_terms():
 
 
 def test_main_flags_default_to_the_user_design():
+    """Unified tree (operator 26.09.): the flags parse to None and
+    phase_policy.resolve_front_defaults gives the user design under the NF
+    standard form (profile nextflash), 0 under qwen27b -- pinned in
+    test_unify_standard_form_profile.py."""
     import inspect
+    import types
+
+    from sglang.srt.weg2 import phase_policy
+
     src = inspect.getsource(front_mod.main)
-    for flag, const in (("--p-phase-max-requests", "P_PHASE_MAX_REQUESTS_DEFAULT"),
-                        ("--p-pool-tokens", "P_POOL_TOKENS_DEFAULT"),
-                        ("--d-wait-bound-s", "D_WAIT_BOUND_S_DEFAULT"),
-                        ("--p-leg1-stall-s", "P_LEG1_STALL_S_DEFAULT")):
+    for flag in ("--p-phase-max-requests", "--p-pool-tokens", "--d-wait-bound-s",
+                 "--p-leg1-stall-s"):
         i = src.index(f'"{flag}"')
-        assert f"phase_policy.{const}" in src[i:i + 200], flag
+        assert "default=None" in src[i:i + 80], flag
+    assert "phase_policy.resolve_front_defaults(args, bool(envs.SGLANG_WEG2_STANDARD_FORM.get()))" in src
     assert "d_wait_bound_s=args.d_wait_bound_s" in src
     assert "p_phase_max_requests=args.p_phase_max_requests" in src
+    ns = types.SimpleNamespace(p_phase_max_requests=None, p_pool_tokens=None,
+                               d_wait_bound_s=None, p_leg1_stall_s=None)
+    phase_policy.resolve_front_defaults(ns, True)
+    assert (ns.p_phase_max_requests, ns.p_pool_tokens, ns.d_wait_bound_s, ns.p_leg1_stall_s) == (
+        phase_policy.P_PHASE_MAX_REQUESTS_DEFAULT, phase_policy.P_POOL_TOKENS_DEFAULT,
+        phase_policy.D_WAIT_BOUND_S_DEFAULT, phase_policy.P_LEG1_STALL_S_DEFAULT)
 
 
 # ------------------------------------------------------ rule 1: the cap

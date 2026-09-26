@@ -330,6 +330,13 @@ class ModelProfile:
     #: line ran it unswitched since RC9 (S7c); NF off until the NF seat
     #: releases it with a boot tag.
     agent_span: bool
+    #: NF H91 STANDARD FORM (user design 25.09.; NF H91b/c/c2/d, H95 B/c):
+    #: the front's phase policy (P phase cap 6 + overlap plan against P's pool,
+    #: D decodes all it was handed, 60 s wait bound parks D and flips, leg-1
+    #: stall bound), the D park (SGLANG_WEG2_D_PARK + its draft KV) and the D
+    #: seats per phase from the wake's handoff_n. Operator 26.09.: nextflash
+    #: on, qwen27b off (the 27B stays byte-identical).
+    standard_form: bool
     vision: str
     context_tokens: int
     records: RecordKey
@@ -355,6 +362,12 @@ class ModelProfile:
         out["SGLANG_WEG2_BIGRAM_ANCHOR_EXACT"] = bool(self.bigram_anchor_exact)
         out["SGLANG_WEG2_ENABLE_WARM_MIN_DWELL"] = bool(self.warm_min_dwell)
         out["SGLANG_WEG2_ENABLE_AGENT_SPAN"] = bool(self.agent_span)
+        out["SGLANG_WEG2_STANDARD_FORM"] = bool(self.standard_form)
+        out["SGLANG_WEG2_D_PARK"] = bool(self.standard_form)
+        out["SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV"] = bool(self.standard_form)
+        # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
+        # installed Form A role plan at run time).
+        out["SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW"] = self.d_layout == "qsa_forma"
         return out
 
     def constant(self, name: str) -> object:
@@ -459,6 +472,7 @@ PROFILES: Dict[str, ModelProfile] = {
         bigram_anchor_exact=False,
         warm_min_dwell=False,
         agent_span=True,
+        standard_form=False,
         vision="transient",
         context_tokens=262144,
         # OPERATOR 26.09. (UN4): the 27B-RC9 records count on this tree as a
@@ -522,6 +536,7 @@ PROFILES: Dict[str, ModelProfile] = {
         warm_min_dwell=True,
         # NF P49: off until the NF seat releases #49 with a boot tag
         agent_span=False,
+        standard_form=True,
         vision="off",
         context_tokens=262144,
         records=RecordKey(fields=("checkpoint", "form", "power_limit")),
@@ -557,7 +572,10 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE is read in environ.py), the four NF
 #: tail switches (``end_anchor``), SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS
 #: (``mamba_anchor``), SGLANG_WEG2_DRAFT_SHARE_EMBED (``draft.share_embed``),
-#: SGLANG_WEG2_ENABLE_AGENT_SPAN (``agent_span``, #49; operator 26.09.).
+#: SGLANG_WEG2_ENABLE_AGENT_SPAN (``agent_span``, #49; operator 26.09.),
+#: SGLANG_WEG2_STANDARD_FORM / SGLANG_WEG2_D_PARK /
+#: SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV (``standard_form``, NF H91),
+#: SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW (``d_layout`` qsa_forma, NF R12).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }

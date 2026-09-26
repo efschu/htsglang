@@ -211,3 +211,16 @@ def park_verdict(status: int, text: str) -> Tuple[str, List[str], str]:
     if not isinstance(held, list) or not all(isinstance(r, str) for r in held):
         return PARK_FAILED, [], f"http 200 with a malformed held list: {str(text)[:200]}"
     return PARK_PARKED, list(rids) + [r for r in held if r not in rids], ""
+
+
+def resolve_front_defaults(args, standard_form: bool) -> None:
+    """UNIFY (operator 26.09.): the four part-C flags a launcher did not write
+    (``None``) take the H91 defaults under the NF standard form
+    (SGLANG_WEG2_STANDARD_FORM, profile field ``standard_form``) and 0 -- the
+    rule off, the pre-H91 front -- otherwise (qwen27b). A written value wins."""
+    for name, default in (("p_phase_max_requests", P_PHASE_MAX_REQUESTS_DEFAULT),
+                          ("p_pool_tokens", P_POOL_TOKENS_DEFAULT),
+                          ("d_wait_bound_s", D_WAIT_BOUND_S_DEFAULT),
+                          ("p_leg1_stall_s", P_LEG1_STALL_S_DEFAULT)):
+        if getattr(args, name, None) is None:
+            setattr(args, name, default if standard_form else type(default)(0))

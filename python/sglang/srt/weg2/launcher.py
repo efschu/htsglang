@@ -18068,6 +18068,14 @@ def bs_source(flag: str, argv: Optional[Sequence[str]] = None) -> str:
     return "flag" if any(w == flag or w.startswith(flag + "=") for w in words) else "default"
 
 
+def profile_standard_form(ns) -> bool:
+    """UNIFY (operator 26.09.): the registry row's ``standard_form`` (NF H91:
+    D seats 1..6 per phase, pool waves, seat posts; nextflash on, qwen27b
+    off) for ``ns.profile``; an unknown profile is off."""
+    row = weg2_form.profile_row(getattr(ns, "profile", None))
+    return bool(row is not None and row.standard_form)
+
+
 def apply_profile_d_bs_default(ns, argv: Sequence[str]) -> int:
     """H91b/H95 (Nutzer-Design 25.09.): ``--profile nextflash`` without an
     explicit ``--d-bs`` runs D with up to ``DEFAULT_D_BS_NEXTFLASH`` (6) seats
@@ -18076,7 +18084,7 @@ def apply_profile_d_bs_default(ns, argv: Sequence[str]) -> int:
     case n = 2. An explicit ``--d-bs`` always wins and stays the hard bound
     (``bs_source``: a told value is a choice, even when it equals a default).
     Returns the resolved value."""
-    if (getattr(ns, "profile", None) == PROFILE_NEXTFLASH
+    if (profile_standard_form(ns)
             and bs_source("--d-bs", argv) == "default"):
         ns.d_bs = DEFAULT_D_BS_NEXTFLASH
     return int(ns.d_bs)
@@ -18091,7 +18099,7 @@ def apply_profile_d_pool_waves_default(ns) -> Optional[str]:
     value. Returns the line naming it, or None when nothing was added."""
     from sglang.srt.planner.expert_residency import POOL_OVERFLOW_WAVES_ENV
 
-    if getattr(ns, "profile", None) != PROFILE_NEXTFLASH:
+    if not profile_standard_form(ns):
         return None
     env_d = str(getattr(ns, "env_d", "") or "")
     if POOL_OVERFLOW_WAVES_ENV in parse_group_env(env_d):
@@ -18108,7 +18116,7 @@ def apply_profile_d_seat_vram_default(ns) -> Optional[str]:
     phase's occupied seats (SGLANG_OPT_WEG2_D_SEAT_VRAM=1 into ``ns.env_d``)
     unless ``--env-d`` states the switch itself (=0: H95 B's fixed posts).
     Returns the line naming it, or None when nothing was added."""
-    if getattr(ns, "profile", None) != PROFILE_NEXTFLASH or not DEFAULT_D_SEAT_VRAM_NEXTFLASH:
+    if not profile_standard_form(ns) or not DEFAULT_D_SEAT_VRAM_NEXTFLASH:
         return None
     env_d = str(getattr(ns, "env_d", "") or "")
     if "SGLANG_OPT_WEG2_D_SEAT_VRAM" in parse_group_env(env_d):

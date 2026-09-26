@@ -2036,7 +2036,10 @@ class Envs:
     # anchor pool gets 2 x SGLANG_HICACHE_ARENA_MAMBA_SLOTS rows. Only read
     # with an installed Form A role plan whose host is TP rank 0; False =
     # byte-identical to d1c7094ba6.
-    SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW = EnvBool(True)
+    # UNIFY: default per profile (qsa_forma D = nextflash on, qwen27b off); on
+    # without a form (the NF code default).
+    SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW = EnvBool(
+        _profile_default("SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW", True))
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
@@ -2869,7 +2872,18 @@ class Envs:
     # only on group D with SGLANG_WEG2_D_PARK active and the draft tier off;
     # nothing is pinned, nothing un-parked is touched. False = H91b byte for
     # byte (the resumed request drafts over whatever its new slots held).
-    SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV = EnvBool(True)
+    # UNIFY (operator 26.09.): default per profile (ModelProfile.standard_form):
+    # nextflash on, qwen27b off; on without a form (the NF code default).
+    SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV = EnvBool(
+        _profile_default("SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV", True))
+    # NF H91 STANDARD FORM on the front (weg2/front.py): the phase policy's
+    # defaults (P phase cap 6, P pool 262144, D wait bound 60 s, leg-1 stall
+    # 180 s; an explicit front flag wins), rule 2 (D is done only when nothing
+    # is handed over or ready for it) and handoff_n/parked_n on D's wake (D's
+    # seats per phase). Default per profile (ModelProfile.standard_form):
+    # nextflash on, qwen27b off (the 27B front byte-identical); on without a
+    # form (the NF code default).
+    SGLANG_WEG2_STANDARD_FORM = EnvBool(_profile_default("SGLANG_WEG2_STANDARD_FORM", True))
     # H91d: the L2 bound of those buffers per rank (MiB). A FLIP park whose
     # buffer would pass it goes to L3 (a file under
     # SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR/weg2_d_park_draft, written in the
