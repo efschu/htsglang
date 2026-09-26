@@ -757,7 +757,22 @@ def vision_verdict(image_parts: int, video_parts: int, mode: str):
     )
 
 
-def request_text(payload: dict) -> str:
+def front_span_49() -> bool:
+    """#49 switch (``SGLANG_WEG2_FRONT_SPAN_49``, default off in the unified
+    tree): tools first, D serves teach the whole prompt for their epoch, a
+    credited prefix priced in measured tokens. Off prices exactly as before
+    the port. Read per call so a test or an arm can flip it."""
+    return bool(envs.SGLANG_WEG2_FRONT_SPAN_49.get())
+
+
+def front_span_inflight() -> bool:
+    """#49 rest (``SGLANG_WEG2_FRONT_SPAN_INFLIGHT``): credit a D leg 2's text
+    from its first content event on, not from its finish. Only together with
+    :func:`front_span_49` -- the held credit it writes is #49's."""
+    return front_span_49() and bool(envs.SGLANG_WEG2_FRONT_SPAN_INFLIGHT.get())
+
+
+def request_text(payload: dict, tools_first: Optional[bool] = None) -> str:
     """The prompt as ONE string, for the span estimate and the ledger.
 
     Q0-B: covers BOTH forwarded chat shapes. OpenAI carries the system turn
@@ -768,9 +783,37 @@ def request_text(payload: dict) -> str:
     ``test/registered/unit/weg2/test_front_messages_pricing.py`` pins.
     ``tools`` is priced for both shapes -- it was priced for NEITHER before,
     and a Claude-Code agent carries 10-20k tokens of tool schemas.
+
+    #49: ``tools`` is rendered FIRST, where the model's template puts it (the
+    Qwen3.8 chat_template.jinja emits the ``<tools>`` block at the head of the
+    system turn, before the system text and every message). The span LRU
+    matches CHARACTER PREFIXES, so this order decides what a turn is credited
+    with. Rendered LAST, the tool block sat behind the messages: every agent
+    turn diverged from the previous one where its new message began, and the
+    whole block (13,302 chars on boot dkr27bbar1agent09251922, ~4.4k est
+    tokens) was priced as uncached although D held it -- est_uncached 5.4k-11k
+    > X=4096 on all 44 turns, each one over P with two flips.
+
+    MODEL-NEUTRAL: the order is not a copy of one template. The tool list is
+    the one part of an agent prompt that is identical on every turn, so it
+    belongs at the head of a text whose only use is a character-prefix match;
+    and chat templates that take ``tools`` (Qwen3.x, Qwen3-Next, Llama 3.x,
+    Mistral) emit them in the system turn or before the first message, never
+    behind the conversation. ``tools_first=None`` follows the #49 switch
+    (:func:`front_span_49`); off keeps the pre-port order (tools last).
     """
+    if tools_first is None:
+        tools_first = front_span_49()
     if "messages" in payload and isinstance(payload["messages"], list):
         parts = []
+        tools = payload.get("tools")
+        tools_part = None
+        if isinstance(tools, list) and tools:
+            # The whole schema list, serialized once. Deterministic key order
+            # so the span LRU's prefix match is stable across identical turns.
+            tools_part = "tools:" + json.dumps(tools, ensure_ascii=False, sort_keys=True) + "\n"
+        if tools_part is not None and tools_first:
+            parts.append(tools_part)
         sys_field = payload.get("system")
         if sys_field:
             parts.append(f"system:{_content_text(sys_field)}\n")
@@ -779,13 +822,8 @@ def request_text(payload: dict) -> str:
                 parts.append(f"{m}\n")
                 continue
             parts.append(f"{m.get('role', '')}:{_content_text(m.get('content', ''))}\n")
-        tools = payload.get("tools")
-        if isinstance(tools, list) and tools:
-            # The whole schema list, serialized once. Deterministic key order
-            # so the span LRU's prefix match is stable across identical turns.
-            parts.append(
-                "tools:" + json.dumps(tools, ensure_ascii=False, sort_keys=True) + "\n"
-            )
+        if tools_part is not None and not tools_first:
+            parts.append(tools_part)
         return "".join(parts)
     p = payload.get("prompt", payload.get("text", ""))
     if isinstance(p, list):
@@ -849,13 +887,45 @@ class SpanLRU:
     quantity D's own store-priced match (``_weg2_local_store_matches`` over
     ``store_presence_pages``) votes on, observed from the response instead of
     re-derived at the front.
+
+    #49 -- WHAT A D SERVE ADDS, AND FOR HOW LONG. A leg 2 that D answered 200
+    for leaves D's radix holding the WHOLE prompt it just computed, not only
+    the ``cached_tokens`` it found on arrival. Recording only the latter made
+    a D-direct turn teach the front nothing: the next agent turn was credited
+    with the turn BEFORE it (boot dkr27bbar1agent09251922). The whole-prompt
+    fact is ``prompt_tokens`` of the same response, and it is a DIFFERENT fact
+    from the #1324 one -- D computed those tokens itself and holds them on its
+    device, no write-through is claimed -- so it is kept apart and it EXPIRES:
+    it counts only in the epoch D served in (``held_epoch``), and the router
+    asks with an epoch only while D is awake and serving. A flip changes the
+    epoch and D flushes its radix when it sleeps, so a held credit can never
+    outlive the cache that backs it. What remains after the epoch is the
+    measured ``cached_tokens`` reading, exactly as before. An over-credit
+    inside the epoch (radix eviction) is bounded by D's own gate: W31/W50
+    before the first byte re-queues the request for P.
+
+    #49 -- THE PRICE OF A CREDITED PREFIX IS ITS MEASURED TOKEN COUNT. The
+    remainder was ``len(text)/3.0 - credit``: a chars/3 estimate of the WHOLE
+    prompt minus a MEASURED token credit. On agent text (3.1 chars/token,
+    measured) the prefix alone was over-priced by ~2.3k tokens at 70k context,
+    the whole margin of X=4096. With the witness's ``prompt_tokens`` on the
+    entry, the credited prefix is priced by what it measured and only the
+    unmatched tail by chars/3: ``remainder = tail_chars/3 + (prefix_tokens -
+    credited_tokens)``. An entry without ``prompt_tokens`` prices as before.
     """
 
     def __init__(self, cap: int = SPAN_LRU):
         self.cap = cap
-        self.entries: collections.OrderedDict[str, Tuple[str, int]] = collections.OrderedDict()
+        # key -> (text, cached_tokens, prompt_tokens, held_epoch)
+        self.entries: collections.OrderedDict[
+            str, Tuple[str, int, int, Optional[int]]] = collections.OrderedDict()
+        #: the witness of the last pricing answer, for the ROUTE-VERDICT label
+        #: only (``none`` / ``d_leg2_cached`` / ``d_served_epoch``); nothing
+        #: decides on it.
+        self.last_src = "none"
 
-    def record_presence(self, text: str, cached_tokens: int) -> None:
+    def record_presence(self, text: str, cached_tokens: int, prompt_tokens: int = 0,
+                        held_epoch: Optional[int] = None) -> None:
         """One MEASURED cached-on-D outcome for ``text``.
 
         ``cached_tokens`` is a D leg-2 response's own ``cached_tokens``.
@@ -864,53 +934,133 @@ class SpanLRU:
         had ``prompt_tokens`` passed it. A name that states the quantity is
         the only guard that survives the next reader.
 
+        #49: ``prompt_tokens`` is the same response's tokenisation of ``text``
+        (the price of the credited prefix, see the class note), and
+        ``held_epoch`` is set ONLY for a leg 2 D served (200, priced, no
+        in-band refusal): D then holds all ``prompt_tokens`` in its radix for
+        the rest of that epoch.
+
         A MEASURED ZERO RETRACTS, it does not abstain. ``cached_tokens == 0``
         for a text is D saying "I hold none of this", and leaving an older,
         larger entry standing under that measurement is precisely the stale
         credit that routes the next repeat SHORT into a W50. The old guard
         (``prompt_tokens <= 0`` -> return) could not distinguish "no reading"
-        from "a reading of nothing".
+        from "a reading of nothing". A D SERVE of the text is the exception:
+        it retracts the old entry too, and replaces it by what D holds now.
         """
         if not text:
             return
         key = hashlib.sha1(text.encode()).hexdigest()
         self.entries.pop(key, None)
-        if int(cached_tokens) <= 0:
+        ct = max(0, int(cached_tokens))
+        pt = max(0, int(prompt_tokens or 0))
+        held = held_epoch if (held_epoch is not None and pt > 0) else None
+        if ct <= 0 and held is None:
             return
-        self.entries[key] = (text, int(cached_tokens))
+        self.entries[key] = (text, ct, pt, held)
         while len(self.entries) > self.cap:
             self.entries.popitem(last=False)
 
-    def span_tokens(self, text: str) -> Tuple[int, bool]:
-        """(tokens D is MEASURED to hold for this text's prefix, known).
+    def record_inflight(self, text: str, prompt_tokens: int, held_epoch: int) -> None:
+        """#49 rest: D has prefilled ``text`` (its leg 2 delivered its first
+        content event in ``held_epoch``), so D's radix holds all of it for the
+        rest of that epoch. ``prompt_tokens`` is the best count to hand (the
+        exact tokenisation if known, else chars/3 -- an over-count, which
+        only matters after the epoch, where it can only raise a price).
+
+        Keeps an existing entry's MEASURED ``cached_tokens`` (a repeat of a
+        text D already served), so a leg that dies before its finish never
+        erases a measurement; the finish's :meth:`record_presence` replaces
+        this entry with the measured one in any case.
+        """
+        if not text or held_epoch is None:
+            return
+        key = hashlib.sha1(text.encode()).hexdigest()
+        old = self.entries.pop(key, None)
+        ct = old[1] if old else 0
+        pt = max(1, int(prompt_tokens or 0), old[2] if old else 0)
+        self.entries[key] = (text, ct, pt, int(held_epoch))
+        while len(self.entries) > self.cap:
+            self.entries.popitem(last=False)
+
+    def uncached_tokens(self, text: str, est_prompt: int,
+                        epoch: Optional[int] = None) -> Tuple[int, bool]:
+        """(estimated tokens D must prefill for ``text``, presence known).
 
         ``known`` says a PRESENCE witness exists for a prefix of this text --
-        never that a prefill happened (#1324). The scaling stays what it was:
-        the longest common character prefix against a text D served, times
-        that text's realised cached share.
+        never that a prefill happened (#1324). Per entry: the longest common
+        character prefix ``cp`` against a text D served; the entry's credit is
+        its held ``prompt_tokens`` when ``epoch`` is the epoch D served it in
+        (#49), else its measured ``cached_tokens``, scaled by ``cp/len``. The
+        cheapest entry wins.
         """
-        best = 0
-        known = False
-        for etext, etok in self.entries.values():
+        best: Optional[int] = None
+        src = "none"
+        n = len(text)
+        for etext, ct, pt, held_epoch in self.entries.values():
             cp = common_prefix_len(etext, text)
             if cp <= 0:
                 continue
+            held = epoch is not None and held_epoch is not None and held_epoch == epoch
+            credit = max(ct, pt) if held else ct
+            if credit <= 0:
+                continue
+            frac = cp / max(1, len(etext))
+            if pt > 0:
+                # measured prefix price minus the credit, plus the unmatched
+                # tail at chars/3; rounded UP (the danger is under-pricing)
+                r = (n - cp) / CHARS_PER_TOKEN + max(0.0, (pt - credit) * frac)
+                rem = int(r) + (0 if r == int(r) else 1)
+            else:
+                rem = max(0, int(est_prompt) - int(credit * frac))
+            if best is None or rem < best:
+                best = rem
+                src = "d_served_epoch" if held and pt > ct else "d_leg2_cached"
+        self.last_src = src
+        if best is None:
+            return int(est_prompt), False
+        return best, True
+
+    def span_tokens(self, text: str, epoch: Optional[int] = None) -> Tuple[int, bool]:
+        """(tokens credited against this text's chars/3 estimate, known).
+
+        Kept for readers of the old spelling; the price is
+        :meth:`uncached_tokens`. Unified tree (FS 26.09.): the OLD semantics,
+        unclamped -- the largest ``credit * cp/len`` over the entries, where
+        the credit is the held ``max(ct, pt)`` in ``epoch`` (#49) and the
+        measured ``ct`` otherwise. The 27B port clamped it to the chars/3
+        estimate, which changed what H61's presence pin reads.
+        """
+        best = 0
+        known = False
+        for etext, ct, pt, held_epoch in self.entries.values():
+            cp = common_prefix_len(etext, text)
+            if cp <= 0:
+                continue
+            held = epoch is not None and held_epoch is not None and held_epoch == epoch
+            credit = max(ct, pt) if held else ct
+            if credit <= 0:
+                continue
             known = True
-            est = int(etok * (cp / max(1, len(etext))))
-            best = max(best, est)
+            best = max(best, int(credit * (cp / max(1, len(etext)))))
         return best, known
 
 
-def price_remainder(text: str, spans: SpanLRU) -> Tuple[int, int, bool]:
+def price_remainder(text: str, spans: SpanLRU,
+                    epoch: Optional[int] = None) -> Tuple[int, int, bool]:
     """(estimated uncached tokens, estimated prompt tokens, presence_known).
 
     #1324: the subtracted span is the MEASURED cached-on-D presence, never a
     prefill. The third term is therefore "a presence witness exists", which
     is what the SHORT bound needs to hear; see :class:`SpanLRU`.
+
+    #49: ``epoch`` is the epoch of an AWAKE, SERVING D (the router passes
+    ``None`` otherwise); only then does a text D served in that same epoch
+    count with everything D computed for it.
     """
     est_prompt = int(len(text) / CHARS_PER_TOKEN) + 1
-    span, known = spans.span_tokens(text)
-    return max(0, est_prompt - span), est_prompt, known
+    remainder, known = spans.uncached_tokens(text, est_prompt, epoch)
+    return remainder, est_prompt, known
 
 
 def usage_of(body: Any) -> Tuple[int, int, int, bool]:
@@ -1540,6 +1690,18 @@ async def _anthropic_refusal_lookahead(r) -> Tuple[Optional[bytes], bool]:
         if len(head) >= ANTHROPIC_LOOKAHEAD_MAX_BYTES:
             break
     return (bytes(head) if head else None), False
+
+
+def stream_has_content(head: Optional[bytes], path: str) -> bool:
+    """#49 rest: has a leg-2 stream's buffered head reached CONTENT, i.e. has
+    D finished prefilling? Anthropic: a content event (the envelope comes
+    first, see :func:`_anthropic_refusal_lookahead`). OpenAI and /generate:
+    the first ``data:`` chunk, which the server emits with the first token."""
+    if not head:
+        return False
+    if path == "/v1/messages":
+        return any(m in head for m in ANTHROPIC_CONTENT_MARKERS)
+    return b"data:" in head
 
 
 def witness_verdict(front_outstanding: int, rank_idle: bool) -> Optional[str]:
@@ -3807,7 +3969,16 @@ class Front:
         if isinstance(payload, dict):
             payload["rid"] = rid  # #1442: P and D see the same rid (the hand-off key)
         text = request_text(payload)
-        remainder, est_prompt, known = price_remainder(text, self.spans)
+        # #49: a text D served in THIS epoch counts with everything D computed
+        # for it -- but only while D is the awake, serving group. Queued or
+        # P-phase arrivals are priced on the measured cached share alone (D
+        # flushes its radix when it sleeps; see SpanLRU).
+        # Unified tree: behind SGLANG_WEG2_FRONT_SPAN_49 (off = no held credit,
+        # the pre-port pricing).
+        _held_epoch = (self.epoch if (front_span_49() and self.awake == "D"
+                                      and self.state == "serving")
+                       else None)
+        remainder, est_prompt, known = price_remainder(text, self.spans, epoch=_held_epoch)
         # MF-3: the routing probe's OTHER half, taken here and nowhere else.
         # `price_remainder` already asked the span LRU how much of this prompt
         # D is MEASURED to hold, and subtracted it.  That difference is the
@@ -3828,7 +3999,8 @@ class Front:
         # store; these two fields say which reading it is and how big, so a
         # SHORT verdict can never again be traced back to a witness that only
         # ever saw a prefill.
-        presence_src = "d_leg2_cached" if known else "none"
+        presence_src = ((getattr(self.spans, "last_src", None) or "d_leg2_cached")
+                        if known else "none")
         if not known:
             self.counters["W22_Weg2SpanUnknownPricedFull"] += 1
         self.counters["requests"] += 1
@@ -3893,7 +4065,8 @@ class Front:
             "what D must PREFILL, at CHARS_PER_TOKEN=%.1f minus the MEASURED "
             "cached-on-D presence) presence_span=%d presence_src=%s (#1324: the "
             "credit's witness -- d_leg2_cached is a realised cached_tokens "
-            "reading from group D, never a prefill on P) carrier_est=%d src=%s "
+            "reading from group D, never a prefill on P; #49 d_served_epoch = "
+            "prompt_tokens of a text D served in this epoch) carrier_est=%d src=%s "
             "(THE COMPARED VALUE for carrier_max=%d: the WHOLE prompt's KV "
             "through the host staging pool, at CARRIER_CHARS_PER_TOKEN=%.1f) "
             "est_prompt=%d chars=%d (#1290)",
@@ -4574,6 +4747,34 @@ class Front:
                         return await self._requeue_after_x_refusal(
                             request, rid, payload, text, stream, pending, seat, first_chunk
                         )
+                _has_content = (stream and r.status == 200 and early_body is None
+                                and stream_has_content(first_chunk, request.path))
+                if _has_content:
+                    # #49 rest, INSTRUMENT (routing unchanged): D's first
+                    # content for this leg. Joined by rid with the
+                    # ROUTE-VERDICT line (the arrival), it is the
+                    # arrival-to-first-token the agent-load boot measures.
+                    logger.info("WEG2 LEG2-FIRST-CONTENT rid=%s epoch=%d via=%s leg2_ms=%.0f",
+                                rid, self.epoch, ("d_direct" if pending is None
+                                                 else "d_single" if single_prefill else "after_p"),
+                                (time.time() - t0) * 1000.0)
+                if _has_content and front_span_inflight():
+                    # #49 rest: D has produced this leg's first content, so it
+                    # has PREFILLED the whole prompt into its radix, where a
+                    # concurrent request with this prefix matches it (boot
+                    # dkr27bbar1agent09252206: weg2-12-11 matched 32972 of the
+                    # still-decoding weg2-12-10's 33003). Credit it NOW for
+                    # this epoch; the finish below replaces the entry with
+                    # the measured one. Without this the twin of a turn
+                    # (+~155 tokens, 1-10 s later) priced its predecessor as
+                    # uncached and went over P (weg2-14-15: 157 real tokens,
+                    # routed LONG at est 5327, 55 s wait; nvfp4 weg2-10-7: a
+                    # P epoch of its own).
+                    self.spans.record_inflight(
+                        text, self.exact_tokens.get(hashlib.sha1(text.encode(errors="replace")).hexdigest())
+                        or int(len(text) / CHARS_PER_TOKEN) + 1,
+                        held_epoch=self.epoch)
+                    self.counters["span_inflight_credited"] += 1
                 if stream:
                     resp = web.StreamResponse(status=r.status)
                     resp.content_type = r.content_type
@@ -4670,7 +4871,10 @@ class Front:
                         # tokenisation fact (`carrier_est`); `ct` is what D
                         # did not have to prefill, and it is the only measured
                         # answer to "can D serve this text back".
-                        self.spans.record_presence(text, ct)
+                        _fs49 = front_span_49()
+                        self.spans.record_presence(text, ct, prompt_tokens=(pt if _fs49 else 0),
+                                                   held_epoch=(self.epoch if _fs49 and r.status == 200
+                                                               and priced and not x_inband else None))
                         self._note_exact(text, pt)
                     dterms = await self._draft_terms(g, None, rid=rid, uncached=max(0, pt - ct),
                                                      mark=_pfc_mark0)
@@ -4753,7 +4957,12 @@ class Front:
                     # thereby RETRACTS any larger stale credit for this text
                     # -- D's own refusal is the strongest evidence the prefix
                     # did not come back.
-                    self.spans.record_presence(text, ct)
+                    # #49: a 200 D served (not a re-route) leaves the whole
+                    # prompt in D's radix for this epoch.
+                    _fs49 = front_span_49()
+                    self.spans.record_presence(text, ct, prompt_tokens=(pt if _fs49 else 0),
+                                               held_epoch=(self.epoch if _fs49 and r.status == 200
+                                                           and priced and verdict != "reroute" else None))
                     self._note_exact(text, pt)
                 if r.status == 200 and pending is not None and verdict == "reroute":
                     self.counters["reroute"] += 1

@@ -952,6 +952,19 @@ class Envs:
     # is in flight; otherwise it is routed with the start X (to P). NF D is
     # bs1, so a burst served serially on D would be slower than P's batch.
     SGLANG_WEG2_X_SOLO_WINDOW_MS = EnvInt(250)
+    # #49 (Weg-2 front, agent turns stay on D; 27B 196f6a8f57, ported into the
+    # unified tree behind this switch): tools priced FIRST in the span text,
+    # a D serve teaches the front its whole prompt for that epoch, and a
+    # credited prefix is priced in its measured tokens. Off = the unified
+    # tree's pricing before the port (tools last, cached_tokens only).
+    SGLANG_WEG2_FRONT_SPAN_49 = EnvBool(False)
+    # #49 rest (FS 26.09.): a D leg 2 whose stream has delivered its first
+    # content event has PREFILLED its whole prompt into D's radix -- the
+    # front credits that text for the rest of the epoch at once, not only
+    # when the leg finishes. Closes the twin gap (a Claude-Code turn's second
+    # request, +~155 tokens on the first, arriving while the first decodes).
+    # Needs SGLANG_WEG2_FRONT_SPAN_49; off = presence only at leg-2 finish.
+    SGLANG_WEG2_FRONT_SPAN_INFLIGHT = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     # Weight loader: read safetensors tensors with pread() instead of mmap
     # page faults (ZFS: ~0.5 GB/s per rank through mmap, ~3 GB/s through
