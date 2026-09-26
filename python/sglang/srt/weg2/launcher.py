@@ -13031,6 +13031,27 @@ def p_trim_end_anchor_env(on: bool) -> Dict[str, str]:
     return {_pt.TRIM_ENV: "1"} if on else {}
 
 
+def fork_anchor_env(token: Optional[int], p_trim: bool) -> Dict[str, str]:
+    """``--fork-anchor-token``: the SAME environment for group P and group D
+    ({} when off -- the byte-identity guarantee). The variable NAME lives in
+    weg2/fork_anchor.py, the one module the ranks read it from.
+
+    Refused without ``--p-trim-end-anchor``: D's store read stops at the fork
+    and must meet a P leg whose END anchor sits there; P's split path anchors
+    at N-1 and would leave D's capped read without an anchor in range."""
+    from sglang.srt.weg2 import fork_anchor as _fa
+
+    if token is None:
+        return {}
+    if int(token) <= 0:
+        raise SystemExit(f"--fork-anchor-token must be a positive token id, got {token}")
+    if not p_trim:
+        raise SystemExit(
+            "--fork-anchor-token needs --p-trim-end-anchor: group D stops its store "
+            "read at the prompt's fork, which only a fork-cut P leg anchors")
+    return {_fa.TOKEN_ENV: str(int(token))}
+
+
 def p_host_overlap_env(overlap: bool, hostgap: bool) -> Dict[str, str]:
     """Group P's extra environment for ``--p-host-overlap`` / ``--p-hostgap``.
 
@@ -17033,6 +17054,18 @@ def build_parser() -> argparse.ArgumentParser:
              "prompts keep today's split. Adds SGLANG_WEG2_P_TRIM_END_ANCHOR=1 to "
              "group P only; default off = argv and env byte-identical.")
     ap.add_argument(
+        "--fork-anchor-token", type=int, default=None, metavar="ID",
+        help="FORK ANCHOR (27B line, weg2/fork_anchor.py): the chat template's "
+             "turn-start token id (<|im_start|> = 248045 on Qwen3.8-27B). Group P "
+             "then cuts a leg-1 prompt before its generation prompt (the last such "
+             "token among the final 16) instead of at N-1, so its END anchor also "
+             "serves a sibling request that forks there (boot "
+             "dkr27brc10bar1agent09261821: 9 of 78 D-direct requests fell back "
+             "1.2k-4.7k tokens); group D reads the store up to the same cut and keeps "
+             "its own prefill anchor at or below it. Needs --p-trim-end-anchor. Adds "
+             "SGLANG_WEG2_FORK_ANCHOR_TOKEN to both groups; default off = argv and "
+             "env byte-identical.")
+    ap.add_argument(
         "--fp8-uniform-marlin", action="store_true",
         help="27B line, an FP8 checkpoint (Qwen/Qwen3.8-27B-FP8, block 128x128) on "
              "the flip: force the Marlin FP8 kernel on EVERY rank of both groups "
@@ -19893,6 +19926,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # the 1-token END-ANCHOR forward above never runs for it.
     _p_trim_env = p_trim_end_anchor_env(bool(getattr(ns, "p_trim_end_anchor", False)))
     env_p.update(_p_trim_env)
+    # FORK ANCHOR (weg2/fork_anchor.py): {} when off; the same env goes to D.
+    _fork_env = fork_anchor_env(getattr(ns, "fork_anchor_token", None),
+                                bool(getattr(ns, "p_trim_end_anchor", False)))
+    env_p.update(_fork_env)
+    if _fork_env:
+        log("WEG2 FORK-ANCHOR: on (--fork-anchor-token %s) -- group P cuts a leg-1 "
+            "prompt before its generation prompt, group D reads the store up to the "
+            "same cut and keeps its prefill anchor at or below it (rank lines 'WEG2 "
+            "P-TRIM-END-ANCHOR ... fork', 'WEG2 FORK-ANCHOR TRACK')"
+            % ns.fork_anchor_token)
     if _p_trim_env:
         log("WEG2 P-TRIM-END-ANCHOR: on (--p-trim-end-anchor) -- group P takes every "
             "front leg-1 prompt of N tokens as N-1 (token level, at its intake): the "
@@ -20293,6 +20336,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
         env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
         env_d.update(d_kv_evict_env())  # --d-kv-evict-for-placement: {} under 'off'
+        env_d.update(fork_anchor_env(getattr(ns, "fork_anchor_token", None),
+                                     bool(getattr(ns, "p_trim_end_anchor", False))))  # {} when off
         # #114 auch HIER: es gibt ZWEI spec_d-Stellen, und die erste Fassung
         # traf nur die andere -- der Dry-Run blieb ohne die Zeile, und der
         # Verdrahtungs-Check meldete "#114 fehlt im Baum", obwohl es im Baum
@@ -20413,6 +20458,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
     env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
     env_d.update(d_kv_evict_env())  # --d-kv-evict-for-placement: {} under 'off'
+    env_d.update(fork_anchor_env(getattr(ns, "fork_anchor_token", None),
+                                 bool(getattr(ns, "p_trim_end_anchor", False))))  # {} when off
     # #114: DIE EFFEKTIVE GRUPPEN-ENV GEHOERT INS LOG.
     #
     # Der Verdrahtungs-Check (weg2/verdrahtung_check.sh) liest das

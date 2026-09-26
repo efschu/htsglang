@@ -4464,7 +4464,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         logger.warning(
             "WEG2 END-ANCHOR n=%d rid=%s tokens=%d anchor=%d target=%d units=%d/%d ok=%s short=%d"
             + (" trim=%d" % _trim if _trim else ""),
-            n, str(getattr(req, "rid", "?"))[:12], tokens, anchor, tokens - 1,
+            # FORK ANCHOR (weg2/fork_anchor.py): a fork cut's target is the
+            # fork (N - trim), not N-1; trim=1 prints N-1 exactly as before.
+            n, str(getattr(req, "rid", "?"))[:12], tokens, anchor, tokens - (_trim or 1),
             usable_units, target_units, ok, getattr(UnifiedRadixCache, "_weg2_end_anchor_short", 0),
         )
 
