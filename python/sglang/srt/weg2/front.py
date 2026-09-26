@@ -93,6 +93,7 @@ from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import host_ledger
+from sglang.srt.weg2 import prefill_clock  # UNIFY S4 (H85): D's prefill clock reader (stdlib only)
 
 logger = logging.getLogger("weg2.front")
 
@@ -2535,7 +2536,8 @@ class Front:
                  admin_key_file: str = "",
                  wake_credit_plan: Optional[Dict[str, Any]] = None,
                  vision: str = VISION_MODE_OFF,
-                 x_ceiling_tokens: int = 0):
+                 x_ceiling_tokens: int = 0,
+                 x_busy_tokens: Optional[int] = None):
         # #1275: the key arrives as a PATH, never as an argv value. The groups
         # have no choice (`server_args` offers only `--admin-api-key`, so their
         # key is world-readable in /proc/<pid>/cmdline), but the front does, and
@@ -2702,6 +2704,10 @@ class Front:
         self._d_admissions = 0
         #: Where the last r_D sample came from, printed with every X decision.
         self._x_r_d_src = "none yet"
+        #: UNIFY S4 (H85 / 27B RC7): the ``(boot, seq)`` head of D's prefill
+        #: clock at the front's last ``/get_server_info`` read; a record counts
+        #: for a leg only when it is newer (weg2/prefill_clock.attribute).
+        self._d_prefill_mark: Optional[Tuple[str, int]] = None
         # H84: THE LIVE X MAY NOT CROSS D'S OWN RIEGEL. The front's X is only
         # the front's; D refuses by W50 on its own --tp-prefill-max-tokens, the
         # START X unless the launcher raised it with --x-ceiling-tokens. An X
@@ -2712,6 +2718,13 @@ class Front:
         self.x_ceiling_tokens = max(self.x_start_tokens, int(x_ceiling_tokens or 0))
         #: H84: band requests inside their X-SOLO window right now.
         self._x_solo_waiting = 0
+        # UNIFY S4 (27B RC7-X X_busy): the FLOOR of the X-SOLO band -- up to it
+        # D prefills a SHORT request while it decodes others, above it only as
+        # a singleton. None = the start X (the H84 band floor; both profiles
+        # launch at 4096 today, which is also the 27B's one-chunk default).
+        # Never above the X in force (:meth:`_x_band_floor`).
+        self.x_busy_tokens: Optional[int] = (
+            None if x_busy_tokens is None else max(0, int(x_busy_tokens)))
         # C8/K7: None = derive from the last completed flip in that direction.
         self.min_dwell_ms = None if min_dwell_ms is None else float(min_dwell_ms)
         # law 5 / C6: which group is awake when nothing is pending.
@@ -3858,9 +3871,10 @@ class Front:
         # live X nothing changes; `x_route` is the X this request was actually
         # routed on, and every line below prints it.
         x_route = self.tp_prefill_max_tokens
-        if route == "short" and remainder > self.x_start_tokens:
+        _x_floor = self._x_band_floor()
+        if route == "short" and remainder > _x_floor:
             if not await self._x_solo_admits(rid, remainder):
-                x_route = self.x_start_tokens
+                x_route = _x_floor
                 route = serviceable_route(remainder, carrier_est, x_route,
                                           self.carrier_max_tokens,
                                           carrier_exact=exact is not None)
@@ -4045,6 +4059,12 @@ class Front:
         if p is not None and p.posted_evt is not None and not p.posted_evt.is_set():
             p.posted_evt.set()
 
+    def _x_band_floor(self) -> int:
+        """UNIFY S4: the X-SOLO band's floor as applied -- ``--x-busy-tokens``
+        (27B X_busy), else the start X (H84), never above the X in force."""
+        xb = self.x_start_tokens if getattr(self, "x_busy_tokens", None) is None else self.x_busy_tokens
+        return max(0, min(int(xb), int(self.tp_prefill_max_tokens)))
+
     def _x_solo_busy(self) -> Optional[str]:
         """H84: None when the system is otherwise EMPTY, else what is in it.
 
@@ -4093,9 +4113,10 @@ class Front:
                 busy = self._x_solo_busy()
         self.counters["x_solo_d" if busy is None else "x_solo_p"] += 1
         logger.info("WEG2 X-SOLO rid=%s uncached=%d X_live=%d verdict=%s reason=%s "
-                    "(band floor = start X %d, window_ms=%d; verdict=p routes on the start X)",
+                    "(band floor = X_busy %d, the start X unless --x-busy-tokens; window_ms=%d; "
+                    "verdict=p routes on the band floor)",
                     rid, uncached, self.tp_prefill_max_tokens, "d" if busy is None else "p",
-                    busy or "solo", self.x_start_tokens, window_ms)
+                    busy or "solo", self._x_band_floor(), window_ms)
         return busy is None
 
     async def _acquire_short_seat(self, rid: str, est_tokens: int = 0) -> Optional[Seat]:
@@ -4436,6 +4457,56 @@ class Front:
         _solo_adm0 = self._d_admissions
         _solo_entry = len(g.outstanding) == 1
         t0 = time.time()
+        # UNIFY S4 (H85 / 27B RC7): the prefill-clock mark as this leg starts.
+        _pfc_mark0 = getattr(self, "_d_prefill_mark", None)
+
+        def _sample_r_d(pt: int, ct: int, verdict: str, dterms: dict) -> None:
+            """H84's r_D sample, ONE form for both wire shapes (UNIFY S4: the
+            NF H84/H85 probe and the 27B RC7-X probe were the same intent,
+            doubly built). r_D = uncached / D's OWN prefill seconds -- the
+            body's ``weg2_prefill_s`` (H84) first, else the record on D's
+            ``/get_server_info`` that prefill_clock attributes to this leg
+            (H85: streamed legs and ``/v1/messages`` carry no body time).
+
+            The solo witness is #1289 round 2's: nothing else was admitted to
+            D over the whole leg and D held only this rid at both ends. The
+            leg wall (prefill plus the decode of every completion token) is
+            printed, never divided. The guard lives HERE (27B Review V RC7b):
+            a probe error never turns a served leg into a 503."""
+            try:
+                _unc = max(0, pt - ct)
+                _w = time.time() - t0
+                _solo = (_solo_entry
+                         and self._d_admissions == _solo_adm0
+                         and len(g.outstanding) == 1)
+                if not _solo:
+                    if _unc > 0:
+                        self.counters["r_d_skipped_concurrent"] += 1
+                    return
+                if _unc <= 0:
+                    return
+                _ps = (dterms or {}).get("prefill_s")
+                _src = (dterms or {}).get("prefill_src", "none")
+                rate, why = r_d_probe(_unc, _ps, envs.SGLANG_WEG2_X_RD_MIN_UNCACHED.get())
+                logger.info("WEG2 X R_D rid=%s uncached=%d d_prefill_s=%s wall=%.2fs verdict=%s "
+                            "r_D=%s d_prefill_src=%s d_prefill_attr=%s stream=%d path=%s "
+                            "(r_D = uncached / d_prefill_s; the wall is shown, never used)",
+                            rid, _unc, "none" if _ps is None else f"{float(_ps):.3f}", _w, why,
+                            "-" if rate is None else f"{rate:.0f}", _src,
+                            (dterms or {}).get("prefill_attr", "-"), int(bool(stream)), request.path)
+                if rate is not None:
+                    self._x_r_d_src = f"d_prefill_s verdict={verdict} via={_src}"
+                    self.counters[f"r_d_sampled_{_src}"] += 1
+                    self.note_x_sample("r_d", rate)
+                elif why == "short":
+                    self.counters["r_d_skipped_short"] += 1
+                else:
+                    self.counters["r_d_skipped_no_prefill_time"] += 1
+            except Exception as e:  # noqa: BLE001 - never breaks serving
+                self.counters["r_d_probe_errors"] += 1
+                logger.warning("WEG2 X R_D-PROBE-ERROR rid=%s %s: %s (no sample)",
+                               rid, type(e).__name__, e)
+
         if pending is not None and pending.skip_leg1:
             single_prefill = True
         if (stream and pending is not None and request.path.startswith("/v1/")
@@ -4601,11 +4672,15 @@ class Front:
                         # answer to "can D serve this text back".
                         self.spans.record_presence(text, ct)
                         self._note_exact(text, pt)
-                    dterms = await self._draft_terms(g, None)
+                    dterms = await self._draft_terms(g, None, rid=rid, uncached=max(0, pt - ct),
+                                                     mark=_pfc_mark0)
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                                 "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
                                 rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
                                 dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
+                    # UNIFY S4 (H85): the streamed leg samples r_D too (it never did).
+                    if r.status == 200 and priced and not x_inband:
+                        _sample_r_d(pt, ct, verdict, dterms)
                     if pending is not None and ct > 0:
                         self.counters["cross_group_prefix_hits"] += 1
                     return resp
@@ -4628,7 +4703,8 @@ class Front:
                     return web.json_response({"error": f"W28 Weg2Leg2Unpriced rid={rid}"}, status=503)
                 verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, False, rid)
                 g.served += 1
-                dterms = await self._draft_terms(g, js)
+                dterms = await self._draft_terms(g, js, rid=rid, uncached=max(0, pt - ct),
+                                                 mark=_pfc_mark0)
                 logger.info("WEG2-SERVED group=D leg=2 rid=%s status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                             "uncached=%d verdict=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
                             rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, time.time() - t0, self.epoch,
@@ -4663,29 +4739,13 @@ class Front:
                 # not moving rules out an arrival that came and went inside
                 # this window, which `len(outstanding)` at two instants
                 # cannot.
-                _unc = max(0, pt - ct)
-                _w = time.time() - t0
-                _solo = (_solo_entry
-                         and self._d_admissions == _solo_adm0
-                         and len(g.outstanding) == 1)
-                if _solo and _unc > 0:
-                    # H84: THE RATE IS D'S OWN PREFILL TIME, never this wall
-                    # (the wall holds the decode; see `r_d_probe`).
-                    _pfs = d_prefill_seconds(js)
-                    _r_d, _why = r_d_probe(_unc, _pfs, envs.SGLANG_WEG2_X_RD_MIN_UNCACHED.get())
-                    logger.info("WEG2 X R_D rid=%s uncached=%d d_prefill_s=%s wall=%.2fs verdict=%s "
-                                "r_D=%s (r_D = uncached / d_prefill_s; the wall is shown, never used)",
-                                rid, _unc, "none" if _pfs is None else f"{_pfs:.3f}", _w, _why,
-                                "-" if _r_d is None else f"{_r_d:.0f}")
-                    if _r_d is not None:
-                        self._x_r_d_src = f"d_prefill_s verdict={verdict}"
-                        self.note_x_sample("r_d", _r_d)
-                    elif _why == "short":
-                        self.counters["r_d_skipped_short"] += 1
-                    else:
-                        self.counters["r_d_skipped_no_prefill_time"] += 1
-                elif _unc > 0:
-                    self.counters["r_d_skipped_concurrent"] += 1
+                #
+                # H84: AND THE DENOMINATOR IS D's OWN PREFILL TIME, never this
+                # leg's wall (see `_sample_r_d` at the top of this method, one
+                # probe for both wire shapes -- UNIFY S4). A 200 only (27B
+                # RC7-X): a refusal body is no prefill.
+                if r.status == 200:
+                    _sample_r_d(pt, ct, verdict, dterms)
                 if pt:
                     # #1324, as on the streamed branch above: `ct` is the
                     # measured presence, `pt` the tokenisation fact. On a W31
@@ -4979,7 +5039,8 @@ class Front:
         self._mark_posted(p)
         return await self.leg2(request, rid, payload, text, stream, pending=p, seat=p.seat)
 
-    async def _draft_terms(self, g, body) -> dict:
+    async def _draft_terms(self, g, body, rid: str = "", uncached: int = 0,
+                           mark: Optional[Tuple[str, int]] = None) -> dict:
         """#1233 (C16, L12): the draft terms of one served request.
 
         ``accept_len`` comes from ``meta_info.spec_accept_length`` when the
@@ -4990,7 +5051,17 @@ class Front:
         flight at a time on the leg-2 route, so the delta is this request's).
         Never raises: a missing instrument is ``accept_src=none``.
         """
-        out = {"draft_pages": 0, "draft_miss": 0, "accept_len": 0.0, "accept_src": "none"}
+        out = {"draft_pages": 0, "draft_miss": 0, "accept_len": 0.0, "accept_src": "none",
+               # UNIFY S4 (H84 + H85): this leg's prefill seconds by D's own
+               # clock -- the body's meta_info/sglext weg2_prefill_s (H84)
+               # first, else the record on the SAME read below that
+               # prefill_clock.attribute assigns to this leg; prefill_attr says
+               # how, or why not.
+               "prefill_s": d_prefill_seconds(body), "prefill_src": "none",
+               "prefill_attr": "no_read"}
+        if out["prefill_s"] is not None:
+            out["prefill_src"] = "body"
+            out["prefill_attr"] = "body"
         try:
             mi = (body or {}).get("meta_info") if isinstance(body, dict) else None
             if isinstance(mi, dict) and mi.get("spec_accept_length") is not None:
@@ -5022,6 +5093,20 @@ class Front:
             if out["accept_src"] == "none" and info.get("avg_spec_accept_length") is not None:
                 out["accept_len"] = float(info["avg_spec_accept_length"])
                 out["accept_src"] = "server_info_avg"
+            # H85: D's prefill clock (weg2/prefill_clock.py), attributed
+            # against the leg's ENTRY mark; then the mark moves to this read.
+            _pfc = info.get(prefill_clock.INTERNAL_STATE_KEY)
+            if out["prefill_s"] is None:
+                if uncached > 0:
+                    _s, _how = prefill_clock.attribute(_pfc, rid, uncached, mark)
+                else:
+                    _s, _how = None, "no_extent"
+                out["prefill_attr"] = _how
+                if _s is not None:
+                    out["prefill_s"] = _s
+                    out["prefill_src"] = "server_info"
+            self._d_prefill_mark = prefill_clock.advance(
+                getattr(self, "_d_prefill_mark", None), prefill_clock.mark_of(_pfc))
         except Exception as e:  # noqa: BLE001 - an instrument never breaks serving
             logger.debug("draft terms unavailable: %s: %s", type(e).__name__, e)
         return out
@@ -7140,6 +7225,11 @@ def main():
                          "--x-ceiling-tokens. 0 = the start X (--tp-prefill-max-tokens), so a front "
                          "without it never routes above D's riegel. Requests between the start X "
                          "and the live X go to D only as singletons (WEG2 X-SOLO).")
+    ap.add_argument("--x-busy-tokens", type=int, default=None,
+                    help="27B RC7-X X_busy / UNIFY S4: the floor of the X-SOLO band -- up to it D "
+                         "prefills a SHORT request while it decodes others; between it and the live "
+                         "X only as a singleton. Unset (default) = the start X (H84). 0 = no D "
+                         "prefill while D decodes others. Never above the X in force.")
     ap.add_argument("--flip-min-work-tokens", type=int, default=None,
                     help="C7/K6: queued prompt tokens that make a D->P round trip worth its cost. "
                          "Defaults to --tp-prefill-max-tokens because it IS the same break-even "
@@ -7244,7 +7334,8 @@ def main():
                   ledger_arm=json.loads(args.ledger_arm) if args.ledger_arm else {},
                   admin_key_file=args.admin_key_file,
                   vision=args.vision,
-                  x_ceiling_tokens=args.x_ceiling_tokens)
+                  x_ceiling_tokens=args.x_ceiling_tokens,
+                  x_busy_tokens=args.x_busy_tokens)
     # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
     # against. Kept from weg2/idle-anon-0908.
     if args.anon_preboot_bytes > 0:

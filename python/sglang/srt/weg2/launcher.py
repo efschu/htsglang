@@ -1458,7 +1458,8 @@ class XSeed(NamedTuple):
     measured: bool
 
 
-def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> XSeed:
+def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int,
+              accept: Optional[Callable[[str], bool]] = None) -> XSeed:
     """X and its PROVENANCE LINE, naming the three inputs and their source.
 
     Order: an explicit ``--tp-prefill-max-tokens`` wins (A1-4: derived with
@@ -1487,6 +1488,13 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> 
     fallback.  Without it "no front log on this rig carried all three
     instruments" reads as a fact about the rig when it was only a fact about
     the eight the scan looked at.
+
+    UNIFY S4: ``accept`` is this boot's calibration identity
+    (:func:`calib_log_accept_of`, the same filter the design-prefix and P-log
+    scans take): a front log of another checkpoint, form or line never seeds
+    X -- a 27B front log used to seed NF's X and the other way round (NF
+    inventory, risk (c)). ``None`` (a desk caller) = every log, as before.
+    Refused logs are counted in the provenance line, like the barren ones.
     """
     if override is not None:
         return XSeed(max(floor_tokens, int(override)), (
@@ -1503,6 +1511,13 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> 
     except OSError:
         logs = []
     skipped = 0
+    refused = 0
+    if accept is not None:
+        kept = [q for q in logs if accept(q)]
+        refused = len(logs) - len(kept)
+        logs = kept
+    refused_note = (f"; refused {refused} front log(s) of another checkpoint/form/line "
+                    f"(calibration identity)" if accept is not None else "")
     for path in logs:
         got = measure_x_inputs(path, floor_tokens)
         if got is None:
@@ -1520,6 +1535,7 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> 
             f"r_D={r_d:.0f} tok/s (median of {n_d} D single prefills) "
             f"r_P={r_p:.0f} tok/s (median of {n_p} P leg 1s) floor={floor_tokens}; "
             f"skipped {skipped} newer front log(s) carrying no complete instrument set"
+            f"{refused_note}"
         ), True)
     rec_flip_s = _pconst("X_RECORDED_FLIP_S")
     rec_r_d = _pconst("X_RECORDED_R_D_TOKS")
@@ -1527,7 +1543,7 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> 
     x = derive_x_star(rec_flip_s, rec_r_d, rec_r_p, floor_tokens)
     return XSeed(x, (
         f"X={x} source=recorded PRE-BARLINK (examined {len(logs)} front log(s) on this rig, "
-        f"none carried all three instruments) X*=2*flip_s/(1/r_D-1/r_P) flip_s={rec_flip_s} "
+        f"none carried all three instruments{refused_note}) X*=2*flip_s/(1/r_D-1/r_P) flip_s={rec_flip_s} "
         f"r_D={rec_r_d:.0f} tok/s r_P={rec_r_p:.0f} tok/s "
         f"floor={floor_tokens} -- record 1l/1o weg2zr2, conservative corner of the measured "
         f"range; post-barlink r_D 1354 tok/s pushes X far higher and post-flipcost pulls it "
@@ -1535,23 +1551,41 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> 
     ), False)
 
 
-def resolve_x_ceiling(ceiling_flag: Optional[int], x_tokens: int) -> Tuple[int, int, str]:
+#: RC7-X (27B): the name a negative --x-busy-tokens is refused with at launch.
+X_BUSY_NEGATIVE_NAME = "W155 Weg2XBusyNegative"
+
+
+def resolve_x_ceiling(ceiling_flag: Optional[int], x_tokens: int,
+                      x_busy: Optional[int] = None) -> Tuple[int, int, str]:
     """H84: ``(D's --tp-prefill-max-tokens, the front's --x-ceiling-tokens or 0, line)``.
 
-    D refuses by W50 on its OWN ``--tp-prefill-max-tokens``; the front routes on
-    its LIVE X. Without the flag both stay the start X, byte-identical to before.
-    With it, D's riegel is raised to the ceiling and the front is told the same
+    UNIFY S4: ONE form of the NF H84 and the 27B RC7-X ceiling (the same
+    intent, doubly built; the 27B had already taken the H84 names). D refuses
+    by W50 on its OWN ``--tp-prefill-max-tokens``; the front routes on its LIVE
+    X. Without the flag both stay the start X, byte-identical to before. With
+    it, D's riegel is raised to the ceiling and the front is told the same
     number, so the live X may rise up to exactly what D accepts and never above
     it -- raising only the front's X sent 5-9k to D, D answered W50 and the
     request went round through P. A ceiling below the start X is lifted to it:
     D's riegel may never sit below what the front already routes to D. Group P
     carries no ``--tp-prefill-max-tokens`` and is not touched.
+
+    ``x_busy`` (27B ``--x-busy-tokens``): the floor of the front's X-SOLO band
+    -- up to it D prefills while it decodes others, above it only as a
+    singleton. None = the front's default (the start X, the H84 band floor);
+    a negative value is refused (W155); 0 = no D prefill while D decodes
+    others.
     """
+    if x_busy is not None and int(x_busy) < 0:
+        raise SystemExit(
+            f"{X_BUSY_NEGATIVE_NAME}: --x-busy-tokens {x_busy} < 0. It bounds the uncached "
+            f"tokens D prefills while it decodes other requests; 0 = none, unset = the start X.")
     asked = int(ceiling_flag or 0)
     x = int(x_tokens)
+    busy = "" if x_busy is None else f"; --x-busy-tokens {int(x_busy)} (X-SOLO band floor)"
     if asked <= 0:
         return x, 0, (f"X CEILING: off (--x-ceiling-tokens 0) -- group D --tp-prefill-max-tokens {x} "
-                      f"= the front's start X, which is also the ceiling of the front's live X")
+                      f"= the front's start X, which is also the ceiling of the front's live X{busy}")
     ceiling = max(asked, x)
     lifted = "" if ceiling == asked else f" (asked {asked} < start X {x}: lifted to the start X)"
     return ceiling, ceiling, (
@@ -1559,7 +1593,8 @@ def resolve_x_ceiling(ceiling_flag: Optional[int], x_tokens: int) -> Tuple[int, 
         f"{ceiling} (its W50 riegel; D prefills in --chunked-prefill-size {CHUNKED_PREFILL_TOKENS} "
         f"chunks); front --tp-prefill-max-tokens {x} (start X, unchanged) --x-ceiling-tokens "
         f"{ceiling}: the live X re-solves within [{CHUNKED_PREFILL_TOKENS}, {ceiling}] and a request "
-        f"between {x} and the live X goes to D only as a singleton (WEG2 X-SOLO); group P unchanged")
+        f"between {x if x_busy is None else min(int(x_busy), x)} and the live X goes to D only as a "
+        f"singleton (WEG2 X-SOLO); group P unchanged{busy}")
 
 
 def resolve_pool_floor(
@@ -13095,6 +13130,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "rise up to it; a request between the start X and the live X goes to D "
                          "only when nothing else is in flight (WEG2 X-SOLO). Lifted to the start X "
                          "when below it. Group P is not affected.")
+    ap.add_argument("--x-busy-tokens", type=int, default=None,
+                    help="27B RC7-X / UNIFY S4: the floor of the front's X-SOLO band -- up to it "
+                         "D prefills a SHORT request while it decodes others, above it (up to the "
+                         "live X) only as a singleton. Unset (default) = the front's default, the "
+                         "start X (the H84 band floor); passed to the front only when set. 0 = no D "
+                         "prefill while D decodes others; negative is refused (W155).")
     ap.add_argument("--flip-min-work-tokens", type=int, default=None,
                     help="K6: queued tokens that make a D->P round trip worth its cost. Unset = X.")
     ap.add_argument("--min-dwell-ms", type=float, default=None,
@@ -14589,10 +14630,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for _ln in _l2_lines:
         log(_ln)
     # 0 = derive (the flag's default is the 4096 pin since 2026-09-15).
-    x_seed = resolve_x(ns.tp_prefill_max_tokens or None, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS)
+    x_seed = resolve_x(ns.tp_prefill_max_tokens or None, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS,
+                       accept=calib_log_accept_of(ns))
     x_tokens, x_provenance = x_seed.tokens, x_seed.provenance
     # H84: D's riegel and the front's live-X ceiling, one number (0 = off).
-    d_x_tokens, front_x_ceiling, x_ceiling_line = resolve_x_ceiling(ns.x_ceiling_tokens, x_tokens)
+    d_x_tokens, front_x_ceiling, x_ceiling_line = resolve_x_ceiling(
+        ns.x_ceiling_tokens, x_tokens, getattr(ns, "x_busy_tokens", None))
     flip_min_work_tokens = int(ns.flip_min_work_tokens) if ns.flip_min_work_tokens is not None else x_tokens
     idle_layout_front = "P" if ns.idle_layout == "pp" else "D"
     # THE OPERATING POINT, WITH ITS PROVENANCE, ON EVERY BOOT RECORD. The pair
@@ -14623,6 +14666,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"--max-kv-per-request {max_kv_per_request} --tp-prefill-max-tokens {d_x_tokens}; "
         f"front: --p-concurrency {p_bs} --d-bs {d_bs} --tp-prefill-max-tokens {x_tokens} "
         + (f"--x-ceiling-tokens {front_x_ceiling} " if front_x_ceiling > 0 else "")
+        + ("" if getattr(ns, "x_busy_tokens", None) is None
+           else f"--x-busy-tokens {int(ns.x_busy_tokens)} ")
         + f"--flip-min-work-tokens {flip_min_work_tokens} --idle-layout {idle_layout_front} "
         f"--drain-deadline-s {ns.drain_deadline_s} --fairness-w-s {ns.fairness_w_s}"
         + ("" if ns.min_dwell_ms is None else f" --min-dwell-ms {ns.min_dwell_ms}"))
@@ -16643,9 +16688,12 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
     if admin_key_file:
         argv += ["--admin-key-file", admin_key_file]
     # H84: the live X's ceiling = group D's riegel (resolve_x_ceiling); 0 = off
+    # (UNIFY S4: --x-busy-tokens follows the same rule -- only when set)
     # and the argv stays byte-identical to the one before the flag existed.
     if x_ceiling_tokens > 0:
         argv += ["--x-ceiling-tokens", str(int(x_ceiling_tokens))]
+    if getattr(ns, "x_busy_tokens", None) is not None:
+        argv += ["--x-busy-tokens", str(int(ns.x_busy_tokens))]
     # #1269 fix 4 follow-up: THE PRE-BOOT ANON BASELINE, MEASURED ONCE AND
     # CARRIED. The W22 guard splits its reading into `sglang=` and `foreign=`
     # by subtracting this baseline, and the split is only subtractable because
