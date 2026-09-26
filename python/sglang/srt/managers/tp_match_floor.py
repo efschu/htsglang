@@ -170,6 +170,12 @@ def anchor_unusable(tree_cache: Any, node: Any) -> bool:
             if not anchor_bytes_reachable(tree_cache, value):
                 return True
         return False
+    # H99 audit: this except stays, and only here: every caller is a VOTE
+    # (usable arm, H97 realize round, H98 admission probe) that enters a MIN
+    # reduce, so a rank-local error changes the GROUP value identically on
+    # every rank. Admission never reads it (the follower always follows);
+    # a host that votes over an anchor it then refuses stops by name there
+    # (FormAHostBelowGroup / RankFloorCapMiss).
     except Exception:  # noqa: BLE001 - a vote may never break the reduce
         return False
 
@@ -314,6 +320,12 @@ def can_realize(tree_cache: Any, req: Any, depth: int) -> bool:
         if _local_match_len(result) != int(depth):
             return False
         return not anchor_unusable(tree_cache, getattr(result, "best_match_node", None))
+    # H99 audit: this except stays, and only here: every caller is a VOTE
+    # (usable arm, H97 realize round, H98 admission probe) that enters a MIN
+    # reduce, so a rank-local error changes the GROUP value identically on
+    # every rank. Admission never reads it (the follower always follows);
+    # a host that votes over an anchor it then refuses stops by name there
+    # (FormAHostBelowGroup / RankFloorCapMiss).
     except Exception:  # noqa: BLE001 - a vote may never break the reduce
         return False
 
@@ -409,14 +421,17 @@ def group_floor_zeroes(tree_cache: Any, req: Any, result: Any) -> bool:
     if not group or req is None:
         return False
     rid = str(getattr(req, "rid", "") or "")
-    local = 0
+    # H99 audit: no broad except here. This is an ADMISSION verdict taken on
+    # one rank; a swallowed error used to answer "no zero" on that rank alone
+    # while its peers zeroed -- a silent split. It stops by name instead.
     try:
-        di = getattr(result, "device_indices", None)
-        local = (0 if di is None else len(di)) + int(
-            getattr(result, "host_hit_length", 0) or 0
-        )
-    except Exception:  # noqa: BLE001
-        return False
+        local = _local_match_len(result)
+    except Exception as exc:  # noqa: BLE001 - re-raised by name
+        raise RankFloorUndecidable(
+            f"RU FLOOR UNDECIDABLE rid={rid[:16]}: this rank could not measure "
+            f"its own match ({type(exc).__name__}: {exc}); its peers act on the "
+            "group verdict, so guessing here would split the extend."
+        ) from exc
     verdict = floor_verdict(local, group.get(rid))
     if verdict == "zero":
         _STATS["zeroed"] += 1
@@ -440,6 +455,11 @@ class RankFloorCapMiss(RuntimeError):
     """H96: this rank cannot materialize the group's usable match depth."""
 
 
+class RankFloorUndecidable(RuntimeError):
+    """H99 audit: an admission-site floor verdict could not be taken on this
+    rank. Named stop -- never a rank-local fallback (raenge-nie-uneins)."""
+
+
 def _local_match_len(result: Any) -> int:
     di = getattr(result, "device_indices", None)
     return (0 if di is None else len(di)) + int(
@@ -457,8 +477,11 @@ def group_floor_cap(tree_cache: Any, req: Any, result: Any) -> Optional[int]:
     rid = str(getattr(req, "rid", "") or "")
     try:
         local = _local_match_len(result)
-    except Exception:  # noqa: BLE001
-        return None
+    except Exception as exc:  # noqa: BLE001 - re-raised by name (H99 audit)
+        raise RankFloorUndecidable(
+            f"RU FLOOR UNDECIDABLE rid={rid[:16]}: this rank could not measure "
+            f"its own match ({type(exc).__name__}: {exc}) for the H96 cap."
+        ) from exc
     if floor_verdict(local, group.get(rid)) != "above_group":
         return None
     return int(group[rid])
@@ -550,6 +573,10 @@ def rematch_at_group_depth(tree_cache: Any, params: Any, cap: int, local: int) -
 FOLLOW_ATTR = "_tp_match_floor_follow_walk"
 
 
+class FormAFollowUndecidable(RuntimeError):
+    """H99 audit: the follow switch/plan could not be read on this rank."""
+
+
 class FormAFollowMiss(RuntimeError):
     """H98: a Form A worker cannot present the host's depth on its KV path."""
 
@@ -561,7 +588,12 @@ class FormAHostBelowGroup(RuntimeError):
 def form_a_follow_active() -> bool:
     """Group-uniform: the switch is on and a Form A role plan is installed
     (the same plan on every rank of the group). False on every classic boot,
-    so every caller's pre-H98 path is untouched by construction."""
+    so every caller's pre-H98 path is untouched by construction.
+
+    H99 audit: NO FALLBACK. The answer selects vote layouts and admission
+    paths on this rank; an error swallowed into ``False`` would put this rank
+    on the H97 path while its peers follow -- the silent split the bare-except
+    trap produces. Any error is a named stop (:class:`FormAFollowUndecidable`)."""
     try:
         from sglang.srt.environ import envs
 
@@ -570,8 +602,14 @@ def form_a_follow_active() -> bool:
         from sglang.srt.rank_role import installed_role_plan
 
         return installed_role_plan() is not None
-    except Exception:  # noqa: BLE001 - a predicate may never break the reduce
-        return False
+    except Exception as exc:  # noqa: BLE001 - re-raised by name
+        raise FormAFollowUndecidable(
+            "RU FORM-A FOLLOW UNDECIDABLE: this rank cannot tell whether the "
+            f"H98/H99 follow is active ({type(exc).__name__}: {exc}); a "
+            "rank-local fallback would split the group's vote and admission "
+            "paths, so it stops by name (check SGLANG_WEG2_ENABLE_FORM_A_TP0_"
+            "FOLLOW and the --rank-role plan on every rank)."
+        ) from exc
 
 
 def this_rank_follows() -> bool:
@@ -657,6 +695,12 @@ def admission_probe(tree_cache: Any, req: Any, *, follow: bool) -> int:
             _STATS["unusable_votes"] += 1
             return 0
         return n
+    # H99 audit: this except stays, and only here: every caller is a VOTE
+    # (usable arm, H97 realize round, H98 admission probe) that enters a MIN
+    # reduce, so a rank-local error changes the GROUP value identically on
+    # every rank. Admission never reads it (the follower always follows);
+    # a host that votes over an anchor it then refuses stops by name there
+    # (FormAHostBelowGroup / RankFloorCapMiss).
     except Exception:  # noqa: BLE001 - a vote may never break the reduce
         _STATS["probe_failed"] = _STATS.get("probe_failed", 0) + 1
         return 0
@@ -719,10 +763,11 @@ def form_a_follow_admission(tree_cache: Any, req: Any, result: Any) -> Optional[
     if this_rank_follows():
         if g <= 0:
             return 0 if local > 0 else None
-        if local == g and not anchor_unusable(
-            tree_cache, getattr(result, "best_match_node", None)
-        ):
-            return None
+        # H99 audit: ALWAYS the follow walk for g > 0. The shortcut "own match
+        # already g on a usable anchor" asked `anchor_unusable`, whose broad
+        # except answers "usable" on an error -- the worker would then take
+        # the ordinary path and its #928 could zero it alone. The follow walk
+        # admits exactly g without asking the byteless anchor at all.
         return g
     if g > 0 and local < g:
         raise FormAHostBelowGroup(
@@ -776,6 +821,9 @@ def follow_rematch(tree_cache: Any, params: Any, depth: int, local: int) -> Any:
             "present the host's depth on its KV path although its reach vote "
             "covered it -- stopping instead of extending a different shape."
         )
+    if int(local) == got:
+        _STATS["follow_same"] = _STATS.get("follow_same", 0) + 1
+        return followed
     _STATS["follow"] = _STATS.get("follow", 0) + 1
     n = _STATS["follow"]
     if n <= 20 or n % 256 == 0:
@@ -848,14 +896,13 @@ def form_a_trim_to_group(
     always None off a follower)."""
     if not this_rank_follows():
         return None
-    try:
-        spans = getattr(tree_cache, PREFETCH_SPAN_ATTR, None)
-        if spans is None:
-            spans = {}
-            setattr(tree_cache, PREFETCH_SPAN_ATTR, spans)
-        spans[str(req_id)] = int(group_span)
-    except Exception:  # noqa: BLE001 - bookkeeping only
-        pass
+    # H99 audit: no except -- a lost span would leave this worker's hold
+    # settle on its own span while its peers use the host's.
+    spans = getattr(tree_cache, PREFETCH_SPAN_ATTR, None)
+    if spans is None:
+        spans = {}
+        setattr(tree_cache, PREFETCH_SPAN_ATTR, spans)
+    spans[str(req_id)] = int(group_span)
     group_len = int(group_len)
     trimmed = False
     if host_indices is not None and len(host_indices) > group_len:
