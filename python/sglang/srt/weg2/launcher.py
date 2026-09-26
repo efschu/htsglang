@@ -10232,14 +10232,29 @@ def newest_prefill_census_log(
     return None
 
 
+def calib_identity_of(ns) -> Optional["weg2_form.CalibrationIdentity"]:
+    """UNIFY S3: this boot's ONE calibration identity (weg2_form
+    .calibration_identity): checkpoint AND form, AND -- where the profile's
+    records row names it (27B, line_identity 76e87ac3b2) -- a boot commit that
+    is an ancestor of the tree this launcher runs. None without a resolved
+    form (a desk caller, a teardown)."""
+    form = getattr(ns, "weg2_boot_form", None)
+    if form is None:
+        return None
+    tree = getattr(ns, "tree", "") or ""
+    return weg2_form.calibration_identity(
+        getattr(ns, "model", ""), EVIDENCE_DIR, form,
+        repo=os.path.abspath(tree) if tree else "")
+
+
 def calib_log_accept_of(ns) -> Optional[Callable[[str], bool]]:
     """WEG2-FORM: the P-log calibration filter of this boot -- logs of THIS
     checkpoint only (xsn417, a Qwen3.8-27B boot, cut its P stages on the
-    Next-Flash boot fnFL2x142's prefill census). None when ``ns`` carries no
+    Next-Flash boot fnFL2x142's prefill census), and of this line where the
+    profile's records row names it (UNIFY S3). None when ``ns`` carries no
     resolved form (a desk caller): every log, as before."""
-    if getattr(ns, "weg2_boot_form", None) is None:
-        return None
-    return weg2_form.same_model_log(getattr(ns, "model", ""))
+    ident = calib_identity_of(ns)
+    return ident.accepts_log if ident is not None else None
 
 
 #: UNIFY S3: argparse defaults that are MEASURED constants of one model. The
@@ -14326,12 +14341,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # profile's registry row (unset flags only).
         apply_profile_arg_defaults(ns, list(sys.argv[1:] if argv is None else argv))
     ns.weg2_boot_form = boot_form
-    # WEG2-FORM: THE CALIBRATION IDENTITY. Every measured source this boot
-    # prices from (the sidecar record, the P logs the cut and the depth read)
-    # is taken only from boots of THIS checkpoint. None (teardown) = no filter.
+    # WEG2-FORM + UNIFY S3: THE CALIBRATION IDENTITY (one acceptor, its terms
+    # from the profile's records row: checkpoint AND form, AND the 27B line
+    # term where the row names it). Every measured source this boot prices
+    # from (the sidecar record, the P logs the cut and the depth read) passes
+    # it. None (teardown) = no filter.
+    calib_identity = calib_identity_of(ns)
     calib_sample_accept = (
-        weg2_form.same_model_sample(ns.model, EVIDENCE_DIR, boot_form)
-        if boot_form is not None else None)
+        calib_identity.accepts_sample if calib_identity is not None else None)
     calib_log_accept = calib_log_accept_of(ns)
     apply_spec_form(ns)
     # #1386: THE SWITCH IS RESOLVED HERE, ONCE, AS EARLY AS `ns` EXISTS --
@@ -14484,6 +14501,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if boot_form.profile in weg2_form.PROFILES else None
         if _borrowed:
             log(_borrowed)
+        if calib_identity is not None:
+            log("WEG2-PROFILE calibration identity (" + boot_form.profile + "): a measured "
+                "source counts only when its boot ran " + calib_identity.describe())
         log("#114 P-PREFILL-TRANSIENT (form " + boot_form.describe() + "): "
             + p_prefill_transient_for(boot_form)[1])
     if dirty and not dry:

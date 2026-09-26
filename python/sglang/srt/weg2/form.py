@@ -51,6 +51,8 @@ THE MODEL-PROFILE REGISTRY (UNIFY S3): :class:`ModelProfile` rows in
 follows the model (:data:`PROFILE_SWITCH_DEFAULTS`, derived), per-group env
 rows, and its measured constants with provenance (:func:`profile_constant`).
 Ranks read the row through the published form (:func:`current_profile`).
+:func:`calibration_identity` is the ONE acceptor for measured sources
+(checkpoint AND form, AND the 27B line term where the row names it).
 
 Torch-free and launcher-free on purpose: ranks import this module.
 """
@@ -1137,3 +1139,148 @@ def same_model_log(model: str) -> Callable[[str], bool]:
 
     return accept
 
+
+# --------------------------------------------------------------------------
+# UNIFY S3: ONE calibration identity (UNIFY_PLAN L1)
+# --------------------------------------------------------------------------
+#
+# Two lines built the same intent twice: the NF line filters measured sources
+# by checkpoint + form (same_model_sample / same_model_log above, 9310d2893a),
+# the 27B line by checkpoint + LINE (weg2/line_identity.py 76e87ac3b2: the
+# boot's commit is an ancestor of the commit this launcher runs -- user order
+# 2026-09-24 11:4xZ "getrennt von nf und separat fuers 27b"). Here they are ONE
+# acceptor; WHICH terms apply is the profile's ``records`` row, not a second
+# module: accept(source) = checkpoint AND form AND (line, when the row names
+# it). ``power_limit`` is part of the declared key (planner/power_limit.py
+# SCALES rates by the NVML limit) but not a filter yet -- no front log states
+# its boot's limits in a form a record sample can be judged by (Schritt 9).
+
+_BOOT_LOG_RE = re.compile(
+    r"^boot_weg2_(?P<tag>.+)_(?P<tip>[0-9a-f]{7,40})_(?P<day>\d{4})_(?P<time>\d{6})"
+    r"\.(?P<kind>front|P|D)\.log$"
+)
+
+
+@lru_cache(maxsize=16)
+def _repo_head(repo: str) -> Optional[str]:
+    """The commit the tree ``repo`` has checked out; None = git unreadable."""
+    import subprocess
+
+    try:
+        r = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
+
+
+@lru_cache(maxsize=16)
+def _ancestor_index(repo: str, head: str) -> Optional[Dict[str, Tuple[str, ...]]]:
+    """Every commit reachable from ``head``, indexed by its 7-char prefix. ONE
+    git call per (repo, head) -- 27B line_identity measured 0.12 s against
+    3.74 s for one ``merge-base --is-ancestor`` per boot tag (the front's
+    sleep-leg gate sits inside the first flip). None = git unreadable."""
+    import subprocess
+
+    try:
+        r = subprocess.run(["git", "-C", repo, "rev-list", head],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    idx: Dict[str, List[str]] = {}
+    for sha in r.stdout.split():
+        idx.setdefault(sha[:7], []).append(sha)
+    return {k: tuple(v) for k, v in idx.items()}
+
+
+def is_line_ancestor(repo: str, commit: str, head: Optional[str] = None) -> bool:
+    """``commit`` (a boot's short tip, >= 7 hex) is ``head`` (default: the
+    tree's HEAD) or one of its ancestors. Unreadable git or an unknown commit
+    -> False: an unproven provenance is not accepted."""
+    head = head or _repo_head(repo)
+    c = str(commit or "").lower()
+    if not head or len(c) < 7:
+        return False
+    idx = _ancestor_index(repo, head)
+    if idx is None:
+        return False
+    return any(full.startswith(c) for full in idx.get(c[:7], ()))
+
+
+def _boot_tag_tip(tag: str, evidence_dir: str) -> Optional[str]:
+    """The commit of the newest front log of boot ``tag``; None = no such log."""
+    try:
+        stamp = int(os.path.getmtime(evidence_dir))
+    except OSError:
+        return None
+    for path in _front_log_index(evidence_dir, stamp).get(str(tag), ()):
+        m = _FRONT_LOG_RE.match(os.path.basename(path))
+        if m:
+            return m.group("tip")
+    return None
+
+
+@dataclass(frozen=True)
+class CalibrationIdentity:
+    """What a measured source must share with this boot to count: the terms
+    are the profile's ``records.fields`` (:class:`RecordKey`)."""
+
+    model: str
+    evidence_dir: str
+    form: Optional[Weg2Form] = None
+    fields: Tuple[str, ...] = ("checkpoint", "form")
+    #: the tree this launcher runs (the ``line`` term's repository)
+    repo: str = ""
+
+    @property
+    def uses_line(self) -> bool:
+        return "line" in self.fields and bool(self.repo)
+
+    def describe(self) -> str:
+        parts = [f"checkpoint {model_key(self.model)}"]
+        if "form" in self.fields and self.form is not None:
+            parts.append("form " + " ".join(f"{a}={getattr(self.form, a)}" for a in RESIDUE_AXES))
+        if self.uses_line:
+            parts.append(f"a boot commit that is an ancestor of {self.repo} HEAD (the line)")
+        declared = [f for f in self.fields if f not in ("checkpoint", "form", "line")]
+        tail = f" [declared, not filtered: {', '.join(declared)}]" if declared else ""
+        return " AND ".join(parts) + tail
+
+    def accepts_sample(self, sample: dict) -> bool:
+        """A measured-record sample, judged by its ``boot_tag``'s own front log."""
+        base = same_model_sample(
+            self.model, self.evidence_dir, self.form if "form" in self.fields else None)
+        if not base(sample):
+            return False
+        if not self.uses_line:
+            return True
+        tip = _boot_tag_tip(str((sample or {}).get("boot_tag", "") or ""), self.evidence_dir)
+        return tip is not None and is_line_ancestor(self.repo, tip)
+
+    def accepts_log(self, path: str) -> bool:
+        """A ``boot_weg2_*.{front,P,D}.log``: this checkpoint (and, with the
+        ``line`` term, a commit of this line, read off the log's own name)."""
+        if not same_model_log(self.model)(path):
+            return False
+        if not self.uses_line:
+            return True
+        m = _BOOT_LOG_RE.match(os.path.basename(str(path)))
+        return m is not None and is_line_ancestor(self.repo, m.group("tip"))
+
+
+def calibration_identity(
+    model: str, evidence_dir: str, form: Optional[Weg2Form], repo: str = ""
+) -> CalibrationIdentity:
+    """The identity of this boot, its terms from the form's profile row
+    (``records.fields``); a profile the registry does not know keeps the
+    checkpoint + form terms (the NF-line form of 24.09.)."""
+    if not isinstance(form, Weg2Form):
+        form = None  # a desk stand-in: checkpoint term only, as before
+    row = profile_row(form.profile) if form is not None else None
+    fields = row.records.fields if row is not None else ("checkpoint", "form")
+    return CalibrationIdentity(model=str(model or ""), evidence_dir=str(evidence_dir),
+                               form=form, fields=tuple(fields), repo=str(repo or ""))

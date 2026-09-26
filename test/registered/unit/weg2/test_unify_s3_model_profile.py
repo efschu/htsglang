@@ -312,3 +312,48 @@ def test_no_profile_name_branch_left_in_weg2_code():
                         isinstance(side, ast.Constant) and side.value in literals):
                     bad.append(f"{py.name}:{node.lineno}")
     assert bad == []
+
+
+# ---------------------------------------------------------------- calibration identity
+
+
+def _git(repo, *args):
+    return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def test_the_line_term_is_the_27b_rows_and_not_the_nf_rows():
+    assert "line" in F.PROFILES["qwen27b"].records.fields
+    assert "line" not in F.PROFILES["nextflash"].records.fields
+    fq = F.parse_form(_form_env("qwen27b"))
+    fn = F.parse_form(_form_env("nextflash"))
+    assert F.calibration_identity("/m/x", "/ev", fq, repo="/r").uses_line
+    assert not F.calibration_identity("/m/x", "/ev", fn, repo="/r").uses_line
+    assert not F.calibration_identity("/m/x", "/ev", fq).uses_line  # no tree, no line
+    assert "power_limit" in F.RECORD_KEY_FIELDS
+
+
+def test_line_term_accepts_ancestors_only(monkeypatch):
+    with tempfile.TemporaryDirectory() as repo:
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.email", "t@t")
+        _git(repo, "config", "user.name", "t")
+        _git(repo, "commit", "-q", "--allow-empty", "-m", "a")
+        a = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "checkout", "-q", "-b", "side")
+        _git(repo, "commit", "-q", "--allow-empty", "-m", "s")
+        side = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "checkout", "-q", "-")
+        _git(repo, "commit", "-q", "--allow-empty", "-m", "b")
+        F._repo_head.cache_clear()
+        F._ancestor_index.cache_clear()
+        assert F.is_line_ancestor(repo, a[:10])
+        assert not F.is_line_ancestor(repo, side[:10])
+        assert not F.is_line_ancestor(repo, "")
+        monkeypatch.setattr(F, "same_model_log", lambda model: (lambda path: True))
+        ident = F.calibration_identity("/m/x", "/ev", F.parse_form(_form_env("qwen27b")), repo=repo)
+        assert ident.accepts_log(f"/ev/boot_weg2_t_{a[:10]}_0926_010203.P.log")
+        assert not ident.accepts_log(f"/ev/boot_weg2_t_{side[:10]}_0926_010203.P.log")
+        assert not ident.accepts_log("/ev/unnamed.P.log")
+        nf = F.calibration_identity("/m/x", "/ev", F.parse_form(_form_env("nextflash")), repo=repo)
+        assert nf.accepts_log(f"/ev/boot_weg2_t_{side[:10]}_0926_010203.P.log")
