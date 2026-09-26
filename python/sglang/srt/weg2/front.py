@@ -682,6 +682,22 @@ def _content_text(c: Any) -> str:
     return str(c if c is not None else "")
 
 
+def _native_items(value) -> int:
+    """H125b: how many items a native ``/generate`` multimodal field carries.
+
+    The field is a single item (URL/path/base64 string, dict, or an already
+    decoded object), a list of items, or -- for a batch -- a list of such
+    lists. Every non-empty leaf counts; ``None``, ``""`` and empty lists count
+    0, so a client that sends ``image_data: null`` stays text."""
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple)):
+        return sum(_native_items(v) for v in value)
+    if isinstance(value, (str, bytes)) and not value:
+        return 0
+    return 1
+
+
 def _image_parts(payload) -> int:
     """#1356: how many image parts this request carries. 0 for text-only.
 
@@ -704,6 +720,15 @@ def _image_parts(payload) -> int:
                     n += 1
     except Exception:  # noqa: BLE001 - a malformed body is not an image
         return 0
+    # H125b: THE NATIVE FIELD. `/generate` carries images as `image_data`
+    # (io_struct.GenerateReqInput), not as chat content parts, so this
+    # counter scored 0 and the request routed as TEXT: under `off` both groups
+    # run --no-enable-multimodal, the tokenizer has no mm_processor
+    # (tokenizer_manager.should_run_mm_processor) and the image was DROPPED
+    # SILENTLY -- a plausible answer to a question about a picture nobody
+    # looked at. Counted here, so it gets the chat parts' verdict and line.
+    if isinstance(payload, dict):
+        n += _native_items(payload.get("image_data"))
     return n
 
 
@@ -739,6 +764,28 @@ def _video_parts(payload) -> int:
                     n += 1
     except Exception:  # noqa: BLE001 - a malformed body is not a video
         return 0
+    # H125b: the native `/generate` field, same hole as `image_data`.
+    if isinstance(payload, dict):
+        n += _native_items(payload.get("video_data"))
+    return n
+
+
+def _embed_parts(payload) -> int:
+    """H125b: native ``/generate`` inputs the Weg-2 path cannot carry at all.
+
+    ``input_embeds`` replaces the token ids with caller-computed embeddings:
+    the front prices and routes by text, P and D match their prefixes on token
+    ids, and the hand-off keys on those ids -- none of it sees an embedding.
+    ``audio_data`` names a modality this model family has no encoder for.
+    Both were passed through untouched and answered as whatever the text
+    around them said. Refused by name in EVERY vision mode (W125), because
+    no mode serves them."""
+    if not isinstance(payload, dict):
+        return 0
+    n = 0
+    if payload.get("input_embeds") is not None:
+        n += 1
+    n += _native_items(payload.get("audio_data"))
     return n
 
 
@@ -769,9 +816,11 @@ VERDICT_STAGE = "stage"
 VERDICT_REFUSE_IMAGE = "refuse-image"
 VERDICT_REFUSE_VIDEO = "refuse-video"
 VERDICT_REFUSE_MODE = "refuse-mode"
+#: H125b: input_embeds / audio_data on the native /generate (W125)
+VERDICT_REFUSE_EMBEDS = "refuse-embeds"
 
 
-def vision_verdict(image_parts: int, video_parts: int, mode: str):
+def vision_verdict(image_parts: int, video_parts: int, mode: str, embed_parts: int = 0):
     """PURE: what happens to a request, given its parts and the boot's mode.
 
     Split out of `handle_generate` so the decision can be enumerated at a
@@ -798,6 +847,14 @@ def vision_verdict(image_parts: int, video_parts: int, mode: str):
             f"unknown vision mode {mode!r} (expected one of {list(VISION_MODES)}); "
             "refusing rather than routing, because routing an image at a boot "
             "whose tower state is unknown returns plausible wrong text"
+        )
+    if embed_parts:
+        # H125b: before video and image -- no mode can carry these.
+        return VERDICT_REFUSE_EMBEDS, (
+            f"{embed_parts} input_embeds/audio_data field(s): the Weg-2 path "
+            "prices, routes, matches and hands off by TOKEN IDS, and this model "
+            "has no audio encoder, so these inputs cannot be served by either "
+            "group; refused by name rather than answered from the text alone"
         )
     if video_parts:
         return VERDICT_REFUSE_VIDEO, (
@@ -4114,7 +4171,8 @@ class Front:
         # lives in `vision_verdict`, where it can be enumerated at a desk.
         _img = _image_parts(payload)
         _vid = _video_parts(payload)
-        _verdict, _why = vision_verdict(_img, _vid, self.vision)
+        _emb = _embed_parts(payload)
+        _verdict, _why = vision_verdict(_img, _vid, self.vision, _emb)
         if _verdict == VERDICT_STAGE:
             # Task #58: THE STAGE RUNS IN THE GROUP, and the request that
             # carries the image IS the message that asks for it. The front
@@ -4149,12 +4207,16 @@ class Front:
                 VERDICT_REFUSE_IMAGE: "W101 Weg2VisionRefused",
                 VERDICT_REFUSE_VIDEO: "W103 Weg2VideoRefused",
                 VERDICT_REFUSE_MODE: "W104 Weg2VisionModeUnknown",
+                VERDICT_REFUSE_EMBEDS: "W125 Weg2InputEmbedsRefused",
             }[_verdict]
             _rid_peek = f"weg2-{self.epoch}-{self._rid + 1}"
             logger.warning(
-                "%s rid=%s image_parts=%d video_parts=%d mode=%s -- request "
+                "%s rid=%s image_parts=%d video_parts=%d mode=%s%s -- request "
                 "refused with 501 and NOT routed",
-                _code, _rid_peek, int(_img), int(_vid), self.vision)
+                _code, _rid_peek, int(_img), int(_vid), self.vision,
+                # H125b: named only when present, so the W101/W103 line of a
+                # chat request is the line it always was
+                f" embed_parts={int(_emb)}" if _emb else "")
             return web.json_response({"error": f"{_code}: {_why}"}, status=501)
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
