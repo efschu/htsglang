@@ -19587,6 +19587,11 @@ def run_scheduler_process(
         # taken at either runner's capture_end is missing the other's.
         flight_recorder.mark("boot_complete", rank=tp_rank)
         flight_recorder.dump_trace("boot_complete", rank=tp_rank)
+        # SB 26.09.: rank-side GC warning (--gc-warning-threshold-secs > 0) and
+        # the optional gc.freeze() (SGLANG_WEG2_GC_FREEZE=1); both off by default.
+        from sglang.srt.weg2.gc_instrument import arm_after_boot as _weg2_gc_arm
+
+        _weg2_gc_arm(server_args, tp_rank)
         # #1054: a MEASUREMENT run keeps the window open past this point. The
         # boot-bounded window is right for the resident posts and blind to the
         # transient one that killed boot 24 -- the GDN extend allocation only

@@ -62,6 +62,19 @@ POLICIES = (POLICY_OFF, POLICY_WAKE, POLICY_LIVE)
 POLICY_ENV = "SGLANG_WEG2_D_RESHARD"
 SPEC_ENV = "SGLANG_WEG2_D_RESHARD_SPEC"
 
+#: What the planner minimises (SB 26.09., rc9meas refutation of the sum model).
+#: 'sum' (default, unchanged): max_r of the per-rank SUMS + a floor -- the model
+#: sec. 1 of DYN_D_RESHARD.md.  'segment': the round is the sum over the layer
+#: segments (mixer = attention/GDN + DCP, MLP) of the slowest rank IN THAT
+#: segment plus a floor (collectives + host), sec. 15.  The launcher value
+#: ``--d-reshard wake-seg`` is ``wake`` with objective 'segment'; the server's
+#: D-SPEED table follows this env on group D.
+OBJECTIVE_ENV = "SGLANG_WEG2_DRESHARD_OBJECTIVE"
+OBJECTIVE_SUM = "sum"
+OBJECTIVE_SEGMENT = "segment"
+OBJECTIVES = (OBJECTIVE_SUM, OBJECTIVE_SEGMENT)
+POLICY_WAKE_SEG = "wake-seg"  # launcher value only; the spec carries policy=wake, objective=segment
+
 #: The profile field (UNIFY_PLAN "Profil-Registry"; on desk/27b-unified-0926 this
 #: becomes ``ModelProfile.d_reshard``).  Operator order 26.09. ~08:45Z.
 SUPPORTED = "supported"
@@ -408,10 +421,13 @@ class ReshardSpec:
     boot: str
     min_gain: float = DEFAULT_MIN_GAIN
     fmt: str = ""
+    objective: str = OBJECTIVE_SUM
 
     def validate(self, geom: DGeometry) -> None:
         if self.policy not in POLICIES:
             raise ReshardError(f"policy {self.policy!r} not in {POLICIES}")
+        if self.objective not in OBJECTIVES:
+            raise ReshardError(f"objective {self.objective!r} not in {OBJECTIVES}")
         names = [p.name for p in self.presets]
         if len(set(names)) != len(names) or not names:
             raise ReshardError(f"preset names must be unique and non-empty: {names}")
@@ -428,6 +444,8 @@ class ReshardSpec:
     def to_json(self) -> str:
         d = asdict(self)
         d["presets"] = [{"name": p.name, "mlp": list(p.mlp)} for p in self.presets]
+        if d.get("objective") == OBJECTIVE_SUM:
+            d.pop("objective")  # the default spec (and its digest) stays byte-identical
         return json.dumps(d, sort_keys=True, separators=(",", ":"))
 
     @classmethod
@@ -436,7 +454,7 @@ class ReshardSpec:
         return cls(policy=str(d["policy"]), base=tuple(int(x) for x in d["base"]),
                    presets=tuple(Preset(str(p["name"]), tuple(int(x) for x in p["mlp"])) for p in d["presets"]),
                    boot=str(d["boot"]), min_gain=float(d.get("min_gain", DEFAULT_MIN_GAIN)),
-                   fmt=str(d.get("fmt", "")))
+                   fmt=str(d.get("fmt", "")), objective=str(d.get("objective", OBJECTIVE_SUM)))
 
     def digest(self) -> str:
         return hashlib.sha256(self.to_json().encode()).hexdigest()[:16]
@@ -687,7 +705,8 @@ def parse_presets(raw: str, fmt: str) -> Tuple[Preset, ...]:
 
 def armed_line(spec: ReshardSpec, where: str = "") -> str:
     ps = " ".join(f"{p.name}={','.join(map(str, p.mlp))}" for p in spec.presets)
-    return (f"D-RESHARD armed policy={spec.policy} base={','.join(map(str, spec.base))} "
+    obj = "" if spec.objective == OBJECTIVE_SUM else f" objective={spec.objective}"
+    return (f"D-RESHARD armed policy={spec.policy}{obj} base={','.join(map(str, spec.base))} "
             f"boot={spec.boot} presets[{ps}] min_gain={spec.min_gain} fmt={spec.fmt} "
             f"spec={spec.digest()} {where}".rstrip())
 
@@ -865,3 +884,323 @@ def uneven_dcp_token_split(dcp_size: int, tp_size: int, uneven_dcp_flag: bool, v
     either a non-uniform vector installed or --uneven-dcp requested.  Every input
     is rank-uniform, so the KV hint's collective is skipped on all ranks or none."""
     return int(tp_size) > 1 and int(dcp_size) == int(tp_size) and (bool(vector_active) or bool(uneven_dcp_flag))
+
+
+# ---------------------------------------------------------------------------
+# Segment model (SB 26.09.; DYN_D_RESHARD.md sec. 15)
+# ---------------------------------------------------------------------------
+#
+# rc9meas 26.09. refuted the sum model: 'wake' 707,191,190 (INT8) balanced the
+# per-rank compute SUMS (20.6/20.6/20.2 ms against 18.6/22.0/21.6) and the round
+# got SLOWER (+0.9 % at 10k .. +2.5 % at 240k bs1); NVFP4 98,19,19 gained up to
+# 128k and lost at 240k.  A D round is a chain of layers; every layer has two
+# segments separated by a TP all_reduce -- the mixer (attention with its DCP
+# gather/a2a, or GDN) and the MLP -- and in each segment the slowest rank is
+# what everyone waits for (agent KS, desk/27b-dcollective-0926).  So
+#
+#   round = max_r m_r + max_r x_r + floor
+#
+# m_r = the rank's MLP segments of one round (all layers + draft), x_r = the
+# rest of its compute (mixer segments, lm_head, sampling), floor = collectives
+# and host.  Calibrated per format and batch size on the rank lines
+# "Decode rank batch ... compute/wait" (n_split ~16 % of the rows):
+#
+#   compute_r = c0_r + kappa_r * u_r + alpha_r * t_r * ctx/1000
+#   m_r       = kappa_r * u_r + (dmu if r == 0 else 0)
+#
+# u_r = MLP unit share, t_r = owned-token share (DCP), ctx = tokens of ONE
+# request.  kappa and alpha come straight from the per-rank compute (the MLP
+# shares differ between the h and r arms, the token shares and depths between
+# points); dmu and floor from the round time.  Only dmu is identified, not
+# where each rank's intercept sits between m and x: a common shift of the
+# intercepts moves the same amount from max m to max x and cancels.
+
+#: owned-token ladder of the measurement (measure27b_eval_v2 points 10k/32k/128k/240k)
+SEG_LADDER_CTX = (10240, 32768, 131072, 245760)
+SEG_LADDER_BS = (1, 2)
+SEG_SHARE_RANGE = (0.40, 0.90)
+
+
+@dataclass(frozen=True)
+class SegCalib:
+    """Segment-model constants of one checkpoint format (rank order 5090, 3080, 3080).
+
+    Per calibrated batch size (``bs``): ``c0`` [ms], ``kappa`` [ms per unit MLP
+    share], ``alpha`` [ms per 1k owned tokens of one request], ``dmu`` [ms],
+    ``floor`` [ms].  Other batch sizes are interpolated linearly, outside the
+    calibrated range EXTRAPOLATED (and said so)."""
+
+    name: str
+    bs: Tuple[int, ...]
+    c0: Tuple[Tuple[float, ...], ...]
+    kappa: Tuple[Tuple[float, ...], ...]
+    alpha: Tuple[Tuple[float, ...], ...]
+    dmu: Tuple[float, ...]
+    floor: Tuple[float, ...]
+    provenance: str = ""
+    borrowed: str = ""
+
+    def at(self, bs: int):
+        """(c0, kappa, alpha, dmu, floor, extrapolated) at batch size ``bs``."""
+        if len(self.bs) == 1 or bs in self.bs:
+            i = self.bs.index(bs) if bs in self.bs else 0
+            return self.c0[i], self.kappa[i], self.alpha[i], self.dmu[i], self.floor[i], bs not in self.bs
+        lo, hi = 0, len(self.bs) - 1
+        for i in range(len(self.bs) - 1):
+            if self.bs[i] <= bs <= self.bs[i + 1]:
+                lo, hi = i, i + 1
+                break
+        else:
+            lo, hi = (0, 1) if bs < self.bs[0] else (len(self.bs) - 2, len(self.bs) - 1)
+        w = (bs - self.bs[lo]) / float(self.bs[hi] - self.bs[lo])
+
+        def mix(a, b):
+            if isinstance(a, tuple):
+                return tuple(x + w * (y - x) for x, y in zip(a, b))
+            return a + w * (b - a)
+
+        ext = not (self.bs[0] <= bs <= self.bs[-1])
+        return (mix(self.c0[lo], self.c0[hi]), mix(self.kappa[lo], self.kappa[hi]),
+                mix(self.alpha[lo], self.alpha[hi]), mix(self.dmu[lo], self.dmu[hi]),
+                mix(self.floor[lo], self.floor[hi]), ext)
+
+
+#: Least squares over the h and r arms of rc9meas 26.09. (both temperatures,
+#: all six points; i8h dkr27bbar1mwh09261051 [58,25,25] tok [26,19,19], i8r
+#: dkr27bint8drbar109261105 [707,191,190] tok [21,22,21], n4h
+#: dkr27bnvfp4bar1mwh09261131 [58,25,25] tok [14,9,9], n4r
+#: dkr27bnvfp4drbar109261148 [98,19,19] tok [6,5,5]).  In-sample round rms
+#: INT8 0.14/0.30 ms (bs1/bs2), NVFP4 0.39/0.30 ms; the rt arms (bandwidth
+#: placement) out of sample 0.39/0.38 and 0.49/0.58 ms.  Evidence:
+#: /spinning/gpu-arb/docker/measure27b_v2_retro_0926/, .../jobs/1ab4cd30/tmp/v2n4/.
+_SEG_INT8 = SegCalib(
+    name="int8", bs=(1, 2),
+    c0=((9.502, 14.934, 15.374), (9.765, 16.358, 16.513)),
+    kappa=((16.714, 29.862, 26.164), (16.185, 27.509, 25.604)),
+    alpha=((0.0287, 0.0943, 0.0996), (0.0504, 0.1789, 0.1903)),
+    dmu=(-3.79, -4.16), floor=(8.843, 12.968),
+    provenance="rc9meas 26.09. i8h+i8r, 48+46 points, Decode rank batch compute split")
+_SEG_NVFP4 = SegCalib(
+    name="nvfp4", bs=(1, 2),
+    c0=((9.354, 13.164, 13.268), (10.498, 14.908, 15.072)),
+    kappa=((10.532, 21.528, 21.544), (8.501, 19.882, 19.492)),
+    alpha=((0.0287, 0.0961, 0.1004), (0.0498, 0.1806, 0.1885)),
+    dmu=(-3.22, -2.89), floor=(9.517, 13.096),
+    provenance="rc9meas 26.09. n4h+n4r, 48+46 points, Decode rank batch compute split")
+
+
+def rc9_seg_calib(fmt: str) -> SegCalib:
+    """Segment constants per format; FP8 borrows INT8 (1 B/param, but sm86 runs
+    W8A16 Marlin -- labelled on every line)."""
+    if fmt == "int8":
+        return _SEG_INT8
+    if fmt == "nvfp4":
+        return _SEG_NVFP4
+    if fmt == "fp8":
+        return SegCalib(**{**asdict(_SEG_INT8), "name": "fp8", "borrowed": "INT8 constants"})
+    raise ReshardError(f"no segment calibration for format {fmt!r}")
+
+
+def _seg_fmt_key(fmt: str) -> str:
+    return "int8" if fmt == "fp8" else fmt
+
+
+def unit_shares(units: Sequence[int]) -> Tuple[float, ...]:
+    tot = float(sum(units))
+    return tuple(u / tot for u in units)
+
+
+def seg_parts(cal: SegCalib, u: Sequence[float], t: Sequence[float], bs: int,
+              ctx: int) -> Tuple[List[float], List[float], List[float], float, bool]:
+    """(m_r, x_r, compute_r, floor, extrapolated) of one decode round."""
+    c0, kap, alp, dmu, floor, ext = cal.at(int(bs))
+    comp, m, x = [], [], []
+    for r in range(len(c0)):
+        mr = kap[r] * u[r] + (dmu if r == 0 else 0.0)
+        cr = c0[r] + kap[r] * u[r] + alp[r] * t[r] * ctx / 1000.0
+        m.append(mr)
+        x.append(cr - mr)
+        comp.append(cr)
+    return m, x, comp, floor, ext
+
+
+def seg_round_ms(cal: SegCalib, u: Sequence[float], t: Sequence[float], bs: int, ctx: int) -> float:
+    m, x, _c, floor, _e = seg_parts(cal, u, t, bs, ctx)
+    return max(m) + max(x) + floor
+
+
+def seg_token_share(fmt: str, mlp_units: Sequence[int], placement: str = "capacity",
+                    shares: Optional[Sequence[float]] = None,
+                    geom: Optional[DGeometry] = None) -> Tuple[float, ...]:
+    """Owned-token shares of one request under the D token placement.
+
+    capacity (default): the installed token vector follows the per-rank KV
+    capacity, which the MLP vector moves (rank_bytes delta / KV cell against
+    the measured rc9 capacity; checked: i8r predicted 253954/260577/253633
+    against 247074/262401/254977 measured).  bandwidth: the placement's shares
+    while the rank's class has room (the fill switch is not modelled)."""
+    if placement == "bandwidth":
+        from sglang.srt.weg2.d_token_placement import RC9_EFF_BW_GBS
+        w = tuple(float(x) for x in (shares or RC9_EFF_BW_GBS))
+        return tuple(x / sum(w) for x in w)
+    if placement != "capacity":
+        raise ReshardError(f"unknown token placement {placement!r}")
+    key = _seg_fmt_key(fmt)
+    g = geom or rc9_geometry(key)
+    base = rank_bytes(g, Vector(RC9_BASE))
+    new = rank_bytes(g, Vector(RC9_BASE, tuple(int(x) for x in mlp_units)))
+    caps, _ = kv_tokens_after(RC9_KV_CAPACITY[key], [b - a for a, b in zip(base, new)])
+    return tuple(c / float(sum(caps)) for c in caps)
+
+
+def seg_vectors(units: int, n: int = 3, lo: float = SEG_SHARE_RANGE[0],
+                hi: float = SEG_SHARE_RANGE[1]) -> List[Tuple[int, ...]]:
+    """Every MLP unit vector with rank 0 in [lo, hi] of the units, rest even."""
+    out = []
+    for u0 in range(int(math.ceil(lo * units)), int(math.floor(hi * units)) + 1):
+        rest = units - u0
+        tail = [rest // (n - 1)] * (n - 1)
+        for i in range(rest - sum(tail)):
+            tail[i] += 1
+        out.append(tuple([u0] + tail))
+    return out
+
+
+@dataclass(frozen=True)
+class SegPoint:
+    bs: int
+    ctx: int
+
+    def key(self) -> str:
+        return f"decode-bs{self.bs}-{self.ctx // 1024}k"
+
+
+def seg_ladder(depth: Optional[int] = None) -> Tuple[SegPoint, ...]:
+    """The measured ladder (bs1/bs2 x 10k..240k), or bs1/bs2 at one expected depth."""
+    ctxs = SEG_LADDER_CTX if depth is None else (int(depth),)
+    return tuple(SegPoint(b, c) for b in SEG_LADDER_BS for c in ctxs)
+
+
+def seg_ms_of(fmt: str, mlp_units: Sequence[int], pt: SegPoint, placement: str = "capacity",
+              shares: Optional[Sequence[float]] = None, cal: Optional[SegCalib] = None,
+              geom: Optional[DGeometry] = None, token_share: Optional[Sequence[float]] = None) -> float:
+    cal = cal or rc9_seg_calib(fmt)
+    t = token_share or seg_token_share(fmt, mlp_units, placement, shares, geom)
+    return seg_round_ms(cal, unit_shares(mlp_units), t, pt.bs, pt.ctx)
+
+
+def seg_best(fmt: str, pt: SegPoint, units: int, placement: str = "capacity",
+             shares: Optional[Sequence[float]] = None, geom: Optional[DGeometry] = None,
+             token_share: Optional[Sequence[float]] = None) -> Tuple[Tuple[int, ...], float]:
+    """The per-point segment optimum over :func:`seg_vectors` (ties -> fewer on rank 0)."""
+    cal = rc9_seg_calib(fmt)
+    best = None
+    for v in seg_vectors(units):
+        ms = seg_ms_of(fmt, v, pt, placement, shares, cal, geom, token_share)
+        if best is None or ms < best[1] - 1e-9:
+            best = (v, ms)
+    return best
+
+
+def seg_choose(fmt: str, points: Sequence[SegPoint], units: int, placement: str = "capacity",
+               shares: Optional[Sequence[float]] = None, geom: Optional[DGeometry] = None,
+               token_share: Optional[Sequence[float]] = None):
+    """The ONE vector a wake can set: minimal worst relative loss against the
+    per-point optimum over ``points`` (minimax regret; ties -> smaller mean
+    regret, then fewer units on rank 0).  Returns (vector, worst, {key: regret})."""
+    cal = rc9_seg_calib(fmt)
+    opt = {p.key(): seg_best(fmt, p, units, placement, shares, geom, token_share)[1] for p in points}
+    best = None
+    for v in seg_vectors(units):
+        reg = {p.key(): seg_ms_of(fmt, v, p, placement, shares, cal, geom, token_share) / opt[p.key()] - 1.0
+               for p in points}
+        worst, mean = max(reg.values()), sum(reg.values()) / len(reg)
+        if best is None or (worst, mean) < (best[1] - 1e-12, best[3] - 1e-12):
+            best = (v, worst, reg, mean)
+    return best[0], best[1], best[2]
+
+
+def seg_plan_lines(fmt: str, chosen: Sequence[int], points: Sequence[SegPoint],
+                   placement: str = "capacity", shares: Optional[Sequence[float]] = None) -> List[str]:
+    """Desk plan of the segment objective: per point the chosen vector's round
+    against today's D (base [58,25,25], capacity tokens) and against the sum
+    model's 'dec' preset, and its loss against the per-point optimum."""
+    key = _seg_fmt_key(fmt)
+    g = rc9_geometry(key)
+    cal = rc9_seg_calib(fmt)
+    base = tuple(partition_units(g.mlp_units, list(RC9_BASE)))
+    dec = rc9_presets(key, ("dec",))[0].mlp
+    tag = f" BORROWED({cal.borrowed})" if cal.borrowed else ""
+    out = []
+    for p in points:
+        t_base = seg_ms_of(fmt, base, p, "capacity", None, cal)
+        t_dec = seg_ms_of(fmt, dec, p, "capacity", None, cal)
+        t_ch = seg_ms_of(fmt, chosen, p, placement, shares, cal)
+        v_opt, t_opt = seg_best(fmt, p, g.mlp_units, placement, shares)
+        ext = cal.at(p.bs)[5]
+        out.append(f"D-RESHARD seg-plan {p.key()} mlp={','.join(map(str, chosen))} ms={t_ch:.2f} "
+                   f"base_ms={t_base:.2f} gain={100.0 * (t_base - t_ch) / t_base:+.1f}% "
+                   f"(sum-dec {','.join(map(str, dec))} {100.0 * (t_base - t_dec) / t_base:+.1f}%) "
+                   f"opt={','.join(map(str, v_opt))} {t_opt:.2f} loss_vs_opt={100.0 * (t_ch / t_opt - 1):.1f}% "
+                   f"placement={placement}{tag}{' EXTRAPOLATED(bs)' if ext else ''}")
+    return out
+
+
+def objective_from_env(env: Optional[Mapping[str, str]] = None) -> str:
+    """The D-SPEED objective of this process; anything but 'segment' is the default."""
+    import os
+
+    raw = str((env if env is not None else os.environ).get(OBJECTIVE_ENV, "") or "").strip().lower()
+    return OBJECTIVE_SEGMENT if raw == OBJECTIVE_SEGMENT else OBJECTIVE_SUM
+
+
+def seg_speed_advisory_lines(text_cfg: Mapping, quant_method: Optional[str], base: Sequence[int],
+                             current_mlp: Sequence[int], mlp_units: int,
+                             token_vector: Optional[Sequence[int]]) -> List[str]:
+    """D-SPEED under objective 'segment': per ladder point the segment-optimal
+    MLP vector, its gain against the RUNNING vector, and the robust wake-seg
+    vector's gain.  Candidates take the capacity token share their vector would
+    install (rc9 base only); otherwise the installed token vector for all."""
+    n = len(base)
+    head = "uneven DCP: KV sum is conserved when MLP units move (token vector follows capacity)"
+    fmt = advisory_format(quant_method)
+    why = None
+    if fmt is None:
+        why = f"no D segment model for quant method {quant_method!r} (calibrated: INT8, NVFP4; FP8 borrowed)"
+    elif n != 3:
+        why = f"segment model is calibrated for TP=3 (5090 + 2x3080), this group has {n} ranks"
+    else:
+        try:
+            geom = advisory_geometry(text_cfg, fmt, mlp_units)
+        except (KeyError, TypeError, ValueError) as exc:
+            geom, why = None, f"config is not a Qwen3.5/3.8 dense hybrid ({exc!r})"
+        if geom is not None and (geom.hidden, geom.layers, geom.inter) != (5120, 64, 17408):
+            why = (f"segment model is calibrated for the Qwen3.8-27B geometry, this model is "
+                   f"hidden={geom.hidden} layers={geom.layers} inter={geom.inter}")
+    if why is not None:
+        return [f"{head}; the old 'restart with SGLANG_UNEVEN_MLP_VECTOR' KV hint does not apply. "
+                f"No segment speed table: {why}."]
+    rc9 = tuple(int(x) for x in base) == tuple(RC9_BASE)
+    ts = None
+    if not rc9:
+        ts = token_share(token_vector) if token_vector and len(token_vector) == n else (1.0 / n,) * n
+    cal = rc9_seg_calib(fmt)
+    points = seg_ladder()
+    wake, worst, _reg = seg_choose(fmt, points, mlp_units, geom=geom, token_share=ts)
+    tag = f" BORROWED({cal.borrowed})" if cal.borrowed else ""
+    cur = tuple(int(u) for u in current_mlp)
+    lines = [f"{head}; the old 'restart with SGLANG_UNEVEN_MLP_VECTOR' KV hint does not apply. "
+             f"D segment speed optima (HOCHRECHNUNG, weg2/d_reshard objective=segment, fmt={fmt}{tag}, "
+             f"base={','.join(map(str, base))}, running mlp={','.join(map(str, cur))}, "
+             f"--d-reshard wake-seg takes mlp={','.join(map(str, wake))}, worst loss vs per-point "
+             f"optimum {100.0 * worst:.1f}%):"]
+    for p in points:
+        t_cur = seg_ms_of(fmt, cur, p, cal=cal, geom=geom, token_share=ts)
+        v_best, t_best = seg_best(fmt, p, mlp_units, geom=geom, token_share=ts)
+        t_wake = seg_ms_of(fmt, wake, p, cal=cal, geom=geom, token_share=ts)
+        lines.append(f"  D-SPEED {p.key():16s} mlp={','.join(map(str, v_best)):14s} "
+                     f"gain={100.0 * (t_cur - t_best) / t_cur:+5.1f}% (wake-seg mlp "
+                     f"{100.0 * (t_cur - t_wake) / t_cur:+5.1f}%) ms {t_cur:.1f}->{t_best:.1f} [segment]")
+    lines.append("  D-SPEED prefill: not priced by the segment objective (compute-bound chunk; sum-model "
+                 "row only under the default objective)")
+    return lines
