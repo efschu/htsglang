@@ -59,7 +59,8 @@ def _load_as(pkg: str):
 def test_prefix_table_matches_the_plan():
     assert SUB == ("SG" "LANG_" "WE" "G2_", "FLLIPER_PDFLIP_")
     assert GEN == ("SG" "LANG_", "FLLIPER_")
-    assert nc.CANONICAL_SIDE == 0  # this tree is not renamed yet
+    # 0 before the mechanical rename, 1 after it (the same file bridges both ways)
+    assert nc.CANONICAL_SIDE == (0 if nc.__name__.split(".")[0] == "sg" "lang" else 1)
 
 
 def test_without_other_spellings_the_env_is_byte_identical():
@@ -69,6 +70,9 @@ def test_without_other_spellings_the_env_is_byte_identical():
             del env[k]
     env.update({canon(SUB, "GROUP"): "P", canon(GEN, "HICACHE_X"): "1", "SGL_ALIAS": "a",
                 "HT" "SG" "LANG_PRODUCT": "b", "PATH": "/bin", canon(GEN, "RPF_N"): "8"})
+    # a foreign reader (sgl-kernel) always keeps its legacy spelling beside the canonical one: after the
+    # rename the fixed point carries both (before it, both are the same name)
+    env[GEN[0] + "RPF_N"] = "8"
     before = list(env.items())
     out = nc.canonical_env(env)
     assert out is env

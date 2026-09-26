@@ -863,7 +863,7 @@ def test_the_launcher_default_and_an_operators_word():
     other = types.SimpleNamespace(profile=L.PROFILE_QWEN27B, env_d="")
     assert L.apply_profile_d_seat_vram_default(other) is None and other.env_d == ""
     src = open(L.__file__).read()
-    j = src.index("    ns = build_parser().parse_args(argv)\n")
+    j = src.index("    ns = build_parser().parse_args(")  # FL6: the argv goes through _canonical_flags
     assert "apply_profile_d_seat_vram_default(ns)" in src[j:j + 900]
     ns = types.SimpleNamespace(env_d="SGLANG_WEG2_D_SEAT_EXPERT_ROWS=9,0,0")
     from sglang.srt.planner import expert_residency as er

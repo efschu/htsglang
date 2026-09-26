@@ -14,6 +14,9 @@ suppress_noisy_warnings()
 
 def run_server(server_args):
     """Run the server based on the gRPC flags and server_args.encoder_only."""
+    from sglang._compat_boot import link_state_dir   # rename transition: rig-state dir (compat_shims)
+
+    link_state_dir()
     if server_args.encoder_only:
         # For encoder disaggregation
         if server_args.smg_grpc_mode or server_args.grpc_mode:

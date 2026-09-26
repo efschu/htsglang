@@ -1,5 +1,13 @@
 # SGLang public APIs
 
+# Rename transition (RENAME_PLAN 8.7 step 2): canonical environment spelling BEFORE anything below
+# reads it. See _compat_boot.py. (The rig-state directory is linked by the server entry points, not
+# at import: an import must not write into $HOME.)
+from ._compat_boot import bridge_environ as _bridge_environ
+
+_bridge_environ()
+del _bridge_environ
+
 # Install stubs early for platforms where certain dependencies are unavailable
 # (e.g. macOS/MPS has no triton, and torch.mps lacks Stream / set_device /
 # get_device_properties).  This must run before any downstream imports.

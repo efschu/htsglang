@@ -225,7 +225,7 @@ def test_the_launcher_main_applies_both_nextflash_defaults_first():
     from sglang.srt.weg2 import launcher as L
 
     src = open(L.__file__).read()
-    j = src.index("    ns = build_parser().parse_args(argv)\n")
+    j = src.index("    ns = build_parser().parse_args(")  # FL6: the argv goes through _canonical_flags
     head = src[j:j + 600]
     assert "apply_profile_d_bs_default(ns," in head
     assert "apply_profile_d_pool_waves_default(ns)" in head

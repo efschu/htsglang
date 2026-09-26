@@ -8897,6 +8897,10 @@ def main():
         app.router.add_post(path, front.handle_passthrough_post)
     for path in FORWARD_PATHS:
         app.router.add_post(path, front.handle_generate)
+    # rename transition: the old and the new flip-front route prefixes both answer (compat_shims)
+    from sglang.srt.compat_shims import alias_aiohttp_routes
+
+    alias_aiohttp_routes(app)
     logger.info("WEG2-FRONT %s:%s -> P=%s D=%s awake=%s weights_tags=%s src_chunk_cards=%s", args.host, args.port,
                 args.prefill, args.decode, args.awake, front.weights_tags, front.src_chunk_cards)
     web.run_app(app, host=args.host, port=args.port, print=None)

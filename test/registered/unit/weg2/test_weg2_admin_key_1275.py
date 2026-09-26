@@ -157,7 +157,8 @@ class TheKeyFile(CustomTestCase):
         self.assertGreaterEqual(len(ak.mint()), 32)
 
     def test_the_path_is_beside_the_boots_own_state_json(self):
-        self.assertEqual(ak.key_path("/g", "weg2sb5"), "/g/weg2/boot_weg2sb5.adminkey")
+        # the operator dir is a host path, kept through the rename (compat_shims): written split
+        self.assertEqual(ak.key_path("/g", "weg2sb5"), "/g/" + "we" "g2" + "/boot_weg2sb5.adminkey")
 
 
 class BothGroupsOrNeither(CustomTestCase):
