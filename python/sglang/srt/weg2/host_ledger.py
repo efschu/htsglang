@@ -4600,9 +4600,12 @@ def read_flip_currency_gib(root: str = "/sys/fs/cgroup") -> Optional[float]:
         return None
     if not st:
         return None
-    return (
-        st.get("anon", 0) + st.get("shmem", 0) + st.get("slab_unreclaimable", 0)
-    ) / GIB
+    total = st.get("anon", 0) + st.get("shmem", 0) + st.get("slab_unreclaimable", 0)
+    if swap_aware():
+        # SWAP-AWARE (off by default): pages swapped out of this cgroup leave
+        # ``anon``/``shmem`` without being freed; count them back in.
+        total += read_swap_current_bytes(root) or 0
+    return total / GIB
 
 
 def read_cgroup_pressure(root: str = "/sys/fs/cgroup") -> Dict[str, Optional[float]]:
@@ -4703,7 +4706,116 @@ def read_cgroup_pressure(root: str = "/sys/fs/cgroup") -> Dict[str, Optional[flo
         )
     else:
         out["source"] = "memory.stat unreadable -- no non-reclaimable reading"
+    sw = read_swap_current_bytes(root)
+    out["swap_gib"] = sw / GIB if sw is not None else None
+    if swap_aware() and sw and out["nonreclaim_gib"] is not None:
+        # cgroup v2 ``memory.current`` does NOT count swapped-out pages: without
+        # this term a swapping cgroup reads as "headroom" it bought by paging
+        # its own working set to disk.
+        out["nonreclaim_gib"] = out["nonreclaim_gib"] + sw / GIB
+        out["source"] = f"{out['source']} + memory.swap.current ({SWAP_AWARE_ENV}=1)"
     return out
+
+
+#: SWAP READINESS (2026-09-26, /spinning/gpu-arb/docs/SWAP_READINESS_0926.md).
+#: Every currency in this module assumes the serving cgroup CANNOT swap: then
+#: shmem is unevictable and ``anon + shmem`` / ``memory.current`` hold every
+#: page the boot owns.  That holds while the EFFECTIVE ``memory.swap.max`` of an
+#: ancestor is 0 (CT999 ``swap: 0``; Docker ``--memory-swap == --memory``) --
+#: NOT because ``SwapTotal`` is 0.  Once pages do get swapped out they leave
+#: ``anon``/``shmem``/``memory.current`` (v2 counts swap separately in
+#: ``memory.swap.current``) and every figure here turns OPTIMISTIC.
+#: ``SGLANG_WEG2_SWAP_AWARE=1`` adds ``memory.swap.current`` back into the flip
+#: currency and the non-reclaimable pressure; default 0 = bit-identical to the
+#: swapless form.  ``memory.zswap.current`` is REPORTED only: zswapped pages
+#: already sit in ``memory.swap.current`` at their full size, adding the
+#: compressed pool too would count them twice.
+#: TRAP: inside CT999 the visible cgroup root (``/.lxc``) reads
+#: ``memory.swap.max = max`` although the effective limit on ``lxc/999`` is 0
+#: (read live 2026-09-26 20:17Z) -- the visible ``swap.max`` is never evidence
+#: that swap is allowed; ``memory.swap.current`` is what actually moved.
+SWAP_AWARE_ENV = "SGLANG_WEG2_SWAP_AWARE"
+
+
+def swap_aware() -> bool:
+    """``True`` when ``SGLANG_WEG2_SWAP_AWARE=1`` (default off)."""
+    return os.environ.get(SWAP_AWARE_ENV, "0").strip() == "1"
+
+
+def _read_cg_int(path: str) -> Optional[int]:
+    try:
+        with open(path) as f:
+            text = f.read().strip()
+    except OSError:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def read_swap_current_bytes(root: str = "/sys/fs/cgroup") -> Optional[int]:
+    """``memory.swap.current`` in bytes, ``None`` when the file is absent."""
+    return _read_cg_int(f"{root}/memory.swap.current")
+
+
+def read_swap_state(
+    root: str = "/sys/fs/cgroup", meminfo_path: str = "/proc/meminfo"
+) -> Dict[str, Optional[object]]:
+    """The swap facts, raw: meminfo SwapTotal/SwapFree (bytes), this cgroup's
+    ``memory.swap.current`` / ``memory.zswap.current`` (bytes) and the VISIBLE
+    ``memory.swap.max`` as its text (``"max"`` is not evidence, see above).
+    Absent terms are ``None``, never 0."""
+    out: Dict[str, Optional[object]] = {
+        "swap_total": None, "swap_free": None,
+        "swap_current": read_swap_current_bytes(root),
+        "zswap_current": _read_cg_int(f"{root}/memory.zswap.current"),
+        "swap_max_visible": None,
+    }
+    try:
+        with open(meminfo_path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] in ("SwapTotal:", "SwapFree:"):
+                    key = "swap_total" if parts[0] == "SwapTotal:" else "swap_free"
+                    out[key] = int(parts[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(f"{root}/memory.swap.max") as f:
+            out["swap_max_visible"] = f.read().strip()
+    except OSError:
+        pass
+    return out
+
+
+def swap_state_line(
+    root: str = "/sys/fs/cgroup", meminfo_path: str = "/proc/meminfo"
+) -> Tuple[str, bool]:
+    """``(line, warn)`` for the preflight log.  ``warn`` is ``True`` when this
+    cgroup HAS swapped pages out (``memory.swap.current > 0``): the swapless
+    assumption of every currency in this module no longer carries."""
+    st = read_swap_state(root, meminfo_path)
+
+    def _g(v: Optional[object]) -> str:
+        return "absent" if v is None else f"{int(v) / GIB:.2f}"  # type: ignore[arg-type]
+
+    sc = st["swap_current"]
+    warn = sc is not None and int(sc) > 0  # type: ignore[arg-type]
+    line = (
+        f"WEG2-HOST SWAP: SwapTotal={_g(st['swap_total'])} GiB "
+        f"SwapFree={_g(st['swap_free'])} GiB "
+        f"cg swap.current={_g(sc)} GiB zswap.current={_g(st['zswap_current'])} GiB "
+        f"swap.max(visible)={st['swap_max_visible'] or 'absent'} "
+        f"{SWAP_AWARE_ENV}={'1' if swap_aware() else '0'}"
+    )
+    if warn:
+        line += (
+            " -- WARN: this cgroup HAS swapped pages out; the ledger's swapless "
+            "currency (anon+shmem, memory.current) under-reads by that amount"
+            + ("" if swap_aware() else f" (set {SWAP_AWARE_ENV}=1 to count it)")
+        )
+    return line, warn
 
 
 def read_cgroup_anon_bytes(root: str = "/sys/fs/cgroup") -> Optional[int]:
