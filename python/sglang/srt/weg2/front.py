@@ -6641,6 +6641,51 @@ class Front:
                 logger.error("WEG2 DORMANT-IMAGE not persisted to %s: %s -- the next boot "
                              "will price the recorded dk7 reading instead", self.measured_record, e)
 
+    def _note_pd_free0(self, src: str, dst: str, free_mib: Dict[int, int]) -> None:
+        """H92d: the P->D credit plan's free at flip start, MEASURED.
+
+        ``wake_credit_pd.plan_wake_credit_pd`` prices each card's free at the
+        start of a P->D wake; until H92d it took that from one reference boot
+        (fnFL2x158/1, 24.09.) while the sleeping D co-tenant grew with D's
+        seats (x178 1 seat 1698/768/766 MiB, bb2 6 seats 1944/872/874): plan
+        nvml2 9013 against 8629 on the metal. The planner now takes the NEWEST
+        measurement of the same form; this is its writer: the first
+        ``FREE0_FLIPS`` P->D wakes of the boot append a ``pd_free0`` record
+        (the planner's form from ``--wake-credit-plan`` + ``driver_free`` of
+        the FLIP-ORDER sample) through the H78 writer thread. No form in the
+        plan (a D-only boot, a hand-built namespace) -> nothing written.
+
+        The record is only BUILT here; it is handed to the writer at
+        ``WEG2-FLIP done`` (:meth:`_flush_pd_free0`): this flip's own sleep-leg
+        gate awaits every pending append (``_sidecar_ready``), so a submit here
+        would put ~90 ms of JSON on the flip it measures."""
+        from sglang.srt.weg2 import wake_credit_pd as _wpd
+
+        meta = (getattr(self, "wake_credit_plan", None) or {}).get("P->D-free0")
+        n = int(self.__dict__.get("_pd_free0_seen", 0))
+        if (src, dst) != ("P", "D") or not meta or n >= _wpd.FREE0_FLIPS:
+            return
+        self._pd_free0_seen = n + 1
+        path = getattr(self, "measured_record", "")
+        if not path:
+            return
+        now = time.time()
+        rec = _wpd.free0_record_from_flip(
+            meta, free_mib, flip=n, tag=str(self.tag), commit=getattr(self, "commit", None),
+            at=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now))
+            + ",%03d" % int((now % 1) * 1000))
+        logger.info("WEG2-PD-FREE0 flip=%d free=%s p_rows=%s d_seats=%s form=%s -> sidecar at "
+                    "flip done (H92d: the next boot's P->D credit plan reads the newest one of "
+                    "this form)", n, rec["free"], rec["p_rows"], rec["d_seats"], rec["form_key"])
+        self._pd_free0_pending = (path, rec)
+
+    def _flush_pd_free0(self) -> None:
+        """H92d: hand the record built at FLIP-ORDER to the H78 writer, after
+        the flip it measured (see :meth:`_note_pd_free0`)."""
+        pending = self.__dict__.pop("_pd_free0_pending", None)
+        if pending:
+            self._sidecar_submit(host_ledger.append_measured_record, *pending)
+
     def _write_flip_ratchet(self, done_epoch: int,
                             taken: Optional[Tuple[Optional[float], str]] = None) -> None:
         """#1350 READING 2 OF 2: the FIRST FULL PAIR's permanent step, recorded.
@@ -6975,6 +7020,10 @@ class Front:
                 f"paused on {src}; VRAM state untouched, no flip",
             )
             return
+        # H92d: free0 of this boot's first two P->D wakes, the SAME sample as
+        # the FLIP-ORDER line, for the next boot's P->D credit plan -- in the
+        # H78 writer thread, never on the flip.
+        self._note_pd_free0(src, dst, free_mib)
         # FIX 2 round 2: the token names the BOOT and the flip, not the flip
         # alone -- see weg2_memory_saver.credit_epoch for the leftover counters
         # a bare flip index made this boot inherit.
@@ -7297,6 +7346,7 @@ class Front:
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
         else:
             self._write_flip_ratchet(rec["epoch"])
+        self._flush_pd_free0()  # H92d: after the flip it measured, in the writer thread
         logger.info("WEG2-FLIP done epoch=%d slept=%s woke=%s drain+quiesce=%d ms sleep=%d ms (kv RPC + the %s leg of the gathered pair) "
                     "wake=%d ms (the %s leg + kv RPC) "
                     "interleave=%d ms (NOT sleep+wake: the legs overlap -- gather wall %d ms against %d + %d ms of legs) "

@@ -14706,8 +14706,17 @@ def log_wake_credit_solve_pd(ns, cards: List[Card], log, label: str, *, p_split,
     from sglang.srt.planner import expert_residency as _er
     from sglang.srt.weg2 import wake_credit_pd as _wpd
 
+    # H92d: free beim Flip-Start aus der juengsten Messung derselben Form UND
+    # derselben D-Sitzzahl (der schlafende D-Mitbewohner waechst mit den
+    # Sitzen: x178 1 Sitz 1698/768/766 MiB, bb2 6 Sitze 1944/872/874) --
+    # Sidecar-Records vor den eingebauten; eine Form ohne genannte Sitze
+    # (handgebaute Namespaces) rechnet wie vorher.
+    _d_seats = d_stated_seats(ns)
     try:
         pplan = _wpd.plan_wake_credit_pd(
+            d_seats=_d_seats,
+            free0_records=(_wpd.read_free0_records(measured_record_path())
+                           if _d_seats is not None else ()),
             model=ns.model, p_split=p_split, chunk_layers=int(chunk_layers),
             n_layers=int(n_layers), p_card=[c.nvml_index for c in cards],
             d_ratio=",".join(str(x) for x in ratios),
