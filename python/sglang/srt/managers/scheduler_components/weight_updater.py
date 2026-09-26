@@ -2478,7 +2478,8 @@ class SchedulerWeightUpdaterManager:
         return self._weg2_xchg_inject_from_peer(terms=terms, tag=tag, **kw)
 
     def _weg2_xchg_deposit_before_sleep(self, *, flip_index: int = -1,
-                                        tag: Optional[str] = None) -> None:
+                                        tag: Optional[str] = None,
+                                        lanes=None) -> None:
         """THE DEPOSIT HALF -- the group going dormant stages its card bytes.
 
         WEG2XSN25 MEASURED THE HOLE: `SEAM-DIGEST MATCH 0/6`, and the cause was
@@ -2686,6 +2687,10 @@ class SchedulerWeightUpdaterManager:
                 # check just cleared it (ring still on, or the exchange is
                 # authoritative and genuinely has nothing FOR THIS RANK,
                 # which is fine as long as SOME rank does).
+                if lanes is not None and lanes != "diag":
+                    # fnFL2 H111b: a pair-lane worker's step on a tag this
+                    # rank does not hold -- the loop's diagonal call logs it.
+                    return
                 logger.info(
                     "WEG2-XCHG DEPOSIT tag=%s group=%s rank=%s pieces=0 "
                     "resident_bytes=%s -- this rank's plan carries no desc "
@@ -2695,6 +2700,16 @@ class SchedulerWeightUpdaterManager:
                     tag, group, rank,
                     "unmeasurable" if _resident is None else int(_resident))
                 return
+        if lanes is not None:
+            # fnFL2 H111b: ONE lane of this tag -- "diag" = the on-card lane
+            # (the loop thread), an int = that cross-card pair (its worker).
+            # The same grouping the leg lanes by, so the union of the calls
+            # is exactly the lockstep's descriptor set.
+            from sglang.srt.weg2 import weight_exchange_bounce as _bx
+            _by = _bx.group_descs_by_pair(_descs)
+            _descs = list(_by.get(None if lanes == "diag" else int(lanes), []))
+            if not _descs:
+                return
         self._weg2_xchg_bounce_leg(
             descs=_descs, ops=self._weg2_xchg_device_ops(),
             boot_nonce=boot_nonce, terms=terms, mode=wx.inject_mode(),
@@ -2702,6 +2717,87 @@ class SchedulerWeightUpdaterManager:
             region=self._weg2_shadow_region(),
             sems=self._weg2_xchg_sems(), tag=tag, rank=int(rank),
         )
+
+    @contextmanager
+    def _weg2_h111b_scope(self, recv_req, weights_tags):
+        """fnFL2 H111b: the pair-lane lookahead of ONE sleep leg, or None.
+
+        None (the lockstep, the pre-H111b loop call for call) unless
+        SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD is on AND this sleep is a flip
+        deposit with at least one cross-card pair lane. The workers take the
+        rank's CUDA device first (a fresh thread sits on device 0, the
+        _weg2_device_index danger); the scope closes them and names the chain.
+        """
+        from sglang.srt.environ import envs  # noqa: PLC0415
+        from sglang.srt.weg2 import deposit_lookahead as dl
+
+        if not dl.lookahead_on(self._weg2_group_name()):
+            yield None
+            return
+        flip_index = _weg2_flip_index_of(getattr(recv_req, "epoch", None))
+        lanes = self._weg2_xchg_deposit_pair_lanes(flip_index)
+        if not lanes:
+            logger.info("WEG2-H111B off for this leg: no cross-card pair lane "
+                        "(flip_index=%s) -- the per-tag lockstep", flip_index)
+            yield None
+            return
+        from sglang.srt.weg2 import weight_exchange_bounce as bx
+
+        dev = self._weg2_device_index()
+
+        def _thread_init():
+            if int(dev) >= 0:
+                torch.cuda.set_device(int(dev))
+
+        def _deposit(tag, lane):
+            self._weg2_xchg_deposit_before_sleep(
+                flip_index=flip_index, tag=tag, lanes=int(lane))
+
+        look = dl.LaneLookahead(
+            list(weights_tags), lanes, _deposit,
+            ahead=int(envs.SGLANG_WEG2_DEPOSIT_LANE_AHEAD.get()),
+            budget_s=float(bx.LANE_RENDEZVOUS_BUDGET_S),
+            log=logger.info, thread_init=_thread_init)
+        look.start()
+        try:
+            yield look
+        finally:
+            look.close()
+            logger.info(
+                "WEG2-H111B chain tags=%d lanes=%s ahead=%d ms=%.0f (pair lanes "
+                "left the per-tag lockstep; on-card lane, pause and credit in "
+                "their old order)", len(look.tags),
+                ",".join(f"p{k}" for k in look.lanes), look.ahead, look.chain_ms())
+
+    def _weg2_xchg_deposit_pair_lanes(self, flip_index: int) -> List[int]:
+        """fnFL2 H111b: the cross-card pair lanes this rank deposits on in
+        this flip ([] = no lookahead: not armed, no flip, no plan, or no pair
+        lane). Read from the SAME source-hook plan the per-tag deposit
+        filters, grouped by the same function the leg lanes by."""
+        from sglang.srt.weg2 import weight_exchange as wx
+        from sglang.srt.weg2 import weight_exchange_bounce as bx
+        from sglang.srt.weg2 import weight_exchange_shadow as sh
+
+        try:
+            if not wx.exchange_armed() or int(flip_index) < 0:
+                return []
+            group = self._weg2_group_name()
+            rank = self._weg2_rank()
+            if not group or rank is None or int(rank) < 0:
+                return []
+            if not wx.leg_enabled(sh.HOOK_SOURCE, group):
+                return []
+            plan, _reason = self._weg2_shadow_plan(
+                sh.HOOK_SOURCE, group, int(rank), agreed=None,
+                require_agreement=False)
+            if plan is None:
+                return []
+            by = bx.group_descs_by_pair(
+                [d for d in plan.descs if getattr(d, "kind", None) != wx.ZEROFILL])
+            return sorted(int(k) for k in by if k is not None)
+        except Exception:  # noqa: BLE001 -- no lanes = the lockstep, never a crash
+            logger.warning("WEG2-H111B pair lanes unreadable -> lockstep", exc_info=True)
+            return []
 
     def _weg2_xchg_wake_source_gap(self, tag, *, cdescs_present: bool,
                                    resident_bytes: Optional[int] = None,
@@ -8501,10 +8597,13 @@ class SchedulerWeightUpdaterManager:
                 self._weg2_flip_index_now = _weg2_flip_index_of(getattr(recv_req, "epoch", None))
             except Exception:  # noqa: BLE001 -- the stubs carry no epoch: the counter seq stays
                 pass
-            with self._weg2_pcie_lock_retired("sleep-D2H " + ",".join(weights_tags)):
+            # fnFL2 H111b: the pair lanes one tag ahead of the pause
+            # (weg2/deposit_lookahead.py); the scope yields None = lockstep.
+            with self._weg2_pcie_lock_retired("sleep-D2H " + ",".join(weights_tags)), \
+                    self._weg2_h111b_scope(recv_req, weights_tags) as _h111b:
                 _t_prev_end = None
                 logger.info("WEG2-SLEEP-PRELOOP ms " + " ".join(f"{_n}={_ms:.0f}" for _n, _ms in _weg2_ph_l) + f" t={time.time():.3f}")
-                for tag in weights_tags:
+                for _h111b_i, tag in enumerate(weights_tags):
                     weg2_ring_guard.guard_tag(
                         tag,
                         int(tag_bytes.get(tag, 0)),
@@ -8523,7 +8622,11 @@ class SchedulerWeightUpdaterManager:
                     self._weg2_xchg_deposit_before_sleep(
                         flip_index=_weg2_flip_index_of(
                             getattr(recv_req, "epoch", None)),
-                        tag=tag)
+                        tag=tag, lanes=None if _h111b is None else "diag")
+                    if _h111b is not None:
+                        # every pair lane of THIS tag has deposited before its
+                        # pause -- the per-tag law, unchanged (H111b)
+                        _h111b.join_tag(_h111b_i)
                     # S1 (PLAN_FLIP_LANES_0917): the native pause() ends in
                     # cuMemUnmap, which synchronises the WHOLE device -- every
                     # copy this process still has in flight (the HiCache KV
@@ -8549,6 +8652,8 @@ class SchedulerWeightUpdaterManager:
                         # the same number, from the same instrument, that the
                         # waking rank is waiting on.
                         credit.publish(tag, tag_bytes.get(tag, 0))
+                    if _h111b is not None:
+                        _h111b.advance(_h111b_i)  # H111b: lanes may take the next tag
                     _t_prev_end = time.perf_counter()
                     # 2026-09-15 (Nutzer-Order: die Schlaefer-Schleife je Tag
                     # messen): deposit = plan filter + gap check + lanes,
