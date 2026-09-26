@@ -411,6 +411,8 @@ class TheRouterEndToEnd(CustomTestCase):
         f.vision = VISION_MODE_OFF
         # H84 X-SOLO band: the constructor's start X is the X at launch
         f.x_start_tokens = f.tp_prefill_max_tokens
+        # X-EXACT (6a472f45c5): off -- the chars/3 pricing this file pins
+        f.x_exact = False
         return f
 
     @staticmethod
