@@ -3791,6 +3791,7 @@ def argv_p(
     spec_flags: Optional[Sequence[str]] = None,
 ) -> List[str]:
     _refuse_if_extra_raises_budget(budgets, list(extra or ()), "P")
+    _refuse_if_extra_drops_transient_override(vision, extra, "P")
     # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
     # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
     # server_args hands to derive_pp_layer_split, which builds a CONTIGUOUS
@@ -4184,6 +4185,32 @@ def _adopt_load_format_flag(armed: bool) -> List[str]:
     return ["--load-format", "dummy"]
 
 
+def _refuse_if_extra_drops_transient_override(vision: str, extra, group: str) -> None:
+    """EXTRA is appended LAST and argparse keeps the last occurrence of
+    ``--json-model-override-args``, so an EXTRA override is the one the group
+    gets. Under ``--weg2-vision transient`` it must carry
+    ``language_model_only`` itself, or the group would build the tower it must
+    not have -- refused by name instead of lost silently (27B f09dc0d6e4,
+    extended to P on NF by H125: the NF arm's EXTRA_P and EXTRA_D both carry
+    ``{"language_model_only":true}``, which passes)."""
+    _extra = list(extra or ())
+    if vision != VISION_TRANSIENT or "--json-model-override-args" not in _extra:
+        return
+    _i = len(_extra) - 1 - _extra[::-1].index("--json-model-override-args")
+    try:
+        _lmo = bool(json.loads(_extra[_i + 1]).get("language_model_only"))
+    except (IndexError, ValueError, AttributeError):
+        _lmo = False
+    if not _lmo:
+        raise Weg2LaunchRefused(
+            f"W111 Weg2VisionArmRefused: --extra-{group.lower()} carries its own "
+            "--json-model-override-args without language_model_only, and "
+            "argparse keeps only the last one -- --weg2-vision transient's "
+            f"{VISION_TRANSIENT_OVERRIDE} would be lost and {group} would build a "
+            'tower. Add "language_model_only": true to the EXTRA override.'
+        )
+
+
 def argv_d(
     py: str,
     model: str,
@@ -4217,14 +4244,25 @@ def argv_d(
     profile: str = PROFILE_QWEN27B,
     # #108: kommt als WERT vom Launcher, nie aus der Env dieses Prozesses.
     d_adopt: bool = False,
+    # WEG2 VISION (D side, 24.09., 27B f09dc0d6e4; H125 on NF): APPENDED LAST
+    # (argv_d has no `*` marker). Under `transient` D tokenizes images like P
+    # (language_model_only instead of --no-enable-multimodal): the same pad
+    # ids reach P's stored pages and the decode gets the mrope delta. D still
+    # has no tower and arms no stage (SGLANG_WEG2_VISION stays P-only,
+    # build_env); an image inside D's own extent is refused by name at its
+    # admission (W123). `off` (default) is byte-identical to every argv
+    # before this parameter existed.
+    vision: str = VISION_OFF,
 ) -> List[str]:
     _refuse_if_extra_raises_budget(budgets, list(extra or ()), "D")
+    _refuse_if_extra_drops_transient_override(vision, extra, "D")
     return [py, "-m", "sglang.launch_server"] + common_flags(
         model, s_gb, m_mib, store_cfg, max_kv_per_request, d_write_policy, "D",
         random_seed, barlink_cap_cycles, census_interval,
         hicache_disabled=hicache_disabled,
         weights_cpu_backup=weights_cpu_backup,
         profile=profile,
+        vision=vision,
     ) + (
         ["--disable-overlap-schedule"] if disable_overlap else []
     ) + (
@@ -15875,7 +15913,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap)
         _sg = ";".join(f"{k}={v}" for k, v in sorted(env_d.items()) if str(k).startswith("SGLANG_"))
         log(f"WEG2-GROUP-ENV D: {_sg or '(leer)'}")
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, max_kv_per_request, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns)), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, max_kv_per_request, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
         state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
         launch_group(spec_d, tree, log, dry)
         if dry:
@@ -15915,7 +15953,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
                            if str(k).startswith("SGLANG_"))
             log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns)), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -16032,7 +16070,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
                        if str(k).startswith("SGLANG_"))
         log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns)), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
