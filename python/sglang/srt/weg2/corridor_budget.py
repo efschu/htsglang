@@ -95,6 +95,8 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from sglang.srt.compat_shims import operator_dir as _operator_dir  # host dir kept through the rename
+
 #: The two W-codes this pass owns, enumerated against the (hardened) census:
 #: W53 and W54 were free, W52 was NOT -- see the module docstring.  Written as
 #: plain literals rather than a bare code concatenated with a marker constant,
@@ -138,9 +140,8 @@ BYTES_PER_MIB = 1 << 20
 #: corridor sampler plus that boot's own launcher and D-group log lines.
 #: Follows SGLANG_WEG2_GPU_ARB like the launcher's GPU_ARB (docker plan, stage
 #: B); unset or empty -> byte-identical to the rig literal.
-DEFAULT_SAMPLE_PATH = (
-    f"{os.environ.get('SGLANG_WEG2_GPU_ARB') or '/spinning/gpu-arb'}"
-    "/weg2/corridor_budget_sample.json"
+DEFAULT_SAMPLE_PATH = _operator_dir(
+    os.environ.get('SGLANG_WEG2_GPU_ARB') or '/spinning/gpu-arb', "corridor_budget_sample.json"
 )
 
 

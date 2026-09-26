@@ -8,6 +8,7 @@ import torch
 from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUW8A8Int8DynamicLinearMethod,
 )
@@ -46,6 +47,19 @@ if _is_cuda:
         _has_sgl_int8_scaled_mm = True
     except ImportError:
         int8_scaled_mm = None
+
+
+def _resolve_int8_sm120_triton() -> bool:
+    # SGLANG_INT8_SM120_TRITON (default off): small-M INT8 GEMMs on sm_120 go
+    # through the Triton kernel with exact int32 split-K when their (N, K) is
+    # in the table measured on the 5090 (int8_sm120_triton.py). Resolved once
+    # per process at import; off -> apply_weights runs the sgl call only.
+    return bool(_is_cuda and envs.SGLANG_INT8_SM120_TRITON.get())
+
+
+_int8_sm120_triton = _resolve_int8_sm120_triton()
+if _int8_sm120_triton:
+    from sglang.srt.layers.quantization import int8_sm120_triton as _i8tri
 
 
 class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
@@ -211,6 +225,15 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
     ) -> torch.Tensor:
         # TODO: add cutlass_scaled_mm_azp support
         x_q, x_scale = per_token_quant_int8(x)
+
+        if _int8_sm120_triton:
+            # sm_120, M <= 16, bias-free bf16, (N, K) in the measured table ->
+            # Triton (bit-identical output); anything else returns None.
+            y = _i8tri.maybe_int8_scaled_mm(
+                x_q, layer.weight, x_scale, layer.weight_scale, x.dtype, bias
+            )
+            if y is not None:
+                return y
 
         return int8_scaled_mm(
             x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias

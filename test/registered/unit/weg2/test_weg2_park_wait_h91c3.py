@@ -43,7 +43,25 @@ from sglang.srt.weg2 import phase_policy as pp  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_weg2_park_wait_h91c2 import FakeClock, _admit, _req, _Sched  # noqa: E402
-from test_weg2_phase_policy_h91c import FakeGroup, Harness, _until  # noqa: E402
+from test_weg2_phase_policy_h91c import FakeGroup, Harness  # noqa: E402
+from test_weg2_phase_policy_h91c import _until as _until_h91c  # noqa: E402
+
+#: Deadline of every positive wait in the harness tests (the final gather and
+#: each ``_until``). Load-proof, not a behaviour bound: a green run returns as
+#: soon as the awaited state holds (test_h91c3_1 alone: ~7.5 s). h91bb3's stack_new
+#: (26.09., 15:00Z) ran test_h91c3_1 into its fixed 20-s gather while the incg
+#: cgroup (cpu.idle=1) was starved by a 27B boot -- the harness's first flip
+#: imports the launcher on the event loop (resolve_x_live; the served front
+#: prewarms it off the loop, H75), 5.5-7 s of frozen loop even on an idle rig.
+#: Override with H91C3_TEST_WAIT_S. The negative window (``sleep(1.0)`` then
+#: ``not in``) and every assert stay as they were.
+_WAIT_S = float(os.environ.get("H91C3_TEST_WAIT_S", "90"))
+
+
+async def _until(pred, timeout: float = 10.0, tick: float = 0.02) -> bool:
+    """The h91c harness's ``_until`` with its deadline raised to ``_WAIT_S``."""
+    return await _until_h91c(pred, max(timeout, _WAIT_S), tick)
+
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                      "..", "..", "..", ".."))
@@ -113,7 +131,7 @@ def test_h91c3_1_the_front_stamps_the_park_before_the_rpc():
             assert stamp <= h.d.t_park_received, (stamp, h.d.t_park_received)
             assert h.d.t_park_received - stamp < 0.4
             h.d.release_all()
-            results = await asyncio.wait_for(asyncio.gather(t0, tl), 20)
+            results = await asyncio.wait_for(asyncio.gather(t0, tl), _WAIT_S)
             assert [s for s, _ in results] == [200, 200]
 
     asyncio.run(body())
@@ -132,7 +150,7 @@ def test_h91c3_1_a_failed_park_leaves_no_stamp():
             assert await _until(lambda: h.front.counters["park_failed"] == 1, 10)
             assert h.front._d_parked == {}
             h.d.release_all()
-            results = await asyncio.wait_for(asyncio.gather(t0, tl), 20)
+            results = await asyncio.wait_for(asyncio.gather(t0, tl), _WAIT_S)
             assert [s for s, _ in results] == [200, 200]
 
     asyncio.run(body())
@@ -344,7 +362,7 @@ def test_h91c3_2_a_hand_off_in_flight_at_the_park_is_parked_not_drained():
             kv = [b for b in h.d.resume_bodies if b.get("tags") == ["kv_cache"]]
             assert kv[-1].get("parked_n") == 2, kv
             h.d.release_all()
-            results = await asyncio.wait_for(asyncio.gather(t0, tlate, tl), 20)
+            results = await asyncio.wait_for(asyncio.gather(t0, tlate, tl), _WAIT_S)
             assert [s for s, _ in results] == [200, 200, 200]
             assert h.d.gen_marks.count("late") == 1             # never re-posted
 
@@ -372,7 +390,7 @@ def test_h91c3_2_an_old_d_without_late_hold_is_drained_as_before():
             h.d.release("late")
             assert await _until(lambda: "rpc:release_memory_occupation" in h.d.timeline, 10)
             h.d.release_all()
-            results = await asyncio.wait_for(asyncio.gather(t0, tlate, tl), 20)
+            results = await asyncio.wait_for(asyncio.gather(t0, tlate, tl), _WAIT_S)
             assert [s for s, _ in results] == [200, 200, 200]
 
     asyncio.run(body())
@@ -419,7 +437,7 @@ def test_h91c3_3_an_x_route_past_the_phase_seats_waits_where_the_bound_sees_it()
             assert await _until(lambda: "gen:s1" in h.d.timeline, 10)
             h.d.release("L0")
             h.d.release("s1")
-            results = await asyncio.wait_for(asyncio.gather(tl, t1), 20)
+            results = await asyncio.wait_for(asyncio.gather(tl, t1), _WAIT_S)
             assert [s for s, _ in results] == [200, 200]
             assert h.d.gen_marks.count("L0") == 1               # parked, never re-posted
 
@@ -437,14 +455,14 @@ def test_h91c3_3_a_free_phase_seat_still_takes_the_x_route_on_d():
             tl = h.post("L0", chars=400_000)
             assert await _until(lambda: h.d.running, 20)
             h.d.release("L0")
-            (s0, _) = await asyncio.wait_for(tl, 10)
+            (s0, _) = await asyncio.wait_for(tl, _WAIT_S)
             assert s0 == 200 and h.front.awake == "D"
             t1 = h.post("s1")
             assert await _until(lambda: h.d.running, 10)
             assert h.front.counters["route_short"] == 1
             assert h.front.counters["short_phase_seats_full"] == 0
             h.d.release_all()
-            (s1, _) = await asyncio.wait_for(t1, 10)
+            (s1, _) = await asyncio.wait_for(t1, _WAIT_S)
             assert s1 == 200 and "gen:s1" not in h.p.timeline
 
     asyncio.run(body())
@@ -465,7 +483,7 @@ def test_h91c3_3_without_the_wait_bound_the_x_route_is_untouched():
             assert h.front.counters["route_short"] == 1
             assert h.front.counters["short_phase_seats_full"] == 0
             h.d.release_all()
-            results = await asyncio.wait_for(asyncio.gather(tl, t1), 20)
+            results = await asyncio.wait_for(asyncio.gather(tl, t1), _WAIT_S)
             assert [s for s, _ in results] == [200, 200]
 
     asyncio.run(body())

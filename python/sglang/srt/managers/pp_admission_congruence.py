@@ -1694,7 +1694,16 @@ def state_aligned_load_back_len(req) -> Optional[int]:
             _1040_ALIGN["loss_max"] = loss
 
     n = _1040_ALIGN["n"]
-    if loss > 0 or absent_class == "ANCHOR-ABSENT-ON-MATCH" or n <= 5 or n % 64 == 0:
+    from sglang.srt.weg2 import prefix_trace as _pt
+
+    if (
+        loss > 0
+        or absent_class == "ANCHOR-ABSENT-ON-MATCH"
+        or n <= 5
+        or n % 64 == 0
+        # prefix trace (IN 26.09.): every distinct (rid, extent)
+        or _pt.once("1040", getattr(req, "rid", None), int(extent))
+    ):
         logger.info(
             "#1040 EXTENT STATE-ALIGN rid=%s kv=%d extent=%d loss=%d "
             "anchor_depth=%s device_len=%d key_match_depth=%s class=%s -- "

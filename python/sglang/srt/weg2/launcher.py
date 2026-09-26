@@ -134,10 +134,11 @@ PORT_D = 30032
 #: reaches the ring tables), so the environment is the one seam an image has.
 EVIDENCE_DIR = os.environ.get("SGLANG_WEG2_EVIDENCE_DIR") or "/spinning/evidence-665-f1"
 GPU_ARB = os.environ.get("SGLANG_WEG2_GPU_ARB") or "/spinning/gpu-arb"
+from sglang.srt.compat_shims import canonical_flags as _canonical_flags, env_name_variants as _env_name_variants, name_counterparts as _name_counterparts, name_variants as _name_variants, operator_dir as _operator_dir  # noqa: E402  rename transition
 #: The step-0 metal probe's RECORD (C0, WEG2_BUILD_DECISIONS_0906 section 1p).
 #: A FILE, not a number: the per-card duplex ratios C12/C13 gate on are parsed
 #: out of its own measured rows and printed with this path beside them.
-DUPLEX_PROBE_DEFAULT = f"{GPU_ARB}/weg2/PROBE_RING_0907.md"
+DUPLEX_PROBE_DEFAULT = _operator_dir(GPU_ARB, "PROBE_RING_0907.md")
 #: The three rig helpers main() runs itself. Their own override, so an image can
 #: ship them read-only while GPU_ARB is a writable state volume.
 DEVTOOLS_DIR = os.environ.get("SGLANG_WEG2_DEVTOOLS_DIR") or f"{GPU_ARB}/devtools"
@@ -224,6 +225,9 @@ SHM_OWN_PREFIXES = (
     # occupied. The tag is new every boot, so an arena is never reopened.
     "weg2-arena-",
 )
+#: Rename transition (compat_shims): the residue of a boot that ran under the other package /
+#: subsystem name is this line's own too, so the sweep also lists the other spelling of every family.
+SHM_OWN_PREFIXES = SHM_OWN_PREFIXES + _name_counterparts(SHM_OWN_PREFIXES)
 #: The corridor law is 819-1229 MiB NVML-free per card under the awake
 #: group's load.  MEASURED 2026-09-07 boot weg2onebackup2 with this constant
 #: at 1024: the 5090's continuous minimum under group D was 620-684 MiB
@@ -4557,6 +4561,17 @@ def _tree_bytes(path: str) -> Tuple[int, int, int]:
 #: its argv carries ``-m`` followed by EXACTLY this token -- see
 #: :func:`live_launch_servers` for why a substring of the command line is not.
 LAUNCH_SERVER_MODULE = "sglang.launch_server"
+#: Rename transition (compat_shims): this tree's module FIRST, then the other package
+#: generation's.  A server started by a launcher of the other generation holds cards and
+#: /dev/shm exactly like one of ours; without its spelling here the #1217 census would not
+#: even look at it (FL5, RENAME_PLAN 8.14 item 1).
+LAUNCH_SERVER_MODULES: Tuple[str, ...] = _name_variants(LAUNCH_SERVER_MODULE)
+#: The boot token's env key as ``KEY=`` bytes, this tree's spelling first, then the other
+#: generation's.  A rank's own environment is folded onto one spelling by the package hook, so a
+#: server of the other generation carries ONLY the other one (see :func:`_proc_boot_tag`).
+BOOT_TOKEN_ENV_KEYS: Tuple[bytes, ...] = tuple(
+    k.encode() + b"=" for k in _env_name_variants("SGLANG_WEG2_BOOT_TOKEN")
+)
 
 
 def _proc_argv(pid: str, proc_root: str) -> List[str]:
@@ -4600,10 +4615,11 @@ def is_launch_server_argv(argv: Sequence[str]) -> bool:
     """
     if not argv or not os.path.basename(argv[0]).startswith("python"):
         return False
+    # rename transition: either generation's module (LAUNCH_SERVER_MODULES)
     for i, a in enumerate(argv[1:], start=1):
-        if a == "-m" and i + 1 < len(argv) and argv[i + 1] == LAUNCH_SERVER_MODULE:
+        if a == "-m" and i + 1 < len(argv) and argv[i + 1] in LAUNCH_SERVER_MODULES:
             return True
-        if a == "-m" + LAUNCH_SERVER_MODULE:
+        if a.startswith("-m") and a[2:] in LAUNCH_SERVER_MODULES:
             return True
     return False
 
@@ -4634,15 +4650,25 @@ def _proc_boot_tag(pid: str, proc_root: str) -> Optional[str]:
     """The Weg-2 boot tag a server was started under, from its own
     ``SGLANG_WEG2_BOOT_TOKEN`` (``<tag>:<epoch>:<launcher pid>``, published by
     :func:`build_env` for both groups).  ``None`` = no token (a stock server of
-    another operator) or unreadable -- both count as a FOREIGN tag."""
+    another operator) or unreadable -- both count as a FOREIGN tag.
+
+    Rename transition: either spelling of the key (:data:`BOOT_TOKEN_ENV_KEYS`),
+    this tree's first when a process somehow carries both.  A server of the
+    other generation with a token is judged by its TAG like one of ours, not
+    as "no token"."""
     try:
         with open(f"{proc_root}/{pid}/environ", "rb") as f:
             raw = f.read()
     except OSError:
         return None
+    found: Dict[bytes, bytes] = {}
     for kv in raw.split(b"\0"):
-        if kv.startswith(b"SGLANG_WEG2_BOOT_TOKEN="):
-            return kv.split(b"=", 1)[1].decode("utf-8", "replace").split(":", 1)[0]
+        for key in BOOT_TOKEN_ENV_KEYS:
+            if kv.startswith(key) and key not in found:
+                found[key] = kv[len(key):]
+    for key in BOOT_TOKEN_ENV_KEYS:
+        if key in found:
+            return found[key].decode("utf-8", "replace").split(":", 1)[0]
     return None
 
 
@@ -4689,7 +4715,7 @@ def live_launch_servers(
         if not argv:
             continue
         server = is_launch_server_argv(argv)
-        if not server and not any(LAUNCH_SERVER_MODULE in a for a in argv):
+        if not server and not any(m in a for a in argv for m in LAUNCH_SERVER_MODULES):
             continue
         pid = int(entry)
         head = " ".join(argv)[:160]
@@ -4764,7 +4790,7 @@ def shm_residue_sweep(
     if ignored:
         log(
             f"#1217 shm residue (fnFL2 H26): {len(ignored)} process(es) mention "
-            f"{LAUNCH_SERVER_MODULE} but are NOT a live foreign server, not counted: {ignored}"
+            f"{'|'.join(LAUNCH_SERVER_MODULES)} but are NOT a live foreign server, not counted: {ignored}"
         )
     if live:
         raise Weg2LaunchRefused(
@@ -6669,11 +6695,13 @@ def _credit_counter_rows(credit_dir: str = "") -> List[Tuple[str, str, str, int]
                        weg2_memory_saver.DEFAULT_PCIE_LOCK_DIR),
     )
     prefix = "." + weg2_memory_saver.VRAM_CREDIT_PREFIX
+    # rename transition (compat_shims): counters of boots under the other name are this line's too
+    prefixes = (prefix,) + _name_counterparts((prefix,))
     rows: List[Tuple[str, str, str, int]] = []
     if not os.path.isdir(directory):
         return rows
     for name in sorted(os.listdir(directory)):
-        if not name.startswith(prefix):
+        if not name.startswith(prefixes):
             continue
         path = os.path.join(directory, name)
         epoch, pid = "", 0
@@ -6803,7 +6831,8 @@ def sweep_xchg_semaphores(
         log(f"#1273 xchg semaphores: {shm_dir} unreadable -- NOT swept, and not read as empty")
         return []
     prefix = f"sem.{weight_exchange_region.REGION_PREFIX}"
-    stale = [n for n in names if n.startswith(prefix)]
+    # rename transition (compat_shims): a dead boot under the other name left its handshake too
+    stale = [n for n in names if n.startswith((prefix,) + _name_counterparts((prefix,)))]
     if not stale:
         log("WEG2-XCHG-SEM residue: none")
         return []
@@ -18152,7 +18181,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # a PREVIOUS boot in the same process (there is none today; guards the
     # shape anyway) must never make a fast pre-spawn refusal look post-spawn.
     _ACTIVE_BOOT_STATE = None
-    ns = build_parser().parse_args(argv)
+    # rename transition (compat_shims): old and new flip-flag spellings both reach the parser
+    ns = build_parser().parse_args(_canonical_flags(sys.argv[1:] if argv is None else list(argv)))
+    if not ns.teardown:   # rename transition: rig-state dir (compat_shims); a teardown boots nothing
+        from sglang._compat_boot import link_state_dir
+
+        link_state_dir()
     # H91b/H95: the Next-Flash form's own D seat bound (6, dynamic 1..6 per
     # phase) and its pool waves, before anything reads --d-bs or --env-d.
     apply_profile_d_bs_default(ns, list(sys.argv[1:] if argv is None else argv))
@@ -20590,7 +20624,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.helper_pids.append(arm_deadman(log, spec_p.log, PORT_P, f"launch_server.*--port {PORT_P}", huge, ns.tag, "P", dry))
     state.helper_pids.append(arm_deadman(log, spec_d.log, PORT_D, f"launch_server.*--port {PORT_D}", huge, ns.tag, "D", dry))
     state.helper_pids.append(arm_deadman(log, front_log, PORT_FRONT, "sglang.srt.weg2.front", 120, ns.tag, "front", dry))
-    with open(f"{GPU_ARB}/weg2/boot_{ns.tag}.logpath", "w") as f:
+    with open(_operator_dir(GPU_ARB, f"boot_{ns.tag}.logpath"), "w") as f:
         f.write(front_log + "\n")
     _write_state(state)
     log(f"LAUNCHED: P pid {spec_p.pid} (asleep) D pid {spec_d.pid} (awake) front pid {fp.pid}; state {state_path(state)}; /root/current_boot.log -> {front_log}")
@@ -20844,11 +20878,11 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
 
 
 def state_path(state: BootState) -> str:
-    return f"{GPU_ARB}/weg2/boot_{state.tag}.json"
+    return _operator_dir(GPU_ARB, f"boot_{state.tag}.json")
 
 
 def _write_state(state: BootState) -> None:
-    os.makedirs(f"{GPU_ARB}/weg2", exist_ok=True)
+    os.makedirs(_operator_dir(GPU_ARB), exist_ok=True)
     with open(state_path(state), "w") as f:
         json.dump(state.__dict__, f, indent=1, default=str)
 

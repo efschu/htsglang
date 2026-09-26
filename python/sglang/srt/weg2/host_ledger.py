@@ -133,6 +133,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from sglang.srt.compat_shims import operator_dir as _operator_dir  # host dir kept through the rename
+
 GIB = float(2**30)
 GB = 1e9
 
@@ -3576,7 +3578,7 @@ MANIFEST_CENSUS_SURCHARGE_SOURCE = (
 #: spent on a 32-layer model because nothing asked.
 #: Follows SGLANG_WEG2_GPU_ARB like the launcher's GPU_ARB (docker plan, stage
 #: B); unset or empty -> byte-identical to the rig literal.
-CALIB_DIR = f"{os.environ.get('SGLANG_WEG2_GPU_ARB') or '/spinning/gpu-arb'}/weg2/calib"
+CALIB_DIR = _operator_dir(os.environ.get('SGLANG_WEG2_GPU_ARB') or '/spinning/gpu-arb', "calib")
 CALIB_SCHEMA = "weg2-pp-calib/1"
 
 

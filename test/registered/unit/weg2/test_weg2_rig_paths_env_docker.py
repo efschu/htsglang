@@ -28,6 +28,9 @@ import sys
 TREE = pathlib.Path(__file__).resolve().parents[4]
 PYTHON_DIR = TREE / "python"
 TMS_SCRIPT = TREE / "scripts" / "weg2" / "tms" / "build_tms_preload.sh"
+#: the operator subdirectory under the gpu-arb root is a HOST path and keeps its name through the
+#: rename (compat_shims.operator_dir); written split so the mechanical pass leaves it alone
+_OP = "we" "g2"
 
 #: The literals as they stood before stage B (launcher.py, host_ledger.py,
 #: corridor_budget.py at 5a3f533f0f).
@@ -102,15 +105,15 @@ def test_every_path_follows_its_variable():
     assert got == {
         "EVIDENCE_DIR": "/img/evidence",
         "GPU_ARB": "/img/arb",
-        "DUPLEX_PROBE_DEFAULT": "/img/arb/weg2/PROBE_RING_0907.md",
+        "DUPLEX_PROBE_DEFAULT": "/img/arb/" + _OP + "/PROBE_RING_0907.md",
         "DEADMAN": "/opt/tools/boot_deadman.sh",
         "MEMTS": "/opt/tools/mem_timeseries.sh",
         "HOST_PREFLIGHT": "/opt/tools/host_ledger_preflight.sh",
         "STORE_ROOT": "/img/store",
         "SHM_ARCHIVE_ROOT": "/img/arb/shm_residue",
         "VENV_DEFAULT": "/opt/venv",
-        "CALIB_DIR": "/img/arb/weg2/calib",
-        "DEFAULT_SAMPLE_PATH": "/img/arb/weg2/corridor_budget_sample.json",
+        "CALIB_DIR": "/img/arb/" + _OP + "/calib",
+        "DEFAULT_SAMPLE_PATH": "/img/arb/" + _OP + "/corridor_budget_sample.json",
     }
 
 
@@ -148,6 +151,6 @@ def test_tms_script_defaults_unchanged_without_variables():
 
 def test_tms_script_follows_variables():
     assert _tms_defaults(SGLANG_WEG2_VENV="/opt/venv", SGLANG_WEG2_GPU_ARB="/img/arb") == (
-        "/opt/venv", "/img/arb/weg2/tms")
+        "/opt/venv", "/img/arb/" + _OP + "/tms")
     assert _tms_defaults(SGLANG_WEG2_GPU_ARB="/img/arb",
                          SGLANG_WEG2_TMS_OUT_DIR="/opt/tms")[1] == "/opt/tms"

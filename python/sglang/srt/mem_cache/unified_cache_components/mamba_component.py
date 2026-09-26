@@ -79,12 +79,15 @@ _1469_N = 0
 _1469_CAP = 600
 
 
-def _1469_note(kind: str, **kw) -> None:
-    """#1469: one line per retention/free/evict event, first 600 per process."""
+def _1469_note(kind: str, _uncapped: bool = False, **kw) -> None:
+    """#1469: one line per retention/free/evict event, first 600 per process.
+    ``_uncapped`` (prefix trace, IN 26.09.: the traced EVICT) bypasses the cap
+    and does not spend it."""
     global _1469_N
-    _1469_N += 1
-    if _1469_N > _1469_CAP:
-        return
+    if not _uncapped:
+        _1469_N += 1
+        if _1469_N > _1469_CAP:
+            return
     try:
         logger.info("#1469 %s %s", kind, " ".join(f"{k}={v}" for k, v in kw.items()))
     except Exception:  # noqa: BLE001

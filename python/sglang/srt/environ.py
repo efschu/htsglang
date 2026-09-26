@@ -329,6 +329,14 @@ class Envs:
     # flattened memory_stats() -- the same number without the Python flatten
     # (~0.7 ms per DFLASH round on D). Off = torch.cuda.max_memory_allocated().
     SGLANG_VRAM_PEAK_FAST_READ = EnvBool(False)
+    # INT8 W8A8 small-M GEMM on sm_120 (27b-int8tri 26.09.): route
+    # CompressedTensorsW8A8Int8.apply_weights through the Triton kernel with
+    # exact int32 split-K (layers/quantization/int8_sm120_triton.py) when the
+    # device is sm_120, M <= 16, bias-free bf16, and (N, K) is in the table
+    # measured on the 5090 (int8_mm_sweep 20260926T171511Z). Every other
+    # call, and every other device, stays on sgl_kernel.int8_scaled_mm.
+    # Off = the sgl call only, byte-identical.
+    SGLANG_INT8_SM120_TRITON = EnvBool(False)
 
     # Downgrade the draft-model unloaded-parameter check (#290/#318) from a
     # hard error to a log line. An unloaded drafter proposes noise, so this is
@@ -1039,6 +1047,15 @@ class Envs:
     # gap (a Claude-Code turn's second request, +~155 tokens on the first,
     # arriving while the first decodes). Off = presence only at leg-2 finish.
     SGLANG_WEG2_FRONT_SPAN_INFLIGHT = EnvBool(False)
+    # Prefix trace (IN 26.09., weg2/prefix_trace.py): every prefix miss of an
+    # agent-load boot gets a token receipt -- one #1420 WALK-STOP line per
+    # (rid, stop depth) whose unmatched rest is >= the minimum below, full
+    # rids and no 8/256 sampling in #1400/#1416*, #1442 REG and #1040 EXTENT
+    # unsampled, #1469 EVICT / #1427 ARENA-DROP uncapped with parent node and
+    # page/slot keys. Never a line on the decode round path. Off = the
+    # sampled instruments exactly as before.
+    SGLANG_WEG2_PREFIX_TRACE = EnvBool(False)
+    SGLANG_WEG2_PREFIX_TRACE_MIN_TOKENS = EnvInt(1024)
     # UNIFY S7 (27B RC7-X, 7f81f09daf/e28c450a0d/0e8faa7178): the front half of
     # the 27B busy/idle split beyond the shared X-SOLO band -- a band request
     # the singleton rule sent to P is marked deferred and served on D by the

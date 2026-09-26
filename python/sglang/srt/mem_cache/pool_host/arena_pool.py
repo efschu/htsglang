@@ -38,6 +38,7 @@ from sglang.jit_kernel.hicache import (
 
 from sglang.srt.mem_cache.pool_host.base import NO_KV_RANK_TOKENS
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.weg2 import prefix_trace as _prefix_trace
 
 logger = logging.getLogger(__name__)
 
@@ -1081,7 +1082,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if bool(bad.any()):
             if bool((st == 4).any()):
                 # H81 (27B 479f6eccb0): room in C, no disk round in the claim
-                self._evict_for_claim(arena, int((st == 4).sum()))
+                self._evict_for_claim(arena, int((st == 4).sum()),
+                                      claim_stem=stems[0] if stems else None)
                 redo = np.nonzero(st == 4)[0]
                 s2, st2, g2 = arena.claim_slots_np([stems[int(i)] for i in redo], [self._page_bytes] * int(redo.size))
                 slots[redo] = s2; st[redo] = st2; gens[redo] = g2
@@ -1205,7 +1207,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         Returns the references dropped."""
         return ArenaMHAHostPool.release_queued_rows(self, host_indices)
 
-    def _evict_for_claim(self, arena, need: int) -> int:
+    def _evict_for_claim(self, arena, need: int, claim_stem: Optional[str] = None) -> int:
         """H81 (27B 479f6eccb0): make room for a claim that found no free
         slot -- free the ``need`` oldest UNREFERENCED complete slots (the
         arena clock, second chance) WITHOUT writing them to disk. Returns how
@@ -1237,7 +1239,17 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             return 0
         k = getattr(ArenaMHAHostPool, "_1427_drop_n", 0) + 1
         ArenaMHAHostPool._1427_drop_n = k
-        if k <= 8 or k % 256 == 0:
+        if _prefix_trace.on():
+            # Prefix trace (IN 26.09.): uncapped, and joinable -- `dropped` are
+            # the evicted slots' key128 low words (hex; key128 = blake2b-16 of
+            # the store stem, hicache_arena.key128), `claim` the first stem of
+            # the claim that needed the room. The keys are already in hand.
+            logger.info("#1427 ARENA-DROP n=%d need=%d freed=%d slot_bytes=%d trace=1 "
+                        "claim=%s dropped=%s (claim-time room without disk I/O -- H81)",
+                        k, need, len(cands), int(getattr(arena, "slot_bytes", 0) or 0),
+                        (str(claim_stem)[:80] if claim_stem else "-"),
+                        ",".join("%016x" % (int(c[1]) & 0xFFFFFFFFFFFFFFFF) for c in cands))
+        elif k <= 8 or k % 256 == 0:
             logger.info("#1427 ARENA-DROP n=%d need=%d freed=%d slot_bytes=%d (claim-time room "
                         "without disk I/O -- H81, user rule 24.09.: no copy in the compute path)",
                         k, need, len(cands), int(getattr(arena, "slot_bytes", 0) or 0))
@@ -1264,7 +1276,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if any(st in (3, 4) for _, st, _ in got):
             if any(st == 4 for _, st, _ in got):
                 # H81 (27B 479f6eccb0): room in C, no disk round in the claim
-                self._evict_for_claim(arena, sum(1 for _, st, _ in got if st == 4))
+                self._evict_for_claim(arena, sum(1 for _, st, _ in got if st == 4),
+                                      claim_stem=stems[0] if stems else None)
                 redo = [i for i, (_, st, _) in enumerate(got) if st == 4]
                 again = arena.claim_slots([stems[i] for i in redo], [self._page_bytes] * len(redo))
                 for i, g in zip(redo, again):

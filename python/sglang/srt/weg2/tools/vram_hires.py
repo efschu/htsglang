@@ -147,7 +147,9 @@ class NvmlSource:
 # Rollen-Zuordnung pid -> P:PP0 / D:TP1 / ?:<comm>
 # --------------------------------------------------------------------------
 
-_RX_SCHED = re.compile(r"sglang::scheduler_(PP|TP)(\d+)")
+#: Rename transition: the scheduler title of either package generation (old and new name
+#: written split, so the mechanical rename leaves both in place; RENAME_PLAN 8.15).
+_RX_SCHED = re.compile(r"(?:%s|%s)::scheduler_(PP|TP)(\d+)" % ("sg" "lang", "fl" "liper"))
 _RX_TAG = re.compile(r"--tag (\S+)")
 
 

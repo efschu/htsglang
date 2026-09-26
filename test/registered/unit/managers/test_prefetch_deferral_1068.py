@@ -217,6 +217,9 @@ class _Intake:
     # too). Missing since the unified base a3b9479f29: every intake raised
     # AttributeError, 31 tests red behind "retry() exceed maximum" (UN6 26.09.).
     _ple_admit_on_intake = lambda self, req: None  # noqa: E731
+    # NF H91c3-2: a hand-off arriving after the D park is held behind it;
+    # this double is no parked group D, so nothing is ever held here.
+    _weg2_d_park_hold_late = lambda self, req: False  # noqa: E731
 
     def _stall_witness(self, req):
         """#1317k stand-in (installed per test): every retry is a no-progress

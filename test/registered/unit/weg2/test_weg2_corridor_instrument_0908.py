@@ -666,7 +666,10 @@ class TheProseLineIsRealTest(unittest.TestCase):
 
     def test_rg6_front_log_contains_the_prose_line(self):
         with open(self._log(), errors="replace") as f:
-            hits = [ln for ln in f if "front carries no WEG2-CORRIDOR" in ln]
+            # the log is evidence written before the rename: either spelling (name_compat 1a)
+            from sglang.srt.name_compat import has_marker
+
+            hits = [ln for ln in f if has_marker(ln, "front carries no WEG2-CORRIDOR")]
         self.assertEqual(len(hits), 1, "the trigger line is not in the rg6 log")
         self.assertIsNone(ring_table._corridor_sample_phase(hits[0]))
 
