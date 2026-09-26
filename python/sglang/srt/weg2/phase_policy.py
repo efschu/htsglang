@@ -227,3 +227,13 @@ def park_late_hold(status: int, text: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return isinstance(js, dict) and js.get("late_hold") is True
+
+
+def d_phase_seats(handoff_n: int, parked_n: int, d_bs: int) -> int:
+    """H91c3-3: the D phase's seat count n the wake of D fixes (H95) -- the
+    very function D applies to the same two integers
+    (``d_seats.phase_seats``), with the front's ``--d-bs`` as the cap (the
+    launcher checks it against D's --max-running-requests)."""
+    from sglang.srt.weg2.d_seats import phase_seats
+
+    return phase_seats(handoff_n, parked_n, cap=d_bs).n

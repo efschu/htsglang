@@ -16,6 +16,13 @@ the NF standard form H91 (desk play-through, no GPU, no model).
   window, then W1b aborted it). D now holds every new arrival between the
   park and the sleep behind the park and says so (``late_hold``); the front
   counts its in-flight hand-offs as parked.
+* H91c3-3 (front): an X-route request during a D phase does not count in the
+  phase's n (H95). With n < --d-bs the front still had a seat for it, so it
+  went to D and waited there behind the H95c seat cap -- in neither the
+  front's queue nor anything the wait bound reads (with the P queue empty
+  the controller never even evaluated the bound). With the wait bound armed
+  and the phase's n seats taken, it now falls through to route BATCH: the P
+  queue, where its arrival counts in ``d_phase_wait_s``.
 """
 from __future__ import annotations
 
@@ -369,3 +376,102 @@ def test_h91c3_2_an_old_d_without_late_hold_is_drained_as_before():
             assert [s for s, _ in results] == [200, 200, 200]
 
     asyncio.run(body())
+
+
+# ================================================================ H91c3-3
+def _kv_resumes(d):
+    return [b for b in d.resume_bodies if b.get("tags") == ["kv_cache"]]
+
+
+def _seat_harness(bound_s: float = 0.6) -> Harness:
+    from test_weg2_park_wait_h91c2 import HeldD
+
+    hh = Harness(awake="P", p_concurrency=4, d_bs=4, tp_prefill_max_tokens=100_000,
+                 d_wait_bound_s=bound_s, p_phase_max_requests=6, drain_deadline_s=3.0)
+    hh.d = HeldD("D")
+    hh.d.queued_marks = {"s1"}          # D's H95c cap n = 1 keeps s1 queued (emulated)
+    return hh
+
+
+def test_h91c3_3_an_x_route_past_the_phase_seats_waits_where_the_bound_sees_it():
+    """Red on 636502eb97: s1 went to D and waited there behind the seat cap
+    n = 1; the P queue was empty, the wait bound never fired."""
+
+    async def body():
+        async with _seat_harness() as h:
+            h.d.hold = {}
+            tl = h.post("L0", chars=400_000)                    # LONG: the phase's one hand-off
+            assert await _until(lambda: h.d.running, 20)
+            assert _kv_resumes(h.d)[-1].get("handoff_n") == 1   # -> n = 1
+            assert h.front._d_phase_n == 1
+            t1 = h.post("s1")                                   # X route, the n seat is taken
+            assert await _until(lambda: h.front.counters["wait_bound_fired"] == 1, 5)
+            assert h.front.counters["route_short"] == 0
+            assert h.front.counters["short_phase_seats_full"] >= 1
+            h.d.queued_marks = set()                            # next phase: n = 2
+            assert await _until(lambda: "gen:s1" in h.p.timeline, 10)   # served via P
+            assert await _until(lambda: h.front.awake == "D" and not h.front._d_parked, 20)
+            kv = _kv_resumes(h.d)[-1]
+            assert kv.get("handoff_n") == 1 and kv.get("parked_n") == 1, kv
+            assert h.front._d_phase_n == 2
+            # s1 reaches D in the new phase, then both end (release per mark:
+            # HeldD, unlike FakeGroup, cannot serve a request after release_all)
+            assert await _until(lambda: "gen:s1" in h.d.timeline, 10)
+            h.d.release("L0")
+            h.d.release("s1")
+            results = await asyncio.wait_for(asyncio.gather(tl, t1), 20)
+            assert [s for s, _ in results] == [200, 200]
+            assert h.d.gen_marks.count("L0") == 1               # parked, never re-posted
+
+    asyncio.run(body())
+
+
+def test_h91c3_3_a_free_phase_seat_still_takes_the_x_route_on_d():
+    """The phase's hand-off is done: its seat is free, the X-route request
+    goes to D directly as before."""
+
+    async def body():
+        async with _seat_harness() as h:
+            h.d.queued_marks = set()
+            h.d.hold = {}
+            tl = h.post("L0", chars=400_000)
+            assert await _until(lambda: h.d.running, 20)
+            h.d.release("L0")
+            (s0, _) = await asyncio.wait_for(tl, 10)
+            assert s0 == 200 and h.front.awake == "D"
+            t1 = h.post("s1")
+            assert await _until(lambda: h.d.running, 10)
+            assert h.front.counters["route_short"] == 1
+            assert h.front.counters["short_phase_seats_full"] == 0
+            h.d.release_all()
+            (s1, _) = await asyncio.wait_for(t1, 10)
+            assert s1 == 200 and "gen:s1" not in h.p.timeline
+
+    asyncio.run(body())
+
+
+def test_h91c3_3_without_the_wait_bound_the_x_route_is_untouched():
+    """--d-wait-bound-s 0 (H91 part C rule 3 off): the X route as before,
+    whatever n is."""
+
+    async def body():
+        async with _seat_harness(bound_s=0.0) as h:
+            h.d.queued_marks = set()
+            h.d.hold = {}
+            tl = h.post("L0", chars=400_000)
+            assert await _until(lambda: h.d.running, 20)
+            t1 = h.post("s1")
+            assert await _until(lambda: len(h.d.running) == 2, 10)
+            assert h.front.counters["route_short"] == 1
+            assert h.front.counters["short_phase_seats_full"] == 0
+            h.d.release_all()
+            results = await asyncio.wait_for(asyncio.gather(tl, t1), 20)
+            assert [s for s, _ in results] == [200, 200]
+
+    asyncio.run(body())
+
+
+def test_h91c3_3_the_front_derives_n_with_ds_own_function():
+    assert pp.d_phase_seats(1, 0, 6) == ds.phase_seats(1, 0, cap=6).n == 1
+    assert pp.d_phase_seats(3, 6, 6) == 6          # clamped to --d-bs
+    assert pp.d_phase_seats(0, 0, 6) == 1          # at least one seat
