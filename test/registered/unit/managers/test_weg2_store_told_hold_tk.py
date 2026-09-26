@@ -172,29 +172,91 @@ def test_hold_reread_on_pp0_then_release_follower_registers_once_on_the_final_to
     assert m.admission(f, r1, lambda *a: None) == 98304
 
 
-def test_pp0_parked_at_the_wake_publishes_after_the_settle(_env):
-    """No re-read fitted into the flip: PP0's zero read parks at the wake
-    (#1471), the follower (nothing registered) releases. PP0's settle tick
-    re-reads; the told goes out only when the settle released it."""
+def test_pp0_zero_read_at_the_wake_is_read_once_more_and_published_without_a_park(_env):
+    """No re-read fitted into the flip (flip < 2 s): PP0's hold read answered
+    zero and the store has landed since. P is the PRODUCER: the wake gives
+    PP0 ONE final read of what the store holds now, releases it at once and
+    publishes when that read terminates -- no #1471 park, no 2-s poll. (The
+    shipped form parked it and re-read in the settle tick.)"""
     p0, f = _Rank(0, extent=0, n_ids=98306), _Rank(1, extent=98304, n_ids=98306)
     r0, r1 = _req("weg2-11-2", 98306), _req("weg2-11-2", 98306)
     p0.add(r0)
     f.add(r1)
+    p0.tree_cache.check_prefetch_progress("weg2-11-2")  # the zero answer
     p0.tree_cache.extent = 98304
-    assert p0.wake() == 0 and p0.weg2_post_wake_settle == [r0]
+    assert p0.wake() == 1 and p0.waiting_queue == [r0]
+    assert not getattr(p0, "weg2_post_wake_settle", None)
     assert f.wake() == 1 and f.waiting_queue == [r1]
-    assert m.pp0_publish(p0, []) == []
-    _tick_2s(r0)
-    p0._weg2_post_wake_settle_tick()  # re-reads
-    assert m.pp0_publish(p0, []) == []
-    p0._weg2_post_wake_settle_tick()  # read complete -> queued
-    assert p0.waiting_queue == [r0]
+    assert [x[1:] for x in p0.registered] == [(None, 0), (None, 0)], "one final read at the wake"
     wire = m.pp0_publish(p0, [])
     assert [w.told for w in wire] == [98304]
     m.follower_absorb(f, list(wire))
     assert [x[1] for x in f.registered] == [98305]
     assert m.admission(f, r1, lambda *a: None) == 98304
     assert m.admission(p0, r0, lambda *a: None) is not None
+
+
+AGENT_STORE = 95000
+AGENT_PROMPT = AGENT_STORE + 3000 + 1  # the store's prefix + a 3k new turn
+
+
+def test_agent_turn_pp0_publishes_right_after_the_wake(_env):
+    """THE AGENT-TURN FORM: prompt = what the store holds + 3k new tokens.
+    PP0's hold read answered zero at the intake (write-through not landed),
+    the #1456 top-up in the sleep then read the store's 95000; the prompt
+    stays 3000 tokens beyond the store for good -- P computes those itself.
+    The shipped form called that "short" after the zero answer, parked PP0 at
+    the wake and polled every 2 s until the 20-s settle bound: 20 s per turn.
+    Now: released at the wake, told published in the same pass."""
+    p0 = _Rank(0, extent=0, n_ids=AGENT_PROMPT)
+    f = _Rank(1, extent=AGENT_STORE, n_ids=AGENT_PROMPT)
+    r0, r1 = _req("weg2-12-1", AGENT_PROMPT), _req("weg2-12-1", AGENT_PROMPT)
+    p0.add(r0)
+    f.add(r1)
+    p0.tree_cache.extent = AGENT_STORE
+    _tick_2s(r0)
+    assert p0._weg2_hold_refetch() == 1  # the sleep top-up, as before
+    assert p0.wake() == 1 and p0.waiting_queue == [r0]
+    assert not getattr(p0, "weg2_post_wake_settle", None), "no park"
+    assert len(p0.registered) == 2, "no re-read after the wake: the read is final"
+    f.wake()
+    wire = m.pp0_publish(p0, [])
+    assert [w.told for w in wire] == [AGENT_STORE]
+    m.follower_absorb(f, list(wire))
+    assert m.admission(p0, r0, lambda *a: None) is not None
+    assert m.admission(f, r1, lambda *a: None) == AGENT_STORE
+
+
+class _DRank(_Rank):
+    """Group D: one TP stage (pp_size 1), no told form -- the consumer."""
+
+    def __init__(self, extent, n_ids):
+        super().__init__(0, extent, n_ids)
+        self.ps = SimpleNamespace(pp_rank=0, pp_size=1, tp_size=1)
+        self._weg2_store_told_armed = False
+
+    def add(self, req):
+        self._prefetch_kvcache(req)
+        self.weg2_dormant_hold.append(req)
+
+
+def test_d_consumer_still_parks_a_short_read_at_the_wake(_env):
+    """D is unchanged: the same agent-turn read parks at the wake and the
+    settle re-reads on its 2-s clock (the store may still be receiving P's
+    write-through; D's X gate must not price the remainder)."""
+    d = _DRank(extent=0, n_ids=AGENT_PROMPT)
+    r = _req("weg2-12-2", AGENT_PROMPT)
+    d.add(r)
+    d.tree_cache.extent = AGENT_STORE
+    _tick_2s(r)
+    assert d._weg2_hold_refetch() == 1
+    assert d.wake() == 0 and d.weg2_post_wake_settle == [r]
+    assert d.waiting_queue == []
+    d._weg2_post_wake_settle_tick()
+    assert d.weg2_post_wake_settle == [r], "still parked inside the 2-s clock"
+    _tick_2s(r)
+    d._weg2_post_wake_settle_tick()
+    assert len(d.registered) == 3, "the settle re-read, as shipped"
 
 
 def test_paced_read_ahead_leaves_only_after_the_release(_env, monkeypatch):
