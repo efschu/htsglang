@@ -4061,6 +4061,17 @@ COLLECTIVE_CENSUS_INTERVAL = 50
 P_BARLINK_BAR1_WINDOW_MIB = "24,PP_0=96"
 #: Group P's device mamba pool (--max-mamba-cache-size); see argv_p.
 P_MAX_MAMBA_CACHE_SIZE = 24
+#: H92c: the runtime's HARD FLOOR per running P request on P's posture
+#: (``mem_cache/mamba_pool_floor.mamba_slots_per_running_req``): 1 active + 1
+#: ping-pong (P runs --disable-overlap-schedule) + 1 donation + 1 pinned
+#: checkpoint (``--hicache-write-policy write_back``: no #755 reorder, so the
+#: two do not share). Measured, fnFL2h91bb2 P log:
+#: ``MAMBA-FLOOR pool=32 floor=32 retention_budget=0 (8 running requests x 4 =
+#: 32)``. Everything above ``seats x this`` is the anchor-retention budget; at 0
+#: every host backup of an anchor is refused. The planner only NAMES it on the
+#: budget-posts line (the launch/runtime riegel is AW's); a test holds this
+#: constant against the runtime function on P's posture.
+P_MAMBA_FLOOR_SLOTS_PER_SEAT = 4
 
 
 class Weg2LaunchRefused(RuntimeError):
@@ -10657,6 +10668,92 @@ def _p_page_size(model: str, p_bs: int = DEFAULT_P_BS) -> int:
         return 1
 
 
+def p_seats(ns) -> int:
+    """Group P's SEATS = its effective ``--max-running-requests``: a value in
+    ``--extra-p`` beats ``--p-bs`` (argparse keeps the last; the same rule as
+    ``p_micro_batch_flags``). One reader for the P card and the mamba floor."""
+    _mrr = _argv_scalar(getattr(ns, "extra_p", ""), "--max-running-requests")
+    try:
+        return int(_mrr) if _mrr is not None else int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
+    except (TypeError, ValueError):
+        return int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
+
+
+def p_mamba_mib_per_slot_by_stage(kinds: Sequence[str], stage_layers: Sequence[int],
+                                  mib_per_linear_layer_per_slot: float) -> Tuple[float, ...]:
+    """H92c: MiB one mamba slot costs on each P stage = price x the stage's
+    LINEAR layers, counted off the checkpoint's own ``layer_types`` over the
+    contiguous cut (Next Flash 29,11,8 -> 22/8/6 linear -> 34.29/12.47/9.35)."""
+    out: List[float] = []
+    start = 0
+    for n in stage_layers:
+        seg = list(kinds[start:start + int(n)])
+        out.append(float(mib_per_linear_layer_per_slot)
+                   * sum(1 for k in seg if str(k) != "full_attention"))
+        start += int(n)
+    return tuple(out)
+
+
+def p_mamba_floor_text(slots: int, seats: int) -> str:
+    """H92c: the runtime's hard floor against P's slots, as a named clause of
+    the budget-posts line. A WARNING, never a refusal (the riegel is AW's):
+    at retention 0 every anchor host backup is refused (fnFL2h91bb2)."""
+    floor = int(seats) * int(P_MAMBA_FLOOR_SLOTS_PER_SEAT)
+    retention = int(slots) - floor
+    text = ("mamba floor %d seats x %d = %d, retention budget %d"
+            % (int(seats), int(P_MAMBA_FLOOR_SLOTS_PER_SEAT), floor, retention))
+    if retention <= 0:
+        text += (" -- WARNUNG MAMBA-RETENTION: --max-mamba-cache-size %d <= Sitze x %d; "
+                 "jeder Host-Backup eines Ankers wird verweigert (fnFL2h91bb2 "
+                 "'MAMBA-FLOOR pool=32 floor=32 retention_budget=0'); mindestens "
+                 "Sitze x %d + Retention-Budget geben" % (
+                     int(slots), int(P_MAMBA_FLOOR_SLOTS_PER_SEAT),
+                     int(P_MAMBA_FLOOR_SLOTS_PER_SEAT)))
+    return text
+
+
+def p_mamba_slots(ns, model: str, p_bs: int) -> Tuple[int, str]:
+    """Group P's device mamba SLOTS as the boot allocates them, and the source.
+
+    H92c. The pool model charged ``ceil(--p-bs x 2 x 1.25)`` slots -- the
+    DEMAND-DRIVEN branch of the runtime's sizer -- but argv_p never lets P reach
+    that branch: it always states ``--max-mamba-cache-size`` (its own
+    ``P_MAX_MAMBA_CACHE_SIZE`` = 24, or the operator's value in ``--extra-p``,
+    which wins), and ``model_runner_kv_cache_mixin`` takes an explicit value as
+    the pool size (``Mamba Cache is allocated. max_mamba_cache_size: N``; later
+    passes only LOWER it: the world MIN-sync and ``--gdn-resident-state-slots``).
+    fnFL2h91bb2 (P_BS 8, ``--max-mamba-cache-size 32``) was charged 20 slots and
+    allocated 32 -- 411/150/112 MiB missing from the pool budget per stage;
+    x178 (P_BS 4, the default 24) was charged 10 and allocated 24.
+
+    Read off P's argv AS THIS LAUNCHER BUILDS IT, with the boot's own
+    ``--extra-p`` (the last occurrence, argparse's rule), not restated; only a
+    P argv without the flag falls back to the demand formula, which then IS the
+    runtime's branch (an upper bound on ``_auto_mamba_demand_size``, #1286 F4).
+    """
+    flags = argv_p("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG,
+                   shlex.split(str(getattr(ns, "extra_p", "") or "")), p_bs=int(p_bs),
+                   stage_ratio="", attn_stage_ratio="")
+    value = None
+    for i, tok in enumerate(flags):
+        tok = str(tok)
+        if tok == "--max-mamba-cache-size" and i + 1 < len(flags):
+            value = str(flags[i + 1])
+        elif tok.startswith("--max-mamba-cache-size="):
+            value = tok[len("--max-mamba-cache-size="):]
+    if value is not None:
+        return int(value), "--max-mamba-cache-size %d on P's argv" % int(value)
+    target = _max_running_requests(model, "P", int(p_bs))
+    per_req = int(getattr(ns, "pp_cut_mamba_slots_per_running_request",
+                          P_MAMBA_SLOTS_PER_RUNNING_REQUEST))
+    slots = math.ceil(target * per_req * P_MAMBA_AUTO_SAFETY_MARGIN)
+    return slots, (
+        "ceil(--p-bs %d x %d slots/running-request x safety %.2f), an UPPER BOUND on "
+        "_auto_mamba_demand_size incl. its hard floor (P's argv states no "
+        "--max-mamba-cache-size)" % (target, per_req, P_MAMBA_AUTO_SAFETY_MARGIN)
+    )
+
+
 def p_activation_reserve_provenance(model: str, p_bs: int = DEFAULT_P_BS) -> Tuple[float, str]:
     """What group P's boot would charge for the prefill activation reserve if
     NOTHING on this rig were calibrated -- and the line that tells you which
@@ -15064,7 +15161,8 @@ def apply_p_draft_post(ns, cards, fracs, stage_layers, row_mib: float,
 def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
                    fracs: Sequence[float], lru_rows: Sequence[int],
                    stage_layers: Sequence[int], kv_mib, num_experts: int,
-                   row_mib: float) -> None:
+                   row_mib: float, mamba_slots: int = 0,
+                   mamba_mib_per_slot: Sequence[float] = ()) -> None:
     """H41: ``PP-CUT ACTIVATION`` (T_s(chunk) je Stufe mit Quelle) und
     ``PP-CUT P-KARTE`` (Kopfraum je Stufe im Chunk-Forward); W132, wenn eine
     Stufe unter near-OOM faellt, W131 fuer einen ungemessenen Chunk.
@@ -15128,11 +15226,7 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
     # H59 FORM-SCHLUESSEL: die Sitze DIESES Boots = group P's wirksames
     # --max-running-requests (das argparse behaelt: ein --extra-p-Wert schlaegt
     # --p-bs, dieselbe Regel wie p_micro_batch_flags).
-    _mrr = _argv_scalar(getattr(ns, "extra_p", ""), "--max-running-requests")
-    try:
-        seats = int(_mrr) if _mrr is not None else int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
-    except (TypeError, ValueError):
-        seats = int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
+    seats = p_seats(ns)
     if kv_mib is None:
         log(f"{_p_card.CARD_MARKER} ENTFAELLT: kein KV-Preis je Stufe (#156 entfiel "
             f"oder --pp-cut-reserve-mib ersetzt ihn); ohne KV ist der Kopfraum "
@@ -15170,6 +15264,7 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
             near_oom_mib=float(corridor_guard.NEAR_OOM_MIB),
             prompt_tokens=tokens, lmem_fixed=lmem_fixed,
             seats=seats, co_tenant=co_tenant,
+            mamba_slots=int(mamba_slots), mamba_mib_per_slot=tuple(mamba_mib_per_slot),
         )
 
     try:
@@ -15252,6 +15347,10 @@ def solve_p_cut(
     # name, because the 27B constants priced 8 layers on rank 0 and refused
     # every cut (W40, 19.09. dry run nfdry4).
     layer_mib_by_stage: Tuple[float, ...] = ()
+    # H92c: P's mamba slots, read ONCE off P's argv (with --extra-p): the pool
+    # model's mamba post and the P card's mamba term are the same number.
+    _p_mamba_slots, _p_mamba_src = p_mamba_slots(
+        ns, model, int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS))
     _skip_140 = weg2_form.gate_skip_line(
         "#140 PP-CUT FRACTION-SOLVE", getattr(ns, "weg2_boot_form", None))
     if _skip_140 and terms.expert_layer_weight_bytes <= 0.0:
@@ -15482,6 +15581,8 @@ def solve_p_cut(
         # (FR_P[0] 0.45/0.40, Chunk 16384) passierten beides und starben im
         # ersten Chunk. Hier: gemessener Kopfraum je Stufe, verschoben um
         # Puffer, KV, die Chunk-Transiente T_s(chunk) und den Draft.
+        # H92c: und um die Mamba-Slots dieses Boots gegen die der Referenz
+        # (Slots x 1.5588 MiB x lineare Layer der Stufe).
         p_card_verdict(
             ns, cards, log,
             model=model,
@@ -15492,6 +15593,10 @@ def solve_p_cut(
             kv_mib=_kv_p,
             num_experts=int(terms.num_experts),
             row_mib=row_bytes / _pp_cut.MIB,
+            mamba_slots=int(_p_mamba_slots),
+            mamba_mib_per_slot=p_mamba_mib_per_slot_by_stage(
+                kinds, _stage_layers_for_solve,
+                float(ns.pp_cut_mamba_mib_per_linear_layer_per_slot)),
         )
     ms = _csv_floats(ns.pp_cut_measured_ms_per_layer)
     model_pool = _pp_cut.PhasePoolModel(
@@ -15566,11 +15671,14 @@ def solve_p_cut(
         # unreachable here: `_max_running_requests` raises unless the flag is
         # literally on the argv this launcher builds, so P's value is always
         # the user-set branch.
-        mamba_slots=math.ceil(
-            _max_running_requests(model, "P", int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS))
-            * int(ns.pp_cut_mamba_slots_per_running_request)
-            * P_MAMBA_AUTO_SAFETY_MARGIN
-        ),
+        #
+        # H92c: and the demand branch is not the one P takes. argv_p ALWAYS
+        # states --max-mamba-cache-size (24, or the arm's --extra-p value), and
+        # an explicit value IS the pool: fnFL2h91bb2 was charged 20 slots here
+        # and allocated 32 ('Mamba Cache is allocated. max_mamba_cache_size:
+        # 32'), x178 10 against 24. p_mamba_slots reads P's argv and keeps the
+        # bound above only for an argv without the flag.
+        mamba_slots=int(_p_mamba_slots),
         # #1286 F7: the sizer's second floor. Read off P's argv for the same
         # reason as the target above -- a second copy would drift the day
         # --page-size moves.
@@ -15873,9 +15981,7 @@ def solve_p_cut(
     log(
         "PP-CUT budget posts (the boot's own list, MiB/rank): "
         "weights+runtime = %.1f/layer x n + stage_fixed %s; corridor holdback "
-        "%.1f; mamba %.4f/linear-layer/slot x %d slots (ceil(--p-bs %d x %d "
-        "slots/running-request x safety %.2f), an UPPER BOUND on "
-        "_auto_mamba_demand_size incl. its hard floor); speculative "
+        "%.1f; mamba %.4f/linear-layer/slot x %d slots (%s; %s); speculative "
         "intermediate %.1f; prefill activation reserve %.1f; mamba pre-capture "
         "reserve %.1f; page_size %d. Zero posts ACKNOWLEDGED (absent from both "
         "reference boots' emitted lists, not merely unmeasured): %s. Every one "
@@ -15888,9 +15994,8 @@ def solve_p_cut(
             float(model_pool.corridor_holdback_mib or 0.0),
             float(model_pool.mamba_mib_per_linear_layer_per_slot),
             int(model_pool.mamba_slots),
-            int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS),
-            int(ns.pp_cut_mamba_slots_per_running_request),
-            P_MAMBA_AUTO_SAFETY_MARGIN,
+            _p_mamba_src,
+            p_mamba_floor_text(int(model_pool.mamba_slots), p_seats(ns)),
             float(model_pool.speculative_intermediate_mib),
             float(model_pool.activation_reserve_mib),
             float(model_pool.mamba_precapture_reserve_mib),
@@ -16046,10 +16151,11 @@ def solve_p_cut(
         "this pool model's error FOR THIS CUT and belongs in the boot record; "
         "it was +64.1%% before #1286 and the residual the posts carry now is "
         "the two-boot spread of --pp-cut-stage-fixed-mib (<=12.7 MiB/rank). "
-        "SECOND JOIN, same discipline: mamba_slots is an UPPER BOUND on the "
-        "boot's '[auto-mamba] ... -> max_mamba_cache_size=N slots', so N <= "
-        "%d must hold; N above it means the mamba post is under-charged and "
-        "the pool over-priced (#1286 F4)."
+        "SECOND JOIN, same discipline: mamba_slots is P's --max-mamba-cache-size "
+        "(H92c; the demand bound only for an argv without it) against the boot's "
+        "'Mamba Cache is allocated. max_mamba_cache_size: N', so N <= %d must "
+        "hold; N above it means the mamba post is under-charged and the pool "
+        "over-priced (#1286 F4)."
         % (
             str(ns.pp_solve_objective),
             ",".join(str(n) for n in chosen.layers),

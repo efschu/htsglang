@@ -5,6 +5,9 @@
 [2026-09-24 19:12:29 PP2] KV pool sizing: available_bytes=4442357760 (4.137 GiB), cell_size=2176, page_size=64 -> max_total_num_tokens=2041472
 [2026-09-24 19:12:29 PP1] KV pool sizing: available_bytes=2642149376 (2.461 GiB), cell_size=3264, page_size=64 -> max_total_num_tokens=809472
 [2026-09-24 19:12:29 PP0] KV pool sizing: available_bytes=3573547008 (3.328 GiB), cell_size=7616, page_size=64 -> max_total_num_tokens=469184
+[2026-09-24 19:12:29 PP2] Mamba Cache is allocated. max_mamba_cache_size: 24, conv_state size: 0.01GB, ssm_state size: 0.22GB 
+[2026-09-24 19:12:29 PP1] Mamba Cache is allocated. max_mamba_cache_size: 24, conv_state size: 0.01GB, ssm_state size: 0.29GB 
+[2026-09-24 19:12:29 PP0] Mamba Cache is allocated. max_mamba_cache_size: 24, conv_state size: 0.03GB, ssm_state size: 0.81GB 
 [2026-09-24 19:12:30 PP2] max_total_num_tokens=262144, chunked_prefill_size=16384, max_prefill_tokens=16384, max_running_requests=4, context_len=262144, available_gpu_mem=8.73 GB
 [2026-09-24 19:12:30 PP1] max_total_num_tokens=262144, chunked_prefill_size=16384, max_prefill_tokens=16384, max_running_requests=4, context_len=262144, available_gpu_mem=6.15 GB
 [2026-09-24 19:12:30 PP0] max_total_num_tokens=262144, chunked_prefill_size=16384, max_prefill_tokens=16384, max_running_requests=4, context_len=262144, available_gpu_mem=7.54 GB
