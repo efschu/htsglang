@@ -70,6 +70,8 @@ from typing import (
 from sglang.srt.environ import envs
 from sglang.srt.managers import corridor_guard
 from sglang.srt.planner import p_card_chunk as _p_card
+# #48b: die Experten-Fractions aus der gemessenen Retry-Kante (statt Profil-Pins).
+from sglang.srt.planner import expert_rows_auto as _rows_auto
 # fnFL2 H57: das Power-Limit je Karte (Startzeile, Referenz-Datierung, Raten-Schnitt).
 from sglang.srt.planner import power_limit as _power
 from sglang.srt.registry import nvml as nvml_registry
@@ -12208,7 +12210,14 @@ def solve_p_cut(
         # before anything is priced, and the raised fraction is written back
         # to all three places FR_P lives (weg2/draft_post.py).
         ns._expert_row_mib = row_bytes / _pp_cut.MIB
-        if str(getattr(ns, "draft_kv_on_p", "on")) == "off":
+        if getattr(ns, "_expert_rows_auto_p", False):
+            # #48b: the auto rows ARE the measured card of a draft-free P
+            # (the reference's buffer already carries the H25 post, x177
+            # PP2 buffer=408); adding the post again would count it twice.
+            log("PP-CUT draft post (H25) ENTFAELLT: FR_P kommt aus %s (Retry-Kante "
+                "der gemessenen Karte, H25-Form der Referenz), der Posten steckt "
+                "darin" % _rows_auto.MARKER)
+        elif str(getattr(ns, "draft_kv_on_p", "on")) == "off":
             fracs = apply_p_draft_post(ns, cards, fracs, _stage_layers_for_solve,
                                        row_bytes / _pp_cut.MIB,
                                        int(terms.num_experts), log)
@@ -13331,6 +13340,16 @@ def build_parser() -> argparse.ArgumentParser:
              "wachsenden Chunk der Referenz (fnFL2x160: Chunk 3, gemessen ueber "
              "16 Chunks); ein Prompt laenger als der laengste der Referenz heisst "
              "HOCHRECHNUNG. 0 = der volle Kontext (262144).")
+    ap.add_argument(
+        "--expert-rows-reference-logs", default="",
+        help="#48b: P.log[,P.log...] gemessener Boots DERSELBEN Form (der D.log "
+             "liegt daneben). Fehlt eine Experten-Fraction (--pp-cut-expert-device-"
+             "fraction bzw. --rank-moe-resident-fraction in --extra-d) oder steht "
+             "dort 'auto', loest der Planer die Zeilen je Rang aus der Retry-Kante "
+             "dieser Logs (EXPERT-ROWS-AUTO: [vram-peak] card_free + alloc_retries) "
+             "und setzt die Fraction an ALLEN Stellen der Gruppe, bevor ein Leser "
+             "sie sieht. Ein gegebener Vektor bleibt ein Override (Zeile OVERRIDE, "
+             "Planer-Schuld #48). Leer = keine auto-Loesung (wie bisher).")
     ap.add_argument(
         "--wake-credit-reference-logs", default="",
         help="H14: P.log,D.log,front.log EINES Boots, dessen erster Wake (D->P) "
@@ -14508,6 +14527,164 @@ def apply_profile_d_seat_vram_default(ns) -> Optional[str]:
             "--env-d SGLANG_OPT_WEG2_D_SEAT_VRAM=0 = H95 B)" % item)
 
 
+_FR_FLAG = "--rank-moe-resident-fraction"
+_FR_ENV = "SGLANG_MOE_RESIDENT_EXPERT_FRACTION"
+
+
+def _group_fraction_state(values) -> Tuple[List[str], bool]:
+    """(gegebene Werte, 'auto' woertlich) ueber die Stellen EINER Gruppe."""
+    given = [str(v).strip() for v in values
+             if v is not None and not _rows_auto.is_auto(v)]
+    literal = any(v is not None and str(v).strip().lower() == "auto" for v in values)
+    return given, literal
+
+
+def _scratch_vector(env: Mapping[str, str], fallback: str, n: int) -> List[int]:
+    raw = str(env.get("SGLANG_MOE_SCRATCH_SLOTS", "") or "").strip() or str(fallback or "").strip()
+    vals = [int(round(float(x))) for x in raw.split(",") if x.strip()]
+    if len(vals) == 1:
+        vals = vals * n
+    return vals
+
+
+def apply_expert_rows_auto(ns, log) -> None:
+    """#48b: die Experten-Fraction je Gruppe vom PLANER, nicht aus dem Profil.
+
+    Fehlt der Vektor einer Gruppe an allen ihren Stellen (P:
+    ``--pp-cut-expert-device-fraction``, ``--extra-p --rank-moe-resident-
+    fraction``, ``--env-p SGLANG_MOE_RESIDENT_EXPERT_FRACTION``; D: die beiden
+    ``-d``-Stellen) oder steht dort ``auto``, rechnet
+    :func:`expert_rows_auto.solve_group` die Zeilen je Rang aus der Retry-Kante
+    der ``--expert-rows-reference-logs`` und schreibt die Fraction an ALLE
+    Stellen -- vor ``resolve_form`` und jedem anderen Leser. Ein gegebener
+    Vektor gilt als Override und wird nur neben auto gedruckt. ``auto`` ohne
+    Referenz, eine fremde Form oder ein Widerspruch zwischen den Stellen
+    verweigert (W160) mit Namen."""
+    import shlex as _sh
+
+    refs = [p.strip() for p in str(getattr(ns, "expert_rows_reference_logs", "") or "").split(",")
+            if p.strip()]
+    env_p = parse_group_env(getattr(ns, "env_p", "") or "")
+    env_d = parse_group_env(getattr(ns, "env_d", "") or "")
+    extra_p = str(getattr(ns, "extra_p", "") or "")
+    extra_d = str(getattr(ns, "extra_d", "") or "")
+    p_vals = [getattr(ns, "pp_cut_expert_device_fraction", None) or None,
+              _rows_auto.flag_value(extra_p, _FR_FLAG, shlex_split=_sh.split),
+              env_p.get(_FR_ENV)]
+    d_vals = [_rows_auto.flag_value(extra_d, _FR_FLAG, shlex_split=_sh.split), env_d.get(_FR_ENV)]
+    groups = {"P": _group_fraction_state(p_vals), "D": _group_fraction_state(d_vals)}
+    for g, (given, literal) in groups.items():
+        if given and literal:
+            raise Weg2LaunchRefused(
+                "%s %s: die Stellen der Gruppe widersprechen sich -- 'auto' neben %s. "
+                "Entweder alle Stellen auto/leer oder ein Override an allen."
+                % (_rows_auto.REFUSAL_CODE, g, given))
+        if len(set(given)) > 1:
+            raise Weg2LaunchRefused(
+                "%s %s: verschiedene Vektoren an den Stellen der Gruppe %s (argv-Doppelung)"
+                % (_rows_auto.REFUSAL_CODE, g, sorted(set(given))))
+    if not refs:
+        bad = [g for g, (given, literal) in groups.items() if literal]
+        if bad:
+            raise Weg2LaunchRefused(
+                "%s %s: 'auto' verlangt, aber --expert-rows-reference-logs ist leer"
+                % (_rows_auto.REFUSAL_CODE, bad))
+        return
+    from sglang.srt.planner import pp_cut as _pp_cut
+
+    terms = _pp_cut.checkpoint_weight_terms(ns.model)
+    if terms.expert_layer_weight_bytes <= 0.0:
+        log("%s ENTFAELLT: %s traegt keine MoE-Experten" % (_rows_auto.MARKER, ns.model))
+        return
+    E_all = int(terms.num_experts)
+    slot_mib = float(terms.expert_layer_weight_bytes) / E_all / float(1 << 20)
+    n_layers = int(terms.n_layers)
+    texts_p, texts_d = [], []
+    for path in refs:
+        with open(path, errors="replace") as fh:
+            texts_p.append((os.path.basename(path), fh.read()))
+        d_path = path[: -len(".P.log")] + ".D.log" if path.endswith(".P.log") else ""
+        if d_path and os.path.isfile(d_path):
+            with open(d_path, errors="replace") as fh:
+                texts_d.append((os.path.basename(d_path), fh.read()))
+    solved: Dict[str, "_rows_auto.GroupAuto"] = {}
+    # --- P: PP-Stufen, jede haelt alle Experten ihrer Layer
+    ratio_p = _csv_floats(str(getattr(ns, "pp_stage_ratio", "") or "")) or []
+    if ratio_p and int(round(sum(ratio_p))) == n_layers:
+        layers_p = [int(round(x)) for x in ratio_p]
+        _mrr = _argv_scalar(extra_p, "--max-running-requests")
+        seats_p = int(_mrr) if _mrr is not None else int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
+        gp = _rows_auto.solve_group(
+            group="P", reference_texts=texts_p, tag="PP", phases=_rows_auto.P_PHASES,
+            slot_mib=slot_mib, local_experts=[E_all] * len(layers_p), layers=layers_p,
+            scratch=_scratch_vector(env_p, getattr(ns, "pp_cut_expert_lru_rows", ""), len(layers_p)),
+            seats=seats_p, chunk=int(P_CHUNKED_PREFILL_TOKENS))
+        if str(getattr(ns, "draft_kv_on_p", "off")) == "on":
+            gp = _rows_auto._refused("P", "--draft-kv-on-p on: die Referenz ist die H25-Form "
+                                     "(Draft nicht auf P), die Karte mit Draft ist ungemessen")
+    else:
+        gp = _rows_auto._refused("P", "--pp-stage-ratio %r ist nicht die Layerzahl je Stufe "
+                                 "(Summe != %d)" % (getattr(ns, "pp_stage_ratio", ""), n_layers))
+    solved["P"] = gp
+    # --- D: TP-Raenge, Experten nach dem VERHAELTNIS --rank-moe-ratio (+1 Pad)
+    ratios_d = [float(x) for x in (_argv_vector(extra_d, "--rank-moe-ratio") or [])]
+    if ratios_d and texts_d:
+        e_d = _rows_auto.ratio_spans(E_all, ratios_d, pad=1)
+        _mrr = _argv_scalar(extra_d, "--max-running-requests")
+        seats_d = int(_mrr) if _mrr is not None else int(getattr(ns, "d_bs", DEFAULT_D_BS) or DEFAULT_D_BS)
+        gd = _rows_auto.solve_group(
+            group="D", reference_texts=texts_d, tag="TP", phases=_rows_auto.D_PHASES,
+            slot_mib=slot_mib, local_experts=e_d, layers=[n_layers] * len(e_d),
+            scratch=_scratch_vector(env_d, "", len(e_d)), seats=seats_d)
+    else:
+        gd = _rows_auto._refused("D", "keine --rank-moe-ratio in --extra-d" if not ratios_d
+                                 else "kein D.log neben %s" % refs)
+    solved["D"] = gd
+    for g, ga in solved.items():
+        given, _literal = groups[g]
+        if given:
+            if ga.refusal is None:
+                for ln in ga.lines:
+                    log(ln)
+                n = len(ga.rows)
+                if g == "P":
+                    E_g = [E_all] * n
+                    S_g = _scratch_vector(env_p, getattr(ns, "pp_cut_expert_lru_rows", ""), n)
+                    row_g = [x * slot_mib for x in [int(round(v)) for v in ratio_p]]
+                else:
+                    E_g = _rows_auto.ratio_spans(E_all, ratios_d, pad=1)
+                    S_g = _scratch_vector(env_d, "", n)
+                    row_g = [n_layers * slot_mib] * n
+                pinned = _rows_auto.fractions_of(given[0])
+                if len(pinned) == n:
+                    log(_rows_auto.pin_delta_line(g, ga, pinned, E_g, S_g, row_g))
+            else:
+                log("%s %s OVERRIDE %s (Hand-Pin, Planer-Schuld #48); auto entfaellt: %s"
+                    % (_rows_auto.MARKER, g, given[0], ga.refusal))
+            continue
+        if ga.refusal is not None:
+            for ln in ga.lines:
+                log(ln)
+            raise Weg2LaunchRefused(ga.refusal)
+        for ln in ga.lines:
+            log(ln)
+        vec = list(ga.fractions)
+        text = ",".join(_rows_auto._fmt(x) for x in vec)
+        if g == "P":
+            ns.pp_cut_expert_device_fraction = text
+            ns.extra_p = _rows_auto.set_flag(ns.extra_p, _FR_FLAG, vec,
+                                             shlex_split=_sh.split, shlex_join=_sh.join)
+            ns.env_p = _rows_auto.set_env(getattr(ns, "env_p", ""), _FR_ENV, vec)
+            ns._expert_rows_auto_p = True
+            where = "--pp-cut-expert-device-fraction, --extra-p %s, --env-p %s" % (_FR_FLAG, _FR_ENV)
+        else:
+            ns.extra_d = _rows_auto.set_flag(ns.extra_d, _FR_FLAG, vec,
+                                             shlex_split=_sh.split, shlex_join=_sh.join)
+            ns.env_d = _rows_auto.set_env(getattr(ns, "env_d", ""), _FR_ENV, vec)
+            where = "--extra-d %s, --env-d %s" % (_FR_FLAG, _FR_ENV)
+        log("%s %s FR %s (published to %s)" % (_rows_auto.MARKER, g, text, where))
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global _ACTIVE_BOOT_STATE
     # #1248: unclaimed until a BootState exists below -- a stale pointer from
@@ -14524,6 +14701,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _h95c_line = apply_profile_d_seat_vram_default(ns)
     if _h95c_line:
         print(_h95c_line, flush=True)
+    # #48b: the expert fractions, solved from the measured retry edge BEFORE
+    # the form resolver and every other reader (three places per group).
+    if not ns.teardown:
+        apply_expert_rows_auto(ns, lambda s: print("WEG2-LAUNCH " + s, flush=True))
     # WEG2-FORM: resolved ONCE, before apply_spec_form (--form-draft and
     # --form-p-draft may drive --spec-form / --draft-kv-on-p /
     # --dflash-produce-on-p), and PUBLISHED into this process's own environment
