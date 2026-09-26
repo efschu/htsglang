@@ -795,6 +795,7 @@ P_PREFILL_GRAPH_POLICY_DEFAULT = "auto"
 _P_PREFILL_GRAPH: Dict[str, object] = {
     "bucket": P_PREFILL_GRAPH_DEFAULT, "tiny": (), "captured": (), "legacy": (),
     "policy": P_PREFILL_GRAPH_POLICY_DEFAULT, "verdicts": (), "calibration": None, "lines": (),
+    "extras": (), "min_gain": None, "cut_check": None,
 }
 
 
@@ -818,19 +819,65 @@ def apply_p_prefill_graph(ns) -> None:
     except ValueError:
         raise SystemExit(f"--p-prefill-graph-buckets {raw_extra!r}: comma list of token counts expected")
     cal = p_prefill_graph_calibration_of(ns)
+    min_gain = float(getattr(ns, "p_prefill_graph_min_gain", _pgp.DEFAULT_MIN_GAIN))
+    legacy = tuple(sorted(set(_P_PREFILL_GRAPH["tiny"]) | {bucket})) if bucket else ()
+    _P_PREFILL_GRAPH.update(policy=policy, legacy=legacy, extras=extras, min_gain=min_gain,
+                            cut_check=None)
+    _p_prefill_graph_decide(cal)
+
+
+def _p_prefill_graph_decide(cal) -> None:
+    """The policy's answer for the installed switch and ``cal`` (None = no
+    table); shared by the install and the cut check's fallback."""
+    from sglang.srt.weg2 import p_graph_policy as _pgp
+
+    g = _P_PREFILL_GRAPH
+    policy, bucket = str(g["policy"]), int(g["bucket"])
     try:
-        captured, verdicts = _pgp.decide(policy, bucket, _P_PREFILL_GRAPH["tiny"], extras, cal,
-                                         P_PREFILL_GRAPH_STAGES,
-                                         float(getattr(ns, "p_prefill_graph_min_gain",
-                                                       _pgp.DEFAULT_MIN_GAIN)))
+        captured, verdicts = _pgp.decide(policy, bucket, g["tiny"], g["extras"], cal,
+                                         P_PREFILL_GRAPH_STAGES, float(g["min_gain"]))
     except _pgp.GraphPolicyError as exc:
         raise SystemExit(str(exc))
-    legacy = tuple(sorted(set(_P_PREFILL_GRAPH["tiny"]) | {bucket})) if bucket else ()
-    _P_PREFILL_GRAPH.update(
-        policy=policy, captured=tuple(captured), legacy=legacy, verdicts=tuple(verdicts),
-        calibration=cal,
+    g.update(
+        captured=tuple(captured), verdicts=tuple(verdicts), calibration=cal,
         lines=tuple(_pgp.decision_lines(policy, captured, verdicts, cal)) if bucket else (),
     )
+
+
+def p_prefill_graph_cut_check(ns, cut, log) -> bool:
+    """The calibration table's P cut against the cut this boot SHIPS (Agent
+    PG2 26.09.; graphcal_int8 was measured with G 43,11,10 against E
+    44,10,10 and was therefore no measurement). Called ONCE in the launcher
+    right after solve_p_cut, before any rank starts, so every P rank runs
+    the same verdict (raenge-nie-uneins): the ranks only ever see the
+    captured set and the chunk spec this function leaves behind.
+
+    No table or the switch off: nothing, no line (byte-identical). The table
+    names no cut: a WARNING line, the table stays. A different cut: the loud
+    ``PREFILL-GRAPH-CALIBRATION CUT-MISMATCH table=... boot=... -> fallback``
+    line, the policy is decided again WITHOUT the table and the chunk policy
+    re-installed; returns True -- the capture set, and with it the capture
+    pool post the solve priced, may have changed, so the caller solves the
+    cut again (that solve has no table, so it is final)."""
+    from sglang.srt.weg2 import p_graph_policy as _pgp
+
+    cal = _P_PREFILL_GRAPH.get("calibration")
+    if cal is None or not p_prefill_graph_bucket():
+        return False
+    verdict, line = _pgp.cut_check(
+        cal, tuple(getattr(cut, "layer_counts", ()) or ()),
+        gapped=bool(getattr(cut, "gapped", False)), layer_set=str(getattr(cut, "layer_set", "") or ""))
+    log("WEG2 " + line)
+    if verdict != _pgp.CUT_MISMATCH:
+        _P_PREFILL_GRAPH["cut_check"] = verdict
+        _P_PREFILL_GRAPH["lines"] = tuple(p_prefill_graph_policy_lines()) + (line,)
+        return False
+    _p_prefill_graph_decide(None)
+    _P_PREFILL_GRAPH["cut_check"] = verdict
+    _P_PREFILL_GRAPH["lines"] = tuple(p_prefill_graph_policy_lines()) + (line,)
+    # The chunk plan priced the widths off the same table (overlay): without it.
+    apply_p_chunk_policy(ns)
+    return True
 
 
 def p_prefill_graph_calibration_of(ns):
@@ -12447,7 +12494,11 @@ def build_parser() -> argparse.ArgumentParser:
              "{'ref_prefix': N, 'widths': {'512': {'graph_ms': [..], 'eager_ms': [..]}, ...}} "
              "(per P stage, the prefix-free ms of one forward; written by "
              "docker/graphcal_eval.py from a graph and an eager metal boot). Empty "
-             "(default) = the 'graph_calibration' key of a --p-chunk-model JSON, else none.")
+             "(default) = the 'graph_calibration' key of a --p-chunk-model JSON, else none. "
+             "The table's 'pp_layer_ratio' (the P cut it was measured on) is compared with "
+             "the cut this boot ships: different = PREFILL-GRAPH-CALIBRATION CUT-MISMATCH, "
+             "the table is dropped and the cut solved again; absent (older tables) = a "
+             "warning, the table is used.")
     ap.add_argument(
         "--p-prefill-graph-min-gain", type=float, default=0.01, metavar="FRACTION",
         help="Only with --p-prefill-graph-policy auto: the graph must be at least this "
@@ -14192,6 +14243,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens,
         user_reserve_by_card=user_reserve_by_card,
     )
+    # --p-prefill-graph-calibration: the table is valid only for the cut it
+    # was measured on (Agent PG2 26.09.). Checked HERE, once, for all P ranks;
+    # no table = no-op. On a mismatch the table is dropped and the cut solved
+    # again for the table-less capture set (chunk_tokens does not depend on
+    # the table: it is the graph bucket or the dynamic ceiling).
+    if p_prefill_graph_cut_check(ns, cut, log):
+        cut = solve_p_cut(
+            ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens,
+            user_reserve_by_card=user_reserve_by_card,
+        )
+        log("WEG2 PREFILL-GRAPH-CALIBRATION CUT-MISMATCH re-solved without the table: cut %s "
+            "(captured=%s)" % (",".join(str(c) for c in cut.layer_counts) or cut.layer_set or "?",
+                               p_prefill_graph_captured() or "none"))
     stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio
     # 1b' (moved here by the argv slice's FIX 2) -- P's PP LAYER SPLIT, of the
     # cut group P is ACTUALLY LAUNCHED WITH.  Read off PCutFacts, where

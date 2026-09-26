@@ -12,7 +12,8 @@ THE TABLE (JSON, ``--p-prefill-graph-calibration PATH`` or the key
      "widths": {"512":  {"graph_ms": [g0, g1, g2], "eager_ms": [e0, e1, e2],
                          "graph_attn": [...], "eager_attn": [...]},   # optional
                 "1024": {...}, "2048": {...}},
-     "source": "graphcal boots ..."}
+     "source": "graphcal boots ...",
+     "pp_layer_ratio": "43,11,10"}          # optional, see THE CUT below
 
 ``graph_ms`` / ``eager_ms`` = the prefix-free cost of ONE forward of that
 width per P stage (the ``a`` of the #PGAP line ``gpu_fwd = a + attn * w *
@@ -35,6 +36,19 @@ bucket regardless (the metal calibration arm); ``off`` = the switch is not
 consulted at all (exactly the pre-switch behaviour; extra buckets refused).
 Extra buckets additionally have to pass the VRAM gate in the launcher (the P
 cut's pool with their capture pool must still clear the pool floor).
+
+THE CUT (``pp_layer_ratio``, Agent PG2 26.09.). A table is a measurement OF ONE
+P CUT: graph against eager per stage only compares when both arms ran the same
+layers and the same full-attention layers per stage (graphcal_int8 did not --
+G 43,11,10 against E 44,10,10 -- and PP1 compared 3 against 2 attention
+layers). docker/graphcal_eval.py writes the arms' realised cut (the ranks'
+``--pp-layer-ratio A,B,C`` line) into the table and refuses G != E. The
+launcher compares it with the cut the boot SHIPS (:func:`cut_check`, ONCE,
+before any rank starts, so every P rank gets the same verdict): equal = the
+table is used; the table carries no cut (older tables) = a warning and the
+table is used as before; different = ``CUT-MISMATCH ... -> fallback``, the
+policy runs as if no table was given (safe default, no overlay) and the cut
+is solved again for that capture set.
 """
 
 from __future__ import annotations
@@ -52,6 +66,10 @@ POLICIES = (POLICY_AUTO, POLICY_ON, POLICY_OFF)
 DEFAULT_MIN_GAIN = 0.01
 DEFAULT_REF_PREFIX = 16384
 LOG_TAG = "P-PREFILL-GRAPH-POLICY"
+CUT_TAG = "PREFILL-GRAPH-CALIBRATION"
+CUT_MATCH = "match"
+CUT_MISMATCH = "mismatch"
+CUT_UNKNOWN = "unknown"
 
 
 class GraphPolicyError(ValueError):
@@ -74,6 +92,9 @@ class Calibration:
     widths: Dict[int, WidthCal]
     ref_prefix: int = DEFAULT_REF_PREFIX
     source: str = ""
+    #: the realised P layer split the table was measured on (``()`` = the
+    #: table does not say -- tables written before 26.09.)
+    pp_layer_ratio: Tuple[int, ...] = ()
 
     @classmethod
     def from_json(cls, d) -> "Calibration":
@@ -103,7 +124,7 @@ class Calibration:
         ref = int(d.get("ref_prefix", DEFAULT_REF_PREFIX) or 0)
         if ref < 0:
             raise GraphPolicyError("graph calibration: ref_prefix must be >= 0")
-        return cls(out, ref, str(d.get("source", "")))
+        return cls(out, ref, str(d.get("source", "")), parse_cut(d.get("pp_layer_ratio")))
 
     def to_json(self) -> Dict[str, object]:
         ws = {}
@@ -114,7 +135,52 @@ class Calibration:
             if c.eager_attn:
                 e["eager_attn"] = list(c.eager_attn)
             ws[str(w)] = e
-        return {"ref_prefix": self.ref_prefix, "widths": ws, "source": self.source}
+        out = {"ref_prefix": self.ref_prefix, "widths": ws, "source": self.source}
+        if self.pp_layer_ratio:
+            out["pp_layer_ratio"] = ",".join(str(x) for x in self.pp_layer_ratio)
+        return out
+
+
+def parse_cut(raw) -> Tuple[int, ...]:
+    """A table's ``pp_layer_ratio``: ``"43,11,10"`` (graphcal_eval.py's form)
+    or a number list; None / "" = the table does not name its cut."""
+    if raw is None or raw == "" or raw == []:
+        return ()
+    try:
+        vals = tuple(int(x) for x in (raw.split(",") if isinstance(raw, str) else raw))
+    except (TypeError, ValueError):
+        raise GraphPolicyError(f"graph calibration: pp_layer_ratio {raw!r} is not a comma list of layer counts")
+    if not vals or any(v <= 0 for v in vals):
+        raise GraphPolicyError(f"graph calibration: pp_layer_ratio {raw!r}: every stage needs >= 1 layer")
+    return vals
+
+
+def cut_check(cal: Calibration, boot_counts: Sequence[int], gapped: bool = False,
+              layer_set: str = "") -> Tuple[str, str]:
+    """``(verdict, line)`` -- the table's cut against the cut this boot ships.
+
+    ``boot_counts`` = the realised layers per P stage (the launcher's
+    PCutFacts.layer_counts, round-tripped through the runtime's own split).
+    A contiguous split is fully named by its counts (the layer families are
+    the model's), a GAPPED map is not: it never matches a counts table.
+    Verdicts: :data:`CUT_MATCH`, :data:`CUT_UNKNOWN` (the table names no cut:
+    used as before, with a warning), :data:`CUT_MISMATCH` (fallback)."""
+    boot = ",".join(str(int(x)) for x in boot_counts) or "?"
+    if gapped:
+        boot = f"gapped({layer_set or boot})"
+    src = cal.source or "given"
+    if not cal.pp_layer_ratio:
+        return CUT_UNKNOWN, (
+            f"{CUT_TAG} CUT-UNKNOWN WARNING table={src!r} names no pp_layer_ratio (written before "
+            f"26.09.) boot={boot} -> table used as before; it is only valid for the cut it was "
+            f"measured on (re-measure with docker/graphcal_eval.py)")
+    table = ",".join(str(x) for x in cal.pp_layer_ratio)
+    if not gapped and tuple(int(x) for x in boot_counts) == tuple(cal.pp_layer_ratio):
+        return CUT_MATCH, f"{CUT_TAG} CUT-MATCH table={table} boot={boot} -> table used ({src})"
+    return CUT_MISMATCH, (
+        f"{CUT_TAG} CUT-MISMATCH table={table} boot={boot} -> fallback: the table ({src}) was "
+        f"measured on another P cut, the policy runs as without a table (auto: main bucket "
+        f"graph, extra buckets eager; no graphcal overlay on the chunk plan)")
 
 
 def load_calibration(path: str) -> Calibration:
@@ -248,5 +314,6 @@ def decision_lines(policy: str, captured: Sequence[int], verdicts: Sequence[Widt
 __all__ = [
     "POLICY_AUTO", "POLICY_ON", "POLICY_OFF", "POLICIES", "DEFAULT_MIN_GAIN", "LOG_TAG",
     "GraphPolicyError", "WidthCal", "Calibration", "WidthVerdict", "load_calibration", "verdict",
-    "decide", "overlay_stage_models", "decision_lines",
+    "decide", "overlay_stage_models", "decision_lines", "CUT_TAG", "CUT_MATCH", "CUT_MISMATCH",
+    "CUT_UNKNOWN", "parse_cut", "cut_check",
 ]
