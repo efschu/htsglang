@@ -3194,11 +3194,15 @@ class Front:
     #: H78: the modules the flip / leg path imports lazily on its FIRST use --
     #: credit_pause_order (wake_credit), timed_pause_order (wake_credit_pd),
     #: the gathered legs (wake_kv), a BATCH arrival's PLE hint (ple_admit_hint).
+    #: UNIFY S2 (27B RC2 Blocker A, d0fba8955f): the admitter's
+    #: ``_d_accepts_leg2`` (retain_publish) -- the one first-import the 27B
+    #: line's serving-loop probe still found inside the loop on this form.
     FLIP_PATH_IMPORTS = (
         "sglang.srt.weg2.wake_credit",
         "sglang.srt.weg2.wake_credit_pd",
         "sglang.srt.weg2.wake_kv",
         "sglang.srt.weg2.ple_admit_hint",
+        "sglang.srt.weg2.retain_publish",
     )
 
     async def _prewarm_flip_path_imports(self) -> None:
