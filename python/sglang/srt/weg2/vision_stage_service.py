@@ -570,6 +570,7 @@ class VisionStageService:
             pause_tag=self.pause_tag or _no_eviction_pause,
             resume_tag=self.resume_tag or _no_eviction_resume,
             flip_armed=self.flip_armed,
+            own_bytes=own_process_bytes_on_card,
         )
         rows_hint = 0
         try:
@@ -637,6 +638,29 @@ class VisionStageService:
             rows=result.rows,
             seconds=self.clock() - started,
         )
+
+
+def own_process_bytes_on_card(card: int) -> Optional[int]:
+    """xsn411: this process's device bytes on NVML card ``card`` (None when
+    NVML cannot say). The runtime reads it before the load and after the
+    release; the difference is the residue the teardown owns, unconfounded by
+    the sibling ranks' prefill on the same card."""
+    import os
+
+    from sglang.srt.registry.nvml import nvml_session
+
+    pid = os.getpid()
+    with nvml_session() as pynvml:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(int(card))
+        try:
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses_v3(handle)
+        except AttributeError:  # older binding
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        for proc in procs:
+            if int(proc.pid) == pid:
+                used = getattr(proc, "usedGpuMemory", None)
+                return None if used is None else int(used)
+    return 0  # no context on that card yet: nothing held
 
 
 def _no_eviction_pause(name: str) -> None:
