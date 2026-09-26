@@ -114,6 +114,20 @@ def split_ids(recv_req: Any) -> Tuple[Sequence[int], Optional[Sequence[int]]]:
               "stays on P (today's path, END-ANCHOR split included)",
               why, str(getattr(recv_req, "rid", "?"))[:24], len(ids) if ids is not None else -1)
         return ids, None
+    # FORK ANCHOR (weg2/fork_anchor.py, SGLANG_WEG2_FORK_ANCHOR_TOKEN, default
+    # off): cut before the chat's generation prompt instead of at N-1, so the
+    # END anchor D resumes from also serves a sibling that forks there.
+    from sglang.srt.weg2 import fork_anchor as _fa
+
+    f = _fa.fork_cut(ids, _fa.fork_token(), _fa.max_tail())
+    if f is not None:
+        _note("fork",
+              "WEG2 P-TRIM-END-ANCHOR n=%d fork rid=%s tokens=%d->%d: P's last chunk ends "
+              "before the generation prompt (last fork token at %d); its finish anchor is "
+              "the one D resumes from (D computes the %d-token tail) and the one a sibling "
+              "that forks there resumes from",
+              str(recv_req.rid)[:24], len(ids), f, f, len(ids) - f)
+        return ids[:f], ids[f:]
     _note("trim",
           "WEG2 P-TRIM-END-ANCHOR n=%d rid=%s tokens=%d->%d: P's last chunk ends at N-1 "
           "and its finish anchor is the N-1 anchor D claims; no 1-token END-ANCHOR "
