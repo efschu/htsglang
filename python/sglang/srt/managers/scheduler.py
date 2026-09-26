@@ -5332,6 +5332,13 @@ class Scheduler(
                         str(req.rid)[:12], _tail, self.WEG2_TAIL_RECOMPUTE_TOKENS,
                         int(getattr(req, "_1456_n", 0) or 0), reason)
             return "complete"
+        # TK (#1400 told form, tp_size 1 = no group MIN): a follower re-reads
+        # only PP0's told span, never before the told, and PP0 never after
+        # its told is on the wire (weg2_store_told.refetch_plan).
+        _told_plan = weg2_store_told.refetch_plan(self, req)
+        if _told_plan == weg2_store_told.REFETCH_SKIP:
+            req._1471_short = False
+            return "complete"
         req._1471_short = True
         if now - float(getattr(req, "_1456_last", 0.0) or 0.0) < 2.0:
             return "wait"
@@ -5349,7 +5356,10 @@ class Scheduler(
         clear = getattr(self, "_clear_prefetch_deferral_fields", None)
         if clear is not None:
             clear(req)  # the shortfall mark is ours to re-issue, not the drain's
-        verdict = self._prefetch_kvcache(req)
+        if _told_plan is None:
+            verdict = self._prefetch_kvcache(req)
+        else:
+            verdict = self._prefetch_kvcache(req, limit_tokens=int(_told_plan))
         if req._1456_n <= 4 or req._1456_n % 16 == 0:
             logger.info("#1456 HOLD-REFETCH rid=%s n=%d reason=%s verdict=%s (the store was short; "
                         "re-read from the registered extent)", str(req.rid)[:12], req._1456_n, reason, verdict)

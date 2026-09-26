@@ -1073,6 +1073,42 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
     return credit
 
 
+#: :func:`refetch_plan` verdict: this rank must not re-read the rid at all.
+REFETCH_SKIP = "skip"
+
+
+def refetch_plan(scheduler, req):
+    """TK (#1456/#1471 on the told form): may the dormant hold's re-read or
+    the post-wake settle re-register ``req`` on THIS rank, and how?
+
+    ``None``  = not the told form: re-read as before (group D, every non-PP
+                boot -- byte-identical).
+    ``REFETCH_SKIP`` = never: a follower without PP0's told (it registers only
+                with the told span), or PP0 once its told is on the wire (a
+                re-read would move PP0's record under the followers' feet).
+    ``int``   = the ``limit_tokens`` of the re-read: a follower re-reads the
+                told span again, exactly like its first read. Without it the
+                re-read of a follower still in the hold when the told arrived
+                ran to the prompt end, past told -> Weg2StoreToldMismatch.
+    """
+    try:
+        if not armed(scheduler):
+            return None
+    except Exception:  # noqa: BLE001 - a stand-in without the form
+        return None
+    rid = _rid(req)
+    told_map = getattr(scheduler, "_weg2_store_told", None) or {}
+    if is_pp0(scheduler):
+        published = rid in told_map or rid in (getattr(scheduler, "_weg2_told_pacing", None) or {})
+        return REFETCH_SKIP if published else None
+    told = told_map.get(rid)
+    if told is None:
+        told = (getattr(scheduler, "_weg2_told_early", None) or {}).get(rid)
+    if told is None or int(told) <= 0:
+        return REFETCH_SKIP
+    return follower_limit_tokens(getattr(scheduler, "tree_cache", None), int(told))
+
+
 from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed  # noqa: E402
 
 follower_absorb = _pass_timed("_1475_absorb_ms")(_follower_absorb_impl)  # #1475
