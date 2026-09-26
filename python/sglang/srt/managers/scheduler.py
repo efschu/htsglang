@@ -6137,6 +6137,9 @@ class Scheduler(
                 prefix_keys,
                 locally_eligible=locally_eligible,
             )
+            # H99: on a Form A expert worker the span bookkeeping is the host's
+            # (the vote carried it); a no-op on every other rank and boot.
+            tp_match_floor.adopt_host_prefetch_span(self.tree_cache, req, _match_end)
         else:
             self.tree_cache.prefetch_from_storage(
                 req.rid,
