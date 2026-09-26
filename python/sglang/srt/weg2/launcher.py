@@ -1445,6 +1445,55 @@ def d_reshard_env() -> Dict[str, str]:
     return {_dr.POLICY_ENV: spec.policy, _dr.SPEC_ENV: spec.to_json()}
 
 
+#: --d-token-placement (27B, user 26.09. ~09:40Z/09:45Z: "es muss dynamisch
+#: sein ... den kv so zu verteilen wie er optimal schnell ist zur jeweiligen
+#: fuelle"). weg2/d_token_placement.py: NEW D tokens pick the card through the
+#: allocator's slot id (weighted owner rule), by effective bandwidth while the
+#: pool has room, by capacity when it is tight; stored KV never moves.
+#: 'capacity' (default) = today: no env, argv byte-identical.
+D_TOKEN_PLACEMENT_DEFAULT = "capacity"
+_D_TOKEN_PLACEMENT: Dict[str, object] = {"spec": None}
+
+
+def apply_d_token_placement(ns) -> None:
+    from sglang.srt.weg2 import d_reshard as _dr
+    from sglang.srt.weg2 import d_token_placement as _dtp
+
+    policy = str(getattr(ns, "d_token_placement", D_TOKEN_PLACEMENT_DEFAULT) or D_TOKEN_PLACEMENT_DEFAULT)
+    _D_TOKEN_PLACEMENT["spec"] = None
+    if policy not in _dtp.POLICIES:
+        raise SystemExit(f"--d-token-placement {policy!r}: one of {list(_dtp.POLICIES)}")
+    if policy == _dtp.POLICY_CAPACITY:
+        return
+    model = str(getattr(ns, "model", "") or "")
+    try:
+        with open(model_config_path(model)) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"--d-token-placement {policy}: cannot read the model config of {model!r}: {exc}")
+    try:
+        _dr.check_profile(_dr.profile_of_config(cfg), "live")
+    except _dr.ReshardProfileRefused as exc:
+        raise SystemExit(str(exc).replace("--d-reshard live", f"--d-token-placement {policy}"))
+    raw = str(getattr(ns, "d_token_shares", "auto") or "auto")
+    try:
+        shares = _dtp.RC9_EFF_BW_GBS if raw == "auto" else tuple(float(x) for x in raw.split(","))
+        spec = _dtp.PlacementSpec(policy, tuple(shares),
+                                  float(getattr(ns, "d_token_fill_switch", _dtp.DEFAULT_FILL_SWITCH)))
+        spec.validate()
+    except (ValueError, _dtp.PlacementError) as exc:
+        raise SystemExit(f"--d-token-placement {policy}: {exc}")
+    _D_TOKEN_PLACEMENT["spec"] = spec
+
+
+def d_token_placement_env() -> Dict[str, str]:
+    """Group D's env for the token placement; {} under 'capacity'."""
+    from sglang.srt.weg2 import d_token_placement as _dtp
+
+    spec = _D_TOKEN_PLACEMENT.get("spec")
+    return {} if spec is None else {_dtp.ENV: spec.to_json()}
+
+
 def spec_form_is_dflash() -> bool:
     return str(_SPEC_FORM["form"]) == "DFLASH"
 
@@ -12410,6 +12459,22 @@ def build_parser() -> argparse.ArgumentParser:
              "measures every width on every prompt length (graph calibration ladder). "
              "Overrides --p-chunk-dynamic-min-tokens. Empty (default) = off.")
     ap.add_argument(
+        "--d-token-placement", choices=["capacity", "bandwidth"], default=D_TOKEN_PLACEMENT_DEFAULT,
+        help="Group D: where NEW KV tokens land (27B uneven DCP only; weg2/d_token_placement.py, "
+             "DYN_D_RESHARD.md sec. 13). 'capacity' (default) = today, env byte-identical. "
+             "'bandwidth' = the allocator interleaves its free slot ids so new tokens go to the "
+             "ranks by effective bandwidth while the pool has room, by free capacity once a "
+             "rank's class would pass --d-token-fill-switch; stored KV never moves. Refused "
+             "for the NF profile.")
+    ap.add_argument(
+        "--d-token-shares", default="auto", metavar="W",
+        help="Only with --d-token-placement bandwidth: per-rank weights (rank order), "
+             "'auto' = the d_reshard fit 937,604,604 GB/s (5090 first).")
+    ap.add_argument(
+        "--d-token-fill-switch", type=float, default=0.85, metavar="FRACTION",
+        help="Only with --d-token-placement bandwidth: fall to capacity placement once the "
+             "bandwidth target would fill a rank's class beyond this fraction (default 0.85).")
+    ap.add_argument(
         "--d-reshard", choices=["off", "wake", "live"], default=D_RESHARD_DEFAULT,
         help="Group D weight shards per load class (27B TP>1 uneven TP + uneven DCP only; "
              "weg2/d_reshard.py, DYN_D_RESHARD.md). 'off' (default) = today, argv and env "
@@ -13660,6 +13725,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     apply_p_chunk_policy(ns)
     # --d-reshard: before any argv; 'off' installs nothing.
     apply_d_reshard(ns)
+    apply_d_token_placement(ns)
     # 27B line G2: the one tokenizer both groups load, installed before any
     # argv is built; its line is logged with the checkpoint lines under 1a'.
     tokenizer_line = apply_tokenizer_path(ns)
@@ -15106,6 +15172,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
         env_d.update(store_short_tail_env(x_tokens, x_d_riegel))  # RC7-X
         env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
+        env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
         spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
@@ -15208,6 +15275,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
     env_d.update(store_short_tail_env(x_tokens, x_d_riegel))  # RC7-X
     env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
+    env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
     spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)

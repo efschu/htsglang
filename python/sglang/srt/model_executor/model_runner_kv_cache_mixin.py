@@ -5030,6 +5030,15 @@ class ModelRunnerKVCacheMixin:
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
                         )
+                        # --d-token-placement (26.09.): weighted owner placement
+                        # of NEW tokens; absent env = capacity = unchanged.
+                        from sglang.srt.weg2 import d_token_placement as _dtp
+
+                        _dtp.arm_on_allocator(
+                            self.token_to_kv_pool_allocator,
+                            _dtp.spec_from_env(),
+                            logger,
+                        )
                     else:
                         # Stock even-DCP (unchanged): interleave via inflated
                         # page granularity.
