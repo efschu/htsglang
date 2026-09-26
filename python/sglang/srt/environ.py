@@ -671,6 +671,17 @@ class Envs:
     # round read late by query (GPU idle the host caused). perf_counter around
     # existing calls, no sync; 0 = no line and no events.
     SGLANG_DEBUG_DECODE_HOST_SPLIT = EnvInt(64)
+    # COLLECTIVE-CLOCK GRAPH READER (Register #52, utils/collective_clock.py):
+    # lay the clock's event-record NODES into every captured decode graph
+    # (#1241b), bind K event sets per graph (Task #52) and, before every
+    # replay, swap the set (2 cudaGraphExecEventRecordNodeSetEvent per pair)
+    # and record a launch fence (#1302). That is what makes a graphed
+    # 'Decode rank batch' line carry a compute/wait split (and feeds
+    # BARLINK-ROUND-CENSUS, H28). Measuring form only: x176 bound 192 pairs x
+    # 8 sets per graph; 20.09. Runden/s 26,0 -> 24,4..27,1. Off: no node, no
+    # set, no swap, no fence; graphed rounds print 'split unavailable:
+    # graph-replay-reader-off'. Per rank env (set it in group D).
+    SGLANG_DEBUG_COLLECTIVE_CLOCK_GRAPH_NODES = EnvBool(False)
     # LRU_WARM_FROM_HANDOFF (H29b): after rearm_after_wake the free LRU rows
     # of every pool layer are filled with P's most-routed experts of the last
     # LRU_WARM_TOKENS prompt tokens (no new VRAM: only rows the reinit left
