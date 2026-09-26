@@ -38,6 +38,8 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
+from sglang.srt.mem_cache import form_a_host_shadow as _r12
+
 logger = logging.getLogger(__name__)
 
 #: #1028d one-shot for the broadcast-stamp banner (see _stamped_broadcast).
@@ -280,7 +282,18 @@ class SchedulerRequestReceiver:
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
+        # R12 (mem_cache/form_a_host_shadow.py): on a Form A D group TP0's own
+        # host decisions of the last pass ride THIS broadcast (first in the
+        # list, the #969 W3 pattern: no new arc, no new collective), and every
+        # rank applies them right after it, before any request of the pass.
+        _r12_wire = _r12.wire_active(self.server_args, self.ps)
+        if _r12_wire and is_request_origin and recv_reqs is not None:
+            recv_reqs = _r12.attach(recv_reqs)
+
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
+
+        if _r12_wire:
+            recv_reqs = _r12.consume(recv_reqs)
 
         if self.ps.pp_rank == 0:
             self.unwrap_pickle_wrapper(recv_reqs)
