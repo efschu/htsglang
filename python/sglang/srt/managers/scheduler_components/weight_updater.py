@@ -1957,15 +1957,43 @@ class SchedulerWeightUpdaterManager:
     def _weg2_zero_local_scratch(self, models) -> list:
         """fnFL2 v43: zero the runtime-built parameters (Marlin workspaces)
         of these models; the names zeroed. A failure is NAMED, never raised
-        and never swallowed silently."""
+        and never swallowed silently.
+
+        UNIFY S2 -- the two 27B additions, one implementation for both profiles:
+
+        * PARTIAL-CHUNK GUARD (27B 8c86eb86c8 placement): the memset walks
+          WHOLE models, so it runs only once the weights family is complete
+          (``offload_tags`` is updated before the legs); a partial wake chunk
+          leaves other weights tags unmapped and the memset would write into
+          them. A single-chunk wake (NF) zeroes exactly where it did.
+        * RESIDUE (27B d0589ee5b7): the non-zero lock entries found BEFORE the
+          memset go into ``self._weg2_scratch_residue`` ([count, scope]). The
+          count costs one host sync, so it is skipped while an H25 draft
+          unpark is in flight (the draft call must stay stream-ordered);
+          scope then reads ``target``."""
         out: list = []
         if not models:
             return out
+        if any(is_weights_family_tag(t)
+               for t in (getattr(self, "offload_tags", None) or ())):
+            logger.info(
+                "WEG2-RESUME local-scratch deferred models=%d (weights family "
+                "partial: zeroed in the chunk that completes it)", len(models))
+            return out
+        acc = getattr(self, "_weg2_scratch_residue", None)
+        residue = None
+        if acc is not None:
+            if getattr(self, "_weg2_draft_unpark_ph0", None) is None:
+                residue = []
+            else:
+                acc[1] = "target"
         try:
             from sglang.srt.weg2.weight_exchange import zero_local_scratch
 
             for _m in models:
-                out.extend(zero_local_scratch(_m))
+                out.extend(zero_local_scratch(_m, residue=residue))
+            if residue is not None:
+                acc[0] += int(sum(residue))
         except Exception as _sexc:  # noqa: BLE001
             # a failure here means the first forward after this wake runs
             # on the peer's semaphores
@@ -9504,6 +9532,9 @@ class SchedulerWeightUpdaterManager:
             _t_rearm = time.perf_counter()
             # H31: join the side stream first -- only the rest is paid here.
             _pf_join = _rearm_pf.join(_weg2_ph_l) if _rearm_pf is not None else None
+            # UNIFY S2: the helper carries the 27B additions (partial-chunk
+            # guard, residue counter) -- see _weg2_zero_local_scratch.
+            self._weg2_scratch_residue = [0, "all"]
             _scratch = self._weg2_zero_local_scratch(_early)
             _rl = _rz = 0
             for _m in _early:
@@ -9525,11 +9556,16 @@ class SchedulerWeightUpdaterManager:
                 _rl += int(_l)
                 _rz += int(_z)
             if _scratch:
+                # residue_nonzero: lock entries the recycled pages handed back
+                # NON-ZERO, counted before the memset (27B 2026-09-25: the
+                # scheme-held workspace of the W8 draft was not reached before).
                 logger.info(
-                    "WEG2-RESUME local-scratch zeroed=%d first=%s "
-                    "(runtime-built parameters the exchange has no source "
+                    "WEG2-RESUME local-scratch zeroed=%d residue_nonzero=%d "
+                    "residue_scope=%s first=%s "
+                    "(runtime-built tensors the exchange has no source "
                     "for; see weight_exchange.LOCAL_SCRATCH_REASON)",
-                    len(_scratch), _scratch[0],
+                    len(_scratch), self._weg2_scratch_residue[0],
+                    self._weg2_scratch_residue[1], _scratch[0],
                 )
             if _rl:
                 _pf_rows = _pf_join.rows if _pf_join is not None else 0
