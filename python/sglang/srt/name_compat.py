@@ -27,8 +27,11 @@ Readers only. Writers are not touched here; the rename renames them.
 from __future__ import annotations
 
 import functools
+import os
 import re
-from typing import Optional, Tuple
+import shlex
+import sys
+from typing import Dict, List, MutableMapping, Optional, Tuple
 
 # --------------------------------------------------------------------------
 # 1a: log markers and boot-log stems
@@ -108,3 +111,140 @@ def marker_tail(text: str, marker: str) -> Optional[str]:
         return None
     return text[best[0] + len(best[1]):]
 
+
+# --------------------------------------------------------------------------
+# 1b: environment names
+# --------------------------------------------------------------------------
+
+_LEG = "SG" "LANG_"  # the legacy env prefix, split for the rename (module doc)
+_LEG_SUB = _LEG + "WE" "G2_"
+
+#: (legacy, renamed) env prefix pairs, the more specific first: the subsystem
+#: family ``<LEGACY>_<OLD>_X <-> FLLIPER_PDFLIP_X`` (RENAME_PLAN 8.1) before the
+#: generic ``<LEGACY>_X <-> FLLIPER_X`` (RENAME_PLAN 4.1). ``SGL_*`` (upstream
+#: legacy aliases) and the product prefix ``HT...`` belong to neither family.
+ENV_PREFIX_PAIRS: Tuple[Tuple[str, str], ...] = (
+    (_LEG_SUB, "FLLIPER_PDFLIP_"),
+    (_LEG, "FLLIPER_"),
+)
+
+def _package_name() -> str:
+    if __name__ != "__main__":
+        return __name__.split(".")[0]
+    # run as a script (the container entrypoint): <tree>/python/<pkg>/srt/name_compat.py
+    return os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+#: Which side of each pair THIS tree reads. The package name decides, at run
+#: time, so the same file bridges in both directions: before the rename the
+#: legacy names are canonical (a stray new name is folded onto them), after it
+#: the new names are.
+_PKG = _package_name()
+CANONICAL_SIDE: int = 0 if _PKG == "sg" "lang" else 1
+
+#: Names read by code the rename does not touch, in their LEGACY spelling:
+#: the ``sgl_kernel`` wheel (``getenv`` in its csrc, ``os.environ`` in its
+#: python), the JIT CUDA sources under ``jit_kernel/csrc`` and the other C++
+#: the tool skips (``--cxx`` off): the host-ring TMS and the C++ radix tree;
+#: plus the rust gRPC server and the model gateway. Found by a search for
+#: ``getenv`` / literal legacy names in sgl-kernel, 3rdparty, rust,
+#: sgl-model-gateway and every C/C++/CUDA file of the tree (rename step 1b).
+#: Each keeps its legacy spelling set whenever any spelling is set.
+FOREIGN_READERS: frozenset = frozenset(
+    [_LEG + s for s in (
+        # sgl-kernel (csrc getenv, python/sgl_kernel/debug_utils.py)
+        "CUSTOM_ALLREDUCE_ALGO", "GGUF_KQ_KERNEL", "RPF_N", "KERNEL_API_LOGLEVEL",
+        # jit_kernel/csrc (JIT-compiled CUDA)
+        "DEBUG_C128_ONLINE_GUARD", "DEBUG_C128_ONLINE_NO_H2D", "DEBUG_C128_ONLINE_SYNC_H2D",
+        "MARLIN_EPILOGUE_SYNC", "MARLIN_NO_K_SPLIT", "MARLIN_SMS_OVERRIDE",
+        "OPT_FUSED_MOE_ACTIVATION_QUANT_FUSE", "OPT_FUSED_MOE_ACTIVATION_VEC",
+        # mem_cache/cpp_radix_tree (C++)
+        "RADIX_CPP_DEBUG_LIMIT",
+        # rust/ gRPC server, sgl-model-gateway (foreign packages)
+        "TONIC_PAYLOAD", "LOG_MS", "MCP_CONFIG",
+    )]
+    + [_LEG_SUB + s for s in (
+        # the host-ring torch_memory_saver sources (tms_csrc/utils.h getenv)
+        "VMM_EXPORTABLE",
+    )]
+)
+
+
+def _env_family(name: str) -> Optional[Tuple[str, str, str]]:
+    """``(legacy, renamed, canonical)`` spelling of an env name that belongs to
+    one of :data:`ENV_PREFIX_PAIRS`, else ``None``."""
+    for pair in ENV_PREFIX_PAIRS:
+        for side in (0, 1):
+            if name.startswith(pair[side]):
+                rest = name[len(pair[side]):]
+                if not rest:
+                    return None
+                leg, new = pair[0] + rest, pair[1] + rest
+                return leg, new, (leg, new)[CANONICAL_SIDE]
+    return None
+
+
+def canonical_env_name(name: str) -> str:
+    """The spelling of ``name`` this tree reads (itself when it has no
+    legacy/renamed counterpart)."""
+    fam = _env_family(name)
+    return fam[2] if fam else name
+
+
+def canonical_env(env: MutableMapping, *, foreign_keep=FOREIGN_READERS) -> MutableMapping:
+    """Fold every legacy/renamed env spelling onto the one this tree reads.
+
+    In place; returns ``env``. When several spellings of one name are
+    present, the canonical spelling's value wins (it is what the tree has
+    always read, and after the rename it is the explicit new name); when the
+    canonical spelling is absent, the other one's value moves onto it. Then
+    every non-canonical spelling is REMOVED, so a later ``env.pop(canonical)``
+    removes the variable -- no other spelling survives to be mirrored back by a
+    child's own import. The exception is ``foreign_keep`` (legacy spellings
+    read by code outside the rename): for those the legacy spelling is always
+    set, and both spellings, where present, carry the resolved value.
+
+    An env that holds only canonical spellings of non-foreign names comes back
+    unchanged, key order included.
+    """
+    groups: Dict[Tuple[str, str, str], List[str]] = {}
+    for k in list(env.keys()):
+        fam = _env_family(k)
+        if fam is not None:
+            groups.setdefault(fam, []).append(k)
+    for (leg, new, canon), present in groups.items():
+        foreign = leg in foreign_keep
+        if present == [canon] and (not foreign or leg == canon):
+            continue
+        if canon in env:
+            value = env[canon]
+        else:
+            other = new if canon == leg else leg
+            value = env[other] if other in env else env[present[0]]
+            env[canon] = value
+        for k in present:
+            if k != canon and not (foreign and k in (leg, new)):
+                del env[k]
+        if foreign:
+            env[leg] = value
+            if new in env:
+                env[new] = value
+    return env
+
+
+def shell_statements(env: Optional[MutableMapping] = None) -> List[str]:
+    """``unset``/``export`` lines that turn ``env`` (default: this process's
+    environment) into :func:`canonical_env` of it -- for shell launchers (the
+    container entrypoint) that cannot import the package."""
+    before = dict(os.environ if env is None else env)
+    after = canonical_env(dict(before))
+    out = ["unset %s" % k for k in before if k not in after]
+    out += ["export %s=%s" % (k, shlex.quote(v)) for k, v in after.items() if before.get(k) != v]
+    return out
+
+
+if __name__ == "__main__":
+    # eval "$(python <tree>/python/<pkg>/srt/name_compat.py --shell)"
+    if sys.argv[1:] != ["--shell"]:
+        sys.exit("usage: name_compat.py --shell")
+    print("\n".join(shell_statements()))

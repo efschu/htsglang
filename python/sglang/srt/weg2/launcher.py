@@ -69,7 +69,7 @@ from typing import (
 
 from sglang.srt.environ import envs
 from sglang.srt.managers import corridor_guard
-from sglang.srt.name_compat import tolerant_compile
+from sglang.srt.name_compat import canonical_env, tolerant_compile
 from sglang.srt.planner import p_card_chunk as _p_card
 # fnFL2 H57: das Power-Limit je Karte (Startzeile, Referenz-Datierung, Raten-Schnitt).
 from sglang.srt.planner import power_limit as _power
@@ -4594,7 +4594,8 @@ def _resolve_keys_in_rank_tree(
     precisely the divergence this check exists to see and precisely the one an
     in-process import cannot show.
     """
-    env = dict(os.environ)
+    # Rename 1b: one spelling per variable before the pop below (name_compat).
+    env = canonical_env(dict(os.environ))
     env["PYTHONPATH"] = f"{tree}/python"
     env["CUDA_VISIBLE_DEVICES"] = ""
     from sglang.srt.managers import weg2_memory_saver as _s
@@ -5936,7 +5937,9 @@ def parse_group_env(spec: str) -> Dict[str, str]:
             raise ValueError(f"--env-p/--env-d entry {item!r} is not KEY=VAL")
         k, v = item.split("=", 1)
         out[k.strip()] = v.strip()
-    return out
+    # Rename 1b: an arm may still spell a name the old (or already the new)
+    # way; callers read the dict by the tree's own name.
+    return canonical_env(out)
 
 
 def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, tag: str,
@@ -5978,7 +5981,13 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               # = a desk caller: every form-keyed branch below keeps its
               # pre-form behaviour and SGLANG_WEG2_FORM is popped.
               boot_form: Optional["weg2_form.Weg2Form"] = None) -> Dict[str, str]:
-    env = dict(os.environ)
+    # Rename 1b: ONE spelling per variable from here on -- the one this tree
+    # reads (name_compat.canonical_env). Every pop, the PHASE_FLIP prefix strip
+    # and the per-group overrides below act on that name; an operator's
+    # legacy/renamed spelling is folded onto it first, so none survives a pop
+    # to be mirrored back by the rank's own import. Foreign readers
+    # (sgl_kernel, JIT C++, TMS) keep their legacy spelling as well.
+    env = canonical_env(dict(os.environ))
     # Task #58: THE ARMING SIGNAL for the transient vision stage, and the ONE
     # thing that turns `vision_stage_service`'s seam from a no-op into a stage.
     # Read by `weg2/vision_stage_boot.vision_mode`, which the P group's
@@ -6259,7 +6268,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         # spell differently (e.g. SGLANG_MOE_SCRATCH_SLOTS: one value per TP
         # rank -- P's stages run tp 1, D's Form A runs tp 3). Applied LAST so
         # an operator value is what the group runs, and printed by the caller.
-        env.update({str(k): str(v) for k, v in group_env_extra.items()})
+        env.update(canonical_env({str(k): str(v) for k, v in group_env_extra.items()}))
     env["SGLANG_BARLINK_BUILD_WINDOW_CAP_S"] = str(barlink_build_window_cap_s)
     if str(transport) == "nccl":
         # #1234 C6: half-configuring a transport the group does not run is

@@ -83,6 +83,7 @@ import textwrap
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
+from sglang.srt.name_compat import canonical_env
 from sglang.srt.planner.vision_stage import (
     GIB,
     MIB,
@@ -338,7 +339,7 @@ def context_probe_command(
             "cannot probe a CUDA context without the card's NVML UUID; an "
             "index would be torch's order, not NVML's"
         )
-    env = dict(os.environ)
+    env = canonical_env(dict(os.environ))  # rename 1b: the pop below sees one spelling
     env["CUDA_VISIBLE_DEVICES"] = uuid
     # The probe must not inherit a rank's memory-saver preload or a partial
     # distributed environment; it initialises one context and exits.
