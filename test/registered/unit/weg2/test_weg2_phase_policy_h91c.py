@@ -19,6 +19,7 @@ pytest-asyncio in this venv).
 """
 
 import asyncio
+import importlib
 import json
 import os
 import re
@@ -162,6 +163,14 @@ class Harness:
         self.server = TestServer(app)
         await self.server.start_server()
         self.client = ClientSession(timeout=ClientTimeout(total=60))
+        # H75, as the served front does it (front.py Front._prewarm_launcher_import,
+        # scheduled from its on_startup hook, which this harness does not run):
+        # import the launcher in a worker thread BEFORE the first flip. Without
+        # it Front.resolve_x_live imports it on the event loop inside the first
+        # completed flip -- 5.5-7.0 s of frozen loop measured on an idle rig
+        # (TF 26.09.), past a 20-s test deadline when the incg cgroup
+        # (cpu.idle=1) starves beside a boot (h91bb3 stack_new, test_h91c3_1).
+        await asyncio.to_thread(importlib.import_module, "sglang.srt.weg2.launcher")
         self.tasks = [asyncio.create_task(self.front.controller())]
         if self.admitter:
             self.tasks.append(asyncio.create_task(self.front.d_admitter()))
