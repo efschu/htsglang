@@ -58,6 +58,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import msgspec
 
+from sglang.srt.name_compat import tolerant_compile
+
 MIB = float(1 << 20)
 GIB_IN_MIB = 1024.0
 
@@ -274,7 +276,7 @@ P_TRANSIENT_SUPPORT_FNFL2 = TransientSupport(
 
 
 #: H59: die H55-Fensterzeile eines Chunks (``WEG2-VRAM-PEAK ... phase=chunk``).
-_RX_H55_CHUNK = re.compile(
+_RX_H55_CHUNK = tolerant_compile(
     _STAGE + r" WEG2-VRAM-PEAK rank=\d+ phase=chunk rows=(\d+) n=\d+ .*?"
     r"peak_allocated_mib=(\d+) peak_reserved_mib=(\d+) start_allocated_mib=(\d+) "
     r"transient_mib=(-?\d+) allocated_mib=(\d+) reserved_mib=(\d+) "
@@ -485,13 +487,13 @@ class PCardReference(msgspec.Struct, frozen=True, kw_only=True):
 
 
 _RX_EXTENT = re.compile(_STAGE + r" #969 EXTENT n=\d+ fwd=\d+ reqs=\[\('[^']*', (\d+), (\d+)")
-_RX_POOL = re.compile(
+_RX_POOL = tolerant_compile(
     _STAGE + r" WEG2-GRAPH-POOL rank=\d+ phase=(\S+) .*?private_free_mib=(-?\d+) "
     r".*?peak_mib=(\d+) .*?cap_mib=(\d+) "
 )
 _RX_EXC = re.compile(_STAGE + r" Scheduler hit an exception")
-_RX_RUNWRITE = re.compile(_STAGE + r" WEG2-ARENA-WRITE n=\d+ .*mode=run ")
-_RX_SLEEP_LMEM = re.compile(_STAGE + r" WEG2-SLEEP-LMEM lmem \d+->\d+ MiB released \(stack (\d+)->")
+_RX_RUNWRITE = tolerant_compile(_STAGE + r" WEG2-ARENA-WRITE n=\d+ .*mode=run ")
+_RX_SLEEP_LMEM = tolerant_compile(_STAGE + r" WEG2-SLEEP-LMEM lmem \d+->\d+ MiB released \(stack (\d+)->")
 _RX_OOM = re.compile(
     r"OutOfMemoryError: CUDA out of memory\. Tried to allocate ([0-9.]+) (MiB|GiB)\. "
     r"GPU \d+ has a total capacity of [0-9.]+ GiB of which ([0-9.]+) (MiB|GiB) is free\."
@@ -577,7 +579,7 @@ def pool_samples(text: str) -> Dict[int, List[PoolSample]]:
 # war 372. Der Term ist die GEMESSENE Spanne, keine Reserve: Maximum ueber
 # die gemessenen Flips minus das, was am Referenzpunkt schon in cap steckt.
 
-_RX_DORMANT = re.compile(
+_RX_DORMANT = tolerant_compile(
     r"\[(?:[0-9-]+ [0-9:]+ )?TP(\d+)\] WEG2-DC-BREAKDOWN stage=release "
     r"tags=\['weights_[^\]]*\] nvml_proc=(\d+) MiB"
 )

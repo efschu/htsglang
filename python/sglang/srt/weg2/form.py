@@ -66,6 +66,8 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from sglang.srt.name_compat import has_marker, tolerant_compile, tolerant_rx
+
 FORM_ENV = "SGLANG_WEG2_FORM"
 FORM_LINE_TAG = "WEG2-FORM"
 W_CONTRADICTION = "W140 Weg2FormContradiction"
@@ -1079,9 +1081,9 @@ def add_form_arguments(ap) -> None:
 # calibration identity: which boot measured which model
 # --------------------------------------------------------------------------
 
-_FORM_LINE_MODEL_RE = re.compile(re.escape(FORM_LINE_TAG) + r" .*?\bmodel=(\S+)")
+_FORM_LINE_MODEL_RE = re.compile(tolerant_rx(re.escape(FORM_LINE_TAG)) + r" .*?\bmodel=(\S+)")
 _FORM_LINE_AXES_RE = re.compile(
-    re.escape(FORM_LINE_TAG) + r" (arch=\S+ experts=\S+ draft=\S+ p_draft=\S+ kv=\S+ "
+    tolerant_rx(re.escape(FORM_LINE_TAG)) + r" (arch=\S+ experts=\S+ draft=\S+ p_draft=\S+ kv=\S+ "
     r"flip=\S+ vision=\S+) profile=(\S*) model=(\S+)")
 _MODEL_PATH_RE = re.compile(r"--model-path[= ]'?([^\s']+)")
 _SPEC_ALGO_RE = re.compile(r"--speculative-algorithm[= ]'?([A-Z_]+)")
@@ -1111,7 +1113,7 @@ def log_identity(path: str) -> BootIdentity:
                 if seen > _SCAN_MAX_BYTES:
                     break
                 line = raw.decode("utf-8", "replace")
-                if FORM_LINE_TAG in line:
+                if has_marker(line, FORM_LINE_TAG):
                     m = _FORM_LINE_AXES_RE.search(line)
                     if m:
                         kv = dict(x.split("=", 1) for x in m.group(1).split())
@@ -1164,7 +1166,7 @@ def group_log_model(path: str) -> Optional[str]:
     return _group_log_model_cached(path, mtime)
 
 
-_FRONT_LOG_RE = re.compile(
+_FRONT_LOG_RE = tolerant_compile(
     r"^boot_weg2_(?P<tag>.+)_(?P<tip>[0-9a-f]{7,40})_(?P<day>\d{4})_(?P<time>\d{6})\.front\.log$"
 )
 
@@ -1271,7 +1273,7 @@ def same_model_log(model: str) -> Callable[[str], bool]:
 # SCALES rates by the NVML limit) but not a filter yet -- no front log states
 # its boot's limits in a form a record sample can be judged by (Schritt 9).
 
-_BOOT_LOG_RE = re.compile(
+_BOOT_LOG_RE = tolerant_compile(
     r"^boot_weg2_(?P<tag>.+)_(?P<tip>[0-9a-f]{7,40})_(?P<day>\d{4})_(?P<time>\d{6})"
     r"\.(?P<kind>front|P|D)\.log$"
 )

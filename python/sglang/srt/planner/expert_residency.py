@@ -63,6 +63,8 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import msgspec
 
+from sglang.srt.name_compat import tolerant_compile
+
 MIB = float(1 << 20)
 GIB_IN_MIB = 1024.0
 
@@ -243,7 +245,7 @@ def dense_repack_outside_pool(env: Mapping[str, str]) -> bool:
 #: (``weg2_memory_saver._release_one_load_pool("ckpt")``; ein noch lebender
 #: Block haelt den Pool und die Zeile bleibt aus). Der Zustand einer Referenz
 #: ist damit die gemessene WIRKUNG, nicht der Schalter.
-_RX_H39_RELEASED = re.compile(
+_RX_H39_RELEASED = tolerant_compile(
     r"\[(?:[0-9-]+ [0-9:]+ )?TP\d+\] WEG2-TAG-POOL checkpoint-format pool RELEASED"
 )
 

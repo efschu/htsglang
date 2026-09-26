@@ -46,6 +46,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
+from sglang.srt.name_compat import tolerant_compile
+
 #: Die Verweigerung (Dry-Run und Front). W122 = Residenz ueber Budget (H8),
 #: W123..W125 belegt auf dem Layout-Switch-Zweig (4e11cd11ad).
 REFUSAL_CODE = "W126 Weg2WakeCreditCycle"
@@ -510,24 +512,24 @@ def verdict_lines(order: Sequence[str], cards: Sequence[WakeCard], *, label: str
 # Messung: eine Referenz aus den Logs EINES Boots (der erste Wake, D -> P)
 # ---------------------------------------------------------------------------
 
-_RX_ORDER = re.compile(
+_RX_ORDER = tolerant_compile(
     r"WEG2-FLIP-ORDER epoch=0 src=D driver_free=(\{[^}]*\}) pause_order=(\[[^\]]*\])")
 _RANK = r"\[(?:[0-9-]+ [0-9:]+ )?"
-_RX_P_RELEASE = re.compile(
+_RX_P_RELEASE = tolerant_compile(
     _RANK + r"PP(\d+)\] WEG2-DC-BREAKDOWN stage=release tags=\['kv_cache', 'weights_0'"
     r".*? tms_paused \d+ (\{[^}]*\})")
-_RX_D_RELEASE = re.compile(
+_RX_D_RELEASE = tolerant_compile(
     _RANK + r"TP(\d+)\] WEG2-DC-BREAKDOWN stage=release tags=\['kv_cache', 'cuda_graph'\]"
     r".*? tms_resident \d+ (\{[^}]*\})")
-_RX_FLOOR = re.compile(_RANK + r"PP(\d+)\] WEG2-CREDIT-FLOOR card=\S+ group=P floor_mib=(\d+)")
+_RX_FLOOR = tolerant_compile(_RANK + r"PP(\d+)\] WEG2-CREDIT-FLOOR card=\S+ group=P floor_mib=(\d+)")
 _RX_ROWS = re.compile(
     _RANK + r"(PP|TP)(\d+)\] MoE expert-offload active on layer \d+: .*?\(buffer=(\d+),")
 #: H59: derselbe Zeilentyp, der Layer je PP-Rang (fuer den Schnitt der Referenz)
 _RX_P_LAYER = re.compile(_RANK + r"PP(\d+)\] MoE expert-offload active on layer (\d+):")
-_RX_ONCARD = re.compile(
+_RX_ONCARD = tolerant_compile(
     _RANK + r"TP(\d+)\] WEG2-SEQ lane=c\d+ phase=deposit handshake=\S+ descs=\d+ slot=\d+ "
     r"slot_bytes=(\d+)")
-_RX_TAGTIME = re.compile(_RANK + r"TP(\d+)\] WEG2-SLEEP-TAG-TIME tag=(\w+)")
+_RX_TAGTIME = tolerant_compile(_RANK + r"TP(\d+)\] WEG2-SLEEP-TAG-TIME tag=(\w+)")
 
 
 def _family(d: Mapping[str, float]) -> Dict[str, float]:

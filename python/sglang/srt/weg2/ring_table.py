@@ -121,6 +121,7 @@ from typing import (
     Tuple,
 )
 
+from sglang.srt.name_compat import has_marker, tolerant_compile, tolerant_rx
 from sglang.srt.weg2 import host_ledger
 
 MIB = 1024 * 1024
@@ -128,7 +129,7 @@ GIB = float(2**30)
 GB = 1e9
 
 #: ``[2026-09-07 21:10:23 TP2] WEG2-CHUNK-BYTES sleep tags=['weights_0'] host_image_delta=982 MiB``
-_CHUNK_RE = re.compile(
+_CHUNK_RE = tolerant_compile(
     r"\b(?:TP|PP)(\d+)\]\s+WEG2-CHUNK-BYTES\s+sleep\s+tags=\[([^\]]*)\]\s+"
     r"host_image_delta=(-?\d+)\s+MiB"
 )
@@ -165,7 +166,7 @@ _CHUNK_RE = re.compile(
 #: to read the line it cannot read.  Two halves, both needed -- the regex accepts
 #: the sign, and :func:`parse_group_log` REFUSES BY NAME (W37) when a log's tag
 #: lines exist and none of them parse, so the next divergence is loud.
-_TAG_RE = re.compile(
+_TAG_RE = tolerant_compile(
     r"WEG2-FLIP-TAG\s+group=\S+\s+rank=(-?\d+)\s+card=(\S+)\s+dir=\S+\s+tag=(\S+)\s+"
     r"bytes=(\d+)\s+MiB(?:\s+population=(\S+))?"
 )
@@ -181,7 +182,7 @@ TAG_POPULATION_WEIGHTS = "weights-family"
 #: computable (FIX 1, finding 3): anchors and rings are pure functions of
 #: ``(S, M)`` in :mod:`host_ledger`, and the boot whose RssShmem is being read
 #: is the boot whose arm must be subtracted from it.
-_CHOSEN_ARM_RE = re.compile(
+_CHOSEN_ARM_RE = tolerant_compile(
     r"WEG2-HOST-LEDGER CHOSEN\s+S=(\d+)\s+GB\b.*?\bM=(\d+)\s+MiB"
 )
 #: ``KV Cache is allocated. ... K size: 5.63 GB, V size: 5.63 GB``
@@ -190,11 +191,11 @@ _KV_RE = re.compile(
     r"V size:\s*([\d.]+)\s*GB"
 )
 #: ``WEG2-CORRIDOR phase=D(awake) ... nvml0:free=2474MiB nvml1:free=1987MiB ...``
-_CORRIDOR_PHASE_RE = re.compile(r"WEG2-CORRIDOR\s+phase=([A-Z])\(awake\)")
+_CORRIDOR_PHASE_RE = tolerant_compile(r"WEG2-CORRIDOR\s+phase=([A-Z])\(awake\)")
 _CORRIDOR_FREE_RE = re.compile(r"nvml(\d+):free=(\d+)MiB")
 #: ``instrument=nvml_v2_free,allocatable`` -- present only on boots taken after
 #: the corridor instrument fix (front.CORRIDOR_INSTRUMENT).
-_CORRIDOR_INSTRUMENT_RE = re.compile(r"WEG2-CORRIDOR\s+phase=[A-Z]\(awake\)[^\n]*?instrument=(\S+)")
+_CORRIDOR_INSTRUMENT_RE = tolerant_compile(r"WEG2-CORRIDOR\s+phase=[A-Z]\(awake\)[^\n]*?instrument=(\S+)")
 
 
 #: #1257c: the front prints its DERIVED per-card floor beside every free
@@ -257,7 +258,7 @@ def parse_front_corridor_floors(path: str) -> Dict[int, FrontFloor]:
     try:
         with open(path, errors="replace") as f:
             for line in f:
-                if "WEG2-CORRIDOR" not in line:
+                if not has_marker(line, "WEG2-CORRIDOR"):
                     continue
                 for m in _CORRIDOR_FLOOR_RE.finditer(line):
                     floor, source = int(m.group(2)), m.group(4)
@@ -699,7 +700,7 @@ XCHG_FORM_TOKEN = "--weg2-xchg-region=armed"
 #: ``slots=`` / ``bytes=``).  Prose puts a lowercase English word after it, and
 #: the one genuine line on every armed boot puts ``epoch=`` there.
 _XCHG_FORM_EVENT_RE = re.compile(
-    r"(?<![\w-])" + re.escape(XCHG_FORM_MARKER) + r"\s+[A-Za-z_][\w.-]*="
+    r"(?<![\w-])" + tolerant_rx(re.escape(XCHG_FORM_MARKER)) + r"\s+[A-Za-z_][\w.-]*="
 )
 
 
@@ -1739,7 +1740,7 @@ def parse_group_log(path: str) -> GroupLog:
     )
     with open(path, errors="replace") as f:
         for line in f:
-            if "WEG2-FLIP-TAG" in line:
+            if has_marker(line, "WEG2-FLIP-TAG"):
                 tag_lines_seen += 1
                 m = _TAG_RE.search(line)
                 if not m:
@@ -1789,7 +1790,7 @@ def parse_group_log(path: str) -> GroupLog:
                             "38.63 GiB against 28.83 of weight tags)"
                         )
                     continue
-            if "WEG2-CHUNK-BYTES sleep" in line:
+            if has_marker(line, "WEG2-CHUNK-BYTES sleep"):
                 m = _CHUNK_RE.search(line)
                 if m:
                     rank = int(m.group(1))
@@ -2420,7 +2421,7 @@ def parse_front_corridor(path: str) -> Dict[str, Dict[int, int]]:
     out: Dict[str, Dict[int, int]] = {}
     with open(path, errors="replace") as f:
         for line in f:
-            if "WEG2-CORRIDOR" not in line:
+            if not has_marker(line, "WEG2-CORRIDOR"):
                 continue
             letter = _corridor_sample_phase(line)
             if letter is None:
@@ -2466,7 +2467,7 @@ def front_corridor_instrument(path: str) -> str:
     try:
         with open(path, errors="replace") as f:
             for line in f:
-                if "WEG2-CORRIDOR" not in line:
+                if not has_marker(line, "WEG2-CORRIDOR"):
                     continue
                 if _corridor_sample_phase(line) is None:
                     continue
@@ -2585,7 +2586,7 @@ def _boot_stems(evidence_dir: str) -> List[str]:
 #: (``launcher.main``: ``f"{EVIDENCE_DIR}/boot_weg2_{ns.tag}_{tip}_{stamp}"``).
 #: Anchored at both ends so a stem that does not have this shape yields None and
 #: the caller treats the sidecar as ABSENT rather than matching a wrong boot.
-_STEM_RE = re.compile(r"^boot_weg2_(?P<tag>.+)_[0-9a-f]{6,40}_\d{4}_\d{6}$")
+_STEM_RE = tolerant_compile(r"^boot_weg2_(?P<tag>.+)_[0-9a-f]{6,40}_\d{4}_\d{6}$")
 
 
 def boot_tag_of_stem(stem: str) -> Optional[str]:
@@ -2770,7 +2771,7 @@ def solve(
             f"{len(same_form)} same-form candidate(s) ranked ahead of "
             f"{len(other_form)} of another form (form key {my_key}; other-form "
             f"ranking by form DISTANCE then age: "
-            + ", ".join(f"{s.replace('boot_weg2_', '')}(d={d})" for d, s in scored[:6])
+            + ", ".join(f"{re.sub(tolerant_rx('boot_weg2_'), '', s)}(d={d})" for d, s in scored[:6])
             + (" ..." if len(scored) > 6 else "")
             + f"; {len(xchg_excluded)} xchg-shadow source(s) EXCLUDED for this non-xchg boot)"
         )

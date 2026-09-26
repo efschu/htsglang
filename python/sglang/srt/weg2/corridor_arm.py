@@ -65,6 +65,7 @@ from typing import Dict, List, Mapping, Optional, Tuple
 # needs is delegated because #656's one-converter gate forbids a ``-`` in
 # ``arm_report`` by name.
 from sglang.srt.managers import corridor_guard
+from sglang.srt.name_compat import has_marker
 from sglang.srt.weg2 import front, ring_table
 
 #: The DELTAS a pre-fix pairing shows, MiB.  Used ONLY to recognise the pre-fix
@@ -296,7 +297,7 @@ def arm_report(
     try:
         with open(path, errors="replace") as f:
             for line in f:
-                if "WEG2-CORRIDOR" not in line:
+                if not has_marker(line, "WEG2-CORRIDOR"):
                     continue
                 if ring_table._corridor_sample_phase(line) is None:
                     rep.prose_mentions += 1

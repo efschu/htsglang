@@ -63,6 +63,8 @@ import urllib.request
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from sglang.srt.name_compat import tolerant_compile
+
 #: Gemessen: 225 Saetze dieser Form + Frage = 3899 prompt_tokens (x144 KONTROLLE MID).
 TOKENS_PER_SENTENCE = 17.1
 PROMPT_OVERHEAD_TOKENS = 80
@@ -219,11 +221,11 @@ RE_BATCH = re.compile(_TS + r".*?Prefill batch, #new-seq: (?P<seq>\d+), #new-tok
 RE_RANK = re.compile(_TS + r".*?Prefill rank batch, #new-token: (?P<tok>\d+),.*?gpu-ms: (?P<gpu>[\d.]+)")
 RE_FWD = re.compile(_TS + r".*?FWD-TIMING-PREFILL forward=(?P<fwd>\d+) tokens=(?P<tok>\d+) (?P<rest>.*)")
 RE_MS = re.compile(r"(\w+)_ms=([\d.]+)")
-RE_SERVED_P = re.compile(_TS + r".*?WEG2-SERVED group=P leg=1 rid=(?P<rid>\S+) prompt_tokens=(?P<pt>\d+)"
+RE_SERVED_P = tolerant_compile(_TS + r".*?WEG2-SERVED group=P leg=1 rid=(?P<rid>\S+) prompt_tokens=(?P<pt>\d+)"
                          r" cached_tokens=(?P<ct>\d+) wall=(?P<wall>[\d.]+)s")
-RE_SERVED_D = re.compile(_TS + r".*?WEG2-SERVED group=D leg=2 rid=(?P<rid>\S+) status=(?P<st>\d+)"
+RE_SERVED_D = tolerant_compile(_TS + r".*?WEG2-SERVED group=D leg=2 rid=(?P<rid>\S+) status=(?P<st>\d+)"
                          r" prompt_tokens=(?P<pt>\d+) cached_tokens=(?P<ct>\d+)")
-RE_FLIP = re.compile(r"WEG2-FLIP begin")
+RE_FLIP = tolerant_compile(r"WEG2-FLIP begin")
 
 
 def _epoch(ts: str) -> float:

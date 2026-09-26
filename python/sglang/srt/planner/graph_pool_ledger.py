@@ -58,6 +58,8 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import msgspec
 
+from sglang.srt.name_compat import tolerant_compile
+
 MIB = float(1 << 20)
 GIB_IN_MIB = 1024.0
 
@@ -245,7 +247,7 @@ def format_line(sample: GraphPoolSample) -> str:
 # ---------------------------------------------------------------------------
 
 _TP = r"\[(?:[0-9-]+ [0-9:]+ )?TP(\d+)\]"
-_RX_LINE = re.compile(re.escape(MARKER) + r" rank=(\d+) phase=(\S+) (.*)$")
+_RX_LINE = tolerant_compile(re.escape(MARKER) + r" rank=(\d+) phase=(\S+) (.*)$")
 _RX_KV = re.compile(r"(\w+)=(-?[0-9.]+)")
 _RX_PEAK = re.compile(
     _TP + r" \[vram-peak\] (\S+) \((-?\d+) rows\): allocator peak since pools "

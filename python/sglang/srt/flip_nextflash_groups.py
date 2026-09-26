@@ -60,6 +60,7 @@ from sglang.srt.flip_nextflash_plan import (
     FlipInfeasible,
     Weg2FlipKvRelayInfeasible,
 )
+from sglang.srt.name_compat import canonical_env
 from sglang.srt.weg2.form import PROFILE_NEXTFLASH as _PROFILE_NEXTFLASH
 from sglang.srt.weg2.form import PROFILES as _PROFILES
 
@@ -282,6 +283,9 @@ def build_group_env(
             f"expected one of {sorted(GROUP_ENV_VALUES)}"
         )
 
+    # Rename 1b: W116 judges the CANONICAL name -- a legacy/renamed spelling
+    # of a group-owned variable is the same inheritance and must not slip past.
+    base_env = canonical_env(dict(base_env))
     leaked = sorted(k for k in GROUP_OWNED_ENV if k in base_env)
     if leaked:
         reasons = "; ".join(f"{k}: {GROUP_OWNED_ENV[k]}" for k in leaked)
@@ -299,6 +303,7 @@ def build_group_env(
     env = dict(base_env)
     env.update(GROUP_ENV_VALUES[group])
     if extra:
+        extra = canonical_env(dict(extra))
         collide = sorted(k for k in extra if k in GROUP_OWNED_ENV)
         if collide:
             raise Weg2FlipGroupEnvInherited(
