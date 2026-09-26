@@ -68,6 +68,7 @@ from sglang.srt.managers.weg2_sleep_drain import (
     WEG2_SLEEP_DRAIN_BOUND_S,
     Weg2SleepDrainRefused,
     drain_until_group_verdict,
+    hold_owned_prefetch,
     refusal_message,
 )
 from sglang.srt.mem_cache.hicache_collective import collective_rank_desc
@@ -4226,7 +4227,23 @@ class SchedulerWeightUpdaterManager:
             return
         tc = sch.tree_cache
         t0 = time.monotonic()
-        first = list(sch.idle_blockers())
+        # H91e (fnFL2h91bb3): the dormant hold's own store reads span the
+        # flip by design (#1455/#1456) and target host rows only -- not a
+        # sleep term (weg2_sleep_drain.hold_owned_prefetch).
+        owned = self._weg2_hold_owned_prefetch()
+        blockers = (
+            functools.partial(sch.idle_blockers, exempt_prefetch=owned)
+            if owned
+            else sch.idle_blockers
+        )
+        if owned:
+            logger.info(
+                "H91e SLEEP-DRAIN HOLD-OWNED prefetch=%d rids=%s: store->host "
+                "reads of the #1443 dormant hold (KV pool paused; the device "
+                "load is the wake's) -- not a sleep term, they keep running",
+                len(owned), sorted(r[:12] for r in owned),
+            )
+        first = list(blockers())
         # H136: the decode-round cadence of the storage-queue agreement
         # (SGLANG_HICACHE_DRAIN_AGREE_EVERY) does not apply to this group loop
         # -- every poll agrees, as with the gate unset (see
@@ -4234,7 +4251,7 @@ class SchedulerWeightUpdaterManager:
         _forced = getattr(tc, "drain_gate_forced", None)
         with (_forced() if callable(_forced) else nullcontext()):
             verdict, polls = drain_until_group_verdict(
-                idle_blockers=sch.idle_blockers,
+                idle_blockers=blockers,
                 check_hicache_events=tc.check_hicache_events,
                 group_max=functools.partial(
                     tc.hicache_group_max, label="weg2_sleep_drain"
@@ -4242,7 +4259,7 @@ class SchedulerWeightUpdaterManager:
                 bound_s=bound_s,
             )
         waited_s = time.monotonic() - t0
-        now = list(sch.idle_blockers())
+        now = list(blockers())
         if first or polls or not verdict.idle:
             logger.warning(
                 "WEG2 SLEEP-DRAIN: waited %.2f s (%d group polls) for HiCache "
@@ -4261,6 +4278,29 @@ class SchedulerWeightUpdaterManager:
                     rank_desc=collective_rank_desc(tc),
                 )
             )
+
+    def _weg2_hold_owned_prefetch(self) -> frozenset:
+        """H91e: the open prefetch records of the #1443 dormant hold (empty
+        while the group is awake) -- see ``weg2_sleep_drain.hold_owned_prefetch``."""
+        sch = self.scheduler
+        if sch is None:
+            return frozenset()
+        return hold_owned_prefetch(
+            dormant=bool(getattr(sch, "weg2_dormant", False)),
+            hold=getattr(sch, "weg2_dormant_hold", None) or (),
+            ongoing_prefetch=getattr(
+                getattr(sch, "tree_cache", None), "ongoing_prefetch", None
+            )
+            or (),
+        )
+
+    def _weg2_sleep_idle(self) -> bool:
+        """The release leg's idle assert. H91e: with the dormant hold's own
+        reads exempt, exactly as the drain before it counted them."""
+        owned = self._weg2_hold_owned_prefetch()
+        if owned:
+            return self.is_fully_idle(exempt_prefetch=owned)
+        return self.is_fully_idle()
 
     # ------------------------------------------------------------------
     # C15 -- ranks never disagree: a rank that could not finish its half of a
@@ -8592,7 +8632,7 @@ class SchedulerWeightUpdaterManager:
         _weg2_ph("drain_hicache")
 
         assert (
-            self.is_fully_idle()
+            self._weg2_sleep_idle()
         ), "release_memory_occupation should be called only when server is idle."
 
         tags = recv_req.tags
@@ -8733,6 +8773,8 @@ class SchedulerWeightUpdaterManager:
                 # H91b: the requests /weg2/park_running parked enter the
                 # dormant hold FIRST, their store prefetch issued now so it
                 # runs during the flip (a no-op when nothing is parked).
+                # H91e: the drain of every LATER leg of this sleep exempts
+                # these reads (_weg2_hold_owned_prefetch) -- fnFL2h91bb3.
                 _hold_parked = getattr(scheduler, "weg2_d_hold_parked", None)
                 if callable(_hold_parked):
                     _hold_parked()

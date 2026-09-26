@@ -17756,7 +17756,10 @@ class Scheduler(
         except Exception as exc:  # noqa: BLE001 - a probe must never break a boot
             logger.info("POOL-PHASE %s unreadable: %r", phase, exc)
 
-    def is_fully_idle(self, for_health_check=False) -> bool:
+    def is_fully_idle(self, for_health_check=False, exempt_prefetch=()) -> bool:
+        # H91e: ``exempt_prefetch`` names open prefetch records that are not
+        # an idle term -- only the sleep leg passes it, with the dormant
+        # hold's own reads (weg2_sleep_drain.hold_owned_prefetch).
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
@@ -17808,7 +17811,7 @@ class Scheduler(
                 idle &= len(tc.ongoing_write_through) == 0
                 idle &= len(tc.ongoing_load_back) == 0
                 if tc.enable_storage:
-                    idle &= len(tc.ongoing_prefetch) == 0
+                    idle &= all(str(r) in exempt_prefetch for r in list(tc.ongoing_prefetch))
                     idle &= len(tc.ongoing_backup) == 0
 
         return idle
@@ -18345,8 +18348,9 @@ class Scheduler(
             f"rank's own optimistic answer, which is the #1268 defect itself."
         )
 
-    def idle_blockers(self) -> List[str]:
-        """Which clauses of :meth:`is_fully_idle` are currently false.
+    def idle_blockers(self, exempt_prefetch=()) -> List[str]:
+        """Which clauses of :meth:`is_fully_idle` are currently false
+        (``exempt_prefetch`` as there -- H91e).
 
         Diagnostic only -- no caller changes behaviour on it. It exists
         because "not idle" with every visible counter at zero is a state
@@ -18394,10 +18398,11 @@ class Scheduler(
                 len(tc.ongoing_load_back) == 0,
             )
             if tc.enable_storage:
+                _open = [r for r in list(tc.ongoing_prefetch) if str(r) not in exempt_prefetch]
                 _check(
-                    f"hicache_prefetch({len(tc.ongoing_prefetch)}: "
-                    f"{','.join(str(r)[:8] for r in list(tc.ongoing_prefetch)[:4])})",
-                    len(tc.ongoing_prefetch) == 0,
+                    f"hicache_prefetch({len(_open)}: "
+                    f"{','.join(str(r)[:8] for r in _open[:4])})",
+                    len(_open) == 0,
                 )
                 _check(
                     f"hicache_backup({len(tc.ongoing_backup)})",

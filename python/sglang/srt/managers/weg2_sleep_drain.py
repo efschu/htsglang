@@ -31,7 +31,7 @@ every rank at once (W120), which the leg wrapper turns into one W29 group stop
 from __future__ import annotations
 
 import time
-from typing import Callable, List, Sequence, Tuple
+from typing import Callable, Collection, FrozenSet, Iterable, List, Sequence, Tuple
 
 import msgspec
 
@@ -75,6 +75,60 @@ def local_drain_terms(blockers: Sequence[str], *, expired: bool) -> List[int]:
     """This rank's contribution: [hicache terms, other terms, expired]."""
     hicache = sum(1 for b in blockers if b.startswith("hicache"))
     return [hicache, len(blockers) - hicache, int(expired)]
+
+
+def hold_owned_prefetch(
+    *,
+    dormant: bool,
+    hold: Iterable[object],
+    ongoing_prefetch: Collection[object],
+) -> FrozenSet[str]:
+    """H91e: the open prefetch records the #1443 dormant hold OWNS -- not a
+    sleep term.
+
+    THE DEATH (boot fnFL2h91bb3 @ 50cd2884ac, 2026-09-26 15:52:39 -> 15:52:50,
+    D TP=3). The front parked the running rid weg2-16-23 (H91c2
+    ``park_running``, wait-bound-60s) and flipped D->P. D's FIRST sleep leg
+    (kv_cache + cuda_graph) drained, flushed, paused the KV pool, set
+    ``weg2_dormant`` and handed the parked request to the #1443 hold
+    (``d_park_runtime.hold_parked``) -- through the ordinary intake, which
+    registers its store read (``ongoing_prefetch``) BEFORE it holds, as #1455
+    orders: the read runs during the flip, the device load comes at the wake.
+    The SECOND sleep leg (the weights, 41 ms later) opened with this drain and
+    found ``hicache_prefetch(1: weg2-16-)`` on every rank; 887 group polls /
+    10.01 s later the bound expired -> W120 on 3/3 -> W29 -> D dead.
+
+    The poll could never have drained it. A prefetch record leaves
+    ``ongoing_prefetch`` only through ``check_prefetch_progress`` (admission,
+    the #1233 orphan collector -- which exempts held rids since #1456 --, and
+    #1456's own hold top-up), a revoke, an abort or a re-issue; the drain's
+    ``check_hicache_events`` calls none of them. And by design it must not:
+    the hold's read is meant to live across the whole flip (#1455) and to be
+    topped up while the group sleeps (#1456). Not a self-block against the
+    park's write-through (that joined at the flush, ``#1470 FLUSH-PUBLISH ...
+    joined BEFORE the reset``), not an arena ack.
+
+    WHY IT IS NOT A SLEEP TERM, and only under these conditions:
+
+    * ``dormant``: the KV pool is paused (the flag is set right after
+      ``pause(kv_cache)``). A prefetch record is a storage -> HOST operation
+      (``cache_controller.prefetch_thread_func``: into host-pool rows); its
+      device half is a load-back (``init_load_back`` at the wake or
+      admission), which is a separate term (``ongoing_load_back``) and STILL
+      blocks. With the KV pool unmapped no device target exists to pause
+      under it.
+    * the rid is in the hold: the hold is replicated (the park is a broadcast
+      control request, the intake order is the group's) and prefetch
+      registration is participation-voted, so the owned set is the same on
+      every rank; the drain's verdict is a group MAX over what remains anyway.
+
+    Everything else -- an awake group, a read of a request that is not held,
+    write-through, backup, load-back -- counts as before.
+    """
+    if not dormant or not hold or not ongoing_prefetch:
+        return frozenset()
+    held = {str(getattr(r, "rid", "")) for r in hold}
+    return frozenset(str(r) for r in list(ongoing_prefetch) if str(r) in held)
 
 
 def drain_until_group_verdict(
