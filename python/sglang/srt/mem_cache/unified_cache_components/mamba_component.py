@@ -50,6 +50,10 @@ from sglang.srt.mem_cache.mamba_ckpt_utils import (
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.managers.tp_match_floor import (
+    follow_rematch,
+    following_walk,
+    form_a_follow_admission,
+    form_a_host_zero_guard,
     group_floor_cap,
     group_floor_zeroes,
     rematch_at_group_depth,
@@ -230,6 +234,11 @@ class MambaComponent(TreeComponent):
     ) -> Callable[[UnifiedTreeNode, int], bool]:
         ct = self.component_type
         interval = self.mamba_checkpoint_interval
+        # H98: a Form A expert worker's anchors carry no bytes; inside ONE
+        # follow walk (tp_match_floor.follow_walk) the recurrent rule does not
+        # bound its match -- the KV path does, and the host decided the depth.
+        if following_walk(self.cache):
+            return lambda node, depth: True
         # #747 match seam: the anchor decision (state present AND on the
         # checkpoint grid) is the shared `is_resume_candidate` rule -- the
         # same call MambaRadixCache._match_prefix_helper makes, so the two
@@ -334,6 +343,9 @@ class MambaComponent(TreeComponent):
         req = params.req
         last_node = result.best_match_node
         interval = self.mamba_checkpoint_interval
+        # H98: inside a Form A worker's follow walk the byteless anchor is no
+        # reason to shorten or refuse anything (#747, RU/H96, #928 skipped).
+        following = following_walk(self.cache)
 
         # #747 strict resume, mirroring the SGLANG_MAMBA_CKPT_STRICT_RESUME
         # block in MambaRadixCache._match_post_processor (:1591-1607):
@@ -353,6 +365,7 @@ class MambaComponent(TreeComponent):
             and self.mamba_ckpt_strict_resume
             and self.cache.cache_controller is None
             and best_value_len > 0
+            and not following
         ):
             total_match_tokens = sum(len(v) for v in value_chunks)
             best_depth = sum(len(v) for v in value_chunks[:best_value_len])
@@ -404,13 +417,35 @@ class MambaComponent(TreeComponent):
         # pass's packed reduce, planted for the plan call only; everywhere else
         # this is a getattr miss. Zero on some rank => zero here: rc9i died
         # because TP1/TP2 refused this very rid's anchor and TP0 resumed alone.
-        if cow_mamba and group_floor_zeroes(self.cache, req, result):
+        #
+        # H98 FIRST: on a Form A group the attention host decides the depth;
+        # an expert worker adopts it on its KV path (its anchors are bytes-
+        # less bookkeeping), the host stops by name below a planted depth.
+        # None everywhere else (switch off, classic boot, no group opinion).
+        if cow_mamba and not following:
+            follow_depth = form_a_follow_admission(self.cache, req, result)
+            if follow_depth is not None:
+                if follow_depth <= 0:
+                    return zero_match_result(self.cache, result)._replace(
+                        mamba_branching_seqlen=branching_seqlen
+                    )
+                return follow_rematch(
+                    self.cache,
+                    params,
+                    follow_depth,
+                    len(result.device_indices) + int(result.host_hit_length or 0),
+                )
+        if cow_mamba and not following and group_floor_zeroes(self.cache, req, result):
             return zero_match_result(self.cache, result)._replace(
                 mamba_branching_seqlen=branching_seqlen
             )
         # H96: 0 < group < local -- admit the group depth, not the local one
         # (rc9l: TP0 extended from 19712 while TP1/TP2 extended from 16384).
-        cap = group_floor_cap(self.cache, req, result) if cow_mamba else None
+        cap = (
+            group_floor_cap(self.cache, req, result)
+            if cow_mamba and not following
+            else None
+        )
         if cap is not None:
             return rematch_at_group_depth(
                 self.cache, params, cap, len(result.device_indices) + int(result.host_hit_length or 0)
@@ -428,7 +463,7 @@ class MambaComponent(TreeComponent):
         # Both refusals keep `branching_seqlen`, as the strict-resume zeroing
         # above does: the re-prefill re-establishes the anchor at that grid
         # position, and dropping it would make the next request pay again.
-        if cow_mamba:
+        if cow_mamba and not following:
             host_value = last_node.component_data[self.component_type].host_value
             if mamba_value is None and host_value is None:
                 # (a) NO STATE AT ALL. `prepare_for_caching_req` plants such a
@@ -463,6 +498,7 @@ class MambaComponent(TreeComponent):
                         best_value_len,
                         result.host_hit_length,
                     )
+                form_a_host_zero_guard(self.cache, req, "#928 (a) no state")
                 return zero_match_result(self.cache, result)._replace(
                     mamba_branching_seqlen=branching_seqlen
                 )
@@ -519,6 +555,7 @@ class MambaComponent(TreeComponent):
                         count,
                         getattr(req, "rid", None),
                     )
+                form_a_host_zero_guard(self.cache, req, "#928 (b) foreign pool")
                 return zero_match_result(self.cache, result)._replace(
                     mamba_branching_seqlen=branching_seqlen
                 )
@@ -556,6 +593,7 @@ class MambaComponent(TreeComponent):
                     # without the matching mamba state would be silently wrong,
                     # so the whole match is zeroed.
                     self._log_mamba_slot_starvation("mamba (prefix-resume COW)")
+                    form_a_host_zero_guard(self.cache, req, "mamba slot starvation")
                     return zero_match_result(self.cache, result)
                 # #Q0 (b): the COW acquire was the other uninstrumented draw.
                 note_924d(
