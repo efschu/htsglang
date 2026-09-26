@@ -234,8 +234,12 @@ class TestLauncherNF(unittest.TestCase):
         L.P_CHUNKED_PREFILL_TOKENS = self._pc
 
     def _apply(self, *extra, model=NF_MODEL):
-        ns = L.build_parser().parse_args(["--tree", "/t", "--tag", "t", "--model", model, *extra])
-        L.apply_p_chunk_policy(ns)
+        # unified tree: ONE --p-chunk-policy installer; the NF line is
+        # --profile nextflash, and the NF defaults of the shared flags follow
+        # the argv (a flag not written reads NF's own default).
+        argv = ["--tree", "/t", "--tag", "t", "--model", model, "--profile", "nextflash", *extra]
+        ns = L.build_parser().parse_args(argv)
+        L.apply_p_chunk_policy(ns, None, argv)
         return ns
 
     def test_default_fixed_is_byte_identical(self):
