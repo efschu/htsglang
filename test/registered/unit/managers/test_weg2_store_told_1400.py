@@ -516,6 +516,8 @@ def test_1416d_on_uses_the_handed_over_page_keys_like_the_fetch(monkeypatch):
     sched, req, backend = _bigram_fixture(told=100, n_ids=102)
     hk = ["P%d" % i for i in range(60)]
     backend.written |= set(hk)
-    monkeypatch.setattr(m, "_handoff_keys", lambda rid: hk if rid == "weg2-12-8" else None)
+    # TK: the probe takes the request's chain from token 0, not the registry
+    # (which the scheduler slices at the matched head)
+    req._weg2_handoff_page_keys = hk
     assert m._anchor_clamp(sched, req, 100) == 100
     assert backend.asked[0][:60] == hk and backend.asked[0][60] == "u(1060, 1061)"

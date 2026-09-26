@@ -99,6 +99,16 @@ class Weg2StoreTold:
     #: MEMBERSHIP arrives later as :class:`Weg2StoreAdmit`. False = the
     #: pre-#1416e single-phase told (read + membership in one object).
     paced: bool = False
+    #: TK: True = ``told`` is ABSOLUTE (PP0's registered head + its store span,
+    #: TW's twin form for every request, SGLANG_WEG2_TOLD_ABSOLUTE); a follower
+    #: compares its own registered head + its own span. False = the span-
+    #: relative #1400 record (the host insert is rooted at last_host_node).
+    absolute: bool = False
+    #: TK (#1442 PP0-authoritative): digest of the hand-off chain PP0's read
+    #: used (``handoff_keys.chain_digest``; "" = own hashes). The follower
+    #: adopts it instead of deciding from its own file read. None = an old
+    #: sender (the follower decides itself, as before).
+    keys_digest: Optional[str] = None
 
 
 @dataclass
@@ -260,7 +270,18 @@ def follower_limit_tokens(tree, told: int) -> int:
     return int(told) + bigram
 
 
+def prefix_cap_tokens(tree, told: int) -> int:
+    """TK (#1419 with told > 0): the RAW-token cap that lets the radix match
+    reach exactly ``told`` KEYS. ``_weg2_cap_key_limit`` feeds it to
+    ``RadixKey(limit=...)`` and the tree's bigram view of a raw limit L has
+    L-1 keys: a cap of ``told`` stopped one key short of the anchor told
+    names, and the match fell back to an earlier anchor (or 0). Same +1 as
+    :func:`follower_limit_tokens`; told 0 still matches nothing."""
+    return follower_limit_tokens(tree, told)
+
+
 def _follower_register(scheduler, req, told: int) -> str:
+    _adopt_keys(scheduler, req)
     if told <= 0:
         return "declined:weg2_told_zero"
     verdict = scheduler._prefetch_kvcache(
@@ -355,12 +376,98 @@ def _probe_key(scheduler, req, ids, told: int):
 
 
 def _handoff_keys(rid: str):
+    """The scheduler's registry entry: P's keys SLICED AT THE MATCHED LENGTH
+    of the last registration (``keys_for_span``). Not a chain from token 0 --
+    the probe below takes :func:`_handoff_chain` instead."""
     try:
         from sglang.srt.managers.cache_controller import WEG2_HANDOFF_PAGE_KEYS
 
         return WEG2_HANDOFF_PAGE_KEYS.get(rid)
     except Exception:  # noqa: BLE001 - no registry = own hashes only
         return None
+
+
+def _handoff_chain(req):
+    """TK: the hand-off chain this request's registration read with, indexed
+    from token 0 (``req._weg2_handoff_page_keys``), or None. The #1416d probe
+    hashes the span from position 0; the registry (:func:`_handoff_keys`) is
+    sliced at the matched head, so a PP0 with a head > 0 put P's keys of
+    pages [head, ...) at page 0 and asked the store about keys nobody wrote."""
+    from sglang.srt.weg2.handoff_keys import CHAIN_ATTR, OFF_ATTR
+
+    if getattr(req, OFF_ATTR, False):
+        return None
+    chain = getattr(req, CHAIN_ATTR, None)
+    return list(chain) if chain else None
+
+
+#: TK switch: every told ABSOLUTE (head + span). Default follows the #1416d
+#: tree-key switch -- the one that makes told > 0 -- because a span-relative
+#: told > 0 against a follower whose device head is shorter than told is a
+#: named mismatch (rank exit), and any head is lost to the #1419 cap.
+ENV_ABSOLUTE = "SGLANG_WEG2_TOLD_ABSOLUTE"
+
+
+def _absolute_armed() -> bool:
+    default = "1" if _tree_key_probe_armed() else "0"
+    return os.environ.get(ENV_ABSOLUTE, default).strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _pp0_keys_digest(req) -> str:
+    from sglang.srt.weg2.handoff_keys import chain_digest
+
+    return chain_digest(_handoff_chain(req))
+
+
+def _digests(scheduler) -> Dict[str, str]:
+    d = getattr(scheduler, "_weg2_told_keys_digest", None)
+    if d is None:
+        d = scheduler._weg2_told_keys_digest = {}
+    return d
+
+
+def _note_digest(scheduler, rid: str, digest) -> None:
+    if digest is None:
+        return
+    d = _digests(scheduler)
+    d[rid] = str(digest)
+    while len(d) > 4096:
+        d.pop(next(iter(d)))
+
+
+def _adopt_keys(scheduler, req) -> None:
+    """Follower, right before a registration with PP0's told: take PP0's
+    hand-off key source (#1442, PP0-authoritative)."""
+    d = getattr(scheduler, "_weg2_told_keys_digest", None)
+    if not d:
+        return
+    digest = d.pop(_rid(req), None)
+    if digest is None:
+        return
+    try:
+        from sglang.srt.weg2 import handoff as _ho
+        from sglang.srt.weg2.handoff_keys import ADOPT_DISAGREE, adopt_pp0_decision
+
+        verdict = adopt_pp0_decision(req, digest, _ho.read)
+    except Exception as exc:  # noqa: BLE001 - never leave the registration undone
+        logger.warning("#1442 HANDOFF-KEYS adopt n/a rid=%s: %r", rid8(req), exc)
+        return
+    if verdict == ADOPT_DISAGREE:
+        logger.warning(
+            "#1442 HANDOFF-KEYS PP0-DISAGREE rank pp=%s rid=%s pp0=%s: this rank "
+            "cannot reproduce the hand-off chain PP0 read with (file gone or "
+            "different); reading with own hashes -- the told comparison at "
+            "admission names any shortfall.",
+            getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), rid8(req), digest,
+        )
+    else:
+        n = getattr(scheduler, "_tk_adopt_n", 0) + 1
+        scheduler._tk_adopt_n = n
+        if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+            logger.info("#1442 HANDOFF-KEYS ADOPT rid=%s pp0=%r verdict=%s (n=%d)",
+                        rid8(req), digest, verdict, n)
 
 
 def _anchored_pages_full_span(cc, ids, page_size: int, handoff_keys=None):
@@ -420,7 +527,7 @@ def _anchor_clamp(scheduler, req, told: int) -> int:
         if _tree_key_probe_armed():
             key, bigram = _probe_key(scheduler, req, ids, told)
             pages = _anchored_pages_full_span(
-                cc, key, page_size, handoff_keys=_handoff_keys(_rid(req))
+                cc, key, page_size, handoff_keys=_handoff_chain(req)
             )
             n = getattr(scheduler, "_1416d_probe_n", 0) + 1
             try:
@@ -498,7 +605,7 @@ def _twin_register(scheduler, req, twin: bool) -> str:
     return verdict
 
 
-def _twin_pp0_told(scheduler, tree, req, rid: str) -> int:
+def _twin_pp0_told(scheduler, tree, req, rid: str, label: str = "TW TWIN-TOLD") -> int:
     """TW: PP0's told for a released fork twin. The #1400 record counts only
     the span beyond the registration's match (the host insert is rooted at
     ``last_host_node``); a twin's point is the head it matched on the device
@@ -512,12 +619,44 @@ def _twin_pp0_told(scheduler, tree, req, rid: str) -> int:
         tree._prefetch_completed_tokens[rid] = clamped
     except Exception:  # noqa: BLE001 - a tree without the dict keeps its number
         pass
-    logger.info(
-        "#TW TWIN-TOLD rid=%s head=%d span=%d told=%d clamped=%d: the twin's told "
-        "is absolute (the followers compare head + span)",
-        rid[:12], head, span, told, clamped,
-    )
+    if label == "TW TWIN-TOLD":
+        logger.info(
+            "#TW TWIN-TOLD rid=%s head=%d span=%d told=%d clamped=%d: the twin's told "
+            "is absolute (the followers compare head + span)",
+            rid[:12], head, span, told, clamped,
+        )
+    else:
+        n = getattr(scheduler, "_tk_abs_told_n", 0) + 1
+        scheduler._tk_abs_told_n = n
+        if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+            logger.info(
+                "#%s rid=%s head=%d span=%d told=%d clamped=%d (n=%d): absolute told, "
+                "the followers compare head + span",
+                label, rid[:12], head, span, told, clamped, n,
+            )
     return clamped
+
+
+def _pp0_told_any(scheduler, tree, req, rid: str, twin: bool):
+    """(told, absolute): the twin's and -- switch on -- every request's told
+    is ABSOLUTE (TW's form); otherwise the span-relative #1400 record."""
+    if twin:
+        return _twin_pp0_told(scheduler, tree, req, rid), True
+    if _absolute_armed():
+        return _twin_pp0_told(scheduler, tree, req, rid, label="TK ABS-TOLD"), True
+    return _pp0_told(scheduler, tree, req, rid), False
+
+
+def _parked(scheduler) -> set:
+    """TK path 4: rids that left the waiting queue only for the dormant hold
+    (#1443/#1455) or the post-wake settle (#1471). They come back through the
+    release, NOT through intake -- dropping them from ``held`` left them
+    without a told for ever (weg2_store_told_pending on every rank)."""
+    out = set()
+    for attr in ("weg2_dormant_hold", "weg2_post_wake_settle"):
+        for r in getattr(scheduler, attr, None) or ():
+            out.add(_rid(r))
+    return out
 
 
 def pp0_publish(scheduler, recv_reqs: List) -> List:
@@ -538,9 +677,14 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     for _treq, _is_twin in _twin.release_due(scheduler, queued):
         _twin_register(scheduler, _treq, _is_twin)
     out: List[Weg2StoreTold] = []
+    parked = _parked(scheduler)
     for rid in list(held):
         req = held[rid]
         if rid not in queued:
+            if rid in parked:
+                # TK path 4: held by the dormant hold / settle; published
+                # once the release has queued it (PP0's record is final then).
+                continue
             # Left the queue without an admission (abort, deferral elsewhere);
             # a re-queue holds it again through intake.
             held.pop(rid, None)
@@ -555,13 +699,11 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
         if not tree.check_prefetch_progress(rid):
             continue
         twin = _twin.take_pp0_twin(scheduler, rid)
-        if twin:
-            told = _twin_pp0_told(scheduler, tree, req, rid)
-        else:
-            told = _pp0_told(scheduler, tree, req, rid)
+        told, absolute = _pp0_told_any(scheduler, tree, req, rid, twin)
         told_map[rid] = told
         held.pop(rid, None)
-        out.append((Weg2StoreToldTwin if twin else Weg2StoreTold)(rid=rid, told=told))
+        out.append((Weg2StoreToldTwin if twin else Weg2StoreTold)(
+            rid=rid, told=told, absolute=absolute, keys_digest=_pp0_keys_digest(req)))
         n = getattr(scheduler, "_weg2_store_told_published", 0) + 1
         scheduler._weg2_store_told_published = n
         if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
@@ -609,9 +751,13 @@ def _follower_absorb_impl(scheduler, recv_reqs: List) -> List:
                     early.pop(k, None)
         else:
             told_map[rid] = told
-        if getattr(item, "twin", False):
-            # TW: an absolute twin told (read-ahead or single-phase alike).
+        if getattr(item, "twin", False) or getattr(item, "absolute", False):
+            # TW: an absolute twin told (read-ahead or single-phase alike);
+            # TK: every absolute told takes the same follower mark.
             _twin.note_follower_twin(scheduler, rid)
+        # TK (#1442): PP0's key source rides to whichever registration of
+        # this rid comes next (here, at the paced Admit, or at intake).
+        _note_digest(scheduler, rid, getattr(item, "keys_digest", None))
         req = held.pop(rid, None)
         n = getattr(scheduler, "_weg2_store_told_absorbed", 0) + 1
         scheduler._weg2_store_told_absorbed = n
@@ -781,9 +927,12 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
                 rid[:8], p.told, p.window_s, now - p.published_at, pass_n - p.published_pass, n,
             )
     # (b) read-aheads for terminated reads (the single-phase checks)
+    parked = _parked(scheduler)
     for rid in list(held):
         req = held[rid]
         if rid not in queued:
+            if rid in parked:
+                continue  # TK path 4: back through the hold release
             held.pop(rid, None)
             intake_t.pop(rid, None)
             _twin.take_pp0_twin(scheduler, rid)
@@ -795,21 +944,19 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
         if not tree.check_prefetch_progress(rid):
             continue
         twin = _twin.take_pp0_twin(scheduler, rid)
-        if twin:
-            told = _twin_pp0_told(scheduler, tree, req, rid)
-        else:
-            told = _pp0_told(scheduler, tree, req, rid)
+        told, absolute = _pp0_told_any(scheduler, tree, req, rid, twin)
         _cls = Weg2StoreToldTwin if twin else Weg2StoreTold
+        _extra = {"absolute": absolute, "keys_digest": _pp0_keys_digest(req)}
         held.pop(rid, None)
         own_read_s = now - intake_t.pop(rid, now)
         if told <= 0:
             # nothing to read on any rank: single-phase, as before
             told_map[rid] = told
-            out.append(_cls(rid=rid, told=told))
+            out.append(_cls(rid=rid, told=told, **_extra))
             continue
         window = pace_window_s(own_read_s, told)
         pacing[rid] = _Pace(req=req, told=told, published_at=now, published_pass=pass_n, window_s=window)
-        out.append(_cls(rid=rid, told=told, paced=True))
+        out.append(_cls(rid=rid, told=told, paced=True, **_extra))
         n = getattr(scheduler, "_1416e_ahead_n", 0) + 1
         scheduler._1416e_ahead_n = n
         if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
@@ -864,8 +1011,9 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
     tree = scheduler.tree_cache
     # #1419: told bounds this rank's radix match (schedule_batch
     # _weg2_cap_key_limit) so no rank -- PP0 included -- admits more than told.
+    # TK: the cap is RAW tokens and told counts KEYS (prefix_cap_tokens).
     try:
-        req._weg2_prefix_cap = int(told)
+        req._weg2_prefix_cap = prefix_cap_tokens(tree, told)
     except Exception:  # noqa: BLE001
         pass
     satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None) or {}
