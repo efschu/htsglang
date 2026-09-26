@@ -13,18 +13,28 @@ WHAT. One tiny launch per form and per USE_COUNTS value, at the end of the
 scheduler init (after graph capture, before the sampling warmup's barrier and
 the first sleep): q = zeros [T, heads, head_dim], rows = -1 (nothing attended,
 the loop is masked), T = the smallest row count that selects the form. The
-specialization (heads, head_dim, dtype, the rows width K and the pool tensors,
-all constexpr or dtype keys) is the one the capture's own launch recorded
-(sparse_attn.rows_prewarm_signature), so the prewarm builds exactly the
-variants serving will launch. Each load passes the #1056 chokepoint, where
+forms are the bands of the effective rows table (sparse_attn.rows_launch_forms:
+env table for this arch, else the H101 arch default, else H20/L20), i.e. a
+function of the architecture and the table alone. The specialization (heads,
+head_dim, dtype, the rows width K and the pool tensors, all constexpr or dtype
+keys) is DERIVED (H101b) by every QSA backend of this rank from its own model
+and KV pool (QwenSparseAttnBackend.rows_prewarm_signature: the full-attention
+layer's q heads -- the DCP group's under DCP --, head_dim, the model dtype,
+K = indexer_budget + compress_ratio - 1, the pool as get_key_buffer hands it
+out, so its dtype decides the fp8 decode variant). A launch the capture
+recorded is only a second source: on an fp8 pool its weak pool reference is
+dead by now (fnFL2h91bb2: D-TP0 launched in its draft capture, the prewarm
+still read 'skipped'), and the P stages capture nothing. So the prewarm builds
+exactly the variants serving will launch, whether or not anything launched
+before it. Each load passes the #1056 chokepoint, where
 H101's census reads its LOCAL_SIZE and pre-grows the context stack
 (utils/lmem_census.py) -- so the whole local-memory need of the rows kernel is
 reached HERE, measured, printed per rank (``H101 QSA-ROWS-PREWARM``), carried
 by the first WEG2-SLEEP-LMEM line and restored at every wake.
 
-Fail-soft: no recorded launch (no attention on this rank, graphs disabled) is
-a named skip; a launch that raises is logged and the next form still runs --
-the lazy path stays what it was.
+Fail-soft: no signature (no QSA attention on this rank) is a named skip; a
+launch that raises is logged and the next form still runs -- the lazy path
+stays what it was.
 """
 
 from __future__ import annotations
@@ -49,6 +59,9 @@ class PrewarmResult(msgspec.Struct, frozen=True, kw_only=True):
     census_kernel: str = ""
     ms: float = 0.0
     errors: Tuple[str, ...] = ()
+    #: H101b: which specializations were warmed and where each came from
+    #: ("derived" = named by a QSA backend, "recorded" = a capture launch).
+    signatures: Tuple[str, ...] = ()
 
     def line(self, threads: Optional[int] = None) -> str:
         mib = ""
@@ -61,8 +74,34 @@ class PrewarmResult(msgspec.Struct, frozen=True, kw_only=True):
             f"H101 QSA-ROWS-PREWARM {self.status} forms=[{', '.join(self.forms)}] "
             f"stack {self.stack_before}->{self.stack_after} B{mib} "
             f"census_max={self.census_max_bytes}({self.census_kernel or '-'}) ms={self.ms:.0f}"
+            + (f" sigs=[{'; '.join(self.signatures)}]" if self.signatures else "")
             + (f" errors=[{'; '.join(self.errors)}]" if self.errors else "")
         )
+
+
+def describe_signature(sig: dict) -> str:
+    """``24x256 bfloat16 K2051 kv=float8_e4m3fn (derived)`` -- the line's
+    name for one specialization."""
+    kv = str(getattr(sig.get("k_pool"), "dtype", "?")).replace("torch.", "")
+    return (
+        f"{sig.get('heads')}x{sig.get('head_dim')} {str(sig.get('dtype')).replace('torch.', '')} "
+        f"K{sig.get('k')} kv={kv} ({sig.get('source') or '?'})"
+    )
+
+
+def merge_signatures(derived: Sequence[dict], recorded: Sequence[dict]) -> List[dict]:
+    """H101b: the derived signatures first, then every recorded one whose build
+    key no derived one covers (one launch per build key)."""
+    out: List[dict] = []
+    seen = set()
+    for sig in list(derived) + list(recorded):
+        key = sig.get("key")
+        if key is not None and key in seen:
+            continue
+        if key is not None:
+            seen.add(key)
+        out.append(sig)
+    return out
 
 
 def prewarm_rows_forms(
@@ -80,8 +119,9 @@ def prewarm_rows_forms(
     builds (q, rows, counts)."""
     t0 = time.perf_counter()
     if not signatures:
-        return PrewarmResult(status="skipped: no rows launch recorded on this rank "
-                                    "(no QSA attention here, or no capture ran)")
+        return PrewarmResult(status="skipped: no rows launch recorded and no QSA backend "
+                                    "on this rank names a rows specialization "
+                                    "(no QSA attention here)")
     before = stack_bytes()
     done: List[str] = []
     errors: List[str] = []
@@ -107,6 +147,7 @@ def prewarm_rows_forms(
         census_kernel=c_kernel,
         ms=(time.perf_counter() - t0) * 1000.0,
         errors=tuple(errors),
+        signatures=tuple(describe_signature(s) for s in signatures),
     )
 
 
@@ -148,8 +189,11 @@ def run_boot_prewarm() -> Optional[PrewarmResult]:
             sa.sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale, row_counts=counts)
 
         try:
+            # H101b: the backends' own signatures first; a capture record only
+            # adds a build key none of them named.
+            derived, derive_errors = sa.derived_rows_prewarm_signatures()
             res = prewarm_rows_forms(
-                signatures=sa.rows_prewarm_signatures(),
+                signatures=merge_signatures(derived, sa.rows_prewarm_signatures()),
                 forms=sa.rows_launch_forms(),
                 launch=_launch,
                 stack_bytes=_stack,
@@ -160,6 +204,10 @@ def run_boot_prewarm() -> Optional[PrewarmResult]:
                 torch.cuda.synchronize()
         finally:
             sa.close_rows_prewarm_recording()
+        if derive_errors:
+            res = msgspec.structs.replace(
+                res, errors=res.errors + tuple(f"derive {e}" for e in derive_errors)
+            )
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         threads = int(props.multi_processor_count) * int(props.max_threads_per_multi_processor)
         (logger.warning if res.errors else logger.info)("%s", res.line(threads))

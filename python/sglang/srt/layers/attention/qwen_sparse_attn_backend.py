@@ -381,6 +381,71 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+        # H101b: the boot prewarm asks every QSA backend (target, draft, draft
+        # steps) for the rows specialization it launches (weak registration).
+        from sglang.srt.layers.attention.qsa.sparse_attn import (
+            register_rows_prewarm_provider,
+        )
+
+        register_rows_prewarm_provider(self)
+
+    def rows_prewarm_signatures(self) -> list:
+        """H101b: the specializations ``_attend_rows`` launches the rows kernel
+        with on this rank -- derived from the model and the KV pool, not from a
+        launch (see qsa/rows_prewarm.py): the first full-attention layer this
+        rank's pool holds (its q heads; under DCP the group's gathered heads, as
+        ``_attend_rows`` gathers them), its head_dim, the model dtype, the rows
+        width K = indexer_budget + compress_ratio - 1 (``expand_qsa_block_indices``
+        / ``select_prefill_tokens``: 2048 + 4 - 1 = 2051 on NF) and the pool
+        tensors as ``get_key_buffer`` hands them out (fp8 or 16-bit decides the
+        decode variant). Under QSA MTP index sharing the draft decode steps
+        launch the shared selection's width (K + speculative_num_steps + 1,
+        eagle_worker_v2) as a second build. Empty when this backend launches no
+        rows kernel here."""
+        from sglang.srt.layers.attention.qsa.sparse_attn import rows_prewarm_signature
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        profile = self.qsa_profile
+        runner = self.runner
+        pool = self.token_to_kv_pool
+        if pool is None:
+            pool = getattr(runner, "token_to_kv_pool", None)
+        model = getattr(runner, "model", None)
+        if profile is None or pool is None or model is None:
+            return []
+        dtype = getattr(runner, "dtype", None)
+        if not isinstance(dtype, torch.dtype):
+            dtype = getattr(getattr(runner, "model_config", None), "dtype", None)
+        if not isinstance(dtype, torch.dtype):
+            return []
+        widths = [int(profile.budget) + int(profile.compress_ratio) - 1]
+        shared = self._mtp_shared_sparse_indices
+        if shared is not None and int(shared.indices.shape[-1]) not in widths:
+            widths.append(int(shared.indices.shape[-1]))
+        for module in model.modules():
+            if not isinstance(module, RadixAttention):
+                continue
+            try:
+                k_pool = pool.get_key_buffer(module.layer_id)
+                v_pool = pool.get_value_buffer(module.layer_id)
+            except Exception:  # noqa: BLE001 -- not a layer of this pool
+                continue
+            heads = int(module.tp_q_head_num)
+            if self.dcp_size > 1:
+                heads = int(sum(self._dcp_group_q_head_counts(heads)))
+            return [
+                rows_prewarm_signature(
+                    heads=heads,
+                    head_dim=int(module.head_dim),
+                    dtype=dtype,
+                    k=k,
+                    k_pool=k_pool,
+                    v_pool=v_pool,
+                    source="derived",
+                )
+                for k in widths
+            ]
+        return []
 
     # ------------------------------------------------------------------
     # WP3b: uneven DCP (this line's token-sharded KV pool) for the sparse
