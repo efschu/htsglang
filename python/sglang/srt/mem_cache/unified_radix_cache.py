@@ -1790,8 +1790,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
         # P-HOST-OVERLAP: a chunk publish still deferred goes out before the
         # finish path publishes its own node, so the chain keeps parents first.
-        # Nothing is deferred unless SGLANG_WEG2_P_HOST_OVERLAP=1.
-        self.weg2_flush_deferred_chunk_publish()
+        # Nothing is deferred unless SGLANG_WEG2_P_HOST_OVERLAP=1 (the only
+        # deferral site, cache_unfinished_req, asks the same switch) -- so the
+        # flush is asked under that switch too, and the off path is the stock
+        # finish, byte for byte (rc2.1m Nachzug: the unconditional call broke
+        # the h63c/h63d finish harnesses, which bind cache_finished_req alone).
+        if _weg2_p_overlap.p_host_overlap_on():
+            self.weg2_flush_deferred_chunk_publish()
         if _weg2_p_overlap.p_host_overlap_on():
             # SERVED-AFTER-ACK (xsn422/xsn423 HOLD-REFETCH, rid weg2-18-36): the
             # deferred publish of the N-1 node is issued after the LAST chunk's
