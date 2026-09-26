@@ -35,9 +35,22 @@ Ranks never disagree: every input here is replicated scheduler state
 group-reduced available count), so every rank computes the same order and the
 same gate without a collective.
 
-Stage 2 (NOT built, prepared for): seats become dynamic 1..6 with per-seat
-posts only for occupied seats.  Nothing here assumes two seats -- the order,
-the gate and the park are all functions of the live set.
+Stage 2 (H95, Nutzer-Design 25.09.): the seats are DYNAMIC, n = 1..--d-bs
+per D phase.  The front knows n at the P->D flip (``handoff_n`` + ``parked_n``
+on the kv_cache resume, H91c rule 2); :func:`phase_seats` turns that into the
+phase's seat count on every rank from the SAME replicated request -- no
+collective, no rank-local input.  Nothing here assumes two seats -- the order,
+the gate and the park are all functions of the live set; bs2 (H91b) is n = 2.
+
+What a seat costs and where (the per-seat posts; H95 report, file:line in
+the commit): the GDN/Mamba state slots (``mamba_slots_for_seats``), the
+speculative verify state (ReplaySSM spec ring rows ``spec_state_size + 1``),
+one decode CUDA graph per batch size 1..--d-bs, and -- before H95 -- expert
+pool scratch growing with n (``min(n x 4 x 10, E - R)``).  H95 A removes the
+last one (overflow waves, the scratch of bs1 serves every n); the first two
+are allocated at boot for --d-bs seats.  Loading them only for the n occupied
+seats and handing the rest to the experts per flip needs a VRAM re-partition
+at the wake (open, metal).
 """
 from __future__ import annotations
 
@@ -308,6 +321,54 @@ def mamba_slots_for_seats(
     for this shape)."""
     s = max(1, int(seats))
     return int(max(math.ceil(s * int(ratio) * float(safety)), int(ratio)))
+
+
+@dataclass(frozen=True)
+class PhaseSeats:
+    """H95: one D phase's seat count, decided at the wake of D."""
+
+    n: int
+    handoff_n: int
+    parked_n: int
+    cap: int
+    epoch: Optional[str] = None
+
+    @property
+    def clamped(self) -> bool:
+        return self.handoff_n + self.parked_n > self.cap
+
+    def line(self) -> str:
+        return (
+            "WEG2 D-PHASE-SEATS (H95) epoch=%s handoff_n=%d parked_n=%d -> n=%d of "
+            "cap %d%s: decode batch bs%d, GDN slots in use <= %d of %d (boot), "
+            "replicated from the wake request, no collective"
+            % (
+                self.epoch, self.handoff_n, self.parked_n, self.n, self.cap,
+                " (CLAMPED: the front handed more than --d-bs)" if self.clamped else "",
+                self.n, mamba_slots_for_seats(self.n), mamba_slots_for_seats(self.cap),
+            )
+        )
+
+
+def phase_seats(
+    handoff_n: Optional[int], parked_n: Optional[int], *, cap: int,
+    epoch: Optional[str] = None,
+) -> Optional[PhaseSeats]:
+    """H95: the seats of the D phase that starts with this wake -- every
+    request the ending P phase handed over plus the wait-bound-parked ones D
+    resumes first, at least 1, at most ``cap`` (= D's --max-running-requests,
+    the --d-bs upper bound). ``None`` when the wake carries no count (a P
+    wake, a pre-H91c front, a stock resume): nothing is decided then.
+
+    A pure function of the wake request's two integers and of the boot's
+    ``cap`` -- both identical on every rank (the scheduler receives the SAME
+    control request on each rank), so the ranks cannot disagree."""
+    if handoff_n is None and parked_n is None:
+        return None
+    h = max(0, int(handoff_n or 0))
+    p = max(0, int(parked_n or 0))
+    c = max(1, int(cap))
+    return PhaseSeats(n=max(1, min(h + p, c)), handoff_n=h, parked_n=p, cap=c, epoch=epoch)
 
 
 def graph_bs_covers(graph_bs: Optional[Sequence[int]], seats: int) -> bool:

@@ -56,13 +56,22 @@ DEFAULT_P_BS = 2
 #: 6 by the order of 2026-09-09 quoted above ("nicht mehr bs4").
 DEFAULT_D_BS = 6
 
-#: H91 Teil B (Nutzer-Design 25.09., Stufe 1): the Next-Flash Form-A D group
-#: decodes with TWO seats (was bs1, profile ``--d-bs 1``).  Applies only to
-#: ``--profile nextflash`` when ``--d-bs`` is not given; the seat posts (MTP
-#: verify state, GDN slots) are priced by the D-FRACTION-SOLVE for exactly
-#: this count (planner/expert_residency.seat_rebook).  Stage 2 (dynamic
-#: 1..6) will replace the constant, not this line's consumers.
-DEFAULT_D_BS_NEXTFLASH = 2
+#: H91 Teil B (Nutzer-Design 25.09.), Stufe 2 (H95): the Next-Flash Form-A D
+#: group decodes a DYNAMIC seat count n = 1..this per D phase -- the requests
+#: the P phase handed over (``handoff_n`` on the wake, weg2/d_seats.
+#: phase_seats).  This constant is the UPPER BOUND (--d-bs, D's
+#: --max-running-requests, the graph list 1..n); the seat posts (MTP verify
+#: state, GDN slots) are priced by the D-FRACTION-SOLVE for it
+#: (planner/expert_residency.seat_rebook, per n in seat_table).  Stufe 1
+#: (H91b) fixed it at 2; that is now the case n = 2.  Applies only to
+#: ``--profile nextflash`` when ``--d-bs`` is not given.
+DEFAULT_D_BS_NEXTFLASH = 6
+
+#: H95: the Next-Flash D group's expert pool runs the captured decode step in
+#: up to this many OVERFLOW WAVES (SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES), so the
+#: bs1 scratch serves every seat count (x177 form: 2 waves carry n = 1..6 on
+#: all three ranks).  Written into --env-d unless the operator states it.
+DEFAULT_D_POOL_WAVES_NEXTFLASH = 2
 
 #: K3 -- THE ORDERED P CUT, from which the solver's POOL FLOOR is DERIVED AT
 #: BOOT.  Moved here from ``launcher.py`` by the serve-next5 train (2026-09-09)

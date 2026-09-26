@@ -193,9 +193,11 @@ def allocate_pool_tables(
 def plan_width_for(max_step_ids: Optional[int]) -> int:
     """H91b: the step buffers' width (the kernel's ``WIDTH`` constexpr, a
     power of two) for the widest captured step. One bs1 MTP verify routes
-    4 rows x top-10 = 40 ids and fits the historic 64; bs2 routes 80 and needs
-    128. Never below ``PLAN_WIDTH``, so a bs1 form keeps its exact width (and
-    its kernel)."""
+    4 rows x top-10 = 40 ids and fits the historic 64; n seats route n x 40
+    (H95: n = 1..--d-bs; bs2/3 = 128, bs4..6 = 256 lanes). Never below
+    ``PLAN_WIDTH``, so a bs1 form keeps its exact width (and its kernel).
+    The width is lanes, not rows: H95's overflow waves keep the ROWS at the
+    bs1 scratch; every wave plans the same ``n x 40`` lanes."""
     if max_step_ids is None or int(max_step_ids) <= PLAN_WIDTH:
         return PLAN_WIDTH
     return _next_power_of_two(int(max_step_ids))

@@ -76,6 +76,7 @@ from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import (
     DEFAULT_D_BS,
     DEFAULT_D_BS_NEXTFLASH,
+    DEFAULT_D_POOL_WAVES_NEXTFLASH,
     DEFAULT_P_BS,
     DEFAULT_PP_ORDERED_CUT,
 )
@@ -1108,8 +1109,12 @@ def d_seat_lines(ns) -> List[str]:
     graph = _argv_int_list(extra, "--cuda-graph-bs-decode")
     out = [
         "D-SITZE (H91b): --d-bs %d (Front-Sitze), D --max-running-requests %d (wirksam), "
-        "--cuda-graph-bs-decode %s"
-        % (d_bs, seats, "Runtime-Default" if graph is None else " ".join(str(b) for b in graph))
+        "--cuda-graph-bs-decode %s%s"
+        % (d_bs, seats, "Runtime-Default" if graph is None else " ".join(str(b) for b in graph),
+           # H95: the seat count is the phase's handoff_n, this is its bound
+           (" -- H95: %d ist die OBERGRENZE, D faehrt je Phase n = 1..%d Sitze "
+            "(handoff_n beim Flip P->D, WEG2 D-PHASE-SEATS), die Sitz-Posten sind "
+            "fuer %d gebucht" % (seats, seats, seats)) if seats > 1 else "")
     ]
     if seats != d_bs:
         out.append(
@@ -1128,6 +1133,45 @@ def d_seat_lines(ns) -> List[str]:
             )
         )
     return out
+
+
+def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
+    """H95: the D-FRACTION-SOLVE once per seat count n = 1..seats (the SAME
+    ``plan_d_residency`` with ``seats=n`` -- seat_rebook re-books the posts;
+    no second pricing), rendered by ``expert_residency.describe_seat_table``.
+    Informational: the boot is priced (and refused) at the upper bound by the
+    solve above. Empty below two seats or without the pool mode / verify
+    form; never raises."""
+    try:
+        seats = d_stated_seats(ns)
+        form = d_replayssm_spec_plan_form(ns)
+        env_d = plan_kwargs.get("env_d") or {}
+        pool = str(env_d.get(er.POOL_GRAPH_MODE_ENV, "")).strip().lower() == "pool"
+        if seats is None or int(seats) < 2 or form is None or not pool:
+            return []
+        import json
+        import os
+
+        import msgspec
+
+        with open(os.path.join(ns.model, "config.json")) as fh:
+            cfg = json.load(fh)
+        top_k = int((cfg.get("text_config") or cfg).get("num_experts_per_tok") or 0)
+        if top_k <= 0:
+            return []
+
+        def plan_for(n):
+            return er.plan_d_residency(
+                **plan_kwargs, seats=n,
+                replayssm_spec=msgspec.structs.replace(form, max_running=n))
+
+        rows = er.seat_table(
+            plan_for, seats_max=int(seats), verify_tokens=int(form.draft_tokens),
+            top_k=top_k, waves=er.pool_overflow_waves(env_d))
+        return list(er.describe_seat_table(rows, marker=D_RANK_SOLVE_MARKER, label=label))
+    except Exception as exc:  # noqa: BLE001 -- an informational table never kills a launch
+        return ["%s FRACTION-SOLVE %s D-SITZE (H95) Tabelle entfaellt: %s: %s"
+                % (D_RANK_SOLVE_MARKER, label, type(exc).__name__, exc)]
 
 
 def d_seat_graph_mib(ns) -> Optional[List[float]]:
@@ -11384,6 +11428,25 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         return
     for line in plan.lines:
         log(line)
+    # H95: the seats are dynamic 1..--d-bs per D phase -- the same solve per
+    # seat count n (seat_rebook re-books the seat posts), one line each.
+    for _ln in d_seat_table_lines(ns, _er, dict(
+            model_path=ns.model,
+            budgets_mib=[float(b) for b in budgets_d],
+            ratios=[float(x) for x in ratios],
+            fractions=[float(x) for x in fr_d],
+            scratch_rows=[int(x) for x in scratch],
+            rank_tp_ratio=",".join(tp_ratio),
+            env_d=_env_d,
+            reference_logs=ns.d_residency_reference_logs,
+            kv_tokens=CONTEXT_LENGTH_TOKENS,
+            label=label,
+            marker=D_RANK_SOLVE_MARKER,
+            card_reference_logs=getattr(ns, "d_card_reference_logs", "") or "",
+            seat_graph_mib=d_seat_graph_mib(ns),
+            reference_seats=int(getattr(ns, "d_residency_reference_seats", 1) or 1),
+    ), label):
+        log(_ln)
     if plan.refusal is not None:
         log(f"{D_RANK_SOLVE_MARKER} {plan.refusal}")
         raise Weg2LaunchRefused(plan.refusal)
@@ -14339,15 +14402,38 @@ def bs_source(flag: str, argv: Optional[Sequence[str]] = None) -> str:
 
 
 def apply_profile_d_bs_default(ns, argv: Sequence[str]) -> int:
-    """H91b (Nutzer-Design 25.09., Stufe 1): ``--profile nextflash`` without an
-    explicit ``--d-bs`` runs D with ``DEFAULT_D_BS_NEXTFLASH`` (2) seats instead
-    of the 27B-era ``DEFAULT_D_BS`` (6). An explicit ``--d-bs`` always wins
+    """H91b/H95 (Nutzer-Design 25.09.): ``--profile nextflash`` without an
+    explicit ``--d-bs`` runs D with up to ``DEFAULT_D_BS_NEXTFLASH`` (6) seats
+    -- the UPPER BOUND of the dynamic seat count n = 1..6 per D phase
+    (``d_seats.phase_seats`` from the wake's handoff_n); H91b's fixed 2 is the
+    case n = 2. An explicit ``--d-bs`` always wins and stays the hard bound
     (``bs_source``: a told value is a choice, even when it equals a default).
     Returns the resolved value."""
     if (getattr(ns, "profile", None) == PROFILE_NEXTFLASH
             and bs_source("--d-bs", argv) == "default"):
         ns.d_bs = DEFAULT_D_BS_NEXTFLASH
     return int(ns.d_bs)
+
+
+def apply_profile_d_pool_waves_default(ns) -> Optional[str]:
+    """H95: ``--profile nextflash`` runs D's expert pool with
+    ``DEFAULT_D_POOL_WAVES_NEXTFLASH`` overflow waves unless ``--env-d``
+    states SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES itself (0 = the H91b bound).
+    Written INTO ``ns.env_d`` so the D-FRACTION-SOLVE (which reads --env-d)
+    and the D group's environment (build_env applies --env-d last) see ONE
+    value. Returns the line naming it, or None when nothing was added."""
+    from sglang.srt.planner.expert_residency import POOL_OVERFLOW_WAVES_ENV
+
+    if getattr(ns, "profile", None) != PROFILE_NEXTFLASH:
+        return None
+    env_d = str(getattr(ns, "env_d", "") or "")
+    if POOL_OVERFLOW_WAVES_ENV in parse_group_env(env_d):
+        return None
+    item = "%s=%d" % (POOL_OVERFLOW_WAVES_ENV, DEFAULT_D_POOL_WAVES_NEXTFLASH)
+    ns.env_d = (env_d.rstrip(";") + ";" + item) if env_d.strip() else item
+    return ("D-POOL-WELLEN (H95): --profile nextflash -> --env-d %s (Ueberlaufwellen: "
+            "der bs1-Scratch traegt jede Sitzzahl 1..--d-bs; --env-d %s=0 = die "
+            "H91b-Schranke)" % (item, POOL_OVERFLOW_WAVES_ENV))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -14357,9 +14443,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # shape anyway) must never make a fast pre-spawn refusal look post-spawn.
     _ACTIVE_BOOT_STATE = None
     ns = build_parser().parse_args(argv)
-    # H91b: the Next-Flash form's own D seat default (2), before anything
-    # reads --d-bs.
+    # H91b/H95: the Next-Flash form's own D seat bound (6, dynamic 1..6 per
+    # phase) and its pool waves, before anything reads --d-bs or --env-d.
     apply_profile_d_bs_default(ns, list(sys.argv[1:] if argv is None else argv))
+    _h95_waves_line = apply_profile_d_pool_waves_default(ns)
+    if _h95_waves_line:
+        print(_h95_waves_line, flush=True)
     # WEG2-FORM: resolved ONCE, before apply_spec_form (--form-draft and
     # --form-p-draft may drive --spec-form / --draft-kv-on-p /
     # --dflash-produce-on-p), and PUBLISHED into this process's own environment
