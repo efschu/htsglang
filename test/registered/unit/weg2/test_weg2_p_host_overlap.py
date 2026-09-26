@@ -150,6 +150,50 @@ class TestDeferredPublish(unittest.TestCase):
         self.assertLess(src.index("self.weg2_flush_deferred_chunk_publish()"),
                         src.index("req.pop_committed_kv_cache()"))
 
+    def test_finish_retires_done_copies_before_it_serves(self):
+        # xsn422/423 HOLD-REFETCH: the N-1 publish's copy is done at the finish
+        # but its ack was never polled (PP0 sat in the last chunk's output
+        # wait), so the page was not COMPLETE when the response went out
+        src = inspect.getsource(urc.UnifiedRadixCache.cache_finished_req)
+        i_flush = src.index("self.weg2_flush_deferred_chunk_publish()")
+        i_gate = src.index("if _weg2_p_overlap.p_host_overlap_on():", i_flush)
+        i_poll = src.index("self.writing_check()", i_gate)
+        # the NON-blocking branch (write_back=False): never waits for a copy
+        self.assertNotIn("write_back=True", src[i_poll:i_poll + 40])
+        for later in ("req.pop_committed_kv_cache()", "self._weg2_handoff_write(req, radix_key)",
+                      "self._weg2_publish_at_retain(req, radix_key)"):
+            self.assertLess(i_poll, src.index(later), later)
+
+    def test_poll_retires_only_complete_acks(self):
+        # writing_check(write_back=False): Event.query() decides, a copy still
+        # running stays pending -- the finish never waits for it
+        done_ids, events = [], []
+
+        class _Ev:
+            def __init__(self, done):
+                self.done = done
+
+            def query(self):
+                return self.done
+
+            def synchronize(self):
+                if not self.done:
+                    raise AssertionError("the finish poll waited for a running copy")
+
+            def elapsed_time(self, other):
+                return 0.0
+
+        c = types.SimpleNamespace()
+        c.cache_controller = types.SimpleNamespace(ack_write_queue=[
+            (_Ev(True), _Ev(True), [1]), (_Ev(False), _Ev(False), [2])])
+        c._count_ready_acks = types.MethodType(urc.UnifiedRadixCache._count_ready_acks, c)
+        c._drain_depth_every = 0
+        c.pp_rank = 0
+        c._finish_write_through_ack = lambda ack_id: done_ids.append(ack_id)
+        urc.UnifiedRadixCache.writing_check(c)
+        self.assertEqual(done_ids, [1])
+        self.assertEqual(len(c.cache_controller.ack_write_queue), 1)
+
 
 class TestLoopWiring(unittest.TestCase):
     def test_flush_sits_after_the_launch_and_before_the_output_commit(self):
