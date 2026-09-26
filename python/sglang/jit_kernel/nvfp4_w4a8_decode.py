@@ -11,6 +11,11 @@ splits K over the warps of a CTA (deterministic shared-memory reduction). See th
 
 Requirements (else the caller falls back to N4A's GEMM): Kp % 128 == 0 and K == Kp (no K padding), 16-B aligned
 rows. All Qwen3.8-27B shards satisfy both (uneven-TP block [128, 128]).
+
+``SGLANG_W4A8_DECODE_FUSED_QUANT=1`` (default 0, row 25 of the fLLiper release table): the GEMV quantises the bf16
+activation itself (separate JIT module ``nvfp4_w4a8_decode_fused_sm86``) instead of a quant launch before it -- same
+int8 values, same scales, same accumulation order, i.e. bit-identical output, one kernel per linear instead of two.
+The in-kernel hand-over uses a 3-counter semaphore per (device, weight, stream); see the .cuh header.
 """
 
 from __future__ import annotations
@@ -51,6 +56,23 @@ def _jit_module() -> Module:
     )
 
 
+@cache_once_per_arch
+def _jit_fused_module() -> Module:
+    # A separate module: the default path's artefact (nvfp4_w4a8_decode_sm86) does not carry the fused kernels.
+    return load_jit(
+        "nvfp4_w4a8_decode_fused_sm86",
+        cuda_files=["gemm/nvfp4_w4a8_decode_sm86.cuh"],
+        cuda_wrappers=[("fused_gemm", "nvfp4_w4a8_decode_fused_gemm")],
+        extra_cuda_cflags=[
+            "-ftz=false",
+            "-prec-div=true",
+            "-prec-sqrt=true",
+            "-lineinfo",
+            "-DSGL_W4A8_DEC_FUSED=1",
+        ],
+    )
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, default))
@@ -61,6 +83,31 @@ def _env_int(name: str, default: int) -> int:
 def decode_max_m() -> int:
     """``SGLANG_W4A8_DECODE_MAX_M`` (default 48, 0 disables the decode GEMV)."""
     return max(0, min(DECODE_MAX_M, _env_int("SGLANG_W4A8_DECODE_MAX_M", DECODE_MAX_M)))
+
+
+def fused_quant_enabled() -> bool:
+    """``SGLANG_W4A8_DECODE_FUSED_QUANT`` (default off): activation quantisation inside the GEMV."""
+    return os.environ.get("SGLANG_W4A8_DECODE_FUSED_QUANT", "0").strip().lower() in ("1", "true", "on", "yes")
+
+
+#: (device index, weight data_ptr, stream handle) -> int32[4] semaphore of the fused GEMV. A launch leaves its
+#: semaphore at zero; two launches that may run CONCURRENTLY must not share one, and launches of one weight on one
+#: stream never do (stream order). Created on the first call of a (weight, stream) -- the warm-up before any CUDA graph
+#: capture -- and kept for the process lifetime (16 B each).
+_FUSED_SEMS: dict = {}
+
+
+def _stream_handle(device: torch.device) -> int:
+    return int(torch.cuda.current_stream(device).cuda_stream)
+
+
+def fused_semaphore(weight: torch.Tensor) -> torch.Tensor:
+    key = (weight.device.index, weight.data_ptr(), _stream_handle(weight.device))
+    sem = _FUSED_SEMS.get(key)
+    if sem is None:
+        sem = torch.zeros(4, dtype=torch.int32, device=weight.device)
+        _FUSED_SEMS[key] = sem
+    return sem
 
 
 def mode_for_m(m: int) -> int:
@@ -152,6 +199,36 @@ def decode_gemm(
     return out
 
 
+def decode_fused(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+    out_features: int,
+    cfg: Optional[Tuple[int, int, int, int]] = None,
+    sem: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """bf16 [M, Kp] -> bf16 [M, out_features] in ONE launch (activation quantised inside the GEMV)."""
+    assert x.dtype == torch.bfloat16 and x.dim() == 2 and x.stride(-1) == 1
+    m, kp = x.shape
+    if cfg is None:
+        cfg = config_for(m, weight.shape[0], kp)
+    mode, kw, rw, u = cfg
+    xq = torch.empty((m, kp), dtype=torch.int8, device=x.device)
+    xs = torch.empty((m,), dtype=torch.float32, device=x.device)
+    out = torch.empty((m, out_features), dtype=torch.bfloat16, device=x.device)
+    gs = weight_global_scale.reshape(1)
+    if gs.dtype != torch.float32:
+        gs = gs.to(torch.float32)
+    ws = weight_scale.view(torch.uint8) if weight_scale.dtype != torch.uint8 else weight_scale
+    if sem is None:
+        sem = fused_semaphore(weight)
+    _jit_fused_module().fused_gemm(
+        out, x, xq, xs, weight, ws, gs, sem, int(out_features), int(mode), int(kw), int(rw), int(u)
+    )
+    return out
+
+
 def nvfp4_w4a8_decode_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -165,5 +242,7 @@ def nvfp4_w4a8_decode_linear(
     m = x.shape[0]
     if cfg is None:
         cfg = config_for(m, weight.shape[0], weight.shape[1] * 2)
+    if fused_quant_enabled():
+        return decode_fused(x, weight, weight_scale, weight_global_scale, out_features, cfg)
     xq, xs = quantize_activation(x, permuted=(cfg[0] == 1))
     return decode_gemm(xq, xs, weight, weight_scale, weight_global_scale, out_features, cfg)
