@@ -405,6 +405,10 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         # Measured before (x144/x145 D-TP0): every transient of this method
         # stayed a dead block of a live private pool, 4.6 GiB of the 4.9 GiB
         # private-free that capped the 5090 at 94 expert rows.
+        # Dense 27B (W8A8-INT8 target, no repack): the only WNA16 module is the
+        # DFlash2-W8 drafter; weg2xsn423/xsn424 measured its dead blocks in the
+        # live ``weights_draft`` pool at 431/209/199 MiB (D TP0-2), 771 MiB (P
+        # PP2) -- the 27B line's port 3c9bfeff95, one code path since UNIFY S2.
         if dense_repack_outside_pool_armed():
             from sglang.srt.managers.weg2_memory_saver import outside_tag_pool
 

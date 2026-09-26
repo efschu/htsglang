@@ -751,6 +751,10 @@ class Envs:
     # pool. On D-TP0 those dead blocks were 4.6 of the 4.9 GiB private-free
     # (weights pool 1.22 GiB = lm_head, bands 3.45 GiB). False = the
     # 2026-09-24 form, byte for byte (everything born in the tag pool).
+    # UNIFY S2: ONE switch for both profiles. The 27B line ported the same code
+    # under the same name with default False (3c9bfeff95), but every 27B arm
+    # since xsn426 and docker/profiles/27b.env set it to 1 -- the default True
+    # is therefore the booted form of both lines; 0 stays the old form.
     SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL = EnvBool(True)
     # SEQ_LANE_RING (H44, Task #17): the on-card HOST lanes (c0/c1/c2,
     # /dev/shm/weg2-seq-<boot>/c<card>[_s1]_unit_buffer.bin) were sized to
