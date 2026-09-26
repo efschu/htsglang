@@ -49,7 +49,11 @@ from sglang.srt.mem_cache.mamba_ckpt_utils import (
     retention_shrinks_protected,
 )
 from sglang.srt.runtime_context import get_server_args
-from sglang.srt.managers.tp_match_floor import group_floor_zeroes
+from sglang.srt.managers.tp_match_floor import (
+    group_floor_cap,
+    group_floor_zeroes,
+    rematch_at_group_depth,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -403,6 +407,13 @@ class MambaComponent(TreeComponent):
         if cow_mamba and group_floor_zeroes(self.cache, req, result):
             return zero_match_result(self.cache, result)._replace(
                 mamba_branching_seqlen=branching_seqlen
+            )
+        # H96: 0 < group < local -- admit the group depth, not the local one
+        # (rc9l: TP0 extended from 19712 while TP1/TP2 extended from 16384).
+        cap = group_floor_cap(self.cache, req, result) if cow_mamba else None
+        if cap is not None:
+            return rematch_at_group_depth(
+                self.cache, params, cap, len(result.device_indices) + int(result.host_hit_length or 0)
             )
 
         mamba_value = last_node.component_data[self.component_type].value
