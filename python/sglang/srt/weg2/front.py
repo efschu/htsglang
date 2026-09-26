@@ -3026,17 +3026,29 @@ class Front:
             return "failed"
         known = [r for r in rids if r in D.outstanding]
         unknown = [r for r in rids if r not in D.outstanding]
-        for r in known:
+        # H91c3-2: a hand-off already in ``D.outstanding`` whose leg 2 had not
+        # reached D's scheduler when the park came (tokenizer / HTTP pipe) is
+        # in neither of D's lists. A D that answers ``late_hold`` holds every
+        # request reaching it after the park behind the park (d_park_runtime.
+        # hold_late_arrival; after the sleep the #1443 hold) -- parked for the
+        # front too, or the drain waited for its whole decode. No new rid
+        # enters D.outstanding meanwhile: admit_d went False above, and a
+        # seat without an outstanding entry held the park back (handing_off).
+        late: List[str] = []
+        if phase_policy.park_late_hold(code, text):
+            late = [r for r in self._flip_ledger(D) if r not in rids]
+        for r in known + late:
             self._d_parked[r] = t_park
-        self.counters["d_parked"] += len(known)
+        self.counters["d_parked"] += len(known) + len(late)
+        self.counters["d_parked_in_flight"] += len(late)
         still = self._flip_ledger(D)
         logger.warning(
             "WEG2 PARK-RUNNING epoch=%d reason=%s status=%d parked=%d rids=%s unknown_to_front=%s "
-            "still_running=%s rpc_s=%.2f -- parked requests stay in flight (client streams open, "
-            "no requeue, no second leg 1) and continue in the next D phase before the new ones; "
-            "the D->P drain waits only for still_running",
-            self.epoch, body["reason"], code, len(known), known[:8], unknown[:8], still[:8],
-            time.time() - t_park)
+            "in_flight_held=%s still_running=%s rpc_s=%.2f -- parked requests stay in flight "
+            "(client streams open, no requeue, no second leg 1) and continue in the next D phase "
+            "before the new ones; the D->P drain waits only for still_running",
+            self.epoch, body["reason"], code, len(known) + len(late), known[:8], unknown[:8],
+            late[:8], still[:8], time.time() - t_park)
         return "parked"
 
     # ---------------- seat / gate bookkeeping (C4, C5) ----------------

@@ -211,3 +211,19 @@ def park_verdict(status: int, text: str) -> Tuple[str, List[str], str]:
     if not isinstance(held, list) or not all(isinstance(r, str) for r in held):
         return PARK_FAILED, [], f"http 200 with a malformed held list: {str(text)[:200]}"
     return PARK_PARKED, list(rids) + [r for r in held if r not in rids], ""
+
+
+def park_late_hold(status: int, text: str) -> bool:
+    """H91c3-2: did D's park answer promise to hold every request that reaches
+    it after the park (``"late_hold": true``)? Only then are the front's
+    hand-offs still in flight to D's scheduler (in ``D.outstanding``, in
+    neither of D's lists) parked for the front too. Anything else -- an old D,
+    a failed park, a malformed body -- is False: the drain waits for them as
+    before."""
+    if status != 200:
+        return False
+    try:
+        js = json.loads(text)
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(js, dict) and js.get("late_hold") is True
