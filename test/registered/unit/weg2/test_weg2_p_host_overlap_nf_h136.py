@@ -140,9 +140,13 @@ class ResetAndGroups(unittest.TestCase):
             self.assertEqual(L.p_host_overlap_env(False, False), {})
             self.assertEqual(L.p_host_overlap_lines(False, False), [])
             on = L.p_host_overlap_env(True, False)
+            # unified tree: the 27B form of the switch set (6b24aa60da adds
+            # the FLA l2norm run-time bound to --p-host-overlap's group-P env)
             self.assertEqual(on, {pov.P_HOST_OVERLAP_ENV: "1",
                                   pov.SKIP_PURE_CHUNK_OUTPUT_ENV: "1",
-                                  pov.P_NOSYNC_ENV: "1"})
+                                  pov.P_NOSYNC_ENV: "1",
+                                  pov.L2NORM_RUNTIME_T_ENV: "1"})
+            self.assertEqual(on, pov.launcher_env_p_host_overlap())
 
 
 if __name__ == "__main__":
