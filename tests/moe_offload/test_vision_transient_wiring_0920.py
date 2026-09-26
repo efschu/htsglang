@@ -180,15 +180,21 @@ def test_every_non_route_verdict_has_a_W_CODE_in_the_handler():
     }
     # the verdict set is exactly the refusals plus route plus stage, and the
     # last two are NOT refusals -- so the dict must cover the refusals and
-    # nothing else can reach it
+    # nothing else can reach it. H125b adds ONE verdict with its own branch
+    # (W125, input_embeds/audio_data on the native /generate): the dict
+    # branch excludes it, so it never reaches the dict's KeyError.
     assert set(fr.__dict__[n] for n in dir(fr) if n.startswith("VERDICT_")) == (
-        refusals | {fr.VERDICT_ROUTE, fr.VERDICT_STAGE}
+        refusals | {fr.VERDICT_ROUTE, fr.VERDICT_STAGE, fr.VERDICT_REFUSE_EMBEDS}
     )
     for v in refusals:
         assert f"VERDICT_{v.upper().replace('-', '_')}:" in src
     assert "W101 Weg2VisionRefused" in src
     assert "W103 Weg2VideoRefused" in src
     assert "W104 Weg2VisionModeUnknown" in src
+    generic = src.index("elif _verdict != VERDICT_ROUTE and _verdict != VERDICT_REFUSE_EMBEDS:")
+    own = src.index("elif _verdict == VERDICT_REFUSE_EMBEDS:")
+    assert generic < own  # the dict branch never sees the embeds verdict
+    assert "W125 Weg2InputEmbedsRefused" in src[own:]
 
 
 def test_the_transient_mode_now_ROUTES_instead_of_refusing():
