@@ -87,6 +87,9 @@ logger = logging.getLogger(__name__)
 P_HOST_OVERLAP_ENV = "SGLANG_WEG2_P_HOST_OVERLAP"
 P_HOSTGAP_ENV = "SGLANG_WEG2_P_HOSTGAP"
 SKIP_PURE_CHUNK_OUTPUT_ENV = "SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM"
+#: P-NOSYNC: the per-chunk cache path never makes the host wait on a stream --
+#: see `p_nosync_on` for the three sites and the measurement.
+P_NOSYNC_ENV = "SGLANG_WEG2_P_NOSYNC"
 
 
 def p_host_overlap_on() -> bool:
@@ -98,10 +101,38 @@ def hostgap_on() -> bool:
     return os.environ.get(P_HOSTGAP_ENV, "") == "1"
 
 
+def p_nosync_on() -> bool:
+    """P-NOSYNC: no host wait on a CUDA stream in the per-chunk cache path.
+
+    MEASURED (weg2xsn422, --p-host-overlap + #PGAP): the host still sat 409-604
+    ms per 4096 chunk in the ANCHOR (plan_parts anchor), and py-spy on PP0 put
+    1731 of 2357 samples on ONE line: ``MambaSlotAllocator._do_alloc``'s
+    ``self.slot_used[select_index] = True``. Assigning a Python scalar into a
+    CUDA tensor copies the scalar host->device with ``non_blocking=False``,
+    which PyTorch completes with ``cudaStreamSynchronize`` on the CURRENT
+    stream -- the schedule stream, which carries the fence of the forward that
+    is still running. So the "anchor" waited for the whole forward; the D2D
+    anchor copy itself never blocked. Every such host read/write in the chunk
+    path is the same trap:
+
+    * ``MambaSlotAllocator``: ``index_fill_`` (device scalar) instead of the
+      scalar assignment in alloc/free, and the #924 double-free answer read
+      from PINNED host memory once its event is complete;
+    * ``HiCacheController._refuse_unaddressable_kv_rows`` (#923): the bounds
+      check is computed on the device and read at the next check/ack, not by
+      ``int(rows.max())`` on the host;
+    * ``HiCacheController.move_indices`` (direct + layer_first): the device
+      indices stay on the device (permuted there) instead of ``.cpu()``.
+
+    Set for group P by the launcher's ``--p-host-overlap``; unset = the stock
+    code paths, byte-identical."""
+    return os.environ.get(P_NOSYNC_ENV, "") == "1"
+
+
 def launcher_env_p_host_overlap() -> Dict[str, str]:
     """The group-P environment ``--p-host-overlap`` adds. ONE place, read by the
     launcher and pinned by the tests, so the two halves cannot drift."""
-    return {P_HOST_OVERLAP_ENV: "1", SKIP_PURE_CHUNK_OUTPUT_ENV: "1"}
+    return {P_HOST_OVERLAP_ENV: "1", SKIP_PURE_CHUNK_OUTPUT_ENV: "1", P_NOSYNC_ENV: "1"}
 
 
 def launcher_env_p_hostgap() -> Dict[str, str]:
