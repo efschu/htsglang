@@ -23,6 +23,8 @@ from sglang.srt.distributed.pp_typed_channel import (
     stash_typed,
     typed_inbox,
 )
+from sglang.srt.weg2 import p_layer_split as _pls_S  # --p-layer-split row key
+from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt
 from sglang.srt.distributed.pp_object_recv import get_or_create_frame
 from sglang.srt.distributed.utils import pp_gapped_ownership_active
 from sglang.srt.managers import weg2_store_told
@@ -10444,6 +10446,21 @@ class SchedulerPPMixin:
             if isinstance(raw, dict)
             else None
         )
+        # --p-layer-split dynamic: PP0's layer-cut row for THIS frame's
+        # forward, popped under the same law as the admission row (a list
+        # left in the frame would reach the model / graph copy). A row on an
+        # unarmed rank means the group disagrees about the mode: crash-stop.
+        _pls_row = (
+            raw.pop(_pls_S.ROW_KEY, None) if isinstance(raw, dict) else None
+        )
+        if _pls_row is not None:
+            _pls = _pls_rt.active()
+            if _pls is None:
+                raise _pls_S.LayerSplitDivergence(
+                    f"{_pls_S.LOG_TAG}: a layer-split row reached a rank without "
+                    "the split armed (group P disagrees about --p-layer-split)"
+                )
+            _pls.push_row(_pls_row)
         # #631 ROW AUTHORITY: reset before the parse, so a frame without a
         # row can never hand the pre-plan consumer a previous pass's
         # decision (a pass that receives nothing must inherit nothing).

@@ -7204,8 +7204,20 @@ class SchedulerWeightUpdaterManager:
             # device may be appended after the pause in this block.
             # #1457: no KV zeroing before a pause that discards the pages (the
             # mamba/req_to_token resets in the flush still run on mapped pages).
+            # --p-layer-split dynamic: land the pulls/refill the last forward
+            # announced while the mirror pages are still mapped (no-op static)
+            from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt
+
+            _pls = _pls_rt.active()
+            if _pls is not None:
+                _pls.on_sleep()
+                logger.info("%s", _pls.census_line())
             self.flush_cache(zero_kv=False)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            if _pls is not None and _pls.modules:
+                # the swing weights sleep with the KV pool (their own tag,
+                # outside the exchanged family); refilled from home on wake
+                self.memory_saver_adapter.pause(_pls_rt.SWING_WEIGHTS_TAG)
             _weg2_ph("kv_pause")
             # W25 Weg2DormantRefused (S1 boot killer K2): from this statement
             # on the req-index / KV / mamba pools are unmapped, so the
@@ -7699,6 +7711,15 @@ class SchedulerWeightUpdaterManager:
             if not self._weg2_kv_group_verdict(True, _kv_epoch):
                 return False  # a sibling refused: the verdict paused this rank's pool again
             self._weg2_kv_resumed_epoch = _kv_epoch
+            # --p-layer-split dynamic: the swing weights come back with the
+            # pool, content undefined until PP0's refill row (no-op static)
+            from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt
+
+            _pls = _pls_rt.active()
+            if _pls is not None:
+                if _pls.modules:
+                    self.memory_saver_adapter.resume(_pls_rt.SWING_WEIGHTS_TAG)
+                _pls.on_wake()
             _weg2_ph("kv_resume")
             scheduler = self.scheduler
             if scheduler is not None and weg2_memory_saver_on:

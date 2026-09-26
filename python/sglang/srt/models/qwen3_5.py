@@ -250,6 +250,15 @@ if _is_npu:
     )
 
 
+def _p_layer_split_swing(model) -> frozenset:
+    """--p-layer-split dynamic: the swing layers this stage built beyond its
+    home interval (their weights load like home ones); empty under static."""
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        layers = getattr(getattr(model, "model", None), "layers", None)
+    return getattr(layers, "swing_layers", None) or frozenset()
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -1675,6 +1684,23 @@ class Qwen3_5ForCausalLM(nn.Module):
         from sglang.srt.distributed.pp_crossing_wire import build_wire_for_model
 
         self.pp_crossing_wire = build_wire_for_model(config, self.pp_group)
+        # --p-layer-split dynamic: the stage's split runtime when THIS stack is
+        # the armed target model on this stage (make_layers installed it) --
+        # also on a stage without a window: its executed range shrinks when
+        # the upstream boundary rises, and it sends pulls. None otherwise
+        # (static, a draft's one-layer stack, group D): every hook in
+        # forward() below is then skipped.
+        from sglang.srt.weg2.p_layer_split_runtime import active as _pls_active
+
+        _rt = _pls_active()
+        self._p_layer_split = (
+            _rt
+            if _rt is not None
+            and int(config.num_hidden_layers) == _rt.geom.num_layers
+            and int(self.pp_group.rank_in_group) == _rt.stage
+            and int(self.pp_group.world_size) == _rt.stages
+            else None
+        )
 
         # Final normalization
         if self.pp_group.is_last_rank:
@@ -1760,6 +1786,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.layers_to_capture = layers_to_capture
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+        if getattr(self, "_p_layer_split", None) is not None:
+            # swing modules may already be detached from self.layers
+            self._p_layer_split.mark_capture(layers_to_capture)
 
     @property
     def start_layer(self) -> int:
@@ -1817,8 +1846,22 @@ class Qwen3_5ForCausalLM(nn.Module):
         # assemble every stage's captures in layer-id order.
         captured_layer_ids = []
         # Pass through decoder layers
-        for layer_idx in owned_layer_ids(self.layers, self.start_layer, self.end_layer):
-            layer = self.layers[layer_idx]
+        # --p-layer-split dynamic: THIS forward's executed layers (home
+        # extended by swing layers, or home minus the head an upstream stage
+        # ran), decided by PP0 and adopted from the row; None = static, the
+        # loop below is exactly the owned iteration.
+        _pls = self._p_layer_split
+        _layer_iter = owned_layer_ids(self.layers, self.start_layer, self.end_layer)
+        if _pls is not None:
+            _layer_iter = _pls.layer_ids(_layer_iter)
+        for layer_idx in _layer_iter:
+            layer = (
+                self.layers[layer_idx]
+                if _pls is None
+                else _pls.module(layer_idx, self.layers[layer_idx])
+            )
+            if _pls is not None:
+                _pls.before_layer(layer_idx)
             # #753: receive whatever a peer computed since this rank's last
             # layer. Identity on the contiguous path.
             hidden_states, residual = self.pp_crossing_wire.before_layer(
@@ -1856,6 +1899,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             # would have carried forward itself. Identity on the contiguous
             # path.
             self.pp_crossing_wire.after_layer(layer_idx, hidden_states, residual)
+            if _pls is not None:
+                _pls.after_layer(layer_idx)
 
             if _LAYER_NORM_TRACE:
                 _trace_layer_norms(layer_idx, hidden_states, residual)
@@ -1946,6 +1991,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 layer_id is not None
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
+                and layer_id not in _p_layer_split_swing(self)
             ):
                 continue
 
@@ -2090,6 +2136,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 layer_id is not None
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
+                and layer_id not in _p_layer_split_swing(self)
             ):
                 continue
 
@@ -2314,6 +2361,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 layer_id is not None
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
+                and layer_id not in _p_layer_split_swing(self)
             ):
                 continue
 
@@ -2574,6 +2622,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 layer_id is not None
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
+                and layer_id not in _p_layer_split_swing(self)
             ):
                 continue
 

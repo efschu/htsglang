@@ -19,8 +19,8 @@ Pinned without a GPU (design: /spinning/gpu-arb/docs/DYN_LAYER_SPLIT.md):
     mirror + write-back gives bit-identical outputs and bit-identical HOME
     pools; a prefix gather/scatter over two ranks' own req_to_token rows
     moves exactly the request's rows;
-  * STATIC IS IDENTICAL -- no env, no launcher env/argv change by default,
-    'dynamic' refuses the boot until the executor is wired.
+  * STATIC IS IDENTICAL -- no env, no launcher env/argv change by default;
+    'dynamic' arms group P's env (executor: test_weg2_p_layer_split_exec_0926).
 """
 
 from __future__ import annotations
@@ -232,7 +232,9 @@ class TestRanksAgree(unittest.TestCase):
             self.assertEqual(sum((list(p) for p in parts), []), list(range(64)))
             for s in (1, 2):
                 self.assertEqual(fol[s].incoming(got[s]), fol[s - 1].swing(got[s - 1]))
-            self.assertEqual(fol[0].graph_ok(got[0]), got[0].cut == spec.geometry.home_cuts)
+            # per stage: a stage keeps its graph while ITS range is home
+            self.assertEqual(fol[0].graph_ok(got[0]), got[0].cut[0] == spec.geometry.home_cuts[0])
+            self.assertEqual(fol[2].graph_ok(got[2]), got[2].cut[1] == spec.geometry.home_cuts[1])
             cuts.append(row.cut)
             pos += w
         for a, b in zip(cuts, cuts[1:]):
@@ -423,22 +425,26 @@ class TestStaticIdentical(unittest.TestCase):
         L.apply_p_layer_split(ns)
         self.assertEqual(L.p_layer_split_env(), {})
 
-    def test_launcher_dynamic_refuses(self):
+    def test_launcher_dynamic_arms(self):
         from sglang.srt.weg2 import launcher as L
 
         base = ["--tree", "/t", "--tag", "t", "--p-layer-split", "dynamic"]
         ns = L.build_parser().parse_args(base)
         with self.assertRaises(SystemExit):          # incomplete spec
             L.apply_p_layer_split(ns)
+        self.assertEqual(L.p_layer_split_env(), {})
         ns = L.build_parser().parse_args(base + [
             "--p-layer-split-home", "48,56", "--p-layer-split-window", "3,3",
             "--p-layer-split-model", "27b_nvfp4_rc9j"])
-        with self.assertRaises(SystemExit) as cm:    # complete spec: plans printed, boot refused
-            L.apply_p_layer_split(ns)
-        msg = str(cm.exception.code)
-        self.assertIn("P-LAYER-SPLIT armed", msg)
-        self.assertIn("P-LAYER-SPLIT plan", msg)
-        self.assertIn("REFUSED", msg)
+        try:
+            L.apply_p_layer_split(ns)                # complete spec: armed, env for group P
+            lines = "\n".join(L._P_LAYER_SPLIT["lines"])
+            self.assertIn("P-LAYER-SPLIT armed", lines)
+            self.assertIn("P-LAYER-SPLIT plan", lines)
+            self.assertIn("P-LAYER-SPLIT slab", lines)
+            self.assertEqual(L.p_layer_split_env()[S.POLICY_ENV], "dynamic")
+        finally:
+            L.apply_p_layer_split(L.build_parser().parse_args(["--tree", "/t", "--tag", "t"]))
         self.assertEqual(L.p_layer_split_env(), {})
 
 

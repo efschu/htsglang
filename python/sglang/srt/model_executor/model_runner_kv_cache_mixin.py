@@ -2179,6 +2179,11 @@ class ModelRunnerKVCacheMixin:
         if self.pp_size <= 1:
             return n_global, n_global
         n_local = sum(1 for lid in layers if self.start_layer <= lid < self.end_layer)
+        # --p-layer-split dynamic: the swing GDN mirrors are state-pool
+        # shaped, one per swing layer -- charged like owned layers. +0 static.
+        from sglang.srt.weg2.p_layer_split_runtime import swing_extra_layer_counts
+
+        n_local += swing_extra_layer_counts(self.start_layer, self.end_layer)[1]
         return n_local, n_global
 
     def _stage_local_mamba_cache_per_req(self: ModelRunner, config) -> int:
@@ -6812,6 +6817,16 @@ class ModelRunnerKVCacheMixin:
             )
 
         self._init_pools()
+        # --p-layer-split dynamic: allocate this stage's swing mirrors (KV for
+        # swing attention layers, state for swing GDN layers; same slot frame
+        # as the pools, inside their memory-saver region) and route the pool
+        # accessors to them for swing ids. The configurator above already
+        # priced them (pool_configurator: swing_extra_layers). No-op under
+        # static and on any runner without swing modules (draft, group D).
+        if not self.is_draft_worker:
+            from sglang.srt.weg2.p_layer_split_runtime import bind_pools as _pls_bind
+
+            _pls_bind(self.token_to_kv_pool, self.req_to_token_pool)
 
     # ------------------------------------------------------------------
     # #656: the flip seam as a sizing post. See

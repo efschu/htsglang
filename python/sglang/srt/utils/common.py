@@ -2083,6 +2083,17 @@ def make_layers(
         if pp_rank is not None and pp_size is not None
         else (0, num_hidden_layers)
     )
+    # --p-layer-split dynamic (weg2/p_layer_split_runtime.py): this stage also
+    # BUILDS the head layers of the next stage's span (its swing window),
+    # under their own memory-saver tag; ownership (start/end, every
+    # home-keyed consumer) stays the home interval. () under static.
+    from sglang.srt.weg2.p_layer_split_runtime import swing_window_for
+
+    swing = (
+        swing_window_for(num_hidden_layers, pp_rank, pp_size, (start_layer, end_layer))
+        if pp_rank is not None and pp_size is not None
+        else ()
+    )
     modules = torch.nn.ModuleList(
         [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
         + get_offloader().wrap_modules(
@@ -2090,10 +2101,16 @@ def make_layers(
             **(offloader_kwargs or {}),
         )
         + [
-            PPMissingLayer(return_tuple=return_tuple)
-            for _ in range(end_layer, num_hidden_layers)
+            (
+                _make_layer(idx)
+                if idx in swing
+                else PPMissingLayer(return_tuple=return_tuple)
+            )
+            for idx in range(end_layer, num_hidden_layers)
         ]
     )
+    if swing:
+        modules.swing_layers = frozenset(swing)
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer

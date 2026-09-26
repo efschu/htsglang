@@ -1345,14 +1345,18 @@ def p_chunk_policy_lines() -> List[str]:
 #: (pure); design and evidence /spinning/gpu-arb/docs/DYN_LAYER_SPLIT.md.
 #: 'static' (the default until the metal ladder) changes NOTHING: no env, no
 #: line, argv and the P form key byte-identical. 'dynamic' builds and prints
-#: the spec and its dry-run plans, then REFUSES the boot: the rank-side
-#: executor (resident swing window, write-back on the proxy frame, row on the
-#: #791 decision, graph bypass, swing weights across the flip) is not wired
-#: yet (DYN_LAYER_SPLIT.md sec. 7), and a dynamic arm that silently ran the
-#: static cut would measure the wrong thing.
+#: the spec, the swing slab and its dry-run plans and hands group P the spec
+#: env; the rank-side executor is weg2/p_layer_split_runtime.py (resident
+#: swing window under tag weights_swing, write-back on the proxy frame, the
+#: row on the #791 decision, prefix pull + weight refill upstream, graph
+#: bypass for non-home cuts). With PREFIX PULL by default (sec. 5: without
+#: pull there is no gain); --p-layer-split-pull-gbps 0 is the V1 frontier.
 P_LAYER_SPLIT_DEFAULT = "static"
+#: the measured x4-3080 BAR1 rate that bounds both 27B P edges (card probe
+#: 14.4 / 6.5 / 13.3 GB/s) -- the planner's price of a pull
+P_LAYER_SPLIT_PULL_GBPS_DEFAULT = 6.5
 P_LAYER_SPLIT_DRY_RUN_TOKENS = (32768, 131072)
-_P_LAYER_SPLIT: Dict[str, object] = {"policy": P_LAYER_SPLIT_DEFAULT, "spec": None}
+_P_LAYER_SPLIT: Dict[str, object] = {"policy": P_LAYER_SPLIT_DEFAULT, "spec": None, "lines": ()}
 
 
 def _int_list(raw: str, what: str) -> Tuple[int, ...]:
@@ -1392,7 +1396,8 @@ def p_layer_split_spec_from_ns(ns):
             max_tokens=P_CHUNK_MAX_DEFAULT, min_tokens=p_prefill_graph_bucket() or 512,
             fixed_tokens=p_prefill_graph_bucket() or 512, page=1,
             graph_buckets=tuple(p_prefill_graph_buckets()), eager=True)
-        pull = float(getattr(ns, "p_layer_split_pull_gbps", 0.0) or 0.0)
+        _pull_raw = getattr(ns, "p_layer_split_pull_gbps", None)
+        pull = P_LAYER_SPLIT_PULL_GBPS_DEFAULT if _pull_raw is None else float(_pull_raw)
         extra = _pls.ExtraCosts(
             _pls.WritebackPrice(2048, 1634304, tuple(6.5 for _ in home), True),
             floors[: len(home) + 1], tuple(pull for _ in home) if pull > 0 else ())
@@ -1414,18 +1419,66 @@ def apply_p_layer_split(ns) -> None:
         raise SystemExit(f"--p-layer-split {policy!r}: one of {list(_pls.POLICIES)}")
     _P_LAYER_SPLIT["policy"] = policy
     _P_LAYER_SPLIT["spec"] = None
+    _P_LAYER_SPLIT["lines"] = ()
     if policy == _pls.POLICY_STATIC:
         return
+    if os.environ.get(PP_LAYER_SET_ENV, "").strip() or getattr(ns, "pp_layer_set", None):
+        raise SystemExit("--p-layer-split dynamic: REFUSED -- a layer SET (SGLANG_PP_LAYER_SET / "
+                         "--pp-layer-set) is not the contiguous home cut the split mirrors")
     spec = p_layer_split_spec_from_ns(ns)
+    ratio = str(getattr(ns, "pp_stage_ratio", "") or "")
+    if ratio:
+        counts = _int_list(ratio, "--pp-stage-ratio")
+        ends = tuple(sum(counts[: i + 1]) for i in range(len(counts) - 1))
+        if ends != spec.geometry.home_cuts:
+            raise SystemExit(f"--p-layer-split dynamic: REFUSED -- --pp-stage-ratio {ratio} cuts at "
+                             f"{list(ends)} but --p-layer-split-home is {list(spec.geometry.home_cuts)}; "
+                             f"the home cut IS the P partition (one cut, one author)")
     lines = ["WEG2 " + _pls.armed_line(spec, "group=P")]
+    lines += ["WEG2 " + x for x in p_layer_split_slab_lines(spec)]
     for n in P_LAYER_SPLIT_DRY_RUN_TOKENS:
         res = _pls.plan_split(n, spec.geometry, spec.model, spec.limits, min_gain=spec.min_gain,
                               extra=spec.extra)
         lines.append("WEG2 " + _pls.plan_line(res, key=f"dry-run-{n}", end=n)
                      + " (HOCHRECHNUNG on the model, not a measurement)")
-    raise SystemExit(
-        "\n".join(lines) + "\n--p-layer-split dynamic: REFUSED -- the rank-side executor is not "
-        "wired yet (DYN_LAYER_SPLIT.md sec. 7); the plan above is the desk prediction only.")
+    _P_LAYER_SPLIT["spec"] = spec
+    _P_LAYER_SPLIT["lines"] = tuple(lines)
+    for line in lines:
+        print(line, flush=True)
+
+
+def p_layer_split_swing_by_stage(n_stages: int) -> Tuple[Tuple[int, int], ...]:
+    """The planner's swing post: (attention, linear) swing layers per P stage;
+    () under static or when the spec's stage count is not P's."""
+    from sglang.srt.weg2 import p_layer_split as _pls
+
+    spec = _P_LAYER_SPLIT.get("spec")
+    if spec is None or spec.geometry.stages != int(n_stages):
+        return ()
+    g = spec.geometry
+    out = []
+    for s in range(g.stages):
+        win = tuple(g.swing_window(s))
+        na = sum(1 for i in win if g.families[i] == _pls.FAMILY_ATTENTION)
+        out.append((na, len(win) - na))
+    return tuple(out)
+
+
+def p_layer_split_slab_lines(spec) -> List[str]:
+    """The swing slab per stage as the planner's post (weights from the rc9
+    checkpoint census, DYN_LAYER_SPLIT.md sec. 2; the rank-side sizer prices
+    the mirrors exactly, pool_configurator swing_extra_layer_counts)."""
+    from sglang.srt.weg2 import p_layer_split as _pls
+
+    g = spec.geometry
+    out = []
+    for s in range(g.stages - 1):
+        win = tuple(g.swing_window(s))
+        na = sum(1 for i in win if g.families[i] == _pls.FAMILY_ATTENTION)
+        out.append(f"{_pls.LOG_TAG} slab stage={s} window={list(win)} attention={na} gdn={len(win) - na} "
+                   f"(KV mirror = {na} x pool x 2048 B/token, state mirror = {len(win) - na} x mamba slots "
+                   f"x 1.56 MiB, weights resident under tag weights_swing)")
+    return out
 
 
 def p_layer_split_env() -> Dict[str, str]:
@@ -11561,6 +11614,8 @@ def solve_p_cut(
         # --p-prefill-graph: the SAME vector the ranks book (env_p, see
         # p_prefill_graph_env); () when off -- the pool model is unchanged.
         prefill_graph_pool_mib=p_prefill_graph_pool_mib(ns),
+        # --p-layer-split dynamic: the swing slab per stage; () under static.
+        swing_layers_by_stage=p_layer_split_swing_by_stage(len(budgets_p)),
         activation_reserve_mib=float(ns.pp_cut_activation_reserve_mib),
         # #1257c: None = follow the reserve (the runtime charges exactly it);
         # a number = the operator pinned it.
@@ -12610,8 +12665,11 @@ def build_parser() -> argparse.ArgumentParser:
              "are byte-identical. 'dynamic' = PP0 moves each boundary chunk by chunk "
              "inside [--p-layer-split-home, home + --p-layer-split-window] (upstream "
              "stage executes the head of its neighbour's home span from a mirror and "
-             "writes KV/GDN state back; non-home cuts run eager). Desk stage: prints "
-             "the spec and dry-run plans, then refuses (executor not wired).")
+             "writes KV/GDN state back; a rise pulls the prefix from home over the PP "
+             "link; non-home cuts run eager, the home cut keeps its graphs; the planner "
+             "stays on the home cut wherever it predicts < --p-layer-split-min-gain). "
+             "Rank lines 'P-LAYER-SPLIT runtime/slab/plan/census', 'PREFILL-GRAPH eager "
+             "reason=layer_split'.")
     ap.add_argument(
         "--p-layer-split-home", default="", metavar="CUT",
         help="Only with --p-layer-split dynamic: the home cut as stage ends, e.g. 41,53.")
@@ -12629,10 +12687,12 @@ def build_parser() -> argparse.ArgumentParser:
              "(weg2/p_stage_model.py), a JSON path or a name under p_stage_model_data/ "
              "(27b_int8_rc9j, 27b_nvfp4_rc9j).")
     ap.add_argument(
-        "--p-layer-split-pull-gbps", type=float, default=0.0, metavar="GBPS",
-        help="Only with --p-layer-split dynamic: allow a cut to RISE mid-request, pulling "
-             "the KV prefix / GDN state of the newly swung layers at this BAR1 rate "
-             "(0 = default: rises only on a fresh request's first chunk).")
+        "--p-layer-split-pull-gbps", type=float, default=None, metavar="GBPS",
+        help="Only with --p-layer-split dynamic: the link rate the planner prices a "
+             "PREFIX PULL at (a cut RISING mid-request pulls the KV prefix / GDN state "
+             "of the newly swung layers from home). Default "
+             f"{P_LAYER_SPLIT_PULL_GBPS_DEFAULT} (the x4-3080 edge); 0 = V1 (rises only on a "
+             "fresh request's first chunk, no pull).")
     ap.add_argument(
         "--p-layer-split-min-gain", type=float, default=0.01, metavar="FRACTION",
         help="Only with --p-layer-split dynamic: a moving cut is taken only when "

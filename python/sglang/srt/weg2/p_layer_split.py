@@ -459,6 +459,41 @@ def stage_times(geom: SplitGeometry, model, cut: Cut, m_exec: int, m_real: int,
     return tuple(out)
 
 
+def stage_graph_ok(geom: SplitGeometry, cut: Cut, s: int) -> bool:
+    """May stage ``s`` replay its captured prefill graph under ``cut``? Only
+    when it executes exactly its HOME range (both of its boundaries home):
+    the graph captured that layer loop and nothing else."""
+    h = geom.home_cuts
+    return (s == 0 or cut[s - 1] == h[s - 1]) and (s == geom.stages - 1 or cut[s] == h[s])
+
+
+def forward_times(geom: SplitGeometry, model, cut: Cut, c: int, prefix: int, limits: _pcp.ChunkLimits,
+                  extra: Optional[ExtraCosts] = None) -> Tuple[float, ...]:
+    """Per-stage ms of one forward of a ``c``-token chunk under ``cut``, each
+    stage in ITS OWN mode: a stage whose range is home keeps its graph (at the
+    bucket width), a stage whose range moved runs eager (at the real width,
+    with the host floor). This is what the runtime does (``FollowerCursor.
+    graph_ok`` per stage)."""
+    na = geom.counts(cut)
+    counts = tuple(n for n, _ in na)
+    attn = tuple(a for _, a in na)
+    m_graph, eager_graph = limits.exec_shape(int(c))
+    out = []
+    for s in range(geom.stages):
+        if stage_graph_ok(geom, cut, s):
+            m_exec, eager = m_graph, eager_graph
+        else:
+            m_exec, eager = int(c), True
+        t = model.stage_ms(counts, s, int(m_exec), int(prefix), "eager" if eager else "graph", attn)
+        if extra is not None:
+            if eager and extra.eager_host_ms_per_layer:
+                t = max(t, counts[s] * extra.eager_host_ms_per_layer[s])
+            if extra.writeback is not None:
+                t += extra.writeback.ms(geom, cut, s, int(c))
+        out.append(t)
+    return tuple(out)
+
+
 _MODEL_KEYS: Dict[int, Tuple[object, str]] = {}
 
 
@@ -491,30 +526,85 @@ def check_layout(geom: "SplitGeometry", model) -> None:
         raise LayerSplitError("stage model layer layout differs from the split geometry's")
 
 
+_STAGE_T: Dict[tuple, Dict[tuple, Tuple[float, ...]]] = {}
+
+
+def _stage_times_cached(geom: SplitGeometry, model, cut: Cut, c: int, prefix: int,
+                        limits: _pcp.ChunkLimits, extra: Optional[ExtraCosts]) -> Tuple[float, ...]:
+    """``forward_times`` memoised per (geometry, model, limits, extra): the
+    refine loop prices the same (cut, width, prefix) thousands of times."""
+    outer = (geom, model_key(model), limits.key(), extra)
+    inner = _STAGE_T.get(outer)
+    if inner is None:
+        if len(_STAGE_T) > 16:
+            _STAGE_T.clear()
+        inner = _STAGE_T[outer] = {}
+    key = (tuple(cut), int(c), int(prefix))
+    hit = inner.get(key)
+    if hit is None:
+        if len(inner) > 400000:
+            inner.clear()
+        hit = inner[key] = forward_times(geom, model, cut, c, prefix, limits, extra)
+    return hit
+
+
+def pull_layers(geom: SplitGeometry, before: Cut, cut: Cut, b: int) -> Tuple[int, ...]:
+    """Layers boundary ``b``'s upstream stage must PULL from home before it
+    executes ``cut`` when its mirrors are valid up to ``before``."""
+    return tuple(range(int(before[b]), int(cut[b]))) if int(cut[b]) > int(before[b]) else ()
+
+
 def makespan(chunks: Sequence[int], cuts: Sequence[Cut], start: int, geom: SplitGeometry,
              model: FamilyStageModel, limits: _pcp.ChunkLimits,
              extra: Optional[ExtraCosts] = None) -> float:
     """Exact flow shop (``p_chunk_policy.makespan_ms``) with a per-chunk cut.
-    A chunk whose cut is not home executes EAGER (no captured graph)."""
+    A chunk whose cut is not home executes EAGER (no captured graph).
+
+    A RISE (pull mode) adds a precedence, not just a transfer: stage b may
+    run its newly swung layers of chunk j only after home (stage b+1) has
+    executed those layers for chunk j-1 and the pull crossed the link. The
+    pulled layers are the HEAD of home's executed range in chunk j-1 (the
+    frontier equals chunk j-1's cut), and the runtime sends right after the
+    last of them (async, inside home's forward) and receives right before
+    the first of them on stage b. So the pulled share of stage b's time (by
+    layer count) waits for ``start[b+1](j-1) + head share of ts[b+1](j-1)
+    + pull_ms``; stage b's layers below overlap the wait."""
     S = geom.stages
     k = limits.max_inflight or S
     fin = [0.0] * S
     last: List[float] = []
     p = int(start)
+    pulls = extra is not None and bool(extra.pull_gbps)
     before: Optional[Cut] = None if int(start) == 0 else geom.home_cuts
+    start_prev = [0.0] * S
+    ts_prev: Tuple[float, ...] = tuple(0.0 for _ in range(S))
     for i, (c, cut) in enumerate(zip(chunks, cuts)):
-        m_exec, eager = limits.exec_shape(int(c))
-        if tuple(cut) != geom.home_cuts:
-            m_exec, eager = int(c), True
-        ts = stage_times(geom, model, cut, m_exec, int(c), p, eager, extra)
-        if extra is not None and before is not None and extra.pull_gbps:
-            ts = tuple(t + extra.pull_ms(geom, before, cut, s, p) for s, t in enumerate(ts))
-        before = tuple(cut)
+        cut = tuple(cut)
+        ts = _stage_times_cached(geom, model, cut, int(c), p, limits, extra)
+        wait: Dict[int, Tuple[float, float]] = {}
+        if pulls and before is not None:
+            n_exec = geom.counts(cut)
+            n_prev = geom.counts(before)
+            for b in range(S - 1):
+                new = pull_layers(geom, before, cut, b)
+                if new:
+                    head = len(new) / float(max(1, n_prev[b + 1][0]))
+                    avail = start_prev[b + 1] + ts_prev[b + 1] * head + extra.pull_ms(geom, before, cut, b, p)
+                    wait[b] = (avail, len(new) / float(max(1, n_exec[b][0])))
+        before = cut
         prev = last[i - k] if i >= k else 0.0
+        starts = [0.0] * S
         for s in range(S):
-            f = max(fin[s], prev) + ts[s]
+            t0 = max(fin[s], prev)
+            starts[s] = t0
+            if s in wait:
+                avail, frac = wait[s]
+                f = max(t0 + ts[s] * (1.0 - frac), avail) + ts[s] * frac
+            else:
+                f = t0 + ts[s]
             fin[s] = f
             prev = f
+        start_prev, ts_prev = starts, ts
         last.append(prev)
         p += int(c)
     return fin[-1] if S else 0.0
@@ -527,13 +617,10 @@ def balanced_cut(geom: SplitGeometry, model: FamilyStageModel, c: int, prefix: i
     home), among cuts dominated by ``ceiling`` (the frontier rule); with
     ``before`` (the previous chunk's cut) a rise pays its pull."""
     best, best_key = geom.home_cuts, None
-    m_home, eager_home = limits.exec_shape(int(c))
     for cut in geom.cut_options():
         if ceiling is not None and not dominated(cut, ceiling):
             continue
-        home = cut == geom.home_cuts
-        ts = stage_times(geom, model, cut, m_home if home else int(c), int(c), prefix,
-                         eager_home if home else True, extra)
+        ts = _stage_times_cached(geom, model, cut, int(c), prefix, limits, extra)
         if extra is not None and before is not None and extra.pull_gbps:
             ts = tuple(t + extra.pull_ms(geom, before, cut, s, prefix) for s, t in enumerate(ts))
         key = (round(max(ts), 6), sum(cut))
@@ -552,15 +639,20 @@ def trajectory(chunks: Sequence[int], start: int, geom: SplitGeometry, model: Fa
     drain is where a flow shop and a per-chunk bottleneck disagree)."""
     pulls = extra is not None and bool(extra.pull_gbps)
     ceiling: Optional[Cut] = None if (allow_rise or pulls) else geom.home_cuts
+    # A warm first chunk (start > 0) cannot rise even with pulls: a pull is
+    # announced on the PREVIOUS forward of the same request (the home stage
+    # sends after it), and a warm request has none -- home until chunk 2.
+    warm_head = pulls and int(start) > 0
     out: List[Cut] = []
     p = int(start)
     mk = model_key(model)
     before: Optional[Cut] = None if int(start) == 0 else geom.home_cuts
-    for c in chunks:
-        key = (geom, mk, limits.key(), int(c), p, ceiling, extra, before if pulls else None)
+    for j, c in enumerate(chunks):
+        ceil_j = geom.home_cuts if (warm_head and j == 0) else ceiling
+        key = (geom, mk, limits.key(), int(c), p, ceil_j, extra, before if pulls else None)
         cut = _BALANCED.get(key)
         if cut is None:
-            cut = balanced_cut(geom, model, int(c), p, limits, ceiling, extra,
+            cut = balanced_cut(geom, model, int(c), p, limits, ceil_j, extra,
                                before if pulls else None)
             if len(_BALANCED) > 200000:
                 _BALANCED.clear()
@@ -577,6 +669,8 @@ def trajectory(chunks: Sequence[int], start: int, geom: SplitGeometry, model: Fa
         lo = out[i - 1] if i > 0 else None
         for cut in geom.cut_options():
             if cut == out[i]:
+                continue
+            if warm_head and i == 0 and cut != geom.home_cuts:
                 continue
             if not pulls:
                 if lo is not None and not dominated(cut, lo):
@@ -642,7 +736,7 @@ def _chunk_candidates(start: int, end: int, limits: _pcp.ChunkLimits, ramps: boo
 def plan_split(prompt_len: int, geom: SplitGeometry, model: FamilyStageModel,
                limits: _pcp.ChunkLimits, *, start: int = 0, min_gain: float = DEFAULT_MIN_GAIN,
                ramps: Optional[bool] = None, allow_rise: Optional[bool] = None,
-               extra: Optional[ExtraCosts] = None) -> SplitPlan:
+               extra: Optional[ExtraCosts] = None, dyn_candidates: int = 0) -> SplitPlan:
     """Joint chunk widths + per-chunk cut for ``prompt_len`` tokens from
     ``start``. ``allow_rise`` defaults to ``start == 0`` (V1: no prefix pull)."""
     n = int(prompt_len)
@@ -654,31 +748,41 @@ def plan_split(prompt_len: int, geom: SplitGeometry, model: FamilyStageModel,
     use_ramps = limits.ramps if ramps is None else bool(ramps)
     rise = (int(start) == 0) if allow_rise is None else bool(allow_rise)
     key = (int(start), int(start) + n, geom, model_key(model), limits.key(), use_ramps, rise,
-           float(min_gain), extra)
+           float(min_gain), extra, int(dyn_candidates))
     hit = _PLANS.get(key)
     if hit is None:
-        hit = _plan(int(start), int(start) + n, geom, model, limits, use_ramps, rise, float(min_gain), extra)
+        hit = _plan(int(start), int(start) + n, geom, model, limits, use_ramps, rise, float(min_gain), extra,
+                    int(dyn_candidates))
         if len(_PLANS) > 512:
             _PLANS.clear()
         _PLANS[key] = hit
     return hit
 
 
-def _plan(start, end, geom, model, limits, ramps, rise, min_gain, extra) -> SplitPlan:
+def _plan(start, end, geom, model, limits, ramps, rise, min_gain, extra, dyn_candidates=0) -> SplitPlan:
+    """Every chunk candidate is priced at the home cut; the moving cut is
+    searched on all of them (``dyn_candidates`` 0) or only on the
+    ``dyn_candidates`` best home candidates -- the runtime bound: PP0 plans
+    in its scheduler loop, and the full search costs ~1 s at 128k."""
     home = geom.home_cuts
-    best_home: Optional[Tuple[float, str, List[int]]] = None
-    best_dyn: Optional[Tuple[float, str, List[int], Tuple[Cut, ...]]] = None
-    for name, chunks in _chunk_candidates(start, end, limits, ramps):
+    priced: List[Tuple[float, int, str, List[int]]] = []
+    for idx, (name, chunks) in enumerate(_chunk_candidates(start, end, limits, ramps)):
         hms = makespan(chunks, [home] * len(chunks), start, geom, model, limits, extra)
-        if best_home is None or hms < best_home[0] - 1e-9:
-            best_home = (hms, name, chunks)
+        priced.append((hms, idx, name, chunks))
+    best_home = min(priced, key=lambda x: (x[0], x[1]))
+    pool = sorted(priced, key=lambda x: (x[0], x[1]))
+    if dyn_candidates and dyn_candidates > 0:
+        pool = pool[: int(dyn_candidates)]
+    pool.sort(key=lambda x: x[1])
+    best_dyn: Optional[Tuple[float, str, List[int], Tuple[Cut, ...]]] = None
+    for _hms, _idx, name, chunks in pool:
         cuts = trajectory(chunks, start, geom, model, limits, rise, extra)
         if all(c == home for c in cuts):
             continue
         dms = makespan(chunks, cuts, start, geom, model, limits, extra)
         if best_dyn is None or dms < best_dyn[0] - 1e-9:
             best_dyn = (dms, name, chunks, cuts)
-    hms, hname, hchunks = best_home
+    hms, _i, hname, hchunks = best_home
     if best_dyn is None or best_dyn[0] > hms * (1.0 - min_gain):
         return SplitPlan(start, tuple(hchunks), tuple([home] * len(hchunks)), hms, hms, tuple(hchunks),
                          "home" if best_dyn is None else "home(hysteresis)")
@@ -782,23 +886,67 @@ def split_from_env(env: Mapping[str, str]) -> Optional[SplitSpec]:
 # the Besitzkarte: PP0 decides per forward, everyone else follows the row
 
 
+#: One pull entry of a row: (slot, boundary, lo, hi, end). ``slot`` = the
+#: request's index in THIS forward's batch order (#791 makes it rank-uniform),
+#: ``boundary`` b = stage b PULLS layers [lo, hi) of stage b+1's home span,
+#: ``end`` = the request's position after this forward (the prefix the pull
+#: carries: KV rows [0, end) of every pulled attention layer, the GDN state
+#: at end of every pulled GDN layer).
+Pull = Tuple[int, int, int, int, int]
+
+
 @dataclasses.dataclass(frozen=True)
 class ForwardRow:
-    """What crosses the wire per forward (inside the #791 decision row)."""
+    """What crosses the wire per forward (inside the #791 decision row).
+
+    ``pulls`` are ANNOUNCED here and executed around the NEXT forward: the
+    home stage b+1 sends after THIS forward (its state is then current),
+    stage b receives right before the first pulled layer of its next
+    forward. Announcing one forward ahead is what makes the pull
+    deadlock-free: the row reaches b+1 with this forward's frame, long
+    before b needs the data."""
 
     version: int
     digest: str
     cut: Cut
     gdn_wb: bool
+    pulls: Tuple[Pull, ...] = ()
+    #: swing WEIGHTS refill after a wake (their pages came back unmapped-
+    #: then-remapped, content undefined): every home stage sends its window
+    #: layers' weights upstream at the START of this forward, every mirror
+    #: stage receives them at the start of its next one. The leader forces
+    #: this forward to the home cut, so nothing executes a swing layer before
+    #: the weights landed.
+    refill: bool = False
+    #: short hash of the batch's request order (``batch_order``); the slots
+    #: of ``pulls`` index it, so every rank checks it against its own batch
+    order: str = ""
 
     def encode(self) -> List[object]:
-        return [int(self.version), str(self.digest), [int(c) for c in self.cut], int(bool(self.gdn_wb))]
+        return [int(self.version), str(self.digest), [int(c) for c in self.cut], int(bool(self.gdn_wb)),
+                [[int(x) for x in p] for p in self.pulls], int(bool(self.refill)), str(self.order)]
 
     @classmethod
     def decode(cls, raw: Sequence[object]) -> "ForwardRow":
-        if raw is None or len(raw) != 4:
+        if raw is None or len(raw) not in (4, 5, 6, 7):
             raise LayerSplitDivergence(f"{LOG_TAG}: malformed row {raw!r}")
-        return cls(int(raw[0]), str(raw[1]), tuple(int(c) for c in raw[2]), bool(int(raw[3])))
+        pulls: Tuple[Pull, ...] = ()
+        if len(raw) >= 5:
+            try:
+                pulls = tuple(tuple(int(x) for x in p) for p in raw[4])
+            except (TypeError, ValueError):
+                raise LayerSplitDivergence(f"{LOG_TAG}: malformed pulls {raw[4]!r}")
+            if any(len(p) != 5 for p in pulls):
+                raise LayerSplitDivergence(f"{LOG_TAG}: malformed pulls {raw[4]!r}")
+        refill = bool(int(raw[5])) if len(raw) >= 6 else False
+        order = str(raw[6]) if len(raw) >= 7 else ""
+        return cls(int(raw[0]), str(raw[1]), tuple(int(c) for c in raw[2]), bool(int(raw[3])), pulls, refill,
+                   order)
+
+
+def batch_order(keys: Sequence[object]) -> str:
+    """The request order of a forward, hashed (row field ``order``)."""
+    return hashlib.sha256("\x1f".join(str(k) for k in keys).encode()).hexdigest()[:12]
 
 
 @dataclasses.dataclass
@@ -807,53 +955,149 @@ class _ReqState:
     frontier: Cut
     plan: SplitPlan
     steps: Dict[int, Tuple[int, Cut]]
+    #: async planning: (start, future) of the moving-cut plan of the rest
+    pending: Optional[Tuple[int, object]] = None
+
+
+def plan_home(prompt_len: int, geom: SplitGeometry, model, limits: _pcp.ChunkLimits, *, start: int = 0,
+              extra: Optional[ExtraCosts] = None) -> SplitPlan:
+    """The best chunk plan at the HOME cut only (cheap: no cut search) --
+    what PP0 runs while the moving-cut plan is computed in the background."""
+    n = int(prompt_len)
+    if n <= 0:
+        return SplitPlan(int(start), (), (), 0.0, 0.0, (), "empty")
+    home = geom.home_cuts
+    best = None
+    for idx, (name, chunks) in enumerate(_chunk_candidates(int(start), int(start) + n, limits, limits.ramps)):
+        hms = makespan(chunks, [home] * len(chunks), int(start), geom, model, limits, extra)
+        if best is None or hms < best[0] - 1e-9:
+            best = (hms, name, chunks)
+    hms, _name, chunks = best
+    return SplitPlan(int(start), tuple(chunks), tuple([home] * len(chunks)), hms, hms, tuple(chunks), "home(lead)")
 
 
 class LeaderCursor:
-    """PP0 only. Plans each request once (joint chunks + cuts), keeps its
-    frontier (the one monotone cut its mirrors are valid under) and decides
-    each forward's cut as the minimum over the batch."""
+    """PP0 only. Plans each request (joint chunks + cuts), keeps its
+    frontier -- the Besitzkarte: per boundary b, the mirrors of layers
+    [home_b, frontier_b) on stage b hold the request's complete state -- and
+    decides each forward's cut as the minimum over the batch.
 
-    def __init__(self, spec: SplitSpec, on_plan=None, max_keys: int = 256):
+    The frontier FALLS with every forward (layers above the forward's cut
+    ran on home: the mirrors went stale) and RISES only through an announced
+    pull (pull mode, ``spec.extra.pull_gbps``): when a request's NEXT planned
+    chunk wants more than its frontier, the row of THIS forward announces
+    the pull of [frontier_b, want_b) and the frontier is lifted for the next
+    forward. Without pull mode it never rises (V1).
+
+    ``executor`` (async planning, the runtime form): the moving-cut search
+    costs 0.1-0.7 s per request (measured, K=8 candidates), which PP0's
+    scheduler loop must not pay. A new request then starts on the cheap HOME
+    plan; the plan of the rest from the position after ``lead_chunks`` home
+    chunks is computed in the background (``executor.submit``) and adopted
+    at exactly that position if it is ready, else the request stays home
+    (counted). ``executor=None`` plans synchronously (tests, dry runs)."""
+
+    def __init__(self, spec: SplitSpec, on_plan=None, max_keys: int = 256, *, executor=None,
+                 lead_chunks: int = 2, dyn_candidates: int = 0):
         self.spec = spec
         self.digest = spec.digest()
         self.on_plan = on_plan
         self._reqs: Dict[object, _ReqState] = {}
         self._version = 0
         self._max_keys = int(max_keys)
+        self.pull = spec.extra is not None and bool(spec.extra.pull_gbps)
+        self.executor = executor
+        self.lead_chunks = max(1, int(lead_chunks))
+        self.dyn_candidates = int(dyn_candidates)
+        self.stats: Dict[str, int] = {"plans": 0, "async_adopted": 0, "async_late": 0, "async_short": 0}
+        #: set after a wake: the next forward announces the swing-weight
+        #: refill and runs home
+        self.refill_needed = False
 
-    def _make(self, key, pos: int, end: int) -> _ReqState:
+    def _top(self) -> Cut:
+        g = self.spec.geometry
+        return tuple(h + w for h, w in zip(g.home_cuts, g.window))
+
+    def _plan(self, pos: int, end: int) -> SplitPlan:
         sp = self.spec
-        plan = plan_split(end - pos, sp.geometry, sp.model, sp.limits, start=pos, min_gain=sp.min_gain,
-                          extra=sp.extra)
+        return plan_split(end - pos, sp.geometry, sp.model, sp.limits, start=pos, min_gain=sp.min_gain,
+                          extra=sp.extra, dyn_candidates=self.dyn_candidates)
+
+    @staticmethod
+    def _steps(plan: SplitPlan) -> Dict[int, Tuple[int, Cut]]:
         steps: Dict[int, Tuple[int, Cut]] = {}
-        p = pos
+        p = plan.start
         for c, cut in zip(plan.chunks, plan.cuts):
             steps[p] = (c, cut)
             p += c
-        frontier = plan.cuts[0] if (pos == 0 and plan.cuts) else sp.geometry.home_cuts
-        st = _ReqState(end, frontier, plan, steps)
+        return steps
+
+    def _make(self, key, pos: int, end: int) -> _ReqState:
+        sp = self.spec
+        pending = None
+        if self.executor is None:
+            plan = self._plan(pos, end)
+        else:
+            plan = plan_home(end - pos, sp.geometry, sp.model, sp.limits, start=pos, extra=sp.extra)
+            if len(plan.chunks) > self.lead_chunks + 1:
+                at = pos + sum(plan.chunks[: self.lead_chunks])
+                pending = (at, self.executor.submit(self._plan, at, end))
+            else:
+                self.stats["async_short"] += 1
+        self.stats["plans"] += 1
+        if pos == 0:
+            # fresh: no prefix, every mirror trivially complete
+            frontier = self._top() if self.pull else (plan.cuts[0] if plan.cuts else sp.geometry.home_cuts)
+        else:
+            frontier = sp.geometry.home_cuts
+        st = _ReqState(end, frontier, plan, self._steps(plan), pending)
         if len(self._reqs) >= self._max_keys:
             self._reqs.pop(next(iter(self._reqs)))
         self._reqs[key] = st
-        if self.on_plan is not None:
+        if self.on_plan is not None and pending is None:
             self.on_plan(key, plan, pos, end)
         return st
+
+    def _adopt_pending(self, key, st: _ReqState, pos: int) -> None:
+        at, fut = st.pending
+        if pos < at:
+            return
+        st.pending = None
+        if pos != at or not fut.done():
+            self.stats["async_late"] += 1
+            if not fut.done():
+                fut.cancel()
+            return
+        try:
+            rest = fut.result()
+        except Exception:  # noqa: BLE001 -- a plan must never stop a pass
+            self.stats["async_late"] += 1
+            return
+        for p in [q for q in st.steps if q >= at]:
+            del st.steps[p]
+        st.steps.update(self._steps(rest))
+        st.plan = rest
+        self.stats["async_adopted"] += 1
+        if self.on_plan is not None:
+            self.on_plan(key, rest, at, st.end)
 
     def next_width(self, key, pos: int, end: int) -> int:
         """The planned chunk width (the ``ChunkPlanner.next_width`` twin).
         An off-plan ``pos`` (narrowed by corridor/park/load-back) replans the
-        rest; the frontier is kept (it can only fall)."""
+        rest; the frontier is kept."""
         pos, end = int(pos), int(end)
         if end <= pos:
             return 0
         st = self._reqs.get(key)
         if st is None or st.end != end:
             st = self._make(key, pos, end)
-        elif pos not in st.steps:
-            frontier = st.frontier
-            st = self._make(key, pos, end)
-            st.frontier = frontier
+        else:
+            if st.pending is not None:
+                self._adopt_pending(key, st, pos)
+            if pos not in st.steps:
+                frontier = st.frontier
+                st = self._make(key, pos, end)
+                st.frontier = frontier
         return int(st.steps[pos][0])
 
     def wanted_cut(self, key, pos: int) -> Cut:
@@ -862,12 +1106,16 @@ class LeaderCursor:
             return self.spec.geometry.home_cuts
         return st.steps[pos][1]
 
+    def frontier(self, key) -> Optional[Cut]:
+        st = self._reqs.get(key)
+        return None if st is None else st.frontier
+
     def decide(self, batch: Sequence[Tuple[object, int, int]], *, anchor_or_last: bool = True) -> ForwardRow:
         """``batch`` = ``(key, pos, width)`` of every request in this forward,
         in batch order. The forward's cut = min over the batch of each
-        request's wanted cut capped by its frontier; a request whose first
-        forward this is (pos == 0, fresh) may lift its frontier to its plan.
-        Every frontier then falls to the forward's cut."""
+        request's wanted cut capped by its frontier. Every frontier then
+        falls to the forward's cut; in pull mode a request whose next planned
+        chunk wants more announces its pull."""
         geom = self.spec.geometry
         home = geom.home_cuts
         caps: List[Cut] = []
@@ -877,40 +1125,68 @@ class LeaderCursor:
                 caps.append(home)
                 continue
             want = self.wanted_cut(key, int(pos))
-            cap = st.frontier
-            caps.append(want if dominated(want, cap) else cut_min([want, cap]))
+            caps.append(cut_min([want, st.frontier]))
         cut = cut_min(caps) if caps else home
+        refill = bool(self.refill_needed)
+        if refill:
+            cut = home
+            self.refill_needed = False
         if not geom.valid(cut):
             raise LayerSplitError(f"{LOG_TAG}: decided cut {cut} outside the geometry")
-        for key, pos, width in batch:
+        pulls: List[Pull] = []
+        for slot, (key, pos, width) in enumerate(batch):
             st = self._reqs.get(key)
-            if st is not None:
-                st.frontier = cut_min([st.frontier, cut])
-                if int(pos) + int(width) >= st.end:
-                    self._reqs.pop(key, None)
+            if st is None:
+                continue
+            st.frontier = cut_min([st.frontier, cut])
+            nxt = int(pos) + int(width)
+            if nxt >= st.end:
+                self._reqs.pop(key, None)
+                continue
+            if not self.pull or nxt not in st.steps:
+                continue
+            want = st.steps[nxt][1]
+            lifted = list(st.frontier)
+            for b in range(len(home)):
+                if want[b] > st.frontier[b]:
+                    pulls.append((slot, b, int(st.frontier[b]), int(want[b]), nxt))
+                    lifted[b] = int(want[b])
+            st.frontier = tuple(lifted)
         self._version += 1
         swing_gdn = any(geom.families[i] == FAMILY_LINEAR
                         for s in range(geom.stages) for i in geom.swing(cut, s))
         gdn_wb = swing_gdn and (self.spec.gdn_writeback == "every" or anchor_or_last)
-        return ForwardRow(self._version, self.digest, cut, gdn_wb)
+        return ForwardRow(self._version, self.digest, cut, gdn_wb, tuple(pulls), refill,
+                          batch_order([k for k, _p, _w in batch]))
 
     def forget(self, key) -> None:
-        self._reqs.pop(key, None)
+        st = self._reqs.pop(key, None)
+        if st is not None and st.pending is not None:
+            st.pending[1].cancel()
+
+    def reset(self) -> None:
+        """Drop every request (after a flip: nothing is in flight)."""
+        for key in list(self._reqs):
+            self.forget(key)
 
 
 class FollowerCursor:
     """Every rank (PP0 included, on its own row): adopt the forwarded row and
-    derive what this stage executes, mirrors and writes back. Any
-    disagreement -- missing row, foreign spec, version not advancing, a cut
-    outside the geometry -- is a crash-stop."""
+    derive what this stage executes, mirrors, writes back, sends and pulls.
+    Any disagreement -- missing row, foreign spec, version not advancing, a
+    cut or pull outside the geometry -- is a crash-stop."""
 
     def __init__(self, spec: SplitSpec, stage: int):
         self.spec = spec
         self.stage = int(stage)
         self.digest = spec.digest()
         self._last_version = 0
+        #: pulls announced by the previous row that THIS stage receives
+        #: during its next forward (stage == boundary)
+        self._pending_recv: Tuple[Pull, ...] = ()
+        self._pending_version = 0
 
-    def adopt(self, raw) -> ForwardRow:
+    def adopt(self, raw, batch_size: Optional[int] = None) -> ForwardRow:
         if raw is None:
             raise LayerSplitDivergence(
                 f"{LOG_TAG}: stage {self.stage} got a forward without a layer-split row while "
@@ -923,10 +1199,29 @@ class FollowerCursor:
             raise LayerSplitDivergence(
                 f"{LOG_TAG}: stage {self.stage} row version {row.version} does not advance "
                 f"past {self._last_version}")
-        if not self.spec.geometry.valid(row.cut):
+        g = self.spec.geometry
+        if not g.valid(row.cut):
             raise LayerSplitDivergence(f"{LOG_TAG}: row cut {row.cut} outside the geometry")
+        for slot, b, lo, hi, end in row.pulls:
+            h = g.home_cuts[b] if 0 <= b < len(g.home_cuts) else None
+            if (h is None or not (h <= lo < hi <= h + g.window[b]) or end <= 0 or slot < 0
+                    or (batch_size is not None and slot >= batch_size)
+                    or not g.valid(tuple(hi if bb == b else g.home_cuts[bb]
+                                         for bb in range(len(g.home_cuts))))):
+                raise LayerSplitDivergence(f"{LOG_TAG}: row pull {(slot, b, lo, hi, end)} outside the geometry")
         self._last_version = row.version
         return row
+
+    def take_pending_recv(self) -> Tuple[Pull, ...]:
+        """Pulls announced by the PREVIOUS row that this stage receives now
+        (call once per forward, before :meth:`note_row`)."""
+        out, self._pending_recv = self._pending_recv, ()
+        return out
+
+    def note_row(self, row: ForwardRow) -> None:
+        """Remember this row's pulls that this stage will receive next."""
+        self._pending_recv = tuple(p for p in row.pulls if p[1] == self.stage)
+        self._pending_version = row.version
 
     def executed(self, row: ForwardRow) -> Tuple[int, ...]:
         return tuple(self.spec.geometry.executed(row.cut, self.stage))
@@ -942,8 +1237,15 @@ class FollowerCursor:
             return ()
         return self.spec.geometry.swing(row.cut, self.stage - 1)
 
+    def pull_sends(self, row: ForwardRow) -> Tuple[Pull, ...]:
+        """Pulls this stage SENDS upstream after this forward (it is home of
+        boundary ``stage - 1``'s window)."""
+        return tuple(p for p in row.pulls if p[1] == self.stage - 1)
+
     def graph_ok(self, row: ForwardRow) -> bool:
-        return row.cut == self.spec.geometry.home_cuts
+        """This stage may replay its graph: it executes exactly its home
+        range (a moved boundary elsewhere does not change its layer loop)."""
+        return stage_graph_ok(self.spec.geometry, row.cut, self.stage)
 
 
 # ---------------------------------------------------------------------------
@@ -1050,9 +1352,10 @@ def writeback_payload(swing_attn: Sequence[int], swing_gdn: Sequence[int], kv_of
         out[f"{WB_V}{l}"] = gather_rows(v, out_cache_loc)
     if gdn_wb:
         for l in swing_gdn:
-            conv, ssm = state_of(l)
-            out[f"{WB_CONV}{l}"] = gather_rows(conv, state_idx)
-            out[f"{WB_SSM}{l}"] = gather_rows(ssm, state_idx)
+            # every tensor of the layer's state (conv windows, temporal, any
+            # ring the pool carries), in the pool's field order
+            for i, buf in enumerate(state_of(l)):
+                out[f"{WB_SSM}{l}.{i}"] = gather_rows(buf, state_idx)
     return out
 
 
@@ -1071,16 +1374,96 @@ def apply_writeback(payload: Mapping[str, object], incoming_attn: Sequence[int],
         scatter_rows(v, out_cache_loc, payload[vk])
     if gdn_wb:
         for l in incoming_gdn:
-            ck, sk = f"{WB_CONV}{l}", f"{WB_SSM}{l}"
-            if ck not in payload or sk not in payload:
-                raise LayerSplitDivergence(f"{LOG_TAG}: write-back of GDN layer {l} missing")
-            conv, ssm = state_of(l)
-            scatter_rows(conv, state_idx, payload[ck])
-            scatter_rows(ssm, state_idx, payload[sk])
+            bufs = state_of(l)
+            keys = [f"{WB_SSM}{l}.{i}" for i in range(len(bufs))]
+            if any(k not in payload for k in keys) or f"{WB_SSM}{l}.{len(bufs)}" in payload:
+                raise LayerSplitDivergence(f"{LOG_TAG}: write-back of GDN layer {l} missing or misshapen")
+            for k, buf in zip(keys, bufs):
+                scatter_rows(buf, state_idx, payload[k])
 
 
 def is_writeback_key(name: str) -> bool:
     return name.startswith((WB_K, WB_V, WB_CONV, WB_SSM))
+
+
+#: Prefix pull (home -> upstream mirror), in PIECES of at most
+#: ``PULL_PIECE_TOKENS`` KV rows so the sender's gather and the receiver's
+#: staging stay bounded (one piece of one attention layer: 16384 x 2048 B =
+#: 32 MiB on the 27B) instead of a whole 128k prefix (256 MiB per layer).
+PULL_PIECE_TOKENS = 16384
+
+
+def pull_families(families: Sequence[str], lo: int, hi: int) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    """(attention layers, GDN layers) of a pull's range [lo, hi)."""
+    ids = range(int(lo), int(hi))
+    return (tuple(i for i in ids if families[i] == FAMILY_ATTENTION),
+            tuple(i for i in ids if families[i] == FAMILY_LINEAR))
+
+
+def pull_pieces(end: int, piece_tokens: int = PULL_PIECE_TOKENS) -> Tuple[Tuple[int, int], ...]:
+    """KV row ranges [a, b) covering [0, end) in order."""
+    step = max(1, int(piece_tokens))
+    return tuple((a, min(int(end), a + step)) for a in range(0, int(end), step))
+
+
+def pull_bytes(families: Sequence[str], pull: Pull, kv_bytes_per_token_layer: int,
+               state_bytes_per_layer: int) -> int:
+    _slot, _b, lo, hi, end = pull
+    attn, gdn = pull_families(families, lo, hi)
+    return len(attn) * int(end) * int(kv_bytes_per_token_layer) + len(gdn) * int(state_bytes_per_layer)
+
+
+def pull_send(pull: Pull, families: Sequence[str], kv_of, state_of, req_row_loc, state_idx, send,
+              piece_tokens: int = PULL_PIECE_TOKENS) -> int:
+    """HOME side, after the announcing forward: send the request's KV rows
+    [0, end) of every pulled attention layer (gathered over THIS rank's
+    ``req_row_loc(a, b)``, its own req_to_token row) piece by piece, then the
+    state of every pulled GDN layer at THIS rank's ``state_idx``. ``send(t)``
+    is the transport (one tensor, in order). Returns the bytes sent."""
+    _slot, _b, lo, hi, end = pull
+    attn, gdn = pull_families(families, lo, hi)
+    n = 0
+    for l in attn:
+        k, v = kv_of(l)
+        for a, b in pull_pieces(end, piece_tokens):
+            loc = req_row_loc(a, b)
+            for buf in (k, v):
+                t = gather_rows(buf, loc)
+                send(t)
+                n += t.numel() * t.element_size()
+    for l in gdn:
+        for buf in state_of(l):
+            t = gather_rows(buf, state_idx)
+            send(t)
+            n += t.numel() * t.element_size()
+    return n
+
+
+def pull_recv(pull: Pull, families: Sequence[str], kv_of, state_of, req_row_loc, state_idx, recv,
+              piece_tokens: int = PULL_PIECE_TOKENS) -> int:
+    """MIRROR side, right before the first pulled layer of the next forward:
+    the exact mirror image of :func:`pull_send` -- same order, same shapes
+    (``recv(like)`` returns a tensor shaped like ``like``), scattered over
+    THIS rank's own req_to_token row and mamba index. No index crosses the
+    wire. Returns the bytes received."""
+    _slot, _b, lo, hi, end = pull
+    attn, gdn = pull_families(families, lo, hi)
+    n = 0
+    for l in attn:
+        k, v = kv_of(l)
+        for a, b in pull_pieces(end, piece_tokens):
+            loc = req_row_loc(a, b)
+            for buf in (k, v):
+                t = recv(buf.new_empty((b - a,) + tuple(buf.shape[1:])))
+                scatter_rows(buf, loc, t)
+                n += t.numel() * t.element_size()
+    for l in gdn:
+        for buf in state_of(l):
+            t = recv(buf.new_empty((int(state_idx.numel()),) + tuple(buf.shape[1:])))
+            scatter_rows(buf, state_idx, t)
+            n += t.numel() * t.element_size()
+    return n
+
 
 
 __all__ = [
@@ -1090,4 +1473,6 @@ __all__ = [
     "plan_split", "best_static_cut", "makespan", "balanced_cut", "trajectory", "swing_slab",
     "writeback_bytes", "WritebackPrice", "ExtraCosts", "split_from_env", "plan_line", "armed_line", "gather_rows", "scatter_rows",
     "request_loc", "writeback_payload", "apply_writeback", "is_writeback_key", "dominated", "cut_min",
+    "Pull", "pull_layers", "pull_families", "pull_pieces", "pull_bytes", "pull_send", "pull_recv",
+    "PULL_PIECE_TOKENS", "plan_home", "batch_order", "stage_graph_ok", "forward_times",
 ]

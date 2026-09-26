@@ -883,6 +883,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        # --p-layer-split dynamic: a forward whose cut is not the home cut
+        # executes a different layer range than the captured body -- eager.
+        # The home cut keeps its graphs. No runtime (static): skipped.
+        from sglang.srt.weg2.p_layer_split_runtime import active as _pls_active
+
+        _pls = _pls_active()
+        if _pls is not None and _pls.force_eager():
+            if self._is_full_backend:
+                self._note_eager("layer_split", forward_batch)
+            return False
         if self._is_full_backend:
             reason = self._full_graph_ineligible_reason(forward_batch)
             if reason is not None:
