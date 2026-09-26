@@ -828,9 +828,15 @@ def rebuild_window_rows_sync_free(
     start: torch.Tensor,
     lengths: torch.Tensor,
     max_len: int,
-) -> None:
+    return_holes: bool = False,
+) -> Optional[torch.Tensor]:
     """Window pool, sync-free: rows ``[0, lengths[b])`` of the draft's private
     req_to_token, in draft-slot space, WITHOUT a host read.
+
+    ``return_holes`` (SGLANG_DFLASH_WINDOW_HOLE_MASK): also return the bool
+    ``[bs, max_len]`` block that marks the real window rows reading the hole
+    slot 0 (mapped draft slots are >= 1), or None when nothing was rebuilt.
+    Default: returns None, as before.
 
     The legacy chain (``_gather_req_to_token_segments`` -> ``translate_read``
     -> ``assign_req_to_token_pool_func``) reads ``lengths.max().item()`` and
@@ -844,7 +850,7 @@ def rebuild_window_rows_sync_free(
     """
     bs = int(req_pool_indices.shape[0])
     if bs == 0 or max_len <= 0:
-        return
+        return None
     if max_len > int(draft_req_to_token.shape[1]):
         raise RuntimeError(
             f"DFLASH window pool: host length bound {max_len} exceeds the "
@@ -863,3 +869,6 @@ def rebuild_window_rows_sync_free(
     draft_req_to_token[rows2d, cols2d] = torch.where(
         mask, draft_slots.to(draft_req_to_token.dtype), held
     )
+    if return_holes:
+        return mask & (draft_slots == 0)
+    return None
