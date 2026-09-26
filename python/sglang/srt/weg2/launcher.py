@@ -18277,6 +18277,36 @@ def standard_form_resolved(ns) -> Tuple[bool, str]:
     return weg2_form.standard_form_state(os.environ, getattr(ns, "profile", None))
 
 
+def d_park_split_refusal(ns, environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """27B park (review RV B5): the front fires the immediate park from the
+    launcher's env (SGLANG_WEG2_D_PARK_IMMEDIATE / the profile row), D parks
+    only with its FLIP park on (d_seats.d_flip_park_active over D's env = the
+    launcher env + --env-d). An explicit SGLANG_WEG2_D_PARK=0 decides alone on
+    D -- profile_docker.render writes exactly that line for qwen27b -- so the
+    front would park and D answer 409 every phase (PARK-FAILED, the pre-park
+    fallback, K0). Refused at launch instead, by name. None = consistent."""
+    env = dict(os.environ if environ is None else environ)
+    prof = getattr(ns, "profile", None)
+    front_on, front_src = weg2_form.d_park_immediate_state(env, prof)
+    if not front_on:
+        return None
+    d_env = dict(env)
+    d_env.update(parse_group_env(str(getattr(ns, "env_d", "") or "")))
+    raw = str(d_env.get("SGLANG_WEG2_D_PARK", "") or "").strip()
+    if raw:
+        d_on, d_src = raw.lower() not in ("0", "false", "no", "off"), "SGLANG_WEG2_D_PARK=" + raw
+    else:
+        d_imm, d_imm_src = weg2_form.d_park_immediate_state(d_env, prof)
+        d_sf, d_sf_src = weg2_form.standard_form_state(d_env, prof)
+        d_on, d_src = d_imm or d_sf, "immediate %s, standard form %s" % (d_imm_src, d_sf_src)
+    if d_on:
+        return None
+    return ("WEG2 D-PARK-SPLIT refused: the front's immediate park is ON (%s) but group D's flip "
+            "park is OFF (%s) -- the front would park every D phase and D answer 409 "
+            "(PARK-FAILED). Unset SGLANG_WEG2_D_PARK (or set it 1) in the profile/--env-d, or turn "
+            "SGLANG_WEG2_D_PARK_IMMEDIATE off" % (front_src, d_src))
+
+
 def apply_profile_d_bs_default(ns, argv: Sequence[str]) -> int:
     """H91b/H95 (Nutzer-Design 25.09.): ``--profile nextflash`` without an
     explicit ``--d-bs`` runs D with up to ``DEFAULT_D_BS_NEXTFLASH`` (6) seats
@@ -18366,6 +18396,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _h95c_line = apply_profile_d_seat_vram_default(ns)
     if _h95c_line:
         print(_h95c_line, flush=True)
+    if not ns.teardown:
+        _park_split = d_park_split_refusal(ns)  # 27B park (RV B5): front and D must agree
+        if _park_split:
+            print(_park_split, flush=True)
+            raise SystemExit(_park_split)
     _sf_on, _sf_src = standard_form_resolved(ns)
     if _sf_on or _sf_src.startswith("env "):
         print("WEG2-STANDARD-FORM (NF H91, profile field standard_form): %s (%s) -- D seats per "

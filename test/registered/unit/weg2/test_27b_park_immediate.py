@@ -596,3 +596,44 @@ def test_a_rearmed_dflash_resume_is_judged_cold_only_when_it_came_back_through_t
     assert "restored target-only" in (B.draft_cold_reason(None, req, tier_armed=False) or "")
     req.host_hit_length = 0
     assert B.draft_cold_reason(None, req, tier_armed=False) is None
+
+
+# ------------------------------------------------ RV B5: front on, D park off -> refuse the boot
+@pytest.mark.parametrize("env,env_d,refused", [
+    ({IMM: "1"}, "", False),                                        # 27B park: both on
+    ({IMM: "1", "SGLANG_WEG2_D_PARK": "0"}, "", True),              # profile_docker render line
+    ({IMM: "1"}, "SGLANG_WEG2_D_PARK=0", True),                     # --env-d vetoes D only
+    ({IMM: "1"}, "SGLANG_WEG2_D_PARK_IMMEDIATE=0", True),           # D's switch off, front on
+    ({IMM: "1", "SGLANG_WEG2_D_PARK": "1"}, "", False),             # explicit full park
+    ({"SGLANG_WEG2_D_PARK": "0"}, "", False),                       # immediate off: nothing to agree on
+    ({}, "", False),                                                # 27B today
+])
+def test_the_launcher_refuses_a_front_that_parks_into_a_d_that_cannot(clean, env, env_d, refused):
+    from sglang.srt.weg2 import launcher as L
+
+    ns = types.SimpleNamespace(profile="qwen27b", env_d=env_d)
+    why = L.d_park_split_refusal(ns, env)
+    assert (why is not None) is refused, why
+    if refused:
+        assert "D-PARK-SPLIT refused" in why
+
+
+def test_the_rendered_27b_registry_env_is_caught_when_the_park_is_switched_on(clean):
+    """profile_docker.render writes `_form SGLANG_WEG2_D_PARK 0` for qwen27b; a
+    profile that adds only SGLANG_WEG2_D_PARK_IMMEDIATE=1 on top must not boot."""
+    from sglang.srt.weg2 import launcher as L
+    from sglang.srt.weg2 import profile_docker as PD
+
+    frag = PD.render("27b", "qwen27b", "int8")
+    assert "  _form SGLANG_WEG2_D_PARK 0" in frag
+    env = {"SGLANG_WEG2_D_PARK": "0", IMM: "1"}
+    assert L.d_park_split_refusal(types.SimpleNamespace(profile="qwen27b", env_d=""), env)
+
+
+def test_the_launcher_main_runs_the_refusal_before_anything_spawns():
+    from sglang.srt.weg2 import launcher as L
+
+    src = open(L.__file__).read()
+    i_ref = src.index("_park_split = d_park_split_refusal(ns)")
+    i_sf = src.index("_sf_on, _sf_src = standard_form_resolved(ns)")
+    assert i_ref < i_sf
