@@ -227,18 +227,41 @@ def _split_host_indices_by_binding(pool, indices, op: str):
         return indices, 0
     pool._stale_index_refusals = getattr(pool, "_stale_index_refusals", 0) + 1
     if pool._stale_index_refusals == 1:
+        # HX (NF, 26.09.): on an ARENA-bound pool `size` is the staging ring,
+        # not a retired tier -- ids above it are arena pages and read
+        # placeholders (#1424 id space). Name them, so the line cannot pass
+        # for the harmless rebind story when it is the queue-refs leak
+        # (h91v1/h91bb1/h91bb2: pool '?' = ArenaMHAHostPool, bound = staging).
+        arena_note = ""
+        if getattr(pool, "arena", None) is not None and hasattr(pool, "staging_rows"):
+            try:
+                s_rows = int(pool.staging_rows)
+                a_end = s_rows + _arena_id_tokens(pool)
+                st = indices[stray_mask]
+                n_arena = int(((st >= s_rows) & (st < a_end)).sum())
+                n_ph = int((st >= a_end).sum())
+                arena_note = (
+                    f" ARENA-BOUND pool: [0, {size}) is the staging ring; of these "
+                    f"{n_arena} are arena page ids [{s_rows}, {a_end}) whose reader "
+                    f"references are NOT returned on this path (leak unless "
+                    f"SGLANG_HICACHE_ARENA_QUEUE_REFS is on), {n_ph} are read "
+                    f"placeholders (harmless)."
+                )
+            except Exception:  # noqa: BLE001 - a log annotation never breaks a free
+                arena_note = ""
         logger.error(
             "HICACHE-INDEX REFUSED (#718 class, index axis): %s on host pool %r "
             "was handed %d index(es) outside [0, %d) -- highest %d. These were "
             "minted against a wider host tier that a phase rebind has since "
             "retired; the slots they name no longer exist, so they are dropped "
             "rather than applied. Applying them is the W38 IndexError at "
-            "pool_host/base.py:344. Counting further occurrences silently.",
+            "pool_host/base.py:344. Counting further occurrences silently.%s",
             op,
-            getattr(pool, "pool_name", "?"),
+            getattr(pool, "pool_name", None) or type(pool).__name__,
             n_stray,
             size,
             int(indices.max()),
+            arena_note,
         )
     return indices[~stray_mask], n_stray
 

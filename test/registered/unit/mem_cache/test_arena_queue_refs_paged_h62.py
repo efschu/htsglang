@@ -183,9 +183,16 @@ class TheGeometryIsPaged(_Case):
         self.assertEqual(a.pool.id_space, S + A * P + PLACEHOLDERS)
 
 
-class TheDefaultStillLeaks(_Case):
+class TheOptOutStillLeaks(_Case):
+    """HX: the switch defaults ON; "0" is the opt-out and keeps the old path
+    (and its leak) -- pinned here so the opt-out stays what it says."""
+
+    def off(self):
+        os.environ[ENV] = "0"
+
     def test_default_drops_the_queued_pages_and_keeps_their_references(self):
         """The defect as it stands on NF (the x165 #718 line)."""
+        self.off()
         a = _Rank(self.path)
         slots = a.publish([f"p{j}" for j in range(4)])
         hi, got = a.prefetch([f"p{j}" for j in range(4)])
@@ -198,6 +205,7 @@ class TheDefaultStillLeaks(_Case):
         """One unclaimed page per cycle through the queue: its slot stays
         referenced, eviction cannot take it, and the writer's claim is refused
         within a few cycles of a 6-slot arena."""
+        self.off()
         a = _Rank(self.path)
         refused_at = None
         for i in range(12):
@@ -329,6 +337,72 @@ class TheLedgerOnlyReleasesOwnReferences(_Case):
             a.release_via_queue(hi)
         _st, ref = _hdr(a.arena)
         self.assertGreater(int(ref[slots.numpy()].sum()), 0, "mutant survived")
+
+
+class TheReleaseFormNeedsNoArmEnvHX(_Case):
+    """HX (26.09.): h91v1/h91bb1/h91bb2 ran WITHOUT the env (their arms descend
+    from the pre-RC2 x177 arm), x178/RC2 and every docker profile with it:
+    'HICACHE-INDEX REFUSED' 1 line per group vs 0, 'ARENA-QUEUE-REFS' 0 vs 8.
+    The RC2 form must not depend on an arm remembering an env line. Every test
+    here leaves the env UNSET (setUp pops it)."""
+
+    def test_unset_env_returns_the_unclaimed_heads_references(self):
+        a = _Rank(self.path)
+        self.assertIsNotNone(getattr(a.arena, "_ledger", None), "no ledger by default")
+        slots = a.publish([f"d{j}" for j in range(4)])
+        hi, got = a.prefetch([f"d{j}" for j in range(4)])
+        self.assertEqual(got, 4)
+        a.release_via_queue(hi[: 2 * P])  # the unclaimed head: two pages
+        _st, ref = _hdr(a.arena)
+        self.assertEqual(ref[slots[:2].numpy()].tolist(), [0, 0])
+        self.assertEqual(ref[slots[2:].numpy()].tolist(), [1, 1])
+
+    def test_unset_env_never_pins_the_arena(self):
+        """The cycle of `test_default_pins_the_arena_until_a_claim_is_refused`
+        with the env unset: no claim is refused, nothing stays pinned."""
+        a = _Rank(self.path)
+        for i in range(30):
+            hashes = [f"u{i}-p{j}" for j in range(4)]
+            rows = a.pool.alloc_write(hashes)
+            self.assertIsNotNone(rows, f"claim refused at cycle {i}: the arena is pinned")
+            a.pool.complete_write(rows)
+            a.pool.free(rows)
+            hi, got = a.prefetch(hashes)
+            a.release_via_queue(hi[:P])
+            a.pool.free(hi[P: got * P])
+        pinned, refs, _complete = a.arena.ref_census()
+        self.assertEqual((pinned, refs), (0, 0))
+
+    def test_unset_env_cold_miss_placeholders_draw_no_refusal(self):
+        """The bb2 D form: a cold-miss prefetch registration (10 pages of
+        placeholders on NF, 640 ids above S + A*P) comes back through the
+        queue. It is not a stray of a retired tier and must not be logged as
+        one."""
+        a = _Rank(self.path)
+        hi = a.pool.alloc_read(2 * P)
+        with mock.patch("sglang.srt.mem_cache.memory_pool_host.logger") as lg:
+            a.release_via_queue(hi)
+        self.assertFalse(any("HICACHE-INDEX REFUSED" in str(c) for c in lg.error.call_args_list))
+
+    def test_opt_out_refusal_names_the_pool_and_splits_arena_from_placeholders(self):
+        """With the opt-out, the #718 line must say WHICH pool (not '?') and
+        that the ids above the staging ring are arena pages (leak) and
+        placeholders (harmless) -- not a retired tier."""
+        os.environ[ENV] = "0"
+        a = _Rank(self.path)
+        slots = a.publish(["n0", "n1"])
+        hi, _ = a.prefetch(["n0", "n1"])
+        ph = a.pool.alloc_read(P)
+        with mock.patch("sglang.srt.mem_cache.memory_pool_host.logger") as lg:
+            a.group.free(torch.cat([hi, ph]))
+        lines = [c.args[0] % c.args[1:] for c in lg.error.call_args_list
+                 if "HICACHE-INDEX REFUSED" in str(c.args[0])]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("'ArenaMHAHostPool'", lines[0])
+        self.assertIn(f"of these {2 * P} are arena page ids", lines[0])
+        self.assertIn(f"{P} are read placeholders", lines[0])
+        _st, ref = _hdr(a.arena)
+        self.assertEqual(ref[slots.numpy()].tolist(), [1, 1])  # opt-out: still pinned
 
 
 if __name__ == "__main__":

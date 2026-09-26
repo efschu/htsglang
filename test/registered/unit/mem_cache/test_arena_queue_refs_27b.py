@@ -169,7 +169,9 @@ class _ArenaCase(CustomTestCase):
 
 class TheDefaultIsUnchanged(_ArenaCase):
     def test_default_drops_the_queued_arena_rows_and_keeps_their_references(self):
-        """The defect, as it stands on the unchanged path."""
+        """The defect, as it stands on the unchanged path (HX: now the
+        explicit opt-out "0"; the default is on)."""
+        os.environ[ENV] = "0"
         a = _Rank(self.path, self.SLOTS)
         self.assertIsNone(getattr(a.arena, "_ledger", None))
         slots = a.publish([f"p{j}" for j in range(8)])

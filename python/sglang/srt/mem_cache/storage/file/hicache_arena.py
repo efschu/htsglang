@@ -36,18 +36,28 @@ _failed = False
 #: every extent boundary must sit on this granule (arena.c GRANULE)
 GRANULE = 1  # coverage is an interval list; any byte range counts
 
-#: 27B 24.09. (arena reader refs out of the release queue). Default OFF.
+#: 27B 24.09. (arena reader refs out of the release queue).
 #: "1": (a) every ShmArena of this process keeps a LEDGER of the reader
 #: references this process holds per slot, and a release (-1) never takes more
 #: than that -- a rank can never drop another rank's reference, nor drop one
 #: it does not hold; (b) HostPoolGroup.free hands arena ids from the host
 #: release queue back to the arena (one reference per row) instead of dropping
 #: them as #718 strays. See HostPoolGroup._free_arena_rows.
+#:
+#: HX (NF, 26.09.): DEFAULT ON. The NF-RC2 form (b89592806a, x178 + f3, and
+#: every docker profile since: nf.env NF_ENV_RC2_FORM) sets it to 1; the native
+#: H91 arms descend from the pre-RC2 x177 arm and never carried it, so h91v1,
+#: h91bb1 and h91bb2 ran the leaking default again ("HICACHE-INDEX REFUSED" 1
+#: line per group, 0 "ARENA-QUEUE-REFS" lines; x178: the reverse). Off, every
+#: resolved-but-unadopted arena page on the queue keeps its reader reference
+#: forever (docker agent boots measured up to 1528 such pages per boot on D,
+#: a 5461-slot arena) -- the pin that ends in ARENA-CLAIM REFUSED. A form that
+#: exists only in an arm's env is lost with the arm; "0" still opts out.
 ENV_QUEUE_REFS = "SGLANG_HICACHE_ARENA_QUEUE_REFS"
 
 
 def arena_queue_refs_on() -> bool:
-    return os.environ.get(ENV_QUEUE_REFS, "0").strip().lower() in ("1", "true", "yes", "on")
+    return os.environ.get(ENV_QUEUE_REFS, "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 class RefLedger:
