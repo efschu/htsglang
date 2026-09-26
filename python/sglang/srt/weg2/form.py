@@ -353,6 +353,14 @@ class ModelProfile:
     #: checkpoints the #114 P prefill transient support points were measured on
     prefill_transient_checkpoints: Tuple[str, ...]
     constants: Mapping[str, Measured]
+    #: the exchange form's group-D dormant reserve IS this profile's census
+    #: reading (NF cb1575e94e, user 22.09. "diesen wert nicht doppelt oder gar
+    #: nicht nehmen": it replaces the constant in dc_expect_d, a record still
+    #: wins when larger). False = the 27B line: DC_MEASURED_D_XCHG_* (weg2xsn14)
+    #: is the reserve and the census is only reported beside it (#1273 B4i) --
+    #: the 27B census (weg2xsn246: 1622 MiB on the 5090) is below every 27B D
+    #: residue record (2074-2150 MiB), so taking it would under-reserve D.
+    d_residue_census: bool = False
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -493,6 +501,7 @@ PROFILES: Dict[str, ModelProfile] = {
         group_env={},
         prefill_transient_checkpoints=(),
         constants=_QWEN27B_CONSTANTS,
+        d_residue_census=False,
     ),
     PROFILE_NEXTFLASH: ModelProfile(
         id=PROFILE_NEXTFLASH,
@@ -556,6 +565,7 @@ PROFILES: Dict[str, ModelProfile] = {
         },
         prefill_transient_checkpoints=("Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",),
         constants=_NEXTFLASH_CONSTANTS,
+        d_residue_census=True,
     ),
 }
 
