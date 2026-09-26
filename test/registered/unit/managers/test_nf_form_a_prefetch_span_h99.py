@@ -100,6 +100,7 @@ def run_ranks(fn):
 
     def _t(r):
         _ROLE.worker = ROLES[r] == "worker"
+        _ROLE.rank = r
         try:
             results[r] = fn(r)
         except BaseException as e:  # noqa: BLE001
@@ -311,6 +312,74 @@ class TestPieces(unittest.TestCase):
         src = inspect.getsource(Scheduler._prefetch_kvcache)
         i = src.index("locally_eligible=locally_eligible,")
         self.assertLess(i, src.index("tp_match_floor.adopt_host_prefetch_span("))
+
+
+class TestAuditNoSilentFallback(unittest.TestCase):
+    """Release audit: a broad except must not put ONE rank on another path."""
+
+    def _raising_switch(self, only_rank=None):
+        from sglang.srt.environ import envs
+
+        field = getattr(envs, SWITCH)
+        real = field.get
+
+        def _get():
+            if only_rank is None or getattr(_ROLE, "rank", None) == only_rank:
+                raise ValueError("unparsable switch")
+            return real()
+
+        return mock.patch.object(field, "get", _get)
+
+    def test_follow_predicate_error_is_a_named_stop(self):
+        with _Env(), self._raising_switch():
+            with self.assertRaises(m.FormAFollowUndecidable):
+                m.form_a_follow_active()
+
+    def test_one_rank_throws_in_the_vote_and_stops_by_name(self):
+        group = MockGlooGroup(timeout=1.0)
+
+        def _rank(r):
+            c = _carrier(r, group)
+            c.prefetch_from_storage(
+                "weg2-33-33", _host_node(), PROMPT[RC9O[r]:], last_hash=None, prefix_keys=None
+            )
+            return _registered_len(c, "weg2-33-33")
+
+        with _Env(), self._raising_switch(only_rank=1):
+            results, errors = run_ranks(_rank)
+        self.assertIsInstance(
+            errors.get(1), m.FormAFollowUndecidable,
+            f"rank 1 must stop by name, not fall back to its own span: {errors}",
+        )
+        self.assertFalse(any(v for v in results.values()), f"nobody registers: {results}")
+
+    def test_worker_follows_even_if_the_anchor_check_swallowed_an_error(self):
+        # The worker's own match already reaches the group depth, but on a
+        # TOMBSTONE; `anchor_unusable` answers "usable" (what its broad except
+        # does on an error). The ordinary path's #928 would then zero this
+        # worker alone while TP0 admits 18112.
+        import test_nf_form_a_follow_h98 as h98
+
+        class _TombTree(h98._Tree):
+            def _node(self, n):
+                if n <= 0:
+                    return self.root_node
+                data = [None, None, types.SimpleNamespace(value=None, host_value=None)]
+                return types.SimpleNamespace(name=f"n{n}", component_data=data)
+
+        tree = _TombTree(18112, [18112])
+        with mock.patch.object(m, "anchor_unusable", return_value=False):
+            got = h98._admit(tree, 1, {"r": 18112}, "r")
+        self.assertEqual(got, 18112)
+
+    def test_floor_verdict_error_is_a_named_stop(self):
+        tree = types.SimpleNamespace(**{"_tp_match_floor_group": {"r": 0}})
+        bad = types.SimpleNamespace(device_indices=object(), host_hit_length=5)
+        with self.assertRaises(m.RankFloorUndecidable):
+            m.group_floor_zeroes(tree, types.SimpleNamespace(rid="r"), bad)
+        tree2 = types.SimpleNamespace(**{"_tp_match_floor_group": {"r": 64}})
+        with self.assertRaises(m.RankFloorUndecidable):
+            m.group_floor_cap(tree2, types.SimpleNamespace(rid="r"), bad)
 
 
 if __name__ == "__main__":
