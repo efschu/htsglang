@@ -1,0 +1,450 @@
+{
+ "profile": "qwen27b",
+ "what": "Measured records of the Qwen3.8-27B profile (UNIFY_PLAN Schritt 9). The scalar rows were the _QWEN27B_CONSTANTS literals in weg2/form.py (values unchanged); P_CHUNK_BUILTIN was launcher P_CHUNK_BUILTIN_INT8; D_SPEED_* were the literals of weg2/d_reshard _rc9_*_calib. A record holds only for its power limit and (per-stage tables) its P cut.",
+ "records": [
+  {
+   "name": "DC_MEASURED_D_5090_MIB",
+   "value": 2228,
+   "provenance": "boot weg2ls1b2 (#1233 D dormant residue, 5090)",
+   "boots": [
+    "weg2ls1b2"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "DC_MEASURED_D_3080_MIB",
+   "value": 1922,
+   "provenance": "boot weg2ls1b2 (#1233 D dormant residue, 3080)",
+   "boots": [
+    "weg2ls1b2"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "DC_MEASURED_D_XCHG_MIB",
+   "value": [
+    2588,
+    3084,
+    2588
+   ],
+   "provenance": "boot weg2xsn14 (exchange arm, B4h/B4k)",
+   "boots": [
+    "weg2xsn14"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "P_OVERSHOOT_MIB",
+   "value": [
+    920,
+    0,
+    512
+   ],
+   "provenance": "boot weg2ls2b2 (P awake overshoot per P ordinal)",
+   "boots": [
+    "weg2ls2b2"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "D_OVERSHOOT_MIB",
+   "value": [
+    489,
+    0,
+    0
+   ],
+   "provenance": "boot weg2ls4b1 (D awake overshoot, NEXTN TP-D)",
+   "boots": [
+    "weg2ls4b1"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "P_DRAFT_RESIDENT_BUDGET_MIB",
+   "value": 1618.2,
+   "provenance": "27B NEXTN head: mtp 405.2 + embed 1213.0 MiB (#1233 fix 3, L2 resident_mib)",
+   "boots": [],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)",
+   "parts": [
+    405.2,
+    1213.0
+   ]
+  },
+  {
+   "name": "CALIBRATION_LAYERS",
+   "value": 64,
+   "provenance": "boot bsscale (the cut MEASURED_MS_PER_LAYER was taken under)",
+   "boots": [
+    "bsscale"
+   ],
+   "kind": "geometry",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "MEASURED_MS_PER_LAYER",
+   "value": "8.10,35.16,33.59",
+   "provenance": "boot bsscale 2026-09-07 (BSSCALE_0907.md, chunk 4096 bs6, cut 32,18,14)",
+   "boots": [
+    "bsscale"
+   ],
+   "kind": "timing",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "P_PP_STAGE_FIXED_MIB",
+   "value": "2342.0,1105.5,3518.0",
+   "provenance": "boots weg2sb5f + weg2rg6 (#1286)",
+   "boots": [
+    "weg2sb5f",
+    "weg2rg6"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT",
+   "value": 1.5588,
+   "provenance": "boots weg2sb5f + weg2rg6 (#1286, six rank readings)",
+   "boots": [
+    "weg2sb5f",
+    "weg2rg6"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "X_RECORDED_R_D_TOKS",
+   "value": 690.0,
+   "provenance": "record 1l/1o weg2zr2 (PRE-BARLINK)",
+   "boots": [
+    "weg2zr2"
+   ],
+   "kind": "timing",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "X_RECORDED_R_P_TOKS",
+   "value": 3640.0,
+   "provenance": "record 1l/1o weg2zr2 (PRE-BARLINK)",
+   "boots": [
+    "weg2zr2"
+   ],
+   "kind": "timing",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "X_RECORDED_FLIP_S",
+   "value": 13.247,
+   "provenance": "record 1l/1o weg2zr2 (PRE-BARLINK)",
+   "boots": [
+    "weg2zr2"
+   ],
+   "kind": "timing",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "STORE_CENSUS_PROVENANCE",
+   "value": "boot weg2sb5g W9 store census 2026-09-09T07:12:38Z",
+   "provenance": "boot weg2sb5g",
+   "boots": [
+    "weg2sb5g"
+   ],
+   "kind": "census",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "STORE_CENSUS_KV_PAGES",
+   "value": 50651,
+   "provenance": "boot weg2sb5g W9 store census",
+   "boots": [
+    "weg2sb5g"
+   ],
+   "kind": "census",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "STORE_CENSUS_MAMBA_BLOBS",
+   "value": 42,
+   "provenance": "boot weg2sb5g W9 store census",
+   "boots": [
+    "weg2sb5g"
+   ],
+   "kind": "census",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "STORE_CENSUS_DRAFT_PAGES",
+   "value": 26040,
+   "provenance": "boot weg2sb5g W9 store census",
+   "boots": [
+    "weg2sb5g"
+   ],
+   "kind": "census",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "STORE_CENSUS_KV_PAGE_BYTES",
+   "value": 32768,
+   "provenance": "boot weg2sb5g W9 store census",
+   "boots": [
+    "weg2sb5g"
+   ],
+   "kind": "census",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  },
+  {
+   "name": "P_CHUNK_BUILTIN",
+   "value": [
+    {
+     "a_ms": 43.94,
+     "b_ms_per_1k": 1.022,
+     "fwd_overhead_ms": 3.73,
+     "eager_floor_ms": 63.0
+    },
+    {
+     "a_ms": 36.87,
+     "b_ms_per_1k": 0.922,
+     "fwd_overhead_ms": 0.0,
+     "eager_floor_ms": 42.0
+    },
+    {
+     "a_ms": 40.41,
+     "b_ms_per_1k": 0.995,
+     "fwd_overhead_ms": 0.0,
+     "eager_floor_ms": 74.0
+    }
+   ],
+   "provenance": "the --p-chunk-model builtin-int8 stage lines: a_ms/b_ms_per_1k = pgap_stage_fit.fit_rank_lines over prefixes [0, 32768) of boot weg2rc7c (a54f21cda0, INT8, cut 42/11/11, 512 graph, 1076-1082 device-bound chunks per rank, sd 2.1-2.5 ms), per 512 chunk t = a + b*(prefix+256)/1000; fwd_overhead_ms = PP0 mean #PGAP gpu_gap_ms below 50 ms (3.73, n=2101); eager_floor_ms = xsn422 #PGAP eager host launch 63/42/74 ms",
+   "boots": [
+    "weg2rc7c",
+    "weg2xsn422"
+   ],
+   "kind": "timing",
+   "power_limit_w": {
+    "RTX5090": 400.0,
+    "RTX3080": 230.0
+   },
+   "power_limit_source": "nvidia-smi power.limit 24.09. 18:55Z and 26.09. (row 27): 5090 400 W, 3080 230 W; boots in between did not record the limit (weg2/power_limit.RIG_POWER_LIMIT_W_0924)",
+   "fmt": "int8",
+   "pp_layer_ratio": [
+    42,
+    11,
+    11
+   ],
+   "n": 1076
+  },
+  {
+   "name": "D_SPEED_DECODE",
+   "value": {
+    "points": [
+     {
+      "boot": "dkr27bbar1final09260145",
+      "base": [
+       58,
+       25,
+       25
+      ],
+      "compute_ms": [
+       18.3,
+       21.9,
+       21.8
+      ],
+      "n": 415
+     },
+     {
+      "boot": "weg2xsn420",
+      "base": [
+       3465,
+       2154,
+       2128
+      ],
+      "compute_ms": [
+       16.3,
+       23.8,
+       23.0
+      ],
+      "n": 646
+     }
+    ],
+    "beta": [
+     0.05,
+     0.07,
+     0.07
+    ],
+    "attn_ms_per_ktok": [
+     0.0264,
+     0.0468,
+     0.0468
+    ],
+    "w1_ms": 9.1,
+    "w_slope_ms": 3.8
+   },
+   "provenance": "decode: two-point fit dkr27bbar1final09260145 [58,25,25] + weg2xsn420 auto [3465,2154,2128]; beta from bs1..6 slopes; attn from #296 depth terms (131k)",
+   "boots": [
+    "dkr27bbar1final09260145",
+    "weg2xsn420"
+   ],
+   "kind": "timing",
+   "power_limit_w": {
+    "RTX5090": 400.0,
+    "RTX3080": 230.0
+   },
+   "power_limit_source": "nvidia-smi power.limit 24.09. 18:55Z and 26.09. (row 27): 5090 400 W, 3080 230 W; boots in between did not record the limit (weg2/power_limit.RIG_POWER_LIMIT_W_0924)",
+   "fmt": "int8",
+   "n": 415
+  },
+  {
+   "name": "D_SPEED_DECODE",
+   "value": {
+    "points": [
+     {
+      "boot": "dkr27bnvfp4bar1final09260231",
+      "base": [
+       58,
+       25,
+       25
+      ],
+      "compute_ms": [
+       14.6,
+       17.9,
+       17.6
+      ],
+      "n": 109
+     }
+    ],
+    "w1_ms": 9.2,
+    "w_slope_ms": 3.8
+   },
+   "provenance": "decode: one point dkr27bnvfp4bar1final09260231, E borrowed from INT8 (LOW confidence: W4A8 on sm86 is compute-heavier than its bytes)",
+   "boots": [
+    "dkr27bnvfp4bar1final09260231"
+   ],
+   "kind": "timing",
+   "power_limit_w": {
+    "RTX5090": 400.0,
+    "RTX3080": 230.0
+   },
+   "power_limit_source": "nvidia-smi power.limit 24.09. 18:55Z and 26.09. (row 27): 5090 400 W, 3080 230 W; boots in between did not record the limit (weg2/power_limit.RIG_POWER_LIMIT_W_0924)",
+   "fmt": "nvfp4",
+   "n": 109,
+   "confidence": "LOW",
+   "borrowed_parts": [
+    "e_gbs, beta, attn_ms_per_ktok <- int8"
+   ]
+  },
+  {
+   "name": "D_SPEED_DECODE",
+   "value": {
+    "points": [
+     {
+      "boot": "dkr27bfp8bar1final09260250",
+      "base": [
+       58,
+       25,
+       25
+      ],
+      "compute_ms": [
+       20.6,
+       26.2,
+       25.6
+      ],
+      "n": 10
+     }
+    ],
+    "w1_ms": 9.8,
+    "w_slope_ms": 3.8
+   },
+   "provenance": "decode: one point dkr27bfp8bar1final09260250 (RC9 103712cdb2, --fp8-uniform-marlin, W8A16 Marlin on every card, MLP_VECTOR 87,26,23), same method as the INT8/NVFP4 points (UN6 26.09.); E, beta, attn and the round slope borrowed from INT8 (same 1 B/param, but Marlin W8A16 is compute-heavier on sm86)",
+   "boots": [
+    "dkr27bfp8bar1final09260250"
+   ],
+   "kind": "timing",
+   "power_limit_w": {
+    "RTX5090": 400.0,
+    "RTX3080": 230.0
+   },
+   "power_limit_source": "nvidia-smi power.limit 24.09. 18:55Z and 26.09. (row 27): 5090 400 W, 3080 230 W; boots in between did not record the limit (weg2/power_limit.RIG_POWER_LIMIT_W_0924)",
+   "fmt": "fp8",
+   "n": 10,
+   "confidence": "LOW: n=10 complete bs1 rounds of one short agent turn",
+   "borrowed_parts": [
+    "e_gbs, beta, attn_ms_per_ktok, w_slope_ms <- int8",
+    "D prefill <- int8 (the FP8 D log has no 4096-token chunk)"
+   ]
+  },
+  {
+   "name": "D_SPEED_PREFILL",
+   "value": {
+    "compute_ms": [
+     256.8,
+     365.2,
+     368.4
+    ],
+    "wait_ms": 1584.7,
+    "invariant_share": 0.35,
+    "chunk_tokens": 4096
+   },
+   "provenance": "prefill: one point, 4096-token D chunk at dkr27bbar1final09260145 (min compute per rank, 3080 wait floor); invariant share 0.35 (uneven_perf._PREDICT_PREFILL_INVARIANT_FRACTION)",
+   "boots": [
+    "dkr27bbar1final09260145"
+   ],
+   "kind": "timing",
+   "power_limit_w": {
+    "RTX5090": 400.0,
+    "RTX3080": 230.0
+   },
+   "power_limit_source": "nvidia-smi power.limit 24.09. 18:55Z and 26.09. (row 27): 5090 400 W, 3080 230 W; boots in between did not record the limit (weg2/power_limit.RIG_POWER_LIMIT_W_0924)",
+   "fmt": "int8",
+   "n": 2
+  },
+  {
+   "name": "D_SPEED_PREFILL",
+   "value": {
+    "compute_ms": [
+     294.9,
+     807.4,
+     802.3
+    ],
+    "wait_ms": 1585.6,
+    "invariant_share": 0.35,
+    "chunk_tokens": 4096
+   },
+   "provenance": "prefill: one point, 4096-token D chunk at dkr27bnvfp4bar1final09260231",
+   "boots": [
+    "dkr27bnvfp4bar1final09260231"
+   ],
+   "kind": "timing",
+   "power_limit_w": {
+    "RTX5090": 400.0,
+    "RTX3080": 230.0
+   },
+   "power_limit_source": "nvidia-smi power.limit 24.09. 18:55Z and 26.09. (row 27): 5090 400 W, 3080 230 W; boots in between did not record the limit (weg2/power_limit.RIG_POWER_LIMIT_W_0924)",
+   "fmt": "nvfp4",
+   "n": 2
+  }
+ ]
+}

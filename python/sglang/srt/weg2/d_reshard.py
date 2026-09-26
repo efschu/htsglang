@@ -605,55 +605,125 @@ def rc9_geometry(fmt: str) -> DGeometry:
         return DGeometry.from_config(_QWEN38_27B, mlp_units=1088, linear_bpp=1.0, draft_bpp=1.0)
     if fmt == "nvfp4":
         return DGeometry.from_config(_QWEN38_27B, mlp_units=136, linear_bpp=0.5625, draft_bpp=0.5625)
+    if fmt == "fp8":
+        # FP8 e4m3 weight_block_size [128,128]: 136 MLP units (the rc9 FP8 D ran
+        # MLP_VECTOR 87,26,23), 1 B/param, the DFlash2-W8 draft at 1 B/param
+        return DGeometry.from_config(_QWEN38_27B, mlp_units=136, linear_bpp=1.0, draft_bpp=1.0)
     raise ReshardError(f"no rc9 geometry for format {fmt!r}")
 
 
-def _rc9_int8_calib() -> DCalib:
+# UNIFY S9: THE D SPEED CONSTANTS ARE RECORDS (weg2/profile_records_data/
+# qwen27b.json, D_SPEED_DECODE / D_SPEED_PREFILL per format), each with its
+# boots, n and the power limit it was measured under (row 27). This module
+# keeps only the FIT (the arithmetic is unchanged: the INT8 two-point fit, the
+# one-point formats on INT8's E). A format without its own prefill record
+# takes INT8's and says so (BORROWED on every line).
+
+#: the card class of each D TP rank on this rig (TP0 on the 5090)
+D_RANK_CARD_CLASSES: Tuple[str, ...] = ("RTX5090", "RTX3080", "RTX3080")
+
+
+def _power_by_class(current_power_w: Optional[Sequence[Optional[float]]]):
+    if not current_power_w:
+        return None
+    out: Dict[str, List[float]] = {}
+    for cls, w in zip(D_RANK_CARD_CLASSES, current_power_w):
+        if w is not None:
+            out.setdefault(cls, []).append(float(w))
+    return {k: tuple(v) for k, v in out.items()} or None
+
+
+def _d_speed_record(name: str, fmt: str, current_power_w=None):
+    """The ``name`` record of ``fmt`` that holds for the running limit (a
+    record under a foreign limit only when nothing else is left -- its lines
+    then say MISMATCH, row 27); None = no record of this format."""
+    from sglang.srt.weg2 import profile_records as _pr
+
+    return _pr.select("qwen27b", name, fmt=fmt, current_power=_power_by_class(current_power_w))
+
+
+def _rank_limits(rec) -> Tuple[float, ...]:
+    lim = rec.power_limits() or {}
+    if not lim:
+        return ()
+    return tuple(float(lim[c]) for c in D_RANK_CARD_CLASSES if c in lim)
+
+
+def _prefill_terms(pf, s: Sequence[float]):
+    pc = tuple(pf["compute_ms"])
+    inv = float(pf["invariant_share"])
+    return (tuple(inv * c for c in pc), tuple((1 - inv) * c / s[r] for r, c in enumerate(pc)),
+            float(pf["wait_ms"]))
+
+
+def _rc9_int8_calib(current_power_w=None) -> DCalib:
+    dec = _d_speed_record("D_SPEED_DECODE", "int8", current_power_w)
+    pfr = _d_speed_record("D_SPEED_PREFILL", "int8", current_power_w)
+    if dec is None or pfr is None:
+        raise ReshardError("no INT8 D speed record (profile_records_data/qwen27b.json)")
+    v = dec.record.value
+    pa, pb = v["points"][0], v["points"][1]
     g = rc9_geometry("int8")
-    a = rank_bytes(g, Vector(RC9_BASE))
-    b = rank_bytes(g, Vector(XSN420_BASE))
-    # bs=1 decode compute medians (Decode rank batch ... compute/wait):
-    # A = dkr27bbar1final09260145 n=415: 18.3/21.9/21.8; B = weg2xsn420 n=646: 16.3/23.8/23.0
-    e0, f0 = fit_two_point(a[0], 18.3, b[0], 16.3)
+    a = rank_bytes(g, Vector(tuple(pa["base"])))
+    b = rank_bytes(g, Vector(tuple(pb["base"])))
+    ca, cb = pa["compute_ms"], pb["compute_ms"]
+    e0, f0 = fit_two_point(a[0], ca[0], b[0], cb[0])
     b12a, b12b = (a[1] + a[2]) / 2, (b[1] + b[2]) / 2
-    e1, f1 = fit_two_point(b12a, (21.9 + 21.8) / 2, b12b, (23.8 + 23.0) / 2)
+    e1, f1 = fit_two_point(b12a, (ca[1] + ca[2]) / 2, b12b, (cb[1] + cb[2]) / 2)
     s = [x / sum(a) for x in a]
-    # D-prefill 4096 chunk at A: compute 256.8/365.2/368.4, wait floor 1584.7 (3080);
-    # invariant share 0.35 (uneven_perf._PREDICT_PREFILL_INVARIANT_FRACTION)
-    pc = (256.8, 365.2, 368.4)
+    pf_fixed, pf_k, pf_wait = _prefill_terms(pfr.record.value, s)
     return DCalib(
-        name="int8", e_gbs=(e0, e1, e1), f_ms=(f0, f1, f1), beta=(0.05, 0.07, 0.07),
-        attn_ms_per_ktok=(0.0264, 0.0468, 0.0468), w1_ms=9.1, w_slope_ms=3.8,
-        pf_fixed_ms=tuple(0.35 * c for c in pc), pf_k_ms=tuple(0.65 * c / s[r] for r, c in enumerate(pc)),
-        pf_wait_ms=1584.7, power_limit_w=RC9_POWER_LIMIT_W,
-        provenance="decode: two-point fit dkr27bbar1final09260145 [58,25,25] + weg2xsn420 auto "
-                   "[3465,2154,2128]; beta from bs1..6 slopes; attn from #296 depth terms (131k); "
-                   "prefill: one point, invariant 0.35")
+        name="int8", e_gbs=(e0, e1, e1), f_ms=(f0, f1, f1), beta=tuple(v["beta"]),
+        attn_ms_per_ktok=tuple(v["attn_ms_per_ktok"]), w1_ms=float(v["w1_ms"]),
+        w_slope_ms=float(v["w_slope_ms"]),
+        pf_fixed_ms=pf_fixed, pf_k_ms=pf_k, pf_wait_ms=pf_wait, power_limit_w=_rank_limits(dec.record),
+        provenance=f"{dec.record.provenance}; {pfr.record.provenance} [{dec.tag()}]")
 
 
-def _rc9_nvfp4_calib(int8: DCalib) -> DCalib:
-    g = rc9_geometry("nvfp4")
-    a = rank_bytes(g, Vector(RC9_BASE))
+def _rc9_one_point_calib(fmt: str, int8: DCalib, current_power_w=None) -> DCalib:
+    """A format with ONE measured decode point: F from the point on INT8's E
+    (and INT8's beta/attn); prefill its own record, else INT8's (BORROWED)."""
+    dec = _d_speed_record("D_SPEED_DECODE", fmt, current_power_w)
+    if dec is None:
+        raise ReshardError(f"no rc9 calibration for format {fmt!r}")
+    pfr = _d_speed_record("D_SPEED_PREFILL", fmt, current_power_w)
+    pf_borrowed = pfr is None
+    if pf_borrowed:
+        pfr = _d_speed_record("D_SPEED_PREFILL", "int8", current_power_w)
+    v = dec.record.value
+    pt = v["points"][0]
+    g = rc9_geometry(fmt)
+    a = rank_bytes(g, Vector(tuple(pt["base"])))
     s = [x / sum(a) for x in a]
-    # one point (dkr27bnvfp4bar1final09260231 n=109): 14.6/17.9/17.6; E borrowed from INT8
-    c = (14.6, 17.9, 17.6)
+    c = pt["compute_ms"]
     f = tuple(c[r] - (a[r] / 1e9) * 1000.0 / int8.e_gbs[r] for r in range(3))
-    pc = (294.9, 807.4, 802.3)
+    if pf_borrowed:
+        # INT8's prefill terms as INT8 calibrated them (its own byte shares)
+        pf_fixed, pf_k, pf_wait = int8.pf_fixed_ms, int8.pf_k_ms, int8.pf_wait_ms
+        pf_prov = f"prefill BORROWED from INT8 ({pfr.record.provenance})"
+    else:
+        pf_fixed, pf_k, pf_wait = _prefill_terms(pfr.record.value, s)
+        pf_prov = pfr.record.provenance
     return DCalib(
-        name="nvfp4", e_gbs=int8.e_gbs, f_ms=f, beta=int8.beta, attn_ms_per_ktok=int8.attn_ms_per_ktok,
-        w1_ms=9.2, w_slope_ms=3.8,
-        pf_fixed_ms=tuple(0.35 * x for x in pc), pf_k_ms=tuple(0.65 * x / s[r] for r, x in enumerate(pc)),
-        pf_wait_ms=1585.6, power_limit_w=int8.power_limit_w,
-        provenance="decode: one point dkr27bnvfp4bar1final09260231, E borrowed from INT8 (LOW "
-                   "confidence: W4A8 on sm86 is compute-heavier than its bytes); prefill one point")
+        name=fmt, e_gbs=int8.e_gbs, f_ms=f, beta=int8.beta, attn_ms_per_ktok=int8.attn_ms_per_ktok,
+        w1_ms=float(v["w1_ms"]), w_slope_ms=float(v["w_slope_ms"]),
+        pf_fixed_ms=pf_fixed, pf_k_ms=pf_k, pf_wait_ms=pf_wait,
+        power_limit_w=_rank_limits(dec.record) or int8.power_limit_w,
+        provenance=f"{dec.record.provenance}; {pf_prov} [{dec.tag()}]")
 
 
-def rc9_calib(fmt: str) -> DCalib:
-    i8 = _rc9_int8_calib()
+#: formats whose D speed constants are not all their own (printed as BORROWED)
+D_SPEED_BORROWED = {"nvfp4": "INT8 E/beta/attn", "fp8": "INT8 E/beta/attn + D prefill"}
+
+
+def rc9_calib(fmt: str, current_power_w: Optional[Sequence[Optional[float]]] = None) -> DCalib:
+    """The D speed constants of ``fmt`` from its records (UNIFY S9); a record
+    set measured under the running power limit is preferred."""
+    i8 = _rc9_int8_calib(current_power_w)
     if fmt == "int8":
         return i8
-    if fmt == "nvfp4":
-        return _rc9_nvfp4_calib(i8)
+    if fmt in ("nvfp4", "fp8"):
+        return _rc9_one_point_calib(fmt, i8, current_power_w)
     raise ReshardError(f"no rc9 calibration for format {fmt!r}")
 
 
@@ -757,8 +827,9 @@ def plan_lines(spec: ReshardSpec, fmt: str, loads: Sequence[LoadClass]) -> List[
 # capacities (the solver's own ceiling note says so) and only moves WHERE the KV
 # lives.  There is no maxkv objective left, only speed optima: this table.
 
-#: formats with a D cost model; 'fp8' borrows INT8's constants (same 1 B/param,
-#: sm86 runs it as W8A16 Marlin: labelled BORROWED on every line).
+#: formats with a D cost model. 'fp8' has its own one-point decode record
+#: (dkr27bfp8bar1final09260250, UNIFY S9) on INT8's E/beta/attn and INT8's D
+#: prefill (no FP8 4096 chunk measured): labelled BORROWED on every line.
 ADVISORY_FORMATS = {"compressed-tensors": "int8", "modelopt": "nvfp4", "modelopt_fp4": "nvfp4",
                     "fp8": "fp8"}
 ADVISORY_BS = (1, 2, 4, 6)
@@ -779,8 +850,8 @@ def advisory_geometry(text_cfg: Mapping, fmt: str, mlp_units: int) -> DGeometry:
     return DGeometry.from_config(text_cfg, mlp_units=mlp_units, linear_bpp=bpp, draft_bpp=bpp)
 
 
-def advisory_calib(fmt: str) -> DCalib:
-    return rc9_calib("int8" if fmt == "fp8" else fmt)
+def advisory_calib(fmt: str, current_power_w: Optional[Sequence[Optional[float]]] = None) -> DCalib:
+    return rc9_calib(fmt, current_power_w)
 
 
 def _share_vectors(geom: DGeometry, n: int) -> List[Tuple[int, ...]]:
@@ -820,7 +891,7 @@ def speed_advisory_lines(text_cfg: Mapping, quant_method: Optional[str], base: S
     fmt = advisory_format(quant_method)
     why = None
     if fmt is None:
-        why = f"no D cost model for quant method {quant_method!r} (calibrated: INT8, NVFP4; FP8 borrowed)"
+        why = f"no D cost model for quant method {quant_method!r} (calibrated: INT8, NVFP4, FP8 one point)"
     elif n != 3:
         why = f"cost model is calibrated for TP=3 (5090 + 2x3080), this group has {n} ranks"
     else:
@@ -834,11 +905,11 @@ def speed_advisory_lines(text_cfg: Mapping, quant_method: Optional[str], base: S
     if why is not None:
         return [f"{head}; the old 'restart with SGLANG_UNEVEN_MLP_VECTOR' KV hint does not apply. "
                 f"No speed table: {why}."]
-    cal = advisory_calib(fmt)
+    cal = advisory_calib(fmt, current_power_w)
     ts = token_share(token_vector) if token_vector and len(token_vector) == n else (1.0 / n,) * n
     cur = Vector(tuple(base), tuple(int(u) for u in current_mlp))
     wake = best_static_mlp(geom, cal, base, ts)
-    tag = " BORROWED(INT8 constants)" if fmt == "fp8" else ""
+    tag = f" BORROWED({D_SPEED_BORROWED[fmt]})" if fmt in D_SPEED_BORROWED else ""
     pl = power_tag(cal.power_limit_w)
     lines = [f"{head}; the old 'restart with SGLANG_UNEVEN_MLP_VECTOR' KV hint does not apply. "
              f"D speed optima (HOCHRECHNUNG, weg2/d_reshard, fmt={fmt}{tag}, base={','.join(map(str, base))}, "

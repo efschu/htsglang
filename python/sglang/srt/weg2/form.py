@@ -182,6 +182,12 @@ class Measured:
     value: object
     provenance: str
     measured_on: str
+    #: UNIFY S9: card class -> W the value was measured under; None = the boot
+    #: did not record it (release table row 27)
+    power_limit_w: Optional[Mapping[str, float]] = None
+    boots: Tuple[str, ...] = ()
+    #: memory | timing | census | geometry (weg2/profile_records.KINDS)
+    kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -233,6 +239,16 @@ class WeightFormat:
     sm8x: str = "native"
     sm12x: str = "native"
     note: str = ""
+    #: UNIFY S9 (docker/profiles from the registry, weg2/profile_docker.py):
+    #: the checkpoint of this format, its draft when it is not ``Draft.path``,
+    #: the launcher flags the format needs, the P cut it pins
+    #: ((stage ratio), (attention stage ratio)); () = solved, and the
+    #: entrypoint's PROFILE_FORMAT spelling when it differs from ``name``.
+    checkpoint: str = ""
+    draft: str = ""
+    args: Tuple[str, ...] = ()
+    p_cut_pin: Tuple[Tuple[int, ...], ...] = ()
+    profile_format: str = ""
 
 
 @dataclass(frozen=True)
@@ -241,8 +257,11 @@ class RecordKey:
     boot to count (UNIFY_PLAN L1): ``checkpoint`` (model_key), ``form`` (the
     RESIDUE_AXES of its WEG2-FORM line, else its draft), ``line`` (the boot's
     commit is an ancestor of the commit this launcher runs -- the 27B
-    line_identity 76e87ac3b2), ``power_limit`` (planner/power_limit.py scales
-    rates by the NVML limit; not a FILTER yet, Schritt 9), ``d_capture_set``
+    line_identity 76e87ac3b2), ``power_limit`` (UNIFY S9, release table row
+    27: a source whose boot printed ``POWER-LIMIT rank`` lines counts only when
+    every card class it names ran within 5 % of the limit the cards run NOW;
+    a source without those lines, or no NVML answer, is not filtered),
+    ``d_capture_set``
 (27B RC1 f1c9a43964: a group-D dormant-residue sample counts only when D ran
 the same ``--max-running-requests``, the CUDA-graph set its sleep keeps).
 
@@ -338,47 +357,36 @@ class ModelProfile:
             raise KeyError(f"profile {self.id!r} carries no constant {name!r}") from None
 
 
-def _m(value: object, provenance: str, on: str = PROFILE_QWEN27B) -> Measured:
-    return Measured(value=value, provenance=provenance, measured_on=on)
+#: UNIFY S9: THE MEASUREMENTS COME FROM RECORDS (weg2/profile_records_data/
+#: <profile>.json, read by weg2/profile_records.py): one record per measured
+#: value with its boots, its power limit (release table row 27) and, for a
+#: per-stage table, its P cut. The 27B rows are the literals that stood here
+#: until Schritt 8 (values unchanged; the provenance comments stay at the
+#: launcher aliases). A value that is no measurement stays a marked constant
+#: in the code.
+def _constants_from_records(profile: str) -> Dict[str, Measured]:
+    from sglang.srt.weg2 import profile_records as _pr
+
+    return {
+        name: Measured(value=r.value, provenance=r.provenance, measured_on=r.measured_on,
+                       power_limit_w=r.power_limits(), boots=r.boots, kind=r.kind)
+        for name, r in _pr.constants_of(profile).items()
+    }
 
 
-#: THE 27B MEASUREMENTS, values unchanged from the launcher module head (the
-#: provenance comments stay there, beside the name every reader knows).
-_QWEN27B_CONSTANTS: Dict[str, Measured] = {
-    "DC_MEASURED_D_5090_MIB": _m(2228, "boot weg2ls1b2 (#1233 D dormant residue, 5090)"),
-    "DC_MEASURED_D_3080_MIB": _m(1922, "boot weg2ls1b2 (#1233 D dormant residue, 3080)"),
-    "DC_MEASURED_D_XCHG_MIB": _m((2588, 3084, 2588), "boot weg2xsn14 (exchange arm, B4h/B4k)"),
-    "P_OVERSHOOT_MIB": _m((920, 0, 512), "boot weg2ls2b2 (P awake overshoot per P ordinal)"),
-    "D_OVERSHOOT_MIB": _m((489, 0, 0), "boot weg2ls4b1 (D awake overshoot, NEXTN TP-D)"),
-    "P_DRAFT_RESIDENT_BUDGET_MIB": _m(
-        405.2 + 1213.0, "27B NEXTN head: mtp 405.2 + embed 1213.0 MiB (#1233 fix 3, L2 resident_mib)"),
-    "CALIBRATION_LAYERS": _m(64, "boot bsscale (the cut MEASURED_MS_PER_LAYER was taken under)"),
-    "MEASURED_MS_PER_LAYER": _m(
-        "8.10,35.16,33.59", "boot bsscale 2026-09-07 (BSSCALE_0907.md, chunk 4096 bs6, cut 32,18,14)"),
-    "P_PP_STAGE_FIXED_MIB": _m("2342.0,1105.5,3518.0", "boots weg2sb5f + weg2rg6 (#1286)"),
-    "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT": _m(1.5588, "boots weg2sb5f + weg2rg6 (#1286, six rank readings)"),
-    "X_RECORDED_R_D_TOKS": _m(690.0, "record 1l/1o weg2zr2 (PRE-BARLINK)"),
-    "X_RECORDED_R_P_TOKS": _m(3640.0, "record 1l/1o weg2zr2 (PRE-BARLINK)"),
-    "X_RECORDED_FLIP_S": _m(13.247, "record 1l/1o weg2zr2 (PRE-BARLINK)"),
-    "STORE_CENSUS_PROVENANCE": _m("boot weg2sb5g W9 store census 2026-09-09T07:12:38Z", "boot weg2sb5g"),
-    "STORE_CENSUS_KV_PAGES": _m(50651, "boot weg2sb5g W9 store census"),
-    "STORE_CENSUS_MAMBA_BLOBS": _m(42, "boot weg2sb5g W9 store census"),
-    "STORE_CENSUS_DRAFT_PAGES": _m(26040, "boot weg2sb5g W9 store census"),
-    "STORE_CENSUS_KV_PAGE_BYTES": _m(32768, "boot weg2sb5g W9 store census"),
-}
+_QWEN27B_CONSTANTS: Dict[str, Measured] = _constants_from_records(PROFILE_QWEN27B)
 
 #: THE NF ROW. Its OWN measurement is P_DRAFT_RESIDENT_BUDGET_MIB (fnFL2v71,
 #: 1da8f29f12). Every other entry is the 27B measurement the NF line has read
-#: since its base 76f8debf2c, BORROWED by name -- kept (the NF argv must stay
-#: byte-identical, P_OVERSHOOT/D_OVERSHOOT shape it) and listed, never mixed in
-#: silently. An NF record replaces a borrowed row (UNIFY_PLAN Risiko (c)).
-_NEXTFLASH_CONSTANTS: Dict[str, Measured] = dict(_QWEN27B_CONSTANTS)
-_NEXTFLASH_CONSTANTS["P_DRAFT_RESIDENT_BUDGET_MIB"] = _m(
-    615.7 + 1522.7,
-    "boot fnFL2v71 (21.09.): packed vocab 615.7 (d84f1394fe) + INT4 g32 mtp 1522.7 MiB "
-    "(a905902f47), 1da8f29f12",
-    on=PROFILE_NEXTFLASH,
-)
+#: since its base 76f8debf2c, BORROWED by name in its records file
+#: (``borrow``) -- kept (the NF argv must stay byte-identical, P_OVERSHOOT/
+#: D_OVERSHOOT shape it) and listed, never mixed in silently. An NF record of
+#: the same name replaces a borrowed row (UNIFY_PLAN Risiko (c)).
+_NEXTFLASH_CONSTANTS: Dict[str, Measured] = _constants_from_records(PROFILE_NEXTFLASH)
+
+
+#: the rig's checkpoint directory (the registry's checkpoint/draft paths)
+_MC = "/spinning/llm_stuff/club-3090/models-cache/"
 
 
 PROFILES: Dict[str, ModelProfile] = {
@@ -416,10 +424,19 @@ PROFILES: Dict[str, ModelProfile] = {
         mamba_carrier_hold=False,
         repack_outside_pool=False,
         formats={
-            "int8": WeightFormat("int8", note="compressed-tensors W8A8"),
-            "fp8": WeightFormat("fp8", sm8x="marlin", note="--fp8-uniform-marlin"),
-            "nvfp4": WeightFormat("nvfp4", sm8x="w4a8", sm12x="native", note="--fp4-native-mixed (78c2f16a90)"),
-            "gguf": WeightFormat("gguf", note=".gguf detection (644de86ef9)"),
+            "int8": WeightFormat("int8", note="compressed-tensors W8A8",
+                                 checkpoint=_MC + "Qwen3.8-27B-INT8-gdncov-vocabembed"),
+            "fp8": WeightFormat("fp8", sm8x="marlin", note="--fp8-uniform-marlin",
+                                checkpoint=_MC + "Qwen3.8-27B-FP8", args=("--fp8-uniform-marlin",)),
+            "nvfp4": WeightFormat("nvfp4", sm8x="w4a8", sm12x="native", note="--fp4-native-mixed (78c2f16a90)",
+                                  checkpoint=_MC + "Qwen3.8-27B-NVFP4-RadixArk",
+                                  draft=_MC + "Qwen3.8-27B-DFlash2-NVFP4-RTNcal",
+                                  args=("--fp8-uniform-marlin", "--fp4-native-mixed"),
+                                  # RC9 N4D projection.py (27b-nvfp4.env)
+                                  p_cut_pin=((49, 8, 7), (12, 2, 2)), profile_format="nvfp4-modelopt"),
+            "gguf": WeightFormat("gguf", note=".gguf detection (644de86ef9)",
+                                 checkpoint=_MC + "Qwen3.8-27B-GGUF-unsloth/Qwen3.8-27B-UD-IQ4_XS.gguf",
+                                 p_cut_pin=((42, 11, 11), (10, 3, 3))),
         },
         p_cut="solved (MEASURED_MS_PER_LAYER, P_PP_STAGE_FIXED_MIB, CALIBRATION_LAYERS)",
         x_start_tokens=4096,
@@ -437,7 +454,7 @@ PROFILES: Dict[str, ModelProfile] = {
         # line's last release head before the unification; its boots are its
         # ancestors, not ancestors of this tree. No recalibration forced.
         records=RecordKey(
-            fields=("checkpoint", "form", "line", "d_capture_set"),
+            fields=("checkpoint", "form", "line", "d_capture_set", "power_limit"),
             line_heads=("103712cdb2550f2fbe6a02696147de32690fbe14",),
         ),
         early_read_flags=True,
@@ -458,7 +475,8 @@ PROFILES: Dict[str, ModelProfile] = {
         arch="moe",
         experts=Experts(store="offload", swap="platztausch", store_dir="/mnt/nf-experts",
                         residency_p=(0.332, 0.64, 0.39), residency_d=(0.06, 0.51, 0.48)),
-        draft=Draft(kind="mtp", steps=3, topk=1, tokens=4, park="host", share_embed=True),
+        draft=Draft(kind="mtp", steps=3, topk=1, tokens=4, park="host", share_embed=True,
+                    path=_MC + "Qwen3.8-Flash-Next-MTP-INT4-g32-albucino"),
         # H25: no draft head on P, D's draft parks in system RAM
         p_draft="none",
         replayssm=True,
@@ -473,9 +491,13 @@ PROFILES: Dict[str, ModelProfile] = {
         mamba_carrier_hold=True,
         repack_outside_pool=True,
         formats={
-            "int4-mixed": WeightFormat("int4-mixed", note="compressed-tensors AutoRound (Minachist)"),
+            "int4-mixed": WeightFormat("int4-mixed", note="compressed-tensors AutoRound (Minachist)",
+                                       checkpoint=_MC + "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",
+                                       p_cut_pin=((29, 11, 8), (7, 3, 2))),
             "nvfp4": WeightFormat("nvfp4", sm8x="w4a8", sm12x="native",
-                                  note="ModelOpt; 3080 W4A8 planned (user 25.09.)"),
+                                  note="ModelOpt; 3080 W4A8 planned (user 25.09.)",
+                                  checkpoint=_MC + "Qwen3.8-Flash-Next-NVFP4-nvidia",
+                                  p_cut_pin=((29, 11, 8), (7, 3, 2)), profile_format="nvfp4-modelopt"),
         },
         p_cut="pinned --pp-stage-ratio 29,11,8 --pp-attn-stage-ratio 7,3,2 (arm)",
         x_start_tokens=4096,
@@ -487,7 +509,7 @@ PROFILES: Dict[str, ModelProfile] = {
         warm_min_dwell=True,
         vision="off",
         context_tokens=262144,
-        records=RecordKey(fields=("checkpoint", "form")),
+        records=RecordKey(fields=("checkpoint", "form", "power_limit")),
         early_read_flags=False,
         # Scheibe 6a: the uneven-DCP axis is GROUP-OWNED on Next Flash (seam D):
         # P (PP3, tp 1) keeps 1/1 (inert), D (Form A) gets 0/0 -- an inherited 1
@@ -1269,9 +1291,8 @@ def same_model_log(model: str) -> Callable[[str], bool]:
 # 2026-09-24 11:4xZ "getrennt von nf und separat fuers 27b"). Here they are ONE
 # acceptor; WHICH terms apply is the profile's ``records`` row, not a second
 # module: accept(source) = checkpoint AND form AND (line, when the row names
-# it). ``power_limit`` is part of the declared key (planner/power_limit.py
-# SCALES rates by the NVML limit) but not a filter yet -- no front log states
-# its boot's limits in a form a record sample can be judged by (Schritt 9).
+# it) AND (power_limit, UNIFY S9: the source's own POWER-LIMIT lines against
+# the limits the cards run now, when both are known).
 
 _BOOT_LOG_RE = tolerant_compile(
     r"^boot_weg2_(?P<tag>.+)_(?P<tip>[0-9a-f]{7,40})_(?P<day>\d{4})_(?P<time>\d{6})"
@@ -1364,6 +1385,39 @@ def _boot_tag_tip(tag: str, evidence_dir: str) -> Optional[str]:
     return None
 
 
+@lru_cache(maxsize=8192)
+def _log_power_by_class(path: str, _mtime: float) -> Tuple[Tuple[str, float], ...]:
+    """``(card class, W)`` of a boot log's ``POWER-LIMIT rank`` lines (release
+    table row 27), read from its first :data:`_SCAN_MAX_BYTES`; () = the log
+    names no limit (it predates row 27)."""
+    from sglang.srt.weg2 import profile_records as _pr
+
+    lines: List[str] = []
+    try:
+        with open(path, "rb") as f:
+            seen = 0
+            for raw in f:
+                seen += len(raw)
+                if seen > _SCAN_MAX_BYTES:
+                    break
+                if b"POWER-LIMIT rank " in raw:
+                    lines.append(raw.decode("utf-8", "replace"))
+    except OSError:
+        return ()
+    return tuple(sorted(_pr.log_power_by_class(lines).items()))
+
+
+def running_power_by_class() -> Tuple[Tuple[str, Tuple[float, ...]], ...]:
+    """The limits the cards run NOW, ``(card class, (W, ...))`` from NVML; ()
+    when NVML cannot answer (the power term is then inactive). The launcher's
+    one read for :func:`calibration_identity` -- never called by a rank or the
+    front."""
+    from sglang.srt.weg2 import profile_records as _pr
+
+    got = _pr.current_power_by_class()
+    return tuple(sorted(got.items())) if got else ()
+
+
 @dataclass(frozen=True)
 class CalibrationIdentity:
     """What a measured source must share with this boot to count: the terms
@@ -1377,10 +1431,32 @@ class CalibrationIdentity:
     repo: str = ""
     #: further accepted line heads (:attr:`RecordKey.line_heads`)
     line_heads: Tuple[str, ...] = ()
+    #: UNIFY S9: the limits the cards run now, ``(card class, (W, ...))``;
+    #: () = unknown (the ``power_limit`` term is then not applied)
+    power_limits: Tuple[Tuple[str, Tuple[float, ...]], ...] = ()
 
     @property
     def uses_line(self) -> bool:
         return "line" in self.fields and bool(self.repo)
+
+    @property
+    def uses_power_limit(self) -> bool:
+        return "power_limit" in self.fields and bool(self.power_limits)
+
+    def power_ok(self, path: str) -> bool:
+        """The ``power_limit`` term for one boot log: False only when the log
+        names a limit of a card class that ran more than 5 % away from the
+        limit that class runs now (a measurement under a FOREIGN limit)."""
+        if not self.uses_power_limit:
+            return True
+        from sglang.srt.weg2 import profile_records as _pr
+
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return True
+        logged = dict(_log_power_by_class(str(path), mtime))
+        return _pr.power_verdict(logged, dict(self.power_limits)) != _pr.POWER_MISMATCH
 
     @property
     def uses_d_capture_set(self) -> bool:
@@ -1412,7 +1488,12 @@ class CalibrationIdentity:
         if self.uses_line:
             heads = "".join(f" or of {h[:10]}" for h in self.line_heads)
             parts.append(f"a boot commit that is an ancestor of {self.repo} HEAD{heads} (the line)")
-        declared = [f for f in self.fields if f not in ("checkpoint", "form", "line")]
+        if self.uses_power_limit:
+            now = ", ".join(f"{c} {'/'.join(f'{w:g}' for w in ws)} W" for c, ws in self.power_limits)
+            parts.append(f"a power limit within 5 % of the running one ({now}) where the boot "
+                         f"logged one")
+        done = ("checkpoint", "form", "line") + (("power_limit",) if self.uses_power_limit else ())
+        declared = [f for f in self.fields if f not in done]
         tail = f" [declared, not filtered: {', '.join(declared)}]" if declared else ""
         return " AND ".join(parts) + tail
 
@@ -1422,10 +1503,25 @@ class CalibrationIdentity:
             self.model, self.evidence_dir, self.form if "form" in self.fields else None)
         if not base(sample):
             return False
+        tag = str((sample or {}).get("boot_tag", "") or "")
+        if self.uses_power_limit and not self._tag_power_ok(tag):
+            return False
         if not self.uses_line:
             return True
-        tip = _boot_tag_tip(str((sample or {}).get("boot_tag", "") or ""), self.evidence_dir)
+        tip = _boot_tag_tip(tag, self.evidence_dir)
         return tip is not None and self._on_line(tip)
+
+    def _tag_power_ok(self, tag: str) -> bool:
+        """The power term for a record sample: its boot's newest front log (the
+        launcher prints one ``POWER-LIMIT rank launcher_card=`` line per card
+        there)."""
+        try:
+            stamp = int(os.path.getmtime(self.evidence_dir))
+        except OSError:
+            return True
+        for path in _front_log_index(self.evidence_dir, stamp).get(str(tag), ()):
+            return self.power_ok(path)
+        return True
 
     def _on_line(self, tip: str) -> bool:
         """``tip`` is on this tree's line, or on one of the allowlisted heads."""
@@ -1438,6 +1534,8 @@ class CalibrationIdentity:
         ``line`` term, a commit of this line, read off the log's own name)."""
         if not same_model_log(self.model)(path):
             return False
+        if not self.power_ok(str(path)):
+            return False
         if not self.uses_line:
             return True
         m = _BOOT_LOG_RE.match(os.path.basename(str(path)))
@@ -1445,7 +1543,8 @@ class CalibrationIdentity:
 
 
 def calibration_identity(
-    model: str, evidence_dir: str, form: Optional[Weg2Form], repo: str = ""
+    model: str, evidence_dir: str, form: Optional[Weg2Form], repo: str = "",
+    power_limits: Optional[Sequence[Tuple[str, Tuple[float, ...]]]] = None,
 ) -> CalibrationIdentity:
     """The identity of this boot, its terms from the form's profile row
     (``records.fields``); a profile the registry does not know keeps the
@@ -1457,4 +1556,20 @@ def calibration_identity(
     heads = row.records.line_heads if row is not None else ()
     return CalibrationIdentity(model=str(model or ""), evidence_dir=str(evidence_dir),
                                form=form, fields=tuple(fields), repo=str(repo or ""),
-                               line_heads=tuple(heads))
+                               line_heads=tuple(heads),
+                               power_limits=tuple(power_limits or ()))
+
+
+def profile_record(name: str, profile: Optional[str] = None, *, fmt: str = "",
+                   current_power=None, cut: Optional[Sequence[int]] = None,
+                   strict_power: bool = False):
+    """UNIFY S9: a format-/power-/cut-bound measured record of ``profile``
+    (default: the published form's, else :data:`DEFAULT_PROFILE`) --
+    :func:`weg2.profile_records.select`. None = no record holds."""
+    from sglang.srt.weg2 import profile_records as _pr
+
+    if profile is None:
+        form = current_form()
+        profile = form.profile if form is not None and form.profile in PROFILES else DEFAULT_PROFILE
+    return _pr.select(str(profile), name, fmt=fmt, current_power=current_power, cut=cut,
+                      strict_power=strict_power)

@@ -669,7 +669,8 @@ def pchunk_json(model: LayerCostModel, counts: Sequence[int]) -> Dict[str, objec
     Row 27: a model that knows its calibration limit hands it on as
     ``power_limit_w`` (one value per stage = per card) with the card classes
     in ``power_limit_cards``; a model without the field writes neither (the
-    JSON is then byte-identical to the pre-row-27 output)."""
+    JSON is then byte-identical to the pre-row-27 output). UNIFY S9: every
+    export names its cut (``pp_layer_ratio``, "41,12,11")."""
     head, sep, scale = model.source.partition(" +powerscale:")
     doc: Dict[str, object] = {
         "stages": [s.to_json() for s in model.stage_models(counts)],
@@ -678,6 +679,9 @@ def pchunk_json(model: LayerCostModel, counts: Sequence[int]) -> Dict[str, objec
     if model.power_limit_w:
         doc["power_limit_w"] = model.stage_power_limits()
         doc["power_limit_cards"] = list(model.stage_cards)
+    # UNIFY S9 (Agent PG: a per-stage table holds only for its cut): the cut
+    # this export is FOR, read by the launcher's p_chunk_model_cut_check.
+    doc["pp_layer_ratio"] = ",".join(str(int(x)) for x in counts)
     return doc
 
 

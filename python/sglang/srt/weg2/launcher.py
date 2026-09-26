@@ -41,6 +41,7 @@ Declared V1 deviations (all printed at launch and listed in the postmortem):
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import math
 import os
@@ -1309,11 +1310,13 @@ P_CHUNK_DYNAMIC_MIN_TOKENS_DEFAULT = 8192
 #: eager_floor_ms = the host launch of an EAGER P forward, xsn422 #PGAP
 #: (63/42/74 ms per stage, before the graph): a chunk above the largest graph
 #: bucket runs eager and is paced by it when its device time is shorter.
-P_CHUNK_BUILTIN_INT8 = (
-    {"a_ms": 43.94, "b_ms_per_1k": 1.022, "fwd_overhead_ms": 3.73, "eager_floor_ms": 63.0},
-    {"a_ms": 36.87, "b_ms_per_1k": 0.922, "fwd_overhead_ms": 0.0, "eager_floor_ms": 42.0},
-    {"a_ms": 40.41, "b_ms_per_1k": 0.995, "fwd_overhead_ms": 0.0, "eager_floor_ms": 74.0},
-)
+#: UNIFY S9: a RECORD of the 27B profile (profile_records_data/qwen27b.json,
+#: P_CHUNK_BUILTIN fmt=int8) carrying its power limit (400/230 W, row 27) and
+#: the P cut it was fitted on (42,11,11: a per-stage table holds only for its
+#: cut, p_chunk_model_cut_check). Values unchanged.
+_P_CHUNK_BUILTIN_RECORD = weg2_form.profile_record(
+    "P_CHUNK_BUILTIN", weg2_form.PROFILE_QWEN27B, fmt="int8").record
+P_CHUNK_BUILTIN_INT8 = tuple(dict(row) for row in _P_CHUNK_BUILTIN_RECORD.value)
 #: Per-token cost relative to M=512, per stage, as a function of the chunk.
 #: 'int8' PP0 (5090): kernel bench n4b_bench_0925_1239 -- the INT8 GEMMs
 #: (gate_up/down/qkvz/o) cost 12.3 % less per token at M=4096 than at 512
@@ -1365,8 +1368,10 @@ def p_chunk_model_power_limits(src: str, stages: int) -> Tuple[Optional[List[Opt
     src = str(src or P_CHUNK_MODEL_DEFAULT).strip()
     classes = list(P_STAGE_CARD_CLASSES[:stages]) + [P_STAGE_CARD_CLASSES[-1]] * max(0, stages - 3)
     if src == "builtin-int8":
-        return ([_pl.RIG_POWER_LIMIT_W_0924.get(c) for c in classes],
-                f"builtin rig limits ({_pl.RIG_POWER_LIMIT_PROVENANCE})")
+        # UNIFY S9: the record's own limit (the rig limits of 24.09.)
+        lim = _P_CHUNK_BUILTIN_RECORD.power_limits() or {}
+        return ([lim.get(c) for c in classes],
+                f"builtin rig limits ({_P_CHUNK_BUILTIN_RECORD.power_limit_source or 'record'})")
     if src.startswith("fit:"):
         path = src[4:]
         try:
@@ -1575,6 +1580,68 @@ def apply_p_chunk_policy(ns) -> None:
 def p_chunk_policy_spec():
     """The installed PolicySpec, None under 'fixed'."""
     return _P_CHUNK.get("spec")
+
+
+P_CHUNK_CUT_TAG = "P-CHUNK-MODEL"
+
+
+def p_chunk_model_cut(src: str) -> Tuple[Tuple[int, ...], str]:
+    """(the P cut the --p-chunk-model table was measured/fitted on, where that
+    came from); () = the table does not say (an older JSON, a fit log)."""
+    from sglang.srt.weg2 import p_graph_policy as _pgp
+
+    src = str(src or P_CHUNK_MODEL_DEFAULT).strip()
+    if src == "builtin-int8":
+        return tuple(_P_CHUNK_BUILTIN_RECORD.pp_layer_ratio), "record P_CHUNK_BUILTIN"
+    if src.startswith("fit:"):
+        return (), f"fit:{os.path.basename(src[4:])} (the fit log's own cut, not stated)"
+    try:
+        with open(src) as fh:
+            data = json.load(fh)
+        return _pgp.parse_cut((data or {}).get("pp_layer_ratio")), f"json:{os.path.basename(src)}"
+    except (OSError, ValueError, AttributeError, _pgp.GraphPolicyError) as exc:
+        return (), f"json:{os.path.basename(src)} pp_layer_ratio unreadable ({exc})"
+
+
+def p_chunk_model_cut_check(ns, cut, log) -> str:
+    """UNIFY S9 (Agent PG: a per-stage table holds only for its P cut): the
+    --p-chunk-model table's cut against the cut this boot SHIPS, once, right
+    after the cut is final (after the graph table's own check). Nothing under
+    'fixed'. The table names no cut: a WARNING, used as before. A different
+    cut: a JSON table (an export for ONE cut) is REFUSED -- there is no
+    table-less dynamic plan to fall back to, and switching to 'fixed' would
+    change P's chunk ceiling behind the operator's back; re-export it for the
+    cut (p_stage_model --cut), pin --pp-stage-ratio to its cut, or run
+    --p-chunk-policy fixed. The builtin INT8 model (fitted at 42,11,11, a desk
+    model for every cut until now) only warns. Returns the verdict."""
+    if p_chunk_policy_spec() is None:
+        return ""
+    src = str(getattr(ns, "p_chunk_model", P_CHUNK_MODEL_DEFAULT) or P_CHUNK_MODEL_DEFAULT).strip()
+    table, where = p_chunk_model_cut(src)
+    counts = tuple(int(x) for x in (getattr(cut, "layer_counts", ()) or ()))
+    gapped = bool(getattr(cut, "gapped", False))
+    boot = (f"gapped({getattr(cut, 'layer_set', '') or ','.join(map(str, counts))})" if gapped
+            else ",".join(map(str, counts)) or "?")
+    if not table:
+        log(f"WEG2 {P_CHUNK_CUT_TAG} CUT-UNKNOWN WARNING table={where} names no pp_layer_ratio, "
+            f"boot={boot} -> used as before; a per-stage table is only valid for the cut it was "
+            f"measured on")
+        return "unknown"
+    tcut = ",".join(map(str, table))
+    if not gapped and counts == tuple(table):
+        log(f"WEG2 {P_CHUNK_CUT_TAG} CUT-MATCH table={tcut} boot={boot} -> used ({where})")
+        return "match"
+    if src == "builtin-int8":
+        log(f"WEG2 {P_CHUNK_CUT_TAG} CUT-MISMATCH WARNING table={tcut} boot={boot} ({where}): the "
+            f"builtin INT8 model was fitted on {tcut}; its per-stage times do not describe this cut "
+            f"-- the plan is a HOCHRECHNUNG here (not refused: the builtin is the desk default); "
+            f"export a model for this cut (p_stage_model) to plan on a measurement")
+        return "mismatch"
+    msg = (f"{P_CHUNK_CUT_TAG} CUT-MISMATCH table={tcut} boot={boot} ({where}): the table was "
+           f"measured on another P cut and is not valid for this one -- re-export it for {boot} "
+           f"(p_stage_model), pin --pp-stage-ratio to {tcut}, or run --p-chunk-policy fixed")
+    log("WEG2 " + msg + " -- REFUSED")
+    raise SystemExit(msg)
 
 
 def p_chunk_policy_env() -> Dict[str, str]:
@@ -12471,7 +12538,24 @@ def calib_identity_of(ns) -> Optional["weg2_form.CalibrationIdentity"]:
     tree = getattr(ns, "tree", "") or ""
     return weg2_form.calibration_identity(
         getattr(ns, "model", ""), EVIDENCE_DIR, form,
-        repo=os.path.abspath(tree) if tree else "")
+        repo=os.path.abspath(tree) if tree else "",
+        power_limits=calib_power_limits(form))
+
+
+@functools.lru_cache(maxsize=1)
+def _running_power_by_class():
+    return weg2_form.running_power_by_class()
+
+
+def calib_power_limits(form) -> Tuple[Tuple[str, Tuple[float, ...]], ...]:
+    """UNIFY S9 (release table row 27, Agent PL): the limits the cards run now,
+    for the ``power_limit`` term of the calibration identity -- one NVML read
+    per launcher, and only when the profile's records row keys the term. ()
+    = unknown (NVML silent): the term is then not applied (never a refusal)."""
+    row = weg2_form.profile_row(getattr(form, "profile", ""))
+    if row is None or "power_limit" not in row.records.fields:
+        return ()
+    return _running_power_by_class()
 
 
 def record_line_spec(ns) -> str:
@@ -17944,6 +18028,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log("WEG2 PREFILL-GRAPH-CALIBRATION CUT-MISMATCH re-solved without the table: cut %s "
             "(captured=%s)" % (",".join(str(c) for c in cut.layer_counts) or cut.layer_set or "?",
                                p_prefill_graph_captured() or "none"))
+    # UNIFY S9: the P chunk model is a per-stage table of ONE cut as well
+    # (record pp_layer_ratio); checked on the final cut, after the graph's.
+    p_chunk_model_cut_check(ns, cut, log)
     stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio
     # 1b' (moved here by the argv slice's FIX 2) -- P's PP LAYER SPLIT, of the
     # cut group P is ACTUALLY LAUNCHED WITH.  Read off PCutFacts, where

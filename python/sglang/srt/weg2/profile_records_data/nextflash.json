@@ -1,0 +1,44 @@
+{
+ "profile": "nextflash",
+ "what": "Measured records of the Qwen3.8-Flash-Next profile. Every row NF never measured is BORROWED from qwen27b by name (UNIFY_PLAN Risiko (c)); an NF record of the same name replaces it.",
+ "records": [
+  {
+   "name": "P_DRAFT_RESIDENT_BUDGET_MIB",
+   "value": 2138.4,
+   "parts": [
+    615.7,
+    1522.7
+   ],
+   "provenance": "boot fnFL2v71 (21.09.): packed vocab 615.7 (d84f1394fe) + INT4 g32 mtp 1522.7 MiB (a905902f47), 1da8f29f12",
+   "boots": [
+    "fnFL2v71"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded: the boot predates the 24.09. reading and row 27 (no POWER-LIMIT line)"
+  }
+ ],
+ "borrow": {
+  "from": "qwen27b",
+  "names": [
+   "DC_MEASURED_D_5090_MIB",
+   "DC_MEASURED_D_3080_MIB",
+   "DC_MEASURED_D_XCHG_MIB",
+   "P_OVERSHOOT_MIB",
+   "D_OVERSHOOT_MIB",
+   "CALIBRATION_LAYERS",
+   "MEASURED_MS_PER_LAYER",
+   "P_PP_STAGE_FIXED_MIB",
+   "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT",
+   "X_RECORDED_R_D_TOKS",
+   "X_RECORDED_R_P_TOKS",
+   "X_RECORDED_FLIP_S",
+   "STORE_CENSUS_PROVENANCE",
+   "STORE_CENSUS_KV_PAGES",
+   "STORE_CENSUS_MAMBA_BLOBS",
+   "STORE_CENSUS_DRAFT_PAGES",
+   "STORE_CENSUS_KV_PAGE_BYTES"
+  ],
+  "why": "the 27B measurement the NF line has read since its base 76f8debf2c; kept so the NF argv stays byte-identical (P_/D_OVERSHOOT_MIB shape it), printed as BORROWED by the launcher. Replacing a row needs an NF control boot (P_/D_OVERSHOOT first)."
+ }
+}

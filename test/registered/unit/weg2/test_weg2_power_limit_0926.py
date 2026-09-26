@@ -265,7 +265,8 @@ class TestStageModel(unittest.TestCase):
         self.assertEqual(m.power_limit_w, {})
         self.assertNotIn("power_limit_w", m.to_json())
         doc = M.pchunk_json(m, (41, 12, 11))
-        self.assertEqual(set(doc), {"stages", "source"})
+        # UNIFY S9: every export names its cut; no power field without a limit
+        self.assertEqual(set(doc), {"stages", "source", "pp_layer_ratio"})
         # the check on an old model warns per card and changes nothing
         m2, lines = M.check_power(m, {"RTX5090": 400.0, "RTX3080": 230.0}, "linear")
         self.assertIs(m2, m)
