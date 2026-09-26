@@ -952,6 +952,12 @@ class Envs:
     # is in flight; otherwise it is routed with the start X (to P). NF D is
     # bs1, so a burst served serially on D would be slower than P's batch.
     SGLANG_WEG2_X_SOLO_WINDOW_MS = EnvInt(250)
+    # H102 (Weg-2 front): a per-request watcher sees the client's connection
+    # close and cancels the work behind it -- dequeued while queued, aborted
+    # on P (/abort_request, the intake-stall path) during leg 1, dropped
+    # before D, a D-parked request aborted on D. One line WEG2-CLIENT-GONE
+    # per request. Off = a dead client's leg 1 runs to its end (pre-H102).
+    SGLANG_WEG2_ENABLE_CLIENT_GONE_ABORT = EnvBool(True)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     # Weight loader: read safetensors tensors with pread() instead of mmap
     # page faults (ZFS: ~0.5 GB/s per rank through mmap, ~3 GB/s through
