@@ -2572,11 +2572,12 @@ def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
         if seats is None or int(seats) < 2 or form is None or not pool:
             return []
         import json
-        import os
 
         import msgspec
 
-        with open(os.path.join(ns.model, "config.json")) as fh:
+        # G2: the model's config by the server's rule -- a GGUF names the
+        # FILE, whose config is the sibling config.json.
+        with open(model_config_path(ns.model)) as fh:
             cfg = json.load(fh)
         top_k = int((cfg.get("text_config") or cfg).get("num_experts_per_tok") or 0)
         if top_k <= 0:

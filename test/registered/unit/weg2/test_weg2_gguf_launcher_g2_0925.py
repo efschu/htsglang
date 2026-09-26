@@ -471,3 +471,37 @@ def test_the_real_unsloth_iq4_xs():
     assert dg, why
     if os.path.isfile(REAL_Q8):
         assert HL.checkpoint_digest(REAL_Q8)[0] not in (None, dg)
+
+
+def test_the_h95_seat_table_reads_the_config_of_a_gguf(tmp_path, monkeypatch):
+    """H95 (8623408ef9) read ``os.path.join(ns.model, "config.json")``: for a
+    GGUF (the FILE) that is ``<x>.gguf/config.json`` and the D seat table was
+    dropped with NotADirectoryError. Behavioural companion of the sweep above:
+    the table reaches its config through ``model_config_path``."""
+    import types
+
+    d = tmp_path / "ckpt"
+    _write_config(str(d), quant_method="gguf")
+    cfg_path = d / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["text_config"]["num_experts_per_tok"] = 8
+    cfg_path.write_text(json.dumps(cfg))
+    gguf = d / "model.gguf"
+    gguf.write_bytes(b"GGUF")
+
+    class _Reached(Exception):
+        pass
+
+    seen = {}
+
+    def _vram(ns, er, plan_kwargs, cfg, form):
+        seen["top_k"] = (cfg.get("text_config") or cfg).get("num_experts_per_tok")
+        raise _Reached()
+
+    monkeypatch.setattr(L, "d_stated_seats", lambda ns: 2)
+    monkeypatch.setattr(L, "d_replayssm_spec_plan_form", lambda ns: object())
+    monkeypatch.setattr(L, "d_seat_vram_plan_form", _vram)
+    er = types.SimpleNamespace(POOL_GRAPH_MODE_ENV="POOL_MODE")
+    lines = L.d_seat_table_lines(types.SimpleNamespace(model=str(gguf)), er,
+                                 {"env_d": {"POOL_MODE": "pool"}}, "D")
+    assert seen.get("top_k") == 8, lines
