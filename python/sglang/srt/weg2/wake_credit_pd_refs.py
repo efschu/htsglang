@@ -1473,3 +1473,56 @@ FORM_KEYS = {
                   "p_split": (29, 11, 8), "chunk_layers": 3, "p_card": (1, 0, 2),
                   "d_ratio": "183,137,168", "draft_on_p": False, "dense_repack": True},
 }
+
+#: H92d: free beim Flip-Start P->D, GEMESSEN je Boot (``pd_free0_from_logs``),
+#: fuer die Form ``form_key`` (FORM_KEYS) und die D-Sitze ``d_seats``; der
+#: Planer nimmt je Flip-Position die JUENGSTE Messung derselben Form
+#: (``wake_credit_pd.resolve_free0``), ein Sidecar-Record
+#: (``weg2.tools.pd_free0_record --append``) zaehlt gleichrangig. Gebunden an
+#: ``test/registered/unit/weg2/fixtures/pd_free0_h92d/`` (woertlich aus
+#: /spinning/evidence-665-f1/boot_weg2_fnFL2{x158,x178,h91v1,h91bb1,h91bb2,h91bb3}_*)
+#: durch test_weg2_pd_free0_record_h92d. Was sie trennt, ist der schlafende
+#: D-Mitbewohner: 1 Sitz (x158, x178) 1696-1698/768/766 MiB, 6 Sitze (h91v1,
+#: bb1, bb2, bb3) 1944/872/874 MiB (WEG2-SLEEP-RESIDUE sleep=1, TP0/TP1/TP2).
+FREE0_RECORDS = [
+    {"kind": "pd_free0", "group": "PD_FREE0", "form_key": "fnFL2x158", "d_seats": 1,
+     "source": "fnFL2x158/0", "flip": 0, "at": "2026-09-24 14:08:18,522",
+     "commit": "c01951e3e1", "free": {0: 10133.0, 1: 12172.0, 2: 8995.0},
+     "p_rows": [166, 263, 408]},
+    {"kind": "pd_free0", "group": "PD_FREE0", "form_key": "fnFL2x158", "d_seats": 1,
+     "source": "fnFL2x158/1", "flip": 1, "at": "2026-09-24 14:08:38,436",
+     "commit": "c01951e3e1", "free": {0: 10151.0, 1: 12020.0, 2: 9013.0},
+     "p_rows": [166, 263, 408]},
+    {"kind": "pd_free0", "group": "PD_FREE0", "form_key": "fnFL2x158", "d_seats": 1,
+     "source": "fnFL2x178/0", "flip": 0, "at": "2026-09-25 08:12:51,746",
+     "commit": "b89592806a", "free": {0: 7411.0, 1: 10864.0, 2: 8735.0},
+     "p_rows": [202, 360, 408]},
+    {"kind": "pd_free0", "group": "PD_FREE0", "form_key": "fnFL2x158", "d_seats": 1,
+     "source": "fnFL2x178/1", "flip": 1, "at": "2026-09-25 08:13:12,630",
+     "commit": "b89592806a", "free": {0: 7501.0, 1: 10674.0, 2: 8825.0},
+     "p_rows": [202, 360, 408]},
+    {"kind": "pd_free0", "group": "PD_FREE0", "form_key": "fnFL2x158", "d_seats": 6,
+     "source": "fnFL2h91v1/0", "flip": 0, "at": "2026-09-26 07:56:45,157",
+     "commit": "39fd662d9e", "free": {0: 7319.0, 1: 10628.0, 2: 8627.0},
+     "p_rows": [202, 360, 408]},
+    {"kind": "pd_free0", "group": "PD_FREE0", "form_key": "fnFL2x158", "d_seats": 6,
+     "source": "fnFL2h91v1/1", "flip": 1, "at": "2026-09-26 07:57:06,436",
+     "commit": "39fd662d9e", "free": {0: 7401.0, 1: 10570.0, 2: 8721.0},
+     "p_rows": [202, 360, 408]},
+    {"kind": "pd_free0", "group": "PD_FREE0", "form_key": "fnFL2x158", "d_seats": 6,
+     "source": "fnFL2h91bb1/0", "flip": 0, "at": "2026-09-26 14:17:51,646",
+     "commit": "e17bd548b5", "free": {0: 7343.0, 1: 10862.0, 2: 8629.0},
+     "p_rows": [198, 359, 408]},
+    {"kind": "pd_free0", "group": "PD_FREE0", "form_key": "fnFL2x158", "d_seats": 6,
+     "source": "fnFL2h91bb2/0", "flip": 0, "at": "2026-09-26 14:30:58,625",
+     "commit": "e17bd548b5", "free": {0: 7343.0, 1: 10862.0, 2: 8629.0},
+     "p_rows": [198, 359, 408]},
+    {"kind": "pd_free0", "group": "PD_FREE0", "form_key": "fnFL2x158", "d_seats": 6,
+     "source": "fnFL2h91bb3/0", "flip": 0, "at": "2026-09-26 15:45:23,042",
+     "commit": "50cd2884ac", "free": {0: 7333.0, 1: 10860.0, 2: 8627.0},
+     "p_rows": [198, 359, 408]},
+    {"kind": "pd_free0", "group": "PD_FREE0", "form_key": "fnFL2x158", "d_seats": 6,
+     "source": "fnFL2h91bb3/1", "flip": 1, "at": "2026-09-26 15:45:45,961",
+     "commit": "50cd2884ac", "free": {0: 7421.0, 1: 10802.0, 2: 8719.0},
+     "p_rows": [198, 359, 408]},
+]

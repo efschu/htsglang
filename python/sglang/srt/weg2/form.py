@@ -229,6 +229,11 @@ class Chunk:
     model: str
     #: the P chunk the profile's arm runs (tokens)
     tokens: int
+    #: what --p-chunk-policy dynamic prices from: "stage-model" (27B: builtin
+    #: -int8 / fit: / a stage-model JSON, weg2/p_chunk_policy.py) or
+    #: "model-key" (NF H92: the *.pchunk.json whose model_key is this
+    #: checkpoint's, weg2/p_chunk_nf.py)
+    dynamic_source: str = "stage-model"
 
 
 @dataclass(frozen=True)
@@ -330,6 +335,13 @@ class ModelProfile:
     #: line ran it unswitched since RC9 (S7c); NF off until the NF seat
     #: releases it with a boot tag.
     agent_span: bool
+    #: NF H91 STANDARD FORM (user design 25.09.; NF H91b/c/c2/d, H95 B/c):
+    #: the front's phase policy (P phase cap 6 + overlap plan against P's pool,
+    #: D decodes all it was handed, 60 s wait bound parks D and flips, leg-1
+    #: stall bound), the D park (SGLANG_WEG2_D_PARK + its draft KV) and the D
+    #: seats per phase from the wake's handoff_n. Operator 26.09.: nextflash
+    #: on, qwen27b off (the 27B stays byte-identical).
+    standard_form: bool
     vision: str
     context_tokens: int
     records: RecordKey
@@ -363,6 +375,12 @@ class ModelProfile:
         out["SGLANG_WEG2_BIGRAM_ANCHOR_EXACT"] = bool(self.bigram_anchor_exact)
         out["SGLANG_WEG2_ENABLE_WARM_MIN_DWELL"] = bool(self.warm_min_dwell)
         out["SGLANG_WEG2_ENABLE_AGENT_SPAN"] = bool(self.agent_span)
+        out["SGLANG_WEG2_STANDARD_FORM"] = bool(self.standard_form)
+        out["SGLANG_WEG2_D_PARK"] = bool(self.standard_form)
+        out["SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV"] = bool(self.standard_form)
+        # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
+        # installed Form A role plan at run time).
+        out["SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW"] = self.d_layout == "qsa_forma"
         return out
 
     def constant(self, name: str) -> object:
@@ -467,6 +485,7 @@ PROFILES: Dict[str, ModelProfile] = {
         bigram_anchor_exact=False,
         warm_min_dwell=False,
         agent_span=True,
+        standard_form=False,
         vision="transient",
         context_tokens=262144,
         # OPERATOR 26.09. (UN4): the 27B-RC9 records count on this tree as a
@@ -507,7 +526,8 @@ PROFILES: Dict[str, ModelProfile] = {
         d_layout="qsa_forma",
         page_size=64,
         kv_dtype="fp8_e4m3",
-        chunk=Chunk(grid=0, policy="fixed", model="linear from measurement (P card)", tokens=16384),
+        chunk=Chunk(grid=0, policy="fixed", model="linear from measurement (P card)", tokens=16384,
+                    dynamic_source="model-key"),
         end_anchor="tail_handoff",
         mamba_anchor="deepest",
         mamba_carrier_hold=True,
@@ -531,6 +551,7 @@ PROFILES: Dict[str, ModelProfile] = {
         warm_min_dwell=True,
         # NF P49: off until the NF seat releases #49 with a boot tag
         agent_span=False,
+        standard_form=True,
         vision="off",
         context_tokens=262144,
         records=RecordKey(fields=("checkpoint", "form", "power_limit")),
@@ -567,7 +588,10 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE is read in environ.py), the four NF
 #: tail switches (``end_anchor``), SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS
 #: (``mamba_anchor``), SGLANG_WEG2_DRAFT_SHARE_EMBED (``draft.share_embed``),
-#: SGLANG_WEG2_ENABLE_AGENT_SPAN (``agent_span``, #49; operator 26.09.).
+#: SGLANG_WEG2_ENABLE_AGENT_SPAN (``agent_span``, #49; operator 26.09.),
+#: SGLANG_WEG2_STANDARD_FORM / SGLANG_WEG2_D_PARK /
+#: SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV (``standard_form``, NF H91),
+#: SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW (``d_layout`` qsa_forma, NF R12).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }
@@ -693,6 +717,33 @@ def current_form(environ: Optional[Mapping[str, str]] = None) -> Optional[Weg2Fo
     boot, or a desk test): callers then keep their pre-form behaviour."""
     env = os.environ if environ is None else environ
     return parse_form(env.get(FORM_ENV, ""))
+
+
+#: The NF H91 standard form's MASTER switch (operator 26.09.): explicitly set,
+#: it wins over the profile row for every part of the form -- front policy,
+#: D park and draft KV, the launcher's seat defaults. Unset = the profile's
+#: ``standard_form`` (no form: on, the NF code default).
+STANDARD_FORM_ENV = "SGLANG_WEG2_STANDARD_FORM"
+_ON_WORDS = ("1", "true", "yes", "on")
+
+
+def standard_form_state(environ: Optional[Mapping[str, str]] = None,
+                        profile: Optional[str] = None) -> Tuple[bool, str]:
+    """``(on, source)`` of the NF standard form: an explicit
+    SGLANG_WEG2_STANDARD_FORM (``source`` "env"), else the registry row of
+    ``profile`` (or of the published form's profile: "profile <id>"), else on
+    ("no form", the NF code default)."""
+    env = os.environ if environ is None else environ
+    raw = env.get(STANDARD_FORM_ENV)
+    if raw is not None and str(raw).strip():
+        return str(raw).strip().lower() in _ON_WORDS, f"env {STANDARD_FORM_ENV}={str(raw).strip()}"
+    if profile is None:
+        form = current_form(environ)
+        profile = form.profile if form is not None else None
+    row = profile_row(profile)
+    if row is not None:
+        return bool(row.standard_form), f"profile {row.id}"
+    return True, "no form (NF code default)"
 
 
 def profile_switch_default(name: str, fallback, environ: Optional[Mapping[str, str]] = None):

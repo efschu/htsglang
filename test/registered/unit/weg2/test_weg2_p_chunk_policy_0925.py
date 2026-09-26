@@ -357,7 +357,10 @@ except Exception as exc:  # pragma: no cover
     _LERR = exc
 
 
-@pytest.mark.skipif(L is None, reason="weg2 launcher unavailable")
+# H92 (NF tree): the 27B launcher half (--p-prefill-graph, builtin-int8) is not
+# in the NF launcher; the NF launcher is pinned by test_weg2_p_chunk_nf_h92.py.
+@pytest.mark.skipif(L is None or not hasattr(L, "apply_p_prefill_graph"),
+                    reason="27B weg2 launcher (--p-prefill-graph) not in this tree")
 class TestLauncher(unittest.TestCase):
     def setUp(self):
         self._g = dict(L._P_PREFILL_GRAPH)

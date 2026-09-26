@@ -2652,6 +2652,12 @@ class FusedMoE(torch.nn.Module):
             cache = self._expert_offload
             if get_is_capture_mode():
                 self._drop_lookahead()
+                # H95: a batch whose worst-case demand exceeds one step's rows
+                # runs in overflow waves (SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES);
+                # 1 wave = the single step below, unchanged.
+                waves = cache.pool_waves(topk_ids.numel())
+                if waves > 1:
+                    return cache.run_pool_waves(dispatch_output, _apply, waves)
                 remapped = cache.prepare_pool(topk_ids)
                 sub = dispatch_output._replace(
                     topk_output=topk_output._replace(topk_ids=remapped)

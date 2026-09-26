@@ -2026,6 +2026,20 @@ class Envs:
     # sync-debug "warn" mode; logs DFLASH-SYNC-ROUND (count per round) and each
     # implicit host-sync call site once (DFLASH-SYNC-SITE). 0 = off.
     SGLANG_DEBUG_DFLASH_SYNC_TRACE = EnvInt(0)
+    # R12 (fLLiper release table row 12, mem_cache/form_a_host_shadow.py): on
+    # a Form A D group every rank keeps the same host and anchor entries. A
+    # worker keeps its byteless host rows as long as TP0 holds them (no transit
+    # release at the store ack or after a load-back, no host eviction of its
+    # own); TP0's own host drops (failed arena rebind, H19 displacement, its
+    # evict_host, a refused backup) ride the tp<-reqs request broadcast and
+    # every rank applies them before the pass's requests; a worker's 0-byte
+    # anchor pool gets 2 x SGLANG_HICACHE_ARENA_MAMBA_SLOTS rows. Only read
+    # with an installed Form A role plan whose host is TP rank 0; False =
+    # byte-identical to d1c7094ba6.
+    # UNIFY: default per profile (qsa_forma D = nextflash on, qwen27b off); on
+    # without a form (the NF code default).
+    SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW = EnvBool(
+        _profile_default("SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW", True))
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
@@ -2334,6 +2348,45 @@ class Envs:
     # the pool's eager forwards follow SGLANG_MOE_OFFLOAD_WAVE_ORDER again.
     # Rank-uniform: every rank reads the same launcher env.
     SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR = EnvBool(True)
+    # H95: the captured decode step of the device-planned pool
+    # (SGLANG_MOE_OFFLOAD_GRAPH_MODE=pool) in up to N OVERFLOW WAVES. 0 or 1
+    # (default) = off, the Task #40 worst case: a captured batch needs
+    # min(bs x verify x top_k, E - R) <= LRU + staging rows, so the scratch
+    # grows with the seats (Form A D bs2: 80 rows, residency 0.29 on the 3080
+    # workers; bs6: 240 ids). N >= 2: the bound is min(ids, E - R) <= N x
+    # (LRU + staging) -- wave 1 is the ordinary step, the experts it cannot
+    # hold are served by the next wave over exactly their lanes (weight 0 in
+    # every other wave), so the scratch stays that of bs1 and a step that fits
+    # computes exactly as without waves. A graph whose batch fits one wave
+    # captures no second one. Rank-uniform: every rank reads the launcher env;
+    # the wave count itself is rank-local (no collective inside the MoE).
+    SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES = EnvInt(0)
+    # H95 probe: every N decode graph replays, one line per rank
+    # 'MOE-POOL-DEMAND (H95)' with, per MoE layer since the last line, the
+    # MAXIMUM number of distinct non-resident expert ids one step routed and
+    # how many steps exceeded LRU + staging -- the measured demand the pool
+    # bound is about, instead of its worst case. 0 (default) = off; the pool
+    # tables then carry no demand counters and the step kernel is unchanged.
+    SGLANG_DEBUG_MOE_POOL_DEMAND = EnvInt(0)
+    # H95c (Nutzer 26.09.: "1,6gb experten cache kostet es nur bei tatsaechlich
+    # 6 sitzen"): D's per-seat posts are PHYSICALLY backed only for the seats
+    # the phase occupies (n = d_seats.phase_seats of the wake's handoff_n); the
+    # rest of the same VRAM backs extra expert-LRU rows on the attention host
+    # (Form A TP0). Mechanism (weg2/d_seat_vram.py): the Mamba/GDN temporal
+    # state and the expert buffers keep their FULL virtual range (CUDA graphs
+    # keep their addresses), the saver's span map (tms_csrc patch 3) maps only
+    # slots(n) per layer resp. rows(cap) + k(n) per expert tensor, the slot
+    # allocator hands out slots(n), the pool tables enable k(n) rows as device
+    # values, D admits at most n. False (default) = byte-identical to H95 B;
+    # the Next-Flash launcher profile writes it True into --env-d.
+    # Rank-uniform: every rank of D reads the same launcher env.
+    SGLANG_OPT_WEG2_D_SEAT_VRAM = EnvBool(False)
+    # H95c: the extra expert rows' VIRTUAL reservation per MoE TP rank
+    # ("16,0,0"), written by the launcher from the seat table (rows at n=1
+    # minus rows at the --d-bs cap, GERECHNET). Only the rows the runtime's
+    # exact granule arithmetic funds in a phase are ever mapped; unset/empty or
+    # 0 on a rank = no extra rows there.
+    SGLANG_WEG2_D_SEAT_EXPERT_ROWS = EnvStr("")
     # #254: how a prefill forward that overflows the scratch region is split.
     #   "token"  (default) -- waves are disjoint TOKEN subsets; every wave
     #     re-fetches the spill experts its tokens need, so a spill expert is
@@ -2393,6 +2446,12 @@ class Envs:
     # 4096 is the flip form; 8192 is the fn7t best form (L2 lever, 24.09.).
     # D keeps 4096 (X's floor, K5).
     SGLANG_WEG2_P_CHUNKED_PREFILL_TOKENS = EnvInt(4096)
+    # H92 (--p-chunk-policy dynamic, NF line): the forward budget of group P
+    # plans the token STREAM of every waiting request ('stream', set by the NF
+    # launcher) instead of the head request alone (unset/'request', the 27B
+    # budget). Read as a mapping by weg2/p_chunk_nf.budget_is_stream, like the
+    # shared SGLANG_P_CHUNK_POLICY/SPEC; inert without a dynamic planner.
+    SGLANG_P_CHUNK_BUDGET = EnvStr("")
     # fnFL2 H37 (Task #118, agent load = many small prefills): group P's
     # --pp-max-micro-batch-size. Unset/False = stock: the scheduler derives it
     # as max_running_requests // pp_size (scheduler.default_pp_micro_batch_size),
@@ -2803,6 +2862,39 @@ class Envs:
     # D->P was held 39.2 s by min-dwell (need 31115 ms, awake 8758 ms) while a batch
     # waiter queued. On: the price is flip_ms - drain_quiesce_ms (the flip itself).
     SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN = EnvBool(False)
+    # H91d D-PARK DRAFT KV (user decision 2026-09-25: "Ausnahme nur fuers
+    # Parken"): the one exception to the tier being off. A PARKED group-D
+    # request (flip park before D's sleep, pressure park of the youngest)
+    # keeps its MTP draft rows -- the non-zero rows of its committed context,
+    # copied off the draft pool before the retraction into one pageable host
+    # buffer per request (L2, in-process, it survives the sleep) and written
+    # back at its new slots on the resume (weg2/d_park_draft.py). Effective
+    # only on group D with SGLANG_WEG2_D_PARK active and the draft tier off;
+    # nothing is pinned, nothing un-parked is touched. False = H91b byte for
+    # byte (the resumed request drafts over whatever its new slots held).
+    # UNIFY (operator 26.09.): default per profile (ModelProfile.standard_form):
+    # nextflash on, qwen27b off; on without a form (the NF code default).
+    SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV = EnvBool(
+        _profile_default("SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV", True))
+    # NF H91 STANDARD FORM on the front (weg2/front.py): the phase policy's
+    # defaults (P phase cap 6, P pool 262144, D wait bound 60 s, leg-1 stall
+    # 180 s; an explicit front flag wins), rule 2 (D is done only when nothing
+    # is handed over or ready for it) and handoff_n/parked_n on D's wake (D's
+    # seats per phase). Default per profile (ModelProfile.standard_form):
+    # nextflash on, qwen27b off (the 27B front byte-identical); on without a
+    # form (the NF code default).
+    SGLANG_WEG2_STANDARD_FORM = EnvBool(_profile_default("SGLANG_WEG2_STANDARD_FORM", True))
+    # NF H91b D park (weg2/d_seats.d_park_active; group D only): default per
+    # profile (ModelProfile.standard_form: nextflash on, qwen27b off); on
+    # without a form. d_seats reads the raw value with the same default (it
+    # also judges hand-built env mappings); an explicit value always wins.
+    SGLANG_WEG2_D_PARK = EnvBool(_profile_default("SGLANG_WEG2_D_PARK", True))
+    # H91d: the L2 bound of those buffers per rank (MiB). A FLIP park whose
+    # buffer would pass it goes to L3 (a file under
+    # SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR/weg2_d_park_draft, written in the
+    # background, the RAM freed once written); a PRESSURE park (no sleep) is
+    # then not carried. 256 = one full 262k context of NF's draft (~1 KiB/token).
+    SGLANG_WEG2_D_PARK_DRAFT_KV_HOST_MIB = EnvInt(256)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)

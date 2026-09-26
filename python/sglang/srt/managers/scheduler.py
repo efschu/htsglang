@@ -195,6 +195,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     VramBudgetReqInput,
     VramBudgetReqOutput,
+    Weg2ParkRunningReqInput,
     sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
@@ -2504,6 +2505,14 @@ class Scheduler(
         from sglang.srt.weg2 import p_chunk_policy as _pcp
 
         self._p_chunk_planner = _pcp.planner_from_env(os.environ, log=logger.info)
+        # H92 (NF): the forward budget plans the token STREAM (P stau up to 6)
+        # when the launcher says so (SGLANG_P_CHUNK_BUDGET=stream); never
+        # without a planner, so fixed/unset stays byte-identical.
+        from sglang.srt.weg2 import p_chunk_nf as _pcnf
+
+        self._p_chunk_stream = self._p_chunk_planner is not None and _pcnf.budget_is_stream(
+            os.environ
+        )
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -3101,6 +3110,7 @@ class Scheduler(
                 (SessionHandoverReqInput, self.handle_session_handover),
                 (SessionCheckpointReqInput, self.handle_session_checkpoint),
                 (VramBudgetReqInput, self.handle_vram_budget),
+                (Weg2ParkRunningReqInput, self.handle_weg2_park_running),
                 (PlePrefetchHintReqInput, self.handle_ple_prefetch_hint),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
@@ -5305,6 +5315,9 @@ class Scheduler(
         if not gone:
             return 0
         hold[:] = keep
+        from sglang.srt.weg2 import d_park_draft as _dpd  # H91d: the park's draft buffer
+
+        _dpd.drop_all(self, gone, "abort")
         try:
             _cc = self.tree_cache.cache_controller
             for _r in gone:
@@ -5318,6 +5331,92 @@ class Scheduler(
         logger.info("#1445 DORMANT-HOLD abort: %d held request(s) dropped (rid=%s abort_all=%s), %d still held",
                     len(gone), rid[:12], abort_all, len(keep))
         return len(gone)
+
+    # ---- H91 Teil B: D seats -- the park and its resume ---------------------
+    # Delegation only (large-class-style): the bookkeeping moves live in
+    # weg2/d_park_runtime.py, the verdicts in weg2/d_seats.py.
+
+    def handle_weg2_park_running(self, recv_req):
+        """H91b: ``POST /weg2/park_running`` -- park every running D request
+        before D's sleep (d_park_runtime.park_running)."""
+        from sglang.srt.weg2 import d_park_runtime
+
+        return d_park_runtime.park_running(
+            self, recv_req, late_hold_armed=_weg2_dormant_admit_armed()
+        )
+
+    def weg2_d_hold_parked(self) -> int:
+        """H91b: the sleep leg's dormant point -- parked requests enter the
+        #1443 hold first (d_park_runtime.hold_parked)."""
+        from sglang.srt.weg2 import d_park_runtime
+
+        return d_park_runtime.hold_parked(self, hold_armed=_weg2_dormant_admit_armed())
+
+    def _weg2_d_park_hold_late(self, req) -> bool:
+        """H91c3-2: a hand-off reaching D after park_running is held behind
+        the park (d_park_runtime.hold_late_arrival)."""
+        from sglang.srt.weg2 import d_park_runtime
+
+        return d_park_runtime.hold_late_arrival(self, req)
+
+    def _weg2_d_park_tick(self) -> int:
+        from sglang.srt.weg2 import d_park_runtime
+
+        return d_park_runtime.park_tick(self)
+
+    def _weg2_d_park_note_retracted(self, retracted_reqs) -> int:
+        from sglang.srt.weg2 import d_park_runtime
+
+        return d_park_runtime.note_retracted(self, retracted_reqs)
+
+    def _weg2_d_park_admission(self, running_batch):
+        from sglang.srt.weg2 import d_park_runtime
+
+        return d_park_runtime.admission(self, running_batch)
+
+    def _weg2_d_park_abort(self, recv_req) -> int:
+        from sglang.srt.weg2 import d_park_runtime
+
+        return d_park_runtime.park_abort(self, recv_req)
+
+    def weg2_d_note_wake_seats(self, recv_req):
+        """H95: the wake of D fixes the phase's seat count from the front's
+        replicated handoff_n/parked_n (d_park_runtime.note_wake_seats)."""
+        from sglang.srt.weg2 import d_park_runtime
+
+        return d_park_runtime.note_wake_seats(self, recv_req)
+
+    def weg2_d_seat_vram_wake(self, recv_req, seats):
+        """H95c: the phase's seat posts as pages (d_park_runtime.seat_vram_wake)."""
+        from sglang.srt.weg2 import d_park_runtime
+
+        return d_park_runtime.seat_vram_wake(self, recv_req, seats)
+
+    def _weg2_d_seat_cap(self):
+        from sglang.srt.weg2 import d_park_runtime
+
+        return d_park_runtime.seat_cap(self)
+
+    def _weg2_d_seat_guard(self, batch) -> None:
+        from sglang.srt.weg2 import d_park_runtime
+
+        d_park_runtime.seat_guard(self, batch)
+
+    # H91d: a parked request's MTP draft rows (weg2/d_park_draft.py).
+    def _weg2_d_park_draft_snapshot(self, batch):
+        from sglang.srt.weg2 import d_park_draft
+
+        return d_park_draft.snapshot(self, batch)
+
+    def _weg2_d_park_draft_save(self, retracted_reqs, snap) -> int:
+        from sglang.srt.weg2 import d_park_draft
+
+        return d_park_draft.save_retracted(self, retracted_reqs, snap)
+
+    def _weg2_d_park_draft_restore(self, batch) -> int:
+        from sglang.srt.weg2 import d_park_draft
+
+        return d_park_draft.restore_admitted(self, batch)
 
     def _weg2_group_min_flags(self, flags):
         """#1471e: ONE verdict for the group.  weg2xsn240: rank 2 released a
@@ -6754,6 +6853,8 @@ class Scheduler(
                     logger.info("#1443 DORMANT-HOLD rid=%s tokens=%d held=%d (prefetch issued during the flip; device load at the wake -- #1455)",
                                 str(req.rid)[:12], len(req.origin_input_ids or []), len(hold))
                 return
+            if not is_retracted and self._weg2_d_park_hold_late(req):
+                return  # H91c3-2: arrived after the D park -- held behind it
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -10361,6 +10462,8 @@ class Scheduler(
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
         self.process_pending_weg2_park()  # Punkt 2 (18.09.)
+        if getattr(self, "weg2_d_parked", None):
+            self._weg2_d_park_tick()  # H91b
         if getattr(self, "weg2_post_wake_settle", None):
             self._weg2_post_wake_settle_tick()  # #1471
 
@@ -11192,6 +11295,10 @@ class Scheduler(
             get_server_args().pp_max_micro_batch_size,
             self.admission_limiter.current,
         )
+        # H95c: a D phase of n seats runs at most n requests (None = no cap)
+        _seat_cap = self._weg2_d_seat_cap()
+        if _seat_cap is not None:
+            limit = min(limit, _seat_cap)
         # #677 PHASE 1: a carrier the phase FORBIDS to decode stops being
         # charged to the concurrency cap. `limit` bounds how much decode may
         # run at once; a request PP may not decode is running nothing, so
@@ -11309,9 +11416,9 @@ class Scheduler(
         """
         from sglang.srt.weg2.p_chunk_policy import forward_budget
 
+        queue = getattr(self, "waiting_queue", None) or []
         req = self.chunked_req
         if req is None:
-            queue = getattr(self, "waiting_queue", None) or []
             if not queue:
                 return 0
             req = queue[0]
@@ -11322,6 +11429,13 @@ class Scheduler(
             )
             prefix = getattr(req, "prefix_indices", None)
             pos = 0 if prefix is None else len(prefix)
+            if getattr(self, "_p_chunk_stream", False):
+                # H92 (NF): plan the stream -- the head's rest plus every
+                # waiting request's rest -- and take its first width as this
+                # forward's budget (weg2/p_chunk_nf.py, interface item 4).
+                from sglang.srt.weg2.p_chunk_nf import stream_end
+
+                end = stream_end(pos, end, (r for r in queue if r is not req))
             width = forward_budget(self._p_chunk_planner, req.rid, pos, end)
         except Exception as exc:  # noqa: BLE001 - a plan must never stop a pass
             n = getattr(self, "_p_chunk_policy_errors", 0) + 1
@@ -13895,6 +14009,9 @@ class Scheduler(
         # queue, same policy, different order -- and a different order is a
         # different batch.
         self._apply_uniform_head_order(_head_inputs)
+        # H91b: on group D the parked requests come first and hold the seats
+        # they return to (weg2/d_seats.admission_gate); None = stock loop.
+        _d_park_gate = self._weg2_d_park_admission(running_batch)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -14558,6 +14675,11 @@ class Scheduler(
             if _burst_hold is not None:  # fnFL2 H42b: the burst is still assembling
                 _note_skip("weg2_burst_assembly", req.rid)
                 continue
+            if _d_park_gate is not None:  # H91b: parked first, newcomers wait
+                _d_skip = _d_park_gate.skip(req)
+                if _d_skip is not None:
+                    _note_skip(_d_skip, req.rid)
+                    continue
             # #988 A REQUEST ALREADY COLLECTED THIS PASS IS NOT A CANDIDATE.
             # `add_chunked_req` appends the continuation to `can_run_list`
             # while the request may still be resident in `waiting_queue` (the
@@ -16169,9 +16291,11 @@ class Scheduler(
         old_mamba_available = (
             mamba_allocator.available_size() if mamba_allocator is not None else None
         )
+        _draft_snap = self._weg2_d_park_draft_snapshot(batch)  # H91d
         retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
             self.server_args
         )
+        self._weg2_d_park_draft_save(retracted_reqs, _draft_snap)  # H91d
         new_available_tokens = self.token_to_kv_pool_allocator.available_size()
         new_token_gained = new_available_tokens - old_available_tokens
         mamba_num_gained = (
@@ -16230,6 +16354,7 @@ class Scheduler(
         for req in retracted_reqs:
             self._969ad_note_retract(req, "_retract_decode_and_requeue")
             self._add_request_to_queue(req, is_retracted=True)
+        self._weg2_d_park_note_retracted(retracted_reqs)  # H91b: D parks, never discards
         return new_token_gained
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
@@ -16609,6 +16734,7 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        self._weg2_d_seat_guard(batch)  # H95c W-SEAT: never wider than the phase's n
 
         # #861 fix (b): a request admitted on a cached prefix whose DRAFT rows
         # nothing wrote must not speculate over them. Here, and not in the
@@ -16704,6 +16830,7 @@ class Scheduler(
             )
 
             arm_draft_cold_for_admission(self, batch)
+            self._weg2_d_park_draft_restore(batch)  # H91d: a resumed park's draft rows
         # fnFL2 H32: the chunked request's NEXT chunk, for the PLE gather to
         # read on its worker processes while this forward runs (no-op unless
         # a PLE prefetcher lives in this process).
@@ -17629,7 +17756,10 @@ class Scheduler(
         except Exception as exc:  # noqa: BLE001 - a probe must never break a boot
             logger.info("POOL-PHASE %s unreadable: %r", phase, exc)
 
-    def is_fully_idle(self, for_health_check=False) -> bool:
+    def is_fully_idle(self, for_health_check=False, exempt_prefetch=()) -> bool:
+        # H91e: ``exempt_prefetch`` names open prefetch records that are not
+        # an idle term -- only the sleep leg passes it, with the dormant
+        # hold's own reads (weg2_sleep_drain.hold_owned_prefetch).
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
@@ -17681,7 +17811,7 @@ class Scheduler(
                 idle &= len(tc.ongoing_write_through) == 0
                 idle &= len(tc.ongoing_load_back) == 0
                 if tc.enable_storage:
-                    idle &= len(tc.ongoing_prefetch) == 0
+                    idle &= all(str(r) in exempt_prefetch for r in list(tc.ongoing_prefetch))
                     idle &= len(tc.ongoing_backup) == 0
 
         return idle
@@ -18218,8 +18348,9 @@ class Scheduler(
             f"rank's own optimistic answer, which is the #1268 defect itself."
         )
 
-    def idle_blockers(self) -> List[str]:
-        """Which clauses of :meth:`is_fully_idle` are currently false.
+    def idle_blockers(self, exempt_prefetch=()) -> List[str]:
+        """Which clauses of :meth:`is_fully_idle` are currently false
+        (``exempt_prefetch`` as there -- H91e).
 
         Diagnostic only -- no caller changes behaviour on it. It exists
         because "not idle" with every visible counter at zero is a state
@@ -18267,10 +18398,11 @@ class Scheduler(
                 len(tc.ongoing_load_back) == 0,
             )
             if tc.enable_storage:
+                _open = [r for r in list(tc.ongoing_prefetch) if str(r) not in exempt_prefetch]
                 _check(
-                    f"hicache_prefetch({len(tc.ongoing_prefetch)}: "
-                    f"{','.join(str(r)[:8] for r in list(tc.ongoing_prefetch)[:4])})",
-                    len(tc.ongoing_prefetch) == 0,
+                    f"hicache_prefetch({len(_open)}: "
+                    f"{','.join(str(r)[:8] for r in _open[:4])})",
+                    len(_open) == 0,
                 )
                 _check(
                     f"hicache_backup({len(tc.ongoing_backup)})",
@@ -19590,6 +19722,7 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
         self._weg2_abort_dormant_hold(recv_req)  # #1445: the hold is a queue too
+        self._weg2_d_park_abort(recv_req)  # H91b: so is the D park
 
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`

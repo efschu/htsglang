@@ -160,6 +160,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
     VramBudgetReqInput,
+    Weg2ParkRunningReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
@@ -1408,6 +1409,32 @@ async def vram_budget(obj: Annotated[VramBudgetReqInput, Body()], request: Reque
     return ORJSONResponse(
         {"success": ret.success, "message": ret.message, "state": ret.state},
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.api_route("/weg2/park_running", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def weg2_park_running(obj: Annotated[Weg2ParkRunningReqInput, Body()], request: Request):
+    """H91b: the Weg-2 front parks every running request of group D before
+    D's sleep (D->P flip). Body {"epoch": <int>, "reason": <str>}; answer 200
+    {"parked": [rid, ...]} (oldest first) plus "held" (queued, never started)
+    and "epoch". The parked requests keep their open streams and resume after
+    D's next wake ahead of every newer request. 409 when this server cannot
+    park (not group D, or a structure that must not be retracted)."""
+    try:
+        ret = await _global_state.tokenizer_manager.weg2_park_running(obj)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse(
+        {
+            "success": ret.success,
+            "parked": list(ret.parked),
+            "held": list(ret.held),
+            "late_hold": bool(getattr(ret, "late_hold", False)),
+            "epoch": ret.epoch,
+            "message": ret.message,
+        },
+        status_code=200 if ret.success else HTTPStatus.CONFLICT,
     )
 
 

@@ -1629,6 +1629,30 @@ class VramBudgetReqOutput(BaseReq, kw_only=True):
     state: Optional[dict] = None
 
 
+class Weg2ParkRunningReqInput(BaseReq, kw_only=True):
+    """H91b: the Weg-2 front parks every running request of group D right
+    before D's sleep (D->P flip); ``POST /weg2/park_running`` with
+    ``{"epoch": <int>, "reason": <str>}``. The requests keep their streams and
+    resume after D's next wake, before any newer request (oldest first)."""
+
+    epoch: int = 0
+    reason: str = ""
+
+
+class Weg2ParkRunningReqOutput(BaseReq, kw_only=True):
+    success: bool
+    #: rids of the parked (formerly running) requests, oldest first
+    parked: List[str] = []
+    #: rids that were only queued on D (never started) and wait behind them
+    held: List[str] = []
+    epoch: int = 0
+    message: str = ""
+    #: H91c3-2: every request reaching D after this park (a hand-off in
+    #: flight) is held behind it until the sleep -- the front counts its
+    #: in-flight hand-offs as parked. False = the pre-H91c3 answer.
+    late_hold: bool = False
+
+
 class PlePrefetchHintReqInput(BaseReq, kw_only=True):
     """fnFL2 H43: the front's hint that request ``rid`` (its prompt tokenized
     here, ``input_ids``) will come to this group; the PP0 scheduler starts the
@@ -2018,6 +2042,14 @@ class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
     # (weg2_memory_saver.credit_epoch), not the bare flip index -- the counter
     # file outlives the boot, so two boots' flip 7 used to compare equal.
     epoch: Optional[str] = None
+    # H91 part C rule 2 / H95: on the kv_cache resume of a P->D flip the front
+    # carries how many requests the ending P phase handed to D (``handoff_n``)
+    # and how many wait-bound-parked ones D resumes first (``parked_n``,
+    # weg2/front.py _wake_handoff_fields). Every rank receives this same
+    # object, so D's phase seat count is a replicated number
+    # (weg2/d_seats.phase_seats). None on every other resume.
+    handoff_n: Optional[int] = None
+    parked_n: Optional[int] = None
 
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):

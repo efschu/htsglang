@@ -146,6 +146,20 @@ uint64_t tms_tag_bytes(const char* tag) {
     return TorchMemorySaver::instance().tag_bytes(tag_str);
 }
 
+// H95c (patch 3) -- THE SPAN MAP.  The D phase's seat count decides how many
+// Mamba/GDN slots and how many expert LRU rows are backed; both live in TMS
+// allocations whose VA (and therefore every captured CUDA graph) stays fixed.
+// ``tms_set_spans`` tells the saver which byte ranges of ONE allocation the
+// next resume maps (``now`` != 0: also apply it to an ACTIVE allocation);
+// ``tms_alloc_info`` reads one allocation back.  Codes: core.h ``set_spans``.
+int tms_set_spans(void* ptr, size_t n, const uint64_t* lo, const uint64_t* hi, int now) {
+    return TorchMemorySaver::instance().set_spans(ptr, n, lo, hi, now != 0);
+}
+
+int tms_alloc_info(void* ptr, uint64_t* size, uint64_t* mapped, uint64_t* planned, int* active) {
+    return TorchMemorySaver::instance().alloc_info(ptr, size, mapped, planned, active);
+}
+
 // C16 / A1-2 (FIX 1 round 1).  ``tms_tag_bytes`` answers "how many device bytes
 // carry this tag"; the ring has to be sized to "how many HOST bytes the dormant
 // image is", and those are exactly the allocations with ``enable_cpu_backup``.

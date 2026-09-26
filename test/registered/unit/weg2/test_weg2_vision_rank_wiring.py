@@ -128,6 +128,7 @@ def test_the_abort_echo_carries_the_origin_reason_and_only_that():
                 send_output=lambda out, req: sent.append(out))),
             disaggregation_mode=DisaggregationMode.NULL,
             _weg2_abort_dormant_hold=lambda recv: None,
+            _weg2_d_park_abort=lambda recv: 0,  # NF H91b: an abort reaches the D park list too
             grammar_manager=types.SimpleNamespace(abort_requests=lambda recv: None),
             ps=types.SimpleNamespace(pp_size=1),
             running_batch=types.SimpleNamespace(reqs=[]),

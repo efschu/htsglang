@@ -72,6 +72,7 @@ from aiohttp import (
 )
 
 from sglang.srt.weg2.intake_stall import is_intake_stall, is_too_large  # weg2xsn272
+from sglang.srt.weg2.intake_stall import STALL_MARK as _INTAKE_STALL_MARK  # H91 part C
 
 #: weg2xsn291: the least a woken group keeps the cards even when fairness or
 #: work-exhaustion override the derived min-dwell (see Front._dwell_ok).
@@ -95,6 +96,7 @@ from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import host_ledger
 from sglang.srt.weg2 import prefill_clock  # UNIFY S4 (H85): D's prefill clock reader (stdlib only)
 from sglang.srt.weg2 import dp_wait as _dp_wait  # R28: DP-WAIT instrument
+from sglang.srt.weg2 import phase_policy  # H91 part C
 
 logger = logging.getLogger("weg2.front")
 
@@ -2390,7 +2392,9 @@ class Group:
         return "prefill" if self.name == "P" else "decode"
 
 
-async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch) -> int:
+async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
+                        max_dispatch: int = 0, cost=None, budget: int = 0,
+                        stats: Optional[Dict[str, int]] = None) -> int:
     """#1459c: keep up to ``limit`` leg-1 calls in flight, refilling from
     ``queue`` (a deque; new arrivals appended while draining are taken too)
     the moment ONE finishes.  ``on_done(p)`` runs in COMPLETION order.
@@ -2399,21 +2403,54 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch) -> int:
     abandoned -- the old gather had the same property for its batch.
     Returns the number of dispatch rounds (the ``passes`` term of the
     drain summary line).
+
+    H91 part C (user 25.09.), both terms off by default (the #1459c pool):
+
+    * ``max_dispatch`` > 0 -- THE PHASE CAP: no further dispatch once this
+      many requests left the queue in this drain (the in-flight ones are
+      still awaited). What stays queued waits for the next P phase.
+    * ``budget`` > 0 with ``cost(p)`` -- THE OVERLAP PLAN: the head is
+      dispatched only while the in-flight costs plus its own fit ``budget``
+      (P's unified pool, :func:`phase_policy.p_overlap_admits`); with nothing
+      in flight it always goes, so an oversized request is P's to refuse by
+      name. The head STAYS the head when it does not fit -- no younger,
+      smaller request overtakes it.
+
+    ``stats`` (optional) is filled with ``dispatched``, ``peak_n``,
+    ``peak_tokens`` and ``pool_holds`` for the drain's P-PHASE line.
     """
-    inflight: set = set()
+    inflight: Dict[Any, int] = {}
+    inflight_tokens = 0
+    dispatched_total = 0
     rounds = 0
+    if stats is not None:
+        for k in ("dispatched", "peak_n", "peak_tokens", "pool_holds"):
+            stats.setdefault(k, 0)
     while True:
         dispatched = False
         while queue and len(inflight) < limit and may_dispatch():
-            inflight.add(asyncio.ensure_future(one(queue.popleft())))
+            if phase_policy.phase_cap_reached(dispatched_total, max_dispatch):
+                break
+            c = int(cost(queue[0])) if (cost is not None and budget > 0) else 0
+            if not phase_policy.p_overlap_admits(inflight_tokens, len(inflight), c, budget):
+                if stats is not None:
+                    stats["pool_holds"] += 1
+                break
+            inflight[asyncio.ensure_future(one(queue.popleft()))] = c
+            inflight_tokens += c
+            dispatched_total += 1
             dispatched = True
+            if stats is not None:
+                stats["dispatched"] = dispatched_total
+                stats["peak_n"] = max(stats["peak_n"], len(inflight))
+                stats["peak_tokens"] = max(stats["peak_tokens"], inflight_tokens)
         if dispatched:
             rounds += 1
         if not inflight:
             return rounds
-        done, _pending = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+        done, _pending = await asyncio.wait(set(inflight), return_when=asyncio.FIRST_COMPLETED)
         for t in done:
-            inflight.discard(t)
+            inflight_tokens -= inflight.pop(t, 0)
             on_done(t.result())
 
 
@@ -2872,7 +2909,11 @@ class Front:
                  x_busy_tokens: Optional[int] = None,
                  d_short_drain_tokens: int = 0,
                  d_hold_s: Optional[float] = None,
-                 record_line: str = ""):
+                 record_line: str = "",
+                 p_phase_max_requests: int = 0,
+                 p_pool_tokens: int = 0,
+                 d_wait_bound_s: float = 0.0,
+                 p_leg1_stall_s: float = 0.0):
         # #1275: the key arrives as a PATH, never as an argv value. The groups
         # have no choice (`server_args` offers only `--admin-api-key`, so their
         # key is world-readable in /proc/<pid>/cmdline), but the front does, and
@@ -3236,6 +3277,222 @@ class Front:
         # remembered exactly as long as a success would have been.
         self._d_pool_retry_after: float = 0.0
         self._d_token_hold_rid: Optional[str] = None
+        # ---- H91 part C: the phase policy (user 25.09., weg2/phase_policy) --
+        # The CLASS defaults are 0 = off (the pre-H91 laws, which the
+        # scheduling tests pin); main()'s flag defaults are the user's design
+        # (6 / 262144 / 60 s), so a launcher that writes none of the three
+        # flags runs the policy.
+        #: rule 1: requests per P phase (0 = law 1 unchanged: drain to empty).
+        self.p_phase_max_requests = max(0, int(p_phase_max_requests or 0))
+        #: rule 1: P's unified pool the overlap is planned against (0 = off).
+        self.p_pool_tokens = max(0, int(p_pool_tokens or 0))
+        #: rule 3: the D-phase wait bound in seconds (0 = off: the fairness
+        #: switch --fairness-w-s acts in the D phase exactly as before).
+        self.d_wait_bound_s = max(0.0, float(d_wait_bound_s or 0.0))
+        #: rule 3: rids D PARKED on the wait bound -> the moment they were.
+        #: Still in ``groups["D"].outstanding`` (their client streams run),
+        #: but not "running" for the D->P drain and the W3 witness. Cleared
+        #: when D wakes again, because D resumes them first.
+        self._d_parked: Dict[str, float] = {}
+        #: rule 3: a D that answered 404/501 on the park endpoint (old D):
+        #: the fallback for the rest of the boot, logged once per fire.
+        self._park_unsupported = False
+        #: rule 3: ONE park attempt per D phase (the epoch that made it).
+        self._park_attempt_epoch = -1
+        #: H91c3-3: the D phase's seat count n (H95) this front sent at the
+        #: last P->D wake; None before the first one (no seat cap known).
+        self._d_phase_n: Optional[int] = None
+        #: part A companion: the bound on a leg 1 that never starts (0 = off).
+        self.p_leg1_stall_s = max(0.0, float(p_leg1_stall_s or 0.0))
+        #: when a leg 1 last completed -- P's work evidence for that bound.
+        self._p_leg1_done_t = 0.0
+        #: UNIFY (operator 26.09.): the NF H91 standard form on this front --
+        #: rule 2's hand-over term and handoff_n/parked_n on D's wake. qwen27b
+        #: off: the 27B front byte-identical (profile field standard_form).
+        from sglang.srt.weg2.form import standard_form_state
+
+        self.standard_form, self.standard_form_src = standard_form_state()
+        if (self.standard_form or self.p_phase_max_requests or self.p_pool_tokens
+                or self.d_wait_bound_s or self.p_leg1_stall_s
+                or self.standard_form_src.startswith("env ")):
+            logger.info(
+                "WEG2-PHASE-POLICY standard_form=%s (%s) "
+                "p_phase_max_requests=%d p_pool_tokens=%d d_wait_bound_s=%.1f "
+                "p_leg1_stall_s=%.0f d_phase_preemption=%s (H91 part C: P prefills at most "
+                "p_phase_max_requests per phase, overlapping as far as their est_prompt fits "
+                "p_pool_tokens; a leg 1 with no P progress for p_leg1_stall_s is requeued as an "
+                "intake stall; D decodes every request it was handed before the flip back; a request "
+                "waiting for P longer than d_wait_bound_s during the D phase parks D's running "
+                "decodes via %s and flips; 0 = that rule off)",
+                "on" if self.standard_form else "off", self.standard_form_src,
+                self.p_phase_max_requests, self.p_pool_tokens, self.d_wait_bound_s,
+                self.p_leg1_stall_s,
+                ("wait-bound (replaces --fairness-w-s in the D phase)" if self.d_wait_bound_s > 0
+                 else f"--fairness-w-s {self.w_s:g}"),
+                phase_policy.PARK_PATH)
+
+    # ---------------- H91 part C: parked requests and the wait bound ----------------
+    def _flip_ledger(self, g: Group) -> List[str]:
+        """The rids a flip must see drained from ``g``: its ledger minus the
+        requests D PARKED on the wait bound (rule 3). Those stay in
+        ``outstanding`` -- the front still holds their client streams -- but
+        D no longer runs them, so neither the drain nor the W3 witness may
+        wait for or count them. For P, and for a D with nothing parked, this
+        is the ledger itself."""
+        parked = getattr(self, "_d_parked", None) or {}
+        if g.name != "D" or not parked:
+            return list(g.outstanding)
+        # Part B re-queues a parked request no sleep followed after
+        # PARK_REQUEUE_S: from then on it runs on D again and counts here.
+        now = time.time()
+        return [r for r in g.outstanding
+                if r not in parked or phase_policy.parked_lapsed(parked[r], now)]
+
+    def _drop_lapsed_parks(self) -> None:
+        """Rule 3 with part B's clock: D awake and serving, and a parked
+        request older than PARK_REQUEUE_S -- no sleep followed its park, D has
+        re-queued it and runs it again. It stops being parked here too."""
+        if not self._d_parked:
+            return
+        now = time.time()
+        lapsed = sorted(r for r, t in self._d_parked.items() if phase_policy.parked_lapsed(t, now))
+        for r in lapsed:
+            self._d_parked.pop(r, None)
+        if lapsed:
+            self.counters["d_parked_lapsed"] += len(lapsed)
+            logger.warning("WEG2 PARK-LAPSED epoch=%d n=%d rids=%s -- parked %.0f s ago and no sleep "
+                           "followed; D re-queued them (part B) and the front counts them as "
+                           "running again", self.epoch, len(lapsed), lapsed[:8],
+                           phase_policy.PARK_REQUEUE_S)
+
+    def _wake_handoff_fields(self, dst: str) -> Dict[str, int]:
+        """Rule 2: what the wake message to D carries.
+
+        ``handoff_n`` -- the requests handed to D at this wake that are NOT
+        parked: the ones D already holds dormant (#1443, dormant admit), the
+        hand-offs in flight and the prefilled ones still in ``_ready_for_d``.
+        Taken at ``WEG2-FLIP begin`` of a P->D flip, i.e. after the P drain
+        ended, so it is the P phase's prefilled batch (<= the phase cap) plus
+        anything an earlier D phase left unadmitted.
+        ``parked_n`` -- requests D parked on the wait bound; it resumes them
+        first. They are NOT in ``handoff_n`` (counted once, in the phase that
+        handed them over).
+
+        Empty for a wake of P. D ignores unknown fields
+        (``msgspec_struct_pydantic_core_schema``: extra_behavior="ignore")
+        until part B declares them. getattr throughout: partial test fronts.
+        """
+        if dst != "D":
+            return {}
+        parked = getattr(self, "_d_parked", None) or {}
+        D = (getattr(self, "groups", None) or {}).get("D")
+        held = [r for r in (getattr(D, "outstanding", None) or {}) if r not in parked]
+        ready = [p for p in (getattr(self, "_ready_for_d", None) or ())
+                 if getattr(p, "fut", None) is None or not p.fut.done()]
+        try:
+            inflight = int(self._handoff_in_flight())
+        except Exception:  # noqa: BLE001 -- a partial front has no seat state
+            inflight = 0
+        return {"handoff_n": len(held) + len(ready) + max(0, inflight),
+                "parked_n": len(parked)}
+
+    async def _wait_bound_park(self, wait_s: Optional[float]) -> str:
+        """Rule 3: the wait bound fired in the D phase -- park D's running
+        decodes and let the controller flip.
+
+        ONE attempt per D phase. ``admit_d`` goes False first, so nothing new
+        is handed to D in this phase (what is in ``_ready_for_d`` stays there
+        and reaches D in its next phase, or while it is dormant). Returns
+        ``parked`` | ``nothing-running`` | ``unsupported`` | ``failed`` |
+        ``already``. On ``unsupported`` / ``failed`` the front has fallen
+        back to the pre-H91 path: admission is closed, the running decodes
+        run to their end, then the flip (A1-1's shape, at this bound).
+        """
+        if self._park_attempt_epoch == self.epoch:
+            return "already"
+        self._park_attempt_epoch = self.epoch
+        D = self.groups["D"]
+        running = self._flip_ledger(D)
+        self.admit_d = False
+        self.counters["wait_bound_fired"] += 1
+        now = time.time()
+        oldest = max(self.queue, key=lambda p: phase_policy.d_phase_wait_s(p.t_arrive, self.t_awake, now),
+                     default=None)
+        logger.warning(
+            "WEG2 WAIT-BOUND FIRED epoch=%d oldest_rid=%s waited_s=%.1f bound_s=%.1f "
+            "(--d-wait-bound-s; measured as now - max(arrival at the front, D phase start)) "
+            "running=%d ready_for_d=%d queue=%d -- admission to D closed for this phase, %s",
+            self.epoch, oldest.rid if oldest is not None else "-", wait_s or 0.0, self.d_wait_bound_s,
+            len(running), len(self._ready_for_d), len(self.queue),
+            "parking the running decodes, then the flip to P" if running
+            else "nothing running: the flip to P follows without a park")
+        if not running:
+            return "nothing-running"
+        if self._park_unsupported:
+            self.counters["park_fallback"] += 1
+            logger.warning(
+                "WEG2 PARK-UNSUPPORTED epoch=%d (D answered 404/501 earlier this boot) -- "
+                "fallback: the %d running decode(s) run to their end, then the flip (pre-H91 "
+                "A1-1 path at the wait bound)", self.epoch, len(running))
+            return "unsupported"
+        body = phase_policy.park_body(self.epoch, self.d_wait_bound_s)
+        # H91c3-1: the park's stamp is taken BEFORE the RPC. D stamps its park
+        # while serving the RPC and re-queues it after PARK_REQUEUE_S on its
+        # own clock; a front stamp taken after the answer ran that clock late
+        # by the RPC's duration, so for that long the front still counted as
+        # parked what D was running again. Stamped before, the front's lapse
+        # comes no later than D's re-queue. The stamp is written only for the
+        # rids D confirms: a failed/unsupported park writes none (withdrawn).
+        t_park = time.time()
+        try:
+            code, text = await self.rpc(D, phase_policy.PARK_PATH, body, phase_policy.PARK_TIMEOUT_S)
+        except Exception as e:  # noqa: BLE001 -- a failed park falls back, never kills the phase
+            code, text = 0, f"{type(e).__name__}: {e}"
+        verdict, rids, why = phase_policy.park_verdict(code, text)
+        if verdict == phase_policy.PARK_UNSUPPORTED:
+            self._park_unsupported = True
+            self.counters["park_unsupported"] += 1
+            self.counters["park_fallback"] += 1
+            logger.warning(
+                "WEG2 PARK-UNSUPPORTED epoch=%d status=%d path=%s -- this D has no park endpoint "
+                "(old D); fallback for the rest of the boot: the %d running decode(s) run to their "
+                "end, then the flip (pre-H91 A1-1 path at the wait bound)",
+                self.epoch, code, phase_policy.PARK_PATH, len(running))
+            return "unsupported"
+        if verdict == phase_policy.PARK_FAILED:
+            self.counters["park_failed"] += 1
+            self.counters["park_fallback"] += 1
+            logger.error(
+                "WEG2 PARK-FAILED epoch=%d status=%d (%s) -- fallback for this phase: the %d "
+                "running decode(s) run to their end, then the flip", self.epoch, code, why,
+                len(running))
+            return "failed"
+        known = [r for r in rids if r in D.outstanding]
+        unknown = [r for r in rids if r not in D.outstanding]
+        # H91c3-2: a hand-off already in ``D.outstanding`` whose leg 2 had not
+        # reached D's scheduler when the park came (tokenizer / HTTP pipe) is
+        # in neither of D's lists. A D that answers ``late_hold`` holds every
+        # request reaching it after the park behind the park (d_park_runtime.
+        # hold_late_arrival; after the sleep the #1443 hold) -- parked for the
+        # front too, or the drain waited for its whole decode. No new rid
+        # enters D.outstanding meanwhile: admit_d went False above, and a
+        # seat without an outstanding entry held the park back (handing_off).
+        late: List[str] = []
+        if phase_policy.park_late_hold(code, text):
+            late = [r for r in self._flip_ledger(D) if r not in rids]
+        for r in known + late:
+            self._d_parked[r] = t_park
+        self.counters["d_parked"] += len(known) + len(late)
+        self.counters["d_parked_in_flight"] += len(late)
+        still = self._flip_ledger(D)
+        logger.warning(
+            "WEG2 PARK-RUNNING epoch=%d reason=%s status=%d parked=%d rids=%s unknown_to_front=%s "
+            "in_flight_held=%s still_running=%s rpc_s=%.2f -- parked requests stay in flight "
+            "(client streams open, no requeue, no second leg 1) and continue in the next D phase "
+            "before the new ones; the D->P drain waits only for still_running",
+            self.epoch, body["reason"], code, len(known) + len(late), known[:8], unknown[:8],
+            late[:8], still[:8], time.time() - t_park)
+        return "parked"
 
     # ---------------- seat / gate bookkeeping (C4, C5) ----------------
     def seats_free(self) -> int:
@@ -4068,6 +4325,13 @@ class Front:
             "flip_min_work_tokens": self.flip_min_work_tokens,
             "x_flip_s": self.x_flip_s_provenance(),
             "vision_flip_urgent": bool(getattr(self, "vision_flip_urgent", False)),
+            # H91 part C: the phase policy and the requests parked on it.
+            "p_phase_max_requests": getattr(self, "p_phase_max_requests", 0),
+            "p_pool_tokens": getattr(self, "p_pool_tokens", 0),
+            "d_wait_bound_s": getattr(self, "d_wait_bound_s", 0.0),
+            "p_leg1_stall_s": getattr(self, "p_leg1_stall_s", 0.0),
+            "d_parked": sorted(getattr(self, "_d_parked", None) or {}),
+            "park_unsupported": bool(getattr(self, "_park_unsupported", False)),
         }
 
     async def handle_passthrough_get(self, request: web.Request) -> web.Response:
@@ -4140,6 +4404,7 @@ class Front:
         for grp in self.groups.values():
             if rid in grp.outstanding:
                 grp.outstanding.pop(rid, None)
+        (getattr(self, "_d_parked", None) or {}).pop(rid, None)  # H91 part C: parked rid leaves too
         for p in list(self.queue):
             if p.rid == rid or p.payload.get("rid") == rid:
                 self.queue.remove(p)
@@ -4717,6 +4982,11 @@ class Front:
             return None
         if not (self.awake == "D" and self.admit_d and self.state == "serving"):
             return None
+        if self._d_phase_seats_full(rid):
+            # H91c3-3: D's seat cap n is full -- fall through to route BATCH
+            # (the P queue, where the wait bound sees it), the return
+            # contract this method already has.
+            return None
         if self._d_token_budget_blocks(rid, est_tokens, await self._d_reading_if_armed()):
             # FIX 4a: the same aggregate bound the BATCH admitter obeys.  A
             # SHORT arrival that does not fit falls through to route BATCH
@@ -4726,10 +4996,40 @@ class Front:
                 refused.append("d_budget")
             return None
         await self._d_seat.acquire()
-        if not (self.awake == "D" and self.admit_d and self.state == "serving"):
+        if (not (self.awake == "D" and self.admit_d and self.state == "serving")
+                or self._d_phase_seats_full(rid, own_seat=True)):
             self._d_seat.release()
             return None
         return Seat(self, rid, "short", tokens=est_tokens)
+
+    def _d_phase_seats_full(self, rid: str, own_seat: bool = False) -> bool:
+        """H91c3-3: are the D phase's n seats (H95, ``d_seats.phase_seats`` of
+        the ``handoff_n``/``parked_n`` this front sent at the P->D wake) all
+        taken? An X-route request D would get then waits on D behind the
+        H95c seat cap -- in neither the front's queue nor its ledger of
+        waiters, so the wait bound never saw it. It goes to the P queue
+        instead: the bound sees its arrival, and the next D phase counts it
+        in n. Only with the wait bound armed (H91 part C) and after a P->D
+        wake of this boot; otherwise never full (the pre-H91c3 path).
+
+        Taken = what the phase already owes D: its running ledger (the
+        wait-bound-parked ones excepted), the hand-offs in flight and the
+        prefilled requests still waiting for a front seat. ``own_seat``: the
+        caller already holds a seat for ``rid`` (counted in flight)."""
+        n = getattr(self, "_d_phase_n", None)
+        if self.d_wait_bound_s <= 0 or not n:
+            return False
+        D = self.groups["D"]
+        ready = [p for p in self._ready_for_d if getattr(p, "fut", None) is None or not p.fut.done()]
+        taken = (len(self._flip_ledger(D)) + max(0, self._handoff_in_flight()) + len(ready)
+                 - (1 if own_seat else 0))
+        if taken < n:
+            return False
+        self.counters["short_phase_seats_full"] += 1
+        logger.info("WEG2 X-ROUTE SEATS-FULL rid=%s epoch=%d taken=%d n=%d (H91c3: the D phase's "
+                    "seats are all taken; queued for P, where the wait bound sees it, instead of "
+                    "waiting on D behind the seat cap)", rid, self.epoch, taken, n)
+        return True
 
     def _d_accepts_leg2(self) -> bool:
         """#1443: D takes leg-2 requests when awake, and -- dormant-admit armed --
@@ -4861,6 +5161,64 @@ class Front:
                 logger.exception("d_admitter error: %s", e)
 
     # ---------------- legs ----------------
+    async def _leg1_bounded(self, p: Pending, post) -> Tuple[int, bytes]:
+        """H91 part C: run leg 1's POST under ``--p-leg1-stall-s``.
+
+        Part A answers an ADMISSIBLE request that does not fit P's pool right
+        now by queueing it on P instead of a 503, so a leg 1 that never starts
+        no longer surfaces as WEG2-INTAKE-STALL -- the drain would wait on it
+        and the flip to D would never come. The front bounds it itself: once
+        the leg is ``bound`` old and P has shown no work for ``bound`` (no leg
+        1 of this front completed, P's own progress counters unchanged,
+        sampled every 10 s), the POST is cancelled and a WEG2-INTAKE-STALL is
+        raised -- the caller's existing path aborts the rid on P, requeues it
+        at the head, ends the drain and flips (weg2xsn272). ``bound`` 0 =
+        today's unbounded await. getattr: partial test fronts have no flag.
+        """
+        bound = float(getattr(self, "p_leg1_stall_s", 0.0) or 0.0)
+        if bound <= 0:
+            return await post
+        task = asyncio.ensure_future(post)
+        t_dispatch = time.time()
+        t_evidence = t_dispatch
+        t_sample = 0.0
+        last_prog: Optional[dict] = None
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=phase_policy.P_LEG1_STALL_CHECK_S)
+                if done:
+                    self._p_leg1_done_t = time.time()
+                    return task.result()
+                now = time.time()
+                t_evidence = max(t_evidence, getattr(self, "_p_leg1_done_t", 0.0))
+                if now - t_sample >= 10.0:
+                    t_sample = now
+                    prog = await self._weg2_decode_progress(self.groups["P"])
+                    if prog is not None:
+                        if last_prog is not None and prog != last_prog:
+                            t_evidence = now
+                        last_prog = prog
+                if phase_policy.leg1_stalled(now, t_dispatch, t_evidence, bound):
+                    self.counters["p_leg1_stall"] += 1
+                    logger.warning(
+                        "WEG2 P-LEG1-STALL rid=%s est_prompt=%d waited_s=%.0f bound_s=%.0f "
+                        "p_progress=%s -- no leg 1 completed and P's progress counters did not "
+                        "move for the whole bound (--p-leg1-stall-s); part A queues an admissible "
+                        "request instead of refusing it, so the front ends this leg itself: abort "
+                        "on P, requeue at the head, the drain ends and the flip to D follows",
+                        p.rid, int(p.est_prompt), now - t_dispatch, bound,
+                        "unreadable" if last_prog is None else "unchanged")
+                    raise RuntimeError(
+                        f"{_INTAKE_STALL_MARK} (front-side, H91 part C) rid={p.rid}: leg 1 on P "
+                        f"did not complete within {bound:.0f} s with no P progress")
+        finally:
+            if not task.done():
+                # Cancelled, not awaited: awaiting here would also swallow a
+                # cancellation of THIS coroutine. The callback retrieves the
+                # POST's own exit so the loop never reports it as unretrieved.
+                task.cancel()
+                task.add_done_callback(lambda t: t.cancelled() or t.exception())
+
     async def leg1(self, p: Pending) -> None:
         g = self.groups["P"]
         payload = dict(p.payload)
@@ -4875,49 +5233,55 @@ class Front:
             payload.pop("max_completion_tokens", None)
         g.outstanding[p.rid] = time.time()
         t0 = time.time()
+
+        async def _post() -> Tuple[int, bytes]:
+            async with self.session.post(f"{g.url}{p.path}", json=payload) as resp:
+                return resp.status, await resp.read()
+
         try:
-            async with self.session.post(f"{g.url}{p.path}", json=payload) as r:
-                body = await r.read()
-                if r.status != 200:
-                    raise RuntimeError(f"leg1 on P returned {r.status}: {body[:300]!r}")
-                try:
-                    js = json.loads(body)
-                except Exception:  # noqa: BLE001
-                    js = {}
-                pt, ct, _, _ = usage_of(js)
-                p.leg1_prompt_tokens = pt
-                self._note_p_prefix_reuse(p, ct)
-                # #1324: NO PRESENCE RECORD HERE. This site used to call
-                # `self.spans.record(p.text, pt)`, i.e. it credited the span
-                # P had just PREFILLED as a span D could read back -- and P's
-                # write-through is asynchronous, so at this instant the store
-                # may hold none of it. Measured on weg2sn6s: recorded 109,132
-                # at 15:21:49, D found 53,247 at 15:22:35, the repeat routed
-                # SHORT on the difference and died W31 -> W50.
-                #
-                # Nothing replaces it, because P HAS no presence witness to
-                # offer: under W38 (`Weg2CarrierlessPpStoreRead`) group P
-                # reads no store at all, so its `cached_tokens` speaks only
-                # for P's own device tier, and its `prompt_tokens` speaks for
-                # a prefill, not for a landing. The witness is D's own
-                # `cached_tokens` on leg 2, recorded there.
-                #
-                # `_note_exact` DOES stay: `prompt_tokens` is a TOKENISATION
-                # fact (this text is 109,132 tokens), it feeds `carrier_est`,
-                # and it was never wrong -- `carrier_est=109132 src=exact` was
-                # the one correct number on the sn6s route line.
-                self._note_exact(p.text, pt)
-                # #1317n THE POST-LEG-1 CARRIER BAND IS GONE. It compared
-                # the realised prompt against what D's host tier could carry AS
-                # ONE READ and sent leg 2 to a single prefill on D -- which,
-                # through D's carrier-exceeds exemption, prefilled it over X.
-                # D's L2 is now derived from `--max-kv-per-request`, so below
-                # the cap the store carries the whole prompt in one prefetch
-                # and there is nothing to correct here; above the cap the front
-                # refuses at admission, before P's prefill is spent.
-                g.served += 1
-                logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d",
-                            p.rid, pt, ct, time.time() - t0, self.epoch)
+            # H91 part C: under part A an admissible request WAITS in P's
+            # queue instead of drawing a 503, so the leg is bounded here.
+            status, body = await self._leg1_bounded(p, _post())
+            if status != 200:
+                raise RuntimeError(f"leg1 on P returned {status}: {body[:300]!r}")
+            try:
+                js = json.loads(body)
+            except Exception:  # noqa: BLE001
+                js = {}
+            pt, ct, _, _ = usage_of(js)
+            p.leg1_prompt_tokens = pt
+            self._note_p_prefix_reuse(p, ct)
+            # #1324: NO PRESENCE RECORD HERE. This site used to call
+            # `self.spans.record(p.text, pt)`, i.e. it credited the span
+            # P had just PREFILLED as a span D could read back -- and P's
+            # write-through is asynchronous, so at this instant the store
+            # may hold none of it. Measured on weg2sn6s: recorded 109,132
+            # at 15:21:49, D found 53,247 at 15:22:35, the repeat routed
+            # SHORT on the difference and died W31 -> W50.
+            #
+            # Nothing replaces it, because P HAS no presence witness to
+            # offer: under W38 (`Weg2CarrierlessPpStoreRead`) group P
+            # reads no store at all, so its `cached_tokens` speaks only
+            # for P's own device tier, and its `prompt_tokens` speaks for
+            # a prefill, not for a landing. The witness is D's own
+            # `cached_tokens` on leg 2, recorded there.
+            #
+            # `_note_exact` DOES stay: `prompt_tokens` is a TOKENISATION
+            # fact (this text is 109,132 tokens), it feeds `carrier_est`,
+            # and it was never wrong -- `carrier_est=109132 src=exact` was
+            # the one correct number on the sn6s route line.
+            self._note_exact(p.text, pt)
+            # #1317n THE POST-LEG-1 CARRIER BAND IS GONE. It compared
+            # the realised prompt against what D's host tier could carry AS
+            # ONE READ and sent leg 2 to a single prefill on D -- which,
+            # through D's carrier-exceeds exemption, prefilled it over X.
+            # D's L2 is now derived from `--max-kv-per-request`, so below
+            # the cap the store carries the whole prompt in one prefetch
+            # and there is nothing to correct here; above the cap the front
+            # refuses at admission, before P's prefill is spent.
+            g.served += 1
+            logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d",
+                        p.rid, pt, ct, time.time() - t0, self.epoch)
         finally:
             g.outstanding.pop(p.rid, None)
 
@@ -5474,6 +5838,9 @@ class Front:
             return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
         finally:
             g.outstanding.pop(rid, None)
+            # H91 part C: a parked request that ends (served, aborted, failed)
+            # is no longer parked either.
+            (getattr(self, "_d_parked", None) or {}).pop(rid, None)
             if seat is not None:
                 # C4: THE refill point.  Every exit of leg 2 -- served,
                 # refused, raised, cancelled -- passes here, so a freed seat
@@ -6034,8 +6401,17 @@ class Front:
         them. So: abort them on the group by name (abort_all -- nothing is
         running, the progress witness established that), drop them from the
         ledger, answer their clients loudly through the aborted leg, and let
-        the flip proceed. Returns True when the drain is clear afterwards."""
-        parked = sorted(g.outstanding)
+        the flip proceed. Returns True when the drain is clear afterwards.
+
+        H91 part C: requests D PARKED on the wait bound (``_d_parked``) are
+        not part of this -- they are held on purpose and continue in D's next
+        phase. With any of them on the group the abort goes out PER RID for
+        the stuck ones, because ``abort_all`` would take the parked ones too."""
+        h91_held = getattr(self, "_d_parked", None) or {}
+        _now = time.time()
+        keep = {r for r in g.outstanding if g.name == "D" and r in h91_held
+                and not phase_policy.parked_lapsed(h91_held[r], _now)}
+        parked = sorted(r for r in g.outstanding if r not in keep)
         if not parked:
             return True
         self.counters["W1b_parked_aborted"] += len(parked)
@@ -6043,17 +6419,30 @@ class Front:
                      "through the %.0f s drain window (rids %s); aborting them on %s and "
                      "flipping -- they answer their clients through the aborted leg",
                      src, len(parked), self.drain_deadline_s, parked[:8], src)
-        try:
-            code, body = await self.rpc(g, "/abort_request", {"rid": "", "abort_all": True}, 30)
-            logger.error("W1b abort_all on %s -> code=%s body=%s", src, code, str(body)[:120])
-        except Exception as e:  # noqa: BLE001
-            logger.error("W1b abort_all on %s raised: %s: %s", src, type(e).__name__, e)
+        if keep:
+            for rid in parked:
+                try:
+                    code, body = await self.rpc(g, "/abort_request", {"rid": rid}, 30)
+                    logger.error("W1b abort rid=%s on %s -> code=%s (per rid: %d wait-bound-parked "
+                                 "request(s) stay, H91 part C)", rid, src, code, len(keep))
+                except Exception as e:  # noqa: BLE001
+                    logger.error("W1b abort rid=%s on %s raised: %s: %s", rid, src, type(e).__name__, e)
+        else:
+            try:
+                code, body = await self.rpc(g, "/abort_request", {"rid": "", "abort_all": True}, 30)
+                logger.error("W1b abort_all on %s -> code=%s body=%s", src, code, str(body)[:120])
+            except Exception as e:  # noqa: BLE001
+                logger.error("W1b abort_all on %s raised: %s: %s", src, type(e).__name__, e)
         for rid in parked:
             g.outstanding.pop(rid, None)
+
+        def _left() -> List[str]:
+            return [r for r in g.outstanding if r not in keep]
+
         t0 = time.time()
-        while g.outstanding and time.time() - t0 < 10.0:
+        while _left() and time.time() - t0 < 10.0:
             await asyncio.sleep(0.25)
-        return not g.outstanding
+        return not _left()
 
     async def drain(self, g: Group) -> bool:
         """Wait for the group to go empty, and RECORD whether it was working.
@@ -6068,7 +6457,11 @@ class Front:
         t0 = time.time()
         before = await self._weg2_decode_progress(g)
         self._drain_progress = None
-        while g.outstanding:
+        # H91 part C: requests D PARKED on the wait bound are not waited for
+        # (they continue in D's next phase); `_flip_ledger` is the ledger
+        # itself whenever nothing is parked.
+        _ledger = getattr(self, "_flip_ledger", None)
+        while (_ledger(g) if _ledger is not None else g.outstanding):
             if time.time() - t0 > self.drain_deadline_s:
                 after = await self._weg2_decode_progress(g)
                 self._drain_progress = weg2_drain_progress_delta(before, after)
@@ -6253,6 +6646,51 @@ class Front:
                 logger.error("WEG2 DORMANT-IMAGE not persisted to %s: %s -- the next boot "
                              "will price the recorded dk7 reading instead", self.measured_record, e)
 
+    def _note_pd_free0(self, src: str, dst: str, free_mib: Dict[int, int]) -> None:
+        """H92d: the P->D credit plan's free at flip start, MEASURED.
+
+        ``wake_credit_pd.plan_wake_credit_pd`` prices each card's free at the
+        start of a P->D wake; until H92d it took that from one reference boot
+        (fnFL2x158/1, 24.09.) while the sleeping D co-tenant grew with D's
+        seats (x178 1 seat 1698/768/766 MiB, bb2 6 seats 1944/872/874): plan
+        nvml2 9013 against 8629 on the metal. The planner now takes the NEWEST
+        measurement of the same form; this is its writer: the first
+        ``FREE0_FLIPS`` P->D wakes of the boot append a ``pd_free0`` record
+        (the planner's form from ``--wake-credit-plan`` + ``driver_free`` of
+        the FLIP-ORDER sample) through the H78 writer thread. No form in the
+        plan (a D-only boot, a hand-built namespace) -> nothing written.
+
+        The record is only BUILT here; it is handed to the writer at
+        ``WEG2-FLIP done`` (:meth:`_flush_pd_free0`): this flip's own sleep-leg
+        gate awaits every pending append (``_sidecar_ready``), so a submit here
+        would put ~90 ms of JSON on the flip it measures."""
+        from sglang.srt.weg2 import wake_credit_pd as _wpd
+
+        meta = (getattr(self, "wake_credit_plan", None) or {}).get("P->D-free0")
+        n = int(self.__dict__.get("_pd_free0_seen", 0))
+        if (src, dst) != ("P", "D") or not meta or n >= _wpd.FREE0_FLIPS:
+            return
+        self._pd_free0_seen = n + 1
+        path = getattr(self, "measured_record", "")
+        if not path:
+            return
+        now = time.time()
+        rec = _wpd.free0_record_from_flip(
+            meta, free_mib, flip=n, tag=str(self.tag), commit=getattr(self, "commit", None),
+            at=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now))
+            + ",%03d" % int((now % 1) * 1000))
+        logger.info("WEG2-PD-FREE0 flip=%d free=%s p_rows=%s d_seats=%s form=%s -> sidecar at "
+                    "flip done (H92d: the next boot's P->D credit plan reads the newest one of "
+                    "this form)", n, rec["free"], rec["p_rows"], rec["d_seats"], rec["form_key"])
+        self._pd_free0_pending = (path, rec)
+
+    def _flush_pd_free0(self) -> None:
+        """H92d: hand the record built at FLIP-ORDER to the H78 writer, after
+        the flip it measured (see :meth:`_note_pd_free0`)."""
+        pending = self.__dict__.pop("_pd_free0_pending", None)
+        if pending:
+            self._sidecar_submit(host_ledger.append_measured_record, *pending)
+
     def _write_flip_ratchet(self, done_epoch: int,
                             taken: Optional[Tuple[Optional[float], str]] = None) -> None:
         """#1350 READING 2 OF 2: the FIRST FULL PAIR's permanent step, recorded.
@@ -6360,6 +6798,20 @@ class Front:
         self._flip_stage = "drain"
         self._flip_marks["drain"] = time.time()
         logger.info("WEG2-FLIP begin epoch=%d sleep=%s wake=%s outstanding=%d queue=%d", self.epoch, src, dst, len(S.outstanding), len(self.queue))
+        # H91 part C rule 2: the wake message to D carries the hand-off count
+        # (`handoff_n`, plus `parked_n`) on its kv_cache resume -- every one of
+        # the three sites below. Unbound call: partial test fronts work too.
+        # UNIFY: only the standard form carries the seat counts (qwen27b: {}).
+        _wake_extra = (Front._wake_handoff_fields(self, dst)
+                       if getattr(self, "standard_form", True) else {})
+        if _wake_extra:
+            # H91c3-3: the phase's n as D derives it (the same pure function)
+            self._d_phase_n = phase_policy.d_phase_seats(
+                _wake_extra["handoff_n"], _wake_extra["parked_n"], self.d_bs)
+            logger.info("WEG2 HANDOFF-N epoch=%d wake=%s handoff_n=%d parked_n=%d (the requests the "
+                        "P phase that just ended handed over, and the wait-bound-parked ones D "
+                        "resumes first; carried on the kv_cache resume to D, H91 part C)",
+                        self.epoch, dst, _wake_extra["handoff_n"], _wake_extra["parked_n"])
         # #1350 READING 1 OF 2, at a moment this front already owns. Only at
         # epoch 0: the term is the step the FIRST waking of each group adds, it
         # SATURATES after the first pair (weg2xsn20: 3.16 of 4.46 GiB in the
@@ -6425,7 +6877,11 @@ class Front:
         self._flip_stage = "quiesce"
         self._flip_marks["quiesce"] = time.time()
         idle, msg = await self.quiesce(S)
-        wv = witness_verdict(len(S.outstanding), idle)
+        # H91 part C: the wait-bound-parked requests are not RUNNING on D, so
+        # witness A counts the flip ledger (the ledger itself when nothing is
+        # parked); part B must leave D fully idle after a park for W3 to agree.
+        _ledger = getattr(self, "_flip_ledger", None)
+        wv = witness_verdict(len(_ledger(S) if _ledger is not None else S.outstanding), idle)
         if wv is not None:
             # #1268: name it as the GROUP's verdict, because it now is one --
             # the reply carries the reduced answer and the lowest blocking rank.
@@ -6569,6 +7025,10 @@ class Front:
                 f"paused on {src}; VRAM state untouched, no flip",
             )
             return
+        # H92d: free0 of this boot's first two P->D wakes, the SAME sample as
+        # the FLIP-ORDER line, for the next boot's P->D credit plan -- in the
+        # H78 writer thread, never on the flip.
+        self._note_pd_free0(src, dst, free_mib)
         # FIX 2 round 2: the token names the BOOT and the flip, not the flip
         # alone -- see weg2_memory_saver.credit_epoch for the leftover counters
         # a bare flip index made this boot inherit.
@@ -6633,7 +7093,8 @@ class Front:
             _kv_early = bool(_kv_early_on())
             if _kv_early:
                 _legs.insert(0, self.timed_rpc(D, "/resume_memory_occupation",
-                                               {"tags": [KV_TAG], "epoch": flip_epoch}, RPC_TIMEOUT_S))
+                                               dict({"tags": [KV_TAG], "epoch": flip_epoch}, **_wake_extra),
+                                               RPC_TIMEOUT_S))
             # fnFL2x83 (23.09.): THE KV WAKE CHAINS ON THE WAKER'S LEG, NOT ON
             # THE SLEEPER'S. x82: D's weights leg returned at 10,170, P's
             # release leg at 10,457 (its tail after the last pause: lane
@@ -6653,7 +7114,7 @@ class Front:
                 self._flip_marks["wake-kv-issued"] = time.time()
                 _kv_task = asyncio.ensure_future(self.leg_rpc(
                     D, "/resume_memory_occupation",
-                    {"tags": [KV_TAG], "epoch": flip_epoch}, RPC_TIMEOUT_S))
+                    dict({"tags": [KV_TAG], "epoch": flip_epoch}, **_wake_extra), RPC_TIMEOUT_S))
             _res = await asyncio.gather(*_leg_tasks[:-1])
             if _kv_early:
                 (k_code, k_body, k_ms), (s_code, s_body, s_ms) = _res
@@ -6722,7 +7183,8 @@ class Front:
             code, body = await _kv_task
         else:
             code, body = await self.leg_rpc(D, "/resume_memory_occupation",
-                                            {"tags": [KV_TAG], "epoch": credit_epoch(self.boot_epoch, self.epoch)},
+                                            dict({"tags": [KV_TAG], "epoch": credit_epoch(self.boot_epoch, self.epoch)},
+                                                 **_wake_extra),
                                             RPC_TIMEOUT_S)  # #1428: retryable, see the sleep leg
         t_w = time.time()
         wake_ms += (t_w - t0) * 1000
@@ -6786,6 +7248,18 @@ class Front:
         # 27B idle policy (c): a hold never spans a flip -- D's free period
         # starts again at its next observation on the awake D.
         self._d_free_since = None
+        _h91_parked = getattr(self, "_d_parked", None)
+        if dst == "D" and _h91_parked:
+            # H91 part C rule 3: D is awake again and resumes the requests it
+            # parked on the wait bound FIRST (D orders them). From here they
+            # are running work of this D phase like any other -- the drain and
+            # W3 count them again. Never requeued, never a second leg 1, and
+            # not in this wake's handoff_n.
+            logger.info("WEG2 PARK-RESUME epoch=%d n=%d rids=%s (D resumes its wait-bound-parked "
+                        "requests before the new ones)", self.epoch, len(_h91_parked),
+                        sorted(_h91_parked)[:8])
+            self.counters["d_parked_resumed"] += len(_h91_parked)
+            _h91_parked.clear()
         # 27B flipfast F3: after a D->P flip the controller that awaits it starts
         # P's drain at once instead of one tick later (no-op with the switch off).
         # NOT after P->D: nothing on D waits for the controller there (leg 2 is
@@ -6877,6 +7351,7 @@ class Front:
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
         else:
             self._write_flip_ratchet(rec["epoch"])
+        self._flush_pd_free0()  # H92d: after the flip it measured, in the writer thread
         logger.info("WEG2-FLIP done epoch=%d slept=%s woke=%s drain+quiesce=%d ms sleep=%d ms (kv RPC + the %s leg of the gathered pair) "
                     "wake=%d ms (the %s leg + kv RPC) "
                     "interleave=%d ms (NOT sleep+wake: the legs overlap -- gather wall %d ms against %d + %d ms of legs) "
@@ -7633,8 +8108,23 @@ class Front:
                     _x_rg = self._x_idle_regrant(_now) if self.queue else "none"
                     if _x_rg == "moved":
                         continue
+                    self._drop_lapsed_parks()
                     oldest = self.queue[0].t_arrive if self.queue else None
-                    fairness_fired = self._fairness_switch(oldest, "batch")
+                    # H91 part C rule 3: with the wait bound armed it is the
+                    # D phase's pre-emption and REPLACES the fairness switch
+                    # here (the fairness bound, 45 s, would otherwise close
+                    # admission to D before the 60 s bound and before D has
+                    # decoded what it was handed -- rule 2). --d-wait-bound-s 0
+                    # restores the fairness switch unchanged.
+                    wait_s: Optional[float] = None
+                    wait_fired = False
+                    if self.d_wait_bound_s > 0:
+                        wait_s = phase_policy.oldest_d_phase_wait(
+                            (p.t_arrive for p in self.queue), self.t_awake, time.time())
+                        wait_fired = phase_policy.wait_bound_fired(wait_s, self.d_wait_bound_s)
+                        fairness_fired = wait_fired or not self.admit_d
+                    else:
+                        fairness_fired = self._fairness_switch(oldest, "batch")
                     # 27B idle policy (c): when D's own work last ended (--d-hold-s).
                     self._note_d_free(not D.outstanding and not self._handoff_in_flight()
                                       and not self._ready_for_d, _now)
@@ -7685,7 +8175,21 @@ class Front:
                     # D->P flip, by at most the W36 barrier that already
                     # bounds a dead client's seat.
                     handing_off = self._handoff_in_flight()
-                    d_work_exhausted = not D.outstanding and not handing_off
+                    if wait_fired and not handing_off:
+                        # H91 part C rule 3: park D's running decodes (once
+                        # per D phase; admission to D closes). A hand-off in
+                        # flight is waited for first -- it registers within
+                        # ms, bounded by the W36 barrier -- so the park sees it.
+                        await self._wait_bound_park(wait_s)
+                    # H91 part C rule 2: D's work is exhausted only when it
+                    # runs nothing (the wait-bound-parked ones excepted), holds
+                    # no hand-off AND no prefilled request still waits in
+                    # `_ready_for_d` for a seat -- without the last term a
+                    # decode ending between two admitter polls read as "D is
+                    # done" and flipped the rest of the P phase's batch away.
+                    d_work_exhausted = (not self._flip_ledger(D) and not handing_off
+                                        and not (getattr(self, "standard_form", True)
+                                                 and self._ready_for_d))
                     if (d_work_exhausted or not self.admit_d) and not handing_off:
                         if _x_rg == "wait" and self.admit_d and not fairness_fired:
                             # UNIFY S7 (27B RC7-X (a)): D takes this backlog itself
@@ -7707,6 +8211,10 @@ class Front:
                 # clock).  LAW 1: the phase ends on an EMPTY queue, never on
                 # p_concurrency and never on a timer -- p_concurrency bounds
                 # only how many leg-1 POSTs are in flight at once.
+                # H91 part C AMENDS law 1 (user 25.09.): with
+                # --p-phase-max-requests N > 0 the phase also ends once N
+                # requests left the queue (the rest waits for the next P phase),
+                # and --p-pool-tokens plans the overlap against P's pool.
                 t_drain0 = time.time()
                 queue_at_entry = len(self.queue)
                 prefilled = 0
@@ -7723,6 +8231,14 @@ class Front:
                           self.counters.get("p_prefix_tokens_in_store", 0),
                           self.counters.get("p_prefix_tokens_reused", 0))
                 _drain_uncached = 0
+                # H91 part C rule 1: the drain's stats and its overlap plan
+                # (the queue head folded against P's pool, for the P-PHASE line).
+                _phase_stats: Dict[str, int] = {}
+                _overlap_plan = phase_policy.plan_p_overlap(
+                    [phase_policy.p_request_cost(p.est_prompt, p.leg1_prompt_tokens, p.skip_leg1)
+                     for p in list(self.queue)[:max(1, self.p_phase_max_requests or len(self.queue))]],
+                    self.p_pool_tokens,
+                    min(self.p_concurrency + _ahead, self.p_phase_max_requests or (self.p_concurrency + _ahead)))
                 async def one(p: Pending) -> Pending:
                     if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once
                         p.leg1_done = True
@@ -7777,7 +8293,29 @@ class Front:
                 # finishes, so P always has the next request queued.
                 passes = await _p_drain_pool(
                     self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
-                    lambda: self.state == "serving" and not self._p_intake_stalled)
+                    lambda: self.state == "serving" and not self._p_intake_stalled,
+                    # H91 part C rule 1: at most p_phase_max_requests leave the
+                    # queue in this P phase, overlapping only as far as their
+                    # est_prompt fits P's unified pool (0 = off, law 1 as before).
+                    max_dispatch=self.p_phase_max_requests,
+                    cost=lambda p: phase_policy.p_request_cost(
+                        p.est_prompt, p.leg1_prompt_tokens, p.skip_leg1),
+                    budget=self.p_pool_tokens, stats=_phase_stats)
+                if passes and (self.p_phase_max_requests or self.p_pool_tokens):
+                    _cap_hit = phase_policy.phase_cap_reached(
+                        _phase_stats["dispatched"], self.p_phase_max_requests)
+                    logger.info(
+                        "WEG2 P-PHASE epoch=%d dispatched=%d cap=%d prefilled=%d end=%s "
+                        "overlap_plan=%d peak_overlap=%d peak_inflight_tokens=%d pool_tokens=%d "
+                        "pool_holds=%d queue_left=%d (H91 part C rule 1: the phase ends at the "
+                        "cap or on an empty queue; overlap planned from est_prompt against P's "
+                        "unified pool; what is left waits for the next P phase)",
+                        self.epoch, _phase_stats["dispatched"], self.p_phase_max_requests,
+                        prefilled,
+                        ("stall" if self._p_intake_stalled else "cap" if _cap_hit
+                         else "empty" if not self.queue else "leaving"),
+                        _overlap_plan, _phase_stats["peak_n"], _phase_stats["peak_tokens"],
+                        self.p_pool_tokens, _phase_stats["pool_holds"], len(self.queue))
                 if passes:
                     oldest_short = 0.0
                     if self._ready_for_d:
@@ -7808,8 +8346,13 @@ class Front:
                 # prefilled sitting on `await fut` behind a one-hour client
                 # timeout -- a LOST-REQUEST class introduced by the fix for
                 # law 5.  The admitter (C4) releases them once D is awake.
-                if self.queue or self._ready_for_d or (self.dormant_admit and self.groups["D"].outstanding):
+                if (self.queue or self._ready_for_d
+                        or (self.dormant_admit and self.groups["D"].outstanding)
+                        or self._d_parked):
                     # #1443: requests already handed to the dormant D are a reason to flip too
+                    # H91 part C rule 3: so are the ones D parked on the wait
+                    # bound -- their clients are waiting for D to resume them,
+                    # under --idle-layout P as well.
                     await self.flip("P", "D")
                 elif self._idle_disposition("P", at_rest=True) == "flip":
                     await self.flip("P", "D")
@@ -8132,6 +8675,27 @@ def main():
                          "Seconds the oldest waiter may wait before the front stops admitting new "
                          "work to D and flips. 0 DISABLES it. Every fire names this switch, the "
                          "oldest wait and the queue it pre-empted.")
+    # UNIFY (operator 26.09.): the four H91 part C defaults follow the
+    # profile's standard form (SGLANG_WEG2_STANDARD_FORM): None here, resolved
+    # after the parse -- nextflash the H91 values, qwen27b 0 (rule off).
+    ap.add_argument("--p-phase-max-requests", type=int, default=None,
+                    help="H91 part C rule 1 (user 25.09.): at most this many requests per P phase; "
+                         "the phase ends when they are dispatched or the queue is empty, and the "
+                         "flip to D follows. 0 = law 1 unchanged (drain to empty).")
+    ap.add_argument("--p-pool-tokens", type=int, default=None,
+                    help="H91 part C rule 1: P's unified KV pool in tokens (NF 262k). The next leg 1 "
+                         "is dispatched only while the in-flight requests' est_prompt plus its own "
+                         "fit it (one always goes). 0 = no token plan, --p-concurrency alone.")
+    ap.add_argument("--d-wait-bound-s", type=float, default=None,
+                    help="H91 part C rule 3 (user: 'wartegrenze 60 s, dann zurueck zu P'): a request "
+                         "waiting for P longer than this during the D phase (from max(arrival, D phase "
+                         "start)) parks D's running decodes via POST /weg2/park_running and flips to P. "
+                         "Replaces --fairness-w-s in the D phase while > 0; 0 = off (fairness as before).")
+    ap.add_argument("--p-leg1-stall-s", type=float, default=None,
+                    help="H91 part C: a leg 1 older than this while P showed no work for as long (no "
+                         "leg 1 completed, P's progress counters unchanged) is aborted on P and "
+                         "requeued at the head as WEG2-INTAKE-STALL; the flip to D follows. Part A "
+                         "queues admissible requests on P instead of a 503. 0 = off.")
     ap.add_argument("--p-concurrency", type=int, default=DEFAULT_P_BS,
                     help=f"law 1 (K3): how many leg-1 POSTs group P runs at once. CONCURRENCY ONLY -- "
                          f"the P phase ends when the backlog is empty, never on this number. Written "
@@ -8259,6 +8823,7 @@ def main():
                     help="#1233 fix 8: JSON {s_gb, m_mib, store_gib} -- the arm the ledger chose, needed to "
                          "derive the RUN-MOMENT residual from the front's own cgroup reading")
     args = ap.parse_args()
+    phase_policy.resolve_front_defaults(args, bool(envs.SGLANG_WEG2_STANDARD_FORM.get()))
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
     dc = {}
     for kv in filter(None, args.dc_reserve.split(",")):
@@ -8284,7 +8849,11 @@ def main():
                   x_busy_tokens=args.x_busy_tokens,
                   d_short_drain_tokens=args.d_short_drain_tokens,
                   d_hold_s=args.d_hold_s,
-                  record_line=args.record_line)
+                  record_line=args.record_line,
+                  p_phase_max_requests=args.p_phase_max_requests,
+                  p_pool_tokens=args.p_pool_tokens,
+                  d_wait_bound_s=args.d_wait_bound_s,
+                  p_leg1_stall_s=args.p_leg1_stall_s)
     # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
     # against. Kept from weg2/idle-anon-0908.
     if args.anon_preboot_bytes > 0:

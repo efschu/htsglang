@@ -283,11 +283,25 @@ class SchedulerPoolStatsObserver:
         full_num_used = self._allocator().size - (
             full_available_size + full_evictable_size
         )
-        mamba_num_used = self.req_to_token_pool.mamba_pool.size - (
+        # H95e: in a D phase of n < --d-bs seats the slots above the phase's
+        # limit are withheld (``MambaSlotAllocator.phase_withheld_slots``,
+        # H95c/H95d): free, without pages, in neither available nor
+        # evictable. Counted against the boot pool they read as occupied --
+        # n=1 idle printed ``mamba usage: 0.82`` (31 of 38) with nothing
+        # running. Occupancy is measured against the REACHABLE slots, the
+        # mamba twin of the KV pool's #656 ``residency_withheld``. Zero
+        # withheld (no phase limit): byte-identical to before.
+        mamba_reachable = self.req_to_token_pool.mamba_pool.size - int(
+            getattr(
+                self.req_to_token_pool.mamba_allocator, "phase_withheld_slots", 0
+            )
+            or 0
+        )
+        mamba_num_used = mamba_reachable - (
             mamba_available_size + mamba_evictable_size
         )
         full_token_usage = full_num_used / self._allocator().size
-        mamba_usage = mamba_num_used / self.req_to_token_pool.mamba_pool.size
+        mamba_usage = mamba_num_used / max(1, mamba_reachable)
 
         return PoolStats(
             is_hybrid_ssm=True,

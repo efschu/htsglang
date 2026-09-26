@@ -1536,7 +1536,15 @@ class MambaPool:
         else:
             for conv in self.mamba_cache.conv:
                 conv.zero_()
-            self.mamba_cache.temporal.zero_()
+            # H95c (weg2/d_seat_vram.py): in a D phase of n < cap seats only
+            # slots [0, keep) of every layer have pages behind them; a zero_()
+            # over the whole tensor would write into the unmapped tail (the
+            # CAMPAIGN (a) fault). None = every slot mapped (the stock path).
+            _seat_keep = getattr(self, "_weg2_seat_keep", None)
+            if _seat_keep is None:
+                self.mamba_cache.temporal.zero_()
+            else:
+                self.mamba_cache.temporal[:, : int(_seat_keep)].zero_()
         for name in (
             "replayssm_d",
             "replayssm_k",

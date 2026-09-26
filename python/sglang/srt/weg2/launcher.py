@@ -77,6 +77,9 @@ from sglang.srt.planner import power_limit as _power
 from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import (
     DEFAULT_D_BS,
+    DEFAULT_D_BS_NEXTFLASH,
+    DEFAULT_D_POOL_WAVES_NEXTFLASH,
+    DEFAULT_D_SEAT_VRAM_NEXTFLASH,
     DEFAULT_P_BS,
     DEFAULT_PP_ORDERED_CUT,
 )
@@ -1344,7 +1347,8 @@ P_CHUNK_MSCALES = {
 P_CHUNK_GRAPH_FIXED_MS = 2.0
 #: The dry-run ladder the launcher prints its plan for (the Messplan rungs).
 P_CHUNK_DRY_RUN_TOKENS = (2048, 8192, 32768, 131072)
-_P_CHUNK: Dict[str, object] = {"policy": P_CHUNK_POLICY_DEFAULT, "spec": None, "power_lines": ()}
+_P_CHUNK: Dict[str, object] = {"policy": P_CHUNK_POLICY_DEFAULT, "spec": None, "power_lines": (),
+                             "profile": None, "ns": None}
 #: --p-power-scale (release table row 27, weg2/power_limit.py). 'off' = the
 #: model is used as calibrated (spec byte-identical); only warning lines added.
 P_POWER_SCALE_DEFAULT = "off"
@@ -1515,11 +1519,17 @@ def p_chunk_stage_model(src: str, mscale: str, stages: int = 3):
     return models, source
 
 
-def apply_p_chunk_policy(ns) -> None:
+def apply_p_chunk_policy(ns, boot_form=None, argv_words: Sequence[str] = ()) -> None:
     """Install --p-chunk-policy once, AFTER apply_p_prefill_graph (it reads the
     graph buckets) and before any argv is built: p_chunked_prefill_tokens()
     reads the ceiling from here, so the cut solve, the ledger, the form key
-    and the shipped argv see ONE value."""
+    and the shipped argv see ONE value.
+
+    H92 (NF): a profile whose chunk row prices 'dynamic' by model key
+    (``Chunk.dynamic_source``, nextflash) resolves the NF profile of
+    this checkpoint instead (:func:`_apply_p_chunk_policy_nf`); its spec is
+    built with env_p (``p_chunk_policy_install``). Every other profile takes
+    the path below, unchanged."""
     from sglang.srt.weg2 import p_chunk_policy as _pcp
 
     policy = str(getattr(ns, "p_chunk_policy", P_CHUNK_POLICY_DEFAULT) or P_CHUNK_POLICY_DEFAULT)
@@ -1528,7 +1538,14 @@ def apply_p_chunk_policy(ns) -> None:
     _P_CHUNK["policy"] = policy
     _P_CHUNK["spec"] = None
     _P_CHUNK["power_lines"] = ()
+    _P_CHUNK["profile"] = None
+    _P_CHUNK["ns"] = None
     if policy == _pcp.POLICY_FIXED:
+        return
+    _row = weg2_form.profile_row((getattr(boot_form, "profile", "") if boot_form is not None
+                                  else getattr(ns, "profile", "")) or "")
+    if _row is not None and _row.chunk.dynamic_source == "model-key":
+        _apply_p_chunk_policy_nf(ns, boot_form, argv_words)
         return
     bucket = p_prefill_graph_bucket()
     fixed = int(getattr(ns, "p_chunk_fixed", 0) or 0) or bucket or CHUNKED_PREFILL_TOKENS
@@ -2387,6 +2404,207 @@ def d_replayssm_spec_line() -> str:
     )
 
 
+def d_effective_seats(ns) -> int:
+    """H91b: the seats group D actually runs -- ``--max-running-requests`` as
+    --extra-d ships it (the LAST value wins, as in argparse), else D's own
+    ``--d-bs``. ONE reader for every D post that scales with the seats (the
+    H64 verify form, the H91b seat rebook), so the price and the argv cannot
+    describe two different seat counts."""
+    extra = str(getattr(ns, "extra_d", "") or "")
+    d_bs = int(getattr(ns, "d_bs", DEFAULT_D_BS) or DEFAULT_D_BS)
+    raw_mrr = _argv_scalar(extra, "--max-running-requests")
+    try:
+        mrr = int(str(raw_mrr)) if raw_mrr is not None else d_bs
+    except ValueError:
+        mrr = d_bs
+    return max(1, mrr)
+
+
+def d_stated_seats(ns) -> Optional[int]:
+    """H91b: D's seats when this namespace STATES them (the launcher's own
+    parse always does: --d-bs has a default; --extra-d may carry
+    --max-running-requests), else None -- a hand-built namespace that says
+    nothing about seats is priced as its reference was, byte-identical."""
+    extra = str(getattr(ns, "extra_d", "") or "")
+    if not hasattr(ns, "d_bs") and _argv_scalar(extra, "--max-running-requests") is None:
+        return None
+    return d_effective_seats(ns)
+
+
+def _argv_int_list(extra: str, flag: str) -> Optional[List[int]]:
+    """The integers after the LAST ``flag`` of an --extra-* string (argparse
+    ``nargs='+'``: up to the next ``--``), or None when the flag is absent."""
+    if not extra or not flag:
+        return None
+    try:
+        parts = shlex.split(str(extra))
+    except ValueError:
+        return None
+    found: Optional[List[int]] = None
+    for i, tok in enumerate(parts):
+        vals: List[str] = []
+        if tok == flag:
+            j = i + 1
+            while j < len(parts) and not parts[j].startswith("--"):
+                vals.append(parts[j])
+                j += 1
+        elif tok.startswith(flag + "="):
+            vals = [v for v in tok[len(flag) + 1:].replace(",", " ").split() if v]
+        else:
+            continue
+        try:
+            found = [int(v) for v in vals]
+        except ValueError:
+            found = None
+    return found
+
+
+def d_seat_lines(ns) -> List[str]:
+    """H91b: what the seat count of this boot implies for D's argv, named.
+
+    * --d-bs (the front's D seats) against D's effective
+      --max-running-requests -- unequal means the front hands D requests it
+      queues, or leaves a seat idle;
+    * --cuda-graph-bs-decode must capture every batch 1..seats, else the
+      uncovered batch runs EAGER (correct, slow: the pool step's host
+      rendezvous per layer).
+    Findings, not refusals: the boot still starts."""
+    from sglang.srt.weg2.d_seats import graph_bs_covers
+
+    extra = str(getattr(ns, "extra_d", "") or "")
+    d_bs = int(getattr(ns, "d_bs", DEFAULT_D_BS) or DEFAULT_D_BS)
+    seats = d_effective_seats(ns)
+    graph = _argv_int_list(extra, "--cuda-graph-bs-decode")
+    out = [
+        "D-SITZE (H91b): --d-bs %d (Front-Sitze), D --max-running-requests %d (wirksam), "
+        "--cuda-graph-bs-decode %s%s"
+        % (d_bs, seats, "Runtime-Default" if graph is None else " ".join(str(b) for b in graph),
+           # H95: the seat count is the phase's handoff_n, this is its bound
+           (" -- H95: %d ist die OBERGRENZE, D faehrt je Phase n = 1..%d Sitze "
+            "(handoff_n beim Flip P->D, WEG2 D-PHASE-SEATS), die Sitz-Posten sind "
+            "fuer %d gebucht" % (seats, seats, seats)) if seats > 1 else "")
+    ]
+    if seats != d_bs:
+        out.append(
+            "D-SITZE (H91b) BEFUND: --d-bs %d != D --max-running-requests %d (--extra-d "
+            "gewinnt) -- die Front und D zaehlen verschiedene Sitze" % (d_bs, seats)
+        )
+    if not graph_bs_covers(graph, seats):
+        out.append(
+            "D-SITZE (H91b) BEFUND: --cuda-graph-bs-decode %s faengt nicht jede Batch "
+            "1..%d ein -- die fehlende laeuft EAGER; fuer %d Sitze '--cuda-graph-bs-decode %s'"
+            % (
+                " ".join(str(b) for b in graph),
+                seats,
+                seats,
+                " ".join(str(b) for b in range(1, seats + 1)),
+            )
+        )
+    return out
+
+
+def d_seat_vram_armed(env_d) -> bool:
+    """H95c: SGLANG_OPT_WEG2_D_SEAT_VRAM truthy in the D group's env."""
+    return str((env_d or {}).get("SGLANG_OPT_WEG2_D_SEAT_VRAM", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def d_seat_vram_plan_form(ns, er, plan_kwargs, cfg, form):
+    """H95c: the seat-post geometry for the seat table's runtime columns
+    (``expert_residency.seat_vram_form``), or None when the switch is off in
+    --env-d or the checkpoint has no GDN geometry."""
+    env_d = plan_kwargs.get("env_d") or {}
+    if not d_seat_vram_armed(env_d):
+        return None
+    from sglang.srt.planner import pp_cut as _pp
+
+    terms = _pp.checkpoint_weight_terms(ns.model)
+    text_cfg = cfg.get("text_config") or cfg
+    ratios = str(plan_kwargs.get("rank_tp_ratio") or "")
+    return er.seat_vram_form(
+        text_cfg, ssm_dtype=getattr(form, "ssm_dtype", None), rank_tp_ratio=ratios,
+        n_ranks=len(plan_kwargs.get("budgets_mib") or ()) or 1,
+        expert_row_bytes=float(terms.expert_layer_weight_bytes) / int(terms.num_experts),
+        moe_layers=int(terms.n_layers))
+
+
+def apply_d_seat_expert_rows(ns, er, rows, seat_vram, label) -> List[str]:
+    """H95c: write SGLANG_WEG2_D_SEAT_EXPERT_ROWS (the seat rows' virtual
+    reservation per rank, from the table) into --env-d -- before build_env
+    reads it -- unless the operator stated it. Returns the lines to log."""
+    env_d_raw = str(getattr(ns, "env_d", "") or "")
+    stated = parse_group_env(env_d_raw).get("SGLANG_WEG2_D_SEAT_EXPERT_ROWS")
+    value = er.seat_expert_rows_value(rows)
+    fixed = er.seat_fixed_mib(rows, seat_vram, value)
+    head = "%s FRACTION-SOLVE %s D-SITZ-VRAM (H95c)" % (D_RANK_SOLVE_MARKER, label)
+    fixed_txt = (
+        "; fest an JEDER Sitzzahl (auch der Kappe): die Seat-Zeilen der Skalen-Tensoren, "
+        "zu klein zum Entmappen, je Rang %s MiB GESCHAETZT -- NICHT im Kappen-Riegel "
+        "gebucht" % ["%.1f" % f for f in fixed] if fixed else "")
+    if stated is not None:
+        return ["%s: --env-d nennt SGLANG_WEG2_D_SEAT_EXPERT_ROWS=%s selbst (Tabelle: %s)%s"
+                % (head, stated, value, fixed_txt)]
+    if not value or all(v == "0" for v in value.split(",")):
+        return ["%s: keine Seat-Zeilen (die Tabelle finanziert bei n=1 keine Zeile)" % head]
+    item = "SGLANG_WEG2_D_SEAT_EXPERT_ROWS=%s" % value
+    ns.env_d = (env_d_raw.rstrip(";") + ";" + item) if env_d_raw.strip() else item
+    return ["%s: --env-d %s (virtuelle Reserve je Rang = k(n=1) + 1; gemappt wird je "
+            "Phase nur, was die Laufzeit exakt aus den ungemappten GDN-Slots finanziert)%s"
+            % (head, item, fixed_txt)]
+
+
+def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
+    """H95: the D-FRACTION-SOLVE once per seat count n = 1..seats (the SAME
+    ``plan_d_residency`` with ``seats=n`` -- seat_rebook re-books the posts;
+    no second pricing), rendered by ``expert_residency.describe_seat_table``.
+    Informational: the boot is priced (and refused) at the upper bound by the
+    solve above. Empty below two seats or without the pool mode / verify
+    form; never raises."""
+    try:
+        seats = d_stated_seats(ns)
+        form = d_replayssm_spec_plan_form(ns)
+        env_d = plan_kwargs.get("env_d") or {}
+        pool = str(env_d.get(er.POOL_GRAPH_MODE_ENV, "")).strip().lower() == "pool"
+        if seats is None or int(seats) < 2 or form is None or not pool:
+            return []
+        import json
+        import os
+
+        import msgspec
+
+        with open(os.path.join(ns.model, "config.json")) as fh:
+            cfg = json.load(fh)
+        top_k = int((cfg.get("text_config") or cfg).get("num_experts_per_tok") or 0)
+        if top_k <= 0:
+            return []
+
+        def plan_for(n):
+            return er.plan_d_residency(
+                **plan_kwargs, seats=n,
+                replayssm_spec=msgspec.structs.replace(form, max_running=n))
+
+        seat_vram = d_seat_vram_plan_form(ns, er, plan_kwargs, cfg, form)
+        rows = er.seat_table(
+            plan_for, seats_max=int(seats), verify_tokens=int(form.draft_tokens),
+            top_k=top_k, waves=er.pool_overflow_waves(env_d), seat_vram=seat_vram)
+        out = list(er.describe_seat_table(rows, marker=D_RANK_SOLVE_MARKER, label=label))
+        if seat_vram is not None:
+            out.extend(apply_d_seat_expert_rows(ns, er, rows, seat_vram, label))
+        return out
+    except Exception as exc:  # noqa: BLE001 -- an informational table never kills a launch
+        return ["%s FRACTION-SOLVE %s D-SITZE (H95) Tabelle entfaellt: %s: %s"
+                % (D_RANK_SOLVE_MARKER, label, type(exc).__name__, exc)]
+
+
+def d_seat_graph_mib(ns) -> Optional[List[float]]:
+    """--d-seat-graph-mib: the measured decode-graph cost per extra seat, one
+    value for every rank or one per rank; None = not given."""
+    raw = str(getattr(ns, "d_seat_graph_mib", "") or "").strip()
+    if not raw:
+        return None
+    return [float(x) for x in raw.split(",") if x.strip()]
+
+
 def d_replayssm_spec_plan_form(ns):
     """H64 (NF line): group D's verify form for the D planner
     (``expert_residency.plan_d_residency``: the #145 FRACTION-SOLVE budget and
@@ -2411,12 +2629,7 @@ def d_replayssm_spec_plan_form(ns):
     from sglang.srt.planner.expert_residency import ReplaySSMSpecForm
 
     extra = str(getattr(ns, "extra_d", "") or "")
-    d_bs = int(getattr(ns, "d_bs", DEFAULT_D_BS) or DEFAULT_D_BS)
-    raw_mrr = _argv_scalar(extra, "--max-running-requests")
-    try:
-        mrr = int(str(raw_mrr)) if raw_mrr is not None else d_bs
-    except ValueError:
-        mrr = d_bs
+    mrr = d_effective_seats(ns)
     ssm = _argv_scalar(extra, "--mamba-ssm-dtype")
     _row = weg2_form.profile_row(getattr(ns, "profile", None))
     if ssm is None and _row is not None and _row.early_read_flags:
@@ -3295,6 +3508,115 @@ def p_prefill_activation_reserve_mib(pinned: Optional[float], chunk_tokens: int)
         float(P_PREFILL_ACTIVATION_RESERVE_MIB),
         max(p_prefill_transient_vector_mib(chunk_tokens)),
     )
+
+
+#: H92 (NF, user order 25.09. ~21:40Z via 27B): the --p-chunk-policy of the
+#: nextflash profile -- ONE flag, ONE installer (:func:`apply_p_chunk_policy`),
+#: which delegates here for --profile nextflash. The NF side (profile by model
+#: key, hard limits, FR_P coupling, stream budget) lives in weg2/p_chunk_nf.py.
+#: 'fixed' changes NOTHING. Under 'dynamic' the plan's CEILING is group P's
+#: --chunked-prefill-size (P_CHUNKED_PREFILL_TOKENS): argv_p stays
+#: byte-identical, only the P group's env carries the spec.
+#: The shared flags keep the 27B defaults in argparse; for NF a flag the
+#: operator did NOT write reads NF's own default (model 'auto', max 0 = the P
+#: chunk, dynamic-min -1 = the P chunk) -- decided by the argv, not by value.
+P_CHUNK_NF_MODEL_DEFAULT = "auto"
+
+
+def _p_chunk_nf_args(ns, argv_words: Sequence[str]) -> Dict[str, object]:
+    """The NF reading of the shared --p-chunk-* flags (see above)."""
+    def given(flag: str) -> bool:
+        return weg2_form.flag_given(list(argv_words or ()), flag)
+
+    return {
+        "model": (str(getattr(ns, "p_chunk_model", "") or P_CHUNK_NF_MODEL_DEFAULT)
+                  if given("--p-chunk-model") else P_CHUNK_NF_MODEL_DEFAULT),
+        "max": int(getattr(ns, "p_chunk_max", 0) or 0) if given("--p-chunk-max") else 0,
+        "min": int(getattr(ns, "p_chunk_min", 0) or 0),
+        "fixed": int(getattr(ns, "p_chunk_fixed", 0) or 0),
+        "raster": int(getattr(ns, "p_chunk_raster", 0) or 0),
+        "min_gain": getattr(ns, "p_chunk_min_gain", None),
+        "dynamic_min": (int(getattr(ns, "p_chunk_dynamic_min_tokens", -1))
+                        if given("--p-chunk-dynamic-min-tokens") else -1),
+    }
+
+
+def _apply_p_chunk_policy_nf(ns, boot_form, argv_words: Sequence[str]) -> None:
+    """H92: resolve --p-chunk-policy dynamic for --profile nextflash: the NF
+    profile of THIS checkpoint (model key, never 27B numbers) and the NF hard
+    limits against the P chunk the planner prices. The spec itself is built
+    at env time (``p_chunk_policy_install``), where FR_P is the effective one
+    (after the H25 draft post)."""
+    from sglang.srt.weg2 import p_chunk_nf as _nf
+
+    nf_args = _p_chunk_nf_args(ns, argv_words)
+    model_key = weg2_form.model_key(getattr(ns, "model", "") or "")
+    try:
+        prof = _nf.resolve_profile(str(nf_args["model"]), model_key)
+        if boot_form is not None and prof.profile and boot_form.profile and prof.profile != boot_form.profile:
+            raise _nf.NfChunkRefused(
+                f"NF chunk profile {os.path.basename(prof.path)} is for --profile {prof.profile}, "
+                f"this boot runs --profile {boot_form.profile}")
+        if prof.ceiling_tokens != P_CHUNKED_PREFILL_TOKENS:
+            raise _nf.NfChunkRefused(
+                f"NF chunk profile {os.path.basename(prof.path)} was measured at P chunk "
+                f"{prof.ceiling_tokens}, this boot prices {P_CHUNKED_PREFILL_TOKENS} "
+                f"(SGLANG_WEG2_P_CHUNKED_PREFILL_TOKENS): a_s belongs to its own residency")
+        _p_chunk_nf_limits(nf_args, len(prof.stages))
+    except _nf.NfChunkRefused as exc:
+        raise SystemExit(f"--p-chunk-policy dynamic (NF): {exc}")
+    _P_CHUNK.update(profile=prof, ns=nf_args)
+
+
+def _p_chunk_nf_limits(nf_args: Dict[str, object], stages: int):
+    from sglang.srt.weg2 import p_chunk_nf as _nf
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+    try:
+        support = int(max(P_PREFILL_TRANSIENT_SUPPORT.chunks))
+    except (AttributeError, TypeError, ValueError):
+        support = 0
+    _mg = nf_args.get("min_gain")
+    return _nf.nf_limits(
+        ceiling=P_CHUNKED_PREFILL_TOKENS,
+        max_tokens=int(nf_args.get("max") or 0),
+        min_tokens=int(nf_args.get("min") or 0),
+        fixed_tokens=int(nf_args.get("fixed") or 0),
+        raster=int(nf_args.get("raster") or _nf.NF_RASTER_TOKENS),
+        transient_support_max=support,
+        min_gain=float(_pcp.DEFAULT_MIN_GAIN if _mg is None else _mg),
+        dynamic_min_tokens=int(nf_args.get("dynamic_min", -1)),
+        stages=stages,
+    )
+
+
+def p_chunk_policy_install(env_p: Dict[str, str]) -> Tuple[Dict[str, str], List[str]]:
+    """``(env additions for group P, launcher lines)``; ``({}, [])`` under
+    'fixed' (env and front log byte-identical). FR_P is read from the group
+    P environment that ships (the effective vector after the draft post)."""
+    from sglang.srt.weg2 import p_chunk_nf as _nf
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+    prof = _P_CHUNK.get("profile")
+    if prof is None:
+        return {}, []
+    fr = _nf.parse_fractions(env_p.get("SGLANG_MOE_RESIDENT_EXPERT_FRACTION", ""))
+    try:
+        stages, fr_note = _nf.fr_adjusted_stages(prof, fr)
+        limits = _p_chunk_nf_limits(_P_CHUNK["ns"], len(stages))
+    except _nf.NfChunkRefused as exc:
+        raise Weg2LaunchRefused(f"--p-chunk-policy dynamic (NF): {exc}") from None
+    spec = _pcp.PolicySpec(stages, limits, prof.source)
+    _P_CHUNK["spec"] = spec
+    env = {_pcp.POLICY_ENV: _pcp.POLICY_DYNAMIC, _pcp.SPEC_ENV: spec.to_json(),
+           _nf.BUDGET_ENV: _nf.BUDGET_STREAM}
+    lines = ["WEG2 " + _pcp.armed_line(spec, "group=P line=NF budget=stream")
+             + f" -- ceiling = group P's --chunked-prefill-size {P_CHUNKED_PREFILL_TOKENS} (unchanged), "
+               f"raster {limits.page} = ChunkLimits.page, profile {os.path.basename(prof.path)}, {fr_note}"]
+    lines.extend(_nf.dry_run_lines(spec))
+    return env, lines
+
+
 
 #: The `gapped corridor holdback` post, MiB per rank. 1.000 GiB on every rank
 #: of both boots. This is the term ARMING_FLOOR_MIB was standing in for, and
@@ -14195,7 +14517,15 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             # H64 (NF): die Verify-Form der D-Gruppe; None unter
             # --d-replayssm-spec off -- die Rechnung bleibt dann byte-gleich.
             replayssm_spec=d_replayssm_spec_plan_form(ns),
+            # H91b: die Sitze, die D wirklich faehrt, und was ihr Graph je
+            # zusaetzlichem Sitz kostet (gemessen, sonst benannt ungebucht).
+            seats=d_stated_seats(ns),
+            seat_graph_mib=d_seat_graph_mib(ns),
+            reference_seats=int(getattr(ns, "d_residency_reference_seats", 1) or 1),
         )
+        if d_stated_seats(ns) is not None:
+            for _ln in d_seat_lines(ns):
+                log(f"{D_RANK_SOLVE_MARKER} {label} {_ln}")
     except (OSError, KeyError, ValueError, _pp_cut.DraftResidencyUnavailable) as _exc:
         # Eine UNLESBARE Geometrie/Referenz verweigert nicht den Boot, sie wird
         # benannt; die Verweigerung unten kommt nur aus einer GERECHNETEN Bilanz.
@@ -14204,6 +14534,25 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         return
     for line in plan.lines:
         log(line)
+    # H95: the seats are dynamic 1..--d-bs per D phase -- the same solve per
+    # seat count n (seat_rebook re-books the seat posts), one line each.
+    for _ln in d_seat_table_lines(ns, _er, dict(
+            model_path=ns.model,
+            budgets_mib=[float(b) for b in budgets_d],
+            ratios=[float(x) for x in ratios],
+            fractions=[float(x) for x in fr_d],
+            scratch_rows=[int(x) for x in scratch],
+            rank_tp_ratio=",".join(tp_ratio),
+            env_d=_env_d,
+            reference_logs=ns.d_residency_reference_logs,
+            kv_tokens=CONTEXT_LENGTH_TOKENS,
+            label=label,
+            marker=D_RANK_SOLVE_MARKER,
+            card_reference_logs=getattr(ns, "d_card_reference_logs", "") or "",
+            seat_graph_mib=d_seat_graph_mib(ns),
+            reference_seats=int(getattr(ns, "d_residency_reference_seats", 1) or 1),
+    ), label):
+        log(_ln)
     if plan.refusal is not None:
         log(f"{D_RANK_SOLVE_MARKER} {plan.refusal}")
         raise Weg2LaunchRefused(plan.refusal)
@@ -14358,8 +14707,17 @@ def log_wake_credit_solve_pd(ns, cards: List[Card], log, label: str, *, p_split,
     from sglang.srt.planner import expert_residency as _er
     from sglang.srt.weg2 import wake_credit_pd as _wpd
 
+    # H92d: free beim Flip-Start aus der juengsten Messung derselben Form UND
+    # derselben D-Sitzzahl (der schlafende D-Mitbewohner waechst mit den
+    # Sitzen: x178 1 Sitz 1698/768/766 MiB, bb2 6 Sitze 1944/872/874) --
+    # Sidecar-Records vor den eingebauten; eine Form ohne genannte Sitze
+    # (handgebaute Namespaces) rechnet wie vorher.
+    _d_seats = d_stated_seats(ns)
     try:
         pplan = _wpd.plan_wake_credit_pd(
+            d_seats=_d_seats,
+            free0_records=(_wpd.read_free0_records(measured_record_path())
+                           if _d_seats is not None else ()),
             model=ns.model, p_split=p_split, chunk_layers=int(chunk_layers),
             n_layers=int(n_layers), p_card=[c.nvml_index for c in cards],
             d_ratio=",".join(str(x) for x in ratios),
@@ -15949,6 +16307,10 @@ def build_parser() -> argparse.ArgumentParser:
                          f"(user order 2026-09-10); 127.0.0.1 keeps it host-local. Refused before any group "
                          f"is spawned if the address cannot be bound (e.g. the temporary LAN forwarder "
                          f"weg2-lan-forward.socket still holds the port).")
+    ap.add_argument(
+        "--p-chunk-raster", type=int, default=0, metavar="TOKENS",
+        help="H92, --profile nextflash only, with --p-chunk-policy dynamic: the NF chunk raster (0 = 4096, the only "
+             "accepted value; ChunkLimits.page).")
     ap.add_argument("--p-bs", type=int, default=DEFAULT_P_BS,
                     help=f"K1: group P's --max-running-requests AND the front's leg-1 concurrency. "
                          f"Independent of --d-bs (law 2). Default {DEFAULT_P_BS} by the user order of "
@@ -16035,6 +16397,18 @@ def build_parser() -> argparse.ArgumentParser:
              "Je D-Rang (ordinal) die MiB, die auf der Karte NICHT den "
              "Gewichten gehoeren: KV-Pool, Draft, Aktivierungen. Ohne Angabe "
              "druckt der Solver die DECKE, nicht die Empfehlung.")
+    ap.add_argument(
+        "--d-residency-reference-seats", type=int, default=1,
+        help="H91b: die Sitze (--max-running-requests), mit denen die Boots aus "
+             "--d-residency-reference-logs liefen. Die eingebauten NF-Referenzen "
+             "tragen 1 (bs1, belegt durch ihre 7 Mamba-Slots). Die Posten 'mamba "
+             "state pool' und 'speculative intermediate state' werden von dieser "
+             "Zahl auf D's wirksame --max-running-requests umgebucht.")
+    ap.add_argument(
+        "--d-seat-graph-mib", default="",
+        help="H91b: GEMESSENE Mehrkosten des Decode-CUDA-Graphen je zusaetzlichem "
+             "D-Sitz, MiB (ein Wert fuer alle Raenge oder einer je Rang). Leer = die "
+             "KARTE-Zeile nennt den Posten als NICHT GEBUCHT (Obergrenze).")
     ap.add_argument(
         "--d-residency-reference-logs", default="",
         help="H8: Komma-Liste von D-Boot-Logs (boot_weg2_<tag>_*.D.log), aus "
@@ -17704,6 +18078,74 @@ def bs_source(flag: str, argv: Optional[Sequence[str]] = None) -> str:
     return "flag" if any(w == flag or w.startswith(flag + "=") for w in words) else "default"
 
 
+def profile_standard_form(ns) -> bool:
+    """UNIFY (operator 26.09.): the NF H91 standard form for this launch (D
+    seats 1..6 per phase, pool waves, seat posts): an explicit
+    SGLANG_WEG2_STANDARD_FORM in the launcher's env wins (build_env hands the
+    same env to P, D and the front), else the registry row's
+    ``standard_form`` for ``ns.profile``; an unknown profile is off."""
+    return standard_form_resolved(ns)[0]
+
+
+def standard_form_resolved(ns) -> Tuple[bool, str]:
+    if weg2_form.profile_row(getattr(ns, "profile", None)) is None and not str(
+            os.environ.get(weg2_form.STANDARD_FORM_ENV, "")).strip():
+        return False, "unknown profile"
+    return weg2_form.standard_form_state(os.environ, getattr(ns, "profile", None))
+
+
+def apply_profile_d_bs_default(ns, argv: Sequence[str]) -> int:
+    """H91b/H95 (Nutzer-Design 25.09.): ``--profile nextflash`` without an
+    explicit ``--d-bs`` runs D with up to ``DEFAULT_D_BS_NEXTFLASH`` (6) seats
+    -- the UPPER BOUND of the dynamic seat count n = 1..6 per D phase
+    (``d_seats.phase_seats`` from the wake's handoff_n); H91b's fixed 2 is the
+    case n = 2. An explicit ``--d-bs`` always wins and stays the hard bound
+    (``bs_source``: a told value is a choice, even when it equals a default).
+    Returns the resolved value."""
+    if (profile_standard_form(ns)
+            and bs_source("--d-bs", argv) == "default"):
+        ns.d_bs = DEFAULT_D_BS_NEXTFLASH
+    return int(ns.d_bs)
+
+
+def apply_profile_d_pool_waves_default(ns) -> Optional[str]:
+    """H95: ``--profile nextflash`` runs D's expert pool with
+    ``DEFAULT_D_POOL_WAVES_NEXTFLASH`` overflow waves unless ``--env-d``
+    states SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES itself (0 = the H91b bound).
+    Written INTO ``ns.env_d`` so the D-FRACTION-SOLVE (which reads --env-d)
+    and the D group's environment (build_env applies --env-d last) see ONE
+    value. Returns the line naming it, or None when nothing was added."""
+    from sglang.srt.planner.expert_residency import POOL_OVERFLOW_WAVES_ENV
+
+    if not profile_standard_form(ns):
+        return None
+    env_d = str(getattr(ns, "env_d", "") or "")
+    if POOL_OVERFLOW_WAVES_ENV in parse_group_env(env_d):
+        return None
+    item = "%s=%d" % (POOL_OVERFLOW_WAVES_ENV, DEFAULT_D_POOL_WAVES_NEXTFLASH)
+    ns.env_d = (env_d.rstrip(";") + ";" + item) if env_d.strip() else item
+    return ("D-POOL-WELLEN (H95): --profile nextflash -> --env-d %s (Ueberlaufwellen: "
+            "der bs1-Scratch traegt jede Sitzzahl 1..--d-bs; --env-d %s=0 = die "
+            "H91b-Schranke)" % (item, POOL_OVERFLOW_WAVES_ENV))
+
+
+def apply_profile_d_seat_vram_default(ns) -> Optional[str]:
+    """H95c: ``--profile nextflash`` backs D's seat posts only for the
+    phase's occupied seats (SGLANG_OPT_WEG2_D_SEAT_VRAM=1 into ``ns.env_d``)
+    unless ``--env-d`` states the switch itself (=0: H95 B's fixed posts).
+    Returns the line naming it, or None when nothing was added."""
+    if not profile_standard_form(ns) or not DEFAULT_D_SEAT_VRAM_NEXTFLASH:
+        return None
+    env_d = str(getattr(ns, "env_d", "") or "")
+    if "SGLANG_OPT_WEG2_D_SEAT_VRAM" in parse_group_env(env_d):
+        return None
+    item = "SGLANG_OPT_WEG2_D_SEAT_VRAM=1"
+    ns.env_d = (env_d.rstrip(";") + ";" + item) if env_d.strip() else item
+    return ("D-SITZ-VRAM (H95c): --profile nextflash -> --env-d %s (Sitz-Posten nur fuer "
+            "die besetzten Sitze der Phase, der Rest als Experten-LRU-Zeilen auf TP0; "
+            "--env-d SGLANG_OPT_WEG2_D_SEAT_VRAM=0 = H95 B)" % item)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global _ACTIVE_BOOT_STATE
     # #1248: unclaimed until a BootState exists below -- a stale pointer from
@@ -17711,6 +18153,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # shape anyway) must never make a fast pre-spawn refusal look post-spawn.
     _ACTIVE_BOOT_STATE = None
     ns = build_parser().parse_args(argv)
+    # H91b/H95: the Next-Flash form's own D seat bound (6, dynamic 1..6 per
+    # phase) and its pool waves, before anything reads --d-bs or --env-d.
+    apply_profile_d_bs_default(ns, list(sys.argv[1:] if argv is None else argv))
+    _h95_waves_line = apply_profile_d_pool_waves_default(ns)
+    if _h95_waves_line:
+        print(_h95_waves_line, flush=True)
+    _h95c_line = apply_profile_d_seat_vram_default(ns)
+    if _h95c_line:
+        print(_h95c_line, flush=True)
+    _sf_on, _sf_src = standard_form_resolved(ns)
+    if _sf_on or _sf_src.startswith("env "):
+        print("WEG2-STANDARD-FORM (NF H91, profile field standard_form): %s (%s) -- D seats per "
+              "phase, park, front phase policy%s" % ("on" if _sf_on else "off", _sf_src,
+              "" if _sf_on else " all OFF (pre-H91 form)"), flush=True)
     # WEG2-FORM: resolved ONCE, before apply_spec_form (--form-draft and
     # --form-p-draft may drive --spec-form / --draft-kv-on-p /
     # --dflash-produce-on-p), and PUBLISHED into this process's own environment
@@ -17748,7 +18204,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     apply_spec_form(ns)
     apply_p_prefill_graph(ns)
     # --p-chunk-policy: after the graph (reads its buckets), before any argv.
-    apply_p_chunk_policy(ns)
+    # H92 (NF): under --profile nextflash the NF profile of this checkpoint (model key).
+    apply_p_chunk_policy(ns, boot_form, list(sys.argv[1:] if argv is None else argv))
     # --p-layer-split: after the chunk policy (the joint plan reads its limits).
     apply_p_layer_split(ns)
     # --d-reshard: before any argv; 'off' installs nothing.
@@ -19272,6 +19729,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     env_p.update(p_attn_head_split_env(_ah_cfg))
     if _ah_cfg is not None:
         log(p_attn_head_split_line(_ah_cfg, len(budgets_p)))
+    # H92 --p-chunk-policy: ({}, []) under 'fixed' -- env and front log
+    # byte-identical. FR_P is read from THIS env_p (the vector that ships).
+    _pcp_env, _pcp_lines = p_chunk_policy_install(env_p)
+    env_p.update(_pcp_env)
+    for _pcl in _pcp_lines:
+        log(_pcl)
     # #1465: group P's write-through copy kernels at high stream priority, so
     # the backlog measured on weg2xsn219 (P running-req 2: 72 -> 103 un-backed
     # nodes, 2.0-2.8 s flush drain at the flip) does not build behind a

@@ -1,4 +1,4 @@
-# Vendored torch_memory_saver 0.0.9.post1 csrc (MIT, fzyzcjy) with TWO patches
+# Vendored torch_memory_saver 0.0.9.post1 csrc (MIT, fzyzcjy) with THREE patches
 
 Source: the PyPI sdist `torch_memory_saver-0.0.9.post1.tar.gz` (the version
 installed in /spinning/htsglang-gpu/.venv, a binary wheel that ships no csrc).
@@ -48,3 +48,27 @@ registration form (`MAP_SHARED` file, or `memfd_create` + fd inheritance) --
 whether `cudaHostRegister` accepts either is a metal fact, so a ring directory
 published without a proven form is refused by name (W33 Weg2RingFormUnproven)
 rather than guessed at.
+
+## Patch 3 -- H95c, the span map (D's seat posts per phase)
+
+`core.{h,cpp}` and `entrypoint.cpp` changed.  An allocation may carry a SPAN
+PLAN: granularity-aligned byte ranges that the next `resume` maps, one
+physical handle per range, the rest of its VA reserved and empty.  The VA is
+never touched, so a captured CUDA graph keeps its addresses.  Two entrypoints:
+
+* `tms_set_spans(ptr, n, lo, hi, now)` -- the plan of the allocation whose BASE
+  is `ptr` (`n == 0` = the whole allocation = the stock mapping).  `now` on an
+  ACTIVE allocation applies it at once: extents wholly inside the new plan keep
+  their pages (and bytes), the others are unmapped, the uncovered ranges get
+  fresh pages.  Refuses a cpu-backed allocation (-2: the host backup walks the
+  whole size), a malformed plan (-3) and a non-base pointer (-1).
+* `tms_alloc_info(ptr, &size, &mapped, &planned, &active)`.
+
+`pause`/`free` release every extent; `resume` maps the plan (a failed map rolls
+the whole tag back, like the stock path); `tag_bytes` reports the PHYSICAL
+bytes (mapped while ACTIVE, planned while PAUSED).  Without a plan -- every
+allocation nobody called `tms_set_spans` on -- each of these is the patch-2
+behaviour unchanged.  Used by `weg2/d_seat_vram.py` (SGLANG_OPT_WEG2_D_SEAT_VRAM):
+D's GDN temporal state maps the slots of the phase's n seats, the expert bank
+the rows those seats' pages fund.  Desk proof: the unit test builds these
+sources against a mock driver (`test_weg2_d_seat_vram_h95c.py`, section 5).

@@ -3363,6 +3363,13 @@ class MoEExpertOffloadCache:
         self._pool_pf_begin = None  # main -> side: x_L is ready
         self._pool_pf_done = None  # side -> main: the predicted rows are in
         self._pool_pf_armed = False
+        # H95: (n_ids -> waves) the captured steps of this layer were built
+        # with, for the capture log line and the demand probe.
+        self._pool_waves_seen: Dict[int, int] = {}
+        # H95c: extra LRU rows at the end of the bank whose pages follow D's
+        # phase seat count (weg2/d_seat_vram.py); 0 = the bank of H95 B. Set
+        # by the presplit that allocated the [R+C+X] buffer.
+        self.seat_rows = int(getattr(layer, "_weg2_seat_rows", 0) or 0)
         from sglang.srt.environ import envs as _envs
 
         self.lookahead_sticky = int(_envs.SGLANG_MOE_EXPERT_LOOKAHEAD.get()) > 0
@@ -3661,11 +3668,13 @@ class MoEExpertOffloadCache:
         # it so moe_align / the runner size to the buffer; topk_ids arriving at
         # apply() are already slot ids in [0, R+C).
         self._orig_num_local_experts = self.layer.num_local_experts
-        self.layer.num_local_experts = buf_slots
+        # H95c: the bank holds R+C+X rows when the presplit reserved seat rows
+        buf_rows = buf_slots + self.seat_rows
+        self.layer.num_local_experts = buf_rows
         runner_cfg = getattr(self.layer, "moe_runner_config", None)
         if runner_cfg is not None and hasattr(runner_cfg, "num_local_experts"):
             try:
-                runner_cfg.num_local_experts = buf_slots
+                runner_cfg.num_local_experts = buf_rows
             except Exception:
                 pass  # frozen/dataclass runner configs: kernel reads the layer attr
         if presplit is not None:
@@ -4162,9 +4171,9 @@ class MoEExpertOffloadCache:
         import os
 
         from sglang.srt.layers.moe.expert_pool_device import (
-            PLAN_WIDTH,
             allocate_pool_tables,
             allocate_step_buffers,
+            plan_width_for,
         )
 
         if self._pool_ready:
@@ -4190,37 +4199,234 @@ class MoEExpertOffloadCache:
                 f"pool mode requires buffer_size == R+C ({rows} != {R}+{C})"
             )
         staging = int(os.environ.get("SGLANG_MOE_POOL_STAGING", "12") or 12)
-        staging = max(1, min(staging, C - 1, PLAN_WIDTH))
+        # H91b/H95: the plan width follows the widest captured step (n seats
+        # x 4 MTP verify rows x top-10, n = 1..--d-bs: 80 ids at bs2, 240 at
+        # bs6 -> 256 lanes); a bs1 form keeps exactly PLAN_WIDTH.
+        width = plan_width_for(self._pool_max_step_ids())
+        staging = max(1, min(staging, C - 1, width))
         attrs = [a for a in self._pinned if a in self._resident]
         device = self._resident[attrs[0]].device
         hot_slot_of, host_row = self._pool_layout()
         self._pool_staging = staging
-        self._pool_tables = allocate_pool_tables(
-            device, E, rows, R, staging, hot_slot_of, host_row
-        )
-        self._pool_buffers = allocate_step_buffers(device, E, PLAN_WIDTH)
+        from sglang.srt.environ import envs
+
+        # H95 probe: the demand counters exist only when it is armed; off,
+        # the tables and the step kernel are exactly those before H95.
+        demand = int(envs.SGLANG_DEBUG_MOE_POOL_DEMAND.get() or 0) > 0
+        if self.seat_rows > 0:
+            # H95c: [R+C+X] bank, seat form (staging first, X rows OFF)
+            self._pool_tables = allocate_pool_tables(
+                device, E, rows + self.seat_rows, R, staging, hot_slot_of, host_row,
+                demand=demand, seat_rows=self.seat_rows,
+            )
+        else:
+            self._pool_tables = allocate_pool_tables(
+                device, E, rows, R, staging, hot_slot_of, host_row, demand=demand
+            )
+        self._pool_buffers = allocate_step_buffers(device, E, width)
         self._pool_srcs = [device_view_of_pinned(self._pinned[a]) for a in attrs]
         self._pool_dsts = [self._resident[a] for a in attrs]
         self._pool_view_holders = [self._pinned[a] for a in attrs]
         if pool_prefetch_enabled():
             import torch
 
-            self._pool_pf_buffers = allocate_step_buffers(device, E, PLAN_WIDTH)
+            self._pool_pf_buffers = allocate_step_buffers(device, E, width)
             self._pool_pf_begin = torch.cuda.Event()
             self._pool_pf_done = torch.cuda.Event()
         self._pool_ready = True
         logging.getLogger(__name__).info(
             "MoE expert pool on layer %s: residents %d, LRU rows %d, staging %d, "
-            "spill rows %d, tensors %d, prefetch %s",
+            "spill rows %d, tensors %d, prefetch %s%s",
             getattr(self.layer, "layer_id", None), R, C - staging, staging,
             sum(1 for h in host_row if h >= 0), len(attrs),
             "on" if self._pool_pf_buffers is not None else "off",
+            (", seat rows %d (H95c, OFF until a D phase funds them)" % self.seat_rows)
+            if self.seat_rows > 0 else "",
         )
 
-    def prepare_pool(self, topk_ids):
+    def _pool_max_step_ids(self):
+        """H91b: the widest step a captured decode graph routes through this
+        layer (``expert_pool_device.pool_max_step_ids``), from the boot's
+        server args; ``None`` (= the historic PLAN_WIDTH) when they are not
+        reachable, e.g. in a desk harness."""
+        from sglang.srt.layers.moe.expert_pool_device import pool_max_step_ids
+
+        try:
+            from sglang.srt.runtime_context import get_server_args
+
+            sa = get_server_args()
+        except Exception:  # noqa: BLE001 -- no runtime context: keep the old width
+            return None
+        spec = getattr(sa, "speculative_algorithm", None)
+        verify = getattr(sa, "speculative_num_draft_tokens", None) if spec else None
+        return pool_max_step_ids(
+            graph_bs=getattr(sa, "cuda_graph_bs_decode", None),
+            max_graph_bs=getattr(sa, "cuda_graph_max_bs_decode", None),
+            max_running=getattr(sa, "max_running_requests", None),
+            verify_tokens=verify,
+            top_k=getattr(self.layer, "top_k", None),
+        )
+
+    def pool_waves(self, n_ids: int) -> int:
+        """H95: how many overflow waves the captured step of ``n_ids`` routed
+        ids runs on this layer -- 1 (today's single step) unless
+        SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES=N >= 2, then ``ceil(min(ids, E - R)
+        / (LRU + staging))`` capped at N (past N the step's own bound refuses
+        the capture by name, exactly as without waves)."""
+        import logging
+
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.expert_pool_device import (
+            pool_row_capacity,
+            pool_waves_for,
+            resident_count,
+            step_row_demand,
+        )
+
+        cap = int(envs.SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES.get() or 0)
+        if cap < 2:
+            return 1
+        if not self._pool_ready:
+            self.install_pool()
+        t = self._pool_tables
+        # H95c: C of the phase with EVERY seat occupied (seat rows OFF) --
+        # the capture happens in that form, a phase with rows ON needs fewer
+        C = pool_row_capacity(t)
+        need = pool_waves_for(int(n_ids), t.num_experts, resident_count(t), C)
+        waves = min(need, cap)
+        if self._pool_waves_seen.get(int(n_ids)) != waves:
+            self._pool_waves_seen[int(n_ids)] = waves
+            lid = getattr(self.layer, "layer_id", None)
+            if lid in (0, 23, 47):
+                logging.getLogger(__name__).info(
+                    "MoE expert pool layer %s (H95): captured step of %d ids -> %d "
+                    "wave(s); demand bound min(ids, E-R)=%d, C=LRU+staging=%d, "
+                    "SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES=%d",
+                    lid, int(n_ids), waves,
+                    step_row_demand(int(n_ids), t.num_experts, resident_count(t)), C, cap,
+                )
+        return waves
+
+    def set_seat_rows_on(self, k: int, *, device_write: bool) -> int:
+        """H95c: this phase's k of the layer's X seat rows are ON
+        (``expert_pool_device.set_seat_rows_on``). Returns the previous k; a
+        layer without seat rows or without its pool tables accepts only 0."""
+        if self.seat_rows <= 0 or not self._pool_ready:
+            if int(k) != 0:
+                raise ValueError("H95c: seat rows on a layer without seat rows / pool")
+            return 0
+        from sglang.srt.layers.moe.expert_pool_device import set_seat_rows_on
+
+        return set_seat_rows_on(self._pool_tables, int(k), device_write=device_write)
+
+    def _pool_zero_row(self):
+        """H95: a [1] device view of the row that masked wave lanes point at.
+        The expert-shard PAD row (all-zero weights, zeroed at every wake
+        before any forward, resident by construction) when this layer has
+        one -- read off ``hot_phys`` at replay, so a re-layout moves it with
+        the tables; else the first row of the resident region that owns an
+        expert (a deferred H31b row owns none and is never chosen)."""
+        import torch
+
+        t = self._pool_tables
+        pad = self._pool_pad_expert()
+        if pad is not None:
+            return t.hot_phys[pad : pad + 1]
+        owned = (t.row_key[: max(1, t.lru_start)] >= 0).to(torch.int32)
+        return torch.argmax(owned).reshape(1).to(torch.int32)
+
+    def _pool_pad_expert(self):
+        """The local id of this layer's expert-shard pad (``FusedMoE.
+        pool_prefetch_local_ids``' rule) when it is a resident pool row."""
+        layer = self.layer
+        if not getattr(layer, "_gguf_expert_shard", False):
+            return None
+        rng = getattr(layer, "_gguf_expert_range", None)
+        if rng is None:
+            return None
+        lo, hi = rng
+        pad = 0 if getattr(layer, "_expert_shard_generic", False) else int(hi) - int(lo)
+        _hot, host_row = self._pool_layout()
+        if not 0 <= pad < len(host_row) or int(host_row[pad]) >= 0:
+            return None
+        return pad
+
+    def run_pool_waves(self, dispatch_output, apply_fn, waves: int):
+        """H95: the captured decode MoE in ``waves`` pool steps (module
+        docstring of ``expert_pool_device``, OVERFLOW WAVES).
+
+        Wave 1 is ``prepare_pool`` with ``spill``: lanes whose expert found no
+        row keep route -1 and are recomputed by the next wave. In every wave a
+        lane it does not serve points at the zero row with weight 0, so each
+        (token, k) lane contributes in exactly one wave and the sum of the
+        waves' outputs is the one-wave output (bit-exact when wave 1 serves
+        everything: the later waves then add exact zeros). The last wave runs
+        without ``spill`` -- anything it cannot serve sets the sticky error as
+        before H95, and the capture-time bound makes that impossible."""
+        import torch
+
+        topk_output = dispatch_output.topk_output
+        topk_ids = topk_output.topk_ids
+        weights = topk_output.topk_weights
+        bs, k = topk_ids.shape
+        E = self.num_local_experts
+        flat = topk_ids.reshape(-1)
+        if flat.dtype != torch.int32:
+            flat = flat.to(torch.int32)
+        routes = self.prepare_pool(topk_ids, spill=True, waves=waves).reshape(-1)
+        zero_row = self._pool_zero_row().to(routes.dtype)
+        valid = (flat >= 0) & (flat < E)
+        over = valid & (routes < 0)
+        zero_w = torch.zeros_like(weights)
+
+        def _run(lane_routes, lane_keep):
+            sub_topk = topk_output._replace(
+                topk_ids=lane_routes.view(bs, k),
+                topk_weights=torch.where(lane_keep.view(bs, k), weights, zero_w),
+            )
+            return apply_fn(dispatch_output._replace(topk_output=sub_topk))
+
+        first = _run(torch.where(over, zero_row, routes), ~over)
+        hidden = first.hidden_states
+        ids = torch.where(over, flat, torch.full_like(flat, -1))
+        for wave in range(2, int(waves) + 1):
+            last = wave == int(waves)
+            r = self._pool_wave_step(ids, spill=not last, waves=waves).to(routes.dtype)
+            served = (ids >= 0) & (r >= 0)
+            hidden = hidden + _run(torch.where(served, r, zero_row), served).hidden_states
+            if not last:
+                ids = torch.where((ids >= 0) & (r < 0), ids, torch.full_like(ids, -1))
+        return first._replace(hidden_states=hidden)
+
+    def _pool_wave_step(self, ids, *, spill: bool, waves: int):
+        """H95: one later wave -- plan ``ids`` (lanes not in this wave = -1),
+        copy its misses, return its routes (flat, one per lane)."""
+        from contextlib import nullcontext
+
+        from sglang.srt.layers.moe.expert_pool_device import copy_rows, step
+        from sglang.srt.utils.collective_clock import collective_clock
+
+        clock = collective_clock()
+        armed = clock.armed
+        with clock.span("pool.step") if armed else nullcontext():
+            step(self._pool_tables, ids, self._pool_buffers, spill=spill, wave=True,
+                 waves=waves)
+        with clock.span("pool.fetch") if armed else nullcontext():
+            copy_rows(
+                self._pool_srcs,
+                self._pool_dsts,
+                self._pool_buffers.gather_src,
+                self._pool_buffers.gather_dst,
+                self._pool_buffers.gather_count,
+            )
+        return self._pool_buffers.routes[: ids.numel()]
+
+    def prepare_pool(self, topk_ids, spill: bool = False, waves: int = 1):
         """The captured decode step: plan on the device, copy only the misses
         (device count), return the physical rows the apply reads. Pure device
-        ops with fixed addresses -- captured once, replayed every step."""
+        ops with fixed addresses -- captured once, replayed every step.
+        ``spill``/``waves``: wave 1 of ``run_pool_waves`` (H95); the defaults
+        are the step before H95."""
         import torch
 
         from sglang.srt.layers.moe.expert_pool_device import copy_rows, step
@@ -4248,7 +4454,10 @@ class MoEExpertOffloadCache:
         clock = collective_clock()
         armed = clock.armed
         with clock.span("pool.step") if armed else nullcontext():
-            step(self._pool_tables, flat, self._pool_buffers)
+            if spill or waves != 1:
+                step(self._pool_tables, flat, self._pool_buffers, spill=spill, waves=waves)
+            else:
+                step(self._pool_tables, flat, self._pool_buffers)
         with clock.span("pool.fetch") if armed else nullcontext():
             copy_rows(
                 self._pool_srcs,
@@ -7111,6 +7320,11 @@ def presplit_expert_offload_after_repack(
     buf_slots = plan.buffer_slots
     static = plan.is_static_layout
     store_rows = _expert_store_rows_for(layer, plan)
+    # H95c: X seat rows behind the [R+C] bank on D's attention host (0 = off,
+    # byte-identical: the allocation below is the one of H95 B)
+    from sglang.srt.weg2 import d_seat_vram as _seat_vram
+
+    _seat_x = _seat_vram.presplit_seat_rows(layer)
     if store_rows is not None:
         layer._moe_offload_store_index = dict(store_rows[4])
 
@@ -7129,10 +7343,18 @@ def presplit_expert_offload_after_repack(
         # repack around it runs outside (ct-stream-presplit, fnFL2x2).
         from sglang.srt.managers.weg2_memory_saver import back_into_tag_pool
 
-        with back_into_tag_pool():
-            buf = torch.empty(
-                (buf_slots,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device
-            )
+        with back_into_tag_pool() as _in_tag_pool:
+            if _seat_x > 0:
+                # H95c: [R+C+X] rows, their pages trimmed to the cap form
+                # (rows [0, R+C)) before anything is written into them
+                buf = _seat_vram.seat_expert_buffer(
+                    rows=buf_slots, extra=_seat_x, tail=tuple(t.shape[1:]),
+                    dtype=t.dtype, device=t.device, in_tag_pool=bool(_in_tag_pool),
+                    name="layer %s %s" % (getattr(layer, "layer_id", "?"), attr))
+            else:
+                buf = torch.empty(
+                    (buf_slots,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device
+                )
         # Spill -> pinned host; the GPU [E] stack is then freed. The static
         # plan is two contiguous slices, exactly as before; a #394 plan gathers
         # the rows the plan names (whole experts on dim 0 either way).
@@ -7299,6 +7521,8 @@ def presplit_expert_offload_after_repack(
 
     if presplit:
         layer._moe_offload_presplit = presplit
+        if _seat_x > 0:
+            layer._weg2_seat_rows = int(_seat_x)
         layer._moe_offload_full_experts = int(E)
         if not static:
             # Same publication contract as the #123-GGUF half: the buffers are

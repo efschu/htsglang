@@ -79,6 +79,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
 )
 from sglang.srt.model_executor.runner import graph_replay_census
+from sglang.srt.layers.moe import pool_demand_probe
 from sglang.srt.model_executor.runner import post_replay_hook
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.utils.collective_clock import collective_clock
@@ -2482,6 +2483,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # fnFL2x46: the first verify replay of a new request dies, one
             # after an eager round lives -- census the inputs it reads.
             graph_replay_census.maybe_census(self, forward_batch)
+            # H95: the pool's per-step demand, every N replays (off: one int test)
+            pool_demand_probe.maybe_report(self.model_runner.model)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
             # fnFL2 H69: host work the caller parked for "right after the
             # launch" (the verify round's PLE stage, gated on the device);
