@@ -324,6 +324,12 @@ class ModelProfile:
     #: NF H34b warm min-dwell (SGLANG_WEG2_ENABLE_WARM_MIN_DWELL); the 27B metal
     #: priced K7 with the last same-direction flip.
     warm_min_dwell: bool
+    #: 27B #49 agent span on the front (SGLANG_WEG2_ENABLE_AGENT_SPAN, NF P49
+    #: c1988ff84f): tools priced first, a D serve holds its prompt_tokens for
+    #: its epoch, prefix priced in measured tokens. Operator 26.09.: the 27B
+    #: line ran it unswitched since RC9 (S7c); NF off until the NF seat
+    #: releases it with a boot tag.
+    agent_span: bool
     vision: str
     context_tokens: int
     records: RecordKey
@@ -348,6 +354,7 @@ class ModelProfile:
         out["SGLANG_WEG2_STORE_SHORT_TAIL"] = bool(self.store_short_tail)
         out["SGLANG_WEG2_BIGRAM_ANCHOR_EXACT"] = bool(self.bigram_anchor_exact)
         out["SGLANG_WEG2_ENABLE_WARM_MIN_DWELL"] = bool(self.warm_min_dwell)
+        out["SGLANG_WEG2_ENABLE_AGENT_SPAN"] = bool(self.agent_span)
         return out
 
     def constant(self, name: str) -> object:
@@ -451,6 +458,7 @@ PROFILES: Dict[str, ModelProfile] = {
         store_short_tail=True,
         bigram_anchor_exact=False,
         warm_min_dwell=False,
+        agent_span=True,
         vision="transient",
         context_tokens=262144,
         # OPERATOR 26.09. (UN4): the 27B-RC9 records count on this tree as a
@@ -512,6 +520,8 @@ PROFILES: Dict[str, ModelProfile] = {
         store_short_tail=False,
         bigram_anchor_exact=True,
         warm_min_dwell=True,
+        # NF P49: off until the NF seat releases #49 with a boot tag
+        agent_span=False,
         vision="off",
         context_tokens=262144,
         records=RecordKey(fields=("checkpoint", "form", "power_limit")),
@@ -546,7 +556,8 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: of 26.09. -- every 27B profile set 1), SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD (H81; the 27B alias
 #: SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE is read in environ.py), the four NF
 #: tail switches (``end_anchor``), SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS
-#: (``mamba_anchor``), SGLANG_WEG2_DRAFT_SHARE_EMBED (``draft.share_embed``).
+#: (``mamba_anchor``), SGLANG_WEG2_DRAFT_SHARE_EMBED (``draft.share_embed``),
+#: SGLANG_WEG2_ENABLE_AGENT_SPAN (``agent_span``, #49; operator 26.09.).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }

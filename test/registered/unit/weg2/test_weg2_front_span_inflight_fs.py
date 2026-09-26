@@ -55,6 +55,9 @@ X = 4096
 
 
 def _on(monkeypatch, inflight=True):
+    # the #49 rest builds on #49 (SGLANG_WEG2_ENABLE_AGENT_SPAN, on for the
+    # qwen27b profile since the operator decision of 26.09.)
+    monkeypatch.setenv("SGLANG_WEG2_ENABLE_AGENT_SPAN", "1")
     if inflight:
         monkeypatch.setenv("SGLANG_WEG2_FRONT_SPAN_INFLIGHT", "1")
     else:

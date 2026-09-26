@@ -1030,6 +1030,18 @@ class Envs:
     # nextflash on (its metal), qwen27b off (upstream keying, the 27B metal);
     # on without a form (the NF code default).
     SGLANG_WEG2_BIGRAM_ANCHOR_EXACT = EnvBool(_profile_default("SGLANG_WEG2_BIGRAM_ANCHOR_EXACT", True))
+    # #49 (27B 196f6a8f57, S7c) behind a switch -- NF P49 c1988ff84f: agent
+    # turns priced so that a short tail on a prefix D already holds stays on D.
+    # On = (A) request_text renders tools FIRST (the Qwen3.8/Flash-Next template
+    # order), (B) a 200 D serve records prompt_tokens as held for that epoch
+    # while D is awake and serving, (C) a credited prefix is priced by its
+    # measured prompt_tokens, only the unmatched tail by chars/3. The law is
+    # unchanged: an uncached rest above X still routes LONG. Off = the pre-#49
+    # pricing (NF rc2.1l + H100). Default per profile (weg2/form.py
+    # ModelProfile.agent_span, operator 26.09.): qwen27b on (its line ran #49
+    # unswitched since RC9), nextflash off until the NF seat releases it with a
+    # boot tag; off without a form (the NF code default).
+    SGLANG_WEG2_ENABLE_AGENT_SPAN = EnvBool(_profile_default("SGLANG_WEG2_ENABLE_AGENT_SPAN", False))
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     # Weight loader: read safetensors tensors with pread() instead of mmap
     # page faults (ZFS: ~0.5 GB/s per rank through mmap, ~3 GB/s through
