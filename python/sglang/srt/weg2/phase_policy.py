@@ -172,9 +172,62 @@ def park_reason(bound_s: float) -> str:
     return f"wait-bound-{float(bound_s):g}s"
 
 
-def park_body(epoch: int, bound_s: float) -> dict:
-    """The park request: ``{"epoch": <int>, "reason": "wait-bound-60s"}``."""
-    return {"epoch": int(epoch), "reason": park_reason(bound_s)}
+#: 27B PARK (user 26.09.): the reason an immediate park names on the wire.
+PARK_REASON_IMMEDIATE = "immediate-over-x"
+
+
+def park_body(epoch: int, bound_s: float, reason: Optional[str] = None) -> dict:
+    """The park request: ``{"epoch": <int>, "reason": "wait-bound-60s"}``
+    (``reason`` given: that string, e.g. :data:`PARK_REASON_IMMEDIATE`)."""
+    return {"epoch": int(epoch), "reason": reason or park_reason(bound_s)}
+
+
+# ---------------------------------------------------------------------------
+# 27B PARK (user decision 26.09. ~19:00Z, memory d2p-sofort-flippen-und-x-
+# exakt-0926): "Wartegrenze 0". A request whose PENDING tokens exceed X while D
+# decodes parks D's running decodes at once and the front flips to P -- no
+# 60 s bound, no waiting for D's decodes to end. Only a request that NEEDS P
+# fires it: one D could serve itself once idle (a SHORT behind D's budget, a
+# band request the RC7-X busy/idle split deferred, a SHORT-only backlog the
+# 27B idle policy (b) drains) never does -- for those no flip is due at all.
+# ---------------------------------------------------------------------------
+
+def needs_p(est_uncached: int, x_tokens: int, *, skip_leg1: bool = False,
+            leg1_done: bool = False, p_only: bool = False, x_requeues: int = 0) -> bool:
+    """Does this queued request need P's prefill (the immediate park's
+    trigger)? ``est_uncached > X`` (law 4: D never prefills above X), a
+    P-only request (an image under transient vision, long by rule), or one D
+    already refused as over X (W31, ``x_requeues``). Never a request whose
+    leg 1 is done (it waits for D, not for P) or that skips leg 1 (route
+    CARRIER-EXCEEDS: D prefills it once, a flip to P buys nothing)."""
+    if skip_leg1 or leg1_done:
+        return False
+    if p_only or int(x_requeues or 0) > 0:
+        return True
+    return int(est_uncached) > int(x_tokens)
+
+
+def immediate_park_trigger(queue: Iterable, x_tokens: int):
+    """The first queued request (head first) that :func:`needs_p`, or None.
+    Reads ``Pending``'s own fields by name (getattr: partial test doubles)."""
+    for p in queue:
+        if needs_p(int(getattr(p, "est_uncached", 0) or 0), x_tokens,
+                   skip_leg1=bool(getattr(p, "skip_leg1", False)),
+                   leg1_done=bool(getattr(p, "leg1_done", False)),
+                   p_only=bool(getattr(p, "p_only", False)),
+                   x_requeues=int(getattr(p, "x_requeues", 0) or 0)):
+            return p
+    return None
+
+
+def immediate_park_dwell_ok(awake_s: float, min_dwell_ms: float, floor_ms: float) -> bool:
+    """The immediate park pre-empts D like the fairness bound does, so it
+    keeps the fairness bound's floor (weg2xsn291: never leave a group that
+    woke 200 ms ago) AND the derived min-dwell (K7: a D phase lasts at least
+    the price of the flip that started it) -- the parked decodes get that
+    much decode per D phase, so a stream of long arrivals cannot starve them
+    to zero progress. Both are inputs: the front owns the clock and K7."""
+    return float(awake_s) * 1000.0 >= max(float(min_dwell_ms), float(floor_ms))
 
 
 def park_verdict(status: int, text: str) -> Tuple[str, List[str], str]:

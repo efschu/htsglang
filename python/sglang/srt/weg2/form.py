@@ -361,6 +361,16 @@ class ModelProfile:
     #: the 27B census (weg2xsn246: 1622 MiB on the 5090) is below every 27B D
     #: residue record (2074-2150 MiB), so taking it would under-reserve D.
     d_residue_census: bool = False
+    #: 27B PARK (user decision 26.09. ~19:00Z, memory d2p-sofort-flippen-und-
+    #: x-exakt-0926): D->P waits for nothing. A queued request whose pending
+    #: tokens exceed X while D decodes parks D's running decodes at once (the
+    #: H91b flip park, POST /weg2/park_running) and the front flips to P; the
+    #: parked ones resume first after the flip back. Only the FLIP park -- the
+    #: pressure park, D seats and the MTP draft carry stay with
+    #: ``standard_form``. qwen27b off until a metal boot measures it (then the
+    #: operator turns the row on); nextflash off (its wait bound is the NF
+    #: seat's). Switch SGLANG_WEG2_D_PARK_IMMEDIATE (explicit value wins).
+    d_park_immediate: bool = False
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -378,6 +388,7 @@ class ModelProfile:
         out["SGLANG_WEG2_STANDARD_FORM"] = bool(self.standard_form)
         out["SGLANG_WEG2_D_PARK"] = bool(self.standard_form)
         out["SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV"] = bool(self.standard_form)
+        out["SGLANG_WEG2_D_PARK_IMMEDIATE"] = bool(self.d_park_immediate)
         # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
         # installed Form A role plan at run time).
         out["SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW"] = self.d_layout == "qsa_forma"
@@ -502,6 +513,9 @@ PROFILES: Dict[str, ModelProfile] = {
         prefill_transient_checkpoints=(),
         constants=_QWEN27B_CONSTANTS,
         d_residue_census=False,
+        # 27B park (user 26.09.): OFF until measured on the metal under agent
+        # load (profiles/27b-park-draft.env turns it on per env).
+        d_park_immediate=False,
     ),
     PROFILE_NEXTFLASH: ModelProfile(
         id=PROFILE_NEXTFLASH,
@@ -566,6 +580,8 @@ PROFILES: Dict[str, ModelProfile] = {
         prefill_transient_checkpoints=("Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",),
         constants=_NEXTFLASH_CONSTANTS,
         d_residue_census=True,
+        # NF keeps its H91 wait bound (standard_form); the NF seat decides.
+        d_park_immediate=False,
     ),
 }
 
@@ -591,7 +607,8 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: SGLANG_WEG2_ENABLE_AGENT_SPAN (``agent_span``, #49; operator 26.09.),
 #: SGLANG_WEG2_STANDARD_FORM / SGLANG_WEG2_D_PARK /
 #: SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV (``standard_form``, NF H91),
-#: SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW (``d_layout`` qsa_forma, NF R12).
+#: SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW (``d_layout`` qsa_forma, NF R12),
+#: SGLANG_WEG2_D_PARK_IMMEDIATE (``d_park_immediate``, 27B park 26.09.).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }
@@ -744,6 +761,30 @@ def standard_form_state(environ: Optional[Mapping[str, str]] = None,
     if row is not None:
         return bool(row.standard_form), f"profile {row.id}"
     return True, "no form (NF code default)"
+
+
+#: 27B PARK (user 26.09.): the immediate D->P flip park. Explicitly set it wins;
+#: unset = the profile's ``d_park_immediate``; no form = off.
+D_PARK_IMMEDIATE_ENV = "SGLANG_WEG2_D_PARK_IMMEDIATE"
+
+
+def d_park_immediate_state(environ: Optional[Mapping[str, str]] = None,
+                           profile: Optional[str] = None) -> Tuple[bool, str]:
+    """``(on, source)`` of the immediate D->P flip park: an explicit
+    SGLANG_WEG2_D_PARK_IMMEDIATE ("env ..."), else the registry row of
+    ``profile`` (or of the published form's profile), else off ("no form")."""
+    env = os.environ if environ is None else environ
+    raw = env.get(D_PARK_IMMEDIATE_ENV)
+    if raw is not None and str(raw).strip():
+        return (str(raw).strip().lower() in _ON_WORDS,
+                f"env {D_PARK_IMMEDIATE_ENV}={str(raw).strip()}")
+    if profile is None:
+        form = current_form(environ)
+        profile = form.profile if form is not None else None
+    row = profile_row(profile)
+    if row is not None:
+        return bool(row.d_park_immediate), f"profile {row.id}"
+    return False, "no form (off)"
 
 
 def profile_switch_default(name: str, fallback, environ: Optional[Mapping[str, str]] = None):
