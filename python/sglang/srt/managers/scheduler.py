@@ -795,6 +795,68 @@ def _weg2_store_short_recompute(sched, req, reason: str, span) -> Optional[str]:
     return "expired"
 
 
+def _weg2_pp_producer_awake(sched) -> bool:
+    """TK: a PP (prefill) group that is awake -- the wake's release and the
+    post-wake settle, not the sleep's #1456 top-up. A module function so no
+    curated stand-in can miss it (see ``_weg2_windowed_path``)."""
+    try:
+        pp = int(getattr(getattr(sched, "ps", None), "pp_size", 1) or 1)
+    except (TypeError, ValueError):
+        return False
+    return pp > 1 and not bool(getattr(sched, "weg2_dormant", False))
+
+
+def _weg2_producer_wake_verdict(sched, req) -> str:
+    """TK (agent-turn boots): the #1471 wake verdict on group P.
+
+    P is the PRODUCER of what the store lacks: a read that ended short of the
+    prompt is a partial hit, and the remainder is P's own prefill (the #1400
+    note in ``_weg2_note_store_shortfall`` already answers None on PP for
+    this reason). The #1471 settle still parked such a request once its first
+    hold read had answered zero (``_1471_short``) and re-read it every 2 s
+    until the 20-s bound -- on an agent turn (prompt = the store's prefix +
+    the new turn) that is every turn, 20 s each, and PP0's told waited with it.
+
+    Here: never park ("complete"). A read still in flight joins the queue as
+    it is -- the told publish / the prefetch gate wait for its termination
+    anyway. A terminated read that answered ZERO gets ONE final re-read of
+    what the store holds now (no 2-s clock), with the told form's plan
+    (``weg2_store_told.refetch_plan``: a follower only the told span, PP0
+    only before publishing); only on a tp_size 1 stage, where the read is no
+    collective (xsn296). Group D (pp_size 1) never comes here."""
+    rid = req.rid
+    if not sched.tree_cache.check_prefetch_progress(rid):
+        req._1471_short = False
+        return "complete"
+    plan = weg2_store_told.refetch_plan(sched, req)
+    req._1471_short = False
+    if plan == weg2_store_told.REFETCH_SKIP or getattr(req, "_tk_wake_reread", False):
+        return "complete"
+    records = getattr(getattr(sched, "tree_cache", None), "prefetch_loaded_tokens_by_reqid", None) or {}
+    have = records.get(str(rid))
+    span = int(getattr(req, "_prefetch_span_tokens", 0) or 0)
+    zero = (have is not None and span > 0
+            and int(getattr(have, "materialized", have) or 0) == 0)
+    tp = int(getattr(getattr(sched, "ps", None), "tp_size", 1) or 1)
+    if not zero or tp != 1:
+        return "complete"
+    req._tk_wake_reread = True
+    clear = getattr(sched, "_clear_prefetch_deferral_fields", None)
+    if clear is not None:
+        clear(req)
+    if plan is None:
+        verdict = sched._prefetch_kvcache(req)
+    else:
+        verdict = sched._prefetch_kvcache(req, limit_tokens=int(plan))
+    n = getattr(sched, "_tk_wake_reread_n", 0) + 1
+    sched._tk_wake_reread_n = n
+    if n <= 8 or n % 64 == 0:
+        logger.info("#TK WAKE-REREAD rid=%s span=%d verdict=%s (n=%d): the hold read "
+                    "answered zero; one final read of the store at the wake, no park "
+                    "(P computes what the store lacks)", str(rid)[:12], span, verdict, n)
+    return "complete"
+
+
 def _weg2_store_tail_settles(sched, req) -> bool:
     """#1324 x #1471 (weg2rc2): a request parked at the wake whose SHORT store
     read leaves a remainder within X is SETTLED -- D prefills the remainder (the
@@ -5269,6 +5331,9 @@ class Scheduler(
         """#1456/#1471: one held request's read -- "reading" (still in
         flight), "complete" (whole prefix on the host), "wait" (short, but
         re-issued less than 2 s ago), "reissued" (short, re-read now)."""
+        if _weg2_pp_producer_awake(self):
+            # TK: group P after the wake is the PRODUCER -- never parked.
+            return _weg2_producer_wake_verdict(self, req)
         if not self.tree_cache.check_prefetch_progress(req.rid):
             return "reading"
         reason = self._weg2_note_store_shortfall(req)
