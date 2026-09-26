@@ -708,6 +708,21 @@ VISION_MODE_RESIDENT = "resident"
 VISION_MODE_TRANSIENT = "transient"
 VISION_MODES = (VISION_MODE_OFF, VISION_MODE_RESIDENT, VISION_MODE_TRANSIENT)
 
+#: xsn438 (2026-09-24, 27B ed6630d6c2; H125 on NF): the D->P latch for
+#: requests only group P can serve.
+VISION_FLIP_URGENT_ENV = "SGLANG_WEG2_VISION_FLIP_URGENT"
+
+
+def vision_flip_urgent(env=None) -> bool:
+    """``SGLANG_WEG2_VISION_FLIP_URGENT=1``: a queued request that ONLY P can
+    serve (an image under ``--weg2-vision transient``, see ``Pending.p_only``)
+    satisfies the D->P flip-economics latch on its own. Default off = the
+    pre-xsn438 latch, under which such a request waits for X* of text or for
+    the fairness switch (weg2xsn438: 45 s)."""
+    src = os.environ if env is None else env
+    raw = src.get(VISION_FLIP_URGENT_ENV, "0")
+    return str(raw if raw is not None else "0").strip().lower() in ("1", "true", "yes", "on")
+
 #: verdicts of :func:`vision_verdict`
 VERDICT_ROUTE = "route"
 VERDICT_STAGE = "stage"
@@ -2180,6 +2195,13 @@ class Pending:
     #: the ``WEG2-FLIP done`` that ends the wait, then cleared. Instrument
     #: only -- nothing routes, admits or flips on it.
     dp_arrival: Optional[_dp_wait.DpArrival] = None
+    #: xsn438: only group P can serve this request -- an image under
+    #: ``--weg2-vision transient`` (W102): its embeddings are attached on P's
+    #: PP0 and D carries no tower. Its route is ``long`` by RULE, not by
+    #: length, so ``est_uncached`` (its text) says nothing about whether D
+    #: could take it. Read by ``_flip_economics_ok`` under
+    #: SGLANG_WEG2_VISION_FLIP_URGENT.
+    p_only: bool = False
 
 
 class Seat:
@@ -2581,6 +2603,19 @@ class Front:
         # by name, because the one verdict a wrong mode must never reach is
         # `route`.
         self.vision = str(vision or VISION_MODE_OFF)
+        # xsn438: resolved once and named once -- a switch that changes the
+        # D->P latch must be readable off the front log, not inferred.
+        self.vision_flip_urgent = vision_flip_urgent()
+        # H125: named only on a boot that serves images -- a text-only front
+        # (`off`, the default) logs exactly what it logged before.
+        if self.vision == VISION_MODE_TRANSIENT or self.vision_flip_urgent:
+            logger.info(
+                "WEG2 VISION-FLIP-URGENT %s (%s=%r, default off; vision=%s): %s",
+                "on" if self.vision_flip_urgent else "off", VISION_FLIP_URGENT_ENV,
+                os.environ.get(VISION_FLIP_URGENT_ENV), self.vision,
+                "a queued request only P can serve satisfies the D->P latch on its own"
+                if self.vision_flip_urgent else
+                "such a request waits for X* of queued work or the fairness switch")
         self.admin_key_file = admin_key_file or ""
         self.admin_key = admin_key_mod.read(admin_key_file) if admin_key_file else None
         self.groups = {"P": Group("P", prefill.rstrip("/"), prefill_sid), "D": Group("D", decode.rstrip("/"), decode_sid)}
@@ -3673,6 +3708,7 @@ class Front:
             "x_tokens": self.tp_prefill_max_tokens,
             "flip_min_work_tokens": self.flip_min_work_tokens,
             "x_flip_s": self.x_flip_s_provenance(),
+            "vision_flip_urgent": bool(getattr(self, "vision_flip_urgent", False)),
         }
 
     async def handle_passthrough_get(self, request: web.Request) -> web.Response:
@@ -4022,7 +4058,10 @@ class Front:
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt,
                         est_uncached=remainder, span_known=known,
-                    store_span_est=store_span)
+                    store_span_est=store_span,
+                    # xsn438: routed `long` by the W102 rule above, not by
+                    # length -- only P can serve it (Pending.p_only).
+                    p_only=_verdict == VERDICT_STAGE)
         self.queue.append(p)
         self._dp_mark(p, "long" if route == "long" else "batch")  # R28
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
@@ -6513,7 +6552,19 @@ class Front:
         queued_uncached = sum(int(p.est_uncached) for p in self.queue)
         queued_tokens = sum(int(p.est_prompt) for p in self.queue)
         threshold = self.flip_min_work_tokens
-        ok = queued_uncached >= threshold or fairness_fired or not self.admit_d
+        # xsn438: WORK D CAN NEVER DO IS NOT PRICED AGAINST D DOING IT. A
+        # P-only request (an image under transient, W102) is `long` by rule,
+        # not by length, and `est_uncached` counts only its text -- xsn438
+        # held `queued_uncached=35 threshold=4096` for 45 s until the fairness
+        # switch. Under SGLANG_WEG2_VISION_FLIP_URGENT it counts as
+        # flip-worthy on its own, like a long text request. NOT a pre-emption:
+        # this latch is only asked once D's work is exhausted or fairness
+        # closed D, the dwell latch still holds, and P still drains the whole
+        # backlog. Default off = the verdict below is the pre-H125 one.
+        p_only = sum(1 for p in self.queue if getattr(p, "p_only", False))
+        urgent_on = bool(getattr(self, "vision_flip_urgent", False))
+        p_only_urgent = urgent_on and p_only > 0
+        ok = queued_uncached >= threshold or fairness_fired or not self.admit_d or p_only_urgent
 
         # THE STRANDED-DECODE TERM, REPORTED AND NEVER A VETO. Every decode
         # resident on D stops for the whole P phase; the user accepted unbounded
@@ -6533,13 +6584,18 @@ class Front:
         except Exception:  # noqa: BLE001 - a report may never break the verdict
             stranded, oldest = -1, -1.0
 
+        # H125: the two vision fields only on a boot that serves images; a
+        # text-only front (`off`, the default) prints the pre-H125 line.
+        _vis = str(getattr(self, "vision", VISION_MODE_OFF)) == VISION_MODE_TRANSIENT or urgent_on
         logger.info(
             "WEG2 FLIP-ECONOMICS queued_uncached=%d queued_tokens=%d threshold=%d "
             "(X*, amortising 2*flip_s once over the backlog) fairness=%s "
-            "stranded_decodes=%d oldest_wait_s=%.1f verdict=%s "
+            + ("p_only=%d vision_flip_urgent=%s " if _vis else "%s%s")
+            + "stranded_decodes=%d oldest_wait_s=%.1f verdict=%s "
             "(stranded is REPORTED, never a veto -- unbounded decode wait under a "
             "prefill stream is accepted; -1 means the census could not be taken)",
             queued_uncached, queued_tokens, threshold, fairness_fired,
+            *((p_only, urgent_on) if _vis else ("", "")),
             stranded, oldest, "flip" if ok else "hold",
         )
         return ok
