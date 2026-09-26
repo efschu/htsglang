@@ -4914,6 +4914,16 @@ class Front:
         else:
             p.fut = asyncio.get_event_loop().create_future()
             p.t_arrive = time.time()
+        # Review V A2: THE BACKLOG IS PRICED AT D's MEASURED EXTENT when D said
+        # it. D refused because its extent after match_prefix exceeded its
+        # riegel; the char estimate above can sit BELOW the live X (and so
+        # below flip_min_work_tokens, which follows X) -- FLIP-ECONOMICS then
+        # held the request on an idle D until the fairness bound (45 s), and
+        # the re-grant cannot take it (d_eligible False: it is P's). A
+        # measurement only ever RAISES the price; an unparsed refusal keeps
+        # the estimate (never a number invented here).
+        if d_extent is not None and int(d_extent) > int(p.est_uncached):
+            p.est_uncached = int(d_extent)
         if seat is not None:
             seat.release("W50_requeue")
         p.seat = None
