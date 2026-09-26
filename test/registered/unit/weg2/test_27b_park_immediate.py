@@ -489,8 +489,19 @@ def test_27b_front_parks_at_once_and_resumes_first(clean):
             assert await H._until(lambda: "gen:r1" in h.p.timeline, 20)
             took = asyncio.get_event_loop().time() - t_arr
             assert h.d.park_bodies == [{"epoch": epoch_d, "reason": "immediate-over-x"}]
-            assert H._first(h.d.timeline, "rpc:weg2/park_running") < \
-                H._first(h.d.timeline, "rpc:release_memory_occupation")
+            # B4 (review RV): the FIRST release in D's timeline may belong to an
+            # EARLIER flip -- the harness front starts awake=P with idle_layout D,
+            # so an idle P->D can land before r0 is posted and r0 (LONG) then pays a
+            # D->P flip of its own (release #1) before D ever decodes it. What must
+            # hold is the order around r0's decode: no D sleep between D starting
+            # r0 and the park, and D's next sleep after the park.
+            tl = h.d.timeline
+            i_gen = H._first(tl, "gen:r0")
+            i_park = H._first(tl, "rpc:weg2/park_running")
+            rel = [i for i, e in enumerate(tl) if e == "rpc:release_memory_occupation"]
+            assert i_gen < i_park, tl
+            assert not [i for i in rel if i_gen < i < i_park], tl   # never slept under r0 unparked
+            assert [i for i in rel if i > i_park], tl                # the park's own sleep follows
             assert not t0.done() and h.p.gen_marks.count("r0") == 1
             assert h.front.counters["park_immediate_fired"] == 1
             assert h.front.counters["wait_bound_fired"] == 0
