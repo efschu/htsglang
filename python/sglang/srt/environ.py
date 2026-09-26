@@ -329,6 +329,14 @@ class Envs:
     # flattened memory_stats() -- the same number without the Python flatten
     # (~0.7 ms per DFLASH round on D). Off = torch.cuda.max_memory_allocated().
     SGLANG_VRAM_PEAK_FAST_READ = EnvBool(False)
+    # INT8 W8A8 small-M GEMM on sm_120 (27b-int8tri 26.09.): route
+    # CompressedTensorsW8A8Int8.apply_weights through the Triton kernel with
+    # exact int32 split-K (layers/quantization/int8_sm120_triton.py) when the
+    # device is sm_120, M <= 16, bias-free bf16, and (N, K) is in the table
+    # measured on the 5090 (int8_mm_sweep 20260926T171511Z). Every other
+    # call, and every other device, stays on sgl_kernel.int8_scaled_mm.
+    # Off = the sgl call only, byte-identical.
+    SGLANG_INT8_SM120_TRITON = EnvBool(False)
 
     # Downgrade the draft-model unloaded-parameter check (#290/#318) from a
     # hard error to a log line. An unloaded drafter proposes noise, so this is
