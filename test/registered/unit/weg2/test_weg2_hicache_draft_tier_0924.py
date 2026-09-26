@@ -55,13 +55,16 @@ def _clean(monkeypatch):
         L._SPEC_FORM.update(saved)
 
 
-def _form(tmp_path, form="NEXTN", draft_on_p=False, cli="on"):
+def _form(tmp_path, form="NEXTN", draft_on_p=False, cli="on", produce="on"):
     """P's form as main leaves it: apply_spec_form, then H25's resolved
     draft_on_p (and HiCache enabled) installed beside resolve_draft_on_p.
-    ``cli`` is --draft-kv-on-p's value, which H25 overrules (default on)."""
+    ``cli`` is --draft-kv-on-p's value, which H25 overrules (default on).
+    ``produce`` is --dflash-produce-on-p (UNIFY S6, only read under DFLASH):
+    ``on`` keeps this file's NF-era meaning "a DFLASH producer on P computes";
+    ``off`` is the 27B standard form p_draft=cold (built, never asked)."""
     L.apply_spec_form(SimpleNamespace(
         spec_form=form, dflash_draft_path=str(tmp_path), dflash_block=8, dflash_window=2048,
-        draft_kv_on_p=cli))
+        draft_kv_on_p=cli, dflash_produce_on_p=produce))
     L._SPEC_FORM["draft_kv_on_p"] = bool(draft_on_p)
 
 
@@ -78,11 +81,17 @@ def test_the_producer_is_read_off_ps_form(tmp_path, monkeypatch):
         (("NEXTN", False), False),   # H25 standard form (Nutzer-Order 24.09. 08:25Z)
         (("NEXTN", True), True),     # the H25 A/B arm: P carries the MTP producer
         (("DFLASH", False), False),
-        (("DFLASH", True), True),    # NF has no --dflash-produce-on-p: it computes
+        (("DFLASH", True), True),    # --dflash-produce-on-p on: it computes
     ]
     for (form, dop), want in cases:
         _form(tmp_path, form, dop)
         assert L.p_group_has_draft_producer() is want, (form, dop)
+    # UNIFY S6: p_draft=cold (27B 2026-09-24) -- the DFlash producer is built
+    # on P but never asked, so P produces no draft pages.
+    _form(tmp_path, "DFLASH", True, produce="off")
+    assert L.p_group_has_draft_producer() is False
+    _form(tmp_path, "NEXTN", True, produce="off")  # only read under DFLASH
+    assert L.p_group_has_draft_producer() is True
     # Unresolved (desk, before main): the H25 env, never the CLI default "on".
     L.apply_spec_form(SimpleNamespace(spec_form="NEXTN", dflash_draft_path=str(tmp_path),
                                       dflash_block=8, dflash_window=2048, draft_kv_on_p="on"))
@@ -129,7 +138,9 @@ def test_spec_form_env_is_byte_identical_in_both_forms(tmp_path, monkeypatch):
     monkeypatch.delenv("SGLANG_WEG2_DFLASH_PLACEMENT", raising=False)
     for dop in (False, True):
         _form(tmp_path, form="DFLASH", draft_on_p=dop)
-        assert L.spec_form_env("P") == {}
+        # UNIFY S6: P's --dflash-produce-on-p switch rides P's env under DFLASH
+        # (always written), independent of draft_on_p.
+        assert L.spec_form_env("P") == {"SGLANG_WEG2_DFLASH_PRODUCE": "1"}
         assert L.spec_form_env("D") == {"SGLANG_DFLASH_WINDOW_POOL": "1"}
         _form(tmp_path, form="NEXTN", draft_on_p=dop)
         assert L.spec_form_env("P") == {} and L.spec_form_env("D") == {}

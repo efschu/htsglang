@@ -53,7 +53,10 @@ def test_dflash_form_is_byte_identical_on_both_groups_but_for_the_role(restore_f
     # default, no placement flag); solo is the explicit A/B opt-in below.
     assert d == ident + ["--speculative-draft-window-size", "2048"]
     assert L.spec_form_env("D") == {"SGLANG_DFLASH_WINDOW_POOL": "1"}
-    assert L.spec_form_env("P") == {}
+    # UNIFY S6 (27B 2026-09-24, user decision "P ohne draft rechnen", as on
+    # the 27B line): P's producer switch rides P's environment, default off
+    # (p_draft=cold). This pin read {} while the switch did not exist here.
+    assert L.spec_form_env("P") == {"SGLANG_WEG2_DFLASH_PRODUCE": "0"}
     assert L.spec_plan_fields() == {
         "speculative_algorithm": "DFLASH",
         "speculative_num_draft_tokens": 8,

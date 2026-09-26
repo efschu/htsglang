@@ -361,8 +361,13 @@ PROFILES: Dict[str, ModelProfile] = {
         draft=Draft(kind="dflash2", block=8, window=2048,
                     path="/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
                     park="card", share_embed=False),
-        # --dflash-produce-on-p off (c60a5d387f); the flag comes with Schritt 6
-        p_draft="none",
+        # UNIFY S6: cold = --dflash-produce-on-p off (c60a5d387f, 27B user
+        # decision 2026-09-24 "P ohne draft rechnen ... layer kalt dort
+        # liegen"): P builds the DFlash producer and computes nothing. The
+        # S3 row said "none", which is NOT what the 27B line builds (the
+        # producer stays on P's last stage; draft.park=card). Read by the
+        # p_draft writer as the default when no flag/env states it.
+        p_draft="cold",
         replayssm=True,
         ple=False,
         attn="full",
@@ -848,6 +853,37 @@ def _apply_stated_p_draft(ns, words: Sequence[str], sources: Dict[str, str]) -> 
     sources["p_draft"] = f"--form-p-draft {stated}"
 
 
+def _resolve_draft_on_p_once(ns, words: Sequence[str], profile: str,
+                             rule: Callable[..., Tuple[bool, str]],
+                             env: Tuple[bool, bool], sources: Dict[str, str]) -> None:
+    """UNIFY S6: the producer half of ``p_draft``, decided once (see
+    :func:`resolve_form`). A stated ``--form-p-draft`` is the operator's word
+    and outranks the H25 default; an explicit env that contradicts it is
+    refused by name."""
+    env_set, env_value = bool(env[0]), bool(env[1])
+    stated = getattr(ns, "form_p_draft", None)
+    if stated:
+        on = stated != "none"
+        if env_set and env_value != on:
+            _refuse(
+                f"--form-p-draft {stated} contradicts the EXPLICIT SGLANG_WEG2_DRAFT_ON_P="
+                f"{'1' if env_value else '0'} (both name whether group P carries a draft "
+                "producer; drop one of them)"
+            )
+        why = f"--form-p-draft {stated}"
+    else:
+        row = profile_row(profile)
+        default_on = row is not None and row.p_draft != "none"
+        on, why = rule(
+            str(getattr(ns, "draft_kv_on_p", "on")),
+            flag_given(words, "--draft-kv-on-p"),
+            env_set, env_value, default_on,
+        )
+    ns.draft_kv_on_p = "on" if on else "off"
+    ns.weg2_draft_on_p = (bool(on), why)
+    sources["p_draft"] = why if on else f"no producer on P: {why}"
+
+
 def resolve_form(
     ns,
     argv_words: Sequence[str],
@@ -855,12 +891,29 @@ def resolve_form(
     parse_group_env: Callable[[str], Dict[str, str]],
     shlex_split: Callable[[str], List[str]],
     arch_probe: Callable[[str], Tuple[Optional[str], str]] = checkpoint_arch,
+    draft_on_p_rule: Optional[Callable[..., Tuple[bool, str]]] = None,
+    draft_on_p_env: Tuple[bool, bool] = (False, False),
 ) -> Weg2Form:
     """THE resolver. Called ONCE by ``launcher.main`` right after parsing and
     BEFORE ``apply_spec_form`` (``--form-draft``/``--form-p-draft`` may write
     ``ns.spec_form``/``ns.draft_kv_on_p``/``ns.dflash_produce_on_p``).
 
     Raises :class:`Weg2FormContradiction` (W140) by name; never guesses.
+
+    UNIFY S6 -- THE ONE WRITER OF ``p_draft``. With ``draft_on_p_rule`` (the
+    launcher's H25 ``resolve_draft_on_p``, injected like ``parse_group_env``;
+    ``draft_on_p_env`` = ``(SGLANG_WEG2_DRAFT_ON_P is set, its value)``) the
+    question "does group P carry a draft producer" is answered HERE, once:
+    ``--form-p-draft`` > SGLANG_WEG2_DRAFT_ON_P (explicit) > ``--draft-kv-on-p``
+    / the profile row's ``p_draft`` (nextflash ``none``: H25, an explicit
+    ``--draft-kv-on-p on`` is overruled unless the env says 1; qwen27b
+    ``cold``: the producer stays on P). The answer is written back into
+    ``ns.draft_kv_on_p`` and ``ns.weg2_draft_on_p`` = ``(bool, provenance)``,
+    which the launcher reads instead of resolving a second time. Under DFLASH
+    ``--dflash-produce-on-p`` (default off) picks ``cold`` or ``compute``.
+    ``SGLANG_WEG2_DRAFT_ON_P`` and ``--dflash-produce-on-p`` are thereby
+    ALIASES of the axis, never second writers. Without the rule (a desk
+    caller) the resolver stays a pure reader of ``ns``, as before.
     """
     words = list(argv_words)
     profile = str(getattr(ns, "profile", PROFILE_QWEN27B) or PROFILE_QWEN27B)
@@ -877,6 +930,8 @@ def resolve_form(
     sources: Dict[str, str] = {}
     _apply_stated_draft(ns, words, sources)
     _apply_stated_p_draft(ns, words, sources)
+    if draft_on_p_rule is not None:
+        _resolve_draft_on_p_once(ns, words, profile, draft_on_p_rule, draft_on_p_env, sources)
 
     model = str(getattr(ns, "model", "") or "")
     extra_p = shlex_split(str(getattr(ns, "extra_p", "") or ""))
@@ -926,7 +981,12 @@ def resolve_form(
         why = f"--dflash-produce-on-p {'on' if produce else 'off'}"
     else:
         p_draft, why = "compute", "NEXTN producer on P (--draft-kv-on-p on)"
-    sources.setdefault("p_draft", why)
+    if hicache_disabled or "p_draft" not in sources:
+        sources["p_draft"] = why
+    elif draft == "dflash" and p_draft in ("compute", "cold"):
+        # UNIFY S6: the producer half came from the one writer; name the
+        # cold/compute half too.
+        sources["p_draft"] = f"{sources['p_draft']}; {why}"
 
     kv, kv_src = derive_kv(extra_d)
     sources["kv"] = kv_src

@@ -2603,6 +2603,17 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    # DFLASH-PRODUCE-ON-P (27B user decision 2026-09-24: "P ohne draft
+    # rechnen"; UNIFY S6: the p_draft axis cold = 0 / compute = 1): 0 = group P
+    # still BUILDS its DFlash draft-KV producer on the last PP stage (the draft
+    # bytes stay cold-resident: same VRAM, same planner cut, same exchange
+    # census and flip) but COMPUTES nothing with it -- no aux hidden capture on
+    # any PP stage, no DFlashDraftKvProducer.produce(), no
+    # publish_draft_rows_direct. Group D is unchanged and finds no draft pages
+    # (its existing cold path). The weg2 launcher always sets it on group P
+    # under --spec-form DFLASH (--dflash-produce-on-p, default off -> 0).
+    # Unset = 1 = the producer form as before (non-launcher boots).
+    SGLANG_WEG2_DFLASH_PRODUCE = EnvBool(True)
     # fnFL2 H1b: a NEXTN/MTP draft that shares the target's embed_tokens /
     # lm_head MODULES builds no vocab table of its own (placeholders, replaced
     # by init_lm_head). 0 restores the old form: both tables built in the
