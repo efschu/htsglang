@@ -190,6 +190,13 @@ class TestSegmentPlanner(unittest.TestCase):
                                     float(r.split("wake-seg mlp")[1].split("%")[0]) - 1e-9)
         self.assertIn("No segment speed table",
                       D.seg_speed_advisory_lines(D._QWEN38_27B, "gguf", (58, 25, 25), (1, 1, 1), 3, None)[0])
+        # PL x SB seam (dwin merge): the mixin passes current_power_w to BOTH objectives.
+        self.assertIn("cards run unknown", lines[0])
+        pw = D.seg_speed_advisory_lines(D._QWEN38_27B, "compressed-tensors", (58, 25, 25),
+                                        partition_units(1088, [58, 25, 25]), 1088, (26, 19, 19),
+                                        current_power_w=[400.0, 230.0, None])
+        self.assertIn("cards run 400/230/NAW", pw[0])
+        self.assertEqual(pw[1:], lines[1:])
 
 
 class TestDefaultUnchanged(unittest.TestCase):

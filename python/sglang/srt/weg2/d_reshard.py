@@ -1156,11 +1156,17 @@ def objective_from_env(env: Optional[Mapping[str, str]] = None) -> str:
 
 def seg_speed_advisory_lines(text_cfg: Mapping, quant_method: Optional[str], base: Sequence[int],
                              current_mlp: Sequence[int], mlp_units: int,
-                             token_vector: Optional[Sequence[int]]) -> List[str]:
+                             token_vector: Optional[Sequence[int]],
+                             current_power_w: Optional[Sequence[Optional[float]]] = None) -> List[str]:
     """D-SPEED under objective 'segment': per ladder point the segment-optimal
     MLP vector, its gain against the RUNNING vector, and the robust wake-seg
     vector's gain.  Candidates take the capacity token share their vector would
-    install (rc9 base only); otherwise the installed token vector for all."""
+    install (rc9 base only); otherwise the installed token vector for all.
+
+    ``current_power_w``: the same keyword speed_advisory_lines takes (row 27, the
+    kv-cache mixin passes it to whichever objective is active).  The segment
+    constants carry no calibration power limit, so the header only NAMES the limit
+    the cards run under; no MISMATCH check (nothing to compare against)."""
     n = len(base)
     head = "uneven DCP: KV sum is conserved when MLP units move (token vector follows capacity)"
     fmt = advisory_format(quant_method)
@@ -1193,7 +1199,8 @@ def seg_speed_advisory_lines(text_cfg: Mapping, quant_method: Optional[str], bas
              f"D segment speed optima (HOCHRECHNUNG, weg2/d_reshard objective=segment, fmt={fmt}{tag}, "
              f"base={','.join(map(str, base))}, running mlp={','.join(map(str, cur))}, "
              f"--d-reshard wake-seg takes mlp={','.join(map(str, wake))}, worst loss vs per-point "
-             f"optimum {100.0 * worst:.1f}%):"]
+             f"optimum {100.0 * worst:.1f}%; calibration power limit not recorded, "
+             f"cards run {power_tag(current_power_w) if current_power_w else 'unknown'}):"]
     for p in points:
         t_cur = seg_ms_of(fmt, cur, p, cal=cal, geom=geom, token_share=ts)
         v_best, t_best = seg_best(fmt, p, mlp_units, geom=geom, token_share=ts)
