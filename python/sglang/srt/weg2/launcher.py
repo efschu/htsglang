@@ -8249,6 +8249,13 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         _row = weg2_form.profile_row(profile)
         if _row is not None:
             env.update(_row.group_env.get(group, {}))
+    # RG (operator 26.09.): the agent-load prefix switches (weg2/form.py
+    # PREFIX_SWITCHES) from the row of THIS boot's form -- an explicitly set
+    # env already in `env` wins, an off row writes nothing, and --env-p /
+    # --env-d below still override. A desk caller (no form) publishes nothing.
+    # The front gets the same call on its env (the front spawn below).
+    if boot_form is not None:
+        weg2_form.publish_prefix_switches(env, boot_form.profile)
     if flip_weights == "resident":
         from sglang.srt.managers.weg2_memory_saver import WEIGHTS_RESIDENT_ENV
 
@@ -18175,6 +18182,22 @@ def apply_profile_d_seat_vram_default(ns) -> Optional[str]:
             "--env-d SGLANG_OPT_WEG2_D_SEAT_VRAM=0 = H95 B)" % item)
 
 
+def prefix_switches_announce(ns, boot_form, environ: Optional[Mapping[str, str]] = None) -> str:
+    """RG (operator 26.09.): the WEG2-PREFIX-SWITCHES line of this boot (value
+    and source -- env or profile -- per prefix switch, weg2/form.py
+    PREFIX_SWITCHES), computed on a COPY of the launcher env: the writers are
+    build_env (P, D) and the front spawn. Refuses (Weg2LaunchRefused) when
+    --env-p/--env-d would run MZ differently on P and D."""
+    env = dict(os.environ if environ is None else environ)
+    rows = weg2_form.publish_prefix_switches(env, boot_form.profile)
+    split = weg2_form.prefix_p_eq_d_mismatch(
+        env, parse_group_env(getattr(ns, "env_p", "") or ""),
+        parse_group_env(getattr(ns, "env_d", "") or ""))
+    if split:
+        raise Weg2LaunchRefused(split)
+    return weg2_form.prefix_switches_line(rows)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global _ACTIVE_BOOT_STATE
     # #1248: unclaimed until a BootState exists below -- a stale pointer from
@@ -18218,6 +18241,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             draft_on_p_env=(envs.SGLANG_WEG2_DRAFT_ON_P.is_set(),
                             bool(envs.SGLANG_WEG2_DRAFT_ON_P.get())))
         os.environ[weg2_form.FORM_ENV] = boot_form.env_value()
+        # RG (operator 26.09.): the agent-load prefix switches are registry
+        # fields. build_env (P, D) and the front's env publish them from the
+        # row of the resolved form's profile (weg2_form.publish_prefix_switches);
+        # an explicitly set env wins; an off row writes nothing (NF byte-equal).
+        # Here: the one line naming value and source, and the MZ P==D refusal
+        # (--env-p/--env-d are applied after the row).
+        print(prefix_switches_announce(ns, boot_form), flush=True)
         # UNIFY S3: argparse defaults that are MEASURED constants follow the
         # profile's registry row (unset flags only).
         apply_profile_arg_defaults(ns, list(sys.argv[1:] if argv is None else argv))
@@ -20578,6 +20608,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # der teuerste Blindflug im ganzen Boot. Die Gruppen selbst sind nicht
     # betroffen (ihre Logger flushen je Zeile); es geht allein um die Front.
     fenv["PYTHONUNBUFFERED"] = "1"
+    # RG (operator 26.09.): the prefix switches the ranks got from build_env,
+    # the same call on the front's env (SGLANG_WEG2_FRONT_SPAN_INFLIGHT is the
+    # front's own; all five as on metal: ENV-IM-RANG front = 1).
+    if getattr(ns, "weg2_boot_form", None) is not None:
+        weg2_form.publish_prefix_switches(fenv, ns.weg2_boot_form.profile)
     # C14 / FIX 2 round 2: the BOOT half of the VRAM credit epoch.  Launcher
     # OUTPUT in exactly the class of TMS_HOST_RING_MAP (R19), never an operator
     # knob: it is this boot's ring epoch, the same nonce every rank already got

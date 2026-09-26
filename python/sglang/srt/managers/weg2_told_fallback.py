@@ -113,7 +113,11 @@ _LOG_EVERY = 256
 
 
 def env_on() -> bool:
-    return os.environ.get(ENV_FALLBACK, "0").strip().lower() in ("1", "true", "yes", "on")
+    # RG 26.09.: unset = the registry row (weg2/form.py PREFIX_SWITCHES; PF is
+    # off on every row -- unproven on metal).
+    from sglang.srt.weg2.form import prefix_switch_armed
+
+    return prefix_switch_armed(ENV_FALLBACK)
 
 
 def _env_float(name: str, default: float) -> float:

@@ -1046,7 +1046,20 @@ class Envs:
     # of the epoch at once, not only when the leg finishes. Closes the twin
     # gap (a Claude-Code turn's second request, +~155 tokens on the first,
     # arriving while the first decodes). Off = presence only at leg-2 finish.
-    SGLANG_WEG2_FRONT_SPAN_INFLIGHT = EnvBool(False)
+    # RG 26.09.: a registry field (weg2/form.py PREFIX_SWITCHES,
+    # front_span_inflight): qwen27b on (dkr27brc10bar1agent09261821), nextflash
+    # and no form off.
+    SGLANG_WEG2_FRONT_SPAN_INFLIGHT = EnvBool(_profile_default("SGLANG_WEG2_FRONT_SPAN_INFLIGHT", False))
+    # RG 26.09.: the told/twin prefix switches as registry fields (weg2/form.py
+    # PREFIX_SWITCHES; their readers in managers/weg2_store_told.py,
+    # weg2/p_twin_defer.py and managers/weg2_told_fallback.py take the same
+    # default through form.prefix_switch_armed). qwen27b on (TK, PX2, TW;
+    # metal dkr27brc10bar1agent09261821), PF off everywhere (unproven);
+    # nextflash and no form off. SGLANG_WEG2_TOLD_ABSOLUTE follows TREE_KEY.
+    SGLANG_WEG2_TOLD_PROBE_TREE_KEY = EnvBool(_profile_default("SGLANG_WEG2_TOLD_PROBE_TREE_KEY", False))
+    SGLANG_WEG2_TOLD_PACED = EnvBool(_profile_default("SGLANG_WEG2_TOLD_PACED", False))
+    SGLANG_WEG2_P_TWIN_DEFER = EnvBool(_profile_default("SGLANG_WEG2_P_TWIN_DEFER", False))
+    SGLANG_WEG2_TOLD_GROUP_FALLBACK = EnvBool(_profile_default("SGLANG_WEG2_TOLD_GROUP_FALLBACK", False))
     # Prefix trace (IN 26.09., weg2/prefix_trace.py): every prefix miss of an
     # agent-load boot gets a token receipt -- one #1420 WALK-STOP line per
     # (rid, stop depth) whose unmatched rest is >= the minimum below, full
@@ -1149,7 +1162,11 @@ class Envs:
     # inline system messages (before any user/assistant turn) are still merged
     # into the head -- that position is prefix-stable. Set it identically on
     # P and D: the P->D handoff keys are P's tokenization of the same body.
-    SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE = EnvBool(False)
+    # RG 26.09.: a registry field (weg2/form.py PREFIX_SWITCHES,
+    # inline_system_in_place): qwen27b on, nextflash and no form off; the
+    # launcher refuses an --env-p/--env-d split.
+    SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE = EnvBool(
+        _profile_default("SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE", False))
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")

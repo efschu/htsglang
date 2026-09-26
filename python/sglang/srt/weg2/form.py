@@ -64,7 +64,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from sglang.srt.name_compat import has_marker, tolerant_compile, tolerant_rx
 
@@ -281,6 +281,21 @@ the same ``--max-running-requests``, the CUDA-graph set its sleep keeps).
 
 RECORD_KEY_FIELDS: Tuple[str, ...] = ("checkpoint", "form", "line", "power_limit", "d_capture_set")
 
+#: RG (operator 26.09.): the agent-load prefix switches as registry fields,
+#: ``(ModelProfile field, env name)``. The first five are the ones
+#: dkr27brc10bar1agent09261821 (rc11a) proved on metal; PF is a field only.
+PREFIX_SWITCHES: Tuple[Tuple[str, str], ...] = (
+    ("inline_system_in_place", "SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE"),  # MZ
+    ("told_probe_tree_key", "SGLANG_WEG2_TOLD_PROBE_TREE_KEY"),  # TK
+    ("told_paced", "SGLANG_WEG2_TOLD_PACED"),  # PX2
+    ("p_twin_defer", "SGLANG_WEG2_P_TWIN_DEFER"),  # TW
+    ("front_span_inflight", "SGLANG_WEG2_FRONT_SPAN_INFLIGHT"),  # #49
+    ("told_group_fallback", "SGLANG_WEG2_TOLD_GROUP_FALLBACK"),  # PF
+)
+#: the one of them P and D must run identically (Befund M: the rendered
+#: prompt, hence the prefix keys, differ otherwise)
+PREFIX_SWITCH_P_EQ_D: Tuple[str, ...] = ("SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE",)
+
 
 @dataclass(frozen=True)
 class ModelProfile:
@@ -342,6 +357,31 @@ class ModelProfile:
     #: seats per phase from the wake's handoff_n. Operator 26.09.: nextflash
     #: on, qwen27b off (the 27B stays byte-identical).
     standard_form: bool
+    #: RG (operator 26.09.): THE 27B AGENT-LOAD PREFIX SWITCHES, one field
+    #: each (:data:`PREFIX_SWITCHES` names field -> env). Metal:
+    #: dkr27brc10bar1agent09261821 (image rc11a, 26.09. 18:21-18:56Z), 108
+    #: requests, flips 0.23/request (before 1.35), wasted prefill ~7 %
+    #: (before 48 %), 0 group deaths, ENV-IM-RANG all five = 1 on P, D and the
+    #: front; lines #1416d TOLD-PROBE=8, PACED 8/8, TWIN 7/7, span_inflight
+    #: 109. qwen27b on, nextflash off until the NF seat releases them with a
+    #: boot tag. The launcher publishes an on value into its own environment
+    #: (P, D via build_env, the front via its dict(os.environ)); an explicitly
+    #: set env wins. MZ: SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE, P and D
+    #: must agree (the launcher refuses an --env-p/--env-d split).
+    inline_system_in_place: bool
+    #: TK: SGLANG_WEG2_TOLD_PROBE_TREE_KEY -- brings SGLANG_WEG2_TOLD_ABSOLUTE
+    #: along (its rank default follows the tree-key switch, weg2_store_told).
+    told_probe_tree_key: bool
+    #: PX2: SGLANG_WEG2_TOLD_PACED (#1416e, effective only with told > 0).
+    told_paced: bool
+    #: TW: SGLANG_WEG2_P_TWIN_DEFER (PP0 twins).
+    p_twin_defer: bool
+    #: #49 rest: SGLANG_WEG2_FRONT_SPAN_INFLIGHT (front; effective only with
+    #: ``agent_span``).
+    front_span_inflight: bool
+    #: PF: SGLANG_WEG2_TOLD_GROUP_FALLBACK -- a field only, OFF on both rows:
+    #: unproven on metal (operator 26.09.).
+    told_group_fallback: bool
     vision: str
     context_tokens: int
     records: RecordKey
@@ -378,6 +418,8 @@ class ModelProfile:
         out["SGLANG_WEG2_STANDARD_FORM"] = bool(self.standard_form)
         out["SGLANG_WEG2_D_PARK"] = bool(self.standard_form)
         out["SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV"] = bool(self.standard_form)
+        for fld, env_name in PREFIX_SWITCHES:
+            out[env_name] = bool(getattr(self, fld))
         # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
         # installed Form A role plan at run time).
         out["SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW"] = self.d_layout == "qsa_forma"
@@ -486,6 +528,14 @@ PROFILES: Dict[str, ModelProfile] = {
         warm_min_dwell=False,
         agent_span=True,
         standard_form=False,
+        # RG 26.09.: on as proven by dkr27brc10bar1agent09261821 (rc11a);
+        # PF stays off (unproven on metal).
+        inline_system_in_place=True,
+        told_probe_tree_key=True,
+        told_paced=True,
+        p_twin_defer=True,
+        front_span_inflight=True,
+        told_group_fallback=False,
         vision="transient",
         context_tokens=262144,
         # OPERATOR 26.09. (UN4): the 27B-RC9 records count on this tree as a
@@ -552,6 +602,14 @@ PROFILES: Dict[str, ModelProfile] = {
         # NF P49: off until the NF seat releases #49 with a boot tag
         agent_span=False,
         standard_form=True,
+        # RG 26.09.: off until the NF seat releases them with a boot tag (the
+        # NF group env stays byte-identical).
+        inline_system_in_place=False,
+        told_probe_tree_key=False,
+        told_paced=False,
+        p_twin_defer=False,
+        front_span_inflight=False,
+        told_group_fallback=False,
         vision="off",
         context_tokens=262144,
         records=RecordKey(fields=("checkpoint", "form", "power_limit")),
@@ -591,7 +649,10 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: SGLANG_WEG2_ENABLE_AGENT_SPAN (``agent_span``, #49; operator 26.09.),
 #: SGLANG_WEG2_STANDARD_FORM / SGLANG_WEG2_D_PARK /
 #: SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV (``standard_form``, NF H91),
-#: SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW (``d_layout`` qsa_forma, NF R12).
+#: SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW (``d_layout`` qsa_forma, NF R12),
+#: the prefix switches of :data:`PREFIX_SWITCHES` (RG 26.09.; their readers
+#: read the ENVIRONMENT, which the launcher writes from the row --
+#: :func:`publish_prefix_switches`).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }
@@ -744,6 +805,111 @@ def standard_form_state(environ: Optional[Mapping[str, str]] = None,
     if row is not None:
         return bool(row.standard_form), f"profile {row.id}"
     return True, "no form (NF code default)"
+
+
+def _prefix_field(name: str) -> str:
+    for fld, env_name in PREFIX_SWITCHES:
+        if env_name == name:
+            return fld
+    raise KeyError(f"{name!r} is no prefix switch; known: {[e for _, e in PREFIX_SWITCHES]}")
+
+
+def _explicit_env(env: Mapping[str, str], name: str) -> Optional[str]:
+    """The explicitly set value of ``name`` in ``env`` -- any spelling of its
+    rename family (name_compat: SGLANG_/FLLIPER_ ...) counts, the tree's own
+    spelling first; ``None`` when unset or blank."""
+    from sglang.srt.name_compat import canonical_env_name
+
+    raw = env.get(name)
+    if raw is None:
+        for k in sorted(env):
+            if k != name and canonical_env_name(k) == name:
+                raw = env[k]
+                break
+    if raw is None or not str(raw).strip():
+        return None
+    return str(raw).strip()
+
+
+def prefix_switch_state(name: str, environ: Optional[Mapping[str, str]] = None,
+                        profile: Optional[str] = None) -> Tuple[bool, str]:
+    """``(on, source)`` of one prefix switch (:data:`PREFIX_SWITCHES`), the
+    :func:`standard_form_state` shape: an explicitly set env wins (``source``
+    "env NAME=value"), else the registry row of ``profile`` (or of the
+    published form's profile: "profile <id>"), else off ("no form", the code
+    default of every reader)."""
+    fld = _prefix_field(name)
+    env = os.environ if environ is None else environ
+    raw = _explicit_env(env, name)
+    if raw is not None:
+        return raw.lower() in _ON_WORDS, f"env {name}={raw}"
+    if profile is None:
+        form = current_form(environ)
+        profile = form.profile if form is not None else None
+    row = profile_row(profile)
+    if row is not None:
+        return bool(getattr(row, fld)), f"profile {row.id}"
+    return False, "no form (code default off)"
+
+
+def publish_prefix_switches(environ: MutableMapping[str, str],
+                            profile: Optional[str]) -> List[Tuple[str, bool, str]]:
+    """THE ONE WRITER (launcher: build_env's group env for P and D, and the
+    front's env): every prefix switch the row of ``profile`` turns on and no
+    env states is written as ``1`` into ``environ`` -- the same call on the
+    same launcher environment, so all three run one value. An off value writes
+    NOTHING (every reader defaults off), so a row with all switches off leaves
+    the environment byte-identical. Returns ``(name, on, source)`` per
+    switch."""
+    rows: List[Tuple[str, bool, str]] = []
+    for _fld, name in PREFIX_SWITCHES:
+        on, src = prefix_switch_state(name, environ, profile)
+        if on and src.startswith("profile "):
+            environ[name] = "1"
+        rows.append((name, on, src))
+    return rows
+
+
+def prefix_switch_armed(name: str, environ: Optional[Mapping[str, str]] = None) -> bool:
+    """THE RANK-SIDE READER of one prefix switch: an explicitly set value is
+    parsed as the readers always did (1/true/yes/on), unset or blank takes
+    the default of the published form's profile (:func:`profile_switch_default`;
+    no form: off, the pre-registry default). The launcher publishes the same
+    row into the env, so both halves answer alike."""
+    _prefix_field(name)
+    env = os.environ if environ is None else environ
+    raw = env.get(name)
+    if raw is None or not str(raw).strip():
+        return bool(profile_switch_default(name, False, env))
+    return str(raw).strip().lower() in _ON_WORDS
+
+
+def prefix_switches_line(rows: Sequence[Tuple[str, bool, str]]) -> str:
+    """The launcher's one line naming every prefix switch, its value and
+    where it came from (env or profile)."""
+    parts = ", ".join(f"{n}={int(on)} ({src})" for n, on, src in rows)
+    return ("WEG2-PREFIX-SWITCHES (registry fields, RG 26.09.; P, D and front get one value; "
+            "SGLANG_WEG2_TOLD_ABSOLUTE follows TOLD_PROBE_TREE_KEY unless set): " + parts)
+
+
+def prefix_p_eq_d_mismatch(environ: Mapping[str, str], env_p: Mapping[str, str],
+                           env_d: Mapping[str, str]) -> Optional[str]:
+    """MZ: a switch of :data:`PREFIX_SWITCH_P_EQ_D` that ``--env-p`` /
+    ``--env-d`` (applied last by build_env) would set differently on P and D
+    -- the refusal text, or ``None``. ``environ`` is the launcher's env AFTER
+    :func:`publish_prefix_switches`."""
+    for name in PREFIX_SWITCH_P_EQ_D:
+        base = _explicit_env(environ, name)
+        vals = []
+        for extra in (env_p, env_d):
+            raw = _explicit_env(extra, name)
+            raw = base if raw is None else raw
+            vals.append(bool(raw is not None and raw.lower() in _ON_WORDS))
+        if vals[0] != vals[1]:
+            return (f"WEG2-PREFIX-SWITCHES {name}: P={int(vals[0])} D={int(vals[1])} via "
+                    f"--env-p/--env-d -- P and D must run it identically (Befund M: the "
+                    f"rendered prompt and with it every prefix key differ otherwise)")
+    return None
 
 
 def profile_switch_default(name: str, fallback, environ: Optional[Mapping[str, str]] = None):

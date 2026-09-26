@@ -84,8 +84,11 @@ _now = time.monotonic  # patched by the tests
 
 
 def _env_on(env=None) -> bool:
-    env = os.environ if env is None else env
-    return str(env.get(ENV, "0")).strip().lower() in ("1", "true", "yes", "on")
+    # RG 26.09.: unset = the registry row of the published form's profile
+    # (weg2/form.py PREFIX_SWITCHES: qwen27b on, nextflash/no form off).
+    from sglang.srt.weg2.form import prefix_switch_armed
+
+    return prefix_switch_armed(ENV, env)
 
 
 def _env_int(name: str, default: int, env=None) -> int:
