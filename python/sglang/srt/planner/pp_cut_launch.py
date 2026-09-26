@@ -963,6 +963,7 @@ def solve_launch_cut(
     objective: str = "maxkv",
     pool_floor: Optional[int] = None,
     pool_floor_from_cut: Optional[Sequence[int]] = None,
+    depth_profile: Optional[Sequence[Tuple[float, float]]] = None,
 ) -> CutDecision:
     """Choose the layer + attention cut, for ``objective``, among the feasible.
 
@@ -996,6 +997,15 @@ def solve_launch_cut(
     word PINNED and priced on the same two axes as the solved cut, never by
     silently replacing it. Same discipline as ``_handle_pp_solve_cut``'s
     "a VALIDATED OVERRIDE still wins when you want it".
+
+    ``depth_profile`` (27B line, default None = unchanged): ``(prefix,
+    weight)`` points; each candidate's makespan becomes the weighted MEAN over
+    them of the per-depth makespan (max over stages, contiguous; sum, gapped)
+    instead of the makespan at the single design prefix. A max of lines is
+    not the line of the mean, so a workload spread over depths (a prompt
+    ladder) is priced on its own chunks -- see
+    ``planner.pgap_stage_fit.depth_profile``. The printed depth is the
+    profile's weighted mean.
     """
     n_stages = len(incumbent_layers)
     total_layers = len(layer_families)
@@ -1071,6 +1081,12 @@ def solve_launch_cut(
         if design_prefix_tokens is not None
         else (family_cost.ref_prefix_tokens if family_cost is not None else 0)
     )
+    profile: Tuple[Tuple[float, float], ...] = tuple(
+        (float(d), float(w)) for d, w in (depth_profile or ()) if float(w) > 0.0
+    )
+    profile_w = sum(w for _, w in profile)
+    if profile:
+        depth = int(round(sum(d * w for d, w in profile) / profile_w))
     pair_ms: Mapping[Tuple[int, int], float] = per_pair_crossing_ms or {}
     unpriced: List[str] = []
 
@@ -1092,10 +1108,19 @@ def solve_launch_cut(
                 return None
             makespan, cross, n_cross = float(fallback_ms), 0.0, 0
         else:
-            stage_ms = family_cost.stage_ms(counts, attn, depth)
-            # The in-flight-pass rule, applied per candidate -- see
-            # ``CutCandidate``. Gapped forbids depth, so its stages serialise.
-            makespan = float(sum(stage_ms) if kind == "gapped" else max(stage_ms))
+            if profile:
+                # 27B line: the weighted mean over the depth profile of the
+                # SAME per-depth rule as below.
+                makespan = 0.0
+                for d, w in profile:
+                    s_ms = family_cost.stage_ms(counts, attn, d)
+                    makespan += w * float(sum(s_ms) if kind == "gapped" else max(s_ms))
+                makespan /= profile_w
+            else:
+                stage_ms = family_cost.stage_ms(counts, attn, depth)
+                # The in-flight-pass rule, applied per candidate -- see
+                # ``CutCandidate``. Gapped forbids depth, so its stages serialise.
+                makespan = float(sum(stage_ms) if kind == "gapped" else max(stage_ms))
             try:
                 cp = crossing_price(owned, int(total_layers), pair_ms)
             except UnpricedCrossing as exc:

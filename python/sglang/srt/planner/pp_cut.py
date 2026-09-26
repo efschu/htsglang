@@ -3189,6 +3189,19 @@ class PhasePoolModel:
     #: launch line.
     zero_posts_acknowledged: Tuple[str, ...] = ()
 
+    #: The runtime's `prefill graph pool` post, MiB PER STAGE (27B line,
+    #: --p-prefill-graph). Booked by ``model_runner_kv_cache_mixin`` from
+    #: ``SGLANG_KV_BUDGET_PREFILL_GRAPH_MIB`` -- the SAME vector the launcher
+    #: hands this model, so the two sides of the seam read one number. It is
+    #: what the full prefill graph's capture keeps resident while P is awake
+    #: (capture pool + static buffers + full-CG attention workspace; the
+    #: stage's rank line ``PREFILL-GRAPH captured ... capture_mib=`` is its
+    #: measurement). Per stage because the stage inputs differ (PP0 reads
+    #: embeddings, the others the proxy plus every carried DFlash capture).
+    #: Empty = the switch is off and the runtime books nothing -- a legitimate
+    #: zero, so it is not in :attr:`unfunded_posts`.
+    prefill_graph_pool_mib: Tuple[float, ...] = ()
+
     #: The runtime's post NAMES, in the runtime's own order, mapped to the field
     #: that funds each (#1286 F2/F3). This is the model's statement of WHICH
     #: list it mirrors, and ``test_pp_cut_boot_sizing_1286`` scans
@@ -3199,6 +3212,9 @@ class PhasePoolModel:
     RUNTIME_BUDGET_POSTS: ClassVar[Tuple[Tuple[str, str], ...]] = (
         ("weights + runtime state", "weight_mib_per_layer + stage_fixed_mib"),
         ("gapped corridor holdback", "corridor_holdback_mib"),
+        # Booked right after the holdback (model_runner_kv_cache_mixin, the
+        # absolute-budget branch), only under --p-prefill-graph.
+        ("prefill graph pool", "prefill_graph_pool_mib"),
         ("mamba state pool", "mamba_mib_per_linear_layer_per_slot"),
         ("speculative intermediate state", "speculative_intermediate_mib"),
         ("prefill activation reserve", "activation_reserve_mib"),
@@ -3968,6 +3984,7 @@ def _stage_free_after_residency(
           - mamba state pool             (rate * linear_layers * slots)
           - speculative intermediate st. (speculative_intermediate_mib)
           - prefill activation reserve   (activation_reserve_mib)
+          - prefill graph pool           (prefill_graph_pool_mib[r]; empty = off)
           - mamba pre-capture reserve    (mamba_precapture_reserve_mib)
           = rest, which the sizer then divides by the cell.
 
@@ -3990,6 +4007,15 @@ def _stage_free_after_residency(
             "embedding sits on stage 0, lm_head and the draft head on the "
             "last) and cannot be broadcast."
         )
+    graph_pool = tuple(
+        float(x) for x in getattr(model, "prefill_graph_pool_mib", ()) or ()
+    )
+    if graph_pool and len(graph_pool) != len(list(counts)):
+        raise ValueError(
+            f"prefill_graph_pool_mib has {len(graph_pool)} entries for "
+            f"{len(list(counts))} stages; it is a PER-STAGE post (the stage "
+            "inputs of the captured body differ) and cannot be broadcast."
+        )
     for r, (n, a) in enumerate(zip(counts, attn_counts)):
         linear = int(n) - int(a)
         holdback = (
@@ -4007,6 +4033,7 @@ def _stage_free_after_residency(
             * int(model.mamba_slots)
             - float(model.speculative_intermediate_mib)
             - float(model.activation_reserve_mib)
+            - (graph_pool[r] if graph_pool else 0.0)
             - float(model.mamba_precapture_reserve_mib)
         )
     return tuple(out)

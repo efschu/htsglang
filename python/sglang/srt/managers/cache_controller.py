@@ -21,6 +21,7 @@ import threading
 import time
 
 from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
+from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -2348,8 +2349,21 @@ class HiCacheController:
         _, rows = self._dcp_owned_device_rows(device_indices)
         if rows.numel() == 0:
             return False
-        row_max = int(rows.max())
-        row_min = int(rows.min())
+        if (
+            _weg2_p_overlap.p_nosync_on()
+            and rows.is_cuda
+            and self._dcp_owner_ctx() is None
+        ):
+            # P-NOSYNC: the bound is checked ON THE DEVICE and read back through
+            # pinned memory at the next check; see `_923_defer_bound_check`.
+            with _weg2_p_overlap.span("rowcheck"):
+                self._923_defer_bound_check(rows, cap, where)
+            return False
+        # #PGAP: these two reads wait for the stream the rows were written on --
+        # the host sync a chunk publish inside the plan waited on (xsn420).
+        with _weg2_p_overlap.span("rowcheck"):
+            row_max = int(rows.max())
+            row_min = int(rows.min())
         if row_min >= 0 and row_max < cap:
             return False
         n = getattr(self, "_unaddressable_kv_rows_refused", 0) + 1
@@ -2375,6 +2389,60 @@ class HiCacheController:
                 n,
             )
         return True
+
+    def _923_defer_bound_check(self, rows: torch.Tensor, cap: int, where: str) -> None:
+        """P-NOSYNC form of the #923 bound check, for IDENTITY rows only.
+
+        `int(rows.max())` on the host copies device->host blocking, i.e. waits
+        for the stream -- behind the fence of the forward that is running
+        (weg2xsn422 PP1: rowcheck 58 ms per chunk). Only taken where the owner
+        rule is the identity (no DCP owner context): there every row comes from
+        this rank's own allocator, so an out-of-range row is an allocator
+        defect, not a routing case -- the refusal-before-commit the docstring
+        above defends is for COMPACT (owner-ruled) pools, and those keep the
+        host check. Here the answer is computed on the stream, copied to pinned
+        host memory, and read once its event is complete; a hit STOPS the rank
+        by name (the copy has already been issued, so it cannot be refused --
+        a late loud stop, never a silent skip)."""
+        self._923_drain_deferred()
+        flag = torch.empty((), dtype=torch.bool, pin_memory=True)
+        flag.copy_(((rows < 0) | (rows >= cap)).any(), non_blocking=True)
+        ev = device_module.Event()
+        ev.record()
+        pend = getattr(self, "_923_deferred", None)
+        if pend is None:
+            pend = self._923_deferred = []
+        pend.append((ev, flag, where, int(cap)))
+
+    def _923_drain_deferred(self, wait: bool = False) -> int:
+        """Read the completed deferred #923 answers (host memory only unless
+        ``wait``); raise on a hit. Returns how many were read."""
+        pend = getattr(self, "_923_deferred", None)
+        if not pend:
+            return 0
+        keep, done = [], 0
+        for ev, flag, where, cap in pend:
+            if not wait and not ev.query():
+                keep.append((ev, flag, where, cap))
+                continue
+            if wait:
+                ev.synchronize()
+            done += 1
+            if bool(flag.item()):
+                self._unaddressable_kv_rows_refused = (
+                    getattr(self, "_unaddressable_kv_rows_refused", 0) + 1
+                )
+                raise RuntimeError(
+                    "#923 HICACHE %s ROW OUT OF RANGE (deferred check, P-NOSYNC): "
+                    "a transfer indexed a device KV row outside the pool's %d "
+                    "rows. With no owner context every row comes from this "
+                    "rank's own allocator, so this is an allocator defect; the "
+                    "copy was already issued and cannot be refused, so the rank "
+                    "stops here instead of serving a page it may have copied "
+                    "from the wrong row." % (where, cap)
+                )
+        self._923_deferred = keep
+        return done
 
     def _dcp_kv_transfer_pairs(
         self, host_indices: torch.Tensor, device_indices: torch.Tensor
@@ -2403,6 +2471,20 @@ class HiCacheController:
             return host_indices, device_indices
         elif self.io_backend == "direct":
             if self.mem_pool_host.layout == "layer_first":
+                if (
+                    _weg2_p_overlap.p_nosync_on()
+                    and device_indices.is_cuda
+                    and not host_indices.is_cuda
+                ):
+                    # P-NOSYNC: the same host-sorted order, but the device
+                    # indices are permuted ON the device (permutation sent
+                    # pinned + non-blocking). `.cpu()` here waited for the
+                    # schedule stream; the arena writers take device indices
+                    # as they are, and a staging (`transfer_kv_direct`) target
+                    # still gets the same pairs.
+                    host_indices, idx = host_indices.sort()
+                    idx = idx.pin_memory().to(device_indices.device, non_blocking=True)
+                    return host_indices, device_indices.index_select(0, idx)
                 device_indices = device_indices.cpu()
                 host_indices, idx = host_indices.sort()
                 return host_indices, device_indices.index_select(0, idx)

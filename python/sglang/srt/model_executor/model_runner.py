@@ -372,6 +372,35 @@ def _needs_float16_fallback(device_id: Optional[int] = None) -> bool:
     return get_device_capability(device_id)[0] < 8
 
 
+def align_pipeline_layers(layers: list, layer_model) -> list:
+    """Pad a PP stage's per-OWNED-layer list to GLOBAL layer ids (ported
+    from upstream #35451 ``_align_pipeline_layers``): ``None`` for every
+    layer outside ``[start_layer, end_layer)``. Refuses a list longer than the
+    stage owns -- that would shift every later layer onto the wrong id."""
+    has_start = hasattr(layer_model, "start_layer")
+    has_end = hasattr(layer_model, "end_layer")
+    assert (
+        has_start == has_end
+    ), "pipeline layer ranges must define start_layer and end_layer together"
+    total = len(layer_model.layers)
+    start = layer_model.start_layer if has_start else 0
+    end = layer_model.end_layer if has_end else total
+    assert isinstance(start, int) and isinstance(
+        end, int
+    ), "pipeline layer ranges must define integer start_layer and end_layer"
+    assert (
+        0 <= start <= end <= total
+    ), f"invalid pipeline layer range [{start}, {end}) for {total} layers"
+    assert (
+        len(layers) <= end - start
+    ), f"found {len(layers)} layers in PP range [{start}, {end})"
+    # Upstream's exact arithmetic: a stage whose owned list has a gap (an
+    # owned layer without attention) comes out SHORT of num_hidden_layers,
+    # so the GQA check that follows keeps the graph off instead of shifting
+    # the ids after the gap.
+    return [None] * start + list(layers) + [None] * (total - end)
+
+
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -4468,6 +4497,43 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 dsa_indexer = layer.self_attn.indexer
             self.dsa_indexers.append(dsa_indexer)
 
+        if self.pp_size > 1:
+            # Pipeline stages hold PPMissingLayer outside [start, end), which
+            # the collection above skips -- so the list is SHORT by the other
+            # stages' layers and the GQA check below read that as "some layers
+            # do not apply Standard GQA" on every stage. Only the full backend
+            # has a PP capture path (upstream #35451, PrefillCudaGraphRunner.
+            # _resolve_pp_proxy_keys); every other backend keeps the previous
+            # outcome under PP, by name.
+            if (
+                self.server_args.cuda_graph_config.prefill.backend
+                != Backend.FULL
+            ):
+                log_info_on_rank0(
+                    logger,
+                    "Disable prefill CUDA graph under pipeline parallelism: only "
+                    "the 'full' prefill backend captures a PP stage.",
+                )
+                return
+            _wire = getattr(layer_model, "pp_crossing_wire", None)
+            if _wire is not None and type(_wire).__name__ != "NoCrossingWire":
+                # A gapped cut sends activations to another rank INSIDE the
+                # layer loop (#753); a captured body would replay those sends
+                # without their host-side protocol. Not built, so refused.
+                logger.warning(
+                    "Disable prefill CUDA graph: this PP stage has a gapped "
+                    "crossing wire (%s); the full prefill graph captures "
+                    "contiguous stages only.",
+                    type(_wire).__name__,
+                )
+                return
+            # Index attention_layers by GLOBAL layer id (upstream #35451
+            # _align_pipeline_layers): the captured custom attention ops look
+            # the layer up as attention_layers[layer_id].
+            self.attention_layers = align_pipeline_layers(
+                self.attention_layers, layer_model
+            )
+
         if len(self.attention_layers) < self.model_config.num_hidden_layers:
             # TODO(yuwei): support Non-Standard GQA
             log_info_on_rank0(
@@ -4497,6 +4563,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"elapsed={time.perf_counter() - tic:.2f} s, "
             f"mem usage={mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
         )
+        if prefill_backend == Backend.FULL:
+            # The planner's `prefill graph pool` post is read off THIS line:
+            # device free before/after the whole capture (graph pool + static
+            # buffers + the full-CG attention workspace), per PP stage, MiB.
+            _pr = self.prefill_cuda_graph_runner
+            logger.info(
+                "PREFILL-GRAPH captured backend=full pp_rank=%d buckets=%s "
+                "slots=%s pp_keys=%s capture_mib=%.1f (instrument: "
+                "get_available_gpu_memory before-after around the runner; "
+                "population = capture pool + static buffers + full-CG "
+                "attention workspace, NOT the eager activation transient)",
+                int(self.pp_rank),
+                capture_num_tokens,
+                getattr(_pr, "_capture_req_slots", None),
+                list(getattr(_pr, "_pp_proxy_keys", None) or []),
+                mem_usage * 1024.0,
+            )
 
     def init_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")

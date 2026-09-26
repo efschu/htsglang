@@ -364,6 +364,9 @@ _is_hip = is_hip()
 
 
 PREFILL_TRANSIENT_ENV = "SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB"
+#: The `prefill graph pool` post (27B line, --p-prefill-graph): scalar or one
+#: entry per rank, MiB, parsed by prefill_transient_mib_for_rank. Unset = 0.
+PREFILL_GRAPH_POOL_ENV = "SGLANG_KV_BUDGET_PREFILL_GRAPH_MIB"
 
 
 def prefill_transient_mib_for_rank(text: str, rank: int) -> float:
@@ -979,6 +982,25 @@ class ModelRunnerKVCacheMixin:
             if _transient_gb > 0.0:
                 rest_memory -= _transient_gb
                 budget_posts.append(("prefill transient (measured)", _transient_gb))
+            # 27B line, --p-prefill-graph: what the full prefill graph's
+            # capture keeps resident while this group is awake (capture pool +
+            # static buffers + full-CG attention workspace). Captured AFTER
+            # this sizing, so without a post the KV pool would take the bytes
+            # and the capture would push the rank past its absolute budget --
+            # the one number the flip's credit ledger holds it to. Same
+            # vector format as the transient above; the launcher hands the
+            # SAME vector to its pool model (PhasePoolModel.
+            # prefill_graph_pool_mib). Default empty = nothing booked.
+            _graph_pool_gb = (
+                prefill_transient_mib_for_rank(
+                    os.environ.get(PREFILL_GRAPH_POOL_ENV, ""),
+                    self._rank_vector_index(),
+                )
+                / 1024.0
+            )
+            if _graph_pool_gb > 0.0:
+                rest_memory -= _graph_pool_gb
+                budget_posts.append(("prefill graph pool", _graph_pool_gb))
             # #260: the budget is ABSOLUTE, so a co-resident process must
             # never shrink it -- but it does bound what this rank can
             # physically allocate. That bound gets its own check and its own

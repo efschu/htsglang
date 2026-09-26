@@ -23,6 +23,8 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.distributed.utils import tp_partition_size
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention import fi_graph_split as _fi_graph_split
+from sglang.srt.layers.attention import fi_prefill_wave_split as _fi_wave_split
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_workspace import (
     HIGH_WORKSPACE_ARCHITECTURES,
@@ -52,6 +54,7 @@ from sglang.srt.layers.dcp.lockstep import (
     weightless_has_prefix,
 )
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -377,6 +380,110 @@ def _local_attn_head_counts(model_runner: "ModelRunner") -> tuple:
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
 global_override_indptr_cpu = None
+
+
+# ---------------------------------------------------------------------------
+# P-NOSYNC prefill plan (managers/weg2_p_overlap.py, SGLANG_WEG2_P_NOSYNC).
+#
+# flashinfer's prefill plan() (paged AND ragged) opens with
+# ``qo_indptr.to("cpu")`` / ``paged_kv_indptr.to("cpu")``: a BLOCKING
+# device->host read that waits for everything queued on the forward stream.
+# Once the plan no longer waits for the running forward (memory_pool
+# ``_nosync_mapping_rows``), launch(k+1) waits HERE for forward k (py-spy
+# weg2xsn423 PP0: 97 samples on prefill.py:1963 already). The values are known
+# on the host -- seq_lens_cpu, extend_prefix_lens_cpu, the paged-lens mirror --
+# so under P-NOSYNC the normal extend hands plan() HOST indptrs, and its
+# ``.to("cpu")`` is a no-op.
+#
+# That removes the one thing that drained the stream before plan() refilled
+# its PINNED staging buffer (``_pin_memory_int_workspace_buffer``: host plan ->
+# pinned -> cudaMemcpyAsync on the stream). With the host free to run ahead,
+# plan(k+2) could overwrite the staging bytes plan(k+1)'s copy has not read
+# yet. So each wrapper waits (host) for the copy of ITS previous plan before
+# planning again -- one plan ahead of the card, never two.
+# ---------------------------------------------------------------------------
+_P_NOSYNC_PLAN_EVENT_ATTR = "_weg2_p_nosync_plan_copy_event"
+_P_NOSYNC_PLAN_BACKENDS = ("auto", "fa2", "fa3")
+
+
+def _p_nosync_host_indptrs(
+    bs: int,
+    seq_lens_cpu,
+    extend_prefix_lens_cpu,
+    paged_kernel_lens_cpu,
+    paged_kernel_lens_sum,
+):
+    """Host (qo_indptr, paged_kv_indptr, last_page_len) for a normal extend,
+    int32, pinned when CUDA is up -- or None when the host mirrors are absent
+    or disagree (the caller then keeps the stock device plan).
+
+    The qo lengths are ``seq_lens_cpu - extend_prefix_lens_cpu`` (the device
+    qo_indptr is the cumsum of ``seq_lens - prefix_lens``); the paged lengths
+    are the mirror of ``paged_kernel_lens`` and must add up to the host sum the
+    caller already holds; page size is 1, so every last page holds one slot."""
+    try:
+        if seq_lens_cpu is None or extend_prefix_lens_cpu is None:
+            return None
+        if paged_kernel_lens_cpu is None:
+            return None
+
+        def _ints(v):
+            return [int(x) for x in (v.tolist() if torch.is_tensor(v) else v)]
+
+        seq = _ints(seq_lens_cpu)
+        pre = _ints(extend_prefix_lens_cpu)
+        paged = _ints(paged_kernel_lens_cpu)
+        if not (len(seq) == len(pre) == len(paged) == bs) or bs <= 0:
+            return None
+        if sum(paged) != int(paged_kernel_lens_sum) or min(paged) < 0:
+            return None
+        qo, kv = [0], [0]
+        for s, p in zip(seq, pre):
+            if s - p <= 0:
+                return None
+            qo.append(qo[-1] + s - p)
+        for n in paged:
+            kv.append(kv[-1] + n)
+        pin = torch.cuda.is_available()
+
+        def _t(v):
+            return torch.tensor(v, dtype=torch.int32, pin_memory=pin)
+
+        return _t(qo), _t(kv), _t([1] * bs)
+    except Exception:  # noqa: BLE001 - an accelerator: the stock plan stays
+        return None
+
+
+def _p_nosync_plan(wrapper, *args, **kwargs) -> None:
+    """``wrapper.begin_forward`` one plan ahead of the card (see above): wait
+    for the copy of this wrapper's previous plan, plan, fence this one."""
+    prev = getattr(wrapper, _P_NOSYNC_PLAN_EVENT_ATTR, None)
+    if prev is not None:
+        prev.synchronize()
+    wrapper.begin_forward(*args, **kwargs)
+    ev = torch.cuda.Event()
+    ev.record()
+    setattr(wrapper, _P_NOSYNC_PLAN_EVENT_ATTR, ev)
+
+
+def _p_nosync_plan_ok(*wrappers) -> bool:
+    """The host-indptr plan applies: P-NOSYNC on, not capturing, every wrapper
+    on a backend whose plan() takes host indptrs, none on fast_prefill_plan."""
+    if not _weg2_p_overlap.p_nosync_on():
+        return False
+    try:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    for w in wrappers:
+        if w is None:
+            continue
+        if getattr(w, "_backend", "auto") not in _P_NOSYNC_PLAN_BACKENDS:
+            return False
+        if hasattr(getattr(w, "begin_forward", None), "func"):
+            return False  # a partial (fast_prefill_plan): its own host contract
+    return True
 
 
 def fast_prefill_plan(
@@ -1127,6 +1234,9 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             self.workspace_buffer = global_workspace_buffer
+        # Read only by _full_cg_prefill_float_workspace (the memory-saver half
+        # of the weg2 graph-scratch region's arming gate).
+        self._full_cg_server_args = model_runner.server_args
         max_bs = _cuda_graph_capture_max_bs(
             model_runner.server_args, model_runner.req_to_token_pool.size
         )
@@ -1617,6 +1727,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 # does not exist on this arm.
                 extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             )
+            # 27B line (fi_graph_split): the KV split INSIDE the full prefill
+            # graph, only under SGLANG_FI_PREFILL_GRAPH_SPLIT=N; unset = the
+            # stock graph plan above, untouched.
+            if _fi_graph_split.graph_split_max_chunks() > 1:
+                self._p_graph_split(forward_batch, bs, in_capture)
         else:
             raise ValueError("Invalid forward mode")
 
@@ -1784,6 +1899,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 # Use new backend-specific implementation
                 multi_item_params = self._process_multi_item_scoring(forward_batch)
 
+            # 27B line (fi_prefill_wave_split): the wave-aware KV split of the
+            # EAGER prefill plan, only under SGLANG_FI_PREFILL_WAVE_SPLIT=1 and
+            # never over the deterministic tile size. Off = the stock value.
+            _prefill_fixed_split = self.prefill_split_tile_size
+            if _prefill_fixed_split is None and _fi_wave_split.wave_split_on():
+                _prefill_fixed_split = self._p_wave_split_size(forward_batch, use_ragged)
+
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -1794,7 +1916,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=None,
-                fixed_split_size=self.prefill_split_tile_size,
+                fixed_split_size=_prefill_fixed_split,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
                 extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
@@ -1806,6 +1928,160 @@ class FlashInferAttnBackend(AttentionBackend):
                 multi_item_params,
                 swa_out_cache_loc=swa_out_cache_loc,
             )
+
+    def _p_graph_split(self, forward_batch: ForwardBatch, bs: int, in_capture: bool) -> None:
+        """Arm (at capture) / refresh (at replay) the KV split inside the full
+        prefill graph -- layers/attention/fi_graph_split.py.
+
+        The capture decides once per wrapper: every check in
+        ``flashinfer_contract_ok`` / ``layout_from_stock`` passes -> the
+        captured kernel gets a grid of q_tiles_max x N work items and this
+        method rewrites the work-item arrays before every replay; any check
+        fails -> the stock plan stays for the life of the capture, named once.
+        A replay of an armed capture MUST get its arrays (the graph reads our
+        offsets), so errors there raise instead of falling back."""
+        wrappers = list(self.full_cg_prefill_wrappers or [])
+        states = self.__dict__.setdefault("_fi_graph_split_states", {})
+        if len(wrappers) != 1:
+            if in_capture:
+                logger.info(
+                    "FI-GRAPH-SPLIT off for this capture: %d full-CG prefill "
+                    "wrappers (one full-attention wrapper is the checked form)",
+                    len(wrappers),
+                )
+            return
+        w = wrappers[0]
+        key = id(w)
+        upd = self.indices_updater_prefill
+        if in_capture:
+            ok, why = _fi_graph_split.flashinfer_contract_ok(w)
+            lay = None
+            if ok:
+                out_bytes = torch.empty((), dtype=upd.q_data_type).element_size()
+                lay, why = _fi_graph_split.layout_from_stock(
+                    list(w._plan_info),
+                    slots=int(getattr(self, "full_cg_prefill_req_slots", bs) or bs),
+                    max_chunks=_fi_graph_split.graph_split_max_chunks(),
+                    num_qo_heads=int(upd.num_qo_heads),
+                    num_kv_heads=int(upd.num_kv_heads),
+                    head_dim_vo=int(upd.head_dim),
+                    out_bytes=int(out_bytes),
+                    int_workspace_bytes=int(w._int_workspace_buffer.numel()),
+                    float_workspace_bytes=int(
+                        w._float_workspace_buffer.numel()
+                        * w._float_workspace_buffer.element_size()
+                    ),
+                )
+            if lay is None:
+                states[key] = None
+                logger.info("FI-GRAPH-SPLIT off for this capture: %s", why)
+                return
+            states[key] = _fi_graph_split.GraphSplitState(lay, list(w._plan_info))
+            o = lay.offsets
+            logger.info(
+                "FI-GRAPH-SPLIT armed: grid %d work items per KV head (%d q tiles x "
+                "%d chunks), partials %.1f MB at float offset %d, int region %d B at "
+                "%d, min chunk %d tokens",
+                lay.padded,
+                lay.padded // lay.max_chunks,
+                lay.max_chunks,
+                (o["float_end"] - o["v"]) / 1e6,
+                o["v"],
+                lay.int_bytes,
+                lay.int_base,
+                _fi_graph_split.graph_split_min_chunk(),
+            )
+        st = states.get(key)
+        if st is None:
+            return
+        seq = forward_batch.seq_lens_cpu
+        seq_l = [int(x) for x in (seq.tolist() if hasattr(seq, "tolist") else list(seq))][:bs]
+        pre = [int(x) for x in (forward_batch.extend_prefix_lens_cpu or [])][:bs]
+        pre += seq_l[len(pre):]  # sentinel slots: no new rows
+        qo = [max(0, s - p) for s, p in zip(seq_l, pre)]
+        num_sm = self.__dict__.get("_fi_wave_num_sm")
+        if num_sm is None:
+            num_sm = int(
+                torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+            )
+            self._fi_wave_num_sm = num_sm
+        chunk, choice = _fi_graph_split.apply(
+            w, st, qo, seq_l, num_kv_heads=int(upd.num_kv_heads), num_sm=num_sm
+        )
+        reason = "capture" if in_capture else choice.reason.split(":")[0]
+        counts = self.__dict__.setdefault("_fi_graph_split_counts", {})
+        n = counts.get(reason, 0) + 1
+        counts[reason] = n
+        if not (n & (n - 1)):
+            logger.info(
+                "FI-GRAPH-SPLIT %s occurrence=%d chunks=%d kv_chunk=%d prefix=%s "
+                "predicted_attn_ratio=%.3f",
+                reason,
+                n,
+                st.last_chunks,
+                chunk,
+                pre[:1],
+                choice.predicted_ratio,
+            )
+
+    def _p_wave_split_size(self, forward_batch: ForwardBatch, use_ragged: bool) -> Optional[int]:
+        """``fixed_split_size`` for THIS eager prefill plan, or None = stock.
+
+        Reached only under ``SGLANG_FI_PREFILL_WAVE_SPLIT=1``
+        (fi_prefill_wave_split). Host-known lengths only -- a missing host
+        mirror returns None (the stock plan), never a device read. The paged
+        kernel reads prefix + new tokens when it runs causal over both
+        (``use_ragged`` False) and the prefix alone under the ragged/paged
+        pair. Every decision is named, rate-limited to occurrences 1, 2, 4, ...
+        per reason."""
+        try:
+            seq = forward_batch.seq_lens_cpu
+            pre = forward_batch.extend_prefix_lens_cpu
+            ext = forward_batch.extend_seq_lens_cpu
+            if seq is None or pre is None or ext is None:
+                return None
+            seq_l = [int(x) for x in (seq.tolist() if hasattr(seq, "tolist") else seq)]
+            pre_l = [int(x) for x in pre]
+            ext_l = [int(x) for x in ext]
+            if not (len(seq_l) == len(pre_l) == len(ext_l)) or not seq_l:
+                return None
+            kv_l = pre_l if use_ragged else seq_l
+            num_sm = self.__dict__.get("_fi_wave_num_sm")
+            if num_sm is None:
+                num_sm = int(
+                    torch.cuda.get_device_properties(
+                        torch.cuda.current_device()
+                    ).multi_processor_count
+                )
+                self._fi_wave_num_sm = num_sm
+            upd = self.indices_updater_prefill
+            choice = _fi_wave_split.choose_prefill_kv_split(
+                ext_l,
+                kv_l,
+                num_qo_heads=int(upd.num_qo_heads),
+                num_kv_heads=int(upd.num_kv_heads),
+                head_dim=int(upd.head_dim),
+                num_sm=num_sm,
+                float_workspace_bytes=int(self.workspace_buffer.numel()),
+                min_prefix_tokens=_fi_wave_split.wave_split_from_prefix(),
+            )
+        except Exception as exc:  # noqa: BLE001 - an accelerator: stock plan stays
+            choice = None
+            reason = "error:%s" % type(exc).__name__
+        else:
+            reason = choice.reason.split(":")[0]
+        counts = self.__dict__.setdefault("_fi_wave_split_counts", {})
+        n = counts.get(reason, 0) + 1
+        counts[reason] = n
+        if not (n & (n - 1)):
+            logger.info(
+                "%s occurrence=%d num_sm=%s from_prefix=%d",
+                choice.line() if choice is not None else "FI-WAVE-SPLIT " + reason,
+                n,
+                self.__dict__.get("_fi_wave_num_sm"),
+                _fi_wave_split.wave_split_from_prefix(),
+            )
+        return None if choice is None else choice.fixed_split_size
 
     def init_cuda_graph_state(
         self,
@@ -1970,6 +2246,60 @@ class FlashInferAttnBackend(AttentionBackend):
         tmp_s = per_row
         return int((tmp_v + tmp_s) * FULL_CG_PREFILL_WORKSPACE_MARGIN)
 
+    def _full_cg_prefill_float_workspace(
+        self, workspace_bytes: int, device
+    ) -> torch.Tensor:
+        """The float (split-kv scratch) workspace of the full prefill graph.
+
+        Default (unchanged): a dedicated buffer, because on a server that
+        also captures DECODE graphs those wrappers' plans pin the shared
+        workspace. Two 27B-line refinements, both only reachable when a full
+        prefill graph captures:
+
+        * ``SGLANG_FULL_CG_PREFILL_SHARED_WORKSPACE=1`` (set by the weg2
+          launcher for group P under --p-prefill-graph; P never captures a
+          decode graph, #1233 FIX 4): reuse the backend's float workspace when
+          it is large enough. Measured by the sizing below it would otherwise
+          cost ~167 MiB on the 5090 (170 SMs -> padded batch 85) and ~94 MiB
+          on a 3080 per stage -- more than the graph's own pool. Same content
+          contract as the eager wrappers that already share it: scratch
+          written before read inside one launch sequence, zeroed per finished
+          request and on every wake (zero_flashinfer_workspaces).
+        * otherwise the dedicated buffer is allocated inside
+          ``weg2_graph_scratch_region`` -- on a Weg-2 rank whose graph tag is
+          armed (the same condition under which the capture itself routes
+          into that tag) it is released by the group's sleep with the graph
+          pool instead of staying resident for the other group's phase; a
+          no-op everywhere else.
+        """
+        if (
+            os.environ.get("SGLANG_FULL_CG_PREFILL_SHARED_WORKSPACE", "0").strip()
+            not in ("", "0")
+            and self.workspace_buffer.numel() * self.workspace_buffer.element_size()
+            >= int(workspace_bytes)
+        ):
+            logger.info(
+                "Full-CG prefill workspace SHARED with the float workspace "
+                "(%.1f MiB >= %.1f MiB needed; no decode graph on this group)",
+                self.workspace_buffer.numel()
+                * self.workspace_buffer.element_size()
+                / (1024 * 1024),
+                int(workspace_bytes) / (1024 * 1024),
+            )
+            return self.workspace_buffer
+        from sglang.srt.managers.weg2_memory_saver import weg2_graph_scratch_region
+
+        memory_saver_on = bool(
+            getattr(
+                getattr(self, "_full_cg_server_args", None),
+                "enable_memory_saver",
+                False,
+            )
+        )
+        with weg2_graph_scratch_region(int(workspace_bytes), memory_saver_on):
+            buf = torch.empty(int(workspace_bytes), dtype=torch.uint8, device=device)
+        return register_flashinfer_workspace_buffer(buf)
+
     def _create_full_cg_prefill_wrappers(
         self, num_slots: int, max_num_tokens: int
     ) -> list:
@@ -2001,8 +2331,8 @@ class FlashInferAttnBackend(AttentionBackend):
             max_num_tokens,
             num_slots,
         )
-        self.full_cg_prefill_workspace_buffer = register_flashinfer_workspace_buffer(
-            torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
+        self.full_cg_prefill_workspace_buffer = self._full_cg_prefill_float_workspace(
+            workspace_bytes, device
         )
         self.full_cg_prefill_qo_indptr = [
             torch.zeros((num_slots + 1,), dtype=torch.int32, device=device)
@@ -7243,6 +7573,9 @@ class FlashInferIndicesUpdaterPrefill:
         # (--speculative-eagle-topk > 1); stays None on every other path so the
         # ragged plan keeps its default (causal chain / non-causal extend).
         ragged_custom_mask = None
+        # P-NOSYNC host indptrs (_p_nosync_host_indptrs); set only by the
+        # normal-extend branch below, None = the stock device plan.
+        nosync_host = None
         if spec_info is None and self.attn_backend.uneven_dcp:
             # Uneven-DCP extend: the paged (prefix) wrapper reads only this
             # rank's OWNED prefix token slots (even-modulo owner rule), with the
@@ -7570,6 +7903,21 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr = qo_indptr[: bs + 1]
 
             custom_mask = cross_attention_custom_mask
+            # P-NOSYNC: the same two vectors from the host mirrors, for plan().
+            # The device ones above stay: the kv-indices kernel reads them.
+            if (
+                custom_mask is None
+                and not use_sliding_window_kv_pool
+                and not (multi_item_params is not None and multi_item_params.is_enabled())
+                and _p_nosync_plan_ok(wrapper_ragged if use_ragged else None, wrapper_paged)
+            ):
+                nosync_host = _p_nosync_host_indptrs(
+                    bs,
+                    seq_lens_cpu,
+                    extend_prefix_lens_cpu,
+                    paged_kernel_lens_cpu,
+                    paged_kernel_lens_sum,
+                )
         else:
             assert isinstance(spec_info, SpecInput)
             if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
@@ -7607,18 +7955,31 @@ class FlashInferIndicesUpdaterPrefill:
                 if self.attn_backend.uneven_dcp
                 else self.num_kv_heads
             )
-            wrapper_ragged.begin_forward(
-                qo_indptr,
-                qo_indptr,
-                ragged_qo_heads,
-                ragged_kv_heads,
-                self.head_dim,
-                q_data_type=self.q_data_type,
-                # Tree-spec only (topk > 1): flashinfer packs this bool mask into
-                # the per-bucket ragged wrapper's custom_mask_buf on every replay
-                # -> CUSTOM mask mode over the draft->draft block. None elsewhere.
-                custom_mask=ragged_custom_mask,
+            # #PGAP fi_plan (weg2_p_overlap.py): flashinfer's plan() reads
+            # qo_indptr device->host BLOCKING (prefill.py `qo_indptr.to("cpu")`),
+            # i.e. it waits for everything queued on the forward stream. The
+            # span names that wait inside the launch; off = a bare yield.
+            # Under P-NOSYNC (nosync_host set) plan() gets the host indptr and
+            # runs one plan ahead of the card (_p_nosync_plan).
+            _qo_r = qo_indptr if nosync_host is None else nosync_host[0]
+            _plan_r = (
+                wrapper_ragged.begin_forward
+                if nosync_host is None
+                else partial(_p_nosync_plan, wrapper_ragged)
             )
+            with _weg2_p_overlap.span("fi_plan"):
+                _plan_r(
+                    _qo_r,
+                    _qo_r,
+                    ragged_qo_heads,
+                    ragged_kv_heads,
+                    self.head_dim,
+                    q_data_type=self.q_data_type,
+                    # Tree-spec only (topk > 1): flashinfer packs this bool mask into
+                    # the per-bucket ragged wrapper's custom_mask_buf on every replay
+                    # -> CUSTOM mask mode over the draft->draft block. None elsewhere.
+                    custom_mask=ragged_custom_mask,
+                )
 
         if use_sliding_window_kv_pool:
             assert self._swa_kv_pool is not None
@@ -7680,26 +8041,33 @@ class FlashInferIndicesUpdaterPrefill:
                 max_kv_len=int(seq_lens_cpu_i32.max()),
             )
 
-        wrapper_paged.begin_forward(
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            self.kv_last_page_len[:bs],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            1,
-            q_data_type=self.q_data_type,
-            kv_data_type=self.data_type,
-            custom_mask=use_custom_mask,
-            non_blocking=True,
-            fixed_split_size=fixed_split_size,
-            prefix_len_ptr=prefix_len_ptr,
-            token_pos_in_items_ptr=token_pos_in_items_ptr,
-            token_pos_in_items_len=token_pos_in_items_len,
-            max_item_len_ptr=max_item_len_ptr,
-            **paged_plan_kwargs,
-        )
+        if nosync_host is None:
+            _qo_p, _kv_p, _last_p = qo_indptr, kv_indptr, self.kv_last_page_len[:bs]
+            _plan_p = wrapper_paged.begin_forward
+        else:  # P-NOSYNC: host indptrs, one plan ahead (see the ragged plan)
+            _qo_p, _kv_p, _last_p = nosync_host
+            _plan_p = partial(_p_nosync_plan, wrapper_paged)
+        with _weg2_p_overlap.span("fi_plan"):  # #PGAP, see the ragged plan above
+            _plan_p(
+                _qo_p,
+                _kv_p,
+                kv_indices,
+                _last_p,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+                custom_mask=use_custom_mask,
+                non_blocking=True,
+                fixed_split_size=fixed_split_size,
+                prefix_len_ptr=prefix_len_ptr,
+                token_pos_in_items_ptr=token_pos_in_items_ptr,
+                token_pos_in_items_len=token_pos_in_items_len,
+                max_item_len_ptr=max_item_len_ptr,
+                **paged_plan_kwargs,
+            )
 
 
 class FlashInferMultiStepDraftBackend:

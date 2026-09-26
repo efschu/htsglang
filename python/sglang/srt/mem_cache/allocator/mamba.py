@@ -61,6 +61,16 @@ logger = logging.getLogger(__name__)
 #: waiting for it.
 SLOT_TRAIL_ENV = "SGLANG_MAMBA_SLOT_TRAIL"
 _SLOT_TRAIL = os.environ.get(SLOT_TRAIL_ENV, "") == "1"
+
+
+def slot_trail_on() -> bool:
+    """Whether ``note_924d`` records anything. A caller whose ``extra=`` text
+    reads a CUDA tensor (``.tolist()``) asks this first under P-NOSYNC: the
+    argument is evaluated before ``note_924d`` can decline, so an off trail
+    still paid the device sync."""
+    return _SLOT_TRAIL
+
+
 _924D_SEEN: set = set()
 _924D_SEQ = 0
 _924D_CAP = 8192
@@ -146,6 +156,15 @@ class MambaSlotAllocator:
     def __init__(self, size: int, device: str):
         self.size = size
         self.device = device
+        # P-NOSYNC (managers/weg2_p_overlap.py): no host wait on the stream in
+        # alloc()/free(). `slot_used[idx] = True` on a CUDA tensor copies the
+        # Python scalar host->device BLOCKING, i.e. cudaStreamSynchronize on the
+        # schedule stream -- which holds the fence of the forward that is still
+        # running (py-spy weg2xsn422 PP0: 1731 of 2357 samples on that line,
+        # #PGAP anchor 409-604 ms per 4096 chunk). Read once; off = unchanged.
+        from sglang.srt.managers.weg2_p_overlap import p_nosync_on
+
+        self._nosync = p_nosync_on()
         # Active preallocated batch for `alloc_group_begin` / `alloc_group_end`.
         # When non-None, `alloc(1)` consumes the next slot from this iterator
         # instead of calling `_do_alloc(1)` per request. Reset to None outside
@@ -201,7 +220,10 @@ class MambaSlotAllocator:
             return None
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        self.slot_used[select_index] = True
+        if self._nosync:
+            self.slot_used.index_fill_(0, select_index, True)  # device scalar, no H2D
+        else:
+            self.slot_used[select_index] = True
         self._note_slot_event(select_index, "ALLOC")
         return select_index
 
@@ -313,7 +335,10 @@ class MambaSlotAllocator:
         # at 1), and masked out of the double-free question.
         safe = torch.where(in_ledger, free_index, torch.zeros_like(free_index))
         self._defer_double_free_check(safe, in_ledger)
-        self.slot_used[safe] = False
+        if self._nosync:
+            self.slot_used.index_fill_(0, safe, False)  # device scalar, no H2D
+        else:
+            self.slot_used[safe] = False
         # #1033b: recorded AFTER the ledger update, so the book holds only
         # releases that genuinely flipped a slot True->False. A refused release
         # never becomes somebody's "first releaser".
@@ -337,11 +362,19 @@ class MambaSlotAllocator:
         if pend is None:
             pend = self._1467_pending = []
         if already_free.is_cuda:
+            flag = None
+            if self._nosync:
+                # The answer travels to PINNED host memory on the stream, so the
+                # drain reads host memory once the event is complete -- a
+                # `bool(tensor.any())` there would copy device->host BLOCKING on
+                # the current stream, i.e. wait for the running forward again.
+                flag = torch.empty((), dtype=torch.bool, pin_memory=True)
+                flag.copy_(already_free.any(), non_blocking=True)
             ev = torch.cuda.Event()
             ev.record()
-            pend.append((ev, already_free, safe, stack))
+            pend.append((ev, already_free, safe, stack, flag))
         else:
-            pend.append((None, already_free, safe, stack))
+            pend.append((None, already_free, safe, stack, None))
         self._drain_double_free_checks()
 
     def _drain_double_free_checks(self, wait: bool = False) -> None:
@@ -349,13 +382,16 @@ class MambaSlotAllocator:
         if not pend:
             return
         keep = []
-        for ev, already_free, safe, stack in pend:
+        for ev, already_free, safe, stack, flag in pend:
             if ev is not None and not wait and not ev.query():
-                keep.append((ev, already_free, safe, stack))
+                keep.append((ev, already_free, safe, stack, flag))
                 continue
             if ev is not None and wait:
                 ev.synchronize()
-            if bool(already_free.any()):
+            # P-NOSYNC: the pinned host copy is complete with the event, so this
+            # reads host memory; without it the device answer is read as before.
+            hit = bool(flag.item()) if flag is not None else bool(already_free.any())
+            if hit:
                 self._refuse_double_free(safe[already_free], stack=stack)
         self._1467_pending = keep
 

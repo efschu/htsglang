@@ -828,6 +828,235 @@ def apply_spec_form(ns) -> None:
         )
 
 
+#: --p-prefill-graph (27B line, 2026-09-24; user: P on 512-token chunks, and
+#: for the fixed chunk a prefill CUDA graph -- "ja unbedingt"). 0 = off, the
+#: default: argv_p, the P form key and every ledger input are byte-identical
+#: to a tree without the switch. N > 0 = group P captures ONE full prefill
+#: graph of N tokens (backend 'full', the only prefill backend that can put
+#: its capture pool in the memory saver's cuda_graph tag -- the same
+#: sleep/wake the decode graphs on D ride) and runs its chunks at N tokens,
+#: because a bucket below the chunk size would replay only the rest chunk.
+#: Measured motive (xsn422 #PGAP): the host launch of one P forward is
+#: 63/42/74 ms per stage, ~24 ms fixed + ~0.9 ms per layer, independent of the
+#: token count, against ~48-71 ms of compute for a 512-token chunk.
+P_PREFILL_GRAPH_DEFAULT = 0
+_P_PREFILL_GRAPH: Dict[str, object] = {"bucket": P_PREFILL_GRAPH_DEFAULT, "tiny": ()}
+
+
+def apply_p_prefill_graph(ns) -> None:
+    """Install --p-prefill-graph once, before any argv is built (the same
+    install-once shape as apply_spec_form: every common_flags("P") call --
+    the cut solve's chunk read, its armed re-check, the form key, the shipped
+    argv -- reads this ONE value, so they cannot disagree)."""
+    bucket = int(getattr(ns, "p_prefill_graph", P_PREFILL_GRAPH_DEFAULT) or 0)
+    if bucket < 0:
+        raise SystemExit(f"--p-prefill-graph must be >= 0, got {bucket}")
+    _P_PREFILL_GRAPH["bucket"] = bucket
+    _P_PREFILL_GRAPH["tiny"] = p_prefill_graph_tiny_of(ns, bucket)
+
+
+def p_prefill_graph_tiny_of(ns, bucket: int) -> Tuple[int, ...]:
+    """--p-prefill-graph-tiny as extra, SMALLER capture buckets (27B line,
+    24.09., default off = ()). Why: group P ends every prompt with the 1-token
+    END-OF-PREFILL ANCHOR chunk (schedule_policy._weg2_end_anchor_split,
+    SGLANG_WEG2_END_ANCHOR=1), and the runner pads every batch up to the
+    smallest captured bucket that holds it (base_cuda_graph_runner.
+    _pad_to_bucket) -- with bs [512] alone that one token replays a full
+    512-row graph: measured xsn430/xsn433 #PGAP tokens=1 gpu_fwd 37.1 / 35.0 /
+    38.0 ms (PP0/PP1/PP2) against ~41 / 34 / 38 ms for a real 512 chunk. A
+    16-token bucket is weight-bandwidth bound instead (~12 / 7 / 7 ms
+    estimated). Buckets must be positive and below the main bucket."""
+    raw = str(getattr(ns, "p_prefill_graph_tiny", "") or "").strip()
+    if not raw:
+        return ()
+    if not bucket:
+        raise SystemExit("--p-prefill-graph-tiny needs --p-prefill-graph N (the main bucket)")
+    try:
+        vals = sorted({int(x) for x in raw.split(",") if x.strip()})
+    except ValueError:
+        raise SystemExit(f"--p-prefill-graph-tiny {raw!r}: comma list of token counts expected")
+    bad = [v for v in vals if v <= 0 or v >= int(bucket)]
+    if bad:
+        raise SystemExit(
+            f"--p-prefill-graph-tiny {raw!r}: every bucket must be in (0, {int(bucket)}), got {bad}"
+        )
+    return tuple(vals)
+
+
+def p_prefill_graph_buckets() -> List[int]:
+    """Every captured prefill bucket, ascending; [] when the graph is off."""
+    bucket = p_prefill_graph_bucket()
+    if not bucket:
+        return []
+    return sorted(set(int(t) for t in _P_PREFILL_GRAPH.get("tiny", ()) or ()) | {bucket})
+
+
+def p_prefill_graph_bucket() -> int:
+    """The P prefill graph's token bucket, 0 when the switch is off."""
+    return int(_P_PREFILL_GRAPH["bucket"])
+
+
+def p_chunked_prefill_tokens() -> int:
+    """Group P's --chunked-prefill-size: the graph bucket when the P prefill
+    graph is on, the common constant otherwise (byte-identical default)."""
+    # UNIFY S7: the common constant is group P's own (P_CHUNKED_PREFILL_TOKENS,
+    # the NF form's SGLANG_WEG2_P_CHUNKED_PREFILL_TOKENS; default = the
+    # constant, byte-identical on the 27B line).
+    return p_prefill_graph_bucket() or P_CHUNKED_PREFILL_TOKENS
+
+
+def p_prefill_graph_flags() -> List[str]:
+    """The ONE argv term of the P prefill graph ([] when off).
+
+    ``--cuda-graph-config`` JSON rather than the convenience flags because it
+    states all three keys in one token and wins over every other source
+    (server_args._parse_cuda_graph_config), and an EXPLICIT prefill backend is
+    also what skips the breakable-only auto-disable cascade (multimodal /
+    memory-saver rules) that turned P's prefill graph off until now:
+      * backend 'full' -- captures into the memory saver's cuda_graph tag
+        (full_cuda_graph_backend.py), released by P's sleep like D's graphs;
+      * bs [bucket]    -- one shape; a shorter rest chunk pads up to it;
+      * full_prefill_max_req 1 -- one request slot: a chunk holding two
+        requests runs eager (named by the runner's PREFILL-GRAPH eager line),
+        and the captured linear-attention metadata never sees a sentinel row.
+    """
+    bucket = p_prefill_graph_bucket()
+    if not bucket:
+        return []
+    return [
+        "--cuda-graph-config",
+        json.dumps(
+            {
+                "prefill": {
+                    "backend": "full",
+                    "bs": p_prefill_graph_buckets(),
+                    "full_prefill_max_req": 1,
+                }
+            },
+            separators=(",", ":"),
+        ),
+    ]
+
+
+#: The `prefill graph pool` post, MiB per 512 graph tokens per P stage. AN
+#: ESTIMATE, NOT A MEASUREMENT (desk, 2026-09-24) -- the capture runs after
+#: KV sizing, so the first boot can only book a forecast, and every later
+#: boot should book the MEASURED rank line 'PREFILL-GRAPH captured ...
+#: capture_mib=' via --p-prefill-graph-pool-mib. Derivation for one 512-token
+#: chunk of the 27B (hidden 5120, intermediate 17408, bf16): the capture pool
+#: reuses freed blocks inside the capture, so it holds ONE layer's working
+#: set -- MLP gate_up 34 MiB + activation 17 + int8 activation 8.5 + the GDN
+#: chunk intermediates ~30 + the residual stream 10 -- plus the stage's
+#: outputs (hidden + residual 10 MiB, + 5 MiB per DFlash capture when the
+#: producer computes) and the static inputs (embeddings / proxy 5-35 MiB).
+#: The flashinfer full-CG split-kv workspace (~167 MiB on the 5090, ~94 MiB
+#: on a 3080) is NOT in it: under the switch P shares the float workspace
+#: that is already in the cuda_graph tag (SGLANG_FULL_CG_PREFILL_SHARED_
+#: WORKSPACE). The task's own forecast was ~0.1 GiB per stage.
+P_PREFILL_GRAPH_POOL_MIB_PER_512 = 160.0
+#: Group P's stage count (argv_p ships --pp-size 3).
+P_PREFILL_GRAPH_STAGES = 3
+
+
+def p_prefill_graph_pool_mib(ns) -> Tuple[float, ...]:
+    """The per-stage `prefill graph pool` post, MiB; () when the switch is
+    off. ONE vector for both sides of the seam: the pool model's
+    PhasePoolModel.prefill_graph_pool_mib and the ranks' SGLANG_KV_BUDGET_
+    PREFILL_GRAPH_MIB (p_prefill_graph_env) are both built from this call."""
+    bucket = p_prefill_graph_bucket()
+    if not bucket:
+        return ()
+    raw = str(getattr(ns, "p_prefill_graph_pool_mib", "") or "").strip()
+    if raw:
+        vals = tuple(float(x) for x in raw.split(",") if x.strip())
+        if len(vals) == 1:
+            vals = vals * P_PREFILL_GRAPH_STAGES
+        if len(vals) != P_PREFILL_GRAPH_STAGES or any(v < 0 for v in vals):
+            raise SystemExit(
+                f"--p-prefill-graph-pool-mib {raw!r}: one value or "
+                f"{P_PREFILL_GRAPH_STAGES} non-negative per-stage values expected"
+            )
+        return vals
+    # Tiny buckets (--p-prefill-graph-tiny) are priced proportionally on top:
+    # an UPPER estimate, the runner captures every bucket into ONE pool (the
+    # full backend's global graph pool, largest first) and the smaller ones
+    # reuse its blocks; the rank line 'PREFILL-GRAPH captured ... capture_mib='
+    # measures all buckets together and replaces this via the flag above.
+    est = P_PREFILL_GRAPH_POOL_MIB_PER_512 * float(sum(p_prefill_graph_buckets())) / 512.0
+    return (est,) * P_PREFILL_GRAPH_STAGES
+
+
+#: --p-deep-split-from (27B line, 2026-09-24): 0 = off, the default.
+P_DEEP_SPLIT_FROM_DEFAULT = 0
+#: The crossover prefix read off the xsn426/xsn428 #PGAP fits: the graph's
+#: PP0 chunk costs 41.9 + 1.432 * (prefix + 256) / 1000 ms, the eager chunk is
+#: bounded below by the ~57 ms host launch of 42 layers, and the split lowers
+#: the eager device time under that line -- so eager + split wins from
+#: (57 - 41.9) / 1.432 * 1000 - 256 ~ 10,300 tokens on. Rounded to 20 chunks
+#: of 512. A RECOMMENDATION printed in the help, never applied by default.
+P_DEEP_SPLIT_FROM_FIT = 10240
+
+
+def p_deep_split_env(ns) -> Dict[str, str]:
+    """Group P's environment for --p-deep-split-from; {} when off."""
+    from sglang.srt.layers.attention import fi_prefill_wave_split as _fiws
+
+    n = int(getattr(ns, "p_deep_split_from", P_DEEP_SPLIT_FROM_DEFAULT) or 0)
+    if n < 0:
+        raise SystemExit(f"--p-deep-split-from must be >= 0, got {n}")
+    return _fiws.launcher_env_p_deep_split(n)
+
+
+def p_prefill_graph_env(
+    pool_mib: Sequence[float], max_prefix: Optional[int] = None
+) -> Dict[str, str]:
+    """Group P's environment under --p-prefill-graph ({} when off, so the
+    default env stays byte-identical). ``max_prefix`` is
+    --p-prefill-graph-max-prefix: None (the default) sets nothing, i.e. no
+    depth threshold."""
+    if not p_prefill_graph_bucket():
+        return {}
+    env = {
+        # model_runner_kv_cache_mixin.PREFILL_GRAPH_POOL_ENV: the runtime
+        # books the same post the pool model priced.
+        "SGLANG_KV_BUDGET_PREFILL_GRAPH_MIB": ",".join("%.1f" % v for v in pool_mib),
+        # flashinfer_backend._full_cg_prefill_float_workspace: P captures no
+        # decode graph (#1233 FIX 4), so the full-CG prefill wrappers may
+        # share the float workspace instead of a second split-kv buffer.
+        "SGLANG_FULL_CG_PREFILL_SHARED_WORKSPACE": "1",
+    }
+    if max_prefix is not None:
+        if int(max_prefix) < 0:
+            raise SystemExit(f"--p-prefill-graph-max-prefix must be >= 0, got {max_prefix}")
+        # prefill_cuda_graph_runner.PREFILL_GRAPH_MAX_PREFIX_ENV: a chunk whose
+        # prefix exceeds it runs eager (census reason 'deep_split').
+        env["SGLANG_PREFILL_GRAPH_MAX_PREFIX"] = str(int(max_prefix))
+    return env
+
+
+def p_prefill_graph_line() -> str:
+    """The one launcher line naming group P's prefill-graph form."""
+    bucket = p_prefill_graph_bucket()
+    if not bucket:
+        return (
+            "WEG2 P-PREFILL-GRAPH: off -- group P prefills eager at "
+            f"--chunked-prefill-size {CHUNKED_PREFILL_TOKENS} (default form)"
+        )
+    tiny = [b for b in p_prefill_graph_buckets() if b != bucket]
+    return (
+        f"WEG2 P-PREFILL-GRAPH: on bucket={bucket} -- group P runs "
+        f"--chunked-prefill-size {bucket} and captures ONE full prefill graph "
+        f"of {bucket} tokens per PP stage"
+        + (f" plus tiny bucket(s) {tiny} (the 1-token END-ANCHOR and short rests "
+           f"replay those instead of padding to {bucket})" if tiny else "")
+        + f" ({' '.join(p_prefill_graph_flags())}); "
+        "capture pool in the memory saver's cuda_graph tag (released by P's "
+        "sleep, remapped by its wake); rank lines 'PREFILL-GRAPH captured ... "
+        "capture_mib=' (cost) and 'PREFILL-GRAPH eager reason=' (every batch "
+        "the graph did not take)"
+    )
+
+
 def spec_form_is_dflash() -> bool:
     return str(_SPEC_FORM["form"]) == "DFLASH"
 
@@ -3914,8 +4143,10 @@ def common_flags(
         "--hicache-canonical-kv-page",
     ]) + [
         "--host", "127.0.0.1",
+        # --p-prefill-graph N moves GROUP P's chunk to the graph bucket N
+        # (p_chunked_prefill_tokens); D and the default keep the constant.
         "--chunked-prefill-size",
-        str(P_CHUNKED_PREFILL_TOKENS if group == "P" else CHUNKED_PREFILL_TOKENS),
+        str(p_chunked_prefill_tokens() if group == "P" else CHUNKED_PREFILL_TOKENS),
         "--scheduler-distributed-teardown",
         "--page-size", "1",
         # #1235: arbitrary and FIXED, which is the whole provenance -- see
@@ -4147,6 +4378,9 @@ def argv_p(
         # the ones an arm passes through --extra-p for both forms (the
         # Next-Flash arm's --speculative-draft-model-path).
     ) + p_micro_batch_flags(p_bs, list(extra or ())) + (
+        # 27B --p-prefill-graph: [] when off (the default argv is unchanged).
+        p_prefill_graph_flags()
+    ) + (
         list(extra) if draft_kv_on_p else strip_speculative_flags(extra)[0])
 
 
@@ -10287,6 +10521,63 @@ def read_pp_bubble(path: str) -> Optional[BubbleMeasurement]:
     )
 
 
+def p_host_overlap_env(overlap: bool, hostgap: bool) -> Dict[str, str]:
+    """Group P's extra environment for ``--p-host-overlap`` / ``--p-hostgap``.
+
+    Empty when both are off -- that is the byte-identity guarantee, pinned by
+    test_weg2_p_host_overlap.py. The variable NAMES live in
+    managers/weg2_p_overlap.py, the one module the runtime reads them from."""
+    from sglang.srt.managers import weg2_p_overlap as _pov
+
+    env: Dict[str, str] = {}
+    if overlap:
+        env.update(_pov.launcher_env_p_host_overlap())
+    if hostgap:
+        env.update(_pov.launcher_env_p_hostgap())
+    return env
+
+
+def p_host_overlap_lines(overlap: bool, hostgap: bool) -> List[str]:
+    """The provenance lines for the two switches -- none when both are off."""
+    lines: List[str] = []
+    if overlap:
+        lines.append(
+            "WEG2 P-HOST-OVERLAP: on (--p-host-overlap) -- group P gets %s: a "
+            "middle prefill chunk exchanges no output (upstream's pure-chunk "
+            "skip), the last rank fences its schedule stream on each forward "
+            "device-side, and the chunked-prefill HiCache publish runs after "
+            "the next launch instead of inside the plan. Reason: weg2xsn420 "
+            "4x98k PP2 pass 873 ms against 733 gpu-ms, ~95-140 ms card idle "
+            "per 4096 chunk from host work serialised behind the stage's own "
+            "forward (managers/weg2_p_overlap.py)."
+            % " ".join("%s=%s" % kv for kv in sorted(p_host_overlap_env(True, False).items()))
+        )
+    if hostgap:
+        lines.append(
+            "WEG2 P-HOSTGAP: on (--p-hostgap) -- group P prints one #PGAP line "
+            "per forward: gpu_gap_ms = card idle before it (timing events, no "
+            "sync), host phases since the previous launch."
+        )
+    return lines
+
+
+#: --p-prefill-graph-split (27B line, 2026-09-24): 0 = off, the default.
+P_PREFILL_GRAPH_SPLIT_DEFAULT = 0
+
+
+def p_graph_split_env(ns) -> Dict[str, str]:
+    """Group P's environment for --p-prefill-graph-split; {} when off or when
+    the prefill graph itself is off (nothing to split inside)."""
+    from sglang.srt.layers.attention import fi_graph_split as _fgs
+
+    n = int(getattr(ns, "p_prefill_graph_split", P_PREFILL_GRAPH_SPLIT_DEFAULT) or 0)
+    if n < 0 or n == 1:
+        raise SystemExit(f"--p-prefill-graph-split must be 0 (off) or >= 2, got {n}")
+    if not p_prefill_graph_bucket():
+        return {}
+    return _fgs.launcher_env_p_graph_split(n)
+
+
 def newest_bubble_log(
     evidence_dir: str, accept: Optional[Callable[[str], bool]] = None
 ) -> Optional[str]:
@@ -10527,6 +10818,153 @@ def pcie_lanes(cards: Sequence[Card]) -> List[Optional[int]]:
         except Exception:
             pass
     return out
+
+
+def card_power_limits_w(cards: Sequence[Card]) -> List[Optional[float]]:
+    """ENFORCED power limit per CUDA ordinal, W, from NVML; ``None`` if unknown.
+
+    27B line (user 24.09. ~18:55Z: the cards run power-limited -- 5090 400 W of
+    600, 3080 230 W of 320 -- and the limits may be raised). A per-layer cost
+    measured at one limit is not the cost at another, so every boot prints
+    its limits (:func:`card_power_line`) and a stage fit is checked against
+    them (:func:`stage_fit_family_cost`)."""
+    out: List[Optional[float]] = []
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        return [None for _ in cards]
+    try:
+        for c in cards:
+            try:
+                h = pynvml.nvmlDeviceGetHandleByIndex(int(c.nvml_index))
+                out.append(float(pynvml.nvmlDeviceGetEnforcedPowerLimit(h)) / 1000.0)
+            except Exception:
+                out.append(None)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+    return out
+
+
+#: The one line a stage-fit RECORD is read back from (group P's cards in stage
+#: order). Parsed by :func:`read_card_power_record`; change both together.
+CARD_POWER_MARKER = "PP-CUT CARD-POWER (the record for --pp-cut-stage-fit):"
+_CARD_POWER_RE = re.compile(r"stage (\d+) card='([^']*)' uuid=(\S+) limit_w=(\S+)")
+#: Two limits within this many watts are the same limit.
+CARD_POWER_TOLERANCE_W = 5.0
+
+
+def card_power_line(cards: Sequence[Card], limits_w: Sequence[Optional[float]]) -> str:
+    return CARD_POWER_MARKER + " " + " ; ".join(
+        "stage %d card='%s' uuid=%s limit_w=%s"
+        % (r, c.name, c.uuid, "unknown" if w is None else "%.0f" % w)
+        for r, (c, w) in enumerate(zip(cards, limits_w))
+    )
+
+
+def read_card_power_record(front_log: str) -> Optional[List[Tuple[str, Optional[float]]]]:
+    """``[(card name, limit W or None), ...]`` in stage order from a boot's
+    front log, or ``None`` when the boot printed no record (every boot before
+    this line existed)."""
+    try:
+        with open(front_log, "r", errors="replace") as fh:
+            for line in fh:
+                if CARD_POWER_MARKER not in line:
+                    continue
+                rows = sorted(
+                    (int(s), name, None if lim == "unknown" else float(lim))
+                    for s, name, _uuid, lim in _CARD_POWER_RE.findall(line)
+                )
+                if rows:
+                    return [(name, lim) for _s, name, lim in rows]
+    except OSError:
+        return None
+    return None
+
+
+def stage_fit_family_cost(ns, cards: Sequence[Card], chunk_tokens: int,
+                          limits_now: Sequence[Optional[float]], log):
+    """--pp-cut-stage-fit: the P cut's stage cost FITTED from a boot's #PGAP
+    lines (planner/pgap_stage_fit.py), or a W40 refusal.
+
+    Returns ``(cost, provenance, fitted_log)``. THE POWER RECORD (user order
+    24.09.): the fitted boot's per-stage card and power limit come from its
+    own front log (:data:`CARD_POWER_MARKER`), else from the operator's
+    ``--pp-cut-stage-fit-power`` assertion; a record whose card or limit
+    differs from this boot's metal is STALE and refused, unless
+    ``--pp-cut-stage-fit-stale-ok`` -- then it is used and the provenance says
+    STALE in capitals. No record at all is refused: never reused silently."""
+    from sglang.srt.planner import pgap_stage_fit as _fit
+
+    arg = str(getattr(ns, "pp_cut_stage_fit", "") or "").strip()
+    if arg == "auto":
+        _line = getattr(ns, "weg2_line_id", None)
+        path, seen = _fit.newest_pgap_log(
+            EVIDENCE_DIR, int(chunk_tokens), len(cards),
+            accept=_line.accepts_log if _line is not None else None)
+        for s in seen:
+            log("PP-CUT STAGE FIT auto: " + s)
+        if path is None:
+            raise Weg2LaunchRefused(
+                "W40 Weg2PPCutRefused: --pp-cut-stage-fit auto found no P log in "
+                f"{EVIDENCE_DIR} with #PGAP lines at chunk {int(chunk_tokens)} and "
+                f"{len(cards)} stages (run a boot with --p-hostgap first, or pass a path)")
+    else:
+        path = arg
+    try:
+        fitted = _fit.read_pgap_log(path)
+        if fitted.chunk_tokens != int(chunk_tokens):
+            raise _fit.StageFitRefused(
+                f"it ran {fitted.chunk_tokens}-token P chunks, this boot runs "
+                f"{int(chunk_tokens)}; the attention cost per chunk is chunk-specific "
+                "(192 CTAs at 512 on the 5090), so a fit does not transfer")
+        cost, prov = _fit.fit_stage_cost(fitted, [c.name for c in cards])
+    except (_fit.StageFitRefused, OSError, ValueError, ZeroDivisionError) as exc:
+        raise Weg2LaunchRefused(f"W40 Weg2PPCutRefused: --pp-cut-stage-fit {path}: {exc}")
+    front = path[: -len(".P.log")] + ".front.log" if path.endswith(".P.log") else ""
+    record = read_card_power_record(front) if front else None
+    source = "record in %s" % os.path.basename(front)
+    asserted = str(getattr(ns, "pp_cut_stage_fit_power", "") or "").strip()
+    if record is None and asserted:
+        vals = _csv_floats(asserted)
+        if len(vals) != len(cards):
+            raise SystemExit(
+                f"--pp-cut-stage-fit-power {asserted!r}: {len(cards)} per-stage watts expected")
+        record = [(c.name, float(v)) for c, v in zip(cards, vals)]
+        source = "ASSERTED by --pp-cut-stage-fit-power (the fitted boot printed no record)"
+    if record is None:
+        raise Weg2LaunchRefused(
+            "W40 Weg2PPCutRefused: --pp-cut-stage-fit %s carries no power record "
+            "(its boot printed no '%s' line) and none was asserted. The per-layer "
+            "cost moves with the power limit, so an unrecorded fit is not reused "
+            "silently: pass --pp-cut-stage-fit-power W,W,W with the limits that "
+            "boot ran at (24.09. user measurement: 400,230,230)"
+            % (path, CARD_POWER_MARKER))
+    diffs = []
+    for r, ((name, lim), c, now) in enumerate(zip(record, cards, limits_now)):
+        if name != c.name:
+            diffs.append(f"stage {r} card {name!r} -> {c.name!r}")
+        elif lim is None or now is None:
+            diffs.append(f"stage {r} limit {lim} W -> {now} W (unknown)")
+        elif abs(float(lim) - float(now)) > CARD_POWER_TOLERANCE_W:
+            diffs.append(f"stage {r} {c.name} {lim:.0f} W -> {now:.0f} W")
+    verdict = (
+        "power MATCH (%s): %s" % (
+            source, ",".join("%.0f" % float(l) for _n, l in record if l is not None))
+        if not diffs else "power STALE (%s): %s" % (source, "; ".join(diffs))
+    )
+    log("PP-CUT STAGE FIT POWER: " + verdict)
+    if diffs and not getattr(ns, "pp_cut_stage_fit_stale_ok", False):
+        raise Weg2LaunchRefused(
+            "W40 Weg2PPCutRefused: --pp-cut-stage-fit %s is STALE against this "
+            "boot's metal -- %s. Re-measure (a boot with --p-hostgap at the new "
+            "limits), or pass --pp-cut-stage-fit-stale-ok to price with it anyway "
+            "(the provenance then says STALE)." % (path, "; ".join(diffs)))
+    return cost, prov + " | " + verdict, fitted
 
 
 def per_pair_crossing_ms(
@@ -12492,6 +12930,9 @@ def solve_p_cut(
         stage_fixed_mib=tuple(_csv_floats(ns.pp_cut_stage_fixed_mib)),
         # #114: priced from the chunk P boots with (see the log line below),
         # never the reference boots' 1024 on a wider chunk.
+        # --p-prefill-graph (27B): the SAME vector the ranks book (env_p, see
+        # p_prefill_graph_env); () when off -- the pool model is unchanged.
+        prefill_graph_pool_mib=p_prefill_graph_pool_mib(ns),
         activation_reserve_mib=p_prefill_activation_reserve_mib(
             ns.pp_cut_activation_reserve_mib, int(chunk_tokens)
         ),
@@ -12671,6 +13112,31 @@ def solve_p_cut(
         anchor_attn_ms_per_layer=float(ns.pp_cut_attn_anchor_ms),
         anchor_prefix_tokens=float(ns.pp_cut_attn_anchor_prefix_tokens),
     )
+    # 27B line (user 24.09.): every boot prints its P cards' power limits --
+    # the record a later --pp-cut-stage-fit is checked against.
+    _power_now = card_power_limits_w(cards)
+    log(card_power_line(cards, _power_now))
+    # --pp-cut-stage-fit (default off): the stage cost FITTED from a boot's own
+    # #PGAP lines replaces the bsscale family split above.
+    _fitted_log = None
+    if str(getattr(ns, "pp_cut_stage_fit", "") or "").strip():
+        family_cost, family_prov, _fitted_log = stage_fit_family_cost(
+            ns, cards, int(chunk_tokens), _power_now, log)
+    # --pp-cut-depth-profile (default off): price each candidate over a depth
+    # profile instead of the single design prefix.
+    _depth_profile = None
+    _prof_arg = str(getattr(ns, "pp_cut_depth_profile", "") or "").strip()
+    if _prof_arg:
+        from sglang.srt.planner import pgap_stage_fit as _fit
+
+        try:
+            _depth_profile, _prof_prov = _fit.depth_profile(
+                _prof_arg, int(chunk_tokens), _fitted_log)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        log("PP-CUT DEPTH PROFILE (--pp-cut-depth-profile): %s -- every "
+            "candidate's makespan below is the weighted mean over it, and its "
+            "depth_tokens the profile's mean" % _prof_prov)
     # THE CROSSING FRAME is the same object the depth price already charges:
     # one PPProxyTensors hidden-states frame, [chunk, hidden] in the model
     # dtype. Derived here from the same three numbers rather than restated.
@@ -12747,7 +13213,10 @@ def solve_p_cut(
         per_pair_crossing_ms=pair_ms,
         pinned_layer_set=ns.pp_layer_set or None,
         measured_provenance=(
-            "MEASURED per-layer ms %s (boot bsscale, BSSCALE_0907.md tip "
+            ("makespan priced by the STAGE FIT (--pp-cut-stage-fit, line 'PP-CUT "
+             "depth axis'); the terms that follow only order the enumeration: "
+             if _fitted_log is not None else "")
+            + "MEASURED per-layer ms %s (boot bsscale, BSSCALE_0907.md tip "
             "37c884b0b0: PP0 259.1 ms/32 layers, PP1 632.9/18, PP2 470.2/14, "
             "per full 4096-token chunk at bs6)" % ns.pp_cut_measured_ms_per_layer
         ),
@@ -12769,6 +13238,7 @@ def solve_p_cut(
         # the floor off its own frontier; both None = the operator passed 0.
         pool_floor=pool_floor,
         pool_floor_from_cut=pool_floor_from_cut,
+        depth_profile=_depth_profile,
     )
     # #1305: THE NUMBER, now that the frontier exists.  A W67/W40 raised by
     # the solve above carries the cut and the floor in its own text.
@@ -13544,6 +14014,71 @@ def build_parser() -> argparse.ArgumentParser:
              "allocation instead of the recurrent references' -- D's KV is capped at "
              "the context there, so the freed bytes reach the expert-row edge.")
     ap.add_argument(
+        "--p-prefill-graph", type=int, default=P_PREFILL_GRAPH_DEFAULT,
+        metavar="TOKENS",
+        help="Group P prefill CUDA graph (27B line). 0 (the default) = off: "
+             "argv_p, the P form key and every ledger input are byte-identical "
+             "to a tree without this flag. N > 0 = P captures ONE full prefill "
+             "graph of N tokens (--cuda-graph-config prefill backend 'full', "
+             "bs [N], one request slot) AND runs its chunks at N tokens "
+             "(--chunked-prefill-size N on group P only; D keeps its chunk) -- "
+             "a bucket below the chunk would replay only the rest chunk. The "
+             "capture pool lives in the memory saver's cuda_graph tag, so P's "
+             "sleep releases it and the wake remaps it, like D's decode graphs. "
+             "A shorter rest chunk pads up to N. Batches the graph cannot take "
+             "(two requests, multimodal inputs, input logprobs) run eager and "
+             "are named by the rank line 'PREFILL-GRAPH eager reason='. The "
+             "capture cost per stage is the rank line 'PREFILL-GRAPH captured "
+             "... capture_mib='. Changes P's form key (chunk + graph config "
+             "are device allocations). User goal: 512.")
+    ap.add_argument(
+        "--p-prefill-graph-tiny", default="", metavar="TOKENS[,TOKENS]",
+        help="Only with --p-prefill-graph (27B line). Empty (the default) = off: "
+             "one captured bucket, argv byte-identical. TOKENS = extra, smaller "
+             "prefill graph buckets, e.g. 16: the 1-token END-OF-PREFILL ANCHOR "
+             "chunk every P prompt ends with (and rests up to TOKENS) replays "
+             "that bucket instead of padding to the main one -- measured "
+             "xsn430/xsn433: a padded 1-token replay costs 37/35/38 ms per "
+             "stage, a real 512 chunk ~41/34/38. Captured into the same pool "
+             "(largest first; smaller buckets reuse its blocks); the budget "
+             "post adds the proportional estimate unless "
+             "--p-prefill-graph-pool-mib gives the measured capture_mib. "
+             "Changes P's form key (graph config).")
+    ap.add_argument(
+        "--p-prefill-graph-pool-mib", default="", metavar="MIB[,MIB,MIB]",
+        help="Only with --p-prefill-graph: the 'prefill graph pool' budget post "
+             "per P stage, MiB -- booked by the ranks "
+             "(SGLANG_KV_BUDGET_PREFILL_GRAPH_MIB) AND by the P cut's pool "
+             "model (PhasePoolModel.prefill_graph_pool_mib), one vector for "
+             "both. Empty (default) = the desk ESTIMATE "
+             f"{P_PREFILL_GRAPH_POOL_MIB_PER_512:.0f} MiB per 512 graph tokens "
+             "per stage; pass the measured 'PREFILL-GRAPH captured ... "
+             "capture_mib=' values of a previous boot instead.")
+    ap.add_argument(
+        "--p-prefill-graph-max-prefix", type=int, default=None, metavar="TOKENS",
+        help="Only with --p-prefill-graph: a P chunk whose prefix is LONGER than "
+             "this many tokens runs eager instead of replaying the graph (rank "
+             "census reason 'deep_split'), so deep chunks can take the eager "
+             "KV-split prefill. Default: no threshold (every eligible chunk "
+             "replays). Reaches the ranks as SGLANG_PREFILL_GRAPH_MAX_PREFIX.")
+    ap.add_argument(
+        "--p-deep-split-from", type=int, default=P_DEEP_SPLIT_FROM_DEFAULT,
+        metavar="PREFIX_TOKENS",
+        help="Group P deep-chunk attention form (27B line). 0 (the default) = "
+             "off: group P's environment is byte-identical. N > 0 = an EAGER P "
+             "chunk whose prefix is >= N tokens plans its flashinfer prefill "
+             "with a wave-aware KV split (the extend plan's fixed_split_size; "
+             "rank line 'FI-WAVE-SPLIT'). With the prefill graph on, pair it "
+             "with Agent H's --p-prefill-graph-max-prefix N (same N): the graph "
+             "then declines those chunks (census reason 'deep_split') and they "
+             "take this split -- the graph-mode plan cannot split. Reason, "
+             "measured on xsn426/xsn428: at 512 tokens head_dim 256 gives 192 "
+             "attention CTAs, two rounds on the 5090's 170 SMs. The 3080 stages "
+             "find no gain and keep the stock plan. Crossover from the same "
+             f"fits: ~{P_DEEP_SPLIT_FROM_FIT} (eager PP0 host launch ~57 ms "
+             "against the graph's 41.9 + 1.432 ms per 1k prefix). Env names in "
+             "layers/attention/fi_prefill_wave_split.py.")
+    ap.add_argument(
         "--transport", choices=["bar1", "nccl"], default="bar1",
         help="Collective transport for BOTH groups. 'bar1' is the shipping "
              "default. 'nccl' is the DEVELOPMENT mode of the user's order of "
@@ -14096,6 +14631,43 @@ def build_parser() -> argparse.ArgumentParser:
              "PINNED and priced on the same axis.",
     )
     ap.add_argument(
+        "--p-host-overlap", action="store_true",
+        help="Group P: let each stage's host work for the NEXT prefill chunk run "
+             "while the forward it just launched computes (managers/"
+             "weg2_p_overlap.py). Adds SGLANG_WEG2_P_HOST_OVERLAP=1 and "
+             "upstream's SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM=1 to group P "
+             "only: a middle chunk exchanges no output (the last rank stops "
+             "waiting on its own forward), the last rank fences its schedule "
+             "stream device-side instead, and the chunked-prefill HiCache "
+             "publish moves from the plan to right after the next launch. "
+             "Measured reason (weg2xsn420, 4x98k): PP2 pass 873 ms vs 733 "
+             "gpu-ms, ~95-140 ms card idle per 4096 chunk, flat over depth. "
+             "Default off = argv and env byte-identical to before.",
+    )
+    ap.add_argument(
+        "--p-hostgap", action="store_true",
+        help="Group P: the #PGAP instrument (SGLANG_WEG2_P_HOSTGAP=1) -- one "
+             "line per forward with the card's idle before it (timing events on "
+             "the forward stream, harvested without a sync) and the host phases "
+             "since the previous launch. For the --p-host-overlap A/B; default "
+             "off.",
+    )
+    ap.add_argument(
+        "--p-prefill-graph-split", type=int, default=P_PREFILL_GRAPH_SPLIT_DEFAULT,
+        metavar="MAX_CHUNKS",
+        help="Group P, only with --p-prefill-graph (27B line). 0 (the default) = "
+             "off: the full prefill graph keeps flashinfer's own plan, env "
+             "byte-identical. N >= 2 = the captured attention grid is sized for "
+             "up to N KV chunks per q tile and every replay plans its own chunk "
+             "count by the wave rule (rank lines 'FI-GRAPH-SPLIT armed' / "
+             "'FI-GRAPH-SPLIT split ...'), in EVERY depth, no eager fallback "
+             "needed. Why: flashinfer's graph plan assumes 2 CTAs/SM "
+             "(scheduler.cuh:717, real occupancy 1 for fp8 KV hd256) and caps "
+             "the grid at 85 work items per KV head on the 5090, so 48 q tiles "
+             "are never split: 192 CTAs on 170 SMs, two rounds. 7 = 99 %% wave "
+             "fill (192 x 7 on 170 SMs), 44 MB of the float workspace. "
+             "layers/attention/fi_graph_split.py.")
+    ap.add_argument(
         "--p-bubble-measured-from", default="",
         help="Path of the group-P log whose PP-BUBBLE lines feed "
              f"--p-microbatch-depth. Unset = the newest log in {EVIDENCE_DIR} "
@@ -14127,6 +14699,39 @@ def build_parser() -> argparse.ArgumentParser:
              "optimal placement of the 16 attention layers is a FUNCTION of "
              "this number, not a constant.",
     )
+    ap.add_argument(
+        "--pp-cut-stage-fit", default="", metavar="P_LOG|auto",
+        help="27B line, default off (unset = the bsscale 4096 family split "
+             "prices the P cut, as before). A group-P log with #PGAP lines "
+             "(--p-hostgap), or 'auto' = the newest such log at THIS boot's P "
+             "chunk size: every forward's gpu_fwd_ms is joined to its chunk's "
+             "prefix and fitted per stage as a + b*(prefix+C/2)/1000 (device-"
+             "bound chunks only), and the solver prices every candidate cut with "
+             "the per-layer, per-attention-layer and per-forward costs that fit "
+             "implies (planner/pgap_stage_fit.py). The pool floor is untouched. "
+             "The fitted boot's power record (its front log's CARD-POWER line, "
+             "else --pp-cut-stage-fit-power) must match this boot's metal, else "
+             "W40 (--pp-cut-stage-fit-stale-ok prices with it anyway, marked "
+             "STALE). The cut itself stays free: --pp-stage-ratio / "
+             "--pp-attn-stage-ratio pin any P cut.")
+    ap.add_argument(
+        "--pp-cut-stage-fit-power", default="", metavar="W,W,W",
+        help="Only with --pp-cut-stage-fit, for a fitted boot that printed no "
+             "CARD-POWER record: the per-stage power limits it ran at, W "
+             "(user measurement 24.09. ~18:55Z: 400,230,230). Compared with "
+             "this boot's NVML limits like a printed record.")
+    ap.add_argument(
+        "--pp-cut-stage-fit-stale-ok", action="store_true",
+        help="Only with --pp-cut-stage-fit: price with a fit whose card or "
+             "power limit differs from this boot's metal (default: W40).")
+    ap.add_argument(
+        "--pp-cut-depth-profile", default="", metavar="ladder:N,N,...|fit",
+        help="27B line, default off (unset = price every cut at the single "
+             "design prefix, as before). 'ladder:2048,8192,32768' = each "
+             "candidate's makespan is the mean over every chunk start of those "
+             "prompt lengths, rungs weighted equally -- a max of lines is not "
+             "the line of the mean, so a prompt ladder is priced on its own "
+             "chunks; 'fit' = over the --pp-cut-stage-fit log's own chunks.")
     ap.add_argument(
         "--pp-cut-design-prefix-from", default="",
         help="Path of the P log whose prefill census feeds "
@@ -14593,6 +15198,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         calib_identity.accepts_sample if calib_identity is not None else None)
     calib_log_accept = calib_log_accept_of(ns)
     apply_spec_form(ns)
+    apply_p_prefill_graph(ns)
     # #1386: THE SWITCH IS RESOLVED HERE, ONCE, AS EARLY AS `ns` EXISTS --
     # earlier than `draft_kv_on_p` below, because the FIRST `common_flags`
     # call (the sentinel `chunk_tokens` solve, several hundred lines down)
@@ -15257,6 +15863,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         draft_kv_on_p, draft_on_p_prov,
         [] if draft_kv_on_p else strip_speculative_flags(shlex.split(ns.extra_p))[1]))
     log(f"WEG2-HOST d_draft_host={d_draft_host_mib:.0f} MiB -- {d_draft_host_prov}")
+    if p_prefill_graph_bucket():
+        # Only when on: the default boot's front log stays byte-identical.
+        log(p_prefill_graph_line())
     if not hicache_disabled:
         log(hicache_draft_tier_line())
     # --d-replayssm-spec (27B ReplaySSM S6): D's verify form, both states named.
@@ -15986,6 +16595,62 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # nodes, 2.0-2.8 s flush drain at the flip) does not build behind a
     # prefill that never idles.  P only; D keeps the default (decode graphs).
     env_p.setdefault("SGLANG_HICACHE_WRITE_STREAM_PRIORITY", "-1")
+    # P-HOST-OVERLAP / #PGAP (managers/weg2_p_overlap.py): group P only, both
+    # default off -- off adds nothing, so argv and env stay byte-identical.
+    env_p.update(p_host_overlap_env(
+        getattr(ns, "p_host_overlap", False), getattr(ns, "p_hostgap", False)))
+    for _pline in p_host_overlap_lines(
+            getattr(ns, "p_host_overlap", False), getattr(ns, "p_hostgap", False)):
+        log(_pline)
+    # --p-prefill-graph: {} when off (env byte-identical). The pool vector is
+    # the SAME call the cut's pool model was built from (solve_p_cut).
+    _pg_pool = p_prefill_graph_pool_mib(ns)
+    env_p.update(p_prefill_graph_env(
+        _pg_pool, max_prefix=getattr(ns, "p_prefill_graph_max_prefix", None)))
+    # --p-prefill-graph-split: {} when off (env byte-identical).
+    _gs_env = p_graph_split_env(ns)
+    env_p.update(_gs_env)
+    if _gs_env:
+        log(
+            "WEG2 P-GRAPH-SPLIT: on, up to %s KV chunks inside the prefill graph "
+            "-- group P gets %s; the captured grid is q_tiles x N, every replay "
+            "writes its own work-item arrays (rank lines 'FI-GRAPH-SPLIT')"
+            % (int(getattr(ns, "p_prefill_graph_split", 0)),
+               " ".join("%s=%s" % kv for kv in sorted(_gs_env.items())))
+        )
+    elif int(getattr(ns, "p_prefill_graph_split", 0) or 0):
+        log("WEG2 P-GRAPH-SPLIT: requested but INERT -- --p-prefill-graph is off, "
+            "there is no captured prefill graph to split inside")
+    # --p-deep-split-from: {} when off (env byte-identical).
+    _ds_env = p_deep_split_env(ns)
+    env_p.update(_ds_env)
+    if _ds_env:
+        log(
+            "WEG2 P-DEEP-SPLIT: on from prefix %s tokens -- group P gets %s: an "
+            "eager chunk that deep plans a wave-aware flashinfer KV split (rank "
+            "line 'FI-WAVE-SPLIT')%s"
+            % (
+                int(getattr(ns, "p_deep_split_from", 0)),
+                " ".join("%s=%s" % kv for kv in sorted(_ds_env.items())),
+                "; the prefill graph is ON, so only the chunks its own depth "
+                "threshold hands to eager (--p-prefill-graph-max-prefix, census "
+                "reason 'deep_split') reach the split -- set it to the same N"
+                if p_prefill_graph_bucket() else "",
+            )
+        )
+    if _pg_pool:
+        log(
+            "WEG2 P-PREFILL-GRAPH post 'prefill graph pool' MiB per stage = %s "
+            "(%s; booked by the ranks via SGLANG_KV_BUDGET_PREFILL_GRAPH_MIB and "
+            "by the cut's pool model; full-CG split-kv workspace shared with the "
+            "float workspace via SGLANG_FULL_CG_PREFILL_SHARED_WORKSPACE=1)"
+            % (
+                ",".join("%.1f" % v for v in _pg_pool),
+                "operator value"
+                if str(getattr(ns, "p_prefill_graph_pool_mib", "") or "").strip()
+                else "DESK ESTIMATE, replace by the measured capture_mib",
+            )
+        )
     # TRAIN FIX 5: the chunk size the cut solver was given BEFORE the ring is
     # re-read here against the arm this boot actually chose.  The hoist above
     # rests on --chunked-prefill-size being a CONSTANT of common_flags rather

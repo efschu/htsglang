@@ -39,12 +39,13 @@ import copy
 import inspect
 import logging
 import warnings
-from typing import TYPE_CHECKING, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import torch
 import tqdm
 
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.distributed.pp_typed_channel import CHANNEL_META_KEYS
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -135,6 +136,97 @@ def prefill_failure_msg(backend_name: str) -> str:
     )
 
 
+#: Depth threshold of the full prefill graph, in prefix tokens: a chunk whose
+#: largest prefix exceeds it runs eager (census reason ``deep_split``). Unset
+#: or empty = no threshold (today's behaviour). Set for group P by the weg2
+#: launcher's --p-prefill-graph-max-prefix; the value comes from Agent K's fit
+#: of where the eager KV-split prefill beats the captured plan.
+PREFILL_GRAPH_MAX_PREFIX_ENV = "SGLANG_PREFILL_GRAPH_MAX_PREFIX"
+
+
+def graph_max_prefix_from_env() -> Optional[int]:
+    """The depth threshold, or None for none. A malformed or negative value
+    is refused at runner construction -- a threshold that silently reads as
+    'none' would hand every deep chunk to the graph the operator meant to
+    keep it away from."""
+    import os
+
+    raw = os.environ.get(PREFILL_GRAPH_MAX_PREFIX_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"{PREFILL_GRAPH_MAX_PREFIX_ENV}={raw!r}: expected an integer "
+            "number of prefix tokens (unset = no threshold)"
+        ) from None
+    if value < 0:
+        raise ValueError(
+            f"{PREFILL_GRAPH_MAX_PREFIX_ENV}={value}: must be >= 0 "
+            "(unset = no threshold)"
+        )
+    return value
+
+
+def _stage_tensors_only(
+    proxy: Optional[PPProxyTensors],
+) -> Optional[PPProxyTensors]:
+    """``proxy`` without the typed channel's metadata entries.
+
+    The keys left out are ``pp_typed_channel.CHANNEL_META_KEYS`` -- an
+    explicit list, so a real stage tensor with a dunder name still counts as a
+    stage key. A new PPProxyTensors over the same tensors (no copy); the
+    caller's dict is untouched."""
+    if proxy is None:
+        return None
+    return PPProxyTensors(
+        {k: v for k, v in proxy.tensors.items() if k not in CHANNEL_META_KEYS}
+    )
+
+
+def _own_stage_output(output: PPProxyTensors, rows: int) -> PPProxyTensors:
+    """The stage output a non-last PP stage hands to its proxy send: the first
+    ``rows`` token rows of every tensor, COPIED into fresh allocations.
+
+    A replayed graph writes its output into the SAME memory on every replay
+    (the capture pool), and the carried aux entries are views of the static
+    input buffers the next load_batch refills. The PP send is posted without
+    being joined (joined a lap late, #1015e) and, under --p-host-overlap, one
+    frame is deliberately left in flight -- so an aliased output is rewritten
+    by the next chunk while the send still reads it. A fresh tensor is kept
+    alive by the send's own reference, exactly like the eager path's output.
+    One D2D copy of the frame (2 x 512 x 5120 x 2 B = 10 MiB) per chunk."""
+    return PPProxyTensors(
+        {
+            k: (v[:rows].clone() if torch.is_tensor(v) else v)
+            for k, v in output.tensors.items()
+        }
+    )
+
+
+def _slice_rows(output: Any, rows: int) -> Any:
+    """``output`` cut to its first ``rows`` token rows, structure kept.
+
+    The full backend's captured body returns whatever layer_model.forward
+    returns: a tensor, a ``PPProxyTensors`` on a non-last PP stage, or on a
+    DFlash capture stage the ``(hidden_states, [aux, ...])`` tuple. A bare
+    ``hs[:rows]`` on that tuple slices the TUPLE (two elements) and leaves
+    every tensor at bucket length -- which is what this helper exists to
+    prevent (upstream #35588 carries the same helper)."""
+    if output is None:
+        return None
+    if torch.is_tensor(output):
+        return output[:rows]
+    if isinstance(output, PPProxyTensors):
+        return output[:rows]
+    if isinstance(output, tuple):
+        return tuple(_slice_rows(item, rows) for item in output)
+    if isinstance(output, list):
+        return [_slice_rows(item, rows) for item in output]
+    return output
+
+
 # Names of the static prefill input tensors a Breakable-backed prefill
 # runner owns. Each is a 1-D int64 tensor of length max_bs; captured
 # Breakable segments read from these stable addresses.
@@ -211,6 +303,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
+        # --- pipeline parallelism (full backend only) ------------------
+        # Ported from upstream #35451 ("Support PP in full prefill CUDA
+        # graphs"), extended by the fork's DFlash aux carry. A non-first stage
+        # enters layer_model.forward with pp_proxy_tensors instead of
+        # input_ids / input_embeds; the captured graph reads them from static
+        # buffers that load_batch refreshes from the live proxy.
+        self._pp_proxy_keys = self._resolve_pp_proxy_keys(_prefill_backend_name)
+
         # --- buffers ---------------------------------------------------
         self.buffers: PrefillInputBuffers = PrefillInputBuffers.create(
             device=self.device,
@@ -221,6 +321,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=self.model_runner.model_config.hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
+            pp_proxy_keys=self._pp_proxy_keys,
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -238,6 +339,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             enable_num_token_non_padded=enable_num_token_non_padded(),
             source=self.buffers,
         )
+        # Static stage input the captured body of a non-first PP stage reads
+        # (set before backend resolution: TcPiecewise's compile pass already
+        # runs _run_forward inside resolve_prefill_backend). The dict is the
+        # buffers' own, i.e. the post-share_buffers tensors the registry bound.
+        self._static_pp_proxy_tensors: Optional[PPProxyTensors] = (
+            PPProxyTensors(self.buffers.pp_proxy_tensors)
+            if self.buffers.pp_proxy_tensors is not None
+            else None
+        )
+        # Rate-limited eager-fallback census of the full backend (see
+        # _note_eager): reason -> count. Instrument only, never a gate.
+        self._eager_reasons: Dict[str, int] = {}
+        # Depth threshold of the full backend (graph_max_prefix_from_env):
+        # None = no threshold, today's behaviour.
+        self._graph_max_prefix: Optional[int] = graph_max_prefix_from_env()
 
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
@@ -378,6 +494,47 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and self.model_runner.spec_algorithm.is_none()
         )
 
+    def _resolve_pp_proxy_keys(self, backend_name) -> Optional[Tuple[str, ...]]:
+        """The proxy keys a NON-first PP stage receives, or None.
+
+        ``hidden_states`` and ``residual`` always; plus ``aux_layer_<id>``
+        for every DFlash capture layer an EARLIER stage owns -- the captures
+        ride the proxy stage by stage (distributed/pp_aux_capture.carry_aux_
+        forward) and each stage forwards everything it received. A capture
+        layer is owned by the stage whose [start_layer, end_layer) holds it
+        (qwen3_5.py forward: ``_is_layer_to_capture`` on an owned layer), so
+        the received set is exactly the capture ids below this stage's
+        start_layer. With the DFlash producer off, ``layers_to_capture`` is
+        empty (ModelRunner._dflash_aux_capture_armed) and so is the aux set.
+        """
+        pp_group = self.model_runner.pp_group
+        if int(getattr(pp_group, "world_size", 1)) <= 1 or pp_group.is_first_rank:
+            return None
+        if backend_name != Backend.FULL:
+            raise RuntimeError(
+                "A prefill CUDA graph on a non-first pipeline stage is "
+                f"supported by the 'full' backend only, got {backend_name!r}; "
+                "ModelRunner.init_prefill_cuda_graph keeps every other backend "
+                "off under pp_size > 1."
+            )
+        language_model = getattr(
+            self.model_runner.model, "language_model", self.model_runner.model
+        )
+        layer_model = (
+            language_model.model
+            if hasattr(language_model, "model")
+            and hasattr(language_model.model, "layers")
+            else language_model
+        )
+        start_layer = int(getattr(layer_model, "start_layer", 0))
+        capture_ids = sorted(
+            int(lid) for lid in (getattr(layer_model, "layers_to_capture", None) or [])
+        )
+        from sglang.srt.distributed.pp_aux_capture import AUX_KEY_PREFIX
+
+        aux = tuple(f"{AUX_KEY_PREFIX}{lid}" for lid in capture_ids if lid < start_layer)
+        return ("hidden_states", "residual") + aux
+
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
 
@@ -503,6 +660,24 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             if self.layer_model is not None:
                 positions = self._get_layer_model_positions(forward_batch)
+                # Which position buffer the captured body reads: the replay
+                # eligibility refuses a batch that brings no mrope positions
+                # to a body captured on them (the slot would stay stale).
+                self.__dict__["_captured_mrope"] = bool(
+                    forward_batch.mrope_positions is not None
+                    and positions is forward_batch.mrope_positions
+                )
+                static_pp = getattr(self, "_static_pp_proxy_tensors", None)
+                if static_pp is not None:
+                    # Non-first PP stage (upstream #35451): the body starts
+                    # from the static stage input, never from token ids.
+                    return self.layer_model.forward(
+                        None,
+                        positions,
+                        forward_batch,
+                        None,
+                        pp_proxy_tensors=static_pp[:num_tokens],
+                    )
                 return self.layer_model.forward(
                     forward_batch.input_ids,
                     positions,
@@ -599,6 +774,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.req_pool_indices = s["req_pool_indices"][:r]
             padded_view.extend_seq_lens = s["extend_seq_lens"][:r]
             padded_view.extend_prefix_lens = s["extend_prefix_lens"][:r]
+            # The linear-attention (GDN) metadata builds query_start_loc from
+            # the start locations, so it needs the slot-padded vector too
+            # (sentinel starts = the real token count, set in load_batch).
+            padded_view.extend_start_loc = s["extend_start_loc"][:r]
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
         if not self.use_captured_attn_metadata:
@@ -612,9 +791,104 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch=static_forward_batch,
         )
 
+    def _full_graph_ineligible_reason(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[str]:
+        """Why a batch cannot replay the FULL prefill graph (None = it can).
+
+        The full backend captures the transformer BODY only; the LM head and
+        the logits processor run eagerly on the live batch. Hence two
+        deliberate differences from the breakable / piecewise rule set below:
+
+        * the hidden-state mode is ``captured >= requested`` (upstream's
+          _validate_capture_hidden_mode), not equality -- the body is
+          identical for NULL / LAST / FULL and only the eager tail reads it.
+          The P group needs this: its DFlash-family runner captures FULL,
+          while its extend batches carry NULL on every stage but the
+          producer's (scheduler._draft_kv_producer_wants).
+        * only a plain EXTEND replays, and never a batch with multimodal
+          inputs: the captured body has no deepstack injection and its
+          linear-attention metadata serves plain EXTEND alone
+          (hybrid_linear_attn_backend.is_plain_extend_graph_mode).
+        """
+        if forward_batch.batch_size > self._capture_req_slots:
+            return "bs>slots"
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return f"mode={getattr(forward_batch.forward_mode, 'name', forward_batch.forward_mode)}"
+        if forward_batch.input_embeds is not None:
+            return "input_embeds"
+        if forward_batch.replace_embeds is not None:
+            return "replace_embeds"
+        contains_mm = getattr(forward_batch, "contains_mm_inputs", None)
+        if callable(contains_mm) and contains_mm():
+            return "mm_inputs"
+        if (
+            self.__dict__.get("_captured_mrope", False)
+            and forward_batch.mrope_positions is None
+        ):
+            return "mrope_missing"
+        mode = forward_batch.capture_hidden_mode
+        if mode is not None and self.capture_hidden_mode < mode:
+            return "capture_hidden_mode"
+        if self._has_inactive_dp_rank(forward_batch):
+            return "inactive_dp_rank"
+        if (
+            forward_batch.global_num_tokens_cpu is not None
+            and not forward_batch.can_run_dp_breakable_cuda_graph
+        ):
+            return "dp"
+        if forward_batch.return_logprob:
+            for start_len, seq_len in zip(
+                forward_batch.extend_logprob_start_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+            ):
+                if start_len is not None and start_len < seq_len:
+                    return "input_logprob"
+        if len(forward_batch.input_ids) > self.max_num_tokens:
+            return "tokens>bucket"
+        max_prefix = self.__dict__.get("_graph_max_prefix")
+        if max_prefix is not None:
+            prefix = max(forward_batch.extend_prefix_lens_cpu or [0])
+            if prefix > max_prefix:
+                # Deep chunks go eager, where the KV-split prefill (Agent K,
+                # 2026-09-24) can widen the attention grid past what a
+                # captured plan holds (5090: 192 CTAs on 170 SMs at 512).
+                return "deep_split"
+        return None
+
+    def _note_eager(self, reason: str, forward_batch: ForwardBatch) -> None:
+        """Name every full-backend eager fallback, rate-limited to occurrences
+        1, 2, 4, 8, ... per reason; ``occurrence=`` is the denominator. A
+        graph that silently never replays is indistinguishable from one that
+        does, which is exactly what this line is for."""
+        counts = self.__dict__.setdefault("_eager_reasons", {})
+        n = counts.get(reason, 0) + 1
+        counts[reason] = n
+        if n & (n - 1):
+            return
+        logger.info(
+            "PREFILL-GRAPH eager reason=%s occurrence=%d bs=%d tokens=%s "
+            "mode=%s buckets=%s slots=%d",
+            reason,
+            n,
+            int(forward_batch.batch_size),
+            (
+                len(forward_batch.input_ids)
+                if forward_batch.input_ids is not None
+                else None
+            ),
+            getattr(forward_batch.forward_mode, "name", forward_batch.forward_mode),
+            list(self.capture_num_tokens),
+            int(self._capture_req_slots),
+        )
+
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
-            return False
+        if self._is_full_backend:
+            reason = self._full_graph_ineligible_reason(forward_batch)
+            if reason is not None:
+                self._note_eager(reason, forward_batch)
+                return False
+            return True
         if forward_batch.input_embeds is not None:
             return False
         if forward_batch.replace_embeds is not None:
@@ -919,12 +1193,40 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         bs = forward_batch.batch_size
         self.raw_bs = bs
 
+        live_pp = kwargs.get("pp_proxy_tensors")
+        static_pp = getattr(self, "_static_pp_proxy_tensors", None)
+        stage_pp = None
+        if static_pp is not None:
+            # The live proxy is the typed channel's message: stage tensors PLUS
+            # the channel's metadata (``__msg_type__`` always rides along into
+            # the PPProxyTensors -- boot weg2xsn427 died here reading it as a
+            # stage key). Only the stage tensors are compared and copied; the
+            # metadata is left out by its EXPLICIT name list, never by prefix.
+            # The caller's dict is not mutated: the eager tail still gets the
+            # message exactly as it arrived.
+            stage_pp = _stage_tensors_only(live_pp)
+            # The captured body of a non-first stage reads EXACTLY these keys.
+            # A different live key set is a configuration drift (e.g. the
+            # DFlash aux carry armed on one stage and not on its peer), never a
+            # batch property -- refuse by name rather than replay a static
+            # buffer the live proxy did not refresh.
+            live_keys = sorted(stage_pp.tensors) if stage_pp is not None else None
+            if live_keys != sorted(static_pp.tensors):
+                raise RuntimeError(
+                    "PREFILL-GRAPH pp proxy key mismatch on a non-first stage: "
+                    f"captured {sorted(static_pp.tensors)}, live stage keys "
+                    f"{live_keys} (channel metadata left out: "
+                    f"{sorted(k for k in (live_pp.tensors if live_pp is not None else ()) if k in CHANNEL_META_KEYS)}). "
+                    "The captured body would read stale stage input."
+                )
+
         self.buffer_registry.fill_from(
             forward_batch,
             raw_bs=bs,
             padded_bs=bs,
             raw_num_tokens=num_tokens,
             padded_num_tokens=static_num_tokens,
+            pp_proxy_tensors=stage_pp,
         )
 
         registry = self.buffer_registry
@@ -1069,6 +1371,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 s["extend_start_loc"][bs:r].fill_(self.raw_num_tokens)
                 s["req_pool_indices"][bs:r].zero_()
                 s["orig_seq_lens"][bs:r].zero_()
+                # Upstream #34184: the captured track scatter reads these rows
+                # too, and a stale mask row still carries a live destination
+                # slot: it would land this replay's conv/GDN window in an
+                # earlier request's checkpoint. fill_from() runs with
+                # padded_bs == raw_bs here, so it never resets [bs:r] itself.
+                registry = self.buffer_registry
+                for name in ("mamba_track_mask", "mamba_track_indices"):
+                    if registry.has_slot(name):
+                        registry.get_slot(name).buffer[bs:r].zero_()
 
         # Refresh the static buffer the captured graph reads from.
         if (
@@ -1117,12 +1428,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         ie = layer_kwargs.get("input_embeds")
                         if ie is None and ie_idx is not None and len(args) > ie_idx:
                             ie = args[ie_idx]
+                        if (
+                            ie is None
+                            and full_path
+                            and self.model_runner.pp_group.is_first_rank
+                        ):
+                            # Upstream #39574: an outer forward that hands the
+                            # body token ids instead of embeddings would
+                            # otherwise replay the PREVIOUS batch's embeds.
+                            ids = args[0] if args else layer_kwargs.get("input_ids")
+                            if ids is not None:
+                                ie = self.model_runner.model.get_input_embeddings()(
+                                    ids
+                                )
                         if ie is not None:
+                            # Head-only copy (upstream #39574): under full
+                            # padding the live embeds carry raw_num_tokens rows
+                            # while the slot holds the bucket; load_batch has
+                            # already zeroed the padded tail of the slot.
                             self.buffer_registry.get_slot("input_embeds").slice_for(
                                 1, static_n
-                            ).copy_(ie[:static_n])
+                            )[: ie.shape[0]].copy_(ie[:static_n])
                     hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
-                    return hs[:raw_num_tokens] if full_path else hs
+                    return _slice_rows(hs, raw_num_tokens) if full_path else hs
 
                 original_layer_forward = self.layer_model.forward
                 self.layer_model.forward = replay_layer_forward
@@ -1222,6 +1550,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 return output
             else:
                 assert isinstance(output, PPProxyTensors)
-                raise NotImplementedError(
-                    "PPProxyTensors is not supported in PrefillCudaGraphRunner yet."
-                )
+                if not self._is_full_backend:
+                    raise NotImplementedError(
+                        "PPProxyTensors is supported by the full prefill "
+                        "CUDA graph backend only."
+                    )
+                # Non-last PP stage under the full backend (upstream #35451):
+                # the stage output, raw rows only -- and OWNED (_own_stage_
+                # output), never the graph's buffers. Boot weg2xsn428 read the
+                # opposite assumption: this fork POSTS a proxy send without
+                # joining it (_pp_commit_comm_work -> _pp_post_send, joined a
+                # lap late, #1015e; under --p-host-overlap bound_proxy_lead
+                # keeps one frame in flight on purpose), so the NEXT chunk's
+                # replay overwrote this chunk's hidden_states / residual --
+                # graph-pool memory, and the aux carry's views of the static
+                # input buffers -- while the send was still reading them.
+                # Eager is immune: its outputs are fresh allocations the send
+                # keeps alive until it is joined.
+                return _own_stage_output(output, self.raw_num_tokens)

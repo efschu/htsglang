@@ -5,11 +5,15 @@ from typing import Optional, Union
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.fla.index import note_host_seq_lens
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
+)
+from sglang.srt.layers.attention.mamba.mamba_state_indices_triton import (
+    fused_replay_state_indices,
 )
 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_conv_window_scatter_with_mask,
@@ -19,6 +23,7 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
 from sglang.srt.layers.prefill_timing import StageHead, flush_wait
 from sglang.srt.layers.fwd_timeline import fwd_mark
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -85,6 +90,14 @@ def _attn_timing_note(kind: str, e0, e1) -> None:
     _ATTN_T["ev"][kind].append((e0, e1))
 
 
+def is_plain_extend_graph_mode(forward_mode: ForwardMode) -> bool:
+    """The one forward mode the FULL prefill graph's linear-attention
+    metadata serves: a plain EXTEND. MIXED (decode rows inside), target
+    verify, draft extend, split prefill and dLLM extend keep their own paths
+    -- and under the full prefill graph they are refused, never mapped."""
+    return forward_mode == ForwardMode.EXTEND
+
+
 class MambaAttnBackendBase(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
@@ -123,6 +136,33 @@ class MambaAttnBackendBase(AttentionBackend):
         self._verify_query_start_loc_by_rows: dict = {}
         self._cuda_graph_max_bs: int = 0
         self.conv_states_shape: tuple[int, int] = None
+        # P prefill graph (full backend, plain EXTEND): static query_start_loc
+        # and state-index buffers per request-slot count. Deliberately NOT the
+        # decode lists above: the prefill runner captures BEFORE the decode
+        # runner (model_runner.init_cuda_graphs), and init_cuda_graph_state
+        # APPENDS -- sharing those lists would shift every decode bucket by
+        # the prefill entries. Empty (never allocated) unless a full prefill
+        # graph captures.
+        self._extend_graph_static: dict = {}
+
+    def _fused_state_indices_ok(self) -> bool:
+        """Upstream #32219 fast path eligibility, asked per replay (the pool
+        object is read live, so a rebinding cannot leave a stale answer).
+
+        The fused kernel gathers ``req_index_to_mamba_index_mapping`` directly,
+        so it is valid only where ``get_mamba_indices`` is that flat gather and
+        the v2p translate is the identity (the static hybrid pool; not the
+        unified pool), and not under ReplaySSM, whose cursor refresh reads the
+        gathered ids."""
+        pool = self.req_to_token_pool
+        return (
+            self.replayssm_write_pos_list is None
+            and str(self.device).startswith("cuda")
+            and isinstance(pool, HybridReqToTokenPool)
+            and type(pool).translate_mamba_indices
+            is HybridReqToTokenPool.translate_mamba_indices
+            and type(pool).get_mamba_indices is HybridReqToTokenPool.get_mamba_indices
+        )
 
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba slot-id translate (identity for the non-unified
@@ -249,6 +289,13 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
+                if _weg2_p_overlap.p_nosync_on():
+                    # P-NOSYNC: FLA's chunk tables for THIS cu_seqlens are
+                    # built from the host lengths (fla/index.py), not by a
+                    # device->host read at the first GDN layer.
+                    note_host_seq_lens(
+                        query_start_loc, forward_batch.extend_seq_lens_cpu
+                    )
                 if (
                     forward_batch.mamba_track_mask is not None
                     and forward_batch.mamba_track_mask.any()
@@ -296,6 +343,13 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if is_plain_extend_graph_mode(forward_batch.forward_mode):
+            # Full prefill CUDA graph (P prefill graph). _replay_metadata
+            # below knows decode / target-verify only and raises for EXTEND.
+            self.forward_metadata = self._extend_graph_metadata(
+                forward_batch, in_capture=in_capture
+            )
+            return
         self.forward_metadata = self._replay_metadata(
             forward_batch.batch_size,
             forward_batch.req_pool_indices,
@@ -308,6 +362,93 @@ class MambaAttnBackendBase(AttentionBackend):
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
         )
+
+    def _extend_graph_buffers(self, slots: int):
+        """(query_start_loc [slots+1] int32, state indices [slots] int32) for
+        a full prefill graph with ``slots`` request slots; allocated once,
+        outside any capture, and refreshed IN PLACE on every replay."""
+        bufs = self._extend_graph_static.get(slots)
+        if bufs is None:
+            bufs = (
+                torch.zeros((slots + 1,), dtype=torch.int32, device=self.device),
+                torch.full(
+                    (slots,), self.pad_slot_id, dtype=torch.int32, device=self.device
+                ),
+            )
+            self._extend_graph_static[slots] = bufs
+        return bufs
+
+    def _extend_graph_metadata(
+        self, forward_batch: ForwardBatch, in_capture: bool
+    ) -> ForwardMetadata:
+        """Out-of-graph metadata for a plain EXTEND under the FULL prefill
+        CUDA graph (the P prefill graph).
+
+        ``forward_batch`` is the runner's slot-padded view: ``batch_size`` is
+        the captured request-slot count, rows past the real requests are
+        zero-length sentinels (``seq_lens_cpu`` 0, ``extend_seq_lens`` 0,
+        ``extend_start_loc`` = the real token count, ``req_pool_indices`` 0).
+
+        Why the captured kernels stay correct for a chunk shorter than the
+        bucket: every GDN extend kernel bounds itself by ``query_start_loc``
+        read ON DEVICE -- the conv kernel returns for token blocks past the
+        sequence end and writes the conv state from the device length, the
+        FLA chunk kernels mask on ``T = eos - bos`` and ``chunk_fwd_h``
+        derives its chunk count in-kernel. Only the GRID is baked at the
+        captured bucket; grid cells past ``T`` load and store nothing.
+
+        The one host-derived input is FLA's chunk index table
+        (``prepare_chunk_indices`` does ``.tolist()``). It is pinned to the
+        static ``query_start_loc`` here, computed once from the CAPTURE
+        content (the full bucket) and held for the process lifetime, so the
+        capture never syncs and the table the graph reads can never be freed
+        by FLA's 4-entry ``tensor_cache`` rotating it out.
+        """
+        if forward_batch.mamba_track_mask is not None:
+            raise NotImplementedError(
+                "P prefill graph: mamba state tracking (mamba_track_mask) is "
+                "not captured by the full prefill graph's EXTEND metadata; "
+                "boot without the prefill graph or without the track."
+            )
+        if self.replayssm_write_pos_list is not None:
+            raise NotImplementedError(
+                "P prefill graph: --enable-linear-replayssm is not supported "
+                "by the full prefill graph's EXTEND metadata."
+            )
+        slots = int(forward_batch.batch_size)
+        qsl, state_idx = self._extend_graph_buffers(slots)
+        # Real rows are the ones with a nonzero HOST seq_len (sentinels carry
+        # 0). Host tensor or list: no device sync.
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is None:
+            real = slots
+        else:
+            real = sum(1 for s in list(seq_lens_cpu)[:slots] if int(s) > 0)
+        real = max(1, min(real, slots))
+        qsl[:slots].copy_(forward_batch.extend_start_loc[:slots])
+        qsl[slots : slots + 1].copy_(
+            forward_batch.extend_start_loc[slots - 1 : slots]
+            + forward_batch.extend_seq_lens[slots - 1 : slots]
+        )
+        mamba_indices = self.req_to_token_pool.get_mamba_indices(
+            forward_batch.req_pool_indices[:slots]
+        )
+        # Translate virtual->physical BEFORE the sentinel poison, exactly as
+        # the eager _forward_metadata does.
+        mamba_indices = self._translate_mamba_indices(mamba_indices)
+        state_idx[:real].copy_(mamba_indices[:real])
+        if real < slots:
+            # Sentinel rows: PAD_SLOT_ID, which both the conv kernel and the
+            # chunked h-kernel skip (chunk_delta_h.py valid_state guard) --
+            # a zero-length row must never read-then-write a live slot.
+            state_idx[real:].fill_(self.pad_slot_id)
+        if in_capture:
+            from sglang.srt.layers.attention.fla.index import (
+                pin_graph_static_cu_seqlens,
+            )
+
+            pin_graph_static_cu_seqlens(qsl)
+        return ForwardMetadata(query_start_loc=qsl, mamba_cache_indices=state_idx)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self._forward_metadata(forward_batch)
@@ -645,14 +786,26 @@ class MambaAttnBackendBase(AttentionBackend):
                 num_padding = torch.count_nonzero(
                     seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
                 )
-        # Make sure forward metadata is correctly handled for padding reqs
-        req_pool_indices[bs - num_padding :] = 0
-        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        # Translate using the LIVE v2p table BEFORE the padding sentinel below;
-        # captured Mamba kernels read state_indices_list as PHYSICAL ids.
-        mamba_indices = self._translate_mamba_indices(mamba_indices)
-        mamba_indices[bs - num_padding :] = -1
-        self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        if self._fused_state_indices_ok():
+            # Upstream #32219 single-launch fast path: mapping gather + padding
+            # sentinel + store into the static buffer, plus zeroing the padded
+            # req_pool_indices rows -- bit-identical to the reference chain.
+            mamba_indices = fused_replay_state_indices(
+                req_pool_indices=req_pool_indices,
+                mamba_index_mapping=self.req_to_token_pool.req_index_to_mamba_index_mapping,
+                out_state_indices=self.state_indices_list[bs - 1],
+                valid_bs=bs - int(num_padding),
+                total_bs=bs,
+            )
+        else:
+            # Make sure forward metadata is correctly handled for padding reqs
+            req_pool_indices[bs - num_padding :] = 0
+            mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+            # Translate using the LIVE v2p table BEFORE the padding sentinel below;
+            # captured Mamba kernels read state_indices_list as PHYSICAL ids.
+            mamba_indices = self._translate_mamba_indices(mamba_indices)
+            mamba_indices[bs - num_padding :] = -1
+            self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
         track_buf = None
