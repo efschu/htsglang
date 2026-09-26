@@ -1253,6 +1253,18 @@ def stream_finish_seen(buf: bytes) -> bool:
     return _STREAM_FINISH_RE.search(buf) is not None
 
 
+#: H61b (2026-09-26): after a client hang-up BEFORE D's end marker, how long
+#: leg 2 keeps reading D for that marker before it aborts D as before. The
+#: end marker and D's usage follow the last content token within the same
+#: scheduler step (Anthropic adapter: content_block_stop, message_delta and
+#: message_stop are yielded back to back after [DONE]; OpenAI wire: finish
+#: chunk, usage chunk, [DONE]), i.e. microseconds to one decode step. A
+#: client that left mid-answer costs D at most this much extra decode (about
+#: 25 tokens at 100 tok/s), then D is aborted. Kept below H61's mid-answer
+#: contract (end 0.6 s after the failed write -> still an abort).
+H61B_END_GRACE_S = 0.25
+
+
 class AnthropicStreamUsage:
     """Roll up an Anthropic SSE stream's usage ACROSS THE WHOLE STREAM.
 
@@ -5108,18 +5120,35 @@ class Front:
                     # finish marker the old abort stands: the error
                     # propagates and closing D's connection aborts decoding
                     # for a client that is gone.
-                    client_io = {"gone": False, "finished": False}
+                    #
+                    # H61b (2026-09-26): THE END IS D'S, NOT THE CLIENT'S.
+                    # Three windows H61 left open, each of which booked no
+                    # presence for a request D had fully served:
+                    #  (a) the finish marker was scanned AFTER the write, so
+                    #      when the hang-up landed between D's last content
+                    #      and its end (Anthropic: after the last
+                    #      content_block_stop, before message_delta), the
+                    #      write of the very chunk that carries the end --
+                    #      and D's usage -- raised with `finished` still
+                    #      False, and that chunk was never fed to the usage
+                    #      reader;
+                    #  (b) only ConnectionResetError was caught, but a write
+                    #      waiting on a paused transport gets aiohttp's plain
+                    #      ConnectionError("Connection lost") from the drain
+                    #      waiter (aiohttp base_protocol.connection_lost);
+                    #  (c) a hang-up one chunk BEFORE D's end marker aborted
+                    #      D although the end -- and D's usage -- was one
+                    #      scheduler step away.
+                    # So the chunk is scanned and fed before it is written,
+                    # any ConnectionError counts as a hang-up, and after a
+                    # hang-up before the marker D is read for at most
+                    # H61B_END_GRACE_S more: the marker arrives -> booked as
+                    # served; it does not -> the old abort (D's connection
+                    # closes, D stops decoding for a client that is gone).
+                    client_io = {"gone": False, "finished": False, "early": False,
+                                 "err": None, "deadline": 0.0}
 
                     async def _push(chunk: bytes) -> None:
-                        if not client_io["gone"]:
-                            try:
-                                await resp.write(chunk)
-                            except ConnectionResetError:
-                                # aiohttp's ClientConnectionResetError is a
-                                # ConnectionResetError.
-                                if not client_io["finished"]:
-                                    raise
-                                client_io["gone"] = True
                         if anth is not None:
                             anth.feed(chunk)
                         _scan_from = max(0, len(tail) - 64)
@@ -5128,6 +5157,31 @@ class Front:
                             client_io["finished"] = True
                         if len(tail) > 262144:
                             del tail[:-131072]
+                        if not client_io["gone"]:
+                            try:
+                                await resp.write(chunk)
+                            except ConnectionError as e:
+                                # aiohttp's ClientConnectionResetError is a
+                                # ConnectionResetError; the drain waiter's
+                                # "Connection lost" is a plain ConnectionError.
+                                client_io["gone"] = True
+                                if not client_io["finished"]:
+                                    client_io["early"] = True
+                                    client_io["err"] = e
+                                    client_io["deadline"] = time.monotonic() + H61B_END_GRACE_S
+
+                    async def _next_d_chunk() -> bytes:
+                        # Same reads as `r.content.iter_any()`; bounded by the
+                        # grace only while the client is gone before the end.
+                        if client_io["gone"] and not client_io["finished"]:
+                            left = client_io["deadline"] - time.monotonic()
+                            if left <= 0:
+                                raise client_io["err"]
+                            try:
+                                return await asyncio.wait_for(r.content.readany(), left)
+                            except asyncio.TimeoutError:
+                                raise client_io["err"]
+                        return await r.content.readany()
 
                     if early_body is not None:
                         # A non-200 whose body this method already consumed
@@ -5136,19 +5190,31 @@ class Front:
                     else:
                         if first_chunk is not None:
                             await _push(first_chunk)
-                        async for chunk in r.content.iter_any():
+                        while True:
+                            chunk = await _next_d_chunk()
+                            if not chunk:
+                                break
                             await _push(chunk)
+                    if client_io["gone"] and not client_io["finished"]:
+                        # The client left and D's stream ended without an end
+                        # marker: not served, exactly as before H61b.
+                        raise client_io["err"]
                     if not client_io["gone"]:
                         try:
                             await resp.write_eof()
-                        except ConnectionResetError:
+                        except ConnectionError:
                             if not client_io["finished"]:
                                 raise
                             client_io["gone"] = True
-                    if client_io["gone"]:
+                    if client_io["early"]:
+                        self.counters["leg2_client_closed_before_end_caught"] += 1
+                        logger.info("WEG2 leg2 rid=%s CLIENT-CLOSED-BEFORE-END-CAUGHT: the client hung up before D's "
+                                    "end marker, which arrived within %.2fs; D's stream was read to its end and is "
+                                    "booked as served (H61b)", rid, H61B_END_GRACE_S)
+                    elif client_io["gone"]:
                         self.counters["leg2_client_closed_after_finish"] += 1
                         logger.info("WEG2 leg2 rid=%s CLIENT-CLOSED-AFTER-FINISH: the client hung up after the "
-                                    "end of the answer was written; D's stream was read to its end and is "
+                                    "end of the answer was sent; D's stream was read to its end and is "
                                     "booked as served (H61)", rid)
                     g.served += 1
                     if anth is not None:
