@@ -50,13 +50,23 @@ THE TWO CLOSES, both on reduces that already run
   needed), so this is the delay-never-force direction: slower (a re-prefill
   the rank could have skipped), never wrong.
 
-WHAT THIS DOES NOT CLOSE, named rather than implied: a group usable match
-strictly between 0 and the local match is only COUNTED
-(``RU FLOOR ABOVE-GROUP``). The benign population there is host-hit skew
-that the synced prefetch extent + #988 LOADBACK already converge (rc9i
-weg2-33-27: host_hit 18304 vs 15744, identical extend); truncating to a
-non-zero group depth would need a recurrent state at exactly that depth on
-this rank, which only a second agreement could establish.
+H96 (rc9l, boot dkrnfbar1rc9l09260540, rid weg2-21-21): the band strictly
+between 0 and the local match was only COUNTED here, on the claim that the
+synced prefetch extent + #988 LOADBACK converge it. They do not: TP0 matched
+19712 on a host-backed anchor (MAMBA-HOST-RESUME depth=19712), TP1/TP2 16384;
+the group usable match was 16384; TP0 logged ``RU FLOOR ABOVE-GROUP``, set
+``#1042 EXTENT 19712`` and ``#988 LOADBACK prefix moved to 19712`` while
+TP1/TP2 took 16384 -- different extend shapes, TP0 JIT-built alone, the group
+stood until the watchdog. The band is therefore ACTED ON now:
+:func:`group_floor_cap` names the group depth and the admission site
+re-matches this rank's key cut to exactly that depth
+(:func:`rematch_at_group_depth`). The group value is the MIN of every rank's
+usable vote, so on the ranks that voted it the depth carries a usable anchor;
+on the asymmetric host tier TP0's host coverage is a superset of TP1/TP2's,
+so the same node carries one here too. If the re-match cannot reach exactly
+that depth on this rank, the rank stops LOUDLY (:class:`RankFloorCapMiss`)
+instead of resuming alone -- a named death, never a silent split
+(raenge-nie-uneins).
 
 PURE ON PURPOSE: every decision is a function of its arguments, so the tests
 drive the real verdict with mock collectives instead of grepping for it.
@@ -262,21 +272,75 @@ def group_floor_zeroes(tree_cache: Any, req: Any, result: Any) -> bool:
                 n,
             )
         return True
-    if verdict == "above_group":
-        _STATS["above_group"] += 1
-        n = _STATS["above_group"]
-        if n <= 20 or n % 256 == 0:
-            logger.info(
-                "RU FLOOR ABOVE-GROUP rid=%s local_match=%d group_usable=%d "
-                "(n=%d): counted, not acted on -- the extent/#988 LOADBACK "
-                "convergence owns this band; a split forward after this line "
-                "names the residual.",
-                rid[:16],
-                local,
-                int(group[rid]),
-                n,
-            )
     return False
+
+
+class RankFloorCapMiss(RuntimeError):
+    """H96: this rank cannot materialize the group's usable match depth."""
+
+
+def _local_match_len(result: Any) -> int:
+    di = getattr(result, "device_indices", None)
+    return (0 if di is None else len(di)) + int(
+        getattr(result, "host_hit_length", 0) or 0
+    )
+
+
+def group_floor_cap(tree_cache: Any, req: Any, result: Any) -> Optional[int]:
+    """Admission-site verdict: the depth THIS rank must cap its match to, or
+    None. Non-None exactly when 0 < group usable match < local match (the
+    ``above_group`` band): every rank then admits the group depth."""
+    group = getattr(tree_cache, TREE_ATTR, None) if tree_cache is not None else None
+    if not group or req is None:
+        return None
+    rid = str(getattr(req, "rid", "") or "")
+    try:
+        local = _local_match_len(result)
+    except Exception:  # noqa: BLE001
+        return None
+    if floor_verdict(local, group.get(rid)) != "above_group":
+        return None
+    return int(group[rid])
+
+
+def rematch_at_group_depth(tree_cache: Any, params: Any, cap: int, local: int) -> Any:
+    """Re-run this rank's match on its key cut to ``cap`` (the group depth).
+
+    Called from ``MambaComponent.finalize_match_result`` BEFORE the COW, so the
+    outer match leaves no copy source and no slot behind; the nested match runs
+    the full component chain (and its own COW) at the group depth, where the
+    planted group value now reads ``agree``. ``params.key`` is already in the
+    match's own units (``maybe_to_bigram_view`` flips it in place), so
+    ``key[:cap]`` cuts at exactly ``cap`` match positions."""
+    import dataclasses
+
+    cut = dataclasses.replace(params, key=params.key[: int(cap)])
+    capped = tree_cache.match_prefix(cut)
+    got = _local_match_len(capped)
+    rid = str(getattr(getattr(params, "req", None), "rid", "") or "")
+    _STATS["above_group"] += 1
+    n = _STATS["above_group"]
+    if got != int(cap):
+        raise RankFloorCapMiss(
+            f"H96 RU FLOOR CAP-MISS rid={rid[:16]} local_match={local} "
+            f"group_usable={cap} capped_match={got}: this rank has no usable "
+            "recurrent anchor at the group depth, so it cannot admit what the "
+            "other TP ranks admit -- stopping instead of resuming alone "
+            "(raenge-nie-uneins; a split extend would hang the group)."
+        )
+    if n <= 20 or n % 256 == 0:
+        logger.warning(
+            "RU FLOOR CAP rid=%s local_match=%d group_usable=%d capped=%d "
+            "(n=%d): this rank matched deeper than the group can use; it "
+            "admits the group depth so every TP rank runs the same extend "
+            "(H96, rc9l weg2-21-21 hung on the uncapped split).",
+            rid[:16],
+            local,
+            cap,
+            got,
+            n,
+        )
+    return capped
 
 
 def stats() -> Dict[str, int]:
