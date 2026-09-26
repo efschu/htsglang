@@ -11,6 +11,96 @@
 #include "hardware_amd_support.h"
 #endif
 
+
+#if defined(USE_CUDA)
+// ---------------------------------------------------------------------------
+// H95c (patch 3): SPAN-MAPPED ALLOCATIONS.  See core.h ``set_spans``.
+// ---------------------------------------------------------------------------
+static CUresult weg2_granularity(CUdevice device, size_t* out) {
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device;
+    return cuMemGetAllocationGranularity(out, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+}
+
+static uint64_t weg2_plan_bytes(const AllocationMetadata& md) {
+    if (md.weg2_plan.empty()) {
+        return (uint64_t) md.size;
+    }
+    uint64_t total = 0;
+    for (size_t i = 0; i < md.weg2_plan.size(); ++i) {
+        total += (uint64_t) (md.weg2_plan[i].second - md.weg2_plan[i].first);
+    }
+    return total;
+}
+
+static uint64_t weg2_mapped_bytes(const AllocationMetadata& md) {
+    if (md.state != AllocationState::ACTIVE) {
+        return 0;
+    }
+    if (md.weg2_extents.empty()) {
+        return (uint64_t) md.size;
+    }
+    uint64_t total = 0;
+    for (size_t i = 0; i < md.weg2_extents.size(); ++i) {
+        total += (uint64_t) md.weg2_extents[i].size;
+    }
+    return total;
+}
+
+//: Unmap and release every page of an ACTIVE allocation (stock or spans).
+static CUresult weg2_unmap_all(void* ptr, AllocationMetadata& md) {
+    if (md.weg2_extents.empty()) {
+        CUresult rc = cuMemUnmap((CUdeviceptr) ptr, md.size);
+        if (rc != CUDA_SUCCESS) return rc;
+        return cuMemRelease(md.allocHandle);
+    }
+    CUresult first = CUDA_SUCCESS;
+    for (size_t i = 0; i < md.weg2_extents.size(); ++i) {
+        const Weg2SpanExtent& e = md.weg2_extents[i];
+        CUresult rc = cuMemUnmap((CUdeviceptr) ((char*) ptr + e.offset), e.size);
+        if (rc == CUDA_SUCCESS) rc = cuMemRelease(e.handle);
+        if (rc != CUDA_SUCCESS && first == CUDA_SUCCESS) first = rc;
+    }
+    md.weg2_extents.clear();
+    return first;
+}
+
+//: Map ``ranges`` of the allocation with one fresh handle each, appending the
+//: extents to ``out``.  On a failure the extents THIS call mapped are unmapped
+//: and released again and the CUresult is returned.
+static CUresult weg2_map_ranges(void* ptr, const AllocationMetadata& md,
+                                const std::vector<std::pair<size_t, size_t>>& ranges,
+                                std::vector<Weg2SpanExtent>* out) {
+    size_t first_new = out->size();
+    for (size_t i = 0; i < ranges.size(); ++i) {
+        size_t off = ranges[i].first;
+        size_t len = ranges[i].second - ranges[i].first;
+        if (len == 0) continue;
+        CUmemGenericAllocationHandle h;
+        CUresult rc = CUDAUtils::cu_mem_create_rc(&h, len, md.device);
+        if (rc == CUDA_SUCCESS) {
+            rc = cuMemMap((CUdeviceptr) ((char*) ptr + off), len, 0, h, 0);
+            if (rc != CUDA_SUCCESS) {
+                cuMemRelease(h);
+            }
+        }
+        if (rc != CUDA_SUCCESS) {
+            for (size_t k = first_new; k < out->size(); ++k) {
+                cuMemUnmap((CUdeviceptr) ((char*) ptr + (*out)[k].offset), (*out)[k].size);
+                cuMemRelease((*out)[k].handle);
+            }
+            out->resize(first_new);
+            return rc;
+        }
+        CUDAUtils::cu_mem_set_access((char*) ptr + off, len, md.device);
+        out->push_back(Weg2SpanExtent{off, len, h});
+    }
+    return CUDA_SUCCESS;
+}
+#endif
+
 TorchMemorySaver::TorchMemorySaver() {}
 
 TorchMemorySaver &TorchMemorySaver::instance() {
@@ -66,8 +156,13 @@ cudaError_t TorchMemorySaver::free(void *ptr) {
         allocation_metadata_.erase(ptr);
     }
 
-    CURESULT_CHECK(cuMemUnmap((CUdeviceptr) ptr, metadata.size));
-    CURESULT_CHECK(cuMemRelease(metadata.allocHandle));
+    if (metadata.weg2_extents.empty()) {
+        CURESULT_CHECK(cuMemUnmap((CUdeviceptr) ptr, metadata.size));
+        CURESULT_CHECK(cuMemRelease(metadata.allocHandle));
+    } else {
+        // H95c: a span-mapped allocation owns one handle per extent.
+        CURESULT_CHECK(weg2_unmap_all(ptr, metadata));
+    }
     CURESULT_CHECK(cuMemAddressFree((CUdeviceptr) ptr, metadata.size));
 
     // C5: give the granules back to whichever allocator owns them.  A freed
@@ -133,7 +228,16 @@ uint64_t TorchMemorySaver::tag_bytes(const std::string& tag) {
     uint64_t total = 0;
     for (auto it = allocation_metadata_.begin(); it != allocation_metadata_.end(); ++it) {
         if (tag.empty() || it->second.tag == tag) {
+#if defined(USE_CUDA)
+            // H95c: the PHYSICAL bytes -- mapped now, or planned for the next
+            // resume; ``metadata.size`` for every allocation without a plan.
+            const AllocationMetadata& md = it->second;
+            total += (md.state == AllocationState::ACTIVE)
+                         ? weg2_mapped_bytes(md)
+                         : weg2_plan_bytes(md);
+#else
             total += static_cast<uint64_t>(it->second.size);
+#endif
         }
     }
     return total;
@@ -182,6 +286,125 @@ bool TorchMemorySaver::ring_stats(HostRingStats* out, std::string* card_uuid) {
         *card_uuid = ring_->card_uuid();
     }
     return true;
+}
+
+int TorchMemorySaver::set_spans(void* ptr, size_t n, const uint64_t* lo, const uint64_t* hi, bool now) {
+#if defined(USE_ROCM)
+    return -5;
+#elif defined(USE_CUDA)
+    const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+    auto it = allocation_metadata_.find(ptr);
+    if (it == allocation_metadata_.end()) {
+        return -1;
+    }
+    AllocationMetadata& md = it->second;
+    if (md.enable_cpu_backup) {
+        return -2;
+    }
+    size_t g = 0;
+    if (weg2_granularity(md.device, &g) != CUDA_SUCCESS || g == 0) {
+        return -4;
+    }
+    std::vector<std::pair<size_t, size_t>> plan;
+    size_t prev_hi = 0;
+    for (size_t i = 0; i < n; ++i) {
+        size_t a = (size_t) lo[i];
+        size_t b = (size_t) hi[i];
+        if (b <= a || a % g != 0 || b % g != 0 || b > md.size || (i > 0 && a < prev_hi)) {
+            return -3;
+        }
+        plan.push_back(std::make_pair(a, b));
+        prev_hi = b;
+    }
+    // One range over the whole allocation IS the stock mapping.
+    if (plan.size() == 1 && plan[0].first == 0 && plan[0].second == md.size) {
+        plan.clear();
+    }
+    md.weg2_plan = plan;
+    if (!now || md.state != AllocationState::ACTIVE) {
+        return 0;
+    }
+    // Apply now: keep every extent wholly inside the new plan (its bytes stay),
+    // unmap the rest, map the uncovered ranges.
+    std::vector<std::pair<size_t, size_t>> want = plan;
+    if (want.empty()) {
+        want.push_back(std::make_pair((size_t) 0, md.size));
+    }
+    std::vector<Weg2SpanExtent> have = md.weg2_extents;
+    if (have.empty()) {
+        have.push_back(Weg2SpanExtent{0, md.size, md.allocHandle});
+    }
+    std::vector<Weg2SpanExtent> kept;
+    for (size_t i = 0; i < have.size(); ++i) {
+        const Weg2SpanExtent& e = have[i];
+        bool inside = false;
+        for (size_t k = 0; k < want.size(); ++k) {
+            if (e.offset >= want[k].first && e.offset + e.size <= want[k].second) {
+                inside = true;
+                break;
+            }
+        }
+        if (inside) {
+            kept.push_back(e);
+        } else {
+            CUresult rc = cuMemUnmap((CUdeviceptr) ((char*) ptr + e.offset), e.size);
+            if (rc == CUDA_SUCCESS) rc = cuMemRelease(e.handle);
+            if (rc != CUDA_SUCCESS) {
+                return (int) rc;
+            }
+        }
+    }
+    // the parts of ``want`` no kept extent covers (extents are disjoint)
+    std::vector<std::pair<size_t, size_t>> gaps;
+    for (size_t k = 0; k < want.size(); ++k) {
+        size_t cur = want[k].first;
+        while (cur < want[k].second) {
+            size_t next_start = want[k].second;
+            size_t covered_to = cur;
+            for (size_t i = 0; i < kept.size(); ++i) {
+                size_t s = kept[i].offset;
+                size_t e2 = kept[i].offset + kept[i].size;
+                if (s <= cur && e2 > cur) {
+                    covered_to = e2;
+                    break;
+                }
+                if (s > cur && s < next_start) {
+                    next_start = s;
+                }
+            }
+            if (covered_to > cur) {
+                cur = covered_to;
+                continue;
+            }
+            gaps.push_back(std::make_pair(cur, next_start));
+            cur = next_start;
+        }
+    }
+    md.weg2_extents = kept;
+    CUresult rc = weg2_map_ranges(ptr, md, gaps, &md.weg2_extents);
+    return rc == CUDA_SUCCESS ? 0 : (int) rc;
+#else
+    #error "USE_PLATFORM is not set"
+#endif
+}
+
+int TorchMemorySaver::alloc_info(void* ptr, uint64_t* size, uint64_t* mapped, uint64_t* planned, int* active) {
+    const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+    auto it = allocation_metadata_.find(ptr);
+    if (it == allocation_metadata_.end()) {
+        return -1;
+    }
+    const AllocationMetadata& md = it->second;
+    if (size != nullptr) *size = (uint64_t) md.size;
+#if defined(USE_CUDA)
+    if (mapped != nullptr) *mapped = weg2_mapped_bytes(md);
+    if (planned != nullptr) *planned = weg2_plan_bytes(md);
+#else
+    if (mapped != nullptr) *mapped = md.state == AllocationState::ACTIVE ? (uint64_t) md.size : 0;
+    if (planned != nullptr) *planned = (uint64_t) md.size;
+#endif
+    if (active != nullptr) *active = md.state == AllocationState::ACTIVE ? 1 : 0;
+    return 0;
 }
 
 void TorchMemorySaver::pause(const std::string& tag) {
@@ -280,8 +503,13 @@ void TorchMemorySaver::pause(const std::string& tag) {
             continue;
         }
 
-        CURESULT_CHECK(cuMemUnmap((CUdeviceptr) ptr, metadata.size));
-        CURESULT_CHECK(cuMemRelease(metadata.allocHandle));
+        if (metadata.weg2_extents.empty()) {
+            CURESULT_CHECK(cuMemUnmap((CUdeviceptr) ptr, metadata.size));
+            CURESULT_CHECK(cuMemRelease(metadata.allocHandle));
+        } else {
+            // H95c: every extent of a span-mapped allocation goes back.
+            CURESULT_CHECK(weg2_unmap_all(ptr, metadata));
+        }
 
         metadata.state = AllocationState::PAUSED;
 
@@ -339,7 +567,7 @@ int TorchMemorySaver::resume(const std::string& tag) {
     // cannot itself perturb the timings it is about to sit beside.
     uint64_t weg2_leg_bytes = 0;
     for (size_t m = 0; m < matched_ptrs.size(); ++m) {
-        weg2_leg_bytes += (uint64_t) allocation_metadata_[matched_ptrs[m]].size;
+        weg2_leg_bytes += weg2_plan_bytes(allocation_metadata_[matched_ptrs[m]]);
     }
 
     // --- pass 1: map every allocation of the tag ---
@@ -348,6 +576,33 @@ int TorchMemorySaver::resume(const std::string& tag) {
         void* ptr = matched_ptrs[m];
         AllocationMetadata& metadata = allocation_metadata_[ptr];
 
+        // H95c (patch 3): an allocation with a span plan maps exactly its plan,
+        // one handle per range; the rest of its VA stays reserved and empty.
+        if (!metadata.weg2_plan.empty()) {
+            CUresult span_rc = weg2_map_ranges(ptr, metadata, metadata.weg2_plan, &metadata.weg2_extents);
+            if (span_rc != CUDA_SUCCESS) {
+                uint64_t weg2_rolled = 0;
+                for (size_t r = 0; r < m; ++r) {
+                    AllocationMetadata& md = allocation_metadata_[matched_ptrs[r]];
+                    weg2_rolled += weg2_mapped_bytes(md);
+                    weg2_unmap_all(matched_ptrs[r], md);
+                    md.state = AllocationState::PAUSED;
+                }
+                const char* err_str = nullptr;
+                cuGetErrorString(span_rc, &err_str);
+                std::cerr << "[core.cpp] WEG2-TMS-RESUME REFUSED tag=" << tag
+                          << " rc=" << (int) span_rc << " (" << (err_str ? err_str : "?") << ")"
+                          << " failed_alloc=" << m << "/" << matched_ptrs.size()
+                          << " failed_bytes=" << weg2_plan_bytes(metadata)
+                          << " (H95c span plan, " << metadata.weg2_plan.size() << " ranges)"
+                          << " rolled_back_bytes=" << weg2_rolled
+                          << " tag_bytes=" << weg2_leg_bytes
+                          << " -- every allocation of the tag is PAUSED again" << std::endl;
+                return (int) span_rc;
+            }
+            metadata.state = AllocationState::ACTIVE;
+            continue;
+        }
         CUmemGenericAllocationHandle newAllocHandle;
         // weg2xsn269: a refused cuMemCreate (OOM on the card) is a RETURN
         // CODE, not an exit(1).  Roll the allocations this call already
@@ -365,10 +620,10 @@ int TorchMemorySaver::resume(const std::string& tag) {
             uint64_t weg2_rolled = 0;
             for (size_t r = 0; r < m; ++r) {
                 AllocationMetadata& md = allocation_metadata_[matched_ptrs[r]];
-                cuMemUnmap((CUdeviceptr) matched_ptrs[r], md.size);
-                cuMemRelease(md.allocHandle);
+                // H95c: an earlier allocation of the tag may be span-mapped
+                weg2_rolled += weg2_mapped_bytes(md);
+                weg2_unmap_all(matched_ptrs[r], md);
                 md.state = AllocationState::PAUSED;
-                weg2_rolled += (uint64_t) md.size;
             }
             const char* err_str = nullptr;
             cuGetErrorString(weg2_rc, &err_str);

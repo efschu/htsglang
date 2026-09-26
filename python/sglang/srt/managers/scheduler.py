@@ -5062,6 +5062,22 @@ class Scheduler(
 
         return d_park_runtime.note_wake_seats(self, recv_req)
 
+    def weg2_d_seat_vram_wake(self, recv_req, seats):
+        """H95c: the phase's seat posts as pages (d_park_runtime.seat_vram_wake)."""
+        from sglang.srt.weg2 import d_park_runtime
+
+        return d_park_runtime.seat_vram_wake(self, recv_req, seats)
+
+    def _weg2_d_seat_cap(self):
+        from sglang.srt.weg2 import d_park_runtime
+
+        return d_park_runtime.seat_cap(self)
+
+    def _weg2_d_seat_guard(self, batch) -> None:
+        from sglang.srt.weg2 import d_park_runtime
+
+        d_park_runtime.seat_guard(self, batch)
+
     # H91d: a parked request's MTP draft rows (weg2/d_park_draft.py).
     def _weg2_d_park_draft_snapshot(self, batch):
         from sglang.srt.weg2 import d_park_draft
@@ -10897,6 +10913,10 @@ class Scheduler(
             get_server_args().pp_max_micro_batch_size,
             self.admission_limiter.current,
         )
+        # H95c: a D phase of n seats runs at most n requests (None = no cap)
+        _seat_cap = self._weg2_d_seat_cap()
+        if _seat_cap is not None:
+            limit = min(limit, _seat_cap)
         # #677 PHASE 1: a carrier the phase FORBIDS to decode stops being
         # charged to the concurrency cap. `limit` bounds how much decode may
         # run at once; a request PP may not decode is running nothing, so
@@ -16119,6 +16139,7 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        self._weg2_d_seat_guard(batch)  # H95c W-SEAT: never wider than the phase's n
 
         # #861 fix (b): a request admitted on a cached prefix whose DRAFT rows
         # nothing wrote must not speculate over them. Here, and not in the
