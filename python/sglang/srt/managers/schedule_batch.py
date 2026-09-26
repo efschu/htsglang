@@ -140,9 +140,16 @@ logger = logging.getLogger(__name__)
 
 def _WEG2_FORK_ANCHOR_ARMED() -> bool:
     """FORK ANCHOR (weg2/fork_anchor.py): the switch, read per extend step
-    (one env lookup; the decode round never calls it)."""
+    (env lookups only; the decode round never calls it). GROUP D ONLY: on
+    group P the prompt ids are already cut at the fork, so a fork token of
+    the chat's LAST message would pull P's inner track back by one chunk
+    (review RV, 26.09.: last message shorter than ~14 tokens)."""
+    import os as _os
+
     from sglang.srt.weg2 import fork_anchor as _fa
 
+    if (_os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() != "D":
+        return False
     return _fa.fork_token() is not None
 
 
