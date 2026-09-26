@@ -323,11 +323,49 @@ def _rows_table_source() -> str:
 #: width is part of the build) and the KV pool tensors (weak references: their
 #: strides and dtype are build keys too). One entry per distinct key, recorded
 #: at the launches the boot already makes (the target's AND the draft's decode
-#: graph capture), so the boot prewarm (qsa/rows_prewarm.py) builds exactly the
-#: variants serving will launch. ``done`` closes the recording after the
-#: prewarm: serving launches then pay one dict read.
+#: graph capture). ``done`` closes the recording after the prewarm: serving
+#: launches then pay one dict read.
+#:
+#: H101b (fnFL2h91bb2, 26.09.): on an fp8 KV pool this record is EMPTY by the
+#: time the prewarm reads it. ``MHATokenToKVPool.get_key_buffer`` returns
+#: ``k_buffer[slot].view(float8_e4m3fn)`` -- a NEW tensor object per call that
+#: nobody holds once the launch returns -- so the weak reference dies with it.
+#: D-TP0 launched the rows kernel in its draft decode capture (14:29:51,
+#: 'QSA-ROWS-LAUNCH ... cfg=32/8/2 first_total_q=6', D-Log Z. 7646) and three
+#: seconds later the prewarm wrote 'skipped: no rows launch recorded'; the P
+#: stages capture no graph at all. The prewarm's primary source is therefore
+#: the DERIVED signature (``register_rows_prewarm_provider`` below): every QSA
+#: backend names its own specialization from its model and pool, whether or
+#: not anything launched. The record stays as a second source (a 16-bit pool
+#: hands out its stored tensor, whose reference lives).
 _ROWS_PREWARM_SIG: dict = {"sigs": {}, "done": False}
 _ROWS_PREWARM_SIG_MAX = 8
+
+
+def rows_prewarm_key(*, heads, head_dim, dtype, k, k_pool, v_pool) -> tuple:
+    """The build key of one rows specialization (what makes Triton compile a
+    separate variant besides the launch form): q heads / head_dim / dtype, the
+    rows width K, the pool dtype and both pool strides."""
+    return (
+        int(heads), int(head_dim), str(dtype), int(k),
+        str(k_pool.dtype), tuple(k_pool.stride()), tuple(v_pool.stride()),
+    )
+
+
+def rows_prewarm_signature(*, heads, head_dim, dtype, k, k_pool, v_pool, source="") -> dict:
+    """A prewarm signature with LIVE pool tensors (what
+    ``rows_prewarm._make_inputs`` and the launch consume)."""
+    return {
+        "key": rows_prewarm_key(heads=heads, head_dim=head_dim, dtype=dtype, k=k,
+                                k_pool=k_pool, v_pool=v_pool),
+        "heads": int(heads),
+        "head_dim": int(head_dim),
+        "dtype": dtype,
+        "k": int(k),
+        "k_pool": k_pool,
+        "v_pool": v_pool,
+        "source": source,
+    }
 
 
 def _note_rows_prewarm_sig(q, k_pool, v_pool, rows) -> None:
@@ -335,19 +373,19 @@ def _note_rows_prewarm_sig(q, k_pool, v_pool, rows) -> None:
 
     try:
         sigs = _ROWS_PREWARM_SIG["sigs"]
-        key = (
-            int(q.shape[1]), int(q.shape[2]), str(q.dtype), int(rows.shape[-1]),
-            str(k_pool.dtype), tuple(k_pool.stride()), tuple(v_pool.stride()),
-        )
+        key = rows_prewarm_key(heads=q.shape[1], head_dim=q.shape[2], dtype=q.dtype,
+                               k=rows.shape[-1], k_pool=k_pool, v_pool=v_pool)
         if key in sigs or len(sigs) >= _ROWS_PREWARM_SIG_MAX:
             return
         sigs[key] = {
+            "key": key,
             "heads": key[0],
             "head_dim": key[1],
             "dtype": q.dtype,
             "k": key[3],
             "k_pool": weakref.ref(k_pool),
             "v_pool": weakref.ref(v_pool),
+            "source": "recorded",
         }
     except Exception:  # noqa: BLE001 -- a record never fails a launch
         pass
@@ -362,6 +400,49 @@ def rows_prewarm_signatures():
         if k_pool is not None and v_pool is not None:
             out.append(dict(sig, k_pool=k_pool, v_pool=v_pool))
     return out
+
+
+#: H101b: the objects (QwenSparseAttnBackend instances: target, draft, draft
+#: steps) that NAME the rows specialization they launch, from their model and
+#: pool, without having launched anything. Weak: a registration never keeps a
+#: backend alive.
+_ROWS_PREWARM_PROVIDERS: list = []
+
+
+def register_rows_prewarm_provider(provider) -> None:
+    """Register an object with ``rows_prewarm_signatures() -> list`` (dicts
+    from :func:`rows_prewarm_signature`). Never raises."""
+    import weakref
+
+    try:
+        if any(ref() is provider for ref in _ROWS_PREWARM_PROVIDERS):
+            return
+        _ROWS_PREWARM_PROVIDERS.append(weakref.ref(provider))
+    except Exception:  # noqa: BLE001 -- a registration never fails an init
+        pass
+
+
+def derived_rows_prewarm_signatures():
+    """(signatures, errors): what every live provider names, one entry per
+    build key, in registration order. A provider that names nothing (no QSA
+    profile, no pool, no full-attention layer in this rank's model) is left
+    out; one that raises is named in ``errors``."""
+    out, seen, errors = [], set(), []
+    for ref in list(_ROWS_PREWARM_PROVIDERS):
+        provider = ref()
+        if provider is None:
+            continue
+        try:
+            sigs = list(provider.rows_prewarm_signatures() or ())
+        except Exception as exc:  # noqa: BLE001 -- named on the prewarm line
+            errors.append(f"{type(provider).__name__}: {type(exc).__name__}: {str(exc)[:120]}")
+            continue
+        for sig in sigs:
+            if sig["key"] in seen:
+                continue
+            seen.add(sig["key"])
+            out.append(sig)
+    return out, errors
 
 
 def close_rows_prewarm_recording() -> None:
