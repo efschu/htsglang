@@ -686,7 +686,7 @@ def on_wake(sched, recv_req, seats) -> Optional[PhaseState]:
     if allocator is not None and hasattr(allocator, "set_phase_limit"):
         size = int(getattr(allocator, "size", 0) or 0)
         want = None if target >= st.cap else phase_slot_limit(size, target, st.cap)
-        if allocator.set_phase_limit(want):
+        if allocator.set_phase_limit(want, seats=target):
             limit = want
         else:
             st.note = ("slots above %s still in use at the wake: slot limit NOT applied, "
