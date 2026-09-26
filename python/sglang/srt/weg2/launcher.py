@@ -1946,6 +1946,108 @@ def p_prefill_activation_reserve_mib(pinned: Optional[float], chunk_tokens: int)
         max(p_prefill_transient_vector_mib(chunk_tokens)),
     )
 
+
+#: --p-chunk-policy on the NF line (H92, user order 25.09. ~21:40Z via 27B:
+#: dynamic P chunk width for NF too, through the 27B interface
+#: weg2/p_chunk_policy.py -- picked from desk/27b-dynchunk-0925, not rebuilt).
+#: The NF side (profile by model key, hard limits, FR_P coupling, stream
+#: budget) lives in weg2/p_chunk_nf.py. 'fixed' (default) changes NOTHING: no
+#: env, no line, argv_p and the P form key byte-identical. Under 'dynamic' the
+#: plan's CEILING is group P's --chunked-prefill-size as it is today
+#: (P_CHUNKED_PREFILL_TOKENS): the plan only chooses widths at or below the
+#: chunk the P card, the transient and FR_P were priced at, so argv_p stays
+#: byte-identical under 'dynamic' too -- only the P group's env carries it.
+P_CHUNK_POLICY_DEFAULT = "fixed"
+P_CHUNK_MODEL_DEFAULT = "auto"
+_P_CHUNK: Dict[str, object] = {"policy": P_CHUNK_POLICY_DEFAULT, "profile": None, "ns": None, "spec": None}
+
+
+def apply_p_chunk_policy(ns, boot_form=None) -> None:
+    """Resolve --p-chunk-policy ONCE, early (a wrong flag dies before any
+    solve): the NF profile of THIS checkpoint (model key, never 27B numbers)
+    and the NF hard limits against the P chunk the planner prices. The spec
+    itself is built at env time (``p_chunk_policy_install``), where FR_P is
+    the effective one (after the H25 draft post)."""
+    from sglang.srt.weg2 import p_chunk_nf as _nf
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+    policy = str(getattr(ns, "p_chunk_policy", P_CHUNK_POLICY_DEFAULT) or P_CHUNK_POLICY_DEFAULT)
+    if policy not in _pcp.POLICIES:
+        raise SystemExit(f"--p-chunk-policy {policy!r}: one of {list(_pcp.POLICIES)}")
+    _P_CHUNK.update(policy=policy, profile=None, ns=None, spec=None)
+    if policy == _pcp.POLICY_FIXED:
+        return
+    model_key = weg2_form.model_key(getattr(ns, "model", "") or "")
+    try:
+        prof = _nf.resolve_profile(
+            str(getattr(ns, "p_chunk_model", P_CHUNK_MODEL_DEFAULT) or P_CHUNK_MODEL_DEFAULT), model_key)
+        if boot_form is not None and prof.profile and boot_form.profile and prof.profile != boot_form.profile:
+            raise _nf.NfChunkRefused(
+                f"NF chunk profile {os.path.basename(prof.path)} is for --profile {prof.profile}, "
+                f"this boot runs --profile {boot_form.profile}")
+        if prof.ceiling_tokens != P_CHUNKED_PREFILL_TOKENS:
+            raise _nf.NfChunkRefused(
+                f"NF chunk profile {os.path.basename(prof.path)} was measured at P chunk "
+                f"{prof.ceiling_tokens}, this boot prices {P_CHUNKED_PREFILL_TOKENS} "
+                f"(SGLANG_WEG2_P_CHUNKED_PREFILL_TOKENS): a_s belongs to its own residency")
+        _p_chunk_nf_limits(ns, len(prof.stages))
+    except _nf.NfChunkRefused as exc:
+        raise SystemExit(f"--p-chunk-policy dynamic (NF): {exc}")
+    _P_CHUNK.update(profile=prof, ns=ns)
+
+
+def _p_chunk_nf_limits(ns, stages: int):
+    from sglang.srt.weg2 import p_chunk_nf as _nf
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+    try:
+        support = int(max(P_PREFILL_TRANSIENT_SUPPORT.chunks))
+    except (AttributeError, TypeError, ValueError):
+        support = 0
+    return _nf.nf_limits(
+        ceiling=P_CHUNKED_PREFILL_TOKENS,
+        max_tokens=int(getattr(ns, "p_chunk_max", 0) or 0),
+        min_tokens=int(getattr(ns, "p_chunk_min", 0) or 0),
+        fixed_tokens=int(getattr(ns, "p_chunk_fixed", 0) or 0),
+        raster=int(getattr(ns, "p_chunk_raster", 0) or _nf.NF_RASTER_TOKENS),
+        transient_support_max=support,
+        min_gain=float(getattr(ns, "p_chunk_min_gain", _pcp.DEFAULT_MIN_GAIN)),
+        dynamic_min_tokens=int(getattr(ns, "p_chunk_dynamic_min_tokens", -1)),
+        stages=stages,
+    )
+
+
+def p_chunk_policy_install(env_p: Dict[str, str]) -> Tuple[Dict[str, str], List[str]]:
+    """``(env additions for group P, launcher lines)``; ``({}, [])`` under
+    'fixed' (env and front log byte-identical). FR_P is read from the group
+    P environment that ships (the effective vector after the draft post)."""
+    from sglang.srt.weg2 import p_chunk_nf as _nf
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+    prof = _P_CHUNK.get("profile")
+    if prof is None:
+        return {}, []
+    fr = _nf.parse_fractions(env_p.get("SGLANG_MOE_RESIDENT_EXPERT_FRACTION", ""))
+    try:
+        stages, fr_note = _nf.fr_adjusted_stages(prof, fr)
+        limits = _p_chunk_nf_limits(_P_CHUNK["ns"], len(stages))
+    except _nf.NfChunkRefused as exc:
+        raise Weg2LaunchRefused(f"--p-chunk-policy dynamic (NF): {exc}") from None
+    spec = _pcp.PolicySpec(stages, limits, prof.source)
+    _P_CHUNK["spec"] = spec
+    env = {_pcp.POLICY_ENV: _pcp.POLICY_DYNAMIC, _pcp.SPEC_ENV: spec.to_json(),
+           _nf.BUDGET_ENV: _nf.BUDGET_STREAM}
+    lines = ["WEG2 " + _pcp.armed_line(spec, "group=P line=NF budget=stream")
+             + f" -- ceiling = group P's --chunked-prefill-size {P_CHUNKED_PREFILL_TOKENS} (unchanged), "
+               f"raster {limits.page} = ChunkLimits.page, profile {os.path.basename(prof.path)}, {fr_note}"]
+    lines.extend(_nf.dry_run_lines(spec))
+    return env, lines
+
+
+def p_chunk_policy_spec():
+    """The installed PolicySpec, None under 'fixed' (or before install)."""
+    return _P_CHUNK.get("spec")
+
 #: The `gapped corridor holdback` post, MiB per rank. 1.000 GiB on every rank
 #: of both boots. This is the term ARMING_FLOOR_MIB was standing in for, and
 #: they are NOT the same thing: the runtime charges this holdback and no
@@ -13129,6 +13231,43 @@ def build_parser() -> argparse.ArgumentParser:
                          f"(user order 2026-09-10); 127.0.0.1 keeps it host-local. Refused before any group "
                          f"is spawned if the address cannot be bound (e.g. the temporary LAN forwarder "
                          f"weg2-lan-forward.socket still holds the port).")
+    ap.add_argument(
+        "--p-chunk-policy", choices=["fixed", "dynamic"], default=P_CHUNK_POLICY_DEFAULT,
+        help="H92: group P prefill chunk width through the shared 27B/NF interface "
+             "weg2/p_chunk_policy.py. 'fixed' (default) = today: every forward takes "
+             "SGLANG_WEG2_P_CHUNKED_PREFILL_TOKENS; argv, env and the P form key are "
+             "byte-identical. 'dynamic' = the forward budget from a flow-shop plan over the "
+             "P stages on the NF profile of THIS checkpoint (weg2/p_chunk_nf.py), planned "
+             "over the token stream of every waiting request (P stau); widths on the 4096 "
+             "raster, never above the priced P chunk. Lines 'WEG2 P-CHUNK-POLICY armed/plan'.")
+    ap.add_argument(
+        "--p-chunk-model", default=P_CHUNK_MODEL_DEFAULT, metavar="SRC",
+        help="Only with --p-chunk-policy dynamic: 'auto' (default) = the *.pchunk.json in "
+             "weg2/p_stage_model_data whose model_key is this --model's directory name, or a "
+             "path to one; the 27B sources (builtin-int8, fit:) are refused on this line.")
+    ap.add_argument(
+        "--p-chunk-max", type=int, default=0, metavar="TOKENS",
+        help="Only with --p-chunk-policy dynamic: the widest planned chunk; 0 (default) = "
+             "the P chunk (SGLANG_WEG2_P_CHUNKED_PREFILL_TOKENS). Above it is refused.")
+    ap.add_argument(
+        "--p-chunk-min", type=int, default=0, metavar="TOKENS",
+        help="Only with --p-chunk-policy dynamic: the smallest planned chunk; 0 (default) = 4096.")
+    ap.add_argument(
+        "--p-chunk-fixed", type=int, default=0, metavar="TOKENS",
+        help="Only with --p-chunk-policy dynamic: the fixed baseline; must be the P chunk "
+             "(0, the default, is that).")
+    ap.add_argument(
+        "--p-chunk-raster", type=int, default=0, metavar="TOKENS",
+        help="Only with --p-chunk-policy dynamic: the NF chunk raster (0 = 4096, the only "
+             "accepted value; ChunkLimits.page).")
+    ap.add_argument(
+        "--p-chunk-min-gain", type=float, default=0.01, metavar="FRACTION",
+        help="Only with --p-chunk-policy dynamic: a plan other than fixed is taken only when "
+             "predicted at least this much faster (default 0.01).")
+    ap.add_argument(
+        "--p-chunk-dynamic-min-tokens", type=int, default=-1, metavar="TOKENS",
+        help="Only with --p-chunk-policy dynamic: a stream whose rest is at most this many "
+             "tokens is not planned (fixed width). -1 (default) = the P chunk.")
     ap.add_argument("--p-bs", type=int, default=DEFAULT_P_BS,
                     help=f"K1: group P's --max-running-requests AND the front's leg-1 concurrency. "
                          f"Independent of --d-bs (law 2). Default {DEFAULT_P_BS} by the user order of "
@@ -14469,6 +14608,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if boot_form is not None else None)
     calib_log_accept = calib_log_accept_of(ns)
     apply_spec_form(ns)
+    # H92 --p-chunk-policy: resolved early (profile by model key, NF hard
+    # limits); 'fixed' returns at once. The spec is built with env_p below.
+    apply_p_chunk_policy(ns, boot_form)
     # #1386: THE SWITCH IS RESOLVED HERE, ONCE, AS EARLY AS `ns` EXISTS --
     # earlier than `draft_kv_on_p` below, because the FIRST `common_flags`
     # call (the sentinel `chunk_tokens` solve, several hundred lines down)
@@ -15823,6 +15965,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
+    # H92 --p-chunk-policy: ({}, []) under 'fixed' -- env and front log
+    # byte-identical. FR_P is read from THIS env_p (the vector that ships).
+    _pcp_env, _pcp_lines = p_chunk_policy_install(env_p)
+    env_p.update(_pcp_env)
+    for _pcl in _pcp_lines:
+        log(_pcl)
     # #1465: group P's write-through copy kernels at high stream priority, so
     # the backlog measured on weg2xsn219 (P running-req 2: 72 -> 103 un-backed
     # nodes, 2.0-2.8 s flush drain at the flip) does not build behind a
