@@ -45,6 +45,13 @@ the front inherit the same value -- the B4k pattern), and ONE accessor,
 :func:`current_form`.  ``None`` means "not a weg2 boot" and every form
 declaration then applies, so non-weg2 paths never change behaviour.
 
+THE MODEL-PROFILE REGISTRY (UNIFY S3): :class:`ModelProfile` rows in
+:data:`PROFILES` carry what is KNOWN about a model -- its form expectations
+(:data:`PROFILE_EXPECT` is derived from them), the rank switches whose default
+follows the model (:data:`PROFILE_SWITCH_DEFAULTS`, derived), per-group env
+rows, and its measured constants with provenance (:func:`profile_constant`).
+Ranks read the row through the published form (:func:`current_profile`).
+
 Torch-free and launcher-free on purpose: ranks import this module.
 """
 
@@ -78,48 +85,407 @@ STATED_AXES: Tuple[str, ...] = ("arch", "experts", "draft", "p_draft", "kv")
 
 PROFILE_QWEN27B = "qwen27b"
 PROFILE_NEXTFLASH = "nextflash"
+#: The profile a caller without a published form gets -- the launcher's own
+#: ``--profile`` default, so a desk caller reads what a bare launcher boots.
+DEFAULT_PROFILE = PROFILE_QWEN27B
 
-#: Profile = named bundle of EXPECTED values per axis (a set: the 27B runs
-#: DFLASH today and ran NEXTN for weeks, both are its forms). Only the stated
-#: axes carry expectations; flip/vision are printed, never expected.
+
+# ==========================================================================
+# UNIFY S3: THE MODEL-PROFILE REGISTRY
+# ==========================================================================
+#
+# User order 2026-09-25 ~22:15Z: unify the 27B and Next-Flash lines "so, dass
+# man andere modelle auch einfach einhaengen kann" (UNIFY_PLAN.md, Schritt 3).
+#
+# The AXES above say what a boot BUILDS (derived from its flags, W140 on a
+# contradiction). A :class:`ModelProfile` says what is KNOWN about a model:
+# which forms it is expected in, which rank mechanics it runs by default
+# (END anchor, mamba anchor, repack, draft sharing), its per-group env rows,
+# and its MEASURED constants with their provenance. One row per model; a new
+# model is a new row (plus its calibration boots), not a new ``if``.
+#
+# RULES OF THE TABLE
+# * Values stay per model. A constant the NF line never measured is NOT
+#   silently the 27B number: its NF row names the 27B measurement it borrows
+#   (``measured_on=qwen27b``) and :func:`borrowed_constants` lists it, so the
+#   launcher can print it (UNIFY_PLAN "Risiko (c)": P_OVERSHOOT_MIB and
+#   D_OVERSHOOT_MIB act on the NF argv today).
+# * Rank switches whose default follows the profile are DERIVED from the
+#   profile's fields through the two tables below (:data:`END_ANCHOR_SWITCHES`,
+#   :data:`MAMBA_ANCHOR_SWITCHES`) plus three direct fields -- never typed a
+#   second time. An explicitly set env var always wins
+#   (:func:`profile_switch_default` is only the default).
+# * A field that names a mechanism not yet in this tree (27B ``trim``,
+#   ``grid4096``, dynamic P chunk ...) declares the model's FORM; until its
+#   migration step lands, what it does here is switch the OTHER model's
+#   mechanism off. UNIFY_PLAN Schritt 7/8 bring the mechanics.
+
+END_ANCHOR_VALUES: Tuple[str, ...] = ("tail_handoff", "trim", "none")
+MAMBA_ANCHOR_VALUES: Tuple[str, ...] = ("deepest", "grid4096", "none")
+DRAFT_KINDS: Tuple[str, ...] = ("dflash2", "mtp", "none")
+D_LAYOUT_VALUES: Tuple[str, ...] = AXIS_VALUES["kv"]
+
+_TAIL_SWITCHES: Tuple[str, ...] = (
+    "SGLANG_WEG2_TAIL_HANDOFF",
+    "SGLANG_WEG2_TAIL_ADOPT",
+    "SGLANG_WEG2_TAIL_VERIFY",
+    "SGLANG_WEG2_TAIL_SKIP_EXTEND",
+)
+
+#: ``end_anchor`` -> the rank switches it owns. ``tail_handoff`` = the NF
+#: hand-off (H18 E1, H21 adopt + verify, H24 skip-extend; weg2/tail_handoff.py,
+#: tail_adopt.py). The fold (H63, SGLANG_WEG2_ENABLE_P_TAIL_FOLD) and the multi
+#: tails (H42) stay code-default OFF and arm-set, as on the NF line. ``trim`` is
+#: the 27B form (P-TRIM N-1, --p-trim-end-anchor, Schritt 8); ``none`` = neither.
+END_ANCHOR_SWITCHES: Dict[str, Dict[str, object]] = {
+    "tail_handoff": {k: True for k in _TAIL_SWITCHES},
+    "trim": {k: False for k in _TAIL_SWITCHES},
+    "none": {k: False for k in _TAIL_SWITCHES},
+}
+
+#: ``mamba_anchor`` -> the rank switches it owns. ``deepest`` = NF H19
+#: (weg2/mamba_arena_displace.py via unified_radix_cache._weg2_mamba_claim,
+#: arena_mamba_pool.settled_anchor_slots/drop_unreferenced, arena.c
+#: arena_drop_unreferenced): -1 = auto max(2, slots // 4). ``0`` = no
+#: displacement -- the cap is 0, the claim is first-come and neither the
+#: displacement nor arena_drop_unreferenced is reached. ``grid4096`` is the 27B
+#: form (anchor every 4096, max 4 per path, inner anchors released; Schritt 8).
+MAMBA_ANCHOR_SWITCHES: Dict[str, Dict[str, object]] = {
+    "deepest": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": -1},
+    "grid4096": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": 0},
+    "none": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": 0},
+}
+
+
+@dataclass(frozen=True)
+class Measured:
+    """A constant MEASURED on one model: its value, where it was measured, and
+    WHICH profile's checkpoint it was measured on (``measured_on`` differing
+    from the row that carries it = a borrowed value, listed by
+    :func:`borrowed_constants`)."""
+
+    value: object
+    provenance: str
+    measured_on: str
+
+
+@dataclass(frozen=True)
+class Experts:
+    """``experts.store`` none | resident | offload and the arm's residency
+    vectors (per P stage / per D rank). The vectors are the ARM's values,
+    printed for the record; their source is the planner (P card, D
+    FRACTION-SOLVE), never this table."""
+
+    store: str = "none"
+    swap: str = ""
+    store_dir: str = ""
+    residency_p: Tuple[float, ...] = ()
+    residency_d: Tuple[float, ...] = ()
+
+
+@dataclass(frozen=True)
+class Draft:
+    kind: str
+    steps: int = 0
+    topk: int = 0
+    tokens: int = 0
+    block: int = 0
+    window: int = 0
+    path: str = ""
+    #: card | host (NF draft_park.py: D's draft parks in system RAM during P)
+    park: str = "card"
+    #: NF H1b (SGLANG_WEG2_DRAFT_SHARE_EMBED): the MTP head shares embed/lm_head
+    share_embed: bool = False
+
+
+@dataclass(frozen=True)
+class Chunk:
+    #: 0 = no grid (NF: the anchor grain is page_size under QSA)
+    grid: int
+    #: fixed | dynamic (27B --p-chunk-policy, Schritt 7)
+    policy: str
+    #: the step model's name (27B builtin-int8) or its source
+    model: str
+    #: the P chunk the profile's arm runs (tokens)
+    tokens: int
+
+
+@dataclass(frozen=True)
+class WeightFormat:
+    """One checkpoint format of a model and the kernel form per card class."""
+
+    name: str
+    sm8x: str = "native"
+    sm12x: str = "native"
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class RecordKey:
+    """What a measured source (record sample, P log) must share with this
+    boot to count (UNIFY_PLAN L1): ``checkpoint`` (model_key), ``form`` (the
+    RESIDUE_AXES of its WEG2-FORM line, else its draft), ``line`` (the boot's
+    commit is an ancestor of the commit this launcher runs -- the 27B
+    line_identity 76e87ac3b2), ``power_limit`` (planner/power_limit.py scales
+    rates by the NVML limit; not a FILTER yet, Schritt 9)."""
+
+    fields: Tuple[str, ...]
+
+
+RECORD_KEY_FIELDS: Tuple[str, ...] = ("checkpoint", "form", "line", "power_limit")
+
+
+@dataclass(frozen=True)
+class ModelProfile:
+    id: str
+    #: WEG2-FORM expectations per stated axis (W140)
+    expect: Mapping[str, Tuple[str, ...]]
+    arch: str
+    experts: Experts
+    draft: Draft
+    p_draft: str
+    replayssm: bool
+    ple: bool
+    #: model fact (config): full | qsa
+    attn: str
+    #: boot choice for D: paged_dcp | qsa_forma (form axis ``kv``)
+    d_layout: str
+    page_size: int
+    kv_dtype: str
+    chunk: Chunk
+    end_anchor: str
+    mamba_anchor: str
+    #: H81 END-anchor carrier hold (SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD)
+    mamba_carrier_hold: bool
+    #: H39 dense repack outside the tag pools (SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL)
+    repack_outside_pool: bool
+    formats: Mapping[str, WeightFormat]
+    #: the P cut: pinned ratio (NF) or solved from the constants (27B)
+    p_cut: str
+    x_start_tokens: int
+    x_ceiling_tokens: int
+    idle_layout: str
+    vision: str
+    context_tokens: int
+    records: RecordKey
+    #: the #1235 early-read facts' FLAG half in both groups' argv (27B TP-D);
+    #: NF drops it (Form A collapses DCP), its env half is owned per group.
+    early_read_flags: bool
+    #: per-group env rows (NF uneven-DCP axis, Scheibe 6a); {} = none
+    group_env: Mapping[str, Mapping[str, str]]
+    #: checkpoints the #114 P prefill transient support points were measured on
+    prefill_transient_checkpoints: Tuple[str, ...]
+    constants: Mapping[str, Measured]
+
+    def switch_defaults(self) -> Dict[str, object]:
+        """The rank switches whose default this profile sets, DERIVED."""
+        out: Dict[str, object] = {}
+        out.update(END_ANCHOR_SWITCHES[self.end_anchor])
+        out.update(MAMBA_ANCHOR_SWITCHES[self.mamba_anchor])
+        out["SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD"] = bool(self.mamba_carrier_hold)
+        out["SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL"] = bool(self.repack_outside_pool)
+        out["SGLANG_WEG2_DRAFT_SHARE_EMBED"] = bool(self.draft.share_embed)
+        return out
+
+    def constant(self, name: str) -> object:
+        try:
+            return self.constants[name].value
+        except KeyError:
+            raise KeyError(f"profile {self.id!r} carries no constant {name!r}") from None
+
+
+def _m(value: object, provenance: str, on: str = PROFILE_QWEN27B) -> Measured:
+    return Measured(value=value, provenance=provenance, measured_on=on)
+
+
+#: THE 27B MEASUREMENTS, values unchanged from the launcher module head (the
+#: provenance comments stay there, beside the name every reader knows).
+_QWEN27B_CONSTANTS: Dict[str, Measured] = {
+    "DC_MEASURED_D_5090_MIB": _m(2228, "boot weg2ls1b2 (#1233 D dormant residue, 5090)"),
+    "DC_MEASURED_D_3080_MIB": _m(1922, "boot weg2ls1b2 (#1233 D dormant residue, 3080)"),
+    "DC_MEASURED_D_XCHG_MIB": _m((2588, 3084, 2588), "boot weg2xsn14 (exchange arm, B4h/B4k)"),
+    "P_OVERSHOOT_MIB": _m((920, 0, 512), "boot weg2ls2b2 (P awake overshoot per P ordinal)"),
+    "D_OVERSHOOT_MIB": _m((489, 0, 0), "boot weg2ls4b1 (D awake overshoot, NEXTN TP-D)"),
+    "P_DRAFT_RESIDENT_BUDGET_MIB": _m(
+        405.2 + 1213.0, "27B NEXTN head: mtp 405.2 + embed 1213.0 MiB (#1233 fix 3, L2 resident_mib)"),
+    "CALIBRATION_LAYERS": _m(64, "boot bsscale (the cut MEASURED_MS_PER_LAYER was taken under)"),
+    "MEASURED_MS_PER_LAYER": _m(
+        "8.10,35.16,33.59", "boot bsscale 2026-09-07 (BSSCALE_0907.md, chunk 4096 bs6, cut 32,18,14)"),
+    "P_PP_STAGE_FIXED_MIB": _m("2342.0,1105.5,3518.0", "boots weg2sb5f + weg2rg6 (#1286)"),
+    "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT": _m(1.5588, "boots weg2sb5f + weg2rg6 (#1286, six rank readings)"),
+    "X_RECORDED_R_D_TOKS": _m(690.0, "record 1l/1o weg2zr2 (PRE-BARLINK)"),
+    "X_RECORDED_R_P_TOKS": _m(3640.0, "record 1l/1o weg2zr2 (PRE-BARLINK)"),
+    "X_RECORDED_FLIP_S": _m(13.247, "record 1l/1o weg2zr2 (PRE-BARLINK)"),
+    "STORE_CENSUS_PROVENANCE": _m("boot weg2sb5g W9 store census 2026-09-09T07:12:38Z", "boot weg2sb5g"),
+    "STORE_CENSUS_KV_PAGES": _m(50651, "boot weg2sb5g W9 store census"),
+    "STORE_CENSUS_MAMBA_BLOBS": _m(42, "boot weg2sb5g W9 store census"),
+    "STORE_CENSUS_DRAFT_PAGES": _m(26040, "boot weg2sb5g W9 store census"),
+    "STORE_CENSUS_KV_PAGE_BYTES": _m(32768, "boot weg2sb5g W9 store census"),
+}
+
+#: THE NF ROW. Its OWN measurement is P_DRAFT_RESIDENT_BUDGET_MIB (fnFL2v71,
+#: 1da8f29f12). Every other entry is the 27B measurement the NF line has read
+#: since its base 76f8debf2c, BORROWED by name -- kept (the NF argv must stay
+#: byte-identical, P_OVERSHOOT/D_OVERSHOOT shape it) and listed, never mixed in
+#: silently. An NF record replaces a borrowed row (UNIFY_PLAN Risiko (c)).
+_NEXTFLASH_CONSTANTS: Dict[str, Measured] = dict(_QWEN27B_CONSTANTS)
+_NEXTFLASH_CONSTANTS["P_DRAFT_RESIDENT_BUDGET_MIB"] = _m(
+    615.7 + 1522.7,
+    "boot fnFL2v71 (21.09.): packed vocab 615.7 (d84f1394fe) + INT4 g32 mtp 1522.7 MiB "
+    "(a905902f47), 1da8f29f12",
+    on=PROFILE_NEXTFLASH,
+)
+
+
+PROFILES: Dict[str, ModelProfile] = {
+    PROFILE_QWEN27B: ModelProfile(
+        id=PROFILE_QWEN27B,
+        expect={
+            "arch": ("dense",),
+            "experts": ("none",),
+            # the 27B runs DFLASH today and ran NEXTN for weeks: both are its forms
+            "draft": ("dflash", "mtp"),
+            "p_draft": ("compute", "cold", "none"),
+            "kv": ("paged_dcp",),
+        },
+        arch="dense",
+        experts=Experts(store="none"),
+        draft=Draft(kind="dflash2", block=8, window=2048,
+                    path="/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+                    park="card", share_embed=False),
+        # --dflash-produce-on-p off (c60a5d387f); the flag comes with Schritt 6
+        p_draft="none",
+        replayssm=True,
+        ple=False,
+        attn="full",
+        d_layout="paged_dcp",
+        page_size=1,
+        kv_dtype="auto",
+        chunk=Chunk(grid=0, policy="dynamic", model="builtin-int8", tokens=2048),
+        end_anchor="trim",
+        mamba_anchor="grid4096",
+        mamba_carrier_hold=False,
+        repack_outside_pool=False,
+        formats={
+            "int8": WeightFormat("int8", note="compressed-tensors W8A8"),
+            "fp8": WeightFormat("fp8", sm8x="marlin", note="--fp8-uniform-marlin"),
+            "nvfp4": WeightFormat("nvfp4", sm8x="w4a8", sm12x="native", note="--fp4-native-mixed (78c2f16a90)"),
+            "gguf": WeightFormat("gguf", note=".gguf detection (644de86ef9)"),
+        },
+        p_cut="solved (MEASURED_MS_PER_LAYER, P_PP_STAGE_FIXED_MIB, CALIBRATION_LAYERS)",
+        x_start_tokens=4096,
+        x_ceiling_tokens=12288,
+        idle_layout="pp",
+        vision="transient",
+        context_tokens=262144,
+        records=RecordKey(fields=("checkpoint", "form", "line")),
+        early_read_flags=True,
+        group_env={},
+        prefill_transient_checkpoints=(),
+        constants=_QWEN27B_CONSTANTS,
+    ),
+    PROFILE_NEXTFLASH: ModelProfile(
+        id=PROFILE_NEXTFLASH,
+        expect={
+            "arch": ("moe",),
+            "experts": ("resident", "offload"),
+            # Memory DRAFT-ZUORDNUNG: DFlash2 is the 27B's draft only, NF = MTP.
+            "draft": ("mtp",),
+            "p_draft": ("compute", "none"),
+            "kv": ("qsa_forma",),
+        },
+        arch="moe",
+        experts=Experts(store="offload", swap="platztausch", store_dir="/mnt/nf-experts",
+                        residency_p=(0.332, 0.64, 0.39), residency_d=(0.06, 0.51, 0.48)),
+        draft=Draft(kind="mtp", steps=3, topk=1, tokens=4, park="host", share_embed=True),
+        # H25: no draft head on P, D's draft parks in system RAM
+        p_draft="none",
+        replayssm=True,
+        ple=True,
+        attn="qsa",
+        d_layout="qsa_forma",
+        page_size=64,
+        kv_dtype="fp8_e4m3",
+        chunk=Chunk(grid=0, policy="fixed", model="linear from measurement (P card)", tokens=16384),
+        end_anchor="tail_handoff",
+        mamba_anchor="deepest",
+        mamba_carrier_hold=True,
+        repack_outside_pool=True,
+        formats={
+            "int4-mixed": WeightFormat("int4-mixed", note="compressed-tensors AutoRound (Minachist)"),
+            "nvfp4": WeightFormat("nvfp4", sm8x="w4a8", sm12x="native",
+                                  note="ModelOpt; 3080 W4A8 planned (user 25.09.)"),
+        },
+        p_cut="pinned --pp-stage-ratio 29,11,8 --pp-attn-stage-ratio 7,3,2 (arm)",
+        x_start_tokens=4096,
+        x_ceiling_tokens=12288,
+        idle_layout="",
+        vision="off",
+        context_tokens=262144,
+        records=RecordKey(fields=("checkpoint", "form")),
+        early_read_flags=False,
+        # Scheibe 6a: the uneven-DCP axis is GROUP-OWNED on Next Flash (seam D):
+        # P (PP3, tp 1) keeps 1/1 (inert), D (Form A) gets 0/0 -- an inherited 1
+        # lands in RankRoleError (rank_role.py resolve_dcp_under_host_kv).
+        group_env={
+            "P": {"SGLANG_UNEVEN_DCP": "1", "SGLANG_UNEVEN_DCP_WEIGHTED": "1"},
+            "D": {"SGLANG_UNEVEN_DCP": "0", "SGLANG_UNEVEN_DCP_WEIGHTED": "0"},
+        },
+        prefill_transient_checkpoints=("Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",),
+        constants=_NEXTFLASH_CONSTANTS,
+    ),
+}
+
+
+#: Profile = named bundle of EXPECTED values per axis (a set). Only the stated
+#: axes carry expectations; flip/vision are printed, never expected. DERIVED
+#: from the registry rows.
 PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
-    PROFILE_QWEN27B: {
-        "arch": ("dense",),
-        "experts": ("none",),
-        "draft": ("dflash", "mtp"),
-        "p_draft": ("compute", "cold", "none"),
-        "kv": ("paged_dcp",),
-    },
-    PROFILE_NEXTFLASH: {
-        "arch": ("moe",),
-        "experts": ("resident", "offload"),
-        # Memory DRAFT-ZUORDNUNG: DFlash2 is the 27B's draft only, NF = MTP.
-        "draft": ("mtp",),
-        "p_draft": ("compute", "none"),
-        "kv": ("qsa_forma",),
-    },
+    pid: {a: tuple(v) for a, v in prof.expect.items()} for pid, prof in PROFILES.items()
 }
 
-#: UNIFY S2: switches whose DEFAULT differs by model profile -- one environ.py
-#: entry each, its default resolved here from the published form's profile
-#: (:func:`profile_switch_default`). An explicitly set env var always wins; no
-#: form / a profile not listed -> the fallback the environ entry names.
-#: SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL (H39): the 27B line shipped the port
-#: 3c9bfeff95 default OFF, the NF line d6b7d4a1d3 default ON -- each kept until a
-#: measurement of that model says otherwise (27B arms set 1 explicitly since xsn426).
-#: SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD (H81): the 27B line armed its END-anchor
-#: hold only with SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE=1 (default off, read as
-#: an alias in environ.py), the NF line holds by default.
-PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, bool]] = {
-    PROFILE_QWEN27B: {
-        "SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL": False,
-        "SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD": False,
-    },
-    PROFILE_NEXTFLASH: {
-        "SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL": True,
-        "SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD": True,
-    },
+#: UNIFY S2/S3: switches whose DEFAULT differs by model profile -- one
+#: environ.py entry each, its default resolved from the published form's
+#: profile (:func:`profile_switch_default`). An explicitly set env var always
+#: wins; no form / a profile not listed -> the fallback the environ entry names
+#: (the NF line's code default). DERIVED from the rows (``switch_defaults``):
+#: SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL (H39; 27B port 3c9bfeff95 off, NF
+#: d6b7d4a1d3 on), SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD (H81; the 27B alias
+#: SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE is read in environ.py), the four NF
+#: tail switches (``end_anchor``), SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS
+#: (``mamba_anchor``), SGLANG_WEG2_DRAFT_SHARE_EMBED (``draft.share_embed``).
+PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
+    pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }
+
+
+def profile_row(profile: Optional[str]) -> Optional[ModelProfile]:
+    """The registry row of ``profile``; ``None`` for no/unknown profile."""
+    return PROFILES.get(str(profile or ""))
+
+
+def borrowed_constants(profile: str) -> Tuple[Tuple[str, str], ...]:
+    """``(name, measured_on)`` of every constant ``profile`` carries that was
+    measured on ANOTHER profile's checkpoint -- the visible form of risk (c)."""
+    prof = PROFILES[profile]
+    return tuple(
+        (n, m.measured_on) for n, m in sorted(prof.constants.items()) if m.measured_on != prof.id
+    )
+
+
+def borrowed_constants_line(profile: str) -> Optional[str]:
+    """One launcher line naming the borrowed constants; None when there are none."""
+    got = borrowed_constants(profile)
+    if not got:
+        return None
+    by: Dict[str, List[str]] = {}
+    for n, on in got:
+        by.setdefault(on, []).append(n)
+    parts = "; ".join(f"from {on}: {', '.join(ns)}" for on, ns in sorted(by.items()))
+    return (f"WEG2-PROFILE {profile}: {len(got)} constant row(s) BORROWED from another "
+            f"model's measurement ({parts}); where the launcher reads a record or census of "
+            f"THIS model (#1444, xchg census, flags) that supersedes the row")
+
 
 #: Checkpoint config keys that name routed experts (top level or text_config).
 _EXPERT_CONFIG_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
@@ -215,16 +581,42 @@ def current_form(environ: Optional[Mapping[str, str]] = None) -> Optional[Weg2Fo
     return parse_form(env.get(FORM_ENV, ""))
 
 
-def profile_switch_default(
-    name: str, fallback: bool, environ: Optional[Mapping[str, str]] = None
-) -> bool:
+def profile_switch_default(name: str, fallback, environ: Optional[Mapping[str, str]] = None):
     """The default of switch ``name`` for the profile in the published form
     (:data:`PROFILE_SWITCH_DEFAULTS`); ``fallback`` without a form, without a
     profile in it, or for a profile that does not list the switch. Reads only
-    the form -- whether ``name`` itself is set is the caller's question."""
+    the form -- whether ``name`` itself is set is the caller's question. The
+    value takes ``fallback``'s type (bool switches stay bool, int stay int)."""
     form = current_form(environ)
     prof = form.profile if form is not None else ""
-    return bool(PROFILE_SWITCH_DEFAULTS.get(prof, {}).get(name, fallback))
+    val = PROFILE_SWITCH_DEFAULTS.get(prof, {}).get(name, fallback)
+    if isinstance(fallback, bool):
+        return bool(val)
+    if isinstance(fallback, int):
+        return int(val)
+    return val
+
+
+def current_profile(environ: Optional[Mapping[str, str]] = None) -> Optional[ModelProfile]:
+    """The registry row of the published form's profile; ``None`` without a
+    form or for a profile the registry does not know."""
+    form = current_form(environ)
+    return profile_row(form.profile) if form is not None else None
+
+
+def profile_constant(
+    name: str, profile: Optional[str] = None, environ: Optional[Mapping[str, str]] = None
+) -> object:
+    """A measured constant of ``profile`` -- by default the published form's
+    profile, else :data:`DEFAULT_PROFILE` (the launcher's ``--profile``
+    default). THE one reader of :attr:`ModelProfile.constants`."""
+    if profile is None:
+        form = current_form(environ)
+        profile = form.profile if form is not None and form.profile in PROFILES else DEFAULT_PROFILE
+    row = profile_row(profile)
+    if row is None:
+        raise KeyError(f"unknown model profile {profile!r}; known: {sorted(PROFILES)}")
+    return row.constant(name)
 
 
 # --------------------------------------------------------------------------
@@ -744,3 +1136,4 @@ def same_model_log(model: str) -> Callable[[str], bool]:
         return group_log_model(path) == want
 
     return accept
+

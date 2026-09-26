@@ -7,13 +7,25 @@ from enum import IntEnum
 from typing import Any, Optional
 
 
-def _dense_repack_outside_pool_default() -> bool:
-    """UNIFY S2: SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL's default per model
-    profile, read from the published weg2 form at get() time (not cached: the
-    form env is per group). weg2.form is stdlib-only, so this stays light."""
-    from sglang.srt.weg2.form import profile_switch_default
+def _profile_default(name: str, fallback):
+    """UNIFY S2/S3: a callable default for the switch ``name`` -- the value the
+    published weg2 form's MODEL PROFILE gives it (weg2/form.py
+    PROFILE_SWITCH_DEFAULTS, derived from the registry rows), read at get()
+    time (not cached: the form env is per group); ``fallback`` (the NF line's
+    code default) without a form. An explicitly set env var never reaches this.
+    weg2.form is stdlib-only, so this stays light."""
 
-    return profile_switch_default("SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL", True)
+    def _default():
+        from sglang.srt.weg2.form import profile_switch_default
+
+        return profile_switch_default(name, fallback)
+
+    _default.__name__ = f"_profile_default_{name}"
+    return _default
+
+
+_dense_repack_outside_pool_default = _profile_default(
+    "SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL", True)
 
 
 #: The 27B line's switch that armed its END-anchor hold (together with its
@@ -29,9 +41,7 @@ def _mamba_carrier_hold_default() -> bool:
     raw = os.environ.get(_MAMBA_CARRIER_HOLD_27B_ALIAS)
     if raw is not None and raw.strip():
         return raw.strip().lower() in ("1", "true", "yes", "on")
-    from sglang.srt.weg2.form import profile_switch_default
-
-    return profile_switch_default("SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD", True)
+    return _profile_default("SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD", True)()
 
 
 @functools.lru_cache(maxsize=1)
@@ -553,7 +563,11 @@ class Envs:
     # [floor_page(c), c) to D through the arena dir (weg2/tail_handoff.py);
     # D probes them at its load-back (WEG2-TAIL-READY). 0 = the 64-token cut
     # and no tail files, byte for byte the 2026-09-24 form.
-    SGLANG_WEG2_TAIL_HANDOFF = EnvBool(True)
+    # UNIFY S3 (BLOCKER S2): the four TAIL switches are the profile field
+    # ``end_anchor`` (weg2/form.py END_ANCHOR_SWITCHES): nextflash tail_handoff
+    # = on, qwen27b trim = off; no published form = on (the NF code default).
+    # Set explicitly, the env always wins.
+    SGLANG_WEG2_TAIL_HANDOFF = EnvBool(_profile_default("SGLANG_WEG2_TAIL_HANDOFF", True))
     # TAIL_ADOPT (H21, second half of E1): D takes the hand-off over -- the
     # TP group MIN-votes it in the prefetch-progress collective, every rank
     # grows the prefix by the partial page's rows [floor_page(c), c), the
@@ -561,12 +575,12 @@ class Envs:
     # at the first GDN layer of the extend forward, and the extend is [c, N)
     # (1-4 tokens). Effective only under TAIL_HANDOFF; 0 = the H18 form
     # (extend from floor_page(c)).
-    SGLANG_WEG2_TAIL_ADOPT = EnvBool(True)
+    SGLANG_WEG2_TAIL_ADOPT = EnvBool(_profile_default("SGLANG_WEG2_TAIL_ADOPT", True))
     # TAIL_VERIFY (H21): D checks the part payloads against the publish
     # digests before its vote (a mismatch votes the group back to the page
     # resume) and reads the written rows/state back once per request for the
     # WEG2-TAIL-ADOPT line (digest=match|MISMATCH).
-    SGLANG_WEG2_TAIL_VERIFY = EnvBool(True)
+    SGLANG_WEG2_TAIL_VERIFY = EnvBool(_profile_default("SGLANG_WEG2_TAIL_VERIFY", True))
     # TAIL_SKIP_EXTEND (H24, E2): P also publishes its END state -- the KV
     # rows [floor_page(c), N), the QSA pending-ring rows of the open group,
     # the GDN state after all N tokens and the token it sampled -- and D,
@@ -575,7 +589,7 @@ class Envs:
     # with prefix N and P's token as its first output. Effective only under
     # TAIL_ADOPT; any refusal falls back to E1 (extend [c, N)), then to the
     # page resume. 0 = the H21 form.
-    SGLANG_WEG2_TAIL_SKIP_EXTEND = EnvBool(True)
+    SGLANG_WEG2_TAIL_SKIP_EXTEND = EnvBool(_profile_default("SGLANG_WEG2_TAIL_SKIP_EXTEND", True))
     # TAIL_WAIT_MS (H45, metal fnFL2x150/x151): P's PP ranks write their tail
     # parts from background threads; D's vote used to read the part list ONCE
     # at the first prefetch check and fell on a partial manifest (parts=1-2 of
@@ -747,7 +761,13 @@ class Envs:
     # only, x130 kept the first 30 of 191 and lost the end anchor. -1 = auto
     # max(2, arena_slots // 4) (32 -> 8; chunk 16384 stays untouched),
     # N >= 2 = N, 0 = off (first-come as before).
-    SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS = EnvInt(-1)
+    # UNIFY S3 (BLOCKER S2): default = the profile field ``mamba_anchor``
+    # (weg2/form.py MAMBA_ANCHOR_SWITCHES): nextflash deepest = -1 (auto),
+    # qwen27b grid4096 = 0 (no displacement, first-come -- the displacement and
+    # arena.c arena_drop_unreferenced are not reached); no form = -1. Set
+    # explicitly, the env always wins.
+    SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS = EnvInt(
+        _profile_default("SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS", -1))
     # MAMBA_CARRIER_HOLD (H81, fnNV4f2): the flip's tree reset gives the
     # tree's arena references back (27B 479f6eccb0 on the NF line) -- except,
     # on group P, the END anchors (#1481 mark) of the phase: those stay
@@ -2576,7 +2596,9 @@ class Envs:
     # lm_head MODULES builds no vocab table of its own (placeholders, replaced
     # by init_lm_head). 0 restores the old form: both tables built in the
     # weights_draft tag, then replaced (Next Flash: 2 x 1212.5 MiB dead reserve).
-    SGLANG_WEG2_DRAFT_SHARE_EMBED = EnvBool(True)
+    # UNIFY S3: default = the profile field ``draft.share_embed`` (nextflash
+    # on, qwen27b off -- the 27B line never had H1b); no form = on.
+    SGLANG_WEG2_DRAFT_SHARE_EMBED = EnvBool(_profile_default("SGLANG_WEG2_DRAFT_SHARE_EMBED", True))
     # HICACHE-DRAFT-TIER (user order 2026-09-24 14:15Z: "und schreiben wir in D
     # auch draft context in den hicache? das muesste raus, weil draft ja keinen
     # hicacheplatz mehr bekommt"). off = the draft gets NO HiCache space on

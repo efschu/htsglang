@@ -208,7 +208,11 @@ def draft_share_embed(env: Mapping[str, str]) -> bool:
     """SGLANG_WEG2_DRAFT_SHARE_EMBED aus der Gruppen-Env, EnvBool-Semantik."""
     raw = str(env.get(DRAFT_SHARE_EMBED_ENV, "")).strip().lower()
     if not raw:
-        return DRAFT_SHARE_EMBED_DEFAULT
+        # UNIFY S3: the default follows the group's published form (profile
+        # field draft.share_embed), exactly as the rank's EnvBool resolves it.
+        from sglang.srt.weg2.form import profile_switch_default
+
+        return profile_switch_default(DRAFT_SHARE_EMBED_ENV, DRAFT_SHARE_EMBED_DEFAULT, env)
     if raw in _TRUE:
         return True
     if raw in _FALSE:
