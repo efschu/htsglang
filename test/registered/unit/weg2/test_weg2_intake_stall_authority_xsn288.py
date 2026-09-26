@@ -101,7 +101,10 @@ def test_abort_forgets_and_wake_resets_source_ratchet():
     assert 'getattr(_ps, "pp_rank", 0) or 0) != 0' in src[j:j + 2500]
     wsrc = open(wu.__file__).read()
     k = wsrc.index('"WEG2-DORMANT cleared: kv_cache resumed, admission seams admit"')
-    assert "_iw.reset()" in wsrc[k:k + 600]
+    # the wake block up to the store rescan (5890ca792d put the wedge-clock
+    # restart between the anchor and the reset: a fixed 600-char window read
+    # past neither)
+    assert "_iw.reset()" in wsrc[k:wsrc.index("self._weg2_rescan_store_index()", k)]
 
 
 def test_xsn291_a_request_larger_than_the_pool_is_named_too_large_and_the_front_refuses(monkeypatch):
