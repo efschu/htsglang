@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.utils import uneven_dcp_active
 from sglang.srt.environ import envs
+from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.weg2 import tail_adopt, tail_handoff
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -1455,7 +1456,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_device_node,
             best_match_device_value_len,
             key_match_depth,
-        ) = self._match_prefix_helper(key)
+        ) = self._match_prefix_helper(
+            key,
+            # Prefix trace (IN 26.09.): the walk names the request it serves.
+            # Off -> one module-global bool test, no attribute read.
+            trace_rid=(
+                getattr(params.req, "rid", None)
+                if params.req is not None and _prefix_trace.on()
+                else None
+            ),
+        )
         return self._match_post_processor(
             params,
             value,
@@ -2272,7 +2282,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return depth
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, trace_rid: Optional[str] = None
     ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int, int]:
         # Non-HiCache mode has only device-resident matches, so the scheduler
         # device anchor follows the best match. In HiCache mode, host-backed
@@ -2404,6 +2414,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # --mamba-checkpoint-interval multiple; mirrors `cum_tokens` in
         # MambaRadixCache._match_prefix_helper.
         cum_tokens = 0
+        # a split stop keeps `key` un-advanced: the rest starts `split_off`
+        # units further in (the #1420 line names the TRUE rest and want).
+        split_off = 0
         while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
 
@@ -2426,6 +2439,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     value.append(node.component_data[BASE_COMPONENT_TYPE].value)
                 cum_tokens += prefix_len
                 _update_best_if_valid(node, cum_tokens, prefix_len)
+                split_off = prefix_len
                 break
 
             if not child.evicted:
@@ -2436,20 +2450,55 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             key = key[prefix_len:]
             if len(key):
                 child_key = key.child_key(self.page_size)
-        if len(key) > 0 and node is not self.root_node and node.children:
+        _rest = len(key) - split_off
+        if _rest > 0 and node.children and (
+            node is not self.root_node or trace_rid is not None
+        ):
             # #1420 instrument (boot xsn172): D's walk for a 98k prompt stopped at
             # the 4314-token split node with the prefetched chain hanging below
             # -- name the child keys the node HAS and the one the walk WANTS.
+            # A split stop names the rest AFTER the split (before IN 26.09. it
+            # printed the un-advanced key: remaining too large by the matched
+            # part, want = the first page of the split child).
             n = getattr(UnifiedRadixCache, "_1420_n", 0) + 1
             UnifiedRadixCache._1420_n = n
-            if n <= 24 or n % 256 == 0:
+            # Prefix trace (IN 26.09.): one line per (rid, stop depth) with a
+            # rest >= SGLANG_WEG2_PREFIX_TRACE_MIN_TOKENS, no process cap, and
+            # a stop at the ROOT counts too (a cold miss in the first page).
+            traced = trace_rid is not None and _prefix_trace.walk_due(
+                trace_rid, cum_tokens, _rest
+            )
+            # A rid-bearing walk under the trace is governed by the trace rule
+            # alone (deduped / below the minimum = no line); rid-less walks
+            # (re-matches with req=None) and the untraced path keep the legacy
+            # sampling (trace_rid is only ever set while the trace is on).
+            if traced or (
+                trace_rid is None
+                and node is not self.root_node
+                and (n <= 24 or n % 256 == 0)
+            ):
                 try:
+                    rk = key[split_off:] if split_off else key
+                    want = rk.child_key(self.page_size)
                     have = [str(k)[:60] for k in list(node.children.keys())[:4]]
+                    extra = ""
+                    if traced:
+                        extra = " rid=%s trace=1 stop_node=%s stop_hash=%s want_run=%s have_run=%s" % (
+                            trace_rid,
+                            node.id,
+                            _prefix_trace.page_hash(node),
+                            _prefix_trace.token_run(rk),
+                            [
+                                _prefix_trace.token_run(c.key)
+                                for c in list(node.children.values())[:4]
+                            ],
+                        )
                     logger.warning(
                         "#1420 WALK-STOP n=%d depth=%d remaining=%d want=%s have=%s "
-                        "bigram=%s node_evicted=%s node_backuped=%s",
-                        n, cum_tokens, len(key), str(child_key)[:60], have,
+                        "bigram=%s node_evicted=%s node_backuped=%s%s",
+                        n, cum_tokens, _rest, str(want)[:60], have,
                         getattr(key, "is_bigram", None), node.evicted, node.backuped,
+                        extra,
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -3022,8 +3071,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if comp.component_type == ComponentType.MAMBA and cd.value is not None:
                 try:  # #1469: a mamba value leaving the device before/after its backup
                     from sglang.srt.mem_cache.unified_cache_components.mamba_component import _1469_note
-                    _1469_note("EVICT", node=node.id, backuped=getattr(node, "backuped", None),
-                               host=(cd.host_value is not None), lock_ref=cd.lock_ref)
+                    if _prefix_trace.on():
+                        # Prefix trace (IN 26.09.): uncapped, and joinable -- the
+                        # parent is the node a later walk stops at when this
+                        # one is gone, the page hashes are the store's keys.
+                        _hv = getattr(node, "hash_value", None)
+                        _1469_note("EVICT", _uncapped=True, node=node.id,
+                                   backuped=getattr(node, "backuped", None),
+                                   host=(cd.host_value is not None), lock_ref=cd.lock_ref,
+                                   parent=getattr(node.parent, "id", None),
+                                   pages=len(_hv) if _hv else 0,
+                                   hash_first=_prefix_trace.page_hash(node, 0),
+                                   hash_last=_prefix_trace.page_hash(node, -1),
+                                   key_len=len(node.key) if node.key is not None else 0,
+                                   trace=1)
+                    else:
+                        _1469_note("EVICT", node=node.id, backuped=getattr(node, "backuped", None),
+                                   host=(cd.host_value is not None), lock_ref=cd.lock_ref)
                 except Exception:  # noqa: BLE001
                     pass
             if cd.value is not None and cd.lock_ref > 0:

@@ -6391,7 +6391,11 @@ class Scheduler(
                     _cc.WEG2_HANDOFF_PAGE_KEYS.pop(req.rid, None)
                 _hr = getattr(self, "_1442_reg_n", 0) + 1
                 self._1442_reg_n = _hr
-                if _hr <= 12 or _hr % 256 == 0:
+                from sglang.srt.weg2 import prefix_trace as _pt
+                # prefix trace (IN 26.09.): every distinct (rid, matched, span)
+                if _pt.once("1442", req.rid, int(_matched_len), len(_span) if _span else 0) or (
+                    _hr <= 12 or _hr % 256 == 0
+                ):
                     logger.info("#1442 HANDOFF-KEYS REG rid=%r handoff=%s matched=%d new=%d span=%d (n=%d)",
                                 req.rid, len(_hd) if _hd else None, int(_matched_len), len(new_input_tokens),
                                 len(_span) if _span else 0, _hr)

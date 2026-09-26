@@ -818,6 +818,13 @@ def front_span_inflight() -> bool:
     return bool(envs.SGLANG_WEG2_FRONT_SPAN_INFLIGHT.get())
 
 
+def front_span_inflight_line() -> str:
+    """The ONE start line of the front that names the #49 rest switch."""
+    return ("WEG2-FRONT #49 SPAN-INFLIGHT armed=%d role=front pid=%d "
+            "(SGLANG_WEG2_FRONT_SPAN_INFLIGHT: D leg-2 text credited at its first "
+            "content event)" % (int(front_span_inflight()), os.getpid()))
+
+
 def request_text(payload: dict) -> str:
     """The prompt as ONE string, for the span estimate and the ledger.
 
@@ -3494,6 +3501,8 @@ class Front:
                     else "that reading under an operator ceiling")
         # 27B flipfast: which of the three front switches this boot runs.
         logger.info("%s", self.flipfast_line())
+        # #49 armed line (AL/IN 26.09.): once, at the front's start.
+        logger.info("%s", front_span_inflight_line())
         # 27B idle policy: the resting layout and the two hold/drain settings.
         logger.info("%s", self.idle_policy_line())
 

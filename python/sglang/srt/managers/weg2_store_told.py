@@ -70,6 +70,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from sglang.srt.weg2 import p_twin_defer as _twin
+from sglang.srt.weg2 import prefix_trace as _pt
 
 logger = logging.getLogger(__name__)
 
@@ -236,10 +237,10 @@ def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
             _pace_intake_t(scheduler).setdefault(rid, _clock())
         n = getattr(scheduler, "_weg2_store_told_intake_n", 0) + 1
         scheduler._weg2_store_told_intake_n = n
-        if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+        if _log_due(n):
             logger.info(
                 "#1400 STORE-TOLD INTAKE rid=%s verdict=%s span=%s matched=%s (n=%d)",
-                rid[:8],
+                _rt(rid),
                 verdict,
                 getattr(req, "_prefetch_span_tokens", None),
                 getattr(req, "_prefetch_registered_prefix_len", None),
@@ -325,7 +326,19 @@ def _follower_register(scheduler, req, told: int) -> str:
 
 
 def rid8(req) -> str:
-    return _rid(req)[:8]
+    """The rid as a log field: 8 characters, the FULL rid under the prefix
+    trace (SGLANG_WEG2_PREFIX_TRACE, IN 26.09.)."""
+    return _pt.rid_text(_rid(req))
+
+
+def _rt(rid) -> str:
+    return _pt.rid_text(rid)
+
+
+def _log_due(n: int) -> bool:
+    """First _LOG_FIRST, then every _LOG_EVERY-th -- every one under the
+    prefix trace (one line per request and event, never per pass)."""
+    return _pt.sampled(n, _LOG_FIRST, _LOG_EVERY)
 
 
 def _local_prefix(req) -> int:
@@ -465,7 +478,7 @@ def _adopt_keys(scheduler, req) -> None:
     else:
         n = getattr(scheduler, "_tk_adopt_n", 0) + 1
         scheduler._tk_adopt_n = n
-        if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+        if _log_due(n):
             logger.info("#1442 HANDOFF-KEYS ADOPT rid=%s pp0=%r verdict=%s (n=%d)",
                         rid8(req), digest, verdict, n)
 
@@ -534,7 +547,7 @@ def _anchor_clamp(scheduler, req, told: int) -> int:
                 scheduler._1416d_probe_n = n
             except Exception:  # noqa: BLE001 - a frozen double keeps no count
                 pass
-            if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+            if _log_due(n):
                 logger.info(
                     "#1416d TOLD-PROBE rid=%s told=%d keys=%d bigram=%s pages=%s "
                     "(n=%d): the clamp asks the store with the fetch's key form",
@@ -628,11 +641,11 @@ def _twin_pp0_told(scheduler, tree, req, rid: str, label: str = "TW TWIN-TOLD") 
     else:
         n = getattr(scheduler, "_tk_abs_told_n", 0) + 1
         scheduler._tk_abs_told_n = n
-        if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+        if _log_due(n):
             logger.info(
                 "#%s rid=%s head=%d span=%d told=%d clamped=%d (n=%d): absolute told, "
                 "the followers compare head + span",
-                label, rid[:12], head, span, told, clamped, n,
+                label, _pt.rid_text(rid, 12), head, span, told, clamped, n,
             )
     return clamped
 
@@ -706,12 +719,12 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
             rid=rid, told=told, absolute=absolute, keys_digest=_pp0_keys_digest(req)))
         n = getattr(scheduler, "_weg2_store_told_published", 0) + 1
         scheduler._weg2_store_told_published = n
-        if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+        if _log_due(n):
             logger.info(
                 "#1400 STORE-TOLD PUBLISHED rid=%s told=%d (n=%d held_left=%d): "
                 "PP0's terminated store prefetch loaded this many page-aligned "
                 "tokens; the followers register exactly this span.",
-                rid[:8],
+                _rt(rid),
                 told,
                 n,
                 len(held),
@@ -765,11 +778,11 @@ def _follower_absorb_impl(scheduler, recv_reqs: List) -> List:
             verdict = _follower_register(scheduler, req, told)
         else:
             verdict = "held:not_yet_queued"
-        if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+        if _log_due(n):
             logger.info(
                 "#1400 STORE-TOLD ABSORBED rank pp=%s rid=%s told=%d verdict=%s (n=%d)",
                 scheduler.ps.pp_rank,
-                rid[:8],
+                _rt(rid),
                 told,
                 verdict,
                 n,
@@ -910,7 +923,7 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             # left the queue during the window (abort): no Admit, nothing
             # admits; the followers' reads end in their own drain.
             pacing.pop(rid, None)
-            logger.info("#1416e PACED-DROP rid=%s told=%d: left the queue inside the window", rid[:8], p.told)
+            logger.info("#1416e PACED-DROP rid=%s told=%d: left the queue inside the window", _rt(rid), p.told)
             continue
         if now - p.published_at < p.window_s:
             continue
@@ -919,12 +932,12 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
         out.append(Weg2StoreAdmit(rid=rid, told=p.told))
         n = getattr(scheduler, "_1416e_admit_n", 0) + 1
         scheduler._1416e_admit_n = n
-        if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+        if _log_due(n):
             logger.info(
                 "#1416e PACED-ADMIT rid=%s told=%d window=%.2fs waited=%.2fs passes=%d (n=%d): "
                 "PP0 admits in this pass, the followers in the pass that absorbs it; "
                 "nobody waited while the window ran",
-                rid[:8], p.told, p.window_s, now - p.published_at, pass_n - p.published_pass, n,
+                _rt(rid), p.told, p.window_s, now - p.published_at, pass_n - p.published_pass, n,
             )
     # (b) read-aheads for terminated reads (the single-phase checks)
     parked = _parked(scheduler)
@@ -959,11 +972,11 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
         out.append(_cls(rid=rid, told=told, paced=True, **_extra))
         n = getattr(scheduler, "_1416e_ahead_n", 0) + 1
         scheduler._1416e_ahead_n = n
-        if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+        if _log_due(n):
             logger.info(
                 "#1416e PACED-TOLD rid=%s told=%d own_read=%.2fs window=%.2fs (n=%d pacing=%d): "
                 "read-ahead on the wire, admission follows the window",
-                rid[:8], told, own_read_s, window, n, len(pacing),
+                _rt(rid), told, own_read_s, window, n, len(pacing),
             )
     if not out:
         return recv_reqs
@@ -987,14 +1000,14 @@ def _follower_admit(scheduler, item: Weg2StoreAdmit) -> None:
     if ahead is not None and int(ahead) != told:
         logger.warning(
             "#1416e PACED-ADMIT rid=%s told=%d differs from the read-ahead %d; admission "
-            "compares against the admitted value", rid[:8], told, int(ahead),
+            "compares against the admitted value", _rt(rid), told, int(ahead),
         )
     n = getattr(scheduler, "_1416e_absorb_n", 0) + 1
     scheduler._1416e_absorb_n = n
-    if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+    if _log_due(n):
         logger.info(
             "#1416e PACED-ADMIT ABSORBED rank pp=%s rid=%s told=%d read_ahead=%s (n=%d)",
-            scheduler.ps.pp_rank, rid[:8], told, ahead, n,
+            scheduler.ps.pp_rank, _rt(rid), told, ahead, n,
         )
 
 
@@ -1034,7 +1047,7 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
         if time.monotonic() > deadline:
             raise Weg2StoreToldMismatch(
                 f"#1400 STORE-TOLD WAIT EXCEEDED rank pp={scheduler.ps.pp_rank} "
-                f"rid={rid[:8]} told={told}: this rank's own store read did not "
+                f"rid={_rt(rid)} told={told}: this rank's own store read did not "
                 f"terminate within {WAIT_CAP_S:g}s; the prefetch policy should "
                 f"have cut it long before, so the storage thread is stuck."
             )
@@ -1049,7 +1062,7 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
     if own != told:
         raise Weg2StoreToldMismatch(
             f"#1400 STORE-TOLD MISMATCH rank pp={scheduler.ps.pp_rank} "
-            f"rid={rid[:8]} told={told} own_prefix={own} own_loaded={credit}: "
+            f"rid={_rt(rid)} told={told} own_prefix={own} own_loaded={credit}: "
             f"this rank's store "
             f"read does not reproduce PP0's verdict, so its prefix would "
             f"diverge from the batch PP0 built (the W27 width split of "
@@ -1058,12 +1071,12 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
     if waited:
         n = getattr(scheduler, "_weg2_store_told_waited", 0) + 1
         scheduler._weg2_store_told_waited = n
-        if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+        if _log_due(n):
             logger.info(
                 "#1400 STORE-TOLD WAITED rank pp=%s rid=%s told=%d (n=%d): the own "
                 "read terminated inside the admission wait.",
                 scheduler.ps.pp_rank,
-                rid[:8],
+                _rt(rid),
                 told,
                 n,
             )
