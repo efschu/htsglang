@@ -99,6 +99,15 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # other collectives is the `armed` attribute read below.
 _COLLECTIVE_CLOCK = collective_clock()
 
+# SGLANG_COLLECTIVE_CLOCK_A2A=1 (default off): give all_to_all a clock span too,
+# so the per-rank line's `wait by family` carries `<group>.all_to_all`. Without
+# it the uneven-DCP a2a LSE merge (16 per 27B verify round) is booked as
+# COMPUTE. Instrument only: the span lays two event-record nodes per a2a into a
+# captured graph and changes no value. Resolved once at import.
+_CLOCK_A2A = os.environ.get("SGLANG_COLLECTIVE_CLOCK_A2A", "0").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+
 # #583 collective census: resolved once at import so the hot-path guard is a
 # module-global bool read, not an environment lookup per collective.
 _CENSUS = census()
@@ -1861,6 +1870,10 @@ class GroupCoordinator:
         torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
     def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
+        if _CLOCK_A2A and _COLLECTIVE_CLOCK.armed:
+            # See all_reduce for why this re-enters.
+            with _COLLECTIVE_CLOCK.span(self._clock_family_all_to_all):
+                return self.all_to_all_single(output, input)
         if self._census_wire:  # #583/#631: see all_reduce for the placement rule.
             _CENSUS.bump(self._clock_family_all_to_all)
         if self.world_size == 1:
@@ -1896,6 +1909,12 @@ class GroupCoordinator:
         Dynamo; whoever needs it under torch.compile has to graph-break
         around it.
         """
+        if _CLOCK_A2A and _COLLECTIVE_CLOCK.armed:
+            # See all_reduce for why this re-enters.
+            with _COLLECTIVE_CLOCK.span(self._clock_family_all_to_all):
+                return self.all_to_all_single_v(
+                    output, input, output_split_sizes, input_split_sizes
+                )
         # Same family as the even form: what the census compares is how many
         # times each rank entered this wire family, and a rank that skips an
         # uneven a2a has skipped an a2a.
