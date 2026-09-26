@@ -1,5 +1,10 @@
 """#951: the #798 void must be decided BEFORE the pass builds anything.
 
+STATUS (since 2026-08-29): #1015c (206661a28b) retired the downstream refusal
+this guard implemented -- `pp_upstream_void_pending` answers False, see
+`PPUpstreamVoidBeforeFormation951`. The inert-shape and shared-predicate
+cases below still hold; the text that follows is the history of the guard.
+
 THE SPECIMEN. boot_943bx_dc4895e1dc_0828_000240.log and ..._001113.log, pin
 dc4895e1dc, two boots, both dead at exactly 7 batches with no CUDA error
 involved:
@@ -210,72 +215,47 @@ def _patch_prefill_blocked(value=False):
 
 
 class PPUpstreamVoidBeforeFormation951(unittest.TestCase):
-    """THE ROOT: a #798-voided pass must not reach the prefill formation."""
+    """#1015c RETIRED THIS GUARD'S REFUSAL; these cases pin the retirement.
 
-    def test_a_pass_whose_upstream_did_not_launch_builds_nothing(self):
-        """RED before the fix, GREEN after.
+    #1015 (01a391fa03) deleted the admission-decision arc and with it the only
+    writer of `_pp_upstream_launched_incoming` (`_pp_recv_admission_decision`),
+    and made the proxy channel unconditional on both ends: a rank with no batch
+    posts a void frame, so a receive can no longer block on a message nobody
+    sent -- the premise of #798 and of this guard. #1015c (206661a28b) then
+    made `pp_upstream_void_pending` answer False, because the fed-only-by-reset
+    flag had turned it into "always True": boot_pp3solo_01a391fa03_0829_112833
+    refused EVERY downstream pass, 0 prefill batches, 0 served. The void
+    decision stays with the rank that owns it (PP0-authoritative direction).
 
-        Before: control reaches the sentinel, i.e. the shipped method runs the
-        whole prefill formation for a pass that is already known to be void.
-        After: the guard withholds the round, exactly as it does for #797.
-        """
+    So a downstream pass whose upstream flag reads False is NOT refused any
+    more: it reaches the formation like any other pass. Before #1015c these
+    cases asserted the refusal; that is the semantics #1015c withdrew.
+    """
+
+    def test_a_pass_whose_upstream_did_not_launch_is_no_longer_refused(self):
+        from sglang.srt.managers import scheduler_pp_mixin as mixin_mod
+
         mod, saved = _patch_prefill_blocked(False)
         try:
             h = _holder(upstream_launched=False, chunked_req=_ChunkReq())
-            try:
-                plan = _run_one_pass(h)
-            except _ReachedPrefillFormation as exc:
-                self.fail(
-                    "#951: the pass reached the prefill formation although its "
-                    "upstream reported launched=False. Everything it does from "
-                    "here is unwound retroactively by _pp_void_own_batch, which "
-                    "is the compensator the #798 specimens died on: " + str(exc)
-                )
-        finally:
-            mod.phase_prefill_blocked_here = saved
-
-        self.assertIsNone(
-            plan.batch_to_run,
-            "a pass whose upstream did not launch must build no batch at all",
-        )
-
-    def test_the_chunked_request_is_not_touched_by_a_voided_pass(self):
-        """The invariant, stated as state rather than as control flow.
-
-        `chunked_req` is scheduler state that outlives the round. A pass that
-        is refused before it starts cannot have moved it, so no unwind is
-        needed and none can be forgotten.
-        """
-        chunk = _ChunkReq()
-        before = (chunk.extend_range.start, chunk.extend_range.end)
-        before_inflight = chunk.inflight_middle_chunks
-
-        mod, saved = _patch_prefill_blocked(False)
-        try:
-            h = _holder(upstream_launched=False, chunked_req=chunk)
-            try:
+            self.assertFalse(mixin_mod.pp_upstream_void_pending(h))
+            with self.assertRaises(_ReachedPrefillFormation):
                 _run_one_pass(h)
-            except _ReachedPrefillFormation:
-                self.fail(
-                    "#951: reached the formation; the state assertions below "
-                    "would be measuring the compensator, not the guard"
-                )
         finally:
             mod.phase_prefill_blocked_here = saved
 
-        self.assertIs(h.chunked_req, chunk, "the chunked request must survive")
-        self.assertEqual(
-            (chunk.extend_range.start, chunk.extend_range.end),
-            before,
-            "a refused pass may not advance the chunked request's extend range",
-        )
-        self.assertEqual(
-            chunk.inflight_middle_chunks,
-            before_inflight,
-            "a refused pass may not leak an inflight_middle_chunks increment -- "
-            "its matching decrement lives in process_batch_result_prefill, "
-            "which never runs for a voided pass",
-        )
+    def test_the_predicate_answers_false_on_every_shape(self):
+        """The retirement is total: no shape of the flag re-arms a
+        downstream refusal (a partial retirement would bring back the
+        pp3solo stall on exactly that shape)."""
+        from sglang.srt.managers import scheduler_pp_mixin as mixin_mod
+
+        for launched in (False, True):
+            for gapped in (False, True):
+                h = _holder(upstream_launched=launched, chunked_req=_ChunkReq())
+                h._pp_gapped_wire = gapped
+                self.assertFalse(mixin_mod.pp_upstream_void_pending(h),
+                                 (launched, gapped))
 
 
 class PPUpstreamVoidGuardIsInert951(unittest.TestCase):
@@ -440,18 +420,18 @@ class PPUpstreamVoidKeepsTheSpinDetector951(unittest.TestCase):
     exactly like a void that did not occur.
     """
 
-    def test_the_streak_still_counts_when_the_guard_emptied_the_slot(self):
-        """The slot is empty BECAUSE the guard refused the pass, and this rank
-        held work. That is the same state the streak has always counted."""
+    def test_no_void_means_no_spin_streak_since_1015c(self):
+        """#1015c (206661a28b): with `pp_upstream_void_pending` False the #798
+        site voids nothing, so there is no no-progress void to count -- the
+        streak is cleared even for a rank that held work, and the slot is
+        left as it was. (Before #1015c this case asserted the count 4 -> 5.)"""
         h = _VoidHolder(withheld_work=True, batch=None, streak=4).bind()
-        h._pp_void_pass_without_upstream_launch(0)
-        self.assertEqual(
-            h._pp_upstream_idle_void_streak,
-            5,
-            "#951 empties the slot on exactly the passes #798 used to find "
-            "non-empty; reading emptiness alone would retire the #801-spin "
-            "detector at the moment it started mattering",
-        )
+        self.assertFalse(h._pp_void_pass_without_upstream_launch(0))
+        self.assertEqual(h._pp_upstream_idle_void_streak, 0)
+        batch = object()
+        h2 = _VoidHolder(withheld_work=True, batch=batch, streak=4).bind()
+        self.assertFalse(h2._pp_void_pass_without_upstream_launch(0))
+        self.assertIs(h2.mbs[0], batch, "a pass that is not void keeps its batch")
 
     def test_an_idle_rank_still_clears_the_streak(self):
         """The other half, and the one that keeps the bound honest: a rank

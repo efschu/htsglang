@@ -405,6 +405,12 @@ class TheRouterEndToEnd(CustomTestCase):
         f.exact_tokens = {}
         f.spans = None
         f.queue = []
+        # #58 (0aeb52e070): handle_generate asks the vision verdict table
+        # first; the constructor's default is "off" (text-only front).
+        from sglang.srt.weg2.front import VISION_MODE_OFF
+        f.vision = VISION_MODE_OFF
+        # H84 X-SOLO band: the constructor's start X is the X at launch
+        f.x_start_tokens = f.tp_prefill_max_tokens
         return f
 
     @staticmethod
@@ -423,7 +429,8 @@ class TheRouterEndToEnd(CustomTestCase):
         async def body():
             with mock.patch.object(
                     front_mod, "price_remainder",
-                    lambda t, s: (SB5F_UNCACHED, SB5F_UNCACHED, True)):
+                    # #49 (196f6a8f57) added the awake-D epoch keyword
+                    lambda t, s, epoch=None: (SB5F_UNCACHED, SB5F_UNCACHED, True)):
                 return await asyncio.wait_for(
                     front.handle_generate(TheRouterEndToEnd._Req(
                         dict(payload, text=text))), 0.5)

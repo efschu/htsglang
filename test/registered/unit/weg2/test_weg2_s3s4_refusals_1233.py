@@ -269,11 +269,21 @@ def test_w25_seam_is_the_first_statement_of_both_admission_handlers():
 
     from sglang.srt.managers.scheduler import Scheduler
 
-    for name in ("handle_generate_request", "handle_embedding_request"):
+    def _body(name):
         src = inspect.getsource(getattr(Scheduler, name))
         tree = ast.parse("class _X:\n" + "\n".join("    " + l for l in src.splitlines()))
-        fn = tree.body[0].body[0]
-        first = fn.body[0]
+        return tree.body[0].body[0].body
+
+    # #1474 (c7cd8aecda): handle_generate_request became a timing wrapper
+    # around _handle_generate_request_impl. The wrapper touches no pool -- a
+    # clock read, then the delegation -- so the seam must be the impl's first
+    # statement, and the wrapper must be exactly that shape.
+    wrapper = _body("handle_generate_request")
+    assert ast.unparse(wrapper[0]) == "_t0 = time.perf_counter()", ast.unparse(wrapper[0])
+    assert isinstance(wrapper[1], ast.Try) and len(wrapper) == 2
+    assert ast.unparse(wrapper[1].body[0]) == "return self._handle_generate_request_impl(recv_req)"
+    for name in ("_handle_generate_request_impl", "handle_embedding_request"):
+        first = _body(name)[0]
         assert isinstance(first, ast.If), name
         assert "weg2_dormant" in ast.unparse(first.test), name
         assert any(isinstance(n, ast.Return) for n in first.body), name
