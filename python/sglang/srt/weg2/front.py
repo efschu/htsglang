@@ -125,6 +125,12 @@ CHARS_PER_TOKEN = 3.0  # conservative: over-estimates tokens, never under-prices
 # 27,466-token carrier bound. Route by a lower divisor; the realised leg-1
 # count corrects any prompt that still slips through (see leg1).
 CARRIER_CHARS_PER_TOKEN = 2.4
+#: X-EXACT: appended inside the ROUTE-VERDICT's witness parenthesis when the
+#: request was priced by the front tokenizer, so the line never reads as the
+#: chars/3 figure it would otherwise name (off: never appended).
+X_EXACT_VERDICT_NOTE = ("; X-EXACT: uncached, est_prompt and carrier_est are the FRONT "
+                        "TOKENIZER's exact counts of the prompt as D renders it, NOT "
+                        "CHARS_PER_TOKEN -- see the X-EXACT-PRICE line")
 #: WEG2_SCHEDULING_SPEC_0907 C13/K10: the drain deadline is a FLAG
 #: (``--drain-deadline-s``); this is the shipped value it preserves (spec
 #: 3.5.4, the #111 link-seam bound reused).  No code reads it except the
@@ -2857,11 +2863,46 @@ def _nvml_process_mib(pids: set) -> Dict[str, int]:
         ).stdout
     except Exception:  # noqa: BLE001
         return {}
+    return parse_compute_apps(out, pids)
+
+
+#: NS 26.09.: lines of ``--query-compute-apps`` output the parser could not
+#: read, summed over this process's lifetime (an instrument, never a gate).
+NVSMI_SKIPPED_LINES = 0
+_NVSMI_SKIP_WARNED = False
+
+
+def parse_compute_apps(out: str, pids: set) -> Dict[str, int]:
+    """``pid, used_memory, gpu_uuid`` rows (csv,noheader,nounits) -> {uuid: MiB}
+    summed over ``pids``.
+
+    A residue READING -- it may never kill the flip (boot
+    dkr27bbar1i8h109261950, 26.09. 19:53Z: W4 Weg2WakeRefused at stage
+    'wake-kv', ``not enough values to unpack (expected 3, got 1)`` on the first
+    flip ~40 min after a host driver reload). nvidia-smi can print rows that are
+    not data: "No running processes found", a warning/error text, ``[N/A]`` or
+    ``[Insufficient Permissions]`` in the memory field. Such a row is SKIPPED
+    and COUNTED (``NVSMI_SKIPPED_LINES``); the first one per process is logged
+    as a WARNING with the row text cut to 120 chars, so the cause is in the log
+    next time.
+    """
+    global NVSMI_SKIPPED_LINES, _NVSMI_SKIP_WARNED
     res: Dict[str, int] = {}
-    for line in out.strip().splitlines():
+    for line in (out or "").strip().splitlines():
         if not line.strip():
             continue
-        pid, used, uuid = [x.strip() for x in line.split(",")]
+        parts = [x.strip() for x in line.split(",")]
+        if (len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit()
+                or not parts[2]):
+            NVSMI_SKIPPED_LINES += 1
+            if not _NVSMI_SKIP_WARNED:
+                _NVSMI_SKIP_WARNED = True
+                logger.warning(
+                    "WEG2 NVSMI-PARSE skipped a --query-compute-apps row that is not "
+                    "'pid, used_memory, gpu_uuid' (warned once per process; total "
+                    "skipped so far %d): %r", NVSMI_SKIPPED_LINES, line.strip()[:120])
+            continue
+        pid, used, uuid = parts
         if int(pid) in pids:
             res[uuid] = res.get(uuid, 0) + int(used)
     return res
@@ -2934,7 +2975,8 @@ class Front:
                  p_phase_max_requests: int = 0,
                  p_pool_tokens: int = 0,
                  d_wait_bound_s: float = 0.0,
-                 p_leg1_stall_s: float = 0.0):
+                 p_leg1_stall_s: float = 0.0,
+                 d_park_immediate: bool = False):
         # #1275: the key arrives as a PATH, never as an argv value. The groups
         # have no choice (`server_args` offers only `--admin-api-key`, so their
         # key is world-readable in /proc/<pid>/cmdline), but the front does, and
@@ -3024,6 +3066,20 @@ class Front:
         self.admit_d = True
         self.queue: Deque[Pending] = collections.deque()
         self.spans = SpanLRU()
+        # X-EXACT (user 26.09. ~19:00Z): the pending tokens priced EXACTLY --
+        # D's tokenizer and template at the front, minus the measured
+        # cached-on-D TOKEN prefix (weg2/front_tokens.py). Off = chars/3 pricing,
+        # byte for byte; nothing below is constructed or imported then.
+        self.x_exact = bool(envs.SGLANG_WEG2_FRONT_EXACT_TOKENS.get())
+        self.ftok = None
+        self.tspans = None
+        #: rid -> (pending priced, tokens counted, witness) for X-EXACT-ERR
+        self._x_exact_rid: "collections.OrderedDict[str, Tuple[int, int, str]]" = collections.OrderedDict()
+        if self.x_exact:
+            from sglang.srt.weg2.front_tokens import FrontTokens, TokenSpans
+
+            self.ftok = FrontTokens()
+            self.tspans = TokenSpans(agent_span=self.spans.agent_span)
         # NF (P49): a boot with the switch on says so once. Off prints nothing,
         # so an off boot's front log keeps the pre-P49 lines (the arm's env
         # line is the off witness).
@@ -3327,6 +3383,16 @@ class Front:
         self.p_leg1_stall_s = max(0.0, float(p_leg1_stall_s or 0.0))
         #: when a leg 1 last completed -- P's work evidence for that bound.
         self._p_leg1_done_t = 0.0
+        #: 27B PARK (user 26.09. ~19:00Z): "Wartegrenze 0" -- a queued request
+        #: that needs P (pending tokens > X) while D decodes parks D's running
+        #: decodes at once (behind min-dwell and the fairness floor) and the
+        #: flip to P follows; the parked ones resume first after the flip back.
+        #: The CLASS default is off (the 27B front byte-identical); main()
+        #: resolves the flag from SGLANG_WEG2_D_PARK_IMMEDIATE / the profile.
+        self.d_park_immediate = bool(d_park_immediate)
+        #: the D phase (epoch) whose immediate park was held by the dwell
+        #: already named (one WEG2 PARK-IMMEDIATE-DWELL line per phase).
+        self._park_immediate_dwell_epoch = -1
         #: UNIFY (operator 26.09.): the NF H91 standard form on this front --
         #: rule 2's hand-over term and handoff_n/parked_n on D's wake. qwen27b
         #: off: the 27B front byte-identical (profile field standard_form).
@@ -3351,6 +3417,14 @@ class Front:
                 ("wait-bound (replaces --fairness-w-s in the D phase)" if self.d_wait_bound_s > 0
                  else f"--fairness-w-s {self.w_s:g}"),
                 phase_policy.PARK_PATH)
+        if self.d_park_immediate:
+            logger.info(
+                "WEG2-PARK-IMMEDIATE on (27B park, user 26.09.: D->P waits for nothing): a queued "
+                "request that needs P (est_uncached > X in force, P-only, or refused by D as over X) "
+                "while D decodes parks D's running decodes via %s at once -- behind min-dwell and "
+                "the %.0f ms fairness floor -- and the flip to P follows; the parked requests resume "
+                "first after the flip back. d_wait_bound_s=%.1f fairness_w_s=%g stay as they are",
+                phase_policy.PARK_PATH, FAIRNESS_DWELL_FLOOR_MS, self.d_wait_bound_s, self.w_s)
 
     # ---------------- H91 part C: parked requests and the wait bound ----------------
     def _flip_ledger(self, g: Group) -> List[str]:
@@ -3417,7 +3491,31 @@ class Front:
         return {"handoff_n": len(held) + len(ready) + max(0, inflight),
                 "parked_n": len(parked)}
 
-    async def _wait_bound_park(self, wait_s: Optional[float]) -> str:
+    def _immediate_park_due(self, D: Group, now: float) -> Optional["Pending"]:
+        """27B PARK: the queued request that fires the immediate park now, or
+        None. Only while D runs something (an idle D flips on its own path),
+        only once per D phase (the park's own latch), only past the dwell --
+        the derived min-dwell (K7) and the fairness floor -- so every D phase
+        decodes the parked requests for at least the price of its flip."""
+        if self._park_attempt_epoch == self.epoch or not self._flip_ledger(D):
+            return None
+        p = phase_policy.immediate_park_trigger(self.queue, int(self.tp_prefill_max_tokens))
+        if p is None:
+            return None
+        need_ms, prov = self._derived_min_dwell_ms("D", "P")
+        awake_s = now - self.t_awake
+        if not phase_policy.immediate_park_dwell_ok(awake_s, need_ms, FAIRNESS_DWELL_FLOOR_MS):
+            if self._park_immediate_dwell_epoch != self.epoch:
+                self._park_immediate_dwell_epoch = self.epoch
+                self.counters["park_immediate_dwell_holds"] += 1
+                logger.info("WEG2 PARK-IMMEDIATE-DWELL epoch=%d rid=%s awake_ms=%d min_dwell_ms=%d "
+                            "(%s) floor_ms=%d -- the park fires once D has decoded that long this "
+                            "phase", self.epoch, p.rid, int(awake_s * 1000.0), int(need_ms), prov,
+                            int(FAIRNESS_DWELL_FLOOR_MS))
+            return None
+        return p
+
+    async def _wait_bound_park(self, wait_s: Optional[float], immediate: Optional["Pending"] = None) -> str:
         """Rule 3: the wait bound fired in the D phase -- park D's running
         decodes and let the controller flip.
 
@@ -3435,18 +3533,32 @@ class Front:
         D = self.groups["D"]
         running = self._flip_ledger(D)
         self.admit_d = False
-        self.counters["wait_bound_fired"] += 1
         now = time.time()
-        oldest = max(self.queue, key=lambda p: phase_policy.d_phase_wait_s(p.t_arrive, self.t_awake, now),
-                     default=None)
-        logger.warning(
-            "WEG2 WAIT-BOUND FIRED epoch=%d oldest_rid=%s waited_s=%.1f bound_s=%.1f "
-            "(--d-wait-bound-s; measured as now - max(arrival at the front, D phase start)) "
-            "running=%d ready_for_d=%d queue=%d -- admission to D closed for this phase, %s",
-            self.epoch, oldest.rid if oldest is not None else "-", wait_s or 0.0, self.d_wait_bound_s,
-            len(running), len(self._ready_for_d), len(self.queue),
-            "parking the running decodes, then the flip to P" if running
-            else "nothing running: the flip to P follows without a park")
+        if immediate is not None:
+            # 27B PARK (user 26.09.): not a bound -- the arrival itself fires.
+            self.counters["park_immediate_fired"] += 1
+            logger.warning(
+                "WEG2 PARK-IMMEDIATE FIRED epoch=%d rid=%s est_uncached=%d X=%d p_only=%s "
+                "x_requeues=%d waited_s=%.1f awake_s=%.1f running=%d ready_for_d=%d queue=%d -- "
+                "admission to D closed for this phase, %s",
+                self.epoch, immediate.rid, int(immediate.est_uncached), int(self.tp_prefill_max_tokens),
+                bool(getattr(immediate, "p_only", False)), int(getattr(immediate, "x_requeues", 0) or 0),
+                max(0.0, now - float(immediate.t_arrive)), max(0.0, now - float(self.t_awake)),
+                len(running), len(self._ready_for_d), len(self.queue),
+                "parking the running decodes, then the flip to P" if running
+                else "nothing running: the flip to P follows without a park")
+        else:
+            self.counters["wait_bound_fired"] += 1
+            oldest = max(self.queue, key=lambda p: phase_policy.d_phase_wait_s(p.t_arrive, self.t_awake, now),
+                         default=None)
+            logger.warning(
+                "WEG2 WAIT-BOUND FIRED epoch=%d oldest_rid=%s waited_s=%.1f bound_s=%.1f "
+                "(--d-wait-bound-s; measured as now - max(arrival at the front, D phase start)) "
+                "running=%d ready_for_d=%d queue=%d -- admission to D closed for this phase, %s",
+                self.epoch, oldest.rid if oldest is not None else "-", wait_s or 0.0, self.d_wait_bound_s,
+                len(running), len(self._ready_for_d), len(self.queue),
+                "parking the running decodes, then the flip to P" if running
+                else "nothing running: the flip to P follows without a park")
         if not running:
             return "nothing-running"
         if self._park_unsupported:
@@ -3456,7 +3568,9 @@ class Front:
                 "fallback: the %d running decode(s) run to their end, then the flip (pre-H91 "
                 "A1-1 path at the wait bound)", self.epoch, len(running))
             return "unsupported"
-        body = phase_policy.park_body(self.epoch, self.d_wait_bound_s)
+        body = phase_policy.park_body(
+            self.epoch, self.d_wait_bound_s,
+            reason=phase_policy.PARK_REASON_IMMEDIATE if immediate is not None else None)
         # H91c3-1: the park's stamp is taken BEFORE the RPC. D stamps its park
         # while serving the RPC and re-queues it after PARK_REQUEUE_S on its
         # own clock; a front stamp taken after the answer ran that clock late
@@ -3887,6 +4001,8 @@ class Front:
         # during the freeze: "Server disconnected", 97k needle lost. Import it
         # once here, in a worker thread, while the front is still idle.
         app["launcher_prewarm"] = asyncio.create_task(self._prewarm_launcher_import())
+        if self.x_exact:
+            app["x_exact"] = asyncio.create_task(self._x_exact_boot())
         # H78: the same move for the flip path's small lazy imports (wake_credit
         # alone put ~5 ms into x175's first FLIP-ORDER) and for the sidecar the
         # sleep-leg gate reads at every flip (18-47 ms of JSON on the loop).
@@ -3933,6 +4049,157 @@ class Front:
         logger.info("WEG2-FRONT launcher prewarmed off the event loop in %.1f s "
                     "(H75: resolve_x_live no longer freezes the front in the first flip)",
                     time.monotonic() - t0)
+
+    # -- X-EXACT (user 26.09. ~19:00Z): exact pending tokens ------------------
+    async def _x_exact_boot(self) -> None:
+        """Load D's rendering stack into the front, off the event loop.
+
+        The tokenizer path and every rendering setting come from a group's own
+        ``/get_server_info`` (the same server args its tokenizer manager
+        runs), so there is one source for the profile's tokenizer: the group.
+        Startup only: retried every 5 s until a group answers, then never
+        again. Until READY every request is priced by chars/3 and says so
+        (``X-EXACT-FALLBACK reason=tokenizer_loading``)."""
+        t0 = time.monotonic()
+        tries = 0
+        info: Dict[str, Any] = {}
+        minfo: Dict[str, Any] = {}
+        while True:
+            tries += 1
+            for name in (self.awake, "P" if self.awake == "D" else "D"):
+                g = self.groups[name]
+                try:
+                    async with self.session.get(f"{g.url}/get_server_info",
+                                                timeout=ClientTimeout(total=10)) as r:
+                        got = await r.json() if r.status == 200 else None
+                    async with self.session.get(f"{g.url}/model_info",
+                                                timeout=ClientTimeout(total=10)) as r:
+                        mi = await r.json() if r.status == 200 else {}
+                except Exception:  # noqa: BLE001 -- group not up yet; retried
+                    got, mi = None, {}
+                if isinstance(got, list) and got:
+                    got = got[0]
+                if isinstance(got, dict) and (got.get("tokenizer_path") or got.get("model_path")):
+                    info = {k: v for k, v in got.items() if k != "internal_states"}
+                    minfo = mi if isinstance(mi, dict) else {}
+                    info["_group"] = name
+                    break
+            if info:
+                break
+            if tries % 12 == 1:
+                logger.info("WEG2 X-EXACT waiting for a group's /get_server_info (try %d, %.0f s)",
+                            tries, time.monotonic() - t0)
+            await asyncio.sleep(5.0)
+        group = info.pop("_group")
+        is_mm = bool(minfo.get("has_image_understanding") or minfo.get("has_audio_understanding"))
+        ft = self.ftok
+        await asyncio.get_running_loop().run_in_executor(ft.executor, ft.load, info, is_mm)
+        if ft.state != "ready":
+            logger.error("WEG2 X-EXACT FAILED to load the front tokenizer from group %s's server args "
+                         "(%s) after %.1f s -- every request stays priced by chars/3 "
+                         "(X-EXACT-FALLBACK reason=tokenizer_failed)", group, ft.why, ft.load_s)
+            return
+        tmpl = getattr(ft._tok, "chat_template", None) or ""
+        logger.info(
+            "WEG2 X-EXACT READY tokenizer=%s (group %s's server_args.tokenizer_path%s) "
+            "chat_template=%s sha1=%s chat_template_default_kwargs=%s reasoning_parser=%s "
+            "tool_call_parser=%s multimodal=%d inline_system_in_place=%d encode=%s load_s=%.1f "
+            "-- pending = tokens(prompt as D renders it) - measured cached-on-D token prefix; "
+            "X holds exactly for it (no band)",
+            ft.tokenizer_path, group,
+            ", OVERRIDDEN by SGLANG_WEG2_FRONT_TOKENIZER_PATH"
+            if envs.SGLANG_WEG2_FRONT_TOKENIZER_PATH.get() else "",
+            info.get("chat_template") or "checkpoint",
+            hashlib.sha1(tmpl.encode()).hexdigest()[:12],
+            info.get("chat_template_default_kwargs"), info.get("reasoning_parser"),
+            info.get("tool_call_parser"), int(is_mm),
+            int(bool(envs.SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE.get())), ft.why, ft.load_s)
+
+    async def _x_exact_price(self, rid: str, path: str, payload: Any, text: str,
+                             est_uncached: int, est_prompt: int, multimodal: bool = False):
+        """The exact pricing of one arrival, or None (then the chars/3 figures
+        stand, and the line below says why). Runs the count in the front
+        tokenizer's worker thread; the event loop only awaits it."""
+        ft = self.ftok
+        reason = None
+        if ft is None or ft.state != "ready":
+            reason = "tokenizer_" + (ft.state if ft is not None else "none")
+        elif multimodal:
+            reason = "multimodal"  # image/video/embeds: D's mm processor expands them
+        elif not isinstance(payload, dict) or path not in ("/v1/messages", "/v1/chat/completions",
+                                                               "/generate"):
+            reason = "path"
+        c = None
+        t0 = time.monotonic()
+        if reason is None:
+            try:
+                c = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(ft.executor, ft.count, path, payload),
+                    timeout=envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0)
+            except asyncio.TimeoutError:
+                reason = "timeout"
+            except Exception as e:  # noqa: BLE001 -- the estimate stands, named
+                reason = f"{type(e).__name__}: {str(e)[:160]}"
+        wait_ms = (time.monotonic() - t0) * 1000.0
+        if c is None:
+            self.counters["x_exact_fallback"] += 1
+            logger.info("WEG2 X-EXACT-FALLBACK rid=%s reason=%s est_uncached=%d est_prompt=%d "
+                        "(chars/3 estimate stands for this request) wait_ms=%.1f",
+                        rid, reason, est_uncached, est_prompt, wait_ms)
+            return None
+        ft.remember(text, c.ids)
+        # the epoch is read AFTER the count: a flip during it ends the held credit
+        epoch = self.epoch if self.awake == "D" and self.state == "serving" else None
+        pending, credit, known, src = self.tspans.pending(c.ids, epoch=epoch)
+        self._x_exact_rid[rid] = (pending, c.n, src)
+        while len(self._x_exact_rid) > 4096:
+            self._x_exact_rid.popitem(last=False)
+        self.counters["x_exact_priced"] += 1
+        logger.info("WEG2 X-EXACT-PRICE rid=%s pending=%d tokens=%d credit=%d src=%s known=%d "
+                    "(EXACT: D's tokenizer+template, minus the MEASURED cached-on-D token prefix) "
+                    "chars3_uncached=%d chars3_prompt=%d delta=%+d count_ms=%.1f wait_ms=%.1f "
+                    "reused=%d encoded=%d",
+                    rid, pending, c.n, credit, src, int(known), est_uncached, est_prompt,
+                    est_uncached - pending, c.ms, wait_ms, c.reused, c.encoded)
+        from types import SimpleNamespace
+
+        return SimpleNamespace(pending=pending, n=c.n, known=known, credit=credit, src=src)
+
+    def _x_exact_tokens_check(self, rid: str, group: str, prompt_tokens: int) -> None:
+        got = self._x_exact_rid.get(rid)
+        if got is None or not prompt_tokens:
+            return
+        if int(prompt_tokens) != got[1]:
+            self.counters["x_exact_token_mismatch"] += 1
+        logger.info("WEG2 X-EXACT-TOKENS rid=%s group=%s tokens_front=%d tokens_group=%d match=%d",
+                    rid, group, got[1], int(prompt_tokens), int(int(prompt_tokens) == got[1]))
+
+    def _x_exact_record(self, rid: str, text: str, pt: int, ct: int, pending: Any,
+                        held_epoch: Optional[int]) -> None:
+        """D leg 2 finished: feed the token spans with D's MEASURED reading and
+        log the residual error of this request's exact price. NO BAND: the
+        error is printed, never folded back into the routing bound."""
+        self.tspans.record_presence(self.ftok.ids_for(text), ct, prompt_tokens=pt,
+                                    held_epoch=held_epoch)
+        got = self._x_exact_rid.pop(rid, None)
+        if got is None:
+            return
+        priced, n, src = got
+        via = ("d_direct" if pending is None
+               else "d_drain" if getattr(pending, "d_direct", False) else "after_p")
+        realised = max(0, int(pt) - int(ct))
+        direct = via != "after_p"
+        if direct:
+            self.counters["x_exact_err_n"] += 1
+            self.counters["x_exact_err_abs_sum"] += abs(priced - realised)
+        logger.info("WEG2 X-EXACT-ERR rid=%s via=%s pending_priced=%d d_uncached=%d err=%s "
+                    "tokens_front=%d tokens_d=%d match=%d src=%s (err = priced - realised; "
+                    "with match=1 it is D's cache moving after the measurement, e.g. a Mamba "
+                    "state only at an anchor depth -- logged, never absorbed by a band; "
+                    "after_p: D read P's prefill back, no comparison)",
+                    rid, via, priced, realised,
+                    ("%+d" % (priced - realised)) if direct else "na",
+                    n, int(pt), int(int(pt) == n), src)
 
     #: H78: the modules the flip / leg path imports lazily on its FIRST use --
     #: credit_pause_order (wake_credit), timed_pause_order (wake_credit_pd),
@@ -4355,6 +4622,8 @@ class Front:
             "p_leg1_stall_s": getattr(self, "p_leg1_stall_s", 0.0),
             "d_parked": sorted(getattr(self, "_d_parked", None) or {}),
             "park_unsupported": bool(getattr(self, "_park_unsupported", False)),
+            # 27B PARK: only when on, so the 27B state stays byte-identical off.
+            **({"d_park_immediate": True} if getattr(self, "d_park_immediate", False) else {}),
         }
 
     async def handle_passthrough_get(self, request: web.Request) -> web.Response:
@@ -4551,11 +4820,22 @@ class Front:
         # ever saw a prefill.
         presence_src = ((getattr(self.spans, "last_src", None) or "d_leg2_cached")
                         if known else "none")
+        # X-EXACT: the count replaces the chars/3 figures (off: never entered).
+        _xx = None
+        if self.x_exact:
+            _xx = await self._x_exact_price(rid, request.path, payload, text,
+                                            remainder, est_prompt,
+                                            multimodal=bool(_img or _vid or _emb))
+            if _xx is not None:
+                remainder, est_prompt, known = _xx.pending, _xx.n, _xx.known
+                store_span, presence_src = _xx.credit, _xx.src
         if not known:
             self.counters["W22_Weg2SpanUnknownPricedFull"] += 1
         self.counters["requests"] += 1
         stream = bool(payload.get("stream"))
         exact = self.exact_tokens.get(hashlib.sha1(text.encode(errors="replace")).hexdigest())
+        if _xx is not None:
+            exact = _xx.n
         carrier_est = exact if exact else int(len(text) / CARRIER_CHARS_PER_TOKEN) + 1
         # #1290: ONE ROUTE VERDICT, TAKEN ONCE, ON BOTH BOUNDS TOGETHER.  The
         # branch below used to test the carrier ALONE and send anything over
@@ -4629,7 +4909,8 @@ class Front:
             # NF (P49): the #49 witness is named only when the switch is on,
             # so the line stays rc2.1l's byte for byte when it is off.
             ("; #49 d_served_epoch = prompt_tokens of a text D served in this epoch"
-             if getattr(self.spans, "agent_span", False) else ""),
+             if getattr(self.spans, "agent_span", False) else "")
+            + (X_EXACT_VERDICT_NOTE if _xx is not None else ""),
             carrier_est, "exact" if exact is not None else "estimate",
             self.carrier_max_tokens, CARRIER_CHARS_PER_TOKEN, est_prompt,
             len(text),
@@ -4695,8 +4976,10 @@ class Front:
         # price_remainder is len(text)/3.0 minus an LRU prefix guess, with no
         # tokenizer at the front.  D re-derives the real extent after
         # match_prefix and refuses by name there (L9/W31).
-        logger.info("WEG2 X-ROUTE rid=%s est_uncached=%d X=%d (ESTIMATE, front pricing, no tokenizer)",
-                    rid, remainder, x_route)
+        logger.info("WEG2 X-ROUTE rid=%s est_uncached=%d X=%d (%s)",
+                    rid, remainder, x_route,
+                    "EXACT, front tokenizer, see X-EXACT-PRICE" if _xx is not None
+                    else "ESTIMATE, front pricing, no tokenizer")
         # RC2 review (idle policy b): why a SHORT falls through to BATCH. Only
         # D's own #915 refusal is recorded -- see `d_eligible` below.
         short_refused: List[str] = []
@@ -5294,6 +5577,8 @@ class Front:
             # and it was never wrong -- `carrier_est=109132 src=exact` was
             # the one correct number on the sn6s route line.
             self._note_exact(p.text, pt)
+            if self.x_exact:
+                self._x_exact_tokens_check(p.rid, "P", pt)
             # #1317n THE POST-LEG-1 CARRIER BAND IS GONE. It compared
             # the realised prompt against what D's host tier could carry AS
             # ONE READ and sent leg 2 to a single prefill on D -- which,
@@ -5574,6 +5859,8 @@ class Front:
                         text, self.exact_tokens.get(hashlib.sha1(text.encode(errors="replace")).hexdigest())
                         or int(len(text) / CHARS_PER_TOKEN) + 1,
                         held_epoch=self.epoch)
+                    if self.x_exact:
+                        self.tspans.record_inflight(self.ftok.ids_for(text), self.epoch)
                     self.counters["span_inflight_credited"] += 1
                 if stream:
                     resp = web.StreamResponse(status=r.status)
@@ -5729,6 +6016,10 @@ class Front:
                                                    held_epoch=(self.epoch if r.status == 200 and priced
                                                                and not x_inband else None))
                         self._note_exact(text, pt)
+                        if self.x_exact:
+                            self._x_exact_record(rid, text, pt, ct, pending,
+                                                 (self.epoch if r.status == 200 and priced
+                                                  and not x_inband else None))
                     dterms = await self._draft_terms(g, None, rid=rid, uncached=max(0, pt - ct),
                                                      mark=_pfc_mark0)
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
@@ -5818,6 +6109,10 @@ class Front:
                                                held_epoch=(self.epoch if r.status == 200 and priced
                                                            and verdict != "reroute" else None))
                     self._note_exact(text, pt)
+                    if self.x_exact:
+                        self._x_exact_record(rid, text, pt, ct, pending,
+                                             (self.epoch if r.status == 200 and priced
+                                              and verdict != "reroute" else None))
                 if r.status == 200 and pending is not None and verdict == "reroute":
                     self.counters["reroute"] += 1
                     pending.reroutes += 1
@@ -8148,6 +8443,15 @@ class Front:
                         fairness_fired = wait_fired or not self.admit_d
                     else:
                         fairness_fired = self._fairness_switch(oldest, "batch")
+                    # 27B PARK (user 26.09.): "Wartegrenze 0" -- a queued request
+                    # that needs P while D decodes fires the park at once (the
+                    # dwell and the fairness floor aside); it pre-empts like the
+                    # fairness bound. Off (the class default): nothing changes.
+                    immediate: Optional[Pending] = None
+                    if self.d_park_immediate and not wait_fired and self.queue:
+                        immediate = self._immediate_park_due(D, _now)
+                        if immediate is not None:
+                            wait_fired = fairness_fired = True
                     # 27B idle policy (c): when D's own work last ended (--d-hold-s).
                     self._note_d_free(not D.outstanding and not self._handoff_in_flight()
                                       and not self._ready_for_d, _now)
@@ -8203,7 +8507,7 @@ class Front:
                         # per D phase; admission to D closes). A hand-off in
                         # flight is waited for first -- it registers within
                         # ms, bounded by the W36 barrier -- so the park sees it.
-                        await self._wait_bound_park(wait_s)
+                        await self._wait_bound_park(wait_s, immediate=immediate)
                     # H91 part C rule 2: D's work is exhausted only when it
                     # runs nothing (the wait-bound-parked ones excepted), holds
                     # no hand-off AND no prefilled request still waits in
@@ -8714,6 +9018,13 @@ def main():
                          "waiting for P longer than this during the D phase (from max(arrival, D phase "
                          "start)) parks D's running decodes via POST /weg2/park_running and flips to P. "
                          "Replaces --fairness-w-s in the D phase while > 0; 0 = off (fairness as before).")
+    ap.add_argument("--d-park-immediate", choices=("on", "off"), default=None,
+                    help="27B park (user 26.09.: D->P waits for nothing): a queued request that needs P "
+                         "(pending tokens > X) while D decodes parks D's running decodes via POST "
+                         "/weg2/park_running at once (behind min-dwell and the fairness floor) and flips "
+                         "to P; the parked ones resume first after the flip back. Unset = "
+                         "SGLANG_WEG2_D_PARK_IMMEDIATE / the profile's d_park_immediate (qwen27b off "
+                         "until measured). D needs the same switch (its flip park).")
     ap.add_argument("--p-leg1-stall-s", type=float, default=None,
                     help="H91 part C: a leg 1 older than this while P showed no work for as long (no "
                          "leg 1 completed, P's progress counters unchanged) is aborted on P and "
@@ -8847,6 +9158,13 @@ def main():
                          "derive the RUN-MOMENT residual from the front's own cgroup reading")
     args = ap.parse_args()
     phase_policy.resolve_front_defaults(args, bool(envs.SGLANG_WEG2_STANDARD_FORM.get()))
+    if args.d_park_immediate is None:  # 27B park: the env / the profile row decides --
+        # through the SAME reader D's flip park uses (form.d_park_immediate_state),
+        # so front and D can never parse one value two ways ("on": EnvBool says no).
+        from sglang.srt.weg2.form import d_park_immediate_state
+
+        _imm, _imm_src = d_park_immediate_state()
+        args.d_park_immediate = "on" if _imm else "off"
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
     dc = {}
     for kv in filter(None, args.dc_reserve.split(",")):
@@ -8876,7 +9194,8 @@ def main():
                   p_phase_max_requests=args.p_phase_max_requests,
                   p_pool_tokens=args.p_pool_tokens,
                   d_wait_bound_s=args.d_wait_bound_s,
-                  p_leg1_stall_s=args.p_leg1_stall_s)
+                  p_leg1_stall_s=args.p_leg1_stall_s,
+                  d_park_immediate=args.d_park_immediate == "on")
     # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
     # against. Kept from weg2/idle-anon-0908.
     if args.anon_preboot_bytes > 0:

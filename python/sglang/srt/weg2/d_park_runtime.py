@@ -48,6 +48,44 @@ def parked_list(sched) -> list:
 LATE_HOLD_ATTR = "_weg2_d_park_late_since"
 
 
+def rearm_window_draft_cold(sched, reqs) -> int:
+    """27B PARK (DFlash2): a flip-parked request on a SLOT-MAPPED draft pool
+    (the DFlash window pool, ``dflash_solo_pool.DraftKVSlotMapper``) resumes
+    exactly like a fresh hand-off -- its draft admission is armed again.
+
+    Why only there, and why this is enough (code read at the park's tree):
+    the window pool is not indexed by target slots, the sleep's tree flush
+    frees the parked span's target slots and the mapper drops their draft
+    rows with them; the resume loads the prefix back into NEW target slots,
+    which the mapper does not know -> the window reads the HOLE slot (zeros,
+    corrected out of the softmax under SGLANG_DFLASH_WINDOW_HOLE_MASK) until
+    the resumed decode writes real rows. That is the state of EVERY 27B
+    hand-off from P (P computes no draft, the draft tier is off), so nothing
+    has to be carried (H91d's MTP carry skips this pool by name) and the
+    target's verify keeps every emitted token exact. What differed was only
+    the admission's bookkeeping: ``COLD_ARMED_ATTR`` from the first admission
+    survives ``reset_for_retract``, so the resume skipped the draft-cold
+    evaluation a fresh hand-off gets -- no ``WEG2 DRAFT-COLD rid=... of N
+    prefix pages`` line (the one per-rid reading of how much prefix came
+    back), a wrong ``draft_cold`` label in the accept profile. Cleared here,
+    the resume is evaluated like the hand-off it now is. An MTP pool (NF,
+    target-slot indexed, H91d carry) is untouched. No collective, nothing
+    feeds a scheduling decision; rank-local attribute only."""
+    if not reqs:
+        return 0
+    from sglang.srt.managers.phase_flip_draft_bootstrap import COLD_ARMED_ATTR, draft_kv_pool
+
+    pool = draft_kv_pool(getattr(sched, "draft_worker", None))
+    if pool is None or getattr(pool, "weg2_slot_mapper", None) is None:
+        return 0
+    n = 0
+    for req in reqs:
+        if getattr(req, COLD_ARMED_ATTR, False):
+            setattr(req, COLD_ARMED_ATTR, False)
+            n += 1
+    return n
+
+
 def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     """Retract every running D request RETAINING its span (KV, the node's
     GDN/Mamba anchor, the draft rows) with a forced host write-through -- the
@@ -71,10 +109,11 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
 
     epoch = int(getattr(recv_req, "epoch", 0) or 0)
     reason = str(getattr(recv_req, "reason", "") or "")
-    if not d_seats.d_park_active():
+    if not d_seats.d_flip_park_active():
         return Weg2ParkRunningReqOutput(
             success=False, parked=[], epoch=epoch,
-            message="W-PARK refused: not group D (or SGLANG_WEG2_D_PARK=0) -- nothing parked",
+            message="W-PARK refused: not group D (or SGLANG_WEG2_D_PARK=0, or neither the "
+                    "standard form nor SGLANG_WEG2_D_PARK_IMMEDIATE) -- nothing parked",
         )
     parked = parked_list(sched)
     if getattr(sched, "weg2_dormant", False):
@@ -108,6 +147,9 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     # H91d: the draft rows have no host twin (tier off) -- copy them off
     # BEFORE the retraction hands the slots to the tree (d_park_draft).
     d_park_draft.save_parked(sched, running, site=d_seats.SITE_FLIP)
+    # 27B PARK: a DFlash window pool carries nothing; the resume is a fresh
+    # hand-off's admission (rearm_window_draft_cold). MTP pools: no-op.
+    rearmed = rearm_window_draft_cold(sched, running)
     retracted = (
         sched.running_batch.retract_all(sched.server_args, offload_kv=False, retain=True)
         if running else []
@@ -143,9 +185,11 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     logger.info(
         "WEG2-D-PARK park_running epoch=%d reason=%s: %d running retracted (span retained, "
         "forced host write-through), parked=%s queued-behind=%s late_hold=%s -- the sleep "
-        "holds them first, the wake resumes oldest first",
+        "holds them first, the wake resumes oldest first%s",
         epoch, reason, len(retracted), [r[:12] for r in rids], [r[:12] for r in held],
         late_hold,
+        (" (DFlash window draft: %d resume(s) re-armed like a fresh hand-off)" % rearmed
+         if rearmed else ""),
     )
     return Weg2ParkRunningReqOutput(
         success=True, parked=rids, held=held, epoch=epoch, late_hold=late_hold,
@@ -163,7 +207,7 @@ def hold_late_arrival(sched, req) -> bool:
     returns. REPLICATED: the park is a broadcast control request and the
     intake order is the group's, so every rank holds the same arrivals."""
     since = getattr(sched, LATE_HOLD_ATTR, None)
-    if since is None or getattr(sched, "weg2_dormant", False) or not d_seats.d_park_active():
+    if since is None or getattr(sched, "weg2_dormant", False) or not d_seats.d_flip_park_active():
         return False
     setattr(req, d_seats.SINCE_ATTR, since)
     parked = parked_list(sched)
@@ -267,9 +311,18 @@ def note_retracted(sched, retracted_reqs) -> int:
 def admission(sched, running_batch):
     """One pass's D admission verdict: parked first, the rest in the group's
     order, the barrier/blocked set of ``d_seats.admission_gate``. None when
-    the park is off or nothing is parked -- the stock loop, untouched."""
-    if not d_seats.d_park_active():
+    the park is off or nothing is parked -- the stock loop, untouched.
+    27B immediate park (d_flip_park_active without d_park_active): only flip
+    parks exist there, so with none waiting this is the stock loop too."""
+    if not d_seats.d_flip_park_active():
         return None
+    if not d_seats.d_park_active() and not any(
+        d_seats.park_site(r) is not None
+        for r in list(sched.waiting_queue)
+        + list(getattr(sched, "weg2_post_wake_settle", None) or [])
+        + list(getattr(sched, "weg2_dormant_hold", None) or [])
+    ):
+        return None  # immediate park, nothing flip-parked waits: the stock loop as is
     sched.waiting_queue = d_seats.order_waiting(sched.waiting_queue)
     book = getattr(sched, "_weg2_d_resume_book", None)
     if book is None:

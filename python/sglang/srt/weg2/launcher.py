@@ -4061,6 +4061,17 @@ COLLECTIVE_CENSUS_INTERVAL = 50
 P_BARLINK_BAR1_WINDOW_MIB = "24,PP_0=96"
 #: Group P's device mamba pool (--max-mamba-cache-size); see argv_p.
 P_MAX_MAMBA_CACHE_SIZE = 24
+#: H92c: the runtime's HARD FLOOR per running P request on P's posture
+#: (``mem_cache/mamba_pool_floor.mamba_slots_per_running_req``): 1 active + 1
+#: ping-pong (P runs --disable-overlap-schedule) + 1 donation + 1 pinned
+#: checkpoint (``--hicache-write-policy write_back``: no #755 reorder, so the
+#: two do not share). Measured, fnFL2h91bb2 P log:
+#: ``MAMBA-FLOOR pool=32 floor=32 retention_budget=0 (8 running requests x 4 =
+#: 32)``. Everything above ``seats x this`` is the anchor-retention budget; at 0
+#: every host backup of an anchor is refused. The planner only NAMES it on the
+#: budget-posts line (the launch/runtime riegel is AW's); a test holds this
+#: constant against the runtime function on P's posture.
+P_MAMBA_FLOOR_SLOTS_PER_SEAT = 4
 
 
 class Weg2LaunchRefused(RuntimeError):
@@ -4300,14 +4311,12 @@ def nvml_process_mib(pids: set) -> Dict[str, int]:
         ["nvidia-smi", "--query-compute-apps=pid,used_memory,gpu_uuid", "--format=csv,noheader,nounits"],
         capture_output=True, text=True, check=True,
     ).stdout
-    res: Dict[str, int] = {}
-    for line in out.strip().splitlines():
-        if not line.strip():
-            continue
-        pid, used, uuid = [x.strip() for x in line.split(",")]
-        if int(pid) in pids:
-            res[uuid] = res.get(uuid, 0) + int(used)
-    return res
+    # NS 26.09.: the same row parser as the front's flip reading -- a row that is
+    # not 'pid, used, uuid' (e.g. "No running processes found", "[N/A]") is
+    # skipped and counted, never an unpack error (boot dkr27bbar1i8h109261950).
+    from sglang.srt.weg2.front import parse_compute_apps
+
+    return parse_compute_apps(out, pids)
 
 
 def session_pids(sid: int) -> set:
@@ -4925,6 +4934,10 @@ def host_preflight(log: Log, tag: str, dry: bool) -> None:
         raise Weg2LaunchRefused(f"free -g available {avail_gib:.1f} GiB < 40 GiB; top RSS holders (NOT killed):\n" + "\n".join(top))
     oom = open("/sys/fs/cgroup/memory.events").read()
     log(f"host preflight PASS: MemAvailable {avail_gib:.1f} GiB; cgroup memory.events baseline: {' '.join(oom.split())}")
+    # SWAP READINESS (26.09.): the ledger's currencies assume a swapless cgroup;
+    # name the swap state once per boot and WARN when pages already moved out.
+    swap_line, _swap_warn = host_ledger.swap_state_line()
+    log(swap_line)
 
 
 def _free_instrument(mem: Dict[str, "nvml_registry.MemoryInfo"], cards: List[Card]) -> str:
@@ -8249,6 +8262,13 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         _row = weg2_form.profile_row(profile)
         if _row is not None:
             env.update(_row.group_env.get(group, {}))
+    # RG (operator 26.09.): the agent-load prefix switches (weg2/form.py
+    # PREFIX_SWITCHES) from the row of THIS boot's form -- an explicitly set
+    # env already in `env` wins, an off row writes nothing, and --env-p /
+    # --env-d below still override. A desk caller (no form) publishes nothing.
+    # The front gets the same call on its env (the front spawn below).
+    if boot_form is not None:
+        weg2_form.publish_prefix_switches(env, boot_form.profile)
     if flip_weights == "resident":
         from sglang.srt.managers.weg2_memory_saver import WEIGHTS_RESIDENT_ENV
 
@@ -10657,6 +10677,98 @@ def _p_page_size(model: str, p_bs: int = DEFAULT_P_BS) -> int:
         return 1
 
 
+def p_seats(ns) -> int:
+    """Group P's SEATS = its effective ``--max-running-requests``: a value in
+    ``--extra-p`` beats ``--p-bs`` (argparse keeps the last; the same rule as
+    ``p_micro_batch_flags``). One reader for the P card and the mamba floor."""
+    _mrr = _argv_scalar(getattr(ns, "extra_p", ""), "--max-running-requests")
+    try:
+        return int(_mrr) if _mrr is not None else int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
+    except (TypeError, ValueError):
+        return int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
+
+
+def p_mamba_mib_per_slot_by_stage(kinds: Sequence[str], stage_layers: Sequence[int],
+                                  mib_per_linear_layer_per_slot: float) -> Tuple[float, ...]:
+    """H92c: MiB one mamba slot costs on each P stage = price x the stage's
+    LINEAR layers, counted off the checkpoint's own ``layer_types`` over the
+    contiguous cut (Next Flash 29,11,8 -> 22/8/6 linear -> 34.29/12.47/9.35)."""
+    out: List[float] = []
+    start = 0
+    for n in stage_layers:
+        seg = list(kinds[start:start + int(n)])
+        out.append(float(mib_per_linear_layer_per_slot)
+                   * sum(1 for k in seg if str(k) != "full_attention"))
+        start += int(n)
+    return tuple(out)
+
+
+def p_mamba_floor_text(slots: int, seats: int) -> str:
+    """H92c: the runtime's hard floor against P's slots, as a named clause of
+    the budget-posts line. A WARNING, never a refusal (the riegel is AW's):
+    at retention 0 every anchor host backup is refused (fnFL2h91bb2)."""
+    floor = int(seats) * int(P_MAMBA_FLOOR_SLOTS_PER_SEAT)
+    retention = int(slots) - floor
+    text = ("mamba floor %d seats x %d = %d, retention budget %d"
+            % (int(seats), int(P_MAMBA_FLOOR_SLOTS_PER_SEAT), floor, retention))
+    if retention <= 0:
+        text += (" -- WARNUNG MAMBA-RETENTION: --max-mamba-cache-size %d <= Sitze x %d; "
+                 "jeder Host-Backup eines Ankers wird verweigert (fnFL2h91bb2 "
+                 "'MAMBA-FLOOR pool=32 floor=32 retention_budget=0'); mindestens "
+                 "Sitze x %d + Retention-Budget geben" % (
+                     int(slots), int(P_MAMBA_FLOOR_SLOTS_PER_SEAT),
+                     int(P_MAMBA_FLOOR_SLOTS_PER_SEAT)))
+    return text
+
+
+def p_mamba_slots(ns, model: str, p_bs: int) -> Tuple[int, str]:
+    """Group P's device mamba SLOTS as the boot allocates them, and the source.
+
+    H92c. The pool model charged ``ceil(--p-bs x 2 x 1.25)`` slots -- the
+    DEMAND-DRIVEN branch of the runtime's sizer -- but argv_p never lets P reach
+    that branch: it always states ``--max-mamba-cache-size`` (its own
+    ``P_MAX_MAMBA_CACHE_SIZE`` = 24, or the operator's value in ``--extra-p``,
+    which wins), and ``model_runner_kv_cache_mixin`` takes an explicit value as
+    the pool size (``Mamba Cache is allocated. max_mamba_cache_size: N``; later
+    passes only LOWER it: the world MIN-sync and ``--gdn-resident-state-slots``).
+    fnFL2h91bb2 (P_BS 8, ``--max-mamba-cache-size 32``) was charged 20 slots and
+    allocated 32 -- 411/150/112 MiB missing from the pool budget per stage;
+    x178 (P_BS 4, the default 24) was charged 10 and allocated 24.
+
+    Read off P's argv AS THIS LAUNCHER BUILDS IT, with the boot's own
+    ``--extra-p`` (the last occurrence, argparse's rule), not restated; only a
+    P argv without the flag falls back to the demand formula, which then IS the
+    runtime's branch (an upper bound on ``_auto_mamba_demand_size``, #1286 F4).
+
+    UNIFY (operator rule, 27B byte-identical): only a profile whose registry
+    row sets ``p_mamba_slots_from_argv`` (nextflash) reads the argv; any other
+    (qwen27b) keeps the demand formula as before H92c.
+    """
+    _row = weg2_form.profile_row(getattr(ns, "profile", None))
+    flags = (argv_p("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG,
+                    shlex.split(str(getattr(ns, "extra_p", "") or "")), p_bs=int(p_bs),
+                    stage_ratio="", attn_stage_ratio="")
+             if _row is not None and _row.p_mamba_slots_from_argv else [])
+    value = None
+    for i, tok in enumerate(flags):
+        tok = str(tok)
+        if tok == "--max-mamba-cache-size" and i + 1 < len(flags):
+            value = str(flags[i + 1])
+        elif tok.startswith("--max-mamba-cache-size="):
+            value = tok[len("--max-mamba-cache-size="):]
+    if value is not None:
+        return int(value), "--max-mamba-cache-size %d on P's argv" % int(value)
+    target = _max_running_requests(model, "P", int(p_bs))
+    per_req = int(getattr(ns, "pp_cut_mamba_slots_per_running_request",
+                          P_MAMBA_SLOTS_PER_RUNNING_REQUEST))
+    slots = math.ceil(target * per_req * P_MAMBA_AUTO_SAFETY_MARGIN)
+    return slots, (
+        "ceil(--p-bs %d x %d slots/running-request x safety %.2f), an UPPER BOUND on "
+        "_auto_mamba_demand_size incl. its hard floor (P's argv states no "
+        "--max-mamba-cache-size)" % (target, per_req, P_MAMBA_AUTO_SAFETY_MARGIN)
+    )
+
+
 def p_activation_reserve_provenance(model: str, p_bs: int = DEFAULT_P_BS) -> Tuple[float, str]:
     """What group P's boot would charge for the prefill activation reserve if
     NOTHING on this rig were calibrated -- and the line that tells you which
@@ -12919,6 +13031,27 @@ def p_trim_end_anchor_env(on: bool) -> Dict[str, str]:
     return {_pt.TRIM_ENV: "1"} if on else {}
 
 
+def fork_anchor_env(token: Optional[int], p_trim: bool) -> Dict[str, str]:
+    """``--fork-anchor-token``: the SAME environment for group P and group D
+    ({} when off -- the byte-identity guarantee). The variable NAME lives in
+    weg2/fork_anchor.py, the one module the ranks read it from.
+
+    Refused without ``--p-trim-end-anchor``: D's store read stops at the fork
+    and must meet a P leg whose END anchor sits there; P's split path anchors
+    at N-1 and would leave D's capped read without an anchor in range."""
+    from sglang.srt.weg2 import fork_anchor as _fa
+
+    if token is None:
+        return {}
+    if int(token) <= 0:
+        raise SystemExit(f"--fork-anchor-token must be a positive token id, got {token}")
+    if not p_trim:
+        raise SystemExit(
+            "--fork-anchor-token needs --p-trim-end-anchor: group D stops its store "
+            "read at the prompt's fork, which only a fork-cut P leg anchors")
+    return {_fa.TOKEN_ENV: str(int(token))}
+
+
 def p_host_overlap_env(overlap: bool, hostgap: bool) -> Dict[str, str]:
     """Group P's extra environment for ``--p-host-overlap`` / ``--p-hostgap``.
 
@@ -15064,7 +15197,8 @@ def apply_p_draft_post(ns, cards, fracs, stage_layers, row_mib: float,
 def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
                    fracs: Sequence[float], lru_rows: Sequence[int],
                    stage_layers: Sequence[int], kv_mib, num_experts: int,
-                   row_mib: float) -> None:
+                   row_mib: float, mamba_slots: int = 0,
+                   mamba_mib_per_slot: Sequence[float] = ()) -> None:
     """H41: ``PP-CUT ACTIVATION`` (T_s(chunk) je Stufe mit Quelle) und
     ``PP-CUT P-KARTE`` (Kopfraum je Stufe im Chunk-Forward); W132, wenn eine
     Stufe unter near-OOM faellt, W131 fuer einen ungemessenen Chunk.
@@ -15128,11 +15262,7 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
     # H59 FORM-SCHLUESSEL: die Sitze DIESES Boots = group P's wirksames
     # --max-running-requests (das argparse behaelt: ein --extra-p-Wert schlaegt
     # --p-bs, dieselbe Regel wie p_micro_batch_flags).
-    _mrr = _argv_scalar(getattr(ns, "extra_p", ""), "--max-running-requests")
-    try:
-        seats = int(_mrr) if _mrr is not None else int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
-    except (TypeError, ValueError):
-        seats = int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
+    seats = p_seats(ns)
     if kv_mib is None:
         log(f"{_p_card.CARD_MARKER} ENTFAELLT: kein KV-Preis je Stufe (#156 entfiel "
             f"oder --pp-cut-reserve-mib ersetzt ihn); ohne KV ist der Kopfraum "
@@ -15170,6 +15300,7 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
             near_oom_mib=float(corridor_guard.NEAR_OOM_MIB),
             prompt_tokens=tokens, lmem_fixed=lmem_fixed,
             seats=seats, co_tenant=co_tenant,
+            mamba_slots=int(mamba_slots), mamba_mib_per_slot=tuple(mamba_mib_per_slot),
         )
 
     try:
@@ -15252,6 +15383,10 @@ def solve_p_cut(
     # name, because the 27B constants priced 8 layers on rank 0 and refused
     # every cut (W40, 19.09. dry run nfdry4).
     layer_mib_by_stage: Tuple[float, ...] = ()
+    # H92c: P's mamba slots, read ONCE off P's argv (with --extra-p): the pool
+    # model's mamba post and the P card's mamba term are the same number.
+    _p_mamba_slots, _p_mamba_src = p_mamba_slots(
+        ns, model, int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS))
     _skip_140 = weg2_form.gate_skip_line(
         "#140 PP-CUT FRACTION-SOLVE", getattr(ns, "weg2_boot_form", None))
     if _skip_140 and terms.expert_layer_weight_bytes <= 0.0:
@@ -15482,6 +15617,8 @@ def solve_p_cut(
         # (FR_P[0] 0.45/0.40, Chunk 16384) passierten beides und starben im
         # ersten Chunk. Hier: gemessener Kopfraum je Stufe, verschoben um
         # Puffer, KV, die Chunk-Transiente T_s(chunk) und den Draft.
+        # H92c: und um die Mamba-Slots dieses Boots gegen die der Referenz
+        # (Slots x 1.5588 MiB x lineare Layer der Stufe).
         p_card_verdict(
             ns, cards, log,
             model=model,
@@ -15492,6 +15629,10 @@ def solve_p_cut(
             kv_mib=_kv_p,
             num_experts=int(terms.num_experts),
             row_mib=row_bytes / _pp_cut.MIB,
+            mamba_slots=int(_p_mamba_slots),
+            mamba_mib_per_slot=p_mamba_mib_per_slot_by_stage(
+                kinds, _stage_layers_for_solve,
+                float(ns.pp_cut_mamba_mib_per_linear_layer_per_slot)),
         )
     ms = _csv_floats(ns.pp_cut_measured_ms_per_layer)
     model_pool = _pp_cut.PhasePoolModel(
@@ -15566,11 +15707,14 @@ def solve_p_cut(
         # unreachable here: `_max_running_requests` raises unless the flag is
         # literally on the argv this launcher builds, so P's value is always
         # the user-set branch.
-        mamba_slots=math.ceil(
-            _max_running_requests(model, "P", int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS))
-            * int(ns.pp_cut_mamba_slots_per_running_request)
-            * P_MAMBA_AUTO_SAFETY_MARGIN
-        ),
+        #
+        # H92c: and the demand branch is not the one P takes. argv_p ALWAYS
+        # states --max-mamba-cache-size (24, or the arm's --extra-p value), and
+        # an explicit value IS the pool: fnFL2h91bb2 was charged 20 slots here
+        # and allocated 32 ('Mamba Cache is allocated. max_mamba_cache_size:
+        # 32'), x178 10 against 24. p_mamba_slots reads P's argv and keeps the
+        # bound above only for an argv without the flag.
+        mamba_slots=int(_p_mamba_slots),
         # #1286 F7: the sizer's second floor. Read off P's argv for the same
         # reason as the target above -- a second copy would drift the day
         # --page-size moves.
@@ -15873,9 +16017,7 @@ def solve_p_cut(
     log(
         "PP-CUT budget posts (the boot's own list, MiB/rank): "
         "weights+runtime = %.1f/layer x n + stage_fixed %s; corridor holdback "
-        "%.1f; mamba %.4f/linear-layer/slot x %d slots (ceil(--p-bs %d x %d "
-        "slots/running-request x safety %.2f), an UPPER BOUND on "
-        "_auto_mamba_demand_size incl. its hard floor); speculative "
+        "%.1f; mamba %.4f/linear-layer/slot x %d slots (%s; %s); speculative "
         "intermediate %.1f; prefill activation reserve %.1f; mamba pre-capture "
         "reserve %.1f; page_size %d. Zero posts ACKNOWLEDGED (absent from both "
         "reference boots' emitted lists, not merely unmeasured): %s. Every one "
@@ -15888,9 +16030,8 @@ def solve_p_cut(
             float(model_pool.corridor_holdback_mib or 0.0),
             float(model_pool.mamba_mib_per_linear_layer_per_slot),
             int(model_pool.mamba_slots),
-            int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS),
-            int(ns.pp_cut_mamba_slots_per_running_request),
-            P_MAMBA_AUTO_SAFETY_MARGIN,
+            _p_mamba_src,
+            p_mamba_floor_text(int(model_pool.mamba_slots), p_seats(ns)),
             float(model_pool.speculative_intermediate_mib),
             float(model_pool.activation_reserve_mib),
             float(model_pool.mamba_precapture_reserve_mib),
@@ -16046,10 +16187,11 @@ def solve_p_cut(
         "this pool model's error FOR THIS CUT and belongs in the boot record; "
         "it was +64.1%% before #1286 and the residual the posts carry now is "
         "the two-boot spread of --pp-cut-stage-fixed-mib (<=12.7 MiB/rank). "
-        "SECOND JOIN, same discipline: mamba_slots is an UPPER BOUND on the "
-        "boot's '[auto-mamba] ... -> max_mamba_cache_size=N slots', so N <= "
-        "%d must hold; N above it means the mamba post is under-charged and "
-        "the pool over-priced (#1286 F4)."
+        "SECOND JOIN, same discipline: mamba_slots is P's --max-mamba-cache-size "
+        "(H92c; the demand bound only for an argv without it) against the boot's "
+        "'Mamba Cache is allocated. max_mamba_cache_size: N', so N <= %d must "
+        "hold; N above it means the mamba post is under-charged and the pool "
+        "over-priced (#1286 F4)."
         % (
             str(ns.pp_solve_objective),
             ",".join(str(n) for n in chosen.layers),
@@ -16911,6 +17053,18 @@ def build_parser() -> argparse.ArgumentParser:
              "all N; N<2, read outputs, sessions, input embeds and multimodal "
              "prompts keep today's split. Adds SGLANG_WEG2_P_TRIM_END_ANCHOR=1 to "
              "group P only; default off = argv and env byte-identical.")
+    ap.add_argument(
+        "--fork-anchor-token", type=int, default=None, metavar="ID",
+        help="FORK ANCHOR (27B line, weg2/fork_anchor.py): the chat template's "
+             "turn-start token id (<|im_start|> = 248045 on Qwen3.8-27B). Group P "
+             "then cuts a leg-1 prompt before its generation prompt (the last such "
+             "token among the final 16) instead of at N-1, so its END anchor also "
+             "serves a sibling request that forks there (boot "
+             "dkr27brc10bar1agent09261821: 9 of 78 D-direct requests fell back "
+             "1.2k-4.7k tokens); group D reads the store up to the same cut and keeps "
+             "its own prefill anchor at or below it. Needs --p-trim-end-anchor. Adds "
+             "SGLANG_WEG2_FORK_ANCHOR_TOKEN to both groups; default off = argv and "
+             "env byte-identical.")
     ap.add_argument(
         "--fp8-uniform-marlin", action="store_true",
         help="27B line, an FP8 checkpoint (Qwen/Qwen3.8-27B-FP8, block 128x128) on "
@@ -18175,6 +18329,22 @@ def apply_profile_d_seat_vram_default(ns) -> Optional[str]:
             "--env-d SGLANG_OPT_WEG2_D_SEAT_VRAM=0 = H95 B)" % item)
 
 
+def prefix_switches_announce(ns, boot_form, environ: Optional[Mapping[str, str]] = None) -> str:
+    """RG (operator 26.09.): the WEG2-PREFIX-SWITCHES line of this boot (value
+    and source -- env or profile -- per prefix switch, weg2/form.py
+    PREFIX_SWITCHES), computed on a COPY of the launcher env: the writers are
+    build_env (P, D) and the front spawn. Refuses (Weg2LaunchRefused) when
+    --env-p/--env-d would run MZ differently on P and D."""
+    env = dict(os.environ if environ is None else environ)
+    rows = weg2_form.publish_prefix_switches(env, boot_form.profile)
+    split = weg2_form.prefix_p_eq_d_mismatch(
+        env, parse_group_env(getattr(ns, "env_p", "") or ""),
+        parse_group_env(getattr(ns, "env_d", "") or ""))
+    if split:
+        raise Weg2LaunchRefused(split)
+    return weg2_form.prefix_switches_line(rows)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global _ACTIVE_BOOT_STATE
     # #1248: unclaimed until a BootState exists below -- a stale pointer from
@@ -18218,6 +18388,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             draft_on_p_env=(envs.SGLANG_WEG2_DRAFT_ON_P.is_set(),
                             bool(envs.SGLANG_WEG2_DRAFT_ON_P.get())))
         os.environ[weg2_form.FORM_ENV] = boot_form.env_value()
+        # RG (operator 26.09.): the agent-load prefix switches are registry
+        # fields. build_env (P, D) and the front's env publish them from the
+        # row of the resolved form's profile (weg2_form.publish_prefix_switches);
+        # an explicitly set env wins; an off row writes nothing (NF byte-equal).
+        # Here: the one line naming value and source, and the MZ P==D refusal
+        # (--env-p/--env-d are applied after the row).
+        print(prefix_switches_announce(ns, boot_form), flush=True)
         # UNIFY S3: argparse defaults that are MEASURED constants follow the
         # profile's registry row (unset flags only).
         apply_profile_arg_defaults(ns, list(sys.argv[1:] if argv is None else argv))
@@ -19749,6 +19926,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # the 1-token END-ANCHOR forward above never runs for it.
     _p_trim_env = p_trim_end_anchor_env(bool(getattr(ns, "p_trim_end_anchor", False)))
     env_p.update(_p_trim_env)
+    # FORK ANCHOR (weg2/fork_anchor.py): {} when off; the same env goes to D.
+    _fork_env = fork_anchor_env(getattr(ns, "fork_anchor_token", None),
+                                bool(getattr(ns, "p_trim_end_anchor", False)))
+    env_p.update(_fork_env)
+    if _fork_env:
+        log("WEG2 FORK-ANCHOR: on (--fork-anchor-token %s) -- group P cuts a leg-1 "
+            "prompt before its generation prompt, group D reads the store up to the "
+            "same cut and keeps its prefill anchor at or below it (rank lines 'WEG2 "
+            "P-TRIM-END-ANCHOR ... fork', 'WEG2 FORK-ANCHOR TRACK')"
+            % ns.fork_anchor_token)
     if _p_trim_env:
         log("WEG2 P-TRIM-END-ANCHOR: on (--p-trim-end-anchor) -- group P takes every "
             "front leg-1 prompt of N tokens as N-1 (token level, at its intake): the "
@@ -20149,6 +20336,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
         env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
         env_d.update(d_kv_evict_env())  # --d-kv-evict-for-placement: {} under 'off'
+        env_d.update(fork_anchor_env(getattr(ns, "fork_anchor_token", None),
+                                     bool(getattr(ns, "p_trim_end_anchor", False))))  # {} when off
         # #114 auch HIER: es gibt ZWEI spec_d-Stellen, und die erste Fassung
         # traf nur die andere -- der Dry-Run blieb ohne die Zeile, und der
         # Verdrahtungs-Check meldete "#114 fehlt im Baum", obwohl es im Baum
@@ -20269,6 +20458,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
     env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
     env_d.update(d_kv_evict_env())  # --d-kv-evict-for-placement: {} under 'off'
+    env_d.update(fork_anchor_env(getattr(ns, "fork_anchor_token", None),
+                                 bool(getattr(ns, "p_trim_end_anchor", False))))  # {} when off
     # #114: DIE EFFEKTIVE GRUPPEN-ENV GEHOERT INS LOG.
     #
     # Der Verdrahtungs-Check (weg2/verdrahtung_check.sh) liest das
@@ -20578,6 +20769,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # der teuerste Blindflug im ganzen Boot. Die Gruppen selbst sind nicht
     # betroffen (ihre Logger flushen je Zeile); es geht allein um die Front.
     fenv["PYTHONUNBUFFERED"] = "1"
+    # RG (operator 26.09.): the prefix switches the ranks got from build_env,
+    # the same call on the front's env (SGLANG_WEG2_FRONT_SPAN_INFLIGHT is the
+    # front's own; all five as on metal: ENV-IM-RANG front = 1).
+    if getattr(ns, "weg2_boot_form", None) is not None:
+        weg2_form.publish_prefix_switches(fenv, ns.weg2_boot_form.profile)
     # C14 / FIX 2 round 2: the BOOT half of the VRAM credit epoch.  Launcher
     # OUTPUT in exactly the class of TMS_HOST_RING_MAP (R19), never an operator
     # knob: it is this boot's ring epoch, the same nonce every rank already got

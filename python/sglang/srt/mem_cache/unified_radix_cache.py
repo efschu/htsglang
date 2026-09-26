@@ -809,6 +809,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         write-through backup will be declined, so it is worth saying out loud
         rather than leaving to be inferred from a silent absence of host
         anchors.
+
+        H113: EXCEPT on group P of a weg2 boot, where those backups are the
+        P->D hand-off itself -- there budget 0 is refused after this line
+        (``_refuse_weg2_p_mamba_retention_zero``).
         """
         if ComponentType.MAMBA not in self.tree_components:
             return
@@ -842,6 +846,36 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         except Exception:  # noqa: BLE001 -- an instrument never breaks a boot
             logger.debug("MAMBA-FLOOR posture unavailable", exc_info=True)
+        # H113: OUTSIDE the instrument's broad except on purpose -- the line
+        # above may never break a boot, the Riegel below must.
+        self._refuse_weg2_p_mamba_retention_zero(mamba_pool)
+
+    def _refuse_weg2_p_mamba_retention_zero(self, mamba_pool) -> None:
+        """H113: group P of a weg2 boot refuses a mamba pin budget of 0.
+
+        The budget is ``self._mamba_pin_budget`` -- the very number
+        ``_mamba_write_through_pin_admissible`` compares against -- so the
+        refusal and the declined backups cannot disagree. See
+        :class:`mamba_pool_floor.Weg2PMambaRetentionZero` for the fnFL2h91bb2
+        chain this stops at boot instead of at the first P->D flip.
+        """
+        from sglang.srt.mem_cache.mamba_pool_floor import (
+            Weg2PMambaRetentionZero,
+            weg2_p_mamba_retention_refusal,
+        )
+        from sglang.srt.runtime_context import get_server_args
+
+        server_args = get_server_args()
+        refusal = weg2_p_mamba_retention_refusal(
+            server_args,
+            server_args.max_running_requests or 1,
+            mamba_pool.size,
+            self._mamba_pin_budget,
+            os.environ.get("SGLANG_WEG2_GROUP", ""),
+        )
+        if refusal is not None:
+            logger.error(refusal)
+            raise Weg2PMambaRetentionZero(refusal)
 
     def _wait_bounded(self, work, label: str) -> None:
         """Wait for ``work`` with a deadline, or raise a named error.
@@ -4430,7 +4464,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         logger.warning(
             "WEG2 END-ANCHOR n=%d rid=%s tokens=%d anchor=%d target=%d units=%d/%d ok=%s short=%d"
             + (" trim=%d" % _trim if _trim else ""),
-            n, str(getattr(req, "rid", "?"))[:12], tokens, anchor, tokens - 1,
+            # FORK ANCHOR (weg2/fork_anchor.py): a fork cut's target is the
+            # fork (N - trim), not N-1; trim=1 prints N-1 exactly as before.
+            n, str(getattr(req, "rid", "?"))[:12], tokens, anchor, tokens - (_trim or 1),
             usable_units, target_units, ok, getattr(UnifiedRadixCache, "_weg2_end_anchor_short", 0),
         )
 
@@ -9575,20 +9611,41 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         f"{ct} device LRU: "
                         f"+tree={tree_ids - lru_ids}, +lru={lru_ids - tree_ids}"
                     )
-                # Aux host-only states must match the host LRU.
+                # Aux host-only states must match the host LRU -- the UNLOCKED
+                # ones. A host lock takes its node off the host LRU by design
+                # (`acquire_component_lock(lock_host=True)` removes it, the
+                # release re-inserts it), so a host-locked host-only node is
+                # correctly absent. Upstream never saw one here: its host locks
+                # end within the pass. The #1417 prefetch pins span passes until
+                # the admission pops them, so two prefetches of one prefix leave
+                # the older anchor pinned and off the LRU at an idle walk
+                # (#1417b, rc11b D TP1/TP2 19:30:47Z: "+S3={249}, +lru=set()").
+                # Both halves of the lock protocol are checked.
                 host_lru = self.host_lru_lists[ct]
-                s3_ids = {
-                    n.id
+                s3_nodes = [
+                    n
                     for n in all_nodes
                     if n is not self.root_node
                     and n.component_data[ct].value is None
                     and n.component_data[ct].host_value is not None
+                ]
+                s3_ids = {
+                    n.id for n in s3_nodes if n.component_data[ct].host_lock_ref == 0
+                }
+                s3_locked_ids = {
+                    n.id for n in s3_nodes if n.component_data[ct].host_lock_ref > 0
                 }
                 host_lru_ids = set(host_lru.cache.keys())
-                if s3_ids != host_lru_ids:
+                if s3_ids != host_lru_ids - s3_locked_ids:
                     E(
                         f"{ct} host LRU: "
-                        f"+S3={s3_ids - host_lru_ids}, +lru={host_lru_ids - s3_ids}"
+                        f"+S3={s3_ids - host_lru_ids}, "
+                        f"+lru={host_lru_ids - s3_ids - s3_locked_ids}"
+                    )
+                if s3_locked_ids & host_lru_ids:
+                    E(
+                        f"{ct} host-locked node(s) on the host LRU: "
+                        f"{s3_locked_ids & host_lru_ids}"
                     )
                 # The same aux node must not appear in both device and host LRU.
                 inv5_overlap = lru_ids & host_lru_ids

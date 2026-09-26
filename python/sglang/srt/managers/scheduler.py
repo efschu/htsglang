@@ -232,6 +232,7 @@ from sglang.srt.managers import weg2_store_told
 from sglang.srt.managers import weg2_d_hostgap as _d_hostgap
 from sglang.srt.layers.quantization import gguf_path_census as _gguf_path_census
 from sglang.srt.weg2 import p_trim_end_anchor as _weg2_trim
+from sglang.srt.weg2 import fork_anchor as _weg2_fork
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers import anchor_tails as _anchor_tails
@@ -701,6 +702,36 @@ def _weg2_prefetch_stall_s() -> float:
 #:     -- store-short must recompute; over X it stays the named W88, the
 #:     user's veto against a prefill over X is untouched.
 _WEG2_STORE_SHORT_TAIL_ENV = "SGLANG_WEG2_STORE_SHORT_TAIL"
+
+
+def _weg2_fork_anchor_on_consumer() -> bool:
+    """FORK ANCHOR (weg2/fork_anchor.py): the store-read cap is group D's
+    (the consumer of P's fork-cut legs); group P keeps its span. Off without
+    the switch."""
+    if _weg2_fork.fork_token() is None:
+        return False
+    return (os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() != "P"
+
+
+def _weg2_fork_match_end(req, match_end: int) -> int:
+    """FORK ANCHOR: the end of ``req``'s store-read span -- ``match_end``
+    unchanged unless the switch is on, this is not group P, and the prompt's
+    fork cut lies below it (then the cut: a fork-cut P leg wrote exactly
+    that far). Counted once per power of two."""
+    if not _weg2_fork_anchor_on_consumer():
+        return match_end
+    fork = _weg2_fork.fork_cut_of_req(req)
+    if fork is None or fork >= match_end:
+        return match_end
+    n = globals().get("_WEG2_FORK_SPAN_N", 0) + 1
+    globals()["_WEG2_FORK_SPAN_N"] = n
+    if n & (n - 1) == 0:
+        logger.info(
+            "WEG2 FORK-ANCHOR SPAN n=%d rid=%s store read ends at the fork %d, not %d "
+            "(a fork-cut P leg wrote exactly that far; the tail is D's own extend)",
+            n, str(getattr(req, "rid", "?"))[:16], fork, match_end,
+        )
+    return fork
 
 
 def _weg2_store_short_tail_on() -> bool:
@@ -6362,6 +6393,13 @@ class Scheduler(
             # its host tree ends where PP0's does -- anchor included -- and
             # the load-back extent is uniform by content.
             _match_end = min(_match_end, int(limit_tokens))
+        # FORK ANCHOR (weg2/fork_anchor.py, SGLANG_WEG2_FORK_ANCHOR_TOKEN, both
+        # groups, default off): a fork-cut P leg wrote the store up to the
+        # prompt's fork, never beyond, so group D asks for no more -- the
+        # leg-2 read then lands complete (no #1324 store-short deferral, no
+        # extra pass after the wake). Pure function of the prompt ids and the
+        # env: the same span on every rank. Group P keeps its span.
+        _match_end = _weg2_fork_match_end(req, _match_end)
         _new_input_tokens = req.full_untruncated_fill_ids[_matched_len:_match_end]
         # #1068 (spec A12.2): the request's OWN span, stamped rank-locally
         # before any verdict is taken, so the UNDEFERRABLE exit of the

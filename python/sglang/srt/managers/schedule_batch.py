@@ -137,6 +137,42 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
 
+
+def _WEG2_FORK_ANCHOR_ARMED() -> bool:
+    """FORK ANCHOR (weg2/fork_anchor.py): the switch, read per extend step
+    (env lookups only; the decode round never calls it). GROUP D ONLY: on
+    group P the prompt ids are already cut at the fork, so a fork token of
+    the chat's LAST message would pull P's inner track back by one chunk
+    (review RV, 26.09.: last message shorter than ~14 tokens)."""
+    import os as _os
+
+    from sglang.srt.weg2 import fork_anchor as _fa
+
+    if (_os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() != "D":
+        return False
+    return _fa.fork_token() is not None
+
+
+def _weg2_fork_track(req, prefix_len: int, end: int, chunk: int,
+                     default_aligned: int) -> Optional[int]:
+    """FORK ANCHOR: the extend track target at or below ``req``'s fork, or
+    None = keep the default. Counted once per power of two."""
+    from sglang.srt.weg2 import fork_anchor as _fa
+
+    t = _fa.track_target(prefix_len, end, _fa.fork_cut_of_req(req), chunk, default_aligned)
+    if t is not None:
+        n = globals().get("_WEG2_FORK_TRACK_N", 0) + 1
+        globals()["_WEG2_FORK_TRACK_N"] = n
+        if n & (n - 1) == 0:
+            logger.info(
+                "WEG2 FORK-ANCHOR TRACK n=%d rid=%s step=[%d,%d) anchor %d -> %d "
+                "(at or below the generation prompt; chunk grid %d)",
+                n, str(getattr(req, "rid", "?"))[:16], prefix_len, end,
+                default_aligned, t, chunk,
+            )
+    return t
+
+
 #: #1036: per-callsite census of admitted-prefix demotions. site -> count.
 _1036_PREFIX_DEMOTIONS: Dict[str, int] = {}
 
@@ -4053,6 +4089,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
+
+            # FORK ANCHOR (weg2/fork_anchor.py, SGLANG_WEG2_FORK_ANCHOR_TOKEN,
+            # default off): the step that reaches a front prompt's end keeps
+            # its anchor at or below the chat's generation prompt -- one grid
+            # step earlier when the default grid point falls inside it
+            # (26-66: extend 1025 put it at N-1, the sibling 26-67 fell back
+            # 1.2k tokens). Extend only; the decode round never gets here.
+            if _WEG2_FORK_ANCHOR_ARMED():
+                _fork_t = _weg2_fork_track(
+                    req, len(req.prefix_indices),
+                    len(req.prefix_indices) + req.extend_range.length,
+                    mamba_cache_chunk_size, mamba_track_seqlen_aligned,
+                )
+                if _fork_t is not None:
+                    # Mid-step: +1 routes the kernel to the intermediate h at
+                    # (t - prefix) / chunk -- the branching track's form. Not
+                    # through `_force_track_h`: t sits on the grid RELATIVE to
+                    # this step's start (all the kernel reads), and a D resume
+                    # prefix is arbitrary, so t need not be a multiple of the
+                    # chunk in absolute terms (78886 + 15*64 on 26-66).
+                    mamba_track_seqlen = _fork_t + 1
+                    mamba_track_seqlen_aligned = _fork_t
 
             # In lazy mode, skip the swap — the second ping-pong slot is not
             # allocated yet; it will be allocated on demand at the track boundary

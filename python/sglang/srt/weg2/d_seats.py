@@ -104,6 +104,30 @@ def d_park_active(env: Optional[Mapping[str, str]] = None) -> bool:
     return str(env.get(GROUP_ENV, "")).strip().upper() == "D"
 
 
+def d_flip_park_active(env: Optional[Mapping[str, str]] = None) -> bool:
+    """The FLIP park alone (``park_running``, its late hold, the sleep's hold,
+    the awake re-queue, the admission barrier for flip-parked requests): on
+    wherever :func:`d_park_active` is, and ADDITIONALLY on group D under the
+    27B immediate park (``SGLANG_WEG2_D_PARK_IMMEDIATE`` /
+    ``ModelProfile.d_park_immediate``, user 26.09.) when the park switch is
+    not set explicitly. What stays on :func:`d_park_active` alone -- the
+    pressure park, the youngest-first retraction order, the MTP draft carry
+    -- is the NF standard form; under the immediate park only a flip parks.
+    An explicit ``SGLANG_WEG2_D_PARK`` decides alone (``0`` = no park at all,
+    the A/B lever for both)."""
+    env = os.environ if env is None else env
+    if d_park_active(env):
+        return True
+    raw = env.get(PARK_ENV)
+    if raw is not None and str(raw).strip():
+        return False
+    if str(env.get(GROUP_ENV, "")).strip().upper() != "D":
+        return False
+    from sglang.srt.weg2.form import d_park_immediate_state
+
+    return bool(d_park_immediate_state(env)[0])
+
+
 def awake_requeue_s(env: Optional[Mapping[str, str]] = None) -> float:
     env = os.environ if env is None else env
     try:

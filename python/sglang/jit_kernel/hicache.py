@@ -41,6 +41,56 @@ def lmem_warning_line(element_size: int, unroll: int, threads: int | None) -> st
     )
 
 
+#: JG (fnFL2h91bb1/bb2/v1): the element a byteless host pool asks a kernel for.
+#: A Form A expert worker holds 0 kv-heads, so ``MHATokenToKVPoolHost 0.00 GB``
+#: has ``element_dim * itemsize == 0``. ``0 % 128 == 0`` let it through the old
+#: guard, nvcc instantiated ``HiCacheKernel<0, ...>`` and failed on
+#: ``zero-sized variable "vec"`` (13 instantiation errors per build), then
+#: ``Discarded incomplete JIT cache entry`` on the next boot. Measured: D group
+#: init +6-7 s per boot (TP1 and TP2 build in turn behind the cache lock, TP0
+#: waits at the next host-pool sync). 0 bytes is a legitimate state -- there is
+#: nothing to copy, so there is no kernel to build.
+BYTELESS_INFO_TAG = "HICACHE-JIT BYTELESS"
+
+_byteless_sites_logged: set = set()
+
+
+class HiCacheJitZeroElementError(ValueError):
+    """A JIT HiCache module was asked for with ``element_size <= 0``. The
+    kernel template cannot hold a 0-byte element (``Storage vec`` is
+    zero-sized), so this never reaches nvcc; a byteless pool must be gated by
+    :func:`is_byteless_element` before it asks for a kernel."""
+
+
+def is_byteless_element(element_size: int, *, site: str) -> bool:
+    """True for a 0-byte element (a pool that holds no bytes on this rank).
+    The first time per ``site`` in a process it prints one named INFO line;
+    the caller then builds no JIT module and launches no copy."""
+    if int(element_size) > 0:
+        return False
+    if site not in _byteless_sites_logged:
+        _byteless_sites_logged.add(site)
+        logging.getLogger(__name__).info(
+            "%s site=%s element_size=%d: this pool holds 0 bytes per element "
+            "on this rank (Form A expert worker: 0 kv-heads) -- no JIT build, "
+            "no copy kernel; transfers through it are no-ops",
+            BYTELESS_INFO_TAG,
+            site,
+            int(element_size),
+        )
+    return True
+
+
+def _refuse_non_positive_element(element_size: int, *, module: str) -> None:
+    if int(element_size) <= 0:
+        raise HiCacheJitZeroElementError(
+            f"HICACHE-JIT ZERO-ELEMENT module={module} "
+            f"element_size={int(element_size)}: a 0-byte element never reaches "
+            f"nvcc (kElementSize=0 -> 'zero-sized variable vec'); gate the pool "
+            f"with is_byteless_element() and skip the transfer"
+        )
+
+
 def _resident_threads() -> int | None:
     try:
         import torch
@@ -53,6 +103,7 @@ def _resident_threads() -> int | None:
 
 @cache_once_per_arch
 def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> Module:
+    _refuse_non_positive_element(element_size, module="hicache")
     line = lmem_warning_line(element_size, unroll, _resident_threads())
     if line is not None:
         logging.getLogger(__name__).warning("%s", line)
@@ -81,6 +132,7 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
 def _jit_hicache_staged_module(
     *, element_size: int, unroll: int, block_quota: int
 ) -> Module:
+    _refuse_non_positive_element(element_size, module="hicache_staged")
     args = make_cpp_args(
         element_size,
         unroll,
@@ -113,6 +165,8 @@ def can_use_hicache_jit_kernel(
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> bool:
     logger = logging.getLogger(__name__)
+    if is_byteless_element(element_size, site="can_use_hicache_jit_kernel"):
+        return False
     if element_size % 128 != 0:
         logger.warning(f"Unsupported {element_size = } for JIT HiCache kernel")
         return False
@@ -137,6 +191,8 @@ def can_use_write_back_jit_kernel(
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> bool:
     logger = logging.getLogger(__name__)
+    if is_byteless_element(element_size, site="can_use_write_back_jit_kernel"):
+        return False
     if element_size % 16 != 0:
         logger.warning(f"Unsupported {element_size = } for staged JIT HiCache kernel")
         return False

@@ -1046,7 +1046,37 @@ class Envs:
     # of the epoch at once, not only when the leg finishes. Closes the twin
     # gap (a Claude-Code turn's second request, +~155 tokens on the first,
     # arriving while the first decodes). Off = presence only at leg-2 finish.
-    SGLANG_WEG2_FRONT_SPAN_INFLIGHT = EnvBool(False)
+    # RG 26.09.: a registry field (weg2/form.py PREFIX_SWITCHES,
+    # front_span_inflight): qwen27b on (dkr27brc10bar1agent09261821), nextflash
+    # and no form off.
+    SGLANG_WEG2_FRONT_SPAN_INFLIGHT = EnvBool(_profile_default("SGLANG_WEG2_FRONT_SPAN_INFLIGHT", False))
+    # X-EXACT (user 26.09. ~19:00Z, memory d2p-sofort-flippen-und-x-exakt-0926):
+    # X holds EXACTLY for the pending tokens -- no 1.3*X band. On = the front
+    # renders and tokenizes every /v1/messages, /v1/chat/completions and
+    # /generate request with the group's own serving code, tokenizer and
+    # template settings (read from its /get_server_info; weg2/front_tokens.py)
+    # and prices pending = tokens - the MEASURED cached-on-D token prefix; the
+    # tokenizer runs in one worker thread, incremental per conversation
+    # prefix. Every D leg 2 logs WEG2 X-EXACT-ERR (priced vs realised). Off
+    # (default, both profiles until an agent-load boot has measured it) = the
+    # chars/3 pricing byte for byte.
+    SGLANG_WEG2_FRONT_EXACT_TOKENS = EnvBool(False)
+    # X-EXACT: longest wait for the count before the request is priced by the
+    # chars/3 estimate instead (named: WEG2 X-EXACT-FALLBACK reason=timeout).
+    SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS = EnvInt(3000)
+    # X-EXACT: tokenizer path override (tests, or a front without a group
+    # reachable); empty = the group's own server_args.tokenizer_path.
+    SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")
+    # RG 26.09.: the told/twin prefix switches as registry fields (weg2/form.py
+    # PREFIX_SWITCHES; their readers in managers/weg2_store_told.py,
+    # weg2/p_twin_defer.py and managers/weg2_told_fallback.py take the same
+    # default through form.prefix_switch_armed). qwen27b on (TK, PX2, TW;
+    # metal dkr27brc10bar1agent09261821), PF off everywhere (unproven);
+    # nextflash and no form off. SGLANG_WEG2_TOLD_ABSOLUTE follows TREE_KEY.
+    SGLANG_WEG2_TOLD_PROBE_TREE_KEY = EnvBool(_profile_default("SGLANG_WEG2_TOLD_PROBE_TREE_KEY", False))
+    SGLANG_WEG2_TOLD_PACED = EnvBool(_profile_default("SGLANG_WEG2_TOLD_PACED", False))
+    SGLANG_WEG2_P_TWIN_DEFER = EnvBool(_profile_default("SGLANG_WEG2_P_TWIN_DEFER", False))
+    SGLANG_WEG2_TOLD_GROUP_FALLBACK = EnvBool(_profile_default("SGLANG_WEG2_TOLD_GROUP_FALLBACK", False))
     # Prefix trace (IN 26.09., weg2/prefix_trace.py): every prefix miss of an
     # agent-load boot gets a token receipt -- one #1420 WALK-STOP line per
     # (rid, stop depth) whose unmatched rest is >= the minimum below, full
@@ -1149,7 +1179,11 @@ class Envs:
     # inline system messages (before any user/assistant turn) are still merged
     # into the head -- that position is prefix-stable. Set it identically on
     # P and D: the P->D handoff keys are P's tokenization of the same body.
-    SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE = EnvBool(False)
+    # RG 26.09.: a registry field (weg2/form.py PREFIX_SWITCHES,
+    # inline_system_in_place): qwen27b on, nextflash and no form off; the
+    # launcher refuses an --env-p/--env-d split.
+    SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE = EnvBool(
+        _profile_default("SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE", False))
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
@@ -2906,6 +2940,15 @@ class Envs:
     # without a form. d_seats reads the raw value with the same default (it
     # also judges hand-built env mappings); an explicit value always wins.
     SGLANG_WEG2_D_PARK = EnvBool(_profile_default("SGLANG_WEG2_D_PARK", True))
+    # 27B PARK (user decision 26.09. ~19:00Z): D->P waits for nothing -- a
+    # queued request whose pending tokens exceed X while D decodes parks D's
+    # running decodes at once (the H91b FLIP park only: no pressure park, no
+    # seats, no MTP draft carry) and the front flips to P (weg2/front.py,
+    # weg2/d_seats.d_flip_park_active). Default per profile
+    # (ModelProfile.d_park_immediate: qwen27b off until measured, nextflash
+    # off); off without a form. d_seats/front read it through
+    # weg2.form.d_park_immediate_state (same default); explicit value wins.
+    SGLANG_WEG2_D_PARK_IMMEDIATE = EnvBool(_profile_default("SGLANG_WEG2_D_PARK_IMMEDIATE", False))
     # H91d: the L2 bound of those buffers per rank (MiB). A FLIP park whose
     # buffer would pass it goes to L3 (a file under
     # SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR/weg2_d_park_draft, written in the

@@ -10,6 +10,7 @@ import torch
 from sglang.jit_kernel.hicache import (
     can_use_hicache_jit_kernel,
     can_use_write_back_jit_kernel,
+    is_byteless_element,
 )
 from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
@@ -180,12 +181,22 @@ class MHATokenToKVPoolHost(HostKVCache):
             budget_flag=budget_flag,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
+        # JG: a Form A expert worker's pool has 0 kv-heads -> 0 bytes per
+        # element. Nothing to copy, so no JIT build and no copy kernel: one
+        # named INFO line here, every transfer below returns at once.
+        self.byteless = is_byteless_element(
+            self.element_dim * self.dtype.itemsize, site=type(self).__name__
+        )
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
         # write-back kernel has a ROCm path, so enable them on HIP too. This
         # keeps the ROCm write-back path consistent with CUDA.
-        self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
-            element_size=self.element_dim * self.dtype.itemsize
+        self.can_use_jit = (
+            (_is_cuda or _is_hip)
+            and not self.byteless
+            and can_use_hicache_jit_kernel(
+                element_size=self.element_dim * self.dtype.itemsize
+            )
         )
 
         if self.layout == "page_first":
@@ -265,6 +276,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.can_use_write_back_jit = False
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
+        if getattr(self, "byteless", False):
+            return
 
         # The staged write-back JIT kernel builds with hipcc and has a ROCm
         # path, so enable it on HIP too (consistent with the CUDA path).
@@ -306,6 +319,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         layer_id,
         io_backend,
     ):
+        if getattr(self, "byteless", False):  # JG: 0 B per element here -- no copy
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -427,6 +442,8 @@ class MHATokenToKVPoolHost(HostKVCache):
             self, device_pool, host_indices, device_indices,
             where="MHATokenToKVPoolHost.backup_from_device_all_layer",
         )
+        if getattr(self, "byteless", False):  # JG: 0 B per element here -- no copy
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
