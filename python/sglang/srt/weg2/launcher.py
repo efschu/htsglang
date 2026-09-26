@@ -1681,6 +1681,63 @@ def resolve_x_ceiling(ceiling_flag: Optional[int], x_tokens: int,
         f"{ceiling}: the live X re-solves within [{CHUNKED_PREFILL_TOKENS}, {ceiling}] and a request "
         f"between {x if x_busy is None else min(int(x_busy), x)} and the live X goes to D only as a "
         f"singleton (WEG2 X-SOLO); group P unchanged{busy}")
+#: RC2 review (L1): the name a --d-short-drain-tokens above X is refused with.
+SHORT_DRAIN_ABOVE_X_NAME = "W153 Weg2ShortDrainAboveX"
+
+
+def refuse_short_drain_above_x(n_tokens: int, x_tokens: int, x_provenance: str) -> None:
+    """LAW 4 SUMMED OVER A DRAIN, at launch (RC2 review, L1).
+
+    ``--d-short-drain-tokens N`` (27B idle policy b) hands a queued SHORT-only
+    backlog of at most N uncached tokens to group D in ONE drain. Each request
+    is <= X by its own route verdict, but the SUM is what D prefills at once,
+    and law 4 (user veto 2026-09-10: D never prefills above X) holds for that
+    sum too. X here is the value this launch hands the front and group D:
+    :func:`resolve_x` has already applied the front floor to the flag
+    (``max(floor, --tp-prefill-max-tokens)``) or derived it. N > X can never
+    be served as asked, so it is refused by name instead of being quietly cut.
+    The front keeps its own riegel beside this one -- every drain is capped at
+    ``min(N, X in force)`` -- because the live X re-solve moves X during a
+    boot, which no launch-time check can see. 0 = off, never refused.
+    """
+    n, x = int(n_tokens or 0), int(x_tokens)
+    if n > 0 and n > x:
+        raise SystemExit(
+            f"{SHORT_DRAIN_ABOVE_X_NAME}: --d-short-drain-tokens {n} exceeds X={x} "
+            f"({x_provenance}). One drain would hand group D {n} uncached tokens to "
+            f"prefill at once; law 4 caps what D prefills at X, summed over the drain "
+            f"too. Pass --d-short-drain-tokens <= {x}, or 0 for off."
+        )
+
+
+#: 27B RC7-X (e28c450a0d): read by group D's scheduler (``_weg2_store_short_tail_x``).
+STORE_SHORT_TAIL_X_ENV = "SGLANG_WEG2_STORE_SHORT_TAIL_X"
+
+
+def store_short_tail_env(x_tokens: int, x_d_riegel: int, x_split: Optional[bool] = None) -> Dict[str, str]:
+    """27B RC7-X: group D's env addition when its W50 riegel stands above the
+    launch X: the #1324/#1471 store-short tail keeps pricing a stalled read's
+    remainder against the LAUNCH X (a recovery prefill on D halts every running
+    decode, like a SHORT grant, which the front bounds by X_busy). Empty when
+    the ceiling is unset -- D's env byte for byte as before.
+
+    UNIFY S7: part of the profile's busy/idle split (``x_split``,
+    SGLANG_WEG2_X_IDLE_REGRANT; qwen27b on, nextflash off) -- off returns {}.
+    ``x_split`` None = read the switch (the published form's profile)."""
+    if x_split is None:
+        x_split = bool(envs.SGLANG_WEG2_X_IDLE_REGRANT.get())
+    if not x_split or int(x_d_riegel) <= int(x_tokens):
+        return {}
+    return {STORE_SHORT_TAIL_X_ENV: str(int(x_tokens))}
+
+
+def d_hold_active(d_hold_s: Optional[float]) -> bool:
+    """RC2 review (L4): is ``--d-hold-s`` ON? Unset OR 0 is OFF, like
+    ``--d-short-drain-tokens 0`` and as the >= 0 refusal already promised
+    ("0 / unset = off"). A 0 s hold is not a hold: it used to release a held
+    backlog the moment D went free -- a different policy under the same flag.
+    ONE definition for the argv and the IDLE POLICY line, so they agree."""
+    return d_hold_s is not None and float(d_hold_s) > 0
 
 
 def resolve_pool_floor(
@@ -13357,6 +13414,21 @@ def build_parser() -> argparse.ArgumentParser:
                     help="K8: which layout is awake at rest -- tp = group D (today's shape), "
                          "pp = group P. The front's idle guard always counts the requests P has "
                          "just prefilled, so resting on P loses no request.")
+    ap.add_argument("--d-short-drain-tokens", type=int, default=0,
+                    help="27B idle policy (b), passed to the front: while D is awake, a queued "
+                         "backlog made ONLY of SHORT requests (each <= X, law 4 -- D never prefills "
+                         "above X) whose uncached tokens sum to at most N is served on D instead of "
+                         "waiting for a flip. N > X is refused (W153: law 4 holds for the sum of a "
+                         "drain too), and the front caps every drain at min(N, the X in force). "
+                         "0 (default) = off = today: such a backlog waits for "
+                         "FLIP-ECONOMICS (--flip-min-work-tokens) or the fairness bound.")
+    ap.add_argument("--d-hold-s", type=float, default=None,
+                    help="27B idle policy (c), passed to the front: D stays awake this many seconds "
+                         "after its own work ended before it flips -- at rest under --idle-layout pp, "
+                         "and in front of a small backlog FLIP-ECONOMICS holds -- so a SHORT arrival "
+                         "inside the hold is served without a flip. Unset (default) or 0 = off = today: "
+                         "the idle flip waits for --min-dwell-ms only, a held backlog for "
+                         "--fairness-w-s only.")
     ap.add_argument("--d-admit-max-tokens", type=int, default=None,
                     help="FIX 4 (round 4): OPERATOR CEILING on the aggregate store-read budget "
                          "group D may hold in flight. Unset (the default) is NOT a derived number "
@@ -14775,6 +14847,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ns.x_ceiling_tokens, x_tokens, getattr(ns, "x_busy_tokens", None))
     flip_min_work_tokens = int(ns.flip_min_work_tokens) if ns.flip_min_work_tokens is not None else x_tokens
     idle_layout_front = "P" if ns.idle_layout == "pp" else "D"
+    if int(ns.d_short_drain_tokens or 0) < 0 or (ns.d_hold_s is not None and float(ns.d_hold_s) < 0):
+        raise SystemExit(f"--d-short-drain-tokens {ns.d_short_drain_tokens} / --d-hold-s {ns.d_hold_s}: "
+                         f"both must be >= 0 (0 / unset = off)")
+    # RC2 review (L1): law 4 summed over a drain -- N above the X this launch
+    # hands out is refused by name (W153), never quietly cut.
+    refuse_short_drain_above_x(int(ns.d_short_drain_tokens or 0), x_tokens, x_provenance)
     # THE OPERATING POINT, WITH ITS PROVENANCE, ON EVERY BOOT RECORD. The pair
     # is provisional by the order that set it (2026-09-09, "vorerst"), so a
     # later re-measurement has to be able to sort past boots into "told" and
@@ -14796,6 +14874,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(f"X PROVENANCE: {x_provenance}; --flip-min-work-tokens {flip_min_work_tokens} "
         f"({'= X, the same break-even at aggregate granularity' if ns.flip_min_work_tokens is None else 'operator override'})")
     log(x_ceiling_line)
+    log(f"IDLE POLICY (27B, user order 2026-09-24): (a) --idle-layout {ns.idle_layout} -> the "
+        f"front rests on {idle_layout_front}; (b) --d-short-drain-tokens "
+        f"{int(ns.d_short_drain_tokens or 0)} ({'off' if not ns.d_short_drain_tokens else 'a queued SHORT-only backlog up to this many tokens is served on D, each request <= X=' + str(x_tokens)}); "
+        f"(c) --d-hold-s {ns.d_hold_s if d_hold_active(ns.d_hold_s) else ('unset (off)' if ns.d_hold_s is None else f'{ns.d_hold_s} (off, like unset)')} "
+        f"({'D stays this long after its own work ended before it flips' if d_hold_active(ns.d_hold_s) else 'the idle flip waits for min-dwell only, a held backlog for the fairness bound'})")
 
     log(f"SCHEDULING FLAGS AS EMITTED -- group P: --max-running-requests {p_bs} "
         f"--max-kv-per-request {max_kv_per_request} (no --tp-prefill-max-tokens: the PP prefill "
@@ -16206,6 +16289,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.op_line)
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap)
+        env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
         # #114 auch HIER: es gibt ZWEI spec_d-Stellen, und die erste Fassung
         # traf nur die andere -- der Dry-Run blieb ohne die Zeile, und der
         # Verdrahtungs-Check meldete "#114 fehlt im Baum", obwohl es im Baum
@@ -16319,6 +16403,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.op_line)
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap)
+    env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
     # #114: DIE EFFEKTIVE GRUPPEN-ENV GEHOERT INS LOG.
     #
     # Der Verdrahtungs-Check (weg2/verdrahtung_check.sh) liest das
@@ -16845,6 +16930,13 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         argv += ["--anon-preboot-bytes", str(int(anon_preboot_bytes))]
     if ns.min_dwell_ms is not None:
         argv += ["--min-dwell-ms", str(ns.min_dwell_ms)]
+    # 27B idle policy (b)/(c): emitted only when set, so a boot without them
+    # ships the front argv byte for byte as before.
+    if int(getattr(ns, "d_short_drain_tokens", 0) or 0) > 0:
+        argv += ["--d-short-drain-tokens", str(int(ns.d_short_drain_tokens))]
+    # RC2 review (L4): --d-hold-s 0 is OFF and ships the argv of unset.
+    if d_hold_active(getattr(ns, "d_hold_s", None)):
+        argv += ["--d-hold-s", str(float(ns.d_hold_s))]
     if ns.d_admit_max_tokens is not None:
         argv += ["--d-admit-max-tokens", str(ns.d_admit_max_tokens)]
     # #1233 weg2dk4/fix 8 (merged into this ONE builder rather than a second

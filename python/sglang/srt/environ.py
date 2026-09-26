@@ -952,6 +952,23 @@ class Envs:
     # is in flight; otherwise it is routed with the start X (to P). NF D is
     # bs1, so a burst served serially on D would be slower than P's batch.
     SGLANG_WEG2_X_SOLO_WINDOW_MS = EnvInt(250)
+    # UNIFY S7 (27B RC7-X, 7f81f09daf/e28c450a0d/0e8faa7178): the front half of
+    # the 27B busy/idle split beyond the shared X-SOLO band -- a band request
+    # the singleton rule sent to P is marked deferred and served on D by the
+    # idle re-grant once D is idle and quiet (no flip for it meanwhile); the
+    # SHORT drain (--d-short-drain-tokens) is capped at X_busy while D decodes;
+    # an X_busy overrun is counted. Default per profile (weg2/form.py
+    # ModelProfile.x_split): qwen27b on (the 27B line's form), nextflash off
+    # (9e36e2185a: D bs1, min-work 4096); off without a form.
+    SGLANG_WEG2_X_IDLE_REGRANT = EnvBool(_profile_default("SGLANG_WEG2_X_IDLE_REGRANT", False))
+    # UNIFY S7 (27B xsn437 3453cc7766 / RC2-final B e34b90ffe8): the store-short
+    # tail -- a short store read re-reads its tail below the prefetch threshold,
+    # a standstill within X recomputes instead of W88 503, a remainder within X
+    # settles at the wake. Default per profile (ModelProfile.store_short_tail):
+    # qwen27b on (the 27B line's code default), nextflash off; on without a
+    # form. The scheduler keeps the 27B parse of an explicit value
+    # (0/false/no/off = off, anything else on); this entry carries the default.
+    SGLANG_WEG2_STORE_SHORT_TAIL = EnvBool(_profile_default("SGLANG_WEG2_STORE_SHORT_TAIL", True))
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     # Weight loader: read safetensors tensors with pread() instead of mmap
     # page faults (ZFS: ~0.5 GB/s per rank through mmap, ~3 GB/s through

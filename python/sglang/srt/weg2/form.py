@@ -273,6 +273,17 @@ class ModelProfile:
     x_start_tokens: int
     x_ceiling_tokens: int
     idle_layout: str
+    #: 27B RC7-X busy/idle split of the live X, its front half beyond the
+    #: shared H84 X-SOLO band (UNIFY S7): the deferred band backlog's idle
+    #: re-grant, the X_busy cap on the SHORT drain and the X_busy overrun
+    #: count (SGLANG_WEG2_X_IDLE_REGRANT). NF deliberately runs without it
+    #: (9e36e2185a: D bs1, min-work 4096).
+    x_split: bool
+    #: 27B xsn437/#1471 store-short tail (SGLANG_WEG2_STORE_SHORT_TAIL): a short
+    #: store read re-reads its tail below the prefetch threshold, a standstill
+    #: within X recomputes instead of W88 503, a remainder within X settles at
+    #: the wake.
+    store_short_tail: bool
     vision: str
     context_tokens: int
     records: RecordKey
@@ -293,6 +304,8 @@ class ModelProfile:
         out["SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD"] = bool(self.mamba_carrier_hold)
         out["SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL"] = bool(self.repack_outside_pool)
         out["SGLANG_WEG2_DRAFT_SHARE_EMBED"] = bool(self.draft.share_embed)
+        out["SGLANG_WEG2_X_IDLE_REGRANT"] = bool(self.x_split)
+        out["SGLANG_WEG2_STORE_SHORT_TAIL"] = bool(self.store_short_tail)
         return out
 
     def constant(self, name: str) -> object:
@@ -389,6 +402,8 @@ PROFILES: Dict[str, ModelProfile] = {
         x_start_tokens=4096,
         x_ceiling_tokens=12288,
         idle_layout="pp",
+        x_split=True,
+        store_short_tail=True,
         vision="transient",
         context_tokens=262144,
         # OPERATOR 26.09. (UN4): the 27B-RC9 records count on this tree as a
@@ -441,6 +456,8 @@ PROFILES: Dict[str, ModelProfile] = {
         x_start_tokens=4096,
         x_ceiling_tokens=12288,
         idle_layout="",
+        x_split=False,
+        store_short_tail=False,
         vision="off",
         context_tokens=262144,
         records=RecordKey(fields=("checkpoint", "form")),
