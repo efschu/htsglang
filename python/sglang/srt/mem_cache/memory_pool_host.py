@@ -510,6 +510,17 @@ class MambaPoolHost(HostKVCache):
             )
             self.size = int(device_pool.size * host_to_device_ratio * anchor_auto_mult)
 
+        # R12 (form_a_host_shadow): a Form A worker keeps its anchor rows as
+        # byteless bookkeeping for as long as TP0 holds the anchor in its
+        # arena -- TP0 addresses staging + arena slots, the synced count above
+        # is only the staging part. 0 B/slot rows only; 0 on every other rank.
+        from sglang.srt.mem_cache.form_a_host_shadow import mamba_shadow_extra_rows
+
+        _r12_extra = mamba_shadow_extra_rows(self.size_per_token)
+        if _r12_extra:
+            self.size += _r12_extra
+            _synced_suffix += f" r12_shadow_rows=+{_r12_extra}"
+
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
 

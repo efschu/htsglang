@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.common import (
     uniform_host_floor_active,
 )
 from sglang.srt.mem_cache import hicache_write_path
+from sglang.srt.mem_cache import form_a_host_shadow as _r12
 from sglang.srt.managers.scheduler_components.host_round_cost import (
     COUNTERS as _HOST_COST,
 )
@@ -1203,6 +1204,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # H81: the old tree's arena references go back FIRST -- see
         # `_release_host_values_before_reset` (fnNV4f2 mamba_full).
         self._release_host_values_before_reset()
+        if getattr(self, "cache_controller", None) is not None and _r12.role() is not None:
+            _r12.on_tree_reset(self)  # R12: no host verdict outlives its nodes
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.priority = -sys.maxsize
         self.root_node.key = RadixKey(array("q"), None)
@@ -2909,6 +2912,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "must select an unlocked node, never free under the pin."
                 )
         device_freed, host_freed = comp.evict_component(node, target=target)
+        if self._r12_rec is not None and EvictLayer.HOST in target and host_freed:
+            self._r12_rec.append(node)  # R12: TP0's own host drop, sent to the workers
         if tracker is not None:
             if EvictLayer.DEVICE in target:
                 tracker[comp.component_type] += device_freed
@@ -3003,7 +3008,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         tracker: dict[ComponentType, int] = {ct: 0 for ct in self.tree_components}
         comp = self.components.get(component_type)
         if comp is not None:
-            comp.drive_host_eviction(num_tokens, tracker)
+            _role = _r12.role() if self.cache_controller is not None else None
+            if _role == "worker":
+                # R12: a Form A worker's host rows are byteless bookkeeping of
+                # TP0's; dropping some on its own is the rank divergence. The
+                # caller refuses (a counted miss) instead.
+                _r12.worker_refuses_own_evict(self, component_type, num_tokens)
+                return 0
+            if _role == "host":
+                self._r12_rec = []
+                try:
+                    comp.drive_host_eviction(num_tokens, tracker)
+                finally:
+                    _rec, self._r12_rec = self._r12_rec, None
+                _seen = set()
+                for _n in _rec:
+                    if id(_n) not in _seen:
+                        _seen.add(id(_n))
+                        _r12.record_state(self, _n, why="evict_host")
+            else:
+                comp.drive_host_eviction(num_tokens, tracker)
         return tracker[component_type]
 
     def _is_device_leaf(self, node: UnifiedTreeNode) -> bool:
@@ -3169,6 +3193,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """#1421 instrument (boot xsn172): the publish sweep printed refused=34
         with in_flight=2 for 90 s and the drain hit W3 -- write_backup said 0
         silently. Name the branch, rate-limited."""
+        try:
+            _role = _r12.role()
+            if _role == "host":
+                _r12.record_state(self, node, why=why)  # R12: a worker may back it up
+            elif _role == "worker":
+                _r12.worker_short(self, why, node)
+        except Exception as _e:  # noqa: BLE001 - an instrument never refuses harder
+            logger.warning("R12 refusal note raised: %s: %s", type(_e).__name__, _e)
         n = getattr(UnifiedRadixCache, "_1421_n", 0) + 1
         UnifiedRadixCache._1421_n = n
         # #1426: sampled PER REASON. xsn186 sampled 1/256 over the whole
@@ -3380,6 +3412,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not write_back:
             lock_params = self.inc_lock_ref(node).to_dec_params()
         self._track_write_through_node(node, lock_params)
+        _r12.note_backup_ok(self, node)  # R12: supersedes an earlier "absent" (TP0 only)
         return len(host_indices)
 
     def _track_write_through_node(
@@ -3527,6 +3560,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         comp = self.components[ComponentType.MAMBA]
         self._evict_component_and_detach_lru(victim.node, comp, target=EvictLayer.HOST, tracker=None)
         self._update_evictable_leaf_sets(victim.node)
+        if _r12.role() == "host":
+            _r12.record_state(self, victim.node, why="h19_" + why)  # R12: workers drop it too
         dropped = mp.drop_unreferenced(list(victim.slots))
         if why == "share":
             st.displaced_share += 1
@@ -3677,6 +3712,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return True
 
     _1472_issued_at: dict = {}
+    _r12_rec = None   # R12: TP0's evict_host records the nodes it drops (form_a_host_shadow)
     _weg2_displace_n: int = 0   # fnFL2 H19: displacement lines, rate-limited
 
     def _finish_write_through_ack(self, ack_id: int) -> None:
@@ -6714,7 +6750,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     if self._weg2_rebind_host_to_arena(node):
                         pass  # #1424: the rows now ARE the arena slots
                     elif getattr(node, "_weg2_chain_piece", False) or self._weg2_host_is_transit():
-                        self._weg2_release_chain_piece_host(node)
+                        # R12: the host life of a node is TP0's decision on
+                        # every rank of a Form A group. A worker keeps its
+                        # byteless rows (TP0 rebinds and keeps); TP0 defers a
+                        # transit release to the next request broadcast, where
+                        # every rank runs this same release.
+                        _role = _r12.role()
+                        if _role == "worker":
+                            _r12.worker_keeps(self, "store-ack", node)
+                        elif _role == "host" and _r12.record_transit(self, node):
+                            pass
+                        else:
+                            self._weg2_release_chain_piece_host(node)
                 # #810: the storage write acked -- this is the drain the
                 # staging ring measures its residency against. Outside the
                 # `entry is not None` arm on purpose: the charge is keyed by
@@ -7587,7 +7634,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         and not getattr(self.cache_controller.mem_pool_host, "arena_read", False)):
                     # #1424: arena rows cost nothing to keep; only a copied
                     # transit row is released after the load-back
-                    self._weg2_release_chain_piece_host(node)
+                    if _r12.role() == "worker":
+                        # R12: TP0 keeps its arena rows here, so does a worker
+                        _r12.worker_keeps(self, "load-back", node)
+                    else:
+                        self._weg2_release_chain_piece_host(node)
             finish_count -= 1
 
     def _staging_host_role(self) -> bool:

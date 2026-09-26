@@ -1860,6 +1860,17 @@ class Envs:
     # a Form A role plan is installed; False restores the H97 votes, byte-
     # identical to 138d9df01c.
     SGLANG_WEG2_ENABLE_FORM_A_TP0_FOLLOW = EnvBool(True)
+    # R12 (fLLiper release table row 12, mem_cache/form_a_host_shadow.py): on
+    # a Form A D group every rank keeps the same host and anchor entries. A
+    # worker keeps its byteless host rows as long as TP0 holds them (no transit
+    # release at the store ack or after a load-back, no host eviction of its
+    # own); TP0's own host drops (failed arena rebind, H19 displacement, its
+    # evict_host, a refused backup) ride the tp<-reqs request broadcast and
+    # every rank applies them before the pass's requests; a worker's 0-byte
+    # anchor pool gets 2 x SGLANG_HICACHE_ARENA_MAMBA_SLOTS rows. Only read
+    # with an installed Form A role plan whose host is TP rank 0; False =
+    # byte-identical to d1c7094ba6.
+    SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW = EnvBool(True)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
