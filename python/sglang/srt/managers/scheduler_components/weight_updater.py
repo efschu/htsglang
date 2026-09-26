@@ -6014,12 +6014,18 @@ class SchedulerWeightUpdaterManager:
         exchanged = self._weg2_wake_weight_carrier() == self.CARRIER_EXCHANGE
         target = getattr(getattr(getattr(self, "tp_worker", None), "model_runner", None), "model", None)
         draft = self._weg2_model_for_group("D")
+        # ONE id set across the models: a layer target and draft SHARE (the
+        # DFlash2 draft's lm_head is the target's module) is converted once, by
+        # the first model that reaches it -- the target, whose lm_head the
+        # exchange carries with the `weights` tag. Per-model sets permuted it
+        # twice (rc9meas n4old: 149 layers to native, 129 + 21 back).
+        seen: set = set()
         for m in models:
             # The draft reloaded from disk went through the loader, whose
             # prepare_layer stamps the truth; everything else the exchange
             # carried is native whatever its stamp said.
             native = exchanged and not (draft_reloaded and m is draft and m is not target)
-            mi.model_to_marlin([m], delivered_native=native)
+            mi.model_to_marlin([m], delivered_native=native, seen=seen)
 
     def _weg2_wake_models(self) -> list:
         """Every model this rank computes with after a wake -- the TARGET

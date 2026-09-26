@@ -390,8 +390,17 @@ def layer_to_native(layer) -> int:
     return n * k // 2 + n * k // 16
 
 
-def flagged_layers(models: Iterable) -> List[torch.nn.Module]:
-    out, seen = [], set()
+def flagged_layers(models: Iterable, seen: Optional[set] = None) -> List[torch.nn.Module]:
+    """Every flagged layer reachable from ``models``, each ONCE (by ``id``).
+
+    ``seen``: a caller-owned id set shared across SEVERAL calls. A layer that
+    two models hold (the DFlash2 draft's ``lm_head`` IS the target's module,
+    dflash_worker_v2 ``self.draft_model.lm_head = lm_head``) must be converted
+    once per flip; a per-model loop without a shared set converted it twice
+    (rc9meas n4old 26.09.: 149 layers to native at sleep, 129 + 21 = 150 back
+    to Marlin at wake -> the shared lm_head permuted twice, needle MISS)."""
+    out = []
+    seen = set() if seen is None else seen
     for m in models or ():
         walk = getattr(m, "modules", None)
         if walk is None:
@@ -431,14 +440,20 @@ def model_to_marlin(
     delivered_native: bool,
     log: Optional[Callable[[str], None]] = None,
     repack: Optional[RepackFn] = None,
+    seen: Optional[set] = None,
 ) -> int:
     """Flip hook, WAKE side: after the seam digest, before any forward.
 
     ``delivered_native``: the exchange wrote this wake's bytes, so every
     flagged parameter holds native content whatever its stamp said (the stamp
     from the last sleep, or from the load). Otherwise (TMS backup restore) the
-    stamp set before the pause is the truth."""
-    layers = flagged_layers(models)
+    stamp set before the pause is the truth.
+
+    ``seen``: pass ONE set to every call of the same wake (see
+    :func:`flagged_layers`). Without it a layer shared by two models is
+    re-stamped native by the second call AFTER the first converted it, and
+    permuted a second time."""
+    layers = flagged_layers(models, seen)
     if not layers:
         return 0
     if delivered_native:
