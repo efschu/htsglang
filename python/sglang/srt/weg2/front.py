@@ -944,6 +944,12 @@ def usage_of(body: Any) -> Tuple[int, int, int, bool]:
         # prompt - 2*cached and fed `_note_exact` a wrong tokenisation.
         ct = int(u.get("cache_read_input_tokens", 0) or 0)
         pt = int(u.get("input_tokens", 0) or 0) + ct
+        # H100: the Anthropic prompt is input + cache_creation + cache_read
+        # (API docs, "Tracking cache performance"). Written-to-cache tokens
+        # were PREFILLED, so they belong to the prompt and to the uncached
+        # part, never to `ct`. htsglang's adapter emits no cache_creation
+        # field (0 here); a wire that does is priced whole instead of short.
+        pt += int(u.get("cache_creation_input_tokens", 0) or 0)
         return pt, ct, int(u.get("output_tokens", 0) or 0), True
     if not isinstance(u, dict) or "prompt_tokens" not in u:
         return 0, 0, 0, False
@@ -1054,6 +1060,16 @@ class AnthropicStreamUsage:
     object as it is written to the client costs one line-split per chunk and
     cannot be trimmed away.
 
+    H100: the sentence above describes the REAL API's usual shape. htsglang's
+    own adapter (anthropic/serving.py) is the opposite: it ships
+    ``message_start`` at once with ``input_tokens=0`` and no cache field and
+    puts the real totals -- ``input_tokens`` (= prompt - cached),
+    ``cache_read_input_tokens`` and ``output_tokens`` -- into the closing
+    ``message_delta``, which the API docs allow (every ``message_delta`` usage
+    count is cumulative; the docs' own web-search example carries all of
+    them). So every field is last-value-wins across both events, and the
+    prompt is ``input + cache_read + cache_creation``.
+
     Chunk boundaries do not respect SSE line boundaries, so the trailing
     partial line is buffered rather than parsed and discarded.
     """
@@ -1061,6 +1077,8 @@ class AnthropicStreamUsage:
     def __init__(self) -> None:
         self.input_tokens = 0
         self.cached_tokens = 0
+        # H100: cache_creation_input_tokens (see ``usage_of``).
+        self.creation_tokens = 0
         self.output_tokens = 0
         self.saw_start = False
         self.saw_stop = False
@@ -1094,6 +1112,7 @@ class AnthropicStreamUsage:
             if isinstance(u, dict):
                 self.input_tokens = int(u.get("input_tokens", 0) or 0)
                 self.cached_tokens = int(u.get("cache_read_input_tokens", 0) or 0)
+                self.creation_tokens = int(u.get("cache_creation_input_tokens", 0) or 0)
                 # message_start already carries the first output token.
                 self.output_tokens = max(
                     self.output_tokens, int(u.get("output_tokens", 0) or 0)
@@ -1117,6 +1136,12 @@ class AnthropicStreamUsage:
                     self.input_tokens = int(u.get("input_tokens", 0) or 0)
                 if "cache_read_input_tokens" in u:
                     self.cached_tokens = int(u.get("cache_read_input_tokens", 0) or 0)
+                # H100: same last-value-wins rule for the third prompt term;
+                # the API docs mark all message_delta usage counts cumulative,
+                # and the SDK's stream accumulator overwrites each field that
+                # is present (anthropic.lib.streaming, message_delta).
+                if "cache_creation_input_tokens" in u:
+                    self.creation_tokens = int(u.get("cache_creation_input_tokens", 0) or 0)
         elif kind == "message_stop":
             self.saw_stop = True
 
@@ -1133,6 +1158,8 @@ class AnthropicStreamUsage:
         # input_tokens is prompt - cached). Priced when a prompt was seen at
         # all -- a fully cached prompt (input 0, cache_read N) is priced too.
         prompt = self.input_tokens + self.cached_tokens
+        # H100: plus cache_creation (0 on htsglang's own adapter).
+        prompt += self.creation_tokens
         if self.saw_start and prompt > 0:
             return prompt, self.cached_tokens, self.output_tokens, True
         return 0, 0, 0, False
