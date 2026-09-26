@@ -3262,6 +3262,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if self.write_backup(node.parent) <= 0:
                 self._1421_refused("parent_unbacked", node)
                 return 0
+            # H95e: the budget was asked ABOVE the recursion, and the parent
+            # chain just took its own pins -- a forced insert (D's flip park,
+            # the finish of a request resumed from it) over k unbacked
+            # checkpoints passed k checks at the same count and then took k
+            # pins. Ask again right before this node's pin; a refusal leaves
+            # the parent backed and this node to the publish sweep.
+            if not self._mamba_write_through_pin_admissible(node, write_back=write_back):
+                self._note_mamba_pin_skipped()
+                self._1421_refused("mamba_pin", node)
+                return 0
 
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
         kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
@@ -7766,9 +7776,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         :func:`mamba_pool_floor.mamba_retention_pin_budget` for why that is
         the right number and what happens without it (#581).
         """
-        if self._mamba_pin_budget_cached is None:
+        # H95e: the budget follows the D phase's slot limit and seat count
+        # (``MambaSlotAllocator.set_phase_limit``, H95c). Cached per
+        # (limit, seats) -- both replicated from the wake request -- and
+        # recomputed when a wake changes them; a budget cached from the boot
+        # pool let n=1's 7 reachable slots be pinned against the cap form's 8.
+        allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        key = (
+            getattr(allocator, "phase_limit", None),
+            getattr(allocator, "phase_seats", None),
+        )
+        if (
+            self._mamba_pin_budget_cached is None
+            or key != getattr(self, "_mamba_pin_budget_key", (None, None))
+        ):
             from sglang.srt.mem_cache.mamba_pool_floor import (
-                mamba_retention_pin_budget,
+                mamba_phase_pin_budget,
             )
             from sglang.srt.runtime_context import get_server_args
 
@@ -7780,11 +7803,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # reads as "unbounded" at the single comparison below.
                 self._mamba_pin_budget_cached = -1
             else:
-                self._mamba_pin_budget_cached = mamba_retention_pin_budget(
+                self._mamba_pin_budget_cached = mamba_phase_pin_budget(
                     server_args,
                     server_args.max_running_requests or 1,
                     mamba_pool.size,
+                    allocator,
                 )
+            self._mamba_pin_budget_key = key
         return self._mamba_pin_budget_cached
 
     def _mamba_write_through_pin_admissible(

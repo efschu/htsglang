@@ -356,16 +356,28 @@ class HiMambaRadixCache(MambaRadixCache):
         more. This makes pin-induced starvation impossible by construction,
         independent of any drain rate.
         """
-        if self._mamba_pin_budget_cached is None:
-            from sglang.srt.mem_cache.mamba_pool_floor import mamba_hard_floor
+        # H95e: same source as the unified lineage -- the pool as reachable
+        # in the current D phase (slot limit + seat count), not the boot pool.
+        allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        key = (
+            getattr(allocator, "phase_limit", None),
+            getattr(allocator, "phase_seats", None),
+        )
+        if (
+            self._mamba_pin_budget_cached is None
+            or key != getattr(self, "_mamba_pin_budget_key", (None, None))
+        ):
+            from sglang.srt.mem_cache.mamba_pool_floor import mamba_phase_pin_budget
             from sglang.srt.runtime_context import get_server_args
 
             server_args = get_server_args()
-            pool_size = self.req_to_token_pool.mamba_pool.size
-            floor = mamba_hard_floor(
-                server_args, server_args.max_running_requests or 1
+            self._mamba_pin_budget_cached = mamba_phase_pin_budget(
+                server_args,
+                server_args.max_running_requests or 1,
+                self.req_to_token_pool.mamba_pool.size,
+                allocator,
             )
-            self._mamba_pin_budget_cached = max(0, pool_size - floor)
+            self._mamba_pin_budget_key = key
         return self._mamba_pin_budget_cached
 
     def _mamba_pins_held(self) -> int:
