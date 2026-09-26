@@ -237,7 +237,9 @@ def test_wiring_park_running_route_and_rpc():
         "managers", "tokenizer_control_mixin.py")
     sch = _read("managers", "scheduler.py")
     assert "(Weg2ParkRunningReqInput, self.handle_weg2_park_running)" in sch
-    assert "d_park_runtime.park_running(self, recv_req)" in sch
+    # H91c3-2: the handler also passes #1443's dormant admit (the late hold)
+    assert "return d_park_runtime.park_running(\n" in sch
+    assert "self, recv_req, late_hold_armed=_weg2_dormant_admit_armed()" in sch
 
 
 def test_wiring_sleep_retract_admission_abort_tick():
