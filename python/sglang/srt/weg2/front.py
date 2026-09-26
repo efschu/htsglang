@@ -3807,7 +3807,7 @@ class Front:
                 "PP0 of the group runs the transient tower before its admission "
                 "and attaches precomputed_embeddings before the prefill",
                 f"weg2-{self.epoch}-{self._rid + 1}", int(_img))
-        elif _verdict != VERDICT_ROUTE:
+        elif _verdict != VERDICT_ROUTE and _verdict != VERDICT_REFUSE_EMBEDS:
             # #1356 THE REFUSAL IS LOGGED, NOT ONLY RETURNED. Without this line
             # W101 existed solely in the caller's response body: `grep W101
             # front.log` read 0 even when it had fired cleanly, so nobody
@@ -3826,17 +3826,25 @@ class Front:
                 VERDICT_REFUSE_IMAGE: "W101 Weg2VisionRefused",
                 VERDICT_REFUSE_VIDEO: "W103 Weg2VideoRefused",
                 VERDICT_REFUSE_MODE: "W104 Weg2VisionModeUnknown",
-                VERDICT_REFUSE_EMBEDS: "W125 Weg2InputEmbedsRefused",
             }[_verdict]
             _rid_peek = f"weg2-{self.epoch}-{self._rid + 1}"
             logger.warning(
-                "%s rid=%s image_parts=%d video_parts=%d mode=%s%s -- request "
+                "%s rid=%s image_parts=%d video_parts=%d mode=%s -- request "
                 "refused with 501 and NOT routed",
-                _code, _rid_peek, int(_img), int(_vid), self.vision,
-                # H125b: named only when present, so the W101/W103 line of a
-                # chat request is the line it always was
-                f" embed_parts={int(_emb)}" if _emb else "")
+                _code, _rid_peek, int(_img), int(_vid), self.vision)
             return web.json_response({"error": f"{_code}: {_why}"}, status=501)
+        elif _verdict == VERDICT_REFUSE_EMBEDS:
+            # H125b: its OWN emitter, the code a leading literal of the format
+            # string (the #1356 emitter rule above), placed AFTER the #1356
+            # branch so the W101/W103 line of an image or video refusal stays
+            # the line it always was, and stays the first one in this handler.
+            logger.warning(
+                "W125 Weg2InputEmbedsRefused rid=%s embed_parts=%d image_parts=%d "
+                "video_parts=%d mode=%s -- request refused with 501 and NOT routed",
+                f"weg2-{self.epoch}-{self._rid + 1}", int(_emb), int(_img), int(_vid),
+                self.vision)
+            return web.json_response(
+                {"error": f"W125 Weg2InputEmbedsRefused: {_why}"}, status=501)
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
         if isinstance(payload, dict):

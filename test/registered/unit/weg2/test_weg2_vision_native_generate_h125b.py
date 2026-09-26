@@ -146,7 +146,7 @@ def test_off_refuses_embeds_and_audio_by_name(field, value, caplog):
         resp, queued = _send(_front("off"), _gen(**{field: value}))
     assert resp is not None and resp.status == 501
     assert _error(resp).startswith("W125 Weg2InputEmbedsRefused") and queued is None
-    assert any("W125" in r.getMessage() and "embed_parts=1" in r.getMessage()
+    assert any(r.getMessage().startswith("W125 Weg2InputEmbedsRefused") and "embed_parts=1" in r.getMessage()
                for r in caplog.records)
 
 

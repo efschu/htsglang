@@ -270,10 +270,11 @@ def test_an_unknown_place_is_refused():
 
 def test_slab_and_air_arithmetic():
     assert vrs.slab_bytes([1, 1, 300]) == 256 + 256 + 300
-    ok, why = vrs.free_vram_verdict(100 * vrs.MIB, 700 * vrs.MIB, 0)
+    # 100 MiB tower + 512 MiB headroom = 612 MiB wanted
+    ok, why = vrs.free_vram_verdict(100 * vrs.MIB, 600 * vrs.MIB, 0)
     assert not ok and "headroom 512 MiB" in why
     ok, _ = vrs.free_vram_verdict(100 * vrs.MIB, 500 * vrs.MIB, 200 * vrs.MIB)
-    assert ok  # the idle allocator cache counts as air
+    assert ok  # the idle allocator cache counts as air (700 >= 612)
     assert vrs.free_headroom(4096 * vrs.MIB) == 1024 * vrs.MIB
 
 
