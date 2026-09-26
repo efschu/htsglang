@@ -92,7 +92,11 @@ WEG2_REFUSAL_NAMES = {
 #: set_is_reachable_after_the_dry_return`) rather than assumed.
 NAMED_POST_SPAWN_HELPERS = (
     "wait_ready", "sleep_group", "d_tp_ratio_decision", "build_env",
-    "gate_w11", "check_drafter_identity", "launch_group",
+    # UNIFY S6 (as on the 27B line since 853c448693): the W10 grader is
+    # gate_w10 (it calls check_drafter_identity and raises W10 itself, skipped
+    # by name under --dflash-produce-on-p off); main() no longer calls
+    # check_drafter_identity directly.
+    "gate_w11", "gate_w10", "launch_group",
 )
 
 #: Pinned 2026-09-09 against this branch (base 80de2d31d1). A raise site
@@ -112,7 +116,7 @@ RAISE_COUNTS_BY_HELPER = {
     "d_tp_ratio_decision": 2,
     "build_env": 1,
     "gate_w11": 2,
-    "check_drafter_identity": 0,
+    "gate_w10": 1,
     "launch_group": 0,
 }
 
