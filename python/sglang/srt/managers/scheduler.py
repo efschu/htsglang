@@ -226,6 +226,7 @@ from sglang.srt.managers.phase_purity import (
 # discipline).
 from sglang.srt.managers import prefetch_ballot
 from sglang.srt.managers import tp_head_congruence
+from sglang.srt.managers import tp_match_floor
 from sglang.srt.managers import weg2_store_told
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers import anchor_tails as _anchor_tails
@@ -8730,6 +8731,25 @@ class Scheduler(
         vals = vals + tp_head_congruence.build_x_store_match_payload(
             _head_canonical, self._weg2_local_store_matches(_head_canonical)
         )
+        # RU (nf_rank_divergence): THE USABLE-MATCH ARM, fourth consumer of this
+        # same reduce, on the SAME canonical head. The order arm votes the
+        # match LENGTH; this arm votes it as 0 when the match ends on a node
+        # whose recurrent anchor this rank cannot use (#928 a/b, evaluated
+        # without COW side effects on the walk `_local_head_prefix_matches`
+        # just took). Admission zeroes a rank's match when the group MIN is 0
+        # (tp_match_floor.group_floor_zeroes, inside the mamba finalize before
+        # the COW). Placed BEFORE the ballot, which is indexed from the tail.
+        # No new collective (MUST NOT 6).
+        _usable_at = len(vals)
+        vals = vals + tp_match_floor.build_usable_match_payload(
+            _head_canonical,
+            tp_match_floor.local_usable_matches(
+                getattr(self, "tree_cache", None),
+                {req.rid: req for req in self.waiting_queue},
+                _head_local_matches,
+            ),
+            tp_head_congruence.TP_HEAD_SLOTS,
+        )
         _ballot_rids = [
             req.rid
             for req in self.waiting_queue[: prefetch_ballot.PREFETCH_BALLOT_SLOTS]
@@ -8783,6 +8803,20 @@ class Scheduler(
                 "foreign number here would admit a prefill the group cannot "
                 "serve. The group stops here by name instead."
             )
+        # RU: read back by its own captured head index, before the ballot.
+        _usable_lens = t[
+            _usable_at : _usable_at + tp_head_congruence.TP_HEAD_SLOTS
+        ].tolist()
+        if len(_usable_lens) != tp_head_congruence.TP_HEAD_SLOTS:
+            raise RuntimeError(
+                "RU USABLE-MATCH LAYOUT STOP: the reduced payload carries no "
+                f"usable-match slice (head={_usable_at}, "
+                f"expected={tp_head_congruence.TP_HEAD_SLOTS}, "
+                f"available={len(vals) - _usable_at})"
+            )
+        self._uniform_usable_floor = tp_match_floor.decode_group_usable(
+            _head_canonical, _usable_lens
+        )
         _admit_limit = int(t[_limit_at])
         # #1203: read back by its captured head index, before the ballot, under
         # the same discipline as the corridor width and the head block.
@@ -11912,6 +11946,9 @@ class Scheduler(
             # (#980 ObjectRecvStalled / #1071 PpChainRecvStalled) or the
             # barlink dead-peer probe -- no new collective on this path.
             raise self._pp_forwarded_schedule_stop(refusal) from refusal
+        finally:
+            # RU: the usable-match floor lives for exactly one plan call.
+            tp_match_floor.clear(self.tree_cache)
 
         if self.prefill_delayer:
             prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
@@ -13098,6 +13135,12 @@ class Scheduler(
         # boot_window2_0823_1554 and every batch formed rank-locally.
         _head_inputs = self._take_uniform_head_inputs()
         self._pp_head_inputs_this_pass = _head_inputs
+        # RU: the group's usable match, consume-once like the head verdict and
+        # planted on the tree for THIS plan call only (cleared in
+        # get_new_batch_prefill's finally). A PP-loop pass never publishes it.
+        tp_match_floor.plant(
+            self.tree_cache, self.__dict__.pop("_uniform_usable_floor", None)
+        )
         # #1153 (PP0 order): on a FORWARDED schedule this rank's seat-count
         # arithmetic is not a verdict. `rank_local_count_veto_applies` is
         # True on PP0 and on every non-PP boot (the pre-#1153 expression,

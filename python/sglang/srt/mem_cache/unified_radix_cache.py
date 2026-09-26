@@ -913,11 +913,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         (prefetch_budget.py). Stock even-TP HiCache (uniform host pools)
         never trips it -> that path is byte-identical. Uses the same attn/TP
         groups the existing prefetch collectives run on."""
-        return (
+        # RU (nf_rank_divergence): an uneven --rank-tp-ratio plan makes the host
+        # tiers asymmetric too, without any DCP token vector -- NF D runs
+        # 1,0,0: TP0 on the arena pool, TP1/TP2 on zero-width plain pools, and
+        # the rc9k gloo "248 vs 4" was TP0 declining `too_short` alone while
+        # TP1/TP2 registered. Even TP (equal ratios, no vector) stays False.
+        from sglang.srt.managers.tp_match_floor import host_tier_asymmetric
+        from sglang.srt.runtime_context import get_server_args
+
+        return bool(
             getattr(self, "enable_storage", False)
             and self.cache_controller is not None
             and self.tp_world_size > 1
-            and uneven_dcp_active()
+            and host_tier_asymmetric(
+                dcp_uneven=uneven_dcp_active(), server_args=get_server_args()
+            )
         )
 
     def prefetch_participation_is_collective(self) -> bool:
@@ -7075,8 +7085,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             from sglang.srt.runtime_context import get_server_args
 
+            from sglang.srt.managers.tp_match_floor import host_tier_asymmetric
+
+            # RU: the same predicate as `_hicache_prefetch_symmetric`.
             symmetric_after = int(getattr(self, "tp_world_size", 1) or 1) > 1 and bool(
-                uneven_dcp_active()
+                host_tier_asymmetric(
+                    dcp_uneven=uneven_dcp_active(), server_args=get_server_args()
+                )
             )
             if symmetric_after:
                 refuse_ratio_sized_pools_under_symmetric_prefetch(

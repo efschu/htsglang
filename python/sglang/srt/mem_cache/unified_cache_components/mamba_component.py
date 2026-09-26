@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.mamba_ckpt_utils import (
     retention_shrinks_protected,
 )
 from sglang.srt.runtime_context import get_server_args
+from sglang.srt.managers.tp_match_floor import group_floor_zeroes
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -391,6 +392,18 @@ class MambaComponent(TreeComponent):
             # (device lineage: the branch-grid block runs after the strict
             # zeroing too).
             return result._replace(mamba_branching_seqlen=branching_seqlen)
+
+        # RU (nf_rank_divergence): THE GROUP'S USABLE MATCH, applied where #928
+        # applies its own refusal and for the same reason -- BEFORE the COW
+        # below, so a zeroed match leaves no copy source and no acquired slot
+        # behind. The group value is the MIN-reduced usable-match arm of this
+        # pass's packed reduce, planted for the plan call only; everywhere else
+        # this is a getattr miss. Zero on some rank => zero here: rc9i died
+        # because TP1/TP2 refused this very rid's anchor and TP0 resumed alone.
+        if cow_mamba and group_floor_zeroes(self.cache, req, result):
+            return zero_match_result(self.cache, result)._replace(
+                mamba_branching_seqlen=branching_seqlen
+            )
 
         mamba_value = last_node.component_data[self.component_type].value
 
