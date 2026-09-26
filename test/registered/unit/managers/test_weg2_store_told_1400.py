@@ -427,3 +427,95 @@ def test_1419_told_caps_the_radix_match_on_every_rank():
     assert _weg2_cap_key_limit(req, 100000) == 4095
     assert _weg2_cap_key_limit(req, 10) == 10
     assert _weg2_cap_key_limit(types.SimpleNamespace(), 77) == 77
+
+
+# ---- #1416d: the clamp probe hashes with the FETCH's key form --------------
+
+
+class _ArenaBackend:
+    """Store double keyed like the arena: a page is present iff its hash was
+    written. `written` is the fetch's key chain (what P's write-through and
+    the store read use); the answer is the leading run, like batch_exists_v2."""
+
+    def __init__(self, written):
+        self.written = set(written)
+        self.asked = []
+
+    def batch_exists_v2(self, keys, transfers, extra):
+        self.asked.append(list(keys))
+        n = 0
+        for k in keys:
+            if k not in self.written:
+                break
+            n += 1
+        return types.SimpleNamespace(kv_hit_pages=n)
+
+
+def _unit_hashes(ids, last_hash, page_size=1):
+    # iterating a bigram RadixKey yields (t_i, t_i+1) units, a list yields ints:
+    # the same split the native hash makes (unit_width 2 vs 1)
+    return ["u%r" % (u,) for u in ids]
+
+
+def _bigram_fixture(told, n_ids):
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+
+    ids = list(range(1000, 1000 + n_ids))
+    fetch_key = RadixKey(list(ids), None, is_bigram=True)[:told]  # prefetch_from_storage
+    backend = _ArenaBackend(_unit_hashes(fetch_key, None))
+    cc = types.SimpleNamespace(
+        page_size=1, storage_backend=backend, get_hash_str=_unit_hashes,
+        _presence_pool_transfers=lambda: ["mamba"],
+    )
+    req = types.SimpleNamespace(origin_input_ids=ids, rid="weg2-12-8", extra_key=None)
+    sched = types.SimpleNamespace(cache_controller=cc, tree_cache=types.SimpleNamespace(is_eagle=True))
+    return sched, req, backend
+
+
+def test_1416d_default_off_keeps_the_unigram_probe_and_its_zero(monkeypatch):
+    """Danger direction named: the switch OFF must stay the pre-#1416d probe --
+    on a bigram tree it asks unigram keys, finds nothing and clamps to 0
+    (the measured 27B agent-boot behaviour, reproduced here)."""
+    monkeypatch.delenv(m.ENV_TREE_KEY, raising=False)
+    sched, req, backend = _bigram_fixture(told=22934, n_ids=22936)
+    assert m._anchor_clamp(sched, req, 22934) == 0
+    assert backend.asked[0][0] == "u1000", "unigram first key: the old probe"
+
+
+def test_1416d_on_asks_the_fetch_keys_and_keeps_told(monkeypatch):
+    monkeypatch.setenv(m.ENV_TREE_KEY, "1")
+    sched, req, backend = _bigram_fixture(told=22934, n_ids=22936)
+    assert m._anchor_clamp(sched, req, 22934) == 22934
+    asked = backend.asked[0]
+    assert len(asked) == 22934, "told counts keys: told+1 raw tokens under bigram"
+    assert asked[0] == "u(1000, 1001)" and asked[-1] == "u(23933, 23934)"
+
+
+def test_1416d_on_still_clamps_a_span_without_anchor_beyond(monkeypatch):
+    """The clamp keeps its #1416 purpose: pages beyond the store's leading run
+    (no anchor / not written) are not admissible."""
+    monkeypatch.setenv(m.ENV_TREE_KEY, "1")
+    sched, req, backend = _bigram_fixture(told=4095, n_ids=22936)
+    assert m._anchor_clamp(sched, req, 22934) == 4095
+
+
+def test_1416d_on_unigram_tree_is_the_old_question(monkeypatch):
+    monkeypatch.setenv(m.ENV_TREE_KEY, "1")
+    ids = list(range(50))
+    backend = _ArenaBackend(_unit_hashes(ids[:40], None))
+    cc = types.SimpleNamespace(page_size=1, storage_backend=backend, get_hash_str=_unit_hashes,
+                               _presence_pool_transfers=lambda: ["mamba"])
+    req = types.SimpleNamespace(origin_input_ids=ids, rid="r", extra_key=None)
+    sched = types.SimpleNamespace(cache_controller=cc, tree_cache=types.SimpleNamespace(is_eagle=False))
+    assert m._anchor_clamp(sched, req, 40) == 40
+    assert backend.asked[0] == _unit_hashes(ids[:40], None)
+
+
+def test_1416d_on_uses_the_handed_over_page_keys_like_the_fetch(monkeypatch):
+    monkeypatch.setenv(m.ENV_TREE_KEY, "1")
+    sched, req, backend = _bigram_fixture(told=100, n_ids=102)
+    hk = ["P%d" % i for i in range(60)]
+    backend.written |= set(hk)
+    monkeypatch.setattr(m, "_handoff_keys", lambda rid: hk if rid == "weg2-12-8" else None)
+    assert m._anchor_clamp(sched, req, 100) == 100
+    assert backend.asked[0][:60] == hk and backend.asked[0][60] == "u(1060, 1061)"
