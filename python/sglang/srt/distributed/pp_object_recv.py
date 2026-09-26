@@ -418,6 +418,43 @@ class ObjectRecvFrame:
             self._state = _COMPLETE
         return True
 
+    def poll(self) -> bool:
+        """PF (26.09.): drive the frame WITHOUT waiting and WITHOUT a line.
+
+        ``advance(step)`` joins the parked wait for ``step`` seconds and names
+        every expired step at WARNING (plus a "resumed" WARNING on the next
+        call) -- right for a receive somebody is blocked on, wrong for a
+        STANDING receive polled once per scheduler pass, where "nothing yet"
+        is the normal answer and a WARNING per pass is spam (the #1268 home
+        harvest pays 2 ms and two WARNINGs per pass while a lap is out).
+
+        This only reads the parked wait's completion flag: nothing is joined
+        (``ParkedWait.join(0)`` would be the RAW BLOCKING wait -- its <= 0
+        escape hatch), nothing is logged above DEBUG, the posted receive stays
+        posted. A completed step is joined with ``None`` -- it returns at once
+        because the flag is set -- only so a transport error raised on the
+        parked thread surfaces here instead of being swallowed (#734).
+        Returns True when a whole object is on the floor (``take`` may be
+        called), False otherwise; the frame stays resumable either way.
+        """
+        if self._state == _COMPLETE:
+            return True
+        if self._state == _IDLE:
+            self._arm()
+        if self._state == _AWAITING_SIZE:
+            assert self._parked is not None
+            if not self._parked.completed:
+                return False
+            self._parked.join(None)
+            self._post_payload()
+        if self._state == _AWAITING_DATA:
+            assert self._parked is not None
+            if not self._parked.completed:
+                return False
+            self._parked.join(None)
+            self._state = _COMPLETE
+        return True
+
     def take(self) -> Any:
         """Unpickle the completed object and reset the frame for the next one.
 

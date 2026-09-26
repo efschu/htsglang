@@ -69,6 +69,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
+from sglang.srt.managers import weg2_told_fallback as _fb
 from sglang.srt.weg2 import p_twin_defer as _twin
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,16 @@ def armed(scheduler) -> bool:
         # so a launcher that armed the switch on one rank only cannot split
         # the group.
         scheduler._weg2_told_paced_on = _paced_env()
+        # PF: the group told=0 fallback -- PP0's switch, effective only on
+        # the paced form (only there does PP0 hold admission for an Admit).
+        scheduler._weg2_told_fallback_on = bool(
+            scheduler._weg2_told_paced_on and _fb.env_on()
+        )
+        if _fb.env_on() and not scheduler._weg2_told_paced_on:
+            logger.warning(
+                "PF %s=1 WITHOUT %s: no effect -- the group told=0 fallback "
+                "needs the paced form", _fb.ENV_FALLBACK, ENV_PACED,
+            )
         logger.warning(
             "#1400 STORE-TOLD ARMED rank pp=%s: carrierless PP form with HiCache "
             "storage -- PP0 publishes its store verdict per request on the "
@@ -281,6 +292,10 @@ def prefix_cap_tokens(tree, told: int) -> int:
 
 
 def _follower_register(scheduler, req, told: int) -> str:
+    if getattr(scheduler, "_weg2_fb_follower", None) is not None:
+        # PF: whatever this registration's outcome (issued, satisfied,
+        # declined), its read state is what PP0's fallback asked for.
+        _fb.follower_note_registered(scheduler, req)
     _adopt_keys(scheduler, req)
     if told <= 0:
         return "declined:weg2_told_zero"
@@ -743,6 +758,9 @@ def _follower_absorb_impl(scheduler, recv_reqs: List) -> List:
             # PP0's verdict; admission still skips until the Admit arrives.
             early = _early(scheduler)
             early[rid] = told
+            if getattr(item, _fb.WIRE_ACK, 0):
+                # PF: PP0 armed the group fallback -- report this read.
+                _fb.follower_expect(scheduler, rid, told)
             if len(early) > 256:
                 # an aborted request never gets its Admit: keep the table
                 # to what is still queued (or just arrived, this rid)
@@ -811,6 +829,10 @@ def _follower_absorb_impl(scheduler, recv_reqs: List) -> List:
 # follower whose read is still short at the Admit falls into the unchanged
 # bounded wait (named, WAIT_CAP_S) -- the residual, not the normal case.
 # Told 0 needs no read and is published single-phase as before.
+# PF (SGLANG_WEG2_TOLD_GROUP_FALLBACK, weg2_told_fallback): with that switch
+# the followers ack their terminated reads to PP0 on a gloo tag of their own,
+# PP0 admits on the acks and switches the rid to told=0 for EVERY rank on a
+# short read or at its Frist -- the residual wait is gone as well.
 
 ENV_PACED = "SGLANG_WEG2_TOLD_PACED"
 ENV_PACE_FACTOR = "SGLANG_WEG2_TOLD_PACE_FACTOR"
@@ -897,6 +919,13 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
     now = _clock()
     pass_n = int(getattr(scheduler, "_weg2_told_pass_n", 0)) + 1
     scheduler._weg2_told_pass_n = pass_n
+    fb_on = bool(getattr(scheduler, "_weg2_told_fallback_on", False))
+    fb_parked = set()
+    if fb_on and pacing:
+        # PF: the followers' read acks that have landed (no wait), BEFORE
+        # the verdicts below read them.
+        _fb.pp0_harvest(scheduler)
+        fb_parked = _parked(scheduler)
     # TW: held fork twins whose sibling finished (or whose Frist ran out)
     # register their store read now (the paced read clock starts here).
     for _treq, _is_twin in _twin.release_due(scheduler, queued):
@@ -907,10 +936,35 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
     for rid in list(pacing):
         p = pacing[rid]
         if rid not in queued:
+            if fb_on and rid in fb_parked:
+                # PF: held by the dormant hold / settle (TK path 4) -- the
+                # verdict waits until the release has queued it again.
+                continue
             # left the queue during the window (abort): no Admit, nothing
             # admits; the followers' reads end in their own drain.
             pacing.pop(rid, None)
+            if fb_on:
+                _fb.pp0_forget(scheduler, rid)
             logger.info("#1416e PACED-DROP rid=%s told=%d: left the queue inside the window", rid[:8], p.told)
+            continue
+        if fb_on:
+            # PF: PP0 alone decides -- told once every follower's read
+            # reproduced it, told=0 for every rank on a short read or at the
+            # Frist. Never the window's guess.
+            verdict = _fb.pp0_decide(scheduler, rid, now)
+            if verdict is None:
+                continue
+            told_final, reason = verdict
+            pacing.pop(rid, None)
+            _fb.pp0_note_verdict(scheduler, rid, p.told, told_final, reason, now, p.published_at)
+            admit = Weg2StoreAdmit(rid=rid, told=told_final)
+            if told_final != p.told:
+                # PP0's own read is released like a follower's: its record
+                # said told, its admission now compares 0 with 0.
+                _fb.release_own_read(scheduler, rid)
+                setattr(admit, _fb.WIRE_FALLBACK, 1)
+            told_map[rid] = told_final
+            out.append(admit)
             continue
         if now - p.published_at < p.window_s:
             continue
@@ -956,7 +1010,21 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             continue
         window = pace_window_s(own_read_s, told)
         pacing[rid] = _Pace(req=req, told=told, published_at=now, published_pass=pass_n, window_s=window)
-        out.append(_cls(rid=rid, told=told, paced=True, **_extra))
+        ahead = _cls(rid=rid, told=told, paced=True, **_extra)
+        if fb_on:
+            # PF: ask the followers for their read state (wire marker, set
+            # only here) and start the Frist.
+            setattr(ahead, _fb.WIRE_ACK, 1)
+            _frist = _fb.pp0_open(scheduler, rid, told, now, own_read_s, window)
+            n_fb = getattr(scheduler, "_pf_open_n", 0) + 1
+            scheduler._pf_open_n = n_fb
+            if n_fb <= _LOG_FIRST or n_fb % _LOG_EVERY == 0:
+                logger.info(
+                    "PF TOLD-OPEN rid=%s told=%d window=%.2fs frist=%.2fs (n=%d): "
+                    "admission follows the followers' read acks, told=0 at the Frist",
+                    rid[:8], told, window, _frist, n_fb,
+                )
+        out.append(ahead)
         n = getattr(scheduler, "_1416e_ahead_n", 0) + 1
         scheduler._1416e_ahead_n = n
         if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
@@ -975,6 +1043,13 @@ def _follower_admit(scheduler, item: Weg2StoreAdmit) -> None:
     verdict (the single-phase told's role from here on)."""
     rid = str(item.rid)
     told = int(item.told)
+    fallback = bool(getattr(item, _fb.WIRE_FALLBACK, 0))
+    if fallback:
+        # PF: PP0 switched this rid to told=0 for every rank -- cut this
+        # rank's read (abort path: rows, lock, reader references) first.
+        _fb.follower_release(scheduler, rid)
+    elif getattr(scheduler, "_weg2_fb_follower", None) is not None:
+        _fb.follower_forget(scheduler, rid)
     early = _early(scheduler)
     ahead = early.pop(rid, None)
     scheduler._weg2_store_told[rid] = told
@@ -984,7 +1059,7 @@ def _follower_admit(scheduler, item: Weg2StoreAdmit) -> None:
         # no read-ahead reached this request (it was not queued yet): register
         # now; admission then waits for it as the single-phase form does.
         _follower_register(scheduler, req, told)
-    if ahead is not None and int(ahead) != told:
+    if ahead is not None and int(ahead) != told and not fallback:
         logger.warning(
             "#1416e PACED-ADMIT rid=%s told=%d differs from the read-ahead %d; admission "
             "compares against the admitted value", rid[:8], told, int(ahead),
@@ -1111,4 +1186,13 @@ def refetch_plan(scheduler, req):
 
 from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed  # noqa: E402
 
-follower_absorb = _pass_timed("_1475_absorb_ms")(_follower_absorb_impl)  # #1475
+
+def _follower_absorb_pass(scheduler, recv_reqs: List) -> List:
+    rest = _follower_absorb_impl(scheduler, recv_reqs)
+    if getattr(scheduler, "_weg2_fb_follower", None) is not None:
+        # PF: report terminated reads to PP0, finish the last send; no wait.
+        _fb.follower_pump(scheduler)
+    return rest
+
+
+follower_absorb = _pass_timed("_1475_absorb_ms")(_follower_absorb_pass)  # #1475
