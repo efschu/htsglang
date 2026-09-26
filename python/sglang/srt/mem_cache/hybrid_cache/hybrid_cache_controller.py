@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from queue import Queue
@@ -527,6 +528,24 @@ class HybridCacheController(BaseHiCacheController):
                     owner.free(host_indices)
                 host_indices = None
         if host_indices is not None:
+            # #989b: this override skipped the base's provenance stamp, so every
+            # conflict on the hybrid/mamba lane named its producers '?'. Keyed
+            # like the base: the first slot of each queued entry.
+            if host_indices.numel():
+                try:
+                    f = sys._getframe(1)
+                    site = f"{f.f_globals.get('__name__', '?').rsplit('.', 1)[-1]}:{f.f_lineno}"
+                    prov = self.__dict__.setdefault("host_release_provenance", {})
+                    ps = int(self.mem_pool_host.page_size or 1)
+                    step = (
+                        int(host_indices.numel())
+                        if coalesce_host_releases() and host_indices.numel() % max(1, ps) == 0
+                        else max(1, ps)
+                    )
+                    for i in range(0, int(host_indices.numel()), step):
+                        prov[int(host_indices[i])] = site
+                except Exception:  # noqa: BLE001 - provenance may never break a release
+                    pass
             self._append_host_mem_release_pages(
                 self.host_mem_release_queue,
                 host_indices,

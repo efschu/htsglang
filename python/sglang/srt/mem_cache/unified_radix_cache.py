@@ -7320,6 +7320,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     n_release,
                     getattr(cc.mem_pool_host, "page_size", 1),
                 )
+            _split = getattr(cc.mem_pool_host, "split_arena_rows", None)
+            if host_indices_list and callable(_split):
+                # #989b: arena rows are reader REFERENCES, returned one queued
+                # entry at a time, BEFORE the merge below. Two prefetches of one
+                # prefix each hold a +1 on the same pages and each queues its
+                # own unclaimed head; merged and de-duplicated here, one of the
+                # two references was never returned (rc11b: 2560 / 13504 / 4032
+                # "queued twice" = the overlap of two unclaimed heads, exactly).
+                # Per entry is the same rule a later drain round already applied
+                # to the same span, and the process's RefLedger still refuses a
+                # release beyond the references this process took.
+                _rest = []
+                for _entry in host_indices_list:
+                    _refs, _other = _split(_entry)
+                    if _refs is not None and _refs.numel():
+                        cc.mem_pool_host.free(_refs)
+                    if _other.numel():
+                        _rest.append(_other)
+                host_indices_list = _rest
             if host_indices_list:
                 # #989 OWNERSHIP AT THE GIVE-BACK: FREE ONLY WHAT IS OWNED.
                 #
@@ -7359,13 +7378,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     _n = getattr(self, "_989_release_conflicts", 0) + 1
                     self._989_release_conflicts = _n
                     if _n <= 8 or _n % 256 == 0:
+                        # #989b: the provenance is keyed by the FIRST slot of a
+                        # queued entry, so an offender inside an entry read '?'.
+                        # Name every entry holding an offender by that entry's
+                        # own stamp: a duplicate then names BOTH producers.
                         _site = getattr(cc, "host_release_site", None)
+                        _off = set(_dupes[:4].tolist()) | set(_unowned[:4].tolist())
                         _names = []
-                        for _t in (_dupes, _unowned):
-                            for _s in _t[:4].tolist():
-                                _names.append(
-                                    f"{_s}<-{_site(_s) if _site else '?'}"
-                                )
+                        for _t in host_indices_list:
+                            _tc = _t.detach().to("cpu", copy=False).flatten()
+                            _hit = [s for s in _tc.tolist() if s in _off]
+                            if _hit:
+                                _who = _site(int(_tc[0])) if _site else "?"
+                                _names.append(f"{_hit[0]}<-{_who}")
                         logger.error(
                             "#989 HOST RELEASE CONFLICT occurrence=%d: %d slot(s) "
                             "queued twice, %d slot(s) already free. Freeing only "

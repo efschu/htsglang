@@ -2255,6 +2255,33 @@ class HostPoolGroup:
             return handed_back
         return handed_back + pool.free(live)
 
+    def split_arena_rows(self, indices):
+        """#989b: (arena + placeholder ids, the rest) of one release entry, or
+        (None, indices) where `_free_arena_rows` would not act.
+
+        The release drain needs this BEFORE it merges its entries. An arena
+        row names a reader REFERENCE, not an allocation: two store prefetches
+        of one prefix each take their own +1 on the shared pages
+        (`_arena_page_get`), so both unclaimed heads legitimately name the
+        same rows. Merged into one batch and de-duplicated, the second
+        reference was never returned -- the slot stays pinned for the rest of
+        the boot (rc11b, NF under agent load: 40, 211 and 63 slots on D TP0,
+        40 on P PP0, each logged as "#989 HOST RELEASE CONFLICT")."""
+        pool = self.anchor_entry.host_pool
+        arena = getattr(pool, "arena", None)
+        if (
+            not arena_queue_refs_on()
+            or arena is None
+            or getattr(arena, "_ledger", None) is None
+            or not callable(getattr(pool, "release_queued_rows", None))
+        ):
+            return None, indices
+        idx = torch.as_tensor(indices).reshape(-1).to(torch.int64).cpu()
+        S = int(pool.staging_rows)
+        top = int(getattr(pool, "id_space", S + _arena_id_tokens(pool)))
+        is_ref = (idx >= S) & (idx < top)
+        return idx[is_ref], idx[~is_ref]
+
     def _free_arena_rows(self, pool, indices):
         """SGLANG_HICACHE_ARENA_QUEUE_REFS (27B, 24.09., default off).
 
