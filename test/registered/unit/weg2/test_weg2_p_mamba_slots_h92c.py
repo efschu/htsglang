@@ -97,8 +97,10 @@ def model(tmp_path):
         yield _model_dir(str(tmp_path))
 
 
-def _ns(extra_p="", p_bs=8):
-    return types.SimpleNamespace(extra_p=extra_p, p_bs=p_bs,
+def _ns(extra_p="", p_bs=8, profile="nextflash"):
+    # unified tree: the argv reading is the registry row's
+    # p_mamba_slots_from_argv (nextflash on, qwen27b off)
+    return types.SimpleNamespace(extra_p=extra_p, p_bs=p_bs, profile=profile,
                                  pp_cut_mamba_slots_per_running_request=2)
 
 
@@ -126,6 +128,15 @@ class TestMambaPost:
         slots, src = lc.p_mamba_slots(_ns("", p_bs=4), model, 4)
         assert slots == lc.P_MAX_MAMBA_CACHE_SIZE == 24
         assert "on P's argv" in src
+
+    def test_qwen27b_keeps_the_demand_formula(self, model):
+        """Operator rule 26.09. (27B byte-identical): on the qwen27b row the post
+        stays ceil(p_bs x 2 x 1.25) even with the flag on P's argv -- the 27B
+        stage constants were fitted with it (reading the argv moves the solved
+        27B cut 42,11,11 -> 39,13,12)."""
+        slots, src = lc.p_mamba_slots(_ns("--max-mamba-cache-size 32", profile="qwen27b"), model, 8)
+        assert slots == 20 and "UPPER BOUND" in src
+        assert lc.p_mamba_slots(_ns("", p_bs=2, profile="qwen27b"), model, 2)[0] == 5
 
     def test_the_demand_bound_only_for_an_argv_without_the_flag(self, model):
         real = lc.argv_p

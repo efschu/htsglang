@@ -361,6 +361,14 @@ class ModelProfile:
     #: the 27B census (weg2xsn246: 1622 MiB on the 5090) is below every 27B D
     #: residue record (2074-2150 MiB), so taking it would under-reserve D.
     d_residue_census: bool = False
+    #: NF H92c: group P's mamba pool in the P pool model = the
+    #: --max-mamba-cache-size P's argv states (what the runtime allocates),
+    #: instead of the demand formula ceil(p_bs x 2 x 1.25). Operator rule
+    #: (27B byte-identical): nextflash on; qwen27b off until the 27B seat
+    #: decides -- on the 27B it moves the solved P cut (42,11,11 -> 39,13,12
+    #: on 27b/27b-fp8, UN dry-run 26.09.), because its measured stage
+    #: constants were fitted with the formula's slot count.
+    p_mamba_slots_from_argv: bool = False
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -566,6 +574,7 @@ PROFILES: Dict[str, ModelProfile] = {
         prefill_transient_checkpoints=("Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",),
         constants=_NEXTFLASH_CONSTANTS,
         d_residue_census=True,
+        p_mamba_slots_from_argv=True,
     ),
 }
 

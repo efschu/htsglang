@@ -10730,10 +10730,16 @@ def p_mamba_slots(ns, model: str, p_bs: int) -> Tuple[int, str]:
     ``--extra-p`` (the last occurrence, argparse's rule), not restated; only a
     P argv without the flag falls back to the demand formula, which then IS the
     runtime's branch (an upper bound on ``_auto_mamba_demand_size``, #1286 F4).
+
+    UNIFY (operator rule, 27B byte-identical): only a profile whose registry
+    row sets ``p_mamba_slots_from_argv`` (nextflash) reads the argv; any other
+    (qwen27b) keeps the demand formula as before H92c.
     """
-    flags = argv_p("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG,
-                   shlex.split(str(getattr(ns, "extra_p", "") or "")), p_bs=int(p_bs),
-                   stage_ratio="", attn_stage_ratio="")
+    _row = weg2_form.profile_row(getattr(ns, "profile", None))
+    flags = (argv_p("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG,
+                    shlex.split(str(getattr(ns, "extra_p", "") or "")), p_bs=int(p_bs),
+                    stage_ratio="", attn_stage_ratio="")
+             if _row is not None and _row.p_mamba_slots_from_argv else [])
     value = None
     for i, tok in enumerate(flags):
         tok = str(tok)
