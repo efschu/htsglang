@@ -377,6 +377,18 @@ def simulate_pd(ref: PDReference, order: Optional[Sequence[str]] = None, *,
                         p_phase[s] = None
                         p_k[s] += 1
                         changed = True
+                if p_k[s] >= n and ring.get(ref.p_card[s]):
+                    # H92d: the sleeper's leg is complete -> its leg-end drain
+                    # (_weg2_xchg_drain_outstanding -> release_stage_buffers)
+                    # hands the on-card stagings back (fnFL2h91bb1: 2 x 617 MiB
+                    # c2, 3 ms after leg_complete), and since H111d the waker's
+                    # credit wait polls through exactly that transient instead
+                    # of refusing. Held to the end of the simulation, the ring
+                    # made the planner see a stall the metal never had once free
+                    # was measured honestly (bb2/bb3 flip weights_8 on nvml2
+                    # after 187-280 ms of wait, credit at PP2's leg end).
+                    ring[ref.p_card[s]] = []
+                    changed = True
             # ---------------- D ranks
             for r in range(n_rk):
                 c = d_card[r]
@@ -683,8 +695,13 @@ def verdict_lines_pd(ref: PDReference, *, label: str, apply: bool,
             costs = []
             for r, c in enumerate(o.d_card):
                 cc = credit_cost_ms(o, c, order) if r2.wait_sum(r) > 0 else 0.0
-                costs.append("card%d %.0f ms (Leg +%s)" % (
-                    c, r2.wait_sum(r), "?" if cc is None else "%.0f" % cc))
+                # H92d: the first P->D wake is the tighter one on the 3080s
+                # (P's allocator rest is larger there) -- its free and its
+                # tightest air are printed, not only its wait.
+                t2 = r2.tightest(r)
+                costs.append("card%d %.0f ms (Leg +%s; free %.0f, engste Luft %s)" % (
+                    c, r2.wait_sum(r), "?" if cc is None else "%.0f" % cc, float(o.free[c]),
+                    "-" if t2 is None else "%.0f MiB bei %s" % (t2.headroom_mib, t2.tag)))
             leg_txt = ("%.0f ms" % r2.leg_ms if r2.leg_ms is not None else "STEHT (%s)" % (
                 "; ".join("D TP%d bei %s FEHLT %.0f MiB" % x for x in r2.stuck) or "Zyklus"))
             lines.append("%s %s %s: Vergleichsflip %s, Ordnung %s -- Leg %s, Kreditwarten je Karte %s" % (
@@ -722,6 +739,9 @@ def plan_wake_credit_pd(*, model: str, p_split: Sequence[int], chunk_layers: int
                         references: Optional[Mapping[str, Mapping[str, object]]] = None,
                         form_keys: Optional[Mapping[str, Mapping[str, object]]] = None,
                         dense_repack: Optional[bool] = None,
+                        d_seats: Optional[int] = None,
+                        free0_records: Optional[Sequence[Mapping[str, object]]] = None,
+                        free0_builtin: Optional[Sequence[Mapping[str, object]]] = None,
                         ) -> WakeCreditPlanPD:
     """Der Planer-Riegel P->D: der Wake der GEPLANTEN Form gegen die gemessene
     Referenz derselben Form (Draft auf P: fnFL2x141, H25: fnFL2x144), Delta =
@@ -732,7 +752,16 @@ def plan_wake_credit_pd(*, model: str, p_split: Sequence[int], chunk_layers: int
     (SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL); er waehlt die Referenz mit, weil
     D-Bedarf und P-Freigabe derselben Form sich um die toten Tag-Pool-Bloecke
     unterscheiden (x144 gegen x158: D TP0 20720 gegen 16366 MiB). ``None`` =
-    der Zustand vor H39 (die Referenzen, die es vor H50 gab)."""
+    der Zustand vor H39 (die Referenzen, die es vor H50 gab).
+
+    H92d: ``free`` beim Flip-Start kommt aus der juengsten MESSUNG derselben
+    Form und derselben D-Sitzzahl ``d_seats`` (:func:`resolve_free0`: Sidecar
+    ``free0_records`` vor eingebauten ``free0_builtin`` =
+    ``wake_credit_pd_refs.FREE0_RECORDS`` bei gleichem Zeitpunkt), je
+    Flip-Position -- ``/1`` fuer die Hauptrechnung, ``/0`` fuer den
+    Vergleichsflip. Die Kopfzeile nennt Herkunft, Boot und Zeitpunkt; ohne
+    Messung (oder ohne ``d_seats``) bleibt free der Zeitreferenz und die Zeile
+    sagt UNGEMESSEN."""
     import os
 
     from sglang.srt.weg2 import wake_credit_pd_refs as _refs
@@ -771,8 +800,13 @@ def plan_wake_credit_pd(*, model: str, p_split: Sequence[int], chunk_layers: int
     kw = dict(p_rows=p_rows, d_rows=d_rows, slot_mib=slot_mib, p_split=p_split,
               chunk_layers=chunk_layers, n_layers=n_layers, p_resident=p_resident,
               d_resident=d_resident)
-    ref = planned_reference_pd(reference_from_dict(main), **kw)
-    also = [planned_reference_pd(reference_from_dict(first), **kw)] if first is not None else []
+    builtin = list(free0_builtin if free0_builtin is not None else _refs.FREE0_RECORDS)
+    fz = {f: resolve_free0(boot, d_seats, f, builtin=builtin, records=list(free0_records or ()),
+                           model=str(model), form_model=key.get("model"))
+          for f in (1, 0)}
+    ref = planned_reference_pd(reference_from_dict(main), free0=fz[1][0], **kw)
+    also = ([planned_reference_pd(reference_from_dict(first), free0=fz[0][0], **kw)]
+            if first is not None else [])
     head = (
         "%s %s %s: Wake P->D (P schlaeft, D wacht, beide Legs zugleich) gegen die Referenz %s "
         "(gemessen: free %s, P-Zeilen %s, D-Zeilen %s), Delta = Pufferregel (Zeilen x Layer x "
@@ -783,8 +817,16 @@ def plan_wake_credit_pd(*, model: str, p_split: Sequence[int], chunk_layers: int
            list(p_rows), list(d_rows), STAGING_DEPTH, COLLECT_RUNAHEAD, COLLECT_WORKERS))
     if _model_note:
         head += "; " + _model_note
+    if d_seats is not None:
+        head += "; H92d " + fz[1][2] + (("; Vergleichsflip " + fz[0][2]) if also else "")
     lines, refusal, chosen = verdict_lines_pd(ref, label=label, apply=apply, also=also)
     front: Dict[str, object] = {DIRECTION: untimed_table_pd(ref)}
+    if d_seats is not None:
+        # H92d: die Front misst free0 dieser Form an ihren ersten zwei Wakes
+        # P->D und schreibt es ins Sidecar -- der naechste Boot rechnet damit.
+        front[DIRECTION + "-free0"] = {
+            "form_key": boot, "d_seats": int(d_seats), "p_rows": [int(x) for x in p_rows],
+            "model": os.path.basename(os.path.normpath(str(model)))}
     if list(chosen) != list(ref.order):
         front[DIRECTION + "-order"] = {"given": list(ref.order), "timed": list(chosen)}
     return WakeCreditPlanPD(lines=(head,) + tuple(lines), refusal=refusal, front_plan=front)
@@ -1030,6 +1072,185 @@ def pd_reference_from_logs(p_text: str, d_text: str, front_text: str, *, source:
 
 
 # ---------------------------------------------------------------------------
+# H92d: free0 -- der Flip-Start aus der JUENGSTEN Messung derselben Form
+# ---------------------------------------------------------------------------
+#
+# WAS FEHLTE. ``planned_reference_pd`` nahm ``free`` beim Flip-Start aus der
+# Zeitreferenz (fnFL2x158/1, 24.09.) und schob nur die P-Zeilen. Beim Start
+# eines Wakes P->D liegt auf jeder Karte aber mehr als P's Puffer: der
+# SCHLAFENDE D-Mitbewohner (Kontext, Graph-Execs, Barlink-/BAR1-Fenster, alles
+# ausserhalb der pausierten Tags), P's Allokator-Rest und fremde Kontexte. Der
+# Mitbewohner ist gewachsen, ohne dass die Referenz es sah:
+#
+#   D-Schlafrest (WEG2-SLEEP-RESIDUE sleep=1 nvml_proc_used, TP0/TP1/TP2)
+#     x158 c01951e3e1 1696/768/766   x178 b89592806a 1698/768/766  (D 1 Sitz)
+#     h91v1 39fd662d9e 1944/872/874  bb1/bb2 e17bd548b5 1944/872/874
+#     bb3 50cd2884ac 1944/872/874                                  (D 6 Sitze)
+#   = +246/+104/+108 MiB, genau der Sprung von "other processes" in P's
+#     DC-BREAKDOWN am Flip-Start x178 -> bb2 (2416/1322/1314 -> 2662/1424/1422
+#     auf nvml1/0/2); der Rest (fremde Kontexte) ist 718/554/548 in beiden.
+#
+# Der Posten ist H91b: D laeuft 6 Sitze statt 1, der Verify-Graph wird fuer
+# bs 1..6 statt bs 1 eingefangen (``Capture target verify CUDA graph begin
+# ... bs=[1, 2, 3, 4, 5, 6]``), und die Graph-Execs liegen ausserhalb des
+# ``cuda_graph``-Tags (nvml_proc outside_torch der 3080er 768 -> 872). Dazu
+# P's Allokator-Rest am ersten Flip (PP2 torch_untagged 288 in x158/1, 628-630
+# in x178/h91v1/bb2), den die Zeitreferenz ebenso wenig kennt. Plan gegen
+# Metall am ersten P->D-Flip von bb2: nvml2 9013 gegen 8629, nvml0 7599 gegen
+# 7343 (zu optimistisch), nvml1 9777 gegen 10862 (zu pessimistisch).
+#
+# DIE REGEL (wie H94 RECORD > BUILTIN > UNMEASURED, Schluessel wie H87): free0
+# ist eine MESSUNG und spricht nur fuer die Form, auf der sie genommen wurde --
+# die Form der Zeitreferenz (FORM_KEYS, Modell nach Speicher-Fussabdruck) UND
+# die D-Sitzzahl, weil der Mitbewohner mit ihr waechst. Je Flip-Position
+# (``/0`` erster Wake P->D, ``/1`` zweiter) gilt die JUENGSTE Messung dieser
+# Form: ein Sidecar-Eintrag (``RECORD``, geschrieben von
+# ``weg2.tools.pd_free0_record`` aus den Logs eines Boots) oder ein
+# eingebauter (``BUILTIN``, ``wake_credit_pd_refs.FREE0_RECORDS``); bei
+# gleichem Zeitpunkt der Sidecar. Keine Messung -> die Zeitreferenz, BENANNT
+# als ungemessen fuer diese Sitzzahl. Keine Reserve, kein Schalter: eine
+# neue Messung derselben Form ersetzt die alte, und ein Commit, der den
+# Mitbewohner bewegt, ist mit dem naechsten Boot gemessen.
+
+#: Eintragsart im Sidecar ``weg2_measured_record.json``. Die anderen Leser
+#: des Sidecars filtern nach ``rss_shmem_gib``/``flip_ratchet_gib`` bzw.
+#: ``group == "FLIP"`` und sehen diese Eintraege nicht.
+FREE0_KIND = "pd_free0"
+FREE0_GROUP = "PD_FREE0"
+FREE0_RECORD = "RECORD"
+FREE0_BUILTIN = "BUILTIN"
+FREE0_UNMEASURED = "UNGEMESSEN"
+
+_RX_VERIFY_BS = re.compile(
+    r"TP0\] Capture target verify CUDA graph begin\..*? bs=\[([\d, ]+)\]")
+
+
+def pd_free0_from_logs(p_text: str, d_text: str, front_text: str, *, source: str,
+                       flip: int) -> Dict[str, object]:
+    """Der Flip-Start des ``flip``-ten Wakes P->D (0 = der erste) eines Boots:
+    ``driver_free`` der Front-Zeile ``WEG2-FLIP-ORDER ... src=P`` je NVML-Karte,
+    P's Pufferzeilen (``MoE expert-offload active ... buffer=``) und die
+    D-Sitze (hoechstes bs des Verify-Graphen, den H91b auf 1..Sitze legt).
+    Fehlt eine Zeile: ``ValueError`` -- nie ein halber Eintrag."""
+    orders = list(_RX_ORDER.finditer(front_text))
+    if len(orders) <= int(flip):
+        raise ValueError("%s: nur %d WEG2-FLIP-ORDER src=P-Zeilen, Flip %d fehlt"
+                         % (source, len(orders), flip))
+    m = orders[int(flip)]
+    rows: Dict[int, int] = {}
+    for mm in _RX_ROWS.finditer(p_text):
+        if mm.group(1) == "PP":
+            rows.setdefault(int(mm.group(2)), int(mm.group(4)))
+    mv = _RX_VERIFY_BS.search(d_text)
+    if not rows or sorted(rows) != list(range(len(rows))) or mv is None:
+        raise ValueError("%s: P-Zeilen %s oder D-Verify-Graph %s fehlen"
+                         % (source, sorted(rows), "da" if mv else "fehlt"))
+    return {
+        "kind": FREE0_KIND, "group": FREE0_GROUP, "source": source, "flip": int(flip),
+        "at": m.group(1),
+        "free": {int(k): float(v) for k, v in ast.literal_eval(m.group(3)).items()},
+        "p_rows": [rows[s] for s in range(len(rows))],
+        "d_seats": max(int(x) for x in mv.group(1).split(",")),
+    }
+
+
+#: Die ersten zwei Wakes P->D eines Boots sind die Positionen, die der Planer
+#: rechnet (``/0`` Vergleichsflip, ``/1`` Hauptrechnung); spaetere schreiben
+#: keinen Record.
+FREE0_FLIPS = 2
+
+
+def free0_record_from_flip(meta: Mapping[str, object], free_mib: Mapping[int, float], *,
+                           flip: int, tag: str, commit: Optional[str],
+                           at: str) -> Dict[str, object]:
+    """Der Record, den die Front am Flip-Start des ``flip``-ten Wakes P->D
+    schreibt: ``driver_free`` DERSELBEN Probe wie ``WEG2-FLIP-ORDER`` und die
+    Form, die der Planer dieses Boots gerechnet hat (``meta`` =
+    ``front_plan["P->D-free0"]``: FORM_KEYS-Name, D-Sitze, P-Zeilen, Modell).
+    Dieselbe Gestalt wie :func:`pd_free0_from_logs` plus Form -- ein Leser."""
+    return {
+        "kind": FREE0_KIND, "group": FREE0_GROUP,
+        "source": "%s/%d" % (tag, int(flip)), "flip": int(flip), "at": str(at),
+        "free": {int(k): float(v) for k, v in dict(free_mib).items()},
+        "p_rows": [int(x) for x in meta["p_rows"]],  # type: ignore[union-attr]
+        "d_seats": int(meta["d_seats"]),  # type: ignore[call-overload]
+        "form_key": str(meta["form_key"]), "model": meta.get("model"),
+        "commit": commit, "boot_tag": tag,
+    }
+
+
+def read_free0_records(path: Optional[str]) -> List[Dict[str, object]]:
+    """Die ``pd_free0``-Eintraege des Sidecars; ein fehlendes oder kaputtes
+    Sidecar ist eine ABWESENHEIT (``[]``), nie eine Null."""
+    if not path:
+        return []
+    import json
+
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    entries = data.get("samples") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries if isinstance(e, dict) and e.get("kind") == FREE0_KIND]
+
+
+def _free0_model_ok(model: Optional[str], entry_model: object, form_model: object) -> bool:
+    """H87: ein Eintrag gilt fuer das Modell der Form, wenn er auf ihm oder auf
+    einem Checkpoint mit demselben Speicher-Fussabdruck gemessen wurde."""
+    if entry_model is None or str(entry_model) == str(form_model):
+        return True
+    if not model:
+        return False
+    import os
+
+    from sglang.srt.weg2 import form as _form
+
+    sibling = os.path.join(os.path.dirname(str(model).rstrip("/")), str(entry_model))
+    return bool(_form.reference_model_verdict(sibling, str(form_model))[0])
+
+
+def resolve_free0(form_key: str, d_seats: Optional[int], flip: int, *,
+                  builtin: Sequence[Mapping[str, object]],
+                  records: Sequence[Mapping[str, object]] = (),
+                  model: Optional[str] = None,
+                  form_model: object = None) -> Tuple[Optional[Mapping[str, object]], str, str]:
+    """``(eintrag, herkunft, zeile)``: die juengste Messung von free0 fuer die
+    Form ``form_key`` (FORM_KEYS-Name der Zeitreferenz), die D-Sitze ``d_seats``
+    und die Flip-Position ``flip``. ``eintrag`` None = keine Messung dieser
+    Form, die Zeile sagt es. ``d_seats`` None: der Aufrufer nennt keine Sitze
+    (handgebaute Form) -- dann rechnet der Riegel wie vor H92d."""
+    if d_seats is None:
+        return None, FREE0_UNMEASURED, "D-Sitze nicht genannt, free0 der Zeitreferenz"
+    cands: List[Tuple[str, int, Mapping[str, object], str]] = []
+    for tier, rank, pool in ((FREE0_RECORD, 1, records), (FREE0_BUILTIN, 0, builtin)):
+        for e in pool:
+            if (e.get("kind", FREE0_KIND) != FREE0_KIND
+                    or str(e.get("form_key")) != str(form_key)
+                    or int(e.get("d_seats", -1)) != int(d_seats)  # type: ignore[call-overload]
+                    or int(e.get("flip", -1)) != int(flip)):  # type: ignore[call-overload]
+                continue
+            if tier == FREE0_RECORD and not _free0_model_ok(model, e.get("model"), form_model):
+                continue
+            cands.append((str(e.get("at", "")), rank, e, tier))
+    if not cands:
+        return None, FREE0_UNMEASURED, (
+            "free0 /%d UNGEMESSEN fuer Form %s mit %d D-Sitz(en): keine Messung dieser Form -- "
+            "free der Zeitreferenz (ihr schlafender D-Mitbewohner ist der IHRER Sitzzahl); "
+            "schliessen: python -m sglang.srt.weg2.tools.pd_free0_record <front.log> --append"
+            % (flip, form_key, int(d_seats)))
+    at, _rank, e, tier = max(cands, key=lambda x: (x[0], x[1]))
+    return e, tier, (
+        "free0 /%d %s %s (%s%s, D-Sitze %d): free %s bei P-Zeilen %s"
+        % (flip, tier, e.get("source"), at,
+           (", " + str(e.get("commit"))) if e.get("commit") else "", int(d_seats),
+           {int(k): float(v) for k, v in dict(e["free"]).items()},  # type: ignore[call-overload]
+           list(e["p_rows"])))  # type: ignore[call-overload]
+
+
+# ---------------------------------------------------------------------------
 # Planer: die geplante Residenz als Delta auf die gemessene Referenz
 # ---------------------------------------------------------------------------
 
@@ -1057,14 +1278,20 @@ def shared_rows(p_resident: Sequence[int], d_resident: Sequence[int]) -> List[Li
 def planned_reference_pd(ref: PDReference, *, p_rows: Sequence[int], d_rows: Sequence[int],
                          slot_mib: float, p_split: Sequence[int], chunk_layers: int,
                          n_layers: int, p_resident: Optional[Sequence[int]] = None,
-                         d_resident: Optional[Sequence[int]] = None) -> PDReference:
+                         d_resident: Optional[Sequence[int]] = None,
+                         free0: Optional[Mapping[str, object]] = None) -> PDReference:
     """Die Referenz der GEPLANTEN Form, Delta = Pufferregel (H8), wie H14:
 
     * P-Tag (Stufe s, Tag t) += (Zeilen_plan - Zeilen_ref) x Layer von t auf s x slot;
       die Pause skaliert mit den Bytes
     * frei beim Flip-Start (Karte von Stufe s) -= (Zeilen_plan - Zeilen_ref) x
       Layer der Stufe x slot (P haelt beim Flip-Start ihren ganzen Puffer; D
-      schlaeft, seine Gewichte sind ungemappt)
+      schlaeft, seine Gewichte sind ungemappt). H92d: mit ``free0`` (ein
+      gemessener Flip-Start derselben Form, :func:`resolve_free0`) ist die Basis
+      dieses Deltas DIESE Messung -- ihr ``free`` und ihre ``p_rows`` -- statt
+      der Zeitreferenz: der schlafende D-Mitbewohner, P's Allokator-Rest und
+      der Kontext fremder Prozesse sind darin so, wie die juengste Messung sie
+      sah; Lanes, Freigaben und Bedarf bleiben die der Zeitreferenz.
     * D-Tag (Rang r, Chunk-Tag t) += (Zeilen_plan - Zeilen_ref) x chunk_layers x slot
     * Lane (s -> r, t): der Experten-Anteil folgt ``shared_rows`` (Zeilen x
       Layer von t auf s x slot), der Rest (Nicht-Experten) bleibt; Dauer,
@@ -1073,7 +1300,12 @@ def planned_reference_pd(ref: PDReference, *, p_rows: Sequence[int], d_rows: Seq
     """
     n_tags = int(math.ceil(int(n_layers) / int(chunk_layers))) if chunk_layers else 0
     layers = tag_layers_by_stage(p_split, chunk_layers, n_tags)
-    free = dict(ref.free)
+    if free0 is not None:
+        free = {int(k): float(v) for k, v in dict(free0["free"]).items()}  # type: ignore[call-overload]
+        free_rows = tuple(int(x) for x in free0["p_rows"])  # type: ignore[union-attr]
+    else:
+        free = dict(ref.free)
+        free_rows = tuple(int(x) for x in ref.p_rows)
     rel_out, pz_out, dem_out = [], [], []
     for s, card in enumerate(ref.p_card):
         dp = int(p_rows[s]) - int(ref.p_rows[s])
@@ -1086,7 +1318,8 @@ def planned_reference_pd(ref: PDReference, *, p_rows: Sequence[int], d_rows: Seq
                 pz[t] = float(ref.p_pause_ms[s][t]) * (nv / float(v) if v else 1.0)
         rel_out.append(rel)
         pz_out.append(pz)
-        free[card] = float(free[card]) - dp * int(p_split[s]) * float(slot_mib)
+        dfree = int(p_rows[s]) - free_rows[s]
+        free[card] = float(free[card]) - dfree * int(p_split[s]) * float(slot_mib)
     for r in range(len(ref.d_floor)):
         dd = int(d_rows[r]) - int(ref.d_rows[r])
         dem = {}
