@@ -15,6 +15,7 @@ Entry points (all no-ops off group D / with nothing parked):
   note_retracted -- a decode-pressure retraction is a PRESSURE park
   admission      -- D's admission verdict for one pass
   park_abort     -- an abort reaches the parked list
+  note_wake_seats -- H95: the wake of D fixes the phase's seat count n
 
 H91d: the parked request's MTP draft rows ride along (``d_park_draft``):
 saved before the flip park's retraction, dropped with an abort.
@@ -22,6 +23,7 @@ saved before the flip park's retraction, dropped with an abort.
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 from sglang.srt.weg2 import d_park_draft, d_seats
@@ -244,3 +246,28 @@ def park_abort(sched, recv_req) -> int:
     logger.info("WEG2-D-PARK abort: %d parked request(s) dropped (rid=%s abort_all=%s)",
                 len(gone), rid[:12], abort_all)
     return len(gone)
+
+
+def note_wake_seats(sched, recv_req):
+    """H95 (H91 Teil B, Stufe 2): the kv_cache resume that wakes D carries the
+    front's ``handoff_n``/``parked_n``; the phase's seat count n is
+    ``d_seats.phase_seats`` of those two integers and of the boot's
+    --max-running-requests (the --d-bs cap) -- the same request object on
+    every rank, so every rank holds the same n without a collective.
+
+    Kept on ``sched.weg2_d_phase_seats`` for the phase (the per-seat posts
+    that a later per-flip re-partition would size by it) and named once per
+    wake (``WEG2 D-PHASE-SEATS (H95)``). None and untouched state off group
+    D or on a wake without the count."""
+    if str(os.environ.get(d_seats.GROUP_ENV, "")).strip().upper() != "D":
+        return None
+    handoff_n = getattr(recv_req, "handoff_n", None)
+    parked_n = getattr(recv_req, "parked_n", None)
+    cap = int(getattr(getattr(sched, "server_args", None), "max_running_requests", 0) or 1)
+    seats = d_seats.phase_seats(handoff_n, parked_n, cap=cap,
+                                epoch=getattr(recv_req, "epoch", None))
+    if seats is None:
+        return None
+    sched.weg2_d_phase_seats = seats
+    logger.info("%s", seats.line())
+    return seats

@@ -1508,13 +1508,15 @@ def describe_spec_rebook(
 
 
 # ---------------------------------------------------------------------------
-# 7. (H91b) die Sitze der D-Gruppe: bs1 -> bs2 (Stufe 1), spaeter 1..6
+# 7. (H91b, H95) die Sitze der D-Gruppe: n = 1..--d-bs je Flip (handoff_n)
 # ---------------------------------------------------------------------------
 
 
 class SeatRebook(msgspec.Struct, frozen=True, kw_only=True):
     """H91b: die sitz-proportionalen Posten einer Referenz, umgebucht auf die
     Sitzzahl des Boots -- GERECHNET aus den gemessenen Posten, nicht gemessen.
+    H95: dieselbe Umbuchung fuer jedes n = 1..--d-bs (:func:`seat_table`);
+    bs2 ist nur n = 2.
 
     ``mamba``: die Runtime baut ``ceil(Sitze x ratio x 1.25)`` Zustands-Slots
     (``_auto_mamba_demand_size``), der Slot kostet ``mamba_ref / slots_ref``.
@@ -1732,6 +1734,157 @@ def pool_step_rows_check(
         )
     )
     return (line,), refusal
+
+
+def seat_scratch_for(
+    *, seats: int, verify_tokens: int, top_k: int, local_experts: int,
+    max_rows: int, waves: int, staging_rows: int = POOL_STAGING_DEFAULT,
+) -> Optional[Tuple[int, int]]:
+    """H95: the SMALLEST scratch (LRU + staging) that makes the captured step
+    of ``seats`` exact on a rank holding ``max_rows`` rows, and the residents
+    it leaves: ``(scratch, R)`` with ``R = max_rows - scratch`` and
+    ``min(ids, E - R) <= waves x scratch``; ``None`` when no split of the rows
+    does it. Without waves (``waves = 1``) that is ``scratch = ids`` as long
+    as ``ids <= E - R`` -- the H91b form (bs2 on a worker: 80) -- and nothing
+    once ``ids`` reaches the rows (``E - R <= scratch`` means ``R + scratch >=
+    E``, full residency; the workers hold fewer rows than E)."""
+    E = int(local_experts)
+    rows = min(int(max_rows), E)
+    ids = int(seats) * int(verify_tokens) * int(top_k)
+    w = max(1, int(waves))
+    lo = max(2, int(staging_rows) + 1)
+    for scratch in range(lo, rows):
+        R = rows - scratch
+        if R < 1:
+            break
+        if min(ids, E - R) <= w * scratch:
+            return scratch, R
+    return None
+
+
+class SeatTableRow(msgspec.Struct, frozen=True, kw_only=True):
+    """H95: one seat count of :func:`seat_table` -- what D pays and what the
+    experts keep when ``seats`` requests decode together. GERECHNET."""
+
+    seats: int
+    ids_per_step: int
+    waves: int
+    #: 'mamba state pool' slots (``d_seats.mamba_slots_for_seats``).
+    mamba_slots: int
+    #: seat posts on the attention host (Form A TP0): mamba + spec, MiB.
+    host_mamba_mib: float
+    host_spec_mib: float
+    #: rows each rank can hold: min(budget ceiling, card ceiling).
+    max_rows: Tuple[int, ...]
+    #: the given scratch per rank, the waves it needs and the fraction it
+    #: leaves at ``max_rows`` (None: the given scratch cannot make the step
+    #: exact at this seat count).
+    scratch_given: Tuple[int, ...]
+    waves_given: Tuple[int, ...]
+    fraction_given: Tuple[Optional[float], ...]
+    #: the smallest exact scratch per rank and the fraction it leaves.
+    scratch_min: Tuple[Optional[int], ...]
+    fraction_max: Tuple[Optional[float], ...]
+    #: the plan's own refusal at the GIVEN fractions/scratch (budget/card/step).
+    refusal: Optional[str]
+
+
+def _fraction_of(E: int, R: Optional[int]) -> Optional[float]:
+    if R is None or R < 1:
+        return None
+    f = math.floor(int(R) * 1000 / int(E)) / 1000.0
+    while f > 0.0 and resident_rows(E, f) > R:
+        f = round(f - 0.001, 3)
+    return f if f > 0.0 else None
+
+
+def seat_table_row(
+    plan: "DResidencyPlan", *, seats: int, verify_tokens: int, top_k: int,
+    waves: int, host_rank: int = 0,
+) -> SeatTableRow:
+    """H95: the table row of one seat count from the D-FRACTION-SOLVE of that
+    seat count (``plan_d_residency(seats=n)``, which re-books the seat posts
+    with :func:`seat_rebook`) -- no second pricing."""
+    from sglang.srt.weg2.d_seats import mamba_slots_for_seats
+
+    fits = list(plan.fits)
+    cards = {c.rank: c for c in (plan.card_fits or ())}
+    ids = int(seats) * int(verify_tokens) * int(top_k)
+    max_rows, s_given, w_given, f_given, s_min, f_max = [], [], [], [], [], []
+    for f in fits:
+        rows = int(f.ceiling_max_rows)
+        c = cards.get(f.rank)
+        if c is not None:
+            rows = min(rows, int(c.ceiling_max_rows))
+        rows = min(rows, int(f.local_experts))
+        max_rows.append(rows)
+        E = int(f.local_experts)
+        S = int(f.scratch_rows)
+        R = rows - S
+        need = min(ids, max(E - R, 0))
+        w_need = pool_step_waves_needed(need_rows=need, scratch_rows=S)
+        s_given.append(S)
+        w_given.append(w_need)
+        f_given.append(_fraction_of(E, R) if (R >= 1 and w_need <= max(1, int(waves))) else None)
+        best = seat_scratch_for(
+            seats=seats, verify_tokens=verify_tokens, top_k=top_k, local_experts=E,
+            max_rows=rows, waves=waves, staging_rows=int(f.staging_rows))
+        s_min.append(None if best is None else best[0])
+        f_max.append(None if best is None else _fraction_of(E, best[1]))
+    host = next((f for f in fits if f.rank == host_rank), fits[0] if fits else None)
+    return SeatTableRow(
+        seats=int(seats), ids_per_step=ids, waves=max(1, int(waves)),
+        mamba_slots=mamba_slots_for_seats(int(seats)),
+        host_mamba_mib=float(host.mamba_mib) if host is not None else 0.0,
+        host_spec_mib=float(host.spec_mib) if host is not None else 0.0,
+        max_rows=tuple(max_rows), scratch_given=tuple(s_given),
+        waves_given=tuple(w_given), fraction_given=tuple(f_given),
+        scratch_min=tuple(s_min), fraction_max=tuple(f_max), refusal=plan.refusal,
+    )
+
+
+def seat_table(
+    plan_for_seats, *, seats_max: int, verify_tokens: int, top_k: int, waves: int,
+    host_rank: int = 0,
+) -> Tuple[SeatTableRow, ...]:
+    """H95: n = 1..``seats_max`` -> :class:`SeatTableRow`. ``plan_for_seats(n)``
+    is the D-FRACTION-SOLVE at ``n`` seats (the launcher passes a closure
+    over its own ``plan_d_residency`` arguments)."""
+    return tuple(
+        seat_table_row(
+            plan_for_seats(n), seats=n, verify_tokens=verify_tokens, top_k=top_k,
+            waves=waves, host_rank=host_rank)
+        for n in range(1, max(1, int(seats_max)) + 1)
+    )
+
+
+def describe_seat_table(rows: Sequence[SeatTableRow], *, marker: str, label: str) -> Tuple[str, ...]:
+    """One line per seat count, the numbers the dynamic D phase runs on."""
+
+    def _f(v):
+        return "-" if v is None else "%.3f" % v
+
+    def _i(v):
+        return "-" if v is None else "%d" % v
+
+    out = []
+    for r in rows:
+        out.append(
+            "%s FRACTION-SOLVE %s D-SITZE (H95) n=%d: %d Ids/Schritt, Wellen-Deckel %d | "
+            "Zeilen je Rang (Budget+Karte) %s | Scratch gegeben %s -> Wellen %s, FR %s | "
+            "Scratch min %s -> FR max %s | GDN-Slots %d, Host-Posten Mamba %.1f + Spec %.1f "
+            "MiB | %s -- GERECHNET"
+            % (
+                marker, label, r.seats, r.ids_per_step, r.waves,
+                list(r.max_rows), list(r.scratch_given), list(r.waves_given),
+                [_f(x) for x in r.fraction_given], [_i(x) for x in r.scratch_min],
+                [_f(x) for x in r.fraction_max], r.mamba_slots, r.host_mamba_mib,
+                r.host_spec_mib,
+                "passt bei gegebener Form" if r.refusal is None
+                else "VERWEIGERT bei gegebener Form: " + r.refusal[:160],
+            )
+        )
+    return tuple(out)
 
 
 def _env_true(env: Mapping[str, str], name: str) -> bool:

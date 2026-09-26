@@ -1,7 +1,8 @@
 """H91 Teil B: the second D seat is PRICED before a boot -- the seat posts on
 the Form-A attention host (GDN/Mamba slots, MTP verify state), the per-step
 expert-pool rows on every rank, the plan width of the pool step -- and the
-Next-Flash launcher runs D with two seats by default."""
+Next-Flash launcher's D seat default. H95 (Stufe 2): that default is the
+UPPER BOUND 6 of a dynamic seat count per D phase; two seats are n = 2."""
 from __future__ import annotations
 
 import os
@@ -141,15 +142,15 @@ def test_the_step_bound_counts_only_what_can_miss():
     assert epd.step_row_demand(40, 512, 12) == 40
 
 
-# ---- the launcher: two seats are the Next-Flash default --------------------
+# ---- the launcher: the Next-Flash seat default (H95: the bound 6) ----------
 
-def test_nextflash_runs_d_with_two_seats_unless_told():
+def test_nextflash_runs_d_with_up_to_six_seats_unless_told():
     from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_D_BS_NEXTFLASH
     from sglang.srt.weg2 import launcher as L
 
-    assert DEFAULT_D_BS_NEXTFLASH == 2
+    assert DEFAULT_D_BS_NEXTFLASH == 6  # H95: dynamic 1..6, was H91b's fixed 2
     ns = types.SimpleNamespace(profile=L.PROFILE_NEXTFLASH, d_bs=DEFAULT_D_BS)
-    assert L.apply_profile_d_bs_default(ns, ["--profile", "nextflash"]) == 2
+    assert L.apply_profile_d_bs_default(ns, ["--profile", "nextflash"]) == 6
     ns = types.SimpleNamespace(profile=L.PROFILE_NEXTFLASH, d_bs=1)
     assert L.apply_profile_d_bs_default(ns, ["--profile", "nextflash", "--d-bs", "1"]) == 1
     ns = types.SimpleNamespace(profile=L.PROFILE_QWEN27B, d_bs=DEFAULT_D_BS)

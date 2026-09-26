@@ -5362,6 +5362,13 @@ class Scheduler(
 
         return d_park_runtime.park_abort(self, recv_req)
 
+    def weg2_d_note_wake_seats(self, recv_req):
+        """H95: the wake of D fixes the phase's seat count from the front's
+        replicated handoff_n/parked_n (d_park_runtime.note_wake_seats)."""
+        from sglang.srt.weg2 import d_park_runtime
+
+        return d_park_runtime.note_wake_seats(self, recv_req)
+
     # H91d: a parked request's MTP draft rows (weg2/d_park_draft.py).
     def _weg2_d_park_draft_snapshot(self, batch):
         from sglang.srt.weg2 import d_park_draft

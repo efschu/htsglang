@@ -4193,9 +4193,9 @@ class MoEExpertOffloadCache:
                 f"pool mode requires buffer_size == R+C ({rows} != {R}+{C})"
             )
         staging = int(os.environ.get("SGLANG_MOE_POOL_STAGING", "12") or 12)
-        # H91b: the plan width follows the widest captured step (bs2 MTP
-        # verify: 2 x 4 x top-10 = 80 ids > the historic 64); a bs1 form keeps
-        # exactly PLAN_WIDTH.
+        # H91b/H95: the plan width follows the widest captured step (n seats
+        # x 4 MTP verify rows x top-10, n = 1..--d-bs: 80 ids at bs2, 240 at
+        # bs6 -> 256 lanes); a bs1 form keeps exactly PLAN_WIDTH.
         width = plan_width_for(self._pool_max_step_ids())
         staging = max(1, min(staging, C - 1, width))
         attrs = [a for a in self._pinned if a in self._resident]

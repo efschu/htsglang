@@ -9130,9 +9130,15 @@ class SchedulerWeightUpdaterManager:
             _n = time.perf_counter()
             _weg2_ph_l.append((name, (_n - _weg2_ph_t[0]) * 1000))
             _weg2_ph_t[0] = _n
-        
+
         if replay is not None:
             return replay
+        # H95: the P->D wake's kv_cache resume carries handoff_n/parked_n
+        # (front rule 2); D's phase seat count follows from it on every rank.
+        if getattr(recv_req, "handoff_n", None) is not None:
+            _note_seats = getattr(getattr(self, "scheduler", None), "weg2_d_note_wake_seats", None)
+            if callable(_note_seats):
+                _note_seats(recv_req)
         # C16/C17: this rank's own per-tag report of THIS leg, filled by the
         # weights block below and reduced over the group at the fence.
         weg2_per_tag: Dict[str, List[float]] = {}

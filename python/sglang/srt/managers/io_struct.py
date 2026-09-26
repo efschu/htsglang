@@ -2038,6 +2038,14 @@ class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
     # (weg2_memory_saver.credit_epoch), not the bare flip index -- the counter
     # file outlives the boot, so two boots' flip 7 used to compare equal.
     epoch: Optional[str] = None
+    # H91 part C rule 2 / H95: on the kv_cache resume of a P->D flip the front
+    # carries how many requests the ending P phase handed to D (``handoff_n``)
+    # and how many wait-bound-parked ones D resumes first (``parked_n``,
+    # weg2/front.py _wake_handoff_fields). Every rank receives this same
+    # object, so D's phase seat count is a replicated number
+    # (weg2/d_seats.phase_seats). None on every other resume.
+    handoff_n: Optional[int] = None
+    parked_n: Optional[int] = None
 
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
