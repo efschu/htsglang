@@ -7890,32 +7890,61 @@ def _proc_start_ticks(pid: int) -> int:
         return 0
 
 
-def register_helper(tag: str, name: str, pid: int, log: Optional[Log] = None) -> str:
+def register_helper(tag: str, name: str, pid: int, log: Optional[Log] = None, suffix: str = "pid") -> str:
     """Write the registry entry for helper ``name`` (a session leader, pgid ==
     pid). Never raises: a registry that cannot be written costs the arm its
-    group stop for this helper, not the boot -- and the line says so."""
-    path = f"{helper_registry_dir(tag)}/{name}.pid"
+    group stop for this helper, not the boot -- and the line says so.
+    ``suffix`` "grp" writes a BOOT GROUP entry instead (H135b, see
+    :func:`register_boot_group`); the line is identical."""
+    path = f"{helper_registry_dir(tag)}/{name}.{suffix}"
     owner = os.getppid()
     line = f"{pid} {_proc_start_ticks(pid)} {owner} {_proc_start_ticks(owner)} {name}\n"
+    kind = "HELPER" if suffix == "pid" else "BOOT-GROUP"
     try:
         os.makedirs(helper_registry_dir(tag), exist_ok=True)
-        tmp = f"{helper_registry_dir(tag)}/.{name}.tmp"
+        tmp = f"{helper_registry_dir(tag)}/.{name}.{suffix}.tmp"
         with open(tmp, "w") as f:
             f.write(line)
         os.replace(tmp, path)
-        msg = f"WEG2-HELPER registered {name} pgid={pid} owner={owner} -> {path}"
+        msg = f"WEG2-{kind} registered {name} pgid={pid} owner={owner} -> {path}"
     except OSError as e:
-        msg = f"WEG2-HELPER NOT registered {name} pgid={pid}: {e} (the arm cannot stop it by group)"
+        msg = f"WEG2-{kind} NOT registered {name} pgid={pid}: {e} (the arm cannot stop it by group)"
     if log is not None:
         log(msg)
     return msg
 
 
-def unregister_helper(tag: str, name: str) -> None:
+def unregister_helper(tag: str, name: str, suffix: str = "pid") -> None:
     try:
-        os.unlink(f"{helper_registry_dir(tag)}/{name}.pid")
+        os.unlink(f"{helper_registry_dir(tag)}/{name}.{suffix}")
     except OSError:
         pass
+
+
+# --------------------------------------------------------------------------
+# H135b: the BOOT GROUPS in the same registry -- no headless boot
+# --------------------------------------------------------------------------
+#
+# P, D and the front are session leaders (start_new_session, pgid == pid) and
+# this launcher RETURNS after LAUNCHED, so nothing but the arm's teardown ever
+# ended them. An arm killed by SIGKILL, the OOM killer or `timeout -k` runs no
+# teardown: the boot went on headless, holding the cards past the gpuq window.
+# PR_SET_PDEATHSIG is no answer -- the parent of the groups is THIS process,
+# which exits by design after LAUNCHED, so it would kill every healthy boot.
+# The arm's owner guard (boot_helpers.sh, setsid + `tail --pid`) already
+# outlives the arm; it needs the boot's groups by identity. Each group is
+# written as ``{name}.grp`` -- the SAME line as a helper's ``.pid`` entry
+# (PGID START OWNER OWNER_START NAME, OWNER = the arm, this launcher's parent),
+# but its own suffix, so the helper paths (bh_stop_all, bh_sweep_stale) never
+# touch a serving group. The guard acts on them only when its owner armed the
+# boot (``boot.arm``) and died without a teardown: ``--teardown`` first, then
+# TERM/KILL per group. ``--teardown`` removes the entries.
+
+BOOT_GROUP_NAMES = ("launcher", "P", "D", "front")
+
+
+def register_boot_group(tag: str, name: str, pid: int, log: Optional[Log] = None) -> str:
+    return register_helper(tag, name, pid, log, suffix="grp")
 
 
 def _stop_helper_pid(pid: int, expect: str = "boot_deadman") -> str:
@@ -16049,6 +16078,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         state.pids["D"] = spec_d.pid
         _write_state(state)
+        register_boot_group(ns.tag, "D", spec_d.pid, log)  # H135b
         state.t_ready["D"] = wait_ready(PORT_D, spec_d.pid, ns.ready_deadline_s, log, "D", spec_d.proc)
         log(f"WEG2-LAUNCH D-ONLY READY group=D port={PORT_D} after {state.t_ready['D']:.1f} s -- no P, no flip, "
             f"no front; D prefills every uncached length itself (W50 = {max_kv_per_request})")
@@ -16093,6 +16123,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     state.pids["P"] = spec_p.pid
     _write_state(state)
+    register_boot_group(ns.tag, "P", spec_p.pid, log)  # H135b
     state.t_ready["P"] = wait_ready(PORT_P, spec_p.pid, ns.ready_deadline_s, log, "P", spec_p.proc)
     # #1386 FOLLOW-UP 2 (xsn31/7 Versuch 2 wall): both markers this gate greps
     # for are printed by managers/cache_controller.py's HiCacheController
@@ -16203,6 +16234,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
     _write_state(state)
+    register_boot_group(ns.tag, "D", spec_d.pid, log)  # H135b
     state.t_ready["D"] = wait_ready(PORT_D, spec_d.pid, ns.ready_deadline_s, log, "D", spec_d.proc)
     # #1386 FOLLOW-UP 2: the mirror of group P's same skip above -- D's
     # cache_controller never builds under `hicache_disabled` either (D is a
@@ -16521,6 +16553,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ffh = open(front_log, "ab")
     fp = subprocess.Popen(front_argv, env=fenv, stdout=ffh, stderr=subprocess.STDOUT, cwd=tree, start_new_session=True)
     state.pids["front"] = fp.pid
+    # H135b: the front into the state json AND the registry at once -- until the
+    # LAUNCHED write below (behind wait_ready and the deadmen) a guard-run
+    # `--teardown` would not know the front by pid.
+    _write_state(state)
+    register_boot_group(ns.tag, "front", fp.pid, log)
     # PUBLISH THE LOG BEFORE WAITING, NOT AFTER.  This used to sit after the
     # LAUNCHED line, i.e. behind `wait_ready` below -- so a boot that never
     # reached a ready front never updated the symlink, and every reader
@@ -16849,6 +16886,11 @@ def teardown(path: str, report: dict | None = None) -> int:
         except OSError:
             pass
     print(f"KILL leftovers {left}")
+    # H135b: the groups are gone -- their registry entries go with them, so the
+    # arm's owner guard finds nothing left to stop after this teardown.
+    if st.get("tag"):
+        for name in BOOT_GROUP_NAMES:
+            unregister_helper(st["tag"], name, suffix="grp")
     time.sleep(3)
     # #1236: the store is a DIRECTORY ON DISK, so teardown removes it instead
     # of unmounting a tmpfs. The umount pair is deleted, not kept behind a
