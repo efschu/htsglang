@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 import psutil
 import torch
 
+from sglang.srt.mem_cache.hicache_drain_budget import coalesce_host_releases
 from sglang.srt.mem_cache.hicache_phase_guard import device_tier_disarmed
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
@@ -3109,7 +3110,15 @@ class HiCacheController:
                     )
                 owner.free(host_indices)
                 return
-        pages = host_indices.split(self.mem_pool_host.page_size)
+        if coalesce_host_releases() and host_indices.numel() % max(
+            1, int(self.mem_pool_host.page_size or 1)
+        ) == 0:
+            # SGLANG_HICACHE_DRAIN_BUDGET (27B, 24.09.): one entry per release
+            # (provenance keyed by its first slot); the budgeted drain cuts it
+            # on page boundaries. See hicache_drain_budget.
+            pages = (host_indices,)
+        else:
+            pages = host_indices.split(self.mem_pool_host.page_size)
         for page in pages:
             # #989: record who queued this page, keyed by its first slot. The
             # map is authoritative only until the page is drained; the drain

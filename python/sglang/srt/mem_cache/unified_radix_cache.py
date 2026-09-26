@@ -65,6 +65,11 @@ from sglang.srt.mem_cache.hicache_collective import (
     bounded_wait,
     collective_rank_desc,
 )
+from sglang.srt.mem_cache.hicache_drain_budget import (
+    ReleaseBudget,
+    drain_ack_budget,
+    drain_budget_tokens,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -591,6 +596,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     #: pool (`bind_req_pool_owner`). None on every boot that never flips, which
     #: is why the property below falls back to the constructor's pool.
     _req_pool_owner = None
+    #: SGLANG_HICACHE_ROUND_TIMING: the drain's part times of the CURRENT
+    #: `check_hicache_events` round (a dict while the instrument is on and the
+    #: round's drain runs, else None -- the drain records nothing then).
+    _hc_parts = None
 
     @property
     def req_to_token_pool(self):
@@ -6595,8 +6604,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         n_release: Optional[int],
         extra_release_counts: Optional[dict[PoolName, int]],
         log_metrics: bool,
+        budget: Optional[ReleaseBudget] = None,
     ) -> None:
+        """``budget`` (SGLANG_HICACHE_DRAIN_BUDGET, steady-state drain only):
+        at most that many rows / entries per release queue this pass, the
+        rest stays queued (see hicache_drain_budget). None = drain the agreed
+        counts whole, the unchanged path."""
         cc = self.cache_controller
+        # SGLANG_HICACHE_ROUND_TIMING: part times of this round (None = off).
+        _parts = getattr(self, "_hc_parts", None)
 
         def _drain_queue(q: Queue[T], limit: Optional[int]) -> Iterator[T]:
             drained = 0
@@ -6672,6 +6688,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 entry = self.ongoing_backup.pop(operation.id, None)
                 if entry is not None:
                     node, lock_params = entry
+                    if _parts is not None:
+                        _tn0 = time.perf_counter()
                     # #1317 C2 WRITER 1 of 2: the L3 write acked, so the pages
                     # behind this node's rows are re-readable and the windowed
                     # store read may recycle those rows. Set on the ack and
@@ -6679,10 +6697,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # would license a free that loses the KV.
                     node.l3_present = True
                     self.dec_host_lock_ref(node, lock_params)
+                    if _parts is not None:
+                        _tn1 = time.perf_counter()
                     if self._weg2_rebind_host_to_arena(node):
                         pass  # #1424: the rows now ARE the arena slots
                     elif getattr(node, "_weg2_chain_piece", False) or self._weg2_host_is_transit():
                         self._weg2_release_chain_piece_host(node)
+                    if _parts is not None:
+                        _tn2 = time.perf_counter()
+                        _parts["lock"] = _parts.get("lock", 0.0) + (_tn1 - _tn0)
+                        _parts["rebind"] = _parts.get("rebind", 0.0) + (_tn2 - _tn1)
                 # #810: the storage write acked -- this is the drain the
                 # staging ring measures its residency against. Outside the
                 # `entry is not None` arm on purpose: the charge is keyed by
@@ -6700,11 +6724,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return drained
 
         def _drain_release():
-            host_indices_list = []
-            released_tokens = 0
-            for host_indices in _drain_queue(cc.host_mem_release_queue, n_release):
-                host_indices_list.append(host_indices)
-                released_tokens += len(host_indices)
+            if budget is None:
+                host_indices_list = []
+                released_tokens = 0
+                for host_indices in _drain_queue(cc.host_mem_release_queue, n_release):
+                    host_indices_list.append(host_indices)
+                    released_tokens += len(host_indices)
+            else:
+                host_indices_list, released_tokens = budget.take(
+                    cc.host_mem_release_queue,
+                    n_release,
+                    getattr(cc.mem_pool_host, "page_size", 1),
+                )
             if host_indices_list:
                 # #989 OWNERSHIP AT THE GIVE-BACK: FREE ONLY WHAT IS OWNED.
                 #
@@ -6781,11 +6812,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 release_queue = cc.extra_host_mem_release_queues.get(pool_name)
                 if release_queue is None:
                     continue
-                host_indices_list = []
-                released_tokens = 0
-                for host_indices in _drain_queue(release_queue, limit):
-                    host_indices_list.append(host_indices)
-                    released_tokens += len(host_indices)
+                if budget is None:
+                    host_indices_list = []
+                    released_tokens = 0
+                    for host_indices in _drain_queue(release_queue, limit):
+                        host_indices_list.append(host_indices)
+                        released_tokens += len(host_indices)
+                else:
+                    _owner = cc.entry_for_extra_release(pool_name)
+                    host_indices_list, released_tokens = budget.take(
+                        release_queue,
+                        limit,
+                        getattr(getattr(_owner, "host_pool", None), "page_size", 1),
+                    )
                 if host_indices_list:
                     # #718/#847: resolve through the queue's OWNING entry, not
                     # only through the currently bound tier. A phase rebind onto
@@ -6814,10 +6853,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
-        _drain_revoke()
-        _drain_backup()
-        _drain_release()
-        _drain_extra_release()
+        if _parts is None:
+            _drain_revoke()
+            _drain_backup()
+            _drain_release()
+            _drain_extra_release()
+            return
+        # SGLANG_HICACHE_ROUND_TIMING: the same four drains, each timed, with
+        # what it drained -- the round's spike is then named by its part.
+        _pc = time.perf_counter
+        _t0 = _pc()
+        _nrev = _drain_revoke()
+        _t1 = _pc()
+        _nack = _drain_backup()
+        _t2 = _pc()
+        _rel_entries, _rel_rows = _drain_release()
+        _t3 = _pc()
+        _extra = _drain_extra_release()
+        _t4 = _pc()
+        _parts["revoke"] = _parts.get("revoke", 0.0) + (_t1 - _t0)
+        _parts["backup"] = _parts.get("backup", 0.0) + (_t2 - _t1)
+        _parts["release"] = _parts.get("release", 0.0) + (_t3 - _t2)
+        _parts["extra"] = _parts.get("extra", 0.0) + (_t4 - _t3)
+        _parts["revokes"] = _parts.get("revokes", 0) + int(_nrev or 0)
+        _parts["acks"] = _parts.get("acks", 0) + int(_nack or 0)
+        _parts["rel_entries"] = _parts.get("rel_entries", 0) + int(_rel_entries)
+        _parts["rel_rows"] = _parts.get("rel_rows", 0) + int(_rel_rows)
+        _parts["extra_entries"] = _parts.get("extra_entries", 0) + sum(e for e, _r in _extra.values())
+        _parts["extra_rows"] = _parts.get("extra_rows", 0) + sum(r for _e, r in _extra.values())
 
     def drain_storage_control_queues(self) -> bool:
         """Drain the storage control queues by the group's MIN of their sizes.
@@ -6846,12 +6909,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             dtype=torch.int,
         )
         _h49_t0 = time.perf_counter()
+        _parts = getattr(self, "_hc_parts", None)
         self._all_reduce_attn_groups(
             qsizes,
             torch.distributed.ReduceOp.MIN,
             label="drain_storage_control_queues",
         )
-        _HOST_COST.drain_ar_ms += (time.perf_counter() - _h49_t0) * 1000.0
+        _h49_dt = time.perf_counter() - _h49_t0
+        _HOST_COST.drain_ar_ms += _h49_dt * 1000.0
+        if _parts is not None:
+            # UNIFY S2: the 27B parts instrument reads the same clock as NF H49
+            _parts["agree"] = _parts.get("agree", 0.0) + _h49_dt
         qsize_list = list(map(int, qsizes.tolist()))
         n_revoke, n_backup, n_release = qsize_list[:3]
         # xsn332: the release drain after a wake carried the whole dormant
@@ -6865,6 +6933,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             pool_name: (min(qsize_list[_pool_slot(pool_name, 3)], _cap) if _cap > 0 else qsize_list[_pool_slot(pool_name, 3)])
             for pool_name in extra_release_queues
         }
+        # SGLANG_HICACHE_DRAIN_BUDGET (27B, 24.09., default off): a constant
+        # allowance of rows per release queue and of acks per pass, applied to
+        # the agreed MIN counts in queue order -- rank-uniform like the cap
+        # above; what exceeds it stays queued (hot -> the next round agrees
+        # again). See hicache_drain_budget.
+        _budget = None
+        _ack_cap = None
+        _tokens = drain_budget_tokens()
+        if _tokens > 0:
+            _budget = ReleaseBudget(_tokens)
+            _acks = drain_ack_budget()
+            if _acks > 0:
+                _ack_cap = _acks
+        # UNIFY S2: NF H74 (rank-local backup-ack drain, a correctness fix: a
+        # stuck ack wedged every /flush_cache) and the 27B ack allowance compose:
+        # with H74 armed the count is THIS rank's own queue (never the group
+        # MIN), capped by the allowance when one is set -- the rest drains in
+        # the next rounds, so no ack can stay behind; without H74 the allowance
+        # caps the agreed MIN as on the 27B line.
         if envs.SGLANG_WEG2_ENABLE_LOCAL_BACKUP_ACK_DRAIN.get():
             # fnFL2 H74 (x172): this rank's storage-write acks are drained in
             # full. `_drain_backup` touches only this rank's own state (its
@@ -6884,13 +6971,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         "(the MIN drain would have left %d of this rank's acks queued) n=%d",
                         _local, n_backup, len(getattr(self, "ongoing_backup", None) or {}), _local - n_backup, _n,
                     )
-            n_backup = None
+            n_backup = None if _ack_cap is None else min(_local, _ack_cap)
+        elif _ack_cap is not None and n_backup > _ack_cap:
+            n_backup = _ack_cap
         self._drain_storage_control_queues_impl(
             n_revoke=n_revoke,
             n_backup=n_backup,
             n_release=n_release,
             extra_release_counts=extra_release_counts,
             log_metrics=True,
+            **({} if _budget is None else {"budget": _budget}),
         )
         return any(v > 0 for v in qsize_list)
 
@@ -7940,13 +8030,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self._pin_trace_every:
             self._emit_pin_trace()
         _t1 = time.perf_counter() if _timing_every else 0.0
+        _parts = None
         if self.enable_storage:
             _h49_t = time.perf_counter()
-            _every = _hicache_drain_agree_every()
-            if _every > 1 and self._drain_agreement_is_collective():
-                self._gated_drain_storage_control_queues(_every)
-            else:
-                self.drain_storage_control_queues()
+            if _timing_every:
+                # the drain records its part times of THIS round here
+                self._hc_parts = _parts = {"_cpu0": time.thread_time()}
+            try:
+                _every = _hicache_drain_agree_every()
+                if _every > 1 and self._drain_agreement_is_collective():
+                    self._gated_drain_storage_control_queues(_every)
+                else:
+                    self.drain_storage_control_queues()
+            finally:
+                if _parts is not None:
+                    self._hc_parts = None
+                    _parts["cpu"] = time.thread_time() - _parts.pop("_cpu0")
             _HOST_COST.drain_ms += (time.perf_counter() - _h49_t) * 1000.0
         _t2 = time.perf_counter() if _timing_every else 0.0
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
@@ -7957,24 +8056,40 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _HOST_COST.hc_calls += 1
         if _timing_every:
             self._note_hicache_round_timing(_timing_every, _t1 - _t0, _t2 - _t1,
-                                            time.perf_counter() - _t0)
+                                            time.perf_counter() - _t0, parts=_parts)
 
     def _note_hicache_round_timing(self, every: int, checks_s: float, drain_s: float,
-                                   total_s: float) -> None:
+                                   total_s: float, parts: Optional[dict] = None) -> None:
         """SGLANG_HICACHE_ROUND_TIMING=N: what `check_hicache_events` costs the
         round. `checks` = PP-sync reap + write/load ack polls (+ pin trace);
         `drain` = the storage-queue agreement and its drain (the gloo
         all_reduce on a multi-rank group); `total` = the whole call. Wall
         time of the scheduler thread, summarised every N rounds; an instrument,
-        never a decision."""
+        never a decision.
+
+        27B 24.09. (xsn429 spikes): `parts` splits the drain into the
+        agreement (`agree`, the gloo MIN on a multi-rank group), the four
+        queue drains (`revoke`, `backup` -- of it `lock` = dec_host_lock_ref and
+        `rebind` = #1424 rebind / #1407 chain release per acked node --,
+        `release`, `extra`) and `cpu` = the scheduler thread's CPU time over the
+        whole drain (wall minus cpu = waiting: GIL, collective, a sync). The
+        line prints their per-round means and, separately, the parts of the
+        round that set `drain max`, with what it drained."""
         acc = getattr(self, "_hc_round_acc", None)
         if acc is None:
             acc = self._hc_round_acc = {"n": 0, "checks": 0.0, "drain": 0.0, "total": 0.0,
-                                        "drain_max": 0.0, "total_max": 0.0}
+                                        "drain_max": 0.0, "total_max": 0.0,
+                                        "parts": {}, "max_parts": None}
         acc["n"] += 1
         acc["checks"] += checks_s
         acc["drain"] += drain_s
         acc["total"] += total_s
+        if parts:
+            _sum = acc.setdefault("parts", {})
+            for k, v in parts.items():
+                _sum[k] = _sum.get(k, 0) + v
+            if drain_s > acc["drain_max"]:
+                acc["max_parts"] = dict(parts)
         acc["drain_max"] = max(acc["drain_max"], drain_s)
         acc["total_max"] = max(acc["total_max"], total_s)
         if acc["n"] >= every:
@@ -7982,13 +8097,46 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             logger.info(
                 "HICACHE-ROUND-TIMING rounds=%d checks_ms=%.3f drain_ms=%.3f (max %.2f) "
                 "total_ms=%.3f (max %.2f) per round, drain_collective=%s agree_every=%d "
-                "gate_skipped=%d (scheduler-thread wall of check_hicache_events)",
+                "gate_skipped=%d (scheduler-thread wall of check_hicache_events)%s",
                 n, acc["checks"] * 1e3 / n, acc["drain"] * 1e3 / n, acc["drain_max"] * 1e3,
                 acc["total"] * 1e3 / n, acc["total_max"] * 1e3,
                 bool(self.enable_storage and self._drain_agreement_is_collective()),
                 _hicache_drain_agree_every(), int(getattr(self, "_drain_gate_skipped", 0)),
+                self._hc_parts_suffix(n, acc) if acc.get("parts") else "",
             )
             self._hc_round_acc = None
+
+    def _hc_parts_suffix(self, n: int, acc: dict) -> str:
+        """The drain parts appended to HICACHE-ROUND-TIMING (see above)."""
+        s = acc.get("parts") or {}
+        m = acc.get("max_parts") or {}
+
+        def ms(d, k, div=1):
+            return float(d.get(k, 0.0)) * 1e3 / div
+
+        def cnt(d, k):
+            return int(d.get(k, 0))
+
+        try:
+            q = self.cache_controller.host_mem_release_queue.qsize()
+        except Exception:  # noqa: BLE001 - an instrument never breaks the round
+            q = -1
+        return (
+            " parts_ms agree=%.3f revoke=%.3f backup=%.3f (lock %.3f rebind %.3f) release=%.3f "
+            "extra=%.3f cpu=%.3f per round, rows=%d acks=%d revokes=%d over %d rounds;"
+            " max-round agree=%.2f revoke=%.2f backup=%.2f (acks %d lock %.2f rebind %.2f) "
+            "release=%.2f (entries %d rows %d) extra=%.2f (entries %d rows %d) cpu=%.2f;"
+            " budget rows=%d acks=%d release_q=%d"
+            % (
+                ms(s, "agree", n), ms(s, "revoke", n), ms(s, "backup", n), ms(s, "lock", n),
+                ms(s, "rebind", n), ms(s, "release", n), ms(s, "extra", n), ms(s, "cpu", n),
+                cnt(s, "rel_rows") + cnt(s, "extra_rows"), cnt(s, "acks"), cnt(s, "revokes"), n,
+                ms(m, "agree"), ms(m, "revoke"), ms(m, "backup"), cnt(m, "acks"), ms(m, "lock"),
+                ms(m, "rebind"), ms(m, "release"), cnt(m, "rel_entries"), cnt(m, "rel_rows"),
+                ms(m, "extra"), cnt(m, "extra_entries"), cnt(m, "extra_rows"), ms(m, "cpu"),
+                drain_budget_tokens(), drain_ack_budget(), q,
+            )
+        )
 
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""
