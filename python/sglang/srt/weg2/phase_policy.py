@@ -43,6 +43,10 @@ from __future__ import annotations
 import json
 from typing import Iterable, List, Optional, Sequence, Tuple
 
+# H91c3-3: imported with this module (the front imports it before its loop),
+# never lazily from `d_phase_seats` -- d_seats is stdlib-only at import time.
+from sglang.srt.weg2 import d_seats as _d_seats
+
 #: Rule 1: requests per P phase (user 25.09.: "bis zu 6").
 P_PHASE_MAX_REQUESTS_DEFAULT = 6
 #: Rule 1: P's unified KV pool in tokens (NF: 262k, memory `262K-PFLICHT`).
@@ -247,6 +251,6 @@ def d_phase_seats(handoff_n: int, parked_n: int, d_bs: int) -> int:
     very function D applies to the same two integers
     (``d_seats.phase_seats``), with the front's ``--d-bs`` as the cap (the
     launcher checks it against D's --max-running-requests)."""
-    from sglang.srt.weg2.d_seats import phase_seats
-
-    return phase_seats(handoff_n, parked_n, cap=d_bs).n
+    # Module-level import (below): the front calls this at the P->D wake, on
+    # its event loop, and a first import there is the H78 loop stall.
+    return _d_seats.phase_seats(handoff_n, parked_n, cap=d_bs).n
