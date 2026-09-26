@@ -1846,3 +1846,213 @@ class OpenRouterCacheAffinityTestCase(unittest.TestCase):
             got = _load_policy_file(path)
             self.assertEqual(got["openrouter_provider_order"], ["Z.AI", "Cloudflare"])
             self.assertEqual(got["openrouter_model_map"], {"a": "b"})
+
+
+class RemoteArmTestCase(AioHTTPTestCase):
+    """The fourth bucket (router/cachy-arm-0926): model id -> another router.
+
+    Production use: Qwen3.8-27B-cachy[-think|-nothink] on 30099 forwarded to
+    the cachyllama router on 30097. The properties pinned here are the ones
+    that make it safe on the lifeline: exact-match only, body untouched, the
+    client credential never forwarded, every other bucket unchanged, the
+    allow-list still in front, and a down remote failing loudly instead of
+    falling through to upstream.
+    """
+
+    REMOTE_ID = "Qwen3.8-27B-cachy"
+    REMOTE_THINK_ID = "Qwen3.8-27B-cachy-think"
+    OPENROUTER_MODEL = "z-ai/glm-5.3-flash"
+    CLIENT_SECRET = "sk-ant-this-must-never-reach-the-remote-box"
+
+    async def get_application(self):
+        upstream_app, self.upstream = _make_backend("upstream")
+        local_app, self.local = _make_backend("local")
+        remote_app, self.remote = _make_backend("remote")
+        openrouter_app, self.openrouter = _make_backend("openrouter")
+        self.upstream_server = TestServer(upstream_app)
+        self.local_server = TestServer(local_app)
+        self.remote_server = TestServer(remote_app)
+        self.openrouter_server = TestServer(openrouter_app)
+        for server in (
+            self.upstream_server,
+            self.local_server,
+            self.remote_server,
+            self.openrouter_server,
+        ):
+            await server.start_server()
+        tmp = tempfile.mkdtemp(prefix="router-remote-")
+        self.key_path = os.path.join(tmp, "openrouter.key")
+        with open(self.key_path, "w") as fh:
+            fh.write("sk-or-v1-test-fake-key-0926\n")
+        self.policy_path = os.path.join(tmp, "policy.json")
+        remote_base = str(self.remote_server.make_url("")).rstrip("/")
+        return create_app(
+            local_models=[LOCAL_MODEL],
+            upstream_base=str(self.upstream_server.make_url("")).rstrip("/"),
+            local_base=str(self.local_server.make_url("")).rstrip("/"),
+            local_wait_s=0,
+            openrouter_models=[self.OPENROUTER_MODEL],
+            openrouter_base=str(self.openrouter_server.make_url("")).rstrip("/"),
+            openrouter_key_file=self.key_path,
+            policy_file=self.policy_path,
+            remote_models={
+                self.REMOTE_ID: remote_base + "/",
+                self.REMOTE_THINK_ID: remote_base,
+            },
+        )
+
+    async def tearDownAsync(self):
+        for server in (
+            self.upstream_server,
+            self.local_server,
+            self.remote_server,
+            self.openrouter_server,
+        ):
+            await server.close()
+        await super().tearDownAsync()
+
+    def _body(self, model, **overrides):
+        body = {
+            "model": model,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        body.update(overrides)
+        return body
+
+    def _others_untouched(self):
+        self.assertEqual(self.local["requests"], [])
+        self.assertEqual(self.upstream["requests"], [])
+        self.assertEqual(self.openrouter["requests"], [])
+
+    async def test_remote_id_goes_to_the_remote_base_byte_identical(self):
+        raw = json.dumps(self._body(self.REMOTE_ID, stream=True)).encode()
+        resp = await self.client.post(
+            "/v1/messages",
+            data=raw,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertIn(b'"backend":"remote"', await resp.read())
+        self.assertEqual(len(self.remote["requests"]), 1)
+        self.assertEqual(self.remote["requests"][0]["raw"], raw)
+        self.assertEqual(self.remote["requests"][0]["path"], "/v1/messages")
+        self._others_untouched()
+
+    async def test_listed_think_alias_is_forwarded_unaliased(self):
+        """The remote owns its aliases: no local -think rewrite on this arm."""
+        await self.client.post("/v1/messages", json=self._body(self.REMOTE_THINK_ID))
+        got = self.remote["requests"][0]["body"]
+        self.assertEqual(got["model"], self.REMOTE_THINK_ID)
+        self.assertNotIn("thinking", got)
+        self._others_untouched()
+
+    async def test_count_tokens_and_query_string_reach_the_remote(self):
+        await self.client.post(
+            "/v1/messages/count_tokens?beta=true", json=self._body(self.REMOTE_ID)
+        )
+        req = self.remote["requests"][0]
+        self.assertEqual(req["path"], "/v1/messages/count_tokens")
+        self.assertEqual(req["query"], "beta=true")
+        self._others_untouched()
+
+    async def test_client_credential_never_reaches_the_remote(self):
+        await self.client.post(
+            "/v1/messages",
+            json=self._body(self.REMOTE_ID),
+            headers={
+                "x-api-key": self.CLIENT_SECRET,
+                "Authorization": "Bearer " + self.CLIENT_SECRET,
+            },
+        )
+        headers = {k.lower(): v for k, v in self.remote["requests"][0]["headers"].items()}
+        self.assertNotIn("authorization", headers)
+        self.assertEqual(headers.get("x-api-key"), "remote-arm-no-auth")
+        self.assertNotIn(self.CLIENT_SECRET, json.dumps(headers))
+
+    async def test_other_buckets_are_unchanged(self):
+        for model, backend in (
+            (LOCAL_MODEL, "local"),
+            (THINKING_ALIAS, "local"),
+            (self.OPENROUTER_MODEL, "openrouter"),
+            (REMOTE_MODEL, "upstream"),
+            # A near-miss of a remote id is NOT remote: exact match only.
+            ("Qwen3.8-27B-cachy-nothink", "upstream"),
+        ):
+            resp = await self.client.post("/v1/messages", json=self._body(model))
+            self.assertEqual((await resp.json())["backend"], backend, model)
+        self.assertEqual(self.remote["requests"], [])
+
+    async def test_upstream_keeps_the_client_credential(self):
+        """Only the remote arm strips it; Anthropic still needs it."""
+        await self.client.post(
+            "/v1/messages",
+            json=self._body(REMOTE_MODEL),
+            headers={"x-api-key": self.CLIENT_SECRET},
+        )
+        headers = {k.lower(): v for k, v in self.upstream["requests"][0]["headers"].items()}
+        self.assertEqual(headers.get("x-api-key"), self.CLIENT_SECRET)
+
+    async def test_allow_list_still_refuses_an_unlisted_remote_id(self):
+        with open(self.policy_path, "w") as fh:
+            json.dump({"allowed_models": [LOCAL_MODEL, self.REMOTE_ID]}, fh)
+        ok = await self.client.post("/v1/messages", json=self._body(self.REMOTE_ID))
+        self.assertEqual(ok.status, 200)
+        refused = await self.client.post(
+            "/v1/messages", json=self._body(self.REMOTE_THINK_ID)
+        )
+        self.assertEqual(refused.status, 403)
+        self.assertEqual(len(self.remote["requests"]), 1)
+
+    async def test_down_remote_is_a_loud_502_never_upstream(self):
+        await self.remote_server.close()
+        resp = await self.client.post("/v1/messages", json=self._body(self.REMOTE_ID))
+        self.assertEqual(resp.status, 502)
+        self.assertEqual(self.upstream["requests"], [])
+        self.assertEqual(self.local["requests"], [])
+
+    async def test_stats_report_remote_models_and_counter(self):
+        await self.client.post("/v1/messages", json=self._body(self.REMOTE_ID))
+        stats = await (await self.client.get(STATS_PATH)).json()
+        self.assertEqual(stats["remote"], 1)
+        self.assertEqual(
+            sorted(stats["remote_models"]), [self.REMOTE_ID, self.REMOTE_THINK_ID]
+        )
+        self.assertFalse(stats["remote_models"][self.REMOTE_ID].endswith("/"))
+
+
+class ParseRemoteModelsTestCase(unittest.TestCase):
+    def test_valid_specs(self):
+        from sglang.srt.entrypoints.anthropic.router import _parse_remote_models
+
+        self.assertEqual(
+            _parse_remote_models(
+                ["a=http://127.0.0.1:30097/", " b = https://h:1 ", "a=http://127.0.0.1:30097"]
+            ),
+            {"a": "http://127.0.0.1:30097", "b": "https://h:1"},
+        )
+        self.assertEqual(_parse_remote_models([]), {})
+
+    def test_bad_specs_fail_loudly(self):
+        from sglang.srt.entrypoints.anthropic.router import _parse_remote_models
+
+        for bad in (["a"], ["=http://h:1"], ["a="], ["a=127.0.0.1:30097"]):
+            with self.assertRaises(ValueError, msg=bad):
+                _parse_remote_models(bad)
+        with self.assertRaises(ValueError):
+            _parse_remote_models(["a=http://h:1", "a=http://h:2"])
+
+    def test_cli_rejects_a_bad_spec_before_serving(self):
+        from sglang.srt.entrypoints.anthropic.router import main
+
+        with self.assertRaises(SystemExit):
+            main(["--port", "0", "--remote-model", "no-equals-sign"])
+
+
+class NoRemoteModelsConfiguredTestCase(RouterTestCase):
+    """Default create_app (no remote_models): the whole old suite, plus stats."""
+
+    async def test_stats_show_an_empty_remote_bucket(self):
+        stats = await (await self.client.get(STATS_PATH)).json()
+        self.assertEqual(stats["remote_models"], {})
+        self.assertEqual(stats["remote"], 0)

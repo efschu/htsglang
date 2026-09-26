@@ -298,6 +298,9 @@ LOCAL_BASE = web.AppKey("local_base", str)
 OPENROUTER_MODELS = web.AppKey("openrouter_models", set)
 OPENROUTER_BASE = web.AppKey("openrouter_base", str)
 OPENROUTER_KEY_FILE = web.AppKey("openrouter_key_file", object)
+# Fourth bucket (router/cachy-arm-0926): model id -> base URL of ANOTHER
+# Anthropic-speaking router (e.g. the cachyllama router on 30097).
+REMOTE_MODELS = web.AppKey("remote_models", dict)
 APPLY_SHIM = web.AppKey("apply_shim", bool)
 STATS = web.AppKey("stats", dict)
 SESSION = web.AppKey("session", aiohttp.ClientSession)
@@ -349,6 +352,49 @@ def _with_openrouter_credential(headers: dict[str, str], key: str) -> dict[str, 
     """
     out = {k: v for k, v in headers.items() if k.lower() not in _CREDENTIAL_HEADER_NAMES}
     out["x-api-key"] = key
+    return out
+
+
+# Sent instead of the client's credential on the remote arm. The remote
+# routers this arm points at (cachy-router on 30097) do not check it; it only
+# has to be non-empty so a front that insists on SOME x-api-key accepts it.
+REMOTE_PLACEHOLDER_KEY = "remote-arm-no-auth"
+
+
+def _without_client_credential(headers: dict[str, str]) -> dict[str, str]:
+    """Strip the client's credential for the remote arm.
+
+    The remote router forwards whatever headers it gets to ITS backend -- for
+    cachy that is llama.cpp on another host (192.168.22.238). The client's
+    Anthropic credential (an OAuth token or API key) must never travel there,
+    so it is dropped and replaced by a fixed placeholder.
+    """
+    out = {k: v for k, v in headers.items() if k.lower() not in _CREDENTIAL_HEADER_NAMES}
+    out["x-api-key"] = REMOTE_PLACEHOLDER_KEY
+    return out
+
+
+def _parse_remote_models(specs: Iterable[str]) -> dict[str, str]:
+    """``["ID=BASE", ...]`` -> ``{ID: BASE}``; raises ValueError on a bad spec.
+
+    Fails loudly at startup rather than guessing: a typo here would otherwise
+    send a model id to the Anthropic upstream, which is exactly the silent
+    misroute the allow-list and the separate buckets exist to prevent.
+    """
+    out: dict[str, str] = {}
+    for spec in specs:
+        model, sep, base = spec.partition("=")
+        model, base = model.strip(), base.strip().rstrip("/")
+        if not sep or not model or not base.startswith(("http://", "https://")):
+            raise ValueError(
+                f"--remote-model {spec!r}: expected ID=http(s)://host:port"
+            )
+        if model in out and out[model] != base:
+            raise ValueError(
+                f"--remote-model {model!r} given twice with different bases "
+                f"({out[model]!r} vs {base!r})"
+            )
+        out[model] = base
     return out
 
 
@@ -1408,6 +1454,7 @@ def create_app(
     openrouter_models: Iterable[str] = (),
     openrouter_base: str = DEFAULT_OPENROUTER,
     openrouter_key_file: Optional[str] = None,
+    remote_models: Optional[dict[str, str]] = None,
 ) -> web.Application:
     """Build the proxy application.
 
@@ -1446,6 +1493,16 @@ def create_app(
     refusal in shape). When a key IS present, it REPLACES whatever
     credential header the client sent on this branch only -- the client's
     own Anthropic credential must never reach a third-party endpoint.
+
+    ``remote_models`` is the FOURTH bucket (router/cachy-arm-0926): an exact
+    ``{model id: base URL}`` map to OTHER Anthropic-speaking routers, e.g.
+    ``{"Qwen3.8-27B-cachy": "http://127.0.0.1:30097"}``. Checked after the
+    local bucket and before openrouter. The body is forwarded untouched -- no
+    alias, no thinking shim, no markers: the remote router applies its own
+    policy (cachy's -think/-nothink aliases live THERE). The client credential
+    is replaced by a placeholder (``_without_client_credential``). No wait
+    buffer: a down remote answers 502 at once, loud and by name, instead of
+    holding a turn. Empty by default -- then this bucket is never consulted.
     """
     if upstream_wait_s < 0:
         logger.warning(
@@ -1469,6 +1526,9 @@ def create_app(
     app[OPENROUTER_MODELS] = set(openrouter_models)
     app[OPENROUTER_BASE] = (openrouter_base or DEFAULT_OPENROUTER).rstrip("/")
     app[OPENROUTER_KEY_FILE] = _KeyFile(openrouter_key_file)
+    app[REMOTE_MODELS] = {
+        m: b.rstrip("/") for m, b in (remote_models or {}).items()
+    }
     app[APPLY_SHIM] = apply_shim
     app[POLICY] = {
         "thinking_enabled": thinking_enabled,
@@ -1486,6 +1546,8 @@ def create_app(
         # A request for a listed openrouter model, refused by name because
         # no key was configured -- never routed elsewhere. See _KeyFile.
         "openrouter_no_key": 0,
+        # Requests forwarded to a --remote-model router (fourth bucket).
+        "remote": 0,
         "errors": 0,
         # Requests answered 403 because their model id was not in the policy
         # file's ``allowed_models`` (see ``proxy``). Lifetime total.
@@ -1523,6 +1585,7 @@ def create_app(
         body["thinking_aliases"] = sorted(request.app[THINKING_ALIASES])
         body["nothink_aliases"] = sorted(request.app[NOTHINK_ALIASES])
         body["openrouter_models"] = sorted(request.app[OPENROUTER_MODELS])
+        body["remote_models"] = dict(sorted(request.app[REMOTE_MODELS].items()))
         # Boolean ONLY -- never the key, never its length. This endpoint has
         # no auth on this rig (LAN-open-without-auth is a deliberate,
         # documented choice elsewhere), so even a side-channel like a length
@@ -1601,11 +1664,24 @@ def create_app(
         # in both without local silently winning -- local_models keeps first
         # claim, matching how the alias check already takes precedence over
         # the local_models set above.
-        to_openrouter = not to_local and (
+        # Fourth bucket (router/cachy-arm-0926): same precedence rule -- local
+        # keeps first claim, and a remote id wins over openrouter.
+        remote_base = (
+            None
+            if to_local or model is None
+            else request.app[REMOTE_MODELS].get(model)
+        )
+        to_remote = remote_base is not None
+        to_openrouter = not to_local and not to_remote and (
             model is not None and model in request.app[OPENROUTER_MODELS]
         )
 
-        if to_local:
+        if to_remote:
+            # Byte pipe: the remote router applies its own thinking policy
+            # and aliases, so nothing here may second-guess the body.
+            base = remote_base
+            request.app[STATS]["remote"] += 1
+        elif to_local:
             base = request.app[LOCAL_BASE]
             policy = _effective_policy(request.app)
             if alias_target is not None:
@@ -1742,7 +1818,13 @@ def create_app(
 
         # model is a client-supplied identifier, never a credential.
         destination = (
-            "local" if to_local else "openrouter" if to_openrouter else "upstream"
+            "local"
+            if to_local
+            else f"remote {remote_base}"
+            if to_remote
+            else "openrouter"
+            if to_openrouter
+            else "upstream"
         )
         logger.info(
             "%s %s -> %s (model=%s)",
@@ -1756,6 +1838,8 @@ def create_app(
         headers = _request_headers(request.headers.items())
         if to_openrouter:
             headers = _with_openrouter_credential(headers, openrouter_key)
+        elif to_remote:
+            headers = _without_client_credential(headers)
 
         # Start the token count NOW, so it overlaps the real request instead
         # of adding a round trip in front of it. Only the local streaming
@@ -1807,6 +1891,21 @@ def create_app(
                 request.app[MAX_BUFFERED],
                 request.app[LOCAL_POLL_INTERVAL_S],
                 "local backend",
+            )
+        elif to_remote:
+            opener = _open_backend(
+                request.app[SESSION],
+                request.method,
+                url,
+                headers,
+                body if body else None,
+                0.0,
+                None,
+                request.app[STATS],
+                request.app[HELD_STARTS],
+                request.app[MAX_BUFFERED],
+                request.app[LOCAL_POLL_INTERVAL_S],
+                "remote backend",
             )
         elif to_openrouter:
             opener = _open_backend(
@@ -2097,6 +2196,21 @@ def main(argv: list[str] | None = None) -> None:
         "never silently routed to local or upstream instead.",
     )
     parser.add_argument(
+        "--remote-model",
+        action="append",
+        default=[],
+        metavar="ID=BASE",
+        help="route model id ID, matched exactly, to BASE -- another router "
+        "that already speaks the Anthropic Messages API (e.g. "
+        "Qwen3.8-27B-cachy=http://127.0.0.1:30097); repeatable. FOURTH "
+        "bucket (router/cachy-arm-0926): checked after --local-model, before "
+        "--openrouter-model. The body goes through untouched (the remote "
+        "applies its own thinking policy and aliases, so list each alias you "
+        "want reachable as its own entry); the client credential is replaced "
+        "by a placeholder so it never leaves this host; no wait buffer. A "
+        "listed id must also be in the policy file's allowed_models.",
+    )
+    parser.add_argument(
         "--shutdown-timeout-s",
         type=float,
         default=DEFAULT_SHUTDOWN_TIMEOUT_S,
@@ -2118,6 +2232,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     if not args.local_model:
         logger.warning("no --local-model given: every request goes upstream")
+    try:
+        remote_models = _parse_remote_models(args.remote_model)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     app = create_app(
         local_models=args.local_model,
@@ -2134,7 +2252,10 @@ def main(argv: list[str] | None = None) -> None:
         openrouter_models=args.openrouter_model,
         openrouter_base=args.openrouter_base,
         openrouter_key_file=args.openrouter_key_file,
+        remote_models=remote_models,
     )
+    if remote_models:
+        logger.warning("remote models (fourth bucket): %s", remote_models)
     logger.info(
         "listening on %s:%d, local models %s (aliases %s) -> %s, "
         "openrouter models %s -> %s (key file %s, key present=%s), "
