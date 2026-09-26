@@ -108,6 +108,7 @@ class _Rank:
         cc = HybridCacheController.__new__(HybridCacheController)
         cc.mem_pool_host, cc.storage_backend, cc.page_size = self.group, _Backend(), 1
         cc.host_mem_release_queue, cc.extra_host_mem_release_queues = Queue(), {}
+        cc.host_release_provenance = {}  # set by HiCacheController.__init__ (#989)
         cc.prefetch_revoke_queue, cc.ack_backup_queue = Queue(), Queue()
         self.cc = cc
         c = u.UnifiedRadixCache.__new__(u.UnifiedRadixCache)
@@ -349,6 +350,92 @@ def _scenario_pending_write(case):
     a.release_via_queue(rows)
     st, _ref = _hdr(a.arena)
     return int(st[int(rows[0]) - S])
+
+
+def _scenario_two_prefetches_one_drain(case):
+    """#989b (rc11b, NF under agent load): two prefetches of ONE prefix each
+    take their own reader reference per page (weg2-16-31 and weg2-16-38 on
+    P PP0: unclaimed heads 2560 and 10752 tokens over the same arena pages);
+    both heads reach the queue before ONE drain. Returns the reference counts
+    left on the slots and whether the drain logged a #989 conflict."""
+    case.on()
+    a = _Rank(case.path, case.SLOTS)
+    hashes = [f"t{j}" for j in range(4)]
+    slots = a.publish(hashes)
+    hi1, got1 = a.prefetch(hashes)  # +1 per page
+    hi2, got2 = a.prefetch(hashes)  # +1 per page, same pages
+    assert (got1, got2) == (4, 4)
+    a.cc.append_host_mem_release(host_indices=hi1)
+    a.cc.append_host_mem_release(host_indices=hi2)
+    with mock.patch.object(u, "logger") as lg:
+        a.cache.check_hicache_events()
+    _st, ref = _hdr(a.arena)
+    flagged = any("#989" in str(c) for c in lg.error.call_args_list)
+    return ref[slots.numpy()].tolist(), flagged
+
+
+class TwoPrefetchesOfOnePrefixInOneDrain(_ArenaCase):
+    def test_both_readers_return_their_reference(self):
+        refs, flagged = _scenario_two_prefetches_one_drain(self)
+        self.assertEqual(refs, [0, 0, 0, 0], "a reader reference was never returned (slot pinned)")
+        self.assertFalse(flagged, "two legitimate references reported as a #989 conflict")
+
+    def test_the_arena_stays_evictable_over_many_rounds(self):
+        """The rc11b shape repeated: every round two agents share a prefix. A
+        merged drain pinned the overlap each round until the arena refused."""
+        self.on()
+        a = _Rank(self.path, 120)
+        for i in range(40):
+            hashes = [f"r{i}-p{j}" for j in range(6)]
+            self.assertIsNotNone(a.publish(hashes), f"claim refused at round {i}")
+            h1, _ = a.prefetch(hashes)
+            h2, _ = a.prefetch(hashes)
+            a.cc.append_host_mem_release(host_indices=h1)
+            a.cc.append_host_mem_release(host_indices=h2)
+            a.cache.check_hicache_events()
+        pinned, refs, _complete = a.arena.ref_census()
+        self.assertEqual((pinned, refs), (0, 0))
+
+    def test_a_double_queued_span_in_one_drain_still_takes_no_other_reference(self):
+        """The #989 danger, same drain: A holds ONE reference, its span is
+        queued twice, B reads the pages. The second release is refused by A's
+        ledger; B keeps its reference."""
+        self.on()
+        a = _Rank(self.path, self.SLOTS)
+        b = _Rank(self.path, self.SLOTS, own_ledger=True)
+        hashes = [f"q{j}" for j in range(4)]
+        slots = a.publish(hashes)
+        b.arena.ref_slots(slots.tolist(), +1)
+        hi, _ = a.prefetch(hashes)
+        a.cc.append_host_mem_release(host_indices=hi)
+        a.cc.append_host_mem_release(host_indices=hi.clone())
+        a.cache.check_hicache_events()
+        _st, ref = _hdr(a.arena)
+        self.assertEqual(ref[slots.numpy()].tolist(), [1, 1, 1, 1])
+
+    def test_staging_duplicates_are_still_caught_and_name_their_producer(self):
+        """The #989 guard keeps its job for real allocations: a staging span
+        queued twice is freed once, and the conflict line now names the site
+        (the hybrid override used to skip the stamp: '?')."""
+        self.on()
+        a = _Rank(self.path, self.SLOTS)
+        # the fixture builds the pool with __new__: give it the staging
+        # bookkeeping HostKVCache.__init__ would (free list, used flags, lock)
+        import threading
+
+        a.pool.lock = threading.RLock()
+        a.pool.free_slots = torch.arange(S, dtype=torch.int64)
+        a.pool.slot_used = torch.zeros(S, dtype=torch.bool)
+        rows = a.pool.alloc(4)
+        a.cc.append_host_mem_release(host_indices=rows)
+        a.cc.append_host_mem_release(host_indices=rows.clone())
+        with mock.patch.object(u, "logger") as lg:
+            a.cache.check_hicache_events()
+        lines = [str(c) for c in lg.error.call_args_list if "#989" in str(c)]
+        self.assertTrue(lines, "a staging double-queue must still be reported")
+        self.assertNotIn("<-?", lines[0])
+        self.assertIn("test_arena_queue_refs_27b", lines[0])
+        self.assertFalse(bool(a.pool.slot_used[rows].any()))
 
 
 class TheDangerScenariosHold(_ArenaCase):
