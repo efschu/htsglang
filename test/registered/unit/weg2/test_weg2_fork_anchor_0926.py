@@ -19,7 +19,8 @@ Hermetic, CPU. Pinned, with ``SGLANG_WEG2_FORK_ANCHOR_TOKEN`` set:
     prompt resumes at the fork too (the tail is its own extend);
   * group D's store read ends at the same cut (so a fork-cut leg-2 read lands
     complete), group P's span and every switch-off span are unchanged;
-  * group D's extend track keeps the anchor at or below the fork;
+  * group D's extend track keeps the anchor at or below the fork (up to 63
+    tokens earlier); group P's track never moves;
   * the launcher switch reaches both groups, needs --p-trim-end-anchor, and is
     default off.
 """
@@ -393,6 +394,23 @@ def test_d_track_works_from_an_unaligned_resume_prefix(d_track):
     aligned, seqlen = _track(sb, ids, prefix)
     assert aligned == prefix + 960 and seqlen == prefix + 961
     assert (seqlen - prefix) % 64 == 1, "the kernel reads h[(seqlen - prefix) // 64] = h[15]"
+
+
+def test_the_track_never_moves_on_group_p(d_track):
+    """Review RV: on P the ids are already cut at the fork; a fork token in a
+    short LAST message (< ~14 tokens) would otherwise pull P's inner track
+    back one chunk. The track rule is group D's alone."""
+    mp, sb = d_track
+    mp.setenv(TOKEN_ENV, str(IM))
+    # a P-cut prompt: ... <|im_start|>user\n + 9-token last message, fork-cut
+    last = [IM, 872, 198] + list(range(7000, 7009))
+    ids = list(range(5000, 5000 + 1025 - len(last))) + last
+    mp.setenv("SGLANG_WEG2_GROUP", "D")
+    assert _track(sb, ids, 0)[0] == 960, "the rule itself fires on these ids"
+    mp.setenv("SGLANG_WEG2_GROUP", "P")
+    assert _track(sb, ids, 0) == (1024, 1025), "group P: today's track"
+    mp.delenv("SGLANG_WEG2_GROUP", raising=False)
+    assert _track(sb, ids, 0) == (1024, 1025), "no group: today's track"
 
 
 def test_d_track_is_unchanged_where_the_grid_point_is_below_the_fork(d_track):

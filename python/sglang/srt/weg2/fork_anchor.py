@@ -31,8 +31,10 @@ finish anchor of 24-54's decode at 74752; 26-58 claimed D's prefill track of
 26-56, not its finish anchor. An anchor "at prompt + generated tokens" would
 have served none of the 9 requests. What serves BOTH shapes -- the sibling
 (shares the prompt up to the fork) and the next turn (shares the whole prompt)
--- is one anchor at the fork: the next turn loses 4 tokens against today's
-N-1, the sibling gains 1.2k-4.7k.
+-- is one anchor at the fork. The cost for the next turn: behind a P leg the
+END anchor moves 4 tokens (N-1 -> N-5); behind a D-direct prefill the D track
+moves by up to 63 tokens (one FLA chunk grid step, only when the default grid
+point fell inside the generation prompt). The sibling gains 1.2k-4.7k.
 
 THE REPAIR, one switch (``SGLANG_WEG2_FORK_ANCHOR_TOKEN=<token id>``, set on
 BOTH groups; unset/empty/0 = every path byte-identical):
@@ -45,9 +47,10 @@ BOTH groups; unset/empty/0 = every path byte-identical):
     fork cut, so a leg-2 read of a fork-cut P leg lands COMPLETE (no #1324
     store-short deferral, no extra pass after the wake) and its claim is the
     fork anchor;
-  * group D: the extend track of the step that reaches a prompt's end lands at
-    or below the fork (one FLA chunk grid step earlier when the default grid
-    point falls inside the generation prompt).
+  * group D only (``SGLANG_WEG2_GROUP=D``): the extend track of the step that
+    reaches a prompt's end lands at or below the fork (one FLA chunk grid step
+    earlier, i.e. up to 63 tokens, when the default grid point falls inside the
+    generation prompt). Never on group P: its ids are already cut at the fork.
 
 Both groups derive the cut from the prompt ids and this env alone -- the same
 decision on every rank, no file, no collective. The decode round never runs
