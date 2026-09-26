@@ -2505,6 +2505,14 @@ class Scheduler(
         from sglang.srt.weg2 import p_chunk_policy as _pcp
 
         self._p_chunk_planner = _pcp.planner_from_env(os.environ, log=logger.info)
+        # H92 (NF): the forward budget plans the token STREAM (P stau up to 6)
+        # when the launcher says so (SGLANG_P_CHUNK_BUDGET=stream); never
+        # without a planner, so fixed/unset stays byte-identical.
+        from sglang.srt.weg2 import p_chunk_nf as _pcnf
+
+        self._p_chunk_stream = self._p_chunk_planner is not None and _pcnf.budget_is_stream(
+            os.environ
+        )
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -11397,9 +11405,9 @@ class Scheduler(
         """
         from sglang.srt.weg2.p_chunk_policy import forward_budget
 
+        queue = getattr(self, "waiting_queue", None) or []
         req = self.chunked_req
         if req is None:
-            queue = getattr(self, "waiting_queue", None) or []
             if not queue:
                 return 0
             req = queue[0]
@@ -11410,6 +11418,13 @@ class Scheduler(
             )
             prefix = getattr(req, "prefix_indices", None)
             pos = 0 if prefix is None else len(prefix)
+            if getattr(self, "_p_chunk_stream", False):
+                # H92 (NF): plan the stream -- the head's rest plus every
+                # waiting request's rest -- and take its first width as this
+                # forward's budget (weg2/p_chunk_nf.py, interface item 4).
+                from sglang.srt.weg2.p_chunk_nf import stream_end
+
+                end = stream_end(pos, end, (r for r in queue if r is not req))
             width = forward_budget(self._p_chunk_planner, req.rid, pos, end)
         except Exception as exc:  # noqa: BLE001 - a plan must never stop a pass
             n = getattr(self, "_p_chunk_policy_errors", 0) + 1
