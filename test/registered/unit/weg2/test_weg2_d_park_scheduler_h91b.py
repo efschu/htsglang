@@ -12,6 +12,7 @@ READ, not imported, by the wiring ratchets (its import pulls transformers ->
 torchao -> the Triton device list, which a GPU-less desk does not have)."""
 from __future__ import annotations
 
+import re
 import os
 import types
 from collections import deque
@@ -244,8 +245,10 @@ def test_wiring_park_running_route_and_rpc():
 
 def test_wiring_sleep_retract_admission_abort_tick():
     wu = _read("managers", "scheduler_components", "weight_updater.py")
-    i = wu.index("scheduler.weg2_dormant = True")
-    assert "weg2_d_hold_parked" in wu[i:i + 1500]
+    # unified tree: the 27B side sets weg2_dormant at a second, earlier site;
+    # the park hook sits after the one of the sleep leg's dormant point.
+    sites = [m.start() for m in re.finditer(re.escape("scheduler.weg2_dormant = True"), wu)]
+    assert any("weg2_d_hold_parked" in wu[i:i + 1500] for i in sites)
     sch = _read("managers", "scheduler.py")
     assert ("self._add_request_to_queue(req, is_retracted=True)\n"
             "        self._weg2_d_park_note_retracted(retracted_reqs)") in sch
