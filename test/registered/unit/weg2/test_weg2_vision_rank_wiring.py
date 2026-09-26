@@ -72,6 +72,9 @@ def _funnel(queue, idle):
     h = _pass_sched(queue, idle=idle)
     h._weg2_vision_rank_stage = True
     h.prefill_delayer = None
+    # NF (H96/H97): get_new_batch_prefill's own `finally` clears the group
+    # match floor off the tree cache; None is its no-op input.
+    h.tree_cache = None
     h.get_new_batch_prefill = types.MethodType(Scheduler.get_new_batch_prefill, h)
     return h
 

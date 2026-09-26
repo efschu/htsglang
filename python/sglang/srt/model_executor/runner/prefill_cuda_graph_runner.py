@@ -903,6 +903,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if forward_batch.replace_embeds is not None:
             return False
+        # H125 (NF, transient vision): an image batch never replays. Its
+        # embeddings are spliced in by the model's mm routine, which a
+        # captured text body never ran -- the 27B line refuses it by the name
+        # `mm_inputs` in its own eligibility rule (37ea1dbfd6). Staged (rows
+        # attached) and unstaged (a PP follower's pixel copy) alike; text
+        # batches (contains_mm_inputs() False) take the path they always took.
+        if forward_batch.contains_mm_inputs():
+            return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if forward_batch.forward_mode.is_target_verify():
             return False
