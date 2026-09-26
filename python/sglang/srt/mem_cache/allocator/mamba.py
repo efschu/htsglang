@@ -343,28 +343,44 @@ class MambaSlotAllocator:
         self.free_slots = candidates[keep]
         self._phase_withheld = candidates[~keep]
 
-    def set_phase_limit(self, limit: Optional[int]) -> bool:
+    def set_phase_limit(self, limit: Optional[int], seats: Optional[int] = None) -> bool:
         """Hand out only slots ``1..limit`` (None or >= size: all of them).
         False -- and nothing changed -- when a slot above ``limit`` is in use:
-        its state is live and must stay reachable."""
+        its state is live and must stay reachable.
+
+        ``seats`` (H95e): the phase's running-request cap n the limit was cut
+        for (``d_seat_vram.on_wake``). The write-through pin budget reads it
+        together with the limit (``mamba_pool_floor.mamba_phase_pin_budget``):
+        the floor of a phase is n running requests, its pool is 1..limit.
+        Replicated like the limit (the wake request's n)."""
         if limit is None or int(limit) >= int(self.size):
             withheld = getattr(self, "_phase_withheld", None)
             if withheld is not None and withheld.numel():
                 self.free_slots = torch.cat((self.free_slots, withheld))
             self._phase_withheld = None
             self._phase_limit = None
+            self._phase_seats = None
             return True
         limit = max(1, int(limit))
         self._drain_double_free_checks(wait=True)
         if bool(self.slot_used[limit + 1:].any()):
             return False
         self._phase_limit = limit
+        self._phase_seats = None if seats is None else max(1, int(seats))
         self._split_phase_withheld(self.free_slots)
         return True
 
     @property
     def phase_limit(self) -> Optional[int]:
         return getattr(self, "_phase_limit", None)
+
+    @property
+    def phase_seats(self) -> Optional[int]:
+        """H95e: the running-request cap of the phase whose limit holds (None
+        without a limit, or when the limit was set without a seat count)."""
+        if getattr(self, "_phase_limit", None) is None:
+            return None
+        return getattr(self, "_phase_seats", None)
 
     @property
     def phase_withheld_slots(self) -> int:

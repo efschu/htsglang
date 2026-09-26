@@ -389,6 +389,44 @@ def weg2_p_mamba_retention_refusal(
     )
 
 
+def mamba_phase_pin_budget(
+    server_args: "ServerArgs",
+    max_running_requests: int,
+    mamba_pool_size: int,
+    allocator=None,
+) -> int:
+    """:func:`mamba_retention_pin_budget` of the pool AS IT IS REACHABLE NOW.
+
+    H95e. A D phase of n < --d-bs seats hands out only slots 1..L(n)
+    (``MambaSlotAllocator.set_phase_limit``, H95c) and admits at most n
+    running requests (``d_seat_vram.admission_cap``). The budget's argument
+    -- floor (the running set) + budget = pool -- then holds for THAT pool and
+    THAT running set: ``L(n) - n x slots_per_running_req``. Taken from the
+    boot pool and the boot's --max-running-requests instead, the budget stays
+    at the cap form's value in every phase: NF D (38 slots, --d-bs 6, 5 slots
+    per request) keeps 38 - 30 = 8 while n=1 reaches 7 slots, so write-through
+    pins could hold every reachable slot and the floor is no guarantee any
+    more. Per phase: 7-5=2, 13-10=3, 19-15=4, 25-20=5, 32-25=7, 38-30=8.
+
+    ``allocator`` is duck-typed (``phase_limit``, ``phase_seats``); without a
+    limit this is exactly :func:`mamba_retention_pin_budget`. A limit without
+    a seat count charges the boot's --max-running-requests -- the larger
+    floor, so the smaller budget (fewer host backups, never a starved slot).
+    Replicated: the limit and n come from the wake request, the floor from
+    server_args -- every rank computes the same number, no collective.
+    """
+    limit = getattr(allocator, "phase_limit", None) if allocator is not None else None
+    if limit is None or int(limit) >= int(mamba_pool_size):
+        return mamba_retention_pin_budget(
+            server_args, max_running_requests, mamba_pool_size
+        )
+    seats = getattr(allocator, "phase_seats", None)
+    running = max(1, int(max_running_requests))
+    if seats is not None:
+        running = max(1, min(running, int(seats)))
+    return mamba_retention_pin_budget(server_args, running, int(limit))
+
+
 def describe_mamba_floor(server_args: "ServerArgs", max_running_requests: int) -> str:
     """Human-readable derivation, for error messages and boot logs."""
     per_req = mamba_slots_per_running_req(server_args)
