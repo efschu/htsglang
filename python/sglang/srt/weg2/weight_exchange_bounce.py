@@ -3267,12 +3267,6 @@ def run_ring_collect(descs, ops, *, sems, stream, card: int, lane_key: str,
     return ""
 
 
-def _mmap_addr(mmv: "_mmap.mmap") -> int:
-    """The mmap's host virtual address, for ops.host_register."""
-    import ctypes
-    return ctypes.addressof(ctypes.c_char.from_buffer(mmv))
-
-
 def _mm_slice(mm, start: int, length: int) -> memoryview:
     """A memoryview of the mmap's region -- for the desk digest_fn."""
     return memoryview(mm)[start:start + length]
