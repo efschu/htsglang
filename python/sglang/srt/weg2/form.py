@@ -409,6 +409,16 @@ class ModelProfile:
     #: on 27b/27b-fp8, UN dry-run 26.09.), because its measured stage
     #: constants were fitted with the formula's slot count.
     p_mamba_slots_from_argv: bool = False
+    #: 27B PARK (user decision 26.09. ~19:00Z, memory d2p-sofort-flippen-und-
+    #: x-exakt-0926): D->P waits for nothing. A queued request whose pending
+    #: tokens exceed X while D decodes parks D's running decodes at once (the
+    #: H91b flip park, POST /weg2/park_running) and the front flips to P; the
+    #: parked ones resume first after the flip back. Only the FLIP park -- the
+    #: pressure park, D seats and the MTP draft carry stay with
+    #: ``standard_form``. qwen27b off until a metal boot measures it (then the
+    #: operator turns the row on); nextflash off (its wait bound is the NF
+    #: seat's). Switch SGLANG_WEG2_D_PARK_IMMEDIATE (explicit value wins).
+    d_park_immediate: bool = False
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -428,6 +438,7 @@ class ModelProfile:
         out["SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV"] = bool(self.standard_form)
         for fld, env_name in PREFIX_SWITCHES:
             out[env_name] = bool(getattr(self, fld))
+        out["SGLANG_WEG2_D_PARK_IMMEDIATE"] = bool(self.d_park_immediate)
         # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
         # installed Form A role plan at run time).
         out["SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW"] = self.d_layout == "qsa_forma"
@@ -560,6 +571,9 @@ PROFILES: Dict[str, ModelProfile] = {
         prefill_transient_checkpoints=(),
         constants=_QWEN27B_CONSTANTS,
         d_residue_census=False,
+        # 27B park (user 26.09.): OFF until measured on the metal under agent
+        # load (profiles/27b-park-draft.env turns it on per env).
+        d_park_immediate=False,
     ),
     PROFILE_NEXTFLASH: ModelProfile(
         id=PROFILE_NEXTFLASH,
@@ -633,6 +647,8 @@ PROFILES: Dict[str, ModelProfile] = {
         constants=_NEXTFLASH_CONSTANTS,
         d_residue_census=True,
         p_mamba_slots_from_argv=True,
+        # NF keeps its H91 wait bound (standard_form); the NF seat decides.
+        d_park_immediate=False,
     ),
 }
 
@@ -662,6 +678,7 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: the prefix switches of :data:`PREFIX_SWITCHES` (RG 26.09.; their readers
 #: read the ENVIRONMENT, which the launcher writes from the row --
 #: :func:`publish_prefix_switches`).
+#: SGLANG_WEG2_D_PARK_IMMEDIATE (``d_park_immediate``, 27B park 26.09.).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }
@@ -919,6 +936,30 @@ def prefix_p_eq_d_mismatch(environ: Mapping[str, str], env_p: Mapping[str, str],
                     f"--env-p/--env-d -- P and D must run it identically (Befund M: the "
                     f"rendered prompt and with it every prefix key differ otherwise)")
     return None
+
+
+#: 27B PARK (user 26.09.): the immediate D->P flip park. Explicitly set it wins;
+#: unset = the profile's ``d_park_immediate``; no form = off.
+D_PARK_IMMEDIATE_ENV = "SGLANG_WEG2_D_PARK_IMMEDIATE"
+
+
+def d_park_immediate_state(environ: Optional[Mapping[str, str]] = None,
+                           profile: Optional[str] = None) -> Tuple[bool, str]:
+    """``(on, source)`` of the immediate D->P flip park: an explicit
+    SGLANG_WEG2_D_PARK_IMMEDIATE ("env ..."), else the registry row of
+    ``profile`` (or of the published form's profile), else off ("no form")."""
+    env = os.environ if environ is None else environ
+    raw = env.get(D_PARK_IMMEDIATE_ENV)
+    if raw is not None and str(raw).strip():
+        return (str(raw).strip().lower() in _ON_WORDS,
+                f"env {D_PARK_IMMEDIATE_ENV}={str(raw).strip()}")
+    if profile is None:
+        form = current_form(environ)
+        profile = form.profile if form is not None else None
+    row = profile_row(profile)
+    if row is not None:
+        return bool(row.d_park_immediate), f"profile {row.id}"
+    return False, "no form (off)"
 
 
 def profile_switch_default(name: str, fallback, environ: Optional[Mapping[str, str]] = None):

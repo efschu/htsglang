@@ -2975,7 +2975,8 @@ class Front:
                  p_phase_max_requests: int = 0,
                  p_pool_tokens: int = 0,
                  d_wait_bound_s: float = 0.0,
-                 p_leg1_stall_s: float = 0.0):
+                 p_leg1_stall_s: float = 0.0,
+                 d_park_immediate: bool = False):
         # #1275: the key arrives as a PATH, never as an argv value. The groups
         # have no choice (`server_args` offers only `--admin-api-key`, so their
         # key is world-readable in /proc/<pid>/cmdline), but the front does, and
@@ -3382,6 +3383,16 @@ class Front:
         self.p_leg1_stall_s = max(0.0, float(p_leg1_stall_s or 0.0))
         #: when a leg 1 last completed -- P's work evidence for that bound.
         self._p_leg1_done_t = 0.0
+        #: 27B PARK (user 26.09. ~19:00Z): "Wartegrenze 0" -- a queued request
+        #: that needs P (pending tokens > X) while D decodes parks D's running
+        #: decodes at once (behind min-dwell and the fairness floor) and the
+        #: flip to P follows; the parked ones resume first after the flip back.
+        #: The CLASS default is off (the 27B front byte-identical); main()
+        #: resolves the flag from SGLANG_WEG2_D_PARK_IMMEDIATE / the profile.
+        self.d_park_immediate = bool(d_park_immediate)
+        #: the D phase (epoch) whose immediate park was held by the dwell
+        #: already named (one WEG2 PARK-IMMEDIATE-DWELL line per phase).
+        self._park_immediate_dwell_epoch = -1
         #: UNIFY (operator 26.09.): the NF H91 standard form on this front --
         #: rule 2's hand-over term and handoff_n/parked_n on D's wake. qwen27b
         #: off: the 27B front byte-identical (profile field standard_form).
@@ -3406,6 +3417,14 @@ class Front:
                 ("wait-bound (replaces --fairness-w-s in the D phase)" if self.d_wait_bound_s > 0
                  else f"--fairness-w-s {self.w_s:g}"),
                 phase_policy.PARK_PATH)
+        if self.d_park_immediate:
+            logger.info(
+                "WEG2-PARK-IMMEDIATE on (27B park, user 26.09.: D->P waits for nothing): a queued "
+                "request that needs P (est_uncached > X in force, P-only, or refused by D as over X) "
+                "while D decodes parks D's running decodes via %s at once -- behind min-dwell and "
+                "the %.0f ms fairness floor -- and the flip to P follows; the parked requests resume "
+                "first after the flip back. d_wait_bound_s=%.1f fairness_w_s=%g stay as they are",
+                phase_policy.PARK_PATH, FAIRNESS_DWELL_FLOOR_MS, self.d_wait_bound_s, self.w_s)
 
     # ---------------- H91 part C: parked requests and the wait bound ----------------
     def _flip_ledger(self, g: Group) -> List[str]:
@@ -3472,7 +3491,31 @@ class Front:
         return {"handoff_n": len(held) + len(ready) + max(0, inflight),
                 "parked_n": len(parked)}
 
-    async def _wait_bound_park(self, wait_s: Optional[float]) -> str:
+    def _immediate_park_due(self, D: Group, now: float) -> Optional["Pending"]:
+        """27B PARK: the queued request that fires the immediate park now, or
+        None. Only while D runs something (an idle D flips on its own path),
+        only once per D phase (the park's own latch), only past the dwell --
+        the derived min-dwell (K7) and the fairness floor -- so every D phase
+        decodes the parked requests for at least the price of its flip."""
+        if self._park_attempt_epoch == self.epoch or not self._flip_ledger(D):
+            return None
+        p = phase_policy.immediate_park_trigger(self.queue, int(self.tp_prefill_max_tokens))
+        if p is None:
+            return None
+        need_ms, prov = self._derived_min_dwell_ms("D", "P")
+        awake_s = now - self.t_awake
+        if not phase_policy.immediate_park_dwell_ok(awake_s, need_ms, FAIRNESS_DWELL_FLOOR_MS):
+            if self._park_immediate_dwell_epoch != self.epoch:
+                self._park_immediate_dwell_epoch = self.epoch
+                self.counters["park_immediate_dwell_holds"] += 1
+                logger.info("WEG2 PARK-IMMEDIATE-DWELL epoch=%d rid=%s awake_ms=%d min_dwell_ms=%d "
+                            "(%s) floor_ms=%d -- the park fires once D has decoded that long this "
+                            "phase", self.epoch, p.rid, int(awake_s * 1000.0), int(need_ms), prov,
+                            int(FAIRNESS_DWELL_FLOOR_MS))
+            return None
+        return p
+
+    async def _wait_bound_park(self, wait_s: Optional[float], immediate: Optional["Pending"] = None) -> str:
         """Rule 3: the wait bound fired in the D phase -- park D's running
         decodes and let the controller flip.
 
@@ -3490,18 +3533,32 @@ class Front:
         D = self.groups["D"]
         running = self._flip_ledger(D)
         self.admit_d = False
-        self.counters["wait_bound_fired"] += 1
         now = time.time()
-        oldest = max(self.queue, key=lambda p: phase_policy.d_phase_wait_s(p.t_arrive, self.t_awake, now),
-                     default=None)
-        logger.warning(
-            "WEG2 WAIT-BOUND FIRED epoch=%d oldest_rid=%s waited_s=%.1f bound_s=%.1f "
-            "(--d-wait-bound-s; measured as now - max(arrival at the front, D phase start)) "
-            "running=%d ready_for_d=%d queue=%d -- admission to D closed for this phase, %s",
-            self.epoch, oldest.rid if oldest is not None else "-", wait_s or 0.0, self.d_wait_bound_s,
-            len(running), len(self._ready_for_d), len(self.queue),
-            "parking the running decodes, then the flip to P" if running
-            else "nothing running: the flip to P follows without a park")
+        if immediate is not None:
+            # 27B PARK (user 26.09.): not a bound -- the arrival itself fires.
+            self.counters["park_immediate_fired"] += 1
+            logger.warning(
+                "WEG2 PARK-IMMEDIATE FIRED epoch=%d rid=%s est_uncached=%d X=%d p_only=%s "
+                "x_requeues=%d waited_s=%.1f awake_s=%.1f running=%d ready_for_d=%d queue=%d -- "
+                "admission to D closed for this phase, %s",
+                self.epoch, immediate.rid, int(immediate.est_uncached), int(self.tp_prefill_max_tokens),
+                bool(getattr(immediate, "p_only", False)), int(getattr(immediate, "x_requeues", 0) or 0),
+                max(0.0, now - float(immediate.t_arrive)), max(0.0, now - float(self.t_awake)),
+                len(running), len(self._ready_for_d), len(self.queue),
+                "parking the running decodes, then the flip to P" if running
+                else "nothing running: the flip to P follows without a park")
+        else:
+            self.counters["wait_bound_fired"] += 1
+            oldest = max(self.queue, key=lambda p: phase_policy.d_phase_wait_s(p.t_arrive, self.t_awake, now),
+                         default=None)
+            logger.warning(
+                "WEG2 WAIT-BOUND FIRED epoch=%d oldest_rid=%s waited_s=%.1f bound_s=%.1f "
+                "(--d-wait-bound-s; measured as now - max(arrival at the front, D phase start)) "
+                "running=%d ready_for_d=%d queue=%d -- admission to D closed for this phase, %s",
+                self.epoch, oldest.rid if oldest is not None else "-", wait_s or 0.0, self.d_wait_bound_s,
+                len(running), len(self._ready_for_d), len(self.queue),
+                "parking the running decodes, then the flip to P" if running
+                else "nothing running: the flip to P follows without a park")
         if not running:
             return "nothing-running"
         if self._park_unsupported:
@@ -3511,7 +3568,9 @@ class Front:
                 "fallback: the %d running decode(s) run to their end, then the flip (pre-H91 "
                 "A1-1 path at the wait bound)", self.epoch, len(running))
             return "unsupported"
-        body = phase_policy.park_body(self.epoch, self.d_wait_bound_s)
+        body = phase_policy.park_body(
+            self.epoch, self.d_wait_bound_s,
+            reason=phase_policy.PARK_REASON_IMMEDIATE if immediate is not None else None)
         # H91c3-1: the park's stamp is taken BEFORE the RPC. D stamps its park
         # while serving the RPC and re-queues it after PARK_REQUEUE_S on its
         # own clock; a front stamp taken after the answer ran that clock late
@@ -4563,6 +4622,8 @@ class Front:
             "p_leg1_stall_s": getattr(self, "p_leg1_stall_s", 0.0),
             "d_parked": sorted(getattr(self, "_d_parked", None) or {}),
             "park_unsupported": bool(getattr(self, "_park_unsupported", False)),
+            # 27B PARK: only when on, so the 27B state stays byte-identical off.
+            **({"d_park_immediate": True} if getattr(self, "d_park_immediate", False) else {}),
         }
 
     async def handle_passthrough_get(self, request: web.Request) -> web.Response:
@@ -8382,6 +8443,15 @@ class Front:
                         fairness_fired = wait_fired or not self.admit_d
                     else:
                         fairness_fired = self._fairness_switch(oldest, "batch")
+                    # 27B PARK (user 26.09.): "Wartegrenze 0" -- a queued request
+                    # that needs P while D decodes fires the park at once (the
+                    # dwell and the fairness floor aside); it pre-empts like the
+                    # fairness bound. Off (the class default): nothing changes.
+                    immediate: Optional[Pending] = None
+                    if self.d_park_immediate and not wait_fired and self.queue:
+                        immediate = self._immediate_park_due(D, _now)
+                        if immediate is not None:
+                            wait_fired = fairness_fired = True
                     # 27B idle policy (c): when D's own work last ended (--d-hold-s).
                     self._note_d_free(not D.outstanding and not self._handoff_in_flight()
                                       and not self._ready_for_d, _now)
@@ -8437,7 +8507,7 @@ class Front:
                         # per D phase; admission to D closes). A hand-off in
                         # flight is waited for first -- it registers within
                         # ms, bounded by the W36 barrier -- so the park sees it.
-                        await self._wait_bound_park(wait_s)
+                        await self._wait_bound_park(wait_s, immediate=immediate)
                     # H91 part C rule 2: D's work is exhausted only when it
                     # runs nothing (the wait-bound-parked ones excepted), holds
                     # no hand-off AND no prefilled request still waits in
@@ -8948,6 +9018,13 @@ def main():
                          "waiting for P longer than this during the D phase (from max(arrival, D phase "
                          "start)) parks D's running decodes via POST /weg2/park_running and flips to P. "
                          "Replaces --fairness-w-s in the D phase while > 0; 0 = off (fairness as before).")
+    ap.add_argument("--d-park-immediate", choices=("on", "off"), default=None,
+                    help="27B park (user 26.09.: D->P waits for nothing): a queued request that needs P "
+                         "(pending tokens > X) while D decodes parks D's running decodes via POST "
+                         "/weg2/park_running at once (behind min-dwell and the fairness floor) and flips "
+                         "to P; the parked ones resume first after the flip back. Unset = "
+                         "SGLANG_WEG2_D_PARK_IMMEDIATE / the profile's d_park_immediate (qwen27b off "
+                         "until measured). D needs the same switch (its flip park).")
     ap.add_argument("--p-leg1-stall-s", type=float, default=None,
                     help="H91 part C: a leg 1 older than this while P showed no work for as long (no "
                          "leg 1 completed, P's progress counters unchanged) is aborted on P and "
@@ -9081,6 +9158,13 @@ def main():
                          "derive the RUN-MOMENT residual from the front's own cgroup reading")
     args = ap.parse_args()
     phase_policy.resolve_front_defaults(args, bool(envs.SGLANG_WEG2_STANDARD_FORM.get()))
+    if args.d_park_immediate is None:  # 27B park: the env / the profile row decides --
+        # through the SAME reader D's flip park uses (form.d_park_immediate_state),
+        # so front and D can never parse one value two ways ("on": EnvBool says no).
+        from sglang.srt.weg2.form import d_park_immediate_state
+
+        _imm, _imm_src = d_park_immediate_state()
+        args.d_park_immediate = "on" if _imm else "off"
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
     dc = {}
     for kv in filter(None, args.dc_reserve.split(",")):
@@ -9110,7 +9194,8 @@ def main():
                   p_phase_max_requests=args.p_phase_max_requests,
                   p_pool_tokens=args.p_pool_tokens,
                   d_wait_bound_s=args.d_wait_bound_s,
-                  p_leg1_stall_s=args.p_leg1_stall_s)
+                  p_leg1_stall_s=args.p_leg1_stall_s,
+                  d_park_immediate=args.d_park_immediate == "on")
     # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
     # against. Kept from weg2/idle-anon-0908.
     if args.anon_preboot_bytes > 0:

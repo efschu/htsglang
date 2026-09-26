@@ -2940,6 +2940,15 @@ class Envs:
     # without a form. d_seats reads the raw value with the same default (it
     # also judges hand-built env mappings); an explicit value always wins.
     SGLANG_WEG2_D_PARK = EnvBool(_profile_default("SGLANG_WEG2_D_PARK", True))
+    # 27B PARK (user decision 26.09. ~19:00Z): D->P waits for nothing -- a
+    # queued request whose pending tokens exceed X while D decodes parks D's
+    # running decodes at once (the H91b FLIP park only: no pressure park, no
+    # seats, no MTP draft carry) and the front flips to P (weg2/front.py,
+    # weg2/d_seats.d_flip_park_active). Default per profile
+    # (ModelProfile.d_park_immediate: qwen27b off until measured, nextflash
+    # off); off without a form. d_seats/front read it through
+    # weg2.form.d_park_immediate_state (same default); explicit value wins.
+    SGLANG_WEG2_D_PARK_IMMEDIATE = EnvBool(_profile_default("SGLANG_WEG2_D_PARK_IMMEDIATE", False))
     # H91d: the L2 bound of those buffers per rank (MiB). A FLIP park whose
     # buffer would pass it goes to L3 (a file under
     # SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR/weg2_d_park_draft, written in the
