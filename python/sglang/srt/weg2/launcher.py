@@ -4934,6 +4934,10 @@ def host_preflight(log: Log, tag: str, dry: bool) -> None:
         raise Weg2LaunchRefused(f"free -g available {avail_gib:.1f} GiB < 40 GiB; top RSS holders (NOT killed):\n" + "\n".join(top))
     oom = open("/sys/fs/cgroup/memory.events").read()
     log(f"host preflight PASS: MemAvailable {avail_gib:.1f} GiB; cgroup memory.events baseline: {' '.join(oom.split())}")
+    # SWAP READINESS (26.09.): the ledger's currencies assume a swapless cgroup;
+    # name the swap state once per boot and WARN when pages already moved out.
+    swap_line, _swap_warn = host_ledger.swap_state_line()
+    log(swap_line)
 
 
 def _free_instrument(mem: Dict[str, "nvml_registry.MemoryInfo"], cards: List[Card]) -> str:

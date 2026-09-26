@@ -459,6 +459,72 @@ def drop_page_cache_range(
 _CGROUP = "/sys/fs/cgroup"
 
 
+#: SWAP READINESS (26.09., /spinning/gpu-arb/docs/SWAP_READINESS_0926.md): the
+#: trim's safety argument is "memory.reclaim can only take clean page cache",
+#: which holds only while this cgroup cannot swap. When swap is POSSIBLE (or
+#: SGLANG_WEG2_SWAP_AWARE=1) the request carries ``swappiness=0`` so proactive
+#: reclaim stays file-only. A kernel that rejects the argument (EINVAL) falls
+#: back to the plain form ONLY when swap is impossible here; otherwise the trim
+#: is refused (the OSError reaches maybe_trim, which disables it).
+_SWAP_AWARE_ENV = "SGLANG_WEG2_SWAP_AWARE"
+
+
+def _swap_possible(cgroup: str = _CGROUP, meminfo: str = "/proc/meminfo") -> bool:
+    """False when this cgroup provably cannot swap: its own ``memory.swap.max``
+    reads 0 (Docker ``--memory-swap == --memory``), or SwapTotal is 0 (CT999
+    ``swap: 0`` via lxcfs, or a swapless host). A visible ``max`` proves
+    nothing (inside CT999 the limit sits on an ancestor), so it falls through
+    to SwapTotal; an unreadable SwapTotal counts as possible."""
+    if (_read_small(f"{cgroup}/memory.swap.max") or "").strip() == "0":
+        return False
+    for line in (_read_small(meminfo) or "").splitlines():
+        if line.startswith("SwapTotal:"):
+            try:
+                return int(line.split()[1]) != 0
+            except (ValueError, IndexError):
+                return True
+    return True
+
+
+def _read_small(path: str) -> Optional[str]:
+    """Read a small kernel file with ``os.open``/``os.read`` -- deliberately
+    NOT ``builtins.open``: the swap-state probe must see the real kernel files
+    even where a caller or test fakes ``open`` for ``memory.reclaim``.
+    ``None`` when unreadable."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        return os.read(fd, 1 << 16).decode("ascii", "replace")
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _write_reclaim(ask: int, cgroup: str = _CGROUP, meminfo: str = "/proc/meminfo") -> str:
+    """Write one ``memory.reclaim`` request; return the string written."""
+    import errno
+
+    possible = _swap_possible(cgroup, meminfo)
+    guarded = possible or os.environ.get(_SWAP_AWARE_ENV, "0").strip() == "1"
+    req = f"{int(ask)} swappiness=0" if guarded else str(int(ask))
+    try:
+        with open(f"{cgroup}/memory.reclaim", "w") as fh:
+            fh.write(req)
+        return req
+    except OSError as err:
+        if not guarded or err.errno != errno.EINVAL or possible:
+            raise
+    # The kernel does not know ``swappiness=`` and this cgroup cannot swap:
+    # the plain request is file-only anyway.
+    req = str(int(ask))
+    with open(f"{cgroup}/memory.reclaim", "w") as fh:
+        fh.write(req)
+    return req
+
+
 class ProgressCoupledTrim:
     """Reclaim page cache when the STREAM advances, not when a clock ticks.
 
@@ -655,8 +721,7 @@ class ProgressCoupledTrim:
         if ask <= 0:
             return
         try:
-            with open(f"{_CGROUP}/memory.reclaim", "w") as fh:
-                fh.write(str(ask))
+            _write_reclaim(ask)
         except OSError as err:
             # A kernel without memory.reclaim, or a cgroup that refuses: this
             # is an optimisation, never a requirement. Say so once and stop.
