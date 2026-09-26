@@ -77,6 +77,7 @@ from sglang.srt.planner import power_limit as _power
 from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import (
     DEFAULT_D_BS,
+    DEFAULT_D_BS_NEXTFLASH,
     DEFAULT_P_BS,
     DEFAULT_PP_ORDERED_CUT,
 )
@@ -2387,6 +2388,110 @@ def d_replayssm_spec_line() -> str:
     )
 
 
+def d_effective_seats(ns) -> int:
+    """H91b: the seats group D actually runs -- ``--max-running-requests`` as
+    --extra-d ships it (the LAST value wins, as in argparse), else D's own
+    ``--d-bs``. ONE reader for every D post that scales with the seats (the
+    H64 verify form, the H91b seat rebook), so the price and the argv cannot
+    describe two different seat counts."""
+    extra = str(getattr(ns, "extra_d", "") or "")
+    d_bs = int(getattr(ns, "d_bs", DEFAULT_D_BS) or DEFAULT_D_BS)
+    raw_mrr = _argv_scalar(extra, "--max-running-requests")
+    try:
+        mrr = int(str(raw_mrr)) if raw_mrr is not None else d_bs
+    except ValueError:
+        mrr = d_bs
+    return max(1, mrr)
+
+
+def d_stated_seats(ns) -> Optional[int]:
+    """H91b: D's seats when this namespace STATES them (the launcher's own
+    parse always does: --d-bs has a default; --extra-d may carry
+    --max-running-requests), else None -- a hand-built namespace that says
+    nothing about seats is priced as its reference was, byte-identical."""
+    extra = str(getattr(ns, "extra_d", "") or "")
+    if not hasattr(ns, "d_bs") and _argv_scalar(extra, "--max-running-requests") is None:
+        return None
+    return d_effective_seats(ns)
+
+
+def _argv_int_list(extra: str, flag: str) -> Optional[List[int]]:
+    """The integers after the LAST ``flag`` of an --extra-* string (argparse
+    ``nargs='+'``: up to the next ``--``), or None when the flag is absent."""
+    if not extra or not flag:
+        return None
+    try:
+        parts = shlex.split(str(extra))
+    except ValueError:
+        return None
+    found: Optional[List[int]] = None
+    for i, tok in enumerate(parts):
+        vals: List[str] = []
+        if tok == flag:
+            j = i + 1
+            while j < len(parts) and not parts[j].startswith("--"):
+                vals.append(parts[j])
+                j += 1
+        elif tok.startswith(flag + "="):
+            vals = [v for v in tok[len(flag) + 1:].replace(",", " ").split() if v]
+        else:
+            continue
+        try:
+            found = [int(v) for v in vals]
+        except ValueError:
+            found = None
+    return found
+
+
+def d_seat_lines(ns) -> List[str]:
+    """H91b: what the seat count of this boot implies for D's argv, named.
+
+    * --d-bs (the front's D seats) against D's effective
+      --max-running-requests -- unequal means the front hands D requests it
+      queues, or leaves a seat idle;
+    * --cuda-graph-bs-decode must capture every batch 1..seats, else the
+      uncovered batch runs EAGER (correct, slow: the pool step's host
+      rendezvous per layer).
+    Findings, not refusals: the boot still starts."""
+    from sglang.srt.weg2.d_seats import graph_bs_covers
+
+    extra = str(getattr(ns, "extra_d", "") or "")
+    d_bs = int(getattr(ns, "d_bs", DEFAULT_D_BS) or DEFAULT_D_BS)
+    seats = d_effective_seats(ns)
+    graph = _argv_int_list(extra, "--cuda-graph-bs-decode")
+    out = [
+        "D-SITZE (H91b): --d-bs %d (Front-Sitze), D --max-running-requests %d (wirksam), "
+        "--cuda-graph-bs-decode %s"
+        % (d_bs, seats, "Runtime-Default" if graph is None else " ".join(str(b) for b in graph))
+    ]
+    if seats != d_bs:
+        out.append(
+            "D-SITZE (H91b) BEFUND: --d-bs %d != D --max-running-requests %d (--extra-d "
+            "gewinnt) -- die Front und D zaehlen verschiedene Sitze" % (d_bs, seats)
+        )
+    if not graph_bs_covers(graph, seats):
+        out.append(
+            "D-SITZE (H91b) BEFUND: --cuda-graph-bs-decode %s faengt nicht jede Batch "
+            "1..%d ein -- die fehlende laeuft EAGER; fuer %d Sitze '--cuda-graph-bs-decode %s'"
+            % (
+                " ".join(str(b) for b in graph),
+                seats,
+                seats,
+                " ".join(str(b) for b in range(1, seats + 1)),
+            )
+        )
+    return out
+
+
+def d_seat_graph_mib(ns) -> Optional[List[float]]:
+    """--d-seat-graph-mib: the measured decode-graph cost per extra seat, one
+    value for every rank or one per rank; None = not given."""
+    raw = str(getattr(ns, "d_seat_graph_mib", "") or "").strip()
+    if not raw:
+        return None
+    return [float(x) for x in raw.split(",") if x.strip()]
+
+
 def d_replayssm_spec_plan_form(ns):
     """H64 (NF line): group D's verify form for the D planner
     (``expert_residency.plan_d_residency``: the #145 FRACTION-SOLVE budget and
@@ -2411,12 +2516,7 @@ def d_replayssm_spec_plan_form(ns):
     from sglang.srt.planner.expert_residency import ReplaySSMSpecForm
 
     extra = str(getattr(ns, "extra_d", "") or "")
-    d_bs = int(getattr(ns, "d_bs", DEFAULT_D_BS) or DEFAULT_D_BS)
-    raw_mrr = _argv_scalar(extra, "--max-running-requests")
-    try:
-        mrr = int(str(raw_mrr)) if raw_mrr is not None else d_bs
-    except ValueError:
-        mrr = d_bs
+    mrr = d_effective_seats(ns)
     ssm = _argv_scalar(extra, "--mamba-ssm-dtype")
     _row = weg2_form.profile_row(getattr(ns, "profile", None))
     if ssm is None and _row is not None and _row.early_read_flags:
@@ -14195,7 +14295,15 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             # H64 (NF): die Verify-Form der D-Gruppe; None unter
             # --d-replayssm-spec off -- die Rechnung bleibt dann byte-gleich.
             replayssm_spec=d_replayssm_spec_plan_form(ns),
+            # H91b: die Sitze, die D wirklich faehrt, und was ihr Graph je
+            # zusaetzlichem Sitz kostet (gemessen, sonst benannt ungebucht).
+            seats=d_stated_seats(ns),
+            seat_graph_mib=d_seat_graph_mib(ns),
+            reference_seats=int(getattr(ns, "d_residency_reference_seats", 1) or 1),
         )
+        if d_stated_seats(ns) is not None:
+            for _ln in d_seat_lines(ns):
+                log(f"{D_RANK_SOLVE_MARKER} {label} {_ln}")
     except (OSError, KeyError, ValueError, _pp_cut.DraftResidencyUnavailable) as _exc:
         # Eine UNLESBARE Geometrie/Referenz verweigert nicht den Boot, sie wird
         # benannt; die Verweigerung unten kommt nur aus einer GERECHNETEN Bilanz.
@@ -16036,6 +16144,18 @@ def build_parser() -> argparse.ArgumentParser:
              "Gewichten gehoeren: KV-Pool, Draft, Aktivierungen. Ohne Angabe "
              "druckt der Solver die DECKE, nicht die Empfehlung.")
     ap.add_argument(
+        "--d-residency-reference-seats", type=int, default=1,
+        help="H91b: die Sitze (--max-running-requests), mit denen die Boots aus "
+             "--d-residency-reference-logs liefen. Die eingebauten NF-Referenzen "
+             "tragen 1 (bs1, belegt durch ihre 7 Mamba-Slots). Die Posten 'mamba "
+             "state pool' und 'speculative intermediate state' werden von dieser "
+             "Zahl auf D's wirksame --max-running-requests umgebucht.")
+    ap.add_argument(
+        "--d-seat-graph-mib", default="",
+        help="H91b: GEMESSENE Mehrkosten des Decode-CUDA-Graphen je zusaetzlichem "
+             "D-Sitz, MiB (ein Wert fuer alle Raenge oder einer je Rang). Leer = die "
+             "KARTE-Zeile nennt den Posten als NICHT GEBUCHT (Obergrenze).")
+    ap.add_argument(
         "--d-residency-reference-logs", default="",
         help="H8: Komma-Liste von D-Boot-Logs (boot_weg2_<tag>_*.D.log), aus "
              "denen der D-FRACTION-SOLVE den festen Rang-Posten MISST "
@@ -17704,6 +17824,18 @@ def bs_source(flag: str, argv: Optional[Sequence[str]] = None) -> str:
     return "flag" if any(w == flag or w.startswith(flag + "=") for w in words) else "default"
 
 
+def apply_profile_d_bs_default(ns, argv: Sequence[str]) -> int:
+    """H91b (Nutzer-Design 25.09., Stufe 1): ``--profile nextflash`` without an
+    explicit ``--d-bs`` runs D with ``DEFAULT_D_BS_NEXTFLASH`` (2) seats instead
+    of the 27B-era ``DEFAULT_D_BS`` (6). An explicit ``--d-bs`` always wins
+    (``bs_source``: a told value is a choice, even when it equals a default).
+    Returns the resolved value."""
+    if (getattr(ns, "profile", None) == PROFILE_NEXTFLASH
+            and bs_source("--d-bs", argv) == "default"):
+        ns.d_bs = DEFAULT_D_BS_NEXTFLASH
+    return int(ns.d_bs)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global _ACTIVE_BOOT_STATE
     # #1248: unclaimed until a BootState exists below -- a stale pointer from
@@ -17711,6 +17843,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # shape anyway) must never make a fast pre-spawn refusal look post-spawn.
     _ACTIVE_BOOT_STATE = None
     ns = build_parser().parse_args(argv)
+    # H91b: the Next-Flash form's own D seat default (2), before anything
+    # reads --d-bs.
+    apply_profile_d_bs_default(ns, list(sys.argv[1:] if argv is None else argv))
     # WEG2-FORM: resolved ONCE, before apply_spec_form (--form-draft and
     # --form-p-draft may drive --spec-form / --draft-kv-on-p /
     # --dflash-produce-on-p), and PUBLISHED into this process's own environment

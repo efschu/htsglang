@@ -4371,7 +4371,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.decode_mem_avail() >= num_tokens
 
-    def retract_all(self, server_args: ServerArgs, offload_kv: bool = True):
+    def retract_all(
+        self, server_args: ServerArgs, offload_kv: bool = True, retain: bool = False
+    ):
+        # H91b: ``retain`` (the D park, /weg2/park_running) keeps every span
+        # in the tree exactly as the #969D cutover does; default = upstream.
         retracted_reqs = retract_all(
             reqs=self.reqs,
             server_args=server_args,
@@ -4380,6 +4384,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
             offload_kv=offload_kv,
+            retain=retain,
         )
         self.reqs = []
         return retracted_reqs
@@ -4511,6 +4516,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         request is retracted first.
         """
         sorted_indices = list(range(len(reqs)))
+
+        # H91b: on Weg-2 group D the YOUNGEST parks (user law 07.09. item 3,
+        # kvso's session_priority_key: spill class, fast lane, FCFS). Under
+        # spec only the back can leave; when the back is not the youngest the
+        # stock order stands and says so.
+        from sglang.srt.weg2 import d_seats as _d_seats
+
+        if _d_seats.d_park_active() and reqs:
+            _order = _d_seats.retraction_order(reqs, spec_active=not allow_policy_sort)
+            if _order is not None:
+                return _order
+            logger.warning(
+                "WEG2-D-PARK retraction: the back of this spec batch (rid=%s) is not its "
+                "youngest request -- the stock back-only order stands",
+                str(getattr(reqs[-1], "rid", "?"))[:12],
+            )
 
         # TODO(lsyin): improve retraction policy for radix cache
         # For spec decoding, filter_batch API can only filter requests from the

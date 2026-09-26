@@ -82,6 +82,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
     VramBudgetReqInput,
     VramBudgetReqOutput,
+    Weg2ParkRunningReqInput,
+    Weg2ParkRunningReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.server_args import LoRARef, ServerArgs
@@ -120,6 +122,7 @@ _COMMUNICATOR_SPECS = [
     ("session_handover", SessionHandoverReqOutput),
     ("session_checkpoint", SessionCheckpointReqOutput),
     ("vram_budget", VramBudgetReqOutput),
+    ("weg2_park_running", Weg2ParkRunningReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -391,6 +394,16 @@ class TokenizerControlMixin:
         boundary (watch the VRAM-DIAL log lines for the DONE record)."""
         self.auto_create_handle_loop()
         return (await self.vram_budget_communicator(obj))[0]
+
+    async def weg2_park_running(
+        self: TokenizerManager, obj: Weg2ParkRunningReqInput
+    ) -> Weg2ParkRunningReqOutput:
+        """H91b: park every running request of Weg-2 group D before its
+        sleep; the schedulers retract them retaining their spans and resume
+        them after the next wake, oldest first. The HTTP streams of the
+        parked requests stay open -- nothing is aborted here."""
+        self.auto_create_handle_loop()
+        return (await self.weg2_park_running_communicator(obj))[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

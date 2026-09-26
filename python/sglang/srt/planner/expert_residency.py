@@ -316,6 +316,11 @@ class DRankReference(msgspec.Struct, frozen=True, kw_only=True):
     #: H64: die Verify-Form der Referenz-Boots (``None`` = rekurrent, sonst
     #: die Ringlaenge L des ReplaySSM-Spec-Rings), aus der Wirkung im Log.
     replayssm_spec_ring_len: Optional[int] = None
+    #: H91b: die SITZE (--max-running-requests) der Referenz-Boots. Die
+    #: Posten 'mamba state pool' und 'speculative intermediate state' sind
+    #: sitz-proportional; ein Boot mit anderer Sitzzahl bucht sie um
+    #: (:func:`seat_rebook`), statt die bs1-Zahl stumm weiterzutragen.
+    max_running: int = 1
 
 
 _TP = r"\[(?:[0-9-]+ [0-9:]+ )?TP(\d+)\]"
@@ -398,6 +403,7 @@ def d_rank_reference_from_logs(
     slot_bytes: float,
     model: str,
     rank_tp_ratio: str,
+    max_running: int = 1,
 ) -> DRankReference:
     """Den festen Rang-Posten aus D-Logs MESSEN (``boots`` = (Name, Text)).
 
@@ -458,10 +464,17 @@ def d_rank_reference_from_logs(
         draft_vocab_held=vocab_held,
         dense_repack_outside_pool=h39,
         replayssm_spec_ring_len=ring,
+        max_running=max(1, int(max_running)),
     )
 
 
 #: Die gemessene Referenz der Next-Flash-Form-A-D-Gruppe (Stand 5a96de48be).
+#: Sitze: beide eingebauten NF-Referenzen liefen mit --max-running-requests 1
+#: (Form A, bs1). Beleg aus ihren eigenen Zahlen: 'mamba state pool' 393.2 MiB
+#: = 7 Slots x 56.17 MiB, und 7 = ceil(1 x (3 + 2) x 1.25) ist genau die
+#: Slotformel der Runtime (``_auto_mamba_demand_size``, Overlap an) fuer EINEN
+#: Sitz; zwei Sitze waeren 13 Slots = 730 MiB. Der Spec-Posten 224.3 MiB = 1
+#: Sitz x 4 Draft-Zeilen x 56.07 MiB je Request-Zustand bestaetigt es.
 #: Hergeleitet von :func:`d_rank_reference_from_logs` aus den Boots
 #: fnFL2x98/x99/x100 (/spinning/evidence-665-f1/boot_weg2_fnFL2x{98,99,100}_*.D.log,
 #: dieselben Zeilen liegen als Test-Fixture unter
@@ -1494,6 +1507,170 @@ def describe_spec_rebook(
     )
 
 
+# ---------------------------------------------------------------------------
+# 7. (H91b) die Sitze der D-Gruppe: bs1 -> bs2 (Stufe 1), spaeter 1..6
+# ---------------------------------------------------------------------------
+
+
+class SeatRebook(msgspec.Struct, frozen=True, kw_only=True):
+    """H91b: die sitz-proportionalen Posten einer Referenz, umgebucht auf die
+    Sitzzahl des Boots -- GERECHNET aus den gemessenen Posten, nicht gemessen.
+
+    ``mamba``: die Runtime baut ``ceil(Sitze x ratio x 1.25)`` Zustands-Slots
+    (``_auto_mamba_demand_size``), der Slot kostet ``mamba_ref / slots_ref``.
+    ``spec``: 'speculative intermediate state' ist ``per_req x Sitze x D``
+    (rekurrent) bzw. ``Sitze x Ring-Werkraum`` -- in beiden Formen linear in
+    den Sitzen."""
+
+    ref_seats: int
+    seats: int
+    slots_ref: int
+    slots: int
+    mamba_ref_mib: Tuple[float, ...]
+    mamba_mib: Tuple[float, ...]
+    spec_ref_mib: Tuple[float, ...]
+    spec_mib: Tuple[float, ...]
+
+    @property
+    def budget_delta_mib(self) -> Tuple[float, ...]:
+        return tuple(
+            round((m - m0) + (s - s0), 1)
+            for m, m0, s, s0 in zip(
+                self.mamba_mib, self.mamba_ref_mib, self.spec_mib, self.spec_ref_mib
+            )
+        )
+
+
+def seat_rebook(reference: DRankReference, *, seats: int) -> SeatRebook:
+    from sglang.srt.weg2.d_seats import mamba_slots_for_seats
+
+    ref_seats = max(1, int(reference.max_running))
+    s = max(1, int(seats))
+    slots_ref = mamba_slots_for_seats(ref_seats)
+    slots = mamba_slots_for_seats(s)
+    return SeatRebook(
+        ref_seats=ref_seats,
+        seats=s,
+        slots_ref=slots_ref,
+        slots=slots,
+        mamba_ref_mib=tuple(float(m) for m in reference.mamba_mib),
+        mamba_mib=tuple(round(float(m) / slots_ref * slots, 1) for m in reference.mamba_mib),
+        spec_ref_mib=tuple(float(x) for x in reference.spec_mib),
+        spec_mib=tuple(round(float(x) / ref_seats * s, 1) for x in reference.spec_mib),
+    )
+
+
+def describe_seat_rebook(rb: SeatRebook, *, source: str) -> str:
+    return (
+        "D-SITZE (H91b): D faehrt %d Sitz(e), die Referenz %s ist mit %d gemessen -> "
+        "'mamba state pool' %d -> %d Slots, je Rang [%s] MiB; 'speculative intermediate "
+        "state' je Rang [%s] MiB; Budget-Delta je Rang %s MiB -- GERECHNET aus den "
+        "gemessenen Posten (Slotformel ceil(Sitze x 5 x 1.25), Spec linear in den "
+        "Sitzen), nicht gemessen"
+        % (
+            rb.seats,
+            source,
+            rb.ref_seats,
+            rb.slots_ref,
+            rb.slots,
+            ", ".join("%.1f -> %.1f" % (a, b) for a, b in zip(rb.mamba_ref_mib, rb.mamba_mib)),
+            ", ".join("%.1f -> %.1f" % (a, b) for a, b in zip(rb.spec_ref_mib, rb.spec_mib)),
+            ["%+.1f" % d for d in rb.budget_delta_mib],
+        )
+    )
+
+
+#: The D group's MoE graph mode; the per-step row bound below holds only for
+#: the device-planned pool (``expert_offload.prepare_pool``).
+POOL_GRAPH_MODE_ENV = "SGLANG_MOE_OFFLOAD_GRAPH_MODE"
+
+
+def pool_step_rows_needed(
+    *, seats: int, verify_tokens: int, top_k: int, local_experts: int, resident_rows: int
+) -> int:
+    """Rows (LRU + staging = scratch) one captured decode step can demand on a
+    rank: the Task #40 overflow-impossible bound of ``expert_pool_device.step``
+    -- every distinct non-resident expert of the step needs a victim or a
+    staging row -- over ``seats x verify_tokens x top_k`` routed ids, capped by
+    how many non-resident experts the rank has at all."""
+    ids = int(seats) * int(verify_tokens) * int(top_k)
+    return int(min(ids, max(int(local_experts) - int(resident_rows), 0)))
+
+
+def pool_step_rows_check(
+    fits: Sequence[DRankResidency],
+    *,
+    seats: Optional[int],
+    verify_tokens: Optional[int],
+    top_k: Optional[object],
+    pool_mode: bool,
+    marker: str,
+    label: str,
+) -> Tuple[Tuple[str, ...], Optional[str]]:
+    """H91b: the per-step row bound at D's seat count, per rank.
+
+    Measured by the Form-A bs2 audit: at bs1 a verify step routes 4 x 10 = 40
+    ids, at bs2 80 -- and a worker with Scratch 48 then raises 'Step ids exceed
+    the LRU rows plus the staging rows' while the bs2 verify graph is CAPTURED
+    (loud, every boot). Refused here with the numbers instead."""
+    if seats is None or not pool_mode:
+        return (), None
+    if verify_tokens is None or top_k is None:
+        return (
+            (
+                "%s FRACTION-SOLVE %s POOL-SCHRITT (H91b) ENTFAELLT: Verify-Fenster "
+                "oder top_k unbekannt (keine Verify-Form uebergeben) -- die "
+                "Zeilenschranke je Schritt bei %d Sitz(en) ist NICHT geprueft"
+                % (marker, label, int(seats)),
+            ),
+            None,
+        )
+    need = [
+        pool_step_rows_needed(
+            seats=int(seats),
+            verify_tokens=int(verify_tokens),
+            top_k=int(top_k),
+            local_experts=f.local_experts,
+            resident_rows=f.resident_rows,
+        )
+        for f in fits
+    ]
+    short = [f.rank for f, n in zip(fits, need) if int(f.scratch_rows) < n]
+    line = (
+        "%s FRACTION-SOLVE %s POOL-SCHRITT (H91b): %d Sitz(e) x %d Verify-Zeilen x "
+        "top_k %d = %d Ids je Schritt -> Zeilen (LRU+Staging) Pflicht je Rang %s = "
+        "min(Ids, E-R), Scratch gegeben %s%s"
+        % (
+            marker,
+            label,
+            int(seats),
+            int(verify_tokens),
+            int(top_k),
+            int(seats) * int(verify_tokens) * int(top_k),
+            need,
+            [int(f.scratch_rows) for f in fits],
+            (" -- ZU KLEIN auf Rang %s" % short) if short else " -- passt",
+        )
+    )
+    if not short:
+        return (line,), None
+    refusal = (
+        "W-SITZE D-Pool-Schritt: bei %d Sitz(en) braucht ein Decode-Schritt je Rang "
+        "%s Zeilen (LRU+Staging), SGLANG_MOE_SCRATCH_SLOTS gibt %s -- Rang %s "
+        "wirft beim Capture des bs%d-Graphen 'Step ids exceed the LRU rows plus the "
+        "staging rows'; Scratch dort anheben (Fraction senken haelt das Budget) "
+        "oder --max-running-requests/--d-bs senken"
+        % (
+            int(seats),
+            need,
+            [int(f.scratch_rows) for f in fits],
+            short,
+            int(seats),
+        )
+    )
+    return (line,), refusal
+
+
 def _env_true(env: Mapping[str, str], name: str) -> bool:
     return str(env.get(name, "")).strip().lower() in _TRUE
 
@@ -1507,9 +1684,11 @@ def _reference_for(
     n_layers: int,
     slot_bytes: float,
     dense_repack: bool = DENSE_REPACK_OUTSIDE_POOL_DEFAULT,
+    reference_seats: int = 1,
 ) -> Tuple[Optional[DRankReference], str]:
     """Die Referenz fuer DIESE Form und DIESEN Baum-Zustand (H50: H39 an/aus),
-    oder ``(None, warum nicht)``."""
+    oder ``(None, warum nicht)``. ``reference_seats`` gilt nur fuer gegebene
+    Logs; die eingebauten Referenzen tragen ihre Sitze selbst (H91b)."""
     import os
 
     model = os.path.basename(os.path.normpath(model_path))
@@ -1526,6 +1705,7 @@ def _reference_for(
             slot_bytes=slot_bytes,
             model=model,
             rank_tp_ratio=rank_tp_ratio,
+            max_running=reference_seats,
         )
         if ref.dense_repack_outside_pool != bool(dense_repack):
             return None, _h39_mismatch_text(
@@ -1590,8 +1770,18 @@ def plan_d_residency(
     marker: str,
     card_reference_logs: str = "",
     replayssm_spec: Optional[ReplaySSMSpecForm] = None,
+    seats: Optional[int] = None,
+    seat_graph_mib: Optional[Sequence[float]] = None,
+    reference_seats: int = 1,
 ) -> DResidencyPlan:
     """Der D-FRACTION-SOLVE mit den Metallregeln, fuer ``launcher``.
+
+    H91b: ``seats`` = D's wirksame --max-running-requests. Weicht sie von den
+    Sitzen der Referenz ab, werden die sitz-proportionalen Posten umgebucht
+    (Budget) und die Karte um die Mehr-Allokation verschoben; ``None`` laesst
+    die Rechnung byte-gleich. ``seat_graph_mib`` = gemessene Mehrkosten des
+    Decode-CUDA-Graphen je zusaetzlichem Sitz und Rang (Karte, ausserhalb des
+    Budgets); fehlt sie, sagt die KARTE-Zeile das mit Namen.
 
     Liest die Checkpoint-Geometrie (Header, keine Tensoren), die Gruppen-Env
     von D und die gemessene Referenz; rechnet je Rang die Bilanz und gibt die
@@ -1629,11 +1819,37 @@ def plan_d_residency(
         n_layers=int(terms.n_layers),
         slot_bytes=slot_bytes,
         dense_repack=dense_repack,
+        reference_seats=reference_seats,
     )
     if ref is None:
         return DResidencyPlan(
             lines=("%s FRACTION-SOLVE %s ENTFAELLT: %s." % (marker, label, why),),
             refusal=None,
+        )
+    # H91b: die Sitze. Die Referenz-Posten gelten fuer IHRE Sitzzahl; ein
+    # bs2-Boot mit der bs1-Zahl waere um einen ganzen Sitz unterbepreist und
+    # stuerbe am KV-Pool bzw. an der Karte. Umbuchen VOR H64, damit dessen
+    # per_req (Posten / (Sitze x D)) aus dem Posten DERSELBEN Sitzzahl folgt.
+    seat_rb: Optional[SeatRebook] = None
+    seat_lines: Tuple[str, ...] = ()
+    ref_seats = int(ref.max_running)
+    if seats is not None and int(seats) != ref_seats:
+        seat_rb = seat_rebook(ref, seats=int(seats))
+        ref = msgspec.structs.replace(
+            ref,
+            mamba_mib=seat_rb.mamba_mib,
+            spec_mib=seat_rb.spec_mib,
+            max_running=int(seats),
+        )
+        seat_lines = (
+            "%s FRACTION-SOLVE %s %s"
+            % (marker, label, describe_seat_rebook(seat_rb, source=ref.source)),
+        )
+    elif seats is not None:
+        seat_lines = (
+            "%s FRACTION-SOLVE %s D-SITZE (H91b): D faehrt %d Sitz(e) wie die Referenz "
+            "%s -- ihre sitz-proportionalen Posten gelten unveraendert"
+            % (marker, label, int(seats), ref.source),
         )
     # H64: der Spec-Posten der Referenz gilt fuer IHRE Verify-Form. Nur wenn
     # der Launcher eine Form uebergibt (--d-replayssm-spec on), wird er auf die
@@ -1735,9 +1951,19 @@ def plan_d_residency(
             dcp_note,
         )
     )
-    lines = (head,) + spec_lines + tuple(
+    lines = (head,) + seat_lines + spec_lines + tuple(
         "%s FRACTION-SOLVE %s %s" % (marker, label, describe_rank(f)) for f in fits
     )
+    step_lines, step_refusal = pool_step_rows_check(
+        fits,
+        seats=seats,
+        verify_tokens=(replayssm_spec.draft_tokens if replayssm_spec is not None else None),
+        top_k=text_cfg.get("num_experts_per_tok"),
+        pool_mode=str(env_d.get(POOL_GRAPH_MODE_ENV, "")).strip().lower() == "pool",
+        marker=marker,
+        label=label,
+    )
+    lines = lines + step_lines
     card_lines, cards, card_refusal = _plan_d_card(
         fits=fits,
         model_path=model_path,
@@ -1756,14 +1982,93 @@ def plan_d_residency(
         ),
         text_cfg=text_cfg,
         act_dtype=act_dtype,
+        seat_rb=seat_rb,
+        seat_graph_mib=seat_graph_mib,
     )
-    refusals = [t for t in (refusal_text(fits, label=label), card_refusal) if t]
+    refusals = [
+        t for t in (refusal_text(fits, label=label), card_refusal, step_refusal) if t
+    ]
     return DResidencyPlan(
         lines=lines + card_lines,
         refusal="; ".join(refusals) if refusals else None,
         fits=fits,
         card_fits=cards,
     )
+
+
+def _seat_card_shift(
+    rb: SeatRebook,
+    *,
+    card_ring_len: Optional[int],
+    replayssm_spec: Optional[ReplaySSMSpecForm],
+    spec_per_req_mib: Optional[Sequence[float]],
+    text_cfg: Optional[Mapping[str, object]],
+    act_dtype: Optional[str],
+    seat_graph_mib: Optional[Sequence[float]],
+    source: str,
+    marker: str,
+    label: str,
+) -> Tuple[Tuple[float, ...], Tuple[str, ...]]:
+    """H91b: um wie viel die Karte je Rang ENGER wird (negativ), weil D mehr
+    Sitze faehrt als die Karten-Referenz: Mamba-Slots (Allokation = Posten),
+    Verify-Allokation in der Form der Karten-Referenz (``(Sitze+1)`` Zeilen,
+    wie ``MambaPool`` sie baut) und -- nur wenn gemessen uebergeben -- der
+    Decode-Graph je zusaetzlichem Sitz."""
+    n = len(rb.mamba_mib)
+    extra = rb.seats - rb.ref_seats
+    mamba = [rb.mamba_mib[r] - rb.mamba_ref_mib[r] for r in range(n)]
+    how = ""
+    if replayssm_spec is not None and spec_per_req_mib is not None and text_cfg is not None:
+        a_seats = replayssm_spec_alloc_mib(
+            per_req_mib=spec_per_req_mib,
+            ring_len=card_ring_len,
+            form=msgspec.structs.replace(replayssm_spec, max_running=rb.seats),
+            text_cfg=text_cfg,
+            act_dtype=act_dtype,
+        )
+        a_ref = replayssm_spec_alloc_mib(
+            per_req_mib=spec_per_req_mib,
+            ring_len=card_ring_len,
+            form=msgspec.structs.replace(replayssm_spec, max_running=rb.ref_seats),
+            text_cfg=text_cfg,
+            act_dtype=act_dtype,
+        )
+        spec = [a - b for a, b in zip(a_seats, a_ref)]
+        how = "Verify-Allokation in der Form der Karten-Referenz (%s)" % spec_form_text(card_ring_len)
+    else:
+        spec = [rb.spec_mib[r] - rb.spec_ref_mib[r] for r in range(n)]
+        how = "Verify-Allokation ~ Spec-Posten (keine Verify-Form uebergeben; Obergrenze)"
+    graph = [0.0] * n
+    if seat_graph_mib is not None and len(seat_graph_mib) in (1, n):
+        vals = list(seat_graph_mib) * (n if len(seat_graph_mib) == 1 else 1)
+        graph = [float(v) * extra for v in vals]
+        graph_text = "Decode-Graph je Sitz %s MiB GEMESSEN uebergeben" % [float(v) for v in vals]
+    else:
+        graph_text = (
+            "Decode-Graph des zusaetzlichen Sitzes NICHT GEBUCHT (--d-seat-graph-mib "
+            "fehlt: die Graph-Pool-Mehrkosten von bs%d sind nur am Metall messbar) -- "
+            "diese KARTE-Zeile ist damit eine OBERGRENZE" % rb.seats
+        )
+    shift = tuple(round(-(mamba[r] + spec[r] + graph[r]), 1) for r in range(n))
+    line = (
+        "%s KARTE %s D-SITZE (H91b): D faehrt %d Sitz(e), Karten-Referenz %s mit %d -> "
+        "Mamba-Slots %s MiB, %s %s MiB, Graph %s MiB => Kopfraum/Decode-frei je Rang "
+        "%s MiB -- GERECHNET; %s"
+        % (
+            marker,
+            label,
+            rb.seats,
+            source,
+            rb.ref_seats,
+            ["%+.1f" % x for x in mamba],
+            how,
+            ["%+.1f" % x for x in spec],
+            ["%+.1f" % x for x in graph],
+            ["%+.1f" % x for x in shift],
+            graph_text,
+        ),
+    )
+    return shift, line
 
 
 def _card_reference_for(
@@ -1849,6 +2154,8 @@ def _plan_d_card(
     spec_per_req_mib: Optional[Sequence[float]] = None,
     text_cfg: Optional[Mapping[str, object]] = None,
     act_dtype: Optional[str] = None,
+    seat_rb: Optional[SeatRebook] = None,
+    seat_graph_mib: Optional[Sequence[float]] = None,
 ) -> Tuple[Tuple[str, ...], Tuple[DCardFit, ...], Optional[str]]:
     """H33: die Karten-Bilanz neben der Budget-Bilanz. Eine unlesbare Referenz
     verweigert nicht, sie wird benannt (wie H8); verweigert wird nur aus einer
@@ -1932,6 +2239,32 @@ def _plan_d_card(
                 ["%+.1f" % s for s in shift],
             ),
         )
+    seat_line: Tuple[str, ...] = ()
+    if seat_rb is not None:
+        seat_shift, seat_line = _seat_card_shift(
+            seat_rb,
+            card_ring_len=ref.replayssm_spec_ring_len,
+            replayssm_spec=replayssm_spec,
+            spec_per_req_mib=spec_per_req_mib,
+            text_cfg=text_cfg,
+            act_dtype=act_dtype,
+            seat_graph_mib=seat_graph_mib,
+            source=ref.source,
+            marker=marker,
+            label=label,
+        )
+        ref = msgspec.structs.replace(
+            ref,
+            headroom0_mib=tuple(
+                round(h + s, 1) for h, s in zip(ref.headroom0_mib, seat_shift)
+            ),
+            peak_mib=tuple(round(pk - s, 1) for pk, s in zip(ref.peak_mib, seat_shift)),
+            free_decode0_mib=tuple(
+                None if f is None else round(f + s, 1)
+                for f, s in zip(ref.free_decode0_mib, seat_shift)
+            ),
+        )
+        shift_line = shift_line + seat_line
     floor = float(corridor_band_floor_mib())
     cards = solve_d_card(
         fits=fits,

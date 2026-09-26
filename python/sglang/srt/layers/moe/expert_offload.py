@@ -4162,9 +4162,9 @@ class MoEExpertOffloadCache:
         import os
 
         from sglang.srt.layers.moe.expert_pool_device import (
-            PLAN_WIDTH,
             allocate_pool_tables,
             allocate_step_buffers,
+            plan_width_for,
         )
 
         if self._pool_ready:
@@ -4190,7 +4190,11 @@ class MoEExpertOffloadCache:
                 f"pool mode requires buffer_size == R+C ({rows} != {R}+{C})"
             )
         staging = int(os.environ.get("SGLANG_MOE_POOL_STAGING", "12") or 12)
-        staging = max(1, min(staging, C - 1, PLAN_WIDTH))
+        # H91b: the plan width follows the widest captured step (bs2 MTP
+        # verify: 2 x 4 x top-10 = 80 ids > the historic 64); a bs1 form keeps
+        # exactly PLAN_WIDTH.
+        width = plan_width_for(self._pool_max_step_ids())
+        staging = max(1, min(staging, C - 1, width))
         attrs = [a for a in self._pinned if a in self._resident]
         device = self._resident[attrs[0]].device
         hot_slot_of, host_row = self._pool_layout()
@@ -4198,14 +4202,14 @@ class MoEExpertOffloadCache:
         self._pool_tables = allocate_pool_tables(
             device, E, rows, R, staging, hot_slot_of, host_row
         )
-        self._pool_buffers = allocate_step_buffers(device, E, PLAN_WIDTH)
+        self._pool_buffers = allocate_step_buffers(device, E, width)
         self._pool_srcs = [device_view_of_pinned(self._pinned[a]) for a in attrs]
         self._pool_dsts = [self._resident[a] for a in attrs]
         self._pool_view_holders = [self._pinned[a] for a in attrs]
         if pool_prefetch_enabled():
             import torch
 
-            self._pool_pf_buffers = allocate_step_buffers(device, E, PLAN_WIDTH)
+            self._pool_pf_buffers = allocate_step_buffers(device, E, width)
             self._pool_pf_begin = torch.cuda.Event()
             self._pool_pf_done = torch.cuda.Event()
         self._pool_ready = True
@@ -4215,6 +4219,29 @@ class MoEExpertOffloadCache:
             getattr(self.layer, "layer_id", None), R, C - staging, staging,
             sum(1 for h in host_row if h >= 0), len(attrs),
             "on" if self._pool_pf_buffers is not None else "off",
+        )
+
+    def _pool_max_step_ids(self):
+        """H91b: the widest step a captured decode graph routes through this
+        layer (``expert_pool_device.pool_max_step_ids``), from the boot's
+        server args; ``None`` (= the historic PLAN_WIDTH) when they are not
+        reachable, e.g. in a desk harness."""
+        from sglang.srt.layers.moe.expert_pool_device import pool_max_step_ids
+
+        try:
+            from sglang.srt.runtime_context import get_server_args
+
+            sa = get_server_args()
+        except Exception:  # noqa: BLE001 -- no runtime context: keep the old width
+            return None
+        spec = getattr(sa, "speculative_algorithm", None)
+        verify = getattr(sa, "speculative_num_draft_tokens", None) if spec else None
+        return pool_max_step_ids(
+            graph_bs=getattr(sa, "cuda_graph_bs_decode", None),
+            max_graph_bs=getattr(sa, "cuda_graph_max_bs_decode", None),
+            max_running=getattr(sa, "max_running_requests", None),
+            verify_tokens=verify,
+            top_k=getattr(self.layer, "top_k", None),
         )
 
     def prepare_pool(self, topk_ids):

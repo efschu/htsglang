@@ -8730,6 +8730,12 @@ class SchedulerWeightUpdaterManager:
                     "with %s until resume_memory_occupation",
                     "W25 Weg2DormantRefused",
                 )
+                # H91b: the requests /weg2/park_running parked enter the
+                # dormant hold FIRST, their store prefetch issued now so it
+                # runs during the flip (a no-op when nothing is parked).
+                _hold_parked = getattr(scheduler, "weg2_d_hold_parked", None)
+                if callable(_hold_parked):
+                    _hold_parked()
         if weights_tags:
             # #89 hibernate: destination="disk" parks the FINAL post-transform
             # weights to hibernate_dir before the normal release/pause, so a
