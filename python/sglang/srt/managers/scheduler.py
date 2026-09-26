@@ -2353,6 +2353,9 @@ class Scheduler(
         # H101: every QSA rows launch form loaded (and its local memory booked)
         # BEFORE the sampling warmup's barrier and the first sleep.
         self.warm_qsa_rows_forms()
+        # H103: the run-time-T FLA l2norm kernel loaded BEFORE the sampling
+        # warmup's barrier and the first sleep (behind H101's rows prewarm).
+        self.warm_fla_l2norm()
         # #603b: LAST in this method, after every worker, pool, backend and
         # graph exists. The warmup ends in a group barrier, so it must sit at a
         # point every rank reaches exactly once with the model fully built.
@@ -2364,6 +2367,17 @@ class Scheduler(
         from sglang.srt.layers.attention.qsa.rows_prewarm import run_boot_prewarm
 
         run_boot_prewarm()
+
+    def warm_fla_l2norm(self):
+        """H103: delegate to fla/l2norm_prewarm.run_boot_prewarm (rank-local, no
+        collective; the #603b barrier right after pairs the ranks up)."""
+        from sglang.srt.layers.attention.fla.l2norm_prewarm import run_boot_prewarm
+
+        run_boot_prewarm(
+            hf_text_config=self.model_config.hf_text_config,
+            dtype=self.model_config.dtype,
+            device=self.tp_worker.device,
+        )
 
     def warm_sampling_backend(self):
         """#603b: make the sampling JIT kernels resident BEFORE serving starts.

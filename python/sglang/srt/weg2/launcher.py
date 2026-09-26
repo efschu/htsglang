@@ -3674,6 +3674,11 @@ PP_CHAIN_RECV_STALL_S = 60
 PP_OCCUPANT_HORIZON_S = 90
 MATCH_REFUSAL_CENSUS_EVERY = 64
 
+#: H103: the FLA l2norm run-time-T switch (fla/l2norm.py ``L2NORM_RUNTIME_T_ENV``,
+#: same name, pinned by the test; spelled here so the launcher never imports
+#: triton/torch). build_env sets it for both groups.
+L2NORM_RUNTIME_T_ENV = "SGLANG_FLA_L2NORM_RUNTIME_T"
+
 #: #1235 THE ARGV LITERALS THAT WERE NOBODY'S.
 #:
 #: RANDOM_SEED is arbitrary and FIXED, and that is its whole provenance: it is
@@ -7706,6 +7711,13 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # publish sweep runs bounded in the PP loop's bubbles, nothing is left
     # for the flip's flush. "0" in the operator's environment disables it.
     env.setdefault("SGLANG_WEG2_BUBBLE_PUBLISH", "1")
+    # H103: FLA l2norm with the row count as a RUN-TIME bound for BOTH groups
+    # (fla/l2norm.py L2NORM_RUNTIME_T_ENV, the 27B strand's switch, 6b24aa60da;
+    # there --p-host-overlap sets it for P only). The stock kernel takes T as
+    # tl.constexpr: rc9p D-TP0 loaded it 15x after READY, 16.7 s of cold-load
+    # windows (one 12.7 s), P 78x. Bit-identical output (same body). "0" in
+    # the operator's environment keeps the stock kernel.
+    env.setdefault(L2NORM_RUNTIME_T_ENV, "1")
     if arming_floor_solved:
         env["SGLANG_ARMING_FLOOR_SOLVED"] = "1"
     else:
