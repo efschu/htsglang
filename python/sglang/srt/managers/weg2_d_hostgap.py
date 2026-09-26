@@ -56,6 +56,8 @@ import time
 from contextlib import contextmanager
 from typing import Dict, Optional
 
+import torch
+
 logger = logging.getLogger(__name__)
 
 D_DEFER_SEQ_LENS_CPU_ENV = "SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU"
@@ -65,6 +67,15 @@ D_DEFER_SEQ_LENS_CPU_ENV = "SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU"
 D_DEFER_REBUILD_ENV = "SGLANG_WEG2_D_DEFER_REBUILD"
 D_HOSTGAP_ENV = "SGLANG_WEG2_D_HOSTGAP"
 D_HOSTGAP_DEFAULT_ROUNDS = 512
+#: Stage 3 (needs D_DEFER_SEQ_LENS_CPU_ENV): the draft replay is launched
+#: BEFORE the host wait when the host already knows the exact compact draft
+#: lengths -- every request's committed length (host lower bound) is at least
+#: the draft window, so min(len, window) == window (page size 1). The wait
+#: moves to the verify prep, behind the queued draft. See early_draft_window_exact.
+D_EARLY_DRAFT_ENV = "SGLANG_WEG2_D_EARLY_DRAFT"
+#: Instrument (needs D_HOSTGAP_ENV): one extra ``#DGAP-SPLIT`` line per
+#: ``#DGAP`` line, the host stretch after the publish wake cut at named marks.
+D_HOSTGAP_SPLIT_ENV = "SGLANG_WEG2_D_HOSTGAP_SPLIT"
 
 
 def defer_seq_lens_cpu_on() -> bool:
@@ -76,6 +87,15 @@ def defer_seq_lens_cpu_on() -> bool:
 def defer_rebuild_on() -> bool:
     """Stage 2 of the deferred read; inert unless the deferral itself is on."""
     return os.environ.get(D_DEFER_REBUILD_ENV, "") == "1"
+
+
+def early_draft_on() -> bool:
+    """Stage 3 of the deferred read; inert unless the deferral itself is on."""
+    return os.environ.get(D_EARLY_DRAFT_ENV, "") == "1"
+
+
+def hostgap_split_on() -> bool:
+    return os.environ.get(D_HOSTGAP_SPLIT_ENV, "") == "1"
 
 
 def hostgap_rounds() -> int:
@@ -112,9 +132,23 @@ class DHostGap:
 
     SPANS = ("publish_wait", "copy_done_wait", "hicache")
 
-    def __init__(self, rounds: int, clock=time.perf_counter):
+    #: Marks of the ``#DGAP-SPLIT`` line, in round order. ``lens``: exact
+    #: compact draft lengths taken; ``fb``: draft ForwardBatch built and the
+    #: sampler staged; ``load``: draft graph inputs copied and its attention
+    #: planned (graph runner, before the replay); ``draft``: draft replay
+    #: launched; ``vprep``: verify prepared; ``vload``: verify graph inputs +
+    #: plan; ``verify``: verify replay launched.
+    SPLIT_MARKS = ("lens", "fb", "load", "draft", "vprep", "vload", "verify")
+
+    def __init__(self, rounds: int, clock=time.perf_counter, split: bool = False):
         self.rounds = int(rounds)
         self._clock = clock
+        self._split: Optional[Dict[str, float]] = (
+            {k: 0.0 for k in self.SPLIT_MARKS} if split else None
+        )
+        self._split_n: Dict[str, int] = {k: 0 for k in self.SPLIT_MARKS}
+        self._split_wake: Optional[float] = None
+        self._early = 0
         self._sums: Dict[str, float] = {k: 0.0 for k in self.SPANS}
         self._crit_sum = 0.0
         self._crit_n = 0
@@ -141,6 +175,27 @@ class DHostGap:
     # -- critical stretch: publish wake -> draft replay launched ----------
     def mark_wake(self) -> None:
         self._wake_t = self._clock()
+        if self._split is not None:
+            self._split_wake = self._wake_t
+
+    def note_early_draft(self) -> None:
+        """This round's draft replay was launched before the publish wake
+        (SGLANG_WEG2_D_EARLY_DRAFT): it has no crit sample. A wake left over
+        from the previous round (its belt wait came after its own draft) is
+        dropped, so it cannot pair with this round's launch."""
+        self._early += 1
+        self._wake_t = None
+
+    def mark(self, label: str) -> None:
+        """``#DGAP-SPLIT``: host ms from this round's publish wake to
+        ``label``. A mark reached before the wake (an early draft) is not a
+        post-wake stretch and is not counted."""
+        if self._split is None or self._split_wake is None:
+            return
+        if label not in self._split:
+            return
+        self._split[label] += (self._clock() - self._split_wake) * 1000.0
+        self._split_n[label] += 1
 
     def mark_draft_launched(self) -> None:
         if self._wake_t is None:
@@ -163,6 +218,7 @@ class DHostGap:
         """Close one decode round; returns (and logs) the line when due."""
         now = self._clock()
         last, self._last_end = self._last_end, now
+        self._split_wake = None
         if last is None or (now - last) > self.IDLE_RESTART_S:
             # First round, or the first after a pause: it only opens a window.
             self._reset_sums()
@@ -189,7 +245,21 @@ class DHostGap:
             f"draft replay launched) deferred={self._deferred}/{n} "
             f"(host clocks only; allreduce is device time inside the replays)"
         )
+        if early_draft_on():
+            line += f" early_draft={self._early}/{n}"
         logger.info(line)
+        if self._split is not None:
+            parts = " ".join(
+                f"{k}={self._split[k] / self._split_n[k]:.3f}"
+                if self._split_n[k] else f"{k}=-"
+                for k in self.SPLIT_MARKS
+            )
+            counts = ",".join(str(self._split_n[k]) for k in self.SPLIT_MARKS)
+            logger.info(
+                "#DGAP-SPLIT rounds=%d %s (ms after the publish wake, mean over "
+                "the rounds that reached the mark after it; n=%s; host clocks)",
+                n, parts, counts,
+            )
         self._reset_sums()
         return line
 
@@ -202,6 +272,11 @@ class DHostGap:
         self._crit_max = 0.0
         self._n = 0
         self._deferred = 0
+        self._early = 0
+        if self._split is not None:
+            for k in self._split:
+                self._split[k] = 0.0
+                self._split_n[k] = 0
 
 
 _METER: Optional[DHostGap] = None
@@ -221,13 +296,26 @@ def meter() -> Optional[DHostGap]:
             # Loud, not fatal: an instrument must never take the boot down.
             logger.warning("#DGAP instrument OFF -- %s", exc)
             rounds = 0
-        _METER = DHostGap(rounds) if rounds else None
+        _METER = DHostGap(rounds, split=hostgap_split_on()) if rounds else None
         if _METER is not None:
             logger.info(
                 "#DGAP instrument on: one line every %d decode rounds (%s)",
                 rounds, D_HOSTGAP_ENV,
             )
+            if _METER._split is not None:
+                logger.info(
+                    "#DGAP-SPLIT on (%s=1): marks %s after the publish wake",
+                    D_HOSTGAP_SPLIT_ENV, ",".join(DHostGap.SPLIT_MARKS),
+                )
     return _METER
+
+
+def split_mark(label: str) -> None:
+    """``meter().mark(label)`` when the ``#DGAP-SPLIT`` instrument is on; one
+    global read otherwise (called from the graph runner's replay path)."""
+    m = _METER if _METER_RESOLVED else meter()
+    if m is not None and m._split is not None:
+        m.mark(label)
 
 
 def reset_for_tests() -> None:
@@ -306,7 +394,10 @@ class PendingSeqLensCpu:
     (the scheduler's forward isolation restores the pre-forward snapshot, in
     which they were still ``None``)."""
 
-    __slots__ = ("_pinned", "_event", "_idx_cpu", "seq_lens_cpu", "seq_lens_sum")
+    __slots__ = (
+        "_pinned", "_event", "_idx_cpu", "seq_lens_cpu", "seq_lens_sum",
+        "lower_bound",
+    )
 
     def __init__(self, pinned, event, req_pool_indices_cpu):
         self._pinned = pinned
@@ -314,6 +405,10 @@ class PendingSeqLensCpu:
         self._idx_cpu = req_pool_indices_cpu
         self.seq_lens_cpu = None
         self.seq_lens_sum = None
+        #: SGLANG_WEG2_D_EARLY_DRAFT: the host lengths the batch carried before
+        #: the deferred resolve cleared them (see snapshot_lower_bound); None
+        #: when the switch is off.
+        self.lower_bound = None
 
     @property
     def done(self) -> bool:
@@ -334,3 +429,63 @@ class PendingSeqLensCpu:
             self._pinned = None
         batch.seq_lens_cpu = self.seq_lens_cpu
         batch.seq_lens_sum = self.seq_lens_sum
+
+
+# -- stage 3: the draft replay before the host wait (SGLANG_WEG2_D_EARLY_DRAFT) --
+
+def snapshot_lower_bound(batch):
+    """The host lengths ``batch.seq_lens_cpu`` holds right BEFORE the deferred
+    resolve clears them, as an int64 CPU copy -- or None (switch off, no
+    mirror).
+
+    Why that is a lower bound of the lengths the round will publish: in a
+    DFLASH decode batch it is the seed ``DFlashDraftInputV2.prepare_for_decode``
+    wrote (``req.kv_committed_len``, which lags the device length by one
+    in-flight verify) or, without a fresh seed, the mirror of an earlier round.
+    Decode lengths never shrink (every verify commits >= 1 token; a retracted
+    request leaves the batch, and filter/merge keep the mirror row-aligned), so
+    any earlier value is <= the value round N publishes."""
+    if not early_draft_on():
+        return None
+    lo = getattr(batch, "seq_lens_cpu", None)
+    if lo is None:
+        return None
+    try:
+        return lo.detach().to(device="cpu", dtype=torch.int64).clone()
+    except Exception:  # noqa: BLE001 -- the fallback is the old wait
+        return None
+
+
+def pending_lower_bound(ready):
+    """The lower bound riding on a ``seq_lens_cpu_ready`` callback (the
+    scheduler's ``partial(PendingSeqLensCpu.complete, batch)``), or None."""
+    pending = getattr(getattr(ready, "func", None), "__self__", None)
+    if not isinstance(pending, PendingSeqLensCpu):
+        return None
+    return pending.lower_bound
+
+
+def early_draft_window_exact(ready, bs: int, window, page_size: int, upper=None) -> bool:
+    """May the draft be planned and launched before the host wait?
+
+    True only when the exact compact draft lengths are already known on the
+    host WITHOUT the published mirror: page size 1 (the compact length is
+    exactly ``min(len, window)``), a lower bound for every row, and every
+    row's lower bound >= the window -- then ``min(len, window) == window``
+    for the unknown exact ``len >= lower bound``. The host values the draft
+    plan then reads (``window`` per row, sum ``bs * window``) are the ones the
+    waited path would compute, so the draft forward is byte-identical; only
+    the host wait moves behind its launch.
+
+    Belt: a lower bound above the reservation bound ``upper`` (the allocator's
+    ``nxt_kv_lens_cpu``) cannot be a lower bound; such a round keeps the wait."""
+    if ready is None or window is None or bs <= 0 or int(page_size) > 1:
+        return False
+    lo = pending_lower_bound(ready)
+    if lo is None or int(lo.numel()) != int(bs):
+        return False
+    if upper is not None:
+        up = upper.to(device="cpu", dtype=torch.int64).reshape(-1)
+        if int(up.numel()) != int(bs) or bool((lo.reshape(-1) > up).any()):
+            return False
+    return int(lo.min()) >= int(window)

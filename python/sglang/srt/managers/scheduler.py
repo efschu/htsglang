@@ -16162,9 +16162,14 @@ class Scheduler(
                 # at its first use of the exact lengths; unset = the old read.
                 _pending_lens = None
                 if _d_hostgap.defer_eligible(self, batch):
+                    # SGLANG_WEG2_D_EARLY_DRAFT: the lengths the batch carries
+                    # before the resolve clears them (None when off).
+                    _lens_lo = _d_hostgap.snapshot_lower_bound(batch)
                     _pending_lens = self.future_map.resolve_seq_lens_cpu(
                         batch, defer=True
                     )
+                    if _pending_lens is not None:
+                        _pending_lens.lower_bound = _lens_lo
                 else:
                     self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:

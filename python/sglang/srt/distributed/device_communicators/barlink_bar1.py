@@ -1658,6 +1658,19 @@ def a2a_rounds(largest_block: int, slot: int) -> int:
     return max(1, -(-int(largest_block) // int(slot)))
 
 
+
+def bar1_algo_code(algo: str, canon_order: bool = False) -> int:
+    """The ``algo`` integer ``bar1_all_reduce`` takes: 0 mesh, 1 ring,
+    2 oneshot, 3 oneshot in canonical rank order
+    (``SGLANG_BARLINK_BAR1_CANON_ORDER``; the kernel maps 3 back to the
+    oneshot with ``Bar1Args.canon`` set). The switch only touches the oneshot:
+    mesh and ring already hand every rank the same bytes (each chunk is
+    reduced by ONE rank and then distributed)."""
+    code = {"mesh": 0, "ring": 1, "oneshot": 2}[algo]
+    if code == 2 and canon_order:
+        return 3
+    return code
+
 def bc_plan(nbytes: int, slot: int) -> list:
     """The round decomposition of a ``broadcast``. Pure arithmetic.
 
@@ -2182,6 +2195,20 @@ class BarlinkBar1Transport:
         self.oneshot_max = int(
             os.environ.get("SGLANG_BARLINK_BAR1_ONESHOT_MAX", str(64 << 10))
         )
+        #: 26.09. (HG): the oneshot reduces over own + received in an order
+        #: that starts at the OWN contribution, so at R=3 rank 2 sums
+        #: (x2+x0)+x1 and ranks 0/1 (x0+x1)+x2 -- not bitwise equal across
+        #: ranks. 1 = every rank sums in rank order 0..R-1 (kernel
+        #: reduceNPhaseCanon; same reads, no extra barrier). Default off =
+        #: the old order. Rank-uniform (must be set on every rank alike).
+        self.canon_order = os.environ.get(
+            "SGLANG_BARLINK_BAR1_CANON_ORDER", ""
+        ) not in ("", "0", "no", "off", "false")
+        if self.canon_order:
+            logger.info(
+                "barlink-BAR1: oneshot all_reduce in canonical rank order "
+                "(SGLANG_BARLINK_BAR1_CANON_ORDER=1): every rank sums 0..R-1"
+            )
         self.max_bytes = 0
         # all_to_all occupies a third slot set in the same region and thus
         # costs a third of the largest all_reduce payload (see `geometry`).
@@ -4086,7 +4113,7 @@ class BarlinkBar1Transport:
         self._note_launch("all_reduce", nbytes, kernel_variant)
         self._ext.bar1_all_reduce(
             inp, out, int(self.rank), int(self.world),
-            {"mesh": 0, "ring": 1, "oneshot": 2}[algo],
+            bar1_algo_code(algo, getattr(self, "canon_order", False)),
             peer_payload, peer_flag,
             int(self._own[0]), int(self._own_flag[0]),
             int(self._geo["chunk_max"]), int(self._geo["off_mesh"]),

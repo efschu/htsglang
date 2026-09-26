@@ -36,6 +36,7 @@ import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.srt.managers.weg2_d_hostgap import split_mark as _d_hostgap_split_mark
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import (
@@ -2276,6 +2277,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
+            # #DGAP-SPLIT (SGLANG_WEG2_D_HOSTGAP_SPLIT): graph inputs copied and
+            # attention planned; one global read when the instrument is off.
+            _d_hostgap_split_mark(
+                "load" if self.model_runner.is_draft_model_runner else "vload"
+            )
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
