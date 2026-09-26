@@ -50,8 +50,10 @@ def _fake_w4a8(x, weight, scale, gscale, n):
     return torch.zeros(x.shape[0], n, dtype=x.dtype)
 
 
-def _resolve_rig(backend, caps, *, kernel=True, sm8x="w4a8"):
-    """One scheduler process per rank: TP0 = 5090, TP1/TP2 = 3080. ``sm8x=None``: the env default."""
+def _resolve_rig(backend, caps, *, kernel=True, sm8x="w4a8", allow_broken=None, sm12x=None):
+    """One scheduler process per rank: TP0 = 5090, TP1/TP2 = 3080. ``sm8x=None``: the env default.
+    ``allow_broken`` / ``sm12x`` None: the env default of SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN /
+    SGLANG_FP4_NATIVE_MIXED_SM12X."""
     args = mock.Mock(fp4_gemm_runner_backend=backend)
     out = []
     def env_patch():
@@ -59,9 +61,23 @@ def _resolve_rig(backend, caps, *, kernel=True, sm8x="w4a8"):
             return contextlib.nullcontext()
         return mock.patch("sglang.srt.environ.envs.SGLANG_FP4_NATIVE_MIXED_SM8X.get", return_value=sm8x)
 
+    def allow_patch():
+        if allow_broken is None:
+            return contextlib.nullcontext()
+        return mock.patch(
+            "sglang.srt.environ.envs.SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN.get", return_value=allow_broken
+        )
+
+    def sm12x_patch():
+        if sm12x is None:
+            return contextlib.nullcontext()
+        return mock.patch("sglang.srt.environ.envs.SGLANG_FP4_NATIVE_MIXED_SM12X.get", return_value=sm12x)
+
     for cap in caps:
         with (
             env_patch(),
+            allow_patch(),
+            sm12x_patch(),
             mock.patch("sglang.srt.utils.common.get_device_capability", return_value=cap),
             mock.patch.object(fp4_utils, "get_device_capability", return_value=cap),
             mock.patch.object(fp4_utils, "is_sm100_supported", return_value=cap[0] == 10),
@@ -115,10 +131,15 @@ class TestRankResolution(CustomTestCase):
         # no silent fallback to Marlin when the kernel is missing
         with self.assertRaisesRegex(nm.NativeMixedUnsupported, "W4A8 INT8 kernel"):
             nm.resolve_rank_backend((8, 6), w4a8_available=False)
-        # Marlin W4A16 in place only on explicit request
-        c = nm.resolve_rank_backend((8, 6), w4a8_available=True, sm8x_choice="marlin")
+        # Marlin W4A16 in place only on explicit request -- and since 26.09. only with the
+        # diagnosis override (NVFP4-SM8X-MARLIN-GUARD, TestSm8xMarlinGuard below)
+        c = nm.resolve_rank_backend(
+            (8, 6), w4a8_available=True, sm8x_choice="marlin", allow_broken_sm8x_marlin=True
+        )
         self.assertEqual((c.backend, c.shared_layout), ("marlin_native_inplace", True))
-        c = nm.resolve_rank_backend((8, 6), w4a8_available=False, sm8x_choice="marlin")
+        c = nm.resolve_rank_backend(
+            (8, 6), w4a8_available=False, sm8x_choice="marlin", allow_broken_sm8x_marlin=True
+        )
         self.assertEqual(c.backend, "marlin_native_inplace")
         c = nm.resolve_rank_backend((10, 0), w4a8_available=False)
         self.assertEqual(c.backend, "flashinfer_cutedsl")
@@ -163,7 +184,7 @@ class TestRankResolution(CustomTestCase):
 
     def test_mixed_rig_marlin_inplace_is_opt_in(self):
         with _fp4_state():
-            got = _resolve_rig("native-mixed", RIG, kernel=False, sm8x="marlin")
+            got = _resolve_rig("native-mixed", RIG, kernel=False, sm8x="marlin", allow_broken=True)
         self.assertEqual(
             got,
             [
@@ -212,6 +233,104 @@ def _swizzle_reference(s):
 def _kernel_offset(m, kb, kp):
     """nvfp4_quant.cuh cvt_quant_to_fp4_get_sf_out_offset."""
     return (m // 128) * (kp // 4) * 512 + (kb // 4) * 512 + (m % 32) * 16 + ((m % 128) // 32) * 4 + kb % 4
+
+
+class TestSm8xMarlinGuard(CustomTestCase):
+    """NVFP4-SM8X-MARLIN-GUARD (26.09.): boot dkr27bnvfp4bar1marlin09261251 (d98b3ba08a, arm
+    n4old = SGLANG_FP4_NATIVE_MIXED_SM8X=marlin, 5090 on flashinfer_cutlass) served wrong
+    tokens. The in-place Marlin rank is refused unless SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN=1."""
+
+    def test_env_default_is_off(self):
+        from sglang.srt.environ import envs
+
+        with mock.patch.dict("os.environ", {}, clear=False):
+            import os as _os
+
+            _os.environ.pop(nm.SM8X_MARLIN_ALLOW_ENV, None)
+            self.assertFalse(envs.SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN.get())
+        self.assertEqual(nm.SM8X_MARLIN_ALLOW_ENV, "SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN")
+
+    def test_guard_refuses_marlin_by_default(self):
+        for kernel in (True, False):
+            with self.assertRaisesRegex(nm.NativeMixedUnsupported, nm.SM8X_MARLIN_GUARD) as cm:
+                nm.resolve_rank_backend((8, 6), w4a8_available=kernel, sm8x_choice="marlin")
+            msg = str(cm.exception)
+            self.assertIn("SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN=1", msg)
+            self.assertIn("w4a8", msg)
+        # case/whitespace variants of the value hit the same guard
+        with self.assertRaisesRegex(nm.NativeMixedUnsupported, nm.SM8X_MARLIN_GUARD):
+            nm.resolve_rank_backend((8, 9), w4a8_available=True, sm8x_choice=" Marlin ")
+
+    def test_guard_refuses_on_the_rig_via_env(self):
+        with _fp4_state(), self.assertRaisesRegex(nm.NativeMixedUnsupported, nm.SM8X_MARLIN_GUARD):
+            _resolve_rig("native-mixed", RIG, kernel=True, sm8x="marlin")
+        with _fp4_state(), self.assertRaisesRegex(nm.NativeMixedUnsupported, nm.SM8X_MARLIN_GUARD):
+            _resolve_rig("native-mixed", RIG, kernel=True, sm8x="marlin", allow_broken=False)
+
+    def test_override_lets_it_run_and_warns(self):
+        with self.assertLogs(nm.logger, level="WARNING") as logs:
+            c = nm.resolve_rank_backend(
+                (8, 6), w4a8_available=True, sm8x_choice="marlin", allow_broken_sm8x_marlin=True
+            )
+        self.assertEqual((c.backend, c.shared_layout), ("marlin_native_inplace", True))
+        self.assertTrue(any(nm.SM8X_MARLIN_GUARD in r and "KNOWN-BROKEN" in r for r in logs.output))
+        with _fp4_state():
+            got = _resolve_rig("native-mixed", RIG, kernel=True, sm8x="marlin", allow_broken=True)
+        self.assertEqual(
+            [g[0] for g in got],
+            [
+                Fp4GemmRunnerBackend.FLASHINFER_CUTLASS,
+                Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE,
+                Fp4GemmRunnerBackend.MARLIN_NATIVE_INPLACE,
+            ],
+        )
+
+    def test_other_values_unchanged(self):
+        # the override changes nothing for any other value or arch
+        for allow in (False, True):
+            c = nm.resolve_rank_backend(
+                (8, 6), w4a8_available=True, sm8x_choice="w4a8", allow_broken_sm8x_marlin=allow
+            )
+            self.assertEqual(c.backend, "w4a8_int8")
+            with self.assertRaisesRegex(nm.NativeMixedUnsupported, "neither 'marlin' nor 'w4a8'"):
+                nm.resolve_rank_backend(
+                    (8, 6), w4a8_available=True, sm8x_choice="int4", allow_broken_sm8x_marlin=allow
+                )
+            # the 5090 never sees the SM8X value
+            c = nm.resolve_rank_backend(
+                (12, 0), w4a8_available=True, sm8x_choice="marlin", sm12x_choice="flashinfer_cutlass",
+                flashinfer_fp4_available=True, allow_broken_sm8x_marlin=allow,
+            )
+            self.assertEqual(c.backend, "flashinfer_cutlass")
+            c = nm.resolve_rank_backend(
+                (12, 0), w4a8_available=True, sm8x_choice="marlin", sm12x_choice="cutlass",
+                allow_broken_sm8x_marlin=allow,
+            )
+            self.assertEqual(c.backend, "cutlass")
+            c = nm.resolve_rank_backend(
+                (10, 0), w4a8_available=False, sm8x_choice="marlin", allow_broken_sm8x_marlin=allow
+            )
+            self.assertEqual(c.backend, "flashinfer_cutedsl")
+        with _fp4_state():
+            got = _resolve_rig("native-mixed", RIG, kernel=True, sm8x=None, allow_broken=None)
+        self.assertEqual(
+            [g[0] for g in got],
+            [
+                Fp4GemmRunnerBackend.FLASHINFER_CUTLASS,
+                Fp4GemmRunnerBackend.W4A8_INT8,
+                Fp4GemmRunnerBackend.W4A8_INT8,
+            ],
+        )
+
+    def test_sm12x_marlin_refusal_is_named_and_not_overridable(self):
+        for allow in (False, True):
+            with self.assertRaisesRegex(nm.NativeMixedUnsupported, "SM12X='marlin' does not exist") as cm:
+                nm.resolve_rank_backend(
+                    (12, 0), w4a8_available=True, sm12x_choice="marlin", allow_broken_sm8x_marlin=allow
+                )
+            self.assertIn(nm.SM8X_MARLIN_GUARD, str(cm.exception))
+        with _fp4_state(), self.assertRaisesRegex(nm.NativeMixedUnsupported, "does not exist"):
+            _resolve_rig("native-mixed", RIG[:1], kernel=True, sm12x="marlin", allow_broken=True)
 
 
 class TestSwizzleAndSlicing(CustomTestCase):

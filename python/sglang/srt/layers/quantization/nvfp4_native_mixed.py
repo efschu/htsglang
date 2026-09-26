@@ -22,7 +22,9 @@ Only the GEMM differs:
                   -> ``marlin_native_inplace`` only with
                      ``SGLANG_FP4_NATIVE_MIXED_SM8X=marlin``: Marlin W4A16, its
                      content permuted in place around every flip
-                     (nvfp4_marlin_inplace.py).
+                     (nvfp4_marlin_inplace.py). BARRED since 26.09. (wrong
+                     output, SM8X_MARLIN_GUARD); runs only with
+                     ``SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN=1`` for diagnosis.
 * sm_12x small-M: ``nvfp4_sm12x_w4a16.maybe_apply_sm12x_w4a16`` (strand F,
   FlashInfer ``cute-dsl-native`` W4A16 on the same native bytes), called once in
   ModelOptFp4LinearMethod.apply; ``SGLANG_FP4_SM12X_W4A16_MAX_M`` (default off).
@@ -67,6 +69,13 @@ class RankKernelChoice:
     capability: Tuple[int, int]
     shared_layout: bool  # the exchange sees the native layout (True on every branch today)
     reason: str
+
+
+#: Named guard (26.09.): the in-place Marlin W4A16 rank of native-mixed
+#: (SGLANG_FP4_NATIVE_MIXED_SM8X=marlin, "n4old") serves wrong tokens on the
+#: current line; it is refused unless the diagnosis override is set.
+SM8X_MARLIN_GUARD = "NVFP4-SM8X-MARLIN-GUARD"
+SM8X_MARLIN_ALLOW_ENV = "SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN"
 
 
 class NativeMixedUnsupported(RuntimeError):
@@ -139,6 +148,7 @@ def resolve_rank_backend(
     native_sm120_available: bool = True,
     sm12x_choice: str = "cutlass",
     flashinfer_fp4_available: bool = False,
+    allow_broken_sm8x_marlin: bool = False,
 ) -> RankKernelChoice:
     """The per-arch table. Every branch keeps the SHARED native layout at the
     exchange. sm_8x defaults to W4A8 (reads the native bytes); the opt-in Marlin
@@ -157,6 +167,13 @@ def resolve_rank_backend(
         # Same bytes: flashinfer_cutlass only passes transposed VIEWS of weight /
         # weight_scale_interleaved, so the shared native layout is untouched.
         want = str(sm12x_choice or "cutlass").strip().lower()
+        if want == "marlin":
+            raise NativeMixedUnsupported(
+                "native-mixed: SGLANG_FP4_NATIVE_MIXED_SM12X='marlin' does not exist -- an "
+                "sm_12x rank only runs native W4A4 ('flashinfer_cutlass' or 'cutlass'). The "
+                "old Marlin path of native-mixed is SGLANG_FP4_NATIVE_MIXED_SM8X=marlin (the "
+                f"3080 ranks), and that one is barred as broken (see {SM8X_MARLIN_GUARD})."
+            )
         if want not in ("cutlass", "flashinfer_cutlass"):
             raise NativeMixedUnsupported(
                 f"native-mixed: SGLANG_FP4_NATIVE_MIXED_SM12X={sm12x_choice!r} is neither "
@@ -187,6 +204,24 @@ def resolve_rank_backend(
                 "w4a8_int8", cap, True, "sm_8x: W4A8 on INT8 tensor cores, native layout"
             )
         if choice == "marlin":
+            if not allow_broken_sm8x_marlin:
+                raise NativeMixedUnsupported(
+                    f"{SM8X_MARLIN_GUARD}: SGLANG_FP4_NATIVE_MIXED_SM8X=marlin on "
+                    f"sm_{major}{minor} is REFUSED -- the in-place Marlin W4A16 path of "
+                    "native-mixed produces wrong output on the current line (measured "
+                    "2026-09-26, boot dkr27bnvfp4bar1marlin09261251 on d98b3ba08a: needle "
+                    "MISS after the first flip, 8 failed ladder reps, ~35 tok/s at 10k). "
+                    "Use the default SGLANG_FP4_NATIVE_MIXED_SM8X=w4a8. For DIAGNOSIS ONLY "
+                    f"set {SM8X_MARLIN_ALLOW_ENV}=1 to run it anyway."
+                )
+            logger.warning(
+                "%s: %s=1 -> running the KNOWN-BROKEN in-place Marlin path on sm_%d%d "
+                "(diagnosis only; outputs are not trustworthy).",
+                SM8X_MARLIN_GUARD,
+                SM8X_MARLIN_ALLOW_ENV,
+                major,
+                minor,
+            )
             return RankKernelChoice(
                 "marlin_native_inplace",
                 cap,
@@ -234,6 +269,7 @@ def resolve_this_rank() -> RankKernelChoice:
         native_sm120_available=native,
         sm12x_choice=str(envs.SGLANG_FP4_NATIVE_MIXED_SM12X.get()),
         flashinfer_fp4_available=_flashinfer_fp4_gemm_available(),
+        allow_broken_sm8x_marlin=bool(envs.SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN.get()),
     )
     log = logger.info if choice.shared_layout else logger.warning
     log(
