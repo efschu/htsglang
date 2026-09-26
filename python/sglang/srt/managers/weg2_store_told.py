@@ -373,9 +373,11 @@ ENV_TREE_KEY = "SGLANG_WEG2_TOLD_PROBE_TREE_KEY"
 
 
 def _tree_key_probe_armed() -> bool:
-    return os.environ.get(ENV_TREE_KEY, "0").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
+    # RG 26.09.: unset = the registry row of the published form's profile
+    # (weg2/form.py PREFIX_SWITCHES: qwen27b on, nextflash/no form off).
+    from sglang.srt.weg2.form import prefix_switch_armed
+
+    return prefix_switch_armed(ENV_TREE_KEY)
 
 
 def _probe_key(scheduler, req, ids, told: int):
@@ -865,7 +867,10 @@ _clock = time.monotonic
 
 
 def _paced_env() -> bool:
-    return os.environ.get(ENV_PACED, "0").strip().lower() in ("1", "true", "yes", "on")
+    # RG 26.09.: unset = the registry row (weg2/form.py PREFIX_SWITCHES).
+    from sglang.srt.weg2.form import prefix_switch_armed
+
+    return prefix_switch_armed(ENV_PACED)
 
 
 def _env_float(name: str, default: float) -> float:
