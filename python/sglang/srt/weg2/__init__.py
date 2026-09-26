@@ -56,6 +56,14 @@ DEFAULT_P_BS = 2
 #: 6 by the order of 2026-09-09 quoted above ("nicht mehr bs4").
 DEFAULT_D_BS = 6
 
+#: H91 Teil B (Nutzer-Design 25.09., Stufe 1): the Next-Flash Form-A D group
+#: decodes with TWO seats (was bs1, profile ``--d-bs 1``).  Applies only to
+#: ``--profile nextflash`` when ``--d-bs`` is not given; the seat posts (MTP
+#: verify state, GDN slots) are priced by the D-FRACTION-SOLVE for exactly
+#: this count (planner/expert_residency.seat_rebook).  Stage 2 (dynamic
+#: 1..6) will replace the constant, not this line's consumers.
+DEFAULT_D_BS_NEXTFLASH = 2
+
 #: K3 -- THE ORDERED P CUT, from which the solver's POOL FLOOR is DERIVED AT
 #: BOOT.  Moved here from ``launcher.py`` by the serve-next5 train (2026-09-09)
 #: as a pool-token CONSTANT (448,027) and REPLACED on the same train by the

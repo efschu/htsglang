@@ -1629,6 +1629,26 @@ class VramBudgetReqOutput(BaseReq, kw_only=True):
     state: Optional[dict] = None
 
 
+class Weg2ParkRunningReqInput(BaseReq, kw_only=True):
+    """H91b: the Weg-2 front parks every running request of group D right
+    before D's sleep (D->P flip); ``POST /weg2/park_running`` with
+    ``{"epoch": <int>, "reason": <str>}``. The requests keep their streams and
+    resume after D's next wake, before any newer request (oldest first)."""
+
+    epoch: int = 0
+    reason: str = ""
+
+
+class Weg2ParkRunningReqOutput(BaseReq, kw_only=True):
+    success: bool
+    #: rids of the parked (formerly running) requests, oldest first
+    parked: List[str] = []
+    #: rids that were only queued on D (never started) and wait behind them
+    held: List[str] = []
+    epoch: int = 0
+    message: str = ""
+
+
 class PlePrefetchHintReqInput(BaseReq, kw_only=True):
     """fnFL2 H43: the front's hint that request ``rid`` (its prompt tokenized
     here, ``input_ids``) will come to this group; the PP0 scheduler starts the
