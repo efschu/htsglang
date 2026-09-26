@@ -93,6 +93,7 @@ from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import host_ledger
+from sglang.srt.weg2 import dp_wait as _dp_wait  # R28: DP-WAIT instrument
 
 logger = logging.getLogger("weg2.front")
 
@@ -2160,6 +2161,11 @@ class Pending:
     #: the probe's source (:class:`SpanLRU`) is mutated by this very request
     #: once leg 1 answers.  See :meth:`Front._note_p_prefix_reuse`.
     store_span_est: int = 0
+    #: R28: the arrival snapshot of a request queued while D was awake, i.e.
+    #: one that waits for a D->P flip; printed once as ``WEG2 DP-WAIT`` at
+    #: the ``WEG2-FLIP done`` that ends the wait, then cleared. Instrument
+    #: only -- nothing routes, admits or flips on it.
+    dp_arrival: Optional[_dp_wait.DpArrival] = None
 
 
 class Seat:
@@ -3943,6 +3949,7 @@ class Front:
                         est_uncached=remainder, span_known=known,
                         skip_leg1=True, store_span_est=store_span)
             self.queue.append(p)
+            self._dp_mark(p, "carrier")  # R28
             self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
             try:
                 await fut
@@ -4002,6 +4009,7 @@ class Front:
                         est_uncached=remainder, span_known=known,
                     store_span_est=store_span)
         self.queue.append(p)
+        self._dp_mark(p, "long" if route == "long" else "batch")  # R28
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         logger.info("WEG2-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d)",
                     rid, self.awake, self.admit_d, est_prompt, remainder, len(self.queue))
@@ -4155,6 +4163,7 @@ class Front:
         if rank is None:
             rank = self._admitted_this_epoch
         self._admitted_this_epoch += 1
+        self.counters["d_admits"] += 1  # R28: DP-WAIT d_admitted_during_wait
         logger.info("WEG2 D-ADMIT rid=%s seat=%d/%d rank=%d oldest_wait_s=%.1f source=%s",
                     rid, self._seats_in_use(), self.d_bs, rank, max(0.0, time.time() - t_arrive), source)
 
@@ -4783,6 +4792,7 @@ class Front:
                         seat.release("reroute")
                     pending.seat = None
                     self.queue.append(pending)
+                    self._dp_mark(pending, "reroute")  # R28
                     self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
                     logger.warning("WEG2-REROUTE rid=%s uncached=%d > %d: rejoining route BATCH once (spec 3.6)",
                                    rid, pt - ct, self.tp_prefill_max_tokens)
@@ -5055,6 +5065,7 @@ class Front:
             seat.release("W50_requeue")
         p.seat = None
         self.queue.append(p)
+        self._dp_mark(p, "reroute")  # R28
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         try:
             await p.fut
@@ -6102,6 +6113,7 @@ class Front:
                         self.epoch, src, dst, _parts, (self.t_awake - _b) * 1000)
         except Exception:  # noqa: BLE001 -- a timeline never breaks a flip
             pass
+        _dp_drain_end = self._flip_marks.get("quiesce")  # R28: drain(S) returned here
         self._flip_marks = {}
         self._admitted_this_epoch = 0
         # C11 / L5.  interleave_ms IS NOT sleep+wake any more, and saying so is
@@ -6180,6 +6192,55 @@ class Front:
                     rec["sleep_leg_ms"], rec["wake_leg_ms"], rec["overlap_ms"], rec["overlap_pct"],
                     rec["critical_path"], rec["flip_ms"], len(self.weights_tags),
                     "off-path" if dc_off_path else dc)
+        if src == "D" and dst == "P":
+            self._dp_report(t_flip0, _dp_drain_end)
+
+    # ---------------- R28: D->P wait instrument ----------------
+    def _dp_mark(self, p: Pending, origin: str) -> None:
+        """R28: snapshot a request that joins the queue while D is awake.
+
+        Such a request waits for a D->P flip (``WEG2 LATE-BATCH`` names the
+        LONG ones). A request queued while P is awake (or requeued by a P
+        intake stall) waits for no D->P flip and carries no snapshot.
+        Instrument only: see :mod:`sglang.srt.weg2.dp_wait`.
+        """
+        if self.awake != "D":
+            p.dp_arrival = None
+            return
+        try:
+            D = self.groups["D"]
+            p.dp_arrival = _dp_wait.take(
+                time.time(), origin, self.state == "flipping", len(D.outstanding),
+                self._handoff_in_flight(), len(self._ready_for_d), self.counters)
+        except Exception:  # noqa: BLE001 -- an instrument never breaks routing
+            p.dp_arrival = None
+
+    def _dp_report(self, t_flip0: float, t_drain_end: Optional[float]) -> None:
+        """R28: one ``WEG2 DP-WAIT`` line per queued request whose wait this
+        D->P flip ends, at its ``WEG2-FLIP done``; each request is reported
+        once. A D->P flip that returned early (DRAIN WAITING, W1) reports
+        nothing -- the next one that completes carries the whole wait, and
+        ``hold_by`` says ``flip-returned``."""
+        for p in list(self.queue):
+            a = p.dp_arrival
+            if a is None:
+                continue
+            p.dp_arrival = None
+            try:
+                dec = _dp_wait.decompose(a, t_flip0, t_drain_end, self.t_awake)
+                by = _dp_wait.hold_by(a, self.counters)
+                logger.info("%s", _dp_wait.line(
+                    p.rid, self.epoch, a, dec, by, self.counters, p.est_prompt,
+                    p.est_uncached, p.store_span_est, p.span_known))
+                self.counters["dp_wait_reported"] += 1
+                w_ms = int(round(dec["wait_s"] * 1000))
+                if w_ms > self.counters.get("dp_wait_max_ms", 0):
+                    self.counters["dp_wait_max_ms"] = w_ms
+                for lim in (10, 30, 60):
+                    if dec["wait_s"] >= lim:
+                        self.counters[f"dp_wait_ge{lim}s"] += 1
+            except Exception as e:  # noqa: BLE001 -- an instrument never breaks a flip
+                logger.debug("DP-WAIT rid=%s not reported: %s: %s", p.rid, type(e).__name__, e)
 
     # ---------------- phase economics (C7, C8) ----------------
     def _derived_min_dwell_ms(self, src: str, dst: str) -> Tuple[float, str]:
@@ -6229,6 +6290,8 @@ class Front:
         logger.info("WEG2 MIN-DWELL src=%s dst=%s awake_ms=%d derived_from_flip_ms=%d overridden_by=%s "
                     "provenance=%s verdict=%s",
                     src, dst, int(awake_ms), int(need), overridden, prov, "flip" if ok else "hold")
+        if not ok and src == "D":
+            self.counters["min_dwell_holds"] += 1  # R28: DP-WAIT hold_by=min-dwell
         return ok
 
     # ------------------------------------------------------------------
