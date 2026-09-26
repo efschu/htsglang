@@ -10005,7 +10005,7 @@ def p_attn_head_split_cfg(ns, pp_size: int, chunk_tokens: int, model: str):
         raise SystemExit(f"--p-attn-head-split: min_w {min_w} > the widest P chunk {max_w} -- "
                          "the split would never fire")
     try:
-        _ah.validate(dels, pp_size=int(pp_size), num_kv_heads=num_kv)
+        _ah.validate(dels, pp_size=int(pp_size), num_kv_heads=num_kv, gqa=max(1, num_q // num_kv))
     except _ah.AHSpecError as exc:
         raise SystemExit(str(exc))
     if num_q % num_kv:
@@ -12627,9 +12627,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--p-attn-head-split", default=P_ATTN_HEAD_SPLIT_DEFAULT, metavar="SPEC",
         help="Group P attention split BY HEADS (27B, release table row 22; "
              "ATTN_HEAD_SPLIT.md phase 2). 'off' (default) = no env, argv and the "
-             "pool model byte-identical. SPEC = owner:helper:n_layers:n_groups[,...]: "
-             "stage OWNER hands the attention of its last n_groups kv groups "
-             "(n_groups x 6 q heads) of its last n_layers full-attention layers to "
+             "pool model byte-identical. SPEC = owner:helper:n_layers:G[,...]: "
+             "stage OWNER hands the attention of its last G kv groups "
+             "(G x 6 q heads) of its last n_layers full-attention layers to "
              "stage HELPER, which must be UPSTREAM (helper < owner; V1). Example "
              "'2:0:2:1,1:0:1:1' = INT8 128k model optimum. Cold single-request eager "
              "chunks only; KV of all groups stays in the owner's pool.")
