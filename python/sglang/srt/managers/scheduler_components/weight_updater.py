@@ -591,6 +591,11 @@ class SchedulerWeightUpdaterManager:
     #: assigned attribute into an error ON THE WRITE.  This cache is written
     #: lazily in :meth:`_weg2_xchg_sems`, so it is declared here.
     _weg2_xchg_sems_cache: Any = "unset"
+    #: fnFL2x82 single-flight lock of the leg-plan derivation (27B UN5
+    #: 1406513f40). A FIELD: its lazy write was wrapped in ``except
+    #: AttributeError`` and on this ``slots=True`` class silently never stored,
+    #: so every lane made its own lock and derived the plan again.
+    _weg2_xchg_leg_lock: Any = None
 
     #: #1350 SEAM GRADER: this rank's pre-pause reading of its own pieces, or
     #: ``None``.  A FIELD for the sixth time in this class, for the reason the
