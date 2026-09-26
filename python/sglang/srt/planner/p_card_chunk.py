@@ -91,7 +91,11 @@ class PChunkUnmeasured(ValueError):
 
 class PCardFormUnmeasured(ValueError):
     """H59: der Boot faehrt mehr Sitze, als die Referenz gemessen hat -- die
-    Bilanz entfaellt mit Namen (keine Zahl aus einer anderen Form)."""
+    Bilanz entfaellt mit Namen (keine Zahl aus einer anderen Form).
+
+    H92c: ausser der Mamba-Term ist rechenbar (Slots dieses Boots UND der
+    Referenz bekannt, Preis je Slot und Stufe gegeben) -- dann rechnet die
+    Karte die Form, und ihre Zeile nennt die uebrigen Sitz-Terme ungemessen."""
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +144,8 @@ _RX_BUFFER = re.compile(
     r"resident \+ (\d+) scratch \(buffer=(\d+), fraction=([0-9.]+)\)"
 )
 _RX_CELL = re.compile(_STAGE + r" KV pool sizing: available_bytes=\d+ .*?cell_size=(\d+),")
+#: H92c: die Mamba-Slots, die der Boot allokiert hat (nach MIN-Sync und Kappe).
+_RX_MAMBA = re.compile(_STAGE + r" Mamba Cache is allocated\. max_mamba_cache_size: (\d+),")
 _DRAFT_ON_P = "draft pp group built"
 
 
@@ -153,6 +159,7 @@ def observe_p_log(text: str) -> Dict[str, Dict[int, object]]:
     fraction: Dict[int, float] = {}
     cell: Dict[int, int] = {}
     transient: Dict[int, float] = {}
+    mamba: Dict[int, int] = {}
     for line in text.splitlines():
         m = _RX_CHUNK.search(line)
         if m:
@@ -174,6 +181,10 @@ def observe_p_log(text: str) -> Dict[str, Dict[int, object]]:
         if m:
             cell.setdefault(int(m.group(1)), int(m.group(2)))
             continue
+        m = _RX_MAMBA.search(line)
+        if m:
+            mamba.setdefault(int(m.group(1)), int(m.group(2)))
+            continue
         m = _RX_PEAK.search(line)
         if m:
             s = int(m.group(1))
@@ -193,6 +204,7 @@ def observe_p_log(text: str) -> Dict[str, Dict[int, object]]:
         "fraction": fraction,
         "cell": cell,
         "transient": transient,
+        "mamba_slots": mamba,
         "draft_on_p": {0: _DRAFT_ON_P in text},
     }
 
@@ -482,6 +494,13 @@ class PCardReference(msgspec.Struct, frozen=True, kw_only=True):
     #: spaeteren Flip mehr, faellt der Kopfraum um genau die Differenz.
     co_tenant_mib: Tuple[float, ...] = ()
     co_tenant_source: str = ""
+    #: H92c: die Mamba-Slots der Referenz (``Mamba Cache is allocated.
+    #: max_mamba_cache_size: N`` im P-Log); 0 = ungemessen. ``K0`` enthaelt
+    #: den Mamba-Pool DIESER Slotzahl: ein Boot mit anderer Slotzahl kostet
+    #: je Stufe (Slots - Referenz-Slots) x Preis je Slot. Der Pool haengt an
+    #: ``--max-mamba-cache-size``, nicht an den Sitzen (x160 1 Sitz und
+    #: x163-x165 4 Sitze: alle 24 Slots).
+    mamba_slots: int = 0
 
 
 _RX_EXTENT = re.compile(_STAGE + r" #969 EXTENT n=\d+ fwd=\d+ reqs=\[\('[^']*', (\d+), (\d+)")
@@ -882,6 +901,7 @@ def p_card_reference_from_logs(
     chunks = set()
     draft = set()
     seats = set()
+    mamba = set()
     longest = 0
     dl = dict(d_logs or {})
     with_co = bool(dl) and all(name in dl for name, _t in boots)
@@ -890,6 +910,7 @@ def p_card_reference_from_logs(
         samples = pool_samples(text)
         draft.add(bool(obs["draft_on_p"][0]))
         seats.update(obs["seats"].values() or [1])
+        mamba.update(obs["mamba_slots"].values())
         longest = max(longest, longest_prompt_tokens(text))
         for s in range(n):
             ss = samples.get(s, [])
@@ -932,6 +953,11 @@ def p_card_reference_from_logs(
             "Referenz ist EINE Form"
             % ([b[0] for b in boots], sorted(chunks), sorted(draft), sorted(seats))
         )
+    if len(mamba) > 1:
+        raise ValueError(
+            "P-Karten-Referenz %s mischt Mamba-Slots %s; K0 enthaelt den Mamba-Pool, "
+            "eine Referenz ist EINE Slotzahl" % ([b[0] for b in boots], sorted(mamba))
+        )
     co_src = ""
     if with_co:
         co_src = "; ".join(
@@ -959,6 +985,7 @@ def p_card_reference_from_logs(
         seats=int(next(iter(seats))),
         co_tenant_mib=tuple(float(best[s][4]) for s in range(n)) if with_co else (),
         co_tenant_source=co_src,
+        mamba_slots=int(next(iter(mamba))) if mamba else 0,
     )
     if not over_boots:
         return ref
@@ -1031,6 +1058,7 @@ P_CARD_REFERENCE_FNFL2_X160 = PCardReference(
     longest_prompt_tokens=259441,
     lmem_mib=(0.0, 2.0, 2.0),
     seats=1,
+    mamba_slots=24,
     co_tenant_mib=(1698.0, 768.0, 766.0),
     co_tenant_source=(
         "stage0 1698 (fnFL2x160, D-TP0 am Chunk-0-Punkt 2026-09-24 15:07:21); stage1 768 "
@@ -1048,7 +1076,9 @@ P_CARD_REFERENCE_FNFL2_X160 = PCardReference(
 #: auf 2e2aac1e4e: jede GRAPH-POOL-Zeile gleich x163, die H55-Fenster zeigen
 #: die Saettigung je Chunk: PP0 persist +411/+349/+321/+320/+1). Alle
 #: ``--max-running-requests 4``, Chunk 16384, KV 262144 x 7616/3264/2176 B,
-#: kein Draft auf P.
+#: kein Draft auf P. H92c: alle drei mit ``--max-mamba-cache-size 24``
+#: (``Mamba Cache is allocated. max_mamba_cache_size: 24`` je Stufe) -- K0
+#: enthaelt 24 Slots x 34.29 / 12.47 / 9.35 MiB.
 #:
 #: Je Stufe das Minimum von ``K0 + Mitbewohner`` (x163 auf allen drei:
 #: PP0 23997.0 + 1698 gegen x164 23925.1 + 1782; der x164-Punkt lag 84 MiB
@@ -1079,6 +1109,7 @@ P_CARD_REFERENCE_FNFL2 = PCardReference(
     longest_prompt_tokens=97841,
     lmem_mib=(0.0, 2.0, 2.0),
     seats=4,
+    mamba_slots=24,
     co_tenant_mib=(1698.0, 768.0, 766.0),
     co_tenant_source=(
         "stage0 1698 (fnFL2x163, D-TP0 am Chunk-0-Punkt 2026-09-24 18:22:41); stage1 768 "
@@ -1121,6 +1152,15 @@ class PCardFit(msgspec.Struct, frozen=True, kw_only=True):
     co_tenant_ref_mib: Optional[float] = None
     co_tenant_max_mib: Optional[float] = None
     seats: int = 0
+    #: H92c: der Mamba-Term ``(Slots - Referenz-Slots) x Preis je Slot`` (MiB,
+    #: negativ = weniger Slots als die Referenz); ``mamba_slots``/
+    #: ``mamba_ref_slots`` 0 = ungemessen (Term 0, benannt).
+    mamba_mib: float = 0.0
+    mamba_slots: int = 0
+    mamba_ref_slots: int = 0
+    #: H92c: Sitze ueber der Referenz. Gerechnet ist dann NUR der Mamba-Term;
+    #: die uebrigen Sitz-Terme sind ungemessen (die Zeile nennt es).
+    seats_over_reference: int = 0
 
     @property
     def refused(self) -> bool:
@@ -1151,13 +1191,16 @@ def solve_p_card(
     use_growth: bool = True,
     seats: int = 0,
     co_tenant: Optional[CoTenantSpan] = None,
+    mamba_slots: int = 0,
+    mamba_mib_per_slot: Sequence[float] = (),
 ) -> Tuple[PCardFit, ...]:
     """Je P-Stufe der Kopfraum am LETZTEN Chunk eines Prompts von
     ``prompt_tokens`` Token (0 = der laengste Prompt der Referenz)::
 
         K0 - Zeilen x Bild - Ueber x (Preis - Bild) - KV - T(chunk) - Draft
            - g x (Token vor dem letzten Chunk) - LMEM
-           - (Mitbewohner-Hochstand - Mitbewohner am Referenzpunkt)  >= near-OOM
+           - (Mitbewohner-Hochstand - Mitbewohner am Referenzpunkt)
+           - (Mamba-Slots - Mamba-Slots der Referenz) x Preis je Slot  >= near-OOM
 
     ``lmem_fixed``: der Baum traegt den H47-Fix (Run-Write in 1-KiB-Elementen)
     -> LMEM 0; sonst der gemessene Hochstand je Stufe (PP0 aus x149).
@@ -1168,6 +1211,16 @@ def solve_p_card(
     ``co_tenant`` = der gemessene Mitbewohner-Hochstand je Stufe; mit einer
     Referenz, die ihren Mitbewohner kennt, kostet jede Stufe die Differenz
     (ein spaeterer Flip mit vollerem D-Cache nimmt der Karte genau so viel).
+
+    H92c: ``mamba_slots`` = P's ``--max-mamba-cache-size`` DIESES Boots (0 =
+    ungemessen), ``mamba_mib_per_slot`` = je Stufe 1.5588 MiB x lineare Layer.
+    ``K0`` enthaelt den Mamba-Pool der Referenz (``reference.mamba_slots``);
+    jede Stufe kostet die Differenz -- Geometrie des Pools, keine Hochrechnung
+    (der Pool ist Slots x ``mamba_cache_per_req``). Mehr Sitze als die
+    Referenz rechnet die Karte NUR mit diesem Term; ohne ihn bleibt es
+    :class:`PCardFormUnmeasured`. Die uebrigen Sitz-Terme (Anfrage-Metadaten,
+    1 -> 4 Sitze gemessen: allocated +3, privat_frei -3 MiB) sind ueber der
+    Referenz ungemessen und stehen mit Namen in der Zeile.
     """
     from sglang.srt.planner import expert_residency as _er
 
@@ -1179,13 +1232,20 @@ def solve_p_card(
             "--p-card-reference-logs geben"
             % (list(stage_layers), reference.source, list(reference.stage_layers))
         )
-    if int(seats) > int(reference.seats):
+    mamba_priced = (
+        int(mamba_slots) > 0
+        and int(reference.mamba_slots) > 0
+        and len(mamba_mib_per_slot) == n
+    )
+    if int(seats) > int(reference.seats) and not mamba_priced:
         raise PCardFormUnmeasured(
             "P-Karte: %d Sitze (P --max-running-requests), die Referenz (%s) ist bei "
             "%d Sitzen gemessen; mehr Sitze sind eine ungemessene Form (mehr "
-            "gleichzeitige Chunks im Flug, eigene Zustaende je Sitz). Boots DIESER "
-            "Form per --p-card-reference-logs geben"
-            % (int(seats), reference.source, int(reference.seats))
+            "gleichzeitige Chunks im Flug, eigene Zustaende je Sitz), und der "
+            "Mamba-Term ist nicht rechenbar (Slots hier %d, Referenz %d, Preis je "
+            "Stufe %s). Boots DIESER Form per --p-card-reference-logs geben"
+            % (int(seats), reference.source, int(reference.seats), int(mamba_slots),
+               int(reference.mamba_slots), list(mamba_mib_per_slot) or "fehlt")
         )
     if len(fractions) != n or len(lru_rows) != n or len(kv_mib) != n:
         raise ValueError(
@@ -1238,8 +1298,13 @@ def solve_p_card(
             if co_tenant is not None and s < len(co_tenant.max_mib):
                 co_max = float(co_tenant.max_mib[s])
                 co = max(0.0, co_max - co_ref)
+        mamba = (
+            (int(mamba_slots) - int(reference.mamba_slots)) * float(mamba_mib_per_slot[s])
+            if mamba_priced else 0.0
+        )
         rest = (
             float(reference.headroom0_mib[s]) - float(kv_mib[s]) - t - draft - growth - lmem - co
+            - mamba
         )
         over = max(0, int(rows) - ref_rows)
         head = rest - rows * layer_mib - over * (row_card - layer_mib)
@@ -1280,6 +1345,10 @@ def solve_p_card(
                 co_tenant_ref_mib=co_ref,
                 co_tenant_max_mib=co_max,
                 seats=int(seats),
+                mamba_mib=mamba,
+                mamba_slots=int(mamba_slots) if mamba_priced else 0,
+                mamba_ref_slots=int(reference.mamba_slots),
+                seats_over_reference=max(0, int(seats) - int(reference.seats)),
             )
         )
     return tuple(out)
@@ -1297,6 +1366,25 @@ def _co_tenant_text(fit: PCardFit) -> str:
     )
 
 
+def _mamba_text(fit: PCardFit) -> str:
+    if not fit.mamba_slots or not fit.mamba_ref_slots:
+        return "Mamba-Slots ungemessen (hier %s, Referenz %s: Term 0)" % (
+            fit.mamba_slots or "?", fit.mamba_ref_slots or "?")
+    return "Mamba %d Slots gegen %d der Referenz -> %+.0f MiB" % (
+        fit.mamba_slots, fit.mamba_ref_slots, fit.mamba_mib)
+
+
+def _seats_text(fit: PCardFit, reference: PCardReference) -> str:
+    if not fit.seats_over_reference:
+        return ""
+    return (
+        " | SITZE UEBER DER REFERENZ (%d statt %d): gerechnet ist nur der Mamba-Term, "
+        "die uebrigen Sitz-Terme sind ungemessen (1 -> 4 Sitze: allocated +3, "
+        "privat_frei -3 MiB) -- Boots dieser Form per --p-card-reference-logs geben"
+        % (fit.seats, reference.seats)
+    )
+
+
 def describe_p_card(fit: PCardFit, reference: PCardReference) -> str:
     s = fit.stage
     ceiling = "KEINE" if fit.ceiling_fraction is None else "%.3f" % fit.ceiling_fraction
@@ -1306,9 +1394,9 @@ def describe_p_card(fit: PCardFit, reference: PCardReference) -> str:
         "%.0f - privat_frei %.0f MiB bei %d Zeilen, KV %.0f, Chunk %d; hier f %.4f -> %d "
         "Zeilen (%+.0f MiB; je Zeile ueber der Referenz %.1f, Bild %.1f), KV %.0f (%+.0f), "
         "Transiente %.0f (%+.0f, %s)%s, Chunk-Wachstum am Chunk %d %.0f MiB (%.1f je "
-        "16k, saettigt nach Chunk %d, gemessen ueber %d Token%s), LMEM %s, %s -> Kopfraum "
-        "%.0f MiB (near-OOM %.0f) -> "
-        "%s | KARTEN-DECKE f %s (<= %d Zeilen)"
+        "16k, saettigt nach Chunk %d, gemessen ueber %d Token%s), LMEM %s, %s, %s -> "
+        "Kopfraum %.0f MiB (near-OOM %.0f) -> "
+        "%s | KARTEN-DECKE f %s (<= %d Zeilen)%s"
         % (
             CARD_MARKER,
             s,
@@ -1343,11 +1431,13 @@ def describe_p_card(fit: PCardFit, reference: PCardReference) -> str:
             ", Prompt laenger als gemessen: HOCHRECHNUNG" if fit.growth_extrapolated else "",
             fit.lmem_source,
             _co_tenant_text(fit),
+            _mamba_text(fit),
             fit.headroom_mib,
             fit.near_oom_mib,
             fit.verdict,
             ceiling,
             fit.ceiling_max_rows,
+            _seats_text(fit, reference),
         )
     )
 
