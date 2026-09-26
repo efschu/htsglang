@@ -362,6 +362,16 @@ def _next_req_pool_binding_tag() -> int:
     return next(_REQ_POOL_BINDING_SEQ)
 
 
+def _pinned_device_rows(rows: List[int], device) -> torch.Tensor:
+    """P-NOSYNC: host row ids onto ``device`` without a host wait -- through
+    pinned memory, ``non_blocking=True``, so the copy is queued on the current
+    stream instead of ``cudaStreamSynchronize``-ing it (see
+    ``HybridReqToTokenPool._nosync_mapping_rows``)."""
+    return torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(
+        device, non_blocking=True
+    )
+
+
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -2076,6 +2086,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
 
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
+        # P-NOSYNC (managers/weg2_p_overlap.py): `alloc` writes the mamba
+        # mapping rows without a host wait on the stream. Read once; off =
+        # the stock write, unchanged.
+        from sglang.srt.managers.weg2_p_overlap import p_nosync_on
+
+        self._nosync = p_nosync_on()
         # Bound by the radix cache at construction (`bind_tree_cache`) so the
         # allocation sites below can evict cached checkpoints before declaring
         # the pool exhausted. None until then (and for pool-only unit setups),
@@ -2411,13 +2427,36 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
             )
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
-        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        rows = select_index
+        if getattr(self, "_nosync", False):
+            rows = self._nosync_mapping_rows(select_index)
+        self.req_index_to_mamba_index_mapping[rows] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping[rows] = (
                 ping_pong_tensor
             )
         return select_index
+
+    def _nosync_mapping_rows(self, select_index: List[int]):
+        """P-NOSYNC: the row index `alloc` writes the mamba mapping with.
+
+        ``mapping[select_index] = t`` with the Python row list makes a CPU
+        index tensor that ``index_put_`` moves to the device BLOCKING
+        (``non_blocking=False``), i.e. ``cudaStreamSynchronize`` on the current
+        stream -- the schedule stream, which carries the fence of the forward
+        that is still running. MEASURED weg2xsn423 (5d8612b118 in the tree,
+        --p-host-overlap): py-spy PP0 1538 of 2263 samples on that line,
+        reached from alloc_for_extend -> alloc_req_slots every chunk, and
+        #PGAP plan 417-495 ms per 4096 chunk against a 544-562 ms forward. The
+        rows go over pinned memory, non-blocking, and the write stays ordered
+        on the stream; the forward that reads the mapping waits for that
+        stream at its launch (``forward_stream.wait_stream``). A CPU mapping
+        (tests, CPU backends) keeps the list."""
+        mapping = self.req_index_to_mamba_index_mapping
+        if not mapping.is_cuda:
+            return select_index
+        return _pinned_device_rows(select_index, mapping.device)
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
