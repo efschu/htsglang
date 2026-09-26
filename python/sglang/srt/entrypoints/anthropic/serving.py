@@ -319,6 +319,11 @@ class AnthropicServing:
         self._merge_inline_system = not detect_inline_system_support(
             self._chat_template()
         )
+        # Befund M: see SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE in environ.py.
+        # Read once per process; the whole group tokenizes in this one process.
+        self._inline_system_in_place = bool(
+            envs.SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE.get()
+        )
 
     def _chat_template(self) -> Optional[str]:
         tokenizer_manager = getattr(self.openai_serving_chat, "tokenizer_manager", None)
@@ -538,8 +543,20 @@ class AnthropicServing:
                     if block.type == "text" and block.text:
                         system_parts.append(block.text)
 
+        # How many inline system messages to hoist into the head system turn.
+        # Default: all of them. In-place mode: only the leading run (before
+        # the first user/assistant turn), which is as prefix-stable as the
+        # top-level ``system`` field; the rest render where they stand.
+        n_hoist = 0
         if self._merge_inline_system:
-            for msg in anthropic_request.messages:
+            if self._inline_system_in_place:
+                for msg in anthropic_request.messages:
+                    if msg.role != "system":
+                        break
+                    n_hoist += 1
+            else:
+                n_hoist = len(anthropic_request.messages)
+            for msg in anthropic_request.messages[:n_hoist]:
                 if msg.role != "system":
                     continue
                 text = _extract_system_text(msg.content)
@@ -568,8 +585,24 @@ class AnthropicServing:
             parts.clear()
 
         # Convert messages
-        for msg in anthropic_request.messages:
+        for msg_idx, msg in enumerate(anthropic_request.messages):
             if msg.role == "system" and self._merge_inline_system:
+                if msg_idx < n_hoist:
+                    continue
+                # In-place mode, non-leading: the template takes no system
+                # turn here, so it becomes a user turn AT ITS POSITION --
+                # everything before it renders exactly as in the previous
+                # turn (Befund M).
+                text = _extract_system_text(msg.content)
+                if text:
+                    openai_messages.append(
+                        {
+                            "role": "user",
+                            "content": "<system-reminder>\n"
+                            + text
+                            + "\n</system-reminder>",
+                        }
+                    )
                 continue
             if isinstance(msg.content, str):
                 openai_messages.append({"role": msg.role, "content": msg.content})

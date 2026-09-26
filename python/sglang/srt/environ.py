@@ -1059,6 +1059,20 @@ class Envs:
     # pre-fix collapse for a deployment whose template names its top tier
     # "max" instead; the collapse is then logged by name.
     SGLANG_ANTHROPIC_XHIGH_EFFORT = EnvStr("xhigh")
+    # Befund M (26.09., boots dkr27bnvfp4bar1agent09252328 / dkr27bbar1final09260145):
+    # Claude Code sends mid-conversation ``role: "system"`` messages
+    # (api_system: tool additions/removals, output_config). For a template
+    # without inline-system support the front HOISTS them into the head system
+    # turn, so the turn that first carries one re-renders every token behind
+    # the system text: D's radix walk and the arena key chain both stop at the
+    # end of the system turn (3.7-4.7k tokens), the match census reads
+    # ``MambaComponent:absent`` there, and the turn goes W31 -> P. On: render
+    # each NON-LEADING inline system message IN PLACE as a user turn wrapped in
+    # <system-reminder>, so a turn stays a token-prefix of the next one. Leading
+    # inline system messages (before any user/assistant turn) are still merged
+    # into the head -- that position is prefix-stable. Set it identically on
+    # P and D: the P->D handoff keys are P's tokenization of the same body.
+    SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
