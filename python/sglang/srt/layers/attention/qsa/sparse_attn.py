@@ -82,10 +82,55 @@ def parse_rows_config(raw: str, arch: int):
 
 _ROWS_CONFIG_CACHE: dict = {}
 
+# H101 (rc9p, 26.09.): the L20 row above 512 query rows, (16, 1, 2), is a
+# SPILLING build on sm120, and since the CUDA-13 image (rc2.1d, 8f1db7a6e5,
+# PTX 9.0) a much bigger one: the container's Triton cache holds the D build
+# (fp8 exp2 decode, USE_COUNTS=False) at REG 128 / STACK 2320 B per thread
+# (cuobjdump -res-usage, entry SEVCQXIANJ...; the same source under PTX 8.8
+# was REG 255 / STACK 992 B). The driver backs the stack for every resident
+# thread: 2320 B x 170 SM x 1536 = 578 MiB (agent09252021, the next
+# WEG2-SLEEP-LMEM: 'lmem 578->0 MiB ... NVML -580 MiB measured'), against the
+# 1024 B = 255 MiB the context holds. The FIRST launch of that form on a rank
+# grows the reservation inside cuLaunchKernel -- rc9p D-TP0 died there
+# ('Triton Error [CUDA]: out of memory', X-direct extend of 3585 rows on a
+# 23744-token prefix, 22 min into the boot), with no planner post for it.
+# Group P never met it: its arm sets SGLANG_FORCE_QSA_ROWS_CONFIG=inf=64/8/2
+# (NF_ENV_P_FORM), group D had no such line and kept the table.
+# The sm120 default therefore replaces ONLY that entry with the build P runs
+# for its 16k chunks: (64, 8, 2) is REG 152 / STACK 0 on sm120 under PTX 9.0
+# (UZIGNZUEW4..., the very D build, fp8 exp2, USE_COUNTS=False) and REG
+# 111-152 / STACK 0 under PTX 8.8. Every band up to 512 rows (decode, verify,
+# short extends) keeps its build, so their SASS is unchanged. sm86 keeps the
+# table (its D ranks do not attend under Form A; its P ranks run the arm's
+# override). An env table for this arch still wins over this default.
+_SM120_ROWS_CONFIGS = [
+    (32, (32, 8, 2)),
+    (64, (64, 8, 2)),
+    (128, (64, 4, 2)),
+    (512, (32, 4, 2)),
+    (float("inf"), (64, 8, 2)),
+]
+_ARCH_ROWS_DEFAULTS = {120: _SM120_ROWS_CONFIGS}
+
+
+def _device_arch() -> int:
+    """sm number of the current device (e.g. 86, 120); torch caches the
+    device properties, so this is a dictionary read per launch."""
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor
+
+
+def rows_table_for_arch(arch: int):
+    """The rows kernel's default (limit, (block_n, warps, stages)) table for
+    ``arch`` when no env override names it: H101's spill-free sm120 table, else
+    ``None`` (= the device-name keyed H20/L20 table of ``_get_best_config``)."""
+    return _ARCH_ROWS_DEFAULTS.get(int(arch))
+
 
 def _get_rows_config(total_q: int):
     """``_get_best_config`` for the rows kernel, unless
-    SGLANG_FORCE_QSA_ROWS_CONFIG names a table for this device's arch."""
+    SGLANG_FORCE_QSA_ROWS_CONFIG names a table for this device's arch, or the
+    arch has a measured spill-free default (H101, sm120)."""
     from sglang.srt.environ import envs
 
     raw = envs.SGLANG_FORCE_QSA_ROWS_CONFIG.get()
@@ -97,7 +142,36 @@ def _get_rows_config(total_q: int):
         table = _ROWS_CONFIG_CACHE[key]
         if table is not None:
             return next(cfg for limit, cfg in table if total_q <= limit)
+    table = rows_table_for_arch(_device_arch())
+    if table is not None:
+        return next(cfg for limit, cfg in table if total_q <= limit)
     return _get_best_config(total_q)
+
+
+def rows_launch_forms(arch: Optional[int] = None):
+    """Every distinct (block_n, warps, stages) the rows launch can pick on this
+    device, each with the smallest total_q that selects it -- the set a boot
+    prewarm has to load (H101). Walks the bands of the effective table."""
+    if arch is None:
+        major, minor = torch.cuda.get_device_capability()
+        arch = major * 10 + minor
+    from sglang.srt.environ import envs
+
+    raw = envs.SGLANG_FORCE_QSA_ROWS_CONFIG.get()
+    table = parse_rows_config(raw, arch) if raw else None
+    if table is None:
+        table = rows_table_for_arch(arch)
+    if table is None:
+        table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
+    forms = []
+    lower = 1
+    for limit, cfg in table:
+        if cfg not in (f for _q, f in forms):
+            forms.append((lower, cfg))
+        if limit == float("inf"):
+            break
+        lower = int(limit) + 1
+    return forms
 
 
 # fnFL2 H65 (F2 of H58): the prefix-free prefill kernel (_sparse_gqa_prefill,
@@ -211,7 +285,7 @@ def _note_rows_launch(total_q, block_n, warps, stages, kv_fp8, fp8_decode) -> No
         arch = "sm?"
     logger.info(
         "QSA-ROWS-LAUNCH arch=%s kv=%s decode=%s cfg=%d/%d/%d first_total_q=%d "
-        "(SGLANG_FORCE_QSA_ROWS_CONFIG=%r SGLANG_WEG2_QSA_FP8_DECODE=%r; one line "
+        "table=%s (SGLANG_FORCE_QSA_ROWS_CONFIG=%r SGLANG_WEG2_QSA_FP8_DECODE=%r; one line "
         "per launch form)",
         arch,
         "fp8" if kv_fp8 else "16bit",
@@ -220,9 +294,78 @@ def _note_rows_launch(total_q, block_n, warps, stages, kv_fp8, fp8_decode) -> No
         warps,
         stages,
         int(total_q),
+        _rows_table_source(),
         envs.SGLANG_FORCE_QSA_ROWS_CONFIG.get(),
         envs.SGLANG_WEG2_QSA_FP8_DECODE.get(),
     )
+
+
+def _rows_table_source() -> str:
+    """Which table the rows launch reads on this device: ``env`` (an override
+    names this arch), ``h101-sm120`` (the spill-free arch default), else the
+    device-name keyed ``h20`` / ``l20``. For the QSA-ROWS-LAUNCH line only."""
+    from sglang.srt.environ import envs
+
+    try:
+        arch = _device_arch()
+        raw = envs.SGLANG_FORCE_QSA_ROWS_CONFIG.get()
+        if raw and parse_rows_config(raw, arch) is not None:
+            return "env"
+        if rows_table_for_arch(arch) is not None:
+            return f"h101-sm{arch}"
+        return "h20" if "H20" in torch.cuda.get_device_name(0) else "l20"
+    except Exception:  # noqa: BLE001 -- a log line never fails a launch
+        return "?"
+
+
+#: H101: the specializations the rows launches of this process use -- q heads /
+#: head_dim / dtype, the rows width K (``sr_m`` is a constexpr, so the exact
+#: width is part of the build) and the KV pool tensors (weak references: their
+#: strides and dtype are build keys too). One entry per distinct key, recorded
+#: at the launches the boot already makes (the target's AND the draft's decode
+#: graph capture), so the boot prewarm (qsa/rows_prewarm.py) builds exactly the
+#: variants serving will launch. ``done`` closes the recording after the
+#: prewarm: serving launches then pay one dict read.
+_ROWS_PREWARM_SIG: dict = {"sigs": {}, "done": False}
+_ROWS_PREWARM_SIG_MAX = 8
+
+
+def _note_rows_prewarm_sig(q, k_pool, v_pool, rows) -> None:
+    import weakref
+
+    try:
+        sigs = _ROWS_PREWARM_SIG["sigs"]
+        key = (
+            int(q.shape[1]), int(q.shape[2]), str(q.dtype), int(rows.shape[-1]),
+            str(k_pool.dtype), tuple(k_pool.stride()), tuple(v_pool.stride()),
+        )
+        if key in sigs or len(sigs) >= _ROWS_PREWARM_SIG_MAX:
+            return
+        sigs[key] = {
+            "heads": key[0],
+            "head_dim": key[1],
+            "dtype": q.dtype,
+            "k": key[3],
+            "k_pool": weakref.ref(k_pool),
+            "v_pool": weakref.ref(v_pool),
+        }
+    except Exception:  # noqa: BLE001 -- a record never fails a launch
+        pass
+
+
+def rows_prewarm_signatures():
+    """The recorded launch signatures (list of dicts with live pool tensors);
+    entries whose pool tensors are gone are left out."""
+    out = []
+    for sig in list(_ROWS_PREWARM_SIG["sigs"].values()):
+        k_pool, v_pool = sig["k_pool"](), sig["v_pool"]()
+        if k_pool is not None and v_pool is not None:
+            out.append(dict(sig, k_pool=k_pool, v_pool=v_pool))
+    return out
+
+
+def close_rows_prewarm_recording() -> None:
+    _ROWS_PREWARM_SIG["done"] = True
 
 
 @triton.jit
@@ -985,6 +1128,8 @@ def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale, row_counts=None):
     lse = torch.empty((total_q, num_q_heads), dtype=torch.float32, device=q.device)
     if total_q == 0:
         return out, lse
+    if not _ROWS_PREWARM_SIG["done"]:
+        _note_rows_prewarm_sig(q, k_pool, v_pool, rows)
     kv_fp8 = k_pool.dtype == torch.float8_e4m3fn
     if kv_fp8:
         # Same strides (1 byte per element either way); decoded in-kernel.

@@ -46,6 +46,17 @@ driver grows the reservation itself if a kernel of the phase needs more. The
 boot base is the stack the FIRST park of the process found (1248 B on the
 5090 PP0 of fnFL2), capped the same way (above it: the driver default).
 
+H101 (rc9p D-TP0, 26.09.): "the driver grows the reservation itself" is a
+launch-time allocation nobody booked -- rc9p died in exactly that growth
+('Triton Error [CUDA]: out of memory' at the first launch of a 2320-B-stack
+kernel, 22 min into the boot). The Triton loader chokepoint therefore keeps a
+census of every loaded kernel's LOCAL_SIZE (utils/lmem_census.py); the wake
+takes it as ``booked_stack_bytes``: the target is raised to the largest stack
+a kernel of THIS process has been loaded with, also above the H47 cap, and the
+line says ``booked=<B>(<kernel>)``. The census holds only kernels the process
+really loaded (i.e. launches), so it is a measured need, not a reserve; with
+no census entry above the old target nothing changes.
+
 Everything here is fail-soft: a refused park leaves the context as it was, a
 refused restore leaves the driver's on-demand growth, and both say so on the
 log line. Nothing here raises into the sleep or the wake.
@@ -162,6 +173,9 @@ class LmemRestore(msgspec.Struct, frozen=True, kw_only=True):
     #: H47: the saved high-water NOT restored, and why ("" = restored as saved).
     skipped_saved_bytes: int = 0
     skip_reason: str = ""
+    #: H101: the census stack that raised the target (0 = none did) and its kernel.
+    booked_stack_bytes: int = 0
+    booked_kernel: str = ""
 
     def skip_line(self) -> str:
         """The H47 line for a saved high-water the wake did not put back ("" if none)."""
@@ -185,6 +199,8 @@ class LmemRestore(msgspec.Struct, frozen=True, kw_only=True):
             f"{lmem_mib(stack_bytes=self.restored_stack_bytes, threads=self.threads):.0f} MiB "
             f"NVML {'n/a' if nv is None else f'+{nv:.0f}'} MiB ms={self.ms:.1f}"
         )
+        if self.booked_stack_bytes:
+            head += f" booked={self.booked_stack_bytes}({self.booked_kernel or '?'})"
         if self.refused:
             return head + f" REFUSED ({self.refused}) -- the driver grows it on demand at the next launch"
         return head
@@ -262,18 +278,42 @@ def _first_accepted_rung(
     return None, errors
 
 
+def booked_wake_target(
+    *, target: int, skip: str, saved: int, booked: Optional[int]
+) -> Tuple[int, str, int]:
+    """H101: raise a :func:`wake_target_stack` answer to the census stack.
+
+    (target, skip, booked_used): ``booked`` above the target wins (also above
+    the H47 cap -- a loaded kernel's LOCAL_SIZE is a need, not a high-water);
+    an "oversized" skip is cleared once the booked stack covers the saved one.
+    ``booked_used`` is 0 when the census did not move the target."""
+    if booked is None or int(booked) <= int(target):
+        return int(target), skip, 0
+    booked = int(booked)
+    if skip and booked >= int(saved):
+        skip = ""
+    return booked, skip, booked
+
+
 def restore_lmem(
     *,
     driver: StackLimitDriver,
     park: LmemPark,
     nvml_bytes: NvmlReader,
     phase_kernel_stack_bytes: Optional[int] = None,
+    booked_stack_bytes: Optional[int] = None,
+    booked_kernel: str = "",
 ) -> LmemRestore:
-    """Raise the limit to :func:`wake_target_stack` unless the context already
-    holds at least that (a wake never lowers it)."""
+    """Raise the limit to :func:`wake_target_stack` (H101: at least the census
+    stack ``booked_stack_bytes``) unless the context already holds at least
+    that (a wake never lowers it)."""
     t0 = time.perf_counter()
     target, skip = wake_target_stack(saved=park.saved_stack_bytes, base=park.base_stack_bytes,
                                      phase_kernel_stack=phase_kernel_stack_bytes)
+    target, skip, booked = booked_wake_target(target=target, skip=skip,
+                                              saved=park.saved_stack_bytes,
+                                              booked=booked_stack_bytes)
+    bk = dict(booked_stack_bytes=booked, booked_kernel=booked_kernel if booked else "")
     skipped = park.saved_stack_bytes if skip else 0
     try:
         found = driver.get_stack_bytes()
@@ -281,11 +321,11 @@ def restore_lmem(
         return LmemRestore(found_stack_bytes=park.parked_stack_bytes,
                            restored_stack_bytes=park.parked_stack_bytes, threads=park.threads,
                            refused=f"get: {type(exc).__name__}: {exc}",
-                           skipped_saved_bytes=skipped, skip_reason=skip)
+                           skipped_saved_bytes=skipped, skip_reason=skip, **bk)
     if found >= target:
         return LmemRestore(found_stack_bytes=found, restored_stack_bytes=found,
                            threads=park.threads, ms=(time.perf_counter() - t0) * 1000.0,
-                           skipped_saved_bytes=skipped, skip_reason=skip)
+                           skipped_saved_bytes=skipped, skip_reason=skip, **bk)
     before = nvml_bytes()
     try:
         driver.set_stack_bytes(target)
@@ -296,7 +336,7 @@ def restore_lmem(
     return LmemRestore(found_stack_bytes=found, restored_stack_bytes=restored,
                        threads=park.threads, nvml_before=before, nvml_after=nvml_bytes(),
                        ms=(time.perf_counter() - t0) * 1000.0, refused=refused,
-                       skipped_saved_bytes=skipped, skip_reason=skip)
+                       skipped_saved_bytes=skipped, skip_reason=skip, **bk)
 
 
 def format_residue_posts(
