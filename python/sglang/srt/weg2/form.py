@@ -297,6 +297,9 @@ class ModelProfile:
     #: within X recomputes instead of W88 503, a remainder within X settles at
     #: the wake.
     store_short_tail: bool
+    #: NF fnFL2x76 exact bigram anchor keying (SGLANG_WEG2_BIGRAM_ANCHOR_EXACT);
+    #: the 27B metal ran the upstream keying.
+    bigram_anchor_exact: bool
     vision: str
     context_tokens: int
     records: RecordKey
@@ -319,6 +322,7 @@ class ModelProfile:
         out["SGLANG_WEG2_DRAFT_SHARE_EMBED"] = bool(self.draft.share_embed)
         out["SGLANG_WEG2_X_IDLE_REGRANT"] = bool(self.x_split)
         out["SGLANG_WEG2_STORE_SHORT_TAIL"] = bool(self.store_short_tail)
+        out["SGLANG_WEG2_BIGRAM_ANCHOR_EXACT"] = bool(self.bigram_anchor_exact)
         return out
 
     def constant(self, name: str) -> object:
@@ -417,6 +421,7 @@ PROFILES: Dict[str, ModelProfile] = {
         idle_layout="pp",
         x_split=True,
         store_short_tail=True,
+        bigram_anchor_exact=False,
         vision="transient",
         context_tokens=262144,
         # OPERATOR 26.09. (UN4): the 27B-RC9 records count on this tree as a
@@ -471,6 +476,7 @@ PROFILES: Dict[str, ModelProfile] = {
         idle_layout="",
         x_split=False,
         store_short_tail=False,
+        bigram_anchor_exact=True,
         vision="off",
         context_tokens=262144,
         records=RecordKey(fields=("checkpoint", "form")),

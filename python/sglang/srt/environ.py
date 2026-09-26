@@ -999,6 +999,12 @@ class Envs:
     # arm's values; nextflash 0 = off). An explicit value always wins.
     SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL = EnvInt(_profile_default("SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL", 0))
     SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH = EnvInt(_profile_default("SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH", 0))
+    # UNIFY S7/S8 (NF fnFL2x76 c8e26de17d): exact bigram anchor keying -- the
+    # retention key takes one more token so node units == tokens the recurrent
+    # state consumed. Default per profile (ModelProfile.bigram_anchor_exact):
+    # nextflash on (its metal), qwen27b off (upstream keying, the 27B metal);
+    # on without a form (the NF code default).
+    SGLANG_WEG2_BIGRAM_ANCHOR_EXACT = EnvBool(_profile_default("SGLANG_WEG2_BIGRAM_ANCHOR_EXACT", True))
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     # Weight loader: read safetensors tensors with pread() instead of mmap
     # page faults (ZFS: ~0.5 GB/s per rank through mmap, ~3 GB/s through

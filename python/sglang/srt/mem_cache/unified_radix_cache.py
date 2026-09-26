@@ -8589,8 +8589,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         takes one more token so node units == tokens the state consumed
         (``bigram_anchor_key``); ``MambaComponent._raw_token_pos`` is then
         the identity.  Dense bigram trees (27B + DFlash2) keep the upstream
-        keying."""
-        return bool(self.is_eagle and ComponentType.MAMBA in self.components)
+        keying.
+
+        UNIFY S7/S8: that last sentence did not hold -- the 27B is a hybrid
+        GDN model (MAMBA component) with bigram keys, so the unified tree gave it
+        the NF keying its metal never ran (the 27B P-TRIM/xsn437 pins read one
+        unit off). The keying is now the profile's (ModelProfile
+        .bigram_anchor_exact -> SGLANG_WEG2_BIGRAM_ANCHOR_EXACT: nextflash on,
+        qwen27b off = upstream keying); on without a form (the NF code default).
+        Read once per tree: the keying must not change under a live tree."""
+        v = self.__dict__.get("_weg2_bigram_anchor_exact")
+        if v is None:
+            v = bool(self.is_eagle and ComponentType.MAMBA in self.components
+                     and envs.SGLANG_WEG2_BIGRAM_ANCHOR_EXACT.get())
+            self.__dict__["_weg2_bigram_anchor_exact"] = v
+        return v
 
     # ---- Streaming session API (delegates to composed StreamingSession) ----
 

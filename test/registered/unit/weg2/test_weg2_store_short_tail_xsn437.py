@@ -80,8 +80,14 @@ MAMBA_LAYER_IDS = [i for i in range(NUM_LAYERS) if i not in FULL_LAYER_IDS]
 @pytest.fixture
 def group_p(monkeypatch):
     from sglang.srt.mem_cache import unified_radix_cache as urc
+    from sglang.srt.weg2 import form as _F
 
     monkeypatch.setenv("SGLANG_WEG2_GROUP", "P")
+    # UNIFY S7/S8: the 27B form -- its profile keeps the upstream bigram anchor
+    # keying (bigram_anchor_exact off) and its store-short tail on.
+    monkeypatch.setenv(_F.FORM_ENV, _F.Weg2Form(
+        arch="dense", experts="none", draft="dflash", p_draft="none", kv="paged_dcp",
+        flip="family", vision="off", profile="qwen27b", model="m").env_value())
     monkeypatch.setenv(ANCHOR_INTERVAL_ENV, str(INTERVAL))
     monkeypatch.setattr(urc, "_WEG2_END_ANCHOR", True)
     return monkeypatch

@@ -64,8 +64,19 @@ class TestWindowPoolSlots(unittest.TestCase):
 
 
 class TestLauncherFacts(unittest.TestCase):
+    def setUp(self):
+        # UNIFY S7: the group facts (early-read mamba dtype) are the qwen27b
+        # profile's; published the way the launcher publishes them.
+        self._form_saved = os.environ.get(F.FORM_ENV)
+        os.environ[F.FORM_ENV] = F.Weg2Form(arch="dense", experts="none", draft="dflash",
+                                          p_draft="none", kv="paged_dcp", flip="family",
+                                          vision="off", profile="qwen27b", model="m").env_value()
+
     def tearDown(self):
         _nextn()
+        os.environ.pop(F.FORM_ENV, None)
+        if self._form_saved is not None:
+            os.environ[F.FORM_ENV] = self._form_saved
 
     def test_plan_carries_group_facts(self):
         _dflash()
@@ -85,9 +96,14 @@ class TestLauncherFacts(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_CKPT, "27B checkpoint / DFlash2 draft not on this box")
-class TestPlannerTerms(unittest.TestCase):
-    def tearDown(self):
-        _nextn()
+class TestPlannerTerms(TestLauncherFacts):
+    """UNIFY S7: under the published qwen27b form (TestLauncherFacts.setUp)."""
+
+    def test_plan_carries_group_facts(self):  # inherited case, run once above
+        pass
+
+    def test_no_window_pool_under_nextn(self):  # inherited case, run once above
+        pass
 
     def _pcm(self, **plan_kw):
         _dflash()

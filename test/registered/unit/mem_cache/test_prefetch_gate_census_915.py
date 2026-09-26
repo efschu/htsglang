@@ -155,7 +155,8 @@ class TestTheGateIsWiredAndOrdered(CustomTestCase):
             "max(1, int(min_tokens))",
             src,
         )
-        self.assertIn("elif prefetch_length < _min_len:", src)
+        # UNIFY S7: the NF extent top-up (_topup) and the 27B minimum compose.
+        self.assertIn("elif prefetch_length < _min_len and not _topup:", src)
         self.assertIn("elif self.cache_controller.prefetch_rate_limited():", src)
 
     def test_the_rate_limit_check_is_still_called_at_most_once(self):
