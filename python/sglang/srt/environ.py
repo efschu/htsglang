@@ -1047,6 +1047,23 @@ class Envs:
     # gap (a Claude-Code turn's second request, +~155 tokens on the first,
     # arriving while the first decodes). Off = presence only at leg-2 finish.
     SGLANG_WEG2_FRONT_SPAN_INFLIGHT = EnvBool(False)
+    # X-EXACT (user 26.09. ~19:00Z, memory d2p-sofort-flippen-und-x-exakt-0926):
+    # X holds EXACTLY for the pending tokens -- no 1.3*X band. On = the front
+    # renders and tokenizes every /v1/messages, /v1/chat/completions and
+    # /generate request with the group's own serving code, tokenizer and
+    # template settings (read from its /get_server_info; weg2/front_tokens.py)
+    # and prices pending = tokens - the MEASURED cached-on-D token prefix; the
+    # tokenizer runs in one worker thread, incremental per conversation
+    # prefix. Every D leg 2 logs WEG2 X-EXACT-ERR (priced vs realised). Off
+    # (default, both profiles until an agent-load boot has measured it) = the
+    # chars/3 pricing byte for byte.
+    SGLANG_WEG2_FRONT_EXACT_TOKENS = EnvBool(False)
+    # X-EXACT: longest wait for the count before the request is priced by the
+    # chars/3 estimate instead (named: WEG2 X-EXACT-FALLBACK reason=timeout).
+    SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS = EnvInt(3000)
+    # X-EXACT: tokenizer path override (tests, or a front without a group
+    # reachable); empty = the group's own server_args.tokenizer_path.
+    SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")
     # Prefix trace (IN 26.09., weg2/prefix_trace.py): every prefix miss of an
     # agent-load boot gets a token receipt -- one #1420 WALK-STOP line per
     # (rid, stop depth) whose unmatched rest is >= the minimum below, full

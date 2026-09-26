@@ -125,6 +125,12 @@ CHARS_PER_TOKEN = 3.0  # conservative: over-estimates tokens, never under-prices
 # 27,466-token carrier bound. Route by a lower divisor; the realised leg-1
 # count corrects any prompt that still slips through (see leg1).
 CARRIER_CHARS_PER_TOKEN = 2.4
+#: X-EXACT: appended inside the ROUTE-VERDICT's witness parenthesis when the
+#: request was priced by the front tokenizer, so the line never reads as the
+#: chars/3 figure it would otherwise name (off: never appended).
+X_EXACT_VERDICT_NOTE = ("; X-EXACT: uncached, est_prompt and carrier_est are the FRONT "
+                        "TOKENIZER's exact counts of the prompt as D renders it, NOT "
+                        "CHARS_PER_TOKEN -- see the X-EXACT-PRICE line")
 #: WEG2_SCHEDULING_SPEC_0907 C13/K10: the drain deadline is a FLAG
 #: (``--drain-deadline-s``); this is the shipped value it preserves (spec
 #: 3.5.4, the #111 link-seam bound reused).  No code reads it except the
@@ -3014,6 +3020,20 @@ class Front:
         self.admit_d = True
         self.queue: Deque[Pending] = collections.deque()
         self.spans = SpanLRU()
+        # X-EXACT (user 26.09. ~19:00Z): the pending tokens priced EXACTLY --
+        # D's tokenizer and template at the front, minus the measured
+        # cached-on-D TOKEN prefix (weg2/front_tokens.py). Off = chars/3 pricing,
+        # byte for byte; nothing below is constructed or imported then.
+        self.x_exact = bool(envs.SGLANG_WEG2_FRONT_EXACT_TOKENS.get())
+        self.ftok = None
+        self.tspans = None
+        #: rid -> (pending priced, tokens counted, witness) for X-EXACT-ERR
+        self._x_exact_rid: "collections.OrderedDict[str, Tuple[int, int, str]]" = collections.OrderedDict()
+        if self.x_exact:
+            from sglang.srt.weg2.front_tokens import FrontTokens, TokenSpans
+
+            self.ftok = FrontTokens()
+            self.tspans = TokenSpans(agent_span=self.spans.agent_span)
         # NF (P49): a boot with the switch on says so once. Off prints nothing,
         # so an off boot's front log keeps the pre-P49 lines (the arm's env
         # line is the off witness).
@@ -3877,6 +3897,8 @@ class Front:
         # during the freeze: "Server disconnected", 97k needle lost. Import it
         # once here, in a worker thread, while the front is still idle.
         app["launcher_prewarm"] = asyncio.create_task(self._prewarm_launcher_import())
+        if self.x_exact:
+            app["x_exact"] = asyncio.create_task(self._x_exact_boot())
         # H78: the same move for the flip path's small lazy imports (wake_credit
         # alone put ~5 ms into x175's first FLIP-ORDER) and for the sidecar the
         # sleep-leg gate reads at every flip (18-47 ms of JSON on the loop).
@@ -3923,6 +3945,157 @@ class Front:
         logger.info("WEG2-FRONT launcher prewarmed off the event loop in %.1f s "
                     "(H75: resolve_x_live no longer freezes the front in the first flip)",
                     time.monotonic() - t0)
+
+    # -- X-EXACT (user 26.09. ~19:00Z): exact pending tokens ------------------
+    async def _x_exact_boot(self) -> None:
+        """Load D's rendering stack into the front, off the event loop.
+
+        The tokenizer path and every rendering setting come from a group's own
+        ``/get_server_info`` (the same server args its tokenizer manager
+        runs), so there is one source for the profile's tokenizer: the group.
+        Startup only: retried every 5 s until a group answers, then never
+        again. Until READY every request is priced by chars/3 and says so
+        (``X-EXACT-FALLBACK reason=tokenizer_loading``)."""
+        t0 = time.monotonic()
+        tries = 0
+        info: Dict[str, Any] = {}
+        minfo: Dict[str, Any] = {}
+        while True:
+            tries += 1
+            for name in (self.awake, "P" if self.awake == "D" else "D"):
+                g = self.groups[name]
+                try:
+                    async with self.session.get(f"{g.url}/get_server_info",
+                                                timeout=ClientTimeout(total=10)) as r:
+                        got = await r.json() if r.status == 200 else None
+                    async with self.session.get(f"{g.url}/model_info",
+                                                timeout=ClientTimeout(total=10)) as r:
+                        mi = await r.json() if r.status == 200 else {}
+                except Exception:  # noqa: BLE001 -- group not up yet; retried
+                    got, mi = None, {}
+                if isinstance(got, list) and got:
+                    got = got[0]
+                if isinstance(got, dict) and (got.get("tokenizer_path") or got.get("model_path")):
+                    info = {k: v for k, v in got.items() if k != "internal_states"}
+                    minfo = mi if isinstance(mi, dict) else {}
+                    info["_group"] = name
+                    break
+            if info:
+                break
+            if tries % 12 == 1:
+                logger.info("WEG2 X-EXACT waiting for a group's /get_server_info (try %d, %.0f s)",
+                            tries, time.monotonic() - t0)
+            await asyncio.sleep(5.0)
+        group = info.pop("_group")
+        is_mm = bool(minfo.get("has_image_understanding") or minfo.get("has_audio_understanding"))
+        ft = self.ftok
+        await asyncio.get_running_loop().run_in_executor(ft.executor, ft.load, info, is_mm)
+        if ft.state != "ready":
+            logger.error("WEG2 X-EXACT FAILED to load the front tokenizer from group %s's server args "
+                         "(%s) after %.1f s -- every request stays priced by chars/3 "
+                         "(X-EXACT-FALLBACK reason=tokenizer_failed)", group, ft.why, ft.load_s)
+            return
+        tmpl = getattr(ft._tok, "chat_template", None) or ""
+        logger.info(
+            "WEG2 X-EXACT READY tokenizer=%s (group %s's server_args.tokenizer_path%s) "
+            "chat_template=%s sha1=%s chat_template_default_kwargs=%s reasoning_parser=%s "
+            "tool_call_parser=%s multimodal=%d inline_system_in_place=%d encode=%s load_s=%.1f "
+            "-- pending = tokens(prompt as D renders it) - measured cached-on-D token prefix; "
+            "X holds exactly for it (no band)",
+            ft.tokenizer_path, group,
+            ", OVERRIDDEN by SGLANG_WEG2_FRONT_TOKENIZER_PATH"
+            if envs.SGLANG_WEG2_FRONT_TOKENIZER_PATH.get() else "",
+            info.get("chat_template") or "checkpoint",
+            hashlib.sha1(tmpl.encode()).hexdigest()[:12],
+            info.get("chat_template_default_kwargs"), info.get("reasoning_parser"),
+            info.get("tool_call_parser"), int(is_mm),
+            int(bool(envs.SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE.get())), ft.why, ft.load_s)
+
+    async def _x_exact_price(self, rid: str, path: str, payload: Any, text: str,
+                             est_uncached: int, est_prompt: int, multimodal: bool = False):
+        """The exact pricing of one arrival, or None (then the chars/3 figures
+        stand, and the line below says why). Runs the count in the front
+        tokenizer's worker thread; the event loop only awaits it."""
+        ft = self.ftok
+        reason = None
+        if ft is None or ft.state != "ready":
+            reason = "tokenizer_" + (ft.state if ft is not None else "none")
+        elif multimodal:
+            reason = "multimodal"  # image/video/embeds: D's mm processor expands them
+        elif not isinstance(payload, dict) or path not in ("/v1/messages", "/v1/chat/completions",
+                                                               "/generate"):
+            reason = "path"
+        c = None
+        t0 = time.monotonic()
+        if reason is None:
+            try:
+                c = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(ft.executor, ft.count, path, payload),
+                    timeout=envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0)
+            except asyncio.TimeoutError:
+                reason = "timeout"
+            except Exception as e:  # noqa: BLE001 -- the estimate stands, named
+                reason = f"{type(e).__name__}: {str(e)[:160]}"
+        wait_ms = (time.monotonic() - t0) * 1000.0
+        if c is None:
+            self.counters["x_exact_fallback"] += 1
+            logger.info("WEG2 X-EXACT-FALLBACK rid=%s reason=%s est_uncached=%d est_prompt=%d "
+                        "(chars/3 estimate stands for this request) wait_ms=%.1f",
+                        rid, reason, est_uncached, est_prompt, wait_ms)
+            return None
+        ft.remember(text, c.ids)
+        # the epoch is read AFTER the count: a flip during it ends the held credit
+        epoch = self.epoch if self.awake == "D" and self.state == "serving" else None
+        pending, credit, known, src = self.tspans.pending(c.ids, epoch=epoch)
+        self._x_exact_rid[rid] = (pending, c.n, src)
+        while len(self._x_exact_rid) > 4096:
+            self._x_exact_rid.popitem(last=False)
+        self.counters["x_exact_priced"] += 1
+        logger.info("WEG2 X-EXACT-PRICE rid=%s pending=%d tokens=%d credit=%d src=%s known=%d "
+                    "(EXACT: D's tokenizer+template, minus the MEASURED cached-on-D token prefix) "
+                    "chars3_uncached=%d chars3_prompt=%d delta=%+d count_ms=%.1f wait_ms=%.1f "
+                    "reused=%d encoded=%d",
+                    rid, pending, c.n, credit, src, int(known), est_uncached, est_prompt,
+                    est_uncached - pending, c.ms, wait_ms, c.reused, c.encoded)
+        from types import SimpleNamespace
+
+        return SimpleNamespace(pending=pending, n=c.n, known=known, credit=credit, src=src)
+
+    def _x_exact_tokens_check(self, rid: str, group: str, prompt_tokens: int) -> None:
+        got = self._x_exact_rid.get(rid)
+        if got is None or not prompt_tokens:
+            return
+        if int(prompt_tokens) != got[1]:
+            self.counters["x_exact_token_mismatch"] += 1
+        logger.info("WEG2 X-EXACT-TOKENS rid=%s group=%s tokens_front=%d tokens_group=%d match=%d",
+                    rid, group, got[1], int(prompt_tokens), int(int(prompt_tokens) == got[1]))
+
+    def _x_exact_record(self, rid: str, text: str, pt: int, ct: int, pending: Any,
+                        held_epoch: Optional[int]) -> None:
+        """D leg 2 finished: feed the token spans with D's MEASURED reading and
+        log the residual error of this request's exact price. NO BAND: the
+        error is printed, never folded back into the routing bound."""
+        self.tspans.record_presence(self.ftok.ids_for(text), ct, prompt_tokens=pt,
+                                    held_epoch=held_epoch)
+        got = self._x_exact_rid.pop(rid, None)
+        if got is None:
+            return
+        priced, n, src = got
+        via = ("d_direct" if pending is None
+               else "d_drain" if getattr(pending, "d_direct", False) else "after_p")
+        realised = max(0, int(pt) - int(ct))
+        direct = via != "after_p"
+        if direct:
+            self.counters["x_exact_err_n"] += 1
+            self.counters["x_exact_err_abs_sum"] += abs(priced - realised)
+        logger.info("WEG2 X-EXACT-ERR rid=%s via=%s pending_priced=%d d_uncached=%d err=%s "
+                    "tokens_front=%d tokens_d=%d match=%d src=%s (err = priced - realised; "
+                    "with match=1 it is D's cache moving after the measurement, e.g. a Mamba "
+                    "state only at an anchor depth -- logged, never absorbed by a band; "
+                    "after_p: D read P's prefill back, no comparison)",
+                    rid, via, priced, realised,
+                    ("%+d" % (priced - realised)) if direct else "na",
+                    n, int(pt), int(int(pt) == n), src)
 
     #: H78: the modules the flip / leg path imports lazily on its FIRST use --
     #: credit_pause_order (wake_credit), timed_pause_order (wake_credit_pd),
@@ -4541,11 +4714,22 @@ class Front:
         # ever saw a prefill.
         presence_src = ((getattr(self.spans, "last_src", None) or "d_leg2_cached")
                         if known else "none")
+        # X-EXACT: the count replaces the chars/3 figures (off: never entered).
+        _xx = None
+        if self.x_exact:
+            _xx = await self._x_exact_price(rid, request.path, payload, text,
+                                            remainder, est_prompt,
+                                            multimodal=bool(_img or _vid or _emb))
+            if _xx is not None:
+                remainder, est_prompt, known = _xx.pending, _xx.n, _xx.known
+                store_span, presence_src = _xx.credit, _xx.src
         if not known:
             self.counters["W22_Weg2SpanUnknownPricedFull"] += 1
         self.counters["requests"] += 1
         stream = bool(payload.get("stream"))
         exact = self.exact_tokens.get(hashlib.sha1(text.encode(errors="replace")).hexdigest())
+        if _xx is not None:
+            exact = _xx.n
         carrier_est = exact if exact else int(len(text) / CARRIER_CHARS_PER_TOKEN) + 1
         # #1290: ONE ROUTE VERDICT, TAKEN ONCE, ON BOTH BOUNDS TOGETHER.  The
         # branch below used to test the carrier ALONE and send anything over
@@ -4619,7 +4803,8 @@ class Front:
             # NF (P49): the #49 witness is named only when the switch is on,
             # so the line stays rc2.1l's byte for byte when it is off.
             ("; #49 d_served_epoch = prompt_tokens of a text D served in this epoch"
-             if getattr(self.spans, "agent_span", False) else ""),
+             if getattr(self.spans, "agent_span", False) else "")
+            + (X_EXACT_VERDICT_NOTE if _xx is not None else ""),
             carrier_est, "exact" if exact is not None else "estimate",
             self.carrier_max_tokens, CARRIER_CHARS_PER_TOKEN, est_prompt,
             len(text),
@@ -4685,8 +4870,10 @@ class Front:
         # price_remainder is len(text)/3.0 minus an LRU prefix guess, with no
         # tokenizer at the front.  D re-derives the real extent after
         # match_prefix and refuses by name there (L9/W31).
-        logger.info("WEG2 X-ROUTE rid=%s est_uncached=%d X=%d (ESTIMATE, front pricing, no tokenizer)",
-                    rid, remainder, x_route)
+        logger.info("WEG2 X-ROUTE rid=%s est_uncached=%d X=%d (%s)",
+                    rid, remainder, x_route,
+                    "EXACT, front tokenizer, see X-EXACT-PRICE" if _xx is not None
+                    else "ESTIMATE, front pricing, no tokenizer")
         # RC2 review (idle policy b): why a SHORT falls through to BATCH. Only
         # D's own #915 refusal is recorded -- see `d_eligible` below.
         short_refused: List[str] = []
@@ -5284,6 +5471,8 @@ class Front:
             # and it was never wrong -- `carrier_est=109132 src=exact` was
             # the one correct number on the sn6s route line.
             self._note_exact(p.text, pt)
+            if self.x_exact:
+                self._x_exact_tokens_check(p.rid, "P", pt)
             # #1317n THE POST-LEG-1 CARRIER BAND IS GONE. It compared
             # the realised prompt against what D's host tier could carry AS
             # ONE READ and sent leg 2 to a single prefill on D -- which,
@@ -5564,6 +5753,8 @@ class Front:
                         text, self.exact_tokens.get(hashlib.sha1(text.encode(errors="replace")).hexdigest())
                         or int(len(text) / CHARS_PER_TOKEN) + 1,
                         held_epoch=self.epoch)
+                    if self.x_exact:
+                        self.tspans.record_inflight(self.ftok.ids_for(text), self.epoch)
                     self.counters["span_inflight_credited"] += 1
                 if stream:
                     resp = web.StreamResponse(status=r.status)
@@ -5719,6 +5910,10 @@ class Front:
                                                    held_epoch=(self.epoch if r.status == 200 and priced
                                                                and not x_inband else None))
                         self._note_exact(text, pt)
+                        if self.x_exact:
+                            self._x_exact_record(rid, text, pt, ct, pending,
+                                                 (self.epoch if r.status == 200 and priced
+                                                  and not x_inband else None))
                     dterms = await self._draft_terms(g, None, rid=rid, uncached=max(0, pt - ct),
                                                      mark=_pfc_mark0)
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
@@ -5808,6 +6003,10 @@ class Front:
                                                held_epoch=(self.epoch if r.status == 200 and priced
                                                            and verdict != "reroute" else None))
                     self._note_exact(text, pt)
+                    if self.x_exact:
+                        self._x_exact_record(rid, text, pt, ct, pending,
+                                             (self.epoch if r.status == 200 and priced
+                                              and verdict != "reroute" else None))
                 if r.status == 200 and pending is not None and verdict == "reroute":
                     self.counters["reroute"] += 1
                     pending.reroutes += 1
