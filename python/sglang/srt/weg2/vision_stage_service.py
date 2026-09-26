@@ -1,6 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Task #58 slice 9 -- the GROUP side: who actually runs the transient stage.
 
+SUPERSEDED 2026-09-24 (user design): the stage now runs INSIDE the P group's
+PP0 rank (``weg2/vision_rank_runner.py``: tower on the KV tail, O_DIRECT
+reader, no second CUDA context, no displacement, no host-RAM post).  The
+tokenizer process arms :func:`install_rank_stage` and this module's seam then
+passes every item on with its pixels.  The answer given below ("which
+process, and why it is not a rank") is the history of the replaced stage; its
+delivery argument is what PP0 answers now -- stage 0 is exactly the rank that
+turns tokens into embeddings, so its rows need no transport at all.
+
 Slices 1-6 built the term, the loader, the hand-off and the ordering with its
 teardown invariant.  All of it was callable and none of it was CALLED.  This
 module is the caller, and the only real decision it makes is WHICH PROCESS.
@@ -688,6 +697,30 @@ _SERVICE: Optional[VisionStageService] = None
 #: and a non-empty string means "transient was asked for and is NOT armed".
 #: Collapsing them is exactly how a broken arming becomes a silent no-op.
 _ARM_REFUSAL: str = ""
+#: Set when the images of this boot are staged INSIDE the P group's PP0 rank
+#: (``weg2/vision_rank_runner.py``, user design 2026-09-24). The tokenizer
+#: process then stages nothing and refuses nothing: the items leave with their
+#: pixels, and the rank encodes them before its admission. A third state, not
+#: a spelling of the other two -- no service here, and no refusal either.
+_RANK_STAGE: bool = False
+
+
+def install_rank_stage() -> None:
+    """Hand this boot's images to the in-rank stage (the replacement of the
+    tokenizer-process stage): ``maybe_run`` and ``assert_nothing_unstaged``
+    pass every item on unchanged."""
+    global _SERVICE, _ARM_REFUSAL, _RANK_STAGE
+    _SERVICE = None
+    _ARM_REFUSAL = ""
+    _RANK_STAGE = True
+    logger.info(
+        "%s: images are staged in the P group's PP0 rank; the tokenizer "
+        "process loads no tower", W_STAGE_OK,
+    )
+
+
+def rank_stage_installed() -> bool:
+    return _RANK_STAGE
 
 
 def install(service: Optional[VisionStageService]) -> None:
@@ -697,10 +730,11 @@ def install(service: Optional[VisionStageService]) -> None:
     mutually exclusive states of one process, and a stale reason beside a
     live service would print a refusal for a stage that ran.
     """
-    global _SERVICE, _ARM_REFUSAL
+    global _SERVICE, _ARM_REFUSAL, _RANK_STAGE
     _SERVICE = service
     if service is not None:
         _ARM_REFUSAL = ""
+        _RANK_STAGE = False
     logger.info(
         "vision stage service %s", "ARMED" if service is not None else "disarmed"
     )
@@ -715,9 +749,10 @@ def install_refusal(reason: str) -> None:
     once at arming -- and said again, with this reason quoted, on the first
     image request.
     """
-    global _SERVICE, _ARM_REFUSAL
+    global _SERVICE, _ARM_REFUSAL, _RANK_STAGE
     _SERVICE = None
     _ARM_REFUSAL = str(reason)
+    _RANK_STAGE = False
     logger.error(
         "%s -- the transient vision stage is NOT armed in this process: %s. "
         "Image requests to this group will be refused by name (%s); text "
@@ -734,10 +769,11 @@ def arm_refusal() -> str:
 
 
 def reset_for_test() -> None:
-    """Drop both states.  Only tests call this; a boot arms once."""
-    global _SERVICE, _ARM_REFUSAL
+    """Drop every state.  Only tests call this; a boot arms once."""
+    global _SERVICE, _ARM_REFUSAL, _RANK_STAGE
     _SERVICE = None
     _ARM_REFUSAL = ""
+    _RANK_STAGE = False
 
 
 def installed() -> Optional[VisionStageService]:
@@ -765,6 +801,8 @@ def maybe_run(items: Sequence[Any], *, rid: str = "") -> Optional[VisionStageOut
     pending = _unstaged(items)
     if not pending:
         return None
+    if _RANK_STAGE:
+        return None  # the P group's PP0 rank stages them before its admission
     service = _SERVICE
     if service is None:
         if _ARM_REFUSAL:
@@ -812,6 +850,8 @@ def assert_nothing_unstaged(items: Sequence[Any], *, rid: str = "") -> None:
     pending = _unstaged(items)
     if not pending:
         return
+    if _RANK_STAGE:
+        return  # staged in the rank, which aborts by name what it cannot stage
     rid = rid or current_rid()
     outcome = VisionStageOutcome(
         ok=False,
