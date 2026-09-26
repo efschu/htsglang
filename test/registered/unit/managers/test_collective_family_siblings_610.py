@@ -560,6 +560,16 @@ class BudgetHarness:
     # (unknown votes YES by design), so on this harness -- no phase runtime,
     # no seam candidates -- it rides neutrally and identically on both ranks.
     _local_seam_premise_vote = Scheduler._local_seam_premise_vote
+    # #1234 fix 7 (6a9830b4eb, the COMPLETION arm) and #1317 design A
+    # (afe89c3ff9, the STORE-PRICED match arm): two more votes on the same
+    # canonical head. Tenth and eleventh drift; the guard named both. Bound,
+    # not stubbed: `waiting_queue` is empty, so the canonical head is empty
+    # and both votes are the empty dict -- neutral and identical on every rank.
+    _weg2_local_store_read_pending_ages = Scheduler._weg2_local_store_read_pending_ages
+    _weg2_local_store_matches = Scheduler._weg2_local_store_matches
+    # ... and the predicate the pending-ages vote asks per head rid (found by
+    # the guard on the next descent, bound for the same reason).
+    _weg2_store_read_is_pending = Scheduler._weg2_store_read_is_pending
 
     def get_num_allocatable_reqs(self, running_bs):
         """A STAND-IN, which is what the guard's own message offers as the

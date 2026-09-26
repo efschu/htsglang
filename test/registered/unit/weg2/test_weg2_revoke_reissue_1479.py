@@ -21,6 +21,12 @@ def _holder(ongoing, record, shortfall=None):
         check_prefetch_progress=lambda rid: rid not in ongoing,
     )
     h._weg2_note_store_shortfall = lambda req: shortfall
+    # fnFL2x38 (ba5847a7c0): `_weg2_refetch_one` reads the class constant
+    # WEG2_TAIL_RECOMPUTE_TOKENS before it re-issues; a stand-in without it
+    # raised AttributeError (and the hold loop swallowed it as "not due").
+    # The tails here (span 97871 vs record <= 4095) are far above it, so the
+    # re-read path under test is unchanged.
+    h.WEG2_TAIL_RECOMPUTE_TOKENS = Scheduler.WEG2_TAIL_RECOMPUTE_TOKENS
     h.issued = []
     h._prefetch_kvcache = lambda req: h.issued.append(req.rid) or "issued"
     h._clear_prefetch_deferral_fields = lambda req: None

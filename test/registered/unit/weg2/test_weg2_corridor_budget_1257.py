@@ -744,10 +744,24 @@ class TheBudgetProducerStaysSingular(CustomTestCase):
         every budget stands byte-identical. This is the case the whole rest of
         the file's fixtures previously took for granted.
         """
+        # HERMETIC: "nothing priced this floor" must be the fixture's fact,
+        # not the rig's. Without an override the floor resolver reads the live
+        # pointer file (~/.cache/sglang/corridor_floor_digest.json, written by
+        # a real boot) and, when this interpreter's NVML fingerprint matches
+        # it, resolves a MEASURED-D floor that actuates -- the case this test
+        # is not about (red under the runtime venv, green under one whose
+        # fingerprint differs). The pointer is aimed at a file that does not
+        # exist, which is the unmeasured rig this docstring describes.
+        from unittest import mock
+
+        from sglang.srt.managers import corridor_guard as _cg
+
+        _none = os.path.join(tempfile.mkdtemp(), "no_floor_digest.json")
         cards, budgets, dormant = sb5f_boot()
-        solve = cb.solve_corridor_budgets(
-            cards, budgets, dormant, sb5f_sample(), group="D"
-        )
+        with mock.patch.dict(os.environ, {_cg.FLOOR_DIGEST_FILE_ENV: _none}):
+            solve = cb.solve_corridor_budgets(
+                cards, budgets, dormant, sb5f_sample(), group="D"
+            )
         self.assertEqual(list(solve.budgets), list(budgets))
         self.assertFalse(solve.changed)
         text = "\n".join(solve.lines)

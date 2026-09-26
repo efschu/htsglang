@@ -511,7 +511,16 @@ def test_the_adapter_reconciles_the_manifest_before_it_derives_the_plan():
 
     from sglang.srt.managers.scheduler_components import weight_updater as wu
 
-    plan_src = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_shadow_plan)
+    # #1378 (c11cd2e352, 2026-09-15, weg2xsn94): `_weg2_shadow_plan` became a
+    # per-leg CACHE in front of `_weg2_shadow_plan_uncached`, which is where
+    # the derivation (and so the forwarding) now lives. The pin follows it:
+    # the cache must hand both terms through unchanged (never a literal), and
+    # the uncached adapter must forward them to the derivation.
+    cache_src = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_shadow_plan)
+    assert cache_src.count("require_agreement=require_agreement") >= 1
+    assert "agreed=agreed" in cache_src
+    assert "require_agreement=True" not in cache_src and "require_agreement=False" not in cache_src
+    plan_src = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_shadow_plan_uncached)
     assert "agreed=agreed" in plan_src
     # #1345 MOVED THIS ASSERTION, IT DID NOT WEAKEN IT.  The adapter used to
     # hard-set ``require_agreement=True`` for EVERY caller, and boot weg2xsn19

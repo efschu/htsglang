@@ -4,6 +4,7 @@ loads overlap the legs; otherwise the old order."""
 from __future__ import annotations
 
 import os
+import re
 import types
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
@@ -62,7 +63,12 @@ def test_the_kv_block_is_one_closure_called_early_or_late():
     assert "WEG2-DORMANT cleared" in body and "_weg2_release_dormant_hold" in body
     # the early call precedes the weight legs' collect worker
     assert e < src.index('thread_name_prefix="weg2-wake-collect"', d)  # the collect worker of THIS handler
-    assert src.count("            _weg2_kv_block()") == 1  # only the late site runs both halves
+    # only the late site runs both halves: exactly ONE call of the closure,
+    # and it sits at the late site. #1490 (f3fded40af) made that call read the
+    # refused-resume verdict (`_weg2_kv_ok = _weg2_kv_block() is not False`),
+    # so the pin counts the call, not a bare-statement spelling of it.
+    calls = [m.start() for m in re.finditer(r"(?<!def )_weg2_kv_block\(\)", src)]
+    assert len(calls) == 1 and calls[0] > l
     # the EARLY path resumes the pool only -- never clears DORMANT before the weights (xsn315)
     k = src.index('if _plan == "early":')
     early = src[k:k + 500]

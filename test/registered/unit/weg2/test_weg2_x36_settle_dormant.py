@@ -130,7 +130,11 @@ class TheTopUpOfAHeldExtentIgnoresTheThreshold(unittest.TestCase):
 
     def test_the_gate_consults_it_on_the_too_short_term_only(self):
         src = inspect.getsource(urc.UnifiedRadixCache.prefetch_from_storage)
-        self.assertRegex(src, r"elif prefetch_length < self\.prefetch_threshold and not _topup:")
+        # xsn437 (27B, in the unified tree since S7a ae40f81dd0): the too-short
+        # term compares against `_min_len`, which IS `prefetch_threshold`
+        # unless the caller passes `min_tokens` (a store-short tail re-read).
+        self.assertRegex(src, r"_min_len = self\.prefetch_threshold if min_tokens is None else")
+        self.assertRegex(src, r"elif prefetch_length < _min_len and not _topup:")
         self.assertRegex(src, r'if not locally_eligible:\s*reason = "anchor"')
 
 
