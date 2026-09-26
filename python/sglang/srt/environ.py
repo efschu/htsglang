@@ -579,6 +579,19 @@ class Envs:
     # False = the 50 ms poll and the unconditional want, byte-identical.
     SGLANG_WEG2_QUIESCE_FAST = EnvBool(False)
     SGLANG_WEG2_QUIESCE_FAST_POLL_MS = EnvInt(10)
+    # DEPOSIT_LANE_LOOKAHEAD (fnFL2 H111b, Legs): the sleeper's pair lanes
+    # (cross-card, BAR1 or host) leave the per-tag lockstep -- each runs in
+    # its own worker over the tag order, at most DEPOSIT_LANE_AHEAD tag(s)
+    # beyond the tag the loop pauses; the on-card lane, the pause and the
+    # credit stay on the loop thread in their old order (weg2/deposit_lookahead.py).
+    # Measured x177/x178/h91v1: lockstep idle 42-156 ms and pause+credit
+    # 5-7 ms x 10 tags per flip sit on PP0's chain above the 1.25 s copy-engine
+    # floor. False = the lockstep, byte for byte.
+    SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD = EnvBool(False)
+    SGLANG_WEG2_DEPOSIT_LANE_AHEAD = EnvInt(1)
+    # the sleeping group(s) that take the lookahead (comma list, default the
+    # P->D direction only: P sleeps, PP0's chain is the Flipzeit's legs).
+    SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD_GROUPS = EnvStr("P")
     # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
     # not carry (pad + D-extra rows, loaded from the host store) are issued on
     # a side stream right behind the resume of their layer's chunk tag, i.e.
