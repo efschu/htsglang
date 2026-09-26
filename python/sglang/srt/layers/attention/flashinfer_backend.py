@@ -2990,14 +2990,17 @@ class FlashInferAttnBackend(AttentionBackend):
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        kv_own: int,
+        kv_own,
+        store: bool = True,
     ) -> torch.Tensor:
         """AH, --p-attn-head-split (weg2/attn_head_split.py): the OWNER's share
-        of a split layer. Stores ALL kv groups of the chunk into the pool, as
-        forward_extend does -- the owner's pool stays complete, so radix,
-        HiCache publish and the D hand-off are untouched -- then attends only
-        its own first ``kv_own`` groups (``q_own`` = their query heads,
-        contiguous [w, kv_own * gqa, D]) over a head-sliced VIEW of the pool.
+        of a split layer. With ``store`` (the layer's first call) it stores ALL
+        kv groups of the chunk into the pool, as forward_extend does -- the
+        owner's pool stays complete, so radix, HiCache publish and the D
+        hand-off are untouched -- then attends the query heads ``q_own``
+        (contiguous [w, n_q, D]) over kv groups ``kv_own`` = (g0, g1) of a
+        head-sliced VIEW of the pool (an int n = V1's (0, n)). V2 calls it
+        again with ``store=False`` for a partial group or a fallback range.
         Paged-only extend (the 27B form), one request; reached only through
         the split rule, never on the default path."""
         if self.forward_metadata.use_ragged or self.uneven_dcp:
@@ -3005,19 +3008,21 @@ class FlashInferAttnBackend(AttentionBackend):
                 "AH owner: the head subset is built for the paged-only extend "
                 "form (use_ragged=False, no uneven DCP)"
             )
-        self.token_to_kv_pool.set_kv_buffer(
-            layer,
-            KVWriteLoc(forward_batch.out_cache_loc, self.forward_metadata.swa_out_cache_loc),
-            k,
-            v,
-            layer.k_scale,
-            layer.v_scale,
-        )
-        wrapper = self._ah_subset_plan(forward_batch, int(q_own.shape[1]), int(kv_own))
+        g0, g1 = (0, int(kv_own)) if isinstance(kv_own, int) else (int(kv_own[0]), int(kv_own[1]))
+        if store:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                KVWriteLoc(forward_batch.out_cache_loc, self.forward_metadata.swa_out_cache_loc),
+                k,
+                v,
+                layer.k_scale,
+                layer.v_scale,
+            )
+        wrapper = self._ah_subset_plan(forward_batch, int(q_own.shape[1]), g1 - g0)
         k_buf, v_buf = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         o = wrapper.forward(
             q_own,
-            (k_buf[:, :kv_own], v_buf[:, :kv_own]),
+            (k_buf[:, g0:g1], v_buf[:, g0:g1]),
             causal=True,
             sm_scale=layer.scaling,
             window_left=layer.sliding_window_size,
@@ -3028,23 +3033,28 @@ class FlashInferAttnBackend(AttentionBackend):
         return o.view(-1, q_own.shape[1] * layer.head_dim)
 
     def _ah_subset_plan(self, forward_batch: ForwardBatch, qo_heads: int, kv_heads: int):
-        """Plan the owner's subset wrapper ONCE per forward (keyed on the
-        forward's metadata object, which init_forward_metadata replaces every
-        forward) from host-known lengths: qo [0, w], kv [0, p + w], the
-        request's req_to_token row as indices, page size 1 -- the same layout
-        the main paged plan uses, with this rank's own head counts."""
+        """Plan the owner's subset wrapper of this (qo, kv) head shape ONCE
+        per forward (keyed on the forward's metadata object, which
+        init_forward_metadata replaces every forward) from host-known lengths:
+        qo [0, w], kv [0, p + w], the request's req_to_token row as indices,
+        page size 1 -- the same layout the main paged plan uses. One wrapper
+        per shape (V2: own pieces and fallback ranges differ), each with its
+        own int workspace (the post books one per shape)."""
         meta = self.forward_metadata
-        cached = self.__dict__.get("_ah_plan")
-        if cached is not None and cached[0] is meta and cached[1] == (qo_heads, kv_heads):
-            return cached[2]
-        wrapper = self.__dict__.get("_ah_wrapper")
+        key = (qo_heads, kv_heads)
+        plans = self.__dict__.setdefault("_ah_plans", {})
+        cached = plans.get(key)
+        if cached is not None and cached[0] is meta:
+            return cached[1]
+        wrappers = self.__dict__.setdefault("_ah_wrappers", {})
+        wrapper = wrappers.get(key)
         if wrapper is None:
             wrapper = _tag_adaptive_int_workspace(
                 BatchPrefillWithPagedKVCacheWrapper(
                     self.workspace_buffer, "NHD", backend=self.prefill_backend
                 )
             )
-            self._ah_wrapper = wrapper
+            wrappers[key] = wrapper
         pre = forward_batch.extend_prefix_lens_cpu
         ext = forward_batch.extend_seq_lens_cpu
         if pre is None or ext is None or len(pre) != 1:
@@ -3065,7 +3075,7 @@ class FlashInferAttnBackend(AttentionBackend):
             kv_data_type=upd.data_type,
             non_blocking=True,
         )
-        self._ah_plan = (meta, (qo_heads, kv_heads), wrapper)
+        plans[key] = (meta, wrapper)
         return wrapper
 
     @debug_kernel_api

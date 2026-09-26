@@ -118,11 +118,12 @@ class MiniOwnerStage:
         pv[p:p + v3.shape[0]] = v3.to(FP8)
 
     def own_attention_fn(self, lid, p):
-        def fn(q_own, k3, v3, kv_own):
-            self._store(lid, k3, v3, p)
+        def fn(q_sub, k3, v3, g0, g1, store=True):
+            if store:
+                self._store(lid, k3, v3, p)
             pk, pv = self.pool[lid]
-            return AH.reference_attention(q_own, pk[:, :kv_own], pv[:, :kv_own], p, self.sm,
-                                          self.k_scale, self.k_scale).reshape(q_own.shape[0], -1)
+            return AH.reference_attention(q_sub, pk[:, g0:g1], pv[:, g0:g1], p, self.sm,
+                                          self.k_scale, self.k_scale).reshape(q_sub.shape[0], -1)
         return fn
 
     def forward(self, x, p, row=None, owner=None):
@@ -135,7 +136,7 @@ class MiniOwnerStage:
                 w = x.shape[0]
                 q3 = q.view(w, self.H, self.D)
                 a = self.own_attention_fn(lid, p)(q3, k.view(w, self.Hk, self.D).clone(),
-                                                  v.view(w, self.Hk, self.D).clone(), self.Hk)
+                                                  v.view(w, self.Hk, self.D).clone(), 0, self.Hk)
             x = x + a @ wo
         return x
 
@@ -338,10 +339,15 @@ class TestSpecAndPost(unittest.TestCase):
         V("2:0:2:h18-23")  # the same as one whole group, written in heads
         self.assertEqual(AH.parse_spec("2:0:2:h18-23")[0].heads(4, 6), AH.HeadRange(18, 24, 3, 4))
         self.assertEqual(AH.parse_spec("1:0:4:h18-20")[0].heads(4, 6), AH.HeadRange(18, 21, 3, 4))
-        for bad, word in (("0:1:1:1", "UPSTREAM"), ("1:0:1:4", "keep at least one"), ("1:0:0:1", "n_layers"),
-                          ("1:0:4:h18-20", "V2"), ("1:0:4:h6-11", "V2"), ("1:0:1:h20-25", "outside"),
+        # V2 (26.09., AH3): downstream helpers, partial groups and non-suffix
+        # ranges are accepted now; see test_weg2_attn_head_split_v2_0926
+        V("0:1:1:1")
+        V("1:0:4:h18-20")
+        V("1:0:4:h6-11")
+        for bad, word in (("0:1:1:h15-20", "inside ONE group"), ("1:0:1:4", "keep at least one"),
+                          ("1:0:0:1", "n_layers"), ("1:0:1:h20-25", "outside"),
                           ("2:1:1:1,1:0:1:1", "owner AND helper"), ("1:0:1:1,1:0:1:1", "twice"),
-                          ("3:0:1:1", "outside")):
+                          ("3:0:1:1", "outside"), ("1:1:1:1", "its own helper")):
             with self.assertRaises(AH.AHSpecError) as cm:
                 V(bad)
             self.assertIn(word, str(cm.exception))
@@ -470,7 +476,7 @@ class TestLauncher(unittest.TestCase):
         self.assertIn("P-ATTN-HEAD-SPLIT", self.L.p_attn_head_split_line(cfg, 3))
 
     def test_refusals(self):
-        for extra, word in ((("--p-attn-head-split", "0:1:1:1"), "UPSTREAM"),
+        for extra, word in ((("--p-attn-head-split", "0:1:1:h15-20"), "inside ONE group"),
                             (("--p-attn-head-split", "1:0:1:1", "--p-attn-head-split-min-w", "4096"), "never fire")):
             with self.assertRaises(SystemExit) as cm:
                 self.L.p_attn_head_split_cfg(self._ns(*extra), 3, 2048, self.tmp)
