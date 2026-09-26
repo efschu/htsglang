@@ -1525,7 +1525,8 @@ def apply_p_chunk_policy(ns, boot_form=None, argv_words: Sequence[str] = ()) -> 
     reads the ceiling from here, so the cut solve, the ledger, the form key
     and the shipped argv see ONE value.
 
-    H92 (NF): under --profile nextflash 'dynamic' resolves the NF profile of
+    H92 (NF): a profile whose chunk row prices 'dynamic' by model key
+    (``Chunk.dynamic_source``, nextflash) resolves the NF profile of
     this checkpoint instead (:func:`_apply_p_chunk_policy_nf`); its spec is
     built with env_p (``p_chunk_policy_install``). Every other profile takes
     the path below, unchanged."""
@@ -1541,9 +1542,9 @@ def apply_p_chunk_policy(ns, boot_form=None, argv_words: Sequence[str] = ()) -> 
     _P_CHUNK["ns"] = None
     if policy == _pcp.POLICY_FIXED:
         return
-    _profile = (getattr(boot_form, "profile", "") if boot_form is not None
-                else getattr(ns, "profile", "")) or ""
-    if _profile == PROFILE_NEXTFLASH:
+    _row = weg2_form.profile_row((getattr(boot_form, "profile", "") if boot_form is not None
+                                  else getattr(ns, "profile", "")) or "")
+    if _row is not None and _row.chunk.dynamic_source == "model-key":
         _apply_p_chunk_policy_nf(ns, boot_form, argv_words)
         return
     bucket = p_prefill_graph_bucket()

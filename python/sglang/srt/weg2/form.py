@@ -229,6 +229,11 @@ class Chunk:
     model: str
     #: the P chunk the profile's arm runs (tokens)
     tokens: int
+    #: what --p-chunk-policy dynamic prices from: "stage-model" (27B: builtin
+    #: -int8 / fit: / a stage-model JSON, weg2/p_chunk_policy.py) or
+    #: "model-key" (NF H92: the *.pchunk.json whose model_key is this
+    #: checkpoint's, weg2/p_chunk_nf.py)
+    dynamic_source: str = "stage-model"
 
 
 @dataclass(frozen=True)
@@ -512,7 +517,8 @@ PROFILES: Dict[str, ModelProfile] = {
         d_layout="qsa_forma",
         page_size=64,
         kv_dtype="fp8_e4m3",
-        chunk=Chunk(grid=0, policy="fixed", model="linear from measurement (P card)", tokens=16384),
+        chunk=Chunk(grid=0, policy="fixed", model="linear from measurement (P card)", tokens=16384,
+                    dynamic_source="model-key"),
         end_anchor="tail_handoff",
         mamba_anchor="deepest",
         mamba_carrier_hold=True,

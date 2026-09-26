@@ -440,7 +440,10 @@ def test_wiring_flip_park_saves_before_retract_all():
 
 def test_the_switch_follows_the_env_conventions():
     src = _read("environ.py")
-    assert "SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV = EnvBool(True)" in src
+    # unified tree: the default is the profile's standard form (nextflash on,
+    # qwen27b off), on without a form -- test_unify_standard_form_profile.py
+    assert ("SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV = EnvBool(\n"
+            "        _profile_default(\"SGLANG_WEG2_ENABLE_D_PARK_DRAFT_KV\", True))") in src
     assert "SGLANG_WEG2_D_PARK_DRAFT_KV_HOST_MIB = EnvInt(256)" in src
     # bounding-default value pin (docs/dev/CONVENTION_bounding_defaults.md):
     # 256 MiB = ONE full 262,144-token context of NF's draft (~1 KiB/token),

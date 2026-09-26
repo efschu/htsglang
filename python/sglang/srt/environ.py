@@ -2884,6 +2884,11 @@ class Envs:
     # nextflash on, qwen27b off (the 27B front byte-identical); on without a
     # form (the NF code default).
     SGLANG_WEG2_STANDARD_FORM = EnvBool(_profile_default("SGLANG_WEG2_STANDARD_FORM", True))
+    # NF H91b D park (weg2/d_seats.d_park_active; group D only): default per
+    # profile (ModelProfile.standard_form: nextflash on, qwen27b off); on
+    # without a form. d_seats reads the raw value with the same default (it
+    # also judges hand-built env mappings); an explicit value always wins.
+    SGLANG_WEG2_D_PARK = EnvBool(_profile_default("SGLANG_WEG2_D_PARK", True))
     # H91d: the L2 bound of those buffers per rank (MiB). A FLIP park whose
     # buffer would pass it goes to L3 (a file under
     # SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR/weg2_d_park_draft, written in the
