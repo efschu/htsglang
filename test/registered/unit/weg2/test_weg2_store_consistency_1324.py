@@ -173,10 +173,14 @@ def test_the_front_records_the_measured_share_on_leg_2():
     import inspect
 
     src = inspect.getsource(front_mod.Front.leg2)
-    assert src.count("spans.record_presence(text, ct)") == 2, (
+    # #49: the call now also carries prompt_tokens (the prefix's measured
+    # price) and held_epoch (a D serve, valid in that epoch only) as KEYWORDS;
+    # the measured cached share stays the positional presence witness.
+    assert src.count("spans.record_presence(text, ct,") == 2, (
         "both the streamed and the non-streamed D leg-2 branches must record "
         "the MEASURED cached share, and neither may record prompt_tokens"
     )
+    assert "spans.record_presence(text, pt" not in src
     assert "spans.record(text, pt)" not in src
 
 
