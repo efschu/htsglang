@@ -655,6 +655,12 @@ class SchedulerWeightUpdaterManager:
     #: (~1 s per tag on every rank: join_manifests + plan_from_join + books,
     #: and the shadow plan with its 1.2M-piece pointer profile).
     _weg2_xchg_leg_cache: Optional[dict] = None
+    #: fnFL2x82 single-flight lock for the leg cache above (27B UN5 1406513f40:
+    #: a FIELD, like every other lazily written attribute of this
+    #: ``slots=True`` class). Its lazy write sits in ``except AttributeError``
+    #: and was silently never stored, so every lane thread took a fresh lock
+    #: and derived its own plan again -- the single-flight did nothing.
+    _weg2_xchg_leg_lock: Any = None
     #: Punkt 2 (weg2xsn107): True while the wake worker collects a tag --
     #: the credit wait's stuck-lane reader must not read those in-flight
     #: bands as 'never drained' (PP0 W108 at the credit wait on xsn107).
