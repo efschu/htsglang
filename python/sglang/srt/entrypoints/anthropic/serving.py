@@ -63,6 +63,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: MZ armed line (AL/IN 26.09.): written once per process.
+_MZ_ANNOUNCED = False
+
+
+def _announce_inline_system_in_place(armed: bool, merge_inline_system: bool) -> None:
+    """Befund M / MZ: ONE start line per process that names the value of
+    SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE and who reads it -- the boot log
+    had no line saying whether the render fix ran. ``merge`` says whether the
+    template needs the hoist at all (False = inline system turns are native
+    and the switch changes nothing). Never on a request path."""
+    global _MZ_ANNOUNCED
+    if _MZ_ANNOUNCED:
+        return
+    _MZ_ANNOUNCED = True
+    import os
+
+    logger.info(
+        "#MZ INLINE-SYSTEM-IN-PLACE armed=%d merge=%d group=%s pid=%d "
+        "(SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE, anthropic adapter)",
+        int(bool(armed)), int(bool(merge_inline_system)),
+        os.environ.get("SGLANG_WEG2_GROUP", "-"), os.getpid(),
+    )
+
 # Map OpenAI finish reasons to Anthropic stop reasons. Only the four
 # values in ``AnthropicMessagesResponse.stop_reason``'s Literal are valid
 # on the wire; ``content_filter`` and ``abort`` have no perfect mapping
@@ -323,6 +346,9 @@ class AnthropicServing:
         # Read once per process; the whole group tokenizes in this one process.
         self._inline_system_in_place = bool(
             envs.SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE.get()
+        )
+        _announce_inline_system_in_place(
+            self._inline_system_in_place, self._merge_inline_system
         )
 
     def _chat_template(self) -> Optional[str]:

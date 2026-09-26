@@ -15,6 +15,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageError
+from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.mem_cache.weg2_store_gates import (
     owner_write_covers_whole_file,
     writes_shared_keys,
@@ -2832,7 +2833,14 @@ class HiCacheFile(HiCacheStorage):
             if st != 2:
                 break
             n += 1
-        if _pn <= 24 or _pn % 512 == 0:
+        # prefix trace (IN 26.09.): every distinct (keys, leading, first stem)
+        # of a probe whose rest (keys - leading, in KEYS: one per token at the
+        # 27B's page size 1) is >= the trace minimum -- the break stem is what
+        # an ARENA-DROP's dropped keys are joined against.
+        _traced = False
+        if _prefix_trace.on() and len(keys) - n >= _prefix_trace.min_tokens():
+            _traced = _prefix_trace.once("1439", len(keys), n, stems[0])
+        if _traced or _pn <= 24 or _pn % 512 == 0:
             # xsn327/328: the dormant hit query answers 0 while P completed the
             # pages; xsn328 showed leading_complete=64 of 4314 -- name the state
             # at the break and the state census over the asked range.
@@ -2853,8 +2861,9 @@ class HiCacheFile(HiCacheStorage):
                 _ast = arena.stats()
             except Exception as exc:  # noqa: BLE001
                 _ast = f"n/a:{type(exc).__name__}"
-            logger.info("#1439 ARENA-PRESENT n=%d keys=%d leading_complete=%d break_state=%d break_stem=%s break_slots=%s stats=%s census=%s first_stem=%s arena=%s",
-                        _pn, len(keys), n, _brk, _brk_stem[:64], _brk_slots, _ast, sorted(_hist.items()), stems[0][:64], getattr(arena, "path", "?"))
+            logger.info("#1439 ARENA-PRESENT n=%d keys=%d leading_complete=%d break_state=%d break_stem=%s break_slots=%s stats=%s census=%s first_stem=%s arena=%s%s",
+                        _pn, len(keys), n, _brk, _brk_stem[:64], _brk_slots, _ast, sorted(_hist.items()), stems[0][:64], getattr(arena, "path", "?"),
+                        (" trace=1 break_stem_full=%s" % _brk_stem) if _traced else "")
         return n
 
     def _readable_stems(self, stems: List[str]) -> List[str]:

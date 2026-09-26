@@ -1039,6 +1039,15 @@ class Envs:
     # gap (a Claude-Code turn's second request, +~155 tokens on the first,
     # arriving while the first decodes). Off = presence only at leg-2 finish.
     SGLANG_WEG2_FRONT_SPAN_INFLIGHT = EnvBool(False)
+    # Prefix trace (IN 26.09., weg2/prefix_trace.py): every prefix miss of an
+    # agent-load boot gets a token receipt -- one #1420 WALK-STOP line per
+    # (rid, stop depth) whose unmatched rest is >= the minimum below, full
+    # rids and no 8/256 sampling in #1400/#1416*, #1442 REG and #1040 EXTENT
+    # unsampled, #1469 EVICT / #1427 ARENA-DROP uncapped with parent node and
+    # page/slot keys. Never a line on the decode round path. Off = the
+    # sampled instruments exactly as before.
+    SGLANG_WEG2_PREFIX_TRACE = EnvBool(False)
+    SGLANG_WEG2_PREFIX_TRACE_MIN_TOKENS = EnvInt(1024)
     # UNIFY S7 (27B RC7-X, 7f81f09daf/e28c450a0d/0e8faa7178): the front half of
     # the 27B busy/idle split beyond the shared X-SOLO band -- a band request
     # the singleton rule sent to P is marked deferred and served on D by the
