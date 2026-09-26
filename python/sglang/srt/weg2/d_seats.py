@@ -87,16 +87,17 @@ _OFF = ("0", "false", "no", "off")
 
 
 def d_park_active(env: Optional[Mapping[str, str]] = None) -> bool:
-    """On group D when the profile's standard form says so (UNIFY, operator
-    26.09.: ModelProfile.standard_form -- nextflash on, qwen27b off; no form =
-    on, the NF code default); an explicit ``SGLANG_WEG2_D_PARK`` wins
-    (``0`` off for A/B)."""
+    """On group D when the standard form says so (UNIFY, operator 26.09.:
+    an explicit SGLANG_WEG2_STANDARD_FORM, else ModelProfile.standard_form --
+    nextflash on, qwen27b off; no form = on, the NF code default); an explicit
+    ``SGLANG_WEG2_D_PARK`` wins over both (``0`` off for A/B)."""
     env = os.environ if env is None else env
     raw = env.get(PARK_ENV)
     if raw is None or not str(raw).strip():
-        from sglang.srt.weg2.form import profile_switch_default
+        # the standard form's master switch (explicit) or the profile's row
+        from sglang.srt.weg2.form import standard_form_state
 
-        if not profile_switch_default(PARK_ENV, True, env):
+        if not standard_form_state(env)[0]:
             return False
     elif str(raw).strip().lower() in _OFF:
         return False

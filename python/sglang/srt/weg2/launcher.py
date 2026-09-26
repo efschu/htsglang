@@ -18079,11 +18079,19 @@ def bs_source(flag: str, argv: Optional[Sequence[str]] = None) -> str:
 
 
 def profile_standard_form(ns) -> bool:
-    """UNIFY (operator 26.09.): the registry row's ``standard_form`` (NF H91:
-    D seats 1..6 per phase, pool waves, seat posts; nextflash on, qwen27b
-    off) for ``ns.profile``; an unknown profile is off."""
-    row = weg2_form.profile_row(getattr(ns, "profile", None))
-    return bool(row is not None and row.standard_form)
+    """UNIFY (operator 26.09.): the NF H91 standard form for this launch (D
+    seats 1..6 per phase, pool waves, seat posts): an explicit
+    SGLANG_WEG2_STANDARD_FORM in the launcher's env wins (build_env hands the
+    same env to P, D and the front), else the registry row's
+    ``standard_form`` for ``ns.profile``; an unknown profile is off."""
+    return standard_form_resolved(ns)[0]
+
+
+def standard_form_resolved(ns) -> Tuple[bool, str]:
+    if weg2_form.profile_row(getattr(ns, "profile", None)) is None and not str(
+            os.environ.get(weg2_form.STANDARD_FORM_ENV, "")).strip():
+        return False, "unknown profile"
+    return weg2_form.standard_form_state(os.environ, getattr(ns, "profile", None))
 
 
 def apply_profile_d_bs_default(ns, argv: Sequence[str]) -> int:
@@ -18147,6 +18155,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ns = build_parser().parse_args(argv)
     # H91b/H95: the Next-Flash form's own D seat bound (6, dynamic 1..6 per
     # phase) and its pool waves, before anything reads --d-bs or --env-d.
+    _sf_on, _sf_src = standard_form_resolved(ns)
+    if _sf_on or _sf_src.startswith("env "):
+        print("WEG2-STANDARD-FORM (NF H91, profile field standard_form): %s (%s) -- D seats per "
+              "phase, park, front phase policy%s" % ("on" if _sf_on else "off", _sf_src,
+              "" if _sf_on else " all OFF (pre-H91 form)"), flush=True)
     apply_profile_d_bs_default(ns, list(sys.argv[1:] if argv is None else argv))
     _h95_waves_line = apply_profile_d_pool_waves_default(ns)
     if _h95_waves_line:

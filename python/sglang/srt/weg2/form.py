@@ -719,6 +719,33 @@ def current_form(environ: Optional[Mapping[str, str]] = None) -> Optional[Weg2Fo
     return parse_form(env.get(FORM_ENV, ""))
 
 
+#: The NF H91 standard form's MASTER switch (operator 26.09.): explicitly set,
+#: it wins over the profile row for every part of the form -- front policy,
+#: D park and draft KV, the launcher's seat defaults. Unset = the profile's
+#: ``standard_form`` (no form: on, the NF code default).
+STANDARD_FORM_ENV = "SGLANG_WEG2_STANDARD_FORM"
+_ON_WORDS = ("1", "true", "yes", "on")
+
+
+def standard_form_state(environ: Optional[Mapping[str, str]] = None,
+                        profile: Optional[str] = None) -> Tuple[bool, str]:
+    """``(on, source)`` of the NF standard form: an explicit
+    SGLANG_WEG2_STANDARD_FORM (``source`` "env"), else the registry row of
+    ``profile`` (or of the published form's profile: "profile <id>"), else on
+    ("no form", the NF code default)."""
+    env = os.environ if environ is None else environ
+    raw = env.get(STANDARD_FORM_ENV)
+    if raw is not None and str(raw).strip():
+        return str(raw).strip().lower() in _ON_WORDS, f"env {STANDARD_FORM_ENV}={str(raw).strip()}"
+    if profile is None:
+        form = current_form(environ)
+        profile = form.profile if form is not None else None
+    row = profile_row(profile)
+    if row is not None:
+        return bool(row.standard_form), f"profile {row.id}"
+    return True, "no form (NF code default)"
+
+
 def profile_switch_default(name: str, fallback, environ: Optional[Mapping[str, str]] = None):
     """The default of switch ``name`` for the profile in the published form
     (:data:`PROFILE_SWITCH_DEFAULTS`); ``fallback`` without a form, without a

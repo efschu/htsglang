@@ -3309,17 +3309,22 @@ class Front:
         #: UNIFY (operator 26.09.): the NF H91 standard form on this front --
         #: rule 2's hand-over term and handoff_n/parked_n on D's wake. qwen27b
         #: off: the 27B front byte-identical (profile field standard_form).
-        self.standard_form = bool(envs.SGLANG_WEG2_STANDARD_FORM.get())
+        from sglang.srt.weg2.form import standard_form_state
+
+        self.standard_form, self.standard_form_src = standard_form_state()
         if (self.standard_form or self.p_phase_max_requests or self.p_pool_tokens
-                or self.d_wait_bound_s or self.p_leg1_stall_s):
+                or self.d_wait_bound_s or self.p_leg1_stall_s
+                or self.standard_form_src.startswith("env ")):
             logger.info(
-                "WEG2-PHASE-POLICY p_phase_max_requests=%d p_pool_tokens=%d d_wait_bound_s=%.1f "
+                "WEG2-PHASE-POLICY standard_form=%s (%s) "
+                "p_phase_max_requests=%d p_pool_tokens=%d d_wait_bound_s=%.1f "
                 "p_leg1_stall_s=%.0f d_phase_preemption=%s (H91 part C: P prefills at most "
                 "p_phase_max_requests per phase, overlapping as far as their est_prompt fits "
                 "p_pool_tokens; a leg 1 with no P progress for p_leg1_stall_s is requeued as an "
                 "intake stall; D decodes every request it was handed before the flip back; a request "
                 "waiting for P longer than d_wait_bound_s during the D phase parks D's running "
                 "decodes via %s and flips; 0 = that rule off)",
+                "on" if self.standard_form else "off", self.standard_form_src,
                 self.p_phase_max_requests, self.p_pool_tokens, self.d_wait_bound_s,
                 self.p_leg1_stall_s,
                 ("wait-bound (replaces --fairness-w-s in the D phase)" if self.d_wait_bound_s > 0

@@ -158,3 +158,48 @@ def test_qwen27b_d_exhaustion_is_the_pre_h91_rule(clean):
             ready.fut.cancel()
 
     asyncio.run(body())
+
+
+# ------------------------------------------------ the master switch (operator 26.09.)
+@pytest.mark.parametrize("profile,master,want", [
+    ("nextflash", "0", False), ("nextflash", "1", True), ("qwen27b", "1", True),
+    ("qwen27b", "0", False), (None, "0", False)])
+def test_an_explicit_master_wins_everywhere(clean, profile, master, want):
+    """SGLANG_WEG2_STANDARD_FORM set explicitly (NF: its x177 acceptance in the
+    pre-H91 form) wins over the profile row for the front, the D park and the
+    launcher's seat defaults -- and the sources say so."""
+    from sglang.srt.weg2.front import Front
+
+    clean.setenv("SGLANG_WEG2_STANDARD_FORM", master)
+    if profile is not None:
+        clean.setenv(FM.FORM_ENV, _form_env(profile))
+    on, src = FM.standard_form_state()
+    assert on is want and src == f"env SGLANG_WEG2_STANDARD_FORM={master}"
+    assert envs.SGLANG_WEG2_STANDARD_FORM.get() is want
+    env = dict(os.environ, SGLANG_WEG2_GROUP="D")
+    assert d_seats.d_park_active(env) is want
+    env["SGLANG_WEG2_D_PARK"] = "1"
+    assert d_seats.d_park_active(env) is True  # an explicit D_PARK wins over the master
+    if profile is not None:
+        ns = types.SimpleNamespace(profile=profile, d_bs=L.DEFAULT_D_BS, env_d="")
+        assert L.profile_standard_form(ns) is want
+        assert (L.apply_profile_d_seat_vram_default(ns) is not None) is want
+    f = Front("http://p", "http://d", **_front_kwargs())
+    assert f.standard_form is want and f.standard_form_src.startswith("env ")
+
+
+def test_the_policy_line_names_the_source(clean, caplog):
+    from sglang.srt.weg2.front import Front
+
+    clean.setenv(FM.FORM_ENV, _form_env("nextflash"))
+    clean.setenv("SGLANG_WEG2_STANDARD_FORM", "0")
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        Front("http://p", "http://d", **_front_kwargs())
+    line = [r.getMessage() for r in caplog.records if "WEG2-PHASE-POLICY" in r.getMessage()]
+    assert line and "standard_form=off (env SGLANG_WEG2_STANDARD_FORM=0)" in line[0], line
+    clean.delenv("SGLANG_WEG2_STANDARD_FORM")
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="weg2.front"):
+        Front("http://p", "http://d", **_front_kwargs())
+    line = [r.getMessage() for r in caplog.records if "WEG2-PHASE-POLICY" in r.getMessage()]
+    assert line and "standard_form=on (profile nextflash)" in line[0], line
