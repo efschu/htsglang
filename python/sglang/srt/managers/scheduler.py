@@ -3449,6 +3449,21 @@ class Scheduler(
         # and takes the direct upstream path.
         self.pp_flip_counters = None
         self.pp_chain_receiver = None
+        # WEG2 VISION (user design 2026-09-24): PP0 of a transient P group
+        # encodes images in its OWN process, on its KV tail, before the
+        # admission (weg2/vision_rank_runner.py). False on every other boot
+        # and rank, and then nothing below changes.
+        self._weg2_vision_rank_stage = False
+        _vision_origin_aborts = None
+        if os.environ.get("SGLANG_WEG2_VISION", "").strip() == "transient":
+            from sglang.srt.weg2.vision_rank_runner import (
+                arm_rank_stage,
+                take_origin_aborts,
+            )
+
+            self._weg2_vision_rank_stage = arm_rank_stage(self)
+            if self._weg2_vision_rank_stage:
+                _vision_origin_aborts = lambda: take_origin_aborts(self)  # noqa: E731
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
@@ -3494,6 +3509,9 @@ class Scheduler(
             return_health_check_ipc=lambda ipc: self.return_health_check_ipcs.append(
                 ipc
             ),
+            # WEG2 VISION: PP0's named aborts of refused stages, injected at
+            # the origin so every rank drops the same rids in the same pass.
+            origin_extra_reqs_hook=_vision_origin_aborts,
         )
 
     def _health_check_gate(self) -> Tuple[bool, int, int]:
@@ -11971,11 +11989,26 @@ class Scheduler(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
 
+        # WEG2 VISION (see init_request_receiver): pending images are encoded
+        # HERE, on PP0, before this admission (a dormant group stages
+        # nothing); what cannot be admitted in this pass is held out of it and
+        # put back below (followers adopt PP0's admissions, so they hold it too).
+        _vision_parked = ()
+        if getattr(self, "_weg2_vision_rank_stage", False):
+            from sglang.srt.weg2.vision_rank_runner import vision_rank_pass
+
+            _vision_parked = vision_rank_pass(self)
         try:
-            ret, running_batch = self._get_new_batch_prefill_raw(
-                prefill_delayer_single_pass=prefill_delayer_single_pass,
-                running_batch=running_batch,
-            )
+            try:
+                ret, running_batch = self._get_new_batch_prefill_raw(
+                    prefill_delayer_single_pass=prefill_delayer_single_pass,
+                    running_batch=running_batch,
+                )
+            finally:
+                if _vision_parked:
+                    from sglang.srt.weg2.vision_rank_runner import vision_unpark
+
+                    vision_unpark(self, _vision_parked)
         except PPScheduleRefused as refusal:
             # #791 CORE: THE LOUD REFUSAL. It may not narrow the batch, retry
             # with different numbers, or fall through to a decode batch --
@@ -18946,7 +18979,13 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            # WEG2 VISION: an origin-injected abort names its W-code; the
+            # tokenizer's own aborts carry no finish reason, so their echo is
+            # unchanged.
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(rid=req.rid, finished_reason=getattr(recv_req, "finished_reason", None)),
+                req,
+            )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
