@@ -102,6 +102,11 @@
   "offset": 3,
   "period": 4
  },
+ "power_limit_source": "nvidia-smi power.limit 24.09. 18:55Z and 26.09. (release table row 27): 5090 400 W, 3080 230 W; the rc9j boots (26.09. 00:10-02:31Z) lie between the two readings and did not record their limit",
+ "power_limit_w": {
+  "RTX3080": 230.0,
+  "RTX5090": 400.0
+ },
  "source": "rc9j (27B 5425830c95) #PGAP fit, cut 42,11,11 attn 10,3,3, logs dkr27bbar1chunka09260010_5425830c95, dkr27bint8chunkBbar109260034_5425830c95; graph = 512 bucket (split 7), eager = 1024/2048 (dynamic policy); per rank lines: PP0 w512 g a=42.03 s=2.8124 n=1388; PP0 w1024 e a=80.75 s=2.0827 n=99; PP0 w2048 e a=161.50 s=1.7427 n=258; PP1 w512 g a=34.86 s=1.9981 n=1384; PP1 w1024 e a=73.07 s=2.1274 n=97; PP1 w2048 e a=163.54 s=2.1194 n=257; PP2 w512 g a=39.00 s=2.0402 n=1386; PP2 w1024 e a=77.56 s=2.1044 n=99; PP2 w2048 e a=168.95 s=2.1386 n=257",
  "stage_cards": [
   "RTX5090",

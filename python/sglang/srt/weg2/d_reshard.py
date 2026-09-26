@@ -273,6 +273,9 @@ class DCalib:
     pf_k_ms: Tuple[float, ...]
     pf_wait_ms: float
     provenance: str = ""
+    #: Release table row 27: the power limit (W) per rank the constants were
+    #: measured under; () = unknown. Every D line names it.
+    power_limit_w: Tuple[float, ...] = ()
 
 
 def fit_two_point(bytes_a: float, ms_a: float, bytes_b: float, ms_b: float) -> Tuple[float, float]:
@@ -538,6 +541,47 @@ _QWEN38_27B = {"hidden_size": 5120, "num_hidden_layers": 64, "full_attention_int
                "model_type": "qwen3_5_text"}
 
 
+#: The limits the rc9 D logs (dkr27b*final0926*, weg2xsn420) ran under: TP0 on
+#: the 5090, TP1/TP2 on the 3080s (weg2/power_limit.RIG_POWER_LIMIT_W_0924 --
+#: nvidia-smi 24.09. 18:55Z and 26.09., the boots lie between the readings).
+RC9_POWER_LIMIT_W: Tuple[float, ...] = (400.0, 230.0, 230.0)
+
+
+def power_tag(pl: Sequence[Optional[float]]) -> str:
+    """'400/230/230W' (NA for an unknown rank, 'unknown' for none)."""
+    if not pl:
+        return "unknown"
+    return "/".join("NA" if v is None else f"{float(v):g}" for v in pl) + "W"
+
+
+def power_check_lines(cal: DCalib, current: Optional[Sequence[Optional[float]]], what: str) -> List[str]:
+    """Row 27: loud line per rank whose running limit is > 5 % away from the
+    calibration limit (the table then describes a FOREIGN limit); [] when all
+    agree or either side is unknown. Nothing is rescaled here (decode is
+    bandwidth bound; the D lines only NAME the limit)."""
+    from sglang.srt.weg2 import power_limit as _pl
+
+    if not cal.power_limit_w or not current:
+        return []
+    labels = [f"TP{r}" for r in range(len(cal.power_limit_w))]
+    vs = _pl.check(labels, list(cal.power_limit_w), list(current))
+    return [ln for ln in _pl.verdict_lines(what, vs, source=f"calib={cal.name}") if "MISMATCH" in ln]
+
+
+def current_power_w_of_ranks(first_gpu_id: int, n: int, step: int = 1) -> Optional[List[Optional[float]]]:
+    """Running power limit (W) of the ``n`` TP ranks at in-process ordinals
+    ``first_gpu_id + r * step`` (NVML by UUID, weg2/power_limit.uuid_for_ordinal);
+    None when NVML cannot answer. Never raises (it only labels a log line)."""
+    try:
+        from sglang.srt.registry import nvml as _nvml
+        from sglang.srt.weg2 import power_limit as _pl
+
+        snap = {p.uuid: p.power_limit_w for p in _nvml.power_snapshot()}
+        return [snap.get(_pl.uuid_for_ordinal(int(first_gpu_id) + r * int(step))) for r in range(int(n))]
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def rc9_geometry(fmt: str) -> DGeometry:
     if fmt == "int8":
         return DGeometry.from_config(_QWEN38_27B, mlp_units=1088, linear_bpp=1.0, draft_bpp=1.0)
@@ -563,7 +607,7 @@ def _rc9_int8_calib() -> DCalib:
         name="int8", e_gbs=(e0, e1, e1), f_ms=(f0, f1, f1), beta=(0.05, 0.07, 0.07),
         attn_ms_per_ktok=(0.0264, 0.0468, 0.0468), w1_ms=9.1, w_slope_ms=3.8,
         pf_fixed_ms=tuple(0.35 * c for c in pc), pf_k_ms=tuple(0.65 * c / s[r] for r, c in enumerate(pc)),
-        pf_wait_ms=1584.7,
+        pf_wait_ms=1584.7, power_limit_w=RC9_POWER_LIMIT_W,
         provenance="decode: two-point fit dkr27bbar1final09260145 [58,25,25] + weg2xsn420 auto "
                    "[3465,2154,2128]; beta from bs1..6 slopes; attn from #296 depth terms (131k); "
                    "prefill: one point, invariant 0.35")
@@ -581,7 +625,7 @@ def _rc9_nvfp4_calib(int8: DCalib) -> DCalib:
         name="nvfp4", e_gbs=int8.e_gbs, f_ms=f, beta=int8.beta, attn_ms_per_ktok=int8.attn_ms_per_ktok,
         w1_ms=9.2, w_slope_ms=3.8,
         pf_fixed_ms=tuple(0.35 * x for x in pc), pf_k_ms=tuple(0.65 * x / s[r] for r, x in enumerate(pc)),
-        pf_wait_ms=1585.6,
+        pf_wait_ms=1585.6, power_limit_w=int8.power_limit_w,
         provenance="decode: one point dkr27bnvfp4bar1final09260231, E borrowed from INT8 (LOW "
                    "confidence: W4A8 on sm86 is compute-heavier than its bytes); prefill one point")
 
@@ -673,7 +717,7 @@ def plan_lines(spec: ReshardSpec, fmt: str, loads: Sequence[LoadClass]) -> List[
         name = choose(g, cal, spec.base, spec.presets, ld, ts, None, spec.min_gain)
         t1 = round_ms(g, cal, spec.preset(name).vector(spec.base), ld, ts)
         out.append(f"D-RESHARD plan {ld.key()} preset={name} ms={t1:.1f} rc9_ms={t0:.1f} "
-                   f"gain={100.0 * (t0 - t1) / t0:+.1f}%")
+                   f"gain={100.0 * (t0 - t1) / t0:+.1f}% pl_w={power_tag(cal.power_limit_w)}")
     sp = spread_bytes(g, spec.base, spec.presets, spec.preset(spec.boot))
     out.append(f"D-RESHARD kv spread_MiB={[round(x / 2**20) for x in sp]} capacity={caps} "
                f"(sum {sum(caps)}, rc9 sum {sum(RC9_KV_CAPACITY[fmt])})")
@@ -746,7 +790,8 @@ def best_static_mlp(geom: DGeometry, cal: DCalib, base: Sequence[int], ts: Seque
 
 def speed_advisory_lines(text_cfg: Mapping, quant_method: Optional[str], base: Sequence[int],
                          current_mlp: Sequence[int], mlp_units: int,
-                         token_vector: Optional[Sequence[int]]) -> List[str]:
+                         token_vector: Optional[Sequence[int]],
+                         current_power_w: Optional[Sequence[Optional[float]]] = None) -> List[str]:
     """The uneven-DCP replacement of the KV restart hint: per load class the
     speed-optimal MLP unit vector, its predicted gain against the RUNNING vector,
     and the vector --d-reshard wake would take.  Never raises for an unmodelled
@@ -775,10 +820,13 @@ def speed_advisory_lines(text_cfg: Mapping, quant_method: Optional[str], base: S
     cur = Vector(tuple(base), tuple(int(u) for u in current_mlp))
     wake = best_static_mlp(geom, cal, base, ts)
     tag = " BORROWED(INT8 constants)" if fmt == "fp8" else ""
+    pl = power_tag(cal.power_limit_w)
     lines = [f"{head}; the old 'restart with SGLANG_UNEVEN_MLP_VECTOR' KV hint does not apply. "
              f"D speed optima (HOCHRECHNUNG, weg2/d_reshard, fmt={fmt}{tag}, base={','.join(map(str, base))}, "
              f"running mlp={','.join(map(str, current_mlp))}, --d-reshard wake takes "
-             f"mlp={','.join(map(str, wake))}):"]
+             f"mlp={','.join(map(str, wake))}; valid under power limit {pl} per rank (calibration), "
+             f"cards run {power_tag(current_power_w) if current_power_w else 'unknown'}):"]
+    lines.extend(power_check_lines(cal, current_power_w, "D speed table"))
     loads = [LoadClass("decode", b, c) for b in ADVISORY_BS for c in ADVISORY_CTX] + [LoadClass("prefill", 1, 4096)]
     vecs = _share_vectors(geom, n)
     for ld in loads:
@@ -787,7 +835,7 @@ def speed_advisory_lines(text_cfg: Mapping, quant_method: Optional[str], base: S
         t_wake = round_ms(geom, cal, Vector(tuple(base), wake), ld, ts)
         lines.append(f"  D-SPEED {ld.key():16s} mlp={','.join(map(str, v_best)):14s} "
                      f"gain={100.0 * (t_cur - t_best) / t_cur:+5.1f}% (wake mlp {100.0 * (t_cur - t_wake) / t_cur:+5.1f}%) "
-                     f"ms {t_cur:.1f}->{t_best:.1f}")
+                     f"ms {t_cur:.1f}->{t_best:.1f} pl_w={pl}")
     return lines
 
 

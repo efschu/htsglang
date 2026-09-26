@@ -508,6 +508,11 @@ def _dcp_speed_advisory(runner) -> bool:
         partition_units(units_total, list(mlp_vec)),
         units_total,
         get_cp_token_ratios(),
+        # Row 27: the table names the limit it is valid under and the one the
+        # cards run under (NVML; None = unknown, the line says so).
+        current_power_w=(
+            _dr.current_power_w_of_ranks(runner.gpu_id, len(base), getattr(sa, "gpu_id_step", 1) or 1)
+            if getattr(runner, "gpu_id", None) is not None else None),
     )
     for line in lines:
         logger.info(line)

@@ -193,6 +193,10 @@ class LayerCostModel:
     layer_types: Tuple[str, ...]
     source: str = ""
     eager_floor_ms: Tuple[float, ...] = ()
+    #: Release table row 27: the power limit (W) each card class was
+    #: CALIBRATED under, e.g. {"RTX5090": 400, "RTX3080": 230}. Empty = an old
+    #: JSON without the field (a warning at the check, never a refusal).
+    power_limit_w: Dict[str, float] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
         cards = {str(k): (v if isinstance(v, CardCost) else CardCost.from_json(v)) for k, v in self.cards.items()}
@@ -200,6 +204,10 @@ class LayerCostModel:
         object.__setattr__(self, "stage_cards", tuple(str(c) for c in self.stage_cards))
         object.__setattr__(self, "layer_types", tuple(str(t) for t in self.layer_types))
         object.__setattr__(self, "eager_floor_ms", tuple(float(x) for x in (self.eager_floor_ms or ())))
+        pl = {str(k): float(v) for k, v in (self.power_limit_w or {}).items()}
+        if [k for k in pl if k not in cards] or [v for v in pl.values() if v <= 0]:
+            raise StageModelError(f"power_limit_w {pl}: keys must be card classes {sorted(cards)}, values > 0 W")
+        object.__setattr__(self, "power_limit_w", pl)
         missing = [c for c in self.stage_cards if c not in cards]
         if missing:
             raise StageModelError(f"stage cards {missing} have no CardCost")
@@ -282,7 +290,30 @@ class LayerCostModel:
         }
         if self.eager_floor_ms:
             d["eager_floor_ms"] = list(self.eager_floor_ms)
+        if self.power_limit_w:
+            d["power_limit_w"] = dict(sorted(self.power_limit_w.items()))
         return d
+
+    def stage_power_limits(self) -> List[Optional[float]]:
+        """The calibration limit per stage (its card's), None where unknown."""
+        return [self.power_limit_w.get(c) for c in self.stage_cards]
+
+    def scaled_compute(self, factors: Dict[str, float]) -> "LayerCostModel":
+        """The model with each card's COMPUTE curves (gemm, attn, first/last
+        fixed) x ``factors[card]`` at widths >= power_limit.COMPUTE_BOUND_MIN_TOKENS;
+        eager floors (host launch) unchanged. A MODEL (weg2/power_limit.py)."""
+        from sglang.srt.weg2 import power_limit as _pl
+
+        cards = {}
+        for name, cc in self.cards.items():
+            f = float(factors.get(name, 1.0))
+            if f == 1.0:
+                cards[name] = cc
+                continue
+            sc = {fld: {m: _pl._scale_pts(v, f) for m, v in getattr(cc, fld).items()}
+                  for fld in ("gemm_ms", "attn", "first_fixed_ms", "last_fixed_ms")}
+            cards[name] = CardCost(cc.name, sc["gemm_ms"], sc["attn"], sc["first_fixed_ms"], sc["last_fixed_ms"])
+        return dataclasses.replace(self, cards=cards)
 
     @classmethod
     def from_json(cls, d) -> "LayerCostModel":
@@ -293,7 +324,8 @@ class LayerCostModel:
             spec = d.get("layer_layout") or {}
             lt = layer_types_every(int(spec["n_layers"]), int(spec.get("period", 4)), int(spec.get("offset", 3)))
         return cls({k: CardCost.from_json(v) for k, v in d["cards"].items()}, tuple(d["stage_cards"]),
-                   tuple(lt), str(d.get("source", "")), tuple(d.get("eager_floor_ms", ()) or ()))
+                   tuple(lt), str(d.get("source", "")), tuple(d.get("eager_floor_ms", ()) or ()),
+                   dict(d.get("power_limit_w") or {}))
 
 
 def load_model(path: str) -> LayerCostModel:
@@ -627,15 +659,53 @@ __all__ = [
     "LayerCostModel", "RungResult", "WidthSample", "WidthLine", "curve_linear", "curve_flat",
     "attn_work", "layer_types_every", "load_model", "contiguous_cuts", "plan_for", "busy_ms",
     "evaluate_cut", "mix_score", "drifting_cut_makespan", "best_drifting_makespan", "samples_from_lines", "fit_width_lines",
-    "card_costs_from_fit",
+    "card_costs_from_fit", "check_power",
 ]
 
 
 def pchunk_json(model: LayerCostModel, counts: Sequence[int]) -> Dict[str, object]:
-    """A ``--p-chunk-model`` JSON ({"stages": [...]}) for the cut ``counts``."""
-    return {"stages": [s.to_json() for s in model.stage_models(counts)],
-            "source": f"p_stage_model cut {','.join(map(str, counts))} attn "
-                      f"{','.join(map(str, model.attn_counts(counts)))} from: {model.source[:300]}"}
+    """A ``--p-chunk-model`` JSON ({"stages": [...]}) for the cut ``counts``.
+
+    Row 27: a model that knows its calibration limit hands it on as
+    ``power_limit_w`` (one value per stage = per card) with the card classes
+    in ``power_limit_cards``; a model without the field writes neither (the
+    JSON is then byte-identical to the pre-row-27 output)."""
+    head, sep, scale = model.source.partition(" +powerscale:")
+    doc: Dict[str, object] = {
+        "stages": [s.to_json() for s in model.stage_models(counts)],
+        "source": f"p_stage_model cut {','.join(map(str, counts))} attn "
+                  f"{','.join(map(str, model.attn_counts(counts)))} from: {head[:300]}{sep}{scale}"}
+    if model.power_limit_w:
+        doc["power_limit_w"] = model.stage_power_limits()
+        doc["power_limit_cards"] = list(model.stage_cards)
+    return doc
+
+
+def check_power(model: LayerCostModel, current: Dict[str, Optional[float]], law: str = "off",
+                exponent: Optional[float] = None) -> Tuple[LayerCostModel, List[str]]:
+    """Row 27: compare the model's calibration limit per card class with the
+    limit the cards run under NOW (``current``: card class -> W). Returns the
+    model (rescaled on a > 5 % mismatch only under an explicit ``law``;
+    otherwise unchanged) and the lines to print (loud on a mismatch, a
+    warning when the model has no ``power_limit_w``). A rescaled model
+    carries the RUNNING limits as its ``power_limit_w`` and says in its
+    source that it is a model, not a measurement."""
+    from sglang.srt.weg2 import power_limit as _pl
+
+    names = sorted(model.cards)
+    verdicts = _pl.check(names, [model.power_limit_w.get(n) for n in names],
+                         [current.get(n) for n in names], law, exponent)
+    lines = _pl.verdict_lines("p_stage_model", verdicts, law, exponent, model.source[:80])
+    factors = {v.label: v.factor for v in verdicts if v.factor != 1.0}
+    if not factors:
+        return model, lines
+    scaled = model.scaled_compute(factors)
+    pl = dict(model.power_limit_w)
+    pl.update({v.label: v.current_w for v in verdicts if v.factor != 1.0})
+    tag = ",".join(f"{k}x{f:.4f}" for k, f in sorted(factors.items()))
+    return dataclasses.replace(
+        scaled, power_limit_w=pl,
+        source=f"{model.source} +powerscale:law={law},{tag} ({_pl.MODEL_LABEL})"), lines
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -643,12 +713,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     write the cut's ``--p-chunk-model`` JSON (stdout without --out)."""
     import argparse
 
+    import sys
+
+    from sglang.srt.weg2 import power_limit as _pl
+
     ap = argparse.ArgumentParser(description=main.__doc__)
     ap.add_argument("model")
     ap.add_argument("--cut", required=True)
     ap.add_argument("--out", default="")
+    ap.add_argument("--current-power-w", default="",
+                    help="running limits per card class, e.g. RTX5090=400,RTX3080=230 (default: NVML)")
+    ap.add_argument("--power-scale", choices=list(_pl.SCALE_LAWS), default=_pl.SCALE_OFF,
+                    help="rescale the compute terms on a > 5%% power-limit mismatch (a MODEL; default off)")
+    ap.add_argument("--power-scale-exponent", type=float, default=None,
+                    help=f"alpha of --power-scale power (default {_pl.DEFAULT_EXPONENT:.4f})")
     a = ap.parse_args(argv)
     model = load_model(a.model)
+    current: Dict[str, Optional[float]] = {}
+    if a.current_power_w:
+        for item in a.current_power_w.split(","):
+            k, _, v = item.partition("=")
+            current[k.strip()] = float(v)
+    else:
+        try:
+            for w, cls in _pl.read_current().values():
+                current.setdefault(cls, w)
+        except Exception as exc:  # noqa: BLE001 - a desk run without NVML still writes
+            print(f"{_pl.LOG_TAG} WARNING: running limits unreadable ({exc}); checked as unknown",
+                  file=sys.stderr)
+    model, lines = check_power(model, current, a.power_scale, a.power_scale_exponent)
+    for ln in lines:
+        print(ln, file=sys.stderr)
     doc = pchunk_json(model, [int(x) for x in a.cut.split(",")])
     text = json.dumps(doc, indent=1, sort_keys=True) + "\n"
     if a.out:

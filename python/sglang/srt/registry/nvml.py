@@ -683,6 +683,104 @@ def process_bytes_on_uuid(uuid: str) -> dict[int, int]:
     raise DeviceNotFoundError(f"no NVML device with UUID {uuid!r}")
 
 
+@dataclass(frozen=True)
+class PowerInfo:
+    """The power limit a card RUNS under, and its SM clock ceiling (release
+    table row 27, 26.09.).
+
+    Why it is read at all: every compute figure this rig measures (#PGAP
+    gpu_fwd, P-chunk points, D decode compute) is taken under an operator-set
+    power limit (user 24.09.: 5090 400 W of 600, 3080 230 W of 320, "spaeter
+    ggf. erhoehen"). A cut or a speed table fitted under one limit is wrong
+    under another, so the limit travels with every record.
+
+    ``None`` in a field = NVML did not answer that query (never 0).
+    """
+
+    uuid: str
+    name: str
+    index: int
+    #: ``nvmlDeviceGetEnforcedPowerLimit`` (mW -> W): the limit in force.
+    power_limit_w: Optional[float]
+    #: ``nvmlDeviceGetPowerManagementDefaultLimit``: the board's default.
+    power_limit_default_w: Optional[float] = None
+    #: upper end of ``nvmlDeviceGetPowerManagementLimitConstraints``.
+    power_limit_max_w: Optional[float] = None
+    #: ``nvmlDeviceGetMaxClockInfo(NVML_CLOCK_SM)``: the SM clock ceiling.
+    sm_clock_max_mhz: Optional[int] = None
+
+    INSTRUMENT = "nvmlDeviceGetEnforcedPowerLimit"
+
+
+def _nvml_try(fn, *args):
+    try:
+        return fn(*args)
+    except Exception:  # noqa: BLE001 - one unanswered query is a None field
+        return None
+
+
+def _power_from_handle(pynvml, handle, index: int) -> PowerInfo:
+    enforced = _nvml_try(pynvml.nvmlDeviceGetEnforcedPowerLimit, handle)
+    default = _nvml_try(pynvml.nvmlDeviceGetPowerManagementDefaultLimit, handle)
+    cons = _nvml_try(pynvml.nvmlDeviceGetPowerManagementLimitConstraints, handle)
+    clock_sm = getattr(pynvml, "NVML_CLOCK_SM", 1)
+    sm_max = _nvml_try(pynvml.nvmlDeviceGetMaxClockInfo, handle, clock_sm)
+    max_w = None
+    if isinstance(cons, (tuple, list)) and len(cons) == 2 and cons[1] is not None:
+        max_w = float(cons[1]) / 1000.0
+    return PowerInfo(
+        uuid=_decode(pynvml.nvmlDeviceGetUUID(handle)),
+        name=_decode(pynvml.nvmlDeviceGetName(handle)),
+        index=int(index),
+        power_limit_w=None if enforced is None else float(enforced) / 1000.0,
+        power_limit_default_w=None if default is None else float(default) / 1000.0,
+        power_limit_max_w=max_w,
+        sm_clock_max_mhz=None if sm_max is None else int(sm_max),
+    )
+
+
+def power_snapshot() -> list[PowerInfo]:
+    """:class:`PowerInfo` of every card, NVML index order.
+
+    Honours :data:`ENV_NVML_REPLAY`: a recorded row may carry
+    ``power_limit_w`` / ``power_limit_default_w`` / ``power_limit_max_w`` /
+    ``sm_clock_max_mhz``; a row without them replays as ``None`` fields
+    (an old recording does not know the limit -- it is not 0 W).
+    """
+    path = os.environ.get(ENV_NVML_REPLAY, "")
+    if path:
+        with open(path) as fh:
+            rows = json.load(fh)
+
+        def _opt(r, k, typ):
+            v = r.get(k)
+            return None if v is None else typ(v)
+
+        return [
+            PowerInfo(
+                uuid=str(r["uuid"]), name=str(r["name"]), index=int(r["index"]),
+                power_limit_w=_opt(r, "power_limit_w", float),
+                power_limit_default_w=_opt(r, "power_limit_default_w", float),
+                power_limit_max_w=_opt(r, "power_limit_max_w", float),
+                sm_clock_max_mhz=_opt(r, "sm_clock_max_mhz", int),
+            )
+            for r in rows
+        ]
+    with nvml_session() as pynvml:
+        return [
+            _power_from_handle(pynvml, pynvml.nvmlDeviceGetHandleByIndex(i), i)
+            for i in range(pynvml.nvmlDeviceGetCount())
+        ]
+
+
+def power_info_for_uuid(uuid: str) -> PowerInfo:
+    """:class:`PowerInfo` of one card, keyed by UUID (never by a CUDA index)."""
+    for info in power_snapshot():
+        if info.uuid == uuid:
+            return info
+    raise DeviceNotFoundError(f"no NVML device with UUID {uuid!r} (power query)")
+
+
 def resolve_devices_by_name_fragment(fragment: str) -> list[DeviceInfo]:
     """Every device whose product name contains ``fragment``, case-insensitive."""
     needle = fragment.lower()
