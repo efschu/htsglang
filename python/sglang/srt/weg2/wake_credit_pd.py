@@ -55,6 +55,7 @@ import statistics
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
+from sglang.srt.name_compat import tolerant_compile
 from sglang.srt.weg2.wake_credit import MARKER, REFUSAL_CODE, tag_layers_by_stage
 
 #: Richtung in jeder Zeile, damit ``grep 'P->D'`` die neue Rechnung trennt.
@@ -810,28 +811,28 @@ def front_timed_order(pause_order: Sequence[str], plan: Optional[Mapping[str, ob
 # ---------------------------------------------------------------------------
 
 _TS = r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(?:,\d+)?)"
-_RX_ORDER = re.compile(
+_RX_ORDER = tolerant_compile(
     _TS + r"\] INFO weg2\.front: WEG2-FLIP-ORDER epoch=(\d+) src=P driver_free=(\{[^}]*\}) "
     r"pause_order=(\[[^\]]*\])")
-_RX_P_RES = re.compile(
+_RX_P_RES = tolerant_compile(
     r"PP(\d+)\] WEG2-DC-BREAKDOWN stage=release tags=\['kv_cache', 'cuda_graph'\].*? "
     r"tms_resident \d+ (\{[^}]*\})")
 _RX_ROWS = re.compile(r"(PP|TP)(\d+)\] MoE expert-offload active on layer \d+: (\d+)/\d+ experts "
                       r"resident \+ \d+ scratch \(buffer=(\d+),")
-_RX_STT = re.compile(
+_RX_STT = tolerant_compile(
     r"PP(\d+)\] WEG2-SLEEP-TAG-TIME tag=(\w+) deposit_ms=(\d+) sync_ms=\d+ pause_ms=(\d+) "
     r".*?t0=([\d.]+) t=([\d.]+)")
-_RX_BAR1 = re.compile(
+_RX_BAR1 = tolerant_compile(
     r"(PP|TP)(\d+)\] WEG2-BAR1 lane-time lane=p(\d+) phase=(deposit|collect) seq=(\d+)-(\w+) "
     r".*?bytes=(\d+) total_ms=(\d+) wait_ms=(\d+)")
-_RX_SEQ = re.compile(
+_RX_SEQ = tolerant_compile(
     r"(PP|TP)(\d+)\] WEG2-SEQ lane-time lane=c(\d+) phase=(deposit|collect) units=\d+ "
     r"bytes=(\d+) total_ms=(\d+) wait_ms=(\d+) .*?t=([\d.]+) t0=([\d.]+)")
-_RX_BEGIN = re.compile(r"TP(\d+)\] WEG2-RESUME begin tag=(\w+) need_mib=(\d+) ")
-_RX_CREDIT = re.compile(
+_RX_BEGIN = tolerant_compile(r"TP(\d+)\] WEG2-RESUME begin tag=(\w+) need_mib=(\d+) ")
+_RX_CREDIT = tolerant_compile(
     r"TP(\d+)\] WEG2-VRAM-CREDIT card=\S+ tag=(\w+) waited=(\d+) ms .*?free_mib=(\d+) "
     r".*?corridor_floor_mib=(\d+)")
-_RX_WTT = re.compile(r"TP(\d+)\] WEG2-WAKE-TAG-TIME tag=(\w+) resume_ms=(\d+) t0=([\d.]+) t=([\d.]+)")
+_RX_WTT = tolerant_compile(r"TP(\d+)\] WEG2-WAKE-TAG-TIME tag=(\w+) resume_ms=(\d+) t0=([\d.]+) t=([\d.]+)")
 
 _MIB = float(1 << 20)
 

@@ -118,6 +118,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+from sglang.srt.name_compat import has_marker, tolerant_compile
 from sglang.srt.weg2 import ring_table
 from sglang.srt.weg2.xchg_residency import (
     GROUPS,
@@ -130,18 +131,18 @@ from sglang.srt.weg2.xchg_residency import (
 #: budget step; this pattern matches only the uuid-keyed one, because an index
 #: is not an identity across boots (#589) and the two lines do not even carry
 #: the same quantity.
-_DC_RE = re.compile(
+_DC_RE = tolerant_compile(
     r"WEG2-DC\s+group=([A-Z])\s+uuid=(GPU-[0-9a-fA-F-]+)\s+measured=(\d+)\s+MiB"
 )
 
 #: ``WEG2-WEIGHT-CHUNKS N=8 tags (layers per chunk 8 of 64; family [...])`` --
 #: the launcher's own record of the tag family that boot paused.  Read rather
 #: than re-derived so the census cannot disagree with the boot it describes.
-_CHUNKS_RE = re.compile(r"WEG2-WEIGHT-CHUNKS\s+N=(\d+)\s")
+_CHUNKS_RE = tolerant_compile(r"WEG2-WEIGHT-CHUNKS\s+N=(\d+)\s")
 
 #: ``WEG2-HOST-RING SOURCE solved from <stem> (...)`` -- a reference boot's own
 #: record of which stem ITS launcher selected.  The selection oracle.
-_SOURCE_RE = re.compile(r"WEG2-HOST-RING SOURCE solved from (\S+)")
+_SOURCE_RE = tolerant_compile(r"WEG2-HOST-RING SOURCE solved from (\S+)")
 
 #: ``WEG2-FLIP-ORDER MAP group=P (SOLVED cut ... -> REALIZED layer split
 #: [39, 13, 12] over 64 layers, 8 layers per chunk, nvml [1, 0, 2] in stage
@@ -150,7 +151,7 @@ _SOURCE_RE = re.compile(r"WEG2-HOST-RING SOURCE solved from (\S+)")
 #: so the map is rebuilt through ``chunk_tag_cards`` (its owner) rather than
 #: parsed out of prose, and the published map itself, so the rebuild is
 #: CHECKED against what that boot actually used.
-_ORDER_MAP_RE = re.compile(
+_ORDER_MAP_RE = tolerant_compile(
     r"WEG2-FLIP-ORDER MAP group=P \(.*?REALIZED layer split \[([0-9,\s]+)\] over "
     r"(\d+) layers, (\d+) layers per chunk, nvml \[([0-9,\s]+)\] in stage order\):\s*"
     r"(\{[^}]*\})"
@@ -208,7 +209,7 @@ def dormant_readings(front_log: str) -> Dict[str, Dict[str, int]]:
     try:
         with open(front_log, errors="replace") as fh:
             for line in fh:
-                if "WEG2-DC" not in line:
+                if not has_marker(line, "WEG2-DC"):
                     continue
                 for group, uuid, mib in _DC_RE.findall(line):
                     per = out.setdefault(group, {})
@@ -736,7 +737,7 @@ def build_census(
     front = os.path.join(evidence_dir, f"{stem}.front.log")
     try:
         with open(front, errors="replace") as fh:
-            marked = any(ring_table.XCHG_FORM_MARKER in line for line in fh)
+            marked = any(has_marker(line, ring_table.XCHG_FORM_MARKER) for line in fh)
     except OSError as exc:
         raise _refuse(f"front log of the selected boot {stem} is unreadable: {exc}")
     # User order 2026-09-17 ("freigeben"): #1305 item 4 keeps excluding

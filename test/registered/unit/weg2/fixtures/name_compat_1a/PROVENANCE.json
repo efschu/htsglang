@@ -1,0 +1,92 @@
+{
+ "what": "verbatim boot-log lines (old spelling, as written by the boots) for the 1a tolerant-reader tests; lines kept whole and in file order; NOT to be renamed",
+ "files": {
+  "h91v1.front.lines": {
+   "source": "/spinning/evidence-665-f1/boot_weg2_fnFL2h91v1_39fd662d9e_0926_074852.front.log",
+   "lines": [
+    3,
+    21,
+    104,
+    224,
+    250,
+    254,
+    263,
+    267,
+    275,
+    286,
+    287,
+    322,
+    323,
+    324,
+    327,
+    328,
+    332,
+    336,
+    338,
+    341,
+    352,
+    377,
+    382,
+    388,
+    398,
+    411,
+    447,
+    456,
+    458,
+    461,
+    474,
+    509,
+    565,
+    567,
+    676,
+    678
+   ],
+   "missing": []
+  },
+  "h91v1.D.lines": {
+   "source": "/spinning/evidence-665-f1/boot_weg2_fnFL2h91v1_39fd662d9e_0926_074852.D.log",
+   "lines": [
+    9022,
+    9023,
+    9024,
+    9025,
+    9027,
+    9028,
+    9030,
+    9031,
+    9033,
+    11303,
+    11304,
+    11305,
+    12396,
+    12398,
+    12403
+   ],
+   "missing": []
+  },
+  "rc7c.P.lines": {
+   "source": "/spinning/evidence-665-f1/boot_weg2_weg2rc7c_a54f21cda0_0925_112748.P.log",
+   "lines": [
+    1382
+   ],
+   "missing": [
+    "WEG2 DRAFT-KV-PRODUCER armed"
+   ]
+  },
+  "xsn412.P.lines": {
+   "source": "/spinning/evidence-665-f1/boot_weg2_weg2xsn412_f295e098eb_0924_083453.P.log",
+   "lines": [
+    416,
+    417
+   ],
+   "missing": []
+  },
+  "sb1.front.lines": {
+   "source": "/spinning/evidence-665-f1/boot_weg2_weg2sb1_7b60280f57_0908_140216.front.log",
+   "lines": [
+    43
+   ],
+   "missing": []
+  }
+ }
+}

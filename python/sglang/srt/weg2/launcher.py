@@ -69,6 +69,7 @@ from typing import (
 
 from sglang.srt.environ import envs
 from sglang.srt.managers import corridor_guard
+from sglang.srt.name_compat import tolerant_compile
 from sglang.srt.planner import p_card_chunk as _p_card
 # fnFL2 H57: das Power-Limit je Karte (Startzeile, Referenz-Datierung, Raten-Schnitt).
 from sglang.srt.planner import power_limit as _power
@@ -1373,13 +1374,13 @@ def derive_x_star(flip_s: float, r_d: float, r_p: float, floor_tokens: int,
 
 
 _RE_FLIP = re.compile(r"flip_total=(\d+) ms")
-_RE_LEG1 = re.compile(
+_RE_LEG1 = tolerant_compile(
     r"WEG2-SERVED group=P leg=1 .*?prompt_tokens=(\d+) cached_tokens=(\d+) wall=([0-9.]+)s"
 )
 #: #1271: the front's own P-drain window -- `prefilled` legs over `drain_s`
 #: seconds. This is the denominator r_P was always meant to have.
-_RE_DRAIN = re.compile(r"WEG2 P-DRAIN epoch=(\d+) .*?drain_s=([0-9.]+)")
-_RE_LEG2 = re.compile(
+_RE_DRAIN = tolerant_compile(r"WEG2 P-DRAIN epoch=(\d+) .*?drain_s=([0-9.]+)")
+_RE_LEG2 = tolerant_compile(
     r"WEG2-SERVED group=D leg=2 .*?uncached=(\d+) verdict=(\S+) wall=([0-9.]+)s"
 )
 
@@ -6412,22 +6413,22 @@ def check_drafter_identity(log_p: str, log_d: str) -> Dict[str, object]:
     return out
 
 
-_RESIDENT_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*resident_mib=(-?\d+(?:\.\d+)?)")
-_HEAD_RELEASED_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*head_released_mib=(-?\d+(?:\.\d+)?)")
+_RESIDENT_RE = tolerant_compile(r"WEG2 DRAFT-KV-PRODUCER armed .*resident_mib=(-?\d+(?:\.\d+)?)")
+_HEAD_RELEASED_RE = tolerant_compile(r"WEG2 DRAFT-KV-PRODUCER armed .*head_released_mib=(-?\d+(?:\.\d+)?)")
 #: #66 (fnFL2v72): the fourth term -- what the private TAG POOLS still cache.
 #: empty_cache cannot reach them (#65 of the same day), so NVML counts those
 #: bytes while residue and release cannot see them: 5334.0 against 2202.6 +
 #: 1212.5 left 1918.9 MiB unexplained and W11b refused a build that was fine.
-_TAG_POOL_INACTIVE_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*tag_pool_inactive_mib=(-?\d+(?:\.\d+)?)")
+_TAG_POOL_INACTIVE_RE = tolerant_compile(r"WEG2 DRAFT-KV-PRODUCER armed .*tag_pool_inactive_mib=(-?\d+(?:\.\d+)?)")
 #: #66: die zwei Terme, die W11b fehlten, als 533,7 MiB unerklaert blieben.
-_OUTSIDE_TORCH_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*outside_torch_mib=(-?\d+(?:\.\d+)?)")
-_DEFAULT_POOL_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*default_pool_inactive_mib=(-?\d+(?:\.\d+)?)")
-_NVML_DELTA_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*nvml_delta_mib=(-?\d+(?:\.\d+)?)")
+_OUTSIDE_TORCH_RE = tolerant_compile(r"WEG2 DRAFT-KV-PRODUCER armed .*outside_torch_mib=(-?\d+(?:\.\d+)?)")
+_DEFAULT_POOL_RE = tolerant_compile(r"WEG2 DRAFT-KV-PRODUCER armed .*default_pool_inactive_mib=(-?\d+(?:\.\d+)?)")
+_NVML_DELTA_RE = tolerant_compile(r"WEG2 DRAFT-KV-PRODUCER armed .*nvml_delta_mib=(-?\d+(?:\.\d+)?)")
 #: #66: der lebende Nicht-Modell-Posten (Attention-Workspace voran) und der
 #: freie Rand der Karte, an dem gemessen wird, ob ein Rest ueberhaupt
 #: gefaehrlich waere.
-_OTHER_LIVE_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*other_live_mib=(-?\d+(?:\.\d+)?)")
-_CARD_FREE_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*card_free_mib=(-?\d+(?:\.\d+)?)")
+_OTHER_LIVE_RE = tolerant_compile(r"WEG2 DRAFT-KV-PRODUCER armed .*other_live_mib=(-?\d+(?:\.\d+)?)")
+_CARD_FREE_RE = tolerant_compile(r"WEG2 DRAFT-KV-PRODUCER armed .*card_free_mib=(-?\d+(?:\.\d+)?)")
 #: W11b (#1233 fix 6): how far the BUILD may stay unexplained by the two terms
 #: that claim to explain it, IN EITHER DIRECTION.  MEASURED on boot weg2dk5's
 #: own L2 line: nvml_delta 3998.0 against resident 1682.9 + head_released

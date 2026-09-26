@@ -94,6 +94,8 @@ import re
 import sys
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
+from sglang.srt.name_compat import has_marker, tolerant_compile
+
 #: The flashinfer FLOAT workspace, MiB.  UNIFORM across ranks -- it is
 #: ``SGLANG_FLASHINFER_WORKSPACE_SIZE``'s default, not a per-rank reading --
 #: which is why it, and not the per-rank capture pool, is every edge below.
@@ -106,7 +108,7 @@ FLOOR_MIB, CEIL_MIB = 819, 1229
 #: ``mib=0.0`` is the saver's own "could not answer" sentinel and is NOT an
 #: empty tag -- the line's own text says so, and A2 refuses it rather than
 #: averaging it in.
-RELEASED_RE = re.compile(
+RELEASED_RE = tolerant_compile(
     r"WEG2-SLEEP released tags=\['cuda_graph'\]\s+mib=([0-9.]+)\s+ms=([0-9.]+)"
 )
 
@@ -210,7 +212,7 @@ def find_degrades(text: str, group: str = "") -> List[str]:
     for ln in text.splitlines():
         for marker in DEGRADE_MARKERS:
             hit = ("group %s: %s" % (group, ln.strip())) if group else ln.strip()
-            if marker in ln and hit not in seen:
+            if has_marker(ln, marker) and hit not in seen:
                 seen.append(hit)
     return seen
 

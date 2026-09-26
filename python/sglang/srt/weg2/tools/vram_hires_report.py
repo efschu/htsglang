@@ -47,6 +47,21 @@ import sys
 from collections import defaultdict
 from typing import Dict, List, Optional, Sequence, Tuple
 
+
+def _load_name_compat():
+    """The old/new name helper (``srt/name_compat.py``), loaded by PATH: this
+    report runs as a script against any venv and imports no package."""
+    import importlib.util
+
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, "name_compat.py")
+    spec = importlib.util.spec_from_file_location("_name_compat_vram_report", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_nc = _load_name_compat()
+
 #: Rang i einer Gruppe liegt auf NVML cards[i] (boot_<tag>.json 'cards'; Form
 #: dieses Rigs: P PP0/1/2 und D TP0/1/2 auf 1/0/2).
 DEFAULT_RANK_CARDS = (1, 0, 2)
@@ -177,10 +192,10 @@ def peak_lines(path: Optional[str]) -> List[Dict[str, str]]:
         return out
     with open(path, errors="replace") as f:
         for ln in f:
-            if "WEG2-VRAM-PEAK " not in ln:
+            if not _nc.has_marker(ln, "WEG2-VRAM-PEAK "):
                 continue
             m = _TS_S.match(ln)
-            d = dict(_RX_KV.findall(ln.split("WEG2-VRAM-PEAK ", 1)[1]))
+            d = dict(_RX_KV.findall(_nc.marker_tail(ln, "WEG2-VRAM-PEAK ")))
             d["rank_tag"] = m.group(3) if m else "?"
             out.append(d)
     return out
@@ -228,11 +243,11 @@ def flip_windows(front_log: Optional[str]) -> List[Window]:
             if not m:
                 continue
             t = _unix_ms(m.group(1), m.group(2), int(m.group(3)))
-            if "WEG2-FLIP begin" in ln:
+            if _nc.has_marker(ln, "WEG2-FLIP begin"):
                 mm = re.search(r"epoch=(\d+) sleep=(\w) wake=(\w)", ln)
                 if mm:
                     begins[mm.group(1)] = (t, f"{mm.group(2)}->{mm.group(3)}")
-            elif "WEG2-FLIP done" in ln:
+            elif _nc.has_marker(ln, "WEG2-FLIP done"):
                 mm = re.search(r"epoch=(\d+)", ln)
                 if mm and mm.group(1) in begins:
                     t0, d = begins.pop(mm.group(1))
@@ -347,7 +362,7 @@ def card_rows(tr: Trace, wins: List[Window], plan, dmon, rank_cards) -> List[Dic
     return rows
 
 
-_RX_POOL_PF = re.compile(r"WEG2-GRAPH-POOL rank=(\d+) phase=\S+ .*?private_free_mib=(-?\d+)")
+_RX_POOL_PF = _nc.tolerant_compile(r"WEG2-GRAPH-POOL rank=(\d+) phase=\S+ .*?private_free_mib=(-?\d+)")
 
 
 def private_free_by_rank(path: Optional[str]) -> Dict[str, int]:
@@ -359,7 +374,7 @@ def private_free_by_rank(path: Optional[str]) -> Dict[str, int]:
         return out
     with open(path, errors="replace") as f:
         for ln in f:
-            if "WEG2-GRAPH-POOL " not in ln:
+            if not _nc.has_marker(ln, "WEG2-GRAPH-POOL "):
                 continue
             m = _RX_POOL_PF.search(ln)
             if m and int(m.group(2)) >= 0:
