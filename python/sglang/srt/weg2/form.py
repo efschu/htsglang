@@ -100,6 +100,18 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
     },
 }
 
+#: UNIFY S2: switches whose DEFAULT differs by model profile -- one environ.py
+#: entry each, its default resolved here from the published form's profile
+#: (:func:`profile_switch_default`). An explicitly set env var always wins; no
+#: form / a profile not listed -> the fallback the environ entry names.
+#: SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL (H39): the 27B line shipped the port
+#: 3c9bfeff95 default OFF, the NF line d6b7d4a1d3 default ON -- each kept until a
+#: measurement of that model says otherwise (27B arms set 1 explicitly since xsn426).
+PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, bool]] = {
+    PROFILE_QWEN27B: {"SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL": False},
+    PROFILE_NEXTFLASH: {"SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL": True},
+}
+
 #: Checkpoint config keys that name routed experts (top level or text_config).
 _EXPERT_CONFIG_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
 #: Launcher/extra flags whose presence states an expert layout (MoE only).
@@ -192,6 +204,18 @@ def current_form(environ: Optional[Mapping[str, str]] = None) -> Optional[Weg2Fo
     boot, or a desk test): callers then keep their pre-form behaviour."""
     env = os.environ if environ is None else environ
     return parse_form(env.get(FORM_ENV, ""))
+
+
+def profile_switch_default(
+    name: str, fallback: bool, environ: Optional[Mapping[str, str]] = None
+) -> bool:
+    """The default of switch ``name`` for the profile in the published form
+    (:data:`PROFILE_SWITCH_DEFAULTS`); ``fallback`` without a form, without a
+    profile in it, or for a profile that does not list the switch. Reads only
+    the form -- whether ``name`` itself is set is the caller's question."""
+    form = current_form(environ)
+    prof = form.profile if form is not None else ""
+    return bool(PROFILE_SWITCH_DEFAULTS.get(prof, {}).get(name, fallback))
 
 
 # --------------------------------------------------------------------------

@@ -7,6 +7,15 @@ from enum import IntEnum
 from typing import Any, Optional
 
 
+def _dense_repack_outside_pool_default() -> bool:
+    """UNIFY S2: SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL's default per model
+    profile, read from the published weg2 form at get() time (not cached: the
+    form env is per group). weg2.form is stdlib-only, so this stays light."""
+    from sglang.srt.weg2.form import profile_switch_default
+
+    return profile_switch_default("SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL", True)
+
+
 @functools.lru_cache(maxsize=1)
 def _default_hip() -> bool:
     """Lazy ROCm/HIP detection for platform-conditional env defaults.
@@ -751,11 +760,12 @@ class Envs:
     # pool. On D-TP0 those dead blocks were 4.6 of the 4.9 GiB private-free
     # (weights pool 1.22 GiB = lm_head, bands 3.45 GiB). False = the
     # 2026-09-24 form, byte for byte (everything born in the tag pool).
-    # UNIFY S2: ONE switch for both profiles. The 27B line ported the same code
-    # under the same name with default False (3c9bfeff95), but every 27B arm
-    # since xsn426 and docker/profiles/27b.env set it to 1 -- the default True
-    # is therefore the booted form of both lines; 0 stays the old form.
-    SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL = EnvBool(True)
+    # UNIFY S2: ONE entry for both profiles, the DEFAULT per profile
+    # (weg2/form.py PROFILE_SWITCH_DEFAULTS): qwen27b False (the 27B port
+    # 3c9bfeff95 shipped it off; its arms set 1 explicitly), nextflash True;
+    # no published form -> True (the NF line's default). Set explicitly, the
+    # env always wins.
+    SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL = EnvBool(_dense_repack_outside_pool_default)
     # SEQ_LANE_RING (H44, Task #17): the on-card HOST lanes (c0/c1/c2,
     # /dev/shm/weg2-seq-<boot>/c<card>[_s1]_unit_buffer.bin) were sized to
     # the lane's biggest TAG, persisted and pinned per buffer slot -- 3.2 GiB

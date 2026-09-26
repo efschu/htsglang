@@ -2,10 +2,10 @@
 tag pool -- behind SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL.
 
 UNIFY S2 (desk/27b-unified-0926): the switch has the SAME name on both lines; the
-27B line defaulted it OFF (byte-identical until booted), the NF line ON.  The
-unified tree keeps the NF default ON: every 27B arm since xsn426 and the docker
-profile 27b.env (``_form SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL 1``) run it ON, so
-the 27B's booted form IS the default; ``=0`` still gives the 2026-09-24 form.
+27B line defaulted it OFF (byte-identical until booted), the NF line ON.  ONE
+environ.py entry, its DEFAULT per profile (weg2/form.py PROFILE_SWITCH_DEFAULTS):
+qwen27b OFF, nextflash ON, no published form ON (the NF default); an explicitly
+set value always wins (the 27B arms and docker/profiles/27b.env set 1).
 
 Code ported from the NF line (b48c7f07e5 tag-pool tracking, 11cadf67a3
 outside/back_into, 4da5c56cc2 load pool + release after the region,
@@ -375,16 +375,66 @@ def test_without_a_tag_pool_nothing_steps_anywhere(monkeypatch):
     assert torch.equal(layer.weight_packed, ref.weight_packed)
 
 
-def test_the_switch_defaults_on_in_the_unified_tree_and_0_is_the_old_form(monkeypatch):
-    """UNIFY S2: default = the NF default (on) = what every 27B arm since xsn426
-    sets explicitly; ``0`` keeps the 27B line's byte-identical off form reachable."""
+def _form_env(profile):
+    from sglang.srt.weg2.form import Weg2Form
+
+    arch, experts, draft, kv = (("dense", "none", "dflash", "paged_dcp") if profile == "qwen27b"
+                                else ("moe", "offload", "mtp", "qsa_forma"))
+    return Weg2Form(arch=arch, experts=experts, draft=draft, p_draft="none", kv=kv,
+                    flip="family", vision="off", profile=profile, model="m").env_value()
+
+
+@pytest.mark.parametrize("profile,want", [("qwen27b", False), ("nextflash", True), (None, True)])
+def test_the_default_is_per_profile(monkeypatch, profile, want):
+    """UNIFY S2: 27B OFF, NF ON, no form ON -- one environ entry, no second one."""
     from sglang.srt.layers.quantization.compressed_tensors.schemes import (
         compressed_tensors_wNa16 as mod,
     )
 
     monkeypatch.delenv("SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL", raising=False)
-    assert envs.SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL.get() is True
-    assert mod.dense_repack_outside_pool_armed() is True
-    monkeypatch.setenv("SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL", "0")
-    assert envs.SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL.get() is False
-    assert mod.dense_repack_outside_pool_armed() is False
+    if profile is None:
+        monkeypatch.delenv("SGLANG_WEG2_FORM", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_WEG2_FORM", _form_env(profile))
+    assert envs.SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL.get() is want
+    assert mod.dense_repack_outside_pool_armed() is want
+
+
+@pytest.mark.parametrize("profile", ["qwen27b", "nextflash", None])
+@pytest.mark.parametrize("explicit,want", [("1", True), ("0", False)])
+def test_an_explicit_value_wins_over_the_profile(monkeypatch, profile, explicit, want):
+    if profile is None:
+        monkeypatch.delenv("SGLANG_WEG2_FORM", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_WEG2_FORM", _form_env(profile))
+    monkeypatch.setenv("SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL", explicit)
+    assert envs.SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL.get() is want
+
+
+@pytest.mark.parametrize("profile,explicit,want", [
+    ("qwen27b", None, False), ("nextflash", None, True), (None, None, True),
+    ("qwen27b", "1", True), ("nextflash", "0", False)])
+def test_the_planner_reads_the_group_env_like_the_rank(profile, explicit, want):
+    """H50's reader of the D-group env resolves the same default as the rank."""
+    from sglang.srt.planner.expert_residency import dense_repack_outside_pool
+
+    env = {}
+    if profile is not None:
+        env["SGLANG_WEG2_FORM"] = _form_env(profile)
+    if explicit is not None:
+        env["SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL"] = explicit
+    assert dense_repack_outside_pool(env) is want
+
+
+def test_environ_holds_exactly_one_entry():
+    import ast
+    import inspect
+
+    from sglang.srt import environ as env_mod
+
+    tree = ast.parse(inspect.getsource(env_mod))
+    hits = [n.lineno for n in ast.walk(tree)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL"
+                    for t in n.targets)]
+    assert len(hits) == 1, hits

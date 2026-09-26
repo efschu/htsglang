@@ -207,10 +207,13 @@ def test_mutant_without_the_h39_posten_refuses_x158_and_with_it_passes_x150():
 # ---------------------------------------------------------------------------
 
 
-def test_the_env_mirror_matches_environ():
+def test_the_env_mirror_matches_environ(monkeypatch):
     from sglang.srt.environ import envs
 
-    assert er.DENSE_REPACK_OUTSIDE_POOL_DEFAULT is envs.SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL.default
+    # UNIFY S2: environ's default is resolved per profile (weg2/form.py); with
+    # no published form it is the NF default this mirror names.
+    monkeypatch.delenv("SGLANG_WEG2_FORM", raising=False)
+    assert er.DENSE_REPACK_OUTSIDE_POOL_DEFAULT is envs.SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL._resolve_default()
     assert er.dense_repack_outside_pool({}) is True
     assert er.dense_repack_outside_pool({er.DENSE_REPACK_OUTSIDE_POOL_ENV: "0"}) is False
     with pytest.raises(ValueError):

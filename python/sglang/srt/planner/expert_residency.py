@@ -221,7 +221,12 @@ def dense_repack_outside_pool(env: Mapping[str, str]) -> bool:
     (H50: welcher Baum-Zustand die gemessene Referenz waehlt)."""
     raw = str(env.get(DENSE_REPACK_OUTSIDE_POOL_ENV, "")).strip().lower()
     if not raw:
-        return DENSE_REPACK_OUTSIDE_POOL_DEFAULT
+        # UNIFY S2: the default follows the group's published form (profile),
+        # exactly as the rank's EnvBool resolves it (weg2/form.py).
+        from sglang.srt.weg2.form import profile_switch_default
+
+        return profile_switch_default(
+            DENSE_REPACK_OUTSIDE_POOL_ENV, DENSE_REPACK_OUTSIDE_POOL_DEFAULT, env)
     if raw in _TRUE:
         return True
     if raw in _FALSE:
