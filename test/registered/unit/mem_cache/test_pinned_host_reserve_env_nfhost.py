@@ -27,9 +27,14 @@ cgroup ``available`` is the cap minus nonreclaim (82 - 73.9), and the 10 GiB
 GiB limit) the same boot never came near the reserve.
 
 WHAT MUST HOLD: unset, the reserve is the historical 10 GiB byte for byte, so
-a native boot is unchanged; set, the module constant -- and with it the default
-of both admission functions -- follows it, so the container can admit the 0.54
-GB the specimen refused.
+a native boot is unchanged; set, the reserve both admission functions use when
+no caller passes one follows it, so the container can admit the 0.54 GB the
+specimen refused.
+
+Unify step 1 (desk/27b-unified-0926): the ONE implementation is the 27B form
+(a9fc5e52ef) -- ``pinned_host_reserve()`` reads the env at CALL time and names
+its source; ``PINNED_HOST_RESERVE_BYTES`` is only the documented default. The
+specimen below is unchanged; it now asks the reader, not the constant.
 """
 
 import json
@@ -50,10 +55,9 @@ DEMAND_GB = 0.54
 TOTAL_GB = 82.0
 ENV = "SGLANG_PINNED_HOST_RESERVE_GIB"
 
-#: Runs in a FRESH interpreter: the reserve is bound at import (module constant
-#: and the default argument of both admission functions), so only a new process
-#: shows what a container launched with the env actually gets -- and a reload
-#: inside this process would swap the registry under every other test module.
+#: Runs in a FRESH interpreter: only a new process shows what a container
+#: launched with the env actually gets from a clean import -- and a reload inside
+#: this process would swap the registry under every other test module.
 _PROBE = f"""
 import json
 from unittest import mock
@@ -68,7 +72,7 @@ with mock.patch.object(m, "pinned_host_memory_bytes",
         m.check_and_register_pinned_post("read buffers", "--hicache-size", int({DEMAND_GB} * {GB}))
     except ValueError:
         admitted = False
-print(json.dumps({{"reserve": m.PINNED_HOST_RESERVE_BYTES, "err": err, "admitted": admitted}}))
+print(json.dumps({{"reserve": m.pinned_host_reserve_bytes(), "err": err, "admitted": admitted}}))
 """
 
 

@@ -47,20 +47,70 @@ from __future__ import annotations
 
 import logging
 import functools
+import math
+import os
 import threading
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
-
-from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
 # Host RAM left free for the OS and every non-pool consumer. Pinned memory is
 # non-swappable and this box has no swap at all, so the reserve is the only
 # thing standing between a tight configuration and the OOM killer.
-# SGLANG_PINNED_HOST_RESERVE_GIB (default 10 = the historical constant) lets a
-# container whose cgroup cap already guards the host lower it -- see environ.py.
-PINNED_HOST_RESERVE_BYTES: int = int(envs.SGLANG_PINNED_HOST_RESERVE_GIB.get() * (1024**3))
+#
+# SETTABLE, DEFAULT UNCHANGED (RC7b, NF host acceptance 2026-09-25). Under a
+# container memory cap the fixed 10 GiB left nothing for the pins that come
+# LATE: cap 82g, `available` (cap - nonreclaim) 8.7 GB, minus 10 GiB = 0 usable,
+# so the P->D KV hand-back's lazy read buffers (0.54 GB) were refused -> W53
+# Weg2StoreHandbackFailed and 413 on long prompts. The reserve is the OS's share
+# of THIS machine, so the container states it: SGLANG_PINNED_HOST_RESERVE_GIB
+# (GiB, a finite number >= 0). Unset = 10 GiB, the native value, byte-identical.
+# Every check reads it through pinned_host_reserve(), at CALL time, and names
+# the value it used and where it came from.
+PINNED_HOST_RESERVE_ENV = "SGLANG_PINNED_HOST_RESERVE_GIB"
+PINNED_HOST_RESERVE_DEFAULT_GIB = 10
+#: The DEFAULT reserve in bytes. The value the checks use is
+#: pinned_host_reserve() -- read it there, never from this constant.
+PINNED_HOST_RESERVE_BYTES: int = PINNED_HOST_RESERVE_DEFAULT_GIB * (1024**3)
+
+
+class PinnedHostReserveInvalid(ValueError):
+    """SGLANG_PINNED_HOST_RESERVE_GIB is set to something that is not a finite
+    number of GiB >= 0. Refused loudly: a reserve read wrong is either an OOM
+    kill (too small) or a refused boot (too large), both far from its cause."""
+
+
+def pinned_host_reserve() -> Tuple[int, str]:
+    """``(bytes, source)`` of the OS reserve the pinned-host checks keep free.
+
+    ``source`` is ``"default 10 GiB"`` or ``"env SGLANG_PINNED_HOST_RESERVE_GIB=<raw>"``
+    -- every message that names the reserve carries it, so a refusal says
+    which number refused it and who set that number."""
+    raw = os.environ.get(PINNED_HOST_RESERVE_ENV)
+    if raw is None or not raw.strip():
+        return (PINNED_HOST_RESERVE_BYTES,
+                f"default {PINNED_HOST_RESERVE_DEFAULT_GIB} GiB")
+    text = raw.strip()
+    try:
+        gib = float(text)
+    except ValueError:
+        raise PinnedHostReserveInvalid(
+            f"{PINNED_HOST_RESERVE_ENV}={raw!r} is not a number of GiB: it is "
+            "the host RAM the pinned-host checks keep free for the OS (a finite "
+            f"number >= 0; unset = {PINNED_HOST_RESERVE_DEFAULT_GIB} GiB)"
+        ) from None
+    if not math.isfinite(gib) or gib < 0:
+        raise PinnedHostReserveInvalid(
+            f"{PINNED_HOST_RESERVE_ENV}={raw!r} must be a finite number of GiB "
+            f">= 0 (unset = {PINNED_HOST_RESERVE_DEFAULT_GIB} GiB)"
+        )
+    return int(gib * (1024**3)), f"env {PINNED_HOST_RESERVE_ENV}={text}"
+
+
+def pinned_host_reserve_bytes() -> int:
+    """The reserve's bytes alone -- see :func:`pinned_host_reserve`."""
+    return pinned_host_reserve()[0]
 
 
 @dataclass(frozen=True)
@@ -100,7 +150,7 @@ def joint_pinned_host_error(
     posts: Sequence[PinnedHostPost],
     total_bytes: Optional[int],
     available_bytes: Optional[int],
-    reserve_bytes: int = PINNED_HOST_RESERVE_BYTES,
+    reserve_bytes: Optional[int] = None,
 ) -> Optional[str]:
     """``None`` when every post fits together, else a complete message.
 
@@ -114,6 +164,10 @@ def joint_pinned_host_error(
         return None
     if total_bytes is None or available_bytes is None:
         return None
+    if reserve_bytes is None:
+        reserve_bytes, reserve_src = pinned_host_reserve()
+    else:
+        reserve_src = "caller"
     demand = sum(p.nbytes for p in live)
     breakdown = _format_posts(live)
     if demand > int(total_bytes):
@@ -129,7 +183,7 @@ def joint_pinned_host_error(
             f"Pinned host RAM over-committed: {demand / 1e9:.2f} GB requested "
             f"across {len(live)} pool(s) [{breakdown}] does not fit in "
             f"{int(available_bytes) / 1e9:.2f} GB available minus a "
-            f"{int(reserve_bytes) / 1e9:.2f} GB OS reserve = "
+            f"{int(reserve_bytes) / 1e9:.2f} GB OS reserve ({reserve_src}) = "
             f"{max(0, usable) / 1e9:.2f} GB usable. Lower one of the named "
             "flags, or free host memory first: the pools are pinned, so an "
             "over-commit invokes the OOM killer instead of swapping."
@@ -230,7 +284,7 @@ def check_and_register_pinned_post(
     name: str,
     flag: str,
     requested_bytes: int,
-    reserve_bytes: int = PINNED_HOST_RESERVE_BYTES,
+    reserve_bytes: Optional[int] = None,
 ) -> None:
     """Admit ``requested_bytes`` for ``name``, or raise naming every post.
 

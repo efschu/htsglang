@@ -8943,11 +8943,11 @@ class ServerArgs:
         post in the launcher for bytes the launcher never pins.
         """
         from sglang.srt.mem_cache.pinned_host_budget import (
-            PINNED_HOST_RESERVE_BYTES,
             PinnedHostPost,
             hicache_configured_host_bytes,
             joint_pinned_host_error,
             pinned_host_memory_bytes,
+            pinned_host_reserve_bytes,
         )
 
         # ONE READER OF THE #809 FLAG AND OF THE POST'S NAME. The pin's own
@@ -9046,7 +9046,7 @@ class ServerArgs:
             headroom = (
                 None
                 if available_bytes is None
-                else int(available_bytes) - PINNED_HOST_RESERVE_BYTES - priced_bytes
+                else int(available_bytes) - pinned_host_reserve_bytes() - priced_bytes
             )
             pin_note = (
                 " + %s ARMED, PRICED AT BOOT AND NOT HERE (off with %s): one "

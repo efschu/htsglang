@@ -2546,9 +2546,10 @@ FLIP_HOST_RAM_MAX_DEFERS: int = 3
 #: 04:0x: 118G total, 38G available, with the flip's host weight images already
 #: pinned at 20.5G. 4G is ~10% of that steady headroom -- enough to absorb the
 #: lane RSS jitter that shares this container (pytest/git spikes run under 2G)
-#: without deferring on ordinary noise. It is deliberately NOT the 10G
-#: PINNED_HOST_RESERVE_BYTES: that reserve protects PERMANENT pins, and a
-#: staging transient is by definition returned.
+#: without deferring on ordinary noise. It is deliberately NOT the pinned-host
+#: OS reserve (pinned_host_budget.pinned_host_reserve(): 10 GiB by default,
+#: SGLANG_PINNED_HOST_RESERVE_GIB in a capped container): that reserve protects
+#: PERMANENT pins, and a staging transient is by definition returned.
 FLIP_HOST_RAM_FLOOR_BYTES: int = 4 * (1024**3)
 
 def flip_defer_budget_after(*, objected: bool, escalated: bool, prior: int) -> int:
