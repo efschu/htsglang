@@ -756,7 +756,7 @@ def vision_verdict(image_parts: int, video_parts: int, mode: str):
     )
 
 
-def request_text(payload: dict) -> str:
+def request_text(payload: dict, tools_first: Optional[bool] = None) -> str:
     """The prompt as ONE string, for the span estimate and the ledger.
 
     Q0-B: covers BOTH forwarded chat shapes. OpenAI carries the system turn
@@ -777,16 +777,25 @@ def request_text(payload: dict) -> str:
     whole block (13,302 chars on boot dkr27bbar1agent09251922, ~4.4k est
     tokens) was priced as uncached although D held it -- est_uncached 5.4k-11k
     > X=4096 on all 44 turns, each one over P with two flips.
+
+    NF (P49): the order is behind ``SGLANG_WEG2_ENABLE_AGENT_SPAN`` (default
+    off = the rc2.1l order, tools LAST, byte for byte). ``tools_first`` None
+    reads the switch; the Qwen3.8-Flash-Next template renders ``<tools>``
+    first exactly like the 27B one (chat_template.jinja:57-67).
     """
+    if tools_first is None:
+        tools_first = bool(envs.SGLANG_WEG2_ENABLE_AGENT_SPAN.get())
     if "messages" in payload and isinstance(payload["messages"], list):
         parts = []
         tools = payload.get("tools")
-        if isinstance(tools, list) and tools:
-            # The whole schema list, serialized once. Deterministic key order
-            # so the span LRU's prefix match is stable across identical turns.
-            parts.append(
-                "tools:" + json.dumps(tools, ensure_ascii=False, sort_keys=True) + "\n"
-            )
+        # The whole schema list, serialized once. Deterministic key order so
+        # the span LRU's prefix match is stable across identical turns.
+        tools_part = (
+            "tools:" + json.dumps(tools, ensure_ascii=False, sort_keys=True) + "\n"
+            if isinstance(tools, list) and tools else None
+        )
+        if tools_part is not None and tools_first:
+            parts.append(tools_part)
         sys_field = payload.get("system")
         if sys_field:
             parts.append(f"system:{_content_text(sys_field)}\n")
@@ -795,6 +804,8 @@ def request_text(payload: dict) -> str:
                 parts.append(f"{m}\n")
                 continue
             parts.append(f"{m.get('role', '')}:{_content_text(m.get('content', ''))}\n")
+        if tools_part is not None and not tools_first:
+            parts.append(tools_part)
         return "".join(parts)
     p = payload.get("prompt", payload.get("text", ""))
     if isinstance(p, list):
@@ -885,8 +896,15 @@ class SpanLRU:
     credited_tokens)``. An entry without ``prompt_tokens`` prices as before.
     """
 
-    def __init__(self, cap: int = SPAN_LRU):
+    def __init__(self, cap: int = SPAN_LRU, agent_span: Optional[bool] = None):
         self.cap = cap
+        #: NF (P49): ``SGLANG_WEG2_ENABLE_AGENT_SPAN``, read ONCE here (None).
+        #: Off (default) = rc2.1l: ``record_presence`` keeps only the measured
+        #: ``cached_tokens`` (prompt_tokens and held_epoch are dropped), so
+        #: every entry prices through the pre-#49 arm of ``uncached_tokens``
+        #: and the pricing equals rc2.1l's ``max(0, est - max(ct*cp/len))``.
+        self.agent_span = (bool(envs.SGLANG_WEG2_ENABLE_AGENT_SPAN.get())
+                           if agent_span is None else bool(agent_span))
         # key -> (text, cached_tokens, prompt_tokens, held_epoch)
         self.entries: collections.OrderedDict[
             str, Tuple[str, int, int, Optional[int]]] = collections.OrderedDict()
@@ -923,6 +941,9 @@ class SpanLRU:
             return
         key = hashlib.sha1(text.encode()).hexdigest()
         self.entries.pop(key, None)
+        if not self.agent_span:
+            # NF (P49) switch off: the rc2.1l entry -- the presence witness only.
+            prompt_tokens, held_epoch = 0, None
         ct = max(0, int(cached_tokens))
         pt = max(0, int(prompt_tokens or 0))
         held = held_epoch if (held_epoch is not None and pt > 0) else None
@@ -975,7 +996,21 @@ class SpanLRU:
 
         Kept for readers of the old spelling; the price is
         :meth:`uncached_tokens`.
+
+        NF (P49) switch off: rc2.1l's reading, uncapped -- the longest common
+        character prefix against a text D served times that text's measured
+        cached share (H61's presence pins read it; under #49 the credit is
+        capped by the chars/3 estimate of ``text``).
         """
+        if not self.agent_span:
+            best, known = 0, False
+            for etext, ct, _pt, _held in self.entries.values():
+                cp = common_prefix_len(etext, text)
+                if cp <= 0:
+                    continue
+                known = True
+                best = max(best, int(ct * (cp / max(1, len(etext)))))
+            return best, known
         est_prompt = int(len(text) / CHARS_PER_TOKEN) + 1
         rem, known = self.uncached_tokens(text, est_prompt, epoch)
         return max(0, est_prompt - rem), known
@@ -2698,6 +2733,14 @@ class Front:
         self.admit_d = True
         self.queue: Deque[Pending] = collections.deque()
         self.spans = SpanLRU()
+        # NF (P49): a boot with the switch on says so once. Off prints nothing,
+        # so an off boot's front log keeps the pre-P49 lines (the arm's env
+        # line is the off witness).
+        if self.spans.agent_span:
+            logger.info(
+                "WEG2 AGENT-SPAN #49 on (SGLANG_WEG2_ENABLE_AGENT_SPAN=1: tools priced "
+                "first, a D serve holds its prompt_tokens for its epoch, prefix priced "
+                "in measured tokens)")
         self.session: Optional[ClientSession] = None
         self.counters: Dict[str, int] = collections.Counter()
         self.corridor_min: Dict[str, Dict[int, int]] = {"P": {}, "D": {}}
@@ -3968,13 +4011,16 @@ class Front:
             "what D must PREFILL, at CHARS_PER_TOKEN=%.1f minus the MEASURED "
             "cached-on-D presence) presence_span=%d presence_src=%s (#1324: the "
             "credit's witness -- d_leg2_cached is a realised cached_tokens "
-            "reading from group D, never a prefill on P; #49 d_served_epoch = "
-            "prompt_tokens of a text D served in this epoch) carrier_est=%d src=%s "
+            "reading from group D, never a prefill on P%s) carrier_est=%d src=%s "
             "(THE COMPARED VALUE for carrier_max=%d: the WHOLE prompt's KV "
             "through the host staging pool, at CARRIER_CHARS_PER_TOKEN=%.1f) "
             "est_prompt=%d chars=%d (#1290)",
             rid, route, remainder, x_route, CHARS_PER_TOKEN,
             store_span, presence_src,
+            # NF (P49): the #49 witness is named only when the switch is on,
+            # so the line stays rc2.1l's byte for byte when it is off.
+            ("; #49 d_served_epoch = prompt_tokens of a text D served in this epoch"
+             if getattr(self.spans, "agent_span", False) else ""),
             carrier_est, "exact" if exact is not None else "estimate",
             self.carrier_max_tokens, CARRIER_CHARS_PER_TOKEN, est_prompt,
             len(text),

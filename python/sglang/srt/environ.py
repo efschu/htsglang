@@ -903,6 +903,15 @@ class Envs:
     # is in flight; otherwise it is routed with the start X (to P). NF D is
     # bs1, so a burst served serially on D would be slower than P's batch.
     SGLANG_WEG2_X_SOLO_WINDOW_MS = EnvInt(250)
+    # P49 (27B #49 196f6a8f57 ported to NF, Weg-2 front): agent turns priced
+    # so that a short tail on a prefix D already holds stays on D. On = (A)
+    # request_text renders tools FIRST (the Qwen3.8/Flash-Next template order),
+    # (B) a 200 D serve records prompt_tokens as held for that epoch while D is
+    # awake and serving, (C) a credited prefix is priced by its measured
+    # prompt_tokens, only the unmatched tail by chars/3. The law is unchanged:
+    # an uncached rest above X still routes LONG. Default off until the user
+    # decides (memory kein-d-direct-prefill-ueber-x); off = rc2.1l pricing.
+    SGLANG_WEG2_ENABLE_AGENT_SPAN = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     # Weight loader: read safetensors tensors with pread() instead of mmap
     # page faults (ZFS: ~0.5 GB/s per rank through mmap, ~3 GB/s through
