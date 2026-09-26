@@ -10,6 +10,7 @@ replicated state, so every rank moves the same requests at the same point.
 
 Entry points (all no-ops off group D / with nothing parked):
   park_running   -- ``POST /weg2/park_running`` (front, before D's sleep)
+  hold_late_arrival -- H91c3: a hand-off reaching D after the park is held
   hold_parked    -- the sleep leg's dormant point (weight_updater)
   park_tick      -- every pass: a park whose sleep never came re-queues
   note_retracted -- a decode-pressure retraction is a PRESSURE park
@@ -41,14 +42,30 @@ def parked_list(sched) -> list:
     return parked
 
 
-def park_running(sched, recv_req):
+#: H91c3-2: set by park_running (the park's rank-local stamp) while every NEW
+#: arrival is held behind the park; None = no park open. Closed by the sleep
+#: (hold_parked) or by the awake re-queue (park_tick).
+LATE_HOLD_ATTR = "_weg2_d_park_late_since"
+
+
+def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     """Retract every running D request RETAINING its span (KV, the node's
     GDN/Mamba anchor, the draft rows) with a forced host write-through -- the
     sleep flushes the tree and the store is the only copy that survives it
     (#969D/#1068) -- and keep it, with whatever only queued on D, in
     ``weg2_d_parked`` (the sleep asserts an idle group). The in-flight batch
     lands first, in upstream ``pause_generation``'s retract shape. Nothing is
-    aborted and nothing is told to the tokenizer: the streams stay open."""
+    aborted and nothing is told to the tokenizer: the streams stay open.
+
+    H91c3-2, ``late_hold_armed`` (the scheduler passes #1443's dormant admit):
+    a hand-off the front had already sent (``D.outstanding``) may reach this
+    scheduler only AFTER the park (tokenizer / HTTP pipe). It was admitted and
+    decoded to its end while the front's drain waited for it. From the park
+    until the sleep (or the awake re-queue) every new arrival is held behind
+    the park instead (:func:`hold_late_arrival`), and the answer says so
+    (``late_hold``) -- the front then counts its in-flight hand-offs as
+    parked. Only with the dormant hold armed: an arrival after the sleep is
+    then held too (#1443) instead of refused (W25)."""
     from sglang.srt.managers.io_struct import Weg2ParkRunningReqOutput
     from sglang.srt.mem_cache.base_prefix_cache import FORCE_HOST_WRITE_THROUGH_ATTR
 
@@ -114,18 +131,47 @@ def park_running(sched, recv_req):
     for req in sched.weg2_d_parked:
         setattr(req, d_seats.SINCE_ATTR, now)
     sched._weg2_d_park_slept = False
+    # A #1471 post-wake settle still pending releases straight into the queue
+    # (not through the intake): D would run it while the front, told
+    # late_hold, counted it parked -- promise nothing then (the front drains
+    # as before). The settle bound (20 s) lies far below the wait bound, so
+    # this is the rare case.
+    late_hold = bool(late_hold_armed) and not getattr(sched, "weg2_post_wake_settle", None)
+    setattr(sched, LATE_HOLD_ATTR, now if late_hold else None)
     rids = [str(r.rid) for r in sched.weg2_d_parked if d_seats.park_site(r) is not None]
     held = [str(r.rid) for r in sched.weg2_d_parked if d_seats.park_site(r) is None]
     logger.info(
         "WEG2-D-PARK park_running epoch=%d reason=%s: %d running retracted (span retained, "
-        "forced host write-through), parked=%s queued-behind=%s -- the sleep holds them "
-        "first, the wake resumes oldest first",
+        "forced host write-through), parked=%s queued-behind=%s late_hold=%s -- the sleep "
+        "holds them first, the wake resumes oldest first",
         epoch, reason, len(retracted), [r[:12] for r in rids], [r[:12] for r in held],
+        late_hold,
     )
     return Weg2ParkRunningReqOutput(
-        success=True, parked=rids, held=held, epoch=epoch,
+        success=True, parked=rids, held=held, epoch=epoch, late_hold=late_hold,
         message="parked %d, queued behind them %d" % (len(rids), len(held)),
     )
+
+
+def hold_late_arrival(sched, req) -> bool:
+    """H91c3-2: a NEW request (never a re-queue) that reaches D between
+    ``park_running`` and the sleep joins the park's list as held (no park
+    site, behind the parked ones) instead of the waiting queue -- the admission
+    loop never sees it, the sleep moves it into the #1443 hold with the rest,
+    an awake re-queue brings it back with the rest. Its requeue clock is the
+    park's (``awake_requeue_due`` reads the oldest). True = held; the caller
+    returns. REPLICATED: the park is a broadcast control request and the
+    intake order is the group's, so every rank holds the same arrivals."""
+    since = getattr(sched, LATE_HOLD_ATTR, None)
+    if since is None or getattr(sched, "weg2_dormant", False) or not d_seats.d_park_active():
+        return False
+    setattr(req, d_seats.SINCE_ATTR, since)
+    parked = parked_list(sched)
+    parked.append(req)
+    logger.info("WEG2-D-PARK late-hold rid=%s: arrived after park_running (a hand-off in flight "
+                "at the park), held behind the park (%d in the park list) -- the front counts it "
+                "parked", str(req.rid)[:12], len(parked))
+    return True
 
 
 def hold_parked(sched, *, hold_armed: bool) -> int:
@@ -134,6 +180,7 @@ def hold_parked(sched, *, hold_armed: bool) -> int:
     FIRST, oldest first, their storage prefetch issued by the ordinary intake
     so it runs during the flip. Hold not armed: they stay parked and the first
     awake pass re-queues them."""
+    setattr(sched, LATE_HOLD_ATTR, None)  # H91c3-2: the sleep closes the late hold
     parked = list(getattr(sched, "weg2_d_parked", None) or [])
     if not parked:
         return 0
@@ -185,6 +232,7 @@ def park_tick(sched) -> int:
     moved = list(parked)
     sched.weg2_d_parked = []
     sched._weg2_d_park_slept = False
+    setattr(sched, LATE_HOLD_ATTR, None)  # H91c3-2: the re-queue closes the late hold
     for req in moved:
         sched._add_request_to_queue(req, is_retracted=True)
     mine = _to_queue_head(sched, moved)

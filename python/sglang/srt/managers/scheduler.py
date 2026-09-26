@@ -5341,7 +5341,9 @@ class Scheduler(
         before D's sleep (d_park_runtime.park_running)."""
         from sglang.srt.weg2 import d_park_runtime
 
-        return d_park_runtime.park_running(self, recv_req)
+        return d_park_runtime.park_running(
+            self, recv_req, late_hold_armed=_weg2_dormant_admit_armed()
+        )
 
     def weg2_d_hold_parked(self) -> int:
         """H91b: the sleep leg's dormant point -- parked requests enter the
@@ -5349,6 +5351,13 @@ class Scheduler(
         from sglang.srt.weg2 import d_park_runtime
 
         return d_park_runtime.hold_parked(self, hold_armed=_weg2_dormant_admit_armed())
+
+    def _weg2_d_park_hold_late(self, req) -> bool:
+        """H91c3-2: a hand-off reaching D after park_running is held behind
+        the park (d_park_runtime.hold_late_arrival)."""
+        from sglang.srt.weg2 import d_park_runtime
+
+        return d_park_runtime.hold_late_arrival(self, req)
 
     def _weg2_d_park_tick(self) -> int:
         from sglang.srt.weg2 import d_park_runtime
@@ -6844,6 +6853,8 @@ class Scheduler(
                     logger.info("#1443 DORMANT-HOLD rid=%s tokens=%d held=%d (prefetch issued during the flip; device load at the wake -- #1455)",
                                 str(req.rid)[:12], len(req.origin_input_ids or []), len(hold))
                 return
+            if not is_retracted and self._weg2_d_park_hold_late(req):
+                return  # H91c3-2: arrived after the D park -- held behind it
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:

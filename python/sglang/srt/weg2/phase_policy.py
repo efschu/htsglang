@@ -224,3 +224,19 @@ def resolve_front_defaults(args, standard_form: bool) -> None:
                           ("p_leg1_stall_s", P_LEG1_STALL_S_DEFAULT)):
         if getattr(args, name, None) is None:
             setattr(args, name, default if standard_form else type(default)(0))
+
+
+def park_late_hold(status: int, text: str) -> bool:
+    """H91c3-2: did D's park answer promise to hold every request that reaches
+    it after the park (``"late_hold": true``)? Only then are the front's
+    hand-offs still in flight to D's scheduler (in ``D.outstanding``, in
+    neither of D's lists) parked for the front too. Anything else -- an old D,
+    a failed park, a malformed body -- is False: the drain waits for them as
+    before."""
+    if status != 200:
+        return False
+    try:
+        js = json.loads(text)
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(js, dict) and js.get("late_hold") is True

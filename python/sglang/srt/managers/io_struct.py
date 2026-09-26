@@ -1647,6 +1647,10 @@ class Weg2ParkRunningReqOutput(BaseReq, kw_only=True):
     held: List[str] = []
     epoch: int = 0
     message: str = ""
+    #: H91c3-2: every request reaching D after this park (a hand-off in
+    #: flight) is held behind it until the sleep -- the front counts its
+    #: in-flight hand-offs as parked. False = the pre-H91c3 answer.
+    late_hold: bool = False
 
 
 class PlePrefetchHintReqInput(BaseReq, kw_only=True):

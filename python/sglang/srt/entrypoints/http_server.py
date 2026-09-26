@@ -1430,6 +1430,7 @@ async def weg2_park_running(obj: Annotated[Weg2ParkRunningReqInput, Body()], req
             "success": ret.success,
             "parked": list(ret.parked),
             "held": list(ret.held),
+            "late_hold": bool(getattr(ret, "late_hold", False)),
             "epoch": ret.epoch,
             "message": ret.message,
         },
