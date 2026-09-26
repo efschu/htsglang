@@ -1371,11 +1371,17 @@ def apply_d_reshard(ns) -> None:
     from sglang.srt.weg2 import d_reshard as _dr
 
     policy = str(getattr(ns, "d_reshard", D_RESHARD_DEFAULT) or D_RESHARD_DEFAULT)
-    if policy not in _dr.POLICIES:
-        raise SystemExit(f"--d-reshard {policy!r}: one of {list(_dr.POLICIES)}")
+    if policy not in _dr.POLICIES + (_dr.POLICY_WAKE_SEG,):
+        raise SystemExit(f"--d-reshard {policy!r}: one of {list(_dr.POLICIES) + [_dr.POLICY_WAKE_SEG]}")
     _D_RESHARD.update(policy=policy, spec=None, lines=())
     if policy == _dr.POLICY_OFF:
         return
+    # 'wake-seg' (SB 26.09.): 'wake' whose preset minimises the SEGMENT round
+    # (sum over layer segments of the slowest rank, d_reshard sec. "Segment
+    # model"), not the per-rank sums -- rc9meas refuted the sum objective.
+    objective = _dr.OBJECTIVE_SUM
+    if policy == _dr.POLICY_WAKE_SEG:
+        policy, objective = _dr.POLICY_WAKE, _dr.OBJECTIVE_SEGMENT
     model = str(getattr(ns, "model", "") or "")
     try:
         with open(model_config_path(model)) as f:
@@ -1391,17 +1397,32 @@ def apply_d_reshard(ns) -> None:
         raise SystemExit(f"--d-reshard {policy}: REFUSED -- no D cost model for checkpoint format "
                          f"{checkpoint_quant_method(model)!r} (calibrated: INT8 compressed-tensors, "
                          f"NVFP4 modelopt; DYN_D_RESHARD.md sec. 1)")
+    raw_presets = str(getattr(ns, "d_reshard_presets", "auto") or "auto").strip()
+    seg_points, seg_place, seg_shares = (), "capacity", None
     try:
-        presets = _dr.parse_presets(str(getattr(ns, "d_reshard_presets", "auto") or "auto"), fmt)
+        if objective == _dr.OBJECTIVE_SEGMENT:
+            seg_points = _dr.seg_ladder(d_reshard_depth(getattr(ns, "d_reshard_depth", "robust")))
+            seg_place, seg_shares = _d_reshard_seg_placement(ns)
+        if objective == _dr.OBJECTIVE_SEGMENT and raw_presets == "auto":
+            vec, _worst, _reg = _dr.seg_choose(fmt, seg_points, _dr.rc9_geometry(fmt).mlp_units,
+                                               seg_place, seg_shares)
+            presets = (_dr.Preset("seg", tuple(vec)),)
+        else:
+            presets = _dr.parse_presets(raw_presets, fmt)
         spec = _dr.ReshardSpec(policy, tuple(_dr.RC9_BASE), presets, presets[0].name,
-                               float(getattr(ns, "d_reshard_min_gain", _dr.DEFAULT_MIN_GAIN)), fmt)
+                               float(getattr(ns, "d_reshard_min_gain", _dr.DEFAULT_MIN_GAIN)), fmt,
+                               objective)
         spec.validate(_dr.rc9_geometry(fmt))
-    except _dr.ReshardError as exc:
+    except (_dr.ReshardError, ValueError) as exc:
         raise SystemExit(f"--d-reshard {policy}: {exc}")
     loads = [_dr.LoadClass(k, b, c) for k, b, c in D_RESHARD_DRY_RUN_LOADS]
     lines = ["WEG2 " + _dr.armed_line(spec, "group=D")]
-    lines += ["WEG2 " + x + " (HOCHRECHNUNG on the model, not a measurement)"
-              for x in _dr.plan_lines(spec, fmt, loads)]
+    if objective == _dr.OBJECTIVE_SEGMENT:
+        lines += ["WEG2 " + x + " (HOCHRECHNUNG on the segment model, not a measurement)"
+                  for x in _dr.seg_plan_lines(fmt, spec.presets[0].mlp, seg_points, seg_place, seg_shares)]
+    else:
+        lines += ["WEG2 " + x + " (HOCHRECHNUNG on the model, not a measurement)"
+                  for x in _dr.plan_lines(spec, fmt, loads)]
     if policy == _dr.POLICY_LIVE:
         raise SystemExit("\n".join(lines) + "\n--d-reshard live: REFUSED -- a live switch moves the "
                          "MLP units over BAR1 (~0.2-0.3 s each way) for at most 33 ms (INT8) / 111 ms "
@@ -1412,6 +1433,27 @@ def apply_d_reshard(ns) -> None:
                          "needs the rank-side executor (per-preset MLP views, graph sets, manifest "
                          "rows, spread posten), which is not wired (DYN_D_RESHARD.md sec. 7).")
     _D_RESHARD.update(spec=spec, lines=tuple(lines))
+
+
+def d_reshard_depth(raw) -> Optional[int]:
+    """--d-reshard-depth: 'robust' -> None (the measured ladder 10k..240k, bs1/bs2),
+    else the expected per-request depth in tokens ('131072', '128k')."""
+    r = str(raw or "robust").strip().lower()
+    if r == "robust":
+        return None
+    mult = 1024 if r.endswith("k") else 1
+    n = int(float(r[:-1] if r.endswith("k") else r) * mult)
+    if n <= 0:
+        raise ValueError(f"--d-reshard-depth {raw!r}: expected 'robust' or a positive token count")
+    return n
+
+
+def _d_reshard_seg_placement(ns) -> Tuple[str, Optional[Tuple[float, ...]]]:
+    """The token placement the segment objective prices (the one this boot runs)."""
+    if str(getattr(ns, "d_token_placement", "capacity") or "capacity") != "bandwidth":
+        return "capacity", None
+    raw = str(getattr(ns, "d_token_shares", "auto") or "auto")
+    return "bandwidth", (None if raw == "auto" else tuple(float(x) for x in raw.split(",")))
 
 
 def d_reshard_lines() -> Tuple[str, ...]:
@@ -1442,7 +1484,25 @@ def d_reshard_env() -> Dict[str, str]:
     spec = _D_RESHARD.get("spec")
     if spec is None:
         return {}
-    return {_dr.POLICY_ENV: spec.policy, _dr.SPEC_ENV: spec.to_json()}
+    env = {_dr.POLICY_ENV: spec.policy, _dr.SPEC_ENV: spec.to_json()}
+    if spec.objective != _dr.OBJECTIVE_SUM:
+        env[_dr.OBJECTIVE_ENV] = spec.objective  # the D-SPEED table on group D follows it
+    return env
+
+
+#: --d-gc-freeze (SB 26.09., agent FR: three single-rank D-round stalls of ~0.5 s,
+#: candidate a Python gen-2 collection).  'on' = group D's schedulers call
+#: gc.freeze() once every runner is up (after the CUDA-graph capture), so the
+#: boot-time objects leave the collector's generations.  'off' (default) = no env.
+D_GC_FREEZE_DEFAULT = "off"
+
+
+def d_gc_env(ns) -> Dict[str, str]:
+    from sglang.srt.weg2 import gc_instrument as _gci
+
+    if str(getattr(ns, "d_gc_freeze", D_GC_FREEZE_DEFAULT) or D_GC_FREEZE_DEFAULT) != "on":
+        return {}
+    return {_gci.FREEZE_ENV: "1"}
 
 
 #: --d-token-placement (27B, user 26.09. ~09:40Z/09:45Z: "es muss dynamisch
@@ -12475,14 +12535,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only with --d-token-placement bandwidth: fall to capacity placement once the "
              "bandwidth target would fill a rank's class beyond this fraction (default 0.85).")
     ap.add_argument(
-        "--d-reshard", choices=["off", "wake", "live"], default=D_RESHARD_DEFAULT,
+        "--d-reshard", choices=["off", "wake", "wake-seg", "live"], default=D_RESHARD_DEFAULT,
         help="Group D weight shards per load class (27B TP>1 uneven TP + uneven DCP only; "
              "weg2/d_reshard.py, DYN_D_RESHARD.md). 'off' (default) = today, argv and env "
              "byte-identical. 'wake' = the MLP family vector is chosen from "
              "--d-reshard-presets at each P->D wake; with ONE preset that is the static "
              "--rank-mlp-ratio on group D (bootable), with more the boot is refused until the "
-             "executor is wired. 'live' = refused (switch costs more than it gains). Refused "
-             "for the NF profile (Form A has no shard vector).")
+             "executor is wired. 'wake-seg' = 'wake' whose 'auto' preset minimises the SEGMENT "
+             "round (sum over layer segments of the slowest rank + floor, calibrated on "
+             "rc9meas 26.09.) instead of the per-rank sums, over --d-reshard-depth; group D's "
+             "D-SPEED table follows (SGLANG_WEG2_DRESHARD_OBJECTIVE=segment). 'live' = refused "
+             "(switch costs more than it gains). Refused for the NF profile (Form A has no "
+             "shard vector).")
+    ap.add_argument(
+        "--d-reshard-depth", default="robust", metavar="TOKENS",
+        help="Only with --d-reshard wake-seg and presets 'auto': 'robust' (default) = the one "
+             "vector with the smallest worst loss against the per-point optimum over the "
+             "measured ladder (bs1/bs2 x 10k/32k/128k/240k); a token count ('131072', '128k') "
+             "= the best vector for that expected depth (bs1/bs2).")
+    ap.add_argument(
+        "--d-gc-freeze", choices=["off", "on"], default=D_GC_FREEZE_DEFAULT,
+        help="Group D: 'on' = every D scheduler calls gc.freeze() once after boot (all CUDA "
+             "graphs captured), so gen-2 collections no longer walk the boot objects (agent FR "
+             "26.09.: ~0.5 s single-rank D-round stalls). 'off' (default) = no env.")
     ap.add_argument(
         "--d-reshard-presets", default="auto", metavar="SPEC",
         help="Only with --d-reshard wake: 'auto' (= dec), desk names 'dec,pf,rc9', or "
@@ -15172,6 +15247,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
         env_d.update(store_short_tail_env(x_tokens, x_d_riegel))  # RC7-X
         env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
+        env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
         env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
         spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
@@ -15275,6 +15351,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
     env_d.update(store_short_tail_env(x_tokens, x_d_riegel))  # RC7-X
     env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
+    env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
     env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
     spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)

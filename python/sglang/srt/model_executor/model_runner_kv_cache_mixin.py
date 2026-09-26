@@ -501,7 +501,9 @@ def _dcp_speed_advisory(runner) -> bool:
             "(base plan %r, mlp plan %r, mlp units %d).", base, mlp_vec, units_total,
         )
         return True
-    lines = _dr.speed_advisory_lines(
+    advisory = (_dr.seg_speed_advisory_lines if _dr.objective_from_env() == _dr.OBJECTIVE_SEGMENT
+                else _dr.speed_advisory_lines)  # SB 26.09.: default objective unchanged
+    lines = advisory(
         _dr.config_dict(runner.model_config.hf_text_config),
         _dr.quant_method_of(runner.model_config.hf_config, getattr(sa, "quantization", None)),
         list(base),
