@@ -223,10 +223,29 @@ def unregister_ple_prefetch_consumer() -> None:
         _HINT = None
 
 
+#: H125: the token PLE sees at image positions (``image_token_id``), set by
+#: the model when its group tokenizes images; None = ids pass untouched (every
+#: boot without image tokenization).
+_MM_PAD_TOKEN: Optional[int] = None
+
+
+def set_mm_pad_token(token_id: Optional[int]) -> None:
+    global _MM_PAD_TOKEN
+    _MM_PAD_TOKEN = None if token_id is None else int(token_id)
+
+
 def _as_int64(seq) -> torch.Tensor:
     if isinstance(seq, array) and seq.typecode == "q" and len(seq):
-        return torch.frombuffer(seq, dtype=torch.int64).clone()
-    return torch.tensor(list(seq), dtype=torch.int64)
+        out = torch.frombuffer(seq, dtype=torch.int64).clone()
+    else:
+        out = torch.tensor(list(seq), dtype=torch.int64)
+    if _MM_PAD_TOKEN is not None and out.numel():
+        # H125: the host mirror predicts the rows the forward will read, so
+        # it maps image pad ids exactly as ple_ids_for_images does.
+        from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+
+        out = torch.where(out >= MM_PAD_SHIFT_VALUE, out.new_tensor(_MM_PAD_TOKEN), out)
+    return out
 
 
 def publish_ple_next_chunk(reqs: Sequence, chunk_size: Optional[int]) -> Optional[PleChunkHint]:
