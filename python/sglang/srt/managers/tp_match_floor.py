@@ -75,6 +75,7 @@ drive the real verdict with mock collectives instead of grepping for it.
 from __future__ import annotations
 
 import logging
+from array import array
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
@@ -208,6 +209,141 @@ def decode_group_usable(
         value = int(value)
         if value > ABSENT:
             out[str(rid)] = value
+    return out
+
+
+# --------------------------------------------------------------------------
+# H97: the MAX arm and the realizability round (rc9m, dkrnfbar1rc9m09260642)
+# --------------------------------------------------------------------------
+#
+# rc9m, rid weg2-18-15: TP0 voted 18112 (host anchor there), TP1/TP2 15552;
+# group MIN 15552. H96 cut TP0's key to 15552 -- and TP0 holds NO recurrent
+# anchor at 15552 (its host-row release policy differs from TP1/TP2's, so the
+# ranks' anchors sit at DIFFERENT depths, not in a superset): capped_match=0,
+# H96 CAP-MISS, D dead. The MIN of each rank's own deepest usable depth is
+# not a depth every rank can USE. So the group now also learns the MAX (a
+# negated arm on the same reduce) and, only for rids where MIN < MAX -- the
+# skew every rank sees identically, so every rank takes the same path -- runs
+# ONE more small MIN over "I can realize exactly the group depth" (a
+# side-effect-free match on the key cut to that depth: length == depth and a
+# usable anchor there). A 0 anywhere plants group usable 0 for that rid: every
+# rank re-prefills from 0 (slower, never wrong) instead of one rank dying.
+
+#: MIN-neutral value of the MAX arm for a rid this rank does not hold (the
+#: MIN arm already abstains for it; every present vote is <= 0).
+MAX_ARM_NEUTRAL = 1
+
+
+def build_usable_max_payload(
+    canonical: Sequence[str], local_usable: Mapping[str, int], slots: int
+) -> List[int]:
+    """The negated usable vote, so the same MIN reduce yields the group MAX."""
+    payload = [MAX_ARM_NEUTRAL] * slots
+    for i, rid in enumerate(list(canonical)[:slots]):
+        if rid in local_usable:
+            payload[i] = -int(local_usable[rid])
+    return payload
+
+
+def decode_group_max(canonical: Sequence[str], reduced: Sequence[int]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for rid, value in zip(list(canonical), list(reduced)):
+        value = int(value)
+        if value <= 0:
+            out[str(rid)] = -value
+    return out
+
+
+def skewed_rids(
+    group_usable: Mapping[str, int], group_max: Mapping[str, int]
+) -> Dict[str, int]:
+    """rid -> group depth for every rid with 0 < MIN < MAX. Identical on every
+    rank (both inputs come from the same reduce)."""
+    out: Dict[str, int] = {}
+    for rid, g in group_usable.items():
+        g = int(g)
+        if g > 0 and int(group_max.get(rid, g)) > g:
+            out[rid] = g
+    return out
+
+
+def can_realize(tree_cache: Any, req: Any, depth: int) -> bool:
+    """Can THIS rank admit exactly ``depth`` tokens of ``req``'s prefix?
+
+    Side-effect free on the request (no ``match_prefix_for_req``: it writes
+    the req's match fields): a plain ``match_prefix`` on the key cut to
+    ``depth`` (bigram-aware -- ``depth`` bigrams span ``depth + 1`` tokens),
+    ``cow_mamba=False`` so no COW and no #928 refusal side effects. Never
+    raises: an unpriceable rank votes 0 (the safe direction)."""
+    try:
+        from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        token_ids = list(req.origin_input_ids) + list(req.output_ids)
+        span = int(depth) + (1 if getattr(tree_cache, "is_eagle", False) else 0)
+        if span > len(token_ids):
+            return False
+        result = tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids=array("q", token_ids[:span]),
+                    extra_key=getattr(req, "extra_key", None),
+                ),
+                cow_mamba=False,
+                req=None,
+            )
+        )
+        if _local_match_len(result) != int(depth):
+            return False
+        return not anchor_unusable(tree_cache, getattr(result, "best_match_node", None))
+    except Exception:  # noqa: BLE001 - a vote may never break the reduce
+        return False
+
+
+def build_realize_payload(
+    canonical: Sequence[str],
+    skewed: Mapping[str, int],
+    local_usable: Mapping[str, int],
+    tree_cache: Any,
+    by_rid: Mapping[str, Any],
+    slots: int,
+) -> List[int]:
+    """1 = this rank can admit the group depth (or has no stake), 0 = it cannot."""
+    payload = [1] * slots
+    for i, rid in enumerate(list(canonical)[:slots]):
+        if rid not in skewed:
+            continue
+        g = int(skewed[rid])
+        if int(local_usable.get(rid, -1)) == g:
+            continue  # this rank's own usable match IS the group depth
+        req = by_rid.get(rid)
+        payload[i] = 1 if (req is not None and can_realize(tree_cache, req, g)) else 0
+    return payload
+
+
+def apply_realize_verdict(
+    group_usable: Dict[str, int],
+    canonical: Sequence[str],
+    skewed: Mapping[str, int],
+    reduced: Sequence[int],
+) -> Dict[str, int]:
+    """Plant 0 for every skewed rid some rank cannot realize."""
+    out = dict(group_usable)
+    for rid, flag in zip(list(canonical), list(reduced)):
+        if rid in skewed and int(flag) <= 0:
+            out[rid] = 0
+            _STATS["skew_zeroed"] = _STATS.get("skew_zeroed", 0) + 1
+            n = _STATS["skew_zeroed"]
+            if n <= 20 or n % 256 == 0:
+                logger.warning(
+                    "RU FLOOR SKEW-ZERO rid=%s group_min=%d (n=%d): some TP rank "
+                    "cannot admit the group depth (no usable anchor there), so the "
+                    "group re-prefills this rid from 0 on every rank (H97, rc9m "
+                    "weg2-18-15 died on H96 CAP-MISS instead).",
+                    str(rid)[:16],
+                    int(skewed[rid]),
+                    n,
+                )
     return out
 
 
