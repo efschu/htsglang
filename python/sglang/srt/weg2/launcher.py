@@ -1438,6 +1438,160 @@ def p_layer_split_env() -> Dict[str, str]:
     return {_pls.POLICY_ENV: _pls.POLICY_DYNAMIC, _pls.SPEC_ENV: spec.to_json()}
 
 
+#: --d-reshard (27B, user order 26.09. ~08:40Z/08:45Z: dynamic D resharding per
+#: load class, "nur auf TP1<, nicht fuers nf"). Rule and model live in
+#: weg2/d_reshard.py (pure); design/evidence /spinning/gpu-arb/docs/DYN_D_RESHARD.md.
+#: 'off' (default) changes NOTHING: no env, no line, D argv byte-identical.
+#: 'wake' with ONE preset is the static MLP family vector (--rank-mlp-ratio on
+#: group D; the flip plan reads the loaders' own widths, xchg_manifest.family_ratios)
+#: and needs no executor. 'wake' with >= 2 presets and 'live' print the spec and
+#: the desk plan, then REFUSE: the rank-side executor (per-preset MLP views, graph
+#: sets, per-preset manifest rows, the planner's spread posten) is not wired.
+#: Any profile other than qwen27b (NF Form A) is refused, never ignored.
+D_RESHARD_DEFAULT = "off"
+D_RESHARD_DRY_RUN_LOADS = (("decode", 1, 32768), ("decode", 4, 32768), ("decode", 1, 131072),
+                           ("prefill", 1, 4096))
+_D_RESHARD: Dict[str, object] = {"policy": D_RESHARD_DEFAULT, "spec": None, "lines": ()}
+
+
+def d_reshard_format(model_path: str) -> str:
+    """'int8' | 'nvfp4' | '' -- the checkpoint formats the D model is calibrated for."""
+    qm = checkpoint_quant_method(str(model_path))
+    if qm == "compressed-tensors":
+        return "int8"
+    if qm == "modelopt":
+        return "nvfp4"
+    return ""
+
+
+def apply_d_reshard(ns) -> None:
+    """Install --d-reshard once, before any argv is built."""
+    from sglang.srt.weg2 import d_reshard as _dr
+
+    policy = str(getattr(ns, "d_reshard", D_RESHARD_DEFAULT) or D_RESHARD_DEFAULT)
+    if policy not in _dr.POLICIES:
+        raise SystemExit(f"--d-reshard {policy!r}: one of {list(_dr.POLICIES)}")
+    _D_RESHARD.update(policy=policy, spec=None, lines=())
+    if policy == _dr.POLICY_OFF:
+        return
+    model = str(getattr(ns, "model", "") or "")
+    try:
+        with open(model_config_path(model)) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"--d-reshard {policy}: cannot read the model config of {model!r}: {exc}")
+    try:
+        _dr.check_profile(_dr.profile_of_config(cfg), policy)
+    except _dr.ReshardProfileRefused as exc:
+        raise SystemExit(str(exc))
+    fmt = d_reshard_format(model)
+    if fmt not in ("int8", "nvfp4"):
+        raise SystemExit(f"--d-reshard {policy}: REFUSED -- no D cost model for checkpoint format "
+                         f"{checkpoint_quant_method(model)!r} (calibrated: INT8 compressed-tensors, "
+                         f"NVFP4 modelopt; DYN_D_RESHARD.md sec. 1)")
+    try:
+        presets = _dr.parse_presets(str(getattr(ns, "d_reshard_presets", "auto") or "auto"), fmt)
+        spec = _dr.ReshardSpec(policy, tuple(_dr.RC9_BASE), presets, presets[0].name,
+                               float(getattr(ns, "d_reshard_min_gain", _dr.DEFAULT_MIN_GAIN)), fmt)
+        spec.validate(_dr.rc9_geometry(fmt))
+    except _dr.ReshardError as exc:
+        raise SystemExit(f"--d-reshard {policy}: {exc}")
+    loads = [_dr.LoadClass(k, b, c) for k, b, c in D_RESHARD_DRY_RUN_LOADS]
+    lines = ["WEG2 " + _dr.armed_line(spec, "group=D")]
+    lines += ["WEG2 " + x + " (HOCHRECHNUNG on the model, not a measurement)"
+              for x in _dr.plan_lines(spec, fmt, loads)]
+    if policy == _dr.POLICY_LIVE:
+        raise SystemExit("\n".join(lines) + "\n--d-reshard live: REFUSED -- a live switch moves the "
+                         "MLP units over BAR1 (~0.2-0.3 s each way) for at most 33 ms (INT8) / 111 ms "
+                         "(NVFP4) per 4096-token D-prefill chunk, and D prefills at most 3 chunks under "
+                         "the X ceiling (DYN_D_RESHARD.md sec. 2.4).")
+    if len(spec.presets) > 1:
+        raise SystemExit("\n".join(lines) + "\n--d-reshard wake: REFUSED -- more than one preset "
+                         "needs the rank-side executor (per-preset MLP views, graph sets, manifest "
+                         "rows, spread posten), which is not wired (DYN_D_RESHARD.md sec. 7).")
+    _D_RESHARD.update(spec=spec, lines=tuple(lines))
+
+
+def d_reshard_lines() -> Tuple[str, ...]:
+    return tuple(_D_RESHARD.get("lines") or ())
+
+
+def d_reshard_argv(d_ratio_flags: Sequence[str], extra_d: Sequence[str]) -> List[str]:
+    """Group D's extra argv: [] under 'off'; under a single-preset 'wake' the MLP
+    family vector. Refuses a base vector the presets were not built for, and a
+    hand-written --rank-mlp-ratio next to it (two authors of one vector)."""
+    spec = _D_RESHARD.get("spec")
+    if spec is None:
+        return []
+    flags = list(d_ratio_flags)
+    base = ",".join(str(x) for x in spec.base)
+    if "--rank-tp-ratio" not in flags or flags[flags.index("--rank-tp-ratio") + 1] != base:
+        raise SystemExit(f"--d-reshard {spec.policy}: REFUSED -- group D's weight vector is "
+                         f"{flags} but the presets are built on --rank-tp-ratio {base}")
+    if any(str(a).startswith("--rank-mlp-ratio") for a in extra_d):
+        raise SystemExit("--d-reshard: REFUSED -- --extra-d already carries --rank-mlp-ratio")
+    return ["--rank-mlp-ratio", ",".join(str(u) for u in spec.presets[0].mlp)]
+
+
+def d_reshard_env() -> Dict[str, str]:
+    """Group D's environment for the reshard; {} under 'off'."""
+    from sglang.srt.weg2 import d_reshard as _dr
+
+    spec = _D_RESHARD.get("spec")
+    if spec is None:
+        return {}
+    return {_dr.POLICY_ENV: spec.policy, _dr.SPEC_ENV: spec.to_json()}
+
+
+#: --d-token-placement (27B, user 26.09. ~09:40Z/09:45Z: "es muss dynamisch
+#: sein ... den kv so zu verteilen wie er optimal schnell ist zur jeweiligen
+#: fuelle"). weg2/d_token_placement.py: NEW D tokens pick the card through the
+#: allocator's slot id (weighted owner rule), by effective bandwidth while the
+#: pool has room, by capacity when it is tight; stored KV never moves.
+#: 'capacity' (default) = today: no env, argv byte-identical.
+D_TOKEN_PLACEMENT_DEFAULT = "capacity"
+_D_TOKEN_PLACEMENT: Dict[str, object] = {"spec": None}
+
+
+def apply_d_token_placement(ns) -> None:
+    from sglang.srt.weg2 import d_reshard as _dr
+    from sglang.srt.weg2 import d_token_placement as _dtp
+
+    policy = str(getattr(ns, "d_token_placement", D_TOKEN_PLACEMENT_DEFAULT) or D_TOKEN_PLACEMENT_DEFAULT)
+    _D_TOKEN_PLACEMENT["spec"] = None
+    if policy not in _dtp.POLICIES:
+        raise SystemExit(f"--d-token-placement {policy!r}: one of {list(_dtp.POLICIES)}")
+    if policy == _dtp.POLICY_CAPACITY:
+        return
+    model = str(getattr(ns, "model", "") or "")
+    try:
+        with open(model_config_path(model)) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"--d-token-placement {policy}: cannot read the model config of {model!r}: {exc}")
+    try:
+        _dr.check_profile(_dr.profile_of_config(cfg), "live")
+    except _dr.ReshardProfileRefused as exc:
+        raise SystemExit(str(exc).replace("--d-reshard live", f"--d-token-placement {policy}"))
+    raw = str(getattr(ns, "d_token_shares", "auto") or "auto")
+    try:
+        shares = _dtp.RC9_EFF_BW_GBS if raw == "auto" else tuple(float(x) for x in raw.split(","))
+        spec = _dtp.PlacementSpec(policy, tuple(shares),
+                                  float(getattr(ns, "d_token_fill_switch", _dtp.DEFAULT_FILL_SWITCH)))
+        spec.validate()
+    except (ValueError, _dtp.PlacementError) as exc:
+        raise SystemExit(f"--d-token-placement {policy}: {exc}")
+    _D_TOKEN_PLACEMENT["spec"] = spec
+
+
+def d_token_placement_env() -> Dict[str, str]:
+    """Group D's env for the token placement; {} under 'capacity'."""
+    from sglang.srt.weg2 import d_token_placement as _dtp
+
+    spec = _D_TOKEN_PLACEMENT.get("spec")
+    return {} if spec is None else {_dtp.ENV: spec.to_json()}
+
+
 def spec_form_is_dflash() -> bool:
     return str(_SPEC_FORM["form"]) == "DFLASH"
 
@@ -12403,6 +12557,40 @@ def build_parser() -> argparse.ArgumentParser:
              "measures every width on every prompt length (graph calibration ladder). "
              "Overrides --p-chunk-dynamic-min-tokens. Empty (default) = off.")
     ap.add_argument(
+        "--d-token-placement", choices=["capacity", "bandwidth"], default=D_TOKEN_PLACEMENT_DEFAULT,
+        help="Group D: where NEW KV tokens land (27B uneven DCP only; weg2/d_token_placement.py, "
+             "DYN_D_RESHARD.md sec. 13). 'capacity' (default) = today, env byte-identical. "
+             "'bandwidth' = the allocator interleaves its free slot ids so new tokens go to the "
+             "ranks by effective bandwidth while the pool has room, by free capacity once a "
+             "rank's class would pass --d-token-fill-switch; stored KV never moves. Refused "
+             "for the NF profile.")
+    ap.add_argument(
+        "--d-token-shares", default="auto", metavar="W",
+        help="Only with --d-token-placement bandwidth: per-rank weights (rank order), "
+             "'auto' = the d_reshard fit 937,604,604 GB/s (5090 first).")
+    ap.add_argument(
+        "--d-token-fill-switch", type=float, default=0.85, metavar="FRACTION",
+        help="Only with --d-token-placement bandwidth: fall to capacity placement once the "
+             "bandwidth target would fill a rank's class beyond this fraction (default 0.85).")
+    ap.add_argument(
+        "--d-reshard", choices=["off", "wake", "live"], default=D_RESHARD_DEFAULT,
+        help="Group D weight shards per load class (27B TP>1 uneven TP + uneven DCP only; "
+             "weg2/d_reshard.py, DYN_D_RESHARD.md). 'off' (default) = today, argv and env "
+             "byte-identical. 'wake' = the MLP family vector is chosen from "
+             "--d-reshard-presets at each P->D wake; with ONE preset that is the static "
+             "--rank-mlp-ratio on group D (bootable), with more the boot is refused until the "
+             "executor is wired. 'live' = refused (switch costs more than it gains). Refused "
+             "for the NF profile (Form A has no shard vector).")
+    ap.add_argument(
+        "--d-reshard-presets", default="auto", metavar="SPEC",
+        help="Only with --d-reshard wake: 'auto' (= dec), desk names 'dec,pf,rc9', or "
+             "explicit MLP unit vectors 'name=u0:u1:u2;name2=...' (sum = the MLP units, "
+             "1088 INT8 / 136 NVFP4). The first preset is the boot preset.")
+    ap.add_argument(
+        "--d-reshard-min-gain", type=float, default=0.02, metavar="FRACTION",
+        help="Only with --d-reshard wake: a different preset is taken at a wake only when "
+             "predicted at least this much faster than the one in force (default 0.02).")
+    ap.add_argument(
         "--p-chunk-policy", choices=["fixed", "dynamic"], default=P_CHUNK_POLICY_DEFAULT,
         help="Group P prefill chunk width (27B and NF line, weg2/p_chunk_policy.py). "
              "'fixed' (the default for this release candidate) = today: every forward "
@@ -13669,6 +13857,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     apply_p_chunk_policy(ns)
     # --p-layer-split: after the chunk policy (the joint plan reads its limits).
     apply_p_layer_split(ns)
+    # --d-reshard: before any argv; 'off' installs nothing.
+    apply_d_reshard(ns)
+    apply_d_token_placement(ns)
     # 27B line G2: the one tokenizer both groups load, installed before any
     # argv is built; its line is logged with the checkpoint lines under 1a'.
     tokenizer_line = apply_tokenizer_path(ns)
@@ -14308,6 +14499,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # --p-chunk-policy: [] under 'fixed' (front log byte-identical).
     for _pcl in p_chunk_policy_lines():
         log(_pcl)
+    # --d-reshard: () under 'off' (front log byte-identical).
+    for _drl in d_reshard_lines():
+        log(_drl)
     if not hicache_disabled:
         log(hicache_draft_tier_line())
     # --d-replayssm-spec (27B ReplaySSM S6): D's verify form, both states named.
@@ -15113,7 +15307,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
         env_d.update(store_short_tail_env(x_tokens, x_d_riegel))  # RC7-X
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
+        env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
+        env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -15214,7 +15410,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
     env_d.update(store_short_tail_env(x_tokens, x_d_riegel))  # RC7-X
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
+    env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
+    env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid

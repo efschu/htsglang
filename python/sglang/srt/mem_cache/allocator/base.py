@@ -58,6 +58,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         #: #656 item 16: the DCP owner class new allocations should prefer,
         #: or None. Set through :meth:`set_owner_bias` only.
         self._owner_bias = None
+        #: --d-token-placement (weg2/d_token_placement.py): a weighted owner
+        #: placement, or None. Set through :meth:`set_owner_placement` only.
+        self._owner_placement = None
 
     # -- #657 item 16, the REBALANCE tier: steering, not moving ------------
     #
@@ -154,6 +157,49 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.free_pages = torch.cat((pages[m], pages[~m]))
         return n
 
+    # -- --d-token-placement: the WEIGHTED owner placement (26.09.) ----------
+    #
+    # The weighted generalisation of the bias above: instead of promoting ONE
+    # class, the free list is interleaved so the next ids come from every
+    # rank's class in proportion to weights the placement derives from the
+    # class fill (bandwidth while there is room, capacity when it is tight).
+    # Same guarantees: it places, it never moves or frees; the order is a pure
+    # function of the replicated free list, so every rank agrees. The two
+    # steers are exclusive (one author of one order).
+
+    def set_owner_placement(self, placement) -> None:
+        if placement is not None and self._owner_bias is not None:
+            raise ValueError("owner placement refuses next to an owner bias")
+        if placement is not None and self.page_size != 1:
+            raise ValueError("owner placement requires page_size == 1")
+        self._owner_placement = placement
+        self._apply_owner_placement()
+
+    def _apply_owner_placement(self) -> str:
+        placement = getattr(self, "_owner_placement", None)
+        if placement is None or not self.is_not_in_free_group:
+            return ""
+        if self.release_pages is not None and len(self.release_pages) > 0:
+            self._merge_and_sort_free_unbiased()
+        if self.free_pages is None:
+            return ""
+        self.free_pages, line = placement.apply(self.free_pages, self.size)
+        if line:
+            logger.info(line)
+        return line
+
+    def _owner_placement_tick(self) -> None:
+        """Alloc-path hook: re-interleave when frees washed the head and the
+        placement's call budget is due. Counters are replicated state."""
+        placement = getattr(self, "_owner_placement", None)
+        if placement is not None and placement.due():
+            self._apply_owner_placement()
+
+    def _owner_placement_touch(self) -> None:
+        placement = getattr(self, "_owner_placement", None)
+        if placement is not None:
+            placement.touched = True
+
     def _merge_and_sort_free_unbiased(self):
         if len(self.release_pages) > 0:
             self.free_pages = torch.cat((self.free_pages, self.release_pages))
@@ -176,6 +222,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             on_free(free_index)
 
     def _notify_clear(self) -> None:
+        # a cleared list (cutover, resize) is re-interleaved at once: the
+        # re-entry right after a flip allocates whole prefixes in few calls
+        if getattr(self, "_owner_placement", None) is not None:
+            self._owner_placement_touch()
+            self._apply_owner_placement()
         for _on_free, on_clear in getattr(self, "_free_listeners", ()):
             if on_clear is not None:
                 on_clear()
@@ -339,6 +390,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         # refill instead of only until the first one.
         if getattr(self, "_owner_bias", None) is not None:
             self._apply_owner_bias()
+        elif getattr(self, "_owner_placement", None) is not None:
+            self._apply_owner_placement()
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         # FIXME: reuse the get_cpu_copy after paged allocator is implemented
