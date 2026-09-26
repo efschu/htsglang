@@ -302,6 +302,93 @@ def mamba_retention_pin_budget(
     return max(0, int(mamba_pool_size) - floor)
 
 
+class Weg2PMambaRetentionZero(RuntimeError):
+    """H113: group P of a weg2 boot with a mamba retention pin budget of 0.
+
+    On group P the host backups of the mamba checkpoints are not cache, they
+    ARE the hand-off: D reads the KV pages and the recurrent anchors P
+    published through the host tier (arena/store). A budget of 0 declines
+    every mamba write-through pin (``_mamba_write_through_pin_admissible``
+    compares ``pins_held < 0``), the first chunk-end node carrying a mamba
+    value is refused (``#1421 BACKUP-REFUSED why=mamba_pin``) and every
+    descendant after it is refused as ``parent_unbacked`` -- so P publishes
+    only the anchor-less pieces before the first checkpoint and nothing else,
+    on every request, for the whole life of the boot. Measured on
+    fnFL2h91bb2 (e17bd548b5, 2026-09-26): ``MAMBA-FLOOR pool=32 floor=32
+    retention_budget=0 (8 running requests x 4)``, the 97k needle reached the
+    arena with 192 of 1528 pages (the three KV-only pieces of chunk 1), D's
+    ``#1439 ARENA-PRESENT leading_complete=192``, ``#1028B FETCH CAP mamba
+    (0,-1)``, ``#1035c ZERO-ANSWER cause=CAPPED by=mamba`` and ``#1471 SETTLE
+    read still short``. That read can never complete -- the bytes were never
+    written -- so the settle wait is not latency, it ends in a short release
+    and a second prefill that is refused the same way. Boots xsn127-134 were
+    the same class at budget 1.
+
+    Refused at tree construction, where the budget is the EXACT number the
+    admission check later compares against (``_mamba_pin_budget``): no
+    second derivation of the per-request slot count exists anywhere.
+    """
+
+
+def weg2_p_mamba_retention_refusal(
+    server_args: "ServerArgs",
+    max_running_requests: int,
+    mamba_pool_size: int,
+    pin_budget: int,
+    group: str,
+) -> "str | None":
+    """H113: the refusal text when group P would run with pin budget 0, else None.
+
+    Only group P (``SGLANG_WEG2_GROUP=P``) with a hierarchical cache: there
+    the budget is a LIVENESS term of the flip, not a cache-size preference.
+    Group D and a non-weg2 boot keep the #773 posture (budget 0 is stated,
+    not refused). A negative budget means "no mamba pool" and is never
+    refused.
+
+    WHAT THE 4 SLOTS PER SEAT ARE on today's P form
+    (``--hicache-write-policy write_back --disable-overlap-schedule
+    --mamba-slot-reorder``), each one a concrete allocation site:
+
+    * 1 active state slot (``req.mamba_pool_idx``);
+    * 1 ping-pong track buffer (extra buffer, overlap schedule off -> 1);
+    * 1 donation slot (allocated before the tracked one is donated);
+    * 1 pinned resume checkpoint (``inc_lock_ref(new_last_node)``).
+
+    ``--mamba-slot-reorder`` does NOT merge the last two on P:
+    :func:`mamba_slot_reorder_active` requires ``hicache_write_policy ==
+    "write_through"`` (the reorder releases the old anchor before the alloc
+    and needs the backup to EXIST at release time; write_back cannot promise
+    that), and #811 ack-release builds on the reorder. So write_back costs the
+    reorder's rebate (3 -> 4 per seat) and the ack-release's (2 -> 4).
+    ``describe_mamba_floor`` prints the branch the boot actually took.
+    """
+    if str(group or "").strip().upper() != "P":
+        return None
+    if int(pin_budget) != 0:
+        return None
+    if not bool(getattr(server_args, "enable_hierarchical_cache", False)):
+        return None
+    mrr = max(1, int(max_running_requests))
+    per_req = mamba_slots_per_running_req(server_args)
+    floor = mamba_hard_floor(server_args, mrr)
+    return (
+        f"H113 WEG2 P MAMBA RETENTION ZERO: --max-mamba-cache-size "
+        f"{int(mamba_pool_size)} leaves group P a mamba retention pin budget "
+        f"of 0 -- pool {int(mamba_pool_size)} - floor {floor} "
+        f"({describe_mamba_floor(server_args, mrr)}). Every mamba "
+        f"write-through backup would be declined ('#1421 BACKUP-REFUSED "
+        f"why=mamba_pin', then 'parent_unbacked' for the rest of the chain), "
+        f"so P publishes no recurrent anchor and D's hand-off read can never "
+        f"complete (fnFL2h91bb2: 192 of 1528 pages, '#1471 SETTLE read still "
+        f"short'). Minimum: --max-mamba-cache-size {floor + 1} "
+        f"(= {mrr} seats x {per_req} + budget 1); the reference form h91v1 "
+        f"ran budget 8 (pool 24 at 4 seats), i.e. {floor + 8} here. Or lower "
+        f"--max-running-requests / --p-bs to at most "
+        f"{max(0, (int(mamba_pool_size) - 1) // max(1, per_req))} for this "
+        f"pool."
+    )
+
+
 def describe_mamba_floor(server_args: "ServerArgs", max_running_requests: int) -> str:
     """Human-readable derivation, for error messages and boot logs."""
     per_req = mamba_slots_per_running_req(server_args)
