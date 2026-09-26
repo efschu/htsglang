@@ -427,6 +427,51 @@ def draft_claim_packed(controller) -> bool:
         getattr(controller, "solo_draft_shadow", False))
 
 
+def claim_form_scalar_by_switch(controller, local: bool) -> bool:
+    """H51: under ``SGLANG_WEG2_HICACHE_DRAFT_TIER=off`` the claim form is the
+    bare scalar on EVERY rank by construction, so the fnFL2x22 form agreement
+    (one scalar MAX over the prefetch groups per operation) is skipped.
+
+    Why that is uniform, not rank-local: the launcher writes the RESOLVED
+    ``off`` into both groups' environment (``hicache_draft_tier_env``), so a
+    prefetch group -- always inside one launch group -- reads one value; and
+    under ``off`` no rank can answer "packed": ``maybe_register_hicache_draft``
+    returns before ``set_draft_kv_pool`` AND before the solo-shadow marker, the
+    cutover route disarms (``rebind_hicache_draft_for_phase``), so
+    ``draft_tier_armed`` is False and ``solo_draft_shadow`` stays False on
+    every rank. The agreement then can only answer False -- a collective per
+    prefetch with no use (fnFL2h91v1 D: 24/24 ``local_packed=False
+    agreed_packed=False``; fnFL2x169: n up to 1280 per boot).
+
+    A rank that answers "packed" under ``off`` contradicts that construction;
+    skipping on it would pair its MAX with its peers' claim MIN, so it is the
+    group STOP by name (``Weg2DraftDisagree`` -> ``_stop_group_from_thread``),
+    never a silent fall-through. Unset/``auto``/``on`` return False: the
+    agreement runs as before (byte-identical)."""
+    from sglang.srt.mem_cache.hicache_storage import hicache_draft_tier_off
+
+    if not hicache_draft_tier_off():
+        return False
+    if local:
+        raise Weg2DraftDisagree(
+            "WEG2 DRAFT-DISAGREE STOP H51 PREFETCH-CLAIM-FORM: this rank answers the "
+            "packed claim form under SGLANG_WEG2_HICACHE_DRAFT_TIER=off (draft_tier_armed="
+            f"{bool(getattr(controller, 'has_draft', False))}, solo_draft_shadow="
+            f"{bool(getattr(controller, 'solo_draft_shadow', False))}) -- under off no rank "
+            "registers a draft pool or marks a shadow, so its peers skip the form "
+            "agreement; stopping the group instead of pairing collectives unevenly."
+        )
+    if not getattr(controller, "_h51_claim_form_logged", False):
+        controller._h51_claim_form_logged = True
+        logger.info(
+            "H51 PREFETCH-CLAIM-FORM scalar by switch (SGLANG_WEG2_HICACHE_DRAFT_TIER=off): "
+            "no rank has a draft claim to pack, the form agreement collective is skipped "
+            "on every rank of the %d prefetch group(s); the claim reduce is the scalar MIN",
+            len(getattr(controller, "prefetch_sync_groups", None) or ()),
+        )
+    return True
+
+
 def assert_draft_claims_agree(min_claim: int, max_claim: int, rid) -> None:
     """L8. ``min_claim``/``max_claim`` come from ONE MIN all_reduce over the
     packed vector ``[claim, -claim]`` (no second collective)."""
@@ -1138,6 +1183,9 @@ class HiCacheController:
         local = draft_claim_packed(self)
         if not self.prefetch_sync_groups:
             return local
+        if claim_form_scalar_by_switch(self, local):
+            # H51: HICACHE-DRAFT-TIER off -- scalar on every rank, no agreement.
+            return False
         flag = torch.tensor([int(local)], dtype=torch.int)
         self._all_reduce_prefetch_groups(flag, torch.distributed.ReduceOp.MAX)
         agreed = bool(int(flag.item()))
