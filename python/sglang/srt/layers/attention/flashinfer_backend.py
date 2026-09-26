@@ -36,7 +36,10 @@ from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dcp.comm import (
+    cp_all_gather_kvq_heads_uneven,
     cp_lse_merge_token_blocks,
+    dcp_fuse_kvq_gather,
+    dcp_fuse_max_rows,
     lse_merge_is_blocked,
     lse_merge_token_spans,
 )
@@ -3085,6 +3088,41 @@ class FlashInferAttnBackend(AttentionBackend):
             torch.cat((k, v), dim=0), group, self.dcp_kv_head_counts
         )
         return kv_full[:n], kv_full[n:]
+
+    def _dcp_kvq_fusable(self, layer, k, v, q_local) -> bool:
+        """May the KV write gather (A) and the q-head gather (B) of this layer
+        run as ONE all-gather (SGLANG_DCP_FUSE_KVQ_GATHER, default off)?
+
+        Every term is rank-uniform (env read once, backend geometry, dtypes of
+        one model), so all ranks answer alike and issue the same collectives.
+        Off for replicated-KV (no A to fuse), for the weightless-KV head (its
+        workers mirror the unfused A,B sequence 1:1) and whenever the three
+        tensors cannot share one buffer."""
+        if not dcp_fuse_kvq_gather():
+            return False
+        if not self.uneven_dcp or self.dcp_kv_replicated_heads or self.weightless_kv:
+            return False
+        if k is None or v is None:
+            return False
+        if not (q_local.dtype == k.dtype == v.dtype):
+            return False
+        if layer.tp_k_head_num != layer.tp_v_head_num:
+            return False
+        if q_local.shape[0] > dcp_fuse_max_rows():
+            return False
+        return q_local.shape[-1] == layer.head_dim
+
+    def _dcp_write_gather_with_q(self, layer, k, v, q_local):
+        """Collectives A (k, v) and B (q) of the per-layer DCP sequence as ONE
+        uneven all-gather -- ``cp_all_gather_kvq_heads_uneven``, bit-identical
+        to ``_dcp_write_gather`` + ``cp_all_gather_heads_uneven(q_local)``
+        (pure data movement). Returns (k_full, v_full, q_full)."""
+        group = get_parallel().dcp_group
+        k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+        v = v.view(-1, layer.tp_v_head_num, layer.head_dim)
+        return cp_all_gather_kvq_heads_uneven(
+            k, v, q_local, group, self.dcp_kv_head_counts, self.dcp_q_head_counts
+        )
 
     def _dcp_masked_write(self, layer, forward_batch, cache_loc, k, v):
         """Gather this rank's local kv-head shard up to the FULL replicated
@@ -6273,11 +6311,25 @@ class FlashInferAttnBackend(AttentionBackend):
         self, q, k, v, layer, forward_batch, decode_wrapper, cache_loc, save_kv_cache
     ):
         group = get_parallel().dcp_group
-        if k is not None and save_kv_cache:
-            self._dcp_masked_write(layer, forward_batch, cache_loc, k, v)
-
         q_local = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-        q_full = cp_all_gather_heads_uneven(q_local, group, self.dcp_q_head_counts)
+        if (
+            k is not None
+            and save_kv_cache
+            and self._dcp_kvq_fusable(layer, k, v, q_local)
+        ):
+            # SGLANG_DCP_FUSE_KVQ_GATHER: A and B in one collective; the
+            # scatter-write is the unchanged local half of _dcp_masked_write.
+            k_full, v_full, q_full = self._dcp_write_gather_with_q(
+                layer, k, v, q_local
+            )
+            self._dcp_write_scatter(layer, forward_batch, cache_loc, k_full, v_full)
+            del k_full, v_full
+        else:
+            if k is not None and save_kv_cache:
+                self._dcp_masked_write(layer, forward_batch, cache_loc, k, v)
+            q_full = cp_all_gather_heads_uneven(
+                q_local, group, self.dcp_q_head_counts
+            )
         if self._sess_spill is not None:
             # kv-session-offload spill tick: attend the host-resident shard
             # via the streamed block loop. Same (o, lse) contract and the
@@ -6546,9 +6598,19 @@ class FlashInferAttnBackend(AttentionBackend):
             #    this rank's owned token slots (token-sharded cache).
             _scatter_late = self.dcp_overlap_scatter_late
             k_full_seq = v_full_seq = None
+            q_full_fused = None
             if do_write:
                 if _scatter_late:
                     k_full_seq, v_full_seq = self._dcp_write_gather(layer, k, v)
+                elif has_prefix and self._dcp_kvq_fusable(layer, k, v, q_local):
+                    # SGLANG_DCP_FUSE_KVQ_GATHER: B (the q gather of step 3)
+                    # moves up into A -- it depends only on q_local, and the
+                    # ragged current-chunk attention in between is local.
+                    k_f, v_f, q_full_fused = self._dcp_write_gather_with_q(
+                        layer, k, v, q_local
+                    )
+                    self._dcp_write_scatter(layer, forward_batch, cache_loc, k_f, v_f)
+                    del k_f, v_f
                 else:
                     self._dcp_masked_write(layer, forward_batch, cache_loc, k, v)
             # 2. Current chunk: ragged LOCAL head-sharded attention (causal).
@@ -6565,7 +6627,12 @@ class FlashInferAttnBackend(AttentionBackend):
             #    the FULL gathered q-heads (non-causal: all prefix keys precede
             #    every current query). Combine the per-rank partials across the
             #    DCP group and slice back to this rank's local heads.
-            q_full = cp_all_gather_heads_uneven(q_local, group, self.dcp_q_head_counts)
+            if q_full_fused is not None:
+                q_full = q_full_fused
+            else:
+                q_full = cp_all_gather_heads_uneven(
+                    q_local, group, self.dcp_q_head_counts
+                )
             if self._sess_verify_active():
                 # C4 (spec-in-spill-tick): this rank's committed prefix lives on
                 # host (kv-session-offload spill) -- stream it blockwise via the

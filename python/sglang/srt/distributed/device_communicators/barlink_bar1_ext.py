@@ -414,6 +414,10 @@ struct Bar1Args {
     int          R;
     int          rank;
     u64          capCycles;
+    // SGLANG_BARLINK_BAR1_CANON_ORDER (oneshot only; 0 = memset default =
+    // the reduction order the kernel always had): every rank sums the R
+    // contributions in rank order 0,1,..,R-1, whichever rank computes.
+    int          canon;
 
     // mesh: indexed by RANK NUMBER, own entry stays empty.
     uint4       *nzSendRS[BARLINK_BAR1_MAX_RANKS];
@@ -493,6 +497,30 @@ __device__ __forceinline__ void reduceNPhase(const uint4 *__restrict__ in,
         for (int q = 0; q < R; ++q) {
             if (q == rank) continue;
             s = addV4<T>(s, readV4(recv[q] + j));
+        }
+        out[j] = s;
+    }
+}
+
+// The same reduction in CANONICAL rank order (SGLANG_BARLINK_BAR1_CANON_ORDER):
+// ((x0 + x1) + x2) + ... on EVERY rank. reduceNPhase starts from the own
+// contribution, so rank 2 of three computes (x2 + x0) + x1 while ranks 0 and
+// 1 compute (x0 + x1) + x2 (IEEE addition commutes, so those two agree) --
+// the oneshot result then differs in the last bit across ranks. Same reads
+// (own from `in`, every peer once from its receive slot), no extra barrier;
+// for rank 0 it is the identical instruction sequence.
+template<typename T>
+__device__ __forceinline__ void reduceNPhaseCanon(const uint4 *__restrict__ in,
+                                                     uint4 *out,
+                                                     const uint4 *const *recv,
+                                                     int R, int rank,
+                                                     int n4, int tid, int nth)
+{
+    for (int j = tid; j < n4; j += nth) {
+        uint4 s = (rank == 0) ? in[j] : readV4(recv[0] + j);
+        for (int q = 1; q < R; ++q) {
+            const uint4 v = (q == rank) ? in[j] : readV4(recv[q] + j);
+            s = addV4<T>(s, v);
         }
         out[j] = s;
     }
@@ -995,7 +1023,8 @@ __global__ void bar1_oneshot_kernel(Bar1Args A)
     }
     __threadfence_system();
     // --- 2. reduce locally over own + all received (full payloads) ---------
-    reduceNPhase<T>(A.in, A.out, sRecvRS, R, r, n4, tid, nth);
+    if (A.canon) reduceNPhaseCanon<T>(A.in, A.out, sRecvRS, R, r, n4, tid, nth);
+    else         reduceNPhase<T>(A.in, A.out, sRecvRS, R, r, n4, tid, nth);
     barrier<GRID>();
     if (isFirst) {
         // #622 ack, same order as the mesh: peers' lines, fence, watermark,
@@ -1581,8 +1610,12 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
     TORCH_CHECK(R >= 2 && R <= BARLINK_BAR1_MAX_RANKS,
                 "barlink-bar1: world ", R, " outside 2..", BARLINK_BAR1_MAX_RANKS);
     TORCH_CHECK(r >= 0 && r < R, "barlink-bar1: rank out of range");
-    TORCH_CHECK(algo == 0 || algo == 1 || algo == 2,
-                "barlink-bar1: algo 0=mesh 1=ring 2=oneshot");
+    TORCH_CHECK(algo == 0 || algo == 1 || algo == 2 || algo == 3,
+                "barlink-bar1: algo 0=mesh 1=ring 2=oneshot 3=oneshot-canon");
+    // 3 = oneshot with the canonical rank order (SGLANG_BARLINK_BAR1_CANON_ORDER);
+    // from here on it IS oneshot, with A.canon set below.
+    const bool canonOrder = (algo == 3);
+    if (canonOrder) algo = 2;
     TORCH_CHECK(inp.is_contiguous() && out.is_contiguous(),
                 "barlink-bar1: only contiguous tensors");
     TORCH_CHECK(inp.numel() == out.numel() && inp.scalar_type() == out.scalar_type(),
@@ -1640,6 +1673,7 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
     A.R            = R;
     A.rank         = r;
     A.capCycles = (u64)cap_cycles;
+    A.canon     = canonOrder ? 1 : 0;
 
     const int steps_mesh = 2;
     const int steps_ring = 2 * (R - 1);

@@ -2469,7 +2469,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         / get_cpu_copy / load_cpu_copy)."""
         return mamba_indices
 
+    #: --p-layer-split dynamic: (shim mamba pool, {swing layer id: dense
+    #: index}) of this stage's swing state mirrors; None under static.
+    _p_layer_split_state = None
+
     def mamba2_layer_cache(self, layer_id: int):
+        sw = self._p_layer_split_state
+        if sw is not None and layer_id in sw[1]:
+            return sw[0].mamba2_layer_cache(sw[1][layer_id])
         assert layer_id in self.mamba_map
         # #904 (supersedes the #752 note that stood here). The recurrent step
         # joins the load stream at the transfer step that filled THIS layer.
@@ -5411,17 +5418,31 @@ class HybridLinearKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id)
 
+    #: --p-layer-split dynamic: (shim pool, {swing layer id: dense index}) of
+    #: this stage's swing KV mirrors (weg2/p_layer_split_runtime.py). None
+    #: under static: every accessor below is then exactly what it was.
+    _p_layer_split_kv = None
+
     def get_key_buffer(self, layer_id: int):
+        sw = self._p_layer_split_kv
+        if sw is not None and layer_id in sw[1]:
+            return sw[0].get_key_buffer(sw[1][layer_id])
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_key_buffer(layer_id)
 
     def get_value_buffer(self, layer_id: int):
+        sw = self._p_layer_split_kv
+        if sw is not None and layer_id in sw[1]:
+            return sw[0].get_value_buffer(sw[1][layer_id])
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int):
+        sw = self._p_layer_split_kv
+        if sw is not None and layer_id in sw[1]:
+            return sw[0].get_kv_buffer(sw[1][layer_id])
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
@@ -5454,6 +5475,21 @@ class HybridLinearKVPool(KVCache):
         # unified pool's pre-translated PHYSICAL loc (None for a static pool, where
         # `loc` is already physical) — either way the pool writes a PHYSICAL loc.
         loc, _, full_loc = unwrap_write_loc(loc)
+        sw = self._p_layer_split_kv
+        if sw is not None and layer.layer_id in sw[1]:
+            # --p-layer-split swing layer: the mirror, same slot frame (the
+            # runtime refuses the unified pool, so `loc` is physical here)
+            sw[0].set_kv_buffer(
+                None,
+                full_loc if full_loc is not None else loc,
+                cache_k,
+                cache_v,
+                k_scale,
+                v_scale,
+                layer_id_override=sw[1][layer.layer_id],
+                dcp_kv_mask=dcp_kv_mask,
+            )
+            return
         layer_id = self._transfer_full_attention_id(layer.layer_id)
         if not self.use_mla:
             write_loc = full_loc if full_loc is not None else loc

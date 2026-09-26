@@ -300,6 +300,9 @@ class ModelProfile:
     #: NF fnFL2x76 exact bigram anchor keying (SGLANG_WEG2_BIGRAM_ANCHOR_EXACT);
     #: the 27B metal ran the upstream keying.
     bigram_anchor_exact: bool
+    #: NF H34b warm min-dwell (SGLANG_WEG2_ENABLE_WARM_MIN_DWELL); the 27B metal
+    #: priced K7 with the last same-direction flip.
+    warm_min_dwell: bool
     vision: str
     context_tokens: int
     records: RecordKey
@@ -323,6 +326,7 @@ class ModelProfile:
         out["SGLANG_WEG2_X_IDLE_REGRANT"] = bool(self.x_split)
         out["SGLANG_WEG2_STORE_SHORT_TAIL"] = bool(self.store_short_tail)
         out["SGLANG_WEG2_BIGRAM_ANCHOR_EXACT"] = bool(self.bigram_anchor_exact)
+        out["SGLANG_WEG2_ENABLE_WARM_MIN_DWELL"] = bool(self.warm_min_dwell)
         return out
 
     def constant(self, name: str) -> object:
@@ -422,6 +426,7 @@ PROFILES: Dict[str, ModelProfile] = {
         x_split=True,
         store_short_tail=True,
         bigram_anchor_exact=False,
+        warm_min_dwell=False,
         vision="transient",
         context_tokens=262144,
         # OPERATOR 26.09. (UN4): the 27B-RC9 records count on this tree as a
@@ -477,6 +482,7 @@ PROFILES: Dict[str, ModelProfile] = {
         x_split=False,
         store_short_tail=False,
         bigram_anchor_exact=True,
+        warm_min_dwell=True,
         vision="off",
         context_tokens=262144,
         records=RecordKey(fields=("checkpoint", "form")),

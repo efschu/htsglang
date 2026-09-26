@@ -2690,6 +2690,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
                 dup_start = max(0, params.prev_prefix_len - total_prefix_length)
                 if dup_start < consumed_from:
+                    # SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY: the request's
+                    # fresh slots are dropped in favour of the tree's own;
+                    # a subscribed DFlash window pool moves the draft rows
+                    # the fresh slots carry over to the kept ones (else a
+                    # D re-prefill of a cached span loses its draft KV).
+                    _alloc = self.token_to_kv_pool_allocator
+                    if getattr(_alloc, "has_alias_listeners", None) and (
+                        _alloc.has_alias_listeners()
+                    ):
+                        _kept = node.component_data[BASE_COMPONENT_TYPE].value
+                        if _kept is not None:
+                            _alloc.notify_alias(
+                                value_slice[dup_start:consumed_from],
+                                _kept[dup_start:consumed_from],
+                            )
                     self.token_to_kv_pool_allocator.free(
                         value_slice[dup_start:consumed_from]
                     )

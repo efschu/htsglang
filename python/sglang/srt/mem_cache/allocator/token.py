@@ -54,6 +54,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return len(self.free_pages) + len(self.release_pages)
 
     def alloc(self, need_size: int):
+        if getattr(self, "_owner_placement", None) is not None:
+            self._owner_placement_tick()
         if self.need_sort and need_size > len(self.free_pages):
             self.merge_and_sort_free()
 
@@ -76,6 +78,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # Grouped frees (the else branch) are notified once, when
             # free_group_end re-enters here with the concatenated indices.
             self._notify_free(free_index)
+            if getattr(self, "_owner_placement", None) is not None:
+                self._owner_placement_touch()
         else:
             self.free_group.append(free_index)
 

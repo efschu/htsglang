@@ -3230,6 +3230,14 @@ class PhasePoolModel:
     #: Empty = the switch is off and the runtime books nothing -- a legitimate
     #: zero, so it is not in :attr:`unfunded_posts`.
     prefill_graph_pool_mib: Tuple[float, ...] = ()
+    #: --p-layer-split dynamic (weg2/p_layer_split_runtime.py): per stage,
+    #: (attention, linear) SWING layers held beyond the stage's cut -- resident
+    #: weights, a pool-shaped KV mirror per attention layer (one more layer in
+    #: the cell divisor) and a state-pool-shaped mirror per linear layer, the
+    #: same three terms the rank's sizer charges (pool_configurator /
+    #: _stage_mamba_layer_counts via swing_extra_layer_counts). Empty = static,
+    #: the model unchanged.
+    swing_layers_by_stage: Tuple[Tuple[int, int], ...] = ()
 
     #: The runtime's post NAMES, in the runtime's own order, mapped to the field
     #: that funds each (#1286 F2/F3). This is the model's statement of WHICH
@@ -3348,6 +3356,10 @@ def stage_pp_capacities(
                 "modelling artifact, not a real configuration: refusing to price "
                 f"cut {tuple(counts)} with attention counts {tuple(attn_counts)}."
             )
+        swing = tuple(getattr(model, "swing_layers_by_stage", ()) or ())
+        if swing:
+            # each swing attention layer's KV mirror is pool-shaped
+            a += int(swing[r][0])
         caps.append(float(stage_capacity_tokens(free, a, model)))
     return tuple(caps)
 
@@ -4045,7 +4057,12 @@ def _stage_free_after_residency(
             f"{len(list(counts))} stages; it is a PER-STAGE post (the stage "
             "inputs of the captured body differ) and cannot be broadcast."
         )
+    swing = tuple(getattr(model, "swing_layers_by_stage", ()) or ())
     for r, (n, a) in enumerate(zip(counts, attn_counts)):
+        if swing:
+            # the swing slab: its layers cost weights and mamba like owned ones
+            n = int(n) + int(swing[r][0]) + int(swing[r][1])
+            a = int(a) + int(swing[r][0])
         linear = int(n) - int(a)
         holdback = (
             float(model.arming_floor_mib[r])

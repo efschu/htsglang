@@ -371,6 +371,6 @@ def test_prebuild_names_the_modules_load_jit_builds():
     from sglang.jit_kernel import nvfp4_w4a8, nvfp4_w4a8_decode, prebuild_nvfp4_w4a8
 
     names = [n for n, _ in prebuild_nvfp4_w4a8._modules()]
-    assert names == ["nvfp4_w4a8_decode_sm86", "nvfp4_w4a8_sm86"]
-    for name, mod in zip(names, (nvfp4_w4a8_decode, nvfp4_w4a8)):
+    assert names == ["nvfp4_w4a8_decode_sm86", "nvfp4_w4a8_sm86", "nvfp4_w4a8_decode_fused_sm86"]
+    for name, mod in zip(names, (nvfp4_w4a8_decode, nvfp4_w4a8, nvfp4_w4a8_decode)):
         assert f'load_jit(\n        "{name}",' in inspect.getsource(mod)

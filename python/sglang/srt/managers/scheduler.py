@@ -231,6 +231,7 @@ from sglang.srt.managers import weg2_store_told
 from sglang.srt.managers import weg2_d_hostgap as _d_hostgap
 from sglang.srt.layers.quantization import gguf_path_census as _gguf_path_census
 from sglang.srt.weg2 import p_trim_end_anchor as _weg2_trim
+from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers import anchor_tails as _anchor_tails
 from sglang.srt.managers.pp_admission_congruence import (
@@ -11134,6 +11135,14 @@ class Scheduler(
         when profiling raises at init), so a None must fall back to the
         static size rather than be handed on as a chunk width.
         """
+        # --p-layer-split dynamic: on PP0 the joint plan (chunk widths AND
+        # per-chunk cut) owns the width; downstream ranks run PP0's #791
+        # extents anyway. 0 -> the paths below.
+        _pls = _pls_rt.active()
+        if _pls is not None and _pls.leader is not None:
+            planned = self._p_layer_split_width(_pls)
+            if planned > 0:
+                return planned
         # --p-chunk-policy dynamic: the plan's width for the request this
         # forward serves (0 = no request / not applicable -> the path below).
         # getattr: harness stubs bind this method without the attribute.
@@ -11151,6 +11160,33 @@ class Scheduler(
             return self.chunked_prefill_size
         self._log_dynamic_chunk_engagement(dynamic_size, history_len)
         return dynamic_size
+
+    def _p_layer_split_width(self, rt) -> int:
+        """--p-layer-split dynamic, PP0: this forward's width from the joint
+        chunk+cut plan (``LeaderCursor.next_width``), for the same request
+        ``_p_chunk_policy_width`` would size. 0 on any failure (static path)."""
+        req = self.chunked_req
+        if req is None:
+            queue = getattr(self, "waiting_queue", None) or []
+            if not queue:
+                return 0
+            req = queue[0]
+        try:
+            fill = getattr(req, "full_untruncated_fill_ids", None)
+            end = len(fill) if fill is not None and len(fill) else (
+                len(req.origin_input_ids) + len(getattr(req, "output_ids", ()) or ())
+            )
+            prefix = getattr(req, "prefix_indices", None)
+            pos = 0 if prefix is None else len(prefix)
+            width = rt.leader_width(req.rid, pos, end)
+        except Exception as exc:  # noqa: BLE001 - a plan must never stop a pass
+            n = getattr(self, "_p_layer_split_errors", 0) + 1
+            self._p_layer_split_errors = n
+            if n <= 4 or n % 256 == 0:
+                logger.warning("P-LAYER-SPLIT plan failed (n=%d), static width this pass: %r", n, exc)
+            return 0
+        cap = int(self.chunked_prefill_size or 0)
+        return min(int(width), cap) if cap > 0 else int(width)
 
     def _p_chunk_policy_width(self) -> int:
         """--p-chunk-policy dynamic: this forward's budget from the plan.
@@ -13516,6 +13552,16 @@ class Scheduler(
             release_pins = getattr(self.tree_cache, "release_acked_anchor_pins", None)
             if release_pins is not None and self.running_batch is not None:
                 release_pins(self.running_batch.reqs)
+            # 24c --d-kv-evict-for-placement (weg2/d_kv_evict.py, DYN_D_RESHARD
+            # sec. 14): cold, L2-backed radix leaves leave the device so the
+            # bandwidth placement keeps its shares. Here because every rank
+            # reaches this point each iteration (the storage-drain agreement
+            # above, the #580 prefetch collectives below); a dict lookup when
+            # SGLANG_WEG2_D_KV_EVICT is absent.
+            if self.__dict__.get("_weg2_d_kv_evictor", True) is not None:
+                from sglang.srt.weg2.d_kv_evict import scheduler_step as _d_kv_evict_step
+
+                _d_kv_evict_step(self)
 
         # #580: rank-uniform entry into the prefetch-progress collectives.
         # MUST stay above every early return and every loop exit below -- all
@@ -15453,6 +15499,16 @@ class Scheduler(
                 # optimisation -- refuse and name it.
                 require_executed_geometry=True,
             )
+            # --p-layer-split dynamic: PP0 decides this forward's layer cut ON
+            # the #791 decision (same entries, same order); the row rides the
+            # forward's proxy frame downstream. No-op under static.
+            _pls = _pls_rt.active()
+            if _pls is not None and _pls.leader is not None:
+                _entries = self._pp_admission_last_built_decision.entries
+                if _entries:
+                    _pls.leader_decide(
+                        [(e.rid, int(e.prefix_len), int(e.extend_len)) for e in _entries]
+                    )
             # #968/#1035 PP0 SEEDS ITS OWN PENDING MAP, because PP0 is the one
             # rank that never receives this fact off the wire -- it is the one
             # that makes it. Downstream ranks fill the same map when they pop
@@ -16620,9 +16676,14 @@ class Scheduler(
                 # at its first use of the exact lengths; unset = the old read.
                 _pending_lens = None
                 if _d_hostgap.defer_eligible(self, batch):
+                    # SGLANG_WEG2_D_EARLY_DRAFT: the lengths the batch carries
+                    # before the resolve clears them (None when off).
+                    _lens_lo = _d_hostgap.snapshot_lower_bound(batch)
                     _pending_lens = self.future_map.resolve_seq_lens_cpu(
                         batch, defer=True
                     )
+                    if _pending_lens is not None:
+                        _pending_lens.lower_bound = _lens_lo
                 else:
                     self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
@@ -16765,6 +16826,16 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
+                # --p-layer-split dynamic: adopt this forward's row, apply the
+                # upstream mirror's write-back (strips it from the proxy
+                # before the model/graph sees the frame), arm the pulls and
+                # the eager bit. None under static: nothing runs.
+                _pls = _pls_rt.active() if batch.forward_mode.is_extend() else None
+                if _pls is not None:
+                    _pls.pre_forward(
+                        _pls_rt.ctx_from_batch(batch, self.req_to_token_pool.req_to_token),
+                        None if pp_proxy_tensors is None else pp_proxy_tensors.tensors,
+                    )
                 with ExitStack() as _stack:
                     produce = self._draft_kv_producer_wants(batch)
                     if produce:
@@ -16777,6 +16848,11 @@ class Scheduler(
                     )
                     if produce:
                         self._draft_kv_produce(batch, batch_result)
+                if _pls is not None:
+                    # the swing layers' write-back and the row ride this
+                    # forward's proxy frame downstream
+                    _out = getattr(batch_result, "pp_hidden_states_proxy_tensors", None)
+                    _pls.post_forward(None if _out is None else _out.tensors)
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
@@ -19747,6 +19823,10 @@ def dispatch_event_loop(scheduler: Scheduler):
         if not getattr(scheduler, "_pp_p2p_warmed", False):
             scheduler._pp_p2p_warmed = True
             _pp.warmup_p2p_pairs()
+            # --p-layer-split dynamic: the upstream pairs (pull / refill) and
+            # the swing-vs-home layout check, same lockstep point on every P
+            # rank. No-op under static.
+            _pls_rt.boot_link(_pp)
 
     # Dispatch to the appropriate event loop based on the disaggregation mode
     server_args = scheduler.server_args
@@ -20123,6 +20203,11 @@ def run_scheduler_process(
         # taken at either runner's capture_end is missing the other's.
         flight_recorder.mark("boot_complete", rank=tp_rank)
         flight_recorder.dump_trace("boot_complete", rank=tp_rank)
+        # SB 26.09.: rank-side GC warning (--gc-warning-threshold-secs > 0) and
+        # the optional gc.freeze() (SGLANG_WEG2_GC_FREEZE=1); both off by default.
+        from sglang.srt.weg2.gc_instrument import arm_after_boot as _weg2_gc_arm
+
+        _weg2_gc_arm(server_args, tp_rank)
         # #1054: a MEASUREMENT run keeps the window open past this point. The
         # boot-bounded window is right for the resident posts and blind to the
         # transient one that killed boot 24 -- the GDN extend allocation only

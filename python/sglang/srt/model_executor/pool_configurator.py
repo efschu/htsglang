@@ -441,6 +441,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     if mr.start_layer <= i < mr.end_layer
                 ]
             num_layers = len(effective_layer_ids)
+            # --p-layer-split dynamic: each swing attention layer holds a
+            # pool-shaped KV mirror (same slot frame as the pool), so it costs
+            # exactly one more attention layer per token. +0 under static.
+            from sglang.srt.weg2.p_layer_split_runtime import (
+                swing_extra_layer_counts,
+            )
+
+            num_layers += swing_extra_layer_counts(mr.start_layer, mr.end_layer)[0]
         else:
             num_layers = mr.num_effective_layers
 

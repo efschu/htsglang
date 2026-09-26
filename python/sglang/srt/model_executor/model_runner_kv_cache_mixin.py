@@ -459,6 +459,68 @@ def _spec_workspace_draft_units(runner, config, D):
     return units
 
 
+def _dcp_speed_advisory(runner) -> bool:
+    """Uneven-DCP replacement of the 'restart with SGLANG_UNEVEN_MLP_VECTOR ... to
+    raise the KV pool' hint (user/operator 26.09. ~09:35Z).
+
+    That hint maximises the MIN of the per-rank local capacities
+    (distributed/utils.py ``suggest_unit_rebalance_multi``) -- the pool of uneven
+    TP without a token split.  Under uneven DCP every rank stores the full kv
+    heads of the tokens it owns (same cell on every rank) and the token vector is
+    installed from the measured capacities, so shifting MLP units conserves the
+    capacity SUM and only moves where the KV lives.  What is left to optimise is
+    speed: rank 0 logs weg2/d_reshard's per-load-class table instead.
+
+    Returns True when the uneven-DCP branch was taken (on every rank alike)."""
+    from sglang.srt.distributed.utils import (
+        get_cp_token_ratios,
+        get_tp_partition_ratios,
+        partition_units,
+    )
+    from sglang.srt.weg2 import d_reshard as _dr
+
+    sa = runner.server_args
+    if not _dr.uneven_dcp_token_split(
+        getattr(runner, "dcp_size", 1) or 1,
+        runner.tp_size,
+        bool(getattr(sa, "uneven_dcp", False)),
+        uneven_dcp_active(getattr(runner, "dcp_size", None)),
+    ):
+        return False
+    if runner.tp_rank != 0 or getattr(runner, "is_draft_worker", False):
+        return True
+    base = get_tp_partition_ratios(None)
+    mlp_vec = get_tp_partition_ratios("mlp")
+    units_total = 0
+    for module in runner.model.modules():
+        if getattr(module, "tp_family", None) == "mlp":
+            units_total = max(units_total, int(getattr(module, "tp_units", 0) or 0))
+    if not base or not mlp_vec or units_total <= 0:
+        logger.info(
+            "uneven DCP: KV sum is conserved when MLP units move; no speed table "
+            "(base plan %r, mlp plan %r, mlp units %d).", base, mlp_vec, units_total,
+        )
+        return True
+    advisory = (_dr.seg_speed_advisory_lines if _dr.objective_from_env() == _dr.OBJECTIVE_SEGMENT
+                else _dr.speed_advisory_lines)  # SB 26.09.: default objective unchanged
+    lines = advisory(
+        _dr.config_dict(runner.model_config.hf_text_config),
+        _dr.quant_method_of(runner.model_config.hf_config, getattr(sa, "quantization", None)),
+        list(base),
+        partition_units(units_total, list(mlp_vec)),
+        units_total,
+        get_cp_token_ratios(),
+        # Row 27: the table names the limit it is valid under and the one the
+        # cards run under (NVML; None = unknown, the line says so).
+        current_power_w=(
+            _dr.current_power_w_of_ranks(runner.gpu_id, len(base), getattr(sa, "gpu_id_step", 1) or 1)
+            if getattr(runner, "gpu_id", None) is not None else None),
+    )
+    for line in lines:
+        logger.info(line)
+    return True
+
+
 class ModelRunnerKVCacheMixin:
     # === #119: expert-offload VRAM -> KV pool ==============================
     # The expert offload (#77/#123) parks cold experts in a pinned host pool and
@@ -2165,6 +2227,11 @@ class ModelRunnerKVCacheMixin:
         if self.pp_size <= 1:
             return n_global, n_global
         n_local = sum(1 for lid in layers if self.start_layer <= lid < self.end_layer)
+        # --p-layer-split dynamic: the swing GDN mirrors are state-pool
+        # shaped, one per swing layer -- charged like owned layers. +0 static.
+        from sglang.srt.weg2.p_layer_split_runtime import swing_extra_layer_counts
+
+        n_local += swing_extra_layer_counts(self.start_layer, self.end_layer)[1]
         return n_local, n_global
 
     def _stage_local_mamba_cache_per_req(self: ModelRunner, config) -> int:
@@ -5029,6 +5096,15 @@ class ModelRunnerKVCacheMixin:
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
                         )
+                        # --d-token-placement (26.09.): weighted owner placement
+                        # of NEW tokens; absent env = capacity = unchanged.
+                        from sglang.srt.weg2 import d_token_placement as _dtp
+
+                        _dtp.arm_on_allocator(
+                            self.token_to_kv_pool_allocator,
+                            _dtp.spec_from_env(),
+                            logger,
+                        )
                     else:
                         # Stock even-DCP (unchanged): interleave via inflated
                         # page granularity.
@@ -5664,6 +5740,12 @@ class ModelRunnerKVCacheMixin:
         sum(bytes_per_token) — growing beyond that needs bigger budgets
         or smaller weights (quantization), not a different vector."""
         if not self.server_args.uneven_memory_budgets_active():
+            return
+        if _dcp_speed_advisory(self):
+            # Uneven DCP (26.09.): the KV sum is conserved when MLP units move,
+            # so the MIN-synced KV hint below would be misleading; the speed
+            # table replaced it (rank-uniform branch: no rank enters the
+            # collective below).
             return
         if get_world_group().world_size <= 1:
             return
@@ -6796,6 +6878,16 @@ class ModelRunnerKVCacheMixin:
             )
 
         self._init_pools()
+        # --p-layer-split dynamic: allocate this stage's swing mirrors (KV for
+        # swing attention layers, state for swing GDN layers; same slot frame
+        # as the pools, inside their memory-saver region) and route the pool
+        # accessors to them for swing ids. The configurator above already
+        # priced them (pool_configurator: swing_extra_layers). No-op under
+        # static and on any runner without swing modules (draft, group D).
+        if not self.is_draft_worker:
+            from sglang.srt.weg2.p_layer_split_runtime import bind_pools as _pls_bind
+
+            _pls_bind(self.token_to_kv_pool, self.req_to_token_pool)
 
     # ------------------------------------------------------------------
     # #656: the flip seam as a sizing post. See

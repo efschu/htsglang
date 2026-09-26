@@ -23,6 +23,8 @@ from sglang.srt.distributed.pp_typed_channel import (
     stash_typed,
     typed_inbox,
 )
+from sglang.srt.weg2 import p_layer_split as _pls_S  # --p-layer-split row key
+from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt
 from sglang.srt.distributed.pp_object_recv import get_or_create_frame
 from sglang.srt.distributed.utils import pp_gapped_ownership_active
 from sglang.srt.managers import anchor_tails as _anchor_tails
@@ -8578,6 +8580,7 @@ class SchedulerPPMixin:
         expected_kind: str = "default",
         all_gather_group: Optional = None,
         mark_consumed: bool = True,
+        on_wire=None,
     ) -> Dict[str, torch.Tensor]:
         """Receive a typed tensor dict, demultiplexing by msg_type.
 
@@ -8619,6 +8622,10 @@ class SchedulerPPMixin:
             )
             self._pp_flip_bump_consumed(CHAN_DICT)
             started[0] = time.perf_counter()
+            # P-RECV-STREAM (weg2_p_overlap.recv_off_fence): every message that
+            # left the wire, the stashed ones included. None = no call.
+            if on_wire is not None:
+                on_wire(tensor_dict)
 
         started = [time.perf_counter()]
         # #821: MARK THE ONE PLACE A PP RANK CAN DISAPPEAR SILENTLY.
@@ -10630,12 +10637,28 @@ class SchedulerPPMixin:
         # this needs the verdict on the #791 ring first -- one send, not a
         # rank-local act -- and that is a separate cut.
         self._pp_wait_for_proxy_readiness(mb_id)
-        raw = self._pp_recv_typed_dict(
-            expected_kind="proxy",
-            all_gather_group=(
-                self.attn_tp_group if self.require_attn_tp_allgather else None
-            ),
-        )
+        if _pov.p_recv_stream_on() and not self.require_attn_tp_allgather:
+            # P-RECV-STREAM (weg2_p_overlap.py): the frame's NCCL receive on a
+            # side stream that carries no fence on the running forward, so the
+            # transfer overlaps it; the schedule stream waits for the side
+            # stream before anything reads the frame. With an attention-TP
+            # all-gather on the receive the stock path below runs.
+            raw = _pov.recv_off_fence(
+                self,
+                lambda _on_wire: self._pp_recv_typed_dict(
+                    expected_kind="proxy",
+                    all_gather_group=None,
+                    on_wire=_on_wire,
+                ),
+                self.device_module,
+            )
+        else:
+            raw = self._pp_recv_typed_dict(
+                expected_kind="proxy",
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                ),
+            )
         # POPPED, not read: the identity has done its entire job the moment
         # the message is accepted, and what remains travels on into model
         # compute. PPProxyTensors' slice path maps v[key] over EVERY entry
@@ -10656,6 +10679,21 @@ class SchedulerPPMixin:
             if isinstance(raw, dict)
             else None
         )
+        # --p-layer-split dynamic: PP0's layer-cut row for THIS frame's
+        # forward, popped under the same law as the admission row (a list
+        # left in the frame would reach the model / graph copy). A row on an
+        # unarmed rank means the group disagrees about the mode: crash-stop.
+        _pls_row = (
+            raw.pop(_pls_S.ROW_KEY, None) if isinstance(raw, dict) else None
+        )
+        if _pls_row is not None:
+            _pls = _pls_rt.active()
+            if _pls is None:
+                raise _pls_S.LayerSplitDivergence(
+                    f"{_pls_S.LOG_TAG}: a layer-split row reached a rank without "
+                    "the split armed (group P disagrees about --p-layer-split)"
+                )
+            _pls.push_row(_pls_row)
         # #631 ROW AUTHORITY: reset before the parse, so a frame without a
         # row can never hand the pre-plan consumer a previous pass's
         # decision (a pass that receives nothing must inherit nothing).

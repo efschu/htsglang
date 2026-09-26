@@ -156,6 +156,99 @@ def launcher_env_p_hostgap() -> Dict[str, str]:
     return {P_HOSTGAP_ENV: "1"}
 
 
+# ------------------------------------------------- proxy receive off the fence
+#: P-RECV-STREAM (launcher ``--p-recv-stream``, group P only; unset = the stock
+#: receive, byte-identical).
+#:
+#: WHAT THE #PGAP LINES SHOW (docker-acceptance 27b, 26.09.: i8B/i8drt/n4B, PP3,
+#: overlap on): the card idle of PP1/PP2 between two chunks does NOT follow the
+#: host work after the wait -- on i8drt PP2 it stays 6.5/6.8 ms while ``plan``
+#: alternates 2/15-21 ms, and over all 2048-chunks corr(gap, plan+process+recv)
+#: is 0.1-0.2 -- it follows the FRAME SIZE (PP2 i8B: 512 -> 1.7 ms, 1024 -> 4.2,
+#: 2048 -> 11.1 ms) and it is 0.1 ms on PP0, the one stage that receives no frame.
+#: The host is already one forward ahead: it launches chunk k while chunk k-1 is
+#: still on the card, and ``d2h_wait`` holds it until chunk k-1 (not k) is done.
+#:
+#: The idle is the proxy RECEIVE of chunk k, serialised behind forward k-1:
+#: ``recv_tensor_dict``'s ``irecv`` is issued on the schedule stream, the NCCL
+#: stream first waits for everything queued there, and the schedule stream
+#: carries the device fence on forward k-1 (``wait_event(launch_event)`` before
+#: the proxy send on PP0/PP1, the overlap fence on the last rank). So the frame
+#: can only start to move when forward k-1 has ended, and forward k waits for it.
+#:
+#: The switch issues that receive on a side stream with no fence on it, so the
+#: transfer overlaps forward k-1; the schedule stream then waits for the side
+#: stream (device-side), so forward k -- which waits for the schedule stream at
+#: launch -- still starts only after its frame has landed. Nothing moves on the
+#: host, the fence stays where it is for every other schedule-stream op, and the
+#: order of the NCCL operations on each pair is the host order, as before.
+P_RECV_STREAM_ENV = "SGLANG_WEG2_P_RECV_STREAM"
+
+#: The scheduler streams that may read a received frame. A tensor allocated on
+#: the side stream belongs to that stream's pool, so every other stream that
+#: reads it must be recorded, or the allocator may hand the block to the next
+#: receive while a forward still reads it.
+_FRAME_CONSUMER_STREAMS = ("forward_stream", "copy_stream", "spill_stream")
+
+
+def p_recv_stream_on() -> bool:
+    """P-RECV-STREAM: proxy receive on a side stream. Read per call."""
+    return os.environ.get(P_RECV_STREAM_ENV, "") == "1"
+
+
+def launcher_env_p_recv_stream() -> Dict[str, str]:
+    return {P_RECV_STREAM_ENV: "1"}
+
+
+def _cuda_tensors(message):
+    import torch
+
+    if not isinstance(message, dict):
+        return []
+    return [
+        v for v in message.values()
+        if isinstance(v, torch.Tensor) and getattr(v, "is_cuda", False)
+    ]
+
+
+def recv_off_fence(holder, recv, device_module, cuda_tensors=_cuda_tensors):
+    """Run ``recv(on_wire)`` with the rank's proxy-receive stream current.
+
+    ``recv`` is the blocking host call that posts the NCCL receives (and
+    allocates their buffers) on the CURRENT stream; ``on_wire`` must be called
+    by it with every message that comes off the wire, the stashed ones
+    included. Afterwards:
+
+    * the stream that was current before (the schedule stream) waits for the
+      side stream -- device-side, the host never waits here;
+    * every CUDA tensor of every wire message is recorded on that stream and on
+      the scheduler's forward/copy/spill streams, so the side pool cannot reuse
+      its block before those reads are done.
+
+    The side stream waits for nothing else, which is the point: the transfer
+    of chunk k is not queued behind the fence on forward k-1.
+    """
+    side = getattr(holder, "_weg2_recv_stream", None)
+    if side is None:
+        side = holder._weg2_recv_stream = device_module.Stream()
+    consumer = device_module.current_stream()
+    wire = []
+    with device_module.stream(side):
+        out = recv(wire.append)
+    consumer.wait_stream(side)
+    streams = [consumer]
+    for name in _FRAME_CONSUMER_STREAMS:
+        s = getattr(holder, name, None)
+        if s is not None and all(s is not x for x in streams):
+            streams.append(s)
+    for message in wire:
+        for t in cuda_tensors(message):
+            for s in streams:
+                t.record_stream(s)
+    holder._weg2_recv_stream_n = getattr(holder, "_weg2_recv_stream_n", 0) + 1
+    return out
+
+
 # ---------------------------------------------------------------- lead bound
 P_OVERLAP_LEAD_ENV = "SGLANG_WEG2_P_OVERLAP_LEAD"
 

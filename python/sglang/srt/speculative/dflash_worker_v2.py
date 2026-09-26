@@ -25,6 +25,10 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.weg2_d_hostgap import meter as _d_hostgap_meter
+from sglang.srt.managers.weg2_d_hostgap import split_mark as _d_hostgap_split_mark
+from sglang.srt.managers.weg2_d_hostgap import (
+    early_draft_window_exact as _early_draft_window_exact,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -646,6 +650,31 @@ class DFlashWorkerV2(BaseSpecWorker):
         from sglang.srt.managers.weg2_d_hostgap import defer_rebuild_on
 
         self._defer_rebuild = defer_rebuild_on()
+        # SGLANG_WEG2_D_EARLY_DRAFT (weg2_d_hostgap): stage 3 -- launch the
+        # draft before the host wait when the exact compact lengths are known
+        # without it (every committed length >= the draft window). Read once.
+        from sglang.srt.managers.weg2_d_hostgap import early_draft_on
+
+        self._early_draft = early_draft_on()
+        # SGLANG_DFLASH_ACCEPT_SYNC_FUSED: the five rank-0 broadcasts of the
+        # Triton accept outputs travel as ONE broadcast of a flat buffer the
+        # five outputs are views of (_ensure_accept_bonus_buffers). Read once.
+        self._accept_sync_fused = (
+            os.environ.get("SGLANG_DFLASH_ACCEPT_SYNC_FUSED", "") == "1"
+        )
+        self._accept_bonus_flats: List[torch.Tensor] = []
+        self._accept_bonus_last_flat: Optional[torch.Tensor] = None
+        if self._early_draft:
+            logger.info(
+                "DGAP-EARLY-DRAFT armed (SGLANG_WEG2_D_EARLY_DRAFT=1): a deferred "
+                "decode round whose committed lengths are all >= the draft window "
+                "launches the draft before the host wait"
+            )
+        if self._accept_sync_fused:
+            logger.info(
+                "DFLASH accept sync fused (SGLANG_DFLASH_ACCEPT_SYNC_FUSED=1): the "
+                "five Triton accept outputs travel as one rank-0 broadcast"
+            )
         # SGLANG_DFLASH_PLAN_SYNC_FREE (layers/dcp/verify_preplan.py): build
         # the verify's uneven-DCP owned-slot index before the draft and plan
         # draft + verify from exact host metadata. Resolved lazily: the target
@@ -1182,6 +1211,29 @@ class DFlashWorkerV2(BaseSpecWorker):
         token_to_kv_pool_allocator.register_free_listener(
             mapper.on_global_free, mapper.on_global_clear
         )
+        # SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY (default off): a D prefill of a
+        # span the radix already holds (e.g. past a mamba-refused match) writes
+        # its draft rows to FRESH slots, and the insert then frees those in
+        # favour of the tree's older slots, which carry no draft row -- the
+        # computed draft KV is thrown away and the window reads zero holes.
+        # With the switch the dedup hands each fresh draft row to the kept
+        # slot instead (dflash_solo_pool.DraftKVSlotMapper._apply_alias).
+        if self._window_pool and envs.SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY.get():
+            if hasattr(token_to_kv_pool_allocator, "register_alias_listener"):
+                token_to_kv_pool_allocator.register_alias_listener(
+                    mapper.on_global_alias
+                )
+                logger.info(
+                    "DFLASH window pool: DEDUP-CARRY armed "
+                    "(SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY=1) -- radix dedup "
+                    "moves the fresh draft rows to the kept slots."
+                )
+            else:
+                logger.warning(
+                    "DFLASH window pool: SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY=1 "
+                    "but allocator %s has no alias listener; carry NOT armed.",
+                    type(token_to_kv_pool_allocator).__name__,
+                )
         logger.info(
             "DFLASH small solo draft pool ACTIVE: ctx cap %d (%s), "
             "%d draft slots (= 1 + (cap %d + block %d) x max_running %d x "
@@ -2609,6 +2661,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         device = self.device
         block_size = int(self.block_size)
+        if getattr(self, "_accept_sync_fused", False):
+            self._alloc_fused_accept_bonus_buffers(new_cap, block_size, device)
+            self._accept_bonus_buffer_cap = new_cap
+            return
         self._accept_len_buf = torch.empty((new_cap,), dtype=torch.int32, device=device)
         self._commit_lens_bufs = [
             torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
@@ -2625,6 +2681,46 @@ class DFlashWorkerV2(BaseSpecWorker):
         ]
         self._accept_bonus_buffer_cap = new_cap
 
+    @staticmethod
+    def _fused_accept_layout(cap: int, block_size: int):
+        """SGLANG_DFLASH_ACCEPT_SYNC_FUSED: int32-word offsets of the five
+        Triton accept outputs inside ONE flat int32 buffer per slot --
+        accept_len | commit_lens | bonus (int32, cap each), then new_seq_lens
+        and out_tokens (int64, 8-byte aligned). Returns (offsets, total words)."""
+        cap = int(cap)
+        o_acc, o_com, o_bon = 0, cap, 2 * cap
+        o_nsl = 3 * cap + (3 * cap) % 2  # 8-byte alignment for the int64 views
+        o_out = o_nsl + 2 * cap
+        total = o_out + 2 * cap * int(block_size)
+        return (o_acc, o_com, o_bon, o_nsl, o_out), total
+
+    def _alloc_fused_accept_bonus_buffers(self, cap: int, block_size: int, device) -> None:
+        """Same shapes and dtypes as the per-tensor buffers, carved out of one
+        flat buffer per slot, so the five rank-0 broadcasts become one
+        broadcast of that buffer (pure data movement, byte-identical results).
+        accept_len gets one view per slot as well (the per-tensor layout keeps
+        one buffer; nothing reads it beyond the round)."""
+        (o_acc, o_com, o_bon, o_nsl, o_out), total = self._fused_accept_layout(
+            cap, block_size
+        )
+        flats = [
+            torch.zeros((total,), dtype=torch.int32, device=device) for _ in range(2)
+        ]
+        self._accept_bonus_flats = flats
+        self._accept_len_bufs_fused = [f[o_acc : o_acc + cap] for f in flats]
+        self._accept_len_buf = self._accept_len_bufs_fused[0]
+        self._commit_lens_bufs = [f[o_com : o_com + cap] for f in flats]
+        self._bonus_id_bufs = [f[o_bon : o_bon + cap] for f in flats]
+        self._new_seq_lens_bufs = [
+            f[o_nsl : o_nsl + 2 * cap].view(torch.int64) for f in flats
+        ]
+        self._out_tokens_bufs = [
+            f[o_out : o_out + 2 * cap * block_size].view(torch.int64).view(
+                cap, block_size
+            )
+            for f in flats
+        ]
+
     def _next_accept_bonus_buffers(self, bs: int) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -2636,6 +2732,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         assert self._accept_len_buf is not None
         slot = self._accept_bonus_buffer_slot
         self._accept_bonus_buffer_slot = (slot + 1) % 2
+        if getattr(self, "_accept_sync_fused", False) and self._accept_bonus_flats:
+            self._accept_bonus_last_flat = self._accept_bonus_flats[slot]
+            return (
+                self._accept_len_bufs_fused[slot][:bs],
+                self._commit_lens_bufs[slot][:bs],
+                self._bonus_id_bufs[slot][:bs],
+                self._out_tokens_bufs[slot][:bs],
+                self._new_seq_lens_bufs[slot][:bs],
+            )
         return (
             self._accept_len_buf[:bs],
             self._commit_lens_bufs[slot][:bs],
@@ -2707,8 +2812,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                         new_seq_lens_out=new_seq_lens,
                     )
                     # #1485b: the decisions this kernel derived, group-wide
-                    for _t in (accept_len, commit_lens, bonus, out_tokens, new_seq_lens):
-                        self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, _t)
+                    if self._accept_sync_fused:
+                        # SGLANG_DFLASH_ACCEPT_SYNC_FUSED: the five outputs are
+                        # views of this slot's flat buffer -- one broadcast.
+                        self._tp_sync.sync(
+                            SpecTpSyncSite.DFLASH_ACCEPT_GREEDY,
+                            self._accept_bonus_last_flat,
+                        )
+                    else:
+                        for _t in (accept_len, commit_lens, bonus, out_tokens, new_seq_lens):
+                            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, _t)
                 except Exception as e:
                     self._use_triton_accept_bonus = False
                     logger.warning(
@@ -3175,12 +3288,32 @@ class DFlashWorkerV2(BaseSpecWorker):
                 and self._solo_pool_mapper.sync_free
                 and draft_input.nxt_kv_lens_cpu is not None
             )
+            # SGLANG_WEG2_D_EARLY_DRAFT (stage 3, needs the deferred read): with
+            # page size 1 the exact compact length is min(len, window); when
+            # every row's host LOWER bound (the committed length the batch
+            # carried before the resolve) is >= the window, it is the window
+            # itself -- known without round N's lengths. The draft is then
+            # planned from exactly the values the waited path computes and
+            # launched before the wait; the wait is the verify's belt below.
+            _early_draft = bool(
+                self._early_draft
+                and seq_lens_cpu_ready is not None
+                and self.use_compact_draft_cache
+                and _early_draft_window_exact(
+                    seq_lens_cpu_ready,
+                    bs,
+                    self.draft_window_size,
+                    self.page_size,
+                    draft_input.nxt_kv_lens_cpu,
+                )
+            )
             if seq_lens_cpu_ready is not None and not _defer_rebuild:
                 # SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU: the block prep, the DCP
                 # prebuild (sized by the reservation bound, see
                 # _dcp_verify_prebuild) and the embedding with its all_reduce
                 # are queued; the draft prep below is the first exact read.
-                seq_lens_cpu_ready()
+                if not _early_draft:
+                    seq_lens_cpu_ready()
             seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
             # SGLANG_DFLASH_PLAN_SYNC_FREE: True only when seq_lens_cpu below
             # is the device length itself (published mirror, page_size 1,
@@ -3203,6 +3336,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self._compute_compact_draft_seq_lens_host(
                         draft_input.nxt_kv_lens_cpu, out=seq_lens_cpu
                     )
+                elif _early_draft:
+                    # Stage 3: every exact compact length is the window.
+                    seq_lens_cpu.fill_(int(self.draft_window_size))
+                    draft_host_lens_exact = self._compact_draft_host_lens_exact()
+                    _d_hostgap_split_mark("lens")
                 elif batch.seq_lens_cpu is not None:
                     self._compute_compact_draft_seq_lens_host(
                         batch.seq_lens_cpu, out=seq_lens_cpu
@@ -3276,11 +3414,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                         # host waits for round N's lengths and takes the exact
                         # compact mirror the draft plan reads (the same two
                         # calls the non-deferred branch above makes).
-                        seq_lens_cpu_ready()
-                        self._compute_compact_draft_seq_lens_host(
-                            batch.seq_lens_cpu, out=seq_lens_cpu
-                        )
+                        if _early_draft:
+                            # Stage 3: no wait -- the exact compact length of
+                            # every row is the window (see _early_draft).
+                            seq_lens_cpu.fill_(int(self.draft_window_size))
+                        else:
+                            seq_lens_cpu_ready()
+                            self._compute_compact_draft_seq_lens_host(
+                                batch.seq_lens_cpu, out=seq_lens_cpu
+                            )
                         draft_host_lens_exact = self._compact_draft_host_lens_exact()
+                        _d_hostgap_split_mark("lens")
                 else:
                     suffix_cache_loc = self._gather_req_to_token_segments(
                         req_to_token=self.model_runner.req_to_token_pool.req_to_token,
@@ -3375,6 +3519,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # block spec info, so it is raised for exactly this forward and
             # lowered again whatever happens inside it.
             self._draft_block_spec_info.host_lens_exact = draft_host_lens_exact
+            _d_hostgap_split_mark("fb")
             try:
                 with torch.inference_mode():
                     draft_out = self.draft_model_runner.forward(forward_batch)
@@ -3382,6 +3527,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._draft_block_spec_info.host_lens_exact = False
             _dgap = _d_hostgap_meter()  # #DGAP (SGLANG_WEG2_D_HOSTGAP)
             if _dgap is not None:
+                _dgap.mark("draft")
+                if _early_draft:
+                    _dgap.note_early_draft()
                 _dgap.mark_draft_launched()
             self._audit_mark("draft_fwd")  # DFLASH AUDIT (env-gated)
             draft_logits_output = draft_out.logits_output
@@ -3506,6 +3654,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
+        _d_hostgap_split_mark("vprep")
         self._audit_mark("verify_prep")  # DFLASH AUDIT (env-gated)
 
         # upstream #30096 (adapted to the fork's synchronous bitmask path, the
@@ -3524,6 +3673,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
+        _d_hostgap_split_mark("verify")
         self._audit_mark("verify")  # DFLASH AUDIT (env-gated)
 
         # SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX: the verify forward left this
@@ -3663,8 +3813,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                         new_seq_lens_out=new_seq_lens,
                     )
                     # #1485b: the decisions this kernel derived, group-wide
-                    for _t in (accept_len, commit_lens, bonus, out_tokens, new_seq_lens):
-                        self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, _t)
+                    if self._accept_sync_fused:
+                        # SGLANG_DFLASH_ACCEPT_SYNC_FUSED: the five outputs are
+                        # views of this slot's flat buffer -- one broadcast.
+                        self._tp_sync.sync(
+                            SpecTpSyncSite.DFLASH_ACCEPT_GREEDY,
+                            self._accept_bonus_last_flat,
+                        )
+                    else:
+                        for _t in (accept_len, commit_lens, bonus, out_tokens, new_seq_lens):
+                            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, _t)
                 except Exception as e:
                     self._use_triton_accept_bonus = False
                     logger.warning(

@@ -888,7 +888,15 @@ def apply_spec_form(ns) -> None:
 #: 63/42/74 ms per stage, ~24 ms fixed + ~0.9 ms per layer, independent of the
 #: token count, against ~48-71 ms of compute for a 512-token chunk.
 P_PREFILL_GRAPH_DEFAULT = 0
-_P_PREFILL_GRAPH: Dict[str, object] = {"bucket": P_PREFILL_GRAPH_DEFAULT, "tiny": ()}
+#: --p-prefill-graph-policy (27B line, user order 26.09. ~05:15Z: "cuda graphen
+#: im prefill nur anschalten wenn es was bringt, wenn es negativ ist,
+#: ausschalten"). The rule is weg2/p_graph_policy.py; 'auto' without a
+#: calibration table captures exactly the pre-switch set (argv byte-identical).
+P_PREFILL_GRAPH_POLICY_DEFAULT = "auto"
+_P_PREFILL_GRAPH: Dict[str, object] = {
+    "bucket": P_PREFILL_GRAPH_DEFAULT, "tiny": (), "captured": (), "legacy": (),
+    "policy": P_PREFILL_GRAPH_POLICY_DEFAULT, "verdicts": (), "calibration": None, "lines": (),
+}
 
 
 def apply_p_prefill_graph(ns) -> None:
@@ -896,11 +904,110 @@ def apply_p_prefill_graph(ns) -> None:
     install-once shape as apply_spec_form: every common_flags("P") call --
     the cut solve's chunk read, its armed re-check, the form key, the shipped
     argv -- reads this ONE value, so they cannot disagree)."""
+    from sglang.srt.weg2 import p_graph_policy as _pgp
+
     bucket = int(getattr(ns, "p_prefill_graph", P_PREFILL_GRAPH_DEFAULT) or 0)
     if bucket < 0:
         raise SystemExit(f"--p-prefill-graph must be >= 0, got {bucket}")
     _P_PREFILL_GRAPH["bucket"] = bucket
     _P_PREFILL_GRAPH["tiny"] = p_prefill_graph_tiny_of(ns, bucket)
+    policy = str(getattr(ns, "p_prefill_graph_policy", P_PREFILL_GRAPH_POLICY_DEFAULT)
+                 or P_PREFILL_GRAPH_POLICY_DEFAULT)
+    raw_extra = str(getattr(ns, "p_prefill_graph_buckets", "") or "").strip()
+    try:
+        extras = tuple(sorted({int(x) for x in raw_extra.split(",") if x.strip()}))
+    except ValueError:
+        raise SystemExit(f"--p-prefill-graph-buckets {raw_extra!r}: comma list of token counts expected")
+    cal = p_prefill_graph_calibration_of(ns)
+    try:
+        captured, verdicts = _pgp.decide(policy, bucket, _P_PREFILL_GRAPH["tiny"], extras, cal,
+                                         P_PREFILL_GRAPH_STAGES,
+                                         float(getattr(ns, "p_prefill_graph_min_gain",
+                                                       _pgp.DEFAULT_MIN_GAIN)))
+    except _pgp.GraphPolicyError as exc:
+        raise SystemExit(str(exc))
+    legacy = tuple(sorted(set(_P_PREFILL_GRAPH["tiny"]) | {bucket})) if bucket else ()
+    _P_PREFILL_GRAPH.update(
+        policy=policy, captured=tuple(captured), legacy=legacy, verdicts=tuple(verdicts),
+        calibration=cal,
+        lines=tuple(_pgp.decision_lines(policy, captured, verdicts, cal)) if bucket else (),
+    )
+
+
+def p_prefill_graph_calibration_of(ns):
+    """The graph calibration table: --p-prefill-graph-calibration PATH, else the
+    'graph_calibration' key of a --p-chunk-model JSON file, else None."""
+    from sglang.srt.weg2 import p_graph_policy as _pgp
+
+    path = str(getattr(ns, "p_prefill_graph_calibration", "") or "").strip()
+    try:
+        if path:
+            return _pgp.load_calibration(path)
+        src = str(getattr(ns, "p_chunk_model", "") or "").strip()
+        if src and src.endswith(".json") and os.path.isfile(src):
+            with open(src) as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and isinstance(data.get("graph_calibration"), dict):
+                return _pgp.Calibration.from_json(data["graph_calibration"])
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"--p-prefill-graph-calibration {path or src}: {exc}")
+    return None
+
+
+def p_prefill_graph_captured() -> List[int]:
+    """The buckets group P really captures (the policy's answer), ascending;
+    [] = no graph (switch off, or 'auto' found the graph slower everywhere)."""
+    return list(_P_PREFILL_GRAPH.get("captured", ()) or ())
+
+
+def p_prefill_graph_policy_lines() -> List[str]:
+    return list(_P_PREFILL_GRAPH.get("lines", ()) or ())
+
+
+def p_prefill_graph_vram_gate(ns, model_pool, pinned_layers, families, pool_floor, log):
+    """Extra buckets (above the main one) that 'auto' admitted must also fit:
+    the P cut's pool WITH their capture pool has to clear the pool floor.
+    Returns the (possibly rebuilt) pool model; drops the extras -- and says so
+    -- when they do not fit or when the cut is not pinned (the solved field
+    has no single cut to check against, so the safe side is taken)."""
+    from sglang.srt.planner import pp_cut as _pp_cut
+
+    captured = tuple(p_prefill_graph_captured())
+    legacy = tuple(_P_PREFILL_GRAPH.get("legacy", ()) or ())
+    extras = tuple(b for b in captured if b not in legacy)
+    if str(_P_PREFILL_GRAPH.get("policy")) != "auto" or not extras:
+        return model_pool
+    reason = None
+    counts = tuple(int(x) for x in (pinned_layers or ()))
+    if not counts or sum(counts) != len(families):
+        reason = "the cut is not pinned by --pp-stage-ratio"
+    else:
+        attn, lo = [], 0
+        for c in counts:
+            attn.append(sum(1 for f in families[lo:lo + c] if f == _pp_cut.LAYER_FAMILY_ATTENTION))
+            lo += c
+        try:
+            pool = _pp_cut.pp_phase_pool(counts, attn, model_pool)
+        except ValueError as exc:
+            pool, reason = None, f"the pinned cut is not priceable with them ({exc})"
+        if pool is not None:
+            if pool_floor is None or pool >= float(pool_floor):
+                log("P-PREFILL-GRAPH-POLICY VRAM gate: extra bucket(s) %s CARRIED -- pinned cut %s "
+                    "pool %d >= floor %s with prefill graph pool %s MiB/stage"
+                    % (list(extras), ",".join(map(str, counts)), int(pool), pool_floor,
+                       ",".join("%.1f" % v for v in model_pool.prefill_graph_pool_mib)))
+                return model_pool
+            reason = "pinned cut %s pool %d < floor %d with their capture pool" % (
+                ",".join(map(str, counts)), int(pool), int(pool_floor))
+    kept = tuple(b for b in captured if b in legacy)
+    _P_PREFILL_GRAPH["captured"] = kept
+    _P_PREFILL_GRAPH["lines"] = tuple(p_prefill_graph_policy_lines()) + (
+        "P-PREFILL-GRAPH-POLICY VRAM gate: extra bucket(s) %s DROPPED (%s); captured=%s"
+        % (list(extras), reason, list(kept) or "none"),)
+    log(_P_PREFILL_GRAPH["lines"][-1])
+    # The chunk policy prices the widths against the captured set: re-install.
+    apply_p_chunk_policy(ns)
+    return replace(model_pool, prefill_graph_pool_mib=p_prefill_graph_pool_mib(ns))
 
 
 def p_prefill_graph_tiny_of(ns, bucket: int) -> Tuple[int, ...]:
@@ -932,11 +1039,11 @@ def p_prefill_graph_tiny_of(ns, bucket: int) -> Tuple[int, ...]:
 
 
 def p_prefill_graph_buckets() -> List[int]:
-    """Every captured prefill bucket, ascending; [] when the graph is off."""
-    bucket = p_prefill_graph_bucket()
-    if not bucket:
+    """Every captured prefill bucket, ascending; [] when no graph is captured
+    (the switch off, or --p-prefill-graph-policy auto dropped every bucket)."""
+    if not p_prefill_graph_bucket():
         return []
-    return sorted(set(int(t) for t in _P_PREFILL_GRAPH.get("tiny", ()) or ()) | {bucket})
+    return p_prefill_graph_captured()
 
 
 def p_prefill_graph_bucket() -> int:
@@ -975,8 +1082,7 @@ def p_prefill_graph_flags() -> List[str]:
         requests runs eager (named by the runner's PREFILL-GRAPH eager line),
         and the captured linear-attention metadata never sees a sentinel row.
     """
-    bucket = p_prefill_graph_bucket()
-    if not bucket:
+    if not p_prefill_graph_buckets():
         return []
     return [
         "--cuda-graph-config",
@@ -1018,8 +1124,7 @@ def p_prefill_graph_pool_mib(ns) -> Tuple[float, ...]:
     off. ONE vector for both sides of the seam: the pool model's
     PhasePoolModel.prefill_graph_pool_mib and the ranks' SGLANG_KV_BUDGET_
     PREFILL_GRAPH_MIB (p_prefill_graph_env) are both built from this call."""
-    bucket = p_prefill_graph_bucket()
-    if not bucket:
+    if not p_prefill_graph_buckets():
         return ()
     raw = str(getattr(ns, "p_prefill_graph_pool_mib", "") or "").strip()
     if raw:
@@ -1069,7 +1174,7 @@ def p_prefill_graph_env(
     default env stays byte-identical). ``max_prefix`` is
     --p-prefill-graph-max-prefix: None (the default) sets nothing, i.e. no
     depth threshold."""
-    if not p_prefill_graph_bucket():
+    if not p_prefill_graph_buckets():
         return {}
     env = {
         # model_runner_kv_cache_mixin.PREFILL_GRAPH_POOL_ENV: the runtime
@@ -1096,6 +1201,20 @@ def p_prefill_graph_line() -> str:
         return (
             "WEG2 P-PREFILL-GRAPH: off -- group P prefills eager at "
             f"--chunked-prefill-size {CHUNKED_PREFILL_TOKENS} (default form)"
+        )
+    if not p_prefill_graph_buckets():
+        return (
+            f"WEG2 P-PREFILL-GRAPH: bucket={bucket} but NOTHING captured "
+            f"(--p-prefill-graph-policy {_P_PREFILL_GRAPH.get('policy')}: the calibration puts "
+            f"eager ahead at every width) -- group P runs --chunked-prefill-size {bucket} EAGER"
+        )
+    if p_prefill_graph_buckets() != list(_P_PREFILL_GRAPH.get("legacy", ()) or ()):
+        return (
+            f"WEG2 P-PREFILL-GRAPH: bucket={bucket} captured={p_prefill_graph_buckets()} "
+            f"(--p-prefill-graph-policy {_P_PREFILL_GRAPH.get('policy')}) -- group P runs "
+            f"--chunked-prefill-size {p_chunked_prefill_tokens()} ({' '.join(p_prefill_graph_flags())}); "
+            "a chunk replays the smallest captured bucket that holds it, above the largest it "
+            "runs eager ('PREFILL-GRAPH eager reason=')"
         )
     tiny = [b for b in p_prefill_graph_buckets() if b != bucket]
     return (
@@ -1174,7 +1293,97 @@ P_CHUNK_MSCALES = {
 P_CHUNK_GRAPH_FIXED_MS = 2.0
 #: The dry-run ladder the launcher prints its plan for (the Messplan rungs).
 P_CHUNK_DRY_RUN_TOKENS = (2048, 8192, 32768, 131072)
-_P_CHUNK: Dict[str, object] = {"policy": P_CHUNK_POLICY_DEFAULT, "spec": None}
+_P_CHUNK: Dict[str, object] = {"policy": P_CHUNK_POLICY_DEFAULT, "spec": None, "power_lines": ()}
+#: --p-power-scale (release table row 27, weg2/power_limit.py). 'off' = the
+#: model is used as calibrated (spec byte-identical); only warning lines added.
+P_POWER_SCALE_DEFAULT = "off"
+P_POWER_SCALE_LAWS = ("off", "linear", "power")
+#: The card class of each P stage: PP0 on the 5090, PP1/PP2 on the 3080s
+#: (order_cards; the builtin/fit models name no cards).
+P_STAGE_CARD_CLASSES = ("RTX5090", "RTX3080", "RTX3080")
+
+
+def p_chunk_model_power_limits(src: str, stages: int) -> Tuple[Optional[List[Optional[float]]], str]:
+    """(calibration power limit per P stage, where it came from) of a
+    --p-chunk-model source; ``None`` = the model does not know its limit (an
+    old JSON, or a fit log from before row 27): warned, never refused.
+
+    builtin-int8: the weg2rc7c fit (25.09.) ran under the rig limits of
+    24.09. (power_limit.RIG_POWER_LIMIT_W_0924, bracketing readings);
+    fit:<P.log>: that log's own ``POWER-LIMIT rank`` lines (PP<r>);
+    JSON: its ``power_limit_w`` field."""
+    from sglang.srt.weg2 import power_limit as _pl
+
+    src = str(src or P_CHUNK_MODEL_DEFAULT).strip()
+    classes = list(P_STAGE_CARD_CLASSES[:stages]) + [P_STAGE_CARD_CLASSES[-1]] * max(0, stages - 3)
+    if src == "builtin-int8":
+        return ([_pl.RIG_POWER_LIMIT_W_0924.get(c) for c in classes],
+                f"builtin rig limits ({_pl.RIG_POWER_LIMIT_PROVENANCE})")
+    if src.startswith("fit:"):
+        path = src[4:]
+        try:
+            with open(path, "rb") as fh:
+                found = _pl.parse_boot_lines(
+                    raw.decode("utf-8", "replace") for raw in fh if b"POWER-LIMIT rank " in raw)
+        except OSError:
+            found = {}
+        vals = [found.get(f"PP{r}", {}).get("power_limit_w") for r in range(stages)]
+        if not any(v is not None for v in vals):
+            return None, f"fit log {os.path.basename(path)} has no POWER-LIMIT rank line (predates row 27)"
+        return [None if v is None else float(v) for v in vals], f"fit log {os.path.basename(path)} POWER-LIMIT lines"
+    try:
+        with open(src) as fh:
+            data = json.load(fh)
+        vals = _pl.stage_limits_from_json(data, stages)
+    except (OSError, ValueError, _pl.PowerLimitError) as exc:
+        return None, f"json:{os.path.basename(src)} power_limit_w unreadable ({exc})"
+    if vals is None:
+        return None, f"json:{os.path.basename(src)} has no power_limit_w (old JSON)"
+    return vals, f"json:{os.path.basename(src)} power_limit_w"
+
+
+def p_stage_power_current(stages: int) -> Tuple[List[Optional[float]], List[str]]:
+    """(running power limit per P stage, stage labels): PP<r> is the r-th card
+    of order_cards (5090 first), read from NVML by UUID. Unknown (NVML
+    unavailable) = None per stage, labels without a card."""
+    from sglang.srt.weg2 import power_limit as _pl
+
+    try:
+        cards = order_cards(resolve_cards())
+        cur = _pl.read_current()
+    except Exception:  # noqa: BLE001 - the check degrades to 'unknown', it never blocks a boot
+        return [None] * stages, [f"PP{r}" for r in range(stages)]
+    vals, labels = [], []
+    for r in range(stages):
+        c = cards[r] if r < len(cards) else None
+        w = cur.get(c.uuid, (None, ""))[0] if c is not None else None
+        vals.append(None if w is None else float(w))
+        labels.append(f"PP{r}" + (f"(nvml{c.nvml_index} {_pl.card_class(c.name)})" if c is not None else ""))
+    return vals, labels
+
+
+def apply_p_power_check(ns, models, source: str, src: str):
+    """Row 27 on the installed chunk model: compare, warn, optionally rescale.
+    Returns (models, source); both unchanged under --p-power-scale off."""
+    from sglang.srt.weg2 import power_limit as _pl
+
+    law = str(getattr(ns, "p_power_scale", P_POWER_SCALE_DEFAULT) or P_POWER_SCALE_DEFAULT)
+    alpha = getattr(ns, "p_power_scale_exponent", None)
+    try:
+        _pl.exponent_of(law, alpha)
+    except _pl.PowerLimitError as exc:
+        raise SystemExit(f"--p-power-scale: {exc}")
+    n = len(models)
+    cal, cal_src = p_chunk_model_power_limits(src, n)
+    cur, labels = p_stage_power_current(n)
+    verdicts = _pl.check(labels, cal or [None] * n, cur, law, alpha)
+    lines = _pl.verdict_lines("p-chunk-model", verdicts, law, alpha, cal_src)
+    _P_CHUNK["power_lines"] = tuple(lines)
+    if not any(v.factor != 1.0 for v in verdicts):
+        return models, source
+    models = tuple(_pl.scale_stage_model(m, v.factor) for m, v in zip(models, verdicts))
+    tag = ",".join(f"PP{r}x{v.factor:.4f}" for r, v in enumerate(verdicts) if v.factor != 1.0)
+    return models, f"{source} +powerscale:law={law},{tag} ({_pl.MODEL_LABEL})"
 
 
 def _p_chunk_stage(a_ms: float, b_ms_per_1k: float, fwd_overhead_ms: float,
@@ -1265,6 +1474,7 @@ def apply_p_chunk_policy(ns) -> None:
         raise SystemExit(f"--p-chunk-policy {policy!r}: one of {list(_pcp.POLICIES)}")
     _P_CHUNK["policy"] = policy
     _P_CHUNK["spec"] = None
+    _P_CHUNK["power_lines"] = ()
     if policy == _pcp.POLICY_FIXED:
         return
     bucket = p_prefill_graph_bucket()
@@ -1279,6 +1489,26 @@ def apply_p_chunk_policy(ns) -> None:
         str(getattr(ns, "p_chunk_mscale", P_CHUNK_MSCALE_DEFAULT) or P_CHUNK_MSCALE_DEFAULT),
         P_PREFILL_GRAPH_STAGES,
     )
+    # --p-prefill-graph-policy: the plan prices every width in the mode the
+    # policy decided (graph or eager), from the SAME calibration table. No
+    # table = the models are untouched (spec byte-identical).
+    _cal = _P_PREFILL_GRAPH.get("calibration")
+    if _cal is not None and bucket:
+        from sglang.srt.weg2 import p_graph_policy as _pgp
+
+        models = _pgp.overlay_stage_models(models, _cal, buckets)
+        source = f"{source} +graphcal:{_cal.source or 'table'}"
+    # Release table row 27: the model's calibration power limit against the
+    # running one (after the graph overlay, so a rescale covers every point
+    # the plan prices). --p-power-scale off: models/source untouched.
+    models, source = apply_p_power_check(
+        ns, models, source,
+        str(getattr(ns, "p_chunk_model", P_CHUNK_MODEL_DEFAULT) or P_CHUNK_MODEL_DEFAULT))
+    _sweep_raw = str(getattr(ns, "p_chunk_sweep", "") or "").strip()
+    try:
+        _sweep = tuple(int(x) for x in _sweep_raw.split(",") if x.strip())
+    except ValueError:
+        raise SystemExit(f"--p-chunk-sweep {_sweep_raw!r}: comma list of token counts expected")
     try:
         limits = _pcp.ChunkLimits(
             max_tokens=cap, min_tokens=low, fixed_tokens=fixed, page=1,
@@ -1287,6 +1517,7 @@ def apply_p_chunk_policy(ns) -> None:
             min_gain=float(getattr(ns, "p_chunk_min_gain", _pcp.DEFAULT_MIN_GAIN)),
             dynamic_min_tokens=int(getattr(ns, "p_chunk_dynamic_min_tokens",
                                            P_CHUNK_DYNAMIC_MIN_TOKENS_DEFAULT) or 0),
+            sweep=_sweep,
         )
     except _pcp.ChunkPolicyError as exc:
         raise SystemExit(f"--p-chunk-policy dynamic: {exc}")
@@ -1306,6 +1537,13 @@ def p_chunk_policy_env() -> Dict[str, str]:
     if spec is None:
         return {}
     return {_pcp.POLICY_ENV: _pcp.POLICY_DYNAMIC, _pcp.SPEC_ENV: spec.to_json()}
+
+
+def p_chunk_power_lines() -> List[str]:
+    """Row 27: the chunk model's power-limit check (one line per P stage, loud
+    on a > 5 % mismatch, a warning for a model without power_limit_w) plus the
+    SCALE line when --p-power-scale rescaled it. [] under 'fixed'."""
+    return ["WEG2 " + ln for ln in (_P_CHUNK.get("power_lines") or ())]
 
 
 def p_chunk_policy_lines() -> List[str]:
@@ -1329,6 +1567,411 @@ def p_chunk_policy_lines() -> List[str]:
         out.append("WEG2 " + _pcp.plan_line(res, key=f"dry-run-{n}", start=0, end=n)
                    + " (HOCHRECHNUNG on the model, not a measurement)")
     return out
+
+
+#: --p-layer-split (27B, user order 26.09. ~05:35Z: "dynamisches layersplit ...
+#: ohne neue ranks ... umsetzen"). The rule lives in weg2/p_layer_split.py
+#: (pure); design and evidence /spinning/gpu-arb/docs/DYN_LAYER_SPLIT.md.
+#: 'static' (the default until the metal ladder) changes NOTHING: no env, no
+#: line, argv and the P form key byte-identical. 'dynamic' builds and prints
+#: the spec, the swing slab and its dry-run plans and hands group P the spec
+#: env; the rank-side executor is weg2/p_layer_split_runtime.py (resident
+#: swing window under tag weights_swing, write-back on the proxy frame, the
+#: row on the #791 decision, prefix pull + weight refill upstream, graph
+#: bypass for non-home cuts). With PREFIX PULL by default (sec. 5: without
+#: pull there is no gain); --p-layer-split-pull-gbps 0 is the V1 frontier.
+P_LAYER_SPLIT_DEFAULT = "static"
+#: the measured x4-3080 BAR1 rate that bounds both 27B P edges (card probe
+#: 14.4 / 6.5 / 13.3 GB/s) -- the planner's price of a pull
+P_LAYER_SPLIT_PULL_GBPS_DEFAULT = 6.5
+P_LAYER_SPLIT_DRY_RUN_TOKENS = (32768, 131072)
+_P_LAYER_SPLIT: Dict[str, object] = {"policy": P_LAYER_SPLIT_DEFAULT, "spec": None, "lines": ()}
+
+
+def _int_list(raw: str, what: str) -> Tuple[int, ...]:
+    try:
+        return tuple(int(x) for x in str(raw).split(",") if x.strip() != "")
+    except ValueError:
+        raise SystemExit(f"{what} {raw!r}: expected comma-separated integers")
+
+
+def p_layer_split_spec_from_ns(ns):
+    """The SplitSpec a 'dynamic' boot would hand group P (no side effects).
+    The stage model is SG's per-layer-type model (weg2/p_stage_model.py):
+    a JSON path or a name under p_stage_model_data/ (27b_int8_rc9j,
+    27b_nvfp4_rc9j)."""
+    from sglang.srt.weg2 import p_chunk_policy as _pcp
+    from sglang.srt.weg2 import p_layer_split as _pls
+    from sglang.srt.weg2 import p_stage_model as _psm
+
+    home = _int_list(getattr(ns, "p_layer_split_home", "") or "", "--p-layer-split-home")
+    window = _int_list(getattr(ns, "p_layer_split_window", "") or "", "--p-layer-split-window")
+    max_attn = _int_list(getattr(ns, "p_layer_split_max_attn", "") or "", "--p-layer-split-max-attn")
+    src = str(getattr(ns, "p_layer_split_model", "") or "")
+    if not home or not window or not src:
+        raise SystemExit("--p-layer-split dynamic needs --p-layer-split-home, "
+                         "--p-layer-split-window and --p-layer-split-model")
+    path = src if os.path.sep in src or src.endswith(".json") else os.path.join(
+        os.path.dirname(_psm.__file__), "p_stage_model_data", src + ".json")
+    try:
+        model = _psm.load_model(path)
+    except (OSError, ValueError, KeyError, _psm.StageModelError) as exc:
+        raise SystemExit(f"--p-layer-split-model {src}: {exc}")
+    floors = tuple(float(r["eager_floor_ms"]) / n for r, n in zip(P_CHUNK_BUILTIN_INT8, (42, 11, 11)))
+    try:
+        geom = _pls.SplitGeometry(_pls.hybrid_families(model.n_layers, 4), home, window, max_attn)
+        chunk = p_chunk_policy_spec()
+        limits = chunk.limits if chunk is not None else _pcp.ChunkLimits(
+            max_tokens=P_CHUNK_MAX_DEFAULT, min_tokens=p_prefill_graph_bucket() or 512,
+            fixed_tokens=p_prefill_graph_bucket() or 512, page=1,
+            graph_buckets=tuple(p_prefill_graph_buckets()), eager=True)
+        _pull_raw = getattr(ns, "p_layer_split_pull_gbps", None)
+        pull = P_LAYER_SPLIT_PULL_GBPS_DEFAULT if _pull_raw is None else float(_pull_raw)
+        extra = _pls.ExtraCosts(
+            _pls.WritebackPrice(2048, 1634304, tuple(6.5 for _ in home), True),
+            floors[: len(home) + 1], tuple(pull for _ in home) if pull > 0 else ())
+        spec = _pls.SplitSpec(geom, model, limits,
+                              float(getattr(ns, "p_layer_split_min_gain", _pls.DEFAULT_MIN_GAIN)),
+                              "every", os.path.basename(path), extra)
+        _pls.check_layout(geom, model)
+        return spec
+    except (_pls.LayerSplitError, _pcp.ChunkPolicyError) as exc:
+        raise SystemExit(f"--p-layer-split dynamic: {exc}")
+
+
+def apply_p_layer_split(ns) -> None:
+    """Install --p-layer-split once, after --p-chunk-policy (joint plan)."""
+    from sglang.srt.weg2 import p_layer_split as _pls
+
+    policy = str(getattr(ns, "p_layer_split", P_LAYER_SPLIT_DEFAULT) or P_LAYER_SPLIT_DEFAULT)
+    if policy not in _pls.POLICIES:
+        raise SystemExit(f"--p-layer-split {policy!r}: one of {list(_pls.POLICIES)}")
+    _P_LAYER_SPLIT["policy"] = policy
+    _P_LAYER_SPLIT["spec"] = None
+    _P_LAYER_SPLIT["lines"] = ()
+    if policy == _pls.POLICY_STATIC:
+        return
+    if os.environ.get(PP_LAYER_SET_ENV, "").strip() or getattr(ns, "pp_layer_set", None):
+        raise SystemExit("--p-layer-split dynamic: REFUSED -- a layer SET (SGLANG_PP_LAYER_SET / "
+                         "--pp-layer-set) is not the contiguous home cut the split mirrors")
+    spec = p_layer_split_spec_from_ns(ns)
+    ratio = str(getattr(ns, "pp_stage_ratio", "") or "")
+    if ratio:
+        counts = _int_list(ratio, "--pp-stage-ratio")
+        ends = tuple(sum(counts[: i + 1]) for i in range(len(counts) - 1))
+        if ends != spec.geometry.home_cuts:
+            raise SystemExit(f"--p-layer-split dynamic: REFUSED -- --pp-stage-ratio {ratio} cuts at "
+                             f"{list(ends)} but --p-layer-split-home is {list(spec.geometry.home_cuts)}; "
+                             f"the home cut IS the P partition (one cut, one author)")
+    lines = ["WEG2 " + _pls.armed_line(spec, "group=P")]
+    lines += ["WEG2 " + x for x in p_layer_split_slab_lines(spec)]
+    for n in P_LAYER_SPLIT_DRY_RUN_TOKENS:
+        res = _pls.plan_split(n, spec.geometry, spec.model, spec.limits, min_gain=spec.min_gain,
+                              extra=spec.extra)
+        lines.append("WEG2 " + _pls.plan_line(res, key=f"dry-run-{n}", end=n)
+                     + " (HOCHRECHNUNG on the model, not a measurement)")
+    _P_LAYER_SPLIT["spec"] = spec
+    _P_LAYER_SPLIT["lines"] = tuple(lines)
+    for line in lines:
+        print(line, flush=True)
+
+
+def p_layer_split_swing_by_stage(n_stages: int) -> Tuple[Tuple[int, int], ...]:
+    """The planner's swing post: (attention, linear) swing layers per P stage;
+    () under static or when the spec's stage count is not P's."""
+    from sglang.srt.weg2 import p_layer_split as _pls
+
+    spec = _P_LAYER_SPLIT.get("spec")
+    if spec is None or spec.geometry.stages != int(n_stages):
+        return ()
+    g = spec.geometry
+    out = []
+    for s in range(g.stages):
+        win = tuple(g.swing_window(s))
+        na = sum(1 for i in win if g.families[i] == _pls.FAMILY_ATTENTION)
+        out.append((na, len(win) - na))
+    return tuple(out)
+
+
+def p_layer_split_slab_lines(spec) -> List[str]:
+    """The swing slab per stage as the planner's post (weights from the rc9
+    checkpoint census, DYN_LAYER_SPLIT.md sec. 2; the rank-side sizer prices
+    the mirrors exactly, pool_configurator swing_extra_layer_counts)."""
+    from sglang.srt.weg2 import p_layer_split as _pls
+
+    g = spec.geometry
+    out = []
+    for s in range(g.stages - 1):
+        win = tuple(g.swing_window(s))
+        na = sum(1 for i in win if g.families[i] == _pls.FAMILY_ATTENTION)
+        out.append(f"{_pls.LOG_TAG} slab stage={s} window={list(win)} attention={na} gdn={len(win) - na} "
+                   f"(KV mirror = {na} x pool x 2048 B/token, state mirror = {len(win) - na} x mamba slots "
+                   f"x 1.56 MiB, weights resident under tag weights_swing)")
+    return out
+
+
+def p_layer_split_env() -> Dict[str, str]:
+    """Group P's environment for the layer split; {} under 'static'."""
+    from sglang.srt.weg2 import p_layer_split as _pls
+
+    spec = _P_LAYER_SPLIT.get("spec")
+    if spec is None:
+        return {}
+    return {_pls.POLICY_ENV: _pls.POLICY_DYNAMIC, _pls.SPEC_ENV: spec.to_json()}
+
+
+#: --d-reshard (27B, user order 26.09. ~08:40Z/08:45Z: dynamic D resharding per
+#: load class, "nur auf TP1<, nicht fuers nf"). Rule and model live in
+#: weg2/d_reshard.py (pure); design/evidence /spinning/gpu-arb/docs/DYN_D_RESHARD.md.
+#: 'off' (default) changes NOTHING: no env, no line, D argv byte-identical.
+#: 'wake' with ONE preset is the static MLP family vector (--rank-mlp-ratio on
+#: group D; the flip plan reads the loaders' own widths, xchg_manifest.family_ratios)
+#: and needs no executor. 'wake' with >= 2 presets and 'live' print the spec and
+#: the desk plan, then REFUSE: the rank-side executor (per-preset MLP views, graph
+#: sets, per-preset manifest rows, the planner's spread posten) is not wired.
+#: Any profile other than qwen27b (NF Form A) is refused, never ignored.
+D_RESHARD_DEFAULT = "off"
+D_RESHARD_DRY_RUN_LOADS = (("decode", 1, 32768), ("decode", 4, 32768), ("decode", 1, 131072),
+                           ("prefill", 1, 4096))
+_D_RESHARD: Dict[str, object] = {"policy": D_RESHARD_DEFAULT, "spec": None, "lines": ()}
+
+
+def d_reshard_format(model_path: str) -> str:
+    """'int8' | 'nvfp4' | '' -- the checkpoint formats the D model is calibrated for."""
+    qm = checkpoint_quant_method(str(model_path))
+    if qm == "compressed-tensors":
+        return "int8"
+    if qm == "modelopt":
+        return "nvfp4"
+    return ""
+
+
+def apply_d_reshard(ns) -> None:
+    """Install --d-reshard once, before any argv is built."""
+    from sglang.srt.weg2 import d_reshard as _dr
+
+    policy = str(getattr(ns, "d_reshard", D_RESHARD_DEFAULT) or D_RESHARD_DEFAULT)
+    if policy not in _dr.POLICIES + (_dr.POLICY_WAKE_SEG,):
+        raise SystemExit(f"--d-reshard {policy!r}: one of {list(_dr.POLICIES) + [_dr.POLICY_WAKE_SEG]}")
+    _D_RESHARD.update(policy=policy, spec=None, lines=())
+    if policy == _dr.POLICY_OFF:
+        return
+    # 'wake-seg' (SB 26.09.): 'wake' whose preset minimises the SEGMENT round
+    # (sum over layer segments of the slowest rank, d_reshard sec. "Segment
+    # model"), not the per-rank sums -- rc9meas refuted the sum objective.
+    objective = _dr.OBJECTIVE_SUM
+    if policy == _dr.POLICY_WAKE_SEG:
+        policy, objective = _dr.POLICY_WAKE, _dr.OBJECTIVE_SEGMENT
+    model = str(getattr(ns, "model", "") or "")
+    try:
+        with open(model_config_path(model)) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"--d-reshard {policy}: cannot read the model config of {model!r}: {exc}")
+    try:
+        _dr.check_profile(_dr.profile_of_config(cfg), policy)
+    except _dr.ReshardProfileRefused as exc:
+        raise SystemExit(str(exc))
+    fmt = d_reshard_format(model)
+    if fmt not in ("int8", "nvfp4"):
+        raise SystemExit(f"--d-reshard {policy}: REFUSED -- no D cost model for checkpoint format "
+                         f"{checkpoint_quant_method(model)!r} (calibrated: INT8 compressed-tensors, "
+                         f"NVFP4 modelopt; DYN_D_RESHARD.md sec. 1)")
+    raw_presets = str(getattr(ns, "d_reshard_presets", "auto") or "auto").strip()
+    seg_points, seg_place, seg_shares = (), "capacity", None
+    try:
+        if objective == _dr.OBJECTIVE_SEGMENT:
+            seg_points = _dr.seg_ladder(d_reshard_depth(getattr(ns, "d_reshard_depth", "robust")))
+            seg_place, seg_shares = _d_reshard_seg_placement(ns)
+        if objective == _dr.OBJECTIVE_SEGMENT and raw_presets == "auto":
+            vec, _worst, _reg = _dr.seg_choose(fmt, seg_points, _dr.rc9_geometry(fmt).mlp_units,
+                                               seg_place, seg_shares)
+            presets = (_dr.Preset("seg", tuple(vec)),)
+        else:
+            presets = _dr.parse_presets(raw_presets, fmt)
+        spec = _dr.ReshardSpec(policy, tuple(_dr.RC9_BASE), presets, presets[0].name,
+                               float(getattr(ns, "d_reshard_min_gain", _dr.DEFAULT_MIN_GAIN)), fmt,
+                               objective)
+        spec.validate(_dr.rc9_geometry(fmt))
+    except (_dr.ReshardError, ValueError) as exc:
+        raise SystemExit(f"--d-reshard {policy}: {exc}")
+    loads = [_dr.LoadClass(k, b, c) for k, b, c in D_RESHARD_DRY_RUN_LOADS]
+    lines = ["WEG2 " + _dr.armed_line(spec, "group=D")]
+    if objective == _dr.OBJECTIVE_SEGMENT:
+        lines += ["WEG2 " + x + " (HOCHRECHNUNG on the segment model, not a measurement)"
+                  for x in _dr.seg_plan_lines(fmt, spec.presets[0].mlp, seg_points, seg_place, seg_shares)]
+    else:
+        lines += ["WEG2 " + x + " (HOCHRECHNUNG on the model, not a measurement)"
+                  for x in _dr.plan_lines(spec, fmt, loads)]
+    if policy == _dr.POLICY_LIVE:
+        raise SystemExit("\n".join(lines) + "\n--d-reshard live: REFUSED -- a live switch moves the "
+                         "MLP units over BAR1 (~0.2-0.3 s each way) for at most 33 ms (INT8) / 111 ms "
+                         "(NVFP4) per 4096-token D-prefill chunk, and D prefills at most 3 chunks under "
+                         "the X ceiling (DYN_D_RESHARD.md sec. 2.4).")
+    if len(spec.presets) > 1:
+        raise SystemExit("\n".join(lines) + "\n--d-reshard wake: REFUSED -- more than one preset "
+                         "needs the rank-side executor (per-preset MLP views, graph sets, manifest "
+                         "rows, spread posten), which is not wired (DYN_D_RESHARD.md sec. 7).")
+    _D_RESHARD.update(spec=spec, lines=tuple(lines))
+
+
+def d_reshard_depth(raw) -> Optional[int]:
+    """--d-reshard-depth: 'robust' -> None (the measured ladder 10k..240k, bs1/bs2),
+    else the expected per-request depth in tokens ('131072', '128k')."""
+    r = str(raw or "robust").strip().lower()
+    if r == "robust":
+        return None
+    mult = 1024 if r.endswith("k") else 1
+    n = int(float(r[:-1] if r.endswith("k") else r) * mult)
+    if n <= 0:
+        raise ValueError(f"--d-reshard-depth {raw!r}: expected 'robust' or a positive token count")
+    return n
+
+
+def _d_reshard_seg_placement(ns) -> Tuple[str, Optional[Tuple[float, ...]]]:
+    """The token placement the segment objective prices (the one this boot runs)."""
+    if str(getattr(ns, "d_token_placement", "capacity") or "capacity") != "bandwidth":
+        return "capacity", None
+    raw = str(getattr(ns, "d_token_shares", "auto") or "auto")
+    return "bandwidth", (None if raw == "auto" else tuple(float(x) for x in raw.split(",")))
+
+
+def d_reshard_lines() -> Tuple[str, ...]:
+    return tuple(_D_RESHARD.get("lines") or ())
+
+
+def d_reshard_argv(d_ratio_flags: Sequence[str], extra_d: Sequence[str]) -> List[str]:
+    """Group D's extra argv: [] under 'off'; under a single-preset 'wake' the MLP
+    family vector. Refuses a base vector the presets were not built for, and a
+    hand-written --rank-mlp-ratio next to it (two authors of one vector)."""
+    spec = _D_RESHARD.get("spec")
+    if spec is None:
+        return []
+    flags = list(d_ratio_flags)
+    base = ",".join(str(x) for x in spec.base)
+    if "--rank-tp-ratio" not in flags or flags[flags.index("--rank-tp-ratio") + 1] != base:
+        raise SystemExit(f"--d-reshard {spec.policy}: REFUSED -- group D's weight vector is "
+                         f"{flags} but the presets are built on --rank-tp-ratio {base}")
+    if any(str(a).startswith("--rank-mlp-ratio") for a in extra_d):
+        raise SystemExit("--d-reshard: REFUSED -- --extra-d already carries --rank-mlp-ratio")
+    return ["--rank-mlp-ratio", ",".join(str(u) for u in spec.presets[0].mlp)]
+
+
+def d_reshard_env() -> Dict[str, str]:
+    """Group D's environment for the reshard; {} under 'off'."""
+    from sglang.srt.weg2 import d_reshard as _dr
+
+    spec = _D_RESHARD.get("spec")
+    if spec is None:
+        return {}
+    env = {_dr.POLICY_ENV: spec.policy, _dr.SPEC_ENV: spec.to_json()}
+    if spec.objective != _dr.OBJECTIVE_SUM:
+        env[_dr.OBJECTIVE_ENV] = spec.objective  # the D-SPEED table on group D follows it
+    return env
+
+
+#: --d-gc-freeze (SB 26.09., agent FR: three single-rank D-round stalls of ~0.5 s,
+#: candidate a Python gen-2 collection).  'on' = group D's schedulers call
+#: gc.freeze() once every runner is up (after the CUDA-graph capture), so the
+#: boot-time objects leave the collector's generations.  'off' (default) = no env.
+D_GC_FREEZE_DEFAULT = "off"
+
+
+def d_gc_env(ns) -> Dict[str, str]:
+    from sglang.srt.weg2 import gc_instrument as _gci
+
+    if str(getattr(ns, "d_gc_freeze", D_GC_FREEZE_DEFAULT) or D_GC_FREEZE_DEFAULT) != "on":
+        return {}
+    return {_gci.FREEZE_ENV: "1"}
+
+
+#: --d-token-placement (27B, user 26.09. ~09:40Z/09:45Z: "es muss dynamisch
+#: sein ... den kv so zu verteilen wie er optimal schnell ist zur jeweiligen
+#: fuelle"). weg2/d_token_placement.py: NEW D tokens pick the card through the
+#: allocator's slot id (weighted owner rule), by effective bandwidth while the
+#: pool has room, by capacity when it is tight; stored KV never moves.
+#: 'capacity' (default) = today: no env, argv byte-identical.
+D_TOKEN_PLACEMENT_DEFAULT = "capacity"
+_D_TOKEN_PLACEMENT: Dict[str, object] = {"spec": None}
+
+
+def apply_d_token_placement(ns) -> None:
+    from sglang.srt.weg2 import d_reshard as _dr
+    from sglang.srt.weg2 import d_token_placement as _dtp
+
+    policy = str(getattr(ns, "d_token_placement", D_TOKEN_PLACEMENT_DEFAULT) or D_TOKEN_PLACEMENT_DEFAULT)
+    _D_TOKEN_PLACEMENT["spec"] = None
+    if policy not in _dtp.POLICIES:
+        raise SystemExit(f"--d-token-placement {policy!r}: one of {list(_dtp.POLICIES)}")
+    if policy == _dtp.POLICY_CAPACITY:
+        return
+    model = str(getattr(ns, "model", "") or "")
+    try:
+        with open(model_config_path(model)) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"--d-token-placement {policy}: cannot read the model config of {model!r}: {exc}")
+    try:
+        _dr.check_profile(_dr.profile_of_config(cfg), "live")
+    except _dr.ReshardProfileRefused as exc:
+        raise SystemExit(str(exc).replace("--d-reshard live", f"--d-token-placement {policy}"))
+    raw = str(getattr(ns, "d_token_shares", "auto") or "auto")
+    try:
+        shares = _dtp.RC9_EFF_BW_GBS if raw == "auto" else tuple(float(x) for x in raw.split(","))
+        spec = _dtp.PlacementSpec(policy, tuple(shares),
+                                  float(getattr(ns, "d_token_fill_switch", _dtp.DEFAULT_FILL_SWITCH)))
+        spec.validate()
+    except (ValueError, _dtp.PlacementError) as exc:
+        raise SystemExit(f"--d-token-placement {policy}: {exc}")
+    _D_TOKEN_PLACEMENT["spec"] = spec
+
+
+def d_token_placement_env() -> Dict[str, str]:
+    """Group D's env for the token placement; {} under 'capacity'."""
+    from sglang.srt.weg2 import d_token_placement as _dtp
+
+    spec = _D_TOKEN_PLACEMENT.get("spec")
+    return {} if spec is None else {_dtp.ENV: spec.to_json()}
+
+
+#: --d-kv-evict-for-placement (27B row 24c, user 26.09.: "fertige requests
+#: oder vorherige requests muessen dann natuerlich den vram kvcache frei machen
+#: um die bestverteilung zu ermoeglichen"). weg2/d_kv_evict.py, DYN_D_RESHARD
+#: sec. 14: cold, L2-backed radix leaves are demoted copy-free (device free,
+#: node keeps its arena rows) so --d-token-placement bandwidth holds its
+#: shares at high fill; the group agrees in one fixed-shape MIN collective.
+#: 'off' (default) = no env, argv byte-identical.
+D_KV_EVICT_DEFAULT = "off"
+_D_KV_EVICT: Dict[str, object] = {"spec": None}
+
+
+def apply_d_kv_evict(ns) -> None:
+    from sglang.srt.weg2 import d_kv_evict as _dke
+
+    mode = str(getattr(ns, "d_kv_evict_for_placement", D_KV_EVICT_DEFAULT) or D_KV_EVICT_DEFAULT)
+    _D_KV_EVICT["spec"] = None
+    if mode not in ("off", "on"):
+        raise SystemExit(f"--d-kv-evict-for-placement {mode!r}: one of ['off', 'on']")
+    if mode == "off":
+        return
+    if _D_TOKEN_PLACEMENT.get("spec") is None:
+        raise SystemExit("--d-kv-evict-for-placement on: REFUSED without --d-token-placement bandwidth "
+                         "(it evicts FOR the bandwidth placement; under 'capacity' there is nothing to hold)")
+    try:
+        spec = _dke.EvictSpec(min_idle_s=float(getattr(ns, "d_kv_evict_min_idle_s", 20.0)),
+                              publish_max=int(getattr(ns, "d_kv_evict_publish_max", 8)))
+        spec.validate()
+    except (ValueError, _dke.EvictError) as exc:
+        raise SystemExit(f"--d-kv-evict-for-placement on: {exc}")
+    _D_KV_EVICT["spec"] = spec
+
+
+def d_kv_evict_env() -> Dict[str, str]:
+    """Group D's env for the placement eviction; {} under 'off'."""
+    from sglang.srt.weg2 import d_kv_evict as _dke
+
+    spec = _D_KV_EVICT.get("spec")
+    return {} if spec is None else {_dke.ENV: spec.to_json()}
 
 
 def spec_form_is_dflash() -> bool:
@@ -3090,6 +3733,29 @@ def resolve_cards() -> List[Card]:
         Card(d.index, d.uuid, d.name, d.total_mib, reserved_mib=d.reserved_mib)
         for d in nvml_registry.list_devices()
     ]
+
+
+def record_card_power(records: List[Dict], cards: List[Card], log) -> None:
+    """Release table row 27: the power limit and SM clock ceiling of every
+    card go into the boot record (``state.cards[i]``: power_limit_w,
+    power_limit_default_w, power_limit_max_w, sm_clock_max_mhz; None = NVML
+    did not answer) and one ``POWER-LIMIT rank`` line per card into the
+    launcher log. Never raises: a missing answer is recorded as such."""
+    from sglang.srt.registry import nvml as _nvml
+    from sglang.srt.weg2 import power_limit as _pl
+
+    try:
+        by_uuid = {p.uuid: p for p in _nvml.power_snapshot()}
+        why = ""
+    except Exception as exc:  # noqa: BLE001
+        by_uuid, why = {}, f"{type(exc).__name__}: {exc}"
+    for i, c in enumerate(cards[:len(records)]):
+        p = by_uuid.get(c.uuid)
+        # a COPY of the record: the Card object itself is not grown
+        records[i] = dict(records[i], **{
+            k: (getattr(p, k) if p is not None else None)
+            for k in ("power_limit_w", "power_limit_default_w", "power_limit_max_w", "sm_clock_max_mhz")})
+        log(_pl.boot_line({"launcher_card": i}, p, why or "card not in the NVML power snapshot"))
 
 
 def order_cards(cards: List[Card]) -> List[Card]:
@@ -11469,6 +12135,30 @@ def p_host_overlap_lines(overlap: bool, hostgap: bool) -> List[str]:
     return lines
 
 
+def p_recv_stream_env(on: bool) -> Dict[str, str]:
+    """Group P's extra environment for ``--p-recv-stream``; empty when off
+    (byte-identity, pinned by test_weg2_p_recv_stream.py). The NAME lives in
+    managers/weg2_p_overlap.py, the one module the runtime reads it from."""
+    from sglang.srt.managers import weg2_p_overlap as _pov
+
+    return _pov.launcher_env_p_recv_stream() if on else {}
+
+
+def p_recv_stream_lines(on: bool) -> List[str]:
+    """The provenance line for ``--p-recv-stream`` -- none when off."""
+    if not on:
+        return []
+    return [
+        "WEG2 P-RECV-STREAM: on (--p-recv-stream) -- group P gets %s: the proxy "
+        "frame's NCCL receive runs on a side stream without the fence on the "
+        "running forward, the schedule stream waits for it device-side. Reason: "
+        "#PGAP 26.09. (i8B/i8drt) PP1/PP2 card idle per chunk = frame transfer "
+        "serialised behind the previous forward (PP2 2048: ~11 ms of ~462 ms, "
+        "0.1 ms on PP0 which receives no frame) (managers/weg2_p_overlap.py)."
+        % " ".join("%s=%s" % kv for kv in sorted(p_recv_stream_env(True).items()))
+    ]
+
+
 #: --p-prefill-graph-split (27B line, 2026-09-24): 0 = off, the default.
 P_PREFILL_GRAPH_SPLIT_DEFAULT = 0
 
@@ -11481,7 +12171,7 @@ def p_graph_split_env(ns) -> Dict[str, str]:
     n = int(getattr(ns, "p_prefill_graph_split", P_PREFILL_GRAPH_SPLIT_DEFAULT) or 0)
     if n < 0 or n == 1:
         raise SystemExit(f"--p-prefill-graph-split must be 0 (off) or >= 2, got {n}")
-    if not p_prefill_graph_bucket():
+    if not p_prefill_graph_buckets():
         return {}
     return _fgs.launcher_env_p_graph_split(n)
 
@@ -13942,6 +14632,8 @@ def solve_p_cut(
         # --p-prefill-graph (27B): the SAME vector the ranks book (env_p, see
         # p_prefill_graph_env); () when off -- the pool model is unchanged.
         prefill_graph_pool_mib=p_prefill_graph_pool_mib(ns),
+        # --p-layer-split dynamic: the swing slab per stage; () under static.
+        swing_layers_by_stage=p_layer_split_swing_by_stage(len(budgets_p)),
         activation_reserve_mib=p_prefill_activation_reserve_mib(
             ns.pp_cut_activation_reserve_mib, int(chunk_tokens)
         ),
@@ -14213,6 +14905,11 @@ def solve_p_cut(
             % (_floor_flag, _cap, int(chunk_tokens)))
     pool_floor, pool_floor_from_cut, pool_floor_rule = resolve_pool_floor(_floor_flag)
     log("PP-CUT POOL FLOOR RULE: " + pool_floor_rule)
+    # --p-prefill-graph-policy auto: extra buckets only where the pool still
+    # clears the floor with their capture pool (no-op without extras).
+    model_pool = p_prefill_graph_vram_gate(
+        ns, model_pool, _csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else None,
+        families, pool_floor, log)
     decision = _cut.solve_launch_cut(
         layer_families=families,
         incumbent_layers=incumbent,
@@ -15051,6 +15748,112 @@ def build_parser() -> argparse.ArgumentParser:
              "... capture_mib='. Changes P's form key (chunk + graph config "
              "are device allocations). User goal: 512.")
     ap.add_argument(
+        "--p-prefill-graph-policy", choices=["auto", "on", "off"],
+        default=P_PREFILL_GRAPH_POLICY_DEFAULT,
+        help="Only with --p-prefill-graph (27B line, weg2/p_graph_policy.py; user order "
+             "26.09.: 'cuda graphen im prefill nur anschalten wenn es was bringt'). "
+             "'auto' (default): per width (the main bucket and every "
+             "--p-prefill-graph-buckets entry) the graph is captured only when the "
+             "calibration table (--p-prefill-graph-calibration) puts its slowest P stage "
+             "at least --p-prefill-graph-min-gain ahead of eager; a width without a "
+             "measurement keeps the safe default -- main bucket graph, extra buckets "
+             "eager -- so without a table the argv is byte-identical to before. Extra "
+             "buckets must also pass the VRAM gate (the pinned cut's pool with their "
+             "capture pool clears the pool floor). 'on': capture every configured bucket "
+             "(the metal calibration arm). 'off': the pre-switch form, extra buckets "
+             "refused. The chunk policy prices each width in the decided mode.")
+    ap.add_argument(
+        "--p-prefill-graph-buckets", default="", metavar="TOKENS[,TOKENS]",
+        help="Only with --p-prefill-graph and --p-prefill-graph-policy auto|on: extra "
+             "prefill graph buckets ABOVE the main one (e.g. 1024,2048 for the dynamic "
+             "chunk ladder). Empty (default) = none. Captured into the same pool; the "
+             "budget post prices them proportionally (upper estimate) unless "
+             "--p-prefill-graph-pool-mib gives the measured capture_mib.")
+    ap.add_argument(
+        "--p-prefill-graph-calibration", default="", metavar="JSON",
+        help="Only with --p-prefill-graph-policy auto: the calibration table "
+             "{'ref_prefix': N, 'widths': {'512': {'graph_ms': [..], 'eager_ms': [..]}, ...}} "
+             "(per P stage, the prefix-free ms of one forward; written by "
+             "docker/graphcal_eval.py from a graph and an eager metal boot). Empty "
+             "(default) = the 'graph_calibration' key of a --p-chunk-model JSON, else none.")
+    ap.add_argument(
+        "--p-prefill-graph-min-gain", type=float, default=0.01, metavar="FRACTION",
+        help="Only with --p-prefill-graph-policy auto: the graph must be at least this "
+             "much faster at the slowest stage (default 0.01).")
+    ap.add_argument(
+        "--p-chunk-sweep", default="", metavar="TOKENS[,TOKENS]",
+        help="MEASUREMENT only, with --p-chunk-policy dynamic: no plan; the n-th request "
+             "runs every chunk at the n-th width of this list (cyclic), so one boot "
+             "measures every width on every prompt length (graph calibration ladder). "
+             "Overrides --p-chunk-dynamic-min-tokens. Empty (default) = off.")
+    ap.add_argument(
+        "--d-token-placement", choices=["capacity", "bandwidth"], default=D_TOKEN_PLACEMENT_DEFAULT,
+        help="Group D: where NEW KV tokens land (27B uneven DCP only; weg2/d_token_placement.py, "
+             "DYN_D_RESHARD.md sec. 13). 'capacity' (default) = today, env byte-identical. "
+             "'bandwidth' = the allocator interleaves its free slot ids so new tokens go to the "
+             "ranks by effective bandwidth while the pool has room, by free capacity once a "
+             "rank's class would pass --d-token-fill-switch; stored KV never moves. Refused "
+             "for the NF profile.")
+    ap.add_argument(
+        "--d-token-shares", default="auto", metavar="W",
+        help="Only with --d-token-placement bandwidth: per-rank weights (rank order), "
+             "'auto' = the d_reshard fit 937,604,604 GB/s (5090 first).")
+    ap.add_argument(
+        "--d-token-fill-switch", type=float, default=0.85, metavar="FRACTION",
+        help="Only with --d-token-placement bandwidth: fall to capacity placement once the "
+             "bandwidth target would fill a rank's class beyond this fraction (default 0.85).")
+    ap.add_argument(
+        "--d-kv-evict-for-placement", choices=["off", "on"], default=D_KV_EVICT_DEFAULT,
+        help="Group D, only with --d-token-placement bandwidth (weg2/d_kv_evict.py, "
+             "DYN_D_RESHARD.md sec. 14): before the fill would push the placement to "
+             "capacity, cold radix leaves (no active reader, idle >= --d-kv-evict-min-idle-s) "
+             "whose KV is already in L2 on every D rank leave the device copy-free "
+             "(the class over its share first); cold un-backed decode tails are published "
+             "through the write stream first. One small group collective per 16 ticks; "
+             "the victim list is group-uniform, a disagreement is a crash-stop. "
+             "'off' (default) = no env, unchanged.")
+    ap.add_argument(
+        "--d-kv-evict-min-idle-s", type=float, default=20.0, metavar="S",
+        help="Only with --d-kv-evict-for-placement on: a radix leaf counts as cold after "
+             "this many seconds without access (group-agreed clock). Default 20.")
+    ap.add_argument(
+        "--d-kv-evict-publish-max", type=int, default=8, metavar="N",
+        help="Only with --d-kv-evict-for-placement on: cold un-backed leaves handed to the "
+             "publish sweep per pass (0 = evict only what is already in L2). Default 8.")
+    ap.add_argument(
+        "--d-reshard", choices=["off", "wake", "wake-seg", "live"], default=D_RESHARD_DEFAULT,
+        help="Group D weight shards per load class (27B TP>1 uneven TP + uneven DCP only; "
+             "weg2/d_reshard.py, DYN_D_RESHARD.md). 'off' (default) = today, argv and env "
+             "byte-identical. 'wake' = the MLP family vector is chosen from "
+             "--d-reshard-presets at each P->D wake; with ONE preset that is the static "
+             "--rank-mlp-ratio on group D (bootable), with more the boot is refused until the "
+             "executor is wired. 'wake-seg' = 'wake' whose 'auto' preset minimises the SEGMENT "
+             "round (sum over layer segments of the slowest rank + floor, calibrated on "
+             "rc9meas 26.09.) instead of the per-rank sums, over --d-reshard-depth; group D's "
+             "D-SPEED table follows (SGLANG_WEG2_DRESHARD_OBJECTIVE=segment). 'live' = refused "
+             "(switch costs more than it gains). Refused for the NF profile (Form A has no "
+             "shard vector).")
+    ap.add_argument(
+        "--d-reshard-depth", default="robust", metavar="TOKENS",
+        help="Only with --d-reshard wake-seg and presets 'auto': 'robust' (default) = the one "
+             "vector with the smallest worst loss against the per-point optimum over the "
+             "measured ladder (bs1/bs2 x 10k/32k/128k/240k); a token count ('131072', '128k') "
+             "= the best vector for that expected depth (bs1/bs2).")
+    ap.add_argument(
+        "--d-gc-freeze", choices=["off", "on"], default=D_GC_FREEZE_DEFAULT,
+        help="Group D: 'on' = every D scheduler calls gc.freeze() once after boot (all CUDA "
+             "graphs captured), so gen-2 collections no longer walk the boot objects (agent FR "
+             "26.09.: ~0.5 s single-rank D-round stalls). 'off' (default) = no env.")
+    ap.add_argument(
+        "--d-reshard-presets", default="auto", metavar="SPEC",
+        help="Only with --d-reshard wake: 'auto' (= dec), desk names 'dec,pf,rc9', or "
+             "explicit MLP unit vectors 'name=u0:u1:u2;name2=...' (sum = the MLP units, "
+             "1088 INT8 / 136 NVFP4). The first preset is the boot preset.")
+    ap.add_argument(
+        "--d-reshard-min-gain", type=float, default=0.02, metavar="FRACTION",
+        help="Only with --d-reshard wake: a different preset is taken at a wake only when "
+             "predicted at least this much faster than the one in force (default 0.02).")
+    ap.add_argument(
         "--p-chunk-policy", choices=["fixed", "dynamic"], default=P_CHUNK_POLICY_DEFAULT,
         help="Group P prefill chunk width (27B and NF line, weg2/p_chunk_policy.py). "
              "'fixed' (the default for this release candidate) = today: every forward "
@@ -15063,6 +15866,45 @@ def build_parser() -> argparse.ArgumentParser:
              "--p-chunk-max (the planner prices the corridor at it); chunks above the "
              "largest prefill graph bucket run eager. Rank lines 'P-CHUNK-POLICY "
              "armed' / 'P-CHUNK-POLICY plan', launcher lines with the dry-run plans.")
+    ap.add_argument(
+        "--p-layer-split", choices=["static", "dynamic"], default=P_LAYER_SPLIT_DEFAULT,
+        help="Group P stage boundaries (27B, weg2/p_layer_split.py, DYN_LAYER_SPLIT.md). "
+             "'static' (default) = today: the P cut is fixed; argv, env and the P form key "
+             "are byte-identical. 'dynamic' = PP0 moves each boundary chunk by chunk "
+             "inside [--p-layer-split-home, home + --p-layer-split-window] (upstream "
+             "stage executes the head of its neighbour's home span from a mirror and "
+             "writes KV/GDN state back; a rise pulls the prefix from home over the PP "
+             "link; non-home cuts run eager, the home cut keeps its graphs; the planner "
+             "stays on the home cut wherever it predicts < --p-layer-split-min-gain). "
+             "Rank lines 'P-LAYER-SPLIT runtime/slab/plan/census', 'PREFILL-GRAPH eager "
+             "reason=layer_split'.")
+    ap.add_argument(
+        "--p-layer-split-home", default="", metavar="CUT",
+        help="Only with --p-layer-split dynamic: the home cut as stage ends, e.g. 41,53.")
+    ap.add_argument(
+        "--p-layer-split-window", default="", metavar="W",
+        help="Only with --p-layer-split dynamic: per boundary, how many head layers of "
+             "the downstream stage the upstream stage may execute, e.g. 7,3.")
+    ap.add_argument(
+        "--p-layer-split-max-attn", default="", metavar="A",
+        help="Only with --p-layer-split dynamic: per boundary, the most attention "
+             "layers inside the window (each costs a pool-shaped KV mirror).")
+    ap.add_argument(
+        "--p-layer-split-model", default="", metavar="SRC",
+        help="Only with --p-layer-split dynamic: SG's per-layer-type stage model "
+             "(weg2/p_stage_model.py), a JSON path or a name under p_stage_model_data/ "
+             "(27b_int8_rc9j, 27b_nvfp4_rc9j).")
+    ap.add_argument(
+        "--p-layer-split-pull-gbps", type=float, default=None, metavar="GBPS",
+        help="Only with --p-layer-split dynamic: the link rate the planner prices a "
+             "PREFIX PULL at (a cut RISING mid-request pulls the KV prefix / GDN state "
+             "of the newly swung layers from home). Default "
+             f"{P_LAYER_SPLIT_PULL_GBPS_DEFAULT} (the x4-3080 edge); 0 = V1 (rises only on a "
+             "fresh request's first chunk, no pull).")
+    ap.add_argument(
+        "--p-layer-split-min-gain", type=float, default=0.01, metavar="FRACTION",
+        help="Only with --p-layer-split dynamic: a moving cut is taken only when "
+             "predicted at least this much faster than the home cut (default 0.01).")
     ap.add_argument(
         "--p-chunk-max", type=int, default=P_CHUNK_MAX_DEFAULT, metavar="TOKENS",
         help="Only with --p-chunk-policy dynamic: the widest chunk (default "
@@ -15089,6 +15931,20 @@ def build_parser() -> argparse.ArgumentParser:
              "per-token cost curve over the chunk width per stage ('int8' / "
              "'nvfp4': the 5090 kernel-bench HOCHRECHNUNG on PP0, 3080 stages flat "
              "until measured; 'flat': no kernel gain anywhere).")
+    ap.add_argument(
+        "--p-power-scale", choices=list(P_POWER_SCALE_LAWS), default=P_POWER_SCALE_DEFAULT,
+        help="Only with --p-chunk-policy dynamic (release table row 27): the chunk model "
+             "carries the power limit per card it was CALIBRATED under (power_limit_w; "
+             "builtin-int8 = the rig limits 5090 400 W / 3080 230 W; fit:<P.log> = that "
+             "log's POWER-LIMIT rank lines). A card whose running limit (NVML) is more "
+             "than 5%% away is ALWAYS warned about loudly. 'off' (default) uses the model "
+             "as calibrated; 'linear' / 'power' rescale its COMPUTE terms by "
+             "(P_cal/P_now)^alpha (alpha 1 / --p-power-scale-exponent) -- a MODEL, not a "
+             "measurement; bandwidth and host-launch terms stay unscaled. The only honest "
+             "fix for a changed limit is a new measurement.")
+    ap.add_argument(
+        "--p-power-scale-exponent", type=float, default=None, metavar="ALPHA",
+        help="alpha of --p-power-scale power (default 1/3: f ~ P^(1/3) on the DVFS curve).")
     ap.add_argument(
         "--p-chunk-grid", type=int, default=0, metavar="TOKENS",
         help="Only with --p-chunk-policy dynamic: no chunk crosses an absolute "
@@ -15140,7 +15996,9 @@ def build_parser() -> argparse.ArgumentParser:
              "rank (E2M1 [N,K/2] + 128x4-swizzled E4M3 block scales), the kernel "
              "chosen per rank (sm_120 native W4A4, sm_86 W4A8 on the INT8 tensor "
              "cores from the same bytes; SGLANG_FP4_NATIVE_MIXED_SM8X=marlin opts into "
-             "Marlin W4A16 with its content permuted in place around every flip). "
+             "Marlin W4A16 with its content permuted in place around every flip -- "
+             "BARRED since 26.09. as broken, diagnosis override "
+             "SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN=1). "
              "Sets SGLANG_FP4_NATIVE_MIXED_BOOT=1 for launcher and ranks (exchange "
              "class leaves L4, planner NVFP4 lane record L7). The FP8 "
              "linears stay on Marlin. Refused (W160) without --fp8-uniform-marlin "
@@ -15769,6 +16627,17 @@ def build_parser() -> argparse.ArgumentParser:
              "Default off = argv and env byte-identical to before.",
     )
     ap.add_argument(
+        "--p-recv-stream", action="store_true",
+        help="Group P: receive each stage's proxy frame (hidden states from the "
+             "stage before) on a side stream that does not wait for the running "
+             "forward, so the transfer overlaps it; the next forward still waits "
+             "for the frame device-side (managers/weg2_p_overlap.py, "
+             "SGLANG_WEG2_P_RECV_STREAM=1). Measured reason (#PGAP 26.09., "
+             "i8B): PP1/PP2 idle ~11 ms per 2048 chunk = the frame transfer, "
+             "queued behind the fence on the previous forward. Default off = "
+             "argv and env byte-identical to before.",
+    )
+    ap.add_argument(
         "--p-hostgap", action="store_true",
         help="Group P: the #PGAP instrument (SGLANG_WEG2_P_HOSTGAP=1) -- one "
              "line per forward with the card's idle before it (timing events on "
@@ -16325,6 +17194,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     apply_p_prefill_graph(ns)
     # --p-chunk-policy: after the graph (reads its buckets), before any argv.
     apply_p_chunk_policy(ns)
+    # --p-layer-split: after the chunk policy (the joint plan reads its limits).
+    apply_p_layer_split(ns)
+    # --d-reshard: before any argv; 'off' installs nothing.
+    apply_d_reshard(ns)
+    apply_d_token_placement(ns)
+    apply_d_kv_evict(ns)  # after the placement it requires
     # 27B line G2: the one tokenizer both groups load, installed before any
     # argv is built; its line is logged with the checkpoint lines under 1a'.
     tokenizer_line = apply_tokenizer_path(ns)
@@ -16532,6 +17407,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     host_preflight(log, ns.tag, dry)
     cards = order_cards(resolve_cards())
     state.cards = [c.__dict__ for c in cards]
+    record_card_power(state.cards, cards, log)
     if not dry:
         cards_free_check(cards, log)
     cvd = ",".join(c.uuid for c in cards)
@@ -17055,9 +17931,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if p_prefill_graph_bucket():
         # Only when on: the default boot's front log stays byte-identical.
         log(p_prefill_graph_line())
+        for _pgl in p_prefill_graph_policy_lines():
+            log("WEG2 " + _pgl)
     # --p-chunk-policy: [] under 'fixed' (front log byte-identical).
     for _pcl in p_chunk_policy_lines():
         log(_pcl)
+    # Row 27: the chunk model's power-limit check ([] under 'fixed').
+    for _pwl in p_chunk_power_lines():
+        log(_pwl)
+    # --d-reshard: () under 'off' (front log byte-identical).
+    for _drl in d_reshard_lines():
+        log(_drl)
     if not hicache_disabled:
         log(hicache_draft_tier_line())
     # --d-replayssm-spec (27B ReplaySSM S6): D's verify form, both states named.
@@ -17807,6 +18691,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for _pline in p_host_overlap_lines(
             getattr(ns, "p_host_overlap", False), getattr(ns, "p_hostgap", False)):
         log(_pline)
+    # P-RECV-STREAM (managers/weg2_p_overlap.py): group P only, default off --
+    # off adds nothing, so argv and env stay byte-identical.
+    env_p.update(p_recv_stream_env(getattr(ns, "p_recv_stream", False)))
+    for _pline in p_recv_stream_lines(getattr(ns, "p_recv_stream", False)):
+        log(_pline)
     # --p-prefill-graph: {} when off (env byte-identical). The pool vector is
     # the SAME call the cut's pool model was built from (solve_p_cut).
     _pg_pool = p_prefill_graph_pool_mib(ns)
@@ -17845,6 +18734,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     # --p-chunk-policy: {} under 'fixed' (env byte-identical).
     env_p.update(p_chunk_policy_env())
+    # --p-layer-split: {} under 'static' (env byte-identical).
+    env_p.update(p_layer_split_env())
     if _pg_pool:
         log(
             "WEG2 P-PREFILL-GRAPH post 'prefill graph pool' MiB per stage = %s "
@@ -18163,6 +19054,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap)
         env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
+        env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
+        env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
+        env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
+        env_d.update(d_kv_evict_env())  # --d-kv-evict-for-placement: {} under 'off'
         # #114 auch HIER: es gibt ZWEI spec_d-Stellen, und die erste Fassung
         # traf nur die andere -- der Dry-Run blieb ohne die Zeile, und der
         # Verdrahtungs-Check meldete "#114 fehlt im Baum", obwohl es im Baum
@@ -18171,7 +19066,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
                            if str(k).startswith("SGLANG_"))
             log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -18278,6 +19173,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap)
     env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
+    env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
+    env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
+    env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
+    env_d.update(d_kv_evict_env())  # --d-kv-evict-for-placement: {} under 'off'
     # #114: DIE EFFEKTIVE GRUPPEN-ENV GEHOERT INS LOG.
     #
     # Der Verdrahtungs-Check (weg2/verdrahtung_check.sh) liest das
@@ -18290,7 +19189,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
                        if str(k).startswith("SGLANG_"))
         log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid

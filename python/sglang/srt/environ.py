@@ -304,6 +304,11 @@ class Envs:
     # is not held behind the verify (dflash_solo_pool sync-free mode). Off =
     # the legacy mapper, byte-identical.
     SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE = EnvBool(False)
+    # DFLASH window pool, radix-dedup draft-row carry (27b-draftholes 26.09.):
+    # when an insert frees a request's fresh KV slots in favour of the tree's
+    # own (same tokens), move the draft rows the fresh slots hold to the kept
+    # slots instead of dropping them. Off = no alias listener, byte-identical.
+    SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY = EnvBool(False)
     # DFLASH decode round, stage 2 of the host-sync removal: plan the draft
     # and the uneven-DCP target verify with HOST-known FlashInfer metadata so
     # the host never waits for the draft forward (owner.py compact[owned] /
@@ -757,7 +762,11 @@ class Envs:
     # the same direction WITHOUT the boot's first flip, else the median of the
     # later flips of either direction, else 0. 0 = the last same-direction
     # flip, first flip included (the pre-H34b rule).
-    SGLANG_WEG2_ENABLE_WARM_MIN_DWELL = EnvBool(True)
+    # UNIFY S7: default per profile (ModelProfile.warm_min_dwell): nextflash on
+    # (H34b, its metal), qwen27b off -- the 27B metal priced K7 with the last
+    # same-direction flip (+ 27B DPWAIT SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN);
+    # on without a form (the NF code default). An explicit value always wins.
+    SGLANG_WEG2_ENABLE_WARM_MIN_DWELL = EnvBool(_profile_default("SGLANG_WEG2_ENABLE_WARM_MIN_DWELL", True))
     SGLANG_WEG2_MIN_DWELL_WINDOW = EnvInt(5)
     # SLEEP_RELEASE_LMEM (H15, fnFL2x120): a complete sleep lowers the context's
     # per-thread stack limit (cuCtxSetLimit), which frees the driver's
@@ -2079,9 +2088,13 @@ class Envs:
     # "w4a8" (default, user order 25.09.): the registered W4A8 INT8 kernel on the
     # native bytes (N4D decode GEMV M<=48, N4A GEMM above; main model and draft).
     # "marlin" (opt-in): Marlin W4A16 on the SHARED native layout, content
-    # permuted in place at every flip (nvfp4_marlin_inplace.py).
+    # permuted in place at every flip (nvfp4_marlin_inplace.py). BARRED since
+    # 26.09. (wrong output), see SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN below.
     SGLANG_FP4_NATIVE_MIXED_SM8X = EnvStr("w4a8")
     SGLANG_FP4_NATIVE_MIXED_SM12X = EnvStr("flashinfer_cutlass")
+    # NVFP4-SM8X-MARLIN-GUARD (26.09.): SM8X=marlin serves wrong output on the
+    # current line and is refused; "1" runs it anyway, for DIAGNOSIS ONLY.
+    SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN = EnvBool(False)
     # Opt-in BIT-DETERMINISM for fp8 linears on sm80..sm88 (#192, from #190).
     #
     # WHAT IS BROKEN. On sm80..88 an fp8 checkpoint has exactly one GEMM
@@ -2702,6 +2715,13 @@ class Envs:
     # p_group_has_draft_producer) and writes `off` into BOTH groups; on a rank
     # anything but `off` (unset, auto, on) is the draft tier as before.
     SGLANG_WEG2_HICACHE_DRAFT_TIER = EnvStr("auto")
+    # 27B DPWAIT (release table row 28, 26.09.): the front's min-dwell (K7) prices a
+    # round trip with the last same-direction flip's flip_ms, and flip_ms INCLUDES the
+    # drain wait for running decodes (drain_quiesce_ms). Measured dkr27bnvfp4bar1agent
+    # 09252328: a D->P flip that drained 29.7 s recorded flip_ms=31115, and the next
+    # D->P was held 39.2 s by min-dwell (need 31115 ms, awake 8758 ms) while a batch
+    # waiter queued. On: the price is flip_ms - drain_quiesce_ms (the flip itself).
+    SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)

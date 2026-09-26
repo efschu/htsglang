@@ -138,3 +138,84 @@ def test_the_boot_time_prewarm_is_off_by_default_after_xsn263(monkeypatch):
     monkeypatch.delenv("SGLANG_WEG2_LANE_PREWARM", raising=False)
     m._weg2_prewarm_lanes_start()
     assert m._weg2_prewarm_thread is None
+
+
+# -- KR 26.09.: form "c" (Befund 2: register_ms=21636 on P's first flip) ------
+
+
+def test_form_c_registers_only_the_diagonal_lane_slot_0_within_the_priced_bytes(monkeypatch):
+    m = _manager(monkeypatch, group="P", rank=0)
+    table = {("source", "c0", "weights_1"): 1_845_575_008,
+             ("authoritative", "c0", "weights_2"): 1_100_317_440,
+             ("source", "p0", "weights_1"): 900_000_000}
+    asked = []
+
+    def lane_bytes_of(hook, lk, tag):
+        asked.append(lk)
+        return table.get((hook, lk, tag), 0)
+
+    registered = []
+    monkeypatch.setattr(bx, "seq_buffer_depth", lambda: 2)
+    out = m._weg2_prewarm_lanes(
+        manifests_ready=lambda: True, lane_bytes_of=lane_bytes_of,
+        persist=lambda p, b, lk: registered.append((os.path.basename(p), int(b), lk)),
+        family=["weights_1", "weights_2"], diagonal_only=True, max_slots=1,
+        priced_lane_bytes=2_111_575_056)
+    assert set(asked) == {"c0"}                 # the cross lanes are not even sized
+    assert out == {"c0": 1_845_575_008}         # the max over roles and tags
+    assert registered == [("c0_unit_buffer.bin", 1_845_575_008, "c0")]  # slot 0 only
+
+
+def test_form_c_never_pins_more_than_the_ledger_priced(monkeypatch):
+    m = _manager(monkeypatch, group="D", rank=2)
+    registered = []
+    monkeypatch.setattr(bx, "seq_buffer_depth", lambda: 1)
+    out = m._weg2_prewarm_lanes(
+        manifests_ready=lambda: True, lane_bytes_of=lambda h, lk, t: 3_000_000_000,
+        persist=lambda p, b, lk: registered.append(lk), family=["weights_0"],
+        diagonal_only=True, max_slots=1, priced_lane_bytes=2_111_575_056)
+    assert out == {"c2": 3_000_000_000}
+    assert registered == []                      # NOT-BOOKED: the flip registers lazily
+
+
+def _start_with(monkeypatch, mode, terms_env):
+    m = _manager(monkeypatch, group="P", rank=0)
+    from sglang.srt.weg2 import weight_exchange as wx
+    from sglang.srt.weg2 import xchg_bounce as xb
+    monkeypatch.setattr(wx, "exchange_armed", lambda: True)
+    monkeypatch.setattr(Manager, "_weg2_bar1_start", lambda self: None, raising=True)
+    started = []
+    monkeypatch.setattr(Manager, "_weg2_prewarm_lanes",
+                        lambda self, **kw: started.append(kw) or {}, raising=True)
+    monkeypatch.setenv("SGLANG_WEG2_LANE_PREWARM", mode)
+    if terms_env is None:
+        monkeypatch.delenv(xb.ENV_BOUNCE_TERMS, raising=False)
+    else:
+        monkeypatch.setenv(xb.ENV_BOUNCE_TERMS, terms_env)
+    m._weg2_prewarm_lanes_start()
+    t = m._weg2_prewarm_thread
+    if t is not None:
+        t.join(5)
+    return t, started
+
+
+_TERMS = ("bytes_per_direction=17637110912,n_layers=64,widest_layer_bytes=1011344880,"
+          "pairs=3,depth=1,slot_bytes=134217728,n_lanes=9,max_tag_bytes=2111575056,"
+          "lanes_concurrent=0,band_credit=0,n_cross_lanes=0,price_lane_cap=0")
+
+
+def test_form_c_starts_with_the_published_per_lane_price(monkeypatch):
+    t, started = _start_with(monkeypatch, "c", _TERMS)
+    assert t is not None
+    assert started == [{"diagonal_only": True, "max_slots": 1,
+                        "priced_lane_bytes": 2_111_575_056}]
+
+
+def test_form_c_without_a_published_price_does_not_start(monkeypatch):
+    t, started = _start_with(monkeypatch, "c", None)
+    assert t is None and started == []
+
+
+def test_form_1_is_unchanged_every_lane_every_slot(monkeypatch):
+    t, started = _start_with(monkeypatch, "1", _TERMS)
+    assert t is not None and started == [{}]

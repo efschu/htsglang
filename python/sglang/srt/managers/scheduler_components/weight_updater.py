@@ -821,11 +821,31 @@ class SchedulerWeightUpdaterManager:
                 self._weg2_draft_prealloc_at_boot()
             except Exception as _dp_exc:  # noqa: BLE001 -- the first park allocates as before
                 logger.info("WEG2-DRAFT-PARK host image not preallocated: %r", _dp_exc)
-            if (os.environ.get("SGLANG_WEG2_LANE_PREWARM", "0") or "0") != "1":
+            _mode = (os.environ.get("SGLANG_WEG2_LANE_PREWARM", "0") or "0").strip()
+            if _mode not in ("1", "c"):
                 return
             import threading
 
-            t = threading.Thread(target=self._weg2_prewarm_lanes,
+            _target = self._weg2_prewarm_lanes
+            if _mode == "c":
+                # KR 26.09. (Befund 2, boot i8rt: `WEG2-SEQ persist lane=c0 new
+                # ... register_ms=21636` on P's first flip, PP0 and PP2
+                # registering at the same instant under MemFree 5.9 GB). With
+                # the cross lanes on BAR1 the diagonal c-lane is the one host
+                # buffer a flip still registers. Form "c": ONLY this rank's
+                # c-lane, ONLY buffer slot 0 (the slot every flip uses; a
+                # second slot stays lazy), sized from the same join, and
+                # ONLY where the launcher's host ledger priced a lane that
+                # large (published max_tag_bytes, see _weg2_prewarm_priced_
+                # lane_bytes) -- never unpriced tmpfs at boot (the xsn263
+                # W98 lesson). "1" keeps the old every-lane form.
+                _priced = self._weg2_prewarm_priced_lane_bytes()
+                if not _priced:
+                    return
+                _target = functools.partial(self._weg2_prewarm_lanes,
+                                            diagonal_only=True, max_slots=1,
+                                            priced_lane_bytes=int(_priced))
+            t = threading.Thread(target=_target,
                                  name="weg2-lane-prewarm", daemon=True)
             self._weg2_prewarm_thread = t
             t.start()
@@ -1076,6 +1096,26 @@ class SchedulerWeightUpdaterManager:
                 return -1.0
             cache[_weg2_plan_key(hook, group, rank, False, None)] = out
         return (time.perf_counter() - t0) * 1000.0
+    def _weg2_prewarm_priced_lane_bytes(self) -> int:
+        """KR 26.09.: the per-lane host bytes the launcher's ledger priced
+        (``SGLANG_WEG2_XCHG_BOUNCE_TERMS``: every diagonal lane is charged at
+        the whole-tag floor ``max_tag_bytes`` x ``depth``). 0 = not published
+        or unreadable -> the c-lane prewarm refuses by name and the flip
+        registers lazily as before."""
+        try:
+            from sglang.srt.weg2 import xchg_bounce as xb
+
+            terms = xb.read_published_terms()
+        except Exception as exc:  # noqa: BLE001 -- a malformed term refuses the prewarm, never the boot
+            logger.info("WEG2-LANE-PREWARM c NOT-PRICED: published bounce terms "
+                        "unreadable (%r) -- the flip registers at first use", exc)
+            return 0
+        if terms is None or int(getattr(terms, "max_tag_bytes", 0) or 0) <= 0:
+            logger.info("WEG2-LANE-PREWARM c NOT-PRICED: no bounce terms published "
+                        "(or max_tag_bytes=0) -- nothing booked for a lane buffer, "
+                        "the flip registers at first use")
+            return 0
+        return int(terms.max_tag_bytes)
 
     def _weg2_bar1_start(self) -> None:
         """Build the BAR1 lane registry (weg2/bar1_lanes.py) and run its
@@ -1116,11 +1156,18 @@ class SchedulerWeightUpdaterManager:
 
     def _weg2_prewarm_lanes(self, *, manifests_ready=None, lane_bytes_of=None,
                             persist=None, family=None, poll_s: float = 2.0,
-                            budget_s: float = 900.0) -> Dict[str, int]:
+                            budget_s: float = 900.0, diagonal_only: bool = False,
+                            max_slots: Optional[int] = None,
+                            priced_lane_bytes: Optional[int] = None) -> Dict[str, int]:
         """Size and register every lane buffer this rank will map (both
         roles: depositor and collector, both buffer slots) from the join.
         Returns ``{lane_key: bytes}``; ``{}`` and a line when nothing could be
-        derived. The hooks exist for the hermetic test."""
+        derived. The hooks exist for the hermetic test.
+
+        KR 26.09. form "c": ``diagonal_only`` sizes/registers the c-lane only,
+        ``max_slots`` caps the buffer slots, and a lane larger than
+        ``priced_lane_bytes`` (what the host ledger charged per lane) is NOT
+        registered here (``NOT-BOOKED`` line; the flip registers it lazily)."""
         from sglang.srt.weg2 import weight_exchange_bounce as bx
         from sglang.srt.weg2 import weight_exchange_region as xr
         from sglang.srt.weg2 import weight_exchange_shadow as sh
@@ -1159,8 +1206,9 @@ class SchedulerWeightUpdaterManager:
                     hook=hook, group=group, rank=rank, pair=pair, card=card,
                     tag=tag, log=None)
                 return sum(int(getattr(d, "nbytes", 0) or 0) for d in (descs or ()))
-        lanes = [f"c{rank}"] + [f"p{i}" for i, (s, d) in enumerate(xr.CROSS_PAIRS)
-                                 if rank in (int(s), int(d))]
+        lanes = [f"c{rank}"] + ([] if diagonal_only else
+                                [f"p{i}" for i, (s, d) in enumerate(xr.CROSS_PAIRS)
+                                 if rank in (int(s), int(d))])
         biggest: Dict[str, int] = {}
         failures = 0
         for hook in (sh.HOOK_SOURCE, "authoritative"):
@@ -1184,11 +1232,19 @@ class SchedulerWeightUpdaterManager:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 return bx._persistent_host_buffer(path, int(nbytes), ops, lk, logger.info)
         depth = max(1, int(bx.seq_buffer_depth()))
+        if max_slots is not None:
+            depth = max(1, min(depth, int(max_slots)))
         n = 0
         total = 0
         for lk in sorted(biggest):
             b = int(biggest[lk])
             if b <= 0:
+                continue
+            if priced_lane_bytes is not None and b > int(priced_lane_bytes):
+                logger.info("WEG2-LANE-PREWARM lane=%s NOT-BOOKED bytes=%d > priced=%d "
+                            "(the host ledger charged less per lane than this lane "
+                            "needs) -- not registered at boot, the flip registers "
+                            "it at first use", lk, b, int(priced_lane_bytes))
                 continue
             for slot in range(depth):
                 path = bx.sequential_buffer_path(
@@ -1199,11 +1255,11 @@ class SchedulerWeightUpdaterManager:
                     total += b
                 except Exception as exc:  # noqa: BLE001 -- the leg registers at first use
                     logger.info("WEG2-LANE-PREWARM lane=%s slot=%d failed: %r", lk, slot, exc)
-        logger.info("WEG2-LANE-PREWARM group=%s rank=%d lanes=%s buffers=%d "
+        logger.info("WEG2-LANE-PREWARM group=%s rank=%d form=%s lanes=%s buffers=%d "
                     "pinned=%.2f GiB sizing_failures=%d ms=%.0f -- the first flip "
                     "finds every lane buffer registered (reuse), nothing to "
                     "register on its critical path",
-                    group, rank,
+                    group, rank, "c" if diagonal_only else "all",
                     ",".join(f"{k}:{v >> 20}MiB" for k, v in sorted(biggest.items()) if v > 0),
                     n, total / (1 << 30), failures, (time.perf_counter() - t0) * 1000)
         return biggest
@@ -8517,8 +8573,20 @@ class SchedulerWeightUpdaterManager:
             # device may be appended after the pause in this block.
             # #1457: no KV zeroing before a pause that discards the pages (the
             # mamba/req_to_token resets in the flush still run on mapped pages).
+            # --p-layer-split dynamic: land the pulls/refill the last forward
+            # announced while the mirror pages are still mapped (no-op static)
+            from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt
+
+            _pls = _pls_rt.active()
+            if _pls is not None:
+                _pls.on_sleep()
+                logger.info("%s", _pls.census_line())
             self.flush_cache(zero_kv=False)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            if _pls is not None and _pls.modules:
+                # the swing weights sleep with the KV pool (their own tag,
+                # outside the exchanged family); refilled from home on wake
+                self.memory_saver_adapter.pause(_pls_rt.SWING_WEIGHTS_TAG)
             _weg2_ph("kv_pause")
             # W25 Weg2DormantRefused (S1 boot killer K2): from this statement
             # on the req-index / KV / mamba pools are unmapped, so the
@@ -9028,6 +9096,15 @@ class SchedulerWeightUpdaterManager:
             if not self._weg2_kv_group_verdict(True, _kv_epoch):
                 return False  # a sibling refused: the verdict paused this rank's pool again
             self._weg2_kv_resumed_epoch = _kv_epoch
+            # --p-layer-split dynamic: the swing weights come back with the
+            # pool, content undefined until PP0's refill row (no-op static)
+            from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt
+
+            _pls = _pls_rt.active()
+            if _pls is not None:
+                if _pls.modules:
+                    self.memory_saver_adapter.resume(_pls_rt.SWING_WEIGHTS_TAG)
+                _pls.on_wake()
             _weg2_ph("kv_resume")
             scheduler = self.scheduler
             if scheduler is not None and weg2_memory_saver_on:

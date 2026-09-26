@@ -2094,6 +2094,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     arch,
                 )
 
+        # Release table row 27: every rank names the power limit (and SM clock
+        # ceiling) its card runs under -- every compute figure of this boot is
+        # measured under it. One log line, NVML only, never raises.
+        if self.device == "cuda" and not getattr(self, "is_draft_worker", False):
+            from sglang.srt.weg2.power_limit import rank_boot_line
+
+            logger.info(rank_boot_line(self.tp_rank, self.pp_rank, self.gpu_id))
+
         backend = get_default_distributed_backend(self.device)
         if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
             backend = "mooncake"
@@ -2866,6 +2874,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             release_load_transient_pool,
         )
 
+        # --p-layer-split dynamic: the swing modules were ordinary members of
+        # the layer list while the weights loaded and post-processed; they
+        # leave the model tree HERE, before the exchange arms below walks
+        # named_parameters. 0 (no-op) under static.
+        from sglang.srt.weg2.p_layer_split_runtime import detach_from_model
+
+        detach_from_model(self.model)
         release_load_transient_pool(reason="after-load")
         # #1273 S2 (spec section 6/S2): arm the exchange for this rank at the
         # END OF WEIGHT LOADING -- every weight page this runner will ever hold

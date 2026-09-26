@@ -131,6 +131,26 @@ DRAIN_DEADLINE_DEFAULT_S = 120.0
 #: weg2zr2 pair) that produce X's fallback.  Only the FRONT's default; the
 #: launcher recomputes from this boot's own lines and tells the front (C2).
 X_FALLBACK_TOKENS = 22000
+def flip_price_ms(rec: dict, *, exclude_drain: bool) -> Tuple[float, float]:
+    """27B DPWAIT (row 28): what one completed flip record costs as a round-trip price.
+
+    ``flip_ms`` runs from the flip's begin to the wake's end, so it INCLUDES
+    ``drain_quiesce_ms`` -- the wait for the running decodes of the sleeping
+    group to finish. That wait is the previous phase's work, not the price of
+    moving the layout; charged to K7's min-dwell it holds the NEXT flip for as
+    long as the last drain took (dkr27bnvfp4bar1agent09252328: flip_ms 31115,
+    of it drain 29670 -> the next D->P held 39.2 s). With ``exclude_drain``
+    (SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN) the price is ``flip_ms -
+    drain_quiesce_ms``, never below 0. Returns ``(price_ms,
+    excluded_drain_ms)``; the second is 0 when nothing was taken off, so the
+    provenance only changes when the value does."""
+    ms = float(rec.get("flip_ms") or 0.0)
+    if not exclude_drain:
+        return ms, 0.0
+    drain = min(ms, max(0.0, float(rec.get("drain_quiesce_ms") or 0.0)))
+    return ms - drain, drain
+
+
 QUIESCE_DEADLINE_S = 90.0
 
 #: fnFL2 v22: how long the quiesce waits for /health_generate proxies the
@@ -6580,9 +6600,14 @@ class Front:
         if envs.SGLANG_WEG2_ENABLE_WARM_MIN_DWELL.get():
             return warm_min_dwell_ms(self.flip_log, src, dst,
                                      window=envs.SGLANG_WEG2_MIN_DWELL_WINDOW.get())
+        exclude_drain = envs.SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN.get()
         for rec in reversed(self.flip_log):
             if rec.get("sleep") == src and rec.get("wake") == dst:
-                return float(rec.get("flip_ms") or 0.0), f"last-flip-{src}->{dst}"
+                ms, drain = flip_price_ms(rec, exclude_drain=exclude_drain)
+                prov = f"last-flip-{src}->{dst}"
+                if drain > 0:
+                    prov += f":drain-{int(drain)}ms-excluded"
+                return ms, prov
         return 0.0, "none-first-flip"
 
     def _dwell_ok(self, src: str, dst: str, fairness_fired: bool,

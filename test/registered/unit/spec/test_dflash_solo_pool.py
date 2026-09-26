@@ -623,5 +623,103 @@ class TestWorkerArmsSyncFreeOnlyForTheWindowPool(CustomTestCase):
         self.assertIsNone(m)
 
 
+
+# ---------------------------------------------------------------------------
+# Radix-dedup draft-row carry (SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY, default
+# off): the tree keeps its own slots, frees the request's fresh duplicates;
+# the fresh draft rows move to the kept slots instead of being dropped.
+# ---------------------------------------------------------------------------
+
+
+class TestDedupCarry(CustomTestCase):
+    def _both(self):
+        return (
+            DraftKVSlotMapper(1000, 16, 64, device="cpu"),
+            DraftKVSlotMapper(1000, 16, 64, device="cpu", sync_free=True),
+        )
+
+    def test_carry_moves_row_to_kept_slot(self):
+        for m in self._both():
+            d = m.translate_write(_t([500, 501, 502]))  # fresh D prefill rows
+            free0 = _free_count(m)
+            # Insert dedup: tree keeps 100..102 (never written), frees 500..502.
+            m.on_global_alias(_t([500, 501, 502]), _t([100, 101, 102]))
+            m.on_global_free(_t([500, 501, 502]))
+            r = m.translate_read(_t([100, 101, 102]))
+            self.assertEqual(r.tolist(), d.tolist())  # same draft rows, no hole
+            self.assertEqual(m.translate_read(_t([500])).tolist(), [0])
+            self.assertEqual(_free_count(m), free0)  # owner change, no free
+            self.assertEqual(m._slot_global[d.to(torch.int64)].tolist(), [100, 101, 102])
+            self.assertEqual(m.stats()["alias_carried_total"], 3)
+            self.assertEqual(m.holes_read_total, 1)  # only the [500] probe
+
+    def test_kept_slot_with_row_keeps_it_and_fresh_row_recycles(self):
+        for m in self._both():
+            kept = m.translate_write(_t([100]))
+            m.translate_write(_t([500]))
+            free0 = _free_count(m)
+            m.on_global_alias(_t([500]), _t([100]))
+            m.on_global_free(_t([500]))
+            self.assertEqual(m.translate_read(_t([100])).tolist(), kept.tolist())
+            self.assertEqual(_free_count(m), free0 + 1)
+            self.assertEqual(m.stats()["alias_carried_total"], 0)
+
+    def test_unmapped_fresh_slot_carries_nothing(self):
+        for m in self._both():
+            m.on_global_alias(_t([500]), _t([100]))
+            m.on_global_free(_t([500]))
+            self.assertEqual(m.translate_read(_t([100])).tolist(), [0])
+            self.assertEqual(m.stats()["mapped"], 0)
+
+    def test_free_before_alias_is_the_old_loss(self):
+        # Queue order is the contract: a free queued BEFORE the alias drops
+        # the row exactly as without the carry.
+        for m in self._both():
+            m.translate_write(_t([500]))
+            m.on_global_free(_t([500]))
+            m.on_global_alias(_t([500]), _t([100]))
+            self.assertEqual(m.translate_read(_t([100])).tolist(), [0])
+
+    def test_mismatched_lengths_ignored_and_clear_drops_queue(self):
+        for m in self._both():
+            d = m.translate_write(_t([500, 501]))
+            m.on_global_alias(_t([500, 501]), _t([100]))  # not element-wise
+            self.assertEqual(m.translate_read(_t([500, 501])).tolist(), d.tolist())
+            m.on_global_alias(_t([500]), _t([100]))
+            m.on_global_clear()
+            self.assertEqual(m.translate_read(_t([100])).tolist(), [0])
+            self.assertEqual(m.stats()["mapped"], 0)
+
+    def test_legacy_and_sync_free_agree(self):
+        a, b = self._both()
+        for m in (a, b):
+            m.translate_write(_t([500, 501, 502, 7]))
+            m.translate_write(_t([100]))
+            m.on_global_alias(_t([500, 501, 502]), _t([100, 101, 102]))
+            m.on_global_free(_t([500, 501, 502]))
+            m.translate_read(_t([100, 101, 102, 7]))
+        self.assertEqual(_state(a), _state(b))
+
+    def test_allocator_alias_listener(self):
+        from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+
+        got = []
+        alloc = types.SimpleNamespace()
+        for name in ("register_alias_listener", "has_alias_listeners", "notify_alias"):
+            setattr(alloc, name, types.MethodType(getattr(BaseTokenToKVPoolAllocator, name), alloc))
+        self.assertFalse(alloc.has_alias_listeners())
+        alloc.notify_alias(_t([1]), _t([2]))  # nobody subscribed: no call
+        alloc.register_alias_listener(lambda s, d: got.append((s.tolist(), d.tolist())))
+        self.assertTrue(alloc.has_alias_listeners())
+        alloc.notify_alias(_t([1]), _t([2]))
+        self.assertEqual(got, [([1], [2])])
+
+    def test_env_switch_defaults_off(self):
+        from sglang.srt.environ import envs
+
+        os.environ.pop("SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY", None)
+        self.assertFalse(envs.SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY.get())
+
+
 if __name__ == "__main__":
     unittest.main()
