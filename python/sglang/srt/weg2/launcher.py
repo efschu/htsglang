@@ -787,7 +787,15 @@ def apply_spec_form(ns) -> None:
 #: 63/42/74 ms per stage, ~24 ms fixed + ~0.9 ms per layer, independent of the
 #: token count, against ~48-71 ms of compute for a 512-token chunk.
 P_PREFILL_GRAPH_DEFAULT = 0
-_P_PREFILL_GRAPH: Dict[str, object] = {"bucket": P_PREFILL_GRAPH_DEFAULT, "tiny": ()}
+#: --p-prefill-graph-policy (27B line, user order 26.09. ~05:15Z: "cuda graphen
+#: im prefill nur anschalten wenn es was bringt, wenn es negativ ist,
+#: ausschalten"). The rule is weg2/p_graph_policy.py; 'auto' without a
+#: calibration table captures exactly the pre-switch set (argv byte-identical).
+P_PREFILL_GRAPH_POLICY_DEFAULT = "auto"
+_P_PREFILL_GRAPH: Dict[str, object] = {
+    "bucket": P_PREFILL_GRAPH_DEFAULT, "tiny": (), "captured": (), "legacy": (),
+    "policy": P_PREFILL_GRAPH_POLICY_DEFAULT, "verdicts": (), "calibration": None, "lines": (),
+}
 
 
 def apply_p_prefill_graph(ns) -> None:
@@ -795,11 +803,110 @@ def apply_p_prefill_graph(ns) -> None:
     install-once shape as apply_spec_form: every common_flags("P") call --
     the cut solve's chunk read, its armed re-check, the form key, the shipped
     argv -- reads this ONE value, so they cannot disagree)."""
+    from sglang.srt.weg2 import p_graph_policy as _pgp
+
     bucket = int(getattr(ns, "p_prefill_graph", P_PREFILL_GRAPH_DEFAULT) or 0)
     if bucket < 0:
         raise SystemExit(f"--p-prefill-graph must be >= 0, got {bucket}")
     _P_PREFILL_GRAPH["bucket"] = bucket
     _P_PREFILL_GRAPH["tiny"] = p_prefill_graph_tiny_of(ns, bucket)
+    policy = str(getattr(ns, "p_prefill_graph_policy", P_PREFILL_GRAPH_POLICY_DEFAULT)
+                 or P_PREFILL_GRAPH_POLICY_DEFAULT)
+    raw_extra = str(getattr(ns, "p_prefill_graph_buckets", "") or "").strip()
+    try:
+        extras = tuple(sorted({int(x) for x in raw_extra.split(",") if x.strip()}))
+    except ValueError:
+        raise SystemExit(f"--p-prefill-graph-buckets {raw_extra!r}: comma list of token counts expected")
+    cal = p_prefill_graph_calibration_of(ns)
+    try:
+        captured, verdicts = _pgp.decide(policy, bucket, _P_PREFILL_GRAPH["tiny"], extras, cal,
+                                         P_PREFILL_GRAPH_STAGES,
+                                         float(getattr(ns, "p_prefill_graph_min_gain",
+                                                       _pgp.DEFAULT_MIN_GAIN)))
+    except _pgp.GraphPolicyError as exc:
+        raise SystemExit(str(exc))
+    legacy = tuple(sorted(set(_P_PREFILL_GRAPH["tiny"]) | {bucket})) if bucket else ()
+    _P_PREFILL_GRAPH.update(
+        policy=policy, captured=tuple(captured), legacy=legacy, verdicts=tuple(verdicts),
+        calibration=cal,
+        lines=tuple(_pgp.decision_lines(policy, captured, verdicts, cal)) if bucket else (),
+    )
+
+
+def p_prefill_graph_calibration_of(ns):
+    """The graph calibration table: --p-prefill-graph-calibration PATH, else the
+    'graph_calibration' key of a --p-chunk-model JSON file, else None."""
+    from sglang.srt.weg2 import p_graph_policy as _pgp
+
+    path = str(getattr(ns, "p_prefill_graph_calibration", "") or "").strip()
+    try:
+        if path:
+            return _pgp.load_calibration(path)
+        src = str(getattr(ns, "p_chunk_model", "") or "").strip()
+        if src and src.endswith(".json") and os.path.isfile(src):
+            with open(src) as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and isinstance(data.get("graph_calibration"), dict):
+                return _pgp.Calibration.from_json(data["graph_calibration"])
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"--p-prefill-graph-calibration {path or src}: {exc}")
+    return None
+
+
+def p_prefill_graph_captured() -> List[int]:
+    """The buckets group P really captures (the policy's answer), ascending;
+    [] = no graph (switch off, or 'auto' found the graph slower everywhere)."""
+    return list(_P_PREFILL_GRAPH.get("captured", ()) or ())
+
+
+def p_prefill_graph_policy_lines() -> List[str]:
+    return list(_P_PREFILL_GRAPH.get("lines", ()) or ())
+
+
+def p_prefill_graph_vram_gate(ns, model_pool, pinned_layers, families, pool_floor, log):
+    """Extra buckets (above the main one) that 'auto' admitted must also fit:
+    the P cut's pool WITH their capture pool has to clear the pool floor.
+    Returns the (possibly rebuilt) pool model; drops the extras -- and says so
+    -- when they do not fit or when the cut is not pinned (the solved field
+    has no single cut to check against, so the safe side is taken)."""
+    from sglang.srt.planner import pp_cut as _pp_cut
+
+    captured = tuple(p_prefill_graph_captured())
+    legacy = tuple(_P_PREFILL_GRAPH.get("legacy", ()) or ())
+    extras = tuple(b for b in captured if b not in legacy)
+    if str(_P_PREFILL_GRAPH.get("policy")) != "auto" or not extras:
+        return model_pool
+    reason = None
+    counts = tuple(int(x) for x in (pinned_layers or ()))
+    if not counts or sum(counts) != len(families):
+        reason = "the cut is not pinned by --pp-stage-ratio"
+    else:
+        attn, lo = [], 0
+        for c in counts:
+            attn.append(sum(1 for f in families[lo:lo + c] if f == _pp_cut.LAYER_FAMILY_ATTENTION))
+            lo += c
+        try:
+            pool = _pp_cut.pp_phase_pool(counts, attn, model_pool)
+        except ValueError as exc:
+            pool, reason = None, f"the pinned cut is not priceable with them ({exc})"
+        if pool is not None:
+            if pool_floor is None or pool >= float(pool_floor):
+                log("P-PREFILL-GRAPH-POLICY VRAM gate: extra bucket(s) %s CARRIED -- pinned cut %s "
+                    "pool %d >= floor %s with prefill graph pool %s MiB/stage"
+                    % (list(extras), ",".join(map(str, counts)), int(pool), pool_floor,
+                       ",".join("%.1f" % v for v in model_pool.prefill_graph_pool_mib)))
+                return model_pool
+            reason = "pinned cut %s pool %d < floor %d with their capture pool" % (
+                ",".join(map(str, counts)), int(pool), int(pool_floor))
+    kept = tuple(b for b in captured if b in legacy)
+    _P_PREFILL_GRAPH["captured"] = kept
+    _P_PREFILL_GRAPH["lines"] = tuple(p_prefill_graph_policy_lines()) + (
+        "P-PREFILL-GRAPH-POLICY VRAM gate: extra bucket(s) %s DROPPED (%s); captured=%s"
+        % (list(extras), reason, list(kept) or "none"),)
+    log(_P_PREFILL_GRAPH["lines"][-1])
+    # The chunk policy prices the widths against the captured set: re-install.
+    apply_p_chunk_policy(ns)
+    return replace(model_pool, prefill_graph_pool_mib=p_prefill_graph_pool_mib(ns))
 
 
 def p_prefill_graph_tiny_of(ns, bucket: int) -> Tuple[int, ...]:
@@ -831,11 +938,11 @@ def p_prefill_graph_tiny_of(ns, bucket: int) -> Tuple[int, ...]:
 
 
 def p_prefill_graph_buckets() -> List[int]:
-    """Every captured prefill bucket, ascending; [] when the graph is off."""
-    bucket = p_prefill_graph_bucket()
-    if not bucket:
+    """Every captured prefill bucket, ascending; [] when no graph is captured
+    (the switch off, or --p-prefill-graph-policy auto dropped every bucket)."""
+    if not p_prefill_graph_bucket():
         return []
-    return sorted(set(int(t) for t in _P_PREFILL_GRAPH.get("tiny", ()) or ()) | {bucket})
+    return p_prefill_graph_captured()
 
 
 def p_prefill_graph_bucket() -> int:
@@ -871,8 +978,7 @@ def p_prefill_graph_flags() -> List[str]:
         requests runs eager (named by the runner's PREFILL-GRAPH eager line),
         and the captured linear-attention metadata never sees a sentinel row.
     """
-    bucket = p_prefill_graph_bucket()
-    if not bucket:
+    if not p_prefill_graph_buckets():
         return []
     return [
         "--cuda-graph-config",
@@ -914,8 +1020,7 @@ def p_prefill_graph_pool_mib(ns) -> Tuple[float, ...]:
     off. ONE vector for both sides of the seam: the pool model's
     PhasePoolModel.prefill_graph_pool_mib and the ranks' SGLANG_KV_BUDGET_
     PREFILL_GRAPH_MIB (p_prefill_graph_env) are both built from this call."""
-    bucket = p_prefill_graph_bucket()
-    if not bucket:
+    if not p_prefill_graph_buckets():
         return ()
     raw = str(getattr(ns, "p_prefill_graph_pool_mib", "") or "").strip()
     if raw:
@@ -944,7 +1049,7 @@ def p_prefill_graph_env(
     default env stays byte-identical). ``max_prefix`` is
     --p-prefill-graph-max-prefix: None (the default) sets nothing, i.e. no
     depth threshold."""
-    if not p_prefill_graph_bucket():
+    if not p_prefill_graph_buckets():
         return {}
     env = {
         # model_runner_kv_cache_mixin.PREFILL_GRAPH_POOL_ENV: the runtime
@@ -971,6 +1076,20 @@ def p_prefill_graph_line() -> str:
         return (
             "WEG2 P-PREFILL-GRAPH: off -- group P prefills eager at "
             f"--chunked-prefill-size {CHUNKED_PREFILL_TOKENS} (default form)"
+        )
+    if not p_prefill_graph_buckets():
+        return (
+            f"WEG2 P-PREFILL-GRAPH: bucket={bucket} but NOTHING captured "
+            f"(--p-prefill-graph-policy {_P_PREFILL_GRAPH.get('policy')}: the calibration puts "
+            f"eager ahead at every width) -- group P runs --chunked-prefill-size {bucket} EAGER"
+        )
+    if p_prefill_graph_buckets() != list(_P_PREFILL_GRAPH.get("legacy", ()) or ()):
+        return (
+            f"WEG2 P-PREFILL-GRAPH: bucket={bucket} captured={p_prefill_graph_buckets()} "
+            f"(--p-prefill-graph-policy {_P_PREFILL_GRAPH.get('policy')}) -- group P runs "
+            f"--chunked-prefill-size {p_chunked_prefill_tokens()} ({' '.join(p_prefill_graph_flags())}); "
+            "a chunk replays the smallest captured bucket that holds it, above the largest it "
+            "runs eager ('PREFILL-GRAPH eager reason=')"
         )
     tiny = [b for b in p_prefill_graph_buckets() if b != bucket]
     return (
@@ -1154,6 +1273,20 @@ def apply_p_chunk_policy(ns) -> None:
         str(getattr(ns, "p_chunk_mscale", P_CHUNK_MSCALE_DEFAULT) or P_CHUNK_MSCALE_DEFAULT),
         P_PREFILL_GRAPH_STAGES,
     )
+    # --p-prefill-graph-policy: the plan prices every width in the mode the
+    # policy decided (graph or eager), from the SAME calibration table. No
+    # table = the models are untouched (spec byte-identical).
+    _cal = _P_PREFILL_GRAPH.get("calibration")
+    if _cal is not None and bucket:
+        from sglang.srt.weg2 import p_graph_policy as _pgp
+
+        models = _pgp.overlay_stage_models(models, _cal, buckets)
+        source = f"{source} +graphcal:{_cal.source or 'table'}"
+    _sweep_raw = str(getattr(ns, "p_chunk_sweep", "") or "").strip()
+    try:
+        _sweep = tuple(int(x) for x in _sweep_raw.split(",") if x.strip())
+    except ValueError:
+        raise SystemExit(f"--p-chunk-sweep {_sweep_raw!r}: comma list of token counts expected")
     try:
         limits = _pcp.ChunkLimits(
             max_tokens=cap, min_tokens=low, fixed_tokens=fixed, page=1,
@@ -1162,6 +1295,7 @@ def apply_p_chunk_policy(ns) -> None:
             min_gain=float(getattr(ns, "p_chunk_min_gain", _pcp.DEFAULT_MIN_GAIN)),
             dynamic_min_tokens=int(getattr(ns, "p_chunk_dynamic_min_tokens",
                                            P_CHUNK_DYNAMIC_MIN_TOKENS_DEFAULT) or 0),
+            sweep=_sweep,
         )
     except _pcp.ChunkPolicyError as exc:
         raise SystemExit(f"--p-chunk-policy dynamic: {exc}")
@@ -9752,7 +9886,7 @@ def p_graph_split_env(ns) -> Dict[str, str]:
     n = int(getattr(ns, "p_prefill_graph_split", P_PREFILL_GRAPH_SPLIT_DEFAULT) or 0)
     if n < 0 or n == 1:
         raise SystemExit(f"--p-prefill-graph-split must be 0 (off) or >= 2, got {n}")
-    if not p_prefill_graph_bucket():
+    if not p_prefill_graph_buckets():
         return {}
     return _fgs.launcher_env_p_graph_split(n)
 
@@ -11440,6 +11574,11 @@ def solve_p_cut(
             % (_floor_flag, _cap, int(chunk_tokens)))
     pool_floor, pool_floor_from_cut, pool_floor_rule = resolve_pool_floor(_floor_flag)
     log("PP-CUT POOL FLOOR RULE: " + pool_floor_rule)
+    # --p-prefill-graph-policy auto: extra buckets only where the pool still
+    # clears the floor with their capture pool (no-op without extras).
+    model_pool = p_prefill_graph_vram_gate(
+        ns, model_pool, _csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else None,
+        families, pool_floor, log)
     decision = _cut.solve_launch_cut(
         layer_families=families,
         incumbent_layers=incumbent,
@@ -12126,6 +12265,45 @@ def build_parser() -> argparse.ArgumentParser:
              "capture cost per stage is the rank line 'PREFILL-GRAPH captured "
              "... capture_mib='. Changes P's form key (chunk + graph config "
              "are device allocations). User goal: 512.")
+    ap.add_argument(
+        "--p-prefill-graph-policy", choices=["auto", "on", "off"],
+        default=P_PREFILL_GRAPH_POLICY_DEFAULT,
+        help="Only with --p-prefill-graph (27B line, weg2/p_graph_policy.py; user order "
+             "26.09.: 'cuda graphen im prefill nur anschalten wenn es was bringt'). "
+             "'auto' (default): per width (the main bucket and every "
+             "--p-prefill-graph-buckets entry) the graph is captured only when the "
+             "calibration table (--p-prefill-graph-calibration) puts its slowest P stage "
+             "at least --p-prefill-graph-min-gain ahead of eager; a width without a "
+             "measurement keeps the safe default -- main bucket graph, extra buckets "
+             "eager -- so without a table the argv is byte-identical to before. Extra "
+             "buckets must also pass the VRAM gate (the pinned cut's pool with their "
+             "capture pool clears the pool floor). 'on': capture every configured bucket "
+             "(the metal calibration arm). 'off': the pre-switch form, extra buckets "
+             "refused. The chunk policy prices each width in the decided mode.")
+    ap.add_argument(
+        "--p-prefill-graph-buckets", default="", metavar="TOKENS[,TOKENS]",
+        help="Only with --p-prefill-graph and --p-prefill-graph-policy auto|on: extra "
+             "prefill graph buckets ABOVE the main one (e.g. 1024,2048 for the dynamic "
+             "chunk ladder). Empty (default) = none. Captured into the same pool; the "
+             "budget post prices them proportionally (upper estimate) unless "
+             "--p-prefill-graph-pool-mib gives the measured capture_mib.")
+    ap.add_argument(
+        "--p-prefill-graph-calibration", default="", metavar="JSON",
+        help="Only with --p-prefill-graph-policy auto: the calibration table "
+             "{'ref_prefix': N, 'widths': {'512': {'graph_ms': [..], 'eager_ms': [..]}, ...}} "
+             "(per P stage, the prefix-free ms of one forward; written by "
+             "docker/graphcal_eval.py from a graph and an eager metal boot). Empty "
+             "(default) = the 'graph_calibration' key of a --p-chunk-model JSON, else none.")
+    ap.add_argument(
+        "--p-prefill-graph-min-gain", type=float, default=0.01, metavar="FRACTION",
+        help="Only with --p-prefill-graph-policy auto: the graph must be at least this "
+             "much faster at the slowest stage (default 0.01).")
+    ap.add_argument(
+        "--p-chunk-sweep", default="", metavar="TOKENS[,TOKENS]",
+        help="MEASUREMENT only, with --p-chunk-policy dynamic: no plan; the n-th request "
+             "runs every chunk at the n-th width of this list (cyclic), so one boot "
+             "measures every width on every prompt length (graph calibration ladder). "
+             "Overrides --p-chunk-dynamic-min-tokens. Empty (default) = off.")
     ap.add_argument(
         "--p-chunk-policy", choices=["fixed", "dynamic"], default=P_CHUNK_POLICY_DEFAULT,
         help="Group P prefill chunk width (27B and NF line, weg2/p_chunk_policy.py). "
@@ -13991,6 +14169,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if p_prefill_graph_bucket():
         # Only when on: the default boot's front log stays byte-identical.
         log(p_prefill_graph_line())
+        for _pgl in p_prefill_graph_policy_lines():
+            log("WEG2 " + _pgl)
     # --p-chunk-policy: [] under 'fixed' (front log byte-identical).
     for _pcl in p_chunk_policy_lines():
         log(_pcl)

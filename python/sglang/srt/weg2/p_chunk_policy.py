@@ -119,12 +119,31 @@ class StageModel:
     ``((m, ms), ...)`` ascending in ``m``; beyond the ends it extends the
     outer segment; ONE point means proportional (``ms * m / m0``). The
     NF form ``a + b * M`` is ``StageModel.linear(a, b)``.
+
+    GRAPH AND EAGER ARE PRICED APART WHEN MEASURED (26.09., user order "cuda
+    graphen im prefill nur anschalten wenn es was bringt"; rc9j #PGAP: the
+    5090's attention costs 0.28 ms per attention layer per (tok x ktok) in the
+    512 graph and 0.17 eager at 2048). Optional, empty = the old model:
+      * ``eager_points``      -- ``base`` of an EAGER forward (else ``points``);
+      * ``attn_points``       -- ``((m, attn_ms_per_tok_1k), ...)``: the
+                                 attention coefficient as a function of the
+                                 EXECUTED width (graph forwards; else the
+                                 scalar ``attn_ms_per_tok_1k``), piecewise
+                                 linear, flat beyond the ends;
+      * ``eager_attn_points`` -- the same for eager forwards (else
+                                 ``attn_points``, else the scalar).
+    The same numbers a graph-policy decision was taken on are handed in here
+    (launcher ``p_prefill_graph_policy``), so the chunk plan prices a width at
+    the cost of the mode it will really run in.
     """
 
     points: Tuple[Tuple[int, float], ...]
     attn_ms_per_tok_1k: float = 0.0
     eager_floor_ms: float = 0.0
     name: str = ""
+    eager_points: Tuple[Tuple[int, float], ...] = ()
+    attn_points: Tuple[Tuple[int, float], ...] = ()
+    eager_attn_points: Tuple[Tuple[int, float], ...] = ()
 
     def __post_init__(self):
         pts = tuple((int(m), float(t)) for m, t in self.points)
@@ -140,6 +159,15 @@ class StageModel:
         if self.attn_ms_per_tok_1k < 0 or self.eager_floor_ms < 0:
             raise ChunkPolicyError("attn_ms_per_tok_1k and eager_floor_ms must be >= 0")
         object.__setattr__(self, "points", pts)
+        for fld in ("eager_points", "attn_points", "eager_attn_points"):
+            raw = tuple((int(m), float(t)) for m, t in (getattr(self, fld) or ()))
+            if raw:
+                xs = [m for m, _ in raw]
+                if any(m <= 0 for m in xs) or xs != sorted(xs) or len(set(xs)) != len(xs):
+                    raise ChunkPolicyError(f"StageModel {fld} must be ascending, unique, > 0: {raw}")
+                if any(t < 0 for _, t in raw):
+                    raise ChunkPolicyError(f"StageModel {fld} values must be >= 0: {raw}")
+            object.__setattr__(self, fld, raw)
 
     @classmethod
     def linear(cls, a_ms: float, b_ms_per_token: float, *, attn_ms_per_tok_1k: float = 0.0,
@@ -148,42 +176,76 @@ class StageModel:
         return cls(((0, float(a_ms)), (1, float(a_ms) + float(b_ms_per_token))),
                    attn_ms_per_tok_1k, eager_floor_ms, name)
 
-    def base_ms(self, m: int) -> float:
-        pts = self.points
-        if len(pts) == 1:
-            m0, t0 = pts[0]
-            return t0 * float(m) / float(m0)
-        if m <= pts[0][0]:
-            (m0, t0), (m1, t1) = pts[0], pts[1]
-        elif m >= pts[-1][0]:
-            (m0, t0), (m1, t1) = pts[-2], pts[-1]
-        else:
-            i = 1
-            while pts[i][0] < m:
-                i += 1
-            (m0, t0), (m1, t1) = pts[i - 1], pts[i]
-        return max(0.0, t0 + (t1 - t0) * (float(m) - m0) / float(m1 - m0))
+    def base_ms(self, m: int, eager: bool = False) -> float:
+        pts = self.eager_points if (eager and self.eager_points) else self.points
+        return _interp_base(pts, m)
+
+    def attn_coeff(self, m: int, eager: bool = False) -> float:
+        """``attn_ms_per_tok_1k`` of a forward executed at width ``m``."""
+        pts = (self.eager_attn_points or self.attn_points) if eager else self.attn_points
+        if not pts:
+            return self.attn_ms_per_tok_1k
+        return _interp_flat(pts, m)
 
     def forward_ms(self, m_exec: int, m_real: int, prefix: int, eager: bool) -> float:
-        t = self.base_ms(m_exec) + self.attn_ms_per_tok_1k * m_real * (prefix + 0.5 * m_real) / 1000.0
+        t = self.base_ms(m_exec, eager) + self.attn_coeff(m_exec, eager) * m_real * (prefix + 0.5 * m_real) / 1000.0
         if eager and self.eager_floor_ms > t:
             t = self.eager_floor_ms
         return t
 
     def to_json(self) -> Dict[str, object]:
-        return {"points": [list(p) for p in self.points], "attn_ms_per_tok_1k": self.attn_ms_per_tok_1k,
-                "eager_floor_ms": self.eager_floor_ms, "name": self.name}
+        d: Dict[str, object] = {"points": [list(p) for p in self.points],
+                                "attn_ms_per_tok_1k": self.attn_ms_per_tok_1k,
+                                "eager_floor_ms": self.eager_floor_ms, "name": self.name}
+        for fld in ("eager_points", "attn_points", "eager_attn_points"):
+            if getattr(self, fld):
+                d[fld] = [list(p) for p in getattr(self, fld)]
+        return d
 
     @classmethod
     def from_json(cls, d: Dict[str, object]) -> "StageModel":
+        extra = {fld: tuple((int(m), float(t)) for m, t in d.get(fld, ()) or ())
+                 for fld in ("eager_points", "attn_points", "eager_attn_points")}
         if "a_ms" in d:
-            return cls.linear(float(d["a_ms"]), float(d.get("b_ms_per_token", 0.0)),
+            base = cls.linear(float(d["a_ms"]), float(d.get("b_ms_per_token", 0.0)),
                               attn_ms_per_tok_1k=float(d.get("attn_ms_per_tok_1k", 0.0)),
                               eager_floor_ms=float(d.get("eager_floor_ms", 0.0)),
                               name=str(d.get("name", "")))
+            return dataclasses.replace(base, **extra) if any(extra.values()) else base
         return cls(tuple((int(m), float(t)) for m, t in d["points"]),
                    float(d.get("attn_ms_per_tok_1k", 0.0)), float(d.get("eager_floor_ms", 0.0)),
-                   str(d.get("name", "")))
+                   str(d.get("name", "")), **extra)
+
+
+def _interp_flat(pts: Sequence[Tuple[int, float]], m: int) -> float:
+    """Piecewise linear in ``m`` over ``pts``, FLAT beyond both ends."""
+    if m <= pts[0][0]:
+        return float(pts[0][1])
+    if m >= pts[-1][0]:
+        return float(pts[-1][1])
+    i = 1
+    while pts[i][0] < m:
+        i += 1
+    (m0, t0), (m1, t1) = pts[i - 1], pts[i]
+    return float(t0 + (t1 - t0) * (float(m) - m0) / float(m1 - m0))
+
+
+def _interp_base(pts: Sequence[Tuple[int, float]], m: int) -> float:
+    """``StageModel.base_ms``: piecewise linear, the outer segment extended,
+    one point proportional."""
+    if len(pts) == 1:
+        m0, t0 = pts[0]
+        return t0 * float(m) / float(m0)
+    if m <= pts[0][0]:
+        (m0, t0), (m1, t1) = pts[0], pts[1]
+    elif m >= pts[-1][0]:
+        (m0, t0), (m1, t1) = pts[-2], pts[-1]
+    else:
+        i = 1
+        while pts[i][0] < m:
+            i += 1
+        (m0, t0), (m1, t1) = pts[i - 1], pts[i]
+    return max(0.0, t0 + (t1 - t0) * (float(m) - m0) / float(m1 - m0))
 
 
 # ---------------------------------------------------------------------------
@@ -214,9 +276,15 @@ class ChunkLimits:
     #: 0 = off (every request is planned). A request that started above it
     #: keeps following its plan to the end.
     dynamic_min_tokens: int = 0
+    #: MEASUREMENT SWEEP (26.09., graph calibration ladder): non-empty = no
+    #: plan at all; the n-th request the cursor sees runs EVERY chunk at
+    #: ``sweep[n % len(sweep)]`` (its rest last), so one boot measures every
+    #: width on every prompt length. Overrides the bypass. () = off.
+    sweep: Tuple[int, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "graph_buckets", tuple(sorted({int(b) for b in self.graph_buckets})))
+        object.__setattr__(self, "sweep", tuple(int(w) for w in (self.sweep or ())))
         if self.page < 1:
             raise ChunkPolicyError(f"page must be >= 1, got {self.page}")
         if not (0 < self.min_tokens <= self.max_tokens):
@@ -246,6 +314,11 @@ class ChunkLimits:
             raise ChunkPolicyError("max_inflight must be >= 0 and 0 <= min_gain < 1")
         if self.dynamic_min_tokens < 0:
             raise ChunkPolicyError(f"dynamic_min_tokens must be >= 0, got {self.dynamic_min_tokens}")
+        for w in self.sweep:
+            if not (0 < w <= self.max_tokens) or w % self.page or (self.grid and w > self.grid):
+                raise ChunkPolicyError(
+                    f"sweep width {w} must be in (0, max_tokens={self.max_tokens}], a multiple of "
+                    f"page {self.page} and not above grid {self.grid or '-'}")
 
     def ladder(self) -> Tuple[int, ...]:
         """The chunk sizes a plan chooses from, ascending."""
@@ -269,14 +342,18 @@ class ChunkLimits:
     def key(self) -> Tuple:
         return (self.max_tokens, self.min_tokens, self.fixed_tokens, self.page, self.grid,
                 self.graph_buckets, self.eager, self.max_inflight, self.min_gain, self.ramps,
-                self.dynamic_min_tokens)
+                self.dynamic_min_tokens, self.sweep)
 
     def to_json(self) -> Dict[str, object]:
-        return {"max_tokens": self.max_tokens, "min_tokens": self.min_tokens,
-                "fixed_tokens": self.fixed_tokens, "page": self.page, "grid": self.grid,
-                "graph_buckets": list(self.graph_buckets), "eager": self.eager,
-                "max_inflight": self.max_inflight, "min_gain": self.min_gain, "ramps": self.ramps,
-                "dynamic_min_tokens": self.dynamic_min_tokens}
+        d: Dict[str, object] = {
+            "max_tokens": self.max_tokens, "min_tokens": self.min_tokens,
+            "fixed_tokens": self.fixed_tokens, "page": self.page, "grid": self.grid,
+            "graph_buckets": list(self.graph_buckets), "eager": self.eager,
+            "max_inflight": self.max_inflight, "min_gain": self.min_gain, "ramps": self.ramps,
+            "dynamic_min_tokens": self.dynamic_min_tokens}
+        if self.sweep:  # only when set: the spec of every other boot stays byte-identical
+            d["sweep"] = list(self.sweep)
+        return d
 
     @classmethod
     def from_json(cls, d: Dict[str, object], tail_hook: Optional[TailHook] = None) -> "ChunkLimits":
@@ -285,7 +362,8 @@ class ChunkLimits:
                    tuple(int(b) for b in d.get("graph_buckets", ()) or ()),
                    bool(d.get("eager", True)), int(d.get("max_inflight", 0)),
                    float(d.get("min_gain", DEFAULT_MIN_GAIN)), bool(d.get("ramps", True)), tail_hook,
-                   int(d.get("dynamic_min_tokens", 0) or 0))
+                   int(d.get("dynamic_min_tokens", 0) or 0),
+                   tuple(int(w) for w in d.get("sweep", ()) or ()))
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +597,8 @@ class ChunkPlanner:
         self.on_plan = on_plan
         self._plans: Dict[object, Tuple[int, Dict[int, int]]] = {}
         self._max_keys = int(max_keys)
+        self._sweep_seen: Dict[object, int] = {}
+        self._sweep_next = 0
 
     def _make(self, key, pos: int, end: int, ramps: bool) -> Dict[int, int]:
         res = plan_detail(end - pos, len(self.spec.stages), self.spec.stages, self.spec.limits,
@@ -539,6 +619,17 @@ class ChunkPlanner:
         pos, end = int(pos), int(end)
         if end <= pos:
             return 0
+        sweep = self.spec.limits.sweep
+        if sweep:
+            # Measurement sweep: the request's width is fixed on first sight.
+            idx = self._sweep_seen.get(key)
+            if idx is None:
+                idx = self._sweep_next
+                self._sweep_next += 1
+                if len(self._sweep_seen) >= self._max_keys:
+                    self._sweep_seen.pop(next(iter(self._sweep_seen)))
+                self._sweep_seen[key] = idx
+            return min(int(sweep[idx % len(sweep)]), end - pos)
         known = self._plans.get(key)
         if known is None or known[0] != end:
             lim = self.spec.limits
@@ -554,6 +645,7 @@ class ChunkPlanner:
 
     def forget(self, key) -> None:
         self._plans.pop(key, None)
+        self._sweep_seen.pop(key, None)
 
 
 def forward_budget(planner: ChunkPlanner, key, pos: int, end: int) -> int:
@@ -580,7 +672,9 @@ def armed_line(spec: PolicySpec, where: str = "") -> str:
         f"min={lim.min_tokens} fixed={lim.fixed_tokens} page={lim.page} grid={lim.grid} "
         f"graph_buckets={list(lim.graph_buckets)} eager={lim.eager} "
         f"min_gain={lim.min_gain:g} ramps={lim.ramps} "
-        f"dynamic_min_tokens={lim.dynamic_min_tokens} source={spec.source or '-'}"
+        f"dynamic_min_tokens={lim.dynamic_min_tokens}"
+        + (f" SWEEP={list(lim.sweep)} (measurement: no plan, width per request)" if lim.sweep else "")
+        + f" source={spec.source or '-'}"
     )
 
 
