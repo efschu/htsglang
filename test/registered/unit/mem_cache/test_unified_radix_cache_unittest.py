@@ -424,6 +424,58 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         self.assertNotEqual(canonical_hashes, leaf.hash_value)
 
 
+
+class TestUnifiedRadixDedupDraftCarry(CustomTestCase):
+    """SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY: an insert that finds its tokens
+    already in the tree frees the request's fresh KV slots and keeps the
+    tree's. The alias listener sees (fresh, kept) element-wise BEFORE the free,
+    so the DFlash window pool can move the fresh draft rows to the kept slots
+    (27b-draftholes 26.09.: without it a D re-prefill of a cached span loses
+    its draft KV and the draft window reads zero holes)."""
+
+    def _insert(self, cache, tokens, value):
+        return cache.insert(
+            InsertParams(key=RadixKey(array("q", tokens)), value=value)
+        )
+
+    def test_alias_listener_sees_fresh_and_kept(self):
+        cache, allocator, _ = build_fixture(CacheConfig())
+        toks = list(range(1, 9))
+        kept = allocator.alloc(len(toks))
+        self._insert(cache, toks, kept)
+        got = []
+        allocator.register_alias_listener(
+            lambda src, dst: got.append((src.tolist(), dst.tolist()))
+        )
+        fresh = allocator.alloc(len(toks))
+        self._insert(cache, toks, fresh)
+        self.assertEqual(got, [(fresh.tolist(), kept.tolist())])
+        cache.sanity_check()
+
+    def test_no_listener_no_call_and_mapper_carry_end_to_end(self):
+        from sglang.srt.speculative.dflash_solo_pool import DraftKVSlotMapper
+
+        for carry in (False, True):
+            cache, allocator, _ = build_fixture(CacheConfig())
+            m = DraftKVSlotMapper(CacheConfig().kv_size + 1, 64, 16, device="cpu")
+            allocator.register_free_listener(m.on_global_free, m.on_global_clear)
+            if carry:
+                allocator.register_alias_listener(m.on_global_alias)
+            toks = list(range(1, 9))
+            kept = allocator.alloc(len(toks))
+            self._insert(cache, toks, kept)  # tree KV, no draft rows (flip/HiCache)
+            fresh = allocator.alloc(len(toks))
+            rows = m.translate_write(fresh)  # D re-prefill writes draft rows
+            self._insert(cache, toks, fresh)  # dedup: fresh freed, kept stays
+            got = m.translate_read(kept)
+            if carry:
+                self.assertEqual(got.tolist(), rows.tolist())
+                self.assertEqual(m.holes_read_total, 0)
+            else:
+                self.assertEqual(got.tolist(), [0] * len(toks))
+                self.assertEqual(m.holes_read_total, len(toks))
+
+
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
 
