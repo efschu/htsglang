@@ -7205,6 +7205,13 @@ class SchedulerWeightUpdaterManager:
             # #1457: no KV zeroing before a pause that discards the pages (the
             # mamba/req_to_token resets in the flush still run on mapped pages).
             self.flush_cache(zero_kv=False)
+            # AH (--p-attn-head-split): the helper mirror lives in this region;
+            # reset the split rule and drain the helper before it is unmapped,
+            # so no request ever continues on a mirror from before the flip.
+            from sglang.srt.weg2 import attn_head_split as _ah_split
+
+            if _ah_split.runtime() is not None:
+                _ah_split.runtime().on_kv_release()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             _weg2_ph("kv_pause")
             # W25 Weg2DormantRefused (S1 boot killer K2): from this statement

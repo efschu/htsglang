@@ -37,6 +37,7 @@ from sglang.srt.configs.qwen3_5 import (
 
 # Distributed
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.weg2 import attn_head_split as _ah_split_mod
 from sglang.srt.distributed.utils import (
     attn_kv_replicated,
     attn_replicated_kv_local_head,
@@ -964,6 +965,10 @@ def select_rank_local_kv_head(
 class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
+    #: AH, --p-attn-head-split (weg2/attn_head_split.py): set on the owner's
+    #: delegated layers only; False = the stock attention call.
+    _ah_split = False
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1434,7 +1439,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        if self._ah_split and _ah_split_mod.owner_split_now(self.layer_id):
+            # AH: this chunk's attention of the delegated kv groups runs on the
+            # helper stage; own heads here, same [w, heads * D] output layout.
+            attn_output = _ah_split_mod.runtime().owner_attention(
+                self.attn, q, k, v, forward_batch
+            )
+        else:
+            attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
             if not _is_npu:

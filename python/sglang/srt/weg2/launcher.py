@@ -9968,6 +9968,78 @@ def p_cut_calibration_line(model_path: str, quant_method: str) -> Optional[str]:
             "checkpoint's P log" % (qm, dg[:12], rec_why, _csv(P_PP_STAGE_RATIO_SCORES), qm))
 
 
+#: --p-attn-head-split (27B, release table row 22, ATTN_HEAD_SPLIT.md phase 2):
+#: 'off' (default) = no env, the pool model and argv byte-identical.
+P_ATTN_HEAD_SPLIT_DEFAULT = "off"
+#: A split chunk must be EAGER: min_w above every captured prefill bucket.
+P_ATTN_HEAD_SPLIT_MIN_W_DEFAULT = 1024
+
+
+def p_attn_head_split_cfg(ns, pp_size: int, chunk_tokens: int, model: str):
+    """The ONE AHConfig for group P, or None when off. Called by solve_p_cut
+    (pool model post) and by main (group P's env) with the same inputs, so
+    the planner and the ranks price and book one number."""
+    from sglang.srt.weg2 import attn_head_split as _ah
+
+    text = str(getattr(ns, "p_attn_head_split", P_ATTN_HEAD_SPLIT_DEFAULT) or "off")
+    try:
+        dels = _ah.parse_spec(text)
+    except _ah.AHSpecError as exc:
+        raise SystemExit(str(exc))
+    if not dels:
+        return None
+    with open(model_config_path(model)) as fh:
+        cfg = json.load(fh)
+    tc = cfg.get("text_config") or cfg
+    num_q, num_kv = int(tc["num_attention_heads"]), int(tc["num_key_value_heads"])
+    head_dim = int(tc.get("head_dim") or int(tc["hidden_size"]) // num_q)
+    min_w = int(getattr(ns, "p_attn_head_split_min_w", P_ATTN_HEAD_SPLIT_MIN_W_DEFAULT)
+                or P_ATTN_HEAD_SPLIT_MIN_W_DEFAULT)
+    buckets = list(p_prefill_graph_buckets())
+    if buckets and min_w <= max(buckets):
+        raise SystemExit(f"--p-attn-head-split-min-w {min_w}: a split chunk must run eager, "
+                         f"above the captured prefill bucket(s) {buckets}")
+    spec = p_chunk_policy_spec()
+    max_w = max(int(chunk_tokens), int(spec.limits.max_tokens) if spec is not None else 0)
+    if min_w > max_w:
+        raise SystemExit(f"--p-attn-head-split: min_w {min_w} > the widest P chunk {max_w} -- "
+                         "the split would never fire")
+    try:
+        _ah.validate(dels, pp_size=int(pp_size), num_kv_heads=num_kv)
+    except _ah.AHSpecError as exc:
+        raise SystemExit(str(exc))
+    if num_q % num_kv:
+        raise SystemExit(f"--p-attn-head-split: {num_q} q heads over {num_kv} kv heads")
+    return _ah.AHConfig(dels, min_w, int(getattr(ns, "max_kv_per_request", 0) or CONTEXT_LENGTH_TOKENS),
+                        max_w, head_dim, num_q // num_kv, num_kv)
+
+
+def _p_ah_post_vector(ns, pp_size: int, chunk_tokens: int, model: str) -> Tuple[float, ...]:
+    from sglang.srt.weg2 import attn_head_split as _ah
+
+    return _ah.stage_post_vector(p_attn_head_split_cfg(ns, pp_size, chunk_tokens, model), pp_size)
+
+
+def p_attn_head_split_env(cfg) -> Dict[str, str]:
+    """Group P's env for the split; {} when off (byte-identical)."""
+    from sglang.srt.weg2 import attn_head_split as _ah
+
+    return {} if cfg is None else {_ah.ENV: cfg.to_env()}
+
+
+def p_attn_head_split_line(cfg, pp_size: int) -> str:
+    from sglang.srt.weg2 import attn_head_split as _ah
+
+    return (
+        "WEG2 P-ATTN-HEAD-SPLIT: on %s (owner:helper:layers:groups), min_w %d, mirror cap %d "
+        "tokens, max_w %d; post '%s' MiB per stage = %s (booked by the ranks and by the cut's "
+        "pool model), barlink p2p %.2f MiB/pair, pinned host %.1f MiB (ATTN_HEAD_SPLIT.md)"
+        % (",".join(d.text() for d in cfg.delegations), cfg.min_w, cfg.cap_tokens, cfg.max_w,
+           _ah.POST_NAME, ",".join("%.1f" % v for v in _ah.stage_post_vector(cfg, pp_size)),
+           cfg.p2p_bytes() / 2**20, _ah.host_pinned_mib(cfg, pp_size))
+    )
+
+
 def p_trim_end_anchor_env(on: bool) -> Dict[str, str]:
     """Group P's environment for ``--p-trim-end-anchor``: {} when off (the
     byte-identity guarantee). The variable NAME lives in
@@ -11463,6 +11535,9 @@ def solve_p_cut(
         # --p-prefill-graph: the SAME vector the ranks book (env_p, see
         # p_prefill_graph_env); () when off -- the pool model is unchanged.
         prefill_graph_pool_mib=p_prefill_graph_pool_mib(ns),
+        # --p-attn-head-split: the SAME vector the ranks book (env_p, see
+        # p_attn_head_split_env); () when off -- the pool model is unchanged.
+        attn_head_split_mib=_p_ah_post_vector(ns, len(budgets_p), chunk_tokens, model),
         activation_reserve_mib=float(ns.pp_cut_activation_reserve_mib),
         # #1257c: None = follow the reserve (the runtime charges exactly it);
         # a number = the operator pinned it.
@@ -12548,6 +12623,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--p-chunk-min-gain", type=float, default=0.01, metavar="FRACTION",
         help="Only with --p-chunk-policy dynamic: a plan other than fixed is taken "
              "only when predicted at least this much faster (default 0.01).")
+    ap.add_argument(
+        "--p-attn-head-split", default=P_ATTN_HEAD_SPLIT_DEFAULT, metavar="SPEC",
+        help="Group P attention split BY HEADS (27B, release table row 22; "
+             "ATTN_HEAD_SPLIT.md phase 2). 'off' (default) = no env, argv and the "
+             "pool model byte-identical. SPEC = owner:helper:n_layers:n_groups[,...]: "
+             "stage OWNER hands the attention of its last n_groups kv groups "
+             "(n_groups x 6 q heads) of its last n_layers full-attention layers to "
+             "stage HELPER, which must be UPSTREAM (helper < owner; V1). Example "
+             "'2:0:2:1,1:0:1:1' = INT8 128k model optimum. Cold single-request eager "
+             "chunks only; KV of all groups stays in the owner's pool.")
+    ap.add_argument(
+        "--p-attn-head-split-min-w", type=int, default=P_ATTN_HEAD_SPLIT_MIN_W_DEFAULT,
+        metavar="TOKENS",
+        help="Only with --p-attn-head-split: the narrowest chunk that splits (must be "
+             "above every captured prefill bucket, so a split chunk is eager).")
     ap.add_argument(
         "--p-trim-end-anchor", action="store_true",
         help="Group P (27B line): take every front leg-1 prompt of N tokens as "
@@ -14848,6 +14938,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "hand-off still carry N; N<2, read outputs, sessions, embeds and "
             "multimodal prompts stay on the split path (rank line 'WEG2 "
             "P-TRIM-END-ANCHOR kept(<reason>)')")
+    # --p-attn-head-split: {} when off (env byte-identical). Same builder and
+    # inputs as the pool model's post in solve_p_cut.
+    _ah_cfg = p_attn_head_split_cfg(ns, len(budgets_p), chunk_tokens, ns.model)
+    env_p.update(p_attn_head_split_env(_ah_cfg))
+    if _ah_cfg is not None:
+        log(p_attn_head_split_line(_ah_cfg, len(budgets_p)))
     # #1465: group P's write-through copy kernels at high stream priority, so
     # the backlog measured on weg2xsn219 (P running-req 2: 72 -> 103 un-backed
     # nodes, 2.0-2.8 s flush drain at the flip) does not build behind a
