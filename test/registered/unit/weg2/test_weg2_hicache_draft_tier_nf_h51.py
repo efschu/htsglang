@@ -535,3 +535,185 @@ def test_nf_w10_skip_line_follows_the_tier(monkeypatch):
         "asks the carrier for draft pages, but group P writes none, so D's draft reads miss and its draft "
         "state is COLD after every flip. Expect draft_pages=0 on the front's served lines; that is this "
         "arm, not a carrier fault. KV and Mamba across the flip are untouched.")
+
+
+# ------------------------------------ H51 (rc2.1l): the claim-form collective
+#
+# fnFL2x22 made the prefetch claim FORM (packed [claim, -claim] or the bare
+# scalar) a group agreement: one scalar MAX over the prefetch groups per
+# prefetch operation, before the claim MIN. The packed form exists only for
+# the draft claim (draft_tier_armed('admission') or the solo-shadow marker).
+# Under HICACHE-DRAFT-TIER off no rank has either, so the agreement can only
+# answer False -- metal fnFL2h91v1 (39fd662d9e) D: 24/24 '#xsn392b
+# PREFETCH-CLAIM-FORM local_packed=False agreed_packed=False' on TP0/TP1/TP2;
+# fnFL2x169: the counter reached n=1280 in one boot, one collective each.
+# Off = byte-identical to a controller without a draft tier: the scalar MIN
+# alone, the same claim.
+
+from sglang.srt.managers.cache_controller import Weg2DraftDisagree  # noqa: E402
+
+
+class _Groups:
+    """The prefetch sync groups' reduce, with the peers' answers.
+
+    ``peers_packed``: what the peers vote in the form MAX; ``peer_claims``:
+    the peers' storage claims in the MIN. Every collective this rank issues is
+    recorded as ``(op, value-before)`` -- the collective sequence IS the
+    pairing contract between ranks."""
+
+    def __init__(self, *, peers_packed=False, peer_claims=()):
+        self.peers_packed = bool(peers_packed)
+        self.peer_claims = list(peer_claims)
+        self.seen = []
+
+    def __call__(self, ctl, tensor, op):
+        flat = tensor.view(-1)  # a view: the reduce writes in place
+        self.seen.append((op, [int(v) for v in flat.tolist()]))
+        if op == torch.distributed.ReduceOp.MAX:
+            flat[0] = max(int(flat[0]), int(self.peers_packed))
+        elif op == torch.distributed.ReduceOp.MIN:
+            if flat.numel() == 1:
+                flat[0] = min([int(flat[0])] + self.peer_claims)
+            else:  # packed [claim, -claim]
+                flat[0] = min([int(flat[0])] + self.peer_claims)
+                flat[1] = min([int(flat[1])] + [-c for c in self.peer_claims])
+        else:  # pragma: no cover
+            raise AssertionError(op)
+
+
+def _prefetch_rank(ctl, groups: _Groups, *, n_groups=1):
+    """``ctl`` (a registered rank) with the prefetch thread's surface bound."""
+    ctl.prefetch_sync_groups = [object()] * n_groups
+    ctl._all_reduce_prefetch_groups = types.MethodType(groups, ctl)
+    ctl._agree_claim_form = types.MethodType(HiCacheController._agree_claim_form, ctl)
+    return ctl
+
+
+def _ops(groups):
+    return [op for op, _ in groups.seen]
+
+
+def _op(rid="weg2-0-1"):
+    return types.SimpleNamespace(request_id=rid)
+
+
+def test_h51_tier_off_group_skips_the_claim_form_agreement(monkeypatch):
+    """RED on d1c7094ba6: every rank of the D group (TP0 host, TP1/TP2
+    shadows) issues the form MAX per prefetch, all voting 0."""
+    form(monkeypatch, group="D", draft_on_p=False, tier="launcher")
+    ranks = [register(), register(shadow=True), register(shadow=True)]
+    for ctl in ranks:
+        g = _Groups()
+        _prefetch_rank(ctl, g)
+        for _ in range(3):
+            assert HiCacheController._agree_claim_form(ctl, _op()) is False
+        assert g.seen == [], f"form collective issued under tier off: {g.seen}"
+
+
+def test_h51_tier_off_claim_form_is_named_once(monkeypatch, caplog):
+    """One named line per controller instead of the '#xsn392b' form lines."""
+    form(monkeypatch, group="D", draft_on_p=False, tier="launcher")
+    ctl = _prefetch_rank(register(), _Groups())
+    with caplog.at_level(logging.INFO):
+        for _ in range(10):
+            HiCacheController._agree_claim_form(ctl, _op())
+    msgs = [r.getMessage() for r in caplog.records]
+    named = [m for m in msgs if m.startswith(
+        "H51 PREFETCH-CLAIM-FORM scalar by switch (SGLANG_WEG2_HICACHE_DRAFT_TIER=off)")]
+    assert len(named) == 1, msgs
+    assert "1 prefetch group(s)" in named[0]
+    assert not any("#xsn392b PREFETCH-CLAIM-FORM" in m for m in msgs)
+
+
+def test_h51_tier_off_prefetch_loop_reduces_the_same_claim_with_one_collective(monkeypatch):
+    """THE BEHAVIOUR, through the real prefetch_thread_func: per operation the
+    rank issues exactly the scalar claim MIN (base: MAX then MIN) and the
+    group claim is the same MIN (TP0 4096 vs peers 4032/4096 -> 4032)."""
+    import queue
+    import threading
+
+    form(monkeypatch, group="D", draft_on_p=False, tier="launcher")
+    g = _Groups(peer_claims=[4032, 4096])
+    ctl = _prefetch_rank(register(), g)
+    stop = threading.Event()
+    stop.set()  # drain the queued operations, then leave the loop
+    q = queue.Queue()
+    ops = []
+    for i in range(2):
+        o = types.SimpleNamespace(
+            request_id=f"weg2-0-{i}", host_indices=torch.arange(4096),
+            binding_generation=None, mark_terminate=lambda: None)
+        ops.append(o)
+        q.put(o)
+    released = []
+    stops = []
+    ctl.storage_stop_event = stop
+    ctl.prefetch_queue = q
+    ctl.prefetch_io_aux_func = lambda: None
+    ctl._prefetch_drained_after_stop = 0
+    ctl._storage_hit_query = lambda op: (["h"] * 64, 4096)
+    ctl._stop_group_from_thread = lambda exc: stops.append(exc)
+    ctl.draft_cold_spans = {}
+    ctl.prefetch_revoke_queue = queue.Queue()
+    ctl.append_host_mem_release = lambda idx, generation=None: released.append(len(idx))
+    ctl.prefetch_threshold = 1 << 20  # revoke path: no transfer machinery needed
+    ctl.page_size = 64
+    HiCacheController.prefetch_thread_func(ctl)
+    assert stops == []
+    assert _ops(g) == [torch.distributed.ReduceOp.MIN] * 2, g.seen
+    assert [v for _, v in g.seen] == [[4096], [4096]]  # the bare scalar, never packed
+    assert [o.probed_hit_tokens for o in ops] == [4032, 4032]
+
+
+def test_h51_tier_off_packed_rank_is_the_named_group_stop(monkeypatch):
+    """A rank answering 'packed' under off contradicts the construction; its
+    peers skip the agreement, so falling through would pair its MAX with their
+    claim MIN. RED on d1c7094ba6 (it falls through and agrees packed)."""
+    form(monkeypatch, group="D", draft_on_p=False, tier="launcher")
+    ctl = register()
+    ctl.solo_draft_shadow = True  # impossible under off (register returns first)
+    g = _Groups()
+    _prefetch_rank(ctl, g)
+    with pytest.raises(Weg2DraftDisagree, match="H51 PREFETCH-CLAIM-FORM"):
+        HiCacheController._agree_claim_form(ctl, _op())
+    assert g.seen == []
+
+
+# GREEN before and after: every form that is not ``off`` keeps the agreement.
+
+
+@pytest.mark.parametrize("tier", ["on", None, "auto"])
+def test_h51_tier_not_off_keeps_the_form_agreement(monkeypatch, tier):
+    """Explicit on (the x158 registration: packed on host and shadow alike),
+    unset and a rank-side auto (a rank cannot resolve auto): one MAX per
+    operation, the answer the group agrees, exactly as fnFL2x22 built it."""
+    form(monkeypatch, group="D", draft_on_p=False, tier=tier)
+    host, shadow = register(), register(shadow=True)
+    for ctl in (host, shadow):
+        g = _Groups()
+        _prefetch_rank(ctl, g)
+        assert HiCacheController._agree_claim_form(ctl, _op()) is True
+        assert _ops(g) == [torch.distributed.ReduceOp.MAX]
+        assert g.seen[0][1] == [1]
+
+
+def test_h51_group_p_without_off_still_agrees_scalar_over_the_group(monkeypatch):
+    """Group P without a drafter and no resolved off (unset): scalar locally,
+    the agreement still runs (a peer could need packed)."""
+    form(monkeypatch, group="P", draft_on_p=False, tier=None)
+    ctl = register(draft_worker=None)
+    g = _Groups(peers_packed=True)
+    _prefetch_rank(ctl, g)
+    assert HiCacheController._agree_claim_form(ctl, _op()) is True
+    assert g.seen == [(torch.distributed.ReduceOp.MAX, [0])]
+
+
+def test_h51_no_sync_group_keeps_the_local_answer_under_off(monkeypatch):
+    """No group, no collective, no line: the single-rank path is untouched."""
+    form(monkeypatch, group="D", draft_on_p=False, tier="launcher")
+    ctl = register()
+    g = _Groups()
+    _prefetch_rank(ctl, g, n_groups=0)
+    assert HiCacheController._agree_claim_form(ctl, _op()) is False
+    assert g.seen == []
+    assert not getattr(ctl, "_h51_claim_form_logged", False)
