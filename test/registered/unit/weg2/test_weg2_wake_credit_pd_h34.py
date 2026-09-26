@@ -292,8 +292,14 @@ def test_the_edge_k_is_judged_per_form():
     assert cost141 >= 300 and 30 <= cost144 <= 150
     luft144 = float(l144.split("engste Luft ")[1].split(" MiB")[0])
     assert 0 <= luft144 < 50
-    assert any("Vergleichsflip fnFL2x141/0+plan, Ordnung gegeben -- Leg STEHT" in ln
-               for ln in k141.lines)
+    # H92d: der Schlaefer gibt sein On-card-Staging am Leg-Ende zurueck (H111d
+    # pollt durch genau diese Rueckgabe; bb3 flippte viermal, wo der bis zum
+    # Ende gehaltene Ring einen Stillstand rechnete) -- der 97k-Vergleichsflip
+    # steht nicht mehr, er zahlt auf nvml2 ~0,6 s Kreditwarten.
+    (cmp141,) = [ln for ln in k141.lines
+                 if "Vergleichsflip fnFL2x141/0+plan, Ordnung gegeben -- Leg " in ln]
+    assert "STEHT" not in cmp141
+    assert float(cmp141.split("card2 ")[1].split(" ms")[0]) >= 400
     assert "P->D-order" in k144.front_plan
 
 
