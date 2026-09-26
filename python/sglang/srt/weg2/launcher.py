@@ -763,7 +763,16 @@ def p_draft_kv_flags(extra_d: Sequence[str]) -> Tuple[str, ...]:
     free to run a shorter chain, and the producer never proposes anyway.
 
     ``--speculative-draft-kv-only`` is P's alone and is never taken from D.
+
+    UNIFY S7 (27B RC9 form): under DFLASH the producer family is the external
+    draft's (:func:`spec_flags` ``producer=True``: DFLASH, the draft path, the
+    block, ``--speculative-draft-kv-only``), byte-identical to the 27B line's
+    argv_p -- the NEXTN constants and D's MTP depth do not apply to it. Before
+    this, a 27B boot with a producer on P (profile p_draft cold) would have
+    handed P ``--speculative-algorithm NEXTN``.
     """
+    if spec_form_is_dflash():
+        return tuple(spec_flags(producer=True))
     want = {
         "--speculative-algorithm": SPEC_ALGORITHM,
         "--speculative-num-steps": str(SPEC_NUM_STEPS),
@@ -4621,7 +4630,7 @@ def argv_p(
     # Group D is NOT touched by this switch: D keeps its own NEXTN head in
     # both forms (argv_d, below), because `off` removes the PRODUCER, not
     # speculative decode.
-    ] + (list(P_DRAFT_KV_FLAGS if spec_flags is None else spec_flags)
+    ] + (list(p_draft_kv_flags(()) if spec_flags is None else spec_flags)
          if draft_kv_on_p else []) + (
         # #1305 item 2: the cap is the SHIPPED cut's priced pool, handed in by
         # the caller that holds PCutFacts; never a constant here.  Head-scoped
