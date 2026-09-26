@@ -8,7 +8,7 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace as _dataclasses_replace
 from datetime import timedelta
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -4227,14 +4227,20 @@ class SchedulerWeightUpdaterManager:
         tc = sch.tree_cache
         t0 = time.monotonic()
         first = list(sch.idle_blockers())
-        verdict, polls = drain_until_group_verdict(
-            idle_blockers=sch.idle_blockers,
-            check_hicache_events=tc.check_hicache_events,
-            group_max=functools.partial(
-                tc.hicache_group_max, label="weg2_sleep_drain"
-            ),
-            bound_s=bound_s,
-        )
+        # H136: the decode-round cadence of the storage-queue agreement
+        # (SGLANG_HICACHE_DRAIN_AGREE_EVERY) does not apply to this group loop
+        # -- every poll agrees, as with the gate unset (see
+        # UnifiedRadixCache.drain_gate_forced for why that stays rank-uniform).
+        _forced = getattr(tc, "drain_gate_forced", None)
+        with (_forced() if callable(_forced) else nullcontext()):
+            verdict, polls = drain_until_group_verdict(
+                idle_blockers=sch.idle_blockers,
+                check_hicache_events=tc.check_hicache_events,
+                group_max=functools.partial(
+                    tc.hicache_group_max, label="weg2_sleep_drain"
+                ),
+                bound_s=bound_s,
+            )
         waited_s = time.monotonic() - t0
         now = list(sch.idle_blockers())
         if first or polls or not verdict.idle:
