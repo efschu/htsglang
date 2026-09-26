@@ -561,32 +561,169 @@ def test_c2c_a_group_age_above_this_ranks_own_is_the_w37_stop():
     assert calm._weg2_x_defers(landed, _pending_head("r", 500)) is True
 
 
-def test_c2d_the_arm_rides_the_existing_reduce_and_adds_no_collective():
-    """MUST NOT 6.  The completion arm exists precisely because a second
-    collective on the prefetch axis is a recorded fatal in this tree (#580).
-    Asserted structurally: ``_update_uniform_pool_budget`` still takes exactly
-    ONE ``all_reduce``, the pending payload is appended BEFORE it, and the
-    slice is read back by a head index captured before the ballot."""
-    src = inspect.getsource(Scheduler._update_uniform_pool_budget)
-    tree = ast.parse(inspect.cleandoc(src))
-    reduces = [
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "all_reduce"
-    ]
-    assert len(reduces) == 1, "one collective, and the arm may not add a second"
+def _reduce_shape_violations(tree):
+    """AST shape of the collectives in ``_update_uniform_pool_budget``.
+
+    Law (#580 + NF H97 138d9df01c, operator 26.09.): exactly ONE unconditional
+    ``all_reduce``; at most ONE more, and only in the body of an ``if`` whose
+    test names ``_usable_skew`` -- a value derived from the ALREADY reduced
+    tensor ``t`` after the first reduce, so every rank takes the same branch.
+    ``build_x_pending_payload`` is voted into the first reduce (appended
+    before it). Returns a list of violations (empty = shape holds)."""
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def _guards(node):
+        """Enclosing conditional constructs, innermost first, with the field
+        (body/orelse) the node sits in."""
+        out, cur = [], node
+        while cur in parents:
+            par = parents[cur]
+            if isinstance(par, (ast.If, ast.For, ast.While, ast.Try, ast.IfExp,
+                                ast.With, ast.AsyncFor, ast.AsyncWith)):
+                field = "body" if cur in getattr(par, "body", []) else "other"
+                if isinstance(par, (ast.With, ast.AsyncWith)):
+                    cur = par
+                    continue  # a with block runs unconditionally
+                out.append((par, field))
+            cur = par
+        return out
+
+    def _names(expr):
+        return {n.id for n in ast.walk(expr) if isinstance(n, ast.Name)}
+
+    reduces = sorted(
+        (
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "all_reduce"
+        ),
+        key=lambda n: n.lineno,
+    )
+    bad = []
+    uncond = [r for r in reduces if not _guards(r)]
+    cond = [r for r in reduces if _guards(r)]
+    if len(uncond) != 1:
+        bad.append(f"{len(uncond)} unconditional all_reduce (want exactly 1)")
+        return bad
+    first = uncond[0]
+    if len(cond) > 1:
+        bad.append(f"{len(cond)} conditional all_reduce (want at most 1)")
+    for r in cond:
+        g = _guards(r)
+        par, field = g[0]
+        if len(g) != 1 or not isinstance(par, ast.If) or field != "body" \
+                or "_usable_skew" not in _names(par.test):
+            bad.append(
+                f"all_reduce at line {r.lineno} is guarded, but not solely by "
+                "the body of an `if` naming _usable_skew"
+            )
+        if r.lineno < first.lineno:
+            bad.append(f"conditional all_reduce at {r.lineno} precedes the first")
+    if cond:
+        skew_defs = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "_usable_skew"
+                    for t in n.targets)
+        ]
+        if len(skew_defs) != 1:
+            bad.append(f"_usable_skew assigned {len(skew_defs)}x (want 1)")
+        else:
+            d = skew_defs[0]
+            if d.lineno < first.lineno:
+                bad.append("_usable_skew derived before the first reduce")
+            if "t" not in _names(d.value):
+                bad.append("_usable_skew not derived from the reduced tensor t")
     builds = [
         n for n in ast.walk(tree)
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
         and n.func.attr == "build_x_pending_payload"
     ]
-    assert len(builds) == 1, "the arm must be voted into that one payload"
-    assert builds[0].lineno < reduces[0].lineno, "and appended before it reduces"
+    if len(builds) != 1:
+        bad.append(f"build_x_pending_payload {len(builds)}x (want 1)")
+    elif builds[0].lineno >= first.lineno:
+        bad.append("build_x_pending_payload not appended before the first reduce")
+    return bad
+
+
+def _update_uniform_pool_budget_tree():
+    src = inspect.getsource(Scheduler._update_uniform_pool_budget)
+    return src, ast.parse(inspect.cleandoc(src))
+
+
+def test_c2d_the_arm_rides_the_existing_reduce_and_adds_no_collective():
+    """MUST NOT 6.  The completion arm exists precisely because a second
+    collective on the prefetch axis is a recorded fatal in this tree (#580).
+    Asserted structurally: ``_update_uniform_pool_budget`` takes exactly ONE
+    unconditional ``all_reduce``, the pending payload is appended BEFORE it,
+    and the slice is read back by a head index captured before the ballot.
+    The one tolerated extra reduce is NF H97 (138d9df01c): a small MIN only
+    under ``if _usable_skew:``, a value derived from the already reduced
+    tensor, so all ranks take the same branch and a skew-free round still
+    pays exactly one collective (operator 26.09.)."""
+    src, tree = _update_uniform_pool_budget_tree()
+    assert _reduce_shape_violations(tree) == []
     assert "_xpend_at = len(vals)" in src, (
         "read back by a captured head index, like the corridor width and the "
         "head block -- a negative index would silently start reading the ballot"
     )
     assert "_xpend_lens" in src and "build_uniform_head_inputs" in src
+
+
+def test_c2d_mutant_unconditional_second_reduce_is_red():
+    """The shape check must catch a second reduce hoisted out of the skew
+    branch (every round would pay two collectives, and a rank-divergent guard
+    could hang the group)."""
+    _src, tree = _update_uniform_pool_budget_tree()
+    fn = tree.body[0]
+    hoisted = False
+    for holder in ast.walk(fn):
+        body = getattr(holder, "body", None)
+        if not isinstance(body, list):
+            continue
+        for i, stmt in enumerate(body):
+            if isinstance(stmt, ast.If) and any(
+                isinstance(n, ast.Name) and n.id == "_usable_skew"
+                for n in ast.walk(stmt.test)
+            ):
+                red = [
+                    s for s in stmt.body
+                    if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
+                    and isinstance(s.value.func, ast.Attribute)
+                    and s.value.func.attr == "all_reduce"
+                ]
+                assert red, "the H97 branch carries its reduce"
+                stmt.body.remove(red[0])
+                if not stmt.body:
+                    stmt.body.append(ast.Pass())
+                body.insert(i + 1, red[0])
+                hoisted = True
+                break
+        if hoisted:
+            break
+    assert hoisted, "found the _usable_skew branch to mutate"
+    mutated = ast.parse(ast.unparse(tree))
+    assert _reduce_shape_violations(mutated), "mutant must be red"
+
+
+def test_c2d_mutant_foreign_guard_is_red():
+    """A second reduce under a guard that is NOT the reduced-skew name (e.g. a
+    rank-local flag) is exactly the rank-divergent collective #580 forbids."""
+    _src, tree = _update_uniform_pool_budget_tree()
+    hit = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and any(
+            isinstance(n, ast.Name) and n.id == "_usable_skew"
+            for n in ast.walk(node.test)
+        ):
+            node.test = ast.Name(id="_rank_local_flag", ctx=ast.Load())
+            hit += 1
+    assert hit == 1
+    mutated = ast.parse(ast.unparse(tree))
+    assert _reduce_shape_violations(mutated), "mutant must be red"
 
 
 def _gloo_worker(rank, init_file, out_dir):
