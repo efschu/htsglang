@@ -2268,6 +2268,13 @@ class Scheduler(
             and self.server_args.enable_mixed_chunk
         )
 
+        # --p-chunk-policy (weg2/p_chunk_policy.py, 25.09.): the P group's
+        # per-request chunk plan. None unless the launcher handed this rank
+        # SGLANG_P_CHUNK_POLICY=dynamic -- fixed/unset is byte-identical.
+        from sglang.srt.weg2 import p_chunk_policy as _pcp
+
+        self._p_chunk_planner = _pcp.planner_from_env(os.environ, log=logger.info)
+
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
             self.server_args.enable_dynamic_chunking and self.ps.pp_size > 1
@@ -10945,6 +10952,13 @@ class Scheduler(
         when profiling raises at init), so a None must fall back to the
         static size rather than be handed on as a chunk width.
         """
+        # --p-chunk-policy dynamic: the plan's width for the request this
+        # forward serves (0 = no request / not applicable -> the path below).
+        # getattr: harness stubs bind this method without the attribute.
+        if getattr(self, "_p_chunk_planner", None) is not None:
+            planned = self._p_chunk_policy_width()
+            if planned > 0:
+                return planned
         if not self.enable_dynamic_chunking:
             return self.chunked_prefill_size
         history_len = (
@@ -10955,6 +10969,49 @@ class Scheduler(
             return self.chunked_prefill_size
         self._log_dynamic_chunk_engagement(dynamic_size, history_len)
         return dynamic_size
+
+    def _p_chunk_policy_width(self) -> int:
+        """--p-chunk-policy dynamic: this forward's budget from the plan.
+
+        The request is the in-flight chunked request, else the head of the
+        waiting queue (already in the group's order: calc_priority and
+        _apply_uniform_head_order ran before this call). Its position is
+        ``len(prefix_indices)`` -- the same history the upstream predictor
+        reads (#656) -- and its end the full fill. On a PP group only PP0's
+        width is executed; downstream ranks run PP0's forwarded extents
+        (#791), so a downstream answer only sizes the local budget. Never
+        above the static --chunked-prefill-size, which under the dynamic
+        policy IS the plan's ceiling (the launcher prices the corridor at it).
+        Any failure returns 0: the caller then takes the static path.
+        """
+        from sglang.srt.weg2.p_chunk_policy import forward_budget
+
+        req = self.chunked_req
+        if req is None:
+            queue = getattr(self, "waiting_queue", None) or []
+            if not queue:
+                return 0
+            req = queue[0]
+        try:
+            fill = getattr(req, "full_untruncated_fill_ids", None)
+            end = len(fill) if fill is not None and len(fill) else (
+                len(req.origin_input_ids) + len(getattr(req, "output_ids", ()) or ())
+            )
+            prefix = getattr(req, "prefix_indices", None)
+            pos = 0 if prefix is None else len(prefix)
+            width = forward_budget(self._p_chunk_planner, req.rid, pos, end)
+        except Exception as exc:  # noqa: BLE001 - a plan must never stop a pass
+            n = getattr(self, "_p_chunk_policy_errors", 0) + 1
+            self._p_chunk_policy_errors = n
+            if n <= 4 or n % 256 == 0:
+                logger.warning(
+                    "P-CHUNK-POLICY plan failed (n=%d), static width this pass: %r",
+                    n,
+                    exc,
+                )
+            return 0
+        cap = int(self.chunked_prefill_size or 0)
+        return min(int(width), cap) if cap > 0 else int(width)
 
     def _log_dynamic_chunk_engagement(self, dynamic_size: int, history_len: int):
         """ENGAGEMENT PROOF for the dynamic-chunking arm, at INFO.
