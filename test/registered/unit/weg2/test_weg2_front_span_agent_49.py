@@ -48,6 +48,24 @@ import pytest
 from sglang.srt.weg2 import front as F
 from sglang.srt.weg2.front import SpanLRU, price_remainder, request_text, serviceable_route
 
+
+
+@pytest.fixture(autouse=True)
+def _agent_span_on():
+    """NF (P49): #49 runs behind SGLANG_WEG2_ENABLE_AGENT_SPAN (default off =
+    rc2.1l, pinned in test_weg2_agent_span_switch_p49.py). These are the 27B
+    #49 tests unchanged, with the switch on."""
+    from sglang.srt.environ import envs
+
+    try:
+        fld = envs.SGLANG_WEG2_ENABLE_AGENT_SPAN
+    except AttributeError:  # a tree without the switch (red-first run on the base)
+        yield
+        return
+    with fld.override(True):
+        yield
+
+
 X = 4096  # the boot's front X (--tp-prefill-max-tokens 4096, never re-solved)
 D_GATE = 12288  # D's own W50 riegel (--x-ceiling-tokens 12288)
 CARRIER_MAX = 648806  # from the boot's LONG lines
