@@ -1002,6 +1002,10 @@ P_CHUNK_POLICY_DEFAULT = "fixed"
 P_CHUNK_MAX_DEFAULT = 2048
 P_CHUNK_MODEL_DEFAULT = "builtin-int8"
 P_CHUNK_MSCALE_DEFAULT = "int8"
+#: Short-prompt bypass (rc9j metal 26.09., Operator): at 2k/8k the plan is
+#: 512xn anyway, yet B measured 10-30 ms slower than A. At or below this rest
+#: the cursor does not plan and every forward gets the fixed width.
+P_CHUNK_DYNAMIC_MIN_TOKENS_DEFAULT = 8192
 #: BUILTIN INT8 stage model (desk, 25.09., MEASURED where stated):
 #: a_ms / b_ms_per_1k = pgap_stage_fit.fit_rank_lines over prefixes [0, 32768)
 #: of boot weg2rc7c (a54f21cda0, INT8, cut 42/11/11, 512 graph, 1076-1082
@@ -1156,6 +1160,8 @@ def apply_p_chunk_policy(ns) -> None:
             grid=int(getattr(ns, "p_chunk_grid", 0) or 0),
             graph_buckets=buckets, eager=True,
             min_gain=float(getattr(ns, "p_chunk_min_gain", _pcp.DEFAULT_MIN_GAIN)),
+            dynamic_min_tokens=int(getattr(ns, "p_chunk_dynamic_min_tokens",
+                                           P_CHUNK_DYNAMIC_MIN_TOKENS_DEFAULT) or 0),
         )
     except _pcp.ChunkPolicyError as exc:
         raise SystemExit(f"--p-chunk-policy dynamic: {exc}")
@@ -1189,6 +1195,11 @@ def p_chunk_policy_lines() -> List[str]:
     out = ["WEG2 " + _pcp.armed_line(spec, "group=P")
            + f" -- group P's --chunked-prefill-size is the ceiling {spec.limits.max_tokens}"]
     for n in P_CHUNK_DRY_RUN_TOKENS:
+        if spec.limits.dynamic_min_tokens and n <= spec.limits.dynamic_min_tokens:
+            out.append(f"WEG2 {_pcp.LOG_TAG} plan policy=dynamic key=dry-run-{n} tokens={n} "
+                       f"BYPASS (<= --p-chunk-dynamic-min-tokens {spec.limits.dynamic_min_tokens}): "
+                       f"fixed width {spec.limits.fixed_tokens}, no plan")
+            continue
         res = _pcp.plan_detail(n, len(spec.stages), spec.stages, spec.limits)
         out.append("WEG2 " + _pcp.plan_line(res, key=f"dry-run-{n}", start=0, end=n)
                    + " (HOCHRECHNUNG on the model, not a measurement)")
@@ -12159,6 +12170,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only with --p-chunk-policy dynamic: no chunk crosses an absolute "
              "multiple of TOKENS (0 = off, the 27B default: its P anchors are "
              "distance-based). The NF line sets 4096.")
+    ap.add_argument(
+        "--p-chunk-dynamic-min-tokens", type=int, default=P_CHUNK_DYNAMIC_MIN_TOKENS_DEFAULT,
+        metavar="TOKENS",
+        help="Only with --p-chunk-policy dynamic: a request whose remaining prompt is at "
+             f"most TOKENS (default {P_CHUNK_DYNAMIC_MIN_TOKENS_DEFAULT}) is not planned -- "
+             "every forward gets the fixed width (--p-chunk-fixed), as under 'fixed'. "
+             "rc9j measured 2k/8k slower under dynamic although the plan was 512xn. "
+             "0 = plan every request.")
     ap.add_argument(
         "--p-chunk-min-gain", type=float, default=0.01, metavar="FRACTION",
         help="Only with --p-chunk-policy dynamic: a plan other than fixed is taken "
