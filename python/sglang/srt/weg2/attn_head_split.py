@@ -1132,6 +1132,7 @@ class FlashinferHelperKernel:
         self.cfg = cfg
         self.device = device
         self.kv_dtype = kv_dtype
+        self._alloc_ctx = alloc_ctx
         with alloc_ctx():
             self.float_ws = torch.empty(int(HELPER_FLOAT_WS_MIB * 2**20), dtype=torch.uint8, device=device)
             self.idx = torch.arange(cfg.cap_tokens, dtype=torch.int32, device=device)
@@ -1141,7 +1142,10 @@ class FlashinferHelperKernel:
     def add_owner(self, owner: int) -> None:
         from flashinfer import BatchPrefillWithPagedKVCacheWrapper
 
-        self.wrappers[owner] = BatchPrefillWithPagedKVCacheWrapper(self.float_ws, "NHD")
+        # its 8 MiB int workspace too: P-phase scratch, paused with the KV
+        # region, never resident through D (the post books it on P only)
+        with self._alloc_ctx():
+            self.wrappers[owner] = BatchPrefillWithPagedKVCacheWrapper(self.float_ws, "NHD")
 
     def plan(self, owner: int, p: int, w: int, n_q: int, n_kv: int) -> None:
         wr = self.wrappers[owner]
