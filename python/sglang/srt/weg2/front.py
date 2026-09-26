@@ -1964,8 +1964,27 @@ def credit_pause_order(order: List[str], why: str, plan: Optional[Dict[str, Any]
     return new, why + ", " + note
 
 
+def flip_price_ms(rec: dict, *, exclude_drain: bool) -> Tuple[float, float]:
+    """27B DPWAIT (30d33262dd, identical reader): one completed flip record as a
+    round-trip price.
+
+    ``flip_ms`` runs from the flip's begin to the wake's end, so it INCLUDES
+    ``drain_quiesce_ms`` -- the wait for the running decodes of the sleeping
+    group. That wait is the previous phase's work, not the price of moving the
+    layout; charged to K7's min-dwell it holds the NEXT flip for as long as the
+    last drain took. With ``exclude_drain`` (SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN)
+    the price is ``flip_ms - drain_quiesce_ms``, never below 0. Returns
+    ``(price_ms, excluded_drain_ms)``; the second is 0 when nothing was taken
+    off, so the provenance only changes when the value does."""
+    ms = float(rec.get("flip_ms") or 0.0)
+    if not exclude_drain:
+        return ms, 0.0
+    drain = min(ms, max(0.0, float(rec.get("drain_quiesce_ms") or 0.0)))
+    return ms - drain, drain
+
+
 def warm_min_dwell_ms(flip_log: List[dict], src: str, dst: str, *,
-                      window: int = 5) -> Tuple[float, str]:
+                      window: int = 5, exclude_drain: bool = False) -> Tuple[float, str]:
     """H34b (fnFL2x148): K7's min-dwell from the boot's WARM flips.
 
     The boot's first flip is not the price of a round trip: it is the only
@@ -1980,7 +1999,13 @@ def warm_min_dwell_ms(flip_log: List[dict], src: str, dst: str, *,
     later flips of EITHER direction (what a warm flip costs on this rig);
     before any later flip, 0 -- the same as before the first flip. The
     provenance is one token (the log line is split on spaces) and names what
-    was excluded."""
+    was excluded.
+
+    27B DPWAIT: with ``exclude_drain`` every record in the median is priced
+    without its drain (:func:`flip_price_ms`) -- the H34b median alone only
+    outvotes a drained flip while it is the minority of the window; the
+    provenance then names the largest drain taken off (one token). Which
+    records enter the window is unchanged."""
     if not flip_log:
         return 0.0, "none-first-flip"
     first = flip_log[0]
@@ -1988,15 +2013,22 @@ def warm_min_dwell_ms(flip_log: List[dict], src: str, dst: str, *,
         first.get("sleep"), first.get("wake"), int(float(first.get("flip_ms") or 0.0)))
     later = [r for r in flip_log[1:] if float(r.get("flip_ms") or 0.0) > 0.0]
     n = max(1, int(window))
+
+    def _median(recs: List[dict]) -> Tuple[float, str]:
+        priced = [flip_price_ms(r, exclude_drain=exclude_drain) for r in recs]
+        drained = max(d for _, d in priced)
+        return (float(statistics.median(ms for ms, _ in priced)),
+                ":drain-max-%dms-excluded" % int(drained) if drained > 0 else "")
+
     same = [r for r in later if r.get("sleep") == src and r.get("wake") == dst][-n:]
     if same:
-        ms = statistics.median(float(r["flip_ms"]) for r in same)
-        return float(ms), "median-warm-%s->%s:n=%d%s" % (src, dst, len(same), tail)
+        ms, dtail = _median(same)
+        return ms, "median-warm-%s->%s:n=%d%s%s" % (src, dst, len(same), tail, dtail)
     anyd = later[-n:]
     if anyd:
-        ms = statistics.median(float(r["flip_ms"]) for r in anyd)
-        return float(ms), "median-warm-any-direction:n=%d:no-warm-%s->%s-yet%s" % (
-            len(anyd), src, dst, tail)
+        ms, dtail = _median(anyd)
+        return ms, "median-warm-any-direction:n=%d:no-warm-%s->%s-yet%s%s" % (
+            len(anyd), src, dst, tail, dtail)
     return 0.0, "none-after-first-flip" + tail
 
 
@@ -6408,12 +6440,18 @@ class Front:
         """
         if self.min_dwell_ms is not None:
             return self.min_dwell_ms, "flag"
+        exclude_drain = envs.SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN.get()
         if envs.SGLANG_WEG2_ENABLE_WARM_MIN_DWELL.get():
             return warm_min_dwell_ms(self.flip_log, src, dst,
-                                     window=envs.SGLANG_WEG2_MIN_DWELL_WINDOW.get())
+                                     window=envs.SGLANG_WEG2_MIN_DWELL_WINDOW.get(),
+                                     exclude_drain=exclude_drain)
         for rec in reversed(self.flip_log):
             if rec.get("sleep") == src and rec.get("wake") == dst:
-                return float(rec.get("flip_ms") or 0.0), f"last-flip-{src}->{dst}"
+                ms, drain = flip_price_ms(rec, exclude_drain=exclude_drain)
+                prov = f"last-flip-{src}->{dst}"
+                if drain > 0:
+                    prov += f":drain-{int(drain)}ms-excluded"
+                return ms, prov
         return 0.0, "none-first-flip"
 
     def _dwell_ok(self, src: str, dst: str, fairness_fired: bool,

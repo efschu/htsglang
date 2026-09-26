@@ -702,6 +702,14 @@ class Envs:
     # flip, first flip included (the pre-H34b rule).
     SGLANG_WEG2_ENABLE_WARM_MIN_DWELL = EnvBool(True)
     SGLANG_WEG2_MIN_DWELL_WINDOW = EnvInt(5)
+    # MIN_DWELL_EXCLUDE_DRAIN (27B DPWAIT 30d33262dd, same name and rule, on the NF
+    # front also inside the H34b warm median): K7 prices a round trip with flip_ms,
+    # and flip_ms INCLUDES drain_quiesce_ms, the wait for the sleeping group's
+    # running decodes -- the previous phase's work, not the price of the flip.
+    # 27B measured a D->P flip that drained 29.7 s holding the next D->P 39.2 s.
+    # On: every priced record is flip_ms - drain_quiesce_ms (floor 0). Off:
+    # byte-identical.
+    SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN = EnvBool(False)
     # SLEEP_RELEASE_LMEM (H15, fnFL2x120): a complete sleep lowers the context's
     # per-thread stack limit (cuCtxSetLimit), which frees the driver's
     # local-memory reservation (derived 255 MiB per process on the 5090,
