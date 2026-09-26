@@ -34,6 +34,7 @@ context, band displacement, host-RAM post) is replaced by this one --
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import gc
 import logging
@@ -114,6 +115,22 @@ def arm_rank_stage(scheduler, env: Optional[Dict[str, str]] = None) -> bool:
                            "private pools past the stage's teardown")
         except Exception:  # noqa: BLE001 -- the env registry is optional here
             pass
+    # H125 (NF): the SOURCE (disk | ram) and the PLACE (auto | kvtail | free),
+    # resolved once. Unset = disk + auto, which on a wholly free KV tail is the
+    # 27B stage byte for byte. A value the stage does not know is an arming
+    # refusal, never a silent default.
+    place, source_kind = vrs.PLACE_AUTO, vrs.SOURCE_DISK
+    if not refusal:
+        try:
+            place = vrs.vision_place(env)
+            source_kind = vrs.vision_source(env)
+        except vrs.VisionRankStageRefused as exc:
+            refusal = str(exc)
+    scheduler._weg2_vision_place = place
+    scheduler._weg2_vision_source = None
+    if not refusal and source_kind == vrs.SOURCE_RAM:
+        scheduler._weg2_vision_source = arm_ram_source(
+            str(getattr(getattr(scheduler, "server_args", None), "model_path", "") or ""), env)
     scheduler._weg2_vision_arm_refusal = refusal
     scheduler._weg2_vision_origin_aborts = []
     scheduler._weg2_vision_refused = set()
@@ -123,10 +140,49 @@ def arm_rank_stage(scheduler, env: Optional[Dict[str, str]] = None) -> bool:
                      "this group are aborted by name (%s); text is unaffected.",
                      W_ARM_REFUSED, refusal, W_NOT_ARMED)
     else:
-        logger.info("%s ARMED in-rank: PP0 pid=%d, tower on the KV tail, O_DIRECT reader "
-                    "(bounce %dx%d MiB), before the admission after the wake",
-                    W_STAGE_OK, os.getpid(), vrs.BOUNCE_COUNT, vrs.BOUNCE_BYTES // vrs.MIB)
+        src = scheduler._weg2_vision_source
+        logger.info("%s ARMED in-rank: PP0 pid=%d, place=%s (tower on the KV tail%s), "
+                    "source=%s (%s, bounce %dx%d MiB), before the admission after the wake",
+                    W_STAGE_OK, os.getpid(), place,
+                    "" if place == vrs.PLACE_KVTAIL else
+                    ", else in the card's free VRAM" if place == vrs.PLACE_AUTO else
+                    " never; the card's free VRAM",
+                    src.kind if src is not None else vrs.SOURCE_DISK,
+                    f"tmpfs image {src.path}, buffered" if src is not None
+                    else "checkpoint shard, O_DIRECT",
+                    vrs.BOUNCE_COUNT, vrs.BOUNCE_BYTES // vrs.MIB)
     return True
+
+
+def arm_ram_source(model_dir: str, env: Optional[Dict[str, str]] = None,
+                   clock: Callable[[], float] = time.perf_counter) -> Optional[vrs.TowerSource]:
+    """Stage the tower's extent into a tmpfs image, once per boot (H125,
+    ``SGLANG_WEG2_VISION_SOURCE=ram``). Returns the source, or None when the
+    staging is refused -- then the stage reads from DISK and says so by name
+    (W111); an image request is never refused for its source.
+
+    The host-RAM price is printed here, where it is paid: the image lives in
+    shmem, charged to this rank's memory cgroup (``memory.current``), until
+    the rank exits (atexit removes it) -- a killed rank leaves it behind, and
+    the next boot REUSES it (same shard, size, mtime) instead of writing a
+    second copy."""
+    t0 = clock()
+    try:
+        shard = find_tower_shard(model_dir)
+        tensors = vrs.checkpoint_tensors(shard, is_vision_weight)
+        src = vrs.stage_tower_to_ram(shard, tensors, vrs.ram_dir(env))
+    except Exception as exc:  # noqa: BLE001 -- named, then the disk reads
+        logger.error("%s RAM source for the transient tower REFUSED (%s: %s) -- the stage "
+                     "reads from DISK (O_DIRECT) instead", W_ARM_REFUSED, type(exc).__name__, exc)
+        return None
+    e = os.environ if env is None else env
+    if (e.get("SGLANG_WEG2_VISION_RAM_KEEP", "") or "").strip() not in ("1", "true", "yes", "on"):
+        atexit.register(vrs.remove_ram_image, src)
+    logger.info("%s SOURCE=ram image=%s host_mib=%.1f (tmpfs/shmem, charged to memory.current "
+                "for the life of this rank) %s in %.0f ms",
+                W_STAGE_OK, src.path, src.host_bytes / vrs.MIB,
+                "REUSED" if src.reused else "staged", (clock() - t0) * 1e3)
+    return src
 
 
 # ---------------------------------------------------------------------------
@@ -316,16 +372,30 @@ class StageOutcome:
     read_bytes: int = 0
     direct: bool = False
     residue_bytes: Optional[int] = None
+    #: H125: where the tower sat (kvtail | free) and where it came from
+    place: str = ""
+    source: str = ""
+    card: Optional[int] = None
     host_current_delta: str = "n/a"
     host_anon_delta: str = "n/a"
     legs_ms: Dict[str, float] = field(default_factory=dict)
+
+
+def card_air(device: torch.device) -> Tuple[int, int]:
+    """(cudaMemGetInfo free, this process's reserved-but-unallocated cache)."""
+    free, _total = torch.cuda.mem_get_info(device)
+    idle = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    return int(free), int(idle)
 
 
 def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config: Any,
                    device: torch.device,
                    build: Callable[[Any, torch.device], Tuple[torch.nn.Module, str]] = build_tower_meta,
                    encode: Callable[[torch.nn.Module, Sequence[Any]], List[torch.Tensor]] = encode_items,
-                   clock: Callable[[], float] = time.perf_counter) -> StageOutcome:
+                   clock: Callable[[], float] = time.perf_counter,
+                   place: str = vrs.PLACE_KVTAIL,
+                   source: Optional[vrs.TowerSource] = None,
+                   air: Callable[[torch.device], Tuple[int, int]] = card_air) -> StageOutcome:
     """One tower load for all ``reqs``. Never raises: the verdict is the
     outcome. The teardown runs on every path, and the residue is measured
     only after the failure (and its traceback, which pins the forward's
@@ -341,7 +411,7 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
     rope_keys = set(rope_factory._ROPE_DICT)
     own0, host0 = own_card_bytes(device), host_bytes()
     touched = False  # did the build start (anything to release)?
-    module = res = views = plan = rows = None
+    module = res = views = plan = rows = slab = None
     on_card = device.type == "cuda"
     leg, t0 = "items", clock()
     try:
@@ -356,8 +426,16 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             module, backend = build(hf_config, device)
             sizes = [p.numel() * p.element_size() for _, p in module.named_parameters()]
             out.tower_bytes = sum(sizes)
-            buffers = vrs.attention_kv_buffers(allocator.get_kvcache())
-            pages = vrs.slots_for(sizes, buffers, out.num_pages, page_size)
+            buffers = pages = None
+            tail_why = ""
+            if place != vrs.PLACE_FREE:
+                try:
+                    buffers = vrs.attention_kv_buffers(allocator.get_kvcache())
+                    pages = vrs.slots_for(sizes, buffers, out.num_pages, page_size)
+                except vrs.VisionRankStageRefused as exc:
+                    if place == vrs.PLACE_KVTAIL:
+                        raise
+                    tail_why = f"no KV tail to place on ({exc})"
             out.legs_ms["build"] = (clock() - t0) * 1e3
             leg, t0 = "reserve", clock()
             if on_card:
@@ -366,20 +444,54 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
                 # is done. The scheduler's own stream, not the device: another
                 # stream's collective may legitimately wait on a peer.
                 torch.cuda.current_stream(device).synchronize()
-            res = vrs.reserve_tail_pages(allocator, pages)
-            if res is None:
-                raise vrs.VisionRankStageRefused(
-                    f"the KV tail ({pages} of {out.num_pages} pages for "
-                    f"{out.tower_bytes / vrs.MIB:.0f} MiB of tower) is not wholly free on PP0")
-            out.tail_pages = res.pages
+            if pages is not None:
+                res = vrs.reserve_tail_pages(allocator, pages)
+                if res is None:
+                    tail_why = (f"the KV tail ({pages} of {out.num_pages} pages for "
+                                f"{out.tower_bytes / vrs.MIB:.0f} MiB of tower) is not wholly "
+                                "free on PP0")
+            if res is not None:
+                out.place = vrs.PLACE_KVTAIL
+                out.tail_pages = res.pages
+                segments = vrs.tail_segments(buffers, res, out.num_pages)
+            elif place == vrs.PLACE_KVTAIL:
+                raise vrs.VisionRankStageRefused(tail_why)
+            else:
+                # H125: the card's own air, when the tail is not wholly free
+                # (auto) or by choice (free). Refused by name when it does not
+                # fit -- never a partial placement, never an eviction.
+                need = vrs.slab_bytes(sizes)
+                card_free, cache_idle = air(device)
+                fits, why = vrs.free_vram_verdict(need, card_free, cache_idle)
+                if not fits:
+                    raise vrs.VisionRankStageRefused(
+                        (f"{tail_why}; " if tail_why else "") + f"free VRAM too small: {why}")
+                slab = torch.empty(need, dtype=torch.uint8, device=device)
+                out.place = vrs.PLACE_FREE
+                segments = [slab]
+                logger.info("%s place=free on PP0 (%s)%s", W_STAGE_OK, why,
+                            f" -- {tail_why}" if tail_why else "")
             leg, t0 = "load", clock()
-            views = vrs.place_parameters(
-                module, vrs.SlabAllocator(vrs.tail_segments(buffers, res, out.num_pages)))
+            views = vrs.place_parameters(module, vrs.SlabAllocator(segments))
+            segments = None
             shard = find_tower_shard(model_dir)
             plan = vrs.plan_checkpoint_into(
                 views, vrs.checkpoint_tensors(shard, is_vision_weight), _tower_name)
+            src = source if source is not None else vrs.disk_source(shard)
+            if src.kind == vrs.SOURCE_RAM and not os.path.exists(src.path):
+                # the image left (a cleaned /dev/shm): staged again, named, and
+                # the disk read is paid inside this leg
+                logger.warning("%s RAM image %s is gone -- staging it again from %s",
+                               W_LOAD, src.path, shard)
+                src = vrs.stage_tower_to_ram(
+                    shard, vrs.checkpoint_tensors(shard, is_vision_weight),
+                    os.path.dirname(src.path))
+                if scheduler is not None and getattr(scheduler, "_weg2_vision_source", None) is not None:
+                    scheduler._weg2_vision_source = src
+            out.source = src.kind
             stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
-            rep = vrs.read_into(shard, plan, stream=stream)
+            rep = vrs.read_into(src.path, vrs.shift_plan(plan, src.shift), stream=stream,
+                                direct=src.direct)
             out.read_bytes, out.direct = rep.bytes_read, rep.direct
             out.legs_ms["load"] = (clock() - t0) * 1e3
             leg, t0 = "encode", clock()
@@ -400,7 +512,7 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             out.detail = f"{leg}: {type(exc).__name__}: {exc}"
     finally:
         t0 = clock()
-        views = plan = rows = None
+        views = plan = rows = segments = slab = None
         if module is not None:
             _strip_module(module)
         module = None
@@ -441,6 +553,8 @@ def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
     legs = ", ".join(f"{k} {v:.0f}" for k, v in out.legs_ms.items())
     residue = "n/a" if out.residue_bytes is None else f"{out.residue_bytes / vrs.MIB:+.1f}"
     line = (f"run={run} rank=PP0 requests={len(rids)} items={out.items} "
+            f"place={out.place or 'none'} source={out.source or 'none'} "
+            f"card={'n/a' if out.card is None else f'nvml{out.card}'} "
             f"tail_pages={out.tail_pages}/{out.num_pages} tower_mib={out.tower_bytes / vrs.MIB:.1f} "
             f"read={('O_DIRECT' if out.direct else 'BUFFERED') if out.read_bytes else 'none'} "
             f"read_mib={out.read_bytes / vrs.MIB:.1f} "
@@ -493,12 +607,17 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
         elif pp0_idle(scheduler):
             scheduler._weg2_vision_runs += 1
             try:
+                dev = _rank_device()
                 out = run_rank_stage(
                     scheduler, pending,
                     model_dir=str(scheduler.server_args.model_path),
                     hf_config=scheduler.model_config.hf_config,
-                    device=_rank_device(),
+                    device=dev,
+                    place=getattr(scheduler, "_weg2_vision_place", vrs.PLACE_AUTO),
+                    source=getattr(scheduler, "_weg2_vision_source", None),
                 )
+                if dev.type == "cuda":
+                    out.card = _nvml_index_of(dev.index if dev.index is not None else 0)
             except Exception as exc:  # noqa: BLE001 -- a stage never kills the group
                 logger.exception("%s: the stage raised outside its own verdict", W_LOAD)
                 out = StageOutcome(ok=False, code=W_LOAD,

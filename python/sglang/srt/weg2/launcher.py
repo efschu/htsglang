@@ -3581,6 +3581,57 @@ VISION_CHOICES = (VISION_OFF, VISION_RESIDENT, VISION_TRANSIENT)
 #: so the launcher and the tests cannot drift.
 VISION_TRANSIENT_OVERRIDE = '{"language_model_only": true}'
 
+#: H125 (NF, user order 2026-09-24 10:15Z): where the transient tower's bytes
+#: come from (`disk` = the checkpoint shard, O_DIRECT, the 27B stage; `ram` =
+#: a tmpfs image of the tower extent, staged once by P's PP0) and where it
+#: sits on the card (`auto` = the KV tail, else free VRAM; `kvtail`; `free`).
+#: The defaults publish NOTHING: the P env of a transient boot is the 27B one,
+#: and a text-only boot is byte-identical to every boot before H125. The
+#: variable names are the rank's (`weg2.vision_rank_stage`), one spelling.
+VISION_SOURCE_DISK = "disk"
+VISION_SOURCE_RAM = "ram"
+VISION_SOURCES = (VISION_SOURCE_DISK, VISION_SOURCE_RAM)
+VISION_PLACE_AUTO = "auto"
+VISION_PLACES = (VISION_PLACE_AUTO, "kvtail", "free")
+VISION_SOURCE_ENV = "SGLANG_WEG2_VISION_SOURCE"
+VISION_PLACE_ENV = "SGLANG_WEG2_VISION_PLACE"
+
+
+def vision_stage_knobs_refusal(vision: str, source: str, place: str) -> str:
+    """A source/place that is not the default only means something under
+    `--weg2-vision transient`; anywhere else it is refused by name (a knob
+    that silently does nothing is a boot nobody can read)."""
+    if vision == VISION_TRANSIENT:
+        return ""
+    if source != VISION_SOURCE_DISK or place != VISION_PLACE_AUTO:
+        return (
+            f"W111 Weg2VisionArmRefused: --weg2-vision-source {source} / "
+            f"--weg2-vision-place {place} were given, but --weg2-vision is "
+            f"{vision!r} -- they act only on the transient stage"
+        )
+    return ""
+
+
+def vision_source_host_line(model: str, source: str) -> str:
+    """The host-RAM price of `--weg2-vision-source ram`, named at the launch:
+    the tower extent (header read only) lives in a tmpfs image for the life
+    of P's PP0 (shmem, charged to memory.current). Empty for `disk`."""
+    if source != VISION_SOURCE_RAM:
+        return ""
+    try:
+        from sglang.srt.planner.vision_stage_load import find_tower_shard, tower_extent
+
+        ext = tower_extent(find_tower_shard(model))
+        mib = f"{(ext.file_last_end - ext.file_first_offset) / (1 << 20):.1f} MiB"
+    except Exception as exc:  # noqa: BLE001 -- unmeasured is said, never guessed
+        mib = f"size unread ({type(exc).__name__}: {exc})"
+    return (
+        f"W102 Weg2VisionStage SOURCE=ram: P's PP0 stages the tower extent into a tmpfs "
+        f"image once ({mib}), held in host RAM for the life of the boot (shmem, counted in "
+        "memory.current, NOT in the host ledger's terms); every image then loads from RAM "
+        "instead of the disk"
+    )
+
 #: Task #47 Scheibe 6a (20.09.): the checkpoint PROFILE the two groups are built
 #: for. ``qwen27b`` is every boot before this flag existed (byte-identical argv
 #: and env). ``nextflash`` = Qwen3.8 Next Flash: P = PP3 (tp 1 per stage), D =
@@ -5851,9 +5902,26 @@ def _env_knobs(ns) -> Dict[str, object]:
         # function exists: three call sites build an environment and a value
         # spelled out at each of them is a value that drifts.
         "vision": str(getattr(ns, "weg2_vision", VISION_OFF)),
+        # H125: source and place of the transient stage (P only, see build_env).
+        "vision_source": _vision_knob(ns, "weg2_vision_source", VISION_SOURCE_DISK),
+        "vision_place": _vision_knob(ns, "weg2_vision_place", VISION_PLACE_AUTO),
         # WEG2-FORM: the one resolved form (launcher.main sets it on ns).
         "boot_form": getattr(ns, "weg2_boot_form", None),
     }
+
+
+def _vision_knob(ns, attr: str, default: str) -> str:
+    """H125: one knob, refused by name when it cannot act (see
+    vision_stage_knobs_refusal)."""
+    val = str(getattr(ns, attr, default) or default)
+    why = vision_stage_knobs_refusal(
+        str(getattr(ns, "weg2_vision", VISION_OFF)),
+        str(getattr(ns, "weg2_vision_source", VISION_SOURCE_DISK) or VISION_SOURCE_DISK),
+        str(getattr(ns, "weg2_vision_place", VISION_PLACE_AUTO) or VISION_PLACE_AUTO),
+    )
+    if why:
+        raise Weg2LaunchRefused(why)
+    return val
 
 
 def weg2_boot_token(ns) -> str:
@@ -6001,6 +6069,10 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               vision: str = VISION_OFF,
               profile: str = PROFILE_QWEN27B,
               flip_weights: str = "family",
+              # H125: the transient stage's source and place, P only; the
+              # defaults publish nothing (byte-identical env).
+              vision_source: str = VISION_SOURCE_DISK,
+              vision_place: str = VISION_PLACE_AUTO,
               group_env_extra: Optional[Dict[str, str]] = None,
               xchg_env: Optional[Dict[str, str]] = None,
               # WEG2-FORM (24.09.): the ONE resolved form of this boot
@@ -6029,6 +6101,17 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         env[VISION_STAGE_ENV] = VISION_TRANSIENT
     else:
         env.pop(VISION_STAGE_ENV, None)
+    # H125: SAME DISCIPLINE -- launcher output, P of a transient boot only,
+    # and only when not the default; popped everywhere else so an operator's
+    # shell value can never pick a source the argv does not say.
+    if vision == VISION_TRANSIENT and group == "P" and vision_source != VISION_SOURCE_DISK:
+        env[VISION_SOURCE_ENV] = vision_source
+    else:
+        env.pop(VISION_SOURCE_ENV, None)
+    if vision == VISION_TRANSIENT and group == "P" and vision_place != VISION_PLACE_AUTO:
+        env[VISION_PLACE_ENV] = vision_place
+    else:
+        env.pop(VISION_PLACE_ENV, None)
     # #1348: the exchange lane's unexecuted-line instrument. SAME DISCIPLINE
     # as SGLANG_WEG2_GROUP and the host-ring family below (R19): this is
     # LAUNCHER OUTPUT, published only when `--xchg-coverage-diff` named a
@@ -13727,6 +13810,22 @@ def build_parser() -> argparse.ArgumentParser:
              "widest-layer one.",
     )
     ap.add_argument(
+        "--weg2-vision-source", choices=list(VISION_SOURCES), default=VISION_SOURCE_DISK,
+        help="H125: where the TRANSIENT tower's bytes come from (only with "
+             "--weg2-vision transient). `disk` (default): the checkpoint shard, "
+             "O_DIRECT, per image request. `ram`: P's PP0 stages the tower extent "
+             "once into a tmpfs image (NF 856 MiB, 27B 879 MiB of host RAM for the "
+             "life of the boot) and every stage reads it from RAM.",
+    )
+    ap.add_argument(
+        "--weg2-vision-place", choices=list(VISION_PLACES), default=VISION_PLACE_AUTO,
+        help="H125: where the TRANSIENT tower sits on PP0's card (only with "
+             "--weg2-vision transient). `auto` (default): the KV tail when it is "
+             "wholly free (the phase start), else the card's free VRAM, else a "
+             "named refusal. `kvtail`: the 27B stage exactly. `free`: always the "
+             "card's free VRAM.",
+    )
+    ap.add_argument(
         # #1356: see VISION_OFF. Default `off` = P and D boot TEXT-ONLY.
         "--weg2-vision", choices=list(VISION_CHOICES), default=VISION_OFF,
         help="#1356: `off` (default) boots both groups text-only by passing "
@@ -15871,6 +15970,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                p_stage_layers=getattr(state, "p_stage_layers", None),
                                chunk_layers=chunk_layers)
     env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap)
+    # H125: the host-RAM price of `--weg2-vision-source ram`, named where the
+    # P env is built (the line is empty, and nothing is logged, for `disk`).
+    _vis_line = vision_source_host_line(
+        ns.model, str(getattr(ns, "weg2_vision_source", VISION_SOURCE_DISK)))
+    if _vis_line and str(getattr(ns, "weg2_vision", VISION_OFF)) == VISION_TRANSIENT:
+        log(_vis_line)
     # #1269 PUBLICATION: build_env's own comment says the decision is
     # "published explicitly so the boot log names the decision" -- but it only
     # SET the variables and logged nothing, so no boot log ever carried them.
