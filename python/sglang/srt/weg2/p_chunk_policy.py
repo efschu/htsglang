@@ -208,6 +208,12 @@ class ChunkLimits:
     min_gain: float = DEFAULT_MIN_GAIN
     ramps: bool = True
     tail_hook: Optional[TailHook] = dataclasses.field(default=None, compare=False, hash=False)
+    #: Short-prompt bypass (rc9j metal, 26.09.): a request whose rest is at
+    #: most this many tokens when the cursor first sees it is NOT planned --
+    #: every forward gets ``fixed_tokens``, exactly the fixed policy's width.
+    #: 0 = off (every request is planned). A request that started above it
+    #: keeps following its plan to the end.
+    dynamic_min_tokens: int = 0
 
     def __post_init__(self):
         object.__setattr__(self, "graph_buckets", tuple(sorted({int(b) for b in self.graph_buckets})))
@@ -238,6 +244,8 @@ class ChunkLimits:
                     f"{self.graph_buckets[-1]}")
         if self.max_inflight < 0 or not (0.0 <= self.min_gain < 1.0):
             raise ChunkPolicyError("max_inflight must be >= 0 and 0 <= min_gain < 1")
+        if self.dynamic_min_tokens < 0:
+            raise ChunkPolicyError(f"dynamic_min_tokens must be >= 0, got {self.dynamic_min_tokens}")
 
     def ladder(self) -> Tuple[int, ...]:
         """The chunk sizes a plan chooses from, ascending."""
@@ -260,13 +268,15 @@ class ChunkLimits:
 
     def key(self) -> Tuple:
         return (self.max_tokens, self.min_tokens, self.fixed_tokens, self.page, self.grid,
-                self.graph_buckets, self.eager, self.max_inflight, self.min_gain, self.ramps)
+                self.graph_buckets, self.eager, self.max_inflight, self.min_gain, self.ramps,
+                self.dynamic_min_tokens)
 
     def to_json(self) -> Dict[str, object]:
         return {"max_tokens": self.max_tokens, "min_tokens": self.min_tokens,
                 "fixed_tokens": self.fixed_tokens, "page": self.page, "grid": self.grid,
                 "graph_buckets": list(self.graph_buckets), "eager": self.eager,
-                "max_inflight": self.max_inflight, "min_gain": self.min_gain, "ramps": self.ramps}
+                "max_inflight": self.max_inflight, "min_gain": self.min_gain, "ramps": self.ramps,
+                "dynamic_min_tokens": self.dynamic_min_tokens}
 
     @classmethod
     def from_json(cls, d: Dict[str, object], tail_hook: Optional[TailHook] = None) -> "ChunkLimits":
@@ -274,7 +284,8 @@ class ChunkLimits:
                    int(d.get("page", 1)), int(d.get("grid", 0)),
                    tuple(int(b) for b in d.get("graph_buckets", ()) or ()),
                    bool(d.get("eager", True)), int(d.get("max_inflight", 0)),
-                   float(d.get("min_gain", DEFAULT_MIN_GAIN)), bool(d.get("ramps", True)), tail_hook)
+                   float(d.get("min_gain", DEFAULT_MIN_GAIN)), bool(d.get("ramps", True)), tail_hook,
+                   int(d.get("dynamic_min_tokens", 0) or 0))
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +541,10 @@ class ChunkPlanner:
             return 0
         known = self._plans.get(key)
         if known is None or known[0] != end:
+            lim = self.spec.limits
+            if lim.dynamic_min_tokens and end - pos <= lim.dynamic_min_tokens:
+                # Short-prompt bypass: no plan, no log line, the fixed width.
+                return min(lim.fixed_tokens, end - pos)
             steps = self._make(key, pos, end, ramps=True)
         else:
             steps = known[1]
@@ -564,7 +579,8 @@ def armed_line(spec: PolicySpec, where: str = "") -> str:
         f"stages={len(spec.stages)} ladder={list(lim.ladder())} max={lim.max_tokens} "
         f"min={lim.min_tokens} fixed={lim.fixed_tokens} page={lim.page} grid={lim.grid} "
         f"graph_buckets={list(lim.graph_buckets)} eager={lim.eager} "
-        f"min_gain={lim.min_gain:g} ramps={lim.ramps} source={spec.source or '-'}"
+        f"min_gain={lim.min_gain:g} ramps={lim.ramps} "
+        f"dynamic_min_tokens={lim.dynamic_min_tokens} source={spec.source or '-'}"
     )
 
 

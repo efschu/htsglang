@@ -273,6 +273,55 @@ class TestCursor(unittest.TestCase):
         self.assertEqual(P.forward_budget(pl, "done", 50, 50), 0)
 
 
+class TestShortPromptBypass(unittest.TestCase):
+    """rc9j metal (26.09.): 2k/8k measured slower under dynamic although the
+    plan was 512xn -- at or below --p-chunk-dynamic-min-tokens nothing is
+    planned and every forward is the fixed width."""
+
+    def _spec(self, thr):
+        st = [_lin(1700.0, 0.05)] * 3  # a model that WOULD plan large chunks
+        return P.PolicySpec(tuple(st), P.ChunkLimits(2048, 512, 512, dynamic_min_tokens=thr), "t")
+
+    def test_bypass_gives_the_fixed_width_and_no_plan(self):
+        seen = []
+        pl = P.ChunkPlanner(self._spec(8192), on_plan=lambda *a: seen.append(a))
+        for n in (1, 300, 2047, 8192):
+            pos, widths = 0, []
+            while pos < n:
+                b = P.forward_budget(pl, f"r{n}", pos, n)
+                widths.append(b)
+                pos += min(b, n - pos)
+            # the forward budget is EXACTLY what the fixed scheduler gives: 512
+            self.assertEqual(set(widths), {512}, n)
+        self.assertEqual(seen, [])
+
+    def test_above_the_threshold_the_plan_is_unchanged(self):
+        spec = self._spec(8192)
+        pl = P.ChunkPlanner(spec)
+        n = 8193
+        want = P.chunk_plan(n, 3, spec.stages, spec.limits)
+        pos, got = 0, []
+        while pos < n:
+            w = pl.next_width("long", pos, n)
+            got.append(w)
+            pos += w
+        self.assertEqual(got, want)
+        self.assertEqual(got, P.chunk_plan(n, 3, spec.stages, P.ChunkLimits(2048, 512, 512)))
+        # the tail of a planned request stays on its plan below the threshold
+        self.assertNotEqual(set(got), {512})
+
+    def test_zero_is_off_and_roundtrip(self):
+        pl = P.ChunkPlanner(self._spec(0))
+        self.assertEqual(pl.next_width("s", 0, 2048), 2048)
+        spec = self._spec(8192)
+        back = P.PolicySpec.from_json(spec.to_json())
+        self.assertEqual(back.limits.dynamic_min_tokens, 8192)
+        self.assertEqual(P.ChunkLimits.from_json({"max_tokens": 2048, "min_tokens": 512,
+                                                  "fixed_tokens": 512}).dynamic_min_tokens, 0)
+        with self.assertRaises(P.ChunkPolicyError):
+            P.ChunkLimits(2048, 512, 512, dynamic_min_tokens=-1)
+
+
 class TestEnv(unittest.TestCase):
     def test_fixed_and_unset_are_none(self):
         self.assertIsNone(P.policy_from_env({}))
@@ -351,6 +400,34 @@ class TestLauncher(unittest.TestCase):
         lines = L.p_chunk_policy_lines()
         self.assertEqual(len(lines), 1 + len(L.P_CHUNK_DRY_RUN_TOKENS))
         self.assertIn("ceiling 2048", lines[0])
+        # default bypass 8192: 2k/8k are not planned, 32k/128k are
+        self.assertEqual(spec.limits.dynamic_min_tokens, 8192)
+        self.assertIn("dynamic_min_tokens=8192", lines[0])
+        self.assertIn("BYPASS", lines[1])
+        self.assertIn("BYPASS", lines[2])
+        self.assertNotIn("BYPASS", lines[3])
+
+    def test_bypass_flag_and_scheduler_width(self):
+        self._apply("--p-prefill-graph", "512", "--p-chunk-policy", "dynamic",
+                    "--p-chunk-dynamic-min-tokens", "0")
+        self.assertEqual(L.p_chunk_policy_spec().limits.dynamic_min_tokens, 0)
+        self._apply("--p-prefill-graph", "512", "--p-chunk-policy", "dynamic")
+        spec = P.PolicySpec.from_json(L.p_chunk_policy_env()[P.SPEC_ENV])
+        from sglang.srt.managers.scheduler import Scheduler
+
+        class _S:
+            _p_chunk_policy_width = Scheduler._p_chunk_policy_width
+
+        s = _S()
+        s.chunked_prefill_size = L.p_chunked_prefill_tokens()  # the 2048 ceiling
+        s.waiting_queue = []
+        s._p_chunk_planner = P.ChunkPlanner(spec)
+        for n in (2047, 8191):
+            for pos in range(0, n, 512):
+                s.chunked_req = SimpleNamespace(rid=f"q{n}", full_untruncated_fill_ids=list(range(n)),
+                                                origin_input_ids=[], output_ids=[],
+                                                prefix_indices=list(range(pos)))
+                self.assertEqual(s._p_chunk_policy_width(), 512, (n, pos))
 
     def test_dynamic_refusals_and_forced_probe(self):
         with self.assertRaises(SystemExit):
