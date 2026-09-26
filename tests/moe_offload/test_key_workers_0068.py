@@ -135,7 +135,7 @@ def test_68b_kein_doppeltes_post_load_im_pread_pfad():
     import inspect
 
     src = inspect.getsource(wu.buffered_multi_thread_safetensors_weights_iterator)
-    i_pread = src.index("pread_safetensors_file(st_file, should_load, post_load=post_load)")
+    i_pread = src.index("post_load=post_load, direct_io=direct_io")
     i_seriell = src.index("{k: post_load(k, v) for k, v in result.items()}")
     assert i_pread < i_seriell
     assert "return _erg" in src[i_pread : i_pread + 200], (

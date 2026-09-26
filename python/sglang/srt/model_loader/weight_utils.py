@@ -1118,7 +1118,7 @@ def safetensors_weights_iterator(
         position=tqdm._get_free_pos(),
     ):
         if pread:
-            result = pread_safetensors_file(st_file, should_load)
+            result = pread_safetensors_file(st_file, should_load, direct_io=direct_io)
             for name in sorted(result.keys()):
                 yield name, result[name]
             del result
@@ -1302,7 +1302,74 @@ def read_safetensors_header(st_file: str):
     return header, 8 + n
 
 
-def _pread_one_key(fd, base, name, info, should_load):
+#: O_DIRECT per tensor (27B-ODIRECT 0926): the pread path reads each tensor
+#: through ONE page-aligned bounce buffer of this size per file and thread, so
+#: the host transient of --weight-loader-direct-io on the pread path is this
+#: buffer, not a second copy of the shard (``read_file_direct`` holds the whole
+#: file twice, x (max_workers + 2) shards on the multi-thread iterator).
+_DIRECT_BOUNCE = 16 << 20
+_DIRECT_FALLBACK_WARNED: set = set()
+
+
+class _DirectReader:
+    """An O_DIRECT fd plus one page-aligned bounce buffer for ONE file.
+
+    ``open`` returns ``None`` when the filesystem refuses O_DIRECT (tmpfs,
+    some FUSE mounts: EINVAL on open) -- the caller then reads buffered, and
+    the refusal is logged once per path, never silently.  Bytes are identical
+    to the buffered read; only the route into memory differs (no page cache).
+    """
+
+    def __init__(self, fd: int):
+        import mmap as _mm
+
+        self.fd = fd
+        self._buf = _mm.mmap(-1, _DIRECT_BOUNCE)  # anonymous => page aligned
+        self._mv = memoryview(self._buf)
+
+    @classmethod
+    def open(cls, path: str) -> Optional["_DirectReader"]:
+        o_direct = getattr(os, "O_DIRECT", 0o40000)
+        try:
+            fd = os.open(path, os.O_RDONLY | o_direct)
+        except OSError as err:
+            if path not in _DIRECT_FALLBACK_WARNED:
+                _DIRECT_FALLBACK_WARNED.add(path)
+                logger.warning(
+                    "weight loader: O_DIRECT refused on %s (%s); reading it "
+                    "BUFFERED (page cache) instead", path, err,
+                )
+            return None
+        return cls(fd)
+
+    def read_into(self, dst: memoryview, file_off: int) -> None:
+        """Fill ``dst`` with the bytes at ``file_off``: aligned reads into the
+        bounce buffer, the wanted window copied out."""
+        need = len(dst)
+        done = 0
+        cur = file_off
+        while done < need:
+            a = cur & ~(_DIRECT_ALIGN - 1)
+            skip = cur - a
+            want = min(_DIRECT_BOUNCE, (skip + (need - done) + _DIRECT_ALIGN - 1)
+                       & ~(_DIRECT_ALIGN - 1))
+            n = os.preadv(self.fd, [self._mv[:want]], a)
+            if n <= skip:
+                raise IOError(f"short O_DIRECT read at {a} (+{want}): got {n}")
+            take = min(n - skip, need - done)
+            dst[done : done + take] = self._mv[skip : skip + take]
+            done += take
+            cur += take
+
+    def close(self) -> None:
+        try:
+            self._mv.release()
+            self._buf.close()
+        finally:
+            os.close(self.fd)
+
+
+def _pread_one_key(fd, base, name, info, should_load, direct=None):
     """EIN Tensor aus einer offenen safetensors-Datei. Der Rumpf ist Zeile
     fuer Zeile der der seriellen Schleife in :func:`pread_safetensors_file`
     -- absichtlich, damit die beiden Formen nicht auseinanderlaufen koennen
@@ -1320,6 +1387,9 @@ def _pread_one_key(fd, base, name, info, should_load):
         return torch.empty(shape, dtype=dtype)
     buf = torch.empty(nbytes, dtype=torch.uint8)
     view = memoryview(buf.numpy())
+    if direct is not None:
+        direct.read_into(view, base + off0)
+        return buf.view(dtype).reshape(shape)
     pos = 0
     while pos < nbytes:
         n = os.preadv(fd, [view[pos : pos + _PREAD_CHUNK]], base + off0 + pos)
@@ -1330,7 +1400,7 @@ def _pread_one_key(fd, base, name, info, should_load):
 
 
 def _pread_keys_parallel(st_file, base, order, should_load, workers: int,
-                         post_load=None) -> dict:
+                         post_load=None, direct_io: bool = False) -> dict:
     """#68: die Keys EINER Datei auf ``workers`` Threads.
 
     Jeder Thread oeffnet seinen EIGENEN fd -- nicht aus Vorsicht vor
@@ -1343,9 +1413,10 @@ def _pread_keys_parallel(st_file, base, order, should_load, workers: int,
     def _lauf(teil):
         eigen = {}
         fd = os.open(st_file, os.O_RDONLY)
+        direct = _DirectReader.open(st_file) if direct_io else None
         try:
             for name, info in teil:
-                t = _pread_one_key(fd, base, name, info, should_load)
+                t = _pread_one_key(fd, base, name, info, should_load, direct)
                 if t is None:
                     continue
                 # #68b DIE CPU-ARBEIT GEHOERT IN DIESEN THREAD.
@@ -1363,6 +1434,8 @@ def _pread_keys_parallel(st_file, base, order, should_load, workers: int,
                     t = post_load(name, t)
                 eigen[name] = t
         finally:
+            if direct is not None:
+                direct.close()
             os.close(fd)
         return eigen
 
@@ -1376,7 +1449,8 @@ def _pread_keys_parallel(st_file, base, order, should_load, workers: int,
     return result
 
 
-def pread_safetensors_file(st_file: str, should_load=None, post_load=None) -> dict:
+def pread_safetensors_file(st_file: str, should_load=None, post_load=None,
+                           direct_io: bool = False) -> dict:
     """Read a safetensors file's tensors with pread() into fresh CPU tensors,
     in file order, one tensor at a time -- no mmap, no whole-file buffer.
 
@@ -1422,7 +1496,8 @@ def pread_safetensors_file(st_file: str, should_load=None, post_load=None) -> di
         _kw = 1
     if _kw > 1 and len(order) > _kw:
         return _pread_keys_parallel(
-            st_file, base, order, should_load, _kw, post_load=post_load
+            st_file, base, order, should_load, _kw, post_load=post_load,
+            direct_io=direct_io,
         )
 
     # #68c DER SERIELLE ZWEIG MUSS `post_load` GENAUSO ANWENDEN.
@@ -1438,15 +1513,18 @@ def pread_safetensors_file(st_file: str, should_load=None, post_load=None) -> di
     # EINMAL im Modul, in `_pread_one_key`, und `post_load` steht in
     # beiden Zweigen unmittelbar daneben.
     fd = os.open(st_file, os.O_RDONLY)
+    direct = _DirectReader.open(st_file) if direct_io else None
     try:
         for name, info in order:
-            t = _pread_one_key(fd, base, name, info, should_load)
+            t = _pread_one_key(fd, base, name, info, should_load, direct)
             if t is None:
                 continue
             if post_load is not None:
                 t = post_load(name, t)
             result[name] = t
     finally:
+        if direct is not None:
+            direct.close()
         os.close(fd)
     return result
 
@@ -1501,11 +1579,19 @@ def buffered_multi_thread_safetensors_weights_iterator(
             # Thread. Der Rueckgabewert ist dann fertig, und die serielle
             # Schleife unten wird uebersprungen -- sonst liefe sie ein
             # zweites Mal ueber dieselben Tensoren.
-            _erg = pread_safetensors_file(st_file, should_load, post_load=post_load)
+            _erg = pread_safetensors_file(
+                st_file, should_load, post_load=post_load, direct_io=direct_io
+            )
             return _erg
         if disable_mmap:
-            with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
+            if direct_io:
+                # 27B-ODIRECT 0926: this branch accepted direct_io and ignored
+                # it (only the single-thread iterator honoured it). Same route
+                # as there; whole-file transient -- prefer pread=1 + direct_io.
+                result = safetensors.torch.load(read_file_direct(st_file))
+            else:
+                with open(st_file, "rb") as f:
+                    result = safetensors.torch.load(f.read())
             if should_load is not None:
                 result = {k: v for k, v in result.items() if should_load(k)}
         else:
