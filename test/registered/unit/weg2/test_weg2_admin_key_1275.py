@@ -208,12 +208,11 @@ class TheSecretDoesNotLeak(CustomTestCase):
         """The groups have no choice (server_args takes only --admin-api-key,
         so their key is world-readable in /proc/<pid>/cmdline). The front does
         have a choice, and a second exposure bought with nothing is not taken."""
-        from types import SimpleNamespace
-
         from sglang.srt.weg2 import launcher as L
 
-        ns = SimpleNamespace(tag="t", fairness_w_s=45.0, drain_deadline_s=90.0,
-                             min_dwell_ms=None, d_admit_max_tokens=None)
+        # #1444 (dc15687a63): front_argv_for reads ns.weg2_weight_source; the
+        # launcher's OWN parser namespace, not a hand-picked one that drifts.
+        ns = L.build_parser().parse_args(["--tree", "/x", "--tag", "t"])
         argv = L.front_argv_for("py", "/store", 1, 2, {}, [], ns, 0, 0, 8, 8,
                                 22000, 22000, "D",
                                 admin_key_file="/g/weg2/boot_t.adminkey")
@@ -231,12 +230,11 @@ class TheSecretDoesNotLeak(CustomTestCase):
             "the front's argv must carry the PATH, never the key")
 
     def test_the_front_argv_is_unchanged_when_unkeyed(self):
-        from types import SimpleNamespace
-
         from sglang.srt.weg2 import launcher as L
 
-        ns = SimpleNamespace(tag="t", fairness_w_s=45.0, drain_deadline_s=90.0,
-                             min_dwell_ms=None, d_admit_max_tokens=None)
+        # #1444 (dc15687a63): front_argv_for reads ns.weg2_weight_source; the
+        # launcher's OWN parser namespace, not a hand-picked one that drifts.
+        ns = L.build_parser().parse_args(["--tree", "/x", "--tag", "t"])
         base = L.front_argv_for("py", "/s", 1, 2, {}, [], ns, 0, 0, 8, 8, 1, 1, "D")
         self.assertNotIn("--admin-key-file", base)
 

@@ -34,13 +34,14 @@ import ast
 import inspect
 import textwrap
 import unittest
-from types import SimpleNamespace
 
 from sglang.srt.weg2 import launcher as L
 from sglang.test.test_utils import CustomTestCase
 
-NS = SimpleNamespace(tag="t", fairness_w_s=45.0, drain_deadline_s=90.0,
-                     min_dwell_ms=None, d_admit_max_tokens=None)
+# #1444 (dc15687a63): front_argv_for reads ns.weg2_weight_source (and more
+# of the launcher's namespace since); the launcher's OWN parser namespace, not
+# a hand-picked one that drifts behind every such read.
+NS = L.build_parser().parse_args(["--tree", "/x", "--tag", "t"])
 
 
 def argv(**kw):

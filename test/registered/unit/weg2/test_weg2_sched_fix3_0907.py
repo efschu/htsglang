@@ -456,6 +456,11 @@ def _run_law4_reach(refuses: bool, drive_pp: bool = False):
     # count veto applies), i.e. the path law 4 is about.
     if "_burst_hold" in kw:
         kw["_burst_hold"] = None
+    # H91b (bf708a1fd6): the same shape again -- the pass-level D park gate
+    # (`_d_park_gate = self._weg2_d_park_admission(...)`, None = stock loop,
+    # "parked first" only on an armed group D).
+    if "_d_park_gate" in kw:
+        kw["_d_park_gate"] = None
     # ... and the carried-seat count of the same change: 0 unless anchor
     # tails are armed (`_carried_n = len(adder.can_run_list) if
     # adder.multi_anchor_tails else 0`).
