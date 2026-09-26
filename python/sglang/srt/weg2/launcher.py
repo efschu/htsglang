@@ -10017,6 +10017,30 @@ def p_host_overlap_lines(overlap: bool, hostgap: bool) -> List[str]:
     return lines
 
 
+def p_recv_stream_env(on: bool) -> Dict[str, str]:
+    """Group P's extra environment for ``--p-recv-stream``; empty when off
+    (byte-identity, pinned by test_weg2_p_recv_stream.py). The NAME lives in
+    managers/weg2_p_overlap.py, the one module the runtime reads it from."""
+    from sglang.srt.managers import weg2_p_overlap as _pov
+
+    return _pov.launcher_env_p_recv_stream() if on else {}
+
+
+def p_recv_stream_lines(on: bool) -> List[str]:
+    """The provenance line for ``--p-recv-stream`` -- none when off."""
+    if not on:
+        return []
+    return [
+        "WEG2 P-RECV-STREAM: on (--p-recv-stream) -- group P gets %s: the proxy "
+        "frame's NCCL receive runs on a side stream without the fence on the "
+        "running forward, the schedule stream waits for it device-side. Reason: "
+        "#PGAP 26.09. (i8B/i8drt) PP1/PP2 card idle per chunk = frame transfer "
+        "serialised behind the previous forward (PP2 2048: ~11 ms of ~462 ms, "
+        "0.1 ms on PP0 which receives no frame) (managers/weg2_p_overlap.py)."
+        % " ".join("%s=%s" % kv for kv in sorted(p_recv_stream_env(True).items()))
+    ]
+
+
 #: --p-deep-split-from (27B line, 2026-09-24): 0 = off, the default.
 P_DEEP_SPLIT_FROM_DEFAULT = 0
 #: The crossover prefix read off the xsn426/xsn428 #PGAP fits: the graph's
@@ -13182,6 +13206,17 @@ def build_parser() -> argparse.ArgumentParser:
              "Default off = argv and env byte-identical to before.",
     )
     ap.add_argument(
+        "--p-recv-stream", action="store_true",
+        help="Group P: receive each stage's proxy frame (hidden states from the "
+             "stage before) on a side stream that does not wait for the running "
+             "forward, so the transfer overlaps it; the next forward still waits "
+             "for the frame device-side (managers/weg2_p_overlap.py, "
+             "SGLANG_WEG2_P_RECV_STREAM=1). Measured reason (#PGAP 26.09., "
+             "i8B): PP1/PP2 idle ~11 ms per 2048 chunk = the frame transfer, "
+             "queued behind the fence on the previous forward. Default off = "
+             "argv and env byte-identical to before.",
+    )
+    ap.add_argument(
         "--p-hostgap", action="store_true",
         help="Group P: the #PGAP instrument (SGLANG_WEG2_P_HOSTGAP=1) -- one "
              "line per forward with the card's idle before it (timing events on "
@@ -14859,6 +14894,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         getattr(ns, "p_host_overlap", False), getattr(ns, "p_hostgap", False)))
     for _pline in p_host_overlap_lines(
             getattr(ns, "p_host_overlap", False), getattr(ns, "p_hostgap", False)):
+        log(_pline)
+    # P-RECV-STREAM (managers/weg2_p_overlap.py): group P only, default off --
+    # off adds nothing, so argv and env stay byte-identical.
+    env_p.update(p_recv_stream_env(getattr(ns, "p_recv_stream", False)))
+    for _pline in p_recv_stream_lines(getattr(ns, "p_recv_stream", False)):
         log(_pline)
     # --p-prefill-graph-split: {} when off (env byte-identical).
     _gs_env = p_graph_split_env(ns)
