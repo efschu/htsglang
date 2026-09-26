@@ -79,6 +79,8 @@ from sglang.srt.weg2 import (
     DEFAULT_PP_ORDERED_CUT,
 )
 from sglang.srt.weg2 import admin_key as admin_key_mod
+# H94: the awake overshoot per card, keyed by the checkpoint it was measured on.
+from sglang.srt.weg2 import awake_overshoot
 # WEG2-FORM (24.09.): the boot's form axes -- ONE resolver, ONE line, ONE env.
 from sglang.srt.weg2 import form as weg2_form
 # Task #58: the arming variable's name comes from the module that READS it, so
@@ -479,7 +481,14 @@ def strip_barlink_flags(argv: List[str]) -> List[str]:
 #: prices ~635 MiB of transient there; the #656 floor is 1024) and ~1.5 GiB on
 #: PP2; PP1 keeps its budget.  R5 grades the result; a boot that measures a
 #: different overshoot replaces these numbers, it does not add to them.
-P_OVERSHOOT_MIB = [920, 0, 512]
+#:
+#: H94: MEASURED ON Qwen3.8-27B, AND CHARGED ONLY THERE. The number lives in
+#: ``awake_overshoot.REFERENCES`` scoped to the ``Qwen3.8-27B`` family; this
+#: name is its read-only alias. A boot of another checkpoint resolves its own
+#: record/reference or the named UNMEASURED-FALLBACK (``awake_overshoot_for``)
+#: -- fnFL2x178 (Next-Flash) was charged these 920/512 MiB by the old literal.
+P_OVERSHOOT_MIB = list(awake_overshoot.reference_for(
+    "P", awake_overshoot.QWEN38_27B_FAMILY).mib)
 #: #1233 boot weg2ls4b1 (2026-09-07 11:24-11:50Z, front corridor sampler with
 #: group D awake under three back-to-back agent-load rounds, 31 requests
 #: each): NVML free continuous minimum 535 / 1260 / 1724 MiB on the 5090
@@ -494,7 +503,9 @@ P_OVERSHOOT_MIB = [920, 0, 512]
 #: pool size follows the min-over-ranks token count, so the cheaper ranks
 #: allocate less), a planner item (uneven token vector), not a budget one.
 #: A boot that measures a different overshoot replaces this number.
-D_OVERSHOOT_MIB = [489, 0, 0]
+#: H94: 27B-scoped like P_OVERSHOOT_MIB above; read-only alias.
+D_OVERSHOOT_MIB = list(awake_overshoot.reference_for(
+    "D", awake_overshoot.QWEN38_27B_FAMILY).mib)
 D_WINDOWS_MIB = 16 + 32 + 24
 P_WINDOWS_MIB = 24 + 96
 #: TRAIN FIX 5.  The group-P FORM KEY has to be computed BEFORE the host ring,
@@ -1279,6 +1290,10 @@ P_CHUNKED_PREFILL_TOKENS = int(envs.SGLANG_WEG2_P_CHUNKED_PREFILL_TOKENS.get())
 X_RECORDED_R_D_TOKS = 690.0
 X_RECORDED_R_P_TOKS = 3640.0
 X_RECORDED_FLIP_S = 13.247
+#: H94: the checkpoint family the recorded pair above was measured on (boot
+#: weg2zr2 ran Qwen3.8-27B). A boot of another checkpoint that finds no front
+#: log of its own never seeds X from it -- see :func:`resolve_x`.
+X_RECORDED_MODEL_FAMILY = awake_overshoot.QWEN38_27B_FAMILY
 
 
 #: #1271: the UNIT a rate is expressed in. X* divides one rate by another, so
@@ -1438,8 +1453,25 @@ class XSeed(NamedTuple):
     measured: bool
 
 
-def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> XSeed:
+def resolve_x(
+    override: Optional[int],
+    evidence_dir: str,
+    floor_tokens: int,
+    accept: Optional[Callable[[str], bool]] = None,
+    model: Optional[str] = None,
+) -> XSeed:
     """X and its PROVENANCE LINE, naming the three inputs and their source.
+
+    H94 -- ONLY THIS CHECKPOINT'S LOGS. ``accept`` is the boot's calibration
+    filter (``calib_log_accept_of``: ``weg2_form.same_model_log``), the same
+    one the design-prefix scan already takes; without it the scan seeded X from
+    the NEWEST front log on the rig whatever it had booted, so a Qwen3.8-27B
+    boot's flip and rates would have seeded a Next-Flash X. The count of logs
+    of other checkpoints is printed. ``model`` scopes the recorded fallback
+    pair: it was measured on :data:`X_RECORDED_MODEL_FAMILY`, and a boot of any
+    other checkpoint gets the named ``UNMEASURED-FALLBACK`` X = floor (one
+    chunk: every prompt above it flips) instead, ``measured=False`` as before.
+    ``None`` for both (desk callers) keeps the pre-H94 answer.
 
     Order: an explicit ``--tp-prefill-max-tokens`` wins (A1-4: derived with
     the flag as override), else the newest front log on this rig that
@@ -1483,7 +1515,11 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> 
     except OSError:
         logs = []
     skipped = 0
+    foreign = 0
     for path in logs:
+        if accept is not None and not accept(path):
+            foreign += 1
+            continue
         got = measure_x_inputs(path, floor_tokens)
         if got is None:
             skipped += 1
@@ -1500,7 +1536,18 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> 
             f"r_D={r_d:.0f} tok/s (median of {n_d} D single prefills) "
             f"r_P={r_p:.0f} tok/s (median of {n_p} P leg 1s) floor={floor_tokens}; "
             f"skipped {skipped} newer front log(s) carrying no complete instrument set"
+            + (f" and {foreign} of another checkpoint (WEG2-FORM calibration identity)"
+               if accept is not None else "")
         ), True)
+    if model is not None and not awake_overshoot.in_family(model, X_RECORDED_MODEL_FAMILY):
+        return XSeed(int(floor_tokens), (
+            f"X={int(floor_tokens)} source=UNMEASURED-FALLBACK (examined {len(logs)} front "
+            f"log(s) on this rig, {foreign} of another checkpoint, none of "
+            f"{awake_overshoot.model_key(model)} carried all three instruments) -- the "
+            f"recorded pair (weg2zr2) was measured on {X_RECORDED_MODEL_FAMILY}, not on this "
+            f"checkpoint, so X is the floor {floor_tokens} (one chunk) until a boot of this "
+            f"checkpoint drains P and flips; pass --tp-prefill-max-tokens to set it"
+        ), False)
     x = derive_x_star(X_RECORDED_FLIP_S, X_RECORDED_R_D_TOKS, X_RECORDED_R_P_TOKS, floor_tokens)
     return XSeed(x, (
         f"X={x} source=recorded PRE-BARLINK (examined {len(logs)} front log(s) on this rig, "
@@ -1970,6 +2017,12 @@ CALIBRATION_PREFIX_TOKENS = 4096
 #: is what makes the optimum a FUNCTION of the design prefix rather than a
 #: constant, and it is cited to its record rather than written as a literal.
 ATTN_ANCHOR_MS = 400.0
+#: H94: the checkpoint family MEASURED_MS_PER_LAYER (boot bsscale) and
+#: ATTN_ANCHOR_MS (the 07.09. physics note) were taken on -- both Qwen3.8-27B.
+#: Another checkpoint that leaves both flags at these defaults is priced with
+#: foreign rates; :func:`foreign_cut_rates` names that, and an UNPINNED solve
+#: on them is refused (it would pick that checkpoint's cut from 27B rates).
+CUT_RATES_MODEL_FAMILY = awake_overshoot.QWEN38_27B_FAMILY
 ATTN_ANCHOR_PREFIX_TOKENS = 262144
 
 #: DESIGN DEPTH FALLBACK. When no boot log carries a prefill census the design
@@ -8162,6 +8215,31 @@ def parse_user_reserve(raw, cards) -> Dict[str, int]:
     return {c.uuid: v for c, v in zip(cards, values)}
 
 
+def awake_overshoot_for(
+    group: str,
+    cards: List[Card],
+    model: str,
+    log: Log,
+    accept: Optional[Callable[[dict], bool]] = None,
+    record_path: Optional[str] = None,
+) -> "awake_overshoot.Resolution":
+    """H94: the measured awake overshoot ``budgets_from_dc`` charges for
+    ``group`` on THIS checkpoint, and its one line.
+
+    RECORD (the sidecar, this checkpoint and -- with ``accept`` -- this form)
+    -> BUILTIN (``awake_overshoot.REFERENCES`` of this checkpoint's family) ->
+    UNMEASURED-FALLBACK (0, named). Never another model's number: until H94
+    both groups charged the Qwen3.8-27B literals on every boot.
+    """
+    res = awake_overshoot.resolve(
+        group, cards, model,
+        record_path=measured_record_path() if record_path is None else record_path,
+        accept=accept,
+    )
+    log(res.line(cards))
+    return res
+
+
 def budgets_from_dc(
     cards: List[Card],
     dc_mib: Dict[str, int],
@@ -11862,6 +11940,29 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
         raise Weg2LaunchRefused(refusal)
 
 
+def foreign_cut_rates(ns, model: str) -> Optional[str]:
+    """H94: why this launch's P-cut rates are ANOTHER checkpoint's, or None.
+
+    Only in a real launch (``ns.weg2_boot_form`` resolved -- the same scope as
+    ``calib_log_accept_of``): a desk caller keeps today's answer. Only when
+    BOTH rate flags sit at their defaults, because an operator-passed rate is
+    that operator's measurement and not this module's to second-guess.
+    """
+    if getattr(ns, "weg2_boot_form", None) is None:
+        return None
+    if awake_overshoot.in_family(model, CUT_RATES_MODEL_FAMILY):
+        return None
+    if str(getattr(ns, "pp_cut_measured_ms_per_layer", MEASURED_MS_PER_LAYER)) != MEASURED_MS_PER_LAYER:
+        return None
+    if float(getattr(ns, "pp_cut_attn_anchor_ms", ATTN_ANCHOR_MS)) != float(ATTN_ANCHOR_MS):
+        return None
+    return (
+        f"--pp-cut-measured-ms-per-layer {MEASURED_MS_PER_LAYER} (boot bsscale) and "
+        f"--pp-cut-attn-anchor-ms {ATTN_ANCHOR_MS} are the defaults MEASURED ON "
+        f"{CUT_RATES_MODEL_FAMILY}, and this boot runs {awake_overshoot.model_key(model)}"
+    )
+
+
 def solve_p_cut(
     ns,
     cards: List[Card],
@@ -11909,6 +12010,27 @@ def solve_p_cut(
         chunk_tokens=int(chunk_tokens),
         fr_p=str(getattr(ns, "pp_cut_expert_device_fraction", "") or ""),
     ))
+    # H94: THE RATES MUST BE THIS CHECKPOINT'S. With the cut pinned they rank
+    # nothing and only the report lines below are priced on them -- named, so
+    # no FRONTIER/family line is read as this model's. Unpinned, the solver
+    # would CHOOSE this checkpoint's cut from 27B rates: refused by name.
+    _foreign_rates = foreign_cut_rates(ns, model)
+    if _foreign_rates is not None:
+        # The attention split is solved from the same rates when only the
+        # layer cut is pinned (best_attention_split), so BOTH count as the pin.
+        if not (getattr(ns, "pp_layer_set", None)
+                or (getattr(ns, "pp_stage_ratio", None)
+                    and getattr(ns, "pp_attn_stage_ratio", None))):
+            raise Weg2LaunchRefused(
+                f"W40 Weg2PPCutRefused: PP-CUT RATES FOREIGN-MODEL -- {_foreign_rates}; an "
+                f"UNPINNED solve would choose this checkpoint's layer cut from another "
+                f"model's rates. Pin the cut (--pp-stage-ratio/--pp-attn-stage-ratio; the "
+                f"'{_power.CUT_MARKER}' line above names this checkpoint's own recommended "
+                f"cut where its stage rates are measured) or pass rates measured on it."
+            )
+        log(f"PP-CUT RATES FOREIGN-MODEL (H94): {_foreign_rates}. The cut is PINNED, so "
+            f"they rank nothing; the family-split, FRONTIER and trade lines below are priced "
+            f"on {CUT_RATES_MODEL_FAMILY} rates and are NOT this checkpoint's.")
     # The KV cell is CONSUMED from config, never fitted (#704 D1).
     kv_mib = _pp_cut.kv_mib_per_token_per_attn_layer_from_config(
         cfg, "fp8_e4m3", n_layers
@@ -12445,7 +12567,9 @@ def solve_p_cut(
         per_pair_crossing_ms=pair_ms,
         pinned_layer_set=ns.pp_layer_set or None,
         measured_provenance=(
-            "MEASURED per-layer ms %s (boot bsscale, BSSCALE_0907.md tip "
+            ("FOREIGN-MODEL (H94: measured on %s, not this checkpoint) " % CUT_RATES_MODEL_FAMILY
+             if _foreign_rates is not None else "")
+            + "MEASURED per-layer ms %s (boot bsscale, BSSCALE_0907.md tip "
             "37c884b0b0: PP0 259.1 ms/32 layers, PP1 632.9/18, PP2 470.2/14, "
             "per full 4096-token chunk at bs6)" % ns.pp_cut_measured_ms_per_layer
         ),
@@ -14476,7 +14600,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for _ln in _l2_lines:
         log(_ln)
     # 0 = derive (the flag's default is the 4096 pin since 2026-09-15).
-    x_seed = resolve_x(ns.tp_prefill_max_tokens or None, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS)
+    x_seed = resolve_x(ns.tp_prefill_max_tokens or None, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS,
+                       accept=calib_log_accept,
+                       model=ns.model if calib_log_accept is not None else None)
     x_tokens, x_provenance = x_seed.tokens, x_seed.provenance
     # H84: D's riegel and the front's live-X ceiling, one number (0 = off).
     d_x_tokens, front_x_ceiling, x_ceiling_line = resolve_x_ceiling(ns.x_ceiling_tokens, x_tokens)
@@ -14686,9 +14812,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "CORRIDOR-FLOOR line and infer the ordering from it; after this line "
         "nobody has to."
     )
+    # H94: the overshoot of THIS checkpoint (record -> built-in -> named 0).
+    _overshoot_p = awake_overshoot_for("P", cards, ns.model, log, accept=calib_sample_accept)
     budgets_p = budgets_from_dc(
-        cards, dc_expect_d, log, "P", overshoot_mib=P_OVERSHOOT_MIB,
-        overshoot_provenance="boot weg2ls2b2",
+        cards, dc_expect_d, log, "P", overshoot_mib=list(_overshoot_p.mib),
+        overshoot_provenance=_overshoot_p.provenance,
         user_reserve_by_card=user_reserve_by_card,
     )
     state.budgets["P"] = budgets_p
@@ -15892,7 +16020,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return int(spec_d.proc.returncode or 0)
     launch_group(spec_p, tree, log, dry)
     if dry:
-        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card)
+        # H94: the dry pass charges the SAME resolved D overshoot the real D
+        # pass below charges -- before H94 it charged none, so the gate's D
+        # budget sat 489 MiB above the boot's on the 5090 and no dry-run ever
+        # printed which overshoot the boot would take.
+        _overshoot_d = awake_overshoot_for("D", cards, ns.model, log, accept=calib_sample_accept)
+        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", overshoot_mib=list(_overshoot_d.mib), overshoot_provenance=_overshoot_d.provenance, corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card)
         # #145 AN BEIDEN STELLEN -- siehe #114 direkt darunter: es gibt ZWEI
         # Stellen, an denen budgets_d entsteht, und eine Fassung, die nur die
         # untere trifft, fehlt genau im Dry-Run, wo das Gate sie sucht.
@@ -16003,8 +16136,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.dc_measured_p = dc_p
 
     # 5. group D
+    _overshoot_d = awake_overshoot_for("D", cards, ns.model, log, accept=calib_sample_accept)
     budgets_d = budgets_from_dc(
-        cards, dc_p, log, "D", overshoot_mib=D_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls4b1",
+        cards, dc_p, log, "D", overshoot_mib=list(_overshoot_d.mib),
+        overshoot_provenance=_overshoot_d.provenance,
         corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
         user_reserve_by_card=user_reserve_by_card,
     )
