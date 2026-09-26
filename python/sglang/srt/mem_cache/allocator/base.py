@@ -215,6 +215,23 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         scheduler thread)."""
         self._free_listeners.append((on_free, on_clear))
 
+    def register_alias_listener(self, on_alias) -> None:
+        """Subscribe to radix DEDUP events: ``on_alias(src, dst)`` is called
+        right BEFORE the tree frees the duplicate slots ``src`` because it
+        keeps its own slots ``dst`` (same tokens, element-wise) instead.
+        Only the DFlash window pool's draft-row carry subscribes
+        (SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY); nobody subscribed = no call."""
+        if not hasattr(self, "_alias_listeners"):
+            self._alias_listeners = []
+        self._alias_listeners.append(on_alias)
+
+    def has_alias_listeners(self) -> bool:
+        return bool(getattr(self, "_alias_listeners", None))
+
+    def notify_alias(self, src, dst) -> None:
+        for on_alias in getattr(self, "_alias_listeners", ()):
+            on_alias(src, dst)
+
     def _notify_free(self, free_index) -> None:
         # getattr: subclasses may clear() from __init__ before the base
         # __init__ ran (defensive; the token allocator initializes in order).

@@ -254,6 +254,11 @@ class Envs:
     # is not held behind the verify (dflash_solo_pool sync-free mode). Off =
     # the legacy mapper, byte-identical.
     SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE = EnvBool(False)
+    # DFLASH window pool, radix-dedup draft-row carry (27b-draftholes 26.09.):
+    # when an insert frees a request's fresh KV slots in favour of the tree's
+    # own (same tokens), move the draft rows the fresh slots hold to the kept
+    # slots instead of dropping them. Off = no alias listener, byte-identical.
+    SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY = EnvBool(False)
     # DFLASH decode round, stage 2 of the host-sync removal: plan the draft
     # and the uneven-DCP target verify with HOST-known FlashInfer metadata so
     # the host never waits for the draft forward (owner.py compact[owned] /

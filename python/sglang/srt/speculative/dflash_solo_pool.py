@@ -211,6 +211,8 @@ class DraftKVSlotMapper:
         self.reclaim_events = 0
         self.reclaimed_slots_total = 0
         self._holes_logged_at = 0
+        # Draft rows carried across radix dedup (on_global_alias); device.
+        self._alias_carried = torch.zeros(1, dtype=torch.int64, device=device)
         # Sync-free mode (class docstring). Off: nothing below is allocated
         # and every method runs its legacy body unchanged.
         self.sync_free = bool(sync_free)
@@ -402,6 +404,22 @@ class DraftKVSlotMapper:
             # Clone: the allocator may go on to cat/mutate its tensors.
             self._pending_free.append(free_index.detach().clone())
 
+    def on_global_alias(self, src: torch.Tensor, dst: torch.Tensor) -> None:
+        """Radix dedup (allocator alias listener, scheduler thread; enqueue
+        only): the tree keeps its slots ``dst`` and is about to free the
+        request's fresh duplicates ``src``. Queued IN ORDER with the frees,
+        so the drain carries the draft rows ``src`` holds over to ``dst``
+        before the free of ``src`` is applied (SGLANG_DFLASH_WINDOW_POOL_
+        DEDUP_CARRY). Never registered without the switch."""
+        if src is None or dst is None or src.numel() == 0:
+            return
+        if src.numel() != dst.numel():
+            return  # not an element-wise pairing; the free stays as it was
+        with self._pending_lock:
+            self._pending_free.append(
+                ("alias", src.detach().clone(), dst.detach().clone())
+            )
+
     def on_global_clear(self) -> None:
         with self._pending_lock:
             self._pending_free.clear()
@@ -421,7 +439,45 @@ class DraftKVSlotMapper:
             self._reset()
             return
         for idx in pending:
-            self._apply_free(idx)
+            if isinstance(idx, tuple):
+                self._apply_alias(idx[1], idx[2])
+            else:
+                self._apply_free(idx)
+
+    def _apply_alias(self, src: torch.Tensor, dst: torch.Tensor) -> None:
+        """Move the draft slot of each fresh ``src`` to its kept ``dst`` when
+        ``dst`` has none: map[dst] := map[src], map[src] := -1, reverse map
+        follows. Where ``dst`` already has a row (or ``src`` has none) nothing
+        moves and the following free of ``src`` recycles as before. Fixed-shape
+        device math, no host read (safe on the sync-free hot path); the free
+        count is untouched (a slot changes owner, none is allocated)."""
+        dev = self.map.device
+        s = src.to(device=dev, dtype=torch.int64).reshape(-1)
+        d = dst.to(device=dev, dtype=torch.int64).reshape(-1)
+        ok = (s > 0) & (s <= self.num_global_slots) & (d > 0) & (d <= self.num_global_slots)
+        zero = torch.zeros_like(s)
+        s_safe = torch.where(ok, s, zero)
+        d_safe = torch.where(ok, d, zero)
+        ms = self.map[s_safe].to(torch.int64)
+        md = self.map[d_safe].to(torch.int64)
+        take = ok & (ms > 0) & (md < 0)
+        # Non-taking entries write harmless constants: map[0] := 0 (always 0)
+        # and the hole slot's reverse entry := -1 (always -1).
+        self.map.index_put_(
+            (torch.where(take, d_safe, zero),),
+            torch.where(take, ms, zero).to(self.map.dtype),
+        )
+        self.map.index_put_(
+            (torch.where(take, s_safe, zero),),
+            torch.where(take, torch.full_like(ms, -1), zero).to(self.map.dtype),
+        )
+        self._slot_global.index_put_(
+            (torch.where(take, ms, zero),),
+            torch.where(take, d_safe, torch.full_like(d_safe, -1)),
+        )
+        # Observability without a host read: summed on the device, read by
+        # stats() (a diagnostic sync, never on the decode path).
+        self._alias_carried.add_(take.sum())
 
     def _reset(self) -> None:
         self.map.fill_(-1)
@@ -759,6 +815,7 @@ class DraftKVSlotMapper:
             "holes_read_total": self.holes_read_total,
             "reclaim_events": self.reclaim_events,
             "reclaimed_slots_total": self.reclaimed_slots_total,
+            "alias_carried_total": int(self._alias_carried.sum().item()),
         }
 
 

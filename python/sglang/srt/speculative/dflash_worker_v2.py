@@ -1211,6 +1211,29 @@ class DFlashWorkerV2(BaseSpecWorker):
         token_to_kv_pool_allocator.register_free_listener(
             mapper.on_global_free, mapper.on_global_clear
         )
+        # SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY (default off): a D prefill of a
+        # span the radix already holds (e.g. past a mamba-refused match) writes
+        # its draft rows to FRESH slots, and the insert then frees those in
+        # favour of the tree's older slots, which carry no draft row -- the
+        # computed draft KV is thrown away and the window reads zero holes.
+        # With the switch the dedup hands each fresh draft row to the kept
+        # slot instead (dflash_solo_pool.DraftKVSlotMapper._apply_alias).
+        if self._window_pool and envs.SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY.get():
+            if hasattr(token_to_kv_pool_allocator, "register_alias_listener"):
+                token_to_kv_pool_allocator.register_alias_listener(
+                    mapper.on_global_alias
+                )
+                logger.info(
+                    "DFLASH window pool: DEDUP-CARRY armed "
+                    "(SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY=1) -- radix dedup "
+                    "moves the fresh draft rows to the kept slots."
+                )
+            else:
+                logger.warning(
+                    "DFLASH window pool: SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY=1 "
+                    "but allocator %s has no alias listener; carry NOT armed.",
+                    type(token_to_kv_pool_allocator).__name__,
+                )
         logger.info(
             "DFLASH small solo draft pool ACTIVE: ctx cap %d (%s), "
             "%d draft slots (= 1 + (cap %d + block %d) x max_running %d x "
