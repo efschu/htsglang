@@ -28,6 +28,22 @@
 //  MODE 1 "xpose" (M <= 48): m16n8k16 per block, the 8 columns are 8 tokens. The quad transposes its 16-B row
 //     segments in registers (4 PRMT + 4 SHFL per row) so lane p holds elements 4p..4p+3 of every block; the
 //     activation comes in a permuted layout from the quantiser (lane-contiguous). 8 mma per n-tile per segment.
+//
+// FUSED activation quantisation (row 25 of the fLLiper release table, opt-in SGLANG_W4A8_DECODE_FUSED_QUANT=1, only
+// compiled with -DSGL_W4A8_DEC_FUSED, i.e. in the separate JIT module nvfp4_w4a8_decode_fused_sm86): the GEMV
+// quantises the bf16 activation itself instead of a separate quant launch before it (measured 25.09. in CUDA
+// graphs: "full" - "gemm" = 2.0-3.5 us per call on the 27B D shapes, 10-15 % of D.down). Protocol, per launch:
+//   (1) every CTA issues its first weight/scale loads (they never touch the activation);
+//   (2) rows are CLAIMED through sem[0] (atomicAdd) by whichever CTAs arrive first -- normally one row each -- and
+//       quantised with arithmetic identical to w4a8_dec_quant_kernel (bit for bit), then published (red.release on
+//       sem[1]). Claiming instead of a static owner is what makes the hand-over deadlock free: a CTA only waits for
+//       rows held by running CTAs that do not wait themselves (a static owner may never get a slot);
+//   (3) thread 0 polls sem[1] (relaxed) until it reaches M, one fence.acq_rel, bar.sync -- the activation is read
+//       with COHERENT loads from here on (ld.global, never .nc: it was written inside this kernel);
+//   (4) the CTA that finishes last (atomicAdd sem[2]) resets sem[0..2] to 0 for the next launch in stream order.
+// Row tiles, stagger and accumulation order are those of the unfused kernel (blockIdx), so the output is
+// bit-identical to quant + GEMM. sem must not be shared by two launches that may run concurrently:
+// the Python side keys it by (device, weight pointer, stream).
 
 #pragma once
 
@@ -36,6 +52,7 @@
 
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <type_traits>
 
 namespace device::nvfp4_w4a8_dec {
 
@@ -58,6 +75,20 @@ struct DecParams {
   int rw;       // row tiles per CTA (their warps read the same segments -> activation hits in L1)
   int n_tiles;  // row tiles in total (ceil128(Nw) / 16)
 };
+
+// FUSED kernel parameters (see the header): bf16 activation [M, ldxb] (K == Kp columns), quantised into xq_w / xs_w
+// (the same buffers as xq / xs) by the CTAs that claim its rows; sem[0] rows claimed, sem[1] rows published, sem[2]
+// CTAs done. A separate type, so the unfused kernels keep their parameter block (and their code) unchanged.
+struct FusedDecParams : DecParams {
+  const __nv_bfloat16* xb16;
+  int ldxb;
+  int8_t* xq_w;
+  float* xs_w;
+  unsigned int* sem;
+};
+
+template <bool FUSED>
+using DecParamsT = typename std::conditional<FUSED, FusedDecParams, DecParams>::type;
 
 // Weights are streamed exactly once: L1 no-allocate and L2 evict-first, so the stream does not push the
 // activation (read by every CTA, M*K bytes) and the shared scale granules out of the 5 MB L2 (measured without
@@ -95,6 +126,23 @@ __device__ __forceinline__ uint4 ldg_nc16(const void* p) {
   uint4 r;
   asm("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
   return r;
+}
+
+// Activation load: read-only (.nc, L2 evict-last) in the unfused kernel. In the FUSED kernel the activation is written
+// inside the same launch, so it must be a COHERENT load (no .nc) and must not be hoisted above the semaphore wait
+// (volatile + memory clobber).
+template <bool FUSED>
+__device__ __forceinline__ uint4 ldg_act16(const void* p, uint64_t pol) {
+  if constexpr (FUSED) {
+    uint4 r;
+    asm volatile("ld.global.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;\n"
+                 : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+                 : "l"(p), "l"(pol)
+                 : "memory");
+    return r;
+  } else {
+    return ldg_keep16(p, pol);
+  }
 }
 
 // 4 packed E2M1 codes (low 16 bits, nibble i = element i) -> 4 int8 = 2 * e2m1 (identical to N4A's helper).
@@ -165,10 +213,127 @@ __device__ __forceinline__ void reduce_store(const DecParams& p, const float* re
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// FUSED activation quantisation (protocol in the header)
+// ---------------------------------------------------------------------------------------------------------------
+// One activation row, the whole CTA (blockDim.x a multiple of 32, <= 256). Arithmetic identical to
+// w4a8_dec_quant_kernel (= N4A's quantiser = per_token_quant_int8): the max is exact in any order, the rest is the
+// same per-element expression, so int8 values and the scale are bit-identical to the separate quant launch.
+template <bool PERM>
+__device__ __forceinline__ void fused_quant_row(const DecParamsT<true>& p, int row) {
+  __shared__ float s_red[8];
+  const int K = p.nseg * 128;
+  const __nv_bfloat16* xr = p.xb16 + static_cast<long long>(row) * p.ldxb;
+  int8_t* qr = p.xq_w + static_cast<long long>(row) * p.ldx;
+  const int nthr = blockDim.x;
+  float amax = 0.f;
+  for (int k = threadIdx.x * 8; k < K; k += nthr * 8) {
+    const uint4 v = *reinterpret_cast<const uint4*>(xr + k);
+    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&v);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 f = __bfloat1622float2(h[j]);
+      amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
+    }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+  if ((threadIdx.x & 31) == 0) s_red[threadIdx.x >> 5] = amax;
+  __syncthreads();
+  float v = 0.f;
+  for (int w = 0; w < (nthr >> 5); ++w) v = fmaxf(v, s_red[w]);
+  amax = fmaxf(v, 1e-10f);
+  const float inv = __fdiv_rn(127.f, amax);
+  if (threadIdx.x == 0) p.xs_w[row] = __fdiv_rn(amax, 127.f);
+  for (int k = threadIdx.x * 8; k < K; k += nthr * 8) {
+    const uint4 xv = *reinterpret_cast<const uint4*>(xr + k);
+    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&xv);
+    uint32_t w[2];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 f = __bfloat1622float2(h[j]);
+      const int q0 = static_cast<int>(roundf(__fmul_rn(f.x, inv)));
+      const int q1 = static_cast<int>(roundf(__fmul_rn(f.y, inv)));
+      const uint32_t pair = (static_cast<uint32_t>(q0) & 0xFFu) | ((static_cast<uint32_t>(q1) & 0xFFu) << 8);
+      if (j & 1)
+        w[j >> 1] |= pair << 16;
+      else
+        w[j >> 1] = pair;
+    }
+    if constexpr (PERM) {
+      const int seg = k >> 7, kk = k & 127, b = kk >> 4, pp = (kk & 15) >> 2;
+      int8_t* base = qr + seg * 128 + 4 * b;
+      *reinterpret_cast<uint32_t*>(base + 32 * pp) = w[0];
+      *reinterpret_cast<uint32_t*>(base + 32 * (pp + 1)) = w[1];
+    } else {
+      *reinterpret_cast<uint2*>(qr + k) = make_uint2(w[0], w[1]);
+    }
+  }
+  __syncthreads();  // s_red is reused by the next row of this CTA
+}
+
+// Rows are CLAIMED (atomicAdd sem[0]), not assigned: a CTA only ever waits for rows that a running CTA has claimed
+// and is quantising without waiting itself, so the hand-over cannot deadlock however few CTAs are resident (a static
+// assignment -- by blockIdx or by arrival ticket -- can: the owner of a missing row may never get a slot). Normally
+// the first M CTAs to arrive take one row each; every later CTA sees sem[0] >= M with one relaxed load and skips.
+template <bool PERM>
+__device__ __forceinline__ void fused_quant_claimed_rows(const DecParamsT<true>& p) {
+  __shared__ int s_row;
+  unsigned int rows = 0;
+  for (;;) {
+    if (threadIdx.x == 0) {
+      int r = p.M;
+      unsigned int seen;
+      asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];\n" : "=r"(seen) : "l"(p.sem) : "memory");
+      if (seen < static_cast<unsigned int>(p.M)) r = static_cast<int>(atomicAdd(p.sem, 1u));
+      s_row = r;
+    }
+    __syncthreads();
+    const int r = s_row;
+    __syncthreads();  // s_row is rewritten by the next claim
+    if (r >= p.M) break;
+    fused_quant_row<PERM>(p, r);
+    ++rows;
+  }
+  if (rows != 0 && threadIdx.x == 0) {
+    // fused_quant_row ended on bar.sync, so every store of the CTA is ordered before this release (cumulativity)
+    asm volatile("red.release.gpu.global.add.u32 [%0], %1;\n" : : "l"(p.sem + 1), "r"(rows) : "memory");
+  }
+}
+
+__device__ __forceinline__ void fused_wait(const DecParamsT<true>& p) {
+  if (threadIdx.x == 0) {
+    const unsigned int want = static_cast<unsigned int>(p.M);
+    unsigned int v;
+    for (;;) {  // relaxed polls (an acquire per poll would invalidate the SM's L1 every time)
+      asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(p.sem + 1) : "memory");
+      if (v >= want) break;
+      __nanosleep(32);
+    }
+    asm volatile("fence.acq_rel.gpu;\n" : : : "memory");  // acquire side of the publishers' release
+  }
+  __syncthreads();
+}
+
+// The last CTA to finish resets the semaphore for the next launch: when the done count reaches nctas, every claim
+// is made and every wait has returned (thread 0's poll completed before its own done increment, program order after
+// the acquire fence). No fence here: nothing this CTA wrote is read through the semaphore, and the next launch is
+// ordered by the kernel boundary.
+__device__ __forceinline__ void fused_done(const DecParamsT<true>& p, int nctas) {
+  if (threadIdx.x == 0) {
+    const unsigned int d = atomicAdd(p.sem + 2, 1u);
+    if (d == static_cast<unsigned int>(nctas - 1)) {
+      atomicExch(p.sem, 0u);
+      atomicExch(p.sem + 1, 0u);
+      atomicExch(p.sem + 2, 0u);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // MODE 0: M <= MT (MT <= 8), block-diagonal B on m16n8k32
 // ---------------------------------------------------------------------------------------------------------------
-template <int MT, int U>
-__global__ void __launch_bounds__(256) w4a8_dec_diag_kernel(const DecParams p) {
+template <int MT, int U, bool FUSED>
+__global__ void __launch_bounds__(256) w4a8_dec_diag_kernel(const DecParamsT<FUSED> p) {
   extern __shared__ float red[];
   const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
   const int g = lane >> 2, q = lane & 3;
@@ -219,7 +384,7 @@ __global__ void __launch_bounds__(256) w4a8_dec_diag_kernel(const DecParams p) {
 #pragma unroll
     for (int m = 0; m < MT; ++m) {
       xv[m] = make_uint4(0, 0, 0, 0);
-      if (act && m < p.M) xv[m] = ldg_keep16(xb + static_cast<long long>(m) * p.ldx + sg * 128, pol_x);
+      if (act && m < p.M) xv[m] = ldg_act16<FUSED>(xb + static_cast<long long>(m) * p.ldx + sg * 128, pol_x);
     }
     // A fragments: j-th 32-bit word of each row = 8 elements; low 16 bits -> k-lo slots, high -> k-hi slots
     const uint32_t wa[4] = {f.a.x, f.a.y, f.a.z, f.a.w};
@@ -255,6 +420,10 @@ __global__ void __launch_bounds__(256) w4a8_dec_diag_kernel(const DecParams p) {
   Buf cur[U], nxt[U];
 #pragma unroll
   for (int u = 0; u < U; ++u) load_seg(warp * U + u, cur[u]);
+  if constexpr (FUSED) {  // the first weight loads are in flight while the activation rows are quantised
+    fused_quant_claimed_rows<false>(p);
+    fused_wait(p);
+  }
   for (int c = warp; c * U < p.nseg; c += p.kw) {
 #pragma unroll
     for (int u = 0; u < U; ++u) load_seg((c + p.kw) * U + u, nxt[u]);
@@ -279,6 +448,7 @@ __global__ void __launch_bounds__(256) w4a8_dec_diag_kernel(const DecParams p) {
     }
   }
   reduce_store<MT>(p, red, T0, 0);
+  if constexpr (FUSED) fused_done(p, static_cast<int>(gridDim.x));
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -305,8 +475,8 @@ __device__ __forceinline__ void quad_transpose(const uint32_t (&Y)[4], uint32_t 
   }
 }
 
-template <int NT, int U>
-__global__ void __launch_bounds__(256) w4a8_dec_xpose_kernel(const DecParams p) {
+template <int NT, int U, bool FUSED>
+__global__ void __launch_bounds__(256) w4a8_dec_xpose_kernel(const DecParamsT<FUSED> p) {
   constexpr int MT = NT * 8;
   extern __shared__ float red[];
   const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
@@ -360,8 +530,8 @@ __global__ void __launch_bounds__(256) w4a8_dec_xpose_kernel(const DecParams p) 
       uint4 lo = make_uint4(0, 0, 0, 0), hi = lo;
       if (m < p.M) {
         const int8_t* src = xb + static_cast<long long>(m) * p.ldx + sg * 128;
-        lo = ldg_keep16(src, pol_x);
-        hi = ldg_keep16(src + 16, pol_x);
+        lo = ldg_act16<FUSED>(src, pol_x);
+        hi = ldg_act16<FUSED>(src + 16, pol_x);
       }
       xw[n][0] = lo.x; xw[n][1] = lo.y; xw[n][2] = lo.z; xw[n][3] = lo.w;
       xw[n][4] = hi.x; xw[n][5] = hi.y; xw[n][6] = hi.z; xw[n][7] = hi.w;
@@ -402,6 +572,10 @@ __global__ void __launch_bounds__(256) w4a8_dec_xpose_kernel(const DecParams p) 
   Buf cur[U], nxt[U];
 #pragma unroll
   for (int u = 0; u < U; ++u) load_seg(warp * U + u, cur[u]);
+  if constexpr (FUSED) {  // the first weight loads are in flight while the activation rows are quantised
+    fused_quant_claimed_rows<true>(p);
+    fused_wait(p);
+  }
   for (int c = warp; c * U < p.nseg; c += p.kw) {
 #pragma unroll
     for (int u = 0; u < U; ++u) load_seg((c + p.kw) * U + u, nxt[u]);
@@ -420,6 +594,7 @@ __global__ void __launch_bounds__(256) w4a8_dec_xpose_kernel(const DecParams p) 
     red[(wid * MT + mm + 1) * 16 + g + 8] = acc[n][3];
   }
   reduce_store<MT>(p, red, T0, m0);
+  if constexpr (FUSED) fused_done(p, static_cast<int>(gridDim.x * gridDim.y));
 }
 
 // bf16 [M, K] -> int8 (natural [M, ldq] or segment-permuted) + fp32 scale [M]; arithmetic identical to N4A's
@@ -489,34 +664,43 @@ namespace host::nvfp4_w4a8_dec {
 
 using namespace device::nvfp4_w4a8_dec;
 
-template <int MT, int U>
-inline void launch_diag(const DecParams& p, DLDevice device) {
+template <int MT, int U, bool FUSED>
+inline void launch_diag(const DecParamsT<FUSED>& p, DLDevice device) {
   const int smem = p.rw * p.kw * MT * 16 * 4;
   host::LaunchKernel(dim3((p.n_tiles + p.rw - 1) / p.rw), dim3(p.rw * p.kw * 32), device, smem)(
-      w4a8_dec_diag_kernel<MT, U>, p);
+      w4a8_dec_diag_kernel<MT, U, FUSED>, p);
 }
-template <int NT, int U>
-inline void launch_xpose(const DecParams& p, DLDevice device) {
+template <int NT, int U, bool FUSED>
+inline void launch_xpose(const DecParamsT<FUSED>& p, DLDevice device) {
   const int smem = p.rw * p.kw * NT * 8 * 16 * 4;
   host::LaunchKernel(dim3((p.n_tiles + p.rw - 1) / p.rw, (p.M + NT * 8 - 1) / (NT * 8)), dim3(p.rw * p.kw * 32),
-                     device, smem)(w4a8_dec_xpose_kernel<NT, U>, p);
+                     device, smem)(w4a8_dec_xpose_kernel<NT, U, FUSED>, p);
 }
 
-template <int U>
-inline void dispatch_u(int mode, const DecParams& p, DLDevice device) {
+template <int U, bool FUSED>
+inline void dispatch_u(int mode, const DecParamsT<FUSED>& p, DLDevice device) {
   if (mode == 0) {
-    if (p.M <= 1) return launch_diag<1, U>(p, device);
-    if (p.M <= 2) return launch_diag<2, U>(p, device);
-    if (p.M <= 4) return launch_diag<4, U>(p, device);
-    return launch_diag<8, U>(p, device);
+    if (p.M <= 1) return launch_diag<1, U, FUSED>(p, device);
+    if (p.M <= 2) return launch_diag<2, U, FUSED>(p, device);
+    if (p.M <= 4) return launch_diag<4, U, FUSED>(p, device);
+    return launch_diag<8, U, FUSED>(p, device);
   }
   switch ((p.M + 7) / 8) {
-    case 1: return launch_xpose<1, U>(p, device);
-    case 2: return launch_xpose<2, U>(p, device);
-    case 3: return launch_xpose<3, U>(p, device);
-    case 4: return launch_xpose<4, U>(p, device);
-    case 5: return launch_xpose<5, U>(p, device);
-    default: return launch_xpose<6, U>(p, device);
+    case 1: return launch_xpose<1, U, FUSED>(p, device);
+    case 2: return launch_xpose<2, U, FUSED>(p, device);
+    case 3: return launch_xpose<3, U, FUSED>(p, device);
+    case 4: return launch_xpose<4, U, FUSED>(p, device);
+    case 5: return launch_xpose<5, U, FUSED>(p, device);
+    default: return launch_xpose<6, U, FUSED>(p, device);
+  }
+}
+
+template <bool FUSED>
+inline void dispatch(int64_t u, int mode, const DecParamsT<FUSED>& p, DLDevice device) {
+  switch (u) {
+    case 1: return dispatch_u<1, FUSED>(mode, p, device);
+    case 2: return dispatch_u<2, FUSED>(mode, p, device);
+    default: return dispatch_u<4, FUSED>(mode, p, device);
   }
 }
 
@@ -524,7 +708,10 @@ inline void dispatch_u(int mode, const DecParams& p, DLDevice device) {
 
 // out bf16 [M, >= n_out]; xq int8 [M, Kp] (mode 0 natural, mode 1 permuted); xs fp32 [M]; weight u8 [Nw, Kp/2];
 // wscale e4m3/u8 [ceil128(Nw), Ks] contiguous or tile view [ceil128(Nw)/128, Ks*128]; gscale fp32 [1].
-inline void nvfp4_w4a8_decode_gemm(
+namespace host::nvfp4_w4a8_dec {
+
+// Validation + launch parameters shared by the unfused and the FUSED entry point.
+inline DecParams make_dec_params(
     tvm::ffi::TensorView out,
     tvm::ffi::TensorView xq,
     tvm::ffi::TensorView xs,
@@ -535,9 +722,9 @@ inline void nvfp4_w4a8_decode_gemm(
     int64_t mode,
     int64_t kw,
     int64_t rw,
-    int64_t u) {
+    int64_t u,
+    DLDevice* device_out) {
   using namespace host;
-  using namespace host::nvfp4_w4a8_dec;
 
   SymbolicDevice dev;
   dev.set_options<kDLCUDA>();
@@ -600,14 +787,79 @@ inline void nvfp4_w4a8_decode_gemm(
   p.n_tiles = static_cast<int>(tiles128 * 8);
   p.kw = static_cast<int>(kw);
   p.rw = static_cast<int>(rw);
-  const DLDevice device = dev.unwrap();
-  switch (u) {
-    case 1: return dispatch_u<1>(static_cast<int>(mode), p, device);
-    case 2: return dispatch_u<2>(static_cast<int>(mode), p, device);
-    default: return dispatch_u<4>(static_cast<int>(mode), p, device);
-  }
+  *device_out = dev.unwrap();
+  return p;
 }
 
+}  // namespace host::nvfp4_w4a8_dec
+
+#ifndef SGL_W4A8_DEC_FUSED
+inline void nvfp4_w4a8_decode_gemm(
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView xq,
+    tvm::ffi::TensorView xs,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView wscale,
+    tvm::ffi::TensorView gscale,
+    int64_t n_out,
+    int64_t mode,
+    int64_t kw,
+    int64_t rw,
+    int64_t u) {
+  using namespace host::nvfp4_w4a8_dec;
+  DLDevice device;
+  const DecParams p = make_dec_params(out, xq, xs, weight, wscale, gscale, n_out, mode, kw, rw, u, &device);
+  dispatch<false>(u, static_cast<int>(mode), p, device);
+}
+#endif  // !SGL_W4A8_DEC_FUSED
+
+#ifdef SGL_W4A8_DEC_FUSED
+// FUSED entry point (module nvfp4_w4a8_decode_fused_sm86 only): x bf16 [M, Kp] is quantised inside the GEMV into the
+// workspace xq int8 [M, Kp] (layout of `mode`) / xs fp32 [M]; sem int32 [>= 3] is zero between launches (the kernel
+// resets it) and must not be shared by launches that can run concurrently.
+inline void nvfp4_w4a8_decode_fused_gemm(
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView x,
+    tvm::ffi::TensorView xq,
+    tvm::ffi::TensorView xs,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView wscale,
+    tvm::ffi::TensorView gscale,
+    tvm::ffi::TensorView sem,
+    int64_t n_out,
+    int64_t mode,
+    int64_t kw,
+    int64_t rw,
+    int64_t u) {
+  using namespace host;
+  using namespace host::nvfp4_w4a8_dec;
+  DLDevice device;
+  FusedDecParams p{};
+  static_cast<DecParams&>(p) = make_dec_params(out, xq, xs, weight, wscale, gscale, n_out, mode, kw, rw, u, &device);
+  SymbolicDevice dev;
+  dev.set_options<kDLCUDA>();
+  SymbolicSize M{"M"}, K{"K"}, ldxb{"ldxb"}, S{"sem"};
+  TensorMatcher({M, K}).with_strides({ldxb, 1}).with_dtype<bf16_t>().with_device(dev).verify(x);
+  TensorMatcher({S}).with_dtype<int32_t>().with_device(dev).verify(sem);
+  RuntimeCheck(M.unwrap() == p.M, "x has ", M.unwrap(), " rows, xq ", p.M);
+  RuntimeCheck(K.unwrap() == static_cast<int64_t>(p.nseg) * 128, "x has ", K.unwrap(), " columns, needs Kp = ",
+               static_cast<int64_t>(p.nseg) * 128, " (no K padding in the fused kernel)");
+  RuntimeCheck(ldxb.unwrap() % 8 == 0, "x row stride must be a multiple of 8 elements");
+  RuntimeCheck(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0, "x must be 16-byte aligned");
+  RuntimeCheck(S.unwrap() >= 3, "sem needs >= 3 int32 counters");
+  RuntimeCheck(reinterpret_cast<uintptr_t>(sem.data_ptr()) % 4 == 0, "sem must be 4-byte aligned");
+  p.xb16 = static_cast<const __nv_bfloat16*>(x.data_ptr());
+  p.ldxb = static_cast<int>(ldxb.unwrap());
+  p.xq_w = static_cast<int8_t*>(xq.data_ptr());
+  p.xs_w = static_cast<float*>(xs.data_ptr());
+  p.sem = static_cast<unsigned int*>(sem.data_ptr());
+  dispatch<true>(u, static_cast<int>(mode), p, device);
+}
+#endif  // SGL_W4A8_DEC_FUSED
+
+
+
+#ifndef SGL_W4A8_DEC_FUSED
 inline void nvfp4_w4a8_decode_quant(
     tvm::ffi::TensorView x, tvm::ffi::TensorView xq, tvm::ffi::TensorView xs, int64_t permuted) {
   using namespace host;
@@ -637,3 +889,4 @@ inline void nvfp4_w4a8_decode_quant(
         static_cast<float*>(xs.data_ptr()));
   }
 }
+#endif  // !SGL_W4A8_DEC_FUSED

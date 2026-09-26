@@ -1,10 +1,12 @@
 """Build the sm_86 W4A8 NVFP4 JIT modules without a GPU (Docker image pre-build).
 
 Under ``--fp4-gemm-backend native-mixed`` every sm_8x rank computes the NVFP4 linears -- main model and NVFP4
-draft -- on two tvm-ffi JIT modules (user order 25.09. ~17:33Z):
+draft -- on two tvm-ffi JIT modules (three with the fused-quant switch) (user order 25.09. ~17:33Z):
 
 * ``nvfp4_w4a8_decode_sm86`` (``sglang.jit_kernel.nvfp4_w4a8_decode``, agent N4D): M <= 48;
-* ``nvfp4_w4a8_sm86``        (``sglang.jit_kernel.nvfp4_w4a8``, agent N4A): M > 48 and the activation quantiser.
+* ``nvfp4_w4a8_sm86``        (``sglang.jit_kernel.nvfp4_w4a8``, agent N4A): M > 48 and the activation quantiser;
+* ``nvfp4_w4a8_decode_fused_sm86`` (same Python module): the decode GEMV with the activation quantisation inside
+  (``SGLANG_W4A8_DECODE_FUSED_QUANT=1``, release table row 25) -- pre-built so that flipping the switch never compiles.
 
 Both are content-addressed under ``$TVM_FFI_CACHE_DIR`` (default ``~/.cache/tvm-ffi``). Built here with the
 image's own nvcc and the target forced to 8.6 (``override_jit_cuda_arch``), the first boot finds a complete entry
@@ -31,6 +33,7 @@ def _modules():
     return (
         ("nvfp4_w4a8_decode_sm86", nvfp4_w4a8_decode._jit_module),
         ("nvfp4_w4a8_sm86", nvfp4_w4a8._jit_nvfp4_w4a8_module),
+        ("nvfp4_w4a8_decode_fused_sm86", nvfp4_w4a8_decode._jit_fused_module),
     )
 
 

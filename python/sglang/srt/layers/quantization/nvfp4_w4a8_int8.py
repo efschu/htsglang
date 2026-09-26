@@ -16,7 +16,9 @@ Importing this module in a tree without the seam does nothing (the kernel itself
 Small M (decode, M <= ``SGLANG_W4A8_DECODE_MAX_M``, default 48) runs agent N4D's decode GEMV
 (``sglang.jit_kernel.nvfp4_w4a8_decode``) on the same bytes with the same arithmetic; larger M and shapes it does
 not take (K not a multiple of 128, K padding) run N4A's tiled GEMM. ``SGLANG_W4A8_DECODE_MAX_M=0`` turns the
-decode GEMV off. Both only ever run when native-mixed resolved ``w4a8_int8`` for the rank -- the
+decode GEMV off; ``SGLANG_W4A8_DECODE_FUSED_QUANT=1`` (default off, release table row 25) quantises the activation
+inside the decode GEMV instead of a separate launch (bit-identical output). Both only ever run when native-mixed
+resolved ``w4a8_int8`` for the rank -- the
 sm_8x default under ``--fp4-gemm-backend native-mixed`` (``SGLANG_FP4_NATIVE_MIXED_SM8X=marlin`` opts
 out); boots without native-mixed never import a kernel from here.
 """
