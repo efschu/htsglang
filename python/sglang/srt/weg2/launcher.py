@@ -1598,6 +1598,46 @@ def d_token_placement_env() -> Dict[str, str]:
     return {} if spec is None else {_dtp.ENV: spec.to_json()}
 
 
+#: --d-kv-evict-for-placement (27B row 24c, user 26.09.: "fertige requests
+#: oder vorherige requests muessen dann natuerlich den vram kvcache frei machen
+#: um die bestverteilung zu ermoeglichen"). weg2/d_kv_evict.py, DYN_D_RESHARD
+#: sec. 14: cold, L2-backed radix leaves are demoted copy-free (device free,
+#: node keeps its arena rows) so --d-token-placement bandwidth holds its
+#: shares at high fill; the group agrees in one fixed-shape MIN collective.
+#: 'off' (default) = no env, argv byte-identical.
+D_KV_EVICT_DEFAULT = "off"
+_D_KV_EVICT: Dict[str, object] = {"spec": None}
+
+
+def apply_d_kv_evict(ns) -> None:
+    from sglang.srt.weg2 import d_kv_evict as _dke
+
+    mode = str(getattr(ns, "d_kv_evict_for_placement", D_KV_EVICT_DEFAULT) or D_KV_EVICT_DEFAULT)
+    _D_KV_EVICT["spec"] = None
+    if mode not in ("off", "on"):
+        raise SystemExit(f"--d-kv-evict-for-placement {mode!r}: one of ['off', 'on']")
+    if mode == "off":
+        return
+    if _D_TOKEN_PLACEMENT.get("spec") is None:
+        raise SystemExit("--d-kv-evict-for-placement on: REFUSED without --d-token-placement bandwidth "
+                         "(it evicts FOR the bandwidth placement; under 'capacity' there is nothing to hold)")
+    try:
+        spec = _dke.EvictSpec(min_idle_s=float(getattr(ns, "d_kv_evict_min_idle_s", 20.0)),
+                              publish_max=int(getattr(ns, "d_kv_evict_publish_max", 8)))
+        spec.validate()
+    except (ValueError, _dke.EvictError) as exc:
+        raise SystemExit(f"--d-kv-evict-for-placement on: {exc}")
+    _D_KV_EVICT["spec"] = spec
+
+
+def d_kv_evict_env() -> Dict[str, str]:
+    """Group D's env for the placement eviction; {} under 'off'."""
+    from sglang.srt.weg2 import d_kv_evict as _dke
+
+    spec = _D_KV_EVICT.get("spec")
+    return {} if spec is None else {_dke.ENV: spec.to_json()}
+
+
 def spec_form_is_dflash() -> bool:
     return str(_SPEC_FORM["form"]) == "DFLASH"
 
@@ -12602,6 +12642,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only with --d-token-placement bandwidth: fall to capacity placement once the "
              "bandwidth target would fill a rank's class beyond this fraction (default 0.85).")
     ap.add_argument(
+        "--d-kv-evict-for-placement", choices=["off", "on"], default=D_KV_EVICT_DEFAULT,
+        help="Group D, only with --d-token-placement bandwidth (weg2/d_kv_evict.py, "
+             "DYN_D_RESHARD.md sec. 14): before the fill would push the placement to "
+             "capacity, cold radix leaves (no active reader, idle >= --d-kv-evict-min-idle-s) "
+             "whose KV is already in L2 on every D rank leave the device copy-free "
+             "(the class over its share first); cold un-backed decode tails are published "
+             "through the write stream first. One small group collective per 16 ticks; "
+             "the victim list is group-uniform, a disagreement is a crash-stop. "
+             "'off' (default) = no env, unchanged.")
+    ap.add_argument(
+        "--d-kv-evict-min-idle-s", type=float, default=20.0, metavar="S",
+        help="Only with --d-kv-evict-for-placement on: a radix leaf counts as cold after "
+             "this many seconds without access (group-agreed clock). Default 20.")
+    ap.add_argument(
+        "--d-kv-evict-publish-max", type=int, default=8, metavar="N",
+        help="Only with --d-kv-evict-for-placement on: cold un-backed leaves handed to the "
+             "publish sweep per pass (0 = evict only what is already in L2). Default 8.")
+    ap.add_argument(
         "--d-reshard", choices=["off", "wake", "live"], default=D_RESHARD_DEFAULT,
         help="Group D weight shards per load class (27B TP>1 uneven TP + uneven DCP only; "
              "weg2/d_reshard.py, DYN_D_RESHARD.md). 'off' (default) = today, argv and env "
@@ -13867,6 +13925,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # --d-reshard: before any argv; 'off' installs nothing.
     apply_d_reshard(ns)
     apply_d_token_placement(ns)
+    apply_d_kv_evict(ns)  # after the placement it requires
     # 27B line G2: the one tokenizer both groups load, installed before any
     # argv is built; its line is logged with the checkpoint lines under 1a'.
     tokenizer_line = apply_tokenizer_path(ns)
@@ -15318,6 +15377,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         env_d.update(store_short_tail_env(x_tokens, x_d_riegel))  # RC7-X
         env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
         env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
+        env_d.update(d_kv_evict_env())  # --d-kv-evict-for-placement: {} under 'off'
         spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
@@ -15421,6 +15481,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     env_d.update(store_short_tail_env(x_tokens, x_d_riegel))  # RC7-X
     env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
     env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
+    env_d.update(d_kv_evict_env())  # --d-kv-evict-for-placement: {} under 'off'
     spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, x_d_riegel, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
