@@ -124,7 +124,9 @@ no reference to a node or a tensor, and is off by default.
 from __future__ import annotations
 
 import dataclasses
+import os
 import threading
+from collections import OrderedDict
 from enum import Enum
 
 __all__ = [
@@ -271,6 +273,52 @@ def generation_history() -> tuple[tuple[int, str], ...]:
 
 _LEDGER_MAX = 1 << 19  # 524288 keys; the measured store held 24277 pages.
 
+#: KR 26.09. (boot n4h dkr27bnvfp4bar1mwh09261131, P->D flip after a 217,614-
+#: token prefill): THE FIFO EVICTION BELOW IS QUADRATIC AT THE CAP. It takes
+#: ``next(iter(d))`` and ``del``s it; CPython leaves the deleted slot as a hole
+#: at the FRONT of the dict's entry array, and ``next(iter(d))`` walks every
+#: hole before it finds a live key -- so each eviction costs O(evictions since
+#: the last resize). Desk measurement at the n4h state (467,649 keys noted,
+#: then the 217,614 adoptions of one completion, 161k of them evicting): 5.69 s
+#: on ONE thread, holding the scheduler thread inside
+#: ``check_prefetch_progress`` (via ``note_prefetch_adopted``) on every D rank
+#: -- the 6.3 s the kv resume sat unread in TP0's socket, and the "0.89 GB/s"
+#: of WEG2-LOAD-DEVICE (its clock stops after this). Below the cap the same
+#: adoption costs ~0.1 s, which is why the dr boots (548k at the 217k point,
+#: 24k evictions) showed 0.5 s and n4h/chunka (past the cap) 6.3/4.9 s.
+#: Armed (=1): the ledger becomes an OrderedDict on its first eviction and the
+#: oldest key leaves by ``popitem(last=False)`` -- O(1), same FIFO order, same
+#: contents, same readers. Default 0 = byte-identical to before.
+ENV_O1_EVICT = "SGLANG_WEG2_CENSUS_O1_EVICT"
+_o1_evict: bool | None = None
+
+
+def census_o1_evict_armed() -> bool:
+    """``SGLANG_WEG2_CENSUS_O1_EVICT=1``; read once per process (the census
+    is process-local; every rank of a group gets the same launcher env)."""
+    global _o1_evict
+    if _o1_evict is None:
+        _o1_evict = (os.environ.get(ENV_O1_EVICT, "0") or "0").strip() == "1"
+    return _o1_evict
+
+
+def _evict_oldest_o1(d: dict) -> dict:
+    """Remove the oldest-inserted key of ``d`` in O(1); returns the mapping to
+    keep (``d`` itself once it is an OrderedDict, else its one-time copy)."""
+    if not isinstance(d, OrderedDict):
+        d = OrderedDict(d)
+        # the witness that the switch reached the rank and the cap was hit
+        # (one line per ledger per process; the conversion is O(n) once).
+        import logging
+
+        logging.getLogger(__name__).info(
+            "KR CENSUS-O1-EVICT ledger at its cap (%d keys): FIFO eviction now "
+            "O(1) via OrderedDict (%s=1)", len(d), ENV_O1_EVICT)
+    if d:
+        d.popitem(last=False)
+    return d
+
+
 _ledger_lock = threading.Lock()
 _ledger: dict[str, int] = {}
 _ledger_dropped = 0
@@ -284,14 +332,17 @@ def note_store_write(key: str, generation: int) -> None:
     a cross-phase hit into ``unknown`` with no trace, and an unknown with no
     trace is the same lie as a plausible zero.
     """
-    global _ledger_dropped, _ledger_writes
+    global _ledger_dropped, _ledger_writes, _ledger
     if key is None or generation is None:
         return
     k = str(key)
     g = int(generation)
     with _ledger_lock:
         _ledger_writes += 1
-        if k not in _ledger and len(_ledger) >= _LEDGER_MAX:
+        if k not in _ledger and len(_ledger) >= _LEDGER_MAX and census_o1_evict_armed():
+            _ledger = _evict_oldest_o1(_ledger)  # KR: O(1) FIFO, see ENV_O1_EVICT
+            _ledger_dropped += 1
+        elif k not in _ledger and len(_ledger) >= _LEDGER_MAX:
             # FIFO on insertion order (py3.7+ dicts preserve it).
             try:
                 oldest = next(iter(_ledger))
@@ -395,23 +446,29 @@ def note_arrival(key: str) -> None:
     LATE for that walk. That is a real, separately actionable outcome and it
     is counted as its own term -- never as a plain miss and never as a hit.
     """
-    global _late_arrivals, _arrivals
     if key is None:
         return
-    k = str(key)
     with _order_lock:
-        _arrivals += 1
-        if _missed_consults.pop(k, 0):
-            _late_arrivals += 1
-        # #1061: remember the key itself (bounded), so `adoption_source_of`
-        # can answer PREFETCH for it later without a per-node carrier.
-        if k not in _arrived and len(_arrived) >= _LEDGER_MAX:
-            try:
-                oldest = next(iter(_arrived))
-                del _arrived[oldest]
-            except StopIteration:  # pragma: no cover - empty dict at the cap
-                pass
-        _arrived[k] = _arrived.get(k, 0) + 1
+        _note_arrival_locked(str(key))
+
+
+def _note_arrival_locked(k: str) -> None:
+    """The body of ``note_arrival``; the caller holds ``_order_lock``."""
+    global _late_arrivals, _arrivals, _arrived
+    _arrivals += 1
+    if _missed_consults.pop(k, 0):
+        _late_arrivals += 1
+    # #1061: remember the key itself (bounded), so `adoption_source_of`
+    # can answer PREFETCH for it later without a per-node carrier.
+    if k not in _arrived and len(_arrived) >= _LEDGER_MAX and census_o1_evict_armed():
+        _arrived = _evict_oldest_o1(_arrived)  # KR: O(1) FIFO, see ENV_O1_EVICT
+    elif k not in _arrived and len(_arrived) >= _LEDGER_MAX:
+        try:
+            oldest = next(iter(_arrived))
+            del _arrived[oldest]
+        except StopIteration:  # pragma: no cover - empty dict at the cap
+            pass
+    _arrived[k] = _arrived.get(k, 0) + 1
 
 
 def arrival_stats() -> dict[str, int]:
@@ -596,6 +653,8 @@ def reset_for_test() -> None:
     global _late_arrivals, _arrivals, _consults, _consult_misses
     global _dpc, _dpc_emitted, _dpc_suppressed, _dpc_over_bound_seen
     global _dpc_fence_pending, _dpc_fence_seed, _dpc_wave_emitted
+    global _o1_evict, _ledger, _arrived
+    _o1_evict = None
     _dpc = None
     _dpc_emitted = 0
     _dpc_suppressed = 0
@@ -614,12 +673,12 @@ def reset_for_test() -> None:
     with _gen_lock:
         _gen_phases.clear()
     with _ledger_lock:
-        _ledger.clear()
+        _ledger = {}
         _ledger_dropped = 0
         _ledger_writes = 0
     with _order_lock:
         _missed_consults.clear()
-        _arrived.clear()
+        _arrived = {}
         _late_arrivals = 0
         _arrivals = 0
         _consults = 0
@@ -837,6 +896,14 @@ def note_prefetch_adopted(keys) -> None:
     Disarmed -> records nothing.
     """
     if census_armed() <= 0 or not keys:
+        return
+    if census_o1_evict_armed():
+        # KR: ONE lock for the whole adoption (217k keys = 217k lock round
+        # trips on the scheduler thread otherwise); same per-key body.
+        with _order_lock:
+            for k in keys:
+                if k is not None:
+                    _note_arrival_locked(str(k))
         return
     for k in keys:
         note_arrival(k)
