@@ -505,13 +505,13 @@ NF_EXTRA = shlex.split('--max-total-tokens 262144 --json-model-override-args '
 def test_the_nf_arm_extra_passes_the_riegel_on_both_groups():
     from sglang.srt.weg2 import launcher as lz
 
-    lz._refuse_if_extra_drops_transient_override(lz.VISION_TRANSIENT, NF_EXTRA, "P")
-    lz._refuse_if_extra_drops_transient_override(lz.VISION_TRANSIENT, NF_EXTRA, "D")
+    lz._refuse_if_extra_drops_transient_lmo(lz.VISION_TRANSIENT, NF_EXTRA, "P")
+    lz._refuse_if_extra_drops_transient_lmo(lz.VISION_TRANSIENT, NF_EXTRA, "D")
     bad = ["--json-model-override-args", '{"rope_theta": 1}']
     with pytest.raises(lz.Weg2LaunchRefused, match="--extra-p"):
-        lz._refuse_if_extra_drops_transient_override(lz.VISION_TRANSIENT, bad, "P")
+        lz._refuse_if_extra_drops_transient_lmo(lz.VISION_TRANSIENT, bad, "P")
     # the LAST occurrence is the one argparse keeps
-    lz._refuse_if_extra_drops_transient_override(lz.VISION_TRANSIENT, bad + NF_EXTRA, "P")
+    lz._refuse_if_extra_drops_transient_lmo(lz.VISION_TRANSIENT, bad + NF_EXTRA, "P")
     with pytest.raises(lz.Weg2LaunchRefused):
-        lz._refuse_if_extra_drops_transient_override(lz.VISION_TRANSIENT, NF_EXTRA + bad, "P")
-    lz._refuse_if_extra_drops_transient_override(lz.VISION_OFF, bad, "P")  # off: operator's business
+        lz._refuse_if_extra_drops_transient_lmo(lz.VISION_TRANSIENT, NF_EXTRA + bad, "P")
+    lz._refuse_if_extra_drops_transient_lmo(lz.VISION_OFF, bad, "P")  # off: operator's business

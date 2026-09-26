@@ -5387,7 +5387,7 @@ def argv_p(
     spec_flags: Optional[Sequence[str]] = None,
 ) -> List[str]:
     _refuse_if_extra_raises_budget(budgets, list(extra or ()), "P")
-    _refuse_if_extra_drops_transient_override(vision, extra, "P")
+    _refuse_if_extra_drops_transient_lmo(vision, extra, "P")
     # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
     # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
     # server_args hands to derive_pp_layer_split, which builds a CONTIGUOUS
@@ -5784,7 +5784,7 @@ def _adopt_load_format_flag(armed: bool) -> List[str]:
     return ["--load-format", "dummy"]
 
 
-def _refuse_if_extra_drops_transient_override(vision: str, extra, group: str) -> None:
+def _refuse_if_extra_drops_transient_lmo(vision: str, extra, group: str) -> None:
     """EXTRA is appended LAST and argparse keeps the last occurrence of
     ``--json-model-override-args``, so an EXTRA override is the one the group
     gets. Under ``--weg2-vision transient`` it must carry
@@ -5854,7 +5854,7 @@ def argv_d(
     vision: str = VISION_OFF,
 ) -> List[str]:
     _refuse_if_extra_raises_budget(budgets, list(extra or ()), "D")
-    _refuse_if_extra_drops_transient_override(vision, extra, "D")
+    _refuse_if_extra_drops_transient_lmo(vision, extra, "D")
     return [py, "-m", "sglang.launch_server"] + common_flags(
         model, s_gb, m_mib, store_cfg, max_kv_per_request, d_write_policy, "D",
         random_seed, barlink_cap_cycles, census_interval,
