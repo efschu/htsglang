@@ -133,6 +133,20 @@ DRAIN_DEADLINE_DEFAULT_S = 120.0
 X_FALLBACK_TOKENS = 22000
 QUIESCE_DEADLINE_S = 90.0
 
+
+def quiesce_poll_s() -> Tuple[float, bool]:
+    """fnFL2 H111: the quiesce poll interval and whether the fast form is armed.
+
+    Off (SGLANG_WEG2_QUIESCE_FAST unset/0): 0.05 s, the #1455 value, and the
+    loop is byte-identical to the pre-H111 form. On: the configured interval
+    (SGLANG_WEG2_QUIESCE_FAST_POLL_MS, default 10), never below 1 ms. The P
+    side's no-re-want guard is armed by the SAME variable -- the launcher
+    hands one environment to the front and to every rank."""
+    if not envs.SGLANG_WEG2_QUIESCE_FAST.get():
+        return 0.05, False
+    return max(1, int(envs.SGLANG_WEG2_QUIESCE_FAST_POLL_MS.get())) / 1000.0, True
+
+
 #: fnFL2 v22: how long the quiesce waits for /health_generate proxies the
 #: front forwarded before the flip began (a 1-token generate, ~1 s warm; the
 #: cold-JIT first probe took 2 min on D -- that one the bound lets run out
@@ -5423,12 +5437,22 @@ class Front:
                 "WEG2-FLIP quiesce group=%s waited %.2f s for %s in-flight /health_generate "
                 "proxy(ies) before the flush (fnFL2 v22)", g.name, waited[0], waited[1]
             )
+        poll_s, fast = quiesce_poll_s()
+        polls = 0
         while time.time() - t0 < QUIESCE_DEADLINE_S:
             code, body = await self.rpc(g, "/flush_cache", None, 60)
+            polls += 1
             if code == 200:
+                if fast:
+                    logger.info(
+                        "WEG2-QUIESCE-FAST group=%s polls=%d ms=%.0f interval_ms=%.0f "
+                        "(fnFL2 H111: poll %.0f ms instead of 50, PP0 re-wants no lap "
+                        "that is still on the ring)",
+                        g.name, polls, (time.time() - t0) * 1000.0, poll_s * 1000.0,
+                        poll_s * 1000.0)
                 return True, body
             last = body
-            await asyncio.sleep(0.05)  # #1455: the P flush RPC answers in ~5 ms; 500 ms poll cost ~1 s per flip
+            await asyncio.sleep(poll_s)  # #1455: the P flush RPC answers in ~5 ms; 500 ms poll cost ~1 s per flip
         return False, last
 
     # #1236: `_store_used_bytes` IS DELETED, not repaired. It read
