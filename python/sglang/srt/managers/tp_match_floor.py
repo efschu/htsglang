@@ -793,5 +793,138 @@ def follow_rematch(tree_cache: Any, params: Any, depth: int, local: int) -> Any:
     return followed
 
 
+# --------------------------------------------------------------------------
+# H99: the prefetch span is the host's too (rc9o, weg2-33-33, W65)
+# --------------------------------------------------------------------------
+#
+# rc9o (2eed285057, boot dkrnfbar1rc9o09260808, 08:29:00): D died at INTAKE,
+# before any admission -- ``_add_request_to_queue`` -> ``_prefetch_kvcache``
+# -> ``prefetch_from_storage`` -> W65 Weg2PrefetchSpanSplit (min=320
+# max=6720). The span each rank voted is ``len(fill[_matched_len:_match_end])``
+# with ``_matched_len`` from the intake re-match
+# (``init_next_round_input(cow_mamba=False)``): the anchor-validated match of
+# the rank's OWN tree -- TP0 32768 (host anchor), TP1/TP2 26368 (their
+# byteless shadow anchors; the same numbers the #1042 EXTENT lines print). H98
+# only acts inside the admission plan call, so it never saw this rid.
+#
+# The fix is the x22 shape: a Form A worker ABSTAINS in the span pair
+# (:data:`PREFETCH_SPAN_ABSTAIN` in both slots), so the vote's span is the
+# host's alone and W65 compares the voters that hold bytes. The worker keeps
+# its LENGTH vote (it still caps the group length at what it can register),
+# registers exactly the group length (:func:`form_a_trim_to_group`,
+# release-only), and adopts the host's prefix/span for its request
+# bookkeeping (:func:`adopt_host_prefetch_span`) -- which the hold settle
+# (``_weg2_refetch_one``) compares against the group-reduced completion. The
+# worker's registered token range stays its own: its null storage tier moves
+# no bytes, and the range only feeds its bookkeeping tree, whose depth H98
+# already subordinates to the host at admission.
+
+#: The x22 abstain sentinel (``cache_controller.CLAIM_VOTE_ABSTAIN``), sized
+#: for the #580 vote's int32 payload.
+PREFETCH_SPAN_ABSTAIN = 1 << 30
+
+#: Tree attribute: rid -> the group span of a follower's last positive vote.
+PREFETCH_SPAN_ATTR = "_tp_match_floor_prefetch_group_span"
+
+
+def form_a_prefetch_span_vote(local_span: int):
+    """(slot 3, slot 4) of the #580 prefetch vote for this rank."""
+    if this_rank_follows():
+        return PREFETCH_SPAN_ABSTAIN, PREFETCH_SPAN_ABSTAIN
+    return int(local_span), -int(local_span)
+
+
+def form_a_trim_to_group(
+    tree_cache: Any,
+    req_id: Any,
+    host_indices: Any,
+    prefetch_key: Any,
+    group_len: int,
+    group_span: int,
+):
+    """On a Form A worker after a positive vote: cut the registration to the
+    group length (release-only) and remember the group span. Returns
+    ``(host_indices, prefetch_key)`` when it trimmed, None otherwise (and
+    always None off a follower)."""
+    if not this_rank_follows():
+        return None
+    try:
+        spans = getattr(tree_cache, PREFETCH_SPAN_ATTR, None)
+        if spans is None:
+            spans = {}
+            setattr(tree_cache, PREFETCH_SPAN_ATTR, spans)
+        spans[str(req_id)] = int(group_span)
+    except Exception:  # noqa: BLE001 - bookkeeping only
+        pass
+    group_len = int(group_len)
+    trimmed = False
+    if host_indices is not None and len(host_indices) > group_len:
+        tree_cache.cache_controller.append_host_mem_release(
+            host_indices=host_indices[group_len:]
+        )
+        host_indices = host_indices[:group_len]
+        trimmed = True
+    if prefetch_key is not None and len(prefetch_key) > group_len:
+        prefetch_key = prefetch_key[:group_len]
+        trimmed = True
+    return (host_indices, prefetch_key) if trimmed else None
+
+
+def host_prefix_from_group_span(
+    *, match_end: int, group_span: int, page_size: int, bigram: bool
+) -> int:
+    """The host's matched prefix, re-derived from the span it voted.
+
+    The host's span is ``len(RadixKey(fill[m0:match_end], is_bigram)
+    .page_aligned(P))`` = floor_P(match_end - m0 - d) with d = 1 for a bigram
+    key; ``m0`` is a whole number of pages (the match is walked on a
+    page-aligned key), so exactly one multiple of P satisfies it:
+    m0 = floor_P(match_end - d - span)."""
+    page = max(1, int(page_size))
+    x = int(match_end) - (1 if bigram else 0) - int(group_span)
+    return max(0, x // page * page)
+
+
+def adopt_host_prefetch_span(tree_cache: Any, req: Any, match_end: int) -> Optional[int]:
+    """Scheduler delegation after ``prefetch_from_storage``: on a Form A
+    worker whose vote just registered, the request's span bookkeeping
+    (``_prefetch_span_tokens``, ``_prefetch_registered_prefix_len``) becomes
+    the host's. Returns the host prefix, or None (no-op) everywhere else."""
+    if not this_rank_follows():
+        return None
+    spans = getattr(tree_cache, PREFETCH_SPAN_ATTR, None)
+    if not spans:
+        return None
+    rid = str(getattr(req, "rid", "") or "")
+    span = spans.pop(rid, None)
+    if span is None:
+        return None
+    m0 = host_prefix_from_group_span(
+        match_end=int(match_end),
+        group_span=int(span),
+        page_size=int(getattr(tree_cache, "page_size", 1) or 1),
+        bigram=bool(getattr(tree_cache, "is_eagle", False)),
+    )
+    local = int(getattr(req, "_prefetch_registered_prefix_len", 0) or 0)
+    req._prefetch_span_tokens = max(0, int(match_end) - m0)
+    req._prefetch_registered_prefix_len = m0
+    _STATS["prefetch_follow"] = _STATS.get("prefetch_follow", 0) + 1
+    n = _STATS["prefetch_follow"]
+    if local != m0 and (n <= 20 or n % 256 == 0):
+        logger.warning(
+            "RU FORM-A PREFETCH-FOLLOW rid=%s tp0_prefix=%d worker_prefix=%d "
+            "tp0_span=%d (n=%d): this expert worker's intake match comes from "
+            "byteless shadow anchors; its prefetch span abstained in the #580 "
+            "vote and its request bookkeeping takes the attention host's (H99, "
+            "rc9o weg2-33-33 W65 min=320 max=6720).",
+            rid[:16],
+            m0,
+            local,
+            int(span),
+            n,
+        )
+    return m0
+
+
 def stats() -> Dict[str, int]:
     return dict(_STATS)
