@@ -1498,9 +1498,13 @@ class Envs:
     # "w4a8" (default, user order 25.09.): the registered W4A8 INT8 kernel on the
     # native bytes (N4D decode GEMV M<=48, N4A GEMM above; main model and draft).
     # "marlin" (opt-in): Marlin W4A16 on the SHARED native layout, content
-    # permuted in place at every flip (nvfp4_marlin_inplace.py).
+    # permuted in place at every flip (nvfp4_marlin_inplace.py). BARRED since
+    # 26.09. (wrong output), see SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN below.
     SGLANG_FP4_NATIVE_MIXED_SM8X = EnvStr("w4a8")
     SGLANG_FP4_NATIVE_MIXED_SM12X = EnvStr("flashinfer_cutlass")
+    # NVFP4-SM8X-MARLIN-GUARD (26.09.): SM8X=marlin serves wrong output on the
+    # current line and is refused; "1" runs it anyway, for DIAGNOSIS ONLY.
+    SGLANG_FP4_ALLOW_BROKEN_SM8X_MARLIN = EnvBool(False)
     # Opt-in BIT-DETERMINISM for fp8 linears on sm80..sm88 (#192, from #190).
     #
     # WHAT IS BROKEN. On sm80..88 an fp8 checkpoint has exactly one GEMM
