@@ -935,8 +935,15 @@ def usage_of(body: Any) -> Tuple[int, int, int, bool]:
         # body reads as UNPRICED and `leg2` refuses a healthy 200 by W28 --
         # i.e. forwarding the path without teaching the pricer would turn the
         # front's 404 into a 503, which is not an improvement.
-        pt = int(u.get("input_tokens", 0) or 0)
+        #
+        # RC7 (Review V (4b)): `input_tokens` is NOT the prompt. The adapter
+        # reports prompt - cached there (anthropic/serving.py
+        # `_anthropic_input_tokens`) and the cached part in
+        # `cache_read_input_tokens`, as the Anthropic API does. The prompt is
+        # their sum; reading `input_tokens` alone priced uncached as
+        # prompt - 2*cached and fed `_note_exact` a wrong tokenisation.
         ct = int(u.get("cache_read_input_tokens", 0) or 0)
+        pt = int(u.get("input_tokens", 0) or 0) + ct
         return pt, ct, int(u.get("output_tokens", 0) or 0), True
     if not isinstance(u, dict) or "prompt_tokens" not in u:
         return 0, 0, 0, False
@@ -1099,8 +1106,17 @@ class AnthropicStreamUsage:
                 self.output_tokens = max(
                     self.output_tokens, int(u.get("output_tokens", 0) or 0)
                 )
-                if not self.input_tokens:
+                # RC7 (Review V (4b)): the closing message_delta CORRECTS the
+                # totals (anthropic/serving.py ships message_start before usage
+                # is known, with input 0 and no cache field) -- the last value
+                # seen wins, for the input AND the cached count. The cached
+                # count used to be read off message_start only, i.e. always 0:
+                # every streamed /v1/messages leg recorded "D holds nothing of
+                # this text" into the span LRU.
+                if "input_tokens" in u or not self.input_tokens:
                     self.input_tokens = int(u.get("input_tokens", 0) or 0)
+                if "cache_read_input_tokens" in u:
+                    self.cached_tokens = int(u.get("cache_read_input_tokens", 0) or 0)
         elif kind == "message_stop":
             self.saw_stop = True
 
@@ -1113,8 +1129,12 @@ class AnthropicStreamUsage:
         refusing to price it would re-introduce the W28 fail-closed this class
         exists to prevent.
         """
-        if self.saw_start and self.input_tokens > 0:
-            return self.input_tokens, self.cached_tokens, self.output_tokens, True
+        # RC7 (Review V (4b)): the prompt is input + cache_read (the adapter's
+        # input_tokens is prompt - cached). Priced when a prompt was seen at
+        # all -- a fully cached prompt (input 0, cache_read N) is priced too.
+        prompt = self.input_tokens + self.cached_tokens
+        if self.saw_start and prompt > 0:
+            return prompt, self.cached_tokens, self.output_tokens, True
         return 0, 0, 0, False
 
 

@@ -248,7 +248,11 @@ def test_usage_of_reads_the_anthropic_body():
     }
     pt, ct, comp, priced = F.usage_of(body)
     assert priced is True
-    assert (pt, ct, comp) == (18651, 18649, 96)
+    # RC7 Review V (4b): input_tokens is prompt - cached on this wire (the
+    # adapter's _anthropic_input_tokens, and the Anthropic API's own
+    # convention), so the PROMPT is input + cache_read. This pin used to read
+    # (18651, 18649) -- it encoded the defect.
+    assert (pt, ct, comp) == (18651 + 18649, 18649, 96)
 
 
 def test_usage_of_still_reads_the_openai_body():
@@ -310,7 +314,8 @@ def test_stream_rollup_parses_a_captured_sequence():
     acc.feed(_captured_stream())
     pt, ct, comp, priced = acc.result()
     assert priced is True
-    assert (pt, ct, comp) == (18651, 18649, 42)
+    # RC7 Review V (4b): prompt = input + cache_read (see the body test above).
+    assert (pt, ct, comp) == (18651 + 18649, 18649, 42)
     assert acc.saw_start and acc.saw_stop
 
 
@@ -321,7 +326,7 @@ def test_stream_rollup_survives_arbitrary_chunk_boundaries(size):
     acc = F.AnthropicStreamUsage()
     for i in range(0, len(blob), size):
         acc.feed(blob[i:i + size])
-    assert acc.result() == (18651, 18649, 42, True)
+    assert acc.result() == (18651 + 18649, 18649, 42, True)  # RC7 Review V (4b)
 
 
 def test_stream_rollup_prices_an_answer_longer_than_the_retained_tail():
@@ -346,7 +351,7 @@ def test_stream_rollup_prices_an_answer_longer_than_the_retained_tail():
     acc.feed(head)
     acc.feed(filler)
     pt, ct, comp, priced = acc.result()
-    assert priced is True and pt == 18651
+    assert priced is True and pt == 18651 + 18649  # RC7 Review V (4b)
 
     # and the instrument it replaces genuinely fails on this input, which is
     # why the accumulator exists (mutation-proof in situ, not an assertion
@@ -370,7 +375,7 @@ def test_stream_rollup_prices_a_stream_cut_short_after_message_start():
     acc = F.AnthropicStreamUsage()
     acc.feed(_captured_stream(n_deltas=1).split(b"event: message_delta")[0])
     pt, _, _, priced = acc.result()
-    assert priced is True and pt == 18651
+    assert priced is True and pt == 18651 + 18649  # RC7 Review V (4b)
 
 
 def test_openai_streams_are_untouched_by_the_new_path():
