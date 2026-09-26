@@ -219,6 +219,106 @@ def cp_all_gather_heads_uneven(
     return torch.cat(parts, dim=1).contiguous()
 
 
+_KVQ_FUSE = {"on": None, "max_rows": None}
+
+
+def dcp_fuse_max_rows() -> int:
+    """SGLANG_DCP_FUSE_MAX_ROWS (default 256): both DCP fusions only for
+    forwards of at most this many rows (decode / verify / short tails). The
+    latency they save is per collective, so a wide prefill-with-prefix gains
+    nothing -- and it would pay the fused buffers' extra transient at up to
+    4096 rows on D TP0, the regime of the RC7 merge OOM. Row count is equal on
+    every rank (the q/LSE gathers require it), so the gate is rank-uniform."""
+    if _KVQ_FUSE["max_rows"] is None:
+        import os
+
+        try:
+            _KVQ_FUSE["max_rows"] = max(0, int(os.environ.get("SGLANG_DCP_FUSE_MAX_ROWS", "256")))
+        except ValueError:
+            _KVQ_FUSE["max_rows"] = 256
+    return int(_KVQ_FUSE["max_rows"])
+
+
+def dcp_fuse_kvq_gather() -> bool:
+    """SGLANG_DCP_FUSE_KVQ_GATHER=1 (default off): the per-layer KV write
+    gather (A) and the q-head gather (B) of the uneven-DCP attention become ONE
+    all-gather (``cp_all_gather_kvq_heads_uneven``).
+
+    Measured motive (27B rc9meas i8h/i8r, 26.09., D TP3 bar1, bs1): the verify
+    graph carries 193 collectives per round, 64 of them DCP (16 layers x
+    {A 32 KiB, B 96 KiB, LSE 1.5 KiB all-gathers, a2a merge}); the dcp
+    all-gathers alone wait 1.5 ms (TP1) / 2.3 ms (TP0) per round, ~31/48 us
+    each, of which the bytes on TP1's x4 link are a minority. Fusing A and B
+    keeps the bytes and drops one rendezvous per full-attention layer.
+
+    Read once; must be set identically on every rank of the DCP group (the
+    collective sequence changes from A,B,C,D to AB,C,D)."""
+    if _KVQ_FUSE["on"] is None:
+        import os
+
+        v = str(os.environ.get("SGLANG_DCP_FUSE_KVQ_GATHER", "0")).strip().lower()
+        _KVQ_FUSE["on"] = v in ("1", "true", "yes", "on")
+        if _KVQ_FUSE["on"]:
+            # the A/B needs proof that the arm bound (default off logs nothing)
+            logging.getLogger(__name__).info(
+                "DCP-FUSE kvq_gather=on (SGLANG_DCP_FUSE_KVQ_GATHER): KV write "
+                "gather + q gather = one all-gather per full-attention layer"
+            )
+    return bool(_KVQ_FUSE["on"])
+
+
+def cp_all_gather_kvq_heads_uneven(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q: torch.Tensor,
+    cp_group: GroupCoordinator,
+    kv_head_counts: list,
+    q_head_counts: list,
+):
+    """ONE uneven head all-gather for the KV write (k, v) AND the q heads.
+
+    Equivalent, element for element, to the two gathers it replaces --
+    ``cp_all_gather_heads_uneven(cat((k, v), 0), kv_counts)`` split at T, and
+    ``cp_all_gather_heads_uneven(q, q_counts)`` -- because an all-gather is
+    pure data movement: every rank contributes ``cat((k, v, q), dim=1)``
+    ([T, 2*kv_r + q_r, D]), the padded gather puts the blocks in rank order,
+    and each output is re-assembled from its per-rank slice of those blocks.
+    No arithmetic touches a value, so the result is BIT-identical.
+
+    Bytes per rank: max_r(2*kv_r + q_r) heads x T x D, never more than the
+    two padded gathers' max_r(kv_r)*2 + max_r(q_r) (for [2,1,1]/[12,6,6]:
+    16 = 4 + 12). One rendezvous instead of two.
+
+    Returns ``(k_full, v_full, q_full)``: [T, sum(kv), D], [T, sum(kv), D],
+    [T, sum(q), D], each contiguous.
+    """
+    T, kv_local, D = k.shape
+    assert v.shape == k.shape, f"k {tuple(k.shape)} != v {tuple(v.shape)}"
+    assert q.shape[0] == T and q.shape[2] == D, (
+        f"q {tuple(q.shape)} does not share T/D with k {tuple(k.shape)}"
+    )
+    assert q.dtype == k.dtype == v.dtype, (q.dtype, k.dtype, v.dtype)
+    kv = [int(c) for c in kv_head_counts]
+    qc = [int(c) for c in q_head_counts]
+    world = cp_group.world_size
+    assert len(kv) == len(qc) == world
+    fused_counts = [2 * a + b for a, b in zip(kv, qc)]
+    x = torch.cat((k, v, q), dim=1)
+    g = cp_all_gather_heads_uneven(x, cp_group, fused_counts)
+    ks, vs, qs = [], [], []
+    off = 0
+    for r in range(world):
+        ks.append(g[:, off : off + kv[r]])
+        vs.append(g[:, off + kv[r] : off + 2 * kv[r]])
+        qs.append(g[:, off + 2 * kv[r] : off + fused_counts[r]])
+        off += fused_counts[r]
+    return (
+        torch.cat(ks, dim=1).contiguous(),
+        torch.cat(vs, dim=1).contiguous(),
+        torch.cat(qs, dim=1).contiguous(),
+    )
+
+
 def cp_local_head_bounds(cp_group: GroupCoordinator, head_counts: list) -> tuple:
     """(start, stop) of this rank's head slice in the gathered full head set
     under uneven DCP (head_counts = per-rank q-head partition, e.g. [12,6,6])."""
@@ -229,7 +329,7 @@ def cp_local_head_bounds(cp_group: GroupCoordinator, head_counts: list) -> tuple
 
 logger = logging.getLogger(__name__)
 
-_LSE_MERGE = {"dtype": None, "mode": None}
+_LSE_MERGE = {"dtype": None, "mode": None, "fused": None}
 
 
 def _ng(stage: str, t: torch.Tensor, cp_group, allow_neg_inf: bool = False) -> None:
@@ -286,6 +386,77 @@ def lse_merge_mode() -> str:
     return _LSE_MERGE["mode"]
 
 
+def lse_merge_fused() -> bool:
+    """SGLANG_DCP_LSE_MERGE_FUSED=1 (default off; only with
+    SGLANG_DCP_LSE_MERGE=a2a and the fp32 wire): the LSE all-gather of the a2a
+    merge rides INSIDE the head all_to_all -- every rank ships the UNSCALED
+    partials of the peer-owned heads plus their LSE (one extra fp32 column,
+    padded to four so a head row stays 16-byte aligned), and the receiver does
+    the logsumexp / scale / sum for its own heads. One rendezvous per merge
+    instead of two (see ``_cp_lse_a2a_fused_body``).
+
+    Read once; rank-uniform like SGLANG_DCP_LSE_MERGE (the collective sequence
+    changes from C,D to CD)."""
+    if _LSE_MERGE["fused"] is None:
+        import os
+
+        v = str(os.environ.get("SGLANG_DCP_LSE_MERGE_FUSED", "0")).strip().lower()
+        _LSE_MERGE["fused"] = v in ("1", "true", "yes", "on")
+        if _LSE_MERGE["fused"]:
+            logger.info(
+                "DCP-FUSE lse_merge=on (SGLANG_DCP_LSE_MERGE_FUSED): the LSE "
+                "all-gather rides in the a2a (fp32 wire only; bf16 keeps two)"
+            )
+    return bool(_LSE_MERGE["fused"])
+
+
+#: Columns the fused a2a appends to each [head, token] row: the LSE in the
+#: first, zeros after it. Four fp32 = 16 bytes, so a head row of D fp32 plus
+#: this tail stays a multiple of 16 bytes (the bar1 a2a kernel's packet).
+LSE_FUSED_TAIL = 4
+
+
+def _cp_lse_a2a_fused_body(cp_attn_out, cp_attn_lse, cp_group, counts, return_lse):
+    """The a2a merge with the LSE all-gather folded into the all_to_all.
+
+    Same math as the two-collective body, moved to the receiver: the sender
+    ships nan_to_num(o) (fp32) and its lse for the heads rank ``s`` owns; rank
+    ``s`` stacks the W received LSEs of ITS heads, takes the same logsumexp over
+    the rank axis, the same nan_to_num(exp(lse - global)) scale, multiplies in
+    fp32 exactly as the sender did, and sums over the rank axis in the same
+    rank order. Every value that enters the arithmetic is transferred exactly
+    (fp32 wire), so on one device class the result is bit-identical to the
+    two-collective body; across device classes it can differ only where the
+    same elementwise exp/logsumexp kernel rounds differently per arch."""
+    world = cp_group.world_size
+    tokens, _h, dim = cp_attn_out.shape
+    rank = cp_group.rank_in_group
+    mine = counts[rank]
+    tail = LSE_FUSED_TAIL
+    o32 = torch.nan_to_num(cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float32)
+    send = o32.new_zeros((_h, tokens, dim + tail))  # [H_total, tokens, D + tail]
+    send[:, :, :dim].copy_(o32.transpose(0, 1))
+    send[:, :, dim].copy_(cp_attn_lse.to(torch.float32).transpose(0, 1))
+    recv = torch.empty((world * mine, tokens, dim + tail), dtype=torch.float32,
+                       device=cp_attn_out.device)
+    cp_group.all_to_all_single_v(
+        recv, send, output_split_sizes=[mine] * world, input_split_sizes=counts
+    )
+    _ng("merge.a2a_send", send, cp_group, allow_neg_inf=True)
+    _ng("merge.a2a_recv", recv, cp_group, allow_neg_inf=True)
+    r4 = recv.view(world, mine, tokens, dim + tail)
+    lses = r4[..., dim]  # [W, mine, tokens]
+    global_lse = torch.logsumexp(lses, dim=0)  # [mine, tokens]
+    scale = torch.exp(lses - global_lse).unsqueeze(-1)
+    scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
+    merged = (r4[..., :dim] * scale).sum(dim=0)  # [mine, tokens, D]
+    _ng("merge.result", merged, cp_group)
+    merged = merged.transpose(0, 1).contiguous()  # [tokens, H_local, D]
+    if return_lse:
+        return merged, global_lse.transpose(0, 1).contiguous()
+    return merged
+
+
 def cp_lse_ag_out_a2a_mha_uneven(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
@@ -315,6 +486,16 @@ def cp_lse_ag_out_a2a_mha_uneven(
     cp_attn_lse = cp_attn_lse.contiguous()
     _ng("merge.local_out", cp_attn_out, cp_group)
     _ng("merge.local_lse", cp_attn_lse, cp_group, allow_neg_inf=True)
+    if (
+        lse_merge_fused()
+        and lse_merge_reduce_dtype() == "fp32"
+        and cp_attn_out.shape[0] <= dcp_fuse_max_rows()
+    ):
+        # SGLANG_DCP_LSE_MERGE_FUSED: one collective instead of two. The bf16
+        # wire keeps the two-collective body -- the LSE must travel in fp32.
+        return _cp_lse_a2a_fused_body(
+            cp_attn_out, cp_attn_lse, cp_group, counts, return_lse
+        )
     lses = _ag_lse(cp_attn_lse, cp_group)
     _ng("merge.gathered_lse", lses, cp_group, allow_neg_inf=True)
     global_lse = torch.logsumexp(lses, dim=0)
