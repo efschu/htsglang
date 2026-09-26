@@ -809,6 +809,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         write-through backup will be declined, so it is worth saying out loud
         rather than leaving to be inferred from a silent absence of host
         anchors.
+
+        H113: EXCEPT on group P of a weg2 boot, where those backups are the
+        P->D hand-off itself -- there budget 0 is refused after this line
+        (``_refuse_weg2_p_mamba_retention_zero``).
         """
         if ComponentType.MAMBA not in self.tree_components:
             return
@@ -842,6 +846,36 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         except Exception:  # noqa: BLE001 -- an instrument never breaks a boot
             logger.debug("MAMBA-FLOOR posture unavailable", exc_info=True)
+        # H113: OUTSIDE the instrument's broad except on purpose -- the line
+        # above may never break a boot, the Riegel below must.
+        self._refuse_weg2_p_mamba_retention_zero(mamba_pool)
+
+    def _refuse_weg2_p_mamba_retention_zero(self, mamba_pool) -> None:
+        """H113: group P of a weg2 boot refuses a mamba pin budget of 0.
+
+        The budget is ``self._mamba_pin_budget`` -- the very number
+        ``_mamba_write_through_pin_admissible`` compares against -- so the
+        refusal and the declined backups cannot disagree. See
+        :class:`mamba_pool_floor.Weg2PMambaRetentionZero` for the fnFL2h91bb2
+        chain this stops at boot instead of at the first P->D flip.
+        """
+        from sglang.srt.mem_cache.mamba_pool_floor import (
+            Weg2PMambaRetentionZero,
+            weg2_p_mamba_retention_refusal,
+        )
+        from sglang.srt.runtime_context import get_server_args
+
+        server_args = get_server_args()
+        refusal = weg2_p_mamba_retention_refusal(
+            server_args,
+            server_args.max_running_requests or 1,
+            mamba_pool.size,
+            self._mamba_pin_budget,
+            os.environ.get("SGLANG_WEG2_GROUP", ""),
+        )
+        if refusal is not None:
+            logger.error(refusal)
+            raise Weg2PMambaRetentionZero(refusal)
 
     def _wait_bounded(self, work, label: str) -> None:
         """Wait for ``work`` with a deadline, or raise a named error.
