@@ -757,6 +757,9 @@ def plan_wake_credit_pd(*, model: str, p_split: Sequence[int], chunk_layers: int
         "dense_repack": want_repack,
     }
     key = dict(keys.get(boot) or {})
+    # H87: das Modell der Referenz nach Speicher-Fussabdruck, nicht nach Name.
+    from sglang.srt.weg2.wake_credit import _model_same_footprint
+    _model_note = _model_same_footprint(model, key, have)
     diff = [k for k in key if key[k] != have.get(k)]
     main, first = refs.get(boot + "/1"), refs.get(boot + "/0")
     if not key or diff or main is None:
@@ -778,6 +781,8 @@ def plan_wake_credit_pd(*, model: str, p_split: Sequence[int], chunk_layers: int
         % (MARKER, DIRECTION, label, boot + "/1", dict(reference_from_dict(main).free),
            list(main["p_rows"]), list(main["d_rows"]), float(slot_mib),  # type: ignore[index]
            list(p_rows), list(d_rows), STAGING_DEPTH, COLLECT_RUNAHEAD, COLLECT_WORKERS))
+    if _model_note:
+        head += "; " + _model_note
     lines, refusal, chosen = verdict_lines_pd(ref, label=label, apply=apply, also=also)
     front: Dict[str, object] = {DIRECTION: untimed_table_pd(ref)}
     if list(chosen) != list(ref.order):
