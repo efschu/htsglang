@@ -9511,20 +9511,41 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         f"{ct} device LRU: "
                         f"+tree={tree_ids - lru_ids}, +lru={lru_ids - tree_ids}"
                     )
-                # Aux host-only states must match the host LRU.
+                # Aux host-only states must match the host LRU -- the UNLOCKED
+                # ones. A host lock takes its node off the host LRU by design
+                # (`acquire_component_lock(lock_host=True)` removes it, the
+                # release re-inserts it), so a host-locked host-only node is
+                # correctly absent. Upstream never saw one here: its host locks
+                # end within the pass. The #1417 prefetch pins span passes until
+                # the admission pops them, so two prefetches of one prefix leave
+                # the older anchor pinned and off the LRU at an idle walk
+                # (#1417b, rc11b D TP1/TP2 19:30:47Z: "+S3={249}, +lru=set()").
+                # Both halves of the lock protocol are checked.
                 host_lru = self.host_lru_lists[ct]
-                s3_ids = {
-                    n.id
+                s3_nodes = [
+                    n
                     for n in all_nodes
                     if n is not self.root_node
                     and n.component_data[ct].value is None
                     and n.component_data[ct].host_value is not None
+                ]
+                s3_ids = {
+                    n.id for n in s3_nodes if n.component_data[ct].host_lock_ref == 0
+                }
+                s3_locked_ids = {
+                    n.id for n in s3_nodes if n.component_data[ct].host_lock_ref > 0
                 }
                 host_lru_ids = set(host_lru.cache.keys())
-                if s3_ids != host_lru_ids:
+                if s3_ids != host_lru_ids - s3_locked_ids:
                     E(
                         f"{ct} host LRU: "
-                        f"+S3={s3_ids - host_lru_ids}, +lru={host_lru_ids - s3_ids}"
+                        f"+S3={s3_ids - host_lru_ids}, "
+                        f"+lru={host_lru_ids - s3_ids - s3_locked_ids}"
+                    )
+                if s3_locked_ids & host_lru_ids:
+                    E(
+                        f"{ct} host-locked node(s) on the host LRU: "
+                        f"{s3_locked_ids & host_lru_ids}"
                     )
                 # The same aux node must not appear in both device and host LRU.
                 inv5_overlap = lru_ids & host_lru_ids
