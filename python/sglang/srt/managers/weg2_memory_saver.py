@@ -1562,6 +1562,10 @@ class VramCredit:
         # weg2xsn258: the allocatable poll's own clock, started at the first
         # short reading and cleared by the first reading that covers `need`.
         _alloc_wait: Dict[str, Any] = {"t0": None}
+        # H111d: the clock of the wait for a COMPLETE peer leg's still-booked
+        # on-card staging (see the leg_complete branch below); None until the
+        # first pass that finds it.
+        _stage_wait_t0 = None
         _next_abort_check = time.monotonic()
         while True:
             if abort_reader is not None and time.monotonic() >= _next_abort_check:
@@ -1811,20 +1815,70 @@ class VramCredit:
                             "short, but the card itself holds the bytes now"
                         ),
                     }
-                raise Weg2VramCreditRefused(
-                    f"W35 Weg2VramCreditRefused (spec section 6 lists it as W30) "
-                    f"card={self.uuid} tag={tag} credit={available // MIB} MiB "
-                    f"published={credit // MIB} MiB "
-                    f"consumed={consumed // MIB} MiB "
-                    f"requested={need // MIB} MiB peer_leg_complete=True "
-                    f"peer_deposit={self.peer_deposit_position()} "
-                    f"free_bytes_now={free_bytes_now} free_mib_at_refusal="
-                    f"{'n/a' if free_now is None else free_now // MIB} -- the "
-                    f"sleeping rank has "
-                    f"finished its whole leg and will release nothing further, so "
-                    f"these bytes are never coming; refusing by name rather than "
-                    f"waiting out the budget or walking into a CUDA OOM"
+                # H111d (fnFL2h91bb1, 26.09. 14:17:53.089Z, D TP2 weights_8):
+                # "LEG COMPLETE" IS NOT YET "RELEASED EVERYTHING". The sleeper
+                # calls `leg_complete()` right after its tag loop and only THEN
+                # runs its leg-end drain, which frees its on-card IPC staging
+                # (`release_stage_buffers` -> `StageBooking` refund). Until that
+                # refund lands, the staging is still booked on this counter
+                # (`staged_bytes`), i.e. bytes the peer DOES still release. bb1:
+                # free 1699 - floor 701 = 998 < 1000 with PP2's two c2 stagings
+                # (2 x 617 MiB) still live; the one pass that looked landed ~3 ms
+                # after PP2's loop end and refused, while the same flip of
+                # fnFL2h91v1 polled after the release and granted at 2879 MiB.
+                # So: while the counter still carries the peer's booked staging
+                # AND the card's free plus exactly that staging covers the tag,
+                # keep polling -- bounded by `alloc_poll_s` (the xsn108 bound for
+                # this very transient, the sleeper's staging) and by the
+                # caller's budget. Everything else refuses at once, as before:
+                # no staging left, or even the staging would not cover it.
+                _peer_staged = int(rec.get("staged_bytes", 0) or 0)
+                _stage_owed = (
+                    free_now is not None
+                    and _peer_staged > 0
+                    and free_now - floor + _peer_staged >= need
                 )
+                if _stage_owed:
+                    if _stage_wait_t0 is None:
+                        _stage_wait_t0 = time.perf_counter()
+                        logger.info(
+                            "WEG2-CREDIT-WAIT tag=%s peer leg COMPLETE but %d MiB "
+                            "of its on-card staging is still booked (freed at its "
+                            "leg end, after leg_complete): free=%d MiB floor=%d MiB "
+                            "+ staged %d MiB >= need=%d MiB -- waiting for the "
+                            "refund, bound %.0f s (H111d)",
+                            tag, _peer_staged // MIB, free_now // MIB, floor // MIB,
+                            _peer_staged // MIB, need // MIB, float(alloc_poll_s))
+                    _stage_owed = (
+                        time.perf_counter() - _stage_wait_t0 < float(alloc_poll_s)
+                        and time.monotonic() < deadline
+                    )
+                if not _stage_owed:
+                    raise Weg2VramCreditRefused(
+                        f"W35 Weg2VramCreditRefused (spec section 6 lists it as W30) "
+                        f"card={self.uuid} tag={tag} credit={available // MIB} MiB "
+                        f"published={credit // MIB} MiB "
+                        f"consumed={consumed // MIB} MiB "
+                        f"requested={need // MIB} MiB peer_leg_complete=True "
+                        f"peer_deposit={self.peer_deposit_position()} "
+                        f"free_bytes_now={free_bytes_now} free_mib_at_refusal="
+                        f"{'n/a' if free_now is None else free_now // MIB} "
+                        f"floor_mib={floor // MIB} peer_staged_mib={_peer_staged // MIB} "
+                        f"stage_waited_ms="
+                        f"{0 if _stage_wait_t0 is None else int((time.perf_counter() - _stage_wait_t0) * 1000)}"
+                        f" -- the sleeping rank has "
+                        f"finished its whole leg and will release nothing further, so "
+                        f"these bytes are never coming; refusing by name rather than "
+                        f"waiting out the budget or walking into a CUDA OOM"
+                        + (
+                            "" if _stage_wait_t0 is None
+                            else f" (H111d: its booked staging of {_peer_staged // MIB} MiB "
+                            f"was waited for and not refunded within the "
+                            f"{float(alloc_poll_s):.0f} s bound)" if _peer_staged > 0
+                            else " (H111d: its booked staging was refunded and the "
+                            "card is still short of floor + request)"
+                        )
+                    )
             if time.monotonic() >= deadline:
                 raise Weg2VramCreditRefused(
                     f"W35 Weg2VramCreditRefused (spec section 6 lists it as W30) "
