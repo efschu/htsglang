@@ -357,3 +357,45 @@ def test_line_term_accepts_ancestors_only(monkeypatch):
         assert not ident.accepts_log("/ev/unnamed.P.log")
         nf = F.calibration_identity("/m/x", "/ev", F.parse_form(_form_env("nextflash")), repo=repo)
         assert nf.accepts_log(f"/ev/boot_weg2_t_{side[:10]}_0926_010203.P.log")
+
+
+def test_27b_rc9_head_is_an_allowlisted_second_line_head():
+    """OPERATOR 26.09. (UN4): the 27B-RC9 records count on the unified tree
+    until the first unified-27B boot writes its own -- an explicit full-id
+    allowlist on the qwen27b records row, none on the NF row."""
+    heads = F.PROFILES["qwen27b"].records.line_heads
+    assert heads == ("103712cdb2550f2fbe6a02696147de32690fbe14",)
+    assert all(len(h) == 40 for h in heads)  # a commit, never a branch name
+    assert F.PROFILES["nextflash"].records.line_heads == ()
+    ident = F.calibration_identity("/m/x", "/ev", F.parse_form(_form_env("qwen27b")), repo="/r")
+    assert ident.line_heads == heads and "103712cdb2" in ident.describe()
+
+
+def test_line_heads_accept_the_allowlisted_heads_ancestors(monkeypatch):
+    with tempfile.TemporaryDirectory() as repo:
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.email", "t@t")
+        _git(repo, "config", "user.name", "t")
+        _git(repo, "commit", "-q", "--allow-empty", "-m", "a")
+        _git(repo, "checkout", "-q", "-b", "rc9")
+        _git(repo, "commit", "-q", "--allow-empty", "-m", "r")
+        r = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "commit", "-q", "--allow-empty", "-m", "r2")
+        rc9_head = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "checkout", "-q", "-b", "other", "HEAD~2")
+        _git(repo, "commit", "-q", "--allow-empty", "-m", "o")
+        other = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "checkout", "-q", "-")
+        _git(repo, "checkout", "-q", "-b", "unified", "HEAD~2")
+        _git(repo, "commit", "-q", "--allow-empty", "-m", "u")
+        F._repo_head.cache_clear()
+        F._ancestor_index.cache_clear()
+        monkeypatch.setattr(F, "same_model_log", lambda model: (lambda path: True))
+        form = F.parse_form(_form_env("qwen27b"))
+        plain = F.CalibrationIdentity("/m/x", "/ev", form, ("checkpoint", "form", "line"), repo)
+        with_head = F.CalibrationIdentity("/m/x", "/ev", form, ("checkpoint", "form", "line"), repo,
+                                          line_heads=(rc9_head,))
+        log = f"/ev/boot_weg2_t_{r[:10]}_0926_010203.P.log"
+        assert not plain.accepts_log(log)  # the RC9 boot is no ancestor of this tree
+        assert with_head.accepts_log(log)  # ... but of the allowlisted head
+        assert not with_head.accepts_log(f"/ev/boot_weg2_t_{other[:10]}_0926_010203.P.log")

@@ -229,9 +229,15 @@ class RecordKey:
     RESIDUE_AXES of its WEG2-FORM line, else its draft), ``line`` (the boot's
     commit is an ancestor of the commit this launcher runs -- the 27B
     line_identity 76e87ac3b2), ``power_limit`` (planner/power_limit.py scales
-    rates by the NVML limit; not a FILTER yet, Schritt 9)."""
+    rates by the NVML limit; not a FILTER yet, Schritt 9).
+
+    ``line_heads``: further line HEADS whose ancestors the ``line`` term also
+    accepts, next to the tree this launcher runs -- an explicit allowlist of
+    full commit ids, never a branch name (a name moves, the records it
+    vouches for do not)."""
 
     fields: Tuple[str, ...]
+    line_heads: Tuple[str, ...] = ()
 
 
 RECORD_KEY_FIELDS: Tuple[str, ...] = ("checkpoint", "form", "line", "power_limit")
@@ -380,7 +386,15 @@ PROFILES: Dict[str, ModelProfile] = {
         idle_layout="pp",
         vision="transient",
         context_tokens=262144,
-        records=RecordKey(fields=("checkpoint", "form", "line")),
+        # OPERATOR 26.09. (UN4): the 27B-RC9 records count on this tree as a
+        # second head of the line -- bis der erste unified-27B-Boot eigene
+        # Records schreibt. 103712cdb2 = origin/desk/27b-rc9-0925, the 27B
+        # line's last release head before the unification; its boots are its
+        # ancestors, not ancestors of this tree. No recalibration forced.
+        records=RecordKey(
+            fields=("checkpoint", "form", "line"),
+            line_heads=("103712cdb2550f2fbe6a02696147de32690fbe14",),
+        ),
         early_read_flags=True,
         group_env={},
         prefill_transient_checkpoints=(),
@@ -1235,6 +1249,8 @@ class CalibrationIdentity:
     fields: Tuple[str, ...] = ("checkpoint", "form")
     #: the tree this launcher runs (the ``line`` term's repository)
     repo: str = ""
+    #: further accepted line heads (:attr:`RecordKey.line_heads`)
+    line_heads: Tuple[str, ...] = ()
 
     @property
     def uses_line(self) -> bool:
@@ -1245,7 +1261,8 @@ class CalibrationIdentity:
         if "form" in self.fields and self.form is not None:
             parts.append("form " + " ".join(f"{a}={getattr(self.form, a)}" for a in RESIDUE_AXES))
         if self.uses_line:
-            parts.append(f"a boot commit that is an ancestor of {self.repo} HEAD (the line)")
+            heads = "".join(f" or of {h[:10]}" for h in self.line_heads)
+            parts.append(f"a boot commit that is an ancestor of {self.repo} HEAD{heads} (the line)")
         declared = [f for f in self.fields if f not in ("checkpoint", "form", "line")]
         tail = f" [declared, not filtered: {', '.join(declared)}]" if declared else ""
         return " AND ".join(parts) + tail
@@ -1259,7 +1276,13 @@ class CalibrationIdentity:
         if not self.uses_line:
             return True
         tip = _boot_tag_tip(str((sample or {}).get("boot_tag", "") or ""), self.evidence_dir)
-        return tip is not None and is_line_ancestor(self.repo, tip)
+        return tip is not None and self._on_line(tip)
+
+    def _on_line(self, tip: str) -> bool:
+        """``tip`` is on this tree's line, or on one of the allowlisted heads."""
+        if is_line_ancestor(self.repo, tip):
+            return True
+        return any(is_line_ancestor(self.repo, tip, head=h) for h in self.line_heads)
 
     def accepts_log(self, path: str) -> bool:
         """A ``boot_weg2_*.{front,P,D}.log``: this checkpoint (and, with the
@@ -1269,7 +1292,7 @@ class CalibrationIdentity:
         if not self.uses_line:
             return True
         m = _BOOT_LOG_RE.match(os.path.basename(str(path)))
-        return m is not None and is_line_ancestor(self.repo, m.group("tip"))
+        return m is not None and self._on_line(m.group("tip"))
 
 
 def calibration_identity(
@@ -1282,5 +1305,7 @@ def calibration_identity(
         form = None  # a desk stand-in: checkpoint term only, as before
     row = profile_row(form.profile) if form is not None else None
     fields = row.records.fields if row is not None else ("checkpoint", "form")
+    heads = row.records.line_heads if row is not None else ()
     return CalibrationIdentity(model=str(model or ""), evidence_dir=str(evidence_dir),
-                               form=form, fields=tuple(fields), repo=str(repo or ""))
+                               form=form, fields=tuple(fields), repo=str(repo or ""),
+                               line_heads=tuple(heads))
