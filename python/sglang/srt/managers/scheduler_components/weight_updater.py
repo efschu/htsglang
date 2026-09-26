@@ -1798,7 +1798,16 @@ class SchedulerWeightUpdaterManager:
         self._weg2_lmem_park = park
         if not park.refused:
             self._weg2_lmem_base_stack = park.base_stack_bytes
-        logger.info("WEG2-SLEEP-LMEM %s", park.format_post())
+        # H101: the per-rank stack high-water of the loaded-kernel census rides
+        # on the H15 line (the planner's LMEM census reads this line).
+        try:
+            from sglang.srt.utils.lmem_census import census_max  # noqa: PLC0415
+
+            c_bytes, c_kernel = census_max()
+            census = f" census={c_bytes}({c_kernel or '-'})"
+        except Exception:  # noqa: BLE001 -- the H15 line stays
+            census = ""
+        logger.info("WEG2-SLEEP-LMEM %s%s", park.format_post(), census)
 
     def _weg2_draft_park_armed(self) -> bool:
         """H25: does THIS rank park its draft at the sleep?  Exactly when a
@@ -2029,10 +2038,15 @@ class SchedulerWeightUpdaterManager:
         if park.refused:
             return
         try:
+            from sglang.srt.utils.lmem_census import census_max  # noqa: PLC0415
             from sglang.srt.weg2.sleep_lmem import CudaDriverStackLimit, restore_lmem  # noqa: PLC0415
 
+            # H101: the largest LOCAL_SIZE of a kernel this process loaded is a
+            # booked need -- restored here, never regrown inside a launch.
+            booked, booked_kernel = census_max()
             rec = restore_lmem(
-                driver=CudaDriverStackLimit(), park=park, nvml_bytes=self._weg2_nvml_self_bytes
+                driver=CudaDriverStackLimit(), park=park, nvml_bytes=self._weg2_nvml_self_bytes,
+                booked_stack_bytes=booked or None, booked_kernel=booked_kernel,
             )
         except Exception as exc:  # noqa: BLE001 -- the driver grows it on demand
             logger.warning("WEG2-WAKE-LMEM n/a (%s: %s)", type(exc).__name__, str(exc)[:160])
