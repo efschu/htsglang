@@ -2768,6 +2768,12 @@ class PrefillAdder:
                 # Per-branch bail patches are how #965 was paid for twice.
                 req.set_extend_range(prefix_len, prefix_len)
                 _note_988_loadback(req, prefix_len)
+                # SF (b23 #1004): the prefix moved -- a pass budget planned for
+                # another start is replanned here, on every rank alike
+                # (weg2/pp_slot_fidelity.py; not installed = switch off).
+                _sf_hook = getattr(self, "sf_replan_after_move", None)
+                if _sf_hook is not None:
+                    _sf_hook(req, prefix_len)
                 # H18's probe stood here; H21 decides the tail at the commit
                 # below (tail_adopt.plan_adopt), on the group's vote.
 

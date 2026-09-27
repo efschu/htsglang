@@ -9050,6 +9050,13 @@ class Scheduler(
             # path. The host and mamba floors are a different axis and keep
             # their None; only the evict floor is being made total here.
             self._publish_uniform_evict_floor(local_avail)
+            # SF (b23 #1004): on pp > 1 this "group min" is THIS rank's own
+            # value and the ranks that must agree are not in the group; the
+            # load-back reads the mark and loads in the same pass instead of
+            # retrying next pass (weg2/pp_slot_fidelity.py). Switch off: no mark.
+            from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+            _sf.mark_floor_scope(getattr(self, "tree_cache", None), _sf.pp_size_of(self) > 1)
             self._publish_uniform_host_floor(None)
             self._publish_uniform_mamba_floor(None)
             # #791b: one rank -- nothing to diverge from, ballot off, the
@@ -10050,6 +10057,12 @@ class Scheduler(
         tree = getattr(self, "tree_cache", None)
         if tree is None:
             return
+        # SF (b23 #1004): a floor published here is a GROUP value (or None);
+        # the single-rank path re-marks it as local right after this call
+        # (weg2/pp_slot_fidelity.py). Switch off: nothing is written.
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        _sf.mark_floor_scope(tree, False)
         # #1045 OPTION A: THE FLOOR IS PUBLISHED UNCONDITIONALLY ON A GROUP.
         #
         # It used to stay None whenever the pools happened to AGREE this
@@ -11516,6 +11529,11 @@ class Scheduler(
         when profiling raises at init), so a None must fall back to the
         static size rather than be handed on as a chunk width.
         """
+        # SF (b23 #1004): the budget plan is this pass's only -- cleared here,
+        # noted by _p_chunk_policy_width, consumed by the adder's move hook.
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        _sf.clear_budget(self)
         # --p-layer-split dynamic: on PP0 the joint plan (chunk widths AND
         # per-chunk cut) owns the width; downstream ranks run PP0's #791
         # extents anyway. 0 -> the paths below.
@@ -11615,7 +11633,13 @@ class Scheduler(
                 )
             return 0
         cap = int(self.chunked_prefill_size or 0)
-        return min(int(width), cap) if cap > 0 else int(width)
+        out = min(int(width), cap) if cap > 0 else int(width)
+        # SF (b23 #1004): remember where this budget was planned, so a #988
+        # prefix move to another start replans (weg2/pp_slot_fidelity.py).
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        _sf.note_budget(self, head, out)
+        return out
 
     def _log_dynamic_chunk_engagement(self, dynamic_size: int, history_len: int):
         """ENGAGEMENT PROOF for the dynamic-chunking arm, at INFO.
@@ -14444,6 +14468,13 @@ class Scheduler(
         # H105: on a Form A group the attention host's gate verdict is the
         # group's (None elsewhere: every gate in add_one_req stays rank-local).
         adder.form_a_admission_follow = self._form_a_admission_follow_fn()
+        # SF (b23 #1004): a #988 prefix move replans the chunk budget at the moved
+        # prefix (None: switch off / no plan policy -> nothing installed).
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        _sf_hook = _sf.replan_hook(self, adder)
+        if _sf_hook is not None:
+            adder.sf_replan_after_move = _sf_hook
         # #996 THIS RANK'S OWN CAP, captured beside the floor. Printed by
         # APPENDING to the existing census line -- the previous revision put a
         # SECOND emission next to it and flipped the death form, which is the

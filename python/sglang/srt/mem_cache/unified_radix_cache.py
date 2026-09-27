@@ -4893,6 +4893,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 f"rid={getattr(req, 'rid', None)} kv_tokens={kv_tokens} "
                 f"local_available={self.token_to_kv_pool_allocator.available_size()}"
             )
+        # SF (b23 #1004, weg2/pp_slot_fidelity.py): on TP=1/PP>1 the floor is
+        # this rank's OWN value (#788: the reduce group has one member), so the
+        # refuse-and-retry-next-pass below skews this stage a pass behind its
+        # peers. There the shortfall is evicted and the load runs in THIS pass;
+        # None = not that form, False = the residual: the path below unchanged.
+        if kv_tokens > floor:
+            from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+            if _sf.local_pp_room(self, kv_tokens, floor, getattr(req, "rid", None)):
+                # A group of one's floor IS this rank's available_size():
+                # re-read after the eviction, it clears the load-back.
+                floor = int(self.token_to_kv_pool_allocator.available_size())
         if floor < kv_tokens:
             # weg2xsn285 (18.09.): THE FLOOR REFUSED AND NOBODY EVICTED. Group
             # D held three finished 98k prompts (retained, backed up,

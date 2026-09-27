@@ -41,7 +41,7 @@ class BudgetHead(NamedTuple):
     req: Any
     pos: int
     end: int
-    src: str          # "chunked" | "told" | "zero"
+    src: str          # "chunked" | "told" | "kept" (SF) | "zero"
     local_prefix: int  # len(prefix_indices) on THIS rank (what the pre-fix code used)
 
 
@@ -79,6 +79,16 @@ def budget_head(scheduler) -> Optional[BudgetHead]:
             told = 0
         pos = max(0, min(told, max(end - 1, 0)))
         return BudgetHead(req, pos, end, "told", local)
+    # SF (b23 #1004): #1400's admission pops the told on the first visit and H91
+    # keeps the verdict (_weg2_told_kept). A head that visited without admitting
+    # sizes the pass from its KEPT told -- kept the same way on every rank -- not
+    # from 0 (PP0 planned start=0 -> 1024 on an extent #988 moved to 40958).
+    from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+    kept = _sf.kept_told(scheduler, req)
+    if kept is not None:
+        pos = max(0, min(int(kept), max(end - 1, 0)))
+        return BudgetHead(req, pos, end, "kept", local)
     return BudgetHead(req, 0, end, "zero", local)
 
 
