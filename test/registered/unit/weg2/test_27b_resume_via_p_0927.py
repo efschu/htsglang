@@ -29,6 +29,9 @@ def d_env(monkeypatch, tmp_path):
     monkeypatch.setenv("SGLANG_WEG2_GROUP", "D")
     monkeypatch.setenv("SGLANG_HICACHE_ARENA_DIR", str(tmp_path))
     monkeypatch.delenv(rvp.ENV, raising=False)
+    # ROS (27.09. NF): this file pins the output>0 rule it was written for;
+    # the open-stream rule has its own file (test_27b_resume_open_stream_0927).
+    monkeypatch.setenv(rvp.ENV_OPEN_STREAM, "0")
     return tmp_path
 
 
