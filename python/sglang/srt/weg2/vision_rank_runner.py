@@ -15,10 +15,11 @@ and skips a dormant group itself, so the flip is finished before it starts
 and it never touches the flip. It stages
 in THE PASS that finds the images, all images waiting at that moment with
 ONE tower load, before that pass's admission -- whether or not microbatches
-are in flight. PP0's own forwards are launched synchronously inside earlier
-passes, so nothing of PP0's runs on the card during the stage; the tower
-takes free KV-tail pages (or free VRAM) that no in-flight batch owns, and
-gives them back before the admission.
+are in flight. The tower takes free KV-tail pages (or free VRAM) that no
+in-flight batch owns, and gives them back before the admission. PP0's last
+forward may still run on ``forward_stream`` meanwhile: on the tail that costs
+nothing, in free VRAM the stage first waits for it (``sync_ms`` in W102), so
+the tower never stacks on that forward's workspace (27B review of H125e).
 
 H125e (V1 dkrnfh91visbar1dauer09270822, 08:29:10Z, #1004 SLOT DISAGREEMENT):
 the stage used to wait for PP0 to DRAIN and held EVERY waiting request out
@@ -377,6 +378,24 @@ class StageOutcome:
     host_current_delta: str = "n/a"
     host_anon_delta: str = "n/a"
     legs_ms: Dict[str, float] = field(default_factory=dict)
+    #: 27B review of H125e: the wait for PP0's last forward before a tower in
+    #: free VRAM (None: not asked -- the tower sat on the KV tail)
+    sync_ms: Optional[float] = None
+
+
+def wait_pp0_forward(scheduler, clock: Callable[[], float] = time.perf_counter) -> float:
+    """Wait for the forward PP0 last launched. Without the drain (H125e) the
+    stage can run while that forward is still on the card: its workspace comes
+    from the caching allocator, so a tower in free VRAM would stack its
+    transient on top of it. On the KV tail the tower only takes pages no batch
+    owns and nothing stacks. The forward runs on ``forward_stream``, not on
+    the scheduler's current stream, so the current-stream sync does not cover
+    it. Returns the wait in ms."""
+    stream = getattr(scheduler, "forward_stream", None)
+    t0 = clock()
+    if stream is not None:
+        stream.synchronize()
+    return (clock() - t0) * 1e3
 
 
 def card_air(device: torch.device) -> Tuple[int, int]:
@@ -457,7 +476,10 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             else:
                 # H125: the card's own air, when the tail is not wholly free
                 # (auto) or by choice (free). Refused by name when it does not
-                # fit -- never a partial placement, never an eviction.
+                # fit -- never a partial placement, never an eviction. Wait for
+                # PP0's in-flight forward first, so the air is read after its
+                # workspace went back to the cache.
+                out.sync_ms = wait_pp0_forward(scheduler, clock)
                 need = vrs.slab_bytes(sizes)
                 card_free, cache_idle = air(device)
                 fits, why = vrs.free_vram_verdict(need, card_free, cache_idle)
@@ -550,13 +572,14 @@ def _strip_module(module: torch.nn.Module) -> None:
 def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
     legs = ", ".join(f"{k} {v:.0f}" for k, v in out.legs_ms.items())
     residue = "n/a" if out.residue_bytes is None else f"{out.residue_bytes / vrs.MIB:+.1f}"
+    sync = "n/a" if out.sync_ms is None else f"{out.sync_ms:.1f}"
     line = (f"run={run} rank=PP0 requests={len(rids)} items={out.items} "
             f"place={out.place or 'none'} source={out.source or 'none'} "
             f"card={'n/a' if out.card is None else f'nvml{out.card}'} "
             f"tail_pages={out.tail_pages}/{out.num_pages} tower_mib={out.tower_bytes / vrs.MIB:.1f} "
             f"read={('O_DIRECT' if out.direct else 'BUFFERED') if out.read_bytes else 'none'} "
             f"read_mib={out.read_bytes / vrs.MIB:.1f} "
-            f"legs_ms=({legs}) vram_residue_mib={residue} "
+            f"legs_ms=({legs}) sync_ms={sync} vram_residue_mib={residue} "
             f"host_current_delta_mib={out.host_current_delta} host_anon_delta_mib={out.host_anon_delta}")
     if out.ok:
         logger.info("%s %s rids=%s", W_STAGE_OK, line, list(rids))
