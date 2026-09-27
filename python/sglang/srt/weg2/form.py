@@ -428,6 +428,13 @@ class ModelProfile:
     #: (X-EXACT-ERR / X-EXACT-TOKENS); then the operator turns the row on.
     #: Switch SGLANG_WEG2_FRONT_EXACT_TOKENS (explicit value wins).
     front_exact_tokens: bool = False
+    #: rc12b D TP0 OOM (27.09. 00:26:34Z): the D budget starts at NVML total
+    #: and never took the driver carve (Card.reserved_mib, 519 MiB on the
+    #: 5090: nvidia-smi "Reserved", torch capacity 32092 of 32607) -- the
+    #: corridor meant for D's transients was 519 MiB smaller than booked.
+    #: On: the budget books it as its own term "driver_carve". qwen27b off
+    #: (byte-identical) until the 27B seat decides (it costs 519 MiB of KV).
+    budget_charges_driver_carve: bool = False
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -664,6 +671,8 @@ PROFILES: Dict[str, ModelProfile] = {
         # X-EXACT (user 26.09., "gilt fuer 27B und NF"): OFF until measured;
         # the NF tokenizer is the group's own (Minachist INT4 tokenizer.json).
         front_exact_tokens=False,
+        # rc12b OOM: the D budget books the driver carve (NF seat, 27.09.).
+        budget_charges_driver_carve=True,
     ),
 }
 

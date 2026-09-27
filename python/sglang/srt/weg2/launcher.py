@@ -10553,6 +10553,29 @@ def served_dormant_growth(cards: List[Card], profile: Optional[str] = None) -> T
     return vals, "WEG2-DORMANT-SERVED record"
 
 
+def _pconst_boots(name: str, profile: Optional[str] = None) -> str:
+    """``boot <tag>[,<tag>...]`` of the record behind ``name`` for ``profile``
+    (H94: a record names the boots it was measured on, so the budget line says
+    whose measurement it charges); the provenance text where no boot is named."""
+    prof = profile if profile is not None else weg2_form.DEFAULT_PROFILE
+    row = weg2_form.profile_row(prof)
+    rec = row.constants.get(name) if row is not None else None
+    if rec is None:
+        return ""
+    boots = tuple(getattr(rec, "boots", ()) or ())
+    if boots:
+        own = "" if getattr(rec, "measured_on", prof) == prof else f" measured_on={rec.measured_on}"
+        return "boot " + ",".join(boots) + own
+    return str(getattr(rec, "provenance", ""))
+
+
+def budget_charges_driver_carve(profile: Optional[str] = None) -> bool:
+    """The profile row's ``budget_charges_driver_carve`` (rc12b OOM); False
+    for an unknown profile, so nothing changes where no row says so."""
+    row = weg2_form.profile_row(profile if profile is not None else weg2_form.DEFAULT_PROFILE)
+    return bool(getattr(row, "budget_charges_driver_carve", False))
+
+
 def budgets_from_dc(
     cards: List[Card],
     dc_mib: Dict[str, int],
@@ -10565,6 +10588,7 @@ def budgets_from_dc(
     user_reserve_by_card: Optional[Dict[str, int]] = None,
     dormant_growth_mib: Optional[List[int]] = None,
     dormant_growth_provenance: str = "",
+    charge_driver_carve: bool = False,
 ) -> List[int]:
     out = []
     # #1257c: ONE derivation, per card, for the group this budget is for.
@@ -10587,7 +10611,12 @@ def budgets_from_dc(
         # (P PP0 1320 -> 1802 MiB). The growth is a measured record
         # (weg2/dormant_residue.py), charged here as its own term.
         grow = int(dormant_growth_mib[i]) if dormant_growth_mib is not None else 0
-        b = c.total_mib - corridor - dc_mib[c.uuid] - grow - over
+        # rc12b OOM: total_mib is the NVML board; the driver's carve
+        # (Card.reserved_mib) is never allocatable. The corridor pass below
+        # subtracts it from predicted_free on its own, so charging it here
+        # does not count it twice.
+        carve = int(getattr(c, "reserved_mib", 0) or 0) if charge_driver_carve else 0
+        b = c.total_mib - corridor - dc_mib[c.uuid] - grow - over - carve
         b = (b // 8) * 8
         out.append(b)
         log(
@@ -10598,6 +10627,7 @@ def budgets_from_dc(
             f"+ awake_overshoot {D_AWAKE_OVERSHOOT_MIB}) "
             f"- dormant_other {dc_mib[c.uuid]}"
             + (f" - served_dormant_growth {grow} ({dormant_growth_provenance})" if grow else "")
+            + (f" - driver_carve {carve} (NVML reserved)" if carve else "")
             + (f" - measured_awake_overshoot {over} ({overshoot_provenance})" if over else "")
             + " MiB"
         )
@@ -20376,7 +20406,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return int(spec_d.proc.returncode or 0)
     launch_group(spec_p, tree, log, dry)
     if dry:
-        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))))
+        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile))
         # #145 AN BEIDEN STELLEN -- siehe #114 direkt darunter: es gibt ZWEI
         # Stellen, an denen budgets_d entsteht, und eine Fassung, die nur die
         # untere trifft, fehlt genau im Dry-Run, wo das Gate sie sucht.
@@ -20497,10 +20527,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # 5. group D
     _grow, _grow_prov = served_dormant_growth(cards, ns.profile)
     budgets_d = budgets_from_dc(
-        cards, dc_p, log, "D", overshoot_mib=list(_pconst("D_OVERSHOOT_MIB", ns.profile)), overshoot_provenance="boot weg2ls4b1",
+        cards, dc_p, log, "D", overshoot_mib=list(_pconst("D_OVERSHOOT_MIB", ns.profile)),
+        overshoot_provenance=_pconst_boots("D_OVERSHOOT_MIB", ns.profile),
         corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
         user_reserve_by_card=user_reserve_by_card,
         dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
+        charge_driver_carve=budget_charges_driver_carve(ns.profile),
     )
     state.budgets["D"] = budgets_d
     log_d_rank_vram_solve(ns, cards, budgets_d, log, "D",

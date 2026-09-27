@@ -33,6 +33,23 @@
    "kind": "memory",
    "power_limit_w": null,
    "power_limit_source": "not a power-dependent quantity (bytes a sleeping rank keeps)"
+  },
+  {
+   "name": "D_OVERSHOOT_MIB",
+   "value": [
+    826,
+    0,
+    0
+   ],
+   "provenance": "NF D awake overshoot = D TP0 peak demand at the card edge - its budget, max over the served NF Dauerlauf boots (per-process NVML in the torch OOM line + the refused request): dkrnfh91bar1dauer09270007 (c6868a1e13) 29890+80-29144 = 826 (14.5 min, includes the run's drift: D untagged sleep residue 1824->2310, allocated 28415->28749); 09262249 (530fb713ce) 29972+80-29624 = 428 (4 min); 09262302 29819+158-29624 = 353. Includes the extend transient in flight at the edge. 3080 ranks: no edge reached on NF, 0 as before. Replaces the qwen27b borrow (489, boot weg2ls4b1).",
+   "boots": [
+    "dkrnfh91bar1dauer09270007",
+    "dkrnfh91bar1dauer09262249",
+    "dkrnfh91bar1dauer09262302"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded per record; the rig ran 5090 400 W / 3080 230 W (row 27)"
   }
  ],
  "borrow": {
@@ -42,7 +59,6 @@
    "DC_MEASURED_D_3080_MIB",
    "DC_MEASURED_D_XCHG_MIB",
    "P_OVERSHOOT_MIB",
-   "D_OVERSHOOT_MIB",
    "CALIBRATION_LAYERS",
    "MEASURED_MS_PER_LAYER",
    "P_PP_STAGE_FIXED_MIB",

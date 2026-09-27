@@ -62,12 +62,15 @@ class TestRecordsAreTheOldLiterals(unittest.TestCase):
         row = F.PROFILES["nextflash"]
         self.assertEqual(row.constant("P_DRAFT_RESIDENT_BUDGET_MIB"), 615.7 + 1522.7)
         self.assertEqual(row.constants["P_DRAFT_RESIDENT_BUDGET_MIB"].measured_on, "nextflash")
+        # rc12b OOM (27.09.): the NF row measures its own D awake overshoot
+        self.assertEqual(row.constant("D_OVERSHOOT_MIB"), (826, 0, 0))
+        self.assertEqual(row.constants["D_OVERSHOOT_MIB"].measured_on, "nextflash")
         got = dict(F.borrowed_constants("nextflash"))
-        self.assertEqual(set(got), set(OLD_27B) - {"P_DRAFT_RESIDENT_BUDGET_MIB"})
+        self.assertEqual(set(got), set(OLD_27B) - {"P_DRAFT_RESIDENT_BUDGET_MIB", "D_OVERSHOOT_MIB"})
         self.assertEqual(set(got.values()), {"qwen27b"})
         for n in got:
             self.assertEqual(row.constant(n), OLD_27B[n], n)
-        self.assertIn("17 constant row(s) BORROWED", F.borrowed_constants_line("nextflash"))
+        self.assertIn("16 constant row(s) BORROWED", F.borrowed_constants_line("nextflash"))
 
     def test_launcher_aliases(self):
         if L is None:
