@@ -192,12 +192,20 @@ def park_body(epoch: int, bound_s: float, reason: Optional[str] = None) -> dict:
 # decodes parks D's running decodes at once and the front flips to P -- no
 # 60 s bound, no waiting for D's decodes to end. Only a request that NEEDS P
 # fires it: one D could serve itself once idle (a SHORT behind D's budget, a
-# band request the RC7-X busy/idle split deferred, a SHORT-only backlog the
-# 27B idle policy (b) drains) never does -- for those no flip is due at all.
+# SHORT-only backlog the 27B idle policy (b) drains) never does -- for those no
+# flip is due at all.
+#
+# PK2 (metal dkr27bparkdraftbar1w209270712, 27.09.): a BAND request the RC7-X
+# busy/idle split deferred (Pending.x_deferred: X_busy < uncached <= live X,
+# routed LONG because D was decoding) DOES fire. While D decodes, the X in force
+# is X_busy (the router's own verdict); the idle re-grant only serves it once D
+# is idle, i.e. after D's decodes end -- weg2-28-62 (4172 > X_busy 4096 <= live X
+# 7290) waited 45 s for the fairness bound and 65 s more for the drain (flip 67 s).
 # ---------------------------------------------------------------------------
 
 def needs_p(est_uncached: int, x_tokens: int, *, skip_leg1: bool = False,
-            leg1_done: bool = False, p_only: bool = False, x_requeues: int = 0) -> bool:
+            leg1_done: bool = False, p_only: bool = False, x_requeues: int = 0,
+            x_deferred: bool = False) -> bool:
     """Does this queued request need P's prefill (the immediate park's
     trigger)? ``est_uncached > X`` (law 4: D never prefills above X), a
     P-only request (an image under transient vision, long by rule), or one D
@@ -206,8 +214,8 @@ def needs_p(est_uncached: int, x_tokens: int, *, skip_leg1: bool = False,
     CARRIER-EXCEEDS: D prefills it once, a flip to P buys nothing)."""
     if skip_leg1 or leg1_done:
         return False
-    if p_only or int(x_requeues or 0) > 0:
-        return True
+    if p_only or int(x_requeues or 0) > 0 or x_deferred:
+        return True  # x_deferred: over X_busy, the X in force while D decodes (PK2)
     return int(est_uncached) > int(x_tokens)
 
 
@@ -219,7 +227,8 @@ def immediate_park_trigger(queue: Iterable, x_tokens: int):
                    skip_leg1=bool(getattr(p, "skip_leg1", False)),
                    leg1_done=bool(getattr(p, "leg1_done", False)),
                    p_only=bool(getattr(p, "p_only", False)),
-                   x_requeues=int(getattr(p, "x_requeues", 0) or 0)):
+                   x_requeues=int(getattr(p, "x_requeues", 0) or 0),
+                   x_deferred=bool(getattr(p, "x_deferred", False))):
             return p
     return None
 

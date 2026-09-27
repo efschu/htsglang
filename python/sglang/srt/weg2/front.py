@@ -3515,7 +3515,8 @@ class Front:
             return None
         return p
 
-    async def _wait_bound_park(self, wait_s: Optional[float], immediate: Optional["Pending"] = None) -> str:
+    async def _wait_bound_park(self, wait_s: Optional[float], immediate: Optional["Pending"] = None,
+                               cause: str = "over-x") -> str:
         """Rule 3: the wait bound fired in the D phase -- park D's running
         decodes and let the controller flip.
 
@@ -3537,11 +3538,16 @@ class Front:
         if immediate is not None:
             # 27B PARK (user 26.09.): not a bound -- the arrival itself fires.
             self.counters["park_immediate_fired"] += 1
+            if cause != "over-x":
+                self.counters[f"park_immediate_{cause}"] += 1
             logger.warning(
-                "WEG2 PARK-IMMEDIATE FIRED epoch=%d rid=%s est_uncached=%d X=%d p_only=%s "
+                "WEG2 PARK-IMMEDIATE FIRED epoch=%d cause=%s rid=%s est_uncached=%d X=%d X_busy=%d "
+                "x_deferred=%s p_only=%s "
                 "x_requeues=%d waited_s=%.1f awake_s=%.1f running=%d ready_for_d=%d queue=%d -- "
                 "admission to D closed for this phase, %s",
-                self.epoch, immediate.rid, int(immediate.est_uncached), int(self.tp_prefill_max_tokens),
+                self.epoch, cause, immediate.rid, int(immediate.est_uncached),
+                int(self.tp_prefill_max_tokens), int(self._x_band_floor()),
+                bool(getattr(immediate, "x_deferred", False)),
                 bool(getattr(immediate, "p_only", False)), int(getattr(immediate, "x_requeues", 0) or 0),
                 max(0.0, now - float(immediate.t_arrive)), max(0.0, now - float(self.t_awake)),
                 len(running), len(self._ready_for_d), len(self.queue),
@@ -8582,6 +8588,16 @@ class Front:
                         if not self._dwell_ok("D", "P", fairness_fired, work_exhausted=d_work_exhausted,
                                               oldest_wait_s=time.time() - (oldest or time.time())):
                             continue
+                        # PK2 (metal ...09270712 epoch 28, 27.09.): under the immediate
+                        # park a D->P flip NEVER drains running decodes -- whatever
+                        # decided it (fairness bound, economics, an admission closed
+                        # earlier). The flip's drain waited 65.7 s for two agent
+                        # decodes (6198 / 11133 tokens) after the fairness switch
+                        # fired; parked, they resume first after the flip back.
+                        if (getattr(self, "d_park_immediate", False) and self.queue
+                                and self._flip_ledger(D)):
+                            await self._wait_bound_park(None, immediate=self.queue[0],
+                                                        cause="before-flip")
                         await self.flip("D", "P")
                     continue
                 # awake == P: prefill the backlog until empty (#1011 PP exit
