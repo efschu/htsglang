@@ -7760,14 +7760,17 @@ class Scheduler(
             f"that is not loading is refused BY NAME rather than served by "
             f"prefilling this group over its own --tp-prefill-max-tokens bound."
         )
+        # #249: which rank's pool set the group MIN of this rid's last trim
+        _cut_fn = getattr(getattr(self, "tree_cache", None), "prefetch_cut_terms", None)
+        cut = _cut_fn(rid) if callable(_cut_fn) else "min_rank=?"
         logger.error(
             "%s %s rid=%s arm=%s span=%s site=%s "
-            "no_progress_passes=%d bound_passes=%d witness=%s n=%d -- terminal, "
+            "no_progress_passes=%d bound_passes=%d witness=%s n=%d %s -- terminal, "
             "answered 503; never admitted over X (denominator: every deferred "
             "store read this exit answered)",
             code, name, rid[:16], arm, span, site, passes,
             self._weg2_prefetch_stall_passes(), terms,
-            self._weg2_store_load_failed,
+            self._weg2_store_load_failed, cut,
         )
         refused_id = id(req)
         self.waiting_queue = [q for q in self.waiting_queue if id(q) != refused_id]

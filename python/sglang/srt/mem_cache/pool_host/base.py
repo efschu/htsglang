@@ -423,6 +423,14 @@ class HostKVCache(abc.ABC):
             int(getattr(self, "size", -1)),
             self._clear_epoch,
         )
+        # #249: ids a byteless pool grew (0 B each) end with the rows they named
+        synced = getattr(self, "_byteless_synced_size", None)
+        if synced is not None and int(self.size) != int(synced):
+            self.size = int(synced)
+            self.page_num = self.size // self.page_size
+            regrow = getattr(self, "_regrow_byteless_buffer", None)
+            if callable(regrow):
+                regrow()
         # Initialize memory states and tracking structures.
         self.mem_state = torch.zeros(
             (self.size,), dtype=torch.uint8, device=self.device
@@ -435,11 +443,61 @@ class HostKVCache(abc.ABC):
     def available_size(self):
         return len(self.free_slots)
 
+    #: #249: BYTELESS-GROW lines printed (first 8, then every 64th)
+    _byteless_grow_n = 0
+
+    def _grow_byteless(self, short: int) -> None:
+        """#249 (rc12t, 8 W88 in 11 min): a Form A expert worker's KV host
+        pool carries 0 bytes per row (JG ``byteless``) and, under R12
+        (form_a_host_shadow), keeps every row until the reset -- a worker
+        never frees a row as transit and never evicts host on its own. Its
+        synced 353573 rows filled up while TP0's arena still had the span,
+        and the #580 vote took the worker's allocated length as the group
+        MIN: ``#915 PREFETCH TRUNCATED need=54336 got=49216``, 64 requeues,
+        ``W88 arm=host_pool_shortfall``.
+
+        A row that holds no bytes is a placeholder, not capacity: the id
+        space grows by whole pages (bookkeeping only, 0 B of KV) instead of
+        refusing, so a worker's length vote is its span again and the
+        group's room is TP0's. No larger pool, no reserve -- the grown ids
+        go back to the synced size at the next ``clear()``. Caller holds
+        the pool lock (``alloc``)."""
+        add = -(-int(short) // self.page_size) * self.page_size
+        if add <= 0:
+            return
+        base = getattr(self, "_byteless_synced_size", None)
+        if base is None:
+            self._byteless_synced_size = int(self.size)
+        old = int(self.size)
+        self.size = old + add
+        self.page_num = self.size // self.page_size
+        self.mem_state = torch.cat(
+            [self.mem_state, torch.zeros((add,), dtype=self.mem_state.dtype, device=self.mem_state.device)]
+        )
+        self.slot_used = torch.cat([self.slot_used, torch.zeros(add, dtype=torch.bool)])
+        self.free_slots = torch.cat(
+            [self.free_slots, torch.arange(old, old + add, dtype=torch.int64)]
+        )
+        regrow = getattr(self, "_regrow_byteless_buffer", None)
+        if callable(regrow):
+            regrow()
+        HostKVCache._byteless_grow_n += 1
+        n = HostKVCache._byteless_grow_n
+        if n <= 8 or n % 64 == 0:
+            logger.info(
+                "#249 BYTELESS-GROW pool=%s rows %d -> %d (+%d, 0 B each; synced %d) "
+                "n=%d -- a row without bytes is a placeholder, never the group's bound",
+                getattr(self, "budget_label", None) or type(self).__name__,
+                old, self.size, add, int(self._byteless_synced_size), n,
+            )
+
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         assert need_size % self.page_size == 0, (
             "The requested size should be a multiple of the page size."
         )
+        if need_size > self.available_size() and getattr(self, "byteless", False):
+            self._grow_byteless(need_size - self.available_size())
         if need_size > self.available_size():
             return None
 

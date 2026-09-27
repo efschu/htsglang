@@ -227,6 +227,33 @@ _MAX_PREFETCH_REISSUES: int = 3
 #: value; it is reduced as a (tag, -tag) pair so one MIN yields min and max.
 _PREFETCH_VOTE_TAG = 580
 
+#: #249: a rank that did not cut the group's span votes this in the cut-rank MIN
+_PREFETCH_NO_CUT_RANK = 1 << 30
+#: #249: rids whose last group truncation is kept for the W88 line (leak bound)
+_PREFETCH_CUT_SLOTS = 4096
+
+
+def _prefetch_cut_rank(tree, local_len: int, group_len: int) -> int:
+    """#249 (rc12t: ``#915 PREFETCH TRUNCATED need=54336 got=49216`` on every
+    rank, 64 requeues, W88 -- and no line said WHICH rank's pool set the
+    group MIN). One MIN over the group of (my rank if my own allocated length
+    IS the group length, else a sentinel): the lowest rank that cut. Called
+    only inside the group-agreed truncation branch (``group_len < span_lo``,
+    both reduced values), so every rank issues it together. -1 = nobody
+    matched (cannot happen past a consistent vote; printed, never raised)."""
+    me = getattr(tree, "_weg2_rank_label", None)  # a desk shell names its rank
+    if me is None:
+        try:
+            me = int(torch.distributed.get_rank()) if torch.distributed.is_initialized() else 0
+        except Exception:  # noqa: BLE001 - a rank number is a label here
+            me = 0
+    t = torch.tensor(
+        [me if int(local_len) == int(group_len) else _PREFETCH_NO_CUT_RANK], dtype=torch.int
+    )
+    tree._all_reduce_attn_groups(t, torch.distributed.ReduceOp.MIN, label="prefetch_cut_rank")
+    v = int(t[0].item())
+    return -1 if v >= _PREFETCH_NO_CUT_RANK else v
+
 # #1276: heartbeat interval for the #1028 ROUND CENSUS line. The counter runs
 # every round; the LINE is written on a state change, or once per this many
 # seconds so a long quiet stretch still leaves a trace. 60 s matches the
@@ -6409,7 +6436,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _note_prefetch_gate(
                     "host_pool_truncated_group", len(prefetch_key) - group_len
                 )
-                self._log_prefetch_truncated(req_id, need, group_len)
+                _cut_rank = _prefetch_cut_rank(self, local_len, group_len)
+                self._log_prefetch_truncated(
+                    req_id, need, group_len, cut_rank=_cut_rank, local=local_len
+                )
+                _cuts = getattr(self, "_prefetch_cut_by_rid", None)
+                if _cuts is None:
+                    _cuts = self._prefetch_cut_by_rid = {}
+                _cuts[str(req_id)] = (_cut_rank, int(group_len), int(need))
+                while len(_cuts) > _PREFETCH_CUT_SLOTS:
+                    _cuts.pop(next(iter(_cuts)))
                 if len(host_indices) > group_len:
                     self.cache_controller.append_host_mem_release(
                         host_indices=host_indices[group_len:]
@@ -6636,12 +6672,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             t["generation"],
         )
 
-    def _log_prefetch_truncated(self, req_id: str, need: int, got: int) -> None:
+    def _log_prefetch_truncated(
+        self, req_id: str, need: int, got: int, cut_rank=None, local=None
+    ) -> None:
         """L2 (#1068 slice 4): the span was cut to the pool's room and still
         registers. ``over_bound`` is the one-chunk law (#939) read per line:
         'true' when the lost tokens exceed chunked_prefill_size, 'false' when
         not, 'unknown' when this tree was built without the chunk term (a
         stand-in) -- never a verdict against an unmeasured bound.
+
+        #249: ``cut_rank`` names the rank whose own allocated length set the
+        group MIN (group trim), ``local`` this rank's own; the per-rank
+        truncation site cuts to this rank's room (``cut_rank=local``).
         """
         t = self._prefetch_line_terms(need)
         lost = int(need) - int(got)
@@ -6649,7 +6691,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         over_bound = "unknown" if chunk <= 0 else ("true" if lost > chunk else "false")
         logger.warning(
             "#915 PREFETCH TRUNCATED rid=%s need=%d got=%d lost=%d chunk=%d "
-            "over_bound=%s available=%d pool_id=%d epoch=%d phase=%s generation=%d",
+            "over_bound=%s available=%d pool_id=%d epoch=%d phase=%s generation=%d "
+            "cut_rank=%s local=%s",
             str(req_id)[:8],
             int(need),
             int(got),
@@ -6661,7 +6704,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             t["epoch"],
             t["phase"],
             t["generation"],
+            "local" if cut_rank is None else cut_rank,
+            int(got) if local is None else int(local),
         )
+
+    def prefetch_cut_terms(self, req_id) -> str:
+        """#249: the last group truncation of ``req_id`` for the W88 line --
+        ``min_rank=R group_len=G need=N`` or ``min_rank=-`` (never cut)."""
+        cut = (getattr(self, "_prefetch_cut_by_rid", None) or {}).get(str(req_id))
+        if cut is None:
+            return "min_rank=-"
+        return f"min_rank={cut[0]} group_len={cut[1]} need={cut[2]}"
+
 
     def _retire_ongoing_prefetch(self, req_id: str) -> bool:
         """Displace the record under ``req_id``, terminated but NOT freed.
