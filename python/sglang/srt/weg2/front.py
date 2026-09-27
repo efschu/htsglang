@@ -2806,6 +2806,14 @@ class Pending:
     short_kept: bool = False
     #: SK: the front epoch the price was taken in.
     price_epoch: int = -1
+    #: SK-X (W35 class, NF rc12t weg2-6-30): D refused this kept SHORT before
+    #: the first byte -- its presence expired with the reroute. The TokenSpans
+    #: record count at that instant: only D evidence recorded AFTER it may
+    #: price the rid back to D (``_sk_admission_reprice``). None = no void.
+    sk_void_seq: Optional[int] = None
+    #: SK-X: P's leg 1 actually ran for this rid (P answered 200). W35 "after
+    #: a full P prefill" is only true when it did.
+    leg1_ran: bool = False
     #: #244: when leg 1 finished and the request started waiting for a D seat.
     t_ready: float = 0.0
     #: xsn438: only group P can serve this request -- an image under
@@ -4851,20 +4859,31 @@ class Front:
         queue as an ordinary BATCH request (leg 1 on P). Returns True when it
         was moved to P. No re-price possible (no exact tokenizer): admitted
         unchanged, D's own gate stands."""
-        if int(getattr(p, "price_epoch", -1)) == int(self.epoch):
+        if (int(getattr(p, "price_epoch", -1)) == int(self.epoch)
+                and getattr(p, "sk_void_seq", None) is None):
             return False
         if not self.x_exact or self.ftok is None or self.tspans is None:
             return False
         ids = self.ftok.ids_for(p.text)
         if ids is None:
             return False
-        new, _credit, _known, src = self.tspans.pending(ids, epoch=self.epoch)
+        # SK-X (W35 class, NF rc12t weg2-6-30): D refused this rid before the
+        # first byte (W50 / x_refusal reroute) -- the presence it was kept on
+        # expired with that refusal. Only D evidence recorded AFTER it counts
+        # (``since_seq``); without a fresh confirmation the P reroute stands.
+        void = getattr(p, "sk_void_seq", None)
+        if void is None:
+            new, _credit, _known, src = self.tspans.pending(ids, epoch=self.epoch)
+        else:
+            new, _credit, _known, src = self.tspans.pending(ids, epoch=self.epoch, since_seq=void)
         old = int(p.est_uncached)
         x = int(self.tp_prefill_max_tokens)
         p.est_uncached = int(new)
         p.price_epoch = int(self.epoch)
         self.counters["short_kept_repriced"] += 1
         to_p = int(new) > x
+        if void is not None:
+            src = f"{src}(fresh-after-reroute)"
         logger.info("WEG2 SHORT-KEPT-REPRICE rid=%s est_uncached %d -> %d X=%d src=%s epoch=%d -> %s "
                     "(a flip lay between the price and the D admission)", p.rid, old, int(new), x, src,
                     self.epoch, "P (presence gone: leg 1 on P)" if to_p else "D")
@@ -6680,6 +6699,7 @@ class Front:
             status, body = await self._leg1_bounded(p, _post())
             if status != 200:
                 raise RuntimeError(f"leg1 on P returned {status}: {body[:300]!r}")
+            p.leg1_ran = True  # SK-X: the W35 premise "after a full P prefill"
             try:
                 js = json.loads(body)
             except Exception:  # noqa: BLE001
@@ -7534,16 +7554,25 @@ class Front:
                  "carrier_est": carrier_est,
                  "carrier_max": self.carrier_max_tokens},
                 status=413)
+        # SK-X (W35 class, NF rc12t weg2-6-30): W35 says "a second time AFTER
+        # A FULL P PREFILL". A rid whose P leg never ran (a kept SHORT whose
+        # first reroute skipped leg 1) gets the regular P reroute instead --
+        # once: a third refusal is W35 whatever ran (the bound stays).
+        leg1_ran = bool(getattr(pending, "leg1_ran", False)) if pending is not None else False
+        terminal = n > 1 and (leg1_ran or n > 2)
+        if n > 1 and not terminal:
+            self.counters["x_requeue_p_never_ran"] += 1
+        _verdict = ("requeue" if not terminal else ("W53" if handback_empty else "W35"))
         logger.warning(
-            "WEG2 X-REQUEUE rid=%s n=%d verdict=%s", rid, n,
-            "requeue" if n <= 1 else ("W53" if handback_empty else "W35"))
+            "WEG2 X-REQUEUE rid=%s n=%d verdict=%s%s", rid, n, _verdict,
+            (" (P never ran for this rid: not W35, the regular P reroute)"
+             if n > 1 and not terminal else ""))
         self._rvp_state()
         logger.warning(
             "WEG2 W50-REROUTE rid=%s front_price=%s d_extent=%s reason=x_refusal path=fresh n=%d "
             "verdict=%s -- refused before the first byte: re-routed through P (leg 1, then leg 2)",
-            rid, self._front_price.get(str(rid), "?"), d_extent, n,
-            "requeue" if n <= 1 else ("W53" if handback_empty else "W35"))
-        if n > 1:
+            rid, self._front_price.get(str(rid), "?"), d_extent, n, _verdict)
+        if terminal:
             # W35 counts the POPULATION -- every rid D refused a second time
             # after a full P prefill. W53 is the SUBSET of those for which
             # D's own number shows the store handed nothing back. So
@@ -7641,6 +7670,19 @@ class Front:
         else:
             p.fut = asyncio.get_event_loop().create_future()
             p.t_arrive = time.time()
+            if getattr(p, "short_kept", False) or getattr(p, "sk_void_seq", None) is not None:
+                # SK-X (W35 class, NF rc12t weg2-6-30): D refused a kept SHORT
+                # before the first byte. Its presence expires with this
+                # refusal: no longer kept, leg 1 runs on P. Only D evidence
+                # recorded after now may price it back to D.
+                p.short_kept = False
+                p.skip_leg1 = False
+                p.sk_void_seq = int(getattr(self.tspans, "seq", 0) or 0) if self.tspans is not None else 0
+                self.counters["short_kept_void_reroute"] += 1
+                logger.warning("WEG2 SHORT-KEPT-VOID rid=%s n=%d d_extent=%s reason=x_refusal (D refused the "
+                               "kept SHORT before the first byte: its presence expired with the reroute -- "
+                               "leg 1 on P; only a fresh D confirmation may price it back to D)",
+                               rid, n, d_extent)
         # Review V A2: THE BACKLOG IS PRICED AT D's MEASURED EXTENT when D said
         # it. D refused because its extent after match_prefix exceeded its
         # riegel; the char estimate above can sit BELOW the live X (and so

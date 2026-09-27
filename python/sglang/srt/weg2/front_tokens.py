@@ -346,6 +346,12 @@ class TokenSpans:
             collections.OrderedDict()
         #: #59: key -> D's ``weg2_resumable_depth`` (see SpanLRU.depth_caps).
         self.depth_caps: Dict[str, int] = {}
+        # SK (W35 class, NF rc12t weg2-6-30): a record counter, so a reader
+        # can ask for D evidence taken AFTER a given instant (``since_seq``)
+        # -- a presence D contradicted by refusing is not credited again
+        # until D confirms it afresh. Beside ``entries``, its tuple unchanged.
+        self.seq = 0
+        self.entry_seq: Dict[str, int] = {}
 
     @staticmethod
     def _key(ids: np.ndarray) -> str:
@@ -367,18 +373,26 @@ class TokenSpans:
         pt = max(0, int(prompt_tokens or 0))
         held = held_epoch if (held_epoch is not None and pt > 0) else None
         if resumable_depth is not None and int(resumable_depth) <= 0:
+            self.entry_seq.pop(key, None)
             return
         if ct <= 0 and held is None:
+            self.entry_seq.pop(key, None)
             return
         self.entries[key] = (ids, ct, pt, held)
         if resumable_depth is not None:
             self.depth_caps[key] = int(resumable_depth)
+        self._stamp(key)
+
+    def _stamp(self, key: str) -> None:
+        self.seq += 1
+        self.entry_seq[key] = self.seq
         self._trim()
 
     def _trim(self) -> None:
         while len(self.entries) > self.cap:
             old_key, _ = self.entries.popitem(last=False)
             self.depth_caps.pop(old_key, None)
+            self.entry_seq.pop(old_key, None)
 
     def record_inflight(self, ids: Optional[np.ndarray], held_epoch: Optional[int]) -> None:
         if ids is None or ids.size == 0 or held_epoch is None:
@@ -388,12 +402,17 @@ class TokenSpans:
         ct = old[1] if old else 0
         pt = max(int(ids.size), old[2] if old else 0)
         self.entries[key] = (ids, ct, pt, int(held_epoch))
-        self._trim()  # #59: an old depth cap stays until the finish replaces it
+        self._stamp(key)  # #59: an old depth cap stays until the finish replaces it
 
-    def pending(self, ids: np.ndarray, epoch: Optional[int] = None) -> Tuple[int, int, bool, str]:
-        """(pending tokens, credited tokens, presence known, witness)."""
+    def pending(self, ids: np.ndarray, epoch: Optional[int] = None,
+                since_seq: Optional[int] = None) -> Tuple[int, int, bool, str]:
+        """(pending tokens, credited tokens, presence known, witness).
+        ``since_seq``: only entries recorded after that record count (a FRESH
+        D confirmation); None = every entry, as before."""
         best, src, known = 0, "none", False
         for key, (eids, ct, pt, held_epoch) in self.entries.items():
+            if since_seq is not None and self.entry_seq.get(key, 0) <= int(since_seq):
+                continue
             lcp = token_lcp(eids, ids)
             if lcp <= 0:
                 continue
