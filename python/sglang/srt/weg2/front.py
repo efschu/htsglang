@@ -2038,6 +2038,14 @@ def _eb_reroute_enabled(env=None) -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def _short_keep_enabled(env=None) -> bool:
+    """SK: ``SGLANG_WEG2_SHORT_KEEP_PRESENCE`` (default on; 0 = a SHORT that
+    falls through is queued BATCH and prefilled on P, as before)."""
+    e = os.environ if env is None else env
+    raw = (e.get("SGLANG_WEG2_SHORT_KEEP_PRESENCE", "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def _flip_single_flight_enabled(env=None) -> bool:
     """FS: ``SGLANG_WEG2_FLIP_SINGLE_FLIGHT`` (default on; 0 = no guard)."""
     e = os.environ if env is None else env
@@ -2658,6 +2666,13 @@ class Pending:
     #: set when that drain handed it to D: its leg 2 then runs exactly as the
     #: SHORT route's (pending=None -- no leg 1 ever ran for it).
     d_direct: bool = False
+    #: SK (#243, NF rc12r weg2-12-39 / weg2-13-44): a SHORT verdict with a
+    #: measured D presence that fell through to the queue (gate timeout, P
+    #: awake): kept for D -- no leg 1 on P -- and re-priced at its D
+    #: admission when a flip lay between the price and the admission.
+    short_kept: bool = False
+    #: SK: the front epoch the price was taken in.
+    price_epoch: int = -1
     #: xsn438: only group P can serve this request -- an image under
     #: ``--weg2-vision transient`` (W102): its embeddings are attached on P's
     #: PP0 and D carries no tower. Its route is ``long`` by RULE, not by
@@ -4544,6 +4559,41 @@ class Front:
                         src, epoch)
         return n
 
+    def _sk_admission_reprice(self, p: "Pending") -> bool:
+        """SK (#243 (a), NF rc12r weg2-12-39: D-ADMIT priced 186 from a D
+        reading taken before a flip, D's extent was 76602). A kept SHORT whose
+        price is from an earlier front epoch is re-priced against the CURRENT
+        measured cached-on-D prefix (X-EXACT). Still <= X: admitted to D with
+        the new price. Over X: the presence is gone -- it goes back to the
+        queue as an ordinary BATCH request (leg 1 on P). Returns True when it
+        was moved to P. No re-price possible (no exact tokenizer): admitted
+        unchanged, D's own gate stands."""
+        if int(getattr(p, "price_epoch", -1)) == int(self.epoch):
+            return False
+        if not self.x_exact or self.ftok is None or self.tspans is None:
+            return False
+        ids = self.ftok.ids_for(p.text)
+        if ids is None:
+            return False
+        new, _credit, _known, src = self.tspans.pending(ids, epoch=self.epoch)
+        old = int(p.est_uncached)
+        x = int(self.tp_prefill_max_tokens)
+        p.est_uncached = int(new)
+        p.price_epoch = int(self.epoch)
+        self.counters["short_kept_repriced"] += 1
+        to_p = int(new) > x
+        logger.info("WEG2 SHORT-KEPT-REPRICE rid=%s est_uncached %d -> %d X=%d src=%s epoch=%d -> %s "
+                    "(a flip lay between the price and the D admission)", p.rid, old, int(new), x, src,
+                    self.epoch, "P (presence gone: leg 1 on P)" if to_p else "D")
+        if not to_p:
+            return False
+        p.short_kept = False
+        p.skip_leg1 = False
+        p.d_direct = False
+        self.queue.append(p)
+        self.counters["short_kept_to_p"] += 1
+        return True
+
     def _x_exact_tokens_check(self, rid: str, group: str, prompt_tokens: int) -> None:
         got = self._x_exact_rid.get(rid)
         if got is None or not prompt_tokens:
@@ -5442,11 +5492,23 @@ class Front:
                 "KV can come back to D) est_prompt=%d queue=%d",
                 rid, remainder, x_route, carrier_est,
                 self.carrier_max_tokens, est_prompt, len(self.queue))
+        # SK (#243): a SHORT verdict whose price rests on a MEASURED D presence
+        # is not re-prefilled on P when it falls through (weg2-12-39: 76602
+        # tokens again on P for an uncached remainder of 186). It keeps its
+        # queue place, skips leg 1 and waits for D; its D admission re-prices
+        # it if a flip lay between (see _sk_admission_reprice).
+        _sk = (short_ok and _short_keep_enabled() and int(store_span or 0) > 0
+               and not short_refused and presence_src not in ("", "none", None))
         if self.awake != "D" and short_ok:
             # L4/R-10: law 1 read literally means every arrival during a P
             # drain is queued BATCH, SHORT ones included.  Counted here,
             # printed by the drain (n=0 printed too), never discovered.
             self.counters["short_behind_p"] += 1
+            # SK: the per-rid line this fall-through never had (weg2-13-44).
+            logger.info("WEG2 SHORT-BEHIND-P rid=%s: SHORT verdict (uncached=%d presence=%d src=%s) "
+                        "arrived while %s is awake -- queued%s", rid, remainder, store_span,
+                        presence_src, self.awake,
+                        " and KEPT for D (no leg 1 on P)" if _sk else " BATCH (leg 1 on P)")
         elif self.awake == "D" and not short_ok:
             # L5: a BATCH arrival during a D phase -- named and left; it is
             # served by the NEXT P phase, whose epoch this line names.
@@ -5455,6 +5517,8 @@ class Front:
         p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt,
                         est_uncached=remainder, span_known=known,
                     store_span_est=store_span,
+                    # SK (#243): see _sk above -- no leg 1, D keeps it.
+                    skip_leg1=_sk, short_kept=_sk, price_epoch=int(self.epoch),
                     # xsn438: routed `long` by the W102 rule above, not by
                     # length -- only P can serve it (Pending.p_only).
                     p_only=_verdict == VERDICT_STAGE,
@@ -5471,7 +5535,22 @@ class Front:
                     # also the ones that fit -- until D's running decodes end,
                     # up to --drain-deadline-s each. Today's path keeps it here.
                     d_eligible=short_ok and not short_refused)
-        self.queue.append(p)
+        if _sk and self.awake == "D" and self.admit_d and self.state == "serving":
+            # SK: D is awake -- the kept SHORT waits in D's own admission line,
+            # BEHIND the batch work that held the gate (no overtaking, no flip
+            # to P for it, no leg 1).
+            p.d_direct = True
+            self._ready_for_d.append(p)
+            self._sync_batch_gate()
+            self.counters["short_kept_d"] += 1
+            logger.info("WEG2 SHORT-KEPT rid=%s uncached=%d presence=%d epoch=%d: the SHORT fell "
+                        "through (gate held / seats / phase) and waits for a D seat behind the batch "
+                        "work -- its D presence is kept, no leg 1 on P", rid, remainder, store_span,
+                        self.epoch)
+        else:
+            if _sk:
+                self.counters["short_kept_queue"] += 1
+            self.queue.append(p)
         self._dp_mark(p, "long" if route == "long" else "batch")  # R28
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         logger.info("WEG2-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d)",
@@ -5837,6 +5916,12 @@ class Front:
                     self._ready_for_d.popleft()
                     self._sync_batch_gate()
                     self.counters["d_admit_skipped_done"] += 1
+                    continue
+                # SK (#243 (a)): a kept SHORT priced in an earlier epoch is
+                # re-priced before it takes a D seat; gone presence -> P.
+                if getattr(p, "short_kept", False) and self._sk_admission_reprice(p):
+                    self._ready_for_d.popleft()
+                    self._sync_batch_gate()
                     continue
                 # FIX 7: the realised count when leg 1 has answered for this
                 # rid, the arrival estimate only for a cold one -- and the
