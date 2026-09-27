@@ -359,11 +359,23 @@ def _log_due(n: int) -> bool:
 
 def _local_prefix(req) -> int:
     """Tokens this rank already holds for ``req`` (device + host tier), the
-    same two terms ``_prefetch_kvcache`` subtracts before it reads."""
+    same two terms ``_prefetch_kvcache`` subtracts before it reads.
+
+    SL (NF rc12u 09271905, weg2-4-7 19:11:06): ``len(prefix_indices or [])``
+    asked ``bool()`` of the torch tensor the live match stores there, which
+    raises for more than one element; the ``except`` below turned that into 0
+    on EVERY real request. So "FOLLOWER SATISFIED LOCALLY" never fired on metal
+    (27B 09271525: 24 DECLINED, 0 SATISFIED) and a follower that already held
+    the told span (PP1 "#1442 HANDOFF-KEYS REG matched=39232 new=1", told
+    39232, "#915 PREFETCH REFUSED reason=too_short") was named "cannot load
+    what PP0 admitted". The twin told got through (its admission adds the
+    registered head); a plain told on that shape -- PP0 re-read what its
+    followers still hold, xsn141 -- would have reached the named MISMATCH.
+    ``len()`` of the object itself, no truthiness."""
     try:
-        return int(len(getattr(req, "prefix_indices", []) or [])) + int(
-            getattr(req, "host_hit_length", 0) or 0
-        )
+        pi = getattr(req, "prefix_indices", None)
+        n = 0 if pi is None else int(len(pi))
+        return n + int(getattr(req, "host_hit_length", 0) or 0)
     except Exception:  # noqa: BLE001 - a double without the fields holds nothing
         return 0
 

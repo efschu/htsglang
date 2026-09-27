@@ -5645,7 +5645,9 @@ class SchedulerWeightUpdaterManager:
                 ext = sp._pp_load_back_extent(req)
                 if not ext:
                     logger.info("WEG2-PRELOAD rid=%s no host extent (device hit %d)",
-                                str(getattr(req, "rid", "?"))[:12], len(getattr(req, "prefix_indices", []) or []))
+                                str(getattr(req, "rid", "?"))[:12],
+                                0 if getattr(req, "prefix_indices", None) is None
+                                else len(req.prefix_indices))  # SL: no bool() of a tensor
                     continue
                 res = tree.inc_lock_ref(req.last_node)
                 dec = res.to_dec_params() if tree.is_tree_cache() else None
