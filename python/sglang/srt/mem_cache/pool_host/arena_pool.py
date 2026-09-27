@@ -122,6 +122,119 @@ def _page_slots_or_none(pool, rows: torch.Tensor) -> Optional[torch.Tensor]:
     return None
 
 
+_CHAIN_REPAIRED_N = [0]
+
+
+class ArenaChainMismatch(RuntimeError):
+    """#1424: a load-back chain addresses arena rows that neither form whole
+    pages nor can be proven against the page keys -- loading them could put
+    another page's KV under these tokens, so the load is refused by name."""
+
+
+def _rows_page_clean(P: int, rows: torch.Tensor) -> bool:
+    n = int(rows.numel())
+    if P == 1:
+        return True
+    if n % P:
+        return False
+    pages = rows.view(-1, P)
+    first = pages[:, 0]
+    lane = torch.arange(P, device=rows.device, dtype=rows.dtype)[None, :]
+    return not (bool((first % P).any()) or bool((pages != first[:, None] + lane).any()))
+
+
+def _chain_clean(P: int, rows: torch.Tensor) -> bool:
+    """Whole consecutive pages AND no page twice: one prefix never holds the
+    same slot at two depths (a twin page survives the per-page check and
+    breaks only after the load's sort)."""
+    if not _rows_page_clean(P, rows):
+        return False
+    first = rows.view(-1, P)[:, 0] if P > 1 else rows
+    return int(torch.unique(first).numel()) == int(first.numel())
+
+
+def verify_load_chain(pool, nodes, host_indices, rows_of, stems_of):
+    """#1424 (rc12m-dpr D-TP0 11:49:05 and 12:19:06): the host rows of ONE
+    load-back chain, checked before they are queued. Returns the chain's host
+    indices (rebuilt when a page was re-pointed) or raises
+    ``ArenaChainMismatch``.
+
+    Both deaths came after a prefix that arrived in TWO prefetch pieces
+    (INCOMPLETE, then the re-read of the rest) and a #988 park loadback over
+    the whole depth; the paged load then refused the rows. A correct chain is
+    always whole consecutive pages, no slot twice -- every page is one arena
+    slot's P ids, written by ``resolve_rows`` / ``alloc_write``, and one
+    prefix never holds one page at two depths -- so a chain that is not has
+    a page whose rows are not the slot its page KEY names, and a per-row
+    gather over it would put another page's KV under those tokens. Such a
+    chain is proven page by page against the arena: a page whose key names a
+    COMPLETE slot is re-pointed to that slot's ids (the answer a prefetch
+    read gives; the node's host value is corrected in place and the slot
+    referenced), anything that cannot be proven is a named stop. A clean
+    chain costs one vectorised shape check. Duplicates ACROSS chains (two
+    requests loading a page they share in one merged load) are not a chain
+    property and stay with the per-row gather of ``_page_slots_or_none``.
+    ``rows_of(node)`` is the node's KV host rows, ``stems_of(hashes)`` maps
+    its page hashes to arena stems."""
+    P = _psz(pool)
+    if P == 1 or host_indices is None or int(host_indices.numel()) == 0:
+        return host_indices
+    S = int(pool.staging_rows)
+    if _chain_clean(P, host_indices.to("cpu", dtype=torch.int64) - S):
+        return host_indices
+    arena = getattr(pool, "arena", None)
+    lane = torch.arange(P, dtype=torch.int64)[None, :]
+    nodes = list(nodes)
+    fixed = []
+    for node in nodes:
+        hv_ref = rows_of(node)
+        hv = hv_ref.to("cpu", dtype=torch.int64).reshape(-1) - S
+        hashes = list(getattr(node, "hash_value", None) or ())
+        nid = getattr(node, "id", "?")
+        if len(hashes) * P != int(hv.numel()) or (hashes and arena is None):
+            raise ArenaChainMismatch(
+                f"#1424 CHAIN MISMATCH node={nid}: {int(hv.numel())} host rows against "
+                f"{len(hashes)} page key(s) of {P} tokens{'' if arena is not None else ', no arena'} "
+                f"-- the rows are not whole pages and cannot be proven; the load is refused")
+        if not hashes:
+            continue
+        slots, states = arena.find_slots_np(stems_of(hashes))
+        slots = torch.as_tensor(slots, dtype=torch.int64)
+        states = torch.as_tensor(states, dtype=torch.int64)
+        want = slots[:, None] * P + lane
+        pages = hv.view(-1, P)
+        bad = (pages != want).any(dim=1)
+        if not bool(bad.any()):
+            continue
+        idx = bad.nonzero()[:, 0]
+        i = int(idx[0])
+        what = (f"node={nid} page={i} of {len(hashes)} bad={int(idx.numel())}: key slot "
+                f"{int(slots[i])} (state {int(states[i])}), rows {int(pages[i, 0])}..{int(pages[i, -1])}")
+        if bool(((slots[idx] < 0) | (states[idx] != 2)).any()):
+            raise ArenaChainMismatch(
+                f"#1424 CHAIN MISMATCH {what} -- the page key names no COMPLETE slot, so the "
+                f"rows cannot be proven; loading would put unknown KV under these tokens")
+        arena.ref_slots([int(x) for x in slots[idx].tolist()], +1)
+        pages[idx] = want[idx]
+        hv_ref.copy_((hv + S).to(hv_ref.dtype).view(hv_ref.shape))
+        fixed.append(what)
+    if not fixed:
+        raise ArenaChainMismatch(
+            "#1424 CHAIN MISMATCH: the chain's rows are not whole distinct pages although "
+            f"every node's pages match their keys ({len(nodes)} node(s)) -- the chain and its "
+            "nodes disagree; the load is refused")
+    _CHAIN_REPAIRED_N[0] += 1
+    logger.warning(
+        "#1424 CHAIN REPAIRED n=%d nodes=%d: %s -- a page addressed rows that are not the slot "
+        "its key names; re-pointed to the key's COMPLETE slot before the load (a per-row "
+        "gather would have loaded another page's KV here)",
+        _CHAIN_REPAIRED_N[0], len(nodes), "; ".join(fixed[:4]))
+    rebuilt = torch.cat([rows_of(n).reshape(-1) for n in nodes])
+    if not _chain_clean(P, rebuilt.to("cpu", dtype=torch.int64) - S):
+        raise ArenaChainMismatch("#1424 CHAIN MISMATCH: still not whole distinct pages after the repair")
+    return rebuilt.to(host_indices.device, dtype=host_indices.dtype)
+
+
 def _page_slots(pool, rows: torch.Tensor) -> torch.Tensor:
     """x59: token rows of whole pages -> one slot per page (the P consecutive
     ids of each page, in order; anything else is a caller handing tokens of

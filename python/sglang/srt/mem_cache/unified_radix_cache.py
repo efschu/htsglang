@@ -4854,6 +4854,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
             best_match_node, CacheTransferPhase.LOAD_BACK
         )[0]
+        try:
+            self._1424_verify_load_chain(kv_xfer)
+        except BaseException:
+            self.dec_host_lock_ref(best_match_node, host_anchor_params)
+            raise
 
         # Lock path & pre-evict if device pool is insufficient
         result = self.inc_lock_ref(best_match_node)
@@ -5044,6 +5049,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
 
         return True
+
+    def _1424_verify_load_chain(self, kv_xfer) -> None:
+        """#1424: a paged-arena load-back chain whose rows are not whole
+        consecutive pages is proven page by page against the arena (and
+        re-pointed to its keys' slots) before it is queued
+        (pool_host/arena_pool.verify_load_chain); unpaged pools and the
+        staging path are untouched."""
+        cc = self.cache_controller
+        group = getattr(cc, "mem_pool_host", None)
+        if not getattr(group, "arena_read", False):
+            return
+        pool = getattr(getattr(group, "anchor_entry", None), "host_pool", group)
+        if getattr(pool, "arena", None) is None:
+            return
+        from sglang.srt.managers.cache_controller import weg2_suffixed_stems
+        from sglang.srt.mem_cache.pool_host import arena_pool as _ap
+
+        kv_xfer.host_indices = _ap.verify_load_chain(
+            pool,
+            kv_xfer.nodes_to_load or (),
+            kv_xfer.host_indices,
+            rows_of=lambda n: n.component_data[BASE_COMPONENT_TYPE].host_value,
+            stems_of=lambda h: weg2_suffixed_stems(cc.storage_backend, h),
+        )
 
     def _build_sidecar_transfers(
         self,
