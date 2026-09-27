@@ -420,6 +420,10 @@ def _reconcile(tree: Any, node: Any, exists: int, kv: int, m: int) -> str:
     if has_kv and not want_kv:
         if not node.evicted:
             for comp in tree._components_tuple:
+                if want_m and comp.component_type == _anchor_ct():
+                    # #248: TP0 gave only the KV rows back after a load-back
+                    # (weg2.park_l3.release_loaded_host); the anchor stays
+                    continue
                 tree._evict_component_and_detach_lru(node, comp, target=EvictLayer.HOST, tracker=None)
             tree.evictable_host_leaves.discard(node)
             tree._update_evictable_leaf_sets(node)

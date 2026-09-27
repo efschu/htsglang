@@ -569,6 +569,23 @@ class Envs:
     # (the front's drop missing). A garbage bound, not a capacity: the order
     # itself never holds a slot. Seat waits up to 658 s were measured (rc12r).
     SGLANG_WEG2_HANDOFF_PENDING_EXPIRE_S = EnvFloat(900.0)
+    # ENABLE_PARK_L3 (#248, rc12s 17:32:40: D held 5213 of 5461 KV arena slots
+    # by reference while it slept -- 2 parked + 3 held requests -- and P's
+    # claims found "no free slot"): a request that does not run on D (parked,
+    # in the dormant hold) holds NO arena reference over a flip. Its span is
+    # kept by ORDER (weg2.handoff_pending role "park"), copied to the L3 disk
+    # store in the background (PARK_DEMOTE_S), and read -- reference, pin,
+    # device load -- at the wake. False = the pre-#248 hold read (reference
+    # and pin during the sleep), byte for byte.
+    SGLANG_WEG2_ENABLE_PARK_L3 = EnvBool(True)
+    # PARK_DEMOTE_S (#248): the tick of the background thread (D, attention
+    # rank 0, never the scheduler thread) that copies the kept pages of
+    # parked and waiting rids from the arena to HiCacheFile without freeing
+    # them -- a claim may then free such a page without I/O (stage ii).
+    # 0 = no demotion (every kept page stays copy-less: stage iii).
+    SGLANG_WEG2_PARK_DEMOTE_S = EnvFloat(1.0)
+    # PARK_DEMOTE_BATCH (#248): pages copied per write batch of the demoter.
+    SGLANG_WEG2_PARK_DEMOTE_BATCH = EnvInt(256)
     # IDLE_VOTE_FRESHNESS (fnFL2 H77, #1268): PP0 reads a landed idle lap as
     # the PP group's /flush_cache verdict only while the state it witnessed
     # holds -- the lap of PP0's latest stamp, PP0 neither asleep nor busy

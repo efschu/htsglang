@@ -180,6 +180,14 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     queued = list(sched.waiting_queue)
     sched.waiting_queue = []
     sched.weg2_d_parked = d_seats.order_waiting(list(parked) + list(retracted) + queued)
+    # #248: every parked request is kept by ORDER over the flip -- the
+    # sleep's reset gives its references back, the hold reads it at the wake
+    try:
+        from sglang.srt.weg2 import park_l3
+
+        park_l3.mark_parked(sched, sched.weg2_d_parked)
+    except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
+        logger.warning("#248 PARK-MARK failed", exc_info=True)
     # H91c2: park_tick's awake requeue is the net for a sleep that never comes
     # after THIS park, so its clock starts now for every request the park
     # holds. A request decode pressure parked earlier kept its older stamp and

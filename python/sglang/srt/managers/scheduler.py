@@ -5500,6 +5500,12 @@ class Scheduler(
 
         return d_park_runtime.hold_parked(self, hold_armed=_weg2_dormant_admit_armed())
 
+    def _weg2_park_l3_defer_hold_read(self, req) -> bool:
+        """#248: the dormant hold intake only looks ``req`` up (weg2.park_l3)."""
+        from sglang.srt.weg2 import park_l3
+
+        return park_l3.defer_hold_read(self, req)
+
     def _weg2_d_park_hold_late(self, req) -> bool:
         """H91c3-2: a hand-off reaching D after park_running is held behind
         the park (d_park_runtime.hold_late_arrival)."""
@@ -5595,6 +5601,10 @@ class Scheduler(
         if _weg2_pp_producer_awake(self):
             # TK: group P after the wake is the PRODUCER -- never parked.
             return _weg2_producer_wake_verdict(self, req)
+        if getattr(req, "_weg2_248_read_at_wake", False):
+            # #248: looked up only -- no read in the sleep, nothing to top up;
+            # the wake issues it (weg2.park_l3.issue_deferred_reads)
+            return "complete"
         if not self.tree_cache.check_prefetch_progress(req.rid):
             return "reading"
         reason = self._weg2_note_store_shortfall(req)
@@ -5865,6 +5875,12 @@ class Scheduler(
             except Exception:  # noqa: BLE001
                 pass
             self.waiting_queue.extend(r for r, _s, _l in release)
+            try:  # #248: a wake read that completed drops its hand-off keys
+                from sglang.srt.weg2 import park_l3 as _pl3
+
+                _pl3.after_release([r for r, _s, _l in release])
+            except Exception:  # noqa: BLE001
+                pass
             for _r, _s, _l in release:
                 logger.info("#1471 SETTLE-RELEASE rid=%s state=%s lapsed=%s held_after_wake_s=%.1f",
                             str(_r.rid)[:12], _s, _l, now - float(getattr(_r, "_1471_since", now)))
@@ -5879,6 +5895,8 @@ class Scheduler(
             from sglang.srt.managers import cache_controller as _cc
             from sglang.srt.weg2 import handoff as _ho
             for _r in hold:
+                if getattr(_r, "_weg2_248_read_at_wake", False):
+                    continue  # #248: its read is issued now -- the keys serve it (park_l3.after_release)
                 _rid = getattr(_r, "rid", None)
                 _cc.WEG2_HANDOFF_PAGE_KEYS.pop(_rid, None)
                 _cc.WEG2_HANDOFF_OFF.pop(_rid, None)
@@ -5892,6 +5910,15 @@ class Scheduler(
             pass
         if not hold:
             return 0
+        # #248: the held requests whose intake only looked them up are read
+        # NOW, in hold order on every rank (reference, pin, host tree); the
+        # verdicts below park them in the #1471 settle until complete.
+        try:
+            from sglang.srt.weg2 import park_l3 as _pl3
+
+            _pl3.issue_deferred_reads(self, hold)
+        except Exception as exc:  # noqa: BLE001 -- a failed issue is a short read: the settle re-reads
+            logger.warning("#248 WAKE-READ n/a (%s: %s)", type(exc).__name__, exc)
         # #1471: ONLY A COMPLETE READ JOINS THE QUEUE AT THE WAKE.  weg2xsn229
         # (P --max-running-requests 2): the read issued at the hold ended
         # short (4095 of 98210), the refetch was issued, and the wake queued
@@ -5952,6 +5979,12 @@ class Scheduler(
         # the wake does not flush any more, so the requests join the queue
         # as they are -- their device load follows at scheduling.
         self.waiting_queue.extend(released)
+        try:  # #248: a wake read already complete drops its hand-off keys
+            from sglang.srt.weg2 import park_l3 as _pl3
+
+            _pl3.after_release(released)
+        except Exception:  # noqa: BLE001
+            pass
         n = len(released)
         logger.info("#1443 DORMANT-RELEASE %d held request(s) queued after the wake (prefetch ran during the flip -- #1455)", n)
         return n
@@ -6900,7 +6933,18 @@ class Scheduler(
             # line names the host-pool room the verdict was taken against.
             _population = getattr(req, "_969c_population", None)
             _available_before = self._host_pool_available_size()
-            if weg2_store_told.armed(self):
+            # #248: a request entering the dormant hold is LOOKED UP only --
+            # no store read, no arena reference, no pin over the flip (rc12s:
+            # 5213 of 5461 KV slots held by a sleeping D). Its read runs at
+            # the wake (``weg2.park_l3``).
+            _defer_248 = bool(
+                getattr(self, "weg2_dormant", False)
+                and _weg2_dormant_admit_armed()
+                and self._weg2_park_l3_defer_hold_read(req)
+            )
+            if _defer_248:
+                _pf_verdict = "deferred:248-read-at-wake"
+            elif weg2_store_told.armed(self):
                 # #1400: PP0 registers and holds; a follower holds and
                 # registers later with PP0's told span (module docstring).
                 from sglang.srt.mem_cache.match_refusal_census import (
@@ -6930,7 +6974,8 @@ class Scheduler(
             # (stamped residents AND re-issued occupants).
             # Grep: "#969C READMIT-PREFETCH".
             req._969c_verdict = _pf_verdict
-            self._apply_prefetch_deferral(req, _pf_verdict, site="intake")
+            if not _defer_248:
+                self._apply_prefetch_deferral(req, _pf_verdict, site="intake")
             try:
                 from sglang.srt.managers.phase_purity import (
                     SEAM_READMIT_ATTR as _SRA,

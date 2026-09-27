@@ -2747,6 +2747,85 @@ class HiCacheFile(HiCacheStorage):
             stems.pop((c[1], c[2]), None)
         return moved
 
+    def arena_copy_to_disk(self, arena, stems) -> dict:
+        """#248 PARK-DEMOTE: copy the COMPLETE arena pages of ``stems`` to the
+        disk store WITHOUT freeing them -- ``_arena_evict_to_disk`` minus the
+        free. The slot stays where it is; from now on a claim may free it
+        without I/O (stage ii of ``_evict_for_claim``), and a later read takes
+        it back from disk (``arena_fill_from_disk``).
+
+        Each slot carries a transient reader reference while its bytes are
+        written (raw, past this process's ledger: it is no holder), so no
+        claim can free and refill it under the write; a slot whose key moved
+        between the lookup and that reference is skipped. Runs on the D
+        demoter's thread, never on a scheduler thread (H81). Returns
+        ``{written, on_disk, absent, bytes}``."""
+        import ctypes
+
+        out = {"written": 0, "on_disk": 0, "absent": 0, "bytes": 0}
+        stems = [s for s in dict.fromkeys(stems or ()) if s]
+        if not stems or arena is None:
+            return out
+        on_disk = self._stat_stems(stems)
+        todo = [s for s in stems if s not in on_disk]
+        out["on_disk"] = len(stems) - len(todo)
+        if not todo:
+            return out
+        from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
+        from sglang.srt.mem_cache.canonical_page_store import canonical_fsync_default
+
+        pio = _load_pageio()
+        if pio is None:
+            out["absent"] = len(todo)
+            return out
+        lib, base = arena._lib, arena._base
+
+        def _ref(slot, delta):
+            return int(lib.arena_ref_slots(base, 1, (ctypes.c_int64 * 1)(int(slot)), int(delta)))
+
+        pinned = []
+        for stem, (slot, state) in zip(todo, arena.find_slots(todo)):
+            if slot < 0 or int(state) != 2 or _ref(slot, +1) != 1:
+                out["absent"] += 1
+                continue
+            (s2, st2), = arena.find_slots([stem])
+            if s2 != slot or int(st2) != 2:
+                _ref(slot, -1)  # evicted and re-claimed between find and pin
+                out["absent"] += 1
+                continue
+            pinned.append((stem, int(slot)))
+        try:
+            total = int(arena.slot_bytes)
+            batch = []
+            for stem, slot in pinned:
+                path = self._sharded_path(stem)
+                if not self._evictor.reserve(
+                    stem, total, key=stem,
+                    owner_writes_whole_file=owner_write_covers_whole_file(
+                        is_mla_model=self._key_geom["is_mla_model"],
+                        canonical_extent_write=True,
+                    ),
+                ):
+                    continue
+                self._ensure_shard_dir(path)
+                batch.append((stem, slot, path))
+            if batch:
+                statuses = pio.write_pages(
+                    [b[2] for b in batch], [total] * len(batch), [((0, total),)] * len(batch),
+                    [int(lib.arena_slot_ptr(base, b[1])) for b in batch], canonical_fsync_default(),
+                )
+                for (stem, _slot, _path), st in zip(batch, statuses):
+                    if st in (0, 1, 2):
+                        self._evictor.commit(stem)
+                        out["written"] += 1
+                        out["bytes"] += total
+                    else:
+                        self._evictor.abort(stem)
+        finally:
+            for _stem, slot in pinned:
+                _ref(slot, -1)
+        return out
+
     def _l3_index(self):
         """#1459: the shared L3 stem index beside the arena, opened once
         (None without an arena dir, with the env off, or when the build
