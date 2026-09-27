@@ -2001,6 +2001,57 @@ def flip_escape_verdict(
     )
 
 
+def _flip_single_flight_enabled(env=None) -> bool:
+    """FS: ``SGLANG_WEG2_FLIP_SINGLE_FLIGHT`` (default on; 0 = no guard)."""
+    e = os.environ if env is None else env
+    raw = (e.get("SGLANG_WEG2_FLIP_SINGLE_FLIGHT", "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _flip_single_flight(body):
+    """FS (27B rc12o27 b1, 13:11:50-55Z): ONE flip at a time.
+
+    A POST /weg2/flip (the acceptance probe) began P->D at 13:11:50 while the
+    controller's P-drain ran (state still 'serving', the handler's only gate);
+    the drain ended at 13:11:53.435 and the controller called flip('P','D')
+    too -- a second flip of the same epoch, whose quiesce polled /flush_cache
+    beside the first flip's legs. One of its flushes (13:11:53.581) queued
+    behind the first flip's release; PP1/PP2 ran it on the released pools ->
+    illegal memory access, group P dead.
+
+    With SGLANG_WEG2_FLIP_SINGLE_FLIGHT on (default): a flip while another is
+    open, or of a group that is not the awake one, is skipped by name
+    (``WEG2-FLIP SKIPPED``); the caller's loop decides again on the state the
+    open flip leaves. ``0`` = no guard. ``functools.wraps`` keeps
+    ``inspect.getsource(Front.flip)`` the body's source.
+    """
+    import functools
+
+    @functools.wraps(body)
+    async def flip(self, src: str, dst: str) -> None:
+        if not _flip_single_flight_enabled():
+            return await body(self, src, dst)
+        reason = None
+        if getattr(self, "_flip_open", False):
+            reason = "another flip is open"
+        elif getattr(self, "awake", src) != src:
+            reason = f"{src} is not awake (awake={getattr(self, 'awake', '?')})"
+        if reason is not None:
+            self.counters["flip_skipped_concurrent"] += 1
+            logger.warning(
+                "WEG2-FLIP SKIPPED epoch=%s sleep=%s wake=%s: %s -- one flip at a time "
+                "(FS, rc12o27 b1: a second flip's quiesce flushed P after the first one's release)",
+                getattr(self, "epoch", "?"), src, dst, reason)
+            return
+        self._flip_open = True
+        try:
+            return await body(self, src, dst)
+        finally:
+            self._flip_open = False
+
+    return flip
+
+
 def health_is_serving_fact(http_200: bool, process_alive: bool) -> bool:
     """W17: an HTTP 200 is a transport fact; liveness needs the process too."""
     return bool(http_200 and process_alive)
@@ -7390,6 +7441,7 @@ class Front:
                 self.measured_record, e,
             )
 
+    @_flip_single_flight
     async def flip(self, src: str, dst: str) -> None:
         S, D = self.groups[src], self.groups[dst]
         self.state = "flipping"

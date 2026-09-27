@@ -2529,6 +2529,8 @@ class Scheduler(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
             ipc_channels=self.ipc_channels,
+            # FD (rc12o27 b1): a /flush_cache on a released group is refused.
+            is_dormant=lambda: bool(getattr(self, "weg2_dormant", False)),
         )
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
