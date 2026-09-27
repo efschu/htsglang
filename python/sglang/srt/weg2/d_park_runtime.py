@@ -163,6 +163,15 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     for req in retracted:
         d_seats.mark_parked(req, d_seats.SITE_FLIP, epoch=epoch, now=now)
         sched._969ad_note_retract(req, "weg2_park_running")
+        # STALE-DELIVERED (b23 10:23:15, weg2-24-100): a flip park opens a NEW
+        # read cycle. The #1324 stamp of the previous cycle's read (79103) made
+        # the #1471 wake settle release a request whose THIS-cycle read had
+        # answered zero ("SETTLE-TAIL delivered=79103 remainder=1405"); its
+        # admission found nothing (state=cold host_hit=0) and the X gate
+        # refused it mid-stream (W50, client stream dead). The stamp belongs
+        # to one read -- cleared here, set again by this cycle's own read.
+        if getattr(req, "_weg2_store_delivered", None) is not None:
+            req._weg2_store_delivered = None
         # PARK-RETAIN READ: the store read of this request ends at what the
         # retraction just retained (the KV above the mamba track was freed).
         if d_park_read.stamp_parked(req) is not None:
