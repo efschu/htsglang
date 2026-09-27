@@ -150,6 +150,7 @@ def _d_pass(profile, lines, terms=None, rest=True):
                               overshoot_provenance=op, dormant_growth_mib=g,
                               dormant_growth_provenance=gp,
                               charge_driver_carve=L.budget_charges_driver_carve(profile),
+                              driver_carve_min_total_mib=L.driver_carve_min_total_mib(profile),
                               awake_rest_mib=r, awake_rest_provenance=rp, terms_out=terms)
     return cards, b
 
@@ -187,7 +188,9 @@ class TheDBudgetBooksTheRestNotTheRatchet(CustomTestCase):
             self.assertIn("+ awake_overshoot 404)", bi)
         self.assertEqual(b[1], 17664)  # rc12c front.log, unchanged
 
-    def test_27b_budget_is_byte_identical(self):
+    def test_27b_budget_differs_only_by_the_5090_carve(self):
+        # 27B b1 death (27.09.): the 27B row books the driver carve on the 5090
+        # only (driver_carve_min_total_mib 32000); no awake rest, no fixed record.
         lines, plain = [], []
         cards, b = _d_pass("qwen27b", lines, terms=[])
         from unittest import mock
@@ -195,8 +198,10 @@ class TheDBudgetBooksTheRestNotTheRatchet(CustomTestCase):
         with mock.patch.object(L.corridor_budget, "floors_for_cards", _floors):
             ref = L.budgets_from_dc(cards, dict(DORMANT), plain.append, "D",
                                     overshoot_mib=[489, 0, 0], overshoot_provenance="boot weg2ls4b1")
-        self.assertEqual(b, ref)
-        self.assertEqual(lines, plain)
+        self.assertEqual(b[1:], ref[1:])
+        self.assertLessEqual(abs((ref[0] - b[0]) - cards[0].reserved_mib), 8)
+        self.assertEqual([l for l in lines if "ordinal=0 " not in l], [l for l in plain if "ordinal=0 " not in l])
+        self.assertIn("driver_carve", [l for l in lines if l.startswith("budget D") and "ordinal=0 " in l][0])
         self.assertEqual(L.d_awake_rest(cards, "qwen27b"), (None, ""))
         self.assertEqual(L.d_fixed_record("qwen27b"), (None, ""))
 

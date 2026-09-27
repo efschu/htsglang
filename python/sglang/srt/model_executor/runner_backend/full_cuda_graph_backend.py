@@ -169,6 +169,13 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        # 27B b1 death (27.09.): pay the exec upload NOW, while the card is
+        # roomy, instead of in the first replay of this shape under load
+        # (weg2/graph_upload.py; never raises, one WEG2-GRAPH-UPLOAD line).
+        from sglang.srt.weg2 import graph_upload as _gu
+
+        if _gu.enabled():
+            _gu.upload_after_capture(graph, shape_key, self._capture_stream)
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs

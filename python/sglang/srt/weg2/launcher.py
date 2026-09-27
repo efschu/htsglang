@@ -8297,6 +8297,11 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         from sglang.srt.managers.weg2_memory_saver import WEIGHTS_RESIDENT_ENV
 
         env[WEIGHTS_RESIDENT_ENV] = "1"
+    if group == "D":
+        # 27B b1 death (27.09. 06:57:17Z): D's full graphs upload at capture,
+        # not at their first replay under load (weg2/graph_upload.py). A value
+        # already in the env (container / arm) and --env-d below win.
+        env.setdefault("SGLANG_WEG2_GRAPH_UPLOAD_AT_CAPTURE", "1")
     if group_env_extra:
         # --env-p / --env-d (Scheibe 6a): per-group variables the two layouts
         # spell differently (e.g. SGLANG_MOE_SCRATCH_SLOTS: one value per TP
@@ -10747,6 +10752,14 @@ def budget_charges_driver_carve(profile: Optional[str] = None) -> bool:
     return bool(getattr(row, "budget_charges_driver_carve", False))
 
 
+def driver_carve_min_total_mib(profile: Optional[str] = None) -> int:
+    """The profile row's ``driver_carve_min_total_mib`` (27B b1 death): the
+    carve is charged only on cards with at least this NVML total; 0 (and an
+    unknown profile) = every card."""
+    row = weg2_form.profile_row(profile if profile is not None else weg2_form.DEFAULT_PROFILE)
+    return int(getattr(row, "driver_carve_min_total_mib", 0) or 0)
+
+
 def budgets_from_dc(
     cards: List[Card],
     dc_mib: Dict[str, int],
@@ -10760,6 +10773,7 @@ def budgets_from_dc(
     dormant_growth_mib: Optional[List[int]] = None,
     dormant_growth_provenance: str = "",
     charge_driver_carve: bool = False,
+    driver_carve_min_total_mib: int = 0,
     awake_rest_mib: Optional[List[Optional[int]]] = None,
     awake_rest_provenance: str = "",
     terms_out: Optional[List[Dict[str, object]]] = None,
@@ -10803,7 +10817,10 @@ def budgets_from_dc(
         # (Card.reserved_mib) is never allocatable. The corridor pass below
         # subtracts it from predicted_free on its own, so charging it here
         # does not count it twice.
-        carve = int(getattr(c, "reserved_mib", 0) or 0) if charge_driver_carve else 0
+        # 27B b1 death: a profile may scope the carve to its big cards
+        # (driver_carve_min_total_mib; 0 = every card, the NF row).
+        carve = (int(getattr(c, "reserved_mib", 0) or 0)
+                 if charge_driver_carve and int(c.total_mib) >= int(driver_carve_min_total_mib or 0) else 0)
         awake = int(rest) if rest is not None else 0
         b = c.total_mib - corridor - dc_mib[c.uuid] - grow - over - carve - awake
         b = (b // 8) * 8
@@ -20726,7 +20743,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     launch_group(spec_p, tree, log, dry)
     if dry:
         _dry_terms: List[Dict[str, object]] = []
-        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), terms_out=_dry_terms)
+        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), terms_out=_dry_terms)
         # #145 AN BEIDEN STELLEN -- siehe #114 direkt darunter: es gibt ZWEI
         # Stellen, an denen budgets_d entsteht, und eine Fassung, die nur die
         # untere trifft, fehlt genau im Dry-Run, wo das Gate sie sucht.
@@ -20856,7 +20873,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
         user_reserve_by_card=user_reserve_by_card,
         dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
-        charge_driver_carve=budget_charges_driver_carve(ns.profile),
+        charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile),
         awake_rest_mib=_rest, awake_rest_provenance=_rest_prov, terms_out=_d_terms,
     )
     state.budgets["D"] = budgets_d

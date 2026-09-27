@@ -46,6 +46,9 @@ def _d_budgets(profile, lines):
     charge = getattr(L, "budget_charges_driver_carve", None)
     if charge is not None:
         kw["charge_driver_carve"] = charge(profile)
+    scope = getattr(L, "driver_carve_min_total_mib", None)
+    if scope is not None:
+        kw["driver_carve_min_total_mib"] = scope(profile)
     return cards, L.budgets_from_dc(cards, dict(FRESH), lines.append, "D",
                                      overshoot_mib=[489, 0, 0], overshoot_provenance="boot weg2ls4b1",
                                      dormant_growth_mib=g, dormant_growth_provenance=prov, **kw)
@@ -96,18 +99,48 @@ class TheNextFlashNoLongerBooksABudgetRelativeOvershoot(CustomTestCase):
         self.assertEqual(L._pconst_boots("D_OVERSHOOT_MIB", "qwen27b"), "boot weg2ls4b1")
 
 
-class TheQwen27bBudgetIsByteIdentical(CustomTestCase):
-    def test_27b_does_not_charge_the_carve(self):
-        charge = getattr(L, "budget_charges_driver_carve", None)
-        if charge is not None:
-            self.assertFalse(charge("qwen27b"))
-        lines = []
-        cards, budgets = _d_budgets("qwen27b", lines)
+class TheQwen27bBudgetBooksTheCarveOnThe5090Only(CustomTestCase):
+    """27B b1 death (27.09. 06:57:17Z, dkr27breleasedraftbar1w109270652): D TP0
+    on the 5090 OOMed at card_free 5 MiB; the launcher's own corridor pass had
+    said REFUSED-WOULD-BIND on the 5090 only (shortfall 547, carve=518 in its
+    terms), both 3080s SATISFIED with their carve already in predicted_free.
+    The 27B row charges the carve where the board is >= 32000 MiB."""
+
+    def _plain(self, cards):
         plain = []
         ref = L.budgets_from_dc(cards, dict(FRESH), plain.append, "D", overshoot_mib=[489, 0, 0],
                                 overshoot_provenance="boot weg2ls4b1")
-        self.assertEqual(budgets, ref)
-        self.assertEqual(lines, plain)
+        return ref, plain
+
+    def test_the_row_says_so(self):
+        self.assertTrue(L.budget_charges_driver_carve("qwen27b"))
+        self.assertEqual(L.driver_carve_min_total_mib("qwen27b"), 32000)
+        self.assertEqual(L.driver_carve_min_total_mib("nextflash"), 0)
+        self.assertEqual(L.driver_carve_min_total_mib("no-such-profile"), 0)
+
+    def test_the_5090_loses_its_carve_and_the_3080s_are_byte_identical(self):
+        lines = []
+        cards, budgets = _d_budgets("qwen27b", lines)
+        ref, plain = self._plain(cards)
+        self.assertEqual(cards[0].name, "NVIDIA GeForce RTX 5090")
+        self.assertLessEqual(budgets[0], ref[0] - 518 + 8)
+        self.assertGreaterEqual(budgets[0], ref[0] - 518 - 8)
+        self.assertEqual(budgets[1:], ref[1:])
+        b = lambda ls, i: [l for l in ls if l.startswith("budget D") and f"ordinal={i} " in l][0]
+        self.assertIn("driver_carve 518", b(lines, 0))
+        for i in (1, 2):
+            self.assertNotIn("driver_carve", b(lines, i))
+            self.assertEqual(b(lines, i), b(plain, i))
+
+    def test_scope_zero_charges_every_card(self):
+        cards = _cards()
+        ref, _ = self._plain(cards)
+        every = L.budgets_from_dc(cards, dict(FRESH), [].append, "D", overshoot_mib=[489, 0, 0],
+                                  overshoot_provenance="boot weg2ls4b1", charge_driver_carve=True,
+                                  driver_carve_min_total_mib=0)
+        for i, c in enumerate(cards):
+            self.assertLessEqual(every[i], ref[i] - c.reserved_mib + 8, c.name)
+            self.assertGreaterEqual(every[i], ref[i] - c.reserved_mib - 8, c.name)
 
 
 if __name__ == "__main__":

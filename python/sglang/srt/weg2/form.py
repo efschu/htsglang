@@ -432,9 +432,19 @@ class ModelProfile:
     #: and never took the driver carve (Card.reserved_mib, 519 MiB on the
     #: 5090: nvidia-smi "Reserved", torch capacity 32092 of 32607) -- the
     #: corridor meant for D's transients was 519 MiB smaller than booked.
-    #: On: the budget books it as its own term "driver_carve". qwen27b off
-    #: (byte-identical) until the 27B seat decides (it costs 519 MiB of KV).
+    #: On: the budget books it as its own term "driver_carve". qwen27b on
+    #: since the 27B b1 death (see ``driver_carve_min_total_mib``).
     budget_charges_driver_carve: bool = False
+    #: 27B b1 (27.09. 06:57:17Z, dkr27breleasedraftbar1w109270652, D TP0 5090
+    #: OOM at card_free 5 MiB): the carve is charged only on cards whose NVML
+    #: total is at least this many MiB; 0 = every card (the NF row). The 27B
+    #: corridor pass REFUSED-WOULD-BIND only the 5090 (shortfall 547 MiB with
+    #: carve=518 in its terms); both 3080s were SATISFIED with their carve 425
+    #: already in predicted_free (margin 67/84 MiB). The 3080s bind the world
+    #: pool (binder=2), so charging them too would cost ~5 % of the world KV
+    #: for no measured need; the 5090 alone costs ~0.3 % (W55: cut 552 MiB ->
+    #: world_pool 559232 -> 557472).
+    driver_carve_min_total_mib: int = 0
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -593,6 +603,11 @@ PROFILES: Dict[str, ModelProfile] = {
         d_park_immediate=False,
         # X-EXACT (user 26.09.): OFF until an agent-load boot measured it.
         front_exact_tokens=False,
+        # 27B b1 death (27.09. 06:57:17Z): the D budget books the driver carve
+        # (518 MiB, NVML reserved) -- on the 5090 only (32607 MiB board; the
+        # 3080s are 20480), see driver_carve_min_total_mib.
+        budget_charges_driver_carve=True,
+        driver_carve_min_total_mib=32000,
     ),
     PROFILE_NEXTFLASH: ModelProfile(
         id=PROFILE_NEXTFLASH,

@@ -840,6 +840,12 @@ class Envs:
     # 102 MiB on a 3080); the wake puts the saved limit back before its
     # kv_cache fit check (weg2/sleep_lmem.py). 0 = the context keeps it.
     SGLANG_WEG2_SLEEP_RELEASE_LMEM = EnvBool(True)
+    # GRAPH_UPLOAD_AT_CAPTURE (27B b1 death 27.09., D TP0 OOM in the FIRST bs=3
+    # replay at card_free 5 MiB): upload each full-graph exec right after its
+    # capture (cuGraphUpload), not at its first replay under load; one
+    # WEG2-GRAPH-UPLOAD line per shape (weg2/graph_upload.py). Code default off;
+    # the weg2 launcher sets it for group D (build_env), an explicit value wins.
+    SGLANG_WEG2_GRAPH_UPLOAD_AT_CAPTURE = EnvBool(False)
     # SLEEP_HEAP_CENSUS (H16, fnFL2x127): the gc walk of WEG2-SLEEP-HOST-HEAP
     # (sleeps 1, 2, 4, 8, ...) cost 505-639 ms INSIDE the sleep RPC, which the
     # front waits for before the wake -- on the flip's critical path (P PP0
