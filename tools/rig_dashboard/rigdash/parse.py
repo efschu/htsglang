@@ -80,6 +80,16 @@ F_MODEL_PATH = _f(r"model_path='([^']*)'")
 F_SERVED_NAME = _f(r"served_model_name='([^']*)'")
 F_TP = _f(r"\btp_size=(\d+)")
 F_PP = _f(r"\bpp_size=(\d+)")
+F_SERVED = _f(r"WEG2-SERVED group=(\w+) leg=(\d+) rid=(\S+)")
+F_PROMPT_T = _f(r"\bprompt_tokens=(\d+)")
+F_CACHED_T = _f(r"\bcached_tokens=(\d+)")
+F_COMPL_T = _f(r"\bcompletion_tokens=(\d+)")
+F_LOADBACK = _f(r"^#988 LOADBACK rid=(\S+)")
+F_ANCHOR = _f(r"\banchor_depth=(\d+)")
+F_KV_APPLIED = _f(r"\bkv_applied=(\d+)")
+F_MAMBA_RESUME = _f(r"^MAMBA-HOST-RESUME n=\d+: anchor accepted at depth=(\d+)")
+F_STORE_INC = _f(r"^#\d+ STORE READ INCOMPLETE rid=(\S+) delivered=(\d+) deliverable=(\d+)")
+F_PREFETCH = _f(r"^#\d+ PREFETCH (LANDED|REFUSED|DEFERRED|TIMEOUT)\b")
 F_BOOT = _f(r"WEG2 BOOT tag=(\S+) tree=(\S+) @ (\w+)")
 F_FORM_MODEL = _f(r"WEG2-FORM .*?\bmodel=(\S+)")
 F_FORM = _f(r"WEG2-FORM (.*?) \(sources:")
@@ -193,6 +203,32 @@ def parse_line(line: str) -> Optional[dict]:
     if h:
         ev.update(kind="health", group=h.group(1), http_ok=h.group(2) == "True",
                   alive=h.group(3) == "True", streak=int(h.group(4)) if h.group(4) else None)
+        return ev
+    # --- cache families (scheduler lines, per rank; the reader keeps rank 0) ---
+    if rest.startswith("#988 LOADBACK"):
+        m2 = F_LOADBACK.search(rest)
+        ev.update(kind="loadback", rid=m2.group(1) if m2 else None,
+                  depth=_num(F_ANCHOR, rest, int), kv_applied=_num(F_KV_APPLIED, rest, int))
+        return ev
+    if rest.startswith("MAMBA-HOST-RESUME"):
+        m2 = F_MAMBA_RESUME.search(rest)
+        ev.update(kind="mamba_host_resume", depth=int(m2.group(1)) if m2 else None)
+        return ev
+    m2 = F_STORE_INC.search(rest)
+    if m2:
+        ev.update(kind="store_read_incomplete", rid=m2.group(1), delivered=int(m2.group(2)),
+                  deliverable=int(m2.group(3)))
+        return ev
+    m2 = F_PREFETCH.search(rest)
+    if m2:
+        ev.update(kind="prefetch", outcome=m2.group(1))
+        return ev
+    # --- front: one line per served leg of one request (rid): exact, no rank duplication ---
+    m2 = F_SERVED.search(rest)
+    if m2:
+        ev.update(kind="served", group=m2.group(1), leg=int(m2.group(2)), rid=m2.group(3),
+                  prompt_tokens=_num(F_PROMPT_T, rest, int), cached_tokens=_num(F_CACHED_T, rest, int),
+                  completion_tokens=_num(F_COMPL_T, rest, int))
         return ev
     bt = F_BOOT.search(rest)
     if bt:

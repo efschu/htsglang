@@ -18,7 +18,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import health, live, sources, weg2line
+from . import health, live, redact, sources, weg2line
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -132,7 +132,7 @@ def make_handler(app: App):
             self.wfile.write(body)
 
         def _json(self, obj, code=200):
-            self._send(code, json.dumps(obj, default=str), "application/json")
+            self._send(code, redact.guard(json.dumps(obj, default=str)), "application/json")
 
         def _weg2(self, path):
             from urllib.parse import parse_qs, urlsplit

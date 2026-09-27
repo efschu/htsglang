@@ -104,6 +104,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .alarm .why b { font-weight: 700; }
 section.card.dead { border: 3px solid var(--alarm-dead); }
 section.card.hang { border: 3px solid var(--alarm-hang); }
+.cachebox { margin-top: 12px; }
+.cachebox td, .cachebox th { font-size: 12px; white-space: nowrap; }
 .launch { font-size: 11px; color: var(--text-2); margin-top: 6px; max-height: 360px; overflow: auto; }
 .launch div { padding: 2px 0; border-bottom: 1px dashed var(--line); overflow-wrap: anywhere; }
 details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
@@ -284,6 +286,42 @@ function alarmHtml(b, now) {
     ${(a.reasons || []).map((r) => `<div class="why"><b>${r.level === "dead" ? "tot" : r.level === "hang" ? "h\u00e4ngt" : "Hinweis"}</b> &middot; ${r.t ? hhmm(r.t) + " &middot; " : ""}${esc(r.text)}</div>`).join("")}</div>`;
 }
 
+const pct = (x) => x == null ? "\u2014" : fmt(100 * x, x >= 0.995 || x < 0.1 ? 1 : 0) + " %";
+function cacheHtml(b) {
+  const c = b.cache || {}, t = b.totals || {};
+  const row = (label, g) => {
+    const x = c[g]; if (!x) return "";
+    const w = x.window || {}, a = x.boot || {};
+    const hit = (o) => o.hit_share == null ? "\u2014" : `${pct(o.hit_share)} <span class="muted">(${fmt(o.cached)} / ${fmt(o.new)})</span>`;
+    const l2 = (o) => o.loadback_n ? `${fmt(o.loadback_n)} &times; &middot; ${fmt(o.loadback_tok)} Tok${o.l2_share != null ? " &middot; " + pct(o.l2_share) : ""}` : "0";
+    const l3 = (o) => o.l3inc_n ? `${fmt(o.l3inc_n)} &times; &middot; ${pct(o.l3inc_share)} <span class="muted">(${fmt(o.l3inc_delivered)} / ${fmt(o.l3inc_deliverable)})</span>` : "0";
+    return `<tr><td><b>${label}</b></td><td class="num">${hit(w)}</td><td class="num">${hit(a)}</td><td class="num">${l2(w)}</td><td class="num">${l2(a)}</td><td class="num">${a.mamba_n ? fmt(a.mamba_n) + " &times;" : "0"}</td><td class="num">${l3(a)}</td></tr>`;
+  };
+  const req = (label, g) => {
+    const x = c[g]; if (!x) return "";
+    const w = x.window || {}, a = x.boot || {};
+    const r = (o) => o.req_hit_share == null ? "\u2014" : `${pct(o.req_hit_share)} <span class="muted">(${fmt(o.cached)} / ${fmt(o.prompt)})</span>`;
+    return `<tr><td>${label}</td><td class="num">${r(w)}</td><td class="num">${r(a)}</td><td colspan="4" class="muted">${fmt(a.n)} Anfragen seit Boot</td></tr>`;
+  };
+  const prog = t.read_progress != null && t.read_progress < 1 ? ` <span class="chip warn">Z\u00e4hlung l\u00e4uft: ${fmt(100 * t.read_progress)} % des Logs gelesen</span>` : "";
+  return `<div class="cachebox">
+    <div class="tiles" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin-bottom:10px">
+      <div class="tile"><div class="label">P neu prefillt seit Boot</div><div class="big num" style="font-size:24px">${fmt(t.p_new)}<small>Tok</small></div><div class="state">&Sigma; #new-token, Zeile &bdquo;Prefill batch&ldquo;, nur PP0 (${fmt(t.p_chunks)} Chunks), ohne Cache-Treffer</div></div>
+      <div class="tile"><div class="label">D neu prefillt seit Boot</div><div class="big num" style="font-size:24px">${fmt(t.d_new)}<small>Tok</small></div><div class="state">&Sigma; #new-token, &bdquo;Prefill batch&ldquo;, nur TP0 (${fmt(t.d_chunks)} Chunks), ohne &Uuml;bernahme/Cache</div></div>
+      <div class="tile"><div class="label">dekodiert seit Boot</div><div class="big num" style="font-size:24px">${fmt(t.decoded)}<small>Tok</small></div><div class="state">&Sigma; completion_tokens der Front-Zeilen WEG2-SERVED (je Anfrage einmal, ${fmt(t.served_requests)} D-Beine)</div></div>
+    </div>
+    <h3 style="font-size:13px;margin:4px 0 6px">Cache-Treffer (aus den Boot-Logs)${prog}</h3>
+    <div class="tablewrap"><table>
+      <tr><th></th><th class="num">aus Cache / neu &middot; 60 s</th><th class="num">seit Boot</th><th class="num">L2 Host: #988 Load-back &middot; 60 s</th><th class="num">seit Boot</th><th class="num">MAMBA-HOST-RESUME</th><th class="num">L3 Store: unvollst. Lesungen</th></tr>
+      ${row("P-Gruppe", "P")}${row("D-Gruppe", "D")}${row("Gruppe", "single")}
+      ${req("Front je Anfrage, P-Bein (cached/prompt)", "served_P")}${req("Front je Anfrage, D-Bein (cached/prompt)", "served_D")}
+    </table></div>
+    <div class="muted" style="font-size:11px;margin-top:4px">aus Cache = &Sigma; #cached-token / neu = &Sigma; #new-token der Zeile &bdquo;Prefill batch&ldquo; (nur erster Rang, jeder Chunk einmal). Bei D ist &bdquo;aus Cache&ldquo; vor allem der von P &uuml;bergebene Pr&auml;fix, nicht nur echte Treffer.
+      L2: Zeilen &bdquo;#988 LOADBACK&ldquo; (TP0), Tokens = anchor_depth, Anteil gegen alle Prompt-Tokens der Gruppe. L3: nur <b>unvollst&auml;ndige</b> Store-Lesungen werden geloggt (&bdquo;STORE READ INCOMPLETE&ldquo;, delivered/deliverable) &mdash; vollst&auml;ndige erscheinen nicht.
+      L1-Device ist nicht eigens geloggt; h&ouml;chstens aus Cache &minus; L2 &minus; L3. Front: WEG2-SERVED cached_tokens/prompt_tokens je Anfrage.</div>
+  </div>`;
+}
+
 function bootCard(b, now, binders) {
   const m = b.meta || {};
   const c = b.container;
@@ -334,6 +372,7 @@ function bootCard(b, now, binders) {
         ${flipHtml}${flipHtml ? `<div class="muted" style="font-size:11px">letzte ${flips.length} Flips, Höhe = flip_total &middot; <span style="color:var(--s1)">■</span> P→D <span style="color:var(--s2)">■</span> D→P</div>` : ""}
       </div>
     </div>
+    ${cacheHtml(b)}
     ${(m.launch || []).length ? `<details id="launch-${esc(b.stem)}" style="margin-top:10px"><summary>Startform (weg2-Launcher, ${m.launch.length} Kernzeilen aus dem Front-Log)</summary><div class="launch mono">${m.launch.map((l) => `<div>${esc(l)}</div>`).join("")}</div></details>` : ""}
     ${errs.length ? `<details id="err-${esc(b.stem)}" style="margin-top:10px"><summary>letzte Fehlerzeilen (${fmt(b.error_count)})</summary>${errs.map((e) => `<div class="err mono">${hhmm(e.t)} [${esc(e.group)}] ${esc(e.text)}</div>`).join("")}</details>` : ""}
   </section>`;
@@ -386,8 +425,8 @@ function historyHtml(boots, now) {
   const rows = boots.filter((b) => !b.live);
   if (!rows.length) return `<div class="muted">keine weiteren Boots</div>`;
   const r = (b, g) => { const p = (b.prefill || {})[g]; return p && p.last_burst ? fmt(p.last_burst.tps) : "—"; };
-  return `<table><tr><th>Modell</th><th>Tag</th><th class="num">letztes Log</th><th class="num">P-Prefill</th><th class="num">D-Prefill</th><th class="num">Decode</th><th class="num">Flips</th><th>Ende</th></tr>` +
-    rows.map((b) => `<tr><td>${esc((b.meta || {}).model || "")}</td><td class="mono">${esc((b.meta || {}).tag || b.stem)}</td><td class="num">vor ${ago(b.age_s)}</td><td class="num">${r(b, "P")}</td><td class="num">${r(b, "D")}</td><td class="num">${b.decode && b.decode.D ? fmt(b.decode.D.gen_tps_last, 1) : "—"}</td><td class="num">${fmt(b.flip_count)}</td><td class="err mono" style="max-width:420px">${b.alarm && b.alarm.ended_on && !b.alarm.ended_on.recovered ? esc(b.alarm.ended_on.group + ": " + b.alarm.ended_on.text.slice(0, 140)) : ""}</td></tr>`).join("") +
+  return `<table><tr><th>Modell</th><th>Tag</th><th class="num">letztes Log</th><th class="num">P-Prefill</th><th class="num">D-Prefill</th><th class="num">Decode</th><th class="num">Flips</th><th class="num" title="Summe #new-token, Prefill batch, nur PP0">P neu &Sigma;<br><span class="muted">#new-token PP0</span></th><th class="num" title="Summe #new-token, Prefill batch, nur TP0">D neu &Sigma;<br><span class="muted">#new-token TP0</span></th><th class="num" title="Summe completion_tokens der Front-Zeilen WEG2-SERVED">dekodiert &Sigma;<br><span class="muted">WEG2-SERVED</span></th><th>Ende</th></tr>` +
+    rows.map((b) => `<tr><td>${esc((b.meta || {}).model || "")}</td><td class="mono">${esc((b.meta || {}).tag || b.stem)}</td><td class="num">vor ${ago(b.age_s)}</td><td class="num">${r(b, "P")}</td><td class="num">${r(b, "D")}</td><td class="num">${b.decode && b.decode.D ? fmt(b.decode.D.gen_tps_last, 1) : "—"}</td><td class="num">${fmt(b.flip_count)}</td><td class="num">${fmt((b.totals || {}).p_new)}</td><td class="num">${fmt((b.totals || {}).d_new)}</td><td class="num">${fmt((b.totals || {}).decoded)}${(b.totals || {}).read_progress < 1 ? "*" : ""}</td><td class="err mono" style="max-width:420px">${b.alarm && b.alarm.ended_on && !b.alarm.ended_on.recovered ? esc(b.alarm.ended_on.group + ": " + b.alarm.ended_on.text.slice(0, 140)) : ""}</td></tr>`).join("") +
     `</table><div class="muted" style="font-size:12px;margin-top:4px">Prefill-Spalten: Rechenrate (gpu-ms) des letzten Schubs, langsamster Rang; Decode: letzter gen-throughput-Wert.</div>`;
 }
 

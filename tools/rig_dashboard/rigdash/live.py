@@ -22,15 +22,15 @@ import threading
 import time
 from typing import Dict, List, Optional
 
-from . import parse
+from . import parse, redact
 
 DEFAULT_LOG_GLOBS = [
     "/spinning/docker-acceptance/*/evidence/boot_*.log",
     "/spinning/evidence-665-f1/boot_*.log",
 ]
-BACKFILL_BYTES = 24 * 1024 * 1024
+BACKFILL_BYTES = None     # None = read every log from its start (totals "seit Boot" need all of it)
 HEAD_BYTES = 512 * 1024
-MAX_READ_PER_POLL = 32 * 1024 * 1024
+MAX_READ_PER_POLL = 8 * 1024 * 1024
 LIVE_S = 90.0          # a log written within this many seconds is "live"
 SHOW_S = 6 * 3600.0    # boots are listed while their newest log is younger
 WINDOW_S = 60.0        # headline window for the rates
@@ -86,7 +86,7 @@ class Tail:
         self.size, self.mtime = st.st_size, st.st_mtime
         if self.offset is None or st.st_ino != self.ino or st.st_size < self.offset:
             self.ino = st.st_ino
-            start = max(0, st.st_size - self.backfill) if self.offset is None else 0
+            start = (max(0, st.st_size - self.backfill) if self.backfill else 0) if self.offset is None else 0
             self.offset = start
             self.partial = b""
             skip_first = start > 0
@@ -116,8 +116,8 @@ def launch_lines(lines: List[str]) -> List[str]:
         i = ln.find("WEG2-LAUNCH ")
         if i < 0:
             continue
-        body = ln[i + len("WEG2-LAUNCH "):].strip()
-        if not any(k in body for k in LAUNCH_KEYS) or body in seen:
+        body = redact.clean(ln[i + len("WEG2-LAUNCH "):].strip())
+        if body is None or not any(k in body for k in LAUNCH_KEYS) or body in seen:
             continue
         seen.add(body)
         out.append(body[:600])
@@ -152,6 +152,10 @@ class Boot:
         self.flip_open = None
         self.counts = collections.Counter()
         self._last_t = {}       # group -> newest log timestamp seen in that file
+        self.lock = threading.Lock()
+        # totals since boot (whole file read) and a 60-s event window, per group
+        self.tot = collections.defaultdict(collections.Counter)
+        self.win = collections.deque(maxlen=20000)
 
     def add_file(self, group: str, path: str):
         if group in self.tails:
@@ -171,6 +175,15 @@ class Boot:
         return max((t.mtime for t in self.tails.values()), default=0.0)
 
     def poll(self):
+        with self.lock:
+            self._poll()
+
+    def read_progress(self) -> float:
+        size = sum(t.size for t in self.tails.values())
+        done = sum((t.offset or 0) for t in self.tails.values())
+        return 1.0 if size == 0 else min(1.0, done / size)
+
+    def _poll(self):
         for group, t in self.tails.items():
             for line in t.poll():
                 ev = parse.parse_line(line)
@@ -189,7 +202,9 @@ class Boot:
         traceback) take the newest timestamp seen in the same file."""
         m = parse.RE_PREFIX.match(line)
         ts = parse.parse_ts(m) if m else self._last_t.get(group, tail.mtime)
-        text = line[m.end():] if m else line
+        text = redact.clean(line[m.end():] if m else line)
+        if text is None:
+            return
         self.ev["stops"].append({
             "t": ts, "group": group, "text": text.strip()[:400],
             # the bare "Traceback (most recent call last):" says THAT, the
@@ -227,9 +242,48 @@ class Boot:
         if head:
             return
         self.counts[k] += 1
+        rank0 = ev.get("rank") in (None, 0)
         if k in ("prefill_rank", "prefill_batch", "decode_batch", "decode_rank"):
             self.ev["%s_%s" % (group, k)].append(ev)
             self.last["%s_%s" % (group, k)] = ev
+            if k == "prefill_batch" and rank0:
+                # one "Prefill batch" line per chunk on the FIRST rank only (PP0/TP0):
+                # the other ranks log the same chunk again
+                new, cached = ev.get("new_tok") or 0, ev.get("cached") or 0
+                tt = self.tot[group]
+                tt["new"] += new
+                tt["cached"] += cached
+                tt["chunks"] += 1
+                self.win.append((ev["t"], group, "pb", new, cached))
+            return
+        if k in ("loadback", "mamba_host_resume", "store_read_incomplete", "prefetch"):
+            if not rank0:
+                return
+            tt = self.tot[group]
+            if k == "loadback":
+                tt["loadback_n"] += 1
+                tt["loadback_tok"] += ev.get("depth") or 0
+                self.win.append((ev["t"], group, "lb", ev.get("depth") or 0, 0))
+            elif k == "mamba_host_resume":
+                tt["mamba_n"] += 1
+                tt["mamba_tok"] += ev.get("depth") or 0
+                self.win.append((ev["t"], group, "mb", ev.get("depth") or 0, 0))
+            elif k == "store_read_incomplete":
+                tt["l3inc_n"] += 1
+                tt["l3inc_delivered"] += ev["delivered"]
+                tt["l3inc_deliverable"] += ev["deliverable"]
+                self.win.append((ev["t"], group, "l3", ev["delivered"], ev["deliverable"]))
+            else:
+                tt["prefetch_" + ev["outcome"].lower()] += 1
+            return
+        if k == "served":
+            key = "served_" + ev["group"]
+            tt = self.tot[key]
+            tt["n"] += 1
+            tt["prompt"] += ev.get("prompt_tokens") or 0
+            tt["cached"] += ev.get("cached_tokens") or 0
+            tt["completion"] += ev.get("completion_tokens") or 0
+            self.win.append((ev["t"], key, "sv", ev.get("prompt_tokens") or 0, ev.get("cached_tokens") or 0))
             return
         if k == "flip_begin":
             self.flip_open = ev
@@ -251,7 +305,9 @@ class Boot:
             return
         if k == "error":
             ev["group"] = group
-            self.ev["errors"].append(ev)
+            ev["text"] = redact.clean(ev.get("text"))
+            if ev["text"] is not None:
+                self.ev["errors"].append(ev)
 
     # ---------------------------------------------------------------- views
 
@@ -406,9 +462,57 @@ class Boot:
             "prefill": {g: self._prefill_view(g, now) for g in self.groups_with("prefill_rank")},
             "decode": {g: self._decode_view(g, now) for g in self.groups_with("decode_batch")},
         }
+        v["totals"] = self.totals_view()
+        v["cache"] = self.cache_view(now)
         if with_series:
             v["series"] = self.series(now)
         return v
+
+    def totals_view(self) -> dict:
+        p, d = self.tot.get("P", {}), self.tot.get("D", {})
+        s1 = self.tot.get("single", {})
+        dec = sum(self.tot.get(k, {}).get("completion", 0) for k in list(self.tot) if k.startswith("served_"))
+        return {
+            "p_new": p.get("new", 0) + s1.get("new", 0), "d_new": d.get("new", 0),
+            "p_chunks": p.get("chunks", 0), "d_chunks": d.get("chunks", 0),
+            "decoded": dec, "served_requests": self.tot.get("served_D", {}).get("n", 0),
+            "read_progress": round(self.read_progress(), 4),
+        }
+
+    def cache_view(self, now: float) -> dict:
+        t0 = now - WINDOW_S
+        w = collections.defaultdict(collections.Counter)
+        for t, g, kind, a, b in self.win:
+            if t < t0:
+                continue
+            c = w[g]
+            if kind == "pb":
+                c["new"] += a; c["cached"] += b; c["chunks"] += 1
+            elif kind == "lb":
+                c["loadback_n"] += 1; c["loadback_tok"] += a
+            elif kind == "mb":
+                c["mamba_n"] += 1; c["mamba_tok"] += a
+            elif kind == "l3":
+                c["l3inc_n"] += 1; c["l3inc_delivered"] += a; c["l3inc_deliverable"] += b
+            elif kind == "sv":
+                c["n"] += 1; c["prompt"] += a; c["cached"] += b
+
+        def one(c):
+            c = dict(c)
+            seen = c.get("new", 0) + c.get("cached", 0)
+            c["hit_share"] = (c.get("cached", 0) / seen) if seen else None
+            c["l2_share"] = (c.get("loadback_tok", 0) / seen) if seen else None
+            dl = c.get("l3inc_deliverable", 0)
+            c["l3inc_share"] = (c.get("l3inc_delivered", 0) / dl) if dl else None
+            pr = c.get("prompt", 0)
+            c["req_hit_share"] = (c.get("cached", 0) / pr) if pr else None
+            return c
+
+        out = {}
+        for g in ("P", "D", "single", "served_P", "served_D"):
+            if g in self.tot or g in w:
+                out[g] = {"window": one(w.get(g, {})), "boot": one(self.tot.get(g, {}))}
+        return out
 
 
 class LiveLogs:
@@ -453,8 +557,10 @@ class LiveLogs:
         if now - self._last_scan >= self.scan_s:
             self.scan(now)
         with self.lock:
-            for b in self.boots.values():
-                b.poll()
+            boots = list(self.boots.values())
+        # newest first, so the live boot is caught up before the history rows
+        for b in sorted(boots, key=lambda x: -x.newest_mtime):
+            b.poll()
 
     def snapshot(self, with_series: bool = True, max_boots: int = 10) -> List[dict]:
         now = time.time()
@@ -464,11 +570,12 @@ class LiveLogs:
             for b in boots:
                 newest_in_dir.setdefault(b.dir, b)
             views = []
-            for b in boots:
-                primary = (now - b.newest_mtime < LIVE_S) or newest_in_dir.get(b.dir) is b
+        for b in boots:
+            primary = (now - b.newest_mtime < LIVE_S) or newest_in_dir.get(b.dir) is b
+            with b.lock:
                 v = b.view(now, with_series and primary)
-                v["primary"] = primary
-                views.append(v)
+            v["primary"] = primary
+            views.append(v)
         views.sort(key=lambda v: (not v["live"], not v["primary"],
                                   v["age_s"] if v["age_s"] is not None else 1e12))
         return views

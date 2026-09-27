@@ -312,6 +312,56 @@ class StopScanTests(unittest.TestCase):
             self.assertEqual(v["last_activity"]["P"], parse.parse_line(P_RANK0)["t"])
 
 
+# verbatim, NF dkrnfh91bar1dauer09270859 (D log / front log), 2026-09-27
+LB0 = ("[2026-09-27 09:05:29 TP0] #988 LOADBACK rid=weg2-0-1 prefix moved to 27456, extend_range re-derived to the "
+       "parked shape at the mutation (seen=1) kv_applied=1 mamba_restored=1 kv_only=0 anchor_depth=27456 extent=27456")
+MB1 = ("[2026-09-27 09:04:40 TP1] MAMBA-HOST-RESUME n=1: anchor accepted at depth=16384 on a HOST-backed state (device "
+       "copy evicted); this match triggers load_back. interval=None")
+SR0 = ("[2026-09-27 09:04:40 TP0] #1324 STORE READ INCOMPLETE rid=weg2-0-1 delivered=16384 deliverable=27456 "
+       "shortfall=11072 site=drain occurrence=1 -- the read TERMINATED holding less than the prefix it asked for")
+SV_D = ("[2026-09-27 09:05:39,208] INFO weg2.front: WEG2-SERVED group=D leg=2 rid=weg2-0-6 stream=1 status=200 "
+        "prompt_tokens=26012 cached_tokens=25984 completion_tokens=28 uncached=28 verdict=serve priced=True")
+SV_P = ("[2026-09-27 09:04:38,917] INFO weg2.front: WEG2-SERVED group=P leg=1 rid=weg2-0-1 prompt_tokens=27512 "
+        "cached_tokens=0 wall=39.25s epoch=1")
+D_BATCH = ("[2026-09-27 09:18:53 TP0] Prefill batch, #new-seq: 1, #new-token: 4, #cached-token: 52172, full token usage: "
+           "0.89, mamba usage: 0.63, #running-req: 5, #queue-req: 0, #pending-token: 0, cuda graph: False, input "
+           "throughput (token/s): 0.39")
+P_BATCH_PP1 = P_BATCH.replace(" PP0]", " PP1]")
+ADMIN = ("[2026-09-27T09:57:55Z] WEG2-LAUNCH WEG2 ADMIN-KEY minted for this boot -> /var/lib/htsglang/arb/weg2/"
+         "boot_x.adminkey (mode 0600); both groups get --admin-api-key")
+
+
+class TotalsAndCacheTests(unittest.TestCase):
+    def test_counted_once_per_chunk_and_request(self):
+        now = time.time()
+        with tempfile.TemporaryDirectory() as d:
+            stem = os.path.join(d, "boot_weg2_x_0927_000000")
+            with open(stem + ".P.log", "w") as fh:   # the same chunk logged by PP0 and PP1: count once
+                fh.write("\n".join([_shift(P_BATCH, now - 5), _shift(P_BATCH_PP1, now - 5)]) + "\n")
+            with open(stem + ".D.log", "w") as fh:
+                fh.write("\n".join([_shift(D_BATCH, now - 4), _shift(LB0, now - 4), _shift(MB1, now - 4),
+                                     _shift(SR0, now - 4), _shift(SR0.replace(" TP0]", " TP1]"), now - 4)]) + "\n")
+            with open(stem + ".front.log", "w") as fh:
+                fh.write("\n".join([ADMIN, _shift(SV_P, now - 6), _shift(SV_D, now - 3)]) + "\n")
+            ll = live.LiveLogs([os.path.join(d, "boot_*.log")])
+            ll.poll()
+            [v] = ll.snapshot()
+        t = v["totals"]
+        self.assertEqual((t["p_new"], t["d_new"], t["decoded"]), (16384, 4, 28))
+        self.assertEqual(t["read_progress"], 1.0)
+        dc = v["cache"]["D"]["boot"]
+        self.assertEqual((dc["new"], dc["cached"]), (4, 52172))
+        self.assertAlmostEqual(dc["hit_share"], 52172 / 52176)
+        self.assertEqual((dc["loadback_n"], dc["loadback_tok"]), (1, 27456))
+        self.assertEqual(dc.get("mamba_n", 0), 0)            # the MAMBA line came from TP1: not counted
+        self.assertEqual((dc["l3inc_n"], dc["l3inc_delivered"], dc["l3inc_deliverable"]), (1, 16384, 27456))
+        self.assertEqual(v["cache"]["D"]["window"]["cached"], 52172)
+        sd = v["cache"]["served_D"]["boot"]
+        self.assertAlmostEqual(sd["req_hit_share"], 25984 / 26012)
+        # the ADMIN-KEY launch line never reaches the view
+        self.assertFalse(any("ADMIN" in x for x in v["meta"].get("launch", [])))
+
+
 class SourceTests(unittest.TestCase):
     def test_nvsmi_csv(self):
         txt = ("0, NVIDIA GeForce RTX 3080, GPU-5c64, 225.11, 230.00, 19334, 20480, 100, 65, 1710\n"
