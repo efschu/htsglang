@@ -111,6 +111,38 @@ _LEDGERS: dict = {}
 #: header read of a 720k-slot arena is ~15 ms (desk), numpy releases the GIL.
 ENV_REF_CENSUS_S = "SGLANG_HICACHE_ARENA_REF_CENSUS_S"
 _CENSUS_THREADS: dict = {}
+#: #1424e: the reference HOLDERS of this process, per class, next to the census
+#: (weak methods: a provider never keeps its tree alive). A provider is called
+#: with the arena and returns one line of holder classes, or None when it holds
+#: nothing on that arena.
+_HOLDER_PROVIDERS: list = []
+
+
+def register_holder_census(fn) -> None:
+    """#1424e: add a holder provider (a bound method, held weakly) to the
+    ARENA-REF-CENSUS thread -- one ARENA-REF-HOLDERS line per provider and
+    census tick, never on a round path."""
+    import weakref
+    ref = weakref.WeakMethod(fn) if hasattr(fn, "__self__") else (lambda f=fn: f)
+    with _lock:
+        _HOLDER_PROVIDERS[:] = [r for r in _HOLDER_PROVIDERS if r() is not None]
+        _HOLDER_PROVIDERS.append(ref)
+
+
+def _holder_lines(arena) -> list:
+    with _lock:
+        fns = [r() for r in _HOLDER_PROVIDERS]
+    out = []
+    for fn in fns:
+        if fn is None:
+            continue
+        try:
+            line = fn(arena)
+        except Exception as exc:  # noqa: BLE001 - an instrument never raises
+            line = f"failed={exc!r}"
+        if line:
+            out.append(line)
+    return out
 
 
 def _start_ref_census(arena: "ShmArena") -> None:
@@ -144,6 +176,8 @@ def _start_ref_census(arena: "ShmArena") -> None:
                     )
                 except Exception as exc:  # noqa: BLE001 - an instrument never raises
                     logger.info("ARENA-REF-CENSUS n=%d failed: %r", n, exc)
+                for line in _holder_lines(arena):
+                    logger.info("ARENA-REF-HOLDERS n=%d path=%s %s", n, arena.path, line)
 
         th = threading.Thread(target=_run, name="arena-ref-census", daemon=True)
         _CENSUS_THREADS[key] = stop
@@ -450,6 +484,17 @@ class ShmArena:
         state, ref = hdr[:, 0], hdr[:, 1]
         return (int(((state == 2) & (ref > 0)).sum()), int(ref.sum(dtype=np.int64)),
                 int((state == 2).sum()))
+
+    def slot_refs(self, slots) -> list[int]:
+        """#1424e: the reader references of these slots (the C header, all
+        ranks) -- one strided header read, for the rare re-point path."""
+        import numpy as np
+        out = (ctypes.c_int64 * 6)()
+        self._lib.arena_layout(self.slots, self.slot_bytes, out)
+        hb, hoff = int(out[0]), int(out[3])
+        u32 = np.frombuffer(self._mm, dtype=np.uint32, count=self.slots * hb // 4, offset=hoff)
+        ref = u32.reshape(self.slots, hb // 4)[:, 1]
+        return [int(ref[int(s)]) if 0 <= int(s) < self.slots else 0 for s in slots]
 
     def find_states(self, stems: Sequence[str]) -> list[int]:
         """#1439: the states only (0 absent/free, 1 claimed, 2 complete), by stem, hashed in C."""

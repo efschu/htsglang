@@ -226,7 +226,7 @@ def _chain_plan(pool, nodes, rows_of, stems_of, keys_of, own_hash, p_chain, page
                 f"{len(stored)} page key(s) of {P} tokens{'' if arena is not None else ', no arena'} "
                 f"-- the rows are not whole pages and cannot be proven")), total
         plan = {"node": node, "keys": list(stored), "stored": stored, "rows": hv.clone(),
-                "refs": [], "fixed": [], "rekeyed": []}
+                "refs": [], "unrefs": [], "fixed": [], "rekeyed": []}
         if not stored:
             plans.append(plan)
             continue
@@ -272,6 +272,15 @@ def _chain_plan(pool, nodes, rows_of, stems_of, keys_of, own_hash, p_chain, page
                 return plans, (j + int(invalid[0]) - j0, (
                     f"#1424 CHAIN MISMATCH {what} -- the page key names no COMPLETE slot, so the "
                     f"rows cannot be proven")), total
+            # #1424e: the slot each re-pointed page addressed before (-1: its
+            # rows were no whole arena page -- staging rows, a torn page -- so
+            # they hold no slot reference to give back)
+            old = pages[idx].clone()
+            head = old[:, 0]
+            whole = ((old == head[:, None] + lane).all(dim=1) & (head >= 0)
+                     & (head % P == 0) & (head < _atok(pool)))
+            plan["unrefs"] = [int(s) if bool(w) else -1
+                              for s, w in zip((head // P).tolist(), whole.tolist())]
             pages[idx] = want[idx]
             plan["refs"] = [int(x) for x in slots[idx].tolist()]
             plan["fixed"].append(what)
@@ -286,6 +295,54 @@ def _chain_plan(pool, nodes, rows_of, stems_of, keys_of, own_hash, p_chain, page
             f"page matches {'its tokens' if proven_by_tokens else 'its stored key'} ({len(nodes)} node(s), "
             f"repeated pages (page, first seen) {dups}, page0={page0})")), total
     return plans, None, total
+
+
+def arena_ref_pages(pool, host_indices) -> int:
+    """#1424e census: how many arena pages (one reader reference each) these
+    host rows name -- the release's own rule (``release_queued_rows``): arena
+    rows only, one per page of P token ids."""
+    if host_indices is None or getattr(pool, "arena", None) is None:
+        return 0
+    idx = torch.as_tensor(host_indices).reshape(-1).cpu().to(torch.int64)
+    if idx.numel() == 0:
+        return 0
+    rows = torch.unique(idx[_arena_mask(pool, idx)]) - int(pool.staging_rows)
+    return int(_slots_of_rows(pool, rows).numel()) if rows.numel() else 0
+
+
+def _repoint_unrefs(pool, arena, olds):
+    """#1424e (rc12p D-TP0 ARENA-REF-CENSUS, pinned 4315 of 4669): the old
+    slots of re-pointed pages whose reader reference THIS page holds and gives
+    back with the re-point. A page of a load-back chain holds one reference on
+    the slot its rows address (the read resolve ``_arena_page_get`` +1 per page
+    key, a publish's ``complete_write`` +1), and the node's release (``free`` /
+    ``release_tree_rows``) gives back the slots its rows address THEN -- after a
+    re-point the new slot, so the old one stayed referenced for good.
+
+    Given back only what is really held: rows that were no whole arena page
+    (-1), a slot of a pending write of this pool (its writer's reference comes
+    with the ack, never before), and per slot at most as many as this process
+    holds there (the reference ledger, SGLANG_HICACHE_ARENA_QUEUE_REFS; without
+    it the slot's header count) -- a counter never goes below what exists."""
+    olds = [int(s) for s in olds if int(s) >= 0]
+    if not olds:
+        return []
+    if getattr(pool, "_pending_mask", None) is not None or getattr(pool, "_pending", None):
+        olds = [s for s, pend in zip(olds, pool._pend_has(olds)) if not pend]
+    ledger = getattr(arena, "_ledger", None)
+    if ledger is not None:
+        held = {s: int(ledger.held[s]) for s in set(olds)}
+    elif hasattr(arena, "slot_refs"):
+        uq = sorted(set(olds))
+        held = dict(zip(uq, arena.slot_refs(uq)))
+    else:
+        return []
+    out = []
+    for s in olds:
+        if held.get(s, 0) > 0:
+            held[s] -= 1
+            out.append(s)
+    return out
 
 
 def provable_pages(pool, nodes, rows_of, stems_of, *, keys_of=None, own_hash=None,
@@ -337,7 +394,10 @@ def verify_load_chain(pool, nodes, host_indices, rows_of, stems_of, *, keys_of=N
       slot when they are not its ids);
     * a stored key that is not admissible is replaced by the first admissible
       key whose slot is COMPLETE, the node's hash_value corrected in place and
-      the slot referenced (``#1424 CHAIN REKEYED``).
+      the slot referenced (``#1424 CHAIN REKEYED``);
+    * a re-pointed page gives the reference it held on its OLD slot back
+      (#1424e, ``_repoint_unrefs``) -- the node's release gives back the new
+      one, so the pair balances.
 
     Anything no admissible key proves is a named stop -- the LAST latch: the
     admission vote (``provable_pages`` through
@@ -363,18 +423,23 @@ def verify_load_chain(pool, nodes, host_indices, rows_of, stems_of, *, keys_of=N
     if not fixed and not rekeyed:
         return host_indices
     arena = pool.arena
+    olds = [s for p in plans for s in p["unrefs"]]
+    drop = _repoint_unrefs(pool, arena, olds)
+    took = 0
     for p in plans:
         if p["refs"]:
-            arena.ref_slots(p["refs"], +1)
+            took += int(arena.ref_slots(p["refs"], +1))
         if p["keys"] != p["stored"]:
             p["node"].hash_value = list(p["keys"])
         ref = rows_of(p["node"])
         if not torch.equal(ref.to("cpu", dtype=torch.int64).reshape(-1) - S, p["rows"]):
             ref.copy_((p["rows"] + S).to(ref.dtype).view(ref.shape))
+    gave = int(arena.ref_slots(drop, -1)) if drop else 0
     _CHAIN_REPAIRED_N[0] += 1
     logger.warning(
-        "#1424 CHAIN %s n=%d nodes=%d page0=%s: %s -- %s",
+        "#1424 CHAIN %s n=%d nodes=%d page0=%s refs=+%d/-%d (re-pointed %d, old held %d): %s -- %s",
         "REKEYED" if rekeyed else "REPAIRED", _CHAIN_REPAIRED_N[0], len(nodes), page0,
+        took, gave, len(olds), len(drop),
         "; ".join((rekeyed + fixed)[:4]),
         "a page carried the key of another depth; re-keyed to its tokens' key and re-pointed "
         "to that key's COMPLETE slot" if rekeyed else
