@@ -4823,6 +4823,7 @@ class SchedulerPPMixin:
                     pp_bulletin.clear_after_plan(self)
                 elif _pre_proxy is not None:
                     _dn2 = getattr(self, "_pp_row_deliver_trace_n", 0)
+                    _prow_t0 = time.perf_counter()  # Fix B P-ROW-COST
                     if _dn2 <= 50:
                         try:
                             with torch.profiler.record_function(
@@ -4856,6 +4857,10 @@ class SchedulerPPMixin:
                         finally:
                             if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
                                 pp_bulletin.clear_after_plan(self)
+                    if getattr(self, "_weg2_p_row_only", False):
+                        from sglang.srt.weg2 import p_row_authority as _prow
+
+                        _prow.note_plan(self, (time.perf_counter() - _prow_t0) * 1000.0)
                 else:
                     try:
                         with torch.profiler.record_function("get_next_batch_to_run"):

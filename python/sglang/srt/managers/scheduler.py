@@ -3950,6 +3950,16 @@ class Scheduler(
         # and takes the direct upstream path.
         self.pp_flip_counters = None
         self.pp_chain_receiver = None
+        # Fix B (weg2/p_row_authority.py, SGLANG_WEG2_P_ROW_AUTHORITY, default
+        # OFF): on group P the #631 row form is re-armed -- counters BEFORE the
+        # receiver (the receiver publishes its consumed count through them),
+        # then the named start check. Off: both stay None, byte for byte.
+        from sglang.srt.weg2 import p_row_authority as _prow
+
+        if _prow.applies(self):
+            self.pp_flip_counters = _prow.build_counters(self)
+            self.pp_chain_receiver = _prow.build_chain_receiver(self, self.pp_flip_counters)
+            _prow.start_check(self)
         # WEG2 VISION (user design 2026-09-24): PP0 of a transient P group
         # encodes images in its OWN process, on its KV tail, before the
         # admission (weg2/vision_rank_runner.py). False on every other boot
@@ -4009,7 +4019,7 @@ class Scheduler(
             # #1233 (WEG 2, S0): None, the value every non-flip boot already
             # passed. The receiver falls back to the direct
             # ``point_to_point_pyobj`` call, i.e. the upstream intake path.
-            chain_receiver=None,
+            chain_receiver=self.pp_chain_receiver,
             # #824 W5(b): mark the DIRECT chain receive. That branch runs on
             # every boot, and it was the last blocking PP receive with no
             # marker at all.
@@ -11947,7 +11957,7 @@ class Scheduler(
             # awake overshoot is charged to its budget, so #656 has no reason
             # to narrow). Any mismatch that still reaches the ring is refused
             # by name in model_runner (PPWidthDivergenceRefused), never run.
-            if not pp_row_carrier_present(self):
+            if not pp_row_carrier_present(self, term="corridor"):
                 _n = getattr(self, "_corridor_width_disarmed_calls", 0) + 1
                 self._corridor_width_disarmed_calls = _n
                 if _n == 1 or _n % 500 == 0:
@@ -15308,7 +15318,7 @@ class Scheduler(
             # takes without waiting -- #969Z's uniform, wireless verdict --
             # and the flip-form terms stay exactly as they were where the
             # carrier exists. Resolved ONCE per call, like the kill switch.
-            _pp0_may_withhold = _pp_group and pp_row_carrier_present(self)
+            _pp0_may_withhold = _pp_group and pp_row_carrier_present(self, term="withhold")
             # #1175: the group-completion gate, resolved ONCE per request
             # so the kill switch cannot flip mid-loop and split the pass.
             _group_completion_enabled = _pp0_may_withhold and _group_completion_on()
@@ -15666,7 +15676,7 @@ class Scheduler(
                     # PP0's prefix alone. pp_row_carrier_present is the same
                     # fact the follower half keys on; byte-identical where
                     # the carrier exists.
-                    if pp_row_carrier_present(self):
+                    if pp_row_carrier_present(self, term="floor_clamp"):
                         # #631 ROW AUTHORITY: the telling half is alive again
                         # (downstream builds from the row it receives BEFORE
                         # planning), so PP0's learned-floor clamp is

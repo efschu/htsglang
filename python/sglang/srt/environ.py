@@ -3000,6 +3000,10 @@ class Envs:
     # off); off without a form. d_seats/front read it through
     # weg2.form.d_park_immediate_state (same default); explicit value wins.
     SGLANG_WEG2_D_PARK_IMMEDIATE = EnvBool(_profile_default("SGLANG_WEG2_D_PARK_IMMEDIATE", False))
+    # Fix B (weg2/p_row_authority.py): the #631 row form on group P
+    # (ModelProfile.p_row_authority: off on every row until the metal proof);
+    # the proof boot sets it per docker profile (27b-row-authority.env).
+    SGLANG_WEG2_P_ROW_AUTHORITY = EnvBool(_profile_default("SGLANG_WEG2_P_ROW_AUTHORITY", False))
     # H91d: the L2 bound of those buffers per rank (MiB). A FLIP park whose
     # buffer would pass it goes to L3 (a file under
     # SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR/weg2_d_park_draft, written in the
