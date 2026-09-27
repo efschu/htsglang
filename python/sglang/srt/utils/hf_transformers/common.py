@@ -436,8 +436,29 @@ def get_context_length(config):
     for key in CONTEXT_LENGTH_KEYS:
         val = getattr(text_config, key, None)
         if val is not None:
-            return int(rope_scaling_factor * val)
-    return 2048
+            return max(int(rope_scaling_factor * val), _yarn_context_length(text_config))
+    return max(2048, _yarn_context_length(text_config))
+
+
+def _yarn_context_length(config) -> int:
+    """YaRN x2 (27.09.): the context a YaRN rope stretches the model to --
+    ``original_max_position_embeddings x factor`` (the v4 ``rope_scaling`` or
+    the v5 ``rope_parameters`` block). The branch above takes factor 1 once
+    the original length is named, i.e. ``max_position_embeddings`` alone; a
+    YaRN override of a 262144 model with factor 2 then derived 262144 and a
+    ``--context-length 524288`` needed SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.
+    0 without a YaRN block (the result above stands)."""
+    for key in ("rope_scaling", "rope_parameters"):
+        rope = getattr(config, key, None)
+        if not isinstance(rope, dict):
+            continue
+        if rope.get("rope_type", rope.get("type")) != "yarn":
+            continue
+        orig = rope.get("original_max_position_embeddings")
+        factor = rope.get("factor")
+        if orig and factor:
+            return int(int(orig) * float(factor))
+    return 0
 
 
 @lru_cache_frozenset(maxsize=32)
