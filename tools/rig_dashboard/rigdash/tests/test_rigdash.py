@@ -501,5 +501,82 @@ class SourceTests(unittest.TestCase):
         self.assertIn("{{.Names}}\\t{{.Image}}", sources.DOCKER_PS_FORMAT)
 
 
+class PhaseTimelineTests(unittest.TestCase):
+    """The phase bar: runs per class, flips grey, idle between, nothing guessed."""
+
+    def _pf(self, t, tok, ms, rank=0, rk="PP"):
+        return {"t": t, "s": t - ms / 1000.0, "cls": "P", "ev": {"kind": "prefill_rank", "rk": rk, "rank": rank,
+                                                            "new_tok": tok, "compute_ms": ms, "t": t}}
+
+    def _dec(self, t, gen=None, cls="dec"):
+        return {"t": t, "s": t, "cls": cls, "ev": {"kind": "decode_batch" if gen else "decode_rank", "gen_tps": gen,
+                                                   "running": 2 if gen else None, "t": t}}
+
+    def test_decode_rank_line_carries_its_exact_stamp(self):
+        ev = parse.parse_line("[2026-09-27 17:35:40 TP0] Decode rank batch, rank: 0, #round: 2862, "
+                              "t: 1790530539.968, bs: 3, #rows: 12, #fwd: 1, gpu-ms: 46.2 (split unavailable)")
+        self.assertEqual(ev["kind"], "decode_rank")
+        self.assertAlmostEqual(ev["t_exact"], 1790530539.968)
+
+    def test_flip_pairs_begin_with_done_of_next_epoch(self):
+        fl = live._flip_intervals([{"t": 100.0, "epoch": 7, "sleep": "P", "wake": "D"}],
+                                  [{"t": 102.5, "epoch": 8, "slept": "P", "woke": "D", "total_ms": 2512.0}], None, 200)
+        self.assertEqual((fl[0]["b"], fl[0]["d"]), (100.0, 102.5))
+        # no begin in memory: the start is done - flip_total
+        fl = live._flip_intervals([], [{"t": 102.5, "epoch": 8, "slept": "P", "woke": "D", "total_ms": 2000.0}], None, 200)
+        self.assertAlmostEqual(fl[0]["b"], 100.5)
+
+    def test_prefill_flip_decode_sequence(self):
+        acts = [self._pf(10, 1000, 1000), self._pf(12, 1000, 1000), self._pf(14, 1000, 2000),
+                self._dec(25.0), self._dec(26.0, gen=100.0), self._dec(28.0, gen=120.0)]
+        flips = [{"b": 15.0, "d": 17.0, "slept": "P", "woke": "D", "total_ms": 2000.0, "drain_ms": 100.0, "open": False}]
+        segs = live.phase_timeline(acts, flips, 0.0, 30.0, first_t=5.0)
+        self.assertEqual([x["k"] for x in segs], ["idle", "P", "idle", "flip", "idle", "dec"])
+        p = segs[1]
+        self.assertEqual((p["s"], p["e"]), (9.0, 14.0))          # first chunk's own gpu-ms, not a guess
+        self.assertAlmostEqual(p["tps"], 3000 / 4.0)             # sum tok / sum compute-ms
+        self.assertEqual((segs[3]["s"], segs[3]["e"]), (15.0, 17.0))
+        self.assertEqual(segs[4]["awake"], "D")                  # after the flip D is awake, no work yet
+        self.assertEqual(segs[5]["s"], 24.0)                    # >gap after the flip: 1 s before its first line
+        self.assertAlmostEqual(segs[5]["tps"], 110.0)           # mean gen throughput of the run
+        self.assertTrue(segs[5]["running"])
+        self.assertEqual(segs[5]["e"], 30.0)
+        self.assertEqual(segs[0]["s"], 5.0)                     # nothing before the boot's first line
+
+    def test_short_gap_after_a_flip_is_filled(self):
+        acts = [self._dec(20.0, gen=100.0), self._dec(21.0, gen=100.0)]
+        flips = [{"b": 15.0, "d": 17.0, "slept": "P", "woke": "D", "total_ms": 2000.0, "drain_ms": 1.0, "open": False}]
+        segs = live.phase_timeline(acts, flips, 10.0, 40.0)
+        self.assertEqual([x["k"] for x in segs], ["idle", "flip", "dec", "idle"])
+        self.assertEqual(segs[2]["s"], 17.0)
+
+    def test_drain_work_inside_a_flip_is_work_not_grey(self):
+        acts = [self._dec(10.0, gen=90.0), self._dec(40.0, gen=80.0)]
+        flips = [{"b": 5.0, "d": 42.0, "slept": "D", "woke": "P", "total_ms": 37000.0, "drain_ms": 35000.0, "open": False}]
+        segs = live.phase_timeline(acts, flips, 0.0, 50.0)
+        grey = [x for x in segs if x["k"] == "flip"][0]
+        self.assertEqual(grey["s"], 40.0)                       # grey only after the old group's last line
+        self.assertEqual(sum(1 for x in segs if x["k"] == "dec"), 2)   # a 30-s silence splits the run
+
+    def test_running_phase_reaches_now_and_short_gaps_are_filled(self):
+        acts = [self._dec(10.0, gen=100.0), self._pf(13.0, 100, 500, rk="TP"), self._dec(16.0, gen=100.0)]
+        for a in acts[1:2]:
+            a["cls"] = "D"
+        segs = live.phase_timeline(acts, [], 0.0, 18.0, first_t=0.0)
+        ks = [x["k"] for x in segs]
+        self.assertEqual(ks, ["idle", "dec", "D", "dec"])
+        self.assertEqual(segs[2]["s"], 10.0)                    # D-Prefill fills the 2.5-s gap after decode
+        self.assertEqual(segs[3]["s"], 13.0)
+        self.assertTrue(segs[3]["running"])
+        self.assertEqual(segs[3]["e"], 18.0)
+
+    def test_open_flip_is_grey_until_now(self):
+        fl = live._flip_intervals([], [], {"t": 20.0, "epoch": 3, "sleep": "D", "wake": "P"}, 25.0)
+        segs = live.phase_timeline([self._dec(19.0, gen=50.0)], fl, 0.0, 25.0, first_t=0.0)
+        self.assertEqual(segs[-1]["k"], "flip")
+        self.assertTrue(segs[-1]["open"])
+        self.assertEqual((segs[-1]["s"], segs[-1]["e"]), (20.0, 25.0))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -36,6 +36,7 @@ SHOW_S = 6 * 3600.0    # boots are listed while their newest log is younger
 WINDOW_S = 60.0        # headline window for the rates
 BUCKET_S = 5.0
 HISTORY_S = 15 * 60.0
+PHASE_GAP_S = 5.0      # no line of a class for longer than this -> that phase paused
 
 # Launcher summary lines worth showing as the boot's "start form" (read-only
 # view of what the weg2 launcher actually emitted; the full list is ~250 lines).
@@ -154,6 +155,142 @@ def _rate(tok, ms):
     return (tok / (ms / 1000.0)) if (tok and ms and ms > 0) else None
 
 
+def _flip_intervals(begins, dones, open_begin, t1):
+    """Pair ``WEG2-FLIP begin`` with its ``done`` (the done carries the NEW
+    epoch = begin epoch + 1, and slept/woke = sleep/wake).  Without a begin
+    in memory the start is done - flip_total.  An open flip runs to ``t1``."""
+    out = []
+    bs = sorted(begins, key=lambda e: e["t"])
+    for d in dones:
+        b = None
+        for e in bs:
+            if e["t"] <= d["t"] and e.get("sleep") == d.get("slept") and (
+                    e.get("epoch") == (d.get("epoch") or 0) - 1 or d["t"] - e["t"] < 600):
+                b = e
+        start = b["t"] if b else (d["t"] - (d.get("total_ms") or 0) / 1000.0)
+        out.append({"b": start, "d": d["t"], "slept": d.get("slept"), "woke": d.get("woke"),
+                    "total_ms": d.get("total_ms"), "drain_ms": d.get("drain_ms"), "open": False})
+    if open_begin is not None and open_begin["t"] <= t1:
+        out.append({"b": open_begin["t"], "d": t1, "slept": open_begin.get("sleep"),
+                    "woke": open_begin.get("wake"), "total_ms": None, "drain_ms": None, "open": True})
+    out.sort(key=lambda f: f["b"])
+    return out
+
+
+def _run_stats(cls, evs):
+    """Mean rate of one phase run.  Prefill: compute-honest, per rank
+    sum(#new-token) / sum(compute-ms), the SLOWEST rank (as in the tiles).
+    Decode: mean 'gen throughput' of the run's 'Decode batch' lines."""
+    if cls == "dec":
+        g = [e["gen_tps"] for e in evs if e.get("gen_tps") is not None]
+        run = [e["running"] for e in evs if e.get("running") is not None]
+        rounds = sum(1 for e in evs if e.get("kind") == "decode_rank")
+        return {"tps": (sum(g) / len(g)) if g else None, "n": len(g), "rounds": rounds,
+                "bs": (sum(run) / len(run)) if run else None}
+    per = {}
+    for e in evs:
+        if e.get("compute_ms") is None:
+            continue
+        a = per.setdefault("%s%s" % (e.get("rk", ""), e.get("rank", 0)), [0, 0.0, 0])
+        a[0] += e.get("new_tok") or 0
+        a[1] += e["compute_ms"]
+        a[2] += 1
+    rated = [_rate(a[0], a[1]) for a in per.values()]
+    rated = [r for r in rated if r]
+    r0 = per.get("PP0") or per.get("TP0") or (next(iter(per.values())) if per else None)
+    return {"tps": min(rated) if rated else None, "tok": r0[0] if r0 else 0,
+            "n": r0[2] if r0 else len(evs)}
+
+
+def phase_timeline(acts, flips, t0, t1, first_t=None, awake_hint=None, gap_s=PHASE_GAP_S):
+    """Segments of the phase bar over [t0, t1].  Pure, unit-tested.
+
+    ``acts``: dicts {t, s, cls, ev}: ``t`` = the log line's stamp (the END of
+    the work it reports), ``s`` = its start where the line says how long it
+    took (prefill: t - gpu-ms), else ``t``; ``cls`` P / D (prefill of that
+    group) or dec.  ``flips``: from _flip_intervals.
+
+    Rules, nothing guessed beyond them:
+      * a run = consecutive lines of ONE class, no gap > ``gap_s``, no flip
+        in between; it starts at its first line's start, or at the end of the
+        piece before it when that is at most ``gap_s`` earlier (the work
+        between two lines is still that work), else 1 s before its first line;
+      * a flip is grey from ``WEG2-FLIP begin`` to ``done``; while the old
+        group still logs work inside it (drain), that work is shown as work
+        and the grey starts after its last line;
+      * whatever is left is ``idle`` (awake group from the flips: no work);
+      * the run still going (last line within ``gap_s`` of t1) reaches t1.
+    """
+    acts = sorted(acts, key=lambda a: a["t"])
+    greys = []
+    for f in flips:
+        if f["d"] < t0 - 600 or f["b"] > t1:
+            continue
+        inside = [a["t"] for a in acts if f["b"] <= a["t"] <= f["d"]]
+        gs = max([f["b"]] + inside)
+        greys.append(dict(f, s=min(gs, f["d"]), e=f["d"]))
+
+    def flip_between(a, b):
+        return any(g["s"] < b and g["e"] > a for g in greys)
+
+    runs = []
+    for a in acts:
+        r = runs[-1] if runs else None
+        if r and r["cls"] == a["cls"] and a["t"] - r["e"] <= gap_s and not flip_between(r["e"], a["t"]):
+            r["e"] = a["t"]
+            r["s"] = min(r["s"], a["s"])
+            r["evs"].append(a["ev"])
+        else:
+            runs.append({"cls": a["cls"], "s": min(a["s"], a["t"] - 1.0) if a["s"] >= a["t"] else a["s"],
+                         "e": a["t"], "evs": [a["ev"]], "t_first": a["t"]})
+    # starts: fill a short gap from the piece before, never overlap it
+    pieces = sorted([("run", r) for r in runs] + [("flip", g) for g in greys], key=lambda p: p[1]["e"])
+    prev_end = None
+    for kind, p in pieces:
+        if kind == "run" and prev_end is not None:
+            if p["t_first"] - prev_end <= gap_s or p["s"] < prev_end:
+                p["s"] = prev_end
+        if kind == "flip" and prev_end is not None and p["s"] < prev_end:
+            p["s"] = prev_end
+        p["s"] = min(p["s"], p["e"])
+        prev_end = p["e"] if prev_end is None else max(prev_end, p["e"])
+    if runs and not any(g["e"] > runs[-1]["e"] for g in greys) and t1 - runs[-1]["e"] <= gap_s:
+        runs[-1]["e"] = t1
+        runs[-1]["running"] = True
+
+    def awake_at(t):
+        before = [g for g in greys if g["e"] <= t and not g["open"]]
+        if before:
+            return before[-1]["woke"]
+        after = [g for g in greys if g["s"] >= t]
+        return after[0]["slept"] if after else awake_hint
+
+    segs = []
+    for r in runs:
+        st = _run_stats(r["cls"], r["evs"])
+        segs.append(dict(st, k=r["cls"], s=r["s"], e=r["e"], running=bool(r.get("running"))))
+    for g in greys:
+        segs.append({"k": "flip", "s": g["s"], "e": g["e"], "slept": g["slept"], "woke": g["woke"],
+                     "total_ms": g["total_ms"], "drain_ms": g["drain_ms"], "open": g["open"]})
+    segs.sort(key=lambda x: x["s"])
+    lo = max(t0, first_t) if first_t else t0
+    out, cur = [], lo
+    for x in segs:
+        if x["e"] <= lo or x["s"] >= t1:
+            continue
+        if x["s"] - cur > 0.5:
+            out.append({"k": "idle", "s": cur, "e": x["s"], "awake": awake_at((cur + x["s"]) / 2)})
+        x = dict(x, s=max(x["s"], lo, cur), e=min(x["e"], t1))
+        if x["e"] > x["s"]:
+            out.append(x)
+        cur = max(cur, x["e"])
+    if t1 - cur > 0.5 and (first_t is None or first_t < t1):
+        out.append({"k": "idle", "s": cur, "e": t1, "awake": awake_at((cur + t1) / 2)})
+    for x in out:
+        x["s"], x["e"] = round(x["s"], 2), round(x["e"], 2)
+    return out
+
+
 class Boot:
     """Everything one boot's logs have said, bounded in memory."""
 
@@ -167,7 +304,7 @@ class Boot:
             ("D_prefill_rank", 6000), ("D_prefill_batch", 3000),
             ("P_decode_batch", 2000), ("D_decode_batch", 4000),
             ("P_decode_rank", 2000), ("D_decode_rank", 20000),
-            ("flips", 400), ("errors", 200), ("stops", 60),
+            ("flips", 400), ("flip_begins", 400), ("errors", 200), ("stops", 60),
             ("single_prefill_rank", 6000), ("single_prefill_batch", 3000),
             ("single_decode_batch", 4000), ("single_decode_rank", 20000),
         )}
@@ -325,6 +462,7 @@ class Boot:
             return
         if k == "flip_begin":
             self.flip_open = ev
+            self.ev["flip_begins"].append(ev)
             return
         if k == "flip_done":
             self.flip_open = None
@@ -490,6 +628,39 @@ class Boot:
         out["filled"] = True
         return out
 
+    def timeline(self, now: float, span: float = HISTORY_S) -> dict:
+        """The phase bar feed: P-Prefill / D-Prefill / Decode runs and the
+        flips between them over the last ``span`` seconds (see phase_timeline)."""
+        t0 = now - span
+        lo = t0 - 120.0       # whole runs that began before the window
+        acts = []
+
+        def mid(t):   # P/D log stamps are whole seconds (truncated): the line fell in [t, t+1)
+            return t + 0.5 if t == int(t) else t
+        for g, cls in (("P", "P"), ("single", "P"), ("D", "D")):
+            for e in self.ev.get("%s_prefill_rank" % g, ()):
+                if e["t"] >= lo:
+                    t = mid(e["t"])
+                    ms = e.get("gpu_ms") or e.get("compute_ms")
+                    acts.append({"t": t, "s": t - ms / 1000.0 if ms else t, "cls": cls, "ev": e})
+        for g in ("D", "single"):
+            # every round's own line (exact stamp + gpu-ms) times the decode; the
+            # 'Decode batch' lines carry the rate (gen throughput)
+            for e in self.ev.get("%s_decode_rank" % g, ()):
+                if e["t"] >= lo and e.get("rank", 0) == 0:
+                    t = e.get("t_exact") or mid(e["t"])
+                    ms = e.get("gpu_ms")
+                    acts.append({"t": t, "s": t - ms / 1000.0 if ms else t, "cls": "dec", "ev": e})
+            for e in self.ev.get("%s_decode_batch" % g, ()):
+                if e["t"] >= lo:
+                    acts.append({"t": mid(e["t"]), "s": mid(e["t"]), "cls": "dec", "ev": e})
+        flips = _flip_intervals([e for e in self.ev["flip_begins"] if e["t"] >= lo - 600],
+                                [e for e in self.ev["flips"] if e["t"] >= lo],
+                                self.flip_open, now)
+        hint = (self.last.get("awake") or {}).get("awake")
+        return {"t0": t0, "t1": now, "span_s": span, "gap_s": PHASE_GAP_S,
+                "segs": phase_timeline(acts, flips, t0, now, self.first_t, hint)}
+
     def groups_with(self, kind: str) -> List[str]:
         return [g for g in ("P", "D", "single") if self.ev.get("%s_%s" % (g, kind))]
 
@@ -523,6 +694,8 @@ class Boot:
         v["cache"] = self.cache_view(now)
         if with_series:
             v["series"] = self.series(now)
+            # a finished boot's bar ends with its last log line, not with the wall clock
+            v["timeline"] = self.timeline(now if v["live"] or not self.newest_mtime else min(now, self.newest_mtime))
         return v
 
     def bucket_activity(self, t0: float, n: int, bucket_s: float = BUCKET_S) -> List[dict]:

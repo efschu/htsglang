@@ -52,6 +52,7 @@ F_ACCLEN = _f(r"accept len: ([\d.]+)")
 F_ACCRATE = _f(r"accept rate: ([\d.]+)")
 F_BS = _f(r"\bbs: (\d+)")
 F_ROUND = _f(r"#round: (\d+)")
+F_RANK_T = _f(r", t: (\d+\.\d+),")
 F_BUBBLE = _f(r"bubble_ms=([\d.]+)")
 F_CUDAG = _f(r"cuda graph: (\w+)")
 
@@ -166,6 +167,7 @@ def parse_line(line: str) -> Optional[dict]:
         ev["kind"] = "decode_rank"
         ev["bs"] = _num(F_BS, rest, int)
         ev["round"] = _num(F_ROUND, rest, int)
+        ev["t_exact"] = _num(F_RANK_T, rest)     # the round's own epoch stamp (ms), not the whole-second prefix
         ev["gpu_ms"] = _num(F_GPUMS_BARE, rest)
         return ev
     if rest.startswith("Decode batch"):

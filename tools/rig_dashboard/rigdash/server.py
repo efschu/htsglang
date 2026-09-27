@@ -67,6 +67,10 @@ def finish_series(b: dict, gpu_series: Optional[dict], now: float, bucket_s: flo
         for k in keys:
             ser[k] = [None if t + bucket_s > gap_from else v for t, v in zip(ts, ser[k])]
         ser["gap_from"], ser["gap_reason"] = gap_from, reason
+        tl = b.get("timeline")
+        if tl:
+            tl["segs"] = [dict(x, e=min(x["e"], gap_from)) for x in tl["segs"] if x["s"] < gap_from]
+            tl["cut_at"], tl["cut_reason"] = gap_from, reason
     power = [None] * len(ts)
     if gpu_series and gpu_series.get("t"):
         acc = [[0.0, 0] for _ in ts]

@@ -13,7 +13,7 @@
   --text: #0b0b0b; --text-2: #52514e; --muted: #7b7a75;
   --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
   --good: #008300; --warn: #b77a00; --bad: #d03b3a;
-  --bar: #2a78d6; --bar-bg: #e4e3de;
+  --bar: #2a78d6; --bar-bg: #e4e3de; --flip: #8f8e88;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -23,7 +23,7 @@
     --text: #ffffff; --text-2: #c3c2b7; --muted: #8d8c85;
     --s1: #3987e5; --s2: #d95926; --s3: #199e70;
     --good: #3fb950; --warn: #d9a400; --bad: #e66767;
-    --bar: #3987e5; --bar-bg: #2c2c29;
+    --bar: #3987e5; --bar-bg: #2c2c29; --flip: #6e6d67;
   }
 }
 :root[data-theme="dark"] {
@@ -33,7 +33,7 @@
   --text: #ffffff; --text-2: #c3c2b7; --muted: #8d8c85;
   --s1: #3987e5; --s2: #d95926; --s3: #199e70;
   --good: #3fb950; --warn: #d9a400; --bad: #e66767;
-  --bar: #3987e5; --bar-bg: #2c2c29;
+  --bar: #3987e5; --bar-bg: #2c2c29; --flip: #6e6d67;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text);
@@ -82,6 +82,35 @@ h2 .muted, .muted { color: var(--muted); font-weight: 400; }
 .tile .kv div { display: flex; justify-content: space-between; gap: 10px; border-top: 1px dashed var(--line); padding: 3px 0; }
 .tile .kv div span:last-child { color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
 .tile .kv div.wc span:last-child { color: var(--muted); }
+.tile .bigrow { display: flex; align-items: baseline; gap: 8px; }
+.tile .bigrow .bl { flex: none; width: 58px; font-size: 11px; line-height: 1.2; text-transform: uppercase;
+  letter-spacing: .03em; color: var(--text-2); }
+.tile .bigrow + .bigrow .big { margin-top: 0; }
+.tile .bigrow.off .big, .tile .bigrow.off .bl { color: var(--muted); }
+.tile .bigrow.off .big { opacity: .55; }
+.tile .bigrow.on .bl::before { content: "\25CF\00a0"; color: var(--c); }
+.tile .bigrow.on .big { color: var(--c); }
+.tile.active { box-shadow: inset 3px 0 0 var(--c); }
+.phasewrap { margin: -2px 0 14px; }
+.phasewrap .ph-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; font-size: 12px; color: var(--text-2); margin-bottom: 4px; }
+.phasewrap .ph-head .lg { display: inline-flex; align-items: center; gap: 4px; }
+.phasewrap .ph-head .lg i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.phasewrap .ph-head .span { margin-left: auto; display: inline-flex; gap: 2px; }
+.phasewrap .ph-head .span button { font: inherit; font-size: 11px; padding: 1px 7px; border: 1px solid var(--line);
+  background: var(--surface); color: var(--text-2); border-radius: 5px; cursor: pointer; }
+.phasewrap .ph-head .span button.sel { background: var(--surface-2); color: var(--text); font-weight: 650; }
+.phasebar { position: relative; height: 26px; border-radius: 5px; overflow: hidden; background: var(--bar-bg); touch-action: manipulation; }
+.phasebar .seg { position: absolute; top: 0; bottom: 0;
+  display: flex; align-items: center; justify-content: center; overflow: hidden; cursor: default; }
+.phasebar .seg span { font-size: 11px; font-weight: 650; color: #fff; white-space: nowrap; font-variant-numeric: tabular-nums;
+  padding: 0 3px; pointer-events: none; text-shadow: 0 0 2px rgba(0,0,0,.35); }
+.phasebar .seg span.hide { display: none; }
+.phasebar .seg.k-P { background: var(--s1); } .phasebar .seg.k-D { background: var(--s2); }
+.phasebar .seg.k-dec { background: var(--s3); } .phasebar .seg.k-flip { background: var(--flip); }
+.phasebar .seg.k-idle { background: transparent; box-shadow: inset 0 -3px 0 var(--ic, transparent); }
+.phasebar .seg.run { background-image: repeating-linear-gradient(135deg, rgba(255,255,255,.18) 0 6px, transparent 6px 12px); }
+.phasebar .seg.sel { outline: 2px solid var(--text); outline-offset: -2px; }
+.phasebar .cut { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--bad); }
 .sparkbox { position: relative; margin-top: 8px; }
 .sparkbox .ymax { position: absolute; left: 0; top: -2px; font-size: 10px; color: var(--muted); background: var(--surface); padding-right: 4px; }
 .spark { width: 100%; height: 60px; display: block; }
@@ -276,6 +305,116 @@ function kv(rows) {
   return `<div class="kv">${rows.filter(Boolean).map(([k, v, cls]) => `<div class="${cls || ""}"><span>${k}</span><span>${v}</span></div>`).join("")}</div>`;
 }
 
+// the 60-s figure and, in the same size under it, the 1-s live rate; 0 is normal
+// (only one phase runs at a time): the running one is coloured, the others dimmed
+function bigPair(lbl60, v60, one, digits) {
+  const on = one > 0;
+  return `<div class="bigrow"><span class="bl">${lbl60}</span><span class="big num">${fmt(v60, digits)}<small>tok/s</small></span></div>
+    <div class="bigrow ${on ? "on" : "off"}" title="letzte 1 s: Zeilen mit Stempel in der vorigen oder laufenden Sekunde; 0 = die Phase rechnet gerade nicht"><span class="bl">jetzt 1 s</span><span class="big num">${fmt(one, digits)}<small>tok/s</small></span></div>`;
+}
+
+// ---- phase bar: P-Prefill / D-Prefill / Decode runs and the flips between them
+const PHASE = {P: ["P-Prefill", "var(--s1)"], D: ["D-Prefill", "var(--s2)"], dec: ["Decode", "var(--s3)"], flip: ["Flip", "var(--flip)"]};
+const phaseData = {};
+let phaseSpan = 0;
+try { phaseSpan = +localStorage.getItem("rigdash.phaseSpan") || 0; } catch (e) { phaseSpan = 0; }
+const phaseSpanS = () => phaseSpan || (window.innerWidth < 760 ? 300 : 900);
+function setPhaseSpan(v) {
+  phaseSpan = v;
+  try { localStorage.setItem("rigdash.phaseSpan", String(v)); } catch (e) { /* private window */ }
+  refresh();
+}
+const dur = (s) => s < 90 ? fmt(s, s < 10 ? 1 : 0) + " s" : fmt(s / 60, 1) + " min";
+function phaseName(k, single) { return single && k === "P" ? "Prefill" : (PHASE[k] || [k])[0]; }
+function phaseTip(x, single) {
+  const when = `${hhmm(x.s)}&ndash;${x.running || x.open ? "jetzt" : hhmm(x.e)} &middot; ${dur(x.e - x.s)}`;
+  if (x.k === "flip") return `<b>Flip ${esc(x.slept)}&rarr;${esc(x.woke)}</b>${x.open ? " &middot; l&auml;uft" : ` &middot; flip_total ${fmt(x.total_ms)} ms${x.drain_ms != null ? " (drain+quiesce " + fmt(x.drain_ms) + " ms)" : ""}`}<br>${when} <span class="muted">grau ab der letzten Arbeitszeile der alten Gruppe bis WEG2-FLIP done</span>`;
+  if (x.k === "idle") return `<b>${x.awake ? esc(x.awake) + " wach" : "ruht"} &middot; keine Arbeit</b><br>${when} <span class="muted">keine Prefill-/Decode-Zeile</span>`;
+  const nm = phaseName(x.k, single);
+  if (x.k === "dec") return `<b>${nm}</b> &middot; &Oslash; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s <span class="muted">(gen throughput, ${fmt(x.n)} Zeilen)</span>` : `&mdash; <span class="muted">(keine &bdquo;Decode batch&ldquo;-Zeile in dieser Phase)</span>`}${x.bs != null ? " &middot; bs &Oslash; " + fmt(x.bs, 1) : ""}<br>${when}${x.rounds ? " &middot; " + fmt(x.rounds) + " Runden" : ""}${x.running ? " &middot; l&auml;uft" : ""}`;
+  return `<b>${nm}</b> &middot; &Oslash; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(Rechenrate, langsamster Rang)</span>` : "&mdash;"}<br>${when} &middot; ${fmt(x.tok)} Tok &middot; ${fmt(x.n)} Chunks${x.running ? " &middot; l&auml;uft" : ""}`;
+}
+function phaseHtml(b) {
+  const tl = b.timeline;
+  if (!tl || !tl.segs) return "";
+  const single = !(b.prefill || {}).D && !!(b.prefill || {}).single;
+  const span = Math.min(phaseSpanS(), tl.span_s), t1 = tl.t1, t0 = t1 - span;
+  const segs = tl.segs.filter((x) => x.e > t0).map((x) => Object.assign({}, x, {s: Math.max(x.s, t0)}));
+  const id = "pb-" + b.stem;
+  phaseData[id] = {segs, single};
+  const pos = (t) => (100 * (t - t0) / span).toFixed(3);
+  const bars = segs.map((x, i) => {
+    let full = "", short = "";
+    if (x.k === "flip") { full = short = x.open ? "Flip" : fmt((x.total_ms || 0) / 1000, 1) + " s"; }
+    else if (x.k !== "idle" && x.tps != null) { const d = x.k === "dec" ? 1 : 0; short = fmt(x.tps, d); full = short + " tok/s"; }
+    const ic = x.k === "idle" && x.awake ? `--ic:${x.awake === "P" ? "var(--s1)" : "var(--s2)"};` : "";
+    return `<div class="seg k-${x.k}${x.running ? " run" : ""}" data-i="${i}" style="${ic}left:${pos(x.s)}%;width:${(100 * (x.e - x.s) / span).toFixed(3)}%"><span data-full="${esc(full)}" data-short="${esc(short)}"></span></div>`;
+  }).join("");
+  const cut = tl.cut_at && tl.cut_at > t0 ? `<div class="cut" style="left:${pos(tl.cut_at)}%" title="${esc(tl.cut_reason || "")}"></div>` : "";
+  const end = b.live ? "jetzt" : "Log-Ende " + hhmm(t1);
+  const ticks = span >= 900 ? ["&minus;15 min", "&minus;10", "&minus;5", end] : ["&minus;5 min", "&minus;2:30", end];
+  const lg = (k) => `<span class="lg"><i style="background:${PHASE[k][1]}"></i>${phaseName(k, single)}</span>`;
+  return `<div class="phasewrap">
+    <div class="ph-head"><b style="color:var(--text)">Phasen</b> ${lg("P")}${single ? "" : lg("D")}${lg("dec")}${single ? "" : lg("flip")}
+      <span class="lg"><i style="background:var(--bar-bg);box-shadow:inset 0 -3px 0 var(--muted)"></i>wach, keine Arbeit</span>
+      <span class="span">${[300, 900].map((v) => `<button type="button" class="${span === v ? "sel" : ""}" onclick="setPhaseSpan(${v})">${v / 60} min</button>`).join("")}</span></div>
+    <div class="phasebar" id="${esc(id)}" role="img" aria-label="Phasenverlauf der letzten ${span / 60} Minuten">${bars}${cut}</div>
+    <div class="xaxis">${ticks.map((t) => `<span>${t}</span>`).join("")}</div>
+  </div>`;
+}
+// label = mean tok/s of the phase, inside the segment only where it fits (measured), else on hover / tap
+function fitPhaseLabels() {
+  document.querySelectorAll(".phasebar .seg span").forEach((sp) => {
+    const w = sp.parentElement.getBoundingClientRect().width;
+    sp.classList.remove("hide");
+    for (const t of [sp.dataset.full, sp.dataset.short]) {
+      if (!t) break;
+      sp.textContent = t;
+      if (sp.getBoundingClientRect().width + 4 <= w) return;
+    }
+    sp.textContent = "";
+    sp.classList.add("hide");
+  });
+}
+function showTip(html, x, y) {
+  tip.innerHTML = html;
+  tip.style.whiteSpace = "normal";
+  tip.style.maxWidth = Math.min(460, window.innerWidth - 16) + "px";
+  tip.style.display = "block";
+  const r = tip.getBoundingClientRect();
+  tip.style.left = Math.max(8, Math.min(x + 12, window.innerWidth - r.width - 8)) + "px";
+  tip.style.top = (y - r.height - 12 < 8 ? y + 18 : y - r.height - 12) + "px";
+}
+let tapTimer = null, tapPinned = false;   // a tapped tip stays (touch sends a mouseleave right after the tap)
+function bindPhaseBars() {
+  document.querySelectorAll(".phasebar").forEach((bar) => {
+    const data = phaseData[bar.id];
+    if (!data) return;
+    const segAt = (e) => { const el = e.target.closest(".seg"); return el ? [el, data.segs[+el.dataset.i]] : [null, null]; };
+    bar.addEventListener("mousemove", (e) => {
+      const [, x] = segAt(e);
+      if (!x) { tip.style.display = "none"; return; }
+      showTip(phaseTip(x, data.single), e.clientX, e.clientY);
+    });
+    bar.addEventListener("mouseleave", () => { if (!tapPinned) { tip.style.display = "none"; tip.style.whiteSpace = ""; } });
+    bar.addEventListener("click", (e) => {        // a tap on the phone
+      const [el, x] = segAt(e);
+      if (!x) return;
+      e.stopPropagation();
+      document.querySelectorAll(".phasebar .seg.sel").forEach((s) => s.classList.remove("sel"));
+      el.classList.add("sel");
+      showTip(phaseTip(x, data.single), e.clientX, e.clientY);
+      tapPinned = true;
+      clearTimeout(tapTimer);
+      tapTimer = setTimeout(() => { tapPinned = false; tip.style.display = "none"; el.classList.remove("sel"); }, 5000);
+    });
+  });
+  fitPhaseLabels();
+}
+document.addEventListener("click", (e) => { if (!e.target.closest(".phasebar")) { tapPinned = false; tip.style.display = "none"; document.querySelectorAll(".phasebar .seg.sel").forEach((s) => s.classList.remove("sel")); } });
+let fitTimer = null;
+window.addEventListener("resize", () => { clearTimeout(fitTimer); fitTimer = setTimeout(fitPhaseLabels, 100); });
+
 function prefillTile(b, g, color, label, binders, now) {
   const p = (b.prefill || {})[g];
   if (!p) return `<div class="tile"><div class="label"><i style="background:${color}"></i>${label}</div><div class="big">—</div><div class="state">keine Prefill-Zeilen in diesem Log</div></div>`;
@@ -286,10 +425,10 @@ function prefillTile(b, g, color, label, binders, now) {
   const state = active ? `aktiv &middot; letzte ${Math.round(p.window_s)} s`
     : (p.last_t ? `ruht &middot; letzter Chunk vor ${ago(now - p.last_t)}, Zahl = letzter Schub` : "noch kein Chunk");
   const charts = rateCharts(b, g + "_prefill_tps", color, 0, now, binders);
-  return `<div class="tile"><div class="label"><i style="background:${color}"></i>${label}</div>
-    <div class="big num">${fmt(src && src.tps)}<small>tok/s</small></div>
+  const one = p.one_s || 0;
+  return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>${label}</div>
+    ${bigPair(active ? "&Oslash; 60 s" : "letzter Schub", src && src.tps, one, 0)}
     <div class="state">${state}</div>
-    <div class="state">letzte 1 s: <b class="num">${fmt(p.one_s)}</b> tok/s <span class="muted">&middot; kurzes Fenster, 0 wenn in der Sekunde keine Zeile fiel</span></div>
     ${kv([
       ["Rechenrate je Rang (gpu-ms)", ranks],
       [active ? "Tokens / Chunks im Fenster" : "Tokens / Chunks im letzten Schub", src ? `${fmt(src.tokens)} / ${fmt(src.chunks)}` : "—"],
@@ -311,10 +450,10 @@ function decodeTile(b, g, color, binders, now) {
     : (d.last_t ? `ruht &middot; letzte Zeile vor ${ago(now - d.last_t)}, Zahl = letzter Wert` : "noch keine Decode-Zeile");
   const charts = rateCharts(b, g + "_decode_tps", color, 1, now, binders);
   const per = (v != null && d.running) ? v / d.running : null;
-  return `<div class="tile"><div class="label"><i style="background:${color}"></i>Decode${g !== "D" ? " (" + g + ")" : ""}</div>
-    <div class="big num">${fmt(v, 1)}<small>tok/s</small></div>
+  const one = d.one_s || 0;
+  return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>Decode${g !== "D" ? " (" + g + ")" : ""}</div>
+    ${bigPair(active ? "&Oslash; 60 s" : "letzter Wert", v, one, 1)}
     <div class="state">${state}</div>
-    <div class="state">letzte 1 s: <b class="num">${fmt(d.one_s, 1)}</b> tok/s <span class="muted">&middot; kurzes Fenster, 0 wenn in der Sekunde keine Zeile fiel</span></div>
     ${kv([
       ["laufende Anfragen (bs) &middot; je Anfrage", `${fmt(d.running)} &middot; ${fmt(per, 1)} tok/s`],
       ["accept len &middot; accept rate", `${fmt(d.accept_len, 2)} &middot; ${fmt(d.accept_rate, 2)}`],
@@ -428,6 +567,7 @@ function bootCard(b, now, binders) {
     <div class="muted" style="font-size:12px;margin:-6px 0 10px">
       <span class="mono">${esc(m.tag || b.stem)}</span>${m.sha ? " &middot; Baum " + esc(m.sha) : ""}${topo ? " &middot; " + esc(topo) : ""}${m.form ? " &middot; " + esc(m.form) : ""}
     </div>
+    ${phaseHtml(b)}
     <div class="tiles">
       ${prefillTile(b, "P", "var(--s1)", "P-Prefill", binders, now)}
       ${prefillTile(b, "D", "var(--s2)", "D-Prefill", binders, now)}
@@ -547,6 +687,7 @@ async function refresh() {
     document.title = bad.length ? `[${bad.map((b) => b.alarm.state === "TOT" ? "TOT" : "H\u00c4NGT").join(",")}] Rig-Dashboard` : "Rig-Dashboard";
     $("sub").textContent = `${live.length} Modell${live.length === 1 ? "" : "e"} live · Stand ${hhmm(now)} · rigdash ${d.version}`;
     binders.forEach((f) => f());
+    bindPhaseBars();
     openDetails.forEach((id) => { const el = id && document.getElementById(id); if (el) el.open = true; });
   } catch (e) {
     failures++;
