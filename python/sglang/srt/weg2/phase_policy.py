@@ -41,6 +41,7 @@ waiting.
 from __future__ import annotations
 
 import json
+import os
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 # H91c3-3: imported with this module (the front imports it before its loop),
@@ -241,6 +242,39 @@ def immediate_park_dwell_ok(awake_s: float, min_dwell_ms: float, floor_ms: float
     much decode per D phase, so a stream of long arrivals cannot starve them
     to zero progress. Both are inputs: the front owns the clock and K7."""
     return float(awake_s) * 1000.0 >= max(float(min_dwell_ms), float(floor_ms))
+
+
+#: PARK-CYCLE DWELL (27B rc12k27 b23, 27.09.): switch, default on; 0 = K7's
+#: one-flip dwell for every D phase, byte for byte.
+PARK_CYCLE_DWELL_ENV = "SGLANG_WEG2_PARK_CYCLE_DWELL"
+
+
+def park_cycle_dwell_on(env=None) -> bool:
+    e = os.environ if env is None else env
+    raw = (e.get(PARK_CYCLE_DWELL_ENV, "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def park_cycle_dwell_ms(d_to_p_ms: float, p_to_d_ms: float, resumed_phase: bool,
+                        on: bool = True) -> float:
+    """The dwell an immediate park waits for in a D phase.
+
+    K7 prices a D phase at ONE flip (the D->P flip the park starts). A D phase
+    that began by RESUMING parked requests paid the whole park cycle for them
+    already -- the D->P flip, P's work, the P->D flip back -- and re-parking
+    them after one flip's worth of decode is the measured thrash (b23 10:02:38-
+    10:04:24: 6 parks, D awake 3.0/3.2/10.2/2.6/18.7/20.5 s, the same six rids
+    parked up to 5 times in 80 s, D decoding 55 % of the wall). Such a phase is
+    priced at the cycle's two flips (D->P + P->D, both measured, K7's own
+    source), so every park round trip buys at least as much decode as it costs
+    in flips; an over-X arrival inside that window rides on the one park that
+    follows it (the queue drains on P as a batch). Every other D phase -- a
+    fresh wake, a phase that parked nothing -- keeps K7 unchanged, and so does
+    the switch off. Pure: the front owns the clock and the flip log."""
+    d_to_p = max(0.0, float(d_to_p_ms))
+    if not on or not resumed_phase:
+        return d_to_p
+    return d_to_p + max(0.0, float(p_to_d_ms))
 
 
 def park_verdict(status: int, text: str) -> Tuple[str, List[str], str]:

@@ -3376,6 +3376,9 @@ class Front:
         self._park_unsupported = False
         #: rule 3: ONE park attempt per D phase (the epoch that made it).
         self._park_attempt_epoch = -1
+        #: PARK-CYCLE DWELL: the D phase (epoch) that began by resuming parked
+        #: requests -- its immediate park waits for both flips' price.
+        self._park_resume_epoch = -1
         #: H91c3-3: the D phase's seat count n (H95) this front sent at the
         #: last P->D wake; None before the first one (no seat cap known).
         self._d_phase_n: Optional[int] = None
@@ -3503,6 +3506,13 @@ class Front:
         if p is None:
             return None
         need_ms, prov = self._derived_min_dwell_ms("D", "P")
+        # PARK-CYCLE DWELL: a D phase that began by resuming parked requests is
+        # priced at the whole park cycle (both flips), not at one flip.
+        resumed = getattr(self, "_park_resume_epoch", -1) == self.epoch
+        if resumed and phase_policy.park_cycle_dwell_on():
+            back_ms, back_prov = self._derived_min_dwell_ms("P", "D")
+            need_ms = phase_policy.park_cycle_dwell_ms(need_ms, back_ms, True)
+            prov = f"{prov}+cycle:{back_prov}={int(back_ms)}ms"
         awake_s = now - self.t_awake
         if not phase_policy.immediate_park_dwell_ok(awake_s, need_ms, FAIRNESS_DWELL_FLOOR_MS):
             if self._park_immediate_dwell_epoch != self.epoch:
@@ -7633,6 +7643,7 @@ class Front:
                         "requests before the new ones)", self.epoch, len(_h91_parked),
                         sorted(_h91_parked)[:8])
             self.counters["d_parked_resumed"] += len(_h91_parked)
+            self._park_resume_epoch = self.epoch
             _h91_parked.clear()
         # 27B flipfast F3: after a D->P flip the controller that awaits it starts
         # P's drain at once instead of one tick later (no-op with the switch off).
