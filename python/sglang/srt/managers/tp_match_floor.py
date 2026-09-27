@@ -82,6 +82,7 @@ drive the real verdict with mock collectives instead of grepping for it.
 from __future__ import annotations
 
 import logging
+import types
 from array import array
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -205,8 +206,38 @@ def local_usable_matches(
         ):
             _STATS["unusable_votes"] += 1
             n = 0
+        if n > 0 and req is not None and proof_cut(
+            tree_cache, req, types.SimpleNamespace(best_match_node=getattr(req, "best_match_node", None)), n
+        ) is not None:
+            # #1424d, symmetric form: no re-probe on the head walk -- a match
+            # with an unproven host page votes 0 (re-prefill, or via P above X)
+            _STATS["proof_cut_votes"] = _STATS.get("proof_cut_votes", 0) + 1
+            n = 0
         out[rid] = n
     return out
+
+
+def proof_cut(tree_cache: Any, req: Any, result: Any, n: int) -> Optional[int]:
+    """#1424d (rc12n2 D-TP0 13:36:10): the depth of the last PROVEN page of
+    the host chain this match ends on, when it lies below ``n``; None when the
+    whole match is proven (or the tree has no paged arena to prove against).
+    Side-effect free (``UnifiedRadixCache.weg2_chain_proof_depth``). A vote
+    cut here enters the usable-match MIN, so the group takes every rank to
+    that page: the rest is re-prefilled on D when it fits X and re-routed via
+    P when it does not (the X gate prices the group's cut) -- never loaded
+    unproven, never one rank dying at the load."""
+    fn = getattr(tree_cache, "weg2_chain_proof_depth", None)
+    if not callable(fn) or n <= 0:
+        return None
+    try:
+        cut = fn(getattr(result, "best_match_node", None), req)
+    except Exception:  # noqa: BLE001 - a vote may never break the reduce
+        _STATS["proof_failed"] = _STATS.get("proof_failed", 0) + 1
+        return 0
+    if cut is None or int(cut) >= int(n):
+        return None
+    _STATS["proof_cuts"] = _STATS.get("proof_cuts", 0) + 1
+    return max(0, int(cut))
 
 
 def build_usable_match_payload(
@@ -387,6 +418,16 @@ def apply_realize_verdict(
 def plant(tree_cache: Any, group_usable: Optional[Dict[str, int]]) -> None:
     if tree_cache is not None:
         setattr(tree_cache, TREE_ATTR, group_usable)
+
+
+def group_usable_for(tree_cache: Any, rid: str) -> Optional[int]:
+    """The planted group usable match for ``rid`` (None when the group has no
+    opinion on this pass). Replicated: the MIN of the packed reduce."""
+    group = getattr(tree_cache, TREE_ATTR, None) if tree_cache is not None else None
+    if not group:
+        return None
+    g = group.get(str(rid))
+    return None if g is None else int(g)
 
 
 def clear(tree_cache: Any) -> None:
@@ -691,6 +732,23 @@ def admission_probe(tree_cache: Any, req: Any, *, follow: bool) -> int:
                 return _local_match_len(tree_cache.match_prefix(params))
         result = tree_cache.match_prefix(params)
         n = _local_match_len(result)
+        cut = proof_cut(tree_cache, req, result, n)
+        if cut is not None:
+            # #1424d: a host page of this match is not proven against its
+            # tokens -- vote what this host can admit AT the last proven
+            # page (its own match on the key cut there, anchor rule
+            # included), so the group MIN takes every rank there.
+            params = MatchPrefixParams(
+                key=RadixKey(
+                    token_ids=array("q", token_ids),
+                    extra_key=getattr(req, "extra_key", None),
+                    limit=min(limit, int(cut)),
+                ),
+                cow_mamba=False,
+                req=None,
+            )
+            result = tree_cache.match_prefix(params)
+            n = min(_local_match_len(result), int(cut))
         if n > 0 and anchor_unusable(tree_cache, getattr(result, "best_match_node", None)):
             _STATS["unusable_votes"] += 1
             return 0

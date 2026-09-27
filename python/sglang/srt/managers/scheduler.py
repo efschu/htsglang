@@ -12070,6 +12070,26 @@ class Scheduler(
                     int(gsm) - gm, total, max(0, total - gm),
                     max(0, total - priced_match), n,
                 )
+        # #1424d: the group's USABLE match (the RU/H98 floor, planted for
+        # this plan call from the same packed reduce) is the depth every rank
+        # actually admits -- a proof cut or a zeroed anchor lies below the
+        # head term. The extent D would prefill is priced from the floor, so
+        # a cut whose rest exceeds X is refused by name (W50 -> X-REQUEUE /
+        # RESUME-VIA-P over P) instead of being prefilled on D over X.
+        floor = tp_match_floor.group_usable_for(
+            self.tree_cache, str(getattr(req, "rid", "") or "")
+        )
+        if floor is not None and floor < priced_match:
+            self._weg2_x_floor_priced = getattr(self, "_weg2_x_floor_priced", 0) + 1
+            n = self._weg2_x_floor_priced
+            if n <= 16 or n % 64 == 0:
+                logger.info(
+                    "#1424d X-PRICE-FLOOR rid=%s head=%d floor=%d uncached=%d n=%d (the group "
+                    "admits the usable floor, so the extent is priced from it)",
+                    str(getattr(req, "rid", "?"))[:16], priced_match, floor,
+                    max(0, total - floor), n,
+                )
+            priced_match = floor
         return max(0, total - priced_match)
 
     def _weg2_host_carry_tokens(self) -> int:
