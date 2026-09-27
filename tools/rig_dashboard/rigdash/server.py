@@ -181,7 +181,14 @@ def make_handler(app: App):
         def _json(self, obj, code=200):
             self._send(code, redact.guard(json.dumps(obj, default=str)), "application/json")
 
+        def _via_proxy(self) -> bool:
+            # the public reverse proxy (LXC 208 nginx, https://efeu.ddnss.de/rigdash/) sets these
+            return bool(self.headers.get("X-Forwarded-Prefix") or self.headers.get("X-Forwarded-For"))
+
         def _weg2(self, path):
+            if self._via_proxy():
+                # the dry run executes a check script on the Proxmox host: LAN only
+                return self._json({"ok": False, "error": "Startzeile und Trockenlauf nur im LAN (http://192.168.0.88:8890/weg2)"}, 403)
             from urllib.parse import parse_qs, urlsplit
 
             q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
@@ -205,7 +212,11 @@ def make_handler(app: App):
                         return self._send(200, fh.read(), "text/html; charset=utf-8")
                 if path == "/api/live":
                     series = "noseries" not in self.path
-                    return self._json(app.snapshot(series))
+                    snap = app.snapshot(series)
+                    snap["via_proxy"] = self._via_proxy()
+                    return self._json(snap)
+                if path in ("/weg2", "/weg2.html") and self._via_proxy():
+                    return self._send(403, "Startzeile nur im LAN: http://192.168.0.88:8890/weg2", "text/plain; charset=utf-8")
                 if path in ("/weg2", "/weg2.html"):
                     with open(os.path.join(STATIC, "weg2.html"), "rb") as fh:
                         return self._send(200, fh.read(), "text/html; charset=utf-8")

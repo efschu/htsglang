@@ -73,7 +73,7 @@ function fill(sel, items, val) {
   if (val != null) sel.value = val;
 }
 async function load() {
-  const r = await fetch("/api/weg2/options"); const d = await r.json();
+  const r = await fetch("api/weg2/options"); const d = await r.json();
   if (!d.ok) { $("cmd").textContent = d.error; return; }
   opts = d; $("ha").textContent = d.host_acceptance;
   fill($("profile"), d.profiles.map((p) => [p.name, `${p.name} (Linie ${p.line}, Status ${p.status || "?"})`]), params.get("profile"));
@@ -85,7 +85,7 @@ async function load() {
 }
 async function line() {
   $("dryres").innerHTML = "";
-  const r = await fetch("/api/weg2/line?" + qs()); const d = await r.json();
+  const r = await fetch("api/weg2/line?" + qs()); const d = await r.json();
   if (!d.ok) { $("cmd").textContent = "—"; $("notes").innerHTML = `<li class="err">${esc(d.error)}</li>`; return; }
   $("cmd").textContent = d.command;
   $("notes").innerHTML = d.notes.map((n) => `<li>${esc(n)}</li>`).join("");
@@ -98,7 +98,7 @@ $("copy").onclick = async () => { try { await navigator.clipboard.writeText($("c
 $("dry").onclick = async () => {
   $("dry").disabled = true; $("dryres").innerHTML = `<div class="muted">Trockenlauf läuft auf dem Host&hellip;</div>`;
   try {
-    const r = await fetch("/api/weg2/dry?" + qs()); const d = await r.json();
+    const r = await fetch("api/weg2/dry?" + qs()); const d = await r.json();
     if (!d.ok) { $("dryres").innerHTML = `<div class="err">${esc(d.error)}</div>`; return; }
     const lines = (d.output || "").split("\n").filter((l) => /^DRY/.test(l));
     $("dryres").innerHTML = `<div class="verdict ${d.green ? "green" : "red"}">${d.green ? "GRÜN" : "ROT"} &middot; rc ${d.rc} &middot; ${d.duration_s} s &middot; ${new Date(d.t * 1000).toLocaleTimeString("de-DE")}</div><pre>${esc(lines.join("\n"))}</pre>`;

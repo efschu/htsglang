@@ -128,10 +128,11 @@ details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
   <h1>Rig-Dashboard</h1>
   <span class="sub" id="sub">verbinde&hellip;</span>
   <nav>
-    <a id="gpuqlink" href="/" target="_blank" rel="noopener">GPU-Fensterplan</a>
-    <a href="/weg2" target="_blank" rel="noopener">Startzeile</a>
-    <a id="plannerlink" href="/" target="_blank" rel="noopener">Planer (Tafeln, Wizard)</a>
-    <a href="/api/live" target="_blank" rel="noopener">JSON</a>
+    <a id="gpuqlink" class="lan" href="#" target="_blank" rel="noopener">GPU-Fensterplan</a>
+    <a id="weg2link" class="lan" href="weg2" target="_blank" rel="noopener">Startzeile</a>
+    <a id="plannerlink" class="lan" href="#" target="_blank" rel="noopener">Planer (Tafeln, Wizard)</a>
+    <span id="lannote" class="muted" style="display:none">Planer, GPU-Fensterplan, Startzeile: nur im LAN</span>
+    <a href="api/live" target="_blank" rel="noopener">JSON</a>
   </nav>
 </header>
 <main>
@@ -477,7 +478,7 @@ function chipsHtml(d) {
 let failures = 0;
 async function refresh() {
   try {
-    const r = await fetch("/api/live", {cache: "no-store"});
+    const r = await fetch("api/live", {cache: "no-store"});   // relative: works behind the /rigdash/ prefix
     const d = await r.json();
     failures = 0;
     const now = d.t;
@@ -494,6 +495,9 @@ async function refresh() {
     $("gpuq").innerHTML = gpuqHtml(d);
     $("history").innerHTML = historyHtml(d.boots.filter((b) => !shown.includes(b)), now);
     $("chips").innerHTML = chipsHtml(d);
+    // behind the public proxy the LAN-only services are not reachable: hide their links, say so once
+    document.querySelectorAll("a.lan").forEach((a) => { a.style.display = d.via_proxy ? "none" : ""; });
+    $("lannote").style.display = d.via_proxy ? "" : "none";
     const bad = live.filter((b) => b.alarm && (b.alarm.state === "TOT" || b.alarm.state === "HAENGT"));
     document.title = bad.length ? `[${bad.map((b) => b.alarm.state === "TOT" ? "TOT" : "H\u00c4NGT").join(",")}] Rig-Dashboard` : "Rig-Dashboard";
     $("sub").textContent = `${live.length} Modell${live.length === 1 ? "" : "e"} live · Stand ${hhmm(now)} · rigdash ${d.version}`;
