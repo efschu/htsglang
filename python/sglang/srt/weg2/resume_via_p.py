@@ -103,6 +103,12 @@ def eligible(req, env=None) -> bool:
         return False
     if not bool(getattr(req, "stream", False)):
         return False
+    if getattr(req, "multimodal_inputs", None) is not None:
+        # VISION-D x ROS: the P-only leg 1 carries input_ids alone -- P would
+        # prefill an image's placeholder ids as text and D would continue on a
+        # wrong prefix. An image request keeps the named W50 (X-REQUEUE sends
+        # the original request, image included, before the first byte).
+        return False
     if not open_stream_enabled(e):
         try:
             if len(getattr(req, "output_ids", None) or ()) <= 0:

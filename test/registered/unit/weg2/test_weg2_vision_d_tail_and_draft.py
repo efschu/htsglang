@@ -151,3 +151,25 @@ def test_qwen3_5_mtp_has_no_mm_embeds_assert_left():
         if isinstance(node, ast.Assert) and isinstance(node.test, ast.Compare):
             src = ast.unparse(node.test)
             assert src != "input_embeds is not None", "assert on mm_input_embeds still present"
+
+
+def test_an_image_request_is_never_resumed_via_p(monkeypatch, tmp_path):
+    """ROS (7cac9f5372) holds every streamed X refusal and resumes a committed
+    one through a P-only leg that carries input_ids alone -- an image request
+    would reach P as its placeholder ids. It keeps the named W50 instead."""
+    import types
+
+    from sglang.srt.weg2 import resume_via_p as rvp
+
+    monkeypatch.setenv("SGLANG_WEG2_GROUP", "D")
+    monkeypatch.setenv("SGLANG_HICACHE_ARENA_DIR", str(tmp_path))
+    monkeypatch.delenv(rvp.ENV, raising=False)
+    monkeypatch.delenv(rvp.ENV_OPEN_STREAM, raising=False)
+
+    def _req(mm, out):
+        return types.SimpleNamespace(rid="weg2-2-14", stream=True, output_ids=list(range(out)),
+                                     multimodal_inputs=mm)
+
+    assert rvp.eligible(_req(None, 0)) and rvp.eligible(_req(None, 5))
+    assert not rvp.eligible(_req(object(), 0)), "open image stream: W50, never ids-only on P"
+    assert not rvp.eligible(_req(object(), 5)), "image stream with output: W50 as well"
