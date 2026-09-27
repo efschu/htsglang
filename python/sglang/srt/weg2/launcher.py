@@ -4194,6 +4194,63 @@ class Weg2LaunchRefused(RuntimeError):
     pass
 
 
+class Weg2TokenCutNotWired(Weg2LaunchRefused):
+    """#239 S2: ``--d-kv-token-cut`` (form ``kv=qsa_forma_dcp``) is PLANNED
+    -- the D solve prices the token cut, the dry run prints it -- but the
+    runtime half is not built: a Form A worker attends nothing (seam F5, S3
+    wires the worker attention over its KV share). A real boot is refused
+    here, before any rank loads, instead of booting a KV split nobody reads.
+    """
+
+
+#: #239: the marker of the refusal and of the dry-run line.
+KV_TOKEN_CUT_MARKER = "#239 KV-TOKEN-SCHNITT"
+
+
+def d_kv_token_cut(ns):
+    """#239: what ``--d-kv-token-cut`` hands the D solve: ``None`` (off),
+    ``expert_residency.KV_TOKEN_CUT_MAXMIN``, or the stated ratio vector."""
+    from sglang.srt.planner import expert_residency as _er
+
+    raw = str(getattr(ns, "d_kv_token_cut", weg2_form.KV_TOKEN_CUT_OFF)
+              or weg2_form.KV_TOKEN_CUT_OFF).strip()
+    if raw == weg2_form.KV_TOKEN_CUT_OFF:
+        return None
+    if raw == _er.KV_TOKEN_CUT_MAXMIN:
+        return raw
+    try:
+        vec = [float(x) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        vec = []
+    if not vec or any(x < 0 for x in vec) or sum(vec) <= 0:
+        raise Weg2LaunchRefused(
+            f"{KV_TOKEN_CUT_MARKER}: --d-kv-token-cut {raw!r} is neither "
+            f"{weg2_form.KV_TOKEN_CUT_OFF!r}, {_er.KV_TOKEN_CUT_MAXMIN!r} nor a "
+            "ratio vector of the D ranks")
+    return tuple(vec)
+
+
+def d_kv_dtype_bytes(ns) -> int:
+    """#239: bytes per KV element on D -- ``--kv-cache-dtype`` of extra_d,
+    else the profile row's ``kv_dtype`` (fp8 = 1, anything else 2)."""
+    dtype = _argv_scalar(getattr(ns, "extra_d", ""), "--kv-cache-dtype") or ""
+    if not dtype:
+        row = weg2_form.profile_row(getattr(ns, "profile", "") or "")
+        dtype = str(getattr(row, "kv_dtype", "") or "") if row is not None else ""
+    return 1 if dtype.lower().startswith("fp8") else 2
+
+
+def refuse_unwired_token_cut(ns, boot_form) -> None:
+    """#239 S2: a real boot of ``kv=qsa_forma_dcp`` stops here, by name."""
+    if boot_form is None or boot_form.kv != "qsa_forma_dcp" or getattr(ns, "dry_run", False):
+        return
+    raise Weg2TokenCutNotWired(
+        f"{KV_TOKEN_CUT_MARKER}: --d-kv-token-cut {ns.d_kv_token_cut} (form kv=qsa_forma_dcp) "
+        "is planned but not wired -- the Form A workers attend nothing (seam F5; #239 S3 "
+        "wires the worker attention over its KV share). --dry-run prints the planned cut; "
+        "a real boot needs S3.")
+
+
 class Weg2StoreDiskRefused(Weg2LaunchRefused):
     """W57: the disk cannot fund ``max_size + min_free`` for this boot's store.
 
@@ -15408,6 +15465,10 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     _act_rec, _act_src = (d_activation_record(ns.profile) if card_terms is not None
                           else (None, ""))
     _derive_waves = bool(getattr(ns, "d_pool_waves_derived", False))
+    # #239: the token cut of the full-attention KV (None = off, byte-identical)
+    _kv_cut = d_kv_token_cut(ns)
+    _kv_cut_kw = ({} if _kv_cut is None else
+                  dict(kv_token_shares=_kv_cut, kv_dtype_bytes=d_kv_dtype_bytes(ns)))
     try:
         plan = _er.plan_d_residency(
             model_path=ns.model,
@@ -15437,6 +15498,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             activation_record_mib=_act_rec,
             activation_record_source=_act_src,
             derive_waves=_derive_waves,
+            **_kv_cut_kw,
         )
         if _ledger is not None and plan.refusal is not None and plan.fits:
             # THE CONSUMER FOLLOWS THE BOOKED BUDGET (rc12c): lower the
@@ -15473,6 +15535,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                     activation_record_mib=_act_rec,
                     activation_record_source=_act_src,
                     derive_waves=_derive_waves,
+                    **_kv_cut_kw,
                 )
         if d_stated_seats(ns) is not None:
             for _ln in d_seat_lines(ns):
@@ -15513,6 +15576,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             activation_record_mib=_act_rec,
             activation_record_source=_act_src,
             derive_waves=_derive_waves,
+            **_kv_cut_kw,
     ), label):
         log(_ln)
     if plan.refusal is not None:
@@ -17375,6 +17439,14 @@ def build_parser() -> argparse.ArgumentParser:
     # Wer einen Term weglaesst, bekommt ihn im Druck als FEHLT benannt --
     # kein geratener Default, weil ein geratener Default hier genau die
     # Zahl waere, um die es geht.
+    ap.add_argument(
+        "--d-kv-token-cut", default="off",
+        help="#239 (uneven-DCP-KV, release feature): cut D's full-attention KV "
+             "by TOKENS over the Form A ranks (form kv=qsa_forma_dcp). 'off' "
+             "(default, byte-identical), 'maxmin' (the D solve picks the shares: "
+             "max-min of the relative row ceiling, in 64ths) or a ratio vector "
+             "per D rank. S2: planned and priced (--dry-run prints the cut), a "
+             "real boot is refused by name until S3 wires the worker attention.")
     ap.add_argument(
         "--d-foreign-context-mib", default="",
         help="#145 Term (b): je D-RANG (ordinal) der VRAM, den die SCHLAFENDE "
@@ -19271,6 +19343,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # profile's registry row (unset flags only).
         apply_profile_arg_defaults(ns, list(sys.argv[1:] if argv is None else argv))
     ns.weg2_boot_form = boot_form
+    # #239 S2: a planned-but-unwired token cut never reaches a rank.
+    refuse_unwired_token_cut(ns, boot_form)
     # H87: the #114/H41 calibration identity by memory footprint, decided once
     # here where the checkpoint PATH is known (build_env sees only its name).
     _h87_alias_line = (note_calibration_footprint_alias(ns.model)
