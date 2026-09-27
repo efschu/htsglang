@@ -13,7 +13,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from rigdash import live, parse, server, sources  # noqa: E402
+from rigdash import health, live, parse, server, sources  # noqa: E402
 
 P_RANK0 = ("[2026-09-27 09:20:28 PP0] Prefill rank batch, #new-token: 16384, #cached-token: 0, #chunks: 1, "
            "gpu-ms: 3255.5 (compute 3255.5, wait 0.0) (wait by family: tp.all_reduce 0.0/29x) bubble_ms=16.5 "
@@ -214,6 +214,102 @@ class LaunchLineTests(unittest.TestCase):
         self.assertEqual(len(out), 3)
         self.assertTrue(out[0].startswith("=== WEG2 BOOT tag="))
         self.assertEqual(out[2], "X PROVENANCE: X=4096 source=flag")
+
+
+# verbatim, 27B-b1 dkr27breleasedraftbar1w109270932 P log, 2026-09-27
+TB_PREFIXED = "[2026-09-27 09:45:58 PP1] Scheduler hit an exception: Traceback (most recent call last):"
+W27_UNPREFIXED = ("sglang.srt.managers.pp_admission_congruence.PPWidthDivergenceRefused: #1233 W27 PP WIDTH "
+                  "DIVERGENCE REFUSED: received hidden_states with 1024 row(s) for a batch of 512 token(s)")
+FI_SPLIT_OFF = ("[2026-09-27 09:33:06 PP0] FI-GRAPH-SPLIT off for this capture: flashinfer '0.7.0', this module "
+                "mirrors 0.6.14")
+
+
+class HealthTests(unittest.TestCase):
+    NOW = 1790502000.0
+
+    def _boot(self, **kw):
+        b = {"live": True, "health": {}, "stops": [], "last_activity": {}, "last_activity_any": self.NOW - 5,
+             "container": {"Names": "htsglang-acc-27b-x", "State": "running", "Status": "Up 5 minutes (healthy)"},
+             "front": None, "queue": None}
+        b.update(kw)
+        return b
+
+    def test_healthy_boot_has_no_state(self):
+        self.assertIsNone(health.assess(self._boot(), self.NOW)["state"])
+
+    def test_weg2_health_dead_group(self):
+        b = self._boot(health={"P": {"t": self.NOW - 10, "alive": False, "http_ok": False, "streak": 4}})
+        a = health.assess(b, self.NOW)
+        self.assertEqual(a["state"], "TOT")
+        self.assertIn("Gruppe P tot", a["reasons"][0]["text"])
+
+    def test_stale_health_line_does_not_alarm(self):
+        b = self._boot(health={"P": {"t": self.NOW - 600, "alive": False, "http_ok": False, "streak": 4}})
+        self.assertIsNone(health.assess(b, self.NOW)["state"])
+
+    def test_alive_but_http_down_is_a_hang(self):
+        b = self._boot(health={"P": {"t": self.NOW - 10, "alive": True, "http_ok": False, "streak": 2}})
+        self.assertEqual(health.assess(b, self.NOW)["state"], "HAENGT")
+
+    def test_named_stop_without_later_activity_is_dead_and_named_wins(self):
+        t = self.NOW - 300
+        b = self._boot(stops=[{"t": t, "group": "P", "text": "Traceback (most recent call last):", "bare": True},
+                              {"t": t, "group": "P", "text": W27_UNPREFIXED, "bare": False}],
+                       last_activity={"P": t - 1, "D": self.NOW - 5})
+        a = health.assess(b, self.NOW)
+        self.assertEqual(a["state"], "TOT")
+        self.assertIn("W27", a["reasons"][0]["text"])
+
+    def test_stop_followed_by_activity_is_only_a_warning(self):
+        t = self.NOW - 300
+        b = self._boot(stops=[{"t": t, "group": "D", "text": "ADMISSION SPLIT x", "bare": False}],
+                       last_activity={"D": t + 120})
+        self.assertEqual(health.assess(b, self.NOW)["state"], "WARNUNG")
+
+    def test_queue_without_progress_is_a_hang(self):
+        b = self._boot(front={"queue": 3, "outstanding": {"P": 1, "D": 0}}, last_activity_any=self.NOW - 125)
+        a = health.assess(b, self.NOW)
+        self.assertEqual(a["state"], "HAENGT")
+        self.assertIn("4 Anfrage(n) warten", a["reasons"][0]["text"])
+        self.assertIn("seit 125 s", a["reasons"][0]["text"])
+
+    def test_queue_with_recent_progress_is_fine(self):
+        b = self._boot(front={"queue": 3, "outstanding": {}}, last_activity_any=self.NOW - 20)
+        self.assertIsNone(health.assess(b, self.NOW)["state"])
+
+    def test_docker_unhealthy(self):
+        b = self._boot(container={"Names": "c", "State": "running", "Status": "Up 24 minutes (unhealthy)"})
+        a = health.assess(b, self.NOW)
+        self.assertEqual(a["state"], "HAENGT")
+        self.assertIn("unhealthy", a["reasons"][0]["text"])
+
+    def test_finished_boot_not_judged_but_ended_on_named(self):
+        t = self.NOW - 3000
+        b = self._boot(live=False, container=None,
+                       stops=[{"t": t, "group": "P", "text": W27_UNPREFIXED, "bare": False}])
+        a = health.assess(b, self.NOW)
+        self.assertIsNone(a["state"])
+        self.assertIn("W27", a["ended_on"]["text"])
+
+
+class StopScanTests(unittest.TestCase):
+    def test_stop_lines_from_a_p_log(self):
+        self.assertTrue(parse.stop_match(TB_PREFIXED))
+        self.assertTrue(parse.stop_match(W27_UNPREFIXED))
+        self.assertFalse(parse.stop_match(FI_SPLIT_OFF))
+        with tempfile.TemporaryDirectory() as d:
+            stem = os.path.join(d, "boot_weg2_x_0927_000000")
+            with open(stem + ".P.log", "w") as fh:
+                fh.write("\n".join([FI_SPLIT_OFF, P_RANK0, TB_PREFIXED, "  File \"x.py\", line 1", W27_UNPREFIXED]) + "\n")
+            ll = live.LiveLogs([os.path.join(d, "boot_*.log")])
+            ll.poll()
+            [v] = ll.snapshot()
+            self.assertEqual(v["stop_count"], 2)
+            named = [x for x in v["stops"] if not x["bare"]]
+            self.assertEqual(len(named), 1)
+            # the unprefixed exception line inherits the traceback's timestamp
+            self.assertEqual(time.strftime("%H:%M:%S", time.gmtime(named[0]["t"])), "09:45:58")
+            self.assertEqual(v["last_activity"]["P"], parse.parse_line(P_RANK0)["t"])
 
 
 class SourceTests(unittest.TestCase):

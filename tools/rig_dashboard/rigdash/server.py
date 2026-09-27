@@ -18,7 +18,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import live, sources
+from . import health, live, sources
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -95,6 +95,7 @@ class App:
         fronts = {k: v for k, v in sv.items() if k.startswith("front:")}
         for b in boots:
             b["front"] = sources.front_for_boot(fronts, b["meta"].get("tag"))
+            b["alarm"] = health.assess(b, now)
         return {
             "t": now,
             "version": self.version,

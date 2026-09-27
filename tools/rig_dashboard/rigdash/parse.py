@@ -63,7 +63,19 @@ F_FLIP_SLEEP = _f(r"\bsleep=(\d+(?:\.\d+)?) ms")
 F_FLIP_WAKE = _f(r"\bwake=(\d+(?:\.\d+)?) ms")
 F_CORRIDOR_PHASE = _f(r"WEG2-CORRIDOR phase=(\w)\((\w+)\)")
 F_ROUTE = _f(r"WEG2-ROUTE .*?\(awake=(\w+)\b.*?queue=(\d+)")
-F_HEALTH = _f(r"WEG2-HEALTH group=(\w+) http_ok=(\w+) process_alive=(\w+)")
+F_HEALTH = _f(r"WEG2-HEALTH group=(\w+) http_ok=(\w+) process_alive=(\w+)(?: streak=(\d+))?")
+
+# Named stops in the P/D scheduler logs (operator list 2026-09-27): a refusal
+# the runtime raises on purpose, a scheduler exception, or an OOM.  The
+# harmless "FI-GRAPH-SPLIT off" status line also contains "SPLIT" and must not
+# count.  DEBUG-HOLD is the #1223 hold a rank enters after such a stop -- the
+# process is alive and deliberately parked, which from outside is a hang.
+STOP_RE = _f(r"W27 |#791b|SPLIT refused|ADMISSION SPLIT|Traceback \(most recent|CUDA out of memory|DEBUG-HOLD rank=")
+STOP_EXCLUDE = ("FI-GRAPH-SPLIT off",)
+
+
+def stop_match(line: str) -> bool:
+    return bool(STOP_RE.search(line)) and not any(x in line for x in STOP_EXCLUDE)
 F_MODEL_PATH = _f(r"model_path='([^']*)'")
 F_SERVED_NAME = _f(r"served_model_name='([^']*)'")
 F_TP = _f(r"\btp_size=(\d+)")
@@ -180,7 +192,7 @@ def parse_line(line: str) -> Optional[dict]:
     h = F_HEALTH.search(rest)
     if h:
         ev.update(kind="health", group=h.group(1), http_ok=h.group(2) == "True",
-                  alive=h.group(3) == "True")
+                  alive=h.group(3) == "True", streak=int(h.group(4)) if h.group(4) else None)
         return ev
     bt = F_BOOT.search(rest)
     if bt:

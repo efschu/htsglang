@@ -7,6 +7,7 @@
 <style>
 :root {
   color-scheme: light;
+  --alarm-dead: #c62828; --alarm-hang: #b3261e;
   --bg: #f4f4f2; --surface: #fcfcfb; --surface-2: #efeeea; --line: #dcdad4;
   --text: #0b0b0b; --text-2: #52514e; --muted: #7b7a75;
   --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
@@ -16,6 +17,7 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
+    --alarm-dead: #b71c1c; --alarm-hang: #a52019;
     --bg: #111110; --surface: #1a1a19; --surface-2: #232321; --line: #34332f;
     --text: #ffffff; --text-2: #c3c2b7; --muted: #8d8c85;
     --s1: #3987e5; --s2: #d95926; --s3: #199e70;
@@ -25,6 +27,7 @@
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
+  --alarm-dead: #b71c1c; --alarm-hang: #a52019;
   --bg: #111110; --surface: #1a1a19; --surface-2: #232321; --line: #34332f;
   --text: #ffffff; --text-2: #c3c2b7; --muted: #8d8c85;
   --s1: #3987e5; --s2: #d95926; --s3: #199e70;
@@ -93,6 +96,14 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .gpu .spark { height: 36px; }
 .gpu .sparkbox { margin-top: 0; }
 .err { color: var(--bad); font-size: 12px; }
+.alarm { border-radius: 8px; padding: 12px 14px; margin: 0 0 12px; color: #fff; background: var(--alarm-dead); }
+.alarm.hang { background: var(--alarm-hang); }
+.alarm.warn { background: var(--surface-2); color: var(--text); border: 2px solid var(--warn); }
+.alarm .head { font-size: 22px; font-weight: 800; letter-spacing: .02em; }
+.alarm .why { font-size: 13px; margin-top: 4px; overflow-wrap: anywhere; }
+.alarm .why b { font-weight: 700; }
+section.card.dead { border: 3px solid var(--alarm-dead); }
+section.card.hang { border: 3px solid var(--alarm-hang); }
 .launch { font-size: 11px; color: var(--text-2); margin-top: 6px; max-height: 360px; overflow: auto; }
 .launch div { padding: 2px 0; border-bottom: 1px dashed var(--line); overflow-wrap: anywhere; }
 details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
@@ -259,6 +270,19 @@ function decodeTile(b, g, color, binders, now) {
     ${sp ? sp.svg : ""}</div>`;
 }
 
+function alarmHtml(b, now) {
+  const a = b.alarm || {};
+  if (!a.state) return "";
+  const cls = a.state === "TOT" ? "" : a.state === "HAENGT" ? "hang" : "warn";
+  const groups = [...new Set((a.reasons || []).filter((r) => r.level === "dead" || r.level === "hang").map((r) => r.group).filter(Boolean))];
+  const head = a.state === "TOT" ? `GRUPPE ${groups.join(" + ") || ""} TOT`.replace("GRUPPE  TOT", "MODELL TOT")
+    : a.state === "HAENGT" ? (groups.length ? `GRUPPE ${groups.join(" + ")} H\u00c4NGT` : "MODELL H\u00c4NGT") : "WARNUNG";
+  const since = (a.reasons || []).map((r) => r.t).filter((t) => t != null);
+  const t0 = since.length ? Math.min(...since) : null;
+  return `<div class="alarm ${cls}" role="alert"><div class="head">${esc(head)}${t0 ? ` <span style="font-size:14px;font-weight:600">seit ${hhmm(t0)} (${ago(now - t0)})</span>` : ""}</div>
+    ${(a.reasons || []).map((r) => `<div class="why"><b>${r.level === "dead" ? "tot" : r.level === "hang" ? "h\u00e4ngt" : "Hinweis"}</b> &middot; ${r.t ? hhmm(r.t) + " &middot; " : ""}${esc(r.text)}</div>`).join("")}</div>`;
+}
+
 function bootCard(b, now, binders) {
   const m = b.meta || {};
   const c = b.container;
@@ -279,7 +303,9 @@ function bootCard(b, now, binders) {
       `<b class="${f.slept === "D" ? "dp" : ""}" style="height:${Math.max(6, 100 * (f.total_ms || 0) / mx)}%" title="${esc(f.slept)}→${esc(f.woke)} ${fmt(f.total_ms)} ms um ${hhmm(f.t)}"></b>`).join("")}</div>`;
   }
   const errs = (b.errors || []).slice(-3).reverse();
-  return `<section class="card">
+  const st = (b.alarm || {}).state;
+  return `<section class="card ${st === "TOT" ? "dead" : st === "HAENGT" ? "hang" : ""}">
+    ${alarmHtml(b, now)}
     <div class="boot-head">
       <span class="model">${esc(m.model || b.stem)}</span>
       <span class="badge ${b.live ? "live" : "dead"}">${b.live ? "LIVE" : "kein Log seit " + ago(b.age_s)}</span>
@@ -359,8 +385,8 @@ function historyHtml(boots, now) {
   const rows = boots.filter((b) => !b.live);
   if (!rows.length) return `<div class="muted">keine weiteren Boots</div>`;
   const r = (b, g) => { const p = (b.prefill || {})[g]; return p && p.last_burst ? fmt(p.last_burst.tps) : "—"; };
-  return `<table><tr><th>Modell</th><th>Tag</th><th class="num">letztes Log</th><th class="num">P-Prefill</th><th class="num">D-Prefill</th><th class="num">Decode</th><th class="num">Flips</th></tr>` +
-    rows.map((b) => `<tr><td>${esc((b.meta || {}).model || "")}</td><td class="mono">${esc((b.meta || {}).tag || b.stem)}</td><td class="num">vor ${ago(b.age_s)}</td><td class="num">${r(b, "P")}</td><td class="num">${r(b, "D")}</td><td class="num">${b.decode && b.decode.D ? fmt(b.decode.D.gen_tps_last, 1) : "—"}</td><td class="num">${fmt(b.flip_count)}</td></tr>`).join("") +
+  return `<table><tr><th>Modell</th><th>Tag</th><th class="num">letztes Log</th><th class="num">P-Prefill</th><th class="num">D-Prefill</th><th class="num">Decode</th><th class="num">Flips</th><th>Ende</th></tr>` +
+    rows.map((b) => `<tr><td>${esc((b.meta || {}).model || "")}</td><td class="mono">${esc((b.meta || {}).tag || b.stem)}</td><td class="num">vor ${ago(b.age_s)}</td><td class="num">${r(b, "P")}</td><td class="num">${r(b, "D")}</td><td class="num">${b.decode && b.decode.D ? fmt(b.decode.D.gen_tps_last, 1) : "—"}</td><td class="num">${fmt(b.flip_count)}</td><td class="err mono" style="max-width:420px">${b.alarm && b.alarm.ended_on && !b.alarm.ended_on.recovered ? esc(b.alarm.ended_on.group + ": " + b.alarm.ended_on.text.slice(0, 140)) : ""}</td></tr>`).join("") +
     `</table><div class="muted" style="font-size:12px;margin-top:4px">Prefill-Spalten: Rechenrate (gpu-ms) des letzten Schubs, langsamster Rang; Decode: letzter gen-throughput-Wert.</div>`;
 }
 
@@ -386,7 +412,8 @@ async function refresh() {
     const now = d.t;
     const binders = [];
     const openDetails = new Set([...document.querySelectorAll("details[open]")].map((e) => e.id));
-    const live = d.boots.filter((b) => b.live);
+    // a boot whose container still runs is shown and judged even when its logs went quiet (a hang can be silent)
+    const live = d.boots.filter((b) => b.live || (b.container && b.container.State === "running"));
     const shown = live.length ? live : d.boots.filter((b) => b.primary).slice(0, 1);
     $("boots").innerHTML = shown.length ? shown.map((b) => bootCard(b, now, binders)).join("")
       : `<section class="card"><div class="muted">Kein Boot-Log der letzten 6 h gefunden.</div></section>`;
@@ -396,6 +423,8 @@ async function refresh() {
     $("gpuq").innerHTML = gpuqHtml(d);
     $("history").innerHTML = historyHtml(d.boots.filter((b) => !shown.includes(b)), now);
     $("chips").innerHTML = chipsHtml(d);
+    const bad = live.filter((b) => b.alarm && (b.alarm.state === "TOT" || b.alarm.state === "HAENGT"));
+    document.title = bad.length ? `[${bad.map((b) => b.alarm.state === "TOT" ? "TOT" : "H\u00c4NGT").join(",")}] Rig-Dashboard` : "Rig-Dashboard";
     $("sub").textContent = `${live.length} Modell${live.length === 1 ? "" : "e"} live · Stand ${hhmm(now)} · rigdash ${d.version}`;
     binders.forEach((f) => f());
     openDetails.forEach((id) => { const el = id && document.getElementById(id); if (el) el.open = true; });

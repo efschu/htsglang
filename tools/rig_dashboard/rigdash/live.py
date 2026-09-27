@@ -143,7 +143,7 @@ class Boot:
             ("D_prefill_rank", 6000), ("D_prefill_batch", 3000),
             ("P_decode_batch", 2000), ("D_decode_batch", 4000),
             ("P_decode_rank", 2000), ("D_decode_rank", 20000),
-            ("flips", 400), ("errors", 200),
+            ("flips", 400), ("errors", 200), ("stops", 60),
             ("single_prefill_rank", 6000), ("single_prefill_batch", 3000),
             ("single_decode_batch", 4000), ("single_decode_rank", 20000),
         )}
@@ -151,6 +151,7 @@ class Boot:
         self.health = {}        # group -> last health event
         self.flip_open = None
         self.counts = collections.Counter()
+        self._last_t = {}       # group -> newest log timestamp seen in that file
 
     def add_file(self, group: str, path: str):
         if group in self.tails:
@@ -174,7 +175,39 @@ class Boot:
             for line in t.poll():
                 ev = parse.parse_line(line)
                 if ev:
+                    self._last_t[group] = ev["t"]
                     self._ingest(group, ev)
+                elif group != "front":
+                    m = parse.RE_PREFIX.match(line)
+                    if m:
+                        self._last_t[group] = parse.parse_ts(m)
+                if group != "front" and parse.stop_match(line):
+                    self._stop(group, line, t)
+
+    def _stop(self, group: str, line: str, tail: "Tail"):
+        """A named stop.  Unprefixed lines (the exception text under a
+        traceback) take the newest timestamp seen in the same file."""
+        m = parse.RE_PREFIX.match(line)
+        ts = parse.parse_ts(m) if m else self._last_t.get(group, tail.mtime)
+        text = line[m.end():] if m else line
+        self.ev["stops"].append({
+            "t": ts, "group": group, "text": text.strip()[:400],
+            # the bare "Traceback (most recent call last):" says THAT, the
+            # named line (W27 ..., OOM ...) says WHY -- the view prefers WHY
+            "bare": "Traceback (most recent" in text and not any(
+                k in text for k in ("W27 ", "#791b", "SPLIT refused", "ADMISSION SPLIT", "CUDA out of memory")),
+        })
+        self.counts["stop"] += 1
+
+    def last_activity(self, group: Optional[str] = None) -> Optional[float]:
+        """Newest prefill/decode line (any group, or one group)."""
+        best = None
+        for g in ((group,) if group else ("P", "D", "single")):
+            for k in ("prefill_rank", "prefill_batch", "decode_batch", "decode_rank"):
+                e = self.last.get("%s_%s" % (g, k))
+                if e and (best is None or e["t"] > best):
+                    best = e["t"]
+        return best
 
     def _ingest(self, group: str, ev: dict, head: bool = False):
         k = ev["kind"]
@@ -364,6 +397,11 @@ class Boot:
             "flip_count": self.counts.get("flip_done", 0),
             "health": self.health,
             "errors": list(self.ev["errors"])[-8:],
+            "stops": list(self.ev["stops"])[-12:],
+            "stop_count": self.counts.get("stop", 0),
+            "last_activity": {g: self.last_activity(g) for g in ("P", "D", "single")},
+            "last_activity_any": self.last_activity(),
+            "queue_log": (self.last.get("P_prefill_batch") or {}).get("queue"),
             "error_count": self.counts.get("error", 0),
             "prefill": {g: self._prefill_view(g, now) for g in self.groups_with("prefill_rank")},
             "decode": {g: self._decode_view(g, now) for g in self.groups_with("decode_batch")},
