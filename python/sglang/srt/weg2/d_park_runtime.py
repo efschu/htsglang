@@ -324,6 +324,33 @@ def note_retracted(sched, retracted_reqs) -> int:
     return len(mine)
 
 
+def _apply_park_defer(sched) -> int:
+    """#244 SEAT-ROTATE: a parked request the front deferred this phase is an
+    ordinary waiting request -- its park site is cleared (no barrier, not
+    resumed first) and it goes behind the rest of the queue. Its span stays
+    retained / held (#243). Applied where it is found (queue or dormant hold);
+    each rid once. Replicated input (the wake object), so every rank moves the
+    same requests."""
+    defer = getattr(sched, "weg2_park_defer", None)
+    if not defer:
+        return 0
+    moved = []
+    for r in list(sched.waiting_queue) + list(getattr(sched, "weg2_dormant_hold", None) or []):
+        rid = str(getattr(r, "rid", ""))
+        if rid in defer and d_seats.park_site(r) is not None:
+            d_seats.clear_park(r)
+            defer.discard(rid)
+            moved.append(r)
+    if moved:
+        ids = {id(r) for r in moved}
+        sched.waiting_queue = ([q for q in sched.waiting_queue if id(q) not in ids]
+                               + [q for q in sched.waiting_queue if id(q) in ids])
+        logger.info("WEG2-D-PARK seat-rotate: %d parked request(s) deferred this phase %s "
+                    "(not resumed first; ordinary waiting work behind the hand-offs)",
+                    len(moved), [str(r.rid)[:12] for r in moved])
+    return len(moved)
+
+
 def admission(sched, running_batch):
     """One pass's D admission verdict: parked first, the rest in the group's
     order, the barrier/blocked set of ``d_seats.admission_gate``. None when
@@ -338,6 +365,7 @@ def admission(sched, running_batch):
         + list(getattr(sched, "weg2_dormant_hold", None) or [])
     ):
         return None  # immediate park, nothing flip-parked waits (settle excluded, PK2): stock loop
+    _apply_park_defer(sched)
     sched.waiting_queue = d_seats.order_waiting(sched.waiting_queue)
     book = getattr(sched, "_weg2_d_resume_book", None)
     if book is None:
@@ -407,6 +435,10 @@ def note_wake_seats(sched, recv_req):
         return None
     handoff_n = getattr(recv_req, "handoff_n", None)
     parked_n = getattr(recv_req, "parked_n", None)
+    # #244 SEAT-ROTATE: the parked rids the front defers this phase (replicated:
+    # the same wake object on every rank).
+    _defer = getattr(recv_req, "park_defer_rids", None)
+    sched.weg2_park_defer = set(str(r) for r in _defer) if _defer else set()
     cap = int(getattr(getattr(sched, "server_args", None), "max_running_requests", 0) or 1)
     seats = d_seats.phase_seats(handoff_n, parked_n, cap=cap,
                                 epoch=getattr(recv_req, "epoch", None))
