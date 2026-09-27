@@ -137,7 +137,16 @@ def awake_requeue_s(env: Optional[Mapping[str, str]] = None) -> float:
 
 
 def _arrival(req) -> float:
-    """FCFS position; a request that never passed the queue sorts last."""
+    """FCFS position; a request that never passed the queue sorts last.
+    SA (#244, weg2/seat_age.py): with SGLANG_WEG2_SEAT_ROTATE on, the FRONT
+    arrival (the rid's counter) -- the one order over running, parked and
+    waiting requests the user's design names; replicated (the rid)."""
+    from sglang.srt.weg2 import seat_age as _sa
+
+    if _sa.enabled():
+        age = _sa.rid_age(getattr(req, "rid", ""))
+        if age != _sa.UNKNOWN_AGE:
+            return float(age)
     seq = getattr(req, "kv_arrival_seq", None)
     return float("inf") if seq is None else float(seq)
 
@@ -180,7 +189,13 @@ def retraction_order(reqs: Sequence, *, spec_active: bool) -> Optional[List[int]
     n = len(reqs)
     if n == 0:
         return []
-    by_protection = sorted(range(n), key=lambda i: session_priority_key(reqs[i]), reverse=True)
+    from sglang.srt.weg2 import seat_age as _sa
+
+    if _sa.enabled():
+        # SA (4): the park victim is the YOUNGEST by front arrival.
+        by_protection = sorted(range(n), key=lambda i: _arrival(reqs[i]))
+    else:
+        by_protection = sorted(range(n), key=lambda i: session_priority_key(reqs[i]), reverse=True)
     if not spec_active:
         return by_protection
     youngest = by_protection[-1]
@@ -221,6 +236,8 @@ class AdmissionGate:
     """
 
     barrier: bool = False
+    #: SA: the front-arrival age of the oldest parked request still waiting
+    oldest_parked_age: Optional[float] = None
     blocked: FrozenSet[str] = frozenset()
     note: str = ""
 
@@ -229,7 +246,17 @@ class AdmissionGate:
         site = park_site(req)
         if site is not None:
             return "weg2_d_park_older_live" if str(req.rid) in self.blocked else None
-        return "weg2_d_park_first" if self.barrier else None
+        if not self.barrier:
+            return None
+        # SA (#244): the barrier holds back only newcomers YOUNGER than the
+        # oldest parked request still waiting -- an older one (a waiter a
+        # displacement made room for, a deferred parked one) goes first.
+        from sglang.srt.weg2 import seat_age as _sa
+
+        if _sa.enabled() and self.oldest_parked_age is not None:
+            if _arrival(req) < self.oldest_parked_age:
+                return None
+        return "weg2_d_park_first"
 
 
 @dataclass
@@ -316,7 +343,10 @@ def admission_gate(
         f"gate=weg2_d_park(parked_waiting={len(parked_waiting)} "
         f"parked_outside={len(parked_outside)} blocked={len(blocked)})"
     )
-    return AdmissionGate(barrier=True, blocked=frozenset(blocked), note=note)
+    _waiting_parked = [r for r in parked_waiting if str(r.rid) not in blocked] or parked_waiting
+    oldest = min((_arrival(r) for r in _waiting_parked + parked_outside), default=None)
+    return AdmissionGate(barrier=True, blocked=frozenset(blocked), note=note,
+                         oldest_parked_age=oldest)
 
 
 def awake_requeue_due(parked: Sequence, *, now: float, bound_s: float) -> bool:

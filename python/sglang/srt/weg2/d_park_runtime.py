@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from typing import Optional
 
 from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats
 
@@ -343,12 +344,80 @@ def _apply_park_defer(sched) -> int:
             moved.append(r)
     if moved:
         ids = {id(r) for r in moved}
-        sched.waiting_queue = ([q for q in sched.waiting_queue if id(q) not in ids]
-                               + [q for q in sched.waiting_queue if id(q) in ids])
+        from sglang.srt.weg2 import seat_age as _sa
+
+        rest = [q for q in sched.waiting_queue if id(q) not in ids]
+        mine = [q for q in sched.waiting_queue if id(q) in ids]
+        if _sa.enabled():
+            # SA: each deferred request goes before the first waiting request
+            # YOUNGER than it (the rest keeps the group's order) -- it moves in
+            # as soon as the older ones leave, never behind younger arrivals.
+            for r in _sa.by_age(mine):
+                a = _sa.rid_age(r.rid)
+                k = next((i for i, q in enumerate(rest) if d_seats.park_site(q) is None
+                          and _sa.rid_age(getattr(q, "rid", "")) > a), len(rest))
+                rest.insert(k, r)
+            sched.waiting_queue = rest
+        else:
+            sched.waiting_queue = rest + mine
         logger.info("WEG2-D-PARK seat-rotate: %d parked request(s) deferred this phase %s "
                     "(not resumed first; ordinary waiting work behind the hand-offs)",
                     len(moved), [str(r.rid)[:12] for r in moved])
     return len(moved)
+
+
+def displace_for_age(sched, running_batch) -> Optional[str]:
+    """SA (3) (#244, the user's design): an older request waits on D while
+    every seat is held and a YOUNGER one runs -> the youngest running one is
+    parked WHOLE (retract, span retained, pressure park: it resumes when it is
+    the oldest live request). One per pass. Under speculative decoding only
+    the back of the batch may leave; when the youngest is not the back the
+    displacement waits (named). Partial parking (only part of a request's KV)
+    does not exist -- named follow-up. Replicated inputs (running set, queue,
+    rids, seat cap), so every rank decides alike. Returns the displaced rid."""
+    from sglang.srt.weg2 import seat_age as _sa
+
+    if not _sa.enabled() or not d_seats.d_flip_park_active():
+        return None
+    reqs = list(getattr(running_batch, "reqs", None) or [])
+    if not reqs:
+        return None
+    cap = seat_cap(sched)
+    if cap is None:
+        cap = int(getattr(getattr(sched, "server_args", None), "max_running_requests", 0) or 0)
+    if not cap or len(reqs) < int(cap):
+        return None
+    waiting = [q for q in sched.waiting_queue if d_seats.park_site(q) != d_seats.SITE_PRESSURE]
+    pair = _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True)
+    if pair is None:
+        return None
+    older, victim_rid = pair
+    idx = next(i for i, r in enumerate(reqs) if str(r.rid) == victim_rid)
+    spec = not (getattr(running_batch, "spec_algorithm", None) is None
+                or running_batch.spec_algorithm.is_none())
+    if spec and idx != len(reqs) - 1:
+        n = getattr(sched, "_sa_displace_waits", 0) + 1
+        sched._sa_displace_waits = n
+        if n <= 8 or (n & (n - 1)) == 0:
+            logger.info("SEAT-AGE DISPLACE-WAIT older=%s youngest=%s (n=%d): under speculative "
+                        "decoding only the back of the batch may leave; the youngest is not the back",
+                        older[:16], victim_rid[:16], n)
+        return None
+    snap = sched._weg2_d_park_draft_snapshot(running_batch) if hasattr(
+        sched, "_weg2_d_park_draft_snapshot") else None
+    victim = reqs[idx]
+    running_batch.release_req(idx, len(reqs) - 1, sched.server_args, retain=True)
+    running_batch.filter_batch(keep_indices=[i for i in range(len(reqs)) if i != idx])
+    if snap is not None and hasattr(sched, "_weg2_d_park_draft_save"):
+        sched._weg2_d_park_draft_save([victim], snap)
+    sched._add_request_to_queue(victim, is_retracted=True)
+    d_seats.mark_parked(victim, d_seats.SITE_PRESSURE, now=time.monotonic())
+    sched.waiting_queue = [q for q in sched.waiting_queue if q is not victim] + [victim]
+    sched._weg2_sa_displaced = getattr(sched, "_weg2_sa_displaced", 0) + 1
+    logger.warning("SEAT-AGE DISPLACE rid_out=%s older_waiting=%s running=%d cap=%s: the youngest "
+                   "running request is parked whole (span retained) so the older one moves in",
+                   victim_rid[:16], older[:16], len(reqs), cap)
+    return victim_rid
 
 
 def admission(sched, running_batch):
@@ -359,6 +428,11 @@ def admission(sched, running_batch):
     parks exist there, so with none waiting this is the stock loop too."""
     if not d_seats.d_flip_park_active():
         return None
+    # SA (3) (#244): runs on both forms (27B immediate park / NF), before the
+    # nothing-parked early return -- the older waiting one may be a deferred
+    # parked request whose park site is already cleared.
+    _apply_park_defer(sched)
+    displace_for_age(sched, running_batch)
     if not d_seats.d_park_active() and not any(
         d_seats.park_site(r) is not None
         for r in list(sched.waiting_queue)
