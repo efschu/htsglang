@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Rig-Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="mark.svg">
 <style>
 :root {
   color-scheme: light;
@@ -38,9 +39,12 @@
 body { margin: 0; background: var(--bg); color: var(--text);
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
 .mono, .num { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; }
-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px;
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
   padding: 14px 16px 10px; border-bottom: 1px solid var(--line); background: var(--surface); }
 header h1 { font-size: 18px; margin: 0; font-weight: 650; }
+header .brand { display: inline-flex; align-items: center; align-self: center; }
+header .brand img { display: block; height: 30px; width: auto; }
+header .logo-mark { display: none; }
 header .sub { color: var(--text-2); font-size: 13px; }
 header nav { margin-left: auto; display: flex; gap: 12px; font-size: 13px; }
 a { color: var(--s1); text-decoration: none; } a:hover { text-decoration: underline; }
@@ -122,6 +126,8 @@ details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
 .flipbar b { flex: 1; max-width: 14px; border-radius: 3px 3px 0 0; background: var(--s1); min-height: 2px; }
 .flipbar b.dp { background: var(--s2); }
 @media (max-width: 760px) {
+  header .logo-full { display: none; }
+  header .logo-mark { display: block; }
   .gpu { grid-template-columns: 1fr 1fr; }
   header nav { margin-left: 0; }
   .tile .big { font-size: 28px; }
@@ -130,6 +136,10 @@ details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
 </head>
 <body>
 <header>
+  <a class="brand" href="./" aria-label="fLLiper Rig-Dashboard">
+    <picture class="logo-full"><source srcset="logo-dark.svg" media="(prefers-color-scheme: dark)"><img src="logo.svg" alt="fLLiper" height="30"></picture>
+    <img class="logo-mark" src="mark.svg" alt="fLLiper" height="30" width="30">
+  </a>
   <h1>Rig-Dashboard</h1>
   <span class="sub" id="sub">verbinde&hellip;</span>
   <nav>

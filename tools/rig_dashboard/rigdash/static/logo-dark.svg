@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="540" height="168" viewBox="0 0 540 168" role="img" aria-labelledby="t d">
+  <title id="t">fLLiper</title>
+  <desc id="d">fLLiper logo: two interlocking L-shaped arrows, orange for prefill and teal for decode, circle around three GPU cards of different size; next to it the wordmark fLLiper with the two L highlighted in the same colours.</desc>
+  <!-- dark-background variant; see logo.svg for light backgrounds.
+       Letters are strokes, not text: no font is needed for the wordmark. -->
+  <defs>
+    <style>
+      .fg   { stroke: #E6EDF3; }
+      .fgf  { fill:   #E6EDF3; }
+      .pre  { stroke: #F97316; }
+      .pref { fill:   #F97316; }
+      .dec  { stroke: #2DD4BF; }
+      .decf { fill:   #2DD4BF; }
+      .tag  { fill:   #9CA3AF; }
+    </style>
+  </defs>
+
+  <!-- mark: the flip. Prefill (orange) and decode (teal) hand the same cards to each other. -->
+  <g transform="translate(16 22)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path class="pre" stroke-width="14" d="M14 22 V106 H72"/>
+    <path class="pref" stroke="none" d="M70 93 L94 106 L70 119 Z"/>
+    <path class="dec" stroke-width="14" d="M106 98 V14 H48"/>
+    <path class="decf" stroke="none" d="M50 1 L26 14 L50 27 Z"/>
+    <!-- three cards of unequal size: one 5090, two 3080 -->
+    <rect class="fgf" stroke="none" x="36" y="40" width="16" height="48" rx="3"/>
+    <rect class="fgf" stroke="none" x="58" y="50" width="12" height="38" rx="3" opacity="0.72"/>
+    <rect class="fgf" stroke="none" x="76" y="50" width="12" height="38" rx="3" opacity="0.72"/>
+  </g>
+
+  <!-- wordmark f L L i p e r, baseline y=100 in local coordinates -->
+  <g transform="translate(166 8)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- f -->
+    <path class="fg" stroke-width="11" d="M10 100 V44 A16 16 0 0 1 26 28 H33"/>
+    <path class="fg" stroke-width="11" d="M0 57 H25"/>
+    <!-- L (prefill) -->
+    <path class="pre" stroke-width="15" d="M52 28 V100 H84"/>
+    <!-- L (decode) -->
+    <path class="dec" stroke-width="15" d="M103 28 V100 H135"/>
+    <!-- i -->
+    <path class="fg" stroke-width="11" d="M157 57 V100"/>
+    <circle class="fgf" stroke="none" cx="157" cy="38" r="7"/>
+    <!-- p -->
+    <path class="fg" stroke-width="11" d="M178 57 V128"/>
+    <circle class="fg" stroke-width="11" cx="200" cy="78.5" r="21.5"/>
+    <!-- e -->
+    <path class="fg" stroke-width="11" d="M240 78.5 H283 A21.5 21.5 0 1 0 276.7 93.7"/>
+    <!-- r -->
+    <path class="fg" stroke-width="11" d="M302 100 V57 M302 79 C302 65 311 57 325 57"/>
+  </g>
+
+  <!-- tagline: generic font family with fallbacks, width pinned so any fallback font fits -->
+  <text class="tag" x="166" y="158" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'DejaVu Sans', sans-serif"
+        font-size="12" textLength="330" lengthAdjust="spacingAndGlyphs">fast Large Language inference · Parallel Elastic Runtime</text>
+</svg>

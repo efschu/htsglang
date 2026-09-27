@@ -246,6 +246,10 @@ def make_handler(app: App):
                     snap = app.snapshot(series)
                     snap["via_proxy"] = self._via_proxy()
                     return self._json(snap)
+                if path in ("/logo.svg", "/logo-dark.svg", "/mark.svg", "/favicon.svg"):
+                    name = "mark.svg" if path == "/favicon.svg" else path[1:]
+                    with open(os.path.join(STATIC, name), "rb") as fh:
+                        return self._send(200, fh.read(), "image/svg+xml")
                 if path in ("/weg2", "/weg2.html") and self._via_proxy():
                     return self._send(403, "Startzeile nur im LAN: http://192.168.0.88:8890/weg2", "text/plain; charset=utf-8")
                 if path in ("/weg2", "/weg2.html"):
