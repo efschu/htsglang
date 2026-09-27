@@ -82,7 +82,7 @@ h2 .muted, .muted { color: var(--muted); font-weight: 400; }
 .tile .kv div { display: flex; justify-content: space-between; gap: 10px; border-top: 1px dashed var(--line); padding: 3px 0; }
 .tile .kv div span:last-child { color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
 .tile .kv div.wc span:last-child { color: var(--muted); }
-.tile .bigrow { display: flex; align-items: baseline; gap: 8px; }
+.tile .bigrow { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
 .tile .bigrow .bl { flex: none; width: 70px; font-size: 11px; line-height: 1.2; text-transform: uppercase;
   letter-spacing: .03em; color: var(--text-2); }
 .tile .bigrow + .bigrow .big { margin-top: 0; }
@@ -91,6 +91,11 @@ h2 .muted, .muted { color: var(--muted); font-weight: 400; }
 .tile .bigrow.on .bl::before { content: "\25CF\00a0"; color: var(--c); }
 .tile .bigrow.on .big { color: var(--c); }
 .tile.active { box-shadow: inset 3px 0 0 var(--c); }
+.tile .bsbadge { margin-left: auto; align-self: center; font-size: 15px; white-space: nowrap; color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; padding: 1px 7px; background: var(--surface-2); font-variant-numeric: tabular-nums; }
+.tile .bsbadge b { font-size: 20px; color: var(--c); }
+.tile .bsbadge .q { font-size: 12px; color: var(--warn); }
+.tile .bsbadge.off { opacity: .6; } .tile .bsbadge.off b { color: var(--text-2); }
 .phasewrap { margin: -2px 0 14px; }
 .phasewrap .ph-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; font-size: 12px; color: var(--text-2); margin-bottom: 4px; }
 .phasewrap .ph-head .lg { display: inline-flex; align-items: center; gap: 4px; }
@@ -314,10 +319,21 @@ function kv(rows) {
 
 // the 60-s figure and, in the same size under it, the 1-s live rate; 0 is normal
 // (only one phase runs at a time): the running one is coloured, the others dimmed
-function bigPair(lbl60, v60, one, digits) {
+function bigPair(lbl60, v60, one, digits, extra) {
   const on = one > 0;
   return `<div class="bigrow"><span class="bl">${lbl60}</span><span class="big num">${fmt(v60, digits)}<small>tok/s</small></span></div>
-    <div class="bigrow ${on ? "on" : "off"}" title="letzte 1 s: Zeilen mit Stempel in der vorigen oder laufenden Sekunde; 0 = die Phase rechnet gerade nicht"><span class="bl" style="white-space:nowrap">jetzt 1 s</span><span class="big num">${fmt(one, digits)}<small>tok/s</small></span></div>`;
+    <div class="bigrow ${on ? "on" : "off"}" title="letzte 1 s: Zeilen mit Stempel in der vorigen oder laufenden Sekunde; 0 = die Phase rechnet gerade nicht"><span class="bl" style="white-space:nowrap">jetzt 1 s</span><span class="big num">${fmt(one, digits)}<small>tok/s</small></span>${extra || ""}</div>`;
+}
+
+// decode: how many seats REALLY compute (bs of the newest round) against the
+// seats of this D phase (WEG2 D-PHASE-SEATS n of cap), and what waits in D's queue
+function bsBadge(d, on) {
+  const rb = d.round_bs, se = d.seats || {};
+  const cap = se.n != null ? se.n : d.max_running;
+  const bs = rb ? rb.bs : d.running;
+  if (bs == null) return "";
+  const q = d.queue_req;
+  return `<span class="bsbadge${on ? "" : " off"}" title="rechnend = bs der j&uuml;ngsten Runde (Decode rank batch, TP0)${cap != null ? "; Sitze = " + (se.n != null ? "WEG2 D-PHASE-SEATS n dieser Phase (cap " + fmt(se.cap) + ")" : "--max-running-requests") : ""}; wartend = #queue-req der j&uuml;ngsten Decode-batch-Zeile">bs <b>${fmt(bs)}</b>${cap != null ? " / " + fmt(cap) : ""}${q ? ` <span class="q">&middot; ${fmt(q)} wartend</span>` : ""}</span>`;
 }
 
 // ---- phase bar: P-Prefill / D-Prefill / Decode runs and the flips between them
@@ -339,7 +355,7 @@ function phaseTip(x, single) {
   if (x.k === "idle" && x.boot) return `<b>Boot l&auml;dt</b> &middot; noch keine Prefill-/Decode-Zeile<br>${when}`;
   if (x.k === "idle") return `<b>${x.awake ? esc(x.awake) + " wach" : "ruht"} &middot; keine Arbeit</b><br>${when} <span class="muted">keine Prefill-/Decode-Zeile</span>`;
   const nm = phaseName(x.k, single);
-  if (x.k === "dec") return `<b>${nm}</b> &middot; &Oslash; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s <span class="muted">(gen throughput, ${fmt(x.n)} Zeilen)</span>` : `&mdash; <span class="muted">(keine &bdquo;Decode batch&ldquo;-Zeile in dieser Phase)</span>`}${x.bs != null ? " &middot; bs &Oslash; " + fmt(x.bs, 1) : ""}<br>${when}${x.rounds ? " &middot; " + fmt(x.rounds) + " Runden" : ""}${x.running ? " &middot; l&auml;uft" : ""}`;
+  if (x.k === "dec") return `<b>${nm}</b> &middot; &Oslash; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s <span class="muted">(gen throughput, ${fmt(x.n)} Zeilen)</span>` : `&mdash; <span class="muted">(keine &bdquo;Decode batch&ldquo;-Zeile in dieser Phase)</span>`}${x.bs_mean != null ? ` &middot; bs ${x.bs_min === x.bs_max ? fmt(x.bs_min) : fmt(x.bs_min) + "&ndash;" + fmt(x.bs_max)} (&Oslash; ${fmt(x.bs_mean, 1)}, Runden)` : x.bs != null ? " &middot; bs &Oslash; " + fmt(x.bs, 1) : ""}<br>${when}${x.rounds ? " &middot; " + fmt(x.rounds) + " Runden" : ""}${x.running ? " &middot; l&auml;uft" : ""}`;
   return `<b>${nm}</b> &middot; &Oslash; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(Rechenrate, langsamster Rang)</span>` : "&mdash;"}<br>${when} &middot; ${fmt(x.tok)} Tok &middot; ${fmt(x.n)} Chunks${x.running ? " &middot; l&auml;uft" : ""}`;
 }
 function phaseHtml(b) {
@@ -462,10 +478,11 @@ function decodeTile(b, g, color, binders, now) {
   const per = (v != null && d.running) ? v / d.running : null;
   const one = d.one_s || 0;
   return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>Decode${g !== "D" ? " (" + g + ")" : ""}</div>
-    ${bigPair(active ? "&Oslash; 60 s" : "letzter Wert", v, one, 1)}
+    ${bigPair(active ? "&Oslash; 60 s" : "letzter Wert", v, one, 1, bsBadge(d, one > 0))}
     <div class="state">${state}</div>
     ${kv([
       ["laufende Anfragen (bs) &middot; je Anfrage", `${fmt(d.running)} &middot; ${fmt(per, 1)} tok/s`],
+      d.seats ? ["Sitze dieser D-Phase (D-PHASE-SEATS)", `${fmt(d.seats.n)} von ${fmt(d.seats.cap)} &middot; &uuml;bergeben ${fmt(d.seats.handoff_n)} + geparkt ${fmt(d.seats.parked_n)}${d.seats.clamped ? " (gekappt)" : ""}`] : null,
       ["accept len &middot; accept rate", `${fmt(d.accept_len, 2)} &middot; ${fmt(d.accept_rate, 2)}`],
       ["Rechenrate (bs&times;accept / gpu-ms)", d.compute_tps != null ? `${fmt(d.compute_tps, 1)} tok/s` : "—"],
       ["&Oslash; tok/s/W &middot; 60 s (Kurvenmittel, Ruhe = 0)", fmt(((b.series || {}).per_w_60s || {})[g + "_decode_tps"], 2)],

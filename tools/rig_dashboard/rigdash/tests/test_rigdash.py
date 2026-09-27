@@ -774,5 +774,44 @@ class OneSecondRateTests(unittest.TestCase):
         self.assertTrue(all(145 <= v <= 175 for v in vals), vals)   # gen throughput 160, not bs x accept len x 16 = 110
 
 
+# verbatim, NF D log boot_weg2_dkrnfh91dprbar1dauer09271756, 2026-09-27
+DSEATS = ("[2026-09-27 18:06:42 TP0] WEG2 D-PHASE-SEATS (H95) epoch=1790532154.3 handoff_n=6 parked_n=4 -> n=6 of cap 6 "
+          "(CLAMPED: the front handed more than --d-bs): decode batch bs6, GDN slots in use <= 38 of 38 (boot)")
+SCHEDCAP = ("[2026-09-27 18:02:25 TP0] max_total_num_tokens=262144, chunked_prefill_size=4096, max_prefill_tokens=16384, "
+            "max_running_requests=6, context_len=262144, available_gpu_mem=3.65 GB")
+DEC_BATCH_Q = ("[2026-09-27 18:07:00 TP0] Decode batch, #running-req: 4, #full token: 179392, full token usage: 0.68, mamba num: 16, "
+               "mamba usage: 0.42, accept len: 2.34, accept rate: 0.45, cuda graph: True, gen throughput (token/s): 110.45, #queue-req: 2")
+
+
+class DecodeSeatsTests(unittest.TestCase):
+    """User 27.09.: next to the 1-s decode rate, how many seats (bs) REALLY compute."""
+
+    def test_parse_seats_and_cap(self):
+        e = parse.parse_line(DSEATS)
+        self.assertEqual((e["kind"], e["handoff_n"], e["parked_n"], e["n"], e["cap"], e["clamped"]),
+                         ("d_seats", 6, 4, 6, 6, True))
+        c = parse.parse_line(SCHEDCAP)
+        self.assertEqual((c["kind"], c["max_running"]), ("sched_cap", 6))
+
+    def test_decode_view_running_bs_seats_and_queue(self):
+        b = live.Boot("x", "/tmp")
+        for ln in (SCHEDCAP, DSEATS, DEC_BATCH_Q):
+            b._ingest("D", parse.parse_line(ln))
+        for k, bs in enumerate((6, 5, 4)):
+            b._ingest("D", parse.parse_line(
+                "[2026-09-27 18:07:01 TP0] Decode rank batch, rank: 0, #round: %d, t: %.3f, bs: %d, #rows: 16, #fwd: 1, "
+                "gpu-ms: 50.0 (x)" % (10 + k, 1790532421.0 + 0.06 * k, bs)))
+        v = b._decode_view("D", 1790532421.5)
+        self.assertEqual(v["round_bs"]["bs"], 4)                 # the newest round, not the batch line's 4 by chance
+        self.assertEqual((v["seats"]["n"], v["seats"]["cap"]), (6, 6))
+        self.assertEqual((v["queue_req"], v["max_running"]), (2, 6))
+
+    def test_phase_run_carries_bs_range_of_its_rounds(self):
+        evs = [{"kind": "decode_rank", "bs": b_} for b_ in (6, 6, 5, 4)] + [{"kind": "decode_batch", "gen_tps": 100.0, "running": 5}]
+        st = live._run_stats("dec", evs)
+        self.assertEqual((st["bs_min"], st["bs_max"]), (4, 6))
+        self.assertAlmostEqual(st["bs_mean"], 5.25)
+
+
 if __name__ == "__main__":
     unittest.main()

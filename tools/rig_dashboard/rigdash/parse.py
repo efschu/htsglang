@@ -43,6 +43,10 @@ F_GPUMS = _f(r"gpu-ms: ([\d.]+) \(compute ([\d.]+), wait ([\d.]+)\)")
 F_GPUMS_BARE = _f(r"gpu-ms: ([\d.]+)")
 F_RUNREQ = _f(r"#running-req: (\d+)")
 F_QUEUEREQ = _f(r"#queue-req: (\d+)")
+# D phase seats (H95, D log): "WEG2 D-PHASE-SEATS (H95) epoch=.. handoff_n=6 parked_n=4 -> n=6 of cap 6 (CLAMPED ...)"
+F_DSEATS = _f(r"WEG2 D-PHASE-SEATS \(H95\) epoch=\S+ handoff_n=(\d+) parked_n=(\d+) -> n=(\d+) of cap (\d+)")
+# scheduler caps at start: "max_total_num_tokens=262144, ..., max_running_requests=6, ..."
+F_SCHEDCAP = _f(r"^max_total_num_tokens=(\d+),.*\bmax_running_requests=(\d+)")
 F_PENDTOK = _f(r"#pending-token: (\d+)")
 F_INTPS = _f(r"input throughput \(token/s\): ([\d.]+)")
 F_GENTPS = _f(r"gen throughput \(token/s\): ([\d.]+)")
@@ -184,6 +188,17 @@ def parse_line(line: str) -> Optional[dict]:
         return ev
 
     # front-log families
+    if "WEG2 D-PHASE-SEATS" in rest:
+        d = F_DSEATS.search(rest)
+        if d:
+            ev.update(kind="d_seats", handoff_n=int(d.group(1)), parked_n=int(d.group(2)), n=int(d.group(3)),
+                      cap=int(d.group(4)), clamped="CLAMPED" in rest)
+            return ev
+    if rest.startswith("max_total_num_tokens="):
+        c = F_SCHEDCAP.search(rest)
+        if c:
+            ev.update(kind="sched_cap", max_total_tokens=int(c.group(1)), max_running=int(c.group(2)))
+            return ev
     if "WEG2-FLIP " in rest:
         b = F_FLIP_BEGIN.search(rest)
         if b:

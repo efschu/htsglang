@@ -265,8 +265,11 @@ def _run_stats(cls, evs):
     if cls == "dec":
         g = [e["gen_tps"] for e in evs if e.get("gen_tps") is not None]
         run = [e["running"] for e in evs if e.get("running") is not None]
+        rb = [e["bs"] for e in evs if e.get("kind") == "decode_rank" and e.get("bs") is not None]
         rounds = sum(1 for e in evs if e.get("kind") == "decode_rank")
         return {"tps": (sum(g) / len(g)) if g else None, "n": len(g), "rounds": rounds,
+                "bs_min": min(rb) if rb else None, "bs_max": max(rb) if rb else None,
+                "bs_mean": (sum(rb) / len(rb)) if rb else None,
                 "bs": (sum(run) / len(run)) if run else None}
     per = {}
     for e in evs:
@@ -567,6 +570,10 @@ class Boot:
         if k == "health":
             self.health[ev["group"]] = ev
             return
+        if k in ("d_seats", "sched_cap"):
+            if ev.get("rank") in (None, 0):
+                self.last["%s_%s" % (group, k)] = ev
+            return
         if k == "error":
             ev["group"] = group
             ev["text"] = redact.clean(ev.get("text"))
@@ -711,6 +718,14 @@ class Boot:
         return one_s_rate(per, now, other_after=other, gone_after=gone,
                           rate=compute_rate if kind == "prefill" else None)
 
+    def _round_bs(self, g: str) -> Optional[dict]:
+        """bs of the newest 'Decode rank batch' round of rank 0: the requests
+        that really compute now (below the seats when KV is short)."""
+        for e in reversed(self.ev["%s_decode_rank" % g]):
+            if e.get("rank", 0) == 0 and e.get("bs") is not None:
+                return {"bs": e["bs"], "t": e.get("t_exact") or e["t"]}
+        return None
+
     def _decode_view(self, g: str, now: float) -> dict:
         rows = [e for e in self.ev["%s_decode_batch" % g] if e["t"] >= now - WINDOW_S]
         rr = [e for e in self.ev["%s_decode_rank" % g]
@@ -728,6 +743,10 @@ class Boot:
             "gen_tps": (sum(gen) / len(gen)) if gen else None,
             "gen_tps_last": last.get("gen_tps") if last else None,
             "running": last.get("running") if last else None,
+            "queue_req": last.get("queue") if last else None,
+            "round_bs": self._round_bs(g),
+            "seats": self.last.get("%s_d_seats" % g),
+            "max_running": (self.last.get("%s_sched_cap" % g) or {}).get("max_running"),
             "accept_len": last.get("accept_len") if last else None,
             "accept_rate": last.get("accept_rate") if last else None,
             "full_use": last.get("full_use") if last else None,
