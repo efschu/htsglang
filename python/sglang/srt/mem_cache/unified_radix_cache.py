@@ -5140,6 +5140,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if device_indices is None:
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
+        # SF-X (rc12q weg2-4-37): the load spent the local-PP floor; charge it,
+        # so the SAME pass's extend trigger evicts what it needs.
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        _sf.note_loaded(self, len(device_indices))
 
         # Commit: each component gets only its own transfers
         kv_xfer.device_indices = device_indices

@@ -9060,6 +9060,8 @@ class Scheduler(
             from sglang.srt.weg2 import pp_slot_fidelity as _sf
 
             _sf.mark_floor_scope(getattr(self, "tree_cache", None), _sf.pp_size_of(self) > 1)
+            if _sf.pp_size_of(self) > 1:
+                _sf.ensure_relief_provider(self)  # SF-X: the rank-local extend net
             self._publish_uniform_host_floor(None)
             self._publish_uniform_mamba_floor(None)
             # #791b: one rank -- nothing to diverge from, ballot off, the
