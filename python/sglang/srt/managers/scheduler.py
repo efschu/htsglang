@@ -12727,11 +12727,20 @@ class Scheduler(
             return None
         return len(req.prefix_indices) + int(getattr(req, "host_hit_length", 0) or 0)
 
-    def _weg2_vision_d_verdict(self, req: Req, head_inputs=None) -> str:
+    def _weg2_vision_d_verdict(self, req: Req, head_inputs=None, batch_empty: bool = True) -> str:
         """WEG2 VISION (D side): admit / defer / refuse one request. A rid
         the group has no covered length for is DEFERRED -- never admitted on
         this rank's own number (an admitted image position is a dead group)
-        and never refused on it."""
+        and never refused on it.
+
+        W123 (V2 dfce479f08, weg2-2-14): the covered prefix is the page
+        anchor (1024), but an image ending in the partial last page
+        (4..1027) is covered by P's adopted TAIL, which the admission takes
+        only AFTER this verdict. The group-agreed tail is read here (not
+        taken) and the image is admitted when it ends before the first
+        position the target computes; ``req._weg2_vision_need`` hands that
+        bound to the admission, which re-checks it after ``plan_adopt``."""
+        from sglang.srt.weg2 import tail_adopt as _ta
         from sglang.srt.weg2 import vision_d_guard as _vdg
 
         if not _vdg.image_spans(req):
@@ -12739,8 +12748,18 @@ class Scheduler(
         defers = getattr(self, "_weg2_vision_d_defers", None)
         if defers is None:
             defers = self._weg2_vision_d_defers = {}
+        if getattr(req, "_weg2_vision_tail_lost", False):
+            # the admission found the tail no longer takeable (belt below)
+            return _vdg.bounded(_vdg.REFUSE, str(req.rid), defers)
+        req._weg2_vision_need = _vdg.image_end(req)
+        covered = self._weg2_vision_d_covered(req, head_inputs)
+        # the admission's plan_adopt reads the prefix AFTER the load-back,
+        # i.e. the covered length -- peek with the same number
+        tail_start, tail_wait = (None, False) if covered is None else _ta.peek_target_start(
+            req, int(covered), batch_empty=batch_empty
+        )
         return _vdg.bounded(
-            _vdg.verdict(req, self._weg2_vision_d_covered(req, head_inputs)),
+            _vdg.verdict(req, covered, tail_start=tail_start, tail_wait=tail_wait),
             str(req.rid),
             defers,
         )
@@ -15367,7 +15386,9 @@ class Scheduler(
             # WEG2 VISION (D side): priced like W31 -- the GROUP's match, no
             # new collective -- so the verdict is the same on every rank.
             if getattr(self, "_weg2_vision_d_guard", False):
-                _vd = self._weg2_vision_d_verdict(req, _head_inputs)
+                _vd = self._weg2_vision_d_verdict(
+                    req, _head_inputs, batch_empty=not adder.can_run_list
+                )
                 if _vd == "defer":
                     _note_skip("weg2_vision_defer", req.rid)
                     continue

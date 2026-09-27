@@ -790,6 +790,36 @@ def plan_adopt(req, prefix_len: int, batch_empty: bool = True) -> Optional[Agree
     return entry
 
 
+def peek_target_start(req, prefix_len: int, batch_empty: bool = True) -> Tuple[Optional[int], bool]:
+    """``plan_adopt``'s answer WITHOUT taking it (no pop, no log, no payload
+    drop): (first position the TARGET forward computes if the admission runs
+    now, whether an empty batch would take more). The first is ``n_tokens``
+    under the E2 skip (no target forward), ``c`` under E1, None when the tail
+    is not taken (the extend starts at the page anchor). Every input is
+    rank-uniform, exactly as in ``plan_adopt``.
+
+    W123 (V2 dfce479f08, weg2-2-14, 1055 tokens, image 4..1027): the D vision
+    guard priced the covered prefix at the page anchor (1024) BEFORE the
+    admission consulted the adopted tail [1024, 1055), and refused an image
+    the tail would have covered."""
+    if not adopt_enabled():
+        return None, False
+    entry = _AGREED.get(str(req.rid))
+    if entry is None or not entry.agreed:
+        return None, False
+    if uniform_refusal(entry.staged.spec, req.origin_input_ids, len(req.full_untruncated_fill_ids),
+                       req.extra_key, prefix_len):
+        return None, False
+    spec = entry.staged.spec
+    if entry.skip:
+        why = skip_refusal(entry, req, batch_empty)
+        if not why:
+            return spec.n_tokens, False
+        wait = why == "batch_not_empty"
+        return (spec.cut if entry.staged.e1 else None), wait
+    return spec.cut, False
+
+
 def commit_adopt(req, entry: Agreed, tree_cache, page_size: int) -> int:
     """Admission commit (the request is going into this batch): one page,
     the prefix grows by its first ``rows`` slots, the holding rank queues the
