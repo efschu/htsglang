@@ -10650,16 +10650,30 @@ def d_scratch_cap(fits, scratch: Sequence[int]) -> Tuple[List[int], List[str]]:
     return out, lines
 
 
-def d_extend_trim_env(ledger, fits) -> str:
+def d_extend_growth_record(profile: Optional[str] = None) -> Tuple[Optional[List[Optional[float]]], str]:
+    """rc12f: ``D_EXTEND_GROWTH_MIB`` of the profile (what one D extend adds
+    to torch reserved, measured), or ``(None, "")``."""
+    try:
+        vals = list(_pconst("D_EXTEND_GROWTH_MIB", profile))
+    except KeyError:
+        return None, ""
+    return [None if v is None else float(v) for v in vals], _pconst_boots("D_EXTEND_GROWTH_MIB", profile)
+
+
+def d_extend_trim_env(ledger, fits, growth_mib: Optional[Sequence[Optional[float]]] = None) -> str:
     """rc12e: ``SGLANG_WEG2_EXTEND_TRIM_MIB`` from the card ledger's floor and
-    the solved form's booked activation, per rank; '' when a rank is missing."""
+    the solved form's booked activation, per rank; '' when a rank is missing.
+    rc12f: with ``growth_mib`` (``D_EXTEND_GROWTH_MIB``) the extend's measured
+    reserved growth replaces the activation where it is larger."""
     from sglang.srt.weg2 import extend_trim as _et
 
     act = {int(f.rank): float(f.activation_mib) for f in fits}
     n = len(ledger.floor_mib)
     if any(r not in act for r in range(n)):
         return ""
-    return _et.launcher_thresholds(ledger.floor_mib, [act[r] for r in range(n)])
+    if growth_mib is not None and len(growth_mib) != n:
+        growth_mib = None
+    return _et.launcher_thresholds(ledger.floor_mib, [act[r] for r in range(n)], growth_mib)
 
 
 def set_group_env(spec: str, key: str, value: str) -> str:
@@ -14994,13 +15008,16 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     if _ledger is not None and plan.fits:
         # rc12e: D's extend trims the allocator cache when the card holds
         # less than floor + booked activation (WEG2-EXTEND-CACHE-TRIM).
-        _trim = d_extend_trim_env(_ledger, plan.fits)
+        _growth, _growth_src = d_extend_growth_record(ns.profile)
+        _trim = d_extend_trim_env(_ledger, plan.fits, _growth)
         if _trim:
             ns.env_d = set_group_env(getattr(ns, "env_d", "") or "",
                                      "SGLANG_WEG2_EXTEND_TRIM_MIB", _trim)
+            _gtext = (f"floor + max(gebuchte Aktivierung, gemessener Extend-Zuwachs "
+                      f"D_EXTEND_GROWTH_MIB {_growth} aus {_growth_src}) je Rang"
+                      if _growth is not None else "floor + gebuchte Aktivierung je Rang")
             log(f"{D_RANK_SOLVE_MARKER} {label} EXTEND-TRIM SGLANG_WEG2_EXTEND_TRIM_MIB={_trim} "
-                f"(floor + gebuchte Aktivierung je Rang; darunter leert D vor dem Extend "
-                f"den Allokator-Cache)")
+                f"({_gtext}; darunter leert D vor dem Extend den Allokator-Cache)")
     log_wake_credit_solve(ns, cards, plan.fits, log, label,
                           p_split=p_split, chunk_layers=chunk_layers)
 

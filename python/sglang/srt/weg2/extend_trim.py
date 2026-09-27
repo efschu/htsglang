@@ -145,6 +145,31 @@ def before_extend(worker, batch) -> Optional[str]:
         return None
 
 
-def launcher_thresholds(floor_mib: Sequence[float], activation_mib: Sequence[float]) -> str:
-    """The env value the launcher writes: floor + booked activation per rank."""
-    return ",".join(str(int(round(float(f) + float(a)))) for f, a in zip(floor_mib, activation_mib))
+def launcher_thresholds(floor_mib: Sequence[float], activation_mib: Sequence[float],
+                        growth_mib: Optional[Sequence[Optional[float]]] = None) -> str:
+    """The env value the launcher writes: floor + booked activation per rank --
+    rc12f: floor + max(activation, measured extend growth) where the profile
+    measured the growth (``D_EXTEND_GROWTH_MIB``)."""
+    g = list(growth_mib) if growth_mib is not None else [None] * len(floor_mib)
+    return ",".join(
+        str(int(round(float(f) + max(float(a), float(x) if x is not None else 0.0))))
+        for f, a, x in zip(floor_mib, activation_mib, g)
+    )
+
+
+#: rc12f: only extends of at least this many rows price the growth record.
+GROWTH_MIN_ROWS = 512
+
+
+def extend_growth_mib(windows) -> Optional[int]:
+    """rc12f: the ``D_EXTEND_GROWTH_MIB`` measurement -- max over extend
+    windows ``(rows, transient_mib, reserved_start_mib, peak_reserved_mib)``
+    with ``rows >= GROWTH_MIN_ROWS`` of ``peak_reserved - reserved_start``.
+    A pure function of the windows: no threshold enters it (no ratchet)."""
+    best = None
+    for rows, transient, start, peak in windows:
+        if int(rows) < GROWTH_MIN_ROWS or int(transient) <= 0:
+            continue
+        g = int(peak) - int(start)
+        best = g if best is None else max(best, g)
+    return best

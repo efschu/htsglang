@@ -86,6 +86,24 @@
    "kind": "memory",
    "power_limit_w": null,
    "power_limit_source": "not a power-dependent quantity (bytes one extend adds)"
+  },
+  {
+   "name": "D_EXTEND_GROWTH_MIB",
+   "value": [
+    2304,
+    null,
+    null
+   ],
+   "provenance": "rc12f: what ONE D extend window adds to torch reserved on D-TP0 = peak_reserved of the window that holds the extend's peak minus reserved at the window's start (WEG2-VRAM-PEAK), max over the extends with >= 512 rows (weg2/extend_trim.extend_growth_mib): rc12e (f078f89a08) 03:39:12 rows=4096 transient 920 -> +2304 (card_free 2371 -> 67), 03:41:23 +2272, 03:33:37 +2026 (retry); rc12d (227ae1becd) 02:37:45 +1974, 02:41:14 +1852 (retry); rc12c/rc12b below. The allocator lays new segments on top of a cache it cannot reuse: growth/transient 2.0-2.5 on the 4096-row extends, so the booked activation (1104) under-prices the extend's card cost. Measured against the window start, never against the trim threshold: a trim empties the cache and the growth that follows is the extend's real segment demand, bounded -- no ratchet. The trim threshold is floor + max(activation, this). 3080 ranks: not measured (null: floor + activation stays).",
+   "boots": [
+    "dkrnfh91bar1dauer09270311",
+    "dkrnfh91bar1dauer09270212",
+    "dkrnfh91bar1dauer09270103",
+    "dkrnfh91bar1dauer09270007"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not a power-dependent quantity (bytes one extend adds)"
   }
  ],
  "borrow": {
