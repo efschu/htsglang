@@ -235,6 +235,7 @@ from sglang.srt.weg2 import p_trim_end_anchor as _weg2_trim
 from sglang.srt.weg2 import fork_anchor as _weg2_fork
 from sglang.srt.weg2 import d_park_read as _weg2_park_read  # PARK-RETAIN READ
 from sglang.srt.weg2 import resume_via_p as _weg2_rvp  # RESUME-VIA-P
+from sglang.srt.weg2 import progress_beacon as _weg2_beacon  # FP forward-progress beacon
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
 from sglang.srt.managers import uniform_floor_scope
@@ -17031,6 +17032,9 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        # FP (weg2/progress_beacon.py): the front's /health reads this rank's
+        # forward progress off a 32-byte mmap -- a busy group is not a dead one.
+        _weg2_beacon.beat_start(self.forward_ct)
         self._weg2_d_seat_guard(batch)  # H95c W-SEAT: never wider than the phase's n
 
         # #861 fix (b): a request admitted on a cached prefix whose DRAFT rows
@@ -17651,6 +17655,7 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        _weg2_beacon.beat_done(getattr(self, "forward_ct", 0))
 
         # #485 transient census: one strided, read-only driver query, labelled
         # with the load state that produced it. On every default boot this is
