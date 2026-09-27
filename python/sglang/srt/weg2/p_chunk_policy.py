@@ -74,7 +74,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from functools import lru_cache
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 #: The one flag value set (identical on both lines).
 POLICY_FIXED = "fixed"
@@ -599,6 +599,9 @@ class ChunkPlanner:
         self._max_keys = int(max_keys)
         self._sweep_seen: Dict[object, int] = {}
         self._sweep_next = 0
+        #: Fix A instrument: True while the current call sizes a QUEUED head
+        #: (not the in-flight chunked request); its replans are always logged.
+        self.queued_call = False
 
     def _make(self, key, pos: int, end: int, ramps: bool) -> Dict[int, int]:
         res = plan_detail(end - pos, len(self.spec.stages), self.spec.stages, self.spec.limits,
@@ -615,7 +618,8 @@ class ChunkPlanner:
             self.on_plan(key, res, pos, end, not ramps)
         return steps
 
-    def next_width(self, key, pos: int, end: int) -> int:
+    def next_width(self, key, pos: int, end: int, queued: bool = False) -> int:
+        self.queued_call = bool(queued)
         pos, end = int(pos), int(end)
         if end <= pos:
             return 0
@@ -648,7 +652,7 @@ class ChunkPlanner:
         self._sweep_seen.pop(key, None)
 
 
-def forward_budget(planner: ChunkPlanner, key, pos: int, end: int) -> int:
+def forward_budget(planner: ChunkPlanner, key, pos: int, end: int, queued: bool = False) -> int:
     """The forward's token budget for the request ``key`` at ``pos`` of ``end``.
 
     The planned width -- except when that width FINISHES the request: then
@@ -657,7 +661,7 @@ def forward_budget(planner: ChunkPlanner, key, pos: int, end: int) -> int:
     the fixed policy (a plan never shrinks the forward below fixed just
     because its head request is short). 0 when nothing is left.
     """
-    w = planner.next_width(key, pos, end)
+    w = planner.next_width(key, pos, end, queued=queued) if queued else planner.next_width(key, pos, end)
     if w and w >= end - pos:
         w = max(w, planner.spec.limits.fixed_tokens)
     return int(w)
@@ -690,6 +694,7 @@ def planner_from_env(env: Dict[str, str], log: Optional[Callable[[str], None]] =
     if spec is None:
         return None
     counts = {"plans": 0, "replans": 0}
+    holder: Dict[str, Any] = {}
 
     def _on_plan(key, res: PlanResult, pos: int, end: int, replan: bool = False) -> None:
         if log is None:
@@ -697,16 +702,23 @@ def planner_from_env(env: Dict[str, str], log: Optional[Callable[[str], None]] =
         if replan:
             counts["replans"] += 1
             n = counts["replans"]
-            if n > 16 and n % 64:
+            # Fix A instrument (27.09.): a replan for a QUEUED head is always
+            # logged -- the P group death 08:14:59Z sat behind the rate limit
+            # (replans > 16 were silent since 07:46 on every rank).
+            queued = bool(getattr(holder.get("planner"), "queued_call", False))
+            if n > 16 and n % 64 and not queued:
                 return
-            log(plan_line(res, key=key, start=pos, end=end) + f" replan=1 replans={n}")
+            log(plan_line(res, key=key, start=pos, end=end) + f" replan=1 replans={n}"
+                + (" queued=1" if queued else ""))
             return
         counts["plans"] += 1
         log(plan_line(res, key=key, start=pos, end=end))
 
     if log is not None:
         log(armed_line(spec))
-    return ChunkPlanner(spec, on_plan=_on_plan)
+    planner = ChunkPlanner(spec, on_plan=_on_plan)
+    holder["planner"] = planner
+    return planner
 
 
 def format_plan(res: PlanResult, max_items: int = 12) -> str:

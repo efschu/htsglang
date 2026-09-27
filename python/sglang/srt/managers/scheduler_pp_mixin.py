@@ -1317,7 +1317,9 @@ def _999_geom(scheduler, mb_id: int):
         er = getattr(r, "extend_range", None) if r is not None else None
         if er is None:
             return (-1, -1, -1)
-        return (str(r.rid)[:8], int(er.start), int(er.end))
+        # 27.09. (P group death 08:14:59Z): 12 characters -- with 8 ('weg2-50-')
+        # two different requests of one front epoch printed as the same rid.
+        return (str(r.rid)[:12], int(er.start), int(er.end))
     except Exception:  # noqa: BLE001
         return (-1, -1, -1)
 

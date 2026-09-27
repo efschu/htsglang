@@ -11420,20 +11420,18 @@ class Scheduler(
         """--p-layer-split dynamic, PP0: this forward's width from the joint
         chunk+cut plan (``LeaderCursor.next_width``), for the same request
         ``_p_chunk_policy_width`` would size. 0 on any failure (static path)."""
-        req = self.chunked_req
-        if req is None:
-            queue = getattr(self, "waiting_queue", None) or []
-            if not queue:
-                return 0
-            req = queue[0]
+        # Fix A (27.09., P group death 08:14:59Z): the position is rank-identical
+        # -- chunked request: its prefix; queued head: its published told or 0,
+        # never its local registration match (weg2/p_budget_head.py).
+        from sglang.srt.weg2 import p_budget_head as _pbh
+
         try:
-            fill = getattr(req, "full_untruncated_fill_ids", None)
-            end = len(fill) if fill is not None and len(fill) else (
-                len(req.origin_input_ids) + len(getattr(req, "output_ids", ()) or ())
-            )
-            prefix = getattr(req, "prefix_indices", None)
-            pos = 0 if prefix is None else len(prefix)
+            head = _pbh.budget_head(self)
+            if head is None:
+                return 0
+            req, pos, end = head.req, head.pos, head.end
             width = rt.leader_width(req.rid, pos, end)
+            _pbh.note_new_head(self, head, width, "layer_split")
         except Exception as exc:  # noqa: BLE001 - a plan must never stop a pass
             n = getattr(self, "_p_layer_split_errors", 0) + 1
             self._p_layer_split_errors = n
@@ -11457,21 +11455,19 @@ class Scheduler(
         policy IS the plan's ceiling (the launcher prices the corridor at it).
         Any failure returns 0: the caller then takes the static path.
         """
+        from sglang.srt.weg2 import p_budget_head as _pbh
         from sglang.srt.weg2.p_chunk_policy import forward_budget
 
         queue = getattr(self, "waiting_queue", None) or []
-        req = self.chunked_req
-        if req is None:
-            if not queue:
-                return 0
-            req = queue[0]
         try:
-            fill = getattr(req, "full_untruncated_fill_ids", None)
-            end = len(fill) if fill is not None and len(fill) else (
-                len(req.origin_input_ids) + len(getattr(req, "output_ids", ()) or ())
-            )
-            prefix = getattr(req, "prefix_indices", None)
-            pos = 0 if prefix is None else len(prefix)
+            # Fix A (27.09., P group death 08:14:59Z): rank-identical position --
+            # chunked request: its prefix; queued head: its published told or 0
+            # (weg2/p_budget_head.py). The pre-fix len(prefix_indices) of a queued
+            # head was rank-local (a TW twin's registration match lives on PP0 only).
+            head = _pbh.budget_head(self)
+            if head is None:
+                return 0
+            req, pos, end = head.req, head.pos, head.end
             if getattr(self, "_p_chunk_stream", False):
                 # H92 (NF): plan the stream -- the head's rest plus every
                 # waiting request's rest -- and take its first width as this
@@ -11479,7 +11475,9 @@ class Scheduler(
                 from sglang.srt.weg2.p_chunk_nf import stream_end
 
                 end = stream_end(pos, end, (r for r in queue if r is not req))
-            width = forward_budget(self._p_chunk_planner, req.rid, pos, end)
+            width = forward_budget(self._p_chunk_planner, req.rid, pos, end,
+                                   queued=head.src != "chunked")
+            _pbh.note_new_head(self, head, width, "chunk_policy")
         except Exception as exc:  # noqa: BLE001 - a plan must never stop a pass
             n = getattr(self, "_p_chunk_policy_errors", 0) + 1
             self._p_chunk_policy_errors = n
