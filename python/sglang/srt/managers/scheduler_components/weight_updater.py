@@ -9183,6 +9183,14 @@ class SchedulerWeightUpdaterManager:
 
         if replay is not None:
             return replay
+        # KRIT3 (weg2/resume_via_p.py): a resume is a wake -- P ran in between;
+        # RESUME-VIA-P counts its attempts per wake, not per refusal.
+        try:
+            from sglang.srt.weg2 import resume_via_p as _weg2_rvp_wake
+
+            _weg2_rvp_wake.note_wake(getattr(self, "scheduler", None))
+        except Exception:  # noqa: BLE001 -- an instrument, never the wake
+            pass
         # H95: the P->D wake's kv_cache resume carries handoff_n/parked_n
         # (front rule 2); D's phase seat count follows from it on every rank.
         _phase_seats = None

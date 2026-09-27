@@ -46,11 +46,59 @@ logger = logging.getLogger(__name__)
 
 ENV = "SGLANG_WEG2_RESUME_VIA_P"
 SUBDIR = "needs-p"
-#: the n-th refusal of one rid that still falls back to the abort (a loop
-#: through P that never lands must end by name, not spin).
-MAX_ATTEMPTS = 3
+#: the number of P legs one rid may get (a loop through P that never lands
+#: must end by name, not spin).
+#:
+#: KRIT3 (NF rc12s 17:33-17:35, weg2-3-16 / weg2-3-18): the bound counted
+#: REFUSALS, and a parked request is re-offered to the X gate on every awake
+#: pass (park_tick's awake re-queue) -- weg2-3-16 was refused at 17:33:33 (n=1)
+#: and 17:33:36 (n=2) in the SAME D phase, before any P leg ran (the front
+#: dropped the second needs-p: one path per rid), then once after its one P
+#: leg (17:35:47, n=3) and once more in that same pass: exhausted, in-band W50,
+#: an answerless 200. Now an attempt is a P LEG: a refusal in the same D wake
+#: as the previous one is the same hold (no new attempt, still held), and the
+#: bound is 2 -- the first P leg, then EXACTLY ONE more sequential P leg
+#: (attempt=2); a refusal after the second leg ends by name.
+MAX_ATTEMPTS = 2
 ATTEMPTS_ATTR = "_weg2_rvp_n"
 SINCE_ATTR = "_weg2_rvp_since"
+#: the D wake (see :func:`note_wake`) in which this rid's last attempt began.
+WAKE_ATTR = "_weg2_rvp_wake"
+#: scheduler attribute: D's wake count (every rank, the same resume requests).
+SCHED_WAKE_ATTR = "_weg2_rvp_wake_n"
+ENV_WAKE_ATTEMPTS = "SGLANG_WEG2_RVP_ATTEMPT_PER_WAKE"
+
+
+def wake_attempts_enabled(env=None) -> bool:
+    """KRIT3: ``SGLANG_WEG2_RVP_ATTEMPT_PER_WAKE`` (default on; 0 = every
+    refusal is an attempt, bound 3, as before)."""
+    e = os.environ if env is None else env
+    raw = (e.get(ENV_WAKE_ATTEMPTS, "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def max_attempts(env=None) -> int:
+    return MAX_ATTEMPTS if wake_attempts_enabled(env) else 3
+
+
+def note_wake(sched) -> None:
+    """KRIT3: a resume of D's memory is a wake -- P ran in between. Called on
+    every rank from the same resume request (replicated, no collective)."""
+    if sched is None:
+        return
+    try:
+        setattr(sched, SCHED_WAKE_ATTR, int(getattr(sched, SCHED_WAKE_ATTR, 0) or 0) + 1)
+    except Exception:  # noqa: BLE001 -- a partial scheduler keeps the old count
+        pass
+
+
+def _same_hold(sched, req) -> bool:
+    """KRIT3: this refusal falls in the same D wake as ``req``'s last attempt
+    (no P leg can have run for it in between)."""
+    if sched is None or not wake_attempts_enabled():
+        return False
+    last = getattr(req, WAKE_ATTR, None)
+    return last is not None and last == int(getattr(sched, SCHED_WAKE_ATTR, 0) or 0)
 
 
 def enabled(env=None) -> bool:
@@ -90,7 +138,7 @@ def open_stream_enabled(env=None) -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
-def eligible(req, env=None) -> bool:
+def eligible(req, env=None, sched=None) -> bool:
     """A refusal D may turn into RESUME-VIA-P: switch on, group D, a streamed
     request, under the attempt bound. With ROS off only a request that has
     generated tokens (the old rule); with ROS on every streamed request -- the
@@ -115,7 +163,9 @@ def eligible(req, env=None) -> bool:
                 return False
         except TypeError:
             return False
-    return int(getattr(req, ATTEMPTS_ATTR, 0) or 0) < MAX_ATTEMPTS
+    if _same_hold(sched, req):
+        return True  # KRIT3: the same hold -- the front already has its P leg
+    return int(getattr(req, ATTEMPTS_ATTR, 0) or 0) < max_attempts(e)
 
 
 def held_refusal_body(rec: dict) -> bytes:
@@ -135,7 +185,7 @@ def context_ids(req) -> List[int]:
 
 
 def write_request(rid: str, ids: Iterable[int], d_extent: int, x: int, reason: str,
-                  directory: Optional[str] = None) -> str:
+                  directory: Optional[str] = None, attempt: int = 1) -> str:
     """Atomically publish one needs-P request; returns the path ('' = not written)."""
     d = directory if directory is not None else needs_p_dir()
     if not d or not rid:
@@ -146,7 +196,7 @@ def write_request(rid: str, ids: Iterable[int], d_extent: int, x: int, reason: s
         tmp = f"{p}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
             json.dump({"rid": rid, "input_ids": list(ids), "d_extent": int(d_extent), "x": int(x),
-                       "reason": reason, "t": time.time()}, f)
+                       "reason": reason, "attempt": int(attempt), "t": time.time()}, f)
         os.replace(tmp, p)
         return p
     except Exception:  # noqa: BLE001 - an unwritten request falls back to the abort
@@ -187,8 +237,10 @@ def keep_on_d(sched, req, d_extent: int, x: int) -> bool:
     keeps the request either way."""
     from sglang.srt.weg2 import d_park_read, d_park_runtime, d_seats
 
-    n = int(getattr(req, ATTEMPTS_ATTR, 0) or 0) + 1
+    same = _same_hold(sched, req)
+    n = int(getattr(req, ATTEMPTS_ATTR, 0) or 0) + (0 if same else 1)
     setattr(req, ATTEMPTS_ATTR, n)
+    setattr(req, WAKE_ATTR, int(getattr(sched, SCHED_WAKE_ATTR, 0) or 0))
     setattr(req, SINCE_ATTR, time.monotonic())
     # the read after P is the WHOLE context: the park's retained-span cap and
     # the previous read's stamp describe a cycle that is over
@@ -202,15 +254,17 @@ def keep_on_d(sched, req, d_extent: int, x: int) -> bool:
     # the Scheduler keeps its rank on ``ps`` (``self.tp_rank`` does not exist
     # there -- scheduler.py's own notes at the #10516/#18042 sites)
     rank0 = int(getattr(getattr(sched, "ps", None), "tp_rank", 0) or 0) == 0
-    ok = bool(write_request(str(req.rid), context_ids(req), d_extent, x, "x_refusal_midstream")) if rank0 else True
+    ok = bool(write_request(str(req.rid), context_ids(req), d_extent, x, "x_refusal_midstream",
+                            attempt=n)) if rank0 else True
     d_seats.mark_parked(req, d_seats.SITE_FLIP, epoch=None, now=time.monotonic())
     parked = d_park_runtime.parked_list(sched)
     if not any(p is req for p in parked):
         parked.append(req)
     logger.warning(
         "WEG2 W50-REROUTE rid=%s d_extent=%d X=%d reason=x_refusal_midstream path=midstream n=%d "
-        "written=%s -- D keeps the stream open and parks the request; P prefills its %d-token "
-        "context, D resumes after the flip back (no abort, no bytes to the client)",
-        str(req.rid)[:24], int(d_extent), int(x), n, ok if rank0 else "rank>0",
-        len(context_ids(req)))
+        "attempt=%d/%d hold=%s written=%s -- D keeps the stream open and parks the request; P "
+        "prefills its %d-token context, D resumes after the flip back (no abort, no bytes to the "
+        "client)",
+        str(req.rid)[:24], int(d_extent), int(x), n, n, max_attempts(),
+        "same" if same else "new", ok if rank0 else "rank>0", len(context_ids(req)))
     return ok

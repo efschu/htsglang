@@ -12684,7 +12684,7 @@ class Scheduler(
             # generated tokens is not aborted -- its client holds text, the
             # front cannot re-route it. D keeps it parked, P prefills its
             # context, D continues the same stream after the flip back.
-            if _weg2_rvp.eligible(req):
+            if _weg2_rvp.eligible(req, sched=self):  # KRIT3: attempts per D wake
                 _tc = getattr(self, "tree_cache", None)
                 if _tc is not None:
                     release_admission_acquired_mamba_slot(req, _tc, site="weg2_x_refusal_rvp")
