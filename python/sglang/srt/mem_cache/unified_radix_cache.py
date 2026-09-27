@@ -163,6 +163,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     get_eviction_strategy,
+    get_hash_str,
     split_node_hash_value,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -4855,7 +4856,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node, CacheTransferPhase.LOAD_BACK
         )[0]
         try:
-            self._1424_verify_load_chain(kv_xfer)
+            self._1424_verify_load_chain(kv_xfer, req=req)
         except BaseException:
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             raise
@@ -5050,11 +5051,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         return True
 
-    def _1424_verify_load_chain(self, kv_xfer) -> None:
-        """#1424: a paged-arena load-back chain whose rows are not whole
-        consecutive pages is proven page by page against the arena (and
-        re-pointed to its keys' slots) before it is queued
-        (pool_host/arena_pool.verify_load_chain); unpaged pools and the
+    def _1424_verify_load_chain(self, kv_xfer, req=None) -> None:
+        """#1424: a paged-arena load-back chain is proven against its TOKENS
+        before it is queued (pool_host/arena_pool.verify_load_chain): a chain
+        that is not whole distinct pages, or that carries one of P's hand-off
+        keys at another depth, is re-keyed page by page to the key its tokens
+        have -- P's hand-off key of that depth (the request's chain, indexed
+        from token 0) or D's own key chained from the proven page before it --
+        and re-pointed to that key's COMPLETE slot. Unpaged pools and the
         staging path are untouched."""
         cc = self.cache_controller
         group = getattr(cc, "mem_pool_host", None)
@@ -5065,13 +5069,39 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
         from sglang.srt.managers.cache_controller import weg2_suffixed_stems
         from sglang.srt.mem_cache.pool_host import arena_pool as _ap
+        from sglang.srt.weg2.handoff_keys import CHAIN_ATTR
+
+        nodes = list(kv_xfer.nodes_to_load or ())
+        page0 = prior0 = None
+        P = int(getattr(self, "page_size", 0) or 0)
+        root = getattr(self, "root_node", None)
+        if nodes and P > 1 and hasattr(nodes[0], "parent") and root is not None:
+            parent = nodes[0].parent
+            depth, x = 0, parent
+            while x is not None and x is not root:
+                depth += len(x.key)
+                x = x.parent
+            if x is root and depth % P == 0:
+                page0 = depth // P
+                if parent is not None and len(parent.key) > 0:
+                    prior0 = parent.get_last_hash_value()
+
+        def _own(node, i, prior):
+            try:
+                return get_hash_str(node.key[i * P:(i + 1) * P], prior, page_size=P)[0]
+            except Exception:  # noqa: BLE001 -- no own key = P's key alone proves the page
+                return None
 
         kv_xfer.host_indices = _ap.verify_load_chain(
             pool,
-            kv_xfer.nodes_to_load or (),
+            nodes,
             kv_xfer.host_indices,
             rows_of=lambda n: n.component_data[BASE_COMPONENT_TYPE].host_value,
             stems_of=lambda h: weg2_suffixed_stems(cc.storage_backend, h),
+            own_hash=_own if page0 is not None else None,
+            p_chain=getattr(req, CHAIN_ATTR, None) if req is not None else None,
+            page0=page0,
+            prior0=prior0,
         )
 
     def _build_sidecar_transfers(
