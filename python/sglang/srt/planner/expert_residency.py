@@ -59,7 +59,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import msgspec
 
@@ -649,6 +649,97 @@ def kv_token_cut_cells(
         fixed = float(reference.kv_cell_bytes[r]) - (float(dcp_cell_bytes) if r == host else 0.0)
         cells.append(fixed + float(shares[r]) / total * float(dcp_cell_bytes))
     return tuple(cells)
+
+
+#: #239: the resolution of the planner's token cut -- shares are whole
+#: sixty-fourths (the page grid of the NF D group is 64 tokens, and a finer
+#: vector would promise a split the owner stripes cannot realise).
+KV_TOKEN_SHARE_GRID = 64
+#: #239: ``--d-kv-token-cut maxmin`` -- the planner solves the shares itself.
+KV_TOKEN_CUT_MAXMIN = "maxmin"
+
+
+def fa_kv_token_cell_bytes(text_cfg: Mapping[str, object], kv_dtype_bytes: int) -> int:
+    """#239: bytes per token of the FULL-ATTENTION KV -- the part of a Form A
+    host cell the token cut moves (K+V of every full-attention layer).
+
+    From the checkpoint, not a hand value: the full-attention layers of
+    ``layer_types`` (else every ``full_attention_interval``-th layer), times
+    K+V, times ``num_key_value_heads x head_dim``, times the KV dtype. NF:
+    12 x 2 x 2 x 256 x 1 (fp8) = 12288, the 1.50 + 1.50 GB the rc12r TP0 log
+    names for 262144 tokens. Refused when the geometry is not there.
+    """
+    kinds = list(text_cfg.get("layer_types") or ())
+    if kinds:
+        n_fa = sum(1 for k in kinds if k == "full_attention")
+    else:
+        interval = int(text_cfg.get("full_attention_interval") or 0)
+        layers = int(text_cfg.get("num_hidden_layers") or 0)
+        n_fa = layers // interval if interval > 0 else 0
+    kv_heads = int(text_cfg.get("num_key_value_heads") or 0)
+    head_dim = int(text_cfg.get("head_dim") or 0)
+    if n_fa <= 0 or kv_heads <= 0 or head_dim <= 0 or int(kv_dtype_bytes) <= 0:
+        raise ValueError(
+            "fa_kv_token_cell_bytes: no full-attention KV geometry in the config "
+            "(full-attention layers %d, kv heads %d, head_dim %d, dtype %d B)"
+            % (n_fa, kv_heads, head_dim, int(kv_dtype_bytes))
+        )
+    return n_fa * 2 * kv_heads * head_dim * int(kv_dtype_bytes)
+
+
+def _relative_ceiling(fit: "DRankResidency") -> float:
+    return float(fit.ceiling_max_rows) / float(max(1, fit.buffer_rows))
+
+
+def solve_kv_token_shares(
+    solve: Callable[[Sequence[int]], Sequence["DRankResidency"]],
+    n_ranks: int,
+    grid: int = KV_TOKEN_SHARE_GRID,
+) -> Tuple[Tuple[int, ...], float]:
+    """#239: the token cut the planner chooses -- MAX-MIN of the relative row
+    ceiling (ceiling / the buffer rows the rank's fraction asks for), in whole
+    ``1/grid`` shares; the regeln kein-bindender-rang (no rank is the fixed
+    one) and d-kv-gesamtpool (the shares cover the whole context once).
+
+    ``solve(shares)`` is the D solve for one share vector. A rank's ceiling
+    depends on its OWN share only (its KV is ``tokens x cell(share)``), so each
+    rank is priced once per grid step (``k`` for the rank, ``grid - k`` parked
+    on a neighbour, read back only for the rank itself). The shares are then
+    handed out one sixty-fourth at a time to the rank that stays highest after
+    taking it (ties: the lower rank). With every score non-increasing in its
+    own share this reaches the max-min optimum -- a unit that would drop a rank
+    below the optimum is only handed out when every rank already holds all it
+    can at the optimum, and those hold at least ``grid`` -- and it spreads the
+    slack instead of parking it on one card. Returns ``(shares, min score)``.
+    """
+    n, g = int(n_ranks), int(grid)
+    if n < 1 or g < 1:
+        raise ValueError("solve_kv_token_shares: %d ranks, grid %d" % (n, g))
+    score: List[List[float]] = []
+    for r in range(n):
+        row = []
+        for k in range(g + 1):
+            vec = [0] * n
+            vec[r] = k
+            if k < g:
+                vec[(r + 1) % n] += g - k
+            if n == 1:
+                vec = [g]
+            row.append(_relative_ceiling(solve(vec)[r]))
+        for k in range(g):
+            if row[k + 1] > row[k] + 1e-9:
+                raise ValueError(
+                    "solve_kv_token_shares: rank %d ceiling rises with its KV share "
+                    "(%d/%d -> %.3f, %d/%d -> %.3f) -- the solve is not monotone"
+                    % (r, k, g, row[k], k + 1, g, row[k + 1])
+                )
+        score.append(row)
+
+    take = [0] * n
+    for _ in range(g):
+        nxt = max(range(n), key=lambda r: (score[r][take[r] + 1], -r) if take[r] < g else (-1.0, -r))
+        take[nxt] += 1
+    return tuple(take), min(score[r][take[r]] for r in range(n))
 
 
 def solve_d_rank_residency(
@@ -2367,14 +2458,19 @@ def plan_d_residency(
     activation_record_mib: Optional[Sequence[Optional[float]]] = None,
     activation_record_source: str = "",
     derive_waves: bool = False,
-    kv_token_shares: Optional[Sequence[float]] = None,
+    kv_token_shares: object = None,
     kv_dcp_cell_bytes: int = 0,
+    kv_dtype_bytes: int = 0,
 ) -> DResidencyPlan:
     """Der D-FRACTION-SOLVE mit den Metallregeln, fuer ``launcher``.
 
     #239: ``kv_token_shares`` + ``kv_dcp_cell_bytes`` bucht den Token-Schnitt
     der Voll-Attention-KV ueber die D-Raenge (uneven DCP unter Form A, siehe
     :func:`kv_token_cut_cells`); ohne sie bleibt die Rechnung byte-gleich.
+    ``kv_token_shares == KV_TOKEN_CUT_MAXMIN`` (S2): der Planer waehlt die
+    Anteile selbst (:func:`solve_kv_token_shares`); ``kv_dcp_cell_bytes`` 0
+    heisst dann: aus der Config (:func:`fa_kv_token_cell_bytes` mit
+    ``kv_dtype_bytes``).
 
     rc12c: ``fixed_record_mib`` = der feste Rang-Posten aus dem Record des
     Profils (``D_FIXED_MIB``, gemessen auf der Form, die heute faehrt); ein
@@ -2572,23 +2668,45 @@ def plan_d_residency(
     vocab = draft_vocab_mib(
         vocab_size=int(text_cfg["vocab_size"]), hidden_size=int(text_cfg["hidden_size"])
     )
-    fits = solve_d_rank_residency(
-        budgets_mib=budgets_mib,
-        fractions=fractions,
-        ratios=ratios,
-        scratch_rows=scratch_rows,
-        staging_rows=staging,
-        num_experts=int(terms.num_experts),
-        pad_rows=1,
-        n_layers=int(terms.n_layers),
-        slot_bytes=slot_bytes,
-        reference=ref,
-        vocab_mib=vocab,
-        share_embed=share,
-        kv_tokens=int(kv_tokens),
-        kv_token_shares=kv_token_shares,
-        kv_dcp_cell_bytes=int(kv_dcp_cell_bytes),
-    )
+    cut_lines: Tuple[str, ...] = ()
+    if kv_token_shares is not None and int(kv_dcp_cell_bytes) <= 0:
+        kv_dcp_cell_bytes = fa_kv_token_cell_bytes(text_cfg, int(kv_dtype_bytes))
+
+    def _solve(shares):
+        return solve_d_rank_residency(
+            budgets_mib=budgets_mib,
+            fractions=fractions,
+            ratios=ratios,
+            scratch_rows=scratch_rows,
+            staging_rows=staging,
+            num_experts=int(terms.num_experts),
+            pad_rows=1,
+            n_layers=int(terms.n_layers),
+            slot_bytes=slot_bytes,
+            reference=ref,
+            vocab_mib=vocab,
+            share_embed=share,
+            kv_tokens=int(kv_tokens),
+            kv_token_shares=shares,
+            kv_dcp_cell_bytes=int(kv_dcp_cell_bytes),
+        )
+
+    if isinstance(kv_token_shares, str):
+        if kv_token_shares != KV_TOKEN_CUT_MAXMIN:
+            raise ValueError(
+                "plan_d_residency: KV token cut %r is neither %r nor a ratio vector"
+                % (kv_token_shares, KV_TOKEN_CUT_MAXMIN)
+            )
+        cut, low = solve_kv_token_shares(_solve, n)
+        cut_lines = (
+            "%s FRACTION-SOLVE %s KV-TOKEN-SCHNITT (#239 S2): Anteile %s/%d je Rang "
+            "(max-min der relativen Zeilen-Decke Decke/Puffer, kleinste %.3f; "
+            "Voll-Attention-KV %d B/Token, %d Token)"
+            % (marker, label, list(cut), KV_TOKEN_SHARE_GRID, low,
+               int(kv_dcp_cell_bytes), int(kv_tokens)),
+        )
+        kv_token_shares = cut
+    fits = _solve(kv_token_shares)
     if kv_token_shares is not None:
         dcp_note = (
             " KV-Anteil (#239): Token-Schnitt der Voll-Attention-KV (%d B/Token) je Rang "
@@ -2639,7 +2757,7 @@ def plan_d_residency(
             dcp_note,
         )
     )
-    lines = (head,) + seat_lines + spec_lines + fixed_lines + tuple(
+    lines = (head,) + cut_lines + seat_lines + spec_lines + fixed_lines + tuple(
         "%s FRACTION-SOLVE %s %s" % (marker, label, describe_rank(f)) for f in fits
     )
     waves = pool_overflow_waves(env_d)

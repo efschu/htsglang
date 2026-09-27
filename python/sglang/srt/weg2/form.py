@@ -27,7 +27,8 @@ typed twice):
 ``draft``    dflash | mtp | none    -- ``--spec-form`` (DFLASH | NEXTN)
 ``p_draft``  compute | cold | none  -- ``--draft-kv-on-p`` x ``--dflash-produce-on-p``
                                        x ``--weg2-disable-hicache``
-``kv``       paged_dcp | qsa_forma  -- Form A (a ``worker`` rank role on D)
+``kv``       paged_dcp | qsa_forma | qsa_forma_dcp -- Form A (a ``worker`` rank role on D);
+                                       _dcp: + ``--d-kv-token-cut`` (#239)
 ``flip``     family | resident      -- ``--flip-weights``
 ``vision``   off | resident | transient -- ``--weg2-vision``
 
@@ -78,7 +79,7 @@ AXIS_VALUES: Dict[str, Tuple[str, ...]] = {
     "experts": ("none", "resident", "offload"),
     "draft": ("dflash", "mtp", "none"),
     "p_draft": ("compute", "cold", "none"),
-    "kv": ("paged_dcp", "qsa_forma"),
+    "kv": ("paged_dcp", "qsa_forma", "qsa_forma_dcp"),
     "flip": ("family", "resident"),
     "vision": ("off", "resident", "transient"),
 }
@@ -617,7 +618,9 @@ PROFILES: Dict[str, ModelProfile] = {
             # Memory DRAFT-ZUORDNUNG: DFlash2 is the 27B's draft only, NF = MTP.
             "draft": ("mtp",),
             "p_draft": ("compute", "none"),
-            "kv": ("qsa_forma",),
+            # #239: the token-cut full-attention KV (release feature) is a
+            # value of this profile; it boots only with --d-kv-token-cut.
+            "kv": ("qsa_forma", "qsa_forma_dcp"),
         },
         arch="moe",
         experts=Experts(store="offload", swap="platztausch", store_dir="/mnt/nf-experts",
@@ -1411,9 +1414,27 @@ def expert_evidence(
     return facts, offload
 
 
-def derive_kv(extra_d: Sequence[str]) -> Tuple[str, str]:
+#: #239: the launcher switch that cuts D's full-attention KV by tokens over
+#: the Form A ranks (``off`` | ``maxmin`` | a ratio vector).
+KV_TOKEN_CUT_OFF = "off"
+
+
+def derive_kv(extra_d: Sequence[str], token_cut: str = KV_TOKEN_CUT_OFF) -> Tuple[str, str]:
     roles = flag_values(extra_d, "--rank-role")
-    if roles and "worker" in [r.strip() for r in roles[-1].split(",")]:
+    form_a = bool(roles) and "worker" in [r.strip() for r in roles[-1].split(",")]
+    cut = str(token_cut or KV_TOKEN_CUT_OFF).strip()
+    if cut != KV_TOKEN_CUT_OFF:
+        if not form_a:
+            _refuse(
+                f"--d-kv-token-cut {cut} cuts the full-attention KV over the Form A "
+                "ranks (#239), but D states no worker rank role -- without Form A "
+                "the KV axis is paged_dcp and SGLANG_UNEVEN_DCP already splits it"
+            )
+        return "qsa_forma_dcp", (
+            f"--rank-role {roles[-1]} (extra_d) + --d-kv-token-cut {cut}: "
+            "Form A, full-attention KV cut by tokens (#239)"
+        )
+    if form_a:
         return "qsa_forma", f"--rank-role {roles[-1]} (extra_d): Form A"
     return "paged_dcp", "no worker rank role on D"
 
@@ -1621,7 +1642,8 @@ def resolve_form(
         # cold/compute half too.
         sources["p_draft"] = f"{sources['p_draft']}; {why}"
 
-    kv, kv_src = derive_kv(extra_d)
+    kv, kv_src = derive_kv(
+        extra_d, str(getattr(ns, "d_kv_token_cut", KV_TOKEN_CUT_OFF) or KV_TOKEN_CUT_OFF))
     sources["kv"] = kv_src
 
     flip = str(getattr(ns, "flip_weights", "family") or "family")
