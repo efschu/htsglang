@@ -107,14 +107,15 @@ class PartialKeep(unittest.TestCase):
     def test_keep_role_called_with_the_window_and_its_return_logged(self):
         m = types.ModuleType(MOD)
         m.calls = []
-        m.keep_role = lambda rid, role, page_range: m.calls.append((rid, role, page_range)) or 42
+        m.keep_role = lambda rid, role, page_range=None, *, page_keys=None, page_size=0: (
+            m.calls.append((rid, role, page_range, page_size)) or 42)
         sched, _ = _sched([], [], avail=100)
         import sglang.srt.weg2 as pkg
 
         with mock.patch.dict(sys.modules, {MOD: m}), mock.patch.object(pkg, "handoff_pending", m, create=True):
             got = DPR._partial_keep(sched, _req(R(9), span=10000), _req(R(3), span=5000))
         self.assertEqual(got, "42")
-        self.assertEqual(m.calls, [(R(9), "park", (80, 157))])
+        self.assertEqual(m.calls, [(R(9), "park", (80, 157), 64)])
 
     def test_a_raising_keep_role_falls_back_to_retain(self):
         m = types.ModuleType(MOD)

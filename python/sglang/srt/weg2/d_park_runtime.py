@@ -454,8 +454,8 @@ def _kv_displace_enabled(env=None) -> bool:
 
 def _partial_keep(sched, victim, older_req) -> str:
     """SP: the ONE call site towards NF's #248 keep role
-    (``keep_role(rid, "park", page_range=(a, b))``, guarded import). The window
-    [a, b) is the victim's hindmost pages the older request lacks: a = span end
+    (``keep_role(rid, "park", page_range=(a, b), page_size=page)``, guarded
+    import). The window [a, b) is the victim's hindmost pages the older request lacks: a = span end
     - ceil(shortfall / page_size), shortfall = the older's uncached need minus
     the free rows (0 on a seat trigger: a pure pause, empty window). Module
     missing / raising: today's retain (LRU eviction) -- the displacement stands.
@@ -486,7 +486,9 @@ def _partial_keep(sched, victim, older_req) -> str:
         keep_role = getattr(_hp, "keep_role", None)
         if not callable(keep_role):
             return f"window={a}-{b}(retain)"
-        got = keep_role(str(victim.rid), "park", page_range=(a, b))
+        # page_range is in pages of the tree's page_size; the unit goes along
+        # (NF #248 records it, 0 would read as "unknown").
+        got = keep_role(str(victim.rid), "park", page_range=(a, b), page_size=page)
         return str(got) if isinstance(got, int) else f"window={a}-{b}"
     except Exception:  # noqa: BLE001 -- no module / raising: today's retain
         return f"window={a}-{b}(retain)"
