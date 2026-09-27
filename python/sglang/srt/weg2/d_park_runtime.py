@@ -385,10 +385,32 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
     cap = seat_cap(sched)
     if cap is None:
         cap = int(getattr(getattr(sched, "server_args", None), "max_running_requests", 0) or 0)
-    if not cap or len(reqs) < int(cap):
-        return None
+    # SP (partial park, KV trigger): the rid the adder refused with NO_TOKEN in
+    # the LAST pass (Scheduler sets it; consumed here, one pass old).
+    no_token_rid = getattr(sched, "_weg2_sa_no_token", None)
+    try:
+        sched._weg2_sa_no_token = None
+    except Exception:  # noqa: BLE001
+        pass
     waiting = [q for q in sched.waiting_queue if d_seats.park_site(q) != d_seats.SITE_PRESSURE]
-    pair = _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True)
+    trigger = "seat"
+    pair = None
+    if cap and len(reqs) >= int(cap):
+        pair = _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True)
+    elif _kv_displace_enabled():
+        # KV trigger: a seat is free, but an OLDER waiting request did not fit
+        # D's KV while a younger one runs. The PRECONDITION is replicated (the
+        # queue, the running set and the rids are); the NO_TOKEN verdict is
+        # read through the group MIN (_weg2_group_min_flags), entered by every
+        # rank because the precondition is the same on every rank -- so the
+        # group displaces only when EVERY rank refused (RAENGE-NIE-UNEINS).
+        cand = _sa.displace_victim([str(q.rid) for q in waiting], [str(r.rid) for r in reqs], True)
+        if cand is not None:
+            local = no_token_rid is not None and _sa.rid_age(no_token_rid) <= _sa.rid_age(cand[0])
+            gm = getattr(sched, "_weg2_group_min_flags", None)
+            agreed = bool(gm([local])[0]) if callable(gm) else bool(local)
+            if agreed:
+                pair, trigger = cand, "kv"
     if pair is None:
         return None
     older, victim_rid = pair
@@ -414,10 +436,60 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
     d_seats.mark_parked(victim, d_seats.SITE_PRESSURE, now=time.monotonic())
     sched.waiting_queue = [q for q in sched.waiting_queue if q is not victim] + [victim]
     sched._weg2_sa_displaced = getattr(sched, "_weg2_sa_displaced", 0) + 1
-    logger.warning("SEAT-AGE DISPLACE rid_out=%s older_waiting=%s running=%d cap=%s: the youngest "
-                   "running request is parked whole (span retained) so the older one moves in",
-                   victim_rid[:16], older[:16], len(reqs), cap)
+    older_req = next((q for q in waiting if str(q.rid) == older), None)
+    pages_out = _partial_keep(sched, victim, older_req if trigger == "kv" else None)
+    logger.warning("SEAT-AGE DISPLACE rid_out=%s older_waiting=%s trigger=%s running=%d cap=%s "
+                   "pages_out=%s: the youngest running request pauses (span retained: its KV leaves "
+                   "the device only as far as the older one needs it -- LRU eviction, tail last)",
+                   victim_rid[:16], older[:16], trigger, len(reqs), cap, pages_out)
     return victim_rid
+
+
+def _kv_displace_enabled(env=None) -> bool:
+    """SP: ``SGLANG_WEG2_SEAT_AGE_KV_DISPLACE`` (default on; 0 = seat trigger only)."""
+    e = os.environ if env is None else env
+    raw = (e.get("SGLANG_WEG2_SEAT_AGE_KV_DISPLACE", "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _partial_keep(sched, victim, older_req) -> str:
+    """SP: the ONE call site towards NF's #248 keep role
+    (``keep_role(rid, "park", page_range=(a, b))``, guarded import). The window
+    [a, b) is the victim's hindmost pages the older request lacks: a = span end
+    - ceil(shortfall / page_size), shortfall = the older's uncached need minus
+    the free rows (0 on a seat trigger: a pure pause, empty window). Module
+    missing / raising: today's retain (LRU eviction) -- the displacement stands.
+    Returns what is logged as pages_out."""
+    try:
+        span = len(getattr(victim, "origin_input_ids", None) or ()) + len(
+            getattr(victim, "output_ids", None) or ())
+        tree = getattr(sched, "tree_cache", None)
+        page = int(getattr(tree, "page_size", 1) or 1)
+        shortfall = 0
+        if older_req is not None:
+            need = len(getattr(older_req, "origin_input_ids", None) or ()) + len(
+                getattr(older_req, "output_ids", None) or ()) - len(
+                getattr(older_req, "prefix_indices", None) or ())
+            alloc = getattr(sched, "token_to_kv_pool_allocator", None)
+            free = int(alloc.available_size()) if alloc is not None else 0
+            shortfall = max(0, int(need) - free)
+        n_pages = -(-shortfall // page) if shortfall else 0
+        b = -(-span // page)
+        a = max(0, b - n_pages)
+    except Exception:  # noqa: BLE001
+        return "?"
+    if n_pages == 0:
+        return "0"
+    try:
+        from sglang.srt.weg2 import handoff_pending as _hp  # NF #248 (name pending)
+
+        keep_role = getattr(_hp, "keep_role", None)
+        if not callable(keep_role):
+            return f"window={a}-{b}(retain)"
+        got = keep_role(str(victim.rid), "park", page_range=(a, b))
+        return str(got) if isinstance(got, int) else f"window={a}-{b}"
+    except Exception:  # noqa: BLE001 -- no module / raising: today's retain
+        return f"window={a}-{b}(retain)"
 
 
 def admission(sched, running_batch):

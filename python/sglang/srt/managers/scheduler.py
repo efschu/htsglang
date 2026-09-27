@@ -15774,6 +15774,11 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
+                    # SP (partial park, KV trigger; weg2/d_park_runtime.displace_for_age):
+                    # the first request this pass could not fund; read -- through a
+                    # group MIN -- by the next pass's admission.
+                    if getattr(self, "_weg2_sa_no_token", None) is None:
+                        self._weg2_sa_no_token = str(req.rid)
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
