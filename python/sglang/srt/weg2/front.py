@@ -97,6 +97,7 @@ from sglang.srt.weg2 import host_ledger
 from sglang.srt.weg2 import prefill_clock  # UNIFY S4 (H85): D's prefill clock reader (stdlib only)
 from sglang.srt.weg2 import dp_wait as _dp_wait  # R28: DP-WAIT instrument
 from sglang.srt.weg2 import phase_policy  # H91 part C
+from sglang.srt.weg2 import resume_via_p as _rvp  # RESUME-VIA-P
 
 logger = logging.getLogger("weg2.front")
 
@@ -2545,6 +2546,10 @@ class Pending:
     #: the ``WEG2-FLIP done`` that ends the wait, then cleared. Instrument
     #: only -- nothing routes, admits or flips on it.
     dp_arrival: Optional[_dp_wait.DpArrival] = None
+    #: RESUME-VIA-P (weg2/resume_via_p.py): a P-only leg 1 that prefills the
+    #: context of a request D keeps parked mid-stream; no leg 2 follows (D
+    #: still holds the client's stream).
+    resume_via_p: bool = False
 
 
 class Seat:
@@ -3493,6 +3498,74 @@ class Front:
             inflight = 0
         return {"handoff_n": len(held) + len(ready) + max(0, inflight),
                 "parked_n": len(parked)}
+
+    # -- RESUME-VIA-P (weg2/resume_via_p.py) ---------------------------------
+    def _rvp_state(self) -> None:
+        if getattr(self, "_rvp_dir", None) is None:
+            self._rvp_dir = _rvp.needs_p_dir(getattr(self, "tag", "") or "") if _rvp.enabled() else ""
+            self._rvp_p_done: Dict[str, Tuple[float, float]] = {}
+            self._front_price: Dict[str, int] = {}
+
+    def _note_front_price(self, rid: str, uncached: int) -> None:
+        """The front's route-time price of a rid, for the W50-REROUTE line."""
+        self._rvp_state()
+        self._front_price[str(rid)] = int(uncached)
+        while len(self._front_price) > 4096:
+            self._front_price.pop(next(iter(self._front_price)))
+
+    def _rvp_take(self) -> int:
+        """Take D's needs-P requests and queue a P-only leg 1 for each. One
+        scandir of a small directory per controller pass; nothing when off."""
+        self._rvp_state()
+        if not self._rvp_dir:
+            return 0
+        reqs = _rvp.take_requests(self._rvp_dir)
+        now = time.time()
+        for r in reqs:
+            rid = str(r.get("rid") or "")
+            ids = [int(t) for t in (r.get("input_ids") or ())]
+            if not rid or not ids:
+                continue
+            payload = {"rid": rid, "input_ids": ids,
+                       "sampling_params": {"max_new_tokens": 1, "temperature": 0.0}}
+            p = Pending(rid=rid, path="/generate", payload=payload, text=f"\x00rvp:{rid}",
+                        t_arrive=now, fut=asyncio.get_event_loop().create_future(),
+                        est_prompt=len(ids), est_uncached=int(r.get("d_extent") or len(ids)),
+                        span_known=True, p_only=True, resume_via_p=True)
+            self.queue.append(p)
+            self.counters["rvp_rerouted"] += 1
+            logger.warning(
+                "WEG2 W50-REROUTE rid=%s front_price=%s d_extent=%d reason=%s path=midstream "
+                "tokens=%d -- D kept the stream and parked the request; P prefills its context "
+                "(P-only leg 1, /generate), D resumes after the flip back",
+                rid, self._front_price.get(rid, "?"), int(r.get("d_extent") or 0),
+                r.get("reason", "?"), len(ids))
+        if reqs:
+            self._kick_controller("arrival")
+        return len(reqs)
+
+    def _rvp_p_finished(self, p: "Pending") -> None:
+        """P's leg 1 of a RESUME-VIA-P request is done: no leg 2 (D holds the
+        stream); the stream's next chunk closes the record."""
+        self._rvp_state()
+        now = time.time()
+        p_ms = (now - float(p.t_arrive)) * 1000.0
+        self._rvp_p_done[p.rid] = (now, p_ms)
+        while len(self._rvp_p_done) > 1024:
+            self._rvp_p_done.pop(next(iter(self._rvp_p_done)))
+        if not p.fut.done():
+            p.fut.set_result(None)
+        logger.info("RESUME-VIA-P p-done rid=%s p_ms=%.0f (reroute -> P prefill done, flips "
+                    "included) tokens=%d", p.rid, p_ms, int(p.est_prompt))
+
+    def _rvp_resumed(self, rid: str) -> None:
+        rec = self._rvp_p_done.pop(rid, None)
+        if rec is None:
+            return
+        t_done, p_ms = rec
+        self.counters["rvp_resumed"] += 1
+        logger.info("RESUME-VIA-P done rid=%s p_ms=%.0f d_resume_ms=%.0f (the client's stream "
+                    "moved again)", rid, p_ms, (time.time() - t_done) * 1000.0)
 
     def _immediate_park_due(self, D: Group, now: float) -> Optional["Pending"]:
         """27B PARK: the queued request that fires the immediate park now, or
@@ -4950,6 +5023,7 @@ class Front:
         # cost a reader a whole wrong causal chain -- "None was read as
         # exceeds". Nothing read None as a number; the line simply never
         # showed the number. Instrument-text-lies, class A.
+        self._note_front_price(rid, remainder)  # RESUME-VIA-P: the W50-REROUTE line's front_price
         logger.info(
             "WEG2 ROUTE-VERDICT rid=%s verdict=%s uncached=%d (base for X=%d, "
             "what D must PREFILL, at CHARS_PER_TOKEN=%.1f minus the MEASURED "
@@ -6020,6 +6094,8 @@ class Front:
                             chunk = await _next_d_chunk()
                             if not chunk:
                                 break
+                            if getattr(self, "_rvp_p_done", None) and rid in self._rvp_p_done:
+                                self._rvp_resumed(rid)
                             await _push(chunk)
                     if client_io["gone"] and not client_io["finished"]:
                         # The client left and D's stream ended without an end
@@ -6351,6 +6427,12 @@ class Front:
                 status=413)
         logger.warning(
             "WEG2 X-REQUEUE rid=%s n=%d verdict=%s", rid, n,
+            "requeue" if n <= 1 else ("W53" if handback_empty else "W35"))
+        self._rvp_state()
+        logger.warning(
+            "WEG2 W50-REROUTE rid=%s front_price=%s d_extent=%s reason=x_refusal path=fresh n=%d "
+            "verdict=%s -- refused before the first byte: re-routed through P (leg 1, then leg 2)",
+            rid, self._front_price.get(str(rid), "?"), d_extent, n,
             "requeue" if n <= 1 else ("W53" if handback_empty else "W35"))
         if n > 1:
             # W35 counts the POPULATION -- every rid D refused a second time
@@ -8478,6 +8560,7 @@ class Front:
             try:
                 if self.state != "serving":
                     continue
+                self._rvp_take()
                 if self.awake == "D":
                     D = self.groups["D"]
                     _now = time.time()
@@ -8681,6 +8764,10 @@ class Front:
                     nonlocal _drain_uncached, prefilled
                     if p.intake_stalled:
                         return  # weg2xsn272: back in the queue, not ready for D
+                    if p.resume_via_p:
+                        self._rvp_p_finished(p)
+                        prefilled += 1
+                        return
                     _drain_uncached += int(p.est_uncached)
                     if not p.fut.done():
                         self._ready_for_d.append(p)

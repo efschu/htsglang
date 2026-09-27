@@ -234,6 +234,7 @@ from sglang.srt.layers.quantization import gguf_path_census as _gguf_path_census
 from sglang.srt.weg2 import p_trim_end_anchor as _weg2_trim
 from sglang.srt.weg2 import fork_anchor as _weg2_fork
 from sglang.srt.weg2 import d_park_read as _weg2_park_read  # PARK-RETAIN READ
+from sglang.srt.weg2 import resume_via_p as _weg2_rvp  # RESUME-VIA-P
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
 from sglang.srt.managers import uniform_floor_scope
@@ -12630,6 +12631,20 @@ class Scheduler(
         self.waiting_queue = [q for q in self.waiting_queue if id(q) not in refused_ids]
         for req in refused:
             uncached = self.weg2_uncached_extent(req, head_inputs)
+            # RESUME-VIA-P (weg2/resume_via_p.py): a STREAMED request that has
+            # generated tokens is not aborted -- its client holds text, the
+            # front cannot re-route it. D keeps it parked, P prefills its
+            # context, D continues the same stream after the flip back.
+            if _weg2_rvp.eligible(req):
+                _tc = getattr(self, "tree_cache", None)
+                if _tc is not None:
+                    release_admission_acquired_mamba_slot(req, _tc, site="weg2_x_refusal_rvp")
+                if self.enable_hicache_storage:
+                    self.tree_cache.release_aborted_request(req.rid)
+                elif self.enable_hierarchical_cache:
+                    self.tree_cache.terminate_prefetch(req.rid)
+                _weg2_rvp.keep_on_d(self, req, uncached, x)
+                continue
             message = (
                 f"W50 Weg2TpPrefillExceeded: this group may prefill at most {x} uncached "
                 f"tokens itself (--tp-prefill-max-tokens); this request's extent after "
