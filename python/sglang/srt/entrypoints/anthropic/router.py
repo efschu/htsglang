@@ -633,6 +633,34 @@ def _rewrite_body_model(body: bytes, target: str) -> tuple[bytes, str]:
     return json.dumps(payload).encode(), "body model rewritten"
 
 
+WEB_SEARCH_TOOL_PREFIX = "web_search_"
+
+
+def _is_web_search_request(body: bytes) -> bool:
+    """Is this Claude Code's WebSearch sub-request (a server-side search tool)?
+
+    Claude Code's WebSearch tool does not search locally: it sends a separate
+    /v1/messages request that carries Anthropic's SERVER tool
+    ``{"type": "web_search_20250305", ...}`` and forces it via tool_choice,
+    with ``model`` set to the session's own model (read out of 2.1.280). Only
+    Anthropic's API executes that tool. Recognised by the tool TYPE, never by
+    prompt wording.
+    """
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    tools = payload.get("tools") if isinstance(payload, dict) else None
+    if not isinstance(tools, list):
+        return False
+    return any(
+        isinstance(tool, dict)
+        and isinstance(tool.get("type"), str)
+        and tool["type"].startswith(WEB_SEARCH_TOOL_PREFIX)
+        for tool in tools
+    )
+
+
 def _destination_wants_explicit_markers(model: str) -> bool:
     """Does THIS model's provider cache only what a marker names?
 
@@ -1137,6 +1165,22 @@ def _load_policy_file(path: str) -> dict:
             path,
             mapping,
         )
+    # ``web_search_model``: the Anthropic model that serves the WebSearch
+    # sub-request of a non-Anthropic session (see _is_web_search_request).
+    # Here, not only as a flag, so it can be switched without a restart of
+    # the lifeline process.
+    search_model = obj.get("web_search_model")
+    if search_model is None:
+        pass
+    elif isinstance(search_model, str) and search_model:
+        out["web_search_model"] = search_model
+    else:
+        logger.warning(
+            "policy file %s: bad web_search_model value %r (need a model id); "
+            "not applied",
+            path,
+            search_model,
+        )
     return out
 
 
@@ -1502,6 +1546,7 @@ def create_app(
     openrouter_key_file: Optional[str] = None,
     remote_models: Optional[dict[str, str]] = None,
     local_max_input_tokens: Optional[int] = None,
+    web_search_model: Optional[str] = None,
 ) -> web.Application:
     """Build the proxy application.
 
@@ -1551,6 +1596,16 @@ def create_app(
     buffer: a down remote answers 502 at once, loud and by name, instead of
     holding a turn. Empty by default -- then this bucket is never consulted.
 
+    ``web_search_model`` is the Anthropic model that serves the WebSearch
+    sub-request of a session whose own model is NOT Anthropic's (local,
+    remote or openrouter bucket; see ``_is_web_search_request``). Such a
+    request is re-targeted to this model and sent upstream with the client's
+    own credential, because no other backend can execute Anthropic's
+    server-side search tool -- without it a local model gets "perform a web
+    search" and no search engine, and just writes. The policy file key
+    ``web_search_model`` overrides it hot; ``None`` everywhere = off, every
+    request routed exactly as before.
+
     ``local_max_input_tokens`` caps the prompt the LOCAL backend is sent on
     ``/v1/messages``, counted by that backend's own ``count_tokens``. A longer
     prompt is answered 400 in Anthropic's "prompt is too long: N tokens > MAX
@@ -1593,6 +1648,8 @@ def create_app(
         # list can be edited and hot-reloaded without a restart of the
         # lifeline process.
         "allowed_models": None,
+        # Hot-overridable by the policy file key of the same name.
+        "web_search_model": web_search_model,
     }
     app[POLICY_FILE] = _PolicyFile(policy_file)
     app[STATS] = {
@@ -1618,6 +1675,9 @@ def create_app(
         # instead of being forwarded (--local-max-input-tokens), plus backend
         # context overflows translated into that shape. Lifetime total.
         "refused_too_long": 0,
+        # WebSearch sub-requests of non-Anthropic sessions re-targeted to
+        # web_search_model and sent upstream. Lifetime total.
+        "web_search_rerouted": 0,
     }
     app[LOCAL_WAIT_S] = local_wait_s
     app[UPSTREAM_WAIT_S] = upstream_wait_s
@@ -1736,6 +1796,29 @@ def create_app(
         to_openrouter = not to_local and not to_remote and (
             model is not None and model in request.app[OPENROUTER_MODELS]
         )
+
+        # WebSearch of a non-Anthropic session: the search tool only runs on
+        # Anthropic's API, so the sub-request goes upstream on
+        # web_search_model. Checked after the allow-list (the client's own id
+        # must still be approved) and before any bucket touches the body.
+        web_search_model = _effective_policy(request.app).get("web_search_model")
+        if (
+            web_search_model
+            and request.path == "/v1/messages"
+            and (to_local or to_remote or to_openrouter)
+            and _is_web_search_request(body)
+        ):
+            body, rewrite_diagnosis = _rewrite_body_model(body, web_search_model)
+            request.app[STATS]["web_search_rerouted"] += 1
+            logger.warning(
+                "web search: model=%s -> upstream as %s (%s)",
+                model,
+                web_search_model,
+                rewrite_diagnosis,
+            )
+            model = web_search_model
+            to_local = to_remote = to_openrouter = False
+            remote_base = None
 
         if to_remote:
             # Byte pipe: the remote router applies its own thinking policy
@@ -2324,6 +2407,16 @@ def main(argv: list[str] | None = None) -> None:
         "listed id must also be in the policy file's allowed_models.",
     )
     parser.add_argument(
+        "--web-search-model",
+        default=None,
+        help="Anthropic model that serves Claude Code's WebSearch sub-request "
+        "when the session's own model routes to the local, remote or openrouter "
+        "bucket (those backends cannot run Anthropic's server-side search "
+        "tool). The request is re-targeted to this model and sent upstream "
+        "with the client's credential. Policy file key 'web_search_model' "
+        "overrides it without a restart. Default: off.",
+    )
+    parser.add_argument(
         "--local-max-input-tokens",
         type=int,
         default=None,
@@ -2379,7 +2472,13 @@ def main(argv: list[str] | None = None) -> None:
         openrouter_key_file=args.openrouter_key_file,
         remote_models=remote_models,
         local_max_input_tokens=args.local_max_input_tokens,
+        web_search_model=args.web_search_model,
     )
+    if args.web_search_model:
+        logger.warning(
+            "web search of non-Anthropic sessions -> upstream as %s",
+            args.web_search_model,
+        )
     if args.local_max_input_tokens is not None:
         logger.warning(
             "local input cap: prompts > %d tokens answered as prompt-too-long",

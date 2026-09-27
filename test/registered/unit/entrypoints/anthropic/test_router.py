@@ -2261,3 +2261,195 @@ class NoLocalInputCapTestCase(LocalMaxInputTokensTestCase):
         await self.client.post("/v1/messages", json=self._body(self.N_CTX + 7))
         stats = await (await self.client.get(STATS_PATH)).json()
         self.assertEqual(stats["refused_too_long"], 0)
+
+
+# The tool Claude Code 2.1.280 attaches to its WebSearch sub-request.
+WEB_SEARCH_TOOL = {
+    "type": "web_search_20250305",
+    "name": "web_search",
+    "max_uses": 8,
+}
+
+
+class WebSearchRerouteTestCase(AioHTTPTestCase):
+    """--web-search-model: a non-Anthropic session's WebSearch goes upstream.
+
+    Claude Code sends the WebSearch sub-request with the SESSION's model, so
+    for a Qwen/cachy/openrouter session it reached a backend that cannot run
+    Anthropic's server-side search tool; the model got "perform a web search"
+    and no search engine. Pinned here: every non-Anthropic bucket re-targets a
+    search request to the configured model upstream with the client's own
+    credential, nothing else changes, and the flag/policy gate it.
+    """
+
+    SEARCH_MODEL = "claude-sonnet-5"
+    REMOTE_ID = "Qwen3.8-27B-cachy-think"
+    OPENROUTER_MODEL = "z-ai/glm-5.3-flash"
+    CLIENT_SECRET = "sk-ant-client-credential-0927"
+
+    def _web_search_model(self):
+        return self.SEARCH_MODEL
+
+    async def get_application(self):
+        self.backends = {}
+        self.servers = []
+        for name in ("upstream", "local", "remote", "openrouter"):
+            app, state = _make_backend(name)
+            server = TestServer(app)
+            await server.start_server()
+            self.backends[name] = state
+            self.servers.append(server)
+        base = {
+            name: str(server.make_url("")).rstrip("/")
+            for name, server in zip(self.backends, self.servers)
+        }
+        tmp = tempfile.mkdtemp(prefix="router-websearch-")
+        self.key_path = os.path.join(tmp, "openrouter.key")
+        with open(self.key_path, "w") as fh:
+            fh.write("sk-or-v1-test-fake-key-0927\n")
+        self.policy_path = os.path.join(tmp, "policy.json")
+        return create_app(
+            local_models=[LOCAL_MODEL],
+            upstream_base=base["upstream"],
+            local_base=base["local"],
+            local_wait_s=0,
+            openrouter_models=[self.OPENROUTER_MODEL],
+            openrouter_base=base["openrouter"],
+            openrouter_key_file=self.key_path,
+            policy_file=self.policy_path,
+            remote_models={self.REMOTE_ID: base["remote"]},
+            web_search_model=self._web_search_model(),
+        )
+
+    async def tearDownAsync(self):
+        for server in self.servers:
+            await server.close()
+        await super().tearDownAsync()
+
+    def _search_body(self, model, **overrides):
+        body = {
+            "model": model,
+            "max_tokens": 32000,
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "Perform a web search for the query: x"}
+            ],
+            "tools": [WEB_SEARCH_TOOL],
+            "tool_choice": {"type": "tool", "name": "web_search"},
+            "thinking": {"type": "disabled"},
+        }
+        body.update(overrides)
+        return body
+
+    def _only(self, name):
+        """The one backend that got the request (the local message_start
+        repair's side-channel count_tokens call is not a routed request)."""
+        routed = {
+            other: [
+                r
+                for r in state["requests"]
+                if r["path"] != "/v1/messages/count_tokens" or other != "local"
+            ]
+            for other, state in self.backends.items()
+        }
+        for other, requests in routed.items():
+            self.assertEqual(len(requests), 1 if other == name else 0, other)
+        return routed[name][0]
+
+    async def _post(self, body, **headers):
+        return await self.client.post(
+            "/v1/messages",
+            json=body,
+            headers={"x-api-key": self.CLIENT_SECRET, **headers},
+        )
+
+    async def test_every_non_anthropic_bucket_searches_upstream(self):
+        for model in (LOCAL_MODEL, THINKING_ALIAS, self.REMOTE_ID, self.OPENROUTER_MODEL):
+            for state in self.backends.values():
+                state["requests"].clear()
+            resp = await self._post(self._search_body(model))
+            self.assertEqual(resp.status, 200, model)
+            self.assertIn(b'"backend":"upstream"', await resp.read(), model)
+            got = self._only("upstream")
+            sent = self._search_body(model)
+            sent["model"] = self.SEARCH_MODEL
+            # Only the model id changes: no -think rewrite, no thinking shim,
+            # no cache markers, no provider pin.
+            self.assertEqual(got["body"], sent, model)
+            headers = {k.lower(): v for k, v in got["headers"].items()}
+            # Anthropic bills the client's own account.
+            self.assertEqual(headers.get("x-api-key"), self.CLIENT_SECRET, model)
+        stats = await (await self.client.get(STATS_PATH)).json()
+        self.assertEqual(stats["web_search_rerouted"], 4)
+
+    async def test_non_search_requests_keep_their_bucket(self):
+        for model, backend in (
+            (LOCAL_MODEL, "local"),
+            (self.REMOTE_ID, "remote"),
+            (self.OPENROUTER_MODEL, "openrouter"),
+        ):
+            for state in self.backends.values():
+                state["requests"].clear()
+            body = self._search_body(model)
+            # An ordinary client tool, even one NAMED web_search, is not the
+            # server tool: recognised by type only.
+            body["tools"] = [{"name": "web_search", "input_schema": {"type": "object"}}]
+            await self._post(body)
+            self._only(backend)
+        stats = await (await self.client.get(STATS_PATH)).json()
+        self.assertEqual(stats["web_search_rerouted"], 0)
+
+    async def test_anthropic_session_search_is_untouched(self):
+        resp = await self._post(self._search_body(REMOTE_MODEL))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self._only("upstream")["body"]["model"], REMOTE_MODEL)
+        stats = await (await self.client.get(STATS_PATH)).json()
+        self.assertEqual(stats["web_search_rerouted"], 0)
+
+    async def test_count_tokens_is_not_rerouted(self):
+        await self.client.post(
+            "/v1/messages/count_tokens", json=self._search_body(LOCAL_MODEL)
+        )
+        self.assertEqual(
+            [r["path"] for r in self.backends["local"]["requests"]],
+            ["/v1/messages/count_tokens"],
+        )
+        self.assertEqual(self.backends["upstream"]["requests"], [])
+
+    async def test_allow_list_still_checks_the_clients_own_id(self):
+        with open(self.policy_path, "w") as fh:
+            json.dump({"allowed_models": [LOCAL_MODEL, self.SEARCH_MODEL]}, fh)
+        refused = await self._post(self._search_body(self.OPENROUTER_MODEL))
+        self.assertEqual(refused.status, 403)
+        ok = await self._post(self._search_body(LOCAL_MODEL))
+        self.assertEqual(ok.status, 200)
+        self.assertEqual(self._only("upstream")["body"]["model"], self.SEARCH_MODEL)
+
+    async def test_policy_file_overrides_the_search_model(self):
+        with open(self.policy_path, "w") as fh:
+            json.dump({"web_search_model": "claude-opus-5-5"}, fh)
+        await self._post(self._search_body(LOCAL_MODEL))
+        self.assertEqual(self._only("upstream")["body"]["model"], "claude-opus-5-5")
+
+
+class WebSearchRerouteOffTestCase(WebSearchRerouteTestCase):
+    """No flag and no policy key: a search request stays in its bucket."""
+
+    def _web_search_model(self):
+        return None
+
+    async def test_every_non_anthropic_bucket_searches_upstream(self):
+        await self._post(self._search_body(LOCAL_MODEL))
+        self.assertEqual(self._only("local")["path"], "/v1/messages")
+        stats = await (await self.client.get(STATS_PATH)).json()
+        self.assertEqual(stats["web_search_rerouted"], 0)
+
+    async def test_allow_list_still_checks_the_clients_own_id(self):
+        pass
+
+    async def test_policy_file_overrides_the_search_model(self):
+        # The policy key alone switches it on, without a restart.
+        with open(self.policy_path, "w") as fh:
+            json.dump({"web_search_model": self.SEARCH_MODEL}, fh)
+        await self._post(self._search_body(self.REMOTE_ID))
+        self.assertEqual(self._only("upstream")["body"]["model"], self.SEARCH_MODEL)
