@@ -3780,10 +3780,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        host_indices = self.cache_controller.write(
-            device_value, node_id=node.id, extra_pools=aux_xfers or None,
-            **({"host_indices": _pre} if _pre is not None else {}),
-        )
+        host_indices = self._weg2_write_or_abort(node, device_value, aux_xfers, _pre, ring)
         if host_indices is None:
             if _pre is not None:
                 self._weg2_direct_abort(_pre, node)
@@ -4083,6 +4080,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._1421_refused("draft_claim", node)
                 return False
         return pre
+
+    def _weg2_write_or_abort(self, node, device_value, aux_xfers, pre, ring):
+        """The controller write of `write_backup`. #1424f (rc12p P-PP0
+        15:15:51 / 15:21:05): a write that RAISED after the direct claim left
+        every claimed page PENDING for good -- no ack, no abort -- and the KV
+        arena has no orphan reap. The claim (and the ring admission) go back,
+        the node stays unbacked for the sweep to retry, the error propagates."""
+        try:
+            return self.cache_controller.write(
+                device_value, node_id=node.id, extra_pools=aux_xfers or None,
+                **({"host_indices": pre} if pre is not None else {}),
+            )
+        except BaseException:
+            if pre is not None:
+                self._weg2_direct_abort(pre, node)
+            if ring is not None:
+                ring.abort(node.id)
+            raise
 
     def _weg2_direct_abort(self, rows, node=None) -> None:
         cc = self.cache_controller
