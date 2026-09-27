@@ -3737,51 +3737,44 @@ class Front:
         self._seat_last_defer = ()
 
     def _seat_rotate_plan(self, parked, ready) -> List[str]:
-        """#244 (NF rc12r 16:52-17:04: the same 5 long runs weg2-0-5/1-12/5-21/
-        10-34/13-41 resumed first at every wake, waiters with leg 1 done
-        255 -> 658 s, queued_d 4 -> 13). At the P->D wake: every request
-        waiting for a D seat past the wait bound (leg 1 done, oldest wait
-        first) takes the seat of the YOUNGEST parked one (last admitted to a D
-        seat). Not rotated out: a rid resumed in this or the previous phase
-        (park-cycle dwell) and one deferred >= 2 phases already (fairness: it
-        has priority over new ones). The deferred ones stay in D's hold as
-        ordinary waiting work (d_park_runtime._apply_park_defer). Logs one
-        SEAT-ROTATE line per pair."""
-        if not _seat_rotate_enabled() or not parked:
+        """SA (#244 rebuilt to the user's design, weg2/seat_age.py): at the P->D
+        wake the D seats go by FRONT ARRIVAL (the rid's counter) over the parked
+        and the waiting requests (leg 1 done, in ``_ready_for_d``) -- oldest
+        first, ``--d-bs`` seats. A parked request without a seat is deferred:
+        its front seat is released (``D-REFILL freed_by=rotate``) and D treats it
+        as ordinary waiting work, placed by age (it moves in as soon as the
+        older ones leave). One ``SEAT-ROTATE`` line per deferred one. KV
+        backfill is the admitter's (it holds D's reading). Returns the
+        deferred parked rids."""
+        from sglang.srt.weg2 import seat_age as _sa
+
+        if not _sa.enabled() or not parked:
             return []
-        bound = float(getattr(self, "d_wait_bound_s", 0) or 0)
-        if bound <= 0:
-            return []
-        now = time.time()
-        waiters = []
-        for p in ready:
-            t0 = float(getattr(p, "t_ready", 0.0) or 0.0) or float(p.t_arrive)
-            if getattr(p, "leg1_done", False) and now - t0 > bound:
-                waiters.append((now - t0, p))
+        waiters = [p for p in ready if getattr(p, "leg1_done", False)
+                   and not (getattr(p, "fut", None) is not None and p.fut.done())]
         if not waiters:
             return []
-        waiters.sort(key=lambda w: -w[0])
+        seats = int(getattr(self, "d_bs", 0) or 0) or len(parked)
+        chosen = set(_sa.plan_seats([(r, 0) for r in parked] + [(p.rid, 0) for p in waiters], seats))
+        deferred = _sa.by_age([r for r in parked if r not in chosen])
+        takers = _sa.by_age([p for p in waiters if p.rid in chosen])
+        now = time.time()
         epoch = int(getattr(self, "epoch", 0))
-        resumed = getattr(self, "_seat_resumed_epoch", None) or {}
-        deferred_n = getattr(self, "_seat_defer_n", None) or {}
-        admit_t = getattr(self, "_d_admit_t", None) or {}
-        eligible = [r for r in parked
-                    if resumed.get(r, -10) < epoch - 1 and deferred_n.get(r, 0) < 2]
-        eligible.sort(key=lambda r: -float(admit_t.get(r, 0.0)))  # youngest first
-        pairs = list(zip([w for w in waiters], eligible))
         out = []
-        for (waited, p), r_out in pairs:
+        for k, r_out in enumerate(deferred):
+            p_in = takers[k] if k < len(takers) else None
+            if p_in is None:
+                break
             out.append(r_out)
             self.counters["seat_rotate"] += 1
-            # the front seat goes with it: the deferred one is not running on
-            # D this phase, the waiter takes the seat (D-REFILL freed_by=rotate)
+            waited = now - (float(getattr(p_in, "t_ready", 0.0) or 0.0) or float(p_in.t_arrive))
+            logger.warning("WEG2 SEAT-ROTATE rid_in=%s rid_out=%s reason=age waited_s=%.1f epoch=%d "
+                           "(arrival order: the older request takes the seat of the younger parked one; "
+                           "it waits on D as ordinary work and moves in when a seat frees)",
+                           p_in.rid, r_out, waited, epoch)
             for _st in list(getattr(self, "_d_seats_live", ()) or ()):
                 if getattr(_st, "rid", None) == r_out:
                     _st.release("rotate")
-            logger.warning("WEG2 SEAT-ROTATE rid_in=%s rid_out=%s reason=wait-bound waited_s=%.1f "
-                           "bound_s=%.0f epoch=%d (the youngest parked gives its seat to a request "
-                           "waiting past the bound; it stays held and waits as ordinary work)",
-                           p.rid, r_out, waited, bound, epoch)
         return out
 
     # -- RESUME-VIA-P (weg2/resume_via_p.py) ---------------------------------
@@ -6166,6 +6159,14 @@ class Front:
                     continue
                 if not self._ready_for_d:
                     continue
+                # SA (#244, weg2/seat_age.py): the D line in front-arrival order.
+                from sglang.srt.weg2 import seat_age as _sa
+
+                if _sa.enabled() and len(self._ready_for_d) > 1:
+                    _ordered = _sa.by_age(self._ready_for_d)
+                    if [id(q) for q in _ordered] != [id(q) for q in self._ready_for_d]:
+                        self._ready_for_d.clear()
+                        self._ready_for_d.extend(_ordered)
                 p = self._ready_for_d[0]
                 if p.fut.done():
                     # Already resolved, failed or cancelled (leg 1 error, an
@@ -6190,8 +6191,28 @@ class Front:
                 # rid, the arrival estimate only for a cold one -- and the
                 # SAME number is charged to the seat below, so the gate and
                 # `_d_charged_since` cannot price one request two ways.
+                _reading = await self._d_reading_if_armed()
+                if (_sa.enabled() and len(self._ready_for_d) > 1
+                        and self._d_token_budget_blocks(p.rid, p.est_prompt, _reading,
+                                                        p.leg1_prompt_tokens)):
+                    # SA backfill: the older head does not fit D's free KV; the
+                    # first younger one that does may run (no idle capacity).
+                    # The older keeps its place at the head for the next seat.
+                    for _q in list(self._ready_for_d)[1:8]:
+                        if _q.fut.done():
+                            continue
+                        if not self._d_token_budget_blocks(_q.rid, _q.est_prompt, _reading,
+                                                           _q.leg1_prompt_tokens):
+                            self._ready_for_d.remove(_q)
+                            self._ready_for_d.appendleft(_q)
+                            self.counters["seat_age_backfill"] += 1
+                            logger.info("WEG2 SEAT-AGE BACKFILL rid_in=%s older_blocked=%s (the older "
+                                        "request does not fit D's free KV; the younger fits and runs)",
+                                        _q.rid, p.rid)
+                            p = _q
+                            break
                 if self._d_token_budget_blocks(p.rid, p.est_prompt,
-                                               await self._d_reading_if_armed(),
+                                               _reading,
                                                p.leg1_prompt_tokens):
                     # FIX 4a: the seat is not even reached -- taking one and
                     # holding it while the tokens are unavailable would block
