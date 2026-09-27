@@ -2083,6 +2083,16 @@ _MONITOR_DETECT_PORTS = (30000, 30001, 30100, 8000)
 #: TCP pre-scan, so the width costs nothing when the ports are closed.
 _DETECT_SWEEP_PORTS = tuple(range(30000, 30101)) + (8000, 8080)
 
+#: Ports that are NEVER a monitor target even though they answer inside the
+#: sweep: on this rig 30097 and 30099 are the Anthropic-API split routers (the
+#: agents' lifeline), which proxy enough of the API to pass _probe_sglang.
+#: Measured 2026-09-27: with the model on 30030 down, the Monitor attached to
+#: 30099 and showed the router as "Server running".
+_NEVER_MONITOR_PORTS = tuple(
+    int(x) for x in os.environ.get("SGLANG_PLANNER_EXCLUDE_PORTS", "30097,30099").replace(",", " ").split()
+    if x.strip().isdigit()
+)
+
 #: Cache of the last auto-detected endpoint (re-verified first on each poll so
 #: a stable hand-started server is one cheap probe, not a port sweep).
 _DETECTED_ENDPOINT = None
@@ -3054,7 +3064,7 @@ def _detect_external_endpoint(
     # pay for an HTTP probe.
     from concurrent.futures import ThreadPoolExecutor
 
-    scan = [int(x) for x in (ports or _DETECT_SWEEP_PORTS)]
+    scan = [int(x) for x in (ports or _DETECT_SWEEP_PORTS) if int(x) not in _NEVER_MONITOR_PORTS]
     with ThreadPoolExecutor(max_workers=32) as ex:
         open_ports = [
             prt
@@ -5401,6 +5411,45 @@ def video_jobs_payload(q: Optional[dict] = None) -> dict:
     }
 
 
+#: Read-only mode (SGLANG_PLANNER_READONLY=1, set by rig-planner.service).
+#: Since the weg2/Docker rework, boots run through the weg2 launcher inside a
+#: container, inside a gpuq window -- never from this page.  The always-on
+#: planner therefore refuses every POST that would start or stop a server,
+#: put load on a card or a running model, download, switch its own code, or
+#: publish anything; planning, reading and the wizard stay available.
+READONLY = os.environ.get("SGLANG_PLANNER_READONLY", "") not in ("", "0", "false", "no")
+READONLY_BLOCKED_POST = (
+    "/api/server_start", "/api/server_stop", "/api/server_restart",
+    "/api/bench_run", "/api/bench_probe", "/api/quality_run", "/api/measure_power",
+    "/api/card_probe", "/api/split_probe", "/api/commsuite/run",
+    "/api/rig_pair/start", "/api/rig_pair/advance", "/api/model_download",
+    "/api/version/switch", "/api/version/cleanup",
+    "/api/discussion_submit", "/api/share_submit", "/api/share/rig_submit",
+)
+READONLY_MESSAGE = (
+    "read-only planner: boots run through the weg2 launcher in a Docker container "
+    "inside a gpuq window (http://<host>:8770/), and GPU measurements, downloads, "
+    "self-updates and publishing are switched off on this always-on instance. "
+    "Live P/D prefill and decode rates: http://<host>:8890/."
+)
+_READONLY_BANNER = (
+    '<div id="ro_banner" style="background:#3a2c00;color:#ffd666;padding:8px 16px;'
+    'font:13px/1.4 ui-monospace,monospace;border-bottom:1px solid #6b5300">'
+    '<b>Nur-Lese-Betrieb.</b> Boots laufen &uuml;ber den weg2-Launcher im Docker-Container '
+    'innerhalb eines <a id="ro_gpuq" style="color:#ffd666" href="/">gpuq-Fensters</a>; '
+    'Start/Stop, Messl&auml;ufe auf den Karten, Downloads, Versionswechsel und Ver&ouml;ffentlichen '
+    'sind hier gesperrt. Planen, Wizard und Tafeln gehen. '
+    '<a id="ro_live" style="color:#ffd666" href="/">Live-Raten (P-/D-Prefill, Decode) &rarr; Rig-Dashboard</a>'
+    '<script>(function(){var h=location.protocol+"//"+location.hostname;'
+    'document.getElementById("ro_gpuq").href=h+":8770/";'
+    'document.getElementById("ro_live").href=h+":8890/";})();</script></div>'
+)
+
+
+def readonly_blocked(path: str) -> bool:
+    return READONLY and any(path.startswith(p) for p in READONLY_BLOCKED_POST)
+
+
 class _Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype):
         data = body.encode() if isinstance(body, str) else body
@@ -5420,7 +5469,15 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
-            self._send(200, INDEX_HTML, "text/html; charset=utf-8")
+            page = INDEX_HTML
+            if READONLY:
+                page = page.replace("<body>", "<body>\n" + _READONLY_BANNER, 1)
+            self._send(200, page, "text/html; charset=utf-8")
+            return
+        if self.path.startswith("/api/readonly"):
+            self._json(200, {"ok": True, "readonly": READONLY,
+                             "blocked_post": list(READONLY_BLOCKED_POST) if READONLY else [],
+                             "message": READONLY_MESSAGE if READONLY else None})
             return
         if self.path.startswith("/api/knobs"):
             try:
@@ -5699,6 +5756,10 @@ class _Handler(BaseHTTPRequestHandler):
                 pass
 
     def do_POST(self):
+        if readonly_blocked(self.path):
+            # Refuse BEFORE reading the body: nothing of the request is acted on.
+            self._json(409, {"ok": False, "readonly": True, "error": READONLY_MESSAGE})
+            return
         try:
             payload = self._read_json()
         except Exception as e:

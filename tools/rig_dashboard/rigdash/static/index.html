@@ -93,6 +93,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .gpu .spark { height: 36px; }
 .gpu .sparkbox { margin-top: 0; }
 .err { color: var(--bad); font-size: 12px; }
+.launch { font-size: 11px; color: var(--text-2); margin-top: 6px; max-height: 360px; overflow: auto; }
+.launch div { padding: 2px 0; border-bottom: 1px dashed var(--line); overflow-wrap: anywhere; }
 details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
 .note { font-size: 12px; color: var(--text-2); max-width: 900px; }
 .note b { color: var(--text); }
@@ -112,6 +114,7 @@ details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
   <span class="sub" id="sub">verbinde&hellip;</span>
   <nav>
     <a id="gpuqlink" href="/" target="_blank" rel="noopener">GPU-Fensterplan</a>
+    <a id="plannerlink" href="/" target="_blank" rel="noopener">Planer (Tafeln, Wizard)</a>
     <a href="/api/live" target="_blank" rel="noopener">JSON</a>
   </nav>
 </header>
@@ -304,6 +307,7 @@ function bootCard(b, now, binders) {
         ${flipHtml}${flipHtml ? `<div class="muted" style="font-size:11px">letzte ${flips.length} Flips, Höhe = flip_total &middot; <span style="color:var(--s1)">■</span> P→D <span style="color:var(--s2)">■</span> D→P</div>` : ""}
       </div>
     </div>
+    ${(m.launch || []).length ? `<details id="launch-${esc(b.stem)}" style="margin-top:10px"><summary>Startform (weg2-Launcher, ${m.launch.length} Kernzeilen aus dem Front-Log)</summary><div class="launch mono">${m.launch.map((l) => `<div>${esc(l)}</div>`).join("")}</div></details>` : ""}
     ${errs.length ? `<details id="err-${esc(b.stem)}" style="margin-top:10px"><summary>letzte Fehlerzeilen (${fmt(b.error_count)})</summary>${errs.map((e) => `<div class="err mono">${hhmm(e.t)} [${esc(e.group)}] ${esc(e.text)}</div>`).join("")}</details>` : ""}
   </section>`;
 }
@@ -401,6 +405,7 @@ async function refresh() {
   }
 }
 $("gpuqlink").href = `${location.protocol}//${location.hostname}:8770/`;
+$("plannerlink").href = `${location.protocol}//${location.hostname}:8780/`;
 refresh();
 setInterval(refresh, 2000);
 </script>

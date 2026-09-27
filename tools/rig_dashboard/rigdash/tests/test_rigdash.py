@@ -201,6 +201,21 @@ class LiveTests(unittest.TestCase):
         self.assertFalse(v["health"]["P"]["alive"])
 
 
+class LaunchLineTests(unittest.TestCase):
+    def test_key_lines_kept_dedup_and_stripped(self):
+        lines = [
+            BOOT,
+            FORM,
+            "[2026-09-27T09:32:20Z] WEG2-LAUNCH #1217/#1233 shm residue: none of ours in /dev/shm",
+            "[2026-09-27T09:32:20Z] WEG2-LAUNCH X PROVENANCE: X=4096 source=flag",
+            "[2026-09-27T09:32:21Z] WEG2-LAUNCH X PROVENANCE: X=4096 source=flag",
+        ]
+        out = live.launch_lines(lines)
+        self.assertEqual(len(out), 3)
+        self.assertTrue(out[0].startswith("=== WEG2 BOOT tag="))
+        self.assertEqual(out[2], "X PROVENANCE: X=4096 source=flag")
+
+
 class SourceTests(unittest.TestCase):
     def test_nvsmi_csv(self):
         txt = ("0, NVIDIA GeForce RTX 3080, GPU-5c64, 225.11, 230.00, 19334, 20480, 100, 65, 1710\n"

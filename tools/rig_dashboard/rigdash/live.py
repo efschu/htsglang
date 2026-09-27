@@ -37,6 +37,15 @@ WINDOW_S = 60.0        # headline window for the rates
 BUCKET_S = 5.0
 HISTORY_S = 15 * 60.0
 
+# Launcher summary lines worth showing as the boot's "start form" (read-only
+# view of what the weg2 launcher actually emitted; the full list is ~250 lines).
+LAUNCH_KEYS = (
+    "WEG2 BOOT tag=", "WEG2-FORM ", "NVML -> CUDA ordinal map", "POWER-LIMIT nvml",
+    "SCHEDULING FLAGS AS EMITTED", "SCHEDULING KNOBS", "X PROVENANCE", "X CEILING",
+    "IDLE POLICY", "budget P group=", "budget D group=", "host preflight", "WEG2-L2 D hicache_size",
+)
+MAX_LAUNCH_LINES = 40
+
 RE_GROUP = re.compile(r"^(?P<stem>.+?)\.(?P<group>P|D|front)\.log$")
 
 
@@ -100,6 +109,23 @@ class Tail:
         return [ln.decode("utf-8", "replace") for ln in lines]
 
 
+def launch_lines(lines: List[str]) -> List[str]:
+    """The launcher's key summary lines, de-duplicated, in order, prefix stripped."""
+    out, seen = [], set()
+    for ln in lines:
+        i = ln.find("WEG2-LAUNCH ")
+        if i < 0:
+            continue
+        body = ln[i + len("WEG2-LAUNCH "):].strip()
+        if not any(k in body for k in LAUNCH_KEYS) or body in seen:
+            continue
+        seen.add(body)
+        out.append(body[:600])
+        if len(out) >= MAX_LAUNCH_LINES:
+            break
+    return out
+
+
 def _rate(tok, ms):
     return (tok / (ms / 1000.0)) if (tok and ms and ms > 0) else None
 
@@ -131,7 +157,10 @@ class Boot:
             return
         t = Tail(path)
         self.tails[group] = t
-        for line in t.read_head():
+        head = t.read_head()
+        if group == "front":
+            self.meta["launch"] = launch_lines(head)
+        for line in head:
             ev = parse.parse_line(line)
             if ev and ev["kind"] in ("boot", "form", "server_args"):
                 self._ingest(group, ev, head=True)

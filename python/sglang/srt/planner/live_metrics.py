@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -110,6 +111,27 @@ __all__ = [
 PROMPT_TOKENS_METRIC = "sglang:prompt_tokens_total"
 GENERATION_TOKENS_METRIC = "sglang:generation_tokens_total"
 CACHED_TOKENS_METRIC = "sglang:cached_tokens_total"  # labelled by cache_source
+#: The weg2 front (and newer schedulers) export no prompt/generation counters,
+#: only ``sglang:realtime_tokens_total{mode="prefill_compute"|"prefill_cache"|
+#: "decode"}``.  Without this fallback every rate on the Monitor tab read 0.0
+#: against a server decoding at 200 tok/s (measured 2026-09-27, 27B weg2 boot).
+REALTIME_TOKENS_METRIC = "sglang:realtime_tokens_total"
+
+
+def realtime_tokens_by_mode(metrics_text: str) -> Dict[str, float]:
+    """``{mode: summed value}`` for ``sglang:realtime_tokens_total``."""
+    out: Dict[str, float] = {}
+    for line in metrics_text.splitlines():
+        if not line.startswith(REALTIME_TOKENS_METRIC + "{"):
+            continue
+        m = re.search(r'mode="([^"]+)"', line)
+        try:
+            val = float(line.rsplit("}", 1)[1].split()[0])
+        except (IndexError, ValueError):
+            continue
+        if m:
+            out[m.group(1)] = out.get(m.group(1), 0.0) + val
+    return out
 SPEC_ACCEPT_RATE_METRIC = "sglang:spec_accept_rate"
 SPEC_NUM_STEPS_METRIC = "sglang:spec_num_steps"        # current adaptive-k
 SPEC_EMA_ACCEPT_LEN_METRIC = "sglang:spec_ema_accept_len"
@@ -536,9 +558,22 @@ def _parse_counters(metrics_text: str) -> Dict[str, Any]:
 
     hicache = _parse_hicache(flat)
 
+    prompt_total = flat.get(PROMPT_TOKENS_METRIC, 0.0)
+    gen_total = flat.get(GENERATION_TOKENS_METRIC, 0.0)
+    token_source = "prompt/generation_tokens_total"
+    if PROMPT_TOKENS_METRIC not in flat and GENERATION_TOKENS_METRIC not in flat:
+        rt = realtime_tokens_by_mode(metrics_text)
+        if rt:
+            token_source = "realtime_tokens_total"
+            prompt_total = rt.get("prefill_compute", 0.0) + rt.get("prefill_cache", 0.0)
+            gen_total = rt.get("decode", 0.0)
+            if not cached_by_source and "prefill_cache" in rt:
+                cached_by_source = {"prefill_cache": rt["prefill_cache"]}
+
     return {
-        "prompt_tokens_total": flat.get(PROMPT_TOKENS_METRIC, 0.0),
-        "generation_tokens_total": flat.get(GENERATION_TOKENS_METRIC, 0.0),
+        "prompt_tokens_total": prompt_total,
+        "generation_tokens_total": gen_total,
+        "token_source": token_source,
         "cached_by_source": cached_by_source,
         "cached_total": sum(cached_by_source.values()),
         "gen_throughput": flat.get(GEN_THROUGHPUT_METRIC, 0.0),
