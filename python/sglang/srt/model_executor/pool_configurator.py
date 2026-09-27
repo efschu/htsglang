@@ -660,8 +660,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
         )
+        from sglang.srt.rank_role import this_rank_is_form_a_worker
 
         if num_layers == 0:
+            return 0
+        if this_rank_is_form_a_worker():
+            # #239 S0: a Form A expert worker runs no QSA indexer (its
+            # attention modules are host-only), so it keeps no compressed
+            # index -- rc12r booked 768 B/token = 192 MiB per 3080 for it.
             return 0
         qsa_profile = parse_qsa_profile(hf_config)
         if qsa_profile is None:
