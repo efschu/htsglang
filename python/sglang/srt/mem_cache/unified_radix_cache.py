@@ -5051,27 +5051,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         return True
 
-    def _1424_verify_load_chain(self, kv_xfer, req=None) -> None:
-        """#1424: a paged-arena load-back chain is proven against its TOKENS
-        before it is queued (pool_host/arena_pool.verify_load_chain): a chain
-        that is not whole distinct pages, or that carries one of P's hand-off
-        keys at another depth, is re-keyed page by page to the key its tokens
-        have -- P's hand-off key of that depth (the request's chain, indexed
-        from token 0) or D's own key chained from the proven page before it --
-        and re-pointed to that key's COMPLETE slot. Unpaged pools and the
-        staging path are untouched."""
+    def _1424_chain_args(self, nodes, req=None):
+        """#1424: the chain proof's inputs for ``nodes`` (a load-back chain,
+        root-most first), or None when this tree has no paged arena to prove
+        against. ``page0`` / ``prior0`` come from the ancestors, P's hand-off
+        chain from the request, and D's own keys in BOTH hash conventions the
+        host tier uses: the store's READ convention (``get_hash_str`` over the
+        page's plain token ids -- what ``_storage_hit_query`` keys a prefetch
+        with, and what the prefetch-inserted node stores) and the tree's
+        RadixKey convention (``compute_node_hash_values``; bigram on an EAGLE
+        tree, so it differs from the read convention there)."""
         cc = self.cache_controller
         group = getattr(cc, "mem_pool_host", None)
         if not getattr(group, "arena_read", False):
-            return
+            return None
         pool = getattr(getattr(group, "anchor_entry", None), "host_pool", group)
         if getattr(pool, "arena", None) is None:
-            return
+            return None
         from sglang.srt.managers.cache_controller import weg2_suffixed_stems
-        from sglang.srt.mem_cache.pool_host import arena_pool as _ap
         from sglang.srt.weg2.handoff_keys import CHAIN_ATTR
 
-        nodes = list(kv_xfer.nodes_to_load or ())
         page0 = prior0 = None
         P = int(getattr(self, "page_size", 0) or 0)
         root = getattr(self, "root_node", None)
@@ -5087,15 +5086,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     prior0 = parent.get_last_hash_value()
 
         def _own(node, i, prior):
+            out = []
+            key = node.key
             try:
-                return get_hash_str(node.key[i * P:(i + 1) * P], prior, page_size=P)[0]
-            except Exception:  # noqa: BLE001 -- no own key = P's key alone proves the page
-                return None
+                raw = key.raw_token_ids() if hasattr(key, "raw_token_ids") else key
+                out.append(get_hash_str([int(t) for t in raw[i * P:(i + 1) * P]], prior, page_size=P)[0])
+            except Exception:  # noqa: BLE001 -- a convention that cannot hash proves nothing
+                pass
+            try:
+                tree_key = get_hash_str(key[i * P:(i + 1) * P], prior, page_size=P)[0]
+                if tree_key not in out:
+                    out.append(tree_key)
+            except Exception:  # noqa: BLE001
+                pass
+            return out
 
-        kv_xfer.host_indices = _ap.verify_load_chain(
-            pool,
-            nodes,
-            kv_xfer.host_indices,
+        return dict(
+            pool=pool,
             rows_of=lambda n: n.component_data[BASE_COMPONENT_TYPE].host_value,
             stems_of=lambda h: weg2_suffixed_stems(cc.storage_backend, h),
             own_hash=_own if page0 is not None else None,
@@ -5103,6 +5110,68 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             page0=page0,
             prior0=prior0,
         )
+
+    def _1424_verify_load_chain(self, kv_xfer, req=None) -> None:
+        """#1424: a paged-arena load-back chain is proven against its TOKENS
+        before it is queued (pool_host/arena_pool.verify_load_chain): a chain
+        that is not whole distinct pages, or that carries one of P's hand-off
+        keys at another depth, is re-keyed page by page to the key its tokens
+        have and re-pointed to that key's COMPLETE slot. A page nothing
+        proves is the last latch (named stop): the admission vote cut the
+        group's match above it (``weg2_chain_proof_depth``). Unpaged pools and
+        the staging path are untouched."""
+        from sglang.srt.mem_cache.pool_host import arena_pool as _ap
+
+        nodes = list(kv_xfer.nodes_to_load or ())
+        args = self._1424_chain_args(nodes, req)
+        if args is None:
+            return
+        pool = args.pop("pool")
+        kv_xfer.host_indices = _ap.verify_load_chain(pool, nodes, kv_xfer.host_indices, **args)
+
+    def weg2_chain_proof_depth(self, node, req=None):
+        """#1424d (rc12n2 D-TP0 13:36:10): the depth up to which the host
+        chain ending at ``node`` is PROVEN page by page, or None when there is
+        nothing to cut (no evicted chain, no paged arena, or every page
+        proven). Side-effect free -- the admission vote
+        (``tp_match_floor.admission_probe``) cuts this rank's usable match
+        here, so the group-uniform MIN takes the whole group to the last
+        proven page instead of one rank dying at the load: the rest is
+        re-prefilled on D when it fits X, and re-routed via P when it does not
+        (the X gate prices the group's cut depth)."""
+        from sglang.srt.mem_cache.pool_host import arena_pool as _ap
+
+        root = getattr(self, "root_node", None)
+        chain, cur = [], node
+        while cur is not None and cur is not root and getattr(cur, "evicted", False):
+            chain.append(cur)
+            cur = cur.parent
+        if not chain:
+            return None
+        chain.reverse()
+        args = self._1424_chain_args(chain, req)
+        if args is None:
+            return None
+        pool = args.pop("pool")
+        proven, total = _ap.provable_pages(pool, chain, **args)
+        if proven >= total:
+            return None
+        P = int(self.page_size)
+        base, x = 0, chain[0].parent
+        while x is not None and x is not root:
+            base += len(x.key)
+            x = x.parent
+        cut = base + int(proven) * P
+        n = getattr(UnifiedRadixCache, "_1424d_cut_n", 0) + 1
+        UnifiedRadixCache._1424d_cut_n = n
+        if n <= 16 or n % 64 == 0:
+            logger.warning(
+                "#1424d PROOF-CUT rid=%s chain_pages=%d proven=%d cut_depth=%d n=%d -- a host page "
+                "of this match is not proven against its tokens; the usable match is cut there, "
+                "group-uniform through the usable-match MIN (rest <= X: D re-prefills it; rest > X: "
+                "via P). Never loaded unproven, never a rank alone.",
+                str(getattr(req, "rid", "?")), int(total), int(proven), cut, n)
+        return cut
 
     def _build_sidecar_transfers(
         self,
