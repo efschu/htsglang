@@ -63,6 +63,56 @@ class FakeGraph:
         return self.handle
 
 
+class LazyGraph:
+    """torch 2.11 with keep_graph=True: no exec until instantiate() (rc12i)."""
+
+    def __init__(self, handle=0xBEEF):
+        self.handle = handle
+        self.instantiated = 0
+
+    def raw_cuda_graph_exec(self):
+        if not self.instantiated:
+            raise RuntimeError("You cannot access the raw cudaGraphExec_t instance until instantiate() "
+                               "has been called")
+        return self.handle
+
+    def instantiate(self):
+        self.instantiated += 1
+
+
+class TheLazyExecIsInstantiatedNotSkipped(CustomTestCase):
+    """rc12i metal (27.09., 2d680cbe66): all 36 shapes were 'skipped: RuntimeError
+    ... until instantiate() has been called'. The helper must instantiate."""
+
+    def test_a_lazy_graph_is_instantiated_once_and_uploaded(self):
+        g, lib = LazyGraph(), FakeLib()
+        with self.assertLogs(GU.logger, level="INFO") as cm:
+            got = GU.upload_after_capture(g, "ShapeKey(size=3)", FakeStream(), lib=lib,
+                                          cuda=FakeCuda([900 * MIB, 890 * MIB]))
+        self.assertEqual(got, (0, 10.0))
+        self.assertEqual(g.instantiated, 1)
+        self.assertEqual(lib.calls, [(0xBEEF, 0x5150)])
+        self.assertIn("instantiated_here=1", cm.output[-1])
+        self.assertNotIn("skipped", cm.output[-1])
+
+    def test_an_already_instantiated_graph_is_not_instantiated_again(self):
+        g = LazyGraph(); g.instantiated = 1
+        with self.assertLogs(GU.logger, level="INFO") as cm:
+            GU.upload_after_capture(g, "k", FakeStream(), lib=FakeLib(), cuda=FakeCuda([5 * MIB, 5 * MIB]))
+        self.assertEqual(g.instantiated, 1)
+        self.assertIn("instantiated_here=0", cm.output[-1])
+
+    def test_a_lazy_graph_without_instantiate_is_a_skipped_line(self):
+        class NoInst(LazyGraph):
+            instantiate = None
+
+        lib = FakeLib()
+        with self.assertLogs(GU.logger, level="WARNING") as cm:
+            self.assertIsNone(GU.upload_after_capture(NoInst(), "k", FakeStream(), lib=lib, cuda=FakeCuda([1, 1])))
+        self.assertEqual(lib.calls, [])
+        self.assertIn("skipped: RuntimeError", cm.output[-1])
+
+
 class TheUploadIsPaidAtCaptureAndPrinted(CustomTestCase):
     def test_upload_calls_the_driver_with_exec_and_stream_and_prints_mib(self):
         lib, cuda = FakeLib(), FakeCuda([1000 * MIB, 988 * MIB])

@@ -77,15 +77,32 @@ def reset_for_tests() -> None:
     _LIB["tried"] = False
 
 
-def _exec_handle(graph: Any) -> Optional[int]:
-    """The cudaGraphExec_t (== CUgraphExec) of a torch CUDAGraph, or None
-    (older torch without ``raw_cuda_graph_exec``, or nothing instantiated)."""
+def _exec_handle(graph: Any) -> Tuple[Optional[int], bool]:
+    """``(cudaGraphExec_t, instantiated_here)`` of a torch CUDAGraph; ``(None,
+    False)`` for an older torch without ``raw_cuda_graph_exec``.
+
+    rc12i (27.09., boot on 2d680cbe66): capture_one builds the graph with
+    ``keep_graph=True`` (Task #52), and torch then instantiates LAZILY -- in the
+    first ``replay`` -- so every shape answered "You cannot access the raw
+    cudaGraphExec_t instance until instantiate() has been called" and nothing
+    was uploaded. Instantiating here is what replay would do anyway (it skips
+    its own instantiate once one happened; the collective clock's
+    ``graph_handles`` does the same try/instantiate), only earlier."""
     raw = getattr(graph, "raw_cuda_graph_exec", None)
     if raw is None:
-        return None
-    h = raw()
+        return None, False
+    here = False
+    try:
+        h = raw()
+    except RuntimeError:
+        inst = getattr(graph, "instantiate", None)
+        if inst is None:
+            raise
+        inst()
+        here = True
+        h = raw()
     h = int(h) if h is not None else 0
-    return h or None
+    return (h or None), here
 
 
 def upload_after_capture(
@@ -110,7 +127,7 @@ def upload_after_capture(
                 return None  # never inside a capture
         except Exception:  # noqa: BLE001
             pass
-        h = _exec_handle(graph)
+        h, here = _exec_handle(graph)
         if h is None:
             logger.info("%s shape=%s skipped: no graph exec handle (torch without raw_cuda_graph_exec?)",
                         MARKER, shape_key)
@@ -131,8 +148,8 @@ def upload_after_capture(
         free1, _ = cuda.mem_get_info()
         mib = (float(free0) - float(free1)) / MIB
         if rc == 0:
-            logger.info("%s shape=%s mib=%.1f ms=%.1f rc=0 card_free_after=%.0f", MARKER, shape_key, mib, ms,
-                        free1 / MIB)
+            logger.info("%s shape=%s mib=%.1f ms=%.1f rc=0 card_free_after=%.0f instantiated_here=%d", MARKER,
+                        shape_key, mib, ms, free1 / MIB, int(here))
         else:
             logger.warning("%s shape=%s FAILED rc=%d mib=%.1f card_free=%.0f -- the graph uploads lazily at its "
                            "first replay (the pre-fix behaviour)", MARKER, shape_key, rc, mib, free1 / MIB)
