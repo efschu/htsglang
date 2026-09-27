@@ -3597,6 +3597,11 @@ class Front:
             # answer with X-REQUEUE.
             self._leg2_lookahead: Set[str] = set()
             self._rvp_requeue: Dict[str, dict] = {}
+            # ROS-1P (NF rc12p): ONE path per rid. rids whose client stream
+            # ended (no P-only leg may start for them any more) and rids with a
+            # P-only leg queued or in flight (a second needs-p is the same hold).
+            self._rvp_ended: Dict[str, float] = {}
+            self._rvp_inflight: Set[str] = set()
 
     def _note_front_price(self, rid: str, uncached: int) -> None:
         """The front's route-time price of a rid, for the W50-REROUTE line."""
@@ -3618,17 +3623,23 @@ class Front:
             ids = [int(t) for t in (r.get("input_ids") or ())]
             if not rid or not ids:
                 continue
-            if rid in self._leg2_lookahead and _rvp.open_stream_enabled():
-                # ROS: D holds a stream the front has NOT committed yet (no
-                # byte reached the client): the old X-REQUEUE answers it, from
-                # the lookahead that holds the leg (no P-only leg here).
-                self._rvp_requeue[rid] = r
-                self.counters["rvp_uncommitted_requeue"] += 1
-                logger.warning(
-                    "WEG2 W50-REROUTE rid=%s front_price=%s d_extent=%d reason=%s path=held-uncommitted "
-                    "-- D holds the stream, no byte reached the client yet: X-REQUEUE as a fresh refusal",
-                    rid, self._front_price.get(rid, "?"), int(r.get("d_extent") or 0), r.get("reason", "?"))
+            # ROS-1P (NF rc12p, weg2-9-39): a held-uncommitted stream is NOT
+            # re-queued any more -- the requeue started a second path for the
+            # rid while D kept its park (D streamed 154 tokens on the old
+            # stream, the requeued leg 2 answered an empty 200). D holds, P
+            # prefills, D continues the one stream; the lookahead just keeps
+            # reading it. Same P-only leg as mid-stream.
+            if rid in self._rvp_ended:
+                self.counters["rvp_after_end_dropped"] += 1
+                logger.warning("RESUME-VIA-P needs-p rid=%s dropped: its client stream already "
+                               "ended (no P-only leg for a finished stream)", rid)
                 continue
+            if rid in self._rvp_inflight:
+                self.counters["rvp_duplicate_dropped"] += 1
+                logger.info("RESUME-VIA-P needs-p rid=%s dropped: a P-only leg for it is already "
+                            "queued or running (one path per rid)", rid)
+                continue
+            _path = "held-uncommitted" if rid in self._leg2_lookahead else "midstream"
             payload = {"rid": rid, "input_ids": ids,
                        "sampling_params": {"max_new_tokens": 1, "temperature": 0.0}}
             p = Pending(rid=rid, path="/generate", payload=payload, text=f"\x00rvp:{rid}",
@@ -3636,21 +3647,48 @@ class Front:
                         est_prompt=len(ids), est_uncached=int(r.get("d_extent") or len(ids)),
                         span_known=True, p_only=True, resume_via_p=True)
             self.queue.append(p)
+            self._rvp_inflight.add(rid)
             self.counters["rvp_rerouted"] += 1
             logger.warning(
-                "WEG2 W50-REROUTE rid=%s front_price=%s d_extent=%d reason=%s path=midstream "
+                "WEG2 W50-REROUTE rid=%s front_price=%s d_extent=%d reason=%s path=%s "
                 "tokens=%d -- D kept the stream and parked the request; P prefills its context "
                 "(P-only leg 1, /generate), D resumes after the flip back",
                 rid, self._front_price.get(rid, "?"), int(r.get("d_extent") or 0),
-                r.get("reason", "?"), len(ids))
+                r.get("reason", "?"), _path, len(ids))
         if reqs:
             self._kick_controller("arrival")
         return len(reqs)
 
     def _rvp_p_finished(self, p: "Pending") -> None:
         """P's leg 1 of a RESUME-VIA-P request is done: no leg 2 (D holds the
-        stream); the stream's next chunk closes the record."""
+        stream); the stream's next chunk closes the record.
+
+        ROS-1P (NF rc12p: 13 of 19 p-done lines followed "leg1 on P returned
+        400: Duplicate request ID"): p-done only for a leg that SUCCEEDED
+        (``leg1_done``). A failed leg logs ``RESUME-VIA-P p-failed`` and aborts
+        D's parked request by name -- the client gets an error, not a wait."""
         self._rvp_state()
+        self._rvp_inflight.discard(p.rid)
+        if not getattr(p, "leg1_done", False):
+            self.counters["rvp_p_failed"] += 1
+            err = None
+            try:
+                err = p.fut.exception() if p.fut.done() else None
+            except Exception:  # noqa: BLE001 -- a cancelled fut
+                err = None
+            logger.error("RESUME-VIA-P p-failed rid=%s: P's prefill leg did not succeed (%s); "
+                         "aborting D's parked request by name", p.rid, err)
+            if not p.fut.done():
+                p.fut.set_result(None)
+            if p.rid not in self._rvp_ended:
+                self._rvp_abort_task = asyncio.ensure_future(self._rvp_abort_d(p.rid))
+            return
+        if p.rid in self._rvp_ended:
+            self.counters["rvp_p_done_after_end"] += 1
+            logger.info("RESUME-VIA-P p-done rid=%s after its stream ended -- dropped", p.rid)
+            if not p.fut.done():
+                p.fut.set_result(None)
+            return
         now = time.time()
         p_ms = (now - float(p.t_arrive)) * 1000.0
         self._rvp_p_done[p.rid] = (now, p_ms)
@@ -3660,6 +3698,54 @@ class Front:
             p.fut.set_result(None)
         logger.info("RESUME-VIA-P p-done rid=%s p_ms=%.0f (reroute -> P prefill done, flips "
                     "included) tokens=%d", p.rid, p_ms, int(p.est_prompt))
+
+    async def _rvp_abort_d(self, rid: str) -> None:
+        """ROS-1P: the named abort of D's parked request after a failed P leg."""
+        try:
+            code, body = await self.rpc(self.groups["D"], "/abort_request", {"rid": rid}, 30)
+            logger.error("RESUME-VIA-P p-failed rid=%s -> /abort_request on D: %s %s", rid, code,
+                         str(body)[:200])
+        except Exception as e:  # noqa: BLE001
+            logger.error("RESUME-VIA-P p-failed rid=%s -> /abort_request on D raised: %s", rid, e)
+
+    def _rvp_stream_begin(self, rid: str) -> None:
+        """ROS-1P: a leg 2 for ``rid`` starts (a fresh X-REQUEUE re-enters leg 2
+        under the same rid) -- its earlier end no longer applies."""
+        if getattr(self, "_rvp_ended", None) is not None:
+            self._rvp_ended.pop(rid, None)
+
+    def _rvp_stream_end(self, rid: str) -> None:
+        """ROS-1P (NF rc12p: weg2-10-44 ran 3x on P, weg2-10-42 2x, 44.6 s of P
+        for finished streams; WAIT-BOUND named weg2-10-42 2 min after it was
+        served): the client stream of ``rid`` ended, however it ended. Drop
+        every RESUME-VIA-P record of it, its needs-p file and its queued P-only
+        legs; mark it so no P-only leg starts for it any more."""
+        if getattr(self, "_rvp_dir", None) is None:
+            return
+        self._rvp_p_done.pop(rid, None)
+        self._rvp_requeue.pop(rid, None)
+        self._leg2_lookahead.discard(rid)
+        self._rvp_ended[rid] = time.time()
+        while len(self._rvp_ended) > 4096:
+            self._rvp_ended.pop(next(iter(self._rvp_ended)))
+        dropped = 0
+        for q in list(self.queue):
+            if getattr(q, "resume_via_p", False) and q.rid == rid:
+                self.queue.remove(q)
+                self._rvp_inflight.discard(rid)
+                if not q.fut.done():
+                    q.fut.set_result(None)
+                dropped += 1
+        if self._rvp_dir:
+            try:
+                os.remove(os.path.join(self._rvp_dir, f"{rid}.json"))
+                dropped += 1
+            except OSError:
+                pass
+        if dropped:
+            self.counters["rvp_orphans_dropped"] += dropped
+            logger.info("RESUME-VIA-P stream-end rid=%s: %d orphan(s) dropped (queued P-only "
+                        "leg / needs-p file)", rid, dropped)
 
     def _ros_lookahead_begin(self, rid: str) -> Optional[Callable[[], bool]]:
         """ROS: register ``rid``'s leg-2 lookahead (nothing committed to the
@@ -3765,7 +3851,9 @@ class Front:
                 else "nothing running: the flip to P follows without a park")
         else:
             self.counters["wait_bound_fired"] += 1
-            oldest = max(self.queue, key=lambda p: phase_policy.d_phase_wait_s(p.t_arrive, self.t_awake, now),
+            # ROS-1P: a served / finished request (future done) is not waiting.
+            oldest = max((p for p in self.queue if not p.fut.done()),
+                         key=lambda p: phase_policy.d_phase_wait_s(p.t_arrive, self.t_awake, now),
                          default=None)
             logger.warning(
                 "WEG2 WAIT-BOUND FIRED epoch=%d oldest_rid=%s waited_s=%.1f bound_s=%.1f "
@@ -6081,6 +6169,8 @@ class Front:
             so["include_usage"] = True
             payload["stream_options"] = so
         try:
+            if getattr(self, "_rvp_dir", None) is not None:
+                self._rvp_stream_begin(rid)  # ROS-1P
             async with self.session.post(f"{g.url}{request.path}", json=payload) as r:
                 # FIX 2 (round 1): LAW 4's RE-ROUTE IS DECIDED BEFORE THE
                 # RESPONSE IS COMMITTED, ON BOTH WIRE SHAPES.  The check used
@@ -6484,6 +6574,11 @@ class Front:
             # H91 part C: a parked request that ends (served, aborted, failed)
             # is no longer parked either.
             (getattr(self, "_d_parked", None) or {}).pop(rid, None)
+            # ROS-1P: every RESUME-VIA-P trace of the rid ends with its stream.
+            # (An X-REQUEUE re-enters leg 2 NESTED inside this one and ends
+            # first; ending twice is idempotent.)
+            if stream:
+                self._rvp_stream_end(rid)
             if seat is not None:
                 # C4: THE refill point.  Every exit of leg 2 -- served,
                 # refused, raised, cancelled -- passes here, so a freed seat

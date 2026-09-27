@@ -111,12 +111,13 @@ def test_held_refusal_body_parses_like_ds_w50():
 def _front(tmp_path):
     from sglang.srt.weg2 import front as F
 
-    ns = types.SimpleNamespace(tag="dkrtest", queue=[], counters={"rvp_rerouted": 0, "rvp_resumed": 0,
-                                                                  "rvp_uncommitted_requeue": 0},
-                               kicks=[])
+    import collections
+
+    ns = types.SimpleNamespace(tag="dkrtest", queue=[], counters=collections.Counter(), kicks=[])
     ns._kick_controller = lambda why: ns.kicks.append(why)
     for name in ("_rvp_state", "_note_front_price", "_rvp_take", "_rvp_p_finished", "_rvp_resumed",
-                 "_ros_lookahead_begin", "_ros_lookahead_end"):
+                 "_ros_lookahead_begin", "_ros_lookahead_end", "_rvp_stream_begin",
+                 "_rvp_stream_end", "_rvp_abort_d"):
         setattr(ns, name, getattr(F.Front, name).__get__(ns))
     return F, ns
 
@@ -143,7 +144,10 @@ PING = b'event: ping\ndata: {"type": "ping"}\n\n'
 DELTA = b'event: content_block_start\ndata: {}\n\n'
 
 
-def test_held_while_in_the_lookahead_is_x_requeue(d_env, monkeypatch, caplog):
+def test_held_while_in_the_lookahead_is_resume_via_p_one_path(d_env, monkeypatch, caplog):
+    """ROS-1P (NF rc12p weg2-9-39): a hold during the lookahead is NOT re-queued any more (that
+    started a second path while D kept its park); D holds, P prefills, the lookahead keeps
+    reading the one stream."""
     monkeypatch.setattr("sglang.srt.weg2.front.ROS_POLL_S", 0.02)
     F, ns = _front(d_env)
 
@@ -152,16 +156,14 @@ def test_held_while_in_the_lookahead_is_x_requeue(d_env, monkeypatch, caplog):
         assert stop is not None and "weg2-16-59" in ns._leg2_lookahead
 
         async def d_holds():
-            await asyncio.sleep(0.12)
+            await asyncio.sleep(0.05)
             rvp.write_request("weg2-16-59", list(range(10)), 18749, 12288, "x_refusal_midstream")
 
         asyncio.ensure_future(d_holds())
-        with pytest.raises(F._RosHeld):
-            await F._anthropic_refusal_lookahead(_r([START] + [PING] * 20), stop)
-        rec = ns._ros_lookahead_end("weg2-16-59")
-        assert rec is not None and rec["d_extent"] == 18749
-        assert ns.queue == [], "no P-only leg: the X-REQUEUE answers it"
-        assert "weg2-16-59" not in ns._leg2_lookahead and ns._rvp_requeue == {}
+        head, refused = await F._anthropic_refusal_lookahead(_r([START] + [PING] * 7, gap=0.03), stop)
+        assert not refused and head.count(b"event: ping") == 7
+        assert ns._ros_lookahead_end("weg2-16-59") is None, "no requeue record: one path"
+        assert [q.rid for q in ns.queue] == ["weg2-16-59"] and ns.queue[0].resume_via_p
 
     with caplog.at_level("WARNING"):
         asyncio.new_event_loop().run_until_complete(body())
