@@ -9154,12 +9154,35 @@ class Front:
         oks = await asyncio.gather(
             *(self._probe_group_health(g, _fh.PROBE_TIMEOUT_S) for g in groups)
         )
+        from sglang.srt.weg2 import progress_beacon as _fp
+
+        _fp_dir = _fp.beacon_dir(getattr(self, "tag", "") or "") if _fp.enabled() else ""
+        _fp_prev = getattr(self, "_fp_prev", None)
+        if _fp_prev is None:
+            _fp_prev = self._fp_prev = {}
         for g, ok in zip(groups, oks):
             alive = _sid_alive(g.sid)
             hold = _fh.find_hold(g.sid, self.t0, dirs)
+            # FP: read every poll so the previous snapshot is always the last poll's.
+            _fp_why = None
+            if _fp_dir:
+                _cur = _fp.read_group(_fp_dir, g.name, g.sid)
+                _fp_why = _fp.progress(_fp_prev.get(g.name, {}), _cur)
+                _fp_prev[g.name] = _cur
             if ok and alive and hold is None:
                 g.health_fail_streak = 0
                 g.health_facts = _fh.GroupFacts(True, True, 0, None, time.time())
+                continue
+            if not ok and alive and hold is None and _fp_why is not None:
+                # FP (weg2/progress_beacon.py): the group computes -- a slow
+                # /health behind a long forward is not a failure; no streak.
+                g.health_fail_streak = 0
+                g.health_facts = _fh.GroupFacts(False, True, 0, None, time.time())
+                self.counters["health_busy"] += 1
+                _nb = self.counters["health_busy"]
+                if _nb <= 12 or _nb % 64 == 0:
+                    logger.info("WEG2-HEALTH-BUSY group=%s http_ok=False progress=%s (n=%d): the group "
+                                "computes; not counted toward the streak", g.name, _fp_why, _nb)
                 continue
             g.health_fail_streak += 1
             g.health_facts = _fh.GroupFacts(bool(ok), bool(alive), g.health_fail_streak, hold, time.time())
