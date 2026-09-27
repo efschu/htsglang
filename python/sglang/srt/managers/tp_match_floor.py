@@ -348,7 +348,7 @@ def can_realize(tree_cache: Any, req: Any, depth: int) -> bool:
                 req=None,
             )
         )
-        if _local_match_len(result) != int(depth):
+        if _admission_len(result) != int(depth):
             return False
         return not anchor_unusable(tree_cache, getattr(result, "best_match_node", None))
     # H99 audit: this except stays, and only here: every caller is a VOTE
@@ -508,6 +508,44 @@ def _local_match_len(result: Any) -> int:
     )
 
 
+def host_admission_len(result: Any) -> int:
+    """H105b: the depth the Form A attention host actually ADMITS for this
+    match -- the device prefix plus the #1040 state-aligned load-back extent,
+    the same expression ``stamp_state_aligned_extent`` applies at admission.
+
+    rc12w (dkrnfh91dprsabar1dauer09272038, 20:44:14, rid weg2-0-1, #248
+    wake-read): TP0's match was device 0 + host hit 23040 (the leading 2560-
+    token node counts no host hit), key and anchor at 25600. The host voted
+    23040, the workers FOLLOWED 23040, and TP0's own load-back raised its
+    extent to the anchor (``#1040 ... kv=23040 extent=25600``,
+    ``#988 LOADBACK prefix moved to 25600``). TP0 took the tail skip and
+    closed its admission loop; the workers extended 2571 tokens and went on
+    to the next gate -- ``H105 RU FORM-A ADMISSION MALFORMED``. The host's
+    vote and its admission must be one number."""
+    di = getattr(result, "device_indices", None)
+    device = 0 if di is None else len(di)
+    kv = int(getattr(result, "host_hit_length", 0) or 0)
+    if kv <= 0:
+        return device
+    anchor = getattr(result, "state_anchor_depth", None)
+    if anchor is None:
+        return device + kv
+    from sglang.srt.managers.pp_admission_congruence import state_aligned_extent
+
+    extent, _ = state_aligned_extent(
+        kv, anchor, device, getattr(result, "key_match_depth", None)
+    )
+    return device + int(extent)
+
+
+def _admission_len(result: Any) -> int:
+    """The admitted depth this rank's floor verdicts compare: the Form A
+    host's is :func:`host_admission_len`, everyone else's the raw match."""
+    if form_a_follow_active() and not this_rank_follows():
+        return host_admission_len(result)
+    return _local_match_len(result)
+
+
 def group_floor_cap(tree_cache: Any, req: Any, result: Any) -> Optional[int]:
     """Admission-site verdict: the depth THIS rank must cap its match to, or
     None. Non-None exactly when 0 < group usable match < local match (the
@@ -517,7 +555,9 @@ def group_floor_cap(tree_cache: Any, req: Any, result: Any) -> Optional[int]:
         return None
     rid = str(getattr(req, "rid", "") or "")
     try:
-        local = _local_match_len(result)
+        # H105b: the Form A host compares the depth it ADMITS (load-back
+        # extent included), so a host deeper than the group is capped.
+        local = _admission_len(result)
     except Exception as exc:  # noqa: BLE001 - re-raised by name (H99 audit)
         raise RankFloorUndecidable(
             f"RU FLOOR UNDECIDABLE rid={rid[:16]}: this rank could not measure "
@@ -541,7 +581,7 @@ def rematch_at_group_depth(tree_cache: Any, params: Any, cap: int, local: int) -
 
     cut = dataclasses.replace(params, key=params.key[: int(cap)])
     capped = tree_cache.match_prefix(cut)
-    got = _local_match_len(capped)
+    got = _admission_len(capped)
     rid = str(getattr(getattr(params, "req", None), "rid", "") or "")
     _STATS["above_group"] += 1
     n = _STATS["above_group"]
@@ -731,7 +771,9 @@ def admission_probe(tree_cache: Any, req: Any, *, follow: bool) -> int:
             with follow_walk(tree_cache):
                 return _local_match_len(tree_cache.match_prefix(params))
         result = tree_cache.match_prefix(params)
-        n = _local_match_len(result)
+        # H105b: the host votes what it will ADMIT -- device + the #1040
+        # state-aligned load-back extent -- not the raw host-hit count.
+        n = host_admission_len(result)
         cut = proof_cut(tree_cache, req, result, n)
         if cut is not None:
             # #1424d: a host page of this match is not proven against its
@@ -748,7 +790,7 @@ def admission_probe(tree_cache: Any, req: Any, *, follow: bool) -> int:
                 req=None,
             )
             result = tree_cache.match_prefix(params)
-            n = min(_local_match_len(result), int(cut))
+            n = min(host_admission_len(result), int(cut))
         if n > 0 and anchor_unusable(tree_cache, getattr(result, "best_match_node", None)):
             _STATS["unusable_votes"] += 1
             return 0
@@ -817,16 +859,16 @@ def form_a_follow_admission(tree_cache: Any, req: Any, result: Any) -> Optional[
     if g is None:
         return None
     g = int(g)
-    local = _local_match_len(result)
     if this_rank_follows():
         if g <= 0:
-            return 0 if local > 0 else None
+            return 0 if _local_match_len(result) > 0 else None
         # H99 audit: ALWAYS the follow walk for g > 0. The shortcut "own match
         # already g on a usable anchor" asked `anchor_unusable`, whose broad
         # except answers "usable" on an error -- the worker would then take
         # the ordinary path and its #928 could zero it alone. The follow walk
         # admits exactly g without asking the byteless anchor at all.
         return g
+    local = host_admission_len(result)  # H105b: what the host ADMITS
     if g > 0 and local < g:
         raise FormAHostBelowGroup(
             f"H98 RU FORM-A HOST-BELOW-GROUP rid={rid[:16]} local_match={local} "

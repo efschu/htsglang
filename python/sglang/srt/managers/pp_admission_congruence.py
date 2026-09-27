@@ -1618,6 +1618,42 @@ def stamp_state_aligned_extent(req) -> Optional[int]:
     return extent
 
 
+def state_aligned_extent(kv: int, anchor, device_len: int, key_depth) -> Tuple[int, bool]:
+    """#1040's extent as a pure function: ``(extent, raised_to_anchor)``.
+
+    ``kv`` is the host hit (> 0), ``anchor`` the ABSOLUTE state anchor depth
+    (not None), ``device_len`` the device-resident prefix, ``key_depth`` the
+    key match depth (may be None). One expression for the load-back
+    (:func:`state_aligned_load_back_len`) and for the Form A host's admission
+    vote (H105b, ``tp_match_floor.host_admission_len``): the host must vote
+    the depth its load-back will reach, not the shorter host-hit count."""
+    kv = int(kv)
+    # `state_anchor_depth` is ABSOLUTE (from the root) while the row carries a
+    # DELTA (how many host tokens to pull in beyond what the device already
+    # holds), so the anchor has to be expressed in the same coordinate before
+    # it can clamp anything.
+    room = int(anchor) - int(device_len)
+    extent = kv if room >= kv else max(0, room)
+    # write_back at the flip (boot xsn128, rid ca49dc53): the host walk
+    # matched keys to 4095 with the anchor AT 4095, but `host_hit_length`
+    # counted only the node the read had just landed (4031) -- the leading
+    # 64-token node had come in hitless on an earlier request. The load-back
+    # applies the KEY match up to the anchor (4095), so an extent of 4031
+    # was the #968 'LOAD-BACK GDN ANCHOR OFF-EXTENT' STOP: the KV would be
+    # clamped below a recurrent state that had already consumed those
+    # tokens. When the key match REACHES the anchor and the anchor lies above
+    # the host hit, the anchor is the extent -- the same coordinate the
+    # load-back applies -- never the shorter count.
+    if (
+        key_depth is not None
+        and int(anchor) > 0
+        and int(key_depth) >= int(anchor)
+        and room > kv
+    ):
+        return room, True
+    return extent, False
+
+
 def state_aligned_load_back_len(req) -> Optional[int]:
     """#1040: PP0's load-back extent, rounded DOWN to a state-bearing boundary.
 
@@ -1679,27 +1715,10 @@ def state_aligned_load_back_len(req) -> Optional[int]:
     # tensor of pool pointers (#796).
     prefix_indices = getattr(req, "prefix_indices", None)
     device_len = 0 if prefix_indices is None else len(prefix_indices)
-    room = int(anchor) - int(device_len)
-    extent = kv if room >= kv else max(0, room)
     key_depth = getattr(req, "key_match_depth", None)
-    # write_back at the flip (boot xsn128, rid ca49dc53): the host walk
-    # matched keys to 4095 with the anchor AT 4095, but `host_hit_length`
-    # counted only the node the read had just landed (4031) -- the leading
-    # 64-token node had come in hitless on an earlier request. The load-back
-    # applies the KEY match up to the anchor (4095), so an extent of 4031
-    # was the #968 'LOAD-BACK GDN ANCHOR OFF-EXTENT' STOP: the KV would be
-    # clamped below a recurrent state that had already consumed those
-    # tokens. When the key match REACHES the anchor and the anchor lies above
-    # the host hit, the anchor is the extent -- the same coordinate the
-    # load-back applies -- never the shorter count.
-    if (
-        key_depth is not None
-        and int(anchor) > 0
-        and int(key_depth) >= int(anchor)
-        and room > kv
-    ):
+    extent, raised = state_aligned_extent(kv, anchor, device_len, key_depth)
+    if raised:
         _1040_ALIGN["raised_to_anchor"] = _1040_ALIGN.get("raised_to_anchor", 0) + 1
-        extent = room
 
     _1040_ALIGN["n"] += 1
     loss = max(0, kv - extent)

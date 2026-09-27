@@ -688,6 +688,48 @@ def _weg2_prefetch_resolved_rows(rec):
 _PREFETCH_COMPLETION_SLOTS = 4096
 
 
+def _form_a_note_loaded(tree, rows: int) -> None:
+    """D-OOM (rc12v dkrnfh91dprsabar1dauer09272047, 21:19:18, rid
+    weg2-28-124): charge a load-back's device rows against this
+    iteration's availability floor on a Form A D group.
+
+    TP1/TP2 loaded 23424 rows (TP0 27136 -- the device trees of a Form A
+    group are not replicas: the workers held 3712 rows TP0 did not), the
+    163-token extend then asked the eviction trigger, which read the floor
+    published at the top of the iteration (``floor - admitted``, admitted
+    = 0: nothing charged the load) >= 227, SKIPPED the eviction and
+    failed against a pool with 0 free rows and 19072 evictable ('EVICTION
+    UNDER-DELIVERED asked 227 received 0', no relief provider, D dead).
+    ``pp_slot_fidelity.note_loaded`` charges only the local-PP form; on a
+    TP group the ledger was left to replicated allocations, which a Form
+    A load-back is not. Charged here, the same pass's extend trigger reads
+    ``floor - loaded < need`` and evicts what the extend needs.
+
+    Form A only: its extend depth is the host's (H98/H105), the trigger
+    was already rank-local in effect (different device trees, different
+    victims), and the charge only ever makes a rank evict EARLIER. A
+    classic TP group keeps the replicated-only ledger unchanged."""
+    if rows <= 0 or getattr(tree, "uniform_avail_floor", None) is None:
+        return
+    from sglang.srt.managers.tp_match_floor import form_a_follow_active
+
+    if not form_a_follow_active():
+        return
+    from sglang.srt.mem_cache.common import note_uniform_admitted
+
+    note_uniform_admitted(tree, int(rows))
+    n = getattr(tree, "_form_a_loaded_charges", 0) + 1
+    tree._form_a_loaded_charges = n
+    if n <= 8 or (n & (n - 1)) == 0:
+        logger.info(
+            "D-OOM FORM-A LOADBACK-CHARGED rows=%d floor=%s admitted_since_floor=%s "
+            "(n=%d): the load-back's device rows count against this iteration's "
+            "floor, so the same pass's extend evicts what it needs",
+            int(rows), getattr(tree, "uniform_avail_floor", None),
+            getattr(tree, "uniform_admitted_since_floor", None), n,
+        )
+
+
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     #: The scheduler, once the phase flip has claimed ownership of the request
     #: pool (`bind_req_pool_owner`). None on every boot that never flips, which
@@ -5470,6 +5512,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         from sglang.srt.weg2 import pp_slot_fidelity as _sf
 
         _sf.note_loaded(self, len(device_indices))
+        _form_a_note_loaded(self, len(device_indices))
 
         # Commit: each component gets only its own transfers
         kv_xfer.device_indices = device_indices
