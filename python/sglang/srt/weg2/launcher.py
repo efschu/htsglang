@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import hashlib
 import json
 import math
 import os
@@ -5069,6 +5070,10 @@ class StoreDiskPlan:
     min_free_bytes: int
     fs_free_bytes: int
     fs_total_bytes: int
+    #: L3P: bytes the REUSED persistent directory already occupies (0 for a
+    #: fresh one). They are this store's own, inside its cap, so the disk
+    #: check credits them instead of charging them a second time.
+    reused_bytes: int = 0
 
     @property
     def needed_bytes(self) -> int:
@@ -5087,6 +5092,7 @@ def plan_store(
     min_free_gib: float = STORE_DISK_MIN_FREE_GIB,
     root: str = STORE_ROOT,
     store_max_gb: float = 0.0,
+    directory_name: Optional[str] = None,
 ) -> StoreDiskPlan:
     """Size the store from THE P POOL, and check the DISK can fund it.
 
@@ -5148,8 +5154,16 @@ def plan_store(
     st = os.statvfs(root)
     free = st.f_bavail * st.f_frsize
     total = st.f_blocks * st.f_frsize
+    directory = f"{root}/{directory_name or tag}"
+    # L3P: a persistent directory's own bytes are inside its cap -- the disk
+    # has to fund only what the store may still GROW by. Walked only when the
+    # plain check would refuse, so a cold or roomy disk pays no walk.
+    reused = 0
+    if directory_name and max_size + min_free > free and os.path.isdir(directory):
+        reused = _tree_bytes(directory)[0]
+        free += min(reused, max_size)
     plan = StoreDiskPlan(
-        directory=f"{root}/{tag}",
+        directory=directory,
         p_pool_tokens=int(p_pool_tokens),
         cell_bytes=cell_bytes,
         p_pool_bytes=pool_bytes,
@@ -5158,6 +5172,7 @@ def plan_store(
         min_free_bytes=min_free,
         fs_free_bytes=free,
         fs_total_bytes=total,
+        reused_bytes=reused,
     )
     if plan.needed_bytes > free:
         raise Weg2StoreDiskRefused(
@@ -5202,6 +5217,202 @@ def prepare_store(log: Log, plan: StoreDiskPlan, dry: bool) -> str:
     return plan.directory
 
 
+#: L3P (user 2026-09-27: "der l3 hicache wird jedesmal verworfen, oder? der soll
+#: natürlich persistent sein"): the disk store is the RETENTION tier, so it is
+#: one directory per model that every boot reattaches to, not one per boot tag.
+#: Named ``l3-<model>-<hash of the model path>``; the prefix is what the sweep
+#: spares. What keeps a reused page honest is the KEY, not the directory: every
+#: page key carries compute_model_identity_hash (model path, revision, dtype,
+#: quantization, kv_cache_dtype, uneven-TP vectors), so a page written in
+#: another byte format is a clean miss, never a wrong hit.
+L3_PERSIST_PREFIX = "l3-"
+
+
+def l3_persist_enabled(env=None) -> bool:
+    """L3P: ``SGLANG_WEG2_L3_PERSIST`` (default on; 0 = the per-boot store,
+    swept at the next boot, exactly as before)."""
+    e = os.environ if env is None else env
+    raw = (e.get("SGLANG_WEG2_L3_PERSIST", "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+#: L3P: bump when the ON-DISK page format changes incompatibly (the #706
+#: geometry-neutral canonical page is generation 706); a new generation gets
+#: a new directory instead of a MixedGenerationError on a reused one.
+L3_PERSIST_GENERATION = "706"
+L3_IDENTITY_FILE = "L3_IDENTITY.json"
+
+
+def l3_persist_identity(model: str, profile: str = "", form_kv: str = "",
+                        kv_cache_dtype: str = KV_CACHE_DTYPE) -> dict:
+    """L3P: what a persistent store is FOR. User 2026-09-27: "aber natürlich
+    zwischen 27b und nf verschiedene L3 caches. sonst knallts" -- one model,
+    one directory. The page keys already miss across byte formats; this keeps
+    the DIRECTORIES apart too, so one model's cap, eviction census and sweep
+    never see the other's pages."""
+    real = os.path.realpath(str(model or ""))
+    cfg_sha = ""
+    try:
+        with open(model_config_path(model), "rb") as f:
+            cfg_sha = hashlib.sha1(f.read()).hexdigest()
+    except Exception:  # noqa: BLE001 -- a GGUF or unreadable config: the path still separates
+        pass
+    return {
+        "model_path": real,
+        "model_config_sha1": cfg_sha,
+        "profile": str(profile or ""),
+        "form_kv": str(form_kv or ""),
+        "kv_cache_dtype": str(kv_cache_dtype or ""),
+        "generation": L3_PERSIST_GENERATION,
+    }
+
+
+def l3_persist_dir_name(identity: dict) -> str:
+    """L3P: ``l3-<profile>-<model>-<identity10>``; the readable part names the
+    model, the digest separates everything else the identity carries."""
+    base = os.path.basename(str(identity.get("model_path", "")).rstrip("/")) or "model"
+    label = "-".join(x for x in (identity.get("profile") or "", base) if x)
+    label = re.sub(r"[^A-Za-z0-9._-]+", "_", label)[:80]
+    digest = hashlib.sha1(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:10]
+    return f"{L3_PERSIST_PREFIX}{label}-{digest}"
+
+
+def l3_persist_check_identity(directory: str, identity: dict, dry: bool) -> str:
+    """L3P: the directory's own identity file must match; returns "new" /
+    "match". A mismatch is REFUSED BY NAME -- a store is never shared by two
+    identities, whatever its name says."""
+    path = os.path.join(directory, L3_IDENTITY_FILE)
+    try:
+        with open(path) as f:
+            have = json.load(f)
+    except FileNotFoundError:
+        have = None
+    except (OSError, ValueError) as exc:
+        raise Weg2StoreDiskRefused(
+            f"W57 Weg2StoreDiskRefused: L3-PERSIST identity file {path} unreadable "
+            f"({type(exc).__name__}: {exc}); refusing to reuse a store whose owner "
+            f"cannot be proven. Move the directory aside or set SGLANG_WEG2_L3_PERSIST=0.")
+    if have is None:
+        if not dry:
+            os.makedirs(directory, exist_ok=True)
+            tmp = path + ".w"
+            with open(tmp, "w") as f:
+                json.dump(identity, f, sort_keys=True, indent=1)
+            os.replace(tmp, path)
+        return "new"
+    if have != identity:
+        diff = sorted(k for k in set(have) | set(identity) if have.get(k) != identity.get(k))
+        raise Weg2StoreDiskRefused(
+            f"W57 Weg2StoreDiskRefused: L3-PERSIST store {directory} belongs to another "
+            f"identity (differs in {diff}: store {[have.get(k) for k in diff]} vs this boot "
+            f"{[identity.get(k) for k in diff]}). Two models never share an L3 store "
+            f"(user 2026-09-27). Move the directory aside or set SGLANG_WEG2_L3_PERSIST=0.")
+    return "match"
+
+
+def l3_persist_attach(log: Log, directory: str, dry: bool) -> Tuple[int, int, int]:
+    """L3P: reattach this boot to the persistent store; returns
+    ``(files, bytes, staging_removed)``.
+
+    ONE walk, before any rank starts: counts the ``.bin`` pages a previous boot
+    left (the ``L3-PERSIST`` line is the acceptance marker) and removes the
+    ``<final>.tmp.<uuid>`` staging files a crashed writer left behind -- no
+    writer of this store is alive yet, so a staging file here is abandoned by
+    construction, not "maybe still being filled". Canonical partials are NOT
+    touched: HiCacheFile's attach sweep keeps the resumable ones by marker.
+    """
+    files = nbytes = removed = 0
+    if not os.path.isdir(directory):
+        log(f"L3-PERSIST fresh dir={directory} (no previous store)")
+        return 0, 0, 0
+    for root, _dirs, names in os.walk(directory):
+        for name in names:
+            p = os.path.join(root, name)
+            if ".tmp." in name:
+                if not dry:
+                    try:
+                        os.unlink(p)
+                        removed += 1
+                    except OSError:
+                        pass
+                continue
+            if name.endswith(".bin"):
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                files += 1
+                nbytes += st.st_blocks * 512
+    log(
+        f"L3-PERSIST {'reuse' if files else 'fresh'} dir={directory} files={files} bytes={nbytes} "
+        f"({nbytes / host_ledger.GIB:.2f} GiB) staging_removed={removed}"
+        + (" (DRY-RUN: nothing removed)" if dry else "")
+        + " -- the ranks seed the L3 index and the evictor ledger from it at attach"
+    )
+    return files, nbytes, removed
+
+
+L3_CAP_FILE = "L3_CAP.json"
+
+
+def l3_persist_disk_sum(log: Log, root: str, directory: str, max_size_bytes: int,
+                        min_free_bytes: int, own_bytes: int, dry: bool) -> int:
+    """L3P, user 2026-09-27 "L3, jeder 150gb": every model's store has its own
+    cap, and they share ONE disk. Records this store's cap and size
+    (``L3_CAP.json``) and checks that what ALL stores may still grow by fits
+    the disk: sum over stores of (cap - bytes at its last attach) + min_free
+    <= free now. The other stores' bytes are as of THEIR last boot (named, not
+    re-walked). Over budget is a named WARNING with the numbers, never a
+    silent cap: a sibling store may never grow to its cap. Returns the
+    shortfall in bytes (0 = fits)."""
+    rec = {"max_size_bytes": int(max_size_bytes), "bytes_at_attach": int(own_bytes),
+           "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if not dry:
+        try:
+            tmp = os.path.join(directory, L3_CAP_FILE + ".w")
+            with open(tmp, "w") as f:
+                json.dump(rec, f)
+            os.replace(tmp, os.path.join(directory, L3_CAP_FILE))
+        except OSError as exc:
+            log(f"L3-PERSIST cap record not written ({type(exc).__name__}: {exc})")
+    growth = max(0, int(max_size_bytes) - int(own_bytes))
+    parts = [f"own={os.path.basename(directory)} grow={growth / 1e9:.1f} GB"]
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        names = []
+    for n in names:
+        d = os.path.join(root, n)
+        if not n.startswith(L3_PERSIST_PREFIX) or d == directory:
+            continue
+        try:
+            with open(os.path.join(d, L3_CAP_FILE)) as f:
+                o = json.load(f)
+            g = max(0, int(o["max_size_bytes"]) - int(o["bytes_at_attach"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            parts.append(f"{n}=no cap record")
+            continue
+        growth += g
+        parts.append(f"{n} grow={g / 1e9:.1f} GB (as of {o.get('utc', '?')})")
+    try:
+        st = os.statvfs(root)
+        free = st.f_bavail * st.f_frsize
+    except OSError:
+        log("L3-PERSIST DISK-SUM unreadable (statvfs failed) -- NOT checked")
+        return 0
+    need = growth + int(min_free_bytes)
+    short = max(0, need - free)
+    log(
+        f"L3-PERSIST DISK-SUM {'WARN' if short else 'ok'}: all L3 stores may still grow "
+        f"{growth / 1e9:.1f} GB + min_free {min_free_bytes / 1e9:.1f} GB = {need / 1e9:.1f} GB "
+        f"against {free / 1e9:.1f} GB free on {root}"
+        + (f" -- SHORT by {short / 1e9:.1f} GB: the disk cannot hold every store at its cap; "
+           f"lower --store-max-gb or free space (nothing is capped silently)" if short else "")
+        + f" [{'; '.join(parts)}]"
+    )
+    return short
+
+
 def sweep_store_residue(log: Log, keep: str, dry: bool, root: str = STORE_ROOT) -> int:
     """Remove PREVIOUS boots' store directories under :data:`STORE_ROOT`.
 
@@ -5217,7 +5428,10 @@ def sweep_store_residue(log: Log, keep: str, dry: bool, root: str = STORE_ROOT) 
     except OSError:
         log(f"store residue: {root} unreadable -- NOT swept, and not read as empty")
         return 0
+    # L3P: a persistent store (``l3-*``, this model's or another's) is never
+    # residue -- only the per-boot tag directories are.
     stale = [n for n in names if os.path.join(root, n) != keep
+             and not n.startswith(L3_PERSIST_PREFIX)
              and os.path.isdir(os.path.join(root, n))]
     if not stale:
         log(f"store residue: none under {root} (fresh store per boot)")
@@ -20253,6 +20467,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # before the ring, so the pool this store must cover is known here without
     # moving anything.  The ledger ran first only because the ARC line prices
     # itself against the reap headroom the ledger computes.
+    _l3_ident = (l3_persist_identity(ns.model, getattr(ns, "profile", ""),
+                                     getattr(ns, "form_kv", "") or "")
+                 if l3_persist_enabled() else None)
     store_plan = plan_store(
         ns.tag,
         cut.pool_tokens,
@@ -20261,6 +20478,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         sidecar_factor=ns.store_sidecar_factor,
         store_max_gb=ns.store_max_gb,
         min_free_gib=ns.store_disk_min_free_gib,
+        directory_name=(l3_persist_dir_name(_l3_ident) if _l3_ident else None),
     )
     store_cfg = store_plan.extra_config()
     log(
@@ -20304,6 +20522,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(arc_preflight_line(read_arc_state(), store_plan, reap_headroom_gib))
     log(store_read_cost_line(store_plan, max_kv_per_request))
     sweep_store_residue(log, store_plan.directory, dry)
+    if _l3_ident:
+        # identity FIRST: a store of another identity is refused before this
+        # boot touches a single file in it.
+        _l3_state = l3_persist_check_identity(store_plan.directory, _l3_ident, dry)
+        log(f"L3-PERSIST identity={_l3_state} dir={store_plan.directory} "
+            f"{json.dumps(_l3_ident, sort_keys=True)}")
+        _l3_files, _l3_bytes, _ = l3_persist_attach(log, store_plan.directory, dry)
+        l3_persist_disk_sum(log, os.path.dirname(store_plan.directory), store_plan.directory,
+                            store_plan.max_size_bytes, store_plan.min_free_bytes, _l3_bytes, dry)
     store_dir = prepare_store(log, store_plan, dry)
     state.store_dir = store_dir
     state.store_max_size_bytes = store_plan.max_size_bytes

@@ -2772,9 +2772,39 @@ class HiCacheFile(HiCacheStorage):
                 self._evictor.l3_index = idx
                 logger.info("#1459 L3-INDEX %s at %s (cap %d, entries %d)",
                             "created" if idx.created else "joined", idx.path, idx.cap, idx.count())
+                if idx.created:
+                    self._l3p_seed_index(idx)
         except Exception as exc:  # noqa: BLE001
             logger.warning("#1459 L3-INDEX n/a (%s: %s)", type(exc).__name__, exc)
         return idx
+
+    def _l3p_seed_index(self, idx) -> int:
+        """L3P: a freshly CREATED index starts empty, and "a stem missing here
+        is NOT on disk" -- so every page a previous boot left in a persistent
+        store would read as a miss. The creator seeds it from the directory
+        (one walk, the same ``_iter_existing_files`` the evictor's census
+        uses); joiners that query before the seed completes only see misses,
+        never a wrong hit. ``SGLANG_WEG2_L3_PERSIST=0`` skips it (the per-boot
+        store is empty anyway)."""
+        raw = (os.environ.get("SGLANG_WEG2_L3_PERSIST", "") or "").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return 0
+        n, batch = 0, []
+        try:
+            for stem, _st in self._iter_existing_files():
+                batch.append(stem)
+                if len(batch) >= 4096:
+                    idx.add(batch)
+                    n += len(batch)
+                    batch = []
+            if batch:
+                idx.add(batch)
+                n += len(batch)
+        except Exception as exc:  # noqa: BLE001 -- the index is an accelerator; a partial seed is only misses
+            logger.warning("L3-PERSIST index seed stopped after %d stems (%s: %s)",
+                           n, type(exc).__name__, exc)
+        logger.info("L3-PERSIST index_seeded=%d dir=%s index=%s", n, self.file_path, idx.path)
+        return n
 
     def _stat_stems(self, stems: List[str]) -> dict:
         """``{stem: size}`` for the stems that are on disk; one C call when
