@@ -842,6 +842,179 @@ def follow_rematch(tree_cache: Any, params: Any, depth: int, local: int) -> Any:
 
 
 # --------------------------------------------------------------------------
+# H105: the admission verdict is the host's too (dpr, weg2-14-70, 08:51:31)
+# --------------------------------------------------------------------------
+#
+# H98 made the DEPTH one number; the ADMISSION after it stayed rank-local.
+# `PrefillAdder.add_one_req` gates on `total_tokens >= rem_total_tokens`
+# before the host load-back, and `total_tokens` prices the extend as
+# `fill - len(prefix_indices)`: on TP0 (the only rank with KV and arena bytes)
+# a host-backed hit is 0 device rows until `init_load_back` runs, a worker's
+# bookkeeping tree can hold the same depth as device rows. dpr (rc12j
+# 3e97ef0c8f, boot dkrnfh91dprbar1dauer09270832): weg2-14-70, host hit 75264,
+# uncached 6817 -- TP1/TP2 built the extend (#969 n=68 prefix 75264, 3712
+# rows) and entered the forward, TP0 priced 82081 rows against its own pool
+# (available 99008, 5 decode reservations), got NO_TOKEN in silence (no #988,
+# no ARENA-LOAD, no LOADBACK-WAIT) and ran a decode pass: 5,5 min to the
+# watchdog, blocked in the next pass's tp<-reqs broadcast.
+#
+# So the host decides the gate and the workers take its verdict (the H98
+# form): one small broadcast from TP0 per admission attempt, at the single
+# point in `add_one_req` after every rank-local budget gate and BEFORE the
+# load-back and the tail-adopt vote. A worker's own gate verdict is
+# bookkeeping (its KV pool holds no bytes). A host NO_TOKEN leaves the request
+# in the waiting queue on every rank -- it is retried when the pool frees, not
+# dropped. The rid travels with the verdict: two ranks that reach the gate for
+# different requests stop by name (:class:`FormAAdmissionSplit`), and the
+# built extend set is compared once per pass after the loop
+# (:func:`form_a_extend_set_check`), so any split that slips past the gate is
+# a named stop before the forward instead of a hang inside it.
+
+#: The verdict codes on the wire (``AddReqResult`` names; ``ADMIT`` = passed
+#: every gate, the caller continues with the load-back).
+ADMISSION_ADMIT = "ADMIT"
+
+
+class FormAAdmissionSplit(RuntimeError):
+    """H105: the ranks of a Form A group disagree on an admission."""
+
+
+#: rid -> [monotonic time of the first host refusal, refusals]; bounded.
+_ADMISSION_WAIT: Dict[str, list] = {}
+_ADMISSION_WAIT_CAP = 1024
+
+
+def _note_admission_wait(rid: str, host_code: str, host_price, host_budget,
+                         local: str, price, budget) -> None:
+    """How often and how long a request waits on the host's gate (metal
+    question: is a host-backed span starving?). One line per refusal
+    (first 20, then every 64th), one line when the waiting rid is admitted."""
+    import time
+
+    if host_code != ADMISSION_ADMIT:
+        ent = _ADMISSION_WAIT.get(rid)
+        if ent is None:
+            if len(_ADMISSION_WAIT) >= _ADMISSION_WAIT_CAP:
+                _ADMISSION_WAIT.pop(next(iter(_ADMISSION_WAIT)))
+            ent = _ADMISSION_WAIT[rid] = [time.monotonic(), 0]
+        ent[1] += 1
+        _STATS["admission_refused"] = _STATS.get("admission_refused", 0) + 1
+        n = _STATS["admission_refused"]
+        if n <= 20 or n % 64 == 0:
+            logger.info(
+                "H105 RU FORM-A ADMISSION WAIT rid=%s host=%s host_price=%s "
+                "host_budget=%s local=%s local_price=%s local_budget=%s "
+                "refusals=%d waited_s=%.1f (n=%d): the attention host's gate "
+                "refuses; the request stays queued on every rank.",
+                rid[:16], host_code, host_price, host_budget, local, price,
+                budget, ent[1], time.monotonic() - ent[0], n,
+            )
+        return
+    ent = _ADMISSION_WAIT.pop(rid, None)
+    if ent is not None:
+        logger.info(
+            "H105 RU FORM-A ADMISSION AFTER-WAIT rid=%s refusals=%d waited_s=%.1f "
+            "host_price=%s host_budget=%s",
+            rid[:16], ent[1], time.monotonic() - ent[0], host_price, host_budget,
+        )
+
+
+def form_a_admission_verdict(
+    rid: str,
+    local: str,
+    *,
+    is_host: bool,
+    exchange: Any,
+    price: Any = None,
+    budget: Any = None,
+) -> str:
+    """The host's admission verdict for ``rid``, adopted by every worker.
+
+    ``local`` is this rank's own gate code (``ADMIT``/``NO_TOKEN``/``OTHER``),
+    ``price``/``budget`` the gate's two numbers (``total_tokens``,
+    ``rem_total_tokens``) for the wait line; ``exchange(payload)`` is the TP
+    broadcast from the host (the host passes its ``(rid, code, price,
+    budget)``, a worker ``None``; every rank gets the host's tuple back).
+    Returns the host's code. A payload for another rid, or one that is not a
+    verdict (a rank in the post-loop riegel while this one is at a gate: the
+    loops made different numbers of gate calls), is a named stop."""
+    rid = str(rid)
+    got = exchange((rid, str(local), price, budget) if is_host else None)
+    if not isinstance(got, tuple) or len(got) != 4:
+        raise FormAAdmissionSplit(
+            f"H105 RU FORM-A ADMISSION MALFORMED rid={rid[:16]} got={str(got)[:120]}: "
+            "this rank is at the admission gate but the host sent no verdict -- "
+            "the ranks' admission loops made different numbers of gate calls; "
+            "stopping instead of admitting on a guess (raenge-nie-uneins)."
+        )
+    host_rid, host_code = str(got[0]), str(got[1])
+    if host_rid != rid:
+        raise FormAAdmissionSplit(
+            f"H105 RU FORM-A ADMISSION SPLIT host_rid={host_rid[:16]} "
+            f"local_rid={rid[:16]} host={host_code}: this rank reached the "
+            "admission gate for a different request than the attention host -- "
+            "the queues or the loop's skips diverged; stopping by name instead "
+            "of building a different extend (raenge-nie-uneins)."
+        )
+    if not is_host and host_code != str(local):
+        _STATS["admission_follow"] = _STATS.get("admission_follow", 0) + 1
+        n = _STATS["admission_follow"]
+        if n <= 20 or n % 256 == 0:
+            logger.warning(
+                "H105 RU FORM-A ADMISSION FOLLOW rid=%s host=%s worker_local=%s "
+                "(n=%d): the attention host holds the KV and arena bytes, so its "
+                "gate is the group's; this worker takes it.",
+                rid[:16],
+                host_code,
+                local,
+                n,
+            )
+    if not is_host:
+        _note_admission_wait(rid, host_code, got[2], got[3], str(local), price, budget)
+    return host_code
+
+
+def form_a_extend_set(reqs: Sequence[Any]) -> List[tuple]:
+    """(rid, extend start, extend end) of this pass's admitted requests."""
+    out = []
+    for r in reqs:
+        er = getattr(r, "extend_range", None)
+        out.append(
+            (
+                str(getattr(r, "rid", "?")),
+                None if er is None else int(er.start),
+                None if er is None else int(er.end),
+            )
+        )
+    return out
+
+
+def form_a_extend_set_check(local: Sequence[tuple], *, is_host: bool, exchange: Any) -> None:
+    """The riegel after the admission loop: the host's built extend set
+    (rid, start, end) against this rank's. A difference is a named stop here,
+    before the forward it would otherwise hang (dpr: the workers inside the
+    extend's collectives, the host in a decode pass)."""
+    local = [tuple(x) for x in local]
+    got = exchange(list(local) if is_host else None)
+    if not isinstance(got, list):
+        raise FormAAdmissionSplit(
+            f"H105 RU FORM-A EXTEND-SET MALFORMED got={str(got)[:120]} "
+            f"local={local[:6]}: this rank finished its admission loop while the "
+            "host is still at an admission gate -- the loops made different "
+            "numbers of gate calls; stopping by name (raenge-nie-uneins)."
+        )
+    host = [tuple(x) for x in got]
+    if host != local:
+        raise FormAAdmissionSplit(
+            f"H105 RU FORM-A EXTEND-SET SPLIT host={host[:6]} local={local[:6]} "
+            f"(n_host={len(host)} n_local={len(local)}): this rank built a "
+            "different prefill batch than the attention host; the forward "
+            "would pair a decode with an extend -- stopping by name instead "
+            "(raenge-nie-uneins)."
+        )
+
+
+# --------------------------------------------------------------------------
 # H99: the prefetch span is the host's too (rc9o, weg2-33-33, W65)
 # --------------------------------------------------------------------------
 #
