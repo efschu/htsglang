@@ -998,6 +998,11 @@ class MambaComponent(TreeComponent):
                 vlen = len(value)
                 self.cache.component_evictable_size_[ct] -= vlen
                 self.cache.component_protected_size_[ct] += vlen
+                # ED (mem_cache/evict_frontier_census.py): a mamba lock pins
+                # this node alone; its FULL rows stay counted as evictable.
+                from sglang.srt.mem_cache import evict_frontier_census as _ef
+
+                _ef.note_aux_lock(self.cache, node, True)
             cd.lock_ref += 1
         if self.cache._pin_trace_every:
             self.cache.record_pin_trace_mamba("inc", host=lock_host)
@@ -1070,6 +1075,9 @@ class MambaComponent(TreeComponent):
                 vlen = len(value)
                 self.cache.component_evictable_size_[ct] += vlen
                 self.cache.component_protected_size_[ct] -= vlen
+                from sglang.srt.mem_cache import evict_frontier_census as _ef
+
+                _ef.note_aux_lock(self.cache, node, False)
             cd.lock_ref -= 1
             if self.cache._pin_trace_every:
                 self.cache.record_pin_trace_mamba("dec", host=False)

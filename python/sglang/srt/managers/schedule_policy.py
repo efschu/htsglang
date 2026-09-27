@@ -845,6 +845,9 @@ def _weg2_park_on() -> bool:
     return _WEG2_PARK_ON
 
 
+from sglang.srt.mem_cache.common import deliverable_evictable_or  # ED
+
+
 class PrefillAdder:
     def __init__(
         self,
@@ -1162,9 +1165,11 @@ class PrefillAdder:
                 + self.tree_cache.full_evictable_size()
             )
         elif self.is_hybrid_ssm_cache:
+            # ED (rc12o b1): the peel's deliverable count, not the reported one
+            # (mamba-locked nodes and their ancestors are counted but unpeelable).
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
+                + deliverable_evictable_or(self.tree_cache, self.tree_cache.full_evictable_size)
             )
         else:
             available_and_evictable = (
@@ -1222,9 +1227,11 @@ class PrefillAdder:
                 + self.tree_cache.full_evictable_size()
             )
         elif self.is_hybrid_ssm_cache:
+            # ED (rc12o b1): the peel's deliverable count, not the reported one
+            # (mamba-locked nodes and their ancestors are counted but unpeelable).
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
+                + deliverable_evictable_or(self.tree_cache, self.tree_cache.full_evictable_size)
             )
         else:
             available_and_evictable = (

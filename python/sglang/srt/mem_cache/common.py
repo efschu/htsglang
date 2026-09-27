@@ -756,7 +756,8 @@ def fundable_extend_tokens(tree_cache) -> int:
     except Exception:  # noqa: BLE001 - an admission gate must not raise
         return 0
     try:
-        evictable = int(tree_cache.evictable_size())
+        # ED (rc12o b1): what the peel can pay, where the cache can say it.
+        evictable = deliverable_evictable_or(tree_cache, tree_cache.evictable_size)
     except Exception:  # noqa: BLE001 - a cache without the accessor evicts none
         evictable = 0
     return max(0, avail) + max(0, evictable)
@@ -822,6 +823,19 @@ def admission_retraction_enabled() -> bool:
         "false",
         "False",
     )
+
+
+def deliverable_evictable_or(tree_cache, fallback) -> int:
+    """ED (rc12o b1): the peel's deliverable evictable count where the cache's
+    CLASS defines it, else ``fallback()``. Looked up on the type, not the
+    instance: a duck-typed stand-in (a MagicMock tree) answers every getattr,
+    and its answer is not a count. A non-int answer falls back as well."""
+    fn = getattr(type(tree_cache), "deliverable_evictable_size", None)
+    if callable(fn):
+        v = fn(tree_cache)
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+    return int(fallback())
 
 
 def chunk_tokens_the_pool_can_fund(

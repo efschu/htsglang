@@ -9116,6 +9116,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def full_evictable_size(self) -> int:
         return self.evictable_size()
 
+    def deliverable_evictable_size(self) -> int:
+        """ED (rc12o b1): the FULL-evictable tokens the peel can actually pay --
+        the reported count minus what aux (mamba) locks hold behind unpeelable
+        nodes (mem_cache/evict_frontier_census.py). Admission reads this."""
+        from sglang.srt.mem_cache import evict_frontier_census as _ef
+
+        return _ef.deliverable_evictable(self, BASE_COMPONENT_TYPE)
+
     def full_protected_size(self) -> int:
         return self.protected_size()
 

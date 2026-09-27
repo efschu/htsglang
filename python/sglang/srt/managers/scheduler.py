@@ -14509,6 +14509,16 @@ class Scheduler(
         # H105: on a Form A group the attention host's gate verdict is the
         # group's (None elsewhere: every gate in add_one_req stays rank-local).
         adder.form_a_admission_follow = self._form_a_admission_follow_fn()
+        # ED (rc12o b1): on a Form A group only the host's vote decides (H105);
+        # a worker keeps the reported evictable count so its local extend
+        # arithmetic is the pre-ED one (mem_cache/evict_frontier_census.py).
+        try:
+            from sglang.srt.mem_cache import evict_frontier_census as _ef
+
+            _is_host = self._form_a_is_host() if adder.form_a_admission_follow is not None else None
+            setattr(self.tree_cache, _ef.EXEMPT_ATTR, _is_host is False)
+        except Exception:  # noqa: BLE001 -- a slotted tree keeps the default
+            pass
         # SF (b23 #1004): a #988 prefix move replans the chunk budget at the moved
         # prefix (None: switch off / no plan policy -> nothing installed).
         from sglang.srt.weg2 import pp_slot_fidelity as _sf
