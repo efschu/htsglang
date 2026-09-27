@@ -918,7 +918,7 @@ def _front_with_reading(reading, **kw):
     return f
 
 
-def test_a1_a_seat_is_taken_only_when_the_store_read_can_be_issued(caplog):
+def test_a1_a_seat_is_taken_only_when_the_store_read_can_be_issued(caplog, monkeypatch):
     """(A) The coupling the postmortem named unaddressed: six seats x ~9k
     tokens against a 27,466-token pool bound.  The head WAITS in arrival
     order -- it is not skipped over, and it takes no seat -- and it is served
@@ -931,7 +931,14 @@ def test_a1_a_seat_is_taken_only_when_the_store_read_can_be_issued(caplog):
     could be seen: ``self._ready_for_d.rotate(-1)`` inside the blocked branch
     left the suite 18/18 green.  There are now TWO waiters at the block, the
     head does not fit and the younger one does, and the assertion is that the
-    younger one is STILL not admitted."""
+    younger one is STILL not admitted.
+
+    SA (#244, user design 2026-09-27: "der request der zuletzt ankam wird
+    zuletzt bedient, AUSSER ER PASST ZUFAELLIG IN EINEN SITZ") replaces law 2
+    by a KV backfill when ``SGLANG_WEG2_SEAT_ROTATE`` is on (default). This
+    test pins law 2 on the switch-off path, which keeps it unchanged; the SA
+    side is ``test_a1_sa_backfill_admits_the_younger_that_fits`` below."""
+    monkeypatch.setenv("SGLANG_WEG2_SEAT_ROTATE", "0")
 
     async def body():
         t0 = time.time()
@@ -969,6 +976,44 @@ def test_a1_a_seat_is_taken_only_when_the_store_read_can_be_issued(caplog):
         ps[0].seat.release("leg2_finished")
         assert await _until(lambda: ps[3].fut.done()), (
             "a freed seat's tokens must come back with it, or the gate wedges")
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(body())
+
+
+def test_a1_sa_backfill_admits_the_younger_that_fits(caplog, monkeypatch):
+    """SA on (default): the same five requests -- the blocked head r3 keeps its
+    place and takes no seat, the younger r4 that fits D's free KV runs (one
+    SEAT-AGE BACKFILL line naming the older one), and the head is served when
+    a seat frees its tokens."""
+    monkeypatch.delenv("SGLANG_WEG2_SEAT_ROTATE", raising=False)
+
+    async def body():
+        t0 = time.time()
+        f = _front_with_reading(_reading(27466, 0, 27466, t0), d_bs=6,
+                                carrier_max_tokens=27466)
+        ps = []
+        for i, est in enumerate([8400, 8400, 8400, 8400, 100]):
+            p = _bare_pending(f"r{i}")
+            p.est_prompt = est
+            ps.append(p)
+        f._ready_for_d.extend(ps)
+        f._sync_batch_gate()
+        task = asyncio.create_task(f.d_admitter())
+        for p in ps[:3]:
+            assert await _until(lambda p=p: p.fut.done()), f"{p.rid} not admitted"
+            p.posted_evt.set()
+        with caplog.at_level(logging.INFO, logger=front_mod.logger.name):
+            assert await _until(lambda: ps[4].fut.done()), "r4 fits: backfilled"
+            ps[4].posted_evt.set()
+            await asyncio.sleep(0.2)
+            assert not ps[3].fut.done(), "the head does not fit and takes no seat"
+            assert list(f._ready_for_d) == [ps[3]], "the head keeps its place"
+        assert "WEG2 SEAT-AGE BACKFILL rid_in=r4 older_blocked=r3" in caplog.text
+        assert "d_admitter error" not in caplog.text
+        ps[0].seat.release("leg2_finished")
+        assert await _until(lambda: ps[3].fut.done()), "the head is served when a seat frees"
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 

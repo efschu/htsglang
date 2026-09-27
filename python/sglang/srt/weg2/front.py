@@ -4418,24 +4418,9 @@ class Front:
         if reading is None:
             self._d_token_hold_rid = None
             return False
-        need, need_source = d_seat_need(est_tokens, realised_tokens)
-        charged = self._d_charged_since(reading["t"])
-        raw_available = int(reading["available"]) - charged
-        limit = int(reading["limit"])
-        occupied = int(reading["occupied"]) + charged
-        if self.d_admit_max_tokens is not None:
-            # The operator ceiling bounds the SAME quantity, never replaces it.
-            raw_available = min(raw_available, self.d_admit_max_tokens - occupied)
-        # THE CLAMP, and the over-charge kept rather than swallowed by it: the
-        # comparison below wants "rows this request may have", which cannot be
-        # less than none, while the diagnosis wants "by how much the
-        # extrapolation has overshot the reading it hangs on".  Two questions,
-        # so two numbers -- folding them into one signed integer is what put
-        # `available=-1663` on a line whose reader had no way to tell an
-        # exhausted pool from a stale anchor.
-        available = max(0, raw_available)
-        over_charged = max(0, -raw_available)
-        if need <= available and occupied < limit:
+        fits, need, need_source, available, over_charged, limit, occupied, charged = (
+            self._d_budget_terms(est_tokens, reading, realised_tokens))
+        if fits:
             self._d_token_hold_rid = None
             return False
         self.counters["d_admit_token_held"] += 1
@@ -4457,6 +4442,56 @@ class Front:
                 self._d_inflight_tokens(), self.seats_free(), held,
             )
         return True
+
+    def _ready_for_d_drop(self, q: "Pending") -> None:
+        """Remove ``q`` from ``_ready_for_d`` BY IDENTITY. ``deque.remove``
+        compares with ``Pending.__eq__`` (dataclass, field by field): it can
+        drop a different request with equal fields and walks every field of
+        every entry before it (a partial Pending raised AttributeError there,
+        test_weg2_sched_fix3_0907 a1)."""
+        for i, r in enumerate(self._ready_for_d):
+            if r is q:
+                del self._ready_for_d[i]
+                return
+
+    def _d_budget_terms(self, est_tokens: int, reading: Dict[str, Any],
+                        realised_tokens: int = 0) -> Tuple[bool, int, str, int, int, int, int, int]:
+        """The ONE derivation of the #915 seat-vs-pool terms, shared by the
+        gate (:meth:`_d_token_budget_blocks`) and the SA backfill probe
+        (:meth:`_d_budget_fits`): ``(fits, need, need_source, available,
+        over_charged, limit, occupied, charged)``. Pure -- no counter, no
+        hold-rid, no line."""
+        need, need_source = d_seat_need(est_tokens, realised_tokens)
+        charged = self._d_charged_since(reading["t"])
+        raw_available = int(reading["available"]) - charged
+        limit = int(reading["limit"])
+        occupied = int(reading["occupied"]) + charged
+        if self.d_admit_max_tokens is not None:
+            # The operator ceiling bounds the SAME quantity, never replaces it.
+            raw_available = min(raw_available, self.d_admit_max_tokens - occupied)
+        # THE CLAMP, and the over-charge kept rather than swallowed by it: the
+        # comparison below wants "rows this request may have", which cannot be
+        # less than none, while the diagnosis wants "by how much the
+        # extrapolation has overshot the reading it hangs on".  Two questions,
+        # so two numbers -- folding them into one signed integer is what put
+        # `available=-1663` on a line whose reader had no way to tell an
+        # exhausted pool from a stale anchor.
+        available = max(0, raw_available)
+        over_charged = max(0, -raw_available)
+        fits = need <= available and occupied < limit
+        return fits, need, need_source, available, over_charged, limit, occupied, charged
+
+    def _d_budget_fits(self, est_tokens: int, reading: Optional[Dict[str, Any]],
+                       realised_tokens: int = 0) -> bool:
+        """SA backfill PROBE: would this request pass the gate now? The gate's
+        own terms (:meth:`_d_budget_terms`) and its two open-gate cases, but
+        side-effect free -- probing candidates must not count
+        ``d_admit_token_held`` or flip the D-SEAT-WAIT hold rid (one line per
+        probe and 50 ms pass). The request finally seated still goes through
+        the ONE ``_d_token_budget_blocks`` call of the admitter."""
+        if self.d_admit_max_tokens == 0 or not self._d_seats_live or reading is None:
+            return True
+        return self._d_budget_terms(est_tokens, reading, realised_tokens)[0]
 
     def _sync_batch_gate(self) -> None:
         """THE ONLY writer of ``_batch_gate`` (C5).
@@ -6193,17 +6228,27 @@ class Front:
                 # `_d_charged_since` cannot price one request two ways.
                 _reading = await self._d_reading_if_armed()
                 if (_sa.enabled() and len(self._ready_for_d) > 1
-                        and self._d_token_budget_blocks(p.rid, p.est_prompt, _reading,
-                                                        p.leg1_prompt_tokens)):
+                        and not self._d_budget_fits(p.est_prompt, _reading,
+                                                    p.leg1_prompt_tokens)):
                     # SA backfill: the older head does not fit D's free KV; the
                     # first younger one that does may run (no idle capacity).
                     # The older keeps its place at the head for the next seat.
+                    # PROBES ONLY (_d_budget_fits, pure): the one gate call
+                    # below prices the request that is then seated, with the
+                    # same derivation the Seat charge uses (FIX 7 C3e).
                     for _q in list(self._ready_for_d)[1:8]:
                         if _q.fut.done():
                             continue
-                        if not self._d_token_budget_blocks(_q.rid, _q.est_prompt, _reading,
-                                                           _q.leg1_prompt_tokens):
-                            self._ready_for_d.remove(_q)
+                        # SK (#243 (a)) holds for a backfilled one too: a kept
+                        # SHORT is re-priced before it can take a seat; gone
+                        # presence -> P (the re-price queued it there).
+                        if getattr(_q, "short_kept", False) and self._sk_admission_reprice(_q):
+                            self._ready_for_d_drop(_q)
+                            self._sync_batch_gate()
+                            continue
+                        if self._d_budget_fits(_q.est_prompt, _reading,
+                                               _q.leg1_prompt_tokens):
+                            self._ready_for_d_drop(_q)
                             self._ready_for_d.appendleft(_q)
                             self.counters["seat_age_backfill"] += 1
                             logger.info("WEG2 SEAT-AGE BACKFILL rid_in=%s older_blocked=%s (the older "

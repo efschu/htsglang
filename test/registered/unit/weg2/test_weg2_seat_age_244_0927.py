@@ -161,6 +161,27 @@ class DSide(unittest.TestCase):
         order = DS.retraction_order(reqs, spec_active=False)
         self.assertEqual(reqs[order[-1]].rid, R(9))
 
+    def test_park_victim_age_is_the_front_arrival_not_ds_intake_seq(self):
+        # ONE age: D's kv_arrival_seq (intake order) disagrees with the front
+        # arrival -- the front arrival decides who is youngest.
+        a, b = self._req(R(2)), self._req(R(9))
+        a.kv_arrival_seq, b.kv_arrival_seq = 50, 1  # R(2) reached D last
+        order = DS.retraction_order([a, b], spec_active=False)
+        self.assertEqual([a, b][order[-1]].rid, R(9))
+
+    def test_park_victim_keeps_kvso_class_and_fast_lane_rank(self):
+        # kvso's protection key stands above age: a fast-lane request is not
+        # the victim though youngest, a 'preferred' spill class parks first
+        # though oldest.
+        old, young_fast = self._req(R(2)), self._req(R(9))
+        young_fast.is_fast_lane = True
+        order = DS.retraction_order([old, young_fast], spec_active=False)
+        self.assertEqual([old, young_fast][order[-1]].rid, R(2))
+        pref, young = self._req(R(1)), self._req(R(9))
+        pref.spill_class = "preferred"
+        order = DS.retraction_order([pref, young], spec_active=False)
+        self.assertEqual([pref, young][order[-1]].rid, R(1))
+
     def test_deferred_parked_placed_by_age(self):
         a, b = self._req(R(4), DS.SITE_FLIP), self._req(R(8))
         new_old, new_young = self._req(R(3)), self._req(R(11))
@@ -174,6 +195,38 @@ class DSide(unittest.TestCase):
         with mock.patch.object(DS, "d_flip_park_active", lambda: True), \
              mock.patch.object(DPR, "seat_cap", lambda s: 2):
             self.assertEqual(DPR.displace_for_age(sched, batch), R(6))
+
+
+class BackfillProbe(unittest.TestCase):
+    """SA backfill probes candidates with the gate's own terms, side-effect
+    free; the one gate call (and the one Seat charge) stays with the seated
+    request (FIX 7 C3e)."""
+
+    def _front(self):
+        import time as _t
+
+        f = F.Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, d_bs=6,
+                    carrier_max_tokens=27466)
+        t0 = _t.time()
+        f._d_seats_live = [types.SimpleNamespace(tokens=15047, t_taken=t0 + 1)]
+        return f, {"t": t0, "available": 27466, "limit": 27466, "occupied": 0}
+
+    def test_probe_agrees_with_the_gate_and_counts_nothing(self):
+        f, reading = self._front()
+        before = dict(f.counters)
+        hold = f._d_token_hold_rid
+        for est, realised in ((15308, 0), (15308, 8642), (100, 0)):
+            fits = f._d_budget_fits(est, reading, realised)
+            self.assertEqual(dict(f.counters), before)
+            self.assertEqual(f._d_token_hold_rid, hold)
+            self.assertEqual(fits, not f._d_token_budget_blocks("x", est, reading, realised))
+            f.counters.clear(); f.counters.update(before); f._d_token_hold_rid = hold
+
+    def test_probe_open_gate_cases(self):
+        f, reading = self._front()
+        self.assertTrue(f._d_budget_fits(10 ** 9, None, 0))
+        f._d_seats_live = []
+        self.assertTrue(f._d_budget_fits(10 ** 9, reading, 0))
 
 
 class Kept244(unittest.TestCase):
