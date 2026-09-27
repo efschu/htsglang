@@ -45,6 +45,11 @@ header .sub { color: var(--text-2); font-size: 13px; }
 header nav { margin-left: auto; display: flex; gap: 12px; font-size: 13px; }
 a { color: var(--s1); text-decoration: none; } a:hover { text-decoration: underline; }
 main { padding: 12px 16px 40px; max-width: 1500px; margin: 0 auto; }
+.cardstrip { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 6px; margin: -4px 0 12px; }
+.cardstrip div { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; font-size: 12px; }
+.cardstrip b { font-size: 13px; }
+.cardstrip .bar { height: 5px; background: var(--bar-bg); border-radius: 3px; overflow: hidden; margin-top: 3px; }
+.cardstrip .bar i { display: block; height: 100%; background: var(--bar); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 12px; }
 .chip { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--surface-2);
   color: var(--text-2); border: 1px solid var(--line); white-space: nowrap; }
@@ -137,6 +142,7 @@ details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
 </header>
 <main>
   <div class="chips" id="chips"></div>
+  <div class="cardstrip" id="cardstrip"></div>
   <div id="boots"></div>
   <section class="card" id="gpus-card">
     <h2>Karten <span class="muted">nvidia-smi, alle 2 s &middot; Verlauf 15 min</span></h2>
@@ -495,6 +501,10 @@ async function refresh() {
     $("gpuq").innerHTML = gpuqHtml(d);
     $("history").innerHTML = historyHtml(d.boots.filter((b) => !shown.includes(b)), now);
     $("chips").innerHTML = chipsHtml(d);
+    // compact card strip at the top: the load at a glance, also on a phone
+    $("cardstrip").innerHTML = ((d.gpus || {}).value || []).map((c) => `<div><b>${esc(c.name.replace("NVIDIA GeForce ", ""))}</b>
+      <span class="num">${fmt(c["power.draw"])} W &middot; ${fmt(c["memory.used"] / 1024, 1)}/${fmt(c["memory.total"] / 1024, 0)} GiB &middot; ${fmt(c["utilization.gpu"])} %</span>
+      <div class="bar"><i style="width:${c["power.limit"] ? Math.min(100, 100 * c["power.draw"] / c["power.limit"]) : 0}%"></i></div></div>`).join("");
     // behind the public proxy the LAN-only services are not reachable: hide their links, say so once
     document.querySelectorAll("a.lan").forEach((a) => { a.style.display = d.via_proxy ? "none" : ""; });
     $("lannote").style.display = d.via_proxy ? "" : "none";
