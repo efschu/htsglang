@@ -902,7 +902,26 @@ def _weg2_store_tail_settles(sched, req) -> bool:
         return False
     x = _weg2_store_short_tail_x(sched)
     remainder = _weg2_store_short_remainder(req)
+    if remainder is None and getattr(req, "_1471_short", False):
+        # PK2 (metal dkr27bparkdraftbar1w209270645, 27.09.): a ZERO answer
+        # (#1478: deliverable=0, so no #1324 stamp) is a read that delivered
+        # nothing -- D prefills the WHOLE span. Within X that is D's to do now
+        # (law 4 holds); unstamped, the flip-parked A (418 tokens) sat the whole
+        # 20.1 s settle bound out and was then prefilled from 0 anyway. Over X
+        # it still waits for its read, exactly as before.
+        remainder = _weg2_span_tokens(req)
     return x > 0 and remainder is not None and remainder <= x
+
+
+def _weg2_span_tokens(req) -> Optional[int]:
+    """The request's whole context in tokens (what D prefills on a zero read)."""
+    ids = getattr(req, "full_untruncated_fill_ids", None)
+    if ids is not None:
+        return len(ids)
+    try:
+        return len(req.origin_input_ids or ()) + len(req.output_ids or ())
+    except (AttributeError, TypeError):
+        return None
 
 
 def _weg2_windowed_path(sched) -> bool:

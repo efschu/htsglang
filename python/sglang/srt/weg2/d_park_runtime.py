@@ -319,17 +319,26 @@ def admission(sched, running_batch):
     if not d_seats.d_park_active() and not any(
         d_seats.park_site(r) is not None
         for r in list(sched.waiting_queue)
-        + list(getattr(sched, "weg2_post_wake_settle", None) or [])
         + list(getattr(sched, "weg2_dormant_hold", None) or [])
     ):
-        return None  # immediate park, nothing flip-parked waits: the stock loop as is
+        return None  # immediate park, nothing flip-parked waits (settle excluded, PK2): stock loop
     sched.waiting_queue = d_seats.order_waiting(sched.waiting_queue)
     book = getattr(sched, "_weg2_d_resume_book", None)
     if book is None:
         book = sched._weg2_d_resume_book = d_seats.ResumeBook.from_env()
-    pending = list(getattr(sched, "weg2_post_wake_settle", None) or []) + list(
-        getattr(sched, "weg2_dormant_hold", None) or []
-    )
+    # PK2 (metal dkr27bparkdraftbar1w209270645, park probe, 27.09.): under the
+    # 27B immediate park alone a flip-parked request still READING after the
+    # wake (#1471 post-wake settle) does not hold newcomers back. B (20477
+    # tokens, fully loaded at the wake) sat 20.1 s behind A in the settle
+    # (A's read was short, the settle bound lapsed) -> B-TTFT 26.8-27.1 s. The
+    # barrier exists so no newcomer takes a seat a parked request is coming
+    # back to; D has --d-bs seats and the settle-held one is not coming back
+    # this pass. NF (d_park_active, standard form) keeps the settle in the
+    # barrier unchanged.
+    settle = list(getattr(sched, "weg2_post_wake_settle", None) or [])
+    if not d_seats.d_park_active():
+        settle = []
+    pending = settle + list(getattr(sched, "weg2_dormant_hold", None) or [])
     avail = sched.uniform_min_avail() if book.margin_tokens >= 0 else None
     gate = d_seats.admission_gate(
         sched.waiting_queue,
