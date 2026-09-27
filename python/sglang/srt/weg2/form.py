@@ -668,9 +668,15 @@ PROFILES: Dict[str, ModelProfile] = {
         p_mamba_slots_from_argv=True,
         # NF keeps its H91 wait bound (standard_form); the NF seat decides.
         d_park_immediate=False,
-        # X-EXACT (user 26.09., "gilt fuer 27B und NF"): OFF until measured;
-        # the NF tokenizer is the group's own (Minachist INT4 tokenizer.json).
-        front_exact_tokens=False,
+        # X-EXACT (user 26.09., "gilt fuer 27B und NF"): ON with V1 (NF seat,
+        # 27.09.) together with the D-side PLE pread gather (nf-h91-vis.env
+        # NF_ENV_D_FORM). rc12g front log: chars/3 priced the uncached extent
+        # at 171-591 % of what D prefilled (median 273 %, 7 D-direct legs);
+        # X=4096 stays, the break-even with a warm D PLE is ~2980 tokens.
+        # The container env SGLANG_WEG2_FRONT_EXACT_TOKENS=0 turns it off
+        # (explicit wins). The NF tokenizer is the group's own (Minachist
+        # INT4 tokenizer.json).
+        front_exact_tokens=True,
         # rc12b OOM: the D budget books the driver carve (NF seat, 27.09.).
         budget_charges_driver_carve=True,
     ),
