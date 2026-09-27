@@ -281,7 +281,7 @@ def test_holder_census_names_every_class_and_the_gap(tmp_path, monkeypatch):
         slot_of = _publish(arena, CHAIN)
         t, _p = _tree(arena, slot_of)
         line = t.weg2_arena_holder_census(arena)
-        assert ("pool=FULL tree=2 tree_in_use=1 prefetch=1 retired=0 queue=1 carrier=0 "
+        assert ("pool=FULL tree=2 tree_in_use=1 prefetch=1 retired=0 queue=1 carrier=0 dormant_hold=0 "
                 "sum=5 own_held=5 gap=0") in line, line
         assert arena.ref_slots([slot_of["a0"]], +1) == 1          # nobody's class
         assert "gap=1" in t.weg2_arena_holder_census(arena)

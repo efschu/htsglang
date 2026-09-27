@@ -1494,6 +1494,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
           prefetches, resolved but not yet adopted by the tree;
         * queue: rows waiting in the host release queue (KV);
         * carrier: END anchors held across D's phase (group P, mamba);
+        * dormant_hold (#1424h2): pages of completed #1443 dormant-hold reads
+          until the admission pops the rid, those no tree node names (the
+          resolve's reference, counted once -- never beside the tree);
         * gap = own_held - sum: this process's references no class names (a
           holder outside the tree, or a leak);
         * reset_orphans (#1424g): references the resets of this process gave
@@ -1515,7 +1518,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         Called by the ARENA-REF-CENSUS thread (60 s) and once per reset; a
         snapshot, never exact under a concurrent round."""
-        from sglang.srt.mem_cache.pool_host.arena_pool import arena_ref_pages
+        from sglang.srt.mem_cache.pool_host.arena_pool import arena_ref_pages, arena_ref_slots
 
         lines = []
         for ct, pool in self._weg2_arena_pools().items():
@@ -1530,6 +1533,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             own0 = int(led0.held.sum()) if led0 is not None else None
             epoch0 = int(getattr(self, "_weg2_reset_epoch", 0))
             tree = in_use = 0
+            tree_slots = set()
             root = getattr(self, "root_node", None)
             stack = list(root.children.values()) if root is not None else []
             while stack:
@@ -1538,7 +1542,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 cd = node.component_data[ct]
                 if cd.host_value is None:
                     continue
-                n = arena_ref_pages(pool, cd.host_value)
+                named = arena_ref_slots(pool, cd.host_value)
+                tree_slots.update(named.tolist())
+                n = int(named.numel())
                 if cd.host_lock_ref > 0 or getattr(node, "write_through_pending_id", None) is not None:
                     in_use += n
                 else:
@@ -1560,7 +1566,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             carrier = sum(arena_ref_pages(pool, v)
                           for p, vals in list((getattr(self, "_weg2_carrier_rows", None) or {}).values())
                           if p is pool for v in vals)
-            total = tree + in_use + prefetch + retired + queue + carrier
+            dormant = 0
+            if ct == BASE_COMPONENT_TYPE:
+                seen = set()
+                for rows in list((getattr(self, "_weg2_dormant_done", None) or {}).values()):
+                    seen.update(arena_ref_slots(pool, rows).tolist())
+                dormant = len(seen - tree_slots)
+            total = tree + in_use + prefetch + retired + queue + carrier + dormant
             led = getattr(pool.arena, "_ledger", None)
             own = int(led.held.sum()) if led is not None else None
             orphans = int((getattr(self, "_weg2_reset_orphans", None) or {}).get(ct, 0))
@@ -1570,7 +1582,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             lines.append(
                 f"pool={getattr(ct, 'name', ct)} tree={tree} tree_in_use={in_use} prefetch={prefetch} "
-                f"retired={retired} queue={queue} carrier={carrier} sum={total} "
+                f"retired={retired} queue={queue} carrier={carrier} dormant_hold={dormant} sum={total} "
                 f"own_held={own if own is not None else '-'} "
                 f"gap={own - total if own is not None and not torn else '-'} reset_orphans={orphans} "
                 + (f"snapshot=torn own_before={own0} " if torn else "")
@@ -1675,6 +1687,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # which is what runs once that gate is cleared and the reap is therefore
         # unreachable.
         self._retired_prefetch: list[_OngoingPrefetch] = []
+        # #1424h2: rows of completed #1443 dormant-hold reads, kept for the
+        # ARENA-REF-HOLDERS census until the admission pops the rid (see
+        # `_weg2_note_dormant_done`); they die with the tree they were read for.
+        self._weg2_dormant_done: dict = {}
         self._retired_prefetch_attempts: dict[str, int] = {}
         self._retired_prefetch_reaped = 0
         self._retired_prefetch_recompute = 0
@@ -7155,6 +7171,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+        self._weg2_note_dormant_done(req_id, host_indices[unclaimed_to:min_completed_tokens])
         # #243: D took the hand-off -- every rank's fetched pages carry its own
         # references since they resolved, and this termination is the group's
         # vote that all of them have; the order protection ends here. A SHORT
@@ -7652,10 +7669,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         self._unpin_prefetched_span(req_id)
+        (getattr(self, "_weg2_dormant_done", None) or {}).pop(str(req_id), None)
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     #: #1417 upper bound on pinned spans (rids that never reach admission)
     _PREFETCH_SPAN_PINS_MAX = 64
+
+    def _weg2_note_dormant_done(self, req_id, rows) -> None:
+        """#1424h2 (rc12t D-TP0 18:17:50, ``ARENA-REF-HOLDERS ... sum=0
+        own_held=2771 gap=2771``): the four reads of the #1443 dormant hold
+        completed at 18:17:44 (loaded 52480+8896+4544+111424 tokens = 2771
+        pages) with the reader references of their resolve, and no holder
+        class named those pages. Kept per held rid until the admission pops
+        it (``pop_prefetch_loaded_tokens``), an abort or the reset; census
+        only -- the rows' release stays the tree's."""
+        held = getattr(getattr(self, "cache_controller", None), "weg2_hold_rids", None)
+        if not held or (req_id not in held and str(req_id) not in held):
+            return
+        if rows is None or int(rows.numel()) == 0:
+            return
+        done = getattr(self, "_weg2_dormant_done", None)
+        if done is None:
+            done = self._weg2_dormant_done = {}
+        done[str(req_id)] = rows.reshape(-1).clone()
+        while len(done) > self._PREFETCH_SPAN_PINS_MAX:
+            done.pop(next(iter(done)))
 
     def _pin_prefetched_span(self, req_id: str, deepest, stop_at) -> int:
         """#1417: host-lock every node from *deepest* up to (excluding)
@@ -7739,6 +7777,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._unpin_prefetched_span(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self._prefetch_completed_tokens.pop(rid, None)
+        (getattr(self, "_weg2_dormant_done", None) or {}).pop(str(rid), None)
         if rid not in self.ongoing_prefetch:
             return
 
