@@ -308,6 +308,43 @@ def ple_ids_for_images(input_ids: torch.Tensor, image_token_id: int) -> torch.Te
     )
 
 
+class Qwen4ExpDeepstackRefused(RuntimeError):
+    """H125d: Qwen4-Exp merges image rows into the INPUT embeddings only.
+
+    ``Qwen4ExpVLModel.forward`` takes ``input_deepstack_embeds`` for the
+    signature and drops it: a checkpoint with a non-empty
+    ``deepstack_visual_indexes`` would lose its per-layer visual residuals
+    without a word. The NF checkpoint (Minachist) has ``[]``; any other one is
+    refused at construction, and a deepstack tensor that still reaches the
+    forward is refused there."""
+
+
+DEEPSTACK_REFUSED = "H125d QWEN4EXP DEEPSTACK REFUSED"
+
+
+def refuse_deepstack_config(config) -> None:
+    vision = getattr(config, "vision_config", None)
+    indexes = list(getattr(vision, "deepstack_visual_indexes", None) or [])
+    if indexes:
+        raise Qwen4ExpDeepstackRefused(
+            f"{DEEPSTACK_REFUSED}: vision_config.deepstack_visual_indexes={indexes}; "
+            "Qwen4-Exp adds no per-layer visual residuals, the image would be "
+            "merged incompletely"
+        )
+
+
+def mrope_for_batch(forward_batch) -> bool:
+    """H125d: under ``SGLANG_WEG2_ENABLE_MROPE_IMAGE_EXTENT_ONLY``, does this
+    batch need the 3D mrope path? Only an extend (not decode, not idle) that
+    carries image inputs. Everything else reads row 0 of the mrope positions:
+    for text positions all three sections are equal (``pos + delta``), so the
+    1D rotary over row 0 is the same rotation."""
+    mode = forward_batch.forward_mode
+    if mode.is_decode_or_idle() or mode.is_target_verify():
+        return False
+    return bool(forward_batch.contains_image_inputs())
+
+
 class _PLEBatch(msgspec.Struct, frozen=True):
     mode: ForwardMode
     use_decode_fast_path: bool
@@ -2369,6 +2406,12 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self.last_hc_hidden_states = None
+        if input_deepstack_embeds is not None:
+            # H125d: see Qwen4ExpDeepstackRefused -- never dropped silently
+            raise Qwen4ExpDeepstackRefused(
+                f"{DEEPSTACK_REFUSED}: input_deepstack_embeds "
+                f"{tuple(input_deepstack_embeds.shape)} reached the language model"
+            )
         # mm routine passes input_ids=None; PLE needs the real ids.
         # H125: with images in the batch, the ids captured BEFORE the embed
         # routine clamped the pad ids in place, image positions mapped to
@@ -2606,6 +2649,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         prefix: str = "",
         language_model_cls=Qwen4ExpVLModel,
     ) -> None:
+        refuse_deepstack_config(config)  # H125d
         super().__init__(config, quant_config, prefix, language_model_cls)
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
@@ -2641,6 +2685,16 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.deepstack_visual_indexes = (
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
+        # H125d: mrope only where an extend holds image positions (switch,
+        # read once). Only meaningful when mrope is on at all.
+        self.mrope_image_extent_only = bool(
+            self.is_mrope_enabled and envs.SGLANG_WEG2_ENABLE_MROPE_IMAGE_EXTENT_ONLY.get()
+        )
+        if self.mrope_image_extent_only:
+            logging.getLogger(__name__).info(
+                "H125d MROPE IMAGE-EXTENT-ONLY: 3D mrope only for extends with image "
+                "inputs; decode and text extends use mrope row 0 on the 1D rotary"
+            )
 
     @torch.no_grad()
     def forward(
@@ -2675,6 +2729,18 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 forward_batch.input_ids if input_ids is None else input_ids,
                 self.ple_image_token_id,
             )
+        # H125d SGLANG_WEG2_ENABLE_MROPE_IMAGE_EXTENT_ONLY: a batch without an
+        # image extent takes row 0 of the mrope positions (pos + delta, equal
+        # in all three sections for text) through the 1D rotary -- today's
+        # text path. Decided per forward in Python, so a decode graph is
+        # captured on the 1D path and replays it for image requests too
+        # (their decode positions carry the delta in row 0).
+        mrope_1d = self.mrope_image_extent_only and not mrope_for_batch(forward_batch)
+        if mrope_1d:
+            mrope_positions = getattr(forward_batch, "mrope_positions", None)
+            if mrope_positions is not None:
+                positions = mrope_positions[0]
+            self.is_mrope_enabled = False
         try:
             output = super().forward(
                 input_ids, positions, forward_batch,
@@ -2686,6 +2752,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             raise
         finally:
             self.model.ple_input_ids = None
+            if mrope_1d:
+                self.is_mrope_enabled = True
         if timed:
             fwd_end()
         hc_hidden_states = self.model.last_hc_hidden_states

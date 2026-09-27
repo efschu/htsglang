@@ -953,6 +953,12 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # H125d (NF vision, transient): with images tokenized, Qwen4-Exp runs the
+    # 3D mrope path only for an extend whose extent holds image positions;
+    # decode and text extends take row 0 of the mrope positions (the 1D
+    # positions plus the request's mrope delta) through today's 1D rotary.
+    # Off = mrope on every batch of an image-tokenizing group (H125 8/n).
+    SGLANG_WEG2_ENABLE_MROPE_IMAGE_EXTENT_ONLY = EnvBool(False)
     # --ple-offload-backend file: where the sparse, file-backed PLE table lives
     # (deterministic name, reused across restarts), whether prefill-sized
     # gathers hint the page cache first, and an escape hatch for the device
