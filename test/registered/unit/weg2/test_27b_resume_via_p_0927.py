@@ -173,6 +173,7 @@ def test_front_queues_a_p_only_leg1_and_closes_the_record(d_env, caplog):
             assert p.payload["input_ids"][-1] == 80509 and p.payload["sampling_params"]["max_new_tokens"] == 1
             assert p.est_uncached == 80508 and p.est_prompt == 80510
             assert ns.kicks == ["arrival"]
+            p.leg1_done = True  # ROS-1P: p-done only for a leg that succeeded
             ns._rvp_p_finished(p)
             assert p.fut.done() and "weg2-24-100" in ns._rvp_p_done
             ns._rvp_resumed("weg2-24-100")
