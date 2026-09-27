@@ -66,6 +66,11 @@ import msgspec
 from sglang.srt.name_compat import tolerant_compile
 
 MIB = float(1 << 20)
+#: rc12e: rows of the persistent gather ring per expert tensor on every D rank
+#: with an expert buffer -- the SAME number as
+#: ``layers.moe.expert_offload.GATHER_RING_ROWS`` (a test binds them; the
+#: launcher must not import the runtime module to read it).
+GATHER_RING_ROWS = 16
 GIB_IN_MIB = 1024.0
 
 #: Der W-Code der Verweigerung. W120 (H5, Platztausch-Puffer) und W121 (Flip-
@@ -1344,6 +1349,9 @@ class DResidencyPlan(msgspec.Struct, frozen=True, kw_only=True):
     fits: Tuple[DRankResidency, ...] = ()
     #: H33: die Karten-Bilanz je Rang (leer = sie entfiel, Grund in ``lines``).
     card_fits: Tuple["DCardFit", ...] = ()
+    #: rc12e: die aus der geloesten Form abgeleiteten Ueberlaufwellen
+    #: (``derive_waves``); ``None`` = nicht abgeleitet, die Env gilt.
+    overflow_waves: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -2282,6 +2290,9 @@ def plan_d_residency(
     fixed_record_mib: Optional[Sequence[Optional[float]]] = None,
     fixed_record_source: str = "",
     card_ledger: Optional[DCardLedger] = None,
+    activation_record_mib: Optional[Sequence[Optional[float]]] = None,
+    activation_record_source: str = "",
+    derive_waves: bool = False,
 ) -> DResidencyPlan:
     """Der D-FRACTION-SOLVE mit den Metallregeln, fuer ``launcher``.
 
@@ -2290,6 +2301,17 @@ def plan_d_residency(
     ``None``-Eintrag laesst den Referenz-Posten stehen. ``card_ledger`` ersetzt
     die H33-Karte aus dem Referenz-Boot durch die Karte aus den Budget-Termen
     (:class:`DCardLedger`); ohne beide bleibt die Rechnung byte-gleich.
+    Mit dem Record bucht der feste Posten auch den Gather-Ring (227ae1becd,
+    persistent, ``GATHER_RING_ROWS`` Zeilen je Rang mit Experten-Puffer) --
+    der Record ist vor dem Ring gemessen.
+
+    rc12e: ``activation_record_mib`` = die gemessene D-Aktivierung
+    (``D_ACTIVATION_MIB``, Maximum der Extend-Transienten); ``None`` je
+    Eintrag laesst den Referenz-Posten stehen. ``derive_waves``: die
+    Ueberlaufwellen folgen der geloesten Form -- ``max(Env, ceil(Zeilen je
+    Schritt / Scratch))`` ueber die Raenge (Zeile OVERFLOW-WAVES,
+    ``plan.overflow_waves``); der Launcher setzt es nur, wenn die Wellen sein
+    eigener Profil-Default sind, nie ueber einen Wert aus --env-d.
 
     H91b: ``seats`` = D's wirksame --max-running-requests. Weicht sie von den
     Sitzen der Referenz ab, werden die sitz-proportionalen Posten umgebucht
@@ -2418,6 +2440,13 @@ def plan_d_residency(
             float(v) if v is not None else float(o)
             for v, o in zip(fixed_record_mib, old)
         )
+        # rc12e: the gather ring (expert_offload.gather_rows_into, 227ae1becd)
+        # is persistent -- GATHER_RING_ROWS rows of every expert tensor per
+        # rank with an expert buffer -- and allocated after the posts line the
+        # record was read from, so the record does not hold it.
+        ring = GATHER_RING_ROWS * slot_bytes / MIB
+        rings = tuple(ring if int(scratch_rows[r]) > 0 else 0.0 for r in range(n))
+        new = tuple(v + g for v, g in zip(new, rings))
         ref = msgspec.structs.replace(ref, fixed_mib=new)
         fixed_lines = (
             "%s FRACTION-SOLVE %s FEST (rc12c): fester Rang-Posten aus dem Record "
@@ -2429,6 +2458,33 @@ def plan_d_residency(
                 ["%.0f" % x for x in new],
                 ["%.0f" % x for x in old],
                 ref.source,
+            ),
+            "%s FRACTION-SOLVE %s GATHER-RING (rc12e): %s MiB je Rang (%d Zeilen x %.3f "
+            "MiB, persistent seit 227ae1becd, nach der Record-Messung angelegt) -- im "
+            "festen Posten oben enthalten"
+            % (marker, label, ["%.1f" % x for x in rings], GATHER_RING_ROWS, slot_bytes / MIB),
+        )
+    if activation_record_mib is not None:
+        if len(activation_record_mib) != n:
+            raise ValueError(
+                "D_ACTIVATION_MIB hat %d Eintraege, die D-Gruppe %d Raenge"
+                % (len(activation_record_mib), n)
+            )
+        old_act = tuple(ref.activation_mib)
+        new_act = tuple(
+            float(v) if v is not None else float(o)
+            for v, o in zip(activation_record_mib, old_act)
+        )
+        ref = msgspec.structs.replace(ref, activation_mib=new_act)
+        fixed_lines = fixed_lines + (
+            "%s FRACTION-SOLVE %s AKTIVIERUNG (rc12e): Aktivierungs-Posten aus dem Record "
+            "D_ACTIVATION_MIB (%s) %s statt %s -- gemessen, Maximum der Extend-Transienten"
+            % (
+                marker,
+                label,
+                activation_record_source or "Profil-Record",
+                ["%.0f" % x for x in new_act],
+                ["%.0f" % x for x in old_act],
             ),
         )
     share = draft_share_embed(env_d)
@@ -2494,15 +2550,48 @@ def plan_d_residency(
     lines = (head,) + seat_lines + spec_lines + fixed_lines + tuple(
         "%s FRACTION-SOLVE %s %s" % (marker, label, describe_rank(f)) for f in fits
     )
+    waves = pool_overflow_waves(env_d)
+    pool_mode = str(env_d.get(POOL_GRAPH_MODE_ENV, "")).strip().lower() == "pool"
+    verify_tokens = replayssm_spec.draft_tokens if replayssm_spec is not None else None
+    top_k = text_cfg.get("num_experts_per_tok")
+    derived_waves: Optional[int] = None
+    if derive_waves and seats is not None and pool_mode and verify_tokens and top_k:
+        # rc12e: the scratch follows the booked budget (d_scratch_cap), so the
+        # waves a bs-max step needs follow the scratch -- ceil(rows / scratch)
+        # on the rank that needs most, never below the waves already set.
+        per_rank = [
+            (
+                f.rank,
+                pool_step_rows_needed(
+                    seats=int(seats), verify_tokens=int(verify_tokens), top_k=int(top_k),
+                    local_experts=f.local_experts, resident_rows=f.resident_rows,
+                ),
+                int(f.scratch_rows),
+            )
+            for f in fits
+        ]
+        r_max, need_max, scratch_max = max(
+            per_rank,
+            key=lambda t: pool_step_waves_needed(need_rows=t[1], scratch_rows=t[2]),
+        )
+        need_w = pool_step_waves_needed(need_rows=need_max, scratch_rows=scratch_max)
+        derived_waves = max(waves, need_w)
+        lines = lines + (
+            "%s FRACTION-SOLVE %s OVERFLOW-WAVES rang%d: rows %d / scratch %d -> %d "
+            "(%s: Env %d, abgeleitet aus der geloesten Form bei %d Sitz(en))"
+            % (marker, label, r_max, need_max, scratch_max, derived_waves,
+               POOL_OVERFLOW_WAVES_ENV, waves, int(seats)),
+        )
+        waves = derived_waves
     step_lines, step_refusal = pool_step_rows_check(
         fits,
         seats=seats,
-        verify_tokens=(replayssm_spec.draft_tokens if replayssm_spec is not None else None),
-        top_k=text_cfg.get("num_experts_per_tok"),
-        pool_mode=str(env_d.get(POOL_GRAPH_MODE_ENV, "")).strip().lower() == "pool",
+        verify_tokens=verify_tokens,
+        top_k=top_k,
+        pool_mode=pool_mode,
         marker=marker,
         label=label,
-        waves=pool_overflow_waves(env_d),
+        waves=waves,
     )
     lines = lines + step_lines
     if card_ledger is not None:
@@ -2541,6 +2630,7 @@ def plan_d_residency(
             refusal="; ".join(refusals) if refusals else None,
             fits=fits,
             card_fits=cards,
+            overflow_waves=derived_waves,
         )
     card_lines, cards, card_refusal = _plan_d_card(
         fits=fits,
@@ -2571,6 +2661,7 @@ def plan_d_residency(
         refusal="; ".join(refusals) if refusals else None,
         fits=fits,
         card_fits=cards,
+        overflow_waves=derived_waves,
     )
 
 

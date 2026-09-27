@@ -10584,6 +10584,16 @@ def d_fixed_record(profile: Optional[str] = None) -> Tuple[Optional[List[Optiona
     return [None if v is None else float(v) for v in vals], _pconst_boots("D_FIXED_MIB", profile)
 
 
+def d_activation_record(profile: Optional[str] = None) -> Tuple[Optional[List[Optional[float]]], str]:
+    """rc12e: ``D_ACTIVATION_MIB`` of the profile (the D extend's measured
+    transient maximum per rank), or ``(None, "")`` -- the reference stands."""
+    try:
+        vals = list(_pconst("D_ACTIVATION_MIB", profile))
+    except KeyError:
+        return None, ""
+    return [None if v is None else float(v) for v in vals], _pconst_boots("D_ACTIVATION_MIB", profile)
+
+
 def d_overshoot_record(profile: Optional[str] = None) -> Tuple[Optional[List[int]], str]:
     """``D_OVERSHOOT_MIB`` (peak - budget, the qwen27b record), or ``(None, "")``
     for a profile that prices D's awake excess as ``D_AWAKE_REST_MIB`` instead
@@ -14867,6 +14877,10 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                               else (None, ""))
     _ledger = (d_card_ledger(card_terms, budgets_d, label)
                if card_terms is not None and len(card_terms) == n else None)
+    # rc12e: the D activation measured on the same form (max extend transient)
+    _act_rec, _act_src = (d_activation_record(ns.profile) if card_terms is not None
+                          else (None, ""))
+    _derive_waves = bool(getattr(ns, "d_pool_waves_derived", False))
     try:
         plan = _er.plan_d_residency(
             model_path=ns.model,
@@ -14893,6 +14907,9 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             fixed_record_mib=_fixed_rec,
             fixed_record_source=_fixed_src,
             card_ledger=_ledger,
+            activation_record_mib=_act_rec,
+            activation_record_source=_act_src,
+            derive_waves=_derive_waves,
         )
         if _ledger is not None and plan.refusal is not None and plan.fits:
             # THE CONSUMER FOLLOWS THE BOOKED BUDGET (rc12c): lower the
@@ -14926,6 +14943,9 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                     fixed_record_mib=_fixed_rec,
                     fixed_record_source=_fixed_src,
                     card_ledger=_ledger,
+                    activation_record_mib=_act_rec,
+                    activation_record_source=_act_src,
+                    derive_waves=_derive_waves,
                 )
         if d_stated_seats(ns) is not None:
             for _ln in d_seat_lines(ns):
@@ -14938,6 +14958,11 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         return
     for line in plan.lines:
         log(line)
+    if plan.overflow_waves is not None and plan.overflow_waves != _er.pool_overflow_waves(_env_d):
+        # rc12e: the D group runs the waves its solved form needs.
+        ns.env_d = set_group_env(getattr(ns, "env_d", "") or "",
+                                 _er.POOL_OVERFLOW_WAVES_ENV, str(int(plan.overflow_waves)))
+        _env_d = parse_group_env(ns.env_d)
     # H95: the seats are dynamic 1..--d-bs per D phase -- the same solve per
     # seat count n (seat_rebook re-books the seat posts), one line each.
     for _ln in d_seat_table_lines(ns, _er, dict(
@@ -14958,6 +14983,9 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             fixed_record_mib=_fixed_rec,
             fixed_record_source=_fixed_src,
             card_ledger=_ledger,
+            activation_record_mib=_act_rec,
+            activation_record_source=_act_src,
+            derive_waves=_derive_waves,
     ), label):
         log(_ln)
     if plan.refusal is not None:
@@ -18592,6 +18620,9 @@ def apply_profile_d_pool_waves_default(ns) -> Optional[str]:
         return None
     item = "%s=%d" % (POOL_OVERFLOW_WAVES_ENV, DEFAULT_D_POOL_WAVES_NEXTFLASH)
     ns.env_d = (env_d.rstrip(";") + ";" + item) if env_d.strip() else item
+    # rc12e: the launcher's own default -- the D solve may raise it to what
+    # the solved form needs (OVERFLOW-WAVES); a value told in --env-d is kept.
+    ns.d_pool_waves_derived = True
     return ("D-POOL-WELLEN (H95): --profile nextflash -> --env-d %s (Ueberlaufwellen: "
             "der bs1-Scratch traegt jede Sitzzahl 1..--d-bs; --env-d %s=0 = die "
             "H91b-Schranke)" % (item, POOL_OVERFLOW_WAVES_ENV))

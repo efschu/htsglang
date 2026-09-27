@@ -69,6 +69,23 @@
    "kind": "memory",
    "power_limit_w": null,
    "power_limit_source": "not recorded per record; the rig ran 5090 400 W / 3080 230 W (row 27)"
+  },
+  {
+   "name": "D_ACTIVATION_MIB",
+   "value": [
+    1104,
+    null,
+    null
+   ],
+   "provenance": "rc12e: the D activation post of the #145 solve = the MEASURED maximum of the extend transient on D-TP0 (WEG2-VRAM-PEAK transient_mib = peak_allocated - start_allocated, phase=chunk and the phase=round that holds the draft extend), rounded up to 8 MiB: rc12d (227ae1becd) chunk rows=4059 1101 (max), round 994; rc12c (2e3e38b87c) round 1006; rc12b (c6868a1e13) round 934 -- every window >= 800 MiB carried an allocator retry against the booked 1024 of the fnFL2 reference. The persistent gather ring (16 rows x 2.417 MiB = 38.7 MiB per rank since 227ae1becd) is NOT in this post: it is a fixed post, added to D_FIXED_MIB by the solve. 3080 ranks: no transient edge measured on NF (null: the reference 1024 stays there).",
+   "boots": [
+    "dkrnfh91bar1dauer09270212",
+    "dkrnfh91bar1dauer09270103",
+    "dkrnfh91bar1dauer09270007"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not a power-dependent quantity (bytes one extend adds)"
   }
  ],
  "borrow": {

@@ -196,8 +196,11 @@ def test_the_27b_constants_moved_unchanged_and_the_nf_row_is_separate():
     assert "D_OVERSHOOT_MIB" not in n
     assert n["D_AWAKE_REST_MIB"].measured_on == "nextflash"
     assert n["D_FIXED_MIB"].measured_on == "nextflash"
+    # rc12e: the D activation measured on the NF form (max extend transient)
+    assert n["D_ACTIVATION_MIB"].measured_on == "nextflash"
+    assert "D_ACTIVATION_MIB" not in q
     assert set(borrowed) == set(n) - {"P_DRAFT_RESIDENT_BUDGET_MIB", "P_DORMANT_SERVED_GROWTH_MIB",
-                                      "D_AWAKE_REST_MIB", "D_FIXED_MIB"}
+                                      "D_AWAKE_REST_MIB", "D_FIXED_MIB", "D_ACTIVATION_MIB"}
     assert set(borrowed.values()) == {"qwen27b"}
     assert F.borrowed_constants("qwen27b") == ()
     assert "P_OVERSHOOT_MIB" in F.borrowed_constants_line("nextflash")
