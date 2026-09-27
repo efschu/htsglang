@@ -2046,6 +2046,14 @@ def _short_keep_enabled(env=None) -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def _seat_rotate_enabled(env=None) -> bool:
+    """#244: ``SGLANG_WEG2_SEAT_ROTATE`` (default on; 0 = the parked resume
+    first, as before)."""
+    e = os.environ if env is None else env
+    raw = (e.get("SGLANG_WEG2_SEAT_ROTATE", "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def _flip_single_flight_enabled(env=None) -> bool:
     """FS: ``SGLANG_WEG2_FLIP_SINGLE_FLIGHT`` (default on; 0 = no guard)."""
     e = os.environ if env is None else env
@@ -2673,6 +2681,8 @@ class Pending:
     short_kept: bool = False
     #: SK: the front epoch the price was taken in.
     price_epoch: int = -1
+    #: #244: when leg 1 finished and the request started waiting for a D seat.
+    t_ready: float = 0.0
     #: xsn438: only group P can serve this request -- an image under
     #: ``--weg2-vision transient`` (W102): its embeddings are attached on P's
     #: PP0 and D carries no tower. Its route is ``long`` by RULE, not by
@@ -3635,8 +3645,83 @@ class Front:
             inflight = int(self._handoff_in_flight())
         except Exception:  # noqa: BLE001 -- a partial front has no seat state
             inflight = 0
-        return {"handoff_n": len(held) + len(ready) + max(0, inflight),
-                "parked_n": len(parked)}
+        out = {"handoff_n": len(held) + len(ready) + max(0, inflight),
+               "parked_n": len(parked)}
+        try:
+            defer = Front._seat_rotate_plan(self, parked, ready)
+        except Exception as e:  # noqa: BLE001 -- a plan never breaks the wake
+            logger.warning("SEAT-ROTATE plan failed: %r", e)
+            defer = []
+        if defer:
+            out["parked_n"] = len(parked) - len(defer)
+            out["park_defer_rids"] = list(defer)
+        return out
+
+    def _seat_rotate_note_resume(self, parked) -> None:
+        """#244: at PARK-RESUME, which parked ones resumed (the dwell) and
+        which were deferred (the fairness count); the plan was taken at this
+        flip's begin (``_seat_last_defer``)."""
+        defer = set(getattr(self, "_seat_last_defer", None) or ())
+        if getattr(self, "_seat_resumed_epoch", None) is None:
+            self._seat_resumed_epoch, self._seat_defer_n = {}, {}
+        for r in parked:
+            if r in defer:
+                self._seat_defer_n[r] = self._seat_defer_n.get(r, 0) + 1
+            else:
+                self._seat_resumed_epoch[r] = self.epoch
+                self._seat_defer_n.pop(r, None)
+        if defer:
+            logger.info("WEG2 PARK-RESUME-DEFERRED epoch=%d n=%d rids=%s (#244: their seats went to "
+                        "requests waiting past the bound)", self.epoch, len(defer), sorted(defer)[:8])
+        self._seat_last_defer = ()
+
+    def _seat_rotate_plan(self, parked, ready) -> List[str]:
+        """#244 (NF rc12r 16:52-17:04: the same 5 long runs weg2-0-5/1-12/5-21/
+        10-34/13-41 resumed first at every wake, waiters with leg 1 done
+        255 -> 658 s, queued_d 4 -> 13). At the P->D wake: every request
+        waiting for a D seat past the wait bound (leg 1 done, oldest wait
+        first) takes the seat of the YOUNGEST parked one (last admitted to a D
+        seat). Not rotated out: a rid resumed in this or the previous phase
+        (park-cycle dwell) and one deferred >= 2 phases already (fairness: it
+        has priority over new ones). The deferred ones stay in D's hold as
+        ordinary waiting work (d_park_runtime._apply_park_defer). Logs one
+        SEAT-ROTATE line per pair."""
+        if not _seat_rotate_enabled() or not parked:
+            return []
+        bound = float(getattr(self, "d_wait_bound_s", 0) or 0)
+        if bound <= 0:
+            return []
+        now = time.time()
+        waiters = []
+        for p in ready:
+            t0 = float(getattr(p, "t_ready", 0.0) or 0.0) or float(p.t_arrive)
+            if getattr(p, "leg1_done", False) and now - t0 > bound:
+                waiters.append((now - t0, p))
+        if not waiters:
+            return []
+        waiters.sort(key=lambda w: -w[0])
+        epoch = int(getattr(self, "epoch", 0))
+        resumed = getattr(self, "_seat_resumed_epoch", None) or {}
+        deferred_n = getattr(self, "_seat_defer_n", None) or {}
+        admit_t = getattr(self, "_d_admit_t", None) or {}
+        eligible = [r for r in parked
+                    if resumed.get(r, -10) < epoch - 1 and deferred_n.get(r, 0) < 2]
+        eligible.sort(key=lambda r: -float(admit_t.get(r, 0.0)))  # youngest first
+        pairs = list(zip([w for w in waiters], eligible))
+        out = []
+        for (waited, p), r_out in pairs:
+            out.append(r_out)
+            self.counters["seat_rotate"] += 1
+            # the front seat goes with it: the deferred one is not running on
+            # D this phase, the waiter takes the seat (D-REFILL freed_by=rotate)
+            for _st in list(getattr(self, "_d_seats_live", ()) or ()):
+                if getattr(_st, "rid", None) == r_out:
+                    _st.release("rotate")
+            logger.warning("WEG2 SEAT-ROTATE rid_in=%s rid_out=%s reason=wait-bound waited_s=%.1f "
+                           "bound_s=%.0f epoch=%d (the youngest parked gives its seat to a request "
+                           "waiting past the bound; it stays held and waits as ordinary work)",
+                           p.rid, r_out, waited, bound, epoch)
+        return out
 
     # -- RESUME-VIA-P (weg2/resume_via_p.py) ---------------------------------
     def _rvp_state(self) -> None:
@@ -5846,7 +5931,8 @@ class Front:
         from sglang.srt.weg2.retain_publish import d_accepts_leg2 as _acc
         return _acc(self.awake, self.state, self.dormant_admit)   # xsn347: also during the P->D flip
 
-    def _log_admit(self, rid: str, source: str, t_arrive: float, rank: Optional[int] = None) -> None:
+    def _log_admit(self, rid: str, source: str, t_arrive: float, rank: Optional[int] = None,
+                   t_ready: float = 0.0) -> None:
         """L2.  ``rank`` is this admission's ORDINAL in the current epoch.
 
         Deviation from the spec's wording, stated: the spec asks for the
@@ -5859,8 +5945,16 @@ class Front:
             rank = self._admitted_this_epoch
         self._admitted_this_epoch += 1
         self.counters["d_admits"] += 1  # R28: DP-WAIT d_admitted_during_wait
-        logger.info("WEG2 D-ADMIT rid=%s seat=%d/%d rank=%d oldest_wait_s=%.1f source=%s",
-                    rid, self._seats_in_use(), self.d_bs, rank, max(0.0, time.time() - t_arrive), source)
+        now = time.time()
+        # #244: the seat order "youngest = last admitted to a D seat".
+        if getattr(self, "_d_admit_t", None) is None:
+            self._d_admit_t = {}
+        self._d_admit_t[rid] = now
+        while len(self._d_admit_t) > 4096:
+            self._d_admit_t.pop(next(iter(self._d_admit_t)))
+        _sw = max(0.0, now - (t_ready if t_ready else t_arrive))
+        logger.info("WEG2 D-ADMIT rid=%s seat=%d/%d rank=%d oldest_wait_s=%.1f source=%s seat_wait_s=%.1f",
+                    rid, self._seats_in_use(), self.d_bs, rank, max(0.0, now - t_arrive), source, _sw)
 
     async def d_admitter(self) -> None:
         """Law 2: admit the OLDEST first, ``--d-bs`` at a time, refill on a
@@ -5956,7 +6050,8 @@ class Front:
                 p.seat = Seat(self, p.rid, "batch",
                               tokens=d_seat_need(p.est_prompt, p.leg1_prompt_tokens)[0])
                 p.posted_evt = asyncio.Event()
-                self._log_admit(p.rid, source="batch", t_arrive=p.t_arrive)
+                self._log_admit(p.rid, source="batch", t_arrive=p.t_arrive,
+                                t_ready=getattr(p, "t_ready", 0.0))
                 p.fut.set_result(True)
                 try:
                     await asyncio.wait_for(p.posted_evt.wait(), POST_BARRIER_S)
@@ -7711,6 +7806,7 @@ class Front:
         # UNIFY: only the standard form carries the seat counts (qwen27b: {}).
         _wake_extra = (Front._wake_handoff_fields(self, dst)
                        if getattr(self, "standard_form", True) else {})
+        self._seat_last_defer = tuple(_wake_extra.get("park_defer_rids", ()) or ())  # #244
         if _wake_extra:
             # H91c3-3: the phase's n as D derives it (the same pure function)
             self._d_phase_n = phase_policy.d_phase_seats(
@@ -8171,6 +8267,7 @@ class Front:
                         sorted(_h91_parked)[:8])
             self.counters["d_parked_resumed"] += len(_h91_parked)
             self._park_resume_epoch = self.epoch
+            Front._seat_rotate_note_resume(self, list(_h91_parked))  # #244
             _h91_parked.clear()
         # 27B flipfast F3: after a D->P flip the controller that awaits it starts
         # P's drain at once instead of one tick later (no-op with the switch off).
@@ -9215,6 +9312,7 @@ class Front:
                         return
                     _drain_uncached += int(p.est_uncached)
                     if not p.fut.done():
+                        p.t_ready = time.time()  # #244 seat_wait_s
                         self._ready_for_d.append(p)
                         self._sync_batch_gate()
                         prefilled += 1
