@@ -10640,6 +10640,18 @@ def d_scratch_cap(fits, scratch: Sequence[int]) -> Tuple[List[int], List[str]]:
     return out, lines
 
 
+def d_extend_trim_env(ledger, fits) -> str:
+    """rc12e: ``SGLANG_WEG2_EXTEND_TRIM_MIB`` from the card ledger's floor and
+    the solved form's booked activation, per rank; '' when a rank is missing."""
+    from sglang.srt.weg2 import extend_trim as _et
+
+    act = {int(f.rank): float(f.activation_mib) for f in fits}
+    n = len(ledger.floor_mib)
+    if any(r not in act for r in range(n)):
+        return ""
+    return _et.launcher_thresholds(ledger.floor_mib, [act[r] for r in range(n)])
+
+
 def set_group_env(spec: str, key: str, value: str) -> str:
     """``spec`` ('KEY=VAL;...') with ``key`` set to ``value`` (appended when
     absent); every other entry keeps its text and its place."""
@@ -14951,6 +14963,16 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     if plan.refusal is not None:
         log(f"{D_RANK_SOLVE_MARKER} {plan.refusal}")
         raise Weg2LaunchRefused(plan.refusal)
+    if _ledger is not None and plan.fits:
+        # rc12e: D's extend trims the allocator cache when the card holds
+        # less than floor + booked activation (WEG2-EXTEND-CACHE-TRIM).
+        _trim = d_extend_trim_env(_ledger, plan.fits)
+        if _trim:
+            ns.env_d = set_group_env(getattr(ns, "env_d", "") or "",
+                                     "SGLANG_WEG2_EXTEND_TRIM_MIB", _trim)
+            log(f"{D_RANK_SOLVE_MARKER} {label} EXTEND-TRIM SGLANG_WEG2_EXTEND_TRIM_MIB={_trim} "
+                f"(floor + gebuchte Aktivierung je Rang; darunter leert D vor dem Extend "
+                f"den Allokator-Cache)")
     log_wake_credit_solve(ns, cards, plan.fits, log, label,
                           p_split=p_split, chunk_layers=chunk_layers)
 

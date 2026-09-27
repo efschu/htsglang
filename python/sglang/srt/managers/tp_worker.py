@@ -547,6 +547,13 @@ class TpModelWorker(BaseTpWorker):
         is_verify: bool = False,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
     ) -> GenerationBatchResult:
+        # rc12e: before a D extend, hand unusable cached segments back to a
+        # short card (WEG2-EXTEND-CACHE-TRIM); unset threshold = no-op.
+        if batch is not None:
+            from sglang.srt.weg2 import extend_trim
+
+            extend_trim.before_extend(self, batch)
+
         # Get forward batch from schedule batch
         if batch is not None:
             # update the consumer index of hicache to the running batch

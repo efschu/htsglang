@@ -628,6 +628,14 @@ class Envs:
     # line and no re-base, the 2026-09-24 form.
     SGLANG_WEG2_VRAM_PEAK = EnvBool(True)
     SGLANG_WEG2_VRAM_PEAK_ROUNDS = EnvInt(64)
+    # EXTEND_TRIM_MIB (rc12e): per-rank threshold "a,b,c" in MiB = the card
+    # floor + the booked activation of the D form. Before an extend batch of
+    # the target worker, a card with less free than that empties the caching
+    # allocator (WEG2-EXTEND-CACHE-TRIM): rc12d's extends found 983 MiB cached
+    # but not reusable and took +1174 MiB of new segments for a 621 MiB
+    # transient. The launcher writes it into the D group env from the #145
+    # card ledger (NF only); unset = no read, no trim, the 227ae1becd form.
+    SGLANG_WEG2_EXTEND_TRIM_MIB = EnvStr(None)
     # TAIL_HANDOFF (H18, E1 of H17, fnFL2x132): P ends the prompt's last-but-one
     # chunk at c = floor_r(N-1) (r = QSA compress ratio) instead of the page,
     # and hands the GDN state after c plus the KV/QSA rows of the partial page
