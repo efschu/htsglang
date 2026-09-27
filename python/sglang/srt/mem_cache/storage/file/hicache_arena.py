@@ -214,6 +214,10 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_drop_unreferenced.argtypes = [p_u8, i64, p_i64, p_i8]
             lib.arena_reap_stale.restype = i64
             lib.arena_reap_stale.argtypes = [p_u8]
+            lib.arena_reap_partial.restype = i64
+            lib.arena_reap_partial.argtypes = [p_u8, i64, p_i64, i64]
+            lib.arena_unclaim.restype = i64
+            lib.arena_unclaim.argtypes = [p_u8, i64, p_i64, p_i64]
             lib.arena_stats.restype = None
             lib.arena_stats.argtypes = [p_u8, p_i64]
             lib.arena_find_slots.restype = i64
@@ -583,6 +587,24 @@ class ShmArena:
 
     def reap_stale(self) -> int:
         return int(self._lib.arena_reap_stale(self._base))
+
+    def reap_partial(self, min_age_s: float, cap: int = 64) -> list[int]:
+        """#231: free CLAIMED direct-write slots no writer can still come to
+        -- every claimer merged or gave up (no open writer), nobody holds a
+        reference, untouched for ``min_age_s`` (arena.c arena_reap_partial);
+        returns the freed slot ids (at most ``cap`` listed)."""
+        out = (ctypes.c_int64 * max(1, int(cap)))()
+        n = int(self._lib.arena_reap_partial(self._base, int(float(min_age_s) * 1e3), out, int(cap)))
+        return [int(out[i]) for i in range(min(n, int(cap)))] + [-1] * max(0, n - int(cap))
+
+    def unclaim(self, slots: Sequence[int], gens: Sequence[int]) -> int:
+        """#231: a direct writer gives its JOINED claim up without merging."""
+        n = len(slots)
+        if n == 0:
+            return 0
+        cs = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        cg = (ctypes.c_int64 * n)(*[int(g) for g in gens])
+        return int(self._lib.arena_unclaim(self._base, n, cs, cg))
 
     def stats(self) -> dict:
         out = (ctypes.c_int64 * 4)()

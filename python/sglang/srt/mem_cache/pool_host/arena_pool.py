@@ -315,6 +315,59 @@ def verify_load_chain(pool, nodes, host_indices, rows_of, stems_of, *, keys_of=N
     return rebuilt.to(host_indices.device, dtype=host_indices.dtype)
 
 
+ENV_PARTIAL_REAP_S = "SGLANG_WEG2_ARENA_PARTIAL_REAP_S"
+_PARTIAL_REAP_N = [0, 0]  # calls that freed something, slots freed
+
+
+def _partial_reap_age_s() -> float:
+    """#231: how long a CLAIMED slot may sit untouched and unreferenced
+    before its missing writers count as never coming (default 30 s; a
+    direct write lands within one hicache round, the PP ranks' publishes of
+    one node within a few forwards). 0 switches the reap off."""
+    try:
+        return max(0.0, float(os.environ.get(ENV_PARTIAL_REAP_S, "30")))
+    except ValueError:
+        return 30.0
+
+
+def _reap_orphan_claims(arena) -> list:
+    """#231 (rc12m-dpr 09271152, the P mamba arena of 32 slots): claim-time
+    room from CLAIMED slots whose writers stopped -- the stem some P ranks
+    claimed and wrote and another never joined (the ranks decide their
+    anchor claims locally: MAMBA-ARENA weg2-0-11 PP0 written=1, PP1/PP2
+    written=3). Such a slot is neither COMPLETE (no reader, no evictor) nor
+    FREE; the census went complete 29 -> 5 while every claim found no free
+    slot, the END anchors of all later requests were refused and D resumed
+    short. Only a slot NO writer can still come to goes (arena.c
+    arena_reap_partial): every rank that claimed or joined it has merged or
+    given the claim up (the slot's open-writer count is 0 -- a rank asleep,
+    behind, or mid flip with its claim unmerged keeps it open for any length
+    of time), nobody holds a reference (a merged rank's node holds one until
+    its tree lets it go), untouched for ``SGLANG_WEG2_ARENA_PARTIAL_REAP_S``.
+    A rank that never claimed the stem gets a fresh slot later, never a
+    refused completion. Called for the mamba anchor arena only
+    (``_weg2_reaps_orphan_claims``)."""
+    age = _partial_reap_age_s()
+    if age <= 0 or not hasattr(arena, "reap_partial"):
+        return []
+    try:
+        freed = arena.reap_partial(age)
+    except Exception as exc:  # noqa: BLE001 - the claim below decides, loudly
+        logger.warning("#231 ARENA-REAP-PARTIAL failed: %r", exc)
+        return []
+    if freed:
+        _PARTIAL_REAP_N[0] += 1
+        _PARTIAL_REAP_N[1] += len(freed)
+        k = _PARTIAL_REAP_N[0]
+        if k <= 16 or (k & (k - 1)) == 0:
+            logger.warning(
+                "#231 ARENA-REAP-PARTIAL n=%d freed=%d total=%d slots=%s age_s=%.0f: CLAIMED "
+                "slots no rank referenced or touched -- a writer rank never joined their stem, "
+                "so they could never become COMPLETE; the claim takes their room",
+                k, len(freed), _PARTIAL_REAP_N[1], freed[:8], age)
+    return freed
+
+
 def _page_slots(pool, rows: torch.Tensor) -> torch.Tensor:
     """x59: token rows of whole pages -> one slot per page (the P consecutive
     ids of each page, in order; anything else is a caller handing tokens of
@@ -1474,6 +1527,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         except Exception as exc:  # noqa: BLE001 - loud, the claim below decides
             logger.warning("#1427 ARENA-DROP failed: %r", exc)
             return 0
+        reaped = (_reap_orphan_claims(arena)
+                  if len(cands) < need and getattr(self, "_weg2_reaps_orphan_claims", False) else [])
         k = getattr(ArenaMHAHostPool, "_1427_drop_n", 0) + 1
         ArenaMHAHostPool._1427_drop_n = k
         if _prefix_trace.on():
@@ -1490,7 +1545,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             logger.info("#1427 ARENA-DROP n=%d need=%d freed=%d slot_bytes=%d (claim-time room "
                         "without disk I/O -- H81, user rule 24.09.: no copy in the compute path)",
                         k, need, len(cands), int(getattr(arena, "slot_bytes", 0) or 0))
-        return len(cands)
+        return len(cands) + len(reaped)
 
     def _claim(self, stems):
         """Claim (or join, or find complete) one slot per stem. Returns the
@@ -1523,6 +1578,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 fresh = [s for s, st, _ in got if st == 0]
                 if fresh:
                     arena.free_slots(fresh)
+                joins = [(s, g) for s, st, g in got if st == 1]
+                if joins and hasattr(arena, "unclaim"):
+                    arena.unclaim([s for s, _ in joins], [g for _, g in joins])  # #231
                 k = getattr(ArenaMHAHostPool, "_1427_full_n", 0) + 1
                 ArenaMHAHostPool._1427_full_n = k
                 if k <= 8 or k % 256 == 0:
@@ -1867,13 +1925,14 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         references taken on complete pages."""
         if self.arena is None:
             return
-        fresh, refd = [], []
+        fresh, refd, joined, jgens = [], [], [], []
         if self._pending_mask is not None:
             all_t = torch.as_tensor([s for s in self._slots_of(host_indices) if s >= 0], dtype=torch.int64)
             if all_t.numel():
-                m, sel, _g, fr = self._pend_take(all_t)
+                m, sel, g, fr = self._pend_take(all_t)
                 refd = all_t[~m].tolist()
                 fresh = sel[fr].tolist()
+                joined, jgens = sel[~fr].tolist(), g[~fr].tolist()
         else:
             for s in self._slots_of(host_indices):
                 if s < 0:
@@ -1883,6 +1942,11 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     refd.append(s)
                 elif p[1]:
                     fresh.append(s)
+                else:
+                    joined.append(s)
+                    jgens.append(p[0])
+        if joined and hasattr(self.arena, "unclaim"):
+            self.arena.unclaim(joined, jgens)   # #231: this writer is no longer open on the slot
         if fresh:
             self.arena.free_slots(fresh)
         if refd:
@@ -1956,13 +2020,24 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 st_ = torch.as_tensor(slots, dtype=torch.int64)
                 m, sel, _g, fr = self._pend_take(st_)
                 fresh = sel[fr].tolist()
+                if bool((~fr).any()) and hasattr(self.arena, "unclaim"):
+                    self.arena.unclaim(sel[~fr].tolist(), _g[~fr].tolist())   # #231
                 if fresh:
                     self.arena.free_slots(fresh)
                 slots = st_[~m].tolist()
             else:
                 pend = [s for s in slots if s in self._pending]
                 if pend:
-                    fresh = [s for s in pend if self._pend_pop(s)[1]]
+                    fresh, joined, jgens = [], [], []
+                    for s in pend:
+                        p = self._pend_pop(s)
+                        if p[1]:
+                            fresh.append(s)
+                        else:
+                            joined.append(s)
+                            jgens.append(p[0])
+                    if joined and hasattr(self.arena, "unclaim"):
+                        self.arena.unclaim(joined, jgens)   # #231: a join freed unwritten is no longer open
                     if fresh:
                         self.arena.free_slots(fresh)
                     slots = [s for s in slots if s not in pend]

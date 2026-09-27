@@ -251,6 +251,10 @@ class ArenaMambaPoolHost(MambaPoolHost):
     _pend_mark = ArenaMHAHostPool._pend_mark
     _pend_pop = ArenaMHAHostPool._pend_pop
     _pending_mask = None   # the mamba pool keeps the dict only (1 state per node)
+    # #231: only the mamba anchor arena reaps orphaned direct claims (its anchor
+    # claims are decided per P rank); a form without arena anchor claims (27B:
+    # host_anchor_slots) never claims here, so there is nothing to reap.
+    _weg2_reaps_orphan_claims = True
 
     def _stems(self, hashes, suffix: str = ""):
         from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -640,7 +644,16 @@ class ArenaMambaPoolHost(MambaPoolHost):
             freed += int(super().free(staging))
         if rows:
             pend = [s for s in rows if s in self._pending]
-            fresh = [s for s in pend if self._pending.pop(s)[1]]
+            fresh, joined, jgens = [], [], []
+            for s in pend:
+                g, is_fresh = self._pending.pop(s)[:2]
+                if is_fresh:
+                    fresh.append(s)
+                else:
+                    joined.append(s)
+                    jgens.append(g)
+            if joined:
+                self.arena.unclaim(joined, jgens)   # #231: a join freed unwritten is no longer open
             if fresh:
                 self.arena.free_slots(fresh)
             keep = [s for s in rows if s not in pend]
