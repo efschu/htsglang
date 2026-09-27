@@ -111,6 +111,7 @@ h2 .muted, .muted { color: var(--muted); font-weight: 400; }
 .phasebar .seg.run { background-image: repeating-linear-gradient(135deg, rgba(255,255,255,.18) 0 6px, transparent 6px 12px); }
 .phasebar .seg.sel { outline: 2px solid var(--text); outline-offset: -2px; }
 .phasebar .cut { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--bad); }
+.phasebar .cut.planned { background: var(--text-2); }
 .sparkbox { position: relative; margin-top: 8px; }
 .sparkbox .ymax { position: absolute; left: 0; top: -2px; font-size: 10px; color: var(--muted); background: var(--surface); padding-right: 4px; }
 .spark { width: 100%; height: 60px; display: block; }
@@ -139,6 +140,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .alarm { border-radius: 8px; padding: 12px 14px; margin: 0 0 12px; color: #fff; background: var(--alarm-dead); }
 .alarm.hang { background: var(--alarm-hang); }
 .alarm.warn { background: var(--surface-2); color: var(--text); border: 2px solid var(--warn); }
+.alarm.planned { background: var(--surface-2); color: var(--text); border: 2px solid var(--flip); }
+.alarm.planned .head { font-size: 17px; color: var(--text-2); }
+.badge.stopped { color: var(--text-2); border-color: var(--flip); }
+.sparkbox .gapmark.planned { color: var(--muted); }
+td.stopped { color: var(--muted); font-size: 12px; }
 .alarm .head { font-size: 22px; font-weight: 800; letter-spacing: .02em; }
 .alarm .why { font-size: 13px; margin-top: 4px; overflow-wrap: anywhere; }
 .alarm .why b { font-weight: 700; }
@@ -256,8 +262,9 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
     prev = t; prevV = v;
   }
   const hasGap = opt.gapFrom && opt.gapFrom > t0;
-  const gap = hasGap ? `<line x1="${x(opt.gapFrom).toFixed(1)}" x2="${x(opt.gapFrom).toFixed(1)}" y1="0" y2="${H}" stroke="var(--bad)" stroke-width="2" stroke-dasharray="4 3" vector-effect="non-scaling-stroke"/>` : "";
-  const svg = `<div class="sparkbox"><span class="ymax">${fmt(nice, digits)} ${unit}</span>${hasGap ? `<span class="gapmark">✕ ${esc(opt.gapReason || "Ausfall")} ${hhmm(opt.gapFrom)}</span>` : ""}
+  const planned = opt.gapKind === "planned";
+  const gap = hasGap ? `<line x1="${x(opt.gapFrom).toFixed(1)}" x2="${x(opt.gapFrom).toFixed(1)}" y1="0" y2="${H}" stroke="${planned ? "var(--muted)" : "var(--bad)"}" stroke-width="2" stroke-dasharray="4 3" vector-effect="non-scaling-stroke"/>` : "";
+  const svg = `<div class="sparkbox"><span class="ymax">${fmt(nice, digits)} ${unit}</span>${hasGap ? `<span class="gapmark${planned ? " planned" : ""}">${planned ? "■" : "✕"} ${esc(opt.gapReason || "Ausfall")} ${hhmm(opt.gapFrom)}</span>` : ""}
     <svg class="spark" id="${svgId}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Verlauf 15 min, ${unit}" style="height:${H}px">
     <line class="grid" x1="0" x2="${W}" y1="${y(nice)}" y2="${y(nice)}" vector-effect="non-scaling-stroke"/>
     <line class="grid" x1="0" x2="${W}" y1="${y(0)}" y2="${y(0)}" vector-effect="non-scaling-stroke"/>
@@ -288,7 +295,7 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
 function rateCharts(b, key, color, digits, now, binders) {
   const ser = b.series || {};
   if (!ser[key]) return "";
-  const o = {gapFrom: ser.gap_from, gapReason: ser.gap_reason};
+  const o = {gapFrom: ser.gap_from, gapReason: ser.gap_reason, gapKind: ser.gap_kind};
   const a = spark(`sp-${b.stem}-${key}`, ser.t, ser[key], color, "tok/s", digits, now, o);
   binders.push(a.bind);
   let h = a.svg;
@@ -351,8 +358,10 @@ function phaseHtml(b) {
     const ic = x.k === "idle" && x.awake ? `--ic:${x.awake === "P" ? "var(--s1)" : "var(--s2)"};` : "";
     return `<div class="seg k-${x.k}${x.running ? " run" : ""}" data-i="${i}" style="${ic}left:${pos(x.s)}%;width:${(100 * (x.e - x.s) / span).toFixed(3)}%"><span data-full="${esc(full)}" data-short="${esc(short)}"></span></div>`;
   }).join("");
-  const cut = tl.cut_at && tl.cut_at > t0 ? `<div class="cut" style="left:${pos(tl.cut_at)}%" title="${esc(tl.cut_reason || "")}"></div>` : "";
-  const end = b.live ? "jetzt" : "Log-Ende " + hhmm(t1);
+  const cut = tl.cut_at && tl.cut_at > t0 ? `<div class="cut${tl.cut_kind === "planned" ? " planned" : ""}" style="left:${pos(tl.cut_at)}%" title="${esc(tl.cut_reason || "")}"></div>` : "";
+  let end = b.live ? "jetzt" : "Log-Ende " + hhmm(t1);
+  if (tl.cut_at) end = tl.cut_kind === "planned" ? `<span style="color:var(--text-2)">■ ${esc(tl.cut_reason)} ${hhmm(tl.cut_at)}</span> &middot; ${end}`
+    : `<span style="color:var(--bad)">✕ ${esc(tl.cut_reason)} ${hhmm(tl.cut_at)}</span> &middot; ${end}`;
   const ticks = span >= 900 ? ["&minus;15 min", "&minus;10", "&minus;5", end] : ["&minus;5 min", "&minus;2:30", end];
   const lg = (k) => `<span class="lg"><i style="background:${PHASE[k][1]}"></i>${phaseName(k, single)}</span>`;
   return `<div class="phasewrap">
@@ -465,8 +474,16 @@ function decodeTile(b, g, color, binders, now) {
     ${charts}</div>`;
 }
 
+const plannedStopped = (b) => !!(((b.alarm || {}).planned_stop || {}).stopping);
 function alarmHtml(b, now) {
   const a = b.alarm || {};
+  if (a.state === "GESTOPPT") {
+    const ps = a.planned_stop || {};
+    const t0 = ps.teardown_t || ps.t;
+    return `<div class="alarm planned" role="status"><div class="head">■ gestoppt (geplant)${t0 ? ` <span style="font-size:13px;font-weight:600">seit ${hhmm(t0)} (${ago(now - t0)})</span>` : ""}</div>
+      <div class="why"><b>Stopp-Marker</b> &middot; ${esc(ps.text || "")}</div>
+      ${(ps.teardown || []).map((r) => `<div class="why muted">Abbau danach &middot; ${r.t ? hhmm(r.t) + " &middot; " : ""}${esc(r.text)}</div>`).join("")}</div>`;
+  }
   if (!a.state) return "";
   const cls = a.state === "TOT" ? "" : a.state === "HAENGT" ? "hang" : "warn";
   const groups = [...new Set((a.reasons || []).filter((r) => r.level === "dead" || r.level === "hang").map((r) => r.group).filter(Boolean))];
@@ -560,10 +577,12 @@ function bootCard(b, now, binders) {
     ${alarmHtml(b, now)}
     <div class="boot-head">
       <span class="model">${esc(m.model || b.stem)}</span>
-      <span class="badge ${b.live ? "live" : "dead"}">${b.live ? "LIVE" : "kein Log seit " + ago(b.age_s)}</span>
+      ${plannedStopped(b) ? `<span class="badge stopped">■ gestoppt (geplant) &middot; ${b.live ? "Abbau l&auml;uft" : "kein Log seit " + ago(b.age_s)}</span>`
+        : `<span class="badge ${b.live ? "live" : "dead"}">${b.live ? "LIVE" : "kein Log seit " + ago(b.age_s)}</span>`}
+      ${b.live && ((b.alarm || {}).planned_stop || {}).t && !plannedStopped(b) ? `<span class="chip">Stopp angefordert ${hhmm(b.alarm.planned_stop.t)} (geplant)</span>` : ""}
       ${awake ? `<span class="badge phase">wach: ${esc(awake)}${frState ? " &middot; Front: " + esc(frState) : flipping ? " &middot; flippt" : ""}</span>` : ""}
       ${c ? `<span class="chip ${c.State !== "running" ? "bad" : /unhealthy/.test(c.Status || "") ? "warn" : "ok"}">${esc(c.Names)} &middot; ${esc(c.Status)}</span>` : `<span class="chip warn">kein laufender Container zu diesem Log</span>`}
-      ${health.length ? `<span class="chip bad">Gruppe ${health.map((h) => esc(h.group)).join(", ")} tot (WEG2-HEALTH)</span>` : ""}
+      ${health.length && !plannedStopped(b) ? `<span class="chip bad">Gruppe ${health.map((h) => esc(h.group)).join(", ")} tot (WEG2-HEALTH)</span>` : ""}
     </div>
     <div class="muted" style="font-size:12px;margin:-6px 0 10px">
       <span class="mono">${esc(m.tag || b.stem)}</span>${m.sha ? " &middot; Baum " + esc(m.sha) : ""}${topo ? " &middot; " + esc(topo) : ""}${m.form ? " &middot; " + esc(m.form) : ""}
@@ -635,12 +654,18 @@ function gpuqHtml(d) {
     `<tr><td class="mono">${esc(b.owner)}</td><td>${esc(b.state)}</td><td>${esc((b.cards || []).join(","))}${b.mib ? " &middot; " + fmt(b.mib) + " MiB" : ""}</td><td>${esc(((b.start || {}).local || "").slice(11, 16))}</td><td>${esc(((b.end || {}).local || "").slice(11, 16))}</td><td>${esc(b.purpose)}</td></tr>`).join("") + `</table>`;
 }
 
+function endCell(b) {
+  const a = b.alarm || {}, e = a.ended_on, ps = a.planned_stop;
+  if (ps && (ps.stopping || (e && e.planned)))
+    return `<td class="stopped" style="max-width:420px">■ gestoppt (geplant) ${hhmm(ps.t)} <span class="mono">${esc((ps.src || "") === "nf-dauer" ? "Stop-Datei der NF-Dauerschleife" : "AGENT-HOLD Ende")}</span></td>`;
+  return `<td class="err mono" style="max-width:420px">${e && !e.recovered ? esc(e.group + ": " + e.text.slice(0, 140)) : ""}</td>`;
+}
 function historyHtml(boots, now) {
   const rows = boots.filter((b) => !b.live);
   if (!rows.length) return `<div class="muted">keine weiteren Boots</div>`;
   const r = (b, g) => { const p = (b.prefill || {})[g]; return p && p.last_burst ? fmt(p.last_burst.tps) : "—"; };
   return `<table><tr><th>Modell</th><th>Tag</th><th class="num">letztes Log</th><th class="num">P-Prefill</th><th class="num">D-Prefill</th><th class="num">Decode</th><th class="num">Flips</th><th class="num" title="Summe #new-token, Prefill batch, nur PP0">P neu &Sigma;<br><span class="muted">#new-token PP0</span></th><th class="num" title="Summe #new-token, Prefill batch, nur TP0">D neu &Sigma;<br><span class="muted">#new-token TP0</span></th><th class="num" title="Summe completion_tokens der Front-Zeilen WEG2-SERVED">dekodiert &Sigma;<br><span class="muted">WEG2-SERVED</span></th><th>Ende</th></tr>` +
-    rows.map((b) => `<tr><td>${esc((b.meta || {}).model || "")}</td><td class="mono">${esc((b.meta || {}).tag || b.stem)}</td><td class="num">vor ${ago(b.age_s)}</td><td class="num">${r(b, "P")}</td><td class="num">${r(b, "D")}</td><td class="num">${b.decode && b.decode.D ? fmt(b.decode.D.gen_tps_last, 1) : "—"}</td><td class="num">${fmt(b.flip_count)}</td><td class="num">${fmt((b.totals || {}).p_new)}</td><td class="num">${fmt((b.totals || {}).d_new)}</td><td class="num">${fmt((b.totals || {}).decoded)}${(b.totals || {}).read_progress < 1 ? "*" : ""}</td><td class="err mono" style="max-width:420px">${b.alarm && b.alarm.ended_on && !b.alarm.ended_on.recovered ? esc(b.alarm.ended_on.group + ": " + b.alarm.ended_on.text.slice(0, 140)) : ""}</td></tr>`).join("") +
+    rows.map((b) => `<tr><td>${esc((b.meta || {}).model || "")}</td><td class="mono">${esc((b.meta || {}).tag || b.stem)}</td><td class="num">vor ${ago(b.age_s)}</td><td class="num">${r(b, "P")}</td><td class="num">${r(b, "D")}</td><td class="num">${b.decode && b.decode.D ? fmt(b.decode.D.gen_tps_last, 1) : "—"}</td><td class="num">${fmt(b.flip_count)}</td><td class="num">${fmt((b.totals || {}).p_new)}</td><td class="num">${fmt((b.totals || {}).d_new)}</td><td class="num">${fmt((b.totals || {}).decoded)}${(b.totals || {}).read_progress < 1 ? "*" : ""}</td>${endCell(b)}</tr>`).join("") +
     `</table><div class="muted" style="font-size:12px;margin-top:4px">Prefill-Spalten: Rechenrate (gpu-ms) des letzten Schubs, langsamster Rang; Decode: letzter gen-throughput-Wert.</div>`;
 }
 
@@ -671,7 +696,9 @@ async function refresh() {
     const shown = live.length ? live : d.boots.filter((b) => b.primary).slice(0, 1);
     $("boots").innerHTML = shown.length ? shown.map((b) => bootCard(b, now, binders)).join("")
       : `<section class="card"><div class="muted">Kein Boot-Log der letzten 6 h gefunden.</div></section>`;
-    if (!live.length && shown.length) $("boots").insertAdjacentHTML("afterbegin", `<section class="card" style="border-color:var(--bad)"><b style="color:var(--bad)">Kein Modell schreibt gerade Logs.</b> <span class="muted">Unten der zuletzt aktive Boot mit seinen letzten Zahlen.</span></section>`);
+    if (!live.length && shown.length) $("boots").insertAdjacentHTML("afterbegin", shown.every(plannedStopped)
+      ? `<section class="card" style="border-color:var(--flip)"><b>Kein Modell schreibt gerade Logs</b> <span class="muted">&middot; der letzte Boot wurde geplant gestoppt. Unten seine letzten Zahlen.</span></section>`
+      : `<section class="card" style="border-color:var(--bad)"><b style="color:var(--bad)">Kein Modell schreibt gerade Logs.</b> <span class="muted">Unten der zuletzt aktive Boot mit seinen letzten Zahlen.</span></section>`);
     $("gpus").innerHTML = gpusHtml(d, binders);
     $("containers").innerHTML = containersHtml(d);
     $("gpuq").innerHTML = gpuqHtml(d);

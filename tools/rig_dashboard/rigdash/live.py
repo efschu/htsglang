@@ -22,7 +22,7 @@ import threading
 import time
 from typing import Dict, List, Optional
 
-from . import parse, redact
+from . import parse, redact, stops
 
 DEFAULT_LOG_GLOBS = [
     "/spinning/docker-acceptance/*/evidence/boot_*.log",
@@ -813,6 +813,7 @@ class LiveLogs:
         self.lock = threading.Lock()
         self._last_scan = 0.0
         self.scan_s = 10.0
+        self.harness = stops.HarnessLogs()   # planned stop vs death (stops.py)
 
     def scan(self, now: Optional[float] = None):
         now = now or time.time()
@@ -855,6 +856,7 @@ class LiveLogs:
                     if b.read_progress() >= 0.999:
                         break
                     b.poll()
+        self.harness.poll([b.dir for b in boots])
 
     def snapshot(self, with_series: bool = True, max_boots: int = 10) -> List[dict]:
         now = time.time()
@@ -869,6 +871,9 @@ class LiveLogs:
             with b.lock:
                 v = b.view(now, with_series and primary)
             v["primary"] = primary
+            last_line = max([t for t in b._last_t.values() if t] or [0]) or None
+            v["end"] = stops.classify(b.stem, b.first_t, last_line or b.newest_mtime or None,
+                                      self.harness.for_dir(b.dir))
             views.append(v)
         views.sort(key=lambda v: (not v["live"], not v["primary"],
                                   v["age_s"] if v["age_s"] is not None else 1e12))

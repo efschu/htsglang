@@ -59,18 +59,30 @@ def finish_series(b: dict, gpu_series: Optional[dict], now: float, bucket_s: flo
         if dead:
             gap_from, reason = min(dead), "GRUPPE TOT"
     c = b.get("container") or {}
-    if not b.get("live") and c.get("State") != "running" and b.get("last_log_t"):
+    ended = not b.get("live") and c.get("State") != "running" and b.get("last_log_t")
+    ps = a.get("planned_stop") or {}
+    kind = "dead" if gap_from is not None else None
+    if ps.get("stopping") and gap_from is None:
+        # planned stop (stops.py): grey, from the first teardown sign or the log's end
+        gap_from = ps.get("teardown_t") or (b["last_log_t"] if ended else None)
+        if gap_from is not None:
+            reason, kind = "gestoppt (geplant)", "planned"
+    elif ended:
         if gap_from is None or b["last_log_t"] < gap_from:
-            gap_from, reason = b["last_log_t"], "Boot beendet / Container weg"
+            gap_from, reason, kind = b["last_log_t"], "Boot beendet / Container weg", "ended"
+            death = (b.get("end") or {}).get("death")
+            if death:
+                # the harness named it a death (deadman verdict / hold end "Container-tot")
+                reason = "tot (%s)" % ("Deadman" if death.get("src") == "deadman" else "Container-tot")
     keys = [k for k in ser if k.endswith("_tps")]
     if gap_from is not None:
         for k in keys:
             ser[k] = [None if t + bucket_s > gap_from else v for t, v in zip(ts, ser[k])]
-        ser["gap_from"], ser["gap_reason"] = gap_from, reason
+        ser["gap_from"], ser["gap_reason"], ser["gap_kind"] = gap_from, reason, kind
         tl = b.get("timeline")
         if tl:
             tl["segs"] = [dict(x, e=min(x["e"], gap_from)) for x in tl["segs"] if x["s"] < gap_from]
-            tl["cut_at"], tl["cut_reason"] = gap_from, reason
+            tl["cut_at"], tl["cut_reason"], tl["cut_kind"] = gap_from, reason, kind
     power = [None] * len(ts)
     if gpu_series and gpu_series.get("t"):
         acc = [[0.0, 0] for _ in ts]

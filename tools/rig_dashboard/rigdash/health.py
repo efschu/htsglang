@@ -14,6 +14,13 @@ reason line it produces:
 * the hang indicator: work is queued, but no prefill/decode line for
   HANG_S seconds.
 
+A PLANNED stop is not a death (operator 27.09. ~18Z, NF rc12s stopped by the
+loop's stop file showed "Gruppe D tot"): ``b["end"]`` (stops.classify, from the
+harness log) names a planned stop; every dead/hang sign stamped at or after it
+is the teardown and goes to ``planned_stop.teardown`` instead of the reasons.
+A death marker of the boot (deadman verdict, hold end "Container-tot") clears
+the planned stop there, so a death stays red.
+
 Pure function over the snapshot dicts, so it is unit-tested without a boot.
 """
 
@@ -24,6 +31,7 @@ from typing import List, Optional
 HEALTH_FRESH_S = 120.0   # a WEG2-HEALTH line older than this no longer describes now
 STOP_RECOVERED_S = 30.0  # activity this long after a stop means it ran on
 HANG_S = 60.0            # queued work and no prefill/decode line for this long
+STOP_SLACK_S = 5.0       # a sign this close before the planned-stop marker is already its teardown
 PROGRESS_S = 60.0        # a prefill/decode line this recent is forward progress
 
 
@@ -46,8 +54,19 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
     catching_up = (b.get("totals") or {}).get("read_progress", 1.0) < 0.999
     judged = bool(b.get("live")) or c.get("State") == "running"
 
+    planned = ((b.get("end") or {}).get("planned")) or None
+    pt = planned["t"] if planned else None
+    teardown: List[dict] = []
+
     def add(level, group, text, t=None):
-        reasons.append({"level": level, "group": group, "text": text, "t": t})
+        r = {"level": level, "group": group, "text": text, "t": t}
+        if pt is not None and t is not None and t >= pt - STOP_SLACK_S and level in ("dead", "hang", "warn"):
+            teardown.append(r)
+        else:
+            reasons.append(r)
+
+    def stopping():
+        return pt is not None and (bool(teardown) or not b.get("live") or c.get("State") != "running")
 
     # 1. WEG2-HEALTH
     for g, h in sorted((b.get("health") or {}).items()):
@@ -86,7 +105,7 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
     # model also makes no progress; with prefill/decode lines in the last
     # PROGRESS_S it is a yellow contradiction note carrying the healthcheck text.
     status = c.get("Status") or ""
-    if "unhealthy" in status:
+    if "unhealthy" in status and not stopping():
         idle_now = _age(now, b.get("last_activity_any"))
         hc = (c.get("health_output") or "").strip()
         if catching_up:
@@ -112,12 +131,21 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
     elif q_log is not None and q_log_age is not None and q_log_age < 600:
         queued, src = q_log, "letzte WEG2-ROUTE-Zeile"
     idle = _age(now, b.get("last_activity_any"))
-    if judged and queued and idle is not None and idle >= HANG_S and not catching_up:
+    if judged and queued and idle is not None and idle >= HANG_S and not catching_up and not stopping():
         add("hang", None, "HÄNGT: %d Anfrage(n) warten (%s), seit %d s keine Prefill-/Decode-Zeile" % (
             queued, src, idle))
 
+    ps = None
+    if pt is not None:
+        td = [r["t"] for r in teardown if r.get("t") is not None]
+        ps = {"t": pt, "text": planned.get("text"), "src": planned.get("src"), "stopping": stopping(),
+              "teardown_t": min(td) if td else None, "teardown": teardown[:6]}
+        if ended_on is not None and ended_on["t"] >= pt - STOP_SLACK_S:
+            ended_on = dict(ended_on, planned=True)
     if not judged:
-        return {"state": None, "reasons": [], "ended_on": ended_on}
+        return {"state": None, "reasons": [], "ended_on": ended_on, "planned_stop": ps}
     levels = {r["level"] for r in reasons}
     state = "TOT" if "dead" in levels else "HAENGT" if "hang" in levels else "WARNUNG" if levels else None
-    return {"state": state, "reasons": reasons, "ended_on": ended_on}
+    if state is None and ps and ps["stopping"]:
+        state = "GESTOPPT"
+    return {"state": state, "reasons": reasons, "ended_on": ended_on, "planned_stop": ps}
