@@ -636,6 +636,10 @@ class Envs:
     # transient. The launcher writes it into the D group env from the #145
     # card ledger (NF only); unset = no read, no trim, the 227ae1becd form.
     SGLANG_WEG2_EXTEND_TRIM_MIB = EnvStr(None)
+    # rc12g: per-rank measured reserved growth of a D extend per row (MiB/row,
+    # CSV, "0" = no rate). Set by the weg2 launcher from D_EXTEND_GROWTH_PER_ROW_MIB;
+    # the scheduler caps the extend chunk to floor((card_free_post - 300) / rate).
+    SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB = EnvStr(None)
     # TAIL_HANDOFF (H18, E1 of H17, fnFL2x132): P ends the prompt's last-but-one
     # chunk at c = floor_r(N-1) (r = QSA compress ratio) instead of the page,
     # and hands the GDN state after c plus the KV/QSA rows of the partial page

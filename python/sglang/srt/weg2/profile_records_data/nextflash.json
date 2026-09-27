@@ -104,6 +104,25 @@
    "kind": "memory",
    "power_limit_w": null,
    "power_limit_source": "not a power-dependent quantity (bytes one extend adds)"
+  },
+  {
+   "name": "D_EXTEND_GROWTH_PER_ROW_MIB",
+   "value": [
+    0.5625,
+    null,
+    null
+   ],
+   "provenance": "rc12g: reserved growth of ONE D extend per row on D-TP0 = (peak_reserved of the windows from the '#969 EXTENT' line up to the extend's chunk window - reserved at the extend's start, after its trim) / extend rows, max over the extends with >= 2048 rows (weg2/extend_trim.extend_growth_per_row_mib; where the window opened before the trim its peak is the PRE-trim level, then the card_free drop after the trim is the growth). rc12e (f078f89a08) 03:39:07 4096 rows +2304 -> 0.5625 (max), 03:39:12 4072 +2272 -> 0.558, 03:40:51 0.555; rc12f (26af2ccdca) 04:27:50 4029 +2116 -> 0.525 (card_free 207 after), 04:22:03 3073 +1656 -> 0.539, 04:27:45 / 04:21:25 4096 +1992 -> 0.486; rc12d (227ae1becd) <= 0.482; rc12c/rc12b <= 0.225. Rows < 2048 are not a per-row quantity: rc12b 00:18:02, 603 rows, +776 MiB (1.29/row) is the decode/draft rounds inside the same window. A cut chunk has fewer rows and proportionally less growth, so the rate does not move with the cut (no ratchet). The D scheduler caps the extend chunk to floor((card_free_post - 300) / rate). 3080 ranks: not measured (null: no vote).",
+   "boots": [
+    "dkrnfh91bar1dauer09270402",
+    "dkrnfh91bar1dauer09270311",
+    "dkrnfh91bar1dauer09270212",
+    "dkrnfh91bar1dauer09270103",
+    "dkrnfh91bar1dauer09270007"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not a power-dependent quantity (bytes per extend row)"
   }
  ],
  "borrow": {

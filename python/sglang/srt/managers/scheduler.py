@@ -233,6 +233,7 @@ from sglang.srt.managers import weg2_d_hostgap as _d_hostgap
 from sglang.srt.layers.quantization import gguf_path_census as _gguf_path_census
 from sglang.srt.weg2 import p_trim_end_anchor as _weg2_trim
 from sglang.srt.weg2 import fork_anchor as _weg2_fork
+from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers import anchor_tails as _anchor_tails
@@ -11545,6 +11546,19 @@ class Scheduler(
         configured = int(getattr(self, "chunked_prefill_size", 0) or 0)
         if configured <= 0:
             return 1 << 30
+        # rc12g WEG2-EXTEND-STUECKELUNG: the D extend chunk follows the card
+        # after the trim (weg2/extend_trim.py). A vote on this same reduce, so
+        # every rank cuts to the group's width; None = no vote (byte-identical).
+        vote = _weg2_extend_trim.width_vote(
+            torch.cuda,
+            int(getattr(self, "tp_rank", 0) or 0),
+            configured,
+            int(getattr(self, "page_size", 1) or 1),
+            getattr(self, "chunked_req", None) is not None
+            or bool(getattr(self, "waiting_queue", None)),
+        )
+        if vote is not None:
+            configured = min(configured, int(vote))
         try:
             gate = get_prefill_admission_gate(self)
             if gate is None:

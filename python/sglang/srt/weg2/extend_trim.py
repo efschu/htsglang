@@ -34,6 +34,7 @@ graphs) stay -- ``released`` says what it got. Never under graph capture.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import List, Optional, Sequence
 
@@ -43,7 +44,7 @@ MARKER = "WEG2-EXTEND-CACHE-TRIM"
 MIB = float(1 << 20)
 
 _UNSET = object()
-_CACHE = {"thresholds": _UNSET}
+_CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": None}
 
 
 def parse_thresholds(text: Optional[str]) -> Optional[List[float]]:
@@ -71,8 +72,23 @@ def thresholds() -> Optional[List[float]]:
     return _CACHE["thresholds"]  # type: ignore[return-value]
 
 
+def rates() -> Optional[List[float]]:
+    """rc12g: the process's per-rank extend growth per row (MiB/row), read once."""
+    if _CACHE["rates"] is _UNSET:
+        try:
+            from sglang.srt.environ import envs
+
+            _CACHE["rates"] = parse_thresholds(envs.SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB.get())
+        except Exception:  # noqa: BLE001 -- a guard never kills a pass
+            _CACHE["rates"] = None
+    return _CACHE["rates"]  # type: ignore[return-value]
+
+
 def reset_for_tests() -> None:
     _CACHE["thresholds"] = _UNSET
+    _CACHE["rates"] = _UNSET
+    _CACHE["armed"] = False
+    _CACHE["logged_cap"] = None
 
 
 def threshold_for(rank: int, values: Optional[Sequence[float]]) -> Optional[float]:
@@ -138,6 +154,8 @@ def before_extend(worker, batch) -> Optional[str]:
             return None
         import torch
 
+        # rc12g: an extend is running -- the scheduler may trim again for the next one
+        _CACHE["armed"] = False
         rank = int(getattr(worker, "tp_rank", 0) or 0)
         return maybe_trim(torch.cuda, rank, threshold_for(rank, values))
     except Exception as exc:  # noqa: BLE001 -- a guard never kills a forward
@@ -173,3 +191,112 @@ def extend_growth_mib(windows) -> Optional[int]:
         g = int(peak) - int(start)
         best = g if best is None else max(best, g)
     return best
+
+
+# --------------------------------------------------------------------------
+# rc12g WEG2-EXTEND-STUECKELUNG: the chunk follows the card, not the other way.
+#
+# rc12f at the metal (27.09. 04:27:45 / 04:27:50, D-TP0): the trim raised
+# card_free to 2385 / 2325 MiB -- empty_cache returns cache, not the untagged
+# rest, the draft and the KV fill -- and the next extend chunks (4096 / 4029
+# rows) grew reserved by 1992 / 2116 MiB: 393 and then 207 MiB were left, under
+# the 300 MiB line. No threshold fixes that: the trim never brings a card back
+# above ~2730. What does is the chunk width: before the chunk is formed, cap it
+# to what the card holds after the trim,
+#
+#     rows_cap = floor((card_free_post - 300) / growth_per_row)
+#
+# rounded down to the page. ``growth_per_row`` is the measured record
+# ``D_EXTEND_GROWTH_PER_ROW_MIB`` (maximum of reserved growth / rows). The cap is
+# this rank's VOTE in the scheduler's existing packed MIN reduce (#794 corridor
+# width, `_local_corridor_width_ceiling`), so every rank cuts to the same width
+# and no collective is added. One line per new cap:
+#
+#     WEG2-EXTEND-STUECKELUNG rank=0 geplant=4096 cap=3648 post=2385 rate=0.5625
+#
+# Off (no ``SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB``, or no rate for this rank):
+# no vote, byte-identical. Only while prefill work is pending does it read the
+# card; it trims at most once per extend (``armed`` until an extend runs), so a
+# queue that waits for seats does not synchronize every decode round.
+# --------------------------------------------------------------------------
+
+STUECKELUNG_MARKER = "WEG2-EXTEND-STUECKELUNG"
+#: the card line the cap keeps free after the chunk's growth (the operator's HALT line)
+STUECKELUNG_FLOOR_MIB = 300.0
+#: a per-row rate is only a per-row quantity where the rows dominate the
+#: window: a 603-row extend in rc12b grew the window by 776 MiB (1.29/row, the
+#: decode and draft rounds inside the same window). The cap binds only for
+#: chunks of ~3000+ rows, so the rate is priced where it binds.
+GROWTH_PER_ROW_MIN_ROWS = 2048
+
+
+def extend_growth_per_row_mib(windows) -> Optional[float]:
+    """rc12g: the ``D_EXTEND_GROWTH_PER_ROW_MIB`` measurement -- max over extend
+    windows ``(rows, growth_mib)`` with ``rows >= GROWTH_PER_ROW_MIN_ROWS`` of
+    ``growth / rows``, rounded UP to 4 decimals. A pure function of the windows:
+    a cut chunk has fewer rows AND proportionally less growth, so the rate does
+    not move with the cut (fixpoint)."""
+    best = None
+    for rows, growth in windows:
+        rows = int(rows)
+        if rows < GROWTH_PER_ROW_MIN_ROWS or float(growth) <= 0:
+            continue
+        r = float(growth) / rows
+        best = r if best is None else max(best, r)
+    if best is None:
+        return None
+    return math.ceil(best * 10000.0 - 1e-9) / 10000.0
+
+
+def rows_cap(post_mib: float, rate: float, page_size: int) -> int:
+    """The widest chunk the card funds: ``floor((post - 300) / rate)``, down to
+    the page, never below one page (a chunk must make progress)."""
+    page = max(1, int(page_size or 1))
+    if rate <= 0:
+        return 1 << 30
+    rows = int(math.floor((float(post_mib) - STUECKELUNG_FLOOR_MIB) / float(rate)))
+    return max(page, (rows // page) * page)
+
+
+def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
+               clock=time.perf_counter) -> Optional[int]:
+    """This rank's vote for the group's chunk width, ``None`` = no vote.
+
+    Called once per scheduler iteration from the packed MIN reduce; must never
+    raise. With prefill work pending and a rate for this rank: trim once (if
+    the card is under the trim threshold and no trim is armed yet), read the
+    card, return ``rows_cap`` when it is narrower than ``configured``."""
+    try:
+        vals = rates()
+        rate = threshold_for(rank, vals)
+        if rate is None or rate <= 0 or not pending or int(configured) <= 0:
+            return None
+        if bool(cuda.is_current_stream_capturing()):
+            return None
+        if not _CACHE["armed"]:
+            if maybe_trim(cuda, rank, threshold_for(rank, thresholds()), clock) is not None:
+                _CACHE["armed"] = True
+        post, _total = cuda.mem_get_info()
+        post_mib = post / MIB
+        cap = rows_cap(post_mib, rate, page_size)
+        if cap >= int(configured):
+            _CACHE["logged_cap"] = None
+            return None
+        if cap != _CACHE["logged_cap"]:
+            _CACHE["logged_cap"] = cap
+            logger.info(
+                f"{STUECKELUNG_MARKER} rank={rank} geplant={int(configured)} cap={cap} "
+                f"post={post_mib:.0f} rate={rate:.4f} floor={STUECKELUNG_FLOOR_MIB:.0f}"
+            )
+        return cap
+    except Exception as exc:  # noqa: BLE001 -- a vote that cannot price abstains
+        logger.debug("%s skipped: %s", STUECKELUNG_MARKER, exc)
+        return None
+
+
+def launcher_rates(rate_mib: Sequence[Optional[float]]) -> str:
+    """The env value the launcher writes; '' when no rank has a rate. A rank
+    without a measurement votes nothing (0 is read as 'no rate')."""
+    if not rate_mib or all(r is None for r in rate_mib):
+        return ""
+    return ",".join("0" if r is None else f"{float(r):.4f}" for r in rate_mib)

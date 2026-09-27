@@ -10660,6 +10660,16 @@ def d_extend_growth_record(profile: Optional[str] = None) -> Tuple[Optional[List
     return [None if v is None else float(v) for v in vals], _pconst_boots("D_EXTEND_GROWTH_MIB", profile)
 
 
+def d_extend_growth_per_row_record(profile: Optional[str] = None) -> Tuple[Optional[List[Optional[float]]], str]:
+    """rc12g: ``D_EXTEND_GROWTH_PER_ROW_MIB`` of the profile (reserved growth of
+    one D extend per row, measured), or ``(None, "")`` -- no chunk cap."""
+    try:
+        vals = list(_pconst("D_EXTEND_GROWTH_PER_ROW_MIB", profile))
+    except KeyError:
+        return None, ""
+    return [None if v is None else float(v) for v in vals], _pconst_boots("D_EXTEND_GROWTH_PER_ROW_MIB", profile)
+
+
 def d_extend_trim_env(ledger, fits, growth_mib: Optional[Sequence[Optional[float]]] = None) -> str:
     """rc12e: ``SGLANG_WEG2_EXTEND_TRIM_MIB`` from the card ledger's floor and
     the solved form's booked activation, per rank; '' when a rank is missing.
@@ -15018,6 +15028,27 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                       if _growth is not None else "floor + gebuchte Aktivierung je Rang")
             log(f"{D_RANK_SOLVE_MARKER} {label} EXTEND-TRIM SGLANG_WEG2_EXTEND_TRIM_MIB={_trim} "
                 f"({_gtext}; darunter leert D vor dem Extend den Allokator-Cache)")
+        # rc12g: the extend chunk follows the card after the trim
+        # (WEG2-EXTEND-STUECKELUNG); a value named in --env-d wins.
+        _rate, _rate_src = d_extend_growth_per_row_record(ns.profile)
+        if _rate is not None and len(_rate) == len(_ledger.floor_mib):
+            from sglang.srt.weg2 import extend_trim as _et
+
+            _rtext = _et.launcher_rates(_rate)
+            _env_d = getattr(ns, "env_d", "") or ""
+            # a value that differs from the record's came from the user (a second
+            # solve pass sees its own write, which is not a user value)
+            _given = any(x.split("=", 1)[0].strip() == "SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB"
+                         and x.split("=", 1)[1].strip() != _rtext
+                         for x in _env_d.split(";") if "=" in x)
+            if _rtext and not _given:
+                ns.env_d = set_group_env(_env_d, "SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB", _rtext)
+            if _rtext:
+                log(f"{D_RANK_SOLVE_MARKER} {label} EXTEND-STUECKELUNG rows_cap aus card_free_post: "
+                    f"SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB={_rtext}"
+                    f"{' (aus --env-d, Vorrang)' if _given else ''} "
+                    f"(Rate aus D_EXTEND_GROWTH_PER_ROW_MIB {_rate}, boots {_rate_src}; D kappt den "
+                    f"Extend-Chunk auf floor((card_free_post - 300) / Rate), MIN ueber TP)")
     log_wake_credit_solve(ns, cards, plan.fits, log, label,
                           p_split=p_split, chunk_layers=chunk_layers)
 
