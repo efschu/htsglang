@@ -68,6 +68,11 @@ _EMPTY_CENSUS = {
     # attach only, so over a boot that attaches once they are a component the
     # cap could not see at all.
     "staging_bytes": 0,
+    # L3P: unindexed files a previous boot of the same identity left in a
+    # persistent store (another group's private suffix); named, and outside
+    # the W8b denominator -- see ``_l3p_inherited``.
+    "inherited_bytes": 0,
+    "inherited_entries": 0,
 }
 
 # How often an eviction run may print its proof line, in seconds. Suppressed
@@ -185,6 +190,10 @@ class LRUFileEvictor:
             lambda stem: os.path.join(self.file_path, f"{stem}.bin")
         )
         self._iter_existing = iter_existing or self._iter_existing_flat
+        # L3P: files older than this evictor, in a persistent store, were left
+        # by a previous boot of the SAME identity (the launcher proves it with
+        # L3_IDENTITY.json before any rank starts).
+        self._born = time.time()
         # #1295 round 2, SHOULD_FIX 8: the ``.bin`` walk above is not the whole
         # directory. ``HiCacheFile`` writes every page through a
         # ``<final>.tmp.<uuid>`` staging file and reaps orphaned partials BY AGE
@@ -1158,12 +1167,18 @@ class LRUFileEvictor:
         entries: List[Tuple[float, str, int]] = []
         seen_bytes = 0
         seen_entries = 0
+        inherited_bytes = 0
+        inherited_entries = 0
+        persistent = self._l3p_persistent()
         for stem, st in self._iter_existing():
             size = self._allocated_size(st)
             seen_bytes += size
             seen_entries += 1
             # Only files this index is responsible for.
             if not self._scan_suffixes or not stem.endswith(self._scan_suffixes):
+                if persistent and st.st_mtime < self._born:
+                    inherited_bytes += size
+                    inherited_entries += 1
                 continue
             entries.append((st.st_mtime, stem, size))
         entries.sort(key=lambda e: e[0])  # oldest first
@@ -1181,6 +1196,8 @@ class LRUFileEvictor:
             # these entries this owner already knew about.
             "foreign_indexed_bytes": 0,
             "staging_bytes": staging_bytes,
+            "inherited_bytes": inherited_bytes,
+            "inherited_entries": inherited_entries,
         }
         self._staging_bytes = staging_bytes
         # #1295: MEASURED ALWAYS, ENFORCED ONLY WHERE ONE OWNER ANSWERS FOR THE
@@ -1274,13 +1291,36 @@ class LRUFileEvictor:
         decision and not a new mystery.
         """
         census = self.index_coverage()
+        # L3P: a persistent store of this identity holds the OTHER group's
+        # private-suffix pages from earlier boots. They are not a blind scan
+        # filter (the defect W8b exists for) -- they are inherited, owned and
+        # evicted by that group's own owner. Graded outside the denominator
+        # and named, so the 83.7 %-blind defect on THIS boot's writes is still
+        # caught at the wake re-scan.
+        inh_b = int(census.get("inherited_bytes", 0) or 0)
+        inh_n = int(census.get("inherited_entries", 0) or 0)
+        if inh_n:
+            logger.info(
+                "L3-PERSIST W8b graded without %d inherited file(s) (%d B) a previous "
+                "boot of this identity left under a suffix this group does not scan "
+                "(store %s; seen %d B / %d files, indexed %d B / %d files)",
+                inh_n, inh_b, self.file_path, census["seen_bytes"],
+                census["seen_entries"], census["indexed_bytes"], census["indexed_entries"])
         check_index_coverage(
             store_path=self.file_path,
             indexed_bytes=census["indexed_bytes"],
-            seen_bytes=census["seen_bytes"],
+            seen_bytes=census["seen_bytes"] - inh_b,
             indexed_entries=census["indexed_entries"],
-            seen_entries=census["seen_entries"],
+            seen_entries=census["seen_entries"] - inh_n,
         )
+
+    def _l3p_persistent(self) -> bool:
+        """L3P: is this a persistent store the launcher proved (identity file
+        present, switch not off)?"""
+        raw = (os.environ.get("SGLANG_WEG2_L3_PERSIST", "") or "").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return False
+        return os.path.isfile(os.path.join(self.file_path, "L3_IDENTITY.json"))
 
     def index_coverage(self) -> dict:
         """How much of the directory this evictor's byte cap actually bounds.
