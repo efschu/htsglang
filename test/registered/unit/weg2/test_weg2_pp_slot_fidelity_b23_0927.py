@@ -477,7 +477,7 @@ class Wiring(CustomTestCase):
 
         src = open(sch.__file__).read()
         i = src.index("adder.form_a_admission_follow = self._form_a_admission_follow_fn()")
-        self.assertIn("_sf.replan_hook(self, adder)", src[i:i + 500])
+        self.assertIn("_sf.replan_hook(self, adder)", src[i:i + 1500])  # ED put its Form-A note in between
         j = src.index("def dynamic_chunked_prefill_size(self)")
         k = src.index("_pls = _pls_rt.active()", j)
         self.assertIn("_sf.clear_budget(self)", src[j:k])
