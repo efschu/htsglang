@@ -255,6 +255,9 @@ class ArenaMambaPoolHost(MambaPoolHost):
     # claims are decided per P rank); a form without arena anchor claims (27B:
     # host_anchor_slots) never claims here, so there is nothing to reap.
     _weg2_reaps_orphan_claims = True
+    #: #243: a pending hand-off keeps its END anchor in this arena (the last
+    #: chain keys), not every intermediate anchor on its path
+    _weg2_handoff_keep = "anchor"
 
     def _stems(self, hashes, suffix: str = ""):
         from sglang.srt.mem_cache.hicache_storage import PoolName

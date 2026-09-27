@@ -561,6 +561,14 @@ class Envs:
     # already missing from the free reading (x105 TP2: 943 MiB counted twice,
     # 311 + 293 ms credit waits).
     SGLANG_WEG2_CREDIT_LIVE_STAGING = EnvBool(True)
+    # HANDOFF_PENDING_EXPIRE_S (#243): a P hand-off still marked pending after
+    # this many seconds leaves the eviction order by name (EXPIRED) and reads
+    # LOST (reason=expired, first_lost_page=0), never none -- so a rid still
+    # waiting for its seat is re-routed fresh, never priced on unprotected
+    # pages. It clears the mark of a rid that ended where nobody reported it
+    # (the front's drop missing). A garbage bound, not a capacity: the order
+    # itself never holds a slot. Seat waits up to 658 s were measured (rc12r).
+    SGLANG_WEG2_HANDOFF_PENDING_EXPIRE_S = EnvFloat(900.0)
     # IDLE_VOTE_FRESHNESS (fnFL2 H77, #1268): PP0 reads a landed idle lap as
     # the PP group's /flush_cache verdict only while the state it witnessed
     # holds -- the lap of PP0's latest stamp, PP0 neither asleep nor busy

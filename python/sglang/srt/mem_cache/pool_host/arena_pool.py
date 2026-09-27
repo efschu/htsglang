@@ -39,6 +39,7 @@ from sglang.jit_kernel.hicache import (
 from sglang.srt.mem_cache.pool_host.base import NO_KV_RANK_TOKENS
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
+from sglang.srt.weg2 import handoff_pending as _handoff_pending
 
 logger = logging.getLogger(__name__)
 
@@ -870,6 +871,9 @@ def _select_rows_async(t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 class ArenaMHAHostPool(MHATokenToKVPoolHost):
     """MHA host pool whose rows beyond the staging ring are arena slots."""
+
+    #: #243: a pending hand-off keeps every page of its chain in this arena
+    _weg2_handoff_keep = "kv"
 
     arena_read = True
 
@@ -1710,12 +1714,30 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         the references given back (``release_tree_rows``) it would. A slot
         freed here is a miss for a later reader (recomputed), as an evicted
         page without a disk copy always was; a slot any reader, tree node or
-        carrier hold still references is never a candidate."""
+        carrier hold still references is never a candidate.
+
+        #243: the pages of a P hand-off still waiting for its D seat go LAST
+        (``handoff_pending``: kept by order, not by reference) -- a first pass
+        passes over them, a second pass takes them only when nothing else is
+        left, and every rid that lost pages that way is named (HANDOFF-LOST)."""
         need = int(need)
         if need <= 0:
             return 0
         try:
-            cands = arena.evict_candidates(need)
+            keep = _handoff_pending.keep_for(self)
+        except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
+            logger.warning("#243 HANDOFF-PENDING keep list unavailable", exc_info=True)
+            keep = None
+        try:
+            if keep is not None and len(keep):
+                cands = arena.evict_candidates(need, keep_lo=keep.keys)
+                if len(cands) < need:
+                    last = arena.evict_candidates(need - len(cands))
+                    if last:
+                        _handoff_pending.note_evicted(self, last, keep, need=need)
+                        cands = list(cands) + list(last)
+            else:
+                cands = arena.evict_candidates(need)
             if cands:
                 arena.free_slots([c[0] for c in cands])
                 stems = getattr(arena, "_stems", None)

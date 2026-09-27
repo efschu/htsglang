@@ -240,6 +240,8 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_lookup.argtypes = [p_u8, i64, p_u64, p_u64, p_i8]
             lib.arena_evict_candidates.restype = i64
             lib.arena_evict_candidates.argtypes = [p_u8, i64, p_i64, p_u64, p_u64, p_i64, p_u64, i64]
+            lib.arena_stem_keys.restype = None
+            lib.arena_stem_keys.argtypes = [i64, ctypes.POINTER(ctypes.c_char_p), p_u64]
             lib.arena_slot_ptr.restype = ctypes.c_void_p
             lib.arena_slot_ptr.argtypes = [p_u8, i64]
             lib.arena_free_slots.restype = None
@@ -289,6 +291,22 @@ def key128(stem: str) -> tuple[int, int]:
     if lo in (0, (1 << 64) - 1):
         lo = 1
     return lo, hi
+
+
+def stem_keys_lo(stems: Sequence[str]):
+    """#243: key128(stem)[0] for every stem as a numpy uint64 array, hashed in
+    C (arena.c arena_stem_keys); Python's key128 when the helper is missing."""
+    import numpy as np
+    n = len(stems)
+    lib = _load_lib()
+    if n == 0:
+        return np.zeros(0, dtype=np.uint64)
+    if lib is None or not hasattr(lib, "arena_stem_keys"):
+        return np.fromiter((key128(s)[0] for s in stems), dtype=np.uint64, count=n)
+    out = np.empty(n, dtype=np.uint64)
+    c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
+    lib.arena_stem_keys(n, c_stems, out.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)))
+    return out
 
 
 class ShmArena:
@@ -394,8 +412,12 @@ class ShmArena:
         self._lib.arena_read(self._base, n, lo, hi, c_tot, n_ext, c_off, c_len, c_out, st)
         return list(st)
 
-    def evict_candidates(self, want: int, keep_stems: Sequence[str] = ()):
-        """(slot, key_lo, key_hi, total) of up to `want` slots now EVICTING."""
+    def evict_candidates(self, want: int, keep_stems: Sequence[str] = (), keep_lo=None):
+        """(slot, key_lo, key_hi, total) of up to `want` slots now EVICTING.
+        Slots whose key is in `keep_stems` or `keep_lo` (the keys' low words,
+        #243: a pending hand-off's pages) are passed over; arena.c searches the
+        keep list by bisection, so it goes in sorted."""
+        import numpy as np
         want = int(want)
         if want <= 0:
             return []
@@ -403,9 +425,19 @@ class ShmArena:
         lo = (ctypes.c_uint64 * want)()
         hi = (ctypes.c_uint64 * want)()
         tot = (ctypes.c_int64 * want)()
-        keep = [key128(s)[0] for s in keep_stems]
-        c_keep = (ctypes.c_uint64 * max(1, len(keep)))(*keep)
-        got = self._lib.arena_evict_candidates(self._base, want, slots, lo, hi, tot, c_keep, len(keep))
+        if keep_stems or keep_lo is None:
+            keep = np.fromiter((key128(s)[0] for s in keep_stems), dtype=np.uint64)
+            if keep_lo is not None and len(keep_lo):
+                keep = np.concatenate([keep, np.asarray(keep_lo, dtype=np.uint64)])
+            keep = np.ascontiguousarray(np.sort(keep))
+        else:
+            # `keep_lo` alone comes sorted (handoff_pending.Keep.keys): no
+            # per-claim sort of a thousands-long list
+            keep = np.ascontiguousarray(keep_lo, dtype=np.uint64)
+        n_keep = int(keep.shape[0])
+        c_keep = (keep.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)) if n_keep
+                  else (ctypes.c_uint64 * 1)())
+        got = self._lib.arena_evict_candidates(self._base, want, slots, lo, hi, tot, c_keep, n_keep)
         return [(int(slots[i]), int(lo[i]), int(hi[i]), int(tot[i])) for i in range(got)]
 
     # -- Stufe 3 (#1424): address pages in place --------------------------

@@ -421,7 +421,18 @@ int64_t arena_lookup(uint8_t *base, int64_t n, const uint64_t *klo, const uint64
  * them to EVICTING and unlink them from the index. Returns the count; the
  * slot ids land in `slots`, their keys in klo/khi, their widths in totals.
  * The caller copies the data out (arena_slot_ptr) and then calls
- * arena_free_slots. Slots whose key is listed in `keep` (pinned) are skipped. */
+ * arena_free_slots. Slots whose key is listed in `keep` (pinned) are skipped.
+ * #243: `keep` is SORTED ascending (the Python wrapper sorts it) and searched
+ * by bisection -- a pending hand-off keeps thousands of keys, and a linear
+ * scan per visited slot would put O(slots x keys) into the claim. */
+static int keep_has(const uint64_t *keep, int64_t n, uint64_t k) {
+    int64_t lo = 0, hi = n;
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (keep[mid] < k) lo = mid + 1; else hi = mid;
+    }
+    return lo < n && keep[lo] == k;
+}
 const char *arena_slot_stem(uint8_t *base, int64_t slot) { return slot_hdr(base, (uint64_t)slot)->stem; }
 
 int64_t arena_evict_candidates(uint8_t *base, int64_t want, int64_t *slots, uint64_t *klo,
@@ -437,9 +448,7 @@ int64_t arena_evict_candidates(uint8_t *base, int64_t want, int64_t *slots, uint
         if (atomic_load(&sh->state) != S_COMPLETE) continue;
         if (atomic_exchange(&sh->clock_bit, 0)) continue; /* second chance */
         if (atomic_load(&sh->refcount) != 0) continue;
-        int pinned = 0;
-        for (int64_t p = 0; p < n_keep; p++) if (keep_lo[p] == sh->key_lo) { pinned = 1; break; }
-        if (pinned) { atomic_store(&sh->clock_bit, 1); continue; }
+        if (n_keep > 0 && keep_has(keep_lo, n_keep, sh->key_lo)) { atomic_store(&sh->clock_bit, 1); continue; }
         uint32_t expect = S_COMPLETE;
         if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) continue;
         if (atomic_load(&sh->refcount) != 0) { atomic_store(&sh->state, S_COMPLETE); continue; }
@@ -655,6 +664,14 @@ static void stem_key128(const char *stem, uint64_t *lo, uint64_t *hi) {
     *lo = l; *hi = h;
 }
 void arena_key128(const char *stem, uint64_t *lo, uint64_t *hi) { stem_key128(stem, lo, hi); }
+/* #243: the low key words of many stems in one call -- a pending hand-off's
+ * keep list (a 1196-page chain) is hashed here, not in Python. */
+void arena_stem_keys(int64_t n, const char **stems, uint64_t *lo_out) {
+    for (int64_t i = 0; i < n; i++) {
+        uint64_t hi;
+        stem_key128(stems[i], &lo_out[i], &hi);
+    }
+}
 /* find by STEM: hashing in C, one call for a whole prefix. */
 int64_t arena_find_stems(uint8_t *base, int64_t n, const char **stems, int64_t *slots, int8_t *states) {
     int64_t found = 0;

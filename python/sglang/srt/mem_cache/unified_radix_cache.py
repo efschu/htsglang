@@ -627,6 +627,21 @@ class _OngoingPrefetch(NamedTuple):
 _WEG2_ARMED_TREES: "weakref.WeakSet" = weakref.WeakSet()
 
 
+def _weg2_handoff_consumed(rid, where: str, **kv) -> None:
+    """#243: group D took (or ended) ``rid`` -- its P hand-off is no longer
+    kept last in the arena (``weg2.handoff_pending``). Never raises."""
+    if not isinstance(rid, str) or not rid.startswith("weg2-"):
+        return
+    if (os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() != "D":
+        return
+    try:
+        from sglang.srt.weg2 import handoff_pending as _hp
+
+        _hp.consume(rid, where, **kv)
+    except Exception:  # noqa: BLE001 - bookkeeping never breaks the tree
+        logger.warning("#243 HANDOFF-PENDING consume raised", exc_info=True)
+
+
 def _weg2_prefetch_resolved_rows(rec):
     """#1424g: the rows of a store prefetch whose reader reference the resolve
     has taken -- ``host_indices[:operation.completed_tokens]`` (the IO thread
@@ -1484,6 +1499,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         * reset_orphans (#1424g): references the resets of this process gave
           back because no holder named them any more (cumulative) -- the gap
           a reset used to leave behind for good;
+        * handoff_kept (#243, NOT in sum -- an order, not a reference): kept
+          keys of pending hand-offs still COMPLETE / all kept keys, next to
+          arena_pinned (every process's reference-pinned complete slots: a
+          park, a tree, a prefetch). A pin always wins over the order;
         * snapshot=torn: a reset replaced the tree while the census walked it
           (the census thread against the scheduler) -- gap is then '-', never
           a number from two trees; own_drift: the ledger moved by that much
@@ -1547,13 +1566,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             orphans = int((getattr(self, "_weg2_reset_orphans", None) or {}).get(ct, 0))
             torn = int(getattr(self, "_weg2_reset_epoch", 0)) != epoch0
             drift = (own - own0) if own is not None and own0 is not None else 0
+            from sglang.srt.weg2 import handoff_pending as _hp
+
             lines.append(
                 f"pool={getattr(ct, 'name', ct)} tree={tree} tree_in_use={in_use} prefetch={prefetch} "
                 f"retired={retired} queue={queue} carrier={carrier} sum={total} "
                 f"own_held={own if own is not None else '-'} "
-                f"gap={own - total if own is not None and not torn else '-'} reset_orphans={orphans}"
-                + (f" snapshot=torn own_before={own0}" if torn else "")
-                + (f" own_drift={drift}" if drift and not torn else ""))
+                f"gap={own - total if own is not None and not torn else '-'} reset_orphans={orphans} "
+                + (f"snapshot=torn own_before={own0} " if torn else "")
+                + (f"own_drift={drift} " if drift and not torn else "")
+                + f"{_hp.census(pool)}")
         return "; ".join(lines) or None
 
     def _weg2_log_holder_census(self, where: str) -> None:
@@ -2195,6 +2217,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return DecLockRefResult()
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
+        # #243: the rid ended on D -- its hand-off is no longer waited for
+        _weg2_handoff_consumed(getattr(req, "rid", None), "end")
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
         # P-HOST-OVERLAP: a chunk publish still deferred goes out before the
@@ -4836,6 +4860,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._1442_n = n
                 if n <= 8 or n % 256 == 0:
                     logger.info("#1442 HANDOFF rid=%s ids=%d page_keys=%d (n=%d)", rid[:12], len(ids), len(keys), n)
+                # #243: the hand-off is kept (evicted last) until D takes the
+                # rid -- not only until P's reset / next wake (group P only)
+                from sglang.srt.weg2 import handoff_pending as _hp
+                _hp.mark(rid, len(keys), int(self.page_size))
         except Exception:  # noqa: BLE001 - the hand-off is an accelerator, never a wall
             logger.warning("#1442 hand-off write raised", exc_info=True)
 
@@ -7127,6 +7155,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+        # #243: D took the hand-off -- every rank's fetched pages carry its own
+        # references since they resolved, and this termination is the group's
+        # vote that all of them have; the order protection ends here. A SHORT
+        # read keeps it: the refetch (#1471) still needs the rest.
+        if int(min_completed_tokens) >= len(prefetch_key):
+            _weg2_handoff_consumed(req_id, "fetch", loaded=int(min_completed_tokens))
 
         # #841: a declined insert loaded NOTHING into the tree. Reporting the
         # fetched tail as `loaded` would make the metric measure the transfer
@@ -7701,6 +7735,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
 
     def release_aborted_request(self, rid: str) -> None:
+        _weg2_handoff_consumed(rid, "abort")  # #243: the rid ended on D
         self._unpin_prefetched_span(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self._prefetch_completed_tokens.pop(rid, None)
