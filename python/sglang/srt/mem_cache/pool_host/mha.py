@@ -303,6 +303,25 @@ class MHATokenToKVPoolHost(HostKVCache):
         )
         self.staging_v_buffer = torch.empty_like(self.staging_k_buffer)
 
+    def _regrow_byteless_buffer(self) -> None:
+        """#249: a byteless pool's id space moved (``HostKVCache._grow_byteless``
+        or the ``clear()`` back to the synced size). Its buffer holds 0 bytes;
+        it is re-shaped to the new id count so no index of the grown range is
+        ever out of bounds on a tensor op. Nothing is pinned or copied."""
+        if not getattr(self, "byteless", False) or self.kv_buffer is None:
+            return
+        if self.layout == "layer_first":
+            dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
+        elif self.layout == "page_first":
+            dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
+        elif self.layout == "page_first_direct":
+            dims = (2, self.page_num, self.layer_num, self.page_size, self.head_num, self.head_dim)
+        elif self.layout == "page_head":
+            dims = (2, self.page_num, self.head_num, self.page_size, self.layer_num, self.head_dim)
+        else:
+            return
+        self.kv_buffer = torch.empty(dims, dtype=self.dtype, device=self.kv_buffer.device)
+
     @property
     def k_buffer(self):
         return self.kv_buffer[0]
