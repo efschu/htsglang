@@ -15,7 +15,10 @@ THE FIX (``weg2.park_l3.release_loaded_host``, called from ``loading_check``):
 the span is on the device -> TP0 frees the KV host rows of the loaded path
 (the arena page stays COMPLETE), records a STATE event per node, and the next
 request broadcast takes the workers' mirror rows with it. The mamba anchor
-stays (it may live on the host alone).
+host row goes WITH the KV row (rc12x 22:59:01: a kept anchor host row under a
+released KV row is 'node 28 mamba host present but Full.host_value=None', the
+idle sanity check stopped all three D ranks); a node whose anchor lives on the
+host only keeps its whole host life.
 
 Hermetic (no CUDA): the R12 harness (real UnifiedRadixCache host-life methods,
 real role plans, pickle broadcast) from test_form_a_host_shadow_r12.py.
@@ -85,17 +88,57 @@ def _worker_kv_rows(r):
 
 
 def test_metal_shape_a_load_back_gives_tp0s_arena_rows_and_the_workers_mirror_back():
-    """The span on the device: TP0's KV host rows go (anchors stay), the STATE
-    verdict takes the workers' byteless mirror rows at the next broadcast.
-    RED on the base: every rank keeps (1, 1) until the reset."""
+    """The span on the device: TP0's KV and anchor host rows go together, the
+    STATE verdict takes the workers' byteless mirror rows at the next
+    broadcast. RED before #248: every rank keeps (1, 1) until the reset;
+    RED on 10f5bbf60a: (0, 1) -- the anchor host row outlived the KV row."""
     ranks = _ranks()
     with h._switch(True):
         h._each(ranks, lambda r: r.ack_store_writes())
         h._broadcast(ranks)
         h._each(ranks, lambda r: _load_back(r, 3 * NODE))
         h._broadcast(ranks)
-    assert h._same(ranks) == {NODE: (0, 1), 2 * NODE: (0, 1), 3 * NODE: (0, 1)}
+    assert h._same(ranks) == {NODE: (0, 0), 2 * NODE: (0, 0), 3 * NODE: (0, 0)}
     assert all(r.node_at(3 * NODE).component_data[FULL].value is not None for r in ranks)
+
+
+def _aux_host_without_kv_host(r):
+    """UnifiedRadixCache.sanity_check's rule 'aux data requires Full data' on
+    the host layer: the nodes that break it."""
+    return [n.id for n in r.nodes()
+            if n.component_data[h.MAMBA].host_value is not None
+            and n.component_data[FULL].host_value is None]
+
+
+def test_rc12x_no_anchor_host_row_outlives_its_kv_host_row():
+    """rc12x (dkrnfh91dprsabar1dauer09272253, D log 13138 / 15649): #248
+    LOADED-HOST-RELEASE nodes=1 rows=15424, R12 APPLIED kv_dropped=1
+    anchor_dropped=0, 63 s later on_idle -> sanity_check on every rank:
+    'node 28 mamba host present but Full.host_value=None'. After the release
+    and the verdict no rank may hold an anchor host row without its KV host
+    row. RED on 10f5bbf60a: every node of the loaded span on every rank."""
+    ranks = _ranks()
+    with h._switch(True):
+        h._each(ranks, lambda r: r.ack_store_writes())
+        h._broadcast(ranks)
+        h._each(ranks, lambda r: _load_back(r, 3 * NODE))
+        h._broadcast(ranks)
+    assert [_aux_host_without_kv_host(r) for r in ranks] == [[], [], []]
+
+
+def test_an_anchor_on_the_host_only_keeps_its_node_whole():
+    """The node's anchor has no device copy (only the host row carries the
+    state): dropping the KV row would break the invariant, dropping the anchor
+    would lose the state -- the node keeps its host life, its neighbours go."""
+    ranks = _ranks()
+    tp0 = ranks[0]
+    with h._switch(True):
+        with h._as_rank(tp0):
+            tp0.node_at(2 * NODE).component_data[h.MAMBA].value = None
+            n = park_l3.release_loaded_host(tp0, tp0.node_at(3 * NODE))
+    assert n == 2
+    assert tp0.snapshot() == {NODE: (0, 0), 2 * NODE: (1, 1), 3 * NODE: (0, 0)}
+    assert _aux_host_without_kv_host(tp0) == []
 
 
 def test_the_worker_pool_does_not_ratchet_over_park_and_resume_cycles():

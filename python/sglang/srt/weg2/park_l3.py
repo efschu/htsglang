@@ -154,10 +154,19 @@ def release_loaded_host(tree, node) -> int:
     byteless mirror rows with it (rc12t: the workers' fixed 353573-row pool
     ratcheted to "host_pool_shortfall" before any reset).
 
-    Only the KV (base) component: a mamba anchor may exist on the host alone.
+    The node's WHOLE host life goes, KV and aux (mamba anchor, indexer)
+    together: the tree invariant is "aux data requires Full data" on each
+    layer (``UnifiedRadixCache.sanity_check``), so an aux host value may not
+    outlive the KV host row. rc12x (dkrnfh91dprsabar1dauer09272253, 22:59:01,
+    rid weg2-0-4): this function dropped the KV host rows only, node 28 kept
+    its mamba host anchor, and the idle invariant check stopped every D rank
+    ('node 28 mamba host present but Full.host_value=None'). A node whose aux
+    host value has NO device copy is KEPT whole (dropping the KV row would
+    break the invariant, dropping the anchor would lose the only state).
     Never a node without its device value, never under a host lock (another
     load of it in flight). A Form A worker does nothing itself -- it follows
-    TP0's verdict. Returns the nodes released."""
+    TP0's verdict (STATE carries kv_host and anchor_host). Returns the nodes
+    released."""
     if not enabled() or not _group_d() or node is None:
         return 0
     from sglang.srt.mem_cache import form_a_host_shadow as _r12
@@ -172,25 +181,33 @@ def release_loaded_host(tree, node) -> int:
     comp = next((c for c in tree._components_tuple if c.component_type == BASE_COMPONENT_TYPE), None)
     if comp is None:
         return 0
+    aux = [c for c in tree._components_tuple if c.component_type != BASE_COMPONENT_TYPE]
     root = tree.root_node
-    n, rows = 0, 0
+    n, rows, kept = 0, 0, 0
     while node is not None and node is not root:
         cd = node.component_data[BASE_COMPONENT_TYPE]
         if (cd.host_value is not None and cd.value is not None and not getattr(node, "evicted", False)
                 and not any(int(getattr(c, "host_lock_ref", 0) or 0) > 0 for c in node.component_data)):
-            _, hf = tree._evict_component_and_detach_lru(node, comp, target=EvictLayer.HOST, tracker=None)
-            tree.evictable_host_leaves.discard(node)
-            n += 1
-            rows += int(hf or 0)
-            if role == "host":
-                _r12.record_state(tree, node, why="248-loaded")
+            aux_host = [c for c in aux if node.component_data[c.component_type].host_value is not None]
+            if any(node.component_data[c.component_type].value is None for c in aux_host):
+                kept += 1  # an aux state lives on the host only: the node keeps its host life
+            else:
+                for c in aux_host:  # aux first: never an aux host row without the KV row
+                    tree._evict_component_and_detach_lru(node, c, target=EvictLayer.HOST, tracker=None)
+                _, hf = tree._evict_component_and_detach_lru(node, comp, target=EvictLayer.HOST, tracker=None)
+                tree.evictable_host_leaves.discard(node)
+                n += 1
+                rows += int(hf or 0)
+                if role == "host":
+                    _r12.record_state(tree, node, why="248-loaded")
         node = node.parent
     if n:
         k = getattr(tree, "_248_release_n", 0) + 1
         tree._248_release_n = k
         if k <= 8 or k % 64 == 0:
-            logger.info("#248 LOADED-HOST-RELEASE nodes=%d rows=%d (the span is on the device; its arena "
-                        "pages stay COMPLETE, unreferenced%s) n=%d", n, rows,
+            logger.info("#248 LOADED-HOST-RELEASE nodes=%d rows=%d kept_host_only_aux=%d (the span is on "
+                        "the device; KV and anchor host rows go together, its arena pages stay COMPLETE, "
+                        "unreferenced%s) n=%d", n, rows, kept,
                         "; STATE verdict to the Form A workers" if role == "host" else "", k)
     return n
 
