@@ -560,6 +560,9 @@ class DRankResidency(msgspec.Struct, frozen=True, kw_only=True):
     kv_mib: float
     ceiling_fraction: Optional[float]
     ceiling_max_rows: int
+    #: #239: this rank's share of the token-cut full-attention KV; -1 = the
+    #: cut is not modelled (every rank priced with its reference cell).
+    kv_token_share: float = -1.0
 
     @property
     def pre_kv_rest_mib(self) -> float:
@@ -598,6 +601,56 @@ class DRankResidency(msgspec.Struct, frozen=True, kw_only=True):
         return self.verdict != "PASST"
 
 
+def kv_token_cut_cells(
+    reference: DRankReference,
+    shares: Sequence[float],
+    dcp_cell_bytes: int,
+) -> Tuple[float, ...]:
+    """#239: the per-token KV cell of every D rank once the full-attention KV
+    is cut by TOKENS over the ranks (uneven DCP under Form A).
+
+    The reference is a Form A measurement: its attention host held the whole
+    full-attention KV (``dcp_cell_bytes`` of its cell) plus the parts that stay
+    on the host whatever the cut is (indexer, draft KV); a worker's cell is
+    what it builds without attention. Cut by ``shares`` (a VECTOR OF RATIOS,
+    normalised here -- rank-ratios-sind-verhaeltnis), rank r costs::
+
+        (reference cell_r - dcp_cell if r held the full KV else cell_r)
+            + share_r x dcp_cell
+
+    Refused, not guessed: a reference with more than one attention host (its
+    cell already is a DCP slice), a share vector of the wrong length, a
+    negative share or an all-zero one, and a cut larger than the host cell.
+    """
+    n = len(reference.kv_cell_bytes)
+    if len(shares) != n:
+        raise ValueError(
+            "kv_token_cut_cells: %d D ranks, but %d KV token shares" % (n, len(shares))
+        )
+    if any(float(s) < 0.0 for s in shares) or sum(float(s) for s in shares) <= 0.0:
+        raise ValueError("kv_token_cut_cells: shares %s are not a ratio vector" % (list(shares),))
+    tp = [int(x) for x in str(reference.rank_tp_ratio).split(",") if x.strip()]
+    hosts = [r for r, v in enumerate(tp) if v > 0]
+    if len(tp) != n or len(hosts) != 1:
+        raise ValueError(
+            "kv_token_cut_cells: the reference %s (rank-tp-ratio %s) is not a Form A "
+            "measurement with ONE attention host -- its cells cannot be re-cut"
+            % (reference.source, reference.rank_tp_ratio)
+        )
+    host = hosts[0]
+    if int(dcp_cell_bytes) <= 0 or int(dcp_cell_bytes) > int(reference.kv_cell_bytes[host]):
+        raise ValueError(
+            "kv_token_cut_cells: the token-cut cell %d B is not part of the host cell %d B"
+            % (int(dcp_cell_bytes), int(reference.kv_cell_bytes[host]))
+        )
+    total = sum(float(s) for s in shares)
+    cells = []
+    for r in range(n):
+        fixed = float(reference.kv_cell_bytes[r]) - (float(dcp_cell_bytes) if r == host else 0.0)
+        cells.append(fixed + float(shares[r]) / total * float(dcp_cell_bytes))
+    return tuple(cells)
+
+
 def solve_d_rank_residency(
     *,
     budgets_mib: Sequence[float],
@@ -613,6 +666,8 @@ def solve_d_rank_residency(
     vocab_mib: float,
     share_embed: bool,
     kv_tokens: int,
+    kv_token_shares: Optional[Sequence[float]] = None,
+    kv_dcp_cell_bytes: int = 0,
 ) -> Tuple[DRankResidency, ...]:
     """Je D-Rang die Bilanz gegen SEIN Budget und die Decke.
 
@@ -625,8 +680,18 @@ def solve_d_rank_residency(
     ``vocab_delta_r`` ist auf dem Draft-Host ``-vocab`` wenn die Referenz
     die eigene Tabelle hielt und dieser Boot sie teilt, ``+vocab`` im
     umgekehrten Fall, sonst 0.
+
+    #239: ``kv_token_shares`` (Verhaeltnisvektor je Rang) bucht die
+    Voll-Attention-KV (``kv_dcp_cell_bytes`` je Token) nach dem Token-Schnitt
+    (:func:`kv_token_cut_cells`); ohne ihn bleibt die Rechnung byte-gleich.
     """
     n = len(budgets_mib)
+    cut_cells: Optional[Tuple[float, ...]] = None
+    cut_shares: Tuple[float, ...] = ()
+    if kv_token_shares is not None:
+        cut_cells = kv_token_cut_cells(reference, kv_token_shares, kv_dcp_cell_bytes)
+        total = sum(float(s) for s in kv_token_shares)
+        cut_shares = tuple(float(s) / total for s in kv_token_shares)
     for name, vec in (
         ("fractions", fractions),
         ("ratios", ratios),
@@ -657,7 +722,10 @@ def solve_d_rank_residency(
             delta = (
                 -float(vocab_mib) if reference.draft_vocab_held else float(vocab_mib)
             )
-        kv_mib = float(kv_tokens) * float(reference.kv_cell_bytes[r]) / MIB
+        cell = (
+            float(reference.kv_cell_bytes[r]) if cut_cells is None else cut_cells[r]
+        )
+        kv_mib = float(kv_tokens) * cell / MIB
         posts = (
             reference.fixed_mib[r]
             + delta
@@ -690,12 +758,13 @@ def solve_d_rank_residency(
                 spec_mib=float(reference.spec_mib[r]),
                 activation_mib=float(reference.activation_mib[r]),
                 kv_tokens=int(kv_tokens),
-                kv_cell_bytes=int(reference.kv_cell_bytes[r]),
+                kv_cell_bytes=int(round(cell)),
                 kv_mib=kv_mib,
                 ceiling_fraction=largest_fraction_for_rows(
                     local_experts=E, scratch_rows=S, max_rows=max_rows
                 ),
                 ceiling_max_rows=max_rows,
+                kv_token_share=cut_shares[r] if cut_cells is not None else -1.0,
             )
         )
     return tuple(out)
@@ -708,7 +777,7 @@ def describe_rank(fit: DRankResidency) -> str:
         "rang%d: Ratio %g -> Spanne %d + Pad %d = E %d, Scratch %d (Staging %d liegt "
         "darin, kein eigener Posten), f %.3f -> R %d, Puffer min(R+S,E) = %s Zeilen x %d Layer x "
         "%.3f MiB = %.0f MiB | fest %.0f%s + mamba %.0f + spec %.0f + Aktivierung "
-        "%.0f + KV %d Token x %d B = %.0f MiB | Budget %.0f -> Rest vor KV %.0f, nach "
+        "%.0f + KV %d Token x %d B%s = %.0f MiB | Budget %.0f -> Rest vor KV %.0f, nach "
         "KV %.0f MiB (%d Token erreichbar) -> %s | DECKE f %s (<= %d Zeilen)"
         % (
             fit.rank,
@@ -735,6 +804,11 @@ def describe_rank(fit: DRankResidency) -> str:
             fit.activation_mib,
             fit.kv_tokens,
             fit.kv_cell_bytes,
+            (
+                (" (Token-Schnitt, Anteil %.3f)" % fit.kv_token_share)
+                if fit.kv_token_share >= 0.0
+                else ""
+            ),
             fit.kv_mib,
             fit.budget_mib,
             fit.pre_kv_rest_mib,
@@ -2293,8 +2367,14 @@ def plan_d_residency(
     activation_record_mib: Optional[Sequence[Optional[float]]] = None,
     activation_record_source: str = "",
     derive_waves: bool = False,
+    kv_token_shares: Optional[Sequence[float]] = None,
+    kv_dcp_cell_bytes: int = 0,
 ) -> DResidencyPlan:
     """Der D-FRACTION-SOLVE mit den Metallregeln, fuer ``launcher``.
+
+    #239: ``kv_token_shares`` + ``kv_dcp_cell_bytes`` bucht den Token-Schnitt
+    der Voll-Attention-KV ueber die D-Raenge (uneven DCP unter Form A, siehe
+    :func:`kv_token_cut_cells`); ohne sie bleibt die Rechnung byte-gleich.
 
     rc12c: ``fixed_record_mib`` = der feste Rang-Posten aus dem Record des
     Profils (``D_FIXED_MIB``, gemessen auf der Form, die heute faehrt); ein
@@ -2506,14 +2586,26 @@ def plan_d_residency(
         vocab_mib=vocab,
         share_embed=share,
         kv_tokens=int(kv_tokens),
+        kv_token_shares=kv_token_shares,
+        kv_dcp_cell_bytes=int(kv_dcp_cell_bytes),
     )
-    dcp_note = (
-        " KV-Anteil: SGLANG_UNEVEN_DCP ist an, der Token-Schnitt je Rang ist hier NICHT "
-        "modelliert -- jeder Rang ist mit dem vollen Kontext bepreist (Obergrenze des "
-        "KV-Postens)."
-        if _env_true(env_d, "SGLANG_UNEVEN_DCP")
-        else " KV-Anteil: kein uneven DCP, jeder Rang haelt den vollen Kontext."
-    )
+    if kv_token_shares is not None:
+        dcp_note = (
+            " KV-Anteil (#239): Token-Schnitt der Voll-Attention-KV (%d B/Token) je Rang "
+            "%s, der Host-Rest der Zelle bleibt auf dem Host."
+            % (
+                int(kv_dcp_cell_bytes),
+                ["%.3f" % f.kv_token_share for f in fits],
+            )
+        )
+    elif _env_true(env_d, "SGLANG_UNEVEN_DCP"):
+        dcp_note = (
+            " KV-Anteil: SGLANG_UNEVEN_DCP ist an, der Token-Schnitt je Rang ist hier NICHT "
+            "modelliert -- jeder Rang ist mit dem vollen Kontext bepreist (Obergrenze des "
+            "KV-Postens)."
+        )
+    else:
+        dcp_note = " KV-Anteil: kein uneven DCP, jeder Rang haelt den vollen Kontext."
     head = (
         "%s FRACTION-SOLVE %s (Pufferregel, H8): Budget je Rang %s MiB, %d Layer x "
         "%.3f MiB/Zeile, %d Experten nach --rank-moe-ratio %s + 1 Pad-Zeile, Scratch "
