@@ -174,6 +174,72 @@ def local_pp_room(tree, kv_tokens: int, floor: int, rid=None) -> Optional[bool]:
     return ok
 
 
+def note_loaded(tree, rows: int) -> None:
+    """SF-X (rc12q PP2 15:38:49Z, weg2-4-37): charge a load-back's device rows
+    against this iteration's floor when the floor is this rank's own value.
+
+    The floor (5336) was published at the top of the iteration; the same-pass
+    room evicted 810 and the load took 5932 rows, so the live pool held 214 --
+    while the extend's own eviction trigger (``uniform_avail_for_evict`` =
+    floor - admitted ledger) still read 5336 >= 775 and SKIPPED, and the
+    775-token extend raised with 245003 evictable. Charged here, the trigger
+    reads 5336 - 5932 < 775 and evicts what the extend needs. Only on the
+    local-PP form: on a TP group the floor is a group MIN and its ledger is
+    charged by replicated allocations only (unchanged)."""
+    if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False) or rows <= 0:
+        return
+    try:
+        from sglang.srt.mem_cache.common import note_uniform_admitted
+
+        note_uniform_admitted(tree, int(rows))
+    except Exception:  # noqa: BLE001 -- a ledger note never breaks a load
+        pass
+
+
+def ensure_relief_provider(scheduler) -> None:
+    """SF-X: register ONE rank-local extend relief provider for this process
+    (``common.register_extend_relief_provider``). It acts only while the tree's
+    floor is marked local-PP (tp group of one, pp>1: the floor is rank-local
+    anyway, so a rank-local eviction cannot split a replica group); on a TP
+    group it returns 0 without touching the tree. Evicts exactly the tokens
+    asked, applies staged frees, logs ``EXTEND-RELIEF``."""
+    if not enabled() or getattr(scheduler, "_sf_relief_registered", False):
+        return
+    tree = getattr(scheduler, "tree_cache", None)
+    if tree is None:
+        return
+
+    def _relief(num_tokens: int) -> int:
+        if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False):
+            return 0
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+        from sglang.srt.mem_cache import common as _c
+
+        alloc = tree.token_to_kv_pool_allocator
+        before = int(alloc.available_size())
+        need = max(0, int(num_tokens) - before)
+        res = tree.evict(EvictParams(num_tokens=need)) if need > 0 else None
+        try:
+            _c._flush_deferred_frees(alloc)
+        except Exception:  # noqa: BLE001
+            pass
+        after = int(alloc.available_size())
+        n = _sampled(tree, "_weg2_sf_extend_relief")
+        if n is not None:
+            logger.warning(
+                "EXTEND-RELIEF evicted=%d asked=%d avail %d->%d evictable_left=%d (n=%d): "
+                "rank-local relief on the local-PP floor (tp group of one) -- the extend's "
+                "own trigger read a floor the pass had already spent",
+                int(getattr(res, "num_tokens_evicted", 0) or 0), int(num_tokens), before, after,
+                int(tree.evictable_size()), n)
+        return max(0, after - before)
+
+    from sglang.srt.mem_cache.common import register_extend_relief_provider
+
+    register_extend_relief_provider(_relief)
+    scheduler._sf_relief_registered = True
+
+
 # ---------------------------------------------------------------------------
 # (b1) the budget head's position from the KEPT told
 # ---------------------------------------------------------------------------
