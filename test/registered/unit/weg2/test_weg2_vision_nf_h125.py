@@ -334,6 +334,62 @@ def test_kvtail_keeps_the_27b_refusal(tmp_path):
     assert not out.ok and out.code == vrr.W_NO_ROOM and "free VRAM" not in out.detail
 
 
+class _ForwardStream:
+    """PP0's forward stream: the stage may only wait on it, never launch."""
+
+    def __init__(self):
+        self.syncs = 0
+
+    def synchronize(self):
+        self.syncs += 1
+
+
+def test_free_waits_for_pp0s_forward_before_the_tower_lands(tmp_path):
+    # 27B review of H125e: without the drain a forward may still run on PP0;
+    # in free VRAM the tower would stack on its workspace -- wait for it first
+    _write_model(tmp_path)
+    s = _sched()
+    s.forward_stream = _ForwardStream()
+    seen = []
+
+    def _air(dev):
+        seen.append(s.forward_stream.syncs)  # the air is read after the wait
+        return BIG_AIR(dev)
+
+    out = _run(s, [_req("r", [_Item()])], tmp_path, place=vrs.PLACE_FREE, air=_air)
+    assert out.ok and out.place == "free"
+    assert s.forward_stream.syncs == 1 and seen == [1]
+    assert out.sync_ms is not None and out.sync_ms >= 0.0
+
+
+def test_auto_on_a_busy_tail_waits_too(tmp_path):
+    _write_model(tmp_path)
+    s = _sched()
+    s.forward_stream = _ForwardStream()
+    _tail_in_use(s)
+    out = _run(s, [_req("r", [_Item()])], tmp_path, place=vrs.PLACE_AUTO, air=BIG_AIR)
+    assert out.ok and out.place == "free"
+    assert s.forward_stream.syncs == 1 and out.sync_ms is not None
+
+
+def test_kvtail_never_waits_for_the_forward(tmp_path):
+    # on the KV tail the tower takes pages no batch owns: nothing stacks
+    _write_model(tmp_path)
+    s = _sched()
+    s.forward_stream = _ForwardStream()
+    out = _run(s, [_req("r", [_Item()])], tmp_path, place=vrs.PLACE_KVTAIL, air=BIG_AIR)
+    assert out.ok and out.place == "kvtail"
+    assert s.forward_stream.syncs == 0 and out.sync_ms is None
+
+
+def test_the_log_line_carries_sync_ms(caplog):
+    with caplog.at_level(logging.INFO):
+        vrr.log_outcome(vrr.StageOutcome(place="free", items=1, sync_ms=12.34), ["r"], 1)
+        vrr.log_outcome(vrr.StageOutcome(place="kvtail", items=1), ["r"], 2)
+    msgs = [r.getMessage() for r in caplog.records][-2:]
+    assert "sync_ms=12.3 " in msgs[0] and "sync_ms=n/a " in msgs[1]
+
+
 def test_the_log_line_names_place_source_and_card(caplog):
     out = vrr.StageOutcome(place="free", source="ram", card=1, items=1)
     with caplog.at_level(logging.INFO):
