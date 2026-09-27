@@ -13,13 +13,24 @@ before an admission. :func:`vision_rank_pass` runs in
 ``Scheduler.get_new_batch_prefill`` on PP0 right before the admission call
 and skips a dormant group itself, so the flip is finished before it starts
 and it never touches the flip. It stages
-only while PP0 is idle (no running batch, no chunked request, no microbatch
-in flight -- the scheduler's own ``_pp_microbatches_drained``), all images
-waiting at that moment with ONE tower load. While images wait for PP0 to
-drain, NO waiting request is admitted (parked for this pass, put back after
-it), so a stream of text requests cannot starve an image and an image can
-never reach a forward unstaged. Followers adopt PP0's admissions, so they
-hold the same requests without running anything.
+in THE PASS that finds the images, all images waiting at that moment with
+ONE tower load, before that pass's admission -- whether or not microbatches
+are in flight. PP0's own forwards are launched synchronously inside earlier
+passes, so nothing of PP0's runs on the card during the stage; the tower
+takes free KV-tail pages (or free VRAM) that no in-flight batch owns, and
+gives them back before the admission.
+
+H125e (V1 dkrnfh91visbar1dauer09270822, 08:29:10Z, #1004 SLOT DISAGREEMENT):
+the stage used to wait for PP0 to DRAIN and held EVERY waiting request out
+of the passes in between. Those passes ran on PP0 only -- it cycled its
+in-flight slots to collect their outputs -- while PP1, drained earlier,
+parked idle on the next slot. PP0 then admitted the held work two slots
+later than the follower that received its row (P log: PP0 "#969N ADMIT
+slot=0 fwd_ct=10", PP1 launching slot 1 fwd_ct=10). Row authority keeps the
+followers' admissions equal to PP0's; it cannot keep the SLOT equal when PP0
+defers admissible work across its own drain. So the stage never defers:
+work that is admissible in a pass is admitted in that pass, as without
+vision.
 
 A stage that fails aborts its requests BY NAME through an AbortReq injected
 at PP0's intake (the request origin): the list rides the chain, every PP rank
@@ -186,7 +197,7 @@ def arm_ram_source(model_dir: str, env: Optional[Dict[str, str]] = None,
 
 
 # ---------------------------------------------------------------------------
-# what is pending, and whether PP0 may stage now
+# what is pending
 # ---------------------------------------------------------------------------
 
 
@@ -196,19 +207,6 @@ def unstaged_items(req) -> List[Any]:
     return [it for it in items
             if getattr(it, "precomputed_embeddings", None) is None
             and getattr(it, "feature", None) is not None]
-
-
-def pp0_idle(scheduler) -> bool:
-    """Nothing running and nothing in flight on this rank."""
-    rb = getattr(scheduler, "running_batch", None)
-    if rb is not None and not rb.is_empty():
-        return False
-    if getattr(scheduler, "chunked_req", None) is not None:
-        return False
-    drained = getattr(scheduler, "_pp_microbatches_drained", None)
-    if callable(drained):
-        return bool(drained())
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -587,9 +585,11 @@ def _refuse(scheduler, reqs: Sequence[Any], code: str, detail: str) -> None:
 
 
 def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
-    """Right before PP0's admission. Stages the pending images when PP0 is
-    idle; otherwise returns the requests held out of THIS pass as
-    (index, req) -- the caller puts them back with :func:`vision_unpark`."""
+    """Right before PP0's admission. Stages the pending images in this pass
+    (H125e: never waits for PP0 to drain, module docstring) and returns the
+    requests held out of THIS pass as (index, req) -- only refused ones, the
+    caller puts them back with :func:`vision_unpark` until their abort
+    lands."""
     if getattr(scheduler, "weg2_dormant", False):
         return []
     wq = scheduler.waiting_queue
@@ -604,7 +604,7 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
             logger.error("%s rids=%s -- %s", W_NOT_ARMED, [r.rid for r in pending], refusal)
             _refuse(scheduler, pending, W_NOT_ARMED, refusal)
             held = pending + held
-        elif pp0_idle(scheduler):
+        else:
             scheduler._weg2_vision_runs += 1
             try:
                 dev = _rank_device()
@@ -626,9 +626,6 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
             if not out.ok:
                 _refuse(scheduler, pending, out.code, out.detail)
                 held = pending + held
-        else:
-            # PP0 drains for the stage: nothing new is admitted meanwhile.
-            held = list(wq)
     if not held:
         return []
     ids = {id(r) for r in held}
