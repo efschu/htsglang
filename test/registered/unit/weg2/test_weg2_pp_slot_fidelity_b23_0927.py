@@ -99,6 +99,11 @@ def _tree(avail, evictable, floor, local_pp=None):
     class _T:
         load_back = URC.UnifiedRadixCache.load_back
 
+        def _1424_verify_load_chain(self, kv_xfer, req=None):
+            # #1424b-d (after this test was written): load_back proves the chain
+            # before queueing it. These stand-in trees have no arena chain.
+            return None
+
         def __init__(self):
             self.token_to_kv_pool_allocator = _Alloc(avail)
             self._evictable = evictable
