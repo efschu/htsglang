@@ -78,6 +78,50 @@ def _atok(pool) -> int:
     return int(t) if t else int(getattr(pool, "arena_slots", 0)) * _psz(pool)
 
 
+_PAGE_FALLBACK_N = [0]
+
+
+def _page_slots_or_none(pool, rows: torch.Tensor) -> Optional[torch.Tensor]:
+    """``_page_slots`` for the load path: None (named, counted) when the rows
+    are not whole consecutive pages -- the caller then takes the per-layer
+    gather, which addresses every (slot, token) row on its own.
+
+    #1424 (rc12m-dpr D-TP0 11:49:05, weg2-17-71 + weg2-11-56): two requests
+    of one batch loaded the SAME host rows (the 384-token node [22656, 23040)
+    twice, START-LOADING nodes=3 tokens=37376 = 36608 + 384 + 384) into two
+    device row sets. ``move_indices`` (io_backend direct, layer_first) SORTS
+    the merged host indices, so every duplicated row lands next to its twin
+    -- r0,r0,r1,r1,... -- and no page is 'P consecutive ids from its first'
+    any more: RuntimeError, D dead. Loading the same row into two device
+    rows is legal (the gather does it), only the whole-page fast path cannot.
+    27B never saw it: its arena is unpaged (P == 1, no page check)."""
+    P = _psz(pool)
+    if P == 1:
+        return rows
+    n = int(rows.numel())
+    why = ""
+    if n % P:
+        why = f"{n} rows are not whole pages of {P}"
+    else:
+        pages = rows.view(-1, P)
+        first = pages[:, 0]
+        lane = torch.arange(P, device=rows.device, dtype=rows.dtype)[None, :]
+        if bool((first % P).any()) or bool((pages != first[:, None] + lane).any()):
+            dup = n - int(torch.unique(rows).numel())
+            why = f"a page's rows are not consecutive from its first id (duplicate rows={dup})"
+    if not why:
+        return first // P
+    _PAGE_FALLBACK_N[0] += 1
+    k = _PAGE_FALLBACK_N[0]
+    if k <= 16 or (k & (k - 1)) == 0:
+        logger.warning(
+            "#1424 PAGE-LOAD FALLBACK n=%d rows=%d: %s -- this load takes the per-layer "
+            "(slot, token) gather instead of the whole-page path",
+            k, n, why,
+        )
+    return None
+
+
 def _page_slots(pool, rows: torch.Tensor) -> torch.Tensor:
     """x59: token rows of whole pages -> one slot per page (the P consecutive
     ids of each page, in order; anything else is a caller handing tokens of
@@ -793,8 +837,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 id(rows), id(device_indices), int(rows.numel()), int(device_indices.numel()))
             if layer_id != 0 and self._page_loaded_key == key:
                 return  # every layer came with the page load at layer 0
-            if layer_id == 0:
-                slots = _page_slots(self,rows)
+            slots = _page_slots_or_none(self, rows) if layer_id == 0 else None
+            if slots is not None:
                 _tm0 = time.perf_counter()
                 if self.row_slot is not None:
                     rl = rows.tolist()
