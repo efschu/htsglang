@@ -1898,6 +1898,27 @@ def stream_has_content(head: Optional[bytes], path: str) -> bool:
     return b"data:" in head
 
 
+def inband_error_before_content(head: Optional[bytes], path: str) -> Optional[str]:
+    """EB (NF rc12q 16:26:57, weg2-14-52): D answered a streamed leg 2 with a
+    NAMED error before any content -- there ``W88 Weg2StoreLoadNotProgressing
+    arm=host_pool_shortfall ... terminal, answered 503`` -- and the front
+    committed a 200 carrying no text (SERVED status=200 prompt_tokens=0
+    completion_tokens=0). The non-stream twin (weg2-14-53) got its 503. Returns
+    the error text when the buffered head holds an error event and no content,
+    else None. Anthropic: ``event: error`` without a content event; OpenAI /
+    generate: a first ``data:`` chunk carrying ``"error"`` and no ``"choices"``/
+    ``"text"``."""
+    if not head:
+        return None
+    if path == "/v1/messages":
+        if b"event: error" not in head or any(m in head for m in ANTHROPIC_CONTENT_MARKERS):
+            return None
+    else:
+        if b'"error"' not in head or b'"choices"' in head or b'"text"' in head:
+            return None
+    return head.decode(errors="replace")[:600]
+
+
 def witness_verdict(front_outstanding: int, rank_idle: bool) -> Optional[str]:
     """W3 in either direction; None when the two witnesses agree."""
     if front_outstanding == 0 and rank_idle:
@@ -1999,6 +2020,22 @@ def flip_escape_verdict(
         f"controller's own guard skips every iteration while it is not "
         f"'serving'). No retry; recovery = teardown + relaunch",
     )
+
+
+def _eb_enabled(env=None) -> bool:
+    """EB: ``SGLANG_WEG2_LEG2_ERROR_BEFORE_CONTENT`` (default on; 0 = commit the
+    200 as before)."""
+    e = os.environ if env is None else env
+    raw = (e.get("SGLANG_WEG2_LEG2_ERROR_BEFORE_CONTENT", "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _eb_reroute_enabled(env=None) -> bool:
+    """EB: ``SGLANG_WEG2_LEG2_ERROR_REROUTE`` (default on): a named D error
+    before content re-routes the rid through P once; 0 = answer 503."""
+    e = os.environ if env is None else env
+    raw = (e.get("SGLANG_WEG2_LEG2_ERROR_REROUTE", "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
 
 
 def _flip_single_flight_enabled(env=None) -> bool:
@@ -6244,6 +6281,40 @@ class Front:
                         return await self._requeue_after_x_refusal(
                             request, rid, payload, text, stream, pending, seat, first_chunk
                         )
+                # EB (NF rc12q weg2-14-52): a named D error before any content is
+                # the group's answer, not a stream -- nothing has reached the
+                # client yet, so it gets the status the non-stream twin gets
+                # (503) instead of a 200 with no text. X refusals were handled
+                # above (re-route); this is every other named refusal (W88...).
+                if stream and r.status == 200 and early_body is None and _eb_enabled():
+                    _eb = inband_error_before_content(first_chunk, request.path)
+                    if _eb is not None:
+                        self.counters["leg2_inband_error_before_content"] += 1
+                        g.outstanding.pop(rid, None)
+                        if _eb_reroute_enabled():
+                            # Operator 27.09.: the client gets an ANSWER -- the
+                            # rid goes through P once (the existing X-REQUEUE:
+                            # leg 1 on P, leg 2 on D; a second refusal ends as
+                            # the named W35). D's path is closed (it answered
+                            # terminally, this leg's connection ends here) --
+                            # one path per rid (ROS-1P).
+                            logger.error(
+                                "WEG2 LEG2-ERROR-BEFORE-CONTENT rid=%s path=%s: D answered the stream with "
+                                "a named error before any content; re-routed through P once (no empty "
+                                "200) -- %r", rid, request.path, _eb[:300])
+                            return await self._requeue_after_x_refusal(
+                                request, rid, payload, text, stream, pending, seat,
+                                _eb.encode(errors="replace"))
+                        logger.error(
+                            "WEG2 LEG2-ERROR-BEFORE-CONTENT rid=%s path=%s: D answered the stream with a "
+                            "named error before any content; the client gets 503, not an empty 200 -- %r",
+                            rid, request.path, _eb[:300])
+                        return web.json_response(
+                            {"type": "error",
+                             "error": {"type": "api_error",
+                                       "message": f"WEG2 group D refused rid={rid} before any content: "
+                                                  f"{_eb[:400]}"}},
+                            status=503)
                 _has_content = (stream and r.status == 200 and early_body is None
                                 and stream_has_content(first_chunk, request.path))
                 if _has_content:

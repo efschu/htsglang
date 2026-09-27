@@ -3491,6 +3491,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         node, write_back=True, kv_only_if_mamba_refused=True
                     )
                 if written == 0:
+                    # UD (NF rc12q PP2 16:28:19Z): a write_back leaf whose
+                    # backup is refused (arena full: #1421 arena_claim /
+                    # parent_unbacked up the chain) stays on the device, and so
+                    # does every node behind it -- EVICT-FRONTIER-CENSUS
+                    # on_frontier=1856 behind_device_child=249856, OOM. On the
+                    # local-PP floor (tp group of one: the tree is this rank's
+                    # alone) the leaf is DROPPED like a write_through leaf --
+                    # the cache content is lost (recomputable), the pool is
+                    # paid, and its parent becomes the next leaf.
+                    from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+                    if _sf.unbacked_drop_allowed(self, node):
+                        self._ud_drop_unbacked_leaf(node, tracker)
                     return
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
@@ -3535,6 +3548,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._iteratively_delete_tombstone_leaf(node, tracker)
                 return
         self._evict_to_host(node, tracker)
+
+    def _ud_drop_unbacked_leaf(
+        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+    ) -> None:
+        """UD: delete an un-backed device leaf entirely (the write_through
+        branch's own delete, with its #841 guard checked by the caller)."""
+        before = tracker.get(BASE_COMPONENT_TYPE, 0)
+        self._record_remove_event(node, medium=StorageMedium.GPU)
+        for comp in self._components_tuple:
+            self._evict_component_and_detach_lru(
+                node, comp, target=EvictLayer.ALL, tracker=tracker
+            )
+        self.evictable_device_leaves.discard(node)
+        parent = node.parent
+        self._remove_leaf_from_parent(node)
+        self._update_evictable_leaf_sets(parent)
+        self._iteratively_delete_tombstone_leaf(node, tracker)
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        _sf.note_unbacked_drop(self, node, tracker.get(BASE_COMPONENT_TYPE, 0) - before)
 
     def _evict_host_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]

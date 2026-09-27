@@ -196,6 +196,33 @@ def note_loaded(tree, rows: int) -> None:
         pass
 
 
+def unbacked_drop_allowed(tree, node) -> bool:
+    """UD (NF rc12q PP2 16:28:19Z): may an eviction DROP a write_back leaf whose
+    backup was refused? Only on the local-PP floor (the tree is this rank's own;
+    on a TP group a rank-local drop would split the replicas), only a node with
+    no children (#841: an un-backed node with children would orphan them) and
+    no write-through in flight."""
+    if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False):
+        return False
+    if getattr(node, "children", None):
+        return False
+    ongoing = getattr(tree, "ongoing_write_through", None) or {}
+    if getattr(node, "id", None) in ongoing:
+        return False
+    return True
+
+
+def note_unbacked_drop(tree, node, tokens: int) -> None:
+    n = _sampled(tree, "_weg2_sf_unbacked_drop")
+    if n is not None:
+        logger.warning(
+            "EVICT-UNBACKED-DROP node=%s tokens=%d freed=%d (n=%d): a write_back leaf whose "
+            "backup was refused (arena full / parent un-backed) is dropped on the local-PP "
+            "floor instead of blocking the whole chain behind it (NF rc12q: 249856 tokens behind "
+            "one un-backable leaf)",
+            getattr(node, "id", "?"), len(getattr(node, "key", []) or []), int(tokens), n)
+
+
 def ensure_relief_provider(scheduler) -> None:
     """SF-X: register ONE rank-local extend relief provider for this process
     (``common.register_extend_relief_provider``). It acts only while the tree's
