@@ -6171,6 +6171,29 @@ def _refuse_if_extra_drops_transient_lmo(vision: str, extra, group: str) -> None
         )
 
 
+MM_SKIP_HASH_ENV = "SGLANG_MM_SKIP_COMPUTE_HASH"
+
+
+def _refuse_if_transient_mm_hash_unstable(vision: str, env, group: str) -> None:
+    """H125d: under ``--weg2-vision transient`` an image's radix/L3 key is its
+    ``pad_value`` = ``MM_PAD_SHIFT_VALUE + hash``, computed from the pixel
+    values in P's AND in D's tokenizer (``MultimodalDataItem.set_pad_value``).
+    D reads P's pages only if both hashes agree. ``SGLANG_MM_SKIP_COMPUTE_HASH``
+    replaces the content hash with ``uuid4()`` -- a different key per process,
+    so D never matches the image and refuses it (W123) on every request.
+    Refused by name at the launch instead."""
+    if vision != VISION_TRANSIENT:
+        return
+    raw = str((env or {}).get(MM_SKIP_HASH_ENV, "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        raise Weg2LaunchRefused(
+            f"W111 Weg2VisionArmRefused: {MM_SKIP_HASH_ENV}={raw} in group {group}'s "
+            "environment -- --weg2-vision transient keys an image by its content "
+            "hash on P and D; a random per-process hash makes D's image prefix "
+            "unmatchable (W123 on every image). Unset it for this boot."
+        )
+
+
 def argv_d(
     py: str,
     model: str,
@@ -8004,6 +8027,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         env[VISION_PLACE_ENV] = vision_place
     else:
         env.pop(VISION_PLACE_ENV, None)
+    _refuse_if_transient_mm_hash_unstable(vision, env, group)
     # #1348: the exchange lane's unexecuted-line instrument. SAME DISCIPLINE
     # as SGLANG_WEG2_GROUP and the host-ring family below (R19): this is
     # LAUNCHER OUTPUT, published only when `--xchg-coverage-diff` named a
