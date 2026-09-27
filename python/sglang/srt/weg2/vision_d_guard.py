@@ -64,16 +64,30 @@ def image_spans(req: Any) -> List[Tuple[int, int]]:
     return spans
 
 
-def verdict(req: Any, covered: Optional[int]) -> str:
-    """``admit`` when every placeholder lies inside the covered prefix (or
-    there is none), ``defer`` when the group has no covered length for this
-    rid yet, ``refuse`` when D would have to encode a placeholder."""
+def image_end(req: Any) -> int:
+    """One past the last placeholder position, 0 without images."""
     spans = image_spans(req)
-    if not spans:
+    return (max(end for _, end in spans) + 1) if spans else 0
+
+
+def verdict(req: Any, covered: Optional[int], tail_start: Optional[int] = None,
+            tail_wait: bool = False) -> str:
+    """``admit`` when every placeholder lies before the first position D's
+    target computes -- the covered prefix, or the adopted tail's start when
+    the group took P's tail (``tail_adopt.peek_target_start``) -- ``defer``
+    when the group has no covered length for this rid yet or the tail would
+    cover the image in an empty batch, ``refuse`` when D would have to encode
+    a placeholder."""
+    end = image_end(req)
+    if not end:
         return ADMIT
     if covered is None:
         return DEFER
-    return ADMIT if max(end for _, end in spans) < int(covered) else REFUSE
+    if end <= int(covered):
+        return ADMIT
+    if tail_start is not None and end <= int(tail_start):
+        return ADMIT
+    return DEFER if tail_wait else REFUSE
 
 
 def bounded(verdict_now: str, rid: str, defers: Dict[str, int]) -> str:
@@ -103,3 +117,40 @@ def refusal_message(req: Any, covered: Optional[int]) -> str:
         f"spans tokens {first[0]}..{first[1]} -- the P leg's pages did not reach D's "
         f"store read. Refused by name instead of reaching _require_visual."
     )
+
+
+# -- the draft side (V2 death 11:20:26, weg2-14-72) ---------------------------------
+_DRAFT_NO_EMBEDS_N = [0]
+
+
+def note_draft_mm_without_embeds(input_embeds: Any, forward_batch: Any) -> bool:
+    """True when an MTP draft extend carries multimodal inputs but no
+    ``mm_input_embeds`` -- the caller then embeds its ids like any text
+    extend instead of asserting.
+
+    Upstream's MTP heads reuse the TARGET's input embeddings of an mm extend
+    (``general_mm_embed_routine`` leaves them in ``forward_batch.mm_input_embeds``)
+    and assert they exist. On a group without a tower that assumption breaks
+    where no target forward ran: V2 (dfce479f08) died at 11:20:26 in
+    ``_forward_skip_extend`` (E2, P's END state adopted, no target forward)
+    -> ``_draft_extend_for_prefill`` -> ``qwen4_exp_mtp._prepare_input_embeds``
+    ``assert input_embeds is not None`` on weg2-14-72 (image at the front,
+    5837 tokens). The draft only proposes -- the verifier decides -- so the
+    placeholder ids' own embeddings are a sound input, the form DFlash always
+    uses (models/dflash.py). Never an assert death; counted and named."""
+    if input_embeds is not None:
+        return False
+    _DRAFT_NO_EMBEDS_N[0] += 1
+    n = _DRAFT_NO_EMBEDS_N[0]
+    if n <= 8 or n % 256 == 0:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "W102 VISION-DRAFT NO-MM-EMBEDS n=%d mode=%s bs=%s (an mm extend reached "
+            "the MTP draft without target embeddings -- no tower on this group, or no "
+            "target forward (E2 skip): the draft embeds the ids, the verifier decides)",
+            n,
+            getattr(getattr(forward_batch, "forward_mode", None), "name", "?"),
+            getattr(forward_batch, "batch_size", "?"),
+        )
+    return True

@@ -2817,6 +2817,25 @@ class PrefillAdder:
                 # the extend is [N-1, N) as a shape only -- no forward runs
                 # (EAGLEWorkerV2 -> tail_adopt.run_skip).
                 _tail = tail_adopt.plan_adopt(req, _ea_start, batch_empty=not self.can_run_list)
+                # W123 belt (D vision guard): the guard admitted an image on
+                # the tail it READ; the target's first computed position is
+                # fixed here. An image reaching it would be prefilled by a
+                # group without a tower -- leave the request queued, the
+                # guard refuses it by name next pass. Rank-uniform inputs.
+                _vneed = int(getattr(req, "_weg2_vision_need", 0) or 0)
+                if _vneed:
+                    _tstart = _ea_start if _tail is None else (
+                        len(req.full_untruncated_fill_ids) if _tail.skip else _tail.resume_at
+                    )
+                    if _vneed > _tstart:
+                        req._weg2_vision_tail_lost = True
+                        logger.error(
+                            "W123 VISION TAIL-LOST rid=%s image_end=%d target_start=%d tail=%s "
+                            "(the adopted tail no longer covers the image; refused by name next pass)",
+                            req.rid, _vneed, _tstart,
+                            "none" if _tail is None else ("skip" if _tail.skip else "e1"),
+                        )
+                        return AddReqResult.OTHER
                 if _tail is not None:
                     _ea_start = _tail.resume_at
                 _ea_len, _ea_forced = self._weg2_end_anchor_split(
@@ -2869,6 +2888,16 @@ class PrefillAdder:
                     computed_input_len=_ea_len if _ea_forced else len(req.full_untruncated_fill_ids) - _ea_start,
                 )
             else:
+                # W123 belt, chunked form: no tail is taken on this path, the
+                # target computes from the prefix.
+                _vneed = int(getattr(req, "_weg2_vision_need", 0) or 0)
+                if _vneed > len(req.prefix_indices):
+                    req._weg2_vision_tail_lost = True
+                    logger.error(
+                        "W123 VISION TAIL-LOST rid=%s image_end=%d target_start=%d tail=chunked "
+                        "(refused by name next pass)", req.rid, _vneed, len(req.prefix_indices),
+                    )
+                    return AddReqResult.OTHER
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 

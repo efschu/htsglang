@@ -124,7 +124,7 @@ def test_the_guard_sits_after_w31_and_before_the_adder_and_is_answered_after_the
 
     src = inspect.getsource(Scheduler._get_new_batch_prefill_raw)
     w31 = src.index("self._weg2_x_refuses(req, _head_inputs)")
-    guard = src.index("self._weg2_vision_d_verdict(req, _head_inputs)")
+    guard = src.index("self._weg2_vision_d_verdict(\n                    req, _head_inputs, batch_empty=")
     adder = src.index("res = adder.add_one_req(")
     assert w31 < guard < adder
     assert src.index("self._weg2_answer_x_refusals(") < src.index(
