@@ -70,6 +70,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from sglang.srt.managers import weg2_told_fallback as _fb
+from sglang.srt.managers import weg2_told_fidelity as _tf  # TF told fidelity
 from sglang.srt.weg2 import p_twin_defer as _twin
 from sglang.srt.weg2 import prefix_trace as _pt
 
@@ -900,6 +901,8 @@ class _Pace:
     published_at: float
     published_pass: int
     window_s: float
+    #: TF: the told's unit (absolute keys vs span-relative), for the Admit check.
+    absolute: bool = True
 
 
 def _pace_intake_t(scheduler) -> Dict[str, float]:
@@ -977,6 +980,12 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             if verdict is None:
                 continue
             told_final, reason = verdict
+            if told_final > 0:
+                # TF: the Admit is PP0's own admission -- told=0 for every rank
+                # when PP0's tree cannot resume at it (weg2_told_fidelity).
+                _tf_told, _ = _tf.pp0_verdict(scheduler, p.req, told_final, p.absolute)
+                if _tf_told != told_final:
+                    told_final, reason = _tf_told, "told_fidelity"
             pacing.pop(rid, None)
             _fb.pp0_note_verdict(scheduler, rid, p.told, told_final, reason, now, p.published_at)
             admit = Weg2StoreAdmit(rid=rid, told=told_final)
@@ -991,6 +1000,18 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
         if now - p.published_at < p.window_s:
             continue
         pacing.pop(rid, None)
+        # TF (rc12k27 b1, weg2-10-95): the Admit names what PP0 ITSELF admits
+        # in this pass. Its own tree cannot resume at told -> told=0 for every
+        # rank (PF fallback marker: every read released, every stage prefills
+        # from 0) BEFORE any follower adopts -- never a start split.
+        _tf_told, _tf_own = _tf.pp0_verdict(scheduler, p.req, p.told, p.absolute)
+        if _tf_told != p.told:
+            _fb.release_own_read(scheduler, rid)
+            admit = Weg2StoreAdmit(rid=rid, told=_tf_told)
+            setattr(admit, _fb.WIRE_FALLBACK, 1)
+            told_map[rid] = _tf_told
+            out.append(admit)
+            continue
         told_map[rid] = p.told
         out.append(Weg2StoreAdmit(rid=rid, told=p.told))
         n = getattr(scheduler, "_1416e_admit_n", 0) + 1
@@ -1031,7 +1052,8 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             out.append(_cls(rid=rid, told=told, **_extra))
             continue
         window = pace_window_s(own_read_s, told)
-        pacing[rid] = _Pace(req=req, told=told, published_at=now, published_pass=pass_n, window_s=window)
+        pacing[rid] = _Pace(req=req, told=told, published_at=now, published_pass=pass_n, window_s=window,
+                            absolute=bool(absolute))
         ahead = _cls(rid=rid, told=told, paced=True, **_extra)
         if fb_on:
             # PF: ask the followers for their read state (wire marker, set
