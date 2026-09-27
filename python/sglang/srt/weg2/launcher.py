@@ -10553,6 +10553,102 @@ def served_dormant_growth(cards: List[Card], profile: Optional[str] = None) -> T
     return vals, "WEG2-DORMANT-SERVED record"
 
 
+def d_awake_rest(cards: List[Card], profile: Optional[str] = None) -> Tuple[Optional[List[Optional[int]]], str]:
+    """``D_AWAKE_REST_MIB`` of the profile per D rank (``None`` entries: not
+    measured on that rank), or ``(None, "")`` where the profile never measured
+    it (27B today: its D budget stays byte-identical). rc12c: the rest an awake
+    D rank holds beyond its BOOKED form (weg2/d_awake_rest.py)."""
+    try:
+        vals = list(_pconst("D_AWAKE_REST_MIB", profile))
+    except KeyError:
+        return None, ""
+    if len(vals) != len(cards):
+        raise Weg2LaunchRefused(
+            f"D_AWAKE_REST_MIB has {len(vals)} entries for {len(cards)} cards; "
+            f"re-measure with python -m sglang.srt.weg2.d_awake_rest")
+    return [None if v is None else int(v) for v in vals], _pconst_boots("D_AWAKE_REST_MIB", profile)
+
+
+def d_fixed_record(profile: Optional[str] = None) -> Tuple[Optional[List[Optional[float]]], str]:
+    """``D_FIXED_MIB`` of the profile (the #145 fixed post measured on the
+    form that runs today), or ``(None, "")`` -- the builtin reference stands."""
+    try:
+        vals = list(_pconst("D_FIXED_MIB", profile))
+    except KeyError:
+        return None, ""
+    return [None if v is None else float(v) for v in vals], _pconst_boots("D_FIXED_MIB", profile)
+
+
+def d_overshoot_record(profile: Optional[str] = None) -> Tuple[Optional[List[int]], str]:
+    """``D_OVERSHOOT_MIB`` (peak - budget, the qwen27b record), or ``(None, "")``
+    for a profile that prices D's awake excess as ``D_AWAKE_REST_MIB`` instead
+    (rc12c: peak - budget has no fixpoint once the budget stops binding)."""
+    try:
+        return list(_pconst("D_OVERSHOOT_MIB", profile)), _pconst_boots("D_OVERSHOOT_MIB", profile)
+    except KeyError:
+        return None, ""
+
+
+def d_card_ledger(terms: Sequence[Dict[str, object]], budgets_d: Sequence[int], label: str):
+    """rc12c: the #145 card ledger from the SAME terms ``budgets_from_dc``
+    charged, plus what its measured corridor pass took off on top."""
+    import msgspec
+
+    from sglang.srt.planner import expert_residency as _er
+
+    led = _er.DCardLedger(
+        source=f"budgets_from_dc pass {label}",
+        total_mib=tuple(float(t["total"]) for t in terms),
+        carve_mib=tuple(float(t["carve"]) for t in terms),
+        dormant_mib=tuple(float(t["dormant"]) for t in terms),
+        floor_mib=tuple(float(t["floor"]) for t in terms),
+        awake_mib=tuple(float(t["awake"]) for t in terms),
+        awake_source=tuple(str(t["awake_source"]) for t in terms),
+    )
+    extra = tuple(max(0.0, led.card_budget_mib(i) - float(b)) for i, b in enumerate(budgets_d))
+    return msgspec.structs.replace(led, corridor_pass_mib=extra)
+
+
+def d_scratch_cap(fits, scratch: Sequence[int]) -> Tuple[List[int], List[str]]:
+    """rc12c: THE CONSUMER FOLLOWS THE BOOKED BUDGET. Where the #145 balance of
+    a rank misses (262k KV no longer fits beside its expert buffer), its
+    SGLANG_MOE_SCRATCH_SLOTS is lowered to the planner's edge at the given
+    fraction -- never raised, never below the two rows the runtime needs (a
+    rank without an edge keeps its value and the refusal names it)."""
+    from sglang.srt.planner import expert_residency as _er
+
+    out = [int(s) for s in scratch]
+    lines: List[str] = []
+    for f in fits:
+        if f.verdict == "PASST":
+            continue
+        rows, s_edge = _er.scratch_edge(
+            local_experts=f.local_experts, fraction=f.fraction, max_rows=f.ceiling_max_rows)
+        if s_edge is None or s_edge >= out[f.rank]:
+            continue
+        lines.append(
+            f"SCRATCH-DECKEL rang{f.rank}: SGLANG_MOE_SCRATCH_SLOTS {out[f.rank]} -> {s_edge} "
+            f"(Planer-Kante bei f {f.fraction:.3f}: <= {rows} Zeilen x {f.n_layers * f.slot_mib:.1f} "
+            f"MiB; Budget {f.budget_mib:.0f} MiB gebucht, Verdikt vorher {f.verdict}) -- der "
+            f"Experten-Puffer folgt dem gebuchten Budget, nicht dem freien Speicher")
+        out[f.rank] = int(s_edge)
+    return out, lines
+
+
+def set_group_env(spec: str, key: str, value: str) -> str:
+    """``spec`` ('KEY=VAL;...') with ``key`` set to ``value`` (appended when
+    absent); every other entry keeps its text and its place."""
+    items = [x for x in str(spec or "").split(";") if x.strip()]
+    done = False
+    for i, item in enumerate(items):
+        if "=" in item and item.split("=", 1)[0].strip() == key:
+            items[i] = f"{key}={value}"
+            done = True
+    if not done:
+        items.append(f"{key}={value}")
+    return ";".join(items)
+
+
 def _pconst_boots(name: str, profile: Optional[str] = None) -> str:
     """``boot <tag>[,<tag>...]`` of the record behind ``name`` for ``profile``
     (H94: a record names the boots it was measured on, so the budget line says
@@ -10589,7 +10685,13 @@ def budgets_from_dc(
     dormant_growth_mib: Optional[List[int]] = None,
     dormant_growth_provenance: str = "",
     charge_driver_carve: bool = False,
+    awake_rest_mib: Optional[List[Optional[int]]] = None,
+    awake_rest_provenance: str = "",
+    terms_out: Optional[List[Dict[str, object]]] = None,
 ) -> List[int]:
+    """Per card the budget of group ``label``; ``terms_out`` (a list) receives
+    the terms per card in order, for the #145 card ledger (rc12c: the card
+    side prices the SAME terms, so budget and card cannot disagree)."""
     out = []
     # #1257c: ONE derivation, per card, for the group this budget is for.
     # ``user_reserve_by_card`` is the operator's external headroom (default 0);
@@ -10605,7 +10707,18 @@ def budgets_from_dc(
     for i, c in enumerate(cards):
         over = int(overshoot_mib[i]) if overshoot_mib is not None else 0
         cf = floors[c.uuid]
-        corridor = int(cf.mib) + D_AWAKE_OVERSHOOT_MIB
+        # rc12c (NF Dauerlauf, D TP0 died at 29.2 GiB under budgets 29624 /
+        # 29144 / 28288): where the awake rest is MEASURED against the booked
+        # form (D_AWAKE_REST_MIB, weg2/d_awake_rest.py) it is the whole
+        # awake excess -- charged instead of the builtin 404 and instead of a
+        # budget-relative overshoot, which would count it twice.
+        rest = None
+        if awake_rest_mib is not None and i < len(awake_rest_mib):
+            rest = awake_rest_mib[i]
+        if rest is not None:
+            over = 0
+        awake_builtin = D_AWAKE_OVERSHOOT_MIB if rest is None else 0
+        corridor = int(cf.mib) + awake_builtin
         # rc12 OOM (D TP0, 22:59:07Z): ``dc_mib`` is the other group's residue
         # at its FIRST sleep; a group that has served sleeps heavier
         # (P PP0 1320 -> 1802 MiB). The growth is a measured record
@@ -10616,19 +10729,32 @@ def budgets_from_dc(
         # subtracts it from predicted_free on its own, so charging it here
         # does not count it twice.
         carve = int(getattr(c, "reserved_mib", 0) or 0) if charge_driver_carve else 0
-        b = c.total_mib - corridor - dc_mib[c.uuid] - grow - over - carve
+        awake = int(rest) if rest is not None else 0
+        b = c.total_mib - corridor - dc_mib[c.uuid] - grow - over - carve - awake
         b = (b // 8) * 8
         out.append(b)
+        if terms_out is not None:
+            terms_out.append(dict(
+                total=int(c.total_mib), carve=carve, floor=int(cf.mib),
+                dormant=int(dc_mib[c.uuid]) + grow,
+                awake=(awake if rest is not None else awake_builtin + over),
+                awake_source=(
+                    f"D_AWAKE_REST_MIB {awake_rest_provenance}".strip() if rest is not None
+                    else f"awake_overshoot {awake_builtin}"
+                    + (f" + measured_awake_overshoot {over}" if over else "")),
+            ))
         log(
             f"budget {label} group={group} ordinal={i} "
             f"nvml_idx={c.nvml_index} {c.name}: "
             f"{b} MiB = total {c.total_mib} - corridor {corridor} "
-            f"(floor {cf.mib} source={cf.source} reserve={cf.reserve_mib} "
-            f"+ awake_overshoot {D_AWAKE_OVERSHOOT_MIB}) "
-            f"- dormant_other {dc_mib[c.uuid]}"
+            f"(floor {cf.mib} source={cf.source} reserve={cf.reserve_mib}"
+            + (f" + awake_overshoot {D_AWAKE_OVERSHOOT_MIB}" if rest is None else "")
+            + f") - dormant_other {dc_mib[c.uuid]}"
             + (f" - served_dormant_growth {grow} ({dormant_growth_provenance})" if grow else "")
             + (f" - driver_carve {carve} (NVML reserved)" if carve else "")
             + (f" - measured_awake_overshoot {over} ({overshoot_provenance})" if over else "")
+            + (f" - awake_rest {awake} (D_AWAKE_REST_MIB, measured against the booked "
+               f"form, not the budget; {awake_rest_provenance})" if rest is not None else "")
             + " MiB"
         )
         log(cf.line)
@@ -14584,7 +14710,8 @@ D_RANK_SOLVE_MARKER = "D-RANK VRAM (#145)"
 
 
 def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
-                          label: str, *, p_split=None, chunk_layers=None) -> None:
+                          label: str, *, p_split=None, chunk_layers=None,
+                          card_terms: Optional[Sequence[Dict[str, object]]] = None) -> None:
     """#145: die D-Seite des Planners spuckt ihre Sizing-Zahlen aus.
 
     ZWEI Zeilen, und die Reihenfolge ist Absicht:
@@ -14716,6 +14843,13 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     # min(R+S,E) mit E = Spanne + Pad, fester Rang-Posten gemessen, 262k-KV.
     from sglang.srt.planner import expert_residency as _er
 
+    # rc12c: the fixed post from the profile's record (measured on the form
+    # that runs today) and the card from the budget's own terms -- only where
+    # the profile measured D's awake rest; otherwise byte-identical.
+    _fixed_rec, _fixed_src = (d_fixed_record(ns.profile) if card_terms is not None
+                              else (None, ""))
+    _ledger = (d_card_ledger(card_terms, budgets_d, label)
+               if card_terms is not None and len(card_terms) == n else None)
     try:
         plan = _er.plan_d_residency(
             model_path=ns.model,
@@ -14739,7 +14873,43 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             seats=d_stated_seats(ns),
             seat_graph_mib=d_seat_graph_mib(ns),
             reference_seats=int(getattr(ns, "d_residency_reference_seats", 1) or 1),
+            fixed_record_mib=_fixed_rec,
+            fixed_record_source=_fixed_src,
+            card_ledger=_ledger,
         )
+        if _ledger is not None and plan.refusal is not None and plan.fits:
+            # THE CONSUMER FOLLOWS THE BOOKED BUDGET (rc12c): lower the
+            # expert scratch to the planner's edge, then solve again with it.
+            _capped, _cap_lines = d_scratch_cap(plan.fits, [int(x) for x in scratch])
+            if _cap_lines:
+                for _ln in _cap_lines:
+                    log(f"{D_RANK_SOLVE_MARKER} {label} {_ln}")
+                scratch = [float(x) for x in _capped]
+                ns.env_d = set_group_env(getattr(ns, "env_d", "") or "",
+                                         "SGLANG_MOE_SCRATCH_SLOTS",
+                                         ",".join(str(int(x)) for x in _capped))
+                _env_d = parse_group_env(ns.env_d)
+                plan = _er.plan_d_residency(
+                    model_path=ns.model,
+                    budgets_mib=[float(b) for b in budgets_d],
+                    ratios=[float(x) for x in ratios],
+                    fractions=[float(x) for x in fr_d],
+                    scratch_rows=[int(x) for x in scratch],
+                    rank_tp_ratio=",".join(tp_ratio),
+                    env_d=_env_d,
+                    reference_logs=ns.d_residency_reference_logs,
+                    kv_tokens=CONTEXT_LENGTH_TOKENS,
+                    label=label,
+                    marker=D_RANK_SOLVE_MARKER,
+                    card_reference_logs=getattr(ns, "d_card_reference_logs", "") or "",
+                    replayssm_spec=d_replayssm_spec_plan_form(ns),
+                    seats=d_stated_seats(ns),
+                    seat_graph_mib=d_seat_graph_mib(ns),
+                    reference_seats=int(getattr(ns, "d_residency_reference_seats", 1) or 1),
+                    fixed_record_mib=_fixed_rec,
+                    fixed_record_source=_fixed_src,
+                    card_ledger=_ledger,
+                )
         if d_stated_seats(ns) is not None:
             for _ln in d_seat_lines(ns):
                 log(f"{D_RANK_SOLVE_MARKER} {label} {_ln}")
@@ -14768,6 +14938,9 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             card_reference_logs=getattr(ns, "d_card_reference_logs", "") or "",
             seat_graph_mib=d_seat_graph_mib(ns),
             reference_seats=int(getattr(ns, "d_residency_reference_seats", 1) or 1),
+            fixed_record_mib=_fixed_rec,
+            fixed_record_source=_fixed_src,
+            card_ledger=_ledger,
     ), label):
         log(_ln)
     if plan.refusal is not None:
@@ -20406,12 +20579,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return int(spec_d.proc.returncode or 0)
     launch_group(spec_p, tree, log, dry)
     if dry:
-        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile))
+        _dry_terms: List[Dict[str, object]] = []
+        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), terms_out=_dry_terms)
         # #145 AN BEIDEN STELLEN -- siehe #114 direkt darunter: es gibt ZWEI
         # Stellen, an denen budgets_d entsteht, und eine Fassung, die nur die
         # untere trifft, fehlt genau im Dry-Run, wo das Gate sie sucht.
         log_d_rank_vram_solve(ns, cards, budgets_d, log, "D(dry, expectation)",
-                              p_split=p_split, chunk_layers=chunk_layers)
+                              p_split=p_split, chunk_layers=chunk_layers,
+                              card_terms=(_dry_terms if d_awake_rest(cards, ns.profile)[0] is not None else None))
         d_ratio = d_tp_ratio_decision(
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
             d_bs, getattr(ns, "env_d", "") or "",
@@ -20526,17 +20701,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # 5. group D
     _grow, _grow_prov = served_dormant_growth(cards, ns.profile)
+    _rest, _rest_prov = d_awake_rest(cards, ns.profile)
+    _over, _over_prov = d_overshoot_record(ns.profile)
+    _d_terms: List[Dict[str, object]] = []
     budgets_d = budgets_from_dc(
-        cards, dc_p, log, "D", overshoot_mib=list(_pconst("D_OVERSHOOT_MIB", ns.profile)),
-        overshoot_provenance=_pconst_boots("D_OVERSHOOT_MIB", ns.profile),
+        cards, dc_p, log, "D", overshoot_mib=_over,
+        overshoot_provenance=_over_prov,
         corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
         user_reserve_by_card=user_reserve_by_card,
         dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
         charge_driver_carve=budget_charges_driver_carve(ns.profile),
+        awake_rest_mib=_rest, awake_rest_provenance=_rest_prov, terms_out=_d_terms,
     )
     state.budgets["D"] = budgets_d
     log_d_rank_vram_solve(ns, cards, budgets_d, log, "D",
-                          p_split=p_split, chunk_layers=chunk_layers)
+                          p_split=p_split, chunk_layers=chunk_layers,
+                          card_terms=(_d_terms if _rest is not None else None))
     d_ratio = d_tp_ratio_decision(
         ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
         d_bs, getattr(ns, "env_d", "") or "",

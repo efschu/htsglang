@@ -82,53 +82,18 @@ class TheNextFlashBudgetBooksTheDriverCarve(CustomTestCase):
             self.assertGreaterEqual(with_carve[i], without[i] - c.reserved_mib - 8, c.name)
 
 
-#: the D TP0 peak demand at the card edge, per served NF Dauerlauf boot (torch
-#: OOM line: per-process NVML + the refused request) minus that boot's budget
-NF_D_ABOVE_BUDGET = {"09270007": 29890 + 80 - 29144, "09262249": 29972 + 80 - 29624,
-                     "09262302": 29819 + 158 - 29624}
-EXTEND_TRANSIENT = 270  # WEG2-VRAM-PEAK phase=chunk, max transient_mib over rc12b
+class TheNextFlashNoLongerBooksABudgetRelativeOvershoot(CustomTestCase):
+    """rc12c (27.09.): the NF D_OVERSHOOT_MIB = peak - BUDGET (826) grew by
+    exactly what the budget lost (rc12 428 -> rc12b 826 -> rc12c 1798) -- a
+    ratchet. It is withdrawn; D_AWAKE_REST_MIB (against the booked form)
+    replaces it, see test_weg2_d_awake_rest_rc12c."""
 
-
-class TheNextFlashBooksItsOwnAwakeOvershoot(CustomTestCase):
-    """H94: records only from the same checkpoint. The 489 the NF D budget
-    charged was the 27B's (boot weg2ls4b1); NF measured up to 826."""
-
-    def _nf_d(self, lines):
-        cards = _cards()
-        g, prov = L.served_dormant_growth(cards, "nextflash")
-        over = list(L._pconst("D_OVERSHOOT_MIB", "nextflash"))
-        boots = getattr(L, "_pconst_boots", lambda n, p: "boot weg2ls4b1")("D_OVERSHOOT_MIB", "nextflash")
-        kw = {}
-        if getattr(L, "budget_charges_driver_carve", None) is not None:
-            kw["charge_driver_carve"] = L.budget_charges_driver_carve("nextflash")
-        return cards, L.budgets_from_dc(cards, dict(FRESH), lines.append, "D", overshoot_mib=over,
-                                        overshoot_provenance=boots, dormant_growth_mib=g,
-                                        dormant_growth_provenance=prov, **kw)
-
-    def test_the_record_is_the_nf_maximum(self):
-        self.assertEqual(list(L._pconst("D_OVERSHOOT_MIB", "nextflash"))[0], max(NF_D_ABOVE_BUDGET.values()))
-
-    def test_the_budget_line_names_the_nf_boot(self):
-        lines = []
-        self._nf_d(lines)
-        b0 = [l for l in lines if l.startswith("budget D") and "ordinal=0 " in l][0]
-        self.assertIn("measured_awake_overshoot 826 (boot dkrnfh91bar1dauer09270007", b0)
-
-    def test_the_measured_worst_case_leaves_the_corridor_free(self):
-        lines = []
-        cards, budgets = self._nf_d(lines)
-        c = cards[0]
-        b0 = [l for l in lines if l.startswith("budget D") and "ordinal=0 " in l][0]
-        floor = int(b0.split("(floor ")[1].split(" ")[0])
-        d_max = budgets[0] + max(NF_D_ABOVE_BUDGET.values())
-        free = c.total_mib - c.reserved_mib - SERVED_P_5090 - d_max
-        self.assertGreaterEqual(free, floor, f"{b0}: worst case D {d_max} leaves {free} < law {floor}")
+    def test_nf_carries_no_d_overshoot(self):
+        self.assertEqual(L.d_overshoot_record("nextflash"), (None, ""))
 
     def test_27b_keeps_its_own_overshoot_and_provenance(self):
         self.assertEqual(list(L._pconst("D_OVERSHOOT_MIB", "qwen27b")), [489, 0, 0])
-        boots = getattr(L, "_pconst_boots", None)
-        if boots is not None:
-            self.assertEqual(boots("D_OVERSHOOT_MIB", "qwen27b"), "boot weg2ls4b1")
+        self.assertEqual(L._pconst_boots("D_OVERSHOOT_MIB", "qwen27b"), "boot weg2ls4b1")
 
 
 class TheQwen27bBudgetIsByteIdentical(CustomTestCase):

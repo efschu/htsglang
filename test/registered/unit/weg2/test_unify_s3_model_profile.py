@@ -192,9 +192,12 @@ def test_the_27b_constants_moved_unchanged_and_the_nf_row_is_separate():
     # rc12 OOM: the NF row's second own record (WEG2-DORMANT-SERVED)
     assert n["P_DORMANT_SERVED_GROWTH_MIB"].measured_on == "nextflash"
     assert "P_DORMANT_SERVED_GROWTH_MIB" not in q
-    assert n["D_OVERSHOOT_MIB"].measured_on == "nextflash"  # rc12b OOM, 27.09.
+    # rc12c OOM, 27.09.: D's awake excess against the booked form, own records
+    assert "D_OVERSHOOT_MIB" not in n
+    assert n["D_AWAKE_REST_MIB"].measured_on == "nextflash"
+    assert n["D_FIXED_MIB"].measured_on == "nextflash"
     assert set(borrowed) == set(n) - {"P_DRAFT_RESIDENT_BUDGET_MIB", "P_DORMANT_SERVED_GROWTH_MIB",
-                                      "D_OVERSHOOT_MIB"}
+                                      "D_AWAKE_REST_MIB", "D_FIXED_MIB"}
     assert set(borrowed.values()) == {"qwen27b"}
     assert F.borrowed_constants("qwen27b") == ()
     assert "P_OVERSHOOT_MIB" in F.borrowed_constants_line("nextflash")

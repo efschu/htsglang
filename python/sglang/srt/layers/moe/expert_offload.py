@@ -3099,6 +3099,59 @@ def _fetch_mode() -> str:
     return "memcpy" if v == "memcpy" else "gather"
 
 
+#: rc12c (NF D TP0, 27.09. 01:22:13Z "MoE offload gather fetch failed ...
+#: Tried to allocate 158.00 MiB"): the gather fetch materialised
+#: ``index_select(pool, rows)`` as a FRESH temporary per call -- up to all
+#: fetched rows of one tensor (158 MiB at 100 rows of w13) -- on the copy
+#: stream of THAT layer's cache. 48 layers = 48 copy streams, and the caching
+#: allocator hands a freed block only to its own stream again, so every
+#: stream kept its own cached temporaries the compute stream could never
+#: reuse (VRAM-PEAK round n=18: reserved +766 MiB of NEW segments beside 1145
+#: MiB cached). ONE persistent ring per (device, dtype, row shape) replaces
+#: them: the gather runs in chunks of ``GATHER_RING_ROWS`` rows through it,
+#: and an event recorded after each use orders the next user stream behind it
+#: (the PCIe link serialises these copies anyway). 16 rows of the NF w13 are
+#: ~25 MiB, all four tensors ~39 MiB per rank -- a fixed post the awake rest
+#: (weg2/d_awake_rest.py) measures, where the temporaries were not.
+GATHER_RING_ROWS = 16
+_GATHER_RINGS: dict = {}
+
+
+def gather_rows_into(dst, slots_t, pool_dev, rows_t, *, ring_rows: int, stream=None) -> None:
+    """``dst[slots_t] = pool_dev[rows_t]`` through the shared ring, chunk by
+    chunk -- byte-identical to ``dst.index_copy_(0, slots_t,
+    torch.index_select(pool_dev, 0, rows_t))`` without its temporary. The ring
+    is allocated once (on first use) and never freed, so no per-stream cached
+    block is left behind; ``stream`` (the copy stream issuing this gather)
+    waits for the ring's previous user and records the next event."""
+    import torch
+
+    n = int(rows_t.numel())
+    if n == 0:
+        return
+    key = (str(dst.device), dst.dtype, tuple(dst.shape[1:]))
+    entry = _GATHER_RINGS.get(key)
+    if entry is None:
+        entry = [
+            torch.empty((int(ring_rows),) + tuple(dst.shape[1:]), dtype=dst.dtype, device=dst.device),
+            None,
+        ]
+        _GATHER_RINGS[key] = entry
+    ring, last = entry
+    if stream is not None and last is not None:
+        stream.wait_event(last)
+    k = int(ring.shape[0])
+    for a in range(0, n, k):
+        b = min(n, a + k)
+        buf = ring[: b - a]
+        torch.index_select(pool_dev, 0, rows_t[a:b], out=buf)
+        dst.index_copy_(0, slots_t[a:b], buf)
+    if stream is not None:
+        ev = torch.cuda.Event()
+        ev.record(stream)
+        entry[1] = ev
+
+
 def device_view_of_pinned(pinned):  # pragma: no cover - requires CUDA
     """Return a CUDA tensor aliasing ``pinned`` (no copy; UVA zero-copy view).
 
@@ -3849,11 +3902,19 @@ class MoEExpertOffloadCache:
             import numpy as np
             rows_t = _h2d_i64(np.asarray(rows, dtype=np.int64), dev)
             slots_t = _h2d_i64(np.asarray(slots, dtype=np.int64), dev)
+            # rc12c: through the shared ring, except under graph capture
+            # (a cross-stream event wait is not legal there; the captured
+            # form keeps its own pool and never frees the temporary anyway).
+            capturing = torch.cuda.is_current_stream_capturing()
             for attr in self._pinned:
                 spill = self._pinned.get(attr)
                 dst = self._resident[attr]
                 pool_dev = self._uva_pool_view(attr, spill)
-                dst.index_copy_(0, slots_t, torch.index_select(pool_dev, 0, rows_t))
+                if capturing:
+                    dst.index_copy_(0, slots_t, torch.index_select(pool_dev, 0, rows_t))
+                else:
+                    gather_rows_into(dst, slots_t, pool_dev, rows_t,
+                                     ring_rows=GATHER_RING_ROWS, stream=self._stream)
                 moved += dst[0].numel() * dst.element_size() * len(rows)
 
         def _copies():

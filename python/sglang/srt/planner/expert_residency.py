@@ -1158,6 +1158,138 @@ def describe_card(card: DCardFit, reference: DCardReference) -> str:
     )
 
 
+class DCardLedger(msgspec.Struct, frozen=True, kw_only=True):
+    """rc12c (NF Dauerlauf, 27.09.): die KARTE eines D-Rangs aus DENSELBEN
+    Termen, aus denen der Launcher sein Budget zieht (``budgets_from_dc``),
+    statt aus einem Referenz-Boot einer alten Form.
+
+    Die H33-Karte rechnete gegen fnFL2x151/x158 (Kopfraum 4944 MiB bei 94
+    Zeilen), die Budget-Bilanz gegen deren festen Posten 7264 MiB -- zwei
+    Seiten einer Naht, und sie widersprachen sich: rc12c druckte "Rest nach KV
+    1202 -> PASST" neben "Decode frei -1096 -> KORRIDOR GERISSEN (Befund, kein
+    Stopper)", und D TP0 starb an der Kante. Hier ist die Karte die Bilanz
+    ``total - carve - schlafend - wach - Posten >= Floor`` mit ``wach`` =
+    gemessener Rest gegen die gebuchte Form (``D_AWAKE_REST_MIB``,
+    weg2/d_awake_rest.py) bzw. dort, wo er nicht gemessen ist, dem, was das
+    Budget oberhalb des Floors abzieht (404 + Overshoot). Budget und Karte
+    sagen damit per Konstruktion dasselbe -- getestet, nicht angenommen."""
+
+    source: str
+    total_mib: Tuple[float, ...]
+    carve_mib: Tuple[float, ...]
+    #: dormant_other + served_dormant_growth der anderen Gruppe
+    dormant_mib: Tuple[float, ...]
+    floor_mib: Tuple[float, ...]
+    awake_mib: Tuple[float, ...]
+    awake_source: Tuple[str, ...]
+    #: what the launcher's measured corridor pass took off the formula on top
+    #: (``corridor_budget.solve_corridor_budgets`` may only lower a budget)
+    corridor_pass_mib: Tuple[float, ...] = ()
+
+    def card_budget_mib(self, r: int) -> float:
+        """Was die Karte den Posten von Rang ``r`` laesst, in der 8-MiB-
+        Koernung von ``budgets_from_dc`` (sonst stritten beide Seiten um
+        weniger als 8 MiB)."""
+        b = (
+            float(self.total_mib[r])
+            - float(self.floor_mib[r])
+            - float(self.dormant_mib[r])
+            - float(self.carve_mib[r])
+            - float(self.awake_mib[r])
+        )
+        b = float((int(b) // 8) * 8)
+        if r < len(self.corridor_pass_mib):
+            b -= float(self.corridor_pass_mib[r])
+        return b
+
+
+def solve_d_card_ledger(
+    *, fits: Sequence[DRankResidency], ledger: DCardLedger
+) -> Tuple[DCardFit, ...]:
+    """Je D-Rang die Karte aus dem Ledger: frei am Worst-Case-Peak =
+    ``Floor + Kartenbudget - Posten`` (Posten = dieselben, die die Budget-
+    Bilanz rechnet, inkl. Aktivierung und 262k-KV), gemessen gegen den Floor.
+    ``near_oom`` und ``band_floor`` sind hier beide der Floor: unter ihm
+    verweigert die Budget-Seite (262K VERFEHLT), also auch die Karte."""
+    n = len(fits)
+    if len(ledger.total_mib) != n:
+        raise ValueError(
+            f"solve_d_card_ledger: {n} Raenge, aber das Ledger ({ledger.source}) "
+            f"hat {len(ledger.total_mib)}"
+        )
+    out: List[DCardFit] = []
+    for fit in fits:
+        r = fit.rank
+        layer_mib = float(fit.n_layers) * float(fit.slot_mib)
+        posts = float(fit.budget_mib) - float(fit.kv_rest_mib)
+        non_buffer = posts - float(fit.expert_mib)
+        card_budget = ledger.card_budget_mib(r)
+        floor = float(ledger.floor_mib[r])
+        max_rows = int(math.floor((card_budget - non_buffer) / layer_mib))
+        out.append(
+            DCardFit(
+                rank=r,
+                fraction=float(fit.fraction),
+                scratch_rows=int(fit.scratch_rows),
+                local_experts=int(fit.local_experts),
+                buffer_rows=int(fit.buffer_rows),
+                ref_buffer_rows=int(fit.buffer_rows),
+                layer_row_mib=layer_mib,
+                expert_delta_mib=0.0,
+                vocab_delta_mib=float(fit.draft_vocab_delta_mib),
+                headroom_mib=floor + card_budget - posts,
+                free_decode_mib=None,
+                near_oom_mib=floor,
+                band_floor_mib=floor,
+                ceiling_fraction=largest_fraction_for_rows(
+                    local_experts=int(fit.local_experts),
+                    scratch_rows=int(fit.scratch_rows),
+                    max_rows=max_rows,
+                ),
+                ceiling_max_rows=max_rows,
+            )
+        )
+    return tuple(out)
+
+
+def describe_card_ledger(card: DCardFit, fit: DRankResidency, ledger: DCardLedger) -> str:
+    r = card.rank
+    edge = scratch_edge(
+        local_experts=card.local_experts,
+        fraction=card.fraction,
+        max_rows=card.ceiling_max_rows,
+    )
+    posts = float(fit.budget_mib) - float(fit.kv_rest_mib)
+    return (
+        "rang%d: total %.0f - carve %.0f - schlafend %.0f - wach %.0f (%s) - Posten "
+        "%.0f (Puffer %s Zeilen %.0f + fest %.0f + mamba %.0f + spec %.0f + Aktivierung "
+        "%.0f + KV %.0f) = frei %.0f MiB am Worst-Case-Peak (Floor %.0f) -> %s | "
+        "KANTE bei f %.3f: <= %d Zeilen = SCRATCH <= %s"
+        % (
+            r,
+            ledger.total_mib[r],
+            ledger.carve_mib[r],
+            ledger.dormant_mib[r],
+            ledger.awake_mib[r],
+            ledger.awake_source[r],
+            posts,
+            card.buffer_rows if card.buffer_rows >= 0 else "KEIN",
+            fit.expert_mib,
+            fit.fixed_mib + fit.draft_vocab_delta_mib,
+            fit.mamba_mib,
+            fit.spec_mib,
+            fit.activation_mib,
+            fit.kv_mib,
+            card.headroom_mib,
+            card.near_oom_mib,
+            "PASST" if card.headroom_mib >= card.near_oom_mib else "STIRBT AN DER KARTE",
+            card.fraction,
+            edge[0],
+            "KEINE" if edge[1] is None else edge[1],
+        )
+    )
+
+
 def card_refusal_text(
     cards: Sequence[DCardFit], reference: DCardReference, *, label: str
 ) -> Optional[str]:
@@ -2147,8 +2279,17 @@ def plan_d_residency(
     seats: Optional[int] = None,
     seat_graph_mib: Optional[Sequence[float]] = None,
     reference_seats: int = 1,
+    fixed_record_mib: Optional[Sequence[Optional[float]]] = None,
+    fixed_record_source: str = "",
+    card_ledger: Optional[DCardLedger] = None,
 ) -> DResidencyPlan:
     """Der D-FRACTION-SOLVE mit den Metallregeln, fuer ``launcher``.
+
+    rc12c: ``fixed_record_mib`` = der feste Rang-Posten aus dem Record des
+    Profils (``D_FIXED_MIB``, gemessen auf der Form, die heute faehrt); ein
+    ``None``-Eintrag laesst den Referenz-Posten stehen. ``card_ledger`` ersetzt
+    die H33-Karte aus dem Referenz-Boot durch die Karte aus den Budget-Termen
+    (:class:`DCardLedger`); ohne beide bleibt die Rechnung byte-gleich.
 
     H91b: ``seats`` = D's wirksame --max-running-requests. Weicht sie von den
     Sitzen der Referenz ab, werden die sitz-proportionalen Posten umgebucht
@@ -2265,6 +2406,31 @@ def plan_d_residency(
                 "unveraendert"
                 % (marker, label, spec_form_text(replayssm_spec.ring_len), ref.source),
             )
+    fixed_lines: Tuple[str, ...] = ()
+    if fixed_record_mib is not None:
+        if len(fixed_record_mib) != n:
+            raise ValueError(
+                "D_FIXED_MIB hat %d Eintraege, die D-Gruppe %d Raenge"
+                % (len(fixed_record_mib), n)
+            )
+        old = tuple(ref.fixed_mib)
+        new = tuple(
+            float(v) if v is not None else float(o)
+            for v, o in zip(fixed_record_mib, old)
+        )
+        ref = msgspec.structs.replace(ref, fixed_mib=new)
+        fixed_lines = (
+            "%s FRACTION-SOLVE %s FEST (rc12c): fester Rang-Posten aus dem Record "
+            "D_FIXED_MIB (%s) %s statt %s aus %s"
+            % (
+                marker,
+                label,
+                fixed_record_source or "Profil-Record",
+                ["%.0f" % x for x in new],
+                ["%.0f" % x for x in old],
+                ref.source,
+            ),
+        )
     share = draft_share_embed(env_d)
     staging = int(str(env_d.get(POOL_STAGING_ENV, "")).strip() or POOL_STAGING_DEFAULT)
     vocab = draft_vocab_mib(
@@ -2325,7 +2491,7 @@ def plan_d_residency(
             dcp_note,
         )
     )
-    lines = (head,) + seat_lines + spec_lines + tuple(
+    lines = (head,) + seat_lines + spec_lines + fixed_lines + tuple(
         "%s FRACTION-SOLVE %s %s" % (marker, label, describe_rank(f)) for f in fits
     )
     step_lines, step_refusal = pool_step_rows_check(
@@ -2339,6 +2505,43 @@ def plan_d_residency(
         waves=pool_overflow_waves(env_d),
     )
     lines = lines + step_lines
+    if card_ledger is not None:
+        cards = solve_d_card_ledger(fits=fits, ledger=card_ledger)
+        card_lines = (
+            "%s KARTE %s (rc12c, aus den Budget-Termen %s): frei am Worst-Case-"
+            "Peak = total - carve - schlafend - wach - Posten, gegen den Floor; "
+            "'wach' ist der gemessene Rest gegen die GEBUCHTE Form, nie gegen das "
+            "Budget -- dieselbe Bilanz wie die Budget-Zeile, von der Karte her"
+            % (marker, label, card_ledger.source),
+        ) + tuple(
+            "%s KARTE %s %s" % (marker, label, describe_card_ledger(c, f, card_ledger))
+            for c, f in zip(cards, fits)
+        )
+        bad = [c for c in cards if c.headroom_mib < c.near_oom_mib]
+        card_refusal = (
+            "%s (%s): die Karte traegt die gebuchte Form nicht -- %s (Ledger %s)"
+            % (
+                CARD_REFUSAL_CODE,
+                label,
+                "; ".join(
+                    "rang%d frei %.0f < Floor %.0f MiB, Kante <= %d Zeilen"
+                    % (c.rank, c.headroom_mib, c.near_oom_mib, c.ceiling_max_rows)
+                    for c in bad
+                ),
+                card_ledger.source,
+            )
+            if bad
+            else None
+        )
+        refusals = [
+            t for t in (refusal_text(fits, label=label), card_refusal, step_refusal) if t
+        ]
+        return DResidencyPlan(
+            lines=lines + card_lines,
+            refusal="; ".join(refusals) if refusals else None,
+            fits=fits,
+            card_fits=cards,
+        )
     card_lines, cards, card_refusal = _plan_d_card(
         fits=fits,
         model_path=model_path,

@@ -62,9 +62,13 @@ class TestRecordsAreTheOldLiterals(unittest.TestCase):
         row = F.PROFILES["nextflash"]
         self.assertEqual(row.constant("P_DRAFT_RESIDENT_BUDGET_MIB"), 615.7 + 1522.7)
         self.assertEqual(row.constants["P_DRAFT_RESIDENT_BUDGET_MIB"].measured_on, "nextflash")
-        # rc12b OOM (27.09.): the NF row measures its own D awake overshoot
-        self.assertEqual(row.constant("D_OVERSHOOT_MIB"), (826, 0, 0))
-        self.assertEqual(row.constants["D_OVERSHOOT_MIB"].measured_on, "nextflash")
+        # rc12c (27.09.): the NF row prices D's awake excess against the
+        # booked form (D_AWAKE_REST_MIB) instead of against the budget
+        # (D_OVERSHOOT_MIB, a ratchet without fixpoint) -- neither its own
+        # nor a borrowed D_OVERSHOOT_MIB any more
+        self.assertNotIn("D_OVERSHOOT_MIB", row.constants)
+        self.assertEqual(row.constant("D_AWAKE_REST_MIB"), (3186, None, None))
+        self.assertEqual(row.constant("D_FIXED_MIB"), (7442, 1036, 914))
         got = dict(F.borrowed_constants("nextflash"))
         self.assertEqual(set(got), set(OLD_27B) - {"P_DRAFT_RESIDENT_BUDGET_MIB", "D_OVERSHOOT_MIB"})
         self.assertEqual(set(got.values()), {"qwen27b"})

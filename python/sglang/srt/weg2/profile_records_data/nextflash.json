@@ -35,17 +35,36 @@
    "power_limit_source": "not a power-dependent quantity (bytes a sleeping rank keeps)"
   },
   {
-   "name": "D_OVERSHOOT_MIB",
+   "name": "D_FIXED_MIB",
    "value": [
-    826,
-    0,
-    0
+    7442,
+    1036,
+    914
    ],
-   "provenance": "NF D awake overshoot = D TP0 peak demand at the card edge - its budget, max over the served NF Dauerlauf boots (per-process NVML in the torch OOM line + the refused request): dkrnfh91bar1dauer09270007 (c6868a1e13) 29890+80-29144 = 826 (14.5 min, includes the run's drift: D untagged sleep residue 1824->2310, allocated 28415->28749); 09262249 (530fb713ce) 29972+80-29624 = 428 (4 min); 09262302 29819+158-29624 = 353. Includes the extend transient in flight at the edge. 3080 ranks: no edge reached on NF, 0 as before. Replaces the qwen27b borrow (489, boot weg2ls4b1).",
+   "provenance": "#145 fixed post per D rank = 'weights + runtime state' of the runtime's own KV budget posts line - buffer x 48 x 2.417 MiB (weg2/d_awake_rest.py), max over the NF Dauerlauf boots rc12 (530fb713ce, two boots), rc12b (c6868a1e13), rc12c (2e3e38b87c): TP0 20436 - 112 x 116.0 = 7442 in all four; replaces the fnFL2x151/x158 reference 7264/1044/922 the solve priced the form with (rc12c: 'Rest nach KV 1202 -> PASST' beside a card that died).",
    "boots": [
-    "dkrnfh91bar1dauer09270007",
     "dkrnfh91bar1dauer09262249",
-    "dkrnfh91bar1dauer09262302"
+    "dkrnfh91bar1dauer09262302",
+    "dkrnfh91bar1dauer09270007",
+    "dkrnfh91bar1dauer09270103"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not a power-dependent quantity (bytes the form holds after load)"
+  },
+  {
+   "name": "D_AWAKE_REST_MIB",
+   "value": [
+    3186,
+    null,
+    null
+   ],
+   "provenance": "rc12c: what the awake D rank holds BEYOND its booked form, measured against the form and never against the budget (weg2/d_awake_rest.py): demand at the edge (torch OOM line: capacity - free - other processes + refused request) - the form's posts (W+R + mamba + spec + activation + 262144 x cell, same log). TP0: rc12 3129 and 3077, rc12b 3039, rc12c 3186 -- under budgets 29624/29624/29144/28288 the rest stays 3039-3186 (the budget-relative D_OVERSHOOT_MIB it replaces went 428/353/826/1798: no fixpoint). Covers CUDA graphs 498, untagged 2036-2340, unreusable allocator/private-pool cache, unattributed 331-362 at the edge. LOWER bound (the rank died there). 3080 ranks: no edge on NF, not measured (null: the builtin 404 stays there).",
+   "boots": [
+    "dkrnfh91bar1dauer09262249",
+    "dkrnfh91bar1dauer09262302",
+    "dkrnfh91bar1dauer09270007",
+    "dkrnfh91bar1dauer09270103"
    ],
    "kind": "memory",
    "power_limit_w": null,
