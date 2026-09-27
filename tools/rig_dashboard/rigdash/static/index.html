@@ -52,7 +52,8 @@ section.card { background: var(--surface); border: 1px solid var(--line); border
 h2 { font-size: 15px; margin: 0 0 10px; font-weight: 650; }
 h2 .muted, .muted { color: var(--muted); font-weight: 400; }
 .boot-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin-bottom: 12px; }
-.boot-head .model { font-size: 17px; font-weight: 650; }
+.boot-head .model { font-size: 17px; font-weight: 650; overflow-wrap: anywhere; }
+.boot-head .chip { white-space: normal; }
 .badge { font-size: 12px; font-weight: 650; padding: 2px 9px; border-radius: 6px;
   border: 1px solid var(--line); background: var(--surface-2); }
 .badge.live { color: var(--good); } .badge.dead { color: var(--bad); }
@@ -259,7 +260,9 @@ function bootCard(b, now, binders) {
   const c = b.container;
   const fr = b.front;
   const awake = fr && fr.awake ? fr.awake : (b.awake ? b.awake.awake : null);
-  const flipping = b.live && (fr ? fr.state && /flip/i.test(fr.state) : !!b.flip_open);
+  // the front's own state word (e.g. "flipping" also covers the drain before the legs run)
+  const frState = b.live && fr && fr.state && fr.state !== "serving" ? fr.state : null;
+  const flipping = b.live && !fr && !!b.flip_open;
   const flips = b.flips || [];
   const lastFlip = flips.length ? flips[flips.length - 1] : null;
   const health = Object.values(b.health || {}).filter((h) => now - h.t < 120 && !h.alive);
@@ -276,7 +279,7 @@ function bootCard(b, now, binders) {
     <div class="boot-head">
       <span class="model">${esc(m.model || b.stem)}</span>
       <span class="badge ${b.live ? "live" : "dead"}">${b.live ? "LIVE" : "kein Log seit " + ago(b.age_s)}</span>
-      ${awake ? `<span class="badge phase">wach: ${esc(awake)}${flipping ? " &middot; flippt" : ""}</span>` : ""}
+      ${awake ? `<span class="badge phase">wach: ${esc(awake)}${frState ? " &middot; Front: " + esc(frState) : flipping ? " &middot; flippt" : ""}</span>` : ""}
       ${c ? `<span class="chip ${c.State === "running" ? "ok" : "bad"}">${esc(c.Names)} &middot; ${esc(c.Status)}</span>` : `<span class="chip warn">kein laufender Container zu diesem Log</span>`}
       ${health.length ? `<span class="chip bad">Gruppe ${health.map((h) => esc(h.group)).join(", ")} tot (WEG2-HEALTH)</span>` : ""}
     </div>
