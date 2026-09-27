@@ -301,13 +301,20 @@ def arena_ref_pages(pool, host_indices) -> int:
     """#1424e census: how many arena pages (one reader reference each) these
     host rows name -- the release's own rule (``release_queued_rows``): arena
     rows only, one per page of P token ids."""
+    return int(arena_ref_slots(pool, host_indices).numel())
+
+
+def arena_ref_slots(pool, host_indices) -> torch.Tensor:
+    """#1424g: the arena slots (one reader reference each) these host rows
+    name, by the same rule as ``arena_ref_pages`` -- int64, unique per call."""
+    empty = torch.empty(0, dtype=torch.int64)
     if host_indices is None or getattr(pool, "arena", None) is None:
-        return 0
+        return empty
     idx = torch.as_tensor(host_indices).reshape(-1).cpu().to(torch.int64)
     if idx.numel() == 0:
-        return 0
+        return empty
     rows = torch.unique(idx[_arena_mask(pool, idx)]) - int(pool.staging_rows)
-    return int(_slots_of_rows(pool, rows).numel()) if rows.numel() else 0
+    return _slots_of_rows(pool, rows) if rows.numel() else empty
 
 
 def _claim_duplicates(slots, st):

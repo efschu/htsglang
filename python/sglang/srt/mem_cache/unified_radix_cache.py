@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import time
+import weakref
 
 from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
@@ -620,6 +621,25 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+#: #1424g: the trees of THIS process armed by init_hicache -- the orphan pass
+#: of one names the holders of every other on the same arena (their ledger is
+#: shared: one per file and process).
+_WEG2_ARMED_TREES: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def _weg2_prefetch_resolved_rows(rec):
+    """#1424g: the rows of a store prefetch whose reader reference the resolve
+    has taken -- ``host_indices[:operation.completed_tokens]`` (the IO thread
+    counts a batch after its references are in). A record without an
+    operation counter counts whole."""
+    rows = getattr(rec, "host_indices", None)
+    op = getattr(rec, "operation", None)
+    done = getattr(op, "completed_tokens", None)
+    if rows is None or done is None:
+        return rows
+    return rows.reshape(-1)[: max(0, int(done))]
+
+
 #: #1175: how many rids' completion readings the ring report keeps. Sized
 #: far above any plausible waiting queue (the report only ever needs the
 #: rids currently queued), so the cap is a leak bound, never a policy.
@@ -1230,11 +1250,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if skipped:
             # #1424e: a skipped node's reference is not given back here, and the
             # in-flight host op that locked it dies with this reset (its record
-            # is dropped by _reset_full) -- nothing gives it back later. Named,
-            # not fixed: rc12p, 9 D resets, skipped_in_use=0.
+            # is dropped by _reset_full). #1424g: the reset's orphan give-back
+            # (`_weg2_release_orphan_refs`, after the controller stopped) returns it.
             logger.warning(
                 "#1424e ARENA-REF RESET-SKIPPED n=%d nodes=%s -- references of in-use nodes "
-                "this reset does not give back and no later path releases (a leak by name)",
+                "this release does not give back; the reset's orphan give-back (#1424g) does",
                 skipped, skipped_named[:16])
         return released
 
@@ -1290,6 +1310,153 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         "them is over)", released, failed, reason)
         return released
 
+    def _weg2_release_queued_refs_before_reset(self) -> int:
+        """#1424g: the arena rows waiting in the host release queues hold the
+        reader reference their resolve took (SGLANG_HICACHE_ARENA_QUEUE_REFS:
+        the drain gives it back, ``_free_arena_rows``). The drain is the
+        group's MIN of the queue sizes, and the controller reset CLEARS the
+        queues -- every row still queued at a reset lost its release for good.
+        Given back here, one queued entry at a time (#989b: two entries on the
+        same pages are two references), by the pool's own release rule
+        (arena rows only, pending writes skipped, never beyond this process's
+        ledger). Host bookkeeping only; returns the references given back."""
+        cc = getattr(self, "cache_controller", None)
+        if cc is None or not getattr(cc, "enable_storage", False):
+            return 0  # the controller reset keeps the queues then; the drain still owns them
+        pools = self._weg2_arena_pools()
+        base = pools.get(BASE_COMPONENT_TYPE)
+        todo = []
+        q = getattr(cc, "host_mem_release_queue", None)
+        if base is not None and q is not None:
+            todo += [(base, t) for t in list(getattr(q, "queue", ()))]
+        for name, xq in list((getattr(cc, "extra_host_mem_release_queues", None) or {}).items()):
+            try:
+                entry = cc.entry_for_extra_release(name)
+            except Exception:  # noqa: BLE001 - an unknown queue has no arena pool
+                entry = None
+            pool = getattr(entry, "host_pool", None)
+            if pool is not None and any(p is pool for p in pools.values()):
+                todo += [(pool, t) for t in list(getattr(xq, "queue", ()))]
+        released = entries = 0
+        for pool, rows in todo:
+            if getattr(getattr(pool, "arena", None), "_ledger", None) is None:
+                continue  # without the ledger the drain never gave these back either
+            try:
+                n = int(pool.release_tree_rows(torch.as_tensor(rows).reshape(-1).cpu()))
+            except Exception as exc:  # noqa: BLE001 - the reset must happen
+                logger.warning("#1424g ARENA-REF RESET-QUEUE release raised: %r", exc)
+                continue
+            released += n
+            entries += int(n > 0)
+        if released:
+            logger.info(
+                "#1424g ARENA-REF RESET-QUEUE released=%d entries=%d of %d queued (the controller "
+                "reset drops the release queues; their arena rows' references go back first)",
+                released, entries, len(todo))
+        return released
+
+    def _weg2_release_orphan_refs(self, where: str) -> int:
+        """#1424g (rc12q D-TP0 15:56:23 / 16:00:05: ``ARENA-REF-HOLDERS
+        at=reset tree=0 sum=0 own_held=1016 gap=1016``, 18.6 % of the KV arena
+        pinned by nobody, then ``ARENA-CLAIM REFUSED (4 = no free slot)`` and
+        ``BACKUP-REFUSED why=arena_claim``): after the reset this process's
+        reference ledger must hold exactly what a surviving holder names --
+        the carrier hold (group P), a prefetch or retired record, a queued row
+        (all empty after the reset but counted if not). Every reference beyond
+        that has no holder left: its node, record or queue entry died with the
+        tree, and nothing will ever release it. Given back here, per slot at
+        most ``held - named``, through the ledger (never another process's
+        reference, never below what this process holds).
+
+        Classes that end here: a node the reset skipped (#1424e RESET-SKIPPED,
+        in-flight op dropped with the tree), a slot two tree nodes named (the
+        reset releases one per slot), a reference a path took outside every
+        holder class. Host bookkeeping only (one torch pass per pool, one C
+        call). Returns the references given back."""
+        if not getattr(self, "_weg2_orphan_sweep_armed", False):
+            return 0  # a tree init_hicache never armed (a desk shell sharing a process)
+        done = getattr(self, "_weg2_reset_orphans", None)
+        if done is None:
+            done = self._weg2_reset_orphans = {}
+        total = 0
+        for ct, pool in self._weg2_arena_pools().items():
+            arena = pool.arena
+            led = getattr(arena, "_ledger", None)
+            if led is None:
+                continue
+            named = torch.zeros(int(led.held.numel()), dtype=torch.int64)
+            for tree in {id(t): t for t in list(_WEG2_ARMED_TREES) + [self]}.values():
+                tree._weg2_name_holders(arena, named)
+            with led.lock:
+                held = led.held.to(torch.int64).clone()
+            orphan = (held - named).clamp_min(0)
+            slots = torch.nonzero(orphan).reshape(-1)
+            if slots.numel() == 0:
+                continue
+            multi = torch.repeat_interleave(slots, orphan[slots])
+            given = int(arena.ref_slots_np(multi.numpy(), -1))
+            done[ct] = int(done.get(ct, 0)) + given
+            total += given
+            logger.warning(
+                "#1424g ARENA-REF RESET-ORPHANS at=%s pool=%s released=%d slots=%d first=%s "
+                "(this process's references no holder names after the reset -- node, record or "
+                "queue entry died with the tree; given back so the arena can evict them) "
+                "cumulative=%d",
+                where, getattr(ct, "name", ct), given, int(slots.numel()),
+                slots[:8].tolist(), done[ct])
+        return total
+
+    def _weg2_name_holders(self, arena, named) -> None:
+        """#1424g: add to ``named`` (per slot of ``arena``) every reference a
+        holder of THIS tree names on it -- tree rows, carrier hold, prefetch
+        (resolved part) and retired records, queued release rows."""
+        from sglang.srt.mem_cache.pool_host.arena_pool import arena_ref_slots
+
+        for ct, pool in self._weg2_arena_pools().items():
+            if pool.arena is not arena and os.path.realpath(str(getattr(pool.arena, "path", "a"))) != \
+                    os.path.realpath(str(getattr(arena, "path", "b"))):
+                continue
+
+            def _name(rows, pool=pool, named=named):
+                s = arena_ref_slots(pool, rows)
+                s = s[(s >= 0) & (s < named.numel())]
+                if s.numel():
+                    named.index_add_(0, s, torch.ones(s.numel(), dtype=torch.int64))
+
+            for p, vals in list((getattr(self, "_weg2_carrier_rows", None) or {}).values()):
+                if p is pool:
+                    for v in vals:
+                        _name(v)
+            recs = list((getattr(self, "ongoing_prefetch", None) or {}).values()) + list(
+                getattr(self, "_retired_prefetch", None) or ())
+            for rec in recs:
+                if ct == BASE_COMPONENT_TYPE:
+                    _name(_weg2_prefetch_resolved_rows(rec))
+                else:
+                    for x in (getattr(rec, "comp_xfers", None) or {}).get(ct, ()):
+                        _name(getattr(x, "host_indices", None))
+            root = getattr(self, "root_node", None)
+            stack = list(root.children.values()) if root is not None else []
+            while stack:
+                node = stack.pop()
+                stack.extend(list(node.children.values()))
+                cd = node.component_data[ct]
+                if cd.host_value is not None:
+                    _name(cd.host_value)
+            cc = getattr(self, "cache_controller", None)
+            q = getattr(cc, "host_mem_release_queue", None) if cc is not None else None
+            if ct == BASE_COMPONENT_TYPE and q is not None:
+                for t in list(getattr(q, "queue", ())):
+                    _name(t)
+            for name, xq in list((getattr(cc, "extra_host_mem_release_queues", None) or {}).items()):
+                try:
+                    owner = getattr(cc.entry_for_extra_release(name), "host_pool", None)
+                except Exception:  # noqa: BLE001 - an unknown queue names no arena pool
+                    owner = None
+                if owner is pool:
+                    for t in list(getattr(xq, "queue", ())):
+                        _name(t)
+
     def _weg2_arena_pools(self) -> dict:
         """#1424e: {component type: arena host pool} of this tree."""
         out = {}
@@ -1313,7 +1480,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         * queue: rows waiting in the host release queue (KV);
         * carrier: END anchors held across D's phase (group P, mamba);
         * gap = own_held - sum: this process's references no class names (a
-          holder outside the tree, or a leak).
+          holder outside the tree, or a leak);
+        * reset_orphans (#1424g): references the resets of this process gave
+          back because no holder named them any more (cumulative) -- the gap
+          a reset used to leave behind for good.
+
+        A prefetch counts its RESOLVED pages only (``completed_tokens``, the
+        IO thread's count after it took the page's reference): the rows past
+        it name slots the resolve has not referenced yet (27B rc12q b1: gap
+        -132321 = -prefetch under load).
 
         Called by the ARENA-REF-CENSUS thread (60 s) and once per reset; a
         snapshot, never exact under a concurrent round."""
@@ -1341,7 +1516,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             def _rec_pages(rec, ct=ct, pool=pool):
                 if ct == BASE_COMPONENT_TYPE:
-                    return arena_ref_pages(pool, rec.host_indices)
+                    return arena_ref_pages(pool, _weg2_prefetch_resolved_rows(rec))
                 return sum(arena_ref_pages(pool, getattr(x, "host_indices", None))
                            for x in (rec.comp_xfers or {}).get(ct, ()))
 
@@ -1358,11 +1533,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             total = tree + in_use + prefetch + retired + queue + carrier
             led = getattr(pool.arena, "_ledger", None)
             own = int(led.held.sum()) if led is not None else None
+            orphans = int((getattr(self, "_weg2_reset_orphans", None) or {}).get(ct, 0))
             lines.append(
                 f"pool={getattr(ct, 'name', ct)} tree={tree} tree_in_use={in_use} prefetch={prefetch} "
                 f"retired={retired} queue={queue} carrier={carrier} sum={total} "
                 f"own_held={own if own is not None else '-'} "
-                f"gap={own - total if own is not None else '-'}")
+                f"gap={own - total if own is not None else '-'} reset_orphans={orphans}")
         return "; ".join(lines) or None
 
     def _weg2_log_holder_census(self, where: str) -> None:
@@ -1473,10 +1649,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._init_pin_trace()
 
         if self.cache_controller is not None:
+            # #1424g: the controller reset drops the release queues; an arena
+            # row queued there still holds the reader reference its resolve
+            # took -- given back here, before it has no holder at all.
+            self._weg2_release_queued_refs_before_reset()
             self.cache_controller.reset()
             self.cache_controller.mem_pool_host.clear()
             self.enable_storage = self.cache_controller.enable_storage
             if getattr(self.cache_controller.mem_pool_host, "arena_read", False):
+                self._weg2_release_orphan_refs("reset")
                 self._weg2_log_holder_census("reset")
 
         self._empty_match_result = MatchResult(
@@ -1589,6 +1770,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             register_holder_census(self.weg2_arena_holder_census)
         except Exception:  # noqa: BLE001 - an instrument never blocks the init
             logger.warning("#1424e ARENA-REF-HOLDERS provider not registered", exc_info=True)
+        # #1424g: this process's trees whose holders the reset's orphan pass
+        # names (one per scheduler process; weak, a tree is never kept alive)
+        self._weg2_orphan_sweep_armed = True
+        _WEG2_ARMED_TREES.add(self)
 
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
