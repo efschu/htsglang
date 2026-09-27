@@ -33,6 +33,8 @@ from sglang.srt.distributed.utils import uneven_dcp_active
 from sglang.srt.environ import envs
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.weg2 import tail_adopt, tail_handoff
+from sglang.srt.weg2 import d_park_read as _weg2_park_read
+from sglang.srt.managers.weg2_min_hit import note_min_hit_tokens  # PARK-RETAIN READ
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -2042,6 +2044,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             insert_params.key = radix_key
             insert_params.value = values
+            # PARK-RETAIN READ (weg2/d_park_read.py): the raw span this insert
+            # retains -- a flip park reads back exactly this much, never the
+            # KV tail above the component cap that was just freed.
+            setattr(req, _weg2_park_read.RETAINED_ATTR, _weg2_park_read.retained_raw_tokens(radix_key))
             self._weg2_cap_tail = None
             result = self.insert(insert_params)
 
@@ -5847,6 +5853,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        # PARK-RETAIN READ / xsn437: a caller that priced a read below the
+        # threshold (`min_tokens`) must not have it revoked by the controller's
+        # own copy of the same threshold on the STORE HIT (27B park: 255 pages
+        # stored, `storage_hit_count < prefetch_threshold` -> revoked, x4).
+        # Registered before the operation is queued; group-uniform (the caller
+        # derives it from replicated request state).
+        note_min_hit_tokens(self.cache_controller, req_id, None if min_tokens is None else _min_len)
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,

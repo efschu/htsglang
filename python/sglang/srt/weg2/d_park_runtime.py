@@ -30,7 +30,7 @@ import logging
 import os
 import time
 
-from sglang.srt.weg2 import d_park_draft, d_seats
+from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +144,9 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
         running = list(sched.running_batch.reqs)
     for req in running:
         setattr(req, FORCE_HOST_WRITE_THROUGH_ATTR, True)
+        # PARK-RETAIN READ: the retraction's insert stamps what it retains;
+        # a stamp left from an earlier insert must not stand in for it.
+        setattr(req, d_park_read.RETAINED_ATTR, None)
     # H91d: the draft rows have no host twin (tier off) -- copy them off
     # BEFORE the retraction hands the slots to the tree (d_park_draft).
     d_park_draft.save_parked(sched, running, site=d_seats.SITE_FLIP)
@@ -160,6 +163,10 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     for req in retracted:
         d_seats.mark_parked(req, d_seats.SITE_FLIP, epoch=epoch, now=now)
         sched._969ad_note_retract(req, "weg2_park_running")
+        # PARK-RETAIN READ: the store read of this request ends at what the
+        # retraction just retained (the KV above the mamba track was freed).
+        if d_park_read.stamp_parked(req) is not None:
+            logger.info("WEG2-D-PARK RETAINED rid=%s %s", str(req.rid)[:12], d_park_read.describe(req))
     queued = list(sched.waiting_queue)
     sched.waiting_queue = []
     sched.weg2_d_parked = d_seats.order_waiting(list(parked) + list(retracted) + queued)

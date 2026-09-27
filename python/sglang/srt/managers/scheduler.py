@@ -233,6 +233,7 @@ from sglang.srt.managers import weg2_d_hostgap as _d_hostgap
 from sglang.srt.layers.quantization import gguf_path_census as _gguf_path_census
 from sglang.srt.weg2 import p_trim_end_anchor as _weg2_trim
 from sglang.srt.weg2 import fork_anchor as _weg2_fork
+from sglang.srt.weg2 import d_park_read as _weg2_park_read  # PARK-RETAIN READ
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
 from sglang.srt.managers import uniform_floor_scope
@@ -6432,6 +6433,13 @@ class Scheduler(
         # extra pass after the wake). Pure function of the prompt ids and the
         # env: the same span on every rank. Group P keeps its span.
         _match_end = _weg2_fork_match_end(req, _match_end)
+        # PARK-RETAIN READ (weg2/d_park_read.py, SGLANG_WEG2_PARK_READ_CAP,
+        # default on): a flip-parked request reads back exactly what its park
+        # retained -- the KV above the mamba track point was freed, never
+        # written, and a read asking for it could only end short (27B weg2-2-5,
+        # NF weg2-1-13: 20 s settle each). Pure function of the ids and the
+        # retained key: the same span on every rank.
+        _match_end = _weg2_park_read.park_match_end(req, _match_end)
         _new_input_tokens = req.full_untruncated_fill_ids[_matched_len:_match_end]
         # #1068 (spec A12.2): the request's OWN span, stamped rank-locally
         # before any verdict is taken, so the UNDEFERRABLE exit of the
@@ -6588,6 +6596,12 @@ class Scheduler(
         # xsn437 STORE-SHORT TAIL: a read that completes an earlier short store
         # read may be smaller than the prefetch threshold ({} = unchanged call).
         _tail_min = _weg2_store_tail_min_tokens(req)
+        # PARK-RETAIN READ: the park's retained span is read even below the
+        # prefetch threshold (27B: 255 bigram pages -- the only copy of the
+        # anchor -- were revoked as "too few" on every re-read).
+        _park_min = _weg2_park_read.park_read_min_tokens(req)
+        if _park_min is not None:
+            _tail_min = _park_min if _tail_min is None else min(int(_tail_min), int(_park_min))
         _tail_kw = {"min_tokens": _tail_min} if _tail_min is not None else {}
         if group_decides:
             self.tree_cache.prefetch_from_storage(

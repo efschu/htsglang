@@ -22,6 +22,7 @@ import time
 
 from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
+from sglang.srt.managers.weg2_min_hit import revoke_threshold  # PARK-RETAIN READ
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -4025,8 +4026,10 @@ class HiCacheController:
                 # the probe.
                 operation.probed_hit_tokens = int(storage_hit_count)
 
-                if storage_hit_count < self.prefetch_threshold:
+                if storage_hit_count < revoke_threshold(self, operation):
                     # not to prefetch if not enough benefits
+                    # (PARK-RETAIN READ: a read the caller priced below the
+                    # threshold keeps its own floor, managers/weg2_min_hit.py)
                     self.draft_cold_spans.pop(operation.request_id, None)
                     self.prefetch_revoke_queue.put(operation.request_id)
                     # #1068 (A12.5 addition, decided in the slice 4 fix): the
