@@ -1483,7 +1483,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
           holder outside the tree, or a leak);
         * reset_orphans (#1424g): references the resets of this process gave
           back because no holder named them any more (cumulative) -- the gap
-          a reset used to leave behind for good.
+          a reset used to leave behind for good;
+        * snapshot=torn: a reset replaced the tree while the census walked it
+          (the census thread against the scheduler) -- gap is then '-', never
+          a number from two trees; own_drift: the ledger moved by that much
+          during the walk (a concurrent round), gap is as exact as that.
 
         A prefetch counts its RESOLVED pages only (``completed_tokens``, the
         IO thread's count after it took the page's reference): the rows past
@@ -1499,6 +1503,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if arena is not None and pool.arena is not arena and os.path.realpath(
                     str(getattr(pool.arena, "path", ""))) != os.path.realpath(str(getattr(arena, "path", "?"))):
                 continue
+            # rc12r D-TP0 17:17:01/04 (gap=-2251): the census THREAD walked the
+            # tree it found before a reset (tree=5013, the old tree's own count)
+            # and read the ledger after the reset and the park refetch (2762).
+            # A snapshot the scheduler moved under is named, never a gap.
+            led0 = getattr(pool.arena, "_ledger", None)
+            own0 = int(led0.held.sum()) if led0 is not None else None
+            epoch0 = int(getattr(self, "_weg2_reset_epoch", 0))
             tree = in_use = 0
             root = getattr(self, "root_node", None)
             stack = list(root.children.values()) if root is not None else []
@@ -1534,11 +1545,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             led = getattr(pool.arena, "_ledger", None)
             own = int(led.held.sum()) if led is not None else None
             orphans = int((getattr(self, "_weg2_reset_orphans", None) or {}).get(ct, 0))
+            torn = int(getattr(self, "_weg2_reset_epoch", 0)) != epoch0
+            drift = (own - own0) if own is not None and own0 is not None else 0
             lines.append(
                 f"pool={getattr(ct, 'name', ct)} tree={tree} tree_in_use={in_use} prefetch={prefetch} "
                 f"retired={retired} queue={queue} carrier={carrier} sum={total} "
                 f"own_held={own if own is not None else '-'} "
-                f"gap={own - total if own is not None else '-'} reset_orphans={orphans}")
+                f"gap={own - total if own is not None and not torn else '-'} reset_orphans={orphans}"
+                + (f" snapshot=torn own_before={own0}" if torn else "")
+                + (f" own_drift={drift}" if drift and not torn else ""))
         return "; ".join(lines) or None
 
     def _weg2_log_holder_census(self, where: str) -> None:
@@ -1648,6 +1663,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._drop_staging_write_ring()
         self._init_pin_trace()
 
+        # the HOLDERS census thread names a snapshot a reset moved under (torn)
+        self._weg2_reset_epoch = int(getattr(self, "_weg2_reset_epoch", 0)) + 1
         if self.cache_controller is not None:
             # #1424g: the controller reset drops the release queues; an arena
             # row queued there still holds the reader reference its resolve

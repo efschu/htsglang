@@ -306,7 +306,14 @@ def arena_ref_pages(pool, host_indices) -> int:
 
 def arena_ref_slots(pool, host_indices) -> torch.Tensor:
     """#1424g: the arena slots (one reader reference each) these host rows
-    name, by the same rule as ``arena_ref_pages`` -- int64, unique per call."""
+    name, by the same rule as ``arena_ref_pages`` -- int64, unique per call.
+
+    rc12r P (FULL gap -50/-57/-64, MAMBA -1 after resets, never confirmed by
+    the next census): the release rule skips the slots of a pending (un-acked)
+    write -- a claimed slot takes no reader reference until ``complete_write``
+    (arena.c refuses +1 on a non-COMPLETE slot) -- and the census counted
+    them anyway: a node mid write-through (tree_in_use) named one publish's
+    pages the ledger never held. Skipped here as there."""
     empty = torch.empty(0, dtype=torch.int64)
     if host_indices is None or getattr(pool, "arena", None) is None:
         return empty
@@ -314,7 +321,16 @@ def arena_ref_slots(pool, host_indices) -> torch.Tensor:
     if idx.numel() == 0:
         return empty
     rows = torch.unique(idx[_arena_mask(pool, idx)]) - int(pool.staging_rows)
-    return _slots_of_rows(pool, rows) if rows.numel() else empty
+    if not rows.numel():
+        return empty
+    slots = _slots_of_rows(pool, rows)
+    mask = getattr(pool, "_pending_mask", None)
+    if mask is not None and slots.numel():
+        slots = slots[~mask[slots]]
+    elif getattr(pool, "_pending", None) and slots.numel():
+        pend = pool._pending
+        slots = torch.tensor([s for s in slots.tolist() if s not in pend], dtype=torch.int64)
+    return slots
 
 
 def _claim_duplicates(slots, st):
