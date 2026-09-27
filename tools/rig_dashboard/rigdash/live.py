@@ -155,6 +155,87 @@ def _rate(tok, ms):
     return (tok / (ms / 1000.0)) if (tok and ms and ms > 0) else None
 
 
+ONE_S = 1.0            # the "jetzt 1 s" window
+
+
+def _mid(t):
+    """P/D log stamps are whole seconds, truncated: the line fell in [t, t+1)."""
+    return t + 0.5 if t == int(t) else t
+
+
+def spread_rate(intervals, t_ref, w=ONE_S):
+    """tok/s over [t_ref - w, t_ref]: every interval (start, end, tokens)
+    spreads its tokens evenly over its own compute interval; the rate is the
+    sum of the shares inside the window, / w.  Pure, unit-tested."""
+    lo = t_ref - w
+    tok = 0.0
+    for s, e, n in intervals:
+        if e <= lo or s >= t_ref or not n:
+            continue
+        d = e - s
+        if d <= 0:
+            tok += n if lo < e <= t_ref else 0
+            continue
+        tok += n * (min(e, t_ref) - max(s, lo)) / d
+    return tok / w
+
+
+def compute_rate(intervals, w=ONE_S):
+    """tok/s over the newest ``w`` seconds of COMPUTE time of one rank: walk
+    back from its newest line, each line's tokens spread evenly over its own
+    compute interval.  Compute-honest like the tile's 60-s figure (bubbles
+    and idle between lines do not dilute it), and it does not depend on the
+    whole-second log stamps.  Pure, unit-tested."""
+    acc, tok = 0.0, 0.0
+    for s, e, n in reversed(intervals):
+        d = e - s
+        if d <= 0:
+            continue
+        if acc + d >= w:
+            tok += (n or 0) * (w - acc) / d
+            acc = w
+            break
+        acc += d
+        tok += n or 0
+    return tok / acc if acc > 0 else 0.0
+
+
+def one_s_rate(per_rank, now, other_after=None, gone_after=None, gap_s=PHASE_GAP_S, rate=None):
+    """The live 1-s rate of one class (user order 27.09.: 'es zeigt meistens
+    null an und springt dann auf 5000 / 10000').
+
+    ``per_rank``: {rank: [(start, end, tokens), ...]} sorted by end.  Each
+    rank's window is anchored at ITS newest logged end (``rate``: prefill
+    compute_rate = the newest 1 s of compute; default spread_rate over wall
+    time, used for the decode rounds) (the log lags, and a
+    PP stage logs a chunk after the stage before it already works on the
+    next), so between two chunks of a running class there is no 0.  The
+    class rate is the slowest rank's, as in the tile.  0 when the class is
+    no longer active: its newest line is older than max(gap_s, 1.5 x the last
+    interval + 1 s), or another class of the group / a flip putting the group
+    to sleep came after it (``other_after`` / ``gone_after``: epoch or None).
+    """
+    ends = [iv[-1][1] for iv in per_rank.values() if iv]
+    if not ends:
+        return 0.0
+    t_last = max(ends)
+    last_dur = max((iv[-1][1] - iv[-1][0]) for iv in per_rank.values() if iv)
+    if now - t_last > max(gap_s, 1.5 * last_dur + 1.0):
+        return 0.0
+    if other_after is not None and other_after > t_last + 0.5:
+        return 0.0
+    # a flip putting the group to sleep begins after draining its last chunk; the
+    # chunk's stamp is truncated to the second, its end is taken mid-second
+    if gone_after is not None and gone_after > t_last - 0.5:
+        return 0.0
+    rates = []
+    for iv in per_rank.values():
+        if not iv or iv[-1][1] < t_last - max(gap_s, 1.5 * last_dur + 1.0):
+            continue            # a rank that stopped logging does not bound the class
+        rates.append(rate(iv) if rate else spread_rate(iv, iv[-1][1]))
+    return min(rates) if rates else 0.0
+
+
 def _flip_intervals(begins, dones, open_begin, t1):
     """Pair ``WEG2-FLIP begin`` with its ``done`` (the done carries the NEW
     epoch = begin epoch + 1, and slept/woke = sleep/wake).  Without a begin
@@ -544,18 +625,91 @@ class Boot:
         last_t = ranks[-1]["t"] if ranks else None
         burst = self._prefill_window(ranks, batches, last_t - 20.0) if last_t else None
         lb = self.last.get("%s_prefill_batch" % g)
-        # the last 1 s: log stamps are whole seconds, so "last second" = lines
-        # stamped in the previous or the current second; 0 if none fell
-        one = self._prefill_window(ranks, batches, float(int(now)) - 1.0)
         return {
             "window_s": WINDOW_S,
-            "one_s": one["tps"] or 0.0,
+            "one_s": self._one_s(g, "prefill", now),
             "now": win,
             "last_burst": burst,
             "last_t": last_t,
             "queue": lb.get("queue") if lb else None,
             "pending_tok": lb.get("pending_tok") if lb else None,
         }
+
+    def _intervals(self, g: str, kind: str, since: float) -> Dict[str, list]:
+        """{rank: [(start, end, tokens)]} of one class, newest ``since`` on.
+        Prefill: each rank's 'Prefill rank batch' line, interval = its
+        compute-ms (gpu-ms where the line has no split) up to the
+        (mid-second) stamp, tokens #new-token.  Decode:
+        each round of 'Decode rank batch' rank 0, interval = its gpu-ms up to
+        its exact t:, tokens = bs x accept len of the newest 'Decode batch'
+        line before it."""
+        out: Dict[str, list] = {}
+        if kind == "prefill":
+            for e in self.ev["%s_prefill_rank" % g]:
+                ms = e.get("compute_ms") or e.get("gpu_ms")
+                if e["t"] < since - 1 or not ms:
+                    continue
+                t = _mid(e["t"])
+                out.setdefault("%s%s" % (e.get("rk", ""), e.get("rank", 0)), []).append(
+                    (t - ms / 1000.0, t, e.get("new_tok") or 0))
+        else:
+            # 'gen throughput' of a Decode batch line = tokens since the previous
+            # Decode batch line / the time between; those tokens are spread evenly
+            # over the rounds that fell in between (bs x accept len over-counts:
+            # measured 27.09. NF bs 4 -> ~180 against gen throughput ~100)
+            batches = [e for e in self.ev["%s_decode_batch" % g] if e.get("gen_tps") is not None and e["t"] >= since - 30]
+            rows = [e for e in self.ev["%s_decode_rank" % g]
+                    if e["t"] >= since - 30 and e.get("rank", 0) == 0 and e.get("t_exact")]
+            if rows and batches:
+                rows.sort(key=lambda e: e["t_exact"])
+                bt = [_mid(e["t"]) for e in batches]
+                per_round = [None] * len(rows)
+                j = 0
+                for k in range(1, len(batches)):
+                    lo, hi = bt[k - 1], bt[k]
+                    idx = []
+                    while j < len(rows) and rows[j]["t_exact"] <= hi:
+                        if rows[j]["t_exact"] > lo:
+                            idx.append(j)
+                        j += 1
+                    if idx:
+                        tok = batches[k]["gen_tps"] * (hi - lo) / len(idx)
+                        for i in idx:
+                            per_round[i] = tok
+                last_tok = None
+                for i, e in enumerate(rows):
+                    if per_round[i] is None:
+                        per_round[i] = last_tok       # after the newest batch line: the newest per-round figure
+                    last_tok = per_round[i] if per_round[i] is not None else last_tok
+                    if per_round[i] is None or e["t_exact"] < since:
+                        continue
+                    ms = e.get("gpu_ms") or 0.0
+                    out.setdefault("TP0", []).append((e["t_exact"] - ms / 1000.0, e["t_exact"], per_round[i]))
+        for v in out.values():
+            v.sort(key=lambda x: x[1])
+        return out
+
+    def _one_s(self, g: str, kind: str, now: float) -> float:
+        if self.newest_mtime and now - self.newest_mtime > 120.0:
+            return 0.0          # a finished boot: nothing runs now
+        per = self._intervals(g, kind, now - 120.0)
+        if kind == "decode" and not per:
+            # no per-round lines with t: in this boot: the newest gen throughput while active
+            last = self.last.get("%s_decode_batch" % g)
+            if last and last.get("gen_tps") is not None and now - _mid(last["t"]) <= PHASE_GAP_S:
+                return last["gen_tps"]
+            return 0.0
+        other_kind = "decode" if kind == "prefill" else "prefill"
+        other = None
+        if g in ("D", "single"):
+            ends = [iv[-1][1] for iv in self._intervals(g, other_kind, now - 120.0).values() if iv]
+            other = max(ends) if ends else None
+        gone = None
+        for e in list(self.ev["flip_begins"])[-4:] + ([self.flip_open] if self.flip_open else []):
+            if e and e.get("sleep") == g:
+                gone = e["t"] if gone is None else max(gone, e["t"])
+        return one_s_rate(per, now, other_after=other, gone_after=gone,
+                          rate=compute_rate if kind == "prefill" else None)
 
     def _decode_view(self, g: str, now: float) -> dict:
         rows = [e for e in self.ev["%s_decode_batch" % g] if e["t"] >= now - WINDOW_S]
@@ -568,11 +722,9 @@ class Boot:
             ms = sum(e["gpu_ms"] for e in rr)
             bs = sum((e.get("bs") or 0) for e in rr)
             compute = (bs * last["accept_len"]) / (ms / 1000.0) if ms > 0 else None
-        one = [e["gen_tps"] for e in self.ev["%s_decode_batch" % g]
-               if e["t"] >= float(int(now)) - 1.0 and e.get("gen_tps") is not None]
         return {
             "window_s": WINDOW_S,
-            "one_s": (sum(one) / len(one)) if one else 0.0,
+            "one_s": self._one_s(g, "decode", now),
             "gen_tps": (sum(gen) / len(gen)) if gen else None,
             "gen_tps_last": last.get("gen_tps") if last else None,
             "running": last.get("running") if last else None,

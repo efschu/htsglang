@@ -690,5 +690,89 @@ class PlannedStopTests(unittest.TestCase):
         self.assertEqual(b["timeline"]["cut_kind"], "planned")
 
 
+# verbatim, NF rc12s P log boot_weg2_dkrnfh91dprbar1dauer09271719 (TP1-PP3), a P phase, tails cut after "wait 0.0)"
+PP_CHUNKS = [
+    '[2026-09-27 17:31:27 PP0] Prefill rank batch, #new-token: 16384, #cached-token: 0, #chunks: 1, gpu-ms: 3260.0 (compute 3260.0, wait 0.0)',
+    '[2026-09-27 17:31:27 PP1] Prefill rank batch, #new-token: 16384, #cached-token: 0, #chunks: 1, gpu-ms: 2732.7 (compute 2732.7, wait 0.0)',
+    '[2026-09-27 17:31:30 PP2] Prefill rank batch, #new-token: 16384, #cached-token: 0, #chunks: 1, gpu-ms: 1561.6 (compute 1561.6, wait 0.0)',
+    '[2026-09-27 17:31:30 PP1] Prefill rank batch, #new-token: 16384, #cached-token: 0, #chunks: 1, gpu-ms: 2782.7 (compute 2782.7, wait 0.0)',
+    '[2026-09-27 17:31:30 PP0] Prefill rank batch, #new-token: 16384, #cached-token: 0, #chunks: 1, gpu-ms: 3283.2 (compute 3283.1, wait 0.0)',
+    '[2026-09-27 17:31:33 PP2] Prefill rank batch, #new-token: 16384, #cached-token: 0, #chunks: 1, gpu-ms: 1571.8 (compute 1571.8, wait 0.0)',
+    '[2026-09-27 17:31:34 PP1] Prefill rank batch, #new-token: 16384, #cached-token: 0, #chunks: 1, gpu-ms: 2797.0 (compute 2796.9, wait 0.0)',
+    '[2026-09-27 17:31:34 PP0] Prefill rank batch, #new-token: 16378, #cached-token: 0, #chunks: 1, gpu-ms: 3553.5 (compute 3553.5, wait 0.0)',
+    '[2026-09-27 17:31:37 PP2] Prefill rank batch, #new-token: 16384, #cached-token: 0, #chunks: 1, gpu-ms: 1578.2 (compute 1578.2, wait 0.0)',
+    '[2026-09-27 17:31:37 PP0] Prefill rank batch, #new-token: 16384, #cached-token: 0, #chunks: 1, gpu-ms: 3290.4 (compute 3290.3, wait 0.0)',
+    '[2026-09-27 17:31:37 PP1] Prefill rank batch, #new-token: 16378, #cached-token: 0, #chunks: 1, gpu-ms: 2768.4 (compute 2768.4, wait 0.0)',
+    '[2026-09-27 17:31:40 PP2] Prefill rank batch, #new-token: 16378, #cached-token: 0, #chunks: 1, gpu-ms: 1573.1 (compute 1573.1, wait 0.0)',
+    '[2026-09-27 17:31:40 PP1] Prefill rank batch, #new-token: 16384, #cached-token: 0, #chunks: 1, gpu-ms: 2749.3 (compute 2749.3, wait 0.0)',
+    '[2026-09-27 17:31:40 PP0] Prefill rank batch, #new-token: 16384, #cached-token: 0, #chunks: 1, gpu-ms: 3330.3 (compute 3330.2, wait 0.0)',
+]
+
+
+class OneSecondRateTests(unittest.TestCase):
+    """User 27.09.: 'es zeigt meistens null an und springt dann manchmal auf
+    5000 und manchmal auf 10000 -- dabei sollte es eher durchgehend etwas
+    zwischen 4700-5000 anzeigen'."""
+
+    def _replay(self, lines, group, t_from, t_to, step=0.5, kind="prefill"):
+        evs = []
+        for ln in lines:
+            ev = parse.parse_line(ln)
+            vis = ev["t"] + 1.0 if ev["t"] == int(ev["t"]) else ev["t"]   # a whole-second line is complete at its end
+            evs.append((vis, ev))
+        evs.sort(key=lambda x: x[0])
+        b = live.Boot("x", "/tmp")
+        out, i, now = [], 0, t_from
+        while now <= t_to:
+            while i < len(evs) and evs[i][0] <= now:
+                b._ingest(group, evs[i][1])
+                i += 1
+            out.append((now, b._one_s(group, kind, now)))
+            now += step
+        return out
+
+    def test_spread_rate_shares(self):
+        self.assertAlmostEqual(live.spread_rate([(0.0, 4.0, 4000)], 3.0), 1000.0)
+        self.assertAlmostEqual(live.spread_rate([(0.0, 2.0, 2000), (2.0, 3.0, 3000)], 3.0), 3000.0)
+        self.assertAlmostEqual(live.spread_rate([(0.0, 2.0, 2000), (2.0, 3.0, 3000)], 2.5), 0.5 * 1000 + 0.5 * 3000)
+
+    def test_compute_rate_walks_back_one_second_of_compute(self):
+        # 27B form: 512-token micro-chunks, 220 ms each, several per whole-second stamp
+        iv = [(10.28, 10.5, 512), (10.28, 10.5, 512), (11.28, 11.5, 512), (11.28, 11.5, 512), (11.28, 11.5, 512)]
+        self.assertAlmostEqual(live.compute_rate(iv), 512 / 0.22, delta=1)
+        self.assertAlmostEqual(live.compute_rate([(0.0, 3.3, 16384)]), 16384 / 3.3, delta=1)
+
+    def test_prefill_chunks_give_a_steady_rate_without_zeros(self):
+        t0 = parse.parse_line(PP_CHUNKS[0])["t"]
+        vals = [v for _, v in self._replay(PP_CHUNKS, "P", t0 + 1.0, t0 + 14.0)]
+        self.assertTrue(all(4500 <= v <= 5200 for v in vals), vals)   # slowest stage PP0, ~16384 / 3.3 s
+
+    def test_inactive_after_the_activity_limit_and_after_a_flip(self):
+        t0 = parse.parse_line(PP_CHUNKS[0])["t"]
+        last = max(parse.parse_line(x)["t"] for x in PP_CHUNKS)
+        vals = self._replay(PP_CHUNKS, "P", last + 1.0, last + 12.0, step=1.0)
+        self.assertGreater(vals[0][1], 4500)
+        self.assertEqual(vals[-1][1], 0.0)          # 3.3-s chunks: no line for > 1.5 x 3.3 + 1 s -> stopped
+        b = live.Boot("x", "/tmp")
+        for ln in PP_CHUNKS:
+            b._ingest("P", parse.parse_line(ln))
+        b._ingest("front", {"t": last + 0.2, "kind": "flip_begin", "epoch": 3, "sleep": "P", "wake": "D"})
+        self.assertEqual(b._one_s("P", "prefill", last + 1.5), 0.0)
+
+    def test_decode_rounds_carry_the_gen_throughput(self):
+        base = 1790530380.0
+        lines = []
+        for k in range(80):                             # one round every 62.5 ms, bs 3
+            t = base + k * 0.0625
+            lines.append("[%s TP0] Decode rank batch, rank: 0, #round: %d, t: %.3f, bs: 3, #rows: 12, #fwd: 1, gpu-ms: 50.0 (x)"
+                         % (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t)), 100 + k, t))
+        for s_, gen in ((0, 100.0), (3, 160.0)):
+            lines.append("[%s TP0] Decode batch, #running-req: 3, #full token: 1000, full token usage: 0.10, "
+                         "accept len: 2.30, accept rate: 0.40, cuda graph: True, gen throughput (token/s): %.2f, #queue-req: 0"
+                         % (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(base + s_)), gen))
+        vals = [v for _, v in self._replay(lines, "D", base + 4.0, base + 5.0, step=0.25, kind="decode")]
+        self.assertTrue(all(145 <= v <= 175 for v in vals), vals)   # gen throughput 160, not bs x accept len x 16 = 110
+
+
 if __name__ == "__main__":
     unittest.main()
