@@ -310,6 +310,32 @@ def arena_ref_pages(pool, host_indices) -> int:
     return int(_slots_of_rows(pool, rows).numel()) if rows.numel() else 0
 
 
+def _claim_duplicates(slots, st):
+    """#1424f: the claim's pages that name a slot another page of the SAME
+    claim already names (a boolean mask over the pages, numpy). One node's
+    pages are content-chained keys, so two of them never own one slot; a
+    repeat is a slot the claim's own room-making handed out twice -- refused
+    by name rather than written (the second page would overwrite the first)."""
+    import numpy as np
+    s = np.asarray(slots)
+    ok = s >= 0
+    _u, first, counts = np.unique(s, return_index=True, return_counts=True)
+    dup = np.zeros(s.shape, dtype=bool)
+    if bool((counts > 1).any()):
+        seen = set()
+        for i, v in enumerate(s.tolist()):
+            if v >= 0 and v in seen:
+                dup[i] = True
+            seen.add(v)
+        k = getattr(_claim_duplicates, "_n", 0) + 1
+        _claim_duplicates._n = k
+        if k <= 8 or k % 256 == 0:
+            logger.warning("#1424f ARENA-CLAIM DUPLICATE n=%d pages=%d repeated=%d first=%s statuses=%s -- "
+                           "one slot named by two pages of one claim; refused, never written",
+                           k, int(s.size), int(dup.sum()), s[dup][:4].tolist(), sorted(set(np.asarray(st).tolist())))
+    return dup & ok
+
+
 def _repoint_unrefs(pool, arena, olds):
     """#1424e (rc12p D-TP0 ARENA-REF-CENSUS, pinned 4315 of 4669): the old
     slots of re-pointed pages whose reader reference THIS page holds and gives
@@ -1502,6 +1528,15 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             logger.info("#1427 ARENA-CLAIM n=%d stems=%d first=%s last=%s statuses=%s arena=%s",
                         _cn, len(stems), stems[0] if stems else "-", stems[-1] if stems else "-",
                         sorted(set(st.tolist())), getattr(arena, "path", "?"))
+        # #1424f: the pages this claim found COMPLETE take their reader
+        # reference NOW, before any room is made -- unreferenced, the claim's
+        # own `_evict_for_claim` below could free one of them and the redo
+        # hand the SAME slot to another page of this node (rc12p P-PP0
+        # 15:15:51 / 15:21:05: one node, one slot twice, the write's host-sorted
+        # rows interleaved -> "a page's token rows are not consecutive").
+        done2 = st == 2
+        if bool(done2.any()):
+            arena.ref_slots(slots[done2].tolist(), +1)
         bad = (st == 3) | (st == 4)
         if bool(bad.any()):
             if bool((st == 4).any()):
@@ -1511,11 +1546,20 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 redo = np.nonzero(st == 4)[0]
                 s2, st2, g2 = arena.claim_slots_np([stems[int(i)] for i in redo], [self._page_bytes] * int(redo.size))
                 slots[redo] = s2; st[redo] = st2; gens[redo] = g2
+                if bool((st2 == 2).any()):
+                    arena.ref_slots(s2[st2 == 2].tolist(), +1)
                 bad = (st == 3) | (st == 4)
+            if not bool(bad.any()):
+                bad = _claim_duplicates(slots, st)
             if bool(bad.any()):
                 fresh = slots[st == 0]
                 if fresh.size:
                     arena.free_slots(fresh.tolist())
+                joins = np.nonzero(st == 1)[0]
+                if joins.size and hasattr(arena, "unclaim"):
+                    arena.unclaim(slots[joins].tolist(), gens[joins].tolist())  # #231
+                if bool((st == 2).any()):
+                    arena.ref_slots(slots[st == 2].tolist(), -1)  # #1424f: taken above, the claim is refused
                 k = getattr(ArenaMHAHostPool, "_1427_full_n", 0) + 1
                 ArenaMHAHostPool._1427_full_n = k
                 if k <= 8 or k % 256 == 0:
@@ -1528,9 +1572,6 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             self._pending_mask[idx] = True
             self._pending_gen[idx] = torch.from_numpy(gens[pend])
             self._pending_fresh[idx] = torch.from_numpy(st[pend] == 0)
-        complete = slots[st == 2]
-        if complete.size:
-            arena.ref_slots(complete.tolist(), +1)        # complete already: reader reference only
         return slots.tolist()
 
     def _pend_take(self, slots_t: torch.Tensor):
@@ -1699,6 +1740,12 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             logger.info("#1427 ARENA-CLAIM n=%d stems=%d first=%s last=%s statuses=%s arena=%s",
                         _cn, len(stems), stems[0] if stems else "-", stems[-1] if stems else "-",
                         sorted({st for _, st, _ in got}), getattr(arena, "path", "?"))
+        # #1424f: found-COMPLETE pages are referenced before any room is made
+        # (see _claim_np) -- the eviction below may otherwise free one of them
+        # and the redo give its slot to another page of this node.
+        early = [slot for slot, st, _ in got if st == 2]
+        if early:
+            arena.ref_slots(early, +1)
         if any(st in (3, 4) for _, st, _ in got):
             if any(st == 4 for _, st, _ in got):
                 # H81 (27B 479f6eccb0): room in C, no disk round in the claim
@@ -1708,7 +1755,13 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 again = arena.claim_slots([stems[i] for i in redo], [self._page_bytes] * len(redo))
                 for i, g in zip(redo, again):
                     got[i] = g
-            if any(st in (3, 4) for _, st, _ in got):
+                late = [g[0] for g in again if g[1] == 2]
+                if late:
+                    arena.ref_slots(late, +1)
+            if any(st in (3, 4) for _, st, _ in got) or len({s for s, _, _ in got}) != len(got):
+                done = [slot for slot, st, _ in got if st == 2]
+                if done:
+                    arena.ref_slots(done, -1)   # #1424f: taken above, the claim is refused
                 fresh = [s for s, st, _ in got if st == 0]
                 if fresh:
                     arena.free_slots(fresh)
@@ -1725,9 +1778,6 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # in the scheduler thread -- batched: one dict update, one ref call.
         self._pending.update((slot, (gen, st == 0)) for slot, st, gen in got if st != 2)
         self._pend_mark([slot for slot, st, _ in got if st != 2], True)
-        complete = [slot for slot, st, _ in got if st == 2]
-        if complete:
-            arena.ref_slots(complete, +1)        # complete already: reader reference only
         return [slot for slot, _, _ in got]
 
     def alloc_write(self, hashes) -> Optional[torch.Tensor]:
