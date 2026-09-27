@@ -284,7 +284,7 @@ function bootCard(b, now, binders) {
       <span class="model">${esc(m.model || b.stem)}</span>
       <span class="badge ${b.live ? "live" : "dead"}">${b.live ? "LIVE" : "kein Log seit " + ago(b.age_s)}</span>
       ${awake ? `<span class="badge phase">wach: ${esc(awake)}${frState ? " &middot; Front: " + esc(frState) : flipping ? " &middot; flippt" : ""}</span>` : ""}
-      ${c ? `<span class="chip ${c.State === "running" ? "ok" : "bad"}">${esc(c.Names)} &middot; ${esc(c.Status)}</span>` : `<span class="chip warn">kein laufender Container zu diesem Log</span>`}
+      ${c ? `<span class="chip ${c.State !== "running" ? "bad" : /unhealthy/.test(c.Status || "") ? "warn" : "ok"}">${esc(c.Names)} &middot; ${esc(c.Status)}</span>` : `<span class="chip warn">kein laufender Container zu diesem Log</span>`}
       ${health.length ? `<span class="chip bad">Gruppe ${health.map((h) => esc(h.group)).join(", ")} tot (WEG2-HEALTH)</span>` : ""}
     </div>
     <div class="muted" style="font-size:12px;margin:-6px 0 10px">
@@ -338,7 +338,7 @@ function containersHtml(d) {
   let h = dk.error ? `<div class="err">${esc(dk.error)}</div>` : "";
   if (!rows.length) return h + `<div class="muted">kein htsglang-Container auf dem Host</div>`;
   h += `<table><tr><th>Name</th><th>Zustand</th><th>Image</th><th>Ports</th></tr>` + rows.map((r) =>
-    `<tr><td class="mono">${esc(r.Names)}</td><td><span class="chip ${r.State === "running" ? "ok" : "bad"}">${esc(r.Status)}</span></td><td class="mono">${esc(r.Image)}</td><td class="mono">${esc(r.Ports)}</td></tr>`).join("") + `</table>`;
+    `<tr><td class="mono">${esc(r.Names)}</td><td><span class="chip ${r.State !== "running" ? "bad" : /unhealthy/.test(r.Status || "") ? "warn" : "ok"}">${esc(r.Status)}</span></td><td class="mono">${esc(r.Image)}</td><td class="mono">${esc(r.Ports)}</td></tr>`).join("") + `</table>`;
   return h + `<div class="muted" style="font-size:12px;margin-top:4px">Stand vor ${ago(dk.age_s)}</div>`;
 }
 
