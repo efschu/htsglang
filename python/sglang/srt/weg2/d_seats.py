@@ -192,8 +192,19 @@ def retraction_order(reqs: Sequence, *, spec_active: bool) -> Optional[List[int]
     from sglang.srt.weg2 import seat_age as _sa
 
     if _sa.enabled():
-        # SA (4): the park victim is the YOUNGEST by front arrival.
-        by_protection = sorted(range(n), key=lambda i: _arrival(reqs[i]))
+        # SA (4): the park victim is the YOUNGEST -- kvso's protection key
+        # with its AGE term read from the one SA age (``_arrival``: the front
+        # arrival, D's ``kv_arrival_seq`` only where the rid carries no
+        # counter). The spill class and the fast lane keep their rank above
+        # age: a 'never' session / a fast-lane request is not made a park
+        # victim by SA, a 'preferred' one still parks first. No second age.
+        from sglang.srt.managers.kv_session_offload import spill_class_rank
+
+        def _sa_key(r):
+            return (spill_class_rank(r), 1 if getattr(r, "is_fast_lane", False) else 0,
+                    -_arrival(r))
+
+        by_protection = sorted(range(n), key=lambda i: _sa_key(reqs[i]), reverse=True)
     else:
         by_protection = sorted(range(n), key=lambda i: session_priority_key(reqs[i]), reverse=True)
     if not spec_active:

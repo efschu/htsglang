@@ -86,10 +86,24 @@ class Wiring(unittest.TestCase):
         self.assertIn("self._ready_for_d.append(p)", blk)
 
     def test_admitter_reprices_a_kept_short_before_the_seat(self):
+        # The whole d_admitter body, not a fixed 6000-char window: SA (#244)
+        # added its backfill between the re-price and the seat and pushed the
+        # acquire past the old window -- the ORDER is what is pinned.
         i = self.src.index("    async def d_admitter(self)")
-        blk = self.src[i:i + 6000]
+        j = self.src.index("\n    async def ", i + 10)
+        blk = self.src[i:j]
         a = blk.index('if getattr(p, "short_kept", False) and self._sk_admission_reprice(p):')
         self.assertLess(a, blk.index("await self._d_seat.acquire()"))
+
+    def test_a_backfilled_kept_short_is_repriced_before_the_seat(self):
+        # SA's backfill may seat a younger request past the blocked head; a
+        # kept SHORT among them is re-priced first, like the head.
+        i = self.src.index("    async def d_admitter(self)")
+        j = self.src.index("\n    async def ", i + 10)
+        blk = self.src[i:j]
+        b = blk.index('if getattr(_q, "short_kept", False) and self._sk_admission_reprice(_q):')
+        self.assertLess(b, blk.index("p = _q"))
+        self.assertLess(b, blk.index("await self._d_seat.acquire()"))
 
     def test_p_drain_skips_leg1_for_a_kept_short(self):
         self.assertIn("if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once", self.src)
