@@ -100,6 +100,19 @@ class ReadonlyTests(unittest.TestCase):
             self.assertTrue(f.sent[0][1]["readonly"])
             self.assertEqual(f.h.rfile.tell(), 0, "body must not be read for " + path)
 
+    def test_banner_sits_in_the_real_body(self):
+        webui = _reload_webui({"SGLANG_PLANNER_READONLY": "1"})
+        sent = []
+        h = webui._Handler.__new__(webui._Handler)
+        h.path = "/"
+        h._send = lambda code, body, ctype: sent.append(body)
+        h.do_GET()
+        page = sent[0]
+        # the bare "<body>" string also occurs inside a CSS comment; the banner
+        # must land right before the header, not in that comment
+        self.assertIn("<body>\n" + webui._READONLY_BANNER + '\n<div class="hdr">', page)
+        self.assertEqual(page.count('id="ro_banner"'), 1)
+
     def test_planning_is_not_blocked(self):
         webui = _reload_webui({"SGLANG_PLANNER_READONLY": "1"})
         for path in ("/api/plan", "/api/wizard/command", "/api/recompute", "/api/commsuite/cancel"):

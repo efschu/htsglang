@@ -5471,7 +5471,9 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path in ("/", "/index.html"):
             page = INDEX_HTML
             if READONLY:
-                page = page.replace("<body>", "<body>\n" + _READONLY_BANNER, 1)
+                # anchor on the real body tag: the bare "<body>" string also
+                # occurs earlier, inside a CSS comment of the page.
+                page = page.replace('<body>\n<div class="hdr">', '<body>\n' + _READONLY_BANNER + '\n<div class="hdr">', 1)
             self._send(200, page, "text/html; charset=utf-8")
             return
         if self.path.startswith("/api/readonly"):
