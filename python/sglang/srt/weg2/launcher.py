@@ -9318,6 +9318,8 @@ def choose_host_ledger(
     ring_span1_bytes: int,
     ring_provenance: str = "",
     d_draft_host_gib: float = 0.0,
+    memhist_gib: float = 0.0,
+    memhist_run_only: bool = False,
     meminfo_path: str = "/proc/meminfo",
     cgroup_root: str = "/sys/fs/cgroup",
     record_path: Optional[str] = None,
@@ -9632,6 +9634,9 @@ def choose_host_ledger(
         # 'd_draft_host'), priced by `d_draft_park_term` -- one kwargs block,
         # so the pinned arm and the ladder price the same post.
         d_draft_host_gib=float(d_draft_host_gib),
+        # rc12d: the torch allocation history (weg2/memhist.py) -- 5.4 GiB of
+        # host nobody booked when it was armed from rank start in P and D.
+        memhist_gib=float(memhist_gib), memhist_run_only=bool(memhist_run_only),
         # #1451: no arena on a --weg2-disable-hicache boot -- the term charged
         # 33.6 GiB there too (test_weg2_hicache_disabled_1386 M=2400 unfundable)
         **(_weg2_arena_ledger_terms(model_dir) if (model_dir and not hicache_disabled) else {}),  # #1432
@@ -19956,12 +19961,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # a passed one: it stays False, i.e. a legacy record stays refused.
     _rt = getattr(ring_plan, "table", None)
     _form_key_matches = bool(getattr(_rt, "form_same", None)) if _rt is not None else False
+    # rc12d: the allocation-history post, from the SAME environments the
+    # groups will see (the launcher's own = container env, overlaid by
+    # --env-p / --env-d), priced per armed rank.
+    from sglang.srt.weg2 import memhist as _memhist
+
+    _memhist_gib, _memhist_run_only, _memhist_prov = _memhist.host_charge(
+        os.environ,
+        {"P": parse_group_env(getattr(ns, "env_p", "") or ""),
+         "D": parse_group_env(getattr(ns, "env_d", "") or "")},
+        {"P": 3, "D": 3},
+    )
+    if _memhist_prov:
+        log(f"WEG2-MEMHIST ledger post memhist {_memhist_gib:.2f} GiB "
+            f"({'run moment only' if _memhist_run_only else 'both moments'}): {_memhist_prov}")
+
     def _price_host_ledger():
         """#1453: the ONE ledger pricing, callable twice (see below)."""
         return choose_host_ledger(
             ring_plan.host_weights_bytes,
             ring_plan.host_weights_span1_bytes, ring_plan.provenance,
             d_draft_host_gib=d_draft_host_mib / 1024.0,
+            memhist_gib=_memhist_gib, memhist_run_only=_memhist_run_only,
             # #1390: NAMED, not left to choose_host_ledger's own literal
             # defaults -- see MEMINFO_PATH/CGROUP_ROOT above for why a bare call
             # would keep reading the real box even under a test's mock.

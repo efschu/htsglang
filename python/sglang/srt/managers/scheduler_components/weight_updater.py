@@ -1853,6 +1853,14 @@ class SchedulerWeightUpdaterManager:
             )
         except Exception as exc:  # noqa: BLE001 -- an instrument never kills the sleep
             logger.info("WEG2-SLEEP-RESIDUE instrument raised (%s: %s)", type(exc).__name__, str(exc)[:160])
+        try:
+            # rc12d: the lean history arms here, after the snapshot of this
+            # sleep -- the next sleep dumps what the serving phase allocated.
+            from sglang.srt.managers.weg2_memory_saver import arm_memory_history_after_sleep
+
+            arm_memory_history_after_sleep()
+        except Exception as exc:  # noqa: BLE001 -- an instrument never kills the sleep
+            logger.info("WEG2-MEMHIST arm-after-sleep raised (%s: %s)", type(exc).__name__, str(exc)[:160])
         self._weg2_trim_host_heap_at_sleep()
 
     @staticmethod

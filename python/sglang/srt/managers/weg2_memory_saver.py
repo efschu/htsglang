@@ -3364,22 +3364,51 @@ _load_native_segv_backtrace()
 #: arms torch.cuda.memory._record_memory_history at rank start; the sleep
 #: path then dumps a snapshot next to the boot's evidence (see
 #: weight_updater._weg2_log_sleep_residue) for debugtools memsnapshot_analyze.
+#: rc12d (27.09.): the form from rank start costs ~5.4 GiB of host for three P
+#: ranks; ``SGLANG_WEG2_MEMHIST=sleep`` is the lean form (weg2/memhist.py:
+#: D only by default, armed after the first sleep, 20000 entries), booked by
+#: the launcher's host ledger (post ``memhist``).
 MEMHIST_ENV = "SGLANG_WEG2_MEMHIST"
 _MEMHIST_ARMED = False
 
 
-def _arm_memory_history() -> None:
+def _memhist_plan_here():
+    from sglang.srt.weg2 import memhist as _mh
+
+    p = _mh.plan(os.environ)
+    if p is None:
+        return None
+    group = os.environ.get("SGLANG_WEG2_GROUP", "")
+    # the pre-existing "1" armed every process that saw it, grouped or not
+    if group and not p.armed_for(group):
+        return None
+    if not group and p.mode != _mh.MODE_LOAD:
+        return None
+    return p
+
+
+def _arm_memory_history(stage: str = "load") -> None:
     global _MEMHIST_ARMED
-    if _MEMHIST_ARMED or os.environ.get(MEMHIST_ENV, "") != "1":
+    if _MEMHIST_ARMED:
+        return
+    p = _memhist_plan_here()
+    if p is None or p.mode != stage:
         return
     try:
         import torch
 
-        torch.cuda.memory._record_memory_history(max_entries=200000)
+        torch.cuda.memory._record_memory_history(max_entries=int(p.max_entries))
         _MEMHIST_ARMED = True
-        logger.info("WEG2-MEMHIST armed: torch allocation history with stacks (SGLANG_WEG2_MEMHIST=1)")
+        logger.info("WEG2-MEMHIST armed at %s: torch allocation history with stacks (%s)",
+                    stage, p.describe())
     except Exception as exc:  # noqa: BLE001 -- an instrument never kills a rank
         logger.warning("WEG2-MEMHIST NOT armed: %s", exc)
+
+
+def arm_memory_history_after_sleep() -> None:
+    """The lean form (SGLANG_WEG2_MEMHIST=sleep): arm at the end of a sleep --
+    the first one, since arming is once per process."""
+    _arm_memory_history("sleep")
 
 
 _arm_memory_history()
