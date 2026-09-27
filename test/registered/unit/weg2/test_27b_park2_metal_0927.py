@@ -192,5 +192,22 @@ def test_a_zero_answer_settles_when_the_whole_span_fits_in_x(clean, n, short, de
     from sglang.srt.managers import scheduler as S
 
     clean.setenv(FM.FORM_ENV, _form_env("qwen27b"))  # store_short_tail on (profile)
+    clean.setenv(IMM, "1")  # the zero-read settle rides the 27B immediate park
     sched = types.SimpleNamespace(server_args=types.SimpleNamespace(tp_prefill_max_tokens=4096))
     assert S._weg2_store_tail_settles(sched, _tail_req(n, short, delivered)) is want
+
+
+@pytest.mark.parametrize("profile,imm", [("nextflash", None), ("qwen27b", None), ("qwen27b", "0")])
+def test_without_the_immediate_park_a_zero_answer_waits_as_before_pk2(clean, profile, imm):
+    # NF 27.09. (Fork A on #1004): PK2 settled zero reads on NF-D against its
+    # 12288 riegel. Off the immediate park a zero read waits out #1471 again;
+    # the stamped #1324 tail (remainder within X) is untouched.
+    from sglang.srt.managers import scheduler as S
+
+    clean.setenv(FM.FORM_ENV, _form_env(profile))
+    clean.setenv("SGLANG_WEG2_STORE_SHORT_TAIL", "1")
+    if imm is not None:
+        clean.setenv(IMM, imm)
+    sched = types.SimpleNamespace(server_args=types.SimpleNamespace(tp_prefill_max_tokens=12288))
+    assert S._weg2_store_tail_settles(sched, _tail_req(418, True, None)) is False
+    assert S._weg2_store_tail_settles(sched, _tail_req(4316, True, 4095)) is True

@@ -788,6 +788,17 @@ def _weg2_store_short_tail_x(sched) -> int:
     return min(x, cap) if (x > 0 and cap > 0) else x
 
 
+def _weg2_zero_read_settle_on() -> bool:
+    """PK2's zero-read settle belongs to the 27B immediate park
+    (``SGLANG_WEG2_D_PARK_IMMEDIATE`` / ``ModelProfile.d_park_immediate``),
+    not to every D: NF (27.09., Fork A on #1004) saw it settle zero reads on
+    NF-D against its 12288 riegel -- a behaviour change nobody asked for there.
+    Off = a zero read waits out the #1471 bound, exactly as before PK2."""
+    from sglang.srt.weg2.form import d_park_immediate_state
+
+    return bool(d_park_immediate_state()[0])
+
+
 def _weg2_store_short_recompute(sched, req, reason: str, span) -> Optional[str]:
     """The standstill exit of a STORE-SHORT read whose remainder fits in X:
     clear the mark and return ``'expired'`` -- the request goes to its
@@ -902,7 +913,8 @@ def _weg2_store_tail_settles(sched, req) -> bool:
         return False
     x = _weg2_store_short_tail_x(sched)
     remainder = _weg2_store_short_remainder(req)
-    if remainder is None and getattr(req, "_1471_short", False):
+    if (remainder is None and getattr(req, "_1471_short", False)
+            and _weg2_zero_read_settle_on()):
         # PK2 (metal dkr27bparkdraftbar1w209270645, 27.09.): a ZERO answer
         # (#1478: deliverable=0, so no #1324 stamp) is a read that delivered
         # nothing -- D prefills the WHOLE span. Within X that is D's to do now
