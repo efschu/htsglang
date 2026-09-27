@@ -4093,14 +4093,15 @@ KV_TOKEN_CUT_MARKER = "#239 KV-TOKEN-SCHNITT"
 
 def d_kv_token_cut(ns):
     """#239: what ``--d-kv-token-cut`` hands the D solve: ``None`` (off),
-    ``expert_residency.KV_TOKEN_CUT_MAXMIN``, or the stated ratio vector."""
+    ``expert_residency.KV_TOKEN_CUT_MAXMIN`` / ``KV_TOKEN_CUT_JOINT`` (S2b), or
+    the stated ratio vector."""
     from sglang.srt.planner import expert_residency as _er
 
     raw = str(getattr(ns, "d_kv_token_cut", weg2_form.KV_TOKEN_CUT_OFF)
               or weg2_form.KV_TOKEN_CUT_OFF).strip()
     if raw == weg2_form.KV_TOKEN_CUT_OFF:
         return None
-    if raw == _er.KV_TOKEN_CUT_MAXMIN:
+    if raw in (_er.KV_TOKEN_CUT_MAXMIN, _er.KV_TOKEN_CUT_JOINT):
         return raw
     try:
         vec = [float(x) for x in raw.split(",") if x.strip()]
@@ -4109,8 +4110,8 @@ def d_kv_token_cut(ns):
     if not vec or any(x < 0 for x in vec) or sum(vec) <= 0:
         raise Weg2LaunchRefused(
             f"{KV_TOKEN_CUT_MARKER}: --d-kv-token-cut {raw!r} is neither "
-            f"{weg2_form.KV_TOKEN_CUT_OFF!r}, {_er.KV_TOKEN_CUT_MAXMIN!r} nor a "
-            "ratio vector of the D ranks")
+            f"{weg2_form.KV_TOKEN_CUT_OFF!r}, {_er.KV_TOKEN_CUT_MAXMIN!r}, "
+            f"{_er.KV_TOKEN_CUT_JOINT!r} nor a ratio vector of the D ranks")
     return tuple(vec)
 
 
@@ -15086,6 +15087,22 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         return
     for line in plan.lines:
         log(line)
+    if plan.solved_fractions:
+        # #239 S2b: FR_D is the planner's -- the D group runs the edge it solved
+        # together with the token cut (the stated FR was only the start point).
+        from sglang.srt.weg2 import draft_post as _dp
+
+        ns.extra_d = _dp.replace_vector_flag(getattr(ns, "extra_d", "") or "",
+                                             "--rank-moe-resident-fraction",
+                                             plan.solved_fractions)
+        ns.env_d = _dp.replace_env_vector(getattr(ns, "env_d", "") or "",
+                                          "SGLANG_MOE_RESIDENT_EXPERT_FRACTION",
+                                          plan.solved_fractions)
+        log(f"{D_RANK_SOLVE_MARKER} {label} FR-D (#239 S2b) veroeffentlicht: "
+            f"--extra-d --rank-moe-resident-fraction "
+            f"{','.join(_dp._fmt(x) for x in plan.solved_fractions)} (vorher "
+            f"{','.join(str(x) for x in fr_d)}), Token-Schnitt {list(plan.kv_token_cut)}/"
+            f"{_er.KV_TOKEN_SHARE_GRID}")
     if plan.overflow_waves is not None and plan.overflow_waves != _er.pool_overflow_waves(_env_d):
         # rc12e: the D group runs the waves its solved form needs.
         ns.env_d = set_group_env(getattr(ns, "env_d", "") or "",
@@ -16983,8 +17000,10 @@ def build_parser() -> argparse.ArgumentParser:
              "by TOKENS over the Form A ranks (form kv=qsa_forma_dcp). 'off' "
              "(default, byte-identical), 'maxmin' (the D solve picks the shares: "
              "max-min of the relative row ceiling, in 64ths) or a ratio vector "
-             "per D rank. S2: planned and priced (--dry-run prints the cut), a "
-             "real boot is refused by name until S3 wires the worker attention.")
+             "per D rank; 'joint' (S2b) also sets FR_D at every rank's edge "
+             "(max-min of the resident expert share per card). S2: planned and "
+             "priced (--dry-run prints the cut), a real boot is refused by name "
+             "until S3 wires the worker attention.")
     ap.add_argument(
         "--d-foreign-context-mib", default="",
         help="#145 Term (b): je D-RANG (ordinal) der VRAM, den die SCHLAFENDE "
