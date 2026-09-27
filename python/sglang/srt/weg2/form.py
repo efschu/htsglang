@@ -445,6 +445,11 @@ class ModelProfile:
     #: for no measured need; the 5090 alone costs ~0.3 % (W55: cut 552 MiB ->
     #: world_pool 559232 -> 557472).
     driver_carve_min_total_mib: int = 0
+    #: Fix B (weg2/p_row_authority.py): SGLANG_WEG2_P_ROW_AUTHORITY, the #631
+    #: row form on group P. OFF on every row (operator 27.09.: the default turns
+    #: only after a clean metal proof under agent load); a proof boot switches
+    #: it on per docker profile (profiles/27b-row-authority.env, ``_form``).
+    p_row_authority: bool = False
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -465,6 +470,7 @@ class ModelProfile:
         for fld, env_name in PREFIX_SWITCHES:
             out[env_name] = bool(getattr(self, fld))
         out["SGLANG_WEG2_D_PARK_IMMEDIATE"] = bool(self.d_park_immediate)
+        out["SGLANG_WEG2_P_ROW_AUTHORITY"] = bool(self.p_row_authority)
         out["SGLANG_WEG2_FRONT_EXACT_TOKENS"] = bool(self.front_exact_tokens)
         # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
         # installed Form A role plan at run time).
