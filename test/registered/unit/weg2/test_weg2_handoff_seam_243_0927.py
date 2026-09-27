@@ -118,13 +118,40 @@ class Check(unittest.TestCase):
         self.assertEqual(len([l for l in cap.output if "HANDOFF-LOST-KEPT" in l]), 1)
         self.assertIn("uncached=6202 X=12288", cap.output[0])
 
-    def test_second_loss_is_admitted_not_rerouted_again(self):
+    def test_second_loss_over_x_ends_named_never_sent_to_d(self):
         f, p = _front(), _p()
         p.handoff_lost_reroutes = 1
-        with _Fake({"weg2-12-39": LOST_OVER}) as fk, self.assertLogs(F.logger, level="WARNING") as cap:
+        with _Fake({"weg2-12-39": LOST_OVER}) as fk, self.assertLogs(F.logger, level="ERROR") as cap:
+            self.assertTrue(f._hl_check(p, "admit"))  # the caller takes it out of D's line
+        self.assertEqual((fk.drops, list(f.queue)), ([("weg2-12-39", "terminal_w35")], []))
+        self.assertIsInstance(p.fut.exception(), HS.Weg2HandoffLost)
+        self.assertIn("W35 Weg2XReQueueLoop rid=weg2-12-39", str(p.fut.exception()))
+        self.assertIn("WEG2 HANDOFF-LOST-TERMINAL rid=weg2-12-39", cap.output[0])
+        self.assertEqual((f.counters["W35_Weg2XReQueueLoop"], f.counters["handoff_lost_terminal"]), (1, 1))
+
+    def test_second_loss_under_x_stays_kept(self):
+        f, p = _front(), _p()
+        p.handoff_lost_reroutes = 1
+        with _Fake({"weg2-12-39": LOST_UNDER}) as fk:
             self.assertFalse(f._hl_check(p, "admit"))
-        self.assertEqual((fk.drops, list(f.queue)), ([], []))
-        self.assertIn("already re-routed once", cap.output[0])
+        self.assertEqual((fk.drops, list(f.queue), p.fut.done()), ([], [], False))
+
+    def test_sweep_takes_a_terminal_rid_out_of_ds_line(self):
+        f = _front()
+        a, b = _p("weg2-1-1"), _p("weg2-12-39")
+        b.handoff_lost_reroutes = 1
+        f._ready_for_d.extend([a, b])
+        with _Fake({"weg2-12-39": LOST_OVER}):
+            self.assertEqual(f._hl_sweep(), 1)
+        self.assertEqual((list(f._ready_for_d), list(f.queue)), ([a], []))
+        self.assertTrue(b.fut.done())
+
+    def test_handle_generate_answers_a_failed_future_with_503(self):
+        src = open(F.__file__).read()
+        i = src.index("            await fut  # leg 1 done and D awake")
+        blk = src[i:i + 400]
+        self.assertIn("except Exception as e:", blk)
+        self.assertIn("status=503", blk)
 
     def test_missing_module_reads_none(self):
         f, p = _front(), _p()

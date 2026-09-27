@@ -2758,7 +2758,7 @@ class Pending:
     resume_via_p: bool = False
     #: #243 seam (weg2/handoff_seam.py): how often this rid went back to P
     #: because its hand-off was LOST while it waited for a D seat. Bounded at
-    #: one -- a second loss is admitted and left to D's own X gate.
+    #: one -- a second loss over X ends the rid by name (W35), never sent to D.
     handoff_lost_reroutes: int = 0
 
 
@@ -4757,8 +4757,9 @@ class Front:
         R28 ``reroute``, a controller kick); the X-REQUEUE entry itself answers
         a refused LEG 2 and needs its request and seat, which a rid still
         awaiting its admission does not have yet. Its W31/W35 counter is not
-        touched: the bound here is ``handoff_lost_reroutes`` (one), and a
-        second loss is admitted and left to D's own X gate."""
+        touched: the bound here is ``handoff_lost_reroutes`` (one); a second
+        loss over X ends the rid by name (W35, 503 before any stream) -- it
+        is never sent to D to be refused there (D never prefills over X)."""
         if not _hs.enabled():
             return False
         if (not p.leg1_done or p.skip_leg1 or p.d_direct or p.resume_via_p or p.p_only
@@ -4772,17 +4773,36 @@ class Front:
             return False
         credit, uncached, over_x = terms
         noted = self.__dict__.setdefault("_hl_noted", set())
-        if not over_x or p.handoff_lost_reroutes >= 1:
+        if not over_x:
             if p.rid not in noted:
                 noted.add(p.rid)
                 self.counters["handoff_lost_kept_d"] += 1
                 logger.warning(
                     "WEG2 HANDOFF-LOST-KEPT rid=%s first_lost_page=%d page_size=%d credit=%d "
-                    "uncached=%d X=%d reroutes=%d where=%s -- %s", p.rid, st["first_lost_page"],
-                    st["page_size"], credit, uncached, x, p.handoff_lost_reroutes, where,
-                    "D prefills the lost tail itself (<= X, law 4)" if not over_x else
-                    "already re-routed once: admitted, D's own X gate stands")
+                    "uncached=%d X=%d reroutes=%d where=%s -- D prefills the lost tail itself "
+                    "(<= X, law 4)", p.rid, st["first_lost_page"], st["page_size"], credit,
+                    uncached, x, p.handoff_lost_reroutes, where)
             return False
+        if p.handoff_lost_reroutes >= 1:
+            # Second loss over X: D never prefills over X (user veto) and the
+            # front never sends a rid there on purpose to let D's X gate refuse
+            # it -- the rid ends NAMED before its stream exists (a 503 from
+            # handle_generate's own answer to a failed future), W35 like a
+            # second X refusal.
+            noted.discard(p.rid)
+            _hs.drop(p.rid, "terminal_w35")
+            self.counters["W35_Weg2XReQueueLoop"] += 1
+            self.counters["handoff_lost_terminal"] += 1
+            msg = (f"W35 Weg2XReQueueLoop rid={p.rid}: its hand-off was lost a second time while it "
+                   f"waited for a D seat (first_lost_page={st['first_lost_page']} credit={credit} "
+                   f"uncached={uncached} > X={x}); D never prefills over X -- refused by name "
+                   f"rather than a third P prefill; retry the request")
+            logger.error("WEG2 HANDOFF-LOST-TERMINAL rid=%s first_lost_page=%d credit=%d uncached=%d "
+                         "X=%d reroutes=%d where=%s -- %s", p.rid, st["first_lost_page"], credit,
+                         uncached, x, p.handoff_lost_reroutes, where, msg)
+            if not p.fut.done():
+                p.fut.set_exception(_hs.Weg2HandoffLost(msg))
+            return True
         noted.discard(p.rid)
         _hs.drop(p.rid, "reroute_fresh")
         p.handoff_lost_reroutes += 1
