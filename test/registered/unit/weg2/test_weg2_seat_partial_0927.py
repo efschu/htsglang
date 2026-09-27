@@ -63,7 +63,8 @@ class KvTrigger(unittest.TestCase):
         self.assertEqual(batch.released, [(R(9), True)])
         self.assertEqual(DS.park_site(sched.waiting_queue[-1]), DS.SITE_PRESSURE)
         self.assertIn("trigger=kv", cap.output[0])
-        self.assertIn("pages_out=window=", cap.output[0])  # no #248 module: the requested window
+        # with #248 present keep_role answers a page count, without it the requested window is logged
+        self.assertRegex(cap.output[0], r"pages_out=(window=\d+-\d+(\(retain\))?|\d+)")
         self.assertIsNone(sched._weg2_sa_no_token, "the signal is consumed")
         self.assertEqual(sched.calls, [[True]], "the verdict went through the group MIN")
 
@@ -101,7 +102,11 @@ class PartialKeep(unittest.TestCase):
         # older needs 5000, 100 free -> shortfall 4900 -> 77 pages of 64; victim span 1000 -> 16 pages
         sched, _ = _sched([], [], avail=100)
         victim, older = _req(R(9), span=10000), _req(R(3), span=5000)
-        with mock.patch.dict(sys.modules, {MOD: None}):
+        # "no module": once #248 is imported the package attribute answers ``from ... import``,
+        # so the attribute is hidden as well as the sys.modules entry
+        import sglang.srt.weg2 as _w2
+        with mock.patch.dict(sys.modules, {MOD: None}), \
+             mock.patch.object(_w2, "handoff_pending", None, create=True):
             self.assertEqual(DPR._partial_keep(sched, victim, older), "window=80-157(retain)")
 
     def test_keep_role_called_with_the_window_and_its_return_logged(self):
