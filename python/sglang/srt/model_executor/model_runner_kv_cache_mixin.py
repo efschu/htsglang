@@ -4813,9 +4813,14 @@ class ModelRunnerKVCacheMixin:
                     extra_args["use_mla"] = self.use_mla_backend
                 else:
                     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+                    from sglang.srt.rank_role import this_rank_is_form_a_worker
 
                     _kv_pool_class = QSATokenToKVPool
                     extra_args.update(
+                        # #239 S0: a Form A worker runs no indexer -- no
+                        # compressed index, so no HiCache sidecar either
+                        # (hybrid_pool_assembler registers none for it).
+                        qsa_index_on_rank=not this_rank_is_form_a_worker(),
                         qsa_index_kv_heads=_qsa_profile.kv_heads,
                         qsa_index_head_dim=_qsa_profile.head_dim,
                         qsa_compress_ratio=_qsa_profile.compress_ratio,
