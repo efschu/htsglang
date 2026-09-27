@@ -90,6 +90,21 @@ def container_log_dirs(inspect: List[dict], host_prefix: str) -> Dict[str, str]:
     return res
 
 
+def container_health_output(inspect: List[dict]) -> Dict[str, str]:
+    """name -> the last healthcheck's output (redacted, one line, 300 chars)."""
+    from . import redact
+    out = {}
+    for c in inspect:
+        name = (c.get("Name") or "").lstrip("/")
+        log = (((c.get("State") or {}).get("Health") or {}).get("Log") or [])
+        if log:
+            txt = " ".join(str(log[-1].get("Output") or "").split())
+            txt = redact.clean(txt)
+            if txt:
+                out[name] = txt[:300]
+    return out
+
+
 class Sampler:
     def __init__(self, name: str, period: float, fn: Callable[[], object]):
         self.name, self.period, self.fn = name, period, fn
@@ -210,16 +225,19 @@ class Sources:
         ps = run(ssh + ["docker ps -a --filter name=htsglang --format '%s'" % DOCKER_PS_FORMAT], 12.0)
         rows = parse_docker_ps(ps)
         running = [r["Names"] for r in rows if (r.get("State") == "running")]
-        dirs = {}
+        dirs, health_out = {}, {}
         if running:
             ins = run(ssh + ["docker inspect " + " ".join(running)], 12.0)
             try:
-                dirs = container_log_dirs(json.loads(ins), self.cfg.get("docker_host_prefix", ""))
+                parsed = json.loads(ins)
+                dirs = container_log_dirs(parsed, self.cfg.get("docker_host_prefix", ""))
+                health_out = container_health_output(parsed)
             except ValueError:
                 dirs = {}
         rows.sort(key=lambda r: (r.get("State") != "running", r.get("CreatedAt", "")), reverse=False)
         for r in rows:
             r["evidence_dir"] = dirs.get(r.get("Names"))
+            r["health_output"] = health_out.get(r.get("Names"))
         return rows[:12]
 
     def sample_gpuq(self):

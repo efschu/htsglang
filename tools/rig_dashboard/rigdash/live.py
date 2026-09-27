@@ -237,7 +237,7 @@ class Boot:
             # the bare "Traceback (most recent call last):" says THAT, the
             # named line (W27 ..., OOM ...) says WHY -- the view prefers WHY
             "bare": "Traceback (most recent" in text and not any(
-                k in text for k in ("W27 ", "#791b", "SPLIT refused", "ADMISSION SPLIT", "CUDA out of memory")),
+                k in text for k in ("Refused: #", "#791b", "SPLIT refused", "ADMISSION SPLIT", "CUDA out of memory")),
         })
         self.counts["stop"] += 1
 

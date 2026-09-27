@@ -278,11 +278,21 @@ class HealthTests(unittest.TestCase):
         b = self._boot(front={"queue": 3, "outstanding": {}}, last_activity_any=self.NOW - 20)
         self.assertIsNone(health.assess(b, self.NOW)["state"])
 
-    def test_docker_unhealthy(self):
-        b = self._boot(container={"Names": "c", "State": "running", "Status": "Up 24 minutes (unhealthy)"})
+    def test_docker_unhealthy_without_progress_is_a_hang(self):
+        b = self._boot(container={"Names": "c", "State": "running", "Status": "Up 24 minutes (unhealthy)"},
+                       last_activity_any=self.NOW - 300)
         a = health.assess(b, self.NOW)
         self.assertEqual(a["state"], "HAENGT")
         self.assertIn("unhealthy", a["reasons"][0]["text"])
+
+    def test_docker_unhealthy_with_progress_is_only_a_contradiction_note(self):
+        b = self._boot(container={"Names": "c", "State": "running", "Status": "Up 51 minutes (unhealthy)",
+                                  "health_output": "UNHEALTHY: stop pattern 'W27 ' in the P log"},
+                       last_activity_any=self.NOW - 5)
+        a = health.assess(b, self.NOW)
+        self.assertEqual(a["state"], "WARNUNG")
+        self.assertIn("widerspricht dem Fortschritt", a["reasons"][0]["text"])
+        self.assertIn("W27", a["reasons"][0]["text"])
 
     def test_finished_boot_not_judged_but_ended_on_named(self):
         t = self.NOW - 3000
@@ -296,6 +306,10 @@ class HealthTests(unittest.TestCase):
 class StopScanTests(unittest.TestCase):
     def test_stop_lines_from_a_p_log(self):
         self.assertTrue(parse.stop_match(TB_PREFIXED))
+        # launcher prose that merely NAMES the W27 guard is no stop (27.09. false alarm)
+        self.assertFalse(parse.stop_match("[2026-09-27T14:22:10Z] WEG2-LAUNCH W27 PP WIDTH guard armed: a divergence "
+                                          "raises PPWidthDivergenceRefused: #1233 at the receiver"))
+        self.assertFalse(parse.stop_match("[2026-09-27 14:22:10 PP0] width census W27 ok rows=512"))
         self.assertTrue(parse.stop_match(W27_UNPREFIXED))
         self.assertFalse(parse.stop_match(FI_SPLIT_OFF))
         with tempfile.TemporaryDirectory() as d:

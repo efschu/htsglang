@@ -24,6 +24,7 @@ from typing import List, Optional
 HEALTH_FRESH_S = 120.0   # a WEG2-HEALTH line older than this no longer describes now
 STOP_RECOVERED_S = 30.0  # activity this long after a stop means it ran on
 HANG_S = 60.0            # queued work and no prefill/decode line for this long
+PROGRESS_S = 60.0        # a prefill/decode line this recent is forward progress
 
 
 def _age(now: float, t: Optional[float]) -> Optional[float]:
@@ -73,11 +74,21 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
         else:
             add("dead", g, text, s["t"])
 
-    # 3. Docker health
+    # 3. Docker health.  Measured 27.09. ~14:40Z: the container healthcheck
+    # itself raised a false "unhealthy" (its "W27 " pattern hit launcher prose)
+    # while the model was serving.  So "unhealthy" alone is only a HANG when the
+    # model also makes no progress; with prefill/decode lines in the last
+    # PROGRESS_S it is a yellow contradiction note carrying the healthcheck text.
     status = c.get("Status") or ""
     if "unhealthy" in status:
-        add("dead" if any(r["level"] == "dead" for r in reasons) else "hang", None,
-            "Docker meldet den Container %s: %s" % (c.get("Names"), status))
+        idle_now = _age(now, b.get("last_activity_any"))
+        hc = (c.get("health_output") or "").strip()
+        if idle_now is not None and idle_now < PROGRESS_S:
+            add("warn", None, "Docker-Health widerspricht dem Fortschritt: %s meldet unhealthy, aber vor %d s kam "
+                "eine Prefill-/Decode-Zeile%s" % (c.get("Names"), idle_now, (" -- Healthcheck: " + hc[:300]) if hc else ""))
+        else:
+            add("dead" if any(r["level"] == "dead" for r in reasons) else "hang", None,
+                "Docker meldet den Container %s: %s%s" % (c.get("Names"), status, (" -- Healthcheck: " + hc[:300]) if hc else ""))
 
     # 4. queued work, no progress
     fr = b.get("front") or {}

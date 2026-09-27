@@ -70,8 +70,12 @@ F_HEALTH = _f(r"WEG2-HEALTH group=(\w+) http_ok=(\w+) process_alive=(\w+)(?: str
 # harmless "FI-GRAPH-SPLIT off" status line also contains "SPLIT" and must not
 # count.  DEBUG-HOLD is the #1223 hold a rank enters after such a stop -- the
 # process is alive and deliberately parked, which from outside is a hang.
-STOP_RE = _f(r"W27 |#791b|SPLIT refused|ADMISSION SPLIT|Traceback \(most recent|CUDA out of memory|DEBUG-HOLD rank=")
-STOP_EXCLUDE = ("FI-GRAPH-SPLIT off",)
+# 27.09. ~14:40Z: the bare "W27 " also matched PROSE in a WEG2-LAUNCH line (the
+# launcher explains its guards) and raised a false alarm; a real W27 stop is a
+# named refusal ("...Refused: #1233 W27 PP WIDTH DIVERGENCE REFUSED") under a
+# scheduler traceback, which the patterns below still catch.
+STOP_RE = _f(r"\b\w+Refused: #\d+|#791b|SPLIT refused|ADMISSION SPLIT|Traceback \(most recent|CUDA out of memory|DEBUG-HOLD rank=")
+STOP_EXCLUDE = ("FI-GRAPH-SPLIT off", "WEG2-LAUNCH")
 
 
 def stop_match(line: str) -> bool:

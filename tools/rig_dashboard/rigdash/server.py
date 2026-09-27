@@ -104,7 +104,7 @@ def attach_containers(boots, containers):
             hit = cands[0]
         if hit is not None and hit.get("Names") not in claimed:
             claimed.add(hit.get("Names"))
-            b["container"] = {k: hit.get(k) for k in ("Names", "Image", "Status", "State", "Ports", "RunningFor")}
+            b["container"] = {k: hit.get(k) for k in ("Names", "Image", "Status", "State", "Ports", "RunningFor", "health_output")}
     return boots
 
 
