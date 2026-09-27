@@ -1275,6 +1275,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        # rc12 (D, all ranks, 23:12:47Z: "H-leaf extra: [62, 64, 60, 63]" +
+        # "4 stale nodes in host_leaves"): the #1417 prefetch pins name nodes
+        # of the tree being destroyed. Kept across the sleep flush, the held
+        # request's admission (`pop_prefetch_loaded_tokens`) unpinned them on
+        # the DEAD tree, and `dec_host_lock_ref` filed its host leaves into the
+        # NEW tree's leaf set. Unpinned here, while that tree is still current
+        # -- and before the arena release below, which skips host-locked nodes.
+        for _rid in list(getattr(self, "_prefetch_span_pins", None) or ()):
+            self._unpin_prefetched_span(_rid)
         # H81: the old tree's arena references go back FIRST -- see
         # `_release_host_values_before_reset` (fnNV4f2 mamba_full).
         self._release_host_values_before_reset()
