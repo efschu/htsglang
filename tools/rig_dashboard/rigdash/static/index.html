@@ -279,6 +279,7 @@ function prefillTile(b, g, color, label, binders, now) {
   return `<div class="tile"><div class="label"><i style="background:${color}"></i>${label}</div>
     <div class="big num">${fmt(src && src.tps)}<small>tok/s</small></div>
     <div class="state">${state}</div>
+    <div class="state">letzte 1 s: <b class="num">${fmt(p.one_s)}</b> tok/s <span class="muted">&middot; kurzes Fenster, 0 wenn in der Sekunde keine Zeile fiel</span></div>
     ${kv([
       ["Rechenrate je Rang (gpu-ms)", ranks],
       [active ? "Tokens / Chunks im Fenster" : "Tokens / Chunks im letzten Schub", src ? `${fmt(src.tokens)} / ${fmt(src.chunks)}` : "—"],
@@ -286,6 +287,7 @@ function prefillTile(b, g, color, label, binders, now) {
       active ? ["Durchsatz Wandzeit (Tokens / " + Math.round(p.window_s) + " s)", fmt(n.tokens / p.window_s)] : null,
       ["Warteschlange &middot; ausstehende Tokens", `${fmt(p.queue)} &middot; ${fmt(p.pending_tok)}`],
       src && src.wall_confounded_tps != null ? ["input throughput (wall-konfundiert)", fmt(src.wall_confounded_tps), "wc"] : null,
+      ["&Oslash; tok/s/W &middot; 60 s (Kurvenmittel, Ruhe = 0)", fmt(((b.series || {}).per_w_60s || {})[g + "_prefill_tps"], 2)],
     ])}
     ${charts}</div>`;
 }
@@ -302,10 +304,12 @@ function decodeTile(b, g, color, binders, now) {
   return `<div class="tile"><div class="label"><i style="background:${color}"></i>Decode${g !== "D" ? " (" + g + ")" : ""}</div>
     <div class="big num">${fmt(v, 1)}<small>tok/s</small></div>
     <div class="state">${state}</div>
+    <div class="state">letzte 1 s: <b class="num">${fmt(d.one_s, 1)}</b> tok/s <span class="muted">&middot; kurzes Fenster, 0 wenn in der Sekunde keine Zeile fiel</span></div>
     ${kv([
       ["laufende Anfragen (bs) &middot; je Anfrage", `${fmt(d.running)} &middot; ${fmt(per, 1)} tok/s`],
       ["accept len &middot; accept rate", `${fmt(d.accept_len, 2)} &middot; ${fmt(d.accept_rate, 2)}`],
       ["Rechenrate (bs&times;accept / gpu-ms)", d.compute_tps != null ? `${fmt(d.compute_tps, 1)} tok/s` : "—"],
+      ["&Oslash; tok/s/W &middot; 60 s (Kurvenmittel, Ruhe = 0)", fmt(((b.series || {}).per_w_60s || {})[g + "_decode_tps"], 2)],
       ["KV-Belegung &middot; CUDA-Graph", `${d.full_use != null ? fmt(d.full_use * 100) + " %" : "—"} &middot; ${d.cuda_graph == null ? "—" : d.cuda_graph ? "ja" : "nein"}`],
     ])}
     ${charts}</div>`;
@@ -325,8 +329,24 @@ function alarmHtml(b, now) {
 }
 
 const pct = (x) => x == null ? "\u2014" : fmt(100 * x, x >= 0.995 || x < 0.1 ? 1 : 0) + " %";
+function bootTile(label, tok, src, rGpu, rGpuNote, rWall, e) {
+  e = e || {};
+  const wall = rWall == null ? "\u2014" : fmt(rWall, rWall < 100 ? 1 : 0);
+  return `<div class="tile"><div class="label">${label}</div>
+    <div class="big num" style="font-size:24px">${fmt(tok)}<small>Tok (Summe)</small></div><div class="state">${src}</div>
+    ${kv([
+      ["&Oslash; tok/s seit Boot &middot; GPU-Rechenzeit", rGpu == null ? "\u2014" : fmt(rGpu, rGpu < 100 ? 1 : 0)],
+      ["&Oslash; tok/s seit Boot &middot; Wandzeit", wall],
+      ["Energie je Token", e.j_per_tok == null ? "\u2014" : `${fmt(e.j_per_tok, e.j_per_tok < 1 ? 3 : 2)} J &middot; ${fmt(e.wh_per_1k, 3)} Wh/1k`],
+      ["&Oslash; tok/s/W seit Boot (Token / Energie)", e.tok_per_j == null ? "\u2014" : fmt(e.tok_per_j, 2)],
+    ])}
+    <div class="muted" style="font-size:10px">${rGpuNote}; Wandzeit = &Sigma; Token / Zeit seit der ersten Logzeile</div></div>`;
+}
+
 function cacheHtml(b) {
   const c = b.cache || {}, t = b.totals || {};
+  const en = b.energy || {};
+  const E = (en.cls) || {};
   const row = (label, g) => {
     const x = c[g]; if (!x) return "";
     const w = x.window || {}, a = x.boot || {};
@@ -344,10 +364,15 @@ function cacheHtml(b) {
   const prog = t.read_progress != null && t.read_progress < 1 ? ` <span class="chip warn">Z\u00e4hlung l\u00e4uft: ${fmt(100 * t.read_progress)} % des Logs gelesen</span>` : "";
   return `<div class="cachebox">
     <div class="tiles" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin-bottom:10px">
-      <div class="tile"><div class="label">P neu prefillt seit Boot</div><div class="big num" style="font-size:24px">${fmt(t.p_new)}<small>Tok</small></div><div class="state">&Sigma; #new-token, Zeile &bdquo;Prefill batch&ldquo;, nur PP0 (${fmt(t.p_chunks)} Chunks), ohne Cache-Treffer</div></div>
-      <div class="tile"><div class="label">D neu prefillt seit Boot</div><div class="big num" style="font-size:24px">${fmt(t.d_new)}<small>Tok</small></div><div class="state">&Sigma; #new-token, &bdquo;Prefill batch&ldquo;, nur TP0 (${fmt(t.d_chunks)} Chunks), ohne &Uuml;bernahme/Cache</div></div>
-      <div class="tile"><div class="label">dekodiert seit Boot</div><div class="big num" style="font-size:24px">${fmt(t.decoded)}<small>Tok</small></div><div class="state">&Sigma; completion_tokens der Front-Zeilen WEG2-SERVED (je Anfrage einmal, ${fmt(t.served_requests)} D-Beine)</div></div>
+      ${bootTile("P-Prefill seit Boot", t.p_new, `&Sigma; #new-token, Zeile &bdquo;Prefill batch&ldquo;, nur PP0 (${fmt(t.p_chunks)} Chunks), ohne Cache-Treffer`, t.p_rate_gpu, "GPU-Rechenzeit: &Sigma; Token / &Sigma; compute-ms je Rang, langsamster Rang", t.p_rate_wall, E.P)}
+      ${bootTile("D-Prefill seit Boot", t.d_new, `&Sigma; #new-token, &bdquo;Prefill batch&ldquo;, nur TP0 (${fmt(t.d_chunks)} Chunks), ohne &Uuml;bernahme/Cache`, t.d_rate_gpu, "GPU-Rechenzeit: &Sigma; Token / &Sigma; compute-ms je Rang, langsamster Rang", t.d_rate_wall, E.D)}
+      ${bootTile("Decode seit Boot", t.decoded, `&Sigma; completion_tokens der Front-Zeilen WEG2-SERVED (je Anfrage einmal, ${fmt(t.served_requests)} D-Beine)`, t.dec_rate_gpu, "GPU-Rechenzeit: &Sigma; Token / &Sigma; gpu-ms der Zeilen &bdquo;Decode rank batch&ldquo; (TP0)", t.dec_rate_wall, E.dec)}
     </div>
+    <div class="muted" style="font-size:11px;margin:-4px 0 10px">Energie je Token: jedes abgeschlossene 5-s-Intervall kostet
+      (Mittel der Summe power.draw aller 3 Karten) &times; 5 s; das geht an die Klassen, von denen in dem Intervall eine Logzeile fiel
+      (mehrere: zu gleichen Teilen); Intervalle ohne Arbeit z&auml;hlen als Leerlauf (${fmt((en.idle_j || 0) / 3600, 1)} Wh) und keiner Klasse.
+      Token nur aus denselben Intervallen. Gemessen seit der Dashboard-Messung l&auml;uft: Abdeckung
+      ${en.coverage == null ? "\u2014" : fmt(100 * en.coverage) + " %"} der Bootdauer (${fmt((en.covered_s || 0) / 60)} min).</div>
     <h3 style="font-size:13px;margin:4px 0 6px">Cache-Treffer (aus den Boot-Logs)${prog}</h3>
     <div class="tablewrap"><table>
       <tr><th></th><th class="num">aus Cache / neu &middot; 60 s</th><th class="num">seit Boot</th><th class="num">L2 Host: #988 Load-back &middot; 60 s</th><th class="num">seit Boot</th><th class="num">MAMBA-HOST-RESUME</th><th class="num">L3 Store: unvollst. Lesungen</th></tr>

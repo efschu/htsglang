@@ -181,6 +181,8 @@ class Boot:
         # totals since boot (whole file read) and a 60-s event window, per group
         self.tot = collections.defaultdict(collections.Counter)
         self.win = collections.deque(maxlen=20000)
+        self.rank_tot = collections.defaultdict(lambda: collections.defaultdict(lambda: [0, 0.0]))
+        self.served_ev = collections.deque(maxlen=5000)    # (t, completion_tokens) of served D legs
 
     def add_file(self, group: str, path: str):
         if group in self.tails:
@@ -273,6 +275,13 @@ class Boot:
         if k in ("prefill_rank", "prefill_batch", "decode_batch", "decode_rank"):
             self.ev["%s_%s" % (group, k)].append(ev)
             self.last["%s_%s" % (group, k)] = ev
+            if k == "prefill_rank" and ev.get("compute_ms") is not None:
+                a = self.rank_tot[group]["%s%s" % (ev.get("rk", ""), ev.get("rank", 0))]
+                a[0] += ev.get("new_tok") or 0
+                a[1] += ev["compute_ms"]
+            if k == "decode_rank" and rank0 and ev.get("gpu_ms"):
+                self.tot[group]["dec_gpu_ms"] += ev["gpu_ms"]
+                self.tot[group]["dec_rounds"] += 1
             if k == "prefill_batch" and rank0:
                 # one "Prefill batch" line per chunk on the FIRST rank only (PP0/TP0):
                 # the other ranks log the same chunk again
@@ -310,6 +319,8 @@ class Boot:
             tt["prompt"] += ev.get("prompt_tokens") or 0
             tt["cached"] += ev.get("cached_tokens") or 0
             tt["completion"] += ev.get("completion_tokens") or 0
+            if ev.get("completion_tokens"):
+                self.served_ev.append((ev["t"], ev["completion_tokens"]))
             self.win.append((ev["t"], key, "sv", ev.get("prompt_tokens") or 0, ev.get("cached_tokens") or 0))
             return
         if k == "flip_begin":
@@ -388,8 +399,12 @@ class Boot:
         last_t = ranks[-1]["t"] if ranks else None
         burst = self._prefill_window(ranks, batches, last_t - 20.0) if last_t else None
         lb = self.last.get("%s_prefill_batch" % g)
+        # the last 1 s: log stamps are whole seconds, so "last second" = lines
+        # stamped in the previous or the current second; 0 if none fell
+        one = self._prefill_window(ranks, batches, float(int(now)) - 1.0)
         return {
             "window_s": WINDOW_S,
+            "one_s": one["tps"] or 0.0,
             "now": win,
             "last_burst": burst,
             "last_t": last_t,
@@ -408,8 +423,11 @@ class Boot:
             ms = sum(e["gpu_ms"] for e in rr)
             bs = sum((e.get("bs") or 0) for e in rr)
             compute = (bs * last["accept_len"]) / (ms / 1000.0) if ms > 0 else None
+        one = [e["gen_tps"] for e in self.ev["%s_decode_batch" % g]
+               if e["t"] >= float(int(now)) - 1.0 and e.get("gen_tps") is not None]
         return {
             "window_s": WINDOW_S,
+            "one_s": (sum(one) / len(one)) if one else 0.0,
             "gen_tps": (sum(gen) / len(gen)) if gen else None,
             "gen_tps_last": last.get("gen_tps") if last else None,
             "running": last.get("running") if last else None,
@@ -507,12 +525,60 @@ class Boot:
             v["series"] = self.series(now)
         return v
 
+    def bucket_activity(self, t0: float, n: int, bucket_s: float = BUCKET_S) -> List[dict]:
+        """Per bucket [t0 + i*b, t0 + (i+1)*b): which class computed and how many tokens.
+
+        P/D: a 'Prefill rank batch' line of that group = the class computed; its
+        tokens are the first rank's 'Prefill batch' #new-token.  Decode: a
+        'Decode batch' or 'Decode rank batch' line of D = decode computed; its
+        tokens are the completion_tokens of the requests the front served in
+        the bucket (exact per request, attributed to the bucket it ended in).
+        """
+        out = [{"P": False, "D": False, "dec": False, "P_tok": 0, "D_tok": 0, "dec_tok": 0} for _ in range(n)]
+
+        def idx(t):
+            i = int((t - t0) // bucket_s)
+            return i if 0 <= i < n else None
+
+        for g, key in (("P", "P"), ("single", "P"), ("D", "D")):
+            for e in self.ev.get("%s_prefill_rank" % g, ()):
+                i = idx(e["t"])
+                if i is not None:
+                    out[i][key] = True
+            for e in self.ev.get("%s_prefill_batch" % g, ()):
+                i = idx(e["t"])
+                if i is not None and e.get("rank") in (None, 0):
+                    out[i][key + "_tok"] += e.get("new_tok") or 0
+        for g in ("D", "single"):
+            for k in ("decode_batch", "decode_rank"):
+                for e in self.ev.get("%s_%s" % (g, k), ()):
+                    i = idx(e["t"])
+                    if i is not None:
+                        out[i]["dec"] = True
+        for t, tok in self.served_ev:
+            i = idx(t)
+            if i is not None:
+                out[i]["dec_tok"] += tok
+        return out
+
     def totals_view(self) -> dict:
         p, d = self.tot.get("P", {}), self.tot.get("D", {})
         s1 = self.tot.get("single", {})
         dec = sum(self.tot.get(k, {}).get("completion", 0) for k in list(self.tot) if k.startswith("served_"))
+        def gpu_rate(g):
+            rated = [a[0] / (a[1] / 1000.0) for a in self.rank_tot.get(g, {}).values() if a[1] > 0]
+            return min(rated) if rated else None     # the slowest rank bounds the group, as in the tiles
+        last_t = max([t for t in self._last_t.values() if t] or [0]) or None
+        wall = (last_t - self.first_t) if (last_t and self.first_t and last_t > self.first_t) else None
+        p_new = p.get("new", 0) + s1.get("new", 0)
+        dec_ms = d.get("dec_gpu_ms", 0) + s1.get("dec_gpu_ms", 0)
         return {
-            "p_new": p.get("new", 0) + s1.get("new", 0), "d_new": d.get("new", 0),
+            "boot_wall_s": wall,
+            "p_rate_gpu": gpu_rate("P") or gpu_rate("single"), "d_rate_gpu": gpu_rate("D"),
+            "p_rate_wall": (p_new / wall) if wall else None, "d_rate_wall": (d.get("new", 0) / wall) if wall else None,
+            "dec_rate_gpu": (dec / (dec_ms / 1000.0)) if dec_ms else None,
+            "dec_rate_wall": (dec / wall) if wall else None,
+            "p_new": p_new, "d_new": d.get("new", 0),
             "p_chunks": p.get("chunks", 0), "d_chunks": d.get("chunks", 0),
             "decoded": dec, "served_requests": self.tot.get("served_D", {}).get("n", 0),
             "read_progress": round(self.read_progress(), 4),
@@ -599,9 +665,15 @@ class LiveLogs:
             self.scan(now)
         with self.lock:
             boots = list(self.boots.values())
-        # newest first, so the live boot is caught up before the history rows
+        # newest first, and a LIVE boot gets up to 8 slices per cycle, so after a
+        # restart its verdict and numbers are current long before the history rows
         for b in sorted(boots, key=lambda x: -x.newest_mtime):
             b.poll()
+            if now - b.newest_mtime < LIVE_S:
+                for _ in range(7):
+                    if b.read_progress() >= 0.999:
+                        break
+                    b.poll()
 
     def snapshot(self, with_series: bool = True, max_boots: int = 10) -> List[dict]:
         now = time.time()

@@ -13,7 +13,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from rigdash import health, live, parse, server, sources  # noqa: E402
+from rigdash import energy, health, live, parse, server, sources  # noqa: E402
 
 P_RANK0 = ("[2026-09-27 09:20:28 PP0] Prefill rank batch, #new-token: 16384, #cached-token: 0, #chunks: 1, "
            "gpu-ms: 3255.5 (compute 3255.5, wait 0.0) (wait by family: tp.all_reduce 0.0/29x) bubble_ms=16.5 "
@@ -160,6 +160,11 @@ class LiveTests(unittest.TestCase):
         self.assertAlmostEqual(p["wall_confounded_tps"], 4898.99)
         d = v["decode"]["D"]
         self.assertAlmostEqual(d["gen_tps"], 123.73)
+        self.assertIn("one_s", d)
+        self.assertIn("one_s", v["prefill"]["P"])
+        t = v["totals"]
+        self.assertAlmostEqual(t["p_rate_gpu"], 16384 / 3.2555, places=0)   # since boot, slowest rank, GPU time
+        self.assertIsNotNone(t["boot_wall_s"])
         # compute-derived: bs 5 * accept 2.70 / 0.1177 s
         self.assertAlmostEqual(d["compute_tps"], 5 * 2.70 / 0.1177, places=1)
         self.assertIn("P_prefill_tps", v["series"])
@@ -419,6 +424,36 @@ class SeriesFillTests(unittest.TestCase):
         self.assertEqual(ser["power_sum_w"], [500.0, 450.0, None, 200.0])
         self.assertAlmostEqual(ser["D_decode_tps_per_w"][0], 0.2)
         self.assertIsNone(ser["D_decode_tps_per_w"][2])
+
+
+class EnergyTests(unittest.TestCase):
+    def test_power_goes_to_the_classes_that_computed_idle_to_none(self):
+        book = energy.EnergyBook(None, 5.0)
+        now = 1000.0 + 5 * 4 + energy.LAG_S + 0.1         # buckets 1000..1015 closed
+        act = [{"P": True, "D": False, "dec": False, "P_tok": 1000, "D_tok": 0, "dec_tok": 0},
+               {"P": False, "D": True, "dec": True, "P_tok": 0, "D_tok": 50, "dec_tok": 40},
+               {"P": False, "D": False, "dec": False, "P_tok": 0, "D_tok": 0, "dec_tok": 0},
+               {"P": True, "D": False, "dec": False, "P_tok": 1000, "D_tok": 0, "dec_tok": 0}]
+        pw = [600.0, 400.0, 150.0, None]                  # last bucket: no power sample -> not covered
+        book.update("b", 1000.0, lambda s0, n, bs: act[:n], lambda s0, n, bs: pw[:n], now)
+        v = book.view("b", 20.0)
+        self.assertEqual(v["covered_s"], 15.0)
+        self.assertAlmostEqual(v["coverage"], 0.75)
+        self.assertEqual(v["cls"]["P"]["j"], 3000.0)       # 600 W x 5 s, P alone
+        self.assertEqual(v["cls"]["P"]["tok"], 1000)       # the uncovered bucket's 1000 tokens are NOT counted
+        self.assertAlmostEqual(v["cls"]["P"]["j_per_tok"], 3.0)
+        self.assertEqual(v["cls"]["D"]["j"], 1000.0)       # 400 W x 5 s split between D-prefill and decode
+        self.assertEqual(v["cls"]["dec"]["j"], 1000.0)
+        self.assertAlmostEqual(v["cls"]["dec"]["j_per_tok"], 25.0)
+        self.assertAlmostEqual(v["cls"]["dec"]["wh_per_1k"], 25.0 * 1000 / 3600)
+        self.assertEqual(v["idle_j"], 750.0)
+        # a second update accounts nothing twice
+        book.update("b", 1000.0, lambda s0, n, bs: act[:n], lambda s0, n, bs: pw[:n], now)
+        self.assertEqual(book.view("b", 20.0)["cls"]["P"]["j"], 3000.0)
+
+    def test_power_buckets_mean_of_card_sums(self):
+        gs = {"t": [1000.5, 1002.0, 1006.0], "power": [[100, 200, 300], [100, 100, 100], [50, 50, 50]]}
+        self.assertEqual(energy.power_buckets(gs, 1000.0, 3, 5.0), [450.0, 150.0, None])
 
 
 class RedactTests(unittest.TestCase):

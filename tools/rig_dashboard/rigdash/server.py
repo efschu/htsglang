@@ -19,7 +19,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import health, live, redact, sources, weg2line
+from . import energy, health, live, redact, sources, weg2line
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -78,8 +78,12 @@ def finish_series(b: dict, gpu_series: Optional[dict], now: float, bucket_s: flo
                 acc[i][1] += 1
         power = [(a0 / n) if n else None for a0, n in acc]
     ser["power_sum_w"] = power
+    ser["per_w_60s"] = {}
     for k in keys:
         ser[k + "_per_w"] = [(v / p) if (v is not None and p) else None for v, p in zip(ser[k], power)]
+        # mean of the tok/s/W curve over the last 60 s; rest intervals count as 0
+        last = [x for x in ser[k + "_per_w"][-int(60 / bucket_s):] if x is not None]
+        ser["per_w_60s"][k] = (sum(last) / len(last)) if last else None
 
 
 def attach_containers(boots, containers):
@@ -122,14 +126,39 @@ class App:
         }
         self.src = sources.Sources(cfg)
         self.weg2 = weg2line.Weg2Lines(cfg["docker_ssh"], args.release_profile or [])
+        self.energy = energy.EnergyBook(args.state_dir or None, live.BUCKET_S)
         self.stop = threading.Event()
         self.t0 = time.time()
         self.version = _version()
 
+    def energy_loop(self, stop: threading.Event):
+        """Every 5 s: account the closed 5-s intervals of every live boot (energy.py)."""
+        while not stop.is_set():
+            try:
+                now = time.time()
+                gs = self.src.gpu_series()
+                with self.logs.lock:
+                    boots = list(self.logs.boots.values())
+                for b in boots:
+                    if now - b.newest_mtime > live.LIVE_S or b.read_progress() < 0.999:
+                        continue
+
+                    def act(start, n, bs, b=b):
+                        with b.lock:
+                            return b.bucket_activity(start, n, bs)
+
+                    self.energy.update(b.stem, b.first_t, act,
+                                       lambda start, n, bs: energy.power_buckets(gs, start, n, bs), now)
+                self.energy.save(now)
+            except Exception as e:  # keep accounting alive; visible in /api/live
+                self.energy_error = "%s: %s" % (type(e).__name__, e)
+            stop.wait(5.0)
+
     def start(self):
         self.logs.scan()
         for target, name in ((self.logs.run_forever, "rigdash-logs"),
-                             (self.src.run_forever, "rigdash-sources")):
+                             (self.src.run_forever, "rigdash-sources"),
+                             (self.energy_loop, "rigdash-energy")):
             threading.Thread(target=target, args=(self.stop,), name=name, daemon=True).start()
 
     def snapshot(self, with_series=True) -> dict:
@@ -145,6 +174,7 @@ class App:
         gser = self.src.gpu_series() if with_series else None
         for b in boots:
             finish_series(b, gser, now, live.BUCKET_S)
+            b["energy"] = self.energy.view(b["stem"], (b.get("totals") or {}).get("boot_wall_s"))
         return {
             "t": now,
             "version": self.version,
@@ -156,6 +186,7 @@ class App:
             "gpuq": sv.get("gpuq"),
             "fronts": {k: {kk: vv for kk, vv in v.items() if kk != "value"} for k, v in fronts.items()},
             "collector_error": getattr(self.logs, "last_error", None),
+            "energy_error": getattr(self, "energy_error", None),
             "windows": {"rate_s": live.WINDOW_S, "bucket_s": live.BUCKET_S, "history_s": live.HISTORY_S,
                         "live_s": live.LIVE_S},
         }
