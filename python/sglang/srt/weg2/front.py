@@ -99,6 +99,7 @@ from sglang.srt.weg2 import dp_wait as _dp_wait  # R28: DP-WAIT instrument
 from sglang.srt.weg2 import phase_policy  # H91 part C
 from sglang.srt.weg2 import resume_via_p as _rvp  # RESUME-VIA-P
 from sglang.srt.weg2 import handoff_seam as _hs  # #243 seam: HANDOFF-LOST reroute + rid-end drop
+from sglang.srt.weg2 import session_trace as _st  # SESSION-TRACE: session hash + shared prefix
 
 logger = logging.getLogger("weg2.front")
 
@@ -4686,6 +4687,7 @@ class Front:
                         rid, reason, est_uncached, est_prompt, wait_ms)
             return None
         ft.remember(text, c.ids)
+        self._sess_prefix(rid, c.ids)  # SESSION-TRACE
         # the epoch is read AFTER the count: a flip during it ends the held credit
         epoch = self.epoch if self.awake == "D" and self.state == "serving" else None
         pending, credit, known, src = self.tspans.pending(c.ids, epoch=epoch)
@@ -4850,6 +4852,48 @@ class Front:
         self._dp_mark(p, "reroute")  # R28
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
         return True
+
+    def _sess_note(self, rid: str, request, payload) -> None:
+        """SESSION-TRACE (weg2/session_trace.py): the session of ``rid`` as a
+        10-hex hash, one line per rid; never the id, never text."""
+        try:
+            raw, src = _st.session_raw(getattr(request, "headers", None), payload)
+            sess = _st.short(raw)
+            m = self.__dict__.setdefault("_sess_by_rid", {})
+            m[rid] = sess
+            while len(m) > 4096:
+                m.pop(next(iter(m)))
+            logger.info("WEG2 SESSION rid=%s sess=%s src=%s", rid, sess or "-", src)
+        except Exception:  # noqa: BLE001 -- an instrument, never the route
+            pass
+
+    def _sess_tag(self, rid: str) -> str:
+        """`` sess=<hash>`` for a SERVED line (empty without one)."""
+        sess = (self.__dict__.get("_sess_by_rid") or {}).get(str(rid))
+        return f" sess={sess}" if sess else ""
+
+    def _sess_prefix(self, rid: str, ids) -> None:
+        """SESSION-TRACE: the common token prefix with the same session's
+        previous prompt (front tokenizer ids, the X-EXACT count's own)."""
+        try:
+            sess = (self.__dict__.get("_sess_by_rid") or {}).get(str(rid))
+            if not sess:
+                return
+            sp = self.__dict__.get("_sess_prefixes")
+            if sp is None:
+                sp = self._sess_prefixes = _st.SessionPrefixes()
+            got = sp.note(sess, rid, ids)
+            if got is None:
+                logger.info("WEG2 SESSION-PREFIX rid=%s sess=%s prev_rid=- common=0 prompt=%d "
+                            "prev_prompt=0 (first prompt of this session seen by this front)",
+                            rid, sess, len(ids))
+                return
+            prev_rid, common, prev_len = got
+            logger.info("WEG2 SESSION-PREFIX rid=%s sess=%s prev_rid=%s common=%d prompt=%d "
+                        "prev_prompt=%d (front token ids: where this prompt leaves the session's "
+                        "previous one)", rid, sess, prev_rid, common, len(ids), prev_len)
+        except Exception:  # noqa: BLE001 -- an instrument, never the price
+            pass
 
     def _hl_sweep(self) -> int:
         """#243 seam: every controller pass reads the hand-off state of every
@@ -5533,6 +5577,7 @@ class Front:
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
         _hs.note_request_rid(request, rid)  # #243 seam: the rid-end drop reads it
+        self._sess_note(rid, request, payload)  # SESSION-TRACE
         # UNIFY S7 (27B RC7-X): the arrival time the idle re-grant's quiet
         # window reads ("did anything arrive in the last window").
         self._x_last_arrival = time.time()
@@ -6433,8 +6478,8 @@ class Front:
             # and there is nothing to correct here; above the cap the front
             # refuses at admission, before P's prefill is spent.
             g.served += 1
-            logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d",
-                        p.rid, pt, ct, time.time() - t0, self.epoch)
+            logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
+                        p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
         finally:
             g.outstanding.pop(p.rid, None)
 
@@ -6950,9 +6995,10 @@ class Front:
                     dterms = await self._draft_terms(g, None, rid=rid, uncached=max(0, pt - ct),
                                                      mark=_pfc_mark0)
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
-                                "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
+                                "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s%s",
                                 rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
-                                dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
+                                dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"],
+                                self._sess_tag(rid))
                     # UNIFY S4 (H85): the streamed leg samples r_D too (it never did).
                     if r.status == 200 and priced and not x_inband:
                         _sample_r_d(pt, ct, verdict, dterms)
@@ -6982,9 +7028,10 @@ class Front:
                 dterms = await self._draft_terms(g, js, rid=rid, uncached=max(0, pt - ct),
                                                  mark=_pfc_mark0)
                 logger.info("WEG2-SERVED group=D leg=2 rid=%s status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
-                            "uncached=%d verdict=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
+                            "uncached=%d verdict=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s%s",
                             rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, time.time() - t0, self.epoch,
-                            dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
+                            dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"],
+                            self._sess_tag(rid))
                 # #1271 (b): r_D SAMPLE, and ONLY from a prefill D ran ALONE.
                 # A concurrent leg-2 wall would be a latency and must never
                 # enter this deque (#1271 (a)).
