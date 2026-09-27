@@ -661,9 +661,19 @@ PROFILES: Dict[str, ModelProfile] = {
         # RG 26.09.: off until the NF seat releases them with a boot tag (the
         # NF group env stays byte-identical).
         inline_system_in_place=False,
-        told_probe_tree_key=False,
-        told_paced=False,
-        p_twin_defer=False,
+        # NF-TK (HS 27.09., NF rc12t 09271756: 0 of 41 P legs cached -- every
+        # P read with loaded>0 was clamped to told=0 by "#1416 STORE-TOLD
+        # ANCHOR-CLAMP ... anchored=0", because with TK off the clamp hashed
+        # unigram ids while NF's MTP tree keys bigram -- the 27B #1416d class).
+        # TK only together with PACED (#211: TK alone = the single-phase
+        # follower busy-wait, -15 % PP0 prefill on rc11b) and TW; PF stays off.
+        # On the NF P cut PP0 carries the heaviest store share (7/12 KV slots,
+        # 61 % of the GDN blob), so a follower's read ends inside PP0's pacing
+        # window and the residual admission wait (#1400 STORE-TOLD WAITED)
+        # has no structural cause.
+        told_probe_tree_key=True,
+        told_paced=True,
+        p_twin_defer=True,
         front_span_inflight=False,
         told_group_fallback=False,
         vision="off",
