@@ -53,8 +53,8 @@ if [ -d /root/.cache/htsglang-planner/bench_runs ] && [ ! -e "$state/.cache/htsg
 fi
 
 # keep the three newest releases of each
-ls -1dt /opt/rigdash/releases/*/ | tail -n +4 | grep -v "/$sha/" | xargs -r rm -rf
-ls -1dt /opt/rigdash/planner/releases/*/ | tail -n +4 | grep -v "/$tree/" | xargs -r rm -rf
+ls -1dt /opt/rigdash/releases/*/ | tail -n +4 | grep -v "/$sha/" | xargs -r rm -rf || true
+ls -1dt /opt/rigdash/planner/releases/*/ | tail -n +4 | grep -v "/$tree/" | xargs -r rm -rf || true
 
 for u in rig-dashboard rig-planner; do
   install -m 0644 "$dst/rigdash/deploy/$u.service" "/etc/systemd/system/$u.service"
