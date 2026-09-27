@@ -74,7 +74,6 @@ class App:
             "docker_host_prefix": args.docker_host_prefix,
             "weg2_fronts": args.front or [],
             "gpuq": args.gpuq,
-            "gpuq_public": args.gpuq_public,
         }
         self.src = sources.Sources(cfg)
         self.stop = threading.Event()
@@ -167,7 +166,6 @@ def main(argv=None):
     ap.add_argument("--front", action="append", default=[],
                     help="weg2 front base URL to read /weg2/state from (repeatable)")
     ap.add_argument("--gpuq", default="http://127.0.0.1:8770")
-    ap.add_argument("--gpuq-public", default="http://192.168.0.101:8770/")
     args = ap.parse_args(argv)
     app = App(args)
     app.start()

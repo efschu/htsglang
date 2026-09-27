@@ -110,7 +110,7 @@ details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
   <h1>Rig-Dashboard</h1>
   <span class="sub" id="sub">verbinde&hellip;</span>
   <nav>
-    <a id="gpuqlink" href="http://192.168.0.101:8770/" target="_blank" rel="noopener">GPU-Fensterplan</a>
+    <a id="gpuqlink" href="/" target="_blank" rel="noopener">GPU-Fensterplan</a>
     <a href="/api/live" target="_blank" rel="noopener">JSON</a>
   </nav>
 </header>
@@ -338,7 +338,6 @@ function gpuqHtml(d) {
   const q = d.gpuq || {};
   const v = q.value;
   if (!v) return `<div class="err">${esc(q.error || "gpuq nicht erreichbar")}</div>`;
-  if (v.url) $("gpuqlink").href = v.url;
   const cards = v.cards || [];
   const ownerOf = (id) => { const b = (v.bookings || []).find((x) => x.id === id); return b ? b.owner : id; };
   let h = `<div class="chips">${cards.map((c) => `<span class="chip ${c.busy ? "warn" : "ok"}">${c.index} ${esc(c.short_name)} &middot; frei ${fmt(c.free_mib)} MiB${c.current_booking ? " &middot; " + esc(ownerOf(c.current_booking)) : ""}</span>`).join("")}</div>`;
@@ -397,6 +396,7 @@ async function refresh() {
     $("sub").textContent = `Dashboard-API nicht erreichbar (${failures}×): ${e}`;
   }
 }
+$("gpuqlink").href = `${location.protocol}//${location.hostname}:8770/`;
 refresh();
 setInterval(refresh, 2000);
 </script>

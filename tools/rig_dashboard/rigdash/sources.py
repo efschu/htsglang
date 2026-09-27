@@ -181,7 +181,7 @@ class Sources:
         bookings = http_json(base + "/api/v1/bookings", 3.0)
         live = [b for b in bookings if b.get("state") in ("running", "pending")]
         live.sort(key=lambda b: b.get("position", 0))
-        return {"cards": cards, "bookings": live[:20], "url": self.cfg.get("gpuq_public", base)}
+        return {"cards": cards, "bookings": live[:20]}
 
     # --- loop ----------------------------------------------------------
     def tick(self):
