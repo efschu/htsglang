@@ -27,7 +27,7 @@ from sglang.srt.weg2 import launcher as L  # noqa: E402
 
 MIB = 1 << 20
 PAGE = 64
-RATE = 0.5625
+RATE = 0.5871  # rc12g 05:31:15 / 05:35:05: 1578 / 2688 = 0.58705, rounded up (was 0.5625, rc12e)
 
 #: (boot, time, rows, reserved growth) -- the extend windows of rc12b..f on
 #: D-TP0 with >= 512 rows (tmp/r989/rate_windows.py over the five D-logs)
@@ -44,6 +44,8 @@ WINDOWS = (
     ("09270402", "04:22:03", 3073, 1656),
     ("09270402", "04:27:45", 4096, 1992),
     ("09270402", "04:27:50", 4029, 2116),
+    ("09270501", "05:31:15", 2688, 1578),   # rc12g: the maximum
+    ("09270501", "05:35:05", 2688, 1578),
 )
 
 
@@ -80,7 +82,7 @@ def _env(rates, trim="3071,1724,1725"):
 class TestRecord(CustomTestCase):
     def test_rate_is_the_measured_maximum_of_the_big_extends(self):
         rate = ET.extend_growth_per_row_mib([(r, g) for _b, _t, r, g in WINDOWS])
-        self.assertEqual(rate, RATE)  # rc12e 03:39:07, 2304 / 4096
+        self.assertEqual(rate, RATE)  # rc12g 05:31:15, 1578 / 2688
 
     def test_small_window_does_not_price_the_rate(self):
         # 603 rows, +776 MiB = 1.29/row: the window holds decode/draft rounds
@@ -90,45 +92,56 @@ class TestRecord(CustomTestCase):
     def test_profile_carries_the_record_nextflash_only(self):
         vals, boots = L.d_extend_growth_per_row_record("nextflash")
         self.assertEqual(vals, [RATE, None, None])
+        self.assertIn("dkrnfh91bar1dauer09270501", boots)
         self.assertIn("dkrnfh91bar1dauer09270402", boots)
         self.assertEqual(L.d_extend_growth_per_row_record("qwen27b"), (None, ""))
 
     def test_fixpoint_the_rate_does_not_move_with_the_cut(self):
-        before = ET.extend_growth_per_row_mib([(4096, 2304)])
+        before = ET.extend_growth_per_row_mib([(2688, 1578)])
         cut = ET.rows_cap(2385, before, PAGE)
-        after = ET.extend_growth_per_row_mib([(4096, 2304), (cut, cut * before)])
+        after = ET.extend_growth_per_row_mib([(2688, 1578), (cut, cut * before)])
         self.assertEqual(before, after)
         # and three rounds of "measure, cut, measure" stay put
         rate = before
         for _ in range(3):
             rate = ET.extend_growth_per_row_mib([(ET.rows_cap(2325, rate, PAGE),
-                                                  ET.rows_cap(2325, rate, PAGE) * rate), (4096, 2304)])
+                                                  ET.rows_cap(2325, rate, PAGE) * rate), (2688, 1578)])
         self.assertEqual(rate, before)
 
 
 class TestCap(CustomTestCase):
     def test_metal_0427_45_is_cut(self):
-        # floor((2385 - 300) / 0.5625) = 3706 -> page 3648 < 4096
-        self.assertEqual(ET.rows_cap(2385, RATE, PAGE), 3648)
-        self.assertGreaterEqual(2385 - 3648 * RATE, 300)
+        # floor((2385 - 300) / 0.5871) = 3551 -> page 3520 < 4096
+        self.assertEqual(ET.rows_cap(2385, RATE, PAGE), 3520)
+        self.assertGreaterEqual(2385 - 3520 * RATE, 300)
 
     def test_metal_0427_50_is_cut(self):
-        # floor((2325 - 300) / 0.5625) = 3600 -> page 3584 < 4029 (card_free 207 at the metal)
-        self.assertEqual(ET.rows_cap(2325, RATE, PAGE), 3584)
-        self.assertGreaterEqual(2325 - 3584 * RATE, 300)
+        # floor((2325 - 300) / 0.5871) = 3449 -> page 3392 < 4029 (card_free 207 at the metal)
+        self.assertEqual(ET.rows_cap(2325, RATE, PAGE), 3392)
+        self.assertGreaterEqual(2325 - 3392 * RATE, 300)
+
+    def test_rc12g_post_2327_is_3392_and_keeps_the_floor(self):
+        # the rc12g finding: at post 2327 the 0.5625 cap was 3584 rows, and
+        # 3584 rows at the measured 0.5871 grow 2104 MiB -> 223 free (< 300).
+        # At 0.5871: floor(2027 / 0.5871) = 3452 -> page 3392, 336 MiB free.
+        self.assertEqual(ET.rows_cap(2327, 0.5625, PAGE), 3584)
+        self.assertLess(2327 - 3584 * RATE, 300)
+        cap = ET.rows_cap(2327, RATE, PAGE)
+        self.assertEqual(cap, 3392)
+        self.assertGreaterEqual(2327 - cap * RATE, 300)
 
     def test_metal_0422_03_is_not_cut(self):
-        # floor((2569 - 300) / 0.5625) = 4033 -> 4032 >= 3073 rows: the request
+        # floor((2569 - 300) / 0.5871) = 3864 -> 3840 >= 3073 rows: the request
         # extends whole (at the metal it left 913 MiB)
         cap = ET.rows_cap(2569, RATE, PAGE)
-        self.assertEqual(cap, 4032)
+        self.assertEqual(cap, 3840)
         self.assertGreaterEqual(cap, 3073)
 
     def test_the_boundary_for_a_full_chunk(self):
-        # a 4096-row chunk is cut exactly when post < 300 + 4096 * 0.5625 = 2604
-        self.assertEqual(ET.rows_cap(2604, RATE, PAGE), 4096)
-        self.assertLess(ET.rows_cap(2603, RATE, PAGE), 4096)
-        # the trim threshold itself (3071) funds 4926 rows: never cut there
+        # a 4096-row chunk is cut exactly when post < 300 + 4096 * 0.5871 = 2704.8
+        self.assertEqual(ET.rows_cap(2705, RATE, PAGE), 4096)
+        self.assertLess(ET.rows_cap(2704, RATE, PAGE), 4096)
+        # the trim threshold itself (3071) funds 4719 rows: never cut there
         self.assertGreater(ET.rows_cap(3071, RATE, PAGE), 4096)
 
     def test_never_below_one_page(self):
@@ -209,6 +222,8 @@ class TestGroupMin(CustomTestCase):
         ET.reset_for_tests()
 
     def _ceiling(self, rank, cuda):
+        import types
+
         import torch
 
         from sglang.srt.managers.scheduler import Scheduler
@@ -220,7 +235,7 @@ class TestGroupMin(CustomTestCase):
             waiting_queue = []
 
         s = _S()
-        s.tp_rank = rank
+        s.ps = types.SimpleNamespace(tp_rank=rank)  # no s.tp_rank: the Scheduler has none
         real = torch.cuda
         torch.cuda = cuda
         try:
@@ -239,6 +254,45 @@ class TestGroupMin(CustomTestCase):
         self.assertEqual(votes[1:], [4096, 4096])
         self.assertEqual(min(votes), 3648)  # the reduce: every rank cuts to 3648
 
+    def test_tp2_votes_with_its_own_rate_and_threshold(self):
+        # rc12h: rc12g read getattr(self, "tp_rank", 0) -> 0 on every rank, so
+        # TP2 voted with TP0's rate and trimmed at TP0's 3071. With a rate of
+        # its own (0.6) and its threshold 1725 a card at 2000 free is NOT
+        # trimmed and caps at floor(1700 / 0.6) = 2833 -> 2816.
+        _env("0.5625,0,0.6")
+        cuda = _Cuda(2000, 400)
+        self.assertEqual(self._ceiling(2, cuda), 2816)
+        self.assertEqual(cuda.trims, 0)
+
+    def test_tp2_without_a_rate_casts_no_vote(self):
+        # the record's [0.5871, null, null]: TP1/TP2 read 0 = no rate = no vote,
+        # and no scheduler trim on their card either
+        _env("0.5871,0,0")
+        cuda = _Cuda(1700, 400)
+        self.assertEqual(self._ceiling(2, cuda), 4096)
+        self.assertEqual(cuda.trims, 0)
+
+    def test_no_readable_rank_casts_no_vote(self):
+        import torch
+
+        from sglang.srt.managers.scheduler import Scheduler
+
+        class _S:
+            chunked_prefill_size = 4096
+            page_size = PAGE
+            chunked_req = object()
+            waiting_queue = []
+
+        _env("0.5871,0,0")
+        cuda = _Cuda(1700, 400)
+        real = torch.cuda
+        torch.cuda = cuda
+        try:
+            self.assertEqual(Scheduler._local_corridor_width_ceiling(_S()), 4096)
+        finally:
+            torch.cuda = real
+        self.assertEqual(cuda.trims, 0)
+
     def test_payload_is_an_int_on_every_rank_with_or_without_the_feature(self):
         _env(None)
         for r in range(3):
@@ -247,7 +301,7 @@ class TestGroupMin(CustomTestCase):
 
 class TestLauncher(CustomTestCase):
     def test_env_value_from_the_record(self):
-        self.assertEqual(ET.launcher_rates([RATE, None, None]), "0.5625,0,0")
+        self.assertEqual(ET.launcher_rates([RATE, None, None]), "0.5871,0,0")
         self.assertEqual(ET.launcher_rates([None, None, None]), "")
         self.assertEqual(ET.launcher_rates([]), "")
 

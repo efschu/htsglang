@@ -11549,14 +11549,23 @@ class Scheduler(
         # rc12g WEG2-EXTEND-STUECKELUNG: the D extend chunk follows the card
         # after the trim (weg2/extend_trim.py). A vote on this same reduce, so
         # every rank cuts to the group's width; None = no vote (byte-identical).
-        vote = _weg2_extend_trim.width_vote(
-            torch.cuda,
-            int(getattr(self, "tp_rank", 0) or 0),
-            configured,
-            int(getattr(self, "page_size", 1) or 1),
-            getattr(self, "chunked_req", None) is not None
-            or bool(getattr(self, "waiting_queue", None)),
-        )
+        # rc12h: the rank lives on the parallel state (ps.tp_rank) -- the
+        # Scheduler itself has no tp_rank attribute (the same trap is named
+        # three times in this file); rc12g read that missing attribute with a
+        # default of 0, so every D rank voted with TP0's rate and trimmed at
+        # TP0's threshold against its own card. A rank that cannot be read
+        # casts no vote (never a guessed rank 0).
+        rank = getattr(getattr(self, "ps", None), "tp_rank", None)
+        vote = None
+        if rank is not None:
+            vote = _weg2_extend_trim.width_vote(
+                torch.cuda,
+                int(rank),
+                configured,
+                int(getattr(self, "page_size", 1) or 1),
+                getattr(self, "chunked_req", None) is not None
+                or bool(getattr(self, "waiting_queue", None)),
+            )
         if vote is not None:
             configured = min(configured, int(vote))
         try:
