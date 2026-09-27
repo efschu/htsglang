@@ -1,0 +1,37 @@
+# Rig-Dashboard (rigdash): live P-Prefill / D-Prefill / Decode tok/s, flips,
+# cards, containers and the gpuq plan, on http://192.168.0.101:8890/ .
+#
+# Read-only towards every model: it tails the weg2 boot logs by byte offset,
+# asks nvidia-smi (no CUDA context -- unlike the old planner it never pins the
+# driver, so a driver reload does not have to stop it), `docker ps` on the
+# Proxmox host over ssh, gpuq's GET API, and GET /weg2/state every 10 s.
+#
+# Runs from a DEPLOYED copy (/opt/rigdash/current -> releases/<sha>), never
+# from a git worktree an unrelated agent can delete (the defect recorded in
+# htsglang-planner.service, 2026-08-12). Deploy/update: deploy/install.sh.
+
+[Unit]
+Description=Rig-Dashboard live (rigdash, read-only, LAN :8890)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=exec
+WorkingDirectory=/opt/rigdash/current
+ExecStart=/usr/bin/python3 -m rigdash --host 0.0.0.0 --port 8890 --front http://127.0.0.1:30030
+Environment=PYTHONUNBUFFERED=1
+# ssh reads the `proxmox` alias and key from /root/.ssh
+Environment=HOME=/root
+# Restart=always, not on-failure: a clean SIGTERM from outside must not leave
+# the page silently gone (same finding as gpuq.service, 2026-09-04).
+Restart=always
+RestartSec=3
+Nice=5
+MemoryMax=1G
+NoNewPrivileges=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
