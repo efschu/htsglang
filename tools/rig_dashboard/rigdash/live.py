@@ -202,7 +202,7 @@ def _run_stats(cls, evs):
             "n": r0[2] if r0 else len(evs)}
 
 
-def phase_timeline(acts, flips, t0, t1, first_t=None, awake_hint=None, gap_s=PHASE_GAP_S):
+def phase_timeline(acts, flips, t0, t1, first_t=None, awake_hint=None, gap_s=PHASE_GAP_S, work_from=None):
     """Segments of the phase bar over [t0, t1].  Pure, unit-tested.
 
     ``acts``: dicts {t, s, cls, ev}: ``t`` = the log line's stamp (the END of
@@ -219,6 +219,8 @@ def phase_timeline(acts, flips, t0, t1, first_t=None, awake_hint=None, gap_s=PHA
         group still logs work inside it (drain), that work is shown as work
         and the grey starts after its last line;
       * whatever is left is ``idle`` (awake group from the flips: no work);
+        before the boot's first work line (``work_from``) it is the boot
+        loading (``boot``), not an awake group waiting;
       * the run still going (last line within ``gap_s`` of t1) reaches t1.
     """
     acts = sorted(acts, key=lambda a: a["t"])
@@ -287,6 +289,8 @@ def phase_timeline(acts, flips, t0, t1, first_t=None, awake_hint=None, gap_s=PHA
     if t1 - cur > 0.5 and (first_t is None or first_t < t1):
         out.append({"k": "idle", "s": cur, "e": t1, "awake": awake_at((cur + t1) / 2)})
     for x in out:
+        if x["k"] == "idle" and work_from is not None and x["e"] <= work_from + 0.5:
+            x["awake"], x["boot"] = None, True
         x["s"], x["e"] = round(x["s"], 2), round(x["e"], 2)
     return out
 
@@ -314,6 +318,7 @@ class Boot:
         self.counts = collections.Counter()
         self._last_t = {}       # group -> newest log timestamp seen in that file
         self.first_t = None     # first timestamp of this boot's logs
+        self.first_work_t = None   # first prefill/decode line: before it the boot is still loading
         self.lock = threading.Lock()
         # totals since boot (whole file read) and a 60-s event window, per group
         self.tot = collections.defaultdict(collections.Counter)
@@ -410,6 +415,8 @@ class Boot:
         self.counts[k] += 1
         rank0 = ev.get("rank") in (None, 0)
         if k in ("prefill_rank", "prefill_batch", "decode_batch", "decode_rank"):
+            if self.first_work_t is None or ev["t"] < self.first_work_t:
+                self.first_work_t = ev["t"]
             self.ev["%s_%s" % (group, k)].append(ev)
             self.last["%s_%s" % (group, k)] = ev
             if k == "prefill_rank" and ev.get("compute_ms") is not None:
@@ -659,7 +666,8 @@ class Boot:
                                 self.flip_open, now)
         hint = (self.last.get("awake") or {}).get("awake")
         return {"t0": t0, "t1": now, "span_s": span, "gap_s": PHASE_GAP_S,
-                "segs": phase_timeline(acts, flips, t0, now, self.first_t, hint)}
+                "segs": phase_timeline(acts, flips, t0, now, self.first_t, hint,
+                                       work_from=self.first_work_t if self.first_work_t is not None else now)}
 
     def groups_with(self, kind: str) -> List[str]:
         return [g for g in ("P", "D", "single") if self.ev.get("%s_%s" % (g, kind))]

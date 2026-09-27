@@ -83,7 +83,7 @@ h2 .muted, .muted { color: var(--muted); font-weight: 400; }
 .tile .kv div span:last-child { color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
 .tile .kv div.wc span:last-child { color: var(--muted); }
 .tile .bigrow { display: flex; align-items: baseline; gap: 8px; }
-.tile .bigrow .bl { flex: none; width: 58px; font-size: 11px; line-height: 1.2; text-transform: uppercase;
+.tile .bigrow .bl { flex: none; width: 70px; font-size: 11px; line-height: 1.2; text-transform: uppercase;
   letter-spacing: .03em; color: var(--text-2); }
 .tile .bigrow + .bigrow .big { margin-top: 0; }
 .tile .bigrow.off .big, .tile .bigrow.off .bl { color: var(--muted); }
@@ -310,7 +310,7 @@ function kv(rows) {
 function bigPair(lbl60, v60, one, digits) {
   const on = one > 0;
   return `<div class="bigrow"><span class="bl">${lbl60}</span><span class="big num">${fmt(v60, digits)}<small>tok/s</small></span></div>
-    <div class="bigrow ${on ? "on" : "off"}" title="letzte 1 s: Zeilen mit Stempel in der vorigen oder laufenden Sekunde; 0 = die Phase rechnet gerade nicht"><span class="bl">jetzt 1 s</span><span class="big num">${fmt(one, digits)}<small>tok/s</small></span></div>`;
+    <div class="bigrow ${on ? "on" : "off"}" title="letzte 1 s: Zeilen mit Stempel in der vorigen oder laufenden Sekunde; 0 = die Phase rechnet gerade nicht"><span class="bl" style="white-space:nowrap">jetzt 1 s</span><span class="big num">${fmt(one, digits)}<small>tok/s</small></span></div>`;
 }
 
 // ---- phase bar: P-Prefill / D-Prefill / Decode runs and the flips between them
@@ -329,6 +329,7 @@ function phaseName(k, single) { return single && k === "P" ? "Prefill" : (PHASE[
 function phaseTip(x, single) {
   const when = `${hhmm(x.s)}&ndash;${x.running || x.open ? "jetzt" : hhmm(x.e)} &middot; ${dur(x.e - x.s)}`;
   if (x.k === "flip") return `<b>Flip ${esc(x.slept)}&rarr;${esc(x.woke)}</b>${x.open ? " &middot; l&auml;uft" : ` &middot; flip_total ${fmt(x.total_ms)} ms${x.drain_ms != null ? " (drain+quiesce " + fmt(x.drain_ms) + " ms)" : ""}`}<br>${when} <span class="muted">grau ab der letzten Arbeitszeile der alten Gruppe bis WEG2-FLIP done</span>`;
+  if (x.k === "idle" && x.boot) return `<b>Boot l&auml;dt</b> &middot; noch keine Prefill-/Decode-Zeile<br>${when}`;
   if (x.k === "idle") return `<b>${x.awake ? esc(x.awake) + " wach" : "ruht"} &middot; keine Arbeit</b><br>${when} <span class="muted">keine Prefill-/Decode-Zeile</span>`;
   const nm = phaseName(x.k, single);
   if (x.k === "dec") return `<b>${nm}</b> &middot; &Oslash; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s <span class="muted">(gen throughput, ${fmt(x.n)} Zeilen)</span>` : `&mdash; <span class="muted">(keine &bdquo;Decode batch&ldquo;-Zeile in dieser Phase)</span>`}${x.bs != null ? " &middot; bs &Oslash; " + fmt(x.bs, 1) : ""}<br>${when}${x.rounds ? " &middot; " + fmt(x.rounds) + " Runden" : ""}${x.running ? " &middot; l&auml;uft" : ""}`;

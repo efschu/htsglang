@@ -530,7 +530,7 @@ class PhaseTimelineTests(unittest.TestCase):
         acts = [self._pf(10, 1000, 1000), self._pf(12, 1000, 1000), self._pf(14, 1000, 2000),
                 self._dec(25.0), self._dec(26.0, gen=100.0), self._dec(28.0, gen=120.0)]
         flips = [{"b": 15.0, "d": 17.0, "slept": "P", "woke": "D", "total_ms": 2000.0, "drain_ms": 100.0, "open": False}]
-        segs = live.phase_timeline(acts, flips, 0.0, 30.0, first_t=5.0)
+        segs = live.phase_timeline(acts, flips, 0.0, 30.0, first_t=5.0, work_from=9.0)
         self.assertEqual([x["k"] for x in segs], ["idle", "P", "idle", "flip", "idle", "dec"])
         p = segs[1]
         self.assertEqual((p["s"], p["e"]), (9.0, 14.0))          # first chunk's own gpu-ms, not a guess
@@ -542,6 +542,8 @@ class PhaseTimelineTests(unittest.TestCase):
         self.assertTrue(segs[5]["running"])
         self.assertEqual(segs[5]["e"], 30.0)
         self.assertEqual(segs[0]["s"], 5.0)                     # nothing before the boot's first line
+        self.assertTrue(segs[0].get("boot"))                    # before the first work line: loading, not waiting
+        self.assertFalse(segs[4].get("boot"))
 
     def test_short_gap_after_a_flip_is_filled(self):
         acts = [self._dec(20.0, gen=100.0), self._dec(21.0, gen=100.0)]
