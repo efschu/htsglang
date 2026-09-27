@@ -1920,6 +1920,62 @@ def inband_error_before_content(head: Optional[bytes], path: str) -> Optional[st
     return head.decode(errors="replace")[:600]
 
 
+def _terminal_named_enabled(env=None) -> bool:
+    """TN (NF rc12s KRIT3): ``SGLANG_WEG2_LEG2_TERMINAL_NAMED`` (default on; 0 =
+    a committed stream ends as D left it)."""
+    e = os.environ if env is None else env
+    raw = (e.get("SGLANG_WEG2_LEG2_TERMINAL_NAMED", "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def leg2_terminal_reason(tail: Optional[bytes], path: str, finished: bool) -> Optional[str]:
+    """TN (NF rc12s 17:35:47, weg2-3-16 / weg2-3-18): why a COMMITTED stream is
+    ending without an answer, or None. ``W50``: D's named X refusal arrived after
+    the first byte (the re-route is impossible, the client already holds the
+    stream). ``error:<W-code>``: any other error event of D in the stream (W88
+    store read not progressing, a 503 abort...). ``truncated``: D's stream ended
+    without the end-of-answer marker --
+    only on the OpenAI / Anthropic wires, whose marker :func:`stream_finish_seen`
+    reads; /generate's ``finish_reason`` is an object there, so it is not judged."""
+    if not tail:
+        return None
+    text = tail.decode(errors="replace")
+    if x_refusal_marker_in(text):
+        return "W50"
+    # KRIT3 (NF rc12t weg2-4-16 18:08:55): EVERY named D error after the
+    # commit, not only W50 -- there D's store read did not progress (W88
+    # Weg2StoreLoadNotProgressing ... terminal, answered 503) on a stream that
+    # RESUME-VIA-P held, and the front booked verdict=serve 0/0.
+    if stream_error_event_in(tail, path):
+        m = _W_CODE_RE.search(text[text.rfind("error"):] if "error" in text else text)
+        return f"error:{m.group(1)}" if m else "error"
+    if not finished and path != "/generate":
+        return "truncated"
+    return None
+
+
+_W_CODE_RE = re.compile(r"\b(W\d{1,3}[a-z]?)\s+Weg2[A-Za-z]+")
+
+
+def stream_error_event_in(tail: Optional[bytes], path: str) -> bool:
+    """TN: does the stream already carry an error event the client can read?"""
+    if not tail:
+        return False
+    if path == "/v1/messages":
+        return b"event: error" in tail
+    return b'"error"' in tail
+
+
+def named_error_chunk(path: str, message: str) -> bytes:
+    """TN: one error event in the wire of ``path`` (Anthropic ``event: error``,
+    else an OpenAI-style ``data: {"error": ...}`` chunk)."""
+    if path == "/v1/messages":
+        body = {"type": "error", "error": {"type": "overloaded_error", "message": message}}
+        return b"event: error\ndata: " + json.dumps(body).encode() + b"\n\n"
+    body = {"error": {"message": message, "type": "overloaded_error", "code": 503}}
+    return b"data: " + json.dumps(body).encode() + b"\n\n"
+
+
 def witness_verdict(front_outstanding: int, rank_idle: bool) -> Optional[str]:
     """W3 in either direction; None when the two witnesses agree."""
     if front_outstanding == 0 and rank_idle:
@@ -3793,10 +3849,18 @@ class Front:
             self.counters["rvp_rerouted"] += 1
             logger.warning(
                 "WEG2 W50-REROUTE rid=%s front_price=%s d_extent=%d reason=%s path=%s "
-                "tokens=%d -- D kept the stream and parked the request; P prefills its context "
-                "(P-only leg 1, /generate), D resumes after the flip back",
+                "tokens=%d attempt=%s -- D kept the stream and parked the request; P prefills its "
+                "context (P-only leg 1, /generate), D resumes after the flip back",
                 rid, self._front_price.get(rid, "?"), int(r.get("d_extent") or 0),
-                r.get("reason", "?"), _path, len(ids))
+                r.get("reason", "?"), _path, len(ids), r.get("attempt", "?"))
+            if int(r.get("attempt") or 1) > 1:
+                # KRIT3: the one further sequential P leg after a refusal that
+                # followed RESUME-VIA-P (weg2/resume_via_p.py MAX_ATTEMPTS).
+                self.counters["rvp_attempt2"] += 1
+                logger.warning("RESUME-VIA-P attempt=%s rid=%s: D refused it again after its P leg "
+                               "(d_extent=%d) -- one more sequential P leg; a refusal after this "
+                               "one ends the stream by name", r.get("attempt"), rid,
+                               int(r.get("d_extent") or 0))
         if reqs:
             self._kick_controller("arrival")
         return len(reqs)
@@ -6727,6 +6791,25 @@ class Front:
                         # The client left and D's stream ended without an end
                         # marker: not served, exactly as before H61b.
                         raise client_io["err"]
+                    if not client_io["gone"] and _terminal_named_enabled():
+                        # TN (NF rc12s KRIT3, weg2-3-16/-18): a committed stream
+                        # that ends WITHOUT an answer ends NAMED -- never a bare
+                        # 200 the client reads as an empty answer.
+                        _tn = leg2_terminal_reason(bytes(tail), request.path, client_io["finished"])
+                        if _tn is not None:
+                            _had = stream_error_event_in(bytes(tail), request.path)
+                            if not _had:
+                                await _push(named_error_chunk(
+                                    request.path,
+                                    f"{X_REFUSAL_NAME if _tn == 'W50' else 'W164 Weg2Leg2Truncated'} "
+                                    f"rid={rid}: group D ended this stream without an answer "
+                                    f"({'named X refusal after the first byte' if _tn == 'W50' else 'no end-of-answer marker'}); "
+                                    f"the request was not completed -- retry it"))
+                            self.counters["leg2_terminal_named"] += 1
+                            logger.error(
+                                "WEG2 LEG2-TERMINAL-NAMED rid=%s reason=%s path=%s error_event=%s -- the "
+                                "committed stream ended without an answer and ends named, not as a bare 200",
+                                rid, _tn, request.path, "forwarded" if _had else "synthesized")
                     if not client_io["gone"]:
                         try:
                             await resp.write_eof()
