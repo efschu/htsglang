@@ -98,6 +98,7 @@ from sglang.srt.weg2 import prefill_clock  # UNIFY S4 (H85): D's prefill clock r
 from sglang.srt.weg2 import dp_wait as _dp_wait  # R28: DP-WAIT instrument
 from sglang.srt.weg2 import phase_policy  # H91 part C
 from sglang.srt.weg2 import resume_via_p as _rvp  # RESUME-VIA-P
+from sglang.srt.weg2 import handoff_seam as _hs  # #243 seam: HANDOFF-LOST reroute + rid-end drop
 
 logger = logging.getLogger("weg2.front")
 
@@ -2699,6 +2700,10 @@ class Pending:
     #: context of a request D keeps parked mid-stream; no leg 2 follows (D
     #: still holds the client's stream).
     resume_via_p: bool = False
+    #: #243 seam (weg2/handoff_seam.py): how often this rid went back to P
+    #: because its hand-off was LOST while it waited for a D seat. Bounded at
+    #: one -- a second loss is admitted and left to D's own X gate.
+    handoff_lost_reroutes: int = 0
 
 
 class Seat:
@@ -4679,6 +4684,79 @@ class Front:
         self.counters["short_kept_to_p"] += 1
         return True
 
+    def _hl_check(self, p: "Pending", where: str) -> bool:
+        """#243 seam (weg2/handoff_seam.py): True when ``p`` -- leg 1 ran, it
+        waits for a D seat -- had its hand-off LOST and D would have to prefill
+        more than X of it; it is then back in the queue for a FRESH leg 1 on P
+        (the caller takes it out of ``_ready_for_d``). This is the queue
+        re-entry X-REQUEUE ends with (seat none, d_eligible/d_direct cleared,
+        R28 ``reroute``, a controller kick); the X-REQUEUE entry itself answers
+        a refused LEG 2 and needs its request and seat, which a rid still
+        awaiting its admission does not have yet. Its W31/W35 counter is not
+        touched: the bound here is ``handoff_lost_reroutes`` (one), and a
+        second loss is admitted and left to D's own X gate."""
+        if not _hs.enabled():
+            return False
+        if (not p.leg1_done or p.skip_leg1 or p.d_direct or p.resume_via_p or p.p_only
+                or p.fut.done()):
+            return False
+        st = _hs.status(p.rid)
+        x = int(self.tp_prefill_max_tokens)
+        prompt = int(p.leg1_prompt_tokens or 0) or int(p.est_prompt)
+        terms = _hs.lost_terms(st, prompt, x)
+        if terms is None:
+            return False
+        credit, uncached, over_x = terms
+        noted = self.__dict__.setdefault("_hl_noted", set())
+        if not over_x or p.handoff_lost_reroutes >= 1:
+            if p.rid not in noted:
+                noted.add(p.rid)
+                self.counters["handoff_lost_kept_d"] += 1
+                logger.warning(
+                    "WEG2 HANDOFF-LOST-KEPT rid=%s first_lost_page=%d page_size=%d credit=%d "
+                    "uncached=%d X=%d reroutes=%d where=%s -- %s", p.rid, st["first_lost_page"],
+                    st["page_size"], credit, uncached, x, p.handoff_lost_reroutes, where,
+                    "D prefills the lost tail itself (<= X, law 4)" if not over_x else
+                    "already re-routed once: admitted, D's own X gate stands")
+            return False
+        noted.discard(p.rid)
+        _hs.drop(p.rid, "reroute_fresh")
+        p.handoff_lost_reroutes += 1
+        p.leg1_done = False
+        p.seat = None
+        p.d_eligible = p.d_direct = False
+        p.est_uncached = int(uncached)
+        self.counters["handoff_lost_reroutes"] += 1
+        logger.warning(
+            "WEG2 HANDOFF-LOST-REROUTE rid=%s first_lost_page=%d credit=%d path=fresh-P "
+            "(uncached=%d > X=%d, page_size=%d pages=%d where=%s waited_s=%.1f) -- the hand-off "
+            "was lost while the rid waited for a D seat; leg 1 runs again on P",
+            p.rid, st["first_lost_page"], credit, uncached, x, st["page_size"], st["pages"],
+            where, max(0.0, time.time() - p.t_arrive))
+        # The oldest request: back at the HEAD, as an intake stall is (law 2).
+        self.queue.appendleft(p)
+        self._dp_mark(p, "reroute")  # R28
+        self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
+        return True
+
+    def _hl_sweep(self) -> int:
+        """#243 seam: every controller pass reads the hand-off state of every
+        rid waiting for a D seat (a scandir-cheap read on NF's side) and moves
+        a LOST one over X to P at once instead of at its admission. The
+        admitter's head may be one of them: it re-checks that its head is
+        still ``p`` after the seat wait (FIX 1) and gives the seat back."""
+        if not self._ready_for_d or not _hs.enabled():
+            return 0
+        moved = [p for p in list(self._ready_for_d) if self._hl_check(p, "sweep")]
+        if not moved:
+            return 0
+        ids = {id(p) for p in moved}
+        keep = [p for p in self._ready_for_d if id(p) not in ids]
+        self._ready_for_d.clear()
+        self._ready_for_d.extend(keep)
+        self._sync_batch_gate()
+        return len(moved)
+
     def _x_exact_tokens_check(self, rid: str, group: str, prompt_tokens: int) -> None:
         got = self._x_exact_rid.get(rid)
         if got is None or not prompt_tokens:
@@ -5342,6 +5420,7 @@ class Front:
                 {"error": f"W125 Weg2InputEmbedsRefused: {_why}"}, status=501)
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
+        _hs.note_request_rid(request, rid)  # #243 seam: the rid-end drop reads it
         # UNIFY S7 (27B RC7-X): the arrival time the idle re-grant's quiet
         # window reads ("did anything arrive in the last window").
         self._x_last_arrival = time.time()
@@ -6017,6 +6096,12 @@ class Front:
                     self._ready_for_d.popleft()
                     self._sync_batch_gate()
                     continue
+                # #243 seam: a hand-off LOST while it waited is not given a seat
+                # when D would have to prefill more than X of it -- fresh on P.
+                if self._hl_check(p, "admit"):
+                    self._ready_for_d.popleft()
+                    self._sync_batch_gate()
+                    continue
                 # FIX 7: the realised count when leg 1 has answered for this
                 # rid, the arrival estimate only for a cold one -- and the
                 # SAME number is charged to the seat below, so the gate and
@@ -6044,6 +6129,13 @@ class Front:
                     # while the seat was being waited for.
                     self._d_seat.release()
                     self.counters["d_admit_skipped_done"] += 1
+                    continue
+                if self._hl_check(p, "seat"):
+                    # #243 seam: the seat wait is the longest part of the wait
+                    # (255 s on NF rc12r) -- read again with the seat in hand.
+                    self._d_seat.release()
+                    self._ready_for_d.popleft()
+                    self._sync_batch_gate()
                     continue
                 self._ready_for_d.popleft()
                 self._sync_batch_gate()
@@ -9102,6 +9194,7 @@ class Front:
             try:
                 if self.state != "serving":
                     continue
+                self._hl_sweep()  # #243 seam: lost hand-offs of waiting rids -> P
                 self._rvp_take()
                 if self.awake == "D":
                     D = self.groups["D"]
@@ -10020,6 +10113,10 @@ def main():
         app.router.add_get(path, front.handle_passthrough_get)
     for path in PASSTHROUGH_POST:
         app.router.add_post(path, front.handle_passthrough_post)
+    # #243 seam: the wrapper is the one rid-end site that drops the rid's
+    # hand-off marks (weg2/handoff_seam.py:wrap_handler) -- bound once, here,
+    # before the routes take the handler.
+    front.handle_generate = _hs.wrap_handler(front.handle_generate)
     for path in FORWARD_PATHS:
         app.router.add_post(path, front.handle_generate)
     # rename transition: the old and the new flip-front route prefixes both answer (compat_shims)
