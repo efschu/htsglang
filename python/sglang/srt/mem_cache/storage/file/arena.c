@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define A_MAGIC 0x41524e4132363931ULL /* "ARNA2691" */
 #define S_FREE 0u
@@ -61,7 +62,8 @@ typedef struct {
     _Atomic uint32_t lock;     /* spinlock over the interval list */
     uint32_t n_ivals;          /* merged intervals in use */
     uint64_t cap_ivals;        /* capacity of ivals[] */
-    uint8_t pad[8];
+    _Atomic uint32_t touched_ms; /* #231: CLOCK_MONOTONIC ms (mod 2^32) of the last claim / merge */
+    _Atomic uint32_t writers;    /* #231: direct writers of this generation: claims << 16 | open */
     char stem[192];            /* the store stem, so ANY rank can evict this page to disk */
     Ival ivals[];              /* cap_ivals entries, sorted, disjoint */
 } SlotHeader;
@@ -80,6 +82,21 @@ static inline SlotHeader *slot_hdr(uint8_t *base, uint64_t s) {
 }
 static inline uint8_t *slot_data(uint8_t *base, uint64_t s) {
     return base + hdr(base)->data_off + s * hdr(base)->slot_bytes;
+}
+/* #231: one clock for every process of the host (CLOCK_MONOTONIC is system-wide). */
+static inline uint32_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL);
+}
+#define W_OPEN 0xFFFFu
+#define W_CLAIM 0x10000u
+/* #231: one direct writer of this generation resolved its claim (merged its
+ * extents or gave the claim up) -- the open count goes down, never below 0. */
+static inline void writer_done(SlotHeader *sh) {
+    uint32_t w = atomic_load(&sh->writers);
+    while ((w & W_OPEN) != 0 &&
+           !atomic_compare_exchange_weak(&sh->writers, &w, w - 1u)) { }
 }
 
 /* Size the file for `slots` slots of `slot_bytes`; returns the total bytes and
@@ -204,6 +221,8 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
             atomic_store(&sh->lock, 0);
             atomic_store(&sh->clock_bit, 1);
             atomic_store(&sh->refcount, 0);
+            atomic_store(&sh->writers, 0u);
+            atomic_store(&sh->touched_ms, mono_ms());
             /* publish in the index */
             _Atomic uint64_t *keys = index_keys(base);
             _Atomic uint32_t *slots = index_slots(base);
@@ -532,6 +551,8 @@ int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
             memcpy(sh->stem, stems[i], sl);
             sh->stem[sl] = 0;
         }
+        atomic_fetch_add(&sh->writers, W_CLAIM + 1u);   /* #231: an open direct writer */
+        atomic_store(&sh->touched_ms, mono_ms());
         status[i] = fresh ? 0 : 1;
         ok++;
     }
@@ -551,12 +572,14 @@ int64_t arena_complete(uint8_t *base, int64_t n, const int64_t *slots, const int
         SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
         if ((int64_t)sh->generation != gens[i]) { status[i] = 3; e += k; continue; }
         uint32_t st0 = atomic_load(&sh->state);
-        if (st0 == S_COMPLETE) { status[i] = 2; e += k; ok++; continue; }
+        if (st0 == S_COMPLETE) { writer_done(sh); status[i] = 2; e += k; ok++; continue; }
         if (st0 != S_CLAIMED) { status[i] = 3; e += k; continue; }  /* freed or evicting */
         atomic_thread_fence(memory_order_release);
         int mr = merge_ivals(sh, k, ext_off + e, ext_len + e, sh->total_bytes);
         e += k;
         if (mr < 0) { status[i] = 3; continue; }
+        atomic_store(&sh->touched_ms, mono_ms());
+        writer_done(sh);
         if (mr == 0) { status[i] = 0; ok++; continue; }
         uint32_t expect = S_CLAIMED;
         if (atomic_compare_exchange_strong(&sh->state, &expect, S_COMPLETE)) {
@@ -761,6 +784,91 @@ int64_t arena_reap_stale(uint8_t *base) {
         freed++;
     }
     return freed;
+}
+
+/* #231 (rc12m-dpr 09271152, P mamba arena 32 slots): a slot is COMPLETE only
+ * when every writer rank merged its extents. The P ranks decide their anchor
+ * claims locally (PP0 reads the store and finds nodes already backed, PP1/PP2
+ * publish them): a stem PP1/PP2 claimed and wrote that PP0 never joins stays
+ * CLAIMED for ever -- not COMPLETE, so no reader can use it and no evictor may
+ * take it, and not FREE. Census 12:00 -> 12:15: complete 29 -> 5 while every
+ * claim came back "no free slot": the arena filled with such orphans, the END
+ * anchors of every later request were refused, D resumed short (#928, #1324
+ * shortfall) and P prefilled again.
+ * Reap a CLAIMED slot of the direct-write protocol only when NO writer can
+ * still come to it:
+ *  - no OPEN writer: every rank that claimed or joined it (arena_claim, the
+ *    only way into the direct protocol) has merged (arena_complete) or given
+ *    the claim up (arena_unclaim / free). A rank that claimed and has not
+ *    merged yet -- asleep, behind by minutes, mid flip -- keeps it open, for
+ *    any length of time;
+ *  - no reference: a rank that merged holds its node's reader reference until
+ *    its tree lets the node go (reset, displacement);
+ *  - untouched for `min_age_ms` (belt: no claim or merge just happened).
+ * A rank that never claimed the stem and claims it after the reap gets a
+ * FRESH slot (the index cell is tombstoned) -- never status 3 on a slot it
+ * owns; its anchor is then only as complete as its own writers make it.
+ * The payload path (arena_write, claims counter 0) is never judged here.
+ * Returns the number freed; their ids go to out[0..out_cap). */
+int64_t arena_reap_partial(uint8_t *base, int64_t min_age_ms, int64_t *out, int64_t out_cap) {
+    ArenaHeader *h = hdr(base);
+    uint32_t now = mono_ms();
+    int64_t freed = 0;
+    for (uint64_t s = 0; s < h->slots; s++) {
+        SlotHeader *sh = slot_hdr(base, s);
+        if (atomic_load(&sh->state) != S_CLAIMED) continue;
+        if (atomic_load(&sh->refcount) != 0) continue;
+        uint32_t w = atomic_load(&sh->writers);
+        /* only the direct-write protocol (arena_claim) is judged: at least one
+         * writer claimed, none is open; the payload path (arena_write) merges
+         * in the same call and is never taken here */
+        if ((w >> 16) == 0 || (w & W_OPEN) != 0) continue;
+        uint32_t t = atomic_load(&sh->touched_ms);
+        if ((uint32_t)(now - t) < (uint32_t)min_age_ms) continue;
+        uint32_t expect = S_CLAIMED;
+        if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) continue;
+        if (atomic_load(&sh->refcount) != 0 || atomic_load(&sh->writers) != w
+            || atomic_load(&sh->touched_ms) != t) {
+            atomic_store(&sh->state, S_CLAIMED);
+            continue;
+        }
+        _Atomic uint64_t *keys = index_keys(base);
+        _Atomic uint32_t *islots = index_slots(base);
+        uint64_t mask = h->index_cap - 1;
+        uint64_t j = mix64(sh->key_lo) & mask;
+        for (uint64_t m = 0; m < h->index_cap; m++, j = (j + 1) & mask) {
+            uint64_t k = atomic_load(&keys[j]);
+            if (k == 0) break;
+            if (k == sh->key_lo && atomic_load(&islots[j]) == (uint32_t)s) {
+                atomic_store(&keys[j], TOMB);
+                break;
+            }
+        }
+        sh->key_lo = 0; sh->key_hi = 0;
+        sh->n_ivals = 0;
+        sh->generation++;
+        atomic_store(&sh->writers, 0u);
+        atomic_fetch_sub(&h->n_claimed, 1);
+        atomic_store(&sh->state, S_FREE);
+        if (out && freed < out_cap) out[freed] = (int64_t)s;
+        freed++;
+    }
+    return freed;
+}
+
+/* #231: a direct writer gives its claim up without merging (abort_write of a
+ * JOIN -- a fresh claim is freed whole). Generation-checked; returns the count. */
+int64_t arena_unclaim(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens) {
+    ArenaHeader *h = hdr(base);
+    int64_t done = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if ((int64_t)sh->generation != gens[i]) continue;
+        writer_done(sh);
+        done++;
+    }
+    return done;
 }
 
 void arena_stats(uint8_t *base, int64_t *out) {
