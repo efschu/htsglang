@@ -51,6 +51,11 @@ _UNSET = object()
 _mod: Any = _UNSET
 
 
+class Weg2HandoffLost(Exception):
+    """A rid whose hand-off was lost a second time over X: its future fails with
+    this, and handle_generate answers it with a named 503 (no stream opened)."""
+
+
 def enabled(env=None) -> bool:
     """``SGLANG_WEG2_HANDOFF_LOST_REROUTE`` (default on; 0 = off)."""
     e = os.environ if env is None else env
