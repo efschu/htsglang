@@ -1002,6 +1002,10 @@ class PrefillAdder:
         #: "nothing resident", which is precisely the pass that then mints a
         #: second one.
         self.chunked_req_outstanding = False
+        #: H105: on a Form A group the scheduler installs the host-verdict
+        #: exchange here (`Scheduler._form_a_admission_follow_fn`); None keeps
+        #: every gate in `add_one_req` rank-local exactly as before.
+        self.form_a_admission_follow = None
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
@@ -2396,6 +2400,13 @@ class PrefillAdder:
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
+        # H105: the budget gates below are RANK-LOCAL (this rank's pool, this
+        # rank's `prefix_indices`). On a Form A group they are collected into
+        # one verdict and the attention host's verdict is taken at the single
+        # point inside the lock (`form_a_admission_follow`); everywhere else
+        # the first failing gate returns exactly as before.
+        _fa_follow = self.form_a_admission_follow
+        _gate = None
         if total_tokens >= self.rem_total_tokens:
             # Lifetime doesn't fit VRAM: wedge -- UNLESS Prefill-Spill can admit
             # it born-spilled (input transiently fits, a host region is free),
@@ -2404,28 +2415,32 @@ class PrefillAdder:
             if not self._admit_born_spilled(
                 req, born_input_tokens
             ) and not self._admit_born_spilled_deep(req, born_input_tokens):
-                return AddReqResult.NO_TOKEN
+                _gate = AddReqResult.NO_TOKEN
 
-        if self.is_hybrid_swa:
+        if _gate is None and self.is_hybrid_swa:
             swa_needed = self._swa_budget_for_req(
                 cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
             )
             if swa_needed >= self.rem_swa_tokens:
-                return AddReqResult.NO_TOKEN
+                _gate = AddReqResult.NO_TOKEN
 
         if (
-            self.rem_chunk_tokens is None
+            _gate is None
+            and self.rem_chunk_tokens is None
             and len(self.can_run_list) != 0
             and real_input_tokens >= self.rem_input_tokens
         ):
             # If without chunked prefill:
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
             # - if the can_run_list is empty, always accept the first prefill request
-            return AddReqResult.OTHER
+            _gate = AddReqResult.OTHER
+
+        if _gate is not None and _fa_follow is None:
+            return _gate
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
+            if _gate is None and total_tokens >= self.rem_total_tokens:
                 # Prefill-Spill: a prompt already admitted born-spilled at the
                 # pre-lock gate stays admitted as long as its input still fits
                 # the (possibly shrunk) device budget; otherwise wedge as usual.
@@ -2436,14 +2451,26 @@ class PrefillAdder:
                 if not req.born_spilled_deep and not (
                     req.born_spilled and born_input_tokens < self.rem_total_tokens
                 ):
-                    return AddReqResult.NO_TOKEN
+                    _gate = AddReqResult.NO_TOKEN
 
-            if self.is_hybrid_swa:
+            if _gate is None and self.is_hybrid_swa:
                 swa_needed = self._swa_budget_for_req(
                     cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
                 )
                 if swa_needed >= self.rem_swa_tokens:
-                    return AddReqResult.NO_TOKEN
+                    _gate = AddReqResult.NO_TOKEN
+
+            if _fa_follow is not None:
+                # H105: after every rank-local gate and BEFORE the load-back
+                # (and the tail-adopt vote behind it) -- the one point every
+                # rank of the group reaches for this rid. The host's verdict
+                # is returned on every rank; a host refusal leaves the request
+                # in the waiting queue, as any NO_TOKEN does.
+                _gate = _fa_follow(
+                    req, _gate, int(total_tokens), int(self.rem_total_tokens)
+                )
+            if _gate is not None:
+                return _gate
 
             # #968/#1035: the load-back runs only where its result can be
             # rank-uniform -- and since this slice, uniformity is CONSTRUCTED

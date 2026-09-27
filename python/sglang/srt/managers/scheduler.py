@@ -3765,6 +3765,86 @@ class Scheduler(
 
 
 
+    def _form_a_tp_exchange(self, site: str, payload):
+        """H105: one small broadcast from the attention host (TP rank 0) under
+        the #1028d blocked-recv stamp, so a peer that never arrives is named by
+        the watchdog (``chain-recv/<site>``) instead of read as a silent wedge.
+        The host passes its payload, a worker ``None``; every rank returns the
+        host's."""
+        from sglang.srt.utils import broadcast_pyobj
+
+        self._note_pp_chain_blocked(site, time.monotonic())
+        try:
+            out = broadcast_pyobj(
+                [payload] if payload is not None else [],
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
+        finally:
+            self._note_pp_chain_blocked(None, None)
+        return out[0] if out else None
+
+    def _form_a_is_host(self) -> Optional[bool]:
+        """H105: None off a Form A follow group (tp 1, pp > 1, switch off);
+        else whether this rank is the attention host. The host must be the
+        broadcast source (TP rank 0) -- anything else is a named stop."""
+        if self.ps.tp_size <= 1 or self.ps.pp_size > 1:
+            return None
+        from sglang.srt.managers import tp_match_floor as _tmf
+
+        if not _tmf.form_a_follow_active():
+            return None
+        is_host = not _tmf.this_rank_follows()
+        if is_host != (self.tp_group.rank == self.tp_group.ranks[0]):
+            raise _tmf.FormAAdmissionSplit(
+                f"H105 RU FORM-A ADMISSION HOST-NOT-SOURCE tp_rank={self.tp_group.rank} "
+                f"src={self.tp_group.ranks[0]} is_host={is_host}: the attention "
+                "host must be TP rank 0, the source of the admission broadcast."
+            )
+        return is_host
+
+    def _form_a_admission_follow_fn(self):
+        """H105: the callable `PrefillAdder.add_one_req` hands its gate verdict
+        to on a Form A group (None elsewhere -- every gate stays rank-local)."""
+        is_host = self._form_a_is_host()
+        if is_host is None:
+            return None
+        from sglang.srt.managers import tp_match_floor as _tmf
+
+        def _exchange(payload):
+            return self._form_a_tp_exchange("form-a-admission/tp<-verdict", payload)
+
+        def _follow(req, gate, price=None, budget=None):
+            local = _tmf.ADMISSION_ADMIT if gate is None else gate.name
+            code = _tmf.form_a_admission_verdict(
+                req.rid,
+                local,
+                is_host=is_host,
+                exchange=_exchange,
+                price=price,
+                budget=budget,
+            )
+            return None if code == _tmf.ADMISSION_ADMIT else AddReqResult[code]
+
+        return _follow
+
+    def _form_a_extend_set_riegel(self, can_run_list) -> None:
+        """H105 riegel after the admission loop: the host's built extend set
+        against this rank's; a split is a named stop before the forward."""
+        is_host = self._form_a_is_host()
+        if is_host is None:
+            return
+        from sglang.srt.managers import tp_match_floor as _tmf
+
+        _tmf.form_a_extend_set_check(
+            _tmf.form_a_extend_set(can_run_list),
+            is_host=is_host,
+            exchange=lambda p: self._form_a_tp_exchange(
+                "form-a-admission/tp<-extend-set", p
+            ),
+        )
+
     def init_request_receiver(self) -> None:
         # #1233 (WEG 2, S0): both were built only under the flip, to let an
         # ARMED rank stop taking work at a quiescent boundary. Nothing arms
@@ -14346,6 +14426,9 @@ class Scheduler(
             # same rid set as the two above.
             scheduled_last_chunk=self._pp_scheduled_last_chunk(),
         )
+        # H105: on a Form A group the attention host's gate verdict is the
+        # group's (None elsewhere: every gate in add_one_req stays rank-local).
+        adder.form_a_admission_follow = self._form_a_admission_follow_fn()
         # #996 THIS RANK'S OWN CAP, captured beside the floor. Printed by
         # APPENDING to the existing census line -- the previous revision put a
         # SECOND emission next to it and flipped the death form, which is the
@@ -15697,6 +15780,13 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+
+        # H105 RIEGEL: the built extend set is the host's, or the group stops
+        # by name here -- never a decode on one rank against an extend on the
+        # others (dpr 08:51:31, 5,5 min to the watchdog). Skipped on a pass
+        # whose loop raised a schedule refusal: that rank stops below anyway.
+        if schedule_refusal is None:
+            self._form_a_extend_set_riegel(adder.can_run_list)
 
         # C11: answer the requests this pass refused by name. AFTER the loop,
         # because the loop iterates `waiting_queue` in place.
