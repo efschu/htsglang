@@ -126,6 +126,30 @@ def launch_lines(lines: List[str]) -> List[str]:
     return out
 
 
+def fill_series(ts, vals, flip_ts, first_t, bucket_s):
+    """Hold / zero / none, see Boot.series.  Pure, unit-tested."""
+    raw = [i for i, v in enumerate(vals) if v is not None]
+    gaps = [b - a for a, b in zip(raw, raw[1:]) if b - a > 0]
+    gaps.sort()
+    typical = gaps[len(gaps) // 2] if gaps else 1
+    hold = max(1, 2 * typical)
+    out, last_i = [], None
+    for i, v in enumerate(vals):
+        t = ts[i]
+        if v is not None:
+            out.append(v)
+            last_i = i
+            continue
+        if first_t is None or t + bucket_s <= first_t:
+            out.append(None)
+            continue
+        if last_i is not None and i - last_i <= hold and not any(ts[last_i] < f <= t + bucket_s for f in flip_ts):
+            out.append(vals[last_i])
+        else:
+            out.append(0.0)
+    return out
+
+
 def _rate(tok, ms):
     return (tok / (ms / 1000.0)) if (tok and ms and ms > 0) else None
 
@@ -152,6 +176,7 @@ class Boot:
         self.flip_open = None
         self.counts = collections.Counter()
         self._last_t = {}       # group -> newest log timestamp seen in that file
+        self.first_t = None     # first timestamp of this boot's logs
         self.lock = threading.Lock()
         # totals since boot (whole file read) and a 60-s event window, per group
         self.tot = collections.defaultdict(collections.Counter)
@@ -189,6 +214,8 @@ class Boot:
                 ev = parse.parse_line(line)
                 if ev:
                     self._last_t[group] = ev["t"]
+                    if self.first_t is None or ev["t"] < self.first_t:
+                        self.first_t = ev["t"]
                     self._ingest(group, ev)
                 elif group != "front":
                     m = parse.RE_PREFIX.match(line)
@@ -432,6 +459,17 @@ class Boot:
                 if i is not None and e.get("gen_tps") is not None:
                     s[i].append(e["gen_tps"])
             out["%s_decode_tps" % g] = [(sum(v) / len(v)) if v else None for v in s]
+        # Fill the gaps logically (user order 2026-09-27): a bucket without a line
+        # is NOT a failure.  Within 2x the series' usual line interval after a
+        # value and with no flip in between the group is still computing between
+        # two log lines -> hold the last value (step); otherwise it slept, was
+        # flipped away or had no work -> 0.  Before the boot's first line there is
+        # nothing (None); after its end / death the server cuts the series.
+        flips = [e["t"] for e in self.ev["flips"]]
+        first = self.first_t
+        for key in [k for k in out if k.endswith("_tps")]:
+            out[key] = fill_series(ts, out[key], flips, first, BUCKET_S)
+        out["filled"] = True
         return out
 
     def groups_with(self, kind: str) -> List[str]:
@@ -445,6 +483,7 @@ class Boot:
             "files": {g: {"path": t.path, "size": t.size, "age_s": round(now - t.mtime, 1) if t.mtime else None}
                       for g, t in self.tails.items()},
             "age_s": round(age, 1) if age is not None else None,
+            "last_log_t": self.newest_mtime or None,
             "live": age is not None and age < LIVE_S,
             "awake": self.last.get("awake"),
             "queue": self.last.get("queue"),
@@ -500,6 +539,8 @@ class Boot:
         def one(c):
             c = dict(c)
             seen = c.get("new", 0) + c.get("cached", 0)
+            if "new" not in c and "chunks" not in c:
+                seen = 0          # front rows (served_*) carry no #new-token; their share is req_hit_share
             c["hit_share"] = (c.get("cached", 0) / seen) if seen else None
             c["l2_share"] = (c.get("loadback_tok", 0) / seen) if seen else None
             dl = c.get("l3inc_deliverable", 0)

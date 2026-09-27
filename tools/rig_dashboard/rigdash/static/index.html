@@ -77,6 +77,8 @@ h2 .muted, .muted { color: var(--muted); font-weight: 400; }
 .sparkbox .ymax { position: absolute; left: 0; top: -2px; font-size: 10px; color: var(--muted); background: var(--surface); padding-right: 4px; }
 .spark { width: 100%; height: 60px; display: block; }
 .spark .grid { stroke: var(--line); stroke-width: 1; }
+.sparkbox .gapmark { position: absolute; right: 0; top: -2px; font-size: 10px; color: var(--bad); background: var(--surface); padding-left: 4px; }
+.sparkbox .caption { font-size: 10px; color: var(--muted); }
 .xaxis { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); }
 .tip { position: fixed; pointer-events: none; background: var(--surface); color: var(--text);
   border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font-size: 12px;
@@ -178,8 +180,9 @@ const ago = (s) => s == null ? "—" : s < 90 ? Math.round(s) + " s" : s < 5400 
 const hhmm = (t) => new Date(t * 1000).toLocaleTimeString("de-DE", {hour: "2-digit", minute: "2-digit", second: "2-digit"});
 const tip = $("tip");
 
-function spark(svgId, ts, vals, color, unit, digits, tEnd) {
-  const W = 600, H = 60, padT = 3, padB = 2;
+function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
+  opt = opt || {};
+  const W = 600, H = opt.h || 60, padT = 3, padB = 2;
   const pts = [];
   let max = 0;
   vals.forEach((v, i) => { if (v != null && isFinite(v)) { pts.push([ts[i], v]); if (v > max) max = v; } });
@@ -188,20 +191,35 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd) {
   const mag = max > 0 ? Math.pow(10, Math.floor(Math.log10(max))) : 1;
   const nice = max > 0 ? mag * Math.ceil(max / mag) : 1;
   const y = (v) => padT + (H - padT - padB) * (1 - v / nice);
-  let d = "", prev = null;
+  // working = 2 px (step: a held value stays level until the next bucket), zero = thin base line
+  // (slept / flipped away / no work), no value = no line (no data yet, or a real failure: red mark)
+  let dWork = "", dZero = "", prev = null, prevV = null;
   const step = ts.length > 1 ? (ts[1] - ts[0]) : 5;
   for (const [t, v] of pts) {
     if (t < t0) continue;
-    d += (prev == null || t - prev > 3 * step ? "M" : "L") + x(t).toFixed(1) + "," + y(v).toFixed(1);
-    prev = t;
+    const cont = prev != null && t - prev <= step * 1.01;
+    const X = x(t).toFixed(1), Y = y(v).toFixed(1);
+    if (v > 0) {
+      if (cont && prevV > 0) dWork += `L${X},${y(prevV).toFixed(1)}L${X},${Y}`;
+      else if (cont && prevV === 0) dWork += `M${X},${y(0).toFixed(1)}L${X},${Y}`;
+      else dWork += `M${X},${Y}`;
+    } else {
+      if (cont && prevV > 0) dWork += `L${X},${y(prevV).toFixed(1)}L${X},${Y}`;
+      dZero += (cont && prevV === 0 ? "L" : "M") + `${X},${Y}`;
+    }
+    prev = t; prevV = v;
   }
-  const svg = `<div class="sparkbox"><span class="ymax">${fmt(nice)} ${unit}</span>
-    <svg class="spark" id="${svgId}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Verlauf 15 min, ${unit}">
+  const hasGap = opt.gapFrom && opt.gapFrom > t0;
+  const gap = hasGap ? `<line x1="${x(opt.gapFrom).toFixed(1)}" x2="${x(opt.gapFrom).toFixed(1)}" y1="0" y2="${H}" stroke="var(--bad)" stroke-width="2" stroke-dasharray="4 3" vector-effect="non-scaling-stroke"/>` : "";
+  const svg = `<div class="sparkbox"><span class="ymax">${fmt(nice, digits)} ${unit}</span>${hasGap ? `<span class="gapmark">✕ ${esc(opt.gapReason || "Ausfall")} ${hhmm(opt.gapFrom)}</span>` : ""}
+    <svg class="spark" id="${svgId}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Verlauf 15 min, ${unit}" style="height:${H}px">
     <line class="grid" x1="0" x2="${W}" y1="${y(nice)}" y2="${y(nice)}" vector-effect="non-scaling-stroke"/>
     <line class="grid" x1="0" x2="${W}" y1="${y(0)}" y2="${y(0)}" vector-effect="non-scaling-stroke"/>
-    <path d="${d}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>
+    <path d="${dZero}" fill="none" stroke="${color}" stroke-width="1" stroke-opacity=".7" vector-effect="non-scaling-stroke"/>
+    <path d="${dWork}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>
+    ${gap}
     <line class="cross" x1="0" x2="0" y1="0" y2="${H}" stroke="var(--muted)" stroke-width="1" vector-effect="non-scaling-stroke" visibility="hidden"/>
-    </svg><div class="xaxis"><span>−15 min</span><span>jetzt</span></div></div>`;
+    </svg>${opt.noAxis ? "" : `<div class="xaxis"><span>−15 min</span><span>jetzt</span></div>`}${opt.caption ? `<div class="caption">${opt.caption}</div>` : ""}</div>`;
   return {svg, bind: () => {
     const el = document.getElementById(svgId);
     if (!el) return;
@@ -213,11 +231,28 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd) {
       for (const p of pts) if (best == null || Math.abs(p[0] - tx) < Math.abs(best[0] - tx)) best = p;
       if (!best || Math.abs(best[0] - tx) > 20) { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); return; }
       cross.setAttribute("x1", x(best[0])); cross.setAttribute("x2", x(best[0])); cross.setAttribute("visibility", "visible");
-      tip.innerHTML = `<b>${fmt(best[1], digits)}</b> ${unit} &middot; ${hhmm(best[0])}`;
+      tip.innerHTML = `<b>${fmt(best[1], digits)}</b> ${unit} &middot; ${hhmm(best[0])}${best[1] === 0 ? " &middot; ruht / keine Arbeit" : ""}`;
       tip.style.display = "block"; tip.style.left = (e.clientX + 12) + "px"; tip.style.top = (e.clientY - 28) + "px";
     });
     el.addEventListener("mouseleave", () => { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); });
   }};
+}
+
+// tok/s chart and, under it on the same time grid, tok/s per watt
+function rateCharts(b, key, color, digits, now, binders) {
+  const ser = b.series || {};
+  if (!ser[key]) return "";
+  const o = {gapFrom: ser.gap_from, gapReason: ser.gap_reason};
+  const a = spark(`sp-${b.stem}-${key}`, ser.t, ser[key], color, "tok/s", digits, now, o);
+  binders.push(a.bind);
+  let h = a.svg;
+  if (ser[key + "_per_w"]) {
+    const w = spark(`sp-${b.stem}-${key}-w`, ser.t, ser[key + "_per_w"], color, "tok/s/W", 2, now,
+      Object.assign({}, o, {h: 40, caption: "tok/s pro Watt &middot; Nenner: &Sigma; power.draw aller 3 Karten (nvidia-smi, 5-s-Mittel), inkl. Idle der schlafenden Gruppe"}));
+    binders.push(w.bind);
+    h += w.svg;
+  }
+  return h;
 }
 
 function kv(rows) {
@@ -233,9 +268,7 @@ function prefillTile(b, g, color, label, binders, now) {
   const ranks = src ? Object.entries(src.ranks || {}).map(([r, a]) => `${r} ${fmt(a.tps)}`).join(" &middot; ") : "—";
   const state = active ? `aktiv &middot; letzte ${Math.round(p.window_s)} s`
     : (p.last_t ? `ruht &middot; letzter Chunk vor ${ago(now - p.last_t)}, Zahl = letzter Schub` : "noch kein Chunk");
-  const ser = (b.series || {})[g + "_prefill_tps"];
-  const sp = ser ? spark(`sp-${b.stem}-${g}p`, b.series.t, ser, color, "tok/s", 0, now) : null;
-  if (sp) binders.push(sp.bind);
+  const charts = rateCharts(b, g + "_prefill_tps", color, 0, now, binders);
   return `<div class="tile"><div class="label"><i style="background:${color}"></i>${label}</div>
     <div class="big num">${fmt(src && src.tps)}<small>tok/s</small></div>
     <div class="state">${state}</div>
@@ -247,7 +280,7 @@ function prefillTile(b, g, color, label, binders, now) {
       ["Warteschlange &middot; ausstehende Tokens", `${fmt(p.queue)} &middot; ${fmt(p.pending_tok)}`],
       src && src.wall_confounded_tps != null ? ["input throughput (wall-konfundiert)", fmt(src.wall_confounded_tps), "wc"] : null,
     ])}
-    ${sp ? sp.svg : ""}</div>`;
+    ${charts}</div>`;
 }
 
 function decodeTile(b, g, color, binders, now) {
@@ -257,9 +290,7 @@ function decodeTile(b, g, color, binders, now) {
   const v = active ? d.gen_tps : d.gen_tps_last;
   const state = active ? `aktiv &middot; Mittel der letzten ${Math.round(d.window_s)} s (${d.rows} Zeilen)`
     : (d.last_t ? `ruht &middot; letzte Zeile vor ${ago(now - d.last_t)}, Zahl = letzter Wert` : "noch keine Decode-Zeile");
-  const ser = (b.series || {})[g + "_decode_tps"];
-  const sp = ser ? spark(`sp-${b.stem}-${g}d`, b.series.t, ser, color, "tok/s", 1, now) : null;
-  if (sp) binders.push(sp.bind);
+  const charts = rateCharts(b, g + "_decode_tps", color, 1, now, binders);
   const per = (v != null && d.running) ? v / d.running : null;
   return `<div class="tile"><div class="label"><i style="background:${color}"></i>Decode${g !== "D" ? " (" + g + ")" : ""}</div>
     <div class="big num">${fmt(v, 1)}<small>tok/s</small></div>
@@ -270,7 +301,7 @@ function decodeTile(b, g, color, binders, now) {
       ["Rechenrate (bs&times;accept / gpu-ms)", d.compute_tps != null ? `${fmt(d.compute_tps, 1)} tok/s` : "—"],
       ["KV-Belegung &middot; CUDA-Graph", `${d.full_use != null ? fmt(d.full_use * 100) + " %" : "—"} &middot; ${d.cuda_graph == null ? "—" : d.cuda_graph ? "ja" : "nein"}`],
     ])}
-    ${sp ? sp.svg : ""}</div>`;
+    ${charts}</div>`;
 }
 
 function alarmHtml(b, now) {

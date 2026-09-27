@@ -17,6 +17,7 @@ import shlex
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Optional
 
 from . import health, live, redact, sources, weg2line
 
@@ -36,6 +37,49 @@ def _version():
 def _container_token(name: str) -> str:
     n = re.sub(r"^htsglang-(acc-)?", "", name or "")
     return n.replace("-", "").replace("_", "")
+
+
+def finish_series(b: dict, gpu_series: Optional[dict], now: float, bucket_s: float) -> None:
+    """Cut a series where the model really failed, and add tok/s per watt.
+
+    Gap = GRUPPE TOT (from the first dead reason on) or the boot has ended
+    (no log written and no running container) -- marked by ``gap_from`` and
+    ``gap_reason``.  Power = sum of nvidia-smi power.draw over ALL cards in the
+    bucket (mean of the samples); the idle draw of the sleeping group counts,
+    because it is really spent.
+    """
+    ser = b.get("series")
+    if not ser or not ser.get("t"):
+        return
+    ts = ser["t"]
+    gap_from, reason = None, None
+    a = b.get("alarm") or {}
+    if a.get("state") == "TOT":
+        dead = [r["t"] for r in a.get("reasons") or [] if r.get("level") == "dead" and r.get("t")]
+        if dead:
+            gap_from, reason = min(dead), "GRUPPE TOT"
+    c = b.get("container") or {}
+    if not b.get("live") and c.get("State") != "running" and b.get("last_log_t"):
+        if gap_from is None or b["last_log_t"] < gap_from:
+            gap_from, reason = b["last_log_t"], "Boot beendet / Container weg"
+    keys = [k for k in ser if k.endswith("_tps")]
+    if gap_from is not None:
+        for k in keys:
+            ser[k] = [None if t + bucket_s > gap_from else v for t, v in zip(ts, ser[k])]
+        ser["gap_from"], ser["gap_reason"] = gap_from, reason
+    power = [None] * len(ts)
+    if gpu_series and gpu_series.get("t"):
+        acc = [[0.0, 0] for _ in ts]
+        t0 = ts[0]
+        for t, row in zip(gpu_series["t"], gpu_series["power"]):
+            i = int((t - t0) // bucket_s)
+            if 0 <= i < len(ts) and row and all(x is not None for x in row):
+                acc[i][0] += sum(row)
+                acc[i][1] += 1
+        power = [(a0 / n) if n else None for a0, n in acc]
+    ser["power_sum_w"] = power
+    for k in keys:
+        ser[k + "_per_w"] = [(v / p) if (v is not None and p) else None for v, p in zip(ser[k], power)]
 
 
 def attach_containers(boots, containers):
@@ -98,13 +142,16 @@ class App:
         for b in boots:
             b["front"] = sources.front_for_boot(fronts, b["meta"].get("tag"))
             b["alarm"] = health.assess(b, now)
+        gser = self.src.gpu_series() if with_series else None
+        for b in boots:
+            finish_series(b, gser, now, live.BUCKET_S)
         return {
             "t": now,
             "version": self.version,
             "uptime_s": round(now - self.t0, 1),
             "boots": boots,
             "gpus": sv.get("gpus"),
-            "gpu_series": self.src.gpu_series() if with_series else None,
+            "gpu_series": gser,
             "docker": sv.get("docker"),
             "gpuq": sv.get("gpuq"),
             "fronts": {k: {kk: vv for kk, vv in v.items() if kk != "value"} for k, v in fronts.items()},

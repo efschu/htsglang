@@ -163,7 +163,8 @@ class LiveTests(unittest.TestCase):
         # compute-derived: bs 5 * accept 2.70 / 0.1177 s
         self.assertAlmostEqual(d["compute_tps"], 5 * 2.70 / 0.1177, places=1)
         self.assertIn("P_prefill_tps", v["series"])
-        self.assertEqual(len([x for x in v["series"]["P_prefill_tps"] if x]), 1)
+        vals = [x for x in v["series"]["P_prefill_tps"] if x]
+        self.assertAlmostEqual(max(vals), 16384 / 3.2555, places=0)
 
     def test_idle_window_falls_back_to_last_burst(self):
         old = time.time() - 600
@@ -360,6 +361,52 @@ class TotalsAndCacheTests(unittest.TestCase):
         self.assertAlmostEqual(sd["req_hit_share"], 25984 / 26012)
         # the ADMIN-KEY launch line never reaches the view
         self.assertFalse(any("ADMIN" in x for x in v["meta"].get("launch", [])))
+
+
+class SeriesFillTests(unittest.TestCase):
+    TS = [100.0 + 5 * i for i in range(12)]
+
+    def test_hold_between_lines_then_zero(self):
+        # values every other bucket -> typical gap 2 buckets, hold <= 4
+        vals = [None, 10, None, 12, None, None, None, None, None, None, None, None]
+        out = live.fill_series(self.TS, vals, [], 100.0, 5.0)
+        self.assertEqual(out[:5], [0.0, 10, 10, 12, 12])       # bucket 0 is after the boot's first line -> 0
+        self.assertEqual(out[7], 12)                          # still within 2x the usual interval
+        self.assertEqual(out[8], 0.0)                         # beyond -> no work / slept
+
+    def test_flip_ends_the_hold(self):
+        vals = [5, 5, None, None, None, None, None, None, None, None, None, None]
+        out = live.fill_series(self.TS, vals, [111.0], 100.0, 5.0)
+        self.assertEqual(out[2], 0.0)                          # flipped away in bucket 2
+
+    def test_nothing_before_the_boot(self):
+        vals = [None] * 6 + [7] + [None] * 5
+        out = live.fill_series(self.TS, vals, [], 128.0, 5.0)
+        self.assertEqual(out[:5], [None] * 5)
+
+    def test_dead_boot_is_cut_and_power_divides(self):
+        ts = self.TS[:4]
+        b = {"series": {"t": ts, "D_decode_tps": [100.0, 100.0, 100.0, 100.0]}, "live": True,
+             "container": {"State": "running"},
+             "alarm": {"state": "TOT", "reasons": [{"level": "dead", "t": 111.0, "text": "x"}]}}
+        gs = {"t": [101.0, 106.0, 107.0, 116.0], "power": [[100, 150, 250], [100, 100, 200], [100, 100, 300], [50, 50, 100]]}
+        server.finish_series(b, gs, 125.0, 5.0)
+        ser = b["series"]
+        self.assertEqual(ser["D_decode_tps"], [100.0, 100.0, None, None])
+        self.assertEqual(ser["gap_reason"], "GRUPPE TOT")
+        self.assertEqual(ser["power_sum_w"], [500.0, 450.0, None, 200.0])
+        self.assertAlmostEqual(ser["D_decode_tps_per_w"][0], 0.2)
+        self.assertIsNone(ser["D_decode_tps_per_w"][2])
+
+
+class RedactTests(unittest.TestCase):
+    def test_key_lines_dropped_values_cut_door_closed(self):
+        from rigdash import redact
+        self.assertIsNone(redact.clean("WEG2 ADMIN-KEY minted for this boot -> /x/boot.adminkey (mode 0600)"))
+        self.assertIsNone(redact.clean("RPC auth=bearer abcdefghijklmnop"))
+        self.assertEqual(redact.clean("failed: api_key=sk-or-v1-abcdef0123456789 x"), "failed: api_key=<entfernt> x")
+        self.assertEqual(redact.clean("#new-token: 16384, tokens: 5"), "#new-token: 16384, tokens: 5")
+        self.assertNotIn("ADMIN-KEY", redact.guard('{"t": "WEG2 ADMIN-KEY x"}'))
 
 
 class SourceTests(unittest.TestCase):
