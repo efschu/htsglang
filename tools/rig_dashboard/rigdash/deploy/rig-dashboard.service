@@ -20,7 +20,9 @@ StartLimitBurst=20
 [Service]
 Type=exec
 WorkingDirectory=/opt/rigdash/current
-ExecStart=/usr/bin/python3 -m rigdash --host 0.0.0.0 --port 8890 --front http://127.0.0.1:30030
+# --release-profile: which profiles the start-line wizard offers (Operator 27.09.: 27B INT8 drq + NF H91).
+ExecStart=/usr/bin/python3 -m rigdash --host 0.0.0.0 --port 8890 --front http://127.0.0.1:30030 --state-dir /var/lib/rigdash --release-profile 27b-release-draft --release-profile nf-h91
+StateDirectory=rigdash
 Environment=PYTHONUNBUFFERED=1
 # ssh reads the `proxmox` alias and key from /root/.ssh
 Environment=HOME=/root

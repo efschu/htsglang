@@ -18,7 +18,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import health, live, sources
+from . import health, live, sources, weg2line
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -74,8 +74,10 @@ class App:
             "docker_host_prefix": args.docker_host_prefix,
             "weg2_fronts": args.front or [],
             "gpuq": args.gpuq,
+            "state_dir": args.state_dir or None,
         }
         self.src = sources.Sources(cfg)
+        self.weg2 = weg2line.Weg2Lines(cfg["docker_ssh"], args.release_profile or [])
         self.stop = threading.Event()
         self.t0 = time.time()
         self.version = _version()
@@ -132,6 +134,22 @@ def make_handler(app: App):
         def _json(self, obj, code=200):
             self._send(code, json.dumps(obj, default=str), "application/json")
 
+        def _weg2(self, path):
+            from urllib.parse import parse_qs, urlsplit
+
+            q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+            if not app.weg2.release_profiles:
+                return self._json({"ok": False, "error": "keine Release-Profile konfiguriert (--release-profile)"}, 400)
+            if path == "/api/weg2/options":
+                return self._json(dict(app.weg2.options(), ok=True))
+            built = app.weg2.build(q.get("profile", ""), q.get("image", ""), q.get("transport", "bar1"),
+                                   q.get("house_guard", "memlimit"))
+            if path == "/api/weg2/line":
+                return self._json(dict(built, ok=True))
+            if path == "/api/weg2/dry":
+                return self._json(dict(app.weg2.dry_run(built), ok=True, line=built))
+            return self._send(404, "not found", "text/plain")
+
         def do_GET(self):
             path = self.path.split("?", 1)[0]
             try:
@@ -141,12 +159,19 @@ def make_handler(app: App):
                 if path == "/api/live":
                     series = "noseries" not in self.path
                     return self._json(app.snapshot(series))
+                if path in ("/weg2", "/weg2.html"):
+                    with open(os.path.join(STATIC, "weg2.html"), "rb") as fh:
+                        return self._send(200, fh.read(), "text/html; charset=utf-8")
+                if path.startswith("/api/weg2/"):
+                    return self._weg2(path)
                 if path == "/api/health":
                     return self._json({"ok": True, "version": app.version,
                                        "uptime_s": round(time.time() - app.t0, 1)})
                 return self._send(404, "not found", "text/plain")
             except BrokenPipeError:
                 return None
+            except ValueError as e:
+                return self._json({"ok": False, "error": str(e)}, 400)
             except Exception as e:
                 return self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
 
@@ -167,6 +192,9 @@ def main(argv=None):
     ap.add_argument("--front", action="append", default=[],
                     help="weg2 front base URL to read /weg2/state from (repeatable)")
     ap.add_argument("--gpuq", default="http://127.0.0.1:8770")
+    ap.add_argument("--state-dir", default="", help="keeps the 15-min card history across restarts")
+    ap.add_argument("--release-profile", action="append", default=[],
+                    help="profile name offered by the start-line wizard (repeatable; the unit names the release ones)")
     args = ap.parse_args(argv)
     app = App(args)
     app.start()

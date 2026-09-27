@@ -7046,6 +7046,16 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     <div id="wz_cmd"><span class="muted">choose a family above.</span></div>
   </fieldset>
 
+  <fieldset data-step="weg2">
+    <legend>Startform heute &mdash; weg2-Launcher im Docker-Container (Host-Zeile)</legend>
+    <div class="muted" style="margin-bottom:var(--s2)">Der Befehl oben ist die klassische
+      <code>launch_server</code>-Form einer Familie. Auf diesem Rig startet ein Modell heute &uuml;ber
+      <code>host_acceptance.sh serve</code> auf dem Proxmox-Host, mit Release-Profil, Image und Transport, in einem
+      gpuq-Fenster. Die Zeile unten erzeugt das Rig-Dashboard aus den Profil-Dateien und <code>docker images</code>;
+      der Trockenlauf pr&uuml;ft sie ohne Boot.</div>
+    <iframe id="wz_weg2" title="weg2-Startzeile" style="width:100%;height:760px;border:1px solid var(--bd-weak);border-radius:6px" loading="lazy"></iframe>
+  </fieldset>
+
   <fieldset class="cfg-section" data-step="expert">
     <legend>4 &mdash; expert view: adjust anything, then save it as a profile</legend>
     <div class="muted" style="margin-bottom:var(--s2)">The guide above works
@@ -8711,6 +8721,10 @@ function renderUnusedCards(){
 // while they are marked as belonging to the previous input.
 // ===========================================================================
 const WIZ_STEPS=['model','hardware','goal','families','command','expert'];
+// The weg2 start-line step (after 'command') is served by the rig dashboard on
+// the same host; one inline script per page, so the iframe gets its src here.
+(function(){ const f=document.getElementById('wz_weg2');
+  if(f) f.src=location.protocol+'//'+location.hostname+':8890/weg2?embed=1'; })();
 function wizardInvalidate(from){
   const i=WIZ_STEPS.indexOf(from);
   if(i<0) return;
@@ -9681,11 +9695,22 @@ async function modelsPoll(){
   try{ d = await api('/api/registry/snapshot'+q, {key:'mdl_snapshot'}); }
   catch(e){ if(apiAborted(e)) return; $('mdl_conn').innerHTML='<span class="reasons">'+esc(apiError(e))+'</span>'; return; }
   if (!d.reachable) {
-    $('mdl_conn').innerHTML='<span class="reasons">registry unreachable at '
-      +esc(d.registry_base||'')+(d.error?(': '+esc(d.error)):'')+'</span>';
-    $('mdl_list').innerHTML='<span class="muted">no engines to show -- the registry '
-      +'is not reachable. Start it with <code>python -m sglang.srt.registry</code> '
-      +'or point this tab at the right host:port above.</span>';
+    // A closed port is the rig's normal state since the weg2/Docker rework: engines
+    // are started by host_acceptance.sh, not by a registry. Say that plainly;
+    // any OTHER failure (timeout, bad answer) is still shown as the error it is.
+    if (/refused|Errno 111/i.test(d.error||'')) {
+      $('mdl_conn').innerHTML='<span class="pill">Registry aus</span> <span class="muted">'
+        +esc(d.registry_base||'')+' ist nicht gestartet</span>';
+      const h=location.protocol+'//'+location.hostname;
+      $('mdl_list').innerHTML='<span class="muted">Auf diesem Rig l&auml;uft keine Engine-Registry: Modelle starten '
+        +'heute &uuml;ber den weg2-Launcher im Docker-Container (<code>host_acceptance.sh serve</code>) in einem gpuq-Fenster. '
+        +'Laufendes Modell und Raten: <a href="'+h+':8890/">Rig-Dashboard</a>; Startzeile: <a href="'+h+':8890/weg2">Startzeile</a> '
+        +'(auch im Wizard). Diese Tafel f&uuml;llt sich, sobald oben eine erreichbare Registry eingetragen ist.</span>';
+    } else {
+      $('mdl_conn').innerHTML='<span class="reasons">registry unreachable at '
+        +esc(d.registry_base||'')+(d.error?(': '+esc(d.error)):'')+'</span>';
+      $('mdl_list').innerHTML='<span class="muted">no engines to show -- the registry is not answering.</span>';
+    }
     return;
   }
   $('mdl_conn').innerHTML='<span class="pill">connected: '+esc(d.registry_base)+'</span>';

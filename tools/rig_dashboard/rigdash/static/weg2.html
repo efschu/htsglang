@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Startzeile weg2</title>
+<style>
+:root { color-scheme: light; --bg: #f4f4f2; --surface: #fcfcfb; --surface-2: #efeeea; --line: #dcdad4;
+  --text: #0b0b0b; --text-2: #52514e; --muted: #7b7a75; --accent: #2a78d6; --good: #008300; --bad: #d03b3a; --warn: #b77a00; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { color-scheme: dark; --bg: #111110; --surface: #1a1a19;
+  --surface-2: #232321; --line: #34332f; --text: #fff; --text-2: #c3c2b7; --muted: #8d8c85; --accent: #3987e5; --good: #3fb950;
+  --bad: #e66767; --warn: #d9a400; } }
+:root[data-theme="dark"] { color-scheme: dark; --bg: #111110; --surface: #1a1a19; --surface-2: #232321; --line: #34332f;
+  --text: #fff; --text-2: #c3c2b7; --muted: #8d8c85; --accent: #3987e5; --good: #3fb950; --bad: #e66767; --warn: #d9a400; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+body.embed { background: var(--surface); }
+main { padding: 14px 16px; max-width: 1200px; }
+h1 { font-size: 17px; margin: 0 0 6px; }
+.muted { color: var(--muted); font-size: 12px; }
+.form { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin: 10px 0; }
+label { font-size: 12px; color: var(--text-2); display: block; margin-bottom: 3px; }
+select { width: 100%; padding: 6px; background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+.gpuq { border: 2px solid var(--warn); border-radius: 8px; padding: 8px 12px; margin: 10px 0; font-size: 13px; }
+.gpuq b { color: var(--warn); }
+pre { background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; white-space: pre-wrap;
+  word-break: break-all; font: 12.5px/1.5 ui-monospace, Menlo, Consolas, monospace; margin: 6px 0; }
+ul { margin: 6px 0; padding-left: 18px; font-size: 13px; color: var(--text-2); }
+button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--surface-2); color: var(--text); cursor: pointer; }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+button:disabled { opacity: .6; cursor: default; }
+.verdict { font-weight: 800; font-size: 16px; margin: 8px 0 4px; }
+.verdict.green { color: var(--good); } .verdict.red { color: var(--bad); }
+.err { color: var(--bad); font-size: 13px; }
+table { border-collapse: collapse; font-size: 12px; } td { padding: 2px 10px 2px 0; color: var(--text-2); vertical-align: top; }
+td b { color: var(--text); font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Startzeile heute &mdash; weg2-Launcher im Docker-Container</h1>
+  <div class="muted">Erzeugt die Host-Zeile f&uuml;r <span id="ha">host_acceptance.sh</span> aus den Profil-Dateien, dem Build-Kontext und
+    <code>docker images</code> auf dem Proxmox-Host. Nichts davon ist fest eingetragen. Die Seite startet nichts.</div>
+  <div class="gpuq"><b>Zuerst ein gpuq-Fenster buchen</b> (Karten 0,1,2, ganze Karten) &mdash; <a id="gpuqlink" href="/" target="_blank" rel="noopener">GPU-Fensterplan</a>.
+    Dessen id ersetzt <code>&lt;fenster-id&gt;</code>. Ohne laufendes Fenster wird nicht gebootet. Die Zeile l&auml;uft als root auf dem Proxmox-Host.</div>
+  <div class="form">
+    <div><label for="profile">Release-Profil</label><select id="profile"></select></div>
+    <div><label for="image">Image (docker images auf dem Host)</label><select id="image"></select></div>
+    <div><label for="transport">Transport</label><select id="transport"></select></div>
+    <div><label for="house">Haus-Schutz (HOUSE_GUARD)</label><select id="house"></select></div>
+  </div>
+  <div id="profinfo"></div>
+  <pre id="cmd">lade&hellip;</pre>
+  <button id="copy">Zeile kopieren</button>
+  <ul id="notes"></ul>
+  <div style="margin-top:10px"><button id="dry" class="primary">Trockenlauf (ohne Boot, ohne Karte)</button>
+    <span class="muted" id="drynote">f&uuml;hrt auf dem Host die Parameter-, Image-, Profil- und Haus-Argument-Pr&uuml;fung von host_acceptance.sh aus; startet keinen Container</span></div>
+  <div id="dryres"></div>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const params = new URLSearchParams(location.search);
+if (params.get("embed")) document.body.classList.add("embed");
+$("gpuqlink").href = `${location.protocol}//${location.hostname}:8770/`;
+let opts = null;
+function qs() {
+  return new URLSearchParams({profile: $("profile").value, image: $("image").value, transport: $("transport").value, house_guard: $("house").value}).toString();
+}
+function fill(sel, items, val) {
+  sel.innerHTML = items.map(([v, t]) => `<option value="${esc(v)}">${esc(t)}</option>`).join("");
+  if (val != null) sel.value = val;
+}
+async function load() {
+  const r = await fetch("/api/weg2/options"); const d = await r.json();
+  if (!d.ok) { $("cmd").textContent = d.error; return; }
+  opts = d; $("ha").textContent = d.host_acceptance;
+  fill($("profile"), d.profiles.map((p) => [p.name, `${p.name} (Linie ${p.line}, Status ${p.status || "?"})`]), params.get("profile"));
+  fill($("image"), d.images.filter((i) => i.ctx).map((i) => [i.image, `${i.image}${i.created ? "  · " + i.created.slice(0, 16) : ""}`]), params.get("image") || d.default_image);
+  fill($("transport"), d.transports.map((t) => [t, t]), "bar1");
+  fill($("house"), d.house_guards.map((h) => [h, h === "memlimit" ? "memlimit (CT999 läuft weiter, Container gedeckelt)" : "ct999-ruht (CT999 ruht — nur der Nutzer)"]), "memlimit");
+  if (d.images_error) $("notes").innerHTML = `<li class="err">docker images: ${esc(d.images_error)}</li>`;
+  line();
+}
+async function line() {
+  $("dryres").innerHTML = "";
+  const r = await fetch("/api/weg2/line?" + qs()); const d = await r.json();
+  if (!d.ok) { $("cmd").textContent = "—"; $("notes").innerHTML = `<li class="err">${esc(d.error)}</li>`; return; }
+  $("cmd").textContent = d.command;
+  $("notes").innerHTML = d.notes.map((n) => `<li>${esc(n)}</li>`).join("");
+  const p = d.profile;
+  $("profinfo").innerHTML = `<table><tr><td>Kontext</td><td><b>${esc(d.ctx)}</b></td></tr>
+    <tr><td>Revision (Linie ${esc(p.line)})</td><td><b>${esc((d.revision || "").slice(0, 10))}</b></td></tr>
+    <tr><td>Profil</td><td><b>${esc(p.name)}</b> &middot; ${p.in_image ? "im Image" : "Host-Datei (PROFILE_MOUNT=1)"} &middot; Status ${esc(p.status || "?")}${p.nccl_status ? " &middot; nccl " + esc(p.nccl_status) : ""}</td></tr></table>`;
+}
+$("copy").onclick = async () => { try { await navigator.clipboard.writeText($("cmd").textContent); $("copy").textContent = "kopiert"; } catch (e) { $("copy").textContent = "bitte markieren + kopieren"; } setTimeout(() => $("copy").textContent = "Zeile kopieren", 2000); };
+$("dry").onclick = async () => {
+  $("dry").disabled = true; $("dryres").innerHTML = `<div class="muted">Trockenlauf läuft auf dem Host&hellip;</div>`;
+  try {
+    const r = await fetch("/api/weg2/dry?" + qs()); const d = await r.json();
+    if (!d.ok) { $("dryres").innerHTML = `<div class="err">${esc(d.error)}</div>`; return; }
+    const lines = (d.output || "").split("\n").filter((l) => /^DRY/.test(l));
+    $("dryres").innerHTML = `<div class="verdict ${d.green ? "green" : "red"}">${d.green ? "GRÜN" : "ROT"} &middot; rc ${d.rc} &middot; ${d.duration_s} s &middot; ${new Date(d.t * 1000).toLocaleTimeString("de-DE")}</div><pre>${esc(lines.join("\n"))}</pre>`;
+  } finally { $("dry").disabled = false; }
+};
+["profile", "image", "transport", "house"].forEach((id) => $(id).addEventListener("change", line));
+load();
+</script>
+</body>
+</html>

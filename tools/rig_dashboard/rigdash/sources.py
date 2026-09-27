@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import subprocess
 import threading
 import time
@@ -152,6 +153,45 @@ class Sources:
                 (lambda ep=ep: http_json(ep.rstrip("/") + "/weg2/state", 3.0)))
         self.gpu_hist = collections.deque(maxlen=int(15 * 60 / cfg.get("gpu_period", 2.0)) + 5)
         self.lock = threading.Lock()
+        self.state_dir = cfg.get("state_dir")
+        self._last_save = 0.0
+        self.load_history()
+
+    # --- the 15-min card history survives a restart (the boot series need no
+    # file: they are rebuilt from the logs' own backfill) ---------------
+    def _hist_path(self):
+        return os.path.join(self.state_dir, "gpu_hist.json") if self.state_dir else None
+
+    def load_history(self):
+        p = self._hist_path()
+        if not p:
+            return
+        try:
+            with open(p) as fh:
+                rows = json.load(fh)
+        except (OSError, ValueError):
+            return
+        cut = time.time() - 15 * 60
+        with self.lock:
+            for t, cs in rows:
+                if t >= cut:
+                    self.gpu_hist.append((t, [tuple(c) for c in cs]))
+
+    def save_history(self, now: float, every: float = 30.0):
+        p = self._hist_path()
+        if not p or now - self._last_save < every:
+            return
+        self._last_save = now
+        with self.lock:
+            rows = [[t, [list(c) for c in cs]] for t, cs in self.gpu_hist]
+        try:
+            os.makedirs(self.state_dir, exist_ok=True)
+            tmp = p + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(rows, fh)
+            os.replace(tmp, p)
+        except OSError:
+            pass
 
     # --- samplers ------------------------------------------------------
     def sample_gpus(self):
@@ -162,6 +202,7 @@ class Sources:
         with self.lock:
             self.gpu_hist.append((now, [(c.get("power.draw"), c.get("memory.used"),
                                           c.get("utilization.gpu")) for c in cards]))
+        self.save_history(now)
         return cards
 
     def sample_docker(self):
