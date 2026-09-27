@@ -5424,6 +5424,9 @@ READONLY_BLOCKED_POST = (
     "/api/card_probe", "/api/split_probe", "/api/commsuite/run",
     "/api/rig_pair/start", "/api/rig_pair/advance", "/api/model_download",
     "/api/version/switch", "/api/version/cleanup",
+    # registry: state transitions (serve / demote / delete) start and stop
+    # engine processes; registering writes the registry
+    "/api/registry/state", "/api/registry/engines",
     "/api/discussion_submit", "/api/share_submit", "/api/share/rig_submit",
 )
 READONLY_MESSAGE = (

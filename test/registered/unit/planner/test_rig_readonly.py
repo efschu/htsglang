@@ -93,7 +93,7 @@ class ReadonlyTests(unittest.TestCase):
     def test_blocked_posts_refused_before_the_body_is_read(self):
         webui = _reload_webui({"SGLANG_PLANNER_READONLY": "1"})
         for path in ("/api/server_start", "/api/bench_run", "/api/card_probe", "/api/share_submit",
-                     "/api/version/switch", "/api/quality_run"):
+                     "/api/version/switch", "/api/quality_run", "/api/registry/state"):
             f = _FakeHandler(webui, path, b'{"model": "x"}')
             f.h.do_POST()
             self.assertEqual(f.sent[0][0], 409, path)
@@ -115,7 +115,8 @@ class ReadonlyTests(unittest.TestCase):
 
     def test_planning_is_not_blocked(self):
         webui = _reload_webui({"SGLANG_PLANNER_READONLY": "1"})
-        for path in ("/api/plan", "/api/wizard/command", "/api/recompute", "/api/commsuite/cancel"):
+        for path in ("/api/plan", "/api/wizard/command", "/api/recompute", "/api/commsuite/cancel",
+                     "/api/registry/plan"):
             self.assertFalse(webui.readonly_blocked(path), path)
 
     def test_default_is_not_readonly(self):
