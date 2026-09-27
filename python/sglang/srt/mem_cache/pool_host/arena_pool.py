@@ -153,62 +153,138 @@ def _chain_clean(P: int, rows: torch.Tensor) -> bool:
     return int(torch.unique(first).numel()) == int(first.numel())
 
 
-def verify_load_chain(pool, nodes, host_indices, rows_of, stems_of):
-    """#1424 (rc12m-dpr D-TP0 11:49:05 and 12:19:06): the host rows of ONE
-    load-back chain, checked before they are queued. Returns the chain's host
-    indices (rebuilt when a page was re-pointed) or raises
+def _chain_duplicates(P: int, rows: torch.Tensor, limit: int = 4):
+    """(page index, first page index with the same rows) of repeated pages."""
+    first = (rows.view(-1, P)[:, 0] if P > 1 else rows).tolist()
+    seen, out = {}, []
+    for j, r in enumerate(first):
+        if r in seen:
+            out.append((j, seen[r]))
+            if len(out) >= limit:
+                break
+        else:
+            seen[r] = j
+    return out
+
+
+def verify_load_chain(pool, nodes, host_indices, rows_of, stems_of, *, keys_of=None,
+                      own_hash=None, p_chain=None, page0=None, prior0=None):
+    """#1424 (rc12m-dpr D-TP0 11:49:05 and 12:19:06, rc12n 12:57:43): the host
+    rows of ONE load-back chain, proven before they are queued. Returns the
+    chain's host indices (rebuilt when a page was re-pointed) or raises
     ``ArenaChainMismatch``.
 
-    Both deaths came after a prefix that arrived in TWO prefetch pieces
-    (INCOMPLETE, then the re-read of the rest) and a #988 park loadback over
-    the whole depth; the paged load then refused the rows. A correct chain is
-    always whole consecutive pages, no slot twice -- every page is one arena
-    slot's P ids, written by ``resolve_rows`` / ``alloc_write``, and one
-    prefix never holds one page at two depths -- so a chain that is not has
-    a page whose rows are not the slot its page KEY names, and a per-row
-    gather over it would put another page's KV under those tokens. Such a
-    chain is proven page by page against the arena: a page whose key names a
-    COMPLETE slot is re-pointed to that slot's ids (the answer a prefetch
-    read gives; the node's host value is corrected in place and the slot
-    referenced), anything that cannot be proven is a named stop. A clean
-    chain costs one vectorised shape check. Duplicates ACROSS chains (two
-    requests loading a page they share in one merged load) are not a chain
-    property and stay with the per-row gather of ``_page_slots_or_none``.
-    ``rows_of(node)`` is the node's KV host rows, ``stems_of(hashes)`` maps
-    its page hashes to arena stems."""
+    A correct chain is whole consecutive pages with no slot twice: every page
+    is one arena slot's P ids, and a page KEY is content-chained over the whole
+    prefix, so one prefix never holds one key -- hence one slot -- at two
+    depths. A chain that is not, or that carries one of P's hand-off keys at a
+    depth where P's chain has another key (``p_chain``, indexed from token 0,
+    ``page0`` = the first loaded page's index), is proven PAGE BY PAGE AGAINST
+    ITS TOKENS, not against the keys the node stores:
+
+    * the admissible keys of page j are P's key for depth j (``p_chain[j]``)
+      and D's own key of the page's tokens chained from the proven key of page
+      j-1 (``own_hash(node, i, prior)``, ``prior0`` for the first page);
+    * a stored key that is admissible keeps its slot (rows re-pointed to that
+      slot when they are not its ids);
+    * a stored key that is not admissible -- the rc12n form: two rids of one
+      conversation, the second piece of a two-piece read carrying the key of
+      another depth, so its page's rows were ANOTHER DEPTH'S KV and the chain
+      held one slot twice -- is replaced by the first admissible key whose slot
+      is COMPLETE, the node's hash_value is corrected in place and the slot
+      referenced (``#1424 CHAIN REKEYED``).
+
+    Anything no admissible key can prove is a named stop: loading a duplicate
+    page "because every node matches its stored keys" would put page j-1's KV
+    under page j's tokens. Without ``own_hash``/``p_chain`` (unpaged callers,
+    tests of the old form) the stored keys are the only proof, as before.
+    Duplicates ACROSS chains (two requests loading a page they share in one
+    merged load) are not a chain property and stay with the per-row gather of
+    ``_page_slots_or_none``. ``rows_of(node)`` is the node's KV host rows,
+    ``stems_of(hashes)`` maps page keys to arena stems, ``keys_of(node)`` the
+    node's stored page keys (default ``node.hash_value``)."""
     P = _psz(pool)
     if P == 1 or host_indices is None or int(host_indices.numel()) == 0:
         return host_indices
     S = int(pool.staging_rows)
-    if _chain_clean(P, host_indices.to("cpu", dtype=torch.int64) - S):
+    nodes = list(nodes)
+    keys_of = keys_of or (lambda n: n.hash_value)
+    p_idx = None
+    shifted = False
+    if p_chain and page0 is not None:
+        p_idx = {str(k): i for i, k in enumerate(p_chain)}
+        j = int(page0)
+        for node in nodes:
+            for k in list(keys_of(node) or ()):
+                i = p_idx.get(str(k))
+                if i is not None and i != j:
+                    shifted = True
+                    break
+                j += 1
+            if shifted:
+                break
+    if not shifted and _chain_clean(P, host_indices.to("cpu", dtype=torch.int64) - S):
         return host_indices
     arena = getattr(pool, "arena", None)
     lane = torch.arange(P, dtype=torch.int64)[None, :]
-    nodes = list(nodes)
-    fixed = []
+    proven_by_tokens = own_hash is not None or p_idx is not None
+    fixed, rekeyed = [], []
+    j = int(page0) if page0 is not None else 0
+    prior = prior0
     for node in nodes:
         hv_ref = rows_of(node)
         hv = hv_ref.to("cpu", dtype=torch.int64).reshape(-1) - S
-        hashes = list(getattr(node, "hash_value", None) or ())
+        stored = [str(k) for k in (keys_of(node) or ())]
         nid = getattr(node, "id", "?")
-        if len(hashes) * P != int(hv.numel()) or (hashes and arena is None):
+        if len(stored) * P != int(hv.numel()) or (stored and arena is None):
             raise ArenaChainMismatch(
                 f"#1424 CHAIN MISMATCH node={nid}: {int(hv.numel())} host rows against "
-                f"{len(hashes)} page key(s) of {P} tokens{'' if arena is not None else ', no arena'} "
+                f"{len(stored)} page key(s) of {P} tokens{'' if arena is not None else ', no arena'} "
                 f"-- the rows are not whole pages and cannot be proven; the load is refused")
-        if not hashes:
+        if not stored:
             continue
-        slots, states = arena.find_slots_np(stems_of(hashes))
+        keys = list(stored)
+        if proven_by_tokens:
+            for i, k in enumerate(stored):
+                p_key = str(p_chain[j + i]) if p_chain is not None and j + i < len(p_chain) else None
+                if k == p_key:
+                    prior = k
+                    continue
+                cands = [p_key] if p_key is not None else []
+                own_key = own_hash(node, i, prior) if own_hash is not None else None
+                if own_key is not None:
+                    own_key = str(own_key)
+                    if k == own_key:
+                        prior = k
+                        continue
+                    cands.append(own_key)
+                if cands:
+                    c_slots, c_states = arena.find_slots_np(stems_of(cands))
+                    pick = next((c for c, s, st in zip(cands, c_slots, c_states)
+                                 if int(s) >= 0 and int(st) == 2), None)
+                    if pick is None:
+                        raise ArenaChainMismatch(
+                            f"#1424 CHAIN MISMATCH node={nid} page={i} depth_page={j + i}: the stored key "
+                            f"{k[:16]} is not this page's key (P's {(p_key or '-')[:16]}"
+                            f"{', own ' + own_key[:16] if own_key is not None else ''}) and no admissible "
+                            f"key has a COMPLETE slot -- the page cannot be proven; the load is refused")
+                    keys[i] = pick
+                    rekeyed.append(f"node={nid} page={i} depth_page={j + i} {k[:12]}->{pick[:12]}")
+                prior = keys[i]
+        slots, states = arena.find_slots_np(stems_of(keys))
         slots = torch.as_tensor(slots, dtype=torch.int64)
         states = torch.as_tensor(states, dtype=torch.int64)
         want = slots[:, None] * P + lane
         pages = hv.view(-1, P)
         bad = (pages != want).any(dim=1)
+        if keys != stored:
+            node.hash_value = list(keys)
+        j += len(stored)
         if not bool(bad.any()):
             continue
         idx = bad.nonzero()[:, 0]
         i = int(idx[0])
-        what = (f"node={nid} page={i} of {len(hashes)} bad={int(idx.numel())}: key slot "
+        what = (f"node={nid} page={i} of {len(keys)} bad={int(idx.numel())}: key slot "
                 f"{int(slots[i])} (state {int(states[i])}), rows {int(pages[i, 0])}..{int(pages[i, -1])}")
         if bool(((slots[idx] < 0) | (states[idx] != 2)).any()):
             raise ArenaChainMismatch(
@@ -218,20 +294,24 @@ def verify_load_chain(pool, nodes, host_indices, rows_of, stems_of):
         pages[idx] = want[idx]
         hv_ref.copy_((hv + S).to(hv_ref.dtype).view(hv_ref.shape))
         fixed.append(what)
-    if not fixed:
-        raise ArenaChainMismatch(
-            "#1424 CHAIN MISMATCH: the chain's rows are not whole distinct pages although "
-            f"every node's pages match their keys ({len(nodes)} node(s)) -- the chain and its "
-            "nodes disagree; the load is refused")
-    _CHAIN_REPAIRED_N[0] += 1
-    logger.warning(
-        "#1424 CHAIN REPAIRED n=%d nodes=%d: %s -- a page addressed rows that are not the slot "
-        "its key names; re-pointed to the key's COMPLETE slot before the load (a per-row "
-        "gather would have loaded another page's KV here)",
-        _CHAIN_REPAIRED_N[0], len(nodes), "; ".join(fixed[:4]))
     rebuilt = torch.cat([rows_of(n).reshape(-1) for n in nodes])
     if not _chain_clean(P, rebuilt.to("cpu", dtype=torch.int64) - S):
-        raise ArenaChainMismatch("#1424 CHAIN MISMATCH: still not whole distinct pages after the repair")
+        dups = _chain_duplicates(P, rebuilt.to("cpu", dtype=torch.int64) - S)
+        raise ArenaChainMismatch(
+            "#1424 CHAIN MISMATCH: the chain's rows are not whole distinct pages although every "
+            f"page matches {'its tokens' if proven_by_tokens else 'its stored key'} ({len(nodes)} node(s), "
+            f"repeated pages (page, first seen) {dups}, page0={page0}) -- the load is refused")
+    if not fixed and not rekeyed:
+        return host_indices
+    _CHAIN_REPAIRED_N[0] += 1
+    logger.warning(
+        "#1424 CHAIN %s n=%d nodes=%d page0=%s: %s -- %s",
+        "REKEYED" if rekeyed else "REPAIRED", _CHAIN_REPAIRED_N[0], len(nodes), page0,
+        "; ".join((rekeyed + fixed)[:4]),
+        "a page carried the key of another depth; re-keyed to its tokens' key and re-pointed "
+        "to that key's COMPLETE slot" if rekeyed else
+        "a page addressed rows that are not the slot its key names; re-pointed to the key's "
+        "COMPLETE slot before the load (a per-row gather would have loaded another page's KV here)")
     return rebuilt.to(host_indices.device, dtype=host_indices.dtype)
 
 
