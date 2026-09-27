@@ -21206,6 +21206,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # der teuerste Blindflug im ganzen Boot. Die Gruppen selbst sind nicht
     # betroffen (ihre Logger flushen je Zeile); es geht allein um die Front.
     fenv["PYTHONUNBUFFERED"] = "1"
+    # FH (b1): the front's health poller finds a held rank (#1223) by its dump;
+    # hand it the dir the groups write to (read only by front_health).
+    if env_p.get("SGLANG_DEBUG_HOLD_DIR") and not fenv.get("SGLANG_DEBUG_HOLD_DIR"):
+        fenv["SGLANG_DEBUG_HOLD_DIR"] = env_p["SGLANG_DEBUG_HOLD_DIR"]
     # RG (operator 26.09.): the prefix switches the ranks got from build_env,
     # the same call on the front's env (SGLANG_WEG2_FRONT_SPAN_INFLIGHT is the
     # front's own; all five as on metal: ENV-IM-RANG front = 1).

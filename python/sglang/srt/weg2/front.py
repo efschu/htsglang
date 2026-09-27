@@ -2404,6 +2404,9 @@ class Group:
     outstanding: Dict[str, float] = field(default_factory=dict)
     health_fail_streak: int = 0
     served: int = 0
+    #: FH: the poller's last facts (front_health.GroupFacts), None before the
+    #: first poll and always None with SGLANG_WEG2_FRONT_HEALTH_FACTS=0.
+    health_facts: Optional[Any] = None
 
     @property
     def phase(self) -> str:
@@ -4672,6 +4675,48 @@ class Front:
 
     # ---------------- HTTP handlers ----------------
     async def handle_health(self, request: web.Request) -> web.Response:
+        from sglang.srt.weg2 import front_health as _fh
+
+        if _fh.enabled():
+            return await self._handle_health_facts()
+        return await self._handle_health_old()
+
+    async def _handle_health_facts(self) -> web.Response:
+        """FH: 503 when STOP or any group is unhealthy by the poller's facts
+        (weg2/front_health.py). A group without fresh facts is probed live and
+        judged by the old rule (non-200 = 503)."""
+        from sglang.srt.weg2 import front_health as _fh
+
+        now = time.time()
+        results: dict = {}
+        facts_out: dict = {}
+        unhealthy: dict = {}
+        for g in self.groups.values():
+            f = g.health_facts
+            if f is None or now - f.t > _fh.STALE_S:
+                ok = await self._probe_group_health(g, _fh.PROBE_TIMEOUT_S)
+                results[g.name] = 200 if ok else "error: live probe"
+                facts_out[g.name] = {"source": "live", "http_ok": ok}
+                if not ok:
+                    unhealthy[g.name] = "live /health probe failed (no fresh poller facts)"
+                continue
+            reason = _fh.unhealthy_reason(f, self.state)
+            results[g.name] = 200 if reason is None else 503
+            facts_out[g.name] = {
+                "source": "poller", "http_ok": f.http_ok, "process_alive": f.alive,
+                "streak": f.streak, "age_s": round(now - f.t, 1),
+                "hold": None if f.hold is None else {
+                    "pid": f.hold.pid, "exception": f.hold.exception, "dump": f.hold.path},
+            }
+            if reason is not None:
+                unhealthy[g.name] = reason
+        ok = not unhealthy and self.state != "STOP"
+        results.update({"state": self.state, "awake": self.awake, "epoch": self.epoch,
+                        "stop": str(self.stop) if self.stop else None,
+                        "facts": facts_out, "unhealthy": unhealthy})
+        return web.json_response(results, status=200 if ok else 503)
+
+    async def _handle_health_old(self) -> web.Response:
         results = {}
         for g in self.groups.values():
             try:
@@ -8893,7 +8938,7 @@ class Front:
                     logger.exception("controller error: %s", e)
 
     def group_dead_should_stop(self, *, state: str, ok: bool, alive: bool,
-                               streak: int) -> bool:
+                               streak: int, hold: bool = False) -> bool:
         """W17's gate, ONE decision for the poller.
 
         #1378 xsn39 (measured): the flip legs RUN in the groups' event loops
@@ -8906,7 +8951,14 @@ class Front:
         authority for a stuck flip, and the deadman covers the front itself.
         The stop stays armed for every non-flipping state (a dead group at
         idle is a fact, not a phase).
+
+        FH (b1): a rank held at its wall (#1223 DEBUG-HOLD, a named stop) is
+        a dead group in EVERY state and at the first sighting -- its HTTP
+        stays 200 and its session alive for the whole hold (weg2/front_health.py).
+        ``hold`` is only ever True with SGLANG_WEG2_FRONT_HEALTH_FACTS on.
         """
+        if hold:
+            return True
         if streak < 2:
             return False
         if health_is_serving_fact(ok, alive):
@@ -8923,7 +8975,66 @@ class Front:
             return False
         return True
 
+    async def _probe_group_health(self, g: "Group", timeout_s: float) -> bool:
+        try:
+            async with self.session.get(f"{g.url}/health", timeout=ClientTimeout(total=timeout_s)) as r:
+                return r.status == 200
+        except Exception:  # noqa: BLE001
+            return False
+
     async def health_poller(self) -> None:
+        from sglang.srt.weg2 import front_health as _fh
+
+        if not _fh.enabled():
+            return await self._health_poller_old()
+        dirs = _fh.hold_dirs()
+        logger.info(
+            "WEG2-HEALTH-FACTS armed: poll=%.0fs probe_timeout=%.0fs (concurrent), hold dirs=%s; "
+            "front /health answers from these facts (SGLANG_WEG2_FRONT_HEALTH_FACTS=0 = the old live probe)",
+            _fh.POLL_S, _fh.PROBE_TIMEOUT_S, dirs,
+        )
+        while True:
+            await asyncio.sleep(_fh.POLL_S)
+            await self.health_poll_once(dirs)
+
+    async def health_poll_once(self, dirs) -> None:
+        """FH: one poll of both groups -- HTTP concurrently, session, hold dump."""
+        from sglang.srt.weg2 import front_health as _fh
+
+        groups = list(self.groups.values())
+        oks = await asyncio.gather(
+            *(self._probe_group_health(g, _fh.PROBE_TIMEOUT_S) for g in groups)
+        )
+        for g, ok in zip(groups, oks):
+            alive = _sid_alive(g.sid)
+            hold = _fh.find_hold(g.sid, self.t0, dirs)
+            if ok and alive and hold is None:
+                g.health_fail_streak = 0
+                g.health_facts = _fh.GroupFacts(True, True, 0, None, time.time())
+                continue
+            g.health_fail_streak += 1
+            g.health_facts = _fh.GroupFacts(bool(ok), bool(alive), g.health_fail_streak, hold, time.time())
+            n = g.health_fail_streak
+            if n <= 12 or n % 12 == 0:
+                logger.warning(
+                    "WEG2-HEALTH group=%s http_ok=%s process_alive=%s streak=%d hold=%s",
+                    g.name, ok, alive, n,
+                    "-" if hold is None else f"pid={hold.pid} exception={hold.exception!r} dump={hold.path}",
+                )
+            if self.group_dead_should_stop(
+                state=self.state, ok=ok, alive=alive, streak=n, hold=hold is not None,
+            ):
+                if hold is not None:
+                    self.do_stop(
+                        "W17 Weg2GroupDead",
+                        f"group {g.name}: a rank is held at its wall (#1223 DEBUG-HOLD pid={hold.pid}: "
+                        f"{hold.exception}; dump {hold.path}) -- a held rank serves no request, "
+                        f"http_ok={ok} process_alive={alive} say nothing about it",
+                    )
+                else:
+                    self.do_stop("W17 Weg2GroupDead", f"group {g.name}: /health failed {n}x and process_alive={alive} (a 200 alone is a transport fact)")
+
+    async def _health_poller_old(self) -> None:
         while True:
             await asyncio.sleep(15)
             for g in self.groups.values():

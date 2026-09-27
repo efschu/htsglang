@@ -87,8 +87,13 @@ class TheGateIsWiredInThePoller(unittest.TestCase):
         """ONE decision, one caller: the poller must consult
         ``group_dead_should_stop`` instead of an inline streak check -- a
         second inline copy would be the two-readings defect."""
-        src = __import__("inspect").getsource(front_mod.Front.health_poller)
-        self.assertIn("group_dead_should_stop(", src)
+        # FH (b1): the poll body moved into health_poll_once (switch on) and
+        # _health_poller_old (switch off); both must ask the one gate.
+        _gs = __import__("inspect").getsource
+        for fn in (front_mod.Front.health_poll_once, front_mod.Front._health_poller_old):
+            self.assertIn("group_dead_should_stop(", _gs(fn))
+        src = _gs(front_mod.Front.health_poller) + _gs(front_mod.Front.health_poll_once) + _gs(
+            front_mod.Front._health_poller_old)
         self.assertNotIn("health_fail_streak >= 2 and not health_is_serving_fact",
                          src,
                          "the inline streak check must be gone from the "
