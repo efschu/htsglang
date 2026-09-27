@@ -156,7 +156,7 @@ class TestAttach(CustomTestCase):
             self.assertFalse(os.path.exists(os.path.join(d, "cd", "k3_s.bin.tmp.deadbeef")))
             self.assertIn("L3-PERSIST reuse dir=", log.text)
             self.assertIn("files=2", log.text)
-            self.assertIn("staging_removed=1", log.text)
+            self.assertIn("staging+orphans_removed=1", log.text)
 
     def test_dry_run_removes_nothing(self):
         with tempfile.TemporaryDirectory() as root:
@@ -238,8 +238,16 @@ class TestIndexSeed(CustomTestCase):
         from sglang.srt.mem_cache.hicache_storage import HiCacheFile
 
         src = inspect.getsource(HiCacheFile._l3_index)
-        self.assertIn("if idx.created:", src)
-        self.assertIn("self._l3p_seed_index(idx)", src)
+        self.assertIn("if idx.created and self._l3p_on():", src)
+        self.assertIn("threading.Thread(target=self._l3p_seed_index", src)
+
+    def test_the_index_is_opened_at_backend_init_not_lazily_in_a_collective(self):
+        from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+
+        src = inspect.getsource(HiCacheFile.__init__)
+        self.assertIn("self._l3p_open_index_eagerly()", src)
+        self.assertLess(src.index("self._l3p_check_rank_identity(storage_config)"),
+                        src.index("self._evictor = LRUFileEvictor("))
 
 
 class TestWiring(CustomTestCase):
@@ -259,27 +267,31 @@ class TestWiring(CustomTestCase):
 
 class TestW8bOnAWarmPersistentStore(CustomTestCase):
     """The warm-store W8b refusal pinned by test_weg2_store_cap_1295 is the
-    day the retention tier is reused -- it is today. A persistent store of
-    one identity holds the OTHER group's private-suffix pages from earlier
-    boots; they are inherited, not a blind scan filter."""
+    day the retention tier is reused -- it is today. Inherited = unindexed,
+    older than the launcher's GROUP-WIDE epoch (N2), and under a suffix the
+    previous boot's groups recorded (N1, published by the launcher). A blind
+    own filter and orphan suffixes are NOT inherited."""
 
     PAGE = 4096
 
-    def _dir(self, root, identity=True, old=True):
-        from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor  # noqa: F401
-
+    def _dir(self, root, sibling="_B", identity=True):
         if identity:
             with open(os.path.join(root, "L3_IDENTITY.json"), "w") as f:
                 f.write("{}")
-        # 40 % this group's pages, 60 % the sibling group's private suffix
         for i in range(4):
             _write(os.path.join(root, f"{i:04d}_A.bin"), self.PAGE)
         for i in range(6):
-            _write(os.path.join(root, f"{i:04d}_B.bin"), self.PAGE)
-        if old:
-            past = time.time() - 3600
-            for n in os.listdir(root):
-                os.utime(os.path.join(root, n), (past, past))
+            _write(os.path.join(root, f"{i:04d}{sibling}.bin"), self.PAGE)
+        past = time.time() - 3600
+        for n in os.listdir(root):
+            os.utime(os.path.join(root, n), (past, past))
+
+    def _env(self, suffixes=("_A", "_B"), epoch=None, persist="1"):
+        return mock.patch.dict(os.environ, {
+            "SGLANG_WEG2_L3_PERSIST": persist,
+            "SGLANG_WEG2_L3_EPOCH": f"{time.time() if epoch is None else epoch:.6f}",
+            "SGLANG_WEG2_L3_INHERITED_SUFFIXES": json.dumps(list(suffixes)),
+        })
 
     def _owner(self, root):
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
@@ -290,45 +302,174 @@ class TestW8bOnAWarmPersistentStore(CustomTestCase):
             extra_config={"max_size": str(100 * self.PAGE), "max_size_scope": "shared"},
             writer_count=1)
 
+    def _blind(self):
+        from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreIndexBlind
+
+        return self.assertRaises(Weg2StoreIndexBlind)
+
     def test_60_percent_sibling_private_pages_are_inherited_not_blind(self):
-        with tempfile.TemporaryDirectory() as root, \
-                mock.patch.dict(os.environ, {"SGLANG_WEG2_L3_PERSIST": "1"}):
+        with tempfile.TemporaryDirectory() as root, self._env():
             self._dir(root)
             ev = self._owner(root)                       # must not raise W8b
             cov = ev.index_coverage()
             self.assertEqual(cov["inherited_entries"], 6)
             self.assertEqual(cov["indexed_entries"], 4)
             self.assertEqual(cov["seen_entries"], 10)
+            self.assertIn("walk_s", cov)
+
+    def test_an_orphan_suffix_no_group_recorded_is_not_inherited(self):
+        with tempfile.TemporaryDirectory() as root, self._env(suffixes=("_A", "_B")):
+            self._dir(root, sibling="_ORPHAN")
+            with self._blind():
+                self._owner(root)
+
+    def test_a_blind_own_filter_across_boots_is_still_refused(self):
+        # this group wrote its pages under _X last boot while scanning _A (the
+        # 83.7 % defect shape): _X is in NO record, so it is not inherited
+        with tempfile.TemporaryDirectory() as root, self._env(suffixes=("_A",)):
+            self._dir(root, sibling="_X")
+            with self._blind():
+                self._owner(root)
 
     def test_without_the_identity_file_the_old_refusal_stands(self):
-        from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreIndexBlind
-
-        with tempfile.TemporaryDirectory() as root, \
-                mock.patch.dict(os.environ, {"SGLANG_WEG2_L3_PERSIST": "1"}):
+        with tempfile.TemporaryDirectory() as root, self._env():
             self._dir(root, identity=False)
-            with self.assertRaises(Weg2StoreIndexBlind):
+            with self._blind():
                 self._owner(root)
 
     def test_switch_off_keeps_the_old_refusal(self):
-        from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreIndexBlind
-
-        with tempfile.TemporaryDirectory() as root, \
-                mock.patch.dict(os.environ, {"SGLANG_WEG2_L3_PERSIST": "0"}):
+        with tempfile.TemporaryDirectory() as root, self._env(persist="0"):
             self._dir(root)
-            with self.assertRaises(Weg2StoreIndexBlind):
+            with self._blind():
                 self._owner(root)
 
-    def test_files_newer_than_the_owner_are_not_inherited(self):
-        from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreIndexBlind
+    def test_files_newer_than_the_group_epoch_are_not_inherited(self):
+        with tempfile.TemporaryDirectory() as root, self._env(epoch=time.time() - 7200):
+            self._dir(root)                           # files 1 h old, epoch 2 h old
+            with self._blind():
+                self._owner(root)
 
+    def test_no_published_epoch_inherits_nothing(self):
         with tempfile.TemporaryDirectory() as root, \
                 mock.patch.dict(os.environ, {"SGLANG_WEG2_L3_PERSIST": "1"}):
-            self._dir(root, old=False)
-            future = time.time() + 3600
-            for n in os.listdir(root):
-                os.utime(os.path.join(root, n), (future, future))
-            with self.assertRaises(Weg2StoreIndexBlind):   # this boot's blind writes still refused
+            os.environ.pop("SGLANG_WEG2_L3_EPOCH", None)
+            os.environ.pop("SGLANG_WEG2_L3_INHERITED_SUFFIXES", None)
+            self._dir(root)
+            with self._blind():
                 self._owner(root)
+
+
+class TestOrphanReapAndPublication(CustomTestCase):
+    def test_orphans_reaped_only_with_a_record_and_the_inherited_set_published(self):
+        with tempfile.TemporaryDirectory() as root:
+            d = os.path.join(root, "l3-x")
+            _write(os.path.join(d, "ab", "k1_A.bin"), 4096)
+            _write(os.path.join(d, "ab", "k2_B.bin"), 4096)
+            _write(os.path.join(d, "ab", "k3_OLDHASH.bin"), 4096)
+            with mock.patch.dict(os.environ, {}, clear=False):
+                log = _Log()
+                files, _b, removed = launcher.l3_persist_attach(log, d, dry=False)
+                self.assertEqual((files, removed), (3, 0))       # no record: counted, kept
+                self.assertIn("orphans=0", log.text)
+                self.assertNotIn("SGLANG_WEG2_L3_INHERITED_SUFFIXES", os.environ)
+                self.assertIn("SGLANG_WEG2_L3_EPOCH", os.environ)
+                for g, sfx in (("P", ["_A"]), ("D", ["_B"])):
+                    with open(os.path.join(d, f"L3_SUFFIXES.{g}.json"), "w") as f:
+                        json.dump({"group": g, "suffixes": sfx}, f)
+                log = _Log()
+                files, _b, removed = launcher.l3_persist_attach(log, d, dry=False)
+                self.assertEqual((files, removed), (2, 1))
+                self.assertFalse(os.path.exists(os.path.join(d, "ab", "k3_OLDHASH.bin")))
+                self.assertIn("orphans=1", log.text)
+                self.assertIn("walk_s=", log.text)
+                self.assertEqual(sorted(json.loads(os.environ["SGLANG_WEG2_L3_INHERITED_SUFFIXES"])),
+                                 ["_A", "_B"])
+
+
+class TestRankSide(CustomTestCase):
+    def _fake(self, root, ident, group="P"):
+        from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+
+        fake = mock.MagicMock()
+        fake.file_path = root
+        fake._l3p_on = HiCacheFile._l3p_on
+        fake._l3p_group = HiCacheFile._l3p_group
+        fake._l3p_persistent_dir = lambda: HiCacheFile._l3p_persistent_dir(fake)
+        cfg = mock.MagicMock()
+        cfg.l3_rank_identity = ident
+        return HiCacheFile._l3p_check_rank_identity, fake, cfg
+
+    def test_rank_identity_recorded_then_matched_then_a_drift_refused(self):
+        from sglang.srt.mem_cache.weg2_store_gates import Weg2L3IdentityMismatch
+
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(
+                os.environ, {"SGLANG_WEG2_L3_PERSIST": "1", "SGLANG_WEG2_GROUP": "D"}):
+            with open(os.path.join(root, "L3_IDENTITY.json"), "w") as f:
+                f.write("{}")
+            ident = {"model_identity": "a", "override_sha": "", "weights_fp": "w"}
+            fn, fake, cfg = self._fake(root, ident)
+            fn(fake, cfg)
+            self.assertTrue(os.path.isfile(os.path.join(root, "L3_RANK_IDENTITY.D.json")))
+            fn(fake, cfg)                                  # match
+            fn2, fake2, cfg2 = self._fake(root, dict(ident, override_sha="yarn2"))
+            with self.assertRaises(Weg2L3IdentityMismatch) as cm:
+                fn2(fake2, cfg2)
+            self.assertIn("W165 Weg2L3IdentityMismatch", str(cm.exception))
+
+    def test_not_a_persistent_dir_checks_nothing(self):
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(
+                os.environ, {"SGLANG_WEG2_L3_PERSIST": "1", "SGLANG_WEG2_GROUP": "D"}):
+            fn, fake, cfg = self._fake(root, {"x": 1})
+            fn(fake, cfg)
+            self.assertEqual(os.listdir(root), [])
+
+    def test_rank_identity_moves_with_override_and_weights_not_with_ratio(self):
+        from sglang.srt.mem_cache.hicache_storage import l3_rank_identity
+
+        with tempfile.TemporaryDirectory() as m:
+            _write(os.path.join(m, "model-00001.safetensors"), 16)
+            sa = mock.MagicMock(model_path=m, revision=None, dtype="bfloat16", quantization="",
+                                kv_cache_dtype="fp8_e4m3", json_model_override_args="{}",
+                                rank_tp_ratio="13,6,6", rank_kv_ratio=None)
+            base = l3_rank_identity(sa)
+            sa.rank_tp_ratio = "12,7,7"
+            self.assertEqual(base, l3_rank_identity(sa))
+            sa.json_model_override_args = '{"rope_scaling": {"factor": 2}}'
+            self.assertNotEqual(base["override_sha"], l3_rank_identity(sa)["override_sha"])
+            sa.json_model_override_args = "{}"
+            os.utime(os.path.join(m, "model-00001.safetensors"), (1, 1))
+            self.assertNotEqual(base["weights_fp"], l3_rank_identity(sa)["weights_fp"])
+
+    def test_suffix_record_written_for_the_group(self):
+        from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(
+                os.environ, {"SGLANG_WEG2_L3_PERSIST": "1", "SGLANG_WEG2_GROUP": "P"}):
+            with open(os.path.join(root, "L3_IDENTITY.json"), "w") as f:
+                f.write("{}")
+            fake = mock.MagicMock()
+            fake.file_path = root
+            fake._l3p_group = HiCacheFile._l3p_group
+            fake._l3p_persistent_dir = lambda: HiCacheFile._l3p_persistent_dir(fake)
+            fake._group_scan_suffixes = lambda: ("_A", "_A2")
+            HiCacheFile._l3p_register_suffixes(fake, True)
+            with open(os.path.join(root, "L3_SUFFIXES.P.json")) as f:
+                self.assertEqual(json.load(f)["suffixes"], ["_A", "_A2"])
+
+
+class TestLauncherIdentityN4(CustomTestCase):
+    def test_yarn_override_kv_extra_vision_and_swapped_weights_move_the_directory(self):
+        with tempfile.TemporaryDirectory() as m:
+            a = _model(m, "NF", {"x": 1})
+            _write(os.path.join(a, "w.safetensors"), 8)
+            name = lambda **kw: launcher.l3_persist_dir_name(launcher.l3_persist_identity(a, "nextflash", **kw))
+            base = name()
+            self.assertNotEqual(base, name(extra_p='--json-model-override-args \'{"rope_scaling":{"factor":2}}\''))
+            self.assertNotEqual(base, name(extra_d="--kv-cache-dtype bf16"))
+            self.assertNotEqual(base, name(vision="transient"))
+            self.assertEqual(base, name(extra_p="--some-other-flag 1"))
+            os.utime(os.path.join(a, "w.safetensors"), (1, 1))
+            self.assertNotEqual(base, name())
 
 
 class TestDiskSum(CustomTestCase):

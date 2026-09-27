@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -136,6 +137,36 @@ def compute_model_identity_hash(
     return hashlib.sha256(identity_str.encode()).hexdigest()[:16]
 
 
+def l3_rank_identity(server_args: Any) -> dict:
+    """L3P N3/N4: a rank's identity of the persistent L3 store. The key's
+    identity hash WITHOUT the uneven-TP vectors (those are in every key; a
+    ratio change is a clean miss), the effective model override string
+    (rope_scaling / YaRN changes page bytes, not keys) and a stat fingerprint
+    of the weight files (a checkpoint swapped in place)."""
+    model = str(getattr(server_args, "model_path", "") or "")
+    real = os.path.realpath(model) if model else ""
+    rows = []
+    try:
+        if real and os.path.isfile(real):
+            st = os.stat(real)
+            rows.append((os.path.basename(real), st.st_size, st.st_mtime_ns))
+        elif real:
+            with os.scandir(real) as it:
+                for e in it:
+                    if e.name.endswith((".safetensors", ".gguf", ".bin", ".pt", ".pth")) and e.is_file():
+                        st = e.stat()
+                        rows.append((e.name, st.st_size, st.st_mtime_ns))
+    except OSError:
+        rows = []
+    rows.sort()
+    ovr = str(getattr(server_args, "json_model_override_args", "") or "")
+    return {
+        "model_identity": compute_model_identity_hash(server_args, include_parallel_vectors=False),
+        "override_sha": hashlib.sha1(ovr.encode()).hexdigest()[:16] if ovr and ovr != "{}" else "",
+        "weights_fp": hashlib.sha1(repr(rows).encode()).hexdigest() if rows else "",
+    }
+
+
 @dataclass
 class HiCacheStorageConfig:
     tp_rank: int
@@ -151,6 +182,9 @@ class HiCacheStorageConfig:
     # Hash over (model_path, revision, dtype, quantization, kv_cache_dtype),
     # see compute_model_identity_hash(). None keeps legacy key layout.
     model_identity_hash: Optional[str] = None
+    # L3P N3/N4: what a PERSISTENT store is for, as this rank resolved it
+    # (see l3_rank_identity). None outside the Weg-2 persistent store.
+    l3_rank_identity: Optional[dict] = None
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
@@ -1254,6 +1288,9 @@ class HiCacheFile(HiCacheStorage):
             budget_bytes=int(envs.SGLANG_HICACHE_PIN_BUDGET_BYTES.get() or 0),
         )
         self.pins.load()
+        # L3P (N3/N4): refuse a persistent store whose recorded rank identity
+        # differs, BEFORE the evictor adopts a single page of it.
+        self._l3p_check_rank_identity(storage_config)
         self._evictor = LRUFileEvictor(
             self.file_path,
             self.config_suffix,
@@ -1296,6 +1333,109 @@ class HiCacheFile(HiCacheStorage):
                 getattr(storage_config, "host_role", "retention") == "staging"
             ),
         )
+        # L3P (N1): record this group's scan suffixes for the NEXT boot's
+        # launcher (orphan reap + the inherited set it publishes); (B1) open
+        # the L3 index now and seed it off-thread -- never lazily inside a
+        # prefetch collective.
+        self._l3p_register_suffixes(shared_keys)
+        self._l3p_open_index_eagerly()
+
+    # ------------------------------------------------------------------ L3P
+    @staticmethod
+    def _l3p_on() -> bool:
+        raw = (os.environ.get("SGLANG_WEG2_L3_PERSIST", "") or "").strip().lower()
+        return raw not in ("0", "false", "no", "off")
+
+    def _l3p_persistent_dir(self) -> bool:
+        """A persistent store the launcher proved (identity file present)."""
+        return self._l3p_on() and os.path.isfile(
+            os.path.join(self.file_path, "L3_IDENTITY.json"))
+
+    @staticmethod
+    def _l3p_group() -> str:
+        return (os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip()
+
+    def _l3p_check_rank_identity(self, storage_config) -> None:
+        """L3P N3/N4: the rank's OWN identity of this store, per group:
+        compute_model_identity_hash without the uneven-TP vectors (dtype,
+        quantization, revision, kv dtype as the server resolved them -- a
+        ratio change only moves the keys, a clean miss, never a refusal), the
+        sha of the effective --json-model-override-args (rope_scaling/YaRN:
+        the key hashes token ids only) and the weight-file stat fingerprint.
+        First rank of a group to arrive writes ``L3_RANK_IDENTITY.<group>.json``
+        (O_EXCL); every rank compares; a mismatch is W165 by name (W57 is the launcher's; W91 is seam_digest's)."""
+        ident = getattr(storage_config, "l3_rank_identity", None)
+        group = self._l3p_group()
+        if not ident or not group or not self._l3p_persistent_dir():
+            return
+        path = os.path.join(self.file_path, f"L3_RANK_IDENTITY.{group}.json")
+        body = json.dumps(ident, sort_keys=True)
+        # Written COMPLETE before it becomes visible: tmp file, then link(2) --
+        # create-if-absent and atomic, so a crash mid-write never leaves a torn
+        # record that every later boot would read as a foreign identity.
+        tmp = f"{path}.w{os.getpid()}"
+        try:
+            with open(tmp, "w") as f:
+                f.write(body)
+            try:
+                os.link(tmp, path)
+                logger.info("L3-PERSIST rank identity recorded group=%s %s", group, body)
+                return
+            except FileExistsError:
+                pass
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        have = None
+        for _ in range(50):  # the record appears whole (link); retries cover a slow filesystem only
+            try:
+                with open(path) as f:
+                    txt = f.read()
+                if txt:
+                    have = json.loads(txt)
+                    break
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.1)
+        if have == ident:
+            return
+        from sglang.srt.mem_cache.weg2_store_gates import Weg2L3IdentityMismatch
+
+        raise Weg2L3IdentityMismatch(
+            f"W165 Weg2L3IdentityMismatch: persistent L3 store {self.file_path!r} was "
+            f"written by group {group} under rank identity {have!r}; this rank resolves "
+            f"{ident!r}. Two identities never share an L3 store (user 2026-09-27). "
+            f"The launcher's directory identity did not separate them -- move the "
+            f"directory aside or set SGLANG_WEG2_L3_PERSIST=0.")
+
+    def _l3p_register_suffixes(self, shared_keys: bool) -> None:
+        """L3P N1: ``L3_SUFFIXES.<group>.json`` = the suffixes this group's
+        eviction owner scans. Atomic replace; every rank of the group writes
+        the same set."""
+        group = self._l3p_group()
+        if not group or not shared_keys or not self._l3p_persistent_dir():
+            return
+        try:
+            sfx = list(self._group_scan_suffixes())
+            path = os.path.join(self.file_path, f"L3_SUFFIXES.{group}.json")
+            tmp = f"{path}.w{os.getpid()}"
+            with open(tmp, "w") as f:
+                json.dump({"group": group, "suffixes": sfx}, f)
+            os.replace(tmp, path)
+        except Exception as exc:  # noqa: BLE001 -- a missing record only means orphans are counted, not reaped
+            logger.warning("L3-PERSIST suffix record not written (%s: %s)", type(exc).__name__, exc)
+
+    def _l3p_open_index_eagerly(self) -> None:
+        """L3P B1: open the shared L3 index at backend init (outside every
+        collective); the creator seeds it on a daemon thread."""
+        if not self._l3p_on():
+            return
+        try:
+            self._l3_index()
+        except Exception as exc:  # noqa: BLE001 -- the index is an accelerator
+            logger.warning("L3-PERSIST eager index open failed (%s: %s)", type(exc).__name__, exc)
 
     def _pin_path(self, stem: str) -> str:
         """Where ``stem`` lives in THIS lineage's flat layout.
@@ -2851,8 +2991,14 @@ class HiCacheFile(HiCacheStorage):
                 self._evictor.l3_index = idx
                 logger.info("#1459 L3-INDEX %s at %s (cap %d, entries %d)",
                             "created" if idx.created else "joined", idx.path, idx.cap, idx.count())
-                if idx.created:
-                    self._l3p_seed_index(idx)
+                if idx.created and self._l3p_on():
+                    # B1: never on the caller's thread -- the first caller may
+                    # be the prefetch thread inside a group MIN collective
+                    # (PREFETCH_CLAIM_REDUCE_BOUND_S), and a 150 GB store is
+                    # ~2 M files. Queries before the seed completes see
+                    # misses only (the index is an accelerator).
+                    threading.Thread(target=self._l3p_seed_index, args=(idx,),
+                               name="l3p-index-seed", daemon=True).start()
         except Exception as exc:  # noqa: BLE001
             logger.warning("#1459 L3-INDEX n/a (%s: %s)", type(exc).__name__, exc)
         return idx
@@ -2869,6 +3015,7 @@ class HiCacheFile(HiCacheStorage):
         if raw in ("0", "false", "no", "off"):
             return 0
         n, batch = 0, []
+        t0 = time.monotonic()
         try:
             for stem, _st in self._iter_existing_files():
                 batch.append(stem)
@@ -2882,7 +3029,8 @@ class HiCacheFile(HiCacheStorage):
         except Exception as exc:  # noqa: BLE001 -- the index is an accelerator; a partial seed is only misses
             logger.warning("L3-PERSIST index seed stopped after %d stems (%s: %s)",
                            n, type(exc).__name__, exc)
-        logger.info("L3-PERSIST index_seeded=%d dir=%s index=%s", n, self.file_path, idx.path)
+        logger.info("L3-PERSIST index_seeded=%d walk_s=%.1f dir=%s index=%s",
+                    n, time.monotonic() - t0, self.file_path, idx.path)
         return n
 
     def _stat_stems(self, stems: List[str]) -> dict:

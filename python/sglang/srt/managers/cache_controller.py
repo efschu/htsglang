@@ -111,6 +111,20 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+
+def _l3_rank_identity_or_none(server_args):
+    """L3P: the persistent-store rank identity, or None (no server_args, or
+    it cannot be resolved -- the store then records nothing and checks
+    nothing, which is the pre-L3P behaviour)."""
+    if server_args is None:
+        return None
+    try:
+        from sglang.srt.mem_cache.hicache_storage import l3_rank_identity
+
+        return l3_rank_identity(server_args)
+    except Exception:  # noqa: BLE001
+        return None
+
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
@@ -1765,6 +1779,7 @@ class HiCacheController:
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
             model_identity_hash=model_identity_hash,
+            l3_rank_identity=_l3_rank_identity_or_none(server_args),
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,

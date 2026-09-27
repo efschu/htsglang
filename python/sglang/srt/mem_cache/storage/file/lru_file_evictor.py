@@ -75,6 +75,23 @@ _EMPTY_CENSUS = {
     "inherited_entries": 0,
 }
 
+def _l3p_inheritance_from_env() -> Tuple[float, Tuple[str, ...]]:
+    """L3P: ``(epoch, suffixes)`` the launcher published
+    (``SGLANG_WEG2_L3_EPOCH``, ``SGLANG_WEG2_L3_INHERITED_SUFFIXES``); ``(0.0,
+    ())`` when either is missing or unreadable -- then nothing is inherited."""
+    import json as _json
+
+    try:
+        epoch = float(os.environ.get("SGLANG_WEG2_L3_EPOCH", "") or 0.0)
+        sfx = _json.loads(os.environ.get("SGLANG_WEG2_L3_INHERITED_SUFFIXES", "") or "[]")
+        sfx = tuple(str(x) for x in sfx if x)
+    except (ValueError, TypeError):
+        return 0.0, ()
+    if epoch <= 0 or not sfx:
+        return 0.0, ()
+    return epoch, sfx
+
+
 # How often an eviction run may print its proof line, in seconds. Suppressed
 # runs are counted and printed with the next line (denominator law: a
 # rate-limited emitter that prints no suppressed count turns a throttle into
@@ -190,10 +207,11 @@ class LRUFileEvictor:
             lambda stem: os.path.join(self.file_path, f"{stem}.bin")
         )
         self._iter_existing = iter_existing or self._iter_existing_flat
-        # L3P: files older than this evictor, in a persistent store, were left
-        # by a previous boot of the SAME identity (the launcher proves it with
-        # L3_IDENTITY.json before any rank starts).
-        self._born = time.time()
+        # L3P (N1/N2): what counts as INHERITED is published by the launcher
+        # once for every rank, before any rank starts: the group-wide attach
+        # epoch and the suffixes the previous boot's groups scanned. Unset =
+        # nothing is inherited (the old behaviour).
+        self._l3_epoch, self._l3_inherited_suffixes = _l3p_inheritance_from_env()
         # #1295 round 2, SHOULD_FIX 8: the ``.bin`` walk above is not the whole
         # directory. ``HiCacheFile`` writes every page through a
         # ``<final>.tmp.<uuid>`` staging file and reaps orphaned partials BY AGE
@@ -452,7 +470,9 @@ class LRUFileEvictor:
             f"under the shared #706 suffix -- counted, never unlinked here; 0 "
             f"at attach by construction and non-zero only after a wake "
             f"re-scan), staging={self._staging_bytes} B, "
-            f"directory={self._directory_bytes_locked()} B"
+            f"directory={self._directory_bytes_locked()} B, "
+            f"census_walk_s={(getattr(self, '_scan_census', None) or {}).get('walk_s', 0)}, "
+            f"inherited={(getattr(self, '_scan_census', None) or {}).get('inherited_bytes', 0)} B"
         )
 
     def _load_config(self, extra: dict) -> None:
@@ -1170,13 +1190,16 @@ class LRUFileEvictor:
         inherited_bytes = 0
         inherited_entries = 0
         persistent = self._l3p_persistent()
+        _t0 = time.monotonic()
         for stem, st in self._iter_existing():
             size = self._allocated_size(st)
             seen_bytes += size
             seen_entries += 1
             # Only files this index is responsible for.
             if not self._scan_suffixes or not stem.endswith(self._scan_suffixes):
-                if persistent and st.st_mtime < self._born:
+                if (persistent and self._l3_inherited_suffixes
+                        and st.st_mtime < self._l3_epoch
+                        and stem.endswith(self._l3_inherited_suffixes)):
                     inherited_bytes += size
                     inherited_entries += 1
                 continue
@@ -1198,6 +1221,7 @@ class LRUFileEvictor:
             "staging_bytes": staging_bytes,
             "inherited_bytes": inherited_bytes,
             "inherited_entries": inherited_entries,
+            "walk_s": round(time.monotonic() - _t0, 3),
         }
         self._staging_bytes = staging_bytes
         # #1295: MEASURED ALWAYS, ENFORCED ONLY WHERE ONE OWNER ANSWERS FOR THE
