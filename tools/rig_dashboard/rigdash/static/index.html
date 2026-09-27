@@ -140,8 +140,8 @@ details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
     Zeilen <span class="mono">Prefill rank batch &hellip; gpu-ms: X (compute Y, wait Z)</span>, je Rang summiert
     &uuml;ber das Fenster; die Kachel zeigt den <b>langsamsten Rang</b>, denn eine PP-Stufe bzw. ein TP-Partner
     begrenzt jeden Chunk. Das ist Ger&auml;tezeit, also rechen-ehrlich: Leerlauf zwischen Anfragen senkt sie nicht.</p>
-    <p><b>Durchsatz (Wandzeit)</b> im Verlauf = verarbeitete Prompt-Tokens je 5-s-Intervall &mdash; das, was tats&auml;chlich
-    durchging, inklusive Warten.</p>
+    <p><b>Durchsatz Wandzeit</b> = verarbeitete Prompt-Tokens im Fenster durch die Fensterl&auml;nge &mdash; das, was tats&auml;chlich
+    durchging, inklusive Leerlauf und Warten; ehrlich, aber keine Rechenrate.</p>
     <p><b>input throughput</b> aus der Zeile <span class="mono">Prefill batch</span> ist <b>wall-konfundiert</b>: es teilt durch
     die Scheduler-Wanduhr und springt bei Leerlauf. Es steht nur grau und unter diesem Namen da.</p>
     <p><b>Decode tok/s</b> = <span class="mono">gen throughput</span> der Zeile <span class="mono">Decode batch</span>
@@ -226,6 +226,7 @@ function prefillTile(b, g, color, label, binders, now) {
       ["Rechenrate je Rang (gpu-ms)", ranks],
       [active ? "Tokens / Chunks im Fenster" : "Tokens / Chunks im letzten Schub", src ? `${fmt(src.tokens)} / ${fmt(src.chunks)}` : "—"],
       ["mittl. Chunk &middot; aus Cache", src ? `${fmt(src.mean_chunk)} &middot; ${fmt(src.cached)}` : "—"],
+      active ? ["Durchsatz Wandzeit (Tokens / " + Math.round(p.window_s) + " s)", fmt(n.tokens / p.window_s)] : null,
       ["Warteschlange &middot; ausstehende Tokens", `${fmt(p.queue)} &middot; ${fmt(p.pending_tok)}`],
       src && src.wall_confounded_tps != null ? ["input throughput (wall-konfundiert)", fmt(src.wall_confounded_tps), "wc"] : null,
     ])}
