@@ -197,6 +197,45 @@ def test_a_tail_in_use_is_W105_and_nothing_moves(tmp_path):
     assert list(built[0].parameters()) == []
 
 
+def test_a_stage_while_a_batch_is_in_flight_never_touches_its_pages_H125e(tmp_path):
+    """H125e: the stage now runs while microbatches are in flight. Their KV
+    pages are out of the free list, and the tail is reserved from the free
+    list only, so the tower's pages are disjoint from every in-flight batch's
+    pages by construction; the in-flight rows keep their bytes."""
+    _write_model(tmp_path)
+    s = _stage_sched()
+    alloc = s.token_to_kv_pool_allocator
+    kv = alloc.get_kvcache()
+    in_flight = alloc.free_pages[:3].clone()          # an admitted batch's pages (front)
+    alloc.free_pages = alloc.free_pages[3:]
+    for layer in kv.k_buffer:
+        layer[in_flight] = 7                           # its KV bytes
+    free_before = alloc.free_pages.clone()
+    out = _run(s, [_req("r", [_Item()])], tmp_path)
+    assert out.ok, out.detail
+    lo = NUM_PAGES - out.tail_pages + 1
+    tail = set(range(lo, NUM_PAGES + 1))
+    assert tail.isdisjoint(set(in_flight.tolist()))
+    for layer in kv.k_buffer:
+        assert bool((layer[in_flight] == 7).all())     # untouched
+    assert torch.equal(torch.sort(alloc.free_pages)[0], torch.sort(free_before)[0])
+
+
+def test_a_batch_in_flight_on_the_tail_is_W105_not_a_shared_page_H125e(tmp_path):
+    _write_model(tmp_path)
+    s = _stage_sched()
+    alloc = s.token_to_kv_pool_allocator
+    kv = alloc.get_kvcache()
+    held = torch.tensor([NUM_PAGES], dtype=alloc.free_pages.dtype)  # in flight, in the tail
+    alloc.free_pages = alloc.free_pages[alloc.free_pages != NUM_PAGES]
+    for layer in kv.k_buffer:
+        layer[held] = 9
+    out = _run(s, [_req("r", [_Item()])], tmp_path, place=vrs.PLACE_KVTAIL)
+    assert not out.ok and out.code == vrr.W_NO_ROOM
+    for layer in kv.k_buffer:
+        assert bool((layer[held] == 9).all())
+
+
 def test_an_encode_failure_is_W107_and_the_pages_come_back(tmp_path):
     _write_model(tmp_path)
     s = _stage_sched()
@@ -283,16 +322,38 @@ def test_an_idle_pp0_stages_every_pending_image_with_one_load(stage_calls):
     assert vrr.vision_rank_pass(s) == [] and len(calls) == 1  # staged: nothing pending
 
 
-def test_a_busy_pp0_holds_EVERY_waiting_request_until_it_drained(stage_calls):
+def test_a_busy_pp0_stages_in_this_pass_and_holds_nothing_H125e(stage_calls):
+    """H125e (V1 dkrnfh91visbar1dauer09270822, #1004 SLOT DISAGREEMENT):
+    with microbatches in flight the old pass held EVERY waiting request until
+    PP0 drained. PP0 then cycled its in-flight slots alone while PP1, drained
+    earlier, parked on the next slot, and PP0 admitted the held work two slots
+    later than the follower that took its row. Admissible work is admitted in
+    the pass that finds it: the stage runs now, nothing is parked."""
     calls, _ = stage_calls
     queue = [_req("t1"), _req("i1", [_Item()]), _req("t2")]
     s = _pass_sched(queue, idle=False)
+    s._pp_microbatches_drained = lambda: False  # fwd in flight, as on the metal
     parked = vrr.vision_rank_pass(s)
-    assert calls == [] and s.waiting_queue == []
-    assert [r.rid for _, r in parked] == ["t1", "i1", "t2"]
-    s.waiting_queue.append(_req("new"))  # arrived during the admission
-    vrr.vision_unpark(s, parked)
-    assert [r.rid for r in s.waiting_queue] == ["t1", "i1", "t2", "new"]
+    assert parked == []
+    assert calls == [["i1"]] and s._weg2_vision_runs == 1
+    assert [r.rid for r in s.waiting_queue] == ["t1", "i1", "t2"]
+    assert vrr.unstaged_items(s.waiting_queue[1]) == []  # staged: admissible now
+
+
+def test_a_chunked_request_in_flight_does_not_defer_the_stage_H125e(stage_calls):
+    calls, _ = stage_calls
+    s = _pass_sched([_req("i1", [_Item()])])
+    s.chunked_req = object()
+    assert vrr.vision_rank_pass(s) == [] and calls == [["i1"]]
+
+
+def test_only_a_refused_image_is_held_and_text_beside_it_is_not_H125e(stage_calls):
+    calls, verdict = stage_calls
+    verdict["ok"] = False
+    s = _pass_sched([_req("t1"), _req("i1", [_Item()]), _req("t2")], idle=False)
+    parked = vrr.vision_rank_pass(s)
+    assert [r.rid for _, r in parked] == ["i1"]
+    assert [r.rid for r in s.waiting_queue] == ["t1", "t2"]
 
 
 def test_a_refused_stage_aborts_by_name_and_is_never_restaged(stage_calls):

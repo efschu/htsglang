@@ -1,9 +1,10 @@
 """The in-rank vision stage, WIRED into the scheduler (user design 2026-09-24) -- slice V2b.
 
 Hermetic, CPU. Pinned:
-  * the scheduler's admission never sees a held request and always gets it
-    back, also when the admission raises; an unarmed scheduler admits
-    exactly as before;
+  * H125e: a busy PP0 stages in the pass and the admission sees every
+    waiting request; a refused (held) request never reaches the admission and
+    always comes back, also when the admission raises; an unarmed scheduler
+    admits exactly as before;
   * the waiting-queue abort echo carries the origin's finish reason, and the
     tokenizer's own aborts (no reason) echo unchanged;
   * the receiver injects the origin's extras on the origin only, before the
@@ -59,6 +60,8 @@ def stage_calls(monkeypatch):
 
     def fake(scheduler, reqs, **kw):
         calls.append([r.rid for r in reqs])
+        if getattr(scheduler, "_test_refuse", False):
+            return vrr.StageOutcome(ok=False, code=vrr.W_NO_ROOM, detail="tail busy")
         return vrr.StageOutcome()
 
     monkeypatch.setattr(vrr, "run_rank_stage", fake)
@@ -79,8 +82,18 @@ def _funnel(queue, idle):
     return h
 
 
+def test_a_busy_pp0_admits_every_waiting_request_in_the_stage_pass_H125e(stage_calls):
+    h = _funnel([_req("t1"), _req("i1", [_Item()])], idle=False)
+    seen = []
+    h._get_new_batch_prefill_raw = lambda prefill_delayer_single_pass, running_batch: (
+        seen.append([r.rid for r in h.waiting_queue]) or (None, running_batch))
+    h.get_new_batch_prefill(running_batch=h.running_batch)
+    assert seen == [["t1", "i1"]] and stage_calls == [["i1"]]
+
+
 def test_the_admission_never_sees_a_held_request_and_always_gets_it_back(stage_calls):
     h = _funnel([_req("t1"), _req("i1", [_Item()])], idle=False)
+    h._test_refuse = True  # the stage refuses: i1 is held until its abort lands
     seen = []
 
     def raw(prefill_delayer_single_pass, running_batch):
@@ -89,7 +102,7 @@ def test_the_admission_never_sees_a_held_request_and_always_gets_it_back(stage_c
 
     h._get_new_batch_prefill_raw = raw
     plan = h.get_new_batch_prefill(running_batch=h.running_batch)
-    assert seen == [[]] and plan.batch_to_run is None
+    assert seen == [["t1"]] and plan.batch_to_run is None
     assert [r.rid for r in h.waiting_queue] == ["t1", "i1"]
 
     def boom(**kw):
