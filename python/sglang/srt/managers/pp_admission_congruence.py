@@ -153,6 +153,8 @@ above, which continues to hold with this class in play.
 
 from __future__ import annotations
 
+import re
+
 import hashlib
 import logging
 import os
@@ -306,6 +308,36 @@ class PPWidthDivergenceRefused(RuntimeError):
     """
 
 
+_GEOM_RE = re.compile(r"(sender|receiver)_geom=\('([^']*)',\s*(-?\d+),\s*(-?\d+)\)")
+
+
+def divergence_cause(provenance: str) -> str:
+    """TF (rc12k27 b1): name WHICH term split, read off the two geometries the
+    provenance carries (``sender_geom=(rid, start, end)`` /
+    ``receiver_geom=...``). A START split means the stages admitted the request
+    at different prefixes -- PP0's told was not what one side admitted (see
+    weg2_told_fidelity); a WIDTH split at the same start is a chunk-plan
+    disagreement (Fix A's budget head). Empty when the geometries are absent."""
+    found = {}
+    for side, rid, start, end in _GEOM_RE.findall(str(provenance or "")):
+        found[side] = (rid, int(start), int(end))
+    if "sender" not in found or "receiver" not in found:
+        return ""
+    (srid, s0, s1), (rrid, r0, r1) = found["sender"], found["receiver"]
+    if srid != rrid:
+        return (f" cause=RID-SPLIT: the stages ran different requests in this pass "
+                f"(sender {srid!r}, receiver {rrid!r})")
+    if s0 != r0:
+        return (f" cause=START-SPLIT: rid {srid!r} admitted at prefix {s0} on the sender "
+                f"and {r0} on the receiver -- PP0's told was not the prefix one side "
+                f"admitted (TF told fidelity; widths {s1 - s0} vs {r1 - r0} follow from it)")
+    if (s1 - s0) != (r1 - r0):
+        return (f" cause=WIDTH-SPLIT: rid {srid!r} at the same prefix {s0}, chunk width "
+                f"{s1 - s0} on the sender vs {r1 - r0} on the receiver (the pass's chunk "
+                f"plan differs: P-CHUNK-BUDGET / P-CHUNK-POLICY)")
+    return ""
+
+
 def refuse_pp_width_divergence(
     received_rows: int, wanted_rows: int, provenance: str = ""
 ) -> None:
@@ -320,7 +352,7 @@ def refuse_pp_width_divergence(
     raise PPWidthDivergenceRefused(
         f"#1233 W27 PP WIDTH DIVERGENCE REFUSED: received hidden_states with "
         f"{int(received_rows)} row(s) for a batch of {int(wanted_rows)} "
-        f"token(s) ({provenance or 'no provenance'}). Two PP stages built "
+        f"token(s) ({provenance or 'no provenance'}){divergence_cause(provenance)}. Two PP stages built "
         f"different batches for the same pass; the ranks disagree and this "
         f"group stops here by name instead of running the kernel off the "
         f"tensor (boots weg2ls2b1/b2: illegal memory access in the GDN "
