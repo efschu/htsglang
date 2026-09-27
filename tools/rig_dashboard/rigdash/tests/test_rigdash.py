@@ -274,6 +274,14 @@ class HealthTests(unittest.TestCase):
         self.assertIn("4 Anfrage(n) warten", a["reasons"][0]["text"])
         self.assertIn("seit 125 s", a["reasons"][0]["text"])
 
+    def test_no_hang_verdict_while_the_log_is_still_being_read(self):
+        b = self._boot(front={"queue": 4, "outstanding": {"P": 0, "D": 6}}, last_activity_any=self.NOW - 550,
+                       totals={"read_progress": 0.62},
+                       container={"Names": "c", "State": "running", "Status": "Up 51 minutes (unhealthy)"})
+        a = health.assess(b, self.NOW)
+        self.assertEqual(a["state"], "WARNUNG")
+        self.assertIn("noch eingelesen", a["reasons"][0]["text"])
+
     def test_queue_with_recent_progress_is_fine(self):
         b = self._boot(front={"queue": 3, "outstanding": {}}, last_activity_any=self.NOW - 20)
         self.assertIsNone(health.assess(b, self.NOW)["state"])

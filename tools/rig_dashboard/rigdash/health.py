@@ -40,6 +40,10 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
     """
     reasons: List[dict] = []
     c = b.get("container") or {}
+    # While the reader is still catching up on a log (after a dashboard restart
+    # the logs are read from their start), "last activity" is old by
+    # construction -- judging a hang from it raised a false HAENGT (27.09.).
+    catching_up = (b.get("totals") or {}).get("read_progress", 1.0) < 0.999
     judged = bool(b.get("live")) or c.get("State") == "running"
 
     def add(level, group, text, t=None):
@@ -71,6 +75,8 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
             ended_on = {"group": g, "text": s["text"][:300], "t": s["t"], "recovered": recovered}
         if recovered:
             add("warn", g, text + " (danach lief die Gruppe weiter)", s["t"])
+        elif catching_up:
+            add("warn", g, text + " (Log wird noch eingelesen: ob die Gruppe danach weiterlief, steht noch aus)", s["t"])
         else:
             add("dead", g, text, s["t"])
 
@@ -83,7 +89,10 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
     if "unhealthy" in status:
         idle_now = _age(now, b.get("last_activity_any"))
         hc = (c.get("health_output") or "").strip()
-        if idle_now is not None and idle_now < PROGRESS_S:
+        if catching_up:
+            add("warn", None, "Docker meldet %s unhealthy; Fortschritt noch nicht beurteilbar (Log wird noch eingelesen)%s"
+                % (c.get("Names"), (" -- Healthcheck: " + hc[:300]) if hc else ""))
+        elif idle_now is not None and idle_now < PROGRESS_S:
             add("warn", None, "Docker-Health widerspricht dem Fortschritt: %s meldet unhealthy, aber vor %d s kam "
                 "eine Prefill-/Decode-Zeile%s" % (c.get("Names"), idle_now, (" -- Healthcheck: " + hc[:300]) if hc else ""))
         else:
@@ -103,7 +112,7 @@ def assess(b: dict, now: float, docker_ok: bool = True) -> dict:
     elif q_log is not None and q_log_age is not None and q_log_age < 600:
         queued, src = q_log, "letzte WEG2-ROUTE-Zeile"
     idle = _age(now, b.get("last_activity_any"))
-    if judged and queued and idle is not None and idle >= HANG_S:
+    if judged and queued and idle is not None and idle >= HANG_S and not catching_up:
         add("hang", None, "HÄNGT: %d Anfrage(n) warten (%s), seit %d s keine Prefill-/Decode-Zeile" % (
             queued, src, idle))
 
