@@ -58,6 +58,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         quant_method=None,
         post_capture_active: bool = False,
         qsa_slot_space: Optional[int] = None,
+        qsa_index_on_rank: bool = True,
         **fork_pool_kwargs,
     ):
         # #37500 port: this line's HybridLinearKVPool takes extra keyword
@@ -159,6 +160,20 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_rope_position_buffer = torch.zeros(
             (ring_slots, 3), dtype=torch.int64, device=device
         )
+        if not qsa_index_on_rank:
+            # #239 S0: a Form A expert worker runs no indexer -- its attention
+            # modules are host-only -- so it keeps no compressed index. An
+            # empty per-layer list is the shape the HiCache assembler and the
+            # cache controller already read as "no sidecar on this rank".
+            # The pending ring and the RoPE row above stay (bytes, not MiB):
+            # tail adopt and the flip carry name them per pool.
+            self.qsa_compressed_flat = torch.zeros(
+                (0,), dtype=self.index_state_dtype, device=device
+            )
+            self.qsa_compressed_k_buffer_pool = []
+            k_size, v_size = self.get_kv_size_bytes()
+            self.mem_usage = (k_size + v_size) / GB
+            return
         # One contiguous allocation behind per-layer views: every layer's
         # compressed pages are addressable from a single base pointer.
         # #251c: under D's KV stage form the keys live in the kv_cache tag
