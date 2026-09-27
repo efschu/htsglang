@@ -52,16 +52,22 @@ def parse_nvsmi_csv(text: str) -> List[dict]:
     return cards
 
 
+DOCKER_PS_FIELDS = ["Names", "Image", "Status", "State", "Ports", "CreatedAt", "RunningFor"]
+# Explicit fields, NOT '{{json .}}': the json form includes .Size, which makes
+# the daemon compute every container's disk usage -- measured 12-13 s per call
+# on the Proxmox host 2026-09-27 against 0.6 s for the field list.
+DOCKER_PS_FORMAT = "\\t".join("{{.%s}}" % f for f in DOCKER_PS_FIELDS)
+
+
 def parse_docker_ps(text: str) -> List[dict]:
     out = []
     for line in text.strip().splitlines():
-        line = line.strip()
-        if not line:
+        if not line.strip():
             continue
-        try:
-            out.append(json.loads(line))
-        except ValueError:
+        parts = line.split("\t")
+        if len(parts) != len(DOCKER_PS_FIELDS):
             continue
+        out.append(dict(zip(DOCKER_PS_FIELDS, parts)))
     return out
 
 
@@ -160,7 +166,7 @@ class Sources:
 
     def sample_docker(self):
         ssh = self.cfg["docker_ssh"]
-        ps = run(ssh + ["docker ps -a --filter name=htsglang --format '{{json .}}'"], 12.0)
+        ps = run(ssh + ["docker ps -a --filter name=htsglang --format '%s'" % DOCKER_PS_FORMAT], 12.0)
         rows = parse_docker_ps(ps)
         running = [r["Names"] for r in rows if (r.get("State") == "running")]
         dirs = {}

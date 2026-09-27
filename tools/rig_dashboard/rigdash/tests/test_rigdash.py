@@ -229,8 +229,11 @@ class SourceTests(unittest.TestCase):
         self.assertIsNone(sources.front_for_boot(fr, "other"))
 
     def test_docker_ps_json_lines(self):
-        rows = sources.parse_docker_ps(json.dumps({"Names": "a", "State": "running"}) + "\n\n")
-        self.assertEqual(rows[0]["Names"], "a")
+        line = "\t".join(["htsglang-acc-27b-x", "htsglang:rc12", "Up 3 minutes (healthy)", "running",
+                           "127.0.0.1:31030->30030/tcp", "2026-09-27 11:32:10 +0200 CEST", "3 minutes ago"])
+        rows = sources.parse_docker_ps(line + "\n\n")
+        self.assertEqual((rows[0]["Names"], rows[0]["State"]), ("htsglang-acc-27b-x", "running"))
+        self.assertIn("{{.Names}}\\t{{.Image}}", sources.DOCKER_PS_FORMAT)
 
 
 if __name__ == "__main__":
