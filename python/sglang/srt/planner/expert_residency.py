@@ -657,6 +657,9 @@ def kv_token_cut_cells(
 KV_TOKEN_SHARE_GRID = 64
 #: #239: ``--d-kv-token-cut maxmin`` -- the planner solves the shares itself.
 KV_TOKEN_CUT_MAXMIN = "maxmin"
+#: #239 S2b: ``--d-kv-token-cut joint`` -- the planner solves the shares AND
+#: sets FR_D at every rank's edge (FR setzt der Planer, Nutzer 27.09.).
+KV_TOKEN_CUT_JOINT = "joint"
 
 
 def fa_kv_token_cell_bytes(text_cfg: Mapping[str, object], kv_dtype_bytes: int) -> int:
@@ -691,10 +694,23 @@ def _relative_ceiling(fit: "DRankResidency") -> float:
     return float(fit.ceiling_max_rows) / float(max(1, fit.buffer_rows))
 
 
+def resident_edge_share(fit: "DRankResidency") -> float:
+    """#239 S2b: the share of this rank's local experts that stay RESIDENT at
+    its edge -- ``min(ceiling rows - scratch, E - 2) / E`` (the same bound as
+    :func:`largest_fraction_for_rows`; negative = not even the scratch fits).
+    Independent of the driven fraction, non-increasing in the rank's KV share,
+    and comparable between a 5090 and a 3080 (a card is judged by the part of
+    ITS experts it holds, not by raw rows)."""
+    E = int(fit.local_experts)
+    rows = min(int(fit.ceiling_max_rows) - int(fit.scratch_rows), E - 2)
+    return float(rows) / float(max(1, E))
+
+
 def solve_kv_token_shares(
     solve: Callable[[Sequence[int]], Sequence["DRankResidency"]],
     n_ranks: int,
     grid: int = KV_TOKEN_SHARE_GRID,
+    score: Optional[Callable[["DRankResidency"], float]] = None,
 ) -> Tuple[Tuple[int, ...], float]:
     """#239: the token cut the planner chooses -- MAX-MIN of the relative row
     ceiling (ceiling / the buffer rows the rank's fraction asks for), in whole
@@ -711,7 +727,11 @@ def solve_kv_token_shares(
     below the optimum is only handed out when every rank already holds all it
     can at the optimum, and those hold at least ``grid`` -- and it spreads the
     slack instead of parking it on one card. Returns ``(shares, min score)``.
+
+    ``score`` (S2b) replaces the relative ceiling, e.g. with
+    :func:`resident_edge_share` when FR_D follows the cut.
     """
+    value = score or _relative_ceiling
     n, g = int(n_ranks), int(grid)
     if n < 1 or g < 1:
         raise ValueError("solve_kv_token_shares: %d ranks, grid %d" % (n, g))
@@ -725,7 +745,7 @@ def solve_kv_token_shares(
                 vec[(r + 1) % n] += g - k
             if n == 1:
                 vec = [g]
-            row.append(_relative_ceiling(solve(vec)[r]))
+            row.append(value(solve(vec)[r]))
         for k in range(g):
             if row[k + 1] > row[k] + 1e-9:
                 raise ValueError(
@@ -740,6 +760,31 @@ def solve_kv_token_shares(
         nxt = max(range(n), key=lambda r: (score[r][take[r] + 1], -r) if take[r] < g else (-1.0, -r))
         take[nxt] += 1
     return tuple(take), min(score[r][take[r]] for r in range(n))
+
+
+def solve_joint_cut(
+    solve: Callable[[Sequence[int]], Sequence["DRankResidency"]],
+    fractions: Sequence[float],
+    n_ranks: int,
+    grid: int = KV_TOKEN_SHARE_GRID,
+) -> Tuple[Tuple[int, ...], float, Tuple[float, ...], Tuple["DRankResidency", ...]]:
+    """#239 S2b: token cut AND FR_D in one solve.
+
+    The ceiling of a rank does not depend on its fraction, so the cut is the
+    max-min of :func:`resident_edge_share` over the shares, and FR_D is then
+    every rank's edge (``ceiling_fraction``) at that cut -- FR follows the
+    budget instead of being a stated start value (FR setzt der Planer). A rank
+    with no edge keeps its driven fraction; the W122 line then names it.
+    Returns ``(cut, min resident share, FR_D, fits at the cut)``.
+    """
+    cut, low = solve_kv_token_shares(solve, n_ranks, grid, score=resident_edge_share)
+    edge = tuple(solve(cut))
+    fr = tuple(
+        float(f.ceiling_fraction) if f.ceiling_fraction is not None
+        else float(fractions[f.rank])
+        for f in edge
+    )
+    return tuple(cut), low, fr, edge
 
 
 def solve_d_rank_residency(
@@ -1517,6 +1562,11 @@ class DResidencyPlan(msgspec.Struct, frozen=True, kw_only=True):
     #: rc12e: die aus der geloesten Form abgeleiteten Ueberlaufwellen
     #: (``derive_waves``); ``None`` = nicht abgeleitet, die Env gilt.
     overflow_waves: Optional[int] = None
+    #: #239 S2b: FR_D, die der Planer mit dem Token-Schnitt setzt (leer =
+    #: die gefahrene FR gilt); der Launcher schreibt sie in die D-Argumente.
+    solved_fractions: Tuple[float, ...] = ()
+    #: #239: der geloeste Token-Schnitt in 64steln (leer = kein Schnitt/gegeben).
+    kv_token_cut: Tuple[int, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -2780,10 +2830,10 @@ def plan_d_residency(
     if kv_token_shares is not None and int(kv_dcp_cell_bytes) <= 0:
         kv_dcp_cell_bytes = fa_kv_token_cell_bytes(text_cfg, int(kv_dtype_bytes))
 
-    def _solve(shares):
+    def _solve(shares, fr=None):
         return solve_d_rank_residency(
             budgets_mib=budgets_mib,
-            fractions=fractions,
+            fractions=fractions if fr is None else fr,
             ratios=ratios,
             scratch_rows=scratch_rows,
             staging_rows=staging,
@@ -2799,22 +2849,45 @@ def plan_d_residency(
             kv_dcp_cell_bytes=int(kv_dcp_cell_bytes),
         )
 
+    solved_fr: Tuple[float, ...] = ()
+    solved_cut: Tuple[int, ...] = ()
     if isinstance(kv_token_shares, str):
-        if kv_token_shares != KV_TOKEN_CUT_MAXMIN:
+        if kv_token_shares not in (KV_TOKEN_CUT_MAXMIN, KV_TOKEN_CUT_JOINT):
             raise ValueError(
-                "plan_d_residency: KV token cut %r is neither %r nor a ratio vector"
-                % (kv_token_shares, KV_TOKEN_CUT_MAXMIN)
+                "plan_d_residency: KV token cut %r is neither %r, %r nor a ratio vector"
+                % (kv_token_shares, KV_TOKEN_CUT_MAXMIN, KV_TOKEN_CUT_JOINT)
             )
-        cut, low = solve_kv_token_shares(_solve, n)
+        joint = kv_token_shares == KV_TOKEN_CUT_JOINT
+        if joint:
+            cut, low, solved_fr, edge = solve_joint_cut(_solve, fractions, n)
+        else:
+            cut, low = solve_kv_token_shares(_solve, n)
         cut_lines = (
-            "%s FRACTION-SOLVE %s KV-TOKEN-SCHNITT (#239 S2): Anteile %s/%d je Rang "
-            "(max-min der relativen Zeilen-Decke Decke/Puffer, kleinste %.3f; "
-            "Voll-Attention-KV %d B/Token, %d Token)"
-            % (marker, label, list(cut), KV_TOKEN_SHARE_GRID, low,
-               int(kv_dcp_cell_bytes), int(kv_tokens)),
+            "%s FRACTION-SOLVE %s KV-TOKEN-SCHNITT (#239 %s): Anteile %s/%d je Rang "
+            "(max-min %s, kleinste %.3f; Voll-Attention-KV %d B/Token, %d Token)"
+            % (marker, label, "S2b" if joint else "S2", list(cut), KV_TOKEN_SHARE_GRID,
+               "des residenten Experten-Anteils je Karte an der Kante" if joint
+               else "der relativen Zeilen-Decke Decke/Puffer",
+               low, int(kv_dcp_cell_bytes), int(kv_tokens)),
         )
         kv_token_shares = cut
-    fits = _solve(kv_token_shares)
+        solved_cut = tuple(cut)
+        if joint:
+            cut_lines = cut_lines + (
+                "%s FRACTION-SOLVE %s FR-D (#239 S2b): der Planer setzt FR_D %s an die "
+                "Kante je Rang (gefahren %s) -- resident %s von %s Experten, "
+                "Decke %s Zeilen%s"
+                % (marker, label, ["%.3f" % x for x in solved_fr],
+                   ["%.3f" % float(x) for x in fractions],
+                   [max(0, min(f.ceiling_max_rows - f.scratch_rows, f.local_experts - 2))
+                    for f in edge],
+                   [f.local_experts for f in edge],
+                   [f.ceiling_max_rows for f in edge],
+                   "" if all(f.ceiling_fraction is not None for f in edge) else
+                   " -- KEINE Kante auf Rang %s, dort bleibt die gefahrene FR (W122)"
+                   % [f.rank for f in edge if f.ceiling_fraction is None]),
+            )
+    fits = _solve(kv_token_shares, solved_fr or None)
     if kv_token_shares is not None:
         dcp_note = (
             " KV-Anteil (#239): Token-Schnitt der Voll-Attention-KV (%d B/Token) je Rang "
@@ -2949,6 +3022,8 @@ def plan_d_residency(
             fits=fits,
             card_fits=cards,
             overflow_waves=derived_waves,
+            solved_fractions=solved_fr,
+            kv_token_cut=solved_cut,
         )
     card_lines, cards, card_refusal = _plan_d_card(
         fits=fits,
@@ -2980,6 +3055,8 @@ def plan_d_residency(
         fits=fits,
         card_fits=cards,
         overflow_waves=derived_waves,
+        solved_fractions=solved_fr,
+        kv_token_cut=solved_cut,
     )
 
 
