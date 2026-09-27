@@ -5243,13 +5243,58 @@ L3_PERSIST_GENERATION = "706"
 L3_IDENTITY_FILE = "L3_IDENTITY.json"
 
 
+def _l3_extra_flag(extra: str, flag: str) -> str:
+    """The value argparse will keep for ``flag`` in a shell-split EXTRA string
+    (the LAST occurrence), or ""."""
+    try:
+        toks = shlex.split(extra or "")
+    except ValueError:
+        return str(extra or "")
+    val = ""
+    for i, t in enumerate(toks):
+        if t == flag and i + 1 < len(toks):
+            val = toks[i + 1]
+        elif t.startswith(flag + "="):
+            val = t[len(flag) + 1:]
+    return val
+
+
+def l3_weights_fingerprint(model: str) -> str:
+    """L3P N4: sha1 over (name, size, mtime_ns) of the checkpoint's weight
+    files -- a checkpoint swapped IN PLACE at the same path is a new identity.
+    Top level of the model directory (or the file itself for a GGUF path);
+    stat only, nothing is read."""
+    real = os.path.realpath(str(model or ""))
+    rows = []
+    try:
+        if os.path.isfile(real):
+            st = os.stat(real)
+            rows.append((os.path.basename(real), st.st_size, st.st_mtime_ns))
+        else:
+            with os.scandir(real) as it:
+                for e in it:
+                    if e.name.endswith((".safetensors", ".gguf", ".bin", ".pt", ".pth")) and e.is_file():
+                        st = e.stat()
+                        rows.append((e.name, st.st_size, st.st_mtime_ns))
+    except OSError:
+        return ""
+    rows.sort()
+    return hashlib.sha1(repr(rows).encode()).hexdigest()
+
+
 def l3_persist_identity(model: str, profile: str = "", form_kv: str = "",
-                        kv_cache_dtype: str = KV_CACHE_DTYPE) -> dict:
+                        kv_cache_dtype: str = KV_CACHE_DTYPE, extra_p: str = "",
+                        extra_d: str = "", vision: str = "") -> dict:
     """L3P: what a persistent store is FOR. User 2026-09-27: "aber natürlich
     zwischen 27b und nf verschiedene L3 caches. sonst knallts" -- one model,
-    one directory. The page keys already miss across byte formats; this keeps
-    the DIRECTORIES apart too, so one model's cap, eviction census and sweep
-    never see the other's pages."""
+    one directory. Beside the checkpoint (path, config sha, weight-file stat
+    fingerprint) it carries every launcher-side input that changes the BYTES
+    of a page without changing its key: the KV dtype (the line's constant and
+    an EXTRA override of either group), the effective
+    ``--json-model-override-args`` of both groups (rope_scaling / YaRN: the
+    key hashes token ids only), and the vision mode. The rank adds what only
+    it knows (dtype, quantization, revision) in ``L3_RANK_IDENTITY.<group>``
+    and refuses a mismatch there."""
     real = os.path.realpath(str(model or ""))
     cfg_sha = ""
     try:
@@ -5257,12 +5302,23 @@ def l3_persist_identity(model: str, profile: str = "", form_kv: str = "",
             cfg_sha = hashlib.sha1(f.read()).hexdigest()
     except Exception:  # noqa: BLE001 -- a GGUF or unreadable config: the path still separates
         pass
+    kv = str(kv_cache_dtype or "")
+    kv_p = _l3_extra_flag(extra_p, "--kv-cache-dtype") or kv
+    kv_d = _l3_extra_flag(extra_d, "--kv-cache-dtype") or kv
+
+    def _sha(v: str) -> str:
+        return hashlib.sha1(v.encode()).hexdigest()[:16] if v else ""
+
     return {
         "model_path": real,
         "model_config_sha1": cfg_sha,
+        "weights_fp": l3_weights_fingerprint(model),
         "profile": str(profile or ""),
         "form_kv": str(form_kv or ""),
-        "kv_cache_dtype": str(kv_cache_dtype or ""),
+        "kv_cache_dtype": kv if kv_p == kv_d == kv else f"P={kv_p},D={kv_d}",
+        "override_p": _sha(_l3_extra_flag(extra_p, "--json-model-override-args")),
+        "override_d": _sha(_l3_extra_flag(extra_d, "--json-model-override-args")),
+        "vision": str(vision or ""),
         "generation": L3_PERSIST_GENERATION,
     }
 
@@ -5310,21 +5366,79 @@ def l3_persist_check_identity(directory: str, identity: dict, dry: bool) -> str:
     return "match"
 
 
+L3_SUFFIX_REGISTRY = "L3_SUFFIXES"
+
+
+def l3_registered_suffixes(directory: str) -> Optional[Tuple[str, ...]]:
+    """L3P N1: the union of every group's scan suffixes the ranks recorded in
+    ``<dir>/L3_SUFFIXES.<group>.json`` (written by HiCacheFile at attach), or
+    None when no group has recorded yet (first boot of this store)."""
+    out: List[str] = []
+    found = False
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return None
+    for n in names:
+        if not (n.startswith(L3_SUFFIX_REGISTRY + ".") and n.endswith(".json")):
+            continue
+        try:
+            with open(os.path.join(directory, n)) as f:
+                out.extend(str(x) for x in json.load(f).get("suffixes", []))
+            found = True
+        except (OSError, ValueError, AttributeError):
+            continue
+    return tuple(dict.fromkeys(x for x in out if x)) if found else None
+
+
 def l3_persist_attach(log: Log, directory: str, dry: bool) -> Tuple[int, int, int]:
     """L3P: reattach this boot to the persistent store; returns
-    ``(files, bytes, staging_removed)``.
+    ``(files, bytes, removed)``.
 
-    ONE walk, before any rank starts: counts the ``.bin`` pages a previous boot
-    left (the ``L3-PERSIST`` line is the acceptance marker) and removes the
-    ``<final>.tmp.<uuid>`` staging files a crashed writer left behind -- no
-    writer of this store is alive yet, so a staging file here is abandoned by
-    construction, not "maybe still being filled". Canonical partials are NOT
-    touched: HiCacheFile's attach sweep keeps the resumable ones by marker.
+    ONE walk, before any rank starts (so nothing here sits inside a rank
+    collective): counts the ``.bin`` pages a previous boot left (the
+    ``L3-PERSIST`` line is the acceptance marker) and removes
+    - the ``<final>.tmp.<uuid>`` staging files a crashed writer left behind --
+      no writer of this store is alive yet, so a staging file here is
+      abandoned by construction;
+    - ORPHAN pages (N1): a ``.bin`` whose stem ends in a suffix NO group
+      scans (``L3_SUFFIXES.*``, the groups' own records from the previous
+      boot). No evictor indexes them, so they would sit against the cap as
+      foreign bytes forever; the key already made them unreachable (e.g. a
+      changed uneven-TP ratio moves the identity hash in every key). Without
+      any record yet they are counted, never removed.
+    Canonical partials are NOT touched: HiCacheFile's attach sweep keeps the
+    resumable ones by marker.
+
+    It also publishes the GROUP-WIDE attach epoch (N2,
+    ``SGLANG_WEG2_L3_EPOCH``): every rank of both groups grades "inherited"
+    against the same instant, not against its own start time.
+
+    H8, named: ``/clear_hicache_storage_backend`` clears the WHOLE persistent
+    store (every page of this identity), exactly as it always cleared the
+    per-boot one; the identity and suffix records survive (they are not
+    ``.bin`` pages).
     """
-    files = nbytes = removed = 0
+    epoch = time.time()
+    if not dry:
+        os.environ["SGLANG_WEG2_L3_EPOCH"] = f"{epoch:.6f}"
+        os.environ.pop("SGLANG_WEG2_L3_INHERITED_SUFFIXES", None)
+    files = nbytes = removed = orphans = orphan_bytes = 0
+    t0 = time.monotonic()
     if not os.path.isdir(directory):
-        log(f"L3-PERSIST fresh dir={directory} (no previous store)")
+        log(f"L3-PERSIST fresh dir={directory} (no previous store) epoch={epoch:.3f}")
         return 0, 0, 0
+    known = l3_registered_suffixes(directory)
+    if not dry:
+        # N1: the suffixes the previous boot's groups scanned, published ONCE
+        # for every rank -- a page under one of them that this rank's own
+        # group does not scan is the sibling's (or this group's before an
+        # identity-hash drift): inherited. Anything else unindexed still
+        # counts against W8b (a blind filter on this boot's own writes).
+        if known:
+            os.environ["SGLANG_WEG2_L3_INHERITED_SUFFIXES"] = json.dumps(list(known))
+        else:
+            os.environ.pop("SGLANG_WEG2_L3_INHERITED_SUFFIXES", None)
     for root, _dirs, names in os.walk(directory):
         for name in names:
             p = os.path.join(root, name)
@@ -5336,16 +5450,32 @@ def l3_persist_attach(log: Log, directory: str, dry: bool) -> Tuple[int, int, in
                     except OSError:
                         pass
                 continue
-            if name.endswith(".bin"):
-                try:
-                    st = os.lstat(p)
-                except OSError:
-                    continue
-                files += 1
-                nbytes += st.st_blocks * 512
+            if not name.endswith(".bin"):
+                continue
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            size = st.st_blocks * 512
+            if known is not None and not name[:-4].endswith(known):
+                orphans += 1
+                orphan_bytes += size
+                if not dry:
+                    try:
+                        os.unlink(p)
+                        removed += 1
+                    except OSError:
+                        pass
+                continue
+            files += 1
+            nbytes += size
+    walk_s = time.monotonic() - t0
     log(
         f"L3-PERSIST {'reuse' if files else 'fresh'} dir={directory} files={files} bytes={nbytes} "
-        f"({nbytes / host_ledger.GIB:.2f} GiB) staging_removed={removed}"
+        f"({nbytes / host_ledger.GIB:.2f} GiB) orphans={orphans} ({orphan_bytes / host_ledger.GIB:.2f} GiB, "
+        + ("no suffix record yet: counted, kept" if known is None else
+           f"suffix in no group's record: {'would be ' if dry else ''}removed")
+        + f") staging+orphans_removed={removed} walk_s={walk_s:.1f} epoch={epoch:.3f}"
         + (" (DRY-RUN: nothing removed)" if dry else "")
         + " -- the ranks seed the L3 index and the evictor ledger from it at attach"
     )
@@ -20468,7 +20598,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # moving anything.  The ledger ran first only because the ARC line prices
     # itself against the reap headroom the ledger computes.
     _l3_ident = (l3_persist_identity(ns.model, getattr(ns, "profile", ""),
-                                     getattr(ns, "form_kv", "") or "")
+                                     getattr(ns, "form_kv", "") or "",
+                                     extra_p=getattr(ns, "extra_p", "") or "",
+                                     extra_d=getattr(ns, "extra_d", "") or "",
+                                     vision=str(getattr(ns, "weg2_vision", "") or ""))
                  if l3_persist_enabled() else None)
     store_plan = plan_store(
         ns.tag,

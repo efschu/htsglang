@@ -40,6 +40,11 @@ class Weg2StoreGateError(RuntimeError):
     """Base of the S5 launch refusals. Never caught to continue."""
 
 
+class Weg2L3IdentityMismatch(Weg2StoreGateError):
+    """L3P W165: a persistent L3 store recorded another rank identity (dtype,
+    quantization, revision, model override, weights) than this rank resolves."""
+
+
 class Weg2MambaBlobAbsent(Weg2StoreGateError):
     """W7: a hybrid rank has a canonical KV page but no canonical GDN blob."""
 
