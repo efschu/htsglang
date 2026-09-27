@@ -72,11 +72,30 @@ def needs_p_dir(tag: str = "", env=None) -> str:
     return os.path.join(base, SUBDIR) if base else ""
 
 
+#: ROS (NF rc12m-dpr 12:16:12, weg2-16-59 / weg2-18-64): the hold covers EVERY
+#: streamed request, output or not. D cannot know whether the front already
+#: sent the client a byte (message_start + 5 s pings: the front's lookahead
+#: commits after 8 chunks, ~35 s, with output=0), and a per-rank read of a
+#: front marker would be a rank-local verdict. So D holds every streamed
+#: refusal (the replicated ``stream`` flag decides) and the FRONT, which knows
+#: whether it committed, answers: committed -> P-only leg 1 (RESUME-VIA-P);
+#: not committed -> X-REQUEUE exactly as before (closing D's leg aborts the
+#: parked request, d_park_runtime.park_abort). ``0`` = the output>0 rule.
+ENV_OPEN_STREAM = "SGLANG_WEG2_RESUME_OPEN_STREAM"
+
+
+def open_stream_enabled(env=None) -> bool:
+    e = os.environ if env is None else env
+    raw = (e.get(ENV_OPEN_STREAM, "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def eligible(req, env=None) -> bool:
     """A refusal D may turn into RESUME-VIA-P: switch on, group D, a streamed
-    request that has generated tokens (the client holds text), under the
-    attempt bound. A fresh request (nothing generated) keeps the abort -- the
-    front re-routes it before its first byte (X-REQUEUE)."""
+    request, under the attempt bound. With ROS off only a request that has
+    generated tokens (the old rule); with ROS on every streamed request -- the
+    front decides between the resume and X-REQUEUE (see ENV_OPEN_STREAM). A
+    non-stream request keeps the abort (X-REQUEUE, nothing reached the client)."""
     e = os.environ if env is None else env
     if not enabled(e):
         return False
@@ -84,12 +103,22 @@ def eligible(req, env=None) -> bool:
         return False
     if not bool(getattr(req, "stream", False)):
         return False
-    try:
-        if len(getattr(req, "output_ids", None) or ()) <= 0:
+    if not open_stream_enabled(e):
+        try:
+            if len(getattr(req, "output_ids", None) or ()) <= 0:
+                return False
+        except TypeError:
             return False
-    except TypeError:
-        return False
     return int(getattr(req, ATTEMPTS_ATTR, 0) or 0) < MAX_ATTEMPTS
+
+
+def held_refusal_body(rec: dict) -> bytes:
+    """ROS: the refusal text the front's X-REQUEUE parses, for a request D held
+    (the needs-p record) instead of refusing in-band -- same marker, same
+    extent sentence as D's W50 message."""
+    return (f"W50 Weg2TpPrefillExceeded (held on D, not yet committed to the client): "
+            f"this request's extent after prefix matching is {int(rec.get('d_extent') or 0)}. "
+            f"X={int(rec.get('x') or 0)}").encode()
 
 
 def context_ids(req) -> List[int]:

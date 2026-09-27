@@ -1802,6 +1802,37 @@ async def _first_stream_chunk(r) -> Optional[bytes]:
     return None
 
 
+class _RosHeld(Exception):
+    """ROS: the front learned (needs-p file) that D HOLDS this not-yet-committed
+    stream -- the lookahead ends as a refusal (X-REQUEUE)."""
+
+
+#: ROS: how often a lookahead waiting on D looks at the held flag.
+ROS_POLL_S = 0.5
+
+
+async def _read_chunk_watched(r, stop: Callable[[], bool], poll_s: Optional[float] = None) -> Optional[bytes]:
+    """One ``readany`` of D's stream (None = end), raising :class:`_RosHeld`
+    as soon as ``stop()`` says D holds the request -- asked before the read
+    and at every poll while it waits. The read is polled, not timed out: a
+    held D sends nothing but pings, a live D's chunk returns at once."""
+    if stop():
+        raise _RosHeld()
+    poll_s = ROS_POLL_S if poll_s is None else poll_s
+    task = asyncio.ensure_future(r.content.readany())
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=poll_s)
+            if done:
+                chunk = task.result()
+                return chunk or None
+            if stop():
+                raise _RosHeld()
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 #: Q0-B: how far past the envelope the re-route lookahead may read on the
 #: Anthropic wire, before it gives up and commits the stream to the client.
 #: Bounded in BOTH dimensions so a well-behaved stream can never be delayed
@@ -1816,7 +1847,7 @@ ANTHROPIC_LOOKAHEAD_MAX_BYTES = 65536
 ANTHROPIC_CONTENT_MARKERS = (b"content_block_delta", b"content_block_start")
 
 
-async def _anthropic_refusal_lookahead(r) -> Tuple[Optional[bytes], bool]:
+async def _anthropic_refusal_lookahead(r, stop: Optional[Callable[[], bool]] = None) -> Tuple[Optional[bytes], bool]:
     """(buffered head, refused) for a streamed Anthropic leg 2.
 
     Q0-B, measured 2026-09-09 on boot weg2sn5m: ``_first_stream_chunk`` above
@@ -1840,7 +1871,9 @@ async def _anthropic_refusal_lookahead(r) -> Tuple[Optional[bytes], bool]:
     """
     head = bytearray()
     for _ in range(ANTHROPIC_LOOKAHEAD_MAX_CHUNKS):
-        chunk = await _first_stream_chunk(r)
+        # ROS: ``stop`` given = the read is watched for D's hold (see
+        # _read_chunk_watched); None = the one-__anext__ read, as before.
+        chunk = await (_first_stream_chunk(r) if stop is None else _read_chunk_watched(r, stop))
         if chunk is None:
             break
         head.extend(chunk)
@@ -3508,6 +3541,11 @@ class Front:
             self._rvp_dir = _rvp.needs_p_dir(getattr(self, "tag", "") or "") if _rvp.enabled() else ""
             self._rvp_p_done: Dict[str, Tuple[float, float]] = {}
             self._front_price: Dict[str, int] = {}
+            # ROS: rids whose leg-2 stream is still in the lookahead (nothing
+            # committed to the client), and the held ones the lookahead must
+            # answer with X-REQUEUE.
+            self._leg2_lookahead: Set[str] = set()
+            self._rvp_requeue: Dict[str, dict] = {}
 
     def _note_front_price(self, rid: str, uncached: int) -> None:
         """The front's route-time price of a rid, for the W50-REROUTE line."""
@@ -3528,6 +3566,17 @@ class Front:
             rid = str(r.get("rid") or "")
             ids = [int(t) for t in (r.get("input_ids") or ())]
             if not rid or not ids:
+                continue
+            if rid in self._leg2_lookahead and _rvp.open_stream_enabled():
+                # ROS: D holds a stream the front has NOT committed yet (no
+                # byte reached the client): the old X-REQUEUE answers it, from
+                # the lookahead that holds the leg (no P-only leg here).
+                self._rvp_requeue[rid] = r
+                self.counters["rvp_uncommitted_requeue"] += 1
+                logger.warning(
+                    "WEG2 W50-REROUTE rid=%s front_price=%s d_extent=%d reason=%s path=held-uncommitted "
+                    "-- D holds the stream, no byte reached the client yet: X-REQUEUE as a fresh refusal",
+                    rid, self._front_price.get(rid, "?"), int(r.get("d_extent") or 0), r.get("reason", "?"))
                 continue
             payload = {"rid": rid, "input_ids": ids,
                        "sampling_params": {"max_new_tokens": 1, "temperature": 0.0}}
@@ -3560,6 +3609,30 @@ class Front:
             p.fut.set_result(None)
         logger.info("RESUME-VIA-P p-done rid=%s p_ms=%.0f (reroute -> P prefill done, flips "
                     "included) tokens=%d", p.rid, p_ms, int(p.est_prompt))
+
+    def _ros_lookahead_begin(self, rid: str) -> Optional[Callable[[], bool]]:
+        """ROS: register ``rid``'s leg-2 lookahead (nothing committed to the
+        client yet); returns the lookahead's stop test, or None when ROS or
+        RESUME-VIA-P is off (the old reads, byte for byte)."""
+        if not (_rvp.enabled() and _rvp.open_stream_enabled()):
+            return None
+        self._rvp_state()
+        if not self._rvp_dir:
+            return None
+        self._leg2_lookahead.add(rid)
+
+        def _stop() -> bool:
+            if rid not in self._rvp_requeue:
+                self._rvp_take()  # one scandir; D's hold lands within a poll
+            return rid in self._rvp_requeue
+
+        return _stop
+
+    def _ros_lookahead_end(self, rid: str) -> Optional[dict]:
+        """ROS: the lookahead is over (the next statement commits or re-routes):
+        unregister and return D's held record for ``rid``, if one came."""
+        self._leg2_lookahead.discard(rid)
+        return self._rvp_requeue.pop(rid, None)
 
     def _rvp_resumed(self, rid: str) -> None:
         rec = self._rvp_p_done.pop(rid, None)
@@ -5993,12 +6066,36 @@ class Front:
                     # (measured, boot weg2sn5m). Read to the first CONTENT
                     # event instead, bounded; everything read is forwarded
                     # verbatim below.
-                    if request.path == "/v1/messages":
-                        first_chunk, _refused = await _anthropic_refusal_lookahead(r)
-                    else:
-                        first_chunk = await _first_stream_chunk(r)
-                        _refused = first_chunk is not None and x_refusal_marker_in(
-                            first_chunk.decode(errors="replace")
+                    # ROS (weg2/resume_via_p.py ENV_OPEN_STREAM): D holds EVERY
+                    # streamed refusal; while this lookahead runs nothing has
+                    # reached the client, so a hold seen here is answered with
+                    # the X-REQUEUE a fresh refusal gets. None = the old reads.
+                    _ros_stop = self._ros_lookahead_begin(rid)
+                    try:
+                        if request.path == "/v1/messages":
+                            first_chunk, _refused = await _anthropic_refusal_lookahead(r, _ros_stop)
+                        elif _ros_stop is None:
+                            first_chunk = await _first_stream_chunk(r)
+                            _refused = first_chunk is not None and x_refusal_marker_in(
+                                first_chunk.decode(errors="replace")
+                            )
+                        else:
+                            first_chunk = await _read_chunk_watched(r, _ros_stop)
+                            _refused = first_chunk is not None and x_refusal_marker_in(
+                                first_chunk.decode(errors="replace")
+                            )
+                    except _RosHeld:
+                        first_chunk, _refused = None, False
+                    finally:
+                        _ros_rec = self._ros_lookahead_end(rid) if _ros_stop is not None else None
+                    if _ros_rec is not None:
+                        # held while uncommitted (also when the lookahead ended
+                        # in the same tick): the refusal D would have sent.
+                        self.counters["W50_stream_held_requeued"] += 1
+                        g.outstanding.pop(rid, None)
+                        return await self._requeue_after_x_refusal(
+                            request, rid, payload, text, stream, pending, seat,
+                            _rvp.held_refusal_body(_ros_rec),
                         )
                     if _refused:
                         self.counters["W50_stream_inband_requeued"] += 1
