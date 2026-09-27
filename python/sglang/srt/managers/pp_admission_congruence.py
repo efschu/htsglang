@@ -243,7 +243,7 @@ def pp_row_authority_enabled(scheduler) -> bool:
     return ps is not None and getattr(ps, "pp_size", 1) > 1
 
 
-def pp_row_carrier_present(scheduler) -> bool:
+def pp_row_carrier_present(scheduler, term=None) -> bool:
     """#973: does a carrier deliver PP0's admission decision to the followers
     in the SAME pass, so that they execute it instead of forming an opinion?
 
@@ -270,6 +270,15 @@ def pp_row_carrier_present(scheduler) -> bool:
     """
     if not pp_row_authority_enabled(scheduler):
         return False
+    # Fix B (weg2/p_row_authority.py): on the re-armed P row form the carrier
+    # exists for the FOLLOWERS (their frame probe keys on the counters), but
+    # every PP0 term answers its own switch, default off, and no term = False
+    # -- the told carrier stays armed.
+    from sglang.srt.weg2 import p_row_authority as _prow
+
+    _split = _prow.carrier_for(scheduler, term)
+    if _split is not None:
+        return _split
     return getattr(scheduler, "pp_flip_counters", None) is not None
 
 
