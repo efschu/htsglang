@@ -7847,6 +7847,65 @@ def _argv_scalar(extra: str, flag: str):
     return gefunden
 
 
+def yarn_context_tokens(override_json) -> Optional[int]:
+    """YaRN x2 (27.09.): the context a YaRN rope override stretches the model
+    to -- ``original_max_position_embeddings x factor`` of a ``rope_type``
+    ``yarn`` block in ``--json-model-override-args`` (in ``text_config`` or at
+    the top level, ``rope_parameters`` or ``rope_scaling``); None without one.
+    The runtime derives the same number (``get_context_length``)."""
+    if not override_json:
+        return None
+    try:
+        args = json.loads(override_json) if isinstance(override_json, str) else dict(override_json)
+    except (TypeError, ValueError):
+        return None
+    for scope in (args.get("text_config"), args):
+        if not isinstance(scope, dict):
+            continue
+        for key in ("rope_parameters", "rope_scaling"):
+            rope = scope.get(key)
+            if (isinstance(rope, dict) and rope.get("rope_type", rope.get("type")) == "yarn"
+                    and rope.get("original_max_position_embeddings") and rope.get("factor")):
+                return int(int(rope["original_max_position_embeddings"]) * float(rope["factor"]))
+    return None
+
+
+def group_context_tokens(ns, group: str) -> Tuple[int, str]:
+    """YaRN x2 (27.09.): the context group ``group`` ('p'/'d') is launched
+    with, and where it comes from. argparse keeps the LAST ``--context-length``
+    and the group's ``--extra-*`` follows the common flags
+    (``CONTEXT_LENGTH_TOKENS``), so an extra value is the group's; without one
+    a YaRN override in the extra stretches it; else the rig's common value."""
+    extra = getattr(ns, f"extra_{group}", "") or ""
+    raw = _argv_scalar(extra, "--context-length")
+    if raw is not None:
+        try:
+            return int(raw), f"--extra-{group} --context-length"
+        except ValueError:
+            pass
+    yarn = yarn_context_tokens(_argv_scalar(extra, "--json-model-override-args"))
+    if yarn:
+        return yarn, f"--extra-{group} YaRN override (original x factor)"
+    return CONTEXT_LENGTH_TOKENS, "CONTEXT_LENGTH_TOKENS"
+
+
+def group_kv_tokens(ns, group: str) -> Tuple[int, str]:
+    """YaRN x2 (27.09.): the KV tokens the form of group ``group`` must hold
+    -- its context (#77: the whole context is the duty), or its
+    ``--max-total-tokens`` pool where that is larger. Replaces the fixed
+    CONTEXT_LENGTH_TOKENS of the D solve: a 524288 form priced at 262144
+    'fitted' by 3.5 GiB on TP0 it does not have."""
+    ctx, src = group_context_tokens(ns, group)
+    raw = _argv_scalar(getattr(ns, f"extra_{group}", "") or "", "--max-total-tokens")
+    try:
+        pool = int(raw) if raw is not None else 0
+    except ValueError:
+        pool = 0
+    if pool > ctx:
+        return pool, f"--extra-{group} --max-total-tokens (> context {ctx} from {src})"
+    return ctx, src
+
+
 def _argv_vector(extra: str, flag: str):
     """Der Komma-Vektor hinter ``flag`` in einer ``--extra-*``-Zeichenkette.
 
@@ -15847,6 +15906,12 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     _kv_cut = d_kv_token_cut(ns)
     _kv_cut_kw = ({} if _kv_cut is None else
                   dict(kv_token_shares=_kv_cut, kv_dtype_bytes=d_kv_dtype_bytes(ns)))
+    # YaRN x2 (27.09.): the KV duty is the D form's own context (#77), not
+    # the rig's fixed 262144 -- a 524288 form priced at 262144 "fitted".
+    _d_kv, _d_kv_src = group_kv_tokens(ns, "d")
+    if _d_kv != CONTEXT_LENGTH_TOKENS:
+        log(f"{D_RANK_SOLVE_MARKER} {label} KV-PFLICHT {_d_kv} Token aus {_d_kv_src} "
+            f"(statt {CONTEXT_LENGTH_TOKENS}): der KV-Posten jedes Rangs ist damit bepreist")
     try:
         plan = _er.plan_d_residency(
             model_path=ns.model,
@@ -15857,7 +15922,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             rank_tp_ratio=",".join(tp_ratio),
             env_d=_env_d,
             reference_logs=ns.d_residency_reference_logs,
-            kv_tokens=CONTEXT_LENGTH_TOKENS,
+            kv_tokens=_d_kv,
             label=label,
             marker=D_RANK_SOLVE_MARKER,
             # H33: die KARTEN-Bilanz (Posten ausserhalb des Budgets, W130).
@@ -15899,7 +15964,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                     rank_tp_ratio=",".join(tp_ratio),
                     env_d=_env_d,
                     reference_logs=ns.d_residency_reference_logs,
-                    kv_tokens=CONTEXT_LENGTH_TOKENS,
+                    kv_tokens=_d_kv,
                     label=label,
                     marker=D_RANK_SOLVE_MARKER,
                     card_reference_logs=getattr(ns, "d_card_reference_logs", "") or "",
@@ -15963,7 +16028,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             rank_tp_ratio=",".join(tp_ratio),
             env_d=_env_d,
             reference_logs=ns.d_residency_reference_logs,
-            kv_tokens=CONTEXT_LENGTH_TOKENS,
+            kv_tokens=_d_kv,
             label=label,
             marker=D_RANK_SOLVE_MARKER,
             card_reference_logs=getattr(ns, "d_card_reference_logs", "") or "",
@@ -16623,7 +16688,7 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
     # volle Kontext (262144, NF-Pflicht). Das Chunk-Wachstum SAETTIGT
     # (fnFL2x160: nach Chunk 3, gemessen ueber 16 Chunks), also ist die
     # 262k-Kante die 97k-Kante. LMEM des Run-Writes: 0 mit dem H47-Fix.
-    prompt = int(getattr(ns, "p_card_prompt_tokens", 0) or 0) or CONTEXT_LENGTH_TOKENS
+    prompt = int(getattr(ns, "p_card_prompt_tokens", 0) or 0) or group_context_tokens(ns, "p")[0]
     lmem_fixed = _p_card.arena_write_lmem_fixed()
     # #242r: ein anderer Schnitt als der gemessene wird UMGERECHNET (K0 je
     # Stufe um Dense und Mamba der wandernden Layer); geht das nicht, VERWEIGERT

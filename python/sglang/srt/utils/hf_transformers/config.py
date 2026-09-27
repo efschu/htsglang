@@ -42,6 +42,43 @@ from .common import (
 from .mistral_utils import is_mistral_model, load_mistral_config
 
 
+def apply_model_override_args(config, overrides: dict) -> None:
+    """``--json-model-override-args`` onto a loaded config.
+
+    Top-level keys as ``PretrainedConfig.update`` always set them (setattr) --
+    except a dict for a key whose current value is a SUB-CONFIG (``text_config``
+    of a multimodal wrapper): ``update`` replaced that config object by a plain
+    dict, so a nested override broke the text model instead of reaching it
+    (YaRN x2, 27.09.: ``{"text_config": {"rope_parameters": {...}}}``). A
+    sub-config is merged key by key, and inside it a dict for a dict-valued
+    attribute (``rope_parameters``) is merged too, so a partial override
+    (``rope_type``/``factor``/``original_max_position_embeddings``) keeps its
+    neighbours (``mrope_section``, ``mrope_interleaved``,
+    ``partial_rotary_factor``, ``rope_theta``)."""
+    plain = {}
+    for key, val in overrides.items():
+        cur = getattr(config, key, None)
+        if isinstance(val, dict) and isinstance(cur, PretrainedConfig):
+            _merge_into_sub_config(cur, val)
+        else:
+            plain[key] = val
+    if plain:
+        config.update(plain)
+
+
+def _merge_into_sub_config(sub, overrides: dict) -> None:
+    for key, val in overrides.items():
+        cur = getattr(sub, key, None)
+        if isinstance(val, dict) and isinstance(cur, PretrainedConfig):
+            _merge_into_sub_config(cur, val)
+        elif isinstance(val, dict) and isinstance(cur, dict):
+            merged = dict(cur)
+            merged.update(val)
+            setattr(sub, key, merged)
+        else:
+            setattr(sub, key, val)
+
+
 def _set_architectures(config, arch_name):
     config.update({"architectures": [arch_name]})
 
@@ -295,7 +332,7 @@ def get_config(
     )
 
     if model_override_args:
-        config.update(model_override_args)
+        apply_model_override_args(config, model_override_args)
 
     if is_gguf:
         if gguf_bespoke_arch is not None:
