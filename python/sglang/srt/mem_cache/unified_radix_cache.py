@@ -3354,7 +3354,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.cache_controller is not None
                 and self.cache_controller.write_policy == "write_back"
             ):
-                written = self.write_backup(node, write_back=True)
+                # P-FUND (rc12k 10:51:00, PP0, weg2-10-53 16384 @32768): the
+                # admission counts every unlocked device token as fundable
+                # (common.fundable_extend_tokens), and this peel is what has
+                # to pay it. With the mamba host arena full (32 slots,
+                # MAMBA-ARENA end_anchor=refused on four finished rids) every
+                # leaf's backup was refused ONLY for its mamba anchor, the
+                # return below freed nothing, 226048 "evictable" tokens stayed
+                # on the card and the 16384-token extend raised. The KV has a
+                # host slot; the anchor is what does not fit -- so under
+                # eviction the node goes down KV-only and loses just the
+                # anchor (a later match resumes at a shallower anchor, the
+                # same state as a node that never carried one).
+                written = self.write_backup(
+                    node, write_back=True, kv_only_if_mamba_refused=True
+                )
                 if written == 0 and self.ongoing_write_through:
                     # #1426 (xsn184/185/186): upstream's write-back eviction is
                     # SYNCHRONOUS -- the host has room because the acks that
@@ -3366,7 +3380,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # then try once more. A second zero is a real wall and is
                     # reported by the caller's under-delivery check.
                     self.writing_check(write_back=True)
-                    written = self.write_backup(node, write_back=True)
+                    written = self.write_backup(
+                        node, write_back=True, kv_only_if_mamba_refused=True
+                    )
                 if written == 0:
                     return
                 self.writing_check(write_back=True)
@@ -3469,8 +3485,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             except Exception:  # noqa: BLE001
                 pass
 
-    def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
-        """Backup a node's data from device to host (D->H)."""
+    def _pfund_note_kv_only(self, node) -> None:
+        """P-FUND: an eviction backed a node up KV-only because the mamba
+        arena refused its anchor. Counted and sampled like #1421, so a boot
+        says how many anchors the peel gave up to keep its promise."""
+        n = getattr(UnifiedRadixCache, "_pfund_kv_only_n", 0) + 1
+        UnifiedRadixCache._pfund_kv_only_n = n
+        if n <= 24 or n % 256 == 0:
+            logger.warning(
+                "P-FUND EVICT KV-ONLY n=%d node=%s tokens=%d rid=%s end_anchor=%s "
+                "(mamba arena refused the anchor; the eviction frees the node's "
+                "KV rows to the host tier without it)",
+                n, getattr(node, "id", "?"), len(getattr(node, "key", []) or []),
+                getattr(node, "weg2_anchor_rid", None),
+                bool(getattr(node, "_weg2_end_anchor", False)),
+            )
+
+    def write_backup(
+        self,
+        node: UnifiedTreeNode,
+        write_back: bool = False,
+        kv_only_if_mamba_refused: bool = False,
+    ) -> int:
+        """Backup a node's data from device to host (D->H).
+
+        ``kv_only_if_mamba_refused`` (eviction only, P-FUND): a refused mamba
+        arena claim drops the node's anchor from this backup instead of
+        refusing the node, so the eviction that needs the node's KV rows
+        actually frees them."""
         if self.cache_controller is None:
             return 0
 
@@ -3592,9 +3634,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # slot -- claim one per page and DMA straight into it. No staging
         # row, no ring, no store thread, no rebind. The mamba/draft aux
         # pools still follow their own paths (extra_pools below).
-        _pre = self._weg2_direct_claim(node, comp_xfers)
+        _pre = self._weg2_direct_claim(
+            node, comp_xfers, kv_only_if_mamba_refused=kv_only_if_mamba_refused
+        )
         if _pre is False:
             return 0
+        if ComponentType.MAMBA not in comp_xfers and sidecar_xfers:
+            # P-FUND: the claim dropped the anchor; a sidecar indexed by it
+            # has no source rows either.
+            sidecar_xfers = [
+                x for x in sidecar_xfers
+                if getattr(x, "indices_from_pool", None) != PoolName.MAMBA
+            ]
         host_avail = 0 if _pre is not None else uniform_host_avail_for_backup(
             self, self.cache_controller.mem_pool_host
         )
@@ -3845,10 +3896,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if node is not None and node is not self.root_node and node.weg2_anchor_rid is None:
             node.weg2_anchor_rid = rid
 
-    def _weg2_direct_claim(self, node, comp_xfers=None):
+    def _weg2_direct_claim(self, node, comp_xfers=None, kv_only_if_mamba_refused=False):
         """None = not a direct-write pool (take the staging path); False =
         refused (counted); a tensor = the arena rows to write into. The
-        mamba transfer of `comp_xfers` (if any) gets its arena slot here too."""
+        mamba transfer of `comp_xfers` (if any) gets its arena slot here too;
+        with `kv_only_if_mamba_refused` a full mamba arena removes that
+        transfer from `comp_xfers` and the KV claim stands (P-FUND)."""
         pool = self._weg2_direct_pool()
         if pool is None:
             # #1430: on an arena boot the staging path no longer exists for
@@ -3867,25 +3920,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if pre is None:
             self._1421_refused("arena_claim", node)
             return False
-        mxfer = None
-        for xfers in (comp_xfers or {}).values():
+        mxfer = mct = None
+        for ct, xfers in (comp_xfers or {}).items():
             for x in xfers:
                 if x.name == PoolName.MAMBA and x.host_indices is None and x.device_indices is not None:
-                    mxfer = x
+                    mxfer, mct = x, ct
         if mxfer is not None:
             mp = self._weg2_mamba_pool()
             mrows = self._weg2_mamba_claim(node, mp, hashes[-1]) if mp is not None else None
-            if mrows is None:
+            if mrows is None and mp is not None and kv_only_if_mamba_refused:
+                # P-FUND: the eviction needs this node's KV rows; the anchor
+                # has no arena slot. The node goes down KV-only -- its mamba
+                # state is freed with the device rows, like a node that never
+                # carried an anchor.
+                comp_xfers.pop(mct, None)
+                self._pfund_note_kv_only(node)
+                mxfer = None
+            elif mrows is None:
                 pool.abort_write(pre)
                 _why = "mamba_claim" if mp is not None else "mamba_pool_unbound"
                 self._weg2_sweep_last_refusal = _why   # xsn342: the sweep stops on a full mamba arena
                 self._1421_refused(_why, node)
                 return False
-            mxfer.host_indices = mrows
-            pend = getattr(self, "_weg2_direct_mamba_rows", None)
-            if pend is None:
-                pend = self._weg2_direct_mamba_rows = {}
-            pend[node.id] = mrows
+            if mxfer is not None:
+                mxfer.host_indices = mrows
+                pend = getattr(self, "_weg2_direct_mamba_rows", None)
+                if pend is None:
+                    pend = self._weg2_direct_mamba_rows = {}
+                pend[node.id] = mrows
         cc = self.cache_controller
         dpool = getattr(cc, "mem_pool_host_draft", None)
         if (dpool is not None and getattr(dpool, "arena_read", False)

@@ -492,11 +492,13 @@ def _eviction_shortfall_note(tree_cache, asked: int, evicted: int) -> str:
         f"received {evicted}. The tree still reports {evictable} evictable "
         f"tokens.{_residency_withheld_note(allocator)} Since #681 the frontier "
         f"can pay every unlocked leaf it selects (mamba tombstone leaves "
-        f"included), so a shortfall here is NOT the tree failing to find "
-        f"victims -- it is something taking the freed slots between the tree "
-        f"and the pool. With no confiscator named above, treat it as a "
-        f"REGRESSION SIGNAL: a new class of node is being counted that the "
-        f"peel cannot consume."
+        f"included), and since P-FUND a write_back leaf whose mamba anchor "
+        f"has no arena slot goes down KV-only, so a shortfall here is NOT the "
+        f"tree failing to find victims. Look for #1421 BACKUP-REFUSED lines "
+        f"(a write_back leaf whose KV backup was refused stays on the device) "
+        f"and for something taking the freed slots between the tree and the "
+        f"pool. With neither named, treat it as a REGRESSION SIGNAL: a new "
+        f"class of node is being counted that the peel cannot consume."
     )
 
 
@@ -1317,7 +1319,13 @@ def alloc_paged_token_slots_extend(
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+    # P-FUND: the receipt, measured at the pool like alloc_token_slots (#790).
+    # rc12k 10:51:00 raised here with "226048 evictable" in the message and
+    # no word that the eviction in between had freed nothing.
+    payable_before = payable_size(allocator)
     evict_from_tree_cache(tree_cache, num_tokens)
+    delivered = max(0, payable_size(allocator) - payable_before)
+    evict_asked = max(0, num_tokens - payable_before)
 
     state = None
     if backup_state:
@@ -1422,6 +1430,7 @@ def alloc_paged_token_slots_extend(
             f"Prefill out of memory. Try to lower your batch size.\n"
             f"Try to allocate {extend_num_tokens} tokens.\n"
             f"{available_and_evictable_str(tree_cache)}"
+            f"{_eviction_shortfall_note(tree_cache, evict_asked, delivered)}"
         )
         logger.error(error_msg)
         if tree_cache is not None:
