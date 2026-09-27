@@ -1825,6 +1825,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             register_holder_census(self.weg2_arena_holder_census)
         except Exception:  # noqa: BLE001 - an instrument never blocks the init
             logger.warning("#1424e ARENA-REF-HOLDERS provider not registered", exc_info=True)
+        try:
+            # #248 PARK-DEMOTE: group D's attention rank 0 (the one real store
+            # backend of the group) copies the kept spans to L3 in the
+            # background; never a scheduler thread.
+            _cc248 = getattr(self, "cache_controller", None)
+            if (os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() == "D":
+                from sglang.srt.weg2 import handoff_pending as _hp248
+
+                for _p248 in self._weg2_arena_pools().values():
+                    _hp248.register_pool(_p248)  # keep_state (PA's partial park)
+            if ((os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() == "D"
+                    and _cc248 is not None and int(getattr(_cc248, "tp_rank", 0) or 0) == 0
+                    and self._weg2_arena_pools()):
+                from sglang.srt.weg2 import park_demote as _pd
+
+                _pd.start(_cc248.storage_backend, lambda t=weakref.ref(self): list(
+                    (t()._weg2_arena_pools() if t() is not None else {}).values()))
+        except Exception:  # noqa: BLE001 - the demoter never blocks the init
+            logger.warning("#248 PARK-DEMOTE not started", exc_info=True)
         # #1424g: this process's trees whose holders the reset's orphan pass
         # names (one per scheduler process; weak, a tree is never kept alive)
         self._weg2_orphan_sweep_armed = True
@@ -8948,6 +8967,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         _r12.worker_keeps(self, "load-back", node)
                     else:
                         self._weg2_release_chain_piece_host(node)
+                # #248 (+ #249): the span is on the device now -- its arena
+                # host rows go (weg2.park_l3.release_loaded_host); the page
+                # stays COMPLETE in the arena, and TP0's STATE verdict takes
+                # the Form A workers' byteless mirror rows with it
+                try:
+                    from sglang.srt.weg2 import park_l3 as _pl3
+
+                    _pl3.release_loaded_host(self, node)
+                except Exception:  # noqa: BLE001 -- a kept host row is the old path
+                    logger.warning("#248 LOADED-HOST-RELEASE failed", exc_info=True)
             finish_count -= 1
 
     def _staging_host_role(self) -> bool:

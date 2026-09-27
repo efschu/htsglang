@@ -1719,7 +1719,13 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         #243: the pages of a P hand-off still waiting for its D seat go LAST
         (``handoff_pending``: kept by order, not by reference) -- a first pass
         passes over them, a second pass takes them only when nothing else is
-        left, and every rid that lost pages that way is named (HANDOFF-LOST)."""
+        left, and every rid that lost pages that way is named (HANDOFF-LOST).
+
+        #248: three stages, still without I/O. (i) unreferenced and kept by
+        nobody; (ii) kept (a hand-off or a D park) WITH an L3 copy -- the D
+        demoter wrote it in the background, the page is not lost, the read
+        takes it back from disk (arena_fill_from_disk); (iii) kept WITHOUT a
+        copy -- named HANDOFF-LOST / PARK-LOST. ARENA-DROP names the stages."""
         need = int(need)
         if need <= 0:
             return 0
@@ -1728,16 +1734,30 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
             logger.warning("#243 HANDOFF-PENDING keep list unavailable", exc_info=True)
             keep = None
+        stages = [0, 0, 0]
         try:
             if keep is not None and len(keep):
-                cands = arena.evict_candidates(need, keep_lo=keep.keys)
+                # (i) unreferenced, kept by nobody
+                cands = list(arena.evict_candidates(need, keep_lo=keep.keys))
+                stages[0] = len(cands)
                 if len(cands) < need:
+                    # (ii) #248: kept, WITH an L3 copy -- freed without I/O,
+                    # the copy is the page (arena_fill_from_disk reads it back)
+                    copied = _handoff_pending.copied_mask(self, keep)
+                    if copied.any():
+                        mid = arena.evict_candidates(need - len(cands), keep_lo=keep.keys[~copied])
+                        stages[1] = len(mid)
+                        cands += list(mid)
+                if len(cands) < need:
+                    # (iii) kept, WITHOUT a copy: lost, by name
                     last = arena.evict_candidates(need - len(cands))
                     if last:
+                        stages[2] = len(last)
                         _handoff_pending.note_evicted(self, last, keep, need=need)
-                        cands = list(cands) + list(last)
+                        cands += list(last)
             else:
                 cands = arena.evict_candidates(need)
+                stages[0] = len(cands)
             if cands:
                 arena.free_slots([c[0] for c in cands])
                 stems = getattr(arena, "_stems", None)
@@ -1756,15 +1776,19 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             # the evicted slots' key128 low words (hex; key128 = blake2b-16 of
             # the store stem, hicache_arena.key128), `claim` the first stem of
             # the claim that needed the room. The keys are already in hand.
-            logger.info("#1427 ARENA-DROP n=%d need=%d freed=%d slot_bytes=%d trace=1 "
+            logger.info("#1427 ARENA-DROP n=%d need=%d freed=%d stages=i:%d,ii:%d,iii:%d slot_bytes=%d trace=1 "
                         "claim=%s dropped=%s (claim-time room without disk I/O -- H81)",
-                        k, need, len(cands), int(getattr(arena, "slot_bytes", 0) or 0),
+                        k, need, len(cands), stages[0], stages[1], stages[2],
+                        int(getattr(arena, "slot_bytes", 0) or 0),
                         (str(claim_stem)[:80] if claim_stem else "-"),
                         ",".join("%016x" % (int(c[1]) & 0xFFFFFFFFFFFFFFFF) for c in cands))
-        elif k <= 8 or k % 256 == 0:
-            logger.info("#1427 ARENA-DROP n=%d need=%d freed=%d slot_bytes=%d (claim-time room "
-                        "without disk I/O -- H81, user rule 24.09.: no copy in the compute path)",
-                        k, need, len(cands), int(getattr(arena, "slot_bytes", 0) or 0))
+        elif k <= 8 or k % 256 == 0 or stages[1] or stages[2]:
+            # #248: stage ii (kept, L3 copy, freed without I/O) and stage iii
+            # (kept, no copy, named lost) are always spoken
+            logger.info("#1427 ARENA-DROP n=%d need=%d freed=%d stages=i:%d,ii:%d,iii:%d slot_bytes=%d "
+                        "(claim-time room without disk I/O -- H81, user rule 24.09.: no copy in the "
+                        "compute path)", k, need, len(cands), stages[0], stages[1], stages[2],
+                        int(getattr(arena, "slot_bytes", 0) or 0))
         return len(cands) + len(reaped)
 
     def _claim(self, stems):
