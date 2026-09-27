@@ -223,7 +223,7 @@ function prefillTile(b, g, color, label, binders, now) {
     <div class="state">${state}</div>
     ${kv([
       ["Rechenrate je Rang (gpu-ms)", ranks],
-      ["Tokens / Chunks im Fenster", src ? `${fmt(src.tokens)} / ${fmt(src.chunks)}` : "—"],
+      [active ? "Tokens / Chunks im Fenster" : "Tokens / Chunks im letzten Schub", src ? `${fmt(src.tokens)} / ${fmt(src.chunks)}` : "—"],
       ["mittl. Chunk &middot; aus Cache", src ? `${fmt(src.mean_chunk)} &middot; ${fmt(src.cached)}` : "—"],
       ["Warteschlange &middot; ausstehende Tokens", `${fmt(p.queue)} &middot; ${fmt(p.pending_tok)}`],
       src && src.wall_confounded_tps != null ? ["input throughput (wall-konfundiert)", fmt(src.wall_confounded_tps), "wc"] : null,
