@@ -756,7 +756,9 @@ def fundable_extend_tokens(tree_cache) -> int:
     except Exception:  # noqa: BLE001 - an admission gate must not raise
         return 0
     try:
-        evictable = int(tree_cache.evictable_size())
+        # ED (rc12o b1): what the peel can pay, where the cache can say it.
+        _dev = getattr(tree_cache, "deliverable_evictable_size", None)
+        evictable = int(_dev() if callable(_dev) else tree_cache.evictable_size())
     except Exception:  # noqa: BLE001 - a cache without the accessor evicts none
         evictable = 0
     return max(0, avail) + max(0, evictable)

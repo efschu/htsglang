@@ -1162,9 +1162,12 @@ class PrefillAdder:
                 + self.tree_cache.full_evictable_size()
             )
         elif self.is_hybrid_ssm_cache:
+            # ED (rc12o b1): the peel's deliverable count, not the reported one
+            # (mamba-locked nodes and their ancestors are counted but unpeelable).
+            _dev = getattr(self.tree_cache, "deliverable_evictable_size", None)
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
+                + (_dev() if _dev is not None else self.tree_cache.full_evictable_size())
             )
         else:
             available_and_evictable = (
@@ -1222,9 +1225,12 @@ class PrefillAdder:
                 + self.tree_cache.full_evictable_size()
             )
         elif self.is_hybrid_ssm_cache:
+            # ED (rc12o b1): the peel's deliverable count, not the reported one
+            # (mamba-locked nodes and their ancestors are counted but unpeelable).
+            _dev = getattr(self.tree_cache, "deliverable_evictable_size", None)
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
+                + (_dev() if _dev is not None else self.tree_cache.full_evictable_size())
             )
         else:
             available_and_evictable = (

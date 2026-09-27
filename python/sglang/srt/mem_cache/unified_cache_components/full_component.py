@@ -188,6 +188,22 @@ class FullComponent(TreeComponent):
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
         request = params.num_tokens
+        ct = self.component_type
+        self._peel(request, tracker)
+        # EF (27B rc12o b1, mem_cache/evict_frontier_census.py): the peel ended
+        # short while the tree still reports evictable tokens -- re-derive leaf
+        # membership once, retry, and name what is not on the frontier.
+        if tracker[ct] < request:
+            from sglang.srt.mem_cache import evict_frontier_census as _ef
+
+            reported = int(self.cache.component_evictable_size_.get(ct, 0) or 0)
+            if _ef.enabled() and reported > 0 and hasattr(self.cache, "_collect_all_nodes"):
+                got = tracker[ct]
+                census = _ef.census_and_repair(self.cache, ct)
+                self._peel(request, tracker)
+                _ef.log_census(census, request, got, tracker[ct], reported)
+
+    def _peel(self, request: int, tracker: dict[ComponentType, int]) -> None:
         heap = [
             (self.cache.eviction_strategy.get_priority(n), n)
             for n in self.cache.evictable_device_leaves
