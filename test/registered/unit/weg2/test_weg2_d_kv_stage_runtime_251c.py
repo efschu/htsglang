@@ -207,6 +207,33 @@ def test_the_pool_is_the_top_stage_and_the_budget_must_hold_s0():
             dsv.kv_stage_pool_tokens(63)
 
 
+def test_a_draft_pool_takes_the_stage_form_only_with_the_targets_slot_ids():
+    """Review 28.09. (#251c note (c)): only the TARGET allocator is capped to
+    S0; a draft sized at the top stage is sound only while it writes at the
+    target's slot ids (MTP/EAGLE). A draft with its own allocator (DFlash solo
+    host) is refused by name, never silently handed ids above S0."""
+    with _Ctx(_env()):
+        assert dsv.kv_stage_pool_tokens(100, is_draft_worker=True) == 192
+        assert dsv.kv_stage_pool_tokens(100, is_draft_worker=True, draft_shares_slots=True) == 192
+        with pytest.raises(dsv.Weg2DSeatVramRefused, match="own allocator"):
+            dsv.kv_stage_pool_tokens(100, is_draft_worker=True, draft_shares_slots=False)
+        # the target is unaffected by the draft flag default
+        assert dsv.kv_stage_pool_tokens(100, draft_shares_slots=False) == 192
+    with _Ctx(_env() + [__import__("sglang.srt.environ", fromlist=["envs"]).envs.SGLANG_OPT_WEG2_D_SEAT_VRAM.override(False)]):
+        # form off: a solo-host draft keeps its own number, no refusal
+        assert dsv.kv_stage_pool_tokens(100, is_draft_worker=True, draft_shares_slots=False) == 100
+
+
+def test_the_kv_mixin_passes_the_draft_role_and_the_solo_host():
+    import inspect
+
+    from sglang.srt.model_executor import model_runner_kv_cache_mixin as mx
+
+    src = inspect.getsource(mx)
+    assert 'is_draft_worker=bool(getattr(self, "is_draft_worker", False))' in src
+    assert 'draft_shares_slots=not bool(getattr(self, "is_draft_solo_host", False))' in src
+
+
 # ---- (2) born trimmed -----------------------------------------------------------
 
 def test_a_kv_tensor_is_born_with_only_s0s_pages():

@@ -7889,7 +7889,11 @@ class ModelRunnerKVCacheMixin:
         from sglang.srt.weg2 import d_seat_vram as _dsv
 
         max_tokens = _dsv.kv_stage_pool_tokens(
-            max_tokens, is_form_a_worker=bool(getattr(self, "is_form_a_worker", False))
+            max_tokens, is_form_a_worker=bool(getattr(self, "is_form_a_worker", False)),
+            is_draft_worker=bool(getattr(self, "is_draft_worker", False)),
+            # MTP/EAGLE drafts write at the target's slot ids; the DFlash solo
+            # host keeps its own allocator (see kv_stage_pool_tokens)
+            draft_shares_slots=not bool(getattr(self, "is_draft_solo_host", False)),
         )
         if max_tokens != config.max_total_num_tokens:
             config = configurator.calculate_pool_sizes_from_max_tokens(
