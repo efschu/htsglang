@@ -8242,8 +8242,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self.dec_host_lock_ref(node, lock_params)
                     if _parts is not None:
                         _tn1 = time.perf_counter()
-                    if self._weg2_rebind_host_to_arena(node):
-                        pass  # #1424: the rows now ARE the arena slots
+                    # #239 S4b part 4: under the token cut a worker's rows are
+                    # the page's bytes and TP0 (share 0) writes nothing -- the
+                    # page is complete only when every owner wrote. A worker
+                    # keeps its rows until TP0's verdict; TP0 rebinds a
+                    # complete page (REBIND) or waits for it.
+                    _cut = _r12.cut_role()
+                    if _cut == "worker":
+                        _r12.worker_keeps(self, "store-ack-cut", node)
+                    elif self._weg2_rebind_host_to_arena(node):
+                        # #1424: the rows now ARE the arena slots
+                        if _cut == "host":
+                            _r12.record_rebind(self, node)
+                    elif _cut == "host" and _r12.await_complete(
+                        self, node,
+                        fallback_transit=bool(getattr(node, "_weg2_chain_piece", False)
+                                              or self._weg2_host_is_transit()),
+                    ):
+                        pass
                     elif getattr(node, "_weg2_chain_piece", False) or self._weg2_host_is_transit():
                         # R12: the host life of a node is TP0's decision on
                         # every rank of a Form A group. A worker keeps its
