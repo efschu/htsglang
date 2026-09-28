@@ -313,3 +313,54 @@ def test_admit_before_the_request_reaches_the_follower_registers_at_intake(monke
     assert m.admission(s, r, lambda k, x: None) is None  # no Admit yet
     m.follower_absorb(s, [m.Weg2StoreAdmit("aaaa-told", 100_000)])
     assert m.admission(s, r, lambda k, x: None) == 100_000
+
+
+# --------------------------------------------------------------------------
+# #57 (NF rc12v dkrnfh91dprsabar1dauer09272047, 4c866d534a): told=1728 paced for
+# 8.5-8.9 s. PP0 20:53:48 "#1442 HANDOFF-KEYS REG rid='weg2-1-10' matched=1728
+# new=43917", 20:53:55 "PACED-TOLD rid=weg2-1-1 told=1728 own_read=6.82s
+# window=8.52s", 20:54:04 "PACED-ADMIT ... waited=9.68s"; weg2-0-6 head=2496
+# told=1728 window=4.14s; followers "#1400 FOLLOWER SATISFIED LOCALLY ...
+# local_prefix=2496: nothing to read". own_read is PP0's intake-to-poll time
+# (its passes ran 16k-token chunks), not a read, and the told lay entirely in
+# PP0's registered head: there was nothing for any follower to read.
+# --------------------------------------------------------------------------
+
+
+def test_window_is_zero_when_the_told_lies_in_the_registered_head():
+    assert m.pace_read_tokens(1728, head=1728, absolute=True) == 0
+    assert m.pace_read_tokens(1728, head=2496, absolute=True) == 0
+    assert m.pace_window_s(6.82, m.pace_read_tokens(1728, head=1728, absolute=True)) == 0.0
+    # beyond the head only the rest is read (absolute told)
+    assert m.pace_read_tokens(60416, head=1728, absolute=True) == 58688
+    # a span-relative told IS the read span, the head is not subtracted
+    assert m.pace_read_tokens(1728, head=1728, absolute=False) == 1728
+
+
+def test_paced_told_inside_pp0_head_admits_without_a_window(monkeypatch):
+    """PP0's own read ran long (its pass loop), the told sits in the head:
+    the Admit follows the read-ahead in the next pass, not 1.25 x 6.8 s later."""
+    monkeypatch.setenv(m.ENV_ABSOLUTE, "1")
+    ring = _Ring(monkeypatch, {"aaaa-told": 1728, "bbbb-fresh": 0}, _read_s(pp0_s=6.82, follower_s=0.0))
+
+    def _headed(stage):
+        def _prefetch_kvcache(req, rematch=True, limit_tokens=None):
+            # the registration matched 1728 tokens on the device (head); the
+            # store read of the rest runs (6.82 s on PP0's pass clock) and
+            # finds nothing beyond it
+            req._prefetch_registered_prefix_len = 1728
+            stage.tree_cache.start_read(req.rid, 0, stage.read_s[req.rid])
+            return "issued"
+        return _prefetch_kvcache
+
+    for s in ring.stages:
+        s._prefetch_kvcache = _headed(s)
+        # the real tree's record the absolute told writes back (#1416b)
+        s.tree_cache._prefetch_completed_tokens = s.tree_cache.completed
+    ring.arrive("aaaa-told")
+    ring.run(400)
+    a = ring.plans("aaaa-told")
+    assert a[0] == a[1] == a[2] and len(a[0]) == 1
+    admit_pass = a[0][0][0]
+    # read-ahead at ~6.82 s; the Admit within a few passes, not at +8.5 s
+    assert admit_pass * DT < 6.82 + 0.5, admit_pass * DT
