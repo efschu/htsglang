@@ -736,6 +736,14 @@ def this_rank_follows() -> bool:
     return this_rank_is_form_a_worker()
 
 
+def _worker_holds_kv() -> bool:
+    """#239 S4b (F14): this Form A worker owns token rows under the token cut
+    (real KV bytes in its own arena). False everywhere else."""
+    from sglang.srt.rank_role import form_a_worker_holds_kv
+
+    return form_a_worker_holds_kv()
+
+
 def following_walk(tree_cache: Any) -> bool:
     return tree_cache is not None and bool(getattr(tree_cache, FOLLOW_ATTR, False))
 
@@ -803,7 +811,21 @@ def admission_probe(tree_cache: Any, req: Any, *, follow: bool) -> int:
         )
         if follow:
             with follow_walk(tree_cache):
-                return _local_match_len(tree_cache.match_prefix(params))
+                result = tree_cache.match_prefix(params)
+            n = _local_match_len(result)
+            if n > 0 and _worker_holds_kv():
+                # #239 S4b (F14) part 6: a worker that OWNS token rows under
+                # the token cut loads them from its own arena, and its load
+                # proves the chain (#1424 verify_load_chain) -- a page it
+                # cannot prove would stop it ALONE at the load. Its KV reach
+                # is cut at its last proven page here, so the group MIN (and
+                # H97's realize round, which reads this vote) takes every
+                # rank there. A byteless worker has nothing to prove.
+                cut = proof_cut(tree_cache, req, result, n)
+                if cut is not None:
+                    _STATS["worker_proof_cuts"] = _STATS.get("worker_proof_cuts", 0) + 1
+                    n = int(cut)
+            return n
         result = tree_cache.match_prefix(params)
         # H105b: the host votes what it will ADMIT -- device + the #1040
         # state-aligned load-back extent -- not the raw host-hit count.
