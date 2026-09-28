@@ -854,6 +854,9 @@ OWNED_ATTN_SOURCE_SEED = "Saat UNMEASURED (H65 QSA 3080, 5090 halb; Boden 0,02; 
 #: stepped by 4 (the page grid stays the runtime's).
 OWNED_RATIO_STEP = 8
 OWNED_SHARE_STEP = 4
+#: #239 S3f: the ranked estimates re-solved exactly (the memo's span may
+#: round one expert differently than the full vector's)
+OWNED_EXACT_CHECKS = 64
 
 
 class OwnedCut(msgspec.Struct, frozen=True, kw_only=True):
@@ -874,6 +877,9 @@ class OwnedCut(msgspec.Struct, frozen=True, kw_only=True):
     #: whether the forced form keeps the x1 rule (reported, not enforced).
     forced: bool = False
     x1_ok: bool = True
+    #: budget solves the search ran (the per-rank memo) and its wall time, s
+    solves: int = 0
+    elapsed_s: float = 0.0
 
 
 def owned_miss_rows(fit: "DRankResidency", *, num_experts: int, ids_per_step: int) -> float:
@@ -944,6 +950,38 @@ def owned_ratio_vectors(base: Sequence[int], host: int, *, step: int = OWNED_RAT
                 vec[w] -= t
             if all(vec[w] >= 1 for w in workers):
                 out.append(tuple(vec))
+    return tuple(out)
+
+
+def owned_ratio_vectors_free(base: Sequence[int], *, step: int = OWNED_RATIO_STEP,
+                             max_shift: Optional[int] = None) -> Tuple[Tuple[int, ...], ...]:
+    """#239 S3f (main 28.09. 19:0xZ): EVERY ownership vector around ``base``
+    -- each entry moved by a multiple of ``step`` in either direction, at
+    most ``max_shift`` per rank (default: half the workers' ownership, the
+    old host-only bound), the sum kept, no rank below 1. The host may GIVE
+    ownership and the workers may trade among themselves; the host-only
+    space (:func:`owned_ratio_vectors`) was a search bound, not physics.
+    Ordered by the ownership moved (sum |delta| / 2), then lexically."""
+    base = [int(x) for x in base]
+    n = len(base)
+    total = sum(base)
+    cap = (sum(base) - max(base)) // 2 if max_shift is None else int(max_shift)
+    st = int(step)
+    ranges = [[base[r] + d for d in range(-(cap // st) * st, cap + 1, st) if base[r] + d >= 1]
+              for r in range(n)]
+    out = []
+
+    def _rec(r, acc, used):
+        if r == n - 1:
+            last = total - used
+            if last in set(ranges[r]):
+                out.append(tuple(acc + [last]))
+            return
+        for v in ranges[r]:
+            _rec(r + 1, acc + [v], used + v)
+
+    _rec(0, [], 0)
+    out.sort(key=lambda v: (sum(abs(a - b) for a, b in zip(v, base)), v))
     return tuple(out)
 
 
@@ -1023,33 +1061,79 @@ def solve_owned_cut(
             for w, t in zip(workers, take):
                 vec[w] = t
             shares_list.append(tuple(vec))
-    best = None
+    import time as _time
+
+    t0 = _time.monotonic()
+    solves = 0
+    # a rank's edge and T_r depend on its own (ownership, share) only -- the
+    # budget and the card are per rank; the expert span is the ratio's share
+    # of the (fixed) sum, up to rounding. The memo keeps one budget solve per
+    # (rank, ownership, share); the chosen form is re-solved exactly below.
+    memo: Dict[Tuple[int, int, int], Tuple["_EdgeFit", float]] = {}
+
+    def _exact(rat, sh):
+        nonlocal solves
+        solves += 1
+        fits = _edge(tuple(solve_at(rat, sh)))
+        return fits, owned_round_ms(fits, shares=sh, merged=True, **kw)
+
+    def _terms(rat, sh):
+        keys = [(r, int(rat[r]), int(sh[r])) for r in range(n)]
+        if any(k not in memo for k in keys):
+            fits, ms = _exact(rat, sh)
+            for k, f, t in zip(keys, fits, ms):
+                memo[k] = (f, t)
+        return [memo[k] for k in keys]
+
+    def _verdict(fits, ms):
+        if any(f.ceiling_fraction is None or f.ceiling_max_rows < f.scratch_rows + 2
+               for f in fits):
+            return None
+        x1 = not any(ms[w] > base_ms[w] + 1e-9 for w in workers)
+        if not x1 and not forced:
+            return None
+        return x1
+
+    ranked = []
     cand = feas = 0
-    for rat in owned_ratio_vectors(base, host, step=ratio_step, max_shift=max_shift):
-        shift = rat[host] - base[host]
+    for rat in owned_ratio_vectors_free(base, step=ratio_step, max_shift=max_shift):
+        move = sum(abs(a - b) for a, b in zip(rat, base)) // 2
         for sh in shares_list:
             cand += 1
-            fits = _edge(tuple(solve_at(rat, sh)))
-            if any(f.ceiling_fraction is None or f.ceiling_max_rows < f.scratch_rows + 2
-                   for f in fits):
-                continue
-            ms = owned_round_ms(fits, shares=sh, merged=True, **kw)
-            x1 = not any(ms[w] > base_ms[w] + 1e-9 for w in workers)
-            if not x1 and not forced:
+            terms = _terms(rat, sh)
+            fits = tuple(f for f, _ in terms)
+            ms = tuple(t for _, t in terms)
+            x1 = _verdict(fits, ms)
+            if x1 is None:
                 continue
             feas += 1
             # forced: a form keeping x1 wins over one that breaks it
-            key = (0 if x1 else 1, round(max(ms), 9), round(sum(ms), 9), shift, rat, sh)
-            if best is None or key < best[0]:
-                best = (key, rat, sh, fits, ms)
+            ranked.append((0 if x1 else 1, round(max(ms), 9), round(sum(ms), 9), move,
+                           tuple(rat), tuple(sh)))
+    ranked.sort()
+    best = None
+    for key in ranked[:OWNED_EXACT_CHECKS]:
+        rat, sh = key[4], key[5]
+        fits, ms = _exact(rat, sh)
+        x1 = _verdict(fits, ms)
+        if x1 is None:
+            continue
+        exact_key = (0 if x1 else 1, round(max(ms), 9), round(sum(ms), 9), key[3], rat, sh)
+        if best is None or exact_key < best[0]:
+            best = (exact_key, rat, sh, fits, ms)
+        if best is not None and best[0][:2] <= key[:2]:
+            break  # no later estimate can beat the exact best
+    elapsed = _time.monotonic() - t0
     if best is None:
         return OwnedCut(ratios=(), cut=(), fractions=(), fits=(), round_ms=(),
-                        base_ratios=base, base_round_ms=base_ms, candidates=cand, feasible=0)
+                        base_ratios=base, base_round_ms=base_ms, candidates=cand, feasible=0,
+                        solves=solves, elapsed_s=round(elapsed, 2))
     key, rat, sh, fits, ms = best
     fr = tuple(float(f.ceiling_fraction) for f in fits)
     return OwnedCut(ratios=tuple(rat), cut=tuple(sh), fractions=fr, fits=(), round_ms=ms,
                     base_ratios=base, base_round_ms=base_ms, candidates=cand, feasible=feas,
-                    forced=forced, x1_ok=key[0] == 0)
+                    forced=forced, x1_ok=key[0] == 0, solves=solves,
+                    elapsed_s=round(elapsed, 2))
 
 
 class _EdgeFit(NamedTuple):
@@ -3242,6 +3326,8 @@ def plan_d_residency(
             ("ids_per_step", ids),
             ("candidates", sol.candidates),
             ("feasible", sol.feasible),
+            ("solves", sol.solves),
+            ("elapsed_s", sol.elapsed_s),
             ("forced_shares", list(_forced_shares) if _forced_shares else None),
             ("x1_ok", sol.x1_ok),
             ("target_over_form_a_ms", round(max(sol.round_ms) - max(sol.base_round_ms), 3)
@@ -3258,7 +3344,9 @@ def plan_d_residency(
                 "%s FRACTION-SOLVE %s D-EIGENTUM (#239 S3f): --rank-moe-ratio %s -> %s, "
                 "KV-Token-Schnitt %s/%d (Host 0), FR_D %s an der Kante -- Fehlgriff-Zeit "
                 "bs1 je Rang %s ms (Form A %s), max %.2f gegen %.2f; x1-Regel: %s; "
-                "%d Kandidaten, %d tragbar; Kosten je Zeile %s ms (%s), "
+                "%d Kandidaten (Eigentum frei in beide Richtungen, auch Worker unter "
+                "sich, in %der-Schritten), %d tragbar, %d Budget-Loesungen in %.1f s; "
+                "Kosten je Zeile %s ms (%s), "
                 "%d Ids je Schritt, gleichverteilt (benannt); Attention+LSE je Rang "
                 "(%d FA-Layer, %s); %d Token KV Pflicht"
                 % (marker, label, ",".join(str(x) for x in sol.base_ratios),
@@ -3270,7 +3358,8 @@ def plan_d_residency(
                     "VERLETZT (Schnitt erzwungen, Messarm M1b)") + (
                        " -- Schnitt ERZWUNGEN %s" % list(_forced_shares) if _forced_shares
                        else ""),
-                   sol.candidates, sol.feasible,
+                   sol.candidates, OWNED_RATIO_STEP, sol.feasible, sol.solves,
+                   sol.elapsed_s,
                    "/".join("%g" % x for x in OWNED_MISS_MS_PER_ROW_SEED),
                    OWNED_MISS_MS_SOURCE_SEED, ids, fa_layers, OWNED_ATTN_SOURCE_SEED,
                    int(kv_tokens)),
@@ -3281,15 +3370,16 @@ def plan_d_residency(
                 cut_lines = cut_lines + (
                     "%s FRACTION-SOLVE %s D-EIGENTUM (#239 S3f) ZIELFORM max T_r %.2f > "
                     "Form A max %.2f: +%.2f ms je Runde bs1 (Rang %d, Saat UNMEASURED -- "
-                    "M1 misst)"
+                    "M1 misst); die beste Form des ganzen Suchraums (%d Kandidaten, Eigentum "
+                    "in beide Richtungen) -- keine haelt x1 und Form A zugleich"
                     % (marker, label, max(sol.round_ms), max(sol.base_round_ms),
                        max(sol.round_ms) - max(sol.base_round_ms),
-                       sol.round_ms.index(max(sol.round_ms))),
+                       sol.round_ms.index(max(sol.round_ms)), sol.candidates),
                 )
         else:
             owner_refusal = (
                 "%s (%s): D-EIGENTUM (#239 S3f) -- keine tragbare Form mit Host-Anteil 0: "
-                "%d Kandidaten (Eigentum ab %s in %der-Schritten, Worker-Anteile in "
+                "%d Kandidaten (Eigentum um %s frei in %der-Schritten, Worker-Anteile in "
                 "%der-Schritten), keine mit Kante auf jedem Rang und ohne Mehr-Fehlgriffe "
                 "eines Workers gegen Form A (%s ms)"
                 % (marker, label, sol.candidates, ",".join(str(x) for x in sol.base_ratios),

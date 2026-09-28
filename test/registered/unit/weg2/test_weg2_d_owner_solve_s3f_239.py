@@ -201,8 +201,7 @@ def test_forced_shares_keep_the_cut_and_solve_ownership_and_fr():
     sol = _owned(forced_shares=(0, 32, 32))
     assert sol.forced and sol.cut == (0, 32, 32)
     assert sum(sol.ratios) == sum(BASE) and all(f > 0 for f in sol.fractions)
-    assert sol.candidates == len(er.owned_ratio_vectors(BASE, 0, step=er.OWNED_RATIO_STEP,
-                                                        max_shift=None))
+    assert sol.candidates == len(er.owned_ratio_vectors_free(BASE, step=er.OWNED_RATIO_STEP))
 
 
 def test_forced_shares_report_x1_instead_of_refusing():
