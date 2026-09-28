@@ -932,9 +932,11 @@ def reset_kv_ratio_supersession_announcement() -> None:
 
 
 def _gcd_reduced(vector: Sequence[int]) -> List[int]:
-    """The form ``resolve_cp_token_ratios`` compares and installs."""
-    g = math.gcd(*vector)
-    return [v // g for v in vector]
+    """The form ``resolve_cp_token_ratios`` compares and installs -- the ONE
+    reduction (``reduce_token_vector``), kept as a list even when all-equal."""
+    vec = [int(v) for v in vector]
+    reduced = reduce_token_vector(vec)
+    return reduced if reduced is not None else [1] * len(vec)
 
 
 def announce_superseded_rank_kv_ratio(server_args) -> None:
@@ -1346,11 +1348,9 @@ def resolve_cp_token_ratios(
             for b, w in zip(budgets, weights)
         ]
         vector = partition_units(_CP_TOKEN_UNITS, [max(int(a), 1) for a in avail])
-        g = math.gcd(*vector)
-        return [v // g for v in vector]
+        return _gcd_reduced(vector)
 
-    g = math.gcd(*weights)
-    return [w // g for w in weights]
+    return _gcd_reduced(weights)
 
 
 #: Token-vector resolution granularity (units) and the assumed
@@ -1618,8 +1618,7 @@ def cp_token_speed_vector(
     if best is None:  # cap_vec itself always meets its own floor
         best = (cap_vec, 0.0)
     vec, t = best
-    g = math.gcd(*vec)
-    vec = [v // g for v in vec]
+    vec = _gcd_reduced(vec)
     return vec, cp_token_context_budget(vec, capacities), t
 
 
