@@ -4731,6 +4731,50 @@ def d_fr_ceiling_adopt(plan, fractions, env_d: Mapping[str, str], owned: bool
     return new, lines
 
 
+def d_form_solved_by_planner(ns) -> bool:
+    """#239 rc12z29c: the D solve sets D's ownership and/or FR_D itself (an
+    owned cut, S2b joint, S2 maxmin: ``--d-kv-token-cut`` names a mode, not a
+    vector). Then that form must be solved BEFORE the Platztausch map is
+    built, because the map's D phase (window per rank, resident ids) and its P
+    phase (the common prefix, the store slots) are both functions of it."""
+    return isinstance(d_kv_token_cut(ns), str)
+
+
+def pin_d_form_for_map(ns, log) -> Optional[dict]:
+    """#239 rc12z29c: freeze the D form the Platztausch map is built from.
+
+    rc12z29b (f833fcbb2d, -st-cut) died at D's load, TP1: 'Platztausch-Karte:
+    Layer 0 Phase D nennt Ids ausserhalb dieses Rangs (lokal [-33, ...],
+    lo=226)' -- the map was built (publish_expert_map, before P starts) from
+    the STATED --rank-moe-ratio 183,137,168, the owned solve (after P's sleep)
+    published 215,113,160 into --extra-d, and D's expert window followed the
+    published one. The map cannot follow afterwards: P loaded its common
+    prefix and store slots from it. So the form is solved once before the map
+    (``d_form_solved_by_planner``), the map reads the published vectors, and
+    every later D solve checks exactly that form (fixed cut, fixed ownership,
+    fixed FR_D) against the measured budgets -- a form that no longer fits is
+    refused by name (W122/W130), never re-solved under a map that describes
+    another one. Returns the pinned form (also on ``ns._d_map_form``)."""
+    ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
+    fr = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-resident-fraction")
+    cut = getattr(ns, "_d_solved_cut", None)
+    if not ratios or not fr or not cut:
+        log(f"{D_RANK_SOLVE_MARKER} KARTE-FORM (#239 rc12z29c) NICHT GEPINNT: der Solve "
+            f"vor der Karte hat keinen Schnitt/Vektor veroeffentlicht (ratio {ratios}, "
+            f"FR_D {fr}, Schnitt {cut}) -- die Karte liest die Vektoren, die jetzt in "
+            f"--extra-d stehen")
+        return None
+    form = {"ratios": [str(x) for x in ratios], "fractions": [str(x) for x in fr],
+            "cut": tuple(float(x) for x in cut)}
+    ns._d_map_form = form
+    log(f"{D_RANK_SOLVE_MARKER} KARTE-FORM (#239 rc12z29c) GEPINNT: die Platztausch-Karte "
+        f"baut Phase D aus --rank-moe-ratio {','.join(form['ratios'])}, FR_D "
+        f"{','.join(form['fractions'])}, Token-Schnitt {list(form['cut'])} -- dieselben "
+        f"Vektoren, die D's Expertenfenster liest; jeder spaetere D-Solve prueft genau "
+        f"diese Form gegen sein Budget und loest sie nicht neu")
+    return form
+
+
 #: #239 S3a: the D argv that carries the planner's token cut to the runtime
 #: (server_args._resolve_form_a_dcp -> rank_role.resolve_dcp_under_host_kv).
 D_TOKEN_CUT_FLAGS = (
@@ -16391,7 +16435,15 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     _derive_waves = bool(getattr(ns, "d_pool_waves_derived", False))
     # #239: the token cut of the full-attention KV (None = off, byte-identical)
     _kv_cut = d_kv_token_cut(ns)
-    if _er.owned_cut_request(_kv_cut)[0] and getattr(ns, "_d_owner_stated", None):
+    _pinned = getattr(ns, "_d_map_form", None)
+    if _pinned:
+        # #239 rc12z29c: the Platztausch map was built from this form (P loaded
+        # it) -- check exactly it: fixed cut, ownership and FR_D from --extra-d
+        _kv_cut = tuple(_pinned["cut"])
+        log(f"{D_RANK_SOLVE_MARKER} {label} KARTE-FORM (#239 rc12z29c): geprueft, nicht neu "
+            f"geloest -- Eigentum {','.join(_pinned['ratios'])}, FR_D "
+            f"{','.join(_pinned['fractions'])}, Schnitt {list(_kv_cut)} (die Form der Karte)")
+    elif _er.owned_cut_request(_kv_cut)[0] and getattr(ns, "_d_owner_stated", None):
         # #239 S3f: every pass solves the ownership from the STATED vector
         ratios = list(ns._d_owner_stated)
     _kv_cut_kw = ({} if _kv_cut is None else
@@ -16522,6 +16574,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             f"noch benannte Obergrenze {FR_D_CAP_ENV})")
         fr_d = [float(x) for x in _fr_new]
     # #239 S3a: the cut itself goes to D as the runtime's token vector.
+    ns._d_solved_cut = tuple(getattr(plan, "kv_token_cut", ()) or ()) or None
     _cut_line = publish_d_token_cut(
         ns, d_token_cut_vector(getattr(plan, "kv_token_cut", ()), _kv_cut), label)
     if _cut_line:
@@ -22090,6 +22143,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # TRAIN FIX 5 moved the dc-reserve / budgets_p / cut solve ahead of the
     # ring (block 1b- above); only ``env_p`` stays here, because it is the
     # one thing in this step that genuinely needs the armed ring.
+    # #239 rc12z29c: a form the D solve sets itself (owned / joint / maxmin cut)
+    # is solved HERE, from the expectation budgets, before the map is built --
+    # the map's D windows and P's common prefix are functions of it, and P
+    # loads the map before D's measured budgets exist.
+    if d_form_solved_by_planner(ns) and not getattr(ns, "_d_map_form", None):
+        # only the form's vectors outlive this pass; its env writes (scratch
+        # cap, seat rows, stage form, waves, trims) come from the real budgets
+        _env_d_before = str(getattr(ns, "env_d", "") or "")
+        _map_terms: List[Dict[str, object]] = []
+        _map_budgets = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(Karte, Erwartung)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), terms_out=_map_terms)
+        log_d_rank_vram_solve(ns, cards, _map_budgets, log, "D(Karte, Erwartung)",
+                              p_split=p_split, chunk_layers=chunk_layers,
+                              card_terms=(_map_terms if d_awake_rest(cards, ns.profile)[0] is not None else None))
+        _pin = pin_d_form_for_map(ns, log)
+        ns.env_d = _env_d_before
+        ns._d_kv_stage_written = None
+        if _pin:
+            from sglang.srt.weg2 import draft_post as _dp
+
+            ns.env_d = _dp.replace_env_vector(ns.env_d, "SGLANG_MOE_RESIDENT_EXPERT_FRACTION",
+                                              [float(x) for x in _pin["fractions"]])
     # #107: EINMAL bauen, BEIDE Gruppen bekommen denselben Pfad.
     _emap = publish_expert_map(ns, ns.model, ns.evidence_dir, log,
                                p_stage_layers=getattr(state, "p_stage_layers", None),
