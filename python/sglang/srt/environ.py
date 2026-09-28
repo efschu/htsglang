@@ -677,6 +677,16 @@ class Envs:
     # CSV, "0" = no rate). Set by the weg2 launcher from D_EXTEND_GROWTH_PER_ROW_MIB;
     # the scheduler caps the extend chunk to floor((card_free_post - 300) / rate).
     SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB = EnvStr(None)
+    # DEGEN-SUSPECT (27B weg2-1-13, 28.09. 13:44-13:51: an endless generation
+    # held the D->P drain): the detokenizer watches each request's decode tail
+    # for an exact repetition (smallest period <= 256 tokens covering >= 8
+    # repetitions and >= MIN_SPAN tokens of the last 2048) and logs it once per
+    # rid and period (managers/degen_detect.py). Off the scheduler's decode
+    # round by construction (separate process). STOP is the prepared stage 2
+    # (abort the request): OFF -- stage 1 only logs.
+    SGLANG_WEG2_DEGEN_DETECT = EnvBool(True)
+    SGLANG_WEG2_DEGEN_STOP = EnvBool(False)
+    SGLANG_WEG2_DEGEN_MIN_SPAN = EnvInt(512)
     # TAIL_HANDOFF (H18, E1 of H17, fnFL2x132): P ends the prompt's last-but-one
     # chunk at c = floor_r(N-1) (r = QSA compress ratio) instead of the page,
     # and hands the GDN state after c plus the KV/QSA rows of the partial page
