@@ -75,8 +75,11 @@ starts a new group at c (the QSA ``prefix_lens % ratio == 0`` assert holds).
    [c, N) (draft KV + draft-pool QSA rows of those positions, a real
    draft seed), the shadows take their stub. The request then merges into
    the running batch like any finished prefill. A batch holding a skip
-   request holds nothing else (PrefillAdder refuses the next request, like
-   the born-spilled-deep batch).
+   request holds nothing that needs a forward (PrefillAdder refuses such a
+   request behind it, like behind the born-spilled-deep batch); H24c: further
+   SKIP requests join it -- ``skip_tokens``/``run_skip`` serve the whole
+   batch, so the wake's resumes at their END state take one pass together
+   instead of one pass each (rc12z26 18:05:34: three skips, three passes).
 
 5. WAIT (H45, ``SGLANG_WEG2_TAIL_WAIT_MS``). P's PP ranks write their parts
    from background publish threads, and D's first prefetch check can come
@@ -799,7 +802,9 @@ def skip_refusal(entry: Agreed, req, batch_empty: bool) -> str:
     its token ids), so every rank decides the same."""
     spec = entry.staged.spec
     if not batch_empty:
-        return "batch_not_empty"  # the skipped batch must hold nothing else
+        # the skipped batch must hold nothing that runs a forward; H24c: the
+        # adder passes batch_empty=True while it holds only skip requests
+        return "batch_not_empty"
     if req.return_logprob or req.return_hidden_states:
         return "logprob_or_hidden"
     if req.grammar is not None:
@@ -873,6 +878,26 @@ def peek_target_start(req, prefix_len: int, batch_empty: bool = True) -> Tuple[O
         wait = why == "batch_not_empty"
         return (spec.cut if entry.staged.e1 else None), wait
     return spec.cut, False
+
+
+def skip_joinable(req, prefix_len: Optional[int] = None) -> bool:
+    """H24c: whether ``plan_adopt`` would admit ``req`` with the END state
+    into a batch holding only skip requests -- WITHOUT taking the answer (no
+    pop, no log, no payload drop). The adder asks it once a skip closed the
+    batch to forwards: a request it says no to waits a pass, so the batch
+    never mixes (``skip_tokens``). ``prefix_len`` None = before the match
+    (the page-prefix check is left to the call at the commit). Every input is
+    rank-uniform, exactly as in ``plan_adopt``."""
+    if not adopt_enabled():
+        return False
+    entry = _AGREED.get(str(req.rid))
+    if entry is None or not entry.agreed or not entry.skip:
+        return False
+    spec = entry.staged.spec
+    at = spec.page_prefix if prefix_len is None else int(prefix_len)
+    if uniform_refusal(spec, req.origin_input_ids, len(req.full_untruncated_fill_ids), req.extra_key, at):
+        return False
+    return not skip_refusal(entry, req, batch_empty=True)
 
 
 def commit_adopt(req, entry: Agreed, tree_cache, page_size: int) -> int:
