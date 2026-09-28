@@ -552,11 +552,27 @@ def test_mutant_w53_can_never_fire_on_the_first_refusal():
                 for n in ast.walk(node)
                 if isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Subscript)]
 
+    # SK-X (NF rc12t weg2-6-30, 28.09.): the gate is `if terminal:` with
+    # `terminal = n > 1 and (leg1_ran or n > 2)` -- W35/W53 need a P leg that
+    # actually ran ("after a full P prefill"). What this pin protects is
+    # unchanged and asserted here: the terminal gate still requires `n > 1`
+    # as a conjunct, so W53 can never fire on the first refusal.
+    def _n_gt_1(expr):
+        return (isinstance(expr, ast.Compare) and isinstance(expr.left, ast.Name)
+                and expr.left.id == "n" and isinstance(expr.ops[0], ast.Gt)
+                and isinstance(expr.comparators[0], ast.Constant)
+                and expr.comparators[0].value == 1)
+
+    terminal_defs = [s for s in fn.body
+                     if isinstance(s, ast.Assign) and len(s.targets) == 1
+                     and isinstance(s.targets[0], ast.Name) and s.targets[0].id == "terminal"]
+    assert len(terminal_defs) == 1, "one definition of the terminal verdict"
+    tdef = terminal_defs[0].value
+    assert isinstance(tdef, ast.BoolOp) and isinstance(tdef.op, ast.And) and any(
+        _n_gt_1(v) for v in tdef.values), "terminal must require n > 1 (never the first refusal)"
     guards = [s for s in fn.body
-              if isinstance(s, ast.If) and isinstance(s.test, ast.Compare)
-              and isinstance(s.test.left, ast.Name) and s.test.left.id == "n"
-              and isinstance(s.test.ops[0], ast.Gt)]
-    assert len(guards) == 1, "the `if n > 1:` guard is the only terminal gate"
+              if isinstance(s, ast.If) and isinstance(s.test, ast.Name) and s.test.id == "terminal"]
+    assert len(guards) == 1, "the `if terminal:` guard is the only terminal gate"
     guard = guards[0]
     outside = [c for s in fn.body if s is not guard for c in incs(s)]
 

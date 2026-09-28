@@ -214,7 +214,8 @@ class ACompletedLegOneMakesTheRefusalTerminal(CustomTestCase):
         # find() answers -1 for "absent", and -1 satisfies every assertGreater
         # below -- so each anchor is proved PRESENT before it is ordered.
         # (Assert-on-a-literal, the trap this class has now hit five times.)
-        requeue_log = src.find('"WEG2 X-REQUEUE rid=%s n=%d verdict=%s"')
+        # SK-X: the line carries one more %s (the "P never ran" note)
+        requeue_log = src.find('"WEG2 X-REQUEUE rid=%s n=%d verdict=%s%s"')
         w35 = src.find('self.counters["W35_Weg2XReQueueLoop"] += 1')
         for name, off in (("W53 increment", i), ("X-REQUEUE line", requeue_log),
                           ("W35 increment", w35)):
