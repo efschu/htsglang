@@ -109,6 +109,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.managers.cache_controller import split_host_state_pools
 from sglang.srt.mem_cache import hicache_write_path
 from sglang.srt.mem_cache.hicache_phase_guard import device_tier_disarmed
 from sglang.srt.mem_cache.hicache_storage import (
@@ -1041,11 +1042,20 @@ class HybridCacheController(BaseHiCacheController):
         if operation.pool_transfers or draft_probe is not None:
             self._hitq_v2_n = getattr(self, "_hitq_v2_n", 0) + 1
             _arm = "v2"
-            tree_transfers = list(operation.pool_transfers or [])
+            # #239 Blocker 5: a KV-row worker asks its store about its KV rows
+            # only; the host's pools (mamba anchor, sidecars) are reported
+            # present at the KV boundary below -- never a cap on this rank.
+            tree_transfers, host_pools = split_host_state_pools(
+                self, operation.pool_transfers
+            )
             probe_transfers = tree_transfers + ([draft_probe] if draft_probe else [])
             hit_result = self.storage_backend.batch_exists_v2(
                 hash_value, probe_transfers, extra_info
             )
+            if host_pools and hit_result.kv_hit_pages:
+                hit_result.extra_pool_hit_pages.update(
+                    {t.name: int(hit_result.kv_hit_pages) for t in host_pools}
+                )
             if draft_probe is not None:
                 hit_result = self._apply_draft_claim(
                     operation, hash_value, tree_transfers, draft_probe, hit_result, extra_info
@@ -1306,9 +1316,14 @@ class HybridCacheController(BaseHiCacheController):
             self._sync_trailing_keys(
                 operation.pool_transfers, operation.hash_value, kv_completed_pages
             )
+            # #239 Blocker 5: the host's pools move nothing on a KV-row worker
+            # (byteless there); they land as the null tier's answer did, so the
+            # group MIN of their hit pages stays the host's.
+            own, host_pools = split_host_state_pools(self, operation.pool_transfers)
             self._resolve_sidecar_derived_pool_transfers(operation)
             _te = time.perf_counter()
-            results = self.storage_backend.batch_get_v2(operation.pool_transfers)
+            results = self.storage_backend.batch_get_v2(own) if own else {}
+            results.update({t.name: [True] * len(t.keys or []) for t in host_pools})
             try:  # H2D phase 1 (a): the extra pools' read (mamba anchor, sidecars)
                 from sglang.srt.managers.cache_controller import _read_stages
 
@@ -1323,7 +1338,10 @@ class HybridCacheController(BaseHiCacheController):
         # Backup extra pools
         if operation.pool_transfers:
             self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_set_v2(operation.pool_transfers)
+            # #239 Blocker 5: a KV-row worker never writes the host's pools
+            own, host_pools = split_host_state_pools(self, operation.pool_transfers)
+            results = self.storage_backend.batch_set_v2(own) if own else {}
+            results.update({t.name: [True] * len(t.keys or []) for t in host_pools})
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
 
         if getattr(operation, "sidecar_only", False):

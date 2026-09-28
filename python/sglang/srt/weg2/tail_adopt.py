@@ -238,14 +238,21 @@ def held_shapes(kvpool, req_to_token_pool) -> HeldShapes:
     if isinstance(kvpool, HybridLinearKVPool):
         full = kvpool.full_kv_pool
         qsa = isinstance(kvpool, QSATokenToKVPool)
-        ratio = int(kvpool.qsa_compress_ratio) if qsa else 0
+        # #239 Blocker 5 (rc12z30d -st-cut, 136x 'WEG2-TAIL stage refused ...
+        # IndexError' on TP1/TP2): a Form A worker runs no indexer and keeps
+        # NO compressed QSA rows (qsa_kv_pool ``qsa_index_on_rank=False``: an
+        # empty per-layer list). Its held rows are K/V only -- the cut-worker
+        # shape ``cut_gate`` and the owner install were built for.
+        compressed = bool(getattr(kvpool, "qsa_compressed_k_buffer_pool", None)) if qsa else False
+        ratio = int(kvpool.qsa_compress_ratio) if compressed else 0
         for gid, local in sorted(kvpool.full_attention_layer_id_mapping.items()):
             k = full.k_buffer[local]
             if math.prod(k.shape[1:]) == 0:
                 continue
             rows = [_row(k), _row(full.v_buffer[local])]
-            if qsa:
+            if compressed:
                 rows.append(_row(kvpool.qsa_compressed_k_buffer_pool[local]))
+            if qsa:
                 ring[int(gid)] = _row(kvpool.qsa_key_state_buffer_pool[local])
                 rope = _row(kvpool.qsa_rope_position_buffer)
             fa[int(gid)] = rows
@@ -379,7 +386,10 @@ def _stage_e1(headers: List[th.TailHeader], held: HeldShapes, check_digest: bool
             st.verdict = f"{why}:{h.part}"
             return st
         bundles.append(bundle)
-        fa.update({int(g): tuple(t) for g, t in bundle["fa"].items() if int(g) in held.fa})
+        # a part carries every row P holds (K, V, QSA compressed); a rank
+        # takes the rows it holds -- a cut worker K/V only (#239 Blocker 5)
+        fa.update({int(g): tuple(t)[: len(held.fa[int(g)])] for g, t in bundle["fa"].items()
+                   if int(g) in held.fa})
         gdn.update({int(g): tuple(t) for g, t in bundle["gdn"].items() if int(g) in held.gdn})
     if ple_state.enabled():
         st.ple, st.ple_why = _ple_of(headers, bundles, end=False)
