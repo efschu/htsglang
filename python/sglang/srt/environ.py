@@ -616,6 +616,12 @@ class Envs:
     # (weg2/rank_state.py). Set by the weg2 launcher per group, next to the
     # group log; unset = no record is written (a boot outside the launcher).
     SGLANG_WEG2_RANK_STATE_DIR = EnvStr(None)
+    # WEG2_STATE_DIR (IPC §2.2, 27B B1/H5): the boot's own state directory
+    # state/<boot_id>/ (state.json + events.jsonl), mounted into the container
+    # by the arm, the host writer creates it. The launcher writes its fields
+    # through weg2/state_file.py; unset = the launcher writes no state. The
+    # unprefixed name is the cross-component contract with the host scripts.
+    WEG2_STATE_DIR = EnvStr(None)
     # IDLE_VOTE_FRESHNESS (fnFL2 H77, #1268): PP0 reads a landed idle lap as
     # the PP group's /flush_cache verdict only while the state it witnessed
     # holds -- the lap of PP0's latest stamp, PP0 neither asleep nor busy
