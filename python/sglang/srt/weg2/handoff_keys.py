@@ -51,6 +51,11 @@ def first_mismatch(a: Sequence[str], b: Sequence[str]) -> Optional[int]:
 #: req attribute: PP0 used no hand-off chain -- this rank must not read one.
 OFF_ATTR = "_weg2_handoff_off"
 CHAIN_ATTR = "_weg2_handoff_page_keys"
+#: P4b-fix (28.09.): sticky "this rank read P's hand-off record for this rid" -- the
+#: record is removed at the wake (scheduler._weg2_release_dormant_hold) and the chain
+#: attribute can be cleared (adopt_pp0_decision), but P prefilled the rid either way;
+#: weg2/settle_writer.observe counts it as the chain (p-handoff, never "no writer").
+SEEN_ATTR = "_weg2_handoff_seen"
 
 
 def chain_digest(chain: Optional[Sequence[str]]) -> str:
@@ -78,6 +83,11 @@ def resolve_chain(req, reader) -> Optional[List[str]]:
         chain = list(rec.get("page_keys") or []) if rec else None
         if chain:
             setattr(req, CHAIN_ATTR, chain)
+    if chain:
+        try:
+            setattr(req, SEEN_ATTR, True)
+        except Exception:  # noqa: BLE001 - a frozen double
+            pass
     return list(chain) if chain else None
 
 

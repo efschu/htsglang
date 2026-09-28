@@ -6059,11 +6059,23 @@ class Scheduler(
         # timer (weg2/settle_writer.py). Rank-local facts; every verdict built
         # on them goes through the group MIN below.
         _acts = [_weg2_settle_writer_action(self, req) for req in settle]
-        _pre = []
+        # P4b-fix (28.09.): the writer view is RANK-LOCAL -- a rank that never read the
+        # hand-off record before the wake removed it sees "none" while its peers see P's
+        # hand-off. "decide" must not veto the group's re-read then (it did: 0 in the due
+        # MIN stopped every re-read and the request sat the 20 s bound out). It is neutral
+        # (1) in the due vote and votes separately whether it has no writer; the group skips
+        # the re-read only when EVERY rank decides. One collective: [due..., decide...].
+        _pre, _dec = [], []
         for req, _act in zip(settle, _acts):
-            if _act in ("wait", "decide"):
-                _pre.append(0)  # a re-read cannot see pages nobody writes / still writes
+            if _act == "wait":
+                _pre.append(0)  # a writer at work: a re-read cannot see pages still being written
+                _dec.append(0)
                 continue
+            if _act == "decide":
+                _pre.append(1)  # neutral in the MIN: never vetoes a peer's re-read
+                _dec.append(1)
+                continue
+            _dec.append(0)
             if _act == "reread":
                 req._1456_last = 0.0  # the ack is the clock, not the 2 s timer
             try:
@@ -6071,7 +6083,9 @@ class Scheduler(
             except Exception:  # noqa: BLE001
                 _pre.append(0)
         _gmin0 = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
-        _agreed_due = _gmin0(_pre)
+        _votes = _gmin0(_pre + _dec)
+        _n = len(settle)
+        _agreed_due = [int(bool(d) and not a) for d, a in zip(_votes[:_n], _votes[_n:])]
         for req, _ok, _act in zip(settle, _agreed_due, _acts):
             try:
                 state = _refetch(req, now, allow_reissue=bool(_ok))
@@ -6084,7 +6098,8 @@ class Scheduler(
             lapsed = now - float(getattr(req, "_1471_since", now)) >= self.WEG2_POST_WAKE_SETTLE_S
             # P4b: no writer and no read in flight = decided now (the bound would
             # release the same request "as it is" 20 s later).
-            _no_writer = _act == "decide" and state != "reading"
+            # a re-read the group issued this tick is a read in flight, on this rank too
+            _no_writer = _act == "decide" and state not in ("reading", "reissued")
             if _no_writer:
                 state = "no-writer"
             # weg2rc2: a remainder within X is D's to prefill -- settled now, not at the bound.
