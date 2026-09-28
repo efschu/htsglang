@@ -1035,6 +1035,53 @@ class FormAAdmissionSplit(RuntimeError):
     """H105: the ranks of a Form A group disagree on an admission."""
 
 
+class FormAAdmissionDeadlock(RuntimeError):
+    """H106: the attention host's gate refuses the queue head with nothing
+    running and a budget that no longer moves -- a named stop on every rank
+    instead of a silent wedge until the deadman."""
+
+
+class FormAAdmissionWedgeWatch:
+    """H106: the host's deadlock verdict for the H105 gate (host only; the
+    verdict travels in the broadcast, so every rank stops in the same call).
+
+    rc12z23 D: weg2-14-33 refused 8920 times over 461 s with 0 running and
+    host_budget 48576 constant (price 79176); only the deadman ended it. A
+    refusal counts toward the stop only while nothing runs (a running request
+    frees rows when it ends) and the head's price and budget stand still; any
+    admit, another head, a run, or a moved number restarts the clock."""
+
+    def __init__(self, limit_s: float):
+        self.limit_s = float(limit_s or 0.0)
+        self._key = None
+        self._since = None
+        self._refusals = 0
+
+    def observe(self, rid: str, code: str, price, budget, *, running_empty: bool,
+                now: float) -> str:
+        if self.limit_s <= 0 or code == ADMISSION_ADMIT or not running_empty:
+            self._key = self._since = None
+            self._refusals = 0
+            return ""
+        key = (str(rid), price, budget)
+        if key != self._key:
+            self._key, self._since, self._refusals = key, float(now), 0
+        self._refusals += 1
+        waited = float(now) - float(self._since)
+        if waited < self.limit_s:
+            return ""
+        return (
+            f"H106 FORM-A ADMISSION DEADLOCK rid={str(rid)[:16]} host={code} "
+            f"price={price} budget={budget} refusals={self._refusals} "
+            f"stuck_s={waited:.1f} running=0: the attention host's gate refused "
+            "the queue head with nothing running and neither its price nor the "
+            "group budget moved for the whole window -- nothing on this group can "
+            "free rows for it any more. Stopping by name on every rank "
+            "(SGLANG_WEG2_FORM_A_DEADLOCK_STOP_S) instead of standing still "
+            "until the deadman."
+        )
+
+
 #: rid -> [monotonic time of the first host refusal, refusals]; bounded.
 _ADMISSION_WAIT: Dict[str, list] = {}
 _ADMISSION_WAIT_CAP = 1024
@@ -1084,6 +1131,9 @@ def form_a_admission_verdict(
     price: Any = None,
     budget: Any = None,
     gather: Any = None,
+    drained: int = 0,
+    stop: str = "",
+    on_host_drain: Any = None,
 ) -> str:
     """The host's admission verdict for ``rid``, adopted by every worker.
 
@@ -1100,14 +1150,28 @@ def form_a_admission_verdict(
     tuple in TP order, the host first) a worker's gate is REAL -- it owns
     full-attention rows -- so the verdict is the group's MIN: the host's code
     when it refuses, else the first refusing worker's. Same payload, same
-    count of collectives (a gather in place of the broadcast)."""
+    count of collectives (a gather in place of the broadcast).
+
+    H106 (rc12z23 D 15:28:40-15:36:12): two more fields ride the same
+    broadcast. ``drained`` -- the tokens the host's own load-back drain
+    (xsn285 WEG2-LOADBACK-EVICT) freed in this gate call; a worker hands it
+    to ``on_host_drain`` and drains its own evictable leaves alike, so the
+    replicas and the group floor stay one (the host alone drained 213568
+    tokens there, the floor stayed at the workers' 30336 and the head waited
+    7 min). ``stop`` -- the host's named deadlock verdict
+    (:class:`FormAAdmissionWedgeWatch`); every rank raises
+    :class:`FormAAdmissionDeadlock` with it."""
     rid = str(rid)
     if gather is not None:
         return _form_a_dcp_admission_verdict(
             rid, str(local), is_host=is_host, gather=gather, price=price, budget=budget
         )
-    got = exchange((rid, str(local), price, budget) if is_host else None)
-    if not isinstance(got, tuple) or len(got) != 4:
+    got = exchange(
+        (rid, str(local), price, budget, int(drained or 0), str(stop or ""))
+        if is_host
+        else None
+    )
+    if not isinstance(got, tuple) or len(got) not in (4, 6):
         raise FormAAdmissionSplit(
             f"H105 RU FORM-A ADMISSION MALFORMED rid={rid[:16]} got={str(got)[:120]}: "
             "this rank is at the admission gate but the host sent no verdict -- "
@@ -1138,6 +1202,11 @@ def form_a_admission_verdict(
             )
     if not is_host:
         _note_admission_wait(rid, host_code, got[2], got[3], str(local), price, budget)
+        host_drained = int(got[4] or 0) if len(got) == 6 else 0
+        if host_drained > 0 and on_host_drain is not None:
+            on_host_drain(host_drained)
+    if len(got) == 6 and got[5]:
+        raise FormAAdmissionDeadlock(str(got[5]))
     return host_code
 
 

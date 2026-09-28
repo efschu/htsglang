@@ -490,6 +490,11 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
     d_seats.mark_parked(victim, d_seats.SITE_PRESSURE, now=time.monotonic())
     sched.waiting_queue = [q for q in sched.waiting_queue if q is not victim] + [victim]
     sched._weg2_sa_displaced = getattr(sched, "_weg2_sa_displaced", 0) + 1
+    # H106b (rc12z22-dwell30 D 15:51:41, weg2-6-33): this runs AFTER the pass's
+    # #580 prefetch drain, so the victim joins a queue the drain never saw.
+    # The scheduler excludes it from THIS pass's admission by name
+    # (Scheduler._weg2_sa_exclude_displaced); it resumes from the next pass.
+    sched._weg2_sa_displaced_now = str(victim_rid)
     older_req = next((q for q in waiting if str(q.rid) == older), None)
     pages_out = _partial_keep(sched, victim, older_req if trigger == "kv" else None)
     logger.warning("SEAT-AGE DISPLACE rid_out=%s older_waiting=%s trigger=%s running=%d cap=%s "
@@ -497,6 +502,26 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
                    "the device only as far as the older one needs it -- LRU eviction, tail last)",
                    victim_rid[:16], older[:16], trigger, len(reqs), cap, pages_out)
     return victim_rid
+
+
+def exclude_displaced(sched, prefetch_verdicts) -> Optional[str]:
+    """H106b (rc12z22-dwell30 D 15:51:41, all three ranks): the SA displacement
+    of this pass requeues its victim AFTER the #580 prefetch drain, so the
+    admission loop met weg2-6-33 without a drained verdict and every rank
+    raised ('the queue was mutated in between'). The displacement is
+    replicated, so its victim is excluded from THIS pass by name on every
+    rank alike -- a not-done verdict, the ordinary skip -- and resumes from
+    the next pass's drain. A victim the drain did cover keeps its verdict.
+    Returns the excluded rid."""
+    rid = getattr(sched, "_weg2_sa_displaced_now", None)
+    sched._weg2_sa_displaced_now = None
+    if rid is None or not isinstance(prefetch_verdicts, dict) or rid in prefetch_verdicts:
+        return None
+    prefetch_verdicts[rid] = False
+    logger.info("SEAT-AGE DISPLACED-THIS-PASS rid=%s: requeued after the pass's prefetch "
+                "drain; excluded from this pass's admission (not-done verdict), it "
+                "resumes from the next pass", str(rid)[:16])
+    return rid
 
 
 def _kv_displace_enabled(env=None) -> bool:

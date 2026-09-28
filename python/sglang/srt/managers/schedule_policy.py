@@ -2536,6 +2536,11 @@ class PrefillAdder:
                 # the only lifecycle shape this fact is safe under.
                 req.mamba_loadback_anchor_adopted = False
                 _lb_t0 = time.perf_counter()
+                # H106: what THIS host-first load-back drained (xsn285) rides
+                # the host's verdict below; the workers drain alike.
+                _h106_d0 = int(
+                    getattr(self.tree_cache, "_weg2_loadback_drained_total", 0) or 0
+                )
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
@@ -2549,6 +2554,12 @@ class PrefillAdder:
                     )
                 )
                 WEG2_ADMIT_T["lb_ms"] += (time.perf_counter() - _lb_t0) * 1000.0
+                if _fa_host_first:
+                    req._h106_host_drained = max(
+                        0,
+                        int(getattr(self.tree_cache, "_weg2_loadback_drained_total", 0) or 0)
+                        - _h106_d0,
+                    )
                 WEG2_ADMIT_T["lb_n"] += 1
                 # #968 S1: THE TOLD EXTENT DECIDES *HOW MUCH*, NOT MERELY
                 # *WHETHER* -- enforced HERE because the callee cannot.
