@@ -236,6 +236,7 @@ from sglang.srt.weg2 import fork_anchor as _weg2_fork
 from sglang.srt.weg2 import d_park_read as _weg2_park_read  # PARK-RETAIN READ
 from sglang.srt.weg2 import resume_via_p as _weg2_rvp  # RESUME-VIA-P
 from sglang.srt.weg2 import progress_beacon as _weg2_beacon  # FP forward-progress beacon
+from sglang.srt.weg2.vision_verdict import Weg2VisionVerdict  # H125f vision verdict on the chain
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
 from sglang.srt.managers import uniform_floor_scope
@@ -3706,6 +3707,7 @@ class Scheduler(
                 (SessionCheckpointReqInput, self.handle_session_checkpoint),
                 (VramBudgetReqInput, self.handle_vram_budget),
                 (Weg2ParkRunningReqInput, self.handle_weg2_park_running),
+                (Weg2VisionVerdict, self.handle_weg2_vision_verdict),
                 (PlePrefetchHintReqInput, self.handle_ple_prefetch_hint),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
@@ -4504,6 +4506,13 @@ class Scheduler(
             self._weg2_vision_rank_stage = arm_rank_stage(self)
             if self._weg2_vision_rank_stage:
                 _vision_origin_aborts = lambda: take_origin_aborts(self)  # noqa: E731
+            else:
+                # H125f: a follower of a transient P group holds image
+                # requests until PP0's verdict reaches it (vision_verdict)
+                from sglang.srt.weg2 import vision_verdict as _vv
+                from sglang.srt.weg2.vision_rank_runner import transient_p_boot
+
+                self._weg2_vision_follower_gate = transient_p_boot() and _vv.arm(self)
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
@@ -6100,6 +6109,13 @@ class Scheduler(
     # ---- H91 Teil B: D seats -- the park and its resume ---------------------
     # Delegation only (large-class-style): the bookkeeping moves live in
     # weg2/d_park_runtime.py, the verdicts in weg2/d_seats.py.
+
+    def handle_weg2_vision_verdict(self, recv_req):
+        """H125f: PP0's vision verdict, dispatched on every PP stage."""
+        from sglang.srt.weg2.vision_verdict import absorb
+
+        absorb(self, recv_req)
+        return None
 
     def handle_weg2_park_running(self, recv_req):
         """H91b: ``POST /weg2/park_running`` -- park every running D request
@@ -13704,6 +13720,10 @@ class Scheduler(
             from sglang.srt.weg2.vision_rank_runner import vision_rank_pass
 
             _vision_parked = vision_rank_pass(self)
+        elif getattr(self, "_weg2_vision_follower_gate", False):
+            from sglang.srt.weg2.vision_verdict import follower_pass
+
+            _vision_parked = follower_pass(self)
         try:
             try:
                 ret, running_batch = self._get_new_batch_prefill_raw(

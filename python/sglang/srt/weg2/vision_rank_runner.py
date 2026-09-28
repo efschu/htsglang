@@ -64,6 +64,7 @@ from sglang.srt.planner.vision_stage_load import (
     map_tower_param_name,
 )
 from sglang.srt.weg2 import vision_rank_stage as vrs
+from sglang.srt.weg2 import vision_verdict as _vv
 from sglang.srt.weg2.vision_stage_service import (
     VISION_ENV,
     VISION_GROUP,
@@ -147,6 +148,7 @@ def arm_rank_stage(scheduler, env: Optional[Dict[str, str]] = None) -> bool:
     scheduler._weg2_vision_origin_aborts = []
     scheduler._weg2_vision_refused = set()
     scheduler._weg2_vision_runs = 0
+    _vv.arm(scheduler)  # H125f: PP0's half of the verdict gate (pp_size > 1)
     if refusal:
         logger.error("%s -- in-rank vision stage on PP0 NOT armed: %s. Image requests to "
                      "this group are aborted by name (%s); text is unaffected.",
@@ -939,6 +941,13 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
             if not out.ok:
                 _refuse(scheduler, pending, out.code, out.detail)
                 held = pending + held
+    # H125f (vision_verdict): on a PP group no stage admits an image before
+    # PP0's verdict about it has reached THAT stage over the chain -- PP0
+    # holds it here like every follower does in vision_verdict.follower_pass,
+    # and all of them release it in the pass that absorbs the verdict.
+    if getattr(scheduler, "_weg2_vision_gate", False):
+        _vv.queue_verdicts(scheduler, wq, unstaged_items, scheduler._weg2_vision_refused)
+        held = held + _vv.gate_held(scheduler, wq, held)
     if not held:
         return []
     ids = {id(r) for r in held}
@@ -967,9 +976,10 @@ def vision_unpark(scheduler, parked: Sequence[Tuple[int, Any]]) -> None:
 def take_origin_aborts(scheduler) -> List[Any]:
     """AbortReqs for PP0's intake (the request origin): rank-consistent
     aborts of refused stages, the W-code as the client's finish reason."""
+    verdicts = _vv.take_verdicts(scheduler)  # H125f: release before any abort
     queue = getattr(scheduler, "_weg2_vision_origin_aborts", None)
     if not queue:
-        return []
+        return list(verdicts)
     from http import HTTPStatus
 
     from sglang.srt.managers.io_struct import AbortReq
@@ -983,4 +993,4 @@ def take_origin_aborts(scheduler) -> List[Any]:
         for rid, msg in queue
     ]
     queue.clear()
-    return out
+    return list(verdicts) + out
