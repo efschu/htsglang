@@ -2198,6 +2198,18 @@ class HostPoolGroup:
         return getattr(self.anchor_entry.host_pool, "arena", None)
 
     @property
+    def _page_bytes(self) -> int:
+        """Bytes of one page in ``arena`` -- the ANCHOR pool's, because
+        ``arena`` above is the anchor pool's arena (a mamba entry's arena has
+        its own page size and is never the one named here). rc12z
+        (786d2f615d, D TP0 01:33:06 and P PP0): ``_arena_page_get``'s L3 fill
+        (#1433) read ``pool._page_bytes`` on this group, which fell to
+        ``__getattr__`` -> AttributeError, #1033d refused the whole read, and
+        every prefix evicted to disk was re-prefilled (weg2-24-93, 69937
+        tokens). Workers hold the arena pool itself and read back fine."""
+        return int(self.anchor_entry.host_pool._page_bytes)
+
+    @property
     def staging_rows(self) -> int:
         return int(getattr(self.anchor_entry.host_pool, "staging_rows", self.anchor_entry.host_pool.size))
 
