@@ -1302,10 +1302,15 @@ def _weg2_resume_warm_tick(sched) -> int:
         rw = resume_warm()
         if not rw.pending():
             return 0
-        if not getattr(sched, "weg2_post_wake_settle", None):
+        if getattr(sched, "weg2_dormant", False):
+            return 0  # the flip is not over: never in the leg (x147)
+        # "settle over" only once this wake's hold was released (open_settle in
+        # _weg2_release_dormant_hold, the same resume on every rank); before
+        # that an empty settle is "not built yet", not "done".
+        if rw.settle_open and not getattr(sched, "weg2_post_wake_settle", None):
             rw.cancel("settle_done")
             return 0
-        if getattr(sched, "weg2_dormant", False) or not _weg2_device_idle(sched):
+        if not _weg2_device_idle(sched):
             return 0
         return rw.tick()
     except Exception as exc:  # noqa: BLE001 -- a hint never breaks a pass
@@ -6441,6 +6446,12 @@ class Scheduler(
         hold = getattr(self, "weg2_dormant_hold", None) or []
         # WT: this wake's number (every rank runs this at the same resume)
         self._weg2_wake_seq = int(getattr(self, "_weg2_wake_seq", 0) or 0) + 1
+        try:  # RW: this wake's settle is open (an empty settle = over, from now on)
+            from sglang.srt.layers.moe.expert_offload import resume_warm as _rw
+
+            _rw().open_settle()
+        except Exception:  # noqa: BLE001 -- a hint never breaks the wake
+            pass
         try:  # xsn329/330: the handed-over keys served the hold; the wake re-admits from the tree
             from sglang.srt.managers import cache_controller as _cc
             from sglang.srt.weg2 import handoff as _ho

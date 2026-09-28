@@ -203,11 +203,49 @@ class TheScheduler(_Env):
         self.assertEqual(sched_mod._weg2_resume_warm_tick(self._sched(running=True)), 0)
         self.assertEqual(sched_mod._weg2_resume_warm_tick(self._sched(dormant=True)), 0)
         self.assertEqual(rw.pending(), 3)
+        rw.open_settle()  # the wake released its hold (_weg2_release_dormant_hold)
         self.assertEqual(sched_mod._weg2_resume_warm_tick(self._sched()), 1)
         self.assertEqual(rw.pending(), 2)
         self.assertEqual(sched_mod._weg2_resume_warm_tick(self._sched(settle=False)), 0)
         self.assertEqual(rw.pending(), 0)          # the settle is over: the rest is skipped
         self.assertIn("cancel=settle_done", rw.fields())
+
+    def test_passes_before_the_hold_release_do_not_cancel_the_warm(self):
+        # NF rc12z26 (dc1d5d3da0), 8/8 wakes: warm_layers=0 skipped_cancel=48
+        # cancel=settle_done. The arm runs in the weights leg; the dormant hold
+        # is released (and the #1471 settle built) by a LATER resume RPC. A
+        # scheduler pass in between saw an empty settle and cancelled the warm
+        # as "settle over" before the settle existed.
+        rw = self._armed()
+        os.environ[eo.RESUME_WARM_LAYERS_ENV] = "1"
+        # legs still running (dormant): nothing, the queue stays
+        self.assertEqual(sched_mod._weg2_resume_warm_tick(self._sched(settle=False, dormant=True)), 0)
+        self.assertEqual(rw.pending(), 3)
+        # flip over, hold not yet released, device idle: warm, never cancel
+        self.assertEqual(sched_mod._weg2_resume_warm_tick(self._sched(settle=False)), 1)
+        self.assertEqual(rw.pending(), 2)
+        self.assertNotIn("cancel=settle_done", rw.fields())
+        # the release opens the settle; while it holds requests the warm goes on
+        rw.open_settle()
+        self.assertEqual(sched_mod._weg2_resume_warm_tick(self._sched()), 1)
+        self.assertEqual(rw.pending(), 1)
+        # the settle drained: now an empty settle is "over"
+        self.assertEqual(sched_mod._weg2_resume_warm_tick(self._sched(settle=False)), 0)
+        self.assertEqual(rw.pending(), 0)
+        self.assertIn("cancel=settle_done", rw.fields())
+
+    def test_the_next_arm_closes_the_settle_again(self):
+        rw = self._armed()
+        rw.open_settle()
+        self.assertTrue(rw.settle_open)
+        self._armed()
+        self.assertFalse(eo.resume_warm().settle_open)
+
+    def test_the_hold_release_opens_the_settle(self):
+        rw = self._armed()
+        s = types.SimpleNamespace(weg2_dormant_hold=[], _weg2_wake_seq=0)
+        sched_mod.Scheduler._weg2_release_dormant_hold(s)
+        self.assertTrue(rw.settle_open)
 
     def test_one_line_per_wake_at_the_first_decode(self):
         import time

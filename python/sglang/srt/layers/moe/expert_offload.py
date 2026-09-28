@@ -6553,6 +6553,12 @@ class ResumeWarm:
         self.reset_stats()
         self.snap_layers, self.snap_rows, self.snap_ms = stats
         self._queue = []
+        # The settle of THIS wake is not open yet: the arm runs in the weights
+        # leg, the dormant hold is released (and the #1471 settle built) by a
+        # later resume RPC -- the scheduler passes in between must not read
+        # "no settle" as "settle over" (NF rc12z26: 8/8 wakes cancel=settle_done
+        # with warm_layers=0).
+        self._settle_open = False
         if not resume_warm_enabled():
             return 0
         for model in models:
@@ -6560,6 +6566,15 @@ class ResumeWarm:
                 if getattr(cache, "_rw_snap", None):
                     self._queue.append(cache)
         return len(self._queue)
+
+    def open_settle(self) -> None:
+        """The wake's dormant hold was released: from now on an empty settle
+        means the settle is over."""
+        self._settle_open = True
+
+    @property
+    def settle_open(self) -> bool:
+        return bool(getattr(self, "_settle_open", False))
 
     def pending(self) -> int:
         return len(self._queue)
