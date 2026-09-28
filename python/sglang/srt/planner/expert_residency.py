@@ -2393,6 +2393,7 @@ def kv_stage_table(
     rows: Sequence[SeatTableRow], form: SeatVramForm, *, kv_cell_bytes: int, kv_tokens: int,
     local_experts: int, verify_tokens: int, top_k: int, host_rank: int = 0,
     steps: Sequence[float] = (0.5, 1.0), staging_rows: int = 0,
+    why: Optional[List[str]] = None,
 ) -> Optional[KvStageTable]:
     """#251c: the stage form over the H95 seat table (n = 1..cap).
 
@@ -2406,24 +2407,37 @@ def kv_stage_table(
     of n seats replays every b <= n; at stage j it has C + seat_extra(n) -
     stage_rows[j] rows. The highest j with that >= the need of every b <= n is
     ``max_by_seats[n-1]`` -- no batch gains a wave. None when the geometry is
-    incomplete (no KV cell, no scratch)."""
-    if not rows or int(kv_cell_bytes) <= 0 or int(kv_tokens) <= 0:
+    incomplete (no KV cell, no scratch) or when the scratch cannot give the top
+    stage's rows and keep its staging (C - S <= staging); ``why`` (a list)
+    then gets the reason with its numbers."""
+    def _none(reason: str) -> None:
+        if why is not None:
+            why.append(reason)
         return None
+
+    if not rows or int(kv_cell_bytes) <= 0 or int(kv_tokens) <= 0:
+        return _none("keine KV-Zelle (Zeilen %d, kv_cell_bytes %d, kv_tokens %d)"
+                     % (len(rows or ()), int(kv_cell_bytes), int(kv_tokens)))
     h = int(host_rank)
     last = rows[-1]
     if h >= len(last.scratch_given):
-        return None
+        return _none("kein Scratch fuer Rang %d in der Sitz-Tabelle" % h)
     C = int(last.scratch_given[h])
     R = int(last.max_rows[h]) - C
     row_bytes = (int(form.expert_row_bytes) - int(form.small_row_bytes)) * int(form.moe_layers)
     if C <= 0 or row_bytes <= 0:
-        return None
+        return _none("keine Scratch-Geometrie (Scratch %d, Stufenzeile %d B)" % (C, row_bytes))
     t0 = int(kv_tokens)
     tokens = (t0,) + tuple(t0 + int(round(t0 * float(s))) for s in steps)
     stage_rows = tuple(-(-(t - t0) * int(kv_cell_bytes) // row_bytes) for t in tokens)
     S = int(stage_rows[-1]) + 1
     if C - S <= max(1, int(staging_rows)):
-        return None
+        return _none(
+            "Scratch zu klein fuer die oberste Stufe: C %d - S %d = %d <= Staging %d "
+            "(Stufen %s Token, Stufenzeilen %s bei %d B/Token und %.1f MiB/Zeile) -- "
+            "D faehrt fest %d Token"
+            % (C, S, C - S, max(1, int(staging_rows)), ",".join(str(t) for t in tokens),
+               ",".join(str(r) for r in stage_rows), int(kv_cell_bytes), row_bytes / 2**20, t0))
     E = int(local_experts)
     per_seat = int(verify_tokens) * int(top_k)
     need_b, demand, waves = [], [], []

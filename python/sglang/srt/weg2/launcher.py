@@ -2612,12 +2612,13 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
                 % (head, D_KV_STAGE_KEYS[0], env[D_KV_STAGE_KEYS[0]])]
     fits = list(getattr(plan, "fits", None) or ())
     host = next((f for f in fits if f.rank == host_rank), None)
+    why: List[str] = [] if host is not None else ["kein Attention-Host %d im Plan" % host_rank]
     tab = None if host is None else er.kv_stage_table(
         rows, seat_vram, kv_cell_bytes=int(host.kv_cell_bytes), kv_tokens=int(host.kv_tokens),
         local_experts=int(host.local_experts), verify_tokens=int(verify_tokens),
-        top_k=int(top_k), host_rank=host_rank, staging_rows=int(host.staging_rows))
+        top_k=int(top_k), host_rank=host_rank, staging_rows=int(host.staging_rows), why=why)
     if tab is None:
-        return ["%s: entfaellt (keine KV-Zelle/Scratch-Geometrie auf dem Attention-Host)" % head]
+        return ["%s: entfaellt -- %s" % (head, "; ".join(why) or "ohne Grund")]
     op_raw = env.get(D_KV_STAGE_KEYS[2])
     op_max = operator_kv_stage_max(op_raw, len(tab.max_by_seats), len(tab.tokens))
     max_by = tab.max_by_seats if op_max is None else op_max
