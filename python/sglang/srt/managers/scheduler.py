@@ -21571,7 +21571,7 @@ def configure_scheduler_process(
     _dcp_size = getattr(server_args, "dcp_size", 1)
     if (
         _dcp_size > 1
-        and base_plan is not None
+        and (base_plan is not None or getattr(server_args, "weightless_kv_fastlane", False))
         and server_args.uneven_weighted_dcp_enabled()
     ):
         # #897: SGLANG_UNEVEN_TOKEN_VECTOR beats --rank-kv-ratio on PRESENCE

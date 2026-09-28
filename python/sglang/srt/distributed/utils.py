@@ -1163,6 +1163,19 @@ def announce_superseded_rank_kv_ratio(server_args) -> None:
     )
 
 
+def reduce_token_vector(vector: Sequence[int]) -> Optional[list]:
+    """THE one gcd reduction of a KV-token ownership vector (rank form, 28.09.:
+    one rule for #239's Form A cut and the weightless lane). ``None`` for an
+    all-equal vector -- the even modulo fast path, bit-identical. Zeros are
+    kept (a 0 is a layout: a rank that owns no rows); callers decide whether
+    their backend admits one."""
+    vec = [int(v) for v in vector]
+    if not vec or len(set(vec)) == 1:
+        return None
+    g = math.gcd(*vec)
+    return [v // g for v in vec]
+
+
 def resolve_cp_token_ratios(
     server_args, checkpoint_size_mib: Optional[int] = None
 ) -> Optional[list]:
@@ -1198,6 +1211,25 @@ def resolve_cp_token_ratios(
     vector (the pool pinning and owner rule must agree across ranks)."""
     weights = getattr(server_args, "rank_tp_ratio", None)
     dcp_size = getattr(server_args, "dcp_size", 1)
+    if getattr(server_args, "weightless_kv_fastlane", False) and dcp_size > 1:
+        # Rank form (28.09.): the lane is a base plan of its own (head holds
+        # the weights, every other rank KV only), so the #239 token vector is
+        # its ONE source too. Every rank owns >= 1 share on the lane: the
+        # pool is pinned per rank on local/ratio and the head also writes KV.
+        from sglang.srt.environ import envs as _envs
+
+        _env_vec = _envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()
+        if not _env_vec:
+            return None
+        parsed = [int(x) for x in _env_vec.split(",") if x.strip() != ""]
+        if len(parsed) != dcp_size or any(v < 1 for v in parsed):
+            raise ValueError(
+                f"SGLANG_UNEVEN_TOKEN_VECTOR={_env_vec!r} on --weightless-kv-fastlane must be "
+                f"{dcp_size} POSITIVE integers (one per rank; the lane head writes and "
+                "attends KV too, a 0 there is a #239 Form A layout, not a lane one). "
+                "W181 Weg2RankFormShapeMismatch"
+            )
+        return reduce_token_vector(parsed)
     if not weights or dcp_size <= 1 or len(set(weights)) == 1:
         # HONESTY GUARD (measured): this bail-out runs BEFORE the env vector
         # is read, so SGLANG_UNEVEN_TOKEN_VECTOR without a non-uniform
@@ -1260,10 +1292,9 @@ def resolve_cp_token_ratios(
         _refuse_retracted_token_vector(
             server_args, parsed, "SGLANG_UNEVEN_TOKEN_VECTOR"
         )
-        if len(set(parsed)) == 1:
+        reduced = reduce_token_vector(parsed)
+        if reduced is None:
             return None
-        g = math.gcd(*parsed)
-        reduced = [v // g for v in parsed]
         # #797: a SEED claims it will be superseded in-process. Arm the claim
         # here, where the estimate actually enters the boot, so that
         # assert_seed_superseded() can hold the boot to it later. Armed with
@@ -1281,10 +1312,7 @@ def resolve_cp_token_ratios(
     kv_flag = getattr(server_args, "rank_kv_ratio", None)
     if isinstance(kv_flag, list) and len(kv_flag) == dcp_size:
         _refuse_retracted_token_vector(server_args, kv_flag, "--rank-kv-ratio")
-        if len(set(kv_flag)) == 1:
-            return None
-        g = math.gcd(*kv_flag)
-        return [v // g for v in kv_flag]
+        return reduce_token_vector(kv_flag)
 
     # Planner phase-1 SEED: the predicted per-rank capacity vector, parked by
     # apply_auto_performance. Below the explicit pin and the env override,
@@ -1299,10 +1327,7 @@ def resolve_cp_token_ratios(
     # the derived modes); under 'coupled' it is the boot vector.
     seed = getattr(server_args, "rank_kv_capacity_seed", None)
     if isinstance(seed, list) and len(seed) == dcp_size and all(v > 0 for v in seed):
-        if len(set(seed)) == 1:
-            return None
-        g = math.gcd(*seed)
-        return [v // g for v in seed]
+        return reduce_token_vector(seed)
 
     if checkpoint_size_mib is None:
         checkpoint_size_mib = _checkpoint_size_mib(

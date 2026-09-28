@@ -10875,6 +10875,8 @@ class ServerArgs:
             os.environ.get("SGLANG_UNEVEN_DCP_WEIGHTED", "0") == "1"
             or self.uneven_kv_flag_active()
             or bool(self.form_a_dcp_vector())
+            # rank form (28.09.): the #239 token vector on the weightless lane
+            or bool(self.weightless_kv_fastlane and self.uneven_token_vector)
         )
 
     def world_rank(self, pp_rank: int, tp_rank: int) -> int:
@@ -11181,6 +11183,27 @@ class ServerArgs:
         )
         if res.token_vector:
             logger.info("#239 S3a FORM-A DCP: dcp_size=%d -- %s", res.dcp_size, res.reason)
+
+    def _refuse_second_token_vector_source(self) -> None:
+        """Rank form (28.09., NF review 2): when ``--uneven-token-vector`` is set
+        it is the ONE source of the KV-token ownership vector. An explicit
+        second vector beside it -- ``--rank-kv-ratio a,b,c`` or a
+        ``rank_kv_capacity_seed`` list -- is refused by name instead of losing
+        silently on precedence (#897). A MODE (``--rank-kv-ratio capacity`` /
+        ``speed``) is not a second vector: it measures and supersedes a seed."""
+        if not self.uneven_token_vector:
+            return
+        second = []
+        if isinstance(self.rank_kv_ratio, list):
+            second.append(f"--rank-kv-ratio {','.join(str(v) for v in self.rank_kv_ratio)}")
+        if isinstance(getattr(self, "rank_kv_capacity_seed", None), list):
+            second.append(f"rank_kv_capacity_seed {self.rank_kv_capacity_seed}")
+        if second:
+            raise ValueError(
+                f"--uneven-token-vector {self.uneven_token_vector} is the one source of the "
+                f"KV-token vector; {' and '.join(second)} beside it would lose silently on "
+                "precedence (#897). Drop the second vector. W185 Weg2TokenVectorTwoSources"
+            )
 
     def _admit_lane_rank_tp_ratio(self) -> None:
         """--rank-tp-ratio under --weightless-kv-fastlane (rank form, 28.09.):
@@ -12225,6 +12248,7 @@ class ServerArgs:
             and not self.rank_role
         ):
             self._admit_lane_rank_tp_ratio()
+        self._refuse_second_token_vector_source()
 
         # Form A roles need an EXPLICIT partition, and a resolved one.
         if self.rank_role:

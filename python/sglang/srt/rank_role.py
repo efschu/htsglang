@@ -30,7 +30,6 @@ that is wired loses its guard; a seam that is not keeps it until it is.
 
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -1104,8 +1103,9 @@ def _resolve_token_cut(
             f"{vec}: a token cut over {n} ranks is DCP over all {n}. Drop the "
             "flag; the cut decides the DCP group."
         )
-    g = math.gcd(*vec)
-    reduced = tuple(v // g for v in vec)
+    from sglang.srt.distributed.utils import reduce_token_vector
+
+    reduced = tuple(reduce_token_vector(vec) or [1] * n)
     return DcpResolution(
         dcp_size=n,
         uneven_dcp_kv_replicated=True,

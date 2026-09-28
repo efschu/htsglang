@@ -192,6 +192,13 @@ def resolve_rank_form(
     elif len(weight_ranks) == 1:
         kind = FORM_A
         backend = BACKEND_LANE if dense else BACKEND_FORM_A_239
+        if backend == BACKEND_LANE and t is not None and t[weight_ranks[0]] == 0:
+            # the lane head writes and attends KV too and the pool is pinned
+            # on local/ratio per rank (distributed.utils.resolve_cp_token_ratios)
+            raise _refuse(
+                RankFormShapeMismatch,
+                f"tokens {list(t)}: on the weightless lane the head rank {weight_ranks[0]} "
+                f"needs a token share >= 1 (host 0 is a #239 Form A layout for MoE/QSA)")
     else:
         kind = FORM_B
         if not subgroup_tp_wired:
