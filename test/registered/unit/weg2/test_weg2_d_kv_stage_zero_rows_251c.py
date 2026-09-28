@@ -21,6 +21,7 @@ from unittest import mock
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
+import pytest  # noqa: E402
 import torch  # noqa: E402
 
 from sglang.srt import rank_role  # noqa: E402
@@ -88,8 +89,15 @@ def _armed(tms, rank=None):
                  mock.patch.object(dsv, "_KV_BORN", [])])
 
 
-def teardown_function(_fn):
-    rank_role.set_form_a_role_plan(None, 0)
+@pytest.fixture(autouse=True)
+def _restore_role_plan():
+    """Every test leaves the installed Form A plan exactly as it found it
+    (27B 28.09.: a plan left behind made later suites order-dependent)."""
+    prev = (rank_role._INSTALLED_PLAN, rank_role._INSTALLED_RANK)
+    try:
+        yield
+    finally:
+        rank_role._INSTALLED_PLAN, rank_role._INSTALLED_RANK = prev
 
 
 def _pool(size=192):
