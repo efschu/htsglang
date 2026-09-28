@@ -596,6 +596,77 @@ def _arriving_prefill_tokens(inflight, _already_queued=None, exclude=None) -> in
 #: #1290 vote publishes (see `_prefetch_deferral_refusal_reason`).
 _DEFER_REASON_RATE = "rate_limited"
 _DEFER_REASON_SHORTFALL = "host_pool_shortfall"
+#: HP1: the longest pass interval between two re-issues of one group-arm
+#: mark (`Scheduler._hp1_group_retry_due`).
+_HP1_RETRY_MAX_INTERVAL = 16
+
+
+def _hp1_group_retry_due(sched, req) -> bool:
+    """HP1: is this pass one on which a GROUP-arm mark re-issues its read?
+
+    rc12z20 weg2-8-2: one host_pool_shortfall mark re-issued the store
+    read -- intake re-match plus the #580 vote collective -- on EVERY
+    scheduler pass for 64 s (638 group truncations, 22 M tokens
+    attempted); the decode round's host share went from ~13 to ~32 ms
+    (sched_ms 3 -> 24). A group cut does not heal pass by pass.
+
+    The back-off is counted in RETRY PASSES of this mark (1, 2, 4, 8, 16,
+    then every 16th), never in wall time: the retry set and its order are
+    rank-identical by construction (see `_retry_deferred_prefetches`) and
+    so is this count, so every rank skips and enters the vote together.
+    A fresh mark (``prefetch_defer_since`` changed) restarts at 1. The
+    RATE arm is untouched. A skipped pass still runs the arm's re-defer
+    step (rank-local, no collective), so the #1317k standstill bound keeps
+    counting passes, not retries.
+    """
+    if getattr(req, "prefetch_deferred", None) not in (
+        _DEFER_REASON_SHORTFALL,
+        _DEFER_REASON_STORE_SHORT,
+    ):
+        return True
+    key = getattr(req, "prefetch_defer_since", None)
+    if getattr(req, "_hp1_retry_key", None) != key:
+        req._hp1_retry_key = key
+        req._hp1_retry_seen = 0
+    n = int(getattr(req, "_hp1_retry_seen", 0) or 0) + 1
+    req._hp1_retry_seen = n
+    interval = min(_HP1_RETRY_MAX_INTERVAL, 1 << (n.bit_length() - 1))
+    if n % interval == 0:
+        return True
+    # A skipped pass is still a pass of this mark: it goes through the arm's
+    # own re-defer step (attempts, the #1317k stall witness and its named
+    # terminal exits) exactly as a retry that came back cut again -- only the
+    # store read and its vote are not re-issued. So the standstill bound keeps
+    # counting passes and exits on the same pass it did before.
+    _arm = getattr(sched, "_apply_group_shortfall_deferral", None)
+    if callable(_arm):
+        _arm(
+            req,
+            str(getattr(req, "rid", "?"))[:8],
+            getattr(req, "_prefetch_span_tokens", None),
+            True,
+            "retry_backoff",
+            reason=str(getattr(req, "prefetch_deferred", None)),
+        )
+    else:
+        _note = getattr(sched, "_weg2_note_prefetch_progress", None)
+        if callable(_note):
+            _note(req)
+    skipped = getattr(sched, "_hp1_retry_skipped", 0) + 1
+    sched._hp1_retry_skipped = skipped
+    if skipped <= 8 or skipped % 1024 == 0:
+        logger.info(
+            "HP1 DEFER-RETRY BACKOFF rid=%s mark=%s pass=%d interval=%d "
+            "(skipped=%d): the group-cut read is re-voted on a pass back-off, "
+            "not every pass",
+            str(getattr(req, "rid", "?"))[:16],
+            getattr(req, "prefetch_deferred", None),
+            n,
+            interval,
+            skipped,
+        )
+    return False
+
 #: #1324: the THIRD producer of the same deferral, and the reason it is a
 #: separate NAME rather than a reuse of ``host_pool_shortfall``. Both mean "the
 #: read landed holding less than the request needs, and the moment it leaves
@@ -8719,11 +8790,14 @@ class Scheduler(
             if reason is not None:
                 self._drop_prefetch_deferral(req, reason, site="retry")
                 continue
+            if not _hp1_group_retry_due(self, req):
+                continue
             verdict = self._prefetch_kvcache(req)
             req._969c_verdict = verdict
             self._apply_prefetch_deferral(req, verdict, site="retry")
             retried += 1
         return retried
+
 
     def _admission_held_for_deferred_prefetch(self, req) -> bool:
         """True when the admission loop must skip ``req`` this pass.
