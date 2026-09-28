@@ -199,6 +199,19 @@ class MHATokenToKVPoolHost(HostKVCache):
             )
         )
 
+        self._bind_data_refs()
+        self._init_write_back_staging_buffers()
+
+    def _bind_data_refs(self) -> None:
+        """Per-layer views of ``kv_buffer`` and their pointer vectors.
+
+        #760 (rc12z4-vis, D TP1/TP2 06:24:47): taken ONCE at construction,
+        these outlived the buffer they view when #249 re-shaped a byteless
+        pool (``_regrow_byteless_buffer``, 353600 -> 436032 rows at 06:24:34).
+        The #760 seam guard reads its host capacity from ``k_data_refs`` and
+        refused the legal backup of weg2-0-14 into grown row 365887 as
+        ``dst indices out of bounds ... capacity 353600``. Bound here, and
+        re-bound by every re-shape, so views and buffer never disagree."""
         if self.layout == "page_first":
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
             # This swaps strides without copying data
@@ -219,7 +232,6 @@ class MHATokenToKVPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
-        self._init_write_back_staging_buffers()
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -321,6 +333,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             return
         self.kv_buffer = torch.empty(dims, dtype=self.dtype, device=self.kv_buffer.device)
+        # #760: the per-layer views were cut from the old buffer
+        if getattr(self, "k_data_refs", None) is not None:
+            self._bind_data_refs()
 
     @property
     def k_buffer(self):
