@@ -161,3 +161,55 @@ def test_h106b_periodic_counter_line(pool, monkeypatch, caplog):
     lines = _skip_lines(caplog)
     assert len(lines) == 2, lines  # the transfer line + one periodic line
     assert "(periodic)" in lines[1] and "suppressed_since_last_print=3" in lines[1]
+
+
+# ---- PA review of 1bab093912: the fold key names the pool; the load and backup
+# threads share the fold state and each keeps its own direction ------------------
+
+def test_h106b_two_pools_with_the_same_ids_are_two_transfers(pool, monkeypatch, caplog):
+    """RED on 1bab093912: the key was (dir, first id, pages) class-wide, so a
+    second sidecar pool skipping the same ids was folded into the first."""
+    import logging
+
+    dev, host = pool
+    other = QSAPagedHostPool([dev], num_host_tokens=HOST_PAGES * PAGE, page_size=PAGE,
+                             layout="layer_first", pin_memory=False)
+    other.pool_name = "qsa_other"
+    monkeypatch.setattr(rank_role, "this_rank_is_form_a_worker", lambda: True)
+    monkeypatch.setattr(QSAPagedHostPool, "_h106_open", None)
+    caplog.set_level(logging.WARNING, logger="sglang.srt.mem_cache.qsa_pool_host")
+    host.load_to_device_per_layer(dev, _ids([HOST_PAGES]), _ids([5]), 0, "direct")
+    other.load_to_device_per_layer(dev, _ids([HOST_PAGES]), _ids([5]), 0, "direct")
+    lines = _skip_lines(caplog)
+    assert len(lines) == 2, lines
+    assert "pool=qsa_other" in lines[1]
+
+
+def test_h106b_a_backup_in_another_thread_does_not_rename_a_load(pool, monkeypatch, caplog):
+    """RED on 1bab093912: the direction was an instance attribute; a backup the
+    backup thread starts while the load thread is between its direction and
+    its skip made the load's line say dir=backup."""
+    import logging
+    import threading
+
+    dev, host = pool
+    state = {"inside": False}
+
+    def _worker():
+        if not state["inside"] and threading.current_thread() is threading.main_thread():
+            state["inside"] = True
+            t = threading.Thread(target=lambda: host.backup_from_device_all_layer(
+                dev, _ids([HOST_PAGES + 3]), _ids([1]), "direct"))
+            t.start()
+            t.join()
+        return True
+
+    monkeypatch.setattr(rank_role, "this_rank_is_form_a_worker", _worker)
+    monkeypatch.setattr(QSAPagedHostPool, "_h106_open", None)
+    caplog.set_level(logging.WARNING, logger="sglang.srt.mem_cache.qsa_pool_host")
+    host.load_to_device_per_layer(dev, _ids([HOST_PAGES]), _ids([5]), 0, "direct")
+    lines = _skip_lines(caplog)
+    import re
+
+    dirs = [re.search(r"SIDECAR SKIP pool=\S+ dir=(\w+)", ln).group(1) for ln in lines]
+    assert dirs == ["backup", "load"], lines
