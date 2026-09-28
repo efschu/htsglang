@@ -23,3 +23,9 @@
 [2026-09-24 10:31:25 TP0] [vram-peak] decode (4 rows): allocator peak since pools 23.23 GiB, allocated now 22.31, reserved 27.66, card free 1.04 of 31.34 GiB -> transient headroom used = peak - allocated 0.92 GiB | cache = reserved - allocated 5.36 GiB, of which fragmentation (inactive split) 1.32 GiB, alloc retries 31
 [2026-09-24 10:31:25 TP2] [vram-peak] decode (4 rows): allocator peak since pools 14.10 GiB, allocated now 13.32, reserved 14.21, card free 4.15 of 19.58 GiB -> transient headroom used = peak - allocated 0.78 GiB | cache = reserved - allocated 0.89 GiB, of which fragmentation (inactive split) 0.67 GiB, alloc retries 1
 [2026-09-24 10:31:25 TP1] [vram-peak] decode (4 rows): allocator peak since pools 14.09 GiB, allocated now 13.28, reserved 14.02, card free 4.32 of 19.58 GiB -> transient headroom used = peak - allocated 0.81 GiB | cache = reserved - allocated 0.74 GiB, of which fragmentation (inactive split) 0.52 GiB, alloc retries 2
+[2026-09-24 10:29:47 TP0] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 262144, K size: 1.50 GB, V size: 1.50 GB
+[2026-09-24 10:29:47 TP1] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 262144, K size: 0.00 GB, V size: 0.00 GB
+[2026-09-24 10:29:47 TP2] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 262144, K size: 0.00 GB, V size: 0.00 GB
+[2026-09-24 10:29:46 TP2] KV pool sizing: available_bytes=3573547008 (3.328 GiB), cell_size=768, page_size=64 -> max_total_num_tokens=4653056
+[2026-09-24 10:29:46 TP1] KV pool sizing: available_bytes=3768582144 (3.510 GiB), cell_size=768, page_size=64 -> max_total_num_tokens=4907008
+[2026-09-24 10:29:46 TP0] KV pool sizing: available_bytes=5723963392 (5.331 GiB), cell_size=14143, page_size=64 -> max_total_num_tokens=404672
