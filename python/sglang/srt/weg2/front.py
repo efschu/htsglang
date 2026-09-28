@@ -58,6 +58,7 @@ import re
 import statistics
 import subprocess
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
@@ -97,6 +98,7 @@ from sglang.srt.weg2 import host_ledger
 from sglang.srt.weg2 import prefill_clock  # UNIFY S4 (H85): D's prefill clock reader (stdlib only)
 from sglang.srt.weg2 import dp_wait as _dp_wait  # R28: DP-WAIT instrument
 from sglang.srt.weg2 import phase_policy  # H91 part C
+from sglang.srt.weg2 import p_read_overlap as _ro  # RO: P computes while a store read runs
 from sglang.srt.weg2 import resume_via_p as _rvp  # RESUME-VIA-P
 from sglang.srt.weg2 import handoff_seam as _hs  # #243 seam: HANDOFF-LOST reroute + rid-end drop
 from sglang.srt.weg2 import session_trace as _st  # SESSION-TRACE: session hash + shared prefix
@@ -2674,7 +2676,8 @@ class Group:
 
 async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                         max_dispatch: int = 0, cost=None, budget: int = 0,
-                        stats: Optional[Dict[str, int]] = None) -> int:
+                        stats: Optional[Dict[str, int]] = None,
+                        extra=None, poll_s: float = 0.0) -> int:
     """#1459c: keep up to ``limit`` leg-1 calls in flight, refilling from
     ``queue`` (a deque; new arrivals appended while draining are taken too)
     the moment ONE finishes.  ``on_done(p)`` runs in COMPLETION order, and
@@ -2699,6 +2702,12 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
 
     ``stats`` (optional) is filled with ``dispatched``, ``peak_n``,
     ``peak_tokens`` and ``pool_holds`` for the drain's P-PHASE line.
+
+    RO (weg2.p_read_overlap): ``extra(items)`` gets the in-flight items and
+    returns how many dispatches may go beyond ``limit`` (one per leg P only
+    holds for its store read); with it the pool also wakes every ``poll_s``
+    while legs are in flight, not only on a completion. ``stats`` then also
+    counts ``overlap_dispatched``.
     """
     inflight: Dict[Any, int] = {}
     inflight_tokens = 0
@@ -2709,13 +2718,23 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     # law 2) in Task-id order, i.e. shuffled. Within one round they go in
     # dispatch order, which is the queue's (arrival) order.
     seq: Dict[Any, int] = {}
+    items: Dict[Any, Any] = {}
     rounds = 0
     if stats is not None:
-        for k in ("dispatched", "peak_n", "peak_tokens", "pool_holds"):
+        for k in ("dispatched", "peak_n", "peak_tokens", "pool_holds", "overlap_dispatched"):
             stats.setdefault(k, 0)
+
+    def _cap() -> int:
+        if extra is None or len(inflight) < limit:
+            return limit
+        try:
+            return limit + max(0, int(extra(list(items.values()))))
+        except Exception:  # noqa: BLE001 - the instrument never stops the drain
+            return limit
+
     while True:
         dispatched = False
-        while queue and len(inflight) < limit and may_dispatch():
+        while queue and len(inflight) < _cap() and may_dispatch():
             if phase_policy.phase_cap_reached(dispatched_total, max_dispatch):
                 break
             c = int(cost(queue[0])) if (cost is not None and budget > 0) else 0
@@ -2723,24 +2742,32 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                 if stats is not None:
                     stats["pool_holds"] += 1
                 break
-            t = asyncio.ensure_future(one(queue.popleft()))
+            _beyond = len(inflight) >= limit
+            item = queue.popleft()
+            t = asyncio.ensure_future(one(item))
             inflight[t] = c
+            items[t] = item
             seq[t] = dispatched_total
             inflight_tokens += c
             dispatched_total += 1
             dispatched = True
             if stats is not None:
                 stats["dispatched"] = dispatched_total
+                if _beyond:
+                    stats["overlap_dispatched"] += 1
                 stats["peak_n"] = max(stats["peak_n"], len(inflight))
                 stats["peak_tokens"] = max(stats["peak_tokens"], inflight_tokens)
         if dispatched:
             rounds += 1
         if not inflight:
             return rounds
-        done, _pending = await asyncio.wait(set(inflight), return_when=asyncio.FIRST_COMPLETED)
+        done, _pending = await asyncio.wait(
+            set(inflight), return_when=asyncio.FIRST_COMPLETED,
+            timeout=(poll_s if (extra is not None and poll_s > 0 and queue) else None))
         for t in sorted(done, key=seq.__getitem__):
             inflight_tokens -= inflight.pop(t, 0)
             seq.pop(t, None)
+            items.pop(t, None)
             on_done(t.result())
 
 
@@ -9795,7 +9822,20 @@ class Front:
         # prefill -- boot weg2xsn214 measured a 3 s GPU-idle gap per 100k
         # request between one prefill and the next.
         _ahead = max(0, int(os.environ.get("SGLANG_WEG2_P_QUEUE_AHEAD", "1") or 0))
-        sem = asyncio.Semaphore(self.p_concurrency + _ahead)
+        # RO (weg2.p_read_overlap): a leg P only holds for its store read (or
+        # its twin's, or its pacing window) frees one extra slot, at most
+        # _ro_max; the semaphore is sized for them, the pool enforces the cap.
+        _ro_max = _ro.max_extra() if _ro.enabled() else 0
+        _ro_state = None
+        if _ro_max > 0:
+            try:
+                _ro_state = _ro.ReadState(urllib.parse.urlparse(self.groups["P"].url).port)
+            except Exception:  # noqa: BLE001
+                _ro_state, _ro_max = None, 0
+        sem = asyncio.Semaphore(self.p_concurrency + _ahead + _ro_max)
+        logger.info("WEG2 P-READ-OVERLAP max_extra=%d state=%s (RO: legs P holds for a store "
+                    "read free a dispatch slot each; 0 = the p_concurrency+ahead cap alone)",
+                    _ro_max, getattr(_ro_state, "path", None))
         await self._adopt_first_flip()
         while True:
             # 27B flipfast F2/F3: the 0.2 s tick, ended early by a kick when a
@@ -10044,7 +10084,18 @@ class Front:
                     max_dispatch=self.p_phase_max_requests,
                     cost=lambda p: phase_policy.p_request_cost(
                         p.est_prompt, p.leg1_prompt_tokens, p.skip_leg1),
-                    budget=self.p_pool_tokens, stats=_phase_stats)
+                    budget=self.p_pool_tokens, stats=_phase_stats,
+                    extra=(None if _ro_state is None else
+                           (lambda ps: _ro.extra_slots((q.rid for q in ps), _ro_state.rids(), _ro_max))),
+                    poll_s=_ro.POLL_S)
+                if _phase_stats.get("overlap_dispatched"):
+                    self.counters["p_read_overlap"] += _phase_stats["overlap_dispatched"]
+                    logger.info("WEG2 P-READ-OVERLAP epoch=%d overlap_dispatched=%d dispatched=%d "
+                                "peak_n=%d base=%d (RO: dispatched while P held legs for their "
+                                "store reads -- P computed them instead of idling)",
+                                self.epoch, _phase_stats["overlap_dispatched"],
+                                _phase_stats["dispatched"], _phase_stats["peak_n"],
+                                self.p_concurrency + _ahead)
                 if passes and (self.p_phase_max_requests or self.p_pool_tokens):
                     _cap_hit = phase_policy.phase_cap_reached(
                         _phase_stats["dispatched"], self.p_phase_max_requests)

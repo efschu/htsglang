@@ -2999,7 +2999,7 @@ class HiCacheFile(HiCacheStorage):
             return False
         return False
 
-    def arena_fill_from_disk(self, arena, stems, total_bytes: int):
+    def arena_fill_from_disk(self, arena, stems, total_bytes: int, prefix: bool = False):
         """#1433: the L3 -> L2 return path. For every stem that is NOT in the
         arena but IS on disk: claim a slot, read the whole canonical page from
         the disk store straight into the slot, complete it. Returns one entry
@@ -3007,7 +3007,12 @@ class HiCacheFile(HiCacheStorage):
         the page is not on disk / could not be read / is being filled by
         another writer right now (join later, it is a miss for this read).
         Before #1433 the arena was a write-only sink towards the disk: a
-        page evicted to L3 was never read back, the prefix was recomputed."""
+        page evicted to L3 was never read back, the prefix was recomputed.
+
+        ``prefix=True`` (EG review of L3-FAST, (a)): the stems are a PREFIX
+        walk -- nothing past the first page that can not be had (not on disk,
+        or a claim that yields no slot) is claimed or read; claims already
+        taken past it are freed unread. The answer for those stems is None."""
         n = len(stems)
         out = [None] * n
         if n == 0:
@@ -3022,7 +3027,11 @@ class HiCacheFile(HiCacheStorage):
         # claim/read/complete per page. The claim statuses and what a page
         # yields are exactly the per-page loop's; only the calls are batched.
         t0 = time.perf_counter()
-        cand = [(i, st) for i, st in enumerate(stems) if st in on_disk]
+        if prefix:
+            _gap = next((i for i, st in enumerate(stems) if st not in on_disk), n)
+            cand = [(i, st) for i, st in enumerate(stems[:_gap])]
+        else:
+            cand = [(i, st) for i, st in enumerate(stems) if st in on_disk]
         todo = []
         if cand:
             claims = arena.claim_slots([st for _, st in cand], [int(total_bytes)] * len(cand))
@@ -3045,6 +3054,19 @@ class HiCacheFile(HiCacheStorage):
                         todo.append((i, slot, gen, st))
                     elif status == 2:
                         out[i] = slot
+        if prefix and todo:
+            # (a): the first stem that neither raced in complete nor got a
+            # claim ends the prefix -- its successors are not read
+            todo.sort(key=lambda t: t[0])
+            _mine = {t[0] for t in todo}
+            _stop = next((i for i, _st in cand if out[i] is None and i not in _mine), n)
+            _past = [t[1] for t in todo if t[0] > _stop]
+            if _past:
+                arena.free_slots(_past)
+                todo = [t for t in todo if t[0] < _stop]
+            for i, _st in cand:
+                if i > _stop:
+                    out[i] = None
         if not todo:
             return out
         from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio

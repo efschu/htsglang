@@ -6254,6 +6254,11 @@ class SchedulerPPMixin:
             _wire_reqs = recv_reqs
             if weg2_store_told.armed(self) and weg2_store_told.is_pp0(self):
                 _wire_reqs = weg2_store_told.pp0_publish(self, recv_reqs)
+                # RO: the rids P can only skip (held/paced) for the front's
+                # dispatch cap -- bookkeeping, nothing on the wire changes.
+                from sglang.srt.weg2 import p_read_overlap as _ro
+
+                _ro.export(self)
             # fnFL2 H42c: PP0's pass clock rides list m, and PP0 decides pass
             # m's burst hold on the SAME value its followers will read
             # (anchor_tails H42c note; x161's rank-local clocks split slots).

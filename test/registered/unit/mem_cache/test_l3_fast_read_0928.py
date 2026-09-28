@@ -164,10 +164,16 @@ def _controller(found, fill_ok, evicted=()):
 
     arena = _PoolArena(found, evicted)
     fills = []
+    seen_refs = []
 
-    def fill(ar, stems, nbytes):
+    def fill(ar, stems, nbytes, prefix=False):
         fills.append(list(stems))
-        return [1000 + int(st[1:]) if int(st[1:]) in fill_ok else None for st in stems]
+        seen_refs.append(list(arena.refs))
+        out = [1000 + int(st[1:]) if int(st[1:]) in fill_ok else None for st in stems]
+        if prefix and None in out:  # the storage stops at the first gap
+            k = out.index(None)
+            out[k:] = [None] * (len(out) - k)
+        return out
 
     backend = types.SimpleNamespace(arena_fill_from_disk=fill)
     pool = types.SimpleNamespace(arena_read=True, arena=arena, _page_bytes=PAGE,
@@ -182,6 +188,7 @@ def _controller(found, fill_ok, evicted=()):
         got = cc.HiCacheController._arena_page_get(ctl, op, list(range(len(found))), None)
     finally:
         cc.weg2_suffixed_stems = orig
+    arena.seen_refs = seen_refs
     return got, fills, arena
 
 
@@ -217,3 +224,73 @@ def test_microbench_before_after_on_the_same_sample(tmp_path):
     print("L3-FAST microbench: before %.0f pages/s, after %.0f pages/s (x%.1f)"
           % (2000 / before, 2000 / after, before / after))
     assert before / after >= 2.0
+
+
+# --- EG review of L3-FAST (a) + (b) -----------------------------------------
+
+
+def test_prefix_fill_reads_nothing_past_the_first_page_missing_on_disk(tmp_path):
+    be, stems = _store(tmp_path, 300, missing={7})
+    a = _Arena()
+    out = hs.HiCacheFile.arena_fill_from_disk(be, a, stems, PAGE, prefix=True)
+    assert all(s is not None for s in out[:7])
+    assert all(s is None for s in out[7:])
+    assert len(a.state) == 7 and not a.claimed     # 7 claimed and read, nothing else
+    # the non-prefix fill still reads every page on disk
+    a2 = _Arena()
+    out2 = hs.HiCacheFile.arena_fill_from_disk(be, a2, stems, PAGE)
+    assert sum(s is not None for s in out2) == 299
+
+
+class _BusyArena(_Arena):
+    """Stem ``busy`` is being filled by another writer (claim status 1)."""
+
+    def __init__(self, busy, **kw):
+        super().__init__(**kw)
+        self.busy = busy
+
+    def claim_slots(self, stems, totals):
+        out = super().claim_slots(stems, totals)
+        for k, st in enumerate(stems):
+            if st == self.busy and out[k][1] == 0:
+                s = out[k][0]
+                self.claimed.pop(s)
+                self.free.insert(0, s)
+                out[k] = (-1, 1, 0)
+        return out
+
+
+def test_prefix_fill_frees_claims_past_a_page_it_cannot_have_unread(tmp_path):
+    be, stems = _store(tmp_path, 20)
+    a = _BusyArena("s00005", n_slots=64)
+    out = hs.HiCacheFile.arena_fill_from_disk(be, a, stems, PAGE, prefix=True)
+    assert [s is not None for s in out] == [True] * 5 + [False] * 15
+    assert sorted(a.state) == stems[:5] and not a.claimed
+    assert len(a.free) == 64 - 5                    # the 14 claims past it went back
+    assert not a.buf[5:].any()                      # ... unread (the bytes of the first 5 only)
+
+
+def test_found_l2_pages_are_referenced_before_the_fill():
+    # 3 in L2 past a gap-free L3 page: its reference must precede the fill,
+    # whose arena-full eviction would otherwise take it
+    found = [(10, 2), (-1, 0), (12, 2), (-1, 0)]
+    got, fills, arena = _controller(found, fill_ok={1, 3})
+    assert got == 4
+    assert (12, 1) in arena.seen_refs[0]
+    assert fills == [["s1", "s3"]]
+
+
+def test_references_taken_ahead_past_the_prefix_end_are_given_back():
+    found = [(10, 2), (-1, 0), (12, 2), (13, 2)]
+    got, _fills, arena = _controller(found, fill_ok=set())
+    assert got == 1
+    for s in (12, 13):
+        assert arena.refs.count((s, 1)) == 1 and arena.refs.count((s, -1)) == 1
+
+
+def test_a_failed_reference_ends_the_fill_list_before_the_fill():
+    # page 2 is evicted between find and ref: nothing past it is asked of the L3
+    found = [(10, 2), (-1, 0), (12, 2), (-1, 0)]
+    got, fills, _ = _controller(found, fill_ok={1, 3}, evicted={12})
+    assert got == 2
+    assert fills == [["s1"]]
