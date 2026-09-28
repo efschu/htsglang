@@ -2453,3 +2453,151 @@ class WebSearchRerouteOffTestCase(WebSearchRerouteTestCase):
             json.dump({"web_search_model": self.SEARCH_MODEL}, fh)
         await self._post(self._search_body(self.REMOTE_ID))
         self.assertEqual(self._only("upstream")["body"]["model"], self.SEARCH_MODEL)
+
+
+class ClientGoneCancelsUpstreamTestCase(unittest.IsolatedAsyncioTestCase):
+    """28.09. (#router client-gone): a client that leaves cancels the upstream.
+
+    Measured on the rig: a non-streamed local request whose Claude Code client
+    had already gone kept the router's upstream connection to the front open,
+    so the front never saw the departure and D decoded 39729 tokens for
+    nobody (weg2-1-13, 398 s, until a manual /abort_request). The router
+    waited for the backend's response head, and aiohttp does not cancel a
+    handler when its client disconnects.
+
+    The backend here holds a non-streamed answer for 30 s and records the
+    moment its own connection closes. The client sends the request over a raw
+    socket and closes it; the backend must see its connection close within a
+    second of that.
+    """
+
+    async def asyncSetUp(self):
+        self.backend_closed_at = None
+        self.backend_started = asyncio.Event()
+
+        async def quiet_stream(request):
+            # One SSE frame, then silence (P prefilling a long prompt).
+            self.backend_started.set()
+            await request.read()
+            loop = asyncio.get_running_loop()
+            resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await resp.prepare(request)
+            await resp.write(b"event: ping\ndata: {}\n\n")
+            end = loop.time() + 30.0
+            try:
+                while loop.time() < end:
+                    transport = request.transport
+                    if transport is None or transport.is_closing():
+                        self.backend_closed_at = loop.time()
+                        return resp
+                    await asyncio.sleep(0.02)
+            except asyncio.CancelledError:
+                self.backend_closed_at = loop.time()
+                raise
+            return resp
+
+        async def slow_messages(request):
+            self.backend_started.set()
+            await request.read()
+            loop = asyncio.get_running_loop()
+            end = loop.time() + 30.0
+            try:
+                while loop.time() < end:
+                    transport = request.transport
+                    if transport is None or transport.is_closing():
+                        self.backend_closed_at = loop.time()
+                        return web.json_response({"late": True})
+                    await asyncio.sleep(0.02)
+            except asyncio.CancelledError:
+                # aiohttp cancels a handler whose client connection is lost:
+                # that is how the front sees the router close the upstream.
+                self.backend_closed_at = loop.time()
+                raise
+            return web.json_response({"type": "message", "content": []})
+
+        backend_app = web.Application()
+        backend_app.router.add_post("/v1/messages", slow_messages)
+        backend_app.router.add_post("/v1/stream", quiet_stream)
+        self.local_server = TestServer(backend_app)
+        await self.local_server.start_server()
+        upstream_app, _ = _make_backend("upstream")
+        self.upstream_server = TestServer(upstream_app)
+        await self.upstream_server.start_server()
+        app = create_app(
+            local_models=[LOCAL_MODEL],
+            upstream_base=str(self.upstream_server.make_url("")).rstrip("/"),
+            local_base=str(self.local_server.make_url("")).rstrip("/"),
+            local_wait_s=0,
+        )
+        self.app = app
+        # Production runs web.run_app, whose handler_cancellation defaults to
+        # False: a departed client does NOT cancel the router's handler. The
+        # router must run the same way here (TestServer cancels the handler
+        # and would hide the bug), hence a plain AppRunner.
+        self.router_port = unused_port()
+        self.router_runner = web.AppRunner(app, handler_cancellation=False)
+        await self.router_runner.setup()
+        await web.TCPSite(self.router_runner, "127.0.0.1", self.router_port).start()
+
+    async def asyncTearDown(self):
+        await self.router_runner.cleanup()
+        await self.local_server.close()
+        await self.upstream_server.close()
+
+    async def _send_and_leave(self, body, path="/v1/messages"):
+        payload = json.dumps(body).encode()
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", self.router_port
+        )
+        writer.write(
+            f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n".encode()
+            + b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+            + payload
+        )
+        await writer.drain()
+        await asyncio.wait_for(self.backend_started.wait(), 5.0)
+        await asyncio.sleep(0.3)
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+        return asyncio.get_running_loop().time()
+
+    async def test_non_streamed_local_request_is_cancelled_when_the_client_leaves(self):
+        left_at = await self._send_and_leave(
+            {
+                "model": LOCAL_MODEL,
+                "max_tokens": 64000,
+                "messages": [{"role": "user", "content": "write a big file"}],
+            }
+        )
+        loop = asyncio.get_running_loop()
+        while self.backend_closed_at is None and loop.time() - left_at < 3.0:
+            await asyncio.sleep(0.05)
+        self.assertIsNotNone(
+            self.backend_closed_at,
+            "the router kept the upstream open after its client left",
+        )
+        self.assertLess(self.backend_closed_at - left_at, 1.0)
+        from sglang.srt.entrypoints.anthropic.router import STATS as ROUTER_STATS
+
+        self.assertEqual(self.app[ROUTER_STATS]["client_gone_cancelled"], 1)
+
+    async def test_quiet_stream_is_cancelled_when_the_client_leaves(self):
+        left_at = await self._send_and_leave(
+            {
+                "model": LOCAL_MODEL,
+                "max_tokens": 64,
+                "stream": True,
+                "messages": [{"role": "user", "content": "long prompt"}],
+            },
+            path="/v1/stream",
+        )
+        loop = asyncio.get_running_loop()
+        while self.backend_closed_at is None and loop.time() - left_at < 3.0:
+            await asyncio.sleep(0.05)
+        self.assertIsNotNone(
+            self.backend_closed_at,
+            "the router kept a quiet upstream stream open after its client left",
+        )
+        self.assertLess(self.backend_closed_at - left_at, 1.0)

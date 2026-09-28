@@ -130,6 +130,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -1440,6 +1441,59 @@ async def _wait_for_backend(
             return
 
 
+#: How often the proxy looks at its own client connection while it waits for
+#: a backend's response head (28.09., #router client-gone). Four checks a
+#: second: a departed client cancels the backend request within ~0.25 s.
+CLIENT_GONE_POLL_S = 0.25
+
+
+class _ClientGone(Exception):
+    """The downstream client closed its connection while the backend was pending."""
+
+
+def _client_gone(request: web.Request) -> bool:
+    """True once the downstream client's connection is closed or closing."""
+    transport = request.transport
+    return transport is None or transport.is_closing()
+
+
+async def _await_unless_client_gone(
+    request: web.Request, awaitable, poll_s: float = CLIENT_GONE_POLL_S
+):
+    """Await ``awaitable``; cancel it and raise ``_ClientGone`` if the client leaves.
+
+    aiohttp does not cancel a handler when its client disconnects, so a
+    handler waiting for a backend's response head keeps that backend request
+    alive for nobody. Measured on the rig 28.09.: a non-streamed local
+    request whose client had gone kept the front's leg open and D decoded
+    39729 tokens for nobody (weg2-1-13, 398 s). Cancelling the pending
+    request closes the backend connection, which is what lets the backend
+    see the departure. A streamed response already closes its backend on the
+    first failed write; this covers the wait before the first byte.
+    """
+    task = asyncio.ensure_future(awaitable)
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=poll_s)
+            if done:
+                return task.result()
+            if _client_gone(request):
+                task.cancel()
+                await asyncio.wait({task})
+                if not task.cancelled():
+                    # It finished in the same instant: a response nobody can
+                    # receive any more. Close it rather than hand it on.
+                    with contextlib.suppress(BaseException):
+                        result = task.result()
+                        close = getattr(result, "close", None)
+                        if close is not None:
+                            close()
+                raise _ClientGone()
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+
+
 async def _open_backend(
     session: aiohttp.ClientSession,
     method: str,
@@ -1678,6 +1732,9 @@ def create_app(
         # WebSearch sub-requests of non-Anthropic sessions re-targeted to
         # web_search_model and sent upstream. Lifetime total.
         "web_search_rerouted": 0,
+        # Backend requests cancelled because the client left before the
+        # backend answered (_await_unless_client_gone). Lifetime total.
+        "client_gone_cancelled": 0,
     }
     app[LOCAL_WAIT_S] = local_wait_s
     app[UPSTREAM_WAIT_S] = upstream_wait_s
@@ -2110,8 +2167,9 @@ def create_app(
             )
 
         upstream_response: Optional[aiohttp.ClientResponse] = None
+        out: Optional[web.StreamResponse] = None
         try:
-            upstream_response = await opener
+            upstream_response = await _await_unless_client_gone(request, opener)
             # Only with the cap configured: without it every response keeps
             # going through the untouched byte pipe below.
             if to_local and limit is not None and upstream_response.status == 400:
@@ -2181,10 +2239,31 @@ def create_app(
             # From here on, no failure can retry: the client has already
             # received response headers (and possibly body bytes) that a
             # re-buffered attempt could not un-send (see module docstring).
-            async for chunk in upstream_response.content.iter_any():
+            # Each read also watches the client: a stream that is quiet for a
+            # while (P prefilling a long prompt before the first token) would
+            # otherwise only notice a departed client at its next write.
+            while True:
+                chunk = await _await_unless_client_gone(
+                    request, upstream_response.content.readany()
+                )
+                if not chunk:
+                    break
                 await out.write(chunk)
             await out.write_eof()
             return out
+        except _ClientGone:
+            request.app[STATS]["client_gone_cancelled"] += 1
+            logger.warning(
+                "%s %s client left while waiting on the %s (model=%s); "
+                "backend request cancelled",
+                request.method,
+                request.path,
+                destination,
+                model,
+            )
+            # Nobody is left to receive an answer; a stream already prepared
+            # is simply closed, a response not yet started gets a placeholder.
+            return out if out is not None else web.Response(status=499)
         except _LocalBackendDownTimeout as e:
             request.app[STATS]["errors"] += 1
             logger.warning("local backend still down after holding: %s", e)
