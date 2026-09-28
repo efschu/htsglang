@@ -1851,7 +1851,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # decision point seam F9 names -- it is called for BOTH roles, so a
         # host that ever reached the worker body is refused here too.
         if getattr(self.model_runner, "is_form_a_worker", False):
-            self._guard_form_a_capture_body(rank_role.GRAPH_BODY_MOE_ROUTE)
+            # #239 S3c: under the token cut the recorded route carries each
+            # full-attention layer's A [, T, Q, M] (run_form_a_worker_route).
+            self._guard_form_a_capture_body(
+                rank_role.GRAPH_BODY_MOE_ROUTE_DCP
+                if self.model_runner.attn_backend.form_a_dcp is not None
+                else rank_role.GRAPH_BODY_MOE_ROUTE
+            )
             return self._capture_one_shape_form_a(size, stream_idx, variant_label)
         self._guard_form_a_capture_body(rank_role.GRAPH_BODY_MODEL_FORWARD)
 

@@ -4191,7 +4191,38 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
-        if getattr(self, "is_form_a_worker", False):
+        if (
+            getattr(self, "is_form_a_worker", False)
+            and not self.is_draft_worker
+            and self.server_args.form_a_dcp_vector()
+        ):
+            # #239 S3c: under Form A x the token cut the worker OWNS a token
+            # range of the full-attention KV. It builds the QSA full-attention
+            # backend alone -- not the hybrid wrapper: the GDN layers are the
+            # host's, a worker has no linear-attention state to plan for.
+            # Its Form A branch (S3b, _init_form_a_dcp) takes the worker's
+            # zero-head geometry; the worker forward drives it per layer.
+            from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+            from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+                QwenSparseAttnBackend,
+            )
+
+            if not is_qwen_qsa(self.model_config.hf_config):
+                raise RuntimeError(
+                    "#239 S3c: the Form A token cut is wired for QSA full "
+                    "attention only; this model has none."
+                )
+            self.prefill_attention_backend_str = "form_a_worker_qsa_dcp"
+            self.decode_attention_backend_str = "form_a_worker_qsa_dcp"
+            self.attn_backend = QwenSparseAttnBackend(self)
+            if self.attn_backend.form_a_dcp is None:
+                raise RuntimeError(
+                    "#239 S3c: a Form A worker under the token cut built an "
+                    f"attention backend ({type(self.attn_backend).__name__}) that "
+                    "did not take the Form A DCP geometry; the host would issue "
+                    "A/T/Q/M per full-attention layer that this rank never joins."
+                )
+        elif getattr(self, "is_form_a_worker", False):
             # FORM A (fnFA7 20.09.): a worker has no attention layers and a
             # head share of 0 -- a real backend cannot even be constructed
             # (flashinfer's should_use_tensor_core divides by the kv-head
@@ -5432,10 +5463,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         from sglang.srt.distributed import get_tp_group
 
         group = get_tp_group()
+        # #239 S3c: this rank's backend decides whether its full-attention
+        # layers join A/T/Q/M -- declared from the object that runs them, so a
+        # rank whose backend did not take the token cut disagrees HERE.
+        from sglang.srt.layers.attention.qsa.form_a_dcp import form_a_dcp_of
+
+        form_a_dcp_merge = None
+        if form_a_dcp_of(self.attn_backend) is not None:
+            from sglang.srt.layers.dcp.comm import lse_merge_mode
+
+            form_a_dcp_merge = lse_merge_mode()
         gate_form_a_boot(
             plan,
             self.tp_rank,
             group.all_gather_object,
+            form_a_dcp_merge=form_a_dcp_merge,
             worker_skips_dense=True,
             host_dense_is_unsharded=True,
             # Slice 3's host-centric exchange stays behind its switch; the
@@ -5537,6 +5579,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "without the plan this rank cannot even name the host it "
                 "would receive the MoE input from."
             )
+        # #239 S3c: under the token cut this worker owns a token range of the
+        # full-attention KV and joins every full-attention layer's A [, T, Q, M]
+        # through the QSA backend's worker step (form_a_dcp is None on every
+        # other Form A boot: the worker backend refuses attention by name).
+        backend = self.attn_backend
+        attention, attention_layer_ids = None, ()
+        if backend.form_a_dcp is not None:
+
+            def attention(layer_id: int) -> None:
+                backend.form_a_worker_attention(forward_batch, layer_id)
+
+            attention_layer_ids = tuple(
+                self.token_to_kv_pool.full_attention_layer_id_mapping
+            )
         return run_form_a_worker_layers(
             self._form_a_moe_blocks(),
             num_tokens=int(num_tokens),
@@ -5545,6 +5601,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             device=forward_batch.input_ids.device,
             forward_batch=forward_batch,
             host_rank=int(host_rank),
+            attention=attention,
+            attention_layer_ids=attention_layer_ids,
         )
 
     def _forward_raw(
