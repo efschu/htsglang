@@ -688,6 +688,15 @@ def _form_a_worker() -> bool:
     return bool(this_rank_is_form_a_worker())
 
 
+def _form_a_worker_holds_kv() -> bool:
+    """#239: this process is a Form A worker with a full-attention KV share."""
+    try:
+        from sglang.srt.rank_role import form_a_worker_holds_kv
+    except ImportError:
+        return False
+    return bool(form_a_worker_holds_kv())
+
+
 def kv_stage_trims_here(pool_size: int) -> bool:
     """#251c: this rank trims its KV tensors to S0 at birth -- the stage form
     is armed, the pool is the top stage's, and this is NOT a Form A worker.
@@ -747,6 +756,16 @@ def kv_stage_pool_tokens(max_tokens: int, *, is_form_a_worker: bool = False,
             "stage S0 -- turn the stage form off (SGLANG_WEG2_D_KV_STAGE_TOKENS) for this "
             "draft form" % LINE_MARK)
     is_form_a_worker = bool(is_form_a_worker) or _form_a_worker()
+    if is_form_a_worker and _form_a_worker_holds_kv():
+        # 28.09. (M1 prep): this worker holds full-attention KV under the token
+        # cut; its compacted FA pool follows max_total, and nothing here trims
+        # it -- the top stage would be mapped whole (+100 % FA KV at S0 x 2).
+        raise Weg2DSeatVramRefused(
+            "%s: the KV stage form %s reached a Form A worker that holds full-attention "
+            "KV under the token cut -- its pool would be mapped at the top stage, "
+            "untrimmed; stages per KV rank are S3g. Run the cut with one stage "
+            "(SGLANG_WEG2_D_KV_STAGE_TOKENS=<kv tokens>) until then"
+            % (LINE_MARK, list(form.tokens)))
     if not is_form_a_worker and int(max_tokens) < form.tokens[0]:
         raise Weg2DSeatVramRefused(
             "%s: the KV budget holds %d tokens, below stage S0 = %d -- the boot form "

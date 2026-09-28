@@ -2649,8 +2649,29 @@ def _rank_vec(raw: Optional[str], n: int) -> List[int]:
     return (vals + [0] * n)[:n] if vals else [0] * n
 
 
+def kv_stage_cut_workers(kv_token_shares, host_rank: int = 0) -> List[int]:
+    """#239 S3g (28.09.): the D ranks other than the attention host that hold
+    full-attention KV under the token cut -- every worker with a share > 0,
+    and (a cut the planner still solves: 'owned', 'maxmin', 'joint') every
+    worker, since any of them may get one. [] without a cut."""
+    if kv_token_shares is None:
+        return []
+    if isinstance(kv_token_shares, str):
+        vec = None
+        if kv_token_shares.startswith("owned:"):
+            try:
+                vec = [float(x) for x in kv_token_shares[len("owned:"):].split(",") if x.strip()]
+            except ValueError:
+                vec = None
+        if vec is None:
+            return [-1]  # unsolved: some worker, not yet known which
+    else:
+        vec = [float(x) for x in kv_token_shares]
+    return [r for r, s in enumerate(vec) if r != int(host_rank) and float(s) > 0.0]
+
+
 def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens: int,
-                          top_k: int, host_rank: int = 0) -> List[str]:
+                          top_k: int, host_rank: int = 0, kv_token_shares=None) -> List[str]:
     """#251c: D's KV stage form into --env-d (before build_env reads it) --
     the stage tokens, the stage rows (TP0 moves them from its scratch into its
     seat rows: SGLANG_MOE_SCRATCH_SLOTS[0] - rows, SGLANG_WEG2_D_SEAT_EXPERT_ROWS
@@ -2667,6 +2688,20 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
     if D_KV_STAGE_KEYS[0] in env:
         return ["%s: --env-d nennt %s=%s selbst -- keine Stufenform vom Launcher"
                 % (head, D_KV_STAGE_KEYS[0], env[D_KV_STAGE_KEYS[0]])]
+    cut_workers = kv_stage_cut_workers(kv_token_shares, host_rank)
+    if cut_workers:
+        # 28.09. (M1 prep): the stage form sizes EVERY rank's KV pool at the top
+        # stage (kv_stage_pool_tokens) and only the host trims to S0 -- a worker
+        # holding FA KV under the cut would map its pool at the top stage,
+        # untrimmed (+100 % FA KV at S0 x 2 against the plan). Until the stages
+        # run per KV rank (S3g), no form under such a cut.
+        return ["%s: entfaellt unter dem Token-Schnitt %s -- KV-haltende Worker %s bekaemen "
+                "ihren FA-KV-Pool auf der obersten Stufe ungetrimmt (Stufen je KV-Rang: S3g); "
+                "D faehrt fest %s Token"
+                % (head, kv_token_shares, "(noch ungeloest)" if cut_workers == [-1]
+                   else "Rang %s" % ",".join(str(r) for r in cut_workers),
+                   next((int(f.kv_tokens) for f in (getattr(plan, "fits", None) or ())
+                         if f.rank == host_rank), "die gebuchten"))]
     fits = list(getattr(plan, "fits", None) or ())
     host = next((f for f in fits if f.rank == host_rank), None)
     why: List[str] = [] if host is not None else ["kein Attention-Host %d im Plan" % host_rank]
@@ -2823,7 +2858,8 @@ def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
             out.extend(apply_d_seat_expert_rows(ns, er, rows, seat_vram, label))
             out.extend(apply_d_kv_stage_form(
                 ns, er, rows, seat_vram, plan_for(int(seats)), label,
-                verify_tokens=int(form.draft_tokens), top_k=top_k))
+                verify_tokens=int(form.draft_tokens), top_k=top_k,
+                kv_token_shares=plan_kwargs.get("kv_token_shares")))
         return out
     except Weg2DKvStageMaxRefused:
         raise  # the operator's A/B arm does not fit: named stop, not a quiet default
