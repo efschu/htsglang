@@ -14066,6 +14066,20 @@ class Scheduler(
             return None
         delivered = int(outcome.materialized)
         deliverable = int(outcome.deliverable)
+        # HFB (rc12z21 D 13:35:14, weg2-8-34, PrefetchBallotDigestMismatch):
+        # on a Form A END-vote read `materialized` counts from each rank's
+        # OWN span start -- TP0 13376 (base 12544/15104), the workers 9536 /
+        # 12096 (base 16384). The store-short cycle bound and the remainder
+        # fed on it saw growth on the workers and none on TP0: only TP0 took
+        # 'cycles=5 > bound=4 ... over_x' -> W88 503, its queue emptied, the
+        # workers kept the rid, and the next ballot's digest split. The
+        # reduced END is the group's one answer (25920 / 28480 on all three
+        # ranks) and it is the absolute prompt depth the remainder needs.
+        _synced_end = getattr(outcome, "synced_end", None)
+        if _synced_end is not None:
+            # both ends absolute: the span END is the group's too (#580 END vote)
+            deliverable += int(_synced_end) - int(outcome.synced)
+            delivered = int(_synced_end)
         # The witness term, written BEFORE the arm reads it: a re-read that
         # gains nothing leaves this value unchanged and the standstill count
         # advances, which is what ends the wait honestly.
