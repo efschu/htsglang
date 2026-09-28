@@ -2517,6 +2517,17 @@ class Envs:
     # the pool's eager forwards follow SGLANG_MOE_OFFLOAD_WAVE_ORDER again.
     # Rank-uniform: every rank reads the same launcher env.
     SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR = EnvBool(True)
+    # H107: the expert-major eager forward under the pool (D's extend) reads a
+    # routed spill expert from the LRU row that already OWNS it instead of
+    # fetching it again into the scratch rows, and fetches only the misses into
+    # rows that hold no hit. The pool's hot_phys map crosses in the SAME D2H as
+    # the routed ids (no extra sync per layer); the decode step and its graph
+    # are untouched. Output bit-identical (a row choice never changes what the
+    # apply computes). rc12z26 D TP0: 110 of 193 experts on the card, every
+    # extend still moved 0.20 GiB/layer in 3 waves (~1.6 s gpu-ms) and wiped
+    # the decode LRU. False: the plan before H107. Rank-uniform: every rank
+    # reads the same launcher env; the waves are rank-local (no collective).
+    SGLANG_OPT_MOE_POOL_EAGER_LRU_HITS = EnvBool(True)
     # H95: the captured decode step of the device-planned pool
     # (SGLANG_MOE_OFFLOAD_GRAPH_MODE=pool) in up to N OVERFLOW WAVES. 0 or 1
     # (default) = off, the Task #40 worst case: a captured batch needs

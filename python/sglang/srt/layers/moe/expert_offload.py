@@ -145,6 +145,9 @@ _TRACE_LOCK = threading.Lock()
 # The one layer whose per-chunk H2D volume is logged at INFO (see
 # MoEExpertOffloadCache._log_wave_h2d). Latched to the first layer that reports.
 _H2D_LOG_LAYER = None
+# H107: the one layer whose eager LRU plan is logged at INFO, one line per
+# extend (same latch rule as _H2D_LOG_LAYER).
+_H107_LOG_LAYER = None
 
 
 def write_routing_trace(
@@ -428,6 +431,62 @@ def plan_expert_waves_np(
         spill_sorted[i : i + scratch] for i in range(0, len(spill_sorted), scratch)
     ]
     return used[res_of_used].tolist(), spill_waves
+
+
+def pool_lru_rows(hot_phys, lru_start: int, row_limit: int) -> Dict[int, int]:
+    """H107: expert -> the LRU row it OWNS, read off a host copy of the pool's
+    ``hot_phys`` map. The pool keeps ``row_key[r] == e`` iff ``hot_phys[e] ==
+    r`` over the LRU rows (#104), and a staged expert never enters ``hot_phys``
+    (``step_reference``: staging lives in the step map only), so a row in
+    ``[lru_start, row_limit)`` carries exactly that expert's bytes. Residents
+    (rows below ``lru_start``) and experts without a row (-1) are not listed."""
+    out: Dict[int, int] = {}
+    for e, r in enumerate(hot_phys):
+        r = int(r)
+        if lru_start <= r < row_limit:
+            out[e] = r
+    return out
+
+
+def plan_eager_lru_waves(
+    spill_sorted: Sequence[int],
+    lru_row_of: Dict[int, int],
+    scratch_rows: Sequence[int],
+) -> Optional[Tuple[Dict[int, int], List[List[Tuple[int, int]]]]]:
+    """H107 (D extend, 28.09.): the expert-major eager plan that KNOWS the
+    pool's warm LRU rows.
+
+    Before H107 an eager forward under the pool mode fetched every routed
+    spill expert into the scratch rows ``[R, R + scratch)`` -- also the ones
+    that already sat in an LRU row from the decode rounds before (D TP0
+    rc12z26: 12 residents + 98 LRU rows = 110 of 193 experts on the card, a
+    61-token extend still moved 0.20 GiB per layer in 3 waves, ~1.6 s gpu-ms),
+    and it overwrote the decode working set on the way (H23: cold round 1
+    after every extend).
+
+    Returns ``(hits, miss_waves)``: ``hits`` = spill expert -> the LRU row it
+    is read from (no fetch, computed in the fetch-free wave 0 with the
+    residents); ``miss_waves`` = the remaining spill experts, sorted, chunked
+    over the scratch rows that hold NO hit, as ``(expert, row)`` fetch pairs.
+    A hit row is never written during the forward, so no wave can swap an
+    expert out from under a later wave that reads it. None when misses remain
+    but every scratch row holds a hit (the caller keeps the plain plan).
+
+    Which row holds an expert never changes WHAT the forward computes (the
+    apply reads the expert's bytes wherever they are; expert-major lands every
+    pair in its own k-slot and reduces once at the end), so the output is the
+    plain plan's, bit for bit."""
+    hits = {int(e): int(lru_row_of[e]) for e in spill_sorted if e in lru_row_of}
+    held = set(hits.values())
+    writable = [int(r) for r in scratch_rows if int(r) not in held]
+    misses = [int(e) for e in spill_sorted if e not in hits]
+    if misses and not writable:
+        return None
+    width = max(1, len(writable))
+    miss_waves = [
+        list(zip(misses[i : i + width], writable)) for i in range(0, len(misses), width)
+    ]
+    return hits, miss_waves
 
 
 # fnFL2 H20b: below this many routed (token, k) pairs the list path stays --
@@ -3299,6 +3358,8 @@ class MoEExpertOffloadCache:
     _route_note = False
     #: H31b: the Pad+Extra rows this pool layer has NOT loaded yet (DeferredRows)
     _deferred_rows = None
+    #: H107: armed by run_eager_pool for one eager forward (set per instance)
+    _eager_lru_armed = False
 
     #: names of the stacked per-expert tensors to pool/fetch (dim 0 == expert).
     EXPERT_TENSOR_ATTRS = (
@@ -3548,6 +3609,13 @@ class MoEExpertOffloadCache:
             if envs.SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR.get()
             else self._wave_order
         )
+        # H107: the expert-major eager forward reads warm LRU rows instead of
+        # fetching them again (SGLANG_OPT_MOE_POOL_EAGER_LRU_HITS).
+        self._pool_eager_lru_hits = bool(envs.SGLANG_OPT_MOE_POOL_EAGER_LRU_HITS.get())
+        # per eager forward: armed by run_eager_pool, the hit rows the sync
+        # stamps as used (row -> expert)
+        self._eager_lru_armed = False
+        self._eager_lru_used: Dict[int, int] = {}
 
         # --- Stage-3 CUDA-graph-capturable path ----------------------------
         # Built by install_capturable_buffers() (after install(), and after any
@@ -4628,9 +4696,20 @@ class MoEExpertOffloadCache:
         self.land_deferred_rows()  # H31b: run_waves plans with every resident row
         resume_warm().eager_reached(self)  # RW: an eager layer never waits for the warm
         self.begin_eager_pool()
-        out = self.run_waves(
-            dispatch_output, apply_fn, lookahead=None, order=self._pool_eager_wave_order
+        # H107: static residency and expert-major only (a hot resident set or a
+        # token-major split keep the plain plan)
+        self._eager_lru_armed = (
+            self._pool_eager_lru_hits
+            and self._pool_ready
+            and self._pool_eager_wave_order == "expert"
+            and self.planner.resident_ids is None
         )
+        try:
+            out = self.run_waves(
+                dispatch_output, apply_fn, lookahead=None, order=self._pool_eager_wave_order
+            )
+        finally:
+            self._eager_lru_armed = False
         self.sync_pool_from_host()
         return out
 
@@ -4638,6 +4717,7 @@ class MoEExpertOffloadCache:
         """Before an eager (prefill / uncaptured) forward under the pool mode:
         run_waves will rewrite scratch rows; record exactly those."""
         self._scratch_holds.clear()
+        self._eager_lru_used.clear()
 
     def sync_pool_from_host(self):
         """After that eager forward: the device tables take the host's truth
@@ -4670,9 +4750,12 @@ class MoEExpertOffloadCache:
 
         keep = envs.SGLANG_OPT_MOE_POOL_KEEP_LRU.get()
         resume_warm().note_eager_sync(lid, len(self._scratch_holds))  # RW instrument
-        report = sync_tables(
-            self._pool_tables, dict(self._scratch_holds), keep_unwritten=keep
-        )
+        # H107: a row the pass READ an expert from keeps it and is stamped as
+        # used, exactly like a row it wrote (one owner per expert holds: a hit
+        # row is never written in the same pass)
+        holds = dict(self._eager_lru_used)
+        holds.update(self._scratch_holds)
+        report = sync_tables(self._pool_tables, holds, keep_unwritten=keep)
         if lid in (0, 23, 47):
             # Beweiszeile #104 + SGLANG_OPT_MOE_POOL_KEEP_LRU: wie viel Decode-
             # Arbeitsmenge ein eager Forward uebrig laesst, und wie viele
@@ -5083,7 +5166,14 @@ class MoEExpertOffloadCache:
 
         topk_ids = dispatch_output.topk_output.topk_ids
         n_own = int(topk_ids.numel())
-        if lookahead is None:
+        pool_hot = None
+        if lookahead is None and self._eager_lru_armed:
+            # H107: the pool map rides the ids' D2H (see run_waves)
+            both_np = torch.cat(
+                [topk_ids.reshape(-1), self._pool_tables.hot_phys.reshape(-1).to(topk_ids.dtype)]
+            ).cpu().numpy()
+            pool_hot = both_np[n_own:].tolist()
+        elif lookahead is None:
             both_np = topk_ids.reshape(-1).cpu().numpy()
         else:
             _next_cache, pred = lookahead
@@ -5106,6 +5196,17 @@ class MoEExpertOffloadCache:
             self.planner.resident_ids,
             num_experts=self.num_local_experts,
         )
+        if pool_hot is not None:
+            out = self._run_eager_lru(
+                dispatch_output,
+                apply_fn,
+                flat_np=flat_np,
+                resident_used=resident_used,
+                spill_waves=spill_waves,
+                pool_hot=pool_hot,
+            )
+            if out is not None:
+                return out
         if len(spill_waves) <= 1:
             own = flat_np.tolist()
             ids_list = [own[i : i + k] for i in range(0, n_own, k)]
@@ -5171,7 +5272,18 @@ class MoEExpertOffloadCache:
             return self._run_waves_vector(dispatch_output, apply_fn, lookahead)
 
         prefetch = None
-        if lookahead is None:
+        pool_hot = None
+        if lookahead is None and self._eager_lru_armed:
+            # H107: this layer's pool map crosses in the SAME rendezvous as the
+            # routing -- one D2H per layer, as before
+            n_own = topk_ids.numel()
+            k = topk_ids.shape[-1]
+            both = torch.cat(
+                [topk_ids.reshape(-1), self._pool_tables.hot_phys.reshape(-1).to(topk_ids.dtype)]
+            ).tolist()
+            ids_list = [both[i : i + k] for i in range(0, n_own, k)]
+            pool_hot = both[n_own:]
+        elif lookahead is None:
             ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
         else:
             # One rendezvous for both: this forward's routing and the later
@@ -5217,6 +5329,17 @@ class MoEExpertOffloadCache:
             resident_used, spill_waves = plan_expert_waves(
                 ids_list, self.resident_count, self.scratch, self.planner.resident_ids
             )
+            if pool_hot is not None:
+                out = self._run_eager_lru(
+                    dispatch_output,
+                    apply_fn,
+                    flat_np=np.asarray(ids_list, dtype=np.int64).reshape(-1),
+                    resident_used=resident_used,
+                    spill_waves=spill_waves,
+                    pool_hot=pool_hot,
+                )
+                if out is not None:
+                    return out
             if len(spill_waves) > 1:
                 self.planner.stats.overflow_forwards += 1
                 if prefetch is not None:
@@ -5301,6 +5424,88 @@ class MoEExpertOffloadCache:
         self._log_wave_h2d("token", len(waves), h2d_before)
         return combine_out._replace(hidden_states=out_full)
 
+    def _run_eager_lru(
+        self, dispatch_output, apply_fn, *, flat_np, resident_used, spill_waves, pool_hot
+    ):
+        """H107: run this eager pool forward on the plan that reads warm LRU
+        rows (``plan_eager_lru_waves``). ``pool_hot`` is the host copy of the
+        pool's ``hot_phys`` that crossed with the routing. Returns None when the
+        plan does not apply (every scratch row holds a hit); the caller then
+        runs the plain plan. One fetch-free wave for residents + hits; one
+        apply when the misses fit the rows left, expert-major waves otherwise."""
+        t = self._pool_tables
+        bank_rows = int(next(iter(self._resident.values())).shape[0])
+        lru = pool_lru_rows(pool_hot, t.lru_start, min(int(t.pool_rows), bank_rows))
+        spill = [e for wave in spill_waves for e in wave]
+        R = self.resident_count
+        plan = plan_eager_lru_waves(spill, lru, range(R, R + self.scratch))
+        if plan is None:
+            return None
+        hits, miss_waves = plan
+        self._eager_lru_used.update({row: e for e, row in hits.items()})
+        slot0 = {int(e): int(e) for e in resident_used}
+        slot0.update(hits)
+        n_miss = sum(len(w) for w in miss_waves)
+        stats = self.planner.stats
+        stats.forwards += 1 + len(miss_waves)
+        stats.waves += 1 + len(miss_waves)
+        stats.hits += len(slot0)
+        stats.misses += n_miss
+        stats.fetches += n_miss
+        h2d_before = stats.h2d_bytes
+        if len(miss_waves) <= 1:
+            fetch = list(miss_waves[0]) if miss_waves else []
+            slot = dict(slot0)
+            slot.update(fetch)
+            out = self._run_single_wave(
+                dispatch_output, apply_fn, None, slot_plan=(slot, fetch)
+            )
+        else:
+            self.planner.stats.overflow_forwards += 1
+            out = self._run_waves_expert_major(
+                dispatch_output,
+                apply_fn,
+                flat_np,
+                sorted(slot0),
+                [[e for e, _row in w] for w in miss_waves],
+                slot_plans=[(slot0, [])] + [(dict(w), list(w)) for w in miss_waves],
+            )
+        self._note_eager_lru(
+            tokens=int(dispatch_output.topk_output.topk_ids.shape[0]),
+            spill=len(spill),
+            hits=len(hits),
+            misses=n_miss,
+            waves_before=len(spill_waves),
+            waves_after=len(miss_waves),
+            h2d_bytes=stats.h2d_bytes - h2d_before,
+        )
+        return out
+
+    def _note_eager_lru(self, *, tokens, spill, hits, misses, waves_before, waves_after, h2d_bytes):
+        """H107 metal marker, one line per eager forward (INFO for one
+        representative layer, DEBUG for the rest -- the _log_wave_h2d rule).
+        waves_before = the scratch waves the plain plan would have run."""
+        import logging
+
+        global _H107_LOG_LAYER
+
+        layer_id = getattr(self.layer, "layer_id", "?")
+        if _H107_LOG_LAYER is None:
+            _H107_LOG_LAYER = layer_id
+        logging.getLogger(__name__).log(
+            logging.INFO if layer_id == _H107_LOG_LAYER else logging.DEBUG,
+            "H107 EAGER-LRU layer %s: T=%d spill %d = lru_hits %d + misses %d, "
+            "waves %d -> %d, %.3f GiB H2D",
+            layer_id,
+            tokens,
+            spill,
+            hits,
+            misses,
+            waves_before,
+            waves_after,
+            h2d_bytes / float(1 << 30),
+        )
+
     def _issue_lookahead(self, lookahead, pred_list):
         """Build the prefetch thunk for ``lookahead`` (see run_waves). With
         ``pred_list`` None the prediction was not carried across the
@@ -5374,7 +5579,7 @@ class MoEExpertOffloadCache:
         self.planner.stats.lookahead_prefetched += len(plan)
         return len(plan)
 
-    def _run_single_wave(self, dispatch_output, apply_fn, ids_list, prefetch=None):
+    def _run_single_wave(self, dispatch_output, apply_fn, ids_list, prefetch=None, slot_plan=None):
         """One apply over the full batch: every routed expert fits the buffer at
         once (typical decode, and any prefill whose spill set fits the scratch).
         Shared by both wave orders -- with a single wave they are the same path.
@@ -5395,13 +5600,18 @@ class MoEExpertOffloadCache:
             int(topk_ids.shape[0]),
             int(topk_ids.shape[1]),
         )
-        needed = sorted({e for row in ids_list for e in row if e >= 0})
-        if self.lookahead_sticky:
-            slot_of_needed, fetch_plan, _ = self.planner.resolve_sticky(
-                needed, self._scratch_holds
-            )
+        if slot_plan is not None:
+            # H107: the caller planned the rows (LRU hits + misses)
+            slot_of_needed, fetch_plan = slot_plan
+            needed = sorted(slot_of_needed)
         else:
-            slot_of_needed, fetch_plan = self.planner.resolve(needed)
+            needed = sorted({e for row in ids_list for e in row if e >= 0})
+            if self.lookahead_sticky:
+                slot_of_needed, fetch_plan, _ = self.planner.resolve_sticky(
+                    needed, self._scratch_holds
+                )
+            else:
+                slot_of_needed, fetch_plan = self.planner.resolve(needed)
         _tm = _wave_timing_on() and topk_ids.is_cuda
         fwd_mark("moe_plan")
         if _tm:
@@ -5430,7 +5640,7 @@ class MoEExpertOffloadCache:
         return out
 
     def _run_waves_expert_major(
-        self, dispatch_output, apply_fn, flat_np, resident_used, spill_waves
+        self, dispatch_output, apply_fn, flat_np, resident_used, spill_waves, slot_plans=None
     ):  # pragma: no cover - requires CUDA
         """#254 expert-major prefill: waves are disjoint SPILL-EXPERT groups, so
         every spill expert crosses PCIe exactly ONCE per forward instead of once
@@ -5506,7 +5716,10 @@ class MoEExpertOffloadCache:
                 idx_np = np.flatnonzero(wave_of_pair == w)
                 if idx_np.size == 0:
                     continue
-                slot_of_needed, fetch_plan = self.planner.resolve(needed)
+                if slot_plans is None:
+                    slot_of_needed, fetch_plan = self.planner.resolve(needed)
+                else:
+                    slot_of_needed, fetch_plan = slot_plans[w]  # H107
                 fwd_mark("moe_plan")
                 if _tm:
                     _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
