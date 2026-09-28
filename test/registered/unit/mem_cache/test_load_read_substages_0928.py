@@ -68,7 +68,8 @@ def test_the_timers_change_no_byte(monkeypatch):
         off, ln = lay["t_ext"][l]
         for s, d in zip(slots.tolist(), didx.tolist()):
             want = pool._slot_view[s, off:off + ln].view(torch.bfloat16).view(lay["t_shape"])
-            assert torch.equal(dp.mamba_cache.temporal[l][d], want)
+            # bytes, not values: random uint8 bytes read as bf16 hold NaN patterns (NaN != NaN)
+            assert torch.equal(dp.mamba_cache.temporal[l][d].view(torch.int16), want.view(torch.int16))
 
 
 def test_the_hybrid_pool_folds_the_sub_stages_into_the_components_line():
