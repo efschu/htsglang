@@ -151,3 +151,30 @@ class Wiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TensorFields(unittest.TestCase):
+    """Review 28.09. (the 7e227e5f76 class, 27B rc12z9 D 08:23:24): on D
+    ``prefix_indices`` is a torch tensor; ``x or ()`` asks its truth value,
+    which raises for an empty AND for a multi-element tensor. _partial_keep
+    swallowed it (``except: return "?"``) -- the KV window was never computed
+    and keep_role never called: partial parking was silently off on the metal."""
+
+    def test_window_with_tensor_prefix_indices(self):
+        import torch
+
+        sched, _ = _sched([], [], avail=100)
+        victim, older = _req(R(9), span=10000), _req(R(3), span=5000)
+        for prefix in (torch.zeros(0, dtype=torch.int64), torch.zeros(64, dtype=torch.int64)):
+            older.prefix_indices = prefix
+            victim.prefix_indices = prefix
+            import sglang.srt.weg2 as pkg
+
+            stub = types.ModuleType(MOD)  # NF's module without keep_role: the window is logged
+            with mock.patch.dict(sys.modules, {MOD: stub}), \
+                    mock.patch.object(pkg, "handoff_pending", stub, create=True):
+                got = DPR._partial_keep(sched, victim, older)
+            need = 5000 - len(prefix)
+            n_pages = -(-(need - 100) // 64)
+            b = -(-10000 // 64)
+            self.assertEqual(got, f"window={b - n_pages}-{b}(retain)", f"prefix={len(prefix)}")
