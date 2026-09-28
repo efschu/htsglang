@@ -236,6 +236,7 @@ from sglang.srt.weg2 import fork_anchor as _weg2_fork
 from sglang.srt.weg2 import d_park_read as _weg2_park_read  # PARK-RETAIN READ
 from sglang.srt.weg2 import resume_via_p as _weg2_rvp  # RESUME-VIA-P
 from sglang.srt.weg2 import progress_beacon as _weg2_beacon  # FP forward-progress beacon
+from sglang.srt.weg2.vision_verdict import Weg2VisionVerdict  # H125f vision verdict on the chain
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
 from sglang.srt.managers import uniform_floor_scope
@@ -2950,6 +2951,10 @@ class Scheduler(
         # H103: the run-time-T FLA l2norm kernel loaded BEFORE the sampling
         # warmup's barrier and the first sleep (behind H101's rows prewarm).
         self.warm_fla_l2norm()
+        # P-COLD: the QSA indexer's TileLang prefill kernels built BEFORE the
+        # sampling warmup's barrier and the first sleep (rc12z30c: PP1 compiled
+        # them inside the first real forward, ~9 s of fwd_ms=12783).
+        self.warm_qsa_mqa_tilelang()
         # #603b: LAST in this method, after every worker, pool, backend and
         # graph exists. The warmup ends in a group barrier, so it must sit at a
         # point every rank reaches exactly once with the model fully built.
@@ -2970,6 +2975,17 @@ class Scheduler(
         run_boot_prewarm(
             hf_text_config=self.model_config.hf_text_config,
             dtype=self.model_config.dtype,
+            device=self.tp_worker.device,
+        )
+
+    def warm_qsa_mqa_tilelang(self):
+        """P-COLD: delegate to qsa/mqa_prewarm.run_boot_prewarm (rank-local, no
+        collective; the #603b barrier right after pairs the ranks up)."""
+        from sglang.srt.layers.attention.qsa.mqa_prewarm import run_boot_prewarm
+
+        runner = getattr(self.tp_worker, "model_runner", None)
+        run_boot_prewarm(
+            model=getattr(runner, "model", None),
             device=self.tp_worker.device,
         )
 
@@ -3706,6 +3722,7 @@ class Scheduler(
                 (SessionCheckpointReqInput, self.handle_session_checkpoint),
                 (VramBudgetReqInput, self.handle_vram_budget),
                 (Weg2ParkRunningReqInput, self.handle_weg2_park_running),
+                (Weg2VisionVerdict, self.handle_weg2_vision_verdict),
                 (PlePrefetchHintReqInput, self.handle_ple_prefetch_hint),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
@@ -4504,6 +4521,13 @@ class Scheduler(
             self._weg2_vision_rank_stage = arm_rank_stage(self)
             if self._weg2_vision_rank_stage:
                 _vision_origin_aborts = lambda: take_origin_aborts(self)  # noqa: E731
+            else:
+                # H125f: a follower of a transient P group holds image
+                # requests until PP0's verdict reaches it (vision_verdict)
+                from sglang.srt.weg2 import vision_verdict as _vv
+                from sglang.srt.weg2.vision_rank_runner import transient_p_boot
+
+                self._weg2_vision_follower_gate = transient_p_boot() and _vv.arm(self)
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
@@ -6100,6 +6124,13 @@ class Scheduler(
     # ---- H91 Teil B: D seats -- the park and its resume ---------------------
     # Delegation only (large-class-style): the bookkeeping moves live in
     # weg2/d_park_runtime.py, the verdicts in weg2/d_seats.py.
+
+    def handle_weg2_vision_verdict(self, recv_req):
+        """H125f: PP0's vision verdict, dispatched on every PP stage."""
+        from sglang.srt.weg2.vision_verdict import absorb
+
+        absorb(self, recv_req)
+        return None
 
     def handle_weg2_park_running(self, recv_req):
         """H91b: ``POST /weg2/park_running`` -- park every running D request
@@ -10608,6 +10639,7 @@ class Scheduler(
         self,
         running_bs: int,
         head_inputs: Optional[tp_head_congruence.UniformHeadInputs],
+        slot_held: int = 0,
     ) -> int:
         """#823 W9 COUNT arm: how many of the head this rank may admit.
 
@@ -10631,7 +10663,11 @@ class Scheduler(
         accounting event per pass, matching the order arm, rather than one
         per queued request.
         """
-        local = self.get_num_allocatable_reqs(running_bs)
+        local = (
+            self.get_num_allocatable_reqs(running_bs, slot_held)
+            if slot_held
+            else self.get_num_allocatable_reqs(running_bs)
+        )
         gate = self._tp_head_enforcer_gate()
         limit, source = tp_head_congruence.admit_limit_decision(
             local,
@@ -10825,9 +10861,39 @@ class Scheduler(
         try:
             running = getattr(self, "running_batch", None)
             running_bs = len(running.reqs) if running is not None else 0
+            held = self._chunk_rest_slot_held(running)
+            if held:
+                return int(self.get_num_allocatable_reqs(running_bs, held))
             return int(self.get_num_allocatable_reqs(running_bs))
         except Exception:  # noqa: BLE001 - a vote may never break the reduce
             return None
+
+    def _chunk_rest_slot_held(self, running) -> int:
+        """CHUNK-REST: 1 when this pass's chunked continuation already holds
+        its request slot outside the running batch (it enters can_run_list
+        through ``add_chunked_req``), else 0 -- the vote's copy of the count
+        arm's ``slot_held``. Single-stage groups only: under PP a seam refusal
+        can keep the continuation out of the list, and a vote that gave its
+        slot back would then over-admit; there the vote stays the lower
+        number and the MIN keeps the group at it. Rank-uniform: the chunked
+        continuation is the same request on every rank."""
+        if getattr(getattr(self, "ps", None), "pp_size", 1) != 1:
+            return 0
+        chunked = getattr(self, "chunked_req", None)
+        if chunked is None or getattr(chunked, "req_pool_idx", None) is None:
+            return 0
+        reqs = getattr(running, "reqs", None) or ()
+        return 0 if any(r is chunked for r in reqs) else 1
+
+    @staticmethod
+    def _carried_slot_held(can_run_list, multi_anchor_tails: bool) -> int:
+        """CHUNK-REST, count arm: the members already in can_run_list at the
+        top of the queue loop that hold their request slot (the chunked
+        continuation). 0 with anchor tails armed: ``_carried_n`` already
+        takes every carried member out of the count there."""
+        if multi_anchor_tails:
+            return 0
+        return sum(1 for r in can_run_list if getattr(r, "req_pool_idx", None) is not None)
 
     def _publish_uniform_evict_floor(
         self, min_avail: Optional[int], max_avail: Optional[int] = None
@@ -12288,7 +12354,41 @@ class Scheduler(
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
 
-    def get_num_allocatable_reqs(self, running_bs):
+    def _weg2_note_lost_anchors(self) -> None:
+        """ANCHOR-LOST: the Mamba anchors this flush's reset drops (device
+        only, no host copy -- a write-through the pin budget or the arena
+        claim refused, '#1421 BACKUP-REFUSED why=mamba_pin|mamba_claim').
+        Kept in ``_weg2_anchors_lost`` until the sleep leg's answer carries
+        them to the front, which then stops crediting presence at those
+        depths (weg2/front.py ``SpanLRU.retract_lost_anchors``)."""
+        probe = getattr(self.tree_cache, "weg2_unbacked_anchors", None)
+        if probe is None:
+            return
+        try:
+            lost = probe()
+        except Exception as exc:  # noqa: BLE001 - an instrument never blocks a flush
+            logger.warning("WEG2-ANCHOR-LOST probe raised: %s: %s", type(exc).__name__, exc)
+            return
+        if not lost:
+            return
+        ledger = getattr(self, "_weg2_anchors_lost", None)
+        if ledger is None:
+            ledger = self._weg2_anchors_lost = []
+        ledger.extend(int(d) for d, _rid in lost)
+        logger.warning(
+            "WEG2-ANCHOR-LOST at=flush n=%d depths=%s rids=%s (device Mamba anchors without "
+            "a host copy; the reset drops them and the front retracts presence credit at "
+            "these depths)",
+            len(lost), [d for d, _ in lost][:16], [r for _, r in lost][:16],
+        )
+
+    def weg2_take_anchors_lost(self) -> List[int]:
+        """The depths noted since the last sleep answer, cleared on read."""
+        lost = sorted(set(getattr(self, "_weg2_anchors_lost", None) or ()))
+        self._weg2_anchors_lost = []
+        return lost
+
+    def get_num_allocatable_reqs(self, running_bs, slot_held: int = 0):
         # #287: the floating admission limit joins the existing bounds as one
         # more min(). Without --max-running-requests-ceiling the limiter holds
         # the same max_running_requests that pp_max_micro_batch_size was
@@ -12313,7 +12413,13 @@ class Scheduler(
         # default path below is the pre-change expression unchanged.
         parked = self._parked_carrier_discount(running_bs)
         res = limit - max(0, running_bs - parked)
-        res = min(res, self.req_to_token_pool.available_size())
+        # CHUNK-REST (postflip-admit, 28.09.): a candidate that already HOLDS
+        # its request slot -- the chunked continuation -- is counted by the
+        # caller as a can_run_list member AND is missing from
+        # available_size(); ``slot_held`` gives the slot back once, so six
+        # seats carry six requests (bridge 19:51:39: 4 running + weg2-16-53's
+        # rest -> available 1, list 1 -> 'batch_full_break' for weg2-16-54).
+        res = min(res, self.req_to_token_pool.available_size() + max(0, int(slot_held)))
         # THE SECOND BOUND EXISTS BECAUSE THE FIRST ONE STOPPED BINDING.
         # available_size() above is the REQUEST-slot count -- HybridReqToToken
         # Pool does not override it -- so nothing in this expression has ever
@@ -13704,6 +13810,10 @@ class Scheduler(
             from sglang.srt.weg2.vision_rank_runner import vision_rank_pass
 
             _vision_parked = vision_rank_pass(self)
+        elif getattr(self, "_weg2_vision_follower_gate", False):
+            from sglang.srt.weg2.vision_verdict import follower_pass
+
+            _vision_parked = follower_pass(self)
         try:
             try:
                 ret, running_batch = self._get_new_batch_prefill_raw(
@@ -15831,6 +15941,7 @@ class Scheduler(
         # for the rest of a burst (SGLANG_WEG2_P_BURST_ASSEMBLY_MS). Unarmed:
         # 0 carried, the full queue -- the stock loop.
         _carried_n = len(adder.can_run_list) if adder.multi_anchor_tails else 0
+        _slot_held = self._carried_slot_held(adder.can_run_list, adder.multi_anchor_tails)
         _burst_hold = None
         if adder.multi_anchor_tails and _count_veto:
             _burst_hold = self._weg2_burst_assembly_hold(adder, running_batch)
@@ -15916,7 +16027,9 @@ class Scheduler(
             # STOP. See `rank_local_count_veto_applies`.
             if _count_veto and len(
                 adder.can_run_list
-            ) >= self._uniform_allocatable_reqs(running_bs, _head_inputs) + _carried_n:
+            ) >= self._uniform_allocatable_reqs(
+                running_bs, _head_inputs, _slot_held
+            ) + _carried_n:
                 running_batch.batch_is_full = True
                 self._pp_batch_full_setter = "count_arm"
             _disagg_full = False
@@ -19296,6 +19409,7 @@ class Scheduler(
             # blockers -- x169: hicache_backup(5) on PP1/PP2 in the same
             # second, D's store read short by 11776 tokens.  Join them first.
             self._weg2_join_store_writes_before_reset()
+            self._weg2_note_lost_anchors()
             self.cur_batch_for_debug = None
             self.last_batch = None
             self.tree_cache.reset()

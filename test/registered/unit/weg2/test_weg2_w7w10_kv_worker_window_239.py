@@ -90,11 +90,11 @@ def test_the_d_gate_checks_the_row_owning_workers():
     """RED before: the D half knew no F14 line and no cut."""
     from sglang.srt.weg2 import launcher as L
 
+    # rc12z30f: the D half is the RankState gate (IPC Phase 1); the row-owning
+    # workers from the launcher's argv are handed to it
     src = inspect.getsource(L.main)
-    i = src.index("D logged kv x{n_kv} blob x{n_blob}, need 3 each")
-    tail = src[i:i + 1200]
-    assert "d_kv_worker_ranks(" in tail
-    assert "FORM_A_KV_WORKER_CANONICAL_MARKER" in tail
+    i = src.index("canonical_state_gate(spec_d")
+    assert "kv_owner_ranks=d_kv_worker_ranks(" in src[i:i + 200]
 
 
 def test_the_f14_marker_is_the_line_the_rank_prints():

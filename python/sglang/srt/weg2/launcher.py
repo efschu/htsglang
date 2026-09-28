@@ -85,6 +85,8 @@ from sglang.srt.weg2 import (
     DEFAULT_PP_ORDERED_CUT,
 )
 from sglang.srt.weg2 import admin_key as admin_key_mod
+from sglang.srt.weg2 import rank_state as rank_state_mod
+from sglang.srt.weg2 import state_file as state_file_mod
 # WEG2-FORM (24.09.): the boot's form axes -- ONE resolver, ONE line, ONE env.
 from sglang.srt.weg2 import form as weg2_form
 
@@ -5356,6 +5358,10 @@ def wait_ready(port: int, pid: int, deadline_s: float, log: Log, name: str, proc
         if code == 200:
             dt = time.time() - t0
             log(f"R1 READY group={name} port={port} after {dt:.1f} s")
+            if name in ("P", "D"):
+                boot_state_write(log, fields={f"groups.{name}.state": "ready",
+                                              f"groups.{name}.ready_ts": round(time.time(), 3)},
+                                 event=("group_ready", {"group": name, "port": port, "after_s": round(dt, 1)}))
             return dt
         last = f"{code} {body[:80]!r}"
         time.sleep(3)
@@ -11630,6 +11636,113 @@ def d_kv_worker_ranks(extra_d: str) -> List[int]:
         return []
 
 
+_STATE_MISSING_LOGGED: set = set()
+
+
+def boot_state_dir() -> Optional[str]:
+    """IPC §2.2: the boot's state/<boot_id>/ directory (WEG2_STATE_DIR, mounted by
+    the arm), or None -- then the launcher writes no state and the rank records
+    stay next to the group logs."""
+    return envs.WEG2_STATE_DIR.get() or None
+
+
+def boot_state_write(log: Log, state: Optional[str] = None, *, cause: Optional[dict] = None,
+                     fields: Optional[dict] = None, event: Optional[Tuple[str, dict]] = None) -> None:
+    """Write the launcher's own fields of state.json through the ONE shared writer
+    (weg2/state_file.py, writer=launcher: groups.*, invariants.*, loading/ready,
+    dead with origin launcher|rank). The host writer creates the file; while it
+    does not exist the launcher says so once and writes nothing. A write the
+    order forbids (another writer is already further) is a no-op there, never an
+    error here."""
+    d = boot_state_dir()
+    if not d:
+        return
+    if not os.path.exists(os.path.join(d, "state.json")):
+        if d not in _STATE_MISSING_LOGGED:
+            _STATE_MISSING_LOGGED.add(d)
+            log(f"IPC STATE: {d}/state.json missing -- the host writer creates it; the launcher writes no state")
+        return
+    try:
+        if state is not None or cause is not None or fields:
+            state_file_mod.transition(d, state, cause=cause, fields=fields, writer="launcher")
+        if event is not None:
+            state_file_mod.add_event(d, event[0], event[1], writer="launcher")
+    except OSError as e:
+        log(f"IPC STATE WRITE FAILED ({type(e).__name__}): {e}")
+
+
+_CAUSE_RE = re.compile(r"\b(W\d+[a-z]?)\s+(Weg2[A-Za-z0-9]+)")
+
+
+def refusal_cause(e: BaseException) -> dict:
+    """A launcher refusal as §2.2 cause: code = W-number + name (never the bare
+    W-number, 27B requirement 6), origin launcher, the full text."""
+    msg = str(e)
+    m = _CAUSE_RE.search(msg)
+    if m:
+        code, name = f"{m.group(1)}_{m.group(2)}", m.group(2)
+    else:
+        name = type(e).__name__
+        code = f"{_w_code_of(e)}_{name}"
+    return state_file_mod.make_cause(code, "launcher", msg, name=name, exception_type=type(e).__name__)
+
+
+def rank_state_dir_for(spec: GroupSpec) -> str:
+    """Where group ``spec``'s ranks write their RankState: rankstate/<G> inside the
+    boot's state directory (§2.2), else next to the group log (Phase 1)."""
+    d = boot_state_dir()
+    if d:
+        return os.path.join(d, "rankstate", spec.name)
+    return rank_state_mod.rank_state_dir_for_log(spec.log)
+
+
+def canonical_state_gate(spec: GroupSpec, expected: int, log: Log,
+                         kv_owner_ranks: Sequence[int] = ()) -> None:
+    """IPC Phase 1: the launcher half of W7/W10 decided on the ranks'
+    RankState records (weg2/rank_state.py), not on counted log lines.
+
+    rc12z29d (28.09. 20:29Z) booted D clean and was refused as 'kv x1 blob
+    x1': under the uneven-DCP cut the Form A workers print '#239 F14
+    KV-WORKER-WINDOW' and the count knew only the older worker line. The log
+    count still runs beside the records and a disagreement is REPORTED
+    ('IPC MISMATCH'), but it no longer decides."""
+    state_dir = rank_state_dir_for(spec)
+    states, bad = rank_state_mod.read_group_states(state_dir)
+    verdict = rank_state_mod.grade_canonical(states, expected, group=spec.name)
+    for b in bad:
+        verdict.ok = False
+        verdict.reasons.append(f"unreadable record {b}")
+    # #239 F14 (a33ee80394), kept under the records: a worker the launcher's own
+    # argv gives token rows must REPORT the KV page as applicable and active --
+    # a rank that under-reports applicability would otherwise pass as 'n/a'.
+    _by_tp = {s.tp_rank: s for s in states if s.pp_rank == 0}
+    for r in kv_owner_ranks:
+        s = _by_tp.get(int(r))
+        if s is None or not (s.kv_page_applicable and s.kv_page_active):
+            verdict.ok = False
+            verdict.reasons.append(
+                f"tp{r} owns token rows under the cut but reports kv "
+                f"{'missing' if s is None else f'applicable={s.kv_page_applicable} active={s.kv_page_active}'}")
+    log(f"W7/W10 launcher half, group {spec.name} RankState ({state_dir}): {verdict.line()}")
+    n_kv, n_blob, n_worker = canonical_marker_counts(spec.log)
+    if (n_kv, n_blob) != (verdict.n_kv, verdict.n_blob):
+        log(f"IPC MISMATCH W7/W10 group {spec.name}: log count kv x{n_kv} blob x{n_blob} "
+            f"(worker lines x{n_worker}) vs RankState kv x{verdict.n_kv} blob x{verdict.n_blob} "
+            f"-- the records decide, the log count is reported only")
+    boot_state_write(log, fields={
+        f"groups.{spec.name}.ranks": [json.loads(s.to_json()) for s in states],
+        f"groups.{spec.name}.rankstate_dir": state_dir,
+        f"invariants.W7_W10_CanonicalWindow.{spec.name}": {
+            "verdict": "pass" if verdict.ok else "refuse",
+            "per_rank": [{"rank": k, "state": v} for k, v in sorted(verdict.by_rank.items())],
+            "why": verdict.line()},
+    })
+    if not verdict.ok:
+        raise Weg2LaunchRefused(
+            f"W7 Weg2MambaBlobAbsent / W10 Weg2CanonicalPageMissing (launcher half, RankState): "
+            f"group {spec.name} {verdict.line()}")
+
+
 def count_marker(path: str, marker: str) -> int:
     n = 0
     try:
@@ -11655,6 +11768,13 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
         shlex.quote(a) for a in admin_key_mod.redact_argv(spec.argv)))
     if dry:
         return
+    # IPC Phase 1: the ranks write their RankState next to the group log;
+    # records of an earlier launch into the same log path are removed first,
+    # so a record the launcher grades is always THIS launch's.
+    _rs_dir = rank_state_dir_for(spec)
+    _rs_old = rank_state_mod.clear_rank_state_dir(_rs_dir)
+    spec.env[rank_state_mod.RANK_STATE_ENV] = _rs_dir
+    log(f"group {spec.name} rank state -> {_rs_dir}" + (f" ({_rs_old} record(s) of an earlier launch removed)" if _rs_old else ""))
     fh = open(spec.log, "ab")
     _logged_argv = ' '.join(shlex.quote(a) for a in admin_key_mod.redact_argv(spec.argv))
     fh.write(f"=== WEG2 group {spec.name} launched {_now()} ===\nargv: {_logged_argv}\n".encode())
@@ -11664,6 +11784,9 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
     spec.pid = p.pid
     spec.proc = p
     log(f"group {spec.name} pid {p.pid} (session id = pid) log {spec.log}")
+    if spec.name in ("P", "D"):
+        boot_state_write(log, "loading", fields={f"groups.{spec.name}": {
+            "state": "loading", "pids": [p.pid], "ready_ts": None, "rankstate_dir": _rs_dir, "ranks": []}})
 
 
 def arm_deadman(log: Log, boot_log: str, port: int, pattern: str, probe_s: int, tag: str, name: str, dry: bool) -> int:
@@ -23100,11 +23223,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "this arm runs under prints neither marker. P's own health check "
             "already confirmed it booted clean to READY.")
     else:
-        n_kv = count_marker(spec_p.log, "#706 canonical KV page active")
-        n_blob = count_marker(spec_p.log, "canonical GDN blob active")
-        log(f"W7/W10 launcher half, group P log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob} (need >= 3 each: three ranks)")
-        if n_kv < 3 or n_blob < 3:
-            raise Weg2LaunchRefused(f"W7 Weg2MambaBlobAbsent / W10 Weg2CanonicalPageMissing (launcher half): P logged kv x{n_kv} blob x{n_blob}, need 3 each")
+        canonical_state_gate(spec_p, 3, log)
 
     # 4d. sleep P, measure D_c(P) -- and, fix 8, P's DORMANT HOST IMAGE.
     # This is the one sleep on this box that is NOT interleaved: group D does
@@ -23217,22 +23336,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "never builds either (enable_hierarchical_cache is False) -- no "
             "canonical-page/GDN-blob emitter to grade, same as group P above.")
     else:
-        n_kv, n_blob, n_worker = canonical_marker_counts(spec_d.log)
-        log(f"W7/W10 launcher half, group D log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob}"
-            + (f" (of which {n_worker} Form A worker line(s): no-window/null tier -- fnFL2 v18 -- or F14 KV window, no GDN blob -- #239)" if n_worker else ""))
-        if n_kv < 3 or n_blob < 3:
-            raise Weg2LaunchRefused(f"W7/W10 (launcher half): D logged kv x{n_kv} blob x{n_blob}, need 3 each")
-        # #239 F14: a worker that OWNS token rows must have built its KV
-        # window -- its no-window line would pass the count above while its
-        # rows ride no canonical page. The riegel's point, kept under the cut.
-        _kv_workers = d_kv_worker_ranks(getattr(ns, "extra_d", "") or "")
-        _n_f14 = count_marker(spec_d.log, FORM_A_KV_WORKER_CANONICAL_MARKER)
-        if _n_f14 < len(_kv_workers):
-            raise Weg2LaunchRefused(
-                f"W7/W10 (launcher half): D workers {_kv_workers} own token rows under "
-                f"the cut but only {_n_f14} logged a canonical KV window "
-                f"('{FORM_A_KV_WORKER_CANONICAL_MARKER}') -- a rank holds KV without "
-                f"a canonical page")
+        canonical_state_gate(spec_d, 3, log,
+                             kv_owner_ranks=d_kv_worker_ranks(getattr(ns, "extra_d", "") or ""))
     # #1233 zero-remainder (1j finding 6): W9 LAUNCH-TIME KEY-SCHEME GATE. The
     # store is one carrier; a spec-less group keys pages by unigram unless
     # SGLANG_HICACHE_BIGRAM_KEYS=1 forced the bigram scheme, a NEXTN/EAGLE
@@ -23823,9 +23928,16 @@ def state_path(state: BootState) -> str:
 
 
 def _write_state(state: BootState) -> None:
+    # IPC (27B requirement 8, 28.09.): atomic -- a reader (teardown, the
+    # arms, a watcher) must never see a half-written boot file.
     os.makedirs(_operator_dir(GPU_ARB), exist_ok=True)
-    with open(state_path(state), "w") as f:
+    path = state_path(state)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
         json.dump(state.__dict__, f, indent=1, default=str)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 #: #1248: first W-code substring in a refusal message, for the one-line
@@ -24116,10 +24228,16 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
     refusal before any spawn still takes the fast exit below unchanged,
     because ``_ACTIVE_BOOT_STATE.pids`` is still empty at that point.
     """
+    def _say(line: str) -> None:
+        print(f"[{_now()}] {line}", flush=True)
+
     try:
-        return main(argv)
+        rc = main(argv)
     except REFUSALS as e:
         print(f"[{_now()}] WEG2-LAUNCH REFUSED: {e}", flush=True)
+        # IPC §2.2: the refusal is the boot's cause, written where the arm reads
+        # it -- not only printed for a later grep.
+        boot_state_write(_say, "dead", cause=refusal_cause(e))
         # #1275 fix 2 (3): the KILLER path drops the key too. weg2sb5 refused
         # here and left its key file behind -- a boot that never served, whose
         # secret outlived it. Both exits, or the guarantee is only half true.
@@ -24151,6 +24269,14 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
             flush=True,
         )
         return 2
+    except Exception as e:
+        # Not a refusal: a launcher crash. Named in state.json, then re-raised
+        # unchanged (traceback and exit code stay what they were).
+        boot_state_write(_say, "dead", cause=state_file_mod.make_cause(
+            f"LAUNCHER_EXCEPTION_{type(e).__name__}", "launcher", repr(e), exception_type=type(e).__name__))
+        raise
+    boot_state_write(_say, event=("launcher_done", {"rc": rc}))
+    return rc
 
 
 if __name__ == "__main__":

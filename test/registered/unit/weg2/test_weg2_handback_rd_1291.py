@@ -185,7 +185,9 @@ class ACompletedLegOneMakesTheRefusalTerminal(CustomTestCase):
                            "the re-offer never asks whether the P prefill it "
                            "is about to repeat has already run once")
         self.assertIn("leg1_done", src)
-        self.assertIn("status=413", src[i:i + 3000])
+        # rc12z30d 21:11:35: the status is refusal_status(measured,
+        # carrier_max) -- 503 on a state fault, 413 only over the form.
+        self.assertIn("refusal_status(measured_whole", src[i:i + 3000])
 
     def test_the_terminal_check_follows_the_one_re_offer(self):
         """CORRECTED BY #1296 ROUND 2 -- this assertion pinned the defect.

@@ -60,7 +60,7 @@ import subprocess
 import time
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
 
 from aiohttp import (
     ClientConnectionError,
@@ -603,6 +603,55 @@ MIB = 1024 * 1024
 #: the single bookkeeping of the fact, and its value changing is what a launch
 #: check is allowed to key on.
 FLIP_LEG_FORM = "interleave"
+
+
+def anchors_lost(body: str) -> List[int]:
+    """ANCHOR-LOST: the Mamba-anchor depths D's sleep flush dropped, from
+    the release leg's answer (``anchors_lost``, weight_updater / io_struct).
+    [] when the answer carries none or is not this tree's JSON."""
+    try:
+        payload = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(payload, dict):
+        return []
+    out = []
+    for d in payload.get("anchors_lost") or ():
+        try:
+            if int(d) > 0:
+                out.append(int(d))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(out))
+
+
+def retract_lost_anchors(spans: Any, depths: Sequence[int]) -> List[str]:
+    """ANCHOR-LOST: drop every presence entry whose credit stood on an
+    anchor D's sleep dropped -- its #59 depth cap (or, without a cap, its
+    measured ``cached_tokens``) is one of ``depths``. The KV of that prefix
+    comes back from the store after the wake, the anchor does not, and a
+    hybrid model resumes at an anchor only: kept, the entry routes the next
+    turn SHORT onto D, whose X-gate then refuses the whole prompt (bridge
+    f833 19:51:43 weg2-16-54: front price 2349, D's extent 38291, W31 ->
+    W50 reroute after a 17-s wait for a D seat). Works on :class:`SpanLRU`
+    and ``front_tokens.TokenSpans`` alike (``entries`` + ``depth_caps``).
+    Returns the retracted keys."""
+    lost = {int(d) for d in depths or () if int(d) > 0}
+    if not lost or spans is None:
+        return []
+    entries = getattr(spans, "entries", None)
+    caps = getattr(spans, "depth_caps", None)
+    if entries is None or caps is None:
+        return []
+    gone = []
+    for key, entry in list(entries.items()):
+        cap = caps.get(key)
+        ct = int(entry[1]) if len(entry) > 1 else 0
+        if (cap is not None and int(cap) in lost) or (cap is None and ct in lost):
+            entries.pop(key, None)
+            caps.pop(key, None)
+            gone.append(key)
+    return gone
 
 
 def completed_tags(body: str) -> Tuple[List[str], Dict[str, List[float]], str]:
@@ -2061,6 +2110,51 @@ def named_error_chunk(path: str, message: str) -> bytes:
         return b"event: error\ndata: " + json.dumps(body).encode() + b"\n\n"
     body = {"error": {"message": message, "type": "overloaded_error", "code": 503}}
     return b"data: " + json.dumps(body).encode() + b"\n\n"
+
+
+#: How long a client should wait before re-sending a request the front refused
+#: from STATE (a store hand-back that did not land, a blocked hand-off, a
+#: re-offer loop). One flip pair clears most of those; the number is a hint in
+#: the Retry-After header, never a bound the front enforces.
+STATE_REFUSAL_RETRY_AFTER_S = 5
+
+
+def refusal_status(measured_tokens: Optional[int], static_capacity: int) -> int:
+    """HTTP status of a NAMED terminal refusal: 413 only for a real size fault.
+
+    413 says "this request is too large for this server" -- Claude Code reads
+    it as "Request too large" and abandons the whole agent, so it may only be
+    sent when a MEASURED length (an exact prompt-token count, never the char
+    estimate) exceeds a STATIC capacity of the form (``carrier_max_tokens``,
+    fixed at launch). Every other refusal -- the store handed nothing back, D
+    refused a request well inside the form's capacity, the state of a group
+    blocked the hand-off -- is a condition that can change, so it is a 503
+    with Retry-After (rc12z30d 21:11:35: W53 answered 413 for a 17,053-token
+    prompt against carrier_max 314,553, and the agent died on a state fault).
+    """
+    if measured_tokens is None or int(static_capacity) <= 0:
+        return 503
+    return 413 if int(measured_tokens) > int(static_capacity) else 503
+
+
+def refusal_response(path: str, code: str, detail: str, status: int,
+                     extra: Optional[Dict[str, object]] = None) -> web.Response:
+    """A named refusal in the wire of ``path``: the Anthropic error object on
+    ``/v1/messages``, the OpenAI one elsewhere, the W-code and the full detail
+    in both; 503 carries Retry-After, 413 does not (a retry cannot help)."""
+    if path == "/v1/messages":
+        body: Dict[str, object] = {
+            "type": "error",
+            "error": {"type": "request_too_large" if status == 413 else "overloaded_error",
+                      "message": detail},
+            "code": code}
+    else:
+        body = {"error": {"message": detail,
+                          "type": "invalid_request_error" if status == 413 else "overloaded_error",
+                          "code": code}}
+    body.update(extra or {})
+    headers = {} if status == 413 else {"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)}
+    return web.json_response(body, status=status, headers=headers)
 
 
 def witness_verdict(front_outstanding: int, rank_idle: bool) -> Optional[str]:
@@ -5191,6 +5285,19 @@ class Front:
         logger.info("WEG2 X-EXACT-TOKENS rid=%s group=%s tokens_front=%d tokens_group=%d match=%d",
                     rid, group, got[1], int(prompt_tokens), int(int(prompt_tokens) == got[1]))
 
+    def _retract_lost_anchors(self, depths: Sequence[int]) -> None:
+        """ANCHOR-LOST: D slept and its flush dropped these anchors; no
+        presence entry may credit them any more (both span stores)."""
+        if not depths:
+            return
+        gone = retract_lost_anchors(self.spans, depths)
+        gone_t = retract_lost_anchors(getattr(self, "tspans", None), depths)
+        logger.info(
+            "WEG2 PRESENCE-ANCHOR-LOST depths=%s retracted=%d token_spans=%d (D's sleep flush "
+            "dropped these Mamba anchors; their KV presence is no credit)",
+            list(depths)[:16], len(gone), len(gone_t),
+        )
+
     def _note_resumable_depth(self, rid: str, pt: int, ct: int, held: bool,
                               depth: Optional[int]) -> None:
         """#59: one line when D's ``weg2_resumable_depth`` caps the credit
@@ -6127,8 +6234,9 @@ class Front:
             len(text),
         )
         if route == "none":
-            # TERMINAL AT ADMISSION, and 4xx because it is the request that
-            # does not fit this server, not the server that failed.  sb5f
+            # TERMINAL AT ADMISSION, and 4xx only when the request provably
+            # does not fit this server (`refusal_status`: an EXACT count over
+            # the static carrier bound); on an estimate it is 503.  sb5f
             # spent a median 22.0 s per request discovering this by round trip
             # and answered 503, which reads as "try again" for a condition
             # that cannot change.
@@ -6145,12 +6253,16 @@ class Front:
                 f"tokens, or raise --tp-prefill-max-tokens / the carrier bound."
             )
             logger.error("%s", detail)
-            return web.json_response(
-                {"error": detail, "uncached": remainder,
+            # 413 only on the EXACT count: an estimate over the carrier is not
+            # a measured size fault, so it is a 503 the client may retry.
+            return refusal_response(
+                request.path, NO_ROUTE_NAME, detail,
+                refusal_status(carrier_est if exact is not None else None,
+                               self.carrier_max_tokens),
+                {"uncached": remainder,
                  "x_tokens": self.tp_prefill_max_tokens,
                  "carrier_est": carrier_est,
-                 "carrier_max": self.carrier_max_tokens},
-                status=413)
+                 "carrier_max": self.carrier_max_tokens})
         if route == "carrier_single":
             self.counters["route_carrier_exceeds"] += 1
             logger.warning("WEG2-ROUTE rid=%s CARRIER-EXCEEDS -> D single prefill carrier_est=%d (%s) > carrier_max=%d "
@@ -7661,9 +7773,13 @@ class Front:
         # there, so this is not a prose-only effect.
         #
         # So the terminal MOVES TO THE SECOND REFUSAL, where W35 already
-        # stands, and W35's bare 503 becomes this named, measured 413 --
-        # which is what #1291 actually wanted (name it, 4xx not 503) minus
-        # the lap it should never have skipped. Cost, stated honestly: the
+        # stands, and W35's bare 503 becomes this named, measured refusal --
+        # which is what #1291 actually wanted (name it) minus the lap it
+        # should never have skipped. Its STATUS is not the name's: the store
+        # not handing back is state, so it answers 503 + Retry-After, and 413
+        # only when the measured count exceeds the form's static capacity
+        # (`refusal_status`; rc12z30d 21:11:35, 413 on a state fault killed
+        # the client's agent). Cost, stated honestly: the
         # salad class spends its second P prefill again (13 on sb5h).
         # Benefit: the re-offer that sometimes pays is no longer deleted
         # before it is placed.
@@ -7722,11 +7838,12 @@ class Front:
             logger.error("%s", detail)
             if seat is not None:
                 seat.release(NO_ROUTE_NAME)
-            return web.json_response(
-                {"error": detail, "x_tokens": self.tp_prefill_max_tokens,
+            return refusal_response(
+                request.path, NO_ROUTE_NAME, detail,
+                refusal_status(carrier_est, self.carrier_max_tokens),
+                {"x_tokens": self.tp_prefill_max_tokens,
                  "carrier_est": carrier_est,
-                 "carrier_max": self.carrier_max_tokens},
-                status=413)
+                 "carrier_max": self.carrier_max_tokens})
         # SK-X (W35 class, NF rc12t weg2-6-30): W35 says "a second time AFTER
         # A FULL P PREFILL". A rid whose P leg never ran (a kept SHORT whose
         # first reroute skipped leg 1) gets the regular P reroute instead --
@@ -7782,14 +7899,19 @@ class Front:
                 logger.error("%s", detail)
                 if seat is not None:
                     seat.release(HANDBACK_NAME)
-                return web.json_response(
-                    {"error": detail, "x_tokens": self.tp_prefill_max_tokens,
+                # W53 is a STATE fault (the store did not hand P's prefill
+                # back), not a size fault: 413 only when P's MEASURED count
+                # exceeds the form's static capacity (rc12z30d 21:11:35 sent
+                # 413 for 17,053 tokens against carrier_max 314,553).
+                return refusal_response(
+                    request.path, HANDBACK_NAME, detail,
+                    refusal_status(measured_whole, self.carrier_max_tokens),
+                    {"x_tokens": self.tp_prefill_max_tokens,
                      "est_uncached": pending.est_uncached,
                      "leg1_prompt_tokens": measured_whole,
                      "d_extent": d_extent,
                      "carrier_max": self.carrier_max_tokens,
-                     "leg1_done": True},
-                    status=413)
+                     "leg1_done": True})
             logger.error("W35 Weg2XReQueueLoop rid=%s: D refused this rid with W31 a second time after a full "
                          "P prefill; refusing by name rather than a third pass. D said: %s",
                          rid, body.decode(errors="replace")[:400])
@@ -8923,6 +9045,8 @@ class Front:
         legs_wall_ms = (time.perf_counter() - t_gather0) * 1000
         s_done, s_per_tag, s_crit = completed_tags(s_body)
         w_done, w_per_tag, w_crit = completed_tags(w_body)
+        if src == "D":
+            self._retract_lost_anchors(anchors_lost(s_body))
         sleep_ms += s_ms
         wake_ms += w_ms
         if s_code != 200 or w_code != 200:

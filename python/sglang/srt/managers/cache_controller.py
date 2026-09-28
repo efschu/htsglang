@@ -1162,6 +1162,50 @@ def canonical_kv_owner_rows_for(owner_ctx, page_size, canonical_kv_page) -> Opti
     return (int(page_size), S, lo, hi)
 
 
+def weg2_publish_rank_state(
+    ctl,
+    *,
+    form_a_worker: bool,
+    canonical_on: bool,
+    canonical_kv_built: bool,
+    canonical_blob_built: bool,
+    has_mamba_pool: bool,
+    owner_ctx: Optional[tuple],
+) -> None:
+    """IPC Phase 1: the facts the launcher half of W7/W10 decides on, as a
+    versioned record instead of the '#706 ... active' lines it counted
+    (rc12z29d: the F14 worker line was not among the counted strings, and
+    a clean D group was refused as 'kv x1 blob x1'). Every rank writes,
+    a rank owning zero token rows included. No record without a directory
+    from the launcher. A module function, not a method: the storage-config
+    builder is also driven on bare stand-ins of the controller."""
+    from sglang.srt.environ import envs
+    from sglang.srt.weg2.rank_state import build_rank_state, write_rank_state
+
+    state_dir = envs.SGLANG_WEG2_RANK_STATE_DIR.get()
+    if not state_dir:
+        return
+    seq = getattr(ctl, "_weg2_rank_state_seq", 0) + 1
+    ctl._weg2_rank_state_seq = seq
+    state = build_rank_state(
+        group=(os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper(),
+        tp_rank=ctl.tp_rank,
+        tp_size=ctl.tp_size,
+        pp_rank=ctl.pp_rank,
+        pp_size=ctl.pp_size,
+        form_a_worker=form_a_worker,
+        canonical_on=canonical_on,
+        canonical_kv_built=canonical_kv_built,
+        canonical_blob_built=canonical_blob_built,
+        has_mamba_pool=has_mamba_pool,
+        page_size=ctl.page_size,
+        owner_ctx=owner_ctx,
+        seq=seq,
+    )
+    path = write_rank_state(state, state_dir)
+    logger.info("IPC RANK-STATE written %s: %s", path, state.to_json())
+
+
 class HiCacheController:
     def __init__(
         self,
@@ -2051,6 +2095,18 @@ class HiCacheController:
             None
             if owner_ctx is None
             else canonical_kv_owner_rows_for(owner_ctx, self.page_size, canonical_kv_page)
+        )
+        weg2_publish_rank_state(
+            self,
+            form_a_worker=this_rank_is_form_a_worker(),
+            canonical_on=canonical_on,
+            canonical_kv_built=canonical_kv_page is not None,
+            canonical_blob_built=canonical_mamba_blob is not None,
+            has_mamba_pool=getattr(
+                getattr(self, "mem_pool_device_hybrid", None), "mamba_pool", None
+            )
+            is not None,
+            owner_ctx=owner_ctx,
         )
 
         return HiCacheStorageConfig(
