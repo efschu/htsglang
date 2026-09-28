@@ -277,6 +277,8 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_complete_census.argtypes = [p_u8, i64, p_i64, p_i64, p_u64, p_u64]
             lib.arena_pin_complete.restype = i64
             lib.arena_pin_complete.argtypes = [p_u8, i64, p_i64, p_u64, p_u64, p_i8]
+            lib.arena_ref_slots_mask.restype = i64
+            lib.arena_ref_slots_mask.argtypes = [p_u8, i64, p_i64, p_i8]
             _lib = lib
             return lib
         except Exception as e:  # noqa: BLE001 - the arena is optional
@@ -486,6 +488,26 @@ class ShmArena:
         return int(self._lib.arena_ref_slots(self._base, n,
                                              a.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
                                              int(delta)))
+
+    def ref_slots_mask_np(self, slots):
+        """PB: +1 on every slot of ``slots`` in ONE call; returns the int8
+        per-slot verdict (1 = took the reference). Through this process's
+        ledger when one is armed -- exactly the slots that took it are
+        recorded, so each one can be released by name later."""
+        import numpy as np
+        a = np.ascontiguousarray(np.asarray(slots, dtype=np.int64))
+        n = int(a.shape[0])
+        ok = np.zeros((n,), dtype=np.int8)
+        if n == 0:
+            return ok
+        self._lib.arena_ref_slots_mask(self._base, n,
+                                       a.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                       ok.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
+        if self._ledger is not None:
+            took = a[ok == 1]
+            if took.shape[0]:
+                self._ledger.took(took)
+        return ok
 
     def _ref_ledgered(self, a, delta: int) -> int:
         """SGLANG_HICACHE_ARENA_QUEUE_REFS: a reference change through this

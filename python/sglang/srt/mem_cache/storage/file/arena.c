@@ -706,6 +706,27 @@ int64_t arena_ref_slots(uint8_t *base, int64_t n, const int64_t *slots, int32_t 
     return done;
 }
 
+/* PB (28.09., 27B rc12z24 P 15:59:14-21): arena_ref_slots(+1) for a whole
+ * batch, with the per-slot verdict the one-slot-at-a-time caller needed --
+ * ok[i] = 1: the slot took the reference (COMPLETE or CLAIMED), 0: refused
+ * (it left between find and ref) or slot < 0. The probe hold pinned 45055
+ * pages with one ctypes call per page: 7.1 s of LOAD-DEVICE queue. */
+int64_t arena_ref_slots_mask(uint8_t *base, int64_t n, const int64_t *slots, int8_t *ok) {
+    int64_t done = 0;
+    for (int64_t i = 0; i < n; i++) {
+        ok[i] = 0;
+        if (slots[i] < 0) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        atomic_fetch_add(&sh->refcount, 1);
+        uint32_t st = atomic_load(&sh->state);
+        if (st != S_COMPLETE && st != S_CLAIMED) { atomic_fetch_sub(&sh->refcount, 1); continue; }
+        atomic_store(&sh->clock_bit, 1);
+        ok[i] = 1;
+        done++;
+    }
+    return done;
+}
+
 /* L3-REUSE 0928 (write-behind): the census of COMPLETE slots in ONE call --
  * slot, generation and key of each, so the background thread filters the
  * pages it already secured with numpy instead of a Python loop per slot. */

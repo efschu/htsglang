@@ -81,12 +81,24 @@ def pin(operation, pool, stems) -> int:
         capped = int(cand.size - room)
         cand = cand[:room]
     held = 0
-    for i in cand.tolist():
-        # one slot at a time: a slot that left COMPLETE between find and ref
-        # refuses its reference alone, the rest stay exact (and ledgered)
-        if arena.ref_slots([int(fs[i])], +1) == 1:
-            pins[i] = int(fs[i])
-            held += 1
+    batch = getattr(arena, "ref_slots_mask_np", None)
+    if callable(batch) and cand.size:
+        # PB (28.09., 27B rc12z24 P weg2-0-13: 45055 pages, 7.1 s of
+        # LOAD-DEVICE queue_ms=7809 before its 50 ms read): ONE call with the
+        # per-slot verdict instead of one ctypes call per page -- a slot that
+        # left COMPLETE between find and ref still refuses alone, the rest stay
+        # exact (and ledgered by name)
+        ok = np.asarray(batch(fs[cand]), dtype=np.int8)
+        took = cand[ok == 1]
+        pins[took] = fs[took]
+        held = int(took.size)
+    else:
+        for i in cand.tolist():
+            # one slot at a time: a slot that left COMPLETE between find and ref
+            # refuses its reference alone, the rest stay exact (and ledgered)
+            if arena.ref_slots([int(fs[i])], +1) == 1:
+                pins[i] = int(fs[i])
+                held += 1
     with _lock:
         _held_total += held
     operation.probe_pins = pins
