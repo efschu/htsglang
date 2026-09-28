@@ -3467,6 +3467,16 @@ class HiCacheFile(HiCacheStorage):
             rest = [s for s in stems if s not in out]
             sizes = pio.stat_sizes([self._flat_path(s) for s in rest])
             out.update({s: int(sz) for s, sz in zip(rest, sizes) if sz >= 0})
+        if _idx is not None and len(out) < len(stems):
+            # 28.09.: the index named them, the disk does not have them (a
+            # crash after an unlink, before its E line): a miss, and struck
+            # from both indexes -- never a read of a page that is not there
+            gone = [s for s in stems if s not in out]
+            try:
+                _idx.remove(gone)
+                self._evictor.forget(gone)
+            except Exception:  # noqa: BLE001 -- bookkeeping, never a gate on the read
+                pass
         return out
 
     def _arena_kv_present_prefix(self, keys: List[str]) -> Optional[int]:

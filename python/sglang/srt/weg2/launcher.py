@@ -10818,6 +10818,7 @@ def choose_host_ledger(
     d_draft_host_gib: float = 0.0,
     memhist_gib: float = 0.0,
     memhist_run_only: bool = False,
+    l3_index_gib: float = 0.0,
     meminfo_path: str = "/proc/meminfo",
     cgroup_root: str = "/sys/fs/cgroup",
     record_path: Optional[str] = None,
@@ -11135,6 +11136,8 @@ def choose_host_ledger(
         # rc12d: the torch allocation history (weg2/memhist.py) -- 5.4 GiB of
         # host nobody booked when it was armed from rank start in P and D.
         memhist_gib=float(memhist_gib), memhist_run_only=bool(memhist_run_only),
+        # 28.09.: the L3 store's RAM index (ledger post 'l3_index'), every owner.
+        l3_index_gib=float(l3_index_gib),
         # #1451: no arena on a --weg2-disable-hicache boot -- the term charged
         # 33.6 GiB there too (test_weg2_hicache_disabled_1386 M=2400 unfundable)
         **(_weg2_arena_ledger_terms(model_dir) if (model_dir and not hicache_disabled) else {}),  # #1432
@@ -21938,6 +21941,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(f"WEG2-MEMHIST ledger post memhist {_memhist_gib:.2f} GiB "
             f"({'run moment only' if _memhist_run_only else 'both moments'}): {_memhist_prov}")
 
+    # 28.09. (user order): the L3 store's RAM index is a host post -- entries
+    # (snapshot header, else the file count of the ONE walk the first boot
+    # makes) x RAM_BYTES_PER_ENTRY, once per owner (one per group).
+    from sglang.srt.mem_cache.storage.file import store_journal as _store_journal
+
+    _l3_idx_ident = (l3_persist_identity(ns.model, getattr(ns, "profile", ""),
+                                         getattr(ns, "form_kv", "") or "",
+                                         extra_p=getattr(ns, "extra_p", "") or "",
+                                         extra_d=getattr(ns, "extra_d", "") or "",
+                                         vision=str(getattr(ns, "weg2_vision", "") or ""))
+                     if l3_persist_enabled() else None)
+    _l3_idx_owners = 1 if getattr(ns, "d_only", False) else 2
+    _l3_idx_n, _l3_idx_src = (
+        _store_journal.index_entries(f"{STORE_ROOT}/{l3_persist_dir_name(_l3_idx_ident)}")
+        if _l3_idx_ident and _store_journal.enabled() else (0, "no persistent L3 (per-boot store)"))
+    _l3_index_gib = _l3_idx_n * _store_journal.RAM_BYTES_PER_ENTRY * _l3_idx_owners / (1 << 30)
+    log(f"WEG2-HOST-LEDGER L3 INDEX post l3_index {_l3_index_gib:.2f} GiB = {_l3_idx_n} entries "
+        f"({_l3_idx_src}) x {_store_journal.RAM_BYTES_PER_ENTRY} B x {_l3_idx_owners} owner(s), "
+        f"both moments; grows with the store up to its cap between boots")
+
     def _price_host_ledger():
         """#1453: the ONE ledger pricing, callable twice (see below)."""
         return choose_host_ledger(
@@ -21945,6 +21968,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ring_plan.host_weights_span1_bytes, ring_plan.provenance,
             d_draft_host_gib=d_draft_host_mib / 1024.0,
             memhist_gib=_memhist_gib, memhist_run_only=_memhist_run_only,
+            l3_index_gib=_l3_index_gib,
             # #1390: NAMED, not left to choose_host_ledger's own literal
             # defaults -- see MEMINFO_PATH/CGROUP_ROOT above for why a bare call
             # would keep reading the real box even under a test's mock.
