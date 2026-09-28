@@ -1791,7 +1791,31 @@ class SchedulerWeightUpdaterManager:
             logger.info("%s", census.format_line())
         else:
             logger.warning("%s", census.format_line())
+        self._weg2_free_sleep_staging()
         self._weg2_log_sleep_residue(census, tags)
+
+    def _weg2_free_sleep_staging(self) -> None:
+        """+254 MiB fix (a): drop the lazily re-created device stages at the
+        sleep (weg2/sleep_staging.py); one line with the MiB freed. Never raises."""
+        try:
+            import os
+
+            from sglang.srt.weg2 import sleep_staging as _ss
+
+            if not os.environ.get("SGLANG_WEG2_GROUP") or not _ss.enabled():
+                return
+            model = getattr(getattr(getattr(self, "tp_worker", None), "model_runner", None), "model", None)
+            freed = _ss.free_staging(model)
+            try:
+                import torch
+
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001
+                pass
+            logger.info("WEG2-SLEEP-STAGING freed %s (re-created on first use after the wake, "
+                        "inside the serving phase; %s=0 keeps them)", _ss.format_freed(freed), _ss.ENV)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("WEG2-SLEEP-STAGING skipped (%s: %s)", type(exc).__name__, str(exc)[:160])
 
     def _weg2_log_sleep_residue(self, census: Any, tags: Optional[List[str]]) -> None:
         """weg2xsn296: name what is STILL on the card after the sleep and dump
@@ -1838,6 +1862,14 @@ class SchedulerWeightUpdaterManager:
                     snap = path
                 except Exception as exc:  # noqa: BLE001
                     snap = f"failed:{type(exc).__name__}"
+                # +254 MiB fix (c): who holds the largest untagged live blocks
+                try:
+                    from sglang.srt.weg2 import sleep_staging as _ss
+
+                    for _line in _ss.holder_report(torch.cuda.memory._snapshot(), top=4, depth=3):
+                        logger.info("WEG2-SLEEP-HOLDER sleep=%d %s", n, _line)
+                except Exception as exc:  # noqa: BLE001
+                    logger.info("WEG2-SLEEP-HOLDER skipped (%s: %s)", type(exc).__name__, str(exc)[:160])
             logger.info(
                 "WEG2-SLEEP-RESIDUE sleep=%d untagged_live=%d MiB tagged=%d MiB torch_active=%d MiB "
                 "torch_reserved=%d MiB nvml_proc_used=%s MiB outside_torch=%s MiB snapshot=%s "
@@ -8799,8 +8831,14 @@ class SchedulerWeightUpdaterManager:
             ):
                 self._hibernate_park_weights(recv_req)
             if not family_paused_before:
-                self.stashed_model_static_state = _export_static_state(
-                    self.tp_worker.model_runner.model
+                from sglang.srt.weg2 import sleep_staging as _ss
+
+                # +254 MiB fix (b): the stash sleeps on the HOST (64 MiB on NF
+                # PP0 no pause covered); the wake's import copies it back.
+                self.stashed_model_static_state = (
+                    _ss.export_static_state_host(self.tp_worker.model_runner.model)
+                    if _ss.enabled() and os.environ.get("SGLANG_WEG2_GROUP")
+                    else _export_static_state(self.tp_worker.model_runner.model)
                 )
             torch.distributed.barrier(self.tp_cpu_group)
             # The PCIe serialisation lock is taken AFTER the barrier and around
