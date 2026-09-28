@@ -7,8 +7,9 @@ RAM index is the eviction owner's LRU index (it already existed; the walk built
 it). It now lives in the store as
 
 * ``L3_INDEX.snap`` -- the index as it is (every page file ``(mtime, stem,
-  bytes)`` oldest first, plus epoch and kernel boot id), PICKLED behind one
-  line ``WEG2-L3-INDEX v2 n=<N> bytes=<B> sha1=<of the payload>``; written
+  bytes)`` oldest first, plus epoch and kernel boot id), PICKLED in frames
+  behind one line ``WEG2-L3-INDEX v3 n=<N>``, the last frame carrying n,
+  bytes and the sha1 of the frames before it; written
   tmp + fsync + rename by ONE rank (the D group's owner) when a boot attaches
   -- never in a flip -- and
 * ``L3_JOURNAL.<epoch>.<rank ident>.<token>.jnl`` -- per writing rank, O_APPEND,
@@ -238,27 +239,74 @@ class JournalReader:
 # the snapshot
 # ---------------------------------------------------------------------------
 
-MAGIC = b"WEG2-L3-INDEX v2"
+MAGIC = b"WEG2-L3-INDEX v3"
+#: entries per pickled frame: load and write hold ONE frame beside the index,
+#: never the whole payload (R4 28.09.: v2 held payload + list + dict + copy,
+#: measured 419 B/entry transient over the 263 B/entry index at attach).
+FRAME = 16384
 
 
-def write_snapshot(store: str, items, epoch: int) -> Tuple[int, int]:
-    """``items`` = list of (mtime, stem, bytes) oldest first -- the index as it
-    is, pickled (no format of our own), behind one version/checksum line.
-    Atomic: tmp + fsync + rename + directory fsync."""
-    items = list(items)
-    payload = pickle.dumps(
-        {"epoch": int(epoch), "boot_id": kernel_boot_id(), "items": items},
-        protocol=pickle.HIGHEST_PROTOCOL)
-    total = sum(int(it[2]) for it in items)
-    head = (MAGIC + f" n={len(items)} bytes={total} "
-            f"sha1={hashlib.sha1(payload).hexdigest()}\n".encode())
+class _HashIO:
+    """File wrapper: sha1 over every byte read or written through it."""
+
+    def __init__(self, f):
+        self.f, self.h = f, hashlib.sha1()
+
+    def write(self, b):
+        self.h.update(b)
+        return self.f.write(b)
+
+    def read(self, n=-1):
+        b = self.f.read(n)
+        self.h.update(b)
+        return b
+
+    def readline(self, n=-1):
+        b = self.f.readline(n)
+        self.h.update(b)
+        return b
+
+    def readinto(self, buf):
+        n = self.f.readinto(buf)
+        self.h.update(memoryview(buf)[:n])
+        return n
+
+
+def write_snapshot(store: str, items, epoch: int, n: Optional[int] = None) -> Tuple[int, int]:
+    """``items`` = iterable of (mtime, stem, bytes) oldest first -- the index as
+    it is, pickled (no format of our own) in frames of ``FRAME`` entries behind
+    one line ``WEG2-L3-INDEX v3 n=<N>``; the last frame carries n, bytes and
+    the sha1 of every frame before it. Streamed: no payload, no list. Atomic:
+    tmp + fsync + rename + directory fsync."""
+    if n is None:
+        items = list(items)
+        n = len(items)
     path = os.path.join(store, SNAP)
     tmp = f"{path}.w{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp"
+    count = total = 0
     with open(tmp, "wb") as f:
-        f.write(head)
-        f.write(payload)
+        f.write(MAGIC + f" n={int(n)}\n".encode())
+        w = _HashIO(f)
+        pickle.dump({"epoch": int(epoch), "boot_id": kernel_boot_id()}, w,
+                    protocol=pickle.HIGHEST_PROTOCOL)
+        frame: list = []
+        for it in items:
+            frame.append(it)
+            total += int(it[2])
+            if len(frame) >= FRAME:
+                pickle.dump(frame, w, protocol=pickle.HIGHEST_PROTOCOL)
+                count += len(frame)
+                frame = []
+        if frame:
+            pickle.dump(frame, w, protocol=pickle.HIGHEST_PROTOCOL)
+            count += len(frame)
+        pickle.dump({"end": 1, "n": count, "bytes": total, "sha1": w.h.hexdigest()}, f,
+                    protocol=pickle.HIGHEST_PROTOCOL)
         f.flush()
         os.fsync(f.fileno())
+    if count != int(n):
+        os.unlink(tmp)
+        raise ValueError(f"snapshot: {count} entries written, {n} announced")
     os.replace(tmp, path)
     try:
         dfd = os.open(store, os.O_RDONLY)
@@ -268,7 +316,7 @@ def write_snapshot(store: str, items, epoch: int) -> Tuple[int, int]:
             os.close(dfd)
     except OSError:
         pass
-    return len(items), total
+    return count, total
 
 
 def remove_snapshot_tmps(store: str) -> int:
@@ -353,7 +401,7 @@ def load_index(store: str, *, own_path: Optional[str] = None,
         if snap.boot_id != boot:
             return None, ("kernel boot id changed since the snapshot (host reboot or "
                           "power loss can drop unsynced journal lines)")
-        items = dict(snap.items)
+        items = snap.items  # the loaded dict itself: no copy (R4)
         records: Optional[List[Record]] = []
         used = 0
         for p in journal_paths(store):
@@ -429,34 +477,42 @@ class Snapshot:
 
 
 def load_snapshot(store: str) -> Tuple[Optional[Snapshot], str]:
-    """``(snapshot, "")`` or ``(None, why)`` -- missing, torn, or a sum mismatch."""
+    """``(snapshot, "")`` or ``(None, why)`` -- missing, torn, of another
+    version, or a sum mismatch. Streamed frame by frame into the dict."""
     path = os.path.join(store, SNAP)
     try:
-        st = os.stat(path)
-        with open(path, "rb") as f:
-            data = f.read()
+        f = open(path, "rb")
     except FileNotFoundError:
         return None, "no snapshot"
     except OSError as e:
         return None, f"snapshot unreadable ({e})"
-    nl = data.find(b"\n")
-    if nl < 0 or not data.startswith(MAGIC + b" "):
-        return None, "snapshot torn or of another version (header)"
-    head = dict(kv.split("=", 1) for kv in data[len(MAGIC):nl].decode(errors="replace").split()
-                if "=" in kv)
-    payload = data[nl + 1:]
-    if head.get("sha1") != hashlib.sha1(payload).hexdigest():
+    with f:
+        try:
+            ino = os.fstat(f.fileno()).st_ino
+            head = f.readline(4096)
+            if not head.startswith(MAGIC + b" "):
+                return None, "snapshot torn or of another version (header)"
+            r = _HashIO(f)
+            meta = pickle.load(r)
+            items: Dict[str, Tuple[float, int]] = {}
+            total = 0
+            while True:
+                before = r.h.copy()
+                obj = pickle.load(r)
+                if isinstance(obj, dict):
+                    break
+                for m, stem, n in obj:
+                    items[stem] = (float(m), int(n))
+                    total += int(n)
+            if f.read(1):
+                return None, "snapshot: bytes after the end frame"
+        except Exception as e:  # noqa: BLE001 -- any unpickling fault = a broken snapshot
+            return None, f"snapshot torn ({type(e).__name__})"
+    if obj.get("sha1") != before.hexdigest():
         return None, "snapshot checksum mismatch"
-    try:
-        obj = pickle.loads(payload)
-        items: Dict[str, Tuple[float, int]] = {
-            stem: (float(m), int(n)) for m, stem, n in obj["items"]}
-        epoch = int(obj.get("epoch", 0))
-    except Exception as e:  # noqa: BLE001 -- any unpickling fault = a broken snapshot
-        return None, f"snapshot unreadable ({type(e).__name__})"
-    if int(head.get("n", -1)) != len(items):
+    if int(obj.get("n", -1)) != len(items) or int(obj.get("bytes", -1)) != total:
         return None, "snapshot count mismatch"
-    return Snapshot(epoch, str(obj.get("boot_id", "")), items, st.st_ino), ""
+    return Snapshot(int(meta.get("epoch", 0)), str(meta.get("boot_id", "")), items, ino), ""
 
 
 def replay(items: "Dict[str, Tuple[float, int]]", records: List[Record],

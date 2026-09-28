@@ -1649,10 +1649,12 @@ class LRUFileEvictor:
             self._journal_collect = []
             try:
                 entries = self._census_existing_files()
+                collected = self._journal_collect
             finally:
-                self._journal_items = self._journal_collect
                 self._journal_collect = None
             self._journal_source = f"walk ({why})"
+            collected.sort(key=lambda it: it[0])
+            self._journal_write_snapshot(collected, len(collected))
             return entries
 
         class _St:
@@ -1667,10 +1669,13 @@ class LRUFileEvictor:
             entries = self._census_existing_files()
         finally:
             self._iter_existing = real
-        self._journal_items = [(m, stem, n) for stem, (m, n) in items.items()]
         self._journal_source = why
         logger.info(f"HiCacheFile index LOADED at attach: {why}, {len(items)} files, "
                     f"{(time.monotonic() - t0) * 1000:.0f} ms (no directory walk)")
+        # R4: persisted straight from the loaded dict (insertion order = oldest
+        # first), BEFORE the install -- the dict is gone when the LRU is built
+        self._journal_write_snapshot(
+            ((m, stem, n) for stem, (m, n) in items.items()), len(items))
         return entries
 
     def _journal_load(self):
@@ -1689,28 +1694,33 @@ class LRUFileEvictor:
             skip_epoch_from=epoch if epoch > 0 else None, stat_size=_stat)
 
     def _journal_after_attach(self) -> None:
-        """The snapshot writer persists what this attach installed and compacts;
-        every owner sets where its journal reads start."""
-        items = self._journal_items
+        """Every owner sets where its journal reads start (this boot's journals
+        from offset 0; the snapshot writer already persisted and compacted)."""
         self._journal_items = None
         if self._journal_reader is None:
             return
         epoch = _sj.attach_epoch()
         self._journal_reader.mark(epoch_below=epoch if epoch > 0 else None)
-        if items is None or not self._journal_is_snapshot_writer():
+
+    def _journal_write_snapshot(self, items, n: int) -> None:
+        """The ONE snapshot writer (the D group's owner) persists the attach
+        census it just read -- streamed from ``items`` (R4: no list, no payload)
+        -- and compacts the earlier boots' journals into it."""
+        if (getattr(self, "_journal_reader", None) is None
+                or not self._journal_is_snapshot_writer()):
             return
+        epoch = _sj.attach_epoch()
         try:
-            items.sort(key=lambda it: it[0])
             tmps = _sj.remove_snapshot_tmps(self.file_path)
             if tmps:
                 logger.info(f"HiCacheFile index: {tmps} torn snapshot tmp(s) of a dead writer removed")
-            n, nbytes = _sj.write_snapshot(self.file_path, items, epoch)
+            n, nbytes = _sj.write_snapshot(self.file_path, items, epoch, n=n)
             gone = _sj.remove_journals_before(self.file_path, epoch)
             logger.info(f"HiCacheFile index SNAPSHOT written: {n} files, {nbytes} B "
                         f"({self._journal_source}); {gone} journal(s) of earlier boots compacted; "
                         f"host RAM of this index ~{n * _sj.RAM_BYTES_PER_ENTRY / (1 << 20):.0f} MiB "
                         f"({_sj.RAM_BYTES_PER_ENTRY} B/entry) per owner")
-        except OSError as e:
+        except (OSError, ValueError) as e:
             logger.warning(f"HiCacheFile index snapshot NOT written ({e}); the next attach walks")
 
     def forget(self, stems) -> int:
