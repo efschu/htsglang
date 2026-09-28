@@ -13,7 +13,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from rigdash import energy, health, live, parse, server, sources, stops  # noqa: E402
+from rigdash import energy, health, imagechanges, live, parse, server, sources, stops  # noqa: E402
 
 P_RANK0 = ("[2026-09-27 09:20:28 PP0] Prefill rank batch, #new-token: 16384, #cached-token: 0, #chunks: 1, "
            "gpu-ms: 3255.5 (compute 3255.5, wait 0.0) (wait by family: tp.all_reduce 0.0/29x) bubble_ms=16.5 "
@@ -997,3 +997,94 @@ class GenArtefactTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _boot(stem, tree, sha, live_=False, last=0.0, container=None):
+    b = {"stem": stem, "live": live_, "last_log_t": last,
+         "meta": {"stem": stem, "tree": tree, "sha": sha, "tag": stem.split("_")[2]}}
+    if container:
+        b["container"] = container
+    return b
+
+
+IMAGES = {
+    "f833fcbb2d": {"rc": "rc12z29b", "base": "rc12z29", "built_utc": "2026-09-28T19:21Z", "changes": [
+        {"id": "S3f", "who": "NF", "title": "Owner-Zeilen", "expected": "-st-cut bootet",
+         "status": "belegt", "evidence": "rc12z29b serving"},
+        {"id": "X", "who": "NF", "title": "t", "expected": "e", "status": "geraten", "evidence": ""}]},
+    "70ac86e2bd": {"rc": "rc12z30b", "changes": []},
+}
+
+
+class ImageChangesTests(unittest.TestCase):
+    def test_seat_from_tree_then_form_then_dir(self):
+        self.assertEqual(imagechanges.seat_of({"tree": "/opt/htsglang/src-nf"}), "NF")
+        self.assertEqual(imagechanges.seat_of({"tree": "/opt/htsglang/src-27b/"}), "27B")
+        self.assertEqual(imagechanges.seat_of({"form": "arch=dense profile=qwen27b model=x"}), "27B")
+        self.assertEqual(imagechanges.seat_of({"dir": "/spinning/docker-acceptance/nf/evidence"}), "NF")
+        self.assertIsNone(imagechanges.seat_of({"dir": "/tmp/x"}))
+
+    def test_running_boot_wins_over_a_newer_dead_one(self):
+        boots = [
+            _boot("boot_weg2_nfa_70ac86e2bd_0928_2005", "/opt/htsglang/src-nf", "70ac86e2bd", last=200.0),
+            _boot("boot_weg2_nfb_f833fcbb2d_0928_2011", "/opt/htsglang/src-nf", "f833fcbb2d", live_=True, last=150.0),
+            _boot("boot_weg2_27a_85386b1df1_0928_1851", "/opt/htsglang/src-27b", "85386b1df1", last=100.0),
+        ]
+        cur = imagechanges.current_boot_per_seat(boots)
+        self.assertEqual(cur["NF"]["meta"]["sha"], "f833fcbb2d")
+        self.assertEqual(cur["27B"]["meta"]["sha"], "85386b1df1")
+
+    def test_view_names_the_image_its_changes_and_the_missing_rev(self):
+        boots = [
+            _boot("boot_weg2_nfb_f833fcbb2d_0928_2011", "/opt/htsglang/src-nf", "f833fcbb2d", live_=True, last=1.0,
+                  container={"State": "running", "Image": "htsglang:cu130-weg2-rc12z29b-27b-nf"}),
+            _boot("boot_weg2_27a_85386b1df1_0928_1851", "/opt/htsglang/src-27b", "85386b1df1", last=1.0),
+        ]
+        v = imagechanges.view(boots, IMAGES)
+        self.assertEqual([s["seat"] for s in v["seats"]], ["27B", "NF"])
+        b27, nf = v["seats"]
+        self.assertFalse(b27["found"])
+        self.assertEqual(b27["rev"], "85386b1df1")
+        self.assertTrue(nf["found"] and nf["running"])
+        self.assertEqual((nf["rc"], nf["image"]), ("rc12z29b", "htsglang:cu130-weg2-rc12z29b-27b-nf"))
+        self.assertEqual([c["status"] for c in nf["changes"]], ["belegt", "unbekannt"])
+        self.assertEqual(nf["changes"][1]["status_raw"], "geraten")
+
+    def test_short_or_long_rev_matches(self):
+        self.assertEqual(imagechanges.entry_for(IMAGES, "f833fcbb2d0123")[0], "f833fcbb2d")
+        self.assertEqual(imagechanges.entry_for(IMAGES, "f833fcb")[0], "f833fcbb2d")
+        self.assertEqual(imagechanges.entry_for(IMAGES, "f83")[0], None)
+
+    def test_secret_in_a_text_field_is_cut(self):
+        boots = [_boot("boot_weg2_nfb_f833fcbb2d_0928_2011", "/opt/htsglang/src-nf", "f833fcbb2d", live_=True)]
+        imgs = {"f833fcbb2d": {"changes": [{"id": "A", "status": "belegt", "evidence": "token=abcdefgh12345678"}]}}
+        self.assertNotIn("abcdefgh12345678", json.dumps(imagechanges.view(boots, imgs)))
+
+    def test_loader_rereads_on_change_and_keeps_the_last_good_content(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "image_changes.json")
+            ic = imagechanges.ImageChanges(p)
+            self.assertIsNotNone(ic.load()[1])  # missing file is named
+            with open(p, "w") as fh:
+                json.dump({"images": IMAGES}, fh)
+            imgs, err = ic.load()
+            self.assertIsNone(err)
+            self.assertIn("f833fcbb2d", imgs)
+            with open(p, "w") as fh:
+                fh.write('{"images": {"broken')
+            imgs, err = ic.load()
+            self.assertIn("f833fcbb2d", imgs)
+            self.assertIn("JSONDecodeError", err)
+
+    def test_snapshot_carries_the_view(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "ic.json")
+            with open(p, "w") as fh:
+                json.dump({"images": IMAGES}, fh)
+            ns = argparse.Namespace(log_glob=[os.path.join(d, "none-*.log")], docker_ssh="", docker_host_prefix="",
+                                    front=[], gpuq="", state_dir="", release_profile=[], image_changes=p)
+            app = server.App(ns)
+            snap = app.snapshot(with_series=False)
+            self.assertEqual(snap["image_changes"], {"path": p, "error": None, "seats": []})
+

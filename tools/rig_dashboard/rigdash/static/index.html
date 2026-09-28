@@ -160,6 +160,12 @@ section.card.hang { border: 3px solid var(--alarm-hang); }
 .launch { font-size: 11px; color: var(--text-2); margin-top: 6px; max-height: 360px; overflow: auto; }
 .launch div { padding: 2px 0; border-bottom: 1px dashed var(--line); overflow-wrap: anywhere; }
 details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
+.pill { font-size: 11px; font-weight: 650; padding: 1px 8px; border-radius: 10px; border: 1px solid currentColor;
+  background: var(--surface-2); white-space: nowrap; }
+.pill.s-belegt { color: var(--good); } .pill.s-wirkungslos { color: var(--bad); } .pill.s-unbelegt { color: var(--warn); }
+.pill.s-erwartet { color: var(--bar); } .pill.s-unbekannt { color: var(--muted); }
+.imgseat + .imgseat { margin-top: 14px; }
+.imgseat td.ev { color: var(--text-2); font-size: 12px; max-width: 460px; overflow-wrap: anywhere; }
 .note { font-size: 12px; color: var(--text-2); max-width: 900px; }
 .note b { color: var(--text); }
 .flipbar { display: flex; gap: 2px; align-items: flex-end; height: 34px; margin-top: 6px; }
@@ -195,6 +201,10 @@ details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
   <div class="chips" id="chips"></div>
   <div class="cardstrip" id="cardstrip"></div>
   <div id="boots"></div>
+  <section class="card" id="imgchg-card">
+    <h2>Image-&Auml;nderungen <span class="muted">was das laufende Boot-Image je Sitz gegen&uuml;ber seinem Vorg&auml;nger tr&auml;gt, erwartete Wirkung und Stand am Metall</span></h2>
+    <div id="imgchg"></div>
+  </section>
   <section class="card" id="gpus-card">
     <h2>Karten <span class="muted">nvidia-smi, alle 2 s &middot; Verlauf 15 min</span></h2>
     <div id="gpus"></div>
@@ -689,6 +699,34 @@ function gpuqHtml(d) {
     `<tr><td class="mono">${esc(b.owner)}</td><td>${esc(b.state)}</td><td>${esc((b.cards || []).join(","))}${b.mib ? " &middot; " + fmt(b.mib) + " MiB" : ""}</td><td>${esc(((b.start || {}).local || "").slice(11, 16))}</td><td>${esc(((b.end || {}).local || "").slice(11, 16))}</td><td>${esc(b.purpose)}</td></tr>`).join("") + `</table>`;
 }
 
+const IMG_STATUS = ["belegt", "wirkungslos", "unbelegt", "erwartet", "unbekannt"];
+function imgChgHtml(d) {
+  const ic = d.image_changes;
+  if (!ic) return `<div class="muted">keine Daten</div>`;
+  const err = ic.error ? `<div class="err">image_changes.json: ${esc(ic.error)}</div>` : "";
+  if (!(ic.seats || []).length) return err + `<div class="muted">kein Boot eines Sitzes (27B, NF) in den Logs der letzten 6 h</div>`;
+  return err + ic.seats.map((s) => {
+    const head = `<div class="boot-head"><span class="model">${esc(s.seat)}</span>`
+      + (s.rc ? `<span class="badge phase">${esc(s.rc)}</span>` : "")
+      + `<span class="chip mono">REV ${esc(s.rev)}</span>`
+      + `<span class="chip ${s.running ? "ok" : "warn"}">${s.running ? "l&auml;uft" : "zuletzt gebootet, nicht live"}</span>`
+      + (s.built_utc ? `<span class="chip">gebaut ${esc(String(s.built_utc).replace("T", " ").slice(5))}${s.base ? " &middot; Basis " + esc(s.base) : ""}</span>` : "")
+      + (s.image ? `<span class="chip mono">${esc(s.image)}</span>` : "")
+      + `</div>`;
+    if (!s.found) return `<div class="imgseat">${head}<div class="muted">keine Eintr&auml;ge f&uuml;r REV ${esc(s.rev)}</div></div>`;
+    const ch = s.changes || [];
+    if (!ch.length) return `<div class="imgseat">${head}<div class="muted">Eintrag ohne &Auml;nderungen</div></div>`;
+    const n = {};
+    ch.forEach((c) => { n[c.status] = (n[c.status] || 0) + 1; });
+    const sum = IMG_STATUS.filter((k) => n[k]).map((k) => `<span class="pill s-${k}">${n[k]} ${k}</span>`).join(" ");
+    return `<div class="imgseat">${head}<div style="margin:-4px 0 8px">${sum}</div><div class="tablewrap"><table>
+      <tr><th>Stand</th><th>Fix</th><th>erwartet</th><th>Beleg</th><th>wer</th></tr>`
+      + ch.map((c) => `<tr><td><span class="pill s-${esc(c.status)}" title="${esc(c.status_raw || c.status)}">${esc(c.status)}</span></td>
+        <td><b class="mono">${esc(c.id)}</b> ${esc(c.title)}</td><td>${esc(c.expected)}</td><td class="ev">${esc(c.evidence)}</td><td>${esc(c.who)}</td></tr>`).join("")
+      + `</table></div></div>`;
+  }).join("");
+}
+
 function endCell(b) {
   const a = b.alarm || {}, e = a.ended_on, ps = a.planned_stop;
   if (ps && (ps.stopping || (e && e.planned)))
@@ -734,6 +772,7 @@ async function refresh() {
     if (!live.length && shown.length) $("boots").insertAdjacentHTML("afterbegin", shown.every(plannedStopped)
       ? `<section class="card" style="border-color:var(--flip)"><b>Kein Modell schreibt gerade Logs</b> <span class="muted">&middot; der letzte Boot wurde geplant gestoppt. Unten seine letzten Zahlen.</span></section>`
       : `<section class="card" style="border-color:var(--bad)"><b style="color:var(--bad)">Kein Modell schreibt gerade Logs.</b> <span class="muted">Unten der zuletzt aktive Boot mit seinen letzten Zahlen.</span></section>`);
+    $("imgchg").innerHTML = imgChgHtml(d);
     $("gpus").innerHTML = gpusHtml(d, binders);
     $("containers").innerHTML = containersHtml(d);
     $("gpuq").innerHTML = gpuqHtml(d);

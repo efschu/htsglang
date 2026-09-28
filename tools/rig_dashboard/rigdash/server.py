@@ -3,7 +3,8 @@
 Routes
   GET /               the live page
   GET /api/live       one JSON snapshot: boots (from their logs), GPUs,
-                      containers, gpuq plan, every source's age and error
+                      containers, gpuq plan, every source's age and error,
+                      the running image's changes per seat (image_changes.json)
   GET /api/health     liveness of the dashboard itself
 """
 
@@ -19,7 +20,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import energy, health, live, redact, sources, weg2line
+from . import energy, health, imagechanges, live, redact, sources, weg2line
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -143,6 +144,8 @@ class App:
         self.src = sources.Sources(cfg)
         self.weg2 = weg2line.Weg2Lines(cfg["docker_ssh"], args.release_profile or [])
         self.energy = energy.EnergyBook(args.state_dir or None, live.BUCKET_S)
+        self.imgchg = imagechanges.ImageChanges(args.image_changes)
+        self.imgchg_lock = threading.Lock()
         self.stop = threading.Event()
         self.t0 = time.time()
         self.version = _version()
@@ -191,6 +194,8 @@ class App:
         for b in boots:
             finish_series(b, gser, now, live.BUCKET_S)
             b["energy"] = self.energy.view(b["stem"], (b.get("totals") or {}).get("boot_wall_s"))
+        with self.imgchg_lock:
+            images, img_err = self.imgchg.load()
         return {
             "t": now,
             "version": self.version,
@@ -204,6 +209,7 @@ class App:
             "fronts": {k: {kk: vv for kk, vv in v.items() if kk != "value"} for k, v in fronts.items()},
             "collector_error": getattr(self.logs, "last_error", None),
             "energy_error": getattr(self, "energy_error", None),
+            "image_changes": imagechanges.view(boots, images, img_err, self.imgchg.path),
             "windows": {"rate_s": live.WINDOW_S, "bucket_s": live.BUCKET_S, "history_s": live.HISTORY_S,
                         "live_s": live.LIVE_S},
         }
@@ -303,6 +309,8 @@ def main(argv=None):
                     help="weg2 front base URL to read /weg2/state from (repeatable)")
     ap.add_argument("--gpuq", default="http://127.0.0.1:8770")
     ap.add_argument("--state-dir", default="", help="keeps the 15-min card history across restarts")
+    ap.add_argument("--image-changes", default=imagechanges.DEFAULT_PATH,
+                    help="the operator's per-image change list (rev -> fixes, expected gain, metal status)")
     ap.add_argument("--release-profile", action="append", default=[],
                     help="profile name offered by the start-line wizard (repeatable; the unit names the release ones)")
     args = ap.parse_args(argv)
