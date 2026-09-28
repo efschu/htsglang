@@ -15840,7 +15840,8 @@ class Scheduler(
                 _note_skip("weg2_burst_assembly", req.rid)
                 continue
             if _d_park_gate is not None:  # H91b: parked first, newcomers wait
-                _d_skip = _d_park_gate.skip(req)
+                # AP: the parked requests already admitted THIS pass hold no seat
+                _d_skip = _d_park_gate.skip(req, admitted=[str(_r.rid) for _r in adder.can_run_list])
                 if _d_skip is not None:
                     _note_skip(_d_skip, req.rid)
                     continue

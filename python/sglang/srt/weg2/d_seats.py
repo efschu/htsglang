@@ -251,13 +251,32 @@ class AdmissionGate:
     oldest_parked_age: Optional[float] = None
     blocked: FrozenSet[str] = frozenset()
     note: str = ""
+    #: AP (28.09.): the parked rids IN the queue that may resume this pass --
+    #: the queue serves them first (``order_waiting``); once every one of them
+    #: is admitted THIS pass, a newcomer behind them takes no parked seat.
+    parked_in_queue: FrozenSet[str] = frozenset()
+    #: parked requests OUTSIDE the queue (post-wake settle, deferred): their
+    #: seats stay held for the whole pass, as before
+    parked_outside: int = 0
 
-    def skip(self, req) -> Optional[str]:
-        """Census key when ``req`` is skipped this pass, else None."""
+    def skip(self, req, admitted=None) -> Optional[str]:
+        """Census key when ``req`` is skipped this pass, else None.
+        ``admitted``: the rids already in this pass's batch (None = the old
+        static barrier)."""
         site = park_site(req)
         if site is not None:
             return "weg2_d_park_older_live" if str(req.rid) in self.blocked else None
         if not self.barrier:
+            return None
+        # AP (NF rc12z29b 20:18:16, wake 3): 2 flip-parked resumes were
+        # admitted, and the 3 hold arrivals of the SAME wake waited a whole
+        # extra 1.8-s extend pass as "newcomers" although their seats were
+        # free -- the barrier stood on parked requests that were already in
+        # the batch. The barrier keeps a seat for a parked request that is
+        # still WAITING; one that is admitted in this pass waits for nothing.
+        if (admitted is not None and ap_enabled() and not self.blocked
+                and not self.parked_outside and self.parked_in_queue
+                and self.parked_in_queue <= set(admitted)):
             return None
         # SA (#244): the barrier holds back only newcomers YOUNGER than the
         # oldest parked request still waiting -- an older one (a waiter a
@@ -357,7 +376,19 @@ def admission_gate(
     _waiting_parked = [r for r in parked_waiting if str(r.rid) not in blocked] or parked_waiting
     oldest = min((_arrival(r) for r in _waiting_parked + parked_outside), default=None)
     return AdmissionGate(barrier=True, blocked=frozenset(blocked), note=note,
-                         oldest_parked_age=oldest)
+                         oldest_parked_age=oldest,
+                         parked_in_queue=frozenset(str(r.rid) for r in parked_waiting),
+                         parked_outside=len(parked_outside))
+
+
+AP_ENV = "SGLANG_WEG2_D_PARK_BARRIER_ADMITTED"
+
+
+def ap_enabled(env: Optional[Mapping[str, str]] = None) -> bool:
+    """AP (28.09.), default ON: the park barrier lifts in the pass that
+    admitted every parked request of the queue; 0 = the static barrier."""
+    e = os.environ if env is None else env
+    return str(e.get(AP_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
 
 
 def awake_requeue_due(parked: Sequence, *, now: float, bound_s: float) -> bool:
