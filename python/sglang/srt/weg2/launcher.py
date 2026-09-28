@@ -4606,6 +4606,68 @@ def publish_d_owner_ratio(ns, plan, label: str, log) -> List[float]:
     return [float(x) for x in new]
 
 
+#: VRAM loop P1c (28.09., user: "macht der Planer es besser und die Werte werden
+#: nicht uebernommen?" -- yes: FRACTION-SOLVE D computed DECKE 0.062/0.586/0.491
+#: against the profile's 0.060/0.510/0.480 in every NF boot, ~1.3 GiB idle on
+#: nv0). The planner OWNS FR_D: its edge wins; a profile value binds only as a
+#: named cap (``SGLANG_WEG2_FR_D_CAP`` in --env-d). Default ON.
+FR_D_CEILING_ENV = "SGLANG_WEG2_FR_D_CEILING"
+FR_D_CAP_ENV = "SGLANG_WEG2_FR_D_CAP"
+#: P0 (torch cache cap) must be armed in the SAME D group: the edge leaves ~0 MiB
+#: after KV, and without a bounded cache the allocator swing (0.7-3.5 GiB,
+#: WEG2-VRAM-PEAK rc12z26) takes that memory back at the next peak.
+TORCH_CACHE_CAP_ENV = "SGLANG_WEG2_TORCH_CACHE_CAP"
+FR_D_CEILING_MARKER = "FR-D-DECKE (VRAM-Loop P1c)"
+
+
+def d_fr_ceiling_adopt(plan, fractions, env_d: Mapping[str, str], owned: bool
+                       ) -> Tuple[Optional[List[float]], List[str]]:
+    """The fraction group D boots with when the planner's edge is higher than
+    the stated FR_D, or ``(None, lines)`` when the stated one stays.
+
+    Never under an owned cut (#239 S3f publishes FR_D itself) and never over a
+    fraction the planner already solved (S2b). Raises only: a rank whose edge
+    is below its stated FR is the W122/scratch-cap path's business, not this
+    one's. Every rank is named, adopted or not."""
+    given = [float(x) for x in fractions]
+    if str(env_d.get(FR_D_CEILING_ENV, "1")).strip() == "0":
+        return None, [f"{FR_D_CEILING_MARKER}: {FR_D_CEILING_ENV}=0 -- gegeben {given} bleibt"]
+    if owned or getattr(plan, "solved_fractions", ()) or getattr(plan, "solved_owner_ratio", ()):
+        return None, []
+    fits = list(getattr(plan, "fits", ()) or ())
+    if len(fits) != len(given) or any(f.ceiling_fraction is None for f in fits):
+        return None, [f"{FR_D_CEILING_MARKER}: keine Kante auf jedem Rang -- gegeben {given} bleibt"]
+    ceil = [float(f.ceiling_fraction) for f in fits]
+    cap_raw = str(env_d.get(FR_D_CAP_ENV, "")).strip()
+    cap: Optional[List[float]] = None
+    if cap_raw:
+        try:
+            cap = [float(x) for x in cap_raw.split(",")]
+        except ValueError:
+            cap = None
+        if cap is None or len(cap) != len(given):
+            return None, [f"{FR_D_CEILING_MARKER}: {FR_D_CAP_ENV}={cap_raw!r} unlesbar -- "
+                          f"gegeben {given} bleibt"]
+    new = []
+    lines = []
+    for r, (g, c) in enumerate(zip(given, ceil)):
+        target = min(c, cap[r]) if cap is not None else c
+        val = max(g, target)
+        new.append(val)
+        why = ("Decke" if cap is None or c <= cap[r] else f"Decke {c:.3f} gekappt auf "
+               f"{FR_D_CAP_ENV} {cap[r]:.3f}")
+        lines.append(f"{FR_D_CEILING_MARKER} rang{r}: gegeben {g:.3f} -> {val:.3f} ({why}"
+                     + (", Decke unter gegeben: bleibt" if c < g else "") + ")")
+    if all(abs(a - b) < 5e-4 for a, b in zip(new, given)):
+        return None, lines + [f"{FR_D_CEILING_MARKER}: Decke = gegeben, nichts zu uebernehmen"]
+    if str(env_d.get(TORCH_CACHE_CAP_ENV, "0")).strip() != "1":
+        return None, lines + [f"{FR_D_CEILING_MARKER}: Decke NICHT uebernommen: P0 aus "
+                              f"({TORCH_CACHE_CAP_ENV}!=1 in --env-d) -- ohne gedeckelten "
+                              f"Allokator-Cache nimmt der Cache-Swing den Platz an der naechsten "
+                              f"Spitze zurueck; gegeben {given} bleibt"]
+    return new, lines
+
+
 #: #239 S3a: the D argv that carries the planner's token cut to the runtime
 #: (server_args._resolve_form_a_dcp -> rank_role.resolve_dcp_under_host_kv).
 D_TOKEN_CUT_FLAGS = (
@@ -16365,6 +16427,25 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             f"{','.join(_dp._fmt(x) for x in plan.solved_fractions)} (vorher "
             f"{','.join(str(x) for x in fr_d)}), Token-Schnitt {list(plan.kv_token_cut)}/"
             f"{_er.KV_TOKEN_SHARE_GRID}")
+    # VRAM loop P1c (28.09.): the planner's edge wins over the stated FR_D
+    # (outside an owned cut and an S2b solve), coupled to P0 in this group.
+    _fr_new, _fr_lines = d_fr_ceiling_adopt(
+        plan, fr_d, _env_d, bool(_er.owned_cut_request(_kv_cut)[0]))
+    for _ln in _fr_lines:
+        log(f"{D_RANK_SOLVE_MARKER} {label} {_ln}")
+    if _fr_new is not None:
+        from sglang.srt.weg2 import draft_post as _dp
+
+        ns.extra_d = _dp.replace_vector_flag(getattr(ns, "extra_d", "") or "",
+                                             "--rank-moe-resident-fraction", _fr_new)
+        ns.env_d = _dp.replace_env_vector(getattr(ns, "env_d", "") or "",
+                                          "SGLANG_MOE_RESIDENT_EXPERT_FRACTION", _fr_new)
+        _env_d = parse_group_env(ns.env_d)
+        log(f"{D_RANK_SOLVE_MARKER} {label} {FR_D_CEILING_MARKER} veroeffentlicht: --extra-d "
+            f"--rank-moe-resident-fraction {','.join(_dp._fmt(x) for x in _fr_new)} (vorher "
+            f"{','.join(str(x) for x in fr_d)}; der Planer setzt FR_D, das Profil ist nur "
+            f"noch benannte Obergrenze {FR_D_CAP_ENV})")
+        fr_d = [float(x) for x in _fr_new]
     # #239 S3a: the cut itself goes to D as the runtime's token vector.
     _cut_line = publish_d_token_cut(
         ns, d_token_cut_vector(getattr(plan, "kv_token_cut", ()), _kv_cut), label)
