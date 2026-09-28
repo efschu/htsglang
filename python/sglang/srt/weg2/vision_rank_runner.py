@@ -281,7 +281,9 @@ def encode_items(module: torch.nn.Module, items: Sequence[Any]) -> List[torch.Te
     rows, and host rows outlive the tower."""
     dev = next(module.parameters()).device
     out = []
-    for it in items:
+    _ms = {}
+    for _i, it in enumerate(items):
+        _t = time.perf_counter()
         if hasattr(it, "has_cuda_ipc_proxy") and it.has_cuda_ipc_proxy():
             it.reconstruct(dev.index if dev.index is not None else 0)
         pixel = torch.as_tensor(it.feature).to(dev, dtype=module.dtype, non_blocking=True)
@@ -289,6 +291,12 @@ def encode_items(module: torch.nn.Module, items: Sequence[Any]) -> List[torch.Te
         rows = module(pixel, grid_thw=grid)
         out.append(rows.to("cpu"))
         del pixel, grid, rows
+        _k = "first" if _i == 0 else "rest"
+        _ms[_k] = _ms.get(_k, 0.0) + (time.perf_counter() - _t) * 1e3
+    try:
+        module._weg2_encode_ms = _ms  # (d) instrument, read by run_rank_stage
+    except Exception:  # noqa: BLE001
+        pass
     return out
 
 
@@ -378,6 +386,8 @@ class StageOutcome:
     host_current_delta: str = "n/a"
     host_anon_delta: str = "n/a"
     legs_ms: Dict[str, float] = field(default_factory=dict)
+    teardown_ms: Dict[str, float] = field(default_factory=dict)
+    encode_ms: Dict[str, float] = field(default_factory=dict)
     #: 27B review of H125e: the wait for PP0's last forward before a tower in
     #: free VRAM (None: not asked -- the tower sat on the KV tail)
     sync_ms: Optional[float] = None
@@ -517,6 +527,9 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             leg, t0 = "encode", clock()
             with torch.inference_mode(), attention_backend_scope(backend):
                 rows = encode(module, items)
+            # (d): the encode's first item vs the rest (a cold first kernel
+            # load shows as first >> per-item rest); encode_items fills it
+            out.encode_ms = dict(getattr(module, "_weg2_encode_ms", {}) or {})
             # Plain tensors, as the tokenizer-process stage handed on: an
             # inference tensor would refuse a later in-place use outside
             # inference mode.
@@ -538,18 +551,28 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
         module = None
         for key in set(rope_factory._ROPE_DICT) - rope_keys:
             rope_factory._ROPE_DICT.pop(key, None)
+        _tg = clock()
         if touched:
             gc.collect()
+        _ts = clock()
         if on_card and touched:
             # The encode ran on this stream and the read's copies are already
             # joined (read_into waits on its events): nothing reads the views
             # once this returns.
             torch.cuda.current_stream(device).synchronize()
+        _tr = clock()
         if res is not None:
             vrs.return_tail_pages(allocator, res)
+        _te = clock()
         if on_card and touched:
             torch.cuda.empty_cache()
-        out.legs_ms["teardown"] = (clock() - t0) * 1e3
+        _t1 = clock()
+        out.legs_ms["teardown"] = (_t1 - t0) * 1e3
+        # (d) Befund 28.09.: where the 370-470 ms teardown goes (strip, gc,
+        # stream sync, tail return, empty_cache) -- instrument only.
+        out.teardown_ms = {"strip": (_tg - t0) * 1e3, "gc": (_ts - _tg) * 1e3,
+                           "sync": (_tr - _ts) * 1e3, "tail": (_te - _tr) * 1e3,
+                           "empty_cache": (_t1 - _te) * 1e3}
     own1, host1 = own_card_bytes(device), host_bytes()
     if own0 is not None and own1 is not None:
         out.residue_bytes = own1 - own0
@@ -581,6 +604,10 @@ def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
             f"read_mib={out.read_bytes / vrs.MIB:.1f} "
             f"legs_ms=({legs}) sync_ms={sync} vram_residue_mib={residue} "
             f"host_current_delta_mib={out.host_current_delta} host_anon_delta_mib={out.host_anon_delta}")
+    if out.encode_ms or out.teardown_ms:  # (d) Befund 28.09.: the two long legs, split
+        line += " encode_split_ms=(%s) teardown_split_ms=(%s)" % (
+            ", ".join(f"{k} {v:.0f}" for k, v in out.encode_ms.items()),
+            ", ".join(f"{k} {v:.0f}" for k, v in out.teardown_ms.items()))
     if out.ok:
         logger.info("%s %s rids=%s", W_STAGE_OK, line, list(rids))
     else:
