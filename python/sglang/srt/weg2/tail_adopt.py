@@ -173,10 +173,53 @@ class HeldShapes(msgspec.Struct, frozen=True):
     ring: Dict[int, RowSpec] = {}
     #: E2: the layer-independent RoPE position row of the ring
     rope: Optional[RowSpec] = None
+    #: #239 S4b part 5: ``(S, lo, hi, per_block)`` of this rank's token rows
+    #: under the Form A token cut (``kv=qsa_forma_dcp``); None everywhere else.
+    #: With it the uneven-DCP refusal lifts: each rank writes the partial
+    #: page's rows it OWNS at their compact slot (the write rule of
+    #: ``layers/dcp/owner.dcp_weighted_write_slots``), nothing else.
+    owner: Optional[Tuple[int, int, int, int]] = None
 
     @property
     def holds_nothing(self) -> bool:
         return not self.fa and not self.gdn
+
+
+def cut_owner() -> Optional[Tuple[int, int, int, int]]:
+    """#239 S4b part 5: this rank's owner rows under the Form A token cut, or
+    None (no cut -- plain uneven DCP stays refused as before). Group-uniform
+    in its presence: the installed plan and owner bounds are the same
+    everywhere; only the bounds differ per rank."""
+    try:
+        from sglang.srt.rank_role import form_a_token_cut_active
+
+        if not form_a_token_cut_active():
+            return None
+        from sglang.srt.distributed.utils import uneven_dcp_owner_bounds
+
+        b = uneven_dcp_owner_bounds()
+    except Exception:  # noqa: BLE001 - unreadable = the pre-cut refusal
+        return None
+    if b is None:
+        return None
+    S, lo, hi = (int(x) for x in b)
+    return S, lo, hi, hi - lo
+
+
+def cut_gate(held: "HeldShapes") -> Optional[str]:
+    """The uneven-DCP gate of E1/E2 staging. None: no DCP, the pre-cut path.
+    'dcp_active': DCP without the Form A token cut (refused, as before).
+    '': the token cut, adoptable by owner rows. Otherwise the refusal that
+    keeps the group-uniform riegel for what does not fit the owner install:
+    a worker (no GDN state -- the host's) whose pool also carries the QSA
+    indexer's compressed rows, whose layout under the cut is the host's."""
+    if not held.dcp:
+        return None
+    if held.owner is None:
+        return "dcp_active"
+    if not held.gdn and any(len(r) > 2 for r in held.fa.values()):
+        return "cut_qsa_rows_on_worker"
+    return ""
 
 
 def _row(t: torch.Tensor) -> RowSpec:
@@ -214,8 +257,9 @@ def held_shapes(kvpool, req_to_token_pool) -> HeldShapes:
             if math.prod(t.shape[1:]) == 0:
                 continue
             gdn[int(gid)] = [_row(t)] + [_row(c[local]) for c in cache.conv]
-    return HeldShapes(fa=fa, gdn=gdn, qsa_ratio=ratio, dcp=bool(fa) and bool(uneven_dcp_active()),
-                      ring=ring, rope=rope)
+    dcp = bool(fa) and bool(uneven_dcp_active())
+    return HeldShapes(fa=fa, gdn=gdn, qsa_ratio=ratio, dcp=dcp,
+                      ring=ring, rope=rope, owner=cut_owner() if dcp else None)
 
 
 # -- 1. VOTE ---------------------------------------------------------------------------
@@ -257,6 +301,8 @@ class Staged(msgspec.Struct):
     ple_why: str = "absent"
     end_ple: Optional[Dict[str, torch.Tensor]] = None
     end_ple_why: str = "absent"
+    #: #239 S4b part 5: this rank's owner rows under the token cut (None: all)
+    owner: Optional[Tuple[int, int, int, int]] = None
 
     @property
     def ok(self) -> bool:
@@ -301,7 +347,7 @@ def _stage_e1(headers: List[th.TailHeader], held: HeldShapes, check_digest: bool
     the part payloads read (holding rank only)."""
     spec = headers[0].spec
     st = Staged(spec=spec, headers=list(headers), verdict="ready", qsa_ratio=held.qsa_ratio,
-                e1=all(h.e1 for h in headers))
+                e1=all(h.e1 for h in headers), owner=held.owner)
     for h in headers:
         if h.spec != spec:
             st.verdict = f"spec_differs:{h.part}"
@@ -311,8 +357,14 @@ def _stage_e1(headers: List[th.TailHeader], held: HeldShapes, check_digest: bool
         return st
     need_fa = {g: r[0].shape for g, r in held.fa.items()}
     need_gdn = {g: r[0].shape for g, r in held.gdn.items()}
-    why = "dcp_active" if held.dcp else th.local_readiness(spec, headers, need_fa, need_gdn)
-    if not why and held.fa and (not held.gdn or min(held.gdn) > min(held.fa)):
+    why = cut_gate(held)
+    if why is None or why == "":
+        why = th.local_readiness(spec, headers, need_fa, need_gdn)
+    if not why and held.fa and held.owner is not None and not held.gdn:
+        # #239 S4b part 5: a token-cut worker has no GDN layer; its rows ride
+        # its first attention step instead (install_worker_rows)
+        pass
+    elif not why and held.fa and (not held.gdn or min(held.gdn) > min(held.fa)):
         # the install rides the GDN layer reads; an attention layer read
         # before the first of them would see unwritten rows
         why = "fa_before_gdn"
@@ -353,7 +405,7 @@ def _stage_e1(headers: List[th.TailHeader], held: HeldShapes, check_digest: bool
         fa = {g: tuple(t.pin_memory() for t in ts) for g, ts in fa.items()}
         gdn = {g: tuple(t.pin_memory() for t in ts) for g, ts in gdn.items()}
     st.fa, st.gdn = fa, gdn
-    if check_digest:
+    if check_digest and held.owner is None:
         st.readback = _readback_buffers(fa, gdn, {}, None, pin)
     return st
 
@@ -423,6 +475,9 @@ def _stage_end(st: Staged, bundles: List[dict], held: HeldShapes, check_digest: 
     st.first_token = int(end.first_token)
     if held.holds_nothing:
         return "not_mine"
+    if held.owner is not None and not held.gdn and held.ring:
+        # #239 S4b part 5: the QSA ring is the host's indexer state
+        return "cut_ring_on_worker"
     if (end.rows, end.groups, end.ring_rows) != th.end_geometry(st.spec, held.qsa_ratio):
         return f"end_geometry:{end.rows}/{end.groups}/{end.ring_rows}"
     fa: Dict[int, Tuple[torch.Tensor, ...]] = {}
@@ -449,7 +504,7 @@ def _stage_end(st: Staged, bundles: List[dict], held: HeldShapes, check_digest: 
     st.end_gdn = {g: tuple(_pin(t, pin) for t in ts) for g, ts in gdn.items()}
     st.end_ring = {g: tuple(_pin(t, pin) for t in ts) for g, ts in ring.items()}
     st.end_rope = _pin(ropes[0], pin) if ropes and held.ring else None
-    if check_digest:
+    if check_digest and held.owner is None:
         st.end_readback = _readback_buffers(st.end_fa, st.end_gdn, st.end_ring, st.end_rope, pin)
     return "ready"
 
@@ -904,6 +959,8 @@ class Install(msgspec.Struct):
     ple: Optional[Dict[str, torch.Tensor]] = None
     ple_why: str = "absent"
     pool: Optional[object] = None
+    #: #239 S4b part 5: K/V rows go to this rank's compact owner slots only
+    owner: Optional[Tuple[int, int, int, int]] = None
 
 
 #: installs waiting for the extend forward's GDN layer reads (memory_pool
@@ -961,6 +1018,7 @@ def _queue_install(req, st: Staged, rows: torch.Tensor, tree_cache) -> None:
     PENDING_INSTALLS.append(Install(
         spec=st.spec, headers=st.headers, fa=st.fa, gdn=st.gdn, fa_dst=fa_dst, gdn_dst=gdn_dst,
         rows=rows, groups=groups, slot=slot, t0=time.perf_counter(), readback=st.readback,
+        owner=st.owner,
     ))
 
 
@@ -998,7 +1056,7 @@ def _skip_install(st: Staged, tree_cache) -> Install:
         t0=time.perf_counter(), readback=st.end_readback, end=True, ring=st.end_ring, ring_dst=ring_dst,
         rope=st.end_rope, rope_dst=kvpool.qsa_rope_position_buffer if st.end_rope is not None else None,
         req_to_token=rtp.req_to_token, translate=rtp.translate_mamba_indices, ratio=st.qsa_ratio,
-        ple=st.end_ple, ple_why=st.end_ple_why, pool=rtp,
+        ple=st.end_ple, ple_why=st.end_ple_why, pool=rtp, owner=st.owner,
     )
 
 
@@ -1059,10 +1117,7 @@ def _install_end(inst: Install, req) -> None:
     inst.rows = rows
     if inst.ratio:
         inst.groups = th.group_slots(rows, inst.ratio, end.groups)
-    for gid in sorted(inst.fa):
-        back = inst.readback.get(f"fa{gid}")
-        for j, (dst, src) in enumerate(zip(inst.fa_dst[gid], inst.fa[gid])):
-            _put(dst, inst.groups if j == 2 else rows, src, None if back is None else back[j])
+    _put_fa(inst, rows)
     if inst.ratio and (inst.ring or inst.rope is not None):
         ring_idx = th.ring_slots(req.req_pool_idx, inst.ratio, end.ring_rows)
         for gid in sorted(inst.ring):
@@ -1108,6 +1163,54 @@ def _put(dst: torch.Tensor, idx: torch.Tensor, src: torch.Tensor, back: Optional
         back.copy_(d.index_select(0, i), non_blocking=d.is_cuda)
 
 
+def owner_rows(idx: torch.Tensor, owner: Tuple[int, int, int, int]):
+    """#239 S4b part 5: ``(compact slots, keep)`` of the GLOBAL slots ``idx``
+    this rank owns -- ``layers/dcp/owner.dcp_weighted_write_slots``, the one
+    spelling of the write rule the attention backends use."""
+    from sglang.srt.layers.dcp.owner import dcp_weighted_write_slots
+
+    S, lo, hi, per = owner
+    loc, keep = dcp_weighted_write_slots(idx.to(torch.int64), int(S), int(lo), int(hi), int(per))
+    return loc[keep], keep
+
+
+def _put_fa(inst: Install, rows: torch.Tensor) -> None:
+    """The attention rows of every held layer: K, V at ``rows`` (under the
+    token cut only this rank's owned rows, at their compact slot), the QSA
+    compressed groups at ``inst.groups`` (never on a cut worker -- staged
+    out by ``cut_gate``)."""
+    kv_idx, keep = rows, None
+    if inst.owner is not None:
+        kv_idx, keep = owner_rows(rows, inst.owner)
+    for gid in sorted(inst.fa):
+        back = inst.readback.get(f"fa{gid}")
+        for j, (dst, src) in enumerate(zip(inst.fa_dst[gid], inst.fa[gid])):
+            if j == 2:
+                _put(dst, inst.groups, src, None if back is None else back[j])
+                continue
+            if keep is not None:
+                if int(kv_idx.numel()) == 0:
+                    continue  # share 0 (the host in 0/48/16): no rows of this page
+                src = src[keep.to(src.device)]
+            _put(dst, kv_idx, src, None if back is None else back[j])
+
+
+def install_worker_rows(layer_id: int) -> None:
+    """#239 S4b part 5: a token-cut worker's first attention step of an
+    extend forward (``form_a_dcp_wiring.form_a_worker_attention_step``) --
+    the place its E1 rows land before any of its attention reads, the
+    worker's counterpart of the host's first GDN read. Only installs without
+    GDN state are this rank's (a worker holds none); the host's ride
+    ``install_layer``."""
+    for inst in [i for i in PENDING_INSTALLS if not i.gdn and i.owner is not None]:
+        t = time.perf_counter()
+        _put_fa(inst, inst.rows)
+        inst.fa_done = True
+        inst.issue_ms += (time.perf_counter() - t) * 1000.0
+        PENDING_INSTALLS.remove(inst)
+        _finish(inst, bool(inst.readback))
+
+
 def install_layer(layer_id: int) -> None:
     """GDN layer read of a forward (after its load-stream join): write what
     the pending installs owe up to this layer. Never raises into a forward
@@ -1130,10 +1233,7 @@ def _install_step(inst: Install, layer_id: int) -> None:
     inst.last_gid = layer_id
     verify = bool(inst.readback)
     if not inst.fa_done:
-        for gid in sorted(inst.fa):
-            back = inst.readback.get(f"fa{gid}")
-            for j, (dst, src) in enumerate(zip(inst.fa_dst[gid], inst.fa[gid])):
-                _put(dst, inst.groups if j == 2 else inst.rows, src, None if back is None else back[j])
+        _put_fa(inst, inst.rows)
         inst.fa_done = True
     if layer_id in inst.gdn:
         src = inst.gdn.pop(layer_id)

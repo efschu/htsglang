@@ -110,6 +110,12 @@ def form_a_worker_attention_step(
         return None, ()
 
     def attention(layer_id: int) -> None:
+        # #239 S4b part 5: this worker's owned rows of an adopted tail page
+        # land before its first attention read of the extend (no-op otherwise)
+        from sglang.srt.weg2 import tail_adopt
+
+        if tail_adopt.PENDING_INSTALLS:
+            tail_adopt.install_worker_rows(layer_id)
         attn_backend.form_a_worker_attention(forward_batch, layer_id)
 
     return attention, tuple(token_to_kv_pool.full_attention_layer_id_mapping)
