@@ -5323,6 +5323,16 @@ def l3_persist_identity(model: str, profile: str = "", form_kv: str = "",
     }
 
 
+def l3_persistent_store(directory: str) -> bool:
+    """L3P: ``directory`` is a persistent L3 store (its ``l3-`` name or its
+    identity file) -- no teardown and no sweep may remove it."""
+    d = str(directory or "").rstrip("/")
+    return bool(d) and (
+        os.path.basename(d).startswith(L3_PERSIST_PREFIX)
+        or os.path.isfile(os.path.join(d, L3_IDENTITY_FILE))
+    )
+
+
 def l3_persist_dir_name(identity: dict) -> str:
     """L3P: ``l3-<profile>-<model>-<identity10>``; the readable part names the
     model, the digest separates everything else the identity carries."""
@@ -21991,7 +22001,15 @@ def teardown(path: str, report: dict | None = None) -> int:
     # ran, e.g. after a crash. These are DISK bytes -- nothing freed here was
     # ever charged to the host reap ledger.
     store_dir = st.get("store_dir", "")
-    if store_dir and os.path.isdir(store_dir):
+    if store_dir and os.path.isdir(store_dir) and l3_persistent_store(store_dir):
+        # L3P-TEARDOWN (27B rc12z7b b1 08:01Z: 6.5 GB / 172795 files removed
+        # here, b5 found `identity=new files=0`): a persistent L3 store is
+        # the one thing a teardown must NOT remove -- it is what the next
+        # boot reattaches to. Only the per-boot store of the pre-L3P form
+        # (no identity file, no ``l3-`` name) goes.
+        alloc, _apparent, count = _tree_bytes(store_dir)
+        print(f"store dir {store_dir} KEPT (L3 persistent: {alloc} B allocated, {count} files)")
+    elif store_dir and os.path.isdir(store_dir):
         alloc, _apparent, count = _tree_bytes(store_dir)
         shutil.rmtree(store_dir, ignore_errors=True)
         print(f"store dir {store_dir} removed ({alloc} B allocated, {count} files; DISK, "
