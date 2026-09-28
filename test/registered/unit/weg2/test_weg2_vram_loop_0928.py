@@ -104,6 +104,20 @@ class TestFrCeilingAdopt(unittest.TestCase):
         new, _ = L.d_fr_ceiling_adopt(_plan([0.062, None, 0.491]), _GIVEN, _P0, owned=False)
         self.assertIsNone(new)
 
+    def test_never_after_the_platztausch_map(self):
+        # rc12z30b: the map read FR_D before P started; a raised FR_D after it
+        # is a D form the map does not describe (rc12z29b died of that class)
+        new, lines = L.d_fr_ceiling_adopt(_plan(_CEIL), _GIVEN, _P0, owned=False,
+                                          map_built=True)
+        self.assertIsNone(new)
+        self.assertTrue(any("Platztausch-Karte" in ln for ln in lines))
+
+    def test_launcher_passes_the_map_state(self):
+        import inspect
+        src = inspect.getsource(L.log_d_rank_vram_solve)
+        self.assertIn("map_built=bool(_pinned or getattr(ns, \"_expert_map_path\", \"\"))", src)
+        self.assertIn("ns._expert_map_path = _emap", inspect.getsource(L.main))
+
 
 from sglang.srt.weg2 import torch_cache_cap as TCC
 

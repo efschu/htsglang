@@ -4683,7 +4683,8 @@ TORCH_CACHE_CAP_ENV = "SGLANG_WEG2_TORCH_CACHE_CAP"
 FR_D_CEILING_MARKER = "FR-D-DECKE (VRAM-Loop P1c)"
 
 
-def d_fr_ceiling_adopt(plan, fractions, env_d: Mapping[str, str], owned: bool
+def d_fr_ceiling_adopt(plan, fractions, env_d: Mapping[str, str], owned: bool,
+                       map_built: bool = False
                        ) -> Tuple[Optional[List[float]], List[str]]:
     """The fraction group D boots with when the planner's edge is higher than
     the stated FR_D, or ``(None, lines)`` when the stated one stays.
@@ -4691,7 +4692,11 @@ def d_fr_ceiling_adopt(plan, fractions, env_d: Mapping[str, str], owned: bool
     Never under an owned cut (#239 S3f publishes FR_D itself) and never over a
     fraction the planner already solved (S2b). Raises only: a rank whose edge
     is below its stated FR is the W122/scratch-cap path's business, not this
-    one's. Every rank is named, adopted or not."""
+    one's. Every rank is named, adopted or not.
+
+    rc12z30b: never after the Platztausch map is built (``map_built``) -- the
+    map read FR_D from --extra-d before P started, and a raised FR_D after it
+    is a D form the map does not describe (the rc12z29b death class)."""
     given = [float(x) for x in fractions]
     if str(env_d.get(FR_D_CEILING_ENV, "1")).strip() == "0":
         return None, [f"{FR_D_CEILING_MARKER}: {FR_D_CEILING_ENV}=0 -- gegeben {given} bleibt"]
@@ -4728,6 +4733,11 @@ def d_fr_ceiling_adopt(plan, fractions, env_d: Mapping[str, str], owned: bool
                               f"({TORCH_CACHE_CAP_ENV}!=1 in --env-d) -- ohne gedeckelten "
                               f"Allokator-Cache nimmt der Cache-Swing den Platz an der naechsten "
                               f"Spitze zurueck; gegeben {given} bleibt"]
+    if map_built:
+        return None, lines + [f"{FR_D_CEILING_MARKER}: Decke NICHT uebernommen: die "
+                              f"Platztausch-Karte ist schon aus FR_D {given} gebaut -- "
+                              f"eine hoehere FR_D danach waere eine Form, die die Karte "
+                              f"nicht beschreibt"]
     return new, lines
 
 
@@ -16557,7 +16567,8 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     # VRAM loop P1c (28.09.): the planner's edge wins over the stated FR_D
     # (outside an owned cut and an S2b solve), coupled to P0 in this group.
     _fr_new, _fr_lines = d_fr_ceiling_adopt(
-        plan, fr_d, _env_d, bool(_er.owned_cut_request(_kv_cut)[0]))
+        plan, fr_d, _env_d, bool(_er.owned_cut_request(_kv_cut)[0]),
+        map_built=bool(_pinned or getattr(ns, "_expert_map_path", "")))
     for _ln in _fr_lines:
         log(f"{D_RANK_SOLVE_MARKER} {label} {_ln}")
     if _fr_new is not None:
@@ -22168,6 +22179,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _emap = publish_expert_map(ns, ns.model, ns.evidence_dir, log,
                                p_stage_layers=getattr(state, "p_stage_layers", None),
                                chunk_layers=chunk_layers)
+    # rc12z30b: the map read FR_D from --extra-d now; a later D solve must not move it
+    ns._expert_map_path = _emap
     _estore_id = publish_store_identity(ns.model, _emap, log)
     env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
     # H125: the host-RAM price of `--weg2-vision-source ram`, named where the
