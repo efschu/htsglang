@@ -10624,6 +10624,7 @@ class Scheduler(
         self,
         running_bs: int,
         head_inputs: Optional[tp_head_congruence.UniformHeadInputs],
+        slot_held: int = 0,
     ) -> int:
         """#823 W9 COUNT arm: how many of the head this rank may admit.
 
@@ -10647,7 +10648,11 @@ class Scheduler(
         accounting event per pass, matching the order arm, rather than one
         per queued request.
         """
-        local = self.get_num_allocatable_reqs(running_bs)
+        local = (
+            self.get_num_allocatable_reqs(running_bs, slot_held)
+            if slot_held
+            else self.get_num_allocatable_reqs(running_bs)
+        )
         gate = self._tp_head_enforcer_gate()
         limit, source = tp_head_congruence.admit_limit_decision(
             local,
@@ -10841,9 +10846,39 @@ class Scheduler(
         try:
             running = getattr(self, "running_batch", None)
             running_bs = len(running.reqs) if running is not None else 0
+            held = self._chunk_rest_slot_held(running)
+            if held:
+                return int(self.get_num_allocatable_reqs(running_bs, held))
             return int(self.get_num_allocatable_reqs(running_bs))
         except Exception:  # noqa: BLE001 - a vote may never break the reduce
             return None
+
+    def _chunk_rest_slot_held(self, running) -> int:
+        """CHUNK-REST: 1 when this pass's chunked continuation already holds
+        its request slot outside the running batch (it enters can_run_list
+        through ``add_chunked_req``), else 0 -- the vote's copy of the count
+        arm's ``slot_held``. Single-stage groups only: under PP a seam refusal
+        can keep the continuation out of the list, and a vote that gave its
+        slot back would then over-admit; there the vote stays the lower
+        number and the MIN keeps the group at it. Rank-uniform: the chunked
+        continuation is the same request on every rank."""
+        if getattr(getattr(self, "ps", None), "pp_size", 1) != 1:
+            return 0
+        chunked = getattr(self, "chunked_req", None)
+        if chunked is None or getattr(chunked, "req_pool_idx", None) is None:
+            return 0
+        reqs = getattr(running, "reqs", None) or ()
+        return 0 if any(r is chunked for r in reqs) else 1
+
+    @staticmethod
+    def _carried_slot_held(can_run_list, multi_anchor_tails: bool) -> int:
+        """CHUNK-REST, count arm: the members already in can_run_list at the
+        top of the queue loop that hold their request slot (the chunked
+        continuation). 0 with anchor tails armed: ``_carried_n`` already
+        takes every carried member out of the count there."""
+        if multi_anchor_tails:
+            return 0
+        return sum(1 for r in can_run_list if getattr(r, "req_pool_idx", None) is not None)
 
     def _publish_uniform_evict_floor(
         self, min_avail: Optional[int], max_avail: Optional[int] = None
@@ -12304,7 +12339,7 @@ class Scheduler(
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
 
-    def get_num_allocatable_reqs(self, running_bs):
+    def get_num_allocatable_reqs(self, running_bs, slot_held: int = 0):
         # #287: the floating admission limit joins the existing bounds as one
         # more min(). Without --max-running-requests-ceiling the limiter holds
         # the same max_running_requests that pp_max_micro_batch_size was
@@ -12329,7 +12364,13 @@ class Scheduler(
         # default path below is the pre-change expression unchanged.
         parked = self._parked_carrier_discount(running_bs)
         res = limit - max(0, running_bs - parked)
-        res = min(res, self.req_to_token_pool.available_size())
+        # CHUNK-REST (postflip-admit, 28.09.): a candidate that already HOLDS
+        # its request slot -- the chunked continuation -- is counted by the
+        # caller as a can_run_list member AND is missing from
+        # available_size(); ``slot_held`` gives the slot back once, so six
+        # seats carry six requests (bridge 19:51:39: 4 running + weg2-16-53's
+        # rest -> available 1, list 1 -> 'batch_full_break' for weg2-16-54).
+        res = min(res, self.req_to_token_pool.available_size() + max(0, int(slot_held)))
         # THE SECOND BOUND EXISTS BECAUSE THE FIRST ONE STOPPED BINDING.
         # available_size() above is the REQUEST-slot count -- HybridReqToToken
         # Pool does not override it -- so nothing in this expression has ever
@@ -15851,6 +15892,7 @@ class Scheduler(
         # for the rest of a burst (SGLANG_WEG2_P_BURST_ASSEMBLY_MS). Unarmed:
         # 0 carried, the full queue -- the stock loop.
         _carried_n = len(adder.can_run_list) if adder.multi_anchor_tails else 0
+        _slot_held = self._carried_slot_held(adder.can_run_list, adder.multi_anchor_tails)
         _burst_hold = None
         if adder.multi_anchor_tails and _count_veto:
             _burst_hold = self._weg2_burst_assembly_hold(adder, running_batch)
@@ -15936,7 +15978,9 @@ class Scheduler(
             # STOP. See `rank_local_count_veto_applies`.
             if _count_veto and len(
                 adder.can_run_list
-            ) >= self._uniform_allocatable_reqs(running_bs, _head_inputs) + _carried_n:
+            ) >= self._uniform_allocatable_reqs(
+                running_bs, _head_inputs, _slot_held
+            ) + _carried_n:
                 running_batch.batch_is_full = True
                 self._pp_batch_full_setter = "count_arm"
             _disagg_full = False
