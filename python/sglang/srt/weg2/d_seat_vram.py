@@ -744,12 +744,13 @@ def kv_owner_block() -> Tuple[int, int]:
 
 
 def _worker_stages_here() -> bool:
-    """#239 S3g: a Form A worker that holds FA KV AND was given its own stage
-    rows (SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK) trims its FA KV like the host."""
+    """#239 S3g: a Form A worker the launcher gave its own stage rows
+    (SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK, this rank's entry > 0) stages its
+    KV like the host: born at S0, grown at the wake from those rows."""
     from sglang.srt.environ import envs
 
     form = stage_form()
-    return (form is not None and _form_a_worker_holds_kv()
+    return (form is not None and int(form.rows_on) > 0
             and bool(_ints(envs.SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK.get())))
 
 
@@ -766,24 +767,27 @@ def owner_block_for(pool_size: int) -> Tuple[int, int]:
     return (S, ratio) if int(pool_size) == (int(form.tokens[-1]) // S + 1) * ratio else (0, 0)
 
 
-def kv_stage_trims_here(pool_size: int, *, qsa_keys: bool = False) -> bool:
+def kv_stage_trims_here(pool_size: int) -> bool:
     """#251c: this rank trims its KV tensors to S0 at birth -- the stage form
     is armed, the pool is the top stage's, and this is NOT a Form A worker.
     rc12z11 (590fa56a02, 28.09. 09:01Z and 09:09Z): the workers' QSA keys were
     trimmed like TP0's KV. The stage pages are TP0's only (the planner prices
     them there); a worker's tensors stay H95c's, byte for byte.
 
-    #239 S3g: under the token cut every rank that holds full-attention KV
-    trims its compacted FA pool (``owner_block_for``) -- a worker only when the
-    launcher gave it its own stage rows (``_worker_stages_here``), and never
-    its QSA keys (``qsa_keys=True``: rc12z11 stays)."""
+    #239 S3g: a compacted token-cut FA pool (``owner_block_for``) is the top
+    stage's too. A worker trims only with its own stage rows
+    (``_worker_stages_here``) -- then every KV tensor it holds, its QSA keys
+    included: they follow the stage as the planner books them (S0), grown at
+    the wake from the worker's rows. rc12z11's fault (a worker trimming with
+    no rows to grow from, and under the fill kernel) cannot recur: no rows,
+    no trim; the birth syncs before a page goes (``_sync_before_unmap``)."""
     form = stage_form()
     if form is None:
         return False
-    owner = owner_block_for(pool_size) != (0, 0)
+    top = int(pool_size) >= form.tokens[-1] or owner_block_for(pool_size) != (0, 0)
     if not _form_a_worker():
-        return int(pool_size) >= form.tokens[-1] or owner
-    return owner and not qsa_keys and _worker_stages_here()
+        return top
+    return top and _worker_stages_here()
 
 
 def kv_stage_boot_rows(pool_size: int, page_size: int) -> Optional[int]:

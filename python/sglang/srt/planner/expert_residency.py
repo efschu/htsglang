@@ -563,10 +563,6 @@ class DRankResidency(msgspec.Struct, frozen=True, kw_only=True):
     #: #239: this rank's share of the token-cut full-attention KV; -1 = the
     #: cut is not modelled (every rank priced with its reference cell).
     kv_token_share: float = -1.0
-    #: #239 S3g: bytes per GLOBAL token of this rank's full-attention KV share
-    #: under the cut (share x FA cell) -- what a KV stage above S0 maps on this
-    #: rank; 0 = no share (Form A, or a rank the cut gives none).
-    kv_stage_cell_bytes: int = 0
 
     @property
     def pre_kv_rest_mib(self) -> float:
@@ -1174,8 +1170,6 @@ def solve_d_rank_residency(
                 ),
                 ceiling_max_rows=max_rows,
                 kv_token_share=cut_shares[r] if cut_cells is not None else -1.0,
-                kv_stage_cell_bytes=(int(round(cut_shares[r] * float(kv_dcp_cell_bytes)))
-                                     if cut_cells is not None else 0),
             )
         )
     return tuple(out)
@@ -2748,12 +2742,14 @@ def kv_stage_table(
 
 def kv_stage_trim_cell(fit: "DRankResidency", host_rank: int = 0) -> int:
     """#239 S3g: the bytes per GLOBAL token a KV stage above S0 maps on this
-    rank -- the "Trim-Zelle". The attention host trims every KV tensor it has
-    (its cell, #251c); a worker only its token-cut full-attention share
-    (share x FA cell), never its QSA keys (rc12z11). 0 = no KV to stage."""
-    if int(fit.rank) == int(host_rank):
-        return int(fit.kv_cell_bytes)
-    return int(getattr(fit, "kv_stage_cell_bytes", 0) or 0)
+    rank -- the "Trim-Zelle": its whole KV cell, on every rank. The planner
+    books each rank's KV at S0 (``kv_tokens x cell``); every KV tensor the
+    rank holds (the host's KV, a worker's token-cut FA share AND its QSA
+    keys -- Form A's byteless worker too, 768 B/token) is born at S0 and
+    grows at the wake from the rank's own stage rows. Before, a worker's QSA
+    keys were mapped at the top stage and booked at S0: ~192 MiB per worker
+    unbooked at S0 x 2. 0 = no KV to stage."""
+    return int(fit.kv_cell_bytes)
 
 
 class KvStageGroup(msgspec.Struct, frozen=True, kw_only=True):
@@ -2765,8 +2761,8 @@ class KvStageGroup(msgspec.Struct, frozen=True, kw_only=True):
     are per rank. In S0 a rank's stage rows are rows of its expert bank --
     booked as residency in the FRACTION-SOLVE (scratch -> seat rows, no new
     byte); a wake to S_j unmaps ``stage_rows[j]`` of them over the H95c row
-    switch (``set_seat_rows_on``) for the stage's KV. Form A: one table,
-    byte-identical to #251c."""
+    switch (``set_seat_rows_on``) for the stage's KV. Form A: the host's table
+    is #251c's (ROWS=33); a byteless worker stages its QSA keys (3 rows)."""
 
     tables: Tuple[KvStageTable, ...]
     n_ranks: int

@@ -8,15 +8,19 @@ zeigen, dass Form A byte-gleich bleibt (ROWS=33)."
 WHAT MUST HOLD.
 (1) Form A (no cut, byteless workers): the form is byte-identical to #251c --
     ROWS=33, TP0 scratch 100 -> 67, seat rows 33, no per-rank key.
-(2) Under the cut every KV rank gets its stage rows from the SAME function
-    (``kv_stage_table``) with its own trim cell: the host its whole KV cell,
-    a worker its full-attention share only (never its QSA keys). The launcher
+(2) Every KV rank gets its stage rows from the SAME function
+    (``kv_stage_table``) with its own trim cell = its whole KV cell -- under
+    the cut the host's, a worker's FA share + QSA keys; in Form A a byteless
+    worker's QSA keys (768 B/token). The launcher
     moves each rank's rows from its scratch into its seat rows, writes
     SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK, and the highest stage per seat count
     is the MIN over the KV ranks (a replicated stage choice); the FRACTION-SOLVE
     books the rows as residency, one line per KV rank. Its undo restores all.
 (3) The runtime: a KV worker with its own stage rows reads its entry, trims
-    its compacted FA pool to S0's compacted rows at birth (not its QSA keys),
+    its compacted FA pool to S0's compacted rows and its QSA keys to S0 at
+    birth (main 28.09. ~19:40Z: the worker's QSA keys were mapped at the top
+    stage but booked at S0 -- ~192 MiB per worker unbooked; they follow the
+    stage now),
     does not refuse the stage form; its cells cut its own stage rows at the
     wake (the H95c row switch). A host with a cut share trims its compacted
     FA pool too.
@@ -47,10 +51,9 @@ import test_weg2_d_kv_stage_worker_251c as W251  # noqa: E402
 FA_CELL = 12288  # NF full-attention KV cell, B per token
 
 
-def _fit(rank, *, cell, stage_cell=0, experts=193, staging=12):
+def _fit(rank, *, cell, experts=193, staging=12):
     return types.SimpleNamespace(rank=rank, kv_cell_bytes=cell, kv_tokens=262144,
-                                 local_experts=experts, staging_rows=staging,
-                                 kv_stage_cell_bytes=stage_cell)
+                                 local_experts=experts, staging_rows=staging)
 
 
 def _cut_plan():
@@ -58,8 +61,15 @@ def _cut_plan():
     QSA keys + draft), TP1 holds 3/4 of the FA KV, TP2 1/4."""
     return types.SimpleNamespace(fits=[
         _fit(0, cell=1855),
-        _fit(1, cell=9216 + 768, stage_cell=FA_CELL * 3 // 4, experts=120),
-        _fit(2, cell=3072 + 768, stage_cell=FA_CELL // 4, experts=120)])
+        _fit(1, cell=FA_CELL * 3 // 4 + 768, experts=120),
+        _fit(2, cell=FA_CELL // 4 + 768, experts=120)])
+
+
+def _form_a_plan():
+    """Form A: TP0 holds the whole KV (14143 B/token), the workers only their
+    QSA keys (768 B/token) -- the cells the H33 reference measured."""
+    return types.SimpleNamespace(fits=[
+        _fit(0, cell=14143), _fit(1, cell=768, experts=120), _fit(2, cell=768, experts=120)])
 
 
 # ---- (1) Form A byte-identical --------------------------------------------------------
@@ -92,14 +102,34 @@ def test_form_a_is_one_table_the_251c_table():
     assert g.extra_waves((2,) * 6) == t.extra_waves((2,) * 6)
 
 
-def test_a_worker_trim_cell_is_its_fa_share_the_host_its_whole_cell():
+def test_every_rank_stages_its_whole_kv_cell():
     f = _cut_plan().fits
-    assert er.kv_stage_trim_cell(f[0]) == 1855
-    assert er.kv_stage_trim_cell(f[1]) == 9216  # not 9984: the QSA keys never trim
-    assert er.kv_stage_trim_cell(f[2]) == 3072
-    # Form A: a worker without a cut share has nothing to stage
-    assert er.kv_stage_trim_cell(T251._plan().fits[0]) == 14143
-    assert er.kv_stage_trim_cell(_fit(1, cell=768)) == 0
+    assert [er.kv_stage_trim_cell(x) for x in f] == [1855, 9984, 3840]
+    assert [er.kv_stage_trim_cell(x) for x in _form_a_plan().fits] == [14143, 768, 768]
+
+
+def test_form_a_workers_qsa_keys_follow_the_stage():
+    """RED on 5e1ddba3e2: a byteless worker got no stage rows, so its QSA keys
+    were mapped at the top stage (524288 x 768 B) against the S0 booking
+    (262144 x 768 B) -- 192 MiB per worker unbooked. Now each worker funds
+    its keys' stages from 3 of its own rows; TP0's form is #251c's."""
+    before = "SGLANG_MOE_SCRATCH_SLOTS=100,48,48;X=1"
+    ns = types.SimpleNamespace(env_d=before)
+    L.apply_d_kv_stage_form(ns, er, T251._rows(), T251.FORM, _form_a_plan(), "D",
+                            verify_tokens=4, top_k=10, kv_token_shares=None)
+    env = L.parse_group_env(ns.env_d)
+    assert env["SGLANG_WEG2_D_KV_STAGE_ROWS"] == "33"  # TP0 as ever
+    assert env[L.D_KV_STAGE_ROWS_BY_RANK_KEY] == "33,3,3"
+    assert env["SGLANG_MOE_SCRATCH_SLOTS"] == "67,45,45"
+    assert env["SGLANG_WEG2_D_SEAT_EXPERT_ROWS"] == "33,3,3"
+    assert env["SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS"] == "2,1,1,1,0,0"
+    # 3 rows x 112.5 MiB >= the keys' top-stage growth 262144 x 768 B = 192 MiB
+    g = er.kv_stage_group(T251._rows(), T251.FORM, _form_a_plan().fits, verify_tokens=4,
+                          top_k=10)
+    w = g.tables[1]
+    assert w.stage_rows == (0, 1, 2) and w.rows * w.row_mib >= 262144 * 768 / 2**20
+    L.d_kv_stage_undo(ns)
+    assert L.parse_group_env(ns.env_d) == L.parse_group_env(before)
 
 
 # ---- (2) the launcher under the cut --------------------------------------------------
@@ -115,12 +145,12 @@ def test_every_kv_rank_gets_its_stage_rows_from_the_same_function():
     per_rank = {r: er.kv_stage_table(T251._rows(), T251.FORM, kv_cell_bytes=c,
                                      kv_tokens=262144, local_experts=e, verify_tokens=4,
                                      top_k=10, host_rank=r, staging_rows=12)
-                for r, c, e in ((0, 1855, 193), (1, 9216, 120), (2, 3072, 120))}
-    assert [per_rank[r].rows for r in (0, 1, 2)] == [6, 22, 8]
-    assert env[L.D_KV_STAGE_ROWS_BY_RANK_KEY] == "6,22,8"
+                for r, c, e in ((0, 1855, 193), (1, 9984, 120), (2, 3840, 120))}
+    assert [per_rank[r].rows for r in (0, 1, 2)] == [6, 24, 10]
+    assert env[L.D_KV_STAGE_ROWS_BY_RANK_KEY] == "6,24,10"
     assert env["SGLANG_WEG2_D_KV_STAGE_ROWS"] == "6"
-    assert env["SGLANG_MOE_SCRATCH_SLOTS"] == "94,26,40"
-    assert env["SGLANG_WEG2_D_SEAT_EXPERT_ROWS"] == "6,22,8"
+    assert env["SGLANG_MOE_SCRATCH_SLOTS"] == "94,24,38"
+    assert env["SGLANG_WEG2_D_SEAT_EXPERT_ROWS"] == "6,24,10"
     assert env["SGLANG_WEG2_D_KV_STAGE_TOKENS"] == "262144,393216,524288"
     # the stage choice is replicated: the highest stage every KV rank keeps
     want = tuple(min(per_rank[r].max_by_seats[i] for r in (0, 1, 2)) for i in range(6))
@@ -129,8 +159,8 @@ def test_every_kv_rank_gets_its_stage_rows_from_the_same_function():
     # booked as residency in the FRACTION-SOLVE, one line per KV rank
     res = [ln for ln in lines if "D-KV-STUFEN RESIDENZ (#239 S3g)" in ln]
     assert [ln.split("rang")[1].split(":")[0] for ln in res] == ["0", "1", "2"]
-    assert "rang1: 22 Stufenzeilen" in res[1] and "Scratch 48 -> 26" in res[1]
-    assert "Trim-Zelle 9216 B/Tok" in res[1] and "[11, 21]" in res[1]
+    assert "rang1: 24 Stufenzeilen" in res[1] and "Scratch 48 -> 24" in res[1]
+    assert "Trim-Zelle 9984 B/Tok" in res[1] and "[12, 23]" in res[1]
     assert any("JE KV-RANG (#239 S3g)" in ln for ln in lines)
     assert not any("entfaellt" in ln for ln in lines)
     # a second solve pass takes every rank's rows back
@@ -141,7 +171,7 @@ def test_every_kv_rank_gets_its_stage_rows_from_the_same_function():
 def test_a_kv_rank_whose_scratch_cannot_fund_its_stages_drops_the_form():
     """A stage one rank cannot fund is a stage no rank may choose."""
     plan = _cut_plan()
-    plan.fits[1].staging_rows = 30  # 48 - 22 = 26 <= 30
+    plan.fits[1].staging_rows = 30  # 48 - 24 = 24 <= 30
     ns = types.SimpleNamespace(env_d="SGLANG_MOE_SCRATCH_SLOTS=100,48,48")
     (line,) = L.apply_d_kv_stage_form(ns, er, T251._rows(), T251.FORM, plan, "D",
                                       verify_tokens=4, top_k=10, kv_token_shares=(0, 48, 16))
@@ -162,7 +192,7 @@ G = W251.G
 PAGE = W251.PAGE
 
 
-def _worker_armed(tms, rank, bounds, by_rank="6,22,8"):
+def _worker_armed(tms, rank, bounds, by_rank="6,24,10"):
     from sglang.srt.environ import envs
 
     ctx = W251._armed(tms, rank)
@@ -178,12 +208,12 @@ def test_a_kv_worker_reads_its_rows_and_trims_its_compacted_fa_pool():
     stage (192) is (192 // 64 + 1) x 16 = 64 rows; S0 (64) keeps 32 + page."""
     tms = W251.FakeTms()
     with _worker_armed(tms, rank=1, bounds=(64, 48, 64)):
-        assert dsv.stage_form().rows_on == 22
+        assert dsv.stage_form().rows_on == 24
         assert dsv.kv_stage_pool_tokens(10) == 192  # no refusal, the host's rows
         assert dsv.owner_block_for(64) == (64, 16)
         assert dsv.kv_stage_trims_here(64) is True
-        assert dsv.kv_stage_trims_here(64, qsa_keys=True) is False  # rc12z11 stays
-        assert dsv.kv_stage_trims_here(192) is False  # a whole-context pool: not staged
+        assert dsv.kv_stage_trims_here(192) is True  # its QSA keys follow the stage
+        assert dsv.kv_stage_trims_here(128) is False  # no stage pool
         assert dsv.kv_stage_boot_rows(64, PAGE) == 32 + PAGE
         t = torch.zeros(64 + PAGE, 256, dtype=torch.int32)
         tms.add(t)
@@ -200,7 +230,12 @@ def test_a_kv_worker_reads_its_rows_and_trims_its_compacted_fa_pool():
         n_calls = len(tms.calls)
         dsv.kv_stage_born(q, pool_size=192, page_size=PAGE, name="qsa_compressed",
                           tokens_per_slot=4, layers=3, slots=52)
-        assert len(tms.calls) == n_calls  # the QSA keys stay whole
+        assert len(tms.calls) == n_calls + 1  # the QSA keys born at S0
+        (_, qgeom) = dsv._KV_BORN[-1]
+        assert qgeom.owner_block == (0, 0)  # whole context, 4 tokens per slot
+        assert tms.calls[-1][1] == tuple(dsv.slot_spans(
+            qgeom.geom, qgeom.slots_for(64), G,
+            cuts=[qgeom.slots_for(tk) for tk in (64, 128, 192)]))
 
 
 def test_a_worker_without_its_own_rows_still_refuses_by_name():
@@ -212,11 +247,16 @@ def test_a_worker_without_its_own_rows_still_refuses_by_name():
 
 
 def test_form_a_ranks_trim_as_before():
-    """Byteless worker (ratio 0): nothing; host (whole context): the #251c trim."""
+    """Byteless worker (ratio 0) without rows: nothing (rc12z11); with its own
+    rows: its QSA keys follow the stage; host: the #251c trim."""
     tms = W251.FakeTms()
     with _worker_armed(tms, rank=1, bounds=(64, 0, 0), by_rank=""):
         assert dsv.owner_block_for(192) == (0, 0)
         assert dsv.kv_stage_trims_here(192) is False
+    with _worker_armed(tms, rank=1, bounds=(64, 0, 0), by_rank="33,3,3"):
+        assert dsv.stage_form().rows_on == 3
+        assert dsv.kv_stage_trims_here(192) is True
+        assert dsv.kv_stage_pool_tokens(10) == 192  # no refusal: holds no FA KV
     with _worker_armed(tms, rank=0, bounds=None, by_rank=""):
         assert dsv.stage_form().rows_on == 32
         assert dsv.kv_stage_trims_here(192) is True
@@ -249,12 +289,3 @@ def test_the_workers_cells_cut_its_own_stage_rows_at_the_wake():
         assert c.feasible and c.mapped <= c.cap_mapped
     # each 16 compacted rows x 64 KiB = 1 MiB = one expert row per stage step
     assert ks == [6, 5, 4]
-
-
-def test_the_qsa_keys_ask_as_keys():
-    import inspect
-
-    from sglang.srt.mem_cache import qsa_kv_pool
-
-    src = inspect.getsource(qsa_kv_pool)
-    assert "_staged = _dsv.kv_stage_trims_here(int(size), qsa_keys=True)" in src
