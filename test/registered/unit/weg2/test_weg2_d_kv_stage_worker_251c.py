@@ -182,3 +182,50 @@ def test_a_classic_boot_trims_as_before():
         t = _born(tms)
         dsv.kv_stage_born(t, pool_size=192, page_size=PAGE, name="k0")
         assert len(tms.calls) == 1 and tms.calls[0][2] is True
+
+
+# ---- the boot line (rc12z13: nothing said whether a rank had trimmed) ----------------
+
+class _MappedTms(FakeTms):
+    def add(self, t):
+        super().add(t)
+        self.mapped = getattr(self, "mapped", {})
+        self.mapped[t.data_ptr()] = self.allocs[t.data_ptr()]
+
+    def info(self, ptr):
+        size = self.allocs.get(int(ptr))
+        if size is None:
+            return None
+        return dsv.AllocInfo(size, self.mapped.get(int(ptr), size), size, True)
+
+    def set_spans(self, ptr, spans, *, now):
+        self.mapped[int(ptr)] = sum(h - l for l, h in spans)
+        return super().set_spans(ptr, spans, now=now)
+
+
+def _alloc():
+    import types
+
+    from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+
+    return PagedTokenToKVPoolAllocator(192, page_size=PAGE, dtype=torch.int64, device="cpu",
+                                       kvcache=types.SimpleNamespace(), need_sort=False)
+
+
+def test_every_rank_says_at_boot_whether_it_trimmed(caplog):
+    import logging
+
+    caplog.set_level(logging.INFO)
+    for rank, trims in ((0, True), (1, False)):
+        caplog.clear()
+        tms = _MappedTms()
+        with _armed(tms, rank=rank):
+            dsv.kv_stage_born(_born(tms), pool_size=192, page_size=PAGE, name="k0")
+            assert dsv.kv_stage_boot_cap(_alloc(), PAGE) == 4
+        line = [m for m in caplog.messages if "#251c KV-STAGE" in m]
+        assert len(line) == 1, caplog.messages
+        assert "form=64/128/192" in line[0] and f"trims_here={trims}" in line[0]
+        assert ("born=1" if trims else "born=0") in line[0]
+        assert "cap_pages=4/12" in line[0]
+        if trims:  # 80 rows of 1 KiB mapped of the 208-row VA (4 KiB granule)
+            assert "mapped=0.1/0.2 MiB" in line[0]

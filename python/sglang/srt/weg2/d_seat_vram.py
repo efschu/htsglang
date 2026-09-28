@@ -704,7 +704,29 @@ def kv_stage_boot_cap(allocator, page_size: int) -> Optional[int]:
     form = stage_form()
     if form is None or allocator is None:
         return None
-    return _engage_kv_cap(allocator, form.tokens[0], page_size)
+    pages = _engage_kv_cap(allocator, form.tokens[0], page_size)
+    log_kv_stage_boot(form, allocator, pages)
+    return pages
+
+
+def log_kv_stage_boot(form: "StageForm", allocator, cap_pages: int) -> None:
+    """One line per rank at the boot (rc12z13: no line said whether TP0 had
+    trimmed to S0 and the workers had not): the form, whether this rank trims,
+    the KV tensors born trimmed with their mapped bytes against the VA the
+    top stage reserves, and the allocator cap."""
+    spans = tms()
+    va = mapped = 0
+    for ptr, _geom in _KV_BORN:
+        info = spans.info(ptr) if spans.available else None
+        if info is not None:
+            va += int(info.size)
+            mapped += int(info.mapped)
+    logger.info(
+        "#251c KV-STAGE form=%s trims_here=%s born=%d mapped=%.1f/%.1f MiB cap_pages=%d/%d "
+        "(S0 %d tokens; a Form A worker trims nothing, H95c byte-identical)",
+        "/".join(str(t) for t in form.tokens),
+        kv_stage_trims_here(form.tokens[-1]), len(_KV_BORN), mapped / _MIB, va / _MIB,
+        int(cap_pages), int(getattr(allocator, "num_pages", 0) or 0), form.tokens[0])
 
 
 def _sync_before_unmap(t) -> None:
