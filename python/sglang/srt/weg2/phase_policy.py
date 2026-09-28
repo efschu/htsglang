@@ -277,6 +277,52 @@ def park_cycle_dwell_ms(d_to_p_ms: float, p_to_d_ms: float, resumed_phase: bool,
     return d_to_p + max(0.0, float(p_to_d_ms))
 
 
+PARK_DECODE_DWELL_ENV = "SGLANG_WEG2_PARK_DECODE_DWELL"
+
+
+def park_decode_dwell_on(env=None) -> bool:
+    """NF rc12z22 (boot ...dauer09281447, 14:52-14:58): 22 flips in 374 s, D
+    decoding 1-3 s per 7-16 s D phase -- the resumed requests' store->device
+    reload took 4-8 s after every wake, and the dwell (priced in FLIP time
+    from the wake) fired the next park just as decode began: 335 completion
+    tokens/min for every agent together. Default ON; "0" = the wake clock."""
+    e = os.environ if env is None else env
+    raw = (e.get(PARK_DECODE_DWELL_ENV, "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+PARK_DECODE_DUTY_ENV = "SGLANG_WEG2_PARK_DECODE_DUTY"
+
+
+def park_decode_duty(env=None) -> float:
+    """Target decode share of a park cycle (default 0.5: D decodes at least
+    as long as the cycle costs); clamped to [0.1, 0.9]."""
+    e = os.environ if env is None else env
+    try:
+        v = float((e.get(PARK_DECODE_DUTY_ENV, "") or "0.5").strip())
+    except ValueError:
+        v = 0.5
+    return min(0.9, max(0.1, v))
+
+
+def park_decode_dwell_ok(awake_s: float, decode_s: Optional[float], cycle_ms: float,
+                         floor_ms: float, duty: float = 0.5) -> bool:
+    """The immediate park waits until D has DECODED at least the cycle it
+    costs: ``cycle_ms`` = the D->P + P->D flips (K7, both measured) plus this
+    phase's own resume (wake -> first decoded chunk), so every park round trip
+    buys at least as much decode as it costs -- decode duty >= 50 %.
+    ``decode_s`` is the time since this phase's first decoded chunk (None:
+    none seen yet). Without a decoded chunk the phase has not decoded at all:
+    it holds for twice the cycle on the wake clock, then fires (a phase that
+    streams nothing -- non-stream legs only -- must not hold to the fairness
+    bound). Pure: the front owns the clocks."""
+    d = min(0.9, max(0.1, float(duty)))
+    need = max(float(cycle_ms) * d / (1.0 - d), float(floor_ms)) / 1000.0
+    if decode_s is None:
+        return float(awake_s) >= 2.0 * need
+    return float(decode_s) >= need
+
+
 def park_verdict(status: int, text: str) -> Tuple[str, List[str], str]:
     """Read D's answer to :data:`PARK_PATH`.
 

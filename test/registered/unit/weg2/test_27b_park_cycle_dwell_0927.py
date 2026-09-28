@@ -24,6 +24,8 @@ from sglang.srt.weg2 import phase_policy as pp  # noqa: E402
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     monkeypatch.delenv(pp.PARK_CYCLE_DWELL_ENV, raising=False)
+    # these pin the WAKE clock; the decode clock (PARK-DECODE-DWELL) has its own file
+    monkeypatch.setenv(pp.PARK_DECODE_DWELL_ENV, "0")
 
 
 def test_the_cycle_price_applies_only_to_a_resumed_phase_and_the_switch():

@@ -3724,6 +3724,9 @@ class Front:
         #: PARK-CYCLE DWELL: the D phase (epoch) that began by resuming parked
         #: requests -- its immediate park waits for both flips' price.
         self._park_resume_epoch = -1
+        # PARK-DECODE-DWELL: time of the first chunk D streamed in epoch _d_decode_epoch
+        self._d_decode_epoch = -1
+        self._d_decode_t0 = 0.0
         #: H91c3-3: the D phase's seat count n (H95) this front sent at the
         #: last P->D wake; None before the first one (no seat cap known).
         self._d_phase_n: Optional[int] = None
@@ -4197,7 +4200,26 @@ class Front:
             need_ms = phase_policy.park_cycle_dwell_ms(need_ms, back_ms, True)
             prov = f"{prov}+cycle:{back_prov}={int(back_ms)}ms"
         awake_s = now - self.t_awake
-        if not phase_policy.immediate_park_dwell_ok(awake_s, need_ms, FAIRNESS_DWELL_FLOOR_MS):
+        if phase_policy.park_decode_dwell_on():
+            # PARK-DECODE-DWELL (NF rc12z22 14:52-14:58): the cycle is both flips
+            # plus this phase's resume, and it is counted from D's first decoded
+            # chunk -- not from the wake, which the resume's reload ate.
+            back_ms, back_prov = self._derived_min_dwell_ms("P", "D")
+            seen = getattr(self, "_d_decode_epoch", -1) == self.epoch
+            resume_ms = (self._d_decode_t0 - self.t_awake) * 1000.0 if seen else 0.0
+            if not resumed or not phase_policy.park_cycle_dwell_on():
+                need_ms = need_ms + back_ms
+                prov = f"{prov}+back:{back_prov}={int(back_ms)}ms"
+            need_ms = need_ms + max(0.0, resume_ms)
+            prov = f"{prov}+resume={int(resume_ms)}ms decode-clock"
+            decode_s = (now - self._d_decode_t0) if seen else None
+            _duty = phase_policy.park_decode_duty()
+            prov = f"{prov} duty={_duty:.2f}"
+            dwell_ok = phase_policy.park_decode_dwell_ok(awake_s, decode_s, need_ms,
+                                                         FAIRNESS_DWELL_FLOOR_MS, _duty)
+        else:
+            dwell_ok = phase_policy.immediate_park_dwell_ok(awake_s, need_ms, FAIRNESS_DWELL_FLOOR_MS)
+        if not dwell_ok:
             if self._park_immediate_dwell_epoch != self.epoch:
                 self._park_immediate_dwell_epoch = self.epoch
                 self.counters["park_immediate_dwell_holds"] += 1
@@ -7267,6 +7289,11 @@ class Front:
                         tail.extend(chunk)
                         if not client_io["finished"] and stream_finish_seen(bytes(tail[_scan_from:])):
                             client_io["finished"] = True
+                        # PARK-DECODE-DWELL: the first chunk D streams in this D
+                        # phase starts the park's decode clock (one compare per chunk).
+                        if self.awake == "D" and self._d_decode_epoch != self.epoch:
+                            self._d_decode_epoch = self.epoch
+                            self._d_decode_t0 = time.time()
                         if len(tail) > 262144:
                             del tail[:-131072]
                         if not client_io["gone"]:
