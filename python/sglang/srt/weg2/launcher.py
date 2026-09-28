@@ -2563,6 +2563,23 @@ D_KV_STAGE_KEYS = ("SGLANG_WEG2_D_KV_STAGE_TOKENS", "SGLANG_WEG2_D_KV_STAGE_ROWS
                    "SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS")
 
 
+def operator_kv_stage_max(raw: Optional[str], cap: int, stages: int) -> Optional[Tuple[int, ...]]:
+    """The operator's highest stage per seat count, or None when --env-d does
+    not name it. Refuses by name what the table cannot take."""
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        vals = tuple(int(x) for x in str(raw).split(",") if x.strip())
+    except ValueError:
+        vals = ()
+    if len(vals) != int(cap) or any(v < 0 or v >= int(stages) for v in vals):
+        raise Weg2DKvStageMaxRefused(
+            "W168 Weg2DKvStageMaxRefused: --env-d %s=%s passt nicht zur Stufentabelle "
+            "(%d Sitzzahlen, Stufen 0..%d) -- keine Stufenform geschrieben"
+            % (D_KV_STAGE_KEYS[2], raw, int(cap), int(stages) - 1))
+    return vals
+
+
 def _drop_group_env(spec: str, key: str) -> str:
     return ";".join(x for x in str(spec or "").split(";")
                     if x.strip() and x.split("=", 1)[0].strip() != key)
@@ -2582,7 +2599,9 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
     seat rows: SGLANG_MOE_SCRATCH_SLOTS[0] - rows, SGLANG_WEG2_D_SEAT_EXPERT_ROWS
     [0] + rows, so the boot maps the same bank) and the highest stage per seat
     count (``expert_residency.kv_stage_table``, default: no extra wave).
-    An operator's SGLANG_WEG2_D_KV_STAGE_TOKENS wins (a single stage = off).
+    An operator's SGLANG_WEG2_D_KV_STAGE_TOKENS wins (a single stage = off);
+    an operator's SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS replaces the default
+    highest stage per seat count (the A/B arm), checked against the table.
     Returns the lines to log; ``d_kv_stage_undo`` reverses it for a second
     solve pass."""
     head = "%s FRACTION-SOLVE %s D-KV-STUFEN (#251c)" % (D_RANK_SOLVE_MARKER, label)
@@ -2599,6 +2618,9 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
         top_k=int(top_k), host_rank=host_rank, staging_rows=int(host.staging_rows))
     if tab is None:
         return ["%s: entfaellt (keine KV-Zelle/Scratch-Geometrie auf dem Attention-Host)" % head]
+    op_raw = env.get(D_KV_STAGE_KEYS[2])
+    op_max = operator_kv_stage_max(op_raw, len(tab.max_by_seats), len(tab.tokens))
+    max_by = tab.max_by_seats if op_max is None else op_max
     n = len(rows[-1].scratch_given)
     scratch = _rank_vec(env.get("SGLANG_MOE_SCRATCH_SLOTS"), n)
     seat_raw = env.get("SGLANG_WEG2_D_SEAT_EXPERT_ROWS")
@@ -2610,18 +2632,25 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
         "SGLANG_WEG2_D_SEAT_EXPERT_ROWS": ",".join(str(x) for x in seat),
         D_KV_STAGE_KEYS[0]: ",".join(str(t) for t in tab.tokens),
         D_KV_STAGE_KEYS[1]: str(tab.rows),
-        D_KV_STAGE_KEYS[2]: ",".join(str(j) for j in tab.max_by_seats),
+        D_KV_STAGE_KEYS[2]: ",".join(str(j) for j in max_by),
     }
     for k, v in items.items():
         env_raw = set_group_env(env_raw, k, v)
     ns.env_d = env_raw
-    ns._d_kv_stage_written = {"host": host_rank, "rows": tab.rows, "seat_raw": seat_raw}
+    ns._d_kv_stage_written = {"host": host_rank, "rows": tab.rows, "seat_raw": seat_raw,
+                              "op_max": op_raw if op_max is not None else None}
     caps = " ".join("n=%d:%s" % (i + 1, "/".join(str(c) for c in cs))
                     for i, cs in enumerate(tab.capacity))
     # the A/B candidate (main 28.09.): S1 wherever the default keeps S0 -- the
     # waves it adds per bs, priced by the capture floor (not written)
     cand = tuple(max(1, int(j)) if len(tab.tokens) > 1 else 0 for j in tab.max_by_seats)
     cand_extra = tab.extra_waves(cand)
+    op_line = [] if op_max is None else [
+        "%s: OPERATOR %s=%s statt der Voreinstellung %s -- Zusatzwellen je bs %s "
+        "(Voreinstellung %s); im Rang: '#251 WAKE-RESHARD CAPTURE-FLOOR ... max_by_seats %s'"
+        % (head, D_KV_STAGE_KEYS[2], ",".join(str(j) for j in op_max),
+           ",".join(str(j) for j in tab.max_by_seats), list(tab.extra_waves(op_max)),
+           list(tab.extra_waves(tab.max_by_seats)), list(op_max))]
     return [
         "%s: --env-d %s (Stufen %s Tok, KV-Zelle %d B/Tok, Stufenzeile %.1f MiB: "
         "S1..S%d nehmen %s Zeilen; TP0 Scratch %d -> %d, Sitzzeilen %s -> %s -- die "
@@ -2638,7 +2667,7 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
         "-- Zusatzwellen je bs %s (Default: %s); nicht geschrieben, fuer --env-d im A/B"
         % (head, ",".join(str(j) for j in cand), list(cand_extra),
            list(tab.extra_waves(tab.max_by_seats))),
-    ]
+    ] + op_line
 
 
 def d_kv_stage_undo(ns) -> None:
@@ -2662,6 +2691,8 @@ def d_kv_stage_undo(ns) -> None:
         env_raw = set_group_env(env_raw, "SGLANG_WEG2_D_SEAT_EXPERT_ROWS", str(w["seat_raw"]))
     for k in D_KV_STAGE_KEYS:
         env_raw = _drop_group_env(env_raw, k)
+    if w.get("op_max") is not None:  # the operator's value is not the launcher's to take back
+        env_raw = set_group_env(env_raw, D_KV_STAGE_KEYS[2], str(w["op_max"]))
     ns.env_d = env_raw
     ns._d_kv_stage_written = None
 
@@ -2711,6 +2742,8 @@ def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
                 ns, er, rows, seat_vram, plan_for(int(seats)), label,
                 verify_tokens=int(form.draft_tokens), top_k=top_k))
         return out
+    except Weg2DKvStageMaxRefused:
+        raise  # the operator's A/B arm does not fit: named stop, not a quiet default
     except Exception as exc:  # noqa: BLE001 -- an informational table never kills a launch
         return ["%s FRACTION-SOLVE %s D-SITZE (H95) Tabelle entfaellt: %s: %s"
                 % (D_RANK_SOLVE_MARKER, label, type(exc).__name__, exc)]
@@ -4268,6 +4301,13 @@ P_MAMBA_FLOOR_SLOTS_PER_SEAT = 4
 
 class Weg2LaunchRefused(RuntimeError):
     pass
+
+
+class Weg2DKvStageMaxRefused(Weg2LaunchRefused):
+    """#251c: the operator's SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS does not fit
+    the launcher's stage table (one entry per seat count 1..cap, each a stage
+    index of the table). Named, never quietly replaced by the default -- an
+    A/B arm that silently runs the other arm measures nothing."""
 
 
 class Weg2TokenCutNotWired(Weg2LaunchRefused):
