@@ -66,11 +66,16 @@ def test_weg2_16_42_no_recurrent_state_retracts():
     assert (pending, credit, known) == (46851, 0, False)
 
 
-def test_weg2_16_42_without_the_field_is_the_old_price():
+def test_weg2_16_42_without_the_field_is_priced_at_the_divergence_rule():
+    # rc12y logged (credit 46726, pending 125) -- the over-credit this file's
+    # docstring names. PX 28.09.: 16-42 leaves 13-41 at 46726, before both
+    # the held prompt (46850) and the measured resume point (46848), so no
+    # anchor of the witness lies on its path -- LONG via P even without the
+    # #59 field.
     ts = TokenSpans(agent_span=True)
     ts.record_presence(_ids(46850), 46848, prompt_tokens=46850, held_epoch=16)
     pending, credit, _k, _s = ts.pending(_ids(46851, common=46726), epoch=16)
-    assert (credit, pending) == (46726, 125), "the rc12y log line"
+    assert (credit, pending) == (0, 46851)
 
 
 def test_the_held_epoch_credit_is_capped_too():
@@ -220,7 +225,10 @@ def test_a_tokens_iv_an_old_entry_keeps_its_cap_in_flight():
     ts.record_inflight(old, 5)
     assert ts.depth_caps[_tkey(old)] == 512, "neither 0 nor the neighbour's depth"
     ts.record_inflight(_ids(1500), 5)                  # a new text beside them: inherits, bounded
-    assert ts.depth_caps[_tkey(_ids(1500))] == 1500, "the longest capped prefix (1800), bounded by the shared 1500"
+    # PX 28.09.: the neighbour's anchor 1800 is past the 1500 the texts share
+    # (was 1500 = min(1800, 1500): no anchor sits there); the deepest anchor
+    # on the path is the old entry's 512
+    assert ts.depth_caps[_tkey(_ids(1500))] == 512, "the deepest capped depth on the shared path"
 
 
 def test_a_chars_i_inflight_without_a_known_depth_credits_nothing():

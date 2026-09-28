@@ -331,6 +331,34 @@ def token_lcp(a: np.ndarray, b: np.ndarray) -> int:
     return int(ne[0]) if ne.size else n
 
 
+def divergence_credit(raw: int, ct: int, cap: Optional[int], lcp: int) -> int:
+    """PX (28.09.): the credit one entry gives a text that shares ``lcp``
+    tokens with it. D (hybrid) resumes only at a Mamba ANCHOR, so the credit
+    must be an anchor depth on the shared path, never the divergence point.
+
+    ``raw`` (the entry's measured / held depth, capped by D's #59 resumable
+    depth) is such an anchor. When it lies within the shared prefix it holds
+    as before. When the text leaves the entry BEFORE it, the old credit
+    ``min(raw, lcp)`` named the divergence point itself -- a depth D holds no
+    state at. NF rc12z30e (front log ...09282117_ca2a9706ec_0928_211748):
+    weg2-14-37 (16869 tokens) priced credit=16090 (lcp, not page-aligned),
+    pending 779 -> SHORT; D matched 3840 tokens without state ('[#928 anchor]
+    REFUSING resume ... best_value_len=0'), X-GATE uncached=16869 -> W50
+    reroute, PARK-IMMEDIATE of 4 running decodes (rpc 4.42 s), flip, P prefill
+    of all 16869. Five of that boot's 8 W50 reroutes are this shape (credit =
+    lcp: 10-32 27250, 14-37 16090, 16-40 29285, 16-41 17017, 44-79 33484).
+    The anchors below the divergence the front knows are the entry's measured
+    resume point ``ct`` (D matched it there, so it was an anchor) while it
+    lies on the shared path and within D's deepest depth; otherwise nothing.
+    Under-crediting costs a P leg; over-crediting costs the request and every
+    decode the reroute parks."""
+    if raw <= lcp:
+        return int(raw)
+    if 0 < ct <= lcp and (cap is None or ct <= cap):
+        return int(ct)
+    return 0
+
+
 class TokenSpans:
     """The MEASURED cached-on-D prefixes in TOKENS -- :class:`SpanLRU`'s
     semantics (#1324 presence witness, #49 held epoch, a measured zero
@@ -410,16 +438,20 @@ class TokenSpans:
         self._stamp(key)  # #59: an old depth cap stays until the finish replaces it
 
     def known_prefix_depth(self, ids: np.ndarray, exclude: Optional[str] = None) -> int:
-        """#59 A: the ``depth_cap`` of the CAPPED entry with the longest token
-        LCP against ``ids``, bounded by that LCP; 0 = no depth known."""
-        best_lcp, depth = 0, 0
+        """#59 A: the deepest known anchor on the path of ``ids`` -- the
+        ``depth_cap`` of a CAPPED entry that lies within its token LCP against
+        ``ids``; 0 = no depth known. PX (28.09.): a depth past the divergence
+        is not on this text's path, so it is no depth at all (the old reading
+        took the longest-LCP entry's depth and cut it to the LCP -- the
+        divergence point, where D holds no state)."""
+        best = 0
         for key, (eids, _ct, _pt, _held) in self.entries.items():
             if key == exclude or key not in self.depth_caps:
                 continue
-            lcp = token_lcp(eids, ids)
-            if lcp > best_lcp:
-                best_lcp, depth = lcp, int(self.depth_caps[key])
-        return max(0, min(depth, best_lcp))
+            depth = int(self.depth_caps[key])
+            if best < depth <= token_lcp(eids, ids):
+                best = depth
+        return best
 
     def pending(self, ids: np.ndarray, epoch: Optional[int] = None,
                 since_seq: Optional[int] = None) -> Tuple[int, int, bool, str]:
@@ -441,7 +473,7 @@ class TokenSpans:
             if raw <= 0:
                 continue
             known = True
-            credit = min(raw, lcp)
+            credit = divergence_credit(raw, ct, cap, lcp)
             if credit > best:
                 best = credit
                 src = "d_served_epoch" if held and credit > ct else "d_leg2_cached"

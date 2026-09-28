@@ -262,9 +262,11 @@ def test_credit_is_the_measured_share_capped_by_the_token_lcp():
     ts.record_presence(prev, cached_tokens=8000, prompt_tokens=10000, held_epoch=None)
     new = _ids((0, 9000), (50000, 53000))  # shares 9000 tokens, 3000 new
     assert ts.pending(new) == (12000 - 8000, 8000, True, "d_leg2_cached")
-    # D measured more than the two texts share -> the LCP bounds it
+    # D measured more than the two texts share: its anchor (9990) is past the
+    # divergence (9000) -- PX 28.09.: no credit, the divergence point is no
+    # anchor (was (3000, 9000): the weg2-14-37 W50 shape)
     ts.record_presence(prev, cached_tokens=9990, prompt_tokens=10000)
-    assert ts.pending(new)[:2] == (3000, 9000)
+    assert ts.pending(new)[:2] == (12000, 0)
 
 
 def test_held_credit_only_in_its_epoch_and_a_zero_retracts():
