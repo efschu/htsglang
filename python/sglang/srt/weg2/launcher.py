@@ -2654,7 +2654,7 @@ def kv_stage_wave_floor(group, rows, fits, max_by: Sequence[int], waves_cap: int
     the highest stage the cap may take, as ``d_seat_vram.capture_floors``),
     0 on every rank without a stage table (no KV, no cells, no floor). A
     rank given stage rows the plan stages no KV for is refused as well: its
-    runtime would build no cells and count them OFF. Refuses by name (W170)
+    runtime would build no cells and count them OFF. Refuses by name (W171)
     before any rank is launched; the lines name each rank's air."""
     last = rows[-1]
     n = len(last.scratch_given)
@@ -2684,7 +2684,7 @@ def kv_stage_wave_floor(group, rows, fits, max_by: Sequence[int], waves_cap: int
     orphan = [r for r in staged if r != host and er_trim_cell(fit_by.get(r), host) <= 0]
     if bad or orphan:
         raise Weg2DKvStageWavesRefused(
-            "W170 Weg2DKvStageWavesRefused: Wellenboden je D-Rang gebrochen %s%s -- %s; "
+            "W171 Weg2DKvStageWavesRefused: Wellenboden je D-Rang gebrochen %s%s -- %s; "
             "keine Stufenform geschrieben"
             % (["rang%d" % r for r in bad],
                " / Stufenzeilen ohne KV auf %s" % (["rang%d" % r for r in orphan],)
