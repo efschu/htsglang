@@ -4150,6 +4150,57 @@ def weg2_791c_release_on_idle_vote(self, vote) -> None:
         self._791c_pp0_drained = False
 
 
+_LBV_N = [0]
+
+
+def weg2_loadback_drain_on_idle_vote(self) -> int:
+    """LOAD-BACK LIVENESS (27B rc12z28 boot ...09281851, 19:02:32-19:04:03, W3):
+    a follower's load-back ack is drained by ``loading_check`` inside
+    ``check_hicache_events`` -- which runs in ``_get_new_batch_prefill_raw``,
+    i.e. only on a PLANNED pass. Under the row authority a frameless cycle skips
+    the plan (PLAN BYPASS), so after PP0's last pass (weg2-24-49's #988 load-back,
+    issued on PP1/PP2 in that pass) no follower ever polled its finished ack:
+    ``ongoing_load_back`` kept 1 entry, ``idle_blockers`` said
+    ``hicache_load_back(1)`` on PP1 and PP2 in every lap, and the P->D quiesce
+    ended in W3 90 s later.
+
+    The poll is rank-local by construction (#737: ``_count_ready_acks`` drains
+    only this rank's own finished events, no collective), so the vote may run
+    it: a follower under the row authority whose microbatches are drained
+    drains its finished load-back acks right before it attaches its slot --
+    the slot then says what is true. Nothing is waited on (an unfinished event
+    stays and votes not-idle, as before). A MODULE function for the lap tests'
+    stand-ins, like :func:`weg2_791c_release_on_idle_vote`. Returns the drained
+    count."""
+    tc = getattr(self, "tree_cache", None)
+    pending = getattr(tc, "ongoing_load_back", None)
+    if not pending or int(getattr(getattr(self, "ps", None), "pp_rank", 0) or 0) == 0:
+        return 0
+    check = getattr(tc, "loading_check", None)
+    if not callable(check):
+        return 0
+    try:
+        from sglang.srt.weg2 import p_row_authority as _prow
+
+        if not _prow.applies(self) or not self._pp_microbatches_drained():
+            return 0
+        before = len(pending)
+        check()
+        drained = before - len(getattr(tc, "ongoing_load_back", None) or ())
+    except Exception:  # noqa: BLE001 - the drain never blocks the vote
+        logger.warning("WEG2-LOADBACK-DRAIN-ON-VOTE raised; the slot votes on the undrained state",
+                       exc_info=True)
+        return 0
+    if drained > 0:
+        _LBV_N[0] += 1
+        if _LBV_N[0] <= 16 or _LBV_N[0] % 256 == 0:
+            logger.info("WEG2-LOADBACK-DRAIN-ON-VOTE pp_rank=%d drained=%d left=%d (n=%d): the "
+                        "follower's finished load-back acks, polled at the #1268 vote -- a "
+                        "frameless cycle skips the plan that polls them", int(self.ps.pp_rank),
+                        drained, len(getattr(tc, "ongoing_load_back", None) or ()), _LBV_N[0])
+    return drained
+
+
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -6442,6 +6493,7 @@ class SchedulerPPMixin:
                 )
         rank = int(self.ps.pp_rank)
         weg2_791c_release_on_idle_vote(self, vote)
+        weg2_loadback_drain_on_idle_vote(self)
         if attach_slot(vote, rank, self.is_fully_idle(), ", ".join(self.idle_blockers()) or "none"):
             log_verdict(vote, rank)
 
