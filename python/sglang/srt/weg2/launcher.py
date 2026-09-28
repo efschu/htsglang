@@ -5623,6 +5623,9 @@ def l3_persist_enabled(env=None) -> bool:
 #: a new directory instead of a MixedGenerationError on a reused one.
 L3_PERSIST_GENERATION = "706"
 L3_IDENTITY_FILE = "L3_IDENTITY.json"
+#: YaRN x2: how the runtime applies a rope override (hf_transformers.config.
+#: apply_model_override_args, nested sub-config merge). Bump when that changes.
+L3_ROPE_APPLY = "merge-v1"
 
 
 def _l3_extra_flag(extra: str, flag: str) -> str:
@@ -5691,7 +5694,7 @@ def l3_persist_identity(model: str, profile: str = "", form_kv: str = "",
     def _sha(v: str) -> str:
         return hashlib.sha1(v.encode()).hexdigest()[:16] if v else ""
 
-    return {
+    ident = {
         "model_path": real,
         "model_config_sha1": cfg_sha,
         "weights_fp": l3_weights_fingerprint(model),
@@ -5703,6 +5706,19 @@ def l3_persist_identity(model: str, profile: str = "", form_kv: str = "",
         "vision": str(vision or ""),
         "generation": L3_PERSIST_GENERATION,
     }
+    # YaRN x2 (28.09.): the rope the pages were rotated with, by name -- the
+    # override's rope/position part (rope_scaling, rope_parameters,
+    # max_position_embeddings; top level and text_config), canonical, and the
+    # way the runtime applies it (L3_ROPE_APPLY: f37d83617d merges a nested
+    # text_config override key by key; before it, the same string replaced the
+    # sub-config). Only when an override names a rope -- a store without one
+    # keeps its identity (and its directory) byte for byte.
+    rope_p = _l3_rope_view(_l3_extra_flag(extra_p, "--json-model-override-args"))
+    rope_d = _l3_rope_view(_l3_extra_flag(extra_d, "--json-model-override-args"))
+    if rope_p or rope_d:
+        ident["rope"] = rope_p if rope_p == rope_d else f"P={rope_p},D={rope_d}"
+        ident["rope_apply"] = L3_ROPE_APPLY
+    return ident
 
 
 def l3_persistent_store(directory: str) -> bool:
