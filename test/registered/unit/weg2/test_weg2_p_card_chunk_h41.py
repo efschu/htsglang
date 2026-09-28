@@ -499,19 +499,23 @@ class TestLauncherSeam:
         assert all("saettigt nach Chunk" in l for l in card)
         assert not any("BEFUND" in l for l in lines)
 
-    def test_one_row_over_the_edge_is_refused_w132(self):
-        from sglang.srt.weg2 import launcher
+    def test_one_row_over_the_edge_is_capped_to_the_edge(self):
+        # YaRN x2 (28.09.): FR_P ist die Obergrenze -- statt W132 kappt der
+        # Launcher die reissende Stufe auf ihre Decke (vorher: Verweigerung).
+        ns = self._ns()
+        lines = self._run(ns, (0.412, 0.605, 0.733887), KV_H25)
+        cap = [l for l in lines if l.startswith("PP-CUT W132-FR_P-KAPPUNG stage")]
+        assert len(cap) == 1 and "stage0 (nvml1): f 0.4120 -> 0.402" in cap[0]
+        assert ns.pp_cut_expert_device_fraction == "0.402,0.605,0.733887"
 
-        with pytest.raises(launcher.Weg2LaunchRefused, match="W132 Weg2PCardChunkOom"):
-            self._run(self._ns(), (0.412, 0.605, 0.733887), KV_H25)
-
-    def test_x164s_form_is_refused_and_the_edge_named(self):
-        from sglang.srt.weg2 import launcher
-
-        with pytest.raises(launcher.Weg2LaunchRefused) as ei:
-            self._run(self._ns(p_bs=4, extra_p="--max-running-requests 4"), H164, KV_H25)
-        assert "W132 Weg2PCardChunkOom" in str(ei.value)
-        assert "Groesste tragbare Fraction je Stufe: 0.402,0.708,0.996" in str(ei.value)
+    def test_x164s_form_is_capped_on_both_stages_that_tear(self):
+        ns = self._ns(p_bs=4, extra_p="--max-running-requests 4")
+        lines = self._run(ns, H164, KV_H25)
+        cap = [l for l in lines if l.startswith("PP-CUT W132-FR_P-KAPPUNG stage")]
+        # die Decke je Stufe, die W132 bisher nur nannte (0.402,0.708,0.996)
+        assert [c.split(":")[0] for c in cap] == [
+            "PP-CUT W132-FR_P-KAPPUNG stage0 (nvml1)", "PP-CUT W132-FR_P-KAPPUNG stage1 (nvml0)"]
+        assert ns.pp_cut_expert_device_fraction == "0.402,0.708,0.733887"
 
     def test_the_4_seat_edge_passes_and_names_the_co_tenant(self):
         lines = self._run(self._ns(p_bs=4, extra_p="--max-running-requests 4"), H59_EDGE, KV_H25)

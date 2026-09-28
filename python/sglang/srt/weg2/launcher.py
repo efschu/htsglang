@@ -4645,6 +4645,9 @@ class BootState:
     #: ``nvmlN`` limit/max/default W and the max SM clock. Every time or rate a
     #: later reader takes from this boot is only comparable at this limit.
     power_limits: Dict[str, object] = field(default_factory=dict)
+    #: YaRN x2 (28.09.): die W132-FR_P-KAPPUNG dieses Boots (vorher/nachher je
+    #: Stufe, gekappte Stufen, Zeilen); leer = keine Stufe gekappt.
+    p_fr_cap: Dict[str, object] = field(default_factory=dict)
 
 
 def _now() -> str:
@@ -16780,10 +16783,19 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
                    mamba_mib_per_slot: Sequence[float] = (),
                    layer_kinds: Optional[Sequence[str]] = None,
                    dense_mib_per_layer: Optional[float] = None,
-                   mamba_mib_per_linear_layer_per_slot: Optional[float] = None) -> None:
+                   mamba_mib_per_linear_layer_per_slot: Optional[float] = None,
+                   ) -> Optional[List[float]]:
     """H41: ``PP-CUT ACTIVATION`` (T_s(chunk) je Stufe mit Quelle) und
     ``PP-CUT P-KARTE`` (Kopfraum je Stufe im Chunk-Forward); W132, wenn eine
     Stufe unter near-OOM faellt, W131 fuer einen ungemessenen Chunk.
+
+    YaRN x2 (28.09.): FR_P ist die OBERGRENZE, nicht der exakte Wert. Reisst
+    eine Stufe die Karte, kappt der Launcher NUR diese Stufe auf ihre Karten-
+    Decke (``p_card_fr_cap``), rechnet die Karte mit der Kappung noch einmal
+    und schreibt sie an die drei Stellen, an denen FR_P lebt (wie der
+    H25-Post). Rueckgabe: die gekappten Fractions, None = unveraendert.
+    Verweigert bleibt W132, wenn eine Stufe keine Decke hat (nicht einmal ein
+    residenter Experte plus Scratch) oder die Karte auch gekappt reisst.
 
     Eine Referenz, die nicht zu DIESER Form passt (anderes Modell, anderer
     Schnitt, fehlender KV-Preis oder Draft-Posten), laesst die Karten-Bilanz
@@ -16890,9 +16902,9 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
             log(f"{_p_card.CARD_MARKER} {exc}")
             raise Weg2LaunchRefused(str(exc)) from None
 
-    def _solve(tokens):
+    def _solve(tokens, fractions=fracs):
         return _p_card.solve_p_card(
-            reference=reference, support=support, fractions=fracs,
+            reference=reference, support=support, fractions=fractions,
             lru_rows=lru_rows, stage_layers=stage_layers, chunk=int(chunk_tokens),
             kv_mib=[float(x) for x in kv_mib], num_experts=int(num_experts),
             row_mib=float(row_mib), draft_on_p=draft_on_p,
@@ -16919,9 +16931,111 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
             mamba_mib_per_linear_layer=float(mamba_mib_per_linear_layer_per_slot or 0.0)
             * int(reference.mamba_slots)))
     refusal = _p_card.p_card_refusal_text(fits, reference, chunk=int(chunk_tokens))
-    if refusal is not None:
+    if refusal is None:
+        return None
+    cap = p_card_fr_cap(fits, fracs, int(num_experts), lru_rows)
+    if cap.refusal:
+        refusal = "%s -- %s" % (refusal, cap.refusal)
         log(f"{_p_card.CARD_MARKER} {refusal}")
         raise Weg2LaunchRefused(refusal)
+    capped = _solve(prompt, cap.fractions)
+    for fit in capped:
+        log(_p_card.describe_p_card(fit, reference))
+    again = _p_card.p_card_refusal_text(capped, reference, chunk=int(chunk_tokens))
+    if again is not None:
+        again = "%s -- auch nach %s %s" % (again, P_FR_CAP_MARKER, "; ".join(cap.lines))
+        log(f"{_p_card.CARD_MARKER} {again}")
+        raise Weg2LaunchRefused(again)
+    publish_p_fractions(ns, cap.fractions)
+    ns._w132_fr_cap = {
+        "fr_p_before": [float(x) for x in fracs],
+        "fr_p_after": [float(x) for x in cap.fractions],
+        "stages": list(cap.stages),
+        "lines": list(cap.lines),
+        "chunk": int(chunk_tokens),
+        "prompt": int(capped[0].prompt_tokens) if capped else int(prompt),
+    }
+    for line in cap.lines:
+        log(f"{P_FR_CAP_MARKER} {line}")
+    log(f"{P_FR_CAP_MARKER} FR_P {[round(float(x), 4) for x in fracs]} -> "
+        f"{ns.pp_cut_expert_device_fraction} (published to --pp-cut-expert-device-"
+        f"fraction, --extra-p --rank-moe-resident-fraction, --env-p "
+        f"SGLANG_MOE_RESIDENT_EXPERT_FRACTION; die uebrigen Stufen exakt wie gegeben)")
+    return list(cap.fractions)
+
+
+#: YaRN x2 (28.09.): die Zeile der Kappung. Bewusst 'W132-...' mit Bindestrich:
+#: der Arm zaehlt nach dem Dry-Run ``W[0-9]+ `` als Verweigerung
+#: (test_no_h57_line_is_counted_as_a_w_line_by_the_arm) -- eine Kappung ist
+#: keine.
+P_FR_CAP_MARKER = "PP-CUT W132-FR_P-KAPPUNG"
+
+
+class PFrCap(NamedTuple):
+    fractions: Tuple[float, ...]
+    stages: Tuple[int, ...]
+    lines: Tuple[str, ...]
+    refusal: str
+
+
+def p_card_fr_cap(fits, fracs: Sequence[float], num_experts: int,
+                  lru_rows: Sequence[int]) -> PFrCap:
+    """FR_P als Obergrenze: jede Stufe, die die Karte reisst, auf ihre
+    Karten-Decke (``PCardFit.ceiling_fraction`` = groesste Fraction, deren
+    Puffer in die tragbaren Zeilen passt); jede andere Stufe EXAKT wie gegeben.
+
+    Untergrenze ist die bestehende Mindestresidenz der Stufe:
+    ``largest_fraction_for_rows`` gibt None, wenn die Karte nicht einmal EINEN
+    residenten Experten plus ihren Scratch traegt -- dann bleibt W132 mit Namen
+    (``refusal``), statt auf 0 zu kappen. Ebenso, wenn die Decke nicht unter
+    der gegebenen Fraction liegt (dann liegt der Mangel nicht an den Zeilen,
+    und Kappen haelfe nicht)."""
+    from sglang.srt.planner import expert_residency as _er
+
+    new = [float(x) for x in fracs]
+    stages, lines, why = [], [], []
+    for fit in fits:
+        if not fit.refused:
+            continue
+        s = int(fit.stage)
+        short = float(fit.near_oom_mib) - float(fit.headroom_mib)
+        ceil = fit.ceiling_fraction
+        if ceil is None:
+            why.append(
+                "stage%d (%s): keine Kappung -- die Karte traegt nicht einmal einen "
+                "residenten Experten plus Scratch %d (Mindestresidenz, "
+                "largest_fraction_for_rows), es fehlen %.0f MiB"
+                % (s, fit.card, int(lru_rows[s]), short))
+            continue
+        if float(ceil) >= float(fracs[s]):
+            why.append(
+                "stage%d (%s): keine Kappung -- die Karten-Decke f %.3f liegt nicht "
+                "unter der gegebenen f %.4f, der Mangel (%.0f MiB) liegt nicht an den "
+                "Experten-Zeilen" % (s, fit.card, float(ceil), float(fracs[s]), short))
+            continue
+        new[s] = float(ceil)
+        stages.append(s)
+        rows_new = _er.buffer_rows(local_experts=int(num_experts), fraction=float(ceil),
+                                   scratch_rows=int(lru_rows[s]))
+        lines.append(
+            "stage%d (%s): f %.4f -> %.3f (%d -> %d Zeilen, Decke %d Zeilen): Kopfraum "
+            "am letzten Chunk %.0f MiB < near-OOM %.0f, es fehlen %.0f MiB (Chunk-Index "
+            "%d, Prompt %d); FR_P ist die Obergrenze, der Planer kappt"
+            % (s, fit.card, float(fracs[s]), float(ceil), int(fit.buffer_rows), rows_new,
+               int(fit.ceiling_max_rows), float(fit.headroom_mib), float(fit.near_oom_mib),
+               short, int(fit.last_chunk_index), int(fit.prompt_tokens)))
+    return PFrCap(tuple(new), tuple(stages), tuple(lines), "; ".join(why))
+
+
+def publish_p_fractions(ns, fracs: Sequence[float]) -> None:
+    """FR_P an die DREI Stellen, an denen es lebt (arm_fnFL2.sh: "FR_P steht
+    an DREI Stellen"; dieselben wie ``apply_p_draft_post``)."""
+    from sglang.srt.weg2 import draft_post as _dp
+
+    ns.pp_cut_expert_device_fraction = ",".join(_dp._fmt(x) for x in fracs)
+    ns.extra_p = _dp.replace_vector_flag(ns.extra_p, "--rank-moe-resident-fraction", fracs)
+    ns.env_p = _dp.replace_env_vector(getattr(ns, "env_p", ""),
+                                      "SGLANG_MOE_RESIDENT_EXPERT_FRACTION", fracs)
 
 
 def solve_p_cut(
@@ -17238,7 +17352,7 @@ def solve_p_cut(
             * int(_p_mamba_slots),
             "kv_mib_per_attn_layer": _kv_attn,
         }
-        p_card_verdict(
+        _capped = p_card_verdict(
             ns, cards, log,
             model=model,
             chunk_tokens=int(chunk_tokens),
@@ -17256,6 +17370,15 @@ def solve_p_cut(
             dense_mib_per_layer=float(mean_layer_mib),
             mamba_mib_per_linear_layer_per_slot=float(ns.pp_cut_mamba_mib_per_linear_layer_per_slot),
         )
+        if _capped is not None:
+            # W132-FR_P-KAPPUNG: das Pool-Modell unten bepreist dieselbe
+            # Fraction, die jetzt im argv steht.
+            fracs = list(_capped)
+            layer_mib_by_stage = tuple(
+                mean_layer_mib
+                + (terms.expert_layer_weight_bytes * float(f) + row_bytes * float(r)) / _pp_cut.MIB
+                for f, r in zip(fracs, rows)
+            )
     ms = _csv_floats(ns.pp_cut_measured_ms_per_layer)
     model_pool = _pp_cut.PhasePoolModel(
         free_mib=tuple(float(b) for b in budgets_p),
@@ -20686,6 +20809,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens,
         user_reserve_by_card=user_reserve_by_card, power_reading=power_reading,
     )
+    state.p_fr_cap = dict(getattr(ns, "_w132_fr_cap", None) or {})
     # --p-prefill-graph-calibration: the table is valid only for the cut it
     # was measured on (Agent PG2 26.09.). Checked HERE, once, for all P ranks;
     # no table = no-op. On a mismatch the table is dropped and the cut solved
