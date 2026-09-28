@@ -11096,6 +11096,63 @@ class ServerArgs:
         """True when this boot is the attention-host layout."""
         return bool(self.rank_role)
 
+    # ---- Form B (rank form 28.09., seam F15) -------------------------------
+    def _form_b_candidate(self) -> bool:
+        """--rank-tp-ratio names Form B: >= 2 weight ranks and >= 1 zero, no
+        --rank-role (that is #239 Form A), not the weightless lane (form A of a
+        dense model, admitted by _admit_lane_rank_tp_ratio)."""
+        r = self.rank_tp_ratio
+        if not isinstance(r, list) or self.rank_role or self.weightless_kv_fastlane:
+            return False
+        if any(not isinstance(x, int) for x in r):
+            return False
+        return any(x == 0 for x in r) and sum(1 for x in r if x > 0) >= 2
+
+    def _admit_form_b(self) -> None:
+        """Seam F15 (1): a Form B vector is admitted BY NAME, through the one
+        resolver (rank_form.resolve_rank_form: W181 shape, W182 while F6 is
+        unwired, W188 while F15 is), and only inside its scope: pure TP on one
+        node, every rank in DCP (the spec channel and the KV cut run over dcp
+        == tp), no pipeline, no data/DP-attention parallelism."""
+        from sglang.srt.rank_form import RankFormError, form_b_plan, resolve_rank_form
+
+        raw = self.uneven_token_vector or os.environ.get("SGLANG_UNEVEN_TOKEN_VECTOR") or None
+        tokens = None
+        if raw is not None and str(raw).strip():
+            tokens = [int(x) for x in str(raw).split(",") if x.strip()]
+        why = []
+        if self.pp_size > 1:
+            why.append(f"--pp-size {self.pp_size}")
+        if self.dp_size > 1 or self.enable_dp_attention:
+            why.append("data / DP-attention parallelism")
+        if self.dcp_size != self.tp_size:
+            why.append(f"--dcp-size {self.dcp_size} != --tp-size {self.tp_size} "
+                       "(Form B's KV and spec channel run over dcp = ALL ranks)")
+        if why:
+            raise ValueError(
+                f"--rank-tp-ratio {self.rank_tp_ratio} is Form B (weight ranks over a "
+                f"subset, KV-only ranks beside them), which runs pure TP x DCP only; "
+                f"refused: {'; '.join(why)}. W181 Weg2RankFormShapeMismatch")
+        try:
+            form = resolve_rank_form(self.rank_tp_ratio, tokens)
+        except RankFormError as e:
+            raise ValueError(f"--rank-tp-ratio {self.rank_tp_ratio} (Form B): {e}") from e
+        plan = form_b_plan(form)
+        # Underscore attributes: derived, pickled to the scheduler children.
+        self._form_b_partition = plan.model_tp_partition()
+        logger.info("%s -- model_tp %s", form.line(), self._form_b_partition)
+
+    def form_b_active(self) -> bool:
+        """True when this boot is Form B (admitted by _admit_form_b)."""
+        return getattr(self, "_form_b_partition", None) is not None
+
+    def form_b_model_tp_partition(self):
+        """FormBPlan.model_tp_partition of this boot, or None: what
+        parallel_state.set_model_tp_partition installs before
+        initialize_model_parallel."""
+        part = getattr(self, "_form_b_partition", None)
+        return [list(p) for p in part] if part is not None else None
+
     def _validate_rank_role_plan(self) -> None:
         """--rank-role x --rank-tp-ratio: the two must say the same thing.
 
@@ -12294,7 +12351,8 @@ class ServerArgs:
             # unchanged: in every caller older than Form A a zero is an
             # arithmetic accident, and admitting it globally would turn a
             # typo into a silently wrong shard plan.
-            floor = 0 if self.rank_role else 1
+            form_b = self._form_b_candidate()
+            floor = 0 if (self.rank_role or form_b) else 1
             if any(
                 not isinstance(r, int) or r < floor for r in self.rank_tp_ratio
             ):
@@ -12312,6 +12370,8 @@ class ServerArgs:
                 )
             if self.rank_role:
                 self._validate_rank_role_plan()
+            elif form_b:
+                self._admit_form_b()
             elif len(set(self.rank_tp_ratio)) == 1:
                 raise ValueError(
                     "--rank-tp-ratio with identical entries is the even "

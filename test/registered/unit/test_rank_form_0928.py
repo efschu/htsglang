@@ -360,3 +360,40 @@ def test_form_b_windows_count_two_ranks_on_one_card_twice_and_check_shapes():
     assert rf.parse_window_spec(None) == (rf.BARLINK_WINDOW_MIB_DEFAULT, {})
     with pytest.raises(rf.RankFormBar1Window, match="no usable BAR1"):
         rf.check_form_b_windows(_b(), U, {"GPU-5090": 1})
+
+
+# F15 (1): server_args admits a Form B vector by name, through the one resolver.
+def _seam(monkeypatch, sid, wired):
+    from sglang.srt import rank_role
+
+    monkeypatch.setitem(rank_role.SEAMS, sid, rank_role.SEAMS[sid].__class__(
+        **{**rank_role.SEAMS[sid].__dict__, "wired": wired}))
+
+
+def _b_args(**kw):
+    from sglang.srt.server_args import ServerArgs
+
+    kw.setdefault("enable_vram_ledger", False)
+    kw.setdefault("dcp_size", 3)
+    return ServerArgs(model_path="dummy", tp_size=3, **kw)
+
+
+def test_server_args_admit_form_b_by_name(monkeypatch):
+    a = _b_args(rank_tp_ratio=[3, 1, 0], uneven_token_vector="1,2,2")
+    with pytest.raises(ValueError, match="W188.*F15"):                  # boot path not wired
+        a._handle_uneven_tp()
+    _seam(monkeypatch, "F15", True)
+    a = _b_args(rank_tp_ratio=[3, 1, 0], uneven_token_vector="1,2,2")
+    a._handle_uneven_tp()
+    assert a.form_b_active() and a.form_b_model_tp_partition() == [[0, 1], [2]]
+    assert a.rank_tp_ratio == [3, 1, 0] and not a.form_a_active()
+    for bad, match in (({"dcp_size": 1}, "dcp-size 1 != --tp-size 3"),
+                       ({"uneven_token_vector": "1,2,0"}, "token share 0")):
+        b = _b_args(rank_tp_ratio=[3, 1, 0], **{"uneven_token_vector": "1,2,2", **bad})
+        with pytest.raises(ValueError, match=match):
+            b._handle_uneven_tp()
+    # a single weight rank without --rank-role stays the classic refusal
+    c = _b_args(rank_tp_ratio=[1, 0, 0])
+    with pytest.raises(ValueError, match="positive"):
+        c._handle_uneven_tp()
+    assert not _b_args(rank_tp_ratio=[2, 1, 1]).form_b_active()
