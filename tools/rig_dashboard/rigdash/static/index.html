@@ -321,9 +321,9 @@ function kv(rows) {
 // (only one phase runs at a time): the running one is coloured, the others dimmed
 function bigPair(lbl60, v60, one, digits, extra, max3) {
   const on = one > 0;
-  return `<div class="bigrow" title="hoechster 3-s-Mittelwert der letzten 120 s"><span class="bl" style="white-space:nowrap">MAX 3s/120s</span><span class="big num">${max3 == null ? "–" : fmt(max3, digits) + "<small>tok/s</small>"}</span></div>
-    <div class="bigrow"><span class="bl">${lbl60}</span><span class="big num">${fmt(v60, digits)}<small>tok/s</small></span></div>
-    <div class="bigrow ${on ? "on" : "off"}" title="letzte 1 s: Zeilen mit Stempel in der vorigen oder laufenden Sekunde; 0 = die Phase rechnet gerade nicht"><span class="bl" style="white-space:nowrap">jetzt 1 s</span><span class="big num">${fmt(one, digits)}<small>tok/s</small></span>${extra || ""}</div>`;
+  return `<div class="bigrow ${on ? "on" : "off"}" title="letzte 1 s: Zeilen mit Stempel in der vorigen oder laufenden Sekunde; 0 = die Phase rechnet gerade nicht"><span class="bl" style="white-space:nowrap">jetzt 1 s</span><span class="big num">${fmt(one, digits)}<small>tok/s</small></span>${extra || ""}</div>
+    <div class="bigrow" title="hoechster 3-s-Mittelwert der letzten 120 s"><span class="bl" style="white-space:nowrap">MAX 3s/120s</span><span class="big num">${max3 == null ? "–" : fmt(max3, digits) + "<small>tok/s</small>"}</span></div>
+    <div class="bigrow"><span class="bl">${lbl60}</span><span class="big num">${fmt(v60, digits)}<small>tok/s</small></span></div>`;
 }
 
 // decode: how many seats REALLY compute (bs of the newest round) against the
