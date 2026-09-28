@@ -89,7 +89,7 @@ from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.multimodal.lane_support import image_requests_unsupported_reason
 from sglang.srt.multimodal.mm_utils import has_valid_data
-from sglang.srt.managers import shutdown_gate
+from sglang.srt.managers import shutdown_gate, weg2_resumable_depth
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.shutdown_gate import ServerShuttingDown
@@ -2347,6 +2347,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     weg2_prefill_s = getattr(recv_obj.time_stats[i], "weg2_prefill_s", 0.0)
                     if weg2_prefill_s > 0.0:
                         meta_info["weg2_prefill_s"] = weg2_prefill_s
+                    # #59: the depth the next turn can resume from (the front
+                    # caps its presence credit there); absent = old price.
+                    resumable = weg2_resumable_depth.meta_value(recv_obj.time_stats[i])
+                    if resumable is not None:
+                        meta_info[weg2_resumable_depth.FIELD] = resumable
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)

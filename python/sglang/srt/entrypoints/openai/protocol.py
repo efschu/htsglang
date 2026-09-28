@@ -519,6 +519,10 @@ class SglExt(BaseModel):
     # H84: a Weg-2 D group's own prefill time for this request (meta_info
     # weg2_prefill_s), read by the Weg-2 front's r_D probe.
     weg2_prefill_s: Optional[float] = None
+    # #59: the depth a Weg-2 D group can resume this sequence from (meta_info
+    # weg2_resumable_depth); the front caps its presence credit there. 0 is a
+    # measured "nothing resumable" and is sent.
+    weg2_resumable_depth: Optional[int] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
