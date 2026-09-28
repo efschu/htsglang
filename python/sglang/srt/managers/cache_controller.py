@@ -4157,7 +4157,9 @@ class HiCacheController:
         ]
 
     @_pass_timed("_1474_probe_ms")  # #1474
-    def store_presence_pages(self, token_ids, last_hash, prefix_keys=None) -> int:
+    def store_presence_pages(
+        self, token_ids, last_hash, prefix_keys=None, page_keys=None
+    ) -> int:
         """#950: how many pages the STORE holds for this span, by CONTENT KEY.
 
         THE PRECONDITION REPLACEMENT. `Scheduler._prefetch_kvcache` gated the
@@ -4207,6 +4209,16 @@ class HiCacheController:
         holding the pages, which declines the fetch rather than issuing one that
         cannot land -- and the decline is NAMED, so "we could not ask" never
         reads as "it is not there".
+
+        H108 (rc12z25 D 16:56:02, weg2-72-124 W16 4317 > 4096): ``page_keys``
+        is P's hand-off chain for this span (#1442, ``keys_for_span``), spliced
+        exactly as ``_storage_hit_query`` splices it -- P's keys for the pages
+        it covers, own hashes after. Without it the probe hashed its own chain
+        from ``last_hash``, and on a D-own node (never written through, so the
+        caller came here at all) that hash is the tree's bigram convention: the
+        chain met none of P's keys, the probe answered 0 with every page and
+        the end anchor in the store, TP0 entered the #580 vote with nothing
+        and the group recomputed the whole P leg tail on D.
         """
         if not token_ids:
             return 0
@@ -4216,6 +4228,9 @@ class HiCacheController:
             )
             if not page_hashes:
                 return 0
+            _k = min(len(page_keys), len(page_hashes)) if page_keys else 0
+            if _k > 0:
+                page_hashes = [str(k) for k in page_keys[:_k]] + list(page_hashes[_k:])
             extra_info = HiCacheStorageExtraInfo(
                 prefix_keys=list(prefix_keys) if prefix_keys else None
             )
