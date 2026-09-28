@@ -294,3 +294,43 @@ def test_a_failed_reference_ends_the_fill_list_before_the_fill():
     got, fills, _ = _controller(found, fill_ok={1, 3}, evicted={12})
     assert got == 2
     assert fills == [["s1"]]
+
+
+# --- BS (28.09.): a large single page (the 27B Mamba anchor blob) in pieces --
+
+
+def test_a_large_page_is_read_in_pieces_byte_exact(tmp_path):
+    from sglang.srt.mem_cache.storage.file.pageio import load
+
+    pio = load()
+    total = hs.L3_SPLIT_MIN_BYTES + 3 * hs.L3_SPLIT_CHUNK_BYTES + 12345   # not a chunk multiple
+    rng = np.random.default_rng(7)
+    data = rng.integers(0, 256, size=total, dtype=np.uint8)
+    good = tmp_path / "blob.bin"
+    good.write_bytes(data.tobytes())
+    short = tmp_path / "short.bin"
+    short.write_bytes(data[: total - 1].tobytes())
+    paths = [str(good), str(tmp_path / "missing.bin"), str(short)]
+    bufs = [np.zeros(total, dtype=np.uint8) for _ in paths]
+    rc, k = hs.l3_read_pages_parallel(pio, paths, total, [b.ctypes.data for b in bufs], threads=8)
+    assert k == 8
+    assert rc == [0, 1, 2]                      # ok / missing / size mismatch, per PAGE
+    assert np.array_equal(bufs[0], data)
+    # the serial call (threads=1) is the unchanged single read
+    ref = np.zeros(total, dtype=np.uint8)
+    rc1, k1 = hs.l3_read_pages_parallel(pio, [str(good)], total, [ref.ctypes.data], threads=1)
+    assert (rc1, k1) == ([0], 1) and np.array_equal(ref, data)
+
+
+def test_small_pages_keep_the_page_parallel_path(tmp_path, monkeypatch):
+    calls = []
+    real = hs._l3_read_split
+    monkeypatch.setattr(hs, "_l3_read_split", lambda *a, **k: calls.append(1) or real(*a, **k))
+    be, stems = _store(tmp_path, 100)
+    from sglang.srt.mem_cache.storage.file.pageio import load
+
+    pio = load()
+    b = np.zeros((100, PAGE), dtype=np.uint8)
+    rc, _k = hs.l3_read_pages_parallel(pio, [be._existing_path(s) for s in stems], PAGE,
+                                        [b[i].ctypes.data for i in range(100)], threads=16)
+    assert rc == [0] * 100 and calls == []
