@@ -324,6 +324,42 @@ def owner_token_runs(page_size: int, cp_split: int, lo: int, hi: int) -> tuple:
     return tuple(runs)
 
 
+@dataclasses.dataclass(frozen=True)
+class CanonicalAbstainWindow:
+    """#239 S4b (F13): the KV page of a rank that owns NO token rows.
+
+    Under the token cut the attention host usually owns share 0 (the optimum
+    at x1/x2, plan_s3 F4): its KV page slots are all written by the workers.
+    It still keys the store like every other rank (suffix-free, the canonical
+    page's width) and still reads and writes its mamba/QSA/draft windows, but
+    its KV reads and writes are no-ops. A distinct type rather than an empty
+    extent list, because an empty ``CanonicalExtentWindow`` is refused on
+    purpose (a rank with no bytes must not take part in the byte protocol) --
+    this one takes part in the KEY protocol only."""
+
+    total_bytes: int
+    label: str = "KV page (no token rows on this rank)"
+
+    @property
+    def payload_bytes(self) -> int:
+        return 0
+
+
+def kv_extents_for(kv_page: "CanonicalPageWindow", owner_rows: Optional[tuple]):
+    """#239 S4b (F13): the KV extent window this rank reads and writes.
+
+    ``owner_rows`` is ``(page_size, S, lo, hi)`` under the token cut (a paged
+    owner form), None otherwise -- then the stage/whole-page window as before.
+    A rank with ``hi == lo`` abstains (:class:`CanonicalAbstainWindow`)."""
+    if owner_rows is None:
+        return kv_page.as_extents()
+    page_size, cp_split, lo, hi = (int(x) for x in owner_rows)
+    runs = owner_token_runs(page_size, cp_split, lo, hi)
+    if not runs:
+        return CanonicalAbstainWindow(total_bytes=int(kv_page.spec.page_bytes))
+    return owner_row_window(kv_page, page_size, runs)
+
+
 def owner_row_window(
     window: "CanonicalPageWindow", page_size: int, runs: tuple
 ) -> CanonicalExtentWindow:
