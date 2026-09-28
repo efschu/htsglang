@@ -530,10 +530,13 @@ class StageForm:
     tokens: Tuple[int, ...]
     rows_on: int = 0
     max_by_seats: Tuple[int, ...] = ()
+    #: #251d (SGLANG_WEG2_D_KV_STAGE_BY_DEMAND): no table -- every stage is
+    #: open to every n, the wake's demand alone picks it (choose_form_stage)
+    by_demand: bool = False
 
     def max_stage(self, n: int) -> int:
         top = len(self.tokens) - 1
-        if not self.max_by_seats:
+        if self.by_demand or not self.max_by_seats:
             return top
         i = min(max(1, int(n)), len(self.max_by_seats)) - 1
         return max(0, min(top, int(self.max_by_seats[i])))
@@ -566,7 +569,15 @@ def stage_form(env: Optional[Dict[str, str]] = None) -> Optional[StageForm]:
         tokens=tokens,
         rows_on=max(0, int(envs.SGLANG_WEG2_D_KV_STAGE_ROWS.get() or 0)),
         max_by_seats=_ints(envs.SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS.get()),
+        by_demand=bool(envs.SGLANG_WEG2_D_KV_STAGE_BY_DEMAND.get()),
     )
+
+
+def form_seats_text(form: StageForm):
+    """The highest stage per seat count as the capture/stage lines name it."""
+    if form.by_demand:
+        return "by demand (every stage at every n)"
+    return list(form.max_by_seats) or "all"
 
 
 def choose_form_stage(form: StageForm, n: int, demand_tokens: Optional[int]) -> StageChoice:
@@ -648,7 +659,7 @@ def _capture_floor_table() -> Tuple[int, ...]:
             logger.info("%s CAPTURE-FLOOR rows ON per bs %s (stages %s, max_by_seats %s): the "
                         "captured decode steps count these seat/stage rows as ON",
                         STAGE_MARK, list(floors), list(ctl.form.tokens),
-                        list(ctl.form.max_by_seats) or "all")
+                        form_seats_text(ctl.form))
     _CAPTURE["floors"] = floors
     return floors
 
@@ -1585,7 +1596,10 @@ def on_wake(sched, recv_req, seats) -> Optional[PhaseState]:
         applied = ctl.apply(n_phys)
     logger.info("%s", phase_line(st, applied, ctl))
     if stage is not None:
-        logger.info("%s", stage_line(st, applied))
+        line = stage_line(st, applied)
+        if form.by_demand:
+            line += " form=demand"  # #251d: no table, the demand alone chose
+        logger.info("%s", line)
     return st
 
 

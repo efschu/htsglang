@@ -2567,6 +2567,12 @@ class Envs:
     SGLANG_WEG2_D_KV_STAGE_TOKENS = EnvStr("")
     SGLANG_WEG2_D_KV_STAGE_ROWS = EnvInt(0)
     SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS = EnvStr("")
+    # #251d: the stage follows the next wake's demand alone -- every stage is
+    #   open to every seat count (MAX_BY_SEATS is not read), the smallest one
+    #   holding the phase's KV tokens is taken. The captured waves are priced
+    #   for the lowest stage row count (the launcher raises the wave cap it
+    #   derived, or refuses a told one by name). Off = the table, byte-identical.
+    SGLANG_WEG2_D_KV_STAGE_BY_DEMAND = EnvBool(False)
     # #254: how a prefill forward that overflows the scratch region is split.
     #   "token"  (default) -- waves are disjoint TOKEN subsets; every wave
     #     re-fetches the spill experts its tokens need, so a spill expert is
