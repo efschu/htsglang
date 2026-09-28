@@ -154,6 +154,12 @@ class CanonicalExtentWindow:
     total_bytes: int
     extents: tuple[tuple[int, int], ...]
     label: str = "page"
+    #: #239 S4b (F13): the caller's buffer is the WHOLE page and each extent is
+    #: taken from (write) / put at (read) the same offset in it, instead of the
+    #: extents being packed front to back. The owner-row window of a token-cut
+    #: rank is this shape: its flat host page has the canonical layout (every
+    #: attention layer, full kv heads) but only its own token rows are valid.
+    identity: bool = False
 
     def __post_init__(self) -> None:
         if int(self.total_bytes) <= 0:
@@ -187,7 +193,24 @@ class CanonicalExtentWindow:
 
     @property
     def payload_bytes(self) -> int:
+        """Bytes this rank writes (and reads) -- what the store charges."""
         return sum(int(length) for _off, length in self.extents)
+
+    @property
+    def buffer_bytes(self) -> int:
+        """Bytes of the caller's buffer: the payload, or the whole page for an
+        identity-addressed window."""
+        return int(self.total_bytes) if self.identity else self.payload_bytes
+
+    def buffer_offsets(self) -> tuple[int, ...]:
+        """Where each extent sits in the caller's buffer, in extent order."""
+        if self.identity:
+            return tuple(int(off) for off, _length in self.extents)
+        out, taken = [], 0
+        for _off, length in self.extents:
+            out.append(taken)
+            taken += int(length)
+        return tuple(out)
 
     @property
     def is_whole(self) -> bool:
@@ -268,6 +291,82 @@ class CanonicalPageWindow:
             ),
             label="KV page",
         )
+
+
+def owner_token_runs(page_size: int, cp_split: int, lo: int, hi: int) -> tuple:
+    """#239 S4b (F13): the token rows of one page a DCP owner range holds.
+
+    The owner rule gives global slot ``L`` to the rank with ``L % S`` in
+    ``[lo, hi)``. Pages are allocated page-aligned, so when ``S`` divides the
+    page the owned offsets are the SAME in every page -- ``page_size // S``
+    runs ``[k*S + lo, k*S + hi)`` -- and a page file can carry them as a
+    fixed extent list. A split that does not divide the page would give every
+    page a different cut: refused by name (the launcher puts the token vector
+    on the 64-token grid, so this never binds on the planned forms)."""
+    page_size, cp_split, lo, hi = int(page_size), int(cp_split), int(lo), int(hi)
+    if page_size <= 0 or cp_split <= 0 or page_size % cp_split:
+        raise CanonicalPageError(
+            f"#239 F13: owner split S={cp_split} does not divide the {page_size}-"
+            "token page; the owned rows would differ from page to page and one "
+            "key would name different bytes on every rank."
+        )
+    if not 0 <= lo <= hi <= cp_split:
+        raise CanonicalPageError(f"#239 F13: owner range [{lo}, {hi}) outside S={cp_split}.")
+    if hi == lo:
+        return ()
+    runs = []
+    for k in range(page_size // cp_split):
+        a, b = k * cp_split + lo, k * cp_split + hi
+        if runs and runs[-1][1] == a:
+            runs[-1] = (runs[-1][0], b)
+        else:
+            runs.append((a, b))
+    return tuple(runs)
+
+
+def owner_row_window(
+    window: "CanonicalPageWindow", page_size: int, runs: tuple
+) -> CanonicalExtentWindow:
+    """#239 S4b (F13): the byte extents of ``runs`` (token rows of a page) in
+    every slot of a WHOLE-page window, identity-addressed.
+
+    A token-cut rank holds every full-attention layer with the full kv heads
+    (replicated heads, token-sharded), so its flat host page has the canonical
+    K/V-major layout -- ``[K: slot][token][head][dim] | [V: ...]`` -- and only
+    its own token rows are valid. Its window is those rows in every slot of
+    both halves, at the same offsets in the file and in its buffer. The owners
+    together cover every byte, so the page completes (and becomes readable)
+    exactly when the last owner has written."""
+    if not window.is_whole_page:
+        raise CanonicalPageError(
+            "#239 F13: an owner-row window needs the whole page (every attention "
+            f"layer); this rank holds slots [{window.first_slot}, "
+            f"{window.first_slot + window.num_slots})."
+        )
+    if not runs:
+        raise CanonicalPageError(
+            "#239 F13: a rank that owns no token rows has no KV page window; it "
+            "must not take part in the KV page protocol."
+        )
+    spec = window.spec
+    half = int(spec.half_cell_bytes)
+    page_size = int(page_size)
+    if page_size <= 0 or half % page_size:
+        raise CanonicalPageError(
+            f"#239 F13: a {half}-byte half cell is not {page_size} token rows."
+        )
+    row = half // page_size
+    extents = []
+    for base in (0, int(spec.half_page_bytes)):
+        for slot in window.slots:
+            for a, b in runs:
+                extents.append((base + int(slot) * half + int(a) * row, (int(b) - int(a)) * row))
+    return CanonicalExtentWindow(
+        total_bytes=spec.page_bytes,
+        extents=_merge_sequential(extents),
+        label="KV page (owner rows)",
+        identity=True,
+    )
 
 
 def window_for_layers(
@@ -1254,9 +1353,9 @@ def write_extents(
     a file a reader is using.
     """
     data = _as_bytes(payload)
-    if data.nbytes != window.payload_bytes:
+    if data.nbytes != window.buffer_bytes:
         raise CanonicalPageError(
-            f"this {window.label} window expects {window.payload_bytes} bytes "
+            f"this {window.label} window expects {window.buffer_bytes} bytes "
             f"across {len(window.extents)} extent(s), got {data.nbytes}. A rank "
             "whose shard size differs from the canonical form is not writing "
             "that form -- refusing rather than padding."
@@ -1308,10 +1407,8 @@ def write_extents(
             # Full width from creation: every writer addresses absolute offsets,
             # so the file cannot grow into its own layout.
             os.ftruncate(fd, window.total_bytes)
-        taken = 0
-        for off, length in window.extents:
-            os.pwrite(fd, data[taken : taken + length], off)
-            taken += length
+        for (off, length), src in zip(window.extents, window.buffer_offsets()):
+            os.pwrite(fd, data[src : src + length], off)
         # Re-writing bytes this rank already wrote is legitimate (a crashed run
         # resumes; the bytes are content-addressed and identical), which is why
         # coverage is a union rather than a strict claim.
@@ -1381,7 +1478,7 @@ def read_extents(
     another stage's layers (or a GDN blob missing another rank's channels) is a
     prefix nobody can continue from.
     """
-    expected = window.payload_bytes
+    expected = window.buffer_bytes
     buf = _as_bytes(out)
     if buf.nbytes != expected:
         raise CanonicalPageError(
@@ -1404,8 +1501,7 @@ def read_extents(
                 window.total_bytes,
             )
             return False
-        taken = 0
-        for off, length in window.extents:
+        for (off, length), taken in zip(window.extents, window.buffer_offsets()):
             got = 0
             while got < length:
                 # preadv lands the bytes in the caller's buffer directly; the
@@ -1425,7 +1521,6 @@ def read_extents(
                     off,
                 )
                 return False
-            taken += length
     finally:
         os.close(fd)
     return True
