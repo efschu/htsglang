@@ -339,3 +339,48 @@ def test_a_form_the_pages_cannot_fund_is_refused_by_name(caplog):
         # the controller refused the form by name (a missing piece names itself)
         assert r.sched._weg2_d_seat_vram is False
         assert any("cannot fund" in m for m in caplog.messages)
+
+
+# ---- (6) the capture floor over the rank's own cells ------------------------------
+
+def test_the_capture_floor_comes_from_the_ranks_cells_and_workers_have_none():
+    tms = FakeTms()
+    with _armed(tms, max_by="2,1"), mock.patch.dict(dsv._CAPTURE, {"runner": None,
+                                                                     "floors": None}):
+        r = _rank(tms)
+        runner = r.sched.tp_worker.model_runner
+        runner.server_args = r.sched.server_args
+        dsv.note_capture_context(runner)
+        ctl = dsv.SeatVram.from_runtime(cap=2, req_to_token_pool=runner.req_to_token_pool,
+                                        model=runner.model)
+        want = dsv.capture_floors(ctl.form, ctl.cells, 2)
+        assert want[0] == min(ctl.cells[(1, 2)].extra_rows, ctl.cells[(2, 1)].extra_rows)
+        assert want[1] == ctl.cells[(2, 1)].extra_rows
+        # 4 verify tokens x top-2 per seat: 8 ids = bs1, 16 ids = bs2, past the cap: 0
+        assert dsv.capture_floor_rows(8, 8) == want[0]
+        assert dsv.capture_floor_rows(16, 8) == want[1]
+        assert dsv.capture_floor_rows(24, 8) == 0
+    with _armed(FakeTms()), mock.patch.dict(dsv._CAPTURE, {"runner": None, "floors": None}):
+        w = _rank(FakeTms(), pages=False)
+        runner = w.sched.tp_worker.model_runner
+        runner.server_args = w.sched.server_args
+        dsv.note_capture_context(runner)
+        assert dsv.capture_floor_rows(8, 8) == 0
+
+
+def test_pages_held_above_the_forms_stage_stop_the_wake_by_name():
+    tms = FakeTms()
+    with _armed(tms, max_by="2,0"):
+        r = _rank(tms)
+        for p in list(tms.allocs):
+            tms.pause(p)
+        dsv._engage_kv_cap(r.kv_alloc, 192, PAGE)
+        held = r.kv_alloc.alloc(9 * PAGE)  # pages up to 9 > S1's 8: only S2 maps them
+        assert held is not None and dsv.max_live_page(r.kv_alloc) == 9
+        wake = types.SimpleNamespace(epoch="e1", handoff_n=2, parked_n=0, phase_kv_tokens=40)
+        with pytest.raises(dsv.Weg2DSeatVramRefused, match="above the S0 the form allows 2"):
+            dsv.on_wake(r.sched, wake, _seats(2))
+        # one seat may take S2: the same pages are fine there
+        st = dsv.on_wake(r.sched, types.SimpleNamespace(
+            epoch="e2", handoff_n=1, parked_n=0, phase_kv_tokens=40), _seats(1))
+        assert st.stage == 2

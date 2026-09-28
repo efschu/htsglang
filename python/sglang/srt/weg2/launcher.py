@@ -2558,6 +2558,114 @@ def apply_d_seat_expert_rows(ns, er, rows, seat_vram, label) -> List[str]:
             % (head, item, fixed_txt)]
 
 
+#: #251c: the --env-d keys of D's KV stage form (the launcher's form values)
+D_KV_STAGE_KEYS = ("SGLANG_WEG2_D_KV_STAGE_TOKENS", "SGLANG_WEG2_D_KV_STAGE_ROWS",
+                   "SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS")
+
+
+def _drop_group_env(spec: str, key: str) -> str:
+    return ";".join(x for x in str(spec or "").split(";")
+                    if x.strip() and x.split("=", 1)[0].strip() != key)
+
+
+def _rank_vec(raw: Optional[str], n: int) -> List[int]:
+    vals = [int(float(x)) for x in str(raw or "").split(",") if x.strip()]
+    if len(vals) == 1:
+        vals = vals * n
+    return (vals + [0] * n)[:n] if vals else [0] * n
+
+
+def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens: int,
+                          top_k: int, host_rank: int = 0) -> List[str]:
+    """#251c: D's KV stage form into --env-d (before build_env reads it) --
+    the stage tokens, the stage rows (TP0 moves them from its scratch into its
+    seat rows: SGLANG_MOE_SCRATCH_SLOTS[0] - rows, SGLANG_WEG2_D_SEAT_EXPERT_ROWS
+    [0] + rows, so the boot maps the same bank) and the highest stage per seat
+    count (``expert_residency.kv_stage_table``, default: no extra wave).
+    An operator's SGLANG_WEG2_D_KV_STAGE_TOKENS wins (a single stage = off).
+    Returns the lines to log; ``d_kv_stage_undo`` reverses it for a second
+    solve pass."""
+    head = "%s FRACTION-SOLVE %s D-KV-STUFEN (#251c)" % (D_RANK_SOLVE_MARKER, label)
+    env_raw = str(getattr(ns, "env_d", "") or "")
+    env = parse_group_env(env_raw)
+    if D_KV_STAGE_KEYS[0] in env:
+        return ["%s: --env-d nennt %s=%s selbst -- keine Stufenform vom Launcher"
+                % (head, D_KV_STAGE_KEYS[0], env[D_KV_STAGE_KEYS[0]])]
+    fits = list(getattr(plan, "fits", None) or ())
+    host = next((f for f in fits if f.rank == host_rank), None)
+    tab = None if host is None else er.kv_stage_table(
+        rows, seat_vram, kv_cell_bytes=int(host.kv_cell_bytes), kv_tokens=int(host.kv_tokens),
+        local_experts=int(host.local_experts), verify_tokens=int(verify_tokens),
+        top_k=int(top_k), host_rank=host_rank, staging_rows=int(host.staging_rows))
+    if tab is None:
+        return ["%s: entfaellt (keine KV-Zelle/Scratch-Geometrie auf dem Attention-Host)" % head]
+    n = len(rows[-1].scratch_given)
+    scratch = _rank_vec(env.get("SGLANG_MOE_SCRATCH_SLOTS"), n)
+    seat_raw = env.get("SGLANG_WEG2_D_SEAT_EXPERT_ROWS")
+    seat = _rank_vec(seat_raw, n)
+    scratch[host_rank] -= tab.rows
+    seat[host_rank] += tab.rows
+    items = {
+        "SGLANG_MOE_SCRATCH_SLOTS": ",".join(str(x) for x in scratch),
+        "SGLANG_WEG2_D_SEAT_EXPERT_ROWS": ",".join(str(x) for x in seat),
+        D_KV_STAGE_KEYS[0]: ",".join(str(t) for t in tab.tokens),
+        D_KV_STAGE_KEYS[1]: str(tab.rows),
+        D_KV_STAGE_KEYS[2]: ",".join(str(j) for j in tab.max_by_seats),
+    }
+    for k, v in items.items():
+        env_raw = set_group_env(env_raw, k, v)
+    ns.env_d = env_raw
+    ns._d_kv_stage_written = {"host": host_rank, "rows": tab.rows, "seat_raw": seat_raw}
+    caps = " ".join("n=%d:%s" % (i + 1, "/".join(str(c) for c in cs))
+                    for i, cs in enumerate(tab.capacity))
+    # the A/B candidate (main 28.09.): S1 wherever the default keeps S0 -- the
+    # waves it adds per bs, priced by the capture floor (not written)
+    cand = tuple(max(1, int(j)) if len(tab.tokens) > 1 else 0 for j in tab.max_by_seats)
+    cand_extra = tab.extra_waves(cand)
+    return [
+        "%s: --env-d %s (Stufen %s Tok, KV-Zelle %d B/Tok, Stufenzeile %.1f MiB: "
+        "S1..S%d nehmen %s Zeilen; TP0 Scratch %d -> %d, Sitzzeilen %s -> %s -- die "
+        "Stufenzeilen sind in S0 LRU-Zeilen, der Boot mappt dieselbe Bank)"
+        % (head, ";".join("%s=%s" % kv for kv in items.items()), list(tab.tokens),
+           tab.kv_cell_bytes, tab.row_mib, len(tab.tokens) - 1, list(tab.stage_rows[1:]),
+           tab.scratch, tab.scratch - tab.rows, seat_raw or "0",
+           items["SGLANG_WEG2_D_SEAT_EXPERT_ROWS"]),
+        "%s: hoechste Stufe je Sitzzahl %s (Voreinstellung ohne Zusatzwelle -- Variante B, "
+        "bis die Wellenmessung eine Zusatzwelle preist); Zeilen je (n, S0/S1/S2) %s gegen "
+        "den Bedarf %s; der Capture zaehlt je bs die wenigsten Zeilen, die eine erlaubte "
+        "Phase hat (#251 CAPTURE-FLOOR)" % (head, list(tab.max_by_seats), caps, list(tab.need)),
+        "%s: A/B-Kandidat Zwischenform (S1 bis zur Kappe) SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS=%s "
+        "-- Zusatzwellen je bs %s (Default: %s); nicht geschrieben, fuer --env-d im A/B"
+        % (head, ",".join(str(j) for j in cand), list(cand_extra),
+           list(tab.extra_waves(tab.max_by_seats))),
+    ]
+
+
+def d_kv_stage_undo(ns) -> None:
+    """#251c: take back this launcher's own stage form (a second solve pass
+    prices the bank as priced and writes the form again)."""
+    w = getattr(ns, "_d_kv_stage_written", None)
+    if not w:
+        return
+    env_raw = str(getattr(ns, "env_d", "") or "")
+    env = parse_group_env(env_raw)
+    h, rows_ = int(w["host"]), int(w["rows"])
+    scratch = [int(float(x)) for x in env.get("SGLANG_MOE_SCRATCH_SLOTS", "").split(",")
+               if x.strip()]
+    if h < len(scratch):
+        scratch[h] += rows_
+        env_raw = set_group_env(env_raw, "SGLANG_MOE_SCRATCH_SLOTS",
+                                ",".join(str(x) for x in scratch))
+    if w.get("seat_raw") is None:
+        env_raw = _drop_group_env(env_raw, "SGLANG_WEG2_D_SEAT_EXPERT_ROWS")
+    else:
+        env_raw = set_group_env(env_raw, "SGLANG_WEG2_D_SEAT_EXPERT_ROWS", str(w["seat_raw"]))
+    for k in D_KV_STAGE_KEYS:
+        env_raw = _drop_group_env(env_raw, k)
+    ns.env_d = env_raw
+    ns._d_kv_stage_written = None
+
+
 def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
     """H95: the D-FRACTION-SOLVE once per seat count n = 1..seats (the SAME
     ``plan_d_residency`` with ``seats=n`` -- seat_rebook re-books the posts;
@@ -2583,10 +2691,14 @@ def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
         if top_k <= 0:
             return []
 
+        plans = {}
+
         def plan_for(n):
-            return er.plan_d_residency(
-                **plan_kwargs, seats=n,
-                replayssm_spec=msgspec.structs.replace(form, max_running=n))
+            if n not in plans:
+                plans[n] = er.plan_d_residency(
+                    **plan_kwargs, seats=n,
+                    replayssm_spec=msgspec.structs.replace(form, max_running=n))
+            return plans[n]
 
         seat_vram = d_seat_vram_plan_form(ns, er, plan_kwargs, cfg, form)
         rows = er.seat_table(
@@ -2595,6 +2707,9 @@ def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
         out = list(er.describe_seat_table(rows, marker=D_RANK_SOLVE_MARKER, label=label))
         if seat_vram is not None:
             out.extend(apply_d_seat_expert_rows(ns, er, rows, seat_vram, label))
+            out.extend(apply_d_kv_stage_form(
+                ns, er, rows, seat_vram, plan_for(int(seats)), label,
+                verify_tokens=int(form.draft_tokens), top_k=top_k))
         return out
     except Exception as exc:  # noqa: BLE001 -- an informational table never kills a launch
         return ["%s FRACTION-SOLVE %s D-SITZE (H95) Tabelle entfaellt: %s: %s"
@@ -15182,6 +15297,9 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     """
     from sglang.srt.planner import pp_cut as _pp_cut
 
+    # #251c: a second pass (dry-run expectation, then the real budgets) prices
+    # the bank as priced, not as the first pass's stage form re-split it
+    d_kv_stage_undo(ns)
     n = len(list(budgets_d))
     fehlend: List[str] = []
 

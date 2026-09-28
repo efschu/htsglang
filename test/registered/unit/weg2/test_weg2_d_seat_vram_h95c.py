@@ -848,8 +848,12 @@ def test_dry_run_of_the_x177_form_writes_the_rows_into_env_d():
         lines = L.d_seat_table_lines(ns, er, kw, "D")
     assert any("H95c Laufzeit-Zeilen [133, 140, 141]" in ln for ln in lines if "n=1:" in ln)
     assert any("H95c Laufzeit-Zeilen [120, 140, 141]" in ln for ln in lines if "n=6:" in ln)
-    assert L.parse_group_env(ns.env_d)["SGLANG_WEG2_D_SEAT_EXPERT_ROWS"] == "14,0,0"
-    assert L.parse_group_env(ns.env_d)["SGLANG_OPT_WEG2_D_SEAT_VRAM"] == "1"
+    # #251c: the KV stage form adds its stage rows to TP0's seat rows (and
+    # takes them from its scratch) -- the H95c seat rows themselves are 14
+    env = L.parse_group_env(ns.env_d)
+    stage = int(env.get("SGLANG_WEG2_D_KV_STAGE_ROWS", "0"))
+    assert env["SGLANG_WEG2_D_SEAT_EXPERT_ROWS"] == "%d,0,0" % (14 + stage)
+    assert env["SGLANG_OPT_WEG2_D_SEAT_VRAM"] == "1"
 
 
 def test_the_launcher_default_and_an_operators_word():
