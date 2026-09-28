@@ -611,6 +611,11 @@ class Envs:
     # the ZFS pool instead of the told store disk. A dry run only warns.
     # Empty = no filesystem is refused.
     SGLANG_WEG2_STORE_REFUSE_FS = EnvTuple(("overlay", "zfs"))
+    # RANK_STATE_DIR (IPC Phase 1, user 28.09. "über logfiles?"): the
+    # directory each rank writes its versioned RankState record into
+    # (weg2/rank_state.py). Set by the weg2 launcher per group, next to the
+    # group log; unset = no record is written (a boot outside the launcher).
+    SGLANG_WEG2_RANK_STATE_DIR = EnvStr(None)
     # IDLE_VOTE_FRESHNESS (fnFL2 H77, #1268): PP0 reads a landed idle lap as
     # the PP group's /flush_cache verdict only while the state it witnessed
     # holds -- the lap of PP0's latest stamp, PP0 neither asleep nor busy

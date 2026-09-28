@@ -85,6 +85,7 @@ from sglang.srt.weg2 import (
     DEFAULT_PP_ORDERED_CUT,
 )
 from sglang.srt.weg2 import admin_key as admin_key_mod
+from sglang.srt.weg2 import rank_state as rank_state_mod
 # WEG2-FORM (24.09.): the boot's form axes -- ONE resolver, ONE line, ONE env.
 from sglang.srt.weg2 import form as weg2_form
 
@@ -11618,6 +11619,33 @@ def d_kv_worker_ranks(extra_d: str) -> List[int]:
         return []
 
 
+def canonical_state_gate(spec: GroupSpec, expected: int, log: Log) -> None:
+    """IPC Phase 1: the launcher half of W7/W10 decided on the ranks'
+    RankState records (weg2/rank_state.py), not on counted log lines.
+
+    rc12z29d (28.09. 20:29Z) booted D clean and was refused as 'kv x1 blob
+    x1': under the uneven-DCP cut the Form A workers print '#239 F14
+    KV-WORKER-WINDOW' and the count knew only the older worker line. The log
+    count still runs beside the records and a disagreement is REPORTED
+    ('IPC MISMATCH'), but it no longer decides."""
+    state_dir = rank_state_mod.rank_state_dir_for_log(spec.log)
+    states, bad = rank_state_mod.read_group_states(state_dir)
+    verdict = rank_state_mod.grade_canonical(states, expected, group=spec.name)
+    for b in bad:
+        verdict.ok = False
+        verdict.reasons.append(f"unreadable record {b}")
+    log(f"W7/W10 launcher half, group {spec.name} RankState ({state_dir}): {verdict.line()}")
+    n_kv, n_blob, n_worker = canonical_marker_counts(spec.log)
+    if (n_kv, n_blob) != (verdict.n_kv, verdict.n_blob):
+        log(f"IPC MISMATCH W7/W10 group {spec.name}: log count kv x{n_kv} blob x{n_blob} "
+            f"(worker lines x{n_worker}) vs RankState kv x{verdict.n_kv} blob x{verdict.n_blob} "
+            f"-- the records decide, the log count is reported only")
+    if not verdict.ok:
+        raise Weg2LaunchRefused(
+            f"W7 Weg2MambaBlobAbsent / W10 Weg2CanonicalPageMissing (launcher half, RankState): "
+            f"group {spec.name} {verdict.line()}")
+
+
 def count_marker(path: str, marker: str) -> int:
     n = 0
     try:
@@ -11643,6 +11671,13 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
         shlex.quote(a) for a in admin_key_mod.redact_argv(spec.argv)))
     if dry:
         return
+    # IPC Phase 1: the ranks write their RankState next to the group log;
+    # records of an earlier launch into the same log path are removed first,
+    # so a record the launcher grades is always THIS launch's.
+    _rs_dir = rank_state_mod.rank_state_dir_for_log(spec.log)
+    _rs_old = rank_state_mod.clear_rank_state_dir(_rs_dir)
+    spec.env[rank_state_mod.RANK_STATE_ENV] = _rs_dir
+    log(f"group {spec.name} rank state -> {_rs_dir}" + (f" ({_rs_old} record(s) of an earlier launch removed)" if _rs_old else ""))
     fh = open(spec.log, "ab")
     _logged_argv = ' '.join(shlex.quote(a) for a in admin_key_mod.redact_argv(spec.argv))
     fh.write(f"=== WEG2 group {spec.name} launched {_now()} ===\nargv: {_logged_argv}\n".encode())
@@ -23088,11 +23123,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "this arm runs under prints neither marker. P's own health check "
             "already confirmed it booted clean to READY.")
     else:
-        n_kv = count_marker(spec_p.log, "#706 canonical KV page active")
-        n_blob = count_marker(spec_p.log, "canonical GDN blob active")
-        log(f"W7/W10 launcher half, group P log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob} (need >= 3 each: three ranks)")
-        if n_kv < 3 or n_blob < 3:
-            raise Weg2LaunchRefused(f"W7 Weg2MambaBlobAbsent / W10 Weg2CanonicalPageMissing (launcher half): P logged kv x{n_kv} blob x{n_blob}, need 3 each")
+        canonical_state_gate(spec_p, 3, log)
 
     # 4d. sleep P, measure D_c(P) -- and, fix 8, P's DORMANT HOST IMAGE.
     # This is the one sleep on this box that is NOT interleaved: group D does
@@ -23205,22 +23236,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "never builds either (enable_hierarchical_cache is False) -- no "
             "canonical-page/GDN-blob emitter to grade, same as group P above.")
     else:
-        n_kv, n_blob, n_worker = canonical_marker_counts(spec_d.log)
-        log(f"W7/W10 launcher half, group D log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob}"
-            + (f" (of which {n_worker} Form A worker line(s): no-window/null tier -- fnFL2 v18 -- or F14 KV window, no GDN blob -- #239)" if n_worker else ""))
-        if n_kv < 3 or n_blob < 3:
-            raise Weg2LaunchRefused(f"W7/W10 (launcher half): D logged kv x{n_kv} blob x{n_blob}, need 3 each")
-        # #239 F14: a worker that OWNS token rows must have built its KV
-        # window -- its no-window line would pass the count above while its
-        # rows ride no canonical page. The riegel's point, kept under the cut.
-        _kv_workers = d_kv_worker_ranks(getattr(ns, "extra_d", "") or "")
-        _n_f14 = count_marker(spec_d.log, FORM_A_KV_WORKER_CANONICAL_MARKER)
-        if _n_f14 < len(_kv_workers):
-            raise Weg2LaunchRefused(
-                f"W7/W10 (launcher half): D workers {_kv_workers} own token rows under "
-                f"the cut but only {_n_f14} logged a canonical KV window "
-                f"('{FORM_A_KV_WORKER_CANONICAL_MARKER}') -- a rank holds KV without "
-                f"a canonical page")
+        canonical_state_gate(spec_d, 3, log)
     # #1233 zero-remainder (1j finding 6): W9 LAUNCH-TIME KEY-SCHEME GATE. The
     # store is one carrier; a spec-less group keys pages by unigram unless
     # SGLANG_HICACHE_BIGRAM_KEYS=1 forced the bigram scheme, a NEXTN/EAGLE
@@ -23811,9 +23827,16 @@ def state_path(state: BootState) -> str:
 
 
 def _write_state(state: BootState) -> None:
+    # IPC (27B requirement 8, 28.09.): atomic -- a reader (teardown, the
+    # arms, a watcher) must never see a half-written boot file.
     os.makedirs(_operator_dir(GPU_ARB), exist_ok=True)
-    with open(state_path(state), "w") as f:
+    path = state_path(state)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
         json.dump(state.__dict__, f, indent=1, default=str)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 #: #1248: first W-code substring in a refusal message, for the one-line
