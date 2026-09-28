@@ -1651,6 +1651,10 @@ class Weg2ParkRunningReqOutput(BaseReq, kw_only=True):
     #: flight) is held behind it until the sleep -- the front counts its
     #: in-flight hand-offs as parked. False = the pre-H91c3 answer.
     late_hold: bool = False
+    #: #59b: {rid: the group-uniform depth each parked request resumes from}
+    #: (weg2_resumable_depth.park_depths); empty = nothing named, and the
+    #: front keeps its old price.
+    weg2_resumable_depth: Dict[str, int] = {}
 
 
 class PlePrefetchHintReqInput(BaseReq, kw_only=True):
