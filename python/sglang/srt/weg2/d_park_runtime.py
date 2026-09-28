@@ -49,6 +49,10 @@ def parked_list(sched) -> list:
 #: (hold_parked) or by the awake re-queue (park_tick).
 LATE_HOLD_ATTR = "_weg2_d_park_late_since"
 
+#: PARK-SETTLE (28.09.): a #1471 post-wake settle request the park folded into
+#: its list; an awake re-queue gives it back to the settle, not to the queue.
+FROM_SETTLE_ATTR = "_weg2_park_from_settle"
+
 
 def rearm_window_draft_cold(sched, reqs) -> int:
     """27B PARK (DFlash2): a flip-parked request on a SLOT-MAPPED draft pool
@@ -180,7 +184,25 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
             logger.info("WEG2-D-PARK RETAINED rid=%s %s", str(req.rid)[:12], d_park_read.describe(req))
     queued = list(sched.waiting_queue)
     sched.waiting_queue = []
-    sched.weg2_d_parked = d_seats.order_waiting(list(parked) + list(retracted) + queued)
+    # PARK-SETTLE (28.09., 27B park boot 27.09. 10:24:34, rid weg2-58-201): a
+    # #1471 post-wake settle request (its store read was still short at the
+    # wake) is D work that joins the queue by itself the moment its re-read
+    # completes -- it did 1 s after the park (#988 LOADBACK 10:24:35) and was
+    # decoded to its end while the front's D->P drain waited for it. And
+    # because a pending settle also withdrew the late hold, a hand-off still in
+    # the pipe (weg2-68-220) was admitted and decoded too: the park was
+    # PARTIAL, the flip stalled, the parked ones lapsed (30 s) and ran to their
+    # end as well -- the over-X request that fired the park waited 171 s. The
+    # park takes the settle into its list as held work (no park site): the
+    # sleep holds it, the wake's #1471 verdict reads it again; an awake
+    # re-queue gives it back to the settle (park_tick). Replicated: the settle
+    # list is built and shrunk by group-MIN verdicts only.
+    settle = list(getattr(sched, "weg2_post_wake_settle", None) or [])
+    if settle:
+        sched.weg2_post_wake_settle = []
+        for req in settle:
+            setattr(req, FROM_SETTLE_ATTR, True)
+    sched.weg2_d_parked = d_seats.order_waiting(list(parked) + list(retracted) + settle + queued)
     # #248: every parked request is kept by ORDER over the flip -- the
     # sleep's reset gives its references back, the hold reads it at the wake
     try:
@@ -199,12 +221,9 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     for req in sched.weg2_d_parked:
         setattr(req, d_seats.SINCE_ATTR, now)
     sched._weg2_d_park_slept = False
-    # A #1471 post-wake settle still pending releases straight into the queue
-    # (not through the intake): D would run it while the front, told
-    # late_hold, counted it parked -- promise nothing then (the front drains
-    # as before). The settle bound (20 s) lies far below the wait bound, so
-    # this is the rare case.
-    late_hold = bool(late_hold_armed) and not getattr(sched, "weg2_post_wake_settle", None)
+    # PARK-SETTLE: the settle is in the park list now (above), so nothing
+    # releases into the queue behind the park's back -- the late hold holds.
+    late_hold = bool(late_hold_armed)
     setattr(sched, LATE_HOLD_ATTR, now if late_hold else None)
     rids = [str(r.rid) for r in sched.weg2_d_parked if d_seats.park_site(r) is not None]
     held = [str(r.rid) for r in sched.weg2_d_parked if d_seats.park_site(r) is None]
@@ -217,10 +236,10 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     )
     logger.info(
         "WEG2-D-PARK park_running epoch=%d reason=%s: %d running retracted (span retained, "
-        "forced host write-through), parked=%s queued-behind=%s late_hold=%s -- the sleep "
-        "holds them first, the wake resumes oldest first%s",
+        "forced host write-through), parked=%s queued-behind=%s settle-folded=%s late_hold=%s -- "
+        "the sleep holds them first, the wake resumes oldest first%s",
         epoch, reason, len(retracted), [r[:12] for r in rids], [r[:12] for r in held],
-        late_hold,
+        [str(r.rid)[:12] for r in settle], late_hold,
         (" (DFlash window draft: %d resume(s) re-armed like a fresh hand-off)" % rearmed
          if rearmed else ""),
     )
@@ -269,6 +288,9 @@ def hold_parked(sched, *, hold_armed: bool) -> int:
         return 0
     sched.weg2_d_parked = []
     for req in parked:
+        # PARK-SETTLE: held over the sleep, a folded settle request is hold work
+        # like the rest -- the wake's #1471 verdict reads it again.
+        setattr(req, FROM_SETTLE_ATTR, False)
         sched._add_request_to_queue(req, is_retracted=True)
     hold = getattr(sched, "weg2_dormant_hold", None)
     if hold is None:
@@ -311,12 +333,27 @@ def park_tick(sched) -> int:
     sched.weg2_d_parked = []
     sched._weg2_d_park_slept = False
     setattr(sched, LATE_HOLD_ATTR, None)  # H91c3-2: the re-queue closes the late hold
+    # PARK-SETTLE: a folded settle request goes back to the settle (its read is
+    # still short; the queue would hand it to the X gate unsettled).
+    back = [r for r in moved if getattr(r, FROM_SETTLE_ATTR, False)]
+    moved = [r for r in moved if not getattr(r, FROM_SETTLE_ATTR, False)]
+    if back:
+        now = time.monotonic()
+        settle = getattr(sched, "weg2_post_wake_settle", None)
+        if settle is None:
+            settle = sched.weg2_post_wake_settle = []
+        for req in back:
+            setattr(req, FROM_SETTLE_ATTR, False)
+            req._1471_since = now
+            settle.append(req)
     for req in moved:
         sched._add_request_to_queue(req, is_retracted=True)
     mine = _to_queue_head(sched, moved)
-    logger.info("WEG2-D-PARK requeue (awake): %d parked request(s) at the queue head %s",
-                len(mine), [str(r.rid)[:12] for r in mine])
-    return len(mine)
+    logger.info("WEG2-D-PARK requeue (awake): %d parked request(s) at the queue head %s%s",
+                len(mine), [str(r.rid)[:12] for r in mine],
+                (", %d back to the #1471 settle %s" % (len(back), [str(r.rid)[:12] for r in back]))
+                if back else "")
+    return len(mine) + len(back)
 
 
 def note_retracted(sched, retracted_reqs) -> int:

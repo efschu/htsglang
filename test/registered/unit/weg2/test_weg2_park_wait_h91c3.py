@@ -30,6 +30,7 @@ import asyncio
 import os
 import sys
 import time
+import types
 from typing import Dict
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
@@ -231,15 +232,68 @@ def test_h91c3_2_without_the_dormant_hold_d_neither_holds_nor_promises(clock):
     assert s.waiting_queue == [late]
 
 
-def test_h91c3_2_a_pending_post_wake_settle_withdraws_the_promise(clock):
-    """#1471 settle releases straight into the queue, not through the intake:
-    with one pending D promises nothing (the front drains as before)."""
+def test_h91c3_2_a_pending_post_wake_settle_is_parked_and_the_promise_holds(clock):
+    """PARK-SETTLE (28.09., park boot 27.09. 10:24:34): a pending #1471 settle
+    request is D work too -- the park takes it into its list as held work and
+    the late hold stays armed (before: late_hold False, the settle request and
+    a late hand-off ran to their end while the D->P drain waited)."""
     s = _IntakeSched(running=[_req("a", 1)])
     s.weg2_post_wake_settle = [_req("settling", 2)]
     out = _park_late(s)
-    assert out.late_hold is False
+    assert out.late_hold is True
+    assert out.parked == ["a"] and out.held == ["settling"]
+    assert s.weg2_post_wake_settle == []
     s._add_request_to_queue(_req("late", 3))
-    assert [r.rid for r in s.waiting_queue] == ["late"]
+    assert s.waiting_queue == []
+    assert [r.rid for r in s.weg2_d_parked] == ["a", "settling", "late"]
+
+
+def test_park_settle_the_10_24_34_constellation(clock):
+    """The exact shape of 27.09. 10:24:34 (epoch 68): four decodes running
+    (weg2-52-173, -60-212, -60-210, -67-218), one request in the #1471 settle
+    (weg2-58-201, read short at the wake), one d_direct hand-off in the pipe
+    (weg2-68-220, reaches D after the park). Red on 70136e1942: parked 4,
+    late_hold False, the settle and the late one joined D's queue and the
+    front counted them still running. Green: everything is parked or held,
+    the front's ledger minus D's answer is empty, the drain waits for nothing."""
+    run = [_req("weg2-52-173", 1), _req("weg2-60-212", 2), _req("weg2-60-210", 3), _req("weg2-67-218", 4)]
+    s = _IntakeSched(running=run)
+    s.weg2_post_wake_settle = [_req("weg2-58-201", 5)]
+    out = _park_late(s, epoch=68)
+    late = _req("weg2-68-220", 6)
+    s._add_request_to_queue(late)                     # the d_direct leg 2 lands after the park
+    assert out.late_hold is True
+    assert sorted(out.parked) == sorted(r.rid for r in run)
+    assert out.held == ["weg2-58-201"]
+    assert s.waiting_queue == [] and s.weg2_post_wake_settle == []
+    assert _admit(s) == [] and s.running_batch.reqs == []
+    # the front's view: its ledger (D.outstanding) minus what D answered
+    import json
+    body = json.dumps({"parked": out.parked, "held": out.held, "late_hold": out.late_hold})
+    verdict, rids, _ = pp.park_verdict(200, body)
+    assert verdict == pp.PARK_PARKED
+    ledger = [r.rid for r in run] + ["weg2-58-201", "weg2-68-220"]
+    late_front = [r for r in ledger if r not in rids] if pp.park_late_hold(200, body) else []
+    still = [r for r in ledger if r not in rids and r not in late_front]
+    assert still == []
+    # the sleep holds all six; the settle request is hold work like the rest
+    s.weg2_dormant = True
+    assert rt.hold_parked(s, hold_armed=True) == 6
+    assert not getattr(s.weg2_dormant_hold[4], rt.FROM_SETTLE_ATTR, False)
+
+
+def test_park_settle_an_awake_requeue_gives_the_settle_request_back_to_the_settle(clock):
+    """The park's sleep never came (awake re-queue after 30 s): the folded
+    settle request goes back to the #1471 settle (its read is still short;
+    the queue would hand it unsettled to the X gate), the rest to the queue."""
+    s = _IntakeSched(running=[_req("a", 1)])
+    s.weg2_post_wake_settle = [_req("settling", 2)]
+    _park_late(s)
+    clock.t += 30.0
+    assert rt.park_tick(s) == 2
+    assert [r.rid for r in s.waiting_queue] == ["a"]
+    assert [r.rid for r in s.weg2_post_wake_settle] == ["settling"]
+    assert not getattr(s.weg2_post_wake_settle[0], rt.FROM_SETTLE_ATTR, True)
 
 
 def test_h91c3_2_the_late_hold_is_replicated_across_ranks(clock):
@@ -493,3 +547,32 @@ def test_h91c3_3_the_front_derives_n_with_ds_own_function():
     assert pp.d_phase_seats(1, 0, 6) == ds.phase_seats(1, 0, cap=6).n == 1
     assert pp.d_phase_seats(3, 6, 6) == 6          # clamped to --d-bs
     assert pp.d_phase_seats(0, 0, 6) == 1          # at least one seat
+
+
+def test_park_settle_the_front_names_a_partial_park():
+    """PARK-SETTLE front instrument: a park answer that leaves ledger rids
+    running (no late hold) is counted as park_partial and named."""
+    import collections
+    import json
+
+    from sglang.srt.weg2 import front as front_mod
+
+    f = front_mod.Front.__new__(front_mod.Front)
+    f.epoch, f._park_attempt_epoch, f.admit_d, f._park_unsupported = 68, -1, True, False
+    f.d_wait_bound_s, f.counters, f._d_parked = 0.0, collections.Counter(), {}
+    f.queue, f._ready_for_d, f.t_awake = [], [], time.time()
+    D = types.SimpleNamespace(outstanding={"a": 1.0, "b": 1.0, "still": 1.0}, name="D")
+    f.groups = {"D": D}
+    f._flip_ledger = lambda g: [r for r in g.outstanding if r not in f._d_parked]
+
+    async def rpc(g, path, body, timeout):
+        return 200, json.dumps({"parked": ["a", "b"], "held": [], "late_hold": False})
+
+    f.rpc = rpc
+    assert asyncio.run(f._wait_bound_park(60.0)) == "parked"
+    assert f.counters["park_partial"] == 1
+    D.outstanding.pop("still")
+    f._park_attempt_epoch = -1
+    f.counters.clear()
+    asyncio.run(f._wait_bound_park(60.0))
+    assert f.counters["park_partial"] == 0
