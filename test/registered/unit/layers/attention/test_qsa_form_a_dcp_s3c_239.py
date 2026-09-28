@@ -427,13 +427,83 @@ def test_the_runner_wires_the_worker_step_and_the_gate():
     from sglang.srt.model_executor import model_runner as mr
     from sglang.srt.model_executor.runner import decode_cuda_graph_runner as gr
 
+    # model_runner.py is frozen (large-class-style): it only delegates to
+    # form_a_dcp_wiring, whose three decisions are tested below by behaviour.
     src = inspect.getsource(mr.ModelRunner)
     route = src[src.index("def run_form_a_worker_route"):]
     route = route[: route.index("def _forward_raw")]
-    assert "backend.form_a_worker_attention(forward_batch, layer_id)" in route
-    assert "full_attention_layer_id_mapping" in route
+    assert "form_a_worker_attention_step(" in route
+    assert "attention_layer_ids=attention_layer_ids" in route
     gate = src[src.index("def _run_form_a_boot_gate"):]
-    assert "form_a_dcp_merge=form_a_dcp_merge" in gate[:3000]
+    assert "form_a_dcp_merge=form_a_dcp_merge_of(self.attn_backend)" in gate[:3000]
     init = src[src.index("def init_attention_backend(self)"):]
-    assert "QwenSparseAttnBackend(self)" in init[:4000]
+    assert "form_a_worker_attn_backend(self)" in init[:2000]
+    assert "QwenSparseAttnBackend" not in init[:2000]
     assert "GRAPH_BODY_MOE_ROUTE_DCP" in inspect.getsource(gr)
+
+
+def test_the_wiring_chooses_the_worker_backend_by_the_cut():
+    from unittest import mock
+
+    from sglang.srt import form_a_dcp_wiring as w
+    from sglang.srt.form_a_construction import FormAWorkerAttnBackend
+    from sglang.srt.layers.attention import qwen_sparse_attn_backend as be
+
+    def runner(cut, draft=False, qsa=True):
+        return SimpleNamespace(
+            is_draft_worker=draft,
+            server_args=SimpleNamespace(form_a_dcp_vector=lambda: cut),
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(qsa=qsa)),
+        )
+
+    sentinel = object()
+    with mock.patch(
+        "sglang.srt.form_a_construction.FormAWorkerAttnBackend",
+        lambda r: sentinel,
+    ):
+        for r in (runner(None), runner([64, 0, 0], draft=True)):
+            got = w.form_a_worker_attn_backend(r)
+            assert got == w.FormAWorkerAttn(w.FORM_A_WORKER, sentinel)
+
+    class _Qsa:
+        def __init__(self, r, geo="geo"):
+            self.form_a_dcp = geo
+
+    with mock.patch(
+        "sglang.srt.layers.attention.qsa.config.is_qwen_qsa",
+        lambda hf: hf.qsa,
+    ), mock.patch.object(be, "QwenSparseAttnBackend", _Qsa):
+        got = w.form_a_worker_attn_backend(runner([32, 0, 32]))
+        assert got.name == w.FORM_A_WORKER_QSA_DCP and got.backend.form_a_dcp == "geo"
+        with pytest.raises(RuntimeError, match="QSA full attention only"):
+            w.form_a_worker_attn_backend(runner([32, 0, 32], qsa=False))
+        with mock.patch.object(
+            be, "QwenSparseAttnBackend", lambda r: _Qsa(r, geo=None)
+        ):
+            with pytest.raises(RuntimeError, match="did not take the Form A DCP"):
+                w.form_a_worker_attn_backend(runner([32, 0, 32]))
+    assert FormAWorkerAttnBackend.form_a_dcp is None
+
+
+def test_the_wiring_declares_the_merge_and_builds_the_step():
+    from unittest import mock
+
+    from sglang.srt import form_a_dcp_wiring as w
+    from sglang.srt.form_a_construction import FormAWorkerAttnBackend
+    from sglang.srt.layers.attention import qwen_sparse_attn_backend as be
+
+    qsa = object.__new__(be.QwenSparseAttnBackend)
+    qsa.form_a_dcp = "geo"
+    calls = []
+    qsa.form_a_worker_attention = lambda fb, lid: calls.append((fb, lid))
+    with mock.patch("sglang.srt.layers.dcp.comm.lse_merge_mode", lambda: "a2a"):
+        assert w.form_a_dcp_merge_of(qsa) == "a2a"
+        assert w.form_a_dcp_merge_of(SimpleNamespace(full_attn_backend=qsa)) == "a2a"
+        assert w.form_a_dcp_merge_of(object.__new__(FormAWorkerAttnBackend)) is None
+    pool = SimpleNamespace(full_attention_layer_id_mapping={3: 0, 7: 1})
+    step, ids = w.form_a_worker_attention_step(qsa, "fb", pool)
+    assert ids == (3, 7)
+    step(7)
+    assert calls == [("fb", 7)]
+    worker = object.__new__(FormAWorkerAttnBackend)
+    assert w.form_a_worker_attention_step(worker, "fb", pool) == (None, ())
