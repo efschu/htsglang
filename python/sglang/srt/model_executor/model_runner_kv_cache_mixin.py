@@ -321,6 +321,12 @@ def decompose_mamba_budget_post(total_gb: float, components: dict):
 #: (its per_req is 0 by construction).
 PP_STAGE_NO_MAMBA_STATE_SLOTS = 1 << 30
 
+#: #239 S3a: the owner-block unit a Form A rank with token share 0 AND a KV
+#: cell of 0 contributes to the group MIN-reduce -- it holds nothing that spans
+#: the context, so it bounds nothing. Large enough that any funding rank wins
+#: the MIN, small enough that `unit * S` stays inside int64.
+_ZERO_SHARE_UNBOUNDED_UNIT = 1 << 40
+
 logger = logging.getLogger(__name__)
 
 
@@ -5388,7 +5394,9 @@ class ModelRunnerKVCacheMixin:
         )
         return cap
 
-    def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
+    def _apply_token_constraints(
+        self: ModelRunner, token_capacity: int, *, kv_cell_bytes: Optional[int] = None
+    ) -> int:
         """Apply external constraints to token capacity: user cap, PP sync,
         and the hybrid mamba/attention physical ceiling (#79).
 
@@ -5440,7 +5448,19 @@ class ModelRunnerKVCacheMixin:
             ratios = get_cp_token_ratios()
             split_factor = cp_token_split_factor(self.dcp_size)
             ratio_r = ratios[get_parallel().attn_dcp_rank]
-            local_unit = int(token_capacity) // int(ratio_r)
+            if int(ratio_r) == 0:
+                # #239 S3a: a Form A rank that owns no full-attention token.
+                # Its capacity was priced per GLOBAL token
+                # (pool_configurator.zero_token_share_cell), so it bounds C
+                # directly: unit = capacity // S. A cell of 0 (a worker at
+                # share 0: no index, no draft) bounds nothing.
+                local_unit = (
+                    _ZERO_SHARE_UNBOUNDED_UNIT
+                    if kv_cell_bytes == 0
+                    else int(token_capacity) // int(split_factor)
+                )
+            else:
+                local_unit = int(token_capacity) // int(ratio_r)
             if getattr(self.server_args, "kv_reshard_vectors", None):
                 # #297 fitted ceiling: C must fit EVERY declared reshard
                 # vector on EVERY rank, not only the boot vector. One
@@ -6209,6 +6229,16 @@ class ModelRunnerKVCacheMixin:
             return
         if get_world_group().world_size <= 1:
             _skip("world size is 1, so there is no split to optimise")
+            return
+        if getattr(self.server_args, "rank_role", None):
+            # #239 S3a: the Form A token cut is the planner's, solved together
+            # with the expert residency (S2b), and it may give a rank 0 --
+            # whose capacity is per GLOBAL token and which this proportional
+            # optimiser would divide by. Rank-uniform (server args).
+            _skip(
+                "the Form A token cut (--rank-role, #239) is the planner's; "
+                "the proportional optimiser does not model a rank with share 0"
+            )
             return
         active = get_cp_token_ratios()
         if not active or len(active) != self.dcp_size:
@@ -7885,7 +7915,10 @@ class ModelRunnerKVCacheMixin:
             "n/a" if _frac is None else f"{_frac:.3%}",
         )
         config = configurator.calculate_pool_sizes(budget_bytes, self.page_size)
-        max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
+        max_tokens = self._apply_token_constraints(
+            config.max_total_num_tokens,
+            kv_cell_bytes=getattr(configurator, "_cell_size", None),
+        )
         if cap_tokens is not None:
             max_tokens = min(max_tokens, cap_tokens)
         # #251c: D's KV stage form sizes the pool VIRTUALLY at the top stage;

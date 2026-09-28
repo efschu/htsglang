@@ -174,6 +174,14 @@ def dcp_compact_pool_rows(global_tokens: int, cp_S: int, cp_ratio: int) -> int:
     and a sizing rule whose off-by-one has already cost a debugging round must
     not exist twice.
     """
+    # #239 S3a: under Form A a cp_ratio of 0 is a LAYOUT -- a rank that owns
+    # no token of the context (the owner rule never maps a slot to it), so it
+    # needs zero rows, not a trailing block of them. Anywhere else a zero is
+    # still the nonsense split it always was.
+    from sglang.srt.rank_role import form_a_dense_is_unsharded
+
+    if cp_S > 0 and cp_ratio == 0 and form_a_dense_is_unsharded():
+        return 0
     if cp_S <= 0 or cp_ratio <= 0:
         raise ValueError(
             f"dcp_compact_pool_rows: cp_S ({cp_S}) and cp_ratio ({cp_ratio}) "

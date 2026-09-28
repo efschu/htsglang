@@ -1242,10 +1242,20 @@ def resolve_cp_token_ratios(
     env_vec = envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()
     if env_vec:
         parsed = [int(x) for x in env_vec.split(",") if x.strip() != ""]
-        if len(parsed) != dcp_size or any(v <= 0 for v in parsed):
+        # #239 S3a: under Form A a zero is a layout (a rank that owns no
+        # token of the full-attention KV -- the optimum puts the host there),
+        # exactly as the zero in --rank-tp-ratio is; elsewhere it stays an
+        # arithmetic accident.
+        floor = 0 if getattr(server_args, "rank_role", None) else 1
+        if (
+            len(parsed) != dcp_size
+            or any(v < floor for v in parsed)
+            or sum(parsed) <= 0
+        ):
             raise ValueError(
-                f"SGLANG_UNEVEN_TOKEN_VECTOR must be {dcp_size} positive "
-                f"integers (one per DCP rank), got {env_vec!r}."
+                f"SGLANG_UNEVEN_TOKEN_VECTOR must be {dcp_size} "
+                + ("non-negative" if floor == 0 else "positive")
+                + f" integers (one per DCP rank), got {env_vec!r}."
             )
         _refuse_retracted_token_vector(
             server_args, parsed, "SGLANG_UNEVEN_TOKEN_VECTOR"

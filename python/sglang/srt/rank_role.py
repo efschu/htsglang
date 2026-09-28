@@ -30,6 +30,7 @@ that is wired loses its guard; a seam that is not keeps it until it is.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -907,6 +908,9 @@ class DcpResolution:
     dcp_size: int
     uneven_dcp_kv_replicated: bool
     reason: str
+    #: #239 S3a: the planner's token vector under ``kv=qsa_forma_dcp``,
+    #: gcd-reduced; None = no token cut (classic Form A, the host holds all).
+    token_vector: Optional[Tuple[int, ...]] = None
 
 
 def resolve_dcp_under_host_kv(
@@ -914,6 +918,7 @@ def resolve_dcp_under_host_kv(
     requested_dcp_size: Optional[int],
     requested_replicated: Optional[bool],
     forced: bool = False,
+    token_vector: Optional[Sequence[int]] = None,
 ) -> DcpResolution:
     """Under Form A the host holds the WHOLE KV, so DCP has nothing to do.
 
@@ -927,7 +932,19 @@ def resolve_dcp_under_host_kv(
     `forced` (an explicit --dcp-size / SGLANG_UNEVEN_DCP from the operator)
     is refused rather than overridden: silently ignoring an explicit flag is
     how a measurement ends up comparing two different layouts.
+
+    #239 S3a -- THE TOKEN CUT (form ``kv=qsa_forma_dcp``). The premise above
+    holds for the HEADS, not for the context: the planner may cut the
+    full-attention KV by TOKENS over all ranks (``token_vector``, one share
+    per rank, a zero allowed -- the optimum puts 0 on the host at x1/x2).
+    Then every rank owns a token range and DCP spans the group: dcp_size =
+    ranks, every rank stores the full kv heads of its own tokens
+    (replicated-heads geometry), and the host keeps the heads, the index and
+    the draft for ALL tokens. A vector that leaves every worker at 0 is the
+    classic form and resolves to dcp 1 -- the same answer as no vector.
     """
+    if token_vector is not None:
+        return _resolve_token_cut(plan, requested_dcp_size, token_vector)
     if forced and requested_dcp_size not in (None, 1):
         raise RankRoleError(
             f"--dcp-size {requested_dcp_size} was set explicitly, but under "
@@ -950,4 +967,52 @@ def resolve_dcp_under_host_kv(
             f"the whole KV; ranks {plan.worker_ranks} hold none, so there is "
             "no token axis to split and no LSE merge to run."
         ),
+    )
+
+
+def _resolve_token_cut(
+    plan: RankRolePlan,
+    requested_dcp_size: Optional[int],
+    token_vector: Sequence[int],
+) -> DcpResolution:
+    """#239 S3a: :func:`resolve_dcp_under_host_kv` for a planned token cut."""
+    n = len(plan.roles)
+    try:
+        vec = [int(v) for v in token_vector]
+    except (TypeError, ValueError) as e:
+        raise RankRoleError(
+            f"#239 token cut {list(token_vector)!r} is not a vector of integers"
+        ) from e
+    if len(vec) != n or any(v < 0 for v in vec) or sum(vec) <= 0:
+        raise RankRoleError(
+            f"#239 token cut {vec} must be {n} non-negative integers (one share "
+            f"per rank of {list(plan.roles)}) with at least one positive."
+        )
+    if all(vec[r] == 0 for r in plan.worker_ranks):
+        return DcpResolution(
+            dcp_size=1,
+            uneven_dcp_kv_replicated=False,
+            reason=(
+                f"Form A: the token cut {vec} leaves every worker at 0, so rank "
+                f"{plan.host_rank} holds the whole KV -- classic Form A, dcp 1."
+            ),
+        )
+    if requested_dcp_size not in (None, 1, n):
+        raise RankRoleError(
+            f"--dcp-size {requested_dcp_size} contradicts the #239 token cut "
+            f"{vec}: a token cut over {n} ranks is DCP over all {n}. Drop the "
+            "flag; the cut decides the DCP group."
+        )
+    g = math.gcd(*vec)
+    reduced = tuple(v // g for v in vec)
+    return DcpResolution(
+        dcp_size=n,
+        uneven_dcp_kv_replicated=True,
+        reason=(
+            f"Form A x #239 token cut {list(reduced)}: rank {plan.host_rank} "
+            f"keeps every head, the index and the draft for all tokens; the "
+            f"full-attention KV is cut by tokens over all {n} ranks "
+            f"(dcp {n}, host share {reduced[plan.host_rank]})."
+        ),
+        token_vector=reduced,
     )
