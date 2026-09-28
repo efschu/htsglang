@@ -2054,6 +2054,11 @@ class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
     # (weg2/d_seats.phase_seats). None on every other resume.
     handoff_n: Optional[int] = None
     parked_n: Optional[int] = None
+    # #251c: the KV tokens the phase's requests hold when D wakes (handed-off
+    # plus resumed-first parked, the front's own count); D's KV stage is the
+    # smallest that holds it (weg2/d_seat_vram.choose_stage). Same object on
+    # every rank. None on every other resume and from a front without stages.
+    phase_kv_tokens: Optional[int] = None
     # #244 SEAT-ROTATE: wait-bound-parked rids D does NOT resume first this
     # phase (the front gives their seats to requests waiting past the bound);
     # D treats them as ordinary waiting work (weg2/d_park_runtime). Same object

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import List, Optional
 
 import torch
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
 
 
@@ -159,16 +161,37 @@ class QSATokenToKVPool(HybridLinearKVPool):
         )
         # One contiguous allocation behind per-layer views: every layer's
         # compressed pages are addressable from a single base pointer.
-        self.qsa_compressed_flat = torch.zeros(
-            (
-                len(full_attention_layer_ids),
-                self.qsa_compressed_capacity
-                * self.qsa_index_kv_heads
-                * self.qsa_index_head_dim,
-            ),
-            dtype=self.index_state_dtype,
-            device=device,
-        )
+        # #251c: under D's KV stage form the keys live in the kv_cache tag
+        # beside the KV they index, so their top-stage pages can be unmapped
+        # like the KV's (weg2/d_seat_vram.kv_stage_born); off, byte-identical.
+        from sglang.srt.weg2 import d_seat_vram as _dsv
+
+        _staged = _dsv.stage_form() is not None and int(size) >= _dsv.stage_form().tokens[-1]
+        with (
+            self.full_kv_pool.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE)
+            if _staged
+            else nullcontext()
+        ):
+            self.qsa_compressed_flat = torch.zeros(
+                (
+                    len(full_attention_layer_ids),
+                    self.qsa_compressed_capacity
+                    * self.qsa_index_kv_heads
+                    * self.qsa_index_head_dim,
+                ),
+                dtype=self.index_state_dtype,
+                device=device,
+            )
+        if _staged:
+            self.qsa_compressed_flat = _dsv.kv_stage_born(
+                self.qsa_compressed_flat,
+                pool_size=int(size),
+                page_size=int(page_size),
+                name="qsa_compressed",
+                tokens_per_slot=self.qsa_compress_ratio,
+                layers=len(full_attention_layer_ids),
+                slots=self.qsa_compressed_capacity,
+            )
         self.qsa_compressed_k_buffer_pool = [
             self.qsa_compressed_flat[layer_offset].view(
                 self.qsa_compressed_capacity,
