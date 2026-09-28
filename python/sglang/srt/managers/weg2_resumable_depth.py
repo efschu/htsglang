@@ -21,6 +21,10 @@ GROUP-UNIFORM, never one rank's guess:
 
 * Form A (H98): the attention host decides the depth and the workers follow,
   so the host's probe IS the group's; a worker computes nothing;
+* Form A x the token cut (#239 S3d, ``kv=qsa_forma_dcp``): a worker owns real
+  full-attention rows, so losing one of its pages lowers the depth -- MIN over
+  the TP cpu group (the classic TP collective), the host voting its admission
+  probe, each worker its KV reach (the H98 follow walk: it holds no anchor);
 * one rank (tp 1, no DP attention, no PP): trivially;
 * a classic TP group: MIN over the TP cpu group -- a rank that cannot realize
   a depth takes the group there, as in the RU usable vote;
@@ -48,6 +52,7 @@ FIELD = "weg2_resumable_depth"
 
 MODE_HOST = "form-a-host"
 MODE_FOLLOW = "form-a-worker"
+MODE_DCP_MIN = "form-a-dcp-min"
 MODE_SOLO = "solo"
 MODE_MIN = "tp-min"
 MODE_NONE = "none"
@@ -62,6 +67,10 @@ def group_mode(ps: Any) -> str:
     if int(getattr(ps, "pp_size", 1) or 1) > 1:
         return MODE_NONE
     if tp_match_floor.form_a_follow_active():
+        from sglang.srt.rank_role import form_a_token_cut_active
+
+        if form_a_token_cut_active():
+            return MODE_DCP_MIN
         return MODE_FOLLOW if tp_match_floor.this_rank_follows() else MODE_HOST
     dp = int(getattr(ps, "attn_dp_size", 1) or 1)
     if dp > 1:
@@ -85,14 +94,19 @@ def _next_turn_view(req: Any) -> Any:
     )
 
 
-def local_depth(tree_cache: Any, req: Any) -> int:
+def local_depth(tree_cache: Any, req: Any, *, follow: bool = False) -> int:
     """This rank's realizable resume depth for ``req``'s sequence (0 when the
-    probe cannot price it -- the safe direction, as in every vote)."""
+    probe cannot price it -- the safe direction, as in every vote). ``follow``
+    (a Form A worker under the token cut): its KV reach, walked with the
+    mamba rule suspended -- it holds no anchor to test."""
     from sglang.srt.managers import tp_match_floor
 
     if tree_cache is None:
         return 0
-    return max(0, int(tp_match_floor.admission_probe(tree_cache, _next_turn_view(req), follow=False)))
+    return max(
+        0,
+        int(tp_match_floor.admission_probe(tree_cache, _next_turn_view(req), follow=follow)),
+    )
 
 
 def _tp_min(values: Sequence[int]) -> List[int]:
@@ -122,8 +136,13 @@ def group_depths(
     mode = group_mode(ps)
     if mode in (MODE_NONE, MODE_FOLLOW):
         return mode, None
-    depths = [local_depth(tree_cache, r) for r in reqs]
-    if mode == MODE_MIN:
+    follow = False
+    if mode == MODE_DCP_MIN:
+        from sglang.srt.managers import tp_match_floor
+
+        follow = tp_match_floor.this_rank_follows()
+    depths = [local_depth(tree_cache, r, follow=follow) for r in reqs]
+    if mode in (MODE_MIN, MODE_DCP_MIN):
         depths = (reduce_min or _tp_min)(depths)
     return mode, [max(0, int(d)) for d in depths]
 
