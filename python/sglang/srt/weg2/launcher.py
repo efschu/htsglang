@@ -15959,6 +15959,8 @@ def log_wake_credit_solve_pd(ns, cards: List[Card], log, label: str, *, p_split,
             # (dieselbe Env, aus der der D-FRACTION-SOLVE seine liest).
             dense_repack=_er.dense_repack_outside_pool(
                 parse_group_env(getattr(ns, "env_d", "") or "")),
+            # #242r: die Geometrie des PP-Cut-Solves fuer den Umschnitt
+            recut_geometry=getattr(ns, "_pcut_recut_geometry", None),
         )
     except (KeyError, ValueError, IndexError) as _exc:
         log(f"{_wpd.MARKER} {_wpd.DIRECTION} {label} failed: {type(_exc).__name__}: {_exc}")
@@ -16266,7 +16268,10 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
                    fracs: Sequence[float], lru_rows: Sequence[int],
                    stage_layers: Sequence[int], kv_mib, num_experts: int,
                    row_mib: float, mamba_slots: int = 0,
-                   mamba_mib_per_slot: Sequence[float] = ()) -> None:
+                   mamba_mib_per_slot: Sequence[float] = (),
+                   layer_kinds: Optional[Sequence[str]] = None,
+                   dense_mib_per_layer: Optional[float] = None,
+                   mamba_mib_per_linear_layer_per_slot: Optional[float] = None) -> None:
     """H41: ``PP-CUT ACTIVATION`` (T_s(chunk) je Stufe mit Quelle) und
     ``PP-CUT P-KARTE`` (Kopfraum je Stufe im Chunk-Forward); W132, wenn eine
     Stufe unter near-OOM faellt, W131 fuer einen ungemessenen Chunk.
@@ -16361,6 +16366,20 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
     # 262k-Kante die 97k-Kante. LMEM des Run-Writes: 0 mit dem H47-Fix.
     prompt = int(getattr(ns, "p_card_prompt_tokens", 0) or 0) or CONTEXT_LENGTH_TOKENS
     lmem_fixed = _p_card.arena_write_lmem_fixed()
+    # #242r: ein anderer Schnitt als der gemessene wird UMGERECHNET (K0 je
+    # Stufe um Dense und Mamba der wandernden Layer); geht das nicht, VERWEIGERT
+    # die Karte mit Namen (W167) statt still zu entfallen.
+    recut_from = None
+    if tuple(int(x) for x in stage_layers) != tuple(reference.stage_layers):
+        recut_from = tuple(reference.stage_layers)
+        try:
+            reference = _p_card.recut_reference(
+                reference, stage_layers, layer_kinds=layer_kinds,
+                dense_mib_per_layer=dense_mib_per_layer,
+                mamba_mib_per_linear_layer_per_slot=mamba_mib_per_linear_layer_per_slot)
+        except _p_card.PCutRecutRefused as exc:
+            log(f"{_p_card.CARD_MARKER} {exc}")
+            raise Weg2LaunchRefused(str(exc)) from None
 
     def _solve(tokens):
         return _p_card.solve_p_card(
@@ -16385,6 +16404,11 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
         return
     for fit in fits:
         log(_p_card.describe_p_card(fit, reference))
+    if recut_from is not None:
+        log(_p_card.recut_card_line(
+            recut_from, stage_layers, fits, dense_mib_per_layer=float(dense_mib_per_layer),
+            mamba_mib_per_linear_layer=float(mamba_mib_per_linear_layer_per_slot or 0.0)
+            * int(reference.mamba_slots)))
     refusal = _p_card.p_card_refusal_text(fits, reference, chunk=int(chunk_tokens))
     if refusal is not None:
         log(f"{_p_card.CARD_MARKER} {refusal}")
@@ -16692,6 +16716,19 @@ def solve_p_cut(
         # Puffer, KV, die Chunk-Transiente T_s(chunk) und den Draft.
         # H92c: und um die Mamba-Slots dieses Boots gegen die der Referenz
         # (Slots x 1.5588 MiB x lineare Layer der Stufe).
+        # #242r: die Geometrie des Umschnitts, EINMAL hier (Layer-Typen des
+        # Checkpoints, Dense je Layer, Mamba je linearem Layer, KV je
+        # Attention-Layer) -- P-KARTE und der Wake-Kredit P->D lesen dieselbe.
+        _kv_attn = None
+        if _kv_p is not None:
+            _kv_attn = next((float(k) / int(a) for k, a in zip(_kv_p, _attn) if int(a) > 0), None)
+        ns._pcut_recut_geometry = {
+            "layer_kinds": [str(k) for k in kinds] if kinds else None,
+            "dense_mib_per_layer": float(mean_layer_mib),
+            "mamba_mib_per_linear_layer": float(ns.pp_cut_mamba_mib_per_linear_layer_per_slot)
+            * int(_p_mamba_slots),
+            "kv_mib_per_attn_layer": _kv_attn,
+        }
         p_card_verdict(
             ns, cards, log,
             model=model,
@@ -16706,6 +16743,9 @@ def solve_p_cut(
             mamba_mib_per_slot=p_mamba_mib_per_slot_by_stage(
                 kinds, _stage_layers_for_solve,
                 float(ns.pp_cut_mamba_mib_per_linear_layer_per_slot)),
+            layer_kinds=[str(k) for k in kinds] if kinds else None,
+            dense_mib_per_layer=float(mean_layer_mib),
+            mamba_mib_per_linear_layer_per_slot=float(ns.pp_cut_mamba_mib_per_linear_layer_per_slot),
         )
     ms = _csv_floats(ns.pp_cut_measured_ms_per_layer)
     model_pool = _pp_cut.PhasePoolModel(

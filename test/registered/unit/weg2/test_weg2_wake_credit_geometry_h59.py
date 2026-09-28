@@ -109,12 +109,14 @@ def _run_launcher(split, fr_p, monkeypatch, tmp_path, model=MODEL):
     return lines
 
 
-def test_another_cut_against_the_x162_logs_is_named_not_priced(monkeypatch, tmp_path):
+def test_another_cut_against_the_x162_logs_is_recut_not_dropped(monkeypatch, tmp_path):
+    """#242r: der fremde Schnitt entfaellt nicht mehr still -- die x162-Referenz
+    wird auf 26,10,12 umgerechnet (P-Tags je Band auf die neuen Stufen)."""
     lines = _run_launcher((26, 10, 12), (0.472, 0.796, 0.468262), monkeypatch, tmp_path)
-    assert len(lines) == 1, lines
-    assert "ENTFAELLT" in lines[0]
-    assert "{'p_split': (29, 11, 8)}" in lines[0] and "{'p_split': (26, 10, 12)}" in lines[0]
-    assert not any("FERTIG" in ln for ln in lines)
+    assert not any("ENTFAELLT" in ln for ln in lines), lines
+    assert "fnFL2x162" in lines[0] and "RECUT 29,11,8->26,10,12" in lines[0]
+    assert len([ln for ln in lines if ln.startswith("WAKE-CREDIT") and ("engste Luft" in ln or "FEHLT" in ln)]) == 3
+    assert [ln for ln in lines if ln.startswith("PP-CUT RECUT ref=29,11,8 -> 26,10,12 WAKE-CREDIT D->P")]
 
 
 def test_another_model_against_the_x162_logs_is_named_not_priced(monkeypatch, tmp_path):
@@ -156,5 +158,8 @@ def test_mutant_planned_split_in_the_key_prices_the_foreign_geometry():
     new = wc.plan_wake_credit(reference_key={"p_card": P_CARD,
                                              "p_split": wc.reference_p_split(ref, N_LAYERS),
                                              "chunk_layers": CHUNK}, **kw)
-    assert new.refusal is None and new.front_plan is None
-    assert "ENTFAELLT" in new.lines[0]
+    # #242r: mit dem Schnitt der REFERENZ im Schluessel wird umgerechnet --
+    # weights_12 (Layer 36-38) liegt bei 26,10,12 auf PP2 (card2), nicht mehr auf PP1
+    assert not any("ENTFAELLT" in ln for ln in new.lines)
+    dem = {c["card"]: c["demand"] for c in new.front_plan["D->P"]}
+    assert "weights_12" not in dem[0] and "weights_12" in dem[2]
