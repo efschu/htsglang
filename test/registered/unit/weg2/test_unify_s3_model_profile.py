@@ -205,9 +205,15 @@ def test_the_27b_constants_moved_unchanged_and_the_nf_row_is_separate():
     # rc12g: the reserved growth of one D extend per row (extend chunk cap)
     assert n["D_EXTEND_GROWTH_PER_ROW_MIB"].measured_on == "nextflash"
     assert "D_EXTEND_GROWTH_PER_ROW_MIB" not in q
+    # #242 (28.09.): group P's posts measured on the NF form, no longer the 27B borrow
+    for own in ("P_ACTIVATION_MIB", "P_PP_STAGE_FIXED_MIB", "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT"):
+        assert n[own].measured_on == "nextflash", own
+    assert "P_ACTIVATION_MIB" not in q
     assert set(borrowed) == set(n) - {"P_DRAFT_RESIDENT_BUDGET_MIB", "P_DORMANT_SERVED_GROWTH_MIB",
                                       "D_AWAKE_REST_MIB", "D_FIXED_MIB", "D_ACTIVATION_MIB",
-                                      "D_EXTEND_GROWTH_MIB", "D_EXTEND_GROWTH_PER_ROW_MIB"}
+                                      "D_EXTEND_GROWTH_MIB", "D_EXTEND_GROWTH_PER_ROW_MIB",
+                                      "P_ACTIVATION_MIB", "P_PP_STAGE_FIXED_MIB",
+                                      "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT"}
     assert set(borrowed.values()) == {"qwen27b"}
     assert F.borrowed_constants("qwen27b") == ()
     assert "P_OVERSHOOT_MIB" in F.borrowed_constants_line("nextflash")
@@ -288,9 +294,14 @@ def test_argparse_measured_defaults_follow_the_row_unless_given(third_model):
     ns2 = argparse.Namespace(**{**vars(ns), "pp_cut_measured_ms_per_layer": L.MEASURED_MS_PER_LAYER})
     assert L.apply_profile_arg_defaults(
         ns2, ["--pp-cut-measured-ms-per-layer", L.MEASURED_MS_PER_LAYER]) == []
-    for prof in ("qwen27b", "nextflash"):
-        ns3 = argparse.Namespace(**{**vars(ns2), "profile": prof})
-        assert L.apply_profile_arg_defaults(ns3, []) == [], prof
+    ns3 = argparse.Namespace(**{**vars(ns2), "profile": "qwen27b"})
+    assert L.apply_profile_arg_defaults(ns3, []) == []
+    # #242: the NF row carries its OWN P stage-fixed and mamba rate now
+    ns4 = argparse.Namespace(**{**vars(ns2), "profile": "nextflash"})
+    assert L.apply_profile_arg_defaults(ns4, []) == [
+        "pp_cut_stage_fixed_mib", "pp_cut_mamba_mib_per_linear_layer_per_slot"]
+    assert ns4.pp_cut_stage_fixed_mib == "1584.0,527.1,1065.4"
+    assert ns4.pp_cut_mamba_mib_per_linear_layer_per_slot == pytest.approx(1.5602)
 
 
 def test_group_env_is_a_table_row_in_build_env(clean):
