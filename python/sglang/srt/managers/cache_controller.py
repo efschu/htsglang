@@ -3543,29 +3543,48 @@ class HiCacheController:
         # page -- the 27B boots read 1.4-3.2k tokens/s this way against 10-115k
         # the disk gives. The prefix is walked exactly as before: it ends at
         # the first page the L3 cannot give or the first reference that fails.
+        # EG review: (b) the L2 pages found past the lead are referenced
+        # BEFORE the fill -- its arena-full eviction could otherwise take a
+        # found, not yet referenced prefix page and end the prefix early;
+        # (a) nothing past the first gap is read -- the first failed
+        # reference ends the list here, the first page neither in L2 nor on
+        # disk ends it in the fill (prefix=True).
         _n = int(_fs.shape[0])
+        _end = _n
+        _pre = {}
+        _need = []
+        for i in range(lead, _n):
+            if _hm[i]:
+                continue
+            s_ = int(_fs[i])
+            if s_ >= 0 and int(_st[i]) == 2:
+                if pool.arena.ref_slots([s_], +1) == 1:
+                    _pre[i] = s_
+                    continue
+                _end = i  # evicted between find and ref: the prefix ends here
+                break
+            _need.append(i)
         _fills = {}
-        _need = [i for i in range(lead, _n)
-                 if not _hm[i] and (int(_fs[i]) < 0 or int(_st[i]) != 2)]
         if _need:
             _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
             if callable(_fill_fn):
-                _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes))
+                _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
                 _fills = dict(zip(_need, _got))
-        for i in range(lead, _n):
-            slot, state = int(_fs[i]), int(_st[i])
+        for i in range(lead, _end):
             if _hm[i]:
-                slots.append(slot)  # #257: held since the probe
+                slots.append(int(_fs[i]))  # #257: held since the probe
                 continue
-            if slot < 0 or state != 2:
-                # #1433: not in the L2 -- the L3 fill above read it (or not)
-                fill = _fills.get(i)
-                if fill is None:
-                    break
-                slot = fill
-            if pool.arena.ref_slots([slot], +1) != 1:
-                break  # evicted between find and ref: the prefix ends here
-            slots.append(slot)
+            if i in _pre:
+                slots.append(_pre.pop(i))
+                continue
+            # #1433: not in the L2 -- the L3 fill above read it (or not)
+            fill = _fills.get(i)
+            if fill is None or pool.arena.ref_slots([fill], +1) != 1:
+                break  # not on disk / evicted between fill and ref: the prefix ends here
+            slots.append(fill)
+        if _pre:
+            # referenced ahead, past where the prefix ended: given back
+            pool.arena.ref_slots_np(_np.asarray(list(_pre.values()), dtype=_np.int64), -1)
         if not slots:
             # xsn314/322/326: the dormant hold's re-reads answered ZERO for
             # pages P had completed (PP2's ack flips COMPLETE within ~4 s),
@@ -4597,18 +4616,23 @@ class HiCacheController:
             rows = (_hi_pages.cpu() - int(dpool.staging_rows)).tolist()
             flags, slots, hits = [], [], 0
             # L3-FAST: the draft pages missing in the L2 in ONE fill (batched, parallel reads)
-            _dneed = [i for i, (s_, st_) in enumerate(found) if s_ < 0 or st_ != 2]
+            # EG review (b): the found draft pages are referenced BEFORE the
+            # fill, so its arena-full eviction cannot take them
+            _dref = {i: s_ for i, (s_, st_) in enumerate(found)
+                     if s_ >= 0 and st_ == 2 and dpool.arena.ref_slots([s_], +1) == 1}
+            _dneed = [i for i in range(len(found)) if i not in _dref]
             _dfill = {}
             _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
             if _dneed and callable(_fill_fn):
                 _dfill = dict(zip(_dneed, _fill_fn(dpool.arena, [stems[i] for i in _dneed],
                                                    int(dpool._page_bytes))))
-            for i, (slot, state) in enumerate(found):
-                if slot < 0 or state != 2:  # #1433: L3 -> L2 for the draft page too
-                    fill = _dfill.get(i)
-                    if fill is not None:
-                        slot, state = fill, 2
-                ok = slot >= 0 and state == 2 and dpool.arena.ref_slots([slot], +1) == 1
+            for i in range(len(found)):
+                if i in _dref:
+                    slot, ok = _dref[i], True
+                else:  # #1433: L3 -> L2 for the draft page too
+                    slot = _dfill.get(i)
+                    ok = slot is not None and dpool.arena.ref_slots([slot], +1) == 1
+                    slot = slot if slot is not None else -1
                 slots.append(slot if ok else -1)
                 flags.append(bool(ok))
                 hits += int(ok)

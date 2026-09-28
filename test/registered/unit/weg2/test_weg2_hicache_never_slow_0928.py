@@ -77,3 +77,48 @@ def test_a_dead_controller_drops_out_of_the_gate():
 
     gc.collect()
     assert wb.quiet_reason() is None
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_a_load_that_never_stops_gets_a_bounded_write_window(monkeypatch):
+    # EG review (c): under continuous load the write-behind must still write
+    clk = _Clock()
+    monkeypatch.setattr(wb, "_clock", clk)
+    monkeypatch.setenv(wb.ENV_LOAD_YIELD_MAX_S, "30")
+    monkeypatch.setenv(wb.ENV_LOAD_WRITE_S, "2")
+    wb.register_load_probe(lambda: 1)
+    assert wb.quiet_reason() == "load"
+    clk.t += 29.0
+    assert wb.quiet_reason() == "load"
+    assert wb.load_yield_stats()["running_s"] == pytest.approx(29.0)
+    clk.t += 1.0
+    assert wb.quiet_reason() is None          # the cap: writes anyway
+    clk.t += 1.9
+    assert wb.quiet_reason() is None          # inside the 2 s window
+    clk.t += 0.2
+    assert wb.quiet_reason() == "load"        # the next streak starts
+    st = wb.load_yield_stats()
+    assert st["caps"] == 1 and st["streaks"] == 1 and st["max_s"] == pytest.approx(30.0)
+
+
+def test_the_streaks_are_counted_and_zero_bound_never_writes(monkeypatch):
+    clk = _Clock()
+    monkeypatch.setattr(wb, "_clock", clk)
+    monkeypatch.setenv(wb.ENV_LOAD_YIELD_MAX_S, "0")
+    q = {"n": 1}
+    wb.register_load_probe(lambda: q["n"])
+    assert wb.quiet_reason() == "load"
+    clk.t += 500.0
+    assert wb.quiet_reason() == "load"        # 0 = no bound
+    q["n"] = 0
+    assert wb.quiet_reason() is None
+    st = wb.load_yield_stats()
+    assert st == {"streaks": 1, "total_s": pytest.approx(500.0), "max_s": pytest.approx(500.0),
+                  "caps": 0, "running_s": 0.0}
