@@ -2372,11 +2372,11 @@ class KvStageTable(msgspec.Struct, frozen=True, kw_only=True):
     demand: Tuple[int, ...] = ()
     waves: Tuple[int, ...] = ()
 
-    def extra_waves(self, max_by_seats: Sequence[int]) -> Tuple[int, ...]:
-        """Per batch b = 1..cap: the waves a ``max_by_seats`` row adds to b's
-        captured step over today's -- the capture floor of b is the fewest
-        rows of ANY phase n >= b at its highest stage (a 6-seat phase at S1
-        replays the bs2 graph too), exactly as ``d_seat_vram.capture_floors``."""
+    def capture_waves(self, max_by_seats: Sequence[int]) -> Tuple[int, ...]:
+        """Per batch b = 1..cap: the waves b's captured step needs under a
+        ``max_by_seats`` row -- the capture floor of b is the fewest rows of
+        ANY phase n >= b at its highest stage (a 6-seat phase at S1 replays
+        the bs2 graph too), exactly as ``d_seat_vram.capture_floors``."""
         out = []
         cap = len(self.capacity)
         for b in range(1, cap + 1):
@@ -2384,9 +2384,13 @@ class KvStageTable(msgspec.Struct, frozen=True, kw_only=True):
                                                 len(self.tokens) - 1)]
                        for n in range(b, cap + 1))
             d = self.demand[b - 1]
-            w = max(1, -(-d // max(1, rows))) if d > 0 else 1
-            out.append(w - self.waves[b - 1])
+            out.append(max(1, -(-d // max(1, rows))) if d > 0 else 1)
         return tuple(out)
+
+    def extra_waves(self, max_by_seats: Sequence[int]) -> Tuple[int, ...]:
+        """Per batch b = 1..cap: the waves a ``max_by_seats`` row adds to b's
+        captured step over today's (``capture_waves`` minus ``waves``)."""
+        return tuple(w - t for w, t in zip(self.capture_waves(max_by_seats), self.waves))
 
 
 def kv_stage_table(

@@ -2561,6 +2561,45 @@ def apply_d_seat_expert_rows(ns, er, rows, seat_vram, label) -> List[str]:
 #: #251c: the --env-d keys of D's KV stage form (the launcher's form values)
 D_KV_STAGE_KEYS = ("SGLANG_WEG2_D_KV_STAGE_TOKENS", "SGLANG_WEG2_D_KV_STAGE_ROWS",
                    "SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS")
+#: #251d: the operator's switch -- the stage follows the wake's demand alone
+D_KV_STAGE_BY_DEMAND_KEY = "SGLANG_WEG2_D_KV_STAGE_BY_DEMAND"
+
+
+def d_kv_stage_by_demand(env: Mapping[str, str]) -> bool:
+    """#251d: SGLANG_WEG2_D_KV_STAGE_BY_DEMAND truthy in the D group's env."""
+    return str((env or {}).get(D_KV_STAGE_BY_DEMAND_KEY, "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def kv_stage_wave_cap(ns, er, tab, max_by: Sequence[int], env: Mapping[str, str],
+                      head: str) -> Tuple[Optional[int], List[str]]:
+    """#251d: the overflow-wave cap the captured decode steps need under the
+    highest stage per seat count ``max_by``. A form that lowers a batch's
+    capture floor adds waves (``tab.extra_waves``); the step needs
+    max(``tab.capture_waves``) of them, and below that its own bound refuses
+    the capture on TP0 ('Step ids exceed the LRU rows plus the staging rows')
+    -- rc12z22's SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES=2 against 3 for S1 at
+    n=5/6. The launcher's own cap (derived, or not written at all) is raised;
+    a cap told in --env-d is refused by name (W169). (None, []) = nothing to
+    change: no extra wave, or the cap already carries it (the default table
+    adds none)."""
+    if not any(int(e) > 0 for e in tab.extra_waves(max_by)):
+        return None, []
+    need = max(tab.capture_waves(max_by))
+    have = er.pool_overflow_waves(env)
+    if need <= have:
+        return None, []
+    if er.POOL_OVERFLOW_WAVES_ENV in env and not getattr(ns, "d_pool_waves_derived", False):
+        raise Weg2DKvStageWavesRefused(
+            "W169 Weg2DKvStageWavesRefused: die Stufenform (hoechste Stufe je Sitzzahl %s) "
+            "braucht %d Ueberlaufwellen je bs %s, --env-d nennt %s=%s -- der Capture "
+            "verweigerte auf TP0 ('Step ids exceed ...'); keine Stufenform geschrieben"
+            % (list(max_by), need, list(tab.capture_waves(max_by)),
+               er.POOL_OVERFLOW_WAVES_ENV, env.get(er.POOL_OVERFLOW_WAVES_ENV)))
+    return need, ["%s: WELLEN (#251d) %s %d -> %d (Launcher-Ableitung): die Stufenform senkt "
+                  "den Capture-Floor, Wellen je bs %s statt %s -- ohne die Anhebung verweigert "
+                  "der Capture auf TP0" % (head, er.POOL_OVERFLOW_WAVES_ENV, have, need,
+                                          list(tab.capture_waves(max_by)), list(tab.waves))]
 
 
 def operator_kv_stage_max(raw: Optional[str], cap: int, stages: int) -> Optional[Tuple[int, ...]]:
@@ -2621,6 +2660,12 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
     op_raw = env.get(D_KV_STAGE_KEYS[2])
     op_max = operator_kv_stage_max(op_raw, len(tab.max_by_seats), len(tab.tokens))
     max_by = tab.max_by_seats if op_max is None else op_max
+    by_demand = d_kv_stage_by_demand(env)
+    if by_demand:
+        # #251d: no table -- every stage at every seat count (the rank does not
+        # read the row either; it is written so the capture line names it)
+        max_by = tuple(len(tab.tokens) - 1 for _ in tab.max_by_seats)
+    waves_to, waves_lines = kv_stage_wave_cap(ns, er, tab, max_by, env, head)
     n = len(rows[-1].scratch_given)
     scratch = _rank_vec(env.get("SGLANG_MOE_SCRATCH_SLOTS"), n)
     seat_raw = env.get("SGLANG_WEG2_D_SEAT_EXPERT_ROWS")
@@ -2634,11 +2679,15 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
         D_KV_STAGE_KEYS[1]: str(tab.rows),
         D_KV_STAGE_KEYS[2]: ",".join(str(j) for j in max_by),
     }
+    if waves_to is not None:
+        items[er.POOL_OVERFLOW_WAVES_ENV] = str(int(waves_to))
     for k, v in items.items():
         env_raw = set_group_env(env_raw, k, v)
     ns.env_d = env_raw
     ns._d_kv_stage_written = {"host": host_rank, "rows": tab.rows, "seat_raw": seat_raw,
                               "op_max": op_raw if op_max is not None else None}
+    if waves_to is not None:
+        ns._d_kv_stage_written["waves_raw"] = env.get(er.POOL_OVERFLOW_WAVES_ENV)
     caps = " ".join("n=%d:%s" % (i + 1, "/".join(str(c) for c in cs))
                     for i, cs in enumerate(tab.capacity))
     # the A/B candidate (main 28.09.): S1 wherever the default keeps S0 -- the
@@ -2651,6 +2700,16 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
         % (head, D_KV_STAGE_KEYS[2], ",".join(str(j) for j in op_max),
            ",".join(str(j) for j in tab.max_by_seats), list(tab.extra_waves(op_max)),
            list(tab.extra_waves(tab.max_by_seats)), list(op_max))]
+    if by_demand:
+        op_line.append(
+            "%s: BEDARF (#251d) %s=1 -- keine Tabelle je Sitzzahl: jede Stufe %s bei jeder "
+            "Sitzzahl, der Wake nimmt die kleinste, die die KV-Tokens seiner Sitze haelt "
+            "(%s geschrieben, im Rang nicht gelesen%s); Zusatzwellen je bs %s in JEDER Phase "
+            "(auch S0) -- der Preis, den der A/B-Boot misst"
+            % (head, D_KV_STAGE_BY_DEMAND_KEY, list(tab.tokens), D_KV_STAGE_KEYS[2],
+               "" if op_max is None else ", Operator-Wert %s ersetzt" % op_raw,
+               list(tab.extra_waves(max_by))))
+    op_line.extend(waves_lines)
     return [
         "%s: --env-d %s (Stufen %s Tok, KV-Zelle %d B/Tok, Stufenzeile %.1f MiB: "
         "S1..S%d nehmen %s Zeilen; TP0 Scratch %d -> %d, Sitzzeilen %s -> %s -- die "
@@ -2693,6 +2752,11 @@ def d_kv_stage_undo(ns) -> None:
         env_raw = _drop_group_env(env_raw, k)
     if w.get("op_max") is not None:  # the operator's value is not the launcher's to take back
         env_raw = set_group_env(env_raw, D_KV_STAGE_KEYS[2], str(w["op_max"]))
+    if "waves_raw" in w:  # #251d: the wave cap this form raised goes back too
+        from sglang.srt.planner.expert_residency import POOL_OVERFLOW_WAVES_ENV
+
+        env_raw = (_drop_group_env(env_raw, POOL_OVERFLOW_WAVES_ENV) if w["waves_raw"] is None
+                   else set_group_env(env_raw, POOL_OVERFLOW_WAVES_ENV, str(w["waves_raw"])))
     ns.env_d = env_raw
     ns._d_kv_stage_written = None
 
@@ -4308,6 +4372,13 @@ class Weg2DKvStageMaxRefused(Weg2LaunchRefused):
     the launcher's stage table (one entry per seat count 1..cap, each a stage
     index of the table). Named, never quietly replaced by the default -- an
     A/B arm that silently runs the other arm measures nothing."""
+
+
+class Weg2DKvStageWavesRefused(Weg2DKvStageMaxRefused):
+    """#251d: the stage form lowers a batch's capture floor below what the
+    overflow-wave cap told in --env-d serves -- the capture would refuse the
+    boot on TP0. Named here instead (a subclass, so d_seat_table_lines lets it
+    through like W168)."""
 
 
 class Weg2TokenCutNotWired(Weg2LaunchRefused):
