@@ -261,16 +261,16 @@ class LRUFileEvictor:
         self._is_storage_owner = (not self._writes_shared_keys) or (
             tp_rank == 0 and pp_rank == 0 and attn_cp_rank == 0
         )
-        # 28.09. THE WAKE READS THE JOURNAL, NOT THE DIRECTORY (store_journal.py):
-        # every writing rank of a shared-key store appends a line per committed
-        # page; the owner reads the others' journals from where it last looked.
-        # Journals of earlier boots are compacted away here -- this attach walks
-        # the whole directory anyway. SGLANG_WEG2_STORE_JOURNAL=0: walk as before.
+        # 28.09. THE INDEX IS PERSISTED IN THE STORE (store_journal.py): every
+        # writing rank of a shared-key store appends write-ahead lines to its own
+        # journal; an attach loads snapshot + journals instead of walking, the
+        # wake reads the other journals' new lines, and the D group's owner
+        # rewrites the snapshot and compacts. SGLANG_WEG2_STORE_JOURNAL=0: walk.
         self._journal: Optional[_sj.JournalWriter] = None
         self._journal_reader: Optional[_sj.JournalReader] = None
-        self._journal_wakes = 0
+        self._journal_items: Optional[list] = None
+        self._journal_source = ""
         if self._writes_shared_keys and _sj.enabled():
-            _sj.compact(file_path, _sj.attach_epoch())
             _group = (os.environ.get("SGLANG_WEG2_GROUP", "") or "g").strip() or "g"
             self._journal = _sj.JournalWriter(
                 file_path, f"{_group}-t{tp_rank}-p{pp_rank}-c{attn_cp_rank}")
@@ -448,17 +448,19 @@ class LRUFileEvictor:
                 self.file_path, self.max_size_bytes, self.min_free_bytes
             )
             if self._scan_population_is_group_wide:
-                scanned = self._census_existing_files()
+                scanned = self._attach_census()
                 self._check_index_coverage()
 
         if not self._eviction_enabled:
+            self._journal_items = None  # a non-owner graded; it keeps no index
             return
 
         self._clamp_max_size_to_fs()
 
         if scanned is None:
-            scanned = self._census_existing_files()
+            scanned = self._attach_census()
         self._install_census(scanned)
+        self._journal_after_attach()
         # W8b: the index is what the cap is enforced against, so a cap over a
         # fraction of the directory is not a cap. Armed only for a shared-key
         # store: where every rank legitimately owns its own suffixed files,
@@ -791,6 +793,29 @@ class LRUFileEvictor:
         *,
         owner_writes_whole_file: bool = True,
     ) -> bool:
+        """Write-ahead ``R`` line, then :meth:`_reserve_impl`; ``A`` on refusal.
+
+        Every write path (whole-file rename, canonical extents, QSA/mamba blobs)
+        reserves before it touches the disk, so this one hook puts the intent
+        in the journal before any file changes (store_journal.py, CRASH ORDER).
+        """
+        jn = getattr(self, "_journal", None)
+        if jn is not None:
+            jn.write("R", time.time(), int(value_bytes), suffixed_key)
+        ok = self._reserve_impl(suffixed_key, value_bytes, key,
+                                owner_writes_whole_file=owner_writes_whole_file)
+        if not ok and jn is not None:
+            jn.write("A", time.time(), 0, suffixed_key)
+        return ok
+
+    def _reserve_impl(
+        self,
+        suffixed_key: str,
+        value_bytes: int,
+        key: str = "",
+        *,
+        owner_writes_whole_file: bool = True,
+    ) -> bool:
         """Admit a new write of ``value_bytes``, evicting LRU victims as needed.
 
         On success the key is pre-reserved at MRU and flagged in-flight so a
@@ -991,6 +1016,8 @@ class LRUFileEvictor:
 
     def abort(self, suffixed_key: str) -> None:
         """Release a reservation whose write failed: drop it and refund the bytes."""
+        if getattr(self, "_journal", None) is not None:
+            self._journal.write("A", time.time(), 0, suffixed_key)
         if not self._eviction_enabled:
             return
         with self._lock:
@@ -1223,6 +1250,7 @@ class LRUFileEvictor:
         # a no-op (a known stem is not re-counted, an unlinked one is gone).
         if getattr(self, "_journal_reader", None) is not None:
             self._journal_reader.mark()
+        collect = getattr(self, "_journal_collect", None)
         entries: List[Tuple[float, str, int]] = []
         seen_bytes = 0
         seen_entries = 0
@@ -1234,6 +1262,8 @@ class LRUFileEvictor:
             size = self._allocated_size(st)
             seen_bytes += size
             seen_entries += 1
+            if collect is not None:
+                collect.append((st.st_mtime, stem, size))
             # Only files this index is responsible for.
             if not self._scan_suffixes or not stem.endswith(self._scan_suffixes):
                 if (persistent and self._l3_inherited_suffixes
@@ -1444,16 +1474,11 @@ class LRUFileEvictor:
             return self.index_coverage()
         t0 = time.monotonic()
         if self._journal_reader is not None and _sj.enabled():
-            self._journal_wakes += 1
-            every = _sj.full_walk_every()
-            if every and self._journal_wakes % every == 0:
-                why = f"every {every} wakes ({_sj.FULL_WALK_EVERY_ENV})"
-            else:
-                got = self._journal_reader.read_delta()
-                if got is not None:
-                    return self._journal_apply(got[0], got[1], t0)
-                why = self._journal_reader.why_full
-            logger.info(f"HiCacheFile journal: full walk at this wake -- {why}")
+            recs, nbytes = self._journal_reader.read_delta()
+            for note in self._journal_reader.notes:
+                logger.warning(f"HiCacheFile journal: {note} -- followed from where it is now; "
+                               f"an entry whose file is gone is struck at its next ENOENT")
+            return self._journal_apply(recs, nbytes, t0)
         with self._lock:
             # Adopted at attach, or written by this process: this owner's.
             own_known = set(self._lru) - self._foreign_indexed
@@ -1521,6 +1546,8 @@ class LRUFileEvictor:
         with self._lock:
             c = dict(getattr(self, "_scan_census", None) or _EMPTY_CENSUS)
             for _t, op, size, stem in records:
+                if op not in ("C", "E"):
+                    continue  # R/A: intents, resolved by their C/A (or at the next load)
                 indexed = (not self._scan_suffixes) or stem.endswith(self._scan_suffixes)
                 if op == "C":
                     if indexed:
@@ -1603,6 +1630,153 @@ class LRUFileEvictor:
             f"{(time.monotonic() - t0) * 1000:.0f} ms (no directory walk)"
         )
         return census
+
+    # -- persistent index (store_journal.py) --------------------------------
+
+    def _journal_is_snapshot_writer(self) -> bool:
+        g = (os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper()
+        return self._is_storage_owner and g in ("", "D")
+
+    def _attach_census(self) -> List[Tuple[float, str, int]]:
+        """The attach census: from snapshot + journals when they hold, else ONE
+        walk (which the snapshot writer then persists)."""
+        if getattr(self, "_journal", None) is None:
+            return self._census_existing_files()
+        t0 = time.monotonic()
+        items, why = self._journal_load()
+        if items is None:
+            logger.info(f"HiCacheFile index: FULL WALK at attach -- {why}")
+            self._journal_collect = []
+            try:
+                entries = self._census_existing_files()
+            finally:
+                self._journal_items = self._journal_collect
+                self._journal_collect = None
+            self._journal_source = f"walk ({why})"
+            return entries
+
+        class _St:
+            __slots__ = ("st_mtime", "st_size", "st_blocks")
+
+            def __init__(self, m, n):
+                self.st_mtime, self.st_size, self.st_blocks = m, n, 0
+
+        real = self._iter_existing
+        self._iter_existing = lambda: ((stem, _St(m, n)) for stem, (m, n) in items.items())
+        try:
+            entries = self._census_existing_files()
+        finally:
+            self._iter_existing = real
+        self._journal_items = [(m, stem, n) for stem, (m, n) in items.items()]
+        self._journal_source = why
+        logger.info(f"HiCacheFile index LOADED at attach: {why}, {len(items)} files, "
+                    f"{(time.monotonic() - t0) * 1000:.0f} ms (no directory walk)")
+        return entries
+
+    def _journal_load(self):
+        """``(items, provenance)`` from snapshot + journals, or ``(None, why)``."""
+        own = self._journal.path if self._journal is not None else None
+        epoch = _sj.attach_epoch()
+        boot = _sj.kernel_boot_id()
+
+        def _stat(stem):
+            try:
+                st = os.stat(self._path_for_stem(stem))
+            except OSError:
+                return None
+            return (st.st_mtime, self._allocated_size(st))
+
+        for _attempt in range(5):
+            snap, why = _sj.load_snapshot(self.file_path)
+            if snap is None:
+                return None, why
+            if snap.boot_id != boot:
+                return None, ("kernel boot id changed since the snapshot (host reboot or "
+                              "power loss can drop unsynced journal lines)")
+            items = dict(snap.items)
+            records = []
+            used = 0
+            for p in _sj.journal_paths(self.file_path):
+                if p == own:
+                    continue
+                e = _sj.epoch_of(p) or 0
+                if e < snap.epoch or (epoch > 0 and e >= epoch):
+                    continue  # compacted into the snapshot / this boot's (read at the wake)
+                try:
+                    with open(p, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    records = None
+                    break
+                recs, jboot = _sj.parse_lines(data[: data.rfind(b"\n") + 1])
+                if jboot is not None and jboot != boot:
+                    return None, f"journal {os.path.basename(p)} from another kernel boot"
+                records.extend(recs)
+                used += 1
+            try:
+                same = os.stat(os.path.join(self.file_path, _sj.SNAP)).st_ino == snap.inode
+            except OSError:
+                same = False
+            if records is None or not same:
+                continue  # the snapshot writer compacted meanwhile: load its new one
+            records.sort(key=lambda r: r[0])
+            applied, stated = _sj.replay(items, records, _stat)
+            return items, (f"snapshot epoch {snap.epoch} ({len(snap.items)} files) + {used} "
+                           f"journal(s), {applied} line(s), {stated} open intent(s) stat'ed")
+        return None, "the snapshot kept changing while it was read"
+
+    def _journal_after_attach(self) -> None:
+        """The snapshot writer persists what this attach installed and compacts;
+        every owner sets where its journal reads start."""
+        items = self._journal_items
+        self._journal_items = None
+        if self._journal_reader is None:
+            return
+        epoch = _sj.attach_epoch()
+        self._journal_reader.mark(epoch_below=epoch if epoch > 0 else None)
+        if items is None or not self._journal_is_snapshot_writer():
+            return
+        try:
+            items.sort(key=lambda it: it[0])
+            tmps = _sj.remove_snapshot_tmps(self.file_path)
+            if tmps:
+                logger.info(f"HiCacheFile index: {tmps} torn snapshot tmp(s) of a dead writer removed")
+            n, nbytes = _sj.write_snapshot(self.file_path, items, epoch)
+            gone = _sj.remove_journals_before(self.file_path, epoch)
+            logger.info(f"HiCacheFile index SNAPSHOT written: {n} files, {nbytes} B "
+                        f"({self._journal_source}); {gone} journal(s) of earlier boots compacted; "
+                        f"host RAM of this index ~{n * _sj.RAM_BYTES_PER_ENTRY / (1 << 20):.0f} MiB "
+                        f"({_sj.RAM_BYTES_PER_ENTRY} B/entry) per owner")
+        except OSError as e:
+            logger.warning(f"HiCacheFile index snapshot NOT written ({e}); the next attach walks")
+
+    def forget(self, stems) -> int:
+        """ENOENT at a read: these indexed pages have no file. Struck, and an
+        ``E`` line so the sibling's index strikes them too. Returns the count."""
+        n = 0
+        now = time.time()
+        with self._lock:
+            for stem in stems:
+                prev = self._lru.get(stem)
+                if prev is None or stem in self._pending_writes:
+                    continue
+                del self._lru[stem]
+                self._total_bytes -= prev
+                if stem in self._foreign_indexed:
+                    self._foreign_indexed.discard(stem)
+                    self._foreign_indexed_bytes -= prev
+                n += 1
+                if self._journal is not None:
+                    self._journal.write("E", now, prev, stem)
+        return n
+
+    def journal_sync_async(self) -> None:
+        """fsync this rank's journal on a thread -- called after the sleep leg
+        committed, never inside it (a flip is never slowed)."""
+        jn = getattr(self, "_journal", None)
+        if jn is None:
+            return
+        threading.Thread(target=jn.sync, name="weg2-l3-journal-fsync", daemon=True).start()
 
     def _path_for_stem(self, stem: str) -> str:
         """The file this stem names. One join, so the evictor, the

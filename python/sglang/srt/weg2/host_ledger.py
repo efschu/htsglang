@@ -2620,6 +2620,8 @@ def charge_terms(
     # rc12d: the torch allocation history (weg2/memhist.py), booked. The
     # lean form arms after the first sleep: RUN moment only.
     memhist_gib: float = 0.0,
+    # 28.09.: the L3 store's RAM index (store_journal.py), per owner, both moments
+    l3_index_gib: float = 0.0,
     memhist_run_only: bool = False,
 ) -> Dict[str, object]:
     """Everything the BOOT ITSELF adds to ``memory.current``, per term.
@@ -2686,6 +2688,7 @@ def charge_terms(
         "d_draft_host_gib": max(0.0, float(d_draft_host_gib)),
         # rc12d: the ledger post 'memhist'; key always present (0.0 = off)
         "memhist_gib": max(0.0, float(memhist_gib)),
+        "l3_index_gib": max(0.0, float(l3_index_gib)),
         "memhist_run_only": bool(memhist_run_only),
         "image_p_gib": images.p_gib,
         "image_d_gib": images.d_gib,
@@ -2736,6 +2739,7 @@ def _boot_charges_gib(terms: Dict[str, object]) -> float:
         + float(terms.get("d_draft_host_gib", 0.0) or 0.0)  # H25: parked D draft
         # rc12d: the history armed from rank start is there at both moments
         + (0.0 if terms.get("memhist_run_only") else float(terms.get("memhist_gib", 0.0) or 0.0))
+        + float(terms.get("l3_index_gib", 0.0) or 0.0)  # 28.09.: the L3 index, every owner
     )
 
 
@@ -4237,6 +4241,8 @@ def price(
     anchor_mib: Optional[int] = None,
     d_draft_host_gib: float = 0.0,
     memhist_gib: float = 0.0,
+    # 28.09.: the L3 store's RAM index (store_journal.py), per owner, both moments
+    l3_index_gib: float = 0.0,
     memhist_run_only: bool = False,
     # H87: see `charge_terms` (d_only) and `run_origin_gib`/`resolve_image_terms`
     # (reference_model_ok). Defaults are byte-identical to every caller before.
@@ -4404,7 +4410,8 @@ def price(
                            hicache_disabled=hicache_disabled,
                            arena_gib=arena_gib, staging_gb=staging_gb, anchor_mib=anchor_mib,
                            d_draft_host_gib=d_draft_host_gib, d_only=d_only,
-                           memhist_gib=memhist_gib, memhist_run_only=memhist_run_only)
+                           memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
+                           l3_index_gib=l3_index_gib)
     heaps_gib = charges["heaps_gib"]
     anchors_gib = charges["anchors_gib"]
     rings_gib = charges["rings_gib"]
@@ -4533,6 +4540,7 @@ def price(
         "arena_gib": float(charges.get("arena_gib", 0.0) or 0.0),  # #1432: in the Arm's own terms, so the run peak carries it
         "d_draft_host_gib": float(charges.get("d_draft_host_gib", 0.0) or 0.0),  # H25
         "memhist_gib": float(charges.get("memhist_gib", 0.0) or 0.0),  # rc12d
+        "l3_index_gib": float(charges.get("l3_index_gib", 0.0) or 0.0),  # 28.09.
         "memhist_run_only": bool(charges.get("memhist_run_only", False)),
         "overhead_gib": overhead_gib,
         # #1386: SAME LABEL DEFECT the #1317n comment above names for
@@ -5601,6 +5609,7 @@ def arm_terms_line(arm) -> str:
         f"d_draft_host={_g('d_draft_host_gib')} "
         + (f"memhist={_g('memhist_gib')}{'(run)' if t.get('memhist_run_only') else ''} "
            if float(t.get('memhist_gib') or 0.0) else "")
+        + (f"l3_index={_g('l3_index_gib')} " if float(t.get('l3_index_gib') or 0.0) else "")
         + f"overhead={_g('overhead_gib')} xchg_bounce={_g('xchg_bounce_gib')} "
         f"host_weights={_g('host_ring_gib')} "
         f"ratchet_charged={_g('flip_ratchet_charged_gib')} "
@@ -5690,6 +5699,8 @@ def choose(
     reference_model_ok: Optional[bool] = None,
     reference_model_why: str = "",
     memhist_gib: float = 0.0,
+    # 28.09.: the L3 store's RAM index (store_journal.py), per owner, both moments
+    l3_index_gib: float = 0.0,
     memhist_run_only: bool = False,
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
@@ -5754,6 +5765,7 @@ def choose(
             reference_model_ok=reference_model_ok,
             reference_model_why=reference_model_why,
             memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
+            l3_index_gib=l3_index_gib,
         )
         for s, m in arms
     ]
@@ -6336,6 +6348,7 @@ def choose(
                         reference_model_ok=reference_model_ok,
                         reference_model_why=reference_model_why,
                         memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
+                        l3_index_gib=l3_index_gib,
                     )
                 except Exception:  # noqa: BLE001 - advice may never mask the refusal
                     return False
