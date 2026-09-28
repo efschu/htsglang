@@ -448,6 +448,23 @@ def pool_lru_rows(hot_phys, lru_start: int, row_limit: int) -> Dict[int, int]:
     return out
 
 
+def eager_lru_static_residency(planner, resident_count: int) -> bool:
+    """H107b: does the planner hold the static identity residency -- expert
+    ``e`` resident at slot ``e`` for ``e`` in ``[0, R)`` -- the layout
+    ``_run_eager_lru`` computes wave 0 in (``slot0 = {e: e}``)? True for no
+    map at all and for the store layout's spelled-out identity maps (Task #47,
+    ``resident_ids == range(R)``, ``resident_slot == {e: e}``); False for a hot
+    set or a load-time layout that moved a resident off its own slot."""
+    ids = getattr(planner, "resident_ids", None)
+    if ids is None:
+        return True
+    R = int(resident_count)
+    if frozenset(int(e) for e in ids) != frozenset(range(R)):
+        return False
+    slot = getattr(planner, "resident_slot", None)
+    return slot is None or all(slot.get(e) == e for e in range(R))
+
+
 def plan_eager_lru_waves(
     spill_sorted: Sequence[int],
     lru_row_of: Dict[int, int],
@@ -4711,12 +4728,16 @@ class MoEExpertOffloadCache:
         resume_warm().eager_reached(self)  # RW: an eager layer never waits for the warm
         self.begin_eager_pool()
         # H107: static residency and expert-major only (a hot resident set or a
-        # token-major split keep the plain plan)
+        # token-major split keep the plain plan). H107b: "static" is the
+        # identity [0,R) at slot == id, not "no map" -- the store layout
+        # (Task #47) spells that identity out as maps, and the NF D pool runs
+        # on the store, so `resident_ids is None` kept H107 off on the metal
+        # (bridge 28.09. 19:38-19:58: 0x 'H107 EAGER-LRU').
         self._eager_lru_armed = (
             self._pool_eager_lru_hits
             and self._pool_ready
             and self._pool_eager_wave_order == "expert"
-            and self.planner.resident_ids is None
+            and eager_lru_static_residency(self.planner, self.resident_count)
         )
         try:
             out = self.run_waves(
