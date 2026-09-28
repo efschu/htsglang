@@ -1611,7 +1611,21 @@ class StreamStats:
         self.t0 = None
         self.seconds = 0.0
 
-    def sample_anon(self) -> None:
+    #: NF-Bootzeit (rc12z15 PP0, 28.09.): one /proc/self/status read PER
+    #: TENSOR was 69 % of the consumer's samples (LOAD-PROFILE weight_utils.py
+    #: _rss_anon_bytes 46.8 % + 22.4 %) over 135 032 NF tensors -- the
+    #: instrument, not the disk, bounded the O_DIRECT load (0.59 GB/s).
+    #: Sampled at most every ANON_SAMPLE_S; the last tensor is always sampled.
+    ANON_SAMPLE_S = 0.05
+
+    def sample_anon(self, force: bool = False) -> None:
+        import time as _t
+
+        now = _t.perf_counter()
+        last = getattr(self, "_anon_last", None)
+        if not force and last is not None and now - last < self.ANON_SAMPLE_S:
+            return
+        self._anon_last = now
         a = _rss_anon_bytes()
         if a > self.anon_peak:
             self.anon_peak = a
@@ -1772,6 +1786,7 @@ def pread_safetensors_stream(
             except OSError:
                 pass
         st.seconds = _time.perf_counter() - st.t0
+        st.sample_anon(force=True)
         if log:
             logger.info(st.line())
 
