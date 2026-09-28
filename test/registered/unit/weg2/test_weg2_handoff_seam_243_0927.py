@@ -257,8 +257,11 @@ class Wiring(unittest.TestCase):
         self.assertIn("self._d_seat.release()", blk[after:after + 400])
 
     def test_controller_sweeps_every_pass(self):
+        # the loop head, not a fixed prefix: RO (p_read_overlap) added its
+        # setup above `while True:` and pushed the pins past 1500 chars
         i = self.src.index("    async def controller(self)")
-        blk = self.src[i:i + 1500]
+        j = self.src.index("        while True:", i)
+        blk = self.src[j:j + 1500]
         self.assertLess(blk.index("self._hl_sweep()"), blk.index("self._rvp_take()"))
 
     def test_the_rid_end_wrapper_is_registered_and_the_rid_noted(self):
