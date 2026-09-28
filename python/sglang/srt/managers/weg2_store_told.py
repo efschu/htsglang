@@ -408,12 +408,24 @@ def _probe_key(scheduler, req, ids, told: int):
     ``told`` counts KEYS, so a bigram span needs ``told + 1`` raw tokens
     (the same +1 as ``follower_limit_tokens``); P's handed-over page keys
     (#1442), when registered for this rid, replace the covered prefix
-    exactly as ``_storage_hit_query`` does."""
+    exactly as ``_storage_hit_query`` does.
+
+    R5 (rc12z2 e8a2cd2dc5, P 03:26:41, rid weg2-44-76): the ids go in as
+    ``array('q')`` -- the tree's own key form. A list made every TF probe
+    (``weg2_told_fidelity.pp0_admissible``) die in ``RadixKey.match``
+    (``AssertionError((array.array, list))``, 10 of 10 on that boot, "#TF
+    told-fidelity probe skipped"), so PP0 never saw that its own anchor at
+    told was gone: it put Admit(37952) on the wire, refused its own resume
+    (#928, admitted 0) while PP1 resumed at 37952 -- W27 START-SPLIT. The
+    store hash reads arrays alike (``compute_node_hash_values`` hashes the
+    tree's array keys)."""
+    from array import array
+
     from sglang.srt.mem_cache.radix_cache import RadixKey
 
     tree = getattr(scheduler, "tree_cache", None)
     bigram = bool(getattr(tree, "is_eagle", False))
-    raw = list(ids[: int(told) + (1 if bigram else 0)])
+    raw = array("q", ids[: int(told) + (1 if bigram else 0)])
     key = RadixKey(raw, extra_key=getattr(req, "extra_key", None), is_bigram=bigram)
     return key, bigram
 
