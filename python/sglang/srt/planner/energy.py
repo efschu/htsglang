@@ -1478,7 +1478,12 @@ class ScenarioConfig:
 
 
 #: The endpoints a cold-prefill / benchmark flush hits on the target server.
-CACHE_FLUSH_ENDPOINTS = ("/flush_cache", "/clear_hicache_storage_backend")
+#: L3P (review 28.09.): ``/flush_cache`` only. ``/clear_hicache_storage_backend``
+#: wiped the persistent L3 store of the model identity -- a measurement server
+#: of the same model reattaches the SAME store, so a benchmark flush deleted what
+#: production reuses. A cold prefill needs the device/host tree empty, not the
+#: disk tier; the store is refused without force anyway (W166).
+CACHE_FLUSH_ENDPOINTS = ("/flush_cache",)
 
 
 def cache_flush_warning(

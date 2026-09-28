@@ -1421,7 +1421,8 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
 
 
 class ClearHiCacheReqInput(BaseReq, kw_only=True):
-    pass
+    #: L3P: a persistent L3 store is only cleared with force (HiCacheFile.clear)
+    force: bool = False
 
 
 class ClearHiCacheReqOutput(BaseReq, kw_only=True):

@@ -1550,9 +1550,10 @@ async def list_external_corpora():
 
 @app.api_route("/clear_hicache_storage_backend", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def clear_hicache_storage_backend_deprecated():
-    """Deprecated: use POST /hicache/storage-backend/clear."""
-    ret = await _global_state.tokenizer_manager.clear_hicache_storage()
+async def clear_hicache_storage_backend_deprecated(force: bool = False):
+    """Deprecated: use POST /hicache/storage-backend/clear. ``?force=1`` also
+    clears a persistent L3 store (refused otherwise, W166)."""
+    ret = await _global_state.tokenizer_manager.clear_hicache_storage(force=force)
     return Response(
         content=(
             "Deprecated endpoint. Use POST /hicache/storage-backend/clear.\n"
@@ -1566,9 +1567,10 @@ async def clear_hicache_storage_backend_deprecated():
 # curl -s -X POST http://127.0.0.1:30000/clear_hicache_storage_backend
 @app.api_route("/hicache/storage-backend/clear", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def clear_hicache_storage_backend():
-    """Clear the hierarchical cache storage backend."""
-    ret = await _global_state.tokenizer_manager.clear_hicache_storage()
+async def clear_hicache_storage_backend(force: bool = False):
+    """Clear the hierarchical cache storage backend. ``?force=1`` also clears a
+    persistent L3 store (refused otherwise, W166)."""
+    ret = await _global_state.tokenizer_manager.clear_hicache_storage(force=force)
     return Response(
         content="Hierarchical cache storage backend cleared.\n",
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,

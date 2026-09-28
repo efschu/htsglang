@@ -405,11 +405,11 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         return (await self.weg2_park_running_communicator(obj))[0]
 
-    async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
-        """Clear the hierarchical cache storage."""
+    async def clear_hicache_storage(self: TokenizerManager, force: bool = False) -> ClearHiCacheReqOutput:
+        """Clear the hierarchical cache storage (``force``: also a persistent L3 store)."""
         self.auto_create_handle_loop()
         # Delegate to the scheduler to handle HiCacheStorage clearing
-        return (await self.clear_hicache_storage_communicator(ClearHiCacheReqInput()))[
+        return (await self.clear_hicache_storage_communicator(ClearHiCacheReqInput(force=bool(force))))[
             0
         ]
 

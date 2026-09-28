@@ -8903,9 +8903,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         return True, "Resized HiCache storage backend successfully.", stats
 
-    def clear_storage_backend(self) -> bool:
+    def clear_storage_backend(self, force: bool = False) -> bool:
         try:
-            ok = self.cache_controller.clear_storage_backend()
+            ok = self.cache_controller.clear_storage_backend(force=force)
         except Exception as e:
             logger.error("Failed to clear hierarchical cache storage backend: %s", e)
             return False

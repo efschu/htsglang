@@ -412,7 +412,7 @@ class HybridCacheController(BaseHiCacheController):
             hicache_storage_pass_prefix_keys,
         )
 
-    def clear_storage_backend(self) -> bool:
+    def clear_storage_backend(self, force: bool = False) -> bool:
         if not self.enable_storage:
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
@@ -422,8 +422,9 @@ class HybridCacheController(BaseHiCacheController):
                 type(self.storage_backend).__name__,
             )
             return False
-        self.storage_backend.clear()
-        return True
+        from sglang.srt.mem_cache.hicache_storage import clear_storage
+
+        return clear_storage(self.storage_backend, force=force)
 
     def _init_extra_host_mem_release_queues(self) -> None:
         self.extra_host_mem_release_queues = {}

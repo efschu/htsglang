@@ -3826,7 +3826,21 @@ class HiCacheFile(HiCacheStorage):
         """
         return self._evictor.check_free_space(force=force)
 
-    def clear(self) -> bool:
+    def clear(self, force: bool = False) -> bool:
+        # L3P (review 28.09.): a PERSISTENT store (its launcher identity file is
+        # present) is what the next boot reattaches to; one clear wipes every
+        # page of this model identity -- the energy planner's cold-prefill flush
+        # did exactly that on a measurement server of the same identity. Only an
+        # explicit force clears it.
+        if not force and os.path.isfile(os.path.join(self.file_path, "L3_IDENTITY.json")):
+            logger.error(
+                "W166 Weg2L3ClearRefused: HiCacheFile store %s is the persistent L3 store of "
+                "this model identity (L3_IDENTITY.json); a clear would remove every page the "
+                "next boot reattaches to. Refused -- clear with force=true "
+                "(POST /hicache/storage-backend/clear?force=1) if that is meant.",
+                self.file_path,
+            )
+            return False
         _idx = self._l3_index()
         if _idx is not None:
             _idx.clear()  # #1459
@@ -3845,6 +3859,17 @@ class HiCacheFile(HiCacheStorage):
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
             return False
 
+
+
+def clear_storage(backend, force: bool = False) -> bool:
+    """Clear a storage backend; ``force`` reaches a backend whose ``clear``
+    takes it (HiCacheFile: a persistent L3 store refuses without it). A backend
+    returning None counts as done (the upstream contract)."""
+    try:
+        ok = backend.clear(force=force)
+    except TypeError:
+        ok = backend.clear()
+    return ok is not False
 
 
 class FormAWorkerNullStorage(HiCacheStorage):
