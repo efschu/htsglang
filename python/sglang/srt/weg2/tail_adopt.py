@@ -233,6 +233,7 @@ def held_shapes(kvpool, req_to_token_pool) -> HeldShapes:
     from sglang.srt.distributed.utils import uneven_dcp_active
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+    from sglang.srt.rank_role import kv_only_rank
 
     fa: Dict[int, List[RowSpec]] = {}
     ring: Dict[int, RowSpec] = {}
@@ -260,7 +261,11 @@ def held_shapes(kvpool, req_to_token_pool) -> HeldShapes:
                 rope = _row(kvpool.qsa_rope_position_buffer)
             fa[int(gid)] = rows
     gdn: Dict[int, List[RowSpec]] = {}
-    if isinstance(req_to_token_pool, HybridReqToTokenPool):
+    # Rank form (28.09.): a KV-only rank holds NO GDN state -- the weight
+    # rank's. Whatever mamba pool it carries is a placeholder (the lane sizes
+    # it to one slot, qwen3_next.py), never rows to adopt: a gdn entry here
+    # would also shut the owner install path below (``not held.gdn``).
+    if isinstance(req_to_token_pool, HybridReqToTokenPool) and not kv_only_rank():
         cache = req_to_token_pool.mamba_pool.mamba_cache
         for gid, local in sorted(req_to_token_pool.mamba_map.items()):
             t = cache.temporal[local]

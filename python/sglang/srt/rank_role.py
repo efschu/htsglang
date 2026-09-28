@@ -766,6 +766,40 @@ def form_a_worker_holds_kv() -> bool:
     return bounds is not None and int(bounds[2]) > int(bounds[1])
 
 
+def kv_only_rank() -> bool:
+    """Rank form (28.09., one predicate for #239 and the weightless lane):
+    True only on a rank with dense weight share 0 that OWNS full-attention KV
+    token rows. Such a rank holds K/V rows and nothing else of the attention
+    state -- no GDN/mamba state, no QSA index, no draft; those are the
+    weight-holding rank's. Two sources, one answer:
+
+    * the installed Form A plan: a worker with a share > 0 under the #239
+      token cut (:func:`form_a_worker_holds_kv`);
+    * the weightless-KV lane: every rank but the head, as long as its owner
+      range is not empty (the lane refuses a 0 share, W181).
+
+    Readers ask this, never a backend name: the claim vote's min arm and
+    the host-state pool split (cache_controller), the F14 page window, the
+    RankState record's GDN applicability and tail adoption's held shapes.
+    False on a classic boot, on the host and on a byteless worker."""
+    if form_a_worker_holds_kv():
+        return True
+    from sglang.srt.distributed.utils import (
+        uneven_dcp_owner_bounds,
+        weightless_kv_active,
+        weightless_worker_rank,
+    )
+
+    if not weightless_kv_active():
+        return False
+    from sglang.srt.runtime_context import get_parallel
+
+    if not weightless_worker_rank(get_parallel().tp_rank):
+        return False
+    bounds = uneven_dcp_owner_bounds()
+    return bounds is None or int(bounds[2]) > int(bounds[1])
+
+
 def form_a_token_src_rank() -> Optional[int]:
     """The rank whose sampled tokens every other rank adopts under Form A
     (the host: it alone has lm_head + hidden states), or None on a classic
