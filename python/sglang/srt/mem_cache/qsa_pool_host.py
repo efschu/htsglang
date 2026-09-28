@@ -26,6 +26,7 @@ the last writer would win.
 
 from __future__ import annotations
 
+import logging
 from typing import Sequence
 
 import torch
@@ -35,6 +36,8 @@ from sglang.srt.mem_cache.canonical_page_store import (
     CanonicalPageError,
 )
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+
+logger = logging.getLogger(__name__)
 
 
 def qsa_index_bytes_per_token(device_pools, page_size: int) -> int:
@@ -136,7 +139,68 @@ class QSAPagedHostPool(DeepSeekV4PagedHostPool):
         if present and host_indices.numel() % self.slot_page_size:
             # Partial groups would need ring state; restored prefixes end on pages.
             raise ValueError("QSA HiCache transfers must contain complete KV pages")
+        if present and not self._host_rows_in_range(host_indices):
+            return False
         return present
+
+    #: H106 (rc12z15): transfers a Form A worker skipped, and their pages
+    _formA_skip_n = 0
+    _formA_skip_pages = 0
+
+    def _host_rows_in_range(self, host_indices) -> bool:
+        """H106 (rc12z15 f49f7bddd2, D 10:22:39, TP1+TP2 at once): the KV
+        anchor of a Form A worker is BYTELESS and, under #249 (9996780367),
+        grows its id space past the synced size instead of refusing -- rc12z15
+        ``#249 BYTELESS-GROW pool=MHATokenToKVPoolHost rows 353600 -> 373504``
+        at the wake that read six held prompts (63360 + 17536 + 105664 +
+        17664 + 63488 + 105792 = 373504 ids). This pool is addressed by the
+        KV's ids (``indices_from_pool=KV``) but was sized ONCE from the KV's
+        size at assembly (5525 pages = 353600 ids) with real 4 KiB rows and
+        does not grow: the tail of weg2-0-4 named page >= 5525, the host slice
+        came back EMPTY and ``transfer_kv_direct`` died on ``output with shape
+        [1, 4096] doesn't match the broadcast shape [0, 4096]`` (the kernel
+        branches would have written past the pinned buffer instead).
+
+        A Form A worker runs no dense chain (``form_a_worker_forward``: the
+        host alone holds attention, the QSA indexer and KV; the worker's KV
+        pool is 0 B and its storage tier the null backend), so its QSA rows
+        are never read: an out-of-range transfer there is skipped by name.
+        On any other rank the same shape would be a wrong index for real
+        bytes -- a named stop, never a silent skip. Per-rank local copy, no
+        collective on this path, so skipping changes no group sequence."""
+        try:
+            if host_indices.numel() == 0:
+                return True
+            hi = int(host_indices.max()) // int(self.slot_page_size)
+            lo = int(host_indices.min())
+        except Exception:  # noqa: BLE001 - an index we cannot read is left to the kernel
+            return True
+        if lo >= 0 and hi < int(self.num_host_pages):
+            return True
+        from sglang.srt.rank_role import this_rank_is_form_a_worker
+
+        pages = int(host_indices.numel()) // int(self.slot_page_size)
+        if this_rank_is_form_a_worker():
+            QSAPagedHostPool._formA_skip_n += 1
+            QSAPagedHostPool._formA_skip_pages += pages
+            n = QSAPagedHostPool._formA_skip_n
+            if n <= 16 or n % 256 == 0:
+                logger.warning(
+                    "H106 FORM-A SIDECAR SKIP pool=%s pages=%d host_page_max=%d "
+                    "host_pages=%d min_id=%d (n=%d, pages_total=%d): the byteless KV "
+                    "anchor grew its ids (#249), this pool did not; a Form A worker "
+                    "never reads its QSA rows, so nothing is transferred.",
+                    self.pool_name, pages, hi, int(self.num_host_pages), lo, n,
+                    QSAPagedHostPool._formA_skip_pages,
+                )
+            return False
+        raise RuntimeError(
+            f"H106 SIDECAR HOST INDEX OUT OF RANGE pool={self.pool_name} "
+            f"host_page_max={hi} host_pages={int(self.num_host_pages)} min_id={lo} "
+            f"pages={pages}: this rank holds real QSA bytes and a KV id names a "
+            "row this pool does not have -- copying it would be a wrong index for "
+            "the attention; stopping by name instead."
+        )
 
 
 def build_qsa_index_window(
