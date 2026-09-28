@@ -2030,6 +2030,10 @@ class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
     #: The rank and card that took longest in this leg, as a printable note --
     #: the critical path of L5.  Same collective, same denominator.
     critical_path: Optional[str] = None
+    #: ANCHOR-LOST: token depths of the Mamba anchors this sleep's flush
+    #: dropped (device only, no host copy), union over the group's ranks.
+    #: The front stops crediting presence at them.  None = nothing lost.
+    anchors_lost: Optional[List[int]] = None
 
 
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):

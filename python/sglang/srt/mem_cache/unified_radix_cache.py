@@ -23,6 +23,7 @@ from typing import (
     NamedTuple,
     Optional,
     Sequence,
+    Tuple,
     TypeVar,
 )
 
@@ -1349,6 +1350,47 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def reset(self) -> None:
         self._reset_full()
+
+    def weg2_node_depth(self, node) -> int:
+        """Token depth at the END of ``node`` (its key plus every ancestor's)
+        -- the number a Mamba anchor on this node lets a request resume at."""
+        depth = 0
+        while node is not None and node is not self.root_node:
+            depth += len(getattr(node, "key", None) or [])
+            node = getattr(node, "parent", None)
+        return depth
+
+    def weg2_unbacked_anchors(self) -> List[Tuple[int, Optional[str]]]:
+        """ANCHOR-LOST (postflip-admit 28.09.): ``(depth, rid)`` of every
+        Mamba anchor that lives on the DEVICE only -- no host copy -- so a
+        ``reset()`` now drops it. The flush of a D sleep calls this right
+        before the reset: after the wake the KV of that prefix is back from
+        the store, its anchor is not, and a hybrid model resumes at an anchor
+        only (bridge f833 19:51:36 '[#904 match-census] reached=37376
+        accepted=0 ... MambaComponent:absent=37376', weg2-16-54 re-prefilled
+        38291 tokens through P). ``rid`` is the anchor's writer when the
+        tree knows it (``weg2_anchor_rid``), else None. Host-copy test only
+        (an L3 copy is not checked): an over-count here can only retract
+        credit, never grant it."""
+        out: List[Tuple[int, Optional[str]]] = []
+        mamba = getattr(ComponentType, "MAMBA", None)
+        if mamba is None:
+            return out
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children.values())
+            if node is self.root_node:
+                continue
+            try:
+                cd = node.component_data[mamba]
+            except (KeyError, IndexError, TypeError):
+                continue
+            if cd is None or cd.value is None or cd.host_value is not None:
+                continue
+            out.append((self.weg2_node_depth(node), getattr(node, "weg2_anchor_rid", None)))
+        out.sort()
+        return out
 
     def _release_host_values_before_reset(self) -> int:
         """H81 (27B 479f6eccb0 on the NF line): give back the arena references
@@ -4065,9 +4107,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             try:
                 p = node.parent
                 logger.warning(
-                    "#1421 BACKUP-REFUSED n=%d why=%s node=%s tokens=%d evicted=%s backuped=%s "
+                    "#1421 BACKUP-REFUSED n=%d why=%s node=%s tokens=%d depth=%d rid=%s "
+                    "evicted=%s backuped=%s "
                     "parent=%s parent_evicted=%s parent_backuped=%s parent_is_root=%s pins=%s/%s",
                     n, why, getattr(node, "id", "?"), len(getattr(node, "key", []) or []),
+                    self.weg2_node_depth(node), getattr(node, "weg2_anchor_rid", None),
                     node.evicted, node.backuped, getattr(p, "id", "?"),
                     getattr(p, "evicted", None), getattr(p, "backuped", None),
                     p is self.root_node, self._mamba_pins_held(), self._mamba_pin_budget,

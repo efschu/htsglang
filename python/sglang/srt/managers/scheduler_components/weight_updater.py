@@ -545,6 +545,20 @@ class Weg2LegLedger:
             self._done.popitem(last=False)
 
 
+def _weg2_anchors_lost_for_leg(updater: Any, what: str) -> List[int]:
+    """ANCHOR-LOST: this rank's dropped Mamba anchors for the group fence, on
+    the release leg only (the flush that drops them precedes it);
+    read-and-clear on the scheduler. [] on every other leg and wherever there
+    is no scheduler ledger (fence harnesses, stock engines)."""
+    if not str(what).startswith("release"):
+        return []
+    take = getattr(getattr(updater, "scheduler", None), "weg2_take_anchors_lost", None)
+    try:
+        return list(take()) if take is not None else []
+    except Exception:  # noqa: BLE001 - the answer never fails on an instrument
+        return []
+
+
 @dataclass(kw_only=True, slots=True)
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
@@ -4122,6 +4136,7 @@ class SchedulerWeightUpdaterManager:
             "card": self._weg2_card_uuid() or "unknown",
             "leg_ms": float(leg_ms),
             "per_tag": dict(per_tag or {}),
+            "anchors_lost": _weg2_anchors_lost_for_leg(self, what),
             "waves_published": wx.waves_digest(wx.published_waves() or ()),
             "waves_planned": wx.waves_digest(wx.planned_waves() or ()),
         }
@@ -4175,7 +4190,11 @@ class SchedulerWeightUpdaterManager:
                 f"(slowest of {len(votes)} rank(s) in this leg)"
             )
         )
-        return {"per_tag": merged, "critical_path": critical}
+        lost = sorted({int(d) for v in votes for d in (v.get("anchors_lost") or ())})
+        return {"per_tag": merged, "critical_path": critical, "anchors_lost": lost}
+
+    def _weg2_anchors_lost_for(self, what: str) -> List[int]:
+        return _weg2_anchors_lost_for_leg(self, what)
 
     def _weg2_rescan_store_index(self) -> None:
         """Re-read the L3 store directory into the LRU index at this wake.
@@ -9243,6 +9262,9 @@ class SchedulerWeightUpdaterManager:
             if weg2_memory_saver_on
             else None,
             critical_path=(report.get("critical_path") or None)
+            if weg2_memory_saver_on
+            else None,
+            anchors_lost=(report.get("anchors_lost") or None)
             if weg2_memory_saver_on
             else None,
         ))
