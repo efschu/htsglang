@@ -174,6 +174,11 @@ CGROUP_ROOT = "/sys/fs/cgroup"
 #: that has to be at least as large as a pool that already lives in RAM.
 #: SGLANG_WEG2_STORE_ROOT: see the rig-path block above.
 STORE_ROOT = os.environ.get("SGLANG_WEG2_STORE_ROOT") or "/spinning/hicache-weg2"
+#: W57 (28.09.): whether the store root was TOLD (SGLANG_WEG2_STORE_ROOT) or is
+#: the rig default above. A launcher run without it measured the ZFS pool under
+#: /spinning (171 GiB free, 93 % full) instead of the NF store the container
+#: mounts from XFS [/l3/nf] (1.3 TB free) and refused the store by W57.
+STORE_ROOT_TOLD = bool(os.environ.get("SGLANG_WEG2_STORE_ROOT"))
 #: C18: where the per-card host-ring files live under the MAP_SHARED form.  A
 #: tmpfs, because the granules must be shared PAGES (both co-located rank
 #: processes map the same file), not a disk-backed file.  THIS COMMENT IS THE
@@ -5456,13 +5461,63 @@ class StoreDiskPlan:
     #: fresh one). They are this store's own, inside its cap, so the disk
     #: check credits them instead of charging them a second time.
     reused_bytes: int = 0
+    #: W57: the path statvfs measured (the store directory when it exists,
+    #: else its root), and the filesystem /proc/mounts names for it
+    fs_path: str = ""
+    fs_type: str = ""
+    fs_mount: str = ""
+
+    @property
+    def growth_bytes(self) -> int:
+        """What the store may still GROW by: max_size minus its own bytes."""
+        return max(0, self.max_size_bytes - min(self.reused_bytes, self.max_size_bytes))
 
     @property
     def needed_bytes(self) -> int:
-        return self.max_size_bytes + self.min_free_bytes
+        return self.growth_bytes + self.min_free_bytes
+
+    def disk_line(self, verdict: str) -> str:
+        """W57's one line: where it measured, on what, and the arithmetic."""
+        g = host_ledger.GIB
+        return (f"W57 STORE-DISK {verdict}: path={self.fs_path} fs={self.fs_type or '?'} "
+                f"mount={self.fs_mount or '?'} free={self.fs_free_bytes / g:.2f} GiB "
+                f"reused={self.reused_bytes / g:.2f} GiB max_size={self.max_size_bytes / g:.2f} "
+                f"GiB growth={self.growth_bytes / g:.2f} GiB min_free={self.min_free_bytes / g:.2f} "
+                f"GiB needed={self.needed_bytes / g:.2f} GiB (needed = growth + min_free, "
+                f"growth = max_size - reused)")
 
     def extra_config(self) -> str:
         return store_extra_config(self.max_size_bytes, self.min_free_bytes)
+
+
+def fs_of(path: str, mounts_text: Optional[str] = None) -> Tuple[str, str, str]:
+    """W57: (mount point, fs type, source) of the filesystem holding ``path``
+    -- the longest /proc/mounts mount point above its nearest existing
+    ancestor. ("", "", "") when /proc/mounts is unreadable."""
+    p = os.path.abspath(str(path or "/"))
+    while p != "/" and not os.path.exists(p):
+        p = os.path.dirname(p)
+    real = os.path.realpath(p)
+    if mounts_text is None:
+        try:
+            with open("/proc/mounts") as fh:
+                mounts_text = fh.read()
+        except OSError:
+            return "", "", ""
+
+    def _unesc(v: str) -> str:
+        return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), v)
+
+    best = ("", "", "")
+    for ln in mounts_text.splitlines():
+        parts = ln.split()
+        if len(parts) < 3:
+            continue
+        src, mnt, typ = _unesc(parts[0]), _unesc(parts[1]), parts[2]
+        inside = real == mnt or real.startswith(mnt.rstrip("/") + "/") or mnt == "/"
+        if inside and len(mnt) >= len(best[0]):
+            best = (mnt, typ, src)
+    return best
 
 
 def plan_store(
@@ -5472,7 +5527,7 @@ def plan_store(
     kv_mib_per_token_per_attn_layer: float,
     sidecar_factor: float = STORE_SIDECAR_FACTOR,
     min_free_gib: float = STORE_DISK_MIN_FREE_GIB,
-    root: str = STORE_ROOT,
+    root: Optional[str] = None,
     store_max_gb: float = 0.0,
     directory_name: Optional[str] = None,
 ) -> StoreDiskPlan:
@@ -5532,18 +5587,35 @@ def plan_store(
     else:
         max_size = int(math.ceil(pool_bytes * float(sidecar_factor)))
     min_free = int(round(float(min_free_gib) * host_ledger.GIB))
+    if root is None:
+        # W57 (28.09.): the rig default is a path on the ZFS pool; a launcher
+        # that was not told where its store lives measures THAT disk, not the
+        # store's (the NF store is a bind of XFS [/l3/nf] into the container).
+        if not STORE_ROOT_TOLD:
+            mnt, typ, src = fs_of(STORE_ROOT)
+            raise Weg2StoreDiskRefused(
+                f"W57 Weg2StoreDiskRefused: no store root told -- SGLANG_WEG2_STORE_ROOT "
+                f"is unset, and the launcher's default {STORE_ROOT} lives on fs={typ or '?'} "
+                f"mount={mnt or '?'} ({src or '?'}), which need not be the disk the store "
+                f"is on; nothing was measured. Set SGLANG_WEG2_STORE_ROOT to the store's "
+                f"own root (the container: /var/lib/htsglang/hicache-weg2 with the store "
+                f"volume mounted)."
+            )
+        root = STORE_ROOT
     os.makedirs(root, exist_ok=True)
-    st = os.statvfs(root)
+    directory = f"{root}/{directory_name or tag}"
+    # W57: measure where the store IS -- its own directory when it exists (a
+    # store directory may itself be a mount), else the root it will be made in
+    probe = directory if os.path.isdir(directory) else root
+    st = os.statvfs(probe)
     free = st.f_bavail * st.f_frsize
     total = st.f_blocks * st.f_frsize
-    directory = f"{root}/{directory_name or tag}"
+    fs_mount, fs_type, _fs_src = fs_of(probe)
     # L3P: a persistent directory's own bytes are inside its cap -- the disk
-    # has to fund only what the store may still GROW by. Walked only when the
-    # plain check would refuse, so a cold or roomy disk pays no walk.
+    # has to fund only what the store may still GROW by (``growth_bytes``).
     reused = 0
-    if directory_name and max_size + min_free > free and os.path.isdir(directory):
+    if directory_name and os.path.isdir(directory):
         reused = _tree_bytes(directory)[0]
-        free += min(reused, max_size)
     plan = StoreDiskPlan(
         directory=directory,
         p_pool_tokens=int(p_pool_tokens),
@@ -5555,12 +5627,17 @@ def plan_store(
         fs_free_bytes=free,
         fs_total_bytes=total,
         reused_bytes=reused,
+        fs_path=probe,
+        fs_type=fs_type,
+        fs_mount=fs_mount,
     )
     if plan.needed_bytes > free:
         raise Weg2StoreDiskRefused(
             f"W57 Weg2StoreDiskRefused: the filesystem hosting {root} cannot fund this "
-            f"boot's store. NEEDED {plan.needed_bytes / host_ledger.GIB:.2f} GiB = "
-            f"max_size {max_size / host_ledger.GIB:.2f} GiB (P pool "
+            f"boot's store. {plan.disk_line('REFUSED')}. "
+            f"NEEDED {plan.needed_bytes / host_ledger.GIB:.2f} GiB = growth "
+            f"{plan.growth_bytes / host_ledger.GIB:.2f} GiB of max_size "
+            f"{max_size / host_ledger.GIB:.2f} GiB (P pool "
             f"{plan.p_pool_tokens} tokens x {cell_bytes} B/token = "
             f"{pool_bytes / host_ledger.GIB:.2f} GiB x sidecar factor "
             f"{sidecar_factor:.2f}) + min_free {min_free / host_ledger.GIB:.2f} GiB, "
@@ -21307,6 +21384,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         directory_name=(l3_persist_dir_name(_l3_ident) if _l3_ident else None),
     )
     store_cfg = store_plan.extra_config()
+    log(store_plan.disk_line("ok"))
     log(
         f"WEG2-STORE: dir={store_plan.directory} ON DISK (ZFS dataset, plain directory "
         f"-- #1236 user ruling 2026-09-09: 'normales hicaching mit lvl2 und lvl3', the "
