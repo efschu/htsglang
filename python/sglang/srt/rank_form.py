@@ -303,13 +303,16 @@ class FormMeasures:
             raise ValueError(f"{path}: schema {doc.get('schema')!r}, expected {MEASURES_SCHEMA!r}")
 
         def table(key: str) -> Dict[str, Dict[int, float]]:
+            # GRAPH prices only (operator 28.09. 23:40Z). An eager price over
+            # the Python communicator measured ~100 us per bar1 all-reduce --
+            # the dispatch and launch overhead, not the transport (production
+            # graph floor ~8 us) -- so an eager-only cell is MISSING, never a
+            # fallback: the planner stays UNMEASURED rather than decide on it.
             out: Dict[str, Dict[int, float]] = {}
             for cards, per_bs in ((doc.get(key) or {}).get(transport) or {}).items():
-                out[cards] = {int(bs): float(v["graph_median_us"] if v.get("graph_median_us")
-                                             is not None else v["eager_median_us"])
+                out[cards] = {int(bs): float(v["graph_median_us"])
                               for bs, v in per_bs.items()
-                              if v.get("graph_median_us") is not None
-                              or v.get("eager_median_us") is not None}
+                              if v.get("graph_median_us") is not None}
             return out
 
         rounds: Dict[str, Dict[str, Dict[int, float]]] = {}

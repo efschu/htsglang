@@ -122,6 +122,22 @@ def test_measured_prices_decide(tmp_path):
     assert label == "A" and "CHOSEN A" in line
 
 
+def test_an_eager_price_never_decides(tmp_path):
+    """Operator 28.09. 23:40Z: eager bar1 over the Python communicator measured
+    ~100 us (dispatch + launch, not transport). An eager-only cell is MISSING:
+    the planner stays UNMEASURED instead of deciding on it."""
+    key3 = rf.cards_key(U)
+    m = _measures(tmp_path,
+                  ar={key3: {"1": {"eager_median_us": 100.0}}},
+                  dcp={key3: {"1": {"eager_median_us": 380.0}}})
+    assert m.allreduce_us == {key3: {}} and m.dcp_exchange_us == {key3: {}}
+    cands = {"A": rf.resolve_rank_form([1, 0, 0], [0, 50, 50], dense=False),
+             "C": rf.resolve_rank_form([98, 19, 19])}
+    costs = {k: _cost(f, m) for k, f in cands.items()}
+    label, line = rf.choose_form(cands, costs, today="C")
+    assert label == "C" and "UNMEASURED" in line
+
+
 def test_override_wins_by_name(tmp_path):
     m = rf.FormMeasures.load(None)
     cands = {"A": rf.resolve_rank_form([1, 0, 0]), "C": rf.resolve_rank_form([1, 1, 1])}
