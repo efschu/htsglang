@@ -983,6 +983,35 @@ def probe_hold_pin(controller, operation, hash_value, hit_tokens=None) -> int:
         return 0
 
 
+def refuse_kv_worker_sidecar_bytes(mem_pool_host) -> None:
+    """#239 S4b (F13): a Form A worker that owns token rows carries exactly ONE
+    byte-holding host pool -- the KV anchor. Its sidecars (QSA index, draft,
+    mamba) stay byteless: those states are the attention host's. A sidecar
+    WITH bytes on such a worker would be addressed by the worker's KV ids,
+    whose space is the arena's (staging + slots x page + placeholders) and
+    not the sidecar's fixed row count -- the #249 BYTELESS-GROW shape, where
+    a skip is right only because nothing is there. Refused by name at attach
+    instead of trusted."""
+    from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
+
+    if not isinstance(mem_pool_host, HostPoolGroup):
+        return
+    anchor = mem_pool_host.anchor_entry
+    carrying = [
+        f"{entry.name}({int(entry.host_pool.size_per_token)} B/token)"
+        for entry in mem_pool_host.entries
+        if entry is not anchor and int(entry.host_pool.size_per_token) > 0
+    ]
+    if carrying:
+        raise RuntimeError(
+            "#239 F13 KV-WORKER SIDECAR-BYTES REFUSED: this Form A worker owns KV "
+            f"token rows and also holds bytes in {', '.join(carrying)}. Under the "
+            "token cut only the KV anchor carries bytes on a worker; a sidecar "
+            "keyed by the worker's (arena) KV ids with its own fixed row count "
+            "would read or write beside its rows."
+        )
+
+
 def canonical_kv_owner_rows_for(owner_ctx, page_size, canonical_kv_page) -> Optional[tuple]:
     """#239 S4b (F13): ``(page_size, S, lo, hi)`` when the owner rule runs on
     PAGED pools with the canonical page (the token cut: a page is written by
@@ -1797,6 +1826,7 @@ class HiCacheController:
             canonical_kv_page = build_page_window(
                 attn_layer_ids, self.mem_pool_device_hybrid, self.mem_pool_host
             )
+            refuse_kv_worker_sidecar_bytes(self.mem_pool_host)
             logger.info(
                 "#239 F13 KV-WORKER-WINDOW: Form A worker owns token rows %s of "
                 "every %d-token page; KV page window only (no mamba/QSA/draft).",

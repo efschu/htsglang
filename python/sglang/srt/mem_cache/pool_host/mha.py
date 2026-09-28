@@ -1457,11 +1457,14 @@ def get_mha_host_pool_cls(device_pool: MHATokenToKVPool, role: str = "kv") -> ty
     """
     if device_pool.head_dim != device_pool.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
-    from sglang.srt.rank_role import this_rank_is_form_a_worker
+    from sglang.srt.rank_role import form_a_worker_holds_kv, this_rank_is_form_a_worker
 
     if (
         os.environ.get("SGLANG_HICACHE_ARENA_HOST", "0") == "1"
-        and not this_rank_is_form_a_worker()  # no attention, no arena (as the mamba chooser)
+        # no attention, no arena (as the mamba chooser) -- except a worker
+        # that OWNS token rows under the token cut (#239 S4b F13): its KV
+        # lives in the one L2 like the host's did
+        and (not this_rank_is_form_a_worker() or (role == "kv" and form_a_worker_holds_kv()))
         and (role == "kv" or int(device_pool.page_size) == 1)
     ):
         # #1424 Stufe 3: rows beyond the staging ring are arena slots
