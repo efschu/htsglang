@@ -172,6 +172,7 @@ details summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
   header nav { margin-left: 0; }
   .tile .big { font-size: 28px; }
 }
+.kv .kvb span { font-weight: 700; }
 </style>
 </head>
 <body>
@@ -520,7 +521,7 @@ function bootTile(label, tok, src, rGpu, rGpuNote, rWall, e) {
   return `<div class="tile"><div class="label">${label}</div>
     <div class="big num" style="font-size:24px">${fmt(tok)}<small>Tok (Summe)</small></div><div class="state">${src}</div>
     ${kv([
-      ["&Oslash; tok/s seit Boot &middot; GPU-Rechenzeit", rGpu == null ? "\u2014" : fmt(rGpu, rGpu < 100 ? 1 : 0)],
+      ["&Oslash; tok/s seit Boot &middot; GPU-Rechenzeit", rGpu == null ? "\u2014" : fmt(rGpu, rGpu < 100 ? 1 : 0), "kvb"],
       ["&Oslash; tok/s seit Boot &middot; Wandzeit", wall],
       ["Energie je Token", e.j_per_tok == null ? "\u2014" : `${fmt(e.j_per_tok, e.j_per_tok < 1 ? 3 : 2)} J &middot; ${fmt(e.wh_per_1k, 3)} Wh/1k`],
       ["&Oslash; tok/s/W seit Boot (Token / Energie)", e.tok_per_j == null ? "\u2014" : fmt(e.tok_per_j, 2)],
