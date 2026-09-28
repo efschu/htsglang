@@ -9467,7 +9467,18 @@ class SchedulerWeightUpdaterManager:
                 # fnFL2x36: the standstill pass bound gets a grace of one
                 # stall window from here (scheduler._weg2_note_prefetch_progress)
                 scheduler._weg2_last_wake_t = time.perf_counter()
-                scheduler._rw_first_token_open = True  # RW: one WAKE-FIRST-TOKEN line per wake
+                # RW: one WAKE-FIRST-TOKEN line per wake -- ONLY when the wake has
+                # parked work (the dormant hold or a queued request). NF rc12z26
+                # 18:32: every request was aborted before the wake, the first
+                # decode was a health check 114 s later, and the line printed
+                # wake_to_first_decode_ms=116342 as if the wake had been slow.
+                _rw_work = (len(getattr(scheduler, "weg2_dormant_hold", None) or ())
+                            + len(getattr(scheduler, "weg2_post_wake_settle", None) or ())
+                            + len(getattr(scheduler, "waiting_queue", None) or ()))
+                scheduler._rw_first_token_open = _rw_work > 0
+                if not _rw_work:
+                    logger.info("RW WAKE-FIRST-TOKEN kein Resume: the wake holds no parked or "
+                                "queued request -- no wake-to-first-decode measured for this wake")
                 logger.info(
                     "WEG2-DORMANT cleared: kv_cache resumed, admission seams admit"
                 )
