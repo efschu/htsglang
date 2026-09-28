@@ -5095,9 +5095,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         try:
             # RadixKey asserts the array('q') type of `token_ids` (boot weg2zr1:
             # a list raised at the probe); slicing keeps the type.
-            probe = RadixKey(
-                token_ids if _trim else token_ids[:-1], req.extra_key, is_bigram=self.is_eagle
-            ).page_aligned(self.page_size)
+            if _trim:
+                probe = RadixKey(
+                    token_ids, req.extra_key, is_bigram=self.is_eagle
+                ).page_aligned(self.page_size)
+            else:
+                # W123/#241 (rc12z10 weg2-2-12 N=9537, rc12u weg2-6-18 N=23361):
+                # the N-1 node was inserted with the EXACT bigram key
+                # (`bigram_anchor_key`, N-1 units); the upstream slice
+                # token_ids[:-1] has N-2 units, and at N = 1 mod page that
+                # drops a whole page -- the probe never reached the N-1 node,
+                # ok=False, no #1481 mark, end_anchor=none on P, W123 on D.
+                # The probe asks with the insert's key form.
+                probe = bigram_anchor_key(
+                    token_ids, len(token_ids) - 1, req.extra_key,
+                    is_bigram=self.is_eagle, exact=self.bigram_anchor_exact,
+                    page_size=self.page_size,
+                )
             target_units = len(probe)
             mr = self.match_prefix(MatchPrefixParams(key=probe))
             usable_units = len(mr.device_indices)
