@@ -182,7 +182,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # worker (its keys are no stage page), byte-identical.
         from sglang.srt.weg2 import d_seat_vram as _dsv
 
-        _staged = _dsv.kv_stage_trims_here(int(size))
+        _staged = _dsv.kv_stage_trims_here(int(size), qsa_keys=True)
         with (
             self.full_kv_pool.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE)
             if _staged

@@ -2568,6 +2568,8 @@ D_KV_STAGE_KEYS = ("SGLANG_WEG2_D_KV_STAGE_TOKENS", "SGLANG_WEG2_D_KV_STAGE_ROWS
                    "SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS")
 #: #251d: the operator's switch -- the stage follows the wake's demand alone
 D_KV_STAGE_BY_DEMAND_KEY = "SGLANG_WEG2_D_KV_STAGE_BY_DEMAND"
+#: #239 S3g: the stage rows per D rank under the token cut (every KV rank)
+D_KV_STAGE_ROWS_BY_RANK_KEY = "SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK"
 
 
 def d_kv_stage_by_demand(env: Mapping[str, str]) -> bool:
@@ -2675,44 +2677,47 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
     if D_KV_STAGE_KEYS[0] in env:
         return ["%s: --env-d nennt %s=%s selbst -- keine Stufenform vom Launcher"
                 % (head, D_KV_STAGE_KEYS[0], env[D_KV_STAGE_KEYS[0]])]
+    fits = list(getattr(plan, "fits", None) or ())
     cut_workers = kv_stage_cut_workers(kv_token_shares, host_rank)
-    if cut_workers:
+    staged = [f.rank for f in fits
+              if f.rank != host_rank and er.kv_stage_trim_cell(f, host_rank) > 0]
+    missing = [r for r in cut_workers if r not in staged]
+    if missing:
         # 28.09. (M1 prep): the stage form sizes EVERY rank's KV pool at the top
-        # stage (kv_stage_pool_tokens) and only the host trims to S0 -- a worker
-        # holding FA KV under the cut would map its pool at the top stage,
-        # untrimmed (+100 % FA KV at S0 x 2 against the plan). Until the stages
-        # run per KV rank (S3g), no form under such a cut.
-        return ["%s: entfaellt unter dem Token-Schnitt %s -- KV-haltende Worker %s bekaemen "
-                "ihren FA-KV-Pool auf der obersten Stufe ungetrimmt (Stufen je KV-Rang: S3g); "
+        # stage (kv_stage_pool_tokens); a worker holding FA KV under the cut
+        # trims it only with its own stage rows (S3g), i.e. with its trim cell
+        # in the plan. A cut the plan does not carry per rank: no form.
+        return ["%s: entfaellt unter dem Token-Schnitt %s -- KV-haltende Worker %s ohne "
+                "Trim-Zelle im Plan bekaemen ihren FA-KV-Pool auf der obersten Stufe "
+                "ungetrimmt (Stufen je KV-Rang: S3g braucht den geloesten Schnitt); "
                 "D faehrt fest %s Token"
                 % (head, kv_token_shares, "(noch ungeloest)" if cut_workers == [-1]
                    else "Rang %s" % ",".join(str(r) for r in cut_workers),
-                   next((int(f.kv_tokens) for f in (getattr(plan, "fits", None) or ())
-                         if f.rank == host_rank), "die gebuchten"))]
-    fits = list(getattr(plan, "fits", None) or ())
-    host = next((f for f in fits if f.rank == host_rank), None)
-    why: List[str] = [] if host is not None else ["kein Attention-Host %d im Plan" % host_rank]
-    tab = None if host is None else er.kv_stage_table(
-        rows, seat_vram, kv_cell_bytes=int(host.kv_cell_bytes), kv_tokens=int(host.kv_tokens),
-        local_experts=int(host.local_experts), verify_tokens=int(verify_tokens),
-        top_k=int(top_k), host_rank=host_rank, staging_rows=int(host.staging_rows), why=why)
-    if tab is None:
+                   next((int(f.kv_tokens) for f in fits if f.rank == host_rank),
+                        "die gebuchten"))]
+    why: List[str] = []
+    group = er.kv_stage_group(rows, seat_vram, fits, verify_tokens=int(verify_tokens),
+                              top_k=int(top_k), host_rank=host_rank, why=why)
+    if group is None:
         return ["%s: entfaellt -- %s" % (head, "; ".join(why) or "ohne Grund")]
+    tab = group.host
     op_raw = env.get(D_KV_STAGE_KEYS[2])
     op_max = operator_kv_stage_max(op_raw, len(tab.max_by_seats), len(tab.tokens))
-    max_by = tab.max_by_seats if op_max is None else op_max
+    max_by = group.max_by_seats if op_max is None else op_max
     by_demand = d_kv_stage_by_demand(env)
     if by_demand:
         # #251d: no table -- every stage at every seat count (the rank does not
         # read the row either; it is written so the capture line names it)
         max_by = tuple(len(tab.tokens) - 1 for _ in tab.max_by_seats)
-    waves_to, waves_lines = kv_stage_wave_cap(ns, er, tab, max_by, env, head)
+    waves_to, waves_lines = kv_stage_wave_cap(ns, er, group, max_by, env, head)
     n = len(rows[-1].scratch_given)
     scratch = _rank_vec(env.get("SGLANG_MOE_SCRATCH_SLOTS"), n)
     seat_raw = env.get("SGLANG_WEG2_D_SEAT_EXPERT_ROWS")
     seat = _rank_vec(seat_raw, n)
-    scratch[host_rank] -= tab.rows
-    seat[host_rank] += tab.rows
+    # every KV rank moves its stage rows from its scratch into its seat rows
+    for t in group.tables:
+        scratch[t.host_rank] -= t.rows
+        seat[t.host_rank] += t.rows
     items = {
         "SGLANG_MOE_SCRATCH_SLOTS": ",".join(str(x) for x in scratch),
         "SGLANG_WEG2_D_SEAT_EXPERT_ROWS": ",".join(str(x) for x in seat),
@@ -2720,27 +2725,32 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
         D_KV_STAGE_KEYS[1]: str(tab.rows),
         D_KV_STAGE_KEYS[2]: ",".join(str(j) for j in max_by),
     }
+    worker_tabs = group.tables[1:]
+    if worker_tabs:
+        items[D_KV_STAGE_ROWS_BY_RANK_KEY] = ",".join(str(x) for x in group.rows_by_rank)
     if waves_to is not None:
         items[er.POOL_OVERFLOW_WAVES_ENV] = str(int(waves_to))
     for k, v in items.items():
         env_raw = set_group_env(env_raw, k, v)
     ns.env_d = env_raw
     ns._d_kv_stage_written = {"host": host_rank, "rows": tab.rows, "seat_raw": seat_raw,
-                              "op_max": op_raw if op_max is not None else None}
+                              "op_max": op_raw if op_max is not None else None,
+                              "worker_rows": {int(t.host_rank): int(t.rows)
+                                              for t in worker_tabs}}
     if waves_to is not None:
         ns._d_kv_stage_written["waves_raw"] = env.get(er.POOL_OVERFLOW_WAVES_ENV)
     caps = " ".join("n=%d:%s" % (i + 1, "/".join(str(c) for c in cs))
                     for i, cs in enumerate(tab.capacity))
     # the A/B candidate (main 28.09.): S1 wherever the default keeps S0 -- the
     # waves it adds per bs, priced by the capture floor (not written)
-    cand = tuple(max(1, int(j)) if len(tab.tokens) > 1 else 0 for j in tab.max_by_seats)
-    cand_extra = tab.extra_waves(cand)
+    cand = tuple(max(1, int(j)) if len(tab.tokens) > 1 else 0 for j in group.max_by_seats)
+    cand_extra = group.extra_waves(cand)
     op_line = [] if op_max is None else [
         "%s: OPERATOR %s=%s statt der Voreinstellung %s -- Zusatzwellen je bs %s "
         "(Voreinstellung %s); im Rang: '#251 WAKE-RESHARD CAPTURE-FLOOR ... max_by_seats %s'"
         % (head, D_KV_STAGE_KEYS[2], ",".join(str(j) for j in op_max),
-           ",".join(str(j) for j in tab.max_by_seats), list(tab.extra_waves(op_max)),
-           list(tab.extra_waves(tab.max_by_seats)), list(op_max))]
+           ",".join(str(j) for j in group.max_by_seats), list(group.extra_waves(op_max)),
+           list(group.extra_waves(group.max_by_seats)), list(op_max))]
     if by_demand:
         op_line.append(
             "%s: BEDARF (#251d) %s=1 -- keine Tabelle je Sitzzahl: jede Stufe %s bei jeder "
@@ -2749,8 +2759,20 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
             "(auch S0) -- der Preis, den der A/B-Boot misst"
             % (head, D_KV_STAGE_BY_DEMAND_KEY, list(tab.tokens), D_KV_STAGE_KEYS[2],
                "" if op_max is None else ", Operator-Wert %s ersetzt" % op_raw,
-               list(tab.extra_waves(max_by))))
+               list(group.extra_waves(max_by))))
     op_line.extend(waves_lines)
+    if worker_tabs:
+        # #239 S3g: the stage rows of every KV rank, booked as residency in S0
+        op_line.extend(er.describe_kv_stage_residency(group, marker=D_RANK_SOLVE_MARKER,
+                                                      label=label))
+        op_line.append(
+            "%s: JE KV-RANG (#239 S3g) %s=%s -- hoechste Stufe je Sitzzahl = MIN ueber die "
+            "KV-Raenge %s (Host %s, %s); jeder Rang trimmt seine Voll-Attention-KV auf S0 und "
+            "schneidet am Wake seine eigenen Stufenzeilen"
+            % (head, D_KV_STAGE_ROWS_BY_RANK_KEY, items[D_KV_STAGE_ROWS_BY_RANK_KEY],
+               list(group.max_by_seats), list(tab.max_by_seats),
+               ", ".join("Rang %d %s" % (t.host_rank, list(t.max_by_seats))
+                         for t in worker_tabs)))
     return [
         "%s: --env-d %s (Stufen %s Tok, KV-Zelle %d B/Tok, Stufenzeile %.1f MiB: "
         "S1..S%d nehmen %s Zeilen; TP0 Scratch %d -> %d, Sitzzeilen %s -> %s -- die "
@@ -2762,11 +2784,12 @@ def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens
         "%s: hoechste Stufe je Sitzzahl %s (Voreinstellung ohne Zusatzwelle -- Variante B, "
         "bis die Wellenmessung eine Zusatzwelle preist); Zeilen je (n, S0/S1/S2) %s gegen "
         "den Bedarf %s; der Capture zaehlt je bs die wenigsten Zeilen, die eine erlaubte "
-        "Phase hat (#251 CAPTURE-FLOOR)" % (head, list(tab.max_by_seats), caps, list(tab.need)),
+        "Phase hat (#251 CAPTURE-FLOOR)" % (head, list(group.max_by_seats), caps,
+                                            list(tab.need)),
         "%s: A/B-Kandidat Zwischenform (S1 bis zur Kappe) SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS=%s "
         "-- Zusatzwellen je bs %s (Default: %s); nicht geschrieben, fuer --env-d im A/B"
         % (head, ",".join(str(j) for j in cand), list(cand_extra),
-           list(tab.extra_waves(tab.max_by_seats))),
+           list(group.extra_waves(group.max_by_seats))),
     ] + op_line
 
 
@@ -2781,15 +2804,19 @@ def d_kv_stage_undo(ns) -> None:
     h, rows_ = int(w["host"]), int(w["rows"])
     scratch = [int(float(x)) for x in env.get("SGLANG_MOE_SCRATCH_SLOTS", "").split(",")
                if x.strip()]
-    if h < len(scratch):
-        scratch[h] += rows_
+    given = {h: rows_}
+    given.update({int(r): int(x) for r, x in (w.get("worker_rows") or {}).items()})
+    if any(r < len(scratch) for r in given):
+        for r, x in given.items():
+            if r < len(scratch):
+                scratch[r] += x
         env_raw = set_group_env(env_raw, "SGLANG_MOE_SCRATCH_SLOTS",
                                 ",".join(str(x) for x in scratch))
     if w.get("seat_raw") is None:
         env_raw = _drop_group_env(env_raw, "SGLANG_WEG2_D_SEAT_EXPERT_ROWS")
     else:
         env_raw = set_group_env(env_raw, "SGLANG_WEG2_D_SEAT_EXPERT_ROWS", str(w["seat_raw"]))
-    for k in D_KV_STAGE_KEYS:
+    for k in D_KV_STAGE_KEYS + (D_KV_STAGE_ROWS_BY_RANK_KEY,):
         env_raw = _drop_group_env(env_raw, k)
     if w.get("op_max") is not None:  # the operator's value is not the launcher's to take back
         env_raw = set_group_env(env_raw, D_KV_STAGE_KEYS[2], str(w["op_max"]))

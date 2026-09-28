@@ -142,7 +142,7 @@ def test_the_qsa_keys_are_staged_on_the_host_only():
     from sglang.srt.mem_cache import qsa_kv_pool
 
     src = inspect.getsource(qsa_kv_pool)
-    assert "_staged = _dsv.kv_stage_trims_here(int(size))" in src
+    assert "_staged = _dsv.kv_stage_trims_here(int(size), qsa_keys=True)" in src
     with _armed(FakeTms(), rank=0):
         assert dsv.kv_stage_trims_here(192) is True
         assert dsv.kv_stage_trims_here(128) is False  # not the top stage's pool

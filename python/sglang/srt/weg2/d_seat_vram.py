@@ -377,8 +377,18 @@ class KvTensorGeom:
     geom: SlotTensorGeom
     token_ratio: int = 1
     token_pad: int = 0
+    #: #239 S3g: (cp_S, cp_ratio) of a rank holding its owner share of a
+    #: token-cut FA pool -- global slot L sits at row (L // S) * ratio + (L %
+    #: S - lo), so the first T global tokens live in the first
+    #: ``dcp_compact_pool_rows(T)`` = (T // S + 1) * ratio rows. (0, 0) = the
+    #: whole context on this rank (every other pool), byte-identical.
+    owner_block: Tuple[int, int] = (0, 0)
 
     def slots_for(self, tokens: int) -> int:
+        S, ratio = (int(x) for x in self.owner_block)
+        if S > 0 and ratio > 0:
+            need = (int(tokens) // S + 1) * ratio + int(self.token_pad)
+            return max(0, min(int(self.geom.slots), need))
         need = -(-(int(tokens) + int(self.token_pad)) // max(1, int(self.token_ratio)))
         return max(0, min(int(self.geom.slots), need))
 
@@ -565,9 +575,15 @@ def stage_form(env: Optional[Dict[str, str]] = None) -> Optional[StageForm]:
     tokens = tuple(sorted({t for t in _ints(envs.SGLANG_WEG2_D_KV_STAGE_TOKENS.get()) if t > 0}))
     if len(tokens) < 2:
         return None
+    rows_on = max(0, int(envs.SGLANG_WEG2_D_KV_STAGE_ROWS.get() or 0))
+    by_rank = _ints(envs.SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK.get())
+    if by_rank:
+        # #239 S3g: every KV rank funds its own stages; this rank's entry
+        r = _this_rank()
+        rows_on = max(0, int(by_rank[r])) if 0 <= r < len(by_rank) else 0
     return StageForm(
         tokens=tokens,
-        rows_on=max(0, int(envs.SGLANG_WEG2_D_KV_STAGE_ROWS.get() or 0)),
+        rows_on=rows_on,
         max_by_seats=_ints(envs.SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS.get()),
         by_demand=bool(envs.SGLANG_WEG2_D_KV_STAGE_BY_DEMAND.get()),
     )
@@ -697,22 +713,87 @@ def _form_a_worker_holds_kv() -> bool:
     return bool(form_a_worker_holds_kv())
 
 
-def kv_stage_trims_here(pool_size: int) -> bool:
+def _this_rank() -> int:
+    """#239 S3g: this process's D TP rank (the rank role's, else the TP
+    group's; 0 when neither is up -- a classic single-rank boot)."""
+    from sglang.srt import rank_role
+
+    if getattr(rank_role, "_INSTALLED_PLAN", None) is not None:
+        return int(getattr(rank_role, "_INSTALLED_RANK", 0))
+    try:
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        return int(get_tensor_model_parallel_rank())
+    except Exception:  # noqa: BLE001 -- no TP group: a single rank
+        return 0
+
+
+def kv_owner_block() -> Tuple[int, int]:
+    """#239 S3g: (cp_S, cp_ratio) of this rank's owner share under the token
+    cut, (0, 0) off the weighted lane -- the geometry ``KvTensorGeom`` maps a
+    stage's global tokens to this rank's compacted rows with."""
+    try:
+        from sglang.srt.distributed.utils import uneven_dcp_owner_bounds
+    except ImportError:
+        return (0, 0)
+    b = uneven_dcp_owner_bounds()
+    if b is None:
+        return (0, 0)
+    S, lo, hi = (int(x) for x in b)
+    return (S, hi - lo) if hi > lo else (0, 0)
+
+
+def _worker_stages_here() -> bool:
+    """#239 S3g: a Form A worker that holds FA KV AND was given its own stage
+    rows (SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK) trims its FA KV like the host."""
+    from sglang.srt.environ import envs
+
+    form = stage_form()
+    return (form is not None and _form_a_worker_holds_kv()
+            and bool(_ints(envs.SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK.get())))
+
+
+def owner_block_for(pool_size: int) -> Tuple[int, int]:
+    """#239 S3g: (cp_S, cp_ratio) when ``pool_size`` is this rank's compacted
+    owner share of the top stage -- ``dcp_compact_pool_rows(top)`` = (top // S
+    + 1) x ratio rows of a token-cut FA pool (a worker's, or the host's under a
+    cut that gives it a share); (0, 0) for every pool that holds the whole
+    context (Form A's host KV, the QSA keys, the draft KV) -- byte-identical."""
+    form = stage_form()
+    S, ratio = kv_owner_block()
+    if form is None or S <= 0 or ratio <= 0 or ratio >= S:
+        return (0, 0)
+    return (S, ratio) if int(pool_size) == (int(form.tokens[-1]) // S + 1) * ratio else (0, 0)
+
+
+def kv_stage_trims_here(pool_size: int, *, qsa_keys: bool = False) -> bool:
     """#251c: this rank trims its KV tensors to S0 at birth -- the stage form
     is armed, the pool is the top stage's, and this is NOT a Form A worker.
     rc12z11 (590fa56a02, 28.09. 09:01Z and 09:09Z): the workers' QSA keys were
     trimmed like TP0's KV. The stage pages are TP0's only (the planner prices
-    them there); a worker's tensors stay H95c's, byte for byte."""
+    them there); a worker's tensors stay H95c's, byte for byte.
+
+    #239 S3g: under the token cut every rank that holds full-attention KV
+    trims its compacted FA pool (``owner_block_for``) -- a worker only when the
+    launcher gave it its own stage rows (``_worker_stages_here``), and never
+    its QSA keys (``qsa_keys=True``: rc12z11 stays)."""
     form = stage_form()
-    return form is not None and int(pool_size) >= form.tokens[-1] and not _form_a_worker()
+    if form is None:
+        return False
+    owner = owner_block_for(pool_size) != (0, 0)
+    if not _form_a_worker():
+        return int(pool_size) >= form.tokens[-1] or owner
+    return owner and not qsa_keys and _worker_stages_here()
 
 
 def kv_stage_boot_rows(pool_size: int, page_size: int) -> Optional[int]:
     """#251c: the rows a stage-form pool keeps mapped from its birth to the
-    first wake (S0's tokens + the page), None where this rank trims nothing."""
+    first wake (S0's tokens + the page), None where this rank trims nothing.
+    #239 S3g: a compacted owner-share pool keeps S0's compacted rows + the page."""
     if not kv_stage_trims_here(pool_size):
         return None
-    return int(stage_form().tokens[0]) + int(page_size)
+    form = stage_form()
+    return stage_mapped_rows(pool_size, int(form.tokens[0]), page_size)
 
 
 def bound_stage_rows(pool, rows: int) -> None:
@@ -728,6 +809,31 @@ def bound_stage_rows(pool, rows: int) -> None:
     for sub in subs:
         if isinstance(sub, MHATokenToKVPool):
             sub.set_stage_backed_rows(rows)
+
+
+def stage_mapped_rows(pool_size: int, tokens: int, page_size: int) -> int:
+    """#239 S3g: the rows a pool of ``pool_size`` keeps mapped at a stage of
+    ``tokens`` -- the stage's tokens + the page (#251c), or on a token-cut
+    FA pool (``owner_block_for``) the stage's compacted rows + the page."""
+    S, ratio = owner_block_for(pool_size)
+    if S > 0:
+        return (int(tokens) // S + 1) * ratio + int(page_size)
+    return int(tokens) + int(page_size)
+
+
+def bound_stage_tokens(pool, tokens: int, page_size: int) -> None:
+    """#239 S3g: ``bound_stage_rows`` with each (sub-)pool's own geometry --
+    a hybrid pool's FA sub-pool may be a compacted owner share while the
+    draft's pool holds the whole context."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+
+    subs = [pool]
+    if isinstance(pool, HybridLinearKVPool):
+        subs.append(pool.full_kv_pool)
+    for sub in subs:
+        if isinstance(sub, MHATokenToKVPool):
+            sub.set_stage_backed_rows(
+                stage_mapped_rows(int(getattr(sub, "size", 0) or 0), tokens, page_size))
 
 
 def kv_stage_pool_tokens(max_tokens: int, *, is_form_a_worker: bool = False,
@@ -756,7 +862,7 @@ def kv_stage_pool_tokens(max_tokens: int, *, is_form_a_worker: bool = False,
             "stage S0 -- turn the stage form off (SGLANG_WEG2_D_KV_STAGE_TOKENS) for this "
             "draft form" % LINE_MARK)
     is_form_a_worker = bool(is_form_a_worker) or _form_a_worker()
-    if is_form_a_worker and _form_a_worker_holds_kv():
+    if is_form_a_worker and _form_a_worker_holds_kv() and not _worker_stages_here():
         # 28.09. (M1 prep): this worker holds full-attention KV under the token
         # cut; its compacted FA pool follows max_total, and nothing here trims
         # it -- the top stage would be mapped whole (+100 % FA KV at S0 x 2).
@@ -809,7 +915,9 @@ def kv_stage_born(t, *, pool_size: int, page_size: int, name: str = "kv",
     slot_bytes = (t.numel() * t.element_size()) // max(1, int(layers) * n_slots)
     geom = KvTensorGeom(
         SlotTensorGeom(name, int(layers), n_slots, int(slot_bytes), int(info.size)),
-        token_ratio=int(tokens_per_slot), token_pad=int(page_size))
+        token_ratio=int(tokens_per_slot), token_pad=int(page_size),
+        # #239 S3g: a token-cut FA pool holds its owner share, compacted
+        owner_block=owner_block_for(pool_size))
     # the tensor was born by torch.zeros: its fill kernel may still be in
     # flight. Unmapping under it is a GPU fault that surfaces at the next
     # sync (rc12z11 TP1/TP2: KvRowCap._apply, exit -6) or as a dead context
@@ -858,9 +966,10 @@ def log_kv_stage_boot(form: "StageForm", allocator, cap_pages: int) -> None:
             mapped += int(info.mapped)
     logger.info(
         "#251c KV-STAGE form=%s trims_here=%s born=%d mapped=%.1f/%.1f MiB cap_pages=%d/%d "
-        "(S0 %d tokens; a Form A worker trims nothing, H95c byte-identical)",
+        "(S0 %d tokens; a Form A worker trims only its token-cut FA pool, S3g)",
         "/".join(str(t) for t in form.tokens),
-        kv_stage_trims_here(form.tokens[-1]), len(_KV_BORN), mapped / _MIB, va / _MIB,
+        bool(_KV_BORN) or kv_stage_trims_here(form.tokens[-1]), len(_KV_BORN),
+        mapped / _MIB, va / _MIB,
         int(cap_pages), int(getattr(allocator, "num_pages", 0) or 0), form.tokens[0])
 
 
@@ -1356,8 +1465,9 @@ class SeatVram:
             self.set_plan(m.ptr, m.geom.geom.name, sp, live=live, census=census)
         page = int(self.kv_tensors[0].geom.token_pad) if self.kv_tensors else 0
         for pool in self.kv_pools:
-            # zero_kv_data_buffers (the idle flush) writes only mapped rows
-            bound_stage_rows(pool, tokens + page)
+            # zero_kv_data_buffers (the idle flush) writes only mapped rows --
+            # #239 S3g: each pool's own (a token-cut FA pool: compacted)
+            bound_stage_tokens(pool, tokens, page)
         for m, sp, live in bank_plans:
             self.set_plan(m.ptr, m.geom.name, sp, live=live, census=census)
         if not shrink:
