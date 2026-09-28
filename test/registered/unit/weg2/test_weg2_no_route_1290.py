@@ -321,14 +321,18 @@ class TheRefusalIsTerminalNamedAndFourXX(CustomTestCase):
         self.assertEqual(NO_ROUTE_NAME, "W52 " + NO_ROUTE_MARKER)
         self.assertEqual(NO_ROUTE_MARKER, "Weg2NoServiceableRoute")
 
-    def test_the_router_refuses_4xx_not_503(self):
-        """503 reads as "retry" for a condition that can never change."""
+    def test_the_router_refuses_4xx_only_on_an_exact_count(self):
+        """503 reads as "retry" for a condition that can never change -- but
+        413 kills a Claude Code agent (rc12z30d 21:11:35), so it may only
+        stand on a MEASURED count over the static carrier; an estimate is 503
+        (`refusal_status`, pinned in test_weg2_front_refusal_status_0928)."""
         src = inspect.getsource(Front.handle_generate)
         i = src.find("W52_Weg2NoServiceableRoute")
         self.assertGreater(i, -1, "the router never counts the refusal")
-        self.assertIn("status=413", src[i:i + 2000],
-                      "the admission refusal must be 4xx: the request does not "
-                      "fit this server, the server did not fail")
+        self.assertIn("refusal_status(carrier_est if exact is not None else None",
+                      src[i:i + 2000],
+                      "the admission refusal must decide 413 vs 503 on the "
+                      "exact count, never on the estimate")
 
     def test_the_refusal_carries_all_three_numbers(self):
         src = inspect.getsource(Front.handle_generate)
@@ -360,7 +364,7 @@ class TheReOfferMustBeAbleToChangeTheAnswer(CustomTestCase):
                       "the re-offer does not ask whether a P prefill can "
                       "change D's answer")
         self.assertIn("W52_Weg2NoServiceableRoute", src)
-        self.assertIn("status=413", src)
+        self.assertIn("refusal_status(carrier_est, self.carrier_max_tokens)", src)
 
     def test_the_check_precedes_the_requeue_bookkeeping(self):
         """It must refuse BEFORE the X-REQUEUE line, or the counters record a
