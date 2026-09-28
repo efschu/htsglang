@@ -2080,6 +2080,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             raise
 
+        # VRAM loop P0 (28.09.): bound the caching allocator to this rank's
+        # booked size (weg2/torch_cache_cap.py); off unless the launcher armed it.
+        if self.device == "cuda":
+            from sglang.srt.weg2 import torch_cache_cap as _tcc
+
+            _tcc.arm(self.tp_rank, self.pp_rank, self.gpu_id)
+
         # Mixed-architecture rigs (bug #208): nvidia-cutlass-dsl picks its
         # compile target ONCE per process from driver device 0, not from the
         # device this rank just selected, and that same string keys its JIT
