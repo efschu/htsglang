@@ -74,9 +74,11 @@ class _Env(unittest.TestCase):
         for attr, rows in (("w13_weight_packed", w13), ("w2_weight_packed", w2)):
             open(os.path.join(self.store, f"L0-{attr}.bin"), "wb").close()
             with open(os.path.join(self.store, f"L0-{attr}.bin.r0.written.json"), "w") as fh:
-                json.dump({"rank": 0, "rows": rows}, fh)
+                json.dump({"rank": 0, "rows": rows, "identity": "h2-toy"}, fh)
+        # H2c: adoption needs the boot's store identity, and P's sentinels carry it
         self._env = mock.patch.dict(os.environ, {
-            "SGLANG_WEG2_GROUP": "D", "SGLANG_MOE_EXPERT_STORE_DIR": self.store})
+            "SGLANG_WEG2_GROUP": "D", "SGLANG_MOE_EXPERT_STORE_DIR": self.store,
+            "SGLANG_MOE_EXPERT_STORE_IDENTITY": "h2-toy"})
         self._env.start()
         self._map = mock.patch("sglang.srt.layers.moe.expert_store.expert_map",
                                return_value=KARTE)

@@ -40,6 +40,7 @@ from typing import Dict, FrozenSet, Iterable, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 MARKER = "H2 D-STORE-ADOPT"
+IDENTITY_MARKER = "H2c STORE-IDENTITY"
 _SENTINEL_RE = re.compile(r"^(?P<key>.+?)-(?P<attr>[A-Za-z0-9_]+)\.bin\.r(?P<rank>\d+)\.written\.json$")
 
 #: (layer_key, attr) -> rows listed as written, over every sentinel present at
@@ -54,6 +55,7 @@ class StoreAdoptBroken(RuntimeError):
 def reset_for_tests() -> None:
     _SNAPSHOT["rows"] = None
     _SNAPSHOT["dir"] = None
+    _SNAPSHOT.pop("refused_logged", None)
 
 
 def active() -> bool:
@@ -67,7 +69,19 @@ def active() -> bool:
         return False
     if not _es.store_enabled():
         return False
-    return bool(_em.is_nested(_es.expert_map()))
+    if not _em.is_nested(_es.expert_map()):
+        return False
+    # H2c: ohne Identitaet kann kein Sentinel belegen, dass seine Bytes zu
+    # DIESEM Checkpoint und DIESER Karte gehoeren -- ein Store, der einen
+    # anderen Boot ueberlebt hat, gaebe D fremde Experten. Dann wird gelesen.
+    if not _es.store_identity():
+        if not _SNAPSHOT.get("refused_logged"):
+            _SNAPSHOT["refused_logged"] = True
+            logger.warning("%s: %s is not set -- D reads every expert from the "
+                           "checkpoint (no sentinel can prove whose bytes it lists)",
+                           IDENTITY_MARKER, _es.STORE_IDENTITY_ENV)
+        return False
+    return True
 
 
 def snapshot_rows(directory: str) -> Dict[Tuple[str, str], FrozenSet[int]]:
@@ -75,7 +89,10 @@ def snapshot_rows(directory: str) -> Dict[Tuple[str, str], FrozenSet[int]]:
     a listed row holds bytes its writer read from the checkpoint)."""
     if _SNAPSHOT["rows"] is not None and _SNAPSHOT["dir"] == directory:
         return _SNAPSHOT["rows"]  # type: ignore[return-value]
+    from sglang.srt.layers.moe import expert_store as _es
+
     acc: Dict[Tuple[str, str], set] = {}
+    foreign = 0
     try:
         names = os.listdir(directory)
     except OSError:
@@ -86,11 +103,17 @@ def snapshot_rows(directory: str) -> Dict[Tuple[str, str], FrozenSet[int]]:
             continue
         try:
             with open(os.path.join(directory, name)) as fh:
-                rows = json.load(fh).get("rows", [])
+                data = json.load(fh)
         except (OSError, ValueError):
             continue  # an unreadable sentinel vetoes nothing
-        acc.setdefault((m.group("key"), m.group("attr")), set()).update(int(r) for r in rows)
+        if not _es.sentinel_is_ours(data):
+            foreign += 1  # H2c: another boot's rows vouch for nothing here
+            continue
+        acc.setdefault((m.group("key"), m.group("attr")), set()).update(
+            int(r) for r in data.get("rows", []))
     out = {k: frozenset(v) for k, v in acc.items()}
+    logger.info("%s identity=%s sentinels_ours=%d foreign_ignored=%d dir=%s",
+                IDENTITY_MARKER, _es.store_identity() or "-", len(acc), foreign, directory)
     _SNAPSHOT["rows"] = out
     _SNAPSHOT["dir"] = directory
     return out
