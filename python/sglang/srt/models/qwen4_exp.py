@@ -2462,6 +2462,28 @@ def weight_layer_is_owned(name: str, start_layer: int, end_layer: int) -> bool:
     return start_layer <= layer_id < end_layer
 
 
+def store_adopt_moe_layer(model, local_name: str):
+    """NF-Bootzeit H2: the FusedMoE module of the decoder layer ``local_name``
+    belongs to, or None (no layer index, foreign layer, no routed experts).
+    Module level on purpose: the veto tests drive ``weight_name_needed`` on a
+    bare stub that carries only the veto methods."""
+    m = _LAYER_ID_RE.search(local_name)
+    if m is None:
+        return None
+    lid = int(m.group(1))
+    lm = getattr(model, "model", None)
+    start = int(getattr(lm, "start_layer", 0))
+    layers = getattr(lm, "layers", None)
+    try:
+        layer = layers[lid - start] if layers is not None else None
+    except (IndexError, TypeError):
+        return None
+    experts = getattr(getattr(layer, "mlp", None), "experts", None)
+    if experts is None or int(getattr(experts, "layer_id", lid) or lid) != lid:
+        return None
+    return experts
+
+
 def mixer_is_foreign(model, name: str) -> bool:
     """fnFL2x21: the model-level mixer exists on the last pipeline stage only
     (``Qwen4ExpModel._build_hyper_connection_mixer``). On every other stage its
@@ -2892,10 +2914,20 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return True
         m = self._EXPERT_ID_RE.search(local)
         if m is not None:
+            gid = int(m.group(1))
             rng = self._owned_expert_range()
             if rng is not None:
                 lo, hi = rng
-                return lo <= int(m.group(1)) < hi
+                if not lo <= gid < hi:
+                    return False
+            # NF-Bootzeit H2: group D does not read the rows P already put
+            # into the shared store (store_adopt; inert everywhere else).
+            moe = store_adopt_moe_layer(self, local)
+            if moe is not None:
+                from sglang.srt.layers.moe import store_adopt as _sa
+
+                if _sa.veto_expert(moe, gid):
+                    return False
         return True
 
     def _num_routed_experts_for_form_a(self):
