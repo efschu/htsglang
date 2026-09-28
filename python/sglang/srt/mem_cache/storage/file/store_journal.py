@@ -299,6 +299,43 @@ def page_path(store: str, stem: str) -> str:
     return flat if os.path.exists(flat) else p
 
 
+#: seconds a journaled change may precede its journal line (R before a
+#: rename, C after it) -- never enough for a whole other boot to hide in
+FOREIGN_SLACK_S = 2.0
+
+
+def foreign_writer_since_journals(store: str) -> Optional[str]:
+    """A page shard changed after the newest snapshot/journal write: a writer
+    WITHOUT a journal touched the store (an image before the journal -- the
+    bridge boots of 28.09. -- or an offline tool). Its pages are invisible to
+    snapshot + journals: never evicted against the cap, never moved by a
+    revoked window. Every journaled change is followed by a journal write
+    (C/E after the rename/unlink), so its shard is never newer than the
+    newest journal. One stat per shard (<= 257), attach only."""
+    bound = 0.0
+    for p in [os.path.join(store, SNAP)] + journal_paths(store):
+        try:
+            bound = max(bound, os.stat(p).st_mtime)
+        except OSError:
+            pass
+    try:
+        with os.scandir(store) as it:
+            for e in it:
+                if len(e.name) != 2 or not (e.name == "zz" or all(
+                        c in _SHARD_HEX for c in e.name)):
+                    continue
+                if not e.is_dir(follow_symlinks=False):
+                    continue
+                m = e.stat(follow_symlinks=False).st_mtime
+                if m > bound + FOREIGN_SLACK_S:
+                    return (f"shard {e.name} changed at {m:.3f}, after the newest "
+                            f"snapshot/journal write {bound:.3f}: a writer without "
+                            f"a journal touched the store")
+    except OSError as e:
+        return f"store unreadable ({e})"
+    return None
+
+
 def load_index(store: str, *, own_path: Optional[str] = None,
                skip_epoch_from: Optional[int] = None, stat_size=None,
                open_intents: Optional[List[str]] = None):
@@ -342,6 +379,9 @@ def load_index(store: str, *, own_path: Optional[str] = None,
             same = False
         if records is None or not same:
             continue  # the snapshot writer compacted meanwhile: load its new one
+        foreign = foreign_writer_since_journals(store)
+        if foreign is not None:
+            return None, foreign
         records.sort(key=lambda r: r[0])
         opened: List[str] = []
         applied, stated = replay(items, records, stat_size, opened)

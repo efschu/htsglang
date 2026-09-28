@@ -145,6 +145,37 @@ class TestPersistence(_Env):
             _ev(self.d, walks=walks)
         self.assertEqual(len(walks), 1)
 
+    def test_a_writer_without_a_journal_walks_once(self):
+        # rc12z30c review: the bridge images of 28.09. (rc12z29b/d) write the
+        # same L3 without journals; their pages are invisible to snapshot +
+        # journals (never evicted, never moved by a revoked window)
+        _ev(self.d)
+        shard = os.path.join(self.d, "ab")
+        os.makedirs(shard)
+        with open(os.path.join(shard, f"ab01{SHARED}.bin"), "wb") as f:
+            f.write(b"\x07" * PAGE)
+        newest = max(os.stat(p).st_mtime for p in
+                     [os.path.join(self.d, SJ.SNAP)] + SJ.journal_paths(self.d))
+        os.utime(shard, (newest + 60, newest + 60))
+        self.reboot(200)
+        items, why = SJ.load_index(self.d)
+        self.assertIsNone(items)
+        self.assertIn("without a journal", why)
+        walks = []
+        _ev(self.d, walks=walks)
+        self.assertEqual(len(walks), 1)
+
+    def test_a_journaled_shard_change_still_loads(self):
+        _ev(self.d)
+        shard = os.path.join(self.d, "cd")
+        os.makedirs(shard)
+        newest = max(os.stat(p).st_mtime for p in
+                     [os.path.join(self.d, SJ.SNAP)] + SJ.journal_paths(self.d))
+        os.utime(shard, (newest - 1, newest - 1))
+        self.reboot(200)
+        items, why = SJ.load_index(self.d)
+        self.assertIsNotNone(items, why)
+
     def test_compaction_by_the_d_owner_only(self):
         _ev(self.d)
         p = _ev(self.d, group="P")

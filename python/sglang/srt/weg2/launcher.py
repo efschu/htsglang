@@ -6689,6 +6689,8 @@ def _l3_attach_from_index(log: Log, directory: str, dry: bool, epoch: float,
                         removed += 1
                     except OSError:
                         pass
+                    if jn is None:  # the shard changed: a journal write after it
+                        jn = _sj.JournalWriter(directory, "launcher", epoch=int(epoch) - 1)
     for stem, (mtime, size) in items.items():
         if revoked and any(a <= mtime <= b for a, b, _r in revoked):
             path = _sj.page_path(directory, stem)
