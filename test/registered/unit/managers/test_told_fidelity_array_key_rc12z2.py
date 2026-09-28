@@ -92,3 +92,53 @@ def test_the_anchor_clamp_hashes_the_same_pages():
     lst = get_hash_str(RadixKey(ids, is_bigram=True), None, page_size=64)
     arr = get_hash_str(RadixKey(array("q", ids), is_bigram=True), None, page_size=64)
     assert lst == arr and len(arr) == 4
+
+
+# -- R5b (rc12z3 7055ec73f3, PP0 04:32-04:34): the tree answers with TENSORS --------
+
+
+import torch  # noqa: E402
+
+
+class _TensorTree(_ArrayTree):
+    """As the real tree: ``device_indices`` is a torch tensor (int64), empty
+    on a miss -- the fake above answered lists, which is why R5 stayed green
+    while the metal refused 11 of 11 probes."""
+
+    def match_prefix(self, params):
+        n = self.key.match(params.key)
+        return SimpleNamespace(device_indices=torch.arange(n, dtype=torch.int64),
+                               host_hit_length=0,
+                               last_device_node=self.node, last_host_node=self.node)
+
+
+def test_a_tensor_hit_gives_a_verdict(caplog):
+    """'Boolean value of Tensor with more than one value is ambiguous' (6x)."""
+    s = SimpleNamespace(tree_cache=_TensorTree(TOLD, state=False))
+    with caplog.at_level("WARNING", logger=tf.logger.name):
+        verdict = tf.pp0_verdict(s, _req(), TOLD, absolute=True)
+    assert "told-fidelity probe skipped" not in caplog.text, caplog.text
+    assert verdict == (0, 0)
+    ok = SimpleNamespace(tree_cache=_TensorTree(TOLD, state=True))
+    assert tf.pp0_verdict(ok, _req(), TOLD, absolute=True) == (TOLD, TOLD)
+
+
+def test_an_empty_tensor_miss_gives_a_verdict(caplog):
+    """'Boolean value of Tensor with no values is ambiguous' (5x): a miss is
+    admissible 0, a verdict -- not 'no probe'."""
+    s = SimpleNamespace(tree_cache=_TensorTree(TOLD, state=True))
+    other = _req()
+    other.full_untruncated_fill_ids = [7] * PROMPT  # shares no key with the tree
+    with caplog.at_level("WARNING", logger=tf.logger.name):
+        assert tf.pp0_admissible(s, other, TOLD) == 0
+        assert tf.pp0_verdict(s, other, TOLD, absolute=True) == (0, 0)
+    assert "told-fidelity probe skipped" not in caplog.text, caplog.text
+
+
+def test_tensor_ids_are_read_without_a_truth_test():
+    s = SimpleNamespace(tree_cache=_TensorTree(TOLD, state=True))
+    r = _req()
+    r.full_untruncated_fill_ids = torch.arange(PROMPT, dtype=torch.int64)
+    assert tf.pp0_admissible(s, r, TOLD) == TOLD
+    r.full_untruncated_fill_ids = torch.empty(0, dtype=torch.int64)  # falls back to origin ids
+    assert tf.pp0_admissible(s, r, TOLD) == TOLD

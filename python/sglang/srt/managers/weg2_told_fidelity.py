@@ -77,15 +77,23 @@ def pp0_admissible(scheduler, req, told: int) -> Optional[int]:
     try:
         tree = getattr(scheduler, "tree_cache", None)
         match = getattr(tree, "match_prefix", None)
-        ids = getattr(req, "full_untruncated_fill_ids", None) or getattr(req, "origin_input_ids", None)
-        if tree is None or not callable(match) or not ids:
+        # R5b: no truth test on a sequence that may be a tensor (see below).
+        ids = getattr(req, "full_untruncated_fill_ids", None)
+        if ids is None or len(ids) == 0:
+            ids = getattr(req, "origin_input_ids", None)
+        if tree is None or not callable(match) or ids is None or len(ids) == 0:
             return None  # decided before any import: a tree without a match costs nothing
         from sglang.srt.managers.weg2_store_told import _probe_key
         from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 
         key, _bigram = _probe_key(scheduler, req, ids, int(told))
         mr = match(MatchPrefixParams(key=key))
-        dev = len(getattr(mr, "device_indices", ()) or ())
+        # R5b (rc12z3 7055ec73f3, PP0 04:32-04:34, 11 of 11 probes): the
+        # tree's device_indices is a torch tensor, so ``x or ()`` asked its
+        # truth value -- 'Boolean value of Tensor with more than one value /
+        # with no values is ambiguous' -- and every probe gave no verdict.
+        _di = getattr(mr, "device_indices", None)
+        dev = 0 if _di is None else int(_di.numel() if hasattr(_di, "numel") else len(_di))
         host = int(getattr(mr, "host_hit_length", 0) or 0)
         depth = dev + host
         if depth <= 0:
