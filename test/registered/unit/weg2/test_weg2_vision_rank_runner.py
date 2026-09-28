@@ -452,3 +452,22 @@ def test_captured_vit_graphs_are_refused(monkeypatch):
     s = _arm_sched()
     assert vrr.arm_rank_stage(s, env=P_TRANSIENT) is True
     assert "SGLANG_VIT_ENABLE_CUDA_GRAPH" in s._weg2_vision_arm_refusal
+
+
+def test_the_two_long_legs_are_split_in_the_outcome_and_the_line(tmp_path, caplog):
+    """(d) Befund 28.09.: 27B W102 run=1 legs encode 1773 / teardown 434 ms --
+    the line now says where: encode first vs rest, teardown strip / gc / sync
+    / tail / empty_cache. Instrument only: the stage's result is unchanged."""
+    import logging
+
+    _write_model(tmp_path)
+    s = _stage_sched()
+    out = _run(s, [_req("r1", [_Item(4), _Item(2)])], tmp_path)
+    assert out.ok, out.detail
+    assert set(out.encode_ms) == {"first", "rest"}
+    assert set(out.teardown_ms) == {"strip", "gc", "sync", "tail", "empty_cache"}
+    assert abs(sum(out.teardown_ms.values()) - out.legs_ms["teardown"]) < 5.0
+    with caplog.at_level(logging.INFO, logger=vrr.logger.name):
+        vrr.log_outcome(out, ["r1"], 1)
+    line = next(r.getMessage() for r in caplog.records if "encode_split_ms=" in r.getMessage())
+    assert "teardown_split_ms=(" in line and "gc " in line and "first " in line
