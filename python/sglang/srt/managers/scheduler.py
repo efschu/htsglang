@@ -13016,6 +13016,25 @@ class Scheduler(
         self.waiting_queue = [q for q in self.waiting_queue if id(q) not in refused_ids]
         for req in refused:
             covered = self._weg2_vision_d_covered(req, head_inputs)
+            if not _vdg.reroute_eligible(req) and _weg2_rvp.eligible(req, sched=self, vision=True):
+                # VISION after the first byte: D keeps the stream parked, the
+                # front's P leg sends the ORIGINAL request (image included, P has
+                # the tower), D resumes once P's pages cover the image and
+                # prefills only the streamed output tail itself. Bounded by
+                # RESUME-VIA-P's attempts; the drain skips it (_rvp_inflight).
+                _tc = getattr(self, "tree_cache", None)
+                if _tc is not None:
+                    release_admission_acquired_mamba_slot(req, _tc, site="weg2_vision_rvp")
+                if self.enable_hicache_storage:
+                    self.tree_cache.release_aborted_request(req.rid)
+                elif self.enable_hierarchical_cache:
+                    self.tree_cache.terminate_prefetch(req.rid)
+                _fill = getattr(req, "full_untruncated_fill_ids", None)
+                _weg2_rvp.keep_on_d(
+                    self, req, max(0, (0 if _fill is None else len(_fill)) - int(covered or 0)),
+                    int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0),
+                    reason=_weg2_rvp.REASON_VISION)
+                continue
             if _vdg.reroute_eligible(req):
                 # (B) NF rc12z10 weg2-2-12: nothing streamed yet -> back through P
                 # with the original request (image included), W123 named inside.
