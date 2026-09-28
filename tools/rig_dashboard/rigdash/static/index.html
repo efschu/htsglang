@@ -529,7 +529,7 @@ function bootTile(label, tok, src, rGpu, rGpuNote, rWall, e) {
     <div class="muted" style="font-size:10px">${rGpuNote}; Wandzeit = &Sigma; Token / Zeit seit der ersten Logzeile</div></div>`;
 }
 
-function cacheHtml(b) {
+function cacheHtml(b, now, awake) {
   const c = b.cache || {}, t = b.totals || {};
   const en = b.energy || {};
   const E = (en.cls) || {};
@@ -539,7 +539,18 @@ function cacheHtml(b) {
     const hit = (o) => o.hit_share == null ? "\u2014" : `${pct(o.hit_share)} <span class="muted">(${fmt(o.cached)} / ${fmt(o.new)})</span>`;
     const l2 = (o) => o.loadback_n ? `${fmt(o.loadback_n)} &times; &middot; ${fmt(o.loadback_tok)} Tok${o.l2_share != null ? " &middot; " + pct(o.l2_share) : ""}` : "0";
     const l3 = (o) => o.l3inc_n ? `${fmt(o.l3inc_n)} &times; &middot; ${pct(o.l3inc_share)} <span class="muted">(${fmt(o.l3inc_delivered)} / ${fmt(o.l3inc_deliverable)})</span>` : "0";
-    return `<tr><td><b>${label}</b></td><td class="num">${hit(w)}</td><td class="num">${hit(a)}</td><td class="num">${l2(w)}</td><td class="num">${l2(a)}</td><td class="num">${a.mamba_n ? fmt(a.mamba_n) + " &times;" : "0"}</td><td class="num">${l3(a)}</td></tr>`;
+    // Asleep P: the 60-s cell would only say "—"; show its last burst (from the backend) instead
+    let w60 = hit(w);
+    if (g === "P" && awake !== "P" && !w.chunks) {
+      w60 = x.last_burst
+        ? `P schl&auml;ft &middot; letzter Burst ${hit(x.last_burst)} vor ${ago(now - x.last_burst_t)}`
+        : "P schl&auml;ft &middot; kein Burst im Speicher";
+    }
+    let bootCell = hit(a);
+    if (g === "P") {
+      bootCell += `<br><span class="muted">prefetch refused ${fmt(a.prefetch_refused || 0)} &middot; timeout ${fmt(a.prefetch_timeout || 0)}</span>`;
+    }
+    return `<tr><td><b>${label}</b></td><td class="num">${w60}</td><td class="num">${bootCell}</td><td class="num">${l2(w)}</td><td class="num">${l2(a)}</td><td class="num">${a.mamba_n ? fmt(a.mamba_n) + " &times;" : "0"}</td><td class="num">${l3(a)}</td></tr>`;
   };
   const req = (label, g) => {
     const x = c[g]; if (!x) return "";
@@ -624,7 +635,7 @@ function bootCard(b, now, binders) {
         ${flipHtml}${flipHtml ? `<div class="muted" style="font-size:11px">letzte ${flips.length} Flips, Höhe = flip_total &middot; <span style="color:var(--s1)">■</span> P→D <span style="color:var(--s2)">■</span> D→P</div>` : ""}
       </div>
     </div>
-    ${cacheHtml(b)}
+    ${cacheHtml(b, now, awake)}
     ${(m.launch || []).length ? `<details id="launch-${esc(b.stem)}" style="margin-top:10px"><summary>Startform (weg2-Launcher, ${m.launch.length} Kernzeilen aus dem Front-Log)</summary><div class="launch mono">${m.launch.map((l) => `<div>${esc(l)}</div>`).join("")}</div></details>` : ""}
     ${errs.length ? `<details id="err-${esc(b.stem)}" style="margin-top:10px"><summary>letzte Fehlerzeilen (${fmt(b.error_count)})</summary>${errs.map((e) => `<div class="err mono">${hhmm(e.t)} [${esc(e.group)}] ${esc(e.text)}</div>`).join("")}</details>` : ""}
   </section>`;

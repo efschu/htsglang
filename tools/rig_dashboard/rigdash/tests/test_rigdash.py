@@ -243,6 +243,48 @@ class LiveTests(unittest.TestCase):
         b = next(iter(ll.boots.values()))
         self.assertIsNone(b._max3s("P", "prefill", now))
 
+    def test_cache_view_last_burst_of_a_sleeping_group(self):
+        now = int(time.time())
+        tb = now - 90                       # the burst ends 30 s before the 60-s window opens
+        self._write("front", [BOOT, FORM])
+        self._write("P", [_shift(P_BATCH, tb - 30), _shift(P_BATCH, tb),
+                          _shift(P_BATCH.replace("#new-token: 16384, #cached-token: 0",
+                                                 "#new-token: 4096, #cached-token: 12288"), tb + 1)])
+        ll = live.LiveLogs([os.path.join(self.tmp.name, "boot_*.log")])
+        ll.poll()
+        [v] = ll.snapshot()
+        p = v["cache"]["P"]
+        self.assertIsNone(p["window"]["hit_share"])          # nothing inside 60 s: P sleeps
+        self.assertEqual(p["last_burst_t"], tb + 1)
+        lb = p["last_burst"]
+        self.assertEqual((lb["new"], lb["cached"], lb["chunks"]), (20480, 12288, 2))
+        self.assertAlmostEqual(lb["hit_share"], 12288 / 32768)   # the row at tb-30 lies outside the 20-s burst
+
+    def test_cache_view_without_any_burst(self):
+        now = int(time.time())
+        self._write("front", [BOOT, FORM, _shift(SV_P, now - 5)])
+        ll = live.LiveLogs([os.path.join(self.tmp.name, "boot_*.log")])
+        ll.poll()
+        [v] = ll.snapshot()
+        self.assertIsNone(v["cache"]["served_P"]["last_burst"])
+        self.assertIsNone(v["cache"]["served_P"]["last_burst_t"])
+
+    def test_cache_view_prefetch_refused_and_timeout_since_boot(self):
+        now = int(time.time())
+        self._write("front", [BOOT, FORM])
+        self._write("P", [_shift(P_BATCH, now - 5),
+                          _shift("[2026-09-27 09:20:28 PP0] #123 PREFETCH REFUSED rid=x reason=cap", now - 4),
+                          _shift("[2026-09-27 09:20:28 PP0] #124 PREFETCH TIMEOUT rid=x", now - 3),
+                          _shift("[2026-09-27 09:20:28 PP0] #125 PREFETCH LANDED rid=x", now - 2),
+                          _shift("[2026-09-27 09:20:28 PP1] #126 PREFETCH REFUSED rid=y", now - 2)])
+        ll = live.LiveLogs([os.path.join(self.tmp.name, "boot_*.log")])
+        ll.poll()
+        [v] = ll.snapshot()
+        boot = v["cache"]["P"]["boot"]
+        # rank0 only: the PP1 REFUSED line must not count; LANDED counts under its own key
+        self.assertEqual((boot["prefetch_refused"], boot["prefetch_timeout"]), (1, 1))
+        self.assertEqual(boot["prefetch_landed"], 1)
+
 
 class LaunchLineTests(unittest.TestCase):
     def test_key_lines_kept_dedup_and_stripped(self):

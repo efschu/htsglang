@@ -981,7 +981,10 @@ class Boot:
     def cache_view(self, now: float) -> dict:
         t0 = now - WINDOW_S
         w = collections.defaultdict(collections.Counter)
+        pb_rows = collections.defaultdict(list)   # group -> every "pb" (t, new, cached) the ring holds
         for t, g, kind, a, b in self.win:
+            if kind == "pb":
+                pb_rows[g].append((t, a, b))      # any age: the last burst may predate the 60-s window
             if t < t0:
                 continue
             c = w[g]
@@ -1009,10 +1012,21 @@ class Boot:
             c["req_hit_share"] = (c.get("cached", 0) / pr) if pr else None
             return c
 
+        burst = {}
+        for g, rows in pb_rows.items():
+            t_last = max(t for t, _, _ in rows)
+            c = collections.Counter()
+            for t, a, b in rows:
+                if t_last - 20.0 <= t <= t_last:  # the burst itself, not the idle rows before it
+                    c["new"] += a; c["cached"] += b; c["chunks"] += 1
+            burst[g] = (one(c), t_last)
+
         out = {}
         for g in ("P", "D", "single", "served_P", "served_D"):
             if g in self.tot or g in w:
-                out[g] = {"window": one(w.get(g, {})), "boot": one(self.tot.get(g, {}))}
+                bs, bt = burst.get(g, (None, None))
+                out[g] = {"window": one(w.get(g, {})), "boot": one(self.tot.get(g, {})),
+                          "last_burst": bs, "last_burst_t": bt}
         return out
 
 
