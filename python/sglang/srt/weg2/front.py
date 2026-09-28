@@ -3761,13 +3761,23 @@ class Front:
         wait for or count them. For P, and for a D with nothing parked, this
         is the ledger itself."""
         parked = getattr(self, "_d_parked", None) or {}
-        if g.name != "D" or not parked:
+        # RVP-DRAIN (27B rc12z7b 07:51:45Z, weg2-12-22/14-23/14-25/14-27): a
+        # request D refused mid-stream (W50-REROUTE) is HELD by D -- stream
+        # open, nothing running -- until P prefills it in the P-only leg the
+        # front queued (``_rvp_inflight``). It needs exactly THIS D->P flip,
+        # so the drain may never wait for it: it did, the window counted the
+        # last decode's tokens as progress (DRAIN WAITING), the flip re-began
+        # on the same four and the group sat in `flipping` with 10 requests
+        # waiting.
+        rvp = getattr(self, "_rvp_inflight", None) or set()
+        if g.name != "D" or (not parked and not rvp):
             return list(g.outstanding)
         # Part B re-queues a parked request no sleep followed after
         # PARK_REQUEUE_S: from then on it runs on D again and counts here.
         now = time.time()
         return [r for r in g.outstanding
-                if r not in parked or phase_policy.parked_lapsed(parked[r], now)]
+                if r not in rvp
+                and (r not in parked or phase_policy.parked_lapsed(parked[r], now))]
 
     def _drop_lapsed_parks(self) -> None:
         """Rule 3 with part B's clock: D awake and serving, and a parked
@@ -8024,6 +8034,10 @@ class Front:
         _now = time.time()
         keep = {r for r in g.outstanding if g.name == "D" and r in h91_held
                 and not phase_policy.parked_lapsed(h91_held[r], _now)}
+        # RVP-DRAIN: a W50-held request waits for the P leg this flip starts --
+        # never aborted here (see `_flip_ledger`).
+        if g.name == "D":
+            keep |= {r for r in g.outstanding if r in (getattr(self, "_rvp_inflight", None) or set())}
         parked = sorted(r for r in g.outstanding if r not in keep)
         if not parked:
             return True
