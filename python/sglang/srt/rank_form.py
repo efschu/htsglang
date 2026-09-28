@@ -493,19 +493,28 @@ def form_b_plan(form: RankForm) -> FormBPlan:
 
 
 # --------------------------------------------------------------------------
-# F6 step 6: the BAR1 window riegel of Form B (draft v2 §5 "Fenster").
+# F6 step 6: the BAR1 window riegel of Form B (draft v2 §5 "Fenster"),
+# corrected by NF's answer 4 (28.09. ~23:55Z): the posts are the launcher's
+# REAL group windows, model-dependent; the old "flip lane 32 MiB" was TP_0.
 #
 # Every rank process pins one BAR1 receive window per barlink group it is a
 # member of (world size > 1), on ITS card
 # (device_communicators/barlink_matrix_transport.py: _requested, the per-group
-# key from the live group name, e.g. ``dcp:0`` -> DCP_0). Form B adds one
-# group, ``model_tp:0``, and only the weight ranks W are in it (each KV-only
-# rank sits alone -> no communicator, no window). The flip lane (weight
-# exchange, 32-MiB slots) runs only where weights live. So a W card carries
-# dcp:0 + model_tp:0 + flip lane on top of the group's other windows, a K
-# card only the shared ones -- and the W-3080 is where the aperture binds
-# (#1234 C1: 224 of 256 MiB usable per 3080, measured Used 224/256 with D at
-# 16+32+40 and P at 24+96 -- already exhausted before Form B adds a window).
+# key from the live group name, e.g. ``dcp:0`` -> DCP_0). Group D today runs
+# ``16,TP_0=32,DCP_0=40`` (weg2/launcher.py, #1234 C1), group P ``24,PP_0=96``
+# (launcher P_BARLINK_BAR1_WINDOW_MIB): 208 of the 224 MiB usable per 3080.
+# Form B adds ``model_tp:0`` on the weight ranks W only (a KV-only rank sits
+# alone -> no communicator, no window) and moves the layer all-reduce there:
+#   dense (27B)  tp carries control only (token takeover rides the world cpu
+#                group, tp_worker.py:634) -> TP_0 8, MODEL_TP_0 32:
+#                W-3080 16 + 32 + 8 + 40 + P 120 = 216 <= 224.
+#   MoE (NF)     TP_0 == _MOE_TP carries the MoE combine over ALL expert
+#                holders -> NOT smaller than 32 (below it the combine falls to
+#                the gloo plane, 0.68 instead of 3.19 GB/s, #1234 C1).
+# The bar1 flip lanes (weg2/bar1_lanes.py) are a SEPARATE post sized from what
+# the group windows leave (they fall back to host staging without room); the
+# riegel charges ``flip_lane_mib`` only when a caller names it, and always
+# reports the headroom left per card.
 # A configuration that does not fit is refused BY NAME before any rank loads,
 # instead of a Bar1WindowRefused at the model_tp build on metal.
 # --------------------------------------------------------------------------
@@ -514,11 +523,17 @@ class RankFormBar1Window(RankFormError):
     code = "W187 Weg2RankFormBar1Window"
 
 
-#: #1234 C1 (launcher, D argv): dcp:0's measured window.
+#: weg2/launcher.py, group D's argv today (#1234 C1). A test pins it to the file.
+D_WINDOW_SPEC_TODAY = "16,TP_0=32,DCP_0=40"
+#: weg2/launcher.py P_BARLINK_BAR1_WINDOW_MIB. A test pins it to the file.
+P_WINDOW_SPEC = "24,PP_0=96"
+#: #1234 C1: dcp:0's measured window.
 FORM_B_DCP_WINDOW_MIB = 40
-#: The flip lane's slot (draft v2 §5; the bar1 weight-exchange lanes carry
-#: 32-MiB slots). Charged once per WEIGHT rank.
-FORM_B_FLIP_LANE_MIB = 32
+#: NF answer 4: the smallest TP_0 that keeps NF's MoE combine on bar1.
+FORM_B_MOE_TP_MIN_MIB = 32
+#: Form B's D windows per model family (NF answer 4).
+FORM_B_WINDOW_SPEC_DENSE = "16,TP_0=8,MODEL_TP_0=32,DCP_0=40"
+FORM_B_WINDOW_SPEC_MOE = "16,TP_0=32,MODEL_TP_0=32,DCP_0=40"
 #: #1234 C1: usable BAR1 per RTX 3080 (256 gross minus the RM carve-out,
 #: evaluated by barlink as NVML free minus RESERVE_MIB_DEFAULT 32).
 BAR1_USABLE_MIB_3080 = 224
@@ -551,30 +566,42 @@ def parse_window_spec(spec: Optional[str]) -> Tuple[int, Dict[str, int]]:
     return default, own
 
 
+def window_of(spec: Optional[str], group: str) -> int:
+    default, own = parse_window_spec(spec)
+    return own.get(_group_key(group), default)
+
+
+def form_b_window_spec(*, moe: bool) -> str:
+    """Group D's ``--barlink-bar1-window-mib`` under Form B (NF answer 4)."""
+    return FORM_B_WINDOW_SPEC_MOE if moe else FORM_B_WINDOW_SPEC_DENSE
+
+
+def p_resident_posts(spec: str = P_WINDOW_SPEC) -> Dict[str, int]:
+    """Group P's windows on a card that hosts one P rank (world + pp)."""
+    return {"P world:0": window_of(spec, "world:0"), "P pp:0": window_of(spec, "pp:0")}
+
+
 def form_b_window_requirement(
     plan: FormBPlan,
     card_of_rank: Sequence[str],
     *,
     window_spec: Optional[str],
     groups_all_ranks: Sequence[str] = ("world:0", "tp:0", "dcp:0"),
-    flip_lane_mib: int = FORM_B_FLIP_LANE_MIB,
+    flip_lane_mib: int = 0,
     resident_mib_by_card: Optional[Mapping[str, Mapping[str, int]]] = None,
 ) -> Dict[str, Dict[str, int]]:
     """Per card: every BAR1 window post this Form B group pins there, named.
 
     ``groups_all_ranks`` are the barlink groups every rank is a member of (the
-    D group today: world, the scheduler tp, dcp); ``model_tp:0`` is added for
-    each weight rank when |W| >= 2, the flip lane likewise. A card hosting two
-    ranks pins every window twice (one region per process). ``resident`` are
-    the other tenants' posts on a card (group P's 24 + PP_0 96 on a 3080 in
-    the Weg-2 layout), taken as given."""
+    D group: world, the scheduler tp, dcp); ``model_tp:0`` is added for each
+    weight rank when |W| >= 2. A card hosting two ranks pins every window twice
+    (one region per process). ``flip_lane_mib`` is charged per weight rank only
+    when named (the lanes size themselves from the rest). ``resident`` are the
+    other tenants' posts on a card (``p_resident_posts()``), taken as given."""
     if len(card_of_rank) != plan.world:
         raise _refuse(RankFormBar1Window,
                       f"card map {list(card_of_rank)} names {len(card_of_rank)} ranks, the form {plan.world}")
-    default, own = parse_window_spec(window_spec)
-
-    def window(group: str) -> int:
-        return own.get(_group_key(group), default)
+    parse_window_spec(window_spec)             # a malformed spec is named here
 
     out: Dict[str, Dict[str, int]] = {}
     for card, posts in (resident_mib_by_card or {}).items():
@@ -586,7 +613,7 @@ def form_b_window_requirement(
         if r in plan.weight_ranks and len(plan.weight_ranks) >= 2:
             mine.append("model_tp:0")
         for g in mine:
-            posts[f"rank{r} {g}"] = window(g)
+            posts[f"rank{r} {g}"] = window_of(window_spec, g)
         if r in plan.weight_ranks and flip_lane_mib:
             posts[f"rank{r} flip_lane"] = int(flip_lane_mib)
     return out
@@ -596,12 +623,24 @@ def check_form_b_windows(
     plan: FormBPlan,
     card_of_rank: Sequence[str],
     usable_mib_by_card: Mapping[str, int],
+    *,
+    moe: bool = False,
+    window_spec: Optional[str] = None,
     **kw,
 ) -> Dict[str, Dict[str, int]]:
-    """The riegel: every card's posts must fit its usable BAR1 aperture, or a
-    named W187 listing card, ranks, posts, sum and usable. Returns the posts
-    (for the launch line) when everything fits."""
-    posts = form_b_window_requirement(plan, card_of_rank, **kw)
+    """The riegel: every card's posts must fit its usable BAR1 aperture, and
+    under MoE the tp window must carry the combine; else a named W187 listing
+    card, ranks, posts, sum and usable. ``window_spec`` None = the Form B spec
+    of the model family. Returns the posts plus a ``headroom`` post per card
+    (what the flip lanes can still take) when everything fits."""
+    spec = form_b_window_spec(moe=moe) if window_spec is None else window_spec
+    if moe and window_of(spec, "tp:0") < FORM_B_MOE_TP_MIN_MIB:
+        raise _refuse(
+            RankFormBar1Window,
+            f"window spec {spec!r}: TP_0 {window_of(spec, 'tp:0')} MiB < {FORM_B_MOE_TP_MIN_MIB} under "
+            "MoE -- tp is _MOE_TP and carries the expert combine over ALL holders; a smaller "
+            "window drops it to the gloo plane (0.68 instead of 3.19 GB/s, #1234 C1)")
+    posts = form_b_window_requirement(plan, card_of_rank, window_spec=spec, **kw)
     over = []
     for card, p in posts.items():
         if card not in usable_mib_by_card:
@@ -614,10 +653,12 @@ def check_form_b_windows(
                         + f" = {need} MiB > usable {have} MiB")
     if over:
         raise _refuse(RankFormBar1Window,
-                      "Form B's BAR1 windows do not fit: " + "; ".join(over)
-                      + ". Shrink a window (e.g. TP_0: under Form B the scheduler tp group carries "
-                      "control traffic only; MODEL_TP_0 sized to the o_proj/MLP all-reduce) or move a rank.")
-    return posts
+                      f"Form B's BAR1 windows ({spec}) do not fit: " + "; ".join(over)
+                      + ". Shrink a window (dense: TP_0 carries control only; MODEL_TP_0 sized to "
+                      "the o_proj/MLP all-reduce's largest extend payload and the round budget) or "
+                      "move a rank.")
+    return {card: {**p, "headroom": int(usable_mib_by_card[card]) - sum(p.values())}
+            for card, p in posts.items()}
 
 
 # --------------------------------------------------------------------------

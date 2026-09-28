@@ -3112,6 +3112,24 @@ def get_model_tp_group() -> GroupCoordinator:
     return get_tp_group()
 
 
+def check_form_b_moe_tp() -> None:
+    """F6 x MoE (NF answer 2, 28.09.): under Form B the MoE combine runs over ALL
+    expert holders -- the KV-only ranks K hold experts too -- so moe_tp must span
+    every rank of the tp group, NEVER model_tp (W). Today moe_tp IS tp (the
+    ``moe_tp_size == tensor_model_parallel_size`` branch) and tp stays all ranks
+    under Form B, so this holds; if tp ever shrinks, moe_tp must be built as its
+    own all-ranks group, or K reduces silently in a group of one. Checked where
+    both groups exist; a no-op without a Form B partition."""
+    if _MODEL_TP is None or _MOE_TP is None or _TP is None:
+        return
+    if list(_MOE_TP.ranks) != list(_TP.ranks) or _MOE_TP is _MODEL_TP:
+        raise ValueError(
+            f"F6: under Form B moe_tp {list(_MOE_TP.ranks)} must span the ALL-ranks tp group "
+            f"{list(_TP.ranks)} (every expert holder, K included), not model_tp "
+            f"{list(_MODEL_TP.ranks)}. W181 Weg2RankFormShapeMismatch"
+        )
+
+
 def get_model_tp_group_no_assert() -> Optional[GroupCoordinator]:
     return _MODEL_TP
 
@@ -4039,6 +4057,7 @@ def initialize_model_parallel(
             group_name="moe_tp",
             recovered_rank=recovered_rank,
         )
+    check_form_b_moe_tp()
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size

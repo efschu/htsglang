@@ -67,6 +67,17 @@ def _run(rank, port, out, partition):
         except FormBCollectiveWrongGroup:
             return "refused"
 
+    # NF answer 2: moe_tp spans ALL expert holders (K included), never model_tp
+    res["moe_tp_ranks"] = list(ps.get_moe_tp_group().ranks)
+    saved = ps._MOE_TP
+    ps._MOE_TP = mtp
+    try:
+        ps.check_form_b_moe_tp()
+        res["moe_on_mtp"] = "accepted"
+    except ValueError as e:
+        res["moe_on_mtp"] = "W181" in str(e) or mtp is tp
+    finally:
+        ps._MOE_TP = saved
     res["guard"] = {
         "control_tp": _verdict(C, tp), "control_tp_cpu": _verdict(C, tp.cpu_group),
         "control_mtp": _verdict(C, mtp), "control_mtp_cpu": _verdict(C, mtp.cpu_group),
@@ -106,6 +117,9 @@ def test_model_tp_is_the_weight_ranks_and_tp_stays_everyone():
     assert res[0]["op_ar"] == res[1]["op_ar"] == [3.0, 3.0]
     assert res[0]["op_ag"] == res[1]["op_ag"] == [1.0, 1.0, 2.0, 2.0]
     assert res[2]["op_ag"] == [3.0, 3.0]
+    for r in range(3):
+        assert res[r]["moe_tp_ranks"] == [0, 1, 2]                 # NF answer 2
+        assert res[r]["moe_on_mtp"] is True                         # refused by name
     # 3: reversed guard -- control only on tp, layer only on model_tp
     for r in range(3):
         g = res[r]["guard"]

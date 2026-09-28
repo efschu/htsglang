@@ -294,11 +294,9 @@ def test_form_b_plan_keeps_the_scheduler_group_on_all_ranks():
         rf.form_b_plan(rf.resolve_rank_form([1, 1, 1]))
 
 
-# F6 step 6: the BAR1 window riegel. Weg-2 layout: D "16,TP_0=32,DCP_0=40",
-# P resident 24 + PP_0 96 on each 3080 (#1234 C1: 224 usable per 3080).
-_D_SPEC = "16,TP_0=32,DCP_0=40"
-_P_RES = {"GPU-3080x8": {"P world:0": 24, "P pp:0": 96},
-          "GPU-3080x4": {"P world:0": 24, "P pp:0": 96}}
+# F6 step 6: the BAR1 window riegel, NF answer 4 (28.09.): real launcher posts,
+# model-dependent. P resident 24 + PP_0 96 on each 3080 (224 usable per 3080).
+_P_RES = {"GPU-3080x8": rf.p_resident_posts(), "GPU-3080x4": rf.p_resident_posts()}
 _USABLE = {"GPU-5090": 32768, "GPU-3080x8": rf.BAR1_USABLE_MIB_3080,
            "GPU-3080x4": rf.BAR1_USABLE_MIB_3080}
 
@@ -307,35 +305,58 @@ def _b():
     return rf.form_b_plan(rf.resolve_rank_form([77, 23, 0], [10, 45, 45], subgroup_tp_wired=True))
 
 
-def test_form_b_windows_charge_model_tp_and_the_flip_lane_on_weight_cards_only():
-    posts = rf.form_b_window_requirement(_b(), U, window_spec=_D_SPEC, resident_mib_by_card=_P_RES)
+def test_window_constants_are_the_launchers():
+    """The riegel's 'today' posts are the launcher's literals, not a copy."""
+    import pathlib
+
+    src = (pathlib.Path(rf.__file__).parent / "weg2" / "launcher.py").read_text()
+    assert f'"--barlink-bar1-window-mib", "{rf.D_WINDOW_SPEC_TODAY}"' in src
+    assert f'P_BARLINK_BAR1_WINDOW_MIB = "{rf.P_WINDOW_SPEC}"' in src
+    assert rf.p_resident_posts() == {"P world:0": 24, "P pp:0": 96}
+    assert rf.window_of(rf.D_WINDOW_SPEC_TODAY, "dcp:0") == rf.FORM_B_DCP_WINDOW_MIB == 40
+
+
+def test_today_d_posts_are_208_on_a_3080():
+    c = rf.form_b_plan(rf.resolve_rank_form([1, 1, 0], [1, 1, 1], subgroup_tp_wired=True))
+    posts = rf.form_b_window_requirement(c, U, window_spec=rf.D_WINDOW_SPEC_TODAY,
+                                         groups_all_ranks=("world:0", "tp:0", "dcp:0"),
+                                         resident_mib_by_card=_P_RES)
+    assert sum(posts["GPU-3080x4"].values()) == 208                     # K card: today's D + P
+
+
+def test_dense_form_b_fits_the_w3080_at_216():
+    posts = rf.check_form_b_windows(_b(), U, _USABLE, moe=False, resident_mib_by_card=_P_RES)
     w3080, k3080 = posts["GPU-3080x8"], posts["GPU-3080x4"]
-    assert w3080["rank1 dcp:0"] == rf.FORM_B_DCP_WINDOW_MIB == 40
-    assert w3080["rank1 model_tp:0"] == 16 and w3080["rank1 flip_lane"] == 32
-    assert not [k for k in k3080 if "model_tp" in k or "flip_lane" in k]   # K: none
-    assert sum(k3080.values()) == 208                                      # today's D + P
-    assert sum(w3080.values()) == 256                                      # +16 +32
+    assert w3080["rank1 model_tp:0"] == 32 and w3080["rank1 tp:0"] == 8
+    assert sum(v for k, v in w3080.items() if k != "headroom") == 216 and w3080["headroom"] == 8
+    assert not [k for k in k3080 if "model_tp" in k]                    # K: no model_tp window
+    assert sum(v for k, v in k3080.items() if k != "headroom") == 184
+    assert not [k for k in w3080 if "flip_lane" in k]                   # a separate post
 
 
-def test_form_b_windows_refuse_the_w3080_by_name_and_pass_a_shrunk_layout():
-    with pytest.raises(rf.RankFormBar1Window, match=r"W187.*card GPU-3080x8 \(rank1\).*256 MiB > usable 224"):
-        rf.check_form_b_windows(_b(), U, _USABLE, window_spec=_D_SPEC, resident_mib_by_card=_P_RES)
-    # tp carries control only under Form B: TP_0 8, MODEL_TP_0 8 -> 16+8+40+8+32+120 = 224
-    posts = rf.check_form_b_windows(_b(), U, _USABLE, window_spec="16,TP_0=8,DCP_0=40,MODEL_TP_0=8",
-                                    resident_mib_by_card=_P_RES)
-    assert sum(posts["GPU-3080x8"].values()) == 224
+def test_moe_form_b_keeps_tp0_and_is_refused_on_the_w3080_by_name():
+    with pytest.raises(rf.RankFormBar1Window, match=r"TP_0 8 MiB < 32 under MoE"):
+        rf.check_form_b_windows(_b(), U, _USABLE, moe=True, window_spec=rf.FORM_B_WINDOW_SPEC_DENSE,
+                                resident_mib_by_card=_P_RES)
+    with pytest.raises(rf.RankFormBar1Window,
+                       match=r"W187.*card GPU-3080x8 \(rank1\).*240 MiB > usable 224"):
+        rf.check_form_b_windows(_b(), U, _USABLE, moe=True, resident_mib_by_card=_P_RES)
+    # a named flip lane is charged on weight ranks only
+    with pytest.raises(rf.RankFormBar1Window, match=r"rank1 flip_lane 16 = 232 MiB"):
+        rf.check_form_b_windows(_b(), U, _USABLE, flip_lane_mib=16, resident_mib_by_card=_P_RES)
 
 
 def test_form_b_windows_count_two_ranks_on_one_card_twice_and_check_shapes():
     b = rf.form_b_plan(rf.resolve_rank_form([2, 1, 1, 0], [1, 1, 1, 1], subgroup_tp_wired=True))
+    spec = rf.FORM_B_WINDOW_SPEC_DENSE
     posts = rf.form_b_window_requirement(b, ["GPU-5090", "GPU-5090", "GPU-3080x8", "GPU-3080x4"],
-                                         window_spec=_D_SPEC)
+                                         window_spec=spec)
     assert posts["GPU-5090"]["rank0 dcp:0"] == posts["GPU-5090"]["rank1 dcp:0"] == 40
-    assert sum(posts["GPU-5090"].values()) == 2 * (16 + 32 + 40 + 16 + 32)
+    assert sum(posts["GPU-5090"].values()) == 2 * (16 + 8 + 40 + 32)
     with pytest.raises(rf.RankFormBar1Window, match="W187"):
-        rf.form_b_window_requirement(b, U, window_spec=_D_SPEC)             # 3 cards, 4 ranks
+        rf.form_b_window_requirement(b, U, window_spec=spec)             # 3 cards, 4 ranks
     with pytest.raises(rf.RankFormBar1Window, match="W187"):
         rf.parse_window_spec("16,TP_0=x")
     assert rf.parse_window_spec(None) == (rf.BARLINK_WINDOW_MIB_DEFAULT, {})
     with pytest.raises(rf.RankFormBar1Window, match="no usable BAR1"):
-        rf.check_form_b_windows(_b(), U, {"GPU-5090": 1}, window_spec=_D_SPEC)
+        rf.check_form_b_windows(_b(), U, {"GPU-5090": 1})
