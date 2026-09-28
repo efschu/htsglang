@@ -4460,6 +4460,41 @@ def refuse_unwired_token_cut(ns, boot_form) -> None:
         "--dry-run prints the planned cut; a real boot needs every seam built.")
 
 
+class Weg2TokenCutFlipNotWired(Weg2LaunchRefused):
+    """#239 S3h: a FLIP boot under the token cut (``kv=qsa_forma_dcp`` with P).
+
+    The runtime half of the cut is wired for group D alone (S3a-e, S4a/S4b:
+    F4/F5/F12/F14), but the P->D hand-off under it is not: P writes whole
+    canonical pages, the D workers would have to take exactly their owner rows
+    in every wake path (dormant refetch, PREFETCH-COMPLETE / #580 vote, #988
+    loadback, tail adopt), and the wake credit per card moves with the KV bytes
+    (TP0 -, workers +). Until S3h builds and proves that, a flip boot under the
+    cut stops here by name; ``--d-only`` (H87) is the boot the cut runs in.
+    """
+
+
+#: #239 S3h: the marker of the flip refusal and of its dry-run line.
+KV_TOKEN_CUT_FLIP_MARKER = "#239 S3h FLIP UNTER KV-TOKEN-SCHNITT"
+
+
+def refuse_flip_under_token_cut(ns, boot_form) -> Optional[str]:
+    """#239 S3h: refuse a flip boot (P and D) of ``kv=qsa_forma_dcp``.
+
+    None for every other form and for ``--d-only``. A dry run prints the line
+    and returns it (the planned form is still shown in full); a real boot
+    raises :class:`Weg2TokenCutFlipNotWired`."""
+    if boot_form is None or boot_form.kv != "qsa_forma_dcp" or getattr(ns, "d_only", False):
+        return None
+    msg = (f"{KV_TOKEN_CUT_FLIP_MARKER}: --d-kv-token-cut {ns.d_kv_token_cut} "
+           "(form kv=qsa_forma_dcp) in a FLIP boot -- the P->D hand-off under the "
+           "cut is not built (the D workers' owner rows in the wake paths and the "
+           "wake credit per card, #239 S3h). Boot the cut with --d-only.")
+    if getattr(ns, "dry_run", False):
+        print(msg + " (dry run: would refuse)", flush=True)
+        return msg
+    raise Weg2TokenCutFlipNotWired(msg)
+
+
 #: #239 S3a: the D argv that carries the planner's token cut to the runtime
 #: (server_args._resolve_form_a_dcp -> rank_role.resolve_dcp_under_host_kv).
 D_TOKEN_CUT_FLAGS = (
@@ -20095,6 +20130,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ns.weg2_boot_form = boot_form
     # #239 S2: a planned-but-unwired token cut never reaches a rank.
     refuse_unwired_token_cut(ns, boot_form)
+    # #239 S3h: the cut runs D-only until the P->D hand-off under it is built.
+    refuse_flip_under_token_cut(ns, boot_form)
     # H87: the #114/H41 calibration identity by memory footprint, decided once
     # here where the checkpoint PATH is known (build_env sees only its name).
     _h87_alias_line = (note_calibration_footprint_alias(ns.model)
