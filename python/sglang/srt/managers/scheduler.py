@@ -18873,6 +18873,9 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+        # (d) an async vision stage holds a KV-tail lease on PP0: never idle
+        # (no sleep may release the pool under the tower's views)
+        idle &= getattr(self, "_weg2_vision_inflight", None) is None
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch
@@ -19460,6 +19463,7 @@ class Scheduler(
 
         _check("running_batch", self.running_batch.is_empty())
         _check("chunked_req", self.chunked_req is None)
+        _check("vision_async", getattr(self, "_weg2_vision_inflight", None) is None)
         _check("anchor_tails", not getattr(self, "anchor_tails", None))
         _check("dllm_staging", not self.dllm_manager.any_staging_reqs())
         _check(
