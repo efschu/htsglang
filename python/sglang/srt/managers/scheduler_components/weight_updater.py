@@ -8702,6 +8702,15 @@ class SchedulerWeightUpdaterManager:
             except Exception as _exc:  # noqa: BLE001 -- the warm is a hint, never a sleep refusal
                 logger.warning("RW RESUME-WARM snapshot skipped: %s", _exc)
             _weg2_ph("rw_snapshot")
+            # #276: the D phase ends here -- its heat record, before any pause
+            # (off unless SGLANG_DEBUG_MOE_HEAT names a directory; never raises)
+            from sglang.srt.layers.moe import pool_heat as _heat
+
+            _heat.flush(
+                [getattr(getattr(getattr(self, "tp_worker", None), "model_runner", None), "model", None)],
+                rank=self._weg2_rank(), group="D", reason="sleep",
+                phase_index=_weg2_flip_index_of(getattr(recv_req, "epoch", None)),
+            )
 
         assert (
             self._weg2_sleep_idle()
@@ -10148,6 +10157,11 @@ class SchedulerWeightUpdaterManager:
                     _rw().arm(_early)
                 except Exception as _exc:  # noqa: BLE001
                     logger.warning("RW RESUME-WARM arm skipped: %s", _exc)
+                # #276: the counters live under a paused tag -- a new D phase
+                # counts from zero (no-op when the heat record is off)
+                from sglang.srt.layers.moe import pool_heat as _heat
+
+                _heat.reset(list(_early) + list(_late))
             if _rl:
                 _pf_rows = _pf_join.rows if _pf_join is not None else 0
                 _deferred = deferred_rows_fill().rows_pending()
