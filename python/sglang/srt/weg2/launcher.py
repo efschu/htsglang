@@ -6432,8 +6432,10 @@ def l3_persist_attach(log: Log, directory: str, dry: bool) -> Tuple[int, int, in
     """L3P: reattach this boot to the persistent store; returns
     ``(files, bytes, removed)``.
 
-    ONE walk, before any rank starts (so nothing here sits inside a rank
-    collective): counts the ``.bin`` pages a previous boot left (the
+    Before any rank starts (so nothing here sits inside a rank collective),
+    from the store's persistent index (``_l3_attach_from_index``, 28.09.) --
+    ONE walk only when the index is unusable, exactly when the ranks walk:
+    counts the ``.bin`` pages a previous boot left (the
     ``L3-PERSIST`` line is the acceptance marker) and removes
     - the ``<final>.tmp.<uuid>`` staging files a crashed writer left behind --
       no writer of this store is alive yet, so a staging file here is
@@ -6478,6 +6480,15 @@ def l3_persist_attach(log: Log, directory: str, dry: bool) -> Tuple[int, int, in
             os.environ["SGLANG_WEG2_L3_INHERITED_SUFFIXES"] = json.dumps(list(known))
         else:
             os.environ.pop("SGLANG_WEG2_L3_INHERITED_SUFFIXES", None)
+    # 28.09. (operator order): the same answer from the store's persistent
+    # index (snapshot + journals) -- the directory is walked only when the
+    # ranks would walk it too (snapshot missing/broken, another kernel boot).
+    from sglang.srt.mem_cache.storage.file import store_journal as _sj
+
+    if _sj.enabled():
+        got = _l3_attach_from_index(log, directory, dry, epoch, known, revoked)
+        if got is not None:
+            return got
     for root, _dirs, names in os.walk(directory):
         for name in names:
             p = os.path.join(root, name)
@@ -6528,6 +6539,109 @@ def l3_persist_attach(log: Log, directory: str, dry: bool) -> Tuple[int, int, in
            f"; windows {[(time.strftime('%H:%M:%SZ', time.gmtime(a)), time.strftime('%H:%M:%SZ', time.gmtime(b)), r) for a, b, r in revoked]})"
            if revoked else "")
         + f" walk_s={walk_s:.1f} epoch={epoch:.3f}"
+        + (" (DRY-RUN: nothing removed)" if dry else "")
+        + " -- the ranks seed the L3 index and the evictor ledger from it at attach"
+    )
+    return files, nbytes, removed
+
+
+def _l3_attach_from_index(log: Log, directory: str, dry: bool, epoch: float,
+                          known: Optional[Tuple[str, ...]],
+                          revoked: List[Tuple[float, float, str]]
+                          ) -> Optional[Tuple[int, int, int]]:
+    """``l3_persist_attach`` without the walk: the pages, their bytes and
+    mtimes come from the persistent index (store_journal.load_index, the load
+    the ranks make). Same removals, derived instead of found:
+
+    - staging files: a write that died leaves its ``<final>.tmp.<uuid>`` only
+      after its ``R`` line with no ``C``/``A`` -- the open intents; their
+      staging names are globbed, nothing else is looked at;
+    - ORPHAN pages: indexed stems in no group's suffix record;
+    - revoked pages: indexed mtime inside a revoked window.
+
+    Every page removed or moved gets an ``E`` line in a launcher journal filed
+    under the PREVIOUS epoch, so the ranks' load (which replays every earlier
+    boot's journal) and the D owner's compaction see it -- the index never
+    keeps an entry the launcher unlinked. ``None`` = the index is unusable:
+    the caller walks, as the ranks will.
+    """
+    import glob
+
+    from sglang.srt.mem_cache.storage.file import store_journal as _sj
+
+    t0 = time.monotonic()
+
+    def _stat(stem):
+        try:
+            st = os.lstat(_sj.page_path(directory, stem))
+        except OSError:
+            return None
+        return (st.st_mtime, st.st_blocks * 512)
+
+    intents: List[str] = []
+    items, why = _sj.load_index(directory, stat_size=_stat, open_intents=intents)
+    if items is None:
+        log(f"L3-PERSIST index unusable ({why}) -- ONE walk of dir={directory}")
+        return None
+    jn = None  # opened at the first E line: an attach that removes nothing files no journal
+    now = time.time()
+
+    def _gone(size, stem):
+        nonlocal jn
+        if jn is None:
+            jn = _sj.JournalWriter(directory, "launcher", epoch=int(epoch) - 1)
+        jn.write("E", now, size, stem)
+    files = nbytes = removed = orphans = orphan_bytes = 0
+    rev_n = rev_bytes = rev_failed = 0
+    for stem in intents:
+        final = _sj.page_path(directory, stem)
+        for p in {glob.escape(final), glob.escape(os.path.join(directory, f"{stem}.bin"))}:
+            for tmp in glob.glob(p + ".tmp.*"):
+                if not dry:
+                    try:
+                        os.unlink(tmp)
+                        removed += 1
+                    except OSError:
+                        pass
+    for stem, (mtime, size) in items.items():
+        if revoked and any(a <= mtime <= b for a, b, _r in revoked):
+            path = _sj.page_path(directory, stem)
+            if _l3_move_revoked(directory, os.path.dirname(path), os.path.basename(path), dry):
+                rev_n += 1
+                rev_bytes += size
+                if not dry:
+                    _gone(size, stem)
+            else:
+                rev_failed += 1
+            continue
+        if known is not None and not stem.endswith(known):
+            orphans += 1
+            orphan_bytes += size
+            if not dry:
+                try:
+                    os.unlink(_sj.page_path(directory, stem))
+                    removed += 1
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    continue  # still on disk: its entry stays
+                _gone(size, stem)
+            continue
+        files += 1
+        nbytes += size
+    if jn is not None:
+        jn.sync()
+    log(
+        f"L3-PERSIST {'reuse' if files else 'fresh'} dir={directory} files={files} bytes={nbytes} "
+        f"({nbytes / host_ledger.GIB:.2f} GiB) orphans={orphans} ({orphan_bytes / host_ledger.GIB:.2f} GiB, "
+        + ("no suffix record yet: counted, kept" if known is None else
+           f"suffix in no group's record: {'would be ' if dry else ''}removed")
+        + f") staging+orphans_removed={removed} (staging of {len(intents)} open intent(s))"
+        + (f" revoked={rev_n} ({rev_bytes / host_ledger.GIB:.2f} GiB, "
+           f"{'would be ' if dry else ''}moved to {directory.rstrip('/') + L3_REVOKED_SUFFIX}"
+           f"{f', {rev_failed} NOT moved (kept out of the count, still on disk)' if rev_failed else ''})"
+           if revoked else "")
+        + f" index_s={time.monotonic() - t0:.2f} source=index ({why}), no walk epoch={epoch:.3f}"
         + (" (DRY-RUN: nothing removed)" if dry else "")
         + " -- the ranks seed the L3 index and the evictor ledger from it at attach"
     )

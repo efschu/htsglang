@@ -123,9 +123,10 @@ def parse_lines(data: bytes) -> Tuple[List[Record], Optional[str]]:
 class JournalWriter:
     """This rank's own journal. Never raises into the write path."""
 
-    def __init__(self, store: str, ident: str):
+    def __init__(self, store: str, ident: str, epoch: Optional[int] = None):
         self.path = os.path.join(
-            store, f"{PREFIX}{attach_epoch()}.{ident}.{uuid.uuid4().hex[:8]}{SUFFIX}")
+            store, f"{PREFIX}{attach_epoch() if epoch is None else int(epoch)}."
+                   f"{ident}.{uuid.uuid4().hex[:8]}{SUFFIX}")
         self._fd: Optional[int] = None
         self.failed = False
         self._open()
@@ -283,6 +284,74 @@ def remove_snapshot_tmps(store: str) -> int:
     return n
 
 
+_SHARD_HEX = "0123456789abcdef"
+
+
+def page_path(store: str, stem: str) -> str:
+    """Where the page ``stem`` lives: its shard (``hicache_storage.page_shard``,
+    same rule, kept torch-free here), else the pre-sharding flat path."""
+    prefix = stem[:2]
+    shard = prefix if len(prefix) == 2 and all(c in _SHARD_HEX for c in prefix) else "zz"
+    p = os.path.join(store, shard, f"{stem}.bin")
+    if os.path.exists(p):
+        return p
+    flat = os.path.join(store, f"{stem}.bin")
+    return flat if os.path.exists(flat) else p
+
+
+def load_index(store: str, *, own_path: Optional[str] = None,
+               skip_epoch_from: Optional[int] = None, stat_size=None,
+               open_intents: Optional[List[str]] = None):
+    """``(items, provenance)`` from snapshot + journals, or ``(None, why)``: the
+    ONE load the ranks' attach and the launcher's attach share. ``items`` =
+    stem -> (mtime, bytes). Journals from ``skip_epoch_from`` on (this boot's)
+    are left for the wake; ``open_intents`` receives the stems whose write
+    began and never ended. ``None`` means: walk once (missing/torn snapshot,
+    another kernel boot)."""
+    boot = kernel_boot_id()
+    for _attempt in range(5):
+        snap, why = load_snapshot(store)
+        if snap is None:
+            return None, why
+        if snap.boot_id != boot:
+            return None, ("kernel boot id changed since the snapshot (host reboot or "
+                          "power loss can drop unsynced journal lines)")
+        items = dict(snap.items)
+        records: Optional[List[Record]] = []
+        used = 0
+        for p in journal_paths(store):
+            if p == own_path:
+                continue
+            e = epoch_of(p) or 0
+            if e < snap.epoch or (skip_epoch_from is not None and e >= skip_epoch_from):
+                continue  # compacted into the snapshot / this boot's (read at the wake)
+            try:
+                with open(p, "rb") as f:
+                    data = f.read()
+            except OSError:
+                records = None
+                break
+            recs, jboot = parse_lines(data[: data.rfind(b"\n") + 1])
+            if jboot is not None and jboot != boot:
+                return None, f"journal {os.path.basename(p)} from another kernel boot"
+            records.extend(recs)
+            used += 1
+        try:
+            same = os.stat(os.path.join(store, SNAP)).st_ino == snap.inode
+        except OSError:
+            same = False
+        if records is None or not same:
+            continue  # the snapshot writer compacted meanwhile: load its new one
+        records.sort(key=lambda r: r[0])
+        opened: List[str] = []
+        applied, stated = replay(items, records, stat_size, opened)
+        if open_intents is not None:
+            open_intents.extend(opened)
+        return items, (f"snapshot epoch {snap.epoch} ({len(snap.items)} files) + {used} "
+                       f"journal(s), {applied} line(s), {stated} open intent(s) stat'ed")
+    return None, "the snapshot kept changing while it was read"
+
+
 def index_entries(store: str) -> Tuple[int, str]:
     """How many entries the RAM index of ``store`` holds, for the host ledger:
     the snapshot header's ``n=`` (one line read), else the page-file count of
@@ -299,11 +368,18 @@ def index_entries(store: str) -> Tuple[int, str]:
     n = 0
     try:
         with os.scandir(store) as it:
-            for e in it:
-                if e.name.endswith(".bin"):
-                    n += 1
+            top = list(it)
     except OSError:
         return 0, "no store yet"
+    for e in top:
+        if e.name.endswith(".bin"):
+            n += 1
+        elif e.is_dir(follow_symlinks=False):  # the page shards
+            try:
+                with os.scandir(e.path) as sub:
+                    n += sum(1 for x in sub if x.name.endswith(".bin"))
+            except OSError:
+                pass
     return n, "file count, no snapshot yet"
 
 
@@ -344,10 +420,12 @@ def load_snapshot(store: str) -> Tuple[Optional[Snapshot], str]:
 
 
 def replay(items: "Dict[str, Tuple[float, int]]", records: List[Record],
-           stat_size=None) -> Tuple[int, int]:
+           stat_size=None, open_intents: Optional[List[str]] = None) -> Tuple[int, int]:
     """Apply journal records (time-ordered) to a stem -> (mtime, bytes) map in
     place. An ``R`` left without its ``C``/``A`` is resolved by ONE stat through
-    ``stat_size(stem) -> (mtime, bytes) | None``. Returns (applied, stat'ed)."""
+    ``stat_size(stem) -> (mtime, bytes) | None`` and, when asked, listed in
+    ``open_intents`` (a write that died: its staging file may be left).
+    Returns (applied, stat'ed)."""
     pending: Dict[str, float] = {}
     for t, op, size, stem in records:
         if op == "R":
@@ -362,6 +440,8 @@ def replay(items: "Dict[str, Tuple[float, int]]", records: List[Record],
             pending.pop(stem, None)
             items.pop(stem, None)
     stated = 0
+    if open_intents is not None:
+        open_intents.extend(pending)
     if stat_size is not None:
         for stem in pending:
             stated += 1

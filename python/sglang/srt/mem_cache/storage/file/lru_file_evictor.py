@@ -1675,9 +1675,7 @@ class LRUFileEvictor:
 
     def _journal_load(self):
         """``(items, provenance)`` from snapshot + journals, or ``(None, why)``."""
-        own = self._journal.path if self._journal is not None else None
         epoch = _sj.attach_epoch()
-        boot = _sj.kernel_boot_id()
 
         def _stat(stem):
             try:
@@ -1686,44 +1684,9 @@ class LRUFileEvictor:
                 return None
             return (st.st_mtime, self._allocated_size(st))
 
-        for _attempt in range(5):
-            snap, why = _sj.load_snapshot(self.file_path)
-            if snap is None:
-                return None, why
-            if snap.boot_id != boot:
-                return None, ("kernel boot id changed since the snapshot (host reboot or "
-                              "power loss can drop unsynced journal lines)")
-            items = dict(snap.items)
-            records = []
-            used = 0
-            for p in _sj.journal_paths(self.file_path):
-                if p == own:
-                    continue
-                e = _sj.epoch_of(p) or 0
-                if e < snap.epoch or (epoch > 0 and e >= epoch):
-                    continue  # compacted into the snapshot / this boot's (read at the wake)
-                try:
-                    with open(p, "rb") as f:
-                        data = f.read()
-                except OSError:
-                    records = None
-                    break
-                recs, jboot = _sj.parse_lines(data[: data.rfind(b"\n") + 1])
-                if jboot is not None and jboot != boot:
-                    return None, f"journal {os.path.basename(p)} from another kernel boot"
-                records.extend(recs)
-                used += 1
-            try:
-                same = os.stat(os.path.join(self.file_path, _sj.SNAP)).st_ino == snap.inode
-            except OSError:
-                same = False
-            if records is None or not same:
-                continue  # the snapshot writer compacted meanwhile: load its new one
-            records.sort(key=lambda r: r[0])
-            applied, stated = _sj.replay(items, records, _stat)
-            return items, (f"snapshot epoch {snap.epoch} ({len(snap.items)} files) + {used} "
-                           f"journal(s), {applied} line(s), {stated} open intent(s) stat'ed")
-        return None, "the snapshot kept changing while it was read"
+        return _sj.load_index(
+            self.file_path, own_path=self._journal.path if self._journal is not None else None,
+            skip_epoch_from=epoch if epoch > 0 else None, stat_size=_stat)
 
     def _journal_after_attach(self) -> None:
         """The snapshot writer persists what this attach installed and compacts;
