@@ -2537,6 +2537,13 @@ class Envs:
     # bound is about, instead of its worst case. 0 (default) = off; the pool
     # tables then carry no demand counters and the step kernel is unchanged.
     SGLANG_DEBUG_MOE_POOL_DEMAND = EnvInt(0)
+    # #276 heat record: a directory turns it on. Every pool layer keeps a
+    # device histogram of the routed LOCAL expert ids of its captured decode
+    # steps (one index_add_ in the step, no host read); D writes one JSON
+    # record per rank at its sleep ('MOE-HEAT (#276) wrote ...') and zeroes
+    # the counters at the wake. Unset (default) = off: no tensor, no op, the
+    # captured graph is unchanged. Input of the planner's hot-set stage.
+    SGLANG_DEBUG_MOE_HEAT = EnvStr(None)
     # H95c (Nutzer 26.09.: "1,6gb experten cache kostet es nur bei tatsaechlich
     # 6 sitzen"): D's per-seat posts are PHYSICALLY backed only for the seats
     # the phase occupies (n = d_seats.phase_seats of the wake's handoff_n); the

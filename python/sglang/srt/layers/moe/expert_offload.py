@@ -3416,6 +3416,11 @@ class MoEExpertOffloadCache:
         self._pool_pf_begin = None  # main -> side: x_L is ready
         self._pool_pf_done = None  # side -> main: the predicted rows are in
         self._pool_pf_armed = False
+        # #276 heat record (SGLANG_DEBUG_MOE_HEAT, default off): the device
+        # histogram of the captured step's routed ids (layers/moe/pool_heat).
+        # None = off: prepare_pool then adds no op to the captured step.
+        self._pool_heat = None
+        self._pool_heat_ones = None
         # H95: (n_ids -> waves) the captured steps of this layer were built
         # with, for the capture log line and the demand probe.
         self._pool_waves_seen: Dict[int, int] = {}
@@ -4288,6 +4293,9 @@ class MoEExpertOffloadCache:
                 device, E, rows, R, staging, hot_slot_of, host_row, demand=demand
             )
         self._pool_buffers = allocate_step_buffers(device, E, width)
+        from sglang.srt.layers.moe import pool_heat
+
+        self._pool_heat, self._pool_heat_ones = pool_heat.allocate(device, E, width)
         self._pool_srcs = [device_view_of_pinned(self._pinned[a]) for a in attrs]
         self._pool_dsts = [self._resident[a] for a in attrs]
         self._pool_view_holders = [self._pinned[a] for a in attrs]
@@ -4535,6 +4543,12 @@ class MoEExpertOffloadCache:
             # the graph, and the real plan below sees them as ordinary hits.
             self._pool_pf_armed = False
             torch.cuda.current_stream().wait_event(self._pool_pf_done)
+        heat = getattr(self, "_pool_heat", None)
+        if heat is not None:
+            # #276: wave 1 sees every lane of the step; on the device, no host read
+            from sglang.srt.layers.moe import pool_heat
+
+            pool_heat.count(heat, self._pool_heat_ones, flat, self.num_local_experts)
         # 20.09. (fn8u, Task #52): the pool step and the row fetch are timed
         # as their own clock families, so a decode round's split names the
         # host->device expert traffic apart from compute and collectives.
