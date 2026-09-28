@@ -371,12 +371,16 @@ class TestStoreCapBoundsTheDirectory(CustomTestCase):
 
             owner = _owner(d, (SHARED,), cap, iter_staging=_iter_staging)
             st = owner.stats()
+            # 28.09.: the owner's own write journal (store_journal.py) is a
+            # non-page file under the store too, and counted like one
+            jn = [os.path.join(d, n) for n in os.listdir(d) if n.endswith(".jnl")]
+            jn_bytes = sum(max(os.stat(p).st_blocks * 512, os.stat(p).st_size) for p in jn)
             self.assertEqual(
                 st["staging_bytes"],
-                15 * page,
+                15 * page + jn_bytes,
                 "staging/partial files are still outside the cap's population",
             )
-            self.assertEqual(st["directory_bytes"], 15 * page)
+            self.assertEqual(st["directory_bytes"], 15 * page + jn_bytes)
             _fill(owner, d, [f"n{i:04d}{SHARED}" for i in range(20)], page)
             self.assertLessEqual(
                 _dir_allocated_bytes(d, ".bin") + 15 * page,
@@ -713,7 +717,13 @@ class TestWakeRescanIsWired(CustomTestCase):
             ev = _owner(d, (SHARED,), 40 * page, iter_existing=_iter_existing)
             holder["ev"] = ev
             probed.clear()
-            ev.rescan()
+            # this test grades the WALK; since 28.09. a wake reads the write
+            # journal instead unless SGLANG_WEG2_STORE_JOURNAL=0
+            os.environ["SGLANG_WEG2_STORE_JOURNAL"] = "0"
+            try:
+                ev.rescan()
+            finally:
+                os.environ.pop("SGLANG_WEG2_STORE_JOURNAL", None)
             self.assertTrue(probed, "the walk never ran, so nothing was graded")
             self.assertTrue(
                 all(probed),

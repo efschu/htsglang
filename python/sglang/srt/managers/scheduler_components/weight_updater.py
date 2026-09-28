@@ -4303,7 +4303,8 @@ class SchedulerWeightUpdaterManager:
             "does not scan; %d B are staging/partial files "
             "(instrument: os.scandir + os.stat over the store, charged at "
             "max(st_blocks*512, st_size) -- the #410 unit, not apparent size) "
-            "in %.0f ms",
+            "in %.0f ms (mode %s: journal = only the lines written since the "
+            "last wake, walk = the whole directory)",
             census.get("indexed_entries", 0),
             census.get("seen_entries", 0),
             census.get("indexed_bytes", 0),
@@ -4313,6 +4314,7 @@ class SchedulerWeightUpdaterManager:
             census.get("foreign_bytes", 0),
             census.get("staging_bytes", 0),
             (time.perf_counter() - t0) * 1000,
+            census.get("mode", "walk"),
         )
 
     def _weg2_drain_hicache_before_sleep(

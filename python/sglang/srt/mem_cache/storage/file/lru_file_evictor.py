@@ -31,6 +31,8 @@ import time
 from collections import OrderedDict
 from typing import Any, Callable, Iterable, List, Optional, Set, Tuple
 
+from sglang.srt.mem_cache.storage.file import store_journal as _sj
+
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.weg2_store_gates import (
     check_index_coverage,
@@ -259,6 +261,21 @@ class LRUFileEvictor:
         self._is_storage_owner = (not self._writes_shared_keys) or (
             tp_rank == 0 and pp_rank == 0 and attn_cp_rank == 0
         )
+        # 28.09. THE WAKE READS THE JOURNAL, NOT THE DIRECTORY (store_journal.py):
+        # every writing rank of a shared-key store appends a line per committed
+        # page; the owner reads the others' journals from where it last looked.
+        # Journals of earlier boots are compacted away here -- this attach walks
+        # the whole directory anyway. SGLANG_WEG2_STORE_JOURNAL=0: walk as before.
+        self._journal: Optional[_sj.JournalWriter] = None
+        self._journal_reader: Optional[_sj.JournalReader] = None
+        self._journal_wakes = 0
+        if self._writes_shared_keys and _sj.enabled():
+            _sj.compact(file_path, _sj.attach_epoch())
+            _group = (os.environ.get("SGLANG_WEG2_GROUP", "") or "g").strip() or "g"
+            self._journal = _sj.JournalWriter(
+                file_path, f"{_group}-t{tp_rank}-p{pp_rank}-c{attn_cp_rank}")
+            if self._is_storage_owner and not self._journal.failed:
+                self._journal_reader = _sj.JournalReader(file_path, self._journal.path)
 
         # suffixed_key -> allocated disk bytes; oldest at front.
         self._lru: OrderedDict[str, int] = OrderedDict()
@@ -929,6 +946,17 @@ class LRUFileEvictor:
     l3_index = None
 
     def commit(self, suffixed_key: str) -> None:
+        # 28.09.: the page's journal line, from EVERY writing rank (a non-owner
+        # returns below, and its pages are exactly what the owner's journal
+        # read must learn about).
+        _jst = None
+        _jn = getattr(self, "_journal", None)
+        if _jn is not None:
+            try:
+                _jst = os.stat(self._path_for_stem(suffixed_key))
+                _jn.write("C", _jst.st_mtime, self._allocated_size(_jst), suffixed_key)
+            except OSError:
+                _jst = None
         _idx = getattr(self, "l3_index", None)
         if _idx is not None:
             try:
@@ -949,7 +977,8 @@ class LRUFileEvictor:
             return
         actual = None
         try:
-            actual = self._allocated_size(os.stat(self._path_for_stem(suffixed_key)))
+            actual = self._allocated_size(
+                _jst if _jst is not None else os.stat(self._path_for_stem(suffixed_key)))
         except OSError:
             pass  # gone or unreadable; keep the reservation's estimate
         with self._lock:
@@ -1032,6 +1061,11 @@ class LRUFileEvictor:
             self._foreign_indexed_bytes = 0
             self._staging_bytes = 0
             self._scan_census = dict(_EMPTY_CENSUS)
+        # the backend's clear removed the journals too
+        if self._journal is not None:
+            self._journal.reopen()
+        if self._journal_reader is not None:
+            self._journal_reader.mark()
 
     def _fs_stats(self) -> Optional[tuple]:
         """(total, available) bytes for the filesystem; None if unavailable."""
@@ -1184,6 +1218,11 @@ class LRUFileEvictor:
         index, because a second index over one directory is exactly the twin
         bookkeeping F7 removes.
         """
+        # 28.09.: where every other journal ends NOW -- lines appended during
+        # the walk are read again at the next wake, and applying them twice is
+        # a no-op (a known stem is not re-counted, an unlinked one is gone).
+        if getattr(self, "_journal_reader", None) is not None:
+            self._journal_reader.mark()
         entries: List[Tuple[float, str, int]] = []
         seen_bytes = 0
         seen_entries = 0
@@ -1404,6 +1443,17 @@ class LRUFileEvictor:
         if not self._eviction_enabled:
             return self.index_coverage()
         t0 = time.monotonic()
+        if self._journal_reader is not None and _sj.enabled():
+            self._journal_wakes += 1
+            every = _sj.full_walk_every()
+            if every and self._journal_wakes % every == 0:
+                why = f"every {every} wakes ({_sj.FULL_WALK_EVERY_ENV})"
+            else:
+                got = self._journal_reader.read_delta()
+                if got is not None:
+                    return self._journal_apply(got[0], got[1], t0)
+                why = self._journal_reader.why_full
+            logger.info(f"HiCacheFile journal: full walk at this wake -- {why}")
         with self._lock:
             # Adopted at attach, or written by this process: this owner's.
             own_known = set(self._lru) - self._foreign_indexed
@@ -1454,6 +1504,103 @@ class LRUFileEvictor:
             f"{census['indexed_entries']} of {census['seen_entries']} files, "
             f"{census['indexed_bytes']} of {census['seen_bytes']} B "
             f"({census['fraction']:.1%}) under the cap."
+        )
+        return census
+
+    def _journal_apply(self, records, nbytes: int, t0: float) -> dict:
+        """The wake's index update from the other writers' journal lines.
+
+        Same classification as the walk: a new stem under this group's suffixes
+        is indexed as the sibling's (counted, never unlinked -- this owner did
+        not write it, else it would already be indexed); any other stem is a
+        directory byte this index does not cover. An ``E`` removes. A line that
+        names a page whose file is gone is harmless: the index only ever COUNTS
+        and UNLINKS (FileNotFoundError is a drop), the read path never asks it.
+        """
+        added = removed = 0
+        with self._lock:
+            c = dict(getattr(self, "_scan_census", None) or _EMPTY_CENSUS)
+            for _t, op, size, stem in records:
+                indexed = (not self._scan_suffixes) or stem.endswith(self._scan_suffixes)
+                if op == "C":
+                    if indexed:
+                        prev = self._lru.get(stem)
+                        if prev is None:
+                            self._lru[stem] = size
+                            self._total_bytes += size
+                            self._foreign_indexed.add(stem)
+                            self._foreign_indexed_bytes += size
+                            c["indexed_bytes"] = c.get("indexed_bytes", 0) + size
+                            c["indexed_entries"] = c.get("indexed_entries", 0) + 1
+                            c["seen_bytes"] = c.get("seen_bytes", 0) + size
+                            c["seen_entries"] = c.get("seen_entries", 0) + 1
+                            added += 1
+                        elif prev != size and stem not in self._pending_writes:
+                            self._lru[stem] = size
+                            self._total_bytes += size - prev
+                            if stem in self._foreign_indexed:
+                                self._foreign_indexed_bytes += size - prev
+                            c["indexed_bytes"] = c.get("indexed_bytes", 0) + size - prev
+                            c["seen_bytes"] = c.get("seen_bytes", 0) + size - prev
+                    else:
+                        if self._writes_shared_keys:
+                            self._enforced_foreign_bytes += size
+                        c["foreign_bytes"] = c.get("foreign_bytes", 0) + size
+                        c["seen_bytes"] = c.get("seen_bytes", 0) + size
+                        c["seen_entries"] = c.get("seen_entries", 0) + 1
+                        added += 1
+                else:  # "E"
+                    if indexed:
+                        prev = self._lru.get(stem)
+                        if prev is not None and stem not in self._pending_writes:
+                            del self._lru[stem]
+                            self._total_bytes -= prev
+                            if stem in self._foreign_indexed:
+                                self._foreign_indexed.discard(stem)
+                                self._foreign_indexed_bytes -= prev
+                            c["indexed_bytes"] = max(0, c.get("indexed_bytes", 0) - prev)
+                            c["indexed_entries"] = max(0, c.get("indexed_entries", 0) - 1)
+                            c["seen_bytes"] = max(0, c.get("seen_bytes", 0) - prev)
+                            c["seen_entries"] = max(0, c.get("seen_entries", 0) - 1)
+                            removed += 1
+                    else:
+                        if self._writes_shared_keys:
+                            self._enforced_foreign_bytes = max(0, self._enforced_foreign_bytes - size)
+                        c["foreign_bytes"] = max(0, c.get("foreign_bytes", 0) - size)
+                        c["seen_bytes"] = max(0, c.get("seen_bytes", 0) - size)
+                        c["seen_entries"] = max(0, c.get("seen_entries", 0) - 1)
+                        removed += 1
+            # the index is the truth for what it covers -- this owner's own
+            # writes since the last census included, which no journal line of
+            # another writer carries; the unindexed remainder is what the lines
+            # moved it to
+            unindexed_entries = max(0, c.get("seen_entries", 0) - c.get("indexed_entries", 0))
+            c["indexed_bytes"] = self._total_bytes
+            c["indexed_entries"] = len(self._lru)
+            c["seen_bytes"] = self._total_bytes + c.get("foreign_bytes", 0)
+            c["seen_entries"] = len(self._lru) + unindexed_entries
+            seen = c["seen_bytes"]
+            c["fraction"] = (c["indexed_bytes"] / seen) if seen > 0 else 1.0
+            c["foreign_indexed_bytes"] = self._foreign_indexed_bytes
+            c["mode"] = "journal"
+            c["journal_records"] = len(records)
+            c["walk_s"] = round(time.monotonic() - t0, 3)
+            self._scan_census = c
+            census = self.index_coverage()
+        if self._writes_shared_keys:
+            check_index_coverage(
+                store_path=self.file_path,
+                indexed_bytes=census["indexed_bytes"],
+                seen_bytes=census["seen_bytes"],
+                indexed_entries=census["indexed_entries"],
+                seen_entries=census["seen_entries"],
+            )
+        logger.info(
+            f"HiCacheFile eviction index updated from the journal at wake: "
+            f"{len(records)} line(s) ({nbytes} B) from "
+            f"{len(self._journal_reader.state)} journal(s), +{added}/-{removed} files, "
+            f"{census['indexed_entries']} of {census['seen_entries']} files indexed, "
+            f"{(time.monotonic() - t0) * 1000:.0f} ms (no directory walk)"
         )
         return census
 
@@ -1523,10 +1670,14 @@ class LRUFileEvictor:
                     pass
             if self._on_evict is not None:
                 self._on_evict(evict_stem)
+            if self._journal is not None:
+                self._journal.write("E", time.time(), evict_size, evict_stem)
         except FileNotFoundError:
             freed = 0  # file already gone; still drop the stale index entry
             if self._on_evict is not None:
                 self._on_evict(evict_stem)
+            if self._journal is not None:
+                self._journal.write("E", time.time(), evict_size, evict_stem)
         except OSError as e:
             logger.warning(f"HiCacheFile eviction failed for {evict_stem}: {e}")
             self._lru[evict_stem] = evict_size
