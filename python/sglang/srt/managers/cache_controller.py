@@ -109,6 +109,48 @@ from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
 
+
+def _read_stages(operation) -> dict:
+    """H2D phase 1 (a): CPU ms per read sub-stage of ONE prefetch operation
+    (aux thread): find, adopt (#257 probe hold), ref, l3fill, resolve (arena
+    page get), kv (the whole page get), draft_wait, extra (hybrid pools:
+    mamba anchor / sidecars). Written by the read, printed once by
+    ``_read_stages_line``. Instrument only."""
+    rs = getattr(operation, "_weg2_rs", None)
+    if rs is None:
+        rs = {}
+        try:
+            operation._weg2_rs = rs
+        except Exception:  # noqa: BLE001 -- an operation without a dict: count nothing
+            pass
+    return rs
+
+
+_READ_STAGES_N = [0]
+
+
+def _read_stages_line(operation, total_ms: float) -> None:
+    """One ``WEG2-READ-STAGES`` line per read (the first 16, then every read
+    of >= 64 pages or >= 50 ms): where the aux thread's read time goes."""
+    try:
+        rs = getattr(operation, "_weg2_rs", None) or {}
+        pages = int(rs.get("pages", 0))
+        _READ_STAGES_N[0] += 1
+        if not (_READ_STAGES_N[0] <= 16 or pages >= 64 or total_ms >= 50.0):
+            return
+        parts = " ".join(
+            f"{k}_ms={float(rs[k]):.0f}" for k in
+            ("find", "adopt", "ref", "l3fill", "resolve", "kv", "draft_wait", "extra") if k in rs)
+        logger.info(
+            "WEG2-READ-STAGES req=%s pages=%d l3fill_pages=%d total_ms=%.0f %s "
+            "(aux-thread CPU ms of the read: kv = the whole arena page get incl. "
+            "find/adopt/ref/l3fill/resolve; extra = hybrid pools; no H2D here)",
+            getattr(operation, "request_id", "?"), pages, int(rs.get("l3fill_pages", 0)),
+            total_ms, parts,
+        )
+    except Exception:  # noqa: BLE001 -- an instrument never breaks a read
+        pass
+
 device_module = get_device_module()
 
 
@@ -3535,6 +3577,9 @@ class HiCacheController:
         stems = weg2_suffixed_stems(self.storage_backend, hash_values)  # Posten 2: suffix memoised per key class
         import numpy as _np
         _fs, _st = pool.arena.find_slots_np(stems)  # Posten 2 (18.09.): numpy, no 520k-tuple list
+        _rs = _read_stages(operation)
+        _rs["find"] = _rs.get("find", 0.0) + (time.perf_counter() - _t0) * 1000.0
+        _ta = time.perf_counter()
         # #257 (a): pages the probe HOLDS are read from the held slot -- the
         # probe's reference becomes the read's, no second reference is taken
         _page0 = 0
@@ -3551,6 +3596,7 @@ class HiCacheController:
         else:
             _hm = _np.zeros(int(_fs.shape[0]), dtype=bool)
         _t1 = time.perf_counter()
+        _rs["adopt"] = _rs.get("adopt", 0.0) + (_t1 - _ta) * 1000.0
         slots = []
         # #1439b: the leading run of COMPLETE slots is referenced in ONE C
         # call (xsn200: one ref per page in a Python loop was 7 %); only the
@@ -3593,11 +3639,15 @@ class HiCacheController:
                 break
             _need.append(i)
         _fills = {}
+        _tf = time.perf_counter()
         if _need:
             _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
             if callable(_fill_fn):
                 _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
                 _fills = dict(zip(_need, _got))
+        _tf1 = time.perf_counter()
+        _rs["l3fill"] = _rs.get("l3fill", 0.0) + (_tf1 - _tf) * 1000.0
+        _rs["l3fill_pages"] = _rs.get("l3fill_pages", 0) + len(_need)
         for i in range(lead, _end):
             if _hm[i]:
                 slots.append(int(_fs[i]))  # #257: held since the probe
@@ -3633,9 +3683,12 @@ class HiCacheController:
                             getattr(getattr(pool, "arena", None), "path", type(getattr(pool, "arena", None)).__name__))
             return 0
         _t2 = time.perf_counter()
+        _rs["ref"] = _rs.get("ref", 0.0) + ((_t2 - _t1) - (_tf1 - _tf)) * 1000.0
         _probe_hold.consumed(operation, _page0, len(slots))
         pool.resolve_rows(host_indices, slots)
         _t3 = time.perf_counter()
+        _rs["resolve"] = _rs.get("resolve", 0.0) + (_t3 - _t2) * 1000.0
+        _rs["pages"] = _rs.get("pages", 0) + len(slots)
         # Task #3: ONE increment per batch. `increment` is a lock + an add;
         # 262k of them per re-admission (xsn246 ARENA-GET) is a Python
         # loop on the read path's critical section. A terminated
@@ -3718,9 +3771,14 @@ class HiCacheController:
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            _rs = _read_stages(operation)
+            _tk = time.perf_counter()
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
+            _rs["kv"] = _rs.get("kv", 0.0) + (time.perf_counter() - _tk) * 1000.0
             if _draft_fut is not None:
+                _tw = time.perf_counter()
                 flags = _draft_fut.result()
+                _rs["draft_wait"] = _rs.get("draft_wait", 0.0) + (time.perf_counter() - _tw) * 1000.0
                 if flags is not None and self._draft_read_broke_the_claim(
                     operation, i, flags
                 ):
@@ -3838,6 +3896,7 @@ class HiCacheController:
                 operation.read_start_time = time.monotonic()
                 self._page_transfer(operation)
                 operation.read_end_time = time.monotonic()
+                _read_stages_line(operation, (operation.read_end_time - operation.read_start_time) * 1000.0)
                 # #257: what the read did not take, the probe gives back
                 _probe_hold.release(operation, getattr(self, "mem_pool_host", None), 0, reason="read-end")
                 # operation terminated by controller, release pre-allocated memory

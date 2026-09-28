@@ -2494,6 +2494,13 @@ class HostPoolGroup:
             )
             _k = str(getattr(transfer, "name", None) or type(entry.host_pool).__name__)
             _acc[_k] = _acc.get(_k, 0.0) + (time.perf_counter() - _t) * 1000.0
+            # H2D phase 1 (a): the pool's own sub-stages (mamba: select, idx,
+            # issue, split, sync, ple) ride in the same components line.
+            _sub = getattr(entry.host_pool, "_weg2_load_sub", None)
+            if _sub:
+                for _sk, _sv in _sub.items():
+                    _acc[f"{_k}.{_sk}"] = _acc.get(f"{_k}.{_sk}", 0.0) + _sv
+                _sub.clear()
 
     def backup_from_device_all_layer(
         self,

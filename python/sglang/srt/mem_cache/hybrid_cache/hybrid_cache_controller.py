@@ -1307,7 +1307,15 @@ class HybridCacheController(BaseHiCacheController):
                 operation.pool_transfers, operation.hash_value, kv_completed_pages
             )
             self._resolve_sidecar_derived_pool_transfers(operation)
+            _te = time.perf_counter()
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
+            try:  # H2D phase 1 (a): the extra pools' read (mamba anchor, sidecars)
+                from sglang.srt.managers.cache_controller import _read_stages
+
+                _rs = _read_stages(operation)
+                _rs["extra"] = _rs.get("extra", 0.0) + (time.perf_counter() - _te) * 1000.0
+            except Exception:  # noqa: BLE001
+                pass
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
         operation.pool_transfers_done = True
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Optional, Sequence
 
 import torch
@@ -48,6 +49,17 @@ def _arena_state_load_block_bytes() -> int:
         return max(1 << 20, int(os.environ.get("SGLANG_WEG2_ARENA_STATE_LOAD_BLOCK_BYTES", str(256 << 20))))
     except ValueError:
         return 256 << 20
+
+
+def _load_sub(pool) -> dict:
+    """H2D phase 1 (a): CPU ms of the mamba state load's sub-stages, summed
+    over one start_loading; the hybrid host pool folds them into the
+    ``WEG2-START-LOADING components_ms`` line as ``mamba.<stage>`` and clears
+    them. Instrument only."""
+    sub = getattr(pool, "_weg2_load_sub", None)
+    if sub is None:
+        sub = pool._weg2_load_sub = {}
+    return sub
 
 
 def merge_state_extents(comp):
@@ -583,10 +595,13 @@ class ArenaMambaPoolHost(MambaPoolHost):
         if getattr(self, "_state_dev_stage", None) is None or self._state_dev_stage.shape[0] < bb \
                 or self._state_dev_stage.shape[1] != row_bytes or self._state_dev_stage.device != dev:
             self._state_dev_stage = torch.empty((bb, row_bytes), dtype=torch.uint8, device=dev)
+        _sub = _load_sub(self)
+        _ta = time.perf_counter()
         slots_cpu = slots.to("cpu", dtype=torch.int64)
         # SGLANG_HICACHE_LOAD_ASYNC_INDEX: pinned + non_blocking instead of a
         # pageable `.to(dev)` (a host wait on the forward-fenced load stream).
         didx = index_to_device_async(didx, dev) if load_index_async() else didx.to(dev)
+        _sub["idx"] = _sub.get("idx", 0.0) + (time.perf_counter() - _ta) * 1000.0
         e_c = int(self.conv_dtype.itemsize)
         t_shape = tuple(lay["t_shape"]); conv_shape = tuple(lay["conv_shape"]); width = int(lay["width"])
         L = int(lay["L"])
@@ -594,6 +609,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
             b = min(B, n - start)
             sl = slots_cpu[start:start + b]
             dev_stage = self._state_dev_stage[:b]
+            _tb = time.perf_counter()
             if dma:
                 _state_block_dma(self._slot_view, dev_stage, sl.tolist(), runs)
             else:
@@ -601,6 +617,8 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 for (cur, off, ln) in comp:
                     torch.index_select(self._slot_view[:, off:off + ln], 0, sl, out=stage[:, cur:cur + ln])
                 dev_stage.copy_(stage, non_blocking=_pin)
+            _tc = time.perf_counter()
+            _sub["issue"] = _sub.get("issue", 0.0) + (_tc - _tb) * 1000.0
             d_b = didx[start:start + b]
             k = 0
             for l in range(L):
@@ -616,8 +634,11 @@ class ArenaMambaPoolHost(MambaPoolHost):
                     row[:, ch0:ch0 + n_j] = dev_stage[:, cur_j:cur_j + ln_j].contiguous().view(self.conv_dtype).view(b, n_j, width)
                     ch0 += n_j
                 dst_c.index_copy_(0, d_b, row)
+            _sub["split"] = _sub.get("split", 0.0) + (time.perf_counter() - _tc) * 1000.0
             if _pin and not dma and start + b < n:
+                _td = time.perf_counter()
                 torch.cuda.current_stream(dev).synchronize()  # the stage is reused by the next block
+                _sub["sync"] = _sub.get("sync", 0.0) + (time.perf_counter() - _td) * 1000.0
         global _STATE_LOAD_N
         _STATE_LOAD_N += 1
         if _STATE_LOAD_N <= 8 or _STATE_LOAD_N % 64 == 0:
@@ -644,6 +665,8 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 return  # every layer came with the state load at layer 0
             if layer_id == 0:
                 try:
+                    _sub = _load_sub(self)
+                    _ts = time.perf_counter()
                     if load_index_async():
                         # SGLANG_HICACHE_LOAD_ASYNC_INDEX: the device rows stay on
                         # the card (selected there when not every row is an arena
@@ -653,13 +676,16 @@ class ArenaMambaPoolHost(MambaPoolHost):
                                  else _select_rows_async(device_indices, is_arena))
                     else:
                         _didx = device_indices.cpu()[sel]
+                    _sub["select"] = _sub.get("select", 0.0) + (time.perf_counter() - _ts) * 1000.0
                     self._load_states_all_layers(device_pool, slots, _didx)
                     self._state_loaded_key = key
                     if ple_state.enabled():
                         # H63c: the anchors' PLE side states into the same
                         # targets, on the load stream (before the PLE read's join);
                         # the rows are selected on the card, never `.cpu()`
+                        _tp = time.perf_counter()
                         ple_state.side_read(self.arena, device_pool, slots.tolist(), device_indices, sel)
+                        _sub["ple"] = _sub.get("ple", 0.0) + (time.perf_counter() - _tp) * 1000.0
                     rest = (~is_arena).nonzero(as_tuple=True)[0]
                     if rest.numel():
                         super().load_to_device_per_layer(
