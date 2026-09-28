@@ -50,3 +50,6 @@
 [2026-09-24 14:09:21 TP0] WEG2-WAKE-KV-FIRST LATE free=10572 MiB floor=767 MiB need=4286 MiB (kv_cache resumed after the weight legs; legs' tightest free last wake=4468 MiB - kv=4286 MiB < floor+margin+reserve=5375 MiB)
 [2026-09-24 14:09:21 TP1] WEG2-WAKE-KV-FIRST LATE free=3437 MiB floor=700 MiB need=22 MiB (kv_cache resumed after the weight legs; legs' tightest free last wake=3439 MiB - kv=22 MiB < floor+margin+reserve=5308 MiB)
 [2026-09-24 14:09:21 TP2] WEG2-WAKE-KV-FIRST LATE free=2307 MiB floor=701 MiB need=22 MiB (kv_cache resumed after the weight legs; legs' tightest free last wake=1967 MiB - kv=22 MiB < floor+margin+reserve=5309 MiB)
+[2026-09-24 14:07:01 TP2] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 262144, K size: 0.00 GB, V size: 0.00 GB
+[2026-09-24 14:07:01 TP1] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 262144, K size: 0.00 GB, V size: 0.00 GB
+[2026-09-24 14:07:01 TP0] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 262144, K size: 1.50 GB, V size: 1.50 GB

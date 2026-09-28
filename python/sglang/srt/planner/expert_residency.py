@@ -343,6 +343,8 @@ _RX_REFUSED = re.compile(
     r"\+ runtime state ([0-9.]+) GiB; prefill activation reserve ([0-9.]+) GiB"
 )
 _RX_CELL = re.compile(_TP + r" KV pool sizing: available_bytes=\d+ .*?cell_size=(\d+),")
+#: #239 (Karten-Gutschrift): die KV-Token, fuer die der Pool gebaut wurde.
+_RX_KV_TOKENS = re.compile(_TP + r" KV Cache is allocated\. .*?#tokens: (\d+)")
 _RX_DRAFT = re.compile(
     _TP + r" \[vram-census\] pp0tp\d+-draft after load: model tensors on device "
     r"[0-9.]+ GiB = \{([^}]*)\}"
@@ -361,6 +363,7 @@ def _observe_boot(text: str, *, n_layers: int) -> Dict[str, Dict[int, float]]:
             "cell",
             "draft_experts",
             "draft_vocab",
+            "kv_tokens",
         )
     }
     layer_of: Dict[int, int] = {}
@@ -389,6 +392,10 @@ def _observe_boot(text: str, *, n_layers: int) -> Dict[str, Dict[int, float]]:
         m = _RX_CELL.search(line)
         if m:
             obs["cell"][int(m.group(1))] = float(m.group(2))
+            continue
+        m = _RX_KV_TOKENS.search(line)
+        if m:
+            obs["kv_tokens"][int(m.group(1))] = float(m.group(2))
             continue
         m = _RX_DRAFT.search(line)
         if m:
@@ -1336,6 +1343,12 @@ class DCardReference(msgspec.Struct, frozen=True, kw_only=True):
     #: H64: die Verify-Form der Referenz-Boots (``None`` = rekurrent, sonst
     #: die Ringlaenge L des ReplaySSM-Spec-Rings), aus der Wirkung im Log.
     replayssm_spec_ring_len: Optional[int] = None
+    #: #239 (Karten-Gutschrift): die KV, die im gemessenen Kopfraum steckt --
+    #: Token des Pools und KV-Zelle je Rang ('KV Cache is allocated ...
+    #: #tokens', 'KV pool sizing ... cell_size'). 0 / () = unbekannt: dann
+    #: verschiebt ein Token-Schnitt die Karte nicht (benannt, nicht geraten).
+    kv_tokens: int = 0
+    kv_cell_bytes: Tuple[int, ...] = ()
 
 
 def d_card_reference_from_logs(
@@ -1364,8 +1377,14 @@ def d_card_reference_from_logs(
     dec: Dict[int, float] = {}
     host = -1
     vocab_held = False
+    kv_geoms = set()
     for _name, text in boots:
         obs = _observe_boot(text, n_layers=n_layers)
+        toks = {int(v) for v in obs["kv_tokens"].values()}
+        kv_geoms.add((
+            toks.pop() if len(toks) == 1 else 0,
+            tuple(int(obs["cell"].get(r, 0)) for r in range(n_ranks)),
+        ))
         samples = gpl.samples_from_log(text)
         for r, ss in samples.items():
             if r not in obs["buffer"]:
@@ -1414,7 +1433,20 @@ def d_card_reference_from_logs(
         draft_vocab_held=vocab_held,
         dense_repack_outside_pool=h39,
         replayssm_spec_ring_len=ring,
+        # one KV geometry in every boot (and on every rank's pool), else unknown
+        **_card_kv_geometry(kv_geoms),
     )
+
+
+def _card_kv_geometry(geoms) -> Dict[str, object]:
+    """#239: die KV-Geometrie der Karten-Referenz, wenn alle Boots dieselbe
+    gebaut haben (Token > 0, jede Zelle > 0); sonst unbekannt (leer)."""
+    if len(geoms) != 1:
+        return {}
+    tokens, cells = next(iter(geoms))
+    if int(tokens) <= 0 or not cells or any(int(c) <= 0 for c in cells):
+        return {}
+    return {"kv_tokens": int(tokens), "kv_cell_bytes": tuple(int(c) for c in cells)}
 
 
 #: Die gemessene Karten-Referenz der Next-Flash-Form-A-D-Gruppe, hergeleitet
@@ -1441,6 +1473,10 @@ D_CARD_REFERENCE_FNFL2 = DCardReference(
     draft_host_rank=0,
     draft_vocab_held=False,
     dense_repack_outside_pool=False,
+    # #239: x141/x144 'KV Cache is allocated ... #tokens: 262144' und
+    # 'cell_size=14143/768/768' auf TP0/TP1/TP2
+    kv_tokens=262144,
+    kv_cell_bytes=(14143, 768, 768),
 )
 
 #: fnFL2 H50: die Karten-Referenz im H39-Zustand, von
@@ -1467,6 +1503,10 @@ D_CARD_REFERENCE_FNFL2_H39 = DCardReference(
     draft_host_rank=0,
     draft_vocab_held=False,
     dense_repack_outside_pool=True,
+    # #239: x151/x158 'KV Cache is allocated ... #tokens: 262144' und
+    # 'cell_size=14143/768/768' auf TP0/TP1/TP2
+    kv_tokens=262144,
+    kv_cell_bytes=(14143, 768, 768),
 )
 
 #: Die eingebauten Referenzen je Baum-Zustand (H50): gewaehlt wird nach
@@ -3177,7 +3217,7 @@ def plan_d_residency(
                     spec_per_req_mib=(spec_rebook.per_req_mib if spec_rebook is not None
                                       else None),
                     text_cfg=text_cfg, act_dtype=act_dtype, seat_rb=seat_rb,
-                    seat_graph_mib=seat_graph_mib)
+                    seat_graph_mib=seat_graph_mib, kv_token_cut=True)
             return tuple(int(c.ceiling_max_rows) for c in cs) if cs else None
 
         sol = solve_owned_cut(
@@ -3453,6 +3493,7 @@ def plan_d_residency(
         act_dtype=act_dtype,
         seat_rb=seat_rb,
         seat_graph_mib=seat_graph_mib,
+        kv_token_cut=kv_token_shares is not None,
     )
     refusals = [
         t for t in (refusal_text(fits, label=label), card_refusal, step_refusal,
@@ -3612,6 +3653,37 @@ def _card_reference_for(
     return ref, ""
 
 
+def card_kv_cut_shift(
+    ref: DCardReference, fits: Sequence[DRankResidency]
+) -> Tuple[Optional[Tuple[float, ...]], str]:
+    """#239: die Karten-Verschiebung je Rang unter dem Token-Schnitt, MiB:
+    ``ref_tokens x ref_cell_r - kv_tokens_r x kv_cell_r`` (positiv = frei
+    gewordene KV). Exakt aus beiden Geometrien, nicht aus dem Anteil
+    geschaetzt: was auf dem Host bleibt (QSA-Schluessel, der Nicht-FA-Teil der
+    Zelle), hebt sich auf. ``(None, warum)``, wenn die Referenz ihre KV nicht
+    nennt -- dann bleibt die Karte, benannt."""
+    n = len(fits)
+    if int(ref.kv_tokens) <= 0 or len(ref.kv_cell_bytes) != n:
+        return None, (
+            "ENTFAELLT -- die Karten-Referenz %s nennt ihre KV nicht (Token %d, Zellen %s); "
+            "die Karte bleibt die Form-A-Messung, der Host bekommt KEINE Gutschrift"
+            % (ref.source, int(ref.kv_tokens), list(ref.kv_cell_bytes)))
+    shift = []
+    parts = []
+    for fit in fits:
+        r = fit.rank
+        ref_mib = float(ref.kv_tokens) * float(ref.kv_cell_bytes[r]) / MIB
+        run_mib = float(fit.kv_tokens) * float(fit.kv_cell_bytes) / MIB
+        shift.append(round(ref_mib - run_mib, 1))
+        parts.append("rang%d %d x %d B = %.0f -> %d x %d B = %.0f MiB (%+.0f)" % (
+            r, int(ref.kv_tokens), int(ref.kv_cell_bytes[r]), ref_mib, int(fit.kv_tokens),
+            int(fit.kv_cell_bytes), run_mib, ref_mib - run_mib))
+    return tuple(shift), (
+        "Referenz %s ist Form A (Host-KV im gemessenen Kopfraum); Kopfraum/Decode-frei je "
+        "Rang um Referenz-KV - KV dieses Boots verschoben: %s -- GERECHNET aus beiden "
+        "Geometrien" % (ref.source, "; ".join(parts)))
+
+
 def _plan_d_card(
     *,
     fits: Sequence[DRankResidency],
@@ -3631,10 +3703,17 @@ def _plan_d_card(
     act_dtype: Optional[str] = None,
     seat_rb: Optional[SeatRebook] = None,
     seat_graph_mib: Optional[Sequence[float]] = None,
+    kv_token_cut: bool = False,
 ) -> Tuple[Tuple[str, ...], Tuple[DCardFit, ...], Optional[str]]:
     """H33: die Karten-Bilanz neben der Budget-Bilanz. Eine unlesbare Referenz
     verweigert nicht, sie wird benannt (wie H8); verweigert wird nur aus einer
-    GERECHNETEN Bilanz."""
+    GERECHNETEN Bilanz.
+
+    #239 ``kv_token_cut``: die Referenz ist eine Form-A-Messung, ihr Kopfraum
+    traegt die KV des Hosts. Unter dem Token-Schnitt verschiebt sich jede
+    Karte exakt um (Referenz-KV - KV dieses Boots) = ref_tokens x ref_cell_r -
+    kv_tokens x kv_cell_r (:func:`card_kv_cut_shift`): der Host bekommt die
+    abgegebene Voll-Attention-KV gutgeschrieben, die Worker tragen ihre."""
     from sglang.srt.managers.corridor_guard import (
         NEAR_OOM_MIB,
         corridor_band_floor_mib,
@@ -3740,6 +3819,21 @@ def _plan_d_card(
             ),
         )
         shift_line = shift_line + seat_line
+    if kv_token_cut:
+        kv_shift, kv_line = card_kv_cut_shift(ref, fits)
+        if kv_shift is not None:
+            ref = msgspec.structs.replace(
+                ref,
+                headroom0_mib=tuple(
+                    round(h + s, 1) for h, s in zip(ref.headroom0_mib, kv_shift)
+                ),
+                peak_mib=tuple(round(pk - s, 1) for pk, s in zip(ref.peak_mib, kv_shift)),
+                free_decode0_mib=tuple(
+                    None if f is None else round(f + s, 1)
+                    for f, s in zip(ref.free_decode0_mib, kv_shift)
+                ),
+            )
+        shift_line = shift_line + ("%s KARTE %s KV-SCHNITT (#239): %s" % (marker, label, kv_line),)
     floor = float(corridor_band_floor_mib())
     cards = solve_d_card(
         fits=fits,
