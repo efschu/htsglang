@@ -279,6 +279,26 @@ class TestTokenCutRiegel(unittest.TestCase):
             with self.assertRaisesRegex(L.Weg2TokenCutNotWired, "F5, F13"):
                 L.refuse_unwired_token_cut(self._ns(), types.SimpleNamespace(kv="qsa_forma_dcp"))
 
+    def test_a_boot_without_a_host_tier_needs_no_f13(self):
+        """S4a: --weg2-disable-hicache (no L2, no L3) enters no F13 path, so the
+        cut boots there -- with the named line -- and nowhere else."""
+        import contextlib
+        import dataclasses
+        import io
+
+        from sglang.srt.weg2 import launcher as L
+
+        ns = types.SimpleNamespace(dry_run=False, d_kv_token_cut="joint", weg2_disable_hicache=True)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            L.refuse_unwired_token_cut(ns, types.SimpleNamespace(kv="qsa_forma_dcp"))
+        self.assertIn("#239 KV-TOKEN-SCHNITT F13-FREI (kein Host-Tier)", out.getvalue())
+        f5_open = dict(rank_role.SEAMS)
+        f5_open["F5"] = dataclasses.replace(f5_open["F5"], wired=False)
+        with mock.patch.object(rank_role, "SEAMS", f5_open):
+            with self.assertRaisesRegex(L.Weg2TokenCutNotWired, "F5, F13"):
+                L.refuse_unwired_token_cut(ns, types.SimpleNamespace(kv="qsa_forma_dcp"))
+
     def test_the_f13_anchors_hit(self):
         import os
 
