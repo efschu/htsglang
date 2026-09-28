@@ -63,7 +63,9 @@ class RouteTest(unittest.TestCase):
 
 class WiringTest(unittest.TestCase):
     def _stub(self):
-        return types.SimpleNamespace(dcp_size=1, req_to_token=torch.zeros(2, 8, dtype=torch.int32))
+        # form_a_dcp: the backend's __init__ always sets it (#239 S3b)
+        return types.SimpleNamespace(dcp_size=1, form_a_dcp=None,
+                                     req_to_token=torch.zeros(2, 8, dtype=torch.int32))
 
     def _meta(self):
         return types.SimpleNamespace(
