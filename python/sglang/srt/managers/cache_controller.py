@@ -3612,7 +3612,11 @@ class HiCacheController:
                     operation.mark_terminate()
                     self._prefetch_io_drained_after_stop += 1
                 _probe_hold.expire_if_stale(operation, getattr(self, "mem_pool_host", None))
+                # #257 (iii): the read's own clock (WEG2-LOAD-DEVICE splits
+                # queue / read / harvest wait with it)
+                operation.read_start_time = time.monotonic()
                 self._page_transfer(operation)
+                operation.read_end_time = time.monotonic()
                 # #257: what the read did not take, the probe gives back
                 _probe_hold.release(operation, getattr(self, "mem_pool_host", None), 0, reason="read-end")
                 # operation terminated by controller, release pre-allocated memory

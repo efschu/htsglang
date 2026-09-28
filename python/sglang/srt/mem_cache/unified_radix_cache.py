@@ -7510,12 +7510,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if _bpt <= 0 and hasattr(_hp, "get_ksize_per_token"):
                 _bpt = 2 * int(_hp.get_ksize_per_token() or 0)   # K + V
             _bytes = int(completed_tokens) * _bpt
+            # #257 (iii), vision boot 0928: every slow line (0.01-0.2 GB/s,
+            # e.g. weg2-3-22 23232 tok in 1849 ms) had ms == the rank's
+            # previous scheduler pass (PASS-STALL pass_ms 1823: a 2.4 s
+            # forward) -- the operation is reaped only between forwards, so
+            # the old ms was queue + read + harvest wait, never the read.
+            # The read's own clock is stamped by the aux thread
+            # (read_start_time / read_end_time); GB/s is over the read only.
+            _now = time.monotonic()
+            _rs = float(getattr(operation, "read_start_time", 0.0) or 0.0)
+            _re = float(getattr(operation, "read_end_time", 0.0) or 0.0)
+            if _t0 and _rs and _re >= _rs:
+                _queue_ms = (_rs - _t0) * 1000.0
+                _read_ms = (_re - _rs) * 1000.0
+                _harvest_ms = (_now - _re) * 1000.0
+            else:
+                _queue_ms = _read_ms = _harvest_ms = -1.0
             logger.info(
                 "WEG2-LOAD-DEVICE req=%s tokens=%d bytes_per_token=%d bytes=%d ms=%.0f "
-                "GB/s=%.2f (host arena -> device, the operation's own clock from "
-                "start_loading to terminate_prefetch; matched=%d loaded=%d)",
+                "queue_ms=%.0f read_ms=%.0f harvest_ms=%.0f GB/s=%.2f (the read's own "
+                "clock: aux-thread transfer start to end; ms = queue + read + wait for "
+                "the scheduler pass that reaps it; matched=%d loaded=%d)",
                 req_id, int(completed_tokens), _bpt, _bytes, _ms,
-                (_bytes / (_ms / 1000.0) / 1e9) if _ms > 0 else -1.0,
+                _queue_ms, _read_ms, _harvest_ms,
+                (_bytes / (_read_ms / 1000.0) / 1e9) if _read_ms > 0 else -1.0,
                 int(insert_result.prefix_len), int(loaded_from_storage),
             )
         except Exception as _ie:  # noqa: BLE001 -- an instrument never kills the prefetch
