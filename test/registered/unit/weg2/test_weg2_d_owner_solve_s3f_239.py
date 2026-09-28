@@ -130,7 +130,10 @@ def test_the_solve_starts_every_pass_from_the_stated_vector():
     src = inspect.getsource(L.log_d_rank_vram_solve)
     i = src.index("_kv_cut = d_kv_token_cut(ns)")
     j = src.index("ratios = list(ns._d_owner_stated)", i)
-    assert j - i < 300
+    # rc12z29c: a form pinned for the Platztausch map is checked first (its
+    # branch sits in between); every unpinned pass still restarts here
+    assert j - i < 1200
+    assert src.index("_pinned = getattr(ns, \"_d_map_form\", None)", i) < j
     assert src.index("publish_d_owner_ratio(ns, plan, label, log)") < src.index(
         "if plan.solved_fractions:")
 
