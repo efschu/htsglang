@@ -615,6 +615,26 @@ def claim_vote_min_only(controller) -> bool:
     return bool(form_a_worker_holds_kv())
 
 
+def split_host_state_pools(controller, transfers) -> tuple:
+    """#239 Blocker 5 (rc12z30d -st-cut, D log 21:11:02): ``(own, host)`` of a
+    transfer list. On a Form A worker that owns KV token rows under the cut
+    (:func:`claim_vote_min_only`) every non-KV pool -- the mamba anchor, the
+    QSA / draft sidecars -- is the ATTENTION HOST's state: the worker's pools
+    for it are byteless (``refuse_kv_worker_sidecar_bytes``) and its store
+    holds none of it. Asked of the worker's store, that pool answered "no
+    anchor anywhere" and capped the worker's KV claim to 0 (``#1028B FETCH
+    CAP kv=264 claimed=0 ... by=mamba``), so the group MIN was 0 and D
+    re-prefilled everything. Such a pool is the host's to answer; the worker
+    answers only for its KV rows, exactly as S3h's min-only vote says.
+    Everywhere else: ``(transfers, [])``, byte-identical."""
+    transfers = list(transfers or [])
+    if not transfers or not claim_vote_min_only(controller):
+        return transfers, []
+    own = [t for t in transfers if t.name == PoolName.KV]
+    host = [t for t in transfers if t.name != PoolName.KV]
+    return own, host
+
+
 #: #239 S3h: the line of a claim split the token cut settles by MIN.
 CLAIM_CUT_MIN_ADOPT_MARKER = "#239 S3h CLAIM MIN-ADOPT (Schnitt)"
 
@@ -4147,6 +4167,10 @@ class HiCacheController:
         """
         pools = getattr(self.storage_backend, "registered_pools", None)
         if not pools or PoolName.MAMBA not in pools:
+            return None
+        if claim_vote_min_only(self):
+            # #239 Blocker 5: a KV-row worker holds no recurrent state -- the
+            # anchor is the host's; its presence is its KV rows alone.
             return None
         return [
             PoolTransfer(
