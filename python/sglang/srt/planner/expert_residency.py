@@ -59,7 +59,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import msgspec
 
@@ -785,6 +785,194 @@ def solve_joint_cut(
         for f in edge
     )
     return tuple(cut), low, fr, edge
+
+
+#: #239 S3f: ``--d-kv-token-cut owned`` -- the target form of the uneven-DCP
+#: KV (Nutzer 28.09.): the attention host holds NO full-attention KV (share 0;
+#: QSA index, Mamba and draft stay on it), the workers carry it, and the MoE
+#: OWNERSHIP vector (``--rank-moe-ratio``) is a free variable of the solve
+#: next to the workers' shares and FR_D -- expert ownership moves to the host
+#: card the KV frees. The ownership is the planner's, never a hand value.
+KV_TOKEN_CUT_OWNED = "owned"
+
+#: #239 S3f: cost of ONE expert row a decode round misses, per MoE layer, ms,
+#: (attention host, worker). SEED, UNMEASURED: plan_s3_251 §1 from H29/x138
+#: (5090 x16 ~0.1, 3080 x8 ~0.2). The M1 boot (S4a) writes the record that
+#: replaces it (RECORD > BUILTIN > UNMEASURED, H94).
+OWNED_MISS_MS_PER_ROW_SEED: Tuple[float, float] = (0.1, 0.2)
+OWNED_MISS_MS_SOURCE_SEED = "Saat UNMEASURED (plan_s3_251 §1, H29/x138)"
+#: #239 S3f: the search grid -- ownership moves in steps of 8 ratio units
+#: (a quarter of the smallest NF band), the workers' KV shares in 64ths
+#: stepped by 4 (the page grid stays the runtime's).
+OWNED_RATIO_STEP = 8
+OWNED_SHARE_STEP = 4
+
+
+class OwnedCut(msgspec.Struct, frozen=True, kw_only=True):
+    """#239 S3f: the planner's owned form, or why there is none."""
+
+    ratios: Tuple[int, ...]
+    cut: Tuple[int, ...]
+    fractions: Tuple[float, ...]
+    fits: Tuple["DRankResidency", ...]
+    #: the bs1 miss time per rank of the chosen form and of Form A (no cut,
+    #: stated ownership), ms per round.
+    round_ms: Tuple[float, ...]
+    base_ratios: Tuple[int, ...]
+    base_round_ms: Tuple[float, ...]
+    candidates: int
+    feasible: int
+
+
+def owned_miss_rows(fit: "DRankResidency", *, num_experts: int, ids_per_step: int) -> float:
+    """#239 S3f: expected expert rows a round misses on this rank, per MoE
+    layer -- the rows it cannot hold at its edge (``E - min(ceiling, E)``)
+    times the chance that a uniformly routed step touches a given expert,
+    ``1 - (1 - 1/N)^ids``. Uniform routing is named, not measured (the #45
+    oracle dump would sharpen it)."""
+    E = int(fit.local_experts)
+    held = min(int(fit.ceiling_max_rows), E)
+    p = 1.0 - (1.0 - 1.0 / float(max(1, num_experts))) ** int(max(1, ids_per_step))
+    return float(max(0, E - held)) * p
+
+
+def owned_round_ms(fits: Sequence["DRankResidency"], *, host: int, num_experts: int,
+                   ids_per_step: int, n_layers: int,
+                   miss_ms: Tuple[float, float] = OWNED_MISS_MS_PER_ROW_SEED) -> Tuple[float, ...]:
+    """#239 S3f: T_r = missed rows x MoE layers x cost per row of the card."""
+    return tuple(
+        owned_miss_rows(f, num_experts=num_experts, ids_per_step=ids_per_step)
+        * int(n_layers) * float(miss_ms[0] if f.rank == host else miss_ms[1])
+        for f in fits
+    )
+
+
+def _compositions(total: int, parts: int, step: int):
+    if parts == 1:
+        yield (int(total),)
+        return
+    for t in range(0, int(total) + 1, int(step)):
+        for rest in _compositions(int(total) - t, parts - 1, step):
+            yield (t,) + rest
+
+
+def owned_ratio_vectors(base: Sequence[int], host: int, *, step: int = OWNED_RATIO_STEP,
+                        max_shift: Optional[int] = None) -> Tuple[Tuple[int, ...], ...]:
+    """#239 S3f: every ownership vector with the host's entry raised by a
+    multiple of ``step`` taken from the workers in steps of ``step`` (the sum
+    stays; no worker below 1). ``max_shift`` defaults to half the workers'
+    ownership."""
+    base = [int(x) for x in base]
+    workers = [r for r in range(len(base)) if r != host]
+    cap = sum(base[w] for w in workers) // 2 if max_shift is None else int(max_shift)
+    out = []
+    for shift in range(0, cap + 1, int(step)):
+        for take in _compositions(shift, len(workers), step):
+            vec = list(base)
+            vec[host] += shift
+            for w, t in zip(workers, take):
+                vec[w] -= t
+            if all(vec[w] >= 1 for w in workers):
+                out.append(tuple(vec))
+    return tuple(out)
+
+
+def solve_owned_cut(
+    solve_at: Callable[[Sequence[int], Optional[Sequence[int]]], Sequence["DRankResidency"]],
+    base_ratios: Sequence[int],
+    host: int,
+    *,
+    num_experts: int,
+    n_layers: int,
+    ids_per_step: int,
+    miss_ms: Tuple[float, float] = OWNED_MISS_MS_PER_ROW_SEED,
+    grid: int = KV_TOKEN_SHARE_GRID,
+    ratio_step: int = OWNED_RATIO_STEP,
+    share_step: int = OWNED_SHARE_STEP,
+    max_shift: Optional[int] = None,
+    card_rows: Optional[Callable[[Sequence["DRankResidency"]], Optional[Sequence[int]]]] = None,
+) -> OwnedCut:
+    """#239 S3f: ownership, token cut and FR_D in one solve.
+
+    ``solve_at(ratios, shares)`` is the D budget solve for one ownership
+    vector and one share vector (``None`` = no cut, Form A). The host's
+    share is 0 (the target form); the workers' shares run over the grid in
+    ``share_step``s, the ownership over :func:`owned_ratio_vectors`.
+
+    Objective (plan_s3_251 §1, not S2b's max-min): the smallest max_r T_r
+    of :func:`owned_round_ms` at bs1, ties by the sum, then by the smaller
+    ownership move. Feasible: every rank has an edge with room for its
+    scratch plus two rows, and the x1 rule -- no worker carries more miss
+    time than it does in Form A with the stated ownership (the workers are
+    the critical path, H28/H29; the cut must not buy host rows with worker
+    residency). FR_D is every rank's edge at the chosen form.
+
+    ``card_rows(fits)`` (optional) is the CARD's edge per rank (H33 / the
+    rc12c ledger, W130): the rank's edge is the smaller of budget and card,
+    so the solve never picks a form the card check then refuses.
+    """
+    base = tuple(int(x) for x in base_ratios)
+
+    def _edge(fits):
+        cap = card_rows(fits) if card_rows is not None else None
+        out = []
+        for i, f in enumerate(fits):
+            rows = int(f.ceiling_max_rows)
+            if cap is not None and i < len(cap):
+                rows = min(rows, int(cap[i]))
+            E, S = int(f.local_experts), int(f.scratch_rows)
+            frac = largest_fraction_for_rows(local_experts=E, scratch_rows=S, max_rows=rows)
+            out.append(_EdgeFit(rank=f.rank, local_experts=E, scratch_rows=S,
+                                ceiling_max_rows=rows, ceiling_fraction=frac))
+        return tuple(out)
+
+    n = len(base)
+    workers = [r for r in range(n) if r != host]
+    kw = dict(host=host, num_experts=num_experts, ids_per_step=ids_per_step,
+              n_layers=n_layers, miss_ms=miss_ms)
+    base_fits = _edge(tuple(solve_at(base, None)))
+    base_ms = owned_round_ms(base_fits, **kw)
+    shares_list = []
+    for take in _compositions(int(grid), len(workers), int(share_step)):
+        vec = [0] * n
+        for w, t in zip(workers, take):
+            vec[w] = t
+        shares_list.append(tuple(vec))
+    best = None
+    cand = feas = 0
+    for rat in owned_ratio_vectors(base, host, step=ratio_step, max_shift=max_shift):
+        shift = rat[host] - base[host]
+        for sh in shares_list:
+            cand += 1
+            fits = _edge(tuple(solve_at(rat, sh)))
+            if any(f.ceiling_fraction is None or f.ceiling_max_rows < f.scratch_rows + 2
+                   for f in fits):
+                continue
+            ms = owned_round_ms(fits, **kw)
+            if any(ms[w] > base_ms[w] + 1e-9 for w in workers):
+                continue
+            feas += 1
+            key = (round(max(ms), 9), round(sum(ms), 9), shift, rat, sh)
+            if best is None or key < best[0]:
+                best = (key, rat, sh, fits, ms)
+    if best is None:
+        return OwnedCut(ratios=(), cut=(), fractions=(), fits=(), round_ms=(),
+                        base_ratios=base, base_round_ms=base_ms, candidates=cand, feasible=0)
+    _, rat, sh, fits, ms = best
+    fr = tuple(float(f.ceiling_fraction) for f in fits)
+    return OwnedCut(ratios=tuple(rat), cut=tuple(sh), fractions=fr, fits=(), round_ms=ms,
+                    base_ratios=base, base_round_ms=base_ms, candidates=cand, feasible=feas)
+
+
+class _EdgeFit(NamedTuple):
+    """#239 S3f: a rank's edge as the owned solve sees it (min of budget and
+    card rows)."""
+
+    rank: int
+    local_experts: int
+    scratch_rows: int
+    ceiling_max_rows: int
+    ceiling_fraction: Optional[float]
 
 
 def solve_d_rank_residency(
@@ -1567,6 +1755,11 @@ class DResidencyPlan(msgspec.Struct, frozen=True, kw_only=True):
     solved_fractions: Tuple[float, ...] = ()
     #: #239: der geloeste Token-Schnitt in 64steln (leer = kein Schnitt/gegeben).
     kv_token_cut: Tuple[int, ...] = ()
+    #: #239 S3f: der Eigentumsvektor (``--rank-moe-ratio``), den der Planer
+    #: unter ``owned`` setzt (leer = der gegebene gilt).
+    solved_owner_ratio: Tuple[int, ...] = ()
+    #: #239 S3f: vorher/nachher fuer den Record (leer = kein owned-Solve).
+    owner_record: Tuple[Tuple[str, object], ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -2848,11 +3041,11 @@ def plan_d_residency(
     if kv_token_shares is not None and int(kv_dcp_cell_bytes) <= 0:
         kv_dcp_cell_bytes = fa_kv_token_cell_bytes(text_cfg, int(kv_dtype_bytes))
 
-    def _solve(shares, fr=None):
+    def _solve(shares, fr=None, rat=None):
         return solve_d_rank_residency(
             budgets_mib=budgets_mib,
             fractions=fractions if fr is None else fr,
-            ratios=ratios,
+            ratios=ratios if rat is None else rat,
             scratch_rows=scratch_rows,
             staging_rows=staging,
             num_experts=int(terms.num_experts),
@@ -2869,11 +3062,90 @@ def plan_d_residency(
 
     solved_fr: Tuple[float, ...] = ()
     solved_cut: Tuple[int, ...] = ()
+    solved_owner: Tuple[int, ...] = ()
+    owner_record: Tuple[Tuple[str, object], ...] = ()
+    owner_refusal: Optional[str] = None
+    if kv_token_shares == KV_TOKEN_CUT_OWNED:
+        # #239 S3f: host share 0, ownership + workers' shares + FR_D solved.
+        tp = [int(x) for x in str(rank_tp_ratio).split(",") if x.strip()]
+        hosts = [r for r, v in enumerate(tp) if v > 0]
+        if len(hosts) != 1:
+            raise ValueError(
+                "plan_d_residency: 'owned' needs ONE attention host, rank-tp-ratio %s"
+                % rank_tp_ratio)
+        host = hosts[0]
+        verify = replayssm_spec.draft_tokens if replayssm_spec is not None else 1
+        ids = int(verify) * int(text_cfg.get("num_experts_per_tok") or 1)
+        base_rat = [int(round(float(x))) for x in ratios]
+        def _card_rows(cut_fits):
+            # the card's edge per rank, from the same check the plan ends with
+            if card_ledger is not None:
+                cs = solve_d_card_ledger(fits=cut_fits, ledger=card_ledger)
+            else:
+                _, cs, _ = _plan_d_card(
+                    fits=cut_fits, model_path=model_path, rank_tp_ratio=rank_tp_ratio,
+                    card_reference_logs=card_reference_logs, n_layers=int(terms.n_layers),
+                    slot_bytes=slot_bytes, vocab_mib=vocab, share_embed=share, label=label,
+                    marker=marker, dense_repack=dense_repack, replayssm_spec=replayssm_spec,
+                    spec_per_req_mib=(spec_rebook.per_req_mib if spec_rebook is not None
+                                      else None),
+                    text_cfg=text_cfg, act_dtype=act_dtype, seat_rb=seat_rb,
+                    seat_graph_mib=seat_graph_mib)
+            return tuple(int(c.ceiling_max_rows) for c in cs) if cs else None
+
+        sol = solve_owned_cut(
+            lambda rat, sh: _solve(sh, None, rat), base_rat, host,
+            num_experts=int(terms.num_experts), n_layers=int(terms.n_layers),
+            ids_per_step=ids, card_rows=_card_rows)
+        owner_record = (
+            ("base_ratios", list(sol.base_ratios)),
+            ("base_round_ms", [round(x, 3) for x in sol.base_round_ms]),
+            ("ratios", list(sol.ratios)),
+            ("cut", list(sol.cut)),
+            ("fractions", [round(x, 4) for x in sol.fractions]),
+            ("round_ms", [round(x, 3) for x in sol.round_ms]),
+            ("miss_ms_per_row", list(OWNED_MISS_MS_PER_ROW_SEED)),
+            ("miss_ms_source", OWNED_MISS_MS_SOURCE_SEED),
+            ("ids_per_step", ids),
+            ("candidates", sol.candidates),
+            ("feasible", sol.feasible),
+            ("kv_tokens", int(kv_tokens)),
+        )
+        if sol.feasible:
+            ratios = [float(x) for x in sol.ratios]
+            solved_owner = tuple(sol.ratios)
+            solved_fr = tuple(sol.fractions)
+            kv_token_shares = tuple(sol.cut)
+            solved_cut = tuple(sol.cut)
+            cut_lines = (
+                "%s FRACTION-SOLVE %s D-EIGENTUM (#239 S3f): --rank-moe-ratio %s -> %s, "
+                "KV-Token-Schnitt %s/%d (Host 0), FR_D %s an der Kante -- Fehlgriff-Zeit "
+                "bs1 je Rang %s ms (Form A %s), max %.2f gegen %.2f; x1-Regel: kein Worker "
+                "ueber Form A; %d Kandidaten, %d tragbar; Kosten je Zeile %s ms (%s), "
+                "%d Ids je Schritt, gleichverteilt (benannt); %d Token KV Pflicht"
+                % (marker, label, ",".join(str(x) for x in sol.base_ratios),
+                   ",".join(str(x) for x in sol.ratios), list(sol.cut), KV_TOKEN_SHARE_GRID,
+                   ["%.3f" % x for x in sol.fractions],
+                   ["%.2f" % x for x in sol.round_ms], ["%.2f" % x for x in sol.base_round_ms],
+                   max(sol.round_ms), max(sol.base_round_ms), sol.candidates, sol.feasible,
+                   "/".join("%g" % x for x in OWNED_MISS_MS_PER_ROW_SEED),
+                   OWNED_MISS_MS_SOURCE_SEED, ids, int(kv_tokens)),
+            )
+        else:
+            owner_refusal = (
+                "%s (%s): D-EIGENTUM (#239 S3f) -- keine tragbare Form mit Host-Anteil 0: "
+                "%d Kandidaten (Eigentum ab %s in %der-Schritten, Worker-Anteile in "
+                "%der-Schritten), keine mit Kante auf jedem Rang und ohne Mehr-Fehlgriffe "
+                "eines Workers gegen Form A (%s ms)"
+                % (marker, label, sol.candidates, ",".join(str(x) for x in sol.base_ratios),
+                   OWNED_RATIO_STEP, OWNED_SHARE_STEP,
+                   ["%.2f" % x for x in sol.base_round_ms]))
+            kv_token_shares = None
     if isinstance(kv_token_shares, str):
         if kv_token_shares not in (KV_TOKEN_CUT_MAXMIN, KV_TOKEN_CUT_JOINT):
             raise ValueError(
-                "plan_d_residency: KV token cut %r is neither %r, %r nor a ratio vector"
-                % (kv_token_shares, KV_TOKEN_CUT_MAXMIN, KV_TOKEN_CUT_JOINT)
+                "plan_d_residency: KV token cut %r is neither %r, %r, %r nor a ratio vector"
+                % (kv_token_shares, KV_TOKEN_CUT_MAXMIN, KV_TOKEN_CUT_JOINT, KV_TOKEN_CUT_OWNED)
             )
         joint = kv_token_shares == KV_TOKEN_CUT_JOINT
         if joint:
@@ -3032,7 +3304,8 @@ def plan_d_residency(
             else None
         )
         refusals = [
-            t for t in (refusal_text(fits, label=label), card_refusal, step_refusal) if t
+            t for t in (refusal_text(fits, label=label), card_refusal, step_refusal,
+                        owner_refusal) if t
         ]
         return DResidencyPlan(
             lines=lines + card_lines,
@@ -3042,6 +3315,8 @@ def plan_d_residency(
             overflow_waves=derived_waves,
             solved_fractions=solved_fr,
             kv_token_cut=solved_cut,
+            solved_owner_ratio=solved_owner,
+            owner_record=owner_record,
         )
     card_lines, cards, card_refusal = _plan_d_card(
         fits=fits,
@@ -3065,7 +3340,8 @@ def plan_d_residency(
         seat_graph_mib=seat_graph_mib,
     )
     refusals = [
-        t for t in (refusal_text(fits, label=label), card_refusal, step_refusal) if t
+        t for t in (refusal_text(fits, label=label), card_refusal, step_refusal,
+                    owner_refusal) if t
     ]
     return DResidencyPlan(
         lines=lines + card_lines,
@@ -3075,6 +3351,8 @@ def plan_d_residency(
         overflow_waves=derived_waves,
         solved_fractions=solved_fr,
         kv_token_cut=solved_cut,
+        solved_owner_ratio=solved_owner,
+        owner_record=owner_record,
     )
 
 

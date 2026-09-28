@@ -4410,7 +4410,7 @@ def d_kv_token_cut(ns):
               or weg2_form.KV_TOKEN_CUT_OFF).strip()
     if raw == weg2_form.KV_TOKEN_CUT_OFF:
         return None
-    if raw in (_er.KV_TOKEN_CUT_MAXMIN, _er.KV_TOKEN_CUT_JOINT):
+    if raw in (_er.KV_TOKEN_CUT_MAXMIN, _er.KV_TOKEN_CUT_JOINT, _er.KV_TOKEN_CUT_OWNED):
         return raw
     try:
         vec = [float(x) for x in raw.split(",") if x.strip()]
@@ -4420,7 +4420,8 @@ def d_kv_token_cut(ns):
         raise Weg2LaunchRefused(
             f"{KV_TOKEN_CUT_MARKER}: --d-kv-token-cut {raw!r} is neither "
             f"{weg2_form.KV_TOKEN_CUT_OFF!r}, {_er.KV_TOKEN_CUT_MAXMIN!r}, "
-            f"{_er.KV_TOKEN_CUT_JOINT!r} nor a ratio vector of the D ranks")
+            f"{_er.KV_TOKEN_CUT_JOINT!r}, {_er.KV_TOKEN_CUT_OWNED!r} nor a ratio "
+            f"vector of the D ranks")
     return tuple(vec)
 
 
@@ -4494,6 +4495,38 @@ def refuse_flip_under_token_cut(ns, boot_form) -> Optional[str]:
         print(msg + " (dry run: would refuse)", flush=True)
         return msg
     raise Weg2TokenCutFlipNotWired(msg)
+
+
+#: #239 S3f: the marker of the published ownership.
+D_OWNER_MARKER = "D-EIGENTUM (#239 S3f)"
+
+
+def publish_d_owner_ratio(ns, plan, label: str, log) -> List[float]:
+    """#239 S3f: the ownership vector the planner solved under
+    ``--d-kv-token-cut owned`` goes to ``--extra-d --rank-moe-ratio`` (the one
+    place it lives for group D; argparse keeps the last copy, so every copy is
+    replaced), and the before/after into ``ns._d_owner_solve`` for the
+    record. Returns the new vector as floats for the caller's later readers."""
+    from sglang.srt.weg2 import draft_post as _dp
+
+    before = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
+    if getattr(ns, "_d_owner_stated", None) is None:
+        # the STATED vector, kept once: a second solve pass (dry-run and real
+        # call, the d-only expectation) starts from it again, never from its
+        # own published answer (Form A baseline of the x1 rule stays fixed)
+        ns._d_owner_stated = [str(x) for x in before]
+    before = list(ns._d_owner_stated)
+    new = [int(x) for x in plan.solved_owner_ratio]
+    ns.extra_d = _dp.replace_vector_flag(getattr(ns, "extra_d", "") or "",
+                                         "--rank-moe-ratio", new)
+    rec = dict(plan.owner_record)
+    rec["label"] = label
+    rec["stated_ratios"] = [str(x) for x in before]
+    ns._d_owner_solve = rec
+    log(f"{D_RANK_SOLVE_MARKER} {label} {D_OWNER_MARKER} veroeffentlicht: --extra-d "
+        f"--rank-moe-ratio {','.join(str(x) for x in new)} (vorher "
+        f"{','.join(str(x) for x in before)}; der Planer setzt das Eigentum, kein Handwert)")
+    return [float(x) for x in new]
 
 
 #: #239 S3a: the D argv that carries the planner's token cut to the runtime
@@ -4683,6 +4716,10 @@ class BootState:
     #: YaRN x2 (28.09.): die W132-FR_P-KAPPUNG dieses Boots (vorher/nachher je
     #: Stufe, gekappte Stufen, Zeilen); leer = keine Stufe gekappt.
     p_fr_cap: Dict[str, object] = field(default_factory=dict)
+    #: #239 S3f: the D ownership solve of this boot (``--d-kv-token-cut
+    #: owned``): stated and solved ``--rank-moe-ratio``, cut, FR_D, miss time
+    #: per rank against Form A; empty = no owned solve.
+    d_owner_solve: Dict[str, object] = field(default_factory=dict)
 
 
 def _now() -> str:
@@ -16127,6 +16164,9 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     _derive_waves = bool(getattr(ns, "d_pool_waves_derived", False))
     # #239: the token cut of the full-attention KV (None = off, byte-identical)
     _kv_cut = d_kv_token_cut(ns)
+    if _kv_cut == _er.KV_TOKEN_CUT_OWNED and getattr(ns, "_d_owner_stated", None):
+        # #239 S3f: every pass solves the ownership from the STATED vector
+        ratios = list(ns._d_owner_stated)
     _kv_cut_kw = ({} if _kv_cut is None else
                   dict(kv_token_shares=_kv_cut, kv_dtype_bytes=d_kv_dtype_bytes(ns)))
     # YaRN x2 (27.09.): the KV duty is the D form's own context (#77), not
@@ -16214,6 +16254,11 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         return
     for line in plan.lines:
         log(line)
+    if plan.solved_owner_ratio:
+        # #239 S3f: the ownership is the planner's -- published before FR_D
+        # and the token vector, and every later reader of --rank-moe-ratio
+        # (seat table, Platztausch map, geometry) sees the same vector.
+        ratios = publish_d_owner_ratio(ns, plan, label, log)
     if plan.solved_fractions:
         # #239 S2b: FR_D is the planner's -- the D group runs the edge it solved
         # together with the token cut (the stated FR was only the start point).
@@ -18353,9 +18398,11 @@ def build_parser() -> argparse.ArgumentParser:
              "(default, byte-identical), 'maxmin' (the D solve picks the shares: "
              "max-min of the relative row ceiling, in 64ths) or a ratio vector "
              "per D rank; 'joint' (S2b) also sets FR_D at every rank's edge "
-             "(max-min of the resident expert share per card). S2: planned and "
-             "priced (--dry-run prints the cut), a real boot is refused by name "
-             "until S3 wires the worker attention.")
+             "(max-min of the resident expert share per card); 'owned' (S3f, the "
+             "target form) holds the attention host at share 0 and solves the "
+             "workers' shares, FR_D and the MoE ownership (--rank-moe-ratio) "
+             "together (min max miss time, x1 rule). A flip boot under any cut is "
+             "refused by name until S3h (--d-only boots it).")
     ap.add_argument(
         "--d-foreign-context-mib", default="",
         help="#145 Term (b): je D-RANG (ordinal) der VRAM, den die SCHLAFENDE "
@@ -22350,6 +22397,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log_d_rank_vram_solve(ns, cards, budgets_d, log, "D",
                           p_split=p_split, chunk_layers=chunk_layers,
                           card_terms=(_d_terms if _rest is not None else None))
+    state.d_owner_solve = dict(getattr(ns, "_d_owner_solve", None) or {})
     d_ratio = d_tp_ratio_decision(
         ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
         d_bs, getattr(ns, "env_d", "") or "",
