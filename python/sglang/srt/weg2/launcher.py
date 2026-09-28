@@ -4412,6 +4412,13 @@ def d_kv_token_cut(ns):
         return None
     if raw in (_er.KV_TOKEN_CUT_MAXMIN, _er.KV_TOKEN_CUT_JOINT, _er.KV_TOKEN_CUT_OWNED):
         return raw
+    if raw.startswith(_er.KV_TOKEN_CUT_OWNED_FORCED_PREFIX):
+        # #239 M1b: shares forced, ownership + FR_D solved by the planner
+        try:
+            _er.owned_cut_request(raw)
+        except ValueError as exc:
+            raise Weg2LaunchRefused(f"{KV_TOKEN_CUT_MARKER}: {exc}") from None
+        return raw
     try:
         vec = [float(x) for x in raw.split(",") if x.strip()]
     except ValueError:
@@ -16164,7 +16171,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     _derive_waves = bool(getattr(ns, "d_pool_waves_derived", False))
     # #239: the token cut of the full-attention KV (None = off, byte-identical)
     _kv_cut = d_kv_token_cut(ns)
-    if _kv_cut == _er.KV_TOKEN_CUT_OWNED and getattr(ns, "_d_owner_stated", None):
+    if _er.owned_cut_request(_kv_cut)[0] and getattr(ns, "_d_owner_stated", None):
         # #239 S3f: every pass solves the ownership from the STATED vector
         ratios = list(ns._d_owner_stated)
     _kv_cut_kw = ({} if _kv_cut is None else

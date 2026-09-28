@@ -143,7 +143,7 @@ def test_the_record_carries_the_ownership_solve():
 
 def test_plan_d_residency_knows_owned():
     src = inspect.getsource(er.plan_d_residency)
-    assert "kv_token_shares == KV_TOKEN_CUT_OWNED" in src
+    assert "owned_cut_request(kv_token_shares)" in src
     assert "solved_owner_ratio=solved_owner" in src
     assert "owner_refusal" in src
 
@@ -193,3 +193,35 @@ def test_the_solve_and_the_record_carry_the_attention_post():
     for key in ('"attn_ms_per_row"', '"lse_ms_per_layer"', '"attn_source"', '"fa_layers"'):
         assert key in plan_src
     assert "rows_per_round=int(verify)" in plan_src
+
+
+# ---- M1b: the forced cut (main 28.09.: 'owned:0,32,32') -----------------------
+
+def test_forced_shares_keep_the_cut_and_solve_ownership_and_fr():
+    sol = _owned(forced_shares=(0, 32, 32))
+    assert sol.forced and sol.cut == (0, 32, 32)
+    assert sum(sol.ratios) == sum(BASE) and all(f > 0 for f in sol.fractions)
+    assert sol.candidates == len(er.owned_ratio_vectors(BASE, 0, step=er.OWNED_RATIO_STEP,
+                                                        max_shift=None))
+
+
+def test_forced_shares_report_x1_instead_of_refusing():
+    # a forced cut that breaks the x1 rule is still a form (a measurement arm)
+    sol = _owned(forced_shares=(0, 60, 4))
+    assert sol.feasible > 0 and sol.cut == (0, 60, 4)
+    assert isinstance(sol.x1_ok, bool)
+
+
+def test_forced_shares_need_host_zero():
+    with pytest.raises(ValueError):
+        _owned(forced_shares=(8, 28, 28))
+
+
+def test_the_flag_accepts_owned_with_a_vector():
+    ns = types.SimpleNamespace(d_kv_token_cut="owned:0,32,32")
+    assert L.d_kv_token_cut(ns) == "owned:0,32,32"
+    assert er.owned_cut_request("owned:0,32,32") == (True, (0.0, 32.0, 32.0))
+    assert er.owned_cut_request("owned") == (True, None)
+    assert er.owned_cut_request((0.0, 32.0, 32.0)) == (False, None)
+    with pytest.raises(L.Weg2LaunchRefused):
+        L.d_kv_token_cut(types.SimpleNamespace(d_kv_token_cut="owned:x"))

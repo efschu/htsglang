@@ -794,6 +794,30 @@ def solve_joint_cut(
 #: next to the workers' shares and FR_D -- expert ownership moves to the host
 #: card the KV frees. The ownership is the planner's, never a hand value.
 KV_TOKEN_CUT_OWNED = "owned"
+#: #239 M1b (main 28.09.): ``owned:<vector>`` -- the planner solves ownership
+#: and FR_D as for ``owned``, the workers' shares are FORCED to the vector
+#: (a measurement arm: the attention/LSE posts per share are what M1 records).
+#: The x1 rule is then reported, not enforced -- the arm measures a form the
+#: solve might not pick.
+KV_TOKEN_CUT_OWNED_FORCED_PREFIX = "owned:"
+
+
+def owned_cut_request(kv_token_shares) -> Tuple[bool, Optional[Tuple[float, ...]]]:
+    """#239: (is this an owned solve, the forced worker shares or None)."""
+    if kv_token_shares == KV_TOKEN_CUT_OWNED:
+        return True, None
+    if isinstance(kv_token_shares, str) and kv_token_shares.startswith(
+            KV_TOKEN_CUT_OWNED_FORCED_PREFIX):
+        raw = kv_token_shares[len(KV_TOKEN_CUT_OWNED_FORCED_PREFIX):]
+        try:
+            vec = tuple(float(x) for x in raw.split(",") if x.strip())
+        except ValueError:
+            vec = ()
+        if not vec or any(x < 0 for x in vec) or sum(vec) <= 0:
+            raise ValueError("plan_d_residency: KV token cut %r: 'owned:' needs a share "
+                             "vector of the D ranks" % kv_token_shares)
+        return True, vec
+    return False, None
 
 #: #239 S3f: cost of ONE expert row a decode round misses, per MoE layer, ms,
 #: (attention host, worker). SEED, UNMEASURED: plan_s3_251 §1 from H29/x138
@@ -839,6 +863,10 @@ class OwnedCut(msgspec.Struct, frozen=True, kw_only=True):
     base_round_ms: Tuple[float, ...]
     candidates: int
     feasible: int
+    #: M1b: the shares were forced (``owned:<vector>``); ``x1_ok`` says
+    #: whether the forced form keeps the x1 rule (reported, not enforced).
+    forced: bool = False
+    x1_ok: bool = True
 
 
 def owned_miss_rows(fit: "DRankResidency", *, num_experts: int, ids_per_step: int) -> float:
@@ -928,6 +956,7 @@ def solve_owned_cut(
     card_rows: Optional[Callable[[Sequence["DRankResidency"]], Optional[Sequence[int]]]] = None,
     fa_layers: int = 0,
     rows_per_round: int = 1,
+    forced_shares: Optional[Sequence[float]] = None,
 ) -> OwnedCut:
     """#239 S3f: ownership, token cut and FR_D in one solve.
 
@@ -973,11 +1002,20 @@ def solve_owned_cut(
     base_ms = owned_round_ms(base_fits, shares=tuple(1 if r == host else 0 for r in range(len(base))),
                              merged=False, **kw)
     shares_list = []
-    for take in _compositions(int(grid), len(workers), int(share_step)):
-        vec = [0] * n
-        for w, t in zip(workers, take):
-            vec[w] = t
-        shares_list.append(tuple(vec))
+    forced = forced_shares is not None
+    if forced:
+        vec = [float(x) for x in forced_shares]
+        if len(vec) != n or vec[host] != 0 or sum(vec) <= 0:
+            raise ValueError("solve_owned_cut: forced shares %r need %d ranks and host "
+                             "share 0" % (forced_shares, n))
+        tot = sum(vec)
+        shares_list.append(tuple(int(round(x * int(grid) / tot)) for x in vec))
+    else:
+        for take in _compositions(int(grid), len(workers), int(share_step)):
+            vec = [0] * n
+            for w, t in zip(workers, take):
+                vec[w] = t
+            shares_list.append(tuple(vec))
     best = None
     cand = feas = 0
     for rat in owned_ratio_vectors(base, host, step=ratio_step, max_shift=max_shift):
@@ -989,19 +1027,22 @@ def solve_owned_cut(
                    for f in fits):
                 continue
             ms = owned_round_ms(fits, shares=sh, merged=True, **kw)
-            if any(ms[w] > base_ms[w] + 1e-9 for w in workers):
+            x1 = not any(ms[w] > base_ms[w] + 1e-9 for w in workers)
+            if not x1 and not forced:
                 continue
             feas += 1
-            key = (round(max(ms), 9), round(sum(ms), 9), shift, rat, sh)
+            # forced: a form keeping x1 wins over one that breaks it
+            key = (0 if x1 else 1, round(max(ms), 9), round(sum(ms), 9), shift, rat, sh)
             if best is None or key < best[0]:
                 best = (key, rat, sh, fits, ms)
     if best is None:
         return OwnedCut(ratios=(), cut=(), fractions=(), fits=(), round_ms=(),
                         base_ratios=base, base_round_ms=base_ms, candidates=cand, feasible=0)
-    _, rat, sh, fits, ms = best
+    key, rat, sh, fits, ms = best
     fr = tuple(float(f.ceiling_fraction) for f in fits)
     return OwnedCut(ratios=tuple(rat), cut=tuple(sh), fractions=fr, fits=(), round_ms=ms,
-                    base_ratios=base, base_round_ms=base_ms, candidates=cand, feasible=feas)
+                    base_ratios=base, base_round_ms=base_ms, candidates=cand, feasible=feas,
+                    forced=forced, x1_ok=key[0] == 0)
 
 
 class _EdgeFit(NamedTuple):
@@ -3105,8 +3146,10 @@ def plan_d_residency(
     solved_owner: Tuple[int, ...] = ()
     owner_record: Tuple[Tuple[str, object], ...] = ()
     owner_refusal: Optional[str] = None
-    if kv_token_shares == KV_TOKEN_CUT_OWNED:
-        # #239 S3f: host share 0, ownership + workers' shares + FR_D solved.
+    _owned, _forced_shares = owned_cut_request(kv_token_shares)
+    if _owned:
+        # #239 S3f: host share 0, ownership + workers' shares + FR_D solved
+        # (M1b: shares forced by 'owned:<vector>', ownership + FR_D solved).
         tp = [int(x) for x in str(rank_tp_ratio).split(",") if x.strip()]
         hosts = [r for r, v in enumerate(tp) if v > 0]
         if len(hosts) != 1:
@@ -3141,7 +3184,7 @@ def plan_d_residency(
             lambda rat, sh: _solve(sh, None, rat), base_rat, host,
             num_experts=int(terms.num_experts), n_layers=int(terms.n_layers),
             ids_per_step=ids, card_rows=_card_rows, fa_layers=fa_layers,
-            rows_per_round=int(verify))
+            rows_per_round=int(verify), forced_shares=_forced_shares)
         owner_record = (
             ("base_ratios", list(sol.base_ratios)),
             ("base_round_ms", [round(x, 3) for x in sol.base_round_ms]),
@@ -3159,6 +3202,8 @@ def plan_d_residency(
             ("ids_per_step", ids),
             ("candidates", sol.candidates),
             ("feasible", sol.feasible),
+            ("forced_shares", list(_forced_shares) if _forced_shares else None),
+            ("x1_ok", sol.x1_ok),
             ("kv_tokens", int(kv_tokens)),
         )
         if sol.feasible:
@@ -3170,15 +3215,20 @@ def plan_d_residency(
             cut_lines = (
                 "%s FRACTION-SOLVE %s D-EIGENTUM (#239 S3f): --rank-moe-ratio %s -> %s, "
                 "KV-Token-Schnitt %s/%d (Host 0), FR_D %s an der Kante -- Fehlgriff-Zeit "
-                "bs1 je Rang %s ms (Form A %s), max %.2f gegen %.2f; x1-Regel: kein Worker "
-                "ueber Form A; %d Kandidaten, %d tragbar; Kosten je Zeile %s ms (%s), "
+                "bs1 je Rang %s ms (Form A %s), max %.2f gegen %.2f; x1-Regel: %s; "
+                "%d Kandidaten, %d tragbar; Kosten je Zeile %s ms (%s), "
                 "%d Ids je Schritt, gleichverteilt (benannt); Attention+LSE je Rang "
                 "(%d FA-Layer, %s); %d Token KV Pflicht"
                 % (marker, label, ",".join(str(x) for x in sol.base_ratios),
                    ",".join(str(x) for x in sol.ratios), list(sol.cut), KV_TOKEN_SHARE_GRID,
                    ["%.3f" % x for x in sol.fractions],
                    ["%.2f" % x for x in sol.round_ms], ["%.2f" % x for x in sol.base_round_ms],
-                   max(sol.round_ms), max(sol.base_round_ms), sol.candidates, sol.feasible,
+                   max(sol.round_ms), max(sol.base_round_ms),
+                   ("kein Worker ueber Form A" if sol.x1_ok else
+                    "VERLETZT (Schnitt erzwungen, Messarm M1b)") + (
+                       " -- Schnitt ERZWUNGEN %s" % list(_forced_shares) if _forced_shares
+                       else ""),
+                   sol.candidates, sol.feasible,
                    "/".join("%g" % x for x in OWNED_MISS_MS_PER_ROW_SEED),
                    OWNED_MISS_MS_SOURCE_SEED, ids, fa_layers, OWNED_ATTN_SOURCE_SEED,
                    int(kv_tokens)),
