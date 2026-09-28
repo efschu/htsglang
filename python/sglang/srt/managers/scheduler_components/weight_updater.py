@@ -9292,6 +9292,17 @@ class SchedulerWeightUpdaterManager:
             )
         if store_failure and not report:
             raise Weg2WakeRefused(store_failure)
+        # 28.09.: the L3 journal's fsync, on a thread AFTER this leg's fence --
+        # never inside the sleep RPC (a flip is never slowed); the write-ahead
+        # order already makes an unsynced tail harmless (store_journal.py)
+        try:
+            _tc = getattr(self.scheduler, "tree_cache", None)
+            _ev = getattr(getattr(getattr(_tc, "cache_controller", None), "storage_backend", None),
+                          "_evictor", None)
+            if _ev is not None and hasattr(_ev, "journal_sync_async"):
+                _ev.journal_sync_async()
+        except Exception:  # noqa: BLE001
+            pass
 
         # C17: the group's answer carries what the group moved.  ``per_tag``
         # falls back to THIS rank's own numbers when there was no group to
