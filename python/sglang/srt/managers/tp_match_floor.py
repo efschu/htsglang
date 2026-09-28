@@ -319,7 +319,41 @@ def skewed_rids(
         g = int(g)
         if g > 0 and int(group_max.get(rid, g)) > g:
             out[rid] = g
+    if out:
+        _note_form_a_dcp_worker_floor(out, group_max)
     return out
+
+
+def _note_form_a_dcp_worker_floor(
+    skewed: Mapping[str, int], group_max: Mapping[str, int]
+) -> None:
+    """#239 S3d: under Form A x the token cut a worker's KV reach is REAL (it
+    owns full-attention rows), so its usable vote can take the group below the
+    host's depth -- H98's MAX arm is the host alone, so every skewed rid here
+    is exactly that. The MIN/realize path below acts on it as for any skew;
+    this line only makes it visible (no silent floor). Same inputs on every
+    rank, so every rank logs the same line."""
+    if not form_a_follow_active():
+        return
+    from sglang.srt.rank_role import form_a_token_cut_active
+
+    if not form_a_token_cut_active():
+        return
+    for rid, g in skewed.items():
+        _STATS["dcp_worker_floor"] = _STATS.get("dcp_worker_floor", 0) + 1
+        n = _STATS["dcp_worker_floor"]
+        if n <= 20 or n % 256 == 0:
+            logger.warning(
+                "RU FORM-A-DCP WORKER-FLOOR rid=%s host=%d group=%d (n=%d): an "
+                "expert worker owns fewer of this prefix's full-attention rows "
+                "than the host admits (token cut, #239), so the group takes the "
+                "worker's reach; the realize round decides whether the host can "
+                "resume there or the group re-prefills (H97).",
+                str(rid)[:16],
+                int(group_max.get(rid, g)),
+                int(g),
+                n,
+            )
 
 
 def can_realize(tree_cache: Any, req: Any, depth: int) -> bool:
@@ -1027,6 +1061,7 @@ def form_a_admission_verdict(
     exchange: Any,
     price: Any = None,
     budget: Any = None,
+    gather: Any = None,
 ) -> str:
     """The host's admission verdict for ``rid``, adopted by every worker.
 
@@ -1037,8 +1072,18 @@ def form_a_admission_verdict(
     budget)``, a worker ``None``; every rank gets the host's tuple back).
     Returns the host's code. A payload for another rid, or one that is not a
     verdict (a rank in the post-loop riegel while this one is at a gate: the
-    loops made different numbers of gate calls), is a named stop."""
+    loops made different numbers of gate calls), is a named stop.
+
+    #239 S3d: under the token cut (``gather``, an all-gather of every rank's
+    tuple in TP order, the host first) a worker's gate is REAL -- it owns
+    full-attention rows -- so the verdict is the group's MIN: the host's code
+    when it refuses, else the first refusing worker's. Same payload, same
+    count of collectives (a gather in place of the broadcast)."""
     rid = str(rid)
+    if gather is not None:
+        return _form_a_dcp_admission_verdict(
+            rid, str(local), is_host=is_host, gather=gather, price=price, budget=budget
+        )
     got = exchange((rid, str(local), price, budget) if is_host else None)
     if not isinstance(got, tuple) or len(got) != 4:
         raise FormAAdmissionSplit(
@@ -1072,6 +1117,54 @@ def form_a_admission_verdict(
     if not is_host:
         _note_admission_wait(rid, host_code, got[2], got[3], str(local), price, budget)
     return host_code
+
+
+def _form_a_dcp_admission_verdict(
+    rid: str, local: str, *, is_host: bool, gather: Any, price: Any, budget: Any
+) -> str:
+    """#239 S3d: :func:`form_a_admission_verdict` under the token cut."""
+    got = gather((rid, local, price, budget))
+    if (
+        not isinstance(got, list)
+        or not got
+        or any(not isinstance(v, tuple) or len(v) != 4 for v in got)
+    ):
+        raise FormAAdmissionSplit(
+            f"H105 RU FORM-A ADMISSION MALFORMED rid={rid[:16]} got={str(got)[:120]}: "
+            "this rank is at the admission gate but the group's gather carries no "
+            "verdict from every rank -- the ranks' admission loops made different "
+            "numbers of gate calls; stopping instead of admitting on a guess "
+            "(raenge-nie-uneins)."
+        )
+    rids = [str(v[0]) for v in got]
+    if any(r != rid for r in rids):
+        raise FormAAdmissionSplit(
+            f"H105 RU FORM-A ADMISSION SPLIT rids={[r[:16] for r in rids]} "
+            f"local_rid={rid[:16]}: the ranks reached the admission gate for "
+            "different requests -- the queues or the loop's skips diverged; "
+            "stopping by name instead of building a different extend "
+            "(raenge-nie-uneins)."
+        )
+    code, decider = str(got[0][1]), got[0]
+    if code == ADMISSION_ADMIT:
+        for r, v in enumerate(got[1:], start=1):
+            if str(v[1]) != ADMISSION_ADMIT:
+                code, decider = str(v[1]), v
+                _STATS["dcp_worker_gate"] = _STATS.get("dcp_worker_gate", 0) + 1
+                n = _STATS["dcp_worker_gate"]
+                if n <= 20 or n % 256 == 0:
+                    logger.warning(
+                        "H105 RU FORM-A-DCP WORKER-GATE rid=%s host=ADMIT worker=%d "
+                        "code=%s price=%s budget=%s (n=%d): under the token cut this "
+                        "expert worker owns full-attention rows, so its pool gate is "
+                        "the group's too (#239 S3d); the request stays queued on "
+                        "every rank.",
+                        rid[:16], r, code, v[2], v[3], n,
+                    )
+                break
+    if not is_host:
+        _note_admission_wait(rid, code, decider[2], decider[3], local, price, budget)
+    return code
 
 
 def form_a_extend_set(reqs: Sequence[Any]) -> List[tuple]:
