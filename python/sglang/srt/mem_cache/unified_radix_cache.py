@@ -389,6 +389,25 @@ def _weg2_cap_deliverable(req_id, deliverable: int, no_writer: bool, hit_tokens:
 _WEG2_CAP_N = [0]
 
 
+def _hfb_deliverable_end(end_base: int, span_len: int, no_writer: bool,
+                         hit_end: int, synced_end: int, page: int) -> int:
+    """HFB-b: the #1324 deliverable of an END-vote read as an ABSOLUTE depth.
+
+    Each rank's span starts at its own base, so the span-relative
+    ``len(prefetch_key)`` floored to pages differs per rank whenever a base is
+    not page-aligned (host 12500 -> 17216, worker 16384 -> 13376 for one group
+    END 29760), and ``synced < deliverable`` could answer differently per rank.
+    The END (base + span) is the group's (#580 END vote), so the page floor of
+    the END, capped like ``_weg2_cap_deliverable`` on the reduced hit/synced
+    ENDs, is one number on every rank. Quiet: the span-relative cap already
+    printed its line."""
+    pg = max(1, int(page))
+    dend = ((int(end_base) + int(span_len)) // pg) * pg
+    if no_writer:
+        dend = min(dend, (max(int(hit_end), int(synced_end)) // pg) * pg)
+    return dend
+
+
 class UnifiedTreeNode:
     counter = 0
 
@@ -7311,6 +7330,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             packed = torch.tensor(packed_list, dtype=torch.int)
         _probed, _hit_tokens = self._reap_annotation_from_packed(packed)
+        _hit_end = int(_hit_tokens)
         _hit_tokens = _hp1_end_unpack(_eb, int(_hit_tokens))
         tail_adopt.agree(req_id, int(packed[_REAP_SLOT_TAIL_VOTE].item()))
         # #257 (b): a read that ended short keeps only what a recurrent anchor
@@ -7686,7 +7706,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # reader that needs a group fact takes the reduced END itself --
             # the absolute prompt depth the group delivered (25920 on every
             # rank). Absent = no END vote on this read (every other boot).
-            self.prefetch_loaded_tokens_by_reqid[req_id].synced_end = _synced_end
+            _rec = self.prefetch_loaded_tokens_by_reqid[req_id]
+            _rec.synced_end = _synced_end
+            # HFB-b: `is_incomplete` compares these two ENDs, not the
+            # span-relative pair, so the verdict is the group's too.
+            _rec.deliverable_end = _hfb_deliverable_end(
+                int(_eb_rec), len(prefetch_key),
+                int(packed[_REAP_SLOT_NO_WRITER].item()) > 0,
+                _hit_end, _synced_end, _page)
         # #843: `refused` separates the TWO reasons this line can say loaded=0,
         # which are not the same finding and were indistinguishable at INFO.
         #
