@@ -801,6 +801,23 @@ KV_TOKEN_CUT_OWNED = "owned"
 #: replaces it (RECORD > BUILTIN > UNMEASURED, H94).
 OWNED_MISS_MS_PER_ROW_SEED: Tuple[float, float] = (0.1, 0.2)
 OWNED_MISS_MS_SOURCE_SEED = "Saat UNMEASURED (plan_s3_251 §1, H29/x138)"
+#: #239 S3f (main 28.09.): the ATTENTION and LSE posts of T_r, named, SEED,
+#: UNMEASURED -- without them the solve saw only expert misses and put the
+#: whole FA-KV on one worker (desk probe 524k: cut 0/64/0). Per full-attention
+#: layer and decode round, a rank that holds KV rows pays
+#:   floor (kernel launch + latency, independent of its share)
+#:   + query rows x share x cost of attending the whole sparse top-k,
+#: and with a cut every rank pays the LSE merge collectives (A, T, Q, M of
+#: F5, issued on all ranks). Seeds: per query row and FA layer over the full
+#: top-k (indexer_budget 2048), 3080 ~0.0026 ms from H65 (QSA prefill 42 ms
+#: per 16k chunk and layer), 5090 half; floor 0.02 ms; LSE 0.045 ms per FA
+#: layer (plan_s3_251 §1: 30-60 us, H28 floor 12 us). M1 (DECODE-ROUND-COST
+#: with the workers' attention share) writes the record that replaces them.
+OWNED_ATTN_MS_PER_ROW_SEED: Tuple[float, float] = (0.0013, 0.0026)
+OWNED_ATTN_FLOOR_MS_SEED = 0.02
+OWNED_LSE_MS_PER_LAYER_SEED = 0.045
+OWNED_ATTN_SOURCE_SEED = "Saat UNMEASURED (H65 QSA 3080, 5090 halb; Boden 0,02; LSE 0,045 ms/FA-Layer)"
+
 #: #239 S3f: the search grid -- ownership moves in steps of 8 ratio units
 #: (a quarter of the smallest NF band), the workers' KV shares in 64ths
 #: stepped by 4 (the page grid stays the runtime's).
@@ -838,13 +855,31 @@ def owned_miss_rows(fit: "DRankResidency", *, num_experts: int, ids_per_step: in
 
 def owned_round_ms(fits: Sequence["DRankResidency"], *, host: int, num_experts: int,
                    ids_per_step: int, n_layers: int,
-                   miss_ms: Tuple[float, float] = OWNED_MISS_MS_PER_ROW_SEED) -> Tuple[float, ...]:
-    """#239 S3f: T_r = missed rows x MoE layers x cost per row of the card."""
-    return tuple(
-        owned_miss_rows(f, num_experts=num_experts, ids_per_step=ids_per_step)
-        * int(n_layers) * float(miss_ms[0] if f.rank == host else miss_ms[1])
-        for f in fits
-    )
+                   miss_ms: Tuple[float, float] = OWNED_MISS_MS_PER_ROW_SEED,
+                   shares: Optional[Sequence[int]] = None, fa_layers: int = 0,
+                   rows_per_round: int = 1, merged: bool = False,
+                   attn_ms: Tuple[float, float] = OWNED_ATTN_MS_PER_ROW_SEED,
+                   attn_floor_ms: float = OWNED_ATTN_FLOOR_MS_SEED,
+                   lse_ms: float = OWNED_LSE_MS_PER_LAYER_SEED) -> Tuple[float, ...]:
+    """#239 S3f: T_r = missed rows x MoE layers x cost per row of the card,
+    plus (``fa_layers`` > 0) the attention post of the rank's KV share
+    ``shares`` (floor + rows x share x cost per row, only where the share is
+    > 0) and, when ``merged`` (a token cut), the LSE merge on every rank."""
+    total = float(sum(shares)) if shares else 0.0
+    out = []
+    for f in fits:
+        own = f.rank == host
+        t = (owned_miss_rows(f, num_experts=num_experts, ids_per_step=ids_per_step)
+             * int(n_layers) * float(miss_ms[0] if own else miss_ms[1]))
+        if int(fa_layers) > 0 and total > 0:
+            share = float(shares[f.rank]) / total
+            if share > 0:
+                t += int(fa_layers) * (float(attn_floor_ms) + int(rows_per_round) * share
+                                       * float(attn_ms[0] if own else attn_ms[1]))
+            if merged:
+                t += int(fa_layers) * float(lse_ms)
+        out.append(t)
+    return tuple(out)
 
 
 def _compositions(total: int, parts: int, step: int):
@@ -891,6 +926,8 @@ def solve_owned_cut(
     share_step: int = OWNED_SHARE_STEP,
     max_shift: Optional[int] = None,
     card_rows: Optional[Callable[[Sequence["DRankResidency"]], Optional[Sequence[int]]]] = None,
+    fa_layers: int = 0,
+    rows_per_round: int = 1,
 ) -> OwnedCut:
     """#239 S3f: ownership, token cut and FR_D in one solve.
 
@@ -929,9 +966,12 @@ def solve_owned_cut(
     n = len(base)
     workers = [r for r in range(n) if r != host]
     kw = dict(host=host, num_experts=num_experts, ids_per_step=ids_per_step,
-              n_layers=n_layers, miss_ms=miss_ms)
+              n_layers=n_layers, miss_ms=miss_ms, fa_layers=fa_layers,
+              rows_per_round=rows_per_round)
     base_fits = _edge(tuple(solve_at(base, None)))
-    base_ms = owned_round_ms(base_fits, **kw)
+    # Form A: the host attends over the whole KV, no merge
+    base_ms = owned_round_ms(base_fits, shares=tuple(1 if r == host else 0 for r in range(len(base))),
+                             merged=False, **kw)
     shares_list = []
     for take in _compositions(int(grid), len(workers), int(share_step)):
         vec = [0] * n
@@ -948,7 +988,7 @@ def solve_owned_cut(
             if any(f.ceiling_fraction is None or f.ceiling_max_rows < f.scratch_rows + 2
                    for f in fits):
                 continue
-            ms = owned_round_ms(fits, **kw)
+            ms = owned_round_ms(fits, shares=sh, merged=True, **kw)
             if any(ms[w] > base_ms[w] + 1e-9 for w in workers):
                 continue
             feas += 1
@@ -3062,6 +3102,10 @@ def plan_d_residency(
         host = hosts[0]
         verify = replayssm_spec.draft_tokens if replayssm_spec is not None else 1
         ids = int(verify) * int(text_cfg.get("num_experts_per_tok") or 1)
+        _kinds = list(text_cfg.get("layer_types") or ())
+        fa_layers = (sum(1 for k in _kinds if k == "full_attention") if _kinds else
+                     int(text_cfg.get("num_hidden_layers") or 0)
+                     // max(1, int(text_cfg.get("full_attention_interval") or 0) or 1))
         base_rat = [int(round(float(x))) for x in ratios]
         def _card_rows(cut_fits):
             # the card's edge per rank, from the same check the plan ends with
@@ -3082,7 +3126,8 @@ def plan_d_residency(
         sol = solve_owned_cut(
             lambda rat, sh: _solve(sh, None, rat), base_rat, host,
             num_experts=int(terms.num_experts), n_layers=int(terms.n_layers),
-            ids_per_step=ids, card_rows=_card_rows)
+            ids_per_step=ids, card_rows=_card_rows, fa_layers=fa_layers,
+            rows_per_round=int(verify))
         owner_record = (
             ("base_ratios", list(sol.base_ratios)),
             ("base_round_ms", [round(x, 3) for x in sol.base_round_ms]),
@@ -3092,6 +3137,11 @@ def plan_d_residency(
             ("round_ms", [round(x, 3) for x in sol.round_ms]),
             ("miss_ms_per_row", list(OWNED_MISS_MS_PER_ROW_SEED)),
             ("miss_ms_source", OWNED_MISS_MS_SOURCE_SEED),
+            ("attn_ms_per_row", list(OWNED_ATTN_MS_PER_ROW_SEED)),
+            ("attn_floor_ms", OWNED_ATTN_FLOOR_MS_SEED),
+            ("lse_ms_per_layer", OWNED_LSE_MS_PER_LAYER_SEED),
+            ("attn_source", OWNED_ATTN_SOURCE_SEED),
+            ("fa_layers", fa_layers),
             ("ids_per_step", ids),
             ("candidates", sol.candidates),
             ("feasible", sol.feasible),
@@ -3108,14 +3158,16 @@ def plan_d_residency(
                 "KV-Token-Schnitt %s/%d (Host 0), FR_D %s an der Kante -- Fehlgriff-Zeit "
                 "bs1 je Rang %s ms (Form A %s), max %.2f gegen %.2f; x1-Regel: kein Worker "
                 "ueber Form A; %d Kandidaten, %d tragbar; Kosten je Zeile %s ms (%s), "
-                "%d Ids je Schritt, gleichverteilt (benannt); %d Token KV Pflicht"
+                "%d Ids je Schritt, gleichverteilt (benannt); Attention+LSE je Rang "
+                "(%d FA-Layer, %s); %d Token KV Pflicht"
                 % (marker, label, ",".join(str(x) for x in sol.base_ratios),
                    ",".join(str(x) for x in sol.ratios), list(sol.cut), KV_TOKEN_SHARE_GRID,
                    ["%.3f" % x for x in sol.fractions],
                    ["%.2f" % x for x in sol.round_ms], ["%.2f" % x for x in sol.base_round_ms],
                    max(sol.round_ms), max(sol.base_round_ms), sol.candidates, sol.feasible,
                    "/".join("%g" % x for x in OWNED_MISS_MS_PER_ROW_SEED),
-                   OWNED_MISS_MS_SOURCE_SEED, ids, int(kv_tokens)),
+                   OWNED_MISS_MS_SOURCE_SEED, ids, fa_layers, OWNED_ATTN_SOURCE_SEED,
+                   int(kv_tokens)),
             )
         else:
             owner_refusal = (
