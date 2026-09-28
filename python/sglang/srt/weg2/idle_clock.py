@@ -23,12 +23,17 @@ GPU utilisation is deliberately not an input: during a flip the SLEEPING
 group's legs run on the cards too, and a load reading per card would see a
 quiet card and lock it under a flip.
 
-UNLOCK FIRST, THEN WORK. ``note_busy`` runs synchronously on the event loop
-at a request's first byte (middleware), at the first statement of
-``Front.flip`` and on every controller pass that is not at rest. It returns
-after the daemon has reset the clocks (a few ms, logged per event) -- or, if
-the daemon does not answer in time, after closing the connection, which is
-itself the release (the daemon resets on close).
+UNLOCK BEFORE THE FIRST GPU WORK. The memory-clock unlock costs ~30 ms
+(3080 micro test 28.09.: -lmc 405 -> P8 at 38.7 W, -67 W; unlock ~30 ms,
+ramp to full clock ~33 ms, first round x0.996). On the REQUEST path that
+unlock is STARTED at the request's first byte (middleware, in a worker
+thread) and AWAITED only where the front first reaches a group -- an aiohttp
+``on_request_start`` trace hook on the front's group session, which aiohttp
+awaits before it opens the connection. Tokenizing, pricing and routing run
+beside the unlock. Before a FLIP it stays synchronous (``before_flip``), and
+a controller pass that is not at rest unlocks synchronously too (the safety
+net). An unlock that fails closes the connection, which is itself the
+release (the daemon resets on close).
 
 FAIL-OPEN. The switch is off by default. With it on and no daemon, the lock
 simply never happens (one ``UNAVAILABLE`` line, a retry after ``retry_s``);
@@ -42,10 +47,12 @@ unix:/path, SGLANG_WEG2_IDLE_CLOCK_TIMEOUT_S=0.25.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import socket
+import threading
 import time
 from typing import Callable, Dict, List, Optional
 
@@ -118,19 +125,54 @@ class IdleClock:
         self.locked = False
         self._down_until = 0.0
         self._down_logged = False
-        self.counters: Dict[str, int] = {"lock": 0, "unlock": 0, "unavailable": 0, "unlock_via_close": 0}
+        self.counters: Dict[str, int] = {"lock": 0, "unlock": 0, "unavailable": 0, "unlock_via_close": 0,
+                                         "gate_waits": 0}
+        # the async unlock started at a request's first byte; awaited by ready() / before_flip()
+        self._pending: Optional["asyncio.Future"] = None
+        self._io = threading.Lock()  # one daemon call at a time (loop thread vs. unlock worker thread)
 
-    # -- the three front hooks ------------------------------------------------
+    def _unlock_pending(self) -> bool:
+        return self._pending is not None and not self._pending.done()
+
+    # -- the front hooks ------------------------------------------------------
     def enter(self) -> None:
-        """A POST reaches the front: count it, and unlock before its handler runs."""
+        """A POST reaches the front: count it and START the unlock, without waiting for it."""
         self.inflight += 1
-        self.note_busy("request")
+        self.rest_since = None
+        if self.locked and not self._unlock_pending():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._unlock("request")  # no loop (unit use): synchronous
+                return
+            self._pending = loop.run_in_executor(None, self._unlock, "request")
+
+    async def ready(self) -> None:
+        """Awaited before the front's first request to a group: the unlock must have landed."""
+        p = self._pending
+        if p is None or p.done():
+            return
+        t0 = time.perf_counter()
+        await asyncio.shield(p)
+        self.counters["gate_waits"] += 1
+        logger.info("WEG2 IDLE-CLOCK GATE waited_ms=%.2f (the first group request waited for the unlock "
+                    "started at the request's first byte)", (time.perf_counter() - t0) * 1e3)
+
+    async def before_flip(self) -> None:
+        """A flip: unlock synchronously -- both groups' legs use the cards."""
+        self.rest_since = None
+        if self._unlock_pending():
+            await asyncio.shield(self._pending)
+        elif self.locked:
+            self._unlock("flip")
 
     def leave(self) -> None:
         self.inflight = max(0, self.inflight - 1)
 
     def note_rest(self, queued: int = 0, serving: bool = True) -> None:
         """The controller's idle decision said REST in the configured layout."""
+        if self._unlock_pending():
+            return
         if self.inflight or queued or not serving:
             self.note_busy("request" if self.inflight else "queued" if queued else "not-serving")
             return
@@ -143,16 +185,17 @@ class IdleClock:
         self._lock(now - self.rest_since)
 
     def note_busy(self, why: str) -> None:
-        """Work (or a flip) is about to happen: unlock FIRST, synchronously."""
+        """Controller safety net: not at rest -> unlocked, synchronously unless a request already started it."""
         self.rest_since = None
-        if self.locked:
+        if self.locked and not self._unlock_pending():
             self._unlock(why)
 
     # -- the daemon calls -----------------------------------------------------
     def _lock(self, rest_s: float) -> None:
         t0 = time.perf_counter()
         try:
-            r = self.client.call("lock")
+            with self._io:
+                r = self.client.call("lock")
         except (OSError, ValueError) as e:
             self._unavailable(f"{type(e).__name__}: {e}")
             return
@@ -175,13 +218,15 @@ class IdleClock:
         via = "unlock"
         daemon_ms = None
         try:
-            r = self.client.call("unlock")
+            with self._io:
+                r = self.client.call("unlock")
             daemon_ms = r.get("ms")
             if not r.get("ok"):
                 raise ConnectionError(f"daemon unlock not ok: {r.get('err', r)}")
         except (OSError, ValueError) as e:
             # The connection is the lease: closing it IS the release (daemon resets on close).
-            self.client.close()
+            with self._io:
+                self.client.close()
             via = f"close ({type(e).__name__})"
             self.counters["unlock_via_close"] += 1
         self.locked = False
@@ -235,3 +280,18 @@ def middlewares(ic: Optional[IdleClock]) -> List:
             ic.leave()
 
     return [idle_clock_inflight]
+
+
+def trace_configs(ic: Optional[IdleClock]) -> List:
+    """The request-path gate: aiohttp awaits ``on_request_start`` before it connects, so every request
+    the front sends to a group waits for an unlock started at the client request's first byte."""
+    if ic is None:
+        return []
+    from aiohttp import TraceConfig
+
+    async def _gate(session, ctx, params):
+        await ic.ready()
+
+    tc = TraceConfig()
+    tc.on_request_start.append(_gate)
+    return [tc]

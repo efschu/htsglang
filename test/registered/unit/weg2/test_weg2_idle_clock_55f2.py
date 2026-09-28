@@ -32,13 +32,17 @@ from sglang.srt.weg2 import idle_clock_daemon as dmn
 
 
 class FakeClient:
-    def __init__(self, fail_lock=None, fail_unlock=None, refuse=False):
+    def __init__(self, fail_lock=None, fail_unlock=None, refuse=False, unlock_s=0.0):
         self.calls = []
         self.closed = 0
         self.fail_lock, self.fail_unlock, self.refuse = fail_lock, fail_unlock, refuse
+        self.unlock_s = unlock_s
         self.addr = "fake:0"
 
-    def call(self, op):
+    def call(self, op, **extra):
+        if op == "unlock" and self.unlock_s:
+            import time as _t
+            _t.sleep(self.unlock_s)   # the ~30 ms of a -lmc unlock, stretched
         self.calls.append(op)
         if op == "lock" and self.fail_lock:
             raise self.fail_lock
@@ -130,6 +134,47 @@ class TestUnlockBeforeWork(unittest.TestCase):
                 ic.note_rest(**kw)
                 clk.t += 1.0
         self.assertEqual(ic.client.calls, [])
+
+    def test_request_entry_starts_the_unlock_without_waiting_and_ready_waits(self):
+        ic, _ = self._locked(FakeClient(unlock_s=0.2))
+
+        async def go():
+            import time as _t
+            t0 = _t.perf_counter()
+            ic.enter()                                   # returns at once; unlock runs in a thread
+            entered_ms = (_t.perf_counter() - t0) * 1e3
+            self.assertTrue(ic._unlock_pending())
+            ic.note_rest()                               # never re-locks while the unlock is pending
+            await ic.ready()                             # the first group request waits here
+            return entered_ms
+
+        entered_ms = asyncio.run(go())
+        self.assertLess(entered_ms, 100.0)
+        self.assertEqual(ic.client.calls, ["lock", "unlock"])
+        self.assertFalse(ic.locked)
+        self.assertEqual(ic.counters["gate_waits"], 1)
+
+    def test_second_request_does_not_start_a_second_unlock(self):
+        ic, _ = self._locked(FakeClient(unlock_s=0.1))
+
+        async def go():
+            ic.enter()
+            ic.enter()
+            await ic.ready()
+
+        asyncio.run(go())
+        self.assertEqual(ic.client.calls, ["lock", "unlock"])
+
+    def test_flip_waits_for_a_pending_request_unlock(self):
+        ic, _ = self._locked(FakeClient(unlock_s=0.1))
+
+        async def go():
+            ic.enter()
+            await ic.before_flip()
+            return ic.locked
+
+        self.assertFalse(asyncio.run(go()))
+        self.assertEqual(ic.client.calls, ["lock", "unlock"])
 
     def test_flip_unlocks_before_its_first_statement(self):
         from sglang.srt.weg2 import front as front_mod
@@ -409,6 +454,7 @@ class TestMiddleware(unittest.TestCase):
 
         async def handler(request):
             seen["inflight"] = ic.inflight
+            await ic.ready()
             seen["locked"] = ic.locked
             return web.json_response({"ok": True})
 
@@ -425,6 +471,37 @@ class TestMiddleware(unittest.TestCase):
         asyncio.run(go())
         self.assertEqual(seen, {"inflight": 1, "locked": False})
         self.assertEqual(ic.inflight, 0)
+
+
+class TestGroupRequestGate(unittest.TestCase):
+    """The front's group session carries the gate: a request to a group waits for the pending unlock."""
+
+    def test_group_request_starts_only_after_the_unlock_landed(self):
+        from aiohttp import ClientSession, web
+        from aiohttp.test_utils import TestServer
+
+        ic, clk = _ic(FakeClient(unlock_s=0.15))
+        ic.note_rest()
+        clk.t += 1.0
+        ic.note_rest()
+        seen = {}
+
+        async def group(request):          # stands in for the P/D group server
+            seen["calls_at_group"] = list(ic.client.calls)
+            return web.json_response({"ok": True})
+
+        async def go():
+            app = web.Application()
+            app.router.add_post("/generate", group)
+            async with TestServer(app) as srv:
+                async with ClientSession(trace_configs=idle_clock.trace_configs(ic)) as s:
+                    ic.enter()                  # client request's first byte at the front
+                    async with s.post(srv.make_url("/generate"), json={}) as r:
+                        await r.read()
+
+        asyncio.run(go())
+        self.assertEqual(seen["calls_at_group"], ["lock", "unlock"])
+        self.assertEqual(idle_clock.trace_configs(None), [])
 
 
 if __name__ == "__main__":

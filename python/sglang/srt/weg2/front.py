@@ -4716,7 +4716,10 @@ class Front:
         # rpc_keepalive: the client's idle bound sits below the groups'.
         self.session = ClientSession(timeout=ClientTimeout(total=3600),
                                      connector=rpc_connector(),
-                                     trace_configs=[make_rpc_trace_config()])
+                                     trace_configs=[make_rpc_trace_config(),
+                                                    # #55 F2: the group request waits for the async unlock
+                                                    *_idle_clock_mod.trace_configs(
+                                                        getattr(self, "_idle_clock", None))])
         _ka_client, _ka_server, _ka_src = rpc_keepalive()
         logger.info("WEG2-FRONT RPC-KEEPALIVE client=%s server=%.1f s (%s) -- a pooled connection "
                     "idle longer than the client bound is closed, never written into; the groups "
@@ -8504,7 +8507,7 @@ class Front:
         # #55 F2: unlock the clocks BEFORE anything of the flip runs -- both groups' legs use the cards.
         _ic = getattr(self, "_idle_clock", None)
         if _ic is not None:
-            _ic.note_busy("flip")
+            await _ic.before_flip()
         S, D = self.groups[src], self.groups[dst]
         self.state = "flipping"
         t_flip0 = time.time()
