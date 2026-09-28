@@ -71,7 +71,9 @@ _PRICE = {"ms": None, "n": 0}
 #: below this many new tokens the member's own pass is the cheap one (~12 ms: E2 / small E1).
 EXPENSIVE_MIN_TOKENS = 8
 #: a sibling in one of these states has a read in flight that will land by itself.
-IN_FLIGHT = ("reading", "reissued")
+#: L1b: "wait" (seen short, its re-read due within 2 s) lands too; the settle bound and
+#: the hold cap keep it from holding the cohort long.
+IN_FLIGHT = ("reading", "reissued", "wait")
 
 
 def enabled(env=None) -> bool:
@@ -123,8 +125,8 @@ def new_tokens(req, records=None) -> Optional[int]:
     group-synced record), or 0 when the group agreed the E2 tail skip. None =
     unknown (no annotated record) -- the caller treats it as cheap, so an
     unknown never buys a wait."""
-    ids = getattr(req, "full_untruncated_fill_ids", None)
-    if ids is None:
+    total = _prompt_len(req)
+    if total is None:
         return None
     rec = None if records is None else records.get(getattr(req, "rid", None))
     mat = getattr(rec, "materialized", None)
@@ -137,14 +139,29 @@ def new_tokens(req, records=None) -> Optional[int]:
     except Exception:  # noqa: BLE001 -- no adopt view = the page anchor, as the admission would
         start = None
     first = int(mat) if start is None else int(start)
-    return max(0, len(ids) - first)
+    return max(0, total - first)
+
+
+def _prompt_len(req) -> Optional[int]:
+    """L1b: what the extend covers -- ``origin_input_ids + output_ids``. A request P
+    handed over and D never ran carries an EMPTY ``full_untruncated_fill_ids``
+    (``array("q")`` until ``init_next_round_input``), which priced its pass at 0
+    tokens: cheap, never a hold."""
+    ids = getattr(req, "full_untruncated_fill_ids", None)
+    origin = getattr(req, "origin_input_ids", None)
+    if ids is None and origin is None:
+        return None
+    n = len(origin or ()) + len(getattr(req, "output_ids", None) or ())
+    return max(n, len(ids or ()))
 
 
 def hold_vote(members: Iterable[Tuple[object, str, bool]], since: float, now: float,
               records=None, env=None) -> int:
     """This rank's vote (1 = hold the ready members this tick). ``members`` =
     (req, read state, this rank's release flag) for every parked request;
-    ``since`` = the earliest park time of the settle (the wake)."""
+    ``since`` = when the first member of this wake was ready on this rank (L1b:
+    the cap bounds the HOLD -- measured from the wake it charged the ~1 s reads
+    to the hold, and rc12z29b 20:11- held 0 times in 11 wakes)."""
     ready, flying = [], 0
     for req, state, release in members:
         if release:

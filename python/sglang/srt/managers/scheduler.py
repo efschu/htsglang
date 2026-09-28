@@ -6523,7 +6523,16 @@ class Scheduler(
         _flags = [x[3] for x in _local]
         _cohort_hold = False
         if _wc.asks(settle):
-            _since = min(float(getattr(r, "_1471_since", now)) for r in settle)
+            # L1b (28.09.): the cap bounds the HOLD, so its clock starts when the first member of
+            # this wake was ready on this rank, not at the wake -- from the wake it charged the
+            # ~1 s reads to the hold (rc12z29b 20:11-: holds=0 in all 11 wakes). Rank-local
+            # clock, it feeds the vote only.
+            _seq = getattr(self, "_weg2_wake_seq", None)
+            _ra = getattr(self, "_weg2_cohort_ready_at", None)
+            if any(_flags) and (_ra is None or _ra[0] != _seq):
+                _ra = (_seq, now)
+                self._weg2_cohort_ready_at = _ra
+            _since = _ra[1] if (_ra is not None and _ra[0] == _seq) else now
             _records = getattr(getattr(self, "tree_cache", None), "prefetch_loaded_tokens_by_reqid", None)
             try:
                 _hv = _wc.hold_vote([(x[0], x[1], x[3]) for x in _local], _since, now, records=_records)
@@ -6552,7 +6561,7 @@ class Scheduler(
             _agreed = [0] * len(_agreed)
             if getattr(self, "_weg2_cohort_said", None) != getattr(self, "_weg2_wake_seq", None):
                 self._weg2_cohort_said = getattr(self, "_weg2_wake_seq", None)
-                logger.info("WEG2-WAKE-COHORT HOLD ready=%d parked=%d since_wake_ms=%.0f cap_ms=%.0f "
+                logger.info("WEG2-WAKE-COHORT HOLD ready=%d parked=%d since_ready_ms=%.0f cap_ms=%.0f "
                             "price_ms=%.0f (a sibling read is in flight; the ready members join its extend)",
                             _n_ready, len(settle), (now - _since) * 1000.0, _wc.cap_s() * 1000.0,
                             _wc.price_s() * 1000.0)
