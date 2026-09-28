@@ -159,3 +159,37 @@ def test_the_card_edge_bounds_the_solve():
     assert capped.fractions[0] <= free.fractions[0]
     E0 = capped.ratios[0] + 10
     assert capped.fractions[0] <= (120 - SCRATCH[0]) / float(E0) + 1e-9
+
+
+# ---- the attention and LSE posts (main 28.09.: named, seed UNMEASURED) --------
+
+def test_the_attention_post_follows_the_share_and_the_merge_is_on_every_rank():
+    f = [types.SimpleNamespace(rank=r, local_experts=100, ceiling_max_rows=100)
+         for r in range(3)]            # no misses: only the new posts remain
+    kw = dict(host=0, num_experts=512, ids_per_step=40, n_layers=48, fa_layers=12,
+              rows_per_round=4)
+    split = er.owned_round_ms(f, shares=(0, 32, 32), merged=True, **kw)
+    one = er.owned_round_ms(f, shares=(0, 64, 0), merged=True, **kw)
+    lse = 12 * er.OWNED_LSE_MS_PER_LAYER_SEED
+    floor = 12 * er.OWNED_ATTN_FLOOR_MS_SEED
+    row = er.OWNED_ATTN_MS_PER_ROW_SEED[1]
+    # the host holds no KV: only the merge
+    assert split[0] == pytest.approx(lse) and one[0] == pytest.approx(lse)
+    # a worker pays floor + rows x share x cost, plus the merge
+    assert split[1] == pytest.approx(lse + floor + 12 * 4 * 0.5 * row)
+    assert one[1] == pytest.approx(lse + floor + 12 * 4 * 1.0 * row)
+    assert one[2] == pytest.approx(lse)
+    # Form A: the host attends over the whole KV, no merge
+    base = er.owned_round_ms(f, shares=(1, 0, 0), merged=False, **kw)
+    assert base[0] == pytest.approx(floor + 12 * 4 * er.OWNED_ATTN_MS_PER_ROW_SEED[0])
+    assert base[1] == 0.0
+
+
+def test_the_solve_and_the_record_carry_the_attention_post():
+    src = inspect.getsource(er.solve_owned_cut)
+    assert "owned_round_ms(fits, shares=sh, merged=True, **kw)" in src
+    assert "merged=False" in src
+    plan_src = inspect.getsource(er.plan_d_residency)
+    for key in ('"attn_ms_per_row"', '"lse_ms_per_layer"', '"attn_source"', '"fa_layers"'):
+        assert key in plan_src
+    assert "rows_per_round=int(verify)" in plan_src
