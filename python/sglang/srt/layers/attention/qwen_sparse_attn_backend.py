@@ -606,7 +606,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if self.dcp_size <= 1:
             self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
             return
-        geo = getattr(self, "form_a_dcp", None)
+        geo = self.form_a_dcp
         if geo is not None:
             # #239 S3b collective A: the host's k/v reach every owner.
             from sglang.srt.layers.attention.qsa.form_a_dcp import share_kv
@@ -673,8 +673,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         prefix chunks) through the same launch (_qsa_rows_fused_route, H65)."""
         from sglang.srt.environ import envs
 
-        # getattr: the H65 wiring tests call this on a bare namespace
-        form_a = getattr(self, "form_a_dcp", None)
+        form_a = self.form_a_dcp
         if form_a is not None:
             # #239 S3b collective T: the indexer runs on the host only; every
             # owner resolves its rows from the host's top-k.
@@ -787,7 +786,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         from sglang.srt.runtime_context import get_parallel
 
         group = get_parallel().dcp_group
-        form_a = getattr(self, "form_a_dcp", None)
+        form_a = self.form_a_dcp
         counts = (
             form_a.q_counts
             if form_a is not None
