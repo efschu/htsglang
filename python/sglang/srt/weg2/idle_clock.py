@@ -87,11 +87,11 @@ class DaemonClient:
             raise ValueError(f"{ENV_ADDR}={self.addr!r}: want tcp:HOST:PORT or unix:/path")
         self._sock, self._buf = s, b""
 
-    def call(self, op: str) -> Dict:
+    def call(self, op: str, **extra) -> Dict:
         if self._sock is None:
             self._connect()
         assert self._sock is not None
-        self._sock.sendall((json.dumps({"op": op}) + "\n").encode())
+        self._sock.sendall((json.dumps({"op": op, **extra}) + "\n").encode())
         while b"\n" not in self._buf:
             chunk = self._sock.recv(4096)
             if not chunk:
@@ -164,9 +164,11 @@ class IdleClock:
         self.locked, self._down_logged = True, False
         self.counters["lock"] += 1
         logger.info("WEG2 IDLE-CLOCK LOCK rest_s=%.2f idle_s=%.2f rtt_ms=%.2f daemon_ms=%.3f cards=%s mhz=%s "
-                    "(the front rested in its idle layout with nothing in flight; the graphics clock is "
-                    "held at its floor until the next request or flip)",
-                    rest_s, self.idle_s, rtt_ms, float(r.get("ms", 0.0)), r.get("cards"), r.get("mhz"))
+                    "mem=%s mem_locked=%s mem_mhz=%s%s (the front rested in its idle layout with nothing in "
+                    "flight; the clocks are held at their floor until the next request or flip)",
+                    rest_s, self.idle_s, rtt_ms, float(r.get("ms", 0.0)), r.get("cards"), r.get("mhz"),
+                    r.get("mem_mode", "off"), r.get("mem_locked", False), r.get("mem_mhz"),
+                    f" mem_err={r['mem_err']}" if r.get("mem_err") else "")
 
     def _unlock(self, why: str) -> None:
         t0 = time.perf_counter()

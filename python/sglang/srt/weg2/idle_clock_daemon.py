@@ -27,7 +27,9 @@ daemon all leave the cards unlocked -- the rig then runs exactly as it did
 before this existed.
 
 PROTOCOL, one JSON object per line each way:
-    -> {"op": "lock"}   <- {"ok": true, "locked": true, "ms": 0.4, "cards": [...], "mhz": 210}
+    -> {"op": "lock"}   <- {"ok": true, "locked": true, "ms": 0.4, "cards": [...], "mhz": [210],
+                            "mem_mode": "lock", "mem_locked": true, "mem_mhz": [405]}
+       optional {"op": "lock", "mem": "off"|"lock"|"app"} overrides --mem for this lock
     -> {"op": "unlock"} <- {"ok": true, "locked": false, "ms": 0.3, ...}
     -> {"op": "status"} <- {"ok": true, "locked": ..., "holders": n, ...}
 ``ms`` is the NVML time of this op on this host, not the round trip.
@@ -52,12 +54,27 @@ DEFAULT_LISTEN = "tcp:172.17.0.1:8779"
 FALLBACK_MHZ = 210
 
 
+NVML_NOT_SUPPORTED = 3
+NVML_NO_PERMISSION = 4
+
+#: Memory-clock modes. The 3080 test (28.09., idle_clock_micro_0_0928_130702) showed the SM lock
+#: alone saves only 12 W (109.9 -> 98.3 W, still P2) because the memory clock keeps running at
+#: 9501 MHz; without a context the card sits at P8 / ~40 W. So the memory clock is the lever:
+#:   off  -- graphics clock only (the first version);
+#:   lock -- nvmlDeviceSetMemoryLockedClocks(min, min) (= nvidia-smi -lmc);
+#:   app  -- nvmlDeviceSetApplicationsClocks(mem_min, gfx at mem_min), the older interface, as a
+#:           fallback where -lmc is refused.
+MEM_MODES = ("off", "lock", "app")
+
+
 class NvmlError(RuntimeError):
-    pass
+    def __init__(self, msg: str, rc: int = -1) -> None:
+        super().__init__(msg)
+        self.rc = rc
 
 
 class Nvml:
-    """The five NVML calls this daemon needs, via ctypes (no pynvml on the host)."""
+    """The NVML calls this daemon needs, via ctypes (no pynvml on the host)."""
 
     def __init__(self, lib: str = "libnvidia-ml.so.1") -> None:
         self._l = ctypes.CDLL(lib)
@@ -66,7 +83,13 @@ class Nvml:
 
     def _ck(self, rc: int) -> None:
         if rc != 0:
-            raise NvmlError(f"NVML rc={rc} {self._l.nvmlErrorString(rc).decode(errors='replace')}")
+            raise NvmlError(f"NVML rc={rc} {self._l.nvmlErrorString(rc).decode(errors='replace')}", rc)
+
+    def _fn(self, name: str):
+        try:
+            return getattr(self._l, name)
+        except AttributeError:
+            raise NvmlError(f"NVML symbol {name} missing in this driver", NVML_NOT_SUPPORTED) from None
 
     def count(self) -> int:
         n = ctypes.c_uint()
@@ -83,27 +106,45 @@ class Nvml:
         self._ck(self._l.nvmlDeviceGetUUID(h, buf, ctypes.c_uint(96)))
         return buf.value.decode()
 
-    def min_graphics_mhz(self, h) -> int:
-        """Lowest graphics clock supported at the highest memory clock."""
+    def mem_clocks(self, h) -> List[int]:
         n = ctypes.c_uint(32)
         mem = (ctypes.c_uint * 32)()
         self._ck(self._l.nvmlDeviceGetSupportedMemoryClocks(h, ctypes.byref(n), mem))
-        top = max(mem[i] for i in range(n.value))
-        n2 = ctypes.c_uint(512)
+        return sorted(int(mem[i]) for i in range(n.value))
+
+    def gfx_clocks(self, h, mem_mhz: int) -> List[int]:
+        n = ctypes.c_uint(512)
         gfx = (ctypes.c_uint * 512)()
-        self._ck(self._l.nvmlDeviceGetSupportedGraphicsClocks(h, ctypes.c_uint(top), ctypes.byref(n2), gfx))
-        return int(min(gfx[i] for i in range(n2.value)))
+        self._ck(self._l.nvmlDeviceGetSupportedGraphicsClocks(h, ctypes.c_uint(mem_mhz), ctypes.byref(n), gfx))
+        return sorted(int(gfx[i]) for i in range(n.value))
+
+    def min_graphics_mhz(self, h) -> int:
+        """Lowest graphics clock supported at the highest memory clock."""
+        return self.gfx_clocks(h, self.mem_clocks(h)[-1])[0]
 
     def lock(self, h, lo: int, hi: int) -> None:
-        self._ck(self._l.nvmlDeviceSetGpuLockedClocks(h, ctypes.c_uint(lo), ctypes.c_uint(hi)))
+        self._ck(self._fn("nvmlDeviceSetGpuLockedClocks")(h, ctypes.c_uint(lo), ctypes.c_uint(hi)))
 
     def reset(self, h) -> None:
-        self._ck(self._l.nvmlDeviceResetGpuLockedClocks(h))
+        self._ck(self._fn("nvmlDeviceResetGpuLockedClocks")(h))
+
+    def lock_mem(self, h, lo: int, hi: int) -> None:
+        self._ck(self._fn("nvmlDeviceSetMemoryLockedClocks")(h, ctypes.c_uint(lo), ctypes.c_uint(hi)))
+
+    def reset_mem(self, h) -> None:
+        self._ck(self._fn("nvmlDeviceResetMemoryLockedClocks")(h))
+
+    def set_app(self, h, mem_mhz: int, gfx_mhz: int) -> None:
+        self._ck(self._fn("nvmlDeviceSetApplicationsClocks")(h, ctypes.c_uint(mem_mhz), ctypes.c_uint(gfx_mhz)))
+
+    def reset_app(self, h) -> None:
+        self._ck(self._fn("nvmlDeviceResetApplicationsClocks")(h))
 
 
 class Card:
-    def __init__(self, index: int, uuid: str, handle, mhz: int) -> None:
+    def __init__(self, index: int, uuid: str, handle, mhz: int, mem_min: int = 0, gfx_at_mem_min: int = 0) -> None:
         self.index, self.uuid, self.handle, self.mhz = index, uuid, handle, mhz
+        self.mem_min, self.gfx_at_mem_min = mem_min, gfx_at_mem_min
 
 
 def select_cards(nvml, spec: str, mhz_arg: str) -> List[Card]:
@@ -116,48 +157,98 @@ def select_cards(nvml, spec: str, mhz_arg: str) -> List[Card]:
         u = nvml.uuid(h)
         if want is not None and str(i) not in want and u not in want:
             continue
-        if mhz_arg == "auto":
-            try:
-                mhz = nvml.min_graphics_mhz(h)
-            except NvmlError as e:
-                logger.warning("IDLE-CLOCK-D card=%d supported-clock query failed (%s), floor %d MHz",
-                               i, e, FALLBACK_MHZ)
-                mhz = FALLBACK_MHZ
-        else:
+        mem_min = gfx_at_mem_min = 0
+        try:
+            mems = nvml.mem_clocks(h)
+            mem_min = mems[0]
+            gfx_at_mem_min = nvml.gfx_clocks(h, mem_min)[0]
+            mhz = nvml.gfx_clocks(h, mems[-1])[0]
+        except NvmlError as e:
+            logger.warning("IDLE-CLOCK-D card=%d supported-clock query failed (%s), floor %d MHz",
+                           i, e, FALLBACK_MHZ)
+            mhz = FALLBACK_MHZ
+        if mhz_arg != "auto":
             mhz = int(mhz_arg)
-        cards.append(Card(i, u, h, mhz))
+        cards.append(Card(i, u, h, mhz, mem_min, gfx_at_mem_min))
     if want is not None and len(cards) != len(want):
         raise SystemExit(f"--cards {spec}: matched {len(cards)} of {len(want)} cards")
     return cards
 
 
 class ClockState:
-    """Who holds the lock, and the NVML writes. No I/O besides NVML."""
+    """Who holds the lock, and the NVML writes. No I/O besides NVML.
 
-    def __init__(self, nvml, cards: Sequence[Card], clock=time.perf_counter) -> None:
-        self.nvml, self.cards, self._clock = nvml, list(cards), clock
+    The GRAPHICS lock is the lock: if it fails the whole lock is undone (fail-open). The MEMORY step
+    (``mem`` mode) is best effort on top of it: refused -> the graphics lock stays, the reply says
+    ``mem_locked: false`` and why, so the front's lock line and the micro test name it.
+    """
+
+    def __init__(self, nvml, cards: Sequence[Card], clock=time.perf_counter, mem: str = "off") -> None:
+        if mem not in MEM_MODES:
+            raise ValueError(f"mem mode {mem!r} not in {MEM_MODES}")
+        self.nvml, self.cards, self._clock, self.default_mem = nvml, list(cards), clock, mem
         self.holders: set = set()
         self.locked = False
+        self.mem_mode = "off"      # mode of the lock currently held
+        self.mem_locked = False
+        self.mem_err: List[str] = []
 
     def _reset_all(self) -> Tuple[float, List[str]]:
+        """Reset EVERYTHING this daemon can set, whatever it believes it set (start, stop, last holder)."""
         t0 = self._clock()
         errs = []
         for c in self.cards:
-            try:
-                self.nvml.reset(c.handle)
-            except NvmlError as e:
-                errs.append(f"card{c.index}: {e}")
-        self.locked = False
+            for name, fn in (("gfx", self.nvml.reset), ("mem", getattr(self.nvml, "reset_mem", None)),
+                             ("app", getattr(self.nvml, "reset_app", None))):
+                if fn is None:
+                    continue
+                try:
+                    fn(c.handle)
+                except NvmlError as e:
+                    # A mode never used on this card may be unsupported; only the gfx reset must work.
+                    if name == "gfx" or e.rc not in (NVML_NOT_SUPPORTED, NVML_NO_PERMISSION) or (
+                            self.locked and self.mem_locked and name == self.mem_mode):
+                        errs.append(f"card{c.index} {name}: {e}")
+        self.locked, self.mem_locked, self.mem_mode = False, False, "off"
         return (self._clock() - t0) * 1e3, errs
 
     def _reply(self, ok: bool, ms: float, errs: List[str], op: str) -> Dict:
         r = {"ok": ok, "op": op, "locked": self.locked, "ms": round(ms, 3), "holders": len(self.holders),
-             "cards": [c.index for c in self.cards], "mhz": [c.mhz for c in self.cards]}
+             "cards": [c.index for c in self.cards], "mhz": [c.mhz for c in self.cards],
+             "mem_mode": self.mem_mode, "mem_locked": self.mem_locked,
+             "mem_mhz": [c.mem_min for c in self.cards] if self.mem_locked else None}
+        if self.mem_err and self.locked:
+            r["mem_err"] = "; ".join(self.mem_err)
         if errs:
             r["err"] = "; ".join(errs)
         return r
 
-    def lock(self, who) -> Dict:
+    def _lock_mem(self, mode: str) -> List[str]:
+        errs, done = [], []
+        for c in self.cards:
+            try:
+                if not c.mem_min:
+                    raise NvmlError("no supported memory clock known", NVML_NOT_SUPPORTED)
+                if mode == "lock":
+                    self.nvml.lock_mem(c.handle, c.mem_min, c.mem_min)
+                else:
+                    self.nvml.set_app(c.handle, c.mem_min, c.gfx_at_mem_min or c.mhz)
+                done.append(c)
+            except NvmlError as e:
+                errs.append(f"card{c.index} {mode}: {e}")
+                break
+        if errs:  # all or nothing for the memory step too
+            for c in done:
+                try:
+                    (self.nvml.reset_mem if mode == "lock" else self.nvml.reset_app)(c.handle)
+                except NvmlError:
+                    pass
+        return errs
+
+    def lock(self, who, mem: Optional[str] = None) -> Dict:
+        mode = self.default_mem if mem is None else mem
+        if mode not in MEM_MODES:
+            return {"ok": False, "op": "lock", "err": f"mem mode {mode!r} not in {MEM_MODES}"}
         self.holders.add(who)
         if self.locked:
             return self._reply(True, 0.0, [], "lock")
@@ -177,7 +268,11 @@ class ClockState:
             self.holders.discard(who)
             self.locked = False
             return self._reply(False, (self._clock() - t0) * 1e3, [f"card{c.index}: {e}"], "lock")
-        self.locked = True
+        self.locked, self.mem_err = True, []
+        if mode != "off":
+            self.mem_err = self._lock_mem(mode)
+            self.mem_locked = not self.mem_err
+            self.mem_mode = mode if self.mem_locked else "off"
         return self._reply(True, (self._clock() - t0) * 1e3, [], "lock")
 
     def release(self, who, op: str = "unlock") -> Dict:
@@ -200,11 +295,12 @@ async def serve_conn(state: ClockState, reader: asyncio.StreamReader, writer: as
             if not line:
                 break
             try:
-                op = json.loads(line).get("op")
+                msg = json.loads(line)
+                op, mem = msg.get("op"), msg.get("mem")
             except (ValueError, AttributeError):
-                op = None
+                op, mem = None, None
             if op == "lock":
-                r = state.lock(who)
+                r = state.lock(who, mem)
             elif op == "unlock":
                 r = state.release(who)
             elif op == "status":
@@ -212,9 +308,10 @@ async def serve_conn(state: ClockState, reader: asyncio.StreamReader, writer: as
             else:
                 r = {"ok": False, "err": f"unknown op {op!r}"}
             if op in ("lock", "unlock"):
-                logger.info("IDLE-CLOCK-D %s ok=%s locked=%s ms=%.3f holders=%d peer=%s%s", op, r.get("ok"),
-                            r.get("locked"), r.get("ms", 0.0), r.get("holders", 0), peer,
-                            f" err={r['err']}" if "err" in r else "")
+                logger.info("IDLE-CLOCK-D %s ok=%s locked=%s mem=%s/%s ms=%.3f holders=%d peer=%s%s%s", op,
+                            r.get("ok"), r.get("locked"), r.get("mem_mode"), r.get("mem_locked"), r.get("ms", 0.0),
+                            r.get("holders", 0), peer, f" err={r['err']}" if "err" in r else "",
+                            f" mem_err={r['mem_err']}" if "mem_err" in r else "")
             writer.write((json.dumps(r) + "\n").encode())
             await writer.drain()
     except (ConnectionError, asyncio.IncompleteReadError):
@@ -243,10 +340,11 @@ def parse_listen(spec: str) -> Tuple[str, str, int]:
 
 async def amain(args) -> None:
     nvml = Nvml()
-    state = ClockState(nvml, select_cards(nvml, args.cards, args.mhz))
+    state = ClockState(nvml, select_cards(nvml, args.cards, args.mhz), mem=args.mem)
     ms, errs = state._reset_all()
-    logger.info("IDLE-CLOCK-D start cards=%s mhz=%s reset_ms=%.3f%s",
-                [(c.index, c.uuid) for c in state.cards], [c.mhz for c in state.cards], ms,
+    logger.info("IDLE-CLOCK-D start cards=%s mhz=%s mem=%s mem_min=%s gfx_at_mem_min=%s reset_ms=%.3f%s",
+                [(c.index, c.uuid) for c in state.cards], [c.mhz for c in state.cards], args.mem,
+                [c.mem_min for c in state.cards], [c.gfx_at_mem_min for c in state.cards], ms,
                 f" reset_err={errs}" if errs else "")
     servers = []
     for spec in args.listen:
@@ -279,6 +377,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ap.add_argument("--cards", default="all", help="all | NVML indices 0,2 | UUIDs")
     ap.add_argument("--mhz", default="auto",
                     help="locked graphics clock; auto = lowest supported at the top memory clock")
+    ap.add_argument("--mem", default="off", choices=MEM_MODES,
+                    help="memory clock while locked: off | lock (-lmc to the lowest supported) | app "
+                         "(application clocks, fallback); a lock request may override it with {\"mem\": ...}")
     args = ap.parse_args(argv)
     args.listen = args.listen or [DEFAULT_LISTEN]
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", stream=sys.stdout)
