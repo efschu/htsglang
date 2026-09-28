@@ -9061,6 +9061,18 @@ class SchedulerWeightUpdaterManager:
             # 2026-09-15: the depositor confirms every outstanding drain
             # (the last `depth` tags per lane) and frees its on-card staging.
             self._weg2_xchg_drain_outstanding()
+            # W109b: tags spilled out of a credit cycle are fed from host
+            # memory behind the pauses; the leg is whole once they are through
+            # (every tag is paused now, so no waker still waits on this rank).
+            _b1_bl = getattr(self, "_weg2_bar1", None)
+            if _b1_bl is not None and hasattr(_b1_bl, "join_backlog"):
+                _bl_why = _b1_bl.join_backlog(WEG2_GROUP_FENCE_BUDGET_S)
+                if _bl_why:
+                    from sglang.srt.weg2 import weight_exchange as _wx_bl
+
+                    raise _wx_bl.Weg2XchgPlanDisagree(
+                        f"W68 Weg2XchgPlanDisagree: W109b backlog of this sleep leg "
+                        f"refused: {_bl_why}")
             logger.info(
                 "WEG2-CHUNK-BYTES sleep tags=%s host_image_delta=%.0f MiB (RssShmem %.0f -> %.0f MiB, "
                 "/proc/self/status; CROSS-CHECK ONLY -- tms_tag_bytes above is the instrument, and this "
