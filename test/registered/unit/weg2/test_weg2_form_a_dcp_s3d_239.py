@@ -9,7 +9,11 @@ must now ask whether this rank holds rows:
 * H98/H97 (tp_match_floor): a worker's usable vote is its REAL KV reach, so it
   can take the group below the host -- a named line, never a silent floor;
 * #59 (weg2_resumable_depth): the depth is the group MIN (host admission,
-  worker KV reach), not the host's alone.
+  worker KV reach), not the host's alone;
+* H105: the admission gate is the group MIN (a gather in place of the
+  host's broadcast);
+* S3e: the launch refusal of the cut reads the seam register (F13 -- the
+  worker's bytes in the host tier and store -- is still open).
 
 RED on cdd6522981: the predicate does not exist, a Form A worker names no
 depth and enters no reduce, and a worker-lowered floor is silent.
@@ -239,6 +243,51 @@ class TestAdmissionVerdictIsTheGroupMin(unittest.TestCase):
         self.assertIn("form_a_token_cut_active()", src)
         self.assertIn("gather=_gather", src)
         self.assertIn("all_gather_object", inspect.getsource(sch.Scheduler._form_a_tp_gather))
+
+
+class TestTokenCutRiegel(unittest.TestCase):
+    """S3e: the launch refusal of kv=qsa_forma_dcp reads the seam register."""
+
+    def _ns(self, dry=False):
+        return types.SimpleNamespace(dry_run=dry, d_kv_token_cut="joint")
+
+    def test_the_riegel_names_the_unwired_seam(self):
+        """RED ON cdd6522981: the refusal was unconditional prose ("the
+        workers attend nothing") -- true before S3c, false after it -- and
+        would never lift."""
+        from sglang.srt.weg2 import launcher as L
+
+        self.assertEqual(rank_role.TOKEN_CUT_SEAMS, ("F4", "F5", "F12", "F13"))
+        self.assertEqual(rank_role.unwired_token_cut_seams(), ("F13",))
+        with self.assertRaisesRegex(L.Weg2TokenCutNotWired, r"seam\(s\) F13 unwired.*#239 S3"):
+            L.refuse_unwired_token_cut(self._ns(), types.SimpleNamespace(kv="qsa_forma_dcp"))
+        L.refuse_unwired_token_cut(self._ns(dry=True), types.SimpleNamespace(kv="qsa_forma_dcp"))
+
+    def test_the_riegel_lifts_when_every_seam_is_built(self):
+        import dataclasses
+
+        from sglang.srt.weg2 import launcher as L
+
+        built = dict(rank_role.SEAMS)
+        built["F13"] = dataclasses.replace(built["F13"], wired=True)
+        with mock.patch.object(rank_role, "SEAMS", built):
+            self.assertEqual(rank_role.unwired_token_cut_seams(), ())
+            L.refuse_unwired_token_cut(self._ns(), types.SimpleNamespace(kv="qsa_forma_dcp"))
+        f5_open = dict(rank_role.SEAMS)
+        f5_open["F5"] = dataclasses.replace(f5_open["F5"], wired=False)
+        with mock.patch.object(rank_role, "SEAMS", f5_open):
+            with self.assertRaisesRegex(L.Weg2TokenCutNotWired, "F5, F13"):
+                L.refuse_unwired_token_cut(self._ns(), types.SimpleNamespace(kv="qsa_forma_dcp"))
+
+    def test_the_f13_anchors_hit(self):
+        import os
+
+        root = os.path.dirname(rank_role.__file__)
+        for rel, line, needle in rank_role.SEAMS["F13"].anchors:
+            lines = open(os.path.join(root, rel)).read().splitlines()
+            window = "\n".join(lines[max(0, line - 6): line + 5])
+            self.assertIn(needle, window, f"{rel}:{line}")
+        self.assertIn("F13", rank_role.UNWIRED_ORDER)
 
 
 if __name__ == "__main__":
