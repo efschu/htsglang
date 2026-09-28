@@ -5910,8 +5910,8 @@ class Front:
                         skip_leg1=True, store_span_est=store_span)
             self.queue.append(p)
             self._dp_mark(p, "carrier")  # R28
-            self._arm_client_watch(request, rid, p)  # H102
             self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
+            self._arm_client_watch(request, rid, p)  # H102
             try:
                 await fut
             except Weg2Stop as e:
@@ -6029,8 +6029,8 @@ class Front:
                 self.counters["short_kept_queue"] += 1
             self.queue.append(p)
         self._dp_mark(p, "long" if route == "long" else "batch")  # R28
-        self._arm_client_watch(request, rid, p)  # H102
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
+        self._arm_client_watch(request, rid, p)  # H102
         logger.info("WEG2-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d)",
                     rid, self.awake, self.admit_d, est_prompt, remainder, len(self.queue))
         self._maybe_ple_admit_hint(p)  # fnFL2 H43
