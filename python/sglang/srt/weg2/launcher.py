@@ -2570,6 +2570,19 @@ D_KV_STAGE_KEYS = ("SGLANG_WEG2_D_KV_STAGE_TOKENS", "SGLANG_WEG2_D_KV_STAGE_ROWS
 D_KV_STAGE_BY_DEMAND_KEY = "SGLANG_WEG2_D_KV_STAGE_BY_DEMAND"
 
 
+def d_kv_stage_tokens_named(ns) -> Optional[Tuple[int, ...]]:
+    """#239 S3h: the KV stage tokens the operator names in --env-d
+    (``SGLANG_WEG2_D_KV_STAGE_TOKENS``), or None when the D group's env does
+    not name them (the launcher would then write its own stage form)."""
+    raw = parse_group_env(str(getattr(ns, "env_d", "") or "")).get(D_KV_STAGE_KEYS[0])
+    if raw is None:
+        return None
+    try:
+        return tuple(int(float(x)) for x in str(raw).split(",") if x.strip())
+    except ValueError:
+        return ()
+
+
 def d_kv_stage_by_demand(env: Mapping[str, str]) -> bool:
     """#251d: SGLANG_WEG2_D_KV_STAGE_BY_DEMAND truthy in the D group's env."""
     return str((env or {}).get(D_KV_STAGE_BY_DEMAND_KEY, "")).strip().lower() in (
@@ -4470,38 +4483,76 @@ def refuse_unwired_token_cut(ns, boot_form) -> None:
 
 
 class Weg2TokenCutFlipNotWired(Weg2LaunchRefused):
-    """#239 S3h: a FLIP boot under the token cut (``kv=qsa_forma_dcp`` with P).
+    """#239 S3h: a FLIP boot under the token cut (``kv=qsa_forma_dcp`` with P)
+    in a form whose P->D hand-off is not wired.
 
-    The runtime half of the cut is wired for group D alone (S3a-e, S4a/S4b:
-    F4/F5/F12/F14), but the P->D hand-off under it is not: P writes whole
-    canonical pages, the D workers would have to take exactly their owner rows
-    in every wake path (dormant refetch, PREFETCH-COMPLETE / #580 vote, #988
-    loadback, tail adopt), and the wake credit per card moves with the KV bytes
-    (TP0 -, workers +). Until S3h builds and proves that, a flip boot under the
-    cut stops here by name; ``--d-only`` (H87) is the boot the cut runs in.
+    The wired form (S3h, 28.09.): the hand-off rides the ONE arena L2 and the
+    canonical page store. P writes whole geometry-neutral pages (#706); a D
+    worker that owns rows reads exactly its extents of them through its own
+    L2 binding (S4b part 3, ArenaMHAHostPool with owner rows) and its KV
+    window of the file backend (part 2); tail adopt is per owner (part 5);
+    the claim of every wake-path prefetch is the group MIN (the worker votes
+    in the min arm only, ``cache_controller.claim_vote_min_only``); the wake
+    credit is taken per rank against its own card at run time (the KV resume
+    EARLY only when the card funds it, else after the legs). A flip boot
+    WITHOUT a host tier (``--weg2-disable-hicache``) has no carrier for the
+    cut's rows and stops here by name; ``--d-only`` (H87) boots either way.
     """
 
 
-#: #239 S3h: the marker of the flip refusal and of its dry-run line.
+#: #239 S3h: the marker of the flip riegel line (refusal and allowance).
 KV_TOKEN_CUT_FLIP_MARKER = "#239 S3h FLIP UNTER KV-TOKEN-SCHNITT"
 
 
 def refuse_flip_under_token_cut(ns, boot_form) -> Optional[str]:
-    """#239 S3h: refuse a flip boot (P and D) of ``kv=qsa_forma_dcp``.
+    """#239 S3h: the flip boot (P and D) of ``kv=qsa_forma_dcp``.
 
-    None for every other form and for ``--d-only``. A dry run prints the line
-    and returns it (the planned form is still shown in full); a real boot
-    raises :class:`Weg2TokenCutFlipNotWired`."""
+    None for every other form and for ``--d-only``. A flip boot with a host
+    tier is the wired form: the line names what carries the cut and is
+    returned. A flip boot without one is refused by name (a dry run prints
+    the line with 'would refuse' and returns it; a real boot raises
+    :class:`Weg2TokenCutFlipNotWired`)."""
     if boot_form is None or boot_form.kv != "qsa_forma_dcp" or getattr(ns, "d_only", False):
         return None
-    msg = (f"{KV_TOKEN_CUT_FLIP_MARKER}: --d-kv-token-cut {ns.d_kv_token_cut} "
-           "(form kv=qsa_forma_dcp) in a FLIP boot -- the P->D hand-off under the "
-           "cut is not built (the D workers' owner rows in the wake paths and the "
-           "wake credit per card, #239 S3h). Boot the cut with --d-only.")
-    if getattr(ns, "dry_run", False):
-        print(msg + " (dry run: would refuse)", flush=True)
-        return msg
-    raise Weg2TokenCutFlipNotWired(msg)
+    from sglang.srt import rank_role
+
+    why = []
+    missing = rank_role.unwired_token_cut_seams()
+    if missing:
+        why.append("seam(s) %s unwired (%s)" % (
+            ", ".join(missing), "; ".join(rank_role.SEAMS[m].what for m in missing)))
+    if getattr(ns, "weg2_disable_hicache", False):
+        why.append(
+            "--weg2-disable-hicache: the P->D hand-off under the cut rides the "
+            "arena L2 and the canonical store (the D workers read their owner "
+            "rows of P's pages), and this boot has neither")
+    stages = d_kv_stage_tokens_named(ns)
+    if stages is None or len(stages) != 1:
+        why.append(
+            "the D KV stage form is %s -- under the cut exactly ONE stage "
+            "(--env-d %s=<tokens>): #251c raises max_total to the top stage on "
+            "every rank and a KV-holding worker would build its pool for it "
+            "(S3g open)" % ("not named" if stages is None else "%d stages %s" % (len(stages), list(stages)),
+                            D_KV_STAGE_KEYS[0]))
+    if why:
+        msg = (f"{KV_TOKEN_CUT_FLIP_MARKER}: --d-kv-token-cut {ns.d_kv_token_cut} "
+               "(form kv=qsa_forma_dcp) in a FLIP boot refused -- "
+               + " | ".join(why) + ". The cut boots with --d-only either way.")
+        if getattr(ns, "dry_run", False):
+            print(msg + " (dry run: would refuse)", flush=True)
+            return msg
+        raise Weg2TokenCutFlipNotWired(msg)
+    msg = (f"{KV_TOKEN_CUT_FLIP_MARKER} ERLAUBT: --d-kv-token-cut {ns.d_kv_token_cut} "
+           f"({D_KV_STAGE_KEYS[0]}={stages[0]}) "
+           "im Flip-Boot -- Traeger: das eine Arena-L2 und der kanonische "
+           "Seitenspeicher (P schreibt ganze Seiten, die KV-Worker lesen ihre "
+           "Owner-Zeilen, Tail-Adopt je Owner), Claim = Gruppen-MIN (Worker nur "
+           "im MIN-Arm), Wake-Kredit je Rang gegen die eigene Karte, eine "
+           "KV-Stufe (#251c-Stufenform aus bis S3g). Metall-Marker: "
+           "'#239 F14 KV-WORKER-WINDOW' auf TP1/TP2, 'WEG2-WAKE-KV-FIRST' je Rang, "
+           "kein 'DRAFT-DISAGREE'.")
+    print(msg, flush=True)
+    return msg
 
 
 #: #239 S3f: the marker of the published ownership.
@@ -18429,8 +18480,10 @@ def build_parser() -> argparse.ArgumentParser:
              "(max-min of the resident expert share per card); 'owned' (S3f, the "
              "target form) holds the attention host at share 0 and solves the "
              "workers' shares, FR_D and the MoE ownership (--rank-moe-ratio) "
-             "together (min max miss time, x1 rule). A flip boot under any cut is "
-             "refused by name until S3h (--d-only boots it).")
+             "together (min max miss time, x1 rule). A flip boot under the cut "
+             "(S3h) needs the host tier and exactly one D KV stage "
+             "(--env-d SGLANG_WEG2_D_KV_STAGE_TOKENS=<tokens>), else it is "
+             "refused by name (--d-only boots it either way).")
     ap.add_argument(
         "--d-foreign-context-mib", default="",
         help="#145 Term (b): je D-RANG (ordinal) der VRAM, den die SCHLAFENDE "
