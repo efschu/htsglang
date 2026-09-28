@@ -625,6 +625,23 @@ def resolve_draft_claim(kv_pages: int, draft_pages: int, chunk_pages: int, repro
 #: returns.
 STORAGE_THREAD_JOIN_BOUND_S = 10.0
 
+#: WAKE-PARALLEL (28.09., NF rc12z22 D 14:56:23): the store->host reads of the
+#: operations the prefetch loop hands over run on this many aux threads instead
+#: of one. The five reads the wake issued for its parked requests ran one after
+#: the other (WEG2-LOAD-DEVICE queue_ms 364 / 1028 / 1859 / 2402 / 2750 for
+#: read_ms 681 / 854 / 557 / 350 / 378) -- the last one waited 2.75 s for four
+#: reads it shares nothing with. ``1`` = the single aux thread as before.
+PREFETCH_IO_WORKERS_ENV = "SGLANG_HICACHE_PREFETCH_IO_WORKERS"
+PREFETCH_IO_WORKERS_DEFAULT = 4
+
+
+def prefetch_io_workers() -> int:
+    try:
+        n = int(os.environ.get(PREFETCH_IO_WORKERS_ENV, "") or PREFETCH_IO_WORKERS_DEFAULT)
+    except ValueError:
+        return PREFETCH_IO_WORKERS_DEFAULT
+    return max(1, min(16, n))
+
 
 class StorageStopResult(NamedTuple):
     """What ``_stop_storage_threads`` did, for the ONE '#1068 RESET JOIN' line
@@ -1159,6 +1176,9 @@ class HiCacheController:
         # loop holds it, and the tree's `ongoing_prefetch` stays the record.
         self._prefetch_current: Optional[PrefetchOperation] = None
         self._prefetch_io_current: Optional[PrefetchOperation] = None
+        # WAKE-PARALLEL: every operation an aux thread holds (id -> op); the
+        # pointer above stays the one most recently taken
+        self._prefetch_io_inflight: dict = {}
         # Operations a loop consumed AFTER the stop event was set (one counter
         # per loop, single writer each); summed into the RESET JOIN line.
         self._prefetch_drained_after_stop = 0
@@ -1331,6 +1351,7 @@ class HiCacheController:
         # #1068 (A12.4): a fresh pipeline holds nothing and has drained nothing.
         self._prefetch_current = None
         self._prefetch_io_current = None
+        self._prefetch_io_inflight = {}
         # HICACHE-NEVER-SLOW: the L3 write-behind yields while a load is queued
         try:
             from sglang.srt.mem_cache import l3_write_behind as _l3wb
@@ -1399,6 +1420,8 @@ class HiCacheController:
         # first _start_storage_threads has not published these pointers yet.
         take(getattr(self, "_prefetch_current", None))
         take(getattr(self, "_prefetch_io_current", None))
+        for op in list((getattr(self, "_prefetch_io_inflight", None) or {}).values()):
+            take(op)  # WAKE-PARALLEL: every aux thread's operation
         for op in seen.values():
             op.mark_terminate()
         return len(seen)
@@ -1463,7 +1486,8 @@ class HiCacheController:
             if hasattr(self, "backup_queue"):
                 self.backup_queue.put_nowait(None)
             if hasattr(self, "prefetch_buffer"):
-                self.prefetch_buffer.put_nowait(None)
+                for _ in range(max(1, len(getattr(self, "prefetch_io_aux_threads", None) or ()))):
+                    self.prefetch_buffer.put_nowait(None)
         except Exception:
             pass
 
@@ -1473,8 +1497,12 @@ class HiCacheController:
             threads.append(("prefetch", self.prefetch_thread))
         if hasattr(self, "backup_thread"):
             threads.append(("backup", self.backup_thread))
-        if hasattr(self, "prefetch_io_aux_thread"):
-            threads.append(("prefetch_io_aux", self.prefetch_io_aux_thread))
+        _aux = list(getattr(self, "prefetch_io_aux_threads", None) or ())
+        if hasattr(self, "prefetch_io_aux_thread") and not any(
+                t is self.prefetch_io_aux_thread for t in _aux):
+            _aux.insert(0, self.prefetch_io_aux_thread)
+        for _k, _t in enumerate(_aux):
+            threads.append(("prefetch_io_aux" if _k == 0 else f"prefetch_io_aux{_k}", _t))
 
         for _, t in threads:
             try:
@@ -3798,6 +3826,9 @@ class HiCacheController:
                 # the operation itself (stop already set), or the pointer was
                 # published before `_terminate_inflight_prefetch` read it.
                 self._prefetch_io_current = operation
+                _inflight = getattr(self, "_prefetch_io_inflight", None)
+                if _inflight is not None:
+                    _inflight[id(operation)] = operation
                 if self.storage_stop_event.is_set():
                     operation.mark_terminate()
                     self._prefetch_io_drained_after_stop += 1
@@ -3860,7 +3891,14 @@ class HiCacheController:
                         )
                 continue
             finally:
-                self._prefetch_io_current = None
+                _inflight = getattr(self, "_prefetch_io_inflight", None)
+                if _inflight is None:
+                    self._prefetch_io_current = None
+                else:
+                    if operation is not None:
+                        _inflight.pop(id(operation), None)
+                    # WAKE-PARALLEL: the pointer names an operation still held, if any
+                    self._prefetch_io_current = next(iter(list(_inflight.values())), None)
 
     @property
     def prefetch_capacity_fraction(self) -> float:
@@ -4196,19 +4234,36 @@ class HiCacheController:
         or in flight on the aux thread -- the L3 write-behind's yield signal."""
         n = int(getattr(getattr(self, "prefetch_queue", None), "qsize", lambda: 0)())
         n += int(getattr(getattr(self, "prefetch_buffer", None), "qsize", lambda: 0)())
-        if getattr(self, "_prefetch_io_current", None) is not None:
+        _inflight = getattr(self, "_prefetch_io_inflight", None)
+        if _inflight:
+            n += len(_inflight)
+        elif getattr(self, "_prefetch_io_current", None) is not None:
             n += 1
         return n
+
+    def _start_prefetch_io_workers(self) -> list:
+        """WAKE-PARALLEL: n aux threads take the operations off
+        ``prefetch_buffer``; the first keeps its old name for the join."""
+        self.prefetch_io_aux_threads = [
+            threading.Thread(target=self.prefetch_io_aux_func, daemon=True,
+                             name=f"hicache-prefetch-io-{k}")
+            for k in range(prefetch_io_workers())
+        ]
+        self.prefetch_io_aux_thread = self.prefetch_io_aux_threads[0]
+        for _t in self.prefetch_io_aux_threads:
+            _t.start()
+        if len(self.prefetch_io_aux_threads) > 1:
+            logger.info("WAKE-PARALLEL prefetch io workers=%d (%s; 1 = one aux thread as before)",
+                        len(self.prefetch_io_aux_threads), PREFETCH_IO_WORKERS_ENV)
+        return self.prefetch_io_aux_threads
 
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
         """
         self.prefetch_buffer = Queue()
-        self.prefetch_io_aux_thread = threading.Thread(
-            target=self.prefetch_io_aux_func, daemon=True
-        )
-        self.prefetch_io_aux_thread.start()
+        # class-bound: the loop is driven with bare stand-ins in its tests
+        HiCacheController._start_prefetch_io_workers(self)
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
