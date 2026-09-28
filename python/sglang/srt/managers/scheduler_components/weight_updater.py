@@ -130,11 +130,29 @@ def _weg2_group_stop_on_leg_failure(fn):
 
     @functools.wraps(fn)
     def wrapper(self, recv_req):
+        # L3-REUSE 0928: the L3 write-behind is quiet while a leg runs here
+        # (and after a sleep leg until the wake) -- the legs own the arena and
+        # the lanes. The existing leg bracket, no new clock.
+        _l3wb_ok = False
         try:
-            return fn(self, recv_req)
+            from sglang.srt.mem_cache import l3_write_behind as _l3wb
+
+            _l3wb.leg_enter(fn.__name__, getattr(self, "scheduler", None))
+        except Exception:  # noqa: BLE001 - never the leg
+            _l3wb = None
+        try:
+            out = fn(self, recv_req)
+            _l3wb_ok = True
+            return out
         except Exception as exc:
             self._weg2_leg_failed(f"{fn.__name__} FAILED on this rank", exc)
             raise
+        finally:
+            if _l3wb is not None:
+                try:
+                    _l3wb.leg_exit(fn.__name__, _l3wb_ok)
+                except Exception:  # noqa: BLE001
+                    pass
 
     return wrapper
 

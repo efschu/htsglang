@@ -586,6 +586,18 @@ class Envs:
     SGLANG_WEG2_PARK_DEMOTE_S = EnvFloat(1.0)
     # PARK_DEMOTE_BATCH (#248): pages copied per write batch of the demoter.
     SGLANG_WEG2_PARK_DEMOTE_BATCH = EnvInt(256)
+    # L3_WRITE_BEHIND_S (L3-REUSE 0928, NF rc12z13: the first request after a
+    # boot read 399 of 512 KV pages from L3 -- the rest had been in the
+    # boot's /dev/shm arena only -- and the QSA index for 47): the tick of the
+    # background thread (the persistent store's index owner, P PP0 and D TP0,
+    # never a scheduler thread) that copies every COMPLETE L2 arena page
+    # without an L3 copy to the persistent disk store, without freeing it. A
+    # restart then resumes from L3 instead of re-prefilling. 0 = L3 is written
+    # only when a page leaves L2 (the pre-0928 form).
+    SGLANG_WEG2_L3_WRITE_BEHIND_S = EnvFloat(2.0)
+    # L3_WRITE_BEHIND_MIB: bytes copied per arena and pass (KV 786 KiB pages:
+    # 325 per pass; mamba blobs 56 MiB: 4 per pass).
+    SGLANG_WEG2_L3_WRITE_BEHIND_MIB = EnvInt(256)
     # IDLE_VOTE_FRESHNESS (fnFL2 H77, #1268): PP0 reads a landed idle lap as
     # the PP group's /flush_cache verdict only while the state it witnessed
     # holds -- the lap of PP0's latest stamp, PP0 neither asleep nor busy

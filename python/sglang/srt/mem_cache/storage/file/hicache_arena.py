@@ -273,6 +273,10 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_ref_slots.argtypes = [p_u8, i64, p_i64, ctypes.c_int32]
             lib.arena_data_offset.restype = i64
             lib.arena_data_offset.argtypes = [p_u8]
+            lib.arena_complete_census.restype = i64
+            lib.arena_complete_census.argtypes = [p_u8, i64, p_i64, p_i64, p_u64, p_u64]
+            lib.arena_pin_complete.restype = i64
+            lib.arena_pin_complete.argtypes = [p_u8, i64, p_i64, p_u64, p_u64, p_i8]
             _lib = lib
             return lib
         except Exception as e:  # noqa: BLE001 - the arena is optional
@@ -619,6 +623,54 @@ class ShmArena:
             return self._ref_ledgered(np.asarray([int(s) for s in slots], dtype=np.int64), int(delta))
         c = (ctypes.c_int64 * n)(*[int(s) for s in slots])
         return int(self._lib.arena_ref_slots(self._base, n, c, int(delta)))
+
+    def complete_census(self):
+        """L3-REUSE 0928: ``(slots, gens, key_lo, key_hi)`` of every COMPLETE
+        slot as numpy arrays, from ONE C call (arena_complete_census)."""
+        import numpy as np
+
+        n = int(self.slots)
+        slots = np.empty(n, dtype=np.int64)
+        gens = np.empty(n, dtype=np.int64)
+        klo = np.empty(n, dtype=np.uint64)
+        khi = np.empty(n, dtype=np.uint64)
+        P64 = ctypes.POINTER(ctypes.c_int64)
+        PU64 = ctypes.POINTER(ctypes.c_uint64)
+        got = int(self._lib.arena_complete_census(
+            self._base, n, slots.ctypes.data_as(P64), gens.ctypes.data_as(P64),
+            klo.ctypes.data_as(PU64), khi.ctypes.data_as(PU64)))
+        return slots[:got], gens[:got], klo[:got], khi[:got]
+
+    def pin_complete(self, slots, klo, khi):
+        """L3-REUSE 0928: pin each slot still COMPLETE under that key (one C
+        call); returns a numpy bool mask of the pinned ones. The caller unpins
+        exactly those with :meth:`unpin`."""
+        import numpy as np
+
+        s = np.ascontiguousarray(slots, dtype=np.int64)
+        lo = np.ascontiguousarray(klo, dtype=np.uint64)
+        hi = np.ascontiguousarray(khi, dtype=np.uint64)
+        n = int(s.shape[0])
+        ok = np.zeros(max(1, n), dtype=np.int8)
+        if n:
+            self._lib.arena_pin_complete(
+                self._base, n, s.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                lo.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+                hi.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+                ok.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
+        return ok[:n].astype(bool)
+
+    def unpin(self, slots) -> int:
+        """Give back the pins of :meth:`pin_complete` (raw, past the ledger:
+        the write-behind is no holder)."""
+        import numpy as np
+
+        s = np.ascontiguousarray(slots, dtype=np.int64)
+        n = int(s.shape[0])
+        if not n:
+            return 0
+        return int(self._lib.arena_ref_slots(
+            self._base, n, s.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)), -1))
 
     def data_offset(self) -> int:
         """Byte offset of slot 0's data inside the mapping."""

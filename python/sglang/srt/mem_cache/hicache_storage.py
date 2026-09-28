@@ -1339,6 +1339,9 @@ class HiCacheFile(HiCacheStorage):
         # prefetch collective.
         self._l3p_register_suffixes(shared_keys)
         self._l3p_open_index_eagerly()
+        # L3-REUSE 0928: armed at attach (persistent store, index owner); the
+        # thread itself starts with the first arena this process opens.
+        self._l3wb_armed = True
 
     # ------------------------------------------------------------------ L3P
     @staticmethod
@@ -2714,7 +2717,221 @@ class HiCacheFile(HiCacheStorage):
                            int(total_bytes), type(e).__name__, str(e)[:160])
             arena = None
         arenas[total_bytes] = arena
+        if arena is not None:
+            self._l3_write_behind_start()
         return arena
+
+    # -- L3-REUSE 0928: the persistent L3 holds what L2 holds -----------------
+    def _l3_write_behind_start(self) -> bool:
+        """Start this process's L3 write-behind thread (once per backend).
+
+        Only on a PERSISTENT store (L3P: ``L3_IDENTITY.json``, the directory
+        the next boot reattaches to) and only on the rank that owns the
+        store's LRU index (one per group: P PP0, D TP0) -- the arenas are
+        shared by every rank of both groups, so one reader sees every page.
+        ``SGLANG_WEG2_L3_WRITE_BEHIND_S`` = 0 keeps the pre-0928 form (L3 is
+        written only when a page leaves L2)."""
+        if getattr(self, "_l3wb_thread", None) is not None:
+            return False
+        if not getattr(self, "_l3wb_armed", False):
+            # a backend that never ran __init__ (unit-test scaffolds) has no
+            # attach to arm it; the pass itself stays callable
+            return False
+        try:
+            every = float(envs.SGLANG_WEG2_L3_WRITE_BEHIND_S.get() or 0.0)
+            if every <= 0 or not self._l3p_persistent_dir():
+                return False
+            ev = getattr(self, "_evictor", None)
+            if ev is not None and not getattr(ev, "_is_storage_owner", True):
+                return False
+        except Exception:  # noqa: BLE001 - a bare backend (unit tests) has no store
+            return False
+        stop = threading.Event()
+        self._l3wb_stop = stop
+
+        def _run():
+            fails = 0
+            while not stop.wait(every):
+                try:
+                    self.l3_write_behind_pass()
+                except Exception as exc:  # noqa: BLE001 - never takes the process down
+                    fails += 1
+                    if fails <= 8 or fails % 256 == 0:
+                        logger.warning("L3-REUSE WRITE-BEHIND pass failed (n=%d): %r", fails, exc)
+
+        t = threading.Thread(target=_run, name="weg2-l3-write-behind", daemon=True)
+        self._l3wb_thread = t
+        t.start()
+        logger.info(
+            "L3-REUSE WRITE-BEHIND started (every %.1f s, %d MiB per arena and pass, store %s): "
+            "every COMPLETE L2 arena page gets its L3 copy, so a restart resumes from L3",
+            every, int(self._l3_write_behind_budget() >> 20), self.file_path,
+        )
+        return True
+
+    @staticmethod
+    def _l3_write_behind_budget() -> int:
+        try:
+            return max(1, int(envs.SGLANG_WEG2_L3_WRITE_BEHIND_MIB.get())) << 20
+        except Exception:  # noqa: BLE001
+            return 256 << 20
+
+    def l3_write_behind_pass(self, budget_bytes: Optional[int] = None, quiet=None) -> dict:
+        """One pass: every COMPLETE page of every arena this process opened
+        that has no L3 copy yet is copied to the disk store WITHOUT being
+        freed, up to ``budget_bytes`` per arena.
+
+        L3-REUSE 0928 (NF boot rc12z13, first request after the boot):
+        ``#1472 READ-TRACE asked=512 readable=399 first_missing=eb5869b2...
+        why=no-file``. The L2 arena lives in /dev/shm under the BOOT tag and
+        dies with the boot; before this pass the disk store saw a page only
+        when it LEFT L2 (claim room #257 d, QSA arena full, park demote), so
+        every page still in L2 at the end of a boot -- the hot tail of every
+        live conversation, up to 5461 KV pages = 349k tokens -- was lost and
+        re-prefilled after the restart. The persistent L3 is only persistent
+        for what reaches it.
+
+        Never against the flip, never against the scheduler:
+        * quiet while a leg runs, while this group sleeps and while it is
+          dormant (``l3_write_behind.quiet``: the existing leg bracket and
+          W25 ``weg2_dormant``, no clock) -- checked before every batch;
+        * no per-slot Python: the census of COMPLETE slots is ONE C call
+          (``arena_complete_census``), the pages already secured are filtered
+          by numpy on (slot, generation, key), pinning is one C call
+          (``arena_pin_complete``) and the bytes go arena mapping -> file in
+          ONE ``pageio.write_pages`` call per batch (#1402, GIL released) --
+          no host copy, the same buffered writer every L3 page uses;
+        * each (slot, generation) is written at most once: a page the L3
+          cap evicts later is not written again while it sits in the same
+          slot (no write/evict ping-pong); a refused reservation (cap or
+          min-free) ends this arena's pass instead of retrying page by page.
+        """
+        import numpy as np
+
+        from sglang.srt.mem_cache import l3_write_behind as _gate
+        from sglang.srt.mem_cache.canonical_page_store import canonical_fsync_default
+        from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
+
+        quiet = _gate.quiet_reason if quiet is None else quiet
+        budget = int(budget_bytes) if budget_bytes else self._l3_write_behind_budget()
+        tot = {"arenas": 0, "complete": 0, "new": 0, "on_disk": 0, "written": 0,
+               "pending": 0, "refused": 0, "bytes": 0, "paused": None}
+        t0 = time.perf_counter()
+        c0 = time.thread_time()
+        why = quiet()
+        if (why or "open") != getattr(self, "_l3wb_gate", "open"):
+            # one line per gate change: the metal shows the pass stops at the
+            # flip's first leg and resumes after the wake, never in between
+            logger.info("L3-REUSE WRITE-BEHIND gate=%s (was %s)", why or "open",
+                        getattr(self, "_l3wb_gate", "open"))
+            self._l3wb_gate = why or "open"
+        if why:
+            tot["paused"] = why
+            return tot
+        pio = _load_pageio()
+        if pio is None:
+            return tot
+        fsync = canonical_fsync_default()
+        chunk = 64
+        for arena in [a for a in list((getattr(self, "_arenas", None) or {}).values()) if a is not None]:
+            tot["arenas"] += 1
+            nslots = int(arena.slots)
+            sec = getattr(arena, "_l3wb_sec", None)
+            if sec is None:
+                sec = arena._l3wb_sec = (np.full(nslots, -1, dtype=np.int64),
+                                         np.zeros(nslots, dtype=np.uint64))
+            sec_gen, sec_lo = sec
+            slots, gens, klo, khi = arena.complete_census()
+            tot["complete"] += int(slots.shape[0])
+            if not slots.shape[0]:
+                continue
+            new = np.nonzero((sec_gen[slots] != gens) | (sec_lo[slots] != klo))[0]
+            if not new.shape[0]:
+                continue
+            tot["new"] += int(new.shape[0])
+            slots, gens, klo, khi = slots[new], gens[new], klo[new], khi[new]
+            # the stem of a NEW page only -- once per page in its lifetime
+            stems = [arena.slot_stem(int(s)) for s in slots.tolist()]
+            on = self._stat_stems([s for s in stems if s])
+            have = np.fromiter((bool(s) and s in on for s in stems), dtype=bool, count=len(stems))
+            sec_gen[slots[have]] = gens[have]
+            sec_lo[slots[have]] = klo[have]
+            tot["on_disk"] += int(have.sum())
+            todo = np.nonzero(~have & np.fromiter((bool(s) for s in stems), dtype=bool,
+                                                  count=len(stems)))[0]
+            if not todo.shape[0]:
+                continue
+            total = int(arena.slot_bytes)
+            cap = max(1, budget // max(1, total))
+            tot["pending"] += max(0, int(todo.shape[0]) - cap)
+            todo = todo[:cap]
+            for off in range(0, int(todo.shape[0]), chunk):
+                why = quiet()
+                if why:
+                    tot["paused"] = why
+                    tot["pending"] += int(todo.shape[0]) - off
+                    break
+                part = todo[off:off + chunk]
+                ok = arena.pin_complete(slots[part], klo[part], khi[part])
+                pinned = part[ok]
+                try:
+                    batch = []
+                    refused = False
+                    for i in pinned.tolist():
+                        stem = stems[i]
+                        if not self._evictor.reserve(
+                            stem, total, key=stem,
+                            owner_writes_whole_file=owner_write_covers_whole_file(
+                                is_mla_model=self._key_geom["is_mla_model"],
+                                canonical_extent_write=True,
+                            ),
+                        ):
+                            refused = True
+                            break
+                        path = self._sharded_path(stem)
+                        self._ensure_shard_dir(path)
+                        batch.append((i, stem, path))
+                    if batch:
+                        statuses = pio.write_pages(
+                            [b[2] for b in batch], [total] * len(batch),
+                            [((0, total),)] * len(batch),
+                            [int(arena.slot_ptr(int(slots[b[0]]))) for b in batch], fsync,
+                        )
+                        for (i, stem, _path), st in zip(batch, statuses):
+                            if st in (0, 2):
+                                self._evictor.commit(stem)
+                                sec_gen[slots[i]] = gens[i]
+                                sec_lo[slots[i]] = klo[i]
+                                tot["written"] += 1
+                                tot["bytes"] += total
+                            else:
+                                self._evictor.abort(stem)
+                                tot["pending"] += 1
+                finally:
+                    arena.unpin(slots[pinned])
+                if refused:
+                    tot["refused"] += 1
+                    tot["pending"] += int(todo.shape[0]) - off - len(batch)
+                    break
+        n = getattr(self, "_l3wb_n", 0) + 1
+        self._l3wb_n = n
+        self._l3wb_written = getattr(self, "_l3wb_written", 0) + tot["written"]
+        tot["ms"] = (time.perf_counter() - t0) * 1e3
+        tot["cpu_ms"] = (time.thread_time() - c0) * 1e3
+        if tot["written"] or tot["refused"]:
+            k = getattr(self, "_l3wb_logged", 0) + 1
+            self._l3wb_logged = k
+            if k <= 32 or k % 64 == 0 or tot["refused"]:
+                logger.info(
+                    "L3-REUSE WRITE-BEHIND pass=%d pages=%d bytes=%d ms=%.1f cpu_ms=%.1f "
+                    "arenas=%d complete=%d new=%d on_disk=%d pending=%d refused=%d "
+                    "paused=%s written_total=%d (L2 pages copied to the persistent L3 "
+                    "without a free)",
+                    n, tot["written"], tot["bytes"], tot["ms"], tot["cpu_ms"],
+                    tot["arenas"], tot["complete"], tot["new"], tot["on_disk"],
+                    tot["pending"], tot["refused"], tot["paused"] or "-", self._l3wb_written,
+                )
+        return tot
 
     def _arena_note_disk_home(self, arena, suffixed: str) -> None:
         """#1410: this blob's home is the DISK tier from now on (this process)."""
@@ -2909,9 +3126,97 @@ class HiCacheFile(HiCacheStorage):
             for stem, slot, total, path in todo:
                 self._evictor.abort(stem)
             out["lost"] += len(todo)
+        # L3-REUSE 0928: the KV page's L3 copy carries its QSA index sibling.
+        out.update(self._l3_couple_sidecars(arena, [st for st in cand_stems.values() if st]))
+        return out
+
+    def _l3_sidecar_stems(self, kv_stems) -> list:
+        """The QSA index stems (``{hash}.qsa_indexer`` + suffix) of KV page
+        stems (``{hash}`` + suffix). Empty without a canonical QSA window --
+        a model without the sidecar, or a Form-A worker."""
+        if getattr(self, "canonical_qsa_page", None) is None or not kv_stems:
+            return []
+        kv_sfx = self._suffix_for_key("k")[0]
+        q_sfx = self._suffix_for_key(f"k.{PoolName.QSA_INDEXER}")[0]
+        out = []
+        for stem in kv_stems:
+            if not stem or (kv_sfx and not stem.endswith(kv_sfx)):
+                continue
+            h = stem[: len(stem) - len(kv_sfx)] if kv_sfx else stem
+            if not h or "." in h:
+                continue
+            out.append(f"{h}.{PoolName.QSA_INDEXER}{q_sfx}")
+        return out
+
+    def _l3_couple_sidecars(self, arena, kv_stems) -> dict:
+        """L3-REUSE 0928 (NF boot rc12z13 7b2c6ee5ef, P PP0 09:33:33, the first
+        request after the boot): ``#1028B FETCH CAP n=1: kv=399 claimed=47
+        caps={mamba: 399, qsa_indexer: 47}`` -- the store held 399 leading KV
+        pages and mamba anchors up to page 398, but the QSA index for only 47,
+        so the claim was capped at 47 pages and the prompt re-prefilled. On
+        disk 8104 KV pages against 2048 QSA pages (= 8 x 256, eight
+        ``ARENA-EVICT want=256`` rounds of the QSA arena itself).
+
+        The QSA index page lives in its OWN arena (``_arena_for(49152)``) and
+        its L3 copy was written only when THAT arena ran full. Every path that
+        gives a KV page its L3 copy -- the claim-time room
+        (``arena_secure_to_disk``, #257 d), the park/hand-off demoter
+        (``arena_copy_to_disk``, #248: 147 D copies in boot 0831, pool=kv),
+        the write-behind -- copied the KV page alone; its sibling stayed in L2
+        and died with the boot's /dev/shm arena. ``batch_exists_v2`` takes the
+        MINIMUM over the pools (QSA_INDEXER is ALL_PAGES), so a KV page on
+        disk without its index is worth nothing.
+
+        Rule: a KV page that gets (or has) an L3 copy gets its QSA index copy
+        in the same call, from the QSA arena, without freeing it there. A
+        sibling that is neither in the QSA arena nor on disk is counted
+        (``sidecar_absent``), never silent. No-op for any arena other than
+        the canonical KV page's width."""
+        out = {"sidecar_written": 0, "sidecar_on_disk": 0, "sidecar_absent": 0}
+        try:
+            kv = getattr(self, "_canonical_kv_extents", None)
+            qsa = getattr(self, "canonical_qsa_page", None)
+            if kv is None or qsa is None or arena is None or not kv_stems:
+                return out
+            if int(getattr(arena, "slot_bytes", -1)) != int(kv.total_bytes):
+                return out
+            q_stems = self._l3_sidecar_stems(kv_stems)
+            if not q_stems:
+                return out
+            q_arena = self._arena_for(int(qsa.total_bytes))
+            if q_arena is None:
+                on = self._stat_stems(q_stems)
+                out["sidecar_on_disk"] = len(on)
+                out["sidecar_absent"] = len(q_stems) - len(on)
+                return out
+            r = self._arena_copy_pages_to_disk(q_arena, q_stems)
+            out["sidecar_written"] = int(r.get("written", 0))
+            out["sidecar_on_disk"] = int(r.get("on_disk", 0))
+            out["sidecar_absent"] = int(r.get("absent", 0))
+        except Exception as exc:  # noqa: BLE001 - the KV copy stands; the loss is named
+            logger.warning("L3-REUSE sidecar couple failed: %r", exc)
+            return out
+        n = getattr(self, "_l3_couple_n", 0) + 1
+        self._l3_couple_n = n
+        if out["sidecar_absent"] or n <= 16 or n % 256 == 0:
+            logger.info(
+                "L3-REUSE SIDECAR-COUPLE n=%d kv_pages=%d qsa_written=%d qsa_on_disk=%d "
+                "qsa_absent=%d (a KV page's L3 copy carries its QSA index; absent = the "
+                "index is in neither L2 nor L3, the claim caps there)",
+                n, len(kv_stems), out["sidecar_written"], out["sidecar_on_disk"],
+                out["sidecar_absent"],
+            )
         return out
 
     def arena_copy_to_disk(self, arena, stems) -> dict:
+        """#248 PARK-DEMOTE copy of ``stems`` (see
+        :meth:`_arena_copy_pages_to_disk`), plus -- L3-REUSE 0928 -- the QSA
+        index sibling of every KV page (:meth:`_l3_couple_sidecars`)."""
+        out = self._arena_copy_pages_to_disk(arena, stems)
+        out.update(self._l3_couple_sidecars(arena, [s for s in dict.fromkeys(stems or ()) if s]))
+        return out
+
+    def _arena_copy_pages_to_disk(self, arena, stems) -> dict:
         """#248 PARK-DEMOTE: copy the COMPLETE arena pages of ``stems`` to the
         disk store WITHOUT freeing them -- ``_arena_evict_to_disk`` minus the
         free. The slot stays where it is; from now on a claim may free it

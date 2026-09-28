@@ -705,6 +705,49 @@ int64_t arena_ref_slots(uint8_t *base, int64_t n, const int64_t *slots, int32_t 
     }
     return done;
 }
+
+/* L3-REUSE 0928 (write-behind): the census of COMPLETE slots in ONE call --
+ * slot, generation and key of each, so the background thread filters the
+ * pages it already secured with numpy instead of a Python loop per slot. */
+int64_t arena_complete_census(uint8_t *base, int64_t max, int64_t *slots, int64_t *gens,
+                             uint64_t *klo, uint64_t *khi) {
+    ArenaHeader *h = hdr(base);
+    int64_t got = 0;
+    for (uint64_t s = 0; s < h->slots && got < max; s++) {
+        SlotHeader *sh = slot_hdr(base, s);
+        if (atomic_load(&sh->state) != S_COMPLETE) continue;
+        slots[got] = (int64_t)s;
+        gens[got] = (int64_t)sh->generation;
+        klo[got] = sh->key_lo;
+        khi[got] = sh->key_hi;
+        got++;
+    }
+    return got;
+}
+
+/* L3-REUSE 0928: pin (refcount + 1) each slot that is still COMPLETE under
+ * the key the census saw; ok[i] = 1 pinned (the caller unpins with
+ * arena_ref_slots(-1)), 0 not pinned and left untouched. The recheck after
+ * the increment is the same handshake arena_evict_candidates makes from the
+ * other side (state -> EVICTING, then refcount != 0 reverts). */
+int64_t arena_pin_complete(uint8_t *base, int64_t n, const int64_t *slots, const uint64_t *klo,
+                           const uint64_t *khi, int8_t *ok) {
+    int64_t pinned = 0;
+    for (int64_t i = 0; i < n; i++) {
+        ok[i] = 0;
+        if (slots[i] < 0) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        atomic_fetch_add(&sh->refcount, 1);
+        if (atomic_load(&sh->state) != S_COMPLETE || sh->key_lo != klo[i] || sh->key_hi != khi[i]) {
+            uint32_t r = atomic_load(&sh->refcount);
+            while (r > 0 && !atomic_compare_exchange_weak(&sh->refcount, &r, r - 1u)) { }
+            continue;
+        }
+        ok[i] = 1;
+        pinned++;
+    }
+    return pinned;
+}
 /* #1424 Stufe 3: byte offset of slot 0's data from the mapping base, so a
  * torch view can address every slot as base + data_off + slot * slot_bytes. */
 int64_t arena_data_offset(uint8_t *base) {
