@@ -471,3 +471,85 @@ def test_the_two_long_legs_are_split_in_the_outcome_and_the_line(tmp_path, caplo
         vrr.log_outcome(out, ["r1"], 1)
     line = next(r.getMessage() for r in caplog.records if "encode_split_ms=" in r.getMessage())
     assert "teardown_split_ms=(" in line and "gc " in line and "first " in line
+
+
+# --------------------------------------------------- (d) the async stage --
+
+
+class _ManualPool:
+    """The worker thread under the test's hand: submit() records the job,
+    finish() runs it and completes the future."""
+
+    def __init__(self):
+        from concurrent.futures import Future
+
+        self._Future = Future
+        self.jobs = []
+
+    def submit(self, fn):
+        f = self._Future()
+        self.jobs.append((fn, f))
+        return f
+
+    def finish(self):
+        for fn, f in self.jobs:
+            f.set_result(fn())
+        self.jobs = []
+
+
+def _async_sched(tmp_path, queue):
+    s = _pass_sched(queue)
+    alloc = _Alloc(_kv())
+    s.token_to_kv_pool_allocator = alloc
+    s.server_args = types.SimpleNamespace(model_path=str(tmp_path))
+    s._weg2_vision_source = None
+    return s, alloc
+
+
+def test_async_holds_the_lease_over_two_passes_and_gives_it_back_after_attach(tmp_path, monkeypatch):
+    """(d) user decision 28.09.: the KV-tail LEASE is held while the encode
+    runs; the admission sees those pages as used (they are out of the free
+    list), the image request is held out, other work is admitted in the same
+    pass; after the attach the lease goes back and the request is admitted."""
+    monkeypatch.delenv(vrr.VISION_ASYNC_ENV, raising=False)
+    _write_model(tmp_path)
+    pool = _ManualPool()
+    monkeypatch.setattr(vrr, "_async_pool", lambda: pool)
+    monkeypatch.setattr(vrr, "build_tower_meta", _build())
+    monkeypatch.setattr(vrr, "_rank_device", lambda: torch.device("cpu"))
+    img, txt = _req("img", [_Item(4)]), _req("txt")
+    s, alloc = _async_sched(tmp_path, [img, txt])
+    full = alloc.free_pages.clone()
+    for _pass in range(2):
+        parked = vrr.vision_rank_pass(s)
+        assert [r.rid for _, r in parked] == ["img"]          # held, the text is not
+        assert vrr.vision_async_inflight(s)
+        lease = s._weg2_vision_inflight.res
+        assert lease.pages > 0
+        assert int((alloc.free_pages >= lease.lo_page).sum()) == 0   # the admission sees them used
+        vrr.vision_unpark(s, parked)
+    assert s._weg2_vision_inflight.passes == 1   # held one pass beyond the start
+    pool.finish()
+    parked = vrr.vision_rank_pass(s)
+    assert parked == []                                        # attached: admitted now
+    assert not vrr.vision_async_inflight(s)
+    assert img.multimodal_inputs.mm_items[0].precomputed_embeddings is not None
+    assert torch.equal(alloc.free_pages, full)                 # the lease is back
+    assert s._weg2_vision_runs == 1
+
+
+def test_async_off_is_the_synchronous_stage(tmp_path, monkeypatch, stage_calls):
+    calls, _ = stage_calls
+    monkeypatch.setenv(vrr.VISION_ASYNC_ENV, "0")
+    s = _pass_sched([_req("img", [_Item(4)])])
+    assert vrr.vision_rank_pass(s) == []
+    assert calls == [["img"]] and not vrr.vision_async_inflight(s)
+
+
+def test_a_group_with_a_lease_is_never_idle():
+    import inspect
+    from sglang.srt.managers import scheduler as sm
+
+    src = inspect.getsource(sm.Scheduler.is_fully_idle)
+    assert '_weg2_vision_inflight' in src
+    assert '"vision_async"' in inspect.getsource(sm.Scheduler.idle_blockers)

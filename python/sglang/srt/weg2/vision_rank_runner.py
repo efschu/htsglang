@@ -634,12 +634,198 @@ def _refuse(scheduler, reqs: Sequence[Any], code: str, detail: str) -> None:
         queue.append((r.rid, f"{code}: {detail}"))
 
 
+# ---------------------------------------------------------------------------
+# (d) async stage: the KV-tail lease held across passes (user decision 28.09.:
+# no fixed vision budget, "KV-Tail-Views, immer von Platte" stays)
+# ---------------------------------------------------------------------------
+
+VISION_ASYNC_ENV = "SGLANG_WEG2_VISION_ASYNC"
+
+
+def vision_async_on(env: Optional[Dict[str, str]] = None) -> bool:
+    """(d) default ON: the tower's read + encode run on a worker thread and
+    their own CUDA stream while the scheduler keeps passing; ``0`` = the
+    synchronous stage of H125e byte for byte."""
+    e = os.environ if env is None else env
+    return str(e.get(VISION_ASYNC_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+_ASYNC_POOL = None
+
+
+def _async_pool():
+    global _ASYNC_POOL
+    if _ASYNC_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _ASYNC_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="weg2-vision")
+    return _ASYNC_POOL
+
+
+@dataclass
+class AsyncStage:
+    """One in-flight stage: the reqs it encodes, the KV-tail LEASE it holds
+    (the admission sees those pages as used until :func:`finish_async_stage`
+    hands them back), the tower on the lease and the worker's future."""
+
+    reqs: List[Any]
+    items: List[Any]
+    out: StageOutcome
+    module: Any
+    res: Any
+    allocator: Any
+    device: Any
+    rope_keys: set
+    own0: Optional[int]
+    host0: Tuple[Optional[int], Optional[int]]
+    future: Any = None
+    t_start: float = 0.0
+    passes: int = 0
+
+    def done(self) -> bool:
+        return self.future is not None and self.future.done()
+
+
+def start_async_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config: Any,
+                      device: torch.device,
+                      build: Optional[Callable[[Any, torch.device], Tuple[torch.nn.Module, str]]] = None,
+                      encode: Optional[Callable[[torch.nn.Module, Sequence[Any]], List[torch.Tensor]]] = None,
+                      source: Optional[vrs.TowerSource] = None,
+                      clock: Callable[[], float] = time.perf_counter,
+                      submit: Optional[Callable[..., Any]] = None) -> Optional[AsyncStage]:
+    """Build the tower on a LEASE of the KV tail and hand read + encode to the
+    worker. Returns None when the async form does not apply (a non-image item,
+    or the tail is not wholly free -- the synchronous stage then decides and
+    names it, place=auto may still use free VRAM there); never raises."""
+    from sglang.srt.layers.rotary_embedding import factory as rope_factory
+
+    build = build or build_tower_meta   # resolved at call time (tests patch the module)
+    encode = encode or encode_items
+    items = [it for r in reqs for it in unstaged_items(r)]
+    if not items or any(not it.is_image() for it in items):
+        return None
+    allocator = scheduler.token_to_kv_pool_allocator
+    out = StageOutcome()
+    out.items = len(items)
+    out.num_pages = vrs._allocator_num_pages(allocator)
+    page_size = int(getattr(allocator, "page_size", 1) or 1)
+    rope_keys = set(rope_factory._ROPE_DICT)
+    own0, host0 = own_card_bytes(device), host_bytes()
+    module = res = None
+    t0 = clock()
+    try:
+        module, backend = build(hf_config, device)
+        sizes = [p.numel() * p.element_size() for _, p in module.named_parameters()]
+        out.tower_bytes = sum(sizes)
+        buffers = vrs.attention_kv_buffers(allocator.get_kvcache())
+        pages = vrs.slots_for(sizes, buffers, out.num_pages, page_size)
+        out.legs_ms["build"] = (clock() - t0) * 1e3
+        if device.type == "cuda":
+            torch.cuda.current_stream(device).synchronize()  # as the sync stage: freed pages' readers done
+        res = vrs.reserve_tail_pages(allocator, pages)
+        if res is None:
+            raise vrs.VisionRankStageRefused("tail not wholly free")
+        out.place = vrs.PLACE_KVTAIL
+        out.tail_pages = res.pages
+        views = vrs.place_parameters(module, vrs.SlabAllocator(vrs.tail_segments(buffers, res, out.num_pages)))
+        shard = find_tower_shard(model_dir)
+        plan = vrs.plan_checkpoint_into(views, vrs.checkpoint_tensors(shard, is_vision_weight), _tower_name)
+        src = source if source is not None else vrs.disk_source(shard)
+        out.source = src.kind
+    except Exception as exc:  # noqa: BLE001 -- the sync stage takes over and names it
+        logger.info("%s async not taken (%s: %s) -- the synchronous stage decides",
+                    W_STAGE_OK, type(exc).__name__, exc)
+        if res is not None:
+            vrs.return_tail_pages(allocator, res)
+        if module is not None:
+            _strip_module(module)
+        for key in set(rope_factory._ROPE_DICT) - rope_keys:
+            rope_factory._ROPE_DICT.pop(key, None)
+        return None
+
+    def _work():
+        stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+        legs = {}
+        with ctx:
+            t = clock()
+            rep = vrs.read_into(src.path, vrs.shift_plan(plan, src.shift), stream=stream,
+                                direct=src.direct)
+            legs["load"] = (clock() - t) * 1e3
+            t = clock()
+            with torch.inference_mode(), attention_backend_scope(backend):
+                rows = encode(module, items)
+            rows = [r.clone() if r.is_inference() else r for r in rows]
+            if stream is not None:
+                stream.synchronize()
+            legs["encode"] = (clock() - t) * 1e3
+        return rep, rows, legs
+
+    st = AsyncStage(reqs=list(reqs), items=items, out=out, module=module, res=res,
+                    allocator=allocator, device=device, rope_keys=rope_keys,
+                    own0=own0, host0=host0, t_start=clock())
+    st.future = (submit or _async_pool().submit)(_work)
+    return st
+
+
+def finish_async_stage(st: AsyncStage, clock: Callable[[], float] = time.perf_counter) -> StageOutcome:
+    """On the scheduler thread, once the worker is done: attach the rows, then
+    the teardown of the synchronous stage (the lease goes back LAST, after
+    nothing reads the views any more)."""
+    from sglang.srt.layers.rotary_embedding import factory as rope_factory
+
+    out = st.out
+    try:
+        rep, rows, legs = st.future.result()
+        out.read_bytes, out.direct = rep.bytes_read, rep.direct
+        out.legs_ms.update(legs)
+        out.encode_ms = dict(getattr(st.module, "_weg2_encode_ms", {}) or {})
+        t0 = clock()
+        attach_precomputed_embeddings(st.items, rows, expected_width=int(st.module.out_hidden_size))
+        out.legs_ms["attach"] = (clock() - t0) * 1e3
+    except Exception as exc:  # noqa: BLE001 -- a named verdict, as the sync stage
+        out.ok = False
+        out.code = W_ENCODE
+        out.detail = f"async: {type(exc).__name__}: {exc}"
+    t0 = clock()
+    rows = None
+    _strip_module(st.module)
+    st.module = None
+    for key in set(rope_factory._ROPE_DICT) - st.rope_keys:
+        rope_factory._ROPE_DICT.pop(key, None)
+    gc.collect()
+    if st.device.type == "cuda":
+        torch.cuda.current_stream(st.device).synchronize()
+    vrs.return_tail_pages(st.allocator, st.res)
+    if st.device.type == "cuda":
+        torch.cuda.empty_cache()
+    out.legs_ms["teardown"] = (clock() - t0) * 1e3
+    out.legs_ms["async_wall"] = (clock() - st.t_start) * 1e3
+    out.legs_ms["passes_held"] = float(st.passes)
+    own1, host1 = own_card_bytes(st.device), host_bytes()
+    if st.own0 is not None and own1 is not None:
+        out.residue_bytes = own1 - st.own0
+    out.host_current_delta = _delta_mib(st.host0[0], host1[0])
+    out.host_anon_delta = _delta_mib(st.host0[1], host1[1])
+    return out
+
+
 def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
     """Right before PP0's admission. Stages the pending images in this pass
     (H125e: never waits for PP0 to drain, module docstring) and returns the
     requests held out of THIS pass as (index, req) -- only refused ones, the
     caller puts them back with :func:`vision_unpark` until their abort
     lands."""
+    inflight = getattr(scheduler, "_weg2_vision_inflight", None)
+    if inflight is not None and (inflight.done() or getattr(scheduler, "weg2_dormant", False)):
+        # (d) the worker is done -- or (defensive; the in-flight stage keeps
+        # the group from voting idle, see is_fully_idle) a sleep came anyway:
+        # wait it out, the lease must go back before the pools are released
+        out = finish_async_stage(inflight)
+        scheduler._weg2_vision_inflight = inflight = None
+        log_outcome(out, [r.rid for r in _st_reqs(out)], scheduler._weg2_vision_runs)
+        if not out.ok:
+            _refuse(scheduler, _st_reqs(out), out.code, out.detail)
     if getattr(scheduler, "weg2_dormant", False):
         return []
     wq = scheduler.waiting_queue
@@ -648,6 +834,40 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
         refused.intersection_update({r.rid for r in wq})  # an aborted rid leaves the set
     pending = [r for r in wq if r.rid not in refused and unstaged_items(r)]
     held = [r for r in wq if r.rid in refused]
+    if pending and inflight is not None:
+        # (d) a stage is in flight: every unstaged image waits (the one in
+        # flight and any new one -- the next stage takes those); everything
+        # else is admitted in this pass as without vision (H125e)
+        inflight.passes += 1
+        held = pending + held
+        pending = []
+    if pending:
+        refusal = scheduler._weg2_vision_arm_refusal
+        started = None
+        if not refusal and vision_async_on():
+            scheduler._weg2_vision_runs += 1
+            try:
+                started = start_async_stage(
+                    scheduler, pending,
+                    model_dir=str(scheduler.server_args.model_path),
+                    hf_config=scheduler.model_config.hf_config,
+                    device=_rank_device(),
+                    source=getattr(scheduler, "_weg2_vision_source", None),
+                )
+            except Exception:  # noqa: BLE001 -- the sync stage below decides
+                logger.exception("%s async start raised -- synchronous stage", W_STAGE_OK)
+                started = None
+            if started is None:
+                scheduler._weg2_vision_runs -= 1
+            else:
+                started.out._reqs = list(pending)
+                scheduler._weg2_vision_inflight = started
+                logger.info("%s run=%d ASYNC started rids=%s tail_pages=%d/%d (the lease is held "
+                            "until the rows are attached; the passes go on)", W_STAGE_OK,
+                            scheduler._weg2_vision_runs, [r.rid for r in pending],
+                            started.out.tail_pages, started.out.num_pages)
+                held = pending + held
+                pending = []
     if pending:
         refusal = scheduler._weg2_vision_arm_refusal
         if refusal:
@@ -683,6 +903,15 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
     for i, _ in reversed(parked):
         wq.pop(i)
     return parked
+
+
+def _st_reqs(out: StageOutcome) -> List[Any]:
+    return list(getattr(out, "_reqs", None) or [])
+
+
+def vision_async_inflight(scheduler) -> bool:
+    """(d) an async stage holds a KV-tail lease: the group is not idle."""
+    return getattr(scheduler, "_weg2_vision_inflight", None) is not None
 
 
 def vision_unpark(scheduler, parked: Sequence[Tuple[int, Any]]) -> None:
