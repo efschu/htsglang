@@ -300,17 +300,23 @@ def test_the_backend_takes_form_a_dcp_instead_of_refusing_it(rank):
     rank_role.set_form_a_role_plan(rank_role.RankRolePlan(("host", "worker", "worker")), rank)
     try:
         cfg = SimpleNamespace(
-            hf_text_config=SimpleNamespace(num_attention_heads=24),
+            hf_text_config=SimpleNamespace(
+                num_attention_heads=24, indexer_budget=2048, indexer_compress_ratio=4
+            ),
             get_total_num_kv_heads=lambda: 2,
+            head_dim=256,
         )
         par = SimpleNamespace(attn_dcp_size=3, attn_dcp_rank=rank, attn_tp_size=3)
         obj = object.__new__(be.QwenSparseAttnBackend)
         with mock.patch("sglang.srt.runtime_context.get_parallel", return_value=par):
-            obj._init_dcp(SimpleNamespace(is_draft_worker=False), cfg)
+            obj._init_dcp(SimpleNamespace(is_draft_worker=False, dtype=torch.bfloat16), cfg)
         assert obj.form_a_dcp is not None and obj.dcp_size == 3
         assert obj.uneven_dcp_weighted is True
         assert obj.form_a_dcp.q_counts == [24, 0, 0]
         assert obj.cp_ratio == [0, 23, 9][rank]
+        # #239 S3c: what a worker needs without a layer of its own
+        assert (obj.form_a_dcp.head_dim, obj.form_a_dcp.topk_width) == (256, 2051)
+        assert obj.form_a_dcp.scaling == 256**-0.5 and obj.form_a_dtype == torch.bfloat16
     finally:
         rank_role.set_form_a_role_plan(None, 0)
         set_cp_token_ratios(None)

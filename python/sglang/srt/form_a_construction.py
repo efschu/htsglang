@@ -215,6 +215,10 @@ class FormAWorkerAttnBackend:
     #: guarded by a short-circuit today and a future spec family would reach
     #: it -- and "the attribute happened to be unreachable" is not a design.
     use_captured_forward_metadata_for_breakable_cuda_graph = False
+    #: #239 S3c: this backend never takes the Form A DCP geometry -- the
+    #: worker forward asks the backend, not the server args, whether it joins
+    #: a full-attention step (the QSA backend sets it under the token cut).
+    form_a_dcp = None
 
     def __init__(self, model_runner):
         self.model_runner = model_runner

@@ -469,6 +469,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         # #239 S3b: the Form A geometry when the token cut spreads the KV over
         # the group (None on every other path, byte-identical).
         self.form_a_dcp = None
+        # #239 S3c: the dtype of the host's q/k/v -- a worker's [T, 0, D]
+        # slices must match it in every gather.
+        self.form_a_dtype = None
         self.dcp_model_config = model_config
         self.is_draft_worker = bool(getattr(runner, "is_draft_worker", False))
         if runner is None or model_config is None:
@@ -500,6 +503,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             # full token context, so DCP is off for this instance.
             return
         if self._init_form_a_dcp(model_config, dcp_size, dcp_rank):
+            self.form_a_dtype = runner.dtype
             return
         self.dcp_size = dcp_size
         self.dcp_rank = dcp_rank
@@ -536,15 +540,33 @@ class QwenSparseAttnBackend(AttentionBackend):
         A), not because every rank projects them. Returns True when it took
         the instance (layers/attention/qsa/form_a_dcp.py)."""
         from sglang.srt.distributed.utils import uneven_dcp_active
-        from sglang.srt.layers.attention.qsa.form_a_dcp import form_a_dcp_geometry
+        from sglang.srt.layers.attention.qsa.form_a_dcp import (
+            form_a_dcp_geometry,
+            qsa_topk_width,
+        )
         from sglang.srt.layers.dcp.owner import (
             dcp_weighted_owner_bounds,
             register_owner_bounds_consumer,
         )
+        from sglang.srt.rank_role import installed_role_plan
 
+        if installed_role_plan() is None:
+            return False
         total_q = int(model_config.hf_text_config.num_attention_heads)
         total_kv = int(model_config.get_total_num_kv_heads())
-        geo = form_a_dcp_geometry(total_q, total_kv, dcp_size, dcp_rank)
+        head_dim = int(model_config.head_dim)
+        # #239 S3c: a worker has no attention layer to read these from; they
+        # are the host's RadixAttention values (head_dim**-0.5, the QSA
+        # layers' scale) and the indexer's output width.
+        geo = form_a_dcp_geometry(
+            total_q,
+            total_kv,
+            dcp_size,
+            dcp_rank,
+            head_dim=head_dim,
+            topk_width=qsa_topk_width(model_config.hf_text_config),
+            scaling=head_dim**-0.5,
+        )
         if geo is None:
             return False
         if not uneven_dcp_active(dcp_size):
@@ -608,17 +630,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             return
         geo = self.form_a_dcp
         if geo is not None:
-            # #239 S3b collective A: the host's k/v reach every owner.
+            # #239 S3b collective A: the host's k/v reach every owner. A
+            # worker hands its [T, 0, D] slices as they are (S3c).
             from sglang.srt.layers.attention.qsa.form_a_dcp import share_kv
             from sglang.srt.runtime_context import get_parallel
 
             rows = int(loc.shape[0])
-            k, v = share_kv(
-                k.reshape(rows, geo.kv_heads, -1),
-                v.reshape(rows, geo.kv_heads, -1),
-                get_parallel().dcp_group,
-                geo,
-            )
+            if geo.is_host:
+                k = k.reshape(rows, geo.kv_heads, -1)
+                v = v.reshape(rows, geo.kv_heads, -1)
+            k, v = share_kv(k, v, get_parallel().dcp_group, geo)
         if self.uneven_dcp_weighted:
             from sglang.srt.layers.dcp.owner import dcp_weighted_write_slots
 
@@ -664,7 +685,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             slots = self._logical_to_physical(topk_indices, metadata)
         return self._local_rows(slots)
 
-    def _rows_and_counts(self, topk_indices: torch.Tensor, metadata):
+    def _rows_and_counts(
+        self, topk_indices: Optional[torch.Tensor], metadata, rows: Optional[int] = None
+    ):
         """(rows, counts-or-None): the graph path resolves and compacts in ONE
         Triton launch (qsa/rows_resolve.py, Task #53 Sitz 5) when
         SGLANG_QSA_ROWS_FUSED is on (default); every other path keeps the
@@ -680,13 +703,19 @@ class QwenSparseAttnBackend(AttentionBackend):
             from sglang.srt.layers.attention.qsa.form_a_dcp import share_topk
             from sglang.srt.runtime_context import get_parallel
 
+            # A worker passes None and the query row count (S3c): it
+            # receives the host's [rows, K] top-k.
+            if topk_indices is not None:
+                rows, device = int(topk_indices.shape[0]), topk_indices.device
+            else:
+                device = metadata.token_to_batch_idx.device
             topk_indices = share_topk(
                 topk_indices,
-                int(topk_indices.shape[0]),
-                int(topk_indices.shape[1]),
+                int(rows),
+                int(form_a.topk_width),
                 get_parallel().dcp_group,
                 form_a,
-                topk_indices.device,
+                device,
             )
         eager = bool(envs.SGLANG_WEG2_QSA_ROWS_FUSED_EAGER.get())
         if _qsa_rows_fused_route(metadata, topk_indices, self.req_to_token, eager):
@@ -762,6 +791,56 @@ class QwenSparseAttnBackend(AttentionBackend):
         safe = logical_indices.clamp(min=0, max=req_to_token.shape[1] - 1).long()
         slots = req_to_token[req_rows[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
+
+    def form_a_worker_attention(self, forward_batch, layer_id: int) -> None:
+        """#239 S3c: one full-attention layer on a Form A WORKER -- the host's
+        collective sequence A [, T, Q, M] with this rank's owned rows.
+
+        The worker has no attention module, no q/k/v and no indexer; it
+        enters the SAME backend paths the host runs (``_set_kv_buffer``,
+        ``_rows_and_counts``, ``_attend_rows``) with ``[T, 0, D]`` slices,
+        so the two sides cannot drift into different collective orders.
+        Called by form_a_worker_forward before the layer's MoE-input carrier,
+        which is where the host's attention sits in its layer."""
+        from sglang.srt.layers.attention.qsa.form_a_dcp import form_a_attends
+
+        geo = self.form_a_dcp
+        if geo is None or geo.is_host:
+            raise ValueError(
+                "#239 S3c: form_a_worker_attention on a rank that is not a Form A "
+                "DCP worker (geometry %r)" % (geo,)
+            )
+        layer = self._form_a_worker_layer(int(layer_id))
+        loc = forward_batch.out_cache_loc
+        rows = int(loc.shape[0])
+        empty = torch.empty(
+            (rows, 0, geo.head_dim), dtype=self.form_a_dtype, device=loc.device
+        )
+        self._set_kv_buffer(forward_batch, layer, empty, empty)
+        if not form_a_attends(forward_batch):
+            return
+        metadata = self._resolve_metadata(forward_batch)
+        owned, counts = self._rows_and_counts(None, metadata, rows=rows)
+        self._attend_rows(empty, layer, owned, counts)
+
+    def _form_a_worker_layer(self, layer_id: int):
+        """What the pool write and the attend read of a layer object: its id
+        (the pool's full-attention map) and its softmax scale."""
+        cache = self.__dict__.setdefault("_form_a_worker_layers", {})
+        layer = cache.get(layer_id)
+        if layer is None:
+            from types import SimpleNamespace
+
+            layer = SimpleNamespace(
+                layer_id=int(layer_id),
+                scaling=float(self.form_a_dcp.scaling),
+                head_dim=int(self.form_a_dcp.head_dim),
+                tp_q_head_num=0,
+                tp_k_head_num=0,
+                tp_v_head_num=0,
+            )
+            cache[layer_id] = layer
+        return layer
 
     def _attend_rows(
         self, q: torch.Tensor, layer, rows: torch.Tensor, row_counts=None
