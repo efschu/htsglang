@@ -100,14 +100,27 @@ def test_an_explicit_env_wins(profile, raw, want):
         assert on is want and src == f"env {name}={raw}", (name, src)
 
 
+def _other_spelling(name):
+    # the name's spelling of the OTHER package generation (name_compat prefix pairs). Built at
+    # run time, not written as a literal: a literal of the renamed spelling next to the legacy one
+    # becomes the same word after the mechanical rename (rename_to_flliper.py refuses that as a
+    # collision), and the test would then compare a name with itself.
+    from sglang.srt.compat_shims import env_name_variants
+
+    variants = env_name_variants(name)
+    assert len(variants) == 2 and variants[1] != name, variants
+    return variants[1]
+
+
 def test_an_explicit_renamed_spelling_wins():
-    # name_compat family: FLLIPER_PDFLIP_* / FLLIPER_ANTHROPIC_* are the same switch
-    env = {"FLLIPER_PDFLIP_TOLD_PACED": "0", "FLLIPER_ANTHROPIC_INLINE_SYSTEM_IN_PLACE": "0"}
-    assert FM.prefix_switch_state("SGLANG_WEG2_TOLD_PACED", env, "qwen27b")[0] is False
+    # name_compat family: the other generation's spelling of a switch is the same switch
+    paced = "SGLANG_WEG2_TOLD_PACED"
+    env = {_other_spelling(paced): "0", _other_spelling(MZ): "0"}
+    assert FM.prefix_switch_state(paced, env, "qwen27b")[0] is False
     assert FM.prefix_switch_state(MZ, env, "qwen27b")[0] is False
     got = dict(env)
     FM.publish_prefix_switches(got, "qwen27b")
-    assert "SGLANG_WEG2_TOLD_PACED" not in got and MZ not in got
+    assert paced not in got and MZ not in got
 
 
 def test_blank_env_is_unset():
