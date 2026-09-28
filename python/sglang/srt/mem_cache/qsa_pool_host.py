@@ -27,6 +27,7 @@ the last writer would win.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Sequence
 
 import torch
@@ -155,17 +156,22 @@ class QSAPagedHostPool(DeepSeekV4PagedHostPool):
     _h106_transfers = 0
     #: a periodic line after this many folded calls
     H106_PERIODIC = 256
+    #: PA review of 1bab093912: the load thread and the backup thread both
+    #: reach the skip; the open transfer and every counter change under this
+    #: lock, and the direction is the calling thread's own
+    _h106_lock = threading.Lock()
+    _h106_tls = threading.local()
 
     def load_to_device_per_layer(self, *args, **kwargs):
-        self._h106_dir = "load"
+        QSAPagedHostPool._h106_tls.dir = "load"
         return super().load_to_device_per_layer(*args, **kwargs)
 
     def backup_from_device_all_layer(self, *args, **kwargs):
-        self._h106_dir = "backup"
+        QSAPagedHostPool._h106_tls.dir = "backup"
         return super().backup_from_device_all_layer(*args, **kwargs)
 
     def backup_from_device_indices(self, *args, **kwargs):
-        self._h106_dir = "backup"
+        QSAPagedHostPool._h106_tls.dir = "backup"
         return super().backup_from_device_indices(*args, **kwargs)
 
     def _h106_note_skip(self, pages: int, hi: int, lo: int) -> None:
@@ -175,29 +181,35 @@ class QSAPagedHostPool(DeepSeekV4PagedHostPool):
         the same (direction, first id, pages) as the open transfer is folded
         into it; a new one prints its line with the previous transfer's sums
         (calls, pages_total); every H106_PERIODIC folded calls a counter line
-        with suppressed_since_last_print."""
+        with suppressed_since_last_print. The key carries the pool: two
+        sidecar pools skipping the same ids are two transfers (PA review)."""
         cls = QSAPagedHostPool
-        d = getattr(self, "_h106_dir", "?")
-        key = (d, int(lo), int(pages))
-        cur = cls._h106_open
-        if cur is not None and cur["key"] == key:
-            cur["calls"] += 1
-            cur["pages_total"] += int(pages)
-            cls._h106_suppressed += 1
-            if cls._h106_suppressed % cls.H106_PERIODIC == 0:
-                logger.warning(
-                    "H106 FORM-A SIDECAR SKIP (periodic) pool=%s dir=%s transfers=%d "
-                    "skipped_calls=%d pages_total=%d suppressed_since_last_print=%d",
-                    self.pool_name, d, cls._h106_transfers, cls._formA_skip_n,
-                    cls._formA_skip_pages, cls.H106_PERIODIC,
-                )
-            return
-        prev = ""
-        if cur is not None:
-            prev = " prev(dir=%s calls=%d pages_total=%d)" % (
-                cur["key"][0], cur["calls"], cur["pages_total"])
-        cls._h106_open = {"key": key, "calls": 1, "pages_total": int(pages)}
-        cls._h106_transfers += 1
+        d = getattr(cls._h106_tls, "dir", "?")
+        key = (self.pool_name, d, int(lo), int(pages))
+        with cls._h106_lock:
+            cls._formA_skip_n += 1
+            cls._formA_skip_pages += int(pages)
+            cur = cls._h106_open
+            if cur is not None and cur["key"] == key:
+                cur["calls"] += 1
+                cur["pages_total"] += int(pages)
+                cls._h106_suppressed += 1
+                if cls._h106_suppressed % cls.H106_PERIODIC == 0:
+                    logger.warning(
+                        "H106 FORM-A SIDECAR SKIP (periodic) pool=%s dir=%s transfers=%d "
+                        "skipped_calls=%d pages_total=%d suppressed_since_last_print=%d",
+                        self.pool_name, d, cls._h106_transfers, cls._formA_skip_n,
+                        cls._formA_skip_pages, cls.H106_PERIODIC,
+                    )
+                return
+            prev = ""
+            if cur is not None:
+                prev = " prev(dir=%s calls=%d pages_total=%d)" % (
+                    cur["key"][1], cur["calls"], cur["pages_total"])
+            cls._h106_open = {"key": key, "calls": 1, "pages_total": int(pages)}
+            cls._h106_transfers += 1
+            transfers, skip_n, skip_pages = (
+                cls._h106_transfers, cls._formA_skip_n, cls._formA_skip_pages)
         logger.warning(
             "H106 FORM-A SIDECAR SKIP pool=%s dir=%s pages=%d host_page_max=%d "
             "host_pages=%d min_id=%d transfer=%d%s (skipped_calls=%d "
@@ -205,7 +217,7 @@ class QSAPagedHostPool(DeepSeekV4PagedHostPool):
             "byteless KV anchor grew its ids (#249), this pool did not; a Form A "
             "worker never reads its QSA rows, so nothing is transferred.",
             self.pool_name, d, int(pages), int(hi), int(self.num_host_pages), int(lo),
-            cls._h106_transfers, prev, cls._formA_skip_n, cls._formA_skip_pages,
+            transfers, prev, skip_n, skip_pages,
         )
 
     def _host_rows_in_range(self, host_indices) -> bool:
@@ -242,8 +254,6 @@ class QSAPagedHostPool(DeepSeekV4PagedHostPool):
 
         pages = int(host_indices.numel()) // int(self.slot_page_size)
         if this_rank_is_form_a_worker():
-            QSAPagedHostPool._formA_skip_n += 1
-            QSAPagedHostPool._formA_skip_pages += pages
             self._h106_note_skip(pages, hi, lo)
             return False
         raise RuntimeError(

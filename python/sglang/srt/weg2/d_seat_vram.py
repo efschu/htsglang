@@ -88,6 +88,12 @@ class Weg2DSeatVramRefused(RuntimeError):
     """The seat-form expert bank could not be trimmed to its cap form."""
 
 
+class Weg2DSeatVramWipe(Weg2DSeatVramRefused):
+    """W-SEAT-WIPE: a live span plan would release an extent holding bytes it
+    keeps. Never swallowed into "no controller on this rank" (``controller``):
+    a rank whose pages would be remapped fresh stops by name."""
+
+
 # ---------------------------------------------------------------------------
 # switch
 # ---------------------------------------------------------------------------
@@ -742,6 +748,10 @@ def kv_stage_pool_tokens(max_tokens: int, *, is_form_a_worker: bool = False,
 #: (``kv_stage_born``), in birth order: (data_ptr, geometry). Process-local;
 #: TP0 only (a Form A worker trims none, ``kv_stage_trims_here``).
 _KV_BORN: List[Tuple[int, KvTensorGeom]] = []
+#: the span plan each of them was born with, keyed (data_ptr, geometry, stage
+#: tokens, granule) -- a key that also names what the plan was computed from:
+#: the saver mapped one extent per range, the controller checks them at its build
+_KV_BORN_SPANS: Dict[tuple, Tuple[Tuple[int, int], ...]] = {}
 
 
 def kv_stage_born(t, *, pool_size: int, page_size: int, name: str = "kv",
@@ -776,12 +786,19 @@ def kv_stage_born(t, *, pool_size: int, page_size: int, name: str = "kv",
     # at the next launch (rc12z11 TP0: segfault in fill_kernel_cuda). H95c's
     # apply_stage synchronizes before a page goes; the birth must as well.
     _sync_before_unmap(t)
-    rc = spans.set_spans(t.data_ptr(), slot_spans(geom.geom, geom.slots_for(form.tokens[0]), g),
-                         now=True)
+    # PA review of 1bab093912: born UNCUT, the per-layer ranges of a small
+    # layer-major tensor (the QSA keys: layers far below the 2 MiB granule)
+    # coalesce into one extent across the stage lattice, and the first live
+    # KV move (S0 -> S1 with the KV mapped) stops with W-SEAT-WIPE mid-run.
+    # Born at the lattice (``SeatVram.kv_spans``' cuts), every extent is a cell.
+    born = slot_spans(geom.geom, geom.slots_for(form.tokens[0]), g,
+                      cuts=[geom.slots_for(tk) for tk in form.tokens])
+    rc = spans.set_spans(t.data_ptr(), born, now=True)
     if rc != 0:
         raise Weg2DSeatVramRefused("%s: trimming the KV tensor %s to stage S0 failed "
                                    "(tms_set_spans rc=%d)" % (LINE_MARK, name, rc))
     _KV_BORN.append((int(t.data_ptr()), geom))
+    _KV_BORN_SPANS[(int(t.data_ptr()), geom, tuple(form.tokens), g)] = tuple(born)
     return t
 
 
@@ -1134,8 +1151,22 @@ class SeatVram:
             self.spans_by_ptr.setdefault(int(m.ptr), row_spans(m.geom, m.geom.rows_boot, self.granule))
         if self.form is not None:
             for m in self.kv_tensors:
-                self.spans_by_ptr.setdefault(int(m.ptr), slot_spans(
-                    m.geom.geom, m.geom.slots_for(self.form.tokens[0]), self.granule))
+                born = _KV_BORN_SPANS.get(
+                    (int(m.ptr), m.geom, tuple(self.form.tokens), int(self.granule)))
+                if born is None:
+                    born = slot_spans(m.geom.geom, m.geom.slots_for(self.form.tokens[0]),
+                                      self.granule)
+                self.spans_by_ptr.setdefault(int(m.ptr), tuple(born))
+                # PA review: a birth extent across the lattice would stop the
+                # first live KV move mid-run -- stop at the build instead
+                cut = straddling(self.spans_by_ptr[int(m.ptr)],
+                                 self.kv_spans(m, self.form.tokens[0]))
+                if cut is not None:
+                    raise Weg2DSeatVramWipe(
+                        "%s %s at the controller's build: the KV tensor %s was born with the "
+                        "extent [%d, %d) across the stage lattice -- the first live KV move "
+                        "would release it and map it fresh. Stopped before the first phase."
+                        % (LINE_MARK, WIPE_CODE, m.geom.geom.name, cut[0], cut[1]))
 
     def bank_spans(self, m: "_Managed", k: int) -> Tuple[Tuple[int, int], ...]:
         """The bank tensor's plan for ``k`` rows ON, cut at every k a phase
@@ -1149,20 +1180,23 @@ class SeatVram:
         return slot_spans(m.geom.geom, m.geom.slots_for(tokens), self.granule, cuts=cuts)
 
     def refuse_wipes(self, plans: Sequence[Tuple[int, str, Tuple[Tuple[int, int], ...], bool]]) -> None:
-        """BEFORE anything moves: a live plan that would release an extent
-        holding bytes the plan keeps stops by name (the saver maps a released
-        range FRESH -- rc12z17's wiped bank). Nothing was changed then."""
+        """Before this apply moves anything: a live plan that would release an
+        extent holding bytes the plan keeps stops by name (the saver maps a
+        released range FRESH -- rc12z17's wiped bank). This apply's plans,
+        tables and pages are untouched then; what the wake did before the
+        apply (``on_wake``: the phase limit, the KV cap) stays done."""
         for ptr, name, spans, live in plans:
             prev = self.spans_by_ptr.get(int(ptr))
             if not live or prev is None:
                 continue
             cut = straddling(prev, spans)
             if cut is not None:
-                raise Weg2DSeatVramRefused(
+                raise Weg2DSeatVramWipe(
                     "%s %s: a live apply would release the mapped extent [%d, %d) of %s, "
                     "whose bytes the new plan keeps -- the saver maps a released range "
-                    "fresh (rc12z17 10:51:24: the whole expert bank). Nothing was changed."
-                    % (LINE_MARK, WIPE_CODE, cut[0], cut[1], name))
+                    "fresh (rc12z17 10:51:24: the whole expert bank). No plan, table or "
+                    "page of this apply moved; the wake's phase limit and KV cap were "
+                    "already set." % (LINE_MARK, WIPE_CODE, cut[0], cut[1], name))
 
     def set_plan(self, ptr: int, name: str, spans: Tuple[Tuple[int, int], ...], *,
                  live: bool, census: Optional[Dict[str, int]] = None) -> None:
@@ -1316,7 +1350,11 @@ class SeatVram:
         """The pages of a phase of ``n`` seats (``n`` = cap: the cap form).
         Called BEFORE the saver resumes the tag of a paused allocation (its
         plan is set) and at any time for a mapped one (the expert bank grows
-        or shrinks in place)."""
+        or shrinks in place). A live shrink goes as in ``apply_stage``: rows
+        OFF in the tables first, synchronize, then the pages (PA review of
+        1bab093912: the pages went first here)."""
+        import torch
+
         n = max(1, min(int(n), self.cap))
         notes = []
         k = self.row_for(n).extra_rows if (self.slot_tensors and self.row_tensors) else 0
@@ -1345,13 +1383,22 @@ class SeatVram:
             bank_plans.append((m, self.bank_spans(m, k), info is not None and info.active))
         self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in bank_plans])
         experts_live = any(lv for _m, _sp, lv in bank_plans)
+        shrink = int(k) < int(self.rows_on)
+        if shrink:
+            for cache in self.caches:
+                cache.set_seat_rows_on(k, device_write=experts_live)
+            if experts_live and any(
+                    getattr(getattr(getattr(c, "_pool_tables", None), "row_key", None),
+                            "is_cuda", False) for c in self.caches):
+                torch.cuda.synchronize()
         census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
         for m, sp, live in bank_plans:
             self.set_plan(m.ptr, m.geom.name, sp, live=live, census=census)
         # the tables: written now when the bank is mapped (the wake's rearm
         # already ran), else recorded for the rearm's reinit
-        for cache in self.caches:
-            cache.set_seat_rows_on(k, device_write=experts_live)
+        if not shrink:
+            for cache in self.caches:
+                cache.set_seat_rows_on(k, device_write=experts_live)
         log_live_spans(census, n=n, stage=None, rows_from=int(self.rows_on), rows_to=int(k))
         self.rows_on = int(k)
         applied = PhaseApplied(
@@ -1447,6 +1494,8 @@ def controller(sched) -> Optional[SeatVram]:
                                     kv_pools=_kv_pools(sched))
         if not ctl.slot_tensors and not ctl.row_tensors:
             ctl = None
+    except Weg2DSeatVramWipe:
+        raise  # pages that would be remapped fresh: a stop, never "no controller"
     except Exception as exc:  # noqa: BLE001 -- a missing piece names itself, never guesses
         logger.warning("%s: no page controller on this rank: %s: %s", LINE_MARK,
                        type(exc).__name__, exc)

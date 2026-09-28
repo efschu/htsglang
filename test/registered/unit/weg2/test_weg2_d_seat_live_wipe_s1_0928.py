@@ -342,3 +342,84 @@ def test_a_live_grow_keeps_every_extent_and_writes_the_line(caplog):
             assert tms.ids(b.data_ptr(), 0, 42 * G) == before[b.data_ptr()]
         line = [m for m in caplog.messages if dsv.LIVE_MARK in m][-1]
         assert "cells_freed=0 " in line and "wiped=0" in line
+
+
+# ---- PA review of 1bab093912 ------------------------------------------------------
+
+def test_a_small_layer_major_kv_is_born_at_the_stage_lattice():
+    """(3) A layer-major tensor whose layers are small against the granule (the
+    QSA keys on metal) coalesced at its birth into ONE extent across the stage
+    lattice: the first live KV move would release it (W-SEAT-WIPE mid-run).
+    RED on 1bab093912: born uncut."""
+    tms = CoreTms()
+    with _armed(tms):
+        q = torch.zeros(3, 24 * 64, dtype=torch.int32)  # 3 layers x 24 slots x 256 B
+        tms.add(q, active=True)
+        dsv.kv_stage_born(q, pool_size=192, page_size=PAGE, name="qsa", tokens_per_slot=4,
+                          layers=3, slots=24)
+        geom = dsv._KV_BORN[-1][1]
+        cuts = [geom.slots_for(t) for t in (64, 128, 192)]
+        ext = [(lo, hi) for lo, hi, _ in tms.allocs[q.data_ptr()]["ext"]]
+        assert len(ext) > 1
+        for t in (64, 128, 192):
+            plan = dsv.slot_spans(geom.geom, geom.slots_for(t), G, cuts=cuts)
+            assert dsv.straddling(ext, plan) is None, (t, ext, plan)
+
+
+def test_a_birth_across_the_lattice_stops_at_the_controllers_build():
+    """(3) The named stop: a KV tensor recorded with a birth extent across the
+    lattice stops the controller's build with W-SEAT-WIPE (not swallowed into
+    "no controller on this rank"), before any phase ran."""
+    tms = CoreTms()
+    with _armed(tms), mock.patch.dict(dsv._KV_BORN_SPANS, {}, clear=True):
+        r = _rank(tms)
+        p = r.kv[0].data_ptr()
+        key = [k for k in dsv._KV_BORN_SPANS if k[0] == p][0]
+        dsv._KV_BORN_SPANS[key] = ((0, 144 * 1024),)  # across the S0 cut at 80 KiB
+        with pytest.raises(dsv.Weg2DSeatVramWipe, match="controller's build"):
+            dsv.controller(r.sched)
+
+
+def test_apply_turns_rows_off_before_a_live_shrink_unmaps():
+    """(2) H95c ``apply`` (no stage form in the phase): a live shrink turns the
+    rows OFF in the tables and synchronizes BEFORE the pages go, as
+    ``apply_stage`` does. RED on 1bab093912: set_spans(now=True) first."""
+    tms = CoreTms()
+    with _armed(tms):
+        r = _rank(tms)
+        tms.pause(r.temporal.data_ptr())  # the Mamba pool may shrink
+        ctl = dsv.controller(r.sched)
+        ctl.apply(1)
+        k1 = ctl.rows_on
+        events = []
+        banks = {b.data_ptr() for b in r.banks}
+        real_set = tms.set_spans
+
+        def _spans(ptr, spans, *, now):
+            if int(ptr) in banks and now:
+                events.append("pages")
+            return real_set(ptr, spans, now=now)
+
+        tms.set_spans = _spans
+        for c in r.caches:
+            real = c.set_seat_rows_on
+            c.set_seat_rows_on = (lambda k, device_write=False, _r=real:
+                                  (events.append("rows"), _r(k, device_write=device_write))[1])
+        ctl.apply(2)
+        assert ctl.rows_on < k1, (k1, ctl.rows_on)
+        assert "pages" in events and events.index("rows") < events.index("pages"), events
+
+
+def test_the_wipe_refusal_does_not_claim_nothing_changed():
+    """(4) The wake set its phase limit and KV cap before the apply; the text
+    names what did not move instead of 'Nothing was changed'."""
+    tms = CoreTms()
+    with _armed(tms):
+        r = _rank(tms)
+        ctl = dsv.controller(r.sched)
+        p = r.banks[0].data_ptr()
+        ctl.spans_by_ptr[p] = ((0, 42 * G),)
+        with pytest.raises(dsv.Weg2DSeatVramRefused) as exc:
+            ctl.refuse_wipes([(p, "b", ((0, 26 * G), (26 * G, 42 * G)), True)])
+        assert "Nothing was changed" not in str(exc.value)
+        assert "phase limit" in str(exc.value)
