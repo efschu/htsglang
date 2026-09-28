@@ -5784,6 +5784,18 @@ def shm_residue_sweep(
             "refused": {}, "archive": archive, "sems_unlinked": sem_gone}
 
 
+def d_only_bind_argv(front_host: str) -> List[str]:
+    """#239 M1s (rc12z30g D-only, 28.09.): with --d-only there is NO front, so
+    group D on :30032 IS the client surface. common_flags binds every group to
+    127.0.0.1 (the groups sit behind the front), and inside the container the
+    Docker port forward cannot reach a loopback-only socket -- host_acceptance
+    serve_d waited forever and the probes had to go in by nsenter. D-only binds
+    where the front would have: --front-host (default 0.0.0.0, user order
+    2026-09-10). Appended after common_flags, so it is the last --host argparse
+    reads; a flip boot never calls this."""
+    return ["--host", str(front_host)]
+
+
 def refuse_if_front_unbindable(log: Log, host: str, port: int, dry: bool) -> None:
     """Pre-spawn probe: can the front bind ``host:port`` at all?
 
@@ -23125,7 +23137,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
         _sg = ";".join(f"{k}={v}" for k, v in sorted(env_d.items()) if str(k).startswith("SGLANG_"))
         log(f"WEG2-GROUP-ENV D: {_sg or '(leer)'}")
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, max_kv_per_request, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_only_bind_argv(ns.front_host), d_bs, max_kv_per_request, max_kv_per_request, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
         state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
         launch_group(spec_d, tree, log, dry)
         if dry:
