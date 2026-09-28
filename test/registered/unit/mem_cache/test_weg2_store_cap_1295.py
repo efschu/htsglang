@@ -748,7 +748,9 @@ class TestTheWakeVerdictIsVotedNotRaised(CustomTestCase):
         fake = types.SimpleNamespace(
             scheduler=scheduler, weg2_store_rescan_failure=""
         )
-        return SchedulerWeightUpdaterManager._weg2_rescan_store_index, fake
+        # 28.09.: the verdict logic is the walk's (the wake itself now
+        # starts it on a thread, see test_weg2_flip_rescan_async_0928)
+        return SchedulerWeightUpdaterManager._weg2_rescan_store_index_sync, fake
 
     def test_a_blind_wake_records_the_verdict_and_does_not_raise(self):
         """The rank-local death must not happen; the verdict must survive."""
@@ -874,7 +876,7 @@ class TestTheWakeVerdictIsVotedNotRaised(CustomTestCase):
                 n
                 for n in ast.walk(tree)
                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and n.name == "_weg2_rescan_store_index"
+                and n.name == "_weg2_rescan_store_index_sync"
             ),
             None,
         )
