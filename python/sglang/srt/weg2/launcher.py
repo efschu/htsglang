@@ -16492,9 +16492,13 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
                     getattr(ns, "p_card_over_logs", "") or "").split(",") if x.strip()]:
                 with open(path, errors="replace") as fh:
                     over.append((os.path.basename(path), fh.read()))
+            # #242b: Logs der Mehr-Sequenz-Form messen aus den H55-Fenstern
+            # (Ein-Sequenz-Chunk-0, Grundstand-Wachstum), sonst mischt die
+            # Hochwassermarke die Last in das Wachstum mit der Tiefe.
             reference = _p_card.p_card_reference_from_logs(
                 boots, stage_layers=stage_layers, row_mib=row_mib,
-                support=support, model=name, over_boots=over, d_logs=d_logs)
+                support=support, model=name, over_boots=over, d_logs=d_logs,
+                windows=_p_card.logs_carry_seq_windows(boots))
             if d_logs:
                 co_tenant = _p_card.merge_co_tenant(
                     co_tenant,

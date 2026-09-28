@@ -360,6 +360,128 @@ def chunk_windows(text: str) -> Dict[int, List[ChunkWindow]]:
     return out
 
 
+#: #242b: die Sequenzen im Chunk (``#969N ADMIT ... bs=N``) und alle Requests
+#: des Chunks mit Start/Ende (``#969 EXTENT ... reqs=[('rid', start, end, ...)``).
+_RX_ADMIT_BS = re.compile(_STAGE + r" #969N ADMIT .*? bs=(\d+)")
+_RX_EXTENT_REQS = re.compile(_STAGE + r" #969 EXTENT n=\d+ fwd=\d+ reqs=\[(.*)\]")
+_RX_EXTENT_REQ = re.compile(r"\('([^']*)', (\d+), (\d+), \d+, \d+\)")
+
+
+class SeqWindow(msgspec.Struct, frozen=True, kw_only=True):
+    """#242b: ein H55-Chunkfenster mit seiner Last (Sequenzen im Chunk), seiner
+    Tiefe und seinem Grundstand (allocated nach dem Chunk) gegen den ersten
+    Ein-Sequenz-Chunk-0 der Stufe im selben Boot (``persist_mib``)."""
+
+    stage: int
+    seqs: int
+    #: Request-Instanz (rid#n; ein neuer Start bei 0 ist eine neue Instanz),
+    #: nur bei einer Sequenz im Chunk gesetzt
+    inst: str
+    chunk_index: int
+    rows: int
+    depth: int
+    peak_mib: float
+    end_mib: float
+    persist_mib: Optional[float]
+    t: str = ""
+
+    @property
+    def transient_planner_mib(self) -> float:
+        return self.peak_mib - self.end_mib
+
+
+def seq_windows(text: str, chunk: int) -> Dict[int, List[SeqWindow]]:
+    """Die H55-Chunkfenster je Stufe mit Sequenzzahl (letzte ``#969N ADMIT``
+    der Stufe davor; ohne Zeile 1), Request-Instanz und Tiefe (letzte ``#969
+    EXTENT`` der Stufe davor; ohne Zeile kein Fenster)."""
+    c = max(1, int(chunk))
+    seqs: Dict[int, int] = {}
+    ext: Dict[int, List[Tuple[str, int, int]]] = {}
+    inst_n: Dict[Tuple[int, str], int] = {}
+    base: Dict[int, float] = {}
+    out: Dict[int, List[SeqWindow]] = {}
+    for line in text.splitlines():
+        m = _RX_ADMIT_BS.search(line)
+        if m:
+            seqs[int(m.group(1))] = int(m.group(2))
+            continue
+        m = _RX_EXTENT_REQS.search(line)
+        if m:
+            s = int(m.group(1))
+            reqs = []
+            for rid, st, en in _RX_EXTENT_REQ.findall(m.group(2)):
+                if int(st) == 0 or (s, rid) not in inst_n:
+                    inst_n[(s, rid)] = inst_n.get((s, rid), -1) + 1
+                reqs.append((f"{rid}#{inst_n[(s, rid)]}", int(st), int(en)))
+            if reqs:
+                ext[s] = reqs
+            continue
+        m = _RX_H55_CHUNK.search(line)
+        if not m:
+            continue
+        s = int(m.group(1))
+        if s not in ext:
+            continue
+        n_seq = seqs.get(s, 1)
+        rows, end = int(m.group(2)), float(m.group(7))
+        depth = max(e for _, _, e in ext[s])
+        if s not in base and n_seq == 1 and rows == c and depth == c:
+            base[s] = end
+        ts = _RX_TS.search(line)
+        inst, start, _e = ext[s][0]
+        out.setdefault(s, []).append(SeqWindow(
+            stage=s, seqs=n_seq, inst=inst if n_seq == 1 else "", chunk_index=start // c,
+            rows=rows, depth=depth, peak_mib=float(m.group(3)), end_mib=end,
+            persist_mib=(end - base[s]) if s in base else None,
+            t=ts.group(1) if ts else "",
+        ))
+    return out
+
+
+def logs_carry_seq_windows(boots: Sequence[Tuple[str, str]]) -> bool:
+    """#242b: tragen ALLE Logs H55-Chunkfenster und ``#969N ADMIT`` (die
+    Mehr-Sequenz-Form H91)? Dann misst die Referenz aus den Fenstern
+    (``windows=True``); Logs davor (fnFL2x163-165) bleiben beim alten Weg."""
+    return bool(boots) and all(
+        _RX_H55_CHUNK.search(text) is not None and _RX_ADMIT_BS.search(text) is not None
+        for _name, text in boots
+    )
+
+
+#: #242b: Aufloesung, mit der die Saettigung das gemessene Maximum erreicht.
+GROWTH_SATURATION_MIB = 8.0
+
+
+def window_growth(windows: Sequence[SeqWindow], chunk: int) -> Optional[Tuple[float, int, float]]:
+    """``(MiB je Token, Saettigungs-Chunk, Maximum MiB)`` des Chunk-Wachstums.
+
+    Das Wachstum ist GRUNDSTAND (allocated nach dem Chunk), keine Transiente --
+    die Transiente je Chunk traegt der Stuetzpunkt (P_ACTIVATION_MIB). Das
+    Maximum ist der hoechste Grundstand ueber ALLEN Fenstern jeder Last gegen
+    den Chunk-0-Punkt ihres Boots (mehrere lebende Sequenzen eingeschlossen);
+    die Rate der steilste Anstieg innerhalb EINER Request-Instanz in Ein-
+    Sequenz-Chunks voller Breite (Grundstand am Chunk k minus am Chunk 0 der
+    Instanz, je Chunk). ``None`` ohne Maximum oder ohne Rate. Die Fenster
+    aller Boots gehen gepoolt hinein (Instanzen je Boot eindeutig benannt)."""
+    top = max((w.persist_mib for w in windows if w.persist_mib is not None), default=None)
+    base: Dict[str, float] = {}
+    rate_ci = 0.0
+    for w in windows:
+        if w.seqs != 1 or w.rows != int(chunk) or not w.inst:
+            continue
+        if w.chunk_index == 0:
+            base.setdefault(w.inst, w.end_mib)
+            continue
+        b = base.get(w.inst)
+        if b is not None:
+            rate_ci = max(rate_ci, (w.end_mib - b) / w.chunk_index)
+    if top is None or rate_ci <= 0.0:
+        return None
+    top = max(0.0, top)
+    sat = max(1, math.ceil((top - GROWTH_SATURATION_MIB) / rate_ci))
+    return rate_ci / int(chunk), sat, top
+
+
 def unmeasured_text(support: TransientSupport, chunk: int) -> str:
     lo, hi = support.chunks[0], support.chunks[-1]
     return (
@@ -503,6 +625,12 @@ class PCardReference(msgspec.Struct, frozen=True, kw_only=True):
     #: ``--max-mamba-cache-size``, nicht an den Sitzen (x160 1 Sitz und
     #: x163-x165 4 Sitze: alle 24 Slots).
     mamba_slots: int = 0
+    #: #242b: das gemessene Maximum des Chunk-Wachstums je Stufe (Grundstand
+    #: ueber alle Lastzustaende, MiB). Gesetzt kappt es ``Rate x Chunks``: die
+    #: Rate ist der steilste Anstieg, die Saettigung gerundet -- ohne Kappe
+    #: laege die Saettigung bis zu einer Chunk-Rate ueber jeder Messung.
+    #: Leer = ungekappt (die Referenzen vor #242b).
+    growth_cap_mib: Tuple[float, ...] = ()
 
 
 _RX_EXTENT = re.compile(_STAGE + r" #969 EXTENT n=\d+ fwd=\d+ reqs=\[\('[^']*', (\d+), (\d+)")
@@ -878,6 +1006,7 @@ def p_card_reference_from_logs(
     model: str,
     over_boots: Sequence[Tuple[str, str]] = (),
     d_logs: Optional[Dict[str, str]] = None,
+    windows: bool = False,
 ) -> PCardReference:
     """Die P-Karten-Referenz aus P-Logs MESSEN (``boots`` = (Name, Text)).
 
@@ -894,11 +1023,23 @@ def p_card_reference_from_logs(
     verschieden vollem Mitbewohner sind sonst nicht vergleichbar -- und die
     Referenz nennt den Mitbewohner ihres Punkts. Die Sitze (``max_running_
     requests``) sind Form wie der Chunk: eine Referenz mischt sie nicht.
+
+    #242b ``windows=True`` (Logs mit H55-Fenstern und ``#969N ADMIT``, die
+    Mehr-Sequenz-Form H91): der Chunk-0-Punkt nur aus einem EIN-Sequenz-Chunk,
+    normiert mit SEINER gemessenen Transiente (Spitze minus allocated danach,
+    das H55-Fenster derselben Spitze) statt dem Stuetzpunkt; das Wachstum nur
+    aus Ein-Sequenz-Chunks derselben Anfrage (:func:`window_growth`). Die
+    Hochwassermarken mischen sonst die Last (2-5 Sequenzen im 16k-Chunk: PP0
+    +2500 MiB Transiente) in das Wachstum mit der Tiefe (28.09.: 1942 statt
+    342 MiB je 16k auf PP0).
     """
     n = len(stage_layers)
     best: Dict[int, Tuple[float, PoolSample, int, float, Optional[float], str]] = {}
     growth: Dict[int, float] = {}
     gidx: Dict[int, int] = {}
+    pooled: Dict[int, List[SeqWindow]] = {}
+    pooled_chunk: Dict[int, int] = {}
+    gcap: Dict[int, float] = {}
     lmem: Dict[int, float] = {}
     chunks = set()
     draft = set()
@@ -914,9 +1055,25 @@ def p_card_reference_from_logs(
         seats.update(obs["seats"].values() or [1])
         mamba.update(obs["mamba_slots"].values())
         longest = max(longest, longest_prompt_tokens(text))
+        c0 = int(obs["chunk"].get(0, 0) or 1)
+        wins = seq_windows(text, c0) if windows else {}
         for s in range(n):
+            if windows:
+                # Instanzen je Boot eindeutig; auch ohne Chunk-0-Punkt dieses Boots
+                pooled.setdefault(s, []).extend(
+                    msgspec.structs.replace(w, inst=f"{name}/{w.inst}" if w.inst else "")
+                    for w in wins.get(s, [])
+                )
+                pooled_chunk[s] = c0
             ss = samples.get(s, [])
             first = [p for p in ss if p.chunk_index == 0]
+            t_meas: Dict[float, float] = {}
+            if windows:
+                # der Chunk-0-Punkt nur als Ein-Sequenz-Chunk mit gemessener Transiente
+                for w in wins.get(s, []):
+                    if w.seqs == 1 and w.chunk_index == 0 and w.depth == c0:
+                        t_meas.setdefault(w.peak_mib, w.transient_planner_mib)
+                first = [p for p in first if p.peak_mib in t_meas]
             if not first or s not in obs["buffer"] or s not in obs["cell"] or s not in obs["tokens"]:
                 continue
             c = int(obs["chunk"][s])
@@ -924,7 +1081,10 @@ def p_card_reference_from_logs(
             p0 = min(first, key=lambda p: p.headroom_mib)
             rows = int(obs["buffer"][s])
             kv = float(obs["tokens"][s]) * float(obs["cell"][s]) / MIB
-            t, _src = transient_mib(support, s, c)
+            if windows:
+                t = t_meas[p0.peak_mib]
+            else:
+                t, _src = transient_mib(support, s, c)
             h0 = p0.headroom_mib + rows * int(stage_layers[s]) * float(row_mib) + kv + t
             co = co_tenant_at(dl[name], s, p0.t) if with_co else None
             if with_co and co is None:
@@ -936,12 +1096,17 @@ def p_card_reference_from_logs(
             key = h0 + (co or 0.0)
             if s not in best or key < best[s][0] + (best[s][4] or 0.0):
                 best[s] = (h0, p0, rows, kv, co, name)
-            last = max(ss, key=lambda p: (p.chunk_index, p.peak_mib))
-            if last.chunk_index > 0:
-                g = (last.peak_mib - p0.peak_mib) / (last.chunk_index * c)
-                growth[s] = max(growth.get(s, 0.0), g)
-                gidx[s] = max(gidx.get(s, 0), last.chunk_index)
+            if not windows:
+                last = max(ss, key=lambda p: (p.chunk_index, p.peak_mib))
+                if last.chunk_index > 0:
+                    g = (last.peak_mib - p0.peak_mib) / (last.chunk_index * c)
+                    growth[s] = max(growth.get(s, 0.0), g)
+                    gidx[s] = max(gidx.get(s, 0), last.chunk_index)
             lmem[s] = max(lmem.get(s, 0.0), max(0.0, p0.cap_mib - min(p.cap_mib for p in ss)))
+    for s, ws in pooled.items():
+        wg = window_growth(ws, pooled_chunk[s])
+        if wg is not None:
+            growth[s], gidx[s], gcap[s] = wg
     missing = [s for s in range(n) if s not in best or s not in growth]
     if missing:
         raise ValueError(
@@ -988,6 +1153,7 @@ def p_card_reference_from_logs(
         co_tenant_mib=tuple(float(best[s][4]) for s in range(n)) if with_co else (),
         co_tenant_source=co_src,
         mamba_slots=int(next(iter(mamba))) if mamba else 0,
+        growth_cap_mib=tuple(round(gcap[s], 1) for s in range(n)) if windows else (),
     )
     if not over_boots:
         return ref
@@ -1279,6 +1445,8 @@ def solve_p_card(
             float(reference.growth_mib_per_token[s]) * sat_idx * int(reference.chunk)
             if use_growth else 0.0
         )
+        if reference.growth_cap_mib:
+            growth = min(growth, float(reference.growth_cap_mib[s]))
         ref_last = max(0, -(-int(reference.longest_prompt_tokens) // c) - 1)
         extrapolated = last_idx > ref_last
         if lmem_fixed:
