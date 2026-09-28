@@ -4836,6 +4836,27 @@ def d_form_solved_by_planner(ns) -> bool:
     return isinstance(d_kv_token_cut(ns), str)
 
 
+def d_fr_ceiling_before_map(ns) -> bool:
+    """R2 (28.09.): the P1c FR-D ceiling moves FR_D, and FR_D is a function
+    the Platztausch map is built from -- so where P1c is ARMED (default on,
+    P0 ``SGLANG_WEG2_TORCH_CACHE_CAP=1`` in --env-d, a MoE D form with an
+    ownership and an FR vector in --extra-d) the D form is solved and pinned
+    BEFORE the map, from the expectation budgets, exactly like an owned /
+    joint / maxmin form (#239 rc12z29c). After the map it would be refused
+    (a514587c52, W170) and NF stayed on the profile's FR_D with ~1.3 GiB idle
+    on nv0. A form the planner solves itself is already pinned there."""
+    if d_form_solved_by_planner(ns):
+        return False
+    env_d = parse_group_env(getattr(ns, "env_d", "") or "")
+    if str(env_d.get(FR_D_CEILING_ENV, "1")).strip() == "0":
+        return False
+    if str(env_d.get(TORCH_CACHE_CAP_ENV, "0")).strip() != "1":
+        return False
+    extra_d = getattr(ns, "extra_d", "") or ""
+    return bool(_argv_vector(extra_d, "--rank-moe-ratio")
+                and _argv_vector(extra_d, "--rank-moe-resident-fraction"))
+
+
 def pin_d_form_for_map(ns, log) -> Optional[dict]:
     """#239 rc12z29c: freeze the D form the Platztausch map is built from.
 
@@ -4854,18 +4875,21 @@ def pin_d_form_for_map(ns, log) -> Optional[dict]:
     ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
     fr = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-resident-fraction")
     cut = getattr(ns, "_d_solved_cut", None)
-    if not ratios or not fr or not cut:
+    # R2: a form without a token cut (the P1c pin) pins cut None -- only a
+    # cut that was ASKED for and not published leaves the form unpinned
+    if not ratios or not fr or (not cut and d_kv_token_cut(ns) is not None):
         log(f"{D_RANK_SOLVE_MARKER} KARTE-FORM (#239 rc12z29c) NICHT GEPINNT: der Solve "
             f"vor der Karte hat keinen Schnitt/Vektor veroeffentlicht (ratio {ratios}, "
             f"FR_D {fr}, Schnitt {cut}) -- die Karte liest die Vektoren, die jetzt in "
             f"--extra-d stehen")
         return None
     form = {"ratios": [str(x) for x in ratios], "fractions": [str(x) for x in fr],
-            "cut": tuple(float(x) for x in cut)}
+            "cut": tuple(float(x) for x in cut) if cut else None}
     ns._d_map_form = form
     log(f"{D_RANK_SOLVE_MARKER} KARTE-FORM (#239 rc12z29c) GEPINNT: die Platztausch-Karte "
         f"baut Phase D aus --rank-moe-ratio {','.join(form['ratios'])}, FR_D "
-        f"{','.join(form['fractions'])}, Token-Schnitt {list(form['cut'])} -- dieselben "
+        f"{','.join(form['fractions'])}, Token-Schnitt "
+        f"{list(form['cut']) if form['cut'] else 'keiner'} -- dieselben "
         f"Vektoren, die D's Expertenfenster liest; jeder spaetere D-Solve prueft genau "
         f"diese Form gegen sein Budget und loest sie nicht neu")
     return form
@@ -16654,10 +16678,11 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     if _pinned:
         # #239 rc12z29c: the Platztausch map was built from this form (P loaded
         # it) -- check exactly it: fixed cut, ownership and FR_D from --extra-d
-        _kv_cut = tuple(_pinned["cut"])
+        _kv_cut = tuple(_pinned["cut"]) if _pinned.get("cut") else None
         log(f"{D_RANK_SOLVE_MARKER} {label} KARTE-FORM (#239 rc12z29c): geprueft, nicht neu "
             f"geloest -- Eigentum {','.join(_pinned['ratios'])}, FR_D "
-            f"{','.join(_pinned['fractions'])}, Schnitt {list(_kv_cut)} (die Form der Karte)")
+            f"{','.join(_pinned['fractions'])}, Schnitt "
+            f"{list(_kv_cut) if _kv_cut else 'keiner'} (die Form der Karte)")
     elif _er.owned_cut_request(_kv_cut)[0] and getattr(ns, "_d_owner_stated", None):
         # #239 S3f: every pass solves the ownership from the STATED vector
         ratios = list(ns._d_owner_stated)
@@ -22472,7 +22497,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # is solved HERE, from the expectation budgets, before the map is built --
     # the map's D windows and P's common prefix are functions of it, and P
     # loads the map before D's measured budgets exist.
-    if d_form_solved_by_planner(ns) and not getattr(ns, "_d_map_form", None):
+    # R2 (28.09.): so is a P1c FR-D ceiling (d_fr_ceiling_before_map) -- its
+    # FR_D is published here, the map and STORE-GEOMETRY read exactly it.
+    if ((d_form_solved_by_planner(ns) or d_fr_ceiling_before_map(ns))
+            and not getattr(ns, "_d_map_form", None)):
         # only the form's vectors outlive this pass; its env writes (scratch
         # cap, seat rows, stage form, waves, trims) come from the real budgets
         _env_d_before = str(getattr(ns, "env_d", "") or "")
