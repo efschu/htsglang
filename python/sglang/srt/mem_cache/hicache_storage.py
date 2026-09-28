@@ -3989,6 +3989,15 @@ class HiCacheFile(HiCacheStorage):
         if capacity <= 0:
             return None
         pools = getattr(self, "_read_buffers", None)
+        if pools is not None and pool_name in pools:
+            return pools[pool_name]
+        # WAKE-PARALLEL: several aux threads may ask first at once -- one ring
+        # per pool, never two pinned rings of which one leaks
+        with _read_ring_lock:
+            return self._read_buffer_pool_locked(pool_name, host_pool, capacity)
+
+    def _read_buffer_pool_locked(self, pool_name: str, host_pool, capacity: int):
+        pools = getattr(self, "_read_buffers", None)
         if pools is None:
             pools = self._read_buffers = {}
         pool = pools.get(pool_name)
@@ -4350,6 +4359,7 @@ L3_PARALLEL_MIN_PAGES = 64
 _l3_pool = None
 _l3_pool_n = 0
 _l3_pool_lock = threading.Lock()
+_read_ring_lock = threading.Lock()
 
 
 def l3_read_threads() -> int:
