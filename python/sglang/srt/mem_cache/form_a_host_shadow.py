@@ -55,6 +55,27 @@ THE POLICY (variant c + a, no new collective):
     drops in flight). The KV pool of a worker already covers TP0's id space
     (fnFL2x62 ``_carrier_capacity_bid``).
 
+(d) #239 S4b part 4 -- THE TOKEN CUT (``kv=qsa_forma_dcp``). A worker that
+    owns token rows is no longer byteless: its rows ARE the page's bytes, and
+    TP0 (share 0 in the target form 0/48/16) writes nothing. TP0's own store
+    ack is then no evidence that the page is in the arena, and a TRANSIT
+    decided on it frees rows a worker is still writing from (its store write
+    holds a host lock, so the worker's release was a silent no-op -- the
+    trees parted: TP0 without host rows, the worker with). Under the cut:
+
+    * a worker never rebinds at its own ack -- it keeps its rows until TP0's
+      verdict (the rows carry the bytes of its store write);
+    * TP0 rebinds only a COMPLETE page (every owner wrote: the shared arena
+      header, ``find_slots`` state 2 -- no collective) and sends REBIND, on
+      which every worker rebinds the same node; an incomplete page at TP0's
+      ack waits (``REBIND_WAIT_PASSES`` broadcasts, re-checked at each
+      ``attach``) and only then falls back to what the ack would have done
+      without the cut (TRANSIT for a transit node, keep otherwise);
+    * a REBIND or TRANSIT that meets a busy node (host lock: the node's own
+      write or load in flight) stays pending instead of being dropped.
+
+    Outside the cut every path below is the pre-part-4 one.
+
 Switch ``SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW``; it acts only with an
 installed Form A role plan whose host is TP rank 0, on a pure TP group
 (no DP attention, pp 1). Off (or a classic boot) = the pre-R12 code paths,
@@ -72,6 +93,13 @@ logger = logging.getLogger(__name__)
 #: event kinds
 TRANSIT = "transit"
 STATE = "state"
+#: #239 S4b part 4: TP0 rebound a COMPLETE token-cut page -- every worker does
+REBIND = "rebind"
+
+#: #239 S4b part 4: broadcasts TP0 waits for an incomplete token-cut page
+#: before it falls back to the ack's pre-cut decision (a write of every owner
+#: acks within a pass or two; the bound is a backstop, not a timing)
+REBIND_WAIT_PASSES = 64
 
 #: Tree attribute: while set to a list, ``_evict_component_and_detach_lru``
 #: records every node whose HOST layer it frees (TP0's own evict_host).
@@ -108,6 +136,9 @@ class _State:
         self.pending: Dict[Tuple[str, int], Tuple[str, str, int, int, int, int]] = {}
         self.absent: set = set()
         self.tree: Any = None
+        # #239 S4b part 4 (TP0 only): nodes whose token-cut page was not yet
+        # complete at TP0's ack -> [node, passes waited, fallback transit]
+        self.rebind_wait: Dict[Tuple[str, int], list] = {}
         self.seq = 0
         self.counts: Dict[str, int] = {}
         self.announced = False
@@ -147,6 +178,21 @@ def role() -> Optional[str]:
     from sglang.srt.rank_role import this_rank_is_form_a_worker
 
     return "worker" if this_rank_is_form_a_worker() else "host"
+
+
+def cut_role() -> Optional[str]:
+    """#239 S4b part 4: :func:`role` when the Form A group runs the token cut
+    (a worker owns real KV rows), else None. Group-uniform: the installed
+    plan and the installed owner bounds are the same on every rank."""
+    r = role()
+    if r is None:
+        return None
+    try:
+        from sglang.srt.rank_role import form_a_token_cut_active
+
+        return r if form_a_token_cut_active() else None
+    except Exception:  # noqa: BLE001 - no cut readable = the pre-cut paths
+        return None
 
 
 def wire_active(server_args: Any, ps: Any) -> bool:
@@ -267,6 +313,69 @@ def record_state(tree: Any, node: Any, why: str = "") -> None:
     _S.ledger.append((STATE, k[0], k[1], exists, kv, m))
 
 
+def record_rebind(tree: Any, node: Any) -> bool:
+    """#239 S4b part 4, TP0 under the cut: it rebound a COMPLETE page to the
+    arena; every worker rebinds the same node at the next broadcast (until
+    then it keeps its own rows -- the bytes). False = not keyable (logged)."""
+    k = node_key(node)
+    if k is None:
+        if _note("unkeyed_rebind"):
+            logger.warning("R12 HOST-VERDICT unkeyed rebind node=%s (the workers keep "
+                           "their rows)", getattr(node, "id", "?"))
+        return False
+    register_tree(tree)
+    _announce("host")
+    _S.ledger.append((REBIND, k[0], k[1], 1, 1, 0))
+    return True
+
+
+def await_complete(tree: Any, node: Any, fallback_transit: bool) -> bool:
+    """#239 S4b part 4, TP0 under the cut: its ack came while the page was not
+    complete in the arena (an owner's write still in flight). Wait for the
+    page instead of deciding on TP0's own ack. False = not keyable -> the
+    caller takes the pre-cut decision at once."""
+    k = node_key(node)
+    if k is None:
+        return False
+    register_tree(tree)
+    _announce("host")
+    _S.rebind_wait[k] = [node, 0, bool(fallback_transit)]
+    return True
+
+
+def _retry_rebinds() -> None:
+    """TP0, at ``attach``: re-check every waiting page; complete -> rebind and
+    send REBIND; past the bound -> the pre-cut decision (TRANSIT or keep)."""
+    tree = _S.tree
+    if tree is None or not _S.rebind_wait:
+        return
+    for k, ent in list(_S.rebind_wait.items()):
+        node, waited, fallback = ent
+        if not _attached(node) or node.component_data[int(_base_ct())].host_value is None:
+            del _S.rebind_wait[k]  # the node or its host life went another way
+            continue
+        if tree._weg2_rebind_host_to_arena(node):
+            del _S.rebind_wait[k]
+            _S.ledger.append((REBIND, k[0], k[1], 1, 1, 0))
+            n = _note("rebind_late", 256)
+            if n:
+                logger.info("R12 CUT-REBIND node=%s depth=%d after %d pass(es) (every owner "
+                            "wrote; the workers rebind at this broadcast) n=%d",
+                            getattr(node, "id", "?"), k[1], waited + 1, n)
+            continue
+        ent[1] = waited + 1
+        if ent[1] >= REBIND_WAIT_PASSES:
+            del _S.rebind_wait[k]
+            if fallback:
+                _S.ledger.append((TRANSIT, k[0], k[1], 1, 0, 0))
+            if _note("rebind_expired", 16):
+                logger.warning(
+                    "R12 CUT-REBIND-EXPIRED node=%s depth=%d: the page was not complete "
+                    "in the arena after %d broadcasts -> %s (the pre-cut decision)",
+                    getattr(node, "id", "?"), k[1], ent[1],
+                    "TRANSIT on every rank" if fallback else "every rank keeps its rows")
+
+
 def note_backup_ok(tree: Any, node: Any) -> None:
     """TP0 backed up a node it earlier reported without host: say so, so a
     worker's still-pending drop for it is superseded."""
@@ -279,6 +388,8 @@ def note_backup_ok(tree: Any, node: Any) -> None:
 
 def attach(recv_reqs: List) -> List:
     """Origin (TP0), right before the broadcast: put the pass's verdict FIRST."""
+    if _S.rebind_wait:
+        _retry_rebinds()  # #239 S4b part 4: pages that completed since
     if not _S.ledger:
         return recv_reqs
     _S.seq += 1
@@ -287,8 +398,9 @@ def attach(recv_reqs: List) -> List:
     n = _note("sent")
     if n:
         kinds = [e[0] for e in v.events]
-        logger.info("R12 HOST-VERDICT SENT seq=%d events=%d transit=%d state=%d (n=%d)",
-                    v.seq, len(v.events), kinds.count(TRANSIT), kinds.count(STATE), n)
+        logger.info("R12 HOST-VERDICT SENT seq=%d events=%d transit=%d state=%d rebind=%d (n=%d)",
+                    v.seq, len(v.events), kinds.count(TRANSIT), kinds.count(STATE),
+                    kinds.count(REBIND), n)
     return [v] + list(recv_reqs)
 
 
@@ -322,12 +434,13 @@ def on_tree_reset(tree: Any) -> None:
     """The tree is dropped (flush/flip, on every rank at the same point): no
     event may outlive the nodes it names -- a re-inserted prefix has the same
     hash."""
-    if _S.ledger or _S.pending or _S.absent:
-        logger.info("R12 HOST-VERDICT reset drops ledger=%d pending=%d",
-                    len(_S.ledger), len(_S.pending))
+    if _S.ledger or _S.pending or _S.absent or _S.rebind_wait:
+        logger.info("R12 HOST-VERDICT reset drops ledger=%d pending=%d rebind_wait=%d",
+                    len(_S.ledger), len(_S.pending), len(_S.rebind_wait))
     _S.ledger = []
     _S.pending = {}
     _S.absent = set()
+    _S.rebind_wait = {}
 
 
 # ---------------------------------------------------------------- apply
@@ -364,8 +477,9 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
     runs everywhere (TP0 deferred its own release to here), STATE only on a
     worker (TP0 is already in that state)."""
     r = role()
+    cut = cut_role() is not None
     c = dict(transit=0, kv=0, anchor=0, deleted=0, short=0, missing=0,
-             pending=0, unreconcilable=0, noop=0)
+             pending=0, unreconcilable=0, noop=0, rebind=0, rebind_miss=0)
     for e in events:
         _S.pending[(e[1], int(e[2]))] = e  # a newer event for the key supersedes
     if not _S.pending:
@@ -380,9 +494,29 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
             c["missing"] += 1
             continue
         if kind == TRANSIT:
+            if cut and _busy(tree, node):
+                # #239 S4b part 4: under the cut a worker's own store write
+                # holds the rows -- the release waits for it (was a silent no-op)
+                _S.pending[(h, int(depth))] = e
+                c["pending"] += 1
+                continue
             before = _host_flags(node)
             tree._weg2_release_chain_piece_host(node)
             c["transit" if _host_flags(node) != before else "noop"] += 1
+            continue
+        if kind == REBIND:
+            if r != "worker":
+                continue  # TP0 rebound before it sent the event
+            if _busy(tree, node):
+                _S.pending[(h, int(depth))] = e
+                c["pending"] += 1
+                continue
+            if tree._weg2_rebind_host_to_arena(node):
+                c["rebind"] += 1
+            else:
+                # the page is complete (TP0 saw it, TP0's reference keeps it):
+                # a miss is this rank's pool, not the page -- keep the rows
+                c["rebind_miss"] += 1
             continue
         if r != "worker":
             continue
@@ -391,12 +525,17 @@ def apply(tree: Any, events: List, seq: int = 0) -> Dict[str, int]:
             _S.pending[(h, int(depth))] = e
         c[out] += 1
     n = _note("applied")
-    if n and (events or any(c[k] for k in ("transit", "kv", "anchor", "deleted"))):
+    if n and (events or any(c[k] for k in ("transit", "kv", "anchor", "deleted", "rebind"))):
         logger.info(
             "R12 HOST-VERDICT APPLIED seq=%d role=%s events=%d transit=%d kv_dropped=%d "
-            "anchor_dropped=%d deleted=%d short=%d missing=%d pending=%d unreconcilable=%d (n=%d)",
+            "anchor_dropped=%d deleted=%d short=%d missing=%d pending=%d unreconcilable=%d "
+            "rebind=%d (n=%d)",
             seq, r, len(events), c["transit"], c["kv"], c["anchor"], c["deleted"], c["short"],
-            c["missing"], c["pending"], c["unreconcilable"], n)
+            c["missing"], c["pending"], c["unreconcilable"], c["rebind"], n)
+    if c["rebind_miss"] and _note("rebind_miss", 16):
+        logger.warning("R12 CUT-REBIND-MISS %d node(s): TP0 rebound a complete page, this "
+                       "worker's pool could not -- it keeps its own rows (same tree shape)",
+                       c["rebind_miss"])
     if c["short"] and _note("short_apply", 16):
         logger.warning("R12 SHADOW-SHORT at reconcile: %d node(s) TP0 holds on host, "
                        "this worker does not (its own backup was refused)", c["short"])
