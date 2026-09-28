@@ -3834,7 +3834,38 @@ class Front:
         if defer:
             out["parked_n"] = len(parked) - len(defer)
             out["park_defer_rids"] = list(defer)
+        kv = Front._wake_phase_kv_tokens(self, parked, held, ready, defer, out)
+        if kv > 0:
+            out["phase_kv_tokens"] = kv
         return out
+
+    def _wake_phase_kv_tokens(self, parked, held, ready, defer, fields) -> int:
+        """#251c: the KV tokens of the D phase this wake opens -- what D's KV
+        stage (``d_seat_vram.choose_form_stage``) must hold. The front's OWN
+        count, the one its D seat gate already charges: a seated request by
+        its seat (``d_seat_need`` at grant: realised prompt tokens once leg 1
+        answered, the arrival estimate before), a waiting one by the same
+        function. The phase's seats in D's order -- the parked ones it resumes
+        first, the ones it holds, the hand-offs in flight, then the waiting
+        ones -- summed over the first n = ``d_phase_seats`` (the rest wait for
+        a seat, their KV is not this phase's). Prompt extent only: the decode
+        growth inside the phase is not priced here (the stage granule is its
+        slack, above the top stage the youngest parks). 0 = nothing priced;
+        the field is then left off and D keeps S0 exactly as without it."""
+        seat_tokens: Dict[str, int] = {}
+        for s in list(getattr(self, "_d_seats_live", None) or ()):
+            seat_tokens[s.rid] = seat_tokens.get(s.rid, 0) + int(getattr(s, "tokens", 0) or 0)
+        D = (getattr(self, "groups", None) or {}).get("D")
+        outstanding = getattr(D, "outstanding", None) or {}
+        defer = set(defer or ())
+        order = [seat_tokens.get(r, 0) for r in parked if r not in defer]
+        order += [seat_tokens.get(r, 0) for r in held]
+        order += [t for r, t in seat_tokens.items() if r not in outstanding and r not in parked]
+        order += [d_seat_need(getattr(p, "est_prompt", 0), getattr(p, "leg1_prompt_tokens", 0))[0]
+                  for p in ready]
+        n = phase_policy.d_phase_seats(fields["handoff_n"], fields["parked_n"],
+                                       int(getattr(self, "d_bs", 0) or len(order) or 1))
+        return int(sum(order[:n]))
 
     def _seat_rotate_note_resume(self, parked) -> None:
         """#244: at PARK-RESUME, which parked ones resumed (the dwell) and
@@ -8437,10 +8468,13 @@ class Front:
             # H91c3-3: the phase's n as D derives it (the same pure function)
             self._d_phase_n = phase_policy.d_phase_seats(
                 _wake_extra["handoff_n"], _wake_extra["parked_n"], self.d_bs)
-            logger.info("WEG2 HANDOFF-N epoch=%d wake=%s handoff_n=%d parked_n=%d (the requests the "
+            logger.info("WEG2 HANDOFF-N epoch=%d wake=%s handoff_n=%d parked_n=%d "
+                        "phase_kv_tokens=%s (the requests the "
                         "P phase that just ended handed over, and the wait-bound-parked ones D "
-                        "resumes first; carried on the kv_cache resume to D, H91 part C)",
-                        self.epoch, dst, _wake_extra["handoff_n"], _wake_extra["parked_n"])
+                        "resumes first; carried on the kv_cache resume to D, H91 part C; "
+                        "phase_kv_tokens = their prompt KV, D's #251c stage demand)",
+                        self.epoch, dst, _wake_extra["handoff_n"], _wake_extra["parked_n"],
+                        _wake_extra.get("phase_kv_tokens", "-"))
         # #1350 READING 1 OF 2, at a moment this front already owns. Only at
         # epoch 0: the term is the step the FIRST waking of each group adds, it
         # SATURATES after the first pair (weg2xsn20: 3.16 of 4.46 GiB in the
