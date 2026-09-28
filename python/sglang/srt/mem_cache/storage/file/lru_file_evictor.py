@@ -1633,30 +1633,41 @@ class LRUFileEvictor:
 
     # -- persistent index (store_journal.py) --------------------------------
 
-    def _journal_is_snapshot_writer(self) -> bool:
-        g = (os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper()
-        return self._is_storage_owner and g in ("", "D")
-
     def _attach_census(self) -> List[Tuple[float, str, int]]:
         """The attach census: from snapshot + journals when they hold, else ONE
-        walk (which the snapshot writer then persists)."""
+        walk for the whole store. NF metal rc12z30c: launcher, PP0-2 and D TP0
+        each walked (5 walks, one directory). Now the launcher writes the
+        snapshot (l3_persist_attach); a rank that still finds none takes the
+        store's lock, looks again, and only the first one walks -- writing the
+        full map of the directory it walked -- while the others load it."""
         if getattr(self, "_journal", None) is None:
             return self._census_existing_files()
         t0 = time.monotonic()
         items, why = self._journal_load()
         if items is None:
-            logger.info(f"HiCacheFile index: FULL WALK at attach -- {why}")
-            self._journal_collect = []
-            try:
-                entries = self._census_existing_files()
-                collected = self._journal_collect
-            finally:
-                self._journal_collect = None
-            self._journal_source = f"walk ({why})"
-            collected.sort(key=lambda it: it[0])
-            self._journal_write_snapshot(collected, len(collected))
-            return entries
+            with _sj.snapshot_lock(self.file_path):
+                items, why2 = self._journal_load()
+                if items is None:
+                    return self._attach_walk(why2 or why)
+            why = f"{why2} (behind the one walk: {why})"
+        return self._attach_from_items(items, why, t0)
 
+    def _attach_walk(self, why: str) -> List[Tuple[float, str, int]]:
+        """The one walk (caller holds the store lock): the census, and the
+        full map of the directory persisted as the snapshot at once."""
+        logger.info(f"HiCacheFile index: FULL WALK at attach -- {why}")
+        self._journal_collect = []
+        try:
+            entries = self._census_existing_files()
+            collected = self._journal_collect
+        finally:
+            self._journal_collect = None
+        self._journal_source = f"walk ({why})"
+        collected.sort(key=lambda it: it[0])
+        self._journal_write_snapshot(collected, len(collected))
+        return entries
+
+    def _attach_from_items(self, items, why: str, t0: float) -> List[Tuple[float, str, int]]:
         class _St:
             __slots__ = ("st_mtime", "st_size", "st_blocks")
 
@@ -1672,10 +1683,6 @@ class LRUFileEvictor:
         self._journal_source = why
         logger.info(f"HiCacheFile index LOADED at attach: {why}, {len(items)} files, "
                     f"{(time.monotonic() - t0) * 1000:.0f} ms (no directory walk)")
-        # R4: persisted straight from the loaded dict (insertion order = oldest
-        # first), BEFORE the install -- the dict is gone when the LRU is built
-        self._journal_write_snapshot(
-            ((m, stem, n) for stem, (m, n) in items.items()), len(items))
         return entries
 
     def _journal_load(self):
@@ -1703,19 +1710,13 @@ class LRUFileEvictor:
         self._journal_reader.mark(epoch_below=epoch if epoch > 0 else None)
 
     def _journal_write_snapshot(self, items, n: int) -> None:
-        """The ONE snapshot writer (the D group's owner) persists the attach
-        census it just read -- streamed from ``items`` (R4: no list, no payload)
-        -- and compacts the earlier boots' journals into it."""
-        if (getattr(self, "_journal_reader", None) is None
-                or not self._journal_is_snapshot_writer()):
-            return
+        """Whoever walked persists the full map at once (the caller holds the
+        store lock) -- streamed from ``items`` (R4) -- and folds the earlier
+        boots' journals in. Any group: the first process that needs the
+        index is the one that walks (P starts before D)."""
         epoch = _sj.attach_epoch()
         try:
-            tmps = _sj.remove_snapshot_tmps(self.file_path)
-            if tmps:
-                logger.info(f"HiCacheFile index: {tmps} torn snapshot tmp(s) of a dead writer removed")
-            n, nbytes = _sj.write_snapshot(self.file_path, items, epoch, n=n)
-            gone = _sj.remove_journals_before(self.file_path, epoch)
+            n, nbytes, gone = _sj.persist(self.file_path, items, n, epoch)
             logger.info(f"HiCacheFile index SNAPSHOT written: {n} files, {nbytes} B "
                         f"({self._journal_source}); {gone} journal(s) of earlier boots compacted; "
                         f"host RAM of this index ~{n * _sj.RAM_BYTES_PER_ENTRY / (1 << 20):.0f} MiB "

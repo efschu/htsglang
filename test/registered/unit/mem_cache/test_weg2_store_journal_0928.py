@@ -176,19 +176,43 @@ class TestPersistence(_Env):
         items, why = SJ.load_index(self.d)
         self.assertIsNotNone(items, why)
 
-    def test_compaction_by_the_d_owner_only(self):
-        _ev(self.d)
+    def test_three_p_and_one_d_walk_once_then_never(self):
+        # NF metal rc12z30c: PP0, PP1, PP2 and D TP0 each walked a store
+        # without a snapshot. First boot: the first process walks and writes
+        # the full map, the three after it load it. Second boot: nobody walks.
+        for i in range(6):
+            _write(self.d, f"old{i:04d}{SHARED}")
+        _write(self.d, "privD0000_B", 2 * PAGE)          # a suffix P does not scan
+        walks = []
+        evs = [_ev(self.d, walks=walks, tp=0, group="P") for _pp in range(3)]
+        evs.append(_ev(self.d, walks=walks, tp=0, group="D"))
+        self.assertEqual(len(walks), 1, "more than one process walked the store")
+        self.assertTrue(os.path.exists(os.path.join(self.d, SJ.SNAP)))
+        items, _why = SJ.load_index(self.d)
+        self.assertIn("privD0000_B", items, "the walker persisted only its own suffixes")
+        for e in evs:
+            self.assertEqual(e.index_coverage()["seen_entries"], 7)
+        _fill(evs[0], self.d, [f"p{i:04d}{SHARED}" for i in range(2)])
+        self.reboot(200)
+        walks2 = []
+        for grp in ("P", "P", "P", "D"):
+            last = _ev(self.d, walks=walks2, group=grp)
+        self.assertEqual(len(walks2), 0, "the second boot walked")
+        self.assertEqual(last.index_coverage()["indexed_entries"], 8)
+
+    def test_the_walker_folds_the_earlier_journals_in(self):
         p = _ev(self.d, group="P")
         _fill(p, self.d, [f"p{i:04d}{SHARED}" for i in range(2)])
         old = p._journal.path
+        os.unlink(os.path.join(self.d, SJ.SNAP))         # forces the next boot's one walk
         self.reboot(200)
-        _ev(self.d, group="P")                          # P loads, never compacts
-        self.assertTrue(os.path.exists(old))
-        _ev(self.d, group="D")                          # D writes the snapshot, then compacts
+        walks = []
+        _ev(self.d, walks=walks, group="P")
+        self.assertEqual(len(walks), 1)
         self.assertFalse(os.path.exists(old))
         self.reboot(300)
         walks = []
-        c = _ev(self.d, walks=walks)
+        c = _ev(self.d, walks=walks, group="D")
         self.assertEqual(len(walks), 0)
         self.assertEqual(c.index_coverage()["indexed_entries"], 2)
 

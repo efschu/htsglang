@@ -3421,8 +3421,22 @@ class HiCacheFile(HiCacheStorage):
             return 0
         n, batch = 0, []
         t0 = time.monotonic()
+        # NF metal rc12z30c: the seed was one more walk per boot. The
+        # persistent index (snapshot + earlier boots' journals; this boot's
+        # pages are added by the evictor as they commit) names the same stems.
+        source = "walk"
+        stems = None
         try:
-            for stem, _st in self._iter_existing_files():
+            from sglang.srt.mem_cache.storage.file import store_journal as _sj
+
+            if _sj.enabled():
+                stems, why = _sj.index_stems(self.file_path, _sj.attach_epoch())
+                source = "index" if stems is not None else f"walk ({why})"
+        except Exception as exc:  # noqa: BLE001 -- fall back to the walk
+            source = f"walk ({type(exc).__name__}: {exc})"
+        try:
+            for stem in (stems if stems is not None
+                         else (st for st, _st in self._iter_existing_files())):
                 batch.append(stem)
                 if len(batch) >= 4096:
                     idx.add(batch)
@@ -3434,8 +3448,8 @@ class HiCacheFile(HiCacheStorage):
         except Exception as exc:  # noqa: BLE001 -- the index is an accelerator; a partial seed is only misses
             logger.warning("L3-PERSIST index seed stopped after %d stems (%s: %s)",
                            n, type(exc).__name__, exc)
-        logger.info("L3-PERSIST index_seeded=%d walk_s=%.1f dir=%s index=%s",
-                    n, time.monotonic() - t0, self.file_path, idx.path)
+        logger.info("L3-PERSIST index_seeded=%d source=%s seed_s=%.1f dir=%s index=%s",
+                    n, source, time.monotonic() - t0, self.file_path, idx.path)
         return n
 
     def _stat_stems(self, stems: List[str]) -> dict:

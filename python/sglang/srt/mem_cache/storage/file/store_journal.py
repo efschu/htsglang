@@ -36,6 +36,8 @@ PURE: stdlib only.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import glob
 import hashlib
 import os
@@ -319,6 +321,44 @@ def write_snapshot(store: str, items, epoch: int, n: Optional[int] = None) -> Tu
     return count, total
 
 
+LOCK = "L3_INDEX.lock"
+
+
+@contextlib.contextmanager
+def snapshot_lock(store: str):
+    """The store's ONE-WALK lock (NF metal rc12z30c: launcher, PP0-2 and D TP0
+    each walked a store without a snapshot -- 5 walks for one directory).
+    Whoever finds no usable snapshot takes it, looks again, and only then
+    walks and writes; everyone behind it loads what it wrote. flock on a file
+    in the store, so it holds across the containers that bind the store."""
+    fd = None
+    try:
+        fd = os.open(os.path.join(store, LOCK), os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        if fd is not None:
+            os.close(fd)
+        fd = None  # no lock possible: walk unlocked (the old behaviour), never hang
+    try:
+        yield fd is not None
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def persist(store: str, items, n: int, epoch: int) -> Tuple[int, int, int]:
+    """Snapshot + compaction in one step: the torn tmps of a dead writer go,
+    the snapshot is written, the journals of earlier boots (``< epoch``) are
+    folded into it. Returns (entries, bytes, journals removed). Callers hold
+    ``snapshot_lock``."""
+    remove_snapshot_tmps(store)
+    n, nbytes = write_snapshot(store, items, epoch, n=n)
+    return n, nbytes, remove_journals_before(store, epoch)
+
+
 def remove_snapshot_tmps(store: str) -> int:
     """A snapshot tmp left by a writer that died mid-write (user: ".tmp beim
     Boot weg"). Only the ONE snapshot writer calls this, before it writes."""
@@ -344,7 +384,12 @@ def page_path(store: str, stem: str) -> str:
     if os.path.exists(p):
         return p
     flat = os.path.join(store, f"{stem}.bin")
-    return flat if os.path.exists(flat) else p
+    if os.path.exists(flat):
+        return flat
+    # a page outside the shard rule (never written by the backend, which always
+    # shards by it -- an offline copy or a hand-made store): one glob, on a miss only
+    hits = glob.glob(os.path.join(glob.escape(store), "*", glob.escape(f"{stem}.bin")))
+    return hits[0] if hits else p
 
 
 #: seconds a journaled change may precede its journal line (R before a
@@ -438,6 +483,14 @@ def load_index(store: str, *, own_path: Optional[str] = None,
         return items, (f"snapshot epoch {snap.epoch} ({len(snap.items)} files) + {used} "
                        f"journal(s), {applied} line(s), {stated} open intent(s) stat'ed")
     return None, "the snapshot kept changing while it was read"
+
+
+def index_stems(store: str, epoch: Optional[int] = None) -> Tuple[Optional[list], str]:
+    """The stems the persistent index names (snapshot + earlier boots'
+    journals), for seeding the shared #1459 stem index without a walk;
+    ``(None, why)`` when the index is unusable (the caller walks)."""
+    items, why = load_index(store, skip_epoch_from=epoch if epoch else None)
+    return (None, why) if items is None else (list(items), why)
 
 
 def index_entries(store: str) -> Tuple[int, str]:

@@ -373,7 +373,10 @@ class TestStoreCapBoundsTheDirectory(CustomTestCase):
             st = owner.stats()
             # 28.09.: the owner's own write journal (store_journal.py) is a
             # non-page file under the store too, and counted like one
-            jn = [os.path.join(d, n) for n in os.listdir(d) if n.endswith(".jnl")]
+            # (and, since the one-walk fix, the store's L3_INDEX.lock -- ZFS
+            # books an empty file one 512 B block)
+            jn = [os.path.join(d, n) for n in os.listdir(d)
+                  if n.endswith(".jnl") or n == "L3_INDEX.lock"]
             jn_bytes = sum(max(os.stat(p).st_blocks * 512, os.stat(p).st_size) for p in jn)
             self.assertEqual(
                 st["staging_bytes"],

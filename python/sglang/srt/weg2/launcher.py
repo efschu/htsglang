@@ -6599,6 +6599,15 @@ def l3_persist_attach(log: Log, directory: str, dry: bool) -> Tuple[int, int, in
         got = _l3_attach_from_index(log, directory, dry, epoch, known, revoked)
         if got is not None:
             return got
+    # NF metal rc12z30c: this walk is THE one walk of the boot -- the full map
+    # it sees is persisted as the snapshot at once, so no rank walks after it
+    snap_items: Optional[List[Tuple[float, str, int]]] = (
+        [] if _sj.enabled() and not dry else None)
+
+    def _keep(st, name):
+        if snap_items is not None:
+            snap_items.append((st.st_mtime, name[:-4], max(st.st_blocks * 512, st.st_size)))
+
     for root, _dirs, names in os.walk(directory):
         for name in names:
             p = os.path.join(root, name)
@@ -6623,6 +6632,7 @@ def l3_persist_attach(log: Log, directory: str, dry: bool) -> Tuple[int, int, in
                     rev_bytes += size
                 else:
                     rev_failed += 1
+                    _keep(st, name)  # still on disk: the map must name it
                 continue
             if known is not None and not name[:-4].endswith(known):
                 orphans += 1
@@ -6632,11 +6642,22 @@ def l3_persist_attach(log: Log, directory: str, dry: bool) -> Tuple[int, int, in
                         os.unlink(p)
                         removed += 1
                     except OSError:
-                        pass
+                        _keep(st, name)
                 continue
             files += 1
             nbytes += size
+            _keep(st, name)
     walk_s = time.monotonic() - t0
+    if snap_items is not None:
+        snap_items.sort(key=lambda it: it[0])
+        try:
+            with _sj.snapshot_lock(directory):
+                _n, _b, _gone = _sj.persist(directory, snap_items, len(snap_items), int(epoch))
+            log(f"L3-PERSIST SNAPSHOT written by the one walk: {_n} files, {_b} B, "
+                f"{_gone} journal(s) of earlier boots folded in -- the ranks load it, none walks")
+        except (OSError, ValueError) as exc:
+            log(f"L3-PERSIST snapshot NOT written ({type(exc).__name__}: {exc}) -- the first "
+                f"rank walks once under the store lock")
     log(
         f"L3-PERSIST {'reuse' if files else 'fresh'} dir={directory} files={files} bytes={nbytes} "
         f"({nbytes / host_ledger.GIB:.2f} GiB) orphans={orphans} ({orphan_bytes / host_ledger.GIB:.2f} GiB, "
@@ -6715,6 +6736,7 @@ def _l3_attach_from_index(log: Log, directory: str, dry: bool, epoch: float,
                         pass
                     if jn is None:  # the shard changed: a journal write after it
                         jn = _sj.JournalWriter(directory, "launcher", epoch=int(epoch) - 1)
+    dropped: List[str] = []
     for stem, (mtime, size) in items.items():
         if revoked and any(a <= mtime <= b for a, b, _r in revoked):
             path = _sj.page_path(directory, stem)
@@ -6723,6 +6745,7 @@ def _l3_attach_from_index(log: Log, directory: str, dry: bool, epoch: float,
                 rev_bytes += size
                 if not dry:
                     _gone(size, stem)
+                    dropped.append(stem)
             else:
                 rev_failed += 1
             continue
@@ -6738,11 +6761,28 @@ def _l3_attach_from_index(log: Log, directory: str, dry: bool, epoch: float,
                 except OSError:
                     continue  # still on disk: its entry stays
                 _gone(size, stem)
+                dropped.append(stem)
             continue
         files += 1
         nbytes += size
     if jn is not None:
         jn.sync()
+    snap_note = ""
+    if not dry:
+        # the launcher is the boot's snapshot writer: the loaded map minus
+        # what it just removed, earlier boots' journals folded in -- before
+        # any rank starts, so every rank loads ONE snapshot and replays nothing
+        for stem in dropped:
+            items.pop(stem, None)
+        try:
+            with _sj.snapshot_lock(directory):
+                _n, _b, _jg = _sj.persist(
+                    directory, ((m, st, b) for st, (m, b) in items.items()), len(items),
+                    int(epoch))
+            snap_note = f" snapshot rewritten ({_n} files, {_jg} journal(s) folded in)"
+        except (OSError, ValueError) as exc:
+            snap_note = (f" snapshot NOT rewritten ({type(exc).__name__}: {exc}; the E lines "
+                         f"above carry the removals)")
     log(
         f"L3-PERSIST {'reuse' if files else 'fresh'} dir={directory} files={files} bytes={nbytes} "
         f"({nbytes / host_ledger.GIB:.2f} GiB) orphans={orphans} ({orphan_bytes / host_ledger.GIB:.2f} GiB, "
@@ -6753,7 +6793,8 @@ def _l3_attach_from_index(log: Log, directory: str, dry: bool, epoch: float,
            f"{'would be ' if dry else ''}moved to {directory.rstrip('/') + L3_REVOKED_SUFFIX}"
            f"{f', {rev_failed} NOT moved (kept out of the count, still on disk)' if rev_failed else ''})"
            if revoked else "")
-        + f" index_s={time.monotonic() - t0:.2f} source=index ({why}), no walk epoch={epoch:.3f}"
+        + f" index_s={time.monotonic() - t0:.2f} source=index ({why}), no walk{snap_note}"
+        + f" epoch={epoch:.3f}"
         + (" (DRY-RUN: nothing removed)" if dry else "")
         + " -- the ranks seed the L3 index and the evictor ledger from it at attach"
     )

@@ -8,6 +8,7 @@ replays, so no index keeps an entry the launcher unlinked.
 """
 
 import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -151,6 +152,53 @@ class TestShardRule(unittest.TestCase):
             for stem in (_stem(7), "zz-synthetic", "A1upper"):
                 self.assertEqual(os.path.basename(os.path.dirname(SJ.page_path(d, stem))),
                                  page_shard(stem))
+
+
+class TestOneWalkPerStore(_Store):
+    """NF metal rc12z30c: launcher, PP0-2 and D TP0 each walked one store."""
+
+    def _rank(self, walks, group):
+        from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
+
+        def _iter():
+            walks.append(group)
+            for root, _dirs, names in os.walk(self.d):
+                for n in names:
+                    if n.endswith(".bin"):
+                        yield n[:-4], os.stat(os.path.join(root, n))
+
+        with mock.patch.dict(os.environ, {"SGLANG_WEG2_GROUP": group}):
+            return LRUFileEvictor(self.d, K, tp_rank=0, pp_rank=0, attn_cp_rank=0,
+                                  writes_shared_keys=True, scan_suffixes=(K,),
+                                  extra_config={"max_size": str(10 ** 9),
+                                                "max_size_scope": "shared"},
+                                  writer_count=1, iter_existing=_iter)
+
+    def test_the_launcher_walk_is_the_only_walk_of_the_boot(self):
+        for i in range(12):
+            self.page(_stem(i))
+        (files, _b, _r), log = self.attach(walk_forbidden=False)   # first boot: no snapshot
+        self.assertEqual(files, 12)
+        self.assertIn("SNAPSHOT written by the one walk", " ".join(log))
+        walks = []
+        ranks = [self._rank(walks, g) for g in ("P", "P", "P", "D")]
+        self.assertEqual(walks, [], "a rank walked after the launcher's walk")
+        self.assertEqual(ranks[-1].index_coverage()["indexed_entries"], 12)
+        stems, why = SJ.index_stems(self.d)                   # the #1459 seed, no walk
+        self.assertEqual(len(stems), 12, why)
+        # second boot: the launcher reads and rewrites, the ranks load
+        (files, _b, _r), log = self.attach()
+        self.assertIn("snapshot rewritten", log[-1])
+        walks = []
+        for g in ("P", "P", "P", "D"):
+            self._rank(walks, g)
+        self.assertEqual(walks, [])
+
+    def test_the_seed_of_the_shared_stem_index_reads_the_index(self):
+        from sglang.srt.mem_cache import hicache_storage as HS
+
+        src = inspect.getsource(HS.HiCacheFile._l3p_seed_index)
+        self.assertIn("_sj.index_stems(self.file_path", src)
 
 
 class TestLedgerCountsShards(_Store):

@@ -381,7 +381,8 @@ class TestOrphanReapAndPublication(CustomTestCase):
                 self.assertEqual((files, removed), (2, 1))
                 self.assertFalse(os.path.exists(os.path.join(d, "ab", "k3_OLDHASH.bin")))
                 self.assertIn("orphans=1", log.text)
-                self.assertIn("walk_s=", log.text)
+                # the first attach's one walk wrote the snapshot: this one reads it
+                self.assertIn("source=index", log.text)
                 self.assertEqual(sorted(json.loads(os.environ["SGLANG_WEG2_L3_INHERITED_SUFFIXES"])),
                                  ["_A", "_B"])
 
